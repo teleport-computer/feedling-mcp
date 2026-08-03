@@ -243,17 +243,26 @@ def test_plaintext_import_returns_genesis_job_and_does_not_persist_raw(monkeypat
 
     monkeypatch.setattr(plaintext.db, "genesis_list_jobs", lambda *_args, **_kwargs: [])
 
-    def fake_create(_store, create_payload, *, initial_status="created"):
+    def fake_create(
+        _store,
+        create_payload,
+        *,
+        initial_status="created",
+        trusted_metadata=None,
+    ):
         captured["create_payload"] = create_payload
         captured["initial_status"] = initial_status
+        captured["trusted_metadata"] = trusted_metadata
+        captured["persisted_metadata"] = {
+            **create_payload["metadata"],
+            **(trusted_metadata or {}),
+            "privacy_copy": service.PRIVACY_COPY,
+        }
         job = {
             "job_id": "genesis_job_1",
             "status": "created",
             "source_kind": create_payload["source_kind"],
-            "metadata": {
-                **create_payload["metadata"],
-                "privacy_copy": service.PRIVACY_COPY,
-            },
+            "metadata": captured["persisted_metadata"],
             "privacy_mode": service.PRIVACY_MODE,
         }
         return job, 201
@@ -266,7 +275,7 @@ def test_plaintext_import_returns_genesis_job_and_does_not_persist_raw(monkeypat
         return {
             "job_id": "genesis_job_1",
             "status": "processing",
-            "metadata": captured["create_payload"]["metadata"],
+            "metadata": captured["persisted_metadata"],
             "source_kind": captured["create_payload"]["source_kind"],
             "privacy_mode": service.PRIVACY_MODE,
             "output": kwargs["output"],
@@ -332,6 +341,10 @@ def test_plaintext_import_returns_genesis_job_and_does_not_persist_raw(monkeypat
     assert captured["create_payload"]["metadata"]["client_job_id"] == "ios_job_1"
     assert captured["create_payload"]["metadata"]["timeline_span_days"] == 0
     assert captured["initial_status"] == "processing"
+    assert captured["trusted_metadata"] == plaintext._plaintext_worker_metadata()
+    assert captured["persisted_metadata"]["plaintext_worker_instance"] == (
+        plaintext._PLAINTEXT_WORKER_INSTANCE
+    )
 
 
 def test_plaintext_import_rejects_second_processing_job_with_active_id(monkeypatch):
@@ -401,6 +414,67 @@ def test_plaintext_import_recovers_stale_processing_job_and_resumes(monkeypatch)
     assert resp.status_code == 202
     assert resp.get_json()["job"]["job_id"] == "genesis_stale"
     assert started["job"]["status"] == "processing"
+
+
+def test_plaintext_import_immediately_resumes_dead_same_host_owner(monkeypatch):
+    payload = {"format": "plaintext", "content": "User: resume after pkill"}
+    processing = {
+        "job_id": "genesis_dead_owner",
+        "status": "processing",
+        "metadata": {
+            "ingest": "plaintext",
+            "input_hash": plaintext.history_import._history_import_payload_hash(payload),
+            "mode": "onboarding",
+            "plaintext_worker_host": plaintext._PLAINTEXT_WORKER_HOST,
+            "plaintext_worker_pid": 424244,
+            "plaintext_worker_instance": "dead-instance",
+        },
+    }
+    failed = {**processing, "status": "failed", "error": "plaintext_worker_restarted"}
+    monkeypatch.setattr(plaintext.db, "genesis_list_jobs", lambda *_args, **_kwargs: [processing])
+    monkeypatch.setattr(
+        plaintext.os,
+        "kill",
+        lambda *_args: (_ for _ in ()).throw(ProcessLookupError()),
+    )
+    fail_calls = []
+
+    def fail_dead_owner(*_args, **kwargs):
+        fail_calls.append(kwargs)
+        return failed
+
+    monkeypatch.setattr(plaintext.db, "genesis_fail_stale_plaintext_job", fail_dead_owner)
+    monkeypatch.setattr(plaintext, "_fail_stale_plaintext_job", _FAIL_STALE_PLAINTEXT_JOB)
+    monkeypatch.setattr(
+        plaintext.db,
+        "genesis_patch_job_metadata",
+        lambda *_args, **_kwargs: {
+            **failed,
+            "metadata": {
+                **failed["metadata"],
+                **plaintext._plaintext_worker_metadata(),
+            },
+        },
+    )
+    monkeypatch.setattr(
+        plaintext.db,
+        "genesis_set_job_status",
+        lambda *_args, **_kwargs: {**failed, "status": "processing"},
+    )
+    monkeypatch.setattr(plaintext.service, "write_genesis_state", lambda *_args, **_kwargs: None)
+    started = {}
+    monkeypatch.setattr(
+        plaintext,
+        "_start_plaintext_genesis_job",
+        lambda _store, _api_key, job, **_kwargs: started.update(job=job) or True,
+    )
+
+    resp = _client(monkeypatch).post("/v1/genesis/imports/plaintext", json=payload)
+
+    assert resp.status_code == 202
+    assert resp.get_json()["job"]["job_id"] == "genesis_dead_owner"
+    assert started["job"]["status"] == "processing"
+    assert fail_calls and all(call["force"] is True for call in fail_calls)
 
 
 def test_plaintext_import_reuses_failed_job_for_checkpoint_resume(monkeypatch):
@@ -567,9 +641,6 @@ def test_prepare_plaintext_import_computes_timeline_span_days(monkeypatch):
 
     assert prepared["timeline_span_days"] == 3
     assert metadata["timeline_span_days"] == 3
-    assert metadata["plaintext_worker_host"] == plaintext._PLAINTEXT_WORKER_HOST
-    assert metadata["plaintext_worker_pid"] == plaintext._PLAINTEXT_WORKER_PID
-    assert metadata["plaintext_worker_instance"] == plaintext._PLAINTEXT_WORKER_INSTANCE
 
 
 def test_plaintext_job_reuse_requires_matching_mode(monkeypatch):

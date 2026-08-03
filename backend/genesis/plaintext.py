@@ -508,7 +508,6 @@ def _plaintext_job_metadata(
         "support_count": int(profile.get("support_count") or 0),
         "warning_count": len(prepared.get("warnings") or []),
         "content_bytes": int(prepared.get("content_bytes") or 0),
-        **_plaintext_worker_metadata(),
     }
     filename_fields = [
         payload.get("history_filename"),

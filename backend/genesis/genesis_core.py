@@ -819,13 +819,18 @@ def plaintext_import(
         metadata["distill_model"] = normalized_distill_model
     total_bytes = sum(len(text.encode("utf-8")) for text in prepared["chunk_texts"])
     try:
-        job, _status = service.create_import_job(store, {
-            "source_kind": prepared["source_kind"],
-            "file_manifest_hash": input_hash,
-            "total_chunks": len(prepared["chunk_texts"]),
-            "total_bytes": total_bytes,
-            "metadata": metadata,
-        }, initial_status="processing")
+        job, _status = service.create_import_job(
+            store,
+            {
+                "source_kind": prepared["source_kind"],
+                "file_manifest_hash": input_hash,
+                "total_chunks": len(prepared["chunk_texts"]),
+                "total_bytes": total_bytes,
+                "metadata": metadata,
+            },
+            initial_status="processing",
+            trusted_metadata=plaintext_helpers._plaintext_worker_metadata(),
+        )
     except db.GenesisPlaintextJobActive as e:
         return _bad("import_job_active", 409, active_job_id=e.active_job_id)
     except ValueError as e:

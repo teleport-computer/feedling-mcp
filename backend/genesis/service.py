@@ -357,6 +357,11 @@ SAFE_JOB_METADATA_KEYS = {
     "timeline_span_days",
     "window_count",
 }
+INTERNAL_JOB_METADATA_KEYS = {
+    "plaintext_worker_host",
+    "plaintext_worker_pid",
+    "plaintext_worker_instance",
+}
 
 
 def _text(value: Any, max_chars: int) -> str:
@@ -679,6 +684,7 @@ def create_import_job(
     payload: dict,
     *,
     initial_status: str = "created",
+    trusted_metadata: dict | None = None,
 ) -> tuple[dict, int]:
     job_id = _text(payload.get("job_id") or new_job_id(), 80)
     source_kind = _text(payload.get("source_kind") or payload.get("source") or "unknown", 80)
@@ -692,8 +698,15 @@ def create_import_job(
     if total_bytes < 0:
         raise ValueError("total_bytes_out_of_range")
     metadata = _safe_job_metadata(payload.get("metadata"))
+    internal_metadata = {
+        str(key): value
+        for key, value in (trusted_metadata or {}).items()
+        if key in INTERNAL_JOB_METADATA_KEYS
+        and (isinstance(value, (str, int, float, bool)) or value is None)
+    }
     metadata = {
         **metadata,
+        **internal_metadata,
         "privacy_copy": PRIVACY_COPY,
     }
     normalized_status = str(initial_status or "created").strip().lower()

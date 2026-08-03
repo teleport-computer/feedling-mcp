@@ -109,6 +109,7 @@ def test_create_import_job_drops_plaintext_metadata(monkeypatch):
             "file_count": 2,
             "timeline_span_days": 7,
             "distill_model": "claude-haiku-4-5",
+            "plaintext_worker_instance": "client-spoof",
         },
     })
 
@@ -117,9 +118,38 @@ def test_create_import_job_drops_plaintext_metadata(monkeypatch):
     assert metadata["file_count"] == 2
     assert metadata["timeline_span_days"] == 7
     assert metadata["distill_model"] == "claude-haiku-4-5"
+    assert "plaintext_worker_instance" not in metadata
     assert metadata["privacy_copy"] == service.PRIVACY_COPY
     assert "transcript" not in metadata
     assert "ai_persona" not in metadata
+
+
+def test_create_import_job_persists_only_trusted_worker_owner_metadata(monkeypatch):
+    saved = {}
+
+    def fake_create(_user_id, job):
+        saved.update(job)
+        return {"job_id": job["job_id"], "status": "processing"}
+
+    monkeypatch.setattr(service.db, "genesis_create_job", fake_create)
+    monkeypatch.setattr(service.db, "set_blob", lambda *_args: None)
+
+    service.create_import_job(
+        _store(),
+        {"job_id": "job_owner", "metadata": {"ingest": "plaintext"}},
+        initial_status="processing",
+        trusted_metadata={
+            "plaintext_worker_host": "host-a",
+            "plaintext_worker_pid": 123,
+            "plaintext_worker_instance": "instance-a",
+            "transcript": "must-not-persist",
+        },
+    )
+
+    assert saved["metadata"]["plaintext_worker_host"] == "host-a"
+    assert saved["metadata"]["plaintext_worker_pid"] == 123
+    assert saved["metadata"]["plaintext_worker_instance"] == "instance-a"
+    assert "transcript" not in saved["metadata"]
 
 
 def test_create_import_job_does_not_trust_payload_status(monkeypatch):
