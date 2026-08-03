@@ -18,6 +18,7 @@ import math
 import os
 from pathlib import Path
 import re
+import subprocess
 import sys
 import time
 from typing import Any
@@ -123,35 +124,33 @@ def _retention_index_evidence_passed(evidence: dict[str, Any]) -> bool:
     )
 
 
-def _business_path_evidence_passed(evidence: dict[str, Any]) -> bool:
-    """Gate externally captured recorder/pool/provider no-impact evidence."""
+def _business_path_evidence_passed(
+    evidence: dict[str, Any], *, expected_commit: str
+) -> bool:
+    """Delegate to the producer's strict provenance/raw-sample validator."""
 
-    pool = evidence.get("pool") or {}
-    recorder = evidence.get("recorder") or {}
-    providers = evidence.get("providers") or {}
-
-    def healthy_path(path: dict[str, Any]) -> bool:
-        return bool(
-            isinstance(path.get("requests"), int)
-            and path["requests"] > 0
-            and isinstance(path.get("p95_ms"), (int, float))
-            and path["p95_ms"] >= 0
-            and path.get("business_errors") == 0
-            and path.get("results_match_baseline") is True
+    try:
+        from scripts.perf.provider_attempt_business_path import (  # noqa: PLC0415
+            validate_business_path_evidence,
         )
 
-    return bool(
-        isinstance(pool.get("peak_occupancy"), int)
-        and isinstance(pool.get("capacity"), int)
-        and 0 <= pool["peak_occupancy"] <= pool["capacity"]
-        and pool["capacity"] > 0
-        and pool.get("timeouts") == 0
-        and healthy_path(recorder)
-        and set(providers) >= {"openrouter", "anthropic", "google"}
-        and all(healthy_path(providers[name]) for name in (
-            "openrouter", "anthropic", "google"
-        ))
-    )
+        validate_business_path_evidence(evidence, expected_commit=expected_commit)
+    except (ImportError, TypeError, ValueError):
+        return False
+    return True
+
+
+def _current_git_commit(repo: Path) -> str:
+    commit = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    if len(commit) != 40:
+        raise RuntimeError("formal gate requires a full Git commit")
+    return commit
 
 
 def assert_content_free_metric_sql(statements: list[tuple[str, tuple[Any, ...]]]) -> None:
@@ -886,10 +885,16 @@ def _fixture_counts(conn, prefix: str) -> dict[str, int]:
             "SELECT count(*) FROM users WHERE user_id LIKE %s", (prefix + "%",)
         ).fetchone()[0]
     )
-    counts["watermark"] = int(
+    counts["turn_watermark"] = int(
         conn.execute(
             "SELECT count(*) FROM v2_usage_rollup_watermarks "
-            "WHERE rollup_name IN ('hosted_v2_usage','hosted_v2_attempt_usage')"
+            "WHERE rollup_name='hosted_v2_usage'"
+        ).fetchone()[0]
+    )
+    counts["attempt_watermark"] = int(
+        conn.execute(
+            "SELECT count(*) FROM llm_usage_rollup_watermarks "
+            "WHERE rollup_name='hosted_v2_attempt_usage'"
         ).fetchone()[0]
     )
     counts["dirty_days"] = int(
@@ -1169,16 +1174,6 @@ def _run(args) -> int:
     if args.rows < 1 or args.users < 1 or args.runs < 5 or args.history_days < 90:
         raise SystemExit("rows/users must be positive, runs >= 5, history-days >= 90")
     attempt_rows = _resolve_attempt_rows(args.rows, args.attempt_rows)
-    if not args.business_path_evidence:
-        raise SystemExit(
-            "pass --business-path-evidence with recorder/pool/provider load evidence"
-        )
-    try:
-        business_path_evidence = json.loads(
-            Path(args.business_path_evidence).read_text(encoding="utf-8")
-        )
-    except (OSError, json.JSONDecodeError) as exc:
-        raise SystemExit(f"invalid business-path evidence: {type(exc).__name__}") from exc
     database_url = args.database_url.strip()
     if not database_url:
         raise SystemExit("pass an explicit --database-url for the dedicated scale DB")
@@ -1186,9 +1181,17 @@ def _run(args) -> int:
     os.environ["DATABASE_URL"] = database_url
     os.environ["FEEDLING_V2_USAGE_ROLLUP_ENABLED"] = "1"
     repo = Path(__file__).resolve().parents[2]
+    repo_path = str(repo)
+    if repo_path not in sys.path:
+        sys.path.insert(0, repo_path)
     backend = str(repo / "backend")
     if backend not in sys.path:
         sys.path.insert(0, backend)
+
+    from scripts.perf.provider_attempt_business_path import (  # noqa: PLC0415
+        measure_pool_contention_evidence,
+        produce_business_path_evidence,
+    )
 
     import db  # noqa: PLC0415
     from admin.usage import UsageQuery  # noqa: PLC0415
@@ -1222,6 +1225,21 @@ def _run(args) -> int:
             preset="90d",
         ),
     }
+    pool_evidence = measure_pool_contention_evidence(
+        real_pool=pool,
+        db_module=db,
+        jobs_store=jobs_store,
+        provider_attempt_rollup=provider_attempt_rollup,
+        usage_query=queries["unfiltered"],
+    )
+    business_path_evidence = produce_business_path_evidence(
+        repo=repo, pool_evidence=pool_evidence
+    )
+    if args.business_path_output:
+        Path(args.business_path_output).write_text(
+            json.dumps(business_path_evidence, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
     expected_partition = _validate_rolling_partition(
         usage_reporting.rollup_partition(queries["unfiltered"])
     )
@@ -1507,7 +1525,7 @@ def _run(args) -> int:
                 residual = {
                     key: value
                     for key, value in after_cascade.items()
-                    if key != "watermark" and value
+                    if key not in {"turn_watermark", "attempt_watermark"} and value
                 }
                 if residual:
                     raise RuntimeError(
@@ -1515,8 +1533,11 @@ def _run(args) -> int:
                     )
                 conn.execute(
                     "DELETE FROM v2_usage_rollup_watermarks "
-                    "WHERE rollup_name IN "
-                    "('hosted_v2_usage','hosted_v2_attempt_usage')"
+                    "WHERE rollup_name='hosted_v2_usage'"
+                )
+                conn.execute(
+                    "DELETE FROM llm_usage_rollup_watermarks "
+                    "WHERE rollup_name='hosted_v2_attempt_usage'"
                 )
                 conn.execute(
                     "DELETE FROM llm_usage_rollup_dirty_days "
@@ -1537,7 +1558,9 @@ def _run(args) -> int:
         evidence["cohorts"], evidence["cleanup"]
     ) and _retention_index_evidence_passed(
         evidence["retention_index"]
-    ) and _business_path_evidence_passed(evidence["business_path"])
+    ) and _business_path_evidence_passed(
+        evidence["business_path"], expected_commit=_current_git_commit(repo)
+    )
     rendered = json.dumps(evidence, indent=2, sort_keys=True, default=str) + "\n"
     if args.output:
         Path(args.output).write_text(rendered, encoding="utf-8")
@@ -1557,7 +1580,7 @@ def main() -> int:
     parser.add_argument("--keep-data", action="store_true")
     parser.add_argument("--output", default="")
     parser.add_argument("--precondition-note", default="")
-    parser.add_argument("--business-path-evidence", default="")
+    parser.add_argument("--business-path-output", default="")
     args = parser.parse_args()
     if args.self_test:
         return _self_test()
