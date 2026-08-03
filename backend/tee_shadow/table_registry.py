@@ -198,6 +198,19 @@ REGISTRY: dict[str, Entry] = {
         SKIP,
         "Provider-attempt 聚合的 cursor/replay 控制面；必须与 RDS ledger 原子推进",
     ),
+    "llm_usage_daily_attempt_dimensions": Entry(
+        SKIP,
+        "Canonical provider-attempt 账本可重建的按日维度投影；随用户在当前业务 RDS 级联删除，"
+        "复制到 TEE 会制造第二份 totals",
+    ),
+    "llm_usage_daily_call_memberships": Entry(
+        SKIP,
+        "Canonical provider-attempt 账本可重建的 exact call membership；仅供当前业务 RDS 报表对账",
+    ),
+    "llm_usage_rollup_dirty_days": Entry(
+        SKIP,
+        "Provider-attempt rollup 的稀疏 dirty-day 控制面；必须与 RDS cursor/day rebuild 原子推进",
+    ),
     "tee_sync_runs": Entry(
         SKIP, "TEE 同步自身的控制面/指标表，必须住在 RDS——复制到被它监控的库里没有意义"),
     "tee_reconcile_state": Entry(SKIP, "TEE reconcile 的控制面状态，同上，必须住 RDS"),

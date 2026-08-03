@@ -15,7 +15,6 @@ import sys
 from pathlib import Path
 
 import psycopg
-import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
@@ -112,3 +111,13 @@ def test_logical_lane_is_empty_for_now():
         "LOGICAL lane 尚未实现（RDS 未开 logical replication）。"
         "在通道打通前不要往这条 lane 放表。"
     )
+
+
+def test_attempt_rollup_tables_stay_in_current_rds_only():
+    """Derived accounting rows/control state must not create a second TEE ledger."""
+    expected = {
+        "llm_usage_daily_attempt_dimensions",
+        "llm_usage_daily_call_memberships",
+        "llm_usage_rollup_dirty_days",
+    }
+    assert expected <= set(reg.tables_in_lane(reg.SKIP))

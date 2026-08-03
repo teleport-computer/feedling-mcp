@@ -96,7 +96,7 @@ def test_0076_provider_attempt_schema_is_content_free_and_deletion_safe():
         with db.get_pool().connection() as conn:
             assert conn.execute(
                 "SELECT version_num FROM alembic_version"
-            ).fetchone() == ("0076_llm_provider_attempts",)
+            ).fetchone() == ("0077_llm_usage_attempt_rollups",)
             tables = {
                 row[0]
                 for row in conn.execute(
@@ -349,7 +349,7 @@ def test_0075_usage_rollup_schema_is_installed_without_source_backfill():
             "AND tgrelid='v2_turn_metrics'::regclass"
         ).fetchone()[0]
 
-    assert head == ("0076_llm_provider_attempts",)
+    assert head == ("0077_llm_usage_attempt_rollups",)
     assert tables == {
         "v2_usage_daily_users",
         "v2_usage_daily_dimensions",

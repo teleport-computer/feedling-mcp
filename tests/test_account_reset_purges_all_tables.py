@@ -157,6 +157,23 @@ def _seed_all_per_user_tables(user_id: str) -> None:
             "(attempt_id,user_id,revision,reason_code) VALUES (%s,%s,1,'late_usage')",
             ("aaaaaaaa-aaaa-5aaa-8aaa-aaaaaaaaaaaa", user_id),
         )
+        conn.execute(
+            "INSERT INTO llm_usage_daily_attempt_dimensions "
+            "(local_day,user_id,cohort_lane,requested_provider,requested_model,"
+            "resolved_provider,resolved_model,effective_usage_known,cost_kind,"
+            "attempts,unknown_cost_attempts) "
+            "VALUES ('2026-08-01',%s,'chat','openai','gpt-test','openai','gpt-test',"
+            "false,'unknown',1,1)",
+            (user_id,),
+        )
+        conn.execute(
+            "INSERT INTO llm_usage_daily_call_memberships "
+            "(local_day,user_id,cohort_lane,call_id,requested_provider,requested_model,"
+            "resolved_provider,resolved_model,effective_usage_known) "
+            "VALUES ('2026-08-01',%s,'chat','reset-call','openai','gpt-test',"
+            "'openai','gpt-test',false)",
+            (user_id,),
+        )
     cid = db.model_api_credential_create(
         user_id, provider="anthropic", base_url="", label="k",
         api_key_envelope={"v": 1, "body_ct": "ct", "nonce": "n"},
@@ -181,6 +198,8 @@ _PER_USER_TABLES = (
     "v2_usage_daily_dimensions",
     "llm_provider_attempts",
     "llm_provider_attempt_corrections",
+    "llm_usage_daily_attempt_dimensions",
+    "llm_usage_daily_call_memberships",
     "chat_message_archive",
     "user_blobs",
 )
@@ -243,6 +262,23 @@ def test_db_belt_purges_usage_rollups_without_deleting_parent_user(client):
             "VALUES ('2026-08-02',%s,'chat','anthropic','claude-test',1)",
             (uid,),
         )
+        conn.execute(
+            "INSERT INTO llm_usage_daily_attempt_dimensions "
+            "(local_day,user_id,cohort_lane,requested_provider,requested_model,"
+            "resolved_provider,resolved_model,effective_usage_known,cost_kind,"
+            "attempts,unknown_cost_attempts) "
+            "VALUES ('2026-08-02',%s,'chat','openai','gpt-test','openai','gpt-test',"
+            "false,'unknown',1,1)",
+            (uid,),
+        )
+        conn.execute(
+            "INSERT INTO llm_usage_daily_call_memberships "
+            "(local_day,user_id,cohort_lane,call_id,requested_provider,requested_model,"
+            "resolved_provider,resolved_model,effective_usage_known) "
+            "VALUES ('2026-08-02',%s,'chat','belt-call','openai','gpt-test',"
+            "'openai','gpt-test',false)",
+            (uid,),
+        )
 
     db.delete_user_data(uid)
 
@@ -253,6 +289,8 @@ def test_db_belt_purges_usage_rollups_without_deleting_parent_user(client):
         for table in (
             "v2_usage_daily_users", "v2_usage_daily_dimensions",
             "llm_provider_attempts",
+            "llm_usage_daily_attempt_dimensions",
+            "llm_usage_daily_call_memberships",
         ):
             assert conn.execute(
                 f"SELECT count(*) FROM {table} WHERE user_id=%s", (uid,)
