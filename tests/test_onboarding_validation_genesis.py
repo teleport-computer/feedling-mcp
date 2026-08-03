@@ -304,6 +304,7 @@ def test_genesis_stage_mapped_to_legacy_phase_for_old_ios(monkeypatch):
     # iOS already maps (so old apps don't show raw 'genesis_v2_foreground').
     from genesis import service as genesis_service
     assert genesis_service.public_stage("genesis_v2_foreground") == "chat_history_importing"
+    assert genesis_service.public_stage("genesis_v2_foreground_ready") == "background_importing"
     assert genesis_service.public_stage("genesis_v2_background") == "background_importing"
     assert genesis_service.public_stage("genesis_v2_background_deferred") == "background_importing"
     assert genesis_service.public_stage("genesis_v2_done") == "completed"

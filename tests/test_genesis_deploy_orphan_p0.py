@@ -46,6 +46,34 @@ def _status(uid, jid):
                          (uid, jid)).fetchone()[0]
 
 
+def _seed_in_process_plaintext(
+    uid,
+    jid,
+    *,
+    updated_age_sec,
+    ingest="plaintext",
+    worker_instance="",
+):
+    conftest.seed_user(uid)
+    with db.get_pool().connection() as c:
+        c.execute("DELETE FROM genesis_import_jobs WHERE user_id=%s AND job_id=%s", (uid, jid))
+    db.genesis_create_job(uid, {
+        "job_id": jid,
+        "status": "processing",
+        "source_kind": "history_import",
+        "metadata": {
+            "ingest": ingest,
+            "plaintext_worker_instance": worker_instance,
+        },
+    })
+    with db.get_pool().connection() as c:
+        c.execute(
+            "UPDATE genesis_import_jobs SET updated_at=now()-make_interval(secs=>%s) "
+            "WHERE user_id=%s AND job_id=%s",
+            (updated_age_sec, uid, jid),
+        )
+
+
 def test_deploy_orphan_recovers_within_dead_cutoff_not_30min():
     dead = "v2-worker-OLD-2a19f08:genesis"     # the killed worker (no fresh heartbeat)
     live = "v2-worker-NEW-cd48301:genesis"     # the replacement, heartbeating now
@@ -84,3 +112,64 @@ def test_time_reaper_backstop_still_fails_wedged_job():
                      claimed_age_sec=60, chunks=0, updated_age_sec=2000)
     db.genesis_reap_stale_processing_jobs(1800, error="genesis_stale_timeout:1800s")
     assert _status("u_p0_wedge", "j_wedge") == "failed"
+
+
+def test_plaintext_lease_recovery_only_fails_matching_stale_job():
+    _seed_in_process_plaintext("u_plain_stale", "j_plain_stale", updated_age_sec=180)
+    _seed_in_process_plaintext("u_plain_fresh", "j_plain_fresh", updated_age_sec=10)
+    _seed_in_process_plaintext(
+        "u_non_plain_stale", "j_non_plain_stale", updated_age_sec=180, ingest="sealed")
+
+    failed = db.genesis_fail_stale_plaintext_job(
+        "u_plain_stale",
+        "j_plain_stale",
+        older_than_sec=120,
+        error="plaintext_stale_timeout:120s",
+    )
+    fresh = db.genesis_fail_stale_plaintext_job(
+        "u_plain_fresh",
+        "j_plain_fresh",
+        older_than_sec=120,
+        error="plaintext_stale_timeout:120s",
+    )
+    non_plain = db.genesis_fail_stale_plaintext_job(
+        "u_non_plain_stale",
+        "j_non_plain_stale",
+        older_than_sec=120,
+        error="plaintext_stale_timeout:120s",
+    )
+
+    assert failed and failed["status"] == "failed"
+    assert fresh is None
+    assert non_plain is None
+    assert _status("u_plain_fresh", "j_plain_fresh") == "processing"
+    assert _status("u_non_plain_stale", "j_non_plain_stale") == "processing"
+
+
+def test_plaintext_dead_owner_recovery_is_immediate_and_instance_fenced():
+    _seed_in_process_plaintext(
+        "u_plain_dead_owner",
+        "j_plain_dead_owner",
+        updated_age_sec=1,
+        worker_instance="old-instance",
+    )
+
+    mismatch = db.genesis_fail_stale_plaintext_job(
+        "u_plain_dead_owner",
+        "j_plain_dead_owner",
+        older_than_sec=120,
+        error="plaintext_worker_restarted",
+        expected_worker_instance="new-instance",
+        force=True,
+    )
+    failed = db.genesis_fail_stale_plaintext_job(
+        "u_plain_dead_owner",
+        "j_plain_dead_owner",
+        older_than_sec=120,
+        error="plaintext_worker_restarted",
+        expected_worker_instance="old-instance",
+        force=True,
+    )
+
+    assert mismatch is None
+    assert failed and failed["status"] == "failed"

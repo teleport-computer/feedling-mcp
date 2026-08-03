@@ -416,7 +416,7 @@ def _valid_job_id(job_id: str) -> bool:
 
 
 def _job_response(job: dict | None, *, extra: dict | None = None) -> dict:
-    job = job or {}
+    job = _public_job(job or {})
     # Report the client-facing stage name (v2-internal -> legacy phase the old iOS maps),
     # so shipped apps show correct copy without an update. Stored stage is unchanged.
     out = job.get("output")
@@ -433,6 +433,18 @@ def _job_response(job: dict | None, *, extra: dict | None = None) -> dict:
     if extra:
         body.update(extra)
     return body
+
+
+def _public_job(job: dict) -> dict:
+    metadata = job.get("metadata")
+    if not isinstance(metadata, dict):
+        return job
+    public_metadata = {
+        key: value
+        for key, value in metadata.items()
+        if not str(key).startswith("plaintext_worker_")
+    }
+    return {**job, "metadata": public_metadata}
 
 
 def _json_chunk_payload(payload: dict) -> tuple[bytes, dict[str, Any]]:
@@ -485,7 +497,7 @@ def list_imports(store, *, limit_raw) -> tuple[dict, int]:
     except Exception:
         limit = 20
     return {
-        "jobs": db.genesis_list_jobs(store.user_id, limit=limit),
+        "jobs": [_public_job(job) for job in db.genesis_list_jobs(store.user_id, limit=limit)],
         "state": db.get_blob(store.user_id, service.GENESIS_STATE_BLOB),
     }, 200
 
@@ -504,6 +516,8 @@ def get_import_status(store, job_id: str, *, include_missing_raw) -> tuple[dict,
     job = db.genesis_get_job(store.user_id, job_id)
     if not job:
         return _bad("genesis_job_not_found", 404)
+    if str(job.get("status") or "") == "processing":
+        job = plaintext_helpers._fail_stale_plaintext_job(store, job) or job
     # The app should see a continuous processing->done arc; hide the internal
     # `awaiting_resident` claim status that sits between upload and the resident claim.
     if str(job.get("status") or "") == "awaiting_resident":
@@ -722,6 +736,8 @@ def plaintext_import(
         input_hash=input_hash,
         mode=mode,
     )
+    if existing and str(existing.get("status") or "") == "processing":
+        existing = plaintext_helpers._fail_stale_plaintext_job(store, existing) or existing
     if existing and str(existing.get("status") or "") == service.DONE_JOB_STATUS:
         return _job_response(existing, extra={"status": "done"}), 200
 
@@ -738,11 +754,13 @@ def plaintext_import(
         and str(job["metadata"].get("ingest") or "") == "plaintext"
     ), None)
     if active_plaintext:
-        return _bad(
-            "import_job_active",
-            409,
-            active_job_id=str(active_plaintext.get("job_id") or ""),
-        )
+        recovered = plaintext_helpers._fail_stale_plaintext_job(store, active_plaintext)
+        if not recovered:
+            return _bad(
+                "import_job_active",
+                409,
+                active_job_id=str(active_plaintext.get("job_id") or ""),
+            )
 
     try:
         prepared = prepare(payload)
@@ -759,12 +777,14 @@ def plaintext_import(
         existing_metadata = (
             existing.get("metadata") if isinstance(existing.get("metadata"), dict) else {}
         )
+        metadata_patch = plaintext_helpers._plaintext_worker_metadata()
         if normalized_distill_model or existing_metadata.get("distill_model"):
-            existing = db.genesis_patch_job_metadata(
-                store.user_id,
-                str(existing.get("job_id") or ""),
-                {"distill_model": normalized_distill_model or None},
-            ) or existing
+            metadata_patch["distill_model"] = normalized_distill_model or None
+        existing = db.genesis_patch_job_metadata(
+            store.user_id,
+            str(existing.get("job_id") or ""),
+            metadata_patch,
+        ) or existing
         try:
             existing = db.genesis_set_job_status(
                 store.user_id,

@@ -4650,6 +4650,65 @@ def genesis_reap_stale_processing_jobs(older_than_sec: int, *, error: str, limit
     return out
 
 
+def genesis_fail_stale_plaintext_job(
+    user_id: str,
+    job_id: str,
+    *,
+    older_than_sec: int,
+    error: str,
+    expected_worker_instance: str = "",
+    force: bool = False,
+) -> dict | None:
+    """Atomically fail one abandoned in-process plaintext import.
+
+    Plaintext is held only by the API process that accepted it. Its companion
+    heartbeat updates ``updated_at`` independently of provider calls. A same-host
+    replacement can force recovery after proving the owner PID is gone; remote
+    owners use the stale interval because they may still be active during a
+    rolling deploy. The expected instance fences both paths against ownership
+    changing between the read and this update.
+    """
+    safe_sec = max(60, int(older_than_sec or 0))
+    sql = """
+        UPDATE genesis_import_jobs SET
+            status = 'failed',
+            error = %s,
+            updated_at = now()
+        WHERE user_id = %s AND job_id = %s
+          AND status = 'processing'
+          AND COALESCE(metadata->>'ingest', '') = 'plaintext'
+          AND COALESCE(metadata->>'plaintext_worker_instance', '') = %s
+          AND (%s OR updated_at < now() - make_interval(secs => %s))
+        RETURNING *
+    """
+    params = (
+        error[:1000],
+        user_id,
+        job_id,
+        str(expected_worker_instance or ""),
+        bool(force),
+        safe_sec,
+    )
+    with get_pool().connection() as conn:
+        cur = conn.execute(sql, params)
+        result = _genesis_row(cur, cur.fetchone())
+    if result is not None:
+        from tee_shadow import mirror
+        mirror.execute(
+            "UPDATE genesis_import_jobs SET status='failed', error=%s, updated_at=now() "
+            "WHERE user_id=%s AND job_id=%s AND status='processing' "
+            "AND COALESCE(metadata->>'ingest', '')='plaintext' "
+            "AND COALESCE(metadata->>'plaintext_worker_instance', '')=%s",
+            (
+                error[:1000],
+                user_id,
+                job_id,
+                str(expected_worker_instance or ""),
+            ),
+        )
+    return result
+
+
 def genesis_resident_heartbeat(user_id: str, job_id: str, *, consumer_id: str) -> bool:
     """Renew a resident job's lease. Only the owning consumer (claimed it, still
     processing) may heartbeat — this is what keeps genesis_reap_stale_resident_jobs
@@ -5029,6 +5088,31 @@ def genesis_touch_job(user_id: str, job_id: str) -> None:
         conn.execute(sql, params)
     from tee_shadow import mirror
     mirror.execute(sql, params)
+
+
+def genesis_touch_plaintext_job(
+    user_id: str,
+    job_id: str,
+    *,
+    worker_instance: str,
+) -> bool:
+    """Renew an in-process plaintext lease only while this instance owns it."""
+    sql = (
+        """
+        UPDATE genesis_import_jobs SET updated_at = now()
+        WHERE user_id = %s AND job_id = %s AND status = 'processing'
+          AND COALESCE(metadata->>'ingest', '') = 'plaintext'
+          AND COALESCE(metadata->>'plaintext_worker_instance', '') = %s
+        """
+    )
+    params = (user_id, job_id, str(worker_instance or ""))
+    with get_pool().connection() as conn:
+        cur = conn.execute(sql, params)
+        renewed = cur.rowcount > 0
+    if renewed:
+        from tee_shadow import mirror
+        mirror.execute(sql, params)
+    return renewed
 
 
 def genesis_upsert_output(

@@ -11,8 +11,10 @@ import json
 import math
 import os
 import re
+import socket
 import threading
 import time
+import uuid
 from dataclasses import replace
 from datetime import date
 from typing import Any
@@ -57,6 +59,10 @@ _FAST_DISTILL_MODEL_BY_PROVIDER = {
     "openai": "gpt-4o-mini",
     "openrouter": "anthropic/claude-haiku-4-5",
 }
+_PLAINTEXT_WORKER_HOST = socket.gethostname()
+_PLAINTEXT_WORKER_PID = os.getpid()
+_PLAINTEXT_WORKER_INSTANCE = uuid.uuid4().hex
+_PLAINTEXT_WORKER_ID_LOCK = threading.Lock()
 
 
 class MaterialEmptyError(ValueError):
@@ -297,6 +303,98 @@ def _staged_ttl_sec() -> int:
         return 86400
 
 
+def _plaintext_stale_sec() -> int:
+    try:
+        return max(60, int(os.environ.get("FEEDLING_GENESIS_PLAINTEXT_STALE_SEC", "120")))
+    except (TypeError, ValueError):
+        return 120
+
+
+def _plaintext_heartbeat_sec() -> int:
+    try:
+        return max(5, min(
+            int(os.environ.get("FEEDLING_GENESIS_PLAINTEXT_HEARTBEAT_SEC", "15")),
+            60,
+        ))
+    except (TypeError, ValueError):
+        return 15
+
+
+def _plaintext_worker_metadata() -> dict[str, Any]:
+    global _PLAINTEXT_WORKER_HOST, _PLAINTEXT_WORKER_PID, _PLAINTEXT_WORKER_INSTANCE
+    current_pid = os.getpid()
+    if current_pid != _PLAINTEXT_WORKER_PID:
+        with _PLAINTEXT_WORKER_ID_LOCK:
+            if current_pid != _PLAINTEXT_WORKER_PID:
+                _PLAINTEXT_WORKER_HOST = socket.gethostname()
+                _PLAINTEXT_WORKER_PID = current_pid
+                _PLAINTEXT_WORKER_INSTANCE = uuid.uuid4().hex
+    return {
+        "plaintext_worker_host": _PLAINTEXT_WORKER_HOST,
+        "plaintext_worker_pid": _PLAINTEXT_WORKER_PID,
+        "plaintext_worker_instance": _PLAINTEXT_WORKER_INSTANCE,
+    }
+
+
+def _plaintext_owner_process_is_dead(metadata: dict) -> bool:
+    """Return true only when the persisted owner is certainly dead locally.
+
+    A different host can be a live worker during a rolling deploy, so it must
+    age out through the heartbeat lease. On the same host, a missing PID is an
+    authoritative crash signal and lets the replacement process recover now.
+    """
+    _plaintext_worker_metadata()
+    owner_instance = str(metadata.get("plaintext_worker_instance") or "")
+    owner_host = str(metadata.get("plaintext_worker_host") or "")
+    try:
+        owner_pid = int(metadata.get("plaintext_worker_pid") or 0)
+    except (TypeError, ValueError):
+        return False
+    if not owner_instance or owner_instance == _PLAINTEXT_WORKER_INSTANCE:
+        return False
+    if not owner_host or owner_host != _PLAINTEXT_WORKER_HOST or owner_pid <= 0:
+        return False
+    if os.name != "posix":
+        return False
+    try:
+        os.kill(owner_pid, 0)
+    except ProcessLookupError:
+        return True
+    except (PermissionError, OSError):
+        return False
+    return False
+
+
+def _fail_stale_plaintext_job(store, job: dict | None) -> dict | None:
+    row = job if isinstance(job, dict) else {}
+    if str(row.get("status") or "") != "processing":
+        return None
+    metadata = _metadata_for_job(row)
+    if str(metadata.get("ingest") or "") != "plaintext":
+        return None
+    stale_sec = _plaintext_stale_sec()
+    owner_instance = str(metadata.get("plaintext_worker_instance") or "")
+    owner_dead = _plaintext_owner_process_is_dead(metadata)
+    failed = db.genesis_fail_stale_plaintext_job(
+        store.user_id,
+        str(row.get("job_id") or ""),
+        older_than_sec=stale_sec,
+        error=(
+            "plaintext_worker_restarted"
+            if owner_dead
+            else f"plaintext_stale_timeout:{stale_sec}s"
+        ),
+        expected_worker_instance=owner_instance,
+        force=owner_dead,
+    )
+    if failed:
+        try:
+            service.write_genesis_state(store, failed, status=service.FAILED_JOB_STATUS)
+        except Exception:  # noqa: BLE001
+            pass
+    return failed
+
+
 def _estimate_plaintext_materials(prepared: dict) -> tuple[list[dict], int]:
     materials: list[dict] = []
     for group in prepared.get("source_groups") or []:
@@ -410,6 +508,7 @@ def _plaintext_job_metadata(
         "support_count": int(profile.get("support_count") or 0),
         "warning_count": len(prepared.get("warnings") or []),
         "content_bytes": int(prepared.get("content_bytes") or 0),
+        **_plaintext_worker_metadata(),
     }
     filename_fields = [
         payload.get("history_filename"),
@@ -1036,10 +1135,10 @@ def _run_plaintext_genesis_v2(
     Foreground restores the legacy chat_ready contract: pick 3-5 core memories, derive a
     REAL Identity Card via the existing hosted deriver (foreground_identity, no new
     prompt), write identity + relationship anchor (_store_identity_payload) + a greeting,
-    and only THEN complete the job — so the app enters with a named/anchored TA, never a
-    blank home. Background then does the heavy full reduce (rest of memories + voice +
-    persona), skipping the core and NOT re-writing identity; a background failure never
-    fails the already-greetable onboarding.
+    and publish identity_ready — so the app can enter with a named/anchored TA, never a
+    blank home. Background then does the heavy full reduce over every remaining window,
+    skipping the core and NOT re-writing identity. The job reaches done only after every
+    material window has a durable checkpoint.
 
     Edge: if the deriver can't produce an identity, fall back to the v1-style apply
     (complete on core + background fills identity) — never a fake-complete.
@@ -1211,8 +1310,8 @@ def _run_plaintext_genesis_v2(
 
     # Foreground-ready contract: derive identity when the material contains a real
     # signal, but never invent one or make its absence a speaking gate. Greeting and
-    # Genesis completion still happen before entry; heavy voice/persona/full-memory
-    # stay in background. fresh_start skips the identity LLM entirely: deriving a
+    # identity readiness happen before entry; full-memory completion stays in the
+    # continuation. fresh_start skips the identity LLM entirely: deriving a
     # name from the synthetic sentinel is meaningless (a hallucinated one would be
     # wrong), and a provider hiccup there must not push a material-less onboarding
     # into the retryable-failed path — the greeting below must land regardless.
@@ -1246,7 +1345,7 @@ def _run_plaintext_genesis_v2(
     identity_first = bool(msgs) and foreground_identity.has_identity_signal(identity_payload)
     persona_ref = ""
     persona_sha = ""
-    if combined_map:
+    if combined_map and identity_first:
         persona_ref, persona_sha = service.write_persona_artifact(store, job_id, fg_merged)
         service.write_voice_artifact(store, job_id, fg_merged)
 
@@ -1269,24 +1368,9 @@ def _run_plaintext_genesis_v2(
             language=language,
             fresh_start=fresh_start_only,
         )
-        completed = db.genesis_complete_job(
-            store.user_id, job_id,
-            output={
-                "stage": "genesis_v2_foreground_ready",
-                "history_windows_total": hw_total,
-                "history_windows_failed": hw_failed,
-            },
-            memory_action_count=mem_count, identity_status="initialized",
-            persona_ref=persona_ref, persona_sha256=persona_sha,
-        )
-        if completed:
-            service.write_genesis_state(store, completed, status=service.DONE_JOB_STATUS)
-            # foreground identity-first completion bypasses service.apply_reducer_output
-            # (which resolves genesis notices for the other completion paths) -> resolve
-            # here too so a prior failure notice doesn't linger past a successful retry.
-            notices_core.resolve(store, "genesis:")
+        identity_status = "initialized"
     else:
-        # No foreground identity signal: complete nameless after greeting/core, then
+        # No foreground identity signal: enter nameless after greeting/core, then
         # let background enrichment add an identity later if the full material supports it.
         _append_plaintext_onboarding_greeting(
             store,
@@ -1298,29 +1382,60 @@ def _run_plaintext_genesis_v2(
             language=language,
             fresh_start=fresh_start_only,
         )
-        service.apply_reducer_output(store, api_key, job_id, fg_merged)
+        foreground_result = service.apply_reducer_output(
+            store,
+            api_key,
+            job_id,
+            fg_merged,
+            complete_job=False,
+        ) or {}
+        mem_count = int(foreground_result.get("memory_action_count") or 0)
+        identity_status = str(foreground_result.get("identity_status") or "")
+        persona_ref = str(foreground_result.get("persona_ref") or persona_ref)
+        persona_sha = str(foreground_result.get("persona_sha256") or persona_sha)
+
+    # The foreground has produced a usable entry state, but the import is not done
+    # until the full source_groups set is checkpointed below.
+    notices_core.resolve(store, "genesis:")
 
     if progress:
         progress.mark_identity_ready()
         progress.publish(
             stage="genesis_v2_foreground_ready",
-            status=service.DONE_JOB_STATUS,
+            status="processing",
             extra={
                 "history_windows_total": hw_total,
                 "history_windows_failed": hw_failed,
             },
         )
+    else:
+        db.genesis_set_job_status(
+            store.user_id,
+            job_id,
+            status="processing",
+            output={
+                "stage": "genesis_v2_foreground_ready",
+                "identity_ready": True,
+                "history_windows_total": hw_total,
+                "history_windows_failed": hw_failed,
+            },
+        )
+
+    completion = {
+        "memory_action_count": mem_count,
+        "identity_status": identity_status,
+        "persona_ref": persona_ref,
+        "persona_sha256": persona_sha,
+    }
 
     if fresh_start_only:
         # No material by definition -> nothing to enrich. Background here would
         # re-reduce the pure sentinel as history with write_identity=True (prod
-        # runs WITHOUT FEEDLING_GENESIS_COMBINED_MAP, so this path IS reachable
-        # there) — inventing persona/identity from synthetic text the foreground
+        # can be reached regardless of the combined-map deployment flag) —
+        # inventing persona/identity from synthetic text the foreground
         # explicitly refuses to distill, plus wasted provider calls. The greeting
-        # landed and the job is complete; stop here.
-        return True
-
-    if combined_map:
+        # landed and there are no real material windows to enrich; complete now.
+        _complete_plaintext_v2_job(store, job_id, progress=progress, **completion)
         return True
 
     # foreground core memory texts -> background as "already saved, don't repeat"
@@ -1330,26 +1445,66 @@ def _run_plaintext_genesis_v2(
                     for m in full_memories) if t
     ]
 
-    # background continuation — never fails the (already greetable) job. When the
-    # foreground already wrote identity, the background must NOT re-write it.
+    # Background continuation consumes the full unsampled source groups. Combined-map
+    # already produced voice/persona in the foreground, so its continuation only fills
+    # memory windows; both modes must write the remaining memories.
     try:
         _run_plaintext_background_enrichment(
             store, api_key, job_id, runtime=runtime, source_groups=source_groups,
             relationship_anchor=relationship_anchor,
             skip_family=fg_family, skip_texts=foreground.core_skip_texts(core),
             known_memories=core_memory_texts, write_identity=not identity_first,
-            include_memory=False,
+            include_memory=True,
+            include_persona_voice=not combined_map,
             user_name=user_name,
             llm=llm,
             progress=progress,
+            completion=completion,
         )
     except Exception as e:  # noqa: BLE001
-        db.genesis_set_job_status(
-            store.user_id, job_id, status=service.DONE_JOB_STATUS,
-            output={"stage": "genesis_v2_background_deferred",
-                    "error": f"{type(e).__name__}:{str(e)[:180]}"},
+        service.mark_failed(
+            store,
+            job_id,
+            f"genesis_v2_background_failed:{type(e).__name__}:{str(e)[:220]}",
+            exc=e,
         )
     return True
+
+
+def _complete_plaintext_v2_job(
+    store,
+    job_id: str,
+    *,
+    progress: _PlaintextCheckpointProgress | None,
+    memory_action_count: int,
+    identity_status: str,
+    persona_ref: str,
+    persona_sha256: str,
+) -> None:
+    output: dict[str, Any] = {
+        "stage": "genesis_v2_done",
+        "identity_ready": True,
+    }
+    if progress:
+        materials = progress.materials()
+        incomplete = [
+            item for item in materials
+            if int(item.get("windows_done") or 0) != int(item.get("windows_total") or 0)
+        ]
+        if incomplete:
+            raise RuntimeError("genesis_v2_incomplete_material_windows")
+        output["materials"] = materials
+    completed = db.genesis_complete_job(
+        store.user_id,
+        job_id,
+        output=output,
+        memory_action_count=memory_action_count,
+        identity_status=identity_status,
+        persona_ref=persona_ref,
+        persona_sha256=persona_sha256,
+    )
+    if completed:
+        service.write_genesis_state(store, completed, status=service.DONE_JOB_STATUS)
 
 
 def _run_plaintext_background_enrichment(
@@ -1365,13 +1520,16 @@ def _run_plaintext_background_enrichment(
     known_memories: list[str] | None = None,
     write_identity: bool = True,
     include_memory: bool = True,
+    include_persona_voice: bool = True,
     user_name: str = "",
     llm: GenesisLLMClient | None = None,
     progress: _PlaintextCheckpointProgress | None = None,
+    completion: dict[str, Any] | None = None,
 ) -> None:
     """Background continuation: the full reduce over every group (skipping the core the
     foreground already wrote for skip_family), then apply the REST incrementally —
-    memories + persona + voice. Does NOT re-complete the job (foreground already did).
+    memories + persona + voice. With completion metadata, this is the only path that
+    marks a material-backed v2 job done.
 
     Dedup is two-layered against the foreground core (`known_memories`): the model
     dedups reworded twins semantically inside fact_write (known_memories = "already
@@ -1393,11 +1551,11 @@ def _run_plaintext_background_enrichment(
                 stage="genesis_v2_background",
                 source_family=group_family,
                 source_pass=idx,
-                status=service.DONE_JOB_STATUS,
+                status="processing",
             )
         else:
             db.genesis_set_job_status(
-                store.user_id, job_id, status=service.DONE_JOB_STATUS,
+                store.user_id, job_id, status="processing",
                 output={"stage": "genesis_v2_background", "source_family": group_family,
                         "source_pass": idx, "source_pass_total": len(source_groups)},
             )
@@ -1410,6 +1568,7 @@ def _run_plaintext_background_enrichment(
             skip_fact_texts=skip_texts if group_family == skip_family else None,
             known_memories=known if group_family == skip_family else None,
             include_memory=include_memory,
+            include_persona_voice=include_persona_voice,
             user_name=user_name,
             llm=llm,
             resume_map_outputs=(progress.resume_outputs(idx, group_family) if progress else None),
@@ -1419,6 +1578,12 @@ def _run_plaintext_background_enrichment(
                 if progress else None
             ),
         )
+        if progress and group_family in {"ai_persona", "memory_summary"}:
+            progress.record_non_map_group(
+                idx,
+                group_family,
+                cards=_material_card_count(output),
+            )
         reducer_outputs.append(output)
         next_persona = _plaintext_existing_persona_from_output(output)
         if next_persona:
@@ -1434,11 +1599,15 @@ def _run_plaintext_background_enrichment(
         if dropped:
             merged["memories"] = kept
     # apply the REST without re-completing: memories (core already excluded), persona, voice
+    background_memory_count = 0
     if include_memory:
-        service.apply_memory_outputs(store, api_key, merged)
+        apply_result = service.apply_memory_outputs(store, api_key, merged)
+        if isinstance(apply_result, tuple) and apply_result:
+            background_memory_count = int(apply_result[0] or 0)
     # Identity is normally written by the FOREGROUND now (identity-first contract), so the
     # background skips it (write_identity=False). When foreground had no signal,
     # background may still derive one from the full reduce or persona; absence remains valid.
+    background_identity_status = ""
     if write_identity:
         if not _merged_has_identity(merged) and isinstance(merged.get("persona"), dict):
             persona_content = str(merged["persona"].get("content") or "").strip()
@@ -1459,24 +1628,41 @@ def _run_plaintext_background_enrichment(
                     # also exists.
                     existing_identity = merged.get("identity") if isinstance(merged.get("identity"), dict) else {}
                     merged["identity"] = {**existing_identity, **baseline}
-        service.init_identity_if_absent(
+        background_identity_status = service.init_identity_if_absent(
             store, _attach_plaintext_user_name(merged, user_name), api_key
         )
-    service.write_persona_artifact(store, job_id, merged)
+    background_persona_ref, background_persona_sha = service.write_persona_artifact(
+        store, job_id, merged)
     service.write_voice_artifact(store, job_id, merged)
-    if progress:
+    if completion is not None:
+        _complete_plaintext_v2_job(
+            store,
+            job_id,
+            progress=progress,
+            memory_action_count=(
+                int(completion.get("memory_action_count") or 0) + background_memory_count
+            ),
+            identity_status=(
+                background_identity_status
+                or str(completion.get("identity_status") or "")
+            ),
+            persona_ref=(
+                background_persona_ref
+                or str(completion.get("persona_ref") or "")
+            ),
+            persona_sha256=(
+                background_persona_sha
+                or str(completion.get("persona_sha256") or "")
+            ),
+        )
+    elif progress:
         progress.publish(stage="genesis_v2_done", status=service.DONE_JOB_STATUS)
     else:
         db.genesis_set_job_status(
             store.user_id, job_id, status=service.DONE_JOB_STATUS, output={"stage": "genesis_v2_done"},
         )
-    # NOTE: deliberately no notices_core.resolve() here. This function is a pure
-    # continuation after the job already completed (foreground already ran either
-    # the identity-first path, which resolves at :799, or service.apply_reducer_output
-    # at :813, which resolves at its own start and may then emit a fresh
-    # "genesis:{job_id}:partial" notice for dropped cards). apply_memory_outputs
-    # (used above) never emits notices itself, so resolving again here would only
-    # ever clobber that just-emitted partial — never resolve anything new.
+    # Foreground readiness already resolved stale failure notices. Do not resolve
+    # again here: later stages may add a fresh partial notice in future revisions.
 
 
 def _append_plaintext_onboarding_greeting(
@@ -1751,6 +1937,14 @@ def _run_plaintext_genesis_job(
     relationship_anchor: dict | None = None,
     analysis_messages: list[dict] | None = None,
 ) -> None:
+    heartbeat_stop = threading.Event()
+    heartbeat_thread = threading.Thread(
+        target=_run_plaintext_job_heartbeat,
+        args=(store, job_id, heartbeat_stop),
+        name=f"genesis-plaintext-heartbeat-{job_id[:24]}",
+        daemon=True,
+    )
+    heartbeat_thread.start()
     started_at = time.time()
     group_count = len(source_groups) if isinstance(source_groups, list) else 0
     chunk_count = len(chunk_texts or [])
@@ -1983,11 +2177,26 @@ def _run_plaintext_genesis_job(
             store, job_id, f"plaintext_import_failed:{type(e).__name__}:{str(e)[:220]}", exc=e,
         )
     finally:
+        heartbeat_stop.set()
+        heartbeat_thread.join(timeout=1.0)
         try:
             terminal_job = db.genesis_get_job(store.user_id, job_id)
             if str((terminal_job or {}).get("status") or "") == service.DONE_JOB_STATUS:
                 service.delete_genesis_checkpoint(store, job_id)
         except Exception:
+            pass
+
+
+def _run_plaintext_job_heartbeat(store, job_id: str, stop_event) -> None:
+    while not stop_event.wait(_plaintext_heartbeat_sec()):
+        try:
+            worker_instance = _plaintext_worker_metadata()["plaintext_worker_instance"]
+            db.genesis_touch_plaintext_job(
+                store.user_id,
+                job_id,
+                worker_instance=worker_instance,
+            )
+        except Exception:  # noqa: BLE001
             pass
 
 

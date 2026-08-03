@@ -368,6 +368,40 @@ def test_apply_reducer_output_writes_persona_and_done_state(monkeypatch):
     assert any(output["type"] == "apply" for output in outputs)
 
 
+def test_apply_reducer_output_can_defer_job_completion(monkeypatch):
+    monkeypatch.setattr(
+        service.db,
+        "genesis_get_job",
+        lambda *_args: {"job_id": "job_1", "status": "processing"},
+    )
+    monkeypatch.setattr(service.db, "genesis_set_job_status", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(service.db, "genesis_upsert_output", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        service.db,
+        "genesis_complete_job",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("foreground must not complete the job")),
+    )
+    monkeypatch.setattr(service, "write_genesis_state", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(service.notices, "resolve", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(service, "apply_memory_outputs", lambda *_args: (2, []))
+    monkeypatch.setattr(service, "init_identity_if_absent", lambda *_args: "initialized")
+    monkeypatch.setattr(service, "write_persona_artifact", lambda *_args: ("persona-ref", "persona-sha"))
+    monkeypatch.setattr(service, "write_voice_artifact", lambda *_args: ("voice-ref", "voice-sha"))
+
+    result = service.apply_reducer_output(
+        _store(),
+        "api-key",
+        "job_1",
+        {"memories": [{"summary": "foreground"}]},
+        complete_job=False,
+    )
+
+    assert result["memory_action_count"] == 2
+    assert result["identity_status"] == "initialized"
+    assert result["persona_ref"] == "persona-ref"
+
+
 def test_write_persona_artifact_keeps_existing_higher_priority_persona(monkeypatch):
     writes = []
 
@@ -1233,6 +1267,7 @@ def test_public_stage_maps_plaintext_reducer_to_friendly_phases():
     assert service.public_stage("plaintext_reducer") == "chat_history_importing"
     assert service.public_stage("plaintext_reducer_done") == "background_importing"
     assert service.public_stage("genesis_v2_foreground") == "chat_history_importing"  # unchanged
+    assert service.public_stage("genesis_v2_foreground_ready") == "background_importing"
     assert service.public_stage("unknown_stage") == "unknown_stage"  # passthrough
 
 

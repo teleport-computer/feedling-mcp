@@ -168,18 +168,31 @@ and expired stages return distinct `staged_import_not_found`,
 
 Commit publishes every material immediately with `status: queued`, zero
 completed windows, and its total window count. Subsequent status polls replace
-that initial snapshot with processing and completion progress.
+that initial snapshot with processing and completion progress. For Genesis V2,
+the foreground pass can set `identity_ready: true` while the job remains
+`processing`; the job becomes `done` only after every material reports
+`windows_done == windows_total`. Combined-map deployments reuse foreground
+checkpoints and process every remaining window before completion.
 
 `POST /v1/genesis/imports/plaintext` allows one processing plaintext import per
 account. A second submission returns `409 import_job_active` and the existing
 `active_job_id`; clients should display or poll that job rather than retrying
-the unchanged upload. Done and failed jobs release the account slot.
+the unchanged upload. In-process plaintext workers renew a separate lease every
+15 seconds and persist their process owner. After a same-host backend restart,
+the next status or submission request verifies that the old PID is gone and
+immediately fails the abandoned job as `worker_restarted`, releasing the account
+slot for checkpoint-backed retry. A different host may still be processing the
+job during a rolling deploy, so remote or legacy owners use the 120-second stale
+lease instead of being killed speculatively. Ownership is checked again in the
+atomic update, and live workers renew only jobs they still own. Done and failed
+jobs release the account slot.
 
 The worker uses the first real model request as a canary with a default
 60-second timeout. A timed-out canary ends the job with
 `distill_model_too_slow`; changing to a faster model is required before retry.
-Other provider configuration failures retain their specific error class and
-remediation guidance.
+Malformed JSON response bodies are reported as `model_bad_json`. Other provider
+configuration failures retain their specific error class and remediation
+guidance.
 Later provider timeout failures make at most two attempts. This timeout cap does
 not reduce the existing three-attempt budget for provider `429` and retryable
 `5xx` responses.

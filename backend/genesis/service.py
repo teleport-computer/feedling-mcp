@@ -45,7 +45,7 @@ PERSONA_SOURCE_PRIORITY = {
 # Only what's REPORTED to the client is mapped; stored stages / flow-trace are unchanged.
 _PUBLIC_STAGE_MAP = {
     "genesis_v2_foreground": "chat_history_importing",
-    "genesis_v2_foreground_ready": "completed",
+    "genesis_v2_foreground_ready": "background_importing",
     "genesis_v2_background": "background_importing",
     "genesis_v2_background_deferred": "background_importing",
     "genesis_v2_done": "completed",
@@ -225,8 +225,9 @@ def classify_genesis_error(error: str, exc: BaseException | None = None) -> str:
       - httpx timeout / "TimeoutException" in the wrapped message (worker
         call sites wrap as f"...:{type(e).__name__}") -> provider_timeout.
       - `genesis_stale_timeout:...` / `resident_stale_timeout:...` /
-        `resident_never_claimed:...` (the three stale-processing reapers in
-        worker.py) -> worker_restarted: the job was requeued/failed because
+        `plaintext_worker_restarted` /
+        `resident_never_claimed:...` (the stale-processing recovery paths) ->
+        worker_restarted: the job was requeued/failed because
         the worker/consumer that held it stopped heartbeating, not because of
         anything the model produced.
       - `...decrypt_failed:{type}` (worker._decrypt_envelope, the enclave
@@ -251,7 +252,11 @@ def classify_genesis_error(error: str, exc: BaseException | None = None) -> str:
     # Stale-reap requeue/fail strings all contain "timeout" too (e.g.
     # "genesis_stale_timeout:1800s") — must be checked before the generic
     # timeout match below so a dead worker isn't mislabeled as a slow provider.
-    if "stale_timeout" in lower or "resident_never_claimed" in lower:
+    if (
+        "stale_timeout" in lower
+        or "resident_never_claimed" in lower
+        or "plaintext_worker_restarted" in lower
+    ):
         return "worker_restarted"
 
     status_match = re.search(r"provider_http_(\d{3})\b", lower)
@@ -266,6 +271,8 @@ def classify_genesis_error(error: str, exc: BaseException | None = None) -> str:
         "invalid_json_after_repair" in lower
         or "invalid_json" in lower
         or "json_not_object" in lower
+        or "provider returned non-json response" in lower
+        or "provider returned non-object response" in lower
     ):
         return "model_bad_json"
 
@@ -1683,6 +1690,7 @@ def apply_reducer_output(
     output: dict,
     *,
     runtime_token: str = "",
+    complete_job: bool = True,
 ) -> dict:
     job = db.genesis_get_job(store.user_id, job_id)
     if not job:
@@ -1738,15 +1746,16 @@ def apply_reducer_output(
         ref="sanitized",
     )
     db.genesis_upsert_output(store.user_id, job_id, "apply", doc=result_doc, status="done", ref="inline")
-    completed = db.genesis_complete_job(
-        store.user_id,
-        job_id,
-        output=result_doc,
-        memory_action_count=memory_count,
-        identity_status=identity_status,
-        persona_ref=persona_ref,
-        persona_sha256=persona_sha,
-    )
-    if completed:
-        write_genesis_state(store, completed, status=DONE_JOB_STATUS)
+    if complete_job:
+        completed = db.genesis_complete_job(
+            store.user_id,
+            job_id,
+            output=result_doc,
+            memory_action_count=memory_count,
+            identity_status=identity_status,
+            persona_ref=persona_ref,
+            persona_sha256=persona_sha,
+        )
+        if completed:
+            write_genesis_state(store, completed, status=DONE_JOB_STATUS)
     return result_doc

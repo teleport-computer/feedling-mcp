@@ -12,6 +12,8 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 from genesis import genesis_core, plaintext, service  # noqa: E402
 from urllib.parse import urlparse  # noqa: E402
 
+_FAIL_STALE_PLAINTEXT_JOB = plaintext._fail_stale_plaintext_job
+
 
 def _store(user_id: str = "usr_plaintext"):
     return types.SimpleNamespace(user_id=user_id)
@@ -32,6 +34,7 @@ def _memory_checkpoint(monkeypatch):
     monkeypatch.setattr(plaintext.service, "write_genesis_checkpoint", write)
     monkeypatch.setattr(plaintext.service, "delete_genesis_checkpoint", lambda *_args: None)
     monkeypatch.setattr(plaintext.db, "genesis_get_job", lambda *_args: None)
+    monkeypatch.setattr(plaintext, "_fail_stale_plaintext_job", lambda *_args: None)
 
 
 class _Resp:
@@ -101,6 +104,20 @@ def test_plaintext_user_name_prefers_encrypted_identity_without_provider(monkeyp
         types.SimpleNamespace(),
         [{"source_family": "user_profile", "chunk_texts": ["请叫我小雨"]}],
     ) == "Seven"
+
+
+def test_plaintext_worker_owner_metadata_is_not_public():
+    body = genesis_core._job_response({
+        "job_id": "job_owner",
+        "metadata": {
+            "ingest": "plaintext",
+            "plaintext_worker_host": "internal-host",
+            "plaintext_worker_pid": 123,
+            "plaintext_worker_instance": "internal-instance",
+        },
+    })
+
+    assert body["job"]["metadata"] == {"ingest": "plaintext"}
 
 
 def test_plaintext_user_name_extracts_user_profile_once(monkeypatch):
@@ -343,6 +360,49 @@ def test_plaintext_import_rejects_second_processing_job_with_active_id(monkeypat
     }
 
 
+def test_plaintext_import_recovers_stale_processing_job_and_resumes(monkeypatch):
+    payload = {"format": "plaintext", "content": "User: resume after deploy"}
+    input_hash = plaintext.history_import._history_import_payload_hash(payload)
+    processing = {
+        "job_id": "genesis_stale",
+        "status": "processing",
+        "metadata": {
+            "ingest": "plaintext",
+            "input_hash": input_hash,
+            "mode": "onboarding",
+        },
+    }
+    failed = {
+        **processing,
+        "status": "failed",
+        "error": "plaintext_stale_timeout:120s",
+    }
+    monkeypatch.setattr(plaintext.db, "genesis_list_jobs", lambda *_args, **_kwargs: [processing])
+    monkeypatch.setattr(
+        plaintext,
+        "_fail_stale_plaintext_job",
+        lambda _store, job: failed if job["job_id"] == "genesis_stale" else None,
+    )
+    monkeypatch.setattr(
+        plaintext.db,
+        "genesis_set_job_status",
+        lambda *_args, **_kwargs: {**failed, "status": "processing"},
+    )
+    monkeypatch.setattr(plaintext.service, "write_genesis_state", lambda *_args, **_kwargs: None)
+    started = {}
+    monkeypatch.setattr(
+        plaintext,
+        "_start_plaintext_genesis_job",
+        lambda _store, _api_key, job, **_kwargs: started.update(job=job) or True,
+    )
+
+    resp = _client(monkeypatch).post("/v1/genesis/imports/plaintext", json=payload)
+
+    assert resp.status_code == 202
+    assert resp.get_json()["job"]["job_id"] == "genesis_stale"
+    assert started["job"]["status"] == "processing"
+
+
 def test_plaintext_import_reuses_failed_job_for_checkpoint_resume(monkeypatch):
     client = _client(monkeypatch)
     payload = {"format": "plaintext", "content": "User: retry me"}
@@ -390,6 +450,7 @@ def test_plaintext_import_reuses_failed_job_for_checkpoint_resume(monkeypatch):
     assert resp.get_json()["job"]["job_id"] == "genesis_failed"
     assert started["job"]["status"] == "processing"
     assert patched["distill_model"] is None
+    assert patched["plaintext_worker_instance"] == plaintext._PLAINTEXT_WORKER_INSTANCE
 
 
 def test_plaintext_import_reuses_done_job_without_restart(monkeypatch):
@@ -506,6 +567,9 @@ def test_prepare_plaintext_import_computes_timeline_span_days(monkeypatch):
 
     assert prepared["timeline_span_days"] == 3
     assert metadata["timeline_span_days"] == 3
+    assert metadata["plaintext_worker_host"] == plaintext._PLAINTEXT_WORKER_HOST
+    assert metadata["plaintext_worker_pid"] == plaintext._PLAINTEXT_WORKER_PID
+    assert metadata["plaintext_worker_instance"] == plaintext._PLAINTEXT_WORKER_INSTANCE
 
 
 def test_plaintext_job_reuse_requires_matching_mode(monkeypatch):
@@ -889,6 +953,130 @@ def test_plaintext_status_quota_failure_keeps_cause_aware_copy(monkeypatch):
     assert body["error_class"] == "provider_quota"
     assert service.GENESIS_ERROR_HINTS["provider_quota"] in body["friendly_copy"]
     assert service.GENESIS_ERROR_HINTS["internal"] not in body["friendly_copy"]
+
+
+def test_plaintext_status_reaps_stale_processing_lease(monkeypatch):
+    processing = {
+        "job_id": "job_stale",
+        "status": "processing",
+        "metadata": {"ingest": "plaintext"},
+        "output": {"stage": "genesis_v2_background", "materials": []},
+    }
+    failed = {
+        **processing,
+        "status": "failed",
+        "error": "plaintext_stale_timeout:120s",
+    }
+    monkeypatch.setattr(genesis_core.db, "genesis_get_job", lambda *_args: processing)
+    monkeypatch.setattr(
+        plaintext,
+        "_fail_stale_plaintext_job",
+        lambda *_args: failed,
+    )
+    monkeypatch.setattr(genesis_core.db, "get_blob", lambda *_args: None)
+
+    body, status = genesis_core.get_import_status(
+        _store(), "job_stale", include_missing_raw=False)
+
+    assert status == 200
+    assert body["status"] == "failed"
+    assert body["error_class"] == "worker_restarted"
+
+
+def test_plaintext_dead_same_host_owner_is_recovered_immediately(monkeypatch):
+    processing = {
+        "job_id": "job_dead_owner",
+        "status": "processing",
+        "metadata": {
+            "ingest": "plaintext",
+            "plaintext_worker_host": plaintext._PLAINTEXT_WORKER_HOST,
+            "plaintext_worker_pid": 424242,
+            "plaintext_worker_instance": "old-instance",
+        },
+    }
+    captured = {}
+    failed = {**processing, "status": "failed", "error": "plaintext_worker_restarted"}
+    monkeypatch.setattr(
+        plaintext.os,
+        "kill",
+        lambda *_args: (_ for _ in ()).throw(ProcessLookupError()),
+    )
+    monkeypatch.setattr(
+        plaintext.db,
+        "genesis_fail_stale_plaintext_job",
+        lambda *_args, **kwargs: captured.update(kwargs) or failed,
+    )
+    monkeypatch.setattr(plaintext.service, "write_genesis_state", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        plaintext,
+        "_fail_stale_plaintext_job",
+        _FAIL_STALE_PLAINTEXT_JOB,
+    )
+
+    recovered = plaintext._fail_stale_plaintext_job(_store(), processing)
+
+    assert recovered == failed
+    assert captured["force"] is True
+    assert captured["expected_worker_instance"] == "old-instance"
+    assert captured["error"] == "plaintext_worker_restarted"
+
+
+def test_plaintext_live_same_host_owner_keeps_stale_lease_guard(monkeypatch):
+    processing = {
+        "job_id": "job_live_owner",
+        "status": "processing",
+        "metadata": {
+            "ingest": "plaintext",
+            "plaintext_worker_host": plaintext._PLAINTEXT_WORKER_HOST,
+            "plaintext_worker_pid": 424243,
+            "plaintext_worker_instance": "other-live-instance",
+        },
+    }
+    captured = {}
+    monkeypatch.setattr(plaintext.os, "kill", lambda *_args: None)
+    monkeypatch.setattr(
+        plaintext.db,
+        "genesis_fail_stale_plaintext_job",
+        lambda *_args, **kwargs: captured.update(kwargs) or None,
+    )
+    monkeypatch.setattr(
+        plaintext,
+        "_fail_stale_plaintext_job",
+        _FAIL_STALE_PLAINTEXT_JOB,
+    )
+
+    assert plaintext._fail_stale_plaintext_job(_store(), processing) is None
+    assert captured["force"] is False
+    assert captured["expected_worker_instance"] == "other-live-instance"
+
+
+def test_plaintext_job_heartbeat_renews_processing_lease(monkeypatch):
+    waits = []
+    touched = []
+
+    class StopAfterOneBeat:
+        def wait(self, seconds):
+            waits.append(seconds)
+            return len(waits) > 1
+
+    monkeypatch.setattr(plaintext, "_plaintext_heartbeat_sec", lambda: 15)
+    monkeypatch.setattr(
+        plaintext.db,
+        "genesis_touch_plaintext_job",
+        lambda user_id, job_id, **kwargs: touched.append(
+            (user_id, job_id, kwargs["worker_instance"])
+        ),
+    )
+
+    plaintext._run_plaintext_job_heartbeat(
+        _store(), "job_heartbeat", StopAfterOneBeat())
+
+    assert waits == [15, 15]
+    assert touched == [(
+        "usr_plaintext",
+        "job_heartbeat",
+        plaintext._PLAINTEXT_WORKER_INSTANCE,
+    )]
 
 
 def test_plaintext_background_runner_distills_and_applies(monkeypatch):

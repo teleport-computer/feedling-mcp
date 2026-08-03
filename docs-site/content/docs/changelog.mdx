@@ -33,7 +33,14 @@ change must not be interpreted as an API guarantee.
   for compatible relays. Job status immediately exposes every material as
   queued, followed by ordered progress and real candidate-card counts,
   `identity_ready`, and cause-aware failure fields. Missing, consumed, and
-  expired stages have distinct 4xx errors.
+  expired stages have distinct 4xx errors. Genesis V2 now remains processing
+  after foreground identity readiness and reaches done only after all material
+  windows complete, including combined-map imports. Malformed provider JSON is
+  reported as `model_bad_json` instead of an internal error. Plaintext workers
+  now maintain an independent, instance-fenced lease. Status and submission
+  requests immediately recover a same-host job whose owner process has exited;
+  remote or legacy owners retain a two-minute heartbeat cutoff so a rolling
+  deploy cannot kill a worker that is still running on another host.
 
 - **Genesis plaintext processing now fails fast and resumes completed windows.**
   `POST /v1/genesis/imports/plaintext` permits only one processing plaintext
