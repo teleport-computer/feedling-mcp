@@ -8,6 +8,7 @@ import re
 
 from scripts.perf.admin_usage_ranked_flags_temp_probe import (
     FLAG_COLUMN_NAMES,
+    _gap_ctes,
     _ranked_rows_and_outputs,
 )
 
@@ -29,10 +30,90 @@ _RELATION = re.compile(r"^[a-z_][a-z0-9_]*$")
 __all__ = (
     "FLAG_COLUMN_NAMES",
     "NARROW_IDENTITY_COLUMNS",
+    "_narrow_day_insert_sql",
+    "_narrow_dimension_select",
+    "_narrow_raw_insert_sql",
     "_narrow_storage_passed",
     "_narrow_table_ddl",
     "_ranked_rows_and_outputs",
 )
+
+
+def _narrow_day_insert_sql(effective_ctes: str) -> str:
+    dimensions = _narrow_dimension_select(
+        priced_relation="priced_probe", gap_relation="call_gaps"
+    )
+    columns = ",".join((*NARROW_IDENTITY_COLUMNS, *FLAG_COLUMN_NAMES))
+    return (
+        effective_ctes
+        + _gap_ctes()
+        + ",priced_probe AS MATERIALIZED (SELECT p.* FROM priced p) "
+        "INSERT INTO pg_temp.admin_usage_daily_call_dimensions ("
+        + columns
+        + ") SELECT %s,n.* FROM ("
+        + dimensions
+        + ") n"
+    )
+
+
+def _narrow_raw_insert_sql(effective_ctes: str) -> str:
+    dimensions = _narrow_dimension_select(
+        priced_relation="priced_probe",
+        gap_relation="call_gaps",
+        include_local_day=True,
+    )
+    columns = ",".join((*NARROW_IDENTITY_COLUMNS, *FLAG_COLUMN_NAMES))
+    return (
+        effective_ctes
+        + _gap_ctes()
+        + ",priced_probe AS MATERIALIZED (SELECT "
+        "timezone('Asia/Shanghai',m.created_at)::date AS local_day,p.* "
+        "FROM priced p JOIN llm_provider_attempts source_attempt "
+        "USING(attempt_id) JOIN v2_turn_metrics m "
+        "ON m.job_id=source_attempt.job_id "
+        "AND m.user_id=source_attempt.user_id) "
+        "INSERT INTO pg_temp.admin_usage_daily_call_raw_dimensions ("
+        + columns
+        + ") "
+        + dimensions
+    )
+
+
+def _narrow_dimension_select(
+    *,
+    priced_relation: str,
+    gap_relation: str,
+    include_local_day: bool = False,
+) -> str:
+    ranked_rows, flag_outputs = _ranked_rows_and_outputs(
+        priced_relation=priced_relation, gap_relation=gap_relation
+    )
+    identities = (
+        NARROW_IDENTITY_COLUMNS
+        if include_local_day
+        else NARROW_IDENTITY_COLUMNS[1:]
+    )
+    projection = (
+        "SELECT "
+        + ",".join(identities)
+        + ","
+        + ",".join(flag_outputs)
+        + " FROM ("
+        + ranked_rows
+        + ") ranked"
+    )
+    return (
+        "SELECT "
+        + ",".join(identities)
+        + ","
+        + ",".join(
+            f"sum({name})::bigint AS {name}" for name in FLAG_COLUMN_NAMES
+        )
+        + " FROM ("
+        + projection
+        + ") narrow_flags GROUP BY "
+        + ",".join(identities)
+    )
 
 
 def _narrow_storage_passed(

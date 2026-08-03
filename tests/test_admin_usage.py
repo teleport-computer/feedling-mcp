@@ -532,6 +532,259 @@ def test_ranked_probe_matches_canonical_calls_for_full_filter_matrix():
                         assert sum(row[inner_column] for row in selected_dimensions) == sum(gaps[call_id][1] for call_id in expected_calls), context
 
 
+def _assert_narrow_dimensions_match_canonical_matrix(dimensions, attempts, gaps):
+    raw = tuple(
+        {
+            "call_id": row[1],
+            "user_id": row[2],
+            "cohort_lane": row[3],
+            "requested": (row[4], row[5]),
+            "resolved": (row[6], row[7]),
+            "effective": row[8],
+        }
+        for row in attempts
+    )
+    for user_id in (None, "u1", "u2"):
+        for lane in (None, "chat", "maintenance"):
+            for provider in (None, "p1", "p2"):
+                for model in (None, "shared", "m1", "m2"):
+                    for completeness in ("all", "metered", "unknown"):
+                        selected = tuple(
+                            row
+                            for row in raw
+                            if (user_id is None or row["user_id"] == user_id)
+                            and (lane is None or row["cohort_lane"] == lane)
+                            and (
+                                provider is None
+                                or row["resolved"][0] == provider
+                            )
+                            and (model is None or row["resolved"][1] == model)
+                            and (
+                                completeness == "all"
+                                or row["effective"]
+                                is (completeness == "metered")
+                            )
+                        )
+                        expected_calls = {row["call_id"] for row in selected}
+                        expected_requested = {
+                            identity: len(
+                                {
+                                    row["call_id"]
+                                    for row in selected
+                                    if row["requested"] == identity
+                                }
+                            )
+                            for identity in {
+                                row["requested"] for row in selected
+                            }
+                        }
+                        expected_resolved = {
+                            identity: len(
+                                {
+                                    row["call_id"]
+                                    for row in selected
+                                    if row["resolved"] == identity
+                                }
+                            )
+                            for identity in {
+                                row["resolved"] for row in selected
+                            }
+                        }
+                        selector = (
+                            "provider_model"
+                            if provider and model
+                            else "provider"
+                            if provider
+                            else "model"
+                            if model
+                            else "all"
+                        )
+                        stored_completeness = (
+                            "all" if completeness == "all" else "effective"
+                        )
+                        cohort_column = (
+                            f"logical_calls_cohort_{selector}_"
+                            f"{stored_completeness}"
+                        )
+                        requested_column = (
+                            f"logical_calls_requested_{selector}_"
+                            f"{stored_completeness}"
+                        )
+                        resolved_column = (
+                            "logical_calls_cohort_provider_model_"
+                            f"{stored_completeness}"
+                        )
+                        outer_column = (
+                            f"missing_outer_ordinals_{selector}_"
+                            f"{stored_completeness}"
+                        )
+                        inner_column = (
+                            f"missing_inner_ordinals_{selector}_"
+                            f"{stored_completeness}"
+                        )
+                        selected_dimensions = tuple(
+                            row
+                            for row in dimensions
+                            if (
+                                user_id is None or row["user_id"] == user_id
+                            )
+                            and (
+                                lane is None or row["cohort_lane"] == lane
+                            )
+                            and (
+                                provider is None
+                                or row["resolved_provider"] == provider
+                            )
+                            and (
+                                model is None
+                                or row["resolved_model"] == model
+                            )
+                            and (
+                                completeness == "all"
+                                or row["effective_usage_known"]
+                                is (completeness == "metered")
+                            )
+                        )
+                        actual_requested = {}
+                        actual_resolved = {}
+                        for row in selected_dimensions:
+                            requested_identity = (
+                                row["requested_provider"],
+                                row["requested_model"],
+                            )
+                            resolved_identity = (
+                                row["resolved_provider"],
+                                row["resolved_model"],
+                            )
+                            actual_requested[requested_identity] = (
+                                actual_requested.get(requested_identity, 0)
+                                + row[requested_column]
+                            )
+                            actual_resolved[resolved_identity] = (
+                                actual_resolved.get(resolved_identity, 0)
+                                + row[resolved_column]
+                            )
+                        actual_requested = {
+                            key: value
+                            for key, value in actual_requested.items()
+                            if value
+                        }
+                        actual_resolved = {
+                            key: value
+                            for key, value in actual_resolved.items()
+                            if value
+                        }
+                        context = (
+                            user_id,
+                            lane,
+                            provider,
+                            model,
+                            completeness,
+                        )
+                        assert (
+                            sum(
+                                row[cohort_column]
+                                for row in selected_dimensions
+                            )
+                            == len(expected_calls)
+                        ), context
+                        assert actual_requested == expected_requested, context
+                        assert actual_resolved == expected_resolved, context
+                        assert sum(
+                            row[outer_column] for row in selected_dimensions
+                        ) == sum(
+                            gaps[call_id][0] for call_id in expected_calls
+                        ), context
+                        assert sum(
+                            row[inner_column] for row in selected_dimensions
+                        ) == sum(
+                            gaps[call_id][1] for call_id in expected_calls
+                        ), context
+
+
+def test_narrow_probe_merges_cost_rows_without_changing_canonical_call_truth():
+    probe = _load_narrow_call_probe()
+    attempts = (
+        ("00000000-0000-5000-8000-000000000001", "call-a", "u1", "chat", "req", "a", "p1", "shared", True, "unknown", None),
+        ("00000000-0000-5000-8000-000000000002", "call-a", "u1", "chat", "req", "b", "p2", "shared", False, "unknown", None),
+        ("00000000-0000-5000-8000-000000000003", "call-b", "u1", "maintenance", "req", "a", "p1", "m1", True, "authoritative", "USD"),
+        ("00000000-0000-5000-8000-000000000004", "call-b", "u1", "maintenance", "req", "a", "p1", "m2", True, "estimated", "USD"),
+        ("00000000-0000-5000-8000-000000000005", "call-c", "u2", "chat", "req", "c", "p2", "m1", False, "unknown", None),
+        ("00000000-0000-5000-8000-000000000006", "call-c", "u2", "chat", "req", "c", "p2", "m1", False, "estimated", "USD"),
+    )
+    gaps = {"call-a": (1, 0), "call-b": (0, 1), "call-c": (0, 0)}
+    placeholders = ",".join(
+        "(" + ",".join(("%s",) * len(attempts[0])) + ")"
+        for _ in attempts
+    )
+    gap_placeholders = ",".join("(%s,%s,%s)" for _ in gaps)
+
+    with db.get_pool().connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "WITH priced(attempt_id,call_id,user_id,cohort_lane,"
+                "requested_provider,requested_model,resolved_provider,"
+                "resolved_model,effective_usage_known,cost_kind,currency) "
+                "AS (VALUES "
+                + placeholders
+                + "),call_gaps(call_id,missing_outer_ordinals,"
+                "missing_inner_ordinals) AS (VALUES "
+                + gap_placeholders
+                + ") "
+                + probe._narrow_dimension_select(
+                    priced_relation="priced", gap_relation="call_gaps"
+                ),
+                tuple(value for row in attempts for value in row)
+                + tuple(
+                    value
+                    for call_id, values in gaps.items()
+                    for value in (call_id, *values)
+                ),
+            )
+            dimensions = tuple(cur.fetchall())
+
+    assert len(dimensions) == 5
+    assert all("cost_kind" not in row and "currency" not in row for row in dimensions)
+    assert sum(row["logical_calls_cohort_all_all"] for row in dimensions) == 3
+    assert sum(row["logical_calls_requested_all_all"] for row in dimensions) == 4
+    assert sum(row["missing_outer_ordinals_all_all"] for row in dimensions) == 1
+    assert sum(row["missing_inner_ordinals_all_all"] for row in dimensions) == 1
+    _assert_narrow_dimensions_match_canonical_matrix(dimensions, attempts, gaps)
+
+
+def test_narrow_probe_day_and_raw_builders_execute_on_empty_postgresql():
+    probe = _load_narrow_call_probe()
+    local_day = datetime(2026, 8, 1).date()
+
+    with db.get_pool().connection() as conn, conn.transaction():
+        for relation in (
+            "admin_usage_daily_call_dimensions",
+            "admin_usage_daily_call_raw_dimensions",
+        ):
+            for statement in probe._narrow_table_ddl(relation=relation):
+                conn.execute(statement)
+        day_cursor = conn.execute(
+            probe._narrow_day_insert_sql(
+                provider_attempt_rollup._effective_attempt_ctes()
+            ),
+            (
+                datetime(2026, 7, 31, 16, tzinfo=timezone.utc),
+                datetime(2026, 8, 1, 16, tzinfo=timezone.utc),
+                local_day,
+            ),
+        )
+        raw_cursor = conn.execute(
+            probe._narrow_raw_insert_sql(
+                provider_attempt_rollup._effective_attempt_ctes(
+                    cohort_where="false"
+                )
+            )
+        )
+
+    assert day_cursor.rowcount == 0
+    assert raw_cursor.rowcount == 0
+
+
 def test_admin_usage_scale_harness_self_check():
     """The opt-in scale proof must keep its timing and SQL safety gates."""
     result = subprocess.run(
