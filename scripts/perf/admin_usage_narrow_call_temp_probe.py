@@ -644,6 +644,7 @@ def _sample_candidate(conn, statement: str, params: tuple) -> dict[str, Any]:
 
 
 def _plan_summary(node: dict[str, Any]) -> dict[str, Any]:
+    node = node.get("Plan", node)
     nodes = []
 
     def visit(item: dict[str, Any]) -> None:

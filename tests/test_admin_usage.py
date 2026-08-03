@@ -1209,7 +1209,7 @@ def test_narrow_shape_diagnostic_records_five_warm_attempts_and_full_plan(
             "planning_ms": 1.0,
             "temp_read_blocks": 13,
             "temp_written_blocks": 17,
-            "plan": plan,
+            "plan": {"Plan": plan, "Execution Time": 12_345.0},
         },
     )
 

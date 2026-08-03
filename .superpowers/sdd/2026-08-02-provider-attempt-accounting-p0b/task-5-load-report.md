@@ -477,3 +477,64 @@ This is a hard stop for approach A. The passing storage/build/raw/exactness
 sub-gates do not authorize production implementation because neither query
 shape met the strict delivery-latency gate. No production plan or production
 file follows from this checkpoint.
+
+## Narrow query-shape diagnostic: structural spill, not first-read cache
+
+One separately approved diagnostic run rebuilt the same session-local narrow
+TEMP state and wrote
+`/private/tmp/2026-08-04-narrow-call-shape-diagnostic.json`. The mode was
+explicitly non-accepting: `diagnostic_mode=true` forces `passed=false`, the
+formal samples remained empty, and selection, the old reference, the filtered
+cohort, production code, and migrations remained unreachable.
+
+Both shapes repeated the formal result under warm execution. A1 bounded unions
+timed out on all five 3,000ms attempts at wall times 3,021.186, 3,015.867,
+3,019.699, 3,018.789, and 3,022.465ms. A2 grouping sets also timed out five of
+five at 3,016.867, 3,019.713, 3,018.532, 3,020.547, and 3,017.459ms. The
+subsequent 180,000ms `EXPLAIN ANALYZE` completed in 3,703.852ms for A1 and
+4,341.723ms for A2. This repeatability rejects a one-time first-read/cache
+explanation: both statement shapes have more work than the unchanged 3,000ms
+budget permits.
+
+The complete plans identify materialization and disk-spilling scope aggregation
+as the bottleneck. Each statement consumed 181,199 fact rows and 181,199 call
+rows for the formal window. Materializing the selected fact and call CTEs
+already wrote 6,621 and 8,037 TEMP blocks. The A1 root then read/wrote
+121,242/37,547 TEMP blocks (993,214,464/307,585,024 bytes), read 30,409 shared
+blocks from facts, and read 35,141 local blocks from the call TEMP relation.
+Its five bounded scope branches repeatedly scanned the materialized CTEs; the
+attempt and call scope CTEs respectively reported 34,698/21,471 and
+32,152/16,075 TEMP read/write blocks. Requested and resolved fact breakdowns
+each used a 32,840KB external merge sort.
+
+A2 reduced repeated TEMP reads but replaced them with wider grouping-set
+sorts. Its root read/wrote 53,220/54,692 TEMP blocks
+(435,978,240/448,036,864 bytes), read 30,217 shared fact blocks and 35,141 local
+call blocks. `fact_grouped` reported 16,656/29,934 TEMP read/write blocks behind
+a 44,424KB external merge sort; `call_grouped` reported 8,660/24,755 blocks
+behind a 23,104KB external merge sort. This explains why A2 wrote more and took
+about 638ms longer despite fewer reads.
+
+The artifact's first generated `full_plan.summary` fields are zero because the
+diagnostic summarizer initially treated the EXPLAIN document wrapper as the
+root plan node. The full plans themselves are complete, and the measurements
+above come directly from their authoritative `.plan.Plan` root and CTE nodes.
+The parser was corrected after the run without rerunning the experiment. The
+artifact's older recursively summed top-level TEMP counters also double-count
+parent/child inclusive values; the root-node counters reported above are the
+non-duplicated totals.
+
+The result narrows the next design decision. Selector-vertical call flags could
+reduce the 8,037-block call materialization and the call grouping width, but it
+cannot remove the persistent fact scan, the 6,621-block fact materialization,
+TTFT rescans, or fact-scope sorting. It therefore cannot by itself explain a
+credible sub-3,000ms result, while its estimated fourfold identity/index write
+amplification remains about 1.88--1.95GB total storage. A future candidate, if
+authorized, should first test compact daily preaggregated scope facts/call
+counters that avoid runtime five-scope materialization; it must quantify the
+known 2.51M--3.70M scope-row expansion before any production plan.
+
+The diagnostic retained the same safety boundary: post-state counts, source
+hashes, and watermarks exactly matched pre-state, the TEMP session closed, and
+a fresh connection found zero persistent probe objects. The hard verdict
+remains failed and no production implementation is authorized.
