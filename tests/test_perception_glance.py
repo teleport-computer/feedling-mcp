@@ -55,6 +55,16 @@ def test_disabled_null_and_non_finite_docs_are_unavailable():
     }) == {}
 
 
+def test_huge_integer_invalidates_only_its_domain():
+    """An unrepresentable integer must not abort unrelated glance domains."""
+    assert build_perception_glance({
+        "weather": {"temperature": 1 << 10_000},
+        "app": {"app_name": "private app"},
+    }) == {
+        "app": {"available": True, "recent_activity": True},
+    }
+
+
 def test_explicitly_expired_or_stale_docs_are_unavailable():
     assert build_perception_glance({
         "location": {"expired": True, "place_label": "home"},

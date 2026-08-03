@@ -1236,6 +1236,87 @@ def test_runtime_state_upsert_merges_patch():
     assert jobs_store.get_runtime_state("u_js_10") == {"a": 1, "b": 2}
 
 
+def test_finish_wake_job_persists_glance_before_successor_handoff():
+    """Completion, state merge, and late-input successor share one commit."""
+    uid = "u_js_glance_successor_atomic"
+    seed_user(uid)
+    _reset(uid)
+    jobs_store.upsert_runtime_state(uid, {"preserved": "state"})
+    job_id, _ = jobs_store.enqueue_job(uid, "heartbeat")
+    job = jobs_store.claim_next_job("w-glance")
+    assert job is not None and job["id"] == job_id
+    assert jobs_store.mark_running(job_id, claimed_by="w-glance")
+    same_id, coalesced = jobs_store.enqueue_job(uid, "heartbeat")
+    assert (same_id, coalesced) == (job_id, True)
+
+    completed, successor_id = jobs_store.finish_wake_job(
+        job_id,
+        claimed_by="w-glance",
+        observed_generation=0,
+        context_stream="v2_perception_wake_context",
+        consumed_context_seq=0,
+        completed_perception_glance_fingerprint="b" * 64,
+    )
+
+    assert completed is True
+    assert successor_id is not None
+    assert jobs_store.get_runtime_state(uid) == {
+        "preserved": "state",
+        "last_completed_perception_glance_fingerprint": "b" * 64,
+        "last_completed_perception_glance_source_job_id": job_id,
+    }
+    with db.get_pool().connection() as conn:
+        assert conn.execute(
+            "SELECT status FROM agent_jobs WHERE id=%s", (successor_id,)
+        ).fetchone()[0] == "pending"
+
+
+def test_completed_wake_retry_cannot_overwrite_newer_glance_source():
+    """An exact-source retry is idempotent and ordered by source job id."""
+    uid = "u_js_glance_source_order"
+    seed_user(uid)
+    _reset(uid)
+
+    old_id, _ = jobs_store.enqueue_job(uid, "heartbeat")
+    old_job = jobs_store.claim_next_job("w-old")
+    assert old_job is not None and old_job["id"] == old_id
+    assert jobs_store.mark_running(old_id, claimed_by="w-old")
+    assert jobs_store.finish_wake_job(
+        old_id,
+        claimed_by="w-old",
+        observed_generation=0,
+        context_stream="v2_perception_wake_context",
+        consumed_context_seq=0,
+        completed_perception_glance_fingerprint="1" * 64,
+    ) == (True, None)
+
+    new_id, _ = jobs_store.enqueue_job(uid, "heartbeat")
+    new_job = jobs_store.claim_next_job("w-new")
+    assert new_job is not None and new_job["id"] == new_id
+    assert jobs_store.mark_running(new_id, claimed_by="w-new")
+    assert jobs_store.finish_wake_job(
+        new_id,
+        claimed_by="w-new",
+        observed_generation=0,
+        context_stream="v2_perception_wake_context",
+        consumed_context_seq=0,
+        completed_perception_glance_fingerprint="2" * 64,
+    ) == (True, None)
+
+    assert jobs_store.finish_wake_job(
+        old_id,
+        claimed_by="w-old",
+        observed_generation=0,
+        context_stream="v2_perception_wake_context",
+        consumed_context_seq=0,
+        completed_perception_glance_fingerprint="1" * 64,
+    ) == (True, None)
+    assert jobs_store.get_runtime_state(uid) == {
+        "last_completed_perception_glance_fingerprint": "2" * 64,
+        "last_completed_perception_glance_source_job_id": new_id,
+    }
+
+
 # --- §6 admission ceiling: 三个纯读查询 (live_worker_count / inflight_job_count /
 # recent_mean_service_sec) ---------------------------------------------------
 

@@ -1,4 +1,7 @@
-import sys, pathlib
+import pathlib
+import sys
+
+import pytest
 sys.path.insert(0, str(pathlib.Path(__file__).parent.parent / "backend"))  # noqa: E402
 
 from agent import perception_core  # noqa: E402
@@ -105,3 +108,121 @@ def test_glance_payload_reuses_existing_notable_changes(monkeypatch):
         type("S", (), {"user_id": "u"})(), days_raw=None)
 
     assert result["glance"] == {"health": {"available": True, "notable_change": True}}
+
+
+def _numeric_history(field, *, baseline=10, current=30):
+    def cell(value):
+        return {"sum": value, "count": 1, "min": value, "max": value}
+
+    return [
+        {"date": "2026-08-01", "doc": {field: cell(baseline)}},
+        {"date": "2026-08-02", "doc": {field: cell(baseline)}},
+        {"date": "2026-08-03", "doc": {field: cell(current)}},
+    ]
+
+
+def test_glance_masks_disabled_sleep_history_when_activity_is_available(
+    monkeypatch,
+):
+    """Disabled sleep history cannot mark an authorized health glance changed."""
+    monkeypatch.setattr(
+        perception_core,
+        "agent_perception_payload",
+        lambda store, *, signals_raw: {
+            "ok": True,
+            "signals": {
+                "sleep": {"disabled": True, "reason": "switch_off"},
+                "activity": {"active_energy_kcal": 100},
+            },
+        },
+    )
+    monkeypatch.setattr(
+        perception_core.perception_store,
+        "list_perception_daily",
+        lambda uid, signal, days: (
+            [
+                {"date": "2026-08-01", "doc": {"asleep_minutes": 300}},
+                {"date": "2026-08-02", "doc": {"asleep_minutes": 300}},
+                {"date": "2026-08-03", "doc": {"asleep_minutes": 100}},
+            ]
+            if signal == "health_sleep"
+            else []
+        ),
+    )
+
+    result = perception_core.perception_glance_payload(
+        type("S", (), {"user_id": "u"})(), days_raw=None
+    )
+
+    assert result["glance"] == {
+        "health": {"available": True, "notable_change": False}
+    }
+
+
+@pytest.mark.parametrize(
+    ("signals", "history_field", "notable"),
+    [
+        (
+            {
+                "steps": {"disabled": True, "reason": "switch_off"},
+                "vitals": {"resting_heart_rate": 60},
+            },
+            "step_count",
+            False,
+        ),
+        (
+            {
+                "steps": {"step_count": 100},
+                "vitals": {"disabled": True, "reason": "not_permitted"},
+            },
+            "step_count",
+            True,
+        ),
+        (
+            {
+                "steps": {"step_count": 100},
+                "vitals": {"disabled": True, "reason": "not_permitted"},
+            },
+            "resting_heart_rate",
+            False,
+        ),
+        (
+            {
+                "steps": {"disabled": True, "reason": "switch_off"},
+                "vitals": {"resting_heart_rate": 60},
+            },
+            "resting_heart_rate",
+            True,
+        ),
+    ],
+)
+def test_glance_maps_shared_vitals_history_fields_to_exact_permission_docs(
+    monkeypatch,
+    signals,
+    history_field,
+    notable,
+):
+    """step_count follows steps; every other canonical vital follows vitals."""
+    monkeypatch.setattr(
+        perception_core,
+        "agent_perception_payload",
+        lambda store, *, signals_raw: {"ok": True, "signals": signals},
+    )
+    monkeypatch.setattr(
+        perception_core.perception_store,
+        "list_perception_daily",
+        lambda uid, signal, days: (
+            _numeric_history(history_field)
+            if signal == "health_vitals"
+            else []
+        ),
+    )
+
+    result = perception_core.perception_glance_payload(
+        type("S", (), {"user_id": "u"})(), days_raw=None
+    )
+
+    assert result["glance"]["health"] == {
+        "available": True,
+        "notable_change": notable,
+    }

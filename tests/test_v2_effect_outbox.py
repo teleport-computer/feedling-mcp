@@ -456,6 +456,52 @@ def test_valid_final_reply_atomically_completes_job_and_clears_route_error(
     assert route == ("", "")
 
 
+def test_ordinary_heartbeat_terminal_reply_atomically_persists_fingerprint(
+    pg_clean,
+):
+    """Final effect publication cannot leave completion without its glance."""
+    uid = "u_ob_heartbeat_glance_atomic"
+    seed_user(uid)
+    generation = db.get_runtime_generation(uid)
+    _set_v2_owner(uid)
+    job_id = _running_wake_job(uid, generation)
+    fingerprint = "a" * 64
+    payload = _wake_terminal_payload(observed_user_seq=0)
+    payload[effect_outbox.PERCEPTION_GLANCE_FINGERPRINT_KEY] = fingerprint
+    eid = effect_outbox.enqueue_effect(
+        job_id=job_id,
+        user_id=uid,
+        effect_type=effect_outbox.TERMINAL_REPLY_EFFECT_TYPE,
+        ordinal=0,
+        expected_generation=generation,
+        payload=payload,
+    )
+
+    seen = []
+    result = effect_outbox.apply_pending_effects(
+        uid,
+        dispatch=lambda effect_type, dispatched: seen.append(dispatched),
+    )
+
+    assert result == {
+        "applied": 1,
+        "discarded": 0,
+        effect_outbox.FINALIZED_JOB_IDS_KEY: [job_id],
+    }
+    assert len(seen) == 1
+    assert effect_outbox.PERCEPTION_GLANCE_FINGERPRINT_KEY not in seen[0]
+    assert effect_outbox.get_effect_disposition(
+        eid,
+        user_id=uid,
+        job_id=job_id,
+        effect_type=effect_outbox.TERMINAL_REPLY_EFFECT_TYPE,
+    ) == {"status": "applied", "last_error": ""}
+    assert jobs_store.get_runtime_state(uid) == {
+        "last_completed_perception_glance_fingerprint": fingerprint,
+        "last_completed_perception_glance_source_job_id": job_id,
+    }
+
+
 def test_final_reply_send_first_is_discarded_before_dispatch(pg_clean):
     """If B commits while the provider is in flight, its generation bump wins
     before final-effect apply and the stale A-only answer never reaches a sink."""

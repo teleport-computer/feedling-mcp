@@ -436,12 +436,14 @@ def test_repeated_completed_ordinary_heartbeat_marks_glance_unchanged(
 
     jobs_store.enqueue_job(uid, "heartbeat")
     first_job = jobs_store.claim_next_job("w-first")
+    first_deps = _wake_deps(
+        [{"id": "m1", "ts": 1.0, "role": "user", "content": "hi"}]
+    )
+    first_deps.read_perception_wake_context = lambda uid, job_id: []
     first_status = asyncio.run(
         worker.process_job(
             first_job,
-            _wake_deps(
-                [{"id": "m1", "ts": 1.0, "role": "user", "content": "hi"}]
-            ),
+            first_deps,
             provider_config=_BYOK,
             api_key=None,
             runtime_token="rt",
@@ -462,12 +464,14 @@ def test_repeated_completed_ordinary_heartbeat_marks_glance_unchanged(
 
     jobs_store.enqueue_job(uid, "heartbeat")
     second_job = jobs_store.claim_next_job("w-second")
+    second_deps = _wake_deps(
+        [{"id": "m1", "ts": 1.0, "role": "user", "content": "hi"}]
+    )
+    second_deps.read_perception_wake_context = lambda uid, job_id: []
     second_status = asyncio.run(
         worker.process_job(
             second_job,
-            _wake_deps(
-                [{"id": "m1", "ts": 1.0, "role": "user", "content": "hi"}]
-            ),
+            second_deps,
             provider_config=_BYOK,
             api_key=None,
             runtime_token="rt",
@@ -629,12 +633,14 @@ def test_failed_heartbeat_does_not_persist_glance_fingerprint(monkeypatch):
     monkeypatch.setattr(worker, "_cap_data", fake_cap_data)
     jobs_store.enqueue_job(uid, "heartbeat")
     job = jobs_store.claim_next_job("w")
+    deps = _wake_deps(
+        [{"id": "m1", "ts": 1.0, "role": "user", "content": "hi"}]
+    )
+    deps.read_perception_wake_context = lambda uid, job_id: []
     status = asyncio.run(
         worker.process_job(
             job,
-            _wake_deps(
-                [{"id": "m1", "ts": 1.0, "role": "user", "content": "hi"}]
-            ),
+            deps,
             provider_config=_BYOK,
             api_key=None,
             runtime_token="rt",
@@ -642,6 +648,49 @@ def test_failed_heartbeat_does_not_persist_glance_fingerprint(monkeypatch):
     )
 
     assert status == "failed"
+    assert (
+        "last_completed_perception_glance_fingerprint"
+        not in jobs_store.get_runtime_state(uid)
+    )
+
+
+def test_successful_heartbeat_without_context_reader_does_not_persist_fingerprint(
+    monkeypatch,
+):
+    """No context reader is not evidence that a heartbeat was event-free."""
+    uid = "u_glance_missing_reader"
+    conftest.seed_user(uid)
+    _reset(uid)
+
+    async def fake_provider(*args, **kwargs):
+        return _text_round("")
+
+    glance = {"weather": {"available": True, "notable_change": False}}
+
+    async def fake_cap_data(store, action_type, **kwargs):
+        assert action_type == "perception_glance"
+        return {"glance": glance}
+
+    monkeypatch.setattr(provider_client, "chat_completion_async", fake_provider)
+    monkeypatch.setattr(worker, "_cap_data", fake_cap_data)
+    deps = _wake_deps(
+        [{"id": "m1", "ts": 1.0, "role": "user", "content": "hi"}]
+    )
+    assert deps.read_perception_wake_context is None
+    jobs_store.enqueue_job(uid, "heartbeat")
+    job = jobs_store.claim_next_job("w")
+
+    status = asyncio.run(
+        worker.process_job(
+            job,
+            deps,
+            provider_config=_BYOK,
+            api_key=None,
+            runtime_token="rt",
+        )
+    )
+
+    assert status == "completed"
     assert (
         "last_completed_perception_glance_fingerprint"
         not in jobs_store.get_runtime_state(uid)

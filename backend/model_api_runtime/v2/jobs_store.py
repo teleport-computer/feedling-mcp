@@ -1156,6 +1156,70 @@ def mark_completed(
             return True
 
 
+_PERCEPTION_GLANCE_FINGERPRINT_STATE_KEY = (
+    "last_completed_perception_glance_fingerprint"
+)
+_PERCEPTION_GLANCE_SOURCE_JOB_STATE_KEY = (
+    "last_completed_perception_glance_source_job_id"
+)
+
+
+def _validate_perception_glance_fingerprint(value: object) -> str:
+    if (
+        type(value) is not str
+        or re.fullmatch(r"[0-9a-f]{64}", value) is None
+    ):
+        raise ValueError("completed perception glance fingerprint is invalid")
+    return value
+
+
+def _merge_completed_perception_glance_on_cursor(
+    cur,
+    *,
+    user_id: str,
+    source_job_id: int,
+    fingerprint: str,
+) -> bool:
+    """Shallow-merge an ordered completed-glance marker on this transaction.
+
+    The source id prevents an exact-source retry that resumes after a newer
+    heartbeat from restoring older state. An absent marker adopts the first
+    completion; malformed existing ordering metadata fails closed.
+    """
+    normalized_fingerprint = _validate_perception_glance_fingerprint(
+        fingerprint
+    )
+    source_id = int(source_job_id)
+    if source_id <= 0:
+        raise ValueError("completed perception glance source is invalid")
+    patch = {
+        _PERCEPTION_GLANCE_FINGERPRINT_STATE_KEY: normalized_fingerprint,
+        _PERCEPTION_GLANCE_SOURCE_JOB_STATE_KEY: source_id,
+    }
+    cur.execute(
+        "INSERT INTO runtime_state (user_id,state_json,updated_at) "
+        "VALUES (%s,%s,now()) "
+        "ON CONFLICT (user_id) DO UPDATE SET "
+        "state_json=runtime_state.state_json || EXCLUDED.state_json, "
+        "updated_at=now() WHERE CASE "
+        "WHEN NOT (runtime_state.state_json ? %s) THEN TRUE "
+        "WHEN jsonb_typeof(runtime_state.state_json->%s)='number' "
+        "AND (runtime_state.state_json->>%s) ~ '^[0-9]+$' "
+        "THEN (runtime_state.state_json->>%s)::numeric <= (%s)::numeric "
+        "ELSE FALSE END RETURNING state_json",
+        (
+            str(user_id),
+            Jsonb(patch),
+            _PERCEPTION_GLANCE_SOURCE_JOB_STATE_KEY,
+            _PERCEPTION_GLANCE_SOURCE_JOB_STATE_KEY,
+            _PERCEPTION_GLANCE_SOURCE_JOB_STATE_KEY,
+            _PERCEPTION_GLANCE_SOURCE_JOB_STATE_KEY,
+            source_id,
+        ),
+    )
+    return cur.fetchone() is not None
+
+
 def finish_wake_job(
     job_id: int,
     *,
@@ -1164,15 +1228,28 @@ def finish_wake_job(
     context_stream: str,
     consumed_context_seq: int,
     clear_wake_backoff: bool = False,
+    completed_perception_glance_fingerprint: str | None = None,
 ) -> tuple[bool, int | None]:
-    """Complete a wake and atomically hand late inputs to one successor.
+    """Complete a wake, persist its glance, and hand input to one successor.
 
     Context producers increment ``input_generation`` and append ``user_logs``
     under the same active-job lock. Rows newer than the worker's consumed
     context cursor are reassigned to the successor in this transaction. Thus
     finalization winning creates a fresh job for a later producer, while the
     producer winning forces this finalizer to preserve its input.
+
+    ``completed_perception_glance_fingerprint`` is supplied only for a proven
+    ordinary heartbeat. Its ordered shallow merge shares this transaction with
+    completion and successor creation. A final-reply effect may already have
+    completed the exact source; the same-source merge remains idempotent.
     """
+    completed_fingerprint = (
+        _validate_perception_glance_fingerprint(
+            completed_perception_glance_fingerprint
+        )
+        if completed_perception_glance_fingerprint is not None
+        else None
+    )
     successor_id: int | None = None
     moved_context = False
     user_id = ""
@@ -1211,6 +1288,13 @@ def finish_wake_job(
                 ):
                     return False, None
                 if str(row["status"]) == "completed":
+                    if completed_fingerprint is not None:
+                        _merge_completed_perception_glance_on_cursor(
+                            cur,
+                            user_id=user_id,
+                            source_job_id=int(job_id),
+                            fingerprint=completed_fingerprint,
+                        )
                     if clear_wake_backoff:
                         _clear_wake_backoff_on_cursor(cur, user_id)
                     return True, None
@@ -1229,6 +1313,13 @@ def finish_wake_job(
                     "WHERE id=%s",
                     (int(job_id),),
                 )
+                if completed_fingerprint is not None:
+                    _merge_completed_perception_glance_on_cursor(
+                        cur,
+                        user_id=user_id,
+                        source_job_id=int(job_id),
+                        fingerprint=completed_fingerprint,
+                    )
                 if clear_wake_backoff:
                     _clear_wake_backoff_on_cursor(cur, user_id)
                 if has_late_input:

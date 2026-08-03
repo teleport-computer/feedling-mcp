@@ -5,6 +5,7 @@ from collections.abc import Mapping, Sequence
 import hashlib
 import json
 import math
+import sys
 from typing import Any, Callable
 
 _HEALTH_SIGNALS = ("steps", "sleep", "workout", "vitals", "activity", "body", "metabolic", "cycle")
@@ -22,7 +23,14 @@ _EVENT_FIELDS = {
 
 
 def _finite_number(value: Any) -> bool:
-    return type(value) in {int, float} and math.isfinite(float(value))
+    if type(value) is int:
+        # Preserve the projector's historical "finite float" input range
+        # without coercing an arbitrary-precision int through float(), which
+        # raises OverflowError for malformed giant values.
+        return -sys.float_info.max <= value <= sys.float_info.max
+    if type(value) is float:
+        return math.isfinite(value)
+    return False
 
 
 def _text(value: Any) -> bool:
@@ -89,7 +97,7 @@ def _available(
 
 
 def _positive_count(value: Any) -> bool:
-    return _finite_number(value) and float(value) > 0
+    return _finite_number(value) and value > 0
 
 
 def build_perception_glance(
