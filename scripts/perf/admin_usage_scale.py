@@ -75,6 +75,16 @@ def timing_summary(samples_ms: list[float]) -> dict[str, Any]:
     }
 
 
+def _formal_gate_passed(cohorts: dict[str, Any]) -> bool:
+    required = {"unfiltered", "provider_model_filtered"}
+    return set(cohorts) == required and all(
+        cohort["timing"]["p95_ms"] < P95_BUDGET_MS
+        and cohort["attempt_ledger_statement_count"] == 1
+        and cohort["attempt_runtime_job_index_used"] is True
+        for cohort in cohorts.values()
+    )
+
+
 def assert_content_free_metric_sql(statements: list[tuple[str, tuple[Any, ...]]]) -> None:
     """Reject content-bearing columns without requiring a raw-table branch."""
     reporting_sql = [
@@ -1089,10 +1099,7 @@ def _run(args) -> int:
                     "residual_counts": after_cleanup,
                 }
 
-    evidence["passed"] = all(
-        cohort["timing"]["p95_ms"] < P95_BUDGET_MS
-        for cohort in evidence["cohorts"].values()
-    )
+    evidence["passed"] = _formal_gate_passed(evidence["cohorts"])
     rendered = json.dumps(evidence, indent=2, sort_keys=True, default=str) + "\n"
     if args.output:
         Path(args.output).write_text(rendered, encoding="utf-8")

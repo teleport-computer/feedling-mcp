@@ -82,4 +82,6 @@ results. Run the approved rolling 90-day gate in the dedicated local database:
 The harness records the exact attempt row count, rows matched by the 90-day job
 cohort, valid partial-index definition, one attempt-ledger statement per cohort,
 attempt relation scan nodes, whether the runtime-job index was selected, and
-post-cascade residual counts.
+post-cascade residual counts. Formal success requires both cohorts to stay below
+the p95 budget, execute exactly one attempt-ledger statement, and select the
+runtime-job index.

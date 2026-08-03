@@ -88,6 +88,22 @@ def test_admin_usage_scale_attempt_fixture_is_explicit_and_bounded():
             harness._resolve_attempt_rows(3_000_000, invalid)
 
 
+def test_admin_usage_scale_formal_gate_requires_attempt_index_for_both_cohorts():
+    harness = _load_usage_scale_harness()
+    cohorts = {
+        name: {
+            "timing": {"p95_ms": 2_999.0},
+            "attempt_ledger_statement_count": 1,
+            "attempt_runtime_job_index_used": True,
+        }
+        for name in ("unfiltered", "provider_model_filtered")
+    }
+
+    assert harness._formal_gate_passed(cohorts) is True
+    cohorts["provider_model_filtered"]["attempt_runtime_job_index_used"] = False
+    assert harness._formal_gate_passed(cohorts) is False
+
+
 def test_admin_usage_scale_seeds_and_cleans_content_free_attempt_fixture():
     harness = _load_usage_scale_harness()
     prefix = "scale_usage_unit_attempt_"
