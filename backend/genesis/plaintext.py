@@ -50,6 +50,13 @@ _MATERIAL_KIND_BY_FAMILY = {
     "memory_summary": "memory_summary",
     "history": "chat_history",
 }
+_FAST_DISTILL_MODEL_BY_PROVIDER = {
+    "anthropic": "claude-haiku-4-5",
+    "deepseek": "deepseek-v4-flash",
+    "gemini": "gemini-flash-lite-latest",
+    "openai": "gpt-4o-mini",
+    "openrouter": "anthropic/claude-haiku-4-5",
+}
 
 
 class MaterialEmptyError(ValueError):
@@ -311,15 +318,35 @@ def _estimate_plaintext_materials(prepared: dict) -> tuple[list[dict], int]:
     return materials, sum(item["est_tokens"] for item in materials)
 
 
+def _queued_plaintext_materials(source_groups: list[dict]) -> list[dict]:
+    materials: list[dict] = []
+    for group in source_groups:
+        if not isinstance(group, dict):
+            continue
+        total = len([
+            text for text in group.get("chunk_texts") or []
+            if str(text or "").strip()
+        ])
+        if not total:
+            continue
+        family = str(group.get("source_family") or "history")
+        materials.append({
+            "kind": _MATERIAL_KIND_BY_FAMILY.get(family, family),
+            "status": "queued",
+            "windows_done": 0,
+            "windows_total": total,
+            "cards": 0,
+        })
+    return materials
+
+
 def _recommended_distill_model(store, api_key: str | None) -> str | None:
     runtime = hosted_config_store._load_runtime_provider_config(store, api_key)
     if isinstance(runtime, tuple):
         return None
     provider = provider_client.normalize_provider(runtime.provider)
-    if provider == "openrouter":
-        return "anthropic/claude-haiku-4-5"
-    if provider == "anthropic":
-        return "claude-haiku-4-5"
+    if provider in _FAST_DISTILL_MODEL_BY_PROVIDER:
+        return _FAST_DISTILL_MODEL_BY_PROVIDER[provider]
     if provider != "openai_compatible":
         return None
     try:
@@ -523,7 +550,7 @@ class _PlaintextCheckpointProgress:
                     if isinstance(outputs.get(checkpoint.task_key(task_id, idx)), dict)
                 )
             materials.append({
-                "kind": "chat_history" if family == "history" else family,
+                "kind": _MATERIAL_KIND_BY_FAMILY.get(family, family),
                 "status": status,
                 "windows_done": done,
                 "windows_total": total,

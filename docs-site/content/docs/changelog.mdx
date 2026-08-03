@@ -28,9 +28,10 @@ change must not be interpreted as an API guarantee.
 - **Genesis onboarding supports estimate then commit.** Managed clients can
   encrypted-stage onboarding material and receive per-material window/token
   estimates without an LLM call, then commit the `staged_id` with an optional
-  job-only model override. Fast-model recommendations use the configured
-  provider, including a three-second catalog probe for compatible relays. Job
-  status now exposes ordered material progress, real candidate-card counts,
+  job-only model override. Fast-model recommendations cover Anthropic,
+  DeepSeek, Gemini, OpenAI, and OpenRouter, with a three-second catalog probe
+  for compatible relays. Job status immediately exposes every material as
+  queued, followed by ordered progress and real candidate-card counts,
   `identity_ready`, and cause-aware failure fields. Missing, consumed, and
   expired stages have distinct 4xx errors.
 

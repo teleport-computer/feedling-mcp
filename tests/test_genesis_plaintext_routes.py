@@ -242,20 +242,28 @@ def test_plaintext_import_returns_genesis_job_and_does_not_persist_raw(monkeypat
         return job, 201
 
     monkeypatch.setattr(plaintext.service, "create_import_job", fake_create)
-    monkeypatch.setattr(
-        plaintext.db,
-        "genesis_set_job_status",
-        lambda _user_id, _job_id, **_kwargs: {
+    status_updates = []
+
+    def set_status(_user_id, _job_id, **kwargs):
+        status_updates.append(kwargs)
+        return {
             "job_id": "genesis_job_1",
             "status": "processing",
             "metadata": captured["create_payload"]["metadata"],
             "source_kind": captured["create_payload"]["source_kind"],
             "privacy_mode": service.PRIVACY_MODE,
-        },
+            "output": kwargs["output"],
+        }
+
+    monkeypatch.setattr(
+        plaintext.db,
+        "genesis_set_job_status",
+        set_status,
     )
     monkeypatch.setattr(plaintext.service, "write_genesis_state", lambda *_args, **_kwargs: None)
 
     def fake_start(_store, _api_key, job, *, mode="onboarding", chunk_texts, source_kind, source_groups=None, relationship_anchor=None, analysis_messages=None):
+        assert status_updates
         captured["started"] = {
             "job_id": job["job_id"],
             "mode": mode,
@@ -275,6 +283,26 @@ def test_plaintext_import_returns_genesis_job_and_does_not_persist_raw(monkeypat
     assert body["job"]["job_id"] == "genesis_job_1"
     assert body["status"] == "processing"
     assert body["privacy_copy"] == service.PRIVACY_COPY
+    assert body["job"]["output"] == {
+        "stage": "plaintext_queued",
+        "identity_ready": False,
+        "materials": [
+            {
+                "kind": "ai_persona",
+                "status": "queued",
+                "windows_done": 0,
+                "windows_total": 1,
+                "cards": 0,
+            },
+            {
+                "kind": "chat_history",
+                "status": "queued",
+                "windows_done": 0,
+                "windows_total": 1,
+                "cards": 0,
+            },
+        ],
+    }
     assert captured["started"]["job_id"] == "genesis_job_1"
     assert captured["started"]["mode"] == "onboarding"
     assert len(captured["started"]["chunk_texts"]) <= 8
@@ -628,11 +656,19 @@ def test_plaintext_commit_applies_job_model_override_and_consumes_stage(monkeypa
         return ({"job_id": "job_commit", "status": "processing", "metadata": payload["metadata"]}, 201)
 
     monkeypatch.setattr(plaintext.service, "create_import_job", fake_create)
+
+    def set_status(*_args, **kwargs):
+        captured["queued_output"] = kwargs["output"]
+        return {
+            "job_id": "job_commit",
+            "status": "processing",
+            "metadata": captured["metadata"],
+            "output": kwargs["output"],
+        }
+
     monkeypatch.setattr(
         plaintext.db, "genesis_set_job_status",
-        lambda *_args, **_kwargs: {
-            "job_id": "job_commit", "status": "processing", "metadata": captured["metadata"]
-        },
+        set_status,
     )
     monkeypatch.setattr(plaintext.service, "write_genesis_state", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(plaintext, "_start_plaintext_genesis_job", lambda *_args, **_kwargs: True)
@@ -645,6 +681,15 @@ def test_plaintext_commit_applies_job_model_override_and_consumes_stage(monkeypa
     assert resp.status_code == 202
     assert captured["metadata"]["distill_model"] == "anthropic/claude-haiku-4-5"
     assert captured["consumed"] == ("staged_1", "job_commit")
+    assert captured["queued_output"]["materials"] == [{
+        "kind": "chat_history",
+        "status": "queued",
+        "windows_done": 0,
+        "windows_total": 1,
+        "cards": 0,
+    }]
+    response_materials = resp.get_json()["job"]["output"]["materials"]
+    assert response_materials == captured["queued_output"]["materials"]
 
 
 @pytest.mark.parametrize(
@@ -738,6 +783,35 @@ def test_recommended_distill_model_catalog_priority(monkeypatch):
 
     assert plaintext._recommended_distill_model(_store(), "key") == "vendor/haiku-fast"
     assert captured["total_budget_sec"] == 3.0
+
+
+@pytest.mark.parametrize(
+    ("provider", "expected"),
+    [
+        ("anthropic", "claude-haiku-4-5"),
+        ("deepseek", "deepseek-v4-flash"),
+        ("gemini", "gemini-flash-lite-latest"),
+        ("openai", "gpt-4o-mini"),
+        ("openrouter", "anthropic/claude-haiku-4-5"),
+        ("bedrock", None),
+    ],
+)
+def test_recommended_distill_model_provider_defaults(monkeypatch, provider, expected):
+    runtime = plaintext.provider_client.ProviderConfig(
+        provider, "chat-model", "secret", "https://provider.example/v1")
+    monkeypatch.setattr(
+        plaintext.hosted_config_store,
+        "_load_runtime_provider_config",
+        lambda *_args: runtime,
+    )
+    monkeypatch.setattr(
+        plaintext.provider_client,
+        "list_provider_models",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("dedicated providers must not probe a relay catalog")),
+    )
+
+    assert plaintext._recommended_distill_model(_store(), "key") == expected
 
 
 def test_plaintext_estimate_recommendation_failure_degrades_to_null(monkeypatch):

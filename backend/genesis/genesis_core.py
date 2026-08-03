@@ -749,6 +749,11 @@ def plaintext_import(
     except ValueError as e:
         _log_plaintext_import_rejected(store, mode=mode, reason=str(e), payload=payload)
         return _bad_from_value_error(e, 400)
+    queued_output = {
+        "stage": "plaintext_queued",
+        "materials": plaintext_helpers._queued_plaintext_materials(prepared["source_groups"]),
+        "identity_ready": False,
+    }
 
     if existing:
         existing_metadata = (
@@ -765,7 +770,7 @@ def plaintext_import(
                 store.user_id,
                 str(existing.get("job_id") or ""),
                 status="processing",
-                output={"stage": "plaintext_queued"},
+                output=queued_output,
             ) or existing
         except db.GenesisPlaintextJobActive as e:
             return _bad("import_job_active", 409, active_job_id=e.active_job_id)
@@ -811,7 +816,7 @@ def plaintext_import(
         store.user_id,
         str(job.get("job_id") or ""),
         status="processing",
-        output={"stage": "plaintext_queued"},
+        output=queued_output,
     ) or job
     service.write_genesis_state(store, job, status="processing")
     start_job(
