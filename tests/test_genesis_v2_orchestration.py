@@ -675,9 +675,8 @@ def test_v2_fresh_start_with_empty_core_still_greets(monkeypatch):
     assert calls["greeting"] == "你好，很高兴认识你。我现在还没有名字，你想以后怎么称呼我？"
     assert calls.get("used_apply_reducer") is True               # nameless done
     # No material by definition -> background enrichment must NOT run: it would
-    # re-reduce the pure sentinel as history with write_identity=True (prod runs
-    # WITHOUT FEEDLING_GENESIS_COMBINED_MAP, so that path is reachable there)
-    # and could invent persona/identity from synthetic text.
+    # re-reduce the pure sentinel as history with write_identity=True and could
+    # invent persona/identity from synthetic text, regardless of deployment flags.
     assert "bg_write_identity" not in calls
 
 
