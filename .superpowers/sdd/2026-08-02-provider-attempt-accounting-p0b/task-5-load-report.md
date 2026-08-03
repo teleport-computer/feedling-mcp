@@ -431,3 +431,49 @@ table, and zero dirty days. User/turn/attempt hash sums remained respectively
 `-4676877262142338493875`; both watermark JSON witnesses were byte-for-byte
 unchanged. The retained 0076 source and existing 0077 derived fixture therefore
 remain intact.
+
+## Narrow call-dimensions TEMP checkpoint: failed
+
+The approved single-run narrow checkpoint executed against the unchanged
+retained local 3M fixture and failed closed. Its atomic artifact is
+`/private/tmp/2026-08-04-narrow-call-temp-probe.json`. This experiment created
+session-local TEMP relations only; it did not change production code, Alembic,
+the TEE registry, deployment, or infrastructure.
+
+All non-query feasibility witnesses passed:
+
+- the narrow relation contained exactly 731,199 rows;
+- heap/index/total sizes were 285,523,968 / 324,993,024 / 610,615,296 bytes;
+- total storage was 89,384,704 bytes below the 700,000,000-byte cap and
+  94,484,480 bytes below the strict 705,099,776-byte membership-ratio boundary;
+- all 366 Shanghai local-day builds completed, with total 255,868.941ms,
+  p50 665.630ms, p95 844.285ms, and max 988.031ms, far below the unchanged
+  120,000ms per-day maintenance limit;
+- the bounded raw edge was exact at 8,208 attempts and 8,208 logical calls;
+- the runtime adversarial witness was exact: five narrow rows, three cohort
+  calls, four requested calls, one outer gap, and one inner gap;
+- both candidate statements retained the forbidden-path guard: no memberships,
+  `count(DISTINCT ...)`, or lateral scope expansion.
+
+The hard query gate failed immediately for the unfiltered cohort. Interleaved
+order was A1 bounded unions followed by A2 grouping sets. Each shape's first
+sample, named `first_execution_after_build_analyze` (not a physical cold-cache
+claim), was cancelled by PostgreSQL at the unchanged strict 3,000ms statement
+timeout. Neither shape therefore had a complete six-sample matrix or could be
+eligible. Per the fail-closed plan, the old 180,000ms reference and the filtered
+cohort were skipped rather than spending more work after neither approach
+could pass. There was no rerun, timeout increase, budget relaxation, or attempt
+to select a partial result.
+
+Failure cleanup evidence is complete. The post witness ran in `finally`; all
+persistent counts, source hash sums, and both watermark JSON witnesses exactly
+matched the pre witness. The TEMP session then closed, and a fresh connection
+found no persistent probe objects. The retained fixture remains at 2,000 users,
+3,000,000 turns, attempts, and memberships, 731,199 rows in all three daily
+relations, zero corrections/rate cards/dirty days, and one row in each
+watermark table.
+
+This is a hard stop for approach A. The passing storage/build/raw/exactness
+sub-gates do not authorize production implementation because neither query
+shape met the strict delivery-latency gate. No production plan or production
+file follows from this checkpoint.
