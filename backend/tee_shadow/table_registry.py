@@ -138,6 +138,10 @@ REGISTRY: dict[str, Entry] = {
     "chat_r2_lifecycle": Entry(SNAPSHOT, "R2 生命周期状态，UPDATE 密集，明文"),
     "dau_daily_snapshot": Entry(SNAPSHOT, "DAU 日快照，每日批量写，明文"),
     "model_api_routes": Entry(SNAPSHOT, "BYOK 路由配置（不含凭证，凭证在 model_api_credentials），明文"),
+    "perception_signal_state_v2": Entry(
+        SNAPSHOT,
+        "V2 感知去重基线，频繁原地 UPDATE；只含 HMAC 指纹、事件标识与时间戳，明文整表收敛",
+    ),
     "provider_health": Entry(SNAPSHOT, "provider 健康状态，UPDATE 密集，明文"),
     "retention_cohort_snapshot": Entry(SNAPSHOT, "留存 cohort 快照，批量写，明文"),
     "runtime_state": Entry(SNAPSHOT, "runtime 状态 state_json，UPDATE 密集，明文"),

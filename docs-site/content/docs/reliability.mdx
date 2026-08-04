@@ -139,8 +139,9 @@ raw message count. Foreground Chat targets up to 40 turns; heartbeat,
 agent-scheduled, manual, and screen-watch wakes target up to 16. A smaller
 provider window may reduce the replay to the largest newest suffix that fits,
 but only after those rows are durably represented by the encrypted summary.
-The summary, every uncovered source row, the current request or wake nudge, and
-the provider-native tool transcript remain required and are never clipped.
+The summary, every uncovered source row, the current request or labeled wake
+application data, and the provider-native tool transcript remain required and
+are never clipped.
 This keeps the union of summary coverage and exact rows complete even when
 optional replay shrinks between provider rounds.
 
@@ -218,6 +219,26 @@ and is capped at one hour; a successful automatic wake clears it. A new
 genuine user message invalidates an older delay immediately. Manual wakes and
 screen-watch events bypass this short-horizon guard. Sustained provider
 failures remain the responsibility of the separate provider health circuit.
+
+Automatic heartbeat authorization is content-free and fail-closed: the worker
+checks PostgreSQL for at least one genuine user-authored Chat row before loading
+workspace context, attempting prompt compaction, or calling a model. Encrypted
+summary coverage and assistant-only rows cannot authorize first contact.
+
+Perception anchor baselines are keyed with `FEEDLING_RUNTIME_TOKEN_SECRET` and
+store an opaque key ID. To rotate that secret without false arrival notices,
+deploy the new secret together with the immediately previous value in
+`FEEDLING_RUNTIME_TOKEN_SECRET_PREVIOUS`, retain the previous value through the
+rolling deployment, then remove it only after every old backend worker has
+stopped. Workers
+that encounter an unknown key ID suppress the signal decision without mutating
+the row by default. Dormant rows cannot be proven equal without their next
+observation: after the fleet is fully on the new code/secret, operators may
+temporarily set `FEEDLING_PERCEPTION_REBASELINE_UNKNOWN_KEYS=1`. The next fresh
+observation replaces each unknown-key row with a non-waking current-key
+baseline. Keep the switch off during mixed-version operation, monitor counts by
+opaque key ID until no old rows remain, then turn it off again. Do not rotate
+through another key while convergence is incomplete.
 
 ## Retry safety
 

@@ -365,7 +365,11 @@ def ingest_snapshot_v2(
                         "data": json.dumps(_storage_value_for_decrypted_signal_v2(key, values)),
                         "message": msg,
                     })
-                    if key == "location_signal" and signal.changed is True:
+                    # The client flag is only an upload hint. Every decrypted,
+                    # nonempty anchor must reach the durable decision boundary
+                    # so a first `changed=false` report still establishes the
+                    # server-owned baseline.
+                    if key == "location_signal":
                         location_anchor_observations.append((key, values))
                 else:
                     _record_decrypt_failure_v2(user_id, key, err, now)
@@ -403,6 +407,8 @@ def ingest_device_event_v2(user_id: str, event: dict) -> dict:
             observation.value,
             ts=float((event or {}).get("ts") or _now()),
             origin_refs=observation.origin_refs,
+            source_event_id=observation.source_event_id,
+            allow_first_event=observation.allow_first_event,
             submit_wake=_submit_wake_event_v2_compat,
         )
         submitted += len(result.wake_events)
@@ -1183,6 +1189,8 @@ def photo_evaluate(user_id: str, metadata: dict,
                 {"photo_id": photo_id, "sensitive": sensitive},
                 ts=now,
                 origin_refs=(f"photo:{photo_id}",),
+                source_event_id=photo_id,
+                allow_first_event=True,
                 submit_wake=_submit_wake_event_v2_compat,
             )
     else:

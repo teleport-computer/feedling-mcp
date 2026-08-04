@@ -3779,6 +3779,9 @@ def build_production_deps() -> v2_worker.TurnDeps:
                 core_store.get_store(user_id)
             )
         ),
+        has_genuine_user_history=lambda user_id: (
+            db.chat_latest_genuine_user_ts(user_id) is not None
+        ),
         # ``is True``, never bool(...): strict booleans all the way down, so a
         # corrupt setting cannot read as web access switched ON.
         web_tools_enabled=lambda user_id: (

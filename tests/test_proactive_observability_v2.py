@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
 from perception.differ_v2 import PerceptionDifferV2
+from perception.signal_state_v2 import SignalObservationDecision
 from proactive.background_v2 import BackgroundWorkerV2, InMemoryBackgroundJobStoreV2
 from proactive.observability_v2 import (
     InMemoryMetricsSinkV2,
@@ -75,7 +77,23 @@ def test_background_metrics_capture_append_success_and_stale_completion():
 
 def test_phash_metrics_capture_scene_change_and_dedupe_rate():
     metrics = InMemoryMetricsSinkV2()
-    differ = PerceptionDifferV2(metrics_sink=metrics)
+    outcomes = iter(("changed", "duplicate", "changed"))
+
+    def observe_state(_uid, _signal, _value, *, observed_at, **_kwargs):
+        outcome = next(outcomes)
+        observed = datetime.fromtimestamp(observed_at, tz=timezone.utc)
+        return SignalObservationDecision(
+            outcome=outcome,
+            changed=outcome == "changed",
+            fingerprint="test-fingerprint",
+            last_seen_at=observed,
+            last_changed_at=observed,
+        )
+
+    differ = PerceptionDifferV2(
+        metrics_sink=metrics,
+        observe_state=observe_state,
+    )
 
     first = differ.observe("u1", "screen_phash", "hash_a", ts=1.0)
     second = differ.observe("u1", "screen_phash", "hash_a", ts=2.0)
@@ -102,4 +120,3 @@ def test_cross_wake_metrics_cover_double_send_and_missed_scheduled_rates():
     assert health.double_send_count == 1
     assert health.missed_scheduled_wake_count == 1
     assert health.missed_scheduled_wake_rate == 0.5
-
