@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Recover original cards after the 2026-08 Runtime V2 Dream churn incident.
 
-This tool is intentionally test-only, single-user, dry-run by default, and
-never deletes rows.  It restores superseded non-Dream cards and soft-retires
-Dream-authored churn cards while preserving every ciphertext envelope for
-audit/reversal.
+This tool is intentionally operator-only, single-user, dry-run by default, and
+never deletes rows. It restores cards superseded during the selected incident
+window and soft-retires Dream-authored churn cards while preserving every
+ciphertext envelope for audit/reversal.
 
 Examples:
     python tools/recover_memory_dream_churn.py \
@@ -13,6 +13,9 @@ Examples:
     python tools/recover_memory_dream_churn.py \
       --env test --user-id usr_f10e9fd5ebd63ea0 --apply \
       --confirm-user-id usr_f10e9fd5ebd63ea0 --confirm-churn-stopped
+
+    python tools/recover_memory_dream_churn.py \
+      --env prod --user-id usr_81a0645d0d9c0746 --since 2026-07-29
 """
 
 from __future__ import annotations
@@ -68,6 +71,27 @@ def _is_active(doc: dict[str, Any]) -> bool:
     )
 
 
+def _iso_datetime(value: str) -> datetime:
+    raw = str(value or "").strip()
+    if not raw:
+        raise argparse.ArgumentTypeError("ISO date/time is required")
+    try:
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"invalid ISO date/time: {raw}") from exc
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _at_or_after(value: Any, since: datetime) -> bool:
+    try:
+        parsed = _iso_datetime(str(value or ""))
+    except argparse.ArgumentTypeError:
+        return False
+    return parsed >= since
+
+
 def summarize(docs: list[dict[str, Any]]) -> dict[str, Any]:
     sources = Counter(_source(doc) for doc in docs)
     active_sources = Counter(_source(doc) for doc in docs if _is_active(doc))
@@ -88,7 +112,7 @@ def summarize(docs: list[dict[str, Any]]) -> dict[str, Any]:
 
 
 def recovery_plan(
-    docs: list[dict[str, Any]], *, now_iso: str
+    docs: list[dict[str, Any]], *, now_iso: str, since: datetime | None = None
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     restored = 0
     retired_dream = 0
@@ -96,7 +120,14 @@ def recovery_plan(
     updated: list[dict[str, Any]] = []
     for original in docs:
         doc = dict(original)
-        if _is_dream(doc):
+        dream_created_in_window = _is_dream(doc) and (
+            since is None or _at_or_after(doc.get("created_at"), since)
+        )
+        superseded_in_window = (
+            str(doc.get("status") or "").strip().lower() == "superseded"
+            and (since is None or _at_or_after(doc.get("archived_at"), since))
+        )
+        if dream_created_in_window:
             before = dict(doc)
             doc["status"] = "superseded"
             doc["is_archived"] = True
@@ -107,7 +138,7 @@ def recovery_plan(
                 retired_dream += 1
             else:
                 untouched += 1
-        elif str(doc.get("status") or "").strip().lower() == "superseded":
+        elif superseded_in_window:
             doc["status"] = "active"
             doc["is_archived"] = False
             doc.pop("superseded_by", None)
@@ -132,6 +163,12 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--env", choices=("test", "prod"), required=True)
     parser.add_argument("--user-id", required=True)
+    parser.add_argument(
+        "--since",
+        type=_iso_datetime,
+        default=None,
+        help="Only undo churn at or after this ISO date/time (inclusive).",
+    )
     parser.add_argument("--apply", action="store_true")
     parser.add_argument("--confirm-user-id", default="")
     parser.add_argument("--confirm-churn-stopped", action="store_true")
@@ -159,11 +196,16 @@ def main() -> int:
                 (args.user_id,),
             ).fetchall()
             docs = [dict(row["doc"] or {}) for row in rows]
-            updated, plan = recovery_plan(docs, now_iso=now_iso)
+            updated, plan = recovery_plan(docs, now_iso=now_iso, since=args.since)
             report = {
                 "environment": args.env,
                 "user_id": args.user_id,
                 "mode": "apply" if args.apply else "dry-run",
+                "since": (
+                    args.since.isoformat().replace("+00:00", "Z")
+                    if args.since is not None
+                    else None
+                ),
                 "before": summarize(docs),
                 "plan": plan,
                 "after": summarize(updated),
