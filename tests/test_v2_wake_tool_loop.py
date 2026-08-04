@@ -8,10 +8,9 @@ boundary stubbed is `provider_client.chat_completion_async` (the LLM wire
 specific round shapes).
 
 Key wake-specific differences from the chat lane, both asserted here:
-- No required user message: `_run_wake` always seeds a fixed `_WAKE_NUDGE`
-  user-role turn, so the old `ResponderError("no_user_messages")` guard has no
-  analogue in the tool-loop version — a wake turn is valid even with an empty
-  coalesce/fold.
+- No synthetic user message: explicitly scheduled/manual wakes can run on an
+  empty coalesce/fold, while an ordinary heartbeat with no real chat history
+  completes without calling the provider.
 - An empty terminal reply is NOT a no-filler failure here (unlike chat) — it's
   a legitimate "weak wake sleeps": the job still completes, with zero bubbles.
 """
@@ -221,7 +220,10 @@ def test_wake_terminal_plain_text_writes_exactly_one_proactive_bubble(monkeypatc
 
     calls = _script_provider(monkeypatch, [_text_round("hey, thinking of you")])
     sink_calls = []
-    deps = _wake_deps(tail=[], sink_calls=sink_calls)
+    deps = _wake_deps(
+        tail=[{"id": "m1", "ts": 1.0, "role": "user", "content": "hi"}],
+        sink_calls=sink_calls,
+    )
     trajectory = _TrajectoryCapture()
 
     # Through process_job (not a direct _run_wake call) so a `TurnMetrics`
@@ -277,7 +279,10 @@ def test_wake_empty_terminal_text_completes_with_zero_bubbles(monkeypatch):
         lambda *a, **k: surface_called.update(n=surface_called["n"] + 1))
 
     sink_calls = []
-    deps = _wake_deps(tail=[], sink_calls=sink_calls)
+    deps = _wake_deps(
+        tail=[{"id": "m1", "ts": 1.0, "role": "user", "content": "hi"}],
+        sink_calls=sink_calls,
+    )
     status = asyncio.run(worker._run_wake(
         job_id, uid, "heartbeat", deps, _BYOK, worker.ENCLAVE_SEMAPHORE, str(job["claimed_by"])))
 
@@ -290,8 +295,8 @@ def test_wake_empty_terminal_text_completes_with_zero_bubbles(monkeypatch):
 
 
 # ------------------------------------------------------------------
-# No required user message: an empty tail still completes (the nudge alone
-# satisfies build_turn_messages's "at least one non-system turn").
+# Explicitly scheduled wakes remain valid without real chat history and do not
+# manufacture a user request.
 # ------------------------------------------------------------------
 
 def test_wake_empty_tail_still_completes_no_no_user_messages_guard(monkeypatch):
@@ -310,7 +315,7 @@ def test_wake_empty_tail_still_completes_no_no_user_messages_guard(monkeypatch):
 
     monkeypatch.setattr(provider_client, "chat_completion_async", _fake)
 
-    deps = _wake_deps(tail=[])  # zero real tail rows: only the nudge should be present
+    deps = _wake_deps(tail=[])
     status = asyncio.run(worker._run_wake(
         job_id, uid, "scheduled", deps, _BYOK, worker.ENCLAVE_SEMAPHORE, str(job["claimed_by"])))
 
@@ -326,8 +331,8 @@ def test_wake_empty_tail_still_completes_no_no_user_messages_guard(monkeypatch):
             v2_context.TEMPORAL_CONTEXT_HEADER
         )
     ]
-    assert len(conversation_messages) == 1
-    assert conversation_messages[0]["role"] == "user"
+    assert conversation_messages == []
+    assert not any(message.get("role") == "user" for message in seen["messages"])
 
 
 # ------------------------------------------------------------------
@@ -783,7 +788,10 @@ def _wake_offered(monkeypatch, *, user_enabled: bool, uid: str) -> set[str]:
     _patch_real_write(monkeypatch)
 
     calls = _script_provider(monkeypatch, [_text_round("hey")])
-    deps = _wake_deps(tail=[], sink_calls=[])
+    deps = _wake_deps(
+        tail=[{"id": "m1", "ts": 1.0, "role": "user", "content": "hi"}],
+        sink_calls=[],
+    )
     deps.web_tools_enabled = lambda uid_: user_enabled
 
     status = asyncio.run(worker.process_job(

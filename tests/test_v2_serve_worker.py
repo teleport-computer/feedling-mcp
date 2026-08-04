@@ -428,7 +428,7 @@ def test_main_rejects_invalid_fleet_identity_before_schema_mutation(monkeypatch)
     assert schema_calls == []
 
 
-def test_build_production_deps_returns_turndeps():
+def test_build_production_deps_returns_turndeps(monkeypatch):
     deps = serve_worker.build_production_deps()
     assert isinstance(deps, worker.TurnDeps)
     assert callable(deps.read_messages)
@@ -441,6 +441,19 @@ def test_build_production_deps_returns_turndeps():
     assert callable(deps.read_compaction_tail_after_seq)
     assert callable(deps.read_temporal_snapshot)
     assert callable(deps.read_summary_with_seq)
+    assert callable(deps.has_genuine_user_history)
+    monkeypatch.setattr(
+        serve_worker.db,
+        "chat_latest_genuine_user_ts",
+        lambda _user_id: None,
+    )
+    assert deps.has_genuine_user_history("u-no-history") is False
+    monkeypatch.setattr(
+        serve_worker.db,
+        "chat_latest_genuine_user_ts",
+        lambda _user_id: 123.0,
+    )
+    assert deps.has_genuine_user_history("u-has-history") is True
 
 
 def test_wire_assembly_injects_envelope_pubkey_getter():

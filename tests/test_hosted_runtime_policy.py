@@ -602,7 +602,7 @@ def test_main_compose_serve_worker_wires_memory_maintenance_producers():
             "${FEEDLING_V2_CAPTURE_ENABLED:-1}"
         ), name
         expected_dream = (
-            "${FEEDLING_V2_DREAM_ENABLED:-0}"
+            "1"
             if name == "docker-compose.phala.test.yaml"
             else "${FEEDLING_V2_DREAM_ENABLED:-1}"
         )

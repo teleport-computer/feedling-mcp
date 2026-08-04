@@ -1684,7 +1684,9 @@ def test_run_wake_records_whole_turn_metric_on_success(monkeypatch):
         read_messages=lambda uid_: [],
         resolve_provider=lambda uid_: (_BYOK, {}),
         mint_enclave_token=lambda uid_: "rt",
-        read_tail=lambda uid_, after_ts, limit: [],
+        read_tail=lambda uid_, after_ts, limit: [
+            {"id": "m1", "ts": 1.0, "role": "user", "content": "hi"}
+        ],
         read_summary=lambda uid_: ("", 0.0, 0),
         apply_pending_effects=_apply_effects,
     )
@@ -1723,7 +1725,9 @@ def test_run_wake_weak_wake_still_records_whole_turn_metric_with_call_counted(mo
         read_messages=lambda uid_: [],
         resolve_provider=lambda uid_: (_BYOK, {}),
         mint_enclave_token=lambda uid_: "rt",
-        read_tail=lambda uid_, after_ts, limit: [],
+        read_tail=lambda uid_, after_ts, limit: [
+            {"id": "m1", "ts": 1.0, "role": "user", "content": "hi"}
+        ],
         read_summary=lambda uid_: ("", 0.0, 0),
         apply_pending_effects=_apply_effects,
     )
@@ -2381,7 +2385,9 @@ def test_wake_turn_system_prompt_states_the_live_third_party_model(monkeypatch):
         read_messages=lambda uid_: [],
         resolve_provider=lambda uid_: (_THIRD_PARTY, {}),
         mint_enclave_token=lambda uid_: "rt",
-        read_tail=lambda uid_, after_ts, limit: [],
+        read_tail=lambda uid_, after_ts, limit: [
+            {"id": "m1", "ts": 1.0, "role": "user", "content": "hi"}
+        ],
         read_summary=lambda uid_: ("", 0.0, 0),
         apply_pending_effects=_apply_effects,
     )

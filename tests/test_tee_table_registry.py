@@ -73,6 +73,13 @@ def test_lanes_are_valid_and_reasons_nonempty():
     assert not no_reason, f"这些条目没写理由：{no_reason}"
 
 
+def test_perception_signal_state_uses_snapshot_lane():
+    """Mutable fingerprint state must converge; a SKIP/MIRROR lane can drift."""
+    entry = reg.REGISTRY.get("perception_signal_state_v2")
+    assert entry is not None
+    assert entry.lane == reg.SNAPSHOT
+
+
 def test_skip_entries_must_justify():
     """SKIP 是"这张表永远不进 TEE"的承诺，理由必须具体（不是"暂不需要"）。"""
     vague = {"暂不需要", "不需要", "TODO", "待定", "以后再说"}

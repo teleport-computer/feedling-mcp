@@ -1,13 +1,15 @@
 import json
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
-from perception import service  # noqa: E402
 from core import envelope as core_envelope  # noqa: E402
+from perception import ingress_v2, service  # noqa: E402
 from perception.differ_v2 import PerceptionDifferV2  # noqa: E402
+from perception.signal_state_v2 import SignalObservationDecision  # noqa: E402
 from perception.ingress_v2 import (  # noqa: E402
     device_event_observations_v2,
     observe_signal_v2,
@@ -24,6 +26,33 @@ def _load_fixture(name: str) -> dict:
 
 def _activate_proactive(monkeypatch) -> None:
     monkeypatch.setattr(service, "_proactive_activation_ready", lambda uid: True)
+
+
+def _scripted_state_observer(*steps):
+    remaining = iter(steps)
+
+    def observe(
+        _user_id,
+        _signal,
+        _value,
+        *,
+        observed_at,
+        source_event_id=None,
+        allow_first_event=False,
+    ):
+        del source_event_id, allow_first_event
+        outcome, last_changed_at = next(remaining)
+        seen = datetime.fromtimestamp(float(observed_at), tz=timezone.utc)
+        changed = datetime.fromtimestamp(float(last_changed_at), tz=timezone.utc)
+        return SignalObservationDecision(
+            outcome=outcome,
+            changed=outcome == "changed",
+            fingerprint="test-fingerprint",
+            last_seen_at=seen,
+            last_changed_at=changed,
+        )
+
+    return observe
 
 
 class _Store:
@@ -84,36 +113,65 @@ class _Store:
 
 
 def test_anchor_transition_wakes_once_and_repeat_only_updates_seen():
-    differ = PerceptionDifferV2()
+    user_id = "u1"
+    observe_state = _scripted_state_observer(
+        ("baseline_created", 10.0),
+        ("unchanged", 10.0),
+        ("changed", 30.0),
+    )
     wakes = []
 
     first = observe_signal_v2(
-        "u1",
+        user_id,
         "wifi_anchor",
         {"anchor_id": "wifi-home", "label": "home"},
         ts=10.0,
         origin_refs=("ios_report:location_signal",),
-        differ=differ,
+        differ=PerceptionDifferV2(observe_state=observe_state),
         submit_wake=wakes.append,
     )
     repeat = observe_signal_v2(
-        "u1",
+        user_id,
         "wifi_anchor",
         {"anchor_id": "wifi-home", "label": "home"},
         ts=20.0,
         origin_refs=("ios_report:location_signal",),
-        differ=differ,
+        differ=PerceptionDifferV2(observe_state=observe_state),
+        submit_wake=wakes.append,
+    )
+    moved = observe_signal_v2(
+        user_id,
+        "wifi_anchor",
+        {"anchor_id": "wifi-work", "label": "work"},
+        ts=30.0,
+        origin_refs=("ios_report:location_signal",),
+        differ=PerceptionDifferV2(observe_state=observe_state),
         submit_wake=wakes.append,
     )
 
-    assert len(first.wake_events) == 1
+    assert first.wake_events == ()
     assert repeat.wake_events == ()
+    assert len(moved.wake_events) == 1
     assert len(wakes) == 1
     assert wakes[0].trigger == "arrived_at_anchor"
     assert wakes[0].origin_refs == ("ios_report:location_signal",)
     assert "wifi_anchor" in wakes[0].change_digest
-    assert repeat.result.state.last_seen_ts == 20.0
-    assert repeat.result.state.last_changed_ts == 10.0
+    durable_projection = json.dumps(
+        {
+            "change_digest": wakes[0].change_digest,
+            "presence_hints": wakes[0].presence_hints,
+            "payload": wakes[0].payload,
+        },
+        sort_keys=True,
+    )
+    assert "wifi-home" not in durable_projection
+    assert "wifi-work" not in durable_projection
+    assert '"home"' not in durable_projection
+    assert '"work"' not in durable_projection
+    assert wakes[0].presence_hints == {"anchor_changed": True}
+    assert wakes[0].payload == {"anchor_changed": True}
+    assert moved.result.state.last_seen_ts == 30.0
+    assert moved.result.state.last_changed_ts == 30.0
 
 
 def test_continuous_signals_produce_zero_wakes_through_ingress():
@@ -392,6 +450,17 @@ def test_calendar_encrypted_body_missing_next_event_clears_old_next_event(monkey
 
 
 def test_location_signal_decrypt_feeds_wifi_anchor_differ_once(monkeypatch):
+    user_id = "u_wifi_anchor_decrypt"
+    observe_state = _scripted_state_observer(
+        ("baseline_created", 300.0),
+        ("unchanged", 300.0),
+        ("changed", 320.0),
+    )
+    monkeypatch.setattr(
+        ingress_v2,
+        "DEFAULT_DIFFER_V2",
+        PerceptionDifferV2(observe_state=observe_state),
+    )
     fake = _Store()
     emitted = []
     monkeypatch.setattr(service, "store", fake)
@@ -418,21 +487,31 @@ def test_location_signal_decrypt_feeds_wifi_anchor_differ_once(monkeypatch):
         return json.dumps(plaintext_by_id[envelope["id"]]).encode("utf-8")
 
     first = service.ingest_snapshot_v2(
-        "u_wifi_anchor_decrypt",
-        [{"key": "location_signal", "envelope": {"id": "loc_home_1", "body_ct": "Y3Q="}, "changed": True}],
+        user_id,
+        [{"key": "location_signal", "envelope": {"id": "loc_home_1", "body_ct": "Y3Q="}, "changed": False}],
         client_ts=300.0,
         api_key="api-key",
         decrypt_envelope=decrypt,
     )
+    monkeypatch.setattr(
+        ingress_v2,
+        "DEFAULT_DIFFER_V2",
+        PerceptionDifferV2(observe_state=observe_state),
+    )
     repeat = service.ingest_snapshot_v2(
-        "u_wifi_anchor_decrypt",
+        user_id,
         [{"key": "location_signal", "envelope": {"id": "loc_home_2", "body_ct": "Y3Q="}, "changed": True}],
         client_ts=310.0,
         api_key="api-key",
         decrypt_envelope=decrypt,
     )
+    monkeypatch.setattr(
+        ingress_v2,
+        "DEFAULT_DIFFER_V2",
+        PerceptionDifferV2(observe_state=observe_state),
+    )
     moved = service.ingest_snapshot_v2(
-        "u_wifi_anchor_decrypt",
+        user_id,
         [{"key": "location_signal", "envelope": {"id": "loc_work", "body_ct": "Y3Q="}, "changed": True}],
         client_ts=320.0,
         api_key="api-key",
@@ -442,10 +521,62 @@ def test_location_signal_decrypt_feeds_wifi_anchor_differ_once(monkeypatch):
     assert first["location_signal"] == "accepted"
     assert repeat["location_signal"] == "accepted"
     assert moved["location_signal"] == "accepted"
-    assert [event.trigger for event in emitted] == ["arrived_at_anchor", "arrived_at_anchor"]
+    assert [event.trigger for event in emitted] == ["arrived_at_anchor"]
     assert emitted[0].origin_refs == ("ios_report:location_signal",)
     assert "wifi_anchor" in emitted[0].change_digest
-    assert fake.get_state("u_wifi_anchor_decrypt")["wifi_anchor_id"]["v"] == "wifi-work"
+    assert fake.get_state(user_id)["wifi_anchor_id"]["v"] == "wifi-work"
+
+
+def test_location_snapshot_still_stores_when_durable_decision_fails_closed(monkeypatch):
+    """A DB decision error may suppress a wake, but must not reject the upload."""
+    fake = _Store()
+    emitted = []
+    monkeypatch.setattr(service, "store", fake)
+    monkeypatch.setattr(
+        service, "_submit_wake_event_v2_compat", lambda event: emitted.append(event)
+    )
+
+    def decision_error(_uid, _signal, _value, *, observed_at, **_kwargs):
+        del observed_at
+        return SignalObservationDecision(
+            outcome="error",
+            changed=False,
+            fingerprint=None,
+            last_seen_at=None,
+            last_changed_at=None,
+            error_code="storage_error",
+        )
+
+    monkeypatch.setattr(
+        ingress_v2,
+        "DEFAULT_DIFFER_V2",
+        PerceptionDifferV2(observe_state=decision_error),
+    )
+
+    def decrypt(_envelope, _api_key, *, purpose):
+        assert purpose == "perception:location_signal"
+        return json.dumps({
+            "values": {"wifi_anchor_id": "wifi-home", "place_label": "unknown"}
+        }).encode("utf-8")
+
+    result = service.ingest_snapshot_v2(
+        "u_location_fail_closed",
+        [{
+            "key": "location_signal",
+            "envelope": {"id": "location-1"},
+            "changed": True,
+        }],
+        client_ts=500.0,
+        api_key="api-key",
+        decrypt_envelope=decrypt,
+    )
+
+    assert result["location_signal"] == "accepted"
+    assert (
+        fake.get_state("u_location_fail_closed")["wifi_anchor_id"]["v"]
+        == "wifi-home"
+    )
+    assert emitted == []
 
 
 def test_snapshot_v2_records_an_audit_event_when_a_signal_fails_to_decrypt(monkeypatch):
@@ -564,6 +695,13 @@ def test_photo_added_wake_is_differ_event_with_digest_and_origin_refs(monkeypatc
     monkeypatch.setattr(service, "_settings_v2_for_user", lambda uid: None)
     monkeypatch.setattr(service, "_fire_wake_event_v2", lambda event: emitted.append(event))
     monkeypatch.setattr(service, "perception_ingress_runtime_v2_enabled", lambda user_or_store: True)
+    monkeypatch.setattr(
+        ingress_v2,
+        "DEFAULT_DIFFER_V2",
+        PerceptionDifferV2(
+            observe_state=_scripted_state_observer(("changed", service._now()))
+        ),
+    )
     _activate_proactive(monkeypatch)
 
     out, code = service.photo_evaluate(
@@ -666,11 +804,21 @@ def test_device_event_ingress_runs_even_when_the_chat_fence_says_legacy(monkeypa
 
 
 def test_device_event_phash_respects_broadcast_state(monkeypatch):
+    user_id = "u1"
     fake = _Store()
     emitted = []
     monkeypatch.setattr(service, "store", fake)
     monkeypatch.setattr(service, "_settings_v2_for_user", lambda uid: None)
     monkeypatch.setattr(service, "_fire_wake_event_v2", lambda event: emitted.append(event))
+    monkeypatch.setattr(
+        ingress_v2,
+        "DEFAULT_DIFFER_V2",
+        PerceptionDifferV2(
+            observe_state=_scripted_state_observer(
+                ("changed", 101.0), ("duplicate", 101.0)
+            )
+        ),
+    )
     _activate_proactive(monkeypatch)
 
     off_event = {
@@ -687,8 +835,14 @@ def test_device_event_phash_respects_broadcast_state(monkeypatch):
     }
 
     assert device_event_observations_v2(off_event) == ()
-    assert service.ingest_device_event_v2("u1", off_event) == {"observations": 0, "wake_events": 0}
-    assert service.ingest_device_event_v2("u1", on_event)["wake_events"] == 1
+    observations = device_event_observations_v2(on_event)
+    assert len(observations) == 1
+    assert observations[0].source_event_id == "evt_on"
+    assert observations[0].allow_first_event is True
+    assert service.ingest_device_event_v2(user_id, off_event) == {"observations": 0, "wake_events": 0}
+    assert service.ingest_device_event_v2(user_id, on_event)["wake_events"] == 1
+    assert service.ingest_device_event_v2(user_id, on_event)["wake_events"] == 0
+    assert len(emitted) == 1
     assert emitted[0].source == "scene_change"
     assert emitted[0].origin_refs == ("device_event:evt_on",)
 
@@ -699,6 +853,13 @@ def test_device_event_unlock_after_absence_wakes(monkeypatch):
     monkeypatch.setattr(service, "store", fake)
     monkeypatch.setattr(service, "_settings_v2_for_user", lambda uid: None)
     monkeypatch.setattr(service, "_fire_wake_event_v2", lambda event: emitted.append(event))
+    monkeypatch.setattr(
+        ingress_v2,
+        "DEFAULT_DIFFER_V2",
+        PerceptionDifferV2(
+            observe_state=_scripted_state_observer(("changed", 400.0))
+        ),
+    )
     _activate_proactive(monkeypatch)
 
     out = service.ingest_device_event_v2("u_unlock_after_absence", {

@@ -713,7 +713,7 @@ WAL-G 备份；test/prod 已接双写 + in-process 同步调度器，pre 在首�
 | Placement | prod9 node 18，`tdx.medium`（2 vCPU / 4GB），30GB ZFS |
 | Public PG | `ade3cabf133ec3e9ee6220265843c4ac993e1e63-5432s.dstack-pha-prod9.phala.network:443`（direct TLS） |
 | Backup | `s3://io-in-enclave-db/pre/wal-g`，pre 独立 libsodium key |
-| Schema baseline | Phase 4 target is the current `alembic_tee` release head (`0014_test_runtime_catchup` at this revision); the owner-only workflow must reach the release's head before any app DSN switch. |
+| Schema baseline | Phase 4 target is the current `alembic_tee` release head (`0015_merge_pre_perception` at this revision); the owner-only workflow must reach the release's head before any app DSN switch. |
 | Deploy path | `Deploy Postgres CVM` workflow 的 `pre` lane，目标 ID 在 `deploy/pre-pg-cvm-id.txt` |
 | Migration | `TEE migrate` workflow 的 `pre` lane，owner DSN + verify-full CA |
 | App wiring | Shadow stage: `PRE_TEE_DATABASE_URL` + `PRE_FEEDLING_TEE_DUAL_WRITE`. Primary stage: `PRE_DATABASE_URL` points to the TEE app DSN, `FEEDLING_DATABASE_SCHEMA=tee`, and both shadow variables are empty. |

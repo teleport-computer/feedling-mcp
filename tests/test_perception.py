@@ -29,6 +29,7 @@ from core import store as core_store
 from core import wake_bus as core_wake_bus
 from hosted import config_store as hosted_config_store
 from model_api_runtime.v2 import jobs_store
+from proactive.runtime_v2 import WakeEventV2
 
 
 # The Flask /v1/perception/* blueprint was deleted in the ASGI cutover; this tiny
@@ -194,6 +195,33 @@ def env(monkeypatch):
 
 
 UID = "u1"
+
+
+def _stub_changed_v2_observation(monkeypatch):
+    """Keep FakeStore unit tests below the durable PostgreSQL boundary."""
+    def _observe(
+        user_id,
+        signal,
+        value,
+        *,
+        ts,
+        origin_refs=(),
+        submit_wake=None,
+        **_kwargs,
+    ):
+        if submit_wake is not None:
+            submit_wake(WakeEventV2(
+                user_id=user_id,
+                source="perception_event",
+                trigger=signal,
+                created_at=float(ts),
+                change_digest=f"{signal}: changed",
+                origin_refs=tuple(origin_refs),
+                payload={"value": value},
+            ))
+        return None
+
+    monkeypatch.setattr(service, "observe_signal_v2", _observe)
 
 
 # ---------------------------------------------------------------------------
@@ -579,6 +607,7 @@ def test_photo_v2_burst_dedup_collapses_rapid_captures(env, monkeypatch):
     fake, wakes = env
     monkeypatch.setattr(service, "perception_ingress_runtime_v2_enabled",
                         lambda user_or_store: True)
+    _stub_changed_v2_observation(monkeypatch)
     clock = {"t": 1000.0}
     monkeypatch.setattr(service, "_now", lambda: clock["t"])
 
@@ -1126,6 +1155,7 @@ def test_photo_suppressed_when_photo_wake_disabled(env, monkeypatch):
     fake, wakes = env
     monkeypatch.setattr(service, "perception_ingress_runtime_v2_enabled",
                         lambda user_or_store: True)
+    _stub_changed_v2_observation(monkeypatch)
     monkeypatch.setattr(service, "_settings_v2_for_user",
                         lambda uid: {"switches": {"photo_wake_enabled": False}})
     uid = "u_photo_dnd"

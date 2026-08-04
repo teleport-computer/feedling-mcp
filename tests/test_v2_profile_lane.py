@@ -478,7 +478,7 @@ def test_compose_memory_lane_defaults_match_environment_policy():
             in worker_block
         )
         expected_dream = (
-            'FEEDLING_V2_DREAM_ENABLED: "${FEEDLING_V2_DREAM_ENABLED:-0}"'
+            'FEEDLING_V2_DREAM_ENABLED: "1"'
             if relative.endswith(".test.yaml")
             else 'FEEDLING_V2_DREAM_ENABLED: "${FEEDLING_V2_DREAM_ENABLED:-1}"'
         )

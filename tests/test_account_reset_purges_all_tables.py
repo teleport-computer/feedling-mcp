@@ -54,6 +54,14 @@ def _seed_all_per_user_tables(user_id: str) -> None:
             (user_id,),
         )
         conn.execute(
+            "INSERT INTO perception_signal_state_v2 "
+            "(user_id, signal, value_fingerprint, fingerprint_key_id, "
+            "last_seen_at, last_changed_at) "
+            "VALUES (%s, 'wifi_anchor', 'fingerprint', 'key-id', "
+            "'2026-08-04T00:00:00Z', '2026-08-04T00:00:00Z')",
+            (user_id,),
+        )
+        conn.execute(
             "INSERT INTO genesis_import_jobs (user_id, job_id, status) "
             "VALUES (%s, 'job1', 'done')",
             (user_id,),
@@ -154,6 +162,7 @@ def _seed_all_per_user_tables(user_id: str) -> None:
 _PER_USER_TABLES = (
     "perception_items",
     "perception_daily",
+    "perception_signal_state_v2",
     "genesis_import_jobs",
     "genesis_import_chunks",
     "genesis_import_outputs",
@@ -213,6 +222,14 @@ def test_db_belt_purges_usage_rollups_without_deleting_parent_user(client):
             "VALUES ('2026-08-02',%s,'chat','anthropic','claude-test',1)",
             (uid,),
         )
+        conn.execute(
+            "INSERT INTO perception_signal_state_v2 "
+            "(user_id, signal, value_fingerprint, fingerprint_key_id, "
+            "last_seen_at, last_changed_at) "
+            "VALUES (%s, 'wifi_anchor', 'fingerprint', 'key-id', "
+            "'2026-08-04T00:00:00Z', '2026-08-04T00:00:00Z')",
+            (uid,),
+        )
 
     db.delete_user_data(uid)
 
@@ -224,6 +241,10 @@ def test_db_belt_purges_usage_rollups_without_deleting_parent_user(client):
             assert conn.execute(
                 f"SELECT count(*) FROM {table} WHERE user_id=%s", (uid,)
             ).fetchone() == (0,)
+        assert conn.execute(
+            "SELECT count(*) FROM perception_signal_state_v2 WHERE user_id=%s",
+            (uid,),
+        ).fetchone() == (0,)
         conn.execute("DELETE FROM users WHERE user_id=%s", (uid,))
 
 

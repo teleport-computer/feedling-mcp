@@ -1,10 +1,11 @@
 import json
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
-from perception import service
+from perception import ingress_v2, service
 from perception.ios_contract_v2 import (  # noqa: E402
     EXPECTED_REPORT_KEYS_V2,
     classify_item_v2,
@@ -12,6 +13,7 @@ from perception.ios_contract_v2 import (  # noqa: E402
     missing_expected_keys_v2,
 )
 from perception.differ_v2 import PerceptionDifferV2  # noqa: E402
+from perception.signal_state_v2 import SignalObservationDecision  # noqa: E402
 
 
 FIXTURES = Path(__file__).parent / "fixtures" / "perception_ios_v2"
@@ -218,6 +220,25 @@ def test_ios_photo_fixture_stores_sensitive_scene_without_hard_block(monkeypatch
     monkeypatch.setattr(service, "_settings_v2_for_user", lambda uid: None)
     monkeypatch.setattr(service, "perception_ingress_runtime_v2_enabled", lambda user_or_store: True)
     monkeypatch.setattr(service, "_proactive_activation_ready", lambda uid: True)
+    monkeypatch.setattr(
+        ingress_v2,
+        "DEFAULT_DIFFER_V2",
+        PerceptionDifferV2(
+            observe_state=lambda _uid, _signal, _value, *, observed_at, **_kwargs: (
+                SignalObservationDecision(
+                    outcome="changed",
+                    changed=True,
+                    fingerprint="test-fingerprint",
+                    last_seen_at=datetime.fromtimestamp(
+                        observed_at, tz=timezone.utc
+                    ),
+                    last_changed_at=datetime.fromtimestamp(
+                        observed_at, tz=timezone.utc
+                    ),
+                )
+            )
+        ),
+    )
     wakes = []
     monkeypatch.setattr(service, "_fire_wake_event_v2", lambda event: wakes.append(event))
 
