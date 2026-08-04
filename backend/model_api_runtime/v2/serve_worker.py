@@ -125,6 +125,49 @@ import provider_client
 log = logging.getLogger("feedling.runtime_v2.serve_worker")
 
 
+def _load_genesis_persona(store, *, runtime_token: str) -> str:
+    """JIT-decrypt this user's complete genesis persona for one model turn.
+
+    Runtime V1 reads the same ``genesis_persona.content_envelope`` and sends the
+    resulting Markdown as trusted system text on every freshly spawned turn.
+    V2 keeps that behavior: no truncation or profile rollout gate, and absent,
+    legacy, malformed, or temporarily undecryptable blobs leave the existing
+    generic companion prompt unchanged.
+    """
+    user_id = str(getattr(store, "user_id", "") or "")
+    if not user_id:
+        return ""
+    try:
+        blob = db.get_blob(user_id, "genesis_persona")
+    except Exception as exc:  # noqa: BLE001 — absence must not fail the turn
+        log.warning(
+            "genesis persona blob read failed for %s: %s",
+            user_id,
+            type(exc).__name__,
+        )
+        return ""
+    if not isinstance(blob, dict):
+        return ""
+    envelope = blob.get("content_envelope")
+    if not (isinstance(envelope, dict) and envelope.get("body_ct")):
+        return ""
+    try:
+        raw = core_enclave._decrypt_envelope_via_enclave(
+            envelope,
+            None,
+            purpose="genesis_persona",
+            runtime_token=str(runtime_token or ""),
+        )
+        return raw.decode("utf-8")
+    except Exception as exc:  # noqa: BLE001 — mirror Runtime V1 fallback
+        log.warning(
+            "genesis persona decrypt failed for %s: %s",
+            user_id,
+            type(exc).__name__,
+        )
+        return ""
+
+
 def _load_workspace_prompt(store, *, runtime_token: str) -> dict:
     """Render one authoritative workspace prompt snapshot for a turn.
 
@@ -139,6 +182,12 @@ def _load_workspace_prompt(store, *, runtime_token: str) -> dict:
         store, runtime_token=str(runtime_token or "")
     )
     trusted_system_blocks: list[str] = []
+    persona = _load_genesis_persona(store, runtime_token=runtime_token).strip()
+    if persona:
+        # Persona first, matching V1's persona-before-tools ordering. It remains
+        # inside context.py's single cache-stable system-role prefix and is
+        # deliberately not subject to runtime-data or profile truncation.
+        trusted_system_blocks.append(persona)
     for block in render_trusted_prefix_blocks(
         backend,
         include_working_memory=False,

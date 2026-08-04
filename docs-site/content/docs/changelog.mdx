@@ -10,6 +10,12 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **Hosted Runtime V2 now carries the complete genesis persona into every Chat
+  and proactive wake turn.** The encrypted persona is decrypted just in time
+  for the turn and placed in the trusted system prefix without profile or
+  context truncation. Accounts that have not completed genesis keep the generic
+  companion prompt, and a persona update takes effect on the next turn.
+
 - **Hosted Runtime V2 restores the proactive-presence semantics used by Runtime
   V1.** Automatic wake context is no longer serialized as a synthetic user
   message, and speaking and staying silent are treated as equally valid for
