@@ -337,10 +337,15 @@ def test_coverage_queries_share_one_synthetic_source_predicate():
 
 
 def test_phala_worker_composes_wire_deterministic_flag_default_off():
-    setting = (
+    # Test is the "normal-on" environment since 2026-08-05 (V1-parity
+    # program): deterministic coverage is hardcoded on there.  Prod/pre stay
+    # env-parameterized default-off (with the M5 deployment guard comment)
+    # until Seven schedules the prod rollout.
+    parameterized_off = (
         'FEEDLING_V2_PROFILE_COVERAGE_DETERMINISTIC: '
         '"${FEEDLING_V2_PROFILE_COVERAGE_DETERMINISTIC:-0}"'
     )
+    hardcoded_on = 'FEEDLING_V2_PROFILE_COVERAGE_DETERMINISTIC: "1"'
     deployment_guard = (
         "# DO NOT set to 1 before M5 MEMORY/USER prompt injection is deployed."
     )
@@ -350,5 +355,9 @@ def test_phala_worker_composes_wire_deterministic_flag_default_off():
         "docker-compose.phala.pre.yaml",
     ):
         text = (ROOT / "deploy" / name).read_text()
-        assert text.count(setting) == 1, name
-        assert text.count(deployment_guard) == 1, name
+        if name == "docker-compose.phala.test.yaml":
+            assert text.count(hardcoded_on) == 1, name
+            assert parameterized_off not in text, name
+        else:
+            assert text.count(parameterized_off) == 1, name
+            assert text.count(deployment_guard) == 1, name
