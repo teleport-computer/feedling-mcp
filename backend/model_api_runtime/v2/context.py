@@ -310,6 +310,33 @@ _FILE_FORMAT_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     (".rtf", re.compile(r"(?:\.rtf\b|\brtf\b)")),
 )
 
+# Conservative completion guard for explicit image-creation requests. The model
+# still owns prompt interpretation; this only prevents a text placeholder such
+# as "Image" from satisfying a request that clearly asks IO to create a visual.
+_IMAGE_GENERATION_REQUEST_RE = re.compile(
+    r"(?:\b生图\b|"
+    r"(?:帮我|替我|为我|给我|请)?\s*(?:生成|画|绘制|创作|制作|创建|设计|做)"
+    r"(?:一|1|两|2)?\s*(?:张|幅|个)?\s*"
+    r"[^。！？\n]{0,40}?(?:图片|图像|插画|海报|头像|照片|壁纸|封面|画|图)\b|"
+    r"\b(?:generate|create|draw|render|illustrate|design|make)\b"
+    r"[^.!?\n]{0,48}\b(?:image|picture|illustration|poster|avatar|photo|"
+    r"wallpaper|cover|artwork)\b)"
+)
+_IMAGE_GENERATION_CANCEL_RE = re.compile(
+    r"(?:(?:不要|不用|无需|不需要|别|取消)(?:再|帮我|替我|为我)?\s*"
+    r"(?:生成|画|绘制|创作|制作|创建|设计|做|生)?\s*"
+    r"(?:图片|图像|插画|海报|头像|照片|壁纸|封面|画|图)?|"
+    r"\b(?:do not|don't|no need to|stop|cancel)\b[^.!?\n]{0,32}"
+    r"\b(?:generate|create|draw|render|illustrate|design|make)?\b[^.!?\n]{0,24}"
+    r"\b(?:image|picture|illustration|poster|avatar|photo|artwork)?\b)"
+)
+_IMAGE_GENERATION_INFORMATION_RE = re.compile(
+    r"(?:如何|怎么|怎样|教程|步骤|方法|能不能|可以吗|是否|"
+    r"请(?:解释|介绍|说明|告诉我)|解释一下|介绍一下|讲讲|"
+    r"\b(?:how (?:do|can|should|to)|tutorial|steps?|explain|describe|"
+    r"tell me how|can you|are you able|do you support)\b)"
+)
+
 
 def _norm_role(role: Any) -> str:
     return "assistant" if str(role or "") in _ASSISTANT_ROLES else "user"
@@ -472,6 +499,42 @@ def required_file_suffixes(messages: Sequence[dict]) -> tuple[str, ...] | None:
         else:
             requirement = candidate
     return requirement
+
+
+def required_image_generation_prompt(messages: Sequence[dict]) -> str | None:
+    """Return the current explicit image-generation request, if any.
+
+    This is deliberately narrower than semantic model reasoning. It exists only
+    as a delivery guard for unmistakable creation requests, so questions about
+    image-generation capability or instructions do not accidentally spend image
+    quota. Consecutive user follow-ups are included as prompt refinements until a
+    clear cancellation resets the requirement.
+    """
+    prompt_parts: list[str] = []
+    active = False
+    for message in messages:
+        if _norm_role(message.get("role")) != "user":
+            continue
+        text = text_of(message.get("content"))
+        normalized = unicodedata.normalize("NFKC", text).casefold().strip()
+        if not normalized:
+            continue
+        if _IMAGE_GENERATION_CANCEL_RE.search(normalized):
+            active = False
+            prompt_parts = []
+            positive_tail = _IMAGE_GENERATION_CANCEL_RE.sub(" ", normalized)
+            if not _IMAGE_GENERATION_REQUEST_RE.search(positive_tail):
+                continue
+        has_request = bool(_IMAGE_GENERATION_REQUEST_RE.search(normalized))
+        asks_for_information = bool(_IMAGE_GENERATION_INFORMATION_RE.search(normalized))
+        if has_request and not asks_for_information:
+            active = True
+            prompt_parts = [text.strip()]
+        elif active:
+            prompt_parts.append(text.strip())
+    if not active:
+        return None
+    return "\n".join(part for part in prompt_parts if part).strip() or None
 
 
 def _has_payload(content: Any) -> bool:

@@ -11531,11 +11531,13 @@ _ROUTE_COLUMNS = """
     r.id::text, r.credential_id::text, c.provider, r.model, c.label,
     c.api_key_hint, c.base_url, c.supports_responses,
     COALESCE(r.reasoning_effort, ''), r.context_window_tokens,
-    r.is_active, r.is_vision, r.test_status,
+    r.is_active, r.is_vision, r.is_image_generation, r.test_status,
     COALESCE(to_char(r.last_test_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'), ''),
     r.last_test_error, r.vision_test_status,
     COALESCE(to_char(r.last_vision_test_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'), ''),
-    r.last_vision_test_error, r.last_runtime_error, r.last_runtime_error_class,
+    r.last_vision_test_error, r.image_generation_test_status,
+    COALESCE(to_char(r.last_image_generation_test_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'), ''),
+    r.last_image_generation_test_error, r.last_runtime_error, r.last_runtime_error_class,
     COALESCE(to_char(r.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'), ''),
     COALESCE(to_char(r.updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'), '')
 """
@@ -11548,11 +11550,15 @@ def _route_row_to_dict(row: tuple) -> dict:
         "supports_responses": bool(row[7]), "reasoning_effort": row[8],
         "context_window_tokens": int(row[9]) if row[9] is not None else None,
         "is_active": bool(row[10]), "is_vision": bool(row[11]),
-        "test_status": row[12], "last_test_at": row[13], "last_test_error": row[14],
-        "vision_test_status": row[15], "last_vision_test_at": row[16],
-        "last_vision_test_error": row[17], "last_runtime_error": row[18],
-        "last_runtime_error_class": row[19],
-        "created_at": row[20], "updated_at": row[21],
+        "is_image_generation": bool(row[12]),
+        "test_status": row[13], "last_test_at": row[14], "last_test_error": row[15],
+        "vision_test_status": row[16], "last_vision_test_at": row[17],
+        "last_vision_test_error": row[18],
+        "image_generation_test_status": row[19],
+        "last_image_generation_test_at": row[20],
+        "last_image_generation_test_error": row[21],
+        "last_runtime_error": row[22], "last_runtime_error_class": row[23],
+        "created_at": row[24], "updated_at": row[25],
     }
 
 
@@ -11705,6 +11711,9 @@ def model_api_credential_update(user_id: str, credential_id: str, *,
                         "UPDATE model_api_routes SET "
                         "vision_test_status = 'untested', "
                         "last_vision_test_error = '', last_vision_test_at = NULL, "
+                        "image_generation_test_status = 'untested', "
+                        "last_image_generation_test_error = '', "
+                        "last_image_generation_test_at = NULL, "
                         "updated_at = now() "
                         "WHERE user_id = %s AND credential_id = %s",
                         (user_id, credential_id),
@@ -11869,6 +11878,27 @@ def model_api_vision_route(user_id: str) -> dict | None:
         return out
     except Exception as e:
         log.error("[db] model_api_vision_route(%s) failed: %s", user_id, e)
+        return None
+
+
+def model_api_image_generation_route(user_id: str) -> dict | None:
+    """Return the dedicated image-generation route with its encrypted credential."""
+    try:
+        with get_pool().connection() as conn:
+            row = conn.execute(
+                f"SELECT {_ROUTE_COLUMNS}, c.api_key_envelope "
+                "FROM model_api_routes r "
+                "JOIN model_api_credentials c ON c.id = r.credential_id "
+                "WHERE r.user_id = %s AND r.is_image_generation",
+                (user_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        out = _route_row_to_dict(row)
+        out["api_key_envelope"] = row[-1]
+        return out
+    except Exception as e:
+        log.error("[db] model_api_image_generation_route(%s) failed: %s", user_id, e)
         return None
 
 
@@ -12065,6 +12095,81 @@ def model_api_route_clear_vision(user_id: str) -> bool:
         return True
     except Exception as e:
         log.error("[db] model_api_route_clear_vision(%s) failed: %s", user_id, e)
+        return False
+
+
+def model_api_route_set_image_generation(user_id: str, route_id: str) -> bool:
+    """Atomically assign one saved route as the user's image generator."""
+    try:
+        with get_pool().connection() as conn:
+            with conn.transaction():
+                target = conn.execute(
+                    "SELECT 1 FROM model_api_routes "
+                    "WHERE user_id = %s AND id = %s FOR UPDATE",
+                    (user_id, route_id),
+                ).fetchone()
+                if target is None:
+                    return False
+                conn.execute(
+                    "UPDATE model_api_routes SET is_image_generation = FALSE, "
+                    "updated_at = now() WHERE user_id = %s "
+                    "AND is_image_generation AND id != %s",
+                    (user_id, route_id),
+                )
+                cur = conn.execute(
+                    "UPDATE model_api_routes SET is_image_generation = TRUE, "
+                    "updated_at = now() WHERE user_id = %s AND id = %s",
+                    (user_id, route_id),
+                )
+        return cur.rowcount > 0
+    except Exception as e:
+        log.error(
+            "[db] model_api_route_set_image_generation(%s,%s) failed: %s",
+            user_id,
+            route_id,
+            e,
+        )
+        return False
+
+
+def model_api_route_clear_image_generation(user_id: str) -> bool:
+    try:
+        with get_pool().connection() as conn:
+            conn.execute(
+                "UPDATE model_api_routes SET is_image_generation = FALSE, "
+                "updated_at = now() WHERE user_id = %s AND is_image_generation",
+                (user_id,),
+            )
+        return True
+    except Exception as e:
+        log.error("[db] model_api_route_clear_image_generation(%s) failed: %s", user_id, e)
+        return False
+
+
+def model_api_route_mark_image_generation_test(
+    user_id: str,
+    route_id: str,
+    *,
+    status: str,
+    error: str = "",
+) -> bool:
+    try:
+        with get_pool().connection() as conn:
+            cur = conn.execute(
+                "UPDATE model_api_routes SET image_generation_test_status = %s, "
+                "last_image_generation_test_error = %s, "
+                "last_image_generation_test_at = now(), updated_at = now() "
+                "WHERE user_id = %s AND id = %s",
+                (str(status or "untested")[:32], str(error or "")[:240], user_id, route_id),
+            )
+        return cur.rowcount > 0
+    except Exception as e:
+        log.error(
+            "[db] model_api_route_mark_image_generation_test(%s,%s) failed: %s",
+            user_id,
+            route_id,
+            e,
+        )
         return False
 
 

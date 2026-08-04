@@ -194,6 +194,7 @@ class LoopOutcome:
     rounds: int
     stop_reason: str
     replied_intermediate: bool
+    delivered_media_count: int = 0
 
 
 class FinalReplySuperseded(RuntimeError):
@@ -244,12 +245,17 @@ async def run_tool_loop(
     # response that means "nothing to say" (`required = require_reply and not
     # tool_calls`), and the wake fails silently.
     require_reply: bool = True,
+    allow_image_output: bool = False,
     on_file_reply=None,
+    on_image_reply=None,
     on_tool_event=None,
     required_file_suffixes: tuple[str, ...] | None = None,
     file_requirement_messages=(),
     resolve_required_file_suffixes=None,
     on_file_requirement_changed=None,
+    required_image_generation_prompt: str | None = None,
+    image_requirement_messages=(),
+    resolve_required_image_generation_prompt=None,
     outbound_blocking_read_tool_names=None,
     outbound_blocking_read_tool_predicate=None,
     max_tool_calls_per_round: int = DEFAULT_MAX_TOOL_CALLS_PER_ROUND,
@@ -304,7 +310,14 @@ async def run_tool_loop(
     completion retry before the provider's terminal text is published normally.
     Chat callers may also provide ``file_requirement_messages`` plus a resolver;
     newly folded user messages then update or cancel the requirement before each
-    later provider round."""
+    later provider round.
+
+    ``required_image_generation_prompt`` is the equivalent guard for an explicit
+    image-creation request. If a weak/text-only main model returns a placeholder
+    instead of calling ``generate_image``, the loop discards that text and routes
+    the original request through ``on_image_reply``. This keeps delivery truthful
+    and lets the image adapter return the same structured configuration failure
+    regardless of which conversation model the user selected."""
     max_tool_calls_per_round = _positive_limit(
         max_tool_calls_per_round, name="max_tool_calls_per_round"
     )
@@ -370,6 +383,21 @@ async def run_tool_loop(
         for message in file_requirement_messages
         if isinstance(message, dict)
     ]
+    image_requirement_message_state = [
+        dict(message)
+        for message in image_requirement_messages
+        if isinstance(message, dict)
+    ]
+    resolved_image_generation_prompt = str(
+        required_image_generation_prompt or ""
+    ).strip()
+    if resolve_required_image_generation_prompt is not None:
+        resolved_image_generation_prompt = str(
+            resolve_required_image_generation_prompt(
+                image_requirement_message_state
+            )
+            or ""
+        ).strip()
 
     def _normalize_file_requirement(value) -> tuple[bool, frozenset[str]]:
         suffixes = frozenset(
@@ -442,6 +470,8 @@ async def run_tool_loop(
         disabled_names.add(tool_schema.REPLY_TOOL)
     if on_file_reply is None:
         disabled_names.add(tool_schema.FILE_REPLY_TOOL)
+    if on_image_reply is None:
+        disabled_names.add(tool_schema.IMAGE_REPLY_TOOL)
     turn_catalog = [
         spec
         for spec in (_catalog() + list(extra_tool_specs or []))
@@ -549,6 +579,18 @@ async def run_tool_loop(
                         file_delivery_fallback_reasoning = ""
                         if on_file_requirement_changed is not None:
                             await on_file_requirement_changed()
+                if resolve_required_image_generation_prompt is not None:
+                    image_requirement_message_state.extend(
+                        dict(message)
+                        for message in folded
+                        if isinstance(message, dict)
+                    )
+                    resolved_image_generation_prompt = str(
+                        resolve_required_image_generation_prompt(
+                            image_requirement_message_state
+                        )
+                        or ""
+                    ).strip()
 
         messages = build_messages(list(transcript))
         if delivery_retry_instruction:
@@ -706,6 +748,8 @@ async def run_tool_loop(
         _progress("provider_start")
         try:
             provider_kwargs = {"tools": tools}
+            if allow_image_output and not terminal_text_round:
+                provider_kwargs["allow_image_output"] = True
             if not require_reply:
                 # Only send the non-default so every existing caller's wire
                 # stays byte-identical.
@@ -847,9 +891,26 @@ async def run_tool_loop(
                 await on_provider_success()
             except Exception:
                 pass
+        trajectory_result = result
+        if result.get("media"):
+            trajectory_result = dict(result)
+            trajectory_result["media"] = [
+                {
+                    "mime_type": str(item.get("mime_type") or ""),
+                    "encoded_chars": len(str(item.get("data_base64") or "")),
+                }
+                for item in result.get("media") or []
+                if isinstance(item, dict)
+            ]
+            raw_turn = result.get("assistant_turn")
+            if isinstance(raw_turn, dict):
+                trajectory_result["assistant_turn"] = {
+                    "wire": str(raw_turn.get("wire") or ""),
+                    "payload": "[generated image omitted]",
+                }
         await _trajectory(
             "provider_response",
-            {"round": attempts, "response": result},
+            {"round": attempts, "response": trajectory_result},
         )
         # Exact wire attempts are now durably encrypted. Do not retain large
         # prompt/image bodies through the following tool batch merely because
@@ -861,6 +922,45 @@ async def run_tool_loop(
         # A tools-disabled request is terminal even if a broken relay invents a
         # tool call anyway.  Never execute an undeclared call; use only its text.
         if tools is None or not pr.tool_calls:
+            if resolved_image_generation_prompt and not pr.media:
+                if on_image_reply is None:
+                    raise RuntimeError("generate_image callback is unavailable")
+                await _trajectory(
+                    "required_image_generation_fallback",
+                    {
+                        "round": attempts,
+                        "discarded_text_chars": len(pr.text),
+                    },
+                )
+                media = tuple(
+                    await on_image_reply(
+                        {"prompt": resolved_image_generation_prompt}
+                    )
+                )
+                if not media:
+                    raise RuntimeError("generate_image returned no media")
+                try:
+                    await on_reply("", final=True, media=media)
+                except FinalReplySuperseded:
+                    reasoning_fragments.clear()
+                    seen_reasoning_fragments.clear()
+                    _progress("final_reply_superseded")
+                    await _trajectory(
+                        "final_reply_superseded",
+                        {"round": attempts},
+                    )
+                    if attempts < max_calls:
+                        continue
+                    return LoopOutcome(
+                        "", attempts, "input_advanced", replied_intermediate
+                    )
+                return LoopOutcome(
+                    "",
+                    attempts,
+                    "final_media",
+                    replied_intermediate,
+                    delivered_media_count=len(media),
+                )
             requirement_met = (
                 not file_delivery_required
                 or (
@@ -967,11 +1067,13 @@ async def run_tool_loop(
                 # the rejected assistant text in the transcript: the next round
                 # must answer the newly folded conversation, not critique a
                 # response the user never saw.
-                await on_reply(
-                    pr.text,
-                    final=True,
-                    reasoning=_merged_reasoning(),
-                )
+                reply_kwargs = {
+                    "final": True,
+                    "reasoning": _merged_reasoning(),
+                }
+                if pr.media:
+                    reply_kwargs["media"] = pr.media
+                await on_reply(pr.text, **reply_kwargs)
             except FinalReplySuperseded:
                 reasoning_fragments.clear()
                 seen_reasoning_fragments.clear()
@@ -983,7 +1085,13 @@ async def run_tool_loop(
                 if attempts < max_calls:
                     continue
                 return LoopOutcome("", attempts, "input_advanced", replied_intermediate)
-            return LoopOutcome(pr.text, attempts, "final_text", replied_intermediate)
+            return LoopOutcome(
+                pr.text,
+                attempts,
+                "final_media" if pr.media else "final_text",
+                replied_intermediate,
+                delivered_media_count=len(pr.media),
+            )
 
         call_ids = [tc.id for tc in pr.tool_calls]
         argument_sizes = [
@@ -1007,7 +1115,10 @@ async def run_tool_loop(
             or tool_calls_used + len(pr.tool_calls) > max_tool_calls_per_turn
         )
         offered_names = {spec.name for spec in tools}
-        malformed = any(
+        # Provider media is terminal output. Do not silently discard or retain
+        # its large inline payload when a broken relay also invents function
+        # calls in the same turn; fall back once with every tool disabled.
+        malformed = bool(pr.media) or any(
             not tc.id
             or not tc.name
             or not tc.args_ok
@@ -1026,17 +1137,28 @@ async def run_tool_loop(
             )
             for tc in pr.tool_calls
         )
+        image_reply_calls = [
+            tc for tc in pr.tool_calls if tc.name == tool_schema.IMAGE_REPLY_TOOL
+        ]
         mixed_reply_write = any(
-            tc.name in {tool_schema.REPLY_TOOL, tool_schema.FILE_REPLY_TOOL}
+            tc.name in {
+                tool_schema.REPLY_TOOL,
+                tool_schema.FILE_REPLY_TOOL,
+                tool_schema.IMAGE_REPLY_TOOL,
+            }
             for tc in pr.tool_calls
         ) and any(
             tc.name in _PLATFORM_MUTATION_TOOLS or tc.name in mutating_mcp_names
             for tc in pr.tool_calls
         )
+        invalid_image_batch = bool(image_reply_calls) and (
+            len(image_reply_calls) != 1 or len(pr.tool_calls) != 1
+        )
         if (
             malformed
             or len(set(call_ids)) != len(call_ids)
             or mixed_reply_write
+            or invalid_image_batch
             or over_tool_call_budget
             or oversized_tool_exchange
         ):
@@ -1072,7 +1194,11 @@ async def run_tool_loop(
         file_reply_calls = [
             tc for tc in pr.tool_calls if tc.name == tool_schema.FILE_REPLY_TOOL
         ]
-        loop_reply_tools = {tool_schema.REPLY_TOOL, tool_schema.FILE_REPLY_TOOL}
+        loop_reply_tools = {
+            tool_schema.REPLY_TOOL,
+            tool_schema.FILE_REPLY_TOOL,
+            tool_schema.IMAGE_REPLY_TOOL,
+        }
         other_calls = [tc for tc in pr.tool_calls if tc.name not in loop_reply_tools]
         reply_results: dict[str, ToolResult] = {}
         repeated_memory_calls = []
@@ -1187,6 +1313,39 @@ async def run_tool_loop(
             reply_results[tc.id] = file_result
             await _tool_event(
                 tc, "tool_call_result", {"result": file_result}
+            )
+
+        for tc in image_reply_calls:
+            await _tool_event(tc, "tool_call_started", {})
+            await _trajectory(
+                "image_reply_planned",
+                {"round": attempts, "call_id": tc.id},
+            )
+            if on_image_reply is None:
+                raise RuntimeError("generate_image callback is unavailable")
+            try:
+                media = tuple(await on_image_reply(dict(tc.args)))
+                if not media:
+                    raise RuntimeError("generate_image returned no media")
+                await on_reply("", final=True, media=media)
+            except Exception as exc:
+                await _tool_event(
+                    tc, "tool_call_error", {"error": type(exc).__name__}
+                )
+                raise
+            image_result = ToolResult(
+                call_id=tc.id,
+                content="ok: image delivered",
+            )
+            await _tool_event(
+                tc, "tool_call_result", {"result": image_result}
+            )
+            return LoopOutcome(
+                "",
+                attempts,
+                "final_media",
+                replied_intermediate,
+                delivered_media_count=len(media),
             )
 
         if other_calls:

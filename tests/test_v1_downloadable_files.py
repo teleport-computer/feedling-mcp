@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import base64
+import io
 import os
 import sys
 import threading
@@ -37,6 +38,9 @@ from chat import chat_core  # noqa: E402
 from core import store as core_store  # noqa: E402
 from model_api_runtime.v2 import document_render  # noqa: E402
 from tools import chat_resident_consumer as resident  # noqa: E402
+
+PIL = pytest.importorskip("PIL")
+from PIL import Image  # noqa: E402
 
 
 def _b64(raw: bytes) -> str:
@@ -122,6 +126,97 @@ def test_v1_text_and_file_followup_commit_as_one_ordered_reply(
     assert card["file_byte_count"] == 1234
     assert card["reply_to_message_id"] == parent["id"]
     assert float(card["ts"]) > float(primary["ts"])
+
+
+def test_v1_text_and_images_commit_as_one_ordered_reply(store, monkeypatch):
+    _quiet_response_side_effects(monkeypatch)
+    parent = store.append_chat(
+        "user", "chat", _envelope(store.user_id, "v1_image_parent")
+    )
+
+    body, status = chat_core.write_response(
+        store,
+        {
+            "envelope": _envelope(store.user_id, "v1_image_primary"),
+            "reply_to_message_id": parent["id"],
+            "image_followups": [
+                {
+                    "envelope": _envelope(store.user_id, "v1_image_one"),
+                    "image_mime": "image/png",
+                    "image_byte_count": 123,
+                },
+                {
+                    "envelope": _envelope(store.user_id, "v1_image_two"),
+                    "image_mime": "image/webp",
+                    "image_byte_count": 456,
+                },
+            ],
+        },
+        consumer_id="resident-v1",
+        consumer_info={},
+        allow_verify_reply=False,
+    )
+
+    assert status == 200
+    assert body["id"] == "v1_image_primary"
+    rows = {row["id"]: row for row in db.chat_load(store.user_id)}
+    assert rows["v1_image_primary"]["reply_part_index"] == 0
+    assert rows["v1_image_primary"]["reply_part_count"] == 3
+    assert rows["v1_image_one"]["content_type"] == "image"
+    assert rows["v1_image_one"]["reply_part_index"] == 1
+    assert rows["v1_image_two"]["reply_part_index"] == 2
+    assert rows["v1_image_two"]["reply_to_message_id"] == parent["id"]
+
+
+def _png_bytes() -> bytes:
+    out = io.BytesIO()
+    Image.new("RGB", (48, 32), (20, 40, 60)).save(out, format="PNG")
+    return out.getvalue()
+
+
+def test_resident_stages_generated_image_inside_private_outbox(tmp_path, monkeypatch):
+    outbox = tmp_path / "outbound-files"
+    monkeypatch.setattr(resident, "OUTBOUND_FILE_DIR", outbox)
+    resident._begin_outbound_file_turn("turn-image", None)
+    source = outbox / "model-result.bin"
+    source.write_bytes(_png_bytes())
+
+    reply = resident._handle_stage_image_ipc(
+        {
+            "op": "stage_image",
+            "request_id": "request-image",
+            "path": str(source),
+            "name": "结果图.png",
+        }
+    )
+
+    assert reply["ok"] is True
+    files, images = resident._finish_outbound_attachment_turn("turn-image")
+    assert files == []
+    assert len(images) == 1
+    assert images[0].name == "结果图.png"
+    assert images[0].mime_type == "image/png"
+    assert not source.exists()
+
+
+def test_resident_rejects_generated_image_outside_private_outbox(tmp_path, monkeypatch):
+    outbox = tmp_path / "outbound-files"
+    outside = tmp_path / "outside.png"
+    outside.write_bytes(_png_bytes())
+    monkeypatch.setattr(resident, "OUTBOUND_FILE_DIR", outbox)
+    resident._begin_outbound_file_turn("turn-image-escape", None)
+
+    reply = resident._handle_stage_image_ipc(
+        {
+            "op": "stage_image",
+            "request_id": "request-image-escape",
+            "path": str(outside),
+        }
+    )
+
+    assert reply["ok"] is False
+    assert reply["error"] == "path_outside_outbound_dir"
+    resident._finish_outbound_attachment_turn("turn-image-escape")
 
 
 def test_v1_text_file_and_confirmed_memory_activity_commit_together(

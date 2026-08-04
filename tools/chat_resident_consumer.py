@@ -134,6 +134,7 @@ except ImportError:
     _ENCRYPTION_AVAILABLE = False
 
 import provider_client
+import generated_image
 
 # Shared torn-protocol-JSON leak detector (backend/core, pure). backend/ is on
 # sys.path via the insert above, so it imports as a top-level `core.*` name.
@@ -215,6 +216,16 @@ class AgentTurn:
 @dataclass(frozen=True)
 class StagedChatFile:
     """One resident-generated file waiting for the primary chat reply commit."""
+
+    source_path: str
+    name: str
+    mime_type: str
+    data: bytes
+
+
+@dataclass(frozen=True)
+class StagedChatImage:
+    """One resident-generated image waiting for its chat reply transaction."""
 
     source_path: str
     name: str
@@ -7955,7 +7966,12 @@ def _outbound_file_prompt_block() -> str:
         "send-file returns ok. Do at most one lightweight check that the output "
         "opens and has the requested format; do not repeatedly render, screenshot, "
         "or tune fonts unless the user explicitly asks for layout QA. Tutorial "
-        "questions alone do not require a file."
+        "questions alone do not require a file. "
+        "GENERATED IMAGE DELIVERY: When an image capability produces a PNG, "
+        "JPEG, or WebP, save it under the same outbound directory and run "
+        f"`python {_IO_CLI_PATH} send-image --path <image_path> "
+        "[--name <display_name>]`. It will appear directly as a chat image. "
+        "Never expose a local path or claim delivery unless send-image returns ok."
     )
 
 
@@ -10179,6 +10195,7 @@ def post_reply(
     turn_failure_model: str = "",
     turn_failure_provider: str = "",
     file_followups: list[StagedChatFile] | None = None,
+    image_followups: list[StagedChatImage] | None = None,
 ) -> dict:
     """Post agent reply as a v1 ciphertext envelope.
 
@@ -10236,6 +10253,22 @@ def post_reply(
                         "file_byte_count": len(file_item.data),
                     }
                 )
+            sealed_image_followups = []
+            for image_item in image_followups or []:
+                image_envelope = _build_envelope(
+                    plaintext=bytes(image_item.data),
+                    owner_user_id=seal_user_id,
+                    user_pk_bytes=seal_user_pk,
+                    enclave_pk_bytes=seal_enc_pk,
+                    visibility=visibility,
+                )
+                sealed_image_followups.append(
+                    {
+                        "envelope": image_envelope,
+                        "image_mime": image_item.mime_type,
+                        "image_byte_count": len(image_item.data),
+                    }
+                )
             thinking_envelope = None
             safe_thinking = _sanitize_thinking_summary(thinking_summary)
             if safe_thinking:
@@ -10287,6 +10320,8 @@ def post_reply(
                 body["reply_to_message_id"] = reply_to_message_id
             if sealed_file_followups:
                 body["file_followups"] = sealed_file_followups
+            if sealed_image_followups:
+                body["image_followups"] = sealed_image_followups
             if gate_decision_id:
                 body["gate_decision_id"] = gate_decision_id
             if proactive_job_id:
@@ -10323,9 +10358,9 @@ def post_reply(
                 resp = _HTTP.post(url, json=_sealed_body(), headers=_HEADERS, timeout=15)
         return _handle_post_reply_response(resp)
 
-    if file_followups:
-        log.error("cannot post encrypted file followups without envelope encryption")
-        return {"error": "file_followup_encryption_unavailable"}
+    if file_followups or image_followups:
+        log.error("cannot post encrypted reply followups without envelope encryption")
+        return {"error": "reply_followup_encryption_unavailable"}
 
     # Encryption unavailable — plaintext path (will 400 on v1 backends).
     log.error(
@@ -14019,6 +14054,7 @@ def _process_messages(messages: list) -> float:
             else None
         )
         staged_outbound_files: list[StagedChatFile] = []
+        staged_outbound_images: list[StagedChatImage] = []
         if outbound_file_turn_active:
             try:
                 _begin_outbound_file_turn(trace_id, outbound_file_requirement)
@@ -14103,7 +14139,7 @@ def _process_messages(messages: list) -> float:
                 _notify_agent_turn_failure(e, foreground=True)
                 log.warning("agent error fallback disabled by env; this user turn will not get a visible reply")
                 if outbound_file_turn_active:
-                    _finish_outbound_file_turn(trace_id)
+                    _finish_outbound_attachment_turn(trace_id)
                 latest = max(latest, ts)
                 continue
         else:
@@ -14151,7 +14187,9 @@ def _process_messages(messages: list) -> float:
                     log.error("outbound file completion retry failed: %s", exc)
                     pending_failure_notice = exc
 
-            staged_outbound_files = _finish_outbound_file_turn(trace_id)
+            staged_outbound_files, staged_outbound_images = (
+                _finish_outbound_attachment_turn(trace_id)
+            )
             still_missing = _missing_outbound_file_suffixes(
                 outbound_file_requirement, staged_outbound_files
             )
@@ -14195,7 +14233,9 @@ def _process_messages(messages: list) -> float:
                 continue
             sanitized, removed = _sanitize_outbound_file_reply(
                 message,
-                attachment_staged=bool(staged_outbound_files),
+                attachment_staged=bool(
+                    staged_outbound_files or staged_outbound_images
+                ),
             )
             stripped_file_citation = stripped_file_citation or removed
             if sanitized.strip():
@@ -14212,6 +14252,12 @@ def _process_messages(messages: list) -> float:
                 "文件已经准备好了。"
                 if re.search(r"[\u4e00-\u9fff]", raw_user_content_for_lang)
                 else "The file is ready."
+            ]
+        if staged_outbound_images and not turn.messages:
+            turn.messages = [
+                "图片已经生成。"
+                if re.search(r"[\u4e00-\u9fff]", raw_user_content_for_lang)
+                else "The image is ready."
             ]
         _reply_text = "\n\n".join(m for m in turn.messages if isinstance(m, str) and m.strip())
         _emit_debug_trace(
@@ -14336,6 +14382,8 @@ def _process_messages(messages: list) -> float:
                     )
                 if idx == 0 and staged_outbound_files:
                     post_kwargs["file_followups"] = staged_outbound_files
+                if idx == 0 and staged_outbound_images:
+                    post_kwargs["image_followups"] = staged_outbound_images
                 result = post_reply(reply, **post_kwargs)
                 if isinstance(result, dict) and result.get("error"):
                     if result.get("error") in {
@@ -14525,6 +14573,7 @@ _outbound_file_lock = threading.Lock()
 _active_outbound_file_turn_id = ""
 _active_outbound_file_suffixes: tuple[str, ...] | None = None
 _staged_outbound_files: list[StagedChatFile] = []
+_staged_outbound_images: list[StagedChatImage] = []
 
 
 def _begin_outbound_file_turn(
@@ -14540,6 +14589,7 @@ def _begin_outbound_file_turn(
         _active_outbound_file_turn_id = str(turn_id or "")
         _active_outbound_file_suffixes = required_suffixes
         _staged_outbound_files.clear()
+        _staged_outbound_images.clear()
 
 
 def _staged_outbound_file_snapshot(turn_id: str) -> list[StagedChatFile]:
@@ -14549,21 +14599,31 @@ def _staged_outbound_file_snapshot(turn_id: str) -> list[StagedChatFile]:
         return list(_staged_outbound_files)
 
 
-def _finish_outbound_file_turn(turn_id: str) -> list[StagedChatFile]:
+def _finish_outbound_attachment_turn(
+    turn_id: str,
+) -> tuple[list[StagedChatFile], list[StagedChatImage]]:
     global _active_outbound_file_turn_id, _active_outbound_file_suffixes
     with _outbound_file_lock:
         if str(turn_id or "") != _active_outbound_file_turn_id:
-            return []
-        staged = list(_staged_outbound_files)
+            return [], []
+        staged_files = list(_staged_outbound_files)
+        staged_images = list(_staged_outbound_images)
         _staged_outbound_files.clear()
+        _staged_outbound_images.clear()
         _active_outbound_file_turn_id = ""
         _active_outbound_file_suffixes = None
-    for item in staged:
+    for item in [*staged_files, *staged_images]:
         try:
             Path(item.source_path).unlink(missing_ok=True)
         except OSError:
             pass
-    return staged
+    return staged_files, staged_images
+
+
+def _finish_outbound_file_turn(turn_id: str) -> list[StagedChatFile]:
+    """Backward-compatible file-only test/helper surface."""
+    files, _images = _finish_outbound_attachment_turn(turn_id)
+    return files
 
 
 def _safe_outbound_file_name(raw: str) -> str:
@@ -14691,6 +14751,81 @@ def _handle_stage_file_ipc(msg: dict) -> dict:
                     "request_id": request_id,
                 }
             _staged_outbound_files.append(item)
+    return {
+        "ok": True,
+        "staged": True,
+        "name": item.name,
+        "mime": item.mime_type,
+        "byte_count": len(item.data),
+        "request_id": request_id,
+    }
+
+
+def _handle_stage_image_ipc(msg: dict) -> dict:
+    """Validate and stage one binary raster result from the active agent turn."""
+    request_id = str(msg.get("request_id") or "").strip()
+    raw_path = str(msg.get("path") or "").strip()
+    if not request_id:
+        return {"ok": False, "error": "request_id_required"}
+    if not raw_path:
+        return {"ok": False, "error": "path_required", "request_id": request_id}
+
+    with _outbound_file_lock:
+        active_turn_id = _active_outbound_file_turn_id
+    if not active_turn_id:
+        return {"ok": False, "error": "no_active_chat_turn", "request_id": request_id}
+
+    source_path = Path(raw_path)
+    if not source_path.is_absolute():
+        source_path = OUTBOUND_FILE_DIR / source_path
+    try:
+        resolved_dir = OUTBOUND_FILE_DIR.resolve()
+        resolved_path = source_path.resolve(strict=True)
+        resolved_path.relative_to(resolved_dir)
+    except (OSError, ValueError):
+        return {
+            "ok": False,
+            "error": "path_outside_outbound_dir",
+            "request_id": request_id,
+        }
+
+    try:
+        source_data = resolved_path.read_bytes()
+        normalized = generated_image.normalize_generated_image(
+            source_data,
+            name=str(msg.get("name") or resolved_path.name),
+            index=len(_staged_outbound_images) + 1,
+        )
+    except (OSError, ValueError) as exc:
+        return {"ok": False, "error": str(exc), "request_id": request_id}
+
+    item = StagedChatImage(
+        source_path=str(resolved_path),
+        name=normalized.name,
+        mime_type=normalized.mime_type,
+        data=normalized.data,
+    )
+    with _outbound_file_lock:
+        if active_turn_id != _active_outbound_file_turn_id:
+            return {"ok": False, "error": "chat_turn_finished", "request_id": request_id}
+        for existing in _staged_outbound_images:
+            if existing.source_path == item.source_path:
+                item = existing
+                break
+        else:
+            if len(_staged_outbound_images) >= generated_image.MAX_GENERATED_IMAGES_PER_REPLY:
+                return {
+                    "ok": False,
+                    "error": "too_many_staged_images",
+                    "request_id": request_id,
+                }
+            if len(_staged_outbound_files) + len(_staged_outbound_images) >= 8:
+                return {
+                    "ok": False,
+                    "error": "too_many_staged_attachments",
+                    "request_id": request_id,
+                }
+            _staged_outbound_images.append(item)
     return {
         "ok": True,
         "staged": True,
@@ -14975,6 +15110,8 @@ def _redistill_ipc_serve_forever(sock_path: Path) -> None:
             op = str(obj.get("op") or "") if isinstance(obj, dict) else ""
             if op == "stage_file":
                 reply = _handle_stage_file_ipc(obj)
+            elif op == "stage_image":
+                reply = _handle_stage_image_ipc(obj)
             elif op == "redistill" and not _HOSTED:
                 reply = _handle_redistill_ipc(obj)
             else:
