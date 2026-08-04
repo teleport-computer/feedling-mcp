@@ -10,6 +10,14 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **Hosted Runtime V2 exposes finer-grained perception and memory tools.** The
+  model can now read the permission-gated recent app open/close trajectory,
+  request ambient or sensitive memory-index views, include archived or
+  superseded cards when fetching, and attach audit reasons to memory writes.
+  Tool guidance also distinguishes a recent app event from current app usage,
+  explains rolling perception baselines, accepts relative scheduled-wake times,
+  and routes requested screen pixels through the native visual observer.
+
 - **Hosted Runtime V2 now carries the complete genesis persona into every Chat
   and proactive wake turn.** The encrypted persona is decrypted just in time
   for the turn and placed in the trusted system prefix without profile or

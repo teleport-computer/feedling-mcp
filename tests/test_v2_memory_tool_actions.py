@@ -46,7 +46,26 @@ def test_update_maps_to_supersede_with_target():
 
 def test_delete_maps_to_memory_delete():
     out = worker._memory_tool_actions([{"op": "delete", "target_id": "mem_9"}])
-    assert out == [{"type": "memory.delete", "memory_id": "mem_9"}]
+    assert out == [{
+        "type": "memory.delete",
+        "memory_id": "mem_9",
+        "reason": "Written by the agent via the memory_write tool.",
+    }]
+
+
+def test_reason_is_forwarded_to_add_update_and_delete_with_bound():
+    long_reason = "r" * 1200
+    add, update, delete = worker._memory_tool_actions([
+        {"op": "add", "summary": "s", "content": "c", "reason": "because"},
+        {
+            "op": "update", "target_id": "m1", "summary": "s", "content": "c",
+            "reason": long_reason,
+        },
+        {"op": "delete", "target_id": "m2", "reason": "obsolete"},
+    ])
+    assert add["reason"] == "because"
+    assert update["reason"] == "r" * 1000
+    assert delete["reason"] == "obsolete"
 
 
 def test_update_without_target_is_discarded_not_rewritten():

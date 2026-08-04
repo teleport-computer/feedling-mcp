@@ -166,6 +166,35 @@ def test_photo_read_without_include_image_never_invokes_observer(monkeypatch):
     assert enqueued == []
 
 
+def test_screen_read_with_image_uses_native_observer_and_hides_pixels(monkeypatch):
+    seen = []
+
+    async def _observe_photo(mime, image_b64):
+        seen.append((mime, image_b64))
+        return "a terminal window with green text"
+
+    results, enqueued = _run(
+        [ToolCall(
+            id="screen-image",
+            name="screen_read",
+            args={"frame_id": "f1", "include_image": True},
+        )],
+        turn_authorization=False,
+        run_capability=lambda *_a, **_k: _FakeResult(True, {
+            "frame_id": "f1",
+            "media_type": "image/png",
+            "image_b64": "cGl4ZWxz",
+        }),
+        observe_photo=_observe_photo,
+        monkeypatch=monkeypatch,
+    )
+
+    assert seen == [("image/png", "cGl4ZWxz")]
+    assert "a terminal window with green text" in results[0].content
+    assert "cGl4ZWxz" not in results[0].content
+    assert enqueued == []
+
+
 @pytest.mark.parametrize(
     ("exc", "expected"),
     [

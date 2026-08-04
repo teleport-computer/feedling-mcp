@@ -781,7 +781,13 @@ _OUTBOUND_SAFE_PERCEPTION_SIGNALS = frozenset(
     {"steps", "sleep", "vitals", "activity", "body", "metabolic"}
 )
 _TEXT_BEARING_MEDIA_READ_TOOLS = frozenset(
-    {"screen_recent", "screen_read", "photo_recent", "photo_read"}
+    {
+        "screen_recent",
+        "screen_read",
+        "photo_recent",
+        "photo_read",
+        "perception_recent_apps",
+    }
 )
 
 
@@ -3876,9 +3882,16 @@ def _memory_tool_actions(raw_actions) -> list[dict]:
             or a.get("memory_id")
             or ""
         ).strip()
+        reason = str(a.get("reason") or "").strip()[:1000]
+        if not reason:
+            reason = "Written by the agent via the memory_write tool."
         if op in ("delete", "remove"):
             if target:
-                out.append({"type": "memory.delete", "memory_id": target})
+                out.append({
+                    "type": "memory.delete",
+                    "memory_id": target,
+                    "reason": reason,
+                })
             continue
         if op in ("update", "supersede", "merge", "patch") and not target:
             # Never turn an invalid targeted mutation into a new memory.add.
@@ -3898,7 +3911,7 @@ def _memory_tool_actions(raw_actions) -> list[dict]:
             ),
         }
         base = {
-            "reason": "Written by the agent via the memory_write tool.",
+            "reason": reason,
             "capture_mode": "agent_tool",
         }
         if op in ("update", "supersede", "merge", "patch"):

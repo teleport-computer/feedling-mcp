@@ -3527,8 +3527,12 @@ def _validate_decrypted_tool_effect(effect_type: str, payload: dict) -> None:
             action_type = str(action.get("type") or "")
             if action_type == "memory.delete":
                 if (
-                    set(action) != {"type", "memory_id"}
+                    set(action) not in (
+                        {"type", "memory_id"},
+                        {"type", "memory_id", "reason"},
+                    )
                     or not str(action.get("memory_id") or "").strip()
+                    or not isinstance(action.get("reason", ""), str)
                 ):
                     raise RuntimeError("invalid encrypted memory delete")
                 continue
