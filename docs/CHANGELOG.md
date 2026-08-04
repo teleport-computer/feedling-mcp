@@ -47,6 +47,31 @@
 
 ## 记录正文（最新的在上面）
 
+## 2026-08-05 — V2→V1 颗粒度对齐总攻（Seven 全权委托,一日闭环）
+
+**[DONE] Runtime V2 体验收敛到 V1:人设注入、心跳自觉、工具面 parity、test 开关常态全开,live E2E 全绿。**
+
+- 根因框架(三旋钮):①信息食谱——V2 原本**完全没有人设注入**(`persona`
+  一词在 v2 runtime 不存在),已补(95bbd545,每 turn JIT 解密全文进 system
+  前缀);②harness——wake 补 attention_facts+系统措辞禁令(a53a2923,叠加
+  志豪 PR #158 的伪 user nudge 移除/wake 语义恢复/感知 baseline);③模型
+  本性——弱模型不爱调工具,靠确定性注入兜底(保留的 V2 结构优势)。
+- 工具面 parity(3f9d375d):新增 perception_recent_apps;memory_index 补
+  ambient/include_sensitive、memory_fetch 补 limit/archived/superseded、
+  memory_write 补 reason 审计;D4 改名校验前移;V1 agent_tools_prompt.md 的
+  产品措辞逐条搬进工具描述。chat_image_read 判定为有意 limitation(P2 提案
+  =vision-observer 模式)。DND 现在拦 heartbeat/screen_watch(d8b33a26)。
+- test compose 定为「常态全开」:CAPTURE/PROFILE/DETERMINISTIC 硬编码 1
+  (86f0763c/ecb5c055),守门测试按环境分派;**prod/pre 一字未动**。
+- live E2E(本地 rig+真 deepseek-chat):人设首轮零工具在场✓、wake 无泄漏
+  /无第三人称✓、DND 闸✓、capture 3 张精准卡✓、profile state=ok✓。两个
+  假阴性已分诊(空料输入不写卡/不产画像=正确保守;会话中途改人设名被对话
+  连续性带跑=V1 同病,验收看注入层)。
+- 文档:docs/RUNTIME_V2_FLOWS.md(全流程报告,每 lane 触发→流程→prompt→
+  副作用→V1 差异)、docs/RUNTIME_V2_PARITY.md(债务台账)。
+- 遗留(归 Seven):prod 放 V2/用户迁回、PROFILE 上 prod、chat_image_read
+  P2、reminder 列表 API P2。
+
 ## 2026-07-31 — V2 照片唤醒按需读取真实图片
 
 **[FIX] V2 模型调用 `photo_read(include_image=true)` 后，现在会看到安全的视觉观察文本，而不再只有照片元数据。**

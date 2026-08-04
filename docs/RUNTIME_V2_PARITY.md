@@ -14,6 +14,16 @@
 3. **模型本性**:BYOK 弱模型(Flash/Mini)裸 API 上天生不爱调工具 ——
    prompt 治不了,靠 harness 绕(确定性预取 / tool_choice 强制)。
 
+## ✅ 终局(2026-08-05 夜):live E2E 全绿,总攻闭环
+
+真实弱模型(deepseek-chat)本地 rig 验收:人设首轮零工具在场 PASS("本喵是
+星尘…阿霖喵~");wake 无系统措辞/无第三人称 PASS;DND 闸 PASS;capture 对
+有料对话产 3 张精准卡 PASS(空料不写=正确保守);profile state=ok PASS
+(空花园=empty 正确)。假阴性分诊:会话中途改人设名,弱模型被对话连续性带
+跑答旧名——注入层实证已更新(月见),V1 同病,非 V2 缺陷。Batch-2
+(3f9d375d/d8b33a26)gatekeep PASS(224 独立复验)。遗留 P2:chat_image_read
+(vision-observer 提案)、reminder 列表 API、prod rollout(归 Seven)。
+
 ## 进展(2026-08-05 全面审计后)
 
 - ✅ P0-1 persona 注入(95bbd545)、P0-2 wake attention_facts+禁令(a53a2923,
