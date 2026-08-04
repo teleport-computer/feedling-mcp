@@ -90,13 +90,13 @@ def run_vps_cell(cell: VpsCell) -> dict:
                      f"{time.time() - sent:.0f}s; head={text[:40]!r}" if reply
                      else f"no reply in {REPLY_TIMEOUT:.0f}s; log tail={_tail(log_path)}")
 
-                # decryption continuity (HARD P0, Seven 2026-07-18): the user must
-                # be able to decrypt the resident agent's reply with their own key,
-                # not just receive it (usr_f13f922a). Only meaningful once a reply
-                # arrived; strict decrypt, no server-plaintext shortcut.
+                # Tier/readability continuity (HARD P0): encrypted replies must
+                # decrypt with the user's key; plaintext replies must be canonical
+                # `body` rows without residual crypto fields. Only meaningful once
+                # a reply arrived.
                 if reply is not None:
                     try:
-                        dec = c.decrypt_reply(reply)
+                        dec = c.read_reply_strict(reply)
                         dec_err = ""
                     except Exception as de:  # noqa: BLE001
                         dec, dec_err = "", f"{type(de).__name__}: {de}"

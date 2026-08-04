@@ -63,11 +63,12 @@ def test_envelope_seal_open_roundtrip() -> None:
         client._http.close()
 
 
-def test_message_text_accepts_three_history_shapes() -> None:
+def test_message_text_accepts_plaintext_and_encrypted_history_shapes() -> None:
     client = _client()
     try:
         envelope = client._seal("sealed reply")
         assert client.message_text({"content": "plain reply"}) == "plain reply"
+        assert client.message_text({"body": "plaintext-tier reply"}) == "plaintext-tier reply"
         assert client.message_text(envelope) == "sealed reply"
         assert client.message_text({"envelope": envelope}) == "sealed reply"
     finally:
@@ -114,6 +115,19 @@ def test_decrypt_reply_raises_on_undecryptable_envelope() -> None:
         envelope["body_ct"] = base64.b64encode(b"garbage-ciphertext-not-valid").decode()
         with pytest.raises(Exception):
             client.decrypt_reply(envelope)
+    finally:
+        client._http.close()
+
+
+def test_read_reply_strict_enforces_plaintext_tier_shape() -> None:
+    client = _client()
+    client.content_encryption_effective = "off"
+    try:
+        assert client.read_reply_strict({"body": "plain reply"}) == "plain reply"
+        with pytest.raises(RuntimeError, match="no body"):
+            client.read_reply_strict({"content": "shortcut must not pass"})
+        with pytest.raises(RuntimeError, match="retains crypto fields"):
+            client.read_reply_strict({"body": "mixed", "body_ct": "sealed"})
     finally:
         client._http.close()
 
@@ -282,6 +296,29 @@ def test_send_chat_retry_reuses_one_client_msg_id(monkeypatch) -> None:
     ids = {p["client_msg_id"] for p in payloads}
     assert len(ids) == 1                      # minted once, reused on retry
     uuid.UUID(ids.pop())                      # and a legal UUID
+
+
+def test_send_chat_uses_plaintext_envelope_when_effective_off() -> None:
+    client = _client()
+    client.content_encryption_effective = "off"
+    client._http.close()
+    payloads: list[dict] = []
+
+    class CaptureHTTP:
+        def request(self, _method, _url, *, headers=None, json=None, **_kw):
+            payloads.append(json)
+            return FakeResponse(200, {"ts": 456.0})
+
+        def close(self):
+            pass
+
+    client._http = CaptureHTTP()  # type: ignore[assignment]
+    assert client.send_chat("plain hello") == 456.0
+    assert payloads[0]["envelope"] == {
+        "body": "plain hello",
+        "owner_user_id": "e2e-user",
+        "visibility": "shared",
+    }
 
 
 def test_orphan_manifest_created_0600_and_removed_on_teardown(monkeypatch, tmp_path) -> None:

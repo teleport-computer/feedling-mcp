@@ -109,13 +109,13 @@ def run_hosted_cell(cell: HostedCell, pool: dict[str, str]) -> dict:
             return {"cell": cell.name, "result": "fail", "steps": steps,
                     "user_id": c.user_id}
 
-        # -- decryption continuity (HARD P0, Seven 2026-07-18) ----------------
-        # A reply ARRIVING is not enough — the USER must decrypt it with THEIR
-        # key, or their screen is garbage while the AI keeps talking
-        # (usr_f13f922a). Strict decrypt, no server-plaintext shortcut; failure
-        # blocks the release just like a dead chat loop.
+        # -- tier/readability continuity (HARD P0) ----------------------------
+        # A reply ARRIVING is not enough: encrypted-tier replies must decrypt
+        # with the user's key; plaintext-tier replies must be canonical `body`
+        # rows with no residual crypto fields. A shape/read failure blocks the
+        # release just like a dead chat loop.
         try:
-            dec = c.decrypt_reply(reply)
+            dec = c.read_reply_strict(reply)
             dec_err = ""
         except Exception as de:  # noqa: BLE001
             dec, dec_err = "", f"{type(de).__name__}: {de}"

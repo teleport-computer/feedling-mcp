@@ -77,13 +77,16 @@ class E2EClient:
     """
 
     def __init__(self, api_url: str, user_id: str, api_key: str, sk: PrivateKey,
-                 enclave_pk: bytes):
+                 enclave_pk: bytes, content_encryption_effective: str = "on"):
         _refuse_prod(api_url)
         self.api_url = api_url.rstrip("/")
         self.user_id = user_id
         self.api_key = api_key
         self._sk = sk
         self._enclave_pk = enclave_pk
+        self.content_encryption_effective = (
+            "off" if content_encryption_effective == "off" else "on"
+        )
         self._http = httpx.Client(timeout=60, verify=False)
         self._deleted = False
         self._orphan_file: Path | None = None
@@ -128,10 +131,14 @@ class E2EClient:
                 who = boot.get(f"{api_url}/v1/users/whoami",
                                headers={"X-API-Key": api_key})
                 who.raise_for_status()
+                who_body = who.json()
                 enclave_pk = bytes.fromhex(
-                    who.json().get("enclave_content_public_key_hex") or "")
+                    who_body.get("enclave_content_public_key_hex") or "")
                 if len(enclave_pk) != 32:
                     raise RuntimeError("whoami returned an invalid enclave content public key")
+                content_encryption_effective = str(
+                    who_body.get("content_encryption_effective") or "on"
+                ).strip().lower()
             except Exception:
                 if api_key:
                     try:
@@ -148,7 +155,14 @@ class E2EClient:
                         print(f"[e2e] WARNING provision cleanup failed: {cleanup_error}",
                               file=sys.stderr)
                 raise
-        client = cls(api_url, user_id, api_key, sk, enclave_pk)
+        client = cls(
+            api_url,
+            user_id,
+            api_key,
+            sk,
+            enclave_pk,
+            content_encryption_effective=content_encryption_effective,
+        )
         client._orphan_file = manifest
         return client
 
@@ -231,6 +245,9 @@ class E2EClient:
         content = str(msg.get("content") or "")
         if content:
             return content
+        body = msg.get("body")
+        if isinstance(body, str):
+            return body
         if msg.get("body_ct") and msg.get("K_user"):
             try:
                 return self.open_envelope(msg)
@@ -261,6 +278,26 @@ class E2EClient:
             # don't silently pass. Either way, no envelope = cannot prove readability.
             raise RuntimeError("reply carries no inline sealed envelope to decrypt")
         return self.open_envelope(env)
+
+    def read_reply_strict(self, msg: dict) -> str:
+        """Prove a reply matches and is readable under the effective tier.
+
+        Encrypted accounts must pass the existing user-private-key decrypt
+        proof.  Plaintext accounts must carry the canonical ``body`` shape and
+        no residual crypto fields; accepting a generic ``content`` shortcut
+        here would hide a mixed-shape write regression.
+        """
+        if self.content_encryption_effective != "off":
+            return self.decrypt_reply(msg)
+        body = msg.get("body")
+        if not isinstance(body, str):
+            raise RuntimeError("plaintext-tier reply carries no body")
+        if any(
+            msg.get(key) is not None
+            for key in ("body_ct", "nonce", "K_user", "K_enclave")
+        ):
+            raise RuntimeError("plaintext-tier reply retains crypto fields")
+        return body
 
     def get(self, path: str, **kw) -> httpx.Response:
         return self._request("GET", path, **kw)
@@ -300,8 +337,17 @@ class E2EClient:
         retried POST can never double-ingest (memory ring / wake side effects
         included — envelope-id dedup alone only covers the DB row)."""
         sent_at = time.time()
+        envelope = (
+            {
+                "body": text,
+                "owner_user_id": self.user_id,
+                "visibility": "shared",
+            }
+            if self.content_encryption_effective == "off"
+            else self._seal(text)
+        )
         r = self.post("/v1/chat/message", json={
-            "envelope": self._seal(text),
+            "envelope": envelope,
             "client_msg_id": str(uuid.uuid4()),
         })
         r.raise_for_status()
