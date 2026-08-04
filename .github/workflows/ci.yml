@@ -1891,6 +1891,10 @@ jobs:
         env:
           FEEDLING_API_URL:     ${{ vars.PRE_API_URL || 'https://pre-api.feedling.app' }}
           FEEDLING_ENCLAVE_URL: ${{ vars.PRE_MAIN_ENCLAVE_URL }}
+          # Phala reports the CVM running before the custom-domain TLS ingress
+          # necessarily accepts connections. Keep functional failures strict,
+          # but give transport/502/503/504 readiness up to ~2 minutes.
+          FEEDLING_CANARY_HTTP_TRIES: '7'
         run: |
           python3 -m pip install --quiet cryptography
           python3 tools/deploy_canary.py
