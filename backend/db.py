@@ -10737,6 +10737,7 @@ def delete_user_data(user_id: str) -> None:
         "user_blobs",
         "perception_items",
         "perception_daily",
+        "perception_signal_state_v2",
         "genesis_import_chunks",
         "genesis_import_outputs",
         "genesis_import_jobs",
@@ -10766,6 +10767,7 @@ def delete_user_data(user_id: str) -> None:
         "genesis_import_chunks",
         "model_api_routes",
         "model_api_credentials",
+        "perception_signal_state_v2",
     }
     mirror_group = [
         (f"DELETE FROM {tee_table_for.get(table, table)} WHERE user_id = %s", (user_id,))

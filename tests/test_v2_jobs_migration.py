@@ -59,6 +59,68 @@ def _migration_0075_module():
     )
 
 
+def test_0077_perception_signal_state_is_the_single_installed_head():
+    """A deploy missing the durable baseline migration must fail before rollout."""
+    backend = Path(__file__).parent.parent / "backend"
+    cfg = Config(str(backend / "alembic.ini"))
+    cfg.set_main_option("script_location", str(backend / "alembic"))
+    script = ScriptDirectory.from_config(cfg)
+
+    assert script.get_heads() == ["0077_perception_signal_state_v2"]
+    migration = script.get_revision("0077_perception_signal_state_v2")
+    assert migration.down_revision == "0076_plaintext_job_exclusivity"
+
+    with db.get_pool().connection() as conn:
+        installed_head = conn.execute(
+            "SELECT version_num FROM alembic_version"
+        ).fetchone()
+        columns = {
+            row[0]: (row[1], row[2])
+            for row in conn.execute(
+                "SELECT column_name, data_type, is_nullable "
+                "FROM information_schema.columns "
+                "WHERE table_schema='public' "
+                "AND table_name='perception_signal_state_v2'"
+            ).fetchall()
+        }
+        primary_key = tuple(
+            row[0]
+            for row in conn.execute(
+                "SELECT a.attname "
+                "FROM pg_constraint c "
+                "JOIN unnest(c.conkey) WITH ORDINALITY AS k(attnum, ord) "
+                "  ON TRUE "
+                "JOIN pg_attribute a "
+                "  ON a.attrelid=c.conrelid AND a.attnum=k.attnum "
+                "WHERE c.conrelid='perception_signal_state_v2'::regclass "
+                "AND c.contype='p' ORDER BY k.ord"
+            ).fetchall()
+        )
+        cascade_fk = conn.execute(
+            "SELECT rc.delete_rule "
+            "FROM information_schema.referential_constraints rc "
+            "JOIN information_schema.table_constraints tc "
+            "  ON tc.constraint_catalog=rc.constraint_catalog "
+            " AND tc.constraint_schema=rc.constraint_schema "
+            " AND tc.constraint_name=rc.constraint_name "
+            "WHERE tc.table_schema='public' "
+            "AND tc.table_name='perception_signal_state_v2'"
+        ).fetchone()
+
+    assert installed_head == ("0077_perception_signal_state_v2",)
+    assert columns == {
+        "user_id": ("text", "NO"),
+        "signal": ("text", "NO"),
+        "value_fingerprint": ("text", "NO"),
+        "last_seen_at": ("timestamp with time zone", "NO"),
+        "last_changed_at": ("timestamp with time zone", "NO"),
+        "source_event_id": ("text", "YES"),
+        "updated_at": ("timestamp with time zone", "NO"),
+    }
+    assert primary_key == ("user_id", "signal")
+    assert cascade_fk == ("CASCADE",)
+
+
 def test_0075_usage_rollup_schema_is_installed_without_source_backfill():
     migration = _migration_0075_module()
 
@@ -106,7 +168,7 @@ def test_0075_usage_rollup_schema_is_installed_without_source_backfill():
             "AND tgrelid='v2_turn_metrics'::regclass"
         ).fetchone()[0]
 
-    assert head == ("0076_plaintext_job_exclusivity",)
+    assert head == ("0077_perception_signal_state_v2",)
     assert tables == {
         "v2_usage_daily_users",
         "v2_usage_daily_dimensions",

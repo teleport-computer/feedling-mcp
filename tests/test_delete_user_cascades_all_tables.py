@@ -5,7 +5,7 @@ import db
 # 迁移后加了 FK 的、以及 genesis 子表：删 users 行必须全部级联清空
 _PER_USER_TABLES = [
     "chat_messages", "frame_envelopes", "memory_moments", "perception_daily",
-    "perception_items", "user_blobs", "user_logs",
+    "perception_items", "perception_signal_state_v2", "user_blobs", "user_logs",
     "genesis_import_jobs", "genesis_import_chunks", "genesis_import_outputs",
 ]
 
@@ -35,6 +35,13 @@ def _seed_min_rows(conn, uid):
     conn.execute(
         "INSERT INTO perception_items (user_id, kind, item_id, ts, doc) "
         "VALUES (%s, 'photo', 'p1', 0, '{}')",
+        (uid,),
+    )
+    conn.execute(
+        "INSERT INTO perception_signal_state_v2 "
+        "(user_id, signal, value_fingerprint, last_seen_at, last_changed_at) "
+        "VALUES (%s, 'wifi_anchor', 'fingerprint', "
+        "'2026-08-04T00:00:00Z', '2026-08-04T00:00:00Z')",
         (uid,),
     )
     conn.execute(
