@@ -2,25 +2,39 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Close the Admin usage project with P0-A as the only shipped scope, verify its existing `test` delivery, publish the scope decision, and preserve P0-B as non-deployable experimental work.
+**Goal:** Close the Admin usage project with P0-A as the only shipped scope, verify its existing `test` delivery, publish the scope decision, and preserve P0-B as non-deployable archival/review work.
 
-**Architecture:** PR #146 already merged P0-A into `test` at merge commit `6d65bc7bf09cb8fe04e9e920304b6bcb22b199aa`. The remaining work is release verification and documentation: validate the merged P0-A implementation, prove the test environment serves the Usage and Runtime surfaces without business-path degradation, record the completed direct docs-only update, and preserve P0-B only as an archived branch with no PR or deployment.
+**Architecture:** [PR #146](https://github.com/teleport-computer/feedling-mcp/pull/146) already merged P0-A into `test` at merge commit `6d65bc7bf09cb8fe04e9e920304b6bcb22b199aa` and remains the only product-code delivery. The remaining work is release verification and documentation: validate the merged P0-A implementation, prove the test environment serves the Usage and Runtime surfaces without business-path degradation, record the completed direct two-document update, and preserve P0-B only through an explicitly non-deliverable Draft archive/review PR.
 
 **Tech Stack:** Python 3, pytest, Ruff, PostgreSQL 16 test container, Git/GitHub CLI, existing Feedling test API and business RDS.
 
 ## Execution status (2026-08-04)
 
-PR #146 already merged the P0-A product code into `test`. Docs-only PR #154
+[PR #146](https://github.com/teleport-computer/feedling-mcp/pull/146) merged the
+P0-A product code into `test` and remains the only product-code delivery.
+Docs-only [PR #154](https://github.com/teleport-computer/feedling-mcp/pull/154)
 was closed unmerged after unrelated current-`test` Dream policy checks failed.
-The maintainer-authorized direct docs-only fast-forward completed on `test` at
-integration commit `3b17da22a8bdf3b791ce59bd5f7a655c65543a57`. The former
-follow-up-PR workflow in Task 3 is historical and superseded: it **MUST NOT**
-be executed or used to create another PR. P0-B and P0-C remain deferred.
+The maintainer-authorized direct two-document update landed on `test` through
+the normal fast-forward sequence culminating in the status correction at
+[`953c074d45309448360125753fb231006344eeee`](https://github.com/teleport-computer/feedling-mcp/commit/953c074d45309448360125753fb231006344eeee).
+The former follow-up-PR workflow in Task 3 is historical and superseded: it
+**MUST NOT** be executed or used to create another PR.
+
+User-authorized [Draft PR #155](https://github.com/teleport-computer/feedling-mcp/pull/155)
+is OPEN against `test` from `feat/provider-attempt-accounting` at
+`dbfdeed3b4f19a774870fa0e5c1a7cb4f160d1eb`. It exists only for archival and
+review; GitHub reports `DIRTY` / `CONFLICTING`, and it is **NOT READY FOR MERGE
+OR DEPLOYMENT**. P0-B failed its strict 3-million-turn plus 3-million-attempt
+performance gate and requires redesign, rebase, and renewed validation. The
+Draft authorizes no `test` or production deployment. Only P0-A is shipped on
+`test`; P0-B, P0-C, and billing-grade accounting remain unshipped, production
+is untouched, and no new infrastructure or product store was introduced.
 
 ## Global Constraints
 
 - P0-A is operational telemetry, not financial billing or provider-invoice truth.
-- Do not merge or deploy `feat/provider-attempt-accounting`.
+- Do not merge or deploy `feat/provider-attempt-accounting` or its archival
+  [Draft PR #155](https://github.com/teleport-computer/feedling-mcp/pull/155).
 - Do not start P0-C resident usage upload work.
 - Do not deploy or modify production in this plan.
 - Use only the existing business RDS and existing deployment units; add no SQLite, local PostgreSQL product dependency, Redis, Kafka, RDS, service, container, or CVM.
@@ -55,7 +69,7 @@ be executed or used to create another PR. P0-B and P0-C remain deferred.
 
 **Interfaces:**
 - Consumes: P0-A head `8a42a6d23229be41a36beb1e1a5b2e4b5782b226` and checked-in scale evidence under `docs/superpowers/evidence/2026-08-02-admin-usage-scale.*`.
-- Produces: fresh local test, static-analysis, migration, scope, and performance-evidence results suitable for the follow-up PR.
+- Produces: fresh local test, static-analysis, migration, scope, and performance-evidence results suitable for the closeout record.
 
 - [ ] **Step 1: Confirm branch and merge ancestry**
 
@@ -257,21 +271,26 @@ not infer deployment from GitHub branch state alone.
 
 ### Task 3 (historical — superseded; MUST NOT execute): Former docs-only follow-up PR
 
-**Superseded status:** The maintainer-authorized direct docs-only fast-forward
-completed on `test` at `3b17da22a8bdf3b791ce59bd5f7a655c65543a57`. Docs-only
-PR #154 is closed unmerged. The commands and expected results below are kept
-only as historical context; **do not run them, reopen #154, or create another
-docs-only PR**.
+**Superseded status:** The maintainer-authorized direct two-document update
+landed on `test` through the normal fast-forward sequence culminating in the
+status correction at
+[`953c074d45309448360125753fb231006344eeee`](https://github.com/teleport-computer/feedling-mcp/commit/953c074d45309448360125753fb231006344eeee).
+Docs-only [PR #154](https://github.com/teleport-computer/feedling-mcp/pull/154)
+is closed unmerged; the documents did not land through a PR merge. The commands
+and expectations below are kept only as historical context; **MUST NOT execute
+them, reopen #154, or create another docs-only PR**.
 
 **Files:**
 - Create: `docs/superpowers/specs/2026-08-04-admin-usage-p0a-only-delivery-design.md`
 - Create: `docs/superpowers/plans/2026-08-04-admin-usage-p0a-only-delivery.md`
 
 **Interfaces:**
-- Consumes: successful Task 1 verification and the already merged PR #146.
-- Produces: one docs-only PR against `test` recording the final product boundary.
+- Historical input: successful Task 1 verification and already merged
+  [PR #146](https://github.com/teleport-computer/feedling-mcp/pull/146).
+- Actual outcome: the two documents landed directly through the authorized
+  fast-forward sequence; PR #154 closed unmerged and no product code changed.
 
-- [x] **Historical Step 1 (superseded — do not execute): Verify the follow-up diff contains only the two scope documents**
+- [x] **Archived Step 1 (superseded — MUST NOT execute): Verify the former follow-up diff contains only the two scope documents**
 
 Run:
 
@@ -283,7 +302,7 @@ git diff --check origin/test...HEAD
 
 Expected: exactly the design and plan files listed above; no backend, migration, infrastructure, generated, or evidence files.
 
-- [x] **Historical Step 2 (superseded — do not execute): Push the existing P0-A branch**
+- [x] **Archived Step 2 (superseded — MUST NOT execute): Push the former P0-A branch**
 
 Run:
 
@@ -293,7 +312,7 @@ git push origin feat/admin-runtime-user-report
 
 Expected: remote branch advances to the scope-document commits. This push does not deploy because it does not update `test`.
 
-- [x] **Historical Step 3 (superseded — do not execute): Open the docs-only PR against `test`**
+- [x] **Archived Step 3 (superseded — MUST NOT execute): Open the former docs-only PR against `test`**
 
 Run:
 
@@ -307,7 +326,7 @@ gh pr create --repo teleport-computer/feedling-mcp \
 
 Expected: the PR file list contains only the two scope documents and branch-flow CI accepts the `test` base.
 
-- [x] **Historical Step 4 (superseded — do not execute): Wait for and inspect required checks**
+- [x] **Archived Step 4 (superseded — MUST NOT execute): Wait for and inspect the former PR checks**
 
 Run:
 
@@ -320,7 +339,7 @@ gh pr checks "$TASK_FOLLOWUP_PR" \
 
 Expected: all required checks pass. A failure must be inspected with `gh run view`; do not merge around the check.
 
-- [x] **Historical Step 5 (superseded — do not execute): Merge the docs-only PR only after green checks**
+- [x] **Archived Step 5 (never completed — MUST NOT execute): Former docs-only PR merge**
 
 Run:
 
@@ -329,10 +348,20 @@ gh pr merge "$TASK_FOLLOWUP_PR" \
   --repo teleport-computer/feedling-mcp --merge --delete-branch=false
 ```
 
-Expected: `test` gains documentation only; no production promotion is
-triggered.
+Historical expectation only: `test` would gain documentation only, with no
+production promotion. This merge did not occur: PR #154 was closed unmerged,
+and the authorized direct fast-forward sequence delivered the two documents.
 
-### Task 4: Preserve P0-B as an explicitly non-deliverable experiment
+### Task 4 (completed archival record): Preserve P0-B without delivery authorization
+
+**Completed status:** The user authorized OPEN
+[Draft PR #155](https://github.com/teleport-computer/feedling-mcp/pull/155)
+solely to archive and review the deferred P0-B experiment. It targets `test`
+from `feat/provider-attempt-accounting` at
+`dbfdeed3b4f19a774870fa0e5c1a7cb4f160d1eb`. GitHub reports the Draft as
+`DIRTY` / `CONFLICTING`; it is **NOT READY FOR MERGE OR DEPLOYMENT** and
+**MUST NOT** be merged or deployed. It authorizes no `test` or production
+deployment.
 
 **Files:**
 - Preserve branch: `feat/provider-attempt-accounting`
@@ -342,51 +371,46 @@ triggered.
 
 **Interfaces:**
 - Consumes: local P0-B head `dbfdeed3b4f19a774870fa0e5c1a7cb4f160d1eb` and the P0-A-only scope decision.
-- Produces: a remote archival branch with no PR, merge, deployment, or implied readiness.
+- Produces: a preserved remote branch and an OPEN Draft archival/review PR,
+  with no merge, deployment, or implied readiness.
 
-- [ ] **Step 1: Verify the P0-B worktree has no tracked modifications**
+- [x] **Step 1: Record the preserved branch state**
 
-Run:
+At archival time, the branch head was
+`dbfdeed3b4f19a774870fa0e5c1a7cb4f160d1eb`, and the two raw evidence JSON
+files listed above remained intentionally uncommitted. The committed report and
+design history remain available on the branch.
 
-```bash
-git status --short --branch
-git diff --check
-```
+- [x] **Step 2: Record the user-authorized Draft archive**
 
-Expected: only the two explicitly listed untracked JSON artifacts remain.
+Draft PR #155 is OPEN against `test` from
+`feat/provider-attempt-accounting` at the preserved head. Its only purpose is
+archival/review; opening it did not authorize or trigger a test or production
+deployment.
 
-- [ ] **Step 2: Push the P0-B branch for preservation**
+- [x] **Step 3: Record the failed readiness gate and current conflict state**
 
-Run:
+The strict P0-B 3-million-turn plus 3-million-attempt performance gate failed.
+The final narrow-candidate warm runs timed out, recorded full plans remained at
+approximately 3.704 seconds and 4.342 seconds because of structural
+spill/materialization, and the formal-attempt subsection against the production
+shape also timed out. GitHub currently reports the Draft as `DIRTY` and
+`CONFLICTING`. Redesign, rebase, and renewed validation are required before any
+future delivery decision; the current Draft is **NOT READY FOR MERGE OR
+DEPLOYMENT**.
 
-```bash
-git push -u origin feat/provider-attempt-accounting
-```
+- [x] **Step 4: Record the final delivery boundary**
 
-Expected: remote branch points to `dbfdeed3`; no PR is created and no deployment workflow is triggered.
+Final state:
 
-- [ ] **Step 3: Confirm no P0-B or P0-C delivery PR exists**
-
-Run:
-
-```bash
-gh pr list --repo teleport-computer/feedling-mcp \
-  --state open --head feat/provider-attempt-accounting
-gh pr list --repo teleport-computer/feedling-mcp \
-  --state open --head feat/resident-usage-rds-upload
-```
-
-Expected: both lists are empty.
-
-- [ ] **Step 4: Report the final boundary**
-
-Report:
-
-- P0-A code is merged and verified on `test`;
-- the docs-only scope PR is merged to `test`;
-- P0-B exists only as a non-deployable remote archive;
-- P0-C was not started;
-- production was not modified;
-- exact financial billing remains explicitly unsupported.
+- [PR #146](https://github.com/teleport-computer/feedling-mcp/pull/146)
+  remains the only product-code delivery, and only P0-A is shipped on `test`;
+- PR #154 is closed unmerged; the two closeout documents landed through the
+  authorized normal fast-forward sequence;
+- Draft PR #155 preserves P0-B for archival/review only and **MUST NOT** be
+  merged or deployed;
+- P0-B, P0-C, and billing-grade accounting remain unshipped;
+- production remains untouched; and
+- no new infrastructure or product telemetry store was introduced.
 
 At this milestone, follow the Router preview gate before writing the durable team summary.
