@@ -97,6 +97,19 @@ def test_due_heartbeat_users_includes_user_whose_cooldown_has_expired():
     assert "u_ws_cooldown_over" in due
 
 
+def test_due_heartbeat_users_excludes_dnd_and_restores_when_disabled():
+    uid = "u_ws_dnd"
+    seed_user(uid)
+    now = time.time()
+    jobs_store.upsert_wake_schedule(uid, next_heartbeat_at=now - 10)
+
+    db.set_blob(uid, "proactive_settings", {"dnd": True})
+    assert uid not in jobs_store.due_heartbeat_users(now=now)
+
+    db.set_blob(uid, "proactive_settings", {"dnd": False})
+    assert uid in jobs_store.due_heartbeat_users(now=now)
+
+
 def _append_user_row(user_id: str, msg_id: str, *, source: str = "chat") -> int:
     db.chat_append_strict(
         user_id,

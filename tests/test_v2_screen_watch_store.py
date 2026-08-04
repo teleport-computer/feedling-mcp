@@ -61,6 +61,18 @@ def test_due_screen_watch_users_excludes_payment_cooldown():
     assert jobs_store.due_screen_watch_users(now=500.0) == []
 
 
+def test_due_screen_watch_users_excludes_dnd_and_restores_when_disabled():
+    uid = "u_sw_dnd"
+    conftest.seed_user(uid)
+    jobs_store.upsert_wake_schedule(uid, next_screen_watch_at=100.0)
+
+    db.set_blob(uid, "proactive_settings", {"dnd": True})
+    assert jobs_store.due_screen_watch_users(now=500.0) == []
+
+    db.set_blob(uid, "proactive_settings", {"dnd": False})
+    assert jobs_store.due_screen_watch_users(now=500.0) == [uid]
+
+
 def test_null_next_screen_watch_at_is_not_due():
     conftest.seed_user("u_sw_null")
     jobs_store.upsert_wake_schedule("u_sw_null", next_heartbeat_at=1.0)

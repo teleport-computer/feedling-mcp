@@ -10,6 +10,10 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **Do Not Disturb now suppresses Runtime V2 heartbeat and screen-watch
+  scheduling.** Due-query polling excludes accounts whose proactive settings
+  have `dnd` enabled and resumes automatically when DND is turned off.
+
 - **Hosted Runtime V2 exposes finer-grained perception and memory tools.** The
   model can now read the permission-gated recent app open/close trajectory,
   request ambient or sensitive memory-index views, include archived or
