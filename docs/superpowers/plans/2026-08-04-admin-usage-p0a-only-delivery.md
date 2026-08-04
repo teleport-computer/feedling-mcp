@@ -4,7 +4,7 @@
 
 **Goal:** Close the Admin usage project with P0-A as the only shipped scope, verify its existing `test` delivery, publish the scope decision, and preserve P0-B as non-deployable experimental work.
 
-**Architecture:** PR #146 already merged P0-A into `test` at merge commit `6d65bc7bf09cb8fe04e9e920304b6bcb22b199aa`. The remaining work is release verification and documentation: validate the merged P0-A implementation, prove the test environment serves the Usage and Runtime surfaces without business-path degradation, merge a docs-only scope record, and push P0-B only as an archived branch with no PR or deployment.
+**Architecture:** PR #146 already merged P0-A into `test` at merge commit `6d65bc7bf09cb8fe04e9e920304b6bcb22b199aa`. The remaining work is release verification and documentation: validate the merged P0-A implementation, prove the test environment serves the Usage and Runtime surfaces without business-path degradation, record the completed direct docs-only update, and preserve P0-B only as an archived branch with no PR or deployment.
 
 **Tech Stack:** Python 3, pytest, Ruff, PostgreSQL 16 test container, Git/GitHub CLI, existing Feedling test API and business RDS.
 
@@ -12,8 +12,10 @@
 
 PR #146 already merged the P0-A product code into `test`. Docs-only PR #154
 was closed unmerged after unrelated current-`test` Dream policy checks failed.
-The maintainer explicitly authorized this direct, docs-only update to `test`;
-P0-B and P0-C remain deferred.
+The maintainer-authorized direct docs-only fast-forward completed on `test` at
+integration commit `3b17da22a8bdf3b791ce59bd5f7a655c65543a57`. The former
+follow-up-PR workflow in Task 3 is historical and superseded: it **MUST NOT**
+be executed or used to create another PR. P0-B and P0-C remain deferred.
 
 ## Global Constraints
 
@@ -253,7 +255,13 @@ backend name returned by `phala ps`; if the image is not commit-tagged or the
 ancestry check fails, stop and request authorization for a test redeploy. Do
 not infer deployment from GitHub branch state alone.
 
-### Task 3: Publish the P0-A-only decision as a docs-only follow-up PR
+### Task 3 (historical — superseded; MUST NOT execute): Former docs-only follow-up PR
+
+**Superseded status:** The maintainer-authorized direct docs-only fast-forward
+completed on `test` at `3b17da22a8bdf3b791ce59bd5f7a655c65543a57`. Docs-only
+PR #154 is closed unmerged. The commands and expected results below are kept
+only as historical context; **do not run them, reopen #154, or create another
+docs-only PR**.
 
 **Files:**
 - Create: `docs/superpowers/specs/2026-08-04-admin-usage-p0a-only-delivery-design.md`
@@ -263,7 +271,7 @@ not infer deployment from GitHub branch state alone.
 - Consumes: successful Task 1 verification and the already merged PR #146.
 - Produces: one docs-only PR against `test` recording the final product boundary.
 
-- [ ] **Step 1: Verify the follow-up diff contains only the two scope documents**
+- [x] **Historical Step 1 (superseded — do not execute): Verify the follow-up diff contains only the two scope documents**
 
 Run:
 
@@ -275,7 +283,7 @@ git diff --check origin/test...HEAD
 
 Expected: exactly the design and plan files listed above; no backend, migration, infrastructure, generated, or evidence files.
 
-- [ ] **Step 2: Push the existing P0-A branch**
+- [x] **Historical Step 2 (superseded — do not execute): Push the existing P0-A branch**
 
 Run:
 
@@ -285,7 +293,7 @@ git push origin feat/admin-runtime-user-report
 
 Expected: remote branch advances to the scope-document commits. This push does not deploy because it does not update `test`.
 
-- [ ] **Step 3: Open the docs-only PR against `test`**
+- [x] **Historical Step 3 (superseded — do not execute): Open the docs-only PR against `test`**
 
 Run:
 
@@ -299,7 +307,7 @@ gh pr create --repo teleport-computer/feedling-mcp \
 
 Expected: the PR file list contains only the two scope documents and branch-flow CI accepts the `test` base.
 
-- [ ] **Step 4: Wait for and inspect required checks**
+- [x] **Historical Step 4 (superseded — do not execute): Wait for and inspect required checks**
 
 Run:
 
@@ -312,7 +320,7 @@ gh pr checks "$TASK_FOLLOWUP_PR" \
 
 Expected: all required checks pass. A failure must be inspected with `gh run view`; do not merge around the check.
 
-- [ ] **Step 5: Merge the docs-only PR only after green checks**
+- [x] **Historical Step 5 (superseded — do not execute): Merge the docs-only PR only after green checks**
 
 Run:
 

@@ -13,8 +13,10 @@ adding or changing product behavior.
 
 PR #146 has already merged the P0-A product code into `test`. Docs-only PR
 #154 was closed unmerged after unrelated current-`test` Dream policy checks
-failed. The maintainer explicitly authorized this direct, docs-only update to
-`test`; P0-B and P0-C remain deferred.
+failed. The maintainer-authorized direct docs-only fast-forward completed on
+`test` at integration commit `3b17da22a8bdf3b791ce59bd5f7a655c65543a57`.
+The former follow-up-PR workflow is historical and superseded: it **MUST NOT**
+be executed or used to create another PR. P0-B and P0-C remain deferred.
 
 ## Decision
 
@@ -82,8 +84,10 @@ confirmed product consumer and an explicit privacy/trust-boundary review.
 ## Delivery and validation
 
 1. Treat merged PR #146 as the only product-code delivery PR.
-2. Publish this final boundary through a docs-only follow-up PR against `test`;
-   it must contain no backend, migration, infrastructure, or generated changes.
+2. Historical only — the docs-only follow-up-PR route was superseded by the
+   completed direct fast-forward at `3b17da22a8bdf3b791ce59bd5f7a655c65543a57`;
+   **do not execute it or create another PR**. The completed docs update
+   contains no backend, migration, infrastructure, or generated changes.
 3. Preserve PR #146's screenshots, current-RDS architecture, fail-open behavior,
    and scale proof, and add the operational-not-billing boundary in the
    follow-up record.
