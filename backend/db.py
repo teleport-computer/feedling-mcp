@@ -6008,6 +6008,45 @@ def chat_latest_genuine_user_ts(
     return float(row[0]) if row and row[0] is not None else None
 
 
+def chat_visible_proactive_stats(
+    user_id: str,
+    *,
+    since_ts: float,
+    through_seq: int | None = None,
+) -> dict:
+    """Content-free count/latest timestamp for visible proactive bubbles.
+
+    Runtime V1 marks proactive rows by source; Runtime V2 keeps its fixed wake
+    lane on ``wake_kind``. Count both so a runtime cutover cannot reset the
+    companion's awareness of how often it has already appeared recently.
+    """
+    params: list = [str(user_id), float(since_ts)]
+    upper_predicate = ""
+    if through_seq is not None:
+        upper = int(through_seq)
+        if upper < 0:
+            raise ValueError("through_seq must be >= 0")
+        upper_predicate = "AND seq <= %s "
+        params.append(upper)
+    with get_pool().connection() as conn:
+        row = conn.execute(
+            "SELECT COUNT(*)::int, MAX(ts) FROM chat_messages "
+            "WHERE user_id=%s AND ts >= %s "
+            "AND doc->>'role' IN ('agent','openclaw') "
+            "AND (doc->>'source'='agent_initiated_proactive' "
+            "     OR COALESCE(doc->>'wake_kind','') "
+            "        IN ('heartbeat','scheduled','manual_wake','screen_watch')) "
+            + upper_predicate,
+            tuple(params),
+        ).fetchone()
+    return {
+        "visible_proactive_count_24h": int(row[0]) if row else 0,
+        "last_visible_proactive_message_ts": (
+            float(row[1]) if row and row[1] is not None else None
+        ),
+    }
+
+
 def chat_max_user_seq_between(
     user_id: str,
     after_seq: int,

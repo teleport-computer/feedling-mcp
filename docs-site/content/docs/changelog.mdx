@@ -19,8 +19,11 @@ change must not be interpreted as an API guarantee.
 - **Hosted Runtime V2 restores the proactive-presence semantics used by Runtime
   V1.** Automatic wake context is no longer serialized as a synthetic user
   message, and speaking and staying silent are treated as equally valid for
-  heartbeat and screen-watch moments. Scheduled reminder text is supplied as
-  labeled application data, while an ordinary heartbeat for an account with no
+  heartbeat and screen-watch moments. Those turns now receive content-free
+  attention facts for the last user-message age, recent-tail freshness, and the
+  number of visible proactive messages in the preceding 24 hours. Scheduled
+  reminder text is supplied as labeled application data and retains its
+  must-deliver semantics, while an ordinary heartbeat for an account with no
   genuine conversation history completes without calling the model.
 
 - **Runtime V2 perception wakes now use durable per-signal baselines.** The

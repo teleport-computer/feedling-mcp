@@ -1131,6 +1131,20 @@ def _read_temporal_snapshot(
     }
 
 
+def _read_wake_attention_snapshot(
+    user_id: str,
+    *,
+    now_ts: float,
+    through_seq: int | None = None,
+) -> dict:
+    """Read content-free V1/V2 proactive frequency at the frozen wake frontier."""
+    return db.chat_visible_proactive_stats(
+        user_id,
+        since_ts=float(now_ts) - 86_400.0,
+        through_seq=through_seq,
+    )
+
+
 def _summary_metadata_frontier(state: dict) -> list:
     """Validate canonical provenance without decrypting every retained node."""
     opened = [
@@ -3844,6 +3858,7 @@ def build_production_deps() -> v2_worker.TurnDeps:
         read_compaction_tail_after_seq=_read_compaction_tail_after_seq,
         read_recent_turns=_read_recent_turns,
         read_temporal_snapshot=_read_temporal_snapshot,
+        read_wake_attention_snapshot=_read_wake_attention_snapshot,
         read_summary=_read_summary,
         read_summary_with_seq=_read_summary_with_seq,
         write_summary=_write_summary,
