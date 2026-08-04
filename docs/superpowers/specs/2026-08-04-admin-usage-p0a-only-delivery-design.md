@@ -9,6 +9,13 @@ PR #146 merged into `test` on 2026-08-03. It remains the only product-code
 delivery PR. A later docs-only follow-up may record this scope decision without
 adding or changing product behavior.
 
+## Execution status (2026-08-04)
+
+PR #146 has already merged the P0-A product code into `test`. Docs-only PR
+#154 was closed unmerged after unrelated current-`test` Dream policy checks
+failed. The maintainer explicitly authorized this direct, docs-only update to
+`test`; P0-B and P0-C remain deferred.
+
 ## Decision
 
 Ship P0-A as the complete scope for this delivery. Defer P0-B provider-attempt

@@ -8,6 +8,13 @@
 
 **Tech Stack:** Python 3, pytest, Ruff, PostgreSQL 16 test container, Git/GitHub CLI, existing Feedling test API and business RDS.
 
+## Execution status (2026-08-04)
+
+PR #146 already merged the P0-A product code into `test`. Docs-only PR #154
+was closed unmerged after unrelated current-`test` Dream policy checks failed.
+The maintainer explicitly authorized this direct, docs-only update to `test`;
+P0-B and P0-C remain deferred.
+
 ## Global Constraints
 
 - P0-A is operational telemetry, not financial billing or provider-invoice truth.
