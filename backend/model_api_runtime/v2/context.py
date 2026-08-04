@@ -482,11 +482,12 @@ def build_turn_messages(
     coverage_hole_notice: str = "",
     temporal_context: dict[str, Any] | None = None,
     application_data_role: str = "user",
+    manual_wake: bool = False,
 ) -> list[dict]:
     if application_data_role not in {"user", "assistant"}:
         raise ValueError("application_data_role must be user or assistant")
     has_runtime_context = bool(
-        action_context.strip() or mutation_recovery_active
+        action_context.strip() or mutation_recovery_active or manual_wake
     )
     # This policy is unconditional so a transiently empty perception prefetch or
     # a recovery-state transition changes only the final data block, never the
@@ -561,10 +562,13 @@ def build_turn_messages(
         })
 
     if has_runtime_context:
+        runtime_control = {
+            "mutation_recovery_active": bool(mutation_recovery_active),
+        }
+        if manual_wake:
+            runtime_control["manual_wake"] = True
         runtime_block = {
-            "runtime_control": {
-                "mutation_recovery_active": bool(mutation_recovery_active),
-            },
+            "runtime_control": runtime_control,
             "runtime_data": _decode_runtime_data(action_context),
         }
         messages.append({

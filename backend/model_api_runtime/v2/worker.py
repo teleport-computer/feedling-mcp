@@ -3120,6 +3120,7 @@ def _make_build_messages_fn(
     tail_lane: str = "",
     tail_anchor_seq: int | None = None,
     application_data_role: str = "user",
+    manual_wake: bool = False,
 ) -> Callable[[list], list]:
     """Build the fixed base prompt plus the loop's chronological native transcript.
 
@@ -3183,6 +3184,7 @@ def _make_build_messages_fn(
             coverage_hole_notice=coverage_hole_notice,
             temporal_context=_temporal_for(rendered_tail),
             application_data_role=application_data_role,
+            manual_wake=manual_wake,
         )
 
     base_messages = _base(optional_turns)
@@ -7164,14 +7166,23 @@ async def _run_wake(
                 if not isinstance(item, dict):
                     continue
                 note = str(item.get("note") or "").strip()
+                bounded_note = ""
                 if note:
                     bounded_note = note[:1000]
                     scheduled_notes.append(bounded_note)
-                    scheduled_runtime_data.append({
-                        "note": bounded_note,
-                        "status": "fired",
-                    })
                 metadata = core_chat_activity.safe_schedule_metadata(item)
+                if bounded_note:
+                    runtime_item: dict[str, Any] = {
+                        "note": bounded_note,
+                        **metadata,
+                    }
+                    try:
+                        runtime_fired_at = float(item.get("fired_at") or 0.0)
+                    except (TypeError, ValueError, OverflowError):
+                        runtime_fired_at = 0.0
+                    if math.isfinite(runtime_fired_at) and runtime_fired_at > 0:
+                        runtime_item["fired_at"] = runtime_fired_at
+                    scheduled_runtime_data.append(runtime_item)
                 if not metadata:
                     continue
                 event: dict[str, Any] = {
@@ -7311,7 +7322,7 @@ async def _run_wake(
             )
         if scheduled_runtime_data:
             grounding_results = grounding_results or {}
-            grounding_results["scheduled_wake"] = [
+            grounding_results["scheduled_wakes"] = [
                 {"ok": True, "data": scheduled_runtime_data}
             ]
         safe_perception_events = project_perception_wake_events(
@@ -8080,6 +8091,7 @@ async def _run_wake(
                 tail_source_truncated=tail_source_truncated,
                 tail_lane=lane,
                 application_data_role="assistant",
+                manual_wake=(lane == "manual_wake"),
             )
 
         build_messages = _wake_builder()

@@ -27,6 +27,7 @@ a unit test) reached through a real PR A effect-outbox drain wired via
 from __future__ import annotations
 
 import asyncio
+import json
 import sys
 import time
 from pathlib import Path
@@ -222,7 +223,10 @@ def test_run_wake_reply_push_carries_is_wake_true_and_manual_wake_lane(monkeypat
     reply_text = "hey, thinking of you — " + ("x" * 300)
     assert len(reply_text) > 240
 
+    provider_messages = []
+
     async def _fake(config, messages, *, tools=None, **_kwargs):
+        provider_messages.append(messages)
         return _text_round(reply_text)
 
     monkeypatch.setattr(provider_client, "chat_completion_async", _fake)
@@ -260,6 +264,17 @@ def test_run_wake_reply_push_carries_is_wake_true_and_manual_wake_lane(monkeypat
         "backend derives manual/source from this — a copy-paste bug here "
         "silently breaks the reminders_delivery-off manual-wake bypass"
     )
+    runtime_message = next(
+        message
+        for message in provider_messages[0]
+        if message.get("role") == "assistant"
+        and str(message.get("content") or "").startswith(
+            v2_context.RUNTIME_CONTEXT_HEADER
+        )
+    )
+    runtime_payload = json.loads(runtime_message["content"].split("\n", 1)[1])
+    assert runtime_payload["runtime_control"]["manual_wake"] is True
+    assert not any(message.get("role") == "user" for message in provider_messages[0])
 
 
 def test_wake_workspace_prompt_snapshot_is_loaded_once_across_rounds(
@@ -589,7 +604,28 @@ def test_run_scheduled_wake_prompts_with_the_exact_due_reminders(monkeypatch):
     )
     assert "提醒我喝水" in runtime_text
     assert "提醒我拉伸" in runtime_text
-    assert '"scheduled_wake"' in runtime_text
+    runtime_payload = json.loads(runtime_text.split("\n", 1)[1])
+    scheduled_wakes = runtime_payload["runtime_data"]["scheduled_wakes"]
+    assert scheduled_wakes == [
+        {
+            "note": "提醒我喝水",
+            "schedule_next_trigger_at": "2026-07-27T08:00:00",
+            "schedule_operation": "scheduled_wake",
+            "schedule_status": "fired",
+            "schedule_task_id": "timer-water",
+            "schedule_timezone": "Asia/Shanghai",
+            "fired_at": 123.0,
+        },
+        {
+            "note": "提醒我拉伸",
+            "schedule_next_trigger_at": "2026-07-27T08:00:00",
+            "schedule_operation": "scheduled_wake",
+            "schedule_status": "fired",
+            "schedule_task_id": "timer-stretch",
+            "schedule_timezone": "Asia/Shanghai",
+            "fired_at": 123.0,
+        },
+    ]
     with db.get_pool().connection() as conn:
         payload = conn.execute(
             "SELECT payload FROM v2_effect_outbox "
@@ -597,6 +633,8 @@ def test_run_scheduled_wake_prompts_with_the_exact_due_reminders(monkeypatch):
             (uid, job_id),
         ).fetchone()[0]
     events = payload["activity_events"]
+    assert "提醒我喝水" not in json.dumps(payload, ensure_ascii=False)
+    assert "提醒我拉伸" not in json.dumps(payload, ensure_ascii=False)
     assert [event["schedule_task_id"] for event in events] == [
         "timer-water",
         "timer-stretch",
