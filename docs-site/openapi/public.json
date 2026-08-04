@@ -3502,6 +3502,48 @@
         "description": "Create, validate, and select a dedicated image-generation route using an existing credential or a newly supplied provider key."
       }
     },
+    "/v1/image-generation/generate": {
+      "post": {
+        "summary": "Image Generation Generate",
+        "operationId": "image_generation_generate_v1_image_generation_generate_post",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GenericJsonResponse"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Error response.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "Other"
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ImageGenerationRequest"
+              }
+            }
+          }
+        },
+        "x-feedling-contract-level": "documented"
+      }
+    },
     "/v1/image-generation/main/test": {
       "post": {
         "summary": "Image Generation Main Test",
@@ -9955,6 +9997,20 @@
             }
           }
         ],
+        "additionalProperties": false
+      },
+      "ImageGenerationRequest": {
+        "type": "object",
+        "required": [
+          "prompt"
+        ],
+        "properties": {
+          "prompt": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 8000
+          }
+        },
         "additionalProperties": false
       },
       "VisionObserveRequest": {

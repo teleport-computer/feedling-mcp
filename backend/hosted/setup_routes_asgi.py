@@ -39,6 +39,7 @@ from hosted import config_store
 from hosted import setup_core
 from chat import consumer as chat_consumer
 from hosted import usage_core
+from hosted import image_generator
 from hosted import vision_observer
 
 router = APIRouter()
@@ -235,6 +236,28 @@ async def image_generation_route_test(
         auth.store,
         route_id,
         caller_api_key=caller_api_key,
+    )
+    return JSONResponse(body, status_code=status)
+
+
+@router.post("/v1/image-generation/generate")
+async def image_generation_generate(
+    request: Request,
+    auth: AuthResult = Depends(require_auth),
+):
+    payload = (await asgi_http.read_json_silent(request)) or {}
+    caller_api_key = auth_core.extract_api_key(request.headers, request.query_params)
+    caller_runtime_token = (
+        auth_core.extract_runtime_token(request.headers) or ""
+        if auth.runtime_token_claims is not None
+        else ""
+    )
+    body, status = await threadpool.run_db(
+        image_generator.generate_with_pinned_route,
+        auth.store,
+        payload,
+        caller_api_key=caller_api_key,
+        caller_runtime_token=caller_runtime_token,
     )
     return JSONResponse(body, status_code=status)
 

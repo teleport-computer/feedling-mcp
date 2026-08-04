@@ -1093,6 +1093,14 @@ COMPONENT_SCHEMAS: dict[str, dict[str, Any]] = {
         ],
         "additionalProperties": False,
     },
+    "ImageGenerationRequest": {
+        "type": "object",
+        "required": ["prompt"],
+        "properties": {
+            "prompt": {"type": "string", "minLength": 1, "maxLength": 8000},
+        },
+        "additionalProperties": False,
+    },
     "VisionObserveRequest": {
         "type": "object",
         "required": ["message_id", "route_id"],
@@ -2007,6 +2015,7 @@ PRECISE_JSON_BODIES: dict[Operation, str] = {
     ("post", "/v1/model_api/runtime_error"): "ModelApiRuntimeErrorRequest",
     ("put", "/v1/image-generation/config"): "ImageGenerationConfigUpdateRequest",
     ("post", "/v1/image-generation/config"): "ImageGenerationRouteCreateRequest",
+    ("post", "/v1/image-generation/generate"): "ImageGenerationRequest",
     ("put", "/v1/vision/config"): "VisionConfigUpdateRequest",
     ("post", "/v1/vision/config"): "VisionRouteCreateRequest",
     ("post", "/v1/vision/observe"): "VisionObserveRequest",

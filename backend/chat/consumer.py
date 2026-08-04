@@ -16,6 +16,7 @@ from core.store import UserStore
 _OFFICIAL_CONSUMER_NAME = "feedling-chat-resident"
 VISION_OBSERVER_CAPABILITY = "vision_observer_v1"
 VISION_PROBE_CAPABILITY = "vision_probe_v2"
+IMAGE_GENERATION_CAPABILITY = "image_generation_v1"
 # Advertised by a consumer build whose io_cli carries the V1 web verbs. An older
 # build simply omits these from its X-Feedling-Consumer-Capabilities header, so
 # the settings page fails closed for it (see web.settings_core._runtime_supported).

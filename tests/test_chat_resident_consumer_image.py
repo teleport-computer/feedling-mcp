@@ -321,6 +321,83 @@ def test_process_messages_image_turn_no_caption_uses_placeholder(tmp_path):
     )
 
 
+def test_dedicated_image_route_failure_keeps_stable_settings_guidance(
+    tmp_path, monkeypatch
+):
+    class _Client:
+        def post(self, *_args, **_kwargs):
+            return types.SimpleNamespace(
+                status_code=409,
+                json=lambda: {
+                    "error": "image_generation_model_required",
+                    "error_class": "image_generation_model_required",
+                },
+            )
+
+    monkeypatch.setattr(crc, "OUTBOUND_FILE_DIR", tmp_path / "outbox")
+    monkeypatch.setattr(crc, "_HTTP", _Client())
+    crc._begin_outbound_file_turn("turn-image-required", None)
+
+    with pytest.raises(crc.ImageGenerationFailure) as captured:
+        crc._generate_and_stage_dedicated_images(
+            "turn-image-required",
+            "draw a red robot",
+            raw_user_text="帮我生成一张红色机器人图片",
+        )
+
+    assert captured.value.error_class == "image_generation_model_required"
+    notice = crc.classify_agent_error(captured.value)
+    assert notice.blame == "user_provider"
+    assert "添加生图模型" in notice.user_text
+    assert crc._finish_outbound_attachment_turn("turn-image-required") == ([], [])
+
+
+def test_dedicated_image_route_stages_generated_media(tmp_path, monkeypatch):
+    class _Client:
+        def post(self, *_args, **_kwargs):
+            return types.SimpleNamespace(
+                status_code=200,
+                json=lambda: {
+                    "provider": "openai",
+                    "model": "gpt-image-2",
+                    "images": [
+                        {
+                            "mime_type": "image/png",
+                            "data_base64": "aW1hZ2U=",
+                            "name": "robot.png",
+                        }
+                    ],
+                },
+            )
+
+    monkeypatch.setattr(crc, "OUTBOUND_FILE_DIR", tmp_path / "outbox")
+    monkeypatch.setattr(crc, "_HTTP", _Client())
+    monkeypatch.setattr(
+        crc.generated_image,
+        "normalize_generated_image",
+        lambda *_args, **_kwargs: types.SimpleNamespace(
+            data=b"normalized-image",
+            mime_type="image/png",
+            name="robot.png",
+        ),
+    )
+    crc._begin_outbound_file_turn("turn-image-ready", None)
+
+    count = crc._generate_and_stage_dedicated_images(
+        "turn-image-ready",
+        "draw a red robot",
+        raw_user_text="帮我生成一张红色机器人图片",
+    )
+    files, images = crc._finish_outbound_attachment_turn("turn-image-ready")
+
+    assert count == 1
+    assert files == []
+    assert len(images) == 1
+    assert images[0].name == "robot.png"
+    assert images[0].mime_type == "image/png"
+    assert images[0].data == b"normalized-image"
+
+
 def test_dedicated_vision_sends_only_observation_to_main_model(tmp_path):
     crc._seen_ids.clear()
     crc._seen_ids_order.clear()

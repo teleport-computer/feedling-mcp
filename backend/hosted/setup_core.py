@@ -19,7 +19,6 @@ is ever introduced here. Module-level references (``provider_client``,
 
 from __future__ import annotations
 
-import asyncio
 import os
 import re
 import threading
@@ -684,32 +683,65 @@ def _vision_config_payload(store) -> dict:
 
 
 def _image_generation_config_payload(store) -> dict:
+    capability = vision_routing.runtime_capability(store)
+    onboarding_route = capability["onboarding_route"]
+    uses_model_api_main = capability["runtime"] in {"v2", "hosted_v1"}
     active = db.model_api_active_route(store.user_id)
     dedicated = db.model_api_image_generation_route(store.user_id)
-    main = {
-        "source": "model_api",
-        "route_id": (active or {}).get("id"),
-        "provider": (active or {}).get("provider", ""),
-        "model": (active or {}).get("model", ""),
-        "image_generation_test_status": (
-            active.get("image_generation_test_status", "untested")
-            if active
-            else "not_configured"
-        ),
-        "last_image_generation_test_error": (active or {}).get(
-            "last_image_generation_test_error", ""
-        ),
-    }
+    if uses_model_api_main:
+        main = {
+            "source": "model_api",
+            "route_id": (active or {}).get("id"),
+            "provider": (active or {}).get("provider", ""),
+            "model": (active or {}).get("model", ""),
+            "image_generation_test_status": (
+                active.get("image_generation_test_status", "untested")
+                if active
+                else "not_configured"
+            ),
+            "last_image_generation_test_error": (active or {}).get(
+                "last_image_generation_test_error", ""
+            ),
+        }
+        routing_available = True
+        unavailable_reason = ""
+    else:
+        resident_runtime = vision_routing.chat_consumer.consumer_agent_runtime(store)
+        routing_available = vision_routing.chat_consumer.consumer_supports_capability(
+            store,
+            vision_routing.chat_consumer.IMAGE_GENERATION_CAPABILITY,
+        )
+        unavailable_reason = "" if routing_available else "resident_update_required"
+        main = {
+            "source": "resident",
+            "route_id": None,
+            "provider": resident_runtime.get("provider", ""),
+            "model": resident_runtime.get("model", ""),
+            "image_generation_test_status": "unsupported",
+            "last_image_generation_test_error": "image_generation_model_required",
+        }
     mode = "dedicated" if dedicated else "follow_main"
-    effective = dedicated or active or {}
+    if dedicated and routing_available:
+        effective_status = str(
+            dedicated.get("image_generation_test_status") or "untested"
+        )
+    elif dedicated:
+        effective_status = "untested"
+    elif uses_model_api_main:
+        effective_status = str(
+            (active or {}).get("image_generation_test_status") or "untested"
+        )
+    else:
+        effective_status = "unsupported"
     return {
-        "available": True,
+        "available": routing_available,
+        "runtime": capability["runtime"],
+        "unavailable_reason": unavailable_reason,
         "mode": mode,
+        "onboarding_route": onboarding_route,
         "main_model": main,
         "dedicated_route": _public_saved_route(dedicated),
-        "effective_status": str(
-            effective.get("image_generation_test_status") or "untested"
-        ),
+        "effective_status": effective_status,
     }
 
 
@@ -764,11 +796,9 @@ def _test_route_image_generation_or_error(
         reasoning_effort=str(route.get("reasoning_effort") or ""),
     )
     try:
-        result = asyncio.run(
-            provider_client.generate_image_async(
-                config,
-                "A simple blue circle centered on a plain white background.",
-            )
+        result = provider_client.generate_image(
+            config,
+            "A simple blue circle centered on a plain white background.",
         )
         if not isinstance(result.get("media"), list) or not result["media"]:
             raise provider_client.ProviderError("image_generation_invalid_output")

@@ -106,6 +106,15 @@ def _consumer_blame_map() -> dict[str, str]:
     out.setdefault("reply_parse_failed", "system")
     out.setdefault("model_not_found", "user_provider")  # 裸 404+model 分支，和规则表一致
     out.setdefault("unknown", "system")
+    # Dedicated image generation failures bypass the generic regex rules.
+    # Ask the real classifier for their blame so this parity lock follows the
+    # same branch the resident consumer executes at runtime.
+    for error_class in crc.CONSUMER_ERROR_CLASSES:
+        if error_class.startswith("image_generation_"):
+            notice = crc.classify_agent_error(
+                crc.ImageGenerationFailure(error_class)
+            )
+            out[error_class] = notice.blame
     return out
 
 

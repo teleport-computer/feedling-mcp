@@ -6,7 +6,7 @@ from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
-from hosted import setup_core  # noqa: E402
+from hosted import image_generator, setup_core  # noqa: E402
 
 
 def _store(user_id: str = "image-user"):
@@ -45,6 +45,11 @@ def test_config_payload_follows_main_without_replacing_chat_model(monkeypatch):
         "model_api_image_generation_route",
         lambda _uid: None,
     )
+    monkeypatch.setattr(
+        setup_core.vision_routing,
+        "runtime_capability",
+        lambda _store: {"runtime": "v2", "onboarding_route": "model_api"},
+    )
 
     config = setup_core._image_generation_config_payload(_store())
 
@@ -52,6 +57,155 @@ def test_config_payload_follows_main_without_replacing_chat_model(monkeypatch):
     assert config["main_model"]["model"] == "deepseek-v4-flash"
     assert config["effective_status"] == "unsupported"
     assert config["dedicated_route"] is None
+
+
+def test_resident_config_exposes_text_only_main_and_dedicated_capability(monkeypatch):
+    monkeypatch.setattr(
+        setup_core.vision_routing,
+        "runtime_capability",
+        lambda _store: {"runtime": "vps", "onboarding_route": "resident"},
+    )
+    monkeypatch.setattr(
+        setup_core.db,
+        "model_api_active_route",
+        lambda _uid: None,
+    )
+    monkeypatch.setattr(
+        setup_core.db,
+        "model_api_image_generation_route",
+        lambda _uid: None,
+    )
+    monkeypatch.setattr(
+        setup_core.vision_routing.chat_consumer,
+        "consumer_agent_runtime",
+        lambda _store: {
+            "provider": "openrouter",
+            "model": "deepseek/deepseek-v4-flash",
+        },
+    )
+    monkeypatch.setattr(
+        setup_core.vision_routing.chat_consumer,
+        "consumer_supports_capability",
+        lambda _store, capability: (
+            capability == setup_core.vision_routing.chat_consumer.IMAGE_GENERATION_CAPABILITY
+        ),
+    )
+
+    config = setup_core._image_generation_config_payload(_store())
+
+    assert config["available"] is True
+    assert config["runtime"] == "vps"
+    assert config["main_model"] == {
+        "source": "resident",
+        "route_id": None,
+        "provider": "openrouter",
+        "model": "deepseek/deepseek-v4-flash",
+        "image_generation_test_status": "unsupported",
+        "last_image_generation_test_error": "image_generation_model_required",
+    }
+    assert config["effective_status"] == "unsupported"
+
+
+def test_resident_generate_requires_a_pinned_image_route(monkeypatch):
+    monkeypatch.setattr(
+        image_generator.db,
+        "model_api_image_generation_route",
+        lambda _uid: None,
+    )
+
+    body, status = image_generator.generate_with_pinned_route(
+        _store(),
+        {"prompt": "draw a red robot"},
+        caller_api_key="caller-key",
+    )
+
+    assert status == 409
+    assert body == {
+        "error": "image_generation_model_required",
+        "error_class": "image_generation_model_required",
+    }
+
+
+def test_resident_generate_uses_only_the_pinned_image_route(monkeypatch):
+    marked = []
+    decrypted = []
+    monkeypatch.setattr(
+        image_generator.db,
+        "model_api_image_generation_route",
+        lambda _uid: _route(),
+    )
+
+    def fake_decrypt(envelope, caller_key, *, purpose, runtime_token=""):
+        decrypted.append((envelope, caller_key, purpose, runtime_token))
+        return b"provider-key"
+
+    monkeypatch.setattr(
+        image_generator.core_enclave,
+        "_decrypt_envelope_via_enclave",
+        fake_decrypt,
+    )
+
+    async def generated(config, prompt):
+        assert config.provider == "openai"
+        assert config.model == "gpt-image-2"
+        assert config.api_key == "provider-key"
+        assert prompt == "draw a red robot"
+        return {
+            "media": [
+                {
+                    "mime_type": "image/png",
+                    "data_base64": "aW1hZ2U=",
+                    "name": "robot.png",
+                }
+            ]
+        }
+
+    monkeypatch.setattr(
+        image_generator.provider_client,
+        "generate_image_async",
+        generated,
+    )
+    monkeypatch.setattr(
+        image_generator.generated_image,
+        "normalize_generated_image",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            data=b"normalized-image",
+            mime_type="image/png",
+            name="robot.png",
+        ),
+    )
+    monkeypatch.setattr(
+        image_generator.db,
+        "model_api_route_mark_image_generation_test",
+        lambda _uid, _rid, **kwargs: marked.append(kwargs) or True,
+    )
+
+    body, status = image_generator.generate_with_pinned_route(
+        _store(),
+        {"prompt": "draw a red robot"},
+        caller_api_key="caller-key",
+        caller_runtime_token="runtime-token",
+    )
+
+    assert status == 200
+    assert body["provider"] == "openai"
+    assert body["model"] == "gpt-image-2"
+    assert body["images"] == [
+        {
+            "mime_type": "image/png",
+            "data_base64": "bm9ybWFsaXplZC1pbWFnZQ==",
+            "name": "robot.png",
+        }
+    ]
+    assert decrypted == [
+        (
+            {"ciphertext": "sealed"},
+            "caller-key",
+            "model_api_provider_key",
+            "runtime-token",
+        )
+    ]
+    assert marked == [{"status": "ok"}]
 
 
 def test_select_dedicated_tests_before_changing_route(monkeypatch):

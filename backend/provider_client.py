@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import copy
 import http.cookiejar as _cookiejar
 import json
@@ -4121,6 +4122,9 @@ def test_provider_key(config: ProviderConfig) -> dict[str, Any]:
 # 同步 chat_completion 与异步版各用各的 httpx client，绝不混用（spec §4）。
 
 _shared_async_client: httpx.AsyncClient | None = None
+_isolated_async_client: contextvars.ContextVar[httpx.AsyncClient | None] = (
+    contextvars.ContextVar("provider_isolated_async_client", default=None)
+)
 
 
 def _build_shared_async_client(**kwargs) -> httpx.AsyncClient:
@@ -4130,6 +4134,8 @@ def _build_shared_async_client(**kwargs) -> httpx.AsyncClient:
 
 
 def _async_http_client() -> httpx.AsyncClient:
+    if isolated := _isolated_async_client.get():
+        return isolated
     global _shared_async_client
     if _shared_async_client is None or _shared_async_client.is_closed:
         _shared_async_client = _build_shared_async_client()
@@ -4675,6 +4681,34 @@ async def generate_image_async(
         exc.feedling_error_class = "provider_incompatible"
         raise exc
     return result
+
+
+def generate_image(
+    config: ProviderConfig,
+    prompt: str,
+) -> dict[str, Any]:
+    """Run a synchronous image request without borrowing another loop's pool."""
+
+    async def run_isolated() -> dict[str, Any]:
+        try:
+            async with _build_shared_async_client() as client:
+                token = _isolated_async_client.set(client)
+                try:
+                    return await generate_image_async(config, prompt)
+                finally:
+                    _isolated_async_client.reset(token)
+        except Exception as exc:
+            log.warning(
+                "[image-generation] isolated request failed "
+                "error_type=%s class=%s provider=%s model=%s",
+                type(exc).__name__,
+                classify_provider_error(exc),
+                normalize_provider(config.provider),
+                str(config.model or "")[:96],
+            )
+            raise
+
+    return asyncio.run(run_isolated())
 
 
 # --- Hosted runtime V2: natively async reliable wrapper ---------------------

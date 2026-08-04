@@ -698,6 +698,28 @@ class VisionObserverFailure(RuntimeError):
         self.provider = _sanitize_thinking_meta(provider, max_len=80)
 
 
+class ImageGenerationFailure(RuntimeError):
+    """Safe failure contract returned by the dedicated image route."""
+
+    def __init__(
+        self,
+        error_class: str,
+        *,
+        status_code: int | None = None,
+        detail: str = "",
+        raw_user_text: str = "",
+        model: str = "",
+        provider: str = "",
+    ):
+        super().__init__(error_class)
+        self.error_class = error_class[:64] or "image_generation_failed"
+        self.status_code = status_code
+        self.detail = detail[:160]
+        self.raw_user_text = raw_user_text
+        self.model = _sanitize_thinking_meta(model, max_len=96)
+        self.provider = _sanitize_thinking_meta(provider, max_len=80)
+
+
 def _vision_failure_user_text(error_class: str, raw_user_text: str) -> str:
     raw = raw_user_text or ""
     has_cjk = bool(re.search(r"[\u4e00-\u9fff]", raw))
@@ -741,6 +763,44 @@ def _vision_failure_user_text(error_class: str, raw_user_text: str) -> str:
         "vision_model_failed": "The vision model could not process this image. Retry or choose another model.",
     }
     fallback = "视觉模型处理失败，请重试。" if chinese else "The vision model could not process this image. Try again."
+    return (zh if chinese else en).get(error_class, fallback)
+
+
+def _image_generation_failure_user_text(error_class: str, raw_user_text: str) -> str:
+    raw = raw_user_text or ""
+    has_cjk = bool(re.search(r"[\u4e00-\u9fff]", raw))
+    has_latin = bool(re.search(r"[A-Za-z]", raw))
+    archive_language = str(
+        globals().get("_whoami_cache", {}).get("archive_language") or ""
+    ).strip().lower()
+    chinese = has_cjk or (not has_latin and archive_language.startswith("zh"))
+    zh = {
+        "image_generation_model_required": "当前模型不能生成图片，请到设置里添加生图模型。",
+        "image_generation_model_incompatible": "当前生图模型无法生成图片，请到设置里更换模型。",
+        "image_generation_auth_invalid": "生图模型的 API Key 无效或已过期，请到设置里重新保存。",
+        "image_generation_quota_insufficient": "生图模型服务额度不足，充值后再试。",
+        "image_generation_model_not_found": "当前生图模型不可用，请到设置里更换模型。",
+        "image_generation_model_not_ready": "生图模型尚未准备好，请到设置里重新保存或更换模型。",
+        "image_generation_rate_limited": "生图模型请求太多，请稍等几分钟再试。",
+        "image_generation_unavailable": "生图模型暂时无法连接，请稍后重试。",
+        "image_generation_invalid_output": "生图模型没有返回有效图片，请重试或更换模型。",
+        "image_generation_invalid_prompt": "这次生图请求没有正确送达，我们会尽快排查。",
+        "image_generation_failed": "图片生成失败，请重试；如果仍失败，请更换模型。",
+    }
+    en = {
+        "image_generation_model_required": "Your current model can't generate images. Add an image generation model in Settings.",
+        "image_generation_model_incompatible": "This image generation model can't create images. Choose another model in Settings.",
+        "image_generation_auth_invalid": "The image generation API key is invalid or expired. Save it again in Settings.",
+        "image_generation_quota_insufficient": "The image generation service has insufficient quota. Add credit and try again.",
+        "image_generation_model_not_found": "The image generation model is unavailable. Choose another model in Settings.",
+        "image_generation_model_not_ready": "The image generation model isn't ready. Save it again or choose another model in Settings.",
+        "image_generation_rate_limited": "The image generation service is rate limited. Try again in a few minutes.",
+        "image_generation_unavailable": "The image generation service is temporarily unavailable. Try again later.",
+        "image_generation_invalid_output": "The image generation model returned no valid image. Try again or choose another model.",
+        "image_generation_invalid_prompt": "This image request wasn't delivered correctly. We'll investigate.",
+        "image_generation_failed": "Image generation failed. Try again or choose another model.",
+    }
+    fallback = "图片生成失败，请重试。" if chinese else "Image generation failed. Try again."
     return (zh if chinese else en).get(error_class, fallback)
 
 _ERROR_CLASS_RULES = (
@@ -814,8 +874,16 @@ _ERROR_CLASS_RULES = (
 # 不改分类逻辑本身。
 CONSUMER_ERROR_CLASSES = frozenset(
     {klass for klass, _blame, _text, _pat in _ERROR_CLASS_RULES}
-    | {"turn_timeout", "provider_empty_reply", "reply_parse_failed",
-       "model_not_found", "unknown"}
+    | {
+        "turn_timeout", "provider_empty_reply", "reply_parse_failed",
+        "model_not_found", "unknown",
+        "image_generation_model_required", "image_generation_model_incompatible",
+        "image_generation_auth_invalid", "image_generation_quota_insufficient",
+        "image_generation_model_not_found", "image_generation_model_not_ready",
+        "image_generation_rate_limited", "image_generation_unavailable",
+        "image_generation_invalid_output", "image_generation_invalid_prompt",
+        "image_generation_failed",
+    }
 )
 
 
@@ -897,6 +965,37 @@ def classify_agent_error(exc: BaseException) -> AgentErrorNotice:
             exc.error_class,
             blame,
             _vision_failure_user_text(exc.error_class, exc.raw_user_text),
+            " · ".join(detail_parts)[:200],
+        )
+
+    if isinstance(exc, ImageGenerationFailure):
+        blame = (
+            "user_provider"
+            if exc.error_class in {
+                "image_generation_model_required",
+                "image_generation_model_incompatible",
+                "image_generation_auth_invalid",
+                "image_generation_quota_insufficient",
+                "image_generation_model_not_found",
+                "image_generation_model_not_ready",
+            }
+            else (
+                "system"
+                if exc.error_class == "image_generation_invalid_prompt"
+                else "provider_transient"
+            )
+        )
+        detail_parts = [exc.error_class]
+        if exc.status_code is not None:
+            detail_parts.append(f"HTTP {exc.status_code}")
+        if exc.detail:
+            detail_parts.append(exc.detail)
+        return AgentErrorNotice(
+            exc.error_class,
+            blame,
+            _image_generation_failure_user_text(
+                exc.error_class, exc.raw_user_text
+            ),
             " · ".join(detail_parts)[:200],
         )
 
@@ -1374,15 +1473,15 @@ def _agent_entry_signature() -> str:
 def _consumer_capabilities(hosted: bool) -> str:
     """Comma-separated ``X-Feedling-Consumer-Capabilities`` value.
 
-    Vision caps are advertised on every line. ``web_search_v1`` / ``web_fetch_v1``
-    are a CLOUD-ONLY product: only the HOSTED consumer (per-user runtime token)
-    advertises them. VPS / self-hosted residents must NOT — they use their own
-    model provider's built-in web capability, so our web tools are never offered
-    to them. The settings page keys ``_runtime_supported`` off this header, so
-    omitting the web caps makes web read ``effective = false`` for self-hosted
-    accounts, which is exactly the intended product boundary.
+    Vision and image-generation caps are advertised on every line.
+    ``web_search_v1`` / ``web_fetch_v1`` are a CLOUD-ONLY product: only the
+    HOSTED consumer (per-user runtime token) advertises them. VPS / self-hosted
+    residents must NOT — they use their own model provider's built-in web
+    capability, so our web tools are never offered to them. The settings page
+    keys ``_runtime_supported`` off this header, so omitting the web caps makes
+    web read ``effective = false`` for self-hosted accounts.
     """
-    caps = ["vision_observer_v1", "vision_probe_v2"]
+    caps = ["vision_observer_v1", "vision_probe_v2", "image_generation_v1"]
     if hosted:
         caps += ["web_search_v1", "web_fetch_v1"]
     return ",".join(caps)
@@ -14055,12 +14154,40 @@ def _process_messages(messages: list) -> float:
         )
         staged_outbound_files: list[StagedChatFile] = []
         staged_outbound_images: list[StagedChatImage] = []
+        image_generation_prompt = (
+            downloadable_file_context.required_image_generation_prompt([
+                {"role": "user", "content": raw_user_content_for_lang}
+            ])
+            if outbound_file_turn_active
+            else None
+        )
+        image_generation_failed: ImageGenerationFailure | None = None
         if outbound_file_turn_active:
             try:
                 _begin_outbound_file_turn(trace_id, outbound_file_requirement)
             except OSError as exc:
                 outbound_file_turn_active = False
                 log.error("cannot prepare outbound file directory: %s", exc)
+        if outbound_file_turn_active and image_generation_prompt:
+            try:
+                _generate_and_stage_dedicated_images(
+                    trace_id,
+                    image_generation_prompt,
+                    raw_user_text=raw_user_content_for_lang,
+                )
+                content += (
+                    "\n\n[IO has generated the requested image through the user's "
+                    "dedicated image model and will attach it to this reply. Reply "
+                    "naturally and briefly; do not claim that image generation is "
+                    "unsupported.]"
+                )
+            except ImageGenerationFailure as exc:
+                image_generation_failed = exc
+                log.info(
+                    "dedicated image generation unavailable class=%s status=%s",
+                    exc.error_class,
+                    exc.status_code,
+                )
         # 本回合失败时待发的 system 通知。不在失败当场发，而是等下面的回复写入被
         # 服务端接受（posted_any）后再发（Codex review）：claim 过期 failover 时另
         # 一个 consumer 已回复，本家的兜底会被 already_answered 409 拒——通知若先
@@ -14082,6 +14209,11 @@ def _process_messages(messages: list) -> float:
                     ]
                 }
                 pending_failure_notice = vision_observer_failed
+            elif image_generation_failed:
+                _discard_io_cli_catalog_pending_injection()
+                failure_notice = classify_agent_error(image_generation_failed)
+                agent_result = {"messages": [failure_notice.user_text]}
+                pending_failure_notice = image_generation_failed
             elif use_runtime_v2:
                 agent_result = call_agent(
                     _resident_foreground_chat_message_v2(content),
@@ -14149,18 +14281,18 @@ def _process_messages(messages: list) -> float:
             # session id now (Codex review I10); see _commit_io_cli_catalog_
             # injection's docstring for why this must not wait on parse
             # success.
-            if not vision_observer_failed:
+            if not vision_observer_failed and not image_generation_failed:
                 _commit_io_cli_catalog_injection()
             if voice_stream_update is not None:
                 voice_stream_update.complete()
-            if not vision_observer_failed and (
+            if not vision_observer_failed and not image_generation_failed and (
                 parse_failure_class := _consume_reply_parse_failed()
             ):
                 pending_failure_notice = _reply_parse_failure_exc(
                     parse_failure_class
                 )
                 pending_failure_is_parse_only = True
-            elif not vision_observer_failed:
+            elif not vision_observer_failed and not image_generation_failed:
                 _note_agent_turn_success()
 
         initial_agent_result = agent_result
@@ -14217,12 +14349,26 @@ def _process_messages(messages: list) -> float:
                             _outbound_file_failure_reply(raw_user_content_for_lang)
                         ]
                     }
-            elif staged_outbound_files and pending_failure_is_parse_only:
+            elif (
+                staged_outbound_files or staged_outbound_images
+            ) and pending_failure_is_parse_only:
                 # A successfully staged file is itself a usable model result.
                 # Some CLI drivers emit no separate assistant text after the
                 # send-file tool call; synthesize the short confirmation below
                 # without misclassifying the completed turn as an agent error.
                 pending_failure_notice = None
+                _note_agent_turn_success()
+
+            if staged_outbound_images and pending_failure_notice is not None:
+                agent_result = {
+                    "messages": [
+                        "图片已经生成。"
+                        if re.search(r"[\u4e00-\u9fff]", raw_user_content_for_lang)
+                        else "The image is ready."
+                    ]
+                }
+                pending_failure_notice = None
+                pending_failure_is_parse_only = False
                 _note_agent_turn_success()
 
         turn = _split_agent_turn(agent_result)
@@ -14624,6 +14770,117 @@ def _finish_outbound_file_turn(turn_id: str) -> list[StagedChatFile]:
     """Backward-compatible file-only test/helper surface."""
     files, _images = _finish_outbound_attachment_turn(turn_id)
     return files
+
+
+def _generate_and_stage_dedicated_images(
+    turn_id: str,
+    prompt: str,
+    *,
+    raw_user_text: str,
+) -> int:
+    """Call the user's pinned image route and stage its bounded media."""
+    try:
+        response = _HTTP.post(
+            f"{FEEDLING_API_URL}/v1/image-generation/generate",
+            json={"prompt": str(prompt or "")[:8000]},
+            headers=_HEADERS,
+            timeout=180,
+        )
+    except Exception as exc:
+        raise ImageGenerationFailure(
+            "image_generation_unavailable",
+            detail=type(exc).__name__,
+            raw_user_text=raw_user_text,
+        ) from exc
+
+    try:
+        body = response.json()
+    except Exception:
+        body = {}
+    if response.status_code != 200:
+        error_class = str(
+            body.get("error_class") or body.get("error") or "image_generation_failed"
+        )
+        if not error_class.startswith("image_generation_"):
+            error_class = "image_generation_failed"
+        raise ImageGenerationFailure(
+            error_class,
+            status_code=response.status_code,
+            detail="dedicated_route",
+            raw_user_text=raw_user_text,
+            model=str(body.get("model") or ""),
+            provider=str(body.get("provider") or ""),
+        )
+
+    raw_images = body.get("images")
+    if not isinstance(raw_images, list) or not raw_images:
+        raise ImageGenerationFailure(
+            "image_generation_invalid_output",
+            status_code=response.status_code,
+            detail="images_missing",
+            raw_user_text=raw_user_text,
+            model=str(body.get("model") or ""),
+            provider=str(body.get("provider") or ""),
+        )
+
+    staged: list[StagedChatImage] = []
+    try:
+        for index, raw in enumerate(
+            raw_images[: generated_image.MAX_GENERATED_IMAGES_PER_REPLY],
+            start=1,
+        ):
+            if not isinstance(raw, dict):
+                raise ValueError("generated_image_invalid")
+            normalized = generated_image.normalize_generated_image(
+                generated_image.decode_base64_image(
+                    str(raw.get("data_base64") or "")
+                ),
+                declared_mime=str(raw.get("mime_type") or ""),
+                name=str(raw.get("name") or ""),
+                index=index,
+            )
+            staged.append(StagedChatImage(
+                source_path=f"generated:{turn_id}:{index}",
+                name=normalized.name,
+                mime_type=normalized.mime_type,
+                data=normalized.data,
+            ))
+    except ValueError as exc:
+        raise ImageGenerationFailure(
+            "image_generation_invalid_output",
+            status_code=response.status_code,
+            detail=str(exc)[:80],
+            raw_user_text=raw_user_text,
+            model=str(body.get("model") or ""),
+            provider=str(body.get("provider") or ""),
+        ) from exc
+
+    with _outbound_file_lock:
+        if str(turn_id or "") != _active_outbound_file_turn_id:
+            raise ImageGenerationFailure(
+                "image_generation_failed",
+                detail="chat_turn_finished",
+                raw_user_text=raw_user_text,
+            )
+        remaining = max(
+            0,
+            generated_image.MAX_GENERATED_IMAGES_PER_REPLY
+            - len(_staged_outbound_images),
+        )
+        _staged_outbound_images.extend(staged[:remaining])
+    if not staged:
+        raise ImageGenerationFailure(
+            "image_generation_invalid_output",
+            detail="images_empty",
+            raw_user_text=raw_user_text,
+        )
+    log.info(
+        "dedicated image generation staged count=%d provider=%s model=%s",
+        len(staged[:remaining]),
+        _sanitize_thinking_meta(body.get("provider"), max_len=80),
+        _sanitize_thinking_meta(body.get("model"), max_len=96),
+    )
+    return len(staged[:remaining])
 
 
 def _safe_outbound_file_name(raw: str) -> str:

@@ -1218,6 +1218,43 @@ def test_generate_image_deepseek_fails_before_provider_request(monkeypatch):
         )
 
 
+def test_blocking_image_generation_isolates_each_event_loop(monkeypatch):
+    observed_clients: list[object] = []
+    isolated_clients: list[object] = []
+
+    class IsolatedClient:
+        is_closed = False
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            self.is_closed = True
+
+    async def fake_generate(*_args, **_kwargs):
+        observed_clients.append(pc._async_http_client())
+        return {"media": [{"data_base64": "aW1hZ2U="}]}
+
+    def build_client(**_kwargs):
+        client = IsolatedClient()
+        isolated_clients.append(client)
+        return client
+
+    shared_client = object()
+    monkeypatch.setattr(pc, "_shared_async_client", shared_client)
+    monkeypatch.setattr(pc, "_build_shared_async_client", build_client)
+    monkeypatch.setattr(pc, "generate_image_async", fake_generate)
+
+    config = pc.ProviderConfig("openrouter", "openai/gpt-5.4-image-2", "sk-test")
+    pc.generate_image(config, "first image")
+    pc.generate_image(config, "second image")
+
+    assert observed_clients == isolated_clients
+    assert len({id(client) for client in isolated_clients}) == 2
+    assert pc._shared_async_client is shared_client
+    assert all(client.is_closed for client in isolated_clients)
+
+
 def test_openrouter_text_model_stays_on_chat_completions(monkeypatch):
     import asyncio
 
