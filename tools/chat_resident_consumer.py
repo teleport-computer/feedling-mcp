@@ -8063,6 +8063,9 @@ _whoami_cache: dict = {
     "enclave_pk": None,
     "timezone": "",
     "archive_language": "",
+    # Fail safe for older backends: absent/unknown effective values mean the
+    # resident must keep sealing replies, never silently downgrade to plaintext.
+    "content_encryption_effective": "on",
 }
 
 # monotonic ts of the last successful _load_whoami() that yielded encryption
@@ -8912,6 +8915,11 @@ def _load_whoami() -> bool:
 
     tz = str(info.get("timezone") or "").strip()
     archive_language = str(info.get("archive_language") or "").strip()
+    content_encryption_effective = str(
+        info.get("content_encryption_effective") or "on"
+    ).strip().lower()
+    if content_encryption_effective not in {"on", "off"}:
+        content_encryption_effective = "on"
     _whoami_cache.update(
         user_id=user_id, user_pk=user_pk, enclave_pk=enc_pk,
         # A successful whoami is authoritative — adopt its timezone verbatim,
@@ -8921,6 +8929,7 @@ def _load_whoami() -> bool:
         # update runs.
         timezone=tz,
         archive_language=archive_language,
+        content_encryption_effective=content_encryption_effective,
     )
     ok = bool(user_id and user_pk)
     if _whoami_cache_has_full_keys():
@@ -10003,15 +10012,16 @@ def post_reply(
     turn_failure_provider: str = "",
     file_followups: list[StagedChatFile] | None = None,
 ) -> dict:
-    """Post agent reply as a v1 ciphertext envelope.
+    """Post an agent reply using the account's effective envelope shape.
 
     `suppress_push=True` sends an empty alert_body and no push fields so
     /v1/chat/response's app-state push policy is a no-op — used for private
     writes that must land in the store (for liveness/verify) but must never
     surface as a user-visible APNs notification.
 
-    Falls back to plaintext only when encryption is unavailable — this will
-    return 400 on v1 backends and is logged as an error so it's visible.
+    Missing or unrecognized ``content_encryption_effective`` values fail safe
+    to the encrypted shape.  Plaintext-tier replies still use a v1 envelope;
+    they never use the removed legacy raw ``content`` request shape.
 
     Handles `bootstrap_incomplete` 409 by logging the structured error
     (stage, memory_count, required) and returning without raising — the
@@ -10021,37 +10031,62 @@ def post_reply(
     """
     url = f"{FEEDLING_API_URL}/v1/chat/response"
     if _ENCRYPTION_AVAILABLE and not _refresh_whoami_for_encrypted_reply():
-        log.error("whoami refresh failed before encrypted reply and no cached keys are available; skipping write")
+        log.error("whoami refresh failed before reply and no cached keys are available; skipping write")
         return {"error": "whoami_refresh_failed"}
 
     user_id = _whoami_cache["user_id"]
     user_pk: bytes | None = _whoami_cache["user_pk"]
 
     if _ENCRYPTION_AVAILABLE and user_id and user_pk:
-        def _sealed_body() -> dict[str, Any]:
+        def _effective_encryption() -> str:
+            value = str(
+                _whoami_cache.get("content_encryption_effective") or "on"
+            ).strip().lower()
+            return value if value in {"on", "off"} else "on"
+
+        def _reply_body() -> dict[str, Any]:
             # Reads the whoami cache fresh on every call so the fpr-mismatch
-            # retry below re-seals with the just-refreshed key.
+            # retry below rebuilds with the just-refreshed key and preference.
             seal_user_id = _whoami_cache["user_id"]
             seal_user_pk: bytes = _whoami_cache["user_pk"]
             seal_enc_pk: bytes | None = _whoami_cache["enclave_pk"]
-            visibility = "shared" if seal_enc_pk else "local_only"
-            envelope = _build_envelope(
-                plaintext=content.encode("utf-8"),
-                owner_user_id=seal_user_id,
-                user_pk_bytes=seal_user_pk,
-                enclave_pk_bytes=seal_enc_pk,
-                visibility=visibility,
-            )
-            sealed_file_followups = []
-            for file_item in file_followups or []:
-                file_envelope = _build_envelope(
-                    plaintext=bytes(file_item.data),
+            plaintext_tier = _effective_encryption() == "off"
+            visibility = "shared" if (plaintext_tier or seal_enc_pk) else "local_only"
+
+            def _text_envelope(value: str) -> dict[str, Any]:
+                if plaintext_tier:
+                    return {
+                        "body": value,
+                        "owner_user_id": seal_user_id,
+                        "visibility": "shared",
+                    }
+                return _build_envelope(
+                    plaintext=value.encode("utf-8"),
                     owner_user_id=seal_user_id,
                     user_pk_bytes=seal_user_pk,
                     enclave_pk_bytes=seal_enc_pk,
                     visibility=visibility,
                 )
-                sealed_file_followups.append(
+
+            envelope = _text_envelope(content)
+            reply_file_followups = []
+            for file_item in file_followups or []:
+                if plaintext_tier:
+                    file_envelope = {
+                        "body_b64": base64.b64encode(bytes(file_item.data)).decode("ascii"),
+                        "body_size_bytes": len(file_item.data),
+                        "owner_user_id": seal_user_id,
+                        "visibility": "shared",
+                    }
+                else:
+                    file_envelope = _build_envelope(
+                        plaintext=bytes(file_item.data),
+                        owner_user_id=seal_user_id,
+                        user_pk_bytes=seal_user_pk,
+                        enclave_pk_bytes=seal_enc_pk,
+                        visibility=visibility,
+                    )
+                reply_file_followups.append(
                     {
                         "envelope": file_envelope,
                         "file_name": file_item.name,
@@ -10062,13 +10097,7 @@ def post_reply(
             thinking_envelope = None
             safe_thinking = _sanitize_thinking_summary(thinking_summary)
             if safe_thinking:
-                thinking_envelope = _build_envelope(
-                    plaintext=safe_thinking.encode("utf-8"),
-                    owner_user_id=seal_user_id,
-                    user_pk_bytes=seal_user_pk,
-                    enclave_pk_bytes=seal_enc_pk,
-                    visibility=visibility,
-                )
+                thinking_envelope = _text_envelope(safe_thinking)
             visible_body = "" if suppress_push else content[:240]
             body: dict[str, Any] = {
                 "envelope": envelope,
@@ -10108,8 +10137,8 @@ def post_reply(
                     body["turn_failure_provider"] = failure_provider
             if reply_to_message_id:
                 body["reply_to_message_id"] = reply_to_message_id
-            if sealed_file_followups:
-                body["file_followups"] = sealed_file_followups
+            if reply_file_followups:
+                body["file_followups"] = reply_file_followups
             if gate_decision_id:
                 body["gate_decision_id"] = gate_decision_id
             if proactive_job_id:
@@ -10124,7 +10153,7 @@ def post_reply(
                 }
             return body
 
-        resp = _HTTP.post(url, json=_sealed_body(), headers=_HEADERS, timeout=15)
+        resp = _HTTP.post(url, json=_reply_body(), headers=_HEADERS, timeout=15)
         if _is_fpr_mismatch_response(resp):
             # The backend bounced the envelope: our cached user pk is no longer
             # the registered content key (rotated since the last whoami). Force
@@ -10143,7 +10172,7 @@ def post_reply(
                 context="stale-key reseal",
                 backoff_multiplier=2.0,
             ) and _whoami_cache.get("user_pk"):
-                resp = _HTTP.post(url, json=_sealed_body(), headers=_HEADERS, timeout=15)
+                resp = _HTTP.post(url, json=_reply_body(), headers=_HEADERS, timeout=15)
         return _handle_post_reply_response(resp)
 
     if file_followups:
