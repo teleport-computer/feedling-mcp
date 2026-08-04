@@ -4364,6 +4364,28 @@ def recent_runtime_health(*, within_hours: int = 24) -> dict:
     safe_hours = max(1, min(int(within_hours), 24 * 30))
     terminal_statuses = ("completed", "failed", "expired", "superseded")
 
+    # These jobs intentionally settle as failed so the runtime does not retry or
+    # emit an unsafe bubble.  They are still visible outcomes, but they are not
+    # interchangeable with a provider/worker/runtime failure on an operations
+    # dashboard.  Keep this list content-free and deliberately narrow: an unknown
+    # code stays operational until somebody classifies it explicitly.
+    control_outcome_codes = frozenset({
+        "runtime_mode_changed",
+        "turns_halted",
+        "capture_disabled",
+        "dream_disabled",
+        "profile_disabled",
+        "maintenance_disabled",
+        "heartbeat_disabled",
+        "scheduled_disabled",
+        "manual_wake_disabled",
+    })
+    safety_suppression_codes = frozenset({
+        "wake_failed:degenerate_reply_suppressed",
+        "wake_failed:protocol_fragment_suppressed",
+        "wake_failed:malformed_self_thinking_suppressed",
+    })
+
     with _pool().connection() as conn:
         with conn.cursor(row_factory=dict_row) as cur:
             cur.execute(
@@ -4438,11 +4460,16 @@ def recent_runtime_health(*, within_hours: int = 24) -> dict:
 
             cur.execute(
                 "WITH recent AS ("
-                "  SELECT lane,last_error FROM agent_jobs "
+                "  SELECT id,lane,last_error FROM agent_jobs "
                 "  WHERE status IN ('failed','expired') AND last_error IS NOT NULL "
                 "    AND finished_at >= now() - make_interval(hours => %s)"
-                ") SELECT lane,last_error,COUNT(*)::int AS count "
-                "FROM recent GROUP BY lane,last_error ORDER BY count DESC",
+                ") SELECT recent.lane,recent.last_error,"
+                "  COALESCE(f.error_class,'') AS error_class,"
+                "  COUNT(*)::int AS count "
+                "FROM recent LEFT JOIN v2_terminal_failure_outbox f "
+                "  ON f.job_id=recent.id "
+                "GROUP BY recent.lane,recent.last_error,f.error_class "
+                "ORDER BY count DESC",
                 (safe_hours,),
             )
             failure_rows = cur.fetchall()
@@ -4459,9 +4486,20 @@ def recent_runtime_health(*, within_hours: int = 24) -> dict:
     capture_by_lane = {str(row["lane"] or ""): row for row in capture_rows}
     failures_by_lane: dict[str, list[dict]] = {}
     for row in failure_rows:
+        code = str(row["last_error"] or "")
+        if code in control_outcome_codes:
+            outcome_class = "control"
+        elif code in safety_suppression_codes:
+            outcome_class = "safety_suppression"
+        elif code in {"queue_timeout", "lease_timeout", "runtime_expired"}:
+            outcome_class = "timeout"
+        else:
+            outcome_class = "operational_failure"
         failures_by_lane.setdefault(str(row["lane"] or ""), []).append({
-            "code": str(row["last_error"] or ""),
+            "code": code,
+            "error_class": str(row.get("error_class") or ""),
             "count": int(row["count"] or 0),
+            "outcome_class": outcome_class,
         })
 
     def _optional_ms(row, key):
@@ -4490,6 +4528,23 @@ def recent_runtime_health(*, within_hours: int = 24) -> dict:
         failed = int((outcome or {}).get("failed") or 0)
         expired = int((outcome or {}).get("expired") or 0)
         resolved = completed + failed + expired
+        lane_failures = failures_by_lane.get(lane, [])
+        control_outcomes = sum(
+            int(item.get("count") or 0)
+            for item in lane_failures
+            if item.get("outcome_class") == "control"
+        )
+        safety_suppressions = sum(
+            int(item.get("count") or 0)
+            for item in lane_failures
+            if item.get("outcome_class") == "safety_suppression"
+        )
+        # Expiries are always operational incidents.  Only the two allowlisted
+        # failed-job classes above are removed from the hard-failure numerator.
+        operational_failures = max(
+            0,
+            failed + expired - control_outcomes - safety_suppressions,
+        )
         capture = capture_by_lane.get(lane)
         lanes.append({
             "lane": lane or "unknown",
@@ -4500,8 +4555,15 @@ def recent_runtime_health(*, within_hours: int = 24) -> dict:
             "superseded": int((outcome or {}).get("superseded") or 0),
             "queue_expired": int((outcome or {}).get("queue_expired") or 0),
             "lease_expired": int((outcome or {}).get("lease_expired") or 0),
+            "operational_failures": operational_failures,
+            "control_outcomes": control_outcomes,
+            "safety_suppressions": safety_suppressions,
             "failure_rate": (
                 float(failed + expired) / float(resolved) if resolved else None
+            ),
+            "operational_failure_rate": (
+                float(operational_failures) / float(resolved)
+                if resolved else None
             ),
             "p50_ok_ms": _optional_ms(latency_by_lane.get(lane), "p50_ms"),
             "p95_ok_ms": _optional_ms(latency_by_lane.get(lane), "p95_ms"),
@@ -4514,7 +4576,7 @@ def recent_runtime_health(*, within_hours: int = 24) -> dict:
                 "missing": int((capture or {}).get("missing") or 0),
                 "open": int((capture or {}).get("open") or 0),
             },
-            "top_failures": failures_by_lane.get(lane, [])[:5],
+            "top_failures": lane_failures[:8],
         })
 
     lanes.sort(key=lambda item: (item["sampled_jobs"], item["lane"]), reverse=True)
@@ -4534,6 +4596,329 @@ def recent_runtime_health(*, within_hours: int = 24) -> dict:
                 float(oldest_pending) if oldest_pending is not None else None
             ),
         },
+    }
+
+
+def recent_chat_reliability(
+    *,
+    within_hours: int = 24,
+    recent_limit: int = 50,
+) -> dict:
+    """Hosted V2 chat lifecycle, server-delivery, and latency evidence.
+
+    The cohort begins at ``agent_jobs(lane='chat').created_at``.  A final reply
+    effect in ``applied`` / ``applied_with_results`` means the backend finished
+    its configured sink transaction; it is *not* a device delivery/read ACK.
+    Keeping those two facts separate is the central contract of the Admin chat
+    page.
+
+    Provider/model rows come from whole-turn metrics and are diagnostic only.
+    They cannot answer duplicate-charge or possibly-billed questions: those
+    require the canonical provider-attempt ledger planned for P0-B.
+    """
+    safe_hours = max(1, min(int(within_hours), 24 * 30))
+    safe_limit = max(1, min(int(recent_limit), 200))
+    # ``reply`` predates the explicit final/intermediate effect vocabulary.
+    # Only legacy rows carrying the consumed-input frontier are final.  A
+    # plain ``reply`` may be an acknowledgement or other intermediate bubble
+    # and must not inflate final-delivery counts or make the rate exceed 100%.
+    explicit_final_effect_types = (
+        "reply_final_fenced_v1",
+        "reply_terminal_fenced_v1",
+    )
+
+    with _pool().connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "WITH chat AS ("
+                " SELECT * FROM agent_jobs WHERE lane='chat' "
+                " AND created_at >= now() - make_interval(hours => %s)"
+                ") SELECT "
+                " count(*)::int AS admitted,"
+                " count(*) FILTER (WHERE claimed_at IS NOT NULL "
+                "   OR started_at IS NOT NULL)::int AS started,"
+                " count(*) FILTER (WHERE status='completed')::int AS completed,"
+                " count(*) FILTER (WHERE status='failed')::int AS failed,"
+                " count(*) FILTER (WHERE status='expired')::int AS expired,"
+                " count(*) FILTER (WHERE status='superseded')::int AS superseded,"
+                " count(*) FILTER (WHERE status IN "
+                "   ('pending','claimed','running'))::int AS in_flight,"
+                " count(DISTINCT user_id)::int AS users "
+                "FROM chat",
+                (safe_hours,),
+            )
+            outcome = cur.fetchone() or {}
+
+            cur.execute(
+                "WITH chat AS ("
+                " SELECT id,status FROM agent_jobs WHERE lane='chat' "
+                " AND created_at >= now() - make_interval(hours => %s)"
+                "), effect_by_job AS ("
+                " SELECT e.job_id, count(*)::int AS effect_rows,"
+                "  bool_or(e.status IN ('applied','applied_with_results')) AS applied,"
+                "  bool_or(e.status IN ('pending','pending_fenced_v1')) AS pending,"
+                "  bool_or(e.status='needs_reconciliation') AS needs_reconciliation,"
+                "  bool_or(e.status='discarded') AS discarded "
+                " FROM v2_effect_outbox e JOIN chat ON chat.id=e.job_id "
+                " WHERE (e.effect_type=ANY(%s::text[]) "
+                " OR (e.effect_type='reply' "
+                "     AND e.payload ? 'reply_through_seq')) "
+                " AND e.created_at >= now() - make_interval(hours => %s) "
+                " GROUP BY e.job_id"
+                ") SELECT "
+                " count(*) FILTER (WHERE effect_rows IS NOT NULL)::int "
+                "   AS final_effect_jobs,"
+                " coalesce(sum(effect_rows),0)::int AS final_effect_rows,"
+                " count(*) FILTER (WHERE applied)::int AS final_applied_jobs,"
+                " count(*) FILTER (WHERE pending)::int AS final_pending_jobs,"
+                " count(*) FILTER (WHERE needs_reconciliation)::int "
+                "   AS final_reconciliation_jobs,"
+                " count(*) FILTER (WHERE discarded)::int AS final_discarded_jobs,"
+                " count(*) FILTER (WHERE effect_rows > 1)::int "
+                "   AS duplicate_final_effect_jobs,"
+                " count(*) FILTER (WHERE chat.status='completed' "
+                "   AND coalesce(applied,false) IS NOT TRUE)::int "
+                "   AS completed_without_final_applied "
+                "FROM chat LEFT JOIN effect_by_job e ON e.job_id=chat.id",
+                (safe_hours, list(explicit_final_effect_types), safe_hours),
+            )
+            effects = cur.fetchone() or {}
+
+            cur.execute(
+                "WITH chat AS ("
+                " SELECT id FROM agent_jobs WHERE lane='chat' "
+                " AND created_at >= now() - make_interval(hours => %s)"
+                ") SELECT "
+                " count(*)::int AS failure_rows,"
+                " count(*) FILTER (WHERE f.reply_delivered_at IS NOT NULL)::int "
+                "   AS fallback_reply_delivered,"
+                " count(*) FILTER (WHERE f.reply_delivered_at IS NULL)::int "
+                "   AS fallback_reply_pending,"
+                " count(*) FILTER (WHERE f.status_delivered_at IS NOT NULL)::int "
+                "   AS error_status_delivered,"
+                " count(*) FILTER (WHERE f.runtime_error_delivered_at IS NOT NULL)::int "
+                "   AS runtime_error_delivered "
+                "FROM chat JOIN v2_terminal_failure_outbox f ON f.job_id=chat.id",
+                (safe_hours,),
+            )
+            failure_delivery = cur.fetchone() or {}
+
+            cur.execute(
+                "WITH chat AS ("
+                " SELECT * FROM agent_jobs WHERE lane='chat' "
+                " AND created_at >= now() - make_interval(hours => %s)"
+                "), final_applied AS ("
+                " SELECT e.job_id,min(e.applied_at) AS applied_at "
+                " FROM v2_effect_outbox e JOIN chat ON chat.id=e.job_id "
+                " WHERE (e.effect_type=ANY(%s::text[]) "
+                " OR (e.effect_type='reply' "
+                "     AND e.payload ? 'reply_through_seq')) "
+                " AND e.created_at >= now() - make_interval(hours => %s) "
+                " AND e.status IN ('applied','applied_with_results') "
+                " AND e.applied_at IS NOT NULL GROUP BY e.job_id"
+                ") SELECT "
+                " percentile_cont(0.5) WITHIN GROUP (ORDER BY "
+                "   extract(epoch FROM (coalesce(started_at,claimed_at)-created_at))) "
+                "   FILTER (WHERE coalesce(started_at,claimed_at) >= created_at) "
+                "     AS queue_p50_sec,"
+                " percentile_cont(0.95) WITHIN GROUP (ORDER BY "
+                "   extract(epoch FROM (coalesce(started_at,claimed_at)-created_at))) "
+                "   FILTER (WHERE coalesce(started_at,claimed_at) >= created_at) "
+                "     AS queue_p95_sec,"
+                " percentile_cont(0.99) WITHIN GROUP (ORDER BY "
+                "   extract(epoch FROM (coalesce(started_at,claimed_at)-created_at))) "
+                "   FILTER (WHERE coalesce(started_at,claimed_at) >= created_at) "
+                "     AS queue_p99_sec,"
+                " percentile_cont(0.5) WITHIN GROUP (ORDER BY "
+                "   extract(epoch FROM (finished_at-coalesce(started_at,claimed_at)))) "
+                "   FILTER (WHERE finished_at >= coalesce(started_at,claimed_at)) "
+                "     AS processing_p50_sec,"
+                " percentile_cont(0.95) WITHIN GROUP (ORDER BY "
+                "   extract(epoch FROM (finished_at-coalesce(started_at,claimed_at)))) "
+                "   FILTER (WHERE finished_at >= coalesce(started_at,claimed_at)) "
+                "     AS processing_p95_sec,"
+                " percentile_cont(0.99) WITHIN GROUP (ORDER BY "
+                "   extract(epoch FROM (finished_at-coalesce(started_at,claimed_at)))) "
+                "   FILTER (WHERE finished_at >= coalesce(started_at,claimed_at)) "
+                "     AS processing_p99_sec,"
+                " percentile_cont(0.5) WITHIN GROUP (ORDER BY "
+                "   extract(epoch FROM (finished_at-created_at))) "
+                "   FILTER (WHERE finished_at >= created_at) AS turn_p50_sec,"
+                " percentile_cont(0.95) WITHIN GROUP (ORDER BY "
+                "   extract(epoch FROM (finished_at-created_at))) "
+                "   FILTER (WHERE finished_at >= created_at) AS turn_p95_sec,"
+                " percentile_cont(0.99) WITHIN GROUP (ORDER BY "
+                "   extract(epoch FROM (finished_at-created_at))) "
+                "   FILTER (WHERE finished_at >= created_at) AS turn_p99_sec,"
+                " percentile_cont(0.5) WITHIN GROUP (ORDER BY "
+                "   extract(epoch FROM (final_applied.applied_at-chat.created_at))) "
+                "   FILTER (WHERE final_applied.applied_at >= chat.created_at) "
+                "     AS server_applied_p50_sec,"
+                " percentile_cont(0.95) WITHIN GROUP (ORDER BY "
+                "   extract(epoch FROM (final_applied.applied_at-chat.created_at))) "
+                "   FILTER (WHERE final_applied.applied_at >= chat.created_at) "
+                "     AS server_applied_p95_sec,"
+                " percentile_cont(0.99) WITHIN GROUP (ORDER BY "
+                "   extract(epoch FROM (final_applied.applied_at-chat.created_at))) "
+                "   FILTER (WHERE final_applied.applied_at >= chat.created_at) "
+                "     AS server_applied_p99_sec "
+                "FROM chat LEFT JOIN final_applied ON final_applied.job_id=chat.id",
+                (safe_hours, list(explicit_final_effect_types), safe_hours),
+            )
+            latency = cur.fetchone() or {}
+
+            cur.execute(
+                "SELECT coalesce(provider,'unknown') AS provider,"
+                " coalesce(model,'unknown') AS model,"
+                " count(*)::int AS turns,"
+                " coalesce(sum(model_calls),0)::int AS model_calls,"
+                " coalesce(sum(retries),0)::int AS retries,"
+                " count(*) FILTER (WHERE failed IS TRUE)::int AS failed_turns,"
+                " percentile_cont(0.5) WITHIN GROUP (ORDER BY latency_ms) "
+                "   FILTER (WHERE latency_ms >= 0) AS p50_ms,"
+                " percentile_cont(0.95) WITHIN GROUP (ORDER BY latency_ms) "
+                "   FILTER (WHERE latency_ms >= 0) AS p95_ms,"
+                " percentile_cont(0.99) WITHIN GROUP (ORDER BY latency_ms) "
+                "   FILTER (WHERE latency_ms >= 0) AS p99_ms "
+                "FROM v2_turn_metrics WHERE lane='chat' "
+                " AND created_at >= now() - make_interval(hours => %s) "
+                "GROUP BY provider,model ORDER BY turns DESC,provider,model",
+                (safe_hours,),
+            )
+            model_breakdown = [dict(row) for row in cur.fetchall()]
+
+            cur.execute(
+                "SELECT last_error,count(*)::int AS count FROM agent_jobs "
+                "WHERE lane='chat' AND status IN ('failed','expired') "
+                " AND created_at >= now() - make_interval(hours => %s) "
+                "GROUP BY last_error ORDER BY count DESC",
+                (safe_hours,),
+            )
+            merged_failures: dict[str, int] = {}
+            for row in cur.fetchall():
+                code = _terminal_error_code(row.get("last_error"))
+                merged_failures[code] = (
+                    merged_failures.get(code, 0) + int(row.get("count") or 0)
+                )
+
+            cur.execute(
+                "WITH chat AS ("
+                " SELECT * FROM agent_jobs WHERE lane='chat' "
+                " AND created_at >= now() - make_interval(hours => %s) "
+                " ORDER BY created_at DESC,id DESC LIMIT %s"
+                "), final_effect AS ("
+                " SELECT e.job_id,"
+                "  CASE "
+                "   WHEN bool_or(e.status IN ('applied','applied_with_results')) "
+                "     THEN 'server_applied' "
+                "   WHEN bool_or(e.status='needs_reconciliation') "
+                "     THEN 'needs_reconciliation' "
+                "   WHEN bool_or(e.status IN ('pending','pending_fenced_v1')) "
+                "     THEN 'pending' "
+                "   WHEN bool_or(e.status='discarded') THEN 'discarded' "
+                "   ELSE 'unknown' END AS final_effect_status "
+                " FROM v2_effect_outbox e JOIN chat ON chat.id=e.job_id "
+                " WHERE (e.effect_type=ANY(%s::text[]) "
+                " OR (e.effect_type='reply' "
+                "     AND e.payload ? 'reply_through_seq')) "
+                " AND e.created_at >= now() - make_interval(hours => %s) "
+                " GROUP BY e.job_id"
+                "), metric AS ("
+                " SELECT DISTINCT ON (m.job_id) m.job_id,m.provider,m.model,"
+                "   m.model_calls,m.retries,m.latency_ms "
+                " FROM v2_turn_metrics m JOIN chat ON chat.id=m.job_id "
+                " ORDER BY m.job_id,m.created_at DESC,m.id DESC"
+                ") SELECT chat.id AS job_id,chat.user_id,chat.status,"
+                " chat.last_error,chat.created_at,chat.started_at,chat.finished_at,"
+                " coalesce(final_effect.final_effect_status,'missing') "
+                "   AS final_effect_status,"
+                " metric.provider,metric.model,metric.model_calls,metric.retries,"
+                " metric.latency_ms "
+                "FROM chat LEFT JOIN final_effect ON final_effect.job_id=chat.id "
+                "LEFT JOIN metric ON metric.job_id=chat.id "
+                "ORDER BY chat.created_at DESC,chat.id DESC",
+                (
+                    safe_hours,
+                    safe_limit,
+                    list(explicit_final_effect_types),
+                    safe_hours,
+                ),
+            )
+            recent_jobs = []
+            for row in cur.fetchall():
+                item = dict(row)
+                item["last_error"] = (
+                    _terminal_error_code(item.get("last_error"))
+                    if item.get("last_error") else ""
+                )
+                recent_jobs.append(item)
+
+    def as_int(row: dict, key: str) -> int:
+        return int(row.get(key) or 0)
+
+    def optional_float(row: dict, key: str) -> float | None:
+        value = row.get(key)
+        return None if value is None else float(value)
+
+    completed = as_int(outcome, "completed")
+    failed = as_int(outcome, "failed")
+    expired = as_int(outcome, "expired")
+    admitted = as_int(outcome, "admitted")
+    settled = completed + failed + expired
+    applied = as_int(effects, "final_applied_jobs")
+    return {
+        "window_hours": safe_hours,
+        "outcomes": {
+            key: as_int(outcome, key)
+            for key in (
+                "admitted", "started", "completed", "failed", "expired",
+                "superseded", "in_flight", "users",
+            )
+        },
+        "reply_delivery": {
+            key: as_int(effects, key)
+            for key in (
+                "final_effect_jobs", "final_effect_rows", "final_applied_jobs",
+                "final_pending_jobs", "final_reconciliation_jobs",
+                "final_discarded_jobs", "duplicate_final_effect_jobs",
+                "completed_without_final_applied",
+            )
+        },
+        "failure_delivery": {
+            key: as_int(failure_delivery, key)
+            for key in (
+                "failure_rows", "fallback_reply_delivered",
+                "fallback_reply_pending", "error_status_delivered",
+                "runtime_error_delivered",
+            )
+        },
+        "settled_jobs": settled,
+        "terminal_completion_rate": (
+            float(completed) / float(settled) if settled else None
+        ),
+        "server_final_reply_applied_rate": (
+            float(applied) / float(admitted) if admitted else None
+        ),
+        "latency": {
+            key: optional_float(latency, key)
+            for key in (
+                "queue_p50_sec", "queue_p95_sec", "queue_p99_sec",
+                "processing_p50_sec", "processing_p95_sec",
+                "processing_p99_sec", "turn_p50_sec", "turn_p95_sec",
+                "turn_p99_sec", "server_applied_p50_sec",
+                "server_applied_p95_sec", "server_applied_p99_sec",
+            )
+        },
+        "model_breakdown": model_breakdown,
+        "failure_reasons": [
+            {"code": code, "count": count}
+            for code, count in sorted(
+                merged_failures.items(), key=lambda item: (-item[1], item[0])
+            )[:12]
+        ],
+        "recent_jobs": recent_jobs,
+        "client_delivery_ack": None,
+        "provider_attempt_accounting": None,
     }
 
 
@@ -4569,8 +4954,15 @@ def recent_token_usage_by_lane(*, within_hours: int = 24) -> dict:
     with _pool().connection() as conn:
         with conn.cursor(row_factory=dict_row) as cur:
             cur.execute(
-                "SELECT lane,"
+                "SELECT lane,GROUPING(lane)::int AS is_total,"
+                "  count(*)::bigint AS turns,"
+                "  count(DISTINCT user_id) FILTER (WHERE model_calls > 0)::bigint"
+                "    AS model_active_users,"
+                "  count(DISTINCT (user_id,timezone('Asia/Shanghai',created_at)::date))"
+                "    FILTER (WHERE model_calls > 0)::bigint AS active_user_days,"
                 "  coalesce(sum(model_calls), 0)::bigint AS model_calls,"
+                "  coalesce(sum(retries), 0)::bigint AS retries,"
+                "  count(*) FILTER (WHERE failed IS TRUE)::bigint AS failed_turns,"
                 "  coalesce(sum(usage_reported_calls), 0)::bigint"
                 "    AS usage_reported_calls,"
                 "  coalesce(sum(cache_reported_calls), 0)::bigint"
@@ -4581,7 +4973,7 @@ def recent_token_usage_by_lane(*, within_hours: int = 24) -> dict:
                 "  sum(cache_miss_tokens)::bigint AS cache_miss_tokens "
                 "FROM v2_turn_metrics "
                 "WHERE created_at >= now() - make_interval(hours => %s) "
-                "GROUP BY lane",
+                "GROUP BY GROUPING SETS ((lane), ())",
                 (safe_hours,),
             )
             rows = cur.fetchall()
@@ -4591,6 +4983,7 @@ def recent_token_usage_by_lane(*, within_hours: int = 24) -> dict:
         return int(value) if value is not None else None
 
     lanes: dict[str, dict] = {}
+    total: dict | None = None
     for row in rows:
         model_calls = int(row["model_calls"] or 0)
         usage_calls = int(row["usage_reported_calls"] or 0)
@@ -4613,8 +5006,13 @@ def recent_token_usage_by_lane(*, within_hours: int = 24) -> dict:
             if cache_read is not None and cache_miss is not None
             else 0
         )
-        lanes[str(row["lane"] or "unknown")] = {
+        rendered = {
+            "turns": int(row.get("turns") or 0),
+            "model_active_users": int(row.get("model_active_users") or 0),
+            "active_user_days": int(row.get("active_user_days") or 0),
             "model_calls": model_calls,
+            "retries": int(row.get("retries") or 0),
+            "failed_turns": int(row.get("failed_turns") or 0),
             "usage_reported_calls": usage_calls,
             # cache coverage 与 usage coverage 是两个不同的东西：前者是"有多少次
             # 调用报了缓存指标"，后者是"有多少次调用报了 token usage"。页面此前把
@@ -4642,8 +5040,24 @@ def recent_token_usage_by_lane(*, within_hours: int = 24) -> dict:
                 else None
             ),
         }
+        rendered["tokens_per_active_user_day"] = (
+            float(rendered["total_tokens"]) / float(rendered["active_user_days"])
+            if rendered["total_tokens"] is not None
+            and rendered["active_user_days"]
+            else None
+        )
 
-    return {"window_hours": safe_hours, "lanes": lanes}
+        if int(row.get("is_total") or 0) == 1:
+            total = rendered
+        else:
+            lanes[str(row["lane"] or "unknown")] = rendered
+
+    return {
+        "window_hours": safe_hours,
+        "active_user_day_timezone": "Asia/Shanghai",
+        "lanes": lanes,
+        "total": total,
+    }
 
 
 _RUNTIME_USER_EFFECT_WINDOW_SQL = """
@@ -8073,6 +8487,58 @@ def wake_success_stats(*, within_hours: int = 24) -> dict:
             cur.execute(
                 "SELECT lane, status, count(*) FROM agent_jobs "
                 "WHERE lane IN ('heartbeat','scheduled','manual_wake') "
+                "AND finished_at IS NOT NULL "
+                "AND finished_at > now() - make_interval(hours => %s) "
+                "GROUP BY lane, status",
+                (int(within_hours),),
+            )
+            rows = cur.fetchall()
+    completed = failed = expired = 0
+    by_lane: dict[str, dict[str, int]] = {}
+    for lane, status, count in rows:
+        count = int(count)
+        by_lane.setdefault(lane, {})[status] = count
+        if status == "completed":
+            completed += count
+        elif status == "failed":
+            failed += count
+        elif status == "expired":
+            expired += count
+    denom = completed + failed + expired
+    return {
+        "completed": completed,
+        "failed": failed,
+        "expired": expired,
+        "success_rate": (completed / denom) if denom else None,
+        "by_lane": by_lane,
+    }
+
+
+def memory_lane_health(*, within_hours: int = 24) -> dict:
+    """记忆车道（capture 落卡 / dream 整理）的舰队级健康度。
+
+    为什么单独一条而不是塞进 ``wake_success_stats`` 的 lane 列表：这两条车道不是
+    唤醒。混进去会让"做梦大面积失败"表现为"唤醒成功率下降"，把排查的人引去查唤醒
+    ——同一个数字承载两件事，就是 TESTING §2-N 那条口径漂移。
+
+    补这条的由来（2026-07-31）：用户报"切到 V2 后晚上不整理记忆了"，而当时
+    ``/v1/admin/v2-metrics`` 里**没有任何记忆车道的数字**，只能靠逐个用户比对
+    ``bootstrap_events`` 里最后一次写卡时间才看出 4 个 V2 用户里 3 个自切换起再没
+    写过卡。那个方法只在"已经知道该怀疑谁"时管用；**没有用户报障的话，记忆整理
+    全线停摆我们也发现不了**——它坏掉的样子就是"什么都没发生"，和"今天没什么可记
+    的"长得一模一样。
+
+    与 wake 同一条判据（照抄那边的地雷1）：``completed`` 就是成功，**即使这一轮
+    一张卡都没写**。capture 跑完发现没什么值得记是合法结果（noop），不能当失败去
+    拉低成功率；只有 ``failed``（解析/provider 真错误）和 ``expired``（reaper 判定
+    卡死回收）计入失败侧。
+
+    返回形状与 ``wake_success_stats`` 一致，便于并排读。"""
+    with _pool().connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT lane, status, count(*) FROM agent_jobs "
+                "WHERE lane IN ('capture','dream') "
                 "AND finished_at IS NOT NULL "
                 "AND finished_at > now() - make_interval(hours => %s) "
                 "GROUP BY lane, status",

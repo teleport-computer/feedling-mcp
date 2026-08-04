@@ -387,7 +387,6 @@ _V2_WAKE_OWNER_ID = "hosted_runtime_v2"
 
 _IMAGE_MARKER = "[image]"
 _UNAVAILABLE_CHAT_MARKER = "[message unavailable]"
-_SUMMARY_INTEGRITY_ERROR = "v2_summary_integrity_error"
 _USER_ROLES = frozenset({"user", "human"})
 
 
@@ -1125,6 +1124,44 @@ def _summary_metadata_frontier(state: dict) -> list:
     return validated
 
 
+def _decrypt_summary_text(
+    envelope: dict,
+    *,
+    runtime_token: str,
+    purpose: str,
+) -> str:
+    """Open one canonical summary envelope and preserve integrity failures.
+
+    Enclave availability/auth failures remain ordinary runtime failures so an
+    optional checkpoint may retry later.  An authenticated decrypt rejection,
+    invalid plaintext framing, or non-UTF-8 summary means the canonical node
+    itself cannot be opened and must never be downgraded to best effort.
+    """
+    try:
+        raw = core_enclave._decrypt_envelope_via_enclave(
+            envelope,
+            None,
+            purpose=purpose,
+            runtime_token=runtime_token,
+        )
+    except RuntimeError as exc:
+        reason = str(exc or "")
+        if (
+            reason.startswith("enclave_http_403:")
+            and "decrypt_failed" in reason
+        ) or reason.startswith("enclave_plaintext_decode:"):
+            raise v2_summary_frontier.SummaryFrontierIntegrityError(
+                "canonical_summary_decrypt_failed"
+            ) from exc
+        raise
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise v2_summary_frontier.SummaryFrontierIntegrityError(
+            "canonical_summary_not_utf8"
+        ) from exc
+
+
 def _open_summary_frontier_state(user_id: str) -> tuple[dict | None, list]:
     """Open canonical nodes only for checkpoint generation."""
     state = jobs_store.get_summary_frontier_state(user_id)
@@ -1140,15 +1177,14 @@ def _open_summary_frontier_state(user_id: str) -> tuple[dict | None, list]:
     for row in segment_rows:
         env = row.get("summary_envelope")
         if not env:
-            raise RuntimeError(
-                f"{_SUMMARY_INTEGRITY_ERROR}: segment without encrypted envelope"
+            raise v2_summary_frontier.SummaryFrontierIntegrityError(
+                "canonical_segment_missing_envelope"
             )
-        plaintext = core_enclave._decrypt_envelope_via_enclave(
+        plaintext = _decrypt_summary_text(
             env,
-            None,
             purpose="v2_summary_segment_read",
             runtime_token=token,
-        ).decode("utf-8")
+        )
         meta = metadata_by_id[int(row["segment_id"])]
         opened.append(
             v2_summary_frontier.SummarySegment(
@@ -1269,17 +1305,19 @@ def _read_summary_with_seq(user_id: str) -> tuple[str, float, int, int]:
     env = row.get("summary_envelope")
     if not env:
         if has_durable_coverage:
-            raise RuntimeError(
-                f"{_SUMMARY_INTEGRITY_ERROR}: nonzero watermark without summary envelope"
+            raise v2_summary_frontier.SummaryFrontierIntegrityError(
+                "covered_summary_missing_envelope"
             )
         return "", watermark_ts, version, watermark_seq
     token = _mint_runtime_token(user_id)
-    plaintext = core_enclave._decrypt_envelope_via_enclave(
-        env, None, purpose="v2_summary_read", runtime_token=token
-    ).decode("utf-8")
+    plaintext = _decrypt_summary_text(
+        env,
+        purpose="v2_summary_read",
+        runtime_token=token,
+    )
     if has_durable_coverage and not plaintext.strip():
-        raise RuntimeError(
-            f"{_SUMMARY_INTEGRITY_ERROR}: nonzero watermark with empty summary plaintext"
+        raise v2_summary_frontier.SummaryFrontierIntegrityError(
+            "covered_summary_empty_plaintext"
         )
     return plaintext, watermark_ts, version, watermark_seq
 
@@ -1578,6 +1616,7 @@ def _read_scheduled_wake_context(user_id: str, job_id: int) -> list[dict]:
             "task_id": str(record.timer_id or ""),
             "next_trigger_at": str(record.at or ""),
             "timezone": str(record.timezone or ""),
+            "repeat": str(record.repeat or ""),
             "fired_at": float(record.fired_at or 0.0),
         })
         if len(context) >= 10:
@@ -1926,32 +1965,41 @@ def _read_files(user_id: str, message_ids: list[str]) -> dict[str, dict]:
     return out
 
 
-# 记忆抽取上下文一次拉多少张卡喂 dream prompt。dream 只需要一份粗粒度的现有卡片清单
-# 供模型判断哪些能合并；不是全量导出，控制 prompt 体积 + 一次 enclave 往返的候选数。
+# Candidate count and whole-card prompt budget for one Dream run.  Selected
+# cards are never field-truncated: once the bounded prompt cannot fit another
+# complete fetched card, it stops and leaves that card for a later run.
 _MEMORY_CARDS_LIMIT = int(os.environ.get("FEEDLING_V2_MEMORY_CARDS_LIMIT", "60"))
+_DREAM_CARDS_MAX_CHARS = int(
+    os.environ.get("FEEDLING_V2_DREAM_CARDS_MAX_CHARS", "60000")
+)
 
 
 def _render_card_line(item: dict) -> str:
-    """一张记忆卡渲染成一行（title/summary/content 里第一个非空的）+ 它现在的桶，仅供 dream
-    prompt 参考。带上桶是为了让 dream 能**复用已有桶**、别造近义桶（Q2；capture 已有此上下文，
-    V2 dream 此前只渲染正文、丢了桶）。卡内容经 enclave readside 解出明文（见 memory_index_core），
-    服务器本地不再解密。"""
+    """Render every available plaintext field of one fetched Dream card.
+
+    V2 used to give the model only the first non-empty title/summary/content
+    value from ``memory.index``.  In practice that was just a one-line summary,
+    so 1:1 ``thicken`` operations irreversibly reconstructed cards without
+    seeing their bodies.  Dream now consumes ``memory.fetch`` results and
+    labels summary/content separately, matching the information V1 can inspect
+    through memory-index + memory-get.
+    """
     if not isinstance(item, dict):
         return ""
-    text = str(
-        item.get("title") or item.get("summary") or item.get("content") or ""
-    ).strip()
     mid = str(item.get("id") or "").strip()
-    if not text:
+    summary = str(item.get("summary") or item.get("title") or "").strip()
+    content = str(item.get("content") or "").strip()
+    if not summary and not content:
         return ""
     bucket = str(item.get("bucket") or "").strip()
-    parts = []
-    if mid:
-        parts.append(f"[{mid}]")
-    if bucket:
-        parts.append(f"（桶：{bucket}）")
-    parts.append(text)
-    return "- " + " ".join(parts)
+    source = str(item.get("source") or "").strip()
+    created_at = str(item.get("created_at") or item.get("occurred_at") or "").strip()
+    parts = [f"id={mid}", f"bucket={bucket}", f"source={source}", f"created_at={created_at}"]
+    if summary:
+        parts.append(f"summary={summary}")
+    if content:
+        parts.append(f"content={content}")
+    return "- " + " | ".join(parts)
 
 
 _PROFILE_CARD_CONTENT_MAX_CHARS = 2_000
@@ -2046,7 +2094,7 @@ def _read_profile_cards(user_id: str) -> tuple[str, int]:
     return "\n".join(rendered), user_card_count
 
 
-def _read_memory_context(user_id: str) -> dict:
+def _read_memory_context(user_id: str, *, full_cards: bool = False) -> dict:
     """capture/dream prompt 要的记忆上下文（buckets/threads/identity/cards 明文串）。
 
     **每一项独立 try/except 降级为 ""**（spec §3.5）：任一子取数失败绝不清空其它项、绝不
@@ -2082,6 +2130,7 @@ def _read_memory_context(user_id: str) -> dict:
         "threads": "",
         "identity": "",
         "cards": "",
+        "card_items": [],
     }
     try:
         body, status = memory_core.buckets(store, None, post_enclave=_post)
@@ -2104,8 +2153,51 @@ def _read_memory_context(user_id: str) -> dict:
             store, None, {"limit": _MEMORY_CARDS_LIMIT}, post_enclave=_post
         )
         if status == 200:
-            lines = [_render_card_line(it) for it in (body.get("items") or [])]
-            ctx["cards"] = "\n".join(ln for ln in lines if ln)
+            index_items = [
+                item for item in (body.get("items") or []) if isinstance(item, dict)
+            ]
+            ids = [str(item.get("id") or "").strip() for item in index_items]
+            ids = [memory_id for memory_id in ids if memory_id]
+            if ids and full_cards:
+                fetched, fetch_status = memory_core.fetch(
+                    store,
+                    None,
+                    {"ids": ids, "limit": 0, "include_sensitive": True},
+                    post_enclave=_post,
+                )
+                fetched_items = (
+                    fetched.get("items") if isinstance(fetched, dict) else None
+                )
+                if fetch_status != 200 or not isinstance(fetched_items, list):
+                    raise RuntimeError(f"dream_cards_fetch_failed:{fetch_status}")
+                by_id = {
+                    str(item.get("id") or ""): item
+                    for item in fetched_items
+                    if isinstance(item, dict)
+                }
+                if any(memory_id not in by_id for memory_id in ids):
+                    raise RuntimeError(
+                        f"dream_cards_fetch_incomplete:{len(ids)}/{len(by_id)}"
+                    )
+                selected: list[dict] = []
+                lines: list[str] = []
+                rendered_chars = 0
+                for memory_id in ids:
+                    item = by_id[memory_id]
+                    line = _render_card_line(item)
+                    if not line:
+                        continue
+                    added_chars = len(line) + (1 if lines else 0)
+                    if lines and rendered_chars + added_chars > _DREAM_CARDS_MAX_CHARS:
+                        break
+                    selected.append(item)
+                    lines.append(line)
+                    rendered_chars += added_chars
+                ctx["card_items"] = selected
+                ctx["cards"] = "\n".join(lines)
+            elif not full_cards:
+                lines = [_render_card_line(item) for item in index_items]
+                ctx["cards"] = "\n".join(line for line in lines if line)
     except Exception as e:  # noqa: BLE001 — 单项降级
         log.warning("[v2.serve_worker] memory index unavailable for %s: %s", user_id, e)
     try:
@@ -2119,6 +2211,12 @@ def _read_memory_context(user_id: str) -> dict:
     except Exception as e:  # noqa: BLE001 — 单项降级
         log.warning("[v2.serve_worker] identity unavailable for %s: %s", user_id, e)
     return ctx
+
+
+def _read_dream_memory_context(user_id: str) -> dict:
+    """Dream-only full-card context; Capture keeps its lightweight index."""
+
+    return _read_memory_context(user_id, full_cards=True)
 
 
 def _apply_memory_actions(
@@ -2146,34 +2244,56 @@ def _apply_memory_actions(
       卡确实删了、turn 却失败）。丢弃+记日志：用户照常拿到回复，被拒的 action 在
       runner 日志里可见（body 打进 warning，供事后定位）。"""
     store = core_store.get_store(user_id)
-    body, status = memory_core.actions(
-        store,
-        None,
-        {"actions": actions},
-        runtime_token=runtime_token,
-    )
-    if status >= 500:
-        raise RuntimeError(
-            f"memory_actions_failed: status={status} body={str(body)[:160]}"
+    batches: list[dict] = []
+    for offset in range(0, len(actions), 20):
+        body, status = memory_core.actions(
+            store,
+            None,
+            {"actions": actions[offset : offset + 20]},
+            runtime_token=runtime_token,
         )
-    if status >= 400:
-        log.warning(
-            "[v2.serve_worker] memory action rejected (4xx, dropped) user=%s status=%s body=%s",
-            user_id,
-            status,
-            str(body)[:300],
-        )
-    elif int(body.get("failed_count") or 0) > 0:
-        log.warning(
-            "[v2.serve_worker] memory batch had item failures user=%s "
-            "applied=%s skipped=%s failed=%s body=%s",
-            user_id,
-            body.get("applied_count"),
-            body.get("skipped_count"),
-            body.get("failed_count"),
-            str(body)[:500],
-        )
-    return body
+        if status >= 500:
+            raise RuntimeError(
+                f"memory_actions_failed: status={status} body={str(body)[:160]}"
+            )
+        if status >= 400:
+            log.warning(
+                "[v2.serve_worker] memory action rejected (4xx, dropped) user=%s status=%s body=%s",
+                user_id,
+                status,
+                str(body)[:300],
+            )
+        elif int(body.get("failed_count") or 0) > 0:
+            log.warning(
+                "[v2.serve_worker] memory batch had item failures user=%s "
+                "applied=%s skipped=%s failed=%s body=%s",
+                user_id,
+                body.get("applied_count"),
+                body.get("skipped_count"),
+                body.get("failed_count"),
+                str(body)[:500],
+            )
+        batches.append(body)
+    if len(batches) <= 1:
+        return batches[0] if batches else {"status": "ok", "results": [], "effects": []}
+    results = [row for body in batches for row in body.get("results", [])]
+    effects = [row for body in batches for row in body.get("effects", [])]
+    failed_count = sum(int(body.get("failed_count") or 0) for body in batches)
+    applied_count = sum(int(body.get("applied_count") or 0) for body in batches)
+    skipped_count = sum(int(body.get("skipped_count") or 0) for body in batches)
+    merged = {
+        "status": "ok" if failed_count == 0 else ("failed" if failed_count == len(results) else "partial"),
+        "results": results,
+        "effects": effects,
+        "total_count": len(results),
+        "applied_count": applied_count,
+        "skipped_count": skipped_count,
+        "failed_count": failed_count,
+    }
+    first_error = next((body.get("error") for body in batches if body.get("error")), None)
+    if first_error:
+        merged["error"] = first_error
+    return merged
 
 
 def _build_memory_envelope(
@@ -2907,8 +3027,9 @@ def _sink_schedule(user_id: str, payload: dict) -> object:
     1. Worker's write-tool-call mapping (`worker.process_job`'s
        `_enqueue_write_effect`, spec C6): a `schedule_wake`/`cancel_wake` tool
        call becomes ``{"op": tc.name, **tc.args}`` — the user CAPABILITY params
-       (``at``/``tz``/``reason`` for schedule_wake, ``wake_id``/``reason`` for
-       cancel_wake; see `capabilities/wake.py`'s `schedule`/`cancel`). When
+       (``at``/``tz``/``reason``/``repeat`` for schedule_wake,
+       ``wake_id``/``reason`` for cancel_wake; see `capabilities/wake.py`'s
+       `schedule`/`cancel`). When
        ``payload["op"]`` names one of these, route through
        `cap_registry.run_capability` — the same dispatcher
        `_sink_identity`/executor already use for capability writes — so the
@@ -3610,9 +3731,33 @@ def _record_extraction_status(
     status: str,
     detail: dict,
 ) -> None:
-    # Capture is the only extraction lane enabled on Pre. Dream deliberately
-    # keeps its existing/default-off status behavior until its own frontier
-    # metadata is carried durably with agent_jobs.
+    if lane == "dream":
+        store = core_store.get_store(user_id)
+        snapshot = dream_scheduler._dream_snapshot(store)
+        item_count = max(0, int((detail or {}).get("item_count") or 0))
+        dream_scheduler.record_dream_job_status(
+            store,
+            {
+                "job_kind": "memory_dream",
+                "status": status,
+                "dream_stats": {
+                    "card_count": snapshot.get("card_count") or 0,
+                    "seed_card_count": snapshot.get("seed_card_count") or 0,
+                    "turn_count": snapshot.get("turn_count") or 0,
+                    "signature": snapshot.get("signature") or "",
+                },
+                "dream_until": {
+                    "signature": snapshot.get("signature") or "",
+                    "last_until": snapshot.get("last_until") or "",
+                },
+                "dream_result": {
+                    "organized_count": item_count,
+                    "merged_count": item_count,
+                },
+            },
+            status=status,
+        )
+        return
     if lane != "capture":
         return
     window = detail.get("window") if isinstance(detail, dict) else {}
@@ -3659,6 +3804,7 @@ def build_production_deps() -> v2_worker.TurnDeps:
         observe_photo=_observe_photo,
         read_files=_read_files,
         read_memory_context=_read_memory_context,
+        read_dream_memory_context=_read_dream_memory_context,
         read_profile_cards=_read_profile_cards,
         select_profile_for_turn=_select_agent_profile_for_turn,
         read_scheduled_wake_context=_read_scheduled_wake_context,

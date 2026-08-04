@@ -456,7 +456,7 @@ def test_profile_output_budget_is_raised_for_full_cjk_json():
     assert seen["max_tokens"] == 8000
 
 
-def test_compose_memory_lanes_are_on_in_each_pooled_worker():
+def test_compose_memory_lane_defaults_match_environment_policy():
     root = Path(__file__).parent.parent
     for relative in (
         "deploy/docker-compose.phala.yaml",
@@ -477,10 +477,12 @@ def test_compose_memory_lanes_are_on_in_each_pooled_worker():
             'FEEDLING_V2_CAPTURE_ENABLED: "${FEEDLING_V2_CAPTURE_ENABLED:-1}"'
             in worker_block
         )
-        assert (
-            'FEEDLING_V2_DREAM_ENABLED: "${FEEDLING_V2_DREAM_ENABLED:-1}"'
-            in worker_block
+        expected_dream = (
+            'FEEDLING_V2_DREAM_ENABLED: "${FEEDLING_V2_DREAM_ENABLED:-0}"'
+            if relative.endswith(".test.yaml")
+            else 'FEEDLING_V2_DREAM_ENABLED: "${FEEDLING_V2_DREAM_ENABLED:-1}"'
         )
+        assert expected_dream in worker_block
         assert (
             'FEEDLING_V2_PROFILE_ENABLED: "${FEEDLING_V2_PROFILE_ENABLED:-0}"'
             in worker_block

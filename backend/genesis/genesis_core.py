@@ -38,6 +38,7 @@ import re
 from typing import Any
 
 import db
+from genesis import plaintext as plaintext_helpers
 from genesis import service
 from hosted import history_import
 from identity import service as identity_service
@@ -415,12 +416,15 @@ def _valid_job_id(job_id: str) -> bool:
 
 
 def _job_response(job: dict | None, *, extra: dict | None = None) -> dict:
-    job = job or {}
+    job = _public_job(job or {})
     # Report the client-facing stage name (v2-internal -> legacy phase the old iOS maps),
     # so shipped apps show correct copy without an update. Stored stage is unchanged.
     out = job.get("output")
     if isinstance(out, dict) and out.get("stage"):
-        job = {**job, "output": {**out, "stage": service.public_stage(out["stage"])}}
+        public_output = {**out, "stage": service.public_stage(out["stage"])}
+        if isinstance(out.get("materials"), list):
+            public_output["materials"] = service.public_materials_for_job(job)
+        job = {**job, "output": public_output}
     body = {
         "job": job,
         "privacy_mode": service.PRIVACY_MODE,
@@ -429,6 +433,18 @@ def _job_response(job: dict | None, *, extra: dict | None = None) -> dict:
     if extra:
         body.update(extra)
     return body
+
+
+def _public_job(job: dict) -> dict:
+    metadata = job.get("metadata")
+    if not isinstance(metadata, dict):
+        return job
+    public_metadata = {
+        key: value
+        for key, value in metadata.items()
+        if not str(key).startswith("plaintext_worker_")
+    }
+    return {**job, "metadata": public_metadata}
 
 
 def _json_chunk_payload(payload: dict) -> tuple[bytes, dict[str, Any]]:
@@ -481,7 +497,7 @@ def list_imports(store, *, limit_raw) -> tuple[dict, int]:
     except Exception:
         limit = 20
     return {
-        "jobs": db.genesis_list_jobs(store.user_id, limit=limit),
+        "jobs": [_public_job(job) for job in db.genesis_list_jobs(store.user_id, limit=limit)],
         "state": db.get_blob(store.user_id, service.GENESIS_STATE_BLOB),
     }, 200
 
@@ -500,6 +516,8 @@ def get_import_status(store, job_id: str, *, include_missing_raw) -> tuple[dict,
     job = db.genesis_get_job(store.user_id, job_id)
     if not job:
         return _bad("genesis_job_not_found", 404)
+    if str(job.get("status") or "") == "processing":
+        job = plaintext_helpers._fail_stale_plaintext_job(store, job) or job
     # The app should see a continuous processing->done arc; hide the internal
     # `awaiting_resident` claim status that sits between upload and the resident claim.
     if str(job.get("status") or "") == "awaiting_resident":
@@ -515,6 +533,21 @@ def get_import_status(store, job_id: str, *, include_missing_raw) -> tuple[dict,
             job_id,
             int(job.get("total_chunks") or 0),
         )
+    output = job.get("output") if isinstance(job.get("output"), dict) else {}
+    status_projection: dict[str, Any] = {
+        "job_id": str(job.get("job_id") or job_id),
+        "status": str(job.get("status") or ""),
+        "identity_ready": bool(output.get("identity_ready")),
+        "materials": service.public_materials_for_job(job),
+        "error_class": None,
+        "friendly_copy": "",
+    }
+    if str(job.get("status") or "") == service.FAILED_JOB_STATUS:
+        error_class = service.classify_genesis_error(str(job.get("error") or ""))
+        status_projection["error_class"] = error_class
+        status_projection["friendly_copy"] = service.genesis_failure_required_text(
+            str(job.get("error") or ""))
+    extra.update(status_projection)
     return _job_response(job, extra=extra), 200
 
 
@@ -670,6 +703,7 @@ def plaintext_import(
     plaintext_mode,
     job_metadata,
     start_job,
+    distill_model: str = "",
 ) -> tuple[dict, int]:
     """Enqueue (or reuse) a plaintext genesis distill job.
 
@@ -680,6 +714,10 @@ def plaintext_import(
     that patch ``routes._start_plaintext_genesis_job`` keep working."""
     if not isinstance(payload, dict):
         return _bad("json_object_required", 400)
+    try:
+        normalized_distill_model = plaintext_helpers._distill_model_override(distill_model)
+    except ValueError as e:
+        return _bad(str(e), 400)
 
     # Route by body type, not a global switch. A SEALED body (self-hosted app encrypted it
     # client-side so the server never sees plaintext) → resident lane, where the user's own
@@ -698,23 +736,64 @@ def plaintext_import(
         input_hash=input_hash,
         mode=mode,
     )
+    if existing and str(existing.get("status") or "") == "processing":
+        existing = plaintext_helpers._fail_stale_plaintext_job(store, existing) or existing
     if existing and str(existing.get("status") or "") == service.DONE_JOB_STATUS:
         return _job_response(existing, extra={"status": "done"}), 200
+
+    # Fast-path the stable 409 response. The partial unique index remains the
+    # authoritative cross-worker race guard between this read and insertion.
+    try:
+        active_jobs = db.genesis_list_jobs(store.user_id, limit=100)
+    except Exception:
+        active_jobs = []
+    active_plaintext = next((
+        job for job in active_jobs
+        if str((job or {}).get("status") or "") == "processing"
+        and isinstance((job or {}).get("metadata"), dict)
+        and str(job["metadata"].get("ingest") or "") == "plaintext"
+    ), None)
+    if active_plaintext:
+        recovered = plaintext_helpers._fail_stale_plaintext_job(store, active_plaintext)
+        if not recovered:
+            return _bad(
+                "import_job_active",
+                409,
+                active_job_id=str(active_plaintext.get("job_id") or ""),
+            )
 
     try:
         prepared = prepare(payload)
     except ValueError as e:
         _log_plaintext_import_rejected(store, mode=mode, reason=str(e), payload=payload)
         return _bad_from_value_error(e, 400)
+    queued_output = {
+        "stage": "plaintext_queued",
+        "materials": plaintext_helpers._queued_plaintext_materials(prepared["source_groups"]),
+        "identity_ready": False,
+    }
 
     if existing:
-        existing = db.genesis_set_job_status(
+        existing_metadata = (
+            existing.get("metadata") if isinstance(existing.get("metadata"), dict) else {}
+        )
+        metadata_patch = plaintext_helpers._plaintext_worker_metadata()
+        if normalized_distill_model or existing_metadata.get("distill_model"):
+            metadata_patch["distill_model"] = normalized_distill_model or None
+        existing = db.genesis_patch_job_metadata(
             store.user_id,
             str(existing.get("job_id") or ""),
-            status="processing",
-            output={"stage": "plaintext_queued"},
-            processed_chunks=0,
+            metadata_patch,
         ) or existing
+        try:
+            existing = db.genesis_set_job_status(
+                store.user_id,
+                str(existing.get("job_id") or ""),
+                status="processing",
+                output=queued_output,
+            ) or existing
+        except db.GenesisPlaintextJobActive as e:
+            return _bad("import_job_active", 409, active_job_id=e.active_job_id)
         service.write_genesis_state(store, existing, status="processing")
         start_job(
             store,
@@ -736,15 +815,24 @@ def plaintext_import(
         input_hash=input_hash,
         mode=mode,
     )
+    if normalized_distill_model:
+        metadata["distill_model"] = normalized_distill_model
     total_bytes = sum(len(text.encode("utf-8")) for text in prepared["chunk_texts"])
     try:
-        job, _status = service.create_import_job(store, {
-            "source_kind": prepared["source_kind"],
-            "file_manifest_hash": input_hash,
-            "total_chunks": len(prepared["chunk_texts"]),
-            "total_bytes": total_bytes,
-            "metadata": metadata,
-        })
+        job, _status = service.create_import_job(
+            store,
+            {
+                "source_kind": prepared["source_kind"],
+                "file_manifest_hash": input_hash,
+                "total_chunks": len(prepared["chunk_texts"]),
+                "total_bytes": total_bytes,
+                "metadata": metadata,
+            },
+            initial_status="processing",
+            trusted_metadata=plaintext_helpers._plaintext_worker_metadata(),
+        )
+    except db.GenesisPlaintextJobActive as e:
+        return _bad("import_job_active", 409, active_job_id=e.active_job_id)
     except ValueError as e:
         _log_plaintext_import_rejected(store, mode=mode, reason=str(e), payload=payload)
         return _bad_from_value_error(e, 400)
@@ -753,8 +841,7 @@ def plaintext_import(
         store.user_id,
         str(job.get("job_id") or ""),
         status="processing",
-        output={"stage": "plaintext_queued"},
-        processed_chunks=0,
+        output=queued_output,
     ) or job
     service.write_genesis_state(store, job, status="processing")
     start_job(
@@ -769,3 +856,76 @@ def plaintext_import(
         analysis_messages=prepared["analysis_messages"],
     )
     return _job_response(job, extra={"status": "processing"}), 202
+
+
+def plaintext_estimate(store, payload: dict, *, api_key: str | None) -> tuple[dict, int]:
+    if not isinstance(payload, dict):
+        return _bad("json_object_required", 400)
+    if _is_sealed_body(payload):
+        return _bad("sealed_estimate_unsupported", 400)
+    try:
+        prepared = plaintext_helpers._prepare_plaintext_import(payload)
+        materials, total = plaintext_helpers._estimate_plaintext_materials(prepared)
+        staged_id = service.create_genesis_staged_payload(
+            store, payload, ttl_sec=plaintext_helpers._staged_ttl_sec())
+    except ValueError as e:
+        return _bad_from_value_error(e, 400)
+    except Exception as e:  # noqa: BLE001
+        return _bad(f"staged_import_create_failed:{type(e).__name__}", 500)
+    try:
+        recommended_model = plaintext_helpers._recommended_distill_model(store, api_key)
+    except Exception:  # noqa: BLE001
+        recommended_model = None
+    return {
+        "staged_id": staged_id,
+        "materials": materials,
+        "est_total_tokens": total,
+        "recommended_model": recommended_model,
+    }, 201
+
+
+def plaintext_commit(
+    store,
+    payload: dict,
+    *,
+    api_key: str | None,
+    prepare,
+    find_reusable,
+    plaintext_mode,
+    job_metadata,
+    start_job,
+) -> tuple[dict, int]:
+    if not isinstance(payload, dict):
+        return _bad("json_object_required", 400)
+    staged_id = str(payload.get("staged_id") or "").strip()
+    if not staged_id:
+        return _bad("staged_id_required", 400)
+    try:
+        staged_payload = service.load_genesis_staged_payload(store, api_key, staged_id)
+    except LookupError as e:
+        return _bad(str(e), 404)
+    except TimeoutError as e:
+        return _bad(str(e), 410)
+    except ValueError as e:
+        return _bad(str(e), 409 if str(e) == "staged_import_consumed" else 400)
+    except Exception as e:  # noqa: BLE001
+        return _bad(f"staged_import_load_failed:{type(e).__name__}", 500)
+    body, status = plaintext_import(
+        store,
+        staged_payload,
+        api_key=api_key,
+        prepare=prepare,
+        find_reusable=find_reusable,
+        plaintext_mode=plaintext_mode,
+        job_metadata=job_metadata,
+        start_job=start_job,
+        distill_model=str(payload.get("distill_model") or ""),
+    )
+    if 200 <= status < 300:
+        job = body.get("job") if isinstance(body.get("job"), dict) else {}
+        try:
+            service.mark_genesis_staged_consumed(
+                store, staged_id, str(job.get("job_id") or ""))
+        except Exception:
+            log.exception("genesis staged tombstone write failed staged_id=%s", staged_id)
+    return body, status

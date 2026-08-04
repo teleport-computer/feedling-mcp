@@ -11,6 +11,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "backend"))
 from memory.capture_prompt_v1 import (  # noqa: E402
     CAPTURE_TYPES,
     build_capture_prompt,
+    build_capture_semantic_retry_prompt,
+    capture_semantic_retry_reasons,
     parse_capture_cards,
 )
 
@@ -22,12 +24,15 @@ def test_prompt_renders_with_context_and_escaped_json():
         ai_name="小柒", user_name="Seven",
         buckets="工作, 关系", threads="加班, 吵架",
         identity="伴侣三个月", window="[user] 今天开了一天会",
+        cards="- [mom_123] （桶：工作）长期加班",
     )
     assert "小柒" in p and "Seven" in p
     assert "今天开了一天会" in p
     # the JSON template braces survived .format()
     assert '"cards": []' in p
     assert '"action": "add | merge | supersede | noop"' in p
+    assert "[mom_123]" in p
+    assert "只能从这里复制确切 target_id" in p
 
 
 def test_prompt_falls_back_to_neutral_defaults():
@@ -147,6 +152,23 @@ def test_parse_caps_threads_at_eight():
            '"threads":["a","b","c","d","e","f","g","h","i","j"]}]}')
     cards, err = parse_capture_cards(raw)
     assert len(cards[0]["threads"]) == 8
+
+
+def test_capture_semantic_retry_only_flags_missing_target():
+    assert capture_semantic_retry_reasons(
+        [{"action": "supersede", "target_id": ""}]
+    )
+    assert capture_semantic_retry_reasons(
+        [{"action": "merge", "target_id": "mom_1"}]
+    ) == []
+    assert capture_semantic_retry_reasons([{"action": "add"}]) == []
+
+
+def test_capture_semantic_retry_requires_the_complete_batch():
+    prompt = build_capture_semantic_retry_prompt("ORIGINAL", ["missing target"])
+    assert "包括上次已经合法的卡" in prompt
+    assert "不要只输出失败的卡" in prompt
+    assert "只重答失败的卡" not in prompt
 
 
 # --- A9 bucket convergence: one shared bilingual canonical vocabulary ----------

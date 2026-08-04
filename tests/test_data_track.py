@@ -577,7 +577,7 @@ def test_admin_data_track_sorts_before_pagination(client):
     assert page.status_code == 200, page.get_data(as_text=True)
     html = page.get_data(as_text=True)
     assert "Chat desc" in html
-    assert "DAU" in html
+    assert "日活与时长" in html
     assert "Memory asc" in html
     assert "Proactive desc" in html
 
@@ -662,7 +662,22 @@ def test_effective_responder_covers_v2_resident_and_none_states():
         now_epoch=1_000.0,
     )
     assert hosted_v2["effective_responder"] == "hosted_v2"
+    assert hosted_v2["runtime_state"] == "v2"
     assert hosted_v2["mismatch"] is False
+
+    draining = _dt._effective_responder(
+        route="model_api",
+        consumer_state=None,
+        runtime={
+            "hosted_runtime_state": "draining",
+            "model_api_route": {"is_active": True, "test_status": "ok"},
+            "runner_lease": {"active": False},
+        },
+        now_epoch=1_000.0,
+    )
+    assert draining["effective_responder"] == "hosted_v2"
+    assert draining["runtime_state"] == "draining"
+    assert draining["mismatch"] is False
 
     resident = _dt._effective_responder(
         route="resident",
@@ -678,6 +693,7 @@ def test_effective_responder_covers_v2_resident_and_none_states():
         now_epoch=1_000.0,
     )
     assert resident["effective_responder"] == "resident"
+    assert resident["runtime_state"] == "resident"
     assert resident["mismatch"] is False
 
     none = _dt._effective_responder(
@@ -726,6 +742,68 @@ def test_effective_responder_covers_v2_resident_and_none_states():
     assert stale_hosted["mismatch"] is False
     assert stale_hosted["poll_observations"][0]["recent"] is False
     assert stale_hosted["recent_poll_observations"] == []
+
+
+def test_admin_runtime_state_filter_is_strict_and_links_preserve_query(client):
+    v2_user, _ = _register(client)
+    draining_user, _ = _register(client)
+    resident_user, _ = _register(client)
+    _append_chat_at(
+        v2_user,
+        "msg-v2-activated",
+        "user",
+        "chat",
+        _epoch("2030-06-01T12:00:00Z"),
+    )
+    with db.get_pool().connection() as conn:
+        for user_id, runtime_state in (
+            (v2_user, "v2"),
+            (draining_user, "draining"),
+            (resident_user, "resident"),
+        ):
+            conn.execute(
+                "INSERT INTO v2_runtime_state (user_id,hosted_runtime_state) "
+                "VALUES (%s,%s) ON CONFLICT (user_id) DO UPDATE SET "
+                "hosted_runtime_state=EXCLUDED.hosted_runtime_state",
+                (user_id, runtime_state),
+            )
+
+    query = (
+        "runtime_state=v2&q=usr_&sort=chat&dir=asc&limit=1&offset=0"
+    )
+    response = client.get(
+        f"/v1/admin/data-track/users?{query}",
+        headers=_admin_headers(),
+    )
+    assert response.status_code == 200, response.get_data(as_text=True)
+    body = response.get_json()
+    assert [row["user_id"] for row in body["users"]] == [v2_user]
+    assert body["users"][0]["responder"]["runtime_state"] == "v2"
+    assert body["summary"]["runtime_state_counts"] == {"v2": 1}
+    assert body["summary"]["activated_runtime_state_counts"] == {"v2": 1}
+    assert body["filters"]["runtime_state"] == "v2"
+
+    page = client.get(
+        "/admin/data-track?admin_key=admin-test-token&" + query,
+        headers=_admin_headers(),
+    )
+    assert page.status_code == 200, page.get_data(as_text=True)
+    rendered = page.get_data(as_text=True).replace("&amp;", "&")
+    assert v2_user in rendered
+    assert draining_user not in rendered
+    assert resident_user not in rendered
+    assert "Hosted V2 账号行（当前筛选）" in rendered
+    assert "已激活 Hosted V2 账号行（当前筛选）" in rendered
+    assert '<div class="table-wrap"><table id="users">' in rendered
+    assert 'lang="zh-CN"' in rendered
+    assert (
+        f"/admin/data-track/users/{v2_user}?admin_key=admin-test-token"
+        "&q=usr_&limit=1&offset=0&sort=chat&dir=asc&runtime_state=v2"
+    ) in rendered
+    assert (
+        "/admin/data-track?admin_key=admin-test-token&q=usr_&limit=1&offset=0"
+        "&sort=chat&dir=asc&runtime_state=draining"
+    ) in rendered
 
 
 # App usage-duration rendering (app_session_end aggregation surfaced in the overview).
@@ -945,11 +1023,15 @@ def test_admin_data_track_page_uses_plain_language(client, monkeypatch):
     assert "怎么读这些数" in page          # the explainer note-box
     assert "没有、也无法有「已删除账户数」" in page
     assert "App 使用时长" in page
-    assert "运营 Telemetry" in page
-    assert "全站 V2 token 总量（近 30 天）" in page
-    assert "12,345" in page
-    assert "自托管激活账号（当前筛选）" in page
-    assert "可观测账号覆盖数" in page
+    assert "Runtime 人群" in page
+    assert "实际 Runtime" in page
+    assert "Resident / V1" in page
+    assert "Token 与模型用量已移到独立页面" in page
+    assert "打开 Token 与模型" in page
+    assert "运营 Telemetry" not in page
+    assert "全站 V2 token 总量" not in page
+    assert "12,345" not in page
+    assert "自托管激活账号（当前筛选）" not in page
     assert "已激活 / 原始行" not in page    # old jargon gone
 
 

@@ -12,4 +12,19 @@ def test_card_line_includes_bucket():
 
 def test_card_line_no_bucket_clean():
     line = _render_card_line({"id": "m2", "summary": "一张没有桶的卡"})
-    assert line == "- [m2] 一张没有桶的卡"
+    assert line == "- id=m2 | bucket= | source= | created_at= | summary=一张没有桶的卡"
+
+
+def test_card_line_includes_summary_and_full_content():
+    line = _render_card_line({
+        "id": "m3",
+        "summary": "咖啡偏好",
+        "content": "每天早上会用 V60 手冲，水温通常是 92 度。",
+        "bucket": "生活偏好",
+        "source": "memory_capture",
+        "created_at": "2026-07-01T00:00:00Z",
+    })
+
+    assert "summary=咖啡偏好" in line
+    assert "content=每天早上会用 V60 手冲，水温通常是 92 度。" in line
+    assert "source=memory_capture" in line

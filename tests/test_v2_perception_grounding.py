@@ -249,7 +249,7 @@ def test_chat_can_pull_exact_perception_after_first_round(monkeypatch):
     assert "365" in second
 
 
-def test_chat_turn_injects_pending_schedule_identity(monkeypatch):
+def test_chat_turn_injects_renewed_repeat_wake_id(monkeypatch):
     uid = "u_pending_schedule_context"
     conftest.seed_user(uid)
     _reset(uid)
@@ -262,17 +262,36 @@ def test_chat_turn_injects_pending_schedule_identity(monkeypatch):
     deps = _chat_deps([
         {"id": "m1", "ts": 1.0, "role": "user", "content": "取消刚才的提醒"}
     ])
-    deps.read_pending_scheduled_wake_context = lambda _uid: {
-        "pending_count": 1,
-        "pending_cap": 20,
-        "timers": [{
-            "wake_id": "sched_real_1",
+    from proactive.scheduled_wake_v2 import (
+        InMemoryScheduledWakeStoreV2,
+        ScheduledWakeServiceV2,
+    )
+
+    scheduled = ScheduledWakeServiceV2(InMemoryScheduledWakeStoreV2())
+    first = scheduled.apply_turn_actions(
+        uid,
+        [{
+            "type": "schedule_wake",
             "at": "2026-07-27T10:09:41+08:00",
             "tz": "Asia/Shanghai",
+            "repeat": "daily",
             "note": "提醒用户休息",
-            "origin_refs": [],
         }],
-    }
+        now=1.0,
+    )[0]
+
+    class _Accepted:
+        accepted = True
+        job_id = 1
+
+    fired = scheduled.fire_due_timers(
+        uid,
+        settings={},
+        now=2_000_000_000.0,
+        submit_wake=lambda _event: _Accepted(),
+    )[0]
+    assert fired.timer_id == first.timer_id
+    deps.read_pending_scheduled_wake_context = scheduled.agent_context_for_user
 
     jobs_store.enqueue_job(uid, "chat")
     job = jobs_store.claim_next_job("w")
@@ -288,7 +307,9 @@ def test_chat_turn_injects_pending_schedule_identity(monkeypatch):
     payload = _runtime_payload(seen)
     assert "perception_snapshot" not in payload["runtime_data"]
     timers = payload["runtime_data"]["scheduled_wakes"]["timers"]
-    assert timers[0]["wake_id"] == "sched_real_1"
+    assert timers[0]["wake_id"] == fired.next_timer_id
+    assert timers[0]["wake_id"] != first.timer_id
+    assert timers[0]["repeat"] == "daily"
     assert timers[0]["note"] == "提醒用户休息"
     system = next(
         message["content"]

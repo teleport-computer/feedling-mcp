@@ -48,7 +48,7 @@ def schedule(store, *, api_key=None, runtime_token=None, params=None) -> Capabil
     if not at:
         return err(errors.INVALID, "schedule_wake needs an `at` time", retryable=False)
     action = {"type": "schedule_wake", "at": at}
-    for key in ("tz", "reason"):
+    for key in ("tz", "reason", "repeat"):
         value = str(params.get(key) or "").strip()
         if value:
             action[key] = value

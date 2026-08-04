@@ -87,6 +87,65 @@ def page_html(query_string: str) -> str:
     # Mirror admin_data_track_page's view dispatch.
     with bind(query_string):
         view = (request.args.get("view") or "").strip().lower()
+        if view == "overview":
+            hours = data_track._ops_window_hours()
+            try:
+                imports = db.recent_genesis_import_health(within_hours=hours)
+            except Exception:
+                log.exception("admin operations overview import query failed")
+                imports = None
+            try:
+                chat = jobs_store.recent_chat_reliability(within_hours=hours)
+            except Exception:
+                log.exception("admin operations overview chat query failed")
+                chat = None
+            try:
+                runtime = jobs_store.recent_runtime_health(within_hours=hours)
+            except Exception:
+                log.exception("admin operations overview runtime query failed")
+                runtime = None
+            try:
+                product = db.recent_admin_product_kpis(within_hours=hours)
+            except Exception:
+                log.exception("admin operations overview product KPI query failed")
+                product = None
+            try:
+                usage = jobs_store.recent_token_usage_by_lane(within_hours=hours)
+            except Exception:
+                log.exception("admin operations overview usage query failed")
+                usage = None
+            return data_track._render_ops_overview_page(
+                imports,
+                chat,
+                runtime,
+                product,
+                usage,
+                within_hours=hours,
+            )
+        if view == "imports":
+            hours = data_track._ops_window_hours()
+            try:
+                report = db.recent_genesis_import_health(within_hours=hours)
+            except Exception:
+                log.exception("admin import health query failed")
+                report = None
+            return data_track._render_imports_page(report, within_hours=hours)
+        if view in {"chat", "latency"}:
+            hours = data_track._ops_window_hours()
+            try:
+                report = jobs_store.recent_chat_reliability(within_hours=hours)
+            except Exception:
+                log.exception("admin chat reliability query failed")
+                report = None
+            if view == "latency":
+                return data_track._render_latency_page(
+                    report,
+                    within_hours=hours,
+                )
+            return data_track._render_chat_reliability_page(
+                report,
+                within_hours=hours,
+            )
         if view == "dau":
             return data_track._render_data_track_dau_page(data_track._data_track_dau_payload())
         if view == "growth":
@@ -350,6 +409,10 @@ def v2_metrics(
             )
         },
         "wake": jobs_store.wake_success_stats(),
+        # Deliberately its own block, not extra lanes inside `wake`: capture/dream
+        # are not wakes, and folding them in would make a memory-lane outage look
+        # like a falling wake success rate. See jobs_store.memory_lane_health().
+        "memory_lanes": jobs_store.memory_lane_health(),
         "effects": db.effect_outbox_health(),
         # The genesis import worker rides in the serve_worker process on its own
         # thread, and `run_loop` imports `genesis.worker` lazily — so that thread can

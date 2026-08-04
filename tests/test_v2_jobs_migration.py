@@ -106,7 +106,7 @@ def test_0075_usage_rollup_schema_is_installed_without_source_backfill():
             "AND tgrelid='v2_turn_metrics'::regclass"
         ).fetchone()[0]
 
-    assert head == ("0075_v2_usage_rollup",)
+    assert head == ("0076_plaintext_job_exclusivity",)
     assert tables == {
         "v2_usage_daily_users",
         "v2_usage_daily_dimensions",

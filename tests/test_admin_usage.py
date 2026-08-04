@@ -1855,6 +1855,63 @@ def test_usage_query_defaults_to_rolling_30_days_in_shanghai_timezone():
     assert query.end_date is None
 
 
+def test_usage_focus_day_prefers_today_for_rolling_window():
+    query = _usage.parse_usage_query(
+        {"preset": "30d", "timezone": "Asia/Shanghai"},
+        now_utc=NOW_UTC,
+    )
+    today = {"local_day": "2026-08-02", "total_tokens": 300}
+    report = {"daily": [
+        {"local_day": "2026-08-01", "total_tokens": 200},
+        today,
+    ]}
+
+    row, day, partial = _data_track._usage_focus_day(report, query)
+
+    assert row is today
+    assert day == "2026-08-02"
+    assert partial is True
+
+
+def test_usage_focus_day_uses_inclusive_custom_end_date():
+    query = _usage.parse_usage_query(
+        {
+            "preset": "custom",
+            "start_date": "2026-07-01",
+            "end_date": "2026-07-31",
+            "timezone": "UTC",
+        },
+        now_utc=NOW_UTC,
+    )
+    end_day = {"local_day": "2026-07-31", "total_tokens": 400}
+
+    row, day, partial = _data_track._usage_focus_day(
+        {"daily": [{"local_day": "2026-07-30"}, end_day]},
+        query,
+    )
+
+    assert row is end_day
+    assert day == "2026-07-31"
+    assert partial is False
+
+
+def test_usage_focus_day_falls_back_to_latest_returned_day():
+    query = _usage.parse_usage_query(
+        {"preset": "30d", "timezone": "Asia/Shanghai"},
+        now_utc=NOW_UTC,
+    )
+    latest = {"local_day": "2026-07-31", "total_tokens": 250}
+
+    row, day, partial = _data_track._usage_focus_day(
+        {"daily": [{"local_day": "2026-07-30"}, latest]},
+        query,
+    )
+
+    assert row is latest
+    assert day == "2026-07-31"
+    assert partial is False
+
+
 @pytest.mark.parametrize(
     ("preset", "expected_start"),
     [
@@ -2169,9 +2226,9 @@ def test_usage_page_renders_independent_report_filters_and_drill_down(monkeypatc
         "用户覆盖与窗口活动",
         "当前账号覆盖",
         "所选窗口活动 · 跟随筛选",
-        "全部 App 用户",
-        "当前 Hosted V2",
-        "窗口内 Token 用户",
+        "全部 App 账号行",
+        "当前 Hosted V2 账号行",
+        "Token 可计量用户",
         "Fleet Overview",
         "Token 用量与成本结构",
         "平均值",
@@ -2210,6 +2267,172 @@ def test_usage_page_renders_independent_report_filters_and_drill_down(monkeypatc
     assert "admin_key=query-admin-token" in body
 
 
+def test_usage_page_hero_uses_weighted_window_dau_average():
+    report = _usage_render_report()
+    report["overview"].update({
+        "active_user_days": 10,
+        "total_tokens": 1_900,
+    })
+    report["averages"]["tokens_per_active_user_day"] = 190.0
+    report["daily"] = [
+        {
+            **report["daily"][0],
+            "local_day": "2026-07-30",
+            "model_active_users": 9,
+            "total_tokens": 900,
+            "tokens_per_active_user_day": 100.0,
+        },
+        {
+            **report["daily"][0],
+            "local_day": "2026-07-31",
+            "model_active_users": 1,
+            "total_tokens": 1_000,
+            "tokens_per_active_user_day": 1_000.0,
+        },
+    ]
+    query = _usage.parse_usage_query(
+        {
+            "preset": "custom",
+            "start_date": "2026-07-30",
+            "end_date": "2026-07-31",
+            "timezone": "UTC",
+        },
+        now_utc=NOW_UTC,
+    )
+
+    with reqctx.bind("view=usage&preset=custom"):
+        body = _data_track._render_usage_page(report, query)
+
+    start = body.index("<section class='window-ledger'")
+    ledger = body[start:body.index("</section>", start)]
+    assert "窗口自然日平均 V2 DAU" in ledger
+    assert "<b>5.0</b>" in ledger
+    assert "加权已知 Token / DAU" in ledger
+    assert "<b>190</b>" in ledger
+    assert "<b>550</b>" not in ledger
+
+
+def test_usage_page_rolling_24h_averages_local_day_buckets_not_elapsed_days():
+    report = _usage_render_report()
+    report["daily"] = [
+        {
+            **report["daily"][0],
+            "local_day": "2026-07-30",
+            "model_active_users": 1,
+        },
+        {
+            **report["daily"][0],
+            "local_day": "2026-07-31",
+            "model_active_users": 1,
+        },
+    ]
+    query = _usage.parse_usage_query(
+        {"preset": "24h", "timezone": "America/New_York"},
+        now_utc=NOW_UTC,
+    )
+
+    with reqctx.bind("view=usage&preset=24h"):
+        body = _data_track._render_usage_page(report, query)
+
+    start = body.index("<section class='window-ledger'")
+    ledger = body[start:body.index("</section>", start)]
+    assert "窗口自然日平均 V2 DAU" in ledger
+    assert "<b>1.0</b>" in ledger
+    assert "<b>2.0</b>" not in ledger
+
+
+def test_usage_page_dst_day_uses_calendar_bucket_not_24h_equivalent():
+    report = _usage_render_report()
+    report["daily"] = [{
+        **report["daily"][0],
+        "local_day": "2026-03-08",
+        "model_active_users": 10,
+    }]
+    query = _usage.parse_usage_query(
+        {
+            "preset": "custom",
+            "start_date": "2026-03-08",
+            "end_date": "2026-03-08",
+            "timezone": "America/New_York",
+        },
+        now_utc=NOW_UTC,
+    )
+
+    with reqctx.bind("view=usage&preset=custom"):
+        body = _data_track._render_usage_page(report, query)
+
+    start = body.index("<section class='window-ledger'")
+    ledger = body[start:body.index("</section>", start)]
+    assert "<b>10.0</b>" in ledger
+    assert "<b>10.4</b>" not in ledger
+
+
+def test_usage_page_zero_dau_renders_dash_for_per_dau_result():
+    report = _usage_render_report()
+    report["overview"]["active_user_days"] = 0
+    report["averages"]["tokens_per_active_user_day"] = None
+    report["daily"] = [{
+        **report["daily"][0],
+        "model_active_users": 0,
+        "tokens_per_active_user_day": None,
+    }]
+    query = _usage.parse_usage_query(
+        {
+            "preset": "custom",
+            "start_date": "2026-07-31",
+            "end_date": "2026-07-31",
+            "timezone": "UTC",
+        },
+        now_utc=NOW_UTC,
+    )
+
+    with reqctx.bind("view=usage&preset=custom"):
+        body = _data_track._render_usage_page(report, query)
+
+    pulse_start = body.index("<section class='usage-pulse'")
+    pulse = body[pulse_start:body.index("</section>", pulse_start)]
+    result_start = pulse.index("<div class='equation-result'>")
+    result = pulse[result_start:pulse.index("</div>", result_start)]
+    assert "<strong>—</strong>" in result
+    assert "Token / DAU" in result
+
+
+def test_usage_page_missing_daily_section_does_not_fake_zero_dau():
+    report = _usage_render_report()
+    report["daily"] = None
+    query = _usage.parse_usage_query(
+        {"preset": "30d", "timezone": "UTC"},
+        now_utc=NOW_UTC,
+    )
+
+    with reqctx.bind("view=usage&preset=30d"):
+        body = _data_track._render_usage_page(report, query)
+
+    pulse_start = body.index("<section class='usage-pulse'")
+    pulse = body[pulse_start:body.index("</section>", pulse_start)]
+    dau_start = pulse.index("<small>V2 模型 DAU</small>")
+    dau_term = pulse[dau_start:pulse.index("</div>", dau_start)]
+    assert "<strong>—</strong>" in dau_term
+    assert "<strong>0</strong>" not in dau_term
+
+
+def test_usage_trend_labels_v2_model_dau_explicitly():
+    trend = _data_track._render_usage_trend(
+        [{
+            "local_day": "2026-07-31",
+            "total_tokens": 1_500,
+            "model_active_users": 3,
+            "tokens_per_active_user_day": 500.0,
+        }],
+        focus_day="2026-07-31",
+    )
+
+    assert "aria-label='每日 V2 Token 与模型 DAU'" in trend
+    assert "V2 模型 DAU" in trend
+    assert "DAU 3" in trend
+    assert "500 已知 / DAU" in trend
+
+
 def test_usage_page_renders_unknown_v2_coverage_as_dash(monkeypatch):
     report = _usage_render_report()
     report["overview"].update({
@@ -2220,11 +2443,11 @@ def test_usage_page_renders_unknown_v2_coverage_as_dash(monkeypatch):
     monkeypatch.setattr(_data_track, "_usage_report", lambda _query: report)
 
     body = _admin_core.page_html("view=usage&preset=7d")
-    start = body.index("当前 Hosted V2")
+    start = body.index("当前 Hosted V2 账号行")
     current_v2_card = body[start:body.index("</div></div>", start)]
 
     assert "coverage-value'>0</div>" in current_v2_card
-    assert "占全部 App 用户 —" in current_v2_card
+    assert "占全部 App 账号行 —" in current_v2_card
 
 
 def test_usage_filter_form_preserves_rolling_preset_when_adding_provider(monkeypatch):
@@ -2332,7 +2555,7 @@ def test_usage_user_page_forces_path_user_and_keeps_same_query(monkeypatch):
     assert (kind, status) == ("html", 200)
     assert seen[0].user_id == user_id
     assert seen[0].lane == "chat"
-    assert "Usage / 模型用量" in body
+    assert "Token 与模型" in body
     assert "单用户钻取" in body
     assert "Lane breakdown" in body
     assert "chat" in body
@@ -2361,10 +2584,10 @@ def test_usage_user_page_keeps_drilldown_path_in_presets_filters_and_sorts(
     assert (kind, status) == ("html", 200)
     expected_path = f"/admin/data-track/users/{user_id}"
 
-    nav_start = body.index("<div class='viewbar'>")
-    nav_end = body.index("</div>", nav_start)
+    nav_start = body.index("<nav class='viewbar'")
+    nav_end = body.index("</nav>", nav_start)
     usage_nav = re.search(
-        r"href='([^']+)'[^>]*>Usage / 模型用量</a>",
+        r"href='([^']+)'[^>]*>Token 与模型</a>",
         body[nav_start:nav_end],
     )
     assert usage_nav is not None
@@ -2386,11 +2609,12 @@ def test_usage_user_page_keeps_drilldown_path_in_presets_filters_and_sorts(
     assert "<label>User ID<input name='user_id'" not in form
 
     user_section = body.index("<h2>Per-user Usage</h2>")
-    user_sortbar_end = body.index("</div>", user_section)
+    user_sortbar_start = body.index("<div class='sortbar'>", user_section)
+    user_sortbar_end = body.index("</div>", user_sortbar_start)
     sort_hrefs = [
         unescape(href)
         for href in re.findall(
-            r"href='([^']+)'", body[user_section:user_sortbar_end]
+            r"href='([^']+)'", body[user_sortbar_start:user_sortbar_end]
         )
     ]
     assert len(sort_hrefs) == 4
@@ -2431,8 +2655,9 @@ def test_usage_user_page_pager_keeps_drilldown_path_and_lane_table(monkeypatch):
 
         assert (kind, status) == ("html", 200)
         user_section = body.index("<h2>Per-user Usage</h2>")
-        user_sortbar_end = body.index("</div>", user_section)
-        sortbar = body[user_section:user_sortbar_end]
+        user_sortbar_start = body.index("<div class='sortbar'>", user_section)
+        user_sortbar_end = body.index("</div>", user_sortbar_start)
+        sortbar = body[user_sortbar_start:user_sortbar_end]
         match = re.search(rf"href='([^']+)'>{label}</a>", sortbar)
         assert match is not None
         pager_href = unescape(match.group(1))

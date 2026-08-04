@@ -16,11 +16,51 @@ Memory separates ciphertext storage from enclave-authorized read projections.
 `local_only` records can be stored and synchronized, but the enclave has no
 wrapped key for them, so they are unavailable from `index` and `fetch`.
 
+Runtime V2's `memory_index` tool accepts `bucket` and `thread` filters in
+addition to `limit`, matching the resident CLI's partitioned browsing path.
+Both `memory_index` and `memory_search` results include `total` (the number of
+available Garden cards before the filter) and `returned` (the number matched by
+that call before the model-result display cap). A truncation marker directs the
+model to browse by bucket or thread while the existing result-size limit stays
+unchanged. Specific questions should use `memory_search` followed by
+`memory_fetch`; broad reviews should reconcile partition counts against
+`total`, without indiscriminately loading every card. Bulk cleanup requests
+belong to `memory_organize`, not a chat-loop sequence of single-card edits.
+
 `GET /v1/dream/status` also returns `capture_cards_added` and
 `capture_completed_at`. The count is a monotonic total of cards actually added
 across Capture runs. Clients subtract the total saved when the user last
 dismissed the banner to show the unconfirmed count. A Capture run that adds no
 cards does not change the total or refresh the timestamp.
+
+Hosted Dream maintenance reads complete decrypted candidate cards, stopping
+before the next whole card when the configured prompt budget is reached. Every
+proposed consolidation must explain its rationale, then a fresh independent
+call to the account's configured BYOK model reviews that proposal and its source
+cards. Only an explicit `yes` with a reason can proceed. A `no`, timeout,
+provider failure, or malformed review drops that proposal without blocking the
+remaining proposals. Text overlap is not required: cards may be consolidated
+when they describe the same event or the evolution of one plan, while cards
+that merely share a broad topic remain separate.
+
+Dream does not impose a per-run consolidation count, a per-proposal retired-card
+count, or a cross-run cooldown. It still rejects repeated use of one source card
+within a run, and a one-card rewrite must add substantive information. Every
+proposal is bound to the card snapshot captured before the run and all approved
+actions are applied afterward, so a card created by the current run cannot be
+fed back into that same run. Rejected operations leave every original card
+active, and accepted operations supersede rather than hard-delete source cards.
+Automatic scheduling continues to advance only when new non-Dream cards are
+added; new conversation turns alone do not schedule another Dream run.
+
+In Runtime V2 chat, the model-facing `memory_organize` tool can force-enqueue a
+Dream run when the user explicitly asks to organize or consolidate their
+memories. It bypasses the automatic scheduler's night window, minimum interval,
+and new-material gates, but not Dream's review and soft-deletion safeguards.
+Repeated requests coalesce with an active Dream job. If the deployment-wide or
+user-level Dream switch is off, the tool returns an explainable disabled result.
+Resident V1 agents have the equivalent `io_cli.py memory-organize` command,
+which calls the existing `POST /v1/dream/tick` endpoint with `force: true`.
 
 ## 1. Build and store a card
 

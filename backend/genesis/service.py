@@ -28,6 +28,8 @@ from notices import core as notices
 GENESIS_STATE_BLOB = "genesis_state"
 GENESIS_PERSONA_BLOB = "genesis_persona"
 GENESIS_VOICE_BLOB = "genesis_voice"
+GENESIS_CHECKPOINT_BLOB_PREFIX = "genesis_checkpoint:"
+GENESIS_STAGED_BLOB_PREFIX = "genesis_staged:"
 GENESIS_SOURCE = "genesis_import"
 GENESIS_PERSONA_REF = f"user_blob:{GENESIS_PERSONA_BLOB}"
 GENESIS_VOICE_REF = f"user_blob:{GENESIS_VOICE_BLOB}"
@@ -43,7 +45,7 @@ PERSONA_SOURCE_PRIORITY = {
 # Only what's REPORTED to the client is mapped; stored stages / flow-trace are unchanged.
 _PUBLIC_STAGE_MAP = {
     "genesis_v2_foreground": "chat_history_importing",
-    "genesis_v2_foreground_ready": "completed",
+    "genesis_v2_foreground_ready": "background_importing",
     "genesis_v2_background": "background_importing",
     "genesis_v2_background_deferred": "background_importing",
     "genesis_v2_done": "completed",
@@ -59,6 +61,25 @@ def public_stage(stage: str) -> str:
     """Client-facing stage name. v2-internal stages -> legacy phases the old iOS maps;
     legacy/unknown stages pass through unchanged."""
     return _PUBLIC_STAGE_MAP.get(str(stage or ""), str(stage or ""))
+
+
+def public_materials_for_job(job: dict | None) -> list[dict]:
+    row = job if isinstance(job, dict) else {}
+    output = row.get("output") if isinstance(row.get("output"), dict) else {}
+    failed = str(row.get("status") or "") == FAILED_JOB_STATUS
+    materials: list[dict] = []
+    for raw in output.get("materials") or []:
+        if not isinstance(raw, dict):
+            continue
+        item = dict(raw)
+        status = str(item.get("status") or "queued")
+        if failed and status == "processing":
+            status = "failed"
+        if status not in {"queued", "processing", "failed", "done"}:
+            status = "queued"
+        item["status"] = status
+        materials.append(item)
+    return materials
 
 
 PRIVACY_MODE = "backend_storage_no_plaintext_user_provider_authorized"
@@ -87,6 +108,7 @@ FAILED_JOB_STATUS = "failed"
 # pre's daemon.py only needs to call the same write_genesis_state/mark_failed
 # seam, not duplicate the classification logic.
 GENESIS_ERROR_CODES = (
+    "distill_model_too_slow",
     "bad_api_key",
     "provider_timeout",
     "provider_quota",
@@ -99,6 +121,7 @@ GENESIS_ERROR_CODES = (
 )
 
 GENESIS_ERROR_HINTS: dict[str, str] = {
+    "distill_model_too_slow": "当前模型无法及时处理文件,请换更快的模型后重试",
     "bad_api_key": "模型 API key 无效或无权限,检查 key",
     # usr_9037eaa8 (2026-07-24): a relay "thinking" model timed out 15+ times
     # in a row; the old "稍后重试" hint sent the user retrying into the same
@@ -122,6 +145,9 @@ GENESIS_ERROR_HINTS: dict[str, str] = {
 # read by clients that render `required` verbatim, so the failure line ships
 # both languages; keep the two dicts key-identical (contract-tested).
 GENESIS_ERROR_HINTS_EN: dict[str, str] = {
+    "distill_model_too_slow": (
+        "the current model could not process the file promptly; switch to a faster model and retry"
+    ),
     "bad_api_key": "the model API key is invalid or unauthorized — check the key",
     "provider_timeout": (
         "the model timed out — thinking/slow models and unstable relays are "
@@ -199,8 +225,9 @@ def classify_genesis_error(error: str, exc: BaseException | None = None) -> str:
       - httpx timeout / "TimeoutException" in the wrapped message (worker
         call sites wrap as f"...:{type(e).__name__}") -> provider_timeout.
       - `genesis_stale_timeout:...` / `resident_stale_timeout:...` /
-        `resident_never_claimed:...` (the three stale-processing reapers in
-        worker.py) -> worker_restarted: the job was requeued/failed because
+        `plaintext_worker_restarted` /
+        `resident_never_claimed:...` (the stale-processing recovery paths) ->
+        worker_restarted: the job was requeued/failed because
         the worker/consumer that held it stopped heartbeating, not because of
         anything the model produced.
       - `...decrypt_failed:{type}` (worker._decrypt_envelope, the enclave
@@ -209,6 +236,9 @@ def classify_genesis_error(error: str, exc: BaseException | None = None) -> str:
     """
     text = str(error or "")
     lower = text.lower()
+
+    if "distill_model_too_slow" in lower:
+        return "distill_model_too_slow"
 
     status_code = getattr(exc, "status_code", None)
     if isinstance(status_code, int):
@@ -222,7 +252,11 @@ def classify_genesis_error(error: str, exc: BaseException | None = None) -> str:
     # Stale-reap requeue/fail strings all contain "timeout" too (e.g.
     # "genesis_stale_timeout:1800s") — must be checked before the generic
     # timeout match below so a dead worker isn't mislabeled as a slow provider.
-    if "stale_timeout" in lower or "resident_never_claimed" in lower:
+    if (
+        "stale_timeout" in lower
+        or "resident_never_claimed" in lower
+        or "plaintext_worker_restarted" in lower
+    ):
         return "worker_restarted"
 
     status_match = re.search(r"provider_http_(\d{3})\b", lower)
@@ -237,6 +271,8 @@ def classify_genesis_error(error: str, exc: BaseException | None = None) -> str:
         "invalid_json_after_repair" in lower
         or "invalid_json" in lower
         or "json_not_object" in lower
+        or "provider returned non-json response" in lower
+        or "provider returned non-object response" in lower
     ):
         return "model_bad_json"
 
@@ -310,6 +346,7 @@ SAFE_JOB_METADATA_KEYS = {
     "archive_format",
     "client_version",
     "client_job_id",
+    "distill_model",
     "file_count",
     "history_tier",
     "ingest",
@@ -319,6 +356,11 @@ SAFE_JOB_METADATA_KEYS = {
     "source_label",
     "timeline_span_days",
     "window_count",
+}
+INTERNAL_JOB_METADATA_KEYS = {
+    "plaintext_worker_host",
+    "plaintext_worker_pid",
+    "plaintext_worker_instance",
 }
 
 
@@ -436,6 +478,152 @@ def new_job_id() -> str:
     return core_util._new_public_id("genesis")
 
 
+def _checkpoint_blob_kind(job_id: str) -> str:
+    safe_job_id = _text(job_id, 100)
+    if not safe_job_id:
+        raise ValueError("genesis_checkpoint_job_id_required")
+    return f"{GENESIS_CHECKPOINT_BLOB_PREFIX}{safe_job_id}"
+
+
+def _staged_blob_kind(staged_id: str) -> str:
+    safe_staged_id = _text(staged_id, 100)
+    if not safe_staged_id or safe_staged_id != str(staged_id or ""):
+        raise ValueError("invalid_staged_id")
+    return f"{GENESIS_STAGED_BLOB_PREFIX}{safe_staged_id}"
+
+
+def create_genesis_staged_payload(store: UserStore, payload: dict, *, ttl_sec: int) -> str:
+    if not isinstance(payload, dict):
+        raise ValueError("json_object_required")
+    # One active stage per account. This also reaps consumed tombstones so
+    # repeatedly opening the estimate screen cannot grow user_blobs without bound.
+    for previous in db.list_blobs(store.user_id, GENESIS_STAGED_BLOB_PREFIX):
+        previous_id = str((previous or {}).get("staged_id") or "")
+        if previous_id:
+            db.delete_blob(store.user_id, _staged_blob_kind(previous_id))
+    staged_id = core_util._new_public_id("staged")
+    raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    envelope, err = core_envelope._build_shared_envelope_for_store(
+        store, raw, item_id=f"genesis_staged_{staged_id}")
+    if envelope is None:
+        raise RuntimeError(f"genesis_staged_envelope_failed:{err}")
+    db.set_blob_strict_mirrored(store.user_id, _staged_blob_kind(staged_id), {
+        "v": 1,
+        "staged_id": staged_id,
+        "content_envelope": envelope,
+        "sha256": _sha256_hex(raw),
+        "expires_at": int(time.time()) + max(60, int(ttl_sec)),
+        "consumed": False,
+        "created_at": _now_iso(),
+    })
+    return staged_id
+
+
+def load_genesis_staged_payload(
+    store: UserStore, api_key: str | None, staged_id: str
+) -> dict:
+    blob = db.get_blob_strict(store.user_id, _staged_blob_kind(staged_id))
+    if not isinstance(blob, dict):
+        raise LookupError("staged_import_not_found")
+    if bool(blob.get("consumed")):
+        raise ValueError("staged_import_consumed")
+    if int(blob.get("expires_at") or 0) <= int(time.time()):
+        db.delete_blob(store.user_id, _staged_blob_kind(staged_id))
+        raise TimeoutError("staged_import_expired")
+    envelope = blob.get("content_envelope")
+    if not isinstance(envelope, dict):
+        raise RuntimeError("staged_import_payload_missing")
+    raw = core_enclave._decrypt_envelope_via_enclave(
+        envelope, api_key, purpose="genesis_staged_payload")
+    if _sha256_hex(raw) != str(blob.get("sha256") or ""):
+        raise RuntimeError("staged_import_sha256_mismatch")
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except Exception as exc:
+        raise RuntimeError("staged_import_invalid_json") from exc
+    if not isinstance(payload, dict):
+        raise RuntimeError("staged_import_invalid_object")
+    return payload
+
+
+def mark_genesis_staged_consumed(store: UserStore, staged_id: str, job_id: str) -> None:
+    db.set_blob_strict_mirrored(store.user_id, _staged_blob_kind(staged_id), {
+        "v": 1,
+        "staged_id": staged_id,
+        "consumed": True,
+        "job_id": _text(job_id, 100),
+        "consumed_at": _now_iso(),
+    })
+
+
+def write_genesis_checkpoint(store: UserStore, job_id: str, checkpoint_doc: dict) -> None:
+    """Persist resumable Genesis state without storing candidate plaintext."""
+    if not isinstance(checkpoint_doc, dict):
+        raise ValueError("genesis_checkpoint_object_required")
+    raw = json.dumps(
+        checkpoint_doc,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    digest = _sha256_hex(raw)
+    envelope, err = core_envelope._build_shared_envelope_for_store(
+        store,
+        raw,
+        item_id=f"genesis_checkpoint_{job_id}",
+    )
+    if envelope is None:
+        raise RuntimeError(f"genesis_checkpoint_envelope_failed:{err}")
+    kind = _checkpoint_blob_kind(job_id)
+    db.set_blob(store.user_id, kind, {
+        "v": 1,
+        "job_id": job_id,
+        "encrypted": True,
+        "content_envelope": envelope,
+        "sha256": digest,
+        "task_count": len(checkpoint_doc.get("tasks") or {}),
+        "updated_at": _now_iso(),
+    })
+    saved = db.get_blob_strict(store.user_id, kind)
+    if not isinstance(saved, dict) or str(saved.get("sha256") or "") != digest:
+        raise RuntimeError("genesis_checkpoint_write_failed")
+
+
+def load_genesis_checkpoint(
+    store: UserStore,
+    api_key: str | None,
+    job_id: str,
+    *,
+    runtime_token: str = "",
+) -> dict | None:
+    blob = db.get_blob_strict(store.user_id, _checkpoint_blob_kind(job_id))
+    if blob is None:
+        return None
+    envelope = blob.get("content_envelope") if isinstance(blob, dict) else None
+    if not isinstance(envelope, dict):
+        raise RuntimeError("genesis_checkpoint_envelope_missing")
+    raw = core_enclave._decrypt_envelope_via_enclave(
+        envelope,
+        api_key,
+        purpose="genesis_checkpoint",
+        runtime_token=runtime_token,
+    )
+    digest = _sha256_hex(raw)
+    if digest != str(blob.get("sha256") or ""):
+        raise RuntimeError("genesis_checkpoint_sha256_mismatch")
+    try:
+        parsed = json.loads(raw.decode("utf-8"))
+    except Exception as exc:
+        raise RuntimeError("genesis_checkpoint_invalid_json") from exc
+    if not isinstance(parsed, dict):
+        raise RuntimeError("genesis_checkpoint_invalid_object")
+    return parsed
+
+
+def delete_genesis_checkpoint(store: UserStore, job_id: str) -> None:
+    db.delete_blob(store.user_id, _checkpoint_blob_kind(job_id))
+
+
 def gate_status_for_job_status(status: str) -> str:
     status = str(status or "").strip().lower()
     if status == DONE_JOB_STATUS:
@@ -491,7 +679,13 @@ def write_genesis_state(
     return state
 
 
-def create_import_job(store: UserStore, payload: dict) -> tuple[dict, int]:
+def create_import_job(
+    store: UserStore,
+    payload: dict,
+    *,
+    initial_status: str = "created",
+    trusted_metadata: dict | None = None,
+) -> tuple[dict, int]:
     job_id = _text(payload.get("job_id") or new_job_id(), 80)
     source_kind = _text(payload.get("source_kind") or payload.get("source") or "unknown", 80)
     try:
@@ -504,13 +698,23 @@ def create_import_job(store: UserStore, payload: dict) -> tuple[dict, int]:
     if total_bytes < 0:
         raise ValueError("total_bytes_out_of_range")
     metadata = _safe_job_metadata(payload.get("metadata"))
+    internal_metadata = {
+        str(key): value
+        for key, value in (trusted_metadata or {}).items()
+        if key in INTERNAL_JOB_METADATA_KEYS
+        and (isinstance(value, (str, int, float, bool)) or value is None)
+    }
     metadata = {
         **metadata,
+        **internal_metadata,
         "privacy_copy": PRIVACY_COPY,
     }
+    normalized_status = str(initial_status or "created").strip().lower()
+    if normalized_status not in {"created", "processing"}:
+        raise ValueError("invalid_initial_job_status")
     job = db.genesis_create_job(store.user_id, {
         "job_id": job_id,
-        "status": "created",
+        "status": normalized_status,
         "source_kind": source_kind,
         "file_manifest_hash": _text(payload.get("file_manifest_hash"), 128),
         "total_chunks": total_chunks,
@@ -1499,6 +1703,7 @@ def apply_reducer_output(
     output: dict,
     *,
     runtime_token: str = "",
+    complete_job: bool = True,
 ) -> dict:
     job = db.genesis_get_job(store.user_id, job_id)
     if not job:
@@ -1554,15 +1759,16 @@ def apply_reducer_output(
         ref="sanitized",
     )
     db.genesis_upsert_output(store.user_id, job_id, "apply", doc=result_doc, status="done", ref="inline")
-    completed = db.genesis_complete_job(
-        store.user_id,
-        job_id,
-        output=result_doc,
-        memory_action_count=memory_count,
-        identity_status=identity_status,
-        persona_ref=persona_ref,
-        persona_sha256=persona_sha,
-    )
-    if completed:
-        write_genesis_state(store, completed, status=DONE_JOB_STATUS)
+    if complete_job:
+        completed = db.genesis_complete_job(
+            store.user_id,
+            job_id,
+            output=result_doc,
+            memory_action_count=memory_count,
+            identity_status=identity_status,
+            persona_ref=persona_ref,
+            persona_sha256=persona_sha,
+        )
+        if completed:
+            write_genesis_state(store, completed, status=DONE_JOB_STATUS)
     return result_doc

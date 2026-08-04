@@ -100,6 +100,8 @@ from model_api_runtime.v2 import trajectory as v2_trajectory
 from memory.capture_prompt_v1 import (
     build_capture_prompt,
     build_capture_retry_prompt,
+    build_capture_semantic_retry_prompt,
+    capture_semantic_retry_reasons,
     parse_capture_cards,
 )
 from identity.user_naming import transcript_speaker_label
@@ -109,8 +111,10 @@ from memory.card_text import (
 )
 from memory.dream_prompt_v1 import (
     build_dream_prompt,
+    build_dream_review_prompt,
     build_dream_retry_prompt,
     parse_dream_consolidations,
+    parse_dream_review,
 )
 
 log = logging.getLogger("feedling.runtime_v2.worker")
@@ -174,6 +178,25 @@ async def _record_provider_failure(
     )
 
 
+async def _record_provider_failure_class(
+    user_id: str,
+    error_class: str,
+) -> None:
+    """Record an already-normalized, content-free provider failure class."""
+    normalized = str(error_class or "unknown")
+    if normalized not in notices_catalog.ERROR_CLASSES:
+        # ``provider_config`` is a useful extraction code but too coarse for
+        # the notice catalog: without a safe status-derived subtype, blaming
+        # the user would be guesswork. Provider health therefore records it as
+        # catalog-backed ``unknown`` until a precise class is available.
+        normalized = "unknown"
+    await asyncio.to_thread(
+        provider_health.record_failure,
+        user_id,
+        error_class=normalized,
+    )
+
+
 async def _extract_with_provider_health(
     user_id: str,
     **kwargs: Any,
@@ -184,10 +207,126 @@ async def _extract_with_provider_health(
     except Exception as exc:
         await _record_provider_failure(user_id, exc)
         raise
-    await _record_provider_success(
-        user_id, latency_ms=(time.monotonic() - started) * 1000.0
-    )
+    _items, reason = result
+    provider_failure = v2_extraction.provider_failure_code_from_reason(reason or "")
+    if provider_failure is not None:
+        await _record_provider_failure_class(user_id, provider_failure)
+    else:
+        # Parse/semantic rejection still proves the provider route answered;
+        # provider-health tracks route liveness, not card quality.
+        await _record_provider_success(
+            user_id, latency_ms=(time.monotonic() - started) * 1000.0
+        )
     return result
+
+
+async def _review_dream_consolidations(
+    user_id: str,
+    consolidations: list[dict],
+    *,
+    card_items: list[dict],
+    provider_config: Any,
+    job_id,
+    claimed_by: str | None,
+    tm: "TurnMetrics | None" = None,
+    trajectory_recorder: "v2_trajectory.TrajectoryRecorder | None" = None,
+) -> list[dict]:
+    """Independently review each Dream proposal with a fresh BYOK call.
+
+    A review failure rejects only that proposal. Lease loss is different: a
+    stale worker must stop the whole job before any write. The approved marker
+    is internal and is required again by the deterministic mapper.
+    """
+
+    by_id = {
+        str(card.get("id") or "").strip(): card
+        for card in card_items
+        if isinstance(card, dict) and str(card.get("id") or "").strip()
+    }
+    approved: list[dict] = []
+    for index, consolidation in enumerate(consolidations):
+        if not isinstance(consolidation, dict):
+            continue
+        rationale = str(consolidation.get("rationale") or "").strip()
+        card_ids = list(
+            dict.fromkeys(
+                str(memory_id or "").strip()
+                for memory_id in (consolidation.get("card_ids") or [])
+                if str(memory_id or "").strip()
+            )
+        )
+        source_cards = [by_id.get(memory_id) for memory_id in card_ids]
+        reject_code = ""
+        review: dict | None = None
+        if not rationale:
+            reject_code = "rationale_missing"
+        elif not card_ids or any(card is None for card in source_cards):
+            reject_code = "source_card_unavailable"
+        else:
+            if claimed_by and not await asyncio.to_thread(
+                jobs_store.renew_job_lease,
+                job_id,
+                claimed_by,
+                ttl_sec=jobs_store.RUNNING_TTL_SEC,
+            ):
+                raise LostJobLease("dream ownership lost before semantic review")
+            prompt = build_dream_review_prompt(
+                consolidation=consolidation,
+                source_cards=[card for card in source_cards if card is not None],
+            )
+            _report_turn_progress(f"dream_review_{index}_start")
+            review_result, review_error = await _extract_with_provider_health(
+                user_id,
+                provider_config=provider_config,
+                prompt=prompt,
+                parse=parse_dream_review,
+                max_tokens=300,
+                progress_cb=lambda stage, attempt, proposal=index: _report_turn_progress(
+                    f"dream_review_{proposal}_{stage}_{attempt}"
+                ),
+                usage_out=tm.add_call if tm is not None else None,
+                trajectory_out=(
+                    trajectory_recorder.record
+                    if trajectory_recorder is not None
+                    else None
+                ),
+            )
+            _report_turn_progress(f"dream_review_{index}_complete")
+            if review_error:
+                reject_code = str(review_error)[:120]
+            elif not isinstance(review_result, dict):
+                reject_code = "review_result_invalid"
+            elif review_result.get("approved") is not True:
+                reject_code = "review_no"
+                review = review_result
+            else:
+                review = review_result
+        await _record_trajectory(
+            trajectory_recorder,
+            "dream_semantic_review",
+            {
+                "proposal_index": index,
+                "target_count": len(card_ids),
+                "approved": bool(review and review.get("approved") is True),
+                "reject_code": reject_code,
+            },
+            best_effort=True,
+        )
+        if not review or review.get("approved") is not True:
+            log.warning(
+                "[v2.worker] dream proposal rejected by semantic review "
+                "user=%s proposal=%d targets=%d code=%s",
+                user_id,
+                index,
+                len(card_ids),
+                reject_code or "review_no",
+            )
+            continue
+        accepted = dict(consolidation)
+        accepted["_review_approved"] = True
+        accepted["_review_reason"] = str(review.get("reason") or "")[:1000]
+        approved.append(accepted)
+    return approved
 
 
 def _positive_int_env(name: str, default: str) -> int:
@@ -772,6 +911,7 @@ _DEGENERATE_REPLY_ERROR_CLASS = "upstream_unavailable"
 # job_failed_reasons aggregation instead of hiding behind a plain sleep.
 _PROTOCOL_FRAGMENT_ERROR_CLASS = "upstream_unavailable"
 _PROTOCOL_FRAGMENT_REASON = "protocol_fragment_suppressed"
+_MALFORMED_SELF_THINKING_REASON = "malformed_self_thinking_suppressed"
 
 
 def _torn_protocol_evidence(text: str, reasoning: str, *, lane: str) -> str:
@@ -863,6 +1003,8 @@ def _safe_failure_code(scope: str, exc: BaseException) -> str:
             "degenerate_reply_suppressed",
             "empty_reply",
             "no_user_messages",
+            _PROTOCOL_FRAGMENT_REASON,
+            _MALFORMED_SELF_THINKING_REASON,
         }:
             kind = raw
         elif raw == _COVERAGE_INCOMPLETE or raw.startswith(
@@ -898,6 +1040,48 @@ def _safe_failure_code(scope: str, exc: BaseException) -> str:
     return f"{scope}:{kind}"[:120]
 
 
+_EXTRACTION_FAILURE_REASONS = frozenset(
+    {
+        "capture_batch_frontier_unavailable",
+        "capture_commit_protocol_unavailable",
+        "capture_no_memory_actions",
+        "capture_oldest_reader_unavailable",
+        "capture_provider_authorization_unavailable",
+        "capture_provider_call_cancelled",
+        "capture_provider_fence_incomplete",
+        "capture_provider_result_invalid",
+        "dream_no_memory_actions",
+        "empty_reply",
+        "extraction_memory_writer_unavailable",
+        "memory_occurred_at_required",
+        "missing_cards_list",
+        "missing_consolidations_list",
+        "no_json_object",
+        "not_an_object",
+        "semantic_validation_failed_after_retry",
+    }
+)
+
+
+def _extraction_failure_code(exc: BaseException) -> str:
+    """Preserve expected extraction causes without persisting raw messages."""
+    raw = str(exc or "").strip()
+    provider_code = v2_extraction.provider_failure_code_from_reason(raw)
+    if provider_code is not None:
+        return f"extraction_failed:{provider_code}"
+    if raw.startswith("json_decode_error:"):
+        return "extraction_failed:json_decode_error"
+    if raw.startswith("invalid_card_content_after_retry:"):
+        return "extraction_failed:invalid_card_content_after_retry"
+    if raw.startswith("invalid_card_content:"):
+        return "extraction_failed:invalid_card_content"
+    if raw.startswith("extraction_memory_write_rejected:"):
+        return "extraction_failed:memory_write_rejected"
+    if raw in _EXTRACTION_FAILURE_REASONS:
+        return f"extraction_failed:{raw}"
+    return _safe_failure_code("extraction_failed", exc)
+
+
 def _turn_failure_error_class(exc: BaseException) -> str:
     """Classify V2 foreground failures through the shared notice catalog."""
     if isinstance(exc, DedicatedVisionUnavailable):
@@ -914,6 +1098,8 @@ def _turn_failure_error_class(exc: BaseException) -> str:
     if isinstance(exc, TurnError) and str(exc) in {
         "degenerate_reply_suppressed",
         "empty_reply",
+        _PROTOCOL_FRAGMENT_REASON,
+        _MALFORMED_SELF_THINKING_REASON,
     }:
         return "reply_parse_failed"
     if isinstance(exc, TurnError) and (
@@ -1071,6 +1257,9 @@ class TurnDeps:
     # 任意一项可为 ""）：capture/dream prompt 需要的记忆上下文（enclave 解密明文）。取数失败
     # → 降级为空上下文，不失败 job（spec §3.5）。
     read_memory_context: Callable[[str], dict] | None = None
+    # Dream-specific reader may fetch full selected card bodies.  When absent,
+    # tests/legacy assembly fall back to read_memory_context.
+    read_dream_memory_context: Callable[[str], dict] | None = None
     # user_id -> (all rendered Garden cards, exact card count). Unlike
     # read_memory_context this is fail-loud and rejects any truncated read.
     read_profile_cards: Callable[[str], tuple[str, int]] | None = None
@@ -1356,6 +1545,8 @@ async def _dispatch_mixed_tool_calls(
             mutations.append(("mcp", tc))
         elif mcp_turn.handles(tc.name):
             reads.append(("mcp", tc))
+        elif tc.name == cap_tool_schema.MEMORY_ORGANIZE_TOOL:
+            mutations.append(("platform", tc))
         elif tc.name in cap_registry.WRITE_ACTIONS:
             mutations.append(("platform", tc))
         else:
@@ -1414,7 +1605,11 @@ async def _dispatch_mixed_tool_calls(
                         if inspect.isawaitable(prepared):
                             await prepared
             continue
-        if kind == "platform" and prepare_platform_mutation is not None:
+        if (
+            kind == "platform"
+            and tc.name in cap_registry.WRITE_ACTIONS
+            and prepare_platform_mutation is not None
+        ):
             prepared = prepare_platform_mutation(tc)
             if inspect.isawaitable(prepared):
                 await prepared
@@ -2014,7 +2209,7 @@ def _make_trajectory_recorder(
 ) -> v2_trajectory.TrajectoryRecorder | None:
     if deps.seal_trajectory_payload is None:
         return None
-    return v2_trajectory.TrajectoryRecorder(
+    recorder = v2_trajectory.TrajectoryRecorder(
         job_id=job["id"],
         user_id=str(job["user_id"]),
         seal=deps.seal_trajectory_payload,
@@ -2022,10 +2217,13 @@ def _make_trajectory_recorder(
         append_batch=jobs_store.append_trajectory_events_batch,
         attempt_identity=int(job.get("attempt_count") or 0),
     )
+    setattr(recorder, _LEDGER_LANE_ATTR, str(job.get("lane") or "unknown"))
+    return recorder
 
 
 _LEDGER_EVENTS = frozenset({"provider_response", "provider_error"})
 _LEDGER_ROUTE_ATTR = "_ledger_route"
+_LEDGER_LANE_ATTR = "_ledger_lane"
 
 
 def _note_provider_attempt(
@@ -2108,11 +2306,17 @@ async def _mirror_provider_attempt(
     if not user_id:
         return
     provider, model = getattr(recorder, _LEDGER_ROUTE_ATTR, ("", ""))
+    ledger_payload = payload
+    if not str(payload.get("lane") or ""):
+        ledger_payload = dict(payload)
+        ledger_payload["lane"] = str(
+            getattr(recorder, _LEDGER_LANE_ATTR, "") or "unknown"
+        )
     await asyncio.to_thread(
         _note_provider_attempt,
         user_id,
         event_kind,
-        payload,
+        ledger_payload,
         job_id=getattr(recorder, "job_id", None),
         provider=provider,
         model=model,
@@ -3528,6 +3732,79 @@ def _make_provider_usage_dispatcher(
     return _dispatch
 
 
+_DREAM_TOOL_ENABLED = os.environ.get(
+    "FEEDLING_V2_DREAM_ENABLED", "0"
+).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _dream_tool_enabled_for_user(user_id: str) -> bool:
+    """Fail closed on both the deployment switch and the user's Dream switch."""
+
+    if not _DREAM_TOOL_ENABLED:
+        return False
+    settings = db.get_blob_strict(str(user_id), "proactive_settings")
+    if settings is None:
+        return True
+    if not isinstance(settings, dict):
+        return False
+    return bool(settings.get("dream_enabled", True))
+
+
+async def _dispatch_memory_organize_tool(user_id: str, tc) -> ToolResult:
+    """Force-enqueue Dream without bypassing any Dream execution safety checks."""
+
+    try:
+        enabled = await asyncio.to_thread(_dream_tool_enabled_for_user, user_id)
+    except Exception:  # noqa: BLE001 — unreadable switch fails closed, stays explainable
+        enabled = False
+    if not enabled:
+        return ToolResult(
+            call_id=tc.id,
+            content=json.dumps(
+                {
+                    "status": "disabled",
+                    "message": "整理功能暂时关闭",
+                },
+                ensure_ascii=False,
+            ),
+        )
+    try:
+        job_id, coalesced = await asyncio.to_thread(
+            jobs_store.enqueue_job,
+            user_id,
+            "dream",
+            reason="user_requested",
+        )
+    except Exception:  # noqa: BLE001 — tool failure must remain model-visible
+        return ToolResult(
+            call_id=tc.id,
+            content=json.dumps(
+                {
+                    "status": "error",
+                    "message": "记忆整理暂时无法开始",
+                },
+                ensure_ascii=False,
+            ),
+        )
+    if not coalesced:
+        await asyncio.to_thread(core_wake_bus.notify, "v2_jobs", user_id)
+    return ToolResult(
+        call_id=tc.id,
+        content=json.dumps(
+            {
+                "status": "coalesced" if coalesced else "queued",
+                "job_id": str(job_id),
+                "message": (
+                    "已合并到正在进行的记忆整理"
+                    if coalesced
+                    else "已开始后台整理，完成的部分会体现在记忆花园里"
+                ),
+            },
+            ensure_ascii=False,
+        ),
+    )
+
+
 def _memory_tool_actions(raw_actions) -> list[dict]:
     """Translate the model's PLAINTEXT memory_write actions (tool_schema:
     ``{op, summary, content, bucket, target_id}``) into the server-side
@@ -4687,6 +4964,110 @@ async def _rebalance_summary_frontier(
     )
 
 
+_CHECKPOINT_EXHAUSTION_DETAILS = frozenset(
+    {
+        "empty_rollup_candidate",
+        "single_segment_exceeds_rollup_input",
+        "fanout_run_exceeds_rollup_input",
+        "frontier_head_exceeds_rollup_input",
+        "no_reducing_rollup_candidate",
+        "checkpoint_work_budget_exhausted",
+        "invalid_checkpoint_output",
+        "checkpoint_cas_no_progress",
+        "checkpoint_pass_budget_exhausted",
+        "materialized_prompt_view_over_target",
+    }
+)
+
+
+def _checkpoint_degradation_detail(exc: BaseException) -> str:
+    """Return an allowlisted, content-free checkpoint reason.
+
+    Arbitrary ``.detail`` / ``.code`` attributes are untrusted just like an
+    exception message: a provider SDK or adapter can put credentials or user
+    content there.  Only details minted by our own frontier exception are
+    eligible for plaintext telemetry; everything else is reduced to its class.
+    """
+    if isinstance(exc, v2_summary_frontier.SummaryFrontierExhausted):
+        detail = str(exc.detail or "")
+        if detail in _CHECKPOINT_EXHAUSTION_DETAILS:
+            return detail
+        return "summary_frontier_exhausted"
+    if isinstance(exc, (asyncio.TimeoutError, TimeoutError)):
+        return "checkpoint_timeout"
+    type_name = re.sub(r"[^a-z0-9_]", "", type(exc).__name__.lower())[:64]
+    return f"checkpoint_{type_name}" if type_name else "checkpoint_error"
+
+
+async def _rebalance_summary_frontier_best_effort(
+    user_id: str,
+    deps: TurnDeps,
+    *,
+    lane: str,
+    phase: str,
+    provider_config: Any,
+    enclave_sem: "asyncio.Semaphore | None",
+    claimed_by: str | None = None,
+    job_id=None,
+    add_usage: Callable[[dict | None], None] | None = None,
+    trajectory_recorder: "v2_trajectory.TrajectoryRecorder | None" = None,
+    deterministic_coverage: bool = False,
+    timeout_sec: float = 30.0,
+) -> bool:
+    """Run an optional checkpoint without undoing an already-durable leaf.
+
+    Lease/control cancellation and a corrupt frontier remain fatal.  Every
+    other checkpoint-local failure is a bounded degradation: the exact leaf
+    coverage is already durable and a later maintenance turn can retry the
+    roll-up.  This distinction prevents post-fold optimization failures from
+    being counted as if the fold itself failed.
+    """
+    try:
+        if not math.isfinite(float(timeout_sec)) or float(timeout_sec) <= 0:
+            raise asyncio.TimeoutError
+        await asyncio.wait_for(
+            _rebalance_summary_frontier(
+                user_id,
+                deps,
+                provider_config=provider_config,
+                enclave_sem=enclave_sem,
+                claimed_by=claimed_by,
+                job_id=job_id,
+                add_usage=add_usage,
+                trajectory_recorder=trajectory_recorder,
+                deterministic_coverage=deterministic_coverage,
+            ),
+            timeout=float(timeout_sec),
+        )
+        return True
+    except (LostJobLease, RuntimeModeChanged, asyncio.CancelledError):
+        raise
+    except v2_summary_frontier.SummaryFrontierIntegrityError:
+        raise
+    except Exception as exc:  # noqa: BLE001 — checkpoint is optional here
+        detail = _checkpoint_degradation_detail(exc)
+        _report_turn_progress("compaction_checkpoint_degraded")
+        await _record_trajectory(
+            trajectory_recorder,
+            "compaction_checkpoint_degraded",
+            {
+                "lane": str(lane or "unknown")[:40],
+                "phase": str(phase or "unknown")[:40],
+                "error_class": type(exc).__name__,
+                "detail": detail,
+            },
+            best_effort=True,
+        )
+        log.warning(
+            "[v2.worker] checkpoint degraded user=%s lane=%s phase=%s code=%s",
+            user_id,
+            lane,
+            phase,
+            detail,
+        )
+        return False
+
+
 async def _bound_materialized_summary(
     user_id: str,
     summary: str,
@@ -5088,9 +5469,11 @@ async def _run_compaction(
             )
             _report_turn_progress("deterministic_compaction_batch_complete")
             if ok:
-                await _rebalance_summary_frontier(
+                await _rebalance_summary_frontier_best_effort(
                     user_id,
                     deps,
+                    lane="maintenance",
+                    phase="post_fold_deterministic",
                     provider_config=provider_config,
                     enclave_sem=enclave_sem,
                     claimed_by=claimed_by,
@@ -5145,53 +5528,18 @@ async def _run_compaction(
         # A checkpoint increments the head version; reading first would waste
         # one provider call on a predictably stale leaf and force a retry job.
         if deps.read_summary_frontier is not None:
-            try:
-                await _rebalance_summary_frontier(
-                    user_id,
-                    deps,
-                    provider_config=provider_config,
-                    enclave_sem=enclave_sem,
-                    claimed_by=claimed_by,
-                    job_id=job_id,
-                    add_usage=tm.add_call if tm is not None else None,
-                    trajectory_recorder=trajectory_recorder,
-                )
-            except (LostJobLease, RuntimeModeChanged, asyncio.CancelledError):
-                # Lifecycle, not the checkpoint's own failure — this worker no
-                # longer owns the job and must not keep folding.
-                raise
-            except v2_summary_frontier.SummaryFrontierIntegrityError:
-                # The persisted cover cannot prove complete coverage. Folding on
-                # top of a frontier we cannot trust would extend the damage, so
-                # this one stays fatal.
-                raise
-            except Exception as rebalance_exc:  # noqa: BLE001 — see below
-                # A checkpoint only reduces how many nodes a later prompt has to
-                # read; the fold below is the actual work. Letting a failed
-                # checkpoint skip it (it sits ABOVE the tail read) meant the
-                # backlog could never drain, and since the roll-up input does
-                # not change, it failed identically on every retry — including
-                # manual re-enqueues. usr_7f30 on prod sat at a frozen watermark
-                # for days on exactly this, with `model_calls=1` proving the one
-                # provider call was the checkpoint, never the fold.
-                _report_turn_progress("compaction_checkpoint_degraded")
-                await _record_trajectory(
-                    trajectory_recorder,
-                    "compaction_checkpoint_degraded",
-                    {
-                        "lane": "maintenance",
-                        "error_class": type(rebalance_exc).__name__,
-                        "detail": str(
-                            getattr(rebalance_exc, "detail", "") or ""
-                        )[:80],
-                    },
-                    best_effort=True,
-                )
-                log.warning(
-                    "[v2.worker] checkpoint rebalance degraded for %s: %s",
-                    user_id,
-                    type(rebalance_exc).__name__,
-                )
+            await _rebalance_summary_frontier_best_effort(
+                user_id,
+                deps,
+                lane="maintenance",
+                phase="pre_fold",
+                provider_config=provider_config,
+                enclave_sem=enclave_sem,
+                claimed_by=claimed_by,
+                job_id=job_id,
+                add_usage=tm.add_call if tm is not None else None,
+                trajectory_recorder=trajectory_recorder,
+            )
         async with enclave_sem:
             if deps.read_summary_with_seq is not None and (
                 deps.read_compaction_tail_after_seq is not None
@@ -5403,9 +5751,11 @@ async def _run_compaction(
                     min(_COMPACTION_BATCH, fold_limit + _BATCH_CAP_INCREMENT),
                 )
             if segmented_write:
-                await _rebalance_summary_frontier(
+                await _rebalance_summary_frontier_best_effort(
                     user_id,
                     deps,
+                    lane="maintenance",
+                    phase="post_fold",
                     provider_config=provider_config,
                     enclave_sem=enclave_sem,
                     claimed_by=claimed_by,
@@ -6153,10 +6503,15 @@ async def _ensure_prompt_coverage(
                 )
             )
             if wrote:
-                await _within_deadline(
-                    lambda: _rebalance_summary_frontier(
+                # Leave enough budget for the next authoritative coverage read;
+                # the checkpoint is optional, that verification is not.
+                checkpoint_budget = deadline_at - time.monotonic() - 2.0
+                if checkpoint_budget > 0:
+                    await _rebalance_summary_frontier_best_effort(
                         user_id,
                         deps,
+                        lane="prompt_catchup",
+                        phase="post_fold_deterministic",
                         provider_config=provider_config,
                         enclave_sem=enclave_sem,
                         claimed_by=claimed_by,
@@ -6164,8 +6519,8 @@ async def _ensure_prompt_coverage(
                         add_usage=add_usage,
                         trajectory_recorder=trajectory_recorder,
                         deterministic_coverage=True,
+                        timeout_sec=min(30.0, checkpoint_budget),
                     )
-                )
             _report_turn_progress("prompt_deterministic_catchup_batch_complete")
             await _record_trajectory(
                 trajectory_recorder,
@@ -6472,18 +6827,23 @@ async def _ensure_prompt_coverage(
                 )
             )
             if wrote:
-                await _within_deadline(
-                    lambda: _rebalance_summary_frontier(
+                # Leave enough budget for the next authoritative coverage read;
+                # the checkpoint is optional, that verification is not.
+                checkpoint_budget = deadline_at - time.monotonic() - 2.0
+                if checkpoint_budget > 0:
+                    await _rebalance_summary_frontier_best_effort(
                         user_id,
                         deps,
+                        lane="prompt_catchup",
+                        phase="post_fold",
                         provider_config=provider_config,
                         enclave_sem=enclave_sem,
                         claimed_by=claimed_by,
                         job_id=job_id,
                         add_usage=add_usage,
                         trajectory_recorder=trajectory_recorder,
+                        timeout_sec=min(30.0, checkpoint_budget),
                     )
-                )
         elif new_watermark_seq is not None:
             await _within_deadline(
                 lambda: asyncio.to_thread(
@@ -7068,7 +7428,8 @@ async def _run_wake(
         # answer, so it must never be offered here — unconditionally, not
         # gated by the kill switch (that gate is chat-lane's Task 6 concern).
         wake_disabled_tool_names = wake_disabled_web_tool_names | {
-            cap_tool_schema.PROVIDER_USAGE_TOOL
+            cap_tool_schema.PROVIDER_USAGE_TOOL,
+            cap_tool_schema.MEMORY_ORGANIZE_TOOL,
         }
 
         dispatch_task_batch = _make_task_batch_dispatcher(
@@ -7093,6 +7454,8 @@ async def _run_wake(
             await _fence_wake_effect("tool dispatch")
 
             async def _dispatch_platform_one(tc) -> ToolResult:
+                if tc.name == cap_tool_schema.MEMORY_ORGANIZE_TOOL:
+                    return await _dispatch_memory_organize_tool(user_id, tc)
                 try:
                     (result,) = await v2_executor.dispatch_tool_calls(
                         [tc],
@@ -7309,7 +7672,7 @@ async def _run_wake(
                     _wake_self_thinking_text = _wst_thinking
                 elif _wst_status == _st_wake.FAILED:
                     if final:
-                        raise TurnError("degenerate_reply_suppressed")
+                        raise TurnError(_MALFORMED_SELF_THINKING_REASON)
                     return
             if text and _is_degenerate_reply(text):
                 log.warning(
@@ -8501,10 +8864,15 @@ async def _run_extraction(
         # post_enclave 往返；read_tail 逐条解密），所以**必须同在 enclave_sem 闸内**——enclave
         # 是全系统共享、容量有限的解密代理，正是整个子项目要保护的东西（spec §4）。
         async with enclave_sem:
-            if deps.read_memory_context is not None:
+            memory_context_reader = (
+                deps.read_dream_memory_context
+                if lane == "dream" and deps.read_dream_memory_context is not None
+                else deps.read_memory_context
+            )
+            if memory_context_reader is not None:
                 try:
                     ctx = (
-                        await asyncio.to_thread(deps.read_memory_context, user_id) or {}
+                        await asyncio.to_thread(memory_context_reader, user_id) or {}
                     )
                 except Exception as e:  # noqa: BLE001 — 上下文取数失败 → 降级，不失败（spec §3.5）
                     log.warning(
@@ -8611,6 +8979,8 @@ async def _run_extraction(
                 should_retry=is_card_format_error,
                 build_prompt=build_capture_retry_prompt,
                 parse=lambda reply: parse_capture_cards(reply, strict=False),
+                semantic_reasons=capture_semantic_retry_reasons,
+                build_semantic_prompt=build_capture_semantic_retry_prompt,
             )
         else:
             prompt = build_dream_prompt(
@@ -8646,6 +9016,7 @@ async def _run_extraction(
                     threads=ctx.get("threads", ""),
                     identity=ctx.get("identity", ""),
                     window=window,
+                    cards=ctx.get("cards", ""),
                 )
         if lane == "capture" and prompt_tail:
             await _ensure_capture_not_halted("provider_authorization")
@@ -8808,6 +9179,17 @@ async def _run_extraction(
             _report_turn_progress("extraction_provider_complete")
         if reason:
             raise RuntimeError(reason)
+        if lane == "dream" and items:
+            items = await _review_dream_consolidations(
+                user_id,
+                list(items),
+                card_items=list(ctx.get("card_items") or []),
+                provider_config=provider_config,
+                job_id=job_id,
+                claimed_by=claimed_by,
+                tm=tm,
+                trajectory_recorder=trajectory_recorder,
+            )
         if not items and lane != "capture":
             await _complete_extraction(item_count=0)
             if tm is not None:
@@ -8881,12 +9263,18 @@ async def _run_extraction(
                     "card_user_token_residual",
                     {"lane": lane, "count": leak_count, "cards": len(items)},
                 )
-            actions, _added, _superseded = to_actions(
-                items,
-                occurred_at=occurred_at,
-                source_ids=source_ids,
-                build_envelope=_build_extraction_envelope,
-            )
+            action_kwargs = {
+                "occurred_at": occurred_at,
+                "source_ids": source_ids,
+                "build_envelope": _build_extraction_envelope,
+            }
+            if lane == "dream" and "card_items" in ctx:
+                # Bind every destructive result to the exact full-text cards
+                # disclosed for this run.  Unknown, overlapping, fresh Dream
+                # output, and lossy 1:1 rewrites are rejected deterministically
+                # by the pure mapper before any write reaches Memory Garden.
+                action_kwargs["existing_cards"] = list(ctx.get("card_items") or [])
+            actions, _added, _superseded = to_actions(items, **action_kwargs)
         if claimed_by and not await asyncio.to_thread(
             jobs_store.renew_job_lease,
             job_id,
@@ -9009,7 +9397,7 @@ async def _run_extraction(
             tm.flush(failed=True, status="turns_halted")
         return "failed"
     except Exception as e:  # noqa: BLE001 — 背景 job：静默 mark_failed，绝不 surface/写气泡
-        code = _safe_failure_code("extraction_failed", e)
+        code = _extraction_failure_code(e)
         if lane != "capture" and not extraction_status_recorded:
             try:
                 await _record_extraction_status("failed")
@@ -10150,7 +10538,10 @@ async def process_job(
             disabled_mutation_tool_names = frozenset(
                 set(cap_registry.WRITE_ACTIONS)
                 | set(mcp_mutating_names)
-                | {cap_tool_schema.FILE_REPLY_TOOL}
+                | {
+                    cap_tool_schema.FILE_REPLY_TOOL,
+                    cap_tool_schema.MEMORY_ORGANIZE_TOOL,
+                }
             )
             offered_mcp_tool_specs = tuple(
                 spec
@@ -10276,6 +10667,8 @@ async def process_job(
                 # One call per coroutine lets platform reads share the exact same
                 # worker-level gate as MCP reads. Executor still owns validation,
                 # provenance, encrypted outbox writes, and terminal write failures.
+                if tc.name == cap_tool_schema.MEMORY_ORGANIZE_TOOL:
+                    return await _dispatch_memory_organize_tool(user_id, tc)
                 try:
                     (result,) = await v2_executor.dispatch_tool_calls(
                         [tc],
@@ -10464,6 +10857,7 @@ async def process_job(
                     for tc in tool_calls
                     if tc.name in mcp_mutating_names
                     or tc.name in cap_registry.WRITE_ACTIONS
+                    or tc.name == cap_tool_schema.MEMORY_ORGANIZE_TOOL
                 }
                 dispatchable_calls = [
                     tc for tc in tool_calls if str(tc.id) not in blocked_by_id

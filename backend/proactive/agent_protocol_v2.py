@@ -153,6 +153,11 @@ def _coerce_action(raw: Any) -> tuple[dict[str, Any] | None, str | None, Mapping
             "note": _clean_text(raw.get("note"), MAX_ACTION_NOTE_CHARS_V2),
             "origin_refs": _coerce_origin_refs(raw.get("origin_refs")),
         }
+        repeat = _clean_text(raw.get("repeat"), 20).lower()
+        if repeat:
+            if repeat not in {"daily", "weekly"}:
+                return None, None, None
+            action["repeat"] = repeat
         return action, None, None
 
     if action_type == "cancel_wake":

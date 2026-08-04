@@ -15,7 +15,7 @@ def test_index_wraps_core_body(monkeypatch):
 
     r = cap_memory.index("STORE", api_key="k", runtime_token="rt", params={"limit": 50})
     assert r.ok is True
-    assert r.data == {"items": [1, 2], "limit": 50}
+    assert r.data == {"items": [1, 2], "limit": 50, "total": 2, "returned": 2}
     assert captured["payload"] == {"limit": 50}
     assert callable(captured["post_enclave"])  # closure bound to runtime_token
 
@@ -47,6 +47,7 @@ def test_index_caps_large_item_list(monkeypatch):
     r = cap_memory.index("STORE", params={})
     assert r.ok is True
     assert len(r.data["items"]) == 50
+    assert r.data["returned"] == r.data["total"] == 1000
 
 
 def test_search_forwards_query_to_index(monkeypatch):
@@ -60,9 +61,36 @@ def test_search_forwards_query_to_index(monkeypatch):
     r = cap_memory.search("STORE", api_key="k", runtime_token="rt",
                           params={"query": "hello", "limit": 10})
     assert r.ok is True
-    assert r.data == {"items": [{"id": "1", "text": "hello"}]}
+    assert r.data == {
+        "items": [{"id": "1", "text": "hello"}],
+        "total": 1,
+        "returned": 1,
+    }
     assert captured["payload"] == {"query": "hello", "limit": 10}
     assert callable(captured["post_enclave"])
+
+
+def test_index_total_is_global_card_count_and_filters_pass_through(monkeypatch):
+    captured = {}
+
+    def fake_index(store, api_key, payload, *, post_enclave):
+        captured["payload"] = payload
+        return {
+            "items": [{"id": "travel-1"}, {"id": "travel-2"}],
+            "user_card_count": 103,
+            "limit": 1000,
+        }, 200
+
+    monkeypatch.setattr(memory_core, "index", fake_index)
+
+    result = cap_memory.index(
+        "STORE",
+        params={"bucket": "旅行", "thread": "京都"},
+    )
+
+    assert captured["payload"] == {"bucket": "旅行", "thread": "京都"}
+    assert result.data["total"] == 103
+    assert result.data["returned"] == 2
 
 
 def test_search_requires_nonempty_query(monkeypatch):

@@ -11,15 +11,20 @@ import json
 import math
 import os
 import re
+import socket
 import threading
 import time
+import uuid
+from dataclasses import replace
 from datetime import date
 from typing import Any
 
 import db
 import debug_trace
+import provider_client
 from core import enclave as core_enclave
-from genesis import dedup, foreground, foreground_identity, lightweight_identity, service, worker
+from genesis import checkpoint, dedup, foreground, foreground_identity, lightweight_identity, service, worker
+from genesis.llm_client import GenesisLLMClient
 from hosted import config_store as hosted_config_store
 from hosted import history_import
 from identity import service as identity_service
@@ -28,13 +33,11 @@ from notices import catalog
 from notices import core as notices_core
 
 _SECONDS_PER_DAY = 24 * 60 * 60
-_PLAINTEXT_ACTIVE_LOCK = threading.Lock()
-_PLAINTEXT_ACTIVE_JOBS: set[tuple[str, str]] = set()
 _PLAINTEXT_SOURCE_ORDER = (
     history_import._AI_PERSONA_SOURCE,
-    history_import._HISTORY_SOURCE,
-    history_import._MEMORY_SUMMARY_SOURCE,
     history_import._USER_PROFILE_SOURCE,
+    history_import._MEMORY_SUMMARY_SOURCE,
+    history_import._HISTORY_SOURCE,
 )
 _PLAINTEXT_SUPPORT_SOURCE_FAMILIES = {
     history_import._AI_PERSONA_SOURCE,
@@ -43,6 +46,23 @@ _PLAINTEXT_SUPPORT_SOURCE_FAMILIES = {
 }
 _PLAINTEXT_MODES = {"onboarding", "add_memory", "update_identity"}
 MATERIAL_EMPTY_ERROR = "material_empty"
+_MATERIAL_KIND_BY_FAMILY = {
+    "ai_persona": "ai_persona",
+    "user_profile": "user_profile",
+    "memory_summary": "memory_summary",
+    "history": "chat_history",
+}
+_FAST_DISTILL_MODEL_BY_PROVIDER = {
+    "anthropic": "claude-haiku-4-5",
+    "deepseek": "deepseek-v4-flash",
+    "gemini": "gemini-flash-lite-latest",
+    "openai": "gpt-4o-mini",
+    "openrouter": "anthropic/claude-haiku-4-5",
+}
+_PLAINTEXT_WORKER_HOST = socket.gethostname()
+_PLAINTEXT_WORKER_PID = os.getpid()
+_PLAINTEXT_WORKER_INSTANCE = uuid.uuid4().hex
+_PLAINTEXT_WORKER_ID_LOCK = threading.Lock()
 
 
 class MaterialEmptyError(ValueError):
@@ -173,17 +193,21 @@ def _foreground_history_cap() -> int:
 
 def _cap_foreground_history_chunks(source_groups: list[dict]) -> list[dict]:
     """前台用:只对 history 桶采样到 cap(_select_evenly);其它桶(人物卡/档案/长期记忆)全读。
-    被砍的 history 块由后台补全,不影响身份(名字来自人物卡,全读)。"""
+    被砍的 history 块由后台补全,不影响身份(名字来自人物卡,全读)。每组同时保留
+    全量窗口序号,让前台 checkpoint 可被未采样的后台 pass 正确复用。"""
     cap = _foreground_history_cap()
     out: list[dict] = []
     for g in source_groups:
+        chunks = list(g.get("chunk_texts") or [])
+        indexed_chunks = list(enumerate(chunks))
         if str(g.get("source_family") or "") == "history":
-            chunks = list(g.get("chunk_texts") or [])
             if len(chunks) > cap:
-                chunks = history_import._select_evenly(chunks, cap)
-            out.append({**g, "chunk_texts": chunks})
-        else:
-            out.append(g)
+                indexed_chunks = history_import._select_evenly(indexed_chunks, cap)
+        out.append({
+            **g,
+            "chunk_texts": [chunk for _index, chunk in indexed_chunks],
+            "_checkpoint_chunk_indices": [index for index, _chunk in indexed_chunks],
+        })
     return out
 
 
@@ -272,6 +296,196 @@ def _prepare_plaintext_import(payload: dict) -> dict:
     }
 
 
+def _staged_ttl_sec() -> int:
+    try:
+        return max(60, int(os.environ.get("FEEDLING_GENESIS_STAGED_TTL_SEC", "86400")))
+    except (TypeError, ValueError):
+        return 86400
+
+
+def _plaintext_stale_sec() -> int:
+    try:
+        return max(60, int(os.environ.get("FEEDLING_GENESIS_PLAINTEXT_STALE_SEC", "120")))
+    except (TypeError, ValueError):
+        return 120
+
+
+def _plaintext_heartbeat_sec() -> int:
+    try:
+        return max(5, min(
+            int(os.environ.get("FEEDLING_GENESIS_PLAINTEXT_HEARTBEAT_SEC", "15")),
+            60,
+        ))
+    except (TypeError, ValueError):
+        return 15
+
+
+def _plaintext_worker_metadata() -> dict[str, Any]:
+    global _PLAINTEXT_WORKER_HOST, _PLAINTEXT_WORKER_PID, _PLAINTEXT_WORKER_INSTANCE
+    current_pid = os.getpid()
+    if current_pid != _PLAINTEXT_WORKER_PID:
+        with _PLAINTEXT_WORKER_ID_LOCK:
+            if current_pid != _PLAINTEXT_WORKER_PID:
+                _PLAINTEXT_WORKER_HOST = socket.gethostname()
+                _PLAINTEXT_WORKER_PID = current_pid
+                _PLAINTEXT_WORKER_INSTANCE = uuid.uuid4().hex
+    return {
+        "plaintext_worker_host": _PLAINTEXT_WORKER_HOST,
+        "plaintext_worker_pid": _PLAINTEXT_WORKER_PID,
+        "plaintext_worker_instance": _PLAINTEXT_WORKER_INSTANCE,
+    }
+
+
+def _plaintext_owner_process_is_dead(metadata: dict) -> bool:
+    """Return true only when the persisted owner is certainly dead locally.
+
+    A different host can be a live worker during a rolling deploy, so it must
+    age out through the heartbeat lease. On the same host, a missing PID is an
+    authoritative crash signal and lets the replacement process recover now.
+    """
+    _plaintext_worker_metadata()
+    owner_instance = str(metadata.get("plaintext_worker_instance") or "")
+    owner_host = str(metadata.get("plaintext_worker_host") or "")
+    try:
+        owner_pid = int(metadata.get("plaintext_worker_pid") or 0)
+    except (TypeError, ValueError):
+        return False
+    if not owner_instance or owner_instance == _PLAINTEXT_WORKER_INSTANCE:
+        return False
+    if not owner_host or owner_host != _PLAINTEXT_WORKER_HOST or owner_pid <= 0:
+        return False
+    if os.name != "posix":
+        return False
+    try:
+        os.kill(owner_pid, 0)
+    except ProcessLookupError:
+        return True
+    except (PermissionError, OSError):
+        return False
+    return False
+
+
+def _fail_stale_plaintext_job(store, job: dict | None) -> dict | None:
+    row = job if isinstance(job, dict) else {}
+    if str(row.get("status") or "") != "processing":
+        return None
+    metadata = _metadata_for_job(row)
+    if str(metadata.get("ingest") or "") != "plaintext":
+        return None
+    stale_sec = _plaintext_stale_sec()
+    owner_instance = str(metadata.get("plaintext_worker_instance") or "")
+    owner_dead = _plaintext_owner_process_is_dead(metadata)
+    failed = db.genesis_fail_stale_plaintext_job(
+        store.user_id,
+        str(row.get("job_id") or ""),
+        older_than_sec=stale_sec,
+        error=(
+            "plaintext_worker_restarted"
+            if owner_dead
+            else f"plaintext_stale_timeout:{stale_sec}s"
+        ),
+        expected_worker_instance=owner_instance,
+        force=owner_dead,
+    )
+    if failed:
+        try:
+            service.write_genesis_state(store, failed, status=service.FAILED_JOB_STATUS)
+        except Exception:  # noqa: BLE001
+            pass
+    return failed
+
+
+def _estimate_plaintext_materials(prepared: dict) -> tuple[list[dict], int]:
+    materials: list[dict] = []
+    for group in prepared.get("source_groups") or []:
+        if not isinstance(group, dict):
+            continue
+        chunks = [str(text) for text in group.get("chunk_texts") or [] if str(text or "").strip()]
+        if not chunks:
+            continue
+        family = str(group.get("source_family") or "history")
+        # Conservative arithmetic: input chars / 3.5 plus prompt and maximum
+        # output reservations for every real map window.
+        input_tokens = math.ceil(sum(len(text) for text in chunks) / 3.5)
+        estimated = input_tokens + len(chunks) * (1200 + 2400)
+        materials.append({
+            "kind": _MATERIAL_KIND_BY_FAMILY.get(family, family),
+            "windows": len(chunks),
+            "est_tokens": estimated,
+        })
+    return materials, sum(item["est_tokens"] for item in materials)
+
+
+def _queued_plaintext_materials(source_groups: list[dict]) -> list[dict]:
+    materials: list[dict] = []
+    for group in source_groups:
+        if not isinstance(group, dict):
+            continue
+        total = len([
+            text for text in group.get("chunk_texts") or []
+            if str(text or "").strip()
+        ])
+        if not total:
+            continue
+        family = str(group.get("source_family") or "history")
+        materials.append({
+            "kind": _MATERIAL_KIND_BY_FAMILY.get(family, family),
+            "status": "queued",
+            "windows_done": 0,
+            "windows_total": total,
+            "cards": 0,
+        })
+    return materials
+
+
+def _recommended_distill_model(store, api_key: str | None) -> str | None:
+    runtime = hosted_config_store._load_runtime_provider_config(store, api_key)
+    if isinstance(runtime, tuple):
+        return None
+    provider = provider_client.normalize_provider(runtime.provider)
+    if provider in _FAST_DISTILL_MODEL_BY_PROVIDER:
+        return _FAST_DISTILL_MODEL_BY_PROVIDER[provider]
+    if provider != "openai_compatible":
+        return None
+    try:
+        catalog = provider_client.list_provider_models(
+            provider, runtime.api_key, runtime.base_url, total_budget_sec=3.0)
+    except Exception:
+        return None
+    ids = [
+        str(item.get("id") or "")
+        for item in catalog.get("models") or []
+        if isinstance(item, dict) and "thinking" not in str(item.get("id") or "").lower()
+    ]
+    for needle in ("haiku", "flash", "mini"):
+        match = next((model_id for model_id in ids if needle in model_id.lower()), "")
+        if match:
+            return match
+    return None
+
+
+def _distill_model_override(value: Any) -> str:
+    model = str(value or "").strip()
+    if not model:
+        return ""
+    if len(model) > 160 or any(ord(char) < 32 for char in model):
+        raise ValueError("invalid_distill_model")
+    return model
+
+
+def _material_card_count(output: dict | None) -> int:
+    value = output if isinstance(output, dict) else {}
+    cards = value.get("memories")
+    if not isinstance(cards, list):
+        cards = value.get("facts")
+    count = len(cards) if isinstance(cards, list) else 0
+    if _identity_payload_has_content(value.get("identity")):
+        count += 1
+    if value.get("persona") or value.get("persona_content"):
+        count += 1
+    return count
+
+
 def _plaintext_job_metadata(
     payload: dict,
     prepared: dict,
@@ -326,6 +540,159 @@ def _metadata_plaintext_mode(metadata: dict) -> str:
     return _plaintext_mode_from_client_job_id(str(metadata.get("client_job_id") or ""))
 
 
+def _plaintext_map_task_id(source_pass: int, source_family: str) -> str:
+    return f"plaintext-map:{source_pass}:{source_family}"
+
+
+class _PlaintextCheckpointProgress:
+    """Encrypted map checkpoint plus the non-content progress projection."""
+
+    def __init__(self, store, api_key: str | None, job_id: str, source_groups: list[dict]):
+        self.store = store
+        self.api_key = api_key
+        self.job_id = job_id
+        self.source_groups = source_groups
+        loaded = service.load_genesis_checkpoint(store, api_key, job_id)
+        self.doc = checkpoint.resume(loaded) if loaded else checkpoint.new_checkpoint()
+        self.doc.setdefault("map_outputs", {})
+        service.write_genesis_checkpoint(store, job_id, self.doc)
+        self.publish(stage="plaintext_reducer")
+
+    def _task_id(self, source_pass: int, source_family: str) -> str:
+        return _plaintext_map_task_id(source_pass, source_family)
+
+    def resume_outputs(self, source_pass: int, source_family: str) -> dict[int, dict]:
+        task_id = self._task_id(source_pass, source_family)
+        outputs = self.doc.get("map_outputs") if isinstance(self.doc.get("map_outputs"), dict) else {}
+        resumed: dict[int, dict] = {}
+        for idx in range(len(self.source_groups[source_pass - 1].get("chunk_texts") or [])):
+            key = checkpoint.task_key(task_id, idx)
+            value = outputs.get(key)
+            if checkpoint.is_task_done(self.doc, task_id, idx) and isinstance(value, dict):
+                resumed[idx] = value
+        return resumed
+
+    def record_map(self, source_pass: int, source_family: str, chunk_index: int, output: dict) -> None:
+        task_id = self._task_id(source_pass, source_family)
+        key = checkpoint.task_key(task_id, chunk_index)
+        outputs = dict(self.doc.get("map_outputs") or {})
+        outputs[key] = output
+        self.doc["map_outputs"] = outputs
+        self.doc = checkpoint.upsert_task(
+            self.doc,
+            task_id=task_id,
+            chunk_id=chunk_index,
+            status=checkpoint.TASK_DONE,
+            source_pass=str(source_pass),
+            output_summary=f"candidates={len(output.get('fact_candidates') or [])}",
+        )
+        # Durable checkpoint first, visible progress second. A crash can under-report
+        # completed work, but can never report a window that cannot be resumed.
+        service.write_genesis_checkpoint(self.store, self.job_id, self.doc)
+        self.publish(
+            stage="plaintext_reducer",
+            source_family=source_family,
+            source_pass=source_pass,
+        )
+
+    def record_non_map_group(
+        self, source_pass: int, source_family: str, *, cards: int = 0
+    ) -> None:
+        """Mark direct-reduce source windows complete after that reduce succeeds."""
+        task_id = self._task_id(source_pass, source_family)
+        total = len(self.source_groups[source_pass - 1].get("chunk_texts") or [])
+        for chunk_index in range(total):
+            if checkpoint.is_task_done(self.doc, task_id, chunk_index):
+                continue
+            self.doc = checkpoint.upsert_task(
+                self.doc,
+                task_id=task_id,
+                chunk_id=chunk_index,
+                status=checkpoint.TASK_DONE,
+                source_pass=str(source_pass),
+                output_summary="direct_reduce_complete",
+            )
+        material_cards = dict(self.doc.get("material_cards") or {})
+        material_cards[task_id] = max(0, int(cards))
+        self.doc["material_cards"] = material_cards
+        service.write_genesis_checkpoint(self.store, self.job_id, self.doc)
+        self.publish(
+            stage="plaintext_reducer",
+            source_family=source_family,
+            source_pass=source_pass,
+        )
+
+    def materials(self, *, active_pass: int = 0) -> list[dict]:
+        materials: list[dict] = []
+        outputs = self.doc.get("map_outputs") if isinstance(self.doc.get("map_outputs"), dict) else {}
+        material_cards = self.doc.get("material_cards") if isinstance(self.doc.get("material_cards"), dict) else {}
+        for source_pass, group in enumerate(self.source_groups, start=1):
+            family = str(group.get("source_family") or "history")
+            task_id = self._task_id(source_pass, family)
+            total = len(group.get("chunk_texts") or [])
+            done = sum(
+                1 for idx in range(total)
+                if checkpoint.is_task_done(self.doc, task_id, idx)
+            )
+            if total and done >= total:
+                status = "done"
+            elif source_pass == active_pass or done:
+                status = "processing"
+            else:
+                status = "queued"
+            cards = int(material_cards.get(task_id) or 0)
+            if not cards:
+                cards = sum(
+                    len((outputs.get(checkpoint.task_key(task_id, idx)) or {}).get("fact_candidates") or [])
+                    for idx in range(total)
+                    if isinstance(outputs.get(checkpoint.task_key(task_id, idx)), dict)
+                )
+            materials.append({
+                "kind": _MATERIAL_KIND_BY_FAMILY.get(family, family),
+                "status": status,
+                "windows_done": done,
+                "windows_total": total,
+                "cards": cards,
+            })
+        return materials
+
+    def mark_identity_ready(self) -> None:
+        self.doc["identity_ready"] = True
+        service.write_genesis_checkpoint(self.store, self.job_id, self.doc)
+
+    def processed_chunks(self) -> int:
+        return sum(item["windows_done"] for item in self.materials())
+
+    def publish(
+        self,
+        *,
+        stage: str,
+        source_family: str = "",
+        source_pass: int = 0,
+        status: str = "processing",
+        extra: dict[str, Any] | None = None,
+    ) -> None:
+        output: dict[str, Any] = {
+            "stage": stage,
+            "materials": self.materials(active_pass=source_pass),
+            "identity_ready": bool(self.doc.get("identity_ready")),
+        }
+        if source_family:
+            output["source_family"] = source_family
+        if source_pass:
+            output["source_pass"] = source_pass
+            output["source_pass_total"] = len(self.source_groups)
+        if extra:
+            output.update(extra)
+        db.genesis_set_job_status(
+            self.store.user_id,
+            self.job_id,
+            status=status,
+            output=output,
+            processed_chunks=self.processed_chunks(),
+        )
+
+
 def _find_reusable_plaintext_job(
     store,
     *,
@@ -338,8 +705,6 @@ def _find_reusable_plaintext_job(
     except Exception:
         return None
     for job in jobs:
-        if str(job.get("status") or "") == service.FAILED_JOB_STATUS:
-            continue
         metadata = _metadata_for_job(job)
         if metadata.get("ingest") != "plaintext":
             continue
@@ -761,16 +1126,18 @@ def _run_plaintext_genesis_v2(
     relationship_anchor: dict | None = None,
     analysis_messages: list[dict] | None = None,
     user_name: str = "",
+    llm: GenesisLLMClient | None = None,
+    progress: _PlaintextCheckpointProgress | None = None,
 ) -> bool:
     """Genesis v2 foreground-fast orchestration (behind FEEDLING_GENESIS_V2_ENABLED).
 
     Foreground restores the legacy chat_ready contract: pick 3-5 core memories, derive a
     REAL Identity Card via the existing hosted deriver (foreground_identity, no new
     prompt), write identity + relationship anchor (_store_identity_payload) + a greeting,
-    and only THEN complete the job — so the app enters with a named/anchored TA, never a
-    blank home. Background then does the heavy full reduce (rest of memories + voice +
-    persona), skipping the core and NOT re-writing identity; a background failure never
-    fails the already-greetable onboarding.
+    and publish identity_ready — so the app can enter with a named/anchored TA, never a
+    blank home. Background then does the heavy full reduce over every remaining window,
+    skipping the core and NOT re-writing identity. The job reaches done only after every
+    material window has a durable checkpoint.
 
     Edge: if the deriver can't produce an identity, fall back to the v1-style apply
     (complete on core + background fills identity) — never a fake-complete.
@@ -794,10 +1161,21 @@ def _run_plaintext_genesis_v2(
     fg_kind = str(fg_group.get("source_kind") or history_import._HISTORY_SOURCE)
     fg_family = str(fg_group.get("source_family") or worker._source_family(fg_kind))
 
-    db.genesis_set_job_status(
-        store.user_id, job_id, status="processing",
-        output={"stage": "genesis_v2_foreground", "source_family": fg_family}, processed_chunks=0,
-    )
+    if progress:
+        progress.publish(
+            stage="genesis_v2_foreground",
+            source_family=fg_family,
+            source_pass=fg_idx,
+            status="processing",
+        )
+    else:
+        db.genesis_set_job_status(
+            store.user_id,
+            job_id,
+            status="processing",
+            output={"stage": "genesis_v2_foreground", "source_family": fg_family},
+            processed_chunks=0,
+        )
     msgs = analysis_messages if isinstance(analysis_messages, list) else []
     # fresh_start-only = every analysis message is the synthetic sentinel (routed
     # into the history bucket by _plaintext_route_family, so group source_kind
@@ -825,9 +1203,48 @@ def _run_plaintext_genesis_v2(
     for idx, group in enumerate(fg_source_groups, start=1):
         group_kind = str(group.get("source_kind") or history_import._HISTORY_SOURCE)
         group_family = str(group.get("source_family") or worker._source_family(group_kind))
-        group_chunks = [str(t) for t in (group.get("chunk_texts") or []) if str(t or "").strip()]
-        if not group_chunks:
+        raw_group_chunks = list(group.get("chunk_texts") or [])
+        checkpoint_indices = group.get("_checkpoint_chunk_indices")
+        if (
+            not isinstance(checkpoint_indices, list)
+            or len(checkpoint_indices) != len(raw_group_chunks)
+            or not all(isinstance(value, int) for value in checkpoint_indices)
+        ):
+            checkpoint_indices = list(range(len(raw_group_chunks)))
+        indexed_group_chunks = [
+            (full_index, str(text))
+            for full_index, text in zip(checkpoint_indices, raw_group_chunks)
+            if str(text or "").strip()
+        ]
+        if not indexed_group_chunks:
             continue
+        checkpoint_indices = [full_index for full_index, _text in indexed_group_chunks]
+        group_chunks = [text for _full_index, text in indexed_group_chunks]
+        resume_map_outputs = None
+        on_map_completed = None
+        if progress:
+            completed = progress.resume_outputs(idx, group_family)
+            resume_map_outputs = {
+                local_index: completed[full_index]
+                for local_index, full_index in enumerate(checkpoint_indices)
+                if full_index in completed
+            }
+
+            def on_map_completed(
+                chunk_index,
+                output,
+                *,
+                source_pass=idx,
+                family=group_family,
+                full_indices=tuple(checkpoint_indices),
+            ):
+                progress.record_map(
+                    source_pass,
+                    family,
+                    full_indices[chunk_index],
+                    output,
+                )
+
         if combined_map and group_family == "ai_persona":
             persona_material_parts.extend(group_chunks)
         reduce = worker.build_foreground_output_from_texts(
@@ -837,6 +1254,9 @@ def _run_plaintext_genesis_v2(
             include_voice_candidates=combined_map,
             write_core=False,
             user_name=user_name,
+            llm=llm,
+            resume_map_outputs=resume_map_outputs,
+            on_map_completed=on_map_completed,
         )
         foreground_reduces.append(reduce)
         voice_candidates.extend([c for c in (reduce.get("voice_candidates") or []) if isinstance(c, dict)])
@@ -869,6 +1289,7 @@ def _run_plaintext_genesis_v2(
         runtime=runtime,
         fact_candidates=all_fact_candidates,
         user_name=user_name,
+        llm=llm,
     )
     fg_merged = _plaintext_merge_reducer_outputs(
         [{**primary_reduce, **full_fact_write}],
@@ -883,6 +1304,7 @@ def _run_plaintext_genesis_v2(
             voice_candidates=voice_candidates,
             existing_persona={"content": "\n\n".join(persona_material_parts).strip()} if persona_material_parts else None,
             user_name=user_name,
+            llm=llm,
         )
         fg_merged = _plaintext_merge_reducer_outputs(
             [{**fg_merged, **voice_persona_output}],
@@ -898,8 +1320,8 @@ def _run_plaintext_genesis_v2(
 
     # Foreground-ready contract: derive identity when the material contains a real
     # signal, but never invent one or make its absence a speaking gate. Greeting and
-    # Genesis completion still happen before entry; heavy voice/persona/full-memory
-    # stay in background. fresh_start skips the identity LLM entirely: deriving a
+    # identity readiness happen before entry; full-memory completion stays in the
+    # continuation. fresh_start skips the identity LLM entirely: deriving a
     # name from the synthetic sentinel is meaningless (a hallucinated one would be
     # wrong), and a provider hiccup there must not push a material-less onboarding
     # into the retryable-failed path — the greeting below must land regardless.
@@ -933,7 +1355,7 @@ def _run_plaintext_genesis_v2(
     identity_first = bool(msgs) and foreground_identity.has_identity_signal(identity_payload)
     persona_ref = ""
     persona_sha = ""
-    if combined_map:
+    if combined_map and identity_first:
         persona_ref, persona_sha = service.write_persona_artifact(store, job_id, fg_merged)
         service.write_voice_artifact(store, job_id, fg_merged)
 
@@ -956,24 +1378,9 @@ def _run_plaintext_genesis_v2(
             language=language,
             fresh_start=fresh_start_only,
         )
-        completed = db.genesis_complete_job(
-            store.user_id, job_id,
-            output={
-                "stage": "genesis_v2_foreground_ready",
-                "history_windows_total": hw_total,
-                "history_windows_failed": hw_failed,
-            },
-            memory_action_count=mem_count, identity_status="initialized",
-            persona_ref=persona_ref, persona_sha256=persona_sha,
-        )
-        if completed:
-            service.write_genesis_state(store, completed, status=service.DONE_JOB_STATUS)
-            # foreground identity-first completion bypasses service.apply_reducer_output
-            # (which resolves genesis notices for the other completion paths) -> resolve
-            # here too so a prior failure notice doesn't linger past a successful retry.
-            notices_core.resolve(store, "genesis:")
+        identity_status = "initialized"
     else:
-        # No foreground identity signal: complete nameless after greeting/core, then
+        # No foreground identity signal: enter nameless after greeting/core, then
         # let background enrichment add an identity later if the full material supports it.
         _append_plaintext_onboarding_greeting(
             store,
@@ -985,18 +1392,60 @@ def _run_plaintext_genesis_v2(
             language=language,
             fresh_start=fresh_start_only,
         )
-        service.apply_reducer_output(store, api_key, job_id, fg_merged)
+        foreground_result = service.apply_reducer_output(
+            store,
+            api_key,
+            job_id,
+            fg_merged,
+            complete_job=False,
+        ) or {}
+        mem_count = int(foreground_result.get("memory_action_count") or 0)
+        identity_status = str(foreground_result.get("identity_status") or "")
+        persona_ref = str(foreground_result.get("persona_ref") or persona_ref)
+        persona_sha = str(foreground_result.get("persona_sha256") or persona_sha)
+
+    # The foreground has produced a usable entry state, but the import is not done
+    # until the full source_groups set is checkpointed below.
+    notices_core.resolve(store, "genesis:")
+
+    if progress:
+        progress.mark_identity_ready()
+        progress.publish(
+            stage="genesis_v2_foreground_ready",
+            status="processing",
+            extra={
+                "history_windows_total": hw_total,
+                "history_windows_failed": hw_failed,
+            },
+        )
+    else:
+        db.genesis_set_job_status(
+            store.user_id,
+            job_id,
+            status="processing",
+            output={
+                "stage": "genesis_v2_foreground_ready",
+                "identity_ready": True,
+                "history_windows_total": hw_total,
+                "history_windows_failed": hw_failed,
+            },
+        )
+
+    completion = {
+        "memory_action_count": mem_count,
+        "identity_status": identity_status,
+        "persona_ref": persona_ref,
+        "persona_sha256": persona_sha,
+    }
 
     if fresh_start_only:
         # No material by definition -> nothing to enrich. Background here would
         # re-reduce the pure sentinel as history with write_identity=True (prod
-        # runs WITHOUT FEEDLING_GENESIS_COMBINED_MAP, so this path IS reachable
-        # there) — inventing persona/identity from synthetic text the foreground
+        # can be reached regardless of the combined-map deployment flag) —
+        # inventing persona/identity from synthetic text the foreground
         # explicitly refuses to distill, plus wasted provider calls. The greeting
-        # landed and the job is complete; stop here.
-        return True
-
-    if combined_map:
+        # landed and there are no real material windows to enrich; complete now.
+        _complete_plaintext_v2_job(store, job_id, progress=progress, **completion)
         return True
 
     # foreground core memory texts -> background as "already saved, don't repeat"
@@ -1006,24 +1455,66 @@ def _run_plaintext_genesis_v2(
                     for m in full_memories) if t
     ]
 
-    # background continuation — never fails the (already greetable) job. When the
-    # foreground already wrote identity, the background must NOT re-write it.
+    # Background continuation consumes the full unsampled source groups. Combined-map
+    # already produced voice/persona in the foreground, so its continuation only fills
+    # memory windows; both modes must write the remaining memories.
     try:
         _run_plaintext_background_enrichment(
             store, api_key, job_id, runtime=runtime, source_groups=source_groups,
             relationship_anchor=relationship_anchor,
             skip_family=fg_family, skip_texts=foreground.core_skip_texts(core),
             known_memories=core_memory_texts, write_identity=not identity_first,
-            include_memory=False,
+            include_memory=True,
+            include_persona_voice=not combined_map,
             user_name=user_name,
+            llm=llm,
+            progress=progress,
+            completion=completion,
         )
     except Exception as e:  # noqa: BLE001
-        db.genesis_set_job_status(
-            store.user_id, job_id, status=service.DONE_JOB_STATUS,
-            output={"stage": "genesis_v2_background_deferred",
-                    "error": f"{type(e).__name__}:{str(e)[:180]}"},
+        service.mark_failed(
+            store,
+            job_id,
+            f"genesis_v2_background_failed:{type(e).__name__}:{str(e)[:220]}",
+            exc=e,
         )
     return True
+
+
+def _complete_plaintext_v2_job(
+    store,
+    job_id: str,
+    *,
+    progress: _PlaintextCheckpointProgress | None,
+    memory_action_count: int,
+    identity_status: str,
+    persona_ref: str,
+    persona_sha256: str,
+) -> None:
+    output: dict[str, Any] = {
+        "stage": "genesis_v2_done",
+        "identity_ready": True,
+    }
+    if progress:
+        materials = progress.materials()
+        incomplete = [
+            item for item in materials
+            if int(item.get("windows_done") or 0) != int(item.get("windows_total") or 0)
+        ]
+        if incomplete:
+            raise RuntimeError("genesis_v2_incomplete_material_windows")
+        output["materials"] = materials
+    completed = db.genesis_complete_job(
+        store.user_id,
+        job_id,
+        output=output,
+        memory_action_count=memory_action_count,
+        identity_status=identity_status,
+        persona_ref=persona_ref,
+        persona_sha256=persona_sha256,
+    )
+    if completed:
+        service.write_genesis_state(store, completed, status=service.DONE_JOB_STATUS)
 
 
 def _run_plaintext_background_enrichment(
@@ -1039,11 +1530,16 @@ def _run_plaintext_background_enrichment(
     known_memories: list[str] | None = None,
     write_identity: bool = True,
     include_memory: bool = True,
+    include_persona_voice: bool = True,
     user_name: str = "",
+    llm: GenesisLLMClient | None = None,
+    progress: _PlaintextCheckpointProgress | None = None,
+    completion: dict[str, Any] | None = None,
 ) -> None:
     """Background continuation: the full reduce over every group (skipping the core the
     foreground already wrote for skip_family), then apply the REST incrementally —
-    memories + persona + voice. Does NOT re-complete the job (foreground already did).
+    memories + persona + voice. With completion metadata, this is the only path that
+    marks a material-backed v2 job done.
 
     Dedup is two-layered against the foreground core (`known_memories`): the model
     dedups reworded twins semantically inside fact_write (known_memories = "already
@@ -1060,11 +1556,19 @@ def _run_plaintext_background_enrichment(
         group_chunks = [str(t) for t in (group.get("chunk_texts") or []) if str(t or "").strip()]
         if not group_chunks:
             continue
-        db.genesis_set_job_status(
-            store.user_id, job_id, status=service.DONE_JOB_STATUS,
-            output={"stage": "genesis_v2_background", "source_family": group_family,
-                    "source_pass": idx, "source_pass_total": len(source_groups)},
-        )
+        if progress:
+            progress.publish(
+                stage="genesis_v2_background",
+                source_family=group_family,
+                source_pass=idx,
+                status="processing",
+            )
+        else:
+            db.genesis_set_job_status(
+                store.user_id, job_id, status="processing",
+                output={"stage": "genesis_v2_background", "source_family": group_family,
+                        "source_pass": idx, "source_pass_total": len(source_groups)},
+            )
         output = worker.build_reducer_output_from_texts(
             user_id=store.user_id, job_id=job_id,
             key_prefix=f"{job_id}:source_pass:{idx}:{group_family}",
@@ -1074,8 +1578,22 @@ def _run_plaintext_background_enrichment(
             skip_fact_texts=skip_texts if group_family == skip_family else None,
             known_memories=known if group_family == skip_family else None,
             include_memory=include_memory,
+            include_persona_voice=include_persona_voice,
             user_name=user_name,
+            llm=llm,
+            resume_map_outputs=(progress.resume_outputs(idx, group_family) if progress else None),
+            on_map_completed=(
+                (lambda chunk_index, mapped, source_pass=idx, family=group_family:
+                 progress.record_map(source_pass, family, chunk_index, mapped))
+                if progress else None
+            ),
         )
+        if progress and group_family in {"ai_persona", "memory_summary"}:
+            progress.record_non_map_group(
+                idx,
+                group_family,
+                cards=_material_card_count(output),
+            )
         reducer_outputs.append(output)
         next_persona = _plaintext_existing_persona_from_output(output)
         if next_persona:
@@ -1091,11 +1609,15 @@ def _run_plaintext_background_enrichment(
         if dropped:
             merged["memories"] = kept
     # apply the REST without re-completing: memories (core already excluded), persona, voice
+    background_memory_count = 0
     if include_memory:
-        service.apply_memory_outputs(store, api_key, merged)
+        apply_result = service.apply_memory_outputs(store, api_key, merged)
+        if isinstance(apply_result, tuple) and apply_result:
+            background_memory_count = int(apply_result[0] or 0)
     # Identity is normally written by the FOREGROUND now (identity-first contract), so the
     # background skips it (write_identity=False). When foreground had no signal,
     # background may still derive one from the full reduce or persona; absence remains valid.
+    background_identity_status = ""
     if write_identity:
         if not _merged_has_identity(merged) and isinstance(merged.get("persona"), dict):
             persona_content = str(merged["persona"].get("content") or "").strip()
@@ -1116,21 +1638,41 @@ def _run_plaintext_background_enrichment(
                     # also exists.
                     existing_identity = merged.get("identity") if isinstance(merged.get("identity"), dict) else {}
                     merged["identity"] = {**existing_identity, **baseline}
-        service.init_identity_if_absent(
+        background_identity_status = service.init_identity_if_absent(
             store, _attach_plaintext_user_name(merged, user_name), api_key
         )
-    service.write_persona_artifact(store, job_id, merged)
+    background_persona_ref, background_persona_sha = service.write_persona_artifact(
+        store, job_id, merged)
     service.write_voice_artifact(store, job_id, merged)
-    db.genesis_set_job_status(
-        store.user_id, job_id, status=service.DONE_JOB_STATUS, output={"stage": "genesis_v2_done"},
-    )
-    # NOTE: deliberately no notices_core.resolve() here. This function is a pure
-    # continuation after the job already completed (foreground already ran either
-    # the identity-first path, which resolves at :799, or service.apply_reducer_output
-    # at :813, which resolves at its own start and may then emit a fresh
-    # "genesis:{job_id}:partial" notice for dropped cards). apply_memory_outputs
-    # (used above) never emits notices itself, so resolving again here would only
-    # ever clobber that just-emitted partial — never resolve anything new.
+    if completion is not None:
+        _complete_plaintext_v2_job(
+            store,
+            job_id,
+            progress=progress,
+            memory_action_count=(
+                int(completion.get("memory_action_count") or 0) + background_memory_count
+            ),
+            identity_status=(
+                background_identity_status
+                or str(completion.get("identity_status") or "")
+            ),
+            persona_ref=(
+                background_persona_ref
+                or str(completion.get("persona_ref") or "")
+            ),
+            persona_sha256=(
+                background_persona_sha
+                or str(completion.get("persona_sha256") or "")
+            ),
+        )
+    elif progress:
+        progress.publish(stage="genesis_v2_done", status=service.DONE_JOB_STATUS)
+    else:
+        db.genesis_set_job_status(
+            store.user_id, job_id, status=service.DONE_JOB_STATUS, output={"stage": "genesis_v2_done"},
+        )
+    # Foreground readiness already resolved stale failure notices. Do not resolve
+    # again here: later stages may add a fresh partial notice in future revisions.
 
 
 def _append_plaintext_onboarding_greeting(
@@ -1190,6 +1732,8 @@ def _run_plaintext_add_memory_job(
     source_groups: list[dict],
     relationship_anchor: dict | None = None,
     user_name: str = "",
+    llm: GenesisLLMClient | None = None,
+    progress: _PlaintextCheckpointProgress | None = None,
 ) -> None:
     # this add_memory job path bypasses service.apply_reducer_output (which resolves
     # genesis notices for the reducer-driven completion path) -> resolve here too, at
@@ -1210,17 +1754,25 @@ def _run_plaintext_add_memory_job(
             continue
         keep_all = group_family == "memory_summary"
         keep_all_job = keep_all_job or keep_all
-        db.genesis_set_job_status(
-            store.user_id,
-            job_id,
-            status="processing",
-            output={
-                "stage": "plaintext_add_memory",
-                "source_family": group_family,
-                "source_pass": idx,
-                "source_pass_total": len(source_groups),
-            },
-        )
+        if progress:
+            progress.publish(
+                stage="plaintext_add_memory",
+                source_family=group_family,
+                source_pass=idx,
+                status="processing",
+            )
+        else:
+            db.genesis_set_job_status(
+                store.user_id,
+                job_id,
+                status="processing",
+                output={
+                    "stage": "plaintext_add_memory",
+                    "source_family": group_family,
+                    "source_pass": idx,
+                    "source_pass_total": len(source_groups),
+                },
+            )
         output = worker.build_foreground_output_from_texts(
             user_id=store.user_id,
             job_id=job_id,
@@ -1231,6 +1783,13 @@ def _run_plaintext_add_memory_job(
             write_core=False,
             keep_all=keep_all,
             user_name=user_name,
+            llm=llm,
+            resume_map_outputs=(progress.resume_outputs(idx, group_family) if progress else None),
+            on_map_completed=(
+                (lambda chunk_index, mapped, source_pass=idx, family=group_family:
+                 progress.record_map(source_pass, family, chunk_index, mapped))
+                if progress else None
+            ),
         )
         if not first_output:
             first_output = output
@@ -1245,6 +1804,7 @@ def _run_plaintext_add_memory_job(
         fact_candidates=fact_candidates,
         keep_all=keep_all_job,
         user_name=user_name,
+        llm=llm,
     )
     merged = _plaintext_merge_reducer_outputs([{**first_output, **memory_output}], relationship_anchor=relationship_anchor)
     raw_items = merged.get("memories")
@@ -1276,6 +1836,9 @@ def _run_plaintext_add_memory_job(
     )
     if completed:
         service.write_genesis_state(store, completed, status=service.DONE_JOB_STATUS)
+        if progress:
+            progress.mark_identity_ready()
+            progress.publish(stage="plaintext_add_memory_done", status=service.DONE_JOB_STATUS)
     _write_back_plaintext_user_name(store, api_key, user_name)
 
 
@@ -1288,6 +1851,8 @@ def _run_plaintext_update_identity_job(
     analysis_messages: list[dict] | None,
     relationship_anchor: dict | None = None,
     user_name: str = "",
+    llm: GenesisLLMClient | None = None,
+    progress: _PlaintextCheckpointProgress | None = None,
 ) -> str | None:
     msgs = analysis_messages if isinstance(analysis_messages, list) else []
     language = history_import._import_language_for_store(store, msgs)
@@ -1329,6 +1894,7 @@ def _run_plaintext_update_identity_job(
             source_family="ai_persona",
             existing_persona=existing_persona,
             user_name=user_name,
+            llm=llm,
         )
     except Exception as e:  # noqa: BLE001
         service.mark_failed(
@@ -1348,6 +1914,10 @@ def _run_plaintext_update_identity_job(
             store, job_id, f"persona_write_failed:{type(e).__name__}:{str(e)[:160]}", exc=e,
         )
         return
+    if progress:
+        for source_pass, group in enumerate(progress.source_groups, start=1):
+            family = str(group.get("source_family") or "ai_persona")
+            progress.record_non_map_group(source_pass, family, cards=2)
     completed = db.genesis_complete_job(
         store.user_id,
         job_id,
@@ -1359,6 +1929,9 @@ def _run_plaintext_update_identity_job(
     )
     if completed:
         service.write_genesis_state(store, completed, status=service.DONE_JOB_STATUS)
+        if progress:
+            progress.mark_identity_ready()
+            progress.publish(stage="plaintext_update_identity_done", status=service.DONE_JOB_STATUS)
         # this update_identity path never goes through service.apply_reducer_output
         # (which resolves genesis notices on the other completion paths) -> resolve
         # here too, so a prior genesis_failed notice from an earlier failed attempt
@@ -1382,7 +1955,14 @@ def _run_plaintext_genesis_job(
     relationship_anchor: dict | None = None,
     analysis_messages: list[dict] | None = None,
 ) -> None:
-    active_key = (store.user_id, job_id)
+    heartbeat_stop = threading.Event()
+    heartbeat_thread = threading.Thread(
+        target=_run_plaintext_job_heartbeat,
+        args=(store, job_id, heartbeat_stop),
+        name=f"genesis-plaintext-heartbeat-{job_id[:24]}",
+        daemon=True,
+    )
+    heartbeat_thread.start()
     started_at = time.time()
     group_count = len(source_groups) if isinstance(source_groups, list) else 0
     chunk_count = len(chunk_texts or [])
@@ -1408,25 +1988,25 @@ def _run_plaintext_genesis_job(
         if not source_groups:
             raise MaterialEmptyError("plaintext_import_empty")
 
-        job = db.genesis_set_job_status(
-            store.user_id,
-            job_id,
-            status="processing",
-            output={"stage": "plaintext_reducer"},
-            processed_chunks=0,
-        )
-        if job:
-            service.write_genesis_state(store, job, status="processing")
+        job = db.genesis_get_job(store.user_id, job_id)
         runtime = hosted_config_store._load_runtime_provider_config(store, api_key)
         if isinstance(runtime, tuple):
             _, err = runtime
             raise RuntimeError(json.dumps(err, ensure_ascii=False))
+        job_metadata = job.get("metadata") if isinstance((job or {}).get("metadata"), dict) else {}
+        distill_model = _distill_model_override(job_metadata.get("distill_model"))
+        if distill_model:
+            runtime = replace(runtime, model=distill_model)
         _trace_genesis(
             store,
             "genesis.plaintext.runtime.loaded",
             job_id=job_id,
             summary="runtime config loaded",
             detail={"mode": mode},
+        )
+        llm = GenesisLLMClient(canary=True)
+        progress = _PlaintextCheckpointProgress(
+            store, api_key, job_id, source_groups
         )
         user_name = _resolve_plaintext_user_name(
             store, api_key, runtime, source_groups
@@ -1442,6 +2022,8 @@ def _run_plaintext_genesis_job(
                 source_groups=source_groups,
                 relationship_anchor=relationship_anchor,
                 user_name=user_name,
+                llm=llm,
+                progress=progress,
             )
             _trace_genesis(store, "genesis.plaintext.done", job_id=job_id, summary="add memory job done",
                            detail={"mode": mode}, dur_ms=(time.time() - started_at) * 1000)
@@ -1457,6 +2039,8 @@ def _run_plaintext_genesis_job(
                 analysis_messages=analysis_messages,
                 relationship_anchor=relationship_anchor,
                 user_name=user_name,
+                llm=llm,
+                progress=progress,
             )
             _trace_genesis(store, "genesis.plaintext.done", job_id=job_id, summary="update identity job done",
                            detail={"mode": mode, "identity_status": identity_status or ""},
@@ -1471,6 +2055,8 @@ def _run_plaintext_genesis_job(
             runtime=runtime, source_groups=source_groups, relationship_anchor=relationship_anchor,
             analysis_messages=analysis_messages,
             user_name=user_name,
+            llm=llm,
+            progress=progress,
         ):
             _trace_genesis(store, "genesis.plaintext.done", job_id=job_id, summary="genesis v2 job handled",
                            detail={"mode": mode, "genesis_v2": True}, dur_ms=(time.time() - started_at) * 1000)
@@ -1479,24 +2065,17 @@ def _run_plaintext_genesis_job(
         reducer_outputs: list[dict] = []
         existing_persona: dict = {}
         existing_voice: dict = {}
-        processed_chunks = 0
         for idx, group in enumerate(source_groups, start=1):
             group_source_kind = str(group.get("source_kind") or history_import._HISTORY_SOURCE)
             group_source_family = str(group.get("source_family") or worker._source_family(group_source_kind))
             group_chunk_texts = [str(text) for text in (group.get("chunk_texts") or []) if str(text or "").strip()]
             if not group_chunk_texts:
                 continue
-            db.genesis_set_job_status(
-                store.user_id,
-                job_id,
+            progress.publish(
+                stage="plaintext_reducer",
+                source_family=group_source_family,
+                source_pass=idx,
                 status="processing",
-                output={
-                    "stage": "plaintext_reducer",
-                    "source_family": group_source_family,
-                    "source_pass": idx,
-                    "source_pass_total": len(source_groups),
-                },
-                processed_chunks=processed_chunks,
             )
             pass_started_at = time.time()
             _trace_genesis(
@@ -1521,7 +2100,19 @@ def _run_plaintext_genesis_job(
                 existing_persona=existing_persona,
                 existing_voice=existing_voice,
                 user_name=user_name,
+                llm=llm,
+                resume_map_outputs=progress.resume_outputs(idx, group_source_family),
+                on_map_completed=(
+                    lambda chunk_index, mapped, source_pass=idx, family=group_source_family:
+                    progress.record_map(source_pass, family, chunk_index, mapped)
+                ),
             )
+            if progress and group_source_family in {"ai_persona", "memory_summary"}:
+                progress.record_non_map_group(
+                    idx,
+                    group_source_family,
+                    cards=_material_card_count(output),
+                )
             _trace_genesis(
                 store,
                 "genesis.plaintext.reducer_pass.done",
@@ -1538,7 +2129,6 @@ def _run_plaintext_genesis_job(
                 dur_ms=(time.time() - pass_started_at) * 1000,
             )
             reducer_outputs.append(output)
-            processed_chunks += len(group_chunk_texts)
             next_persona = _plaintext_existing_persona_from_output(output)
             if next_persona:
                 existing_persona = next_persona
@@ -1551,13 +2141,7 @@ def _run_plaintext_genesis_job(
             relationship_anchor=relationship_anchor,
         )
         _attach_plaintext_user_name(reducer_output, user_name)
-        db.genesis_set_job_status(
-            store.user_id,
-            job_id,
-            status="processing",
-            output={"stage": "plaintext_reducer_done"},
-            processed_chunks=sum(len(group.get("chunk_texts") or []) for group in source_groups),
-        )
+        progress.publish(stage="plaintext_reducer_done")
         _trace_genesis(
             store,
             "genesis.plaintext.apply.started",
@@ -1571,6 +2155,8 @@ def _run_plaintext_genesis_job(
             },
         )
         service.apply_reducer_output(store, api_key, job_id, reducer_output)
+        progress.mark_identity_ready()
+        progress.publish(stage="plaintext_reducer_done", status=service.DONE_JOB_STATUS)
         _write_back_plaintext_user_name(store, api_key, user_name)
         _trace_genesis(
             store,
@@ -1594,8 +2180,27 @@ def _run_plaintext_genesis_job(
             store, job_id, f"plaintext_import_failed:{type(e).__name__}:{str(e)[:220]}", exc=e,
         )
     finally:
-        with _PLAINTEXT_ACTIVE_LOCK:
-            _PLAINTEXT_ACTIVE_JOBS.discard(active_key)
+        heartbeat_stop.set()
+        heartbeat_thread.join(timeout=1.0)
+        try:
+            terminal_job = db.genesis_get_job(store.user_id, job_id)
+            if str((terminal_job or {}).get("status") or "") == service.DONE_JOB_STATUS:
+                service.delete_genesis_checkpoint(store, job_id)
+        except Exception:
+            pass
+
+
+def _run_plaintext_job_heartbeat(store, job_id: str, stop_event) -> None:
+    while not stop_event.wait(_plaintext_heartbeat_sec()):
+        try:
+            worker_instance = _plaintext_worker_metadata()["plaintext_worker_instance"]
+            db.genesis_touch_plaintext_job(
+                store.user_id,
+                job_id,
+                worker_instance=worker_instance,
+            )
+        except Exception:  # noqa: BLE001
+            pass
 
 
 def _start_plaintext_genesis_job(
@@ -1613,11 +2218,6 @@ def _start_plaintext_genesis_job(
     job_id = str(job.get("job_id") or "")
     if not job_id:
         return False
-    active_key = (store.user_id, job_id)
-    with _PLAINTEXT_ACTIVE_LOCK:
-        if active_key in _PLAINTEXT_ACTIVE_JOBS:
-            return False
-        _PLAINTEXT_ACTIVE_JOBS.add(active_key)
     thread = threading.Thread(
         target=_run_plaintext_genesis_job,
         args=(store, api_key, job_id),
@@ -1632,12 +2232,7 @@ def _start_plaintext_genesis_job(
         name=f"genesis-plaintext-{job_id[:24]}",
         daemon=True,
     )
-    try:
-        thread.start()
-    except Exception:
-        with _PLAINTEXT_ACTIVE_LOCK:
-            _PLAINTEXT_ACTIVE_JOBS.discard(active_key)
-        raise
+    thread.start()
     return True
 
 

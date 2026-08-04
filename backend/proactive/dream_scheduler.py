@@ -49,10 +49,6 @@ def min_new_cards() -> int:
     return _env_int("FEEDLING_DREAM_MIN_NEW_CARDS", 3, lo=1, hi=1000)
 
 
-def min_new_turns() -> int:
-    return _env_int("FEEDLING_DREAM_MIN_NEW_TURNS", 24, lo=0, hi=10000)
-
-
 def min_interval_sec() -> float:
     return _env_float("FEEDLING_DREAM_MIN_INTERVAL_SEC", 23 * 3600.0, hi=7 * 86400.0)
 
@@ -90,12 +86,20 @@ def _safe_int(value: Any, default: int = 0) -> int:
 
 def _state_doc(raw: Any) -> dict[str, Any]:
     doc = dict(raw) if isinstance(raw, dict) else {}
+    last_card_count = max(0, _safe_int(doc.get("last_dreamed_card_count"), 0))
     return {
         "last_dream_completed_at": _safe_float(doc.get("last_dream_completed_at"), 0.0),
         "last_dream_organized_count": max(0, _safe_int(doc.get("last_dream_organized_count"), 0)),
         "last_dream_merged_count": max(0, _safe_int(doc.get("last_dream_merged_count"), 0)),
         "last_dreamed_until": str(doc.get("last_dreamed_until") or "")[:240],
-        "last_dreamed_card_count": max(0, _safe_int(doc.get("last_dreamed_card_count"), 0)),
+        "last_dreamed_card_count": last_card_count,
+        # Backward-compatible migration: using the old all-active count as the
+        # initial seed floor suppresses an unsafe one-time replay after deploy.
+        # Subsequent completions persist the exact historical non-Dream count.
+        "last_dreamed_seed_card_count": max(
+            0,
+            _safe_int(doc.get("last_dreamed_seed_card_count"), last_card_count),
+        ),
         "last_dreamed_turn_count": max(0, _safe_int(doc.get("last_dreamed_turn_count"), 0)),
         "last_dream_signature": str(doc.get("last_dream_signature") or "")[:240],
         "pending_dream_key": str(doc.get("pending_dream_key") or "")[:240],
@@ -139,15 +143,6 @@ def _within_night_window(store, *, now: float) -> bool:
     return hour >= start or hour < end
 
 
-def _dream_available_moments(store) -> list[dict[str, Any]]:
-    moments = memory_service._load_moments(store)
-    return [
-        dict(moment)
-        for moment in moments
-        if memory_readside_core.memory_available(moment, store.user_id)
-    ]
-
-
 def _live_user_turn_count(store) -> int:
     chat_messages = getattr(store, "chat_messages", None)
     if not isinstance(chat_messages, list):
@@ -161,20 +156,40 @@ def _live_user_turn_count(store) -> int:
     return sum(1 for msg in messages if str(msg.get("role") or "").strip() == "user")
 
 
-def _moment_signature(moment: Mapping[str, Any]) -> str:
-    return "|".join(
-        str(moment.get(key) or "")
-        for key in ("id", "updated_at", "last_referenced_at", "occurred_at", "status")
-    )
-
-
 def _dream_snapshot(store) -> dict[str, Any]:
+    all_moments = [
+        dict(moment)
+        for moment in memory_service._load_moments(store)
+        if isinstance(moment, dict)
+        and str(moment.get("owner_user_id") or "") == str(store.user_id)
+    ]
     moments = sorted(
-        _dream_available_moments(store),
+        [
+            moment
+            for moment in all_moments
+            if memory_readside_core.memory_available(moment, store.user_id)
+        ],
+        key=lambda item: str(item.get("id") or ""),
+    )
+    # Dream output is intentionally excluded from the durable trigger source.
+    # Count historical seed cards (including ones Dream later superseded), so
+    # Dream's own retire/add writes cannot decrease/increase this frontier.
+    seed_moments = sorted(
+        [
+            moment
+            for moment in all_moments
+            if str(moment.get("source") or "").strip() != "memory_dream"
+        ],
         key=lambda item: str(item.get("id") or ""),
     )
     digest = hashlib.sha256(
-        "\n".join(_moment_signature(moment) for moment in moments).encode("utf-8")
+        "\n".join(
+            "|".join(
+                str(moment.get(key) or "")
+                for key in ("id", "source", "created_at", "occurred_at")
+            )
+            for moment in seed_moments
+        ).encode("utf-8")
     ).hexdigest()[:32]
     last = moments[-1] if moments else {}
     last_until = str(
@@ -185,6 +200,7 @@ def _dream_snapshot(store) -> dict[str, Any]:
     )[:240]
     return {
         "card_count": len(moments),
+        "seed_card_count": len(seed_moments),
         "turn_count": _live_user_turn_count(store),
         "signature": digest,
         "last_until": last_until,
@@ -196,7 +212,7 @@ def dream_key_for_snapshot(state: Mapping[str, Any], snapshot: Mapping[str, Any]
         [
             str(state.get("last_dream_signature") or ""),
             str(snapshot.get("signature") or ""),
-            str(snapshot.get("card_count") or 0),
+            str(snapshot.get("seed_card_count") or 0),
             str(snapshot.get("turn_count") or 0),
         ]
     )
@@ -240,19 +256,30 @@ def tick_memory_dream(
         now_ts,
     ):
         return {"enqueued": False, "reason": "failure_backoff", "state": state, "job": None, "snapshot": snapshot}
+    seed_card_count = max(0, int(snapshot.get("seed_card_count") or 0))
     last_count = max(0, int(state.get("last_dreamed_card_count") or 0))
-    new_cards = max(0, card_count - last_count)
+    last_seed_count = max(0, int(state.get("last_dreamed_seed_card_count") or 0))
+    new_cards = max(0, seed_card_count - last_seed_count)
     turn_count = max(0, int(snapshot.get("turn_count") or 0))
     last_turn_count = max(0, int(state.get("last_dreamed_turn_count") or 0))
     new_turns = max(0, turn_count - last_turn_count)
-    if str(state.get("last_dream_signature") or "") == str(snapshot.get("signature") or "") and new_turns <= 0:
-        return {"enqueued": False, "reason": "already_dreamed", "state": state, "job": None, "snapshot": snapshot}
+    if str(state.get("last_dream_signature") or "") == str(snapshot.get("signature") or ""):
+        return {
+            "enqueued": False,
+            "reason": "already_dreamed",
+            "state": state,
+            "job": None,
+            "snapshot": snapshot,
+            "new_cards": new_cards,
+            "new_turns": new_turns,
+        }
     last_completed = _safe_float(state.get("last_dream_completed_at"), 0.0)
     if last_completed and not force and now_ts - last_completed < min_interval_sec():
         return {"enqueued": False, "reason": "min_interval", "state": state, "job": None, "snapshot": snapshot}
-    turn_threshold = min_new_turns()
-    turn_due = turn_threshold > 0 and new_turns >= turn_threshold
-    if not force and new_cards < min_new_cards() and not turn_due:
+    # User turns no longer independently trigger Dream.  Only new cards from a
+    # non-Dream source advance the durable seed frontier; otherwise normal
+    # conversation plus Dream's own rewritten snapshot caused nightly churn.
+    if not force and new_cards < min_new_cards():
         return {
             "enqueued": False,
             "reason": "not_enough_new_cards",
@@ -282,6 +309,8 @@ def tick_memory_dream(
             "new_cards": new_cards,
             "new_turns": new_turns,
             "last_dreamed_card_count": last_count,
+            "last_dreamed_seed_card_count": last_seed_count,
+            "seed_card_count": seed_card_count,
             "last_dreamed_turn_count": last_turn_count,
             "turn_count": turn_count,
             "signature": snapshot.get("signature") or "",
@@ -346,6 +375,13 @@ def record_dream_job_status(store, job: Mapping[str, Any], *, status: str, now: 
         state["last_dream_organized_count"] = max(0, organized_count)
         state["last_dream_merged_count"] = max(0, merged_count)
         state["last_dreamed_card_count"] = max(0, _safe_int(stats.get("card_count"), 0))
+        state["last_dreamed_seed_card_count"] = max(
+            0,
+            _safe_int(
+                stats.get("seed_card_count"),
+                _safe_int(stats.get("card_count"), 0),
+            ),
+        )
         state["last_dreamed_turn_count"] = max(0, _safe_int(stats.get("turn_count"), 0))
         state["last_dream_signature"] = str(stats.get("signature") or until.get("signature") or "")[:240]
         state["last_dreamed_until"] = str(until.get("last_until") or "")[:240]

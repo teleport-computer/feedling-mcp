@@ -120,6 +120,41 @@ def test_runtime_health_level_red_on_high_failure_rate():
     assert any("失败率" in r for r in reasons)
 
 
+def test_runtime_health_level_guard_is_warning_not_hard_failure():
+    lane = _lane(
+        lane="heartbeat",
+        completed=90,
+        failed=10,
+        failure_rate=0.10,
+        operational_failures=0,
+        operational_failure_rate=0.0,
+        safety_suppressions=10,
+    )
+
+    level, reasons = _dt._runtime_health_level(_payload([lane]))
+
+    assert level == "warn"
+    assert any("安全抑制" in reason for reason in reasons)
+    assert not any("系统故障率" in reason for reason in reasons)
+
+
+def test_runtime_health_level_chat_keeps_user_impact_rate():
+    lane = _lane(
+        lane="chat",
+        completed=92,
+        failed=8,
+        failure_rate=0.08,
+        operational_failures=0,
+        operational_failure_rate=0.0,
+        control_outcomes=8,
+    )
+
+    level, reasons = _dt._runtime_health_level(_payload([lane]))
+
+    assert level == "warn"
+    assert any("回复失败率" in reason for reason in reasons)
+
+
 def test_runtime_health_level_red_on_missing_trajectory():
     # 漏写没有「轻微」档：一条就是数据缺口
     level, reasons = _dt._runtime_health_level(
@@ -193,6 +228,69 @@ def test_runtime_health_level_takes_worst_across_lanes():
         _lane(lane="heartbeat", failure_rate=0.9, failed=9, completed=1),
     ]))
     assert level == "bad"
+
+
+def test_runtime_split_keeps_service_green_when_execution_is_bad():
+    payload = _payload([
+        _lane(failure_rate=0.40, failed=40, completed=60),
+    ])
+
+    service_level, service_reasons = _dt._runtime_service_level(payload, {})
+    execution_level, execution_reasons = _dt._runtime_execution_level(payload)
+
+    assert (service_level, service_reasons) == ("ok", [])
+    assert execution_level == "bad"
+    assert any("失败率" in reason for reason in execution_reasons)
+
+
+def test_runtime_mcp_window_failures_affect_execution_not_current_service():
+    payload = _payload()
+    delivery = {
+        "effect_outbox": {"pending": 0, "oldest_pending_age_sec": None},
+        "terminal_failure_outbox": {
+            "status_undelivered": 0,
+            "runtime_error_undelivered": 0,
+            "oldest_undelivered_age_sec": None,
+        },
+        "mcp_mutation": {"unknown": 1, "unresolved": 2},
+    }
+
+    service_level, service_reasons = _dt._runtime_service_level(payload, delivery)
+    execution_level, execution_reasons = _dt._runtime_execution_level(
+        payload, delivery
+    )
+
+    assert (service_level, service_reasons) == ("ok", [])
+    assert execution_level == "warn"
+    assert "MCP 结果未知 1 次" in execution_reasons
+    assert "MCP 悬空 2 次" in execution_reasons
+
+
+def test_runtime_service_is_bad_when_live_workers_have_zero_capacity():
+    level, reasons = _dt._runtime_service_level(
+        _payload(live_workers=1, capacity=0)
+    )
+
+    assert level == "bad"
+    assert "无可执行槽位" in reasons
+
+
+def test_runtime_split_keeps_trajectory_out_of_execution_quality():
+    payload = _payload([
+        _lane(capture={
+            "terminal_seen_no_gap": 99,
+            "partial": 0,
+            "missing": 1,
+            "open": 0,
+        }),
+    ])
+
+    execution_level, execution_reasons = _dt._runtime_execution_level(payload)
+    trajectory_level, trajectory_reasons = _dt._runtime_trajectory_level(payload)
+
+    assert (execution_level, execution_reasons) == ("ok", [])
+    assert trajectory_level == "bad"
+    assert any("漏写 1 条" in reason for reason in trajectory_reasons)
 
 
 def test_runtime_failure_code_keeps_known_enumerations():
@@ -332,6 +430,48 @@ def test_render_runtime_health_page_shows_conclusion_and_lanes(bound_request):
     assert "Worker 池" in html_out
 
 
+def test_render_runtime_health_page_warns_service_when_delivery_is_missing(
+    bound_request,
+):
+    html_out = _dt._render_runtime_health_page(
+        _payload(),
+        delivery=None,
+    )
+    start = html_out.index("当前可服务")
+    section_start = html_out.rindex("<section", 0, start)
+    section_end = html_out.index("</section>", start)
+    service_card = html_out[section_start:section_end]
+
+    assert "health-dimension warn" in service_card
+    assert "注意" in service_card
+    assert "交付数据暂不可用" in service_card
+    assert '综合告警档位（取三项最差）：<span class="warn">注意</span>' in html_out
+
+
+def test_render_runtime_health_page_places_mcp_window_warning_in_execution_card(
+    bound_request,
+):
+    html_out = _dt._render_runtime_health_page(
+        _payload(),
+        delivery={
+            "effect_outbox": {"pending": 0, "oldest_pending_age_sec": None},
+            "terminal_failure_outbox": {
+                "status_undelivered": 0,
+                "runtime_error_undelivered": 0,
+                "oldest_undelivered_age_sec": None,
+            },
+            "mcp_mutation": {"unknown": 1, "unresolved": 0},
+        },
+    )
+    service_start = html_out.index("当前可服务")
+    service_end = html_out.index("</section>", service_start)
+    execution_start = html_out.index("近 24h 运行质量")
+    execution_end = html_out.index("</section>", execution_start)
+
+    assert "MCP 结果未知" not in html_out[service_start:service_end]
+    assert "MCP 结果未知 1 次" in html_out[execution_start:execution_end]
+
+
 def test_render_runtime_health_page_renders_na_not_fake_zero(bound_request):
     html_out = _dt._render_runtime_health_page(_payload([_lane(
         sampled_jobs=0, completed=0, failure_rate=None,
@@ -406,23 +546,23 @@ def test_render_runtime_health_page_failure_rate_three_tiers(bound_request):
 
 
 def test_render_runtime_health_page_uses_bad_class_for_bad_conclusion(bound_request):
-    # I-1: level="bad" 曾被映射到 CSS class "warn"，页顶总体结论永远不会真正
+    # I-1: level="bad" 曾被映射到 CSS class "warn"，页顶综合告警档位永远不会真正
     # 变红——100% 失败率与 6% 失败率在页顶显示成同一个橙色。
     html_out = _dt._render_runtime_health_page(_payload([
         _lane(failure_rate=1.0, failed=20, completed=0),
     ]))
     assert "<span class=\"bad\">" in html_out or "<span class='bad'>" in html_out
-    assert "总体结论" in html_out
+    assert "综合告警档位（取三项最差）" in html_out
     # 不应该把 bad 结论渲染成 warn class
     import re as _re
-    m = _re.search(r"总体结论：<span class=\"([a-z]+)\">", html_out)
+    m = _re.search(r"综合告警档位（取三项最差）：<span class=\"([a-z]+)\">", html_out)
     assert m is not None, html_out
     assert m.group(1) == "bad"
 
 
 def test_render_runtime_health_page_does_not_claim_ok_when_wedged(bound_request):
     # I-3: reviewer 实证——lane 全部 job 在飞（无 pending，worker 心跳还活着），
-    # 页面之前会显示「这不是故障」+ 总体结论「正常」。这是本分支专门要修的洞:
+    # 页面之前会显示「这不是故障」+ 综合告警档位「正常」。这是本分支专门要修的洞:
     # 数据在页面上，但人被页面告知没事。
     html_out = _dt._render_runtime_health_page(_payload([_lane(
         sampled_jobs=0, completed=0, failed=0, expired=0,
@@ -430,7 +570,7 @@ def test_render_runtime_health_page_does_not_claim_ok_when_wedged(bound_request)
         capture={"terminal_seen_no_gap": 0, "partial": 0, "missing": 0, "open": 57},
     )], inflight=57, capacity=8))
     assert "这不是故障" not in html_out
-    # 断言总体结论那个元素，而不是全页搜「正常」：这两个字会合法地出现在说明
+    # 断言综合告警档位那个元素，而不是全页搜「正常」：这两个字会合法地出现在说明
     # 文字里（例如"高吞吐下瞬时积压是正常的"），全页搜会把无关的散文当成回归。
     # 收紧后仍然抓得住原 bug——档位若是 ok，结论就会渲染成 >正常</span>。
     assert ">正常</span>" not in html_out
@@ -478,6 +618,20 @@ def test_runtime_view_falls_back_on_invalid_hours(client, monkeypatch):
     assert seen["within_hours"] == 24
     client.get("/admin/data-track?view=runtime&hours=168", headers=_admin_headers())
     assert seen["within_hours"] == 168
+
+
+def test_runtime_window_links_drop_users_only_runtime_state(client, monkeypatch):
+    monkeypatch.setattr(_dt, "_runtime_health_summary", _fake_summary)
+    page = client.get(
+        "/admin/data-track?view=runtime&hours=24&runtime_state=v2",
+        headers=_admin_headers(),
+    ).get_data(as_text=True).replace("&amp;", "&")
+
+    assert "view=runtime&hours=168" in page
+    assert "view=runtime&hours=720" in page
+    assert "view=runtime&hours=168&runtime_state=" not in page
+    assert "view=runtime&hours=168&runtime_state=v2" not in page
+    assert "view=runtime&hours=720&runtime_state=v2" not in page
 
 
 def test_runtime_view_requires_admin(client):
@@ -600,7 +754,8 @@ def test_render_runtime_health_page_token_columns_are_dash_without_data(bound_re
     # 精确断言：chat 行的 token / 缓存命中 / 上报覆盖 三列都渲染成 muted 的 —。
     # 只写 `assert "—" in html_out` 是无效断言——页面别处本来就有 —。
     # 数量是 3 而非 2：命中率与上报覆盖率已拆成两列（2026-07-30 审计）。
-    assert chat_row.count("<td class='muted'>—</td>") == 3
+    # 新增控制/抑制拆分后，旧 payload 对这两列也只能显示未知（—）。
+    assert chat_row.count("<td class='muted'>—</td>") == 5
     # maintenance 的数字绝不能串到 chat 行上
     assert "951.2k" not in chat_row
 
@@ -620,11 +775,10 @@ def test_render_runtime_health_page_includes_token_only_lane(bound_request):
     assert "87.3%" in row
     # 健康列（样本/成功/失败/过期/superseded/失败率/p50/p95/capture）没有
     # 任何数据来源——必须显 —，不得显 0（0 意味着"确认过是零"，这里是
-    # "压根没被健康查询看见"）。5 个 muted 的 — 来自 superseded/失败率/
-    # p50/p95/capture（这几列本来就带 muted class 或在无数据时切换成
-    # muted）；样本/成功/失败/过期四列不带 muted class，但内容也必须是 —
-    # 而非 0。
-    assert row.count("<td class='muted'>—</td>") == 5
+    # "压根没被健康查询看见"）。新表把控制/抑制与两种失败率拆开，故共有
+    # 7 个 muted dash；样本/成功/失败/过期/系统故障五列不带 muted class，
+    # 内容也必须是 — 而非 0。
+    assert row.count("<td class='muted'>—</td>") == 7
     assert "<td>—</td>" in row  # 样本/成功/失败/过期这几列（不带 muted class）
     assert ">0<" not in row and "0 / 0" not in row
 
@@ -633,8 +787,12 @@ def test_render_runtime_health_page_token_only_lane_does_not_affect_health_level
     # token-only 的合成行不该参与 _runtime_health_level 的判定——那是纯 job
     # 结局层面的判断，这条 lane 没有任何 job 结局信息可供判定。
     payload = _payload([_lane(lane="chat", failure_rate=0.0)])
-    html_out = _dt._render_runtime_health_page(payload, _tokens(lane_name="maintenance"))
-    assert "总体结论：<span class=\"ok\">正常</span>" in html_out
+    html_out = _dt._render_runtime_health_page(
+        payload,
+        _tokens(lane_name="maintenance"),
+        delivery={},
+    )
+    assert "综合告警档位（取三项最差）：<span class=\"ok\">正常</span>" in html_out
 
 
 def test_render_runtime_health_page_tolerates_missing_tokens_arg(bound_request):
@@ -653,7 +811,8 @@ def test_render_runtime_health_page_explains_token_scope(bound_request):
 def test_render_runtime_health_page_declares_window_difference(bound_request):
     # spec §6：两页口径不同必须写明，否则数字对不上会被当成 bug
     html_out = _dt._render_runtime_health_page(_payload(), _tokens())
-    assert "固定近 30 天" in html_out
+    assert "Token 与模型" in html_out
+    assert "默认近 30 天" in html_out
     assert "不是 bug" in html_out
 
 
@@ -773,8 +932,8 @@ def test_render_runtime_health_page_separates_two_coverages(bound_request):
 
 def test_render_runtime_health_page_coverage_columns_dash_without_data(bound_request):
     html_out = _dt._render_runtime_health_page(_payload(), _tokens(lane_name="other"))
-    # chat 行三列全无数据 → token 列 + 命中列 + 覆盖列各一个 muted dash
-    assert _lane_row_html(html_out, "chat").count("<td class='muted'>—</td>") == 3
+    # chat 行 token/命中/覆盖均未知；旧 payload 的控制/抑制列也未知。
+    assert _lane_row_html(html_out, "chat").count("<td class='muted'>—</td>") == 5
 
 
 def test_runtime_page_links_drop_params_it_ignores():
@@ -850,7 +1009,7 @@ def _delivery(**overrides) -> dict:
 
 def test_runtime_health_level_warns_on_trajectory_gap():
     # 回归测试（审计实证）：partial 此前完全不参与判定，于是页面同时显示"有 1 个
-    # partial"和总体结论"正常"。缺口是真实的取证损失，至少 warn。
+    # partial"和综合告警档位"正常"。缺口是真实的取证损失，至少 warn。
     level, reasons = _dt._runtime_health_level(
         _payload([_lane(capture={
             "terminal_seen_no_gap": 99, "partial": 1, "missing": 0, "open": 0,

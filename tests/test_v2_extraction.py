@@ -6,7 +6,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
 import pytest
 
-from model_api_runtime.v2 import extraction
+from model_api_runtime.v2 import extraction, worker
 
 
 def _env(inner):
@@ -61,6 +61,39 @@ def test_extract_returns_reason_on_provider_error(monkeypatch):
     assert parsed is None
     assert err.startswith("provider_call_failed:")
     assert seen == [None]
+
+
+@pytest.mark.parametrize(
+    ("status", "expected"),
+    [
+        (401, "auth_invalid"),
+        (402, "quota_insufficient"),
+        (404, "model_not_found"),
+        (429, "rate_limited"),
+        (503, "upstream_unavailable"),
+    ],
+)
+def test_extract_provider_failure_reason_is_stable_and_content_free(
+    monkeypatch, status, expected
+):
+    async def _boom(cfg, messages, **kw):
+        raise extraction.provider_client.ProviderError(
+            "secret upstream response body", status_code=status
+        )
+
+    monkeypatch.setattr(
+        extraction.provider_client, "reliable_chat_completion_async", _boom
+    )
+    parsed, err = asyncio.run(
+        extraction.extract(
+            provider_config=object(),
+            prompt="P",
+            parse=lambda raw: (["never"], None),
+        )
+    )
+    assert parsed is None
+    assert err == f"provider_call_failed:{expected}"
+    assert "secret" not in err
 
 
 def test_extract_returns_reason_on_parse_error(monkeypatch):
@@ -186,6 +219,192 @@ def test_extract_records_the_bounce_in_the_trajectory(monkeypatch):
     assert bounced == [{"reason": "invalid_card_content:content_empty"}]
 
 
+def test_extract_semantic_bounce_shares_the_one_retry_budget(monkeypatch):
+    fake, prompts = _stub_provider(["missing-target", "corrected"])
+    monkeypatch.setattr(
+        extraction.provider_client, "reliable_chat_completion_async", fake
+    )
+
+    def _parse(raw):
+        target = "mem_1" if raw == "corrected" else ""
+        return ([{"action": "supersede", "target_id": target}], None)
+
+    parsed, err = asyncio.run(
+        extraction.extract(
+            provider_config=object(),
+            prompt="P",
+            parse=_parse,
+            parse_retry=extraction.ParseRetry(
+                should_retry=lambda _e: False,
+                build_prompt=lambda prompt, _e: prompt,
+                parse=_parse,
+                semantic_reasons=lambda cards: (
+                    ["missing target"] if not cards[0].get("target_id") else []
+                ),
+                build_semantic_prompt=lambda prompt, _reasons: prompt + "|semantic",
+            ),
+        )
+    )
+    assert err is None
+    assert parsed[0]["target_id"] == "mem_1"
+    assert prompts == ["P", "P|semantic"]
+
+
+def test_extract_semantic_retry_keeps_valid_cards_when_full_batch_is_returned(
+    monkeypatch,
+):
+    fake, prompts = _stub_provider(["mixed", "corrected-full-batch"])
+    monkeypatch.setattr(
+        extraction.provider_client, "reliable_chat_completion_async", fake
+    )
+
+    def _parse(raw):
+        if raw == "mixed":
+            return (
+                [
+                    {"action": "add", "summary": "valid"},
+                    {"action": "supersede", "target_id": ""},
+                ],
+                None,
+            )
+        return (
+            [
+                {"action": "add", "summary": "valid"},
+                {"action": "supersede", "target_id": "mem_1"},
+            ],
+            None,
+        )
+
+    def _semantic_reasons(cards):
+        return [
+            "missing target"
+            for card in cards
+            if card.get("action") == "supersede" and not card.get("target_id")
+        ]
+
+    parsed, err = asyncio.run(
+        extraction.extract(
+            provider_config=object(),
+            prompt="P",
+            parse=_parse,
+            parse_retry=extraction.ParseRetry(
+                should_retry=lambda _e: False,
+                build_prompt=lambda prompt, _e: prompt,
+                parse=_parse,
+                semantic_reasons=_semantic_reasons,
+                build_semantic_prompt=lambda prompt, _reasons: prompt + "|semantic",
+            ),
+        )
+    )
+
+    assert err is None
+    assert parsed == [
+        {"action": "add", "summary": "valid"},
+        {"action": "supersede", "target_id": "mem_1"},
+    ]
+    assert prompts == ["P", "P|semantic"]
+
+
+def test_extract_does_not_issue_third_call_after_format_retry(monkeypatch):
+    fake, prompts = _stub_provider(["bad-format", "still-missing-target", "unused"])
+    monkeypatch.setattr(
+        extraction.provider_client, "reliable_chat_completion_async", fake
+    )
+
+    parsed, err = asyncio.run(
+        extraction.extract(
+            provider_config=object(),
+            prompt="P",
+            parse=lambda _raw: (None, "invalid_card_content:summary_empty"),
+            parse_retry=extraction.ParseRetry(
+                should_retry=lambda _e: True,
+                build_prompt=lambda prompt, _e: prompt + "|format",
+                parse=lambda _raw: ([{"action": "supersede", "target_id": ""}], None),
+                semantic_reasons=lambda cards: (
+                    ["missing target"] if not cards[0].get("target_id") else []
+                ),
+                build_semantic_prompt=lambda prompt, _reasons: prompt + "|semantic",
+            ),
+        )
+    )
+    assert parsed is None
+    assert err == "semantic_validation_failed_after_retry"
+    assert prompts == ["P", "P|format"]
+
+
+def test_extraction_failure_codes_are_allowlisted_and_drop_raw_details():
+    assert worker._extraction_failure_code(
+        RuntimeError("provider_call_failed:quota_insufficient")
+    ) == "extraction_failed:quota_insufficient"
+    assert worker._extraction_failure_code(
+        RuntimeError("provider_call_failed:sk-live-secret")
+    ) == "extraction_failed:unknown"
+    assert worker._extraction_failure_code(
+        RuntimeError("json_decode_error:JSONDecodeError")
+    ) == "extraction_failed:json_decode_error"
+    assert worker._extraction_failure_code(
+        RuntimeError("extraction_memory_write_rejected:private-db-detail")
+    ) == "extraction_failed:memory_write_rejected"
+
+
+def test_extract_provider_reason_records_failure_not_false_success(monkeypatch):
+    async def _failed_extract(**_kwargs):
+        return None, "provider_call_failed:rate_limited"
+
+    events = []
+
+    async def _failure(user_id, error_class):
+        events.append(("failure", user_id, error_class))
+
+    async def _success(user_id, *, latency_ms=None):
+        events.append(("success", user_id, latency_ms))
+
+    monkeypatch.setattr(extraction, "extract", _failed_extract)
+    monkeypatch.setattr(worker, "_record_provider_failure_class", _failure)
+    monkeypatch.setattr(worker, "_record_provider_success", _success)
+    result = asyncio.run(
+        worker._extract_with_provider_health("u_provider", prompt="P")
+    )
+    assert result == (None, "provider_call_failed:rate_limited")
+    assert events == [("failure", "u_provider", "rate_limited")]
+
+
+def test_extract_empty_reply_records_route_success(monkeypatch):
+    async def _empty_extract(**_kwargs):
+        return None, "empty_reply"
+
+    events = []
+
+    async def _failure(user_id, error_class):
+        events.append(("failure", user_id, error_class))
+
+    async def _success(user_id, *, latency_ms=None):
+        events.append(("success", user_id, latency_ms))
+
+    monkeypatch.setattr(extraction, "extract", _empty_extract)
+    monkeypatch.setattr(worker, "_record_provider_failure_class", _failure)
+    monkeypatch.setattr(worker, "_record_provider_success", _success)
+    result = asyncio.run(
+        worker._extract_with_provider_health("u_provider", prompt="P")
+    )
+    assert result == (None, "empty_reply")
+    assert len(events) == 1
+    assert events[0][0:2] == ("success", "u_provider")
+
+
+def test_provider_health_uses_only_catalog_classes(monkeypatch):
+    seen = []
+
+    def _record(user_id, *, error_class):
+        seen.append((user_id, error_class))
+
+    monkeypatch.setattr(worker.provider_health, "record_failure", _record)
+    asyncio.run(
+        worker._record_provider_failure_class("u_provider", "provider_config")
+    )
+    assert seen == [("u_provider", "unknown")]
+
+
 # ---------- cards_to_actions ----------
 
 def test_cards_to_actions_add_and_supersede():
@@ -254,6 +473,7 @@ def test_consolidations_to_actions_supersedes_when_target_present():
         [{
             "op": "merge",
             "card_ids": ["m1", "m2"],
+            "rationale": "同一事件的两条记录",
             "result": {"summary": "merged", "content": "merged body"},
         }],
         occurred_at="T", source_ids=[], build_envelope=_env)
@@ -263,6 +483,156 @@ def test_consolidations_to_actions_supersedes_when_target_present():
     assert actions[0]["capture_mode"] == "memory_dream"
     assert actions[0]["envelope"]["type"] == "fact"
     assert actions[0]["envelope"]["occurred_at"] == "T"
+
+
+def _existing(memory_id, *, source="memory_capture", created_at="2026-07-01T00:00:00Z"):
+    return {
+        "id": memory_id,
+        "summary": f"{memory_id} 的旧摘要",
+        "content": f"{memory_id} 的旧卡正文，包含需要完整保留的具体事实。",
+        "source": source,
+        "created_at": created_at,
+    }
+
+
+def _merge(ids, *, content="合并后的正文包含两张旧卡的全部具体事实，并保留原始上下文。"):
+    return {
+        "op": "merge",
+        "card_ids": list(ids),
+        "rationale": "独立二审确认属于同一事件或同一线索的演进",
+        "_review_approved": True,
+        "_review_reason": "来源卡属于同一事件线索",
+        "result": {"summary": "合并摘要", "content": content},
+    }
+
+
+def test_dream_guard_has_no_quantity_cap_after_independent_review():
+    cards = [_existing(f"m{i}") for i in range(13)]
+    consolidations = [_merge([f"m{i}", f"m{i + 1}"]) for i in range(0, 12, 2)]
+
+    actions, _added, superseded = extraction.consolidations_to_actions(
+        consolidations,
+        occurred_at="2026-08-01T00:00:00Z",
+        source_ids=[],
+        build_envelope=_env,
+        existing_cards=cards,
+    )
+
+    assert len(actions) == 6
+    assert superseded == 12
+    touched = {memory_id for action in actions for memory_id in action["supersedes"]}
+    assert touched == {f"m{i}" for i in range(12)}
+    assert "m12" not in touched
+
+
+def test_dream_guard_rejects_unknown_and_overlapping_targets():
+    cards = [_existing("m1"), _existing("m2"), _existing("m3")]
+    actions, _added, superseded = extraction.consolidations_to_actions(
+        [
+            _merge(["m1", "m2"]),
+            _merge(["m2", "m3"]),
+            _merge(["missing", "m3"]),
+        ],
+        occurred_at="2026-08-01T00:00:00Z",
+        source_ids=[],
+        build_envelope=_env,
+        existing_cards=cards,
+    )
+
+    assert len(actions) == 1
+    assert actions[0]["supersedes"] == ["m1", "m2"]
+    assert superseded == 2
+
+
+def test_dream_guard_rejects_lossy_one_to_one_rewrite():
+    card = _existing("m1")
+    actions, added, superseded = extraction.consolidations_to_actions(
+        [{"op": "thicken", "card_ids": ["m1"],
+          "rationale": "同一卡片补充细节", "_review_approved": True, "result": {
+            "summary": "改写摘要", "content": "更短的改写。",
+        }}],
+        occurred_at="2026-08-01T00:00:00Z",
+        source_ids=[],
+        build_envelope=_env,
+        existing_cards=[card],
+    )
+
+    assert (actions, added, superseded) == ([], 0, 0)
+
+
+def test_dream_guard_accepts_one_to_one_only_with_substantive_increment():
+    card = _existing("m1")
+    new_detail = (
+        card["content"]
+        + " 新增事实：从 2026 年 7 月起固定使用浅烘豆，并记录了研磨刻度、水粉比和冲煮时长。"
+    )
+    actions, _added, superseded = extraction.consolidations_to_actions(
+        [{"op": "thicken", "card_ids": ["m1"],
+          "rationale": "同一卡片补充新的冲煮事实", "_review_approved": True, "result": {
+            "summary": card["summary"], "content": new_detail,
+        }}],
+        occurred_at="2026-08-01T00:00:00Z",
+        source_ids=[],
+        build_envelope=_env,
+        existing_cards=[card],
+    )
+
+    assert len(actions) == 1
+    assert superseded == 1
+
+
+def test_dream_guard_allows_prior_run_dream_output_to_evolve_immediately():
+    fresh = _existing(
+        "dream-new",
+        source="memory_dream",
+        created_at="2026-07-30T00:00:00Z",
+    )
+    other = _existing("m2")
+    actions, added, superseded = extraction.consolidations_to_actions(
+        [_merge(["dream-new", "m2"])],
+        occurred_at="2026-08-01T00:00:00Z",
+        source_ids=[],
+        build_envelope=_env,
+        existing_cards=[fresh, other],
+    )
+
+    assert added == 0 and superseded == 2
+    assert len(actions) == 1
+
+
+def test_dream_guard_accepts_low_text_overlap_evolution_after_review():
+    cards = [
+        {"id": "plan", "summary": "想去京都看红叶", "content": "希望今年秋天成行。"},
+        {"id": "ticket", "summary": "已经订好机票", "content": "11 月飞往关西机场。"},
+    ]
+
+    actions, _added, superseded = extraction.consolidations_to_actions(
+        [_merge(["plan", "ticket"], content="京都计划已从意向推进到 11 月出票。")],
+        occurred_at="2026-08-03T00:00:00Z",
+        source_ids=[],
+        build_envelope=_env,
+        existing_cards=cards,
+    )
+
+    assert len(actions) == 1 and superseded == 2
+
+
+def test_dream_guard_rejects_unreviewed_or_rationale_free_proposal():
+    cards = [_existing("m1"), _existing("m2")]
+    unreviewed = _merge(["m1", "m2"])
+    unreviewed.pop("_review_approved")
+    no_rationale = _merge(["m1", "m2"])
+    no_rationale["rationale"] = ""
+
+    for proposal in (unreviewed, no_rationale):
+        actions, added, superseded = extraction.consolidations_to_actions(
+            [proposal],
+            occurred_at="2026-08-03T00:00:00Z",
+            source_ids=[],
+            build_envelope=_env,
+            existing_cards=cards,
+        )
+        assert (actions, added, superseded) == ([], 0, 0)
 
 
 def test_nonempty_actions_require_occurred_at():

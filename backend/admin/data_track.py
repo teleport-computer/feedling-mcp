@@ -6,7 +6,7 @@ import math
 import re
 import time
 from datetime import date, datetime, timedelta, timezone
-from zoneinfo import ZoneInfo
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from urllib.parse import parse_qs, quote
 
@@ -100,6 +100,7 @@ def _data_track_qs(**updates) -> str:
         "admin_key", "since", "registered_since", "q", "limit", "offset", "sort",
         "dir", "view", "days", "user_id", "subsystem", "status", "trace_id",
         "mode", "reveal", "page", "event", "day", "events_limit", "hours",
+        "runtime_state",
     ):
         value = request.args.get(key, "").strip()
         if value:
@@ -1090,6 +1091,7 @@ def _effective_responder(
 
     return {
         "effective_responder": effective,
+        "runtime_state": runtime_state,
         "basis": basis,
         "mismatch": bool(mismatch_reasons),
         "mismatch_reasons": mismatch_reasons,
@@ -1622,8 +1624,14 @@ def _data_track_request_filters() -> dict:
     if raw_dir not in {"asc", "desc"}:
         raw_dir = "desc"
     raw_view = (request.args.get("view") or "users").strip().lower()
-    if raw_view not in {"users", "dau", "proactive", "debug", "events", "runtime"}:
+    if raw_view not in {
+        "users", "dau", "growth", "proactive", "debug", "events",
+        "overview", "imports", "chat", "latency", "runtime", "usage",
+    }:
         raw_view = "users"
+    raw_runtime_state = (request.args.get("runtime_state") or "").strip().lower()
+    if raw_runtime_state not in {"", "v2", "draining", "resident"}:
+        raw_runtime_state = ""
 
     def read_int(name: str, default: int, minimum: int, maximum: int) -> int:
         try:
@@ -1641,6 +1649,7 @@ def _data_track_request_filters() -> dict:
         "limit": read_int("limit", 100, 1, 500),
         "offset": read_int("offset", 0, 0, 1_000_000),
         "view": raw_view,
+        "runtime_state": raw_runtime_state,
         "days": read_int("days", 30, 1, 1000),
     }
 
@@ -1667,11 +1676,24 @@ def _data_track_apply_text_filter(rows: list[dict], q: str) -> list[dict]:
             str(row.get("route") or ""),
             str(row.get("archive_language") or ""),
             str(row.get("onboarding", {}).get("stage") or ""),
+            str(row.get("responder", {}).get("runtime_state") or ""),
+            str(row.get("responder", {}).get("effective_responder") or ""),
             " ".join(row.get("access", {}).get("connected_modes") or []),
         ]).lower()
         if needle in hay:
             out.append(row)
     return out
+
+
+def _data_track_apply_runtime_filter(rows: list[dict], runtime_state: str) -> list[dict]:
+    selected = str(runtime_state or "").strip().lower()
+    if not selected:
+        return rows
+    return [
+        row for row in rows
+        if str((row.get("responder") or {}).get("runtime_state") or "resident")
+        .strip().lower() == selected
+    ]
 
 
 def _data_track_sort_rows(rows: list[dict], sort_key: str, direction: str) -> None:
@@ -1757,6 +1779,9 @@ def _data_track_payload(*, include_users: bool = True, include_detail_user: str 
             }
         )
         rows.append(row)
+    rows = _data_track_apply_runtime_filter(
+        rows, str(filters.get("runtime_state") or "")
+    )
     rows = _data_track_apply_text_filter(rows, str(filters.get("q") or ""))
     _data_track_sort_rows(rows, str(filters.get("sort") or ""), str(filters.get("dir") or "desc"))
     completed = sum(1 for r in rows if r["onboarding"]["passing"])
@@ -1788,11 +1813,19 @@ def _data_track_payload(*, include_users: bool = True, include_detail_user: str 
     # is expected (see analytics-app-session-end.md); this is a slight lower bound.
     au_fg_total = au_sessions_total = au_users_active = au_dau_today = 0
     provider_needs_user_action = 0
+    runtime_state_counts: dict[str, int] = {}
+    activated_runtime_state_counts: dict[str, int] = {}
     for row in rows:
         stage = row["onboarding"]["stage"]
         route = row["route"]
         stage_counts[stage] = stage_counts.get(stage, 0) + 1
         route_counts[route] = route_counts.get(route, 0) + 1
+        runtime_state = str(
+            (row.get("responder") or {}).get("runtime_state") or "resident"
+        ).strip().lower()
+        runtime_state_counts[runtime_state] = (
+            runtime_state_counts.get(runtime_state, 0) + 1
+        )
         for mode in row.get("access", {}).get("connected_modes", []):
             access_mode_counts[mode] = access_mode_counts.get(mode, 0) + 1
         chat_total += row["chat"]["total"]
@@ -1812,6 +1845,9 @@ def _data_track_payload(*, include_users: bool = True, include_detail_user: str 
         if is_activated:
             activated += 1
             activated_route_counts[route] = activated_route_counts.get(route, 0) + 1
+            activated_runtime_state_counts[runtime_state] = (
+                activated_runtime_state_counts.get(runtime_state, 0) + 1
+            )
         # Connection health only meaningful for users who actually use it.
         if is_activated:
             cstatus = (row.get("connection") or {}).get("status")
@@ -1877,6 +1913,8 @@ def _data_track_payload(*, include_users: bool = True, include_detail_user: str 
         },
         "stage_counts": stage_counts,
         "route_counts": route_counts,
+        "runtime_state_counts": runtime_state_counts,
+        "activated_runtime_state_counts": activated_runtime_state_counts,
         "activated_route_counts": activated_route_counts,
         "access_mode_counts": access_mode_counts,
         "principals_total": len(set(r.get("principal_id") or r.get("user_id") for r in rows)),
@@ -1903,6 +1941,7 @@ def _data_track_payload(*, include_users: bool = True, include_detail_user: str 
             "q": filters.get("q", ""),
             "sort": filters.get("sort", ""),
             "dir": filters.get("dir", "desc"),
+            "runtime_state": filters.get("runtime_state", ""),
         },
     }
     if include_users:
@@ -2520,7 +2559,13 @@ _RUNTIME_HEALTH_WINDOWS = (24, 168, 720)
 # `?view=runtime&day=2026-07-25` 的截图当成"7 月 25 日的数据"，而页面渲染的其实是
 # 生成时刻向前 24 小时——参数被静默忽略比参数报错危险，因为页顶还写着「窗口 24
 # 小时」，读者不会怀疑自己看错了日期。本页自己生成的链接一律把它们清掉。
-_RUNTIME_IGNORED_PARAMS = {"day": None, "limit": None, "offset": None, "page": None}
+_RUNTIME_IGNORED_PARAMS = {
+    "day": None,
+    "limit": None,
+    "offset": None,
+    "page": None,
+    "runtime_state": None,
+}
 _RUNTIME_HEALTH_FAILURE_WARN = 0.05
 _RUNTIME_HEALTH_FAILURE_BAD = 0.15
 _RUNTIME_HEALTH_P95_WARN_MS = 60_000
@@ -2544,6 +2589,19 @@ _RUNTIME_FAILURE_CODE_MAX = 64
 # 是照 jobs_store._TERMINAL_ERROR_CODE_RE（那个更宽松的 `:`/`-` 全字符集是给
 # outbox 用的，admin 层不 import model_api_runtime，故在此单独定义）。
 _RUNTIME_FAILURE_CODE_RE = re.compile(r"^[a-z0-9_]+(:[a-z0-9_]+)?$")
+_RUNTIME_ERROR_CLASS_RE = re.compile(r"^[a-z0-9_]{1,64}$")
+
+
+def _runtime_operational_rate(lane: dict):
+    """Hard runtime/provider/timeout rate, with backwards-compatible fallback.
+
+    Old/self-host payload producers do not yet emit ``operational_failure_rate``;
+    for those, retaining the raw failure rate is safer than silently turning the
+    dashboard green.
+    """
+    if "operational_failure_rate" in lane:
+        return lane.get("operational_failure_rate")
+    return lane.get("failure_rate")
 
 
 def _runtime_failure_code(raw) -> str:
@@ -2586,12 +2644,26 @@ def _runtime_health_level(
     for lane in payload.get("lanes") or []:
         name = str(lane.get("lane") or "unknown")
         sampled = int(lane.get("sampled_jobs") or 0)
-        rate = lane.get("failure_rate")
+        rate = _runtime_operational_rate(lane)
         if rate is not None and sampled > 0:
             if rate >= _RUNTIME_HEALTH_FAILURE_BAD:
-                escalate("bad", f"{name} 失败率 {rate * 100:.0f}%")
+                escalate("bad", f"{name} 系统故障率 {rate * 100:.0f}%")
             elif rate >= _RUNTIME_HEALTH_FAILURE_WARN:
-                escalate("warn", f"{name} 失败率 {rate * 100:.0f}%")
+                escalate("warn", f"{name} 系统故障率 {rate * 100:.0f}%")
+
+        # Chat is the foreground user contract: every failed/expired terminal
+        # outcome matters even when the cause is an operator route change.  Keep
+        # that user-impact signal next to (not folded into) system attribution.
+        raw_rate = lane.get("failure_rate")
+        if name == "chat" and raw_rate is not None and sampled > 0:
+            if raw_rate >= _RUNTIME_HEALTH_FAILURE_BAD:
+                escalate("bad", f"chat 回复失败率（终态未成功）{raw_rate * 100:.0f}%")
+            elif raw_rate >= _RUNTIME_HEALTH_FAILURE_WARN:
+                escalate("warn", f"chat 回复失败率（终态未成功）{raw_rate * 100:.0f}%")
+
+        suppressed = int(lane.get("safety_suppressions") or 0)
+        if suppressed:
+            escalate("warn", f"{name} 安全抑制 {suppressed} 次（模型输出质量）")
 
         p95 = lane.get("p95_ok_ms")
         if p95 is not None:
@@ -2605,7 +2677,7 @@ def _runtime_health_level(
             escalate("bad", f"{name} trajectory capture missing {missing} 条")
 
         # partial 此前完全不参与判定：只有 missing 才降级，于是一个带 capture_gap
-        # 的回合（轨迹有洞、无法完整回放）在页面上既显示了 partial 计数、总体结论
+        # 的回合（轨迹有洞、无法完整回放）在页面上既显示了 partial 计数、综合告警档位
         # 又写「正常」。2026-07-30 审计实证了这个组合的危害——截图里明明有 1 个
         # partial，读者看到的结论是绿的。缺口是真实的取证损失，至少 warn。
         partial = int((lane.get("capture") or {}).get("partial") or 0)
@@ -2670,6 +2742,132 @@ def _runtime_health_level(
         if unresolved > 0:
             escalate("warn", f"MCP 远端改动悬空未判定 {unresolved} 次")
 
+    return worst, reasons
+
+
+def _runtime_split_level() -> tuple[dict[str, int], list[str], str]:
+    """Small shared state for the three operator-facing Runtime dimensions."""
+    return {"ok": 0, "warn": 1, "bad": 2}, [], "ok"
+
+
+def _runtime_service_level(
+    payload: dict, delivery: dict | None = None
+) -> tuple[str, list[str]]:
+    """Current ability to claim and deliver work, independent of history window."""
+    rank, reasons, worst = _runtime_split_level()
+
+    def escalate(level: str, reason: str) -> None:
+        nonlocal worst
+        if rank[level] > rank[worst]:
+            worst = level
+        if level != "ok":
+            reasons.append(reason)
+
+    pool = payload.get("pool") or {}
+    live_workers = int(pool.get("live_workers") or 0)
+    capacity = int(pool.get("capacity") or 0)
+    if live_workers <= 0:
+        escalate("bad", "无存活 worker")
+    elif capacity <= 0:
+        escalate("bad", "无可执行槽位")
+    inflight = int(pool.get("inflight") or 0)
+    if inflight > capacity:
+        escalate("bad", f"在飞 {inflight} 超过容量 {capacity}")
+    pending_age = pool.get("oldest_pending_age_sec")
+    if pending_age is not None:
+        if pending_age >= _RUNTIME_HEALTH_PENDING_BAD_SEC:
+            escalate("bad", f"最老 pending {pending_age / 60:.0f} 分钟")
+        elif pending_age >= _RUNTIME_HEALTH_PENDING_WARN_SEC:
+            escalate("warn", f"最老 pending {pending_age:.0f} 秒")
+
+    if delivery:
+        def delivery_age(label: str, value) -> None:
+            if value is None:
+                return
+            if value >= _RUNTIME_DELIVERY_AGE_BAD_SEC:
+                escalate("bad", f"{label}堵塞 {value / 3600:.1f} 小时")
+            elif value >= _RUNTIME_DELIVERY_AGE_WARN_SEC:
+                escalate("warn", f"{label}堵塞 {value / 60:.0f} 分钟")
+
+        effect = delivery.get("effect_outbox") or {}
+        delivery_age("副作用 outbox", effect.get("oldest_pending_age_sec"))
+        failure = delivery.get("terminal_failure_outbox") or {}
+        delivery_age(
+            "终态失败投递", failure.get("oldest_undelivered_age_sec")
+        )
+    return worst, reasons
+
+
+def _runtime_execution_level(
+    payload: dict, delivery: dict | None = None
+) -> tuple[str, list[str]]:
+    """Historical success and latency quality for the selected window."""
+    rank, reasons, worst = _runtime_split_level()
+
+    def escalate(level: str, reason: str) -> None:
+        nonlocal worst
+        if rank[level] > rank[worst]:
+            worst = level
+        if level != "ok":
+            reasons.append(reason)
+
+    for lane in payload.get("lanes") or []:
+        name = str(lane.get("lane") or "unknown")
+        sampled = int(lane.get("sampled_jobs") or 0)
+        rate = _runtime_operational_rate(lane)
+        if rate is not None and sampled > 0:
+            if rate >= _RUNTIME_HEALTH_FAILURE_BAD:
+                escalate("bad", f"{name} 系统故障率 {rate * 100:.0f}%")
+            elif rate >= _RUNTIME_HEALTH_FAILURE_WARN:
+                escalate("warn", f"{name} 系统故障率 {rate * 100:.0f}%")
+        raw_rate = lane.get("failure_rate")
+        if name == "chat" and raw_rate is not None and sampled > 0:
+            if raw_rate >= _RUNTIME_HEALTH_FAILURE_BAD:
+                escalate("bad", f"chat 回复失败率（终态未成功）{raw_rate * 100:.0f}%")
+            elif raw_rate >= _RUNTIME_HEALTH_FAILURE_WARN:
+                escalate("warn", f"chat 回复失败率（终态未成功）{raw_rate * 100:.0f}%")
+        suppressed = int(lane.get("safety_suppressions") or 0)
+        if suppressed:
+            escalate("warn", f"{name} 安全抑制 {suppressed} 次（模型输出质量）")
+        p95 = lane.get("p95_ok_ms")
+        if p95 is not None:
+            if p95 >= _RUNTIME_HEALTH_P95_BAD_MS:
+                escalate("bad", f"{name} p95 {p95 / 1000:.0f}s")
+            elif p95 >= _RUNTIME_HEALTH_P95_WARN_MS:
+                escalate("warn", f"{name} p95 {p95 / 1000:.0f}s")
+        open_count = int((lane.get("capture") or {}).get("open") or 0)
+        if sampled == 0 and open_count > 0:
+            escalate("warn", f"{name} {open_count} 个在飞回合无终态")
+    mutation = (delivery or {}).get("mcp_mutation") or {}
+    unknown = int(mutation.get("unknown") or 0)
+    unresolved = int(mutation.get("unresolved") or 0)
+    if unknown:
+        escalate("warn", f"MCP 结果未知 {unknown} 次")
+    if unresolved:
+        escalate("warn", f"MCP 悬空 {unresolved} 次")
+    return worst, reasons
+
+
+def _runtime_trajectory_level(payload: dict) -> tuple[str, list[str]]:
+    """Historical replay/forensics completeness for the selected window."""
+    rank, reasons, worst = _runtime_split_level()
+
+    def escalate(level: str, reason: str) -> None:
+        nonlocal worst
+        if rank[level] > rank[worst]:
+            worst = level
+        if level != "ok":
+            reasons.append(reason)
+
+    for lane in payload.get("lanes") or []:
+        name = str(lane.get("lane") or "unknown")
+        capture = lane.get("capture") or {}
+        missing = int(capture.get("missing") or 0)
+        partial = int(capture.get("partial") or 0)
+        if missing:
+            escalate("bad", f"{name} 漏写 {missing} 条")
+        if partial:
+            escalate("warn", f"{name} 有缺口 {partial} 条")
     return worst, reasons
 
 
@@ -2843,18 +3041,18 @@ def _render_runtime_user_report(user_report: dict | None) -> str:
     计数才跟随所选窗口。所有内容、prompt、reply 与 outbox payload 均不渲染。
     Token / model 分析已移到独立的 <b>Usage / 模型用量</b> 页。
   </div>
-  <table class="runtime-user-delivery">
+  <div class="table-wrap"><table class="runtime-user-delivery">
     <thead><tr><th>User</th><th>Reliability</th><th>Reply effects</th><th>Status effects</th><th>All effects</th><th>Failure reply/status/error</th><th>Oldest unfinished</th></tr></thead>
     <tbody>{delivery_rows}</tbody>
-  </table>
+  </table></div>
 </section>"""
 
 
-# 本次新增的两个 Runtime 视图页共用这一份样式。刻意没有去改造既有 6 个视图页
-# 各自内联的 style——那是独立重构，不该混在功能改动里。
+# Runtime 视图共用这一份样式；其余视图仍保留各自布局，但统一使用同一组
+# sage / paper 基础色，避免红色同时表示“当前选中”和“故障”。
 # 普通字符串（非 f-string），花括号无需转义。
 _RUNTIME_PAGE_CSS = """
-    :root { color-scheme: light; --fg:#191613; --muted:#736963; --line:#e6ddd5; --bg:#fbf8f4; --card:#fffdfa; --accent:#b7352b; --ok:#1d7a4d; --warn:#a05a00; --bad:#b7352b; }
+    :root { color-scheme: light; --fg:#1b201d; --muted:#68706a; --line:#dddcd4; --bg:#f5f4ef; --card:#fcfbf8; --accent:#416b56; --ok:#1d7a4d; --warn:#a05a00; --bad:#b7352b; }
     body { margin:0; background:var(--bg); color:var(--fg); font:14px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; }
     main { max-width:1280px; margin:0 auto; padding:28px 24px 48px; }
     h1 { font-size:26px; margin:0 0 4px; }
@@ -2868,8 +3066,8 @@ _RUNTIME_PAGE_CSS = """
     .metric-value { font-size:24px; font-weight:700; }
     .metric-label { color:var(--muted); font-size:12px; text-transform:uppercase; letter-spacing:.08em; }
     .viewbar,.sortbar { display:flex; flex-wrap:wrap; gap:8px; align-items:center; margin:10px 0 18px; }
-    .sort-button { display:inline-flex; align-items:center; border:1px solid var(--line); border-radius:6px; padding:7px 10px; background:var(--card); color:var(--fg); font-size:13px; }
-    .sort-button.active { border-color:var(--accent); color:var(--accent); background:#fff1ed; }
+    .sort-button { display:inline-flex; min-height:44px; box-sizing:border-box; align-items:center; justify-content:center; border:1px solid var(--line); border-radius:6px; padding:9px 12px; background:var(--card); color:var(--fg); font-size:13px; }
+    .sort-button.active { border-color:var(--accent); color:var(--accent); background:#e7eee9; }
     .note-box { background:#fff8ef; border:1px solid #e8d8be; border-radius:8px; padding:12px 14px; margin:16px 0 4px; font-size:13px; line-height:1.6; color:#5a4d3c; }
     table { width:100%; border-collapse:collapse; background:var(--card); border:1px solid var(--line); border-radius:8px; overflow:hidden; margin-bottom:18px; }
     th,td { text-align:left; padding:10px 12px; border-bottom:1px solid var(--line); vertical-align:top; }
@@ -2881,6 +3079,37 @@ _RUNTIME_PAGE_CSS = """
     .pill.ok { color:var(--ok); background:#e7f3ed; }
     .pill.warn { color:var(--warn); background:#fff1db; }
     .pill.bad { color:var(--bad); background:#fff1ed; }
+    .health-strip { display:grid; grid-template-columns:repeat(3,1fr); gap:10px; margin:18px 0 8px; }
+    .health-dimension { min-width:0; padding:15px; background:var(--card); border:1px solid var(--line); border-radius:8px; }
+    .health-dimension.warn { background:#fff9ed; border-color:#ead7ad; }
+    .health-dimension.bad { background:#fff3f0; border-color:#e7c4bd; }
+    .dimension-top { display:flex; justify-content:space-between; align-items:center; gap:12px; font-weight:750; }
+    .dimension-detail { min-height:38px; margin-top:10px; font-size:13px; line-height:1.45; }
+    .dimension-scope { margin-top:8px; color:var(--muted); font-size:11px; line-height:1.4; }
+    .overall-summary { margin:12px 0 3px; color:var(--muted); font-size:13px; font-weight:650; }
+    .table-wrap { max-width:100%; overflow-x:auto; }
+    .ops-kicker { color:var(--accent); font-size:11px; font-weight:800; letter-spacing:.11em; text-transform:uppercase; }
+    .ops-window { display:flex; flex-wrap:wrap; align-items:center; gap:8px; margin:18px 0; }
+    .ops-window-label { margin-right:3px; color:var(--muted); font-size:12px; }
+    .ops-questions { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:10px; margin:18px 0 8px; }
+    .question-card { min-width:0; background:var(--card); border:1px solid var(--line); border-top:4px solid var(--line); border-radius:9px; padding:15px; }
+    .question-card.ok { border-top-color:var(--ok); background:#f7fbf8; }
+    .question-card.warn { border-top-color:var(--warn); background:#fffaf1; }
+    .question-card.bad { border-top-color:var(--bad); background:#fff5f2; }
+    .question-top { display:flex; align-items:flex-start; justify-content:space-between; gap:10px; }
+    .question-title { margin:0; color:var(--fg); font-size:14px; font-weight:780; }
+    .question-value { margin:16px 0 4px; color:var(--fg); font-size:28px; line-height:1; font-weight:780; font-variant-numeric:tabular-nums; }
+    .question-evidence { min-height:38px; color:var(--muted); font-size:12px; line-height:1.5; }
+    .funnel-line { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:1px; overflow:hidden; margin:15px 0; border:1px solid var(--line); border-radius:9px; background:var(--line); }
+    .funnel-step { background:var(--card); padding:14px; }
+    .funnel-step b { display:block; margin:4px 0; font-size:24px; font-variant-numeric:tabular-nums; }
+    .funnel-step span,.funnel-step small { display:block; color:var(--muted); }
+    .definition-line { max-width:82ch; margin:8px 0 18px; color:var(--muted); font-size:12px; }
+    .evidence-ok { color:var(--ok); font-weight:700; }
+    .evidence-warn { color:var(--warn); font-weight:700; }
+    .evidence-bad { color:var(--bad); font-weight:700; }
+    @media (max-width:940px) { .ops-questions { grid-template-columns:1fr 1fr; } }
+    @media (max-width:760px) { .health-strip,.ops-questions,.funnel-line { grid-template-columns:1fr; } }
 """
 
 
@@ -2900,7 +3129,20 @@ def _render_runtime_health_page(
     见 admin_core）：取不到时对应区块显「暂不可用」，不得把 None 渲染成 0——0
     是"确认过是零"。
     """
-    level, reasons = _runtime_health_level(payload, delivery)
+    service_level, service_reasons = _runtime_service_level(payload, delivery)
+    if delivery is None and service_level == "ok":
+        service_level = "warn"
+        service_reasons = ["交付数据暂不可用"]
+    execution_level, execution_reasons = _runtime_execution_level(
+        payload, delivery
+    )
+    trajectory_level, trajectory_reasons = _runtime_trajectory_level(payload)
+    split_rank = {"ok": 0, "warn": 1, "bad": 2}
+    level = max(
+        (service_level, execution_level, trajectory_level),
+        key=split_rank.__getitem__,
+    )
+    reasons = service_reasons + execution_reasons + trajectory_reasons
     window_hours = int(payload.get("window_hours") or 24)
     lanes = payload.get("lanes") or []
     pool = payload.get("pool") or {}
@@ -2929,7 +3171,11 @@ def _render_runtime_health_page(
                 "failed": None,
                 "expired": None,
                 "superseded": None,
+                "operational_failures": None,
+                "control_outcomes": None,
+                "safety_suppressions": None,
                 "failure_rate": None,
+                "operational_failure_rate": None,
                 "p50_ok_ms": None,
                 "p95_ok_ms": None,
                 "capture": None,
@@ -2941,6 +3187,41 @@ def _render_runtime_health_page(
     level_text = {"ok": "正常", "warn": "注意", "bad": "异常"}[level]
     level_cls = {"ok": "ok", "warn": "warn", "bad": "bad"}[level]
     reason_text = ("：" + "；".join(html.escape(r) for r in reasons)) if reasons else ""
+
+    def split_card(title: str, split_level: str, split_reasons: list[str], scope: str) -> str:
+        label = {"ok": "正常", "warn": "注意", "bad": "异常"}[split_level]
+        detail = "；".join(split_reasons[:3]) if split_reasons else "未发现触发阈值的信号"
+        if len(split_reasons) > 3:
+            detail += f"；另有 {len(split_reasons) - 3} 项"
+        return (
+            f"<section class='health-dimension {split_level}'>"
+            f"<div class='dimension-top'><span>{html.escape(title)}</span>"
+            f"<b class='pill {split_level}'>{html.escape(label)}</b></div>"
+            f"<div class='dimension-detail'>{html.escape(detail)}</div>"
+            f"<div class='dimension-scope'>{html.escape(scope)}</div>"
+            "</section>"
+        )
+
+    split_health = "<div class='health-strip'>" + "".join([
+        split_card(
+            "当前可服务",
+            service_level,
+            service_reasons,
+            "此刻的 worker、pending 与交付积压，不随窗口变化",
+        ),
+        split_card(
+            f"近 {window_hours}h 运行质量",
+            execution_level,
+            execution_reasons,
+            "所选窗口的失败率、成功 p95、无终态回合与 MCP 结果歧义",
+        ),
+        split_card(
+            f"近 {window_hours}h 轨迹可观测性",
+            trajectory_level,
+            trajectory_reasons,
+            "所选窗口的 trajectory 漏写与缺口",
+        ),
+    ]) + "</div>"
 
     window_labels = {24: "24 小时", 168: "7 天", 720: "30 天"}
     window_links = "".join(
@@ -3004,17 +3285,22 @@ def _render_runtime_health_page(
     lane_rows = []
     for lane in lanes:
         name = str(lane.get("lane") or "unknown")
-        rate = lane.get("failure_rate")
-        if rate is None:
-            rate_cell = "<td class='muted'>—</td>"
-        else:
+        raw_rate = lane.get("failure_rate")
+        operational_rate = _runtime_operational_rate(lane)
+
+        def _rate_cell(rate) -> str:
+            if rate is None:
+                return "<td class='muted'>—</td>"
             if rate >= _RUNTIME_HEALTH_FAILURE_BAD:
                 cls = "bad"
             elif rate >= _RUNTIME_HEALTH_FAILURE_WARN:
                 cls = "warn"
             else:
                 cls = "ok"
-            rate_cell = f"<td><span class='pill {cls}'>{rate * 100:.0f}%</span></td>"
+            return f"<td><span class='pill {cls}'>{rate * 100:.0f}%</span></td>"
+
+        raw_rate_cell = _rate_cell(raw_rate)
+        operational_rate_cell = _rate_cell(operational_rate)
         capture = lane.get("capture")
         if capture is None:
             # token-only 的合成行（I-2）：健康侧压根没见过这条 lane，捕获状态
@@ -3078,8 +3364,11 @@ def _render_runtime_health_page(
             f"<td>{_fmt_count(lane.get('completed'))}</td>"
             f"<td>{_fmt_count(lane.get('failed'))}</td>"
             f"<td>{_fmt_count(lane.get('expired'))}</td>"
-            f"<td class='muted'>{_fmt_count(lane.get('superseded'))}</td>"
-            + rate_cell
+            f"<td>{_fmt_count(lane.get('operational_failures'))}</td>"
+            f"<td class='muted'>{_fmt_count(lane.get('control_outcomes'))}</td>"
+            f"<td class='muted'>{_fmt_count(lane.get('safety_suppressions'))}</td>"
+            + raw_rate_cell
+            + operational_rate_cell
             + _ms_cell(lane.get("p50_ok_ms"))
             + _ms_cell(lane.get("p95_ok_ms"))
             + capture_cell
@@ -3096,15 +3385,38 @@ def _render_runtime_health_page(
         # 同一个桶（most commonly "other"），必须在渲染前按清洗后的码合并计数，
         # 否则会渲染成两行都叫 other（reviewer 实证：('other',3) 和
         # ('other',2) 两行，看起来像两个不同故障）。
-        merged: dict[str, int] = {}
+        merged: dict[tuple[str, str, str], int] = {}
         for item in lane.get("top_failures") or []:
             code = _runtime_failure_code(item.get("code"))
-            merged[code] = merged.get(code, 0) + int(item.get("count") or 0)
-        for code, count in sorted(merged.items(), key=lambda kv: kv[1], reverse=True):
+            outcome_class = str(item.get("outcome_class") or "operational_failure")
+            if outcome_class not in {
+                "operational_failure", "timeout", "control", "safety_suppression"
+            }:
+                outcome_class = "operational_failure"
+            error_class = str(item.get("error_class") or "")
+            if not _RUNTIME_ERROR_CLASS_RE.fullmatch(error_class):
+                error_class = ""
+            key = (code, outcome_class, error_class)
+            merged[key] = merged.get(key, 0) + int(item.get("count") or 0)
+        class_labels = {
+            "operational_failure": "执行故障",
+            "timeout": "超时 / 失活",
+            "control": "控制切流",
+            "safety_suppression": "安全抑制",
+        }
+        for (code, outcome_class, error_class), count in sorted(
+            merged.items(), key=lambda kv: kv[1], reverse=True
+        ):
+            error_class_html = (
+                html.escape(error_class)
+                if error_class else "<span class='muted'>—</span>"
+            )
             failure_rows.append(
                 "<tr>"
                 f"<td>{name}</td>"
+                f"<td>{class_labels[outcome_class]}</td>"
                 f"<td><code>{html.escape(code)}</code></td>"
+                f"<td>{error_class_html}</td>"
                 f"<td>{_fmt_count(count)}</td>"
                 "</tr>"
             )
@@ -3136,7 +3448,7 @@ def _render_runtime_health_page(
         )
 
     return f"""<!doctype html>
-<html>
+<html lang="zh-CN">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -3147,10 +3459,12 @@ def _render_runtime_health_page(
 <main>
   <h1>Runtime 健康</h1>
   <div class="muted">Generated {html.escape(_bj_iso(payload.get("generated_at")))}. Metadata only; encrypted content is not read or rendered.</div>
-  <h2>总体结论：<span class="{level_cls}">{html.escape(level_text)}</span></h2>
-  <div class="muted">窗口 {window_hours} 小时{reason_text}</div>
-  <div class="sortbar">{window_links}</div>
   {_render_data_track_view_nav("runtime")}
+  <div class="sortbar">{window_links}</div>
+  <h2>状态拆分</h2>
+  {split_health}
+  <div class="overall-summary">综合告警档位（取三项最差）：<span class="{level_cls}">{html.escape(level_text)}</span></div>
+  <div class="muted">用于兼容告警；当前能否服务请以第一张“当前可服务”卡为准。窗口 {window_hours} 小时{reason_text}</div>
   <div class="note-box">
     <b>口径分工：</b>本页是<b>运行时视角</b>——按 job 生命周期统计，窗口可切。
     「<b>Proactive 日报</b>」是产品视角——按天统计日报送达率。
@@ -3161,14 +3475,14 @@ def _render_runtime_health_page(
     健康列与 token 列<b>都是窗口内全量</b>，无采样上界——两者覆盖同一批样本，
     可以放在一行对账。
     prompt token 已包含 cache read/write，<b>不要与缓存列相加</b>，否则重复计数。
-    本页 token 跟随上方窗口；users 页「运营 Telemetry」固定近 30 天，
+    本页 token 跟随上方窗口；「Token 与模型」页默认近 30 天，
     两处数字不一致是<b>窗口不同</b>，不是 bug——切到 30 天时应当一致。
     「上报 usage/cache」是两种<b>不同</b>的覆盖率：前者指有多少次调用回报了 token
     usage、后者指有多少次回报了缓存指标，不要当成同一个数。
     捕获列的第一格是「<b>见终态·无缺口</b>」，它<b>不等于</b>轨迹完整：只表示找到了
     turn_terminal 事件且没有 capture_gap，不保证 prompt / provider 往返 / tool call
     / 最终回复这些 artifact 都在。有缺口（第二格）意味着<b>取证已经损失</b>，会把
-    总体结论压到「注意」。
+    综合告警档位压到「注意」。
     <b>覆盖范围：</b>本页只统计<b>本实例托管</b>的 Runtime V2 回合。self-host
     consumer 只会 best-effort 上报部分 provider-attempt 元数据，离线实例完全不可见
     ——所以本页的 token 与失败率<b>不是全体用户的总量</b>，不能当作全量用量账。
@@ -3185,19 +3499,20 @@ def _render_runtime_health_page(
   后再收紧。</div>
   {delivery_section}
   <h2>各 lane 健康</h2>
-  <table>
-    <thead><tr><th>Lane</th><th>样本</th><th>成功</th><th>失败</th><th>过期</th><th>superseded</th><th>失败率</th><th>p50(成功)</th><th>p95(成功)</th><th>捕获 见终态·无缺口/有缺口/漏写/在飞</th><th>token 入/出</th><th>缓存命中</th><th>上报 usage/cache</th></tr></thead>
-    <tbody>{''.join(lane_rows) if lane_rows else "<tr><td colspan='13' class='muted'>当前窗口无 job。</td></tr>"}</tbody>
-  </table>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Lane</th><th>样本</th><th>成功</th><th>原始失败</th><th>过期</th><th>系统故障<br><span class='muted'>含过期</span></th><th>控制切流</th><th>安全抑制</th><th>终态未成功率</th><th>系统故障率</th><th>p50(成功)</th><th>p95(成功)</th><th>捕获 见终态·无缺口/有缺口/漏写/在飞</th><th>token 入/出</th><th>缓存命中</th><th>上报 usage/cache</th></tr></thead>
+    <tbody>{''.join(lane_rows) if lane_rows else "<tr><td colspan='16' class='muted'>当前窗口无 job。</td></tr>"}</tbody>
+  </table></div>
   {_render_runtime_user_report(user_report)}
-  <h2>失败原因 Top</h2>
-  <table>
-    <thead><tr><th>Lane</th><th>失败码</th><th>次数</th></tr></thead>
-    <tbody>{''.join(failure_rows) if failure_rows else "<tr><td colspan='3' class='muted'>当前窗口无失败。</td></tr>"}</tbody>
-  </table>
-  <div class="muted">失败码只是分类，不含上游细节。<b>上游原始错</b>（403 余额不足 / 429 / 超时）
-  留在加密 trajectory 里，需走 default-off 的 break-glass trajectory inspector 查看，
-  且每次访问都会写审计。本页只有 metadata。</div>
+  <h2>未成功原因 Top</h2>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Lane</th><th>归类</th><th>失败码</th><th>上游安全归因</th><th>次数</th></tr></thead>
+    <tbody>{''.join(failure_rows) if failure_rows else "<tr><td colspan='5' class='muted'>当前窗口无未成功终态。</td></tr>"}</tbody>
+  </table></div>
+  <div class="muted">“终态未成功率”保留所有 failed / expired，回答“这轮有没有正常完成”；
+  “系统故障率”只统计 provider、Runtime、排队和 lease 故障。控制切流和安全抑制仍保留原始计数，
+  但不再冒充基础设施故障。上游安全归因来自终态 outbox 的 metadata；<b>上游原始错</b>和聊天正文
+  均不在本页读取，如确需查看只能走 default-off、全审计的 break-glass trajectory inspector。</div>
 </main>
 </body>
 </html>"""
@@ -3206,7 +3521,7 @@ def _render_runtime_health_page(
 def _render_runtime_health_error_page() -> str:
     """数据取不到时的降级页：保留 nav，不外泄异常细节。"""
     return f"""<!doctype html>
-<html>
+<html lang="zh-CN">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -3227,6 +3542,473 @@ def _render_runtime_health_error_page() -> str:
 </html>"""
 
 
+# ---- Operations cockpit: Overview / Imports / Chat / Latency --------------
+
+def _ops_window_hours() -> int:
+    """The operations views share one rolling-window contract."""
+    return _runtime_health_window_hours()
+
+
+def _ops_window_links(active: str, hours: int) -> str:
+    labels = {24: "24 小时", 168: "7 天", 720: "30 天"}
+    links = []
+    for value in _RUNTIME_HEALTH_WINDOWS:
+        cls = "sort-button active" if value == hours else "sort-button"
+        href = _data_track_page_href(
+            view=active,
+            hours=value,
+            day=None,
+            limit=None,
+            offset=None,
+            page=None,
+            runtime_state=None,
+            user_id=None,
+        )
+        current = " aria-current='true'" if value == hours else ""
+        links.append(
+            f"<a class='{cls}' href='{html.escape(href, quote=True)}'"
+            f"{current}>{labels[value]}</a>"
+        )
+    return (
+        "<div class='ops-window'><span class='ops-window-label'>统计窗口</span>"
+        + "".join(links)
+        + "</div>"
+    )
+
+
+def _ops_status(level: str) -> str:
+    labels = {"ok": "正常", "warn": "证据不足 / 注意", "bad": "异常"}
+    normalized = level if level in labels else "warn"
+    return f"<span class='pill {normalized}'>{labels[normalized]}</span>"
+
+
+def _ops_import_level(report: dict | None) -> tuple[str, list[str]]:
+    if report is None:
+        return "warn", ["导入统计暂不可用"]
+    started = int(report.get("started") or 0)
+    completed = int(report.get("completed") or 0)
+    failed = int(report.get("failed") or 0)
+    stuck = int(report.get("stuck_over_15m") or 0)
+    unverified = int(report.get("completed_unverified") or 0)
+    if started == 0:
+        return "warn", ["窗口内没有导入样本"]
+    reasons: list[str] = []
+    level = "ok"
+    terminal = completed + failed
+    failure_rate = float(failed) / float(terminal) if terminal else None
+    if stuck:
+        level = "bad"
+        reasons.append(f"{stuck} 个任务超过 15 分钟未更新")
+    if failure_rate is not None and failure_rate >= 0.15:
+        level = "bad"
+        reasons.append(f"终态失败率 {failure_rate * 100:.1f}%")
+    elif failure_rate is not None and failure_rate >= 0.05:
+        if level == "ok":
+            level = "warn"
+        reasons.append(f"终态失败率 {failure_rate * 100:.1f}%")
+    if unverified:
+        if level == "ok":
+            level = "warn"
+        reasons.append(f"{unverified} 个 completed 缺少完整 artifact 证据")
+    return level, reasons
+
+
+def _ops_chat_level(report: dict | None) -> tuple[str, list[str]]:
+    if report is None:
+        return "warn", ["聊天统计暂不可用"]
+    outcomes = report.get("outcomes") or {}
+    delivery = report.get("reply_delivery") or {}
+    settled = int(report.get("settled_jobs") or 0)
+    failed = int(outcomes.get("failed") or 0) + int(outcomes.get("expired") or 0)
+    reasons: list[str] = []
+    level = "warn"  # Device receive/read ACK does not exist; never claim green.
+    if settled == 0:
+        reasons.append("窗口内没有已结算 chat 样本")
+    else:
+        failure_rate = float(failed) / float(settled)
+        if failure_rate >= 0.15:
+            level = "bad"
+        if failure_rate >= 0.05:
+            reasons.append(f"chat 终态未成功率 {failure_rate * 100:.1f}%")
+    missing = int(delivery.get("completed_without_final_applied") or 0)
+    reconciliation = int(delivery.get("final_reconciliation_jobs") or 0)
+    if missing:
+        level = "bad"
+        reasons.append(f"{missing} 个 completed 没有 final reply server-applied 证据")
+    if reconciliation:
+        level = "bad"
+        reasons.append(f"{reconciliation} 个 final reply 需要人工 reconcile")
+    if not reasons:
+        reasons.append("服务端交付可观测；客户端接收 ACK 尚未采集")
+    return level, reasons
+
+
+def _ops_latency_level(report: dict | None) -> tuple[str, list[str]]:
+    if report is None:
+        return "warn", ["延迟统计暂不可用"]
+    value = (report.get("latency") or {}).get("server_applied_p95_sec")
+    if value is None:
+        return "warn", ["缺少发送到服务端 reply applied 的 p95 样本"]
+    seconds = float(value)
+    if seconds >= 120:
+        return "bad", [f"服务端交付 p95 {seconds:.0f}s"]
+    if seconds >= 60:
+        return "warn", [f"服务端交付 p95 {seconds:.0f}s"]
+    return "ok", []
+
+
+def _ops_page(
+    *,
+    active: str,
+    title: str,
+    subtitle: str,
+    hours: int,
+    body: str,
+) -> str:
+    return f"""<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{html.escape(title)} · Feedling Data Track</title>
+<style>{_RUNTIME_PAGE_CSS}</style></head><body><main>
+  <span class="ops-kicker">Operations / metadata only</span>
+  <h1>{html.escape(title)}</h1>
+  <div class="muted">{html.escape(subtitle)}</div>
+  {_render_data_track_view_nav(active)}
+  {_ops_window_links(active, hours)}
+  {body}
+</main></body></html>"""
+
+
+def _render_ops_overview_page(
+    imports: dict | None,
+    chat: dict | None,
+    runtime: dict | None,
+    product: dict | None = None,
+    usage: dict | None = None,
+    *,
+    within_hours: int,
+) -> str:
+    import_level, import_reasons = _ops_import_level(imports)
+    chat_level, chat_reasons = _ops_chat_level(chat)
+    latency_level, latency_reasons = _ops_latency_level(chat)
+
+    completed = int((imports or {}).get("completed") or 0)
+    verified = int((imports or {}).get("artifact_verified") or 0)
+    admitted = int(((chat or {}).get("outcomes") or {}).get("admitted") or 0)
+    applied = int(((chat or {}).get("reply_delivery") or {}).get("final_applied_jobs") or 0)
+    p95 = ((chat or {}).get("latency") or {}).get("server_applied_p95_sec")
+    pool = (runtime or {}).get("pool") or {}
+    live_workers = pool.get("live_workers") if runtime is not None else None
+    capacity = pool.get("capacity") if runtime is not None else None
+    duplicate_effects = int(
+        ((chat or {}).get("reply_delivery") or {}).get("duplicate_final_effect_jobs") or 0
+    )
+    onboarding = (product or {}).get("onboarding") or {}
+    onboarding_covered = bool(onboarding.get("coverage_complete"))
+    onboarding_completed = (
+        onboarding.get("first_genuine_reply") if onboarding_covered else None
+    )
+    onboarding_cohort = (
+        onboarding.get("cohort_accounts") if onboarding_covered else None
+    )
+    onboarding_rate = onboarding.get("completion_rate") if onboarding_covered else None
+    if onboarding_covered:
+        onboarding_value = (
+            f"{_fmt_count(onboarding_completed)} / {_fmt_count(onboarding_cohort)}"
+        )
+        onboarding_label = (
+            "窗口注册 cohort → 首次真回复"
+            f"（{_fmt_ratio(onboarding_rate)}）"
+        )
+    else:
+        onboarding_value = "未知"
+        onboarding_label = "注册 cohort 事件覆盖不完整，未计算完成率"
+
+    usage_total = (usage or {}).get("total")
+    usage_known = usage_total is not None
+    model_calls = usage_total.get("model_calls") if usage_known else None
+    retries = usage_total.get("retries") if usage_known else None
+    retry_rate = (
+        float(retries) / float(model_calls)
+        if retries is not None and model_calls
+        else None
+    )
+    model_active_users = (
+        usage_total.get("model_active_users") if usage_known else None
+    )
+    known_tokens = usage_total.get("total_tokens") if usage_known else None
+    active_user_days = usage_total.get("active_user_days") if usage_known else None
+    tokens_per_active_user_day = (
+        usage_total.get("tokens_per_active_user_day") if usage_known else None
+    )
+
+    def evidence(items: list[str]) -> str:
+        return "；".join(html.escape(item) for item in items) or "当前证据通过"
+
+    body = f"""
+    <section class="ops-questions" aria-label="运营核心问题">
+      <article class="question-card {import_level}">
+        <div class="question-top"><h2 class="question-title">用户导入成功了吗？</h2>{_ops_status(import_level)}</div>
+        <div class="question-value">{_fmt_count(verified)} / {_fmt_count(completed)}</div>
+        <div class="question-evidence">artifact 证据通过 / terminal completed。{evidence(import_reasons)}</div>
+      </article>
+      <article class="question-card {chat_level}">
+        <div class="question-top"><h2 class="question-title">用户真的收到回复了吗？</h2>{_ops_status(chat_level)}</div>
+        <div class="question-value">{_fmt_count(applied)} / {_fmt_count(admitted)}</div>
+        <div class="question-evidence">服务端 final reply applied / admitted Runtime turns。客户端接收或已读 ACK：<b>不可用</b>。{evidence(chat_reasons)}</div>
+      </article>
+      <article class="question-card {latency_level}">
+        <div class="question-top"><h2 class="question-title">回复有多慢？</h2>{_ops_status(latency_level)}</div>
+        <div class="question-value">{_fmt_duration_sec(p95)}</div>
+        <div class="question-evidence">发送到 final reply 服务端 applied 的 p95。{evidence(latency_reasons)}</div>
+      </article>
+      <article class="question-card warn">
+        <div class="question-top"><h2 class="question-title">有重复调用或重复费用吗？</h2>{_ops_status('warn')}</div>
+        <div class="question-value">不可判定</div>
+        <div class="question-evidence">final reply effect 重复候选 {_fmt_count(duplicate_effects)} 个 job；这<b>不等于</b> provider 重复扣费。真实 provider attempt / possibly-billed / authoritative cost 要等 P0-B 账本。</div>
+      </article>
+    </section>
+    <div class="definition-line">四张卡只在证据真的闭环时变绿。当前客户端 ACK 与 provider 请求账本尚未闭环，所以不会用 0 或绿色冒充“确认没有问题”。</div>
+    <h2>产品活跃与 Onboarding</h2>
+    <section class="metrics">
+      {_render_metric('窗口内 App 活跃账号', _fmt_count((product or {}).get('window_app_users') if product is not None else None))}
+      {_render_metric('App sessions', _fmt_count((product or {}).get('app_sessions') if product is not None else None))}
+      {_render_metric('窗口新注册账号', _fmt_count((product or {}).get('new_registered_accounts') if product is not None else None))}
+      {_render_metric(onboarding_label, onboarding_value)}
+    </section>
+    <div class="note-box"><b>产品口径：</b>“窗口内 App 活跃账号”是所选滚动窗口内至少上报一次 <code>app_session_end</code> 的去重账号。iOS 前台 session 可能被系统杀掉而漏报，所以这是保守下限；24 小时档也不是北京自然日 DAU，7 天和 30 天更不是把每日 DAU 相加。自然日趋势看「DAU」。Onboarding 分母只取同一窗口内注册且时间可安全解析的账号，完成定义为截至本页生成时已产生首次非 fallback 真回复。{'<b>当前 cohort 事件覆盖不完整，因此完成率显示未知。</b>' if not onboarding_covered else ''}</div>
+    <h2>Hosted V2 模型用量</h2>
+    <section class="metrics">
+      {_render_metric('V2 模型活跃账号', _fmt_count(model_active_users))}
+      {_render_metric('V2 模型活跃用户日', _fmt_count(active_user_days))}
+      {_render_metric('V2 turns', _fmt_count(usage_total.get('turns') if usage_known else None))}
+      {_render_metric('模型调用', _fmt_count(model_calls))}
+      {_render_metric('重试 / 调用', f"{_fmt_count(retries)} / {_fmt_ratio(retry_rate)}")}
+      {_render_metric('窗口 Token 总量（已知下限）', _fmt_tokens_compact(known_tokens))}
+      {_render_metric('平均每个 V2 活跃用户日 Token', _fmt_tokens_compact(round(tokens_per_active_user_day) if tokens_per_active_user_day is not None else None))}
+      {_render_metric('Token usage 覆盖率', _fmt_ratio(usage_total.get('usage_coverage') if usage_known else None))}
+    </section>
+    <div class="note-box"><b>V2 口径：</b>模型活跃账号来自本实例 <code>v2_turn_metrics</code> 中实际发生过模型调用的去重 user_id；活跃用户日按北京时间把 user_id × 日期去重，和上面的产品 App 活跃账号不是同一分母。Token 是 provider 已上报 usage 的已知下限，缺报会降低覆盖率，不会被伪装成 0；“平均每个活跃用户日 Token”是 Hosted V2 模型活跃口径，不能冒充全产品 App DAU 的人均用量。离线 self-host 与非 V2 路径不在这组数里。</div>
+    <h2>当前承载</h2>
+    <section class="metrics">
+      {_render_metric('存活 worker', _fmt_count(live_workers))}
+      {_render_metric('可执行容量', _fmt_count(capacity))}
+      {_render_metric('在飞 job', _fmt_count(pool.get('inflight') if runtime is not None else None))}
+      {_render_metric('排队 pending', _fmt_count(pool.get('pending') if runtime is not None else None))}
+      {_render_metric('最老 pending', _fmt_duration_sec(pool.get('oldest_pending_age_sec') if runtime is not None else None))}
+    </section>
+    <div class="note-box"><b>下一步看哪里：</b>导入证据与卡住任务看「记忆导入」；消息→Runtime→reply effect 看「聊天可靠性」；排队/执行/服务端交付分段看「延迟」；Token、provider、model 与重试看「Token 与模型」。本总览只覆盖本实例 Hosted Runtime V2 与 Genesis ledger，不代表离线 self-host 全量。</div>
+    """
+    return _ops_page(
+        active="overview",
+        title="运营总览",
+        subtitle=f"最近 {within_hours} 小时 · 四个问题，一眼看证据是否闭环。",
+        hours=within_hours,
+        body=body,
+    )
+
+
+def _ops_time(value) -> str:
+    if value is None or value == "":
+        return "—"
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+    return str(value)
+
+
+def _render_imports_page(report: dict | None, *, within_hours: int) -> str:
+    if report is None:
+        body = "<div class='note-box'><b>导入统计暂时取不到。</b>页面不会把未知渲染成 0；其他 Admin 视图不受影响。</div>"
+        return _ops_page(active="imports", title="记忆导入", subtitle="Genesis import ledger", hours=within_hours, body=body)
+
+    level, reasons = _ops_import_level(report)
+    recent_rows = []
+    status_labels = {
+        "done": "完成", "failed": "失败", "processing": "处理中",
+        "uploaded": "待处理", "awaiting_resident": "等待 resident",
+        "created": "已创建",
+    }
+    for row in report.get("recent_jobs") or []:
+        user_id = str(row.get("user_id") or "unknown")
+        qs = _data_track_qs(view=None, hours=None, offset=None, user_id=None)
+        suffix = f"?{qs}" if qs else ""
+        user_href = f"/admin/data-track/users/{quote(user_id, safe='')}{suffix}"
+        status = str(row.get("status") or "unknown")
+        is_stuck = (
+            status not in {"done", "failed"}
+            and float(row.get("age_since_update_sec") or 0) >= 900
+        )
+        if status == "done" and row.get("artifact_evidence_complete"):
+            evidence_text = "通过"
+            evidence_cls = "evidence-ok"
+        elif status == "done":
+            evidence_text = "终态完成，证据不足"
+            evidence_cls = "evidence-warn"
+        elif status == "failed":
+            evidence_text = "失败"
+            evidence_cls = "evidence-bad"
+        else:
+            evidence_text = "处理中"
+            evidence_cls = "evidence-warn" if is_stuck else ""
+        recent_rows.append(
+            "<tr>"
+            f"<td><a href='{html.escape(user_href, quote=True)}'><code>{html.escape(user_id)}</code></a></td>"
+            f"<td><code>{html.escape(str(row.get('job_id') or ''))}</code></td>"
+            f"<td>{html.escape(str(row.get('import_mode') or row.get('source_kind') or 'unknown'))}</td>"
+            f"<td>{html.escape(status_labels.get(status, status))}{' · 超过15m未更新' if is_stuck else ''}</td>"
+            f"<td class='{evidence_cls}'>{evidence_text}</td>"
+            f"<td>{_fmt_count(row.get('memory_action_count'))} / {'有' if row.get('has_identity_evidence') else '无'}</td>"
+            f"<td><code>{html.escape(str(row.get('error_code') or '—'))}</code></td>"
+            f"<td>{html.escape(_ops_time(row.get('created_at')))}</td>"
+            f"<td>{html.escape(_ops_time(row.get('updated_at')))}</td>"
+            "</tr>"
+        )
+    failure_rows = "".join(
+        "<tr>"
+        f"<td><code>{html.escape(str(row.get('error_code') or 'other'))}</code></td>"
+        f"<td>{_fmt_count(row.get('count'))}</td></tr>"
+        for row in report.get("failure_reasons") or []
+    )
+    reason_text = "；".join(html.escape(item) for item in reasons) or "当前证据通过"
+    body = f"""
+    <div class="overall-summary">结论：{_ops_status(level)} · {reason_text}</div>
+    <section class="metrics">
+      {_render_metric('开始导入', _fmt_count(report.get('started')))}
+      {_render_metric('Terminal done', _fmt_count(report.get('completed')))}
+      {_render_metric('Artifact 证据通过', _fmt_count(report.get('artifact_verified')))}
+      {_render_metric('Done 但证据不足', _fmt_count(report.get('completed_unverified')))}
+      {_render_metric('失败', _fmt_count(report.get('failed')))}
+      {_render_metric('仍在处理中', _fmt_count(report.get('processing')))}
+      {_render_metric('卡住 >15m', _fmt_count(report.get('stuck_over_15m')))}
+      {_render_metric('Terminal 成功率', _fmt_ratio(report.get('terminal_success_rate')))}
+      {_render_metric('Artifact 证据通过率', _fmt_ratio(report.get('artifact_verified_rate')))}
+      {_render_metric('完成 p50', _fmt_duration_sec(report.get('p50_complete_sec')))}
+      {_render_metric('完成 p95', _fmt_duration_sec(report.get('p95_complete_sec')))}
+    </section>
+    <div class="note-box"><b>两种成功不能混：</b>Terminal done 只表示 reducer 把 job 置为完成；Artifact 证据通过则按任务模式检查 durable ledger 中的 identity / memory 写入证据。当前仍不是独立的 artifact-attempt 账本：合法的 nameless / fresh-start 完成可能被保守标为“证据不足”，不会假绿。页面不读取导入正文、模型输出或任意 exception 尾部。</div>
+    <h2>最近任务</h2>
+    <div class="table-wrap"><table><thead><tr><th>User</th><th>Job</th><th>模式</th><th>状态</th><th>Artifact 证据</th><th>Memory / Identity</th><th>安全失败码</th><th>创建 UTC</th><th>更新 UTC</th></tr></thead>
+    <tbody>{''.join(recent_rows) if recent_rows else "<tr><td colspan='9' class='muted'>窗口内无任务。</td></tr>"}</tbody></table></div>
+    <h2>失败原因 Top</h2>
+    <div class="table-wrap"><table><thead><tr><th>安全失败码</th><th>次数</th></tr></thead><tbody>{failure_rows or "<tr><td colspan='2' class='muted'>窗口内无失败。</td></tr>"}</tbody></table></div>
+    """
+    return _ops_page(active="imports", title="记忆导入", subtitle="任务终态与 artifact 证据分开看", hours=within_hours, body=body)
+
+
+def _render_chat_reliability_page(report: dict | None, *, within_hours: int) -> str:
+    if report is None:
+        body = "<div class='note-box'><b>聊天可靠性统计暂时取不到。</b>未知不会显示成 0。</div>"
+        return _ops_page(active="chat", title="聊天可靠性", subtitle="Hosted Runtime V2 server-side evidence", hours=within_hours, body=body)
+    level, reasons = _ops_chat_level(report)
+    outcomes = report.get("outcomes") or {}
+    delivery = report.get("reply_delivery") or {}
+    failure_delivery = report.get("failure_delivery") or {}
+    failure_rows = "".join(
+        "<tr>"
+        f"<td><code>{html.escape(str(row.get('code') or 'runtime_failed'))}</code></td>"
+        f"<td>{_fmt_count(row.get('count'))}</td></tr>"
+        for row in report.get("failure_reasons") or []
+    )
+    recent_rows = []
+    for row in report.get("recent_jobs") or []:
+        user_id = str(row.get("user_id") or "unknown")
+        qs = _data_track_qs(view=None, hours=None, offset=None, user_id=None)
+        suffix = f"?{qs}" if qs else ""
+        href = f"/admin/data-track/users/{quote(user_id, safe='')}{suffix}"
+        recent_rows.append(
+            "<tr>"
+            f"<td><a href='{html.escape(href, quote=True)}'><code>{html.escape(user_id)}</code></a></td>"
+            f"<td>{_fmt_count(row.get('job_id'))}</td>"
+            f"<td>{html.escape(str(row.get('status') or 'unknown'))}</td>"
+            f"<td>{html.escape(str(row.get('final_effect_status') or 'missing'))}</td>"
+            f"<td>{html.escape(str(row.get('provider') or '—'))} / {html.escape(str(row.get('model') or '—'))}</td>"
+            f"<td>{_fmt_count(row.get('model_calls'))} / {_fmt_count(row.get('retries'))}</td>"
+            f"<td><code>{html.escape(str(row.get('last_error') or '—'))}</code></td>"
+            f"<td>{html.escape(_ops_time(row.get('created_at')))}</td>"
+            "</tr>"
+        )
+    reason_text = "；".join(html.escape(item) for item in reasons)
+    body = f"""
+    <div class="overall-summary">结论：{_ops_status(level)} · {reason_text}</div>
+    <div class="funnel-line" role="list" aria-label="聊天生命周期">
+      <div class="funnel-step"><span>消息进入 Runtime</span><b>{_fmt_count(outcomes.get('admitted'))}</b><small>chat agent_jobs admitted</small></div>
+      <div class="funnel-step"><span>开始处理</span><b>{_fmt_count(outcomes.get('started'))}</b><small>claimed_at / started_at 有记录</small></div>
+      <div class="funnel-step"><span>生成 final effect</span><b>{_fmt_count(delivery.get('final_effect_jobs'))}</b><small>服务端 durable effect</small></div>
+      <div class="funnel-step"><span>服务端 applied</span><b>{_fmt_count(delivery.get('final_applied_jobs'))}</b><small>不是客户端 ACK</small></div>
+    </div>
+    <section class="metrics">
+      {_render_metric('已结算 chat', _fmt_count(report.get('settled_jobs')))}
+      {_render_metric('Admitted → final reply 服务端 applied', _fmt_ratio(report.get('server_final_reply_applied_rate')))}
+      {_render_metric('终态完成率', _fmt_ratio(report.get('terminal_completion_rate')))}
+      {_render_metric('Completed', _fmt_count(outcomes.get('completed')))}
+      {_render_metric('Failed', _fmt_count(outcomes.get('failed')))}
+      {_render_metric('Expired', _fmt_count(outcomes.get('expired')))}
+      {_render_metric('仍在飞', _fmt_count(outcomes.get('in_flight')))}
+      {_render_metric('Final pending', _fmt_count(delivery.get('final_pending_jobs')))}
+      {_render_metric('需 reconcile', _fmt_count(delivery.get('final_reconciliation_jobs')))}
+      {_render_metric('Completed 无 applied', _fmt_count(delivery.get('completed_without_final_applied')))}
+      {_render_metric('失败 fallback 已投递', _fmt_count(failure_delivery.get('fallback_reply_delivered')))}
+      {_render_metric('失败 fallback 待投递', _fmt_count(failure_delivery.get('fallback_reply_pending')))}
+    </section>
+    <div class="note-box"><b>两条率不能混：</b>“Admitted → final reply 服务端 applied”以窗口内全部 chat agent_jobs 为同一 cohort，回答进入 Runtime 的 turn 有多少已经落地最终回复；“终态完成率”只在 completed / failed / expired 终态中计算 completed。最终回复只认明确 final effect，或带 <code>reply_through_seq</code> 的 legacy reply；普通中间 reply 不计。服务端 applied 比“模型 API 200”更接近用户结果，但仍<b>不等于设备收到或用户已读</b>；客户端 delivery ACK 当前不可用，因此页面不会给“用户真的收到”绿灯。同一用户在单飞回合中追加的多条消息会折入一个 job，所以 admitted 是 turns，不是原始消息条数。</div>
+    <h2>失败原因 Top</h2><div class="table-wrap"><table><thead><tr><th>失败码</th><th>次数</th></tr></thead><tbody>{failure_rows or "<tr><td colspan='2' class='muted'>窗口内无失败。</td></tr>"}</tbody></table></div>
+    <h2>最近 chat jobs</h2><div class="table-wrap"><table><thead><tr><th>User</th><th>Job</th><th>Job 状态</th><th>Final effect</th><th>Provider / Model</th><th>Calls / retries</th><th>失败码</th><th>创建 UTC</th></tr></thead><tbody>{''.join(recent_rows) if recent_rows else "<tr><td colspan='8' class='muted'>窗口内无 chat。</td></tr>"}</tbody></table></div>
+    """
+    return _ops_page(active="chat", title="聊天可靠性", subtitle="消息进入、处理、生成、服务端交付四段证据", hours=within_hours, body=body)
+
+
+def _render_latency_page(report: dict | None, *, within_hours: int) -> str:
+    if report is None:
+        body = "<div class='note-box'><b>延迟统计暂时取不到。</b>未知不会显示成 0。</div>"
+        return _ops_page(active="latency", title="回复延迟", subtitle="Queue → processing → server applied", hours=within_hours, body=body)
+    level, reasons = _ops_latency_level(report)
+    latency = report.get("latency") or {}
+
+    def stage(label: str, prefix: str, note: str) -> str:
+        return (
+            "<div class='funnel-step'>"
+            f"<span>{html.escape(label)}</span>"
+            f"<b>{_fmt_duration_sec(latency.get(prefix + '_p95_sec'))}</b>"
+            f"<small>p50 {_fmt_duration_sec(latency.get(prefix + '_p50_sec'))} · "
+            f"p99 {_fmt_duration_sec(latency.get(prefix + '_p99_sec'))}<br>{html.escape(note)}</small>"
+            "</div>"
+        )
+
+    model_rows = []
+    for row in report.get("model_breakdown") or []:
+        turns = int(row.get("turns") or 0)
+        failed = int(row.get("failed_turns") or 0)
+        model_rows.append(
+            "<tr>"
+            f"<td>{html.escape(str(row.get('provider') or 'unknown'))}</td>"
+            f"<td>{html.escape(str(row.get('model') or 'unknown'))}</td>"
+            f"<td>{_fmt_count(turns)}</td><td>{_fmt_count(row.get('model_calls'))}</td>"
+            f"<td>{_fmt_count(row.get('retries'))}</td>"
+            f"<td>{_fmt_count(failed)} / {_fmt_ratio(float(failed) / float(turns) if turns else None)}</td>"
+            f"<td>{_fmt_duration_sec(float(row.get('p50_ms')) / 1000 if row.get('p50_ms') is not None else None)}</td>"
+            f"<td>{_fmt_duration_sec(float(row.get('p95_ms')) / 1000 if row.get('p95_ms') is not None else None)}</td>"
+            f"<td>{_fmt_duration_sec(float(row.get('p99_ms')) / 1000 if row.get('p99_ms') is not None else None)}</td>"
+            "</tr>"
+        )
+    reason_text = "；".join(html.escape(item) for item in reasons) or "当前 p95 在阈值内"
+    body = f"""
+    <div class="overall-summary">结论：{_ops_status(level)} · {reason_text}</div>
+    <div class="funnel-line">
+      {stage('排队', 'queue', 'created → claimed/started')}
+      {stage('模型与工具处理', 'processing', 'started → job terminal')}
+      {stage('整轮 job', 'turn', 'created → job terminal')}
+      {stage('用户侧最接近值', 'server_applied', 'created → final reply server applied')}
+    </div>
+    <div class="note-box"><b>延迟口径：</b>p50 / p95 / p99 都来自窗口内有对应时间戳的样本。最后一段是目前最接近“用户等待”的服务端证据，但仍不包含设备网络与客户端渲染时间；没有 client ACK 时不能称为真正 send-to-receive。</div>
+    <h2>Provider / Model whole-turn</h2>
+    <div class="muted">下表 latency_ms 来自 whole-turn metrics；它不是分段延迟，也不是 provider 单次请求延迟。用于比较 provider / model 趋势。</div>
+    <div class="table-wrap"><table><thead><tr><th>Provider</th><th>Model</th><th>Turns</th><th>Calls</th><th>Retries</th><th>Failed</th><th>p50</th><th>p95</th><th>p99</th></tr></thead><tbody>{''.join(model_rows) if model_rows else "<tr><td colspan='9' class='muted'>窗口内无 whole-turn metrics。</td></tr>"}</tbody></table></div>
+    """
+    return _ops_page(active="latency", title="回复延迟", subtitle="把排队、处理、整轮和服务端交付拆开", hours=within_hours, body=body)
+
+
 def _render_admin_login_page(error: bool = False, next_url: str = "/admin/data-track") -> str:
     """Password-gate login page for the admin dashboard. Posts to /admin/login,
     which validates FEEDLING_ADMIN_PASSWORD and sets the signed admin_session
@@ -3236,20 +4018,20 @@ def _render_admin_login_page(error: bool = False, next_url: str = "/admin/data-t
     )
     safe_next = html.escape(next_url or "/admin/data-track", quote=True)
     return f"""<!doctype html>
-<html>
+<html lang="zh-CN">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Feedling Data Track · 登录</title>
   <style>
-    :root {{ color-scheme: light; --fg:#191613; --muted:#736963; --line:#e6ddd5; --bg:#fbf8f4; --card:#fffdfa; --accent:#b7352b; }}
+    :root {{ color-scheme: light; --fg:#1b201d; --muted:#68706a; --line:#dddcd4; --bg:#f5f4ef; --card:#fcfbf8; --accent:#416b56; }}
     body {{ margin:0; background:var(--bg); color:var(--fg); font:15px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; display:flex; min-height:100vh; align-items:center; justify-content:center; }}
     .box {{ background:var(--card); border:1px solid var(--line); border-radius:12px; padding:28px 26px; width:320px; box-shadow:0 2px 14px rgba(0,0,0,.05); }}
     h1 {{ font-size:19px; margin:0 0 4px; }}
     .sub {{ color:var(--muted); font-size:13px; margin:0 0 18px; }}
     input[type=password] {{ width:100%; box-sizing:border-box; padding:11px 12px; font-size:15px; border:1px solid var(--line); border-radius:8px; background:#fff; }}
     button {{ width:100%; margin-top:12px; padding:11px; font-size:15px; font-weight:600; color:#fff; background:var(--accent); border:0; border-radius:8px; cursor:pointer; }}
-    .err {{ color:var(--accent); font-size:13px; margin-bottom:10px; }}
+    .err {{ color:#b7352b; font-size:13px; margin-bottom:10px; }}
   </style>
 </head>
 <body>
@@ -3429,6 +4211,88 @@ def _usage_sorted_users(report: dict) -> tuple[list[dict], int, int]:
     return rows[offset:offset + 100], offset, len(rows)
 
 
+def _usage_focus_day(
+    report: dict,
+    query: admin_usage.UsageQuery,
+) -> tuple[dict | None, str, bool]:
+    """Return the selected window's most relevant local-day row.
+
+    Rolling presets focus the display timezone's current partial day. Custom
+    ranges focus their inclusive end date. A missing target falls back to the
+    latest returned day so partial report degradation remains useful instead
+    of turning the entire executive summary into dashes.
+    """
+    rows = sorted(
+        (row for row in (report.get("daily") or []) if row.get("local_day")),
+        key=lambda row: str(row.get("local_day")),
+    )
+    if query.preset == "custom" and query.end_date:
+        target_day = query.end_date
+        partial = False
+    else:
+        try:
+            display_tz = ZoneInfo(query.timezone)
+        except (ValueError, ZoneInfoNotFoundError):
+            display_tz = _SHANGHAI_TZ
+        target_day = query.end_at_utc.astimezone(display_tz).date().isoformat()
+        partial = True
+    for row in rows:
+        if str(row.get("local_day")) == target_day:
+            return row, target_day, partial
+    if rows:
+        latest = rows[-1]
+        return latest, str(latest.get("local_day")), False
+    return None, target_day, partial
+
+
+def _usage_rate_count(value) -> str:
+    """Human-scale whole-token rate for operator-facing equations."""
+    if value is None:
+        return "—"
+    try:
+        return f"{int(round(float(value))):,}"
+    except (TypeError, ValueError):
+        return "—"
+
+
+def _render_usage_trend(rows: list[dict], *, focus_day: str) -> str:
+    """Compact, dependency-free daily ledger for the latest fourteen rows."""
+    ordered = sorted(
+        (row for row in rows if row.get("local_day")),
+        key=lambda row: str(row.get("local_day")),
+    )[-14:]
+    if not ordered:
+        return "<div class='usage-empty'>所选窗口没有每日用量。</div>"
+    max_tokens = max((int(row.get("total_tokens") or 0) for row in ordered), default=0)
+    rendered = []
+    for row in ordered:
+        day = str(row.get("local_day") or "")
+        total = row.get("total_tokens")
+        numeric_total = int(total or 0)
+        width = (numeric_total / max_tokens * 100) if max_tokens else 0
+        active = int(row.get("model_active_users") or 0)
+        per_dau = row.get("tokens_per_active_user_day")
+        cls = " trend-row focus" if day == focus_day else " trend-row"
+        rendered.append(
+            f"<div class='{cls.strip()}' role='row'>"
+            f"<time role='cell' datetime='{html.escape(day, quote=True)}'>{html.escape(day[5:] or day)}</time>"
+            "<div class='trend-track' role='cell'>"
+            f"<span style='width:{width:.1f}%'></span></div>"
+            f"<b role='cell'>{_fmt_tokens_compact(total)}</b>"
+            f"<span role='cell'>DAU {active:,}</span>"
+            f"<span role='cell'>{_usage_rate_count(per_dau)} 已知 / DAU</span>"
+            "</div>"
+        )
+    return (
+        "<div class='trend-ledger' role='table' aria-label='每日 V2 Token 与模型 DAU'>"
+        "<div class='trend-head' role='row'><span role='columnheader'>日期</span>"
+        "<span role='columnheader'>相对 Token</span><span role='columnheader'>已知 Token</span>"
+        "<span role='columnheader'>V2 模型 DAU</span><span role='columnheader'>已知 Token / DAU</span></div>"
+        + "".join(rendered)
+        + "</div>"
+    )
+
+
 def _render_usage_page(
     report: dict,
     query: admin_usage.UsageQuery,
@@ -3446,6 +4310,88 @@ def _render_usage_page(
         or query.model
         or query.completeness != "all"
     )
+    daily_available = report.get("daily") is not None
+    daily = list(report.get("daily") or [])
+    focus, focus_day, focus_is_partial = _usage_focus_day(report, query)
+    if focus is None:
+        # An empty, successfully-read daily section is a confirmed zero.  A
+        # missing section is unknown and must stay a dash rather than quietly
+        # presenting a synthetic DAU of zero.
+        focus_tokens = 0 if daily_available else None
+        focus_dau = 0 if daily_available else None
+        focus_per_dau = None
+        focus_coverage = None
+    else:
+        focus_tokens = focus.get("total_tokens")
+        focus_dau = int(focus.get("model_active_users") or 0)
+        focus_per_dau = focus.get("tokens_per_active_user_day")
+        focus_coverage = focus.get("usage_coverage")
+    # DAU is a local-calendar-day metric.  Do not divide active user-days by
+    # elapsed seconds / 86400: rolling windows can span N+1 local date buckets,
+    # and DST custom days can be 23 or 25 hours.  The report returns every local
+    # day (including zero rows), so the arithmetic mean of those DAU buckets is
+    # the honest operator-facing "average daily" value.
+    window_avg_dau = (
+        sum(int(row.get("model_active_users") or 0) for row in daily)
+        / len(daily)
+        if daily_available and daily
+        else (0.0 if daily_available else None)
+    )
+    focus_label = (
+        f"今天 {focus_day} · 进行中"
+        if focus_is_partial
+        else f"数据日 {focus_day}"
+    )
+    active_dimensions = [
+        f"{name}={value}"
+        for name, value in (
+            ("lane", query.lane),
+            ("provider", query.provider),
+            ("model", query.model),
+            ("completeness", query.completeness if query.completeness != "all" else None),
+        )
+        if value
+    ]
+    filter_scope = (
+        " · 当前筛选：" + " · ".join(active_dimensions)
+        if active_dimensions
+        else ""
+    )
+    pulse_chips = [
+        "Hosted V2 only",
+        "已知 Token 下界",
+        query.timezone,
+        f"上报覆盖 {_fmt_ratio(focus_coverage)}",
+        *active_dimensions,
+    ]
+    pulse_chip_html = "".join(
+        f"<span>{html.escape(str(label))}</span>" for label in pulse_chips
+    )
+    usage_pulse = f"""
+  <section class='usage-pulse' aria-labelledby='usage-pulse-title'>
+    <div class='pulse-heading'>
+      <div><span class='eyebrow'>{html.escape(focus_label)}</span>
+      <h2 id='usage-pulse-title'>每位 V2 模型 DAU 的已知 Token 用量</h2></div>
+      <div class='scope-chips'>{pulse_chip_html}</div>
+    </div>
+    <div class='pulse-equation' aria-label='{html.escape(f"{focus_label} 已知 Token 除以 V2 模型 DAU", quote=True)}'>
+      <div class='equation-term'><small>已知 V2 Token</small><strong>{_fmt_count(focus_tokens)}</strong></div>
+      <span class='equation-sign'>÷</span>
+      <div class='equation-term'><small>V2 模型 DAU</small><strong>{_fmt_count(focus_dau)}</strong></div>
+      <span class='equation-sign'>=</span>
+      <div class='equation-result'><strong>{_usage_rate_count(focus_per_dau)}</strong><small>已知 Token / DAU（下界）</small></div>
+    </div>
+    <div class='pulse-foot'>
+      <span><b>V2 模型 DAU</b> = 当天至少有一次 model call、按 user_id 去重的 Hosted V2 账号；重装旧号不会合并。</span>
+      <span>它不是“打开 App”的产品 DAU，产品 DAU 请看 <a href='{html.escape(_data_track_page_href(view="dau", user_id=None, offset=0), quote=True)}'>日活与时长</a>。{html.escape(filter_scope)}</span>
+    </div>
+  </section>
+  <section class='window-ledger' aria-label='所选窗口加权平均'>
+    <div><span>窗口已知 Token</span><b>{_fmt_count(overview.get('total_tokens'))}</b></div>
+    <div><span>窗口活跃用户日</span><b>{_fmt_count(overview.get('active_user_days'))}</b></div>
+    <div><span>窗口自然日平均 V2 DAU</span><b>{_usage_float(window_avg_dau)}</b></div>
+    <div><span>加权已知 Token / DAU</span><b>{_usage_rate_count(averages.get('tokens_per_active_user_day'))}</b></div>
+  </section>"""
 
     current_app_users = overview.get("current_app_users")
     current_hosted_v2_users = overview.get("current_hosted_v2_users")
@@ -3496,26 +4442,26 @@ def _render_usage_page(
         "<div class='coverage-group-title'>当前账号覆盖</div>"
         "<div class='coverage-pair'>"
         + coverage_node(
-            "全部 App 用户",
+            "全部 App 账号行",
             _fmt_count(current_app_users),
-            "当前 users account rows · 全 runtime mode",
+            "当前 users rows · 全 runtime mode · 可能含重装旧号",
         )
         + coverage_node(
-            "当前 Hosted V2",
+            "当前 Hosted V2 账号行",
             _fmt_count(current_hosted_v2_users),
-            f"占全部 App 用户 {_fmt_ratio(current_v2_coverage)}",
+            f"占全部 App 账号行 {_fmt_ratio(current_v2_coverage)}",
         )
         + "</div></section>"
         "<section class='coverage-group'>"
         "<div class='coverage-group-title'>所选窗口活动 · 跟随筛选</div>"
         "<div class='coverage-pair'>"
         + coverage_node(
-            "窗口内模型用户",
+            "窗口 V2 用量用户",
             _fmt_count(overview.get("model_active_users")),
-            "至少一次 model call",
+            "所选窗口至少一次 model call",
         )
         + coverage_node(
-            "窗口内 Token 用户（完整）",
+            "Token 可计量用户",
             _fmt_count(overview.get("token_users")),
             "窗口内 input / output 两列各至少有一次已知值",
         )
@@ -3578,10 +4524,10 @@ def _render_usage_page(
         _render_metric("Installations", "unavailable until self-host phase"),
     ])
     usage_metrics = "".join([
-        _render_metric("Model-active users", _fmt_count(overview.get("model_active_users"))),
-        _render_metric("Complete-token users", _fmt_count(overview.get("token_users"))),
-        _render_metric("Usage-reporting users", _fmt_count(overview.get("metered_users"))),
-        _render_metric("Active user-days", _fmt_count(overview.get("active_user_days"))),
+        _render_metric("窗口 V2 用量用户", _fmt_count(overview.get("model_active_users"))),
+        _render_metric("Token 可计量用户", _fmt_count(overview.get("token_users"))),
+        _render_metric("有 usage 回报的用户", _fmt_count(overview.get("metered_users"))),
+        _render_metric("V2 模型活跃用户日", _fmt_count(overview.get("active_user_days"))),
         _render_metric("Turns", _fmt_count(overview.get("turns"))),
         _render_metric("Model calls", _fmt_count(overview.get("model_calls"))),
         _render_metric("Retries", _fmt_count(overview.get("retries"))),
@@ -3590,9 +4536,9 @@ def _render_usage_page(
     token_metrics = "".join([
         _render_metric("Prompt tokens", _fmt_count(overview.get("prompt_tokens"))),
         _render_metric("Completion tokens", _fmt_count(overview.get("completion_tokens"))),
-        _render_metric("Known total tokens", _fmt_count(overview.get("total_tokens"))),
-        _render_metric("Complete-cohort tokens", _fmt_count(overview.get("token_user_tokens"))),
-        _render_metric("Tokens / complete-token user", _usage_float(averages.get("tokens_per_token_user"))),
+        _render_metric("已知 Token 总量（下界）", _fmt_count(overview.get("total_tokens"))),
+        _render_metric("可计量用户 Token", _fmt_count(overview.get("token_user_tokens"))),
+        _render_metric("每位 Token 可计量用户", _usage_float(averages.get("tokens_per_token_user"))),
         _render_metric("Chat known tokens", _fmt_count(chat_tokens)),
         _render_metric("Background known tokens", _fmt_count(background_tokens)),
         _render_metric("Background share", _fmt_ratio(background_share)),
@@ -3614,10 +4560,10 @@ def _render_usage_page(
     distribution_available = averages.get("user_day_tokens") is not None
     distribution = averages.get("user_day_tokens") or {}
     average_metrics = "".join([
-        _render_metric("Tokens / calendar day", _usage_float(averages.get("tokens_per_calendar_day"))),
-        _render_metric("Tokens / active user-day", _usage_float(averages.get("tokens_per_active_user_day"))),
-        _render_metric("Tokens / activated user-day", activated_average_text),
-        _render_metric("Tokens / metered turn", _usage_float(averages.get("tokens_per_metered_turn"))),
+        _render_metric("每日已知 Token（窗口均值）", _usage_float(averages.get("tokens_per_calendar_day"))),
+        _render_metric("每位 V2 模型 DAU 已知 Token（加权）", _usage_float(averages.get("tokens_per_active_user_day"))),
+        _render_metric("每个当前激活账号·日（参考）", activated_average_text),
+        _render_metric("每个可计量 turn", _usage_float(averages.get("tokens_per_metered_turn"))),
         _render_metric("User-day p50 / p75", f"{_usage_float(distribution.get('p50'))} / {_usage_float(distribution.get('p75'))}"),
         _render_metric("User-day p90 / p95 / max", f"{_usage_float(distribution.get('p90'))} / {_usage_float(distribution.get('p95'))} / {_usage_float(distribution.get('max'))}"),
         _render_metric("Model calls / turn", _usage_float(averages.get("model_calls_per_turn"), digits=2)),
@@ -3625,8 +4571,6 @@ def _render_usage_page(
     ])
 
     daily_rows = []
-    daily_available = report.get("daily") is not None
-    daily = report.get("daily") or []
     max_daily_tokens = max(
         (int(row.get("total_tokens") or 0) for row in daily), default=0
     )
@@ -3810,73 +4754,150 @@ def _render_usage_page(
         else ""
     )
     return f"""<!doctype html>
-<html>
+<html lang="zh-CN">
 <head>
   <meta charset='utf-8'>
   <meta name='viewport' content='width=device-width, initial-scale=1'>
-  <title>Usage / 模型用量 · Feedling Data Track</title>
+  <title>Token 与模型 · Feedling Data Track</title>
   <style>{_RUNTIME_PAGE_CSS}
-    .usage-filters {{ display:flex; flex-wrap:wrap; gap:10px; align-items:end; margin:14px 0 20px; }}
+    :root {{ --fg:#1b201d; --muted:#68706a; --line:#dddcd4; --bg:#f5f4ef; --card:#fcfbf8; --accent:#416b56; --accent-soft:#e7eee9; --data:#b16a3f; }}
+    main {{ max-width:1440px; padding-top:24px; }}
+    h1 {{ font-size:30px; letter-spacing:-.025em; }}
+    h2 {{ font-size:17px; letter-spacing:-.01em; }}
+    .usage-header {{ display:flex; justify-content:space-between; align-items:flex-end; gap:24px; margin-bottom:14px; }}
+    .usage-kicker,.eyebrow {{ display:block; color:var(--accent); font-size:11px; font-weight:750; letter-spacing:.1em; text-transform:uppercase; }}
+    .usage-range {{ max-width:72ch; margin-top:6px; }}
+    .range-row {{ display:flex; flex-wrap:wrap; align-items:center; gap:10px; margin:12px 0; }}
+    .range-label {{ color:var(--muted); font-size:12px; font-weight:700; }}
+    .usage-filters {{ display:flex; flex-wrap:wrap; gap:10px; align-items:end; margin:12px 0 2px; }}
     .usage-filters label {{ display:flex; flex-direction:column; gap:4px; color:var(--muted); font-size:12px; }}
-    .usage-filters input,.usage-filters select,.usage-filters button {{ min-height:34px; box-sizing:border-box; border:1px solid var(--line); border-radius:6px; background:var(--card); color:var(--fg); padding:6px 8px; }}
-    .usage-filters button {{ color:#fff; background:var(--accent); cursor:pointer; }}
-    .usage-bar {{ width:90px; height:4px; margin-top:4px; background:#eee3d9; border-radius:2px; overflow:hidden; }}
-    .usage-bar span {{ display:block; height:100%; background:var(--accent); }}
-    .table-wrap {{ overflow-x:auto; }}
-    .coverage-groups {{ display:grid; grid-template-columns:1fr 1fr; gap:12px; margin:18px 0 8px; }}
-    .coverage-group {{ min-width:0; padding:12px; border:1px solid var(--line); border-radius:9px; background:#fbf7f3; }}
-    .coverage-group-title {{ margin:0 0 9px 2px; color:var(--muted); font-size:12px; font-weight:700; letter-spacing:.04em; text-transform:uppercase; }}
+    .usage-filters input,.usage-filters select,.usage-filters button {{ min-height:44px; box-sizing:border-box; border:1px solid var(--line); border-radius:6px; background:var(--card); color:var(--fg); padding:9px 11px; }}
+    .usage-filters button {{ color:#f7faf7; background:var(--accent); border-color:var(--accent); cursor:pointer; font-weight:700; }}
+    .advanced-filters,.technical-block {{ border-top:1px solid var(--line); border-bottom:1px solid var(--line); margin:12px 0 20px; padding:10px 0; }}
+    details > summary {{ cursor:pointer; color:var(--fg); font-weight:700; list-style-position:outside; }}
+    details > summary::marker {{ color:var(--accent); }}
+    .usage-pulse {{ margin:28px 0 0; padding:22px 24px 20px; background:var(--accent-soft); border:1px solid #cddbd1; border-radius:12px; }}
+    .pulse-heading {{ display:flex; justify-content:space-between; align-items:flex-start; gap:20px; }}
+    .pulse-heading h2 {{ margin:4px 0 0; font-size:20px; }}
+    .scope-chips {{ display:flex; flex-wrap:wrap; justify-content:flex-end; gap:6px; }}
+    .scope-chips span {{ padding:4px 8px; border:1px solid #c7d4cb; border-radius:999px; color:#365846; background:#f5f8f5; font-size:11px; font-weight:650; }}
+    .pulse-equation {{ display:grid; grid-template-columns:minmax(130px,1fr) auto minmax(130px,1fr) auto minmax(180px,1.25fr); gap:18px; align-items:end; margin:26px 0 18px; font-variant-numeric:tabular-nums; }}
+    .equation-term,.equation-result {{ display:flex; flex-direction:column; gap:3px; }}
+    .equation-term small,.equation-result small {{ color:var(--muted); font-size:12px; }}
+    .equation-term strong {{ font-size:30px; line-height:1; }}
+    .equation-result {{ padding:12px 14px; background:#315744; color:#f4f7f4; border-radius:8px; }}
+    .equation-result strong {{ font-size:38px; line-height:.95; }}
+    .equation-result small {{ color:#dce8e0; }}
+    .equation-sign {{ align-self:center; color:#718077; font-size:24px; }}
+    .pulse-foot {{ display:flex; justify-content:space-between; gap:18px; padding-top:13px; border-top:1px solid #c7d4cb; color:var(--muted); font-size:12px; }}
+    .window-ledger {{ display:grid; grid-template-columns:repeat(4,1fr); border-bottom:1px solid var(--line); margin:0 0 26px; font-variant-numeric:tabular-nums; }}
+    .window-ledger > div {{ padding:14px 18px 15px; border-right:1px solid var(--line); }}
+    .window-ledger > div:last-child {{ border-right:0; }}
+    .window-ledger span {{ display:block; color:var(--muted); font-size:11px; }}
+    .window-ledger b {{ display:block; margin-top:3px; font-size:21px; }}
+    .trend-ledger {{ margin:12px 0 20px; font-variant-numeric:tabular-nums; }}
+    .trend-head,.trend-row {{ display:grid; grid-template-columns:64px minmax(160px,1fr) 78px 88px 104px; gap:12px; align-items:center; min-height:34px; padding:0 10px; }}
+    .trend-head {{ color:var(--muted); font-size:10px; font-weight:750; letter-spacing:.04em; text-transform:uppercase; border-bottom:1px solid var(--line); }}
+    .trend-row {{ color:var(--muted); font-size:12px; border-bottom:1px solid #e8e6df; }}
+    .trend-row b {{ color:var(--fg); text-align:right; }}
+    .trend-row.focus {{ background:#f0eee7; color:var(--fg); }}
+    .trend-track {{ height:7px; background:#e7e3d9; overflow:hidden; border-radius:999px; }}
+    .trend-track span {{ display:block; height:100%; background:var(--data); }}
+    .usage-empty {{ padding:22px; color:var(--muted); background:var(--card); border:1px dashed var(--line); }}
+    .usage-bar {{ width:90px; height:4px; margin-top:4px; background:#e7e3d9; border-radius:2px; overflow:hidden; }}
+    .usage-bar span {{ display:block; height:100%; background:var(--data); }}
+    .table-wrap {{ overflow-x:auto; margin-top:10px; }}
+    table {{ font-variant-numeric:tabular-nums; }}
+    th {{ position:sticky; top:0; z-index:1; }}
+    .coverage-groups {{ display:grid; grid-template-columns:1fr 1fr; gap:12px; margin:12px 0 8px; }}
+    .coverage-group {{ min-width:0; padding:13px; border:1px solid var(--line); border-radius:9px; background:#f0eee8; }}
+    .coverage-group-title {{ margin:0 0 9px 2px; color:var(--muted); font-size:11px; font-weight:750; letter-spacing:.06em; text-transform:uppercase; }}
     .coverage-pair {{ display:grid; grid-template-columns:1fr 1fr; gap:8px; align-items:stretch; }}
-    .coverage-node {{ height:100%; box-sizing:border-box; background:var(--card); border:1px solid var(--line); border-top:3px solid var(--accent); border-radius:8px; padding:14px; }}
-    .coverage-label {{ color:var(--muted); font-size:12px; letter-spacing:.04em; }}
-    .coverage-value {{ margin:3px 0 2px; font-size:28px; line-height:1.15; font-weight:750; font-variant-numeric:tabular-nums; }}
+    .coverage-node {{ height:100%; box-sizing:border-box; background:var(--card); border:1px solid var(--line); border-radius:7px; padding:13px; }}
+    .coverage-label {{ color:var(--muted); font-size:12px; }}
+    .coverage-value {{ margin:3px 0 2px; font-size:27px; line-height:1.15; font-weight:750; font-variant-numeric:tabular-nums; }}
     .coverage-detail {{ color:var(--muted); font-size:11px; }}
-    @media (max-width:760px) {{
+    .section-intro {{ max-width:78ch; margin-top:-7px; }}
+    .diagnostic-stack {{ display:grid; gap:10px; margin-top:26px; }}
+    .diagnostic-stack > details {{ margin:0; padding:12px 0; }}
+    a:focus-visible,summary:focus-visible,button:focus-visible,input:focus-visible,select:focus-visible {{ outline:3px solid #9bb7a7; outline-offset:2px; }}
+    @media (max-width:860px) {{
+      .pulse-heading,.pulse-foot,.usage-header {{ align-items:flex-start; flex-direction:column; }}
+      .scope-chips {{ justify-content:flex-start; }}
+      .pulse-equation {{ grid-template-columns:1fr auto 1fr; }}
+      .pulse-equation .equation-result {{ grid-column:1 / -1; }}
+      .pulse-equation .equation-sign:nth-of-type(2) {{ display:none; }}
+      .window-ledger {{ grid-template-columns:1fr 1fr; }}
+      .window-ledger > div:nth-child(2) {{ border-right:0; }}
       .coverage-groups {{ grid-template-columns:1fr; }}
     }}
-    @media (max-width:460px) {{ .coverage-pair {{ grid-template-columns:1fr; }} }}
+    @media (max-width:640px) {{
+      main {{ padding:18px 14px 36px; }}
+      .usage-pulse {{ padding:18px 16px; }}
+      .pulse-equation {{ gap:9px; }}
+      .equation-term strong {{ font-size:25px; }}
+      .trend-head {{ display:none; }}
+      .trend-row {{ grid-template-columns:50px minmax(80px,1fr) 62px; gap:8px; padding:6px 4px; }}
+      .trend-row span:nth-last-child(-n+2) {{ grid-column:2 / -1; }}
+      .coverage-pair {{ grid-template-columns:1fr; }}
+    }}
   </style>
 </head>
 <body><main>
-  <h1>Usage / 模型用量</h1>
-  <div class='muted'>Hosted Runtime V2 whole-turn telemetry · UTC range
-    {html.escape(query.start_at_utc.isoformat())} — {html.escape(query.end_at_utc.isoformat())} · display timezone {timezone_name}.</div>
+  <header class='usage-header'>
+    <div><span class='usage-kicker'>Usage / 模型用量</span><h1>Token 与模型</h1>
+    <div class='muted usage-range'>Hosted Runtime V2 whole-turn telemetry · UTC
+      {html.escape(query.start_at_utc.isoformat())} 至 {html.escape(query.end_at_utc.isoformat())} · 展示时区 {timezone_name}</div></div>
+  </header>
   {_render_data_track_view_nav('usage', query, drilldown_user_id)}
-  <div class='sortbar'>{''.join(preset_links)}</div>
-  {filter_form}
+  <div class='range-row'><span class='range-label'>时间范围</span><div class='sortbar'>{''.join(preset_links)}</div></div>
+  <details class='advanced-filters'{" open" if dimension_filtered or query.preset == "custom" else ""}>
+    <summary>高级筛选与自定义日期</summary>{filter_form}
+  </details>
   {drilldown}
-  <h2>用户覆盖与窗口活动</h2>
-  {coverage_groups}
-  <div class='note-box'><b>先看清口径：</b>“当前账号覆盖”是此刻的全站账号状态；“所选窗口活动”是 Hosted V2 telemetry 的历史窗口数据，并跟随筛选。两组不是漏斗，不能直接相减。当前 Hosted V2 覆盖率 = Hosted V2 users / 全部 App account rows；它不是 usage 上报覆盖率。</div>
-  <h2>Reference cohort · 截止所选区间末端</h2>
-  <section class='metrics'>{reference_metrics}</section>
-  <h2>Fleet Overview · filtered usage</h2>
-  <section class='metrics'>{usage_metrics}</section>
+  {usage_pulse}
+  <h2>每日趋势</h2>
+  <div class='muted section-intro'>下方只展示最近 14 个返回日；窗口平均基于窗口内全部自然日行。滚动窗口首尾可能只是部分自然日。Token / DAU 一律使用已知 Token 下界。</div>
+  {_render_usage_trend(daily, focus_day=focus_day)}
+  <details class='technical-block'>
+    <summary>查看完整每日数据</summary>
+    <div class='table-wrap'><table><thead><tr><th>Local day</th><th>Known tokens</th><th>V2 模型 DAU</th><th>Token 可计量用户</th><th>Token / 可计量用户</th><th>Token / V2 模型 DAU</th><th>Token / 可计量 turn</th><th>Calls</th><th>Retries</th><th>Failed</th><th>Usage / cache coverage</th></tr></thead>
+    <tbody>{daily_body}</tbody></table></div>
+  </details>
   <h2>Token 用量与成本结构 · 跟随当前筛选</h2>
   <section class='metrics'>{token_metrics}</section>
-  <div class='muted'>Known total 会保留 partial-only 用户已知的 token；Complete-cohort tokens 与其人均值只统计窗口内 input / output 两列各至少有一次已知值的用户，因此两者不一定相等。Chat / Background 仅拆分当前所选 cohort；例如筛选 lane=chat 时 Background 为 0，不代表全站后台用量为 0。</div>
-  <h2>平均值</h2>
-  <section class='metrics'>{average_metrics}</section>
-  {optional_note}
-  <div class='note-box'><b>P0-A 边界：</b>Reasoning tokens、possibly-billed attempts 与 authoritative cost 均 <b>unavailable until P0-B</b>，不会显示成零。Prompt token 已包含 cache token，不能重复相加。</div>
-  <h2>每日趋势</h2>
-  <div class='muted'>按 {timezone_name} 自然日展示；滚动窗口的首尾日期可能只覆盖部分自然日，custom 日期区间则按完整自然日。</div>
-  <div class='table-wrap'><table><thead><tr><th>Local day</th><th>Known tokens</th><th>Active users</th><th>Complete-token users</th><th>Tokens / complete-token user</th><th>Tokens / active user-day</th><th>Tokens / metered turn</th><th>Calls</th><th>Retries</th><th>Failed</th><th>Usage / cache coverage</th></tr></thead>
-  <tbody>{daily_body}</tbody></table></div>
+  <div class='muted section-intro'>Known total 会保留 partial-only 用户已知的 token；旧名 Complete-cohort tokens 的“可计量用户 Token”与其人均值，只统计窗口内 input / output 两列各至少有一次已知值的用户。Chat / Background 仅拆分当前 cohort；筛选 lane=chat 时 Background 为 0，不代表全站后台用量为 0。</div>
+  <h2>用户覆盖与窗口活动</h2>
+  {coverage_groups}
+  <details class='technical-block'><summary>查看覆盖口径</summary>
+    <div class='note-box'><b>先看清口径：</b>“当前账号覆盖”是此刻的全站账号行状态；“所选窗口活动”是 Hosted V2 telemetry 的历史窗口数据，并跟随筛选。两组不是漏斗，不能直接相减。当前 Hosted V2 覆盖率 = Hosted V2 account rows / 全部 App account rows；它不是 usage 上报覆盖率，也不是去重真人比例。</div>
+  </details>
   <h2>Per-user Usage</h2>
+  <div class='muted section-intro'>按用户查看窗口内已知用量；点击 UID 进入同一筛选口径的单用户钻取。</div>
   <div class='sortbar'>{''.join(sort_links)} {''.join(pager)}<span class='muted'>Showing {user_offset + 1 if user_rows else 0}–{user_offset + len(user_rows)} of {user_total}</span></div>
   <div class='table-wrap'><table><thead><tr><th>User</th><th>Last model call (UTC)</th><th>Active days</th><th>Turns / calls / retries / failed</th><th>Prompt / completion / total</th><th>Cache R / W / M</th><th>Calendar / active-day avg</th><th>Daily p50 / p95</th><th>Tokens / metered turn</th><th>Primary provider / model</th><th>Usage / cache / unknown</th><th>Known share</th></tr></thead>
   <tbody>{user_body}</tbody></table></div>
-  <h2>Provider / Model</h2>
-  <div class='muted'>Identity 是 whole-turn resolved / best-known；requested 与 resolved 将在 P0-B attempt ledger 分开。</div>
-  <div class='table-wrap'><table><thead><tr><th>Provider</th><th>Model</th><th>Users</th><th>Turns / calls / retries</th><th>Failed / failure / retry rate</th><th>Prompt / completion / total</th><th>Cache R / W / M</th><th>Tokens / call</th><th>Latency p50 / p95</th><th>Usage / cache coverage</th></tr></thead>
-  <tbody>{model_body}</tbody></table></div>
-  {lane_section}
-  <h2>数据覆盖与边界</h2>
-  {rollup_freshness}
-  <div class='note-box'>Usage {_fmt_count(coverage.get('usage_reported_calls'))} / {_fmt_count(coverage.get('model_calls'))} ({_fmt_ratio(coverage.get('usage_coverage'))}) · Cache {_fmt_count(coverage.get('cache_reported_calls'))} / {_fmt_count(coverage.get('model_calls'))} ({_fmt_ratio(coverage.get('cache_coverage'))}) · Cache hit {_fmt_ratio(coverage.get('cache_hit_ratio'))}.<br>
-  参考 cohort basis: <code>{html.escape(str(cohort.get('basis') or 'unknown'))}</code>；unparseable registrations {_fmt_count(cohort.get('unparseable_registered_rows'))}，legacy memory timestamps {_fmt_count(cohort.get('legacy_memory_rows_without_valid_created_at'))}。{html.escape(str(cohort.get('limitation') or ''))}<br>
-  <b>范围：</b>全部 App 用户与 range-end reference cards 来自 users，跨所有 runtime mode；其余 usage、每日趋势、用户/模型/lane 明细仅统计本实例 Hosted Runtime V2。Resident V1、Hosted V1 与 self-host token 均未计入，不能从本页数字外推。Unknown 是缺报，不是零。</div>
+  <div class='diagnostic-stack'>
+    <details class='technical-block'><summary>Provider / Model</summary>
+      <h2>Provider / Model</h2>
+      <div class='muted'>Identity 是 whole-turn resolved / best-known；requested 与 resolved 将在 P0-B attempt ledger 分开。</div>
+      <div class='table-wrap'><table><thead><tr><th>Provider</th><th>Model</th><th>Users</th><th>Turns / calls / retries</th><th>Failed / failure / retry rate</th><th>Prompt / completion / total</th><th>Cache R / W / M</th><th>Tokens / call</th><th>Latency p50 / p95</th><th>Usage / cache coverage</th></tr></thead>
+      <tbody>{model_body}</tbody></table></div>
+    </details>
+    <details class='technical-block'><summary>Lane breakdown · 成本拆分</summary>{lane_section}</details>
+    <details class='technical-block'><summary>Fleet Overview 与窗口平均值</summary>
+      <h2>Fleet Overview · filtered usage</h2><section class='metrics'>{usage_metrics}</section>
+      <h2>平均值</h2><section class='metrics'>{average_metrics}</section>{optional_note}
+    </details>
+    <details class='technical-block'><summary>Reference cohort 与数据覆盖边界</summary>
+      <h2>Reference cohort · 截止所选区间末端</h2><section class='metrics'>{reference_metrics}</section>
+      <h2>数据覆盖与边界</h2>{rollup_freshness}
+      <div class='note-box'><b>P0-A 边界：</b>Reasoning tokens、possibly-billed attempts 与 authoritative cost 均 <b>unavailable until P0-B</b>，不会显示成零。Prompt token 已包含 cache token，不能重复相加。</div>
+      <div class='note-box'>Usage {_fmt_count(coverage.get('usage_reported_calls'))} / {_fmt_count(coverage.get('model_calls'))} ({_fmt_ratio(coverage.get('usage_coverage'))}) · Cache {_fmt_count(coverage.get('cache_reported_calls'))} / {_fmt_count(coverage.get('model_calls'))} ({_fmt_ratio(coverage.get('cache_coverage'))}) · Cache hit {_fmt_ratio(coverage.get('cache_hit_ratio'))}.<br>
+      参考 cohort basis: <code>{html.escape(str(cohort.get('basis') or 'unknown'))}</code>；unparseable registrations {_fmt_count(cohort.get('unparseable_registered_rows'))}，legacy memory timestamps {_fmt_count(cohort.get('legacy_memory_rows_without_valid_created_at'))}。{html.escape(str(cohort.get('limitation') or ''))}<br>
+      <b>范围：</b>全部 App 账号行与 range-end reference cards 来自 users，跨所有 runtime mode；其余 usage、每日趋势、用户/模型/lane 明细仅统计本实例 Hosted Runtime V2。Resident V1、Hosted V1 与 self-host token 均未计入，不能从本页数字外推。Unknown 是缺报，不是零。</div>
+    </details>
+  </div>
 </main></body></html>"""
 
 
@@ -3890,7 +4911,7 @@ def _render_usage_error_page(
         if drilldown_user_id else ""
     )
     return f"""<!doctype html>
-<html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width, initial-scale=1'>
+<html lang="zh-CN"><head><meta charset='utf-8'><meta name='viewport' content='width=device-width, initial-scale=1'>
 <title>Usage / 模型用量 · Feedling Data Track</title><style>{_RUNTIME_PAGE_CSS}</style></head>
 <body><main><h1>Usage / 模型用量</h1>{_render_data_track_view_nav('usage', query, drilldown_user_id)}
 <div class='note-box'><b>Usage 数据暂时取不到。</b>仅本页降级；Runtime 健康和其他 Admin 视图不受影响。具体异常见后端日志。</div>
@@ -3922,20 +4943,50 @@ def _render_data_track_view_nav(
                 # Do not leak it into unrelated views where user_id has another
                 # meaning (or is silently ignored).
                 user_id=None if active == "usage" else request.args.get("user_id"),
+                # Runtime population is a Users-only filter.  Carrying it into
+                # DAU / Growth / Runtime produces a URL that looks filtered
+                # even though those views do not consume it.
+                runtime_state=(
+                    request.args.get("runtime_state")
+                    if view == "users"
+                    else None
+                ),
+                # The four operations views and Runtime share the rolling
+                # hours window.  Other pages have their own day/days contracts;
+                # carrying hours there only makes URLs look filtered when they
+                # are not.
+                hours=(
+                    request.args.get("hours")
+                    if view in {"overview", "imports", "chat", "latency", "runtime"}
+                    else None
+                ),
+                day=(
+                    request.args.get("day")
+                    if view in {"dau", "proactive"}
+                    else None
+                ),
             )
-        return f"<a class='{cls}' href='{html.escape(href, quote=True)}'>{html.escape(label)}</a>"
+        current = " aria-current='page'" if active == view else ""
+        return (
+            f"<a class='{cls}' href='{html.escape(href, quote=True)}'"
+            f"{current}>{html.escape(label)}</a>"
+        )
 
     return (
-        "<div class='viewbar'>"
-        f"{nav_item('users', 'Users')}"
-        f"{nav_item('dau', 'DAU')}"
+        "<nav class='viewbar' aria-label='Data Track views'>"
+        f"{nav_item('overview', '总览')}"
+        f"{nav_item('imports', '记忆导入')}"
+        f"{nav_item('chat', '聊天可靠性')}"
+        f"{nav_item('latency', '延迟')}"
+        f"{nav_item('users', '用户')}"
+        f"{nav_item('dau', '日活与时长')}"
         f"{nav_item('growth', '增长 & 留存')}"
-        f"{nav_item('proactive', 'Proactive 日报')}"
-        f"{nav_item('events', '事件健康度')}"
-        f"{nav_item('runtime', 'Runtime 健康')}"
-        f"{nav_item('usage', 'Usage / 模型用量')}"
-        f"{nav_item('debug', 'Debug')}"
-        "</div>"
+        f"{nav_item('proactive', '主动任务')}"
+        f"{nav_item('events', '事件采集')}"
+        f"{nav_item('runtime', '运行状态')}"
+        f"{nav_item('usage', 'Token 与模型')}"
+        f"{nav_item('debug', '调试')}"
+        "</nav>"
     )
 
 
@@ -4008,11 +5059,28 @@ def _render_data_track_page(payload: dict) -> str:
         conn_cls = "warn" if conn_status in ("offline", "stalled") else ("ok" if conn_status == "ok" else "muted")
         conn_age = conn.get("stale_h")
         conn_sub = f"{conn_age:.0f}h" if isinstance(conn_age, (int, float)) else ""
+        responder = row.get("responder") or {}
+        runtime_state = str(responder.get("runtime_state") or "resident")
+        runtime_cls = (
+            "ok" if runtime_state == "v2"
+            else "warn" if runtime_state == "draining"
+            else "muted"
+        )
+        runtime_label = {
+            "v2": "Hosted V2",
+            "draining": "Draining",
+            "resident": "Resident / V1",
+        }.get(runtime_state, runtime_state or "unknown")
+        effective_responder = str(
+            responder.get("effective_responder") or "none"
+        )
         rows_html.append(
             "<tr>"
             f"<td><a href='{html.escape(user_url)}'>{html.escape(row['user_id'])}</a>"
             f"<br><span class='muted'>{html.escape(principal_short)} · keys {access.get('api_keys_count', 0)}</span></td>"
             f"<td>{html.escape(row['route'])}</td>"
+            f"<td><span class='pill {runtime_cls}'>{html.escape(runtime_label)}</span>"
+            f"<br><span class='muted'>{html.escape(effective_responder)}</span></td>"
             f"<td><span class='pill {conn_cls}'>{html.escape(conn.get('label', '—'))}</span>"
             f"<br><span class='muted'>{html.escape(conn_sub)}</span></td>"
             f"<td><span class='pill {status_class}'>{html.escape(stage)}</span></td>"
@@ -4033,11 +5101,19 @@ def _render_data_track_page(payload: dict) -> str:
     raw_rows = int(summary["users_total"])
     off = int(summary.get("conn_offline") or 0)
     stalled = int(summary.get("conn_stalled") or 0)
+    runtime_state_counts = summary.get("runtime_state_counts") or {}
+    activated_runtime_state_counts = (
+        summary.get("activated_runtime_state_counts") or {}
+    )
     # 头条用「激活用户」(真正用起来的人),不用「注册」——注册行含重装/换机产生的孤儿号,
     # 每次静默重注册都新建一行且旧行不删,所以不是人数。principals_total 在 prod 恒等于
     # 注册行(每次重装新密钥=新 principal),去重无意义,不再展示。
     metrics = "".join([
         _render_metric("激活用户（真正用起来的人）", activated),
+        _render_metric("Hosted V2 账号行（当前筛选）", _fmt_count(runtime_state_counts.get("v2", 0))),
+        _render_metric("已激活 Hosted V2 账号行（当前筛选）", _fmt_count(activated_runtime_state_counts.get("v2", 0))),
+        _render_metric("Draining 账号行（当前筛选）", _fmt_count(runtime_state_counts.get("draining", 0))),
+        _render_metric("Resident / V1 账号行（当前筛选）", _fmt_count(runtime_state_counts.get("resident", 0))),
         _render_metric("累计注册行（含重装孤儿·非人数）", raw_rows),
         _render_metric("真人活跃 1d/3d（有人发消息）", f"{summary.get('human_active_1d', 0)} / {summary.get('human_active_3d', 0)}"),
         _render_metric("系统活跃 1d/3d（含后台任务）", f"{fn.get('active_1d', 0)} / {fn.get('active_3d', 0)}"),
@@ -4071,40 +5147,28 @@ def _render_data_track_page(payload: dict) -> str:
         "<h2>Activation funnel（真实使用漏斗 · 基于行为,不看 stage 标签）</h2>"
         f"<section class='funnel'>{funnel_html}</section>"
     )
-    # One operator-facing telemetry surface: Runtime V2 model usage, deployment
-    # route coverage, and iOS foreground duration. The three clocks are labelled
-    # explicitly because model latency is not product engagement time.
-    rt = summary.get("runtime_token_usage") or {}
-    route_counts = summary.get("activated_route_counts") or {}
-    cache_read = rt.get("cache_read_tokens")
-    cache_miss = rt.get("cache_miss_tokens")
-    cache_denominator = (
-        int(cache_read) + int(cache_miss)
-        if cache_read is not None and cache_miss is not None
-        else 0
-    )
-    cache_hit_ratio = (
-        int(cache_read) / cache_denominator if cache_denominator else None
-    )
-    token_window = int(rt.get("window_days") or 30)
-    telemetry_metrics = "".join([
-        _render_metric(f"全站 V2 token 总量（近 {token_window} 天）", _fmt_count(rt.get("total_tokens"))),
-        _render_metric(f"全站 V2 输入 / 输出 token（近 {token_window} 天）", f"{_fmt_count(rt.get('prompt_tokens'))} / {_fmt_count(rt.get('completion_tokens'))}"),
-        _render_metric(f"Prompt cache 读取 token（近 {token_window} 天）", _fmt_count(cache_read)),
-        _render_metric(f"Prompt cache token 命中率（近 {token_window} 天）", _fmt_ratio(cache_hit_ratio)),
-        _render_metric(f"Token 上报覆盖率（近 {token_window} 天）", _fmt_ratio(rt.get("usage_telemetry_coverage"))),
-        _render_metric(f"全站 V2 使用账号 / turns（近 {token_window} 天）", f"{_fmt_count(rt.get('users'))} / {_fmt_count(rt.get('sampled_turns'))}"),
-        _render_metric("托管激活账号（当前筛选）", _fmt_count(route_counts.get("model_api", 0))),
-        _render_metric("自托管激活账号（当前筛选）", _fmt_count(route_counts.get("resident", 0))),
-    ])
-    telemetry_section = (
-        "<h2>运营 Telemetry</h2>"
-        f"<section class='metrics'>{telemetry_metrics}</section>"
-        "<div class='muted'>Token 来自 provider usage，缺报会降低覆盖率而不会伪装成 0；"
-        "prompt token 已包含 cache read/write，不与 cache 列重复相加。"
-        "Token 是全站近期开销，不随用户搜索条件收窄；托管/自托管按当前页面筛选后、当前 route 的已激活账号行统计。"
-        "从未联系官方 backend 的离线自托管实例不可观测，"
-        "重装产生的旧账号也可能重复，因此它是可观测账号覆盖数，不是假装精确的真人/实例数。</div>"
+    runtime_filter_links = []
+    selected_runtime_state = str(filters.get("runtime_state") or "")
+    for state, label in (
+        ("", "全部 runtime"),
+        ("v2", "Hosted V2"),
+        ("draining", "Draining"),
+        ("resident", "Resident / V1"),
+    ):
+        cls = "sort-button active" if selected_runtime_state == state else "sort-button"
+        href = _data_track_page_href(
+            view=None, runtime_state=state or None, offset=0
+        )
+        runtime_filter_links.append(
+            f"<a class='{cls}' href='{html.escape(href, quote=True)}'>{html.escape(label)}</a>"
+        )
+    runtime_population_section = (
+        "<h2>Runtime 人群</h2>"
+        f"<div class='sortbar'>{''.join(runtime_filter_links)}</div>"
+        "<div class='muted'>这里按实际 <code>hosted_runtime_state</code> 筛选，"
+        "不是 onboarding route。这里计的是 user/account rows，不是去重真人；重装旧号可能重复。"
+        "“已激活”仍按有记忆或发过消息的行为口径。Token 与模型用量已移到独立页面，避免把只统计 chat lane 的旧 rollup 误称为全站用量。"
+        f" <a href='{html.escape(_usage_page_href(), quote=True)}'>打开 Token 与模型</a>。</div>"
     )
     # App 使用时长(iOS app_session_end 事件聚合 · summary['app_usage'] 由 db 层填充)。
     au = summary.get("app_usage") or {}
@@ -4126,13 +5190,13 @@ def _render_data_track_page(payload: dict) -> str:
             "<div class='muted'>暂无 app_session_end 事件（iOS 上报后此处出现聚合）。</div>"
         )
     return f"""<!doctype html>
-<html>
+<html lang="zh-CN">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Feedling Beta Data Track</title>
   <style>
-    :root {{ color-scheme: light; --fg:#191613; --muted:#736963; --line:#e6ddd5; --bg:#fbf8f4; --card:#fffdfa; --accent:#b7352b; --ok:#1d7a4d; --warn:#a05a00; }}
+    :root {{ color-scheme: light; --fg:#1b201d; --muted:#68706a; --line:#dddcd4; --bg:#f5f4ef; --card:#fcfbf8; --accent:#416b56; --ok:#1d7a4d; --warn:#a05a00; }}
     body {{ margin:0; background:var(--bg); color:var(--fg); font:14px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; }}
     main {{ max-width:1280px; margin:0 auto; padding:28px 24px 48px; }}
     h1 {{ font-size:26px; margin:0 0 4px; }}
@@ -4151,8 +5215,8 @@ def _render_data_track_page(payload: dict) -> str:
     .note-box {{ background:#fff8ef; border:1px solid #e8d8be; border-radius:8px; padding:12px 14px; margin:16px 0 4px; font-size:13px; line-height:1.6; color:#5a4d3c; }}
 	    .toolbar {{ display:flex; gap:10px; align-items:center; margin:18px 0; }}
 	    .viewbar,.sortbar,.pager {{ display:flex; flex-wrap:wrap; gap:8px; align-items:center; margin:10px 0 18px; }}
-	    .sort-button {{ display:inline-flex; align-items:center; border:1px solid var(--line); border-radius:6px; padding:7px 10px; background:var(--card); color:var(--fg); font-size:13px; }}
-	    .sort-button.active {{ border-color:var(--accent); color:var(--accent); background:#fff1ed; }}
+	    .sort-button {{ display:inline-flex; min-height:44px; box-sizing:border-box; align-items:center; justify-content:center; border:1px solid var(--line); border-radius:6px; padding:9px 12px; background:var(--card); color:var(--fg); font-size:13px; }}
+	    .sort-button.active {{ border-color:var(--accent); color:var(--accent); background:#e7eee9; }}
 	    input {{ width:320px; max-width:100%; border:1px solid var(--line); border-radius:6px; padding:9px 10px; background:white; color:var(--fg); }}
 	    .toolbar button {{ border:0; border-radius:6px; padding:9px 13px; background:var(--accent); color:white; font-weight:600; cursor:pointer; }}
     table {{ width:100%; border-collapse:collapse; background:var(--card); border:1px solid var(--line); border-radius:8px; overflow:hidden; }}
@@ -4164,6 +5228,7 @@ def _render_data_track_page(payload: dict) -> str:
     .pill.ok {{ color:var(--ok); background:#e7f3ed; }}
     .pill.warn {{ color:var(--warn); background:#fff1db; }}
     pre {{ white-space:pre-wrap; word-break:break-word; background:var(--card); border:1px solid var(--line); border-radius:8px; padding:14px; }}
+    .table-wrap {{ max-width:100%; overflow-x:auto; }}
   </style>
 </head>
 <body>
@@ -4180,8 +5245,8 @@ def _render_data_track_page(payload: dict) -> str:
 	  </div>
 	  {_render_data_track_view_nav("users")}
 		  <section class="metrics">{metrics}</section>
+		  {runtime_population_section}
 		  {funnel_section}
-		  {telemetry_section}
 		  {app_usage_section}
 	  <h2>Beta users</h2>
 	  <form class="toolbar" method="get" action="/admin/data-track/users">
@@ -4189,13 +5254,13 @@ def _render_data_track_page(payload: dict) -> str:
 	    <input name="uid" placeholder="输入 UID 直查（usr_…）" autocomplete="off">
 	    <button type="submit">打开用户详情</button>
 	  </form>
-	  <div class="toolbar"><input id="q" placeholder="Filter user, route, stage"></div>
+	  <div class="toolbar"><input id="q" placeholder="筛选 UID、route、runtime state、stage"></div>
 	  <div class="sortbar">{sort_controls}</div>
 	  {pager}
-	  <table id="users">
-    <thead><tr><th>User</th><th>Route</th><th>连接</th><th>Onboarding</th><th>Steps</th><th>Stuck</th><th>Chat</th><th>Memory</th><th>Proactive 心跳/屏幕(fail)</th><th>Last activity</th></tr></thead>
+	  <div class="table-wrap"><table id="users">
+    <thead><tr><th>User</th><th>Onboarding route</th><th>实际 Runtime</th><th>连接</th><th>Onboarding</th><th>Steps</th><th>Chat</th><th>Memory</th><th>Proactive 心跳/屏幕(fail)</th><th>Last activity</th></tr></thead>
     <tbody>{''.join(rows_html) if rows_html else "<tr><td colspan='10' class='muted'>No users yet.</td></tr>"}</tbody>
-  </table>
+  </table></div>
 </main>
 <script>
 const q = document.getElementById('q');
@@ -4337,13 +5402,13 @@ def _render_data_track_dau_page(payload: dict) -> str:
         _render_metric("tracking events", summary["tracking_events"]),
     ])
     return f"""<!doctype html>
-<html>
+<html lang="zh-CN">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Feedling DAU · Data Track</title>
   <style>
-    :root {{ color-scheme: light; --fg:#191613; --muted:#736963; --line:#e6ddd5; --bg:#fbf8f4; --card:#fffdfa; --accent:#b7352b; }}
+    :root {{ color-scheme: light; --fg:#1b201d; --muted:#68706a; --line:#dddcd4; --bg:#f5f4ef; --card:#fcfbf8; --accent:#416b56; }}
     body {{ margin:0; background:var(--bg); color:var(--fg); font:14px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; }}
     main {{ max-width:1280px; margin:0 auto; padding:28px 24px 48px; }}
     h1 {{ font-size:26px; margin:0 0 4px; }}
@@ -4360,8 +5425,8 @@ def _render_data_track_dau_page(payload: dict) -> str:
     .fn-bar span {{ display:block; height:100%; background:var(--accent); }}
     .fn-label {{ color:var(--muted); font-size:12px; }}
     .viewbar,.toolbar {{ display:flex; flex-wrap:wrap; gap:8px; align-items:center; margin:14px 0 18px; }}
-    .sort-button {{ display:inline-flex; align-items:center; border:1px solid var(--line); border-radius:6px; padding:7px 10px; background:var(--card); color:var(--fg); font-size:13px; }}
-    .sort-button.active {{ border-color:var(--accent); color:var(--accent); background:#fff1ed; }}
+    .sort-button {{ display:inline-flex; min-height:44px; box-sizing:border-box; align-items:center; justify-content:center; border:1px solid var(--line); border-radius:6px; padding:9px 12px; background:var(--card); color:var(--fg); font-size:13px; }}
+    .sort-button.active {{ border-color:var(--accent); color:var(--accent); background:#e7eee9; }}
     .histogram {{ background:var(--card); border:1px solid var(--line); border-radius:8px; padding:16px; }}
     .hist-row {{ display:grid; grid-template-columns:72px minmax(120px,1fr) 110px; gap:10px; align-items:center; margin:9px 0; }}
     .hist-label {{ color:var(--muted); font-size:12px; text-align:right; }}
@@ -4453,7 +5518,7 @@ def _data_track_growth_payload() -> dict:
 
 
 _GROWTH_STYLE = """
-    :root { color-scheme: light; --fg:#191613; --muted:#736963; --line:#e6ddd5; --bg:#fbf8f4; --card:#fffdfa; --accent:#b7352b; }
+    :root { color-scheme: light; --fg:#1b201d; --muted:#68706a; --line:#dddcd4; --bg:#f5f4ef; --card:#fcfbf8; --accent:#416b56; }
     body { margin:0; background:var(--bg); color:var(--fg); font:14px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; }
     main { max-width:1280px; margin:0 auto; padding:28px 24px 48px; }
     h1 { font-size:26px; margin:0 0 4px; }
@@ -4464,8 +5529,8 @@ _GROWTH_STYLE = """
     .metric-value { font-size:24px; font-weight:700; }
     .metric-label { color:var(--muted); font-size:12px; text-transform:uppercase; letter-spacing:.08em; }
     .viewbar,.toolbar { display:flex; flex-wrap:wrap; gap:8px; align-items:center; margin:14px 0 18px; }
-    .sort-button { display:inline-flex; align-items:center; border:1px solid var(--line); border-radius:6px; padding:7px 10px; background:var(--card); color:var(--fg); font-size:13px; }
-    .sort-button.active { border-color:var(--accent); color:var(--accent); background:#fff1ed; }
+    .sort-button { display:inline-flex; min-height:44px; box-sizing:border-box; align-items:center; justify-content:center; border:1px solid var(--line); border-radius:6px; padding:9px 12px; background:var(--card); color:var(--fg); font-size:13px; }
+    .sort-button.active { border-color:var(--accent); color:var(--accent); background:#e7eee9; }
     table { width:100%; border-collapse:collapse; background:var(--card); border:1px solid var(--line); border-radius:8px; overflow:hidden; }
     th,td { text-align:left; padding:9px 11px; border-bottom:1px solid var(--line); vertical-align:top; }
     th { font-size:12px; color:var(--muted); text-transform:uppercase; letter-spacing:.06em; background:#f4ece5; }
@@ -4685,7 +5750,7 @@ def _render_data_track_growth_page(payload: dict) -> str:
     boundary = (f"留存只统计<b>冻结边界 {_freeze} 起</b>注册的 cohort;此日之前的历史实时重算、会随删号偏少不准,已按产品决策<b>整体排除</b>,不进本页。"
                 if _freeze else "每日快照尚未生效;生效后本页只统计冻结边界起注册的 cohort。")
     return f"""<!doctype html>
-<html>
+<html lang="zh-CN">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -4837,13 +5902,13 @@ def _render_proactive_daily_page(payload: dict) -> str:
         _render_metric("V2 心跳 / 失败+过期", f"{summary.get('total_v2_heartbeat', 0)} / {summary.get('total_v2_heartbeat_failed', 0)}"),
     ])
     return f"""<!doctype html>
-<html>
+<html lang="zh-CN">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Feedling Proactive 日报 · Data Track</title>
   <style>
-    :root {{ color-scheme: light; --fg:#191613; --muted:#736963; --line:#e6ddd5; --bg:#fbf8f4; --card:#fffdfa; --accent:#b7352b; --ok:#1d7a4d; --warn:#a05a00; --bad:#b7352b; }}
+    :root {{ color-scheme: light; --fg:#1b201d; --muted:#68706a; --line:#dddcd4; --bg:#f5f4ef; --card:#fcfbf8; --accent:#416b56; --ok:#1d7a4d; --warn:#a05a00; --bad:#b7352b; }}
     body {{ margin:0; background:var(--bg); color:var(--fg); font:14px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; }}
     main {{ max-width:1280px; margin:0 auto; padding:28px 24px 48px; }}
     h1 {{ font-size:26px; margin:0 0 4px; }} h2 {{ font-size:16px; margin:28px 0 12px; }}
@@ -4857,8 +5922,8 @@ def _render_proactive_daily_page(payload: dict) -> str:
     .fn-bar span.ok {{ background:var(--ok); }} .fn-bar span.warn {{ background:var(--warn); }} .fn-bar span.bad {{ background:var(--bad); }}
     .viewbar {{ display:flex; flex-wrap:wrap; gap:8px; align-items:center; margin:14px 0 18px; }}
     .toolbar {{ display:flex; gap:8px; margin:14px 0; }}
-    .sort-button {{ display:inline-flex; align-items:center; border:1px solid var(--line); border-radius:6px; padding:7px 10px; background:var(--card); color:var(--fg); font-size:13px; }}
-    .sort-button.active {{ border-color:var(--accent); color:var(--accent); background:#fff1ed; }}
+    .sort-button {{ display:inline-flex; min-height:44px; box-sizing:border-box; align-items:center; justify-content:center; border:1px solid var(--line); border-radius:6px; padding:9px 12px; background:var(--card); color:var(--fg); font-size:13px; }}
+    .sort-button.active {{ border-color:var(--accent); color:var(--accent); background:#e7eee9; }}
     table {{ width:100%; border-collapse:collapse; background:var(--card); border:1px solid var(--line); border-radius:8px; overflow:hidden; }}
     th,td {{ text-align:left; padding:10px 12px; border-bottom:1px solid var(--line); vertical-align:top; }}
     th {{ font-size:12px; color:var(--muted); text-transform:uppercase; letter-spacing:.06em; background:#f4ece5; }}
@@ -5208,14 +6273,14 @@ def _render_data_track_debug_page(payload: dict) -> str:
     )
 
     return f"""<!doctype html>
-<html>
+<html lang="zh-CN">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   {refresh_meta}
   <title>Feedling Debug · Data Track</title>
   <style>
-    :root {{ color-scheme: light; --fg:#191613; --muted:#736963; --line:#e6ddd5; --bg:#fbf8f4; --card:#fffdfa; --accent:#b7352b; --ok:#1d7a4d; --warn:#a05a00; --bad:#b7352b; --ink:#263238; }}
+    :root {{ color-scheme: light; --fg:#1b201d; --muted:#68706a; --line:#dddcd4; --bg:#f5f4ef; --card:#fcfbf8; --accent:#416b56; --ok:#1d7a4d; --warn:#a05a00; --bad:#b7352b; --ink:#263238; }}
     body {{ margin:0; background:var(--bg); color:var(--fg); font:14px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; }}
     main {{ max-width:1280px; margin:0 auto; padding:28px 24px 48px; }}
     h1 {{ font-size:26px; margin:0 0 4px; }} h2 {{ font-size:16px; margin:28px 0 12px; }} h3 {{ display:flex; flex-wrap:wrap; gap:8px; align-items:center; font-size:15px; margin:0 0 10px; }}
@@ -5240,7 +6305,7 @@ def _render_data_track_debug_page(payload: dict) -> str:
     .step-label {{ font-weight:600; font-size:14px; }}
     .step-time {{ font-size:12px; }} .step-rawtype {{ font-size:11px; color:#b5aaa2; }}
     .step-explain {{ color:var(--ink); margin:3px 0 0; font-size:13px; }}
-    .sort-button.active {{ border-color:var(--accent); color:var(--accent); background:#fff1ed; }}
+    .sort-button.active {{ border-color:var(--accent); color:var(--accent); background:#e7eee9; }}
     input,select {{ border:1px solid var(--line); border-radius:6px; padding:8px 9px; background:white; color:var(--fg); }}
     .field {{ display:flex; flex-direction:column; gap:4px; min-width:150px; }} .field label {{ color:var(--muted); font-size:12px; text-transform:uppercase; letter-spacing:.04em; }}
     table {{ width:100%; border-collapse:collapse; background:var(--card); border:1px solid var(--line); border-radius:8px; overflow:hidden; }}
@@ -5361,7 +6426,16 @@ _EVENT_DESCRIPTIONS = {
 
 
 def _data_track_events_payload() -> dict:
-    raw = db.admin_events_overview()
+    """事件健康度看板。
+
+    **按天统计**（北京时区）：`?day=YYYY-MM-DD`，缺省为今天。在 2026-08-04 之前
+    这里是全量历史累计，而 URL 上的 `day=`/`hours=` 参数对它毫无作用——于是"今天
+    200 次全挂"在一万次历史成功面前仍显示 98% 绿，分母只增不减，指标越用越钝。
+    运营真正要看的是"今天健康吗"，所以口径改成单日。
+    """
+    raw_day = str(request.args.get("day") or "").strip()
+    day = _validated_dau_day(raw_day) if raw_day else _events_today()
+    raw = db.admin_events_overview(day=day)
 
     def blank():
         return {"vps": _blank_evt_stat(), "api": _blank_evt_stat()}
@@ -5408,8 +6482,15 @@ def _data_track_events_payload() -> dict:
     return {
         "generated_at": datetime.now().isoformat(),
         "categories": [{"key": k, **cats[k]} for k, _ in _EVENT_CATEGORIES],
-        "note": "Onboarding 漏斗 + 回复延迟为下一阶段；本页先给 成功率/次数/中位耗时(job类)/兜底率，VPS·API 分列。",
+        "day": day,
+        "note": "Onboarding 漏斗 + 回复延迟为下一阶段；本页先给 成功率/次数/中位耗时(job类)/兜底率，VPS·API 分列。按北京时区单日统计。",
     }
+
+
+def _events_today() -> str:
+    """北京时间的今天。与 `admin_events_overview` 的分桶时区同源，
+    否则页面默认打开的"今天"会和 SQL 认定的"今天"错开几小时。"""
+    return datetime.now(_SHANGHAI_TZ).strftime("%Y-%m-%d")
 
 
 def _blank_evt_stat() -> dict:
@@ -5429,6 +6510,35 @@ def _evt_dur(b: dict) -> str:
         return "—"
     d = float(d)
     return f"{d:.1f}s" if d < 60 else f"{d/60:.1f}m"
+
+
+def _render_events_day_nav(day: str) -> str:
+    """前一天 / 后一天 / 直接选日期。
+
+    这个看板的口径是单日，所以"看哪天"必须是页面上的一等控件——否则用户只能手改
+    URL，而 URL 里那个 `day=` 参数在 2026-08-04 之前恰恰是不生效的装饰。
+    """
+    try:
+        d = datetime.strptime(day, "%Y-%m-%d").date()
+    except ValueError:
+        return ""
+    prev = (d - timedelta(days=1)).isoformat()
+    nxt = (d + timedelta(days=1)).isoformat()
+    today = _events_today()
+    # 不给"未来"入口：那天必然是空表，只会让人以为出故障了
+    next_link = (f"<a class='sort-button' href='?view=events&day={nxt}'>后一天 ›</a>"
+                 if nxt <= today else
+                 "<span class='sort-button muted' aria-disabled='true'>后一天 ›</span>")
+    return f"""<div class="viewbar">
+    <a class="sort-button" href="?view=events&day={prev}">‹ 前一天</a>
+    <form method="get" style="display:inline-flex; gap:8px; align-items:center;">
+      <input type="hidden" name="view" value="events">
+      <input class="sort-button" type="date" name="day" value="{html.escape(day)}" max="{today}">
+      <button class="sort-button" type="submit">查看</button>
+    </form>
+    {next_link}
+    {"" if day == today else f"<a class='sort-button' href='?view=events&day={today}'>回到今天</a>"}
+  </div>"""
 
 
 def _render_events_page(payload: dict) -> str:
@@ -5476,17 +6586,17 @@ def _render_events_page(payload: dict) -> str:
         )
     body = "".join(rows)
     return f"""<!doctype html>
-<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Feedling 事件健康度 · Data Track</title>
 <style>
-  :root {{ color-scheme: light; --fg:#191613; --muted:#736963; --line:#e6ddd5; --bg:#fbf8f4; --card:#fffdfa; --accent:#b7352b; --ok:#1d7a4d; --warn:#a05a00; --bad:#b7352b; }}
+  :root {{ color-scheme: light; --fg:#1b201d; --muted:#68706a; --line:#dddcd4; --bg:#f5f4ef; --card:#fcfbf8; --accent:#416b56; --ok:#1d7a4d; --warn:#a05a00; --bad:#b7352b; }}
   body {{ margin:0; background:var(--bg); color:var(--fg); font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; }}
   main {{ max-width:920px; margin:0 auto; padding:28px 24px 48px; }}
   h1 {{ font-size:24px; margin:0 0 4px; }} h2 {{ font-size:15px; margin:24px 0 10px; }}
   .muted {{ color:var(--muted); }} .ok {{ color:var(--ok); }} .warn {{ color:var(--warn); }} .bad {{ color:var(--bad); }}
   .viewbar {{ display:flex; flex-wrap:wrap; gap:8px; margin:14px 0 18px; }}
-  .sort-button {{ display:inline-flex; border:1px solid var(--line); border-radius:6px; padding:7px 10px; background:var(--card); color:var(--fg); font-size:13px; }}
-  .sort-button.active {{ border-color:var(--accent); color:var(--accent); background:#fff1ed; }}
+  .sort-button {{ display:inline-flex; min-height:44px; box-sizing:border-box; align-items:center; justify-content:center; border:1px solid var(--line); border-radius:6px; padding:9px 12px; background:var(--card); color:var(--fg); font-size:13px; }}
+  .sort-button.active {{ border-color:var(--accent); color:var(--accent); background:#e7eee9; }}
   a {{ color:var(--accent); text-decoration:none; }}
   table {{ width:100%; border-collapse:collapse; background:var(--card); border:1px solid var(--line); border-radius:8px; overflow:hidden; }}
   th,td {{ text-align:left; padding:11px 14px; border-bottom:1px solid var(--line); vertical-align:top; }}
@@ -5496,8 +6606,9 @@ def _render_events_page(payload: dict) -> str:
   .note-box {{ background:#fff8ef; border:1px solid #e8d8be; border-radius:8px; padding:12px 14px; margin:14px 0; font-size:13px; line-height:1.65; color:#5a4d3c; }}
 </style></head><body><main>
   <h1>事件健康度</h1>
-  <div class="muted">VPS=resident 自托管；API=model_api 托管。Generated {html.escape(_bj_iso(payload.get('generated_at')))}.</div>
+  <div class="muted">VPS=resident 自托管；API=model_api 托管。统计口径 = <b>{html.escape(str(payload.get('day') or ''))}</b> 当天（北京时间）。Generated {html.escape(_bj_iso(payload.get('generated_at')))}.</div>
   {_render_data_track_view_nav("events")}
+  {_render_events_day_nav(str(payload.get('day') or ''))}
   <div class="note-box">
     <b>每一格怎么读：</b>
     <b>成功率</b> = 完成 ÷（完成 + 失败）（回复类 = 真回复 ÷ 用户消息数，越高越健康）；
@@ -5616,10 +6727,10 @@ def _render_onboarding_funnel_page(payload: dict) -> str:
                 f"<div class='total'>注册→首回复 中位:<b>{html.escape(total)}</b></div></section>")
 
     return f"""<!doctype html>
-<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Onboarding 漏斗 · Data Track</title>
 <style>
-  :root {{ color-scheme: light; --fg:#191613; --muted:#736963; --line:#e6ddd5; --bg:#fbf8f4; --card:#fffdfa; --accent:#b7352b; --ok:#1d7a4d; --warn:#a05a00; --bad:#b7352b; }}
+  :root {{ color-scheme: light; --fg:#1b201d; --muted:#68706a; --line:#dddcd4; --bg:#f5f4ef; --card:#fcfbf8; --accent:#416b56; --ok:#1d7a4d; --warn:#a05a00; --bad:#b7352b; }}
   body {{ margin:0; background:var(--bg); color:var(--fg); font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; }}
   main {{ max-width:900px; margin:0 auto; padding:28px 24px 48px; }}
   h1 {{ font-size:22px; margin:0 0 4px; }} h2 {{ font-size:15px; margin:0 0 14px; }}
@@ -5696,10 +6807,10 @@ def _render_event_users_page(payload: dict) -> str:
     body = "".join(rows) if rows else "<tr><td colspan='6' class='muted'>此事件暂无用户数据。</td></tr>"
     metric3 = "兜底率·延迟" if is_reply else "中位耗时"
     return f"""<!doctype html>
-<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{html.escape(label)} · 按用户 · Data Track</title>
 <style>
-  :root {{ color-scheme: light; --fg:#191613; --muted:#736963; --line:#e6ddd5; --bg:#fbf8f4; --card:#fffdfa; --accent:#b7352b; --ok:#1d7a4d; --warn:#a05a00; --bad:#b7352b; }}
+  :root {{ color-scheme: light; --fg:#1b201d; --muted:#68706a; --line:#dddcd4; --bg:#f5f4ef; --card:#fcfbf8; --accent:#416b56; --ok:#1d7a4d; --warn:#a05a00; --bad:#b7352b; }}
   body {{ margin:0; background:var(--bg); color:var(--fg); font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; }}
   main {{ max-width:1000px; margin:0 auto; padding:28px 24px 48px; }}
   h1 {{ font-size:22px; margin:0 0 4px; }} .muted {{ color:var(--muted); }} .ok {{ color:var(--ok); }} .warn {{ color:var(--warn); }} .bad {{ color:var(--bad); }}
@@ -5888,10 +6999,10 @@ def _render_invalid_data_track_user_page(raw_user_id: str) -> str:
     back = f"/admin/data-track?{back_qs}" if back_qs else "/admin/data-track"
     supplied = str(raw_user_id or "").strip()
     return f"""<!doctype html>
-<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>UID 格式错误 · Feedling Data Track</title>
 <style>
-  :root {{ color-scheme:light; --fg:#191613; --muted:#736963; --line:#e6ddd5; --bg:#fbf8f4; --card:#fffdfa; --accent:#b7352b; }}
+  :root {{ color-scheme:light; --fg:#1b201d; --muted:#68706a; --line:#dddcd4; --bg:#f5f4ef; --card:#fcfbf8; --accent:#416b56; }}
   body {{ margin:0; background:var(--bg); color:var(--fg); font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; }}
   main {{ max-width:620px; margin:80px auto; padding:24px; }}
   .box {{ background:var(--card); border:1px solid var(--line); border-radius:10px; padding:22px; }}
@@ -5922,13 +7033,13 @@ def _render_user_detail_page(user: dict) -> str:
         else ""
     )
     return f"""<!doctype html>
-<html>
+<html lang="zh-CN">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{html.escape(user['user_id'])} · Feedling Data Track</title>
   <style>
-    :root {{ color-scheme: light; --fg:#191613; --muted:#736963; --line:#e6ddd5; --bg:#fbf8f4; --card:#fffdfa; --accent:#b7352b; }}
+    :root {{ color-scheme: light; --fg:#1b201d; --muted:#68706a; --line:#dddcd4; --bg:#f5f4ef; --card:#fcfbf8; --accent:#416b56; }}
     body {{ margin:0; background:var(--bg); color:var(--fg); font:14px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; }}
     main {{ max-width:1040px; margin:0 auto; padding:28px 24px 48px; }}
     a {{ color:var(--accent); text-decoration:none; }}

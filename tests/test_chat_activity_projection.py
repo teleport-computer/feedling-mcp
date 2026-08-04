@@ -379,6 +379,19 @@ def test_memory_index_activity_reports_exact_count_and_categories():
     }
 
 
+def test_memory_index_activity_keeps_content_free_completeness_counts():
+    result = _memory_result("Places & travel", "Places & travel")
+    result["data"].update({"total": 103, "returned": 2})
+
+    assert activity_metadata.memory_result_metadata("memory_index", result) == {
+        "memory_count": 2,
+        "memory_total": 103,
+        "memory_returned": 2,
+        "memory_query_kind": "memory_index",
+        "memory_categories": [{"key": "travel", "count": 2}],
+    }
+
+
 def test_memory_activity_unknown_category_falls_back_to_total():
     assert activity_metadata.memory_result_metadata(
         "memory_search", _memory_result("妈妈", "Family")
@@ -461,3 +474,34 @@ def test_executor_keeps_memory_count_before_provider_result_truncation(monkeypat
         "memory_count": 2,
         "memory_categories": [{"key": "family", "count": 2}],
     }
+
+
+def test_executor_memory_index_truncation_guides_partition_browsing(monkeypatch):
+    monkeypatch.setattr(
+        executor.cap_registry,
+        "run_capability",
+        lambda *_args, **_kwargs: ok(data={
+            "items": [
+                {"id": f"m{index}", "bucket": "Travel", "summary": "x" * 100}
+                for index in range(50)
+            ],
+            "total": 103,
+            "returned": 50,
+        }),
+    )
+
+    async def run():
+        return await executor.dispatch_tool_calls(
+            [ToolCall(id="c-index", name="memory_index", args={"bucket": "Travel"})],
+            store=SimpleNamespace(),
+            api_key=None,
+            runtime_token="rt",
+            enclave_sem=asyncio.Semaphore(1),
+            turn_authorization=True,
+            enqueue_write_effect=lambda _tc: None,
+        )
+
+    result = asyncio.run(run())[0]
+    assert "returned 50 of 103 total cards" in result.content
+    assert "bucket or thread filters" in result.content
+    assert len(result.content) == executor._RESULT_CHAR_CAP + len("...[truncated]")

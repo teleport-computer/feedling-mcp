@@ -14,6 +14,22 @@ The hosted path is asynchronous. A successful send is always `202`, even when
 the assistant ciphertext is already available. It never returns a plaintext
 assistant reply.
 
+## Scheduled reminders
+
+The hosted and resident agent runtimes share the same durable reminder
+scheduler. The `schedule_wake` tool accepts an optional `repeat` value:
+`daily` repeats every 86,400 seconds and `weekly` repeats every 604,800
+seconds. These are fixed elapsed-time intervals, not local wall-clock rules, so
+a daylight-saving transition can shift the displayed local time by one hour.
+
+Pending reminders are deduplicated by their exact trigger instant and repeat
+mode. Two identical daily reminders collapse to one, while daily and weekly
+reminders at the same initial instant remain separate. After each successful
+trigger, the scheduler creates the next pending occurrence with a new
+`wake_id`. `cancel_wake` accepts the current ID exposed in the agent's scheduled
+reminder context and cancels the whole repeating series. Omitting `repeat`
+preserves one-time reminder behavior.
+
 ## Hosted chat
 
 Before sending, the account needs a content public key, a configured model route,

@@ -8,7 +8,13 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
-from model_api_runtime.v2 import jobs_store, reaper as v2_reaper, serve_worker, worker
+from model_api_runtime.v2 import (
+    jobs_store,
+    reaper as v2_reaper,
+    serve_worker,
+    summary_frontier as v2_summary_frontier,
+    worker,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -1211,7 +1217,7 @@ def test_read_summary_nonzero_watermark_without_envelope_fails_closed(
 
     monkeypatch.setattr(core_enclave, "_decrypt_envelope_via_enclave", _boom)
 
-    with pytest.raises(RuntimeError, match="^v2_summary_integrity_error:"):
+    with pytest.raises(v2_summary_frontier.SummaryFrontierIntegrityError):
         serve_worker._read_summary_with_seq("u_summary_test")
 
 
@@ -1233,8 +1239,46 @@ def test_read_summary_nonzero_watermark_with_empty_plaintext_fails_closed(monkey
         lambda envelope, key, *, purpose, runtime_token="": b" \n\t",
     )
 
-    with pytest.raises(RuntimeError, match="^v2_summary_integrity_error:"):
+    with pytest.raises(v2_summary_frontier.SummaryFrontierIntegrityError):
         serve_worker._read_summary("u_summary_test")
+
+
+def test_canonical_summary_decrypt_rejection_is_integrity_failure(monkeypatch):
+    from core import enclave as core_enclave
+
+    def _rejected(*_args, **_kwargs):
+        raise RuntimeError(
+            'enclave_http_403:{"error":"decrypt_failed: ciphertext invalid"}'
+        )
+
+    monkeypatch.setattr(core_enclave, "_decrypt_envelope_via_enclave", _rejected)
+    with pytest.raises(
+        v2_summary_frontier.SummaryFrontierIntegrityError
+    ) as caught:
+        serve_worker._decrypt_summary_text(
+            {"body_ct": "broken"},
+            runtime_token="rt",
+            purpose="v2_summary_read",
+        )
+    assert caught.value.detail == "canonical_summary_decrypt_failed"
+
+
+def test_canonical_summary_transient_enclave_failure_remains_retryable(monkeypatch):
+    from core import enclave as core_enclave
+
+    def _unavailable(*_args, **_kwargs):
+        raise RuntimeError('enclave_http_503:{"error":"not_ready"}')
+
+    monkeypatch.setattr(core_enclave, "_decrypt_envelope_via_enclave", _unavailable)
+    with pytest.raises(RuntimeError, match="^enclave_http_503") as caught:
+        serve_worker._decrypt_summary_text(
+            {"body_ct": "valid"},
+            runtime_token="rt",
+            purpose="v2_summary_read",
+        )
+    assert not isinstance(
+        caught.value, v2_summary_frontier.SummaryFrontierIntegrityError
+    )
 
 
 def test_read_summary_zero_watermark_without_envelope_is_valid(monkeypatch):
@@ -1462,6 +1506,7 @@ def test_read_scheduled_wake_context_returns_notes_and_confirmed_metadata_for_on
             "task_id": "timer-1",
             "next_trigger_at": "2026-07-27T08:00:00",
             "timezone": "Asia/Shanghai",
+            "repeat": "",
             "fired_at": 0.0,
         },
         {
@@ -1471,6 +1516,7 @@ def test_read_scheduled_wake_context_returns_notes_and_confirmed_metadata_for_on
             "task_id": "timer-2",
             "next_trigger_at": "2026-07-27T08:00:00",
             "timezone": "Asia/Shanghai",
+            "repeat": "",
             "fired_at": 0.0,
         },
     ]

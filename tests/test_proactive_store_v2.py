@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 import sys
+import threading
 import uuid
 import os
 from pathlib import Path
@@ -10,7 +12,13 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
 from proactive.runtime_v2 import RuntimeSpineV2, TurnOutcomeV2, WakeEventV2, merge_wakes_v2
-from proactive.scheduled_wake_v2 import DBScheduledWakeStoreV2, SCHEDULED_FIRED, ScheduledWakeServiceV2
+from proactive.scheduled_wake_v2 import (
+    DBScheduledWakeStoreV2,
+    SCHEDULED_CANCELED,
+    SCHEDULED_FIRED,
+    SCHEDULED_PENDING,
+    ScheduledWakeServiceV2,
+)
 from proactive.store_v2 import (
     BACKGROUND_COMPLETED,
     BACKGROUND_JOB_STREAM_V2,
@@ -321,3 +329,84 @@ def test_db_scheduled_wake_survives_restart_and_fires_once():
     assert second == ()
     assert records[0].status == SCHEDULED_FIRED
     assert spine.drain_context(uid, now=2_000_000_000.0).scheduled_note == "db check"
+
+
+def test_db_repeat_fire_reschedules_atomically_and_old_id_cancels_series():
+    uid = _uid()
+    seed_user(uid)
+    service = ScheduledWakeServiceV2(DBScheduledWakeStoreV2(), owner_id="worker-a")
+    scheduled = service.apply_turn_actions(
+        uid,
+        [{
+            "type": "schedule_wake",
+            "at": "2026-06-20T09:00:00Z",
+            "tz": "UTC",
+            "repeat": "daily",
+            "note": "db repeat",
+        }],
+        now=1.0,
+    )[0]
+    original = DBScheduledWakeStoreV2().list_records(uid)[0]
+
+    fired = service.fire_due_timers(
+        uid,
+        settings={},
+        now=original.due_at,
+        submit_wake=RuntimeSpineV2(merge_window_sec=0.0).submit,
+    )[0]
+    records = {record.timer_id: record for record in DBScheduledWakeStoreV2().list_records(uid)}
+
+    assert records[scheduled.timer_id].status == SCHEDULED_FIRED
+    assert records[fired.next_timer_id].status == SCHEDULED_PENDING
+    assert records[fired.next_timer_id].due_at == original.due_at + 86400.0
+
+    canceled = service.apply_turn_actions(
+        uid,
+        [{"type": "cancel_wake", "wake_id": scheduled.timer_id}],
+        now=original.due_at + 1.0,
+    )[0]
+    records = {record.timer_id: record for record in DBScheduledWakeStoreV2().list_records(uid)}
+
+    assert canceled.status == "canceled"
+    assert records[fired.next_timer_id].status == SCHEDULED_CANCELED
+    assert service.fire_due_timers(
+        uid,
+        settings={},
+        now=original.due_at + 86400.0,
+        submit_wake=RuntimeSpineV2(merge_window_sec=0.0).submit,
+    ) == ()
+
+
+def test_db_schedule_dedupes_same_due_and_repeat_across_workers():
+    uid = _uid()
+    seed_user(uid)
+    barrier = threading.Barrier(2)
+
+    def schedule(owner_id: str):
+        service = ScheduledWakeServiceV2(
+            DBScheduledWakeStoreV2(),
+            owner_id=owner_id,
+        )
+        barrier.wait()
+        return service.apply_turn_actions(
+            uid,
+            [{
+                "type": "schedule_wake",
+                "at": "2026-06-20T09:00:00Z",
+                "tz": "UTC",
+                "repeat": "weekly",
+            }],
+            now=1.0,
+        )[0]
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(schedule, ("worker-a", "worker-b")))
+
+    pending = [
+        record
+        for record in DBScheduledWakeStoreV2().list_records(uid)
+        if record.pending_like
+    ]
+    assert len(pending) == 1
+    assert {result.timer_id for result in results} == {pending[0].timer_id}
+    assert sorted(result.reason for result in results) == ["", "already_scheduled"]

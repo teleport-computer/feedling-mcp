@@ -73,6 +73,17 @@ def test_catalog_memory_delete_has_id_flag():
         "memory-delete line should contain --id flag (required argument)"
 
 
+def test_catalog_contains_explicit_only_memory_organize():
+    io_cli_path = os.path.join(
+        os.path.dirname(__file__), "..", "tools", "io_cli.py"
+    )
+    catalog = build_catalog(io_cli_path)
+    lines = [line for line in catalog.split("\n") if line.startswith("memory-organize")]
+
+    assert len(lines) == 1
+    assert "用户明确要求" in lines[0]
+
+
 def test_catalog_perception_trend_has_signal_positional():
     """I6: perception-trend's required positional `signal` must survive
     extraction — a model following the catalog without it hits argparse's
