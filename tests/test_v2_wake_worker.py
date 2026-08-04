@@ -104,13 +104,14 @@ def _apply_effects(user_id):
     return v2_effect_outbox.apply_pending_effects(user_id, dispatch=_reply_effect_dispatch(user_id))
 
 
-def _wake_deps(*, summary="", tail=None):
+def _wake_deps(*, summary="", tail=None, has_genuine_user_history=None):
     return worker.TurnDeps(
         read_messages=lambda uid: [],
         resolve_provider=lambda uid: (_BYOK, {}),
         mint_enclave_token=lambda uid: "rt",
         read_tail=lambda uid, after_ts, limit: list(tail if tail is not None else []),
         read_summary=lambda uid: (summary, 0.0, 0),
+        has_genuine_user_history=has_genuine_user_history,
         apply_pending_effects=_apply_effects,
     )
 
@@ -467,6 +468,51 @@ def test_automatic_heartbeat_with_empty_history_skips_the_provider(monkeypatch):
     assert status == "completed"
     assert provider_calls == []
     assert write_called["n"] == 0
+    assert _job_status(job_id)[0] == "completed"
+
+
+@pytest.mark.parametrize(
+    ("summary", "tail"),
+    [
+        ("A summary exists without any real user message.", []),
+        ("", [{"id": "m1", "ts": 1.0, "role": "assistant", "content": "hello"}]),
+    ],
+)
+def test_automatic_heartbeat_authoritative_no_user_history_skips_all_prompt_work(
+    monkeypatch,
+    summary,
+    tail,
+):
+    """Summary/assistant artifacts cannot authorize a proactive provider call."""
+    uid = f"u_wake_no_authority_{len(tail)}"
+    conftest.seed_user(uid)
+    _reset(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, "heartbeat")
+    claimed_by = _claim(job_id)
+
+    provider_calls = []
+    workspace_calls = []
+
+    async def _fake(config, messages, *, tools=None, **_kwargs):
+        provider_calls.append(messages)
+        return _text_round("")
+
+    monkeypatch.setattr(provider_client, "chat_completion_async", _fake)
+    deps = _wake_deps(
+        summary=summary,
+        tail=tail,
+        has_genuine_user_history=lambda user_id: False,
+    )
+    deps.load_workspace_prompt = lambda *args, **kwargs: workspace_calls.append(
+        (args, kwargs)
+    ) or {"trusted_system_blocks": [], "working_memory": ""}
+
+    status = asyncio.run(worker._run_wake(
+        job_id, uid, "heartbeat", deps, _BYOK, worker.ENCLAVE_SEMAPHORE, claimed_by))
+
+    assert status == "completed"
+    assert provider_calls == []
+    assert workspace_calls == []
     assert _job_status(job_id)[0] == "completed"
 
 

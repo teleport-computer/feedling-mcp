@@ -1178,6 +1178,11 @@ class TurnDeps:
     # stay queued behind the current turn instead of being folded into it.
     ordered_chat_replies: bool = False
     runtime_mode_enabled: Callable[[str], bool] | None = None
+    # Authoritative, content-free existence check for at least one genuine
+    # user-authored chat row. Production wires this directly to chat_messages;
+    # summaries and assistant-only artifacts must never authorize an automatic
+    # heartbeat provider call.
+    has_genuine_user_history: Callable[[str], bool] | None = None
     # (user_id) -> bool：用户的「联网搜索」开关。None / 抛异常 / 非 bool 返回值
     # 一律按禁用处理（见 web_gate.resolve_user_enabled）。默认 None：worker.py
     # 自身不 import hosted，测试不必提供；生产装配见
@@ -6917,23 +6922,6 @@ async def _run_wake(
     push_slot: dict | None = None
     try:
         store = core_store.get_store(user_id)
-        # One HMAC token and one encrypted workspace snapshot per wake turn.
-        # Load before any prompt-coverage provider call so a broken workspace
-        # never produces an under-authorized proactive response.
-        token = deps.mint_enclave_token(user_id)
-        observe_photo = _make_photo_observer(
-            deps,
-            user_id=user_id,
-            provider_config=provider_config,
-            api_key=None,
-            runtime_token=token,
-        )
-        trusted_system_blocks, working_memory = await _load_workspace_prompt_context(
-            deps,
-            store,
-            runtime_token=token,
-            enclave_sem=enclave_sem,
-        )
         seq_native = deps.read_messages_after_seq is not None
         observed_generation = 0
         wake_reply_cursor_seq = 0
@@ -6955,6 +6943,91 @@ async def _run_wake(
                 v2_cursor.load_seq,
                 store,
             )
+
+        async def _sleep_heartbeat_without_history() -> str:
+            wake_generation = observed_generation
+            consumed_context_seq = 0
+            if deps.read_perception_wake_context is not None:
+                context_rows: list[dict] = []
+                for attempt in range(3):
+                    context_rows = await asyncio.to_thread(
+                        deps.read_perception_wake_context,
+                        user_id,
+                        int(job_id),
+                    )
+                    if context_rows or attempt == 2:
+                        break
+                    await asyncio.sleep(0.05)
+                for raw_item in context_rows[:10]:
+                    if not isinstance(raw_item, dict):
+                        continue
+                    try:
+                        consumed_context_seq = max(
+                            consumed_context_seq,
+                            int(raw_item.get("_context_seq", 0) or 0),
+                        )
+                        wake_generation = max(
+                            wake_generation,
+                            int(raw_item.get("_input_generation", 0) or 0),
+                        )
+                    except (TypeError, ValueError, OverflowError):
+                        pass
+                completed, successor_id = await asyncio.to_thread(
+                    jobs_store.finish_wake_job,
+                    job_id,
+                    claimed_by=claimed_by,
+                    observed_generation=wake_generation,
+                    context_stream="v2_perception_wake_context",
+                    consumed_context_seq=consumed_context_seq,
+                    clear_wake_backoff=True,
+                )
+            else:
+                successor_id = None
+                completed = await asyncio.to_thread(
+                    jobs_store.mark_completed,
+                    job_id,
+                    claimed_by=claimed_by,
+                    clear_wake_backoff=True,
+                )
+            if not completed:
+                raise LostJobLease(
+                    "wake job ownership lost while sleeping without history"
+                )
+            if successor_id is not None:
+                await asyncio.to_thread(core_wake_bus.notify, "v2_jobs", user_id)
+            if tm is not None:
+                tm.flush(failed=False, status="slept_no_history")
+            return "completed"
+
+        # This content-free gate runs before workspace loading, compaction, or
+        # any other provider-capable prompt preparation. A summary can outlive
+        # its source rows and assistant/system artifacts can exist on their own;
+        # neither is authority for an automatic outbound message.
+        if lane == "heartbeat" and deps.has_genuine_user_history is not None:
+            has_history = await asyncio.to_thread(
+                deps.has_genuine_user_history,
+                user_id,
+            )
+            if has_history is not True:
+                return await _sleep_heartbeat_without_history()
+
+        # One HMAC token and one encrypted workspace snapshot per authorized
+        # wake turn. Load before any prompt-coverage provider call so a broken
+        # workspace never produces an under-authorized proactive response.
+        token = deps.mint_enclave_token(user_id)
+        observe_photo = _make_photo_observer(
+            deps,
+            user_id=user_id,
+            provider_config=provider_config,
+            api_key=None,
+            runtime_token=token,
+        )
+        trusted_system_blocks, working_memory = await _load_workspace_prompt_context(
+            deps,
+            store,
+            runtime_token=token,
+            enclave_sem=enclave_sem,
+        )
 
         async def _fence_wake_effect(effect: str) -> None:
             if not await asyncio.to_thread(
@@ -7235,36 +7308,13 @@ async def _run_wake(
                 # not a user request or an assistant-authored statement.
         if (
             lane == "heartbeat"
-            and not str(summary or "").strip()
+            and deps.has_genuine_user_history is None
             and not any(_is_genuine_user_seed(row) for row in tail)
         ):
-            successor_id = None
-            if deps.read_perception_wake_context is not None:
-                completed, successor_id = await asyncio.to_thread(
-                    jobs_store.finish_wake_job,
-                    job_id,
-                    claimed_by=claimed_by,
-                    observed_generation=wake_observed_generation,
-                    context_stream="v2_perception_wake_context",
-                    consumed_context_seq=consumed_perception_context_seq,
-                    clear_wake_backoff=True,
-                )
-            else:
-                completed = await asyncio.to_thread(
-                    jobs_store.mark_completed,
-                    job_id,
-                    claimed_by=claimed_by,
-                    clear_wake_backoff=True,
-                )
-            if not completed:
-                raise LostJobLease(
-                    "wake job ownership lost while sleeping without history"
-                )
-            if successor_id is not None:
-                await asyncio.to_thread(core_wake_bus.notify, "v2_jobs", user_id)
-            if tm is not None:
-                tm.flush(failed=False, status="slept_no_history")
-            return "completed"
+            # Legacy/test callers without the authoritative seam still fail
+            # closed once their materialized tail is available. Production has
+            # already passed the earlier DB-backed gate.
+            return await _sleep_heartbeat_without_history()
         temporal_snapshot = await _capture_turn_temporal_snapshot(
             user_id=user_id,
             deps=deps,

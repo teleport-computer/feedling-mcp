@@ -112,6 +112,7 @@ def test_0077_perception_signal_state_is_the_single_installed_head():
         "user_id": ("text", "NO"),
         "signal": ("text", "NO"),
         "value_fingerprint": ("text", "NO"),
+        "fingerprint_key_id": ("text", "NO"),
         "last_seen_at": ("timestamp with time zone", "NO"),
         "last_changed_at": ("timestamp with time zone", "NO"),
         "source_event_id": ("text", "YES"),

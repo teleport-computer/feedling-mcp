@@ -55,8 +55,9 @@ def _seed_all_per_user_tables(user_id: str) -> None:
         )
         conn.execute(
             "INSERT INTO perception_signal_state_v2 "
-            "(user_id, signal, value_fingerprint, last_seen_at, last_changed_at) "
-            "VALUES (%s, 'wifi_anchor', 'fingerprint', "
+            "(user_id, signal, value_fingerprint, fingerprint_key_id, "
+            "last_seen_at, last_changed_at) "
+            "VALUES (%s, 'wifi_anchor', 'fingerprint', 'key-id', "
             "'2026-08-04T00:00:00Z', '2026-08-04T00:00:00Z')",
             (user_id,),
         )
@@ -223,8 +224,9 @@ def test_db_belt_purges_usage_rollups_without_deleting_parent_user(client):
         )
         conn.execute(
             "INSERT INTO perception_signal_state_v2 "
-            "(user_id, signal, value_fingerprint, last_seen_at, last_changed_at) "
-            "VALUES (%s, 'wifi_anchor', 'fingerprint', "
+            "(user_id, signal, value_fingerprint, fingerprint_key_id, "
+            "last_seen_at, last_changed_at) "
+            "VALUES (%s, 'wifi_anchor', 'fingerprint', 'key-id', "
             "'2026-08-04T00:00:00Z', '2026-08-04T00:00:00Z')",
             (uid,),
         )

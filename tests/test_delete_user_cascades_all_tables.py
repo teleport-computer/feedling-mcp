@@ -39,8 +39,9 @@ def _seed_min_rows(conn, uid):
     )
     conn.execute(
         "INSERT INTO perception_signal_state_v2 "
-        "(user_id, signal, value_fingerprint, last_seen_at, last_changed_at) "
-        "VALUES (%s, 'wifi_anchor', 'fingerprint', "
+        "(user_id, signal, value_fingerprint, fingerprint_key_id, "
+        "last_seen_at, last_changed_at) "
+        "VALUES (%s, 'wifi_anchor', 'fingerprint', 'key-id', "
         "'2026-08-04T00:00:00Z', '2026-08-04T00:00:00Z')",
         (uid,),
     )

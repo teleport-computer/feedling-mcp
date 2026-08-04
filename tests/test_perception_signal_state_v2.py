@@ -29,7 +29,7 @@ def _state_row(user_id: str):
     with db.get_pool().connection() as conn:
         return conn.execute(
             "SELECT value_fingerprint, last_seen_at, last_changed_at, "
-            "source_event_id FROM perception_signal_state_v2 "
+            "source_event_id, fingerprint_key_id FROM perception_signal_state_v2 "
             "WHERE user_id=%s AND signal='wifi_anchor'",
             (user_id,),
         ).fetchone()
@@ -267,6 +267,103 @@ def test_missing_secret_fails_closed_without_creating_state(monkeypatch):
     assert decision.changed is False
     assert decision.error_code == "secret_unset"
     assert _state_row(user_id) is None
+
+
+def test_secret_rotation_migrates_equal_value_without_waking(monkeypatch):
+    """The previous key proves equality, then the row converges to the new key."""
+    user_id = _user_id("rotate_equal")
+    seed_user(user_id)
+    monkeypatch.setenv("FEEDLING_RUNTIME_TOKEN_SECRET", "old-runtime-secret")
+    monkeypatch.delenv(
+        "FEEDLING_RUNTIME_TOKEN_SECRET_PREVIOUS", raising=False
+    )
+    signal_state_v2.observe_signal_state(
+        user_id, "wifi_anchor", "wifi-home", observed_at=100.0
+    )
+    old_row = _state_row(user_id)
+
+    monkeypatch.setenv("FEEDLING_RUNTIME_TOKEN_SECRET", "new-runtime-secret")
+    monkeypatch.setenv(
+        "FEEDLING_RUNTIME_TOKEN_SECRET_PREVIOUS", "old-runtime-secret"
+    )
+    decision = signal_state_v2.observe_signal_state(
+        user_id, "wifi_anchor", "wifi-home", observed_at=200.0
+    )
+    migrated = _state_row(user_id)
+
+    assert decision.outcome == "unchanged"
+    assert decision.changed is False
+    assert migrated[0] != old_row[0]
+    assert migrated[4] != old_row[4]
+    assert migrated[1] == datetime.fromtimestamp(200.0, tz=timezone.utc)
+    assert migrated[2] == old_row[2]
+
+
+def test_old_worker_fails_closed_after_a_row_moves_to_new_key(monkeypatch):
+    """Mixed-version workers cannot oscillate a migrated row between secrets."""
+    user_id = _user_id("rotate_mixed")
+    seed_user(user_id)
+    monkeypatch.setenv("FEEDLING_RUNTIME_TOKEN_SECRET", "old-runtime-secret")
+    signal_state_v2.observe_signal_state(
+        user_id, "wifi_anchor", "wifi-home", observed_at=100.0
+    )
+    monkeypatch.setenv("FEEDLING_RUNTIME_TOKEN_SECRET", "new-runtime-secret")
+    monkeypatch.setenv(
+        "FEEDLING_RUNTIME_TOKEN_SECRET_PREVIOUS", "old-runtime-secret"
+    )
+    migrated = signal_state_v2.observe_signal_state(
+        user_id, "wifi_anchor", "wifi-work", observed_at=200.0
+    )
+    new_row = _state_row(user_id)
+
+    monkeypatch.setenv("FEEDLING_RUNTIME_TOKEN_SECRET", "old-runtime-secret")
+    monkeypatch.delenv(
+        "FEEDLING_RUNTIME_TOKEN_SECRET_PREVIOUS", raising=False
+    )
+    old_worker = signal_state_v2.observe_signal_state(
+        user_id, "wifi_anchor", "wifi-work", observed_at=300.0
+    )
+
+    assert migrated.outcome == "changed"
+    assert old_worker.outcome == "error"
+    assert old_worker.changed is False
+    assert old_worker.error_code == "unknown_fingerprint_key"
+    assert _state_row(user_id) == new_row
+
+
+def test_explicit_post_rollout_unknown_key_rebaseline_never_wakes(monkeypatch):
+    """After old workers drain, dormant rows can safely join the current key."""
+    user_id = _user_id("rotate_dormant")
+    seed_user(user_id)
+    monkeypatch.setenv("FEEDLING_RUNTIME_TOKEN_SECRET", "old-runtime-secret")
+    signal_state_v2.observe_signal_state(
+        user_id, "wifi_anchor", "wifi-home", observed_at=100.0
+    )
+    old_row = _state_row(user_id)
+
+    monkeypatch.setenv("FEEDLING_RUNTIME_TOKEN_SECRET", "new-runtime-secret")
+    monkeypatch.delenv(
+        "FEEDLING_RUNTIME_TOKEN_SECRET_PREVIOUS", raising=False
+    )
+    monkeypatch.setenv(
+        "FEEDLING_PERCEPTION_REBASELINE_UNKNOWN_KEYS", "1"
+    )
+    rebaseline = signal_state_v2.observe_signal_state(
+        user_id, "wifi_anchor", "wifi-work", observed_at=200.0
+    )
+    repeated = signal_state_v2.observe_signal_state(
+        user_id, "wifi_anchor", "wifi-work", observed_at=300.0
+    )
+    current_row = _state_row(user_id)
+
+    assert rebaseline.outcome == "baseline_created"
+    assert rebaseline.changed is False
+    assert repeated.outcome == "unchanged"
+    assert repeated.changed is False
+    assert current_row[0] != old_row[0]
+    assert current_row[4] != old_row[4]
+    assert current_row[1] == datetime.fromtimestamp(300.0, tz=timezone.utc)
+    assert current_row[2] == datetime.fromtimestamp(200.0, tz=timezone.utc)
 
 
 def test_noncanonical_value_and_nonfinite_time_fail_closed():

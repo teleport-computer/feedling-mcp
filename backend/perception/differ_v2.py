@@ -49,6 +49,12 @@ _DURABLE_WAKE_SIGNALS = frozenset({
     "photo_added",
 })
 
+_ANCHOR_SIGNALS = frozenset({
+    "connectivity_anchor",
+    "wifi_anchor",
+    "bluetooth_anchor",
+})
+
 
 def _format_value(value: Any) -> str:
     if value is None:
@@ -116,7 +122,14 @@ class PerceptionDifferV2:
             last_seen_ts=last_seen_ts,
             last_changed_ts=last_changed_ts,
         )
-        digest = f"{signal}: {outcome} ({_format_value(value)})"
+        # Exact network/device anchor identifiers are low-entropy location data.
+        # They remain available through authorized perception reads, but wake
+        # queues and context logs persist only a categorical transition.
+        digest = (
+            f"{signal}: {outcome}"
+            if signal in _ANCHOR_SIGNALS
+            else f"{signal}: {outcome} ({_format_value(value)})"
+        )
         events = self._events_for(signal, value, None, digest, changed)
         hints = self._presence_hints_for(signal, value, changed)
         if signal == "screen_phash":
@@ -160,7 +173,7 @@ class PerceptionDifferV2:
             return ()
         if signal in {"motion_state", "battery", "now_playing", "time", "place_label"}:
             return ()
-        if signal in {"connectivity_anchor", "wifi_anchor", "bluetooth_anchor"}:
+        if signal in _ANCHOR_SIGNALS:
             if value is None:
                 return ()
             return (
@@ -169,7 +182,7 @@ class PerceptionDifferV2:
                     trigger="arrived_at_anchor",
                     change_digest=digest,
                     presence_hints={"anchor_changed": True},
-                    payload={"anchor": value, "previous_anchor": prev.value if prev else None},
+                    payload={"anchor_changed": True},
                 ),
             )
         if signal == "unlock_after_absence":
@@ -205,9 +218,8 @@ class PerceptionDifferV2:
             return {}
         if signal == "calendar_presence" and isinstance(value, dict):
             return {"in_meeting": bool(value.get("in_meeting"))}
-        if signal in {"connectivity_anchor", "wifi_anchor", "bluetooth_anchor"}:
-            label = value.get("label") if isinstance(value, dict) else value
-            return {"entered_anchor": label}
+        if signal in _ANCHOR_SIGNALS:
+            return {"anchor_changed": True}
         if signal == "screen_locked":
             return {"screen_locked": bool(value)}
         return {}

@@ -66,15 +66,51 @@ def _decision(
     )
 
 
+def _fingerprint_key_id(secret: str) -> str:
+    return hmac.new(
+        secret.encode("utf-8"),
+        b"perception-signal-key-id-v1",
+        hashlib.sha256,
+    ).hexdigest()
+
+
+def _unknown_key_rebaseline_enabled() -> bool:
+    return os.environ.get(
+        "FEEDLING_PERCEPTION_REBASELINE_UNKNOWN_KEYS", ""
+    ).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _value_fingerprint(
+    secret: str,
+    user_id: str,
+    signal: str,
+    canonical: str,
+) -> str:
+    message = (
+        "perception-signal-v2\0"
+        + user_id
+        + "\0"
+        + signal
+        + "\0"
+        + canonical
+    ).encode("utf-8")
+    return hmac.new(
+        secret.encode("utf-8"), message, hashlib.sha256
+    ).hexdigest()
+
+
 def _observation_material(
     user_id: str,
     signal: str,
     value: Any,
     observed_at: float,
-) -> tuple[str, datetime]:
+) -> tuple[str, str, tuple[str, str] | None, datetime]:
     secret = os.environ.get("FEEDLING_RUNTIME_TOKEN_SECRET", "").strip()
     if not secret:
         raise ValueError("secret_unset")
+    previous_secret = os.environ.get(
+        "FEEDLING_RUNTIME_TOKEN_SECRET_PREVIOUS", ""
+    ).strip()
     timestamp = float(observed_at)
     if not math.isfinite(timestamp):
         raise ValueError("invalid_timestamp")
@@ -85,18 +121,20 @@ def _observation_material(
         separators=(",", ":"),
         allow_nan=False,
     )
-    message = (
-        "perception-signal-v2\0"
-        + user_id
-        + "\0"
-        + signal
-        + "\0"
-        + canonical
-    ).encode("utf-8")
-    fingerprint = hmac.new(
-        secret.encode("utf-8"), message, hashlib.sha256
-    ).hexdigest()
-    return fingerprint, datetime.fromtimestamp(timestamp, tz=timezone.utc)
+    current = _value_fingerprint(secret, user_id, signal, canonical)
+    current_key_id = _fingerprint_key_id(secret)
+    previous = None
+    if previous_secret and previous_secret != secret:
+        previous = (
+            _value_fingerprint(previous_secret, user_id, signal, canonical),
+            _fingerprint_key_id(previous_secret),
+        )
+    return (
+        current,
+        current_key_id,
+        previous,
+        datetime.fromtimestamp(timestamp, tz=timezone.utc),
+    )
 
 
 def observe_signal_state(
@@ -109,7 +147,7 @@ def observe_signal_state(
     allow_first_event: bool = False,
 ) -> SignalObservationDecision:
     try:
-        fingerprint, observed = _observation_material(
+        fingerprint, fingerprint_key_id, previous_material, observed = _observation_material(
             user_id, signal, value, observed_at
         )
     except (TypeError, ValueError, OverflowError) as exc:
@@ -120,7 +158,8 @@ def observe_signal_state(
             with conn.transaction():
                 previous = conn.execute(
                     "SELECT value_fingerprint, last_seen_at, last_changed_at, "
-                    "source_event_id FROM perception_signal_state_v2 "
+                    "source_event_id, fingerprint_key_id "
+                    "FROM perception_signal_state_v2 "
                     "WHERE user_id=%s AND signal=%s FOR UPDATE",
                     (user_id, signal),
                 ).fetchone()
@@ -130,6 +169,7 @@ def observe_signal_state(
                         previous_seen,
                         previous_changed,
                         previous_event_id,
+                        previous_key_id,
                     ) = previous
                     event_id = source_event_id or None
                     if event_id is not None and event_id == previous_event_id:
@@ -146,8 +186,48 @@ def observe_signal_state(
                             last_seen_at=previous_seen,
                             last_changed_at=previous_changed,
                         )
+                    if previous_key_id == fingerprint_key_id:
+                        comparable_fingerprint = fingerprint
+                        migrate_key = False
+                    elif (
+                        previous_material is not None
+                        and previous_key_id == previous_material[1]
+                    ):
+                        comparable_fingerprint = previous_material[0]
+                        migrate_key = True
+                    else:
+                        if (
+                            _unknown_key_rebaseline_enabled()
+                            and observed > previous_seen
+                        ):
+                            conn.execute(
+                                "UPDATE perception_signal_state_v2 "
+                                "SET value_fingerprint=%s, "
+                                "fingerprint_key_id=%s, last_seen_at=%s, "
+                                "last_changed_at=%s, source_event_id=%s, "
+                                "updated_at=now() "
+                                "WHERE user_id=%s AND signal=%s",
+                                (
+                                    fingerprint,
+                                    fingerprint_key_id,
+                                    observed,
+                                    observed,
+                                    event_id,
+                                    user_id,
+                                    signal,
+                                ),
+                            )
+                            return _decision(
+                                "baseline_created",
+                                fingerprint=fingerprint,
+                                last_seen_at=observed,
+                                last_changed_at=observed,
+                            )
+                        return _error("unknown_fingerprint_key")
                     if observed == previous_seen:
-                        if fingerprint != previous_fingerprint:
+                        if not hmac.compare_digest(
+                            comparable_fingerprint, previous_fingerprint
+                        ):
                             return _decision(
                                 "conflict_same_ts",
                                 fingerprint=previous_fingerprint,
@@ -156,38 +236,61 @@ def observe_signal_state(
                             )
                         conn.execute(
                             "UPDATE perception_signal_state_v2 "
-                            "SET source_event_id=%s, updated_at=now() "
+                            "SET value_fingerprint=%s, fingerprint_key_id=%s, "
+                            "source_event_id=%s, updated_at=now() "
                             "WHERE user_id=%s AND signal=%s",
-                            (event_id, user_id, signal),
+                            (
+                                fingerprint,
+                                fingerprint_key_id,
+                                event_id,
+                                user_id,
+                                signal,
+                            ),
                         )
                         return _decision(
                             "unchanged",
-                            fingerprint=previous_fingerprint,
+                            fingerprint=(
+                                fingerprint if migrate_key else previous_fingerprint
+                            ),
                             last_seen_at=previous_seen,
                             last_changed_at=previous_changed,
                         )
-                    if fingerprint == previous_fingerprint:
+                    if hmac.compare_digest(
+                        comparable_fingerprint, previous_fingerprint
+                    ):
                         conn.execute(
                             "UPDATE perception_signal_state_v2 "
-                            "SET last_seen_at=%s, source_event_id=%s, "
+                            "SET value_fingerprint=%s, fingerprint_key_id=%s, "
+                            "last_seen_at=%s, source_event_id=%s, "
                             "updated_at=now() "
                             "WHERE user_id=%s AND signal=%s",
-                            (observed, event_id, user_id, signal),
+                            (
+                                fingerprint,
+                                fingerprint_key_id,
+                                observed,
+                                event_id,
+                                user_id,
+                                signal,
+                            ),
                         )
                         return _decision(
                             "unchanged",
-                            fingerprint=previous_fingerprint,
+                            fingerprint=(
+                                fingerprint if migrate_key else previous_fingerprint
+                            ),
                             last_seen_at=observed,
                             last_changed_at=previous_changed,
                         )
                     conn.execute(
                         "UPDATE perception_signal_state_v2 "
-                        "SET value_fingerprint=%s, last_seen_at=%s, "
+                        "SET value_fingerprint=%s, fingerprint_key_id=%s, "
+                        "last_seen_at=%s, "
                         "last_changed_at=%s, source_event_id=%s, "
                         "updated_at=now() "
                         "WHERE user_id=%s AND signal=%s",
                         (
                             fingerprint,
+                            fingerprint_key_id,
                             observed,
                             observed,
                             event_id,
@@ -203,14 +306,16 @@ def observe_signal_state(
                     )
                 inserted = conn.execute(
                     "INSERT INTO perception_signal_state_v2 "
-                    "(user_id, signal, value_fingerprint, last_seen_at, "
+                    "(user_id, signal, value_fingerprint, fingerprint_key_id, "
+                    "last_seen_at, "
                     "last_changed_at, source_event_id) "
-                    "VALUES (%s,%s,%s,%s,%s,%s) "
+                    "VALUES (%s,%s,%s,%s,%s,%s,%s) "
                     "ON CONFLICT (user_id, signal) DO NOTHING RETURNING 1",
                     (
                         user_id,
                         signal,
                         fingerprint,
+                        fingerprint_key_id,
                         observed,
                         observed,
                         source_event_id or None,

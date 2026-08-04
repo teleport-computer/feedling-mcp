@@ -365,7 +365,11 @@ def ingest_snapshot_v2(
                         "data": json.dumps(_storage_value_for_decrypted_signal_v2(key, values)),
                         "message": msg,
                     })
-                    if key == "location_signal" and signal.changed is True:
+                    # The client flag is only an upload hint. Every decrypted,
+                    # nonempty anchor must reach the durable decision boundary
+                    # so a first `changed=false` report still establishes the
+                    # server-owned baseline.
+                    if key == "location_signal":
                         location_anchor_observations.append((key, values))
                 else:
                     _record_decrypt_failure_v2(user_id, key, err, now)

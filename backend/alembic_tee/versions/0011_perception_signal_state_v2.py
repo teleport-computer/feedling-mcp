@@ -18,6 +18,7 @@ CREATE TABLE perception_signal_state_v2 (
     user_id TEXT NOT NULL,
     signal TEXT NOT NULL,
     value_fingerprint TEXT NOT NULL,
+    fingerprint_key_id TEXT NOT NULL,
     last_seen_at TIMESTAMPTZ NOT NULL,
     last_changed_at TIMESTAMPTZ NOT NULL,
     source_event_id TEXT,

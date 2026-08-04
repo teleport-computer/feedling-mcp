@@ -155,6 +155,20 @@ def test_anchor_transition_wakes_once_and_repeat_only_updates_seen():
     assert wakes[0].trigger == "arrived_at_anchor"
     assert wakes[0].origin_refs == ("ios_report:location_signal",)
     assert "wifi_anchor" in wakes[0].change_digest
+    durable_projection = json.dumps(
+        {
+            "change_digest": wakes[0].change_digest,
+            "presence_hints": wakes[0].presence_hints,
+            "payload": wakes[0].payload,
+        },
+        sort_keys=True,
+    )
+    assert "wifi-home" not in durable_projection
+    assert "wifi-work" not in durable_projection
+    assert '"home"' not in durable_projection
+    assert '"work"' not in durable_projection
+    assert wakes[0].presence_hints == {"anchor_changed": True}
+    assert wakes[0].payload == {"anchor_changed": True}
     assert moved.result.state.last_seen_ts == 30.0
     assert moved.result.state.last_changed_ts == 30.0
 
@@ -449,7 +463,7 @@ def test_location_signal_decrypt_feeds_wifi_anchor_differ_once(monkeypatch):
 
     first = service.ingest_snapshot_v2(
         user_id,
-        [{"key": "location_signal", "envelope": {"id": "loc_home_1"}, "changed": True}],
+        [{"key": "location_signal", "envelope": {"id": "loc_home_1"}, "changed": False}],
         client_ts=300.0,
         api_key="api-key",
         decrypt_envelope=decrypt,

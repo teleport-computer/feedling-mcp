@@ -420,7 +420,10 @@ def test_perception_differ_only_discrete_anchor_wakes_location():
     assert len(moved.events) == 1
     assert moved.events[0].source == "perception_event"
     assert moved.events[0].trigger == "arrived_at_anchor"
-    assert moved.presence_hints["entered_anchor"] == "work"
+    assert moved.presence_hints == {"anchor_changed": True}
+    assert moved.events[0].payload == {"anchor_changed": True}
+    assert "wifi-work" not in moved.change_digest
+    assert "work" not in moved.change_digest
 
 
 def test_perception_differ_tracks_seen_separately_from_changed():
