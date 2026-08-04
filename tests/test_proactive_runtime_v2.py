@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
 from perception.differ_v2 import PerceptionDifferV2
+from perception.signal_state_v2 import SignalObservationDecision
 from proactive.adapters_v2 import wake_event_v2_from_legacy_job
 from proactive.controls_v2 import (
     evaluate_delivery_v2,
@@ -40,6 +42,24 @@ def _switches(**overrides):
     }
     doc.update(overrides)
     return doc
+
+
+def _scripted_state(*steps):
+    remaining = iter(steps)
+
+    def observe(_uid, _signal, _value, *, observed_at, **_kwargs):
+        outcome, last_changed_at = next(remaining)
+        return SignalObservationDecision(
+            outcome=outcome,
+            changed=outcome == "changed",
+            fingerprint="test-fingerprint",
+            last_seen_at=datetime.fromtimestamp(observed_at, tz=timezone.utc),
+            last_changed_at=datetime.fromtimestamp(
+                last_changed_at, tz=timezone.utc
+            ),
+        )
+
+    return observe
 
 
 def test_wake_inbox_merges_nearby_wakes_and_dedupes_same_trigger():
@@ -385,22 +405,28 @@ def test_tool_catalog_cost_classes_and_pull_only_motion():
 
 
 def test_perception_differ_only_discrete_anchor_wakes_location():
-    differ = PerceptionDifferV2()
+    differ = PerceptionDifferV2(observe_state=_scripted_state(
+        ("baseline_created", 3.0), ("changed", 4.0)
+    ))
 
     motion = differ.observe("u1", "motion_state", "walking", ts=1.0)
     place = differ.observe("u1", "place_label", "home", ts=2.0)
     anchor = differ.observe("u1", "connectivity_anchor", {"anchor_id": "wifi-home", "label": "home"}, ts=3.0)
+    moved = differ.observe("u1", "connectivity_anchor", {"anchor_id": "wifi-work", "label": "work"}, ts=4.0)
 
     assert motion.events == ()
     assert place.events == ()
-    assert len(anchor.events) == 1
-    assert anchor.events[0].source == "perception_event"
-    assert anchor.events[0].trigger == "arrived_at_anchor"
-    assert anchor.presence_hints["entered_anchor"] == "home"
+    assert anchor.events == ()
+    assert len(moved.events) == 1
+    assert moved.events[0].source == "perception_event"
+    assert moved.events[0].trigger == "arrived_at_anchor"
+    assert moved.presence_hints["entered_anchor"] == "work"
 
 
 def test_perception_differ_tracks_seen_separately_from_changed():
-    differ = PerceptionDifferV2()
+    differ = PerceptionDifferV2(observe_state=_scripted_state(
+        ("baseline_created", 10.0), ("unchanged", 10.0)
+    ))
 
     first = differ.observe("u1", "connectivity_anchor", "wifi-home", ts=10.0)
     second = differ.observe("u1", "connectivity_anchor", "wifi-home", ts=20.0)

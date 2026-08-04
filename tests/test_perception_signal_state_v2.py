@@ -17,6 +17,8 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 import db  # noqa: E402
 from conftest import seed_user  # noqa: E402
 from perception import signal_state_v2  # noqa: E402
+from perception.differ_v2 import PerceptionDifferV2  # noqa: E402
+from perception.ingress_v2 import observe_signal_v2  # noqa: E402
 
 
 def _user_id(label: str) -> str:
@@ -388,3 +390,92 @@ def test_concurrent_real_transition_returns_changed_exactly_once():
     row = _state_row(user_id)
     assert row[1] == datetime.fromtimestamp(200.0, tz=timezone.utc)
     assert row[2] == row[1]
+
+
+def test_ingress_instances_share_baseline_and_emit_only_the_real_transition():
+    """Process-local differ replacement must not alter user-visible wake behavior."""
+    user_id = _user_id("ingress_workers")
+    seed_user(user_id)
+    wakes = []
+
+    first = observe_signal_v2(
+        user_id,
+        "wifi_anchor",
+        "wifi-home",
+        ts=100.0,
+        differ=PerceptionDifferV2(),
+        submit_wake=wakes.append,
+    )
+    repeated_on_another_worker = observe_signal_v2(
+        user_id,
+        "wifi_anchor",
+        "wifi-home",
+        ts=200.0,
+        differ=PerceptionDifferV2(),
+        submit_wake=wakes.append,
+    )
+    moved_on_a_third_worker = observe_signal_v2(
+        user_id,
+        "wifi_anchor",
+        "wifi-work",
+        ts=300.0,
+        differ=PerceptionDifferV2(),
+        submit_wake=wakes.append,
+    )
+
+    assert first.wake_events == ()
+    assert repeated_on_another_worker.wake_events == ()
+    assert [event.trigger for event in moved_on_a_third_worker.wake_events] == [
+        "arrived_at_anchor"
+    ]
+    assert len(wakes) == 1
+
+
+def test_ingress_suppresses_stale_and_equal_time_conflict_wakes():
+    """Replay ordering decisions must survive the differ-to-wake adapter."""
+    user_id = _user_id("ingress_order")
+    seed_user(user_id)
+    wakes = []
+
+    baseline = observe_signal_v2(
+        user_id,
+        "wifi_anchor",
+        "wifi-home",
+        ts=100.0,
+        differ=PerceptionDifferV2(),
+        submit_wake=wakes.append,
+    )
+    stale = observe_signal_v2(
+        user_id,
+        "wifi_anchor",
+        "wifi-work",
+        ts=50.0,
+        differ=PerceptionDifferV2(),
+        submit_wake=wakes.append,
+    )
+    conflict = observe_signal_v2(
+        user_id,
+        "wifi_anchor",
+        "wifi-work",
+        ts=100.0,
+        differ=PerceptionDifferV2(),
+        submit_wake=wakes.append,
+    )
+    changed = observe_signal_v2(
+        user_id,
+        "wifi_anchor",
+        "wifi-work",
+        ts=200.0,
+        differ=PerceptionDifferV2(),
+        submit_wake=wakes.append,
+    )
+
+    assert baseline.result.changed is False
+    assert stale.result.change_digest.startswith("wifi_anchor: stale")
+    assert conflict.result.change_digest.startswith(
+        "wifi_anchor: conflict_same_ts"
+    )
+    assert stale.wake_events == ()
+    assert conflict.wake_events == ()
+    assert len(changed.wake_events) == 1
+    assert len(wakes) == 1

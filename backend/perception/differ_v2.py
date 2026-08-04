@@ -1,16 +1,16 @@
-"""Perception Differ V2 skeleton.
+"""Perception Differ V2 event renderer.
 
 The existing perception service stores current coarse state. The v2 differ is
-the missing stateful layer between raw signals and wake creation: it tracks
-last-seen vs last-changed, emits only discrete wake events, and prepares cheap
-digests/presence hints for the runtime.
+the layer between durable raw-signal decisions and wake creation: it emits only
+discrete wake events and prepares cheap digests/presence hints for the runtime.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 import time
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 
+from perception import signal_state_v2
 from proactive.observability_v2 import METRIC_PHASH_FRAME, MetricsSinkV2, record_metric_v2
 
 
@@ -40,6 +40,16 @@ class DifferResultV2:
     events: tuple[DifferEventV2, ...] = ()
 
 
+_DURABLE_WAKE_SIGNALS = frozenset({
+    "connectivity_anchor",
+    "wifi_anchor",
+    "bluetooth_anchor",
+    "unlock_after_absence",
+    "screen_phash",
+    "photo_added",
+})
+
+
 def _format_value(value: Any) -> str:
     if value is None:
         return "none"
@@ -51,17 +61,18 @@ def _format_value(value: Any) -> str:
 
 
 class PerceptionDifferV2:
-    """In-memory differ implementation for the v2 contract.
+    """Render durable signal decisions into wake events and presence hints."""
 
-    Production storage can later move this state to Postgres or to a resident
-    local store. The signal semantics live here so hosted and resident can stay
-    equivalent.
-    """
-
-    def __init__(self, *, metrics_sink: MetricsSinkV2 | None = None) -> None:
-        self._state: dict[str, dict[str, SignalStateV2]] = {}
+    def __init__(
+        self,
+        *,
+        metrics_sink: MetricsSinkV2 | None = None,
+        observe_state: (
+            Callable[..., signal_state_v2.SignalObservationDecision] | None
+        ) = None,
+    ) -> None:
         self.metrics_sink = metrics_sink
-
+        self._observe_state = observe_state or signal_state_v2.observe_signal_state
 
     def observe(
         self,
@@ -70,21 +81,43 @@ class PerceptionDifferV2:
         value: Any,
         *,
         ts: float | None = None,
+        source_event_id: str | None = None,
+        allow_first_event: bool = False,
     ) -> DifferResultV2:
         ts = time.time() if ts is None else float(ts)
-        signals = self._state.setdefault(user_id, {})
-        prev = signals.get(signal)
-        changed = prev is None or prev.value != value
-        last_changed_ts = ts if changed else prev.last_changed_ts
-        state = SignalStateV2(value=value, last_seen_ts=ts, last_changed_ts=last_changed_ts)
-        signals[signal] = state
-
-        digest = (
-            f"{signal}: {_format_value(prev.value if prev else None)} -> {_format_value(value)}"
-            if changed
-            else f"{signal}: stable since {int(last_changed_ts)}"
+        if signal in _DURABLE_WAKE_SIGNALS:
+            decision = self._observe_state(
+                user_id,
+                signal,
+                value,
+                observed_at=ts,
+                source_event_id=source_event_id,
+                allow_first_event=allow_first_event,
+            )
+            changed = decision.changed
+            last_seen_ts = (
+                decision.last_seen_at.timestamp()
+                if decision.last_seen_at is not None
+                else ts
+            )
+            last_changed_ts = (
+                decision.last_changed_at.timestamp()
+                if decision.last_changed_at is not None
+                else last_seen_ts
+            )
+            outcome = decision.outcome
+        else:
+            changed = False
+            last_seen_ts = ts
+            last_changed_ts = ts
+            outcome = "unchanged"
+        state = SignalStateV2(
+            value=value,
+            last_seen_ts=last_seen_ts,
+            last_changed_ts=last_changed_ts,
         )
-        events = self._events_for(signal, value, prev, digest, changed)
+        digest = f"{signal}: {outcome} ({_format_value(value)})"
+        events = self._events_for(signal, value, None, digest, changed)
         hints = self._presence_hints_for(signal, value, changed)
         if signal == "screen_phash":
             record_metric_v2(

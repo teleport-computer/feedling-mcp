@@ -403,6 +403,8 @@ def ingest_device_event_v2(user_id: str, event: dict) -> dict:
             observation.value,
             ts=float((event or {}).get("ts") or _now()),
             origin_refs=observation.origin_refs,
+            source_event_id=observation.source_event_id,
+            allow_first_event=observation.allow_first_event,
             submit_wake=_submit_wake_event_v2_compat,
         )
         submitted += len(result.wake_events)
@@ -1183,6 +1185,8 @@ def photo_evaluate(user_id: str, metadata: dict,
                 {"photo_id": photo_id, "sensitive": sensitive},
                 ts=now,
                 origin_refs=(f"photo:{photo_id}",),
+                source_event_id=photo_id,
+                allow_first_event=True,
                 submit_wake=_submit_wake_event_v2_compat,
             )
     else:
