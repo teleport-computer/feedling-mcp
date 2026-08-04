@@ -148,13 +148,15 @@ def test_format_error_and_predicate():
 # --- 现场两张卡的回归 --------------------------------------------------------
 
 _CARD_A = (  # 长标题 + 正文只有省略号
-    '{"consolidations":[{"op":"thicken","card_ids":["m_1"],"result":'
+    '{"consolidations":[{"op":"thicken","card_ids":["m_1"],'
+    '"rationale":"补充裁员事件细节","result":'
     '{"bucket":"工作","threads":["加班"],'
     '"summary":"她提到公司最近在裁员，她的组也受到影响，情绪很低落，还说到了房贷",'
     '"content":"...","importance":0.8,"pulse":0.5}}]}'
 )
 _CARD_B = (  # 方括号占位,一个字没填
-    '{"consolidations":[{"op":"merge","card_ids":["m_2","m_3"],"result":'
+    '{"consolidations":[{"op":"merge","card_ids":["m_2","m_3"],'
+    '"rationale":"合并重复的工作记忆","result":'
     '{"bucket":"...","threads":["...","..."],"summary":"[thickened summary]",'
     '"content":"[thickened content combining work info + incident narrative]"}}]}'
 )
@@ -170,9 +172,11 @@ def test_dream_bounces_the_two_real_garbage_cards():
 def test_dream_relaxed_pass_drops_dirty_keeps_clean():
     raw = (
         '{"consolidations":['
-        '{"op":"merge","card_ids":["m_2"],"result":{"summary":"[thickened summary]",'
+        '{"op":"merge","card_ids":["m_2"],"rationale":"合并重复内容",'
+        '"result":{"summary":"[thickened summary]",'
         '"content":"[…]"}},'
-        '{"op":"thicken","card_ids":["m_9"],"result":{"bucket":"工作",'
+        '{"op":"thicken","card_ids":["m_9"],"rationale":"补充裁员进展",'
+        '"result":{"bucket":"工作",'
         '"threads":["裁员"],"summary":"她的组在裁员名单上",'
         '"content":"她说组里已经走了三个人，她担心下一个是自己。"}}]}'
     )
@@ -206,7 +210,10 @@ def test_all_dirty_after_retry_never_looks_like_a_clean_noop():
     frontier —— 这段对话/这批卡就永久丢了,而且 data-track 上完全看不见
     (codex review P1-3)。真正的空结果必须是「模型没给脏行」。
     """
-    all_dirty = '{"consolidations":[{"op":"merge","card_ids":["m_1"],"result":{"summary":"...","content":"..."}}]}'
+    all_dirty = (
+        '{"consolidations":[{"op":"merge","card_ids":["m_1"],'
+        '"rationale":"合并重复内容","result":{"summary":"...","content":"..."}}]}'
+    )
     cons, _qs, err = parse_dream_consolidations(all_dirty, strict=False)
     assert cons == [] and err.startswith("invalid_card_content_after_retry:")
 
