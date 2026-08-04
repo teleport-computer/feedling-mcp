@@ -709,8 +709,15 @@ def plaintext_import(
     job_metadata,
     start_job,
     distill_model: str = "",
+    trusted_staged_id: str = "",
 ) -> tuple[dict, int]:
     """Enqueue (or reuse) a plaintext genesis distill job.
+
+    ``trusted_staged_id`` is the staged payload this job is committed from, supplied
+    ONLY by ``plaintext_commit`` after it validated + loaded the stage. It is recorded
+    in job metadata so the DONE terminal path can release exactly that stage. The
+    public ``/plaintext`` direct-import path leaves it empty; a client-supplied
+    ``staged_id`` in the request body is never trusted for stage lifecycle.
 
     ``prepare`` / ``find_reusable`` / ``plaintext_mode`` / ``job_metadata`` /
     ``start_job`` are the routes-resident helpers (see module docstring); they are
@@ -744,6 +751,15 @@ def plaintext_import(
     if existing and str(existing.get("status") or "") == "processing":
         existing = plaintext_helpers._fail_stale_plaintext_job(store, existing) or existing
     if existing and str(existing.get("status") or "") == service.DONE_JOB_STATUS:
+        # Identical materials already distilled successfully. No worker runs (and thus
+        # no DONE terminal callback), so release THIS request's stage right here — the
+        # outcome is already known-good.
+        if trusted_staged_id:
+            try:
+                service.mark_genesis_staged_consumed(
+                    store, trusted_staged_id, str(existing.get("job_id") or ""))
+            except Exception:
+                pass  # reap/TTL backstop
         return _job_response(existing, extra={"status": "done"}), 200
 
     # Fast-path the stable 409 response. The partial unique index remains the
@@ -785,6 +801,11 @@ def plaintext_import(
         metadata_patch = plaintext_helpers._plaintext_worker_metadata()
         if normalized_distill_model or existing_metadata.get("distill_model"):
             metadata_patch["distill_model"] = normalized_distill_model or None
+        # Re-bind to THIS request's stage: the original attempt may have been backed by
+        # an older stage that a re-staged retry already reaped. Without this, DONE would
+        # try to release a deleted stage and strand the live one.
+        if trusted_staged_id:
+            metadata_patch["staged_id"] = trusted_staged_id
         existing = db.genesis_patch_job_metadata(
             store.user_id,
             str(existing.get("job_id") or ""),
@@ -819,6 +840,7 @@ def plaintext_import(
         client_job_id=client_job_id,
         input_hash=input_hash,
         mode=mode,
+        staged_id=trusted_staged_id,
     )
     if normalized_distill_model:
         metadata["distill_model"] = normalized_distill_model
@@ -925,12 +947,12 @@ def plaintext_commit(
         job_metadata=job_metadata,
         start_job=start_job,
         distill_model=str(payload.get("distill_model") or ""),
+        # Trusted: staged_id validated by the load_genesis_staged_payload above. Recorded
+        # in job metadata so the DONE terminal path releases exactly this stage.
+        trusted_staged_id=staged_id,
     )
-    if 200 <= status < 300:
-        job = body.get("job") if isinstance(body.get("job"), dict) else {}
-        try:
-            service.mark_genesis_staged_consumed(
-                store, staged_id, str(job.get("job_id") or ""))
-        except Exception:
-            log.exception("genesis staged tombstone write failed staged_id=%s", staged_id)
+    # Do NOT consume the staged payload here. A job accepted at commit can still fail
+    # asynchronously; consuming now would leave the retry with no materials to re-run
+    # (staged_import_consumed 409). Consumption happens on job DONE; a FAILED job keeps
+    # its staged payload so retry can reuse it (growth bounded: one stage/account, TTL).
     return body, status

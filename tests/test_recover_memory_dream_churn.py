@@ -1,4 +1,5 @@
 import importlib.util
+from datetime import timezone
 from pathlib import Path
 
 
@@ -66,3 +67,85 @@ def test_recovery_source_falls_back_to_capture_mode_and_reports_distribution():
 
     assert report["by_source"] == {"memory_capture": 1, "memory_dream": 1}
     assert report["active_by_source"] == {"memory_capture": 1}
+
+
+def test_window_recovery_uses_created_and_archived_boundaries_symmetrically():
+    since = recovery._iso_datetime("2026-07-29")
+    docs = [
+        {
+            "id": "dream-before-active",
+            "source": "memory_dream",
+            "created_at": "2026-07-28T23:59:59Z",
+            "status": "active",
+        },
+        {
+            "id": "dream-at-boundary-active",
+            "source": "memory_dream",
+            "created_at": "2026-07-29T00:00:00Z",
+            "status": "active",
+        },
+        {
+            "id": "capture-superseded-before",
+            "source": "memory_capture",
+            "status": "superseded",
+            "is_archived": True,
+            "archived_at": "2026-07-28T23:59:59Z",
+        },
+        {
+            "id": "capture-superseded-at-boundary",
+            "source": "memory_capture",
+            "status": "superseded",
+            "is_archived": True,
+            "archived_at": "2026-07-29T00:00:00Z",
+        },
+        {
+            "id": "old-dream-swallowed-in-window",
+            "source": "memory_dream",
+            "created_at": "2026-07-20T00:00:00Z",
+            "status": "superseded",
+            "is_archived": True,
+            "archived_at": "2026-07-30T00:00:00Z",
+            "superseded_by": "dream-churn",
+        },
+        {
+            "id": "new-dream-already-superseded",
+            "source": "memory_dream",
+            "created_at": "2026-07-30T00:00:00Z",
+            "status": "superseded",
+            "is_archived": True,
+            "archived_at": "2026-07-31T00:00:00Z",
+        },
+    ]
+
+    updated, plan = recovery.recovery_plan(
+        docs,
+        now_iso="2026-08-04T00:00:00Z",
+        since=since,
+    )
+    by_id = {doc["id"]: doc for doc in updated}
+
+    assert by_id["dream-before-active"] == docs[0]
+    assert by_id["dream-at-boundary-active"]["status"] == "superseded"
+    assert by_id["capture-superseded-before"] == docs[2]
+    assert by_id["capture-superseded-at-boundary"]["status"] == "active"
+    assert by_id["old-dream-swallowed-in-window"]["status"] == "active"
+    assert "superseded_by" not in by_id["old-dream-swallowed-in-window"]
+    assert by_id["new-dream-already-superseded"]["status"] == "superseded"
+    assert plan == {
+        "restore_non_dream_superseded": 2,
+        "retire_memory_dream": 2,
+        "untouched": 2,
+        "hard_deletes": 0,
+    }
+
+
+def test_since_date_is_inclusive_utc_and_workflow_forwards_it():
+    parsed = recovery._iso_datetime("2026-07-29")
+    assert parsed.tzinfo == timezone.utc
+    assert parsed.isoformat() == "2026-07-29T00:00:00+00:00"
+
+    workflow = (
+        Path(__file__).parent.parent / ".github/workflows/recover-dream-churn.yml"
+    ).read_text()
+    assert "since:" in workflow
+    assert 'recovery_args+=(--since "$RECOVERY_SINCE")' in workflow

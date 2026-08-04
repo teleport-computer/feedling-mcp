@@ -1,8 +1,8 @@
 name: recover-dream-churn
 
 # Manually-dispatched runner for tools/recover_memory_dream_churn.py.
-# Exists so the test-RDS DSN never leaves GitHub secrets: the recovery
-# script is test-only, dry-run by default, double-confirmed for apply,
+# Exists so database DSNs never leave GitHub secrets: the recovery script is
+# operator-only, dry-run by default, double-confirmed for apply,
 # and performs zero hard deletes (see tests/test_recover_memory_dream_churn.py).
 
 on:
@@ -16,6 +16,16 @@ on:
         description: "Set to APPLY to actually write; anything else = dry-run"
         required: false
         default: "dry-run"
+        type: string
+      env:
+        description: "test or prod"
+        required: false
+        default: "test"
+        type: string
+      since:
+        description: "Optional inclusive ISO churn-window start (for example 2026-07-29)"
+        required: false
+        default: ""
         type: string
 
 permissions:
@@ -39,14 +49,21 @@ jobs:
       - name: Run recovery (dry-run unless apply=APPLY)
         env:
           TEST_DATABASE_URL: ${{ secrets.TEST_DATABASE_URL }}
+          PROD_DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          RECOVERY_SINCE: ${{ inputs.since }}
         run: |
           set -euo pipefail
+          recovery_args=(
+            --env "${{ inputs.env }}"
+            --user-id "${{ inputs.user_id }}"
+          )
+          if [ -n "$RECOVERY_SINCE" ]; then
+            recovery_args+=(--since "$RECOVERY_SINCE")
+          fi
           if [ "${{ inputs.apply }}" = "APPLY" ]; then
-            python3 tools/recover_memory_dream_churn.py \
-              --env test --user-id "${{ inputs.user_id }}" \
+            python3 tools/recover_memory_dream_churn.py "${recovery_args[@]}" \
               --apply --confirm-user-id "${{ inputs.user_id }}" \
               --confirm-churn-stopped
           else
-            python3 tools/recover_memory_dream_churn.py \
-              --env test --user-id "${{ inputs.user_id }}"
+            python3 tools/recover_memory_dream_churn.py "${recovery_args[@]}"
           fi
