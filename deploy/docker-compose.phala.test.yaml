@@ -370,8 +370,8 @@ services:
       FEEDLING_GENESIS_WORKER_ENABLED: "1"
       # Runtime V2 background memory lanes execute in this worker, not backend.
       FEEDLING_V2_CAPTURE_ENABLED: "${FEEDLING_V2_CAPTURE_ENABLED:-1}"
-      # P0 kill switch: keep V2 dream off in test until the guarded rewrite
-      # path has been deployed and Seven's Garden recovery is verified.
+      # Dream is intentionally always on in test after the guarded rewrite
+      # passed live convergence and non-destructive merge verification.
       FEEDLING_V2_DREAM_ENABLED: "1"
       # CVM-local in-process sandbox: PDF/DOCX/XLSX materialize + extract inside
       # the serve-worker (no E2B), staying within the TDX trust boundary.
