@@ -370,7 +370,7 @@ services:
       FEEDLING_V2_CAPTURE_ENABLED: "${FEEDLING_V2_CAPTURE_ENABLED:-1}"
       # P0 kill switch: keep V2 dream off in test until the guarded rewrite
       # path has been deployed and Seven's Garden recovery is verified.
-      FEEDLING_V2_DREAM_ENABLED: "${FEEDLING_V2_DREAM_ENABLED:-0}"
+      FEEDLING_V2_DREAM_ENABLED: "1"
       # CVM-local in-process sandbox: PDF/DOCX/XLSX materialize + extract inside
       # the serve-worker (no E2B), staying within the TDX trust boundary.
       FEEDLING_V2_SANDBOX_PROVIDER: "local"
