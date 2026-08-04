@@ -28,6 +28,7 @@ from perception.agent_fields import (
     FAST_AGENT_PERCEPTION_SIGNALS,
     project_signal,
 )
+from perception.glance import build_perception_glance
 
 
 class AgentRouteError(Exception):
@@ -119,6 +120,65 @@ def _history_signal(raw: str | None) -> str | None:
     return _HISTORY_SIGNAL_TO_CATALOG.get(sig)
 
 
+def _history_field_permission_signal(
+    catalog_signal: str,
+    field: str,
+) -> str | None:
+    """Map one stored history field back to its authoritative signal doc.
+
+    History uses canonical catalog signals while authorization is represented
+    by the disabled documents returned from ``agent_perception_payload``.  The
+    shared ``health_vitals`` row is the only ambiguous catalog record:
+    ``step_count`` follows the dedicated ``steps`` permission, while every
+    other canonical vital follows ``vitals``. Unknown fields fail closed.
+    """
+    if catalog_signal == "health_vitals" and field == "step_count":
+        return "steps"
+    candidates = [
+        agent_signal
+        for agent_signal, mapped_catalog in _HISTORY_SIGNAL_TO_CATALOG.items()
+        if mapped_catalog == catalog_signal
+        and field in _SIGNAL_FIELDS.get(agent_signal, ())
+    ]
+    return candidates[0] if len(candidates) == 1 else None
+
+
+def _permission_mask_history_rows(
+    rows_by_signal: Mapping[str, list[Mapping[str, Any]]],
+    signal_docs: Mapping[str, Any],
+) -> dict[str, list[dict[str, Any]]]:
+    """Drop history fields whose canonical live signal doc is disabled.
+
+    Masking rows before ``notable_changes`` also prevents a denied high-rank
+    delta from consuming the top-N cap ahead of an authorized change.
+    """
+    masked: dict[str, list[dict[str, Any]]] = {}
+    for catalog_signal, rows in rows_by_signal.items():
+        masked_rows: list[dict[str, Any]] = []
+        for row in rows:
+            if not isinstance(row, Mapping):
+                continue
+            doc = row.get("doc")
+            safe_doc: dict[str, Any] = {}
+            if isinstance(doc, Mapping):
+                for field, value in doc.items():
+                    if not isinstance(field, str):
+                        continue
+                    permission_signal = _history_field_permission_signal(
+                        str(catalog_signal), field
+                    )
+                    permission_doc = signal_docs.get(permission_signal or "")
+                    if (
+                        permission_signal is not None
+                        and isinstance(permission_doc, Mapping)
+                        and permission_doc.get("disabled") is not True
+                    ):
+                        safe_doc[field] = value
+            masked_rows.append({**dict(row), "doc": safe_doc})
+        masked[str(catalog_signal)] = masked_rows
+    return masked
+
+
 def _parse_days(raw: str | None, default: str) -> int:
     """Clamp the ``days`` query param to [1, 365]; raise 400 on non-numeric.
 
@@ -208,6 +268,35 @@ def perception_history_payload(store, *, signal_raw: str | None, days_raw: str |
     days = _parse_days(days_raw, "14")
     rows = perception_store.list_perception_daily(store.user_id, sig, days)
     return {"ok": True, "signal": sig, "days": days, "daily": rows}
+
+
+def perception_glance_payload(store, *, days_raw: str | None) -> dict[str, Any]:
+    """Permission-aware, number-free perception overview for proactive runtime use."""
+    days = _parse_days(days_raw, "30")
+    snapshot = agent_perception_payload(
+        store,
+        signals_raw=",".join(AGENT_PERCEPTION_SIGNALS),
+    )
+    signal_docs = (
+        snapshot.get("signals")
+        if isinstance(snapshot.get("signals"), Mapping)
+        else {}
+    )
+    rows_by_signal = {
+        signal: perception_store.list_perception_daily(store.user_id, signal, days)
+        for signal in perception_history.comparable_signals()
+    }
+    changes = perception_history.notable_changes(
+        _permission_mask_history_rows(rows_by_signal, signal_docs),
+        max_changes=_digest_notable_max(),
+    )
+    return {
+        "ok": True,
+        "glance": build_perception_glance(
+            signal_docs,
+            notable_changes=changes,
+        ),
+    }
 
 
 def perception_digest_payload(store, *, days_raw: str | None) -> dict[str, Any]:

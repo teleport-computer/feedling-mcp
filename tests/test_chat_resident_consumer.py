@@ -2713,6 +2713,7 @@ def test_memory_lane_raw_text_survives_chat_sanitizer(monkeypatch):
         "    {\n"
         '      "op": "merge",\n'
         '      "card_ids": ["a", "b"],\n'
+        '      "rationale": "两张卡记录同一段持续加班经历",\n'
         '      "result": {\n'
         '        "bucket": "工作",\n'
         '        "threads": ["加班"],\n'
@@ -2796,7 +2797,8 @@ def test_capture_window_never_labels_the_person_user():
 
 def _dream_reply(summary: str, content: str, card_id: str = "m_1") -> str:
     return (
-        '{"consolidations":[{"op":"thicken","card_ids":["%s"],"result":'
+        '{"consolidations":[{"op":"thicken","card_ids":["%s"],'
+        '"rationale":"同一张卡的新事实厚化原线索","result":'
         '{"bucket":"工作","threads":["加班"],"summary":%s,"content":%s}}],'
         '"questions_to_ask":[]}'
     ) % (card_id, json.dumps(summary, ensure_ascii=False), json.dumps(content, ensure_ascii=False))
@@ -3174,6 +3176,8 @@ def _install_dream_job_harness(monkeypatch, agent_reply):
 
     def _agent(prompt, *_args, **_kwargs):
         captured["prompts"].append(prompt)
+        if "独立的记忆整理审查员" in prompt:
+            return '{"decision":"yes","reason":"来源卡属于同一条连续线索"}'
         return agent_reply
 
     def _fail_post(*_args, **_kwargs):
@@ -3248,6 +3252,59 @@ def _install_dream_job_harness(monkeypatch, agent_reply):
 
 def _dream_final_status(captured):
     return captured["statuses"][-1]
+
+
+def test_v1_dream_semantic_review_is_isolated_and_rejects_no(monkeypatch):
+    calls = []
+
+    def _agent(prompt, **kwargs):
+        calls.append((prompt, kwargs))
+        return '{"decision":"no","reason":"只是同属健康主题"}'
+
+    monkeypatch.setattr(crc, "call_agent", _agent)
+    reviewed = crc._dream_review_consolidations(
+        [{
+            "op": "merge",
+            "card_ids": ["cycling", "sleep"],
+            "rationale": "都和健康有关",
+            "result": {"summary": "健康", "content": "骑行与失眠。"},
+        }],
+        card_map={
+            "cycling": {"id": "cycling", "content": "周末沿江骑行。"},
+            "sleep": {"id": "sleep", "content": "失眠时听白噪音。"},
+        },
+        job_id="dream-review-v1",
+    )
+
+    assert reviewed == []
+    assert calls[0][1]["isolated_session"] is True
+    assert calls[0][1]["raw_text"] is True
+
+
+def test_v1_dream_semantic_review_failure_drops_one_and_continues(monkeypatch):
+    responses = iter([
+        RuntimeError("provider timeout"),
+        '{"decision":"yes","reason":"同一京都计划的演进"}',
+    ])
+
+    def _agent(*_args, **_kwargs):
+        response = next(responses)
+        if isinstance(response, Exception):
+            raise response
+        return response
+
+    monkeypatch.setattr(crc, "call_agent", _agent)
+    reviewed = crc._dream_review_consolidations(
+        [
+            {"op": "merge", "card_ids": ["a", "b"], "rationale": "第一条", "result": {}},
+            {"op": "merge", "card_ids": ["c", "d"], "rationale": "第二条", "result": {}},
+        ],
+        card_map={key: {"id": key, "content": key} for key in ("a", "b", "c", "d")},
+        job_id="dream-review-v1-continue",
+    )
+
+    assert [row["card_ids"] for row in reviewed] == [["c", "d"]]
+    assert reviewed[0]["_review_reason"] == "同一京都计划的演进"
 
 
 def test_capture_get_json_disables_tls_verification_for_enclave_only(monkeypatch):
@@ -3752,6 +3809,7 @@ def test_dream_job_merge_writes_multi_supersede_without_chat_or_delivery(monkeyp
         "consolidations": [{
             "op": "merge",
             "card_ids": ["mem_a", "mem_b"],
+            "rationale": "两张卡都记录 Seven 对燕麦奶咖啡的同一偏好。",
             "result": {
                 "bucket": "life",
                 "threads": ["coffee"],
@@ -3808,6 +3866,7 @@ def test_dream_job_thicken_and_supersede_are_memory_supersede_actions(monkeypatc
             {
                 "op": "thicken",
                 "card_ids": ["mem_c"],
+                "rationale": "新内容为同一晨间咖啡习惯增加具体细节。",
                 "result": {
                     "bucket": "routine",
                     "threads": ["coffee"],
@@ -3820,6 +3879,7 @@ def test_dream_job_thicken_and_supersede_are_memory_supersede_actions(monkeypatc
             {
                 "op": "supersede",
                 "card_ids": ["mem_a"],
+                "rationale": "新陈述纠正同一牛奶偏好的旧版本。",
                 "result": {
                     "bucket": "life",
                     "threads": ["coffee"],

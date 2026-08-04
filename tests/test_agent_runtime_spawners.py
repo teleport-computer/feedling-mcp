@@ -208,6 +208,80 @@ def test_default_codex_cmd_requests_reasoning_summary_events():
     assert "-c model_reasoning_summary=detailed" in cmd
 
 
+# ---- V1 web capability: block the drivers' NATIVE web tools so the model is
+# forced through our io_cli web-search/web-fetch verbs (server-side authorized +
+# kill-switchable), never the driver's own ungated tool. ----
+
+
+def test_claude_default_cmd_disallows_native_web_tools():
+    # claude ships built-in WebSearch/WebFetch. They are NOT allow-listed, so the
+    # model's preferred WebSearch is denied ("requires approval") and it never
+    # falls back to our io_cli web-search verb → user sees "联网被权限拦截".
+    # --disallowed-tools hard-denies both (deny > allow); WebFetch too, or a model
+    # blocked from search could still fetch arbitrary URLs, bypassing our gate.
+    cmd = spawners._default_cli_cmd("claude", "/h")
+    assert "--disallowed-tools WebSearch,WebFetch" in cmd
+
+
+def test_claude_thinking_cmd_disallows_native_web_tools():
+    # Same block on the thinking (stream-json) claude command — the deepseek /
+    # sonnet-4 / opus-4 path routes here and must not leak the native web tools.
+    cmd = spawners._default_thinking_claude_cmd("/h")
+    assert "--disallowed-tools WebSearch,WebFetch" in cmd
+    # exercised end-to-end through consumer_env for a thinking model too
+    env = spawners.consumer_env(
+        {}, {"api_key": "fk", "provider": "anthropic", "driver": "claude",
+             "model": "claude-sonnet-4-5", "provider_key": "sk-ant"},
+        user_id="u", home="/h")
+    assert "--disallowed-tools WebSearch,WebFetch" in env["AGENT_CLI_CMD"]
+
+
+def test_claude_settings_deny_web_tools_and_survives_user_mcp_merge():
+    # Two-layer defense: the settings.json permissions.deny blocks the native web
+    # tools even if an operator cli_cmd override drops the --disallowed-tools flag
+    # (claude still reads settings.json; deny outranks allow).
+    files = spawners.agent_home_files("/h", driver="claude", provider="anthropic")
+    settings = json.loads(files["/h/claude-home/settings.json"])
+    assert settings["permissions"]["deny"] == ["WebSearch", "WebFetch"]
+
+    # The consumer merges user-MCP allow rules via merge_settings_allow, which only
+    # rewrites permissions.allow — the deny must survive the merge untouched.
+    sys.path.insert(0, str(Path(__file__).parent.parent / "tools"))
+    import user_mcp_materialize
+
+    merged_text = user_mcp_materialize.merge_settings_allow(
+        files["/h/claude-home/settings.json"],
+        ["mcp__svc__*"], managed_names={"svc"})
+    merged = json.loads(merged_text)
+    assert merged["permissions"]["deny"] == ["WebSearch", "WebFetch"]  # deny preserved
+    assert "mcp__svc__*" in merged["permissions"]["allow"]             # allow merged
+    # the io_cli allow rules also survive the merge
+    assert any("io_cli.py perception" in r for r in merged["permissions"]["allow"])
+
+
+def test_codex_default_cmd_disables_native_web_search():
+    # codex ships a native Responses web-search tool (web.run). Disable it at the
+    # CLI (top-level `-c web_search=disabled` — the only form codex-cli 0.142.4
+    # honors) so web only ever flows through io_cli, positioned before {mcp}/{message}.
+    cmd = spawners._default_cli_cmd("codex", "/h")
+    assert "-c web_search=disabled" in cmd
+    assert cmd.index("-c web_search=disabled") < cmd.index("{mcp}")
+    assert cmd.index("-c web_search=disabled") < cmd.index("{message}")
+    # the legacy/ignored forms are NOT used (they no-op on 0.142.4)
+    assert "tools.web_search" not in cmd
+    assert "features.web_search" not in cmd
+
+
+def test_pi_default_cmd_has_no_web_disable_knob():
+    # pi (0.80.3) has no native web tool (only read/bash/edit/write/grep/find/ls),
+    # so there is nothing to disable — the pi command must NOT grow a fabricated
+    # web-disable flag.
+    cmd = spawners._default_cli_cmd("pi", "/h", model="m")
+    assert "web_search" not in cmd
+    assert "--disallowed-tools" not in cmd
+    assert "WebSearch" not in cmd and "WebFetch" not in cmd
+
+
 def test_default_cli_cmds_carry_mcp_placeholder():
     # The resident consumer's `_render_cli_template` (Task 6) replaces `{mcp}`
     # per turn: claude chat turns → `--mcp-config <file>`, codex non-chat turns
@@ -525,8 +599,9 @@ def test_agent_home_files_codex_seeds_agents_md():
     assert "screen-read" in files["/h/codex-home/AGENTS.md"]
     # no claude settings.json for a codex user
     assert not any(p.endswith("claude-home/settings.json") for p in files)
-    # native (default) codex talks straight to OpenAI — no gateway config.toml
-    assert "/h/codex-home/config.toml" not in files
+    # codex now gets a config.toml, but ONLY to disable its native web-search tool
+    # (native OpenAI otherwise; no gateway config). web must flow through io_cli.
+    assert files["/h/codex-home/config.toml"] == 'web_search = "disabled"\n'
 
 
 def test_openclaw_feedling_plugin_declares_native_memory_screen_tools_with_costs():
@@ -636,17 +711,37 @@ def test_agent_home_files_blank_persona_is_tools_only():
     assert append.startswith("# Feedling context tools")  # tools how-to header, no prefix
 
 
-def test_agent_home_files_codex_never_writes_config_toml():
-    # LiteLLM gateway retired: codex is native-only now, and native codex never
-    # gets a config.toml (the CLI default api.openai.com is correct as-is).
+def test_agent_home_files_codex_seeds_web_search_disabled_config_toml():
+    # LiteLLM gateway retired: codex talks straight to OpenAI. The ONLY thing its
+    # config.toml carries is the top-level `web_search = "disabled"` key, so codex's
+    # native Responses web-search tool (web.run) stays off and web only ever flows
+    # through our io_cli web-search verb (server-side authorized + kill-switchable).
     files = spawners.agent_home_files("/h", driver="codex", provider="openai")
-    assert "/h/codex-home/config.toml" not in files
+    assert files["/h/codex-home/config.toml"] == 'web_search = "disabled"\n'
+    # NOT the old dead LiteLLM gateway config — only the web toggle.
+    assert "feedling_gateway" not in files["/h/codex-home/config.toml"]
+    assert "base_url" not in files["/h/codex-home/config.toml"]
 
 
-def test_codex_native_never_writes_config_toml():
-    # Brief Step-1 guard: codex is native-only — no codex-home/config.toml.
-    files = spawners.agent_home_files("/h", driver="codex", provider="openai")
-    assert "/h/codex-home/config.toml" not in files
+def test_codex_web_search_disabled_survives_user_mcp_merge():
+    # The consumer merges user MCP servers into config.toml via
+    # user_mcp_materialize.codex_config_merged at runtime. That merge prepends the
+    # managed [mcp_servers.*] block AFTER the existing top-level content, so the
+    # seeded `web_search = "disabled"` key must survive it (TOML: bare top-level
+    # keys precede any table header, which is exactly the resulting order).
+    sys.path.insert(0, str(Path(__file__).parent.parent / "tools"))
+    import user_mcp_materialize
+
+    seeded = spawners.agent_home_files(
+        "/h", driver="codex", provider="openai")["/h/codex-home/config.toml"]
+    merged = user_mcp_materialize.codex_config_merged(
+        seeded, [{"name": "svc", "url": "https://mcp.example/mcp", "enabled": True}])
+    assert 'web_search = "disabled"' in merged
+    assert "[mcp_servers.svc]" in merged
+    # the top-level key precedes the first table header (valid TOML ordering)
+    assert merged.index('web_search = "disabled"') < merged.index("[mcp_servers.svc]")
+    # merging zero servers leaves the seed untouched too
+    assert user_mcp_materialize.codex_config_merged(seeded, []).strip() == seeded.strip()
 
 
 def test_stale_home_files_codex_always_prunes_config_toml():
@@ -658,17 +753,36 @@ def test_stale_home_files_codex_always_prunes_config_toml():
     assert "/h/codex-home/config.toml" in stale
 
 
-def test_materialize_home_prunes_stale_gateway_config_on_codex(tmp_path):
+def test_materialize_home_overwrites_stale_gateway_config_on_codex(tmp_path):
+    # A codex user with a stale in-CVM LiteLLM gateway config.toml on a PERSISTENT
+    # home. codex now WRITES a fresh config.toml (web_search disabled), which is in
+    # `files` so the prune guard skips it and the fresh write OVERWRITES the stale
+    # gateway content — same net effect (no dead gateway config survives) as the
+    # old unlink path, and it also lands the web-search toggle.
     home = str(tmp_path / "u")
     cfg = tmp_path / "u" / "codex-home" / "config.toml"
     cfg.parent.mkdir(parents=True)
     cfg.write_text('model_provider = "feedling_gateway"\nbase_url = "http://127.0.0.1:4000/v1"\n')
     # 明确指定为官方 provider，所以不会注入身份块
     spawners.materialize_home(home, driver="codex", provider="openai")
-    # the stale gateway config is gone → codex falls back to native (api.openai.com)
-    assert not cfg.exists()
+    # the stale gateway config is gone (overwritten) → codex is native + web off
+    assert cfg.read_text() == 'web_search = "disabled"\n'
+    assert "feedling_gateway" not in cfg.read_text()
     # AGENTS.md still seeded
     assert (tmp_path / "u" / "codex-home" / "AGENTS.md").exists()
+
+
+def test_materialize_home_prunes_codex_config_when_not_codex(tmp_path):
+    # A user who SWITCHED AWAY from codex (now claude) must have any leftover
+    # codex-home/config.toml pruned — it is not in `files` for a non-codex driver,
+    # so the prune path (unlink) still applies. Guards that the overwrite-for-codex
+    # change did not disable pruning for the drivers that still need it.
+    home = str(tmp_path / "u")
+    cfg = tmp_path / "u" / "codex-home" / "config.toml"
+    cfg.parent.mkdir(parents=True)
+    cfg.write_text('web_search = "disabled"\n')
+    spawners.materialize_home(home, driver="claude", provider="anthropic")
+    assert not cfg.exists()
 
 
 def test_materialize_home_creates_image_dir_for_claude(tmp_path):

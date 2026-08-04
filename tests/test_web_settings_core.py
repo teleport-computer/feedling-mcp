@@ -11,6 +11,7 @@ at all, and it reported "not effective" while web_fetch was still usable.
 from __future__ import annotations
 
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -18,7 +19,9 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
 import db  # noqa: E402
+from chat import consumer as chat_consumer  # noqa: E402
 from core.store import UserStore  # noqa: E402
+from hosted import config_store as hosted_config_store  # noqa: E402
 from web import settings_core  # noqa: E402
 
 OPEN = lambda: (False, False)          # noqa: E731 — nothing halted
@@ -129,3 +132,85 @@ def test_rejected_update_leaves_the_stored_preference_alone(store):
         settings_core.update_settings(store, {"enabled": "no"}, halted_reader=OPEN,
                                       runtime_supported_reader=SUPPORTED)
     assert store.load_web_settings()["enabled"] is True
+
+
+# ---------------------------------------------------------------------------
+# The real _runtime_supported gate (batch 4). The tests above inject the reader;
+# these drive the actual V2-or-V1 decision, monkeypatching only its two seams:
+# the V2 ownership row and the consumer_state blob the V1 heartbeat reads.
+# ---------------------------------------------------------------------------
+
+_WEB_CAPS = [chat_consumer.WEB_SEARCH_CAPABILITY, chat_consumer.WEB_FETCH_CAPABILITY]
+
+
+@pytest.fixture()
+def rs_store(monkeypatch):
+    """Store whose consumer_state blob and V2 ownership row are test-controlled."""
+    saved: dict[tuple[str, str], object] = {}
+    monkeypatch.setattr(db, "get_blob", lambda uid, kind: saved.get((uid, kind)))
+    monkeypatch.setattr(
+        hosted_config_store, "hosted_runtime_v2_enabled_strict", lambda s: False)
+    store = UserStore("u-runtime-supported-test")
+
+    def seed_consumer(**fields):
+        saved[(store.user_id, "consumer_state")] = dict(fields)
+
+    store._seed_consumer = seed_consumer  # type: ignore[attr-defined]
+    return store
+
+
+def _fresh_official_web(**over):
+    state = {
+        "official": True,
+        "last_poll_epoch": time.time(),
+        "consumer_capabilities": list(_WEB_CAPS),
+    }
+    state.update(over)
+    return state
+
+
+def test_v2_runtime_is_supported_without_any_consumer_poll(rs_store, monkeypatch):
+    """V2 carries the web tools intrinsically; its semantics are untouched."""
+    monkeypatch.setattr(
+        hosted_config_store, "hosted_runtime_v2_enabled_strict", lambda s: True)
+    assert settings_core._runtime_supported(rs_store) is True
+
+
+def test_v1_fresh_consumer_advertising_web_is_supported(rs_store):
+    rs_store._seed_consumer(**_fresh_official_web())
+    assert settings_core._runtime_supported(rs_store) is True
+
+
+def test_v1_old_consumer_not_advertising_web_is_unsupported(rs_store):
+    """An older build polls fresh but never lists the web capability."""
+    rs_store._seed_consumer(**_fresh_official_web(
+        consumer_capabilities=["vision_observer_v1", "vision_probe_v2"]))
+    assert settings_core._runtime_supported(rs_store) is False
+
+
+def test_v1_stale_heartbeat_is_unsupported(rs_store):
+    """Web was advertised, but the last poll aged past the freshness window."""
+    stale = time.time() - (chat_consumer._CONSUMER_RECENT_SEC + 60)
+    rs_store._seed_consumer(**_fresh_official_web(last_poll_epoch=stale))
+    assert settings_core._runtime_supported(rs_store) is False
+
+
+def test_v1_non_official_consumer_is_unsupported(rs_store):
+    """Only the official consumer's claim counts; an app/API poll must not."""
+    rs_store._seed_consumer(**_fresh_official_web(official=False))
+    assert settings_core._runtime_supported(rs_store) is False
+
+
+def test_v1_no_consumer_state_is_unsupported(rs_store):
+    """No poll on record at all — fail closed."""
+    assert settings_core._runtime_supported(rs_store) is False
+
+
+def test_runtime_read_error_fails_closed(rs_store, monkeypatch):
+    """A control-plane hiccup must degrade to unsupported, never raise/500."""
+    def boom(s):
+        raise RuntimeError("control plane down")
+
+    monkeypatch.setattr(
+        hosted_config_store, "hosted_runtime_v2_enabled_strict", boom)
+    assert settings_core._runtime_supported(rs_store) is False

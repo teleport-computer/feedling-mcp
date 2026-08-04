@@ -1242,6 +1242,29 @@ def test_all_tool_results_share_per_call_and_aggregate_prompt_budgets(monkeypatc
     assert all(result.content.endswith("...[truncated]") for result in exchange.results[1:])
 
 
+def test_truncated_memory_index_result_keeps_partition_guidance_and_metadata():
+    original = ToolResult(
+        call_id="memory-many",
+        content="x" * 5000,
+        metadata={
+            "memory_query_kind": "memory_index",
+            "memory_total": 103,
+            "memory_returned": 50,
+        },
+    )
+
+    (normalized,) = tool_loop._normalize_tool_results(
+        [original],
+        per_result_cap=500,
+        batch_cap=500,
+    )
+
+    assert len(normalized.content) == 500
+    assert "returned 50 of 103 total cards" in normalized.content
+    assert "bucket or thread filters" in normalized.content
+    assert normalized.metadata == original.metadata
+
+
 @pytest.mark.parametrize("status_code", [400, 422])
 def test_tool_schema_rejection_gets_exactly_one_tools_disabled_fallback(monkeypatch, status_code):
     class _RejectThenReply:

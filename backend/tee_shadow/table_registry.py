@@ -156,6 +156,18 @@ REGISTRY: dict[str, Entry] = {
     "v2_trajectory_access_audit": Entry(SNAPSHOT, "V2 轨迹访问审计（审计元数据本身是明文）"),
     "v2_trajectory_streams": Entry(SNAPSHOT, "V2 轨迹流游标，UPDATE 密集，明文"),
     "v2_turn_metrics": Entry(SNAPSHOT, "V2 回合指标，明文"),
+    "v2_usage_daily_dimensions": Entry(
+        SNAPSHOT,
+        "Admin 用量页从 v2_turn_metrics 派生的按日维度投影；TEE 扶正后由同库 worker 继续维护",
+    ),
+    "v2_usage_daily_users": Entry(
+        SNAPSHOT,
+        "Admin 用量页从 v2_turn_metrics 派生的按日用户投影；TEE 扶正后保留报表连续性",
+    ),
+    "v2_usage_rollup_watermarks": Entry(
+        SNAPSHOT,
+        "Admin 用量 rollup 的 bootstrap/cursor/error 控制面；必须与扶正后的派生表同库推进",
+    ),
     "v2_user_allowlist": Entry(SNAPSHOT, "V2 灰度名单，UPDATE 密集，明文"),
     "v2_wake_schedule": Entry(SNAPSHOT, "V2 唤醒排程，UPDATE 密集，明文"),
     "v2_worker_heartbeats": Entry(SNAPSHOT, "V2 worker 心跳，UPDATE 密集，明文"),

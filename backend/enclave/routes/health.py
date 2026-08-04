@@ -41,6 +41,7 @@ def _health_body() -> dict:
         "uptime_s": uptime,
         "booted_at": booted,
         "tls_enabled": st["tls_enabled"],
+        "transport_mode": config.ENCLAVE_TRANSPORT_MODE,
         "phase": 3 if st["tls_enabled"] else 1,
         "error": st["error"],
     }
@@ -80,20 +81,25 @@ async def attestation():
         "report_data_version": 1,
         "phase": 3 if state._state["tls_enabled"] else 1,
         "tls_in_enclave": state._state["tls_enabled"],
-        "notes": (
-            "phase-3: TLS terminated inside the enclave."
-            " enclave_tls_cert_fingerprint_hex = sha256(cert.DER) of the"
-            " cert the TLS handshake presents. Clients must compare the"
-            " live cert's DER hash to this value; do not trust the"
-            " self-signed chain on its own."
-            if state._state["tls_enabled"] else
-            "phase-1 skeleton — TLS cert binding is a placeholder (all"
-            " zeros). Operator-controlled infrastructure terminates TLS."
-            " Until in-enclave TLS is enabled, clients must trust the"
-            " dstack-gateway operator to forward traffic unmodified."
-        ),
+        "transport_mode": config.ENCLAVE_TRANSPORT_MODE,
         "booted_at": state._state["booted_at"],
     }
+    notes_by_transport = {
+        "direct_tls": (
+            "phase-3: TLS terminated by this enclave listener; clients must compare "
+            "the live cert DER fingerprint with enclave_tls_cert_fingerprint_hex."
+        ),
+        "attested_ingress": (
+            "TLS terminated by dstack-ingress inside the measured CVM. Clients must "
+            "verify dstack-ingress evidence separately; the enclave TLS fingerprint "
+            "describes only the direct -5003s listener."
+        ),
+        "operator_tls": (
+            "TLS termination is not attested by this listener; do not treat ordinary "
+            "WebPKI as equivalent to enclave certificate pinning."
+        ),
+    }
+    bundle["notes"] = notes_by_transport[config.ENCLAVE_TRANSPORT_MODE]
     return Response(
         json.dumps(bundle, indent=2),
         media_type="application/json",

@@ -169,6 +169,31 @@ An [independent resident consumer](/docs/workflows/chat#independent-resident-loo
 uses the same encrypted queue-and-reply protocol but runs in infrastructure the
 user or integrator controls instead of Feedling's hosted runner.
 
+### Genesis plaintext imports
+
+The plaintext compatibility endpoint accepts onboarding material inside the
+managed confidential-VM boundary and sends only the required prompt to the
+user-selected model provider. PostgreSQL serializes processing plaintext jobs
+per account, so separate API workers cannot start two provider pipelines for
+the same account concurrently.
+
+After each successful map window, the API creates a shared encrypted envelope
+containing the resumable candidate output. PostgreSQL stores that envelope plus
+plaintext operational metadata such as job ID, material kind, window counts,
+status, and hashes. Candidate text is not written into the job JSON or progress
+fields. An authorized retry decrypts the checkpoint inside the trusted boundary
+and skips completed windows; successful completion deletes the checkpoint.
+Resident-sealed imports and their local plaintext boundary are unchanged.
+
+Managed clients can first call the plaintext estimate endpoint. The API parses
+the material without an LLM call, stores the original payload in a short-lived
+shared encrypted envelope, and returns only material kinds, window counts,
+conservative token estimates, and an optional model recommendation. Commit
+decrypts that account-bound stage inside the trusted boundary and starts the
+same plaintext pipeline. A commit-time model override is copied into job
+metadata and changes only that job's model string; it does not mutate the
+account's chat route, provider URL, or credential.
+
 ### ElevenLabs voice calls
 
 1. An authenticated client creates a short-lived voice session with
@@ -389,17 +414,28 @@ reply, recursive task, mutating MCP, platform-effect, or workspace-write
 surface. Multiple independent children may run in parallel and return bounded
 results to the parent.
 
-Eager perception is projected to fixed numeric, boolean, or null fields.
-Third-party calendar/reminder/app/place/weather text and screen/photo content
-are pull-only; after an explicit text-bearing read, later web, MCP, and `task`
+Runtime V2 layers perception by lane. Foreground Chat starts with perception
+tools but no current readings. Ordinary heartbeat and manual-wake prompts may
+receive only a fixed boolean glance describing domain availability and whether
+that glance changed. Scheduled wake remains reminder-only. Screen watch retains
+only its isolated safe screen-count metadata, while a perception-triggered
+heartbeat receives only its allowlisted event type. Raw change digests,
+presence hints, origin references, and internal glance fingerprints never
+enter model-visible runtime data. Exact readings and private text do not enter
+the initial prompt; they become model-visible only through an authorized tool
+read.
+
+Exact device, environment, activity, health, calendar, reminder, photo, and
+shared-screen data cross the decrypt boundary only through an authorized tool
+read. After an explicit text-bearing private read, later web, MCP, and `task`
 tools are removed for that turn. Numeric health snapshot/trend reads remain
 compatible with outbound work.
 
 ### Runtime V2 prompt caching
 
 Tool schemas, runtime policy, and canonical-path-sorted trusted `/skills` are
-serialized deterministically before dynamic summary, tail, perception, and tool
-results. Provider adapters use route-bound cache affinity or provider-native
+serialized deterministically before dynamic summary, tail, runtime context, and
+tool results. Provider adapters use route-bound cache affinity or provider-native
 cache controls/checkpoints where supported and normalize cache read/write/miss
 usage into whole-turn telemetry.
 
@@ -468,6 +504,30 @@ Running the decrypt service on an ordinary VPS preserves the envelope format but
 does not protect its private key from that machine's operator. Achieving managed
 production parity also requires measured deployment, key lifecycle, network
 policy, secret distribution, backups, monitoring, and incident response.
+
+### Enclave transport trust chains
+
+Managed deployments expose two supported transports to the enclave service. They
+are not interchangeable evidence models:
+
+> Custom-domain path: client TLS -> dstack-ingress inside the measured TDX CVM
+> -> Docker-internal HTTP -> enclave-domain. Verify WebPKI, ingress certificate
+> evidence, and enclave attestation.
+
+> Direct audit path: client TLS -> Phala -5003s passthrough -> enclave. Verify the
+> live self-signed certificate fingerprint against enclave attestation REPORT_DATA.
+
+The custom-domain route has a deliberately disclosed plaintext hop between
+`dstack-ingress` and `enclave-domain`. It is Docker-internal traffic inside the
+measured TDX CVM, not a public-network hop; its protection relies on that CVM
+boundary rather than a second TLS layer. Cloudflare manages DNS-01 records only
+and does not proxy this traffic.
+
+Clients using the custom domain must verify both the ingress certificate-evidence
+bundle and the enclave attestation bundle, in addition to ordinary WebPKI, before
+claiming security equivalent to direct fingerprint pinning. The existing
+`-5003s` endpoint remains the compatibility and audit route for clients that
+perform the direct certificate-fingerprint-to-`REPORT_DATA` check.
 
 ## Health and capability readiness
 

@@ -6,6 +6,8 @@ import sys
 import types
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
 from genesis import service  # noqa: E402
@@ -118,6 +120,8 @@ def test_create_import_job_drops_plaintext_metadata(monkeypatch):
             "file_manifest_hash": "abc123",
             "file_count": 2,
             "timeline_span_days": 7,
+            "distill_model": "claude-haiku-4-5",
+            "plaintext_worker_instance": "client-spoof",
         },
     })
 
@@ -125,9 +129,61 @@ def test_create_import_job_drops_plaintext_metadata(monkeypatch):
     assert metadata["file_manifest_hash"] == "abc123"
     assert metadata["file_count"] == 2
     assert metadata["timeline_span_days"] == 7
+    assert metadata["distill_model"] == "claude-haiku-4-5"
+    assert "plaintext_worker_instance" not in metadata
     assert metadata["privacy_copy"] == service.PRIVACY_COPY
     assert "transcript" not in metadata
     assert "ai_persona" not in metadata
+
+
+def test_create_import_job_persists_only_trusted_worker_owner_metadata(monkeypatch):
+    saved = {}
+
+    def fake_create(_user_id, job):
+        saved.update(job)
+        return {"job_id": job["job_id"], "status": "processing"}
+
+    monkeypatch.setattr(service.db, "genesis_create_job", fake_create)
+    monkeypatch.setattr(service.db, "set_blob", lambda *_args: None)
+
+    service.create_import_job(
+        _store(),
+        {"job_id": "job_owner", "metadata": {"ingest": "plaintext"}},
+        initial_status="processing",
+        trusted_metadata={
+            "plaintext_worker_host": "host-a",
+            "plaintext_worker_pid": 123,
+            "plaintext_worker_instance": "instance-a",
+            "transcript": "must-not-persist",
+        },
+    )
+
+    assert saved["metadata"]["plaintext_worker_host"] == "host-a"
+    assert saved["metadata"]["plaintext_worker_pid"] == 123
+    assert saved["metadata"]["plaintext_worker_instance"] == "instance-a"
+    assert "transcript" not in saved["metadata"]
+
+
+def test_create_import_job_does_not_trust_payload_status(monkeypatch):
+    saved = {}
+
+    def fake_create(_user_id, job):
+        saved.update(job)
+        return {"job_id": job["job_id"], "status": job["status"]}
+
+    monkeypatch.setattr(service.db, "genesis_create_job", fake_create)
+    monkeypatch.setattr(service.db, "set_blob", lambda *_args: None)
+
+    service.create_import_job(_store(), {"job_id": "job_1", "status": "processing"})
+    assert saved["status"] == "created"
+
+    saved.clear()
+    service.create_import_job(
+        _store(),
+        {"job_id": "job_2"},
+        initial_status="processing",
+    )
+    assert saved["status"] == "processing"
 
 
 def test_create_import_job_is_idempotent_for_existing_job(monkeypatch):
@@ -352,6 +408,40 @@ def test_apply_reducer_output_writes_persona_and_done_state(monkeypatch):
     assert reducer_doc["persona_provided"] is True
     assert "You remember the user's voice." not in reducer_json
     assert any(output["type"] == "apply" for output in outputs)
+
+
+def test_apply_reducer_output_can_defer_job_completion(monkeypatch):
+    monkeypatch.setattr(
+        service.db,
+        "genesis_get_job",
+        lambda *_args: {"job_id": "job_1", "status": "processing"},
+    )
+    monkeypatch.setattr(service.db, "genesis_set_job_status", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(service.db, "genesis_upsert_output", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        service.db,
+        "genesis_complete_job",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("foreground must not complete the job")),
+    )
+    monkeypatch.setattr(service, "write_genesis_state", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(service.notices, "resolve", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(service, "apply_memory_outputs", lambda *_args: (2, []))
+    monkeypatch.setattr(service, "init_identity_if_absent", lambda *_args: "initialized")
+    monkeypatch.setattr(service, "write_persona_artifact", lambda *_args: ("persona-ref", "persona-sha"))
+    monkeypatch.setattr(service, "write_voice_artifact", lambda *_args: ("voice-ref", "voice-sha"))
+
+    result = service.apply_reducer_output(
+        _store(),
+        "api-key",
+        "job_1",
+        {"memories": [{"summary": "foreground"}]},
+        complete_job=False,
+    )
+
+    assert result["memory_action_count"] == 2
+    assert result["identity_status"] == "initialized"
+    assert result["persona_ref"] == "persona-ref"
 
 
 def test_write_persona_artifact_keeps_existing_higher_priority_persona(monkeypatch):
@@ -1219,4 +1309,120 @@ def test_public_stage_maps_plaintext_reducer_to_friendly_phases():
     assert service.public_stage("plaintext_reducer") == "chat_history_importing"
     assert service.public_stage("plaintext_reducer_done") == "background_importing"
     assert service.public_stage("genesis_v2_foreground") == "chat_history_importing"  # unchanged
+    assert service.public_stage("genesis_v2_foreground_ready") == "background_importing"
     assert service.public_stage("unknown_stage") == "unknown_stage"  # passthrough
+
+
+def test_genesis_checkpoint_persists_only_encrypted_content(monkeypatch):
+    stored = {}
+    raw_seen = {}
+
+    def build_envelope(_store, raw, *, item_id):
+        raw_seen["raw"] = raw
+        return {"body_ct": "ciphertext", "id": item_id}, ""
+
+    monkeypatch.setattr(service.core_envelope, "_build_shared_envelope_for_store", build_envelope)
+    monkeypatch.setattr(
+        service.db,
+        "set_blob",
+        lambda user_id, kind, doc: stored.update(user_id=user_id, kind=kind, doc=doc),
+    )
+    monkeypatch.setattr(service.db, "get_blob_strict", lambda *_args: stored["doc"])
+
+    checkpoint_doc = {
+        "tasks": {"fact-map::0": {"status": "done"}},
+        "map_outputs": {"fact-map::0": {"fact_candidates": [{"summary": "secret"}]}},
+    }
+    service.write_genesis_checkpoint(_store(), "job_1", checkpoint_doc)
+
+    assert json.loads(raw_seen["raw"]) == checkpoint_doc
+    assert stored["kind"] == "genesis_checkpoint:job_1"
+    assert "secret" not in json.dumps(stored["doc"])
+    assert stored["doc"]["encrypted"] is True
+
+
+def test_genesis_checkpoint_load_verifies_and_decrypts(monkeypatch):
+    checkpoint_doc = {"v": 1, "tasks": {}, "map_outputs": {}}
+    raw = json.dumps(
+        checkpoint_doc, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode()
+    blob = {
+        "content_envelope": {"body_ct": "ciphertext"},
+        "sha256": service._sha256_hex(raw),
+    }
+    monkeypatch.setattr(service.db, "get_blob_strict", lambda *_args: blob)
+    monkeypatch.setattr(
+        service.core_enclave,
+        "_decrypt_envelope_via_enclave",
+        lambda envelope, api_key, **kwargs: raw,
+    )
+
+    assert service.load_genesis_checkpoint(_store(), "api-key", "job_1") == checkpoint_doc
+
+
+def test_genesis_staged_payload_is_encrypted_and_consumed_as_tombstone(monkeypatch):
+    stored = {}
+    deleted = []
+
+    def build_envelope(_store, raw, *, item_id):
+        stored["raw"] = raw
+        return {"body_ct": "ciphertext", "id": item_id}, ""
+
+    monkeypatch.setattr(service.core_envelope, "_build_shared_envelope_for_store", build_envelope)
+    monkeypatch.setattr(
+        service.db,
+        "list_blobs",
+        lambda *_args: [{"staged_id": "staged_previous", "consumed": True}],
+    )
+    monkeypatch.setattr(
+        service.db,
+        "delete_blob",
+        lambda user_id, kind: deleted.append((user_id, kind)) or True,
+    )
+    monkeypatch.setattr(
+        service.db,
+        "set_blob_strict_mirrored",
+        lambda user_id, kind, doc: stored.update(user_id=user_id, kind=kind, doc=doc),
+    )
+    monkeypatch.setattr(service.db, "get_blob_strict", lambda *_args: stored["doc"])
+    monkeypatch.setattr(
+        service.core_enclave,
+        "_decrypt_envelope_via_enclave",
+        lambda *_args, **_kwargs: stored["raw"],
+    )
+
+    staged_id = service.create_genesis_staged_payload(
+        _store(), {"content": "secret history"}, ttl_sec=600)
+    assert deleted == [("usr_genesis", "genesis_staged:staged_previous")]
+    assert stored["kind"] == f"genesis_staged:{staged_id}"
+    assert "secret history" not in json.dumps(stored["doc"])
+    assert service.load_genesis_staged_payload(
+        _store(), "api-key", staged_id) == {"content": "secret history"}
+
+    service.mark_genesis_staged_consumed(_store(), staged_id, "job_1")
+    assert stored["doc"]["consumed"] is True
+    assert "content_envelope" not in stored["doc"]
+
+
+def test_expired_genesis_stage_is_deleted_before_410(monkeypatch):
+    deleted = []
+    monkeypatch.setattr(
+        service.db,
+        "get_blob_strict",
+        lambda *_args: {
+            "staged_id": "staged_expired",
+            "expires_at": 1,
+            "consumed": False,
+            "content_envelope": {"body_ct": "ciphertext"},
+        },
+    )
+    monkeypatch.setattr(
+        service.db,
+        "delete_blob",
+        lambda user_id, kind: deleted.append((user_id, kind)) or True,
+    )
+
+    with pytest.raises(TimeoutError, match="staged_import_expired"):
+        service.load_genesis_staged_payload(_store(), "api-key", "staged_expired")
+
+    assert deleted == [("usr_genesis", "genesis_staged:staged_expired")]

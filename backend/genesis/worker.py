@@ -939,8 +939,11 @@ def _build_reducer_output(
     include_memory: bool = True,
     include_persona_voice: bool = True,
     user_name: str = "",
+    llm: GenesisLLMClient | None = None,
+    resume_map_outputs: dict[int, dict] | None = None,
+    on_map_completed: Callable[[int, dict], None] | None = None,
 ) -> dict:
-    llm = GenesisLLMClient()
+    llm = llm or GenesisLLMClient()
     idempotency_prefix = _idempotency_prefix(job_id, key_prefix)
     source_family = _source_family(source_kind)
     material = _joined_material(chunk_texts)
@@ -1045,19 +1048,25 @@ def _build_reducer_output(
             continue
         fact_map_attempts += 1
         try:
-            facts = _complete_json(
-                llm,
-                user_id=user_id,
-                job_id=job_id,
-                task_id=f"fact-map-{idx}",
-                runtime=runtime,
-                messages=prompts.fact_map_messages(
-                    _source_tagged_fact_text(source_family, text),
-                    user_name=user_name,
-                ),
-                max_tokens=1800,
-                idempotency_key=f"{idempotency_prefix}:fact_map:{idx}",
-            )
+            cached = (resume_map_outputs or {}).get(idx)
+            if isinstance(cached, dict):
+                facts = cached
+            else:
+                facts = _complete_json(
+                    llm,
+                    user_id=user_id,
+                    job_id=job_id,
+                    task_id=f"fact-map-{idx}",
+                    runtime=runtime,
+                    messages=prompts.fact_map_messages(
+                        _source_tagged_fact_text(source_family, text),
+                        user_name=user_name,
+                    ),
+                    max_tokens=1800,
+                    idempotency_key=f"{idempotency_prefix}:fact_map:{idx}",
+                )
+                if on_map_completed is not None:
+                    on_map_completed(idx, facts)
             if isinstance(facts.get("fact_candidates"), list):
                 fact_candidates.extend(item for item in facts["fact_candidates"] if isinstance(item, dict))
         except (provider_client.ProviderError, GenesisWorkerError) as e:
@@ -1184,6 +1193,9 @@ def build_reducer_output_from_texts(
     include_memory: bool = True,
     include_persona_voice: bool = True,
     user_name: str = "",
+    llm: GenesisLLMClient | None = None,
+    resume_map_outputs: dict[int, dict] | None = None,
+    on_map_completed: Callable[[int, dict], None] | None = None,
 ) -> dict:
     """Public wrapper for trusted in-memory Genesis inputs.
 
@@ -1205,6 +1217,9 @@ def build_reducer_output_from_texts(
         include_memory=include_memory,
         include_persona_voice=include_persona_voice,
         user_name=user_name,
+        llm=llm,
+        resume_map_outputs=resume_map_outputs,
+        on_map_completed=on_map_completed,
     )
 
 
@@ -1489,6 +1504,8 @@ def build_foreground_output_from_texts(
     include_voice_candidates: bool = False,
     keep_all: bool = False,
     user_name: str = "",
+    resume_map_outputs: dict[int, dict] | None = None,
+    on_map_completed: Callable[[int, dict], None] | None = None,
 ) -> dict:
     """Genesis v2 FOREGROUND — the light "open the door" pass (Codex flow).
 
@@ -1517,7 +1534,12 @@ def build_foreground_output_from_texts(
         if is_history:
             history_windows_total += 1
         try:
-            if include_voice_candidates and is_history and genesis_combined_map_enabled():
+            cached = (resume_map_outputs or {}).get(idx)
+            if isinstance(cached, dict):
+                facts = cached
+                if include_voice_candidates and is_history and genesis_combined_map_enabled():
+                    voice_candidates.append(_voice_candidate_from_combined_map(facts))
+            elif include_voice_candidates and is_history and genesis_combined_map_enabled():
                 facts = _complete_json_retry_empty(
                     llm,
                     user_id=user_id,
@@ -1546,6 +1568,8 @@ def build_foreground_output_from_texts(
                     idempotency_key=f"{shared_prefix}:fact_map:{idx}",   # SAME key as background -> cache shared
                     is_empty=_fact_map_output_empty,
                 )
+            if cached is None and on_map_completed is not None:
+                on_map_completed(idx, facts)
         except provider_client.ProviderError as e:
             if provider_client.classify_provider_error(e) == "provider_config":
                 raise  # hard error (402/401/403/quota/key) -> caller aborts

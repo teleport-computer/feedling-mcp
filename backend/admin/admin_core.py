@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 import logging
 import time
+from dataclasses import replace
 from datetime import datetime, timezone
 
 import db
@@ -86,6 +87,65 @@ def page_html(query_string: str) -> str:
     # Mirror admin_data_track_page's view dispatch.
     with bind(query_string):
         view = (request.args.get("view") or "").strip().lower()
+        if view == "overview":
+            hours = data_track._ops_window_hours()
+            try:
+                imports = db.recent_genesis_import_health(within_hours=hours)
+            except Exception:
+                log.exception("admin operations overview import query failed")
+                imports = None
+            try:
+                chat = jobs_store.recent_chat_reliability(within_hours=hours)
+            except Exception:
+                log.exception("admin operations overview chat query failed")
+                chat = None
+            try:
+                runtime = jobs_store.recent_runtime_health(within_hours=hours)
+            except Exception:
+                log.exception("admin operations overview runtime query failed")
+                runtime = None
+            try:
+                product = db.recent_admin_product_kpis(within_hours=hours)
+            except Exception:
+                log.exception("admin operations overview product KPI query failed")
+                product = None
+            try:
+                usage = jobs_store.recent_token_usage_by_lane(within_hours=hours)
+            except Exception:
+                log.exception("admin operations overview usage query failed")
+                usage = None
+            return data_track._render_ops_overview_page(
+                imports,
+                chat,
+                runtime,
+                product,
+                usage,
+                within_hours=hours,
+            )
+        if view == "imports":
+            hours = data_track._ops_window_hours()
+            try:
+                report = db.recent_genesis_import_health(within_hours=hours)
+            except Exception:
+                log.exception("admin import health query failed")
+                report = None
+            return data_track._render_imports_page(report, within_hours=hours)
+        if view in {"chat", "latency"}:
+            hours = data_track._ops_window_hours()
+            try:
+                report = jobs_store.recent_chat_reliability(within_hours=hours)
+            except Exception:
+                log.exception("admin chat reliability query failed")
+                report = None
+            if view == "latency":
+                return data_track._render_latency_page(
+                    report,
+                    within_hours=hours,
+                )
+            return data_track._render_chat_reliability_page(
+                report,
+                within_hours=hours,
+            )
         if view == "dau":
             return data_track._render_data_track_dau_page(data_track._data_track_dau_payload())
         if view == "growth":
@@ -94,11 +154,19 @@ def page_html(query_string: str) -> str:
             return data_track._render_proactive_daily_page(data_track._data_track_proactive_daily_payload())
         if view == "debug":
             return data_track._render_data_track_debug_page(data_track._data_track_debug_payload())
+        if view == "usage":
+            query = data_track.admin_usage.parse_usage_query(request.args)
+            try:
+                report = data_track._usage_report(query)
+            except Exception:
+                logging.exception("admin usage report failed (other views still served)")
+                return data_track._render_usage_error_page(query)
+            return data_track._render_usage_page(report, query)
         if view == "runtime":
-            # 窗口算一次、传给两个数据函数——两处各自读 request.args 会让窗口
+            # 窗口算一次、传给四个数据函数——各处自行读 request.args 会让窗口
             # 有机会不一致（同页一个 24 小时、一个 720 小时）。
             hours = data_track._runtime_health_window_hours()
-            # 三次调用是**三个独立的失败域**，不共用一个 try。健康数据是这页的
+            # 四次调用是**四个独立的失败域**，不共用一个 try。健康数据是这页的
             # 核心，它没了才该降级；token 与交付是附加信息。token 的查询无 LIMIT、
             # 扫描量随表增长单调变大，是最先超时的那个——让它把明明可用的健康数据
             # 一起拖进降级页，是这页最坏的失败模式（它恰恰是出事时才被打开的那一
@@ -118,7 +186,14 @@ def page_html(query_string: str) -> str:
             except Exception:
                 logging.exception("runtime delivery health failed (health still served)")
                 delivery = None
-            return data_track._render_runtime_health_page(payload, tokens, delivery)
+            try:
+                user_report = data_track._runtime_user_report(within_hours=hours)
+            except Exception:
+                logging.exception("runtime user report failed (health still served)")
+                user_report = None
+            return data_track._render_runtime_health_page(
+                payload, tokens, delivery, user_report
+            )
         if view == "events":
             event = (request.args.get("event") or "").strip()
             if event == "onboarding":
@@ -145,6 +220,26 @@ def user_page(query_string: str, user_id: str) -> tuple[str, str, int]:
     if not entry:
         return "text", "user not found", 404
     with bind(query_string):
+        view = (request.args.get("view") or "").strip().lower()
+        if view == "usage":
+            query = replace(
+                data_track.admin_usage.parse_usage_query(request.args),
+                user_id=user_id,
+            )
+            try:
+                report = data_track._usage_report(query)
+            except Exception:
+                logging.exception(
+                    "admin user usage report failed (other views still served)"
+                )
+                body = data_track._render_usage_error_page(
+                    query, drilldown_user_id=user_id
+                )
+            else:
+                body = data_track._render_usage_page(
+                    report, query, drilldown_user_id=user_id
+                )
+            return "html", body, 200
         body = data_track._render_user_detail_page(
             data_track._build_data_track_user(entry, include_detail=True)
         )
@@ -314,6 +409,10 @@ def v2_metrics(
             )
         },
         "wake": jobs_store.wake_success_stats(),
+        # Deliberately its own block, not extra lanes inside `wake`: capture/dream
+        # are not wakes, and folding them in would make a memory-lane outage look
+        # like a falling wake success rate. See jobs_store.memory_lane_health().
+        "memory_lanes": jobs_store.memory_lane_health(),
         "effects": db.effect_outbox_health(),
         # The genesis import worker rides in the serve_worker process on its own
         # thread, and `run_loop` imports `genesis.worker` lazily — so that thread can

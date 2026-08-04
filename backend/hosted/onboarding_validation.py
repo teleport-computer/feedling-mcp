@@ -195,6 +195,16 @@ def _model_api_steps_with_genesis(
     hosted_chat_ok = done or _model_api_hosted_chat_verified(store)
     history_windows_total = _int_value(metadata.get("history_windows_total") or output.get("history_windows_total") or 0)
     history_windows_failed = _int_value(metadata.get("history_windows_failed") or output.get("history_windows_failed") or 0)
+    candidate_windows_total = _int_value(metadata.get("window_count") or genesis_job.get("total_chunks"))
+    candidate_windows_done = min(
+        candidate_windows_total,
+        max(0, _int_value(genesis_job.get("processed_chunks"))),
+    )
+    real_progress = (
+        min(99, int(candidate_windows_done * 100 / candidate_windows_total))
+        if candidate_windows_total > 0
+        else 0
+    )
 
     history_step = {
         "id": "history_import",
@@ -205,7 +215,7 @@ def _model_api_steps_with_genesis(
         # client-facing phase: v2-internal stage -> legacy phase the old iOS maps
         "phase": genesis_service.public_stage(stage),
         "phase_label": "Genesis complete" if done else ("Genesis failed" if failed else "Genesis processing"),
-        "progress": 100 if done else (100 if failed else 24),
+        "progress": 100 if done else real_progress,
         "messages_parsed": _int_value(metadata.get("history_count")),
         "support_materials": _int_value(metadata.get("support_count")),
         "source_stats": {},
@@ -215,8 +225,8 @@ def _model_api_steps_with_genesis(
         "memories_created": memory_action_count,
         "history_tier": str(metadata.get("history_tier") or ""),
         "timeline_span_days": _int_value(metadata.get("timeline_span_days")),
-        "candidate_windows_done": 0,
-        "candidate_windows_total": _int_value(metadata.get("window_count") or genesis_job.get("total_chunks")),
+        "candidate_windows_done": candidate_windows_done,
+        "candidate_windows_total": candidate_windows_total,
         "candidates_extracted": 0,
         "candidates_merged": 0,
         "chat_ready": done,
@@ -231,6 +241,7 @@ def _model_api_steps_with_genesis(
         "history_windows_failed": history_windows_failed,
         "degraded": bool(history_windows_failed > 0),
         "support_inputs_present": bool(_int_value(metadata.get("support_count")) > 0),
+        "materials": genesis_service.public_materials_for_job(genesis_job),
         "required": (
             # Cause-aware bilingual line (classify_genesis_error). The old
             # static "Start onboarding again with the latest app build" named

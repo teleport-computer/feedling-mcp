@@ -154,8 +154,10 @@ from memory.card_text import (
 )
 from memory.dream_prompt_v1 import (
     build_dream_prompt,
+    build_dream_review_prompt,
     build_dream_retry_prompt,
     parse_dream_consolidations,
+    parse_dream_review,
 )
 from memory.migrate_prompt_v1 import build_migrate_prompt, parse_migrated_cards
 from chat.reply_language import (
@@ -434,7 +436,6 @@ DREAM_MEMORY_INDEX_LIMIT = int(os.environ.get("FEEDLING_DREAM_MEMORY_INDEX_LIMIT
 DREAM_FETCH_BATCH_SIZE = int(os.environ.get("FEEDLING_DREAM_FETCH_BATCH_SIZE", "100"))
 DREAM_RECENT_CHAT_LIMIT = int(os.environ.get("FEEDLING_DREAM_RECENT_CHAT_LIMIT", "80"))
 DREAM_MEMORY_MAX_CARDS = int(os.environ.get("FEEDLING_DREAM_MEMORY_MAX_CARDS", "200"))
-DREAM_MAX_CONSOLIDATIONS = int(os.environ.get("FEEDLING_DREAM_MAX_CONSOLIDATIONS", "12"))
 CONSUMER_ID = os.environ.get(
     "CONSUMER_ID",
     f"{socket.gethostname()}:{os.getpid()}",
@@ -1259,10 +1260,32 @@ def _agent_entry_signature() -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
 
 
+def _consumer_capabilities(hosted: bool) -> str:
+    """Comma-separated ``X-Feedling-Consumer-Capabilities`` value.
+
+    Vision caps are advertised on every line. ``web_search_v1`` / ``web_fetch_v1``
+    are a CLOUD-ONLY product: only the HOSTED consumer (per-user runtime token)
+    advertises them. VPS / self-hosted residents must NOT — they use their own
+    model provider's built-in web capability, so our web tools are never offered
+    to them. The settings page keys ``_runtime_supported`` off this header, so
+    omitting the web caps makes web read ``effective = false`` for self-hosted
+    accounts, which is exactly the intended product boundary.
+    """
+    caps = ["vision_observer_v1", "vision_probe_v2"]
+    if hosted:
+        caps += ["web_search_v1", "web_fetch_v1"]
+    return ",".join(caps)
+
+
 _HEADERS = {
     "X-API-Key": FEEDLING_API_KEY,
     "X-Feedling-Consumer": "feedling-chat-resident",
-    "X-Feedling-Consumer-Capabilities": "vision_observer_v1,vision_probe_v2",
+    # Web caps are hosted-only — see _consumer_capabilities. ``_HOSTED`` isn't
+    # defined until further down, so read the same signal (the runtime-token
+    # file) directly from the env here.
+    "X-Feedling-Consumer-Capabilities": _consumer_capabilities(
+        bool(os.environ.get("FEEDLING_RUNTIME_TOKEN_FILE", "").strip())
+    ),
     "X-Feedling-Consumer-Id": CONSUMER_ID,
     "X-Feedling-Consumer-Version": "resident-v1",
     "X-Feedling-Consumer-Commit": RUNNING_COMMIT,
@@ -7860,6 +7883,7 @@ def _prepend_io_cli_capability_catalog(content: str) -> str:
     fails before the model ever saw the prompt does not permanently skip the
     catalog for the rest of that session."""
     global _io_cli_catalog_cache, _io_cli_catalog_pending_session_id
+    global _web_advertised_session_id, _web_off_notice_session_id
     if _HOSTED or AGENT_MODE != "cli":
         return content
 
@@ -7867,8 +7891,17 @@ def _prepend_io_cli_capability_catalog(content: str) -> str:
     sid = None
     if not is_codex:
         sid = _load_agent_session_id()
-        if sid == _io_cli_catalog_injected_session_id:
-            return content  # already confirmed-injected for this session
+
+    # Web policy (batch 5) is applied on TOP of the cached full catalog, per turn,
+    # so it tracks a mid-session toggle even for a resume-capable driver whose
+    # catalog was already injected — that early-return path still delivers the
+    # one-line "web is off now" correction below.
+    web_notice = _web_off_notice_for_turn(sid)
+
+    if not is_codex and sid == _io_cli_catalog_injected_session_id:
+        # Catalog already confirmed-injected for this session; only a web-off
+        # correction (if any) still needs to reach the model this turn.
+        return f"{web_notice}\n\n{content}" if web_notice else content
 
     catalog = _io_cli_catalog_cache
     if catalog is None:
@@ -7895,21 +7928,33 @@ def _prepend_io_cli_capability_catalog(content: str) -> str:
             # drop the ONLY defense against instructions smuggled through
             # files/web pages/memory cards now that D2 (confirmation) is gone
             # (I2). Prepend D3 alone — cheap, doesn't need a subprocess, and
-            # independent of whether the full --help sweep succeeds.
+            # independent of whether the full --help sweep succeeds. The fallback
+            # never lists the web verbs, so only a web-off correction can apply.
+            notice = f"{web_notice}\n\n" if web_notice else ""
             return (
-                f"{io_cli_catalog.D3_SOURCING_RULE}\n"
+                f"{notice}{io_cli_catalog.D3_SOURCING_RULE}\n"
                 f"{_memory_read_prompt_block()}\n"
                 f"{_outbound_file_prompt_block()}\n\n{content}"
             )
         _io_cli_catalog_cache = catalog
+
+    # Our web-search / web-fetch is CLOUD-ONLY. This whole path is VPS /
+    # self-hosted only (the ``_HOSTED`` early-return above), so the web verbs are
+    # ALWAYS stripped here regardless of the server-advertised policy — a
+    # self-hosted resident must never be offered our web tools; it uses its own
+    # model provider's built-in web capability. Because we never advertise the
+    # verbs, ``_web_advertised_session_id`` is never set, so ``web_notice`` above
+    # stays empty too (nothing was ever promised to retract).
+    catalog_for_turn = _strip_web_verbs_from_catalog(catalog)
 
     if not is_codex:
         # NOT committed yet — see _commit_io_cli_catalog_injection /
         # _discard_io_cli_catalog_pending_injection docstrings above.
         _io_cli_catalog_pending_session_id = sid
 
+    notice = f"{web_notice}\n\n" if web_notice else ""
     return (
-        f"{catalog}\n{_memory_read_prompt_block()}\n"
+        f"{notice}{catalog_for_turn}\n{_memory_read_prompt_block()}\n"
         f"{_outbound_file_prompt_block()}\n\n{content}"
     )
 
@@ -8082,26 +8127,44 @@ def execute_identity_actions(actions: list[dict]) -> dict:
 def execute_memory_actions(actions: list[dict]) -> dict:
     if not actions:
         return {"status": "ok", "results": [], "effects": []}
-    resp = _HTTP.post(
-        f"{FEEDLING_API_URL}/v1/memory/actions",
-        json={"actions": actions},
-        headers=_HEADERS,
-        timeout=20,
-    )
-    if resp.status_code >= 400:
-        raise ActionsHTTPError(
-            f"memory_actions_http_{resp.status_code}:{resp.text[:500]}",
-            status_code=resp.status_code,
-            body=_parse_actions_error_body(resp),
+    batches: list[dict] = []
+    for offset in range(0, len(actions), 20):
+        resp = _HTTP.post(
+            f"{FEEDLING_API_URL}/v1/memory/actions",
+            json={"actions": actions[offset : offset + 20]},
+            headers=_HEADERS,
+            timeout=20,
         )
-    body = resp.json()
-    if not isinstance(body, dict) or body.get("status") not in {
-        "ok", "partial", "failed", "created", "replaced"
-    }:
-        raise RuntimeError(f"memory_actions_unexpected_response:{str(body)[:500]}")
-    if not isinstance(body.get("results"), list):
-        raise RuntimeError(f"memory_actions_results_missing:{str(body)[:500]}")
-    return body
+        if resp.status_code >= 400:
+            raise ActionsHTTPError(
+                f"memory_actions_http_{resp.status_code}:{resp.text[:500]}",
+                status_code=resp.status_code,
+                body=_parse_actions_error_body(resp),
+            )
+        body = resp.json()
+        if not isinstance(body, dict) or body.get("status") not in {
+            "ok", "partial", "failed", "created", "replaced"
+        }:
+            raise RuntimeError(f"memory_actions_unexpected_response:{str(body)[:500]}")
+        if not isinstance(body.get("results"), list):
+            raise RuntimeError(f"memory_actions_results_missing:{str(body)[:500]}")
+        batches.append(body)
+    if len(batches) == 1:
+        return batches[0]
+    results = [row for body in batches for row in body.get("results", [])]
+    effects = [row for body in batches for row in body.get("effects", [])]
+    failed_count = sum(int(body.get("failed_count") or 0) for body in batches)
+    applied_count = sum(int(body.get("applied_count") or 0) for body in batches)
+    skipped_count = sum(int(body.get("skipped_count") or 0) for body in batches)
+    return {
+        "status": "ok" if failed_count == 0 else ("failed" if failed_count == len(results) else "partial"),
+        "results": results,
+        "effects": effects,
+        "total_count": len(results),
+        "applied_count": applied_count,
+        "skipped_count": skipped_count,
+        "failed_count": failed_count,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -8746,6 +8809,71 @@ _agent_session_id_cache: dict[str, str] = {}
 _agent_session_meta_cache: dict[str, dict[str, Any]] = {}
 _chat_runtime_v2_profile: dict[str, Any] = {}
 
+# The effective web-tool policy the backend advertises on every /v1/chat/poll
+# (batch 5): {"effective": bool, "search": bool, "fetch": bool}. Drives whether
+# the io_cli web-search/web-fetch verbs are shown to the model in the injected
+# catalog. Display only — the real block is the server-side execution gate.
+_web_policy: dict[str, Any] = {}
+# The agent session id whose injected catalog last INCLUDED the web verbs, and
+# the session id we've already told "web is now off". Both keyed by session id
+# (None for codex — it has no resume, so the model never retained the verbs and
+# needs no correction). See _web_off_notice_for_turn.
+_web_advertised_session_id: str | None = None
+_web_off_notice_session_id: str | None = None
+
+# One-line correction prepended for a resume-capable session that already saw the
+# web verbs earlier this session and now has web turned off — the model still has
+# the old prompt in its resumed context, so tell it once the verbs are gone. The
+# server-side gate is what actually enforces; this only stops wasted attempts.
+_WEB_OFF_NOTICE = (
+    "联网搜索已关闭：web-search 与 web-fetch 目前不可用，请勿再调用；"
+    "如需联网请提示用户到设置里重新开启。"
+)
+
+
+def _update_web_policy(policy: Any) -> None:
+    global _web_policy
+    _web_policy = dict(policy) if isinstance(policy, dict) else {}
+
+
+def _web_tools_effective() -> bool:
+    try:
+        return bool(_web_policy.get("effective"))
+    except Exception:
+        return False
+
+
+def _strip_web_verbs_from_catalog(catalog: str) -> str:
+    """Drop the web-search/web-fetch catalog lines (first token match) when web
+    is off. The catalog's own lines are ``verb <args...>  description``, so the
+    leading token is the verb name."""
+    kept = []
+    for line in catalog.split("\n"):
+        token = line.split(" ", 1)[0].strip() if line.strip() else ""
+        if token in ("web-search", "web-fetch"):
+            continue
+        kept.append(line)
+    return "\n".join(kept)
+
+
+def _web_off_notice_for_turn(sid: str | None) -> str:
+    """Return the one-line 'web is off now' notice, once, for a resume-capable
+    session that already advertised the web verbs and now has web disabled;
+    ``''`` otherwise. Codex (sid is None) never gets it — with no resume the
+    model never carried the verbs forward, so the freshly-filtered catalog is
+    already the whole truth."""
+    global _web_off_notice_session_id
+    if _web_tools_effective():
+        return ""
+    if sid is None:
+        return ""
+    if _web_advertised_session_id != sid:
+        return ""  # this session never saw the web verbs
+    if _web_off_notice_session_id == sid:
+        return ""  # already corrected this session
+    _web_off_notice_session_id = sid
+    return _WEB_OFF_NOTICE
+
 
 def _load_whoami() -> bool:
     """Fetch encryption keys from /v1/users/whoami and cache them.
@@ -8931,6 +9059,7 @@ def poll_chat(since: float, timeout: int | None = None, claim: bool = True) -> d
     if isinstance(body, dict):
         _update_chat_runtime_v2_profile(body.get("runtime_v2"))
         _update_user_mcp_advertised(body.get("user_mcp"))
+        _update_web_policy(body.get("web_policy"))
     return body
 
 
@@ -12117,8 +12246,12 @@ def _dream_actions_from_consolidations(
     cards_superseded = 0
     organized_ids: set[str] = set()
     merged_count = 0
-    for row in consolidations[: max(1, DREAM_MAX_CONSOLIDATIONS)]:
+    for row in consolidations:
         op = str(row.get("op") or "").strip().lower()
+        if not str(row.get("rationale") or "").strip():
+            continue
+        if row.get("_review_approved") is not True:
+            continue
         card_ids = [
             str(memory_id or "").strip()
             for memory_id in (row.get("card_ids") if isinstance(row.get("card_ids"), list) else [])
@@ -12126,6 +12259,10 @@ def _dream_actions_from_consolidations(
         ]
         card_ids = list(dict.fromkeys(card_ids))
         if not card_ids:
+            continue
+        if len(card_ids) == 1 and not _dream_has_substantive_increment(
+            card_map.get(card_ids[0]) or {}, row.get("result") or {}
+        ):
             continue
         organized_ids.update(card_ids)
         if op == "merge":
@@ -12149,6 +12286,8 @@ def _dream_actions_from_consolidations(
             "capture_mode": "memory_dream",
             "dream_op": op,
             "dream_card_ids": card_ids,
+            "dream_rationale": str(row.get("rationale") or "")[:1000],
+            "dream_review_reason": str(row.get("_review_reason") or "")[:1000],
         })
         if op == "merge":
             cards_merged += 1
@@ -12158,6 +12297,96 @@ def _dream_actions_from_consolidations(
     if consolidations and not actions:
         raise ValueError("dream_no_memory_actions")
     return actions, cards_merged, cards_thickened, cards_superseded, len(organized_ids), merged_count
+
+
+def _dream_semantic_text(card: dict) -> str:
+    values: list[str] = []
+    for key in ("title", "summary", "description", "content"):
+        value = str(card.get(key) or "").strip()
+        if value and value not in values:
+            values.append(value)
+    return "".join(re.findall(r"[\w]", " ".join(values).lower(), flags=re.UNICODE))
+
+
+def _dream_has_substantive_increment(old_card: dict, result: dict) -> bool:
+    """Keep the deterministic 1:1 anti-churn fence used by the V2 lane."""
+
+    old_text = _dream_semantic_text(old_card)
+    new_text = _dream_semantic_text(result)
+    if not old_text or not new_text:
+        return False
+    min_growth = max(24, (len(old_text) * 15 + 99) // 100)
+    if len(new_text) < len(old_text) + min_growth:
+        return False
+    old_grams = {old_text[index : index + 3] for index in range(max(0, len(old_text) - 2))}
+    new_grams = {new_text[index : index + 3] for index in range(max(0, len(new_text) - 2))}
+    min_novel = max(6, (len(old_grams) * 10 + 99) // 100)
+    return len(new_grams - old_grams) >= min_novel
+
+
+def _dream_review_consolidations(
+    consolidations: list[dict],
+    *,
+    card_map: dict[str, dict],
+    job_id: str,
+) -> list[dict]:
+    """Run one isolated V1 agent review per Dream proposal, fail-closed."""
+
+    approved: list[dict] = []
+    for index, row in enumerate(consolidations):
+        if not isinstance(row, dict):
+            continue
+        rationale = str(row.get("rationale") or "").strip()
+        card_ids = list(
+            dict.fromkeys(
+                str(memory_id or "").strip()
+                for memory_id in (row.get("card_ids") or [])
+                if str(memory_id or "").strip()
+            )
+        )
+        source_cards = [card_map.get(memory_id) for memory_id in card_ids]
+        if not rationale or not card_ids or any(card is None for card in source_cards):
+            log.warning(
+                "dream semantic review skipped invalid proposal id=%s index=%d",
+                job_id,
+                index,
+            )
+            continue
+        try:
+            prompt = build_dream_review_prompt(
+                consolidation=row,
+                source_cards=[card for card in source_cards if card is not None],
+            )
+            raw = call_agent(
+                prompt,
+                raw_text=True,
+                trace_id=f"dream-review:{job_id}:{index}",
+                lane="background",
+                isolated_session=True,
+            )
+            _note_agent_turn_success()
+            review, error = parse_dream_review(_capture_agent_reply_text(raw))
+        except Exception as exc:  # noqa: BLE001 — reject this proposal, keep reviewing
+            log.warning(
+                "dream semantic review failed id=%s index=%d code=%s",
+                job_id,
+                index,
+                type(exc).__name__,
+            )
+            continue
+        if error or not isinstance(review, dict) or review.get("approved") is not True:
+            log.warning(
+                "dream semantic review rejected id=%s index=%d code=%s",
+                job_id,
+                index,
+                str(error or "review_no")[:120],
+            )
+            continue
+        accepted = dict(row)
+        accepted["_review_approved"] = True
+        accepted["_review_reason"] = str(review.get("reason") or "")[:1000]
+        approved.append(accepted)
+    return approved
 
 
 def _process_dream_jobs(jobs: list) -> float:
@@ -12277,6 +12506,29 @@ def _process_dream_jobs(jobs: list) -> float:
                 },
             )
             log.info("dream job completed noop id=%s questions=%d", job_id, len(questions))
+            continue
+        consolidations = _dream_review_consolidations(
+            consolidations,
+            card_map=card_map,
+            job_id=job_id,
+        )
+        if not consolidations:
+            update_proactive_job_status(
+                job_id,
+                "completed",
+                "dream_semantic_review_rejected",
+                extra={
+                    "dream_result": {
+                        "status": "noop",
+                        "reason": "dream_semantic_review_rejected",
+                        "job_kind": "memory_dream",
+                    },
+                    "cards_merged": 0,
+                    "cards_superseded": 0,
+                    "questions": questions,
+                    "noop_reason": "dream_semantic_review_rejected",
+                },
+            )
             continue
         try:
             occurred_at = _format_message_time(time.time())

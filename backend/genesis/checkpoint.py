@@ -1,18 +1,16 @@
 """Genesis v2 Step 2 — job phase state machine + per-task checkpoint (the contract).
 
-⚠️ LIVE-USE STATUS (2026-07-01, self-audit + Codex): the live plaintext orchestration
-in routes.py ONLY uses the dedup anchors here — `normalize_fact_text` /
-`make_candidate_id` / `make_source_ref`. The phase/task/resume STATE MACHINE
-(`new_checkpoint` / `upsert_task` / `runnable_tasks` / `set_phase` /
-`mark_provider_config_blocked` / `resume`) is NOT wired into production yet — it is the
-foundation for Step 4 (resumable background continuation) and currently lives only in
-its own tests + the e2e reference impl. Kept on purpose (don't rebuild it later); just
-don't mistake it for a shipped capability.
+⚠️ LIVE-USE STATUS (2026-08-03): plaintext Genesis now uses
+`new_checkpoint` / `upsert_task` / `is_task_done` / `resume` for encrypted
+per-window map recovery. The foreground-written/provider-blocked phase helpers
+remain the Step-4 contract and are not all driven by the live orchestration yet.
 
 PURE, side-effect-free helpers (no DB / LLM) so they unit-test in isolation. The
-worker/routes own persistence — store this dict in the genesis job blob
-`genesis_checkpoint:{job_id}`. Step 3 (foreground reducer) and Step 4 (background
-continuation) drive it through these helpers; they must NOT reach past this contract.
+worker/routes own persistence. The live plaintext path seals this dict in a shared
+envelope before storing `genesis_checkpoint:{job_id}`; candidate text must never be
+placed in plaintext job/output metadata. Step 3 (foreground reducer) and Step 4
+(background continuation) drive it through these helpers; they must NOT reach past
+this contract.
 
 Bakes in the 4 v2 safety contracts (CC + Codex, 2026-06-30) so Step 3/4 can't
 "forget" them:

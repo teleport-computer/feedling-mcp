@@ -1,11 +1,14 @@
 # Feedling Pre — Phala TDX main-CVM compose.
 #
 # This file is the Pre main deployment unit:
-#   - dstack-ingress: TLS termination for pre-api.feedling.app
-#   - backend:       ASGI (HTTP+WS) — sole source of truth for user data
-#   - enclave:       decrypt proxy + /attestation (own TLS on :5003,
-#                    reachable via dstack-gateway `-5003s.` passthrough)
-#   - serve-worker:  pooled Runtime V2 worker (dual-runtime coexistence,
+#   - dstack-ingress: WebPKI TLS for pre-api.feedling.app and
+#                     pre-enclave.feedling.app
+#   - backend:        ASGI (HTTP+WS) — sole source of truth for user data
+#   - enclave:        decrypt proxy + /attestation with its own TLS on :5003,
+#                     reachable directly via dstack-gateway `-5003s.` passthrough
+#   - enclave-domain: internal HTTP :5004 entrypoint, reachable only through
+#                     the ingress-backed pre-enclave.feedling.app custom domain
+#   - serve-worker:   pooled Runtime V2 worker (dual-runtime coexistence,
 #                    2026-07-21 design doc §7a). Same image as backend; serves
 #                    only the per-user allowlist's v2/draining accounts.
 #
@@ -17,10 +20,16 @@
 # environment — a runner-side serve-worker would double-pool jobs against
 # this CVM's own serve-worker).
 #
-# dstack-ingress manages the pre-api.feedling.app CNAME/TXT/CAA records through
-# a narrowly scoped Cloudflare token injected by CI. The authoritative CVM IDs,
+# dstack-ingress manages both custom domains' CNAME/TXT/CAA records through a
+# narrowly scoped Cloudflare token injected by CI. The authoritative CVM IDs,
 # endpoints, deploy order, and compose-hash publication steps live in
 # deploy/DEPLOYMENTS.md and deploy/HOSTED_RUNTIME_V2_ROLLOUT.md.
+#
+# Enclave entrypoints intentionally coexist:
+#   direct: https://<app-id>-5003s.dstack-pha-prod9.phala.network → enclave:5003
+#           (enclave-owned TLS and certificate pinning)
+#   custom: https://pre-enclave.feedling.app → ingress:443 → enclave-domain:5004
+#           (ingress evidence plus enclave application attestation; no host port)
 #
 # CRITICAL: every literal in this file becomes part of the compose_hash.
 # Any ${VAR} below must be category (A) — cosmetic / non-security.
@@ -29,7 +38,7 @@
 name: feedling-pre
 
 services:
-  # --- Public TLS termination for the api custom domain. ---
+  # --- Public TLS termination for the API and enclave custom domains. ---
   # HAProxy-based L4/L7 ingress inside the TDX CVM. Issues LE certs via
   # CF DNS-01, routes by SNI. Key material stays inside the enclave
   # volume `letsencrypt` — the CF token only has DNS-edit scope, not
@@ -46,8 +55,10 @@ services:
       CERTBOT_EMAIL: "security@feedling.app"
       DOMAINS: |
         pre-api.feedling.app
+        pre-enclave.feedling.app
       ROUTING_MAP: |
         pre-api.feedling.app=backend:5001
+        pre-enclave.feedling.app=enclave-domain:5004
       # CF_API_TOKEN must be injected via `phala deploy -e` (encrypted
       # env channel, NOT baked into compose_hash). Required scopes:
       # Zone.DNS:Edit on the feedling.app zone (for DNS-01 challenge +
@@ -63,6 +74,8 @@ services:
     depends_on:
       backend:
         condition: service_started
+      enclave-domain:
+        condition: service_started
 
   # --- Attestation service + decrypt proxy. ---
   # Keeps its own in-enclave TLS on :5003. NOT routed through ingress —
@@ -72,28 +85,49 @@ services:
   # baked into REPORT_DATA. Moving this behind ingress would break the
   # Phase 3 pinning guarantee.
   enclave:
-    image: ghcr.io/teleport-computer/feedling:ea27549
-    command: ["python", "-u", "backend/enclave_app.py"]
+    image: &enclave-image ghcr.io/teleport-computer/feedling:ea27549
+    command: &enclave-command ["python", "-u", "backend/enclave_app.py"]
     restart: unless-stopped
     environment:
+      <<: &enclave-environment
+        FEEDLING_DATA_DIR: "/data"
+        FEEDLING_FLASK_URL: "http://backend:5001"
+        MEMORY_READSIDE_FOR_MODEL_API: "true"
+        # NOTE: intentionally NOT setting DSTACK_SIMULATOR_ENDPOINT.
+        # dstack-sdk treats "is this env var PRESENT?" as "use simulator"
+        # even when the value is empty, so an empty string would make it
+        # try to connect to "" and fail with EINVAL. Leaving the var unset
+        # lets dstack-sdk fall through to /var/run/dstack.sock (mounted
+        # below). Only set this on dev laptops running the simulator.
       FEEDLING_ENCLAVE_PORT: "5003"
-      FEEDLING_DATA_DIR: "/data"
       FEEDLING_ENCLAVE_TLS: "true"
-      FEEDLING_FLASK_URL: "http://backend:5001"
-      MEMORY_READSIDE_FOR_MODEL_API: "true"
-      # NOTE: intentionally NOT setting DSTACK_SIMULATOR_ENDPOINT.
-      # dstack-sdk treats "is this env var PRESENT?" as "use simulator"
-      # even when the value is empty, so an empty string would make it
-      # try to connect to "" and fail with EINVAL. Leaving the var unset
-      # lets dstack-sdk fall through to /var/run/dstack.sock (mounted
-      # below). Only set this on dev laptops running the simulator.
+      FEEDLING_ENCLAVE_TRANSPORT_MODE: "direct_tls"
     ports:
       - "5003:5003"
-    volumes:
+    volumes: &enclave-volumes
       - feedling_enclave_data_pre:/data
       - /var/run/dstack.sock:/var/run/dstack.sock
     healthcheck:
       test: ["CMD-SHELL", "curl -k -s -o /dev/null -w '%{http_code}' https://127.0.0.1:5003/healthz | grep -qE '^(200|503)$'"]
+      interval: 15s
+      timeout: 5s
+      retries: 20
+      start_period: 120s
+
+  enclave-domain:
+    image: *enclave-image
+    command: *enclave-command
+    restart: unless-stopped
+    environment:
+      <<: *enclave-environment
+      FEEDLING_ENCLAVE_PORT: "5004"
+      FEEDLING_ENCLAVE_TLS: "false"
+      FEEDLING_ENCLAVE_TRANSPORT_MODE: "attested_ingress"
+    expose:
+      - "5004"
+    volumes: *enclave-volumes
+    healthcheck:
+      test: ["CMD-SHELL", "curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:5004/healthz | grep -qE '^(200|503)$'"]
       interval: 15s
       timeout: 5s
       retries: 20

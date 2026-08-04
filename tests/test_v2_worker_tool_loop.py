@@ -1366,8 +1366,8 @@ def test_new_turn_after_intermediate_failure_starts_after_failure_cursor(
     )
     monkeypatch.setattr(
         worker,
-        "_perception_grounding_results",
-        lambda *_args, **_kwargs: asyncio.sleep(0, result=None),
+        "_perception_glance_grounding_results",
+        lambda *_args, **_kwargs: asyncio.sleep(0, result=(None, None)),
     )
 
     def _plaintext(row: dict) -> str:
@@ -1587,8 +1587,8 @@ def test_committed_final_reply_survives_post_commit_bookkeeping_failures(
     )
     monkeypatch.setattr(
         worker,
-        "_perception_grounding_results",
-        lambda *_args, **_kwargs: asyncio.sleep(0, result=None),
+        "_perception_glance_grounding_results",
+        lambda *_args, **_kwargs: asyncio.sleep(0, result=(None, None)),
     )
     monkeypatch.setattr(
         provider_client,

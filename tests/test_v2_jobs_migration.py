@@ -1,6 +1,7 @@
 """0014 迁移落地：四张 V2 表 + single-flight 唯一索引真的存在且生效。"""
 
 import inspect
+import os
 import sys
 from pathlib import Path
 
@@ -10,6 +11,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
 import db
 import psycopg
+from alembic import command
 from alembic.config import Config
 from alembic.script import ScriptDirectory
 from model_api_runtime.v2 import jobs_store
@@ -33,6 +35,511 @@ def _migration_0041_module():
         .get_revision("0041_v2_mcp_mutation_attempts")
         .module
     )
+
+
+def _migration_0074_module():
+    backend = Path(__file__).parent.parent / "backend"
+    cfg = Config(str(backend / "alembic.ini"))
+    cfg.set_main_option("script_location", str(backend / "alembic"))
+    return (
+        ScriptDirectory.from_config(cfg)
+        .get_revision("0074_runtime_user_delivery_idx")
+        .module
+    )
+
+
+def _migration_0075_module():
+    backend = Path(__file__).parent.parent / "backend"
+    cfg = Config(str(backend / "alembic.ini"))
+    cfg.set_main_option("script_location", str(backend / "alembic"))
+    return (
+        ScriptDirectory.from_config(cfg)
+        .get_revision("0075_v2_usage_rollup")
+        .module
+    )
+
+
+def test_0075_usage_rollup_schema_is_installed_without_source_backfill():
+    migration = _migration_0075_module()
+
+    assert migration.down_revision == "0074_runtime_user_delivery_idx"
+    assert migration._SOURCE_CURSOR_INDEX == (
+        "CREATE INDEX CONCURRENTLY ix_v2_turn_metrics_updated_id "
+        "ON v2_turn_metrics (updated_at, id) INCLUDE (created_at)"
+    )
+    assert "INSERT INTO v2_usage_daily" not in migration._SCHEMA_UP
+
+    with db.get_pool().connection() as conn:
+        heads = {
+            row[0]
+            for row in conn.execute("SELECT version_num FROM alembic_version").fetchall()
+        }
+        tables = {
+            row[0]
+            for row in conn.execute(
+                "SELECT table_name FROM information_schema.tables "
+                "WHERE table_name = ANY(%s)",
+                (
+                    [
+                        "v2_usage_daily_users",
+                        "v2_usage_daily_dimensions",
+                        "v2_usage_rollup_watermarks",
+                    ],
+                ),
+            ).fetchall()
+        }
+        source_index = conn.execute(
+            "SELECT indexdef FROM pg_indexes "
+            "WHERE indexname='ix_v2_turn_metrics_updated_id'"
+        ).fetchone()
+        cascade_indexes = dict(
+            conn.execute(
+                "SELECT indexname,indexdef FROM pg_indexes "
+                "WHERE indexname = ANY(%s)",
+                (
+                    [
+                        "ix_v2_usage_daily_users_user_id",
+                        "ix_v2_usage_daily_dimensions_user_id",
+                    ],
+                ),
+            ).fetchall()
+        )
+        rollup_triggers = conn.execute(
+            "SELECT count(*) FROM pg_trigger WHERE NOT tgisinternal "
+            "AND tgrelid='v2_turn_metrics'::regclass"
+        ).fetchone()[0]
+
+    assert heads == {"0077_merge_plaintext_usage"}
+    assert tables == {
+        "v2_usage_daily_users",
+        "v2_usage_daily_dimensions",
+        "v2_usage_rollup_watermarks",
+    }
+    assert source_index is not None
+    assert "(updated_at, id) INCLUDE (created_at)" in source_index[0]
+    assert set(cascade_indexes) == {
+        "ix_v2_usage_daily_users_user_id",
+        "ix_v2_usage_daily_dimensions_user_id",
+    }
+    assert all(
+        "(user_id) WHERE (user_id IS NOT NULL)" in definition
+        for definition in cascade_indexes.values()
+    )
+    assert rollup_triggers == 0
+
+
+def test_0075_schema_phase_is_restartable_after_concurrent_index_failure():
+    migration = _migration_0075_module()
+
+    # autocommit_block commits the schema phase before CREATE INDEX
+    # CONCURRENTLY.  Replaying after an interrupted index build must therefore
+    # accept the already-created empty tables and child-key indexes.
+    with db.get_pool().connection() as conn:
+        conn.execute(migration._SCHEMA_UP)
+
+
+def test_0075_usage_rollup_columns_preserve_overlapping_completeness():
+    expected_common = {
+        f"{prefix}_{metric}"
+        for prefix in ("all", "metered", "unknown")
+        for metric in (
+            "turns",
+            "model_calls",
+            "retries",
+            "failed_turns",
+            "usage_reported_calls",
+            "cache_reported_calls",
+            "unknown_usage_calls",
+            "prompt_tokens_sum",
+            "prompt_tokens_known_count",
+            "completion_tokens_sum",
+            "completion_tokens_known_count",
+            "cache_read_tokens_sum",
+            "cache_read_tokens_known_count",
+            "cache_write_tokens_sum",
+            "cache_write_tokens_known_count",
+            "cache_miss_tokens_sum",
+            "cache_miss_tokens_known_count",
+        )
+    }
+    with db.get_pool().connection() as conn:
+        columns_by_table = {}
+        types_by_table = {}
+        for table in ("v2_usage_daily_users", "v2_usage_daily_dimensions"):
+            rows = conn.execute(
+                "SELECT column_name,data_type FROM information_schema.columns "
+                "WHERE table_name=%s",
+                (table,),
+            ).fetchall()
+            columns_by_table[table] = {row[0] for row in rows}
+            types_by_table[table] = {row[0]: row[1] for row in rows}
+
+    assert expected_common <= columns_by_table["v2_usage_daily_users"]
+    assert expected_common <= columns_by_table["v2_usage_daily_dimensions"]
+    for table in columns_by_table:
+        for column in expected_common:
+            assert types_by_table[table][column] == "bigint"
+    assert {
+        "all_latency_samples",
+        "metered_latency_samples",
+        "unknown_latency_samples",
+    } <= columns_by_table["v2_usage_daily_dimensions"]
+    assert types_by_table["v2_usage_daily_dimensions"]["all_latency_samples"] == "ARRAY"
+
+
+def test_0075_nullable_user_rows_are_canonical_and_known_users_cascade():
+    uid = "u_usage_rollup_fk"
+    day = "2026-08-01"
+    _seed_user(uid)
+    try:
+        with db.get_pool().connection() as conn:
+            conn.execute(
+                "INSERT INTO v2_usage_daily_users (local_day,user_id) "
+                "VALUES (%s,NULL),(%s,%s)",
+                (day, day, uid),
+            )
+            conn.execute(
+                "INSERT INTO v2_usage_daily_dimensions "
+                "(local_day,user_id,lane,provider,model) "
+                "VALUES (%s,NULL,'chat','unknown','unknown'),"
+                "(%s,%s,'chat','anthropic','claude-test')",
+                (day, day, uid),
+            )
+            with pytest.raises(psycopg.errors.UniqueViolation):
+                conn.execute(
+                    "INSERT INTO v2_usage_daily_users (local_day,user_id) "
+                    "VALUES (%s,NULL)",
+                    (day,),
+                )
+            with pytest.raises(psycopg.errors.UniqueViolation):
+                conn.execute(
+                    "INSERT INTO v2_usage_daily_dimensions "
+                    "(local_day,user_id,lane,provider,model) "
+                    "VALUES (%s,NULL,'chat','unknown','unknown')",
+                    (day,),
+                )
+            conn.execute("DELETE FROM users WHERE user_id=%s", (uid,))
+            assert conn.execute(
+                "SELECT count(*) FROM v2_usage_daily_users WHERE user_id=%s",
+                (uid,),
+            ).fetchone() == (0,)
+            assert conn.execute(
+                "SELECT count(*) FROM v2_usage_daily_dimensions WHERE user_id=%s",
+                (uid,),
+            ).fetchone() == (0,)
+            assert conn.execute(
+                "SELECT count(*) FROM v2_usage_daily_users WHERE user_id IS NULL "
+                "AND local_day=%s",
+                (day,),
+            ).fetchone() == (1,)
+    finally:
+        with db.get_pool().connection() as conn:
+            conn.execute(
+                "DELETE FROM v2_usage_daily_dimensions WHERE local_day=%s",
+                (day,),
+            )
+            conn.execute(
+                "DELETE FROM v2_usage_daily_users WHERE local_day=%s",
+                (day,),
+            )
+            conn.execute("DELETE FROM users WHERE user_id=%s", (uid,))
+
+
+def test_0075_usage_rollup_rejects_negative_aggregates_and_tracks_watermarks():
+    with db.get_pool().connection() as conn:
+        with pytest.raises(psycopg.errors.CheckViolation):
+            conn.execute(
+                "INSERT INTO v2_usage_daily_users "
+                "(local_day,user_id,all_model_calls) VALUES ('2026-08-02',NULL,-1)"
+            )
+        with pytest.raises(psycopg.errors.CheckViolation):
+            conn.execute(
+                "INSERT INTO v2_usage_daily_dimensions "
+                "(local_day,user_id,lane,provider,model,all_prompt_tokens_known_count) "
+                "VALUES ('2026-08-02',NULL,'chat','unknown','unknown',1)"
+            )
+        conn.execute(
+            "INSERT INTO v2_usage_rollup_watermarks "
+            "(rollup_name,bootstrap_complete,source_updated_at,source_id,"
+            "refreshed_at,last_error_at,last_error,version) "
+            "VALUES ('hosted_v2_usage',true,'2026-08-02T00:00:00Z',42,now(),"
+            "now(),'transient timeout',3)"
+        )
+        row = conn.execute(
+            "SELECT bootstrap_complete,source_updated_at,source_id,refreshed_at,"
+            "last_error_at,last_error,version "
+            "FROM v2_usage_rollup_watermarks WHERE rollup_name='hosted_v2_usage'"
+        ).fetchone()
+        conn.execute(
+            "DELETE FROM v2_usage_rollup_watermarks "
+            "WHERE rollup_name='hosted_v2_usage'"
+        )
+    assert row[0] is True
+    assert row[1] is not None and row[2] == 42 and row[3] is not None
+    assert row[4] is not None and row[5] == "transient timeout" and row[6] == 3
+
+
+@pytest.mark.parametrize(
+    ("rollup_name", "dirty_from_day", "dirty_through_day"),
+    [
+        ("dirty_from_only", "2026-08-01", None),
+        ("dirty_through_only", None, "2026-08-02"),
+        ("dirty_reversed", "2026-08-03", "2026-08-02"),
+    ],
+)
+def test_0075_dirty_day_bounds_are_paired_and_ordered(
+    rollup_name, dirty_from_day, dirty_through_day
+):
+    with db.get_pool().connection() as conn:
+        with pytest.raises(psycopg.errors.CheckViolation):
+            conn.execute(
+                "INSERT INTO v2_usage_rollup_watermarks "
+                "(rollup_name,dirty_from_day,dirty_through_day) "
+                "VALUES (%s,%s,%s)",
+                (rollup_name, dirty_from_day, dirty_through_day),
+            )
+
+
+@pytest.mark.parametrize(
+    ("table", "prefix", "day"),
+    [
+        ("v2_usage_daily_users", "all", "2026-09-01"),
+        ("v2_usage_daily_users", "metered", "2026-09-02"),
+        ("v2_usage_daily_users", "unknown", "2026-09-03"),
+        ("v2_usage_daily_dimensions", "all", "2026-09-04"),
+        ("v2_usage_daily_dimensions", "metered", "2026-09-05"),
+        ("v2_usage_daily_dimensions", "unknown", "2026-09-06"),
+    ],
+)
+def test_0075_cache_reported_calls_cannot_exceed_model_calls(
+    table, prefix, day
+):
+    with db.get_pool().connection() as conn:
+        if table == "v2_usage_daily_users":
+            sql = (
+                f"INSERT INTO {table} "
+                f"(local_day,user_id,{prefix}_cache_reported_calls,"
+                f"{prefix}_model_calls) VALUES (%s,NULL,1,0)"
+            )
+        else:
+            sql = (
+                f"INSERT INTO {table} "
+                f"(local_day,user_id,lane,provider,model,"
+                f"{prefix}_cache_reported_calls,{prefix}_model_calls) "
+                "VALUES (%s,NULL,'chat','unknown','unknown',1,0)"
+            )
+        with pytest.raises(psycopg.errors.CheckViolation):
+            conn.execute(sql, (day,))
+
+
+def test_0075_downgrade_and_replay_is_repeatable():
+    backend = Path(__file__).parent.parent / "backend"
+    cfg = Config(str(backend / "alembic.ini"))
+    cfg.set_main_option("script_location", str(backend / "alembic"))
+
+    try:
+        command.downgrade(cfg, "0074_runtime_user_delivery_idx")
+        with db.get_pool().connection() as conn:
+            assert {
+                row[0]
+                for row in conn.execute(
+                    "SELECT version_num FROM alembic_version"
+                ).fetchall()
+            } == {
+                "0074_merge_plaintext_tail",
+                "0074_runtime_user_delivery_idx",
+            }
+            assert conn.execute(
+                "SELECT to_regclass('v2_usage_daily_users')"
+            ).fetchone() == (None,)
+
+        command.upgrade(cfg, "0075_v2_usage_rollup")
+        with db.get_pool().connection() as conn:
+            assert {
+                row[0]
+                for row in conn.execute(
+                    "SELECT version_num FROM alembic_version"
+                ).fetchall()
+            } == {"0074_merge_plaintext_tail", "0075_v2_usage_rollup"}
+            assert conn.execute(
+                "SELECT to_regclass('v2_usage_daily_users')"
+            ).fetchone()[0] is not None
+
+        command.downgrade(cfg, "0074_runtime_user_delivery_idx")
+        command.upgrade(cfg, "0075_v2_usage_rollup")
+        with db.get_pool().connection() as conn:
+            assert {
+                row[0]
+                for row in conn.execute(
+                    "SELECT version_num FROM alembic_version"
+                ).fetchall()
+            } == {"0074_merge_plaintext_tail", "0075_v2_usage_rollup"}
+            assert conn.execute(
+                "SELECT to_regclass('v2_usage_daily_dimensions')"
+            ).fetchone()[0] is not None
+    finally:
+        command.upgrade(cfg, "head")
+
+
+def test_0075_upgrade_recovers_a_real_invalid_concurrent_index_shell():
+    backend = Path(__file__).parent.parent / "backend"
+    cfg = Config(str(backend / "alembic.ini"))
+    cfg.set_main_option("script_location", str(backend / "alembic"))
+    uid = "u_0075_invalid_index"
+    _seed_user(uid)
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            "INSERT INTO v2_turn_metrics "
+            "(user_id,lane,model_calls,updated_at) VALUES (%s,'chat',1,now())",
+            (uid,),
+        )
+
+    try:
+        command.downgrade(cfg, "0074_runtime_user_delivery_idx")
+        with psycopg.connect(os.environ["DATABASE_URL"], autocommit=True) as conn:
+            conn.execute(
+                "CREATE FUNCTION v2_usage_test_fail_index(timestamptz) "
+                "RETURNS timestamptz LANGUAGE plpgsql IMMUTABLE AS $$ "
+                "BEGIN RAISE EXCEPTION 'intentional index build failure'; END $$"
+            )
+            with pytest.raises(psycopg.errors.RaiseException):
+                conn.execute(
+                    "CREATE INDEX CONCURRENTLY ix_v2_turn_metrics_updated_id "
+                    "ON v2_turn_metrics "
+                    "(v2_usage_test_fail_index(updated_at),id) INCLUDE(created_at)"
+                )
+            invalid = conn.execute(
+                "SELECT indisvalid FROM pg_index "
+                "WHERE indexrelid='ix_v2_turn_metrics_updated_id'::regclass"
+            ).fetchone()
+        assert invalid == (False,)
+
+        command.upgrade(cfg, "0075_v2_usage_rollup")
+        with db.get_pool().connection() as conn:
+            recovered = conn.execute(
+                "SELECT idx.indisvalid,pg_get_indexdef(idx.indexrelid) "
+                "FROM pg_index idx "
+                "WHERE idx.indexrelid='ix_v2_turn_metrics_updated_id'::regclass"
+            ).fetchone()
+        assert recovered[0] is True
+        assert "(updated_at, id) INCLUDE (created_at)" in recovered[1]
+        assert "v2_usage_test_fail_index" not in recovered[1]
+    finally:
+        command.downgrade(cfg, "0074_runtime_user_delivery_idx")
+        with psycopg.connect(os.environ["DATABASE_URL"], autocommit=True) as conn:
+            conn.execute(
+                "DROP INDEX CONCURRENTLY IF EXISTS ix_v2_turn_metrics_updated_id"
+            )
+            conn.execute("DROP FUNCTION IF EXISTS v2_usage_test_fail_index(timestamptz)")
+        command.upgrade(cfg, "head")
+        with db.get_pool().connection() as conn:
+            conn.execute("DELETE FROM users WHERE user_id=%s", (uid,))
+
+
+@pytest.mark.parametrize(
+    "wrong_index_sql",
+    [
+        "CREATE INDEX CONCURRENTLY ix_v2_turn_metrics_updated_id "
+        "ON users (user_id)",
+        "CREATE INDEX CONCURRENTLY ix_v2_turn_metrics_updated_id "
+        "ON v2_turn_metrics (created_at)",
+    ],
+    ids=("wrong-table", "wrong-columns"),
+)
+def test_0075_upgrade_rebuilds_a_valid_but_wrong_source_cursor_index(
+    wrong_index_sql,
+):
+    backend = Path(__file__).parent.parent / "backend"
+    cfg = Config(str(backend / "alembic.ini"))
+    cfg.set_main_option("script_location", str(backend / "alembic"))
+
+    try:
+        command.downgrade(cfg, "0074_runtime_user_delivery_idx")
+        with psycopg.connect(os.environ["DATABASE_URL"], autocommit=True) as conn:
+            conn.execute(wrong_index_sql)
+            assert conn.execute(
+                "SELECT idx.indisvalid FROM pg_index idx "
+                "WHERE idx.indexrelid='ix_v2_turn_metrics_updated_id'::regclass"
+            ).fetchone() == (True,)
+
+        command.upgrade(cfg, "0075_v2_usage_rollup")
+        with db.get_pool().connection() as conn:
+            recovered = conn.execute(
+                "SELECT idx.indisvalid,tbl.relname,idx.indnkeyatts,idx.indnatts,"
+                "pg_get_indexdef(idx.indexrelid,1,true),"
+                "pg_get_indexdef(idx.indexrelid,2,true),"
+                "pg_get_indexdef(idx.indexrelid,3,true) "
+                "FROM pg_index idx "
+                "JOIN pg_class tbl ON tbl.oid=idx.indrelid "
+                "WHERE idx.indexrelid='ix_v2_turn_metrics_updated_id'::regclass"
+            ).fetchone()
+        assert recovered == (
+            True,
+            "v2_turn_metrics",
+            2,
+            3,
+            "updated_at",
+            "id",
+            "created_at",
+        )
+    finally:
+        command.downgrade(cfg, "0074_runtime_user_delivery_idx")
+        with psycopg.connect(os.environ["DATABASE_URL"], autocommit=True) as conn:
+            conn.execute(
+                "DROP INDEX CONCURRENTLY IF EXISTS ix_v2_turn_metrics_updated_id"
+            )
+        command.upgrade(cfg, "head")
+
+
+def test_0074_runtime_user_delivery_indexes_are_concurrent_and_recoverable():
+    migration = _migration_0074_module()
+
+    assert migration.down_revision == "0073_merge_tail_anchor_deepseek"
+    assert set(migration._INDEXES) == {
+        "ix_v2_effect_report_created_at",
+        "ix_v2_effect_report_unfinished",
+        "ix_v2_terminal_failure_report_created_at",
+        "ix_v2_terminal_failure_report_unfinished",
+    }
+    assert all(
+        "CREATE INDEX CONCURRENTLY" in sql
+        for sql in migration._INDEXES.values()
+    )
+    upgrade_source = inspect.getsource(migration.upgrade)
+    assert "autocommit_block" in upgrade_source
+    assert "validity[name] is False" in upgrade_source
+    assert "DROP INDEX CONCURRENTLY IF EXISTS" in inspect.getsource(
+        migration.downgrade
+    )
+
+    with db.get_pool().connection() as conn:
+        definitions = dict(
+            conn.execute(
+                "SELECT indexname,indexdef FROM pg_indexes "
+                "WHERE indexname = ANY(%s)",
+                (list(migration._INDEXES),),
+            ).fetchall()
+        )
+    assert set(definitions) == set(migration._INDEXES)
+    assert "(created_at DESC, user_id)" in definitions[
+        "ix_v2_effect_report_created_at"
+    ]
+    assert "(user_id, status, created_at)" in definitions[
+        "ix_v2_effect_report_unfinished"
+    ]
+    assert "pending_fenced_v1" in definitions[
+        "ix_v2_effect_report_unfinished"
+    ]
+    assert "(created_at DESC, user_id)" in definitions[
+        "ix_v2_terminal_failure_report_created_at"
+    ]
+    terminal_backlog = definitions[
+        "ix_v2_terminal_failure_report_unfinished"
+    ]
+    assert "(user_id, created_at)" in terminal_backlog
+    assert "reply_delivered_at IS NULL" in terminal_backlog
+    assert "status_delivered_at IS NULL" in terminal_backlog
+    assert "runtime_error_delivered_at IS NULL" in terminal_backlog
 
 
 def test_v2_tables_exist():

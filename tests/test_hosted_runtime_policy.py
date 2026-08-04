@@ -589,7 +589,7 @@ def test_main_compose_serve_worker_shares_the_backend_image_and_stays_internal()
         assert env["FEEDLING_ENCLAVE_URL"] == "https://enclave:5003"
 
 
-def test_main_compose_serve_worker_enables_memory_maintenance_producers():
+def test_main_compose_serve_worker_wires_memory_maintenance_producers():
     """The scheduler lives in serve-worker; backend-only flags are inert."""
     for name in (
         "docker-compose.phala.yaml",
@@ -601,9 +601,12 @@ def test_main_compose_serve_worker_enables_memory_maintenance_producers():
         assert env["FEEDLING_V2_CAPTURE_ENABLED"] == (
             "${FEEDLING_V2_CAPTURE_ENABLED:-1}"
         ), name
-        assert env["FEEDLING_V2_DREAM_ENABLED"] == (
-            "${FEEDLING_V2_DREAM_ENABLED:-1}"
-        ), name
+        expected_dream = (
+            "${FEEDLING_V2_DREAM_ENABLED:-0}"
+            if name == "docker-compose.phala.test.yaml"
+            else "${FEEDLING_V2_DREAM_ENABLED:-1}"
+        )
+        assert env["FEEDLING_V2_DREAM_ENABLED"] == expected_dream, name
 
 
 def test_all_three_standalone_runner_composes_are_v1_agent_runner_only():

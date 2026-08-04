@@ -101,9 +101,45 @@ def test_pending_messages_no_claim_leaves_it_pending(store):
 
 def test_poll_context_shape(store):
     ctx = chat_poll_core.poll_context(store)
-    assert set(ctx) == {"runtime_v2", "client_release", "user_mcp", "vision_probe"}
+    assert set(ctx) == {"runtime_v2", "client_release", "user_mcp", "vision_probe", "web_policy"}
     assert "expected_consumer_commit" in ctx["client_release"]
     assert ctx["user_mcp"] == {"fingerprint": ""}
+    # Default account: web preference off → not effective, nothing advertised.
+    assert ctx["web_policy"] == {"effective": False, "search": False, "fetch": False}
+
+
+def test_web_policy_maps_get_settings_on_and_off():
+    """web_policy is a pure projection of settings_core.get_settings; inject a
+    fake reader so both on and off are exercised without any DB setup."""
+    off = chat_poll_core.web_policy(
+        object(),
+        settings_reader=lambda s: {
+            "effective": False,
+            "tools": {"web_search": {"available": False},
+                      "web_fetch": {"available": False}},
+        },
+    )
+    assert off == {"effective": False, "search": False, "fetch": False}
+
+    on = chat_poll_core.web_policy(
+        object(),
+        settings_reader=lambda s: {
+            "effective": True,
+            "tools": {"web_search": {"available": True},
+                      "web_fetch": {"available": True}},
+        },
+    )
+    assert on == {"effective": True, "search": True, "fetch": True}
+
+
+def test_web_policy_read_failure_degrades_to_off():
+    """A control-plane hiccup must never 500 the poll — under-advertise instead."""
+    def boom(_store):
+        raise RuntimeError("control plane down")
+
+    assert chat_poll_core.web_policy(object(), settings_reader=boom) == {
+        "effective": False, "search": False, "fetch": False,
+    }
 
 
 def test_build_response_contract(store):
@@ -115,8 +151,9 @@ def test_build_response_contract(store):
     assert set(resp) == {
         "messages", "runtime_v2", "client_release", "user_mcp", "timed_out", "consumer_id", "claimed",
         "agent_status_events", "status_cursor",
-        "vision_probe",
+        "vision_probe", "web_policy",
     }
+    assert resp["web_policy"] == ctx["web_policy"]
     assert resp["messages"] == [{"id": "m"}]
     assert resp["consumer_id"] == "c-A"
     assert resp["claimed"] is True

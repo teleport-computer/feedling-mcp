@@ -116,6 +116,7 @@ if not _provisioned:
         "test_web_settings_store.py",
         "test_v2_web_gate.py",
         "test_web_settings_core.py",
+        "test_web_execution_core.py",
         "test_object_storage.py",
         "test_wake_bus.py",
         "test_chat_idempotency_unit.py",
@@ -171,10 +172,15 @@ if not _provisioned:
         "test_identity_nudge_cap.py",
         "test_identity_list_ops.py",
         "test_io_cli_catalog.py",
+        "test_io_cli_web.py",
         "test_io_cli_identity_write_full.py",
         "test_io_cli_mutating_verb_sourcing_rule.py",
         "test_consumer_action_admission.py",
         "test_consumer_capability_inject.py",
+        "test_consumer_web_capability.py",
+        # Batch 5: web verbs advertised only while the poll's web policy is on.
+        # Pure — exercises the consumer's decision helpers with no DB/network.
+        "test_consumer_web_advertise.py",
         "test_identity_redistill_ipc.py",
         "test_redistill_server_merge.py",
         "test_update_stall_reason.py",

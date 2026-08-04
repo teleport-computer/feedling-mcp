@@ -91,6 +91,15 @@ _IO_CLI_VERBS = (
     "memory-delete",
     "schedule-wake",
     "cancel-wake",
+    # web-search/web-fetch: the V1 web capability. Adding them here is the STATIC
+    # Bash allow-rule ONLY — it lets claude's --allowed-tools call io_cli without a
+    # per-turn approval prompt, and the user's mid-session on/off toggle needs no
+    # respawn. It is NOT the authorization boundary: that is re-checked server-side
+    # on every call (web/execution_core: user switch + operator kill switch, fail
+    # closed). Until the V1 supervisor token carries the "web" scope (a later
+    # batch), the endpoint 403s — the allow-rule is harmless before then.
+    "web-search",
+    "web-fetch",
 )
 # Host-side resident sessions rotate at this many turns (vs the shared consumer
 # default of 40) so the persona file re-grounds voice more often within a long
@@ -145,20 +154,45 @@ _AGENT_PROMPT_FALLBACK_COMMANDS = (
     "python {io_cli} chat-image --id <message_id>\n"
     "python {io_cli} send-file --path <source_path> --name <download_name>\n"
     "python {io_cli} schedule-wake --at <time> [--reason <text>] [--tz <tz>]\n"
-    "python {io_cli} cancel-wake --wake-id <id> [--reason <text>]"
+    "python {io_cli} cancel-wake --wake-id <id> [--reason <text>]\n"
+    "python {io_cli} web-search <query> [--limit <n>]\n"
+    "python {io_cli} web-fetch <url>"
 )
 
-# Module-level memo of the live catalog text, keyed by io_cli path (in practice
-# always _IO_CLI). A ``None``/failed build is NEVER cached — same rule as VPS's
+# The V1 web verbs. When the user's web toggle is OFF (or operator-halted, or
+# unsupported — all folded into the ``web_visible`` flag by the caller) these are
+# dropped from the ADVERTISED catalog so the model isn't tempted to call a verb
+# that would just 403 at the server-side execution gate. This is display only:
+# the static Bash allow-rule (``_IO_CLI_VERBS`` above) stays put — a mid-session
+# toggle needs no respawn — and the real authorization boundary is re-checked
+# server-side on every call (web/execution_core, fail closed).
+_WEB_ADVERTISED_VERBS = ("web-search", "web-fetch")
+
+# Module-level memo of the live catalog text, keyed by (io_cli path, web_visible).
+# ``web_visible`` MUST be part of the key: the same process renders the catalog
+# for many users, and a user with web OFF filters the web verbs out — caching that
+# filtered text under the path alone would then serve it to the NEXT user whose
+# web is ON (and vice-versa), leaking one user's toggle onto everyone (Codex
+# batch-5 review). A ``None``/failed build is NEVER cached — same rule as VPS's
 # ``_io_cli_catalog_cache`` (tools/chat_resident_consumer.py) — so a transient
 # failure (e.g. io_cli.py mid-deploy write) retries on the next spawn instead of
 # permanently sticking every subsequent user on the fallback text for this
 # process's lifetime. Without this memo, every agent_home_files() call (one per
 # user spawn) would shell out ~20 subprocesses (one --help per catalog verb).
-_hosted_io_cli_catalog_cache: dict[str, str] = {}
+_hosted_io_cli_catalog_cache: dict[tuple[str, bool], str] = {}
 
 
-def _hosted_io_cli_catalog_text(io_cli: str = _IO_CLI) -> str:
+def _drop_web_from_fallback(fallback: str, io_cli: str) -> str:
+    """Strip the web-search/web-fetch lines from the static fallback command
+    list when web is not visible for this user (mirrors the live-catalog filter
+    below so the fallback path advertises the same surface)."""
+    prefixes = tuple(f"python {io_cli} {verb}" for verb in _WEB_ADVERTISED_VERBS)
+    return "\n".join(
+        line for line in fallback.split("\n") if not line.startswith(prefixes)
+    )
+
+
+def _hosted_io_cli_catalog_text(io_cli: str = _IO_CLI, *, web_visible: bool = True) -> str:
     """Render the io_cli command catalog for the hosted prompt.
 
     Unlike VPS's ``_prepend_io_cli_capability_catalog`` (which prepends
@@ -180,11 +214,14 @@ def _hosted_io_cli_catalog_text(io_cli: str = _IO_CLI) -> str:
     filtering — has nothing left to teach, so a catalog hiccup never ships an
     empty tools section.
     """
-    cached = _hosted_io_cli_catalog_cache.get(io_cli)
+    cache_key = (io_cli, web_visible)
+    cached = _hosted_io_cli_catalog_cache.get(cache_key)
     if cached is not None:
         return cached
 
     fallback = _AGENT_PROMPT_FALLBACK_COMMANDS.format(io_cli=io_cli)
+    if not web_visible:
+        fallback = _drop_web_from_fallback(fallback, io_cli)
     raw = None
     try:
         tools_dir = str(_REPO_ROOT / "tools")
@@ -203,12 +240,16 @@ def _hosted_io_cli_catalog_text(io_cli: str = _IO_CLI) -> str:
     lines = raw.split("\n")
     header, body = lines[:2], lines[2:]  # header = build_catalog's D8/D3 guidance lines
     allowed = set(_IO_CLI_VERBS)
+    if not web_visible:
+        # Advertised-only filter: the verb stays in _IO_CLI_VERBS (Bash allow-rule
+        # untouched), it just isn't shown to the model while web is off.
+        allowed = allowed - set(_WEB_ADVERTISED_VERBS)
     commands = [f"python {io_cli} {line}" for line in body if line.split(" ", 1)[0] in allowed]
     if not commands:
         return fallback
 
     text = "\n".join(header + commands)
-    _hosted_io_cli_catalog_cache[io_cli] = text
+    _hosted_io_cli_catalog_cache[cache_key] = text
     return text
 
 
@@ -686,10 +727,19 @@ def _default_cli_cmd(driver: str, home: str, io_cli: str = _IO_CLI, model: str =
         # native only exposes best-effort summaries, not raw reasoning, so
         # `detailed` improves the chance of seeing a summary but cannot guarantee
         # one for every turn.
+        # -c web_search=disabled: codex ships a native Responses web-search tool
+        # (web.run). Left on, the model reaches for it instead of our io_cli
+        # web-search verb — bypassing the server-side authorization/kill-switch
+        # gate entirely. Disable it at the CLI so web only ever flows through
+        # io_cli. TOML top-level key form is the only one that takes on codex-cli
+        # 0.142.4 (`-c tools.web_search=false` / `features.web_search=false` are
+        # dropped/ignored there); a home-level config.toml seeds the same key so an
+        # operator cli_cmd override can't silently re-enable it (see agent_home_files).
         return (
             "codex exec --skip-git-repo-check --json "
             "-c model_reasoning_effort=medium "
             "-c model_reasoning_summary=detailed "
+            "-c web_search=disabled "
             "{mcp} "
             "--dangerously-bypass-approvals-and-sandbox {message}"
         )
@@ -697,7 +747,7 @@ def _default_cli_cmd(driver: str, home: str, io_cli: str = _IO_CLI, model: str =
     prompt_file = f"{home}/{_AGENT_PROMPT_BASENAME}"
     return (
         f"claude {_CLAUDE_PERMISSION_FLAG} {_attach_dirs_add_dir(home)} "
-        f"--allowed-tools '{grant}' "
+        f"--allowed-tools '{grant}' {_CLAUDE_DISALLOWED_WEB_TOOLS} "
         f"--append-system-prompt-file {prompt_file} {{mcp}} -p {{message}}"
     )
 
@@ -712,6 +762,19 @@ def _default_cli_cmd(driver: str, home: str, io_cli: str = _IO_CLI, model: str =
 # (Verified in-CVM + locally on claude-code 2.1.195, sonnet-4-5 image turns.)
 _CLAUDE_PERMISSION_FLAG = "--permission-mode acceptEdits"
 
+# claude ships its own built-in WebSearch + WebFetch tools. Neither is in our
+# --allowed-tools allowlist, so when the model reaches for WebSearch (its
+# preferred way to go online) claude denies it as "requires approval" — and the
+# model never falls back to our io_cli ``web-search`` verb, so the user just sees
+# "联网被权限拦截" instead of a real search. --disallowed-tools hard-DENIES both
+# (deny outranks allow) so the model stops reaching for them and uses io_cli
+# web-search/web-fetch. WebFetch must be denied too, or a model blocked from
+# WebSearch could still WebFetch an arbitrary URL directly, bypassing our
+# server-side web-fetch authorization gate. Belt-and-suspenders with the
+# settings.json ``permissions.deny`` (agent_home_files) — an operator ``cli_cmd``
+# override drops this flag but still inherits the settings deny, and vice-versa.
+_CLAUDE_DISALLOWED_WEB_TOOLS = "--disallowed-tools WebSearch,WebFetch"
+
 
 def _default_thinking_claude_cmd(home: str, io_cli: str = _IO_CLI) -> str:
     """Claude Code exposes thinking blocks in stream-json output."""
@@ -724,7 +787,7 @@ def _default_thinking_claude_cmd(home: str, io_cli: str = _IO_CLI) -> str:
     return (
         f"claude {_CLAUDE_PERMISSION_FLAG} {_attach_dirs_add_dir(home)} --verbose "
         f"--output-format stream-json --include-partial-messages --effort high "
-        f"--allowed-tools '{grant}' "
+        f"--allowed-tools '{grant}' {_CLAUDE_DISALLOWED_WEB_TOOLS} "
         f"--append-system-prompt-file {prompt_file} {{mcp}} -p {{message}}"
     )
 
@@ -754,6 +817,7 @@ def agent_home_files(
     provider: str = "",
     identity_model: str = "",
     reasoning_effort: str = "",
+    web_visible: bool = True,
 ) -> dict[str, str]:
     """Per-user files seeded into the agent home before spawn (pure: path→content).
 
@@ -788,7 +852,8 @@ def agent_home_files(
     # fill it with the LIVE catalog (falls back to the static list internally on
     # any build failure — see _hosted_io_cli_catalog_text).
     system_append = _AGENT_PROMPT_TEXT.replace("<io_cli>", io_cli).replace(
-        _IO_CLI_CATALOG_PLACEHOLDER, _hosted_io_cli_catalog_text(io_cli)
+        _IO_CLI_CATALOG_PLACEHOLDER,
+        _hosted_io_cli_catalog_text(io_cli, web_visible=web_visible),
     ).replace(_OUTBOUND_FILE_DIR_PLACEHOLDER, f"{home}/outbound-files")
     persona = (persona_content or "").strip()
     if persona:
@@ -801,8 +866,18 @@ def agent_home_files(
     files = {f"{home}/{_AGENT_PROMPT_BASENAME}": system_append}
     if driver == "codex":
         # codex is native-only now (LiteLLM gateway retired) — it reads AGENTS.md
-        # and talks straight to api.openai.com; NO config.toml is ever written.
+        # and talks straight to api.openai.com. The only thing config.toml carries
+        # is ``web_search = "disabled"``: codex's native Responses web-search tool
+        # (web.run) must stay off so web only ever flows through our io_cli
+        # web-search verb (server-side authorized + kill-switchable), never codex's
+        # own ungated tool. Seeding it in the home — not just the CLI ``-c`` flag —
+        # closes the operator ``cli_cmd`` override hole (a custom command without
+        # the flag still inherits this). TOML top-level key form is the one codex-cli
+        # 0.142.4 honors (``tools.web_search`` / ``features.web_search`` are ignored
+        # there). codex_config_merged (user-MCP) prepends its managed [mcp_servers]
+        # block AFTER this top-level key, so the merge preserves it.
         files[f"{home}/codex-home/AGENTS.md"] = system_append
+        files[f"{home}/codex-home/config.toml"] = 'web_search = "disabled"\n'
     elif driver == "pi":
         # pi reads the tools how-to via --append-system-prompt (same mechanism as
         # claude); the relay is registered as a custom provider in models.json.
@@ -817,9 +892,17 @@ def agent_home_files(
         # the allow rules are treated as hints and the default mode auto-denies
         # non-interactively. acceptEdits makes the pre-granted allowlist actually
         # honored without a prompt. (Verified in-CVM: sonnet-4-5 image turns.)
+        # deny WebSearch/WebFetch here too (not only on the CLI --disallowed-tools
+        # flag): _default_cli_cmd can be replaced wholesale by an operator ``cli_cmd``
+        # override, which would drop the flag — but claude still reads this
+        # settings.json, and permissions.deny outranks allow, so the built-in web
+        # tools stay blocked and the model falls back to our io_cli web-search verb.
+        # user-MCP merge only rewrites permissions.allow (merge_settings_allow), so
+        # this deny survives it untouched.
         settings = {
             "permissions": {
                 "defaultMode": "acceptEdits",
+                "deny": ["WebSearch", "WebFetch"],
                 "allow": _claude_allow_rules(io_cli, home),
             }
         }
@@ -835,10 +918,14 @@ def stale_home_files(home: str, *, driver: str) -> list[str]:
     The motivating case (historical): a codex user who used to be bridged through
     the in-CVM LiteLLM gateway (now retired) — or who switches to the claude
     driver — may still carry a ``codex-home/config.toml`` pointing at the
-    (now-dead) gateway on a PERSISTENT home; ``agent_home_files`` never writes
-    that file any more (codex is native-only), so it must always be pruned here
-    or a stale config would keep routing codex at a port nothing listens on
-    anymore → ``error sending request`` → user-visible fallback."""
+    (now-dead) gateway on a PERSISTENT home; a stale config would keep routing
+    codex at a port nothing listens on anymore → ``error sending request`` →
+    user-visible fallback. It stays in this list unconditionally: for a NON-codex
+    driver it is pruned (that user has no codex config); for the codex driver
+    ``agent_home_files`` now writes a fresh ``config.toml`` (``web_search =
+    "disabled"``), which is in ``files`` so ``materialize_home``'s prune guard
+    skips it and the fresh write OVERWRITES any stale gateway content — same net
+    effect (no dead gateway config survives) via overwrite instead of unlink."""
     stale: list[str] = [f"{home}/codex-home/config.toml"]
     if driver != "pi":
         # A user who switched off the pi driver leaves a models.json pointing at
@@ -859,6 +946,7 @@ def materialize_home(
     provider: str = "",
     identity_model: str = "",
     reasoning_effort: str = "",
+    web_visible: bool = True,
 ) -> None:
     """Write the per-user home files for a spawn AND prune stale ones a persistent
     home may carry (see ``stale_home_files``). Idempotent — safe before every
@@ -871,7 +959,7 @@ def materialize_home(
     files = agent_home_files(
         home, driver=driver, io_cli=io_cli, model=model, persona_content=persona_content,
         base_url=base_url, provider=provider, identity_model=identity_model,
-        reasoning_effort=reasoning_effort)
+        reasoning_effort=reasoning_effort, web_visible=web_visible)
     for path, content in files.items():
         p = Path(path)
         p.parent.mkdir(parents=True, exist_ok=True)
@@ -936,6 +1024,28 @@ def _genesis_persona_content(user_id: str, api_key: str | None = None,
         return raw.decode("utf-8")
 
     return _persona_from_blob(blob, _decrypt)
+
+
+def _web_visible_for_user(user_id: str) -> bool:
+    """Whether this user's web verbs should be ADVERTISED in the baked prompt at
+    (re)spawn — the effective web-tool state from ``web.settings_core`` (user
+    preference AND not operator-halted AND runtime-supported). Advertised-only:
+    the Bash allow-rule stays regardless, and the server-side execution gate is
+    the real boundary, so a read failure fails toward NOT advertising (the model
+    just doesn't see the verbs — safe under-advertise, never a false promise).
+
+    A mid-session toggle only reaches the baked prompt on the next respawn; the
+    running consumer keeps the allow-rule and the gate enforces live. Local
+    imports keep this module pure-unit importable without DB/web deps (same idiom
+    as ``_genesis_persona_content``)."""
+    try:
+        from core.store import UserStore
+        from web import settings_core as web_settings_core
+
+        return bool(web_settings_core.get_settings(UserStore(user_id)).get("effective"))
+    except Exception as e:  # noqa: BLE001 — advertised-verb display must never block a spawn
+        log.warning("web-visibility read failed for %s (advertising off): %s", user_id, e)
+        return False
 
 
 def consumer_env(base_env: dict, entry: dict, *, user_id: str, home: str) -> dict:
@@ -1113,7 +1223,7 @@ class ProcessSpawner:
     def spawn(self, entry: dict, user_id: str, home: str) -> int:
         driver = (entry.get("driver") or "claude").strip().lower()
         materialize_home(
-            home, driver=driver,
+            home, driver=driver, web_visible=_web_visible_for_user(user_id),
             model=str(entry.get("model") or ""),
             base_url=str(entry.get("base_url") or ""),
             provider=str(entry.get("provider") or ""),

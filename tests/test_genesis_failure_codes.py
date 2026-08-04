@@ -66,6 +66,18 @@ def test_classify_model_bad_json_after_repair():
     ) == "model_bad_json"
 
 
+def test_classify_model_bad_json_from_non_json_provider_wire_response():
+    assert service.classify_genesis_error(
+        "plaintext_import_failed:ProviderError:provider returned non-json response"
+    ) == "model_bad_json"
+
+
+def test_classify_model_bad_json_from_non_object_provider_wire_response():
+    assert service.classify_genesis_error(
+        "plaintext_import_failed:ProviderError:provider returned non-object response"
+    ) == "model_bad_json"
+
+
 def test_classify_model_empty_output_from_all_fact_maps_failed():
     # real _build_reducer_output floor-check raise
     assert service.classify_genesis_error(
@@ -80,6 +92,16 @@ def test_classify_provider_timeout_from_httpx_exception_type_name():
     ) == "provider_timeout"
 
 
+def test_classify_distill_model_too_slow_before_generic_timeout():
+    assert service.classify_genesis_error(
+        "plaintext_import_failed:DistillModelTooSlowError:distill_model_too_slow:ReadTimeout"
+    ) == "distill_model_too_slow"
+    copy = service.genesis_failure_required_text("distill_model_too_slow")
+    assert "换更快的模型" in copy
+    assert "switch to a faster model" in copy
+    assert "蒸馏" not in copy
+
+
 def test_classify_provider_timeout_from_live_httpx_exc():
     exc = httpx.ReadTimeout("timed out")
     assert service.classify_genesis_error("some wrapper text", exc) == "provider_timeout"
@@ -88,6 +110,10 @@ def test_classify_provider_timeout_from_live_httpx_exc():
 def test_classify_worker_restarted_from_cloud_stale_reaper():
     # real reap_stale_processing_jobs error string
     assert service.classify_genesis_error("genesis_stale_timeout:1800s") == "worker_restarted"
+
+
+def test_classify_worker_restarted_from_dead_plaintext_owner():
+    assert service.classify_genesis_error("plaintext_worker_restarted") == "worker_restarted"
 
 
 def test_classify_worker_restarted_from_resident_stale_reaper():

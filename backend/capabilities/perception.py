@@ -44,3 +44,13 @@ def history(store, *, api_key=None, runtime_token=None, params=None) -> Capabili
                  default_msg="perception history unavailable",
                  store=store, signal_raw=params.get("signal"),
                  days_raw=params.get("days"))
+
+
+def glance(store, *, api_key=None, runtime_token=None, params=None) -> CapabilityResult:
+    params = params or {}
+    result = _wrap(perception_core.perception_glance_payload,
+                   default_msg="perception glance unavailable",
+                   store=store, days_raw=params.get("days"))
+    if result.ok:
+        result.data.pop("ok", None)
+    return result

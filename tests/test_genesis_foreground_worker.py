@@ -80,6 +80,35 @@ def test_foreground_runs_factmap_once_per_chunk_and_writes_only_core(monkeypatch
     assert sum(len(d) for d in calls["fact_write"]) == 3
 
 
+def test_foreground_canary_is_the_real_first_map_and_is_not_repeated(monkeypatch):
+    monkeypatch.setenv("FEEDLING_GENESIS_CANARY_TIMEOUT_SEC", "13")
+    monkeypatch.setattr(db, "genesis_upsert_output", lambda *a, **k: None)
+    fake, calls = _fake_completion_factory()
+    timeouts = []
+
+    def recording_fake(*args, **kwargs):
+        timeouts.append(kwargs["timeout"])
+        return fake(*args, **kwargs)
+
+    out = worker.build_foreground_output_from_texts(
+        user_id="u1",
+        job_id="j-canary",
+        runtime=_RUNTIME,
+        chunk_texts=["第一次见面在图书馆 ..."],
+        source_kind="history",
+        llm=GenesisLLMClient(
+            completion_fn=recording_fake,
+            persist_output=False,
+            canary=True,
+        ),
+    )
+
+    assert calls["fact_map"] == 1
+    assert len(out["all_fact_candidates"]) == len(_FACTS[0])
+    assert timeouts[0] == 13.0
+    assert timeouts[1] == 90.0
+
+
 def test_foreground_core_is_relationship_then_pet(monkeypatch):
     out, _ = _run(monkeypatch, max_core=3)
     core = out["core_fact_candidates"]

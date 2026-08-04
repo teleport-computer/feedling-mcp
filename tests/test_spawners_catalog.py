@@ -206,3 +206,91 @@ def test_rendered_catalog_never_documents_a_verb_outside_the_allowlist():
     files = spawners.agent_home_files("/h", driver="claude", provider="anthropic")
     prompt = files["/h/agent-tools-prompt.md"]
     assert "identity-redistill" not in prompt
+
+
+# ---------------------------------------------------------------------------
+# Batch 5: advertised web verbs follow the user's effective web policy. The verb
+# stays in _IO_CLI_VERBS (Bash allow-rule) regardless; only the DISPLAYED catalog
+# changes, so the model isn't tempted to call a verb the server-side gate will 403.
+# ---------------------------------------------------------------------------
+
+_FAKE_CATALOG = "\n".join([
+    io_cli_catalog.D8_SOFT_GUIDANCE,
+    io_cli_catalog.D3_SOURCING_RULE,
+    "IO CLI INVOCATION: run python <io_cli> <verb>",
+    "memory-index --limit  List memory cards",
+    "web-search <query> --limit  Search the web",
+    "web-fetch <url>  Fetch a URL",
+])
+
+
+def test_web_visible_true_shows_web_verbs(monkeypatch):
+    monkeypatch.setattr(io_cli_catalog, "build_catalog", lambda *a, **kw: _FAKE_CATALOG)
+    text = spawners._hosted_io_cli_catalog_text(spawners._IO_CLI, web_visible=True)
+    assert f"python {spawners._IO_CLI} web-search" in text
+    assert f"python {spawners._IO_CLI} web-fetch" in text
+    assert f"python {spawners._IO_CLI} memory-index" in text
+
+
+def test_web_visible_false_hides_web_verbs_but_keeps_the_rest(monkeypatch):
+    monkeypatch.setattr(io_cli_catalog, "build_catalog", lambda *a, **kw: _FAKE_CATALOG)
+    text = spawners._hosted_io_cli_catalog_text(spawners._IO_CLI, web_visible=False)
+    # Anchor on the verb invocation: the worktree PATH itself can contain the
+    # bare substring "web-search", so a plain `not in` would false-positive.
+    assert f"{spawners._IO_CLI} web-search" not in text
+    assert f"{spawners._IO_CLI} web-fetch" not in text
+    assert f"python {spawners._IO_CLI} memory-index" in text  # non-web verbs untouched
+
+
+def test_web_visibility_does_not_leak_across_users_via_the_path_cache(monkeypatch):
+    """Codex batch-5 review: the memo MUST key on (path, web_visible). One process
+    renders for many users; caching a web-OFF user's filtered text under the path
+    alone would serve it to the next web-ON user (and vice-versa)."""
+    monkeypatch.setattr(io_cli_catalog, "build_catalog", lambda *a, **kw: _FAKE_CATALOG)
+    spawners._hosted_io_cli_catalog_cache.clear()
+
+    off = spawners._hosted_io_cli_catalog_text(spawners._IO_CLI, web_visible=False)
+    on = spawners._hosted_io_cli_catalog_text(spawners._IO_CLI, web_visible=True)
+
+    assert f"{spawners._IO_CLI} web-search" not in off
+    assert f"{spawners._IO_CLI} web-fetch" not in off
+    # The web-ON user must NOT inherit the web-OFF user's cached filtered text.
+    assert f"python {spawners._IO_CLI} web-search" in on
+    assert f"python {spawners._IO_CLI} web-fetch" in on
+
+    # And re-reading each key returns its own cached copy, still distinct.
+    assert f"{spawners._IO_CLI} web-search" not in spawners._hosted_io_cli_catalog_text(
+        spawners._IO_CLI, web_visible=False)
+    assert f"python {spawners._IO_CLI} web-search" in spawners._hosted_io_cli_catalog_text(
+        spawners._IO_CLI, web_visible=True)
+
+
+def test_web_visible_defaults_true_for_byte_identical_current_behaviour(monkeypatch):
+    """No caller passing web_visible (existing tests, any old call site) keeps the
+    current output: web verbs present."""
+    monkeypatch.setattr(io_cli_catalog, "build_catalog", lambda *a, **kw: _FAKE_CATALOG)
+    default = spawners._hosted_io_cli_catalog_text(spawners._IO_CLI)
+    explicit = spawners._hosted_io_cli_catalog_text(spawners._IO_CLI, web_visible=True)
+    assert default == explicit
+
+
+def test_fallback_drops_web_lines_when_web_hidden(monkeypatch):
+    """A build_catalog failure must not smuggle the web verbs back in through the
+    static fallback when the user's web is off."""
+    monkeypatch.setattr(io_cli_catalog, "build_catalog", lambda *a, **kw: None)
+    text = spawners._hosted_io_cli_catalog_text(spawners._IO_CLI, web_visible=False)
+    assert "memory-index" in text  # fallback still teaches the non-web surface
+    assert f"python {spawners._IO_CLI} web-search" not in text
+    assert f"python {spawners._IO_CLI} web-fetch" not in text
+
+
+def test_agent_home_files_hides_web_verbs_when_web_not_visible(monkeypatch):
+    monkeypatch.setattr(io_cli_catalog, "build_catalog", lambda *a, **kw: _FAKE_CATALOG)
+    files = spawners.agent_home_files(
+        "/h", driver="claude", provider="anthropic", web_visible=False)
+    prompt = files["/h/agent-tools-prompt.md"]
+    assert f"{spawners._IO_CLI} web-search" not in prompt
+    assert f"{spawners._IO_CLI} web-fetch" not in prompt
+    # A default (web_visible=True) render still shows them.
+    files_on = spawners.agent_home_files("/h", driver="claude", provider="anthropic")
+    assert f"python {spawners._IO_CLI} web-search" in files_on["/h/agent-tools-prompt.md"]

@@ -1896,6 +1896,56 @@ def test_dream_completion_advances_state(tmp_path, monkeypatch):
     assert second.get_json()["reason"] == "already_dreamed"
 
 
+def test_dream_output_and_new_turns_do_not_retrigger_without_new_seed_cards(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
+    monkeypatch.setenv("FEEDLING_DREAM_NIGHT_ONLY", "false")
+    monkeypatch.setenv("FEEDLING_DREAM_MIN_NEW_CARDS", "3")
+    monkeypatch.setenv("FEEDLING_DREAM_MIN_INTERVAL_SEC", "0")
+    core_store._stores.clear()
+
+    user_id = "usr_dream_no_self_feedback"
+    seed_user(user_id)
+    store = core_store.UserStore(user_id)
+    original = [
+        _dream_test_memory(user_id, f"seed-{i}")
+        for i in range(3)
+    ]
+    db.memory_replace_all(user_id, original)
+
+    first = proactive_dream_scheduler.tick_memory_dream(store, now=1000.0)
+    assert first["enqueued"] is True
+    store.update_proactive_job(first["job"]["job_id"], {"status": "completed"})
+    proactive_dream_scheduler.record_dream_job_status(
+        store, first["job"], status="completed", now=1001.0
+    )
+
+    rewritten = []
+    for card in original:
+        retired = dict(card)
+        retired.update({"status": "superseded", "is_archived": True})
+        rewritten.append(retired)
+    dream_card = _dream_test_memory(user_id, "dream-result")
+    dream_card["source"] = "memory_dream"
+    rewritten.append(dream_card)
+    db.memory_replace_all(user_id, rewritten)
+    for i in range(30):
+        store.append_chat(
+            "user",
+            "chat",
+            _capture_test_envelope(user_id, f"msg-dream-{i}"),
+        )
+
+    second = proactive_dream_scheduler.tick_memory_dream(store, now=2000.0)
+
+    assert second["enqueued"] is False
+    assert second["reason"] == "already_dreamed"
+    assert second["new_cards"] == 0
+    assert second["new_turns"] == 30
+    assert len(_memory_dream_jobs(store)) == 1
+
+
 def test_capture_coordinator_dedupes_same_window_across_signals(tmp_path, monkeypatch):
     monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
     monkeypatch.setenv("FEEDLING_CAPTURE_TURN_BACKSTOP", "1")

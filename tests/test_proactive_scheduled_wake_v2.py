@@ -67,6 +67,7 @@ def test_schedule_action_persists_wall_time_timezone_note_and_origin_refs():
             "at": "2026-06-20T09:30:00+08:00",
             "tz": "Asia/Shanghai",
             "note": "check whether she left for the hospital",
+            "repeat": "daily",
             "origin_refs": ["msg_1", "msg_2"],
         }],
         settings=resolve_settings_v2({"timezone": "Asia/Shanghai"}),
@@ -84,9 +85,57 @@ def test_schedule_action_persists_wall_time_timezone_note_and_origin_refs():
     assert record.at == "2026-06-20T09:30:00"
     assert record.timezone == "Asia/Shanghai"
     assert record.note == "check whether she left for the hospital"
+    assert record.repeat == "daily"
+    assert record.repeat_series_id == record.timer_id
     assert record.origin_refs == ("msg_1", "msg_2")
     assert service.agent_context_for_user("u1")["pending_count"] == 1
     assert service.agent_context_for_user("u1")["pending_cap"] == 20
+    assert service.agent_context_for_user("u1")["timers"][0]["repeat"] == "daily"
+
+
+def test_schedule_dedupes_same_due_and_repeat_but_keeps_distinct_repeats():
+    store, service = _service()
+    at = "2026-06-20T09:30:00Z"
+
+    daily = service.apply_turn_actions(
+        "u1",
+        [{"type": "schedule_wake", "at": at, "tz": "UTC", "repeat": "daily"}],
+        now=1.0,
+    )[0]
+    daily_duplicate = service.apply_turn_actions(
+        "u1",
+        [{"type": "schedule_wake", "at": at, "tz": "UTC", "repeat": "daily"}],
+        now=2.0,
+    )[0]
+    weekly = service.apply_turn_actions(
+        "u1",
+        [{"type": "schedule_wake", "at": at, "tz": "UTC", "repeat": "weekly"}],
+        now=3.0,
+    )[0]
+
+    pending = [record for record in store.list_records("u1") if record.pending_like]
+    due_at = next(record.due_at for record in pending if record.timer_id == daily.timer_id)
+    assert daily_duplicate.timer_id == daily.timer_id
+    assert daily_duplicate.reason == "already_scheduled"
+    assert weekly.timer_id != daily.timer_id
+    assert {(record.due_at, record.repeat) for record in pending} == {
+        (due_at, "daily"),
+        (due_at, "weekly"),
+    }
+
+
+def test_schedule_rejects_unsupported_repeat():
+    store, service = _service()
+
+    result = service.apply_turn_actions(
+        "u1",
+        [{"type": "schedule_wake", "at": "2026-06-20T09:30:00Z", "repeat": "monthly"}],
+        now=1.0,
+    )[0]
+
+    assert result.status == "invalid"
+    assert result.reason == "invalid_repeat"
+    assert store.list_records("u1") == []
 
 
 def test_schedule_instant_keeps_event_timezone_wall_clock_across_dst():
@@ -248,6 +297,127 @@ def test_cancel_wake_prevents_future_fire():
     assert canceled.reason == "plans_changed"
     assert fired == ()
     assert store.list_records("u1")[0].status == SCHEDULED_CANCELED
+
+
+def test_daily_repeat_is_mechanical_and_exposes_new_pending_wake_id():
+    store, service = _service(self_wake_min_lead=10_000_000.0)
+    scheduled = service.apply_turn_actions(
+        "u1",
+        [{
+            "type": "schedule_wake",
+            "at": "2026-06-20T09:00:00Z",
+            "tz": "UTC",
+            "repeat": "daily",
+            "note": "drink water",
+        }],
+        now=1.0,
+    )[0]
+    original = store.list_records("u1")[0]
+    for offset_hours in range(1, 11):
+        service.apply_turn_actions(
+            "u1",
+            [{
+                "type": "schedule_wake",
+                "at": datetime.fromtimestamp(
+                    original.due_at + offset_hours * 3600.0,
+                    timezone.utc,
+                ).isoformat(),
+                "tz": "UTC",
+            }],
+            now=1.0 + offset_hours,
+        )
+    spine = RuntimeSpineV2(merge_window_sec=0.0)
+
+    fired = service.fire_due_timers(
+        "u1",
+        settings={},
+        now=original.due_at,
+        submit_wake=spine.submit,
+    )
+    records = {record.timer_id: record for record in store.list_records("u1")}
+    context = service.agent_context_for_user("u1")
+
+    assert len(fired) == 1
+    assert records[scheduled.timer_id].status == SCHEDULED_FIRED
+    assert fired[0].next_timer_id != scheduled.timer_id
+    next_record = records[fired[0].next_timer_id]
+    assert next_record.status == SCHEDULED_PENDING
+    # The huge self-wake lead does not clamp this: recurrence is a scheduler
+    # transition, not an agent-authored schedule_wake call.
+    assert next_record.due_at == original.due_at + 86400.0
+    assert next_record.repeat_series_id == original.repeat_series_id
+    assert context["pending_count"] == 11
+    renewed_context = next(
+        timer for timer in context["timers"] if timer["wake_id"] == next_record.timer_id
+    )
+    assert renewed_context["repeat"] == "daily"
+
+
+def test_weekly_repeat_uses_fixed_seven_day_interval():
+    store, service = _service()
+    service.apply_turn_actions(
+        "u1",
+        [{
+            "type": "schedule_wake",
+            "at": "2026-06-20T09:00:00Z",
+            "tz": "UTC",
+            "repeat": "weekly",
+        }],
+        now=1.0,
+    )
+    original = store.list_records("u1")[0]
+
+    fired = service.fire_due_timers(
+        "u1",
+        settings={},
+        now=original.due_at,
+        submit_wake=RuntimeSpineV2(merge_window_sec=0.0).submit,
+    )
+    next_record = next(record for record in store.list_records("u1") if record.pending_like)
+
+    assert next_record.timer_id == fired[0].next_timer_id
+    assert next_record.due_at == original.due_at + 604800.0
+    assert next_record.repeat == "weekly"
+
+
+def test_canceling_fired_repeat_id_cancels_next_and_stops_chain():
+    store, service = _service()
+    scheduled = service.apply_turn_actions(
+        "u1",
+        [{
+            "type": "schedule_wake",
+            "at": "2026-06-20T09:00:00Z",
+            "tz": "UTC",
+            "repeat": "daily",
+        }],
+        now=1.0,
+    )[0]
+    original = store.list_records("u1")[0]
+    fired = service.fire_due_timers(
+        "u1",
+        settings={},
+        now=original.due_at,
+        submit_wake=RuntimeSpineV2(merge_window_sec=0.0).submit,
+    )[0]
+
+    canceled = service.apply_turn_actions(
+        "u1",
+        [{"type": "cancel_wake", "wake_id": scheduled.timer_id}],
+        now=original.due_at + 1.0,
+    )[0]
+    records = {record.timer_id: record for record in store.list_records("u1")}
+    later = service.fire_due_timers(
+        "u1",
+        settings={},
+        now=original.due_at + 86400.0,
+        submit_wake=RuntimeSpineV2(merge_window_sec=0.0).submit,
+    )
+
+    assert canceled.status == "canceled"
+    assert records[fired.next_timer_id].status == SCHEDULED_CANCELED
+    assert records[fired.next_timer_id].repeat_canceled_at > 0
+    assert later == ()
+    assert not any(record.pending_like for record in records.values())
 
 
 def test_due_timer_fires_once_across_workers_and_survives_service_restart():

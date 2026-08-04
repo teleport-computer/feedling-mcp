@@ -21,6 +21,7 @@ MEMORY_SOURCE_VALUES = frozenset({
 
 MEMORY_CAPTURE_MODE_VALUES = frozenset({
     "agent_tool",
+    "genesis_import",
     "genesis_resident_distill",
     "memory_capture",
     "memory_dream",
@@ -30,4 +31,3 @@ MEMORY_CAPTURE_MODE_VALUES = frozenset({
 
 RESIDENT_ABSORB_SOURCE = "resident_absorb"
 RESIDENT_PATCH_SOURCE = "resident_patch"
-

@@ -12,7 +12,7 @@ this module so the worker never imports the hosted layer.
   resolve_provider(user_id) 在本回合只解密一次（single-flight 之外的每 job 一次），
   由 `_slot_loop` 在把 job 交给 `process_job` 之前调用、并把结果原样传入、整个回合复用。
 - api_key + runtime_token（enclave-auth）：只喂 executor 的 capability 调用 + 便宜预取
-  （memory_index/perception_snapshot）+ `TurnDeps.read_messages`（enclave 内解密取明文）。
+  （memory_index/perception_glance）+ `TurnDeps.read_messages`（enclave 内解密取明文）。
   runtime_token 由 `TurnDeps.mint_enclave_token` 铸造——这只是签一个短时效令牌（HMAC，不
   是解密），可以在回合内按需多铸，不违反「resolve_provider 只解密一次」的不变量（那条
   不变量特指 BYOK provider-key 的解密，不是 enclave-auth 令牌的签发次数）。
@@ -52,7 +52,6 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable
-from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import db
 import provider_attempt_ledger
@@ -69,7 +68,10 @@ from core import provider_usage
 from core import store as core_store
 from core import wake_bus as core_wake_bus
 from core.downloadable_reply import sanitize_downloadable_reply
-from perception.agent_fields import AGENT_PERCEPTION_SIGNALS
+from perception.glance import (
+    perception_glance_fingerprint,
+    project_perception_wake_events,
+)
 from model_api_runtime.v2 import coalesce as v2_coalesce
 from model_api_runtime.v2 import compaction as v2_compaction
 from model_api_runtime.v2 import context
@@ -98,6 +100,8 @@ from model_api_runtime.v2 import trajectory as v2_trajectory
 from memory.capture_prompt_v1 import (
     build_capture_prompt,
     build_capture_retry_prompt,
+    build_capture_semantic_retry_prompt,
+    capture_semantic_retry_reasons,
     parse_capture_cards,
 )
 from identity.user_naming import transcript_speaker_label
@@ -107,8 +111,10 @@ from memory.card_text import (
 )
 from memory.dream_prompt_v1 import (
     build_dream_prompt,
+    build_dream_review_prompt,
     build_dream_retry_prompt,
     parse_dream_consolidations,
+    parse_dream_review,
 )
 
 log = logging.getLogger("feedling.runtime_v2.worker")
@@ -172,6 +178,25 @@ async def _record_provider_failure(
     )
 
 
+async def _record_provider_failure_class(
+    user_id: str,
+    error_class: str,
+) -> None:
+    """Record an already-normalized, content-free provider failure class."""
+    normalized = str(error_class or "unknown")
+    if normalized not in notices_catalog.ERROR_CLASSES:
+        # ``provider_config`` is a useful extraction code but too coarse for
+        # the notice catalog: without a safe status-derived subtype, blaming
+        # the user would be guesswork. Provider health therefore records it as
+        # catalog-backed ``unknown`` until a precise class is available.
+        normalized = "unknown"
+    await asyncio.to_thread(
+        provider_health.record_failure,
+        user_id,
+        error_class=normalized,
+    )
+
+
 async def _extract_with_provider_health(
     user_id: str,
     **kwargs: Any,
@@ -182,10 +207,126 @@ async def _extract_with_provider_health(
     except Exception as exc:
         await _record_provider_failure(user_id, exc)
         raise
-    await _record_provider_success(
-        user_id, latency_ms=(time.monotonic() - started) * 1000.0
-    )
+    _items, reason = result
+    provider_failure = v2_extraction.provider_failure_code_from_reason(reason or "")
+    if provider_failure is not None:
+        await _record_provider_failure_class(user_id, provider_failure)
+    else:
+        # Parse/semantic rejection still proves the provider route answered;
+        # provider-health tracks route liveness, not card quality.
+        await _record_provider_success(
+            user_id, latency_ms=(time.monotonic() - started) * 1000.0
+        )
     return result
+
+
+async def _review_dream_consolidations(
+    user_id: str,
+    consolidations: list[dict],
+    *,
+    card_items: list[dict],
+    provider_config: Any,
+    job_id,
+    claimed_by: str | None,
+    tm: "TurnMetrics | None" = None,
+    trajectory_recorder: "v2_trajectory.TrajectoryRecorder | None" = None,
+) -> list[dict]:
+    """Independently review each Dream proposal with a fresh BYOK call.
+
+    A review failure rejects only that proposal. Lease loss is different: a
+    stale worker must stop the whole job before any write. The approved marker
+    is internal and is required again by the deterministic mapper.
+    """
+
+    by_id = {
+        str(card.get("id") or "").strip(): card
+        for card in card_items
+        if isinstance(card, dict) and str(card.get("id") or "").strip()
+    }
+    approved: list[dict] = []
+    for index, consolidation in enumerate(consolidations):
+        if not isinstance(consolidation, dict):
+            continue
+        rationale = str(consolidation.get("rationale") or "").strip()
+        card_ids = list(
+            dict.fromkeys(
+                str(memory_id or "").strip()
+                for memory_id in (consolidation.get("card_ids") or [])
+                if str(memory_id or "").strip()
+            )
+        )
+        source_cards = [by_id.get(memory_id) for memory_id in card_ids]
+        reject_code = ""
+        review: dict | None = None
+        if not rationale:
+            reject_code = "rationale_missing"
+        elif not card_ids or any(card is None for card in source_cards):
+            reject_code = "source_card_unavailable"
+        else:
+            if claimed_by and not await asyncio.to_thread(
+                jobs_store.renew_job_lease,
+                job_id,
+                claimed_by,
+                ttl_sec=jobs_store.RUNNING_TTL_SEC,
+            ):
+                raise LostJobLease("dream ownership lost before semantic review")
+            prompt = build_dream_review_prompt(
+                consolidation=consolidation,
+                source_cards=[card for card in source_cards if card is not None],
+            )
+            _report_turn_progress(f"dream_review_{index}_start")
+            review_result, review_error = await _extract_with_provider_health(
+                user_id,
+                provider_config=provider_config,
+                prompt=prompt,
+                parse=parse_dream_review,
+                max_tokens=300,
+                progress_cb=lambda stage, attempt, proposal=index: _report_turn_progress(
+                    f"dream_review_{proposal}_{stage}_{attempt}"
+                ),
+                usage_out=tm.add_call if tm is not None else None,
+                trajectory_out=(
+                    trajectory_recorder.record
+                    if trajectory_recorder is not None
+                    else None
+                ),
+            )
+            _report_turn_progress(f"dream_review_{index}_complete")
+            if review_error:
+                reject_code = str(review_error)[:120]
+            elif not isinstance(review_result, dict):
+                reject_code = "review_result_invalid"
+            elif review_result.get("approved") is not True:
+                reject_code = "review_no"
+                review = review_result
+            else:
+                review = review_result
+        await _record_trajectory(
+            trajectory_recorder,
+            "dream_semantic_review",
+            {
+                "proposal_index": index,
+                "target_count": len(card_ids),
+                "approved": bool(review and review.get("approved") is True),
+                "reject_code": reject_code,
+            },
+            best_effort=True,
+        )
+        if not review or review.get("approved") is not True:
+            log.warning(
+                "[v2.worker] dream proposal rejected by semantic review "
+                "user=%s proposal=%d targets=%d code=%s",
+                user_id,
+                index,
+                len(card_ids),
+                reject_code or "review_no",
+            )
+            continue
+        accepted = dict(consolidation)
+        accepted["_review_approved"] = True
+        accepted["_review_reason"] = str(review.get("reason") or "")[:1000]
+        approved.append(accepted)
+    return approved
 
 
 def _positive_int_env(name: str, default: str) -> int:
@@ -631,58 +772,6 @@ _PRIVATE_READ_TOOLS = frozenset(
         cap_tool_schema.PROVIDER_USAGE_TOOL,
     }
 )
-# Static perception grounding is allowed to coexist with first-round web/MCP/task
-# access, so it must contain only values that cannot carry natural-language
-# instructions.  Keep useful typed readings eager while making every free-form
-# label/title/description pull-only.  The allowlist is deliberately per field,
-# not merely ``isinstance(value, scalar)``: strings are scalars too, and are the
-# exact prompt-injection carrier this boundary excludes.
-_EAGER_PERCEPTION_SCALAR_FIELDS = {
-    "now": frozenset({"battery_level", "charging", "broadcast_active"}),
-    "weather": frozenset(
-        {
-            "temperature",
-            "apparent_temperature",
-            "humidity",
-            "precipitation_chance",
-            "uv_index",
-            "is_daylight",
-        }
-    ),
-    "calendar": frozenset({"calendar_events_truncated"}),
-    "focus": frozenset({"in_focus"}),
-    "audio_route": frozenset({"is_bluetooth"}),
-    "steps": frozenset({"step_count"}),
-    "sleep": frozenset(
-        {"asleep_minutes", "core_minutes", "deep_minutes", "rem_minutes"}
-    ),
-    "workout": frozenset({"duration_min", "count_today"}),
-    "vitals": frozenset(
-        {
-            "resting_heart_rate",
-            "step_count",
-            "current_heart_rate",
-            "hrv_sdnn_ms",
-            "respiratory_rate",
-            "oxygen_saturation_pct",
-            "vo2_max",
-        }
-    ),
-    "activity": frozenset(
-        {"active_energy_kcal", "exercise_minutes", "stand_minutes", "mindful_minutes"}
-    ),
-    "body": frozenset({"weight_kg", "bmi", "body_fat_pct", "height_cm"}),
-    "metabolic": frozenset(
-        {"blood_glucose_mmol_l", "blood_pressure_systolic", "blood_pressure_diastolic"}
-    ),
-    "cycle": frozenset({"is_active_period"}),
-    "mood": frozenset({"valence", "label_count", "recorded_today"}),
-    "reminders": frozenset(
-        {"overdue_count", "due_today_count", "reminders_truncated"}
-    ),
-}
-_STABLE_DISABLED_REASONS = frozenset({"not_permitted", "switch_off"})
-
 # These snapshot signals are made entirely of numeric fields (apart from the
 # runtime-generated disabled marker).  An explicit read limited to this set can
 # safely leave later outbound tools available. Mixed/free-form signals fence the
@@ -694,135 +783,6 @@ _OUTBOUND_SAFE_PERCEPTION_SIGNALS = frozenset(
 _TEXT_BEARING_MEDIA_READ_TOOLS = frozenset(
     {"screen_recent", "screen_read", "photo_recent", "photo_read"}
 )
-
-
-def _finite_typed_scalar(value: object) -> bool:
-    if value is None or isinstance(value, bool) or isinstance(value, int):
-        return True
-    return isinstance(value, float) and math.isfinite(value)
-
-
-# A tiny, format-constrained set of TEXT perception fields that are safe to
-# ground eagerly even though they are strings. The eager block sits before the
-# first round of outbound web/MCP/task tools, so — exactly like the scalar
-# allowlist above — every value here must be incapable of carrying a
-# natural-language instruction. Each field has an explicit validator that
-# returns the value ONLY if the WHOLE value is provably benign, else None
-# (fail-closed, never partial-clean):
-#   - place/city names come from the OS reverse geocoder (a bounded,
-#     non-user-controllable vocabulary), so `locality`/`country` are gated by a
-#     conservative character allowlist + length cap;
-#   - `now.local_time`/`now.timezone` are gated by ISO-8601 / IANA parsing.
-# The genuinely user-nameable free text — `place_label` (user-labeled places)
-# and `wifi_label` (an SSID can literally be "ignore previous instructions") —
-# is deliberately NOT here and stays pull-only behind the outbound fence.
-_COARSE_PLACE_TEXT_RE = re.compile(r"[0-9A-Za-zÀ-￿ .,'\-]+")
-_COARSE_PLACE_MAX_LEN = 48
-
-
-def _safe_coarse_place_text(value: object) -> str | None:
-    """Reverse-geocoded locality/country: whole-value allowlist or drop."""
-    if not isinstance(value, str):
-        return None
-    text = value.strip()
-    if not (1 <= len(text) <= _COARSE_PLACE_MAX_LEN):
-        return None
-    if _COARSE_PLACE_TEXT_RE.fullmatch(text) is None:
-        return None
-    return text
-
-
-def _safe_iso_local_time(value: object) -> str | None:
-    """Device-reported local wall clock: must parse as ISO-8601, else drop."""
-    if not isinstance(value, str):
-        return None
-    text = value.strip()
-    if not (1 <= len(text) <= 40):
-        return None
-    try:
-        datetime.fromisoformat(text)
-    except ValueError:
-        return None
-    return text
-
-
-def _safe_iana_timezone(value: object) -> str | None:
-    """Device-reported timezone: must be a loadable IANA identifier, else drop."""
-    if not isinstance(value, str):
-        return None
-    text = value.strip()
-    if not (1 <= len(text) <= 64):
-        return None
-    try:
-        ZoneInfo(text)
-    except (ZoneInfoNotFoundError, ValueError):
-        return None
-    return text
-
-
-# (signal, field) -> validator. Kept separate from the scalar allowlist so the
-# "scalars only, no strings" invariant of _EAGER_PERCEPTION_SCALAR_FIELDS stays
-# intact and each added string field is opted in with an explicit gate.
-_EAGER_PERCEPTION_TEXT_VALIDATORS: dict[tuple[str, str], Callable[[object], str | None]] = {
-    ("location", "locality"): _safe_coarse_place_text,
-    ("location", "country"): _safe_coarse_place_text,
-    ("now", "local_time"): _safe_iso_local_time,
-    ("now", "timezone"): _safe_iana_timezone,
-}
-# signal -> ordered text fields, derived from the validators above.
-_EAGER_PERCEPTION_TEXT_FIELDS: dict[str, tuple[str, ...]] = {}
-for _sig, _field in _EAGER_PERCEPTION_TEXT_VALIDATORS:
-    _EAGER_PERCEPTION_TEXT_FIELDS.setdefault(_sig, ())
-    _EAGER_PERCEPTION_TEXT_FIELDS[_sig] += (_field,)
-# Signals that contribute ONLY text fields (no scalar allowlist entry) — appended
-# after the scalar signals so projection order stays deterministic.
-_EAGER_PERCEPTION_TEXT_ONLY_SIGNALS = tuple(
-    signal
-    for signal in _EAGER_PERCEPTION_TEXT_FIELDS
-    if signal not in _EAGER_PERCEPTION_SCALAR_FIELDS
-)
-
-
-def _safe_eager_perception_snapshot(data: object) -> dict:
-    """Project a full snapshot to fixed numeric/bool/null fields plus a tiny set
-    of validated, format-constrained text fields.
-
-    Numeric/bool readings pass through the per-signal scalar allowlist. On top of
-    that, `location.locality`/`location.country` (reverse-geocoded, bounded
-    vocabulary) and `now.local_time`/`now.timezone` (ISO / IANA) pass through
-    per-field validators so the agent can answer "where am I / what day is it"
-    without guessing. Everything else free-form — calendar/reminder titles,
-    place/wifi/app/device labels, playback metadata, weather condition/alert
-    strings — is intentionally absent and remains available only through an
-    explicit tool read, which activates the outbound fence below.
-    """
-    if not isinstance(data, dict) or not isinstance(data.get("signals"), dict):
-        return {}
-    safe_signals: dict[str, dict] = {}
-    signal_order = list(_EAGER_PERCEPTION_SCALAR_FIELDS.keys())
-    signal_order.extend(_EAGER_PERCEPTION_TEXT_ONLY_SIGNALS)
-    for signal in signal_order:
-        raw_doc = data["signals"].get(signal)
-        if not isinstance(raw_doc, dict):
-            continue
-        safe_doc = {
-            field: raw_doc[field]
-            for field in _EAGER_PERCEPTION_SCALAR_FIELDS.get(signal, ())
-            if field in raw_doc and _finite_typed_scalar(raw_doc[field])
-        }
-        for field in _EAGER_PERCEPTION_TEXT_FIELDS.get(signal, ()):
-            validator = _EAGER_PERCEPTION_TEXT_VALIDATORS[(signal, field)]
-            cleaned = validator(raw_doc.get(field))
-            if cleaned is not None:
-                safe_doc[field] = cleaned
-        if raw_doc.get("disabled") is True:
-            safe_doc["disabled"] = True
-            reason = str(raw_doc.get("reason") or "").strip().lower()
-            if reason in _STABLE_DISABLED_REASONS:
-                safe_doc["reason"] = reason
-        if safe_doc:
-            safe_signals[signal] = safe_doc
-    return {"signals": safe_signals} if safe_signals else {}
 
 
 def _safe_eager_screen_metadata(data: object) -> dict:
@@ -889,20 +849,17 @@ _SUBAGENT_DISABLED_TOOLS = frozenset(
 # silently mishandled by this task's scope.
 _WAKE_LANES = frozenset({"heartbeat", "scheduled", "manual_wake", "screen_watch"})
 
-# The full agent-pullable catalog, taken from perception.agent_fields — the single
-# source of truth both the agent routes and this grounding read from ("Add a new
-# agent-pullable signal here ONCE and both paths pick it up"). Re-listing the names
-# here would silently drift the moment a signal is added.
-_PERCEPTION_GROUNDING_SIGNALS = tuple(AGENT_PERCEPTION_SIGNALS)
 # 记忆抽取 lane（capture=一窗对话→记忆卡，dream=现有卡片→合并）。同形：
 # build prompt → BYOK 抽取 → parse → memory actions。永不写气泡、永不弹 error chip。
 _EXTRACTION_LANES = frozenset({"capture", "dream"})
 _WAKE_SYSTEM_PROMPT = (
     "You are the user's companion. This is a PROACTIVE moment — the user has not "
-    "just spoken. Look at the conversation so far. If there is something genuine, "
-    "specific, and worth saying right now — a follow-up, a thought, a check-in — say "
-    "it naturally in your own voice. If there is nothing worth saying, reply with an "
-    "empty message; staying silent is correct and expected."
+    "just spoken. Look at the conversation so far. A perception_glance is only a "
+    "hint for deciding whether to look deeper; it is not a checklist to report. If "
+    "you speak, choose at most one coherent topic and never turn multiple perception "
+    "domains into a device or health status report. Use a perception tool when an "
+    "exact reading is genuinely needed. If there is no specific, natural reason to "
+    "reach out, reply with an empty message; silence is correct."
 )
 _WAKE_NUDGE = "(A quiet moment has passed. Reach out only if something is genuinely worth saying right now.)"
 _SCHEDULED_WAKE_SYSTEM_PROMPT = (
@@ -912,9 +869,10 @@ _SCHEDULED_WAKE_SYSTEM_PROMPT = (
     "with a generic check-in."
 )
 # screen_watch lane (Task 3): a wake grounded on recent shared-screen frames rather
-# than a perception snapshot. Its own system prompt sits beside _WAKE_SYSTEM_PROMPT;
-# _run_wake selects it only for lane=="screen_watch". Silence is still the correct
-# answer most ticks (inherits the "weak wake sleeps" empty_reply path).
+# than an ambient perception glance. Its own system prompt sits beside
+# _WAKE_SYSTEM_PROMPT; _run_wake selects it only for lane=="screen_watch". Silence
+# is still the correct answer most ticks (inherits the "weak wake sleeps" empty_reply
+# path).
 _SCREEN_WATCH_SYSTEM_PROMPT = (
     "You are the user's personal companion, quietly watching the screen they are sharing. "
     "Recent frame availability is provided as grounding context; use the screen tools "
@@ -953,6 +911,7 @@ _DEGENERATE_REPLY_ERROR_CLASS = "upstream_unavailable"
 # job_failed_reasons aggregation instead of hiding behind a plain sleep.
 _PROTOCOL_FRAGMENT_ERROR_CLASS = "upstream_unavailable"
 _PROTOCOL_FRAGMENT_REASON = "protocol_fragment_suppressed"
+_MALFORMED_SELF_THINKING_REASON = "malformed_self_thinking_suppressed"
 
 
 def _torn_protocol_evidence(text: str, reasoning: str, *, lane: str) -> str:
@@ -1044,6 +1003,8 @@ def _safe_failure_code(scope: str, exc: BaseException) -> str:
             "degenerate_reply_suppressed",
             "empty_reply",
             "no_user_messages",
+            _PROTOCOL_FRAGMENT_REASON,
+            _MALFORMED_SELF_THINKING_REASON,
         }:
             kind = raw
         elif raw == _COVERAGE_INCOMPLETE or raw.startswith(
@@ -1079,6 +1040,48 @@ def _safe_failure_code(scope: str, exc: BaseException) -> str:
     return f"{scope}:{kind}"[:120]
 
 
+_EXTRACTION_FAILURE_REASONS = frozenset(
+    {
+        "capture_batch_frontier_unavailable",
+        "capture_commit_protocol_unavailable",
+        "capture_no_memory_actions",
+        "capture_oldest_reader_unavailable",
+        "capture_provider_authorization_unavailable",
+        "capture_provider_call_cancelled",
+        "capture_provider_fence_incomplete",
+        "capture_provider_result_invalid",
+        "dream_no_memory_actions",
+        "empty_reply",
+        "extraction_memory_writer_unavailable",
+        "memory_occurred_at_required",
+        "missing_cards_list",
+        "missing_consolidations_list",
+        "no_json_object",
+        "not_an_object",
+        "semantic_validation_failed_after_retry",
+    }
+)
+
+
+def _extraction_failure_code(exc: BaseException) -> str:
+    """Preserve expected extraction causes without persisting raw messages."""
+    raw = str(exc or "").strip()
+    provider_code = v2_extraction.provider_failure_code_from_reason(raw)
+    if provider_code is not None:
+        return f"extraction_failed:{provider_code}"
+    if raw.startswith("json_decode_error:"):
+        return "extraction_failed:json_decode_error"
+    if raw.startswith("invalid_card_content_after_retry:"):
+        return "extraction_failed:invalid_card_content_after_retry"
+    if raw.startswith("invalid_card_content:"):
+        return "extraction_failed:invalid_card_content"
+    if raw.startswith("extraction_memory_write_rejected:"):
+        return "extraction_failed:memory_write_rejected"
+    if raw in _EXTRACTION_FAILURE_REASONS:
+        return f"extraction_failed:{raw}"
+    return _safe_failure_code("extraction_failed", exc)
+
+
 def _turn_failure_error_class(exc: BaseException) -> str:
     """Classify V2 foreground failures through the shared notice catalog."""
     if isinstance(exc, DedicatedVisionUnavailable):
@@ -1095,6 +1098,8 @@ def _turn_failure_error_class(exc: BaseException) -> str:
     if isinstance(exc, TurnError) and str(exc) in {
         "degenerate_reply_suppressed",
         "empty_reply",
+        _PROTOCOL_FRAGMENT_REASON,
+        _MALFORMED_SELF_THINKING_REASON,
     }:
         return "reply_parse_failed"
     if isinstance(exc, TurnError) and (
@@ -1252,6 +1257,9 @@ class TurnDeps:
     # 任意一项可为 ""）：capture/dream prompt 需要的记忆上下文（enclave 解密明文）。取数失败
     # → 降级为空上下文，不失败 job（spec §3.5）。
     read_memory_context: Callable[[str], dict] | None = None
+    # Dream-specific reader may fetch full selected card bodies.  When absent,
+    # tests/legacy assembly fall back to read_memory_context.
+    read_dream_memory_context: Callable[[str], dict] | None = None
     # user_id -> (all rendered Garden cards, exact card count). Unlike
     # read_memory_context this is fail-loud and rejects any truncated read.
     read_profile_cards: Callable[[str], tuple[str, int]] | None = None
@@ -1537,6 +1545,8 @@ async def _dispatch_mixed_tool_calls(
             mutations.append(("mcp", tc))
         elif mcp_turn.handles(tc.name):
             reads.append(("mcp", tc))
+        elif tc.name == cap_tool_schema.MEMORY_ORGANIZE_TOOL:
+            mutations.append(("platform", tc))
         elif tc.name in cap_registry.WRITE_ACTIONS:
             mutations.append(("platform", tc))
         else:
@@ -1595,7 +1605,11 @@ async def _dispatch_mixed_tool_calls(
                         if inspect.isawaitable(prepared):
                             await prepared
             continue
-        if kind == "platform" and prepare_platform_mutation is not None:
+        if (
+            kind == "platform"
+            and tc.name in cap_registry.WRITE_ACTIONS
+            and prepare_platform_mutation is not None
+        ):
             prepared = prepare_platform_mutation(tc)
             if inspect.isawaitable(prepared):
                 await prepared
@@ -2195,7 +2209,7 @@ def _make_trajectory_recorder(
 ) -> v2_trajectory.TrajectoryRecorder | None:
     if deps.seal_trajectory_payload is None:
         return None
-    return v2_trajectory.TrajectoryRecorder(
+    recorder = v2_trajectory.TrajectoryRecorder(
         job_id=job["id"],
         user_id=str(job["user_id"]),
         seal=deps.seal_trajectory_payload,
@@ -2203,10 +2217,13 @@ def _make_trajectory_recorder(
         append_batch=jobs_store.append_trajectory_events_batch,
         attempt_identity=int(job.get("attempt_count") or 0),
     )
+    setattr(recorder, _LEDGER_LANE_ATTR, str(job.get("lane") or "unknown"))
+    return recorder
 
 
 _LEDGER_EVENTS = frozenset({"provider_response", "provider_error"})
 _LEDGER_ROUTE_ATTR = "_ledger_route"
+_LEDGER_LANE_ATTR = "_ledger_lane"
 
 
 def _note_provider_attempt(
@@ -2289,11 +2306,17 @@ async def _mirror_provider_attempt(
     if not user_id:
         return
     provider, model = getattr(recorder, _LEDGER_ROUTE_ATTR, ("", ""))
+    ledger_payload = payload
+    if not str(payload.get("lane") or ""):
+        ledger_payload = dict(payload)
+        ledger_payload["lane"] = str(
+            getattr(recorder, _LEDGER_LANE_ATTR, "") or "unknown"
+        )
     await asyncio.to_thread(
         _note_provider_attempt,
         user_id,
         event_kind,
-        payload,
+        ledger_payload,
         job_id=getattr(recorder, "job_id", None),
         provider=provider,
         model=model,
@@ -2750,51 +2773,31 @@ async def _run_trajectory_review_turn(
         await asyncio.gather(lease_keepalive_task, return_exceptions=True)
 
 
-async def _perception_grounding_results(store, *, runtime_token, enclave_sem):
-    """Prefetch safe typed perception scalars as static grounding.
-
-    Without this the agent is perception-BLIND on every lane but screen_watch: the
-    chat system prompt never mentions perception, so asked "how many steps today"
-    the model answered "can't get that" while `perception_snapshot(signals=["steps"])`
-    would have returned the count immediately.
-
-    Signals are passed EXPLICITLY over the full catalog: the capability's default is
-    `FAST_AGENT_PERCEPTION_SIGNALS` (now/location/weather/motion/calendar) and every
-    health signal — steps/sleep/vitals/activity/body — lives in the SLOW set, so the
-    default would reproduce the exact blindness this fixes. Signal COUNT is not a
-    latency cost (the read is a fixed 3 store reads regardless); it costs tokens only,
-    and the block lands after the reusable conversation prefix (at the end of
-    the base context, before any same-turn transcript), so it does not invalidate
-    prompt caching.
-
-    The complete snapshot is *not* safe to place before first-round outbound
-    tools: calendar/reminder titles, app/device/place labels, playback metadata,
-    and similar third-party strings can contain instructions. The eager block is
-    therefore projected through ``_safe_eager_perception_snapshot``; text remains
-    available only through an explicit perception tool read, after which the
-    tool loop removes later web/MCP/task channels.
-
-    Disabled/null values for allowlisted typed fields are kept: the agent must not
-    infer zero from an absent reading. Their interpretation guidance lives in
-    ``context._RUNTIME_CONTEXT_POLICY`` so the changing runtime-data payload
-    remains observations only.
-
-    Returns the `action_results` shape `action_context_str` expects, or None when the
-    prefetch came back empty — `_cap_data` degrades to {} on failure and this is
-    never fatal: the model still has the tool and can fetch perception itself.
-    """
+async def _perception_glance_grounding_results(
+    store,
+    *,
+    runtime_token,
+    enclave_sem,
+    previous_fingerprint: str | None,
+) -> tuple[dict[str, list[dict]] | None, str | None]:
+    """Prefetch one number-free proactive glance and compare it locally."""
     data = await _cap_data(
         store,
-        "perception_snapshot",
+        "perception_glance",
         api_key=None,
         runtime_token=runtime_token,
-        params={"signals": list(_PERCEPTION_GROUNDING_SIGNALS)},
+        params={"days": 30},
         enclave_sem=enclave_sem,
     )
-    safe_data = _safe_eager_perception_snapshot(data)
-    if not safe_data:
-        return None
-    return {"perception_snapshot": [{"ok": True, "data": safe_data}]}
+    glance = data.get("glance") if isinstance(data, dict) else None
+    if not isinstance(glance, dict) or not glance:
+        return None, None
+    fingerprint = perception_glance_fingerprint(glance)
+    prompt_data = {
+        "glance": glance,
+        "glance_changed": fingerprint != previous_fingerprint,
+    }
+    return {"perception_glance": [{"ok": True, "data": prompt_data}]}, fingerprint
 
 
 async def _cap_data(
@@ -2804,7 +2807,7 @@ async def _cap_data(
     调用方（如 `_run_wake` 的 screen_watch screen_recent 预取）容忍空结果，不是必须成功
     的前提，模型自己会看到空 grounding context 并据此决定要不要再发 tool_call 补查。
 
-    enclave-bound（spec §11 R3）：capability 调用可能触达 enclave（如 perception_snapshot
+    enclave-bound（spec §11 R3）：capability 调用可能触达 enclave（如 perception_glance
     的解密读），跟 executor._run_one 的 capability 调用一样必须过 enclave_sem，否则多 worker
     并发预取会绕开闸门直接打容量有限的共享 enclave。enclave_sem 为 None（部分单测直调）时不设闸——
     与 executor._run_one/process_job 对 enclave_sem 的处理口径一致。"""
@@ -3727,6 +3730,79 @@ def _make_provider_usage_dispatcher(
         return results
 
     return _dispatch
+
+
+_DREAM_TOOL_ENABLED = os.environ.get(
+    "FEEDLING_V2_DREAM_ENABLED", "0"
+).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _dream_tool_enabled_for_user(user_id: str) -> bool:
+    """Fail closed on both the deployment switch and the user's Dream switch."""
+
+    if not _DREAM_TOOL_ENABLED:
+        return False
+    settings = db.get_blob_strict(str(user_id), "proactive_settings")
+    if settings is None:
+        return True
+    if not isinstance(settings, dict):
+        return False
+    return bool(settings.get("dream_enabled", True))
+
+
+async def _dispatch_memory_organize_tool(user_id: str, tc) -> ToolResult:
+    """Force-enqueue Dream without bypassing any Dream execution safety checks."""
+
+    try:
+        enabled = await asyncio.to_thread(_dream_tool_enabled_for_user, user_id)
+    except Exception:  # noqa: BLE001 — unreadable switch fails closed, stays explainable
+        enabled = False
+    if not enabled:
+        return ToolResult(
+            call_id=tc.id,
+            content=json.dumps(
+                {
+                    "status": "disabled",
+                    "message": "整理功能暂时关闭",
+                },
+                ensure_ascii=False,
+            ),
+        )
+    try:
+        job_id, coalesced = await asyncio.to_thread(
+            jobs_store.enqueue_job,
+            user_id,
+            "dream",
+            reason="user_requested",
+        )
+    except Exception:  # noqa: BLE001 — tool failure must remain model-visible
+        return ToolResult(
+            call_id=tc.id,
+            content=json.dumps(
+                {
+                    "status": "error",
+                    "message": "记忆整理暂时无法开始",
+                },
+                ensure_ascii=False,
+            ),
+        )
+    if not coalesced:
+        await asyncio.to_thread(core_wake_bus.notify, "v2_jobs", user_id)
+    return ToolResult(
+        call_id=tc.id,
+        content=json.dumps(
+            {
+                "status": "coalesced" if coalesced else "queued",
+                "job_id": str(job_id),
+                "message": (
+                    "已合并到正在进行的记忆整理"
+                    if coalesced
+                    else "已开始后台整理，完成的部分会体现在记忆花园里"
+                ),
+            },
+            ensure_ascii=False,
+        ),
+    )
 
 
 def _memory_tool_actions(raw_actions) -> list[dict]:
@@ -4888,6 +4964,110 @@ async def _rebalance_summary_frontier(
     )
 
 
+_CHECKPOINT_EXHAUSTION_DETAILS = frozenset(
+    {
+        "empty_rollup_candidate",
+        "single_segment_exceeds_rollup_input",
+        "fanout_run_exceeds_rollup_input",
+        "frontier_head_exceeds_rollup_input",
+        "no_reducing_rollup_candidate",
+        "checkpoint_work_budget_exhausted",
+        "invalid_checkpoint_output",
+        "checkpoint_cas_no_progress",
+        "checkpoint_pass_budget_exhausted",
+        "materialized_prompt_view_over_target",
+    }
+)
+
+
+def _checkpoint_degradation_detail(exc: BaseException) -> str:
+    """Return an allowlisted, content-free checkpoint reason.
+
+    Arbitrary ``.detail`` / ``.code`` attributes are untrusted just like an
+    exception message: a provider SDK or adapter can put credentials or user
+    content there.  Only details minted by our own frontier exception are
+    eligible for plaintext telemetry; everything else is reduced to its class.
+    """
+    if isinstance(exc, v2_summary_frontier.SummaryFrontierExhausted):
+        detail = str(exc.detail or "")
+        if detail in _CHECKPOINT_EXHAUSTION_DETAILS:
+            return detail
+        return "summary_frontier_exhausted"
+    if isinstance(exc, (asyncio.TimeoutError, TimeoutError)):
+        return "checkpoint_timeout"
+    type_name = re.sub(r"[^a-z0-9_]", "", type(exc).__name__.lower())[:64]
+    return f"checkpoint_{type_name}" if type_name else "checkpoint_error"
+
+
+async def _rebalance_summary_frontier_best_effort(
+    user_id: str,
+    deps: TurnDeps,
+    *,
+    lane: str,
+    phase: str,
+    provider_config: Any,
+    enclave_sem: "asyncio.Semaphore | None",
+    claimed_by: str | None = None,
+    job_id=None,
+    add_usage: Callable[[dict | None], None] | None = None,
+    trajectory_recorder: "v2_trajectory.TrajectoryRecorder | None" = None,
+    deterministic_coverage: bool = False,
+    timeout_sec: float = 30.0,
+) -> bool:
+    """Run an optional checkpoint without undoing an already-durable leaf.
+
+    Lease/control cancellation and a corrupt frontier remain fatal.  Every
+    other checkpoint-local failure is a bounded degradation: the exact leaf
+    coverage is already durable and a later maintenance turn can retry the
+    roll-up.  This distinction prevents post-fold optimization failures from
+    being counted as if the fold itself failed.
+    """
+    try:
+        if not math.isfinite(float(timeout_sec)) or float(timeout_sec) <= 0:
+            raise asyncio.TimeoutError
+        await asyncio.wait_for(
+            _rebalance_summary_frontier(
+                user_id,
+                deps,
+                provider_config=provider_config,
+                enclave_sem=enclave_sem,
+                claimed_by=claimed_by,
+                job_id=job_id,
+                add_usage=add_usage,
+                trajectory_recorder=trajectory_recorder,
+                deterministic_coverage=deterministic_coverage,
+            ),
+            timeout=float(timeout_sec),
+        )
+        return True
+    except (LostJobLease, RuntimeModeChanged, asyncio.CancelledError):
+        raise
+    except v2_summary_frontier.SummaryFrontierIntegrityError:
+        raise
+    except Exception as exc:  # noqa: BLE001 — checkpoint is optional here
+        detail = _checkpoint_degradation_detail(exc)
+        _report_turn_progress("compaction_checkpoint_degraded")
+        await _record_trajectory(
+            trajectory_recorder,
+            "compaction_checkpoint_degraded",
+            {
+                "lane": str(lane or "unknown")[:40],
+                "phase": str(phase or "unknown")[:40],
+                "error_class": type(exc).__name__,
+                "detail": detail,
+            },
+            best_effort=True,
+        )
+        log.warning(
+            "[v2.worker] checkpoint degraded user=%s lane=%s phase=%s code=%s",
+            user_id,
+            lane,
+            phase,
+            detail,
+        )
+        return False
+
+
 async def _bound_materialized_summary(
     user_id: str,
     summary: str,
@@ -5289,9 +5469,11 @@ async def _run_compaction(
             )
             _report_turn_progress("deterministic_compaction_batch_complete")
             if ok:
-                await _rebalance_summary_frontier(
+                await _rebalance_summary_frontier_best_effort(
                     user_id,
                     deps,
+                    lane="maintenance",
+                    phase="post_fold_deterministic",
                     provider_config=provider_config,
                     enclave_sem=enclave_sem,
                     claimed_by=claimed_by,
@@ -5346,53 +5528,18 @@ async def _run_compaction(
         # A checkpoint increments the head version; reading first would waste
         # one provider call on a predictably stale leaf and force a retry job.
         if deps.read_summary_frontier is not None:
-            try:
-                await _rebalance_summary_frontier(
-                    user_id,
-                    deps,
-                    provider_config=provider_config,
-                    enclave_sem=enclave_sem,
-                    claimed_by=claimed_by,
-                    job_id=job_id,
-                    add_usage=tm.add_call if tm is not None else None,
-                    trajectory_recorder=trajectory_recorder,
-                )
-            except (LostJobLease, RuntimeModeChanged, asyncio.CancelledError):
-                # Lifecycle, not the checkpoint's own failure — this worker no
-                # longer owns the job and must not keep folding.
-                raise
-            except v2_summary_frontier.SummaryFrontierIntegrityError:
-                # The persisted cover cannot prove complete coverage. Folding on
-                # top of a frontier we cannot trust would extend the damage, so
-                # this one stays fatal.
-                raise
-            except Exception as rebalance_exc:  # noqa: BLE001 — see below
-                # A checkpoint only reduces how many nodes a later prompt has to
-                # read; the fold below is the actual work. Letting a failed
-                # checkpoint skip it (it sits ABOVE the tail read) meant the
-                # backlog could never drain, and since the roll-up input does
-                # not change, it failed identically on every retry — including
-                # manual re-enqueues. usr_7f30 on prod sat at a frozen watermark
-                # for days on exactly this, with `model_calls=1` proving the one
-                # provider call was the checkpoint, never the fold.
-                _report_turn_progress("compaction_checkpoint_degraded")
-                await _record_trajectory(
-                    trajectory_recorder,
-                    "compaction_checkpoint_degraded",
-                    {
-                        "lane": "maintenance",
-                        "error_class": type(rebalance_exc).__name__,
-                        "detail": str(
-                            getattr(rebalance_exc, "detail", "") or ""
-                        )[:80],
-                    },
-                    best_effort=True,
-                )
-                log.warning(
-                    "[v2.worker] checkpoint rebalance degraded for %s: %s",
-                    user_id,
-                    type(rebalance_exc).__name__,
-                )
+            await _rebalance_summary_frontier_best_effort(
+                user_id,
+                deps,
+                lane="maintenance",
+                phase="pre_fold",
+                provider_config=provider_config,
+                enclave_sem=enclave_sem,
+                claimed_by=claimed_by,
+                job_id=job_id,
+                add_usage=tm.add_call if tm is not None else None,
+                trajectory_recorder=trajectory_recorder,
+            )
         async with enclave_sem:
             if deps.read_summary_with_seq is not None and (
                 deps.read_compaction_tail_after_seq is not None
@@ -5604,9 +5751,11 @@ async def _run_compaction(
                     min(_COMPACTION_BATCH, fold_limit + _BATCH_CAP_INCREMENT),
                 )
             if segmented_write:
-                await _rebalance_summary_frontier(
+                await _rebalance_summary_frontier_best_effort(
                     user_id,
                     deps,
+                    lane="maintenance",
+                    phase="post_fold",
                     provider_config=provider_config,
                     enclave_sem=enclave_sem,
                     claimed_by=claimed_by,
@@ -6354,10 +6503,15 @@ async def _ensure_prompt_coverage(
                 )
             )
             if wrote:
-                await _within_deadline(
-                    lambda: _rebalance_summary_frontier(
+                # Leave enough budget for the next authoritative coverage read;
+                # the checkpoint is optional, that verification is not.
+                checkpoint_budget = deadline_at - time.monotonic() - 2.0
+                if checkpoint_budget > 0:
+                    await _rebalance_summary_frontier_best_effort(
                         user_id,
                         deps,
+                        lane="prompt_catchup",
+                        phase="post_fold_deterministic",
                         provider_config=provider_config,
                         enclave_sem=enclave_sem,
                         claimed_by=claimed_by,
@@ -6365,8 +6519,8 @@ async def _ensure_prompt_coverage(
                         add_usage=add_usage,
                         trajectory_recorder=trajectory_recorder,
                         deterministic_coverage=True,
+                        timeout_sec=min(30.0, checkpoint_budget),
                     )
-                )
             _report_turn_progress("prompt_deterministic_catchup_batch_complete")
             await _record_trajectory(
                 trajectory_recorder,
@@ -6673,18 +6827,23 @@ async def _ensure_prompt_coverage(
                 )
             )
             if wrote:
-                await _within_deadline(
-                    lambda: _rebalance_summary_frontier(
+                # Leave enough budget for the next authoritative coverage read;
+                # the checkpoint is optional, that verification is not.
+                checkpoint_budget = deadline_at - time.monotonic() - 2.0
+                if checkpoint_budget > 0:
+                    await _rebalance_summary_frontier_best_effort(
                         user_id,
                         deps,
+                        lane="prompt_catchup",
+                        phase="post_fold",
                         provider_config=provider_config,
                         enclave_sem=enclave_sem,
                         claimed_by=claimed_by,
                         job_id=job_id,
                         add_usage=add_usage,
                         trajectory_recorder=trajectory_recorder,
+                        timeout_sec=min(30.0, checkpoint_budget),
                     )
-                )
         elif new_watermark_seq is not None:
             await _within_deadline(
                 lambda: asyncio.to_thread(
@@ -6743,7 +6902,7 @@ async def _run_wake(
     prompt 组装：读 summary+tail（同 chat 路径的 D1 读法）+ 固定的 `_WAKE_NUDGE`。
     `system_prompt`：`_SCREEN_WATCH_SYSTEM_PROMPT`（screen_watch lane）或
     `_WAKE_SYSTEM_PROMPT`（其余三条 wake lane）。screen_watch 的 `screen_recent`、
-    普通 wake 的 perception snapshot，以及由感知事件路由进 heartbeat job 的触发上下文，
+    普通 wake 的 perception glance，以及由感知事件路由进 heartbeat job 的安全触发标记，
     都通过 `_make_build_messages_fn` 的 `extra_context` 参数（复用
     `context.action_context_str` 的渲染）注入。它们是回合开始时取一次的低信任静态
     grounding，不随 tool-loop 轮次增长，跟 `prior_tool_results`（每轮动态积累的工具
@@ -7040,28 +7199,23 @@ async def _run_wake(
                     break
                 await asyncio.sleep(0.05)
             if perception_wake_context:
-                prompt_context: list[dict] = []
                 for raw_item in perception_wake_context[:10]:
                     if not isinstance(raw_item, dict):
                         continue
-                    item = dict(raw_item)
                     try:
                         consumed_perception_context_seq = max(
                             consumed_perception_context_seq,
-                            int(item.pop("_context_seq", 0) or 0),
+                            int(raw_item.get("_context_seq", 0) or 0),
                         )
                         wake_observed_generation = max(
                             wake_observed_generation,
-                            int(item.pop("_input_generation", 0) or 0),
+                            int(raw_item.get("_input_generation", 0) or 0),
                         )
                     except (TypeError, ValueError, OverflowError):
-                        item.pop("_context_seq", None)
-                        item.pop("_input_generation", None)
-                    prompt_context.append(item)
-                perception_wake_context = prompt_context
+                        pass
                 # Keep event-controlled text out of the authoritative nudge.
-                # The actual digest/origins are rendered below as explicitly
-                # untrusted runtime data.
+                # Only a fixed trigger projection is rendered below as untrusted
+                # runtime data; raw event details remain internal accounting input.
                 wake_nudge = (
                     "A recent perception change may be worth responding to. "
                     "Use the untrusted runtime context below, and stay silent "
@@ -7080,8 +7234,8 @@ async def _run_wake(
         }]
 
         # screen_watch lane grounds on recent shared-screen availability (Task 3).
-        # Fetch ONLY screen_recent — NOT perception_snapshot: the resident explicitly
-        # sets perception_digest=None for screen-watch jobs
+        # Fetch ONLY screen_recent — no perception_glance or perception_snapshot: the
+        # resident explicitly sets perception_digest=None for screen-watch jobs
         # (chat_resident_consumer.py:6611). Caption/app/window text is pull-only;
         # putting it in the first prompt would let screen content choose an outbound
         # web/MCP/task call before any execution fence can activate.
@@ -7093,7 +7247,8 @@ async def _run_wake(
         # (FEEDLING_V2_ENCLAVE_CONCURRENCY defaults to 2, so a naive test would pass
         # while production wedges wherever the value is 1). The gate still bounds the
         # call — _cap_data holds the semaphore for its own turn.
-        screen_results = None
+        grounding_results = None
+        glance_fingerprint = None
         if lane == "screen_watch":
             data = await _cap_data(
                 store,
@@ -7104,23 +7259,37 @@ async def _run_wake(
             )
             safe_screen = _safe_eager_screen_metadata(data)
             if safe_screen:
-                screen_results = {
+                grounding_results = {
                     "screen_recent": [{"ok": True, "data": safe_screen}]
                 }
-        else:
-            # Every OTHER wake lane grounds on the user's perception instead: a
-            # proactive message that cannot see how the user slept / moved / where
-            # they are has nothing real to open with.
-            screen_results = await _perception_grounding_results(
-                store, runtime_token=token, enclave_sem=enclave_sem
+        elif lane in {"heartbeat", "manual_wake"}:
+            prior = await asyncio.to_thread(jobs_store.get_runtime_state, user_id)
+            grounding_results, glance_fingerprint = (
+                await _perception_glance_grounding_results(
+                    store,
+                    runtime_token=token,
+                    enclave_sem=enclave_sem,
+                    previous_fingerprint=(
+                        str(
+                            prior.get(
+                                "last_completed_perception_glance_fingerprint"
+                            )
+                            or ""
+                        )
+                        or None
+                    ),
+                )
             )
-        if perception_wake_context:
-            if screen_results is None:
-                screen_results = {}
-            screen_results["perception_wake"] = [
-                {"ok": True, "data": item}
-                for item in perception_wake_context[:10]
-                if isinstance(item, dict)
+        safe_perception_events = project_perception_wake_events(
+            perception_wake_context
+        )
+        if safe_perception_events:
+            grounding_results = grounding_results or {}
+            # Static action folding unwraps a singleton successful run. Keep the
+            # projected marker collection inside that run so runtime_data retains
+            # a stable list shape even when exactly one event triggered the wake.
+            grounding_results["perception_wake"] = [
+                {"ok": True, "data": safe_perception_events}
             ]
 
         # Pin effects to the generation admitted/claimed for this job, never a
@@ -7259,7 +7428,8 @@ async def _run_wake(
         # answer, so it must never be offered here — unconditionally, not
         # gated by the kill switch (that gate is chat-lane's Task 6 concern).
         wake_disabled_tool_names = wake_disabled_web_tool_names | {
-            cap_tool_schema.PROVIDER_USAGE_TOOL
+            cap_tool_schema.PROVIDER_USAGE_TOOL,
+            cap_tool_schema.MEMORY_ORGANIZE_TOOL,
         }
 
         dispatch_task_batch = _make_task_batch_dispatcher(
@@ -7284,6 +7454,8 @@ async def _run_wake(
             await _fence_wake_effect("tool dispatch")
 
             async def _dispatch_platform_one(tc) -> ToolResult:
+                if tc.name == cap_tool_schema.MEMORY_ORGANIZE_TOOL:
+                    return await _dispatch_memory_organize_tool(user_id, tc)
                 try:
                     (result,) = await v2_executor.dispatch_tool_calls(
                         [tc],
@@ -7500,7 +7672,7 @@ async def _run_wake(
                     _wake_self_thinking_text = _wst_thinking
                 elif _wst_status == _st_wake.FAILED:
                     if final:
-                        raise TurnError("degenerate_reply_suppressed")
+                        raise TurnError(_MALFORMED_SELF_THINKING_REASON)
                     return
             if text and _is_degenerate_reply(text):
                 log.warning(
@@ -7586,6 +7758,19 @@ async def _run_wake(
                     payload[v2_effect_outbox.REPLY_SOURCE_FENCE_KEY] = {
                         "claimed_by": claimed_by,
                     }
+                if (
+                    final
+                    and lane == "heartbeat"
+                    and deps.read_perception_wake_context is not None
+                    and not perception_wake_context
+                    and glance_fingerprint is not None
+                ):
+                    # The final-reply sink terminalizes the source job. Carry
+                    # this prompt-invisible marker into that same transaction
+                    # so a crash cannot leave completion without its glance.
+                    payload[
+                        v2_effect_outbox.PERCEPTION_GLANCE_FINGERPRINT_KEY
+                    ] = glance_fingerprint
             if final and scheduled_activity_events:
                 payload.update(
                     _activity_extra(
@@ -7843,8 +8028,8 @@ async def _run_wake(
                 summary=summary,
                 tail=wake_tail,
                 extra_context=(
-                    context.action_context_str(screen_results)
-                    if screen_results
+                    context.action_context_str(grounding_results)
+                    if grounding_results
                     else ""
                 ),
                 trusted_system_blocks=trusted_system_blocks,
@@ -8000,6 +8185,16 @@ async def _run_wake(
             raise
 
         successor_id = None
+        heartbeat_terminalized = False
+        completed_glance_fingerprint = (
+            glance_fingerprint
+            if (
+                lane == "heartbeat"
+                and deps.read_perception_wake_context is not None
+                and not perception_wake_context
+            )
+            else None
+        )
         if lane == "heartbeat" and deps.read_perception_wake_context is not None:
             completed, successor_id = await asyncio.to_thread(
                 jobs_store.finish_wake_job,
@@ -8009,20 +8204,37 @@ async def _run_wake(
                 context_stream="v2_perception_wake_context",
                 consumed_context_seq=consumed_perception_context_seq,
                 clear_wake_backoff=(lane in _FAIL_BACKOFF_WAKE_LANES),
+                completed_perception_glance_fingerprint=(
+                    completed_glance_fingerprint
+                ),
             )
+            heartbeat_terminalized = completed
         else:
             # Some reply-effect sinks terminalize the source job atomically
             # with final publication. Preserve the established non-heartbeat
             # behavior: a false return here is therefore not necessarily lease
-            # loss. Heartbeat's successor-aware path above owns its own exact
-            # terminalization and must return true.
-            await asyncio.to_thread(
+            # loss. An optional-reader heartbeat must still prove that either
+            # this call completed the job or the exact owned source was already
+            # completed by its final-reply effect.
+            transitioned = await asyncio.to_thread(
                 jobs_store.mark_completed,
                 job_id,
                 claimed_by=claimed_by,
                 clear_wake_backoff=(lane in _FAIL_BACKOFF_WAKE_LANES),
             )
-            completed = True
+            if lane == "heartbeat":
+                heartbeat_terminalized = transitioned
+                if not heartbeat_terminalized:
+                    source_status = await asyncio.to_thread(
+                        jobs_store.get_job_status,
+                        job_id,
+                        user_id=user_id,
+                        claimed_by=claimed_by,
+                    )
+                    heartbeat_terminalized = source_status == "completed"
+                completed = heartbeat_terminalized
+            else:
+                completed = True
         if not completed:
             raise LostJobLease("wake job ownership lost during completion")
         if successor_id is not None:
@@ -8652,10 +8864,15 @@ async def _run_extraction(
         # post_enclave 往返；read_tail 逐条解密），所以**必须同在 enclave_sem 闸内**——enclave
         # 是全系统共享、容量有限的解密代理，正是整个子项目要保护的东西（spec §4）。
         async with enclave_sem:
-            if deps.read_memory_context is not None:
+            memory_context_reader = (
+                deps.read_dream_memory_context
+                if lane == "dream" and deps.read_dream_memory_context is not None
+                else deps.read_memory_context
+            )
+            if memory_context_reader is not None:
                 try:
                     ctx = (
-                        await asyncio.to_thread(deps.read_memory_context, user_id) or {}
+                        await asyncio.to_thread(memory_context_reader, user_id) or {}
                     )
                 except Exception as e:  # noqa: BLE001 — 上下文取数失败 → 降级，不失败（spec §3.5）
                     log.warning(
@@ -8762,6 +8979,8 @@ async def _run_extraction(
                 should_retry=is_card_format_error,
                 build_prompt=build_capture_retry_prompt,
                 parse=lambda reply: parse_capture_cards(reply, strict=False),
+                semantic_reasons=capture_semantic_retry_reasons,
+                build_semantic_prompt=build_capture_semantic_retry_prompt,
             )
         else:
             prompt = build_dream_prompt(
@@ -8797,6 +9016,7 @@ async def _run_extraction(
                     threads=ctx.get("threads", ""),
                     identity=ctx.get("identity", ""),
                     window=window,
+                    cards=ctx.get("cards", ""),
                 )
         if lane == "capture" and prompt_tail:
             await _ensure_capture_not_halted("provider_authorization")
@@ -8959,6 +9179,17 @@ async def _run_extraction(
             _report_turn_progress("extraction_provider_complete")
         if reason:
             raise RuntimeError(reason)
+        if lane == "dream" and items:
+            items = await _review_dream_consolidations(
+                user_id,
+                list(items),
+                card_items=list(ctx.get("card_items") or []),
+                provider_config=provider_config,
+                job_id=job_id,
+                claimed_by=claimed_by,
+                tm=tm,
+                trajectory_recorder=trajectory_recorder,
+            )
         if not items and lane != "capture":
             await _complete_extraction(item_count=0)
             if tm is not None:
@@ -9032,12 +9263,18 @@ async def _run_extraction(
                     "card_user_token_residual",
                     {"lane": lane, "count": leak_count, "cards": len(items)},
                 )
-            actions, _added, _superseded = to_actions(
-                items,
-                occurred_at=occurred_at,
-                source_ids=source_ids,
-                build_envelope=_build_extraction_envelope,
-            )
+            action_kwargs = {
+                "occurred_at": occurred_at,
+                "source_ids": source_ids,
+                "build_envelope": _build_extraction_envelope,
+            }
+            if lane == "dream" and "card_items" in ctx:
+                # Bind every destructive result to the exact full-text cards
+                # disclosed for this run.  Unknown, overlapping, fresh Dream
+                # output, and lossy 1:1 rewrites are rejected deterministically
+                # by the pure mapper before any write reaches Memory Garden.
+                action_kwargs["existing_cards"] = list(ctx.get("card_items") or [])
+            actions, _added, _superseded = to_actions(items, **action_kwargs)
         if claimed_by and not await asyncio.to_thread(
             jobs_store.renew_job_lease,
             job_id,
@@ -9160,7 +9397,7 @@ async def _run_extraction(
             tm.flush(failed=True, status="turns_halted")
         return "failed"
     except Exception as e:  # noqa: BLE001 — 背景 job：静默 mark_failed，绝不 surface/写气泡
-        code = _safe_failure_code("extraction_failed", e)
+        code = _extraction_failure_code(e)
         if lane != "capture" and not extraction_status_recorded:
             try:
                 await _record_extraction_status("failed")
@@ -10301,7 +10538,10 @@ async def process_job(
             disabled_mutation_tool_names = frozenset(
                 set(cap_registry.WRITE_ACTIONS)
                 | set(mcp_mutating_names)
-                | {cap_tool_schema.FILE_REPLY_TOOL}
+                | {
+                    cap_tool_schema.FILE_REPLY_TOOL,
+                    cap_tool_schema.MEMORY_ORGANIZE_TOOL,
+                }
             )
             offered_mcp_tool_specs = tuple(
                 spec
@@ -10353,14 +10593,6 @@ async def process_job(
         # would therefore fail to bound the whole-turn MCP contribution.
         mcp_wall_budget = _McpTurnWallBudget(MCP_TURN_WALL_BUDGET_SEC)
 
-        # Perception grounding for the chat turn. Sits HERE, beside the MCP load and
-        # deliberately OUTSIDE the `async with enclave_sem` block above: `_cap_data`
-        # acquires enclave_sem itself and asyncio.Semaphore is not reentrant (see its
-        # docstring / the wake lane's identical note) — nesting deadlocks at
-        # FEEDLING_V2_ENCLAVE_CONCURRENCY=1.
-        perception_results = await _perception_grounding_results(
-            store, runtime_token=runtime_token, enclave_sem=enclave_sem
-        )
         pending_schedule_results = None
         if deps.read_pending_scheduled_wake_context is not None:
             try:
@@ -10435,6 +10667,8 @@ async def process_job(
                 # One call per coroutine lets platform reads share the exact same
                 # worker-level gate as MCP reads. Executor still owns validation,
                 # provenance, encrypted outbox writes, and terminal write failures.
+                if tc.name == cap_tool_schema.MEMORY_ORGANIZE_TOOL:
+                    return await _dispatch_memory_organize_tool(user_id, tc)
                 try:
                     (result,) = await v2_executor.dispatch_tool_calls(
                         [tc],
@@ -10623,6 +10857,7 @@ async def process_job(
                     for tc in tool_calls
                     if tc.name in mcp_mutating_names
                     or tc.name in cap_registry.WRITE_ACTIONS
+                    or tc.name == cap_tool_schema.MEMORY_ORGANIZE_TOOL
                 }
                 dispatchable_calls = [
                     tc for tc in tool_calls if str(tc.id) not in blocked_by_id
@@ -11197,8 +11432,6 @@ async def process_job(
             return await base_fold_new_messages()
 
         grounding_results: dict[str, Any] = {}
-        if perception_results:
-            grounding_results.update(perception_results)
         if pending_schedule_results:
             grounding_results.update(pending_schedule_results)
         turn_extra_context = (

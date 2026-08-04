@@ -51,7 +51,7 @@ def test_agent_protocol_parses_messages_actions_and_background_request():
         "messages": ["I'll check."],
         "actions": [
             {"type": "send_message", "text": "Starting now."},
-            {"type": "schedule_wake", "at": "2026-06-20T09:00:00+08:00", "tz": "Asia/Shanghai", "note": "check in", "origin_refs": ["msg_1"]},
+            {"type": "schedule_wake", "at": "2026-06-20T09:00:00+08:00", "tz": "Asia/Shanghai", "note": "check in", "origin_refs": ["msg_1"], "repeat": "weekly"},
             {"type": "cancel_wake", "wake_id": "wake_old"},
             {"type": "needs_background", "request": {"tool": "memory.fetch", "ids": ["m1"]}},
         ],
@@ -69,6 +69,7 @@ def test_agent_protocol_parses_messages_actions_and_background_request():
     ]
     assert parsed.needs_background is True
     assert parsed.background_request == {"tool": "memory.fetch", "ids": ["m1"]}
+    assert parsed.actions[2]["repeat"] == "weekly"
 
 
 def test_agent_protocol_malformed_or_internal_fragments_sleep_invisibly():

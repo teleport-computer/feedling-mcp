@@ -37,12 +37,12 @@ def test_schedule_forwards_the_action_shape_apply_turn_actions_expects(monkeypat
 
     monkeypatch.setattr("proactive.scheduled_wake_v2.ScheduledWakeServiceV2", _FakeService)
     res = wake.schedule(_Store(), params={"at": "2026-07-11T18:00", "tz": "Asia/Shanghai",
-                                          "reason": "check in"}).to_dict()
+                                          "reason": "check in", "repeat": "weekly"}).to_dict()
     assert res["ok"] is True
     assert seen["user_id"] == "u_cap_wake"
     assert seen["actions"] == [{"type": "schedule_wake", "at": "2026-07-11T18:00",
                                 "tz": "Asia/Shanghai", "reason": "check in",
-                                "note": "check in"}]
+                                "repeat": "weekly", "note": "check in"}]
 
 
 def test_submit_wake_does_not_enqueue(monkeypatch):
@@ -78,6 +78,10 @@ def test_unified_tool_catalog_offers_the_registered_wake_capabilities():
     specs = {spec.name: spec for spec in tool_schema.build_tool_specs()}
     assert {"schedule_wake", "cancel_wake"} <= specs.keys()
     assert "at" in specs["schedule_wake"].parameters["properties"]
+    assert specs["schedule_wake"].parameters["properties"]["repeat"]["enum"] == [
+        "daily",
+        "weekly",
+    ]
     assert "wake_id" in specs["cancel_wake"].parameters["properties"]
 
 

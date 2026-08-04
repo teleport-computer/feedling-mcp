@@ -152,6 +152,66 @@ account's configured BYOK credential, so the account owner bears those token
 costs. Actual usage depends on message size, summary size, tools, and the
 provider's context limit.
 
+## Genesis plaintext processing
+
+New clients use a two-step flow. `POST /v1/genesis/imports/plaintext/estimate`
+parses and encrypted-stages the upload without making an LLM call, then returns
+per-material `windows` / `est_tokens`, `est_total_tokens`, and an optional
+`recommended_model`. Dedicated Anthropic, DeepSeek, Gemini, OpenAI, and
+OpenRouter configurations receive provider-specific fast-model defaults;
+compatible relays use a bounded model-catalog probe. `POST
+/v1/genesis/imports/plaintext/commit` accepts the
+returned `staged_id` and an optional `distill_model`. The override applies only
+to that Genesis job; the configured chat model is unchanged. Missing, consumed,
+and expired stages return distinct `staged_import_not_found`,
+`staged_import_consumed`, and `staged_import_expired` errors.
+
+Commit publishes every material immediately with `status: queued`, zero
+completed windows, and its total window count. Subsequent status polls replace
+that initial snapshot with processing and completion progress while preserving
+the same complete material list on every frame. For Genesis V2, the foreground
+pass can set `identity_ready: true` while the job remains
+`processing`; the job becomes `done` only after every material reports
+`windows_done == windows_total`. Combined-map deployments reuse foreground
+checkpoints and process every remaining window before completion.
+
+`POST /v1/genesis/imports/plaintext` allows one processing plaintext import per
+account. A second submission returns `409 import_job_active` and the existing
+`active_job_id`; clients should display or poll that job rather than retrying
+the unchanged upload. In-process plaintext workers renew a separate lease every
+15 seconds and persist their process owner. After a same-host backend restart,
+the next status or submission request verifies that the old PID is gone and
+immediately fails the abandoned job as `worker_restarted`, releasing the account
+slot for checkpoint-backed retry. A different host may still be processing the
+job during a rolling deploy, so remote or legacy owners use the 120-second stale
+lease instead of being killed speculatively. Ownership is checked again in the
+atomic update, and live workers renew only jobs they still own. Done and failed
+jobs release the account slot.
+
+The worker uses the first real model request as a canary with a default
+60-second timeout. A timed-out canary ends the job with
+`distill_model_too_slow`; changing to a faster model is required before retry.
+Malformed JSON response bodies are reported as `model_bad_json`. Other provider
+configuration failures retain their specific error class and remediation
+guidance.
+Later provider timeout failures make at most two attempts. This timeout cap does
+not reduce the existing three-attempt budget for provider `429` and retryable
+`5xx` responses.
+
+Each successful map window is checkpointed before its public progress count is
+advanced. The checkpoint's candidates are stored as an encrypted shared
+envelope, not plaintext workflow metadata. Re-submitting the same failed
+`client_job_id` or input resumes that job, skips checkpointed map windows, and
+starts again from the unfinished map or reduction work. Status and onboarding
+validation retain the durable `processed_chunks` count and per-material
+`windows_done` / `windows_total` values after failure; only a completed job
+reports 100 percent.
+
+Job status also exposes `identity_ready` and material entries ordered as AI
+persona, user profile, memory summary, then chat history. Material status uses
+`queued`, `processing`, `failed`, or `done`; `cards` reports the durable mapped
+candidate count instead of a placeholder.
+
 Automatic Runtime V2 heartbeat and agent-scheduled wake failures use a
 persistent per-user exponential retry delay. The delay starts at 60 seconds
 and is capped at one hour; a successful automatic wake clears it. A new

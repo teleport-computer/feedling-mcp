@@ -39,6 +39,22 @@ E2E_KEY_DEEPSEEK=sk-…
 | `vps.py` | VPS 格子流程：本地起真 consumer（子进程）→heartbeat→verify_loop→聊天→删号 |
 | `p0.py` | 编排器 + 结果表（§8 报告格式） |
 
+**专项探针**（不在 p0 编排里，触碰对应功能时手动跑）：
+
+| 文件 | 验什么 | 何时跑 |
+|---|---|---|
+| `repeat_wake_probe.py` | 重复定时提醒：fire 后自动续排 +24h、用**已 fired 的旧 id** 能整串取消、同刻同 repeat 去重、一次性提醒不续排 | 动 `scheduled_wake_v2` / `schedule_wake` 工具面时 |
+| `card_gate_probe.py` | 记忆卡内容闸不误杀真卡 | 动 capture/dream 判据时 |
+| `temporal_probe.py` | 模型真的读到了注入的时间锚点 | 动 V2 上下文组装时 |
+| `turn_failure_smoke.py` | 回合失败的字段/归责能下发到客户端 | 动错误分类或 consumer 兜底时 |
+| `resident_maintenance_smoke.py` | resident 识别/poll/notice/genesis claim | 动 consumer 这几条时 |
+
+`repeat_wake_probe` 的两个坑（写新探针时同样适用）：
+- `/v1/proactive/scheduled/fire` **只触发已到期的**（`due_at <= now`），
+  所以要排在**过去**；排在未来那次 fire 是空转，看起来像"续排没发生"。
+- 断言之间有依赖时要**显式声明前置**——本探针第一版里"取消后无残留 pending"
+  是绿的，但那只是因为上一步压根没排出续排，**假通过**。
+
 ## 判定语义
 
 - **fail**（阻断）：setup / 解锁 / 聊天回环或解密 / 连续性 / 错误气泡非零 / consumer 起不来
@@ -50,3 +66,29 @@ E2E_KEY_DEEPSEEK=sk-…
 - 首轮回复超时 300s（含 hosted runner 冷 spawn）；后续 180s。
 - hermes 格子需要本地 `hermes` CLI + 其自身 profile 可用。
 - P1 全功能清单（协议 §4）暂为半自动：复用本包 client 手工驱动，后续脚本化。
+
+## 处理管线探针(processing_probe)
+
+`docs/testing/TESTING.md` 的「入住/记忆处理」判据的可执行实现。跑真 provider
+的 estimate → commit → status 全链,断言契约、防重、身份先行、分母诚实、
+帧稳定性。
+
+```bash
+python3 -m tools.e2e.processing_probe --list                  # 看格子与 key
+python3 -m tools.e2e.processing_probe                         # 全部已配 key 的 provider
+python3 -m tools.e2e.processing_probe --only hojimi-relay     # 单格
+python3 -m tools.e2e.processing_probe --large                 # 多窗大素材(慢,复刻大导入事故)
+```
+
+**为什么要真跑**:2026-08-03/04 这批上线前,本探针的前身在真跑里抓出四个
+单测与契约测试全绿却真实存在的问题 —— 白名单缺失导致蒸馏 100% 挂、
+combined_map 让 24 窗只蒸 8 窗、后端重启后用户被锁 30 分钟、status 帧
+materials 抖动。共同点:只在「真 provider + 多帧观察」下暴露。
+
+**合并前也能跑**:client 放行 `127.0.0.1`,配合本机 `serve_dev` + dev-seed
+enclave 可以在分支上先真跑一遍(见 docs/testing/TESTING.md 的本地全栈配方),
+再合 test。
+
+**中转站要测两家**:不同中转站 `/models` 的目录格式差异很大(带日期后缀 /
+带方括号标签 / 裸名),推荐链路只测一家不够 —— `relay-openai-compatible`
+与 `hojimi-relay` 两个格子就是为此并存。

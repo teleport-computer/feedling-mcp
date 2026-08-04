@@ -84,6 +84,8 @@ EXPECTED_CORE_BODY_REFS = {
     ("post", "/v1/memory/retype"): "MemoryRetypeRequest",
     ("post", "/v1/perception/report"): "PerceptionReportRequest",
     ("post", "/v1/perception/photo/evaluate"): "PerceptionPhotoEvaluateRequest",
+    ("post", "/v1/agent/web/search"): "WebSearchRequest",
+    ("post", "/v1/agent/web/fetch"): "WebFetchRequest",
 }
 
 EXPECTED_HEADER_OPERATIONS = {
@@ -190,10 +192,12 @@ def test_public_operation_and_parameter_inventory(
     # authenticated resident observer exchange; three mutations carry bodies.
     # 160 since the voice session and OpenAI-compatible Custom LLM endpoints;
     # both accept compatibility JSON envelopes, hence 73 -> 75 bodies.
-    # 161 adds the bodyless unified main-model vision validator; 162 adds the
-    # public runner-fleet health endpoint.
-    assert len(operations) == 162
-    assert sum("requestBody" in operation for operation in operations.values()) == 75
+    # 161 = bodyless unified main-model vision validator; 162 = public runner-fleet
+    # health endpoint (from test); +2 = V1 web execution endpoints
+    # (POST /v1/agent/web/{search,fetch}, both with bodies) → 164 ops, 77 bodies;
+    # Genesis plaintext estimate + commit add two body-bearing operations.
+    assert len(operations) == 166
+    assert sum("requestBody" in operation for operation in operations.values()) == 79
 
     query_operations = {
         key for key, operation in operations.items() if _parameters(operation, "query")
@@ -296,6 +300,22 @@ def test_runtime_success_statuses_and_non_json_media_are_explicit(
             if str(status).startswith("2")
         }
         assert actual == expected, key
+
+    plaintext_responses = operations[("post", "/v1/genesis/imports/plaintext")]["responses"]
+    assert "409" in plaintext_responses
+    assert "import_job_active" in plaintext_responses["409"]["description"]
+
+    estimate_responses = operations[
+        ("post", "/v1/genesis/imports/plaintext/estimate")
+    ]["responses"]
+    assert "201" in estimate_responses
+    assert "no LLM call" in estimate_responses["201"]["description"]
+
+    commit_responses = operations[
+        ("post", "/v1/genesis/imports/plaintext/commit")
+    ]["responses"]
+    assert {"200", "202", "404", "409", "410"} <= set(commit_responses)
+    assert "staged_import_expired" in commit_responses["410"]["description"]
 
     image_responses = operations[
         ("get", "/v1/screen/frames/{frame_id}/image")
@@ -481,7 +501,7 @@ def test_memory_actions_response_exposes_independent_item_outcomes(
     assert {"status", "http_status"} <= set(result_schema["required"])
 
 
-def test_dream_status_documents_daily_capture_banner_fields(
+def test_dream_status_documents_monotonic_capture_banner_fields(
     public_schema: dict[str, Any],
     operations: dict[tuple[str, str], dict[str, Any]],
 ) -> None:
@@ -497,10 +517,7 @@ def test_dream_status_documents_daily_capture_banner_fields(
     assert schema["properties"]["capture_cards_added"] == {
         "type": "integer",
         "minimum": 0,
-        "description": (
-            "Cards actually added on the timestamp's device-local calendar "
-            "day, accumulated across Capture runs."
-        ),
+        "description": "Monotonic total of cards actually added across Capture runs.",
     }
 
 

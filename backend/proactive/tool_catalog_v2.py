@@ -122,7 +122,12 @@ DEFAULT_TOOL_SPECS_V2: tuple[ToolSpecV2, ...] = (
     ),
     ToolSpecV2("send_message", "action", FAST, "Write chat message through DeliveryGate."),
     ToolSpecV2("sleep", "action", FAST, "End turn without visible speech."),
-    ToolSpecV2("schedule_wake", "action", FAST, "Create a durable future wake."),
+    ToolSpecV2(
+        "schedule_wake",
+        "action",
+        FAST,
+        "Create a durable future wake, optionally repeated every 24 hours or 7 days.",
+    ),
     ToolSpecV2("cancel_wake", "action", FAST, "Cancel a durable future wake."),
 )
 

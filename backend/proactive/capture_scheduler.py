@@ -709,16 +709,10 @@ def record_capture_job_status(store, job: Mapping[str, Any], *, status: str, now
             state["last_captured_until_message_id"] = until_id
             state["last_captured_until_ts"] = until_ts
             state["last_capture_completed_at"] = now_ts
-        try:
-            settings = store.load_proactive_settings()
-        except Exception:
-            settings = {}
         state.update(capture_daily.daily_capture_patch(
             state,
             cards_added=cards_added,
             completed_at=now_ts,
-            timezone_name=(settings or {}).get("timezone") or "UTC",
-            device_timezone=capture_daily.device_timezone_name(store.user_id),
         ))
         state["capture_fail_streak"] = 0
         state["last_capture_failed_at"] = 0.0

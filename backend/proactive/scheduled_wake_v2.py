@@ -43,6 +43,13 @@ DEFAULT_PENDING_TIMER_CAP_V2 = int(os.environ.get("FEEDLING_SCHEDULED_WAKE_PENDI
 DEFAULT_CLAIM_TTL_SEC_V2 = float(os.environ.get("FEEDLING_SCHEDULED_WAKE_CLAIM_TTL_SEC_V2", "60"))
 MIN_SELF_WAKE_LEAD_SEC_V2 = float(os.environ.get("FEEDLING_SELF_WAKE_MIN_LEAD_SEC_V2", "300"))
 
+REPEAT_DAILY = "daily"
+REPEAT_WEEKLY = "weekly"
+REPEAT_INTERVALS_V2 = {
+    REPEAT_DAILY: 86400.0,
+    REPEAT_WEEKLY: 604800.0,
+}
+
 
 def _new_timer_id() -> str:
     return "sched_" + uuid.uuid4().hex[:16]
@@ -69,6 +76,13 @@ def _coerce_origin_refs(value: Any, fallback: Sequence[str] = ()) -> tuple[str, 
         if ref and ref not in refs:
             refs.append(ref)
     return tuple(refs[:50])
+
+
+def _coerce_repeat(value: Any) -> str:
+    repeat = _coerce_str(value, 20).lower()
+    if repeat and repeat not in REPEAT_INTERVALS_V2:
+        raise ValueError("invalid_repeat")
+    return repeat
 
 
 def _zone(tz: Any) -> ZoneInfo:
@@ -192,6 +206,9 @@ class ScheduledWakeRecordV2:
     at: str
     timezone: str
     due_at: float
+    repeat: str = ""
+    repeat_series_id: str = ""
+    repeat_canceled_at: float = 0.0
     note: str = ""
     origin_refs: tuple[str, ...] = ()
     created_at: float = 0.0
@@ -227,6 +244,7 @@ class ScheduledWakeActionResultV2:
     evicted_timer_ids: tuple[str, ...] = ()
     next_trigger_at: str = ""
     timezone: str = ""
+    repeat: str = ""
 
     def as_dict(self) -> dict[str, Any]:
         out = {
@@ -247,6 +265,8 @@ class ScheduledWakeActionResultV2:
             out["next_trigger_at"] = self.next_trigger_at
         if self.timezone:
             out["timezone"] = self.timezone
+        if self.repeat:
+            out["repeat"] = self.repeat
         return out
 
 
@@ -257,6 +277,7 @@ class ScheduledWakeFireResultV2:
     wake_id: str = ""
     reason: str = ""
     transparency_wake_id: str = ""
+    next_timer_id: str = ""
 
     def as_dict(self) -> dict[str, Any]:
         out = {"status": self.status, "timer_id": self.timer_id}
@@ -266,6 +287,8 @@ class ScheduledWakeFireResultV2:
             out["reason"] = self.reason
         if self.transparency_wake_id:
             out["transparency_wake_id"] = self.transparency_wake_id
+        if self.next_timer_id:
+            out["next_timer_id"] = self.next_timer_id
         return out
 
 
@@ -278,6 +301,9 @@ def scheduled_record_to_doc_v2(record: ScheduledWakeRecordV2) -> dict[str, Any]:
         "at": record.at,
         "timezone": record.timezone,
         "due_at": float(record.due_at),
+        "repeat": record.repeat,
+        "repeat_series_id": record.repeat_series_id,
+        "repeat_canceled_at": float(record.repeat_canceled_at),
         "note": record.note,
         "origin_refs": list(record.origin_refs),
         "created_at": float(record.created_at),
@@ -299,13 +325,18 @@ def scheduled_record_to_doc_v2(record: ScheduledWakeRecordV2) -> dict[str, Any]:
 
 
 def scheduled_record_from_doc_v2(doc: Mapping[str, Any]) -> ScheduledWakeRecordV2:
+    repeat = str(doc.get("repeat") or "")
+    timer_id = str(doc.get("timer_id") or "")
     return ScheduledWakeRecordV2(
-        timer_id=str(doc.get("timer_id") or ""),
+        timer_id=timer_id,
         user_id=str(doc.get("user_id") or ""),
         status=str(doc.get("status") or ""),
         at=str(doc.get("at") or ""),
         timezone=str(doc.get("timezone") or ""),
         due_at=float(doc.get("due_at") or 0.0),
+        repeat=repeat,
+        repeat_series_id=str(doc.get("repeat_series_id") or (timer_id if repeat else "")),
+        repeat_canceled_at=float(doc.get("repeat_canceled_at") or 0.0),
         note=str(doc.get("note") or ""),
         origin_refs=tuple(str(item) for item in (doc.get("origin_refs") or ())),
         created_at=float(doc.get("created_at") or 0.0),
@@ -327,6 +358,23 @@ def scheduled_record_from_doc_v2(doc: Mapping[str, Any]) -> ScheduledWakeRecordV
     )
 
 
+def _same_pending_schedule(
+    record: ScheduledWakeRecordV2,
+    *,
+    due_at: float,
+    repeat: str,
+) -> bool:
+    return (
+        record.pending_like
+        and float(record.due_at) == float(due_at)
+        and record.repeat == repeat
+    )
+
+
+def _scheduled_lock_key(user_id: str) -> str:
+    return f"scheduled-wake:{user_id}"
+
+
 class InMemoryScheduledWakeStoreV2:
     def __init__(self) -> None:
         self._lock = threading.Lock()
@@ -337,6 +385,23 @@ class InMemoryScheduledWakeStoreV2:
             self._records.setdefault(record.user_id, {})[record.timer_id] = scheduled_record_to_doc_v2(record)
             return scheduled_record_from_doc_v2(self._records[record.user_id][record.timer_id])
 
+    def create_unique_pending(
+        self,
+        record: ScheduledWakeRecordV2,
+    ) -> tuple[ScheduledWakeRecordV2, bool]:
+        with self._lock:
+            records = self._records.setdefault(record.user_id, {})
+            for doc in records.values():
+                existing = scheduled_record_from_doc_v2(doc)
+                if _same_pending_schedule(
+                    existing,
+                    due_at=record.due_at,
+                    repeat=record.repeat,
+                ):
+                    return existing, False
+            records[record.timer_id] = scheduled_record_to_doc_v2(record)
+            return scheduled_record_from_doc_v2(records[record.timer_id]), True
+
     def list_records(self, user_id: str) -> list[ScheduledWakeRecordV2]:
         with self._lock:
             rows = list((self._records.get(user_id) or {}).values())
@@ -344,8 +409,34 @@ class InMemoryScheduledWakeStoreV2:
 
     def cancel(self, user_id: str, timer_id: str, *, reason: str, now: float) -> ScheduledWakeRecordV2 | None:
         with self._lock:
-            doc = (self._records.get(user_id) or {}).get(timer_id)
-            if not doc or str(doc.get("status") or "") not in {SCHEDULED_PENDING, SCHEDULED_CLAIMED}:
+            records = self._records.get(user_id) or {}
+            doc = records.get(timer_id)
+            if not doc:
+                return None
+            repeat = str(doc.get("repeat") or "")
+            series_id = str(doc.get("repeat_series_id") or "")
+            if repeat and series_id:
+                for candidate in records.values():
+                    if str(candidate.get("repeat_series_id") or "") != series_id:
+                        continue
+                    candidate.update({
+                        "repeat_canceled_at": now,
+                        "cancel_reason": reason,
+                        "updated_at": now,
+                    })
+                    if str(candidate.get("status") or "") in {
+                        SCHEDULED_PENDING,
+                        SCHEDULED_CLAIMED,
+                    }:
+                        candidate.update({
+                            "status": SCHEDULED_CANCELED,
+                            "canceled_at": now,
+                        })
+                return scheduled_record_from_doc_v2(records[timer_id])
+            if str(doc.get("status") or "") not in {
+                SCHEDULED_PENDING,
+                SCHEDULED_CLAIMED,
+            }:
                 return None
             doc.update({
                 "status": SCHEDULED_CANCELED,
@@ -403,19 +494,37 @@ class InMemoryScheduledWakeStoreV2:
         wake_id: str,
         job_id: int = 0,
         now: float,
-    ) -> ScheduledWakeRecordV2 | None:
-        return self._mark_terminal(
-            user_id,
-            timer_id,
-            claim_id,
-            {
+        next_record: ScheduledWakeRecordV2 | None = None,
+    ) -> tuple[ScheduledWakeRecordV2 | None, ScheduledWakeRecordV2 | None]:
+        with self._lock:
+            records = self._records.get(user_id) or {}
+            doc = records.get(timer_id)
+            if not doc or str(doc.get("status") or "") != SCHEDULED_CLAIMED:
+                return None, None
+            if str(doc.get("claim_id") or "") != claim_id:
+                return None, None
+            if float(doc.get("repeat_canceled_at") or 0.0) > 0:
+                return None, None
+            doc.update({
                 "status": SCHEDULED_FIRED,
                 "fired_at": now,
                 "fired_wake_id": wake_id,
                 "fired_job_id": int(job_id),
                 "updated_at": now,
-            },
-        )
+            })
+            fired = scheduled_record_from_doc_v2(doc)
+            if next_record is None:
+                return fired, None
+            for candidate_doc in records.values():
+                candidate = scheduled_record_from_doc_v2(candidate_doc)
+                if _same_pending_schedule(
+                    candidate,
+                    due_at=next_record.due_at,
+                    repeat=next_record.repeat,
+                ):
+                    return fired, candidate
+            records[next_record.timer_id] = scheduled_record_to_doc_v2(next_record)
+            return fired, scheduled_record_from_doc_v2(records[next_record.timer_id])
 
     def mark_blocked(
         self,
@@ -457,10 +566,120 @@ class DBScheduledWakeStoreV2:
         db.log_append(record.user_id, SCHEDULED_WAKE_STREAM_V2, doc, ts=record.created_at, item_key=record.timer_id)
         return scheduled_record_from_doc_v2(doc)
 
+    def create_unique_pending(
+        self,
+        record: ScheduledWakeRecordV2,
+    ) -> tuple[ScheduledWakeRecordV2, bool]:
+        doc = scheduled_record_to_doc_v2(record)
+        inserted_seq: int | None = None
+        with db.get_pool().connection() as conn:
+            with conn.transaction():
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                        (_scheduled_lock_key(record.user_id),),
+                    )
+                    cur.execute(
+                        "SELECT doc FROM user_logs WHERE user_id=%s AND stream=%s "
+                        "AND doc->>'status'=ANY(%s) "
+                        "AND COALESCE(NULLIF(doc->>'due_at','')::float8, 0)=%s "
+                        "AND COALESCE(doc->>'repeat','')=%s "
+                        "ORDER BY seq DESC LIMIT 1",
+                        (
+                            record.user_id,
+                            SCHEDULED_WAKE_STREAM_V2,
+                            [SCHEDULED_PENDING, SCHEDULED_CLAIMED],
+                            float(record.due_at),
+                            record.repeat,
+                        ),
+                    )
+                    existing = cur.fetchone()
+                    if existing is not None:
+                        return scheduled_record_from_doc_v2(existing[0]), False
+                    cur.execute(
+                        "INSERT INTO user_logs (user_id, stream, ts, item_key, doc) "
+                        "VALUES (%s, %s, %s, %s, %s) RETURNING seq",
+                        (
+                            record.user_id,
+                            SCHEDULED_WAKE_STREAM_V2,
+                            record.created_at,
+                            record.timer_id,
+                            Jsonb(doc),
+                        ),
+                    )
+                    inserted_seq = int(cur.fetchone()[0])
+        from tee_shadow import mirror
+        mirror.execute(
+            "INSERT INTO user_logs (user_id, stream, seq, ts, item_key, doc) "
+            "OVERRIDING SYSTEM VALUE VALUES (%s, %s, %s, %s, %s, %s) "
+            "ON CONFLICT (user_id, stream, seq) DO NOTHING",
+            (
+                record.user_id,
+                SCHEDULED_WAKE_STREAM_V2,
+                inserted_seq,
+                record.created_at,
+                record.timer_id,
+                Jsonb(doc),
+            ),
+        )
+        return scheduled_record_from_doc_v2(doc), True
+
     def list_records(self, user_id: str) -> list[ScheduledWakeRecordV2]:
         return [scheduled_record_from_doc_v2(doc) for doc in db.log_read_all(user_id, SCHEDULED_WAKE_STREAM_V2)]
 
     def cancel(self, user_id: str, timer_id: str, *, reason: str, now: float) -> ScheduledWakeRecordV2 | None:
+        repeat_target: Mapping[str, Any] | None = None
+        repeat_sql = (
+            "UPDATE user_logs SET doc = doc || %s || "
+            "CASE WHEN doc->>'status'=ANY(%s) THEN %s ELSE '{}'::jsonb END "
+            "WHERE user_id=%s AND stream=%s "
+            "AND doc->>'repeat_series_id'=%s RETURNING item_key,doc"
+        )
+        repeat_params: tuple[Any, ...] | None = None
+        with db.get_pool().connection() as conn:
+            with conn.transaction():
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                        (_scheduled_lock_key(user_id),),
+                    )
+                    cur.execute(
+                        "SELECT doc FROM user_logs WHERE user_id=%s AND stream=%s "
+                        "AND item_key=%s ORDER BY seq DESC LIMIT 1 FOR UPDATE",
+                        (user_id, SCHEDULED_WAKE_STREAM_V2, timer_id),
+                    )
+                    target_row = cur.fetchone()
+                    if target_row is None:
+                        return None
+                    target = dict(target_row[0] or {})
+                    repeat = str(target.get("repeat") or "")
+                    series_id = str(target.get("repeat_series_id") or "")
+                    if repeat and series_id:
+                        common_patch = {
+                            "repeat_canceled_at": now,
+                            "cancel_reason": reason,
+                            "updated_at": now,
+                        }
+                        pending_patch = {
+                            "status": SCHEDULED_CANCELED,
+                            "canceled_at": now,
+                        }
+                        repeat_params = (
+                            Jsonb(common_patch),
+                            [SCHEDULED_PENDING, SCHEDULED_CLAIMED],
+                            Jsonb(pending_patch),
+                            user_id,
+                            SCHEDULED_WAKE_STREAM_V2,
+                            series_id,
+                        )
+                        cur.execute(repeat_sql, repeat_params)
+                        for item_key, candidate_doc in cur.fetchall():
+                            if str(item_key or "") == timer_id:
+                                repeat_target = candidate_doc
+        if repeat_params is not None:
+            from tee_shadow import mirror
+            mirror.execute(repeat_sql, repeat_params)
+            return scheduled_record_from_doc_v2(repeat_target or target)
         doc = self._patch_guarded(
             user_id,
             timer_id,
@@ -529,21 +748,101 @@ class DBScheduledWakeStoreV2:
         wake_id: str,
         job_id: int = 0,
         now: float,
-    ) -> ScheduledWakeRecordV2 | None:
-        doc = self._patch_guarded(
+        next_record: ScheduledWakeRecordV2 | None = None,
+    ) -> tuple[ScheduledWakeRecordV2 | None, ScheduledWakeRecordV2 | None]:
+        patch = {
+            "status": SCHEDULED_FIRED,
+            "fired_at": now,
+            "fired_wake_id": wake_id,
+            "fired_job_id": int(job_id),
+            "updated_at": now,
+        }
+        update_params = (
+            Jsonb(patch),
             user_id,
+            SCHEDULED_WAKE_STREAM_V2,
+            user_id,
+            SCHEDULED_WAKE_STREAM_V2,
             timer_id,
-            {
-                "status": SCHEDULED_FIRED,
-                "fired_at": now,
-                "fired_wake_id": wake_id,
-                "fired_job_id": int(job_id),
-                "updated_at": now,
-            },
-            statuses={SCHEDULED_CLAIMED},
-            claim_id=claim_id,
+            claim_id,
         )
-        return scheduled_record_from_doc_v2(doc) if doc else None
+        update_sql = (
+            "UPDATE user_logs SET doc=doc || %s "
+            "WHERE user_id=%s AND stream=%s AND seq=("
+            "SELECT seq FROM user_logs WHERE user_id=%s AND stream=%s "
+            "AND item_key=%s ORDER BY seq DESC LIMIT 1) "
+            "AND doc->>'status'='claimed' AND doc->>'claim_id'=%s "
+            "AND COALESCE(NULLIF(doc->>'repeat_canceled_at','')::float8, 0)=0 "
+            "RETURNING doc"
+        )
+        fired_doc: Mapping[str, Any] | None = None
+        next_doc: Mapping[str, Any] | None = None
+        next_inserted_seq: int | None = None
+        with db.get_pool().connection() as conn:
+            with conn.transaction():
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                        (_scheduled_lock_key(user_id),),
+                    )
+                    cur.execute(update_sql, update_params)
+                    fired_row = cur.fetchone()
+                    if fired_row is None:
+                        return None, None
+                    fired_doc = fired_row[0]
+                    if next_record is not None:
+                        cur.execute(
+                            "SELECT doc FROM user_logs WHERE user_id=%s AND stream=%s "
+                            "AND doc->>'status'=ANY(%s) "
+                            "AND COALESCE(NULLIF(doc->>'due_at','')::float8, 0)=%s "
+                            "AND COALESCE(doc->>'repeat','')=%s "
+                            "ORDER BY seq DESC LIMIT 1",
+                            (
+                                user_id,
+                                SCHEDULED_WAKE_STREAM_V2,
+                                [SCHEDULED_PENDING, SCHEDULED_CLAIMED],
+                                float(next_record.due_at),
+                                next_record.repeat,
+                            ),
+                        )
+                        existing = cur.fetchone()
+                        if existing is not None:
+                            next_doc = existing[0]
+                        else:
+                            next_doc = scheduled_record_to_doc_v2(next_record)
+                            cur.execute(
+                                "INSERT INTO user_logs "
+                                "(user_id,stream,ts,item_key,doc) "
+                                "VALUES (%s,%s,%s,%s,%s) RETURNING seq",
+                                (
+                                    user_id,
+                                    SCHEDULED_WAKE_STREAM_V2,
+                                    next_record.created_at,
+                                    next_record.timer_id,
+                                    Jsonb(next_doc),
+                                ),
+                            )
+                            next_inserted_seq = int(cur.fetchone()[0])
+        from tee_shadow import mirror
+        mirror.execute(update_sql, update_params)
+        if next_record is not None and next_inserted_seq is not None:
+            mirror.execute(
+                "INSERT INTO user_logs (user_id,stream,seq,ts,item_key,doc) "
+                "OVERRIDING SYSTEM VALUE VALUES (%s,%s,%s,%s,%s,%s) "
+                "ON CONFLICT (user_id,stream,seq) DO NOTHING",
+                (
+                    user_id,
+                    SCHEDULED_WAKE_STREAM_V2,
+                    next_inserted_seq,
+                    next_record.created_at,
+                    next_record.timer_id,
+                    Jsonb(next_doc),
+                ),
+            )
+        return (
+            scheduled_record_from_doc_v2(fired_doc),
+            scheduled_record_from_doc_v2(next_doc) if next_doc is not None else None,
+        )
 
     def mark_blocked(
         self,
@@ -635,10 +934,11 @@ class ScheduledWakeServiceV2:
                     "wake_id": record.timer_id,
                     "at": record.at,
                     "tz": record.timezone,
+                    "repeat": record.repeat,
                     "note": record.note,
                     "origin_refs": list(record.origin_refs),
                 }
-                for record in pending[:10]
+                for record in pending[:self.pending_cap]
             ],
         }
 
@@ -706,6 +1006,7 @@ class ScheduledWakeServiceV2:
                     reason=reason if canceled else "timer_not_found",
                     next_trigger_at=canceled.at if canceled else "",
                     timezone=canceled.timezone if canceled else "",
+                    repeat=canceled.repeat if canceled else "",
                 ))
         return tuple(results)
 
@@ -727,6 +1028,7 @@ class ScheduledWakeServiceV2:
                 action.get("tz") or settings.timezone,
                 now=now,
             )
+            repeat = _coerce_repeat(action.get("repeat"))
         except ValueError as exc:
             return ScheduledWakeActionResultV2("schedule_wake", "invalid", reason=str(exc))
         clamped = False
@@ -744,6 +1046,8 @@ class ScheduledWakeServiceV2:
             at=wall_time,
             timezone=tz_name,
             due_at=due_at,
+            repeat=repeat,
+            repeat_series_id=timer_id if repeat else "",
             note=_coerce_str(action.get("note"), 1000),
             origin_refs=refs,
             created_at=now,
@@ -751,16 +1055,57 @@ class ScheduledWakeServiceV2:
             turn_id=turn_id,
             wake_ids=tuple(str(item) for item in (wake_ids or ())),
         )
-        self.store.create(record)
-        evicted = self._enforce_pending_cap(user_id, now=now, keep_timer_id=timer_id)
+        persisted, created = self.store.create_unique_pending(record)
+        evicted = (
+            self._enforce_pending_cap(
+                user_id,
+                now=now,
+                keep_timer_id=persisted.timer_id,
+            )
+            if created
+            else []
+        )
         return ScheduledWakeActionResultV2(
             "schedule_wake",
             "scheduled",
-            timer_id=timer_id,
-            reason="self_wake_min_lead_clamped" if clamped else "",
+            timer_id=persisted.timer_id,
+            reason=(
+                "already_scheduled"
+                if not created
+                else "self_wake_min_lead_clamped" if clamped else ""
+            ),
             evicted_timer_ids=tuple(record.timer_id for record in evicted),
-            next_trigger_at=wall_time,
-            timezone=tz_name,
+            next_trigger_at=persisted.at,
+            timezone=persisted.timezone,
+            repeat=persisted.repeat,
+        )
+
+    def _next_repeat_record(
+        self,
+        record: ScheduledWakeRecordV2,
+        *,
+        now: float,
+    ) -> ScheduledWakeRecordV2 | None:
+        interval = REPEAT_INTERVALS_V2.get(record.repeat)
+        if interval is None or record.repeat_canceled_at > 0:
+            return None
+        due_at = float(record.due_at) + interval
+        timer_id = _new_timer_id()
+        return ScheduledWakeRecordV2(
+            timer_id=timer_id,
+            user_id=record.user_id,
+            status=SCHEDULED_PENDING,
+            at=_wall_time_for_due_at(due_at, record.timezone),
+            timezone=record.timezone,
+            due_at=due_at,
+            repeat=record.repeat,
+            repeat_series_id=record.repeat_series_id or record.timer_id,
+            note=record.note,
+            origin_refs=record.origin_refs,
+            created_at=now,
+            updated_at=now,
+            turn_id=record.turn_id,
+            wake_ids=record.wake_ids,
         )
 
     def _enforce_pending_cap(self, user_id: str, *, now: float, keep_timer_id: str) -> list[ScheduledWakeRecordV2]:
@@ -808,15 +1153,30 @@ class ScheduledWakeServiceV2:
             if decision.accepted:
                 submitted = submit_wake(event)
                 if getattr(submitted, "accepted", True):
-                    self.store.mark_fired(
+                    fired_record, next_record = self.store.mark_fired(
                         user_id,
                         claimed.timer_id,
                         claimed.claim_id,
                         wake_id=event.wake_id,
                         job_id=int(getattr(submitted, "job_id", 0) or 0),
                         now=now,
+                        next_record=self._next_repeat_record(claimed, now=now),
                     )
-                    results.append(ScheduledWakeFireResultV2("fired", claimed.timer_id, wake_id=event.wake_id))
+                    if fired_record is not None:
+                        if next_record is not None:
+                            self._enforce_pending_cap(
+                                user_id,
+                                now=now,
+                                keep_timer_id=next_record.timer_id,
+                            )
+                        results.append(ScheduledWakeFireResultV2(
+                            "fired",
+                            claimed.timer_id,
+                            wake_id=event.wake_id,
+                            next_timer_id=(
+                                next_record.timer_id if next_record is not None else ""
+                            ),
+                        ))
                     continue
                 decision = submitted
             reason = str(getattr(decision, "reason", "") or "wake_rejected")
@@ -880,6 +1240,7 @@ class ScheduledWakeServiceV2:
                     "at": record.at,
                     "tz": record.timezone,
                     "due_at": record.due_at,
+                    "repeat": record.repeat,
                 }
             },
         )
@@ -907,6 +1268,7 @@ class ScheduledWakeServiceV2:
                 "wake_id": timer.timer_id,
                 "at": timer.at,
                 "tz": timer.timezone,
+                "repeat": timer.repeat,
                 "note": timer.note,
             }
         event = WakeEventV2(

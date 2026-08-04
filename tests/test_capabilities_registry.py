@@ -11,7 +11,7 @@ def test_all_action_types_registered():
     expected = {
         "identity_get", "identity_patch", "identity_nudge", "memory_index", "memory_fetch", "memory_write",
         "memory_search",
-        "perception_snapshot", "perception_trend", "perception_history",
+        "perception_snapshot", "perception_trend", "perception_history", "perception_glance",
         "screen_recent", "screen_read", "photo_recent", "photo_read", "chat_image_read",
         "chat_file_read",
         "web_search", "web_fetch",
@@ -38,16 +38,16 @@ def test_run_capability_unknown():
 
 
 def test_capabilities_is_a_real_populated_dict():
-    assert len(registry.CAPABILITIES) == 24
+    assert len(registry.CAPABILITIES) == 25
     assert set(registry.CAPABILITIES.keys()) == {
         "identity_get", "identity_patch", "identity_nudge", "memory_index", "memory_fetch", "memory_write",
         "memory_search",
-        "perception_snapshot", "perception_trend", "perception_history",
+        "perception_snapshot", "perception_trend", "perception_history", "perception_glance",
         "screen_recent", "screen_read", "photo_recent", "photo_read", "chat_image_read",
         "chat_file_read",
         "web_search", "web_fetch",
         "schedule_wake", "cancel_wake",
         "workspace_list", "workspace_read", "workspace_write", "workspace_delete",
     }
-    assert len(list(registry.CAPABILITIES.items())) == 24
+    assert len(list(registry.CAPABILITIES.items())) == 25
     assert bool(registry.CAPABILITIES) is True

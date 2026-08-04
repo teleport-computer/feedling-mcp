@@ -191,10 +191,17 @@ def test_memory_actions_add_anchor_required_is_slug(backend_env):
             ]
         },
     )
-    # A batch with no applied write promotes the first item failure to the
-    # outer status while preserving the independent per-item result.
+    # Contract (Seven arbitration 2026-08-01/02, restored in e320d0fd): a batch
+    # that applied NOTHING and reported at least one hard failure is an outer
+    # HTTP 400 with the first failed item's slug promoted top-level — callers
+    # using the outer status as their failure signal must never mistake an
+    # all-failed write for success. Partial/complete success stays HTTP 200
+    # with independent per-item outcomes. Both layers are asserted here.
+    # (72de68dc briefly flipped this to 200 in a parallel edit unaware of the
+    # arbitration; do not re-flip without a new product decision.)
     assert res.status_code == 400
     body = res.get_json()
+    assert body["error"] == "anchor_required"           # top-level, slug
     assert body["status"] == "failed"
     assert body["error"] == "anchor_required"
     assert body["detail"] == {"mem_type": "insight"}
