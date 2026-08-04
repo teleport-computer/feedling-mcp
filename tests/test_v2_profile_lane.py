@@ -465,29 +465,36 @@ def test_compose_memory_lane_defaults_match_environment_policy():
     ):
         text = (root / relative).read_text()
         backend_block, worker_block = text.split("  serve-worker:", 1)
-        assert (
-            'FEEDLING_V2_CAPTURE_ENABLED: "${FEEDLING_V2_CAPTURE_ENABLED:-1}"'
-            in backend_block
+        is_test = relative.endswith(".test.yaml")
+        # Test is the "normal-on" environment since 2026-08-05 (V1-parity
+        # program): product memory lanes are hardcoded on so the deployed
+        # state is legible in one file.  Prod/pre stay env-parameterized at
+        # the pre-rollout defaults until Seven schedules the prod rollout.
+        expected_capture = (
+            'FEEDLING_V2_CAPTURE_ENABLED: "1"'
+            if is_test
+            else 'FEEDLING_V2_CAPTURE_ENABLED: "${FEEDLING_V2_CAPTURE_ENABLED:-1}"'
         )
-        assert (
-            'FEEDLING_V2_PROFILE_ENABLED: "${FEEDLING_V2_PROFILE_ENABLED:-0}"'
-            in backend_block
+        expected_profile = (
+            'FEEDLING_V2_PROFILE_ENABLED: "1"'
+            if is_test
+            else 'FEEDLING_V2_PROFILE_ENABLED: "${FEEDLING_V2_PROFILE_ENABLED:-0}"'
         )
-        assert (
-            'FEEDLING_V2_CAPTURE_ENABLED: "${FEEDLING_V2_CAPTURE_ENABLED:-1}"'
-            in worker_block
-        )
+        assert expected_capture in backend_block
+        assert expected_profile in backend_block
+        assert expected_capture in worker_block
         expected_dream = (
             'FEEDLING_V2_DREAM_ENABLED: "1"'
-            if relative.endswith(".test.yaml")
+            if is_test
             else 'FEEDLING_V2_DREAM_ENABLED: "${FEEDLING_V2_DREAM_ENABLED:-1}"'
         )
         assert expected_dream in worker_block
-        assert (
-            'FEEDLING_V2_PROFILE_ENABLED: "${FEEDLING_V2_PROFILE_ENABLED:-0}"'
-            in worker_block
-        )
-        assert "# DO NOT set to 1 before M5 MEMORY/USER prompt injection" in worker_block
+        assert expected_profile in worker_block
+        if not is_test:
+            assert (
+                "# DO NOT set to 1 before M5 MEMORY/USER prompt injection"
+                in worker_block
+            )
 
 
 @pytest.mark.parametrize(

@@ -311,10 +311,14 @@ services:
       FEEDLING_RUNTIME_DEFAULT_DESIRED: "resident"
       # Backend owns capture admission/triggers; serve-worker executes the lane.
       # Keep both deployment gates aligned. User consent remains independent.
-      FEEDLING_V2_CAPTURE_ENABLED: "${FEEDLING_V2_CAPTURE_ENABLED:-1}"
+      # Normal-on in test (V1-parity program 2026-08-05): product lanes are
+      # hardcoded, not env-toggled, so the test state is legible in one file.
+      FEEDLING_V2_CAPTURE_ENABLED: "1"
       # Backend owns the V2-cutover profile trigger; serve-worker executes it.
-      # Keep both copies default-off until profile generation is enabled.
-      FEEDLING_V2_PROFILE_ENABLED: "${FEEDLING_V2_PROFILE_ENABLED:-0}"
+      # M1-M5 (generation + MEMORY/USER prompt injection) merged 3086025c
+      # (2026-07-31); normal-on since 2026-08-05 (V1-parity program).
+      # Rollback order stays: DETERMINISTIC off first, then this.
+      FEEDLING_V2_PROFILE_ENABLED: "1"
       # TEST-ONLY: genesis v2 (foreground-fast onboarding). Greet on 3-5 core +
       # identity baseline, push the heavy reduce (the ~37% prod failure surface)
       # to the background. Prod compose deliberately omits this (keeps the v1
@@ -369,7 +373,12 @@ services:
       FEEDLING_V2_DEPLOYED_BUILD: "${FEEDLING_V2_DEPLOYED_BUILD:-}"
       FEEDLING_GENESIS_WORKER_ENABLED: "1"
       # Runtime V2 background memory lanes execute in this worker, not backend.
-      FEEDLING_V2_CAPTURE_ENABLED: "${FEEDLING_V2_CAPTURE_ENABLED:-1}"
+      # Normal-on in test (V1-parity program 2026-08-05, same style as dream).
+      FEEDLING_V2_CAPTURE_ENABLED: "1"
+      # Reply push + visible self-thinking are code-default ON; declared
+      # explicitly so the test lane state is legible in one file.
+      FEEDLING_V2_PUSH_ENABLED: "1"
+      FEEDLING_V2_SELF_THINKING: "1"
       # Dream is intentionally always on in test after the guarded rewrite
       # passed live convergence and non-destructive merge verification.
       FEEDLING_V2_DREAM_ENABLED: "1"
@@ -403,9 +412,10 @@ services:
       # return; the cost is more fold calls per backlog, which is bounded.
       FEEDLING_V2_COMPACTION_BATCH_MSGS: "${FEEDLING_V2_COMPACTION_BATCH_MSGS:-50}"
       FEEDLING_V2_COMPACTION_BATCH_CHARS: "${FEEDLING_V2_COMPACTION_BATCH_CHARS:-120000}"
-      # Generation may be enabled for M4 validation; prompt replacement stays
-      # locked until M5 has deployed and been verified.
-      FEEDLING_V2_PROFILE_ENABLED: "${FEEDLING_V2_PROFILE_ENABLED:-0}"
+      # M5 MEMORY/USER prompt injection merged 3086025c (2026-07-31) and the
+      # injection path verified in context.py:502-524. Profile lane normal-on
+      # since 2026-08-05 (V1-parity program).
+      FEEDLING_V2_PROFILE_ENABLED: "1"
       # DO NOT set to 1 before M5 MEMORY/USER prompt injection is deployed.
       FEEDLING_V2_PROFILE_COVERAGE_DETERMINISTIC: "${FEEDLING_V2_PROFILE_COVERAGE_DETERMINISTIC:-0}"
       FEEDLING_V2_PROMPT_CATCHUP_DEADLINE_SEC: "${FEEDLING_V2_PROMPT_CATCHUP_DEADLINE_SEC:-600}"
