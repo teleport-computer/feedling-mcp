@@ -91,6 +91,33 @@ def test_missing_field_rejected(sk):
     assert "missing nonce" in ei.value.reason
 
 
+def test_read_envelope_accepts_plaintext_text_and_binary(sk):
+    base = {"id": "itm_plain", "owner_user_id": "usr_a", "visibility": "shared"}
+    assert envmod.read_envelope({**base, "body": "hello 明文"}, "usr_a", sk) == \
+        "hello 明文".encode()
+    assert envmod.read_envelope(
+        {**base, "body_b64": base64.b64encode(b"\x00\x01file").decode()},
+        "usr_a", sk,
+    ) == b"\x00\x01file"
+
+
+def test_read_envelope_plaintext_still_binds_owner(sk):
+    with pytest.raises(envmod.DecryptFailure) as ei:
+        envmod.read_envelope(
+            {"id": "itm_plain", "owner_user_id": "usr_a", "body": "secret"},
+            "usr_b", sk,
+        )
+    assert "owner mismatch" in ei.value.reason
+
+
+def test_read_envelope_rejects_malformed_plaintext_shapes(sk):
+    base = {"id": "itm_plain", "owner_user_id": "usr_a"}
+    with pytest.raises(envmod.DecryptFailure):
+        envmod.read_envelope({**base, "body": 123}, "usr_a", sk)
+    with pytest.raises(envmod.DecryptFailure):
+        envmod.read_envelope({**base, "body_b64": "%%%"}, "usr_a", sk)
+
+
 def test_module_is_pure():
     import enclave.envelope as m
     src = Path(m.__file__).read_text()

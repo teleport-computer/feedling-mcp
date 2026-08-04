@@ -353,12 +353,16 @@ def decrypt_readside_items(
         if not isinstance(moment, dict):
             continue
         memory_id = str(moment.get("id") or "")
-        if moment.get("visibility") == "local_only" or not moment.get("K_enclave"):
+        if moment.get("visibility") == "local_only" or (
+            not moment.get("K_enclave")
+            and moment.get("body") is None
+            and moment.get("body_b64") is None
+        ):
             if memory_id:
                 unavailable_ids.append(memory_id)
             continue
         try:
-            plaintext = envelope.decrypt_envelope(moment, authorized_user_id, content_sk)
+            plaintext = envelope.read_envelope(moment, authorized_user_id, content_sk)
             inner = json.loads(plaintext.decode("utf-8"))
             if not isinstance(inner, dict):
                 raise ValueError("memory plaintext is not an object")
@@ -379,7 +383,7 @@ def moments_to_cards(moments: list, authorized_user_id: str, content_sk) -> list
         if m.get("visibility") == "local_only":
             continue  # enclave doesn't have K_enclave for these
         try:
-            plaintext = envelope.decrypt_envelope(m, authorized_user_id, content_sk)
+            plaintext = envelope.read_envelope(m, authorized_user_id, content_sk)
             inner = json.loads(plaintext.decode("utf-8"))
         except (envelope.DecryptFailure, json.JSONDecodeError):
             continue

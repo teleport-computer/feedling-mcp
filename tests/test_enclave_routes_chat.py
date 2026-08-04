@@ -107,6 +107,23 @@ def test_history_decrypts_text_messages(client, monkeypatch):
     assert "context_memories" in body
 
 
+def test_history_reads_plaintext_tier_text_without_crypto_fields(client, monkeypatch):
+    """TEE-primary stores the opted-out account's body in clear.  The enclave
+    read boundary must still expose the same content contract to resident/V2
+    consumers instead of treating the missing K_enclave as a decrypt failure."""
+    _wire(monkeypatch, [
+        {"id": "p1", "role": "user", "ts": 1.0, "v": 1, "source": "ios",
+         "body": "hello plaintext tier", "owner_user_id": "usr_a",
+         "visibility": "shared", "content_type": "text"},
+    ])
+    r = client.get("/v1/chat/history", headers={"X-API-Key": "k"})
+    assert r.status_code == 200
+    body = r.get_json()
+    assert body["messages"][0]["content"] == "hello plaintext tier"
+    assert body["messages"][0]["decrypt_status"] == "ok"
+    assert body["decrypt_errors"] == []
+
+
 def test_history_decrypts_resident_maintenance_message(client, monkeypatch):
     prompt = "【Feedling 系统维护提醒】\n请更新 resident consumer。"
     _wire(monkeypatch, [
