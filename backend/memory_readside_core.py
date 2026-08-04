@@ -87,7 +87,11 @@ def memory_available(
         return False
     if moment.get("visibility") == "local_only":
         return False
-    if not moment.get("K_enclave"):
+    if (
+        not moment.get("K_enclave")
+        and moment.get("body") is None
+        and moment.get("body_b64") is None
+    ):
         return False
     status = _status(moment)
     if status == "superseded" and not include_superseded:

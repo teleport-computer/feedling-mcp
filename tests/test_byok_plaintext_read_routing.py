@@ -10,6 +10,7 @@ from __future__ import annotations
 import pytest
 
 from core import envelope as core_envelope
+import memory_readside_core
 
 
 def _plaintext_row(body: str = "sk-plain-123") -> dict:
@@ -35,6 +36,22 @@ def test_plaintext_row_is_read_locally_without_touching_enclave(monkeypatch):
 
     assert out == b"sk-plain-123"
     assert called == [], "明文行不应触发任何 enclave 调用"
+
+
+def test_plaintext_memory_is_available_to_enclave_readside():
+    moment = {
+        "id": "mem_plain", "owner_user_id": "usr_x", "visibility": "shared",
+        "body": '{"summary":"明文记忆"}', "status": "active",
+    }
+    assert memory_readside_core.memory_available(moment, "usr_x") is True
+
+
+def test_memory_without_any_supported_body_remains_unavailable():
+    moment = {
+        "id": "mem_broken", "owner_user_id": "usr_x", "visibility": "shared",
+        "status": "active",
+    }
+    assert memory_readside_core.memory_available(moment, "usr_x") is False
 
 
 def test_envelope_row_still_goes_through_enclave(monkeypatch):
