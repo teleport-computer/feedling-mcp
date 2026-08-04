@@ -427,7 +427,7 @@ def test_memory_sink_forwards_enclave_runtime_token(pg_clean, monkeypatch):
 # ------------------------------------------------------------------
 # BUG-3: the `schedule` effect_type has two producers sharing one sink.
 # schedule_wake/cancel_wake write-tool-calls carry capability params
-# (at/tz/reason/wake_id) under payload["op"] and must route through
+# (at/tz/reason/repeat/wake_id) under payload["op"] and must route through
 # cap_registry.run_capability -- NOT jobs_store.upsert_wake_schedule,
 # whose kwargs (_SCHEDULE_PAYLOAD_KEYS) are an unrelated PR A/D
 # wake-timing-table shape that silently drops every capability param.
@@ -456,7 +456,8 @@ def test_sink_schedule_routes_schedule_wake_op_through_run_capability(pg_clean, 
     dispatch = serve_worker.build_production_effect_dispatch("u_sink_sched_wake")
     applied = dispatch("schedule", {
         "effect_id": "job_sw:schedule:0", "op": "schedule_wake",
-        "at": "2026-07-11T09:00:00Z", "tz": "Asia/Shanghai", "reason": "remind me",
+        "at": "2026-07-11T09:00:00Z", "tz": "Asia/Shanghai",
+        "reason": "remind me", "repeat": "daily",
     })
 
     assert len(calls) == 1
@@ -465,7 +466,8 @@ def test_sink_schedule_routes_schedule_wake_op_through_run_capability(pg_clean, 
     assert user_id == "u_sink_sched_wake"
     assert api_key is None
     assert params == {
-        "at": "2026-07-11T09:00:00Z", "tz": "Asia/Shanghai", "reason": "remind me",
+        "at": "2026-07-11T09:00:00Z", "tz": "Asia/Shanghai",
+        "reason": "remind me", "repeat": "daily",
     }
     assert applied.result == {
         "kind": "schedule_v1",

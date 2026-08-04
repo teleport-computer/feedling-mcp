@@ -155,6 +155,38 @@ def test_model_api_validate_failed_job_keeps_artifacts_lit_but_overall_fails(mon
     assert "failed" in steps["history_import"]["required"].lower()
 
 
+def test_failed_genesis_reports_durable_window_progress_and_materials(monkeypatch):
+    materials = [{
+        "kind": "chat_history",
+        "status": "processing",
+        "windows_done": 2,
+        "windows_total": 5,
+        "cards": 0,
+    }]
+    _install_model_api_harness(
+        monkeypatch,
+        genesis_jobs=[{
+            "job_id": "genesis_partial",
+            "status": "failed",
+            "source_kind": "history_import",
+            "processed_chunks": 2,
+            "total_chunks": 5,
+            "output": {"stage": "plaintext_reducer", "materials": materials},
+            "metadata": {"ingest": "plaintext", "window_count": 5},
+        }],
+    )
+
+    steps = {
+        step["id"]: step
+        for step in validation._model_api_onboarding_validation_payload(_store())["steps"]
+    }
+    history = steps["history_import"]
+    assert history["progress"] == 40
+    assert history["candidate_windows_done"] == 2
+    assert history["candidate_windows_total"] == 5
+    assert history["materials"] == [{**materials[0], "status": "failed"}]
+
+
 def test_model_api_failed_genesis_required_names_the_real_cause(monkeypatch):
     # usr_9037eaa8 (2026-07-24): five provider-timeout jobs were answered with
     # the static "Start onboarding again with the latest app build" — the
@@ -272,6 +304,7 @@ def test_genesis_stage_mapped_to_legacy_phase_for_old_ios(monkeypatch):
     # iOS already maps (so old apps don't show raw 'genesis_v2_foreground').
     from genesis import service as genesis_service
     assert genesis_service.public_stage("genesis_v2_foreground") == "chat_history_importing"
+    assert genesis_service.public_stage("genesis_v2_foreground_ready") == "background_importing"
     assert genesis_service.public_stage("genesis_v2_background") == "background_importing"
     assert genesis_service.public_stage("genesis_v2_background_deferred") == "background_importing"
     assert genesis_service.public_stage("genesis_v2_done") == "completed"

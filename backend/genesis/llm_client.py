@@ -29,6 +29,12 @@ class GenesisLLMResult:
     max_tokens: int = 0
 
 
+class DistillModelTooSlowError(RuntimeError):
+    """The job-level canary could not complete within its bounded first call."""
+
+    feedling_error_class = "provider_config"
+
+
 CompletionFn = Callable[..., dict[str, Any]]
 _user_semaphores: dict[str, threading.BoundedSemaphore] = {}
 _user_semaphores_lock = threading.Lock()
@@ -78,11 +84,19 @@ def _messages_hash(messages: list[dict[str, Any]]) -> str:
 class GenesisLLMClient:
     """Thin, idempotent wrapper around provider_client.chat_completion."""
 
-    def __init__(self, completion_fn: CompletionFn | None = None, *, persist_output: bool = True):
+    def __init__(
+        self,
+        completion_fn: CompletionFn | None = None,
+        *,
+        persist_output: bool = True,
+        canary: bool = False,
+    ):
         # Genesis v2 Step 1: drive every genesis LLM call through the retry wrapper
         # so a single cheap-relay blip (timeout / 429 / 5xx / empty) no longer kills
         # the whole import. provider_config failures (402 / bad key) are NOT retried.
         self._completion_fn = completion_fn or provider_client.reliable_chat_completion
+        self._uses_default_completion = completion_fn is None
+        self._canary_pending = bool(canary)
         # persist_output=True (default, cloud CVM): record each call's metadata + heartbeat
         # the job in Postgres. The VPS resident consumer reuses this SAME extraction engine
         # (chunk → fact_map → fact_write) with a local-agent completion_fn but has NO backend
@@ -113,15 +127,39 @@ class GenesisLLMClient:
         # default completion_fn): transient blips (timeout/429/5xx/empty) retry
         # there, provider_config (402/401) don't. Do NOT add a second retry layer
         # here — it would multiply one blip into N×M upstream calls.
-        with _user_slot(user_id):
-            result = self._completion_fn(
-                runtime,
-                messages,
-                max_tokens=capped_max_tokens,
-                temperature=temperature,
-                timeout=timeout,
-                response_format=response_format,
-            )
+        canary_call = self._canary_pending
+        effective_timeout = (
+            float(_env_int("FEEDLING_GENESIS_CANARY_TIMEOUT_SEC", 60))
+            if canary_call
+            else timeout
+        )
+        completion_kwargs = {
+            "max_tokens": capped_max_tokens,
+            "temperature": temperature,
+            "timeout": effective_timeout,
+            "response_format": response_format,
+        }
+        if self._uses_default_completion:
+            # Keep 429/5xx at the shared default of three attempts, while bounding
+            # ReadTimeout-like failures to two attempts for Genesis. The canary is
+            # a single attempt by design: a slow first real call fails the job fast.
+            completion_kwargs["max_attempts"] = 1 if canary_call else 3
+            completion_kwargs["max_timeout_attempts"] = 1 if canary_call else 2
+        try:
+            with _user_slot(user_id):
+                result = self._completion_fn(runtime, messages, **completion_kwargs)
+        except Exception as exc:
+            provider_error_class = provider_client.classify_provider_error(exc)
+            if (
+                canary_call
+                and provider_error_class != "provider_config"
+                and provider_client.is_timeout_error(exc)
+            ):
+                raise DistillModelTooSlowError(
+                    f"distill_model_too_slow:{type(exc).__name__}:{str(exc)[:160]}"
+                ) from exc
+            raise
+        self._canary_pending = False
         text = str(result.get("reply") or "")
         usage = result.get("usage") if isinstance(result.get("usage"), dict) else {}
         stop_reason = str(result.get("stop_reason") or "").strip()
@@ -135,7 +173,7 @@ class GenesisLLMClient:
             "response_sha256": text_sha256,
             "response_chars": len(text),
             "max_tokens": capped_max_tokens,
-            "timeout": timeout,
+            "timeout": effective_timeout,
             "budget_label": budget_label,
             "plaintext_stored": False,
             "stop_reason": stop_reason,

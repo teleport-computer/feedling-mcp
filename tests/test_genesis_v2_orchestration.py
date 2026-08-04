@@ -89,6 +89,87 @@ def test_v2_foreground_completes_then_background_skips_only_history_core(monkeyp
     assert calls["bg_known"] == ["用户养了一只狗叫蛋子"]
 
 
+def test_v2_sampled_foreground_checkpoints_full_history_indices(monkeypatch):
+    monkeypatch.setenv("FEEDLING_GENESIS_FG_HISTORY_CAP", "8")
+    chunks = [f"history-{idx}" for idx in range(12)]
+    expected_indices = [0, 2, 3, 5, 6, 8, 9, 11]
+    captured = {}
+
+    class Progress:
+        def __init__(self):
+            self.outputs = {}
+            self.published = []
+
+        def resume_outputs(self, source_pass, source_family):
+            assert (source_pass, source_family) == (1, "history")
+            return dict(self.outputs)
+
+        def record_map(self, source_pass, source_family, chunk_index, output):
+            assert (source_pass, source_family) == (1, "history")
+            self.outputs[chunk_index] = output
+
+        def publish(self, **kwargs):
+            self.published.append(kwargs)
+
+        def mark_identity_ready(self):
+            return None
+
+    progress = Progress()
+    monkeypatch.setattr(db, "genesis_set_job_status", lambda *a, **k: None)
+
+    def fake_foreground(**kwargs):
+        assert kwargs["chunk_texts"] == [chunks[idx] for idx in expected_indices]
+        resumed = kwargs.get("resume_map_outputs") or {}
+        for local_index, text in enumerate(kwargs["chunk_texts"]):
+            if local_index not in resumed:
+                kwargs["on_map_completed"](
+                    local_index,
+                    {"fact_candidates": [{"summary": text}]},
+                )
+        return _greetable_fg()
+
+    monkeypatch.setattr(worker, "build_foreground_output_from_texts", fake_foreground)
+    monkeypatch.setattr(
+        plaintext,
+        "_plaintext_merge_reducer_outputs",
+        lambda outs, **k: {"memories": [{"summary": "foreground memory"}]},
+    )
+    monkeypatch.setattr(
+        foreground_identity,
+        "derive_foreground_identity",
+        lambda **k: ({"agent_name": "", "dimensions": []}, []),
+    )
+    monkeypatch.setattr(service, "apply_reducer_output", lambda *a, **k: None)
+
+    def fake_background(*_args, **kwargs):
+        captured["resumed"] = kwargs["progress"].resume_outputs(1, "history")
+
+    monkeypatch.setattr(plaintext, "_run_plaintext_background_enrichment", fake_background)
+
+    handled = plaintext._run_plaintext_genesis_v2(
+        _Store(),
+        "key",
+        "job-large",
+        runtime=object(),
+        source_groups=[{
+            "source_kind": "history_import",
+            "source_family": "history",
+            "chunk_texts": chunks,
+        }],
+        progress=progress,
+    )
+
+    assert handled is True
+    assert sorted(captured["resumed"]) == expected_indices
+    assert {
+        index: captured["resumed"][index]["fact_candidates"][0]["summary"]
+        for index in expected_indices
+    } == {index: chunks[index] for index in expected_indices}
+    assert sorted(set(range(len(chunks))) - set(captured["resumed"])) == [1, 4, 7, 10]
+    assert progress.published[0]["stage"] == "genesis_v2_foreground"
+    assert progress.published[0]["source_pass"] == 1
+
+
 def test_v2_returns_false_when_nothing_greetable(monkeypatch):
     applied = {"n": 0}
     monkeypatch.setattr(db, "genesis_set_job_status", lambda *a, **k: None)
@@ -103,7 +184,7 @@ def test_v2_returns_false_when_nothing_greetable(monkeypatch):
     assert handled is False and applied["n"] == 0                # never greets/completes on nothing
 
 
-def test_v2_background_failure_keeps_job_done(monkeypatch):
+def test_v2_background_failure_marks_job_failed_for_retry(monkeypatch):
     last = {}
     monkeypatch.setattr(db, "genesis_set_job_status", lambda *a, **k: last.update(output=k.get("output")))
     monkeypatch.setattr(worker, "build_foreground_output_from_texts", _greetable_fg)
@@ -115,13 +196,20 @@ def test_v2_background_failure_keeps_job_done(monkeypatch):
     def boom(*a, **k):
         raise RuntimeError("provider 402 out of credits")
     monkeypatch.setattr(plaintext, "_run_plaintext_background_enrichment", boom)
+    monkeypatch.setattr(
+        service,
+        "mark_failed",
+        lambda _store, job_id, error, **_kwargs: last.update(
+            job_id=job_id, error=error, status="failed"),
+    )
 
     handled = plaintext._run_plaintext_genesis_v2(
         _Store(), "key", "job1", runtime=object(), source_groups=_groups(), relationship_anchor=None)
 
-    assert handled is True                                       # job NOT failed — already greetable
-    assert last["output"]["stage"] == "genesis_v2_background_deferred"
-    assert "402" in last["output"]["error"]
+    assert handled is True
+    assert last["status"] == "failed"
+    assert last["job_id"] == "job1"
+    assert "402" in last["error"]
 
 
 def test_v2_background_lexical_backstop_drops_near_identical(monkeypatch):
@@ -153,12 +241,16 @@ def test_v2_background_lexical_backstop_drops_near_identical(monkeypatch):
     assert applied.get("identity_applied") is True       # background writes the real identity
 
 
-def test_v2_foreground_writes_identity_greeting_then_completes(monkeypatch):
+def test_v2_foreground_writes_identity_greeting_before_background_completion(monkeypatch):
     # identity-first contract (restored from legacy chat_ready): when analysis_messages
     # exist and the deriver yields a real identity, the FOREGROUND writes identity +
-    # greeting + core, completes the job, and the background does NOT re-write identity.
-    calls = {}
-    monkeypatch.setattr(db, "genesis_set_job_status", lambda *a, **k: None)
+    # greeting + core, publishes readiness, and the background does NOT re-write identity.
+    calls = {"statuses": []}
+    monkeypatch.setattr(
+        db,
+        "genesis_set_job_status",
+        lambda *a, **k: calls["statuses"].append(k),
+    )
     monkeypatch.setattr(worker, "build_foreground_output_from_texts", _greetable_fg)
     monkeypatch.setattr(plaintext, "_plaintext_merge_reducer_outputs",
                         lambda outs, **k: {"memories": [{"summary": "用户养了一只狗叫蛋子"}]})
@@ -175,9 +267,6 @@ def test_v2_foreground_writes_identity_greeting_then_completes(monkeypatch):
                         lambda *a, **k: ("小柒: 好久不见呀", []))
     monkeypatch.setattr(history_import, "_append_model_api_onboarding_greeting",
                         lambda store, text: calls.__setitem__("greeting", text))
-    monkeypatch.setattr(db, "genesis_complete_job", lambda *a, **k: {"job_id": "job1", "status": "done"})
-    monkeypatch.setattr(service, "write_genesis_state",
-                        lambda store, job, status=None: calls.__setitem__("completed", status))
     monkeypatch.setattr(service, "apply_reducer_output",
                         lambda *a, **k: calls.__setitem__("used_apply_reducer", True))
     monkeypatch.setattr(plaintext, "_run_plaintext_background_enrichment",
@@ -191,7 +280,8 @@ def test_v2_foreground_writes_identity_greeting_then_completes(monkeypatch):
     assert handled is True
     assert calls["identity_stored"]["agent_name"] == "小柒"     # identity written in foreground
     assert "小柒" in calls["greeting"]                          # greeting written in foreground
-    assert calls["completed"] == service.DONE_JOB_STATUS         # job completed after identity+greeting
+    assert calls["statuses"][-1]["status"] == "processing"
+    assert calls["statuses"][-1]["output"]["identity_ready"] is True
     assert calls["stored_days"] == 144                           # relationship anchor days -> identity
     assert calls["bg_write_identity"] is False                   # background must NOT re-write identity
     assert "used_apply_reducer" not in calls                     # did NOT take the empty-identity fallback
@@ -236,7 +326,7 @@ def test_v2_foreground_writes_full_memory_set_and_feeds_identity_and_greeting(mo
     assert calls["greeting_memories"] == full_memories
 
 
-def test_v2_combined_flag_writes_voice_persona_before_completion(monkeypatch):
+def test_v2_combined_flag_writes_voice_persona_then_completes_remaining_windows(monkeypatch):
     calls = {"order": []}
     monkeypatch.setenv("FEEDLING_GENESIS_COMBINED_MAP", "1")
     monkeypatch.setattr(db, "genesis_set_job_status", lambda *a, **k: None)
@@ -279,15 +369,13 @@ def test_v2_combined_flag_writes_voice_persona_before_completion(monkeypatch):
     monkeypatch.setattr(service, "write_voice_artifact",
                         lambda *a, **k: calls["order"].append("voice") or ("voice-ref", "voice-sha"))
 
-    def fake_complete(*_a, **kwargs):
-        calls["order"].append("complete")
-        calls["complete"] = kwargs
-        return {"job_id": "job1", "status": "done"}
-
-    monkeypatch.setattr(db, "genesis_complete_job", fake_complete)
     monkeypatch.setattr(service, "write_genesis_state", lambda *a, **k: None)
-    monkeypatch.setattr(plaintext, "_run_plaintext_background_enrichment",
-                        lambda *a, **k: (_ for _ in ()).throw(AssertionError("combined path must not rely on background")))
+
+    def fake_background(*_args, **kwargs):
+        calls["order"].append("background")
+        calls["background"] = kwargs
+
+    monkeypatch.setattr(plaintext, "_run_plaintext_background_enrichment", fake_background)
 
     handled = plaintext._run_plaintext_genesis_v2(
         _Store(), "key", "job1", runtime=object(), source_groups=_groups(),
@@ -297,9 +385,13 @@ def test_v2_combined_flag_writes_voice_persona_before_completion(monkeypatch):
     assert handled is True
     assert calls["voice_persona_candidates"] == [{"behavior_notes_candidates": ["短句"], "exemplar_candidates": []}]
     assert calls["existing_persona"] == {"content": "p1"}
-    assert calls["order"] == ["persona", "voice", "complete"]
-    assert calls["complete"]["persona_ref"] == "persona-ref"
-    assert calls["complete"]["persona_sha256"] == "persona-sha"
+    assert calls["order"] == ["persona", "voice", "background"]
+    assert calls["background"]["source_groups"] == _groups()
+    assert calls["background"]["include_memory"] is True
+    assert calls["background"]["include_persona_voice"] is False
+    assert calls["background"]["write_identity"] is False
+    assert calls["background"]["completion"]["persona_ref"] == "persona-ref"
+    assert calls["background"]["completion"]["persona_sha256"] == "persona-sha"
 
 
 def test_v2_foreground_full_fact_write_spans_all_source_groups(monkeypatch):
@@ -397,11 +489,117 @@ def test_v2_background_can_skip_fact_write_for_voice_persona_only(monkeypatch):
     assert calls["voice"] is True
 
 
+def test_v2_combined_background_completes_every_material_window(monkeypatch):
+    chunks = [f"history-{idx}" for idx in range(12)]
+    foreground_indices = {0, 2, 3, 5, 6, 8, 9, 11}
+    calls = {}
+
+    class Progress:
+        def __init__(self):
+            self.outputs = {
+                idx: {"fact_candidates": [{"summary": chunks[idx]}]}
+                for idx in foreground_indices
+            }
+
+        def publish(self, **kwargs):
+            calls.setdefault("published", []).append(kwargs)
+
+        def resume_outputs(self, source_pass, source_family):
+            assert (source_pass, source_family) == (1, "history")
+            return dict(self.outputs)
+
+        def record_map(self, source_pass, source_family, chunk_index, output):
+            assert (source_pass, source_family) == (1, "history")
+            self.outputs[chunk_index] = output
+
+        def materials(self):
+            done = len(self.outputs)
+            return [{
+                "kind": "chat_history",
+                "status": "done" if done == len(chunks) else "processing",
+                "windows_done": done,
+                "windows_total": len(chunks),
+                "cards": done,
+            }]
+
+    progress = Progress()
+
+    def fake_build(**kwargs):
+        calls["include_memory"] = kwargs["include_memory"]
+        calls["include_persona_voice"] = kwargs["include_persona_voice"]
+        resumed = kwargs["resume_map_outputs"]
+        for idx, text in enumerate(kwargs["chunk_texts"]):
+            if idx not in resumed:
+                kwargs["on_map_completed"](
+                    idx, {"fact_candidates": [{"summary": text}]})
+        return {
+            "memories": [{"summary": text} for text in kwargs["chunk_texts"]],
+            "source_family": "history",
+        }
+
+    monkeypatch.setattr(worker, "build_reducer_output_from_texts", fake_build)
+    monkeypatch.setattr(
+        plaintext,
+        "_plaintext_merge_reducer_outputs",
+        lambda outputs, **_kwargs: outputs[0],
+    )
+    monkeypatch.setattr(
+        service,
+        "apply_memory_outputs",
+        lambda *_args: (4, []),
+    )
+    monkeypatch.setattr(service, "write_persona_artifact", lambda *_args: ("", ""))
+    monkeypatch.setattr(service, "write_voice_artifact", lambda *_args: ("", ""))
+    monkeypatch.setattr(
+        db,
+        "genesis_complete_job",
+        lambda *_args, **kwargs: calls.update(completed=kwargs) or {
+            "job_id": "job-large",
+            "status": "done",
+            "output": kwargs["output"],
+        },
+    )
+    monkeypatch.setattr(service, "write_genesis_state", lambda *_args, **_kwargs: None)
+
+    plaintext._run_plaintext_background_enrichment(
+        _Store(),
+        "key",
+        "job-large",
+        runtime=object(),
+        source_groups=[{
+            "source_kind": "history_import",
+            "source_family": "history",
+            "chunk_texts": chunks,
+        }],
+        relationship_anchor=None,
+        skip_family="history",
+        skip_texts=set(),
+        known_memories=["foreground memory"],
+        write_identity=False,
+        include_memory=True,
+        include_persona_voice=False,
+        progress=progress,
+        completion={
+            "memory_action_count": 8,
+            "identity_status": "initialized",
+            "persona_ref": "persona-ref",
+            "persona_sha256": "persona-sha",
+        },
+    )
+
+    assert calls["include_memory"] is True
+    assert calls["include_persona_voice"] is False
+    assert sorted(progress.outputs) == list(range(12))
+    assert calls["completed"]["memory_action_count"] == 12
+    assert calls["completed"]["output"]["materials"][0]["windows_done"] == 12
+    assert calls["completed"]["output"]["materials"][0]["windows_total"] == 12
+
+
 def test_v2_foreground_salvages_identity_from_support_card(monkeypatch):
     # LLM derive fails/empty, but the upload includes a character-card support message
     # with an explicit name -> the non-LLM lightweight fallback salvages it, and the
-    # salvaged identity flows through the normal identity-first write path (job DONE,
-    # never failed).
+    # salvaged identity flows through the normal identity-first write path before
+    # background completion and never fails.
     calls = {}
     monkeypatch.setattr(db, "genesis_set_job_status", lambda *a, **k: None)
     monkeypatch.setattr(worker, "build_foreground_output_from_texts", _greetable_fg)
@@ -414,10 +612,12 @@ def test_v2_foreground_salvages_identity_from_support_card(monkeypatch):
                         lambda store, payload, **k: calls.update(payload=payload))
     monkeypatch.setattr(history_import, "_generate_model_api_onboarding_greeting", lambda *a, **k: ("", []))
     monkeypatch.setattr(history_import, "_append_model_api_onboarding_greeting", lambda *a, **k: None)
-    monkeypatch.setattr(db, "genesis_complete_job",
-                        lambda *a, **k: calls.update(completed=True) or {"job_id": "job1"})
     monkeypatch.setattr(service, "write_genesis_state", lambda *a, **k: None)
-    monkeypatch.setattr(plaintext, "_run_plaintext_background_enrichment", lambda *a, **k: None)
+    monkeypatch.setattr(
+        plaintext,
+        "_run_plaintext_background_enrichment",
+        lambda *a, **k: calls.update(background=True),
+    )
     monkeypatch.setattr(service, "mark_failed",
                         lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not fail when salvage succeeds")))
 
@@ -436,7 +636,7 @@ def test_v2_foreground_salvages_identity_from_support_card(monkeypatch):
 
     assert handled is True
     assert calls["payload"]["agent_name"] == "阿樟"
-    assert calls.get("completed") is True
+    assert calls.get("background") is True
 
 
 def test_v2_fresh_start_with_empty_core_still_greets(monkeypatch):
@@ -475,9 +675,8 @@ def test_v2_fresh_start_with_empty_core_still_greets(monkeypatch):
     assert calls["greeting"] == "你好，很高兴认识你。我现在还没有名字，你想以后怎么称呼我？"
     assert calls.get("used_apply_reducer") is True               # nameless done
     # No material by definition -> background enrichment must NOT run: it would
-    # re-reduce the pure sentinel as history with write_identity=True (prod runs
-    # WITHOUT FEEDLING_GENESIS_COMBINED_MAP, so that path is reachable there)
-    # and could invent persona/identity from synthetic text.
+    # re-reduce the pure sentinel as history with write_identity=True and could
+    # invent persona/identity from synthetic text, regardless of deployment flags.
     assert "bg_write_identity" not in calls
 
 

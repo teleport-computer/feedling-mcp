@@ -577,7 +577,7 @@ def test_admin_data_track_sorts_before_pagination(client):
     assert page.status_code == 200, page.get_data(as_text=True)
     html = page.get_data(as_text=True)
     assert "Chat desc" in html
-    assert "DAU" in html
+    assert "日活与时长" in html
     assert "Memory asc" in html
     assert "Proactive desc" in html
 
@@ -662,7 +662,22 @@ def test_effective_responder_covers_v2_resident_and_none_states():
         now_epoch=1_000.0,
     )
     assert hosted_v2["effective_responder"] == "hosted_v2"
+    assert hosted_v2["runtime_state"] == "v2"
     assert hosted_v2["mismatch"] is False
+
+    draining = _dt._effective_responder(
+        route="model_api",
+        consumer_state=None,
+        runtime={
+            "hosted_runtime_state": "draining",
+            "model_api_route": {"is_active": True, "test_status": "ok"},
+            "runner_lease": {"active": False},
+        },
+        now_epoch=1_000.0,
+    )
+    assert draining["effective_responder"] == "hosted_v2"
+    assert draining["runtime_state"] == "draining"
+    assert draining["mismatch"] is False
 
     resident = _dt._effective_responder(
         route="resident",
@@ -678,6 +693,7 @@ def test_effective_responder_covers_v2_resident_and_none_states():
         now_epoch=1_000.0,
     )
     assert resident["effective_responder"] == "resident"
+    assert resident["runtime_state"] == "resident"
     assert resident["mismatch"] is False
 
     none = _dt._effective_responder(
@@ -726,6 +742,68 @@ def test_effective_responder_covers_v2_resident_and_none_states():
     assert stale_hosted["mismatch"] is False
     assert stale_hosted["poll_observations"][0]["recent"] is False
     assert stale_hosted["recent_poll_observations"] == []
+
+
+def test_admin_runtime_state_filter_is_strict_and_links_preserve_query(client):
+    v2_user, _ = _register(client)
+    draining_user, _ = _register(client)
+    resident_user, _ = _register(client)
+    _append_chat_at(
+        v2_user,
+        "msg-v2-activated",
+        "user",
+        "chat",
+        _epoch("2030-06-01T12:00:00Z"),
+    )
+    with db.get_pool().connection() as conn:
+        for user_id, runtime_state in (
+            (v2_user, "v2"),
+            (draining_user, "draining"),
+            (resident_user, "resident"),
+        ):
+            conn.execute(
+                "INSERT INTO v2_runtime_state (user_id,hosted_runtime_state) "
+                "VALUES (%s,%s) ON CONFLICT (user_id) DO UPDATE SET "
+                "hosted_runtime_state=EXCLUDED.hosted_runtime_state",
+                (user_id, runtime_state),
+            )
+
+    query = (
+        "runtime_state=v2&q=usr_&sort=chat&dir=asc&limit=1&offset=0"
+    )
+    response = client.get(
+        f"/v1/admin/data-track/users?{query}",
+        headers=_admin_headers(),
+    )
+    assert response.status_code == 200, response.get_data(as_text=True)
+    body = response.get_json()
+    assert [row["user_id"] for row in body["users"]] == [v2_user]
+    assert body["users"][0]["responder"]["runtime_state"] == "v2"
+    assert body["summary"]["runtime_state_counts"] == {"v2": 1}
+    assert body["summary"]["activated_runtime_state_counts"] == {"v2": 1}
+    assert body["filters"]["runtime_state"] == "v2"
+
+    page = client.get(
+        "/admin/data-track?admin_key=admin-test-token&" + query,
+        headers=_admin_headers(),
+    )
+    assert page.status_code == 200, page.get_data(as_text=True)
+    rendered = page.get_data(as_text=True).replace("&amp;", "&")
+    assert v2_user in rendered
+    assert draining_user not in rendered
+    assert resident_user not in rendered
+    assert "Hosted V2 账号行（当前筛选）" in rendered
+    assert "已激活 Hosted V2 账号行（当前筛选）" in rendered
+    assert '<div class="table-wrap"><table id="users">' in rendered
+    assert 'lang="zh-CN"' in rendered
+    assert (
+        f"/admin/data-track/users/{v2_user}?admin_key=admin-test-token"
+        "&q=usr_&limit=1&offset=0&sort=chat&dir=asc&runtime_state=v2"
+    ) in rendered
+    assert (
+        "/admin/data-track?admin_key=admin-test-token&q=usr_&limit=1&offset=0"
+        "&sort=chat&dir=asc&runtime_state=draining"
+    ) in rendered
 
 
 # App usage-duration rendering (app_session_end aggregation surfaced in the overview).
@@ -945,11 +1023,15 @@ def test_admin_data_track_page_uses_plain_language(client, monkeypatch):
     assert "怎么读这些数" in page          # the explainer note-box
     assert "没有、也无法有「已删除账户数」" in page
     assert "App 使用时长" in page
-    assert "运营 Telemetry" in page
-    assert "全站 V2 token 总量（近 30 天）" in page
-    assert "12,345" in page
-    assert "自托管激活账号（当前筛选）" in page
-    assert "可观测账号覆盖数" in page
+    assert "Runtime 人群" in page
+    assert "实际 Runtime" in page
+    assert "Resident / V1" in page
+    assert "Token 与模型用量已移到独立页面" in page
+    assert "打开 Token 与模型" in page
+    assert "运营 Telemetry" not in page
+    assert "全站 V2 token 总量" not in page
+    assert "12,345" not in page
+    assert "自托管激活账号（当前筛选）" not in page
     assert "已激活 / 原始行" not in page    # old jargon gone
 
 
@@ -1164,6 +1246,150 @@ def test_detail_payload_exposes_content_free_route_errors_and_notice_summaries(c
     assert "private-free-form-detail" not in serialized
     assert "private-prompt" not in serialized
     assert "private-dedupe" not in serialized
+
+
+def test_detail_payload_exposes_content_free_v2_profile_status_true_pg(client):
+    from model_api_runtime.v2 import profile_store
+
+    user_id, _api_key = _register(client)
+    endpoint = f"/v1/admin/data-track/users/{user_id}"
+
+    missing = client.get(endpoint, headers=_admin_headers())
+    assert missing.status_code == 200
+    assert missing.get_json()["user"]["v2_profile"] == {"state": "missing"}
+
+    pending_doc = profile_store.build_profile_document(
+        user_id,
+        state="pending",
+        source={
+            "card_count": 7,
+            "max_updated_at": "2026-08-01T10:00:00Z",
+            "generated_at": "2026-08-01T10:01:00Z",
+        },
+        last_attempt={
+            "at": "2026-08-01T10:01:00Z",
+            "reject_code": "provider_retry",
+            "attempts": 2,
+            "retry_not_before": 1_785_580_860,
+        },
+        disabled=False,
+    )
+    db.set_blob(user_id, profile_store.PROFILE_BLOB_KIND, pending_doc)
+
+    pending = client.get(endpoint, headers=_admin_headers())
+    assert pending.status_code == 200
+    assert pending.get_json()["user"]["v2_profile"] == {
+        "state": "pending",
+        "memory_chars": 0,
+        "user_chars": 0,
+        "source": {
+            "card_count": 7,
+            "max_updated_at": "2026-08-01T10:00:00Z",
+            "generated_at": "2026-08-01T10:01:00Z",
+        },
+        "last_attempt": {
+            "reject_code": "provider_retry",
+            "attempts": 2,
+            "retry_not_before": 1_785_580_860.0,
+        },
+        "disabled": False,
+    }
+
+    ok_doc = profile_store.build_profile_document(
+        user_id,
+        state="ok",
+        source={
+            "card_count": 8,
+            "max_updated_at": "2026-08-02T10:00:00Z",
+            "generated_at": "2026-08-02T10:01:00Z",
+        },
+        last_attempt={
+            "at": "2026-08-02T10:01:00Z",
+            "reject_code": "",
+            "attempts": 3,
+            "retry_not_before": 0,
+        },
+        memory_text="private memory profile",
+        user_text="private user profile",
+        seal_text=lambda _uid, text: {
+            "body_ct": f"private-ciphertext-{len(text)}",
+            "nonce": "private-nonce",
+        },
+        disabled=True,
+    )
+    db.set_blob(user_id, profile_store.PROFILE_BLOB_KIND, ok_doc)
+
+    ok = client.get(endpoint, headers=_admin_headers())
+    assert ok.status_code == 200
+    user_detail = ok.get_json()["user"]
+    profile = user_detail["v2_profile"]
+    assert profile == {
+        "state": "ok",
+        "memory_chars": len("private memory profile"),
+        "user_chars": len("private user profile"),
+        "source": {
+            "card_count": 8,
+            "max_updated_at": "2026-08-02T10:00:00Z",
+            "generated_at": "2026-08-02T10:01:00Z",
+        },
+        "last_attempt": {
+            "reject_code": "",
+            "attempts": 3,
+            "retry_not_before": 0.0,
+        },
+        "disabled": True,
+    }
+    serialized = json.dumps(user_detail, sort_keys=True)
+    assert "envelope" not in serialized
+    assert "body_ct" not in serialized
+    assert "private" not in serialized
+
+
+def test_v2_profile_detail_is_allowlisted_truncated_and_read_safe(monkeypatch):
+    from admin import data_track as data_track
+
+    monkeypatch.setattr(
+        data_track.db,
+        "get_blob_strict",
+        lambda *_args: {
+            "state": "degraded",
+            "memory": {"chars": 4, "envelope": {"body_ct": "secret"}},
+            "user": {"chars": 5, "envelope": {"body_ct": "secret"}},
+            "source": {
+                "card_count": 6,
+                "max_updated_at": "latest",
+                "generated_at": "generated",
+                "private_source": "secret",
+            },
+            "last_attempt": {
+                "reject_code": "r" * 200,
+                "attempts": 7,
+                "retry_not_before": 8,
+                "private_error": "secret",
+            },
+            "disabled": False,
+            "plaintext": "secret",
+        },
+    )
+
+    detail = data_track._v2_profile_detail("usr_test")
+    assert detail["last_attempt"]["reject_code"] == "r" * 160
+    assert set(detail) == {
+        "state", "memory_chars", "user_chars", "source", "last_attempt", "disabled"
+    }
+    assert set(detail["source"]) == {
+        "card_count", "max_updated_at", "generated_at"
+    }
+    assert set(detail["last_attempt"]) == {
+        "reject_code", "attempts", "retry_not_before"
+    }
+    assert "secret" not in json.dumps(detail, sort_keys=True)
+
+    def _fail(*_args):
+        raise RuntimeError("database unavailable")
+
+    monkeypatch.setattr(data_track.db, "get_blob_strict", _fail)
+    assert data_track._v2_profile_detail("usr_test") == {"state": "read_error"}
 
 
 def test_detail_payload_exposes_capture_validation_decisions(client):

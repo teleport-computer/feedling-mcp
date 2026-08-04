@@ -46,6 +46,18 @@ def memory_result_metadata(tool_name: str, result: Mapping[str, Any]) -> dict:
         return {}
     items = data["items"]
     metadata: dict[str, Any] = {"memory_count": len(items)}
+    if str(tool_name) in {"memory_index", "memory_search"}:
+        has_completeness = False
+        for source_key, metadata_key in (
+            ("total", "memory_total"),
+            ("returned", "memory_returned"),
+        ):
+            value = data.get(source_key)
+            if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+                metadata[metadata_key] = value
+                has_completeness = True
+        if has_completeness:
+            metadata["memory_query_kind"] = str(tool_name)
     if not items:
         return metadata
 

@@ -7,7 +7,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "backend"))
 from memory.dream_prompt_v1 import (  # noqa: E402
     DREAM_OPS,
     build_dream_prompt,
+    build_dream_review_prompt,
     parse_dream_consolidations,
+    parse_dream_review,
 )
 
 _FENCE = "`" * 3
@@ -22,6 +24,7 @@ def test_prompt_renders_with_context_and_escaped_json():
     assert "我们的关系" in p
     assert '"consolidations": []' in p
     assert '"op": "merge | thicken | supersede"' in p
+    assert '"rationale"' in p
     # red line present
     assert "superseded" in p and "不删" in p
 
@@ -62,6 +65,7 @@ def test_reserved_placeholder_user_name_treated_as_unknown():
 
 def test_parse_normal_consolidation():
     raw = ('{"consolidations":[{"op":"merge","card_ids":["a","b"],'
+           '"rationale":"同一加班事件的连续记录",'
            '"result":{"bucket":"工作","threads":["加班"],"summary":"合并卡",'
            '"content":"厚正文","importance":0.7,"pulse":0.3}}],'
            '"questions_to_ask":["要不要问 TA X"]}')
@@ -69,6 +73,7 @@ def test_parse_normal_consolidation():
     assert err is None and len(cons) == 1
     c = cons[0]
     assert c["op"] == "merge" and c["card_ids"] == ["a", "b"]
+    assert c["rationale"] == "同一加班事件的连续记录"
     assert c["result"]["summary"] == "合并卡" and c["result"]["importance"] == 0.7
     assert qs == ["要不要问 TA X"]
 
@@ -92,10 +97,19 @@ def test_parse_drops_consolidation_without_card_ids():
     assert cons == [] and err is None  # Dream only edits existing cards
 
 
+def test_parse_drops_consolidation_without_rationale():
+    cons, qs, err = parse_dream_consolidations(
+        '{"consolidations":[{"op":"merge","card_ids":["a","b"],'
+        '"result":{"summary":"标题","content":"正文"}}]}'
+    )
+    assert cons == [] and qs == [] and err is None
+
+
 def test_parse_bounces_hollow_result():
     # 空 result 以前静默丢弃;现在严格模式打回(让调用方重问一次),
     # 放宽模式(打回后的第二问)才只丢这一行。
-    raw = '{"consolidations":[{"op":"thicken","card_ids":["a"],"result":{}}]}'
+    raw = ('{"consolidations":[{"op":"thicken","card_ids":["a"],'
+           '"rationale":"为同一张卡补充新事实","result":{}}]}')
     cons, qs, err = parse_dream_consolidations(raw)
     assert cons == [] and err == "invalid_card_content:summary_empty"
     # 放宽的第二问里它是唯一一行 → 全脏,报 after_retry 让 job 失败(别推进 frontier)
@@ -105,6 +119,7 @@ def test_parse_bounces_hollow_result():
 
 def test_parse_handles_fence_and_prose_and_clamps():
     raw = ("整理完了：" + _FENCE + 'json\n{"consolidations":[{"op":"supersede","card_ids":["old"],'
+           '"rationale":"同一事实已有更新",'
            '"result":{"summary":"标题","content":"正文","importance":5,"pulse":-2}}]}\n' + _FENCE)
     cons, qs, err = parse_dream_consolidations(raw)
     assert err is None and len(cons) == 1
@@ -126,3 +141,32 @@ def test_parse_keeps_questions_even_when_no_consolidations():
 
 def test_dream_ops_are_merge_thicken_supersede():
     assert set(DREAM_OPS) == {"merge", "thicken", "supersede"}
+
+
+def test_review_prompt_contains_source_cards_proposal_and_evolution_rule():
+    prompt = build_dream_review_prompt(
+        consolidation={
+            "op": "merge",
+            "card_ids": ["plan", "ticket"],
+            "rationale": "同一京都计划从意向推进到出票",
+            "result": {"summary": "11 月去京都", "content": "已经订票。"},
+        },
+        source_cards=[
+            {"id": "plan", "summary": "想去京都看红叶", "content": "计划秋天出发。"},
+            {"id": "ticket", "summary": "订了京都机票", "content": "航班在 11 月。"},
+        ],
+    )
+
+    assert "同一事件" in prompt and "文字相似不是必要条件" in prompt
+    assert "想去京都看红叶" in prompt and "订了京都机票" in prompt
+    assert "同一京都计划从意向推进到出票" in prompt
+
+
+def test_parse_review_requires_explicit_decision_and_reason():
+    yes, error = parse_dream_review('{"decision":"yes","reason":"同一京都计划的演进"}')
+    no, no_error = parse_dream_review('{"decision":"no","reason":"只是同属健康主题"}')
+
+    assert error is None and yes == {"approved": True, "reason": "同一京都计划的演进"}
+    assert no_error is None and no == {"approved": False, "reason": "只是同属健康主题"}
+    assert parse_dream_review('{"decision":"yes","reason":""}')[1] == "dream_review_reason_required"
+    assert parse_dream_review('{"decision":"maybe","reason":"不确定"}')[1] == "dream_review_decision_required"

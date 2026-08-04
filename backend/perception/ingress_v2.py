@@ -23,6 +23,8 @@ class IngressObservationV2:
     signal: str
     value: Any
     origin_refs: tuple[str, ...] = ()
+    source_event_id: str | None = None
+    allow_first_event: bool = False
 
 
 @dataclass(frozen=True)
@@ -57,12 +59,21 @@ def observe_signal_v2(
     *,
     ts: float | None = None,
     origin_refs: Iterable[str] = (),
+    source_event_id: str | None = None,
+    allow_first_event: bool = False,
     differ: PerceptionDifferV2 | None = None,
     submit_wake: Callable[[WakeEventV2], None] | None = None,
 ) -> IngressObserveResultV2:
     ts = time.time() if ts is None else float(ts)
     active_differ = differ or DEFAULT_DIFFER_V2
-    result = active_differ.observe(user_id, signal, value, ts=ts)
+    result = active_differ.observe(
+        user_id,
+        signal,
+        value,
+        ts=ts,
+        source_event_id=source_event_id,
+        allow_first_event=allow_first_event,
+    )
     wake_events = tuple(
         wake_event_from_differ_event_v2(
             user_id,
@@ -100,10 +111,22 @@ def device_event_observations_v2(event: Mapping[str, Any]) -> tuple[IngressObser
 
     wake_trigger = str(payload.get("wake_trigger") or "").strip().lower()
     if event_type == "unlock_after_absence" or wake_trigger == "unlock_after_absence":
-        out.append(IngressObservationV2("unlock_after_absence", True, origin))
+        out.append(IngressObservationV2(
+            "unlock_after_absence",
+            True,
+            origin,
+            source_event_id=event_id or None,
+            allow_first_event=True,
+        ))
 
     phash = payload.get("safe_screen_phash") or payload.get("screen_phash")
     broadcast_state = str(payload.get("broadcast_state") or "").strip().lower()
     if phash and broadcast_state in {"on", "broadcasting"}:
-        out.append(IngressObservationV2("screen_phash", str(phash), origin))
+        out.append(IngressObservationV2(
+            "screen_phash",
+            str(phash),
+            origin,
+            source_event_id=event_id or None,
+            allow_first_event=True,
+        ))
     return tuple(out)

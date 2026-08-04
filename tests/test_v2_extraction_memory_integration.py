@@ -126,6 +126,7 @@ def test_dream_parser_mapper_and_real_validator_supersede_all_sources(monkeypatc
         "consolidations": [{
             "op": "merge",
             "card_ids": ["memory-a", "memory-b"],
+            "rationale": "两张卡都是晨间手冲这一稳定偏好的记录",
             "result": {
                 "summary": "用户稳定地喜欢自己做咖啡。",
                 "content": "多次提到晨间手冲，合并为一个稳定偏好。",
@@ -158,3 +159,145 @@ def test_dream_parser_mapper_and_real_validator_supersede_all_sources(monkeypatc
     assert new["supersedes"] == ["memory-a", "memory-b"]
     assert new["source"] == "memory_dream"
     assert new["occurred_at"] == "2026-07-18T10:00:00Z"
+
+
+def test_dream_apply_allows_prior_run_dream_output_without_long_cooldown(monkeypatch):
+    user_id = "dream-cooldown-user"
+    store = types.SimpleNamespace(user_id=user_id)
+    recent = _old_card(user_id, "dream-recent")
+    recent["source"] = "memory_dream"
+    recent["created_at"] = "2999-01-01T00:00:00Z"
+    moments = [recent]
+    saved = _install_storage(monkeypatch, moments)
+    actions, _added, _superseded = extraction.consolidations_to_actions(
+        [{
+            "op": "thicken",
+            "card_ids": ["dream-recent"],
+            "rationale": "同一线索出现了新的演进事实",
+            "result": {"summary": "new", "content": "new body"},
+        }],
+        occurred_at="2026-08-01T00:00:00Z",
+        source_ids=[],
+        build_envelope=_builder(user_id),
+    )
+
+    body, status = memory_actions._execute_memory_actions(store, None, actions)
+
+    assert status == 200 and body["applied_count"] == 1
+    assert len(saved) == 2
+    assert moments[0]["status"] == "superseded"
+
+
+def test_dream_apply_has_no_five_rewrite_cap(monkeypatch):
+    user_id = "dream-cap-user"
+    store = types.SimpleNamespace(user_id=user_id)
+    moments = [_old_card(user_id, f"memory-{i}") for i in range(12)]
+    saved = _install_storage(monkeypatch, moments)
+    builder = _builder(user_id)
+    actions = []
+    for i in range(6):
+        mapped, _added, _superseded = extraction.consolidations_to_actions(
+            [{
+                "op": "merge",
+                "card_ids": [f"memory-{i * 2}", f"memory-{i * 2 + 1}"],
+                "rationale": "独立二审已确认同一线索",
+                "result": {"summary": f"merged-{i}", "content": f"body-{i}"},
+            }],
+            occurred_at="2026-08-01T00:00:00Z",
+            source_ids=[],
+            build_envelope=builder,
+        )
+        actions.extend(mapped)
+
+    body, status = memory_actions._execute_memory_actions(store, None, actions)
+
+    assert status == 200 and body["applied_count"] == 6
+    assert len(saved) == 18
+    assert all(
+        moment["status"] == "superseded"
+        for moment in moments
+        if moment["id"].startswith("memory-")
+    )
+
+
+def test_dream_apply_has_no_four_retired_card_cap(monkeypatch):
+    user_id = "dream-retired-cap-user"
+    store = types.SimpleNamespace(user_id=user_id)
+    moments = [_old_card(user_id, f"memory-{i}") for i in range(6)]
+    saved = _install_storage(monkeypatch, moments)
+    builder = _builder(user_id)
+    actions = []
+    for offset in (0, 3):
+        mapped, _added, _superseded = extraction.consolidations_to_actions(
+            [{
+                "op": "merge",
+                "card_ids": [f"memory-{i}" for i in range(offset, offset + 3)],
+                "rationale": "独立二审已确认三张卡是同一事件演进",
+                "result": {"summary": f"merged-{offset}", "content": "merged body"},
+            }],
+            occurred_at="2026-08-01T00:00:00Z",
+            source_ids=[],
+            build_envelope=builder,
+        )
+        actions.extend(mapped)
+
+    body, status = memory_actions._execute_memory_actions(store, None, actions)
+
+    assert status == 200 and body["applied_count"] == 2
+    assert len(saved) == 8
+    assert all(
+        moment["status"] == "superseded"
+        for moment in moments
+        if moment["id"].startswith("memory-")
+    )
+
+
+def test_dream_live_rig_shape_persists_only_duplicate_merge(monkeypatch):
+    user_id = "dream-live-rig-user"
+    store = types.SimpleNamespace(user_id=user_id)
+    candidates = [
+        {"id": "freeze-a", "summary": "小波爱吃冻干", "content": "小波最喜欢吃鸡肉冻干，会当作日常零食。"},
+        {"id": "freeze-b", "summary": "小波爱吃冻干", "content": "小波喜欢吃鸡肉冻干，平时会当作零食。"},
+        {"id": "cycling", "summary": "周末骑行", "content": "计划沿江骑行四十公里。"},
+        {"id": "coffee", "summary": "手冲咖啡", "content": "早晨用 V60 和浅烘豆冲咖啡。"},
+        {"id": "kyoto", "summary": "京都旅行", "content": "秋天想去京都看红叶和寺院。"},
+        {"id": "project", "summary": "项目截止", "content": "发布版本截止日期是九月十五日。"},
+        {"id": "birthday", "summary": "家人生日", "content": "妈妈生日是五月十二日。"},
+        {"id": "insomnia", "summary": "最近失眠", "content": "连续三晚凌晨两点后才睡着。"},
+    ]
+    moments = [_old_card(user_id, card["id"]) for card in candidates]
+    saved = _install_storage(monkeypatch, moments)
+    pairings = [
+        ["freeze-a", "freeze-b"],
+        ["cycling", "coffee"],
+        ["kyoto", "project"],
+        ["birthday", "insomnia"],
+    ]
+    actions, _added, superseded = extraction.consolidations_to_actions(
+        [
+            {
+                "op": "merge",
+                "card_ids": pair,
+                "rationale": "批处理模型声称它们属于同一线索",
+                **({"_review_approved": True} if pair == pairings[0] else {}),
+                "result": {"summary": "模型合并结果", "content": "模型合并后的正文。"},
+            }
+            for pair in pairings
+        ],
+        occurred_at="2026-08-03T00:00:00Z",
+        source_ids=[],
+        build_envelope=_builder(user_id),
+        existing_cards=candidates,
+    )
+
+    body, status = memory_actions._execute_memory_actions(store, None, actions)
+
+    assert status == 200 and body["applied_count"] == 1
+    assert superseded == 2
+    assert len(saved) == 9
+    by_id = {item["id"]: item for item in saved}
+    assert by_id["freeze-a"]["status"] == "superseded"
+    assert by_id["freeze-b"]["status"] == "superseded"
+    for memory_id in ("cycling", "coffee", "kyoto", "project", "birthday", "insomnia"):
+        assert by_id[memory_id]["status"] == "active"
+    assert sum(1 for item in saved if item.get("status") == "active") == 7

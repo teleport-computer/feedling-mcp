@@ -98,7 +98,7 @@ services:
   # baked into REPORT_DATA. Moving this behind ingress would break the
   # Phase 3 pinning guarantee.
   enclave:
-    image: &enclave-image ghcr.io/teleport-computer/feedling:f40d13a
+    image: &enclave-image ghcr.io/teleport-computer/feedling:f1fada2
     command: &enclave-command ["python", "-u", "backend/enclave_app.py"]
     restart: unless-stopped
     environment:
@@ -178,7 +178,7 @@ services:
   # a safe no-op unless invoked with --force.
 
   backend:
-    image: ghcr.io/teleport-computer/feedling:f40d13a
+    image: ghcr.io/teleport-computer/feedling:f1fada2
     # gunicorn (uvicorn ASGI worker) = production server (the Werkzeug dev server stalls on large
     # responses under TDX). Worker count now comes from FEEDLING_BACKEND_WORKERS
     # (backend/gunicorn_conf.py, default 1) — NOT a `-w` flag — so the default is
@@ -330,6 +330,8 @@ services:
       FEEDLING_MIGRATE_ENABLE: "${FEEDLING_MIGRATE_ENABLE:-}"
       # Runtime-token secret shared by backend, enclave, and pooled V2 worker.
       FEEDLING_RUNTIME_TOKEN_SECRET: "${FEEDLING_RUNTIME_TOKEN_SECRET:-}"
+      FEEDLING_RUNTIME_TOKEN_SECRET_PREVIOUS: "${FEEDLING_RUNTIME_TOKEN_SECRET_PREVIOUS:-}"
+      FEEDLING_PERCEPTION_REBASELINE_UNKNOWN_KEYS: "${FEEDLING_PERCEPTION_REBASELINE_UNKNOWN_KEYS:-0}"
     ports:
       - "5001:5001"
       - "9998:9998"
@@ -349,7 +351,7 @@ services:
   # (deploy/docker-compose.phala.runner.yaml) is unrelated extra V2 capacity
   # and is untouched by this change.
   serve-worker:
-    image: ghcr.io/teleport-computer/feedling:f40d13a
+    image: ghcr.io/teleport-computer/feedling:f1fada2
     container_name: serve-worker
     command: ["python", "-u", "backend/model_api_runtime/v2/serve_worker.py"]
     restart: unless-stopped
@@ -368,7 +370,9 @@ services:
       FEEDLING_GENESIS_WORKER_ENABLED: "1"
       # Runtime V2 background memory lanes execute in this worker, not backend.
       FEEDLING_V2_CAPTURE_ENABLED: "${FEEDLING_V2_CAPTURE_ENABLED:-1}"
-      FEEDLING_V2_DREAM_ENABLED: "${FEEDLING_V2_DREAM_ENABLED:-1}"
+      # Dream is intentionally always on in test after the guarded rewrite
+      # passed live convergence and non-destructive merge verification.
+      FEEDLING_V2_DREAM_ENABLED: "1"
       # CVM-local in-process sandbox: PDF/DOCX/XLSX materialize + extract inside
       # the serve-worker (no E2B), staying within the TDX trust boundary.
       FEEDLING_V2_SANDBOX_PROVIDER: "local"

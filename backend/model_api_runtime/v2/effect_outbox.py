@@ -25,6 +25,7 @@ _PENDING_EFFECT_STATUSES = frozenset({"pending", "pending_fenced_v1"})
 # contract and never need to know about the agent-job admission protocol.
 FINAL_REPLY_FENCE_KEY = "_final_reply_fence"
 REPLY_SOURCE_FENCE_KEY = "_reply_source_fence"
+PERCEPTION_GLANCE_FINGERPRINT_KEY = "_perception_glance_fingerprint"
 FINAL_REPLY_EFFECT_TYPE = "reply_final_fenced_v1"
 TERMINAL_REPLY_EFFECT_TYPE = "reply_terminal_fenced_v1"
 INTERMEDIATE_REPLY_EFFECT_TYPE = "reply_intermediate_fenced_v1"
@@ -312,6 +313,25 @@ def _exact_nonnegative_json_int(value) -> int | None:
     if type(value) is not int or value < 0:
         return None
     return value
+
+
+_MISSING = object()
+
+
+def _pop_perception_glance_fingerprint(
+    payload: dict,
+) -> tuple[str | None, bool]:
+    """Remove internal terminal metadata and validate exact SHA-256 hex."""
+    value = payload.pop(PERCEPTION_GLANCE_FINGERPRINT_KEY, _MISSING)
+    if value is _MISSING:
+        return None, True
+    if (
+        type(value) is not str
+        or len(value) != 64
+        or any(char not in "0123456789abcdef" for char in value)
+    ):
+        return None, False
+    return value, True
 
 
 def _lock_active_reply_source_job(
@@ -620,6 +640,7 @@ def _complete_final_reply_job_on_cursor(
     job_id,
     claimed_by: str,
     input_generation: int,
+    perception_glance_fingerprint: str | None = None,
 ) -> int:
     """Consume the exact source job as part of final-reply publication.
 
@@ -643,6 +664,19 @@ def _complete_final_reply_job_on_cursor(
     row = cur.fetchone()
     if row is None or cur.rowcount != 1:
         raise RuntimeError("final reply source job completion lost ownership")
+    if perception_glance_fingerprint is not None:
+        if str(row[1]) != "heartbeat":
+            raise RuntimeError(
+                "perception glance fingerprint source is not a heartbeat"
+            )
+        from model_api_runtime.v2 import jobs_store
+
+        jobs_store._merge_completed_perception_glance_on_cursor(
+            cur,
+            user_id=str(user_id),
+            source_job_id=int(job_id),
+            fingerprint=perception_glance_fingerprint,
+        )
     # This is the same normal-success clear previously performed by
     # jobs_store.finish_chat_job. A proactive/wake success must not erase an
     # unresolved failed-chat chip, so only chat-source publication owns it.
@@ -852,8 +886,14 @@ def apply_pending_effects(
                             final_reply_discard_reason = None
                             final_reply_claimed_by = None
                             final_reply_input_generation = None
+                            perception_glance_fingerprint = None
+                            perception_glance_fingerprint_valid = True
                             reply_mode = "ordinary"
                             if deferred_dispatch_error is None:
+                                (
+                                    perception_glance_fingerprint,
+                                    perception_glance_fingerprint_valid,
+                                ) = _pop_perception_glance_fingerprint(payload)
                                 try:
                                     (
                                         final_reply_discard_reason,
@@ -871,6 +911,49 @@ def apply_pending_effects(
                                     )
                                 except Exception as exc:  # trusted metadata, fail closed
                                     deferred_dispatch_error = exc
+                            if (
+                                deferred_dispatch_error is None
+                                and final_reply_discard_reason is None
+                                and not perception_glance_fingerprint_valid
+                            ):
+                                final_reply_discard_reason = (
+                                    FINAL_REPLY_INVALID_FENCE
+                                )
+                            if (
+                                deferred_dispatch_error is None
+                                and final_reply_discard_reason is None
+                                and perception_glance_fingerprint is not None
+                            ):
+                                if (
+                                    reply_mode not in {"final", "terminal"}
+                                    or str(effect_type)
+                                    not in {
+                                        FINAL_REPLY_EFFECT_TYPE,
+                                        TERMINAL_REPLY_EFFECT_TYPE,
+                                    }
+                                ):
+                                    final_reply_discard_reason = (
+                                        FINAL_REPLY_INVALID_FENCE
+                                    )
+                                else:
+                                    cur.execute(
+                                        "SELECT lane FROM agent_jobs "
+                                        "WHERE id=%s AND user_id=%s "
+                                        "AND claimed_by=%s",
+                                        (
+                                            job_id,
+                                            user_id,
+                                            final_reply_claimed_by,
+                                        ),
+                                    )
+                                    glance_source = cur.fetchone()
+                                    if (
+                                        glance_source is None
+                                        or str(glance_source[0]) != "heartbeat"
+                                    ):
+                                        final_reply_discard_reason = (
+                                            FINAL_REPLY_INVALID_FENCE
+                                        )
                             if (
                                 deferred_dispatch_error is None
                                 and final_reply_discard_reason is not None
@@ -922,6 +1005,9 @@ def apply_pending_effects(
                                                     claimed_by=final_reply_claimed_by,
                                                     input_generation=(
                                                         final_reply_input_generation
+                                                    ),
+                                                    perception_glance_fingerprint=(
+                                                        perception_glance_fingerprint
                                                     ),
                                                 )
                                             )

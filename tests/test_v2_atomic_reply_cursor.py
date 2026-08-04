@@ -911,8 +911,8 @@ def test_wake_yields_snapshot_race_input_to_chat_without_duplicate_reply(
     monkeypatch.setattr(provider_client, "chat_completion_async", _provider)
     monkeypatch.setattr(
         worker,
-        "_perception_grounding_results",
-        lambda *_args, **_kwargs: asyncio.sleep(0, result=None),
+        "_perception_glance_grounding_results",
+        lambda *_args, **_kwargs: asyncio.sleep(0, result=(None, None)),
     )
     monkeypatch.setattr(
         worker.core_envelope,

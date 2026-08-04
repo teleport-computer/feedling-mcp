@@ -1451,6 +1451,21 @@ def cmd_memory_write(args):
     _emit({"ok": False, "http_status": status, "error": body}, 1)
 
 
+def cmd_memory_organize(args):
+    """Force one resident Dream pass after an explicit user request."""
+
+    api_url, auth = _require_backend()
+    status, body = _http_json(
+        "POST",
+        f"{api_url}/v1/dream/tick",
+        auth,
+        payload={"force": True},
+    )
+    if status in (200, 201):
+        _emit({"ok": True, **(body if isinstance(body, dict) else {"result": body})})
+    _emit({"ok": False, "http_status": status, "error": body}, 1)
+
+
 def _memory_patch_payload(*, memory_id, summary, content, bucket, threads, importance, pulse, mem_type, source, reason):
     """Build the /v1/memory/actions body for a single plaintext memory.supersede. Pure (testable).
 
@@ -1963,6 +1978,14 @@ def main():
         help="closed provenance value (default: resident_absorb)",
     )
     mw.set_defaults(func=cmd_memory_write)
+
+    mo = sub.add_parser(
+        "memory-organize",
+        help="仅当用户明确要求整理记忆时，唤醒一次后台 Dream 全量整理；平时夜间会自动运行。",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=f"D3 来源规则: {D3_SOURCING_RULE}\n",
+    )
+    mo.set_defaults(func=cmd_memory_organize)
 
     md = sub.add_parser(
         "memory-delete",

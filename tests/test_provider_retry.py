@@ -81,6 +81,44 @@ def test_reliable_exhausts_persistent_transient(monkeypatch):
     assert calls["n"] == 3  # tried max_attempts times
 
 
+def test_reliable_caps_timeout_attempts_without_changing_429_budget(monkeypatch):
+    timeout_fn, timeout_calls = _fake([httpx.ReadTimeout("slow")])
+    monkeypatch.setattr(pc, "chat_completion", timeout_fn)
+    with pytest.raises(httpx.ReadTimeout):
+        reliable_chat_completion(
+            max_attempts=3,
+            max_timeout_attempts=2,
+            base_delay_sec=0.0,
+        )
+    assert timeout_calls["n"] == 2
+
+    rate_fn, rate_calls = _fake([ProviderError("rate", status_code=429),
+                                 ProviderError("rate", status_code=429), "ok"])
+    monkeypatch.setattr(pc, "chat_completion", rate_fn)
+    assert reliable_chat_completion(
+        max_attempts=3,
+        max_timeout_attempts=2,
+        base_delay_sec=0.0,
+    ) == "ok"
+    assert rate_calls["n"] == 3
+
+
+def test_reliable_caps_adapter_wrapped_read_timeout(monkeypatch):
+    wrapped = ProviderError("provider network error: ReadTimeout")
+    wrapped.__cause__ = httpx.ReadTimeout("slow")
+    fn, calls = _fake([wrapped])
+    monkeypatch.setattr(pc, "chat_completion", fn)
+
+    with pytest.raises(ProviderError):
+        reliable_chat_completion(
+            max_attempts=3,
+            max_timeout_attempts=2,
+            base_delay_sec=0.0,
+        )
+
+    assert calls["n"] == 2
+
+
 def test_reliable_passes_through_args(monkeypatch):
     seen = {}
 

@@ -8,9 +8,8 @@ from __future__ import annotations
 import os
 import sys
 import tempfile
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
-from zoneinfo import ZoneInfo
 
 _DATA_DIR = tempfile.mkdtemp(prefix="feedling-capture-trace-test-")
 os.environ.setdefault("FEEDLING_DATA_DIR", _DATA_DIR)
@@ -126,10 +125,8 @@ def test_record_capture_job_status_completed_zero_cards_is_legal_noop_wording(tm
     assert "没有可抓取的新记忆" in done[0]["explain"]
 
 
-def test_v1_capture_banner_accumulates_resets_and_ignores_noop(tmp_path, monkeypatch):
+def test_v1_capture_banner_accumulates_across_midnight_and_ignores_noop(tmp_path, monkeypatch):
     store = _store(tmp_path, monkeypatch, "usr_capture_daily_v1")
-    store.save_proactive_settings({"timezone": "Asia/Shanghai"})
-    zone = ZoneInfo("Asia/Shanghai")
 
     def completed(cards_added: int, until: str) -> dict:
         return {
@@ -142,10 +139,10 @@ def test_v1_capture_banner_accumulates_resets_and_ignores_noop(tmp_path, monkeyp
             },
         }
 
-    first_at = datetime(2026, 8, 1, 10, tzinfo=zone).timestamp()
-    second_at = datetime(2026, 8, 1, 22, tzinfo=zone).timestamp()
-    noop_at = datetime(2026, 8, 2, 8, tzinfo=zone).timestamp()
-    next_positive_at = datetime(2026, 8, 2, 9, tzinfo=zone).timestamp()
+    first_at = datetime(2026, 8, 1, 10, tzinfo=timezone.utc).timestamp()
+    second_at = datetime(2026, 8, 1, 22, tzinfo=timezone.utc).timestamp()
+    noop_at = datetime(2026, 8, 2, 8, tzinfo=timezone.utc).timestamp()
+    next_positive_at = datetime(2026, 8, 2, 9, tzinfo=timezone.utc).timestamp()
 
     capture_scheduler.record_capture_job_status(
         store, completed(2, "m1"), status="completed", now=first_at
@@ -173,7 +170,7 @@ def test_v1_capture_banner_accumulates_resets_and_ignores_noop(tmp_path, monkeyp
         store, completed(1, "m4"), status="completed", now=next_positive_at
     )
     state = capture_scheduler.load_capture_state(store)
-    assert state["last_capture_cards_added"] == 1
+    assert state["last_capture_cards_added"] == 6
     assert state["last_capture_cards_added_at"] == next_positive_at
 
 

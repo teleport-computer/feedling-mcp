@@ -634,10 +634,10 @@ COMPONENT_SCHEMAS: dict[str, dict[str, Any]] = {
         "type": "object",
         "description": (
             "Memory Garden banner status. Dream counts describe the latest "
-            "completed Dream. Capture fields describe cards added on the "
-            "device-local calendar day containing capture_completed_at; clients "
-            "decide whether that timestamp is still today. Legal zero-card "
-            "Capture runs do not reset or refresh the fields."
+            "completed Dream. Capture fields expose a monotonic total of cards "
+            "added by Capture; clients subtract the total saved when the user "
+            "last dismissed the banner. Legal zero-card Capture runs do not "
+            "reset or refresh the fields."
         ),
         "required": [
             "dreaming",
@@ -664,8 +664,7 @@ COMPONENT_SCHEMAS: dict[str, dict[str, Any]] = {
                 "type": "integer",
                 "minimum": 0,
                 "description": (
-                    "Cards actually added on the timestamp's device-local "
-                    "calendar day, accumulated across Capture runs."
+                    "Monotonic total of cards actually added across Capture runs."
                 ),
             },
         },
@@ -1396,6 +1395,7 @@ COMPONENT_SCHEMAS: dict[str, dict[str, Any]] = {
                 "type": "string",
                 "enum": [
                     "agent_tool",
+                    "genesis_import",
                     "genesis_resident_distill",
                     "memory_capture",
                     "memory_dream",
@@ -2063,7 +2063,9 @@ OPERATION_DESCRIPTIONS: dict[Operation, str] = {
     ("post", "/v1/access/claim-token"): "Consume a one-time link token and issue an additional API key. Existing keys remain active.",
     ("post", "/v1/account/recover/verify"): "Verify keypair possession and issue an additional API key for the existing account. Existing keys remain active.",
     ("post", "/v1/account/reset"): "Permanently delete the account, its data, and all of its API keys. This is not a per-key revocation endpoint.",
-    ("post", "/v1/genesis/imports/plaintext"): "Queue an asynchronous plaintext import. In update_identity mode, the uploaded role card creates an identity when absent or updates the existing card while preserving its relationship anchor by default. Reusing a completed client_job_id returns the existing job.",
+    ("post", "/v1/genesis/imports/plaintext"): "Queue an asynchronous plaintext import and immediately publish every material as queued with its total window count. Every processing frame preserves the complete material list while item progress advances. Identity may become ready while processing continues; done is published only after every material window completes. Only one plaintext import can process per account; a concurrent submission returns 409 import_job_active with active_job_id. A same-host abandoned worker is detected by its exited process and failed immediately as worker_restarted; remote or legacy owners use a bounded heartbeat lease so a live rolling-deploy worker is not killed. A failed matching client_job_id or input is resumed from its encrypted per-window checkpoint, while a completed match returns the existing job. In update_identity mode, the uploaded role card creates an identity when absent or updates the existing card while preserving its relationship anchor by default.",
+    ("post", "/v1/genesis/imports/plaintext/estimate"): "Parse and encrypt-stage plaintext onboarding material without calling an LLM. Returns per-material window and conservative token estimates plus an optional fast-model recommendation for Anthropic, DeepSeek, Gemini, OpenAI, OpenRouter, or compatible relay configurations. The staged payload expires and must be committed by staged_id.",
+    ("post", "/v1/genesis/imports/plaintext/commit"): "Commit one encrypted staged plaintext import and start asynchronous processing. An optional distill_model overrides only this job's model; provider, base URL, credential, and the account chat model remain unchanged.",
     ("get", "/v1/mcp/servers"): "List the caller's user-configured MCP servers. Secrets (url, headers, ca_pem) are never returned; url_hint is the hostname only and header_names lists header keys only.",
     ("post", "/v1/mcp/servers"): (
         "Create or update a user-configured MCP server (matched by name). http:// and https:// URLs "
@@ -2148,7 +2150,7 @@ OPERATION_DESCRIPTIONS: dict[Operation, str] = {
 RESPONSE_OVERRIDES: dict[Operation, dict[str, Any]] = {
     ("get", "/v1/dream/status"): {
         "200": {
-            "description": "Current Dream and daily Capture banner status.",
+            "description": "Current Dream and Capture banner status.",
             "content": {
                 "application/json": {
                     "schema": {"$ref": "#/components/schemas/DreamStatusResponse"}
@@ -2410,7 +2412,39 @@ RESPONSE_OVERRIDES: dict[Operation, dict[str, Any]] = {
         "202": {
             "description": "Plaintext import accepted for asynchronous processing.",
             "content": {"application/json": {"schema": {"$ref": "#/components/schemas/GenericJsonResponse"}}},
-        }
+        },
+        "409": {
+            "description": "Another plaintext import is processing for this account. The response error is import_job_active and active_job_id identifies it.",
+            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ErrorResponse"}}},
+        },
+    },
+    ("post", "/v1/genesis/imports/plaintext/estimate"): {
+        "201": {
+            "description": "Material parsed and encrypted-staged; no LLM call was made.",
+            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/GenericJsonResponse"}}},
+        },
+    },
+    ("post", "/v1/genesis/imports/plaintext/commit"): {
+        "200": {
+            "description": "A previously completed matching import was reused and the stage consumed.",
+            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/GenericJsonResponse"}}},
+        },
+        "202": {
+            "description": "The staged import was committed and processing started.",
+            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/GenericJsonResponse"}}},
+        },
+        "404": {
+            "description": "staged_import_not_found: the staged_id does not exist for this account.",
+            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ErrorResponse"}}},
+        },
+        "409": {
+            "description": "The stage was already consumed, or another plaintext import is processing.",
+            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ErrorResponse"}}},
+        },
+        "410": {
+            "description": "staged_import_expired: the encrypted staged payload has expired.",
+            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ErrorResponse"}}},
+        },
     },
     ("post", "/v1/genesis/imports/{job_id}/finalize"): {
         "202": {

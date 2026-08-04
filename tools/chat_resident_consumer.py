@@ -154,8 +154,10 @@ from memory.card_text import (
 )
 from memory.dream_prompt_v1 import (
     build_dream_prompt,
+    build_dream_review_prompt,
     build_dream_retry_prompt,
     parse_dream_consolidations,
+    parse_dream_review,
 )
 from memory.migrate_prompt_v1 import build_migrate_prompt, parse_migrated_cards
 from chat.reply_language import (
@@ -434,7 +436,6 @@ DREAM_MEMORY_INDEX_LIMIT = int(os.environ.get("FEEDLING_DREAM_MEMORY_INDEX_LIMIT
 DREAM_FETCH_BATCH_SIZE = int(os.environ.get("FEEDLING_DREAM_FETCH_BATCH_SIZE", "100"))
 DREAM_RECENT_CHAT_LIMIT = int(os.environ.get("FEEDLING_DREAM_RECENT_CHAT_LIMIT", "80"))
 DREAM_MEMORY_MAX_CARDS = int(os.environ.get("FEEDLING_DREAM_MEMORY_MAX_CARDS", "200"))
-DREAM_MAX_CONSOLIDATIONS = int(os.environ.get("FEEDLING_DREAM_MAX_CONSOLIDATIONS", "12"))
 CONSUMER_ID = os.environ.get(
     "CONSUMER_ID",
     f"{socket.gethostname()}:{os.getpid()}",
@@ -8126,26 +8127,44 @@ def execute_identity_actions(actions: list[dict]) -> dict:
 def execute_memory_actions(actions: list[dict]) -> dict:
     if not actions:
         return {"status": "ok", "results": [], "effects": []}
-    resp = _HTTP.post(
-        f"{FEEDLING_API_URL}/v1/memory/actions",
-        json={"actions": actions},
-        headers=_HEADERS,
-        timeout=20,
-    )
-    if resp.status_code >= 400:
-        raise ActionsHTTPError(
-            f"memory_actions_http_{resp.status_code}:{resp.text[:500]}",
-            status_code=resp.status_code,
-            body=_parse_actions_error_body(resp),
+    batches: list[dict] = []
+    for offset in range(0, len(actions), 20):
+        resp = _HTTP.post(
+            f"{FEEDLING_API_URL}/v1/memory/actions",
+            json={"actions": actions[offset : offset + 20]},
+            headers=_HEADERS,
+            timeout=20,
         )
-    body = resp.json()
-    if not isinstance(body, dict) or body.get("status") not in {
-        "ok", "partial", "failed", "created", "replaced"
-    }:
-        raise RuntimeError(f"memory_actions_unexpected_response:{str(body)[:500]}")
-    if not isinstance(body.get("results"), list):
-        raise RuntimeError(f"memory_actions_results_missing:{str(body)[:500]}")
-    return body
+        if resp.status_code >= 400:
+            raise ActionsHTTPError(
+                f"memory_actions_http_{resp.status_code}:{resp.text[:500]}",
+                status_code=resp.status_code,
+                body=_parse_actions_error_body(resp),
+            )
+        body = resp.json()
+        if not isinstance(body, dict) or body.get("status") not in {
+            "ok", "partial", "failed", "created", "replaced"
+        }:
+            raise RuntimeError(f"memory_actions_unexpected_response:{str(body)[:500]}")
+        if not isinstance(body.get("results"), list):
+            raise RuntimeError(f"memory_actions_results_missing:{str(body)[:500]}")
+        batches.append(body)
+    if len(batches) == 1:
+        return batches[0]
+    results = [row for body in batches for row in body.get("results", [])]
+    effects = [row for body in batches for row in body.get("effects", [])]
+    failed_count = sum(int(body.get("failed_count") or 0) for body in batches)
+    applied_count = sum(int(body.get("applied_count") or 0) for body in batches)
+    skipped_count = sum(int(body.get("skipped_count") or 0) for body in batches)
+    return {
+        "status": "ok" if failed_count == 0 else ("failed" if failed_count == len(results) else "partial"),
+        "results": results,
+        "effects": effects,
+        "total_count": len(results),
+        "applied_count": applied_count,
+        "skipped_count": skipped_count,
+        "failed_count": failed_count,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -12227,8 +12246,12 @@ def _dream_actions_from_consolidations(
     cards_superseded = 0
     organized_ids: set[str] = set()
     merged_count = 0
-    for row in consolidations[: max(1, DREAM_MAX_CONSOLIDATIONS)]:
+    for row in consolidations:
         op = str(row.get("op") or "").strip().lower()
+        if not str(row.get("rationale") or "").strip():
+            continue
+        if row.get("_review_approved") is not True:
+            continue
         card_ids = [
             str(memory_id or "").strip()
             for memory_id in (row.get("card_ids") if isinstance(row.get("card_ids"), list) else [])
@@ -12236,6 +12259,10 @@ def _dream_actions_from_consolidations(
         ]
         card_ids = list(dict.fromkeys(card_ids))
         if not card_ids:
+            continue
+        if len(card_ids) == 1 and not _dream_has_substantive_increment(
+            card_map.get(card_ids[0]) or {}, row.get("result") or {}
+        ):
             continue
         organized_ids.update(card_ids)
         if op == "merge":
@@ -12259,6 +12286,8 @@ def _dream_actions_from_consolidations(
             "capture_mode": "memory_dream",
             "dream_op": op,
             "dream_card_ids": card_ids,
+            "dream_rationale": str(row.get("rationale") or "")[:1000],
+            "dream_review_reason": str(row.get("_review_reason") or "")[:1000],
         })
         if op == "merge":
             cards_merged += 1
@@ -12268,6 +12297,96 @@ def _dream_actions_from_consolidations(
     if consolidations and not actions:
         raise ValueError("dream_no_memory_actions")
     return actions, cards_merged, cards_thickened, cards_superseded, len(organized_ids), merged_count
+
+
+def _dream_semantic_text(card: dict) -> str:
+    values: list[str] = []
+    for key in ("title", "summary", "description", "content"):
+        value = str(card.get(key) or "").strip()
+        if value and value not in values:
+            values.append(value)
+    return "".join(re.findall(r"[\w]", " ".join(values).lower(), flags=re.UNICODE))
+
+
+def _dream_has_substantive_increment(old_card: dict, result: dict) -> bool:
+    """Keep the deterministic 1:1 anti-churn fence used by the V2 lane."""
+
+    old_text = _dream_semantic_text(old_card)
+    new_text = _dream_semantic_text(result)
+    if not old_text or not new_text:
+        return False
+    min_growth = max(24, (len(old_text) * 15 + 99) // 100)
+    if len(new_text) < len(old_text) + min_growth:
+        return False
+    old_grams = {old_text[index : index + 3] for index in range(max(0, len(old_text) - 2))}
+    new_grams = {new_text[index : index + 3] for index in range(max(0, len(new_text) - 2))}
+    min_novel = max(6, (len(old_grams) * 10 + 99) // 100)
+    return len(new_grams - old_grams) >= min_novel
+
+
+def _dream_review_consolidations(
+    consolidations: list[dict],
+    *,
+    card_map: dict[str, dict],
+    job_id: str,
+) -> list[dict]:
+    """Run one isolated V1 agent review per Dream proposal, fail-closed."""
+
+    approved: list[dict] = []
+    for index, row in enumerate(consolidations):
+        if not isinstance(row, dict):
+            continue
+        rationale = str(row.get("rationale") or "").strip()
+        card_ids = list(
+            dict.fromkeys(
+                str(memory_id or "").strip()
+                for memory_id in (row.get("card_ids") or [])
+                if str(memory_id or "").strip()
+            )
+        )
+        source_cards = [card_map.get(memory_id) for memory_id in card_ids]
+        if not rationale or not card_ids or any(card is None for card in source_cards):
+            log.warning(
+                "dream semantic review skipped invalid proposal id=%s index=%d",
+                job_id,
+                index,
+            )
+            continue
+        try:
+            prompt = build_dream_review_prompt(
+                consolidation=row,
+                source_cards=[card for card in source_cards if card is not None],
+            )
+            raw = call_agent(
+                prompt,
+                raw_text=True,
+                trace_id=f"dream-review:{job_id}:{index}",
+                lane="background",
+                isolated_session=True,
+            )
+            _note_agent_turn_success()
+            review, error = parse_dream_review(_capture_agent_reply_text(raw))
+        except Exception as exc:  # noqa: BLE001 — reject this proposal, keep reviewing
+            log.warning(
+                "dream semantic review failed id=%s index=%d code=%s",
+                job_id,
+                index,
+                type(exc).__name__,
+            )
+            continue
+        if error or not isinstance(review, dict) or review.get("approved") is not True:
+            log.warning(
+                "dream semantic review rejected id=%s index=%d code=%s",
+                job_id,
+                index,
+                str(error or "review_no")[:120],
+            )
+            continue
+        accepted = dict(row)
+        accepted["_review_approved"] = True
+        accepted["_review_reason"] = str(review.get("reason") or "")[:1000]
+        approved.append(accepted)
+    return approved
 
 
 def _process_dream_jobs(jobs: list) -> float:
@@ -12387,6 +12506,29 @@ def _process_dream_jobs(jobs: list) -> float:
                 },
             )
             log.info("dream job completed noop id=%s questions=%d", job_id, len(questions))
+            continue
+        consolidations = _dream_review_consolidations(
+            consolidations,
+            card_map=card_map,
+            job_id=job_id,
+        )
+        if not consolidations:
+            update_proactive_job_status(
+                job_id,
+                "completed",
+                "dream_semantic_review_rejected",
+                extra={
+                    "dream_result": {
+                        "status": "noop",
+                        "reason": "dream_semantic_review_rejected",
+                        "job_kind": "memory_dream",
+                    },
+                    "cards_merged": 0,
+                    "cards_superseded": 0,
+                    "questions": questions,
+                    "noop_reason": "dream_semantic_review_rejected",
+                },
+            )
             continue
         try:
             occurred_at = _format_message_time(time.time())

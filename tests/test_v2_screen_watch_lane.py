@@ -75,6 +75,14 @@ def _status_events(uid):
     return jobs_store.list_status_events(uid, after_id=0, limit=100)
 
 
+def test_screen_watch_policy_does_not_default_to_silence():
+    prompt = worker._SCREEN_WATCH_SYSTEM_PROMPT.lower()
+    assert "speaking and staying silent are equally valid" in prompt
+    assert "you do not need a strong reason to speak" in prompt
+    assert "only if" not in prompt
+    assert "silence is the correct answer most of the time" not in prompt
+
+
 def _reply_effect_dispatch(user_id):
     """Test-local production-shaped `reply` sink — mirrors
     `serve_worker._sink_reply` without pulling in hosted-adjacent wiring."""

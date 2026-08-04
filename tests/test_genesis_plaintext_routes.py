@@ -5,14 +5,36 @@ import sys
 import types
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
 from genesis import genesis_core, plaintext, service  # noqa: E402
 from urllib.parse import urlparse  # noqa: E402
 
+_FAIL_STALE_PLAINTEXT_JOB = plaintext._fail_stale_plaintext_job
+
 
 def _store(user_id: str = "usr_plaintext"):
     return types.SimpleNamespace(user_id=user_id)
+
+
+@pytest.fixture(autouse=True)
+def _memory_checkpoint(monkeypatch):
+    checkpoints = {}
+
+    def load(_store, _api_key, job_id, **_kwargs):
+        value = checkpoints.get(job_id)
+        return json.loads(json.dumps(value)) if value is not None else None
+
+    def write(_store, job_id, doc):
+        checkpoints[job_id] = json.loads(json.dumps(doc))
+
+    monkeypatch.setattr(plaintext.service, "load_genesis_checkpoint", load)
+    monkeypatch.setattr(plaintext.service, "write_genesis_checkpoint", write)
+    monkeypatch.setattr(plaintext.service, "delete_genesis_checkpoint", lambda *_args: None)
+    monkeypatch.setattr(plaintext.db, "genesis_get_job", lambda *_args: None)
+    monkeypatch.setattr(plaintext, "_fail_stale_plaintext_job", lambda *_args: None)
 
 
 class _Resp:
@@ -35,6 +57,20 @@ class _CoreClient:
         p = urlparse(path).path
         if p == "/v1/genesis/imports/plaintext":
             body, status = genesis_core.plaintext_import(
+                self._store, json or {}, api_key="user_api_key",
+                prepare=plaintext._prepare_plaintext_import,
+                find_reusable=plaintext._find_reusable_plaintext_job,
+                plaintext_mode=plaintext._plaintext_mode,
+                job_metadata=plaintext._plaintext_job_metadata,
+                start_job=plaintext._start_plaintext_genesis_job,
+            )
+            return _Resp(body, status)
+        if p == "/v1/genesis/imports/plaintext/estimate":
+            body, status = genesis_core.plaintext_estimate(
+                self._store, json or {}, api_key="user_api_key")
+            return _Resp(body, status)
+        if p == "/v1/genesis/imports/plaintext/commit":
+            body, status = genesis_core.plaintext_commit(
                 self._store, json or {}, api_key="user_api_key",
                 prepare=plaintext._prepare_plaintext_import,
                 find_reusable=plaintext._find_reusable_plaintext_job,
@@ -68,6 +104,20 @@ def test_plaintext_user_name_prefers_encrypted_identity_without_provider(monkeyp
         types.SimpleNamespace(),
         [{"source_family": "user_profile", "chunk_texts": ["请叫我小雨"]}],
     ) == "Seven"
+
+
+def test_plaintext_worker_owner_metadata_is_not_public():
+    body = genesis_core._job_response({
+        "job_id": "job_owner",
+        "metadata": {
+            "ingest": "plaintext",
+            "plaintext_worker_host": "internal-host",
+            "plaintext_worker_pid": 123,
+            "plaintext_worker_instance": "internal-instance",
+        },
+    })
+
+    assert body["job"]["metadata"] == {"ingest": "plaintext"}
 
 
 def test_plaintext_user_name_extracts_user_profile_once(monkeypatch):
@@ -193,35 +243,53 @@ def test_plaintext_import_returns_genesis_job_and_does_not_persist_raw(monkeypat
 
     monkeypatch.setattr(plaintext.db, "genesis_list_jobs", lambda *_args, **_kwargs: [])
 
-    def fake_create(_store, create_payload):
+    def fake_create(
+        _store,
+        create_payload,
+        *,
+        initial_status="created",
+        trusted_metadata=None,
+    ):
         captured["create_payload"] = create_payload
+        captured["initial_status"] = initial_status
+        captured["trusted_metadata"] = trusted_metadata
+        captured["persisted_metadata"] = {
+            **create_payload["metadata"],
+            **(trusted_metadata or {}),
+            "privacy_copy": service.PRIVACY_COPY,
+        }
         job = {
             "job_id": "genesis_job_1",
             "status": "created",
             "source_kind": create_payload["source_kind"],
-            "metadata": {
-                **create_payload["metadata"],
-                "privacy_copy": service.PRIVACY_COPY,
-            },
+            "metadata": captured["persisted_metadata"],
             "privacy_mode": service.PRIVACY_MODE,
         }
         return job, 201
 
     monkeypatch.setattr(plaintext.service, "create_import_job", fake_create)
+    status_updates = []
+
+    def set_status(_user_id, _job_id, **kwargs):
+        status_updates.append(kwargs)
+        return {
+            "job_id": "genesis_job_1",
+            "status": "processing",
+            "metadata": captured["persisted_metadata"],
+            "source_kind": captured["create_payload"]["source_kind"],
+            "privacy_mode": service.PRIVACY_MODE,
+            "output": kwargs["output"],
+        }
+
     monkeypatch.setattr(
         plaintext.db,
         "genesis_set_job_status",
-        lambda _user_id, _job_id, **_kwargs: {
-            "job_id": "genesis_job_1",
-            "status": "processing",
-            "metadata": captured["create_payload"]["metadata"],
-            "source_kind": captured["create_payload"]["source_kind"],
-            "privacy_mode": service.PRIVACY_MODE,
-        },
+        set_status,
     )
     monkeypatch.setattr(plaintext.service, "write_genesis_state", lambda *_args, **_kwargs: None)
 
     def fake_start(_store, _api_key, job, *, mode="onboarding", chunk_texts, source_kind, source_groups=None, relationship_anchor=None, analysis_messages=None):
+        assert status_updates
         captured["started"] = {
             "job_id": job["job_id"],
             "mode": mode,
@@ -241,6 +309,26 @@ def test_plaintext_import_returns_genesis_job_and_does_not_persist_raw(monkeypat
     assert body["job"]["job_id"] == "genesis_job_1"
     assert body["status"] == "processing"
     assert body["privacy_copy"] == service.PRIVACY_COPY
+    assert body["job"]["output"] == {
+        "stage": "plaintext_queued",
+        "identity_ready": False,
+        "materials": [
+            {
+                "kind": "ai_persona",
+                "status": "queued",
+                "windows_done": 0,
+                "windows_total": 1,
+                "cards": 0,
+            },
+            {
+                "kind": "chat_history",
+                "status": "queued",
+                "windows_done": 0,
+                "windows_total": 1,
+                "cards": 0,
+            },
+        ],
+    }
     assert captured["started"]["job_id"] == "genesis_job_1"
     assert captured["started"]["mode"] == "onboarding"
     assert len(captured["started"]["chunk_texts"]) <= 8
@@ -252,6 +340,202 @@ def test_plaintext_import_returns_genesis_job_and_does_not_persist_raw(monkeypat
     assert captured["create_payload"]["metadata"]["ingest"] == "plaintext"
     assert captured["create_payload"]["metadata"]["client_job_id"] == "ios_job_1"
     assert captured["create_payload"]["metadata"]["timeline_span_days"] == 0
+    assert captured["initial_status"] == "processing"
+    assert captured["trusted_metadata"] == plaintext._plaintext_worker_metadata()
+    assert captured["persisted_metadata"]["plaintext_worker_instance"] == (
+        plaintext._PLAINTEXT_WORKER_INSTANCE
+    )
+
+
+def test_plaintext_import_rejects_second_processing_job_with_active_id(monkeypatch):
+    client = _client(monkeypatch)
+    active = {
+        "job_id": "genesis_active",
+        "status": "processing",
+        "metadata": {"ingest": "plaintext", "input_hash": "different"},
+    }
+    monkeypatch.setattr(plaintext.db, "genesis_list_jobs", lambda *_args, **_kwargs: [active])
+    monkeypatch.setattr(
+        plaintext.service,
+        "create_import_job",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("must not create")),
+    )
+
+    resp = client.post(
+        "/v1/genesis/imports/plaintext",
+        json={"format": "plaintext", "content": "User: second upload"},
+    )
+
+    assert resp.status_code == 409
+    assert resp.get_json() == {
+        "error": "import_job_active",
+        "active_job_id": "genesis_active",
+    }
+
+
+def test_plaintext_import_recovers_stale_processing_job_and_resumes(monkeypatch):
+    payload = {"format": "plaintext", "content": "User: resume after deploy"}
+    input_hash = plaintext.history_import._history_import_payload_hash(payload)
+    processing = {
+        "job_id": "genesis_stale",
+        "status": "processing",
+        "metadata": {
+            "ingest": "plaintext",
+            "input_hash": input_hash,
+            "mode": "onboarding",
+        },
+    }
+    failed = {
+        **processing,
+        "status": "failed",
+        "error": "plaintext_stale_timeout:120s",
+    }
+    monkeypatch.setattr(plaintext.db, "genesis_list_jobs", lambda *_args, **_kwargs: [processing])
+    monkeypatch.setattr(
+        plaintext,
+        "_fail_stale_plaintext_job",
+        lambda _store, job: failed if job["job_id"] == "genesis_stale" else None,
+    )
+    monkeypatch.setattr(
+        plaintext.db,
+        "genesis_patch_job_metadata",
+        lambda *_args, **_kwargs: {
+            **failed,
+            "metadata": {
+                **failed["metadata"],
+                **plaintext._plaintext_worker_metadata(),
+            },
+        },
+    )
+    monkeypatch.setattr(
+        plaintext.db,
+        "genesis_set_job_status",
+        lambda *_args, **_kwargs: {**failed, "status": "processing"},
+    )
+    monkeypatch.setattr(plaintext.service, "write_genesis_state", lambda *_args, **_kwargs: None)
+    started = {}
+    monkeypatch.setattr(
+        plaintext,
+        "_start_plaintext_genesis_job",
+        lambda _store, _api_key, job, **_kwargs: started.update(job=job) or True,
+    )
+
+    resp = _client(monkeypatch).post("/v1/genesis/imports/plaintext", json=payload)
+
+    assert resp.status_code == 202
+    assert resp.get_json()["job"]["job_id"] == "genesis_stale"
+    assert started["job"]["status"] == "processing"
+
+
+def test_plaintext_import_immediately_resumes_dead_same_host_owner(monkeypatch):
+    payload = {"format": "plaintext", "content": "User: resume after pkill"}
+    processing = {
+        "job_id": "genesis_dead_owner",
+        "status": "processing",
+        "metadata": {
+            "ingest": "plaintext",
+            "input_hash": plaintext.history_import._history_import_payload_hash(payload),
+            "mode": "onboarding",
+            "plaintext_worker_host": plaintext._PLAINTEXT_WORKER_HOST,
+            "plaintext_worker_pid": 424244,
+            "plaintext_worker_instance": "dead-instance",
+        },
+    }
+    failed = {**processing, "status": "failed", "error": "plaintext_worker_restarted"}
+    monkeypatch.setattr(plaintext.db, "genesis_list_jobs", lambda *_args, **_kwargs: [processing])
+    monkeypatch.setattr(
+        plaintext.os,
+        "kill",
+        lambda *_args: (_ for _ in ()).throw(ProcessLookupError()),
+    )
+    fail_calls = []
+
+    def fail_dead_owner(*_args, **kwargs):
+        fail_calls.append(kwargs)
+        return failed
+
+    monkeypatch.setattr(plaintext.db, "genesis_fail_stale_plaintext_job", fail_dead_owner)
+    monkeypatch.setattr(plaintext, "_fail_stale_plaintext_job", _FAIL_STALE_PLAINTEXT_JOB)
+    monkeypatch.setattr(
+        plaintext.db,
+        "genesis_patch_job_metadata",
+        lambda *_args, **_kwargs: {
+            **failed,
+            "metadata": {
+                **failed["metadata"],
+                **plaintext._plaintext_worker_metadata(),
+            },
+        },
+    )
+    monkeypatch.setattr(
+        plaintext.db,
+        "genesis_set_job_status",
+        lambda *_args, **_kwargs: {**failed, "status": "processing"},
+    )
+    monkeypatch.setattr(plaintext.service, "write_genesis_state", lambda *_args, **_kwargs: None)
+    started = {}
+    monkeypatch.setattr(
+        plaintext,
+        "_start_plaintext_genesis_job",
+        lambda _store, _api_key, job, **_kwargs: started.update(job=job) or True,
+    )
+
+    resp = _client(monkeypatch).post("/v1/genesis/imports/plaintext", json=payload)
+
+    assert resp.status_code == 202
+    assert resp.get_json()["job"]["job_id"] == "genesis_dead_owner"
+    assert started["job"]["status"] == "processing"
+    assert fail_calls and all(call["force"] is True for call in fail_calls)
+
+
+def test_plaintext_import_reuses_failed_job_for_checkpoint_resume(monkeypatch):
+    client = _client(monkeypatch)
+    payload = {"format": "plaintext", "content": "User: retry me"}
+    failed = {
+        "job_id": "genesis_failed",
+        "status": "failed",
+        "metadata": {
+            "ingest": "plaintext",
+            "input_hash": plaintext.history_import._history_import_payload_hash(payload),
+            "mode": "onboarding",
+            "distill_model": "old-fast-model",
+        },
+    }
+    list_calls = {"n": 0}
+
+    def list_jobs(*_args, **_kwargs):
+        list_calls["n"] += 1
+        return [failed]
+
+    monkeypatch.setattr(plaintext.db, "genesis_list_jobs", list_jobs)
+    patched = {}
+    monkeypatch.setattr(
+        plaintext.db,
+        "genesis_patch_job_metadata",
+        lambda _user_id, _job_id, patch: patched.update(patch) or {
+            **failed, "metadata": {**failed["metadata"], **patch}
+        },
+    )
+    monkeypatch.setattr(
+        plaintext.db,
+        "genesis_set_job_status",
+        lambda *_args, **_kwargs: {**failed, "status": "processing"},
+    )
+    started = {}
+    monkeypatch.setattr(
+        plaintext,
+        "_start_plaintext_genesis_job",
+        lambda _store, _api_key, job, **_kwargs: started.update(job=job) or True,
+    )
+    monkeypatch.setattr(plaintext.service, "write_genesis_state", lambda *_args, **_kwargs: None)
+
+    resp = client.post("/v1/genesis/imports/plaintext", json=payload)
+
+    assert resp.status_code == 202
+    assert resp.get_json()["job"]["job_id"] == "genesis_failed"
+    assert started["job"]["status"] == "processing"
+    assert patched["distill_model"] is None
+    assert patched["plaintext_worker_instance"] == plaintext._PLAINTEXT_WORKER_INSTANCE
 
 
 def test_plaintext_import_reuses_done_job_without_restart(monkeypatch):
@@ -456,16 +740,548 @@ def test_prepare_plaintext_import_builds_ordered_per_source_groups(monkeypatch):
 
     assert [group["source_family"] for group in prepared["source_groups"]] == [
         "ai_persona",
-        "history",
-        "memory_summary",
         "user_profile",
+        "memory_summary",
+        "history",
     ]
     assert prepared["chunk_texts"] == [
         "ai_persona_import:1",
-        "history_import:1",
-        "memory_summary_import:1",
         "user_profile_import:1",
+        "memory_summary_import:1",
+        "history_import:1",
     ]
+
+
+def test_plaintext_estimate_stages_without_llm_and_returns_locked_contract(monkeypatch):
+    monkeypatch.setattr(
+        plaintext.service,
+        "create_genesis_staged_payload",
+        lambda _store, payload, **_kwargs: "staged_1",
+    )
+    monkeypatch.setattr(
+        plaintext,
+        "_recommended_distill_model",
+        lambda *_args: "anthropic/claude-haiku-4-5",
+    )
+
+    resp = _client(monkeypatch).post("/v1/genesis/imports/plaintext/estimate", json={
+        "ai_persona_content": "Name: Mira",
+        "personal_profile_content": "User likes direct answers",
+        "content": "User: hello\nAssistant: hi",
+    })
+
+    assert resp.status_code == 201
+    body = resp.get_json()
+    assert set(body) == {
+        "staged_id", "materials", "est_total_tokens", "recommended_model"
+    }
+    assert body["staged_id"] == "staged_1"
+    assert [item["kind"] for item in body["materials"]] == [
+        "ai_persona", "user_profile", "chat_history"
+    ]
+    assert all(set(item) == {"kind", "windows", "est_tokens"} for item in body["materials"])
+    assert body["est_total_tokens"] == sum(item["est_tokens"] for item in body["materials"])
+    assert body["recommended_model"] == "anthropic/claude-haiku-4-5"
+
+
+def test_plaintext_commit_applies_job_model_override_without_consuming_stage(monkeypatch):
+    # Commit must NOT consume the staged payload: the job it starts can still fail
+    # asynchronously, and consuming now would leave a retry with no materials to
+    # re-run (staged_import_consumed 409). Consumption happens on DONE instead.
+    # The staged_id is threaded into the job metadata so completion can find it.
+    staged_payload = {"format": "plaintext", "content": "User: hello"}
+    captured = {}
+    monkeypatch.setattr(
+        plaintext.service, "load_genesis_staged_payload",
+        lambda *_args: staged_payload,
+    )
+    monkeypatch.setattr(
+        plaintext.service, "mark_genesis_staged_consumed",
+        lambda *_args: (_ for _ in ()).throw(
+            AssertionError("commit must not consume the stage")),
+    )
+    monkeypatch.setattr(plaintext.db, "genesis_list_jobs", lambda *_args, **_kwargs: [])
+
+    def fake_create(_store, payload, **_kwargs):
+        captured["metadata"] = payload["metadata"]
+        return ({"job_id": "job_commit", "status": "processing", "metadata": payload["metadata"]}, 201)
+
+    monkeypatch.setattr(plaintext.service, "create_import_job", fake_create)
+
+    def set_status(*_args, **kwargs):
+        captured["queued_output"] = kwargs["output"]
+        return {
+            "job_id": "job_commit",
+            "status": "processing",
+            "metadata": captured["metadata"],
+            "output": kwargs["output"],
+        }
+
+    monkeypatch.setattr(
+        plaintext.db, "genesis_set_job_status",
+        set_status,
+    )
+    monkeypatch.setattr(plaintext.service, "write_genesis_state", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(plaintext, "_start_plaintext_genesis_job", lambda *_args, **_kwargs: True)
+
+    resp = _client(monkeypatch).post("/v1/genesis/imports/plaintext/commit", json={
+        "staged_id": "staged_1",
+        "distill_model": "anthropic/claude-haiku-4-5",
+    })
+
+    assert resp.status_code == 202
+    assert captured["metadata"]["distill_model"] == "anthropic/claude-haiku-4-5"
+    # staged_id threaded into metadata so consume-on-DONE can release it later.
+    assert captured["metadata"]["staged_id"] == "staged_1"
+    assert captured["queued_output"]["materials"] == [{
+        "kind": "chat_history",
+        "status": "queued",
+        "windows_done": 0,
+        "windows_total": 1,
+        "cards": 0,
+    }]
+    response_materials = resp.get_json()["job"]["output"]["materials"]
+    assert response_materials == captured["queued_output"]["materials"]
+
+
+@pytest.mark.parametrize(
+    ("error", "status"),
+    [
+        (LookupError("staged_import_not_found"), 404),
+        (TimeoutError("staged_import_expired"), 410),
+        (ValueError("staged_import_consumed"), 409),
+    ],
+)
+def test_plaintext_commit_staged_id_errors_are_distinct(monkeypatch, error, status):
+    monkeypatch.setattr(
+        plaintext.service,
+        "load_genesis_staged_payload",
+        lambda *_args: (_ for _ in ()).throw(error),
+    )
+
+    resp = _client(monkeypatch).post(
+        "/v1/genesis/imports/plaintext/commit", json={"staged_id": "staged_1"})
+
+    assert resp.status_code == status
+    assert resp.get_json()["error"] == str(error)
+
+
+def test_plaintext_commit_active_job_returns_409_without_consuming_stage(monkeypatch):
+    monkeypatch.setattr(
+        plaintext.service,
+        "load_genesis_staged_payload",
+        lambda *_args: {"format": "plaintext", "content": "User: staged"},
+    )
+    monkeypatch.setattr(
+        plaintext.db,
+        "genesis_list_jobs",
+        lambda *_args, **_kwargs: [{
+            "job_id": "job_active",
+            "status": "processing",
+            "metadata": {"ingest": "plaintext", "input_hash": "other"},
+        }],
+    )
+    monkeypatch.setattr(
+        plaintext.service,
+        "mark_genesis_staged_consumed",
+        lambda *_args: (_ for _ in ()).throw(AssertionError("409 must keep stage")),
+    )
+
+    resp = _client(monkeypatch).post(
+        "/v1/genesis/imports/plaintext/commit", json={"staged_id": "staged_1"})
+
+    assert resp.status_code == 409
+    assert resp.get_json() == {
+        "error": "import_job_active",
+        "active_job_id": "job_active",
+    }
+
+
+def test_consume_staged_for_completed_job_releases_recorded_stage(monkeypatch):
+    # On DONE, the staged payload recorded in job metadata is released.
+    captured = {}
+    monkeypatch.setattr(
+        service.db, "genesis_get_job",
+        lambda _uid, _jid: {
+            "job_id": "job_done", "status": "done",
+            "metadata": {"ingest": "plaintext", "staged_id": "staged_42"},
+        },
+    )
+    monkeypatch.setattr(
+        service, "mark_genesis_staged_consumed",
+        lambda _store, staged_id, job_id: captured.update(consumed=(staged_id, job_id)),
+    )
+    service.consume_staged_for_completed_job(_store(), "job_done")
+    assert captured["consumed"] == ("staged_42", "job_done")
+
+
+def test_consume_staged_for_completed_job_noop_without_staged_id(monkeypatch):
+    # Older jobs (or an already-released stage) carry no staged_id → no-op, no raise.
+    monkeypatch.setattr(
+        service.db, "genesis_get_job",
+        lambda _uid, _jid: {"job_id": "job_x", "metadata": {"ingest": "plaintext"}},
+    )
+    monkeypatch.setattr(
+        service, "mark_genesis_staged_consumed",
+        lambda *_args: (_ for _ in ()).throw(AssertionError("must not consume")),
+    )
+    service.consume_staged_for_completed_job(_store(), "job_x")
+
+
+def test_plaintext_commit_retry_rebinds_staged_id_on_reused_failed_job(monkeypatch):
+    # A re-staged retry (stage_B) that reuses the original failed job must re-bind the
+    # job's staged_id to stage_B, so consume-on-DONE releases the live stage — not the
+    # already-reaped stage_A recorded on the first attempt.
+    materials = {"format": "plaintext", "content": "User: retry me"}
+    monkeypatch.setattr(plaintext.service, "load_genesis_staged_payload", lambda *_a: materials)
+    failed = {
+        "job_id": "genesis_failed", "status": "failed",
+        "metadata": {
+            "ingest": "plaintext",
+            "input_hash": plaintext.history_import._history_import_payload_hash(materials),
+            "mode": "onboarding", "staged_id": "stage_A",
+        },
+    }
+    monkeypatch.setattr(plaintext.db, "genesis_list_jobs", lambda *_a, **_k: [failed])
+    patched = {}
+    monkeypatch.setattr(
+        plaintext.db, "genesis_patch_job_metadata",
+        lambda _u, _j, patch: patched.update(patch) or {**failed, "metadata": {**failed["metadata"], **patch}},
+    )
+    monkeypatch.setattr(
+        plaintext.db, "genesis_set_job_status",
+        lambda *_a, **_k: {**failed, "status": "processing"},
+    )
+    monkeypatch.setattr(plaintext, "_start_plaintext_genesis_job", lambda *_a, **_k: True)
+    monkeypatch.setattr(plaintext.service, "write_genesis_state", lambda *_a, **_k: None)
+
+    resp = _client(monkeypatch).post(
+        "/v1/genesis/imports/plaintext/commit", json={"staged_id": "stage_B"})
+
+    assert resp.status_code == 202
+    assert patched["staged_id"] == "stage_B"
+
+
+def test_plaintext_commit_reused_done_job_consumes_current_stage(monkeypatch):
+    # Identical materials already distilled (DONE): no worker runs, so the current
+    # request's stage is released immediately rather than stranded.
+    materials = {"format": "plaintext", "content": "User: hello"}
+    monkeypatch.setattr(plaintext.service, "load_genesis_staged_payload", lambda *_a: materials)
+    done = {
+        "job_id": "genesis_done", "status": "done",
+        "metadata": {
+            "ingest": "plaintext",
+            "input_hash": plaintext.history_import._history_import_payload_hash(materials),
+        },
+    }
+    monkeypatch.setattr(plaintext.db, "genesis_list_jobs", lambda *_a, **_k: [done])
+    consumed = {}
+    monkeypatch.setattr(
+        genesis_core.service, "mark_genesis_staged_consumed",
+        lambda _s, staged_id, job_id: consumed.update(v=(staged_id, job_id)),
+    )
+
+    resp = _client(monkeypatch).post(
+        "/v1/genesis/imports/plaintext/commit", json={"staged_id": "stage_now"})
+
+    assert resp.status_code == 200
+    assert consumed["v"] == ("stage_now", "genesis_done")
+
+
+def test_plaintext_direct_import_ignores_client_staged_id(monkeypatch):
+    # The public /plaintext direct-import path must NOT record a client-supplied
+    # staged_id into job metadata (that would let a client tombstone another of their
+    # own stages). Only plaintext_commit's trusted arg sets it.
+    captured = {}
+    monkeypatch.setattr(plaintext.db, "genesis_list_jobs", lambda *_a, **_k: [])
+
+    def fake_create(_store, payload, **_kwargs):
+        captured["metadata"] = payload["metadata"]
+        return ({"job_id": "job_direct", "status": "processing", "metadata": payload["metadata"]}, 201)
+
+    monkeypatch.setattr(plaintext.service, "create_import_job", fake_create)
+    monkeypatch.setattr(plaintext.db, "genesis_set_job_status",
+                        lambda *_a, **k: {"job_id": "job_direct", "status": "processing",
+                                          "metadata": captured["metadata"], "output": k.get("output")})
+    monkeypatch.setattr(plaintext.service, "write_genesis_state", lambda *_a, **_k: None)
+    monkeypatch.setattr(plaintext, "_start_plaintext_genesis_job", lambda *_a, **_k: True)
+
+    resp = _client(monkeypatch).post(
+        "/v1/genesis/imports/plaintext",
+        json={"format": "plaintext", "content": "User: hi", "staged_id": "victim_stage"})
+
+    assert resp.status_code == 202
+    assert captured["metadata"]["staged_id"] == ""
+
+
+def test_plaintext_commit_rejects_invalid_distill_model(monkeypatch):
+    monkeypatch.setattr(
+        plaintext.service,
+        "load_genesis_staged_payload",
+        lambda *_args: {"format": "plaintext", "content": "User: staged"},
+    )
+
+    resp = _client(monkeypatch).post("/v1/genesis/imports/plaintext/commit", json={
+        "staged_id": "staged_1",
+        "distill_model": "x" * 161,
+    })
+
+    assert resp.status_code == 400
+    assert resp.get_json()["error"] == "invalid_distill_model"
+
+
+def test_recommended_distill_model_catalog_priority(monkeypatch):
+    runtime = plaintext.provider_client.ProviderConfig(
+        "openai_compatible", "chat-model", "secret", "https://relay.example/v1")
+    monkeypatch.setattr(
+        plaintext.hosted_config_store,
+        "_load_runtime_provider_config",
+        lambda *_args: runtime,
+    )
+    captured = {}
+
+    def catalog(*_args, **kwargs):
+        captured.update(kwargs)
+        return {"models": [
+            {"id": "vendor/flash-thinking"},
+            {"id": "vendor/mini-fast"},
+            {"id": "vendor/haiku-fast"},
+        ]}
+
+    monkeypatch.setattr(plaintext.provider_client, "list_provider_models", catalog)
+
+    assert plaintext._recommended_distill_model(_store(), "key") == "vendor/haiku-fast"
+    assert captured["total_budget_sec"] == 3.0
+
+
+@pytest.mark.parametrize(
+    ("provider", "expected"),
+    [
+        ("anthropic", "claude-haiku-4-5"),
+        ("deepseek", "deepseek-v4-flash"),
+        ("gemini", "gemini-flash-lite-latest"),
+        ("openai", "gpt-4o-mini"),
+        ("openrouter", "anthropic/claude-haiku-4-5"),
+        ("bedrock", None),
+    ],
+)
+def test_recommended_distill_model_provider_defaults(monkeypatch, provider, expected):
+    runtime = plaintext.provider_client.ProviderConfig(
+        provider, "chat-model", "secret", "https://provider.example/v1")
+    monkeypatch.setattr(
+        plaintext.hosted_config_store,
+        "_load_runtime_provider_config",
+        lambda *_args: runtime,
+    )
+    monkeypatch.setattr(
+        plaintext.provider_client,
+        "list_provider_models",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("dedicated providers must not probe a relay catalog")),
+    )
+
+    assert plaintext._recommended_distill_model(_store(), "key") == expected
+
+
+def test_plaintext_estimate_recommendation_failure_degrades_to_null(monkeypatch):
+    monkeypatch.setattr(
+        plaintext.service,
+        "create_genesis_staged_payload",
+        lambda *_args, **_kwargs: "staged_1",
+    )
+    monkeypatch.setattr(
+        plaintext,
+        "_recommended_distill_model",
+        lambda *_args: (_ for _ in ()).throw(RuntimeError("config unavailable")),
+    )
+
+    resp = _client(monkeypatch).post(
+        "/v1/genesis/imports/plaintext/estimate",
+        json={"content": "User: hello"},
+    )
+
+    assert resp.status_code == 201
+    assert resp.get_json()["staged_id"] == "staged_1"
+    assert resp.get_json()["recommended_model"] is None
+
+
+def test_plaintext_status_exposes_identity_materials_and_failure_copy(monkeypatch):
+    materials = [{
+        "kind": "chat_history",
+        "status": "processing",
+        "windows_done": 2,
+        "windows_total": 4,
+        "cards": 7,
+    }]
+    monkeypatch.setattr(
+        genesis_core.db,
+        "genesis_get_job",
+        lambda *_args: {
+            "job_id": "job_status",
+            "status": "failed",
+            "error": "plaintext_import_failed:ReadTimeout",
+            "output": {"identity_ready": True, "materials": materials},
+        },
+    )
+    monkeypatch.setattr(genesis_core.db, "get_blob", lambda *_args: None)
+
+    body, status = genesis_core.get_import_status(
+        _store(), "job_status", include_missing_raw=False)
+
+    assert status == 200
+    assert body["job_id"] == "job_status"
+    assert body["status"] == "failed"
+    assert body["identity_ready"] is True
+    assert body["materials"] == [{**materials[0], "status": "failed"}]
+    assert body["error_class"] == "provider_timeout"
+    assert body["friendly_copy"]
+
+
+def test_plaintext_status_quota_failure_keeps_cause_aware_copy(monkeypatch):
+    raw_error = "plaintext_import_failed:ProviderError:provider_http_402"
+    monkeypatch.setattr(
+        genesis_core.db,
+        "genesis_get_job",
+        lambda *_args: {
+            "job_id": "job_quota",
+            "status": "failed",
+            "error": raw_error,
+            "output": {"stage": "plaintext_reducer", "materials": []},
+        },
+    )
+    monkeypatch.setattr(genesis_core.db, "get_blob", lambda *_args: None)
+
+    body, status = genesis_core.get_import_status(
+        _store(), "job_quota", include_missing_raw=False)
+
+    assert status == 200
+    assert body["error_class"] == "provider_quota"
+    assert service.GENESIS_ERROR_HINTS["provider_quota"] in body["friendly_copy"]
+    assert service.GENESIS_ERROR_HINTS["internal"] not in body["friendly_copy"]
+
+
+def test_plaintext_status_reaps_stale_processing_lease(monkeypatch):
+    processing = {
+        "job_id": "job_stale",
+        "status": "processing",
+        "metadata": {"ingest": "plaintext"},
+        "output": {"stage": "genesis_v2_background", "materials": []},
+    }
+    failed = {
+        **processing,
+        "status": "failed",
+        "error": "plaintext_stale_timeout:120s",
+    }
+    monkeypatch.setattr(genesis_core.db, "genesis_get_job", lambda *_args: processing)
+    monkeypatch.setattr(
+        plaintext,
+        "_fail_stale_plaintext_job",
+        lambda *_args: failed,
+    )
+    monkeypatch.setattr(genesis_core.db, "get_blob", lambda *_args: None)
+
+    body, status = genesis_core.get_import_status(
+        _store(), "job_stale", include_missing_raw=False)
+
+    assert status == 200
+    assert body["status"] == "failed"
+    assert body["error_class"] == "worker_restarted"
+
+
+def test_plaintext_dead_same_host_owner_is_recovered_immediately(monkeypatch):
+    processing = {
+        "job_id": "job_dead_owner",
+        "status": "processing",
+        "metadata": {
+            "ingest": "plaintext",
+            "plaintext_worker_host": plaintext._PLAINTEXT_WORKER_HOST,
+            "plaintext_worker_pid": 424242,
+            "plaintext_worker_instance": "old-instance",
+        },
+    }
+    captured = {}
+    failed = {**processing, "status": "failed", "error": "plaintext_worker_restarted"}
+    monkeypatch.setattr(
+        plaintext.os,
+        "kill",
+        lambda *_args: (_ for _ in ()).throw(ProcessLookupError()),
+    )
+    monkeypatch.setattr(
+        plaintext.db,
+        "genesis_fail_stale_plaintext_job",
+        lambda *_args, **kwargs: captured.update(kwargs) or failed,
+    )
+    monkeypatch.setattr(plaintext.service, "write_genesis_state", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        plaintext,
+        "_fail_stale_plaintext_job",
+        _FAIL_STALE_PLAINTEXT_JOB,
+    )
+
+    recovered = plaintext._fail_stale_plaintext_job(_store(), processing)
+
+    assert recovered == failed
+    assert captured["force"] is True
+    assert captured["expected_worker_instance"] == "old-instance"
+    assert captured["error"] == "plaintext_worker_restarted"
+
+
+def test_plaintext_live_same_host_owner_keeps_stale_lease_guard(monkeypatch):
+    processing = {
+        "job_id": "job_live_owner",
+        "status": "processing",
+        "metadata": {
+            "ingest": "plaintext",
+            "plaintext_worker_host": plaintext._PLAINTEXT_WORKER_HOST,
+            "plaintext_worker_pid": 424243,
+            "plaintext_worker_instance": "other-live-instance",
+        },
+    }
+    captured = {}
+    monkeypatch.setattr(plaintext.os, "kill", lambda *_args: None)
+    monkeypatch.setattr(
+        plaintext.db,
+        "genesis_fail_stale_plaintext_job",
+        lambda *_args, **kwargs: captured.update(kwargs) or None,
+    )
+    monkeypatch.setattr(
+        plaintext,
+        "_fail_stale_plaintext_job",
+        _FAIL_STALE_PLAINTEXT_JOB,
+    )
+
+    assert plaintext._fail_stale_plaintext_job(_store(), processing) is None
+    assert captured["force"] is False
+    assert captured["expected_worker_instance"] == "other-live-instance"
+
+
+def test_plaintext_job_heartbeat_renews_processing_lease(monkeypatch):
+    waits = []
+    touched = []
+
+    class StopAfterOneBeat:
+        def wait(self, seconds):
+            waits.append(seconds)
+            return len(waits) > 1
+
+    monkeypatch.setattr(plaintext, "_plaintext_heartbeat_sec", lambda: 15)
+    monkeypatch.setattr(
+        plaintext.db,
+        "genesis_touch_plaintext_job",
+        lambda user_id, job_id, **kwargs: touched.append(
+            (user_id, job_id, kwargs["worker_instance"])
+        ),
+    )
+
+    plaintext._run_plaintext_job_heartbeat(
+        _store(), "job_heartbeat", StopAfterOneBeat())
+
+    assert waits == [15, 15]
+    assert touched == [(
+        "usr_plaintext",
+        "job_heartbeat",
+        plaintext._PLAINTEXT_WORKER_INSTANCE,
+    )]
 
 
 def test_plaintext_background_runner_distills_and_applies(monkeypatch):
@@ -486,14 +1302,31 @@ def test_plaintext_background_runner_distills_and_applies(monkeypatch):
             "status": kwargs["status"],
             "source_kind": "history_import",
             "privacy_mode": service.PRIVACY_MODE,
+            "metadata": {"distill_model": "fast-genesis-model"},
         }
 
     monkeypatch.setattr(plaintext.db, "genesis_set_job_status", fake_set_status)
+    monkeypatch.setattr(
+        plaintext.db,
+        "genesis_get_job",
+        lambda *_args: {
+            "job_id": "genesis_job_1",
+            "status": "processing",
+            "metadata": {"distill_model": "fast-genesis-model"},
+        },
+    )
     monkeypatch.setattr(plaintext.service, "write_genesis_state", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(plaintext.hosted_config_store, "_load_runtime_provider_config", lambda *_args: "runtime")
+    chat_runtime = plaintext.provider_client.ProviderConfig(
+        "anthropic", "chat-model", "provider-key", "https://api.anthropic.com")
+    monkeypatch.setattr(
+        plaintext.hosted_config_store,
+        "_load_runtime_provider_config",
+        lambda *_args: chat_runtime,
+    )
 
     def fake_build(**kwargs):
         calls["build"] = kwargs
+        kwargs["on_map_completed"](0, {"fact_candidates": []})
         return {"memories": [], "identity": {}, "voice": {}, "persona": {}}
 
     monkeypatch.setattr(plaintext.worker, "build_reducer_output_from_texts", fake_build)
@@ -519,8 +1352,27 @@ def test_plaintext_background_runner_distills_and_applies(monkeypatch):
     assert calls["build"]["user_id"] == "usr_plaintext"
     assert calls["build"]["chunk_texts"] == ["window 1"]
     assert calls["build"]["source_kind"] == "history_import"
+    assert calls["build"]["runtime"].model == "fast-genesis-model"
+    assert chat_runtime.model == "chat-model"
     assert calls["applied"]["memories"] == []
     assert calls["statuses"][-1]["processed_chunks"] == 1
+    assert calls["statuses"][-1]["status"] == service.DONE_JOB_STATUS
+    assert calls["statuses"][-1]["output"]["identity_ready"] is True
+    assert calls["statuses"][-1]["output"]["materials"] == [{
+        "kind": "chat_history",
+        "status": "done",
+        "windows_done": 1,
+        "windows_total": 1,
+        "cards": 0,
+    }]
+    material_counts = [
+        len(status["output"].get("materials") or [])
+        for status in calls["statuses"]
+        if status.get("status") == "processing"
+    ]
+    assert material_counts
+    assert material_counts == sorted(material_counts)
+    assert material_counts[0] == 1
     assert [
         event["type"]
         for event in trace_events
@@ -540,6 +1392,37 @@ def test_plaintext_background_runner_distills_and_applies(monkeypatch):
         "genesis.plaintext.apply.started",
         "genesis.plaintext.done",
     ]
+
+
+def test_plaintext_material_cards_come_from_durable_map_outputs(monkeypatch):
+    statuses = []
+    monkeypatch.setattr(
+        plaintext.db,
+        "genesis_set_job_status",
+        lambda *_args, **kwargs: statuses.append(kwargs) or None,
+    )
+    progress = plaintext._PlaintextCheckpointProgress(
+        _store(),
+        "api-key",
+        "job-cards",
+        [{
+            "source_kind": "history_import",
+            "source_family": "history",
+            "chunk_texts": ["window"],
+        }],
+    )
+
+    progress.record_map(1, "history", 0, {
+        "fact_candidates": [{"summary": "one"}, {"summary": "two"}],
+    })
+
+    assert statuses[-1]["output"]["materials"] == [{
+        "kind": "chat_history",
+        "status": "done",
+        "windows_done": 1,
+        "windows_total": 1,
+        "cards": 2,
+    }]
 
 
 def test_plaintext_background_runner_routes_sources_and_merges_with_firewall(monkeypatch):
@@ -689,6 +1572,85 @@ def test_plaintext_background_runner_routes_sources_and_merges_with_firewall(mon
     serialized = json.dumps(applied, ensure_ascii=False)
     assert "WrongUserName" not in serialized
     assert "bad user persona" not in serialized
+
+
+def test_plaintext_retry_uses_checkpoint_and_skips_completed_maps(monkeypatch):
+    store = _store()
+    calls = {"maps": 0, "reduces": 0, "failures": []}
+    monkeypatch.setattr(plaintext.worker, "genesis_v2_enabled", lambda: True)
+    monkeypatch.setattr(plaintext.worker, "genesis_combined_map_enabled", lambda: True)
+    monkeypatch.setattr(plaintext.hosted_config_store, "_load_runtime_provider_config", lambda *_args: "runtime")
+    monkeypatch.setattr(plaintext, "_resolve_plaintext_user_name", lambda *_args: "TA")
+    monkeypatch.setattr(
+        plaintext.db,
+        "genesis_set_job_status",
+        lambda _uid, _jid, **kwargs: {"job_id": "resume_job", "status": kwargs["status"]},
+    )
+    monkeypatch.setattr(plaintext.service, "write_genesis_state", lambda *_args, **_kwargs: None)
+
+    def foreground_map(**kwargs):
+        if 0 not in (kwargs.get("resume_map_outputs") or {}):
+            calls["maps"] += 1
+            kwargs["on_map_completed"](0, {"fact_candidates": [{"summary": "remembered"}]})
+        return {
+            "source_family": "history",
+            "all_fact_candidates": [{"summary": "remembered"}],
+            "core_fact_candidates": [{"summary": "remembered"}],
+        }
+
+    monkeypatch.setattr(plaintext.worker, "build_foreground_output_from_texts", foreground_map)
+
+    def reduce_candidates(**_kwargs):
+        calls["reduces"] += 1
+        if calls["reduces"] == 1:
+            raise RuntimeError("forced reduce failure")
+        return {"memories": [{"summary": "remembered"}], "identity": {}}
+
+    monkeypatch.setattr(plaintext.worker, "build_memory_output_from_fact_candidates", reduce_candidates)
+    monkeypatch.setattr(
+        plaintext.worker,
+        "build_voice_persona_output_from_candidates",
+        lambda **_kwargs: {},
+    )
+    monkeypatch.setattr(
+        plaintext,
+        "_plaintext_merge_reducer_outputs",
+        lambda *_args, **_kwargs: {"memories": [{"summary": "remembered"}]},
+    )
+    monkeypatch.setattr(
+        plaintext.foreground_identity,
+        "derive_foreground_identity",
+        lambda **_kwargs: ({"agent_name": "", "dimensions": []}, []),
+    )
+    monkeypatch.setattr(plaintext.lightweight_identity, "derive_from_support", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(plaintext.lightweight_identity, "has_signal", lambda *_args: False)
+    monkeypatch.setattr(plaintext, "_append_plaintext_onboarding_greeting", lambda *_args, **_kwargs: "hi")
+    monkeypatch.setattr(plaintext.service, "apply_reducer_output", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        plaintext.db,
+        "genesis_complete_job",
+        lambda _user_id, job_id, **_kwargs: {"job_id": job_id, "status": "done"},
+    )
+    monkeypatch.setattr(
+        plaintext.service,
+        "mark_failed",
+        lambda _store, _job_id, error, **_kwargs: calls["failures"].append(error),
+    )
+
+    kwargs = {
+        "source_groups": [{
+            "source_kind": "history_import",
+            "source_family": "history",
+            "chunk_texts": ["window one"],
+        }],
+        "analysis_messages": [{"role": "user", "content": "window one"}],
+    }
+    plaintext._run_plaintext_genesis_job(store, "api_key", "resume_job", **kwargs)
+    plaintext._run_plaintext_genesis_job(store, "api_key", "resume_job", **kwargs)
+
+    assert calls["maps"] == 1
+    assert calls["reduces"] == 2
+    assert len(calls["failures"]) == 1
 
 
 def test_plaintext_relationship_anchor_uses_earliest_timestamp_when_no_date():
@@ -1157,7 +2119,7 @@ def test_update_identity_plaintext_enqueues_without_existing_identity(monkeypatc
     monkeypatch.setattr(
         plaintext.service,
         "create_import_job",
-        lambda _store, payload: ({
+        lambda _store, payload, **_kwargs: ({
             "job_id": "identity_create",
             "status": "created",
             "source_kind": payload["source_kind"],
@@ -1202,7 +2164,9 @@ def test_foreground_history_chunks_capped_support_untouched(monkeypatch):
     hist = next(g for g in capped if g["source_family"] == "history")
     persona = next(g for g in capped if g["source_family"] == "ai_persona")
     assert len(hist["chunk_texts"]) == 8          # history 采样到 8
+    assert hist["_checkpoint_chunk_indices"] == [0, 4, 7, 11, 15, 19, 22, 26]
     assert len(persona["chunk_texts"]) == 1        # 小桶不动
+    assert persona["_checkpoint_chunk_indices"] == [0]
 
 
 def test_plaintext_import_rejection_logs_breadcrumb(monkeypatch, caplog):

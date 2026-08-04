@@ -9,11 +9,10 @@ of a wake lane is letting the companion reach out proactively.
 
 "Weak wake sleeps": an empty terminal reply (the model chose to stay silent)
 is NOT a failure — it's `mark_completed` with zero bubbles. This is the
-OPPOSITE of the chat lane's no-filler rule. There is no longer a distinct
-"no_user_messages" failure mode: `_run_wake` always seeds a fixed
-`_WAKE_NUDGE` user-role turn, so `build_turn_messages` never produces a
-tail with zero non-system turns — a wake turn is valid even with a
-completely empty coalesce/read_tail.
+OPPOSITE of the chat lane's no-filler rule. Proactive application data is
+never serialized as a user request. An ordinary heartbeat with no real chat
+history completes without calling the provider; explicitly scheduled and
+manual wakes remain valid with an empty coalesce/read_tail.
 
 A real provider failure (`provider_client.chat_completion_async` raising) IS
 a failure — silent `mark_failed`, still no user-visible error chip
@@ -28,6 +27,7 @@ a unit test) reached through a real PR A effect-outbox drain wired via
 from __future__ import annotations
 
 import asyncio
+import json
 import sys
 import time
 from pathlib import Path
@@ -104,13 +104,14 @@ def _apply_effects(user_id):
     return v2_effect_outbox.apply_pending_effects(user_id, dispatch=_reply_effect_dispatch(user_id))
 
 
-def _wake_deps(*, summary="", tail=None):
+def _wake_deps(*, summary="", tail=None, has_genuine_user_history=None):
     return worker.TurnDeps(
         read_messages=lambda uid: [],
         resolve_provider=lambda uid: (_BYOK, {}),
         mint_enclave_token=lambda uid: "rt",
         read_tail=lambda uid, after_ts, limit: list(tail if tail is not None else []),
         read_summary=lambda uid: (summary, 0.0, 0),
+        has_genuine_user_history=has_genuine_user_history,
         apply_pending_effects=_apply_effects,
     )
 
@@ -167,6 +168,11 @@ def test_run_wake_reply_written_and_job_completed(monkeypatch):
     assert _job_status(job_id)[0] == "completed"
     system_msg = next(m for m in seen["messages"] if m["role"] == "system")
     assert worker._WAKE_SYSTEM_PROMPT in system_msg["content"]
+    assert [
+        message["content"]
+        for message in seen["messages"]
+        if message.get("role") == "user"
+    ] == ["hi"]
 
 
 def test_run_wake_reply_push_carries_is_wake_true_and_manual_wake_lane(monkeypatch):
@@ -218,7 +224,10 @@ def test_run_wake_reply_push_carries_is_wake_true_and_manual_wake_lane(monkeypat
     reply_text = "hey, thinking of you — " + ("x" * 300)
     assert len(reply_text) > 240
 
+    provider_messages = []
+
     async def _fake(config, messages, *, tools=None, **_kwargs):
+        provider_messages.append(messages)
         return _text_round(reply_text)
 
     monkeypatch.setattr(provider_client, "chat_completion_async", _fake)
@@ -256,6 +265,17 @@ def test_run_wake_reply_push_carries_is_wake_true_and_manual_wake_lane(monkeypat
         "backend derives manual/source from this — a copy-paste bug here "
         "silently breaks the reminders_delivery-off manual-wake bypass"
     )
+    runtime_message = next(
+        message
+        for message in provider_messages[0]
+        if message.get("role") == "assistant"
+        and str(message.get("content") or "").startswith(
+            v2_context.RUNTIME_CONTEXT_HEADER
+        )
+    )
+    runtime_payload = json.loads(runtime_message["content"].split("\n", 1)[1])
+    assert runtime_payload["runtime_control"]["manual_wake"] is True
+    assert not any(message.get("role") == "user" for message in provider_messages[0])
 
 
 def test_wake_workspace_prompt_snapshot_is_loaded_once_across_rounds(
@@ -304,7 +324,9 @@ def test_wake_workspace_prompt_snapshot_is_loaded_once_across_rounds(
         lambda _store, _text: {"id": "wake-reply"},
     )
     loader_calls = []
-    deps = _wake_deps(tail=[])
+    deps = _wake_deps(
+        tail=[{"id": "m1", "ts": 1.0, "role": "user", "content": "hi"}]
+    )
     deps.load_workspace_prompt = lambda _store, **kwargs: (
         loader_calls.append(kwargs["runtime_token"])
         or {
@@ -419,22 +441,18 @@ def test_run_wake_weak_wake_sleeps_no_bubble_no_error(monkeypatch):
     assert not any(e["kind"] == "error" for e in _status_events(uid))
 
 
-def test_run_wake_empty_tail_also_sleeps_silently(monkeypatch):
-    """A degenerate prompt (zero real tail rows, only the fixed `_WAKE_NUDGE`)
-    must be treated identically to any other weak-wake silence — there is no
-    longer a distinct "no_user_messages" failure mode (Task 8 removed that
-    guard: `wake_tail` always has at least the nudge, so `build_turn_messages`
-    never sees zero non-system turns for a wake lane)."""
+def test_automatic_heartbeat_with_empty_history_skips_the_provider(monkeypatch):
+    """An account with no genuine conversation must not receive a fabricated turn."""
     uid = "u_wake_nouser"
     conftest.seed_user(uid)
     _reset(uid)
-    job_id, _ = jobs_store.enqueue_job(uid, "scheduled")
+    job_id, _ = jobs_store.enqueue_job(uid, "heartbeat")
     claimed_by = _claim(job_id)
 
-    seen = {}
+    provider_calls = []
 
     async def _fake(config, messages, *, tools=None, **_kwargs):
-        seen["messages"] = messages
+        provider_calls.append(messages)
         return _text_round("")
 
     monkeypatch.setattr(provider_client, "chat_completion_async", _fake)
@@ -445,23 +463,69 @@ def test_run_wake_empty_tail_also_sleeps_silently(monkeypatch):
 
     deps = _wake_deps(tail=[])
     status = asyncio.run(worker._run_wake(
-        job_id, uid, "scheduled", deps, _BYOK, worker.ENCLAVE_SEMAPHORE, claimed_by))
+        job_id, uid, "heartbeat", deps, _BYOK, worker.ENCLAVE_SEMAPHORE, claimed_by))
 
     assert status == "completed"
+    assert provider_calls == []
     assert write_called["n"] == 0
     assert _job_status(job_id)[0] == "completed"
-    conversation_messages = [
-        message
-        for message in seen["messages"]
-        if message.get("role") != "system"
-        and not str(message.get("content") or "").startswith(
-            v2_context.RUNTIME_CONTEXT_HEADER
-        )
-        and not str(message.get("content") or "").startswith(
-            v2_context.TEMPORAL_CONTEXT_HEADER
-        )
-    ]
-    assert len(conversation_messages) == 1  # just the nudge — no real tail rows
+
+
+@pytest.mark.parametrize(
+    ("summary", "tail"),
+    [
+        ("A summary exists without any real user message.", []),
+        ("", [{"id": "m1", "ts": 1.0, "role": "assistant", "content": "hello"}]),
+    ],
+)
+def test_automatic_heartbeat_authoritative_no_user_history_skips_all_prompt_work(
+    monkeypatch,
+    summary,
+    tail,
+):
+    """Summary/assistant artifacts cannot authorize a proactive provider call."""
+    uid = f"u_wake_no_authority_{len(tail)}"
+    conftest.seed_user(uid)
+    _reset(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, "heartbeat")
+    claimed_by = _claim(job_id)
+
+    provider_calls = []
+    workspace_calls = []
+
+    async def _fake(config, messages, *, tools=None, **_kwargs):
+        provider_calls.append(messages)
+        return _text_round("")
+
+    monkeypatch.setattr(provider_client, "chat_completion_async", _fake)
+    deps = _wake_deps(
+        summary=summary,
+        tail=tail,
+        has_genuine_user_history=lambda user_id: False,
+    )
+    deps.load_workspace_prompt = lambda *args, **kwargs: workspace_calls.append(
+        (args, kwargs)
+    ) or {"trusted_system_blocks": [], "working_memory": ""}
+
+    status = asyncio.run(worker._run_wake(
+        job_id, uid, "heartbeat", deps, _BYOK, worker.ENCLAVE_SEMAPHORE, claimed_by))
+
+    assert status == "completed"
+    assert provider_calls == []
+    assert workspace_calls == []
+    assert _job_status(job_id)[0] == "completed"
+
+
+def test_proactive_policy_does_not_bias_the_model_toward_silence():
+    """The policy must preserve V1's equal speak/sleep product decision."""
+    prompt = worker._WAKE_SYSTEM_PROMPT.lower()
+
+    assert "speaking and staying silent are equally valid" in prompt
+    assert "do not need a strong reason" in prompt
+    assert "not a user request" in prompt
+    assert "only if" not in prompt
+    assert "genuinely worth saying" not in prompt
+    assert "silence is correct" not in prompt
 
 
 def test_run_wake_degenerate_reply_fails_silently(monkeypatch):
@@ -575,9 +639,39 @@ def test_run_scheduled_wake_prompts_with_the_exact_due_reminders(monkeypatch):
         for message in seen["messages"]
         if message.get("role") == "user"
     )
-    assert "提醒我喝水" in user_text
-    assert "提醒我拉伸" in user_text
-    assert worker._WAKE_NUDGE not in user_text
+    assert user_text == ""
+    runtime_text = "\n".join(
+        str(message.get("content") or "")
+        for message in seen["messages"]
+        if message.get("role") == "assistant"
+        and str(message.get("content") or "").startswith(
+            v2_context.RUNTIME_CONTEXT_HEADER
+        )
+    )
+    assert "提醒我喝水" in runtime_text
+    assert "提醒我拉伸" in runtime_text
+    runtime_payload = json.loads(runtime_text.split("\n", 1)[1])
+    scheduled_wakes = runtime_payload["runtime_data"]["scheduled_wakes"]
+    assert scheduled_wakes == [
+        {
+            "note": "提醒我喝水",
+            "schedule_next_trigger_at": "2026-07-27T08:00:00",
+            "schedule_operation": "scheduled_wake",
+            "schedule_status": "fired",
+            "schedule_task_id": "timer-water",
+            "schedule_timezone": "Asia/Shanghai",
+            "fired_at": 123.0,
+        },
+        {
+            "note": "提醒我拉伸",
+            "schedule_next_trigger_at": "2026-07-27T08:00:00",
+            "schedule_operation": "scheduled_wake",
+            "schedule_status": "fired",
+            "schedule_task_id": "timer-stretch",
+            "schedule_timezone": "Asia/Shanghai",
+            "fired_at": 123.0,
+        },
+    ]
     with db.get_pool().connection() as conn:
         payload = conn.execute(
             "SELECT payload FROM v2_effect_outbox "
@@ -585,6 +679,8 @@ def test_run_scheduled_wake_prompts_with_the_exact_due_reminders(monkeypatch):
             (uid, job_id),
         ).fetchone()[0]
     events = payload["activity_events"]
+    assert "提醒我喝水" not in json.dumps(payload, ensure_ascii=False)
+    assert "提醒我拉伸" not in json.dumps(payload, ensure_ascii=False)
     assert [event["schedule_task_id"] for event in events] == [
         "timer-water",
         "timer-stretch",
@@ -606,12 +702,16 @@ def test_run_perception_wake_injects_trigger_as_untrusted_runtime_data(monkeypat
         seen["messages"] = messages
         return _text_round("")
 
-    async def _empty_grounding(*_args, **_kwargs):
-        return {}
+    async def _empty_glance(*_args, **_kwargs):
+        return None, None
 
     monkeypatch.setattr(provider_client, "chat_completion_async", _fake)
-    monkeypatch.setattr(worker, "_perception_grounding_results", _empty_grounding)
-    deps = _wake_deps(tail=[])
+    monkeypatch.setattr(
+        worker, "_perception_glance_grounding_results", _empty_glance
+    )
+    deps = _wake_deps(
+        tail=[{"id": "m1", "ts": 1.0, "role": "user", "content": "hi"}]
+    )
     deps.read_perception_wake_context = lambda user_id, wake_job_id: [{
         "wake_id": "wake-1",
         "source": "perception_event",
@@ -642,22 +742,332 @@ def test_run_perception_wake_injects_trigger_as_untrusted_runtime_data(monkeypat
     runtime_messages = [
         message
         for message in seen["messages"]
-        if message.get("role") == "user"
+        if message.get("role") == "assistant"
         and str(message.get("content") or "").startswith(
             v2_context.RUNTIME_CONTEXT_HEADER
         )
     ]
     assert len(runtime_messages) == 1
+    assert [
+        message.get("content")
+        for message in seen["messages"]
+        if message.get("role") == "user"
+    ] == ["hi"]
     runtime_text = str(runtime_messages[0]["content"])
     assert '"perception_wake"' in runtime_text
     assert "arrived_at_anchor" in runtime_text
-    assert "arrived near home" in runtime_text
-    assert "location:home" in runtime_text
-    assert any(
-        "A recent perception change may be worth responding to."
-        in str(message.get("content") or "")
-        for message in seen["messages"]
-        if message.get("role") == "user"
+    assert "anchor_changed" in runtime_text
+    assert "arrived near home" not in runtime_text
+    assert "location:home" not in runtime_text
+    assert "A recent perception change may be worth responding to." not in str(
+        seen["messages"]
+    )
+
+
+def test_lost_heartbeat_lease_does_not_persist_glance_fingerprint(monkeypatch):
+    """Catches a candidate write that happens before terminalization wins."""
+    uid = "u_glance_lost_lease"
+    conftest.seed_user(uid)
+    _reset(uid)
+    monkeypatch.setattr(
+        worker, "_write_encrypted_reply", lambda store, text: {"id": "r"}
+    )
+
+    async def fake_provider(*args, **kwargs):
+        return _text_round("")
+
+    async def fake_cap_data(store, action_type, **kwargs):
+        assert action_type == "perception_glance"
+        return {
+            "glance": {
+                "weather": {"available": True, "notable_change": False}
+            }
+        }
+
+    upserts = []
+    monkeypatch.setattr(provider_client, "chat_completion_async", fake_provider)
+    monkeypatch.setattr(worker, "_cap_data", fake_cap_data)
+    monkeypatch.setattr(
+        jobs_store,
+        "finish_wake_job",
+        lambda *args, **kwargs: (False, None),
+    )
+    monkeypatch.setattr(
+        jobs_store,
+        "upsert_runtime_state",
+        lambda *args, **kwargs: upserts.append((args, kwargs)),
+    )
+    deps = _wake_deps(
+        tail=[{"id": "m1", "ts": 1.0, "role": "user", "content": "hi"}]
+    )
+    deps.read_perception_wake_context = lambda uid, job_id: []
+    jobs_store.enqueue_job(uid, "heartbeat")
+    job = jobs_store.claim_next_job("w")
+    status = asyncio.run(
+        worker.process_job(
+            job,
+            deps,
+            provider_config=_BYOK,
+            api_key=None,
+            runtime_token="rt",
+        )
+    )
+
+    assert status == "failed"
+    assert upserts == []
+
+
+def test_ordinary_heartbeat_gives_fingerprint_to_atomic_finish(monkeypatch):
+    """The worker must not terminalize and persist in separate store calls."""
+    uid = "u_glance_atomic_finish"
+    conftest.seed_user(uid)
+    _reset(uid)
+
+    async def fake_provider(*args, **kwargs):
+        return _text_round("")
+
+    glance = {"weather": {"available": True, "notable_change": False}}
+    fingerprint = worker.perception_glance_fingerprint(glance)
+
+    async def fake_cap_data(store, action_type, **kwargs):
+        assert action_type == "perception_glance"
+        return {"glance": glance}
+
+    finishes = []
+
+    def fake_finish(*args, **kwargs):
+        finishes.append((args, kwargs))
+        return True, None
+
+    monkeypatch.setattr(provider_client, "chat_completion_async", fake_provider)
+    monkeypatch.setattr(worker, "_cap_data", fake_cap_data)
+    monkeypatch.setattr(jobs_store, "finish_wake_job", fake_finish)
+    monkeypatch.setattr(
+        jobs_store,
+        "upsert_runtime_state",
+        lambda *args, **kwargs: pytest.fail("separate fingerprint upsert"),
+    )
+    deps = _wake_deps(
+        tail=[{"id": "m1", "ts": 1.0, "role": "user", "content": "hi"}]
+    )
+    deps.read_perception_wake_context = lambda uid, job_id: []
+    jobs_store.enqueue_job(uid, "heartbeat")
+    job = jobs_store.claim_next_job("w")
+
+    status = asyncio.run(
+        worker.process_job(
+            job,
+            deps,
+            provider_config=_BYOK,
+            api_key=None,
+            runtime_token="rt",
+        )
+    )
+
+    assert status == "completed"
+    assert len(finishes) == 1
+    assert finishes[0][1]["completed_perception_glance_fingerprint"] == fingerprint
+
+
+def test_ordinary_heartbeat_final_reply_persists_glance_before_finish(
+    monkeypatch,
+):
+    """The final effect owns the marker before the worker resumes completion."""
+    uid = "u_glance_atomic_reply_finish"
+    conftest.seed_user(uid)
+    _reset(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, "heartbeat")
+    claimed_by = _claim(job_id)
+    assert jobs_store.mark_running(job_id, claimed_by=claimed_by)
+
+    glance = {"weather": {"available": True, "notable_change": False}}
+    fingerprint = worker.perception_glance_fingerprint(glance)
+
+    async def fake_cap_data(store, action_type, **kwargs):
+        assert action_type == "perception_glance"
+        return {"glance": glance}
+
+    async def fake_provider(*args, **kwargs):
+        return _text_round("A quiet proactive reply.")
+
+    def fake_envelope(_store, _text, *, item_id=None):
+        return (
+            {
+                "v": 1,
+                "id": str(item_id),
+                "owner_user_id": uid,
+                "visibility": "shared",
+                "body_ct": "ciphertext",
+                "nonce": "nonce",
+                "K_user": "sealed-user-key",
+                "K_enclave": "sealed-enclave-key",
+            },
+            "",
+        )
+
+    real_finish = jobs_store.finish_wake_job
+    finish_calls = []
+
+    def assert_effect_committed_first(*args, **kwargs):
+        finish_calls.append((args, kwargs))
+        assert jobs_store.get_runtime_state(uid) == {
+            "last_completed_perception_glance_fingerprint": fingerprint,
+            "last_completed_perception_glance_source_job_id": job_id,
+        }
+        return real_finish(*args, **kwargs)
+
+    monkeypatch.setattr(provider_client, "chat_completion_async", fake_provider)
+    monkeypatch.setattr(worker, "_cap_data", fake_cap_data)
+    monkeypatch.setattr(
+        worker.core_envelope,
+        "_build_shared_envelope_for_store",
+        fake_envelope,
+    )
+    monkeypatch.setattr(
+        jobs_store,
+        "finish_wake_job",
+        assert_effect_committed_first,
+    )
+    deps = worker.TurnDeps(
+        read_messages=lambda uid: [],
+        resolve_provider=lambda uid: (_BYOK, {}),
+        mint_enclave_token=lambda uid: "rt",
+        read_tail=lambda uid, after_ts, limit: [
+            {"id": "m1", "ts": 1.0, "role": "user", "content": "hi"}
+        ],
+        read_summary=lambda uid: ("", 0.0, 0),
+        read_messages_after_seq=lambda uid, after_seq: [],
+        read_perception_wake_context=lambda uid, job_id: [],
+        apply_pending_effects=serve_worker._apply_pending_effects_for_user,
+    )
+
+    status = asyncio.run(
+        worker._run_wake(
+            job_id,
+            uid,
+            "heartbeat",
+            deps,
+            _BYOK,
+            worker.ENCLAVE_SEMAPHORE,
+            claimed_by,
+        )
+    )
+
+    assert status == "completed"
+    assert len(finish_calls) == 1
+
+
+def test_heartbeat_without_context_reader_does_not_persist_after_failed_completion(
+    monkeypatch,
+):
+    """Catches optional-reader heartbeats treating failed completion as success."""
+    uid = "u_glance_no_context_reader_lost_lease"
+    conftest.seed_user(uid)
+    _reset(uid)
+
+    async def fake_provider(*args, **kwargs):
+        return _text_round("")
+
+    async def fake_cap_data(store, action_type, **kwargs):
+        assert action_type == "perception_glance"
+        return {
+            "glance": {
+                "weather": {"available": True, "notable_change": False}
+            }
+        }
+
+    upserts = []
+    monkeypatch.setattr(provider_client, "chat_completion_async", fake_provider)
+    monkeypatch.setattr(worker, "_cap_data", fake_cap_data)
+    monkeypatch.setattr(jobs_store, "mark_completed", lambda *args, **kwargs: False)
+    monkeypatch.setattr(
+        jobs_store,
+        "upsert_runtime_state",
+        lambda *args, **kwargs: upserts.append((args, kwargs)),
+    )
+    deps = _wake_deps(
+        tail=[{"id": "m1", "ts": 1.0, "role": "user", "content": "hi"}]
+    )
+    assert deps.read_perception_wake_context is None
+    jobs_store.enqueue_job(uid, "heartbeat")
+    job = jobs_store.claim_next_job("w")
+    status = asyncio.run(
+        worker.process_job(
+            job,
+            deps,
+            provider_config=_BYOK,
+            api_key=None,
+            runtime_token="rt",
+        )
+    )
+
+    assert status == "failed"
+    assert upserts == []
+
+
+def test_generation_change_before_atomic_heartbeat_completion_fences_fingerprint(
+    monkeypatch,
+):
+    """A stale source cannot complete or write after its runtime generation."""
+    uid = "u_glance_generation_fence"
+    conftest.seed_user(uid)
+    _reset(uid)
+    monkeypatch.setattr(
+        worker, "_write_encrypted_reply", lambda store, text: {"id": "r"}
+    )
+
+    async def fake_provider(*args, **kwargs):
+        return _text_round("")
+
+    async def fake_cap_data(store, action_type, **kwargs):
+        assert action_type == "perception_glance"
+        return {
+            "glance": {
+                "weather": {"available": True, "notable_change": False}
+            }
+        }
+
+    real_finish_wake_job = jobs_store.finish_wake_job
+
+    def advance_generation_then_finish(*args, **kwargs):
+        with db.get_pool().connection() as conn:
+            conn.execute(
+                "UPDATE v2_runtime_state "
+                "SET runtime_generation=runtime_generation+1 "
+                "WHERE user_id=%s",
+                (uid,),
+            )
+        result = real_finish_wake_job(*args, **kwargs)
+        assert result == (False, None)
+        return result
+
+    monkeypatch.setattr(provider_client, "chat_completion_async", fake_provider)
+    monkeypatch.setattr(worker, "_cap_data", fake_cap_data)
+    monkeypatch.setattr(
+        jobs_store,
+        "finish_wake_job",
+        advance_generation_then_finish,
+    )
+    deps = _wake_deps(
+        tail=[{"id": "m1", "ts": 1.0, "role": "user", "content": "hi"}]
+    )
+    deps.read_perception_wake_context = lambda uid, job_id: []
+    jobs_store.enqueue_job(uid, "heartbeat")
+    job = jobs_store.claim_next_job("w")
+    status = asyncio.run(
+        worker.process_job(
+            job,
+            deps,
+            provider_config=_BYOK,
+            api_key=None,
+            runtime_token="rt",
+        )
+    )
+
+    assert status == "failed"
+    assert (
+        "last_completed_perception_glance_fingerprint"
+        not in jobs_store.get_runtime_state(uid)
     )
 
 
@@ -733,12 +1143,16 @@ def test_run_perception_wake_hands_late_context_to_successor(monkeypatch):
         assert late_coalesced is True
         return _text_round("This reply is stale after the late event.")
 
-    async def _empty_grounding(*_args, **_kwargs):
-        return {}
+    async def _empty_glance(*_args, **_kwargs):
+        return None, None
 
     monkeypatch.setattr(provider_client, "chat_completion_async", _fake)
-    monkeypatch.setattr(worker, "_perception_grounding_results", _empty_grounding)
-    deps = _wake_deps(tail=[])
+    monkeypatch.setattr(
+        worker, "_perception_glance_grounding_results", _empty_glance
+    )
+    deps = _wake_deps(
+        tail=[{"id": "m1", "ts": 1.0, "role": "user", "content": "hi"}]
+    )
     deps.read_messages_after_seq = lambda user_id, after_seq: []
     deps.read_perception_wake_context = (
         serve_worker._read_perception_wake_context
@@ -902,10 +1316,10 @@ def test_run_wake_tolerates_missing_read_summary_read_tail(monkeypatch):
     job_id, _ = jobs_store.enqueue_job(uid, "heartbeat")
     claimed_by = _claim(job_id)
 
-    seen = {}
+    provider_calls = []
 
     async def _fake(config, messages, *, tools=None, **_kwargs):
-        seen["messages"] = messages
+        provider_calls.append(messages)
         return _text_round("")
 
     monkeypatch.setattr(provider_client, "chat_completion_async", _fake)
@@ -921,21 +1335,7 @@ def test_run_wake_tolerates_missing_read_summary_read_tail(monkeypatch):
         job_id, uid, "heartbeat", deps, _BYOK, worker.ENCLAVE_SEMAPHORE, claimed_by))
 
     assert status == "completed"
-    conversation_messages = [
-        message
-        for message in seen["messages"]
-        if message.get("role") != "system"
-        and not str(message.get("content") or "").startswith(
-            v2_context.RUNTIME_CONTEXT_HEADER
-        )
-        and not str(message.get("content") or "").startswith(
-            v2_context.TEMPORAL_CONTEXT_HEADER
-        )
-    ]
-    # The conversational tail should be just the wake nudge. Live grounding,
-    # when available, is a separate untrusted user-role runtime-data block.
-    assert len(conversation_messages) == 1
-    assert conversation_messages[0]["role"] == "user"
+    assert provider_calls == []
     schedule = jobs_store.get_wake_schedule(uid)
     assert schedule["proactive_fail_streak"] == 0
     assert schedule["proactive_backoff_until"] is None
@@ -1025,7 +1425,9 @@ def test_run_wake_rollback_blocks_provider_cooldown_write(monkeypatch):
         "upsert_wake_schedule",
         lambda *a, **k: cooldown_calls.append((a, k)),
     )
-    deps = _wake_deps(tail=[])
+    deps = _wake_deps(
+        tail=[{"id": "m1", "ts": 1.0, "role": "user", "content": "hi"}]
+    )
     deps.runtime_mode_enabled = lambda _uid: next(mode_checks)
 
     status = asyncio.run(worker._run_wake(
@@ -1055,8 +1457,11 @@ def test_run_wake_lost_lease_blocks_provider_cooldown_write(monkeypatch):
         lambda *a, **k: cooldown_calls.append((a, k)),
     )
 
+    deps = _wake_deps(
+        tail=[{"id": "m1", "ts": 1.0, "role": "user", "content": "hi"}]
+    )
     status = asyncio.run(worker._run_wake(
-        job_id, uid, "heartbeat", _wake_deps(tail=[]), _BYOK,
+        job_id, uid, "heartbeat", deps, _BYOK,
         worker.ENCLAVE_SEMAPHORE, claimed_by))
 
     assert status == "failed"
@@ -1130,7 +1535,9 @@ def test_process_job_dispatches_wake_lanes_to_run_wake_not_chat_path(monkeypatch
         read_messages=lambda uid_: [],
         resolve_provider=lambda uid_: (_BYOK, {}),
         mint_enclave_token=lambda uid_: "rt",
-        read_tail=lambda uid_, after_ts, limit: [],
+        read_tail=lambda uid_, after_ts, limit: [
+            {"id": "m1", "ts": 1.0, "role": "user", "content": "hi"}
+        ],
         read_summary=lambda uid_: ("", 0.0, 0),
         apply_pending_effects=_apply_effects,
     )

@@ -10,6 +10,109 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **Hosted Runtime V2 restores the proactive-presence semantics used by Runtime
+  V1.** Automatic wake context is no longer serialized as a synthetic user
+  message, and speaking and staying silent are treated as equally valid for
+  heartbeat and screen-watch moments. Scheduled reminder text is supplied as
+  labeled application data, while an ordinary heartbeat for an account with no
+  genuine conversation history completes without calling the model.
+
+- **Runtime V2 perception wakes now use durable per-signal baselines.** The
+  first observation establishes a baseline without waking the model, and stale
+  or replayed source events cannot manufacture a later change. Only a fresh,
+  allowlisted transition can enqueue its corresponding proactive wake, which
+  prevents delayed arrival or unlock notices from old sensor data. Exact
+  network/device anchor identifiers and home/work labels are excluded from
+  durable wake metadata. Baseline fingerprints record an opaque key ID and
+  support a one-generation previous-secret bridge so rolling secret rotation
+  cannot manufacture a location change. A separate post-rollout convergence
+  switch can rebaseline dormant unknown-key rows without waking, but remains
+  disabled by default and must not be used while old workers are running.
+
+- Changed Hosted Runtime V2 perception grounding to keep foreground chat
+  readings tool-only and give proactive wake a boolean-only glance.
+  Perception-triggered wake messages no longer receive unrelated exact battery,
+  weather, activity, sleep, or health values in their initial prompt.
+
+- **Hosted Dream maintenance now uses proposal rationale plus independent
+  semantic review.** Runtime V2 fetches complete candidate card bodies instead
+  of reconstructing them from one-line summaries. Every consolidation must
+  include a rationale and receive an isolated second yes/no judgment from the
+  account's BYOK model; a negative, failed, timed-out, or malformed judgment
+  rejects only that proposal. This replaces the temporary text-overlap,
+  five-consolidation, four-retired-card, and seven-day cooldown fences, allowing
+  low-overlap evolution such as a travel plan becoming a booked ticket while
+  keeping merely related events separate. One-card rewrites still require
+  substantive new information, one source card cannot be reused within a run,
+  and all actions remain soft supersedes bound to the pre-run card snapshot.
+  Dream's durable automatic trigger advances only on new non-Dream cards.
+
+- **Users can explicitly wake a full Memory Dream organization from chat.**
+  Runtime V2 exposes `memory_organize` only for an explicit user request and
+  force-enqueues a single-flight Dream job without granting direct merge access
+  to the chat turn. It bypasses automatic timing and new-material gates but
+  retains rationale review, soft supersedes, and the deployment/user Dream
+  switches; a disabled switch returns a clear disabled state. Resident V1 has
+  the equivalent `memory-organize` CLI verb over `POST /v1/dream/tick` with
+  `force: true`.
+
+- **Runtime V2 can browse large Memory Gardens by partition without increasing
+  its tool-result cap.** `memory_index` now exposes the existing `bucket` and
+  `thread` filters, restoring resident CLI parity without adding offset-based
+  full-library pagination. Index and search results report content-free
+  `total` and `returned` counts, and truncated results tell the model to browse
+  bucket or thread partitions. Tool guidance keeps targeted questions on
+  `memory_search` then `memory_fetch`, while user-requested bulk cleanup is sent
+  to `memory_organize` rather than many chat-loop card edits.
+
+- **Scheduled reminders can repeat daily or weekly.** The model-facing
+  `schedule_wake` tool accepts `repeat: "daily"` or `repeat: "weekly"` and uses
+  fixed 24-hour or 7-day intervals. Identical pending reminders are deduplicated
+  by trigger instant and repeat mode, each successful trigger publishes a new
+  pending `wake_id`, and `cancel_wake` stops the complete repeating series.
+  One-time reminders remain unchanged.
+
+- **Hosted Genesis memory imports no longer fail provenance validation or
+  complete after every card was rejected.** `genesis_import` is now a published
+  `capture_mode` for `POST /v1/memory/actions`, matching the existing memory
+  source value used by plaintext and long-term-memory imports. If an import
+  batch writes no cards and reports any failed item, the Genesis job is marked
+  `failed` with the underlying action error instead of completing with a zero
+  memory count; partial batches that write at least one card still complete.
+
+- **Genesis onboarding supports estimate then commit.** Managed clients can
+  encrypted-stage onboarding material and receive per-material window/token
+  estimates without an LLM call, then commit the `staged_id` with an optional
+  job-only model override. Fast-model recommendations cover Anthropic,
+  DeepSeek, Gemini, OpenAI, and OpenRouter, with a three-second catalog probe
+  for compatible relays. Job status immediately exposes every material as
+  queued, followed by ordered progress and real candidate-card counts,
+  `identity_ready`, and cause-aware failure fields. Processing frames preserve
+  the complete material list while individual items advance, so counters do
+  not disappear between stages. Missing, consumed, and expired stages have
+  distinct 4xx errors. Genesis V2 now remains processing
+  after foreground identity readiness and reaches done only after all material
+  windows complete, including combined-map imports. Malformed provider JSON is
+  reported as `model_bad_json` instead of an internal error. Plaintext workers
+  now maintain an independent, instance-fenced lease. Status and submission
+  requests immediately recover a same-host job whose owner process has exited;
+  remote or legacy owners retain a two-minute heartbeat cutoff so a rolling
+  deploy cannot kill a worker that is still running on another host.
+
+- **Genesis plaintext processing now fails fast and resumes completed windows.**
+  `POST /v1/genesis/imports/plaintext` permits only one processing plaintext
+  job per account. A concurrent submission returns `409 import_job_active`
+  with `active_job_id`; the guard is enforced in PostgreSQL across API workers.
+  The first real model call is a bounded canary, provider timeouts make at most
+  two attempts while `429`/`5xx` retain their existing retry budget, and a
+  timed-out canary is reported as `distill_model_too_slow` with copy directing
+  the user to a faster model. Other provider configuration failures retain their
+  specific cause-aware guidance. Each successful material window is durably
+  checkpointed in an encrypted envelope before progress advances. Retrying the
+  same failed import skips completed windows and resumes at reduction, and
+  failed onboarding validation now reports the durable window percentage and
+  per-material progress instead of `progress: 100`.
+
 - **Web search and fetch now work on Runtime V1 too (managed runtime only).**
   The user-controlled `web_search` / `web_fetch` tools were previously a Runtime
   V2 capability only; V1 accounts on the **managed (cloud) runtime** can now use
@@ -33,12 +136,12 @@ change must not be interpreted as an API guarantee.
   enclave-attestation bundles before claiming pinning-equivalent security;
   WebPKI alone is insufficient.
 
-- **Memory Garden status now reports today's captured-card total.**
+- **Memory Garden status now reports a monotonic captured-card total.**
   `GET /v1/dream/status` adds `capture_cards_added` and
-  `capture_completed_at`. Resident and Runtime V2 Capture runs accumulate only
-  cards actually added on the device-local calendar day, start a fresh total
-  on the first positive Capture of the next day, and leave the banner fields
-  unchanged after a zero-card run.
+  `capture_completed_at`. Resident and Runtime V2 Capture runs add only cards
+  actually inserted, never reset the total at a calendar boundary, and leave
+  the banner fields unchanged after a zero-card run. Clients derive the
+  unconfirmed count from the total saved when the user last dismissed it.
 
 - **Background agent turns can no longer rewrite the identity card.** Runtime
   V2 now visibly refuses `identity_patch` and `identity_nudge` during proactive
