@@ -3,27 +3,41 @@
 **Date:** 2026-08-04
 **Status:** Approved scope decision
 **Delivery branch:** `feat/admin-runtime-user-report`
-**Pull request:** [#146](https://github.com/teleport-computer/feedling-mcp/pull/146)
+**Product-code pull request:** [#146](https://github.com/teleport-computer/feedling-mcp/pull/146)
+**P0-B archive/review pull request:** [Draft #155](https://github.com/teleport-computer/feedling-mcp/pull/155)
 
-PR #146 merged into `test` on 2026-08-03. It remains the only product-code
-delivery PR. A later docs-only follow-up may record this scope decision without
-adding or changing product behavior.
+[PR #146](https://github.com/teleport-computer/feedling-mcp/pull/146) merged
+P0-A into `test` on 2026-08-03 and remains the only product-code delivery.
+Only P0-A is shipped on `test`; P0-B, P0-C, and billing-grade accounting remain
+unshipped, and production is untouched.
 
 ## Execution status (2026-08-04)
 
-PR #146 has already merged the P0-A product code into `test`. Docs-only PR
-#154 was closed unmerged after unrelated current-`test` Dream policy checks
-failed. The maintainer-authorized direct docs-only fast-forward completed on
-`test` at integration commit `3b17da22a8bdf3b791ce59bd5f7a655c65543a57`.
+[PR #146](https://github.com/teleport-computer/feedling-mcp/pull/146) merged the
+P0-A product code into `test` and remains the only product-code delivery.
+Docs-only [PR #154](https://github.com/teleport-computer/feedling-mcp/pull/154)
+was closed unmerged after unrelated current-`test` Dream policy checks failed.
+The maintainer-authorized direct two-document update landed on `test` through
+the normal fast-forward sequence culminating in the status correction at
+[`953c074d45309448360125753fb231006344eeee`](https://github.com/teleport-computer/feedling-mcp/commit/953c074d45309448360125753fb231006344eeee).
 The former follow-up-PR workflow is historical and superseded: it **MUST NOT**
-be executed or used to create another PR. P0-B and P0-C remain deferred.
+be executed or used to create another PR.
+
+User-authorized [Draft PR #155](https://github.com/teleport-computer/feedling-mcp/pull/155)
+is OPEN against `test` from `feat/provider-attempt-accounting` at
+`dbfdeed3b4f19a774870fa0e5c1a7cb4f160d1eb`, solely for archival and review.
+GitHub reports it as `DIRTY` / `CONFLICTING`; it is **NOT READY FOR MERGE OR
+DEPLOYMENT**. The strict 3-million-turn plus 3-million-attempt performance gate
+failed, so P0-B requires redesign, rebase, and renewed validation. The Draft
+authorizes no `test` or production deployment.
 
 ## Decision
 
-Ship P0-A as the complete scope for this delivery. Defer P0-B provider-attempt
-accounting and P0-C resident telemetry because the current product need is
-operational usage and reliability visibility, not financial billing or exact
-provider-invoice reconciliation.
+Ship P0-A as the complete scope for this delivery. Keep P0-B provider-attempt
+accounting and P0-C resident telemetry deferred and unshipped because the
+current product need is operational usage and reliability visibility, not
+financial billing or exact provider-invoice reconciliation. The open Draft for
+P0-B does not change this boundary.
 
 ## Product outcome
 
@@ -66,10 +80,17 @@ or financial truth.
 
 ### P0-B: provider-attempt accounting
 
-Do not merge or deploy `feat/provider-attempt-accounting`. Preserve the branch
-as experimental evidence only. Its current strict 3-million-turn plus
-3-million-attempt query gate is not met: the tested query shapes remain above
-the three-second budget and spill aggregation work to disk.
+Do not merge or deploy `feat/provider-attempt-accounting`. The user-authorized
+[Draft PR #155](https://github.com/teleport-computer/feedling-mcp/pull/155)
+preserves the branch solely as experimental archival/review evidence; it is
+OPEN against `test` at `dbfdeed3b4f19a774870fa0e5c1a7cb4f160d1eb`, and GitHub
+reports it as `DIRTY` / `CONFLICTING`. It is **NOT READY FOR MERGE OR
+DEPLOYMENT** and authorizes no test or production deployment.
+
+Its strict 3-million-turn plus 3-million-attempt query gate failed: the tested
+query shapes exceeded the three-second budget and spilled aggregation work to
+disk. Redesign, rebase, and renewed validation are required before any new
+delivery decision.
 
 If exact attempt accounting becomes a real requirement, start with a fresh
 design review using the recorded experiments. Do not resume by merging the
@@ -83,14 +104,18 @@ confirmed product consumer and an explicit privacy/trust-boundary review.
 
 ## Delivery and validation
 
-1. Treat merged PR #146 as the only product-code delivery PR.
+1. Treat merged [PR #146](https://github.com/teleport-computer/feedling-mcp/pull/146)
+   as the only product-code delivery.
 2. Historical only — the docs-only follow-up-PR route was superseded by the
-   completed direct fast-forward at `3b17da22a8bdf3b791ce59bd5f7a655c65543a57`;
-   **do not execute it or create another PR**. The completed docs update
-   contains no backend, migration, infrastructure, or generated changes.
+   authorized direct two-document fast-forward sequence culminating in the
+   status correction at
+   [`953c074d45309448360125753fb231006344eeee`](https://github.com/teleport-computer/feedling-mcp/commit/953c074d45309448360125753fb231006344eeee);
+   **do not execute it or create another docs-only PR**. PR #154 closed
+   unmerged, and the completed direct update contains no backend, migration,
+   infrastructure, or generated changes.
 3. Preserve PR #146's screenshots, current-RDS architecture, fail-open behavior,
    and scale proof, and add the operational-not-billing boundary in the
-   follow-up record.
+   closeout record.
 4. Require the focused Admin/Usage/Runtime/migration suites and repository CI to
    pass on the final P0-A head.
 5. Retain the recorded 3-million-row, rolling-90-day proof with both unfiltered
@@ -112,6 +137,11 @@ confirmed product consumer and an explicit privacy/trust-boundary review.
 - No new infrastructure or local persistent telemetry store is introduced.
 - Documentation and PR text state that P0-A is operational telemetry, not a
   financial billing source.
+- P0-A remains the only scope shipped on `test`; P0-B, P0-C, and billing-grade
+  accounting remain unshipped.
+- Draft PR #155 remains archival/review-only and must not be merged or deployed
+  without redesign, rebase, renewed validation, and a new delivery decision.
+- Production remains untouched.
 
 ## Future reopening triggers
 
