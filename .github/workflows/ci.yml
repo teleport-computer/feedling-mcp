@@ -879,6 +879,68 @@ jobs:
           fi
           exit "$missing"
 
+      # PRE can run with the owner-migrated TEE database as DATABASE_URL.  The
+      # app role deliberately cannot run DDL and startup fails closed when the
+      # database is behind the release head.  Check that contract before
+      # `phala deploy`; otherwise a push containing a new alembic_tee revision
+      # replaces the healthy CVM first and only discovers the missing owner
+      # migration while backend and serve-worker restart-loop.
+      - name: Prepare PRE TEE schema preflight credentials
+        if: ${{ vars.PRE_FEEDLING_DATABASE_SCHEMA == 'tee' }}
+        env:
+          PRE_CA_PEM: ${{ secrets.PRE_TEE_PG_CA_PEM }}
+          PRE_DSN: ${{ secrets.PRE_TEE_MIGRATION_DSN }}
+        run: |
+          test -n "$PRE_DSN" || { echo "::error::PRE_TEE_MIGRATION_DSN is required for TEE-primary deploy preflight"; exit 1; }
+          umask 077
+          printf '%s' "$PRE_CA_PEM" > /tmp/pre-tee-ca.crt
+          test -s /tmp/pre-tee-ca.crt || { echo "::error::PRE_TEE_PG_CA_PEM is required for TEE-primary deploy preflight"; exit 1; }
+
+      - name: Set up Python for PRE TEE schema preflight
+        if: ${{ vars.PRE_FEEDLING_DATABASE_SCHEMA == 'tee' }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install PRE TEE schema preflight dependencies
+        if: ${{ vars.PRE_FEEDLING_DATABASE_SCHEMA == 'tee' }}
+        run: |
+          python -m pip install --upgrade pip
+          pip install --require-hashes -r backend/requirements.lock
+
+      - name: Require PRE TEE schema at release head before mutating either CVM
+        if: ${{ vars.PRE_FEEDLING_DATABASE_SCHEMA == 'tee' }}
+        env:
+          PRE_DSN: ${{ secrets.PRE_TEE_MIGRATION_DSN }}
+        run: |
+          export TEE_MIGRATION_DATABASE_URL="${PRE_DSN}&sslrootcert=/tmp/pre-tee-ca.crt"
+          python - <<'PY'
+          import os
+          import psycopg
+          from alembic.config import Config
+          from alembic.script import ScriptDirectory
+
+          cfg = Config("backend/alembic_tee/alembic.ini")
+          cfg.set_main_option("script_location", "backend/alembic_tee")
+          expected = set(ScriptDirectory.from_config(cfg).get_heads())
+          with psycopg.connect(os.environ["TEE_MIGRATION_DATABASE_URL"]) as conn:
+              actual = {
+                  str(row[0])
+                  for row in conn.execute(
+                      "SELECT version_num FROM alembic_tee_version"
+                  ).fetchall()
+              }
+          print(f"PRE TEE schema: expected={sorted(expected)} actual={sorted(actual)}")
+          if actual != expected:
+              print(
+                  "::error title=PRE TEE schema migration required::"
+                  f"expected {sorted(expected)}, got {sorted(actual)}; "
+                  "run the TEE migrate workflow for pre, then rerun failed jobs. "
+                  "No PRE CVM was changed."
+              )
+              raise SystemExit(1)
+          PY
+
       - name: Build and verify the content-addressed E2B template
         if: ${{ vars.PRE_FEEDLING_V2_SANDBOX_PROVIDER == 'e2b' }}
         env:

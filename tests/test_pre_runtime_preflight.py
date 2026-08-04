@@ -57,6 +57,35 @@ def test_preflight_validates_entire_two_cvm_release_before_mutation():
         assert required in preflight
 
 
+def test_preflight_blocks_tee_primary_deploy_before_mutating_a_cvm():
+    source = WORKFLOW.read_text()
+    preflight = _job(
+        source,
+        "validate-pre-runtime-prerequisites",
+        "deploy-cvm",
+    )
+
+    for required in (
+        "PRE_FEEDLING_DATABASE_SCHEMA == 'tee'",
+        "PRE_TEE_MIGRATION_DSN",
+        "PRE_TEE_PG_CA_PEM",
+        "backend/alembic_tee/alembic.ini",
+        "SELECT version_num FROM alembic_tee_version",
+        "PRE TEE schema migration required",
+        "run the TEE migrate workflow for pre",
+        "No PRE CVM was changed",
+    ):
+        assert required in preflight
+
+    schema_gate = preflight.index(
+        "Require PRE TEE schema at release head before mutating either CVM"
+    )
+    image_gate = preflight.index(
+        "Require both Runtime V2 images before mutating either CVM"
+    )
+    assert schema_gate < image_gate
+
+
 def test_preflight_is_triggered_by_both_cvm_inventory_files():
     source = WORKFLOW.read_text()
     detection = _job(
