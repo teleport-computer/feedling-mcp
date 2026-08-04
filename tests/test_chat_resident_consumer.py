@@ -133,6 +133,14 @@ def test_pi_runtime_metadata_reads_exact_model_modalities(tmp_path, monkeypatch)
     }
 
 
+def test_consumer_advertises_native_image_generation_only_when_enabled(monkeypatch):
+    monkeypatch.delenv("FEEDLING_AGENT_IMAGE_GENERATION", raising=False)
+    assert crc.AGENT_IMAGE_GENERATION_CAPABILITY not in crc._consumer_capabilities()
+
+    monkeypatch.setenv("FEEDLING_AGENT_IMAGE_GENERATION", "true")
+    assert crc.AGENT_IMAGE_GENERATION_CAPABILITY in crc._consumer_capabilities()
+
+
 def test_runtime_model_identity_uses_configured_fact(monkeypatch):
     monkeypatch.setattr(
         crc,

@@ -352,6 +352,24 @@ def test_dedicated_image_route_failure_keeps_stable_settings_guidance(
     assert crc._finish_outbound_attachment_turn("turn-image-required") == ([], [])
 
 
+def test_native_agent_fallback_only_applies_when_dedicated_route_is_absent(
+    monkeypatch,
+):
+    monkeypatch.setenv("FEEDLING_AGENT_IMAGE_GENERATION", "true")
+
+    assert crc._should_use_agent_image_generation(
+        crc.ImageGenerationFailure("image_generation_model_required")
+    )
+    assert not crc._should_use_agent_image_generation(
+        crc.ImageGenerationFailure("image_generation_auth_invalid")
+    )
+
+    monkeypatch.setenv("FEEDLING_AGENT_IMAGE_GENERATION", "false")
+    assert not crc._should_use_agent_image_generation(
+        crc.ImageGenerationFailure("image_generation_model_required")
+    )
+
+
 def test_dedicated_image_route_stages_generated_media(tmp_path, monkeypatch):
     class _Client:
         def post(self, *_args, **_kwargs):
@@ -396,6 +414,67 @@ def test_dedicated_image_route_stages_generated_media(tmp_path, monkeypatch):
     assert images[0].name == "robot.png"
     assert images[0].mime_type == "image/png"
     assert images[0].data == b"normalized-image"
+
+
+def test_dedicated_image_success_delivers_without_waiting_for_main_model(
+    monkeypatch,
+):
+    crc._seen_ids.clear()
+    crc._seen_ids_order.clear()
+    msg = {
+        "id": "image-fast-path-01",
+        "role": "user",
+        "content": "帮我生成一张红色机器人图片",
+        "content_type": "text",
+        "source": "chat",
+        "ts": 9250.0,
+    }
+    posted = []
+
+    def fake_generate(turn_id, prompt, *, raw_user_text):
+        assert turn_id == "image-fast-path-01"
+        assert prompt == "draw a red robot"
+        assert raw_user_text == msg["content"]
+        with crc._outbound_file_lock:
+            crc._staged_outbound_images.append(
+                crc.StagedChatImage(
+                    source_path="generated:image-fast-path-01:1",
+                    name="robot.png",
+                    mime_type="image/png",
+                    data=b"normalized-image",
+                )
+            )
+        return 1
+
+    monkeypatch.setattr(crc, "AGENT_MODE", "cli")
+    monkeypatch.setattr(
+        crc.downloadable_file_context,
+        "required_image_generation_prompt",
+        lambda _messages: "draw a red robot",
+    )
+    monkeypatch.setattr(
+        crc, "_generate_and_stage_dedicated_images", fake_generate
+    )
+    monkeypatch.setattr(crc, "_worldbook_context_for_foreground", lambda _text: "")
+    monkeypatch.setattr(
+        crc,
+        "post_reply",
+        lambda reply, **kwargs: posted.append((reply, kwargs))
+        or {"id": "reply-image-fast-path-01"},
+    )
+    mock_agent = patch.object(crc, "call_agent")
+
+    with mock_agent as agent:
+        result_ts = crc._process_messages([msg])
+
+    assert result_ts == pytest.approx(9250.0)
+    agent.assert_not_called()
+    assert len(posted) == 1
+    reply, kwargs = posted[0]
+    assert reply == "图片已经生成。"
+    assert kwargs["reply_to_message_id"] == "image-fast-path-01"
+    assert len(kwargs["image_followups"]) == 1
+    assert kwargs["image_followups"][0].name == "robot.png"
 
 
 def test_dedicated_vision_sends_only_observation_to_main_model(tmp_path):

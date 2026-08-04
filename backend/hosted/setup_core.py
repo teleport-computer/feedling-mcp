@@ -707,6 +707,12 @@ def _image_generation_config_payload(store) -> dict:
         unavailable_reason = ""
     else:
         resident_runtime = vision_routing.chat_consumer.consumer_agent_runtime(store)
+        resident_main_supports_image_generation = (
+            vision_routing.chat_consumer.consumer_supports_capability(
+                store,
+                vision_routing.chat_consumer.AGENT_IMAGE_GENERATION_CAPABILITY,
+            )
+        )
         routing_available = vision_routing.chat_consumer.consumer_supports_capability(
             store,
             vision_routing.chat_consumer.IMAGE_GENERATION_CAPABILITY,
@@ -717,8 +723,13 @@ def _image_generation_config_payload(store) -> dict:
             "route_id": None,
             "provider": resident_runtime.get("provider", ""),
             "model": resident_runtime.get("model", ""),
-            "image_generation_test_status": "unsupported",
-            "last_image_generation_test_error": "image_generation_model_required",
+            "image_generation_test_status": (
+                "ok" if resident_main_supports_image_generation else "unsupported"
+            ),
+            "last_image_generation_test_error": (
+                "" if resident_main_supports_image_generation
+                else "image_generation_model_required"
+            ),
         }
     mode = "dedicated" if dedicated else "follow_main"
     if dedicated and routing_available:
@@ -732,7 +743,7 @@ def _image_generation_config_payload(store) -> dict:
             (active or {}).get("image_generation_test_status") or "untested"
         )
     else:
-        effective_status = "unsupported"
+        effective_status = main["image_generation_test_status"]
     return {
         "available": routing_available,
         "runtime": capability["runtime"],
@@ -1547,6 +1558,14 @@ def image_generation_main_test(
     *,
     caller_api_key: str | None,
 ) -> tuple[dict, int]:
+    capability = vision_routing.runtime_capability(store)
+    if capability["runtime"] == "vps":
+        if vision_routing.chat_consumer.consumer_supports_capability(
+            store,
+            vision_routing.chat_consumer.AGENT_IMAGE_GENERATION_CAPABILITY,
+        ):
+            return {"config": _image_generation_config_payload(store)}, 200
+        return {"error": "image_generation_model_required"}, 409
     route = db.model_api_active_route(store.user_id)
     if not route:
         return {"error": "model_api_not_configured"}, 404

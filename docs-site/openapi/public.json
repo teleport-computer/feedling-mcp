@@ -1372,12 +1372,12 @@
             "name": "X-Feedling-Consumer-Capabilities",
             "in": "header",
             "required": false,
-            "description": "Comma-separated capabilities advertised by the current official resident poll.",
+            "description": "Comma-separated capabilities advertised by the current official resident poll. agent_image_generation_v1 means the configured agent entry exposes a callable native image-generation tool; it is not inferred from VPS deployment alone.",
             "schema": {
               "type": "string",
               "maxLength": 500
             },
-            "example": "vision_observer_v1"
+            "example": "vision_observer_v1,agent_image_generation_v1"
           },
           {
             "name": "X-Feedling-Consumer-Compat-Commit",
@@ -1511,12 +1511,12 @@
             "name": "X-Feedling-Consumer-Capabilities",
             "in": "header",
             "required": false,
-            "description": "Comma-separated capabilities advertised by the current official resident poll.",
+            "description": "Comma-separated capabilities advertised by the current official resident poll. agent_image_generation_v1 means the configured agent entry exposes a callable native image-generation tool; it is not inferred from VPS deployment alone.",
             "schema": {
               "type": "string",
               "maxLength": 500
             },
-            "example": "vision_observer_v1"
+            "example": "vision_observer_v1,agent_image_generation_v1"
           }
         ],
         "requestBody": {

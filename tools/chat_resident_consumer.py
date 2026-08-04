@@ -41,6 +41,9 @@ CLI mode:
                         auto-injects --resume on later turns.
   AGENT_CLI_PATH        Optional colon-separated executable search path added
                         before PATH. Useful for systemd services.
+  FEEDLING_AGENT_IMAGE_GENERATION
+                        Set true only when the configured resident agent exposes
+                        a callable native image-generation capability.
 
 Optional:
   CHECKPOINT_FILE       Path to persist last-processed timestamp.
@@ -295,6 +298,7 @@ AGENT_CLI_CMD = os.environ.get("AGENT_CLI_CMD", "")
 # single-flight chat lane forever.
 AGENT_TURN_TIMEOUT_SEC = max(30, int(os.environ.get("FEEDLING_AGENT_TURN_TIMEOUT_SEC", "300")))
 AGENT_CLI_PATH = os.environ.get("AGENT_CLI_PATH", "")
+AGENT_IMAGE_GENERATION_CAPABILITY = "agent_image_generation_v1"
 
 CHECKPOINT_API_KEY_FINGERPRINT = hashlib.sha1(FEEDLING_API_KEY.encode()).hexdigest()[:10]
 CHECKPOINT_FILE = Path(
@@ -1455,6 +1459,19 @@ def _agent_runtime_metadata(
 AGENT_RUNTIME_METADATA = _agent_runtime_metadata()
 
 
+def _agent_image_generation_enabled() -> bool:
+    """Whether this exact resident entry exposes a callable image tool."""
+    return _env_bool("FEEDLING_AGENT_IMAGE_GENERATION")
+
+
+def _should_use_agent_image_generation(exc: ImageGenerationFailure) -> bool:
+    """Fall through only when no dedicated route was selected."""
+    return bool(
+        exc.error_class == "image_generation_model_required"
+        and _agent_image_generation_enabled()
+    )
+
+
 def _agent_entry_signature() -> str:
     """Stable, secret-free identity for the configured model entry."""
     payload = json.dumps(
@@ -1470,10 +1487,12 @@ def _agent_entry_signature() -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
 
 
-def _consumer_capabilities(hosted: bool) -> str:
+def _consumer_capabilities(hosted: bool = False) -> str:
     """Comma-separated ``X-Feedling-Consumer-Capabilities`` value.
 
-    Vision and image-generation caps are advertised on every line.
+    Vision and dedicated image-generation caps are advertised on every line.
+    The native agent image capability is advertised only when this exact entry
+    is configured to expose it.
     ``web_search_v1`` / ``web_fetch_v1`` are a CLOUD-ONLY product: only the
     HOSTED consumer (per-user runtime token) advertises them. VPS / self-hosted
     residents must NOT — they use their own model provider's built-in web
@@ -1482,6 +1501,8 @@ def _consumer_capabilities(hosted: bool) -> str:
     web read ``effective = false`` for self-hosted accounts.
     """
     caps = ["vision_observer_v1", "vision_probe_v2", "image_generation_v1"]
+    if _agent_image_generation_enabled():
+        caps.append(AGENT_IMAGE_GENERATION_CAPABILITY)
     if hosted:
         caps += ["web_search_v1", "web_fetch_v1"]
     return ",".join(caps)
@@ -8125,6 +8146,12 @@ def _outbound_file_failure_reply(text: str) -> str:
     return "I couldn't generate the requested downloadable file this time. Please try again."
 
 
+def _image_ready_reply(text: str) -> str:
+    if re.search(r"[\u4e00-\u9fff]", str(text or "")):
+        return "图片已经生成。"
+    return "The image is ready."
+
+
 def _sanitize_outbound_file_reply(
     text: str,
     *,
@@ -14162,6 +14189,7 @@ def _process_messages(messages: list) -> float:
             else None
         )
         image_generation_failed: ImageGenerationFailure | None = None
+        dedicated_image_generation_succeeded = False
         if outbound_file_turn_active:
             try:
                 _begin_outbound_file_turn(trace_id, outbound_file_requirement)
@@ -14175,19 +14203,28 @@ def _process_messages(messages: list) -> float:
                     image_generation_prompt,
                     raw_user_text=raw_user_content_for_lang,
                 )
-                content += (
-                    "\n\n[IO has generated the requested image through the user's "
-                    "dedicated image model and will attach it to this reply. Reply "
-                    "naturally and briefly; do not claim that image generation is "
-                    "unsupported.]"
-                )
+                dedicated_image_generation_succeeded = True
             except ImageGenerationFailure as exc:
-                image_generation_failed = exc
-                log.info(
-                    "dedicated image generation unavailable class=%s status=%s",
-                    exc.error_class,
-                    exc.status_code,
-                )
+                if _should_use_agent_image_generation(exc):
+                    content += (
+                        "\n\n[IO runtime fact — not user-authored: no dedicated "
+                        "image route is selected, but this resident declares a "
+                        "native image-generation capability. Use that capability "
+                        "now, then deliver its PNG, JPEG, or WebP with the "
+                        "send-image command described above. Do not claim image "
+                        "generation is unsupported without attempting it.]"
+                    )
+                    log.info(
+                        "dedicated image route absent; falling through to resident "
+                        "native image generation"
+                    )
+                else:
+                    image_generation_failed = exc
+                    log.info(
+                        "dedicated image generation unavailable class=%s status=%s",
+                        exc.error_class,
+                        exc.status_code,
+                    )
         # 本回合失败时待发的 system 通知。不在失败当场发，而是等下面的回复写入被
         # 服务端接受（posted_any）后再发（Codex review）：claim 过期 failover 时另
         # 一个 consumer 已回复，本家的兜底会被 already_answered 409 拒——通知若先
@@ -14214,6 +14251,13 @@ def _process_messages(messages: list) -> float:
                 failure_notice = classify_agent_error(image_generation_failed)
                 agent_result = {"messages": [failure_notice.user_text]}
                 pending_failure_notice = image_generation_failed
+            elif dedicated_image_generation_succeeded:
+                # The dedicated route already has the result; keep the atomic
+                # reply path without waiting for another resident-model turn.
+                _discard_io_cli_catalog_pending_injection()
+                agent_result = {
+                    "messages": [_image_ready_reply(raw_user_content_for_lang)]
+                }
             elif use_runtime_v2:
                 agent_result = call_agent(
                     _resident_foreground_chat_message_v2(content),
@@ -14281,18 +14325,29 @@ def _process_messages(messages: list) -> float:
             # session id now (Codex review I10); see _commit_io_cli_catalog_
             # injection's docstring for why this must not wait on parse
             # success.
-            if not vision_observer_failed and not image_generation_failed:
+            if (
+                not vision_observer_failed
+                and not image_generation_failed
+                and not dedicated_image_generation_succeeded
+            ):
                 _commit_io_cli_catalog_injection()
             if voice_stream_update is not None:
                 voice_stream_update.complete()
-            if not vision_observer_failed and not image_generation_failed and (
-                parse_failure_class := _consume_reply_parse_failed()
+            if (
+                not vision_observer_failed
+                and not image_generation_failed
+                and not dedicated_image_generation_succeeded
+                and (parse_failure_class := _consume_reply_parse_failed())
             ):
                 pending_failure_notice = _reply_parse_failure_exc(
                     parse_failure_class
                 )
                 pending_failure_is_parse_only = True
-            elif not vision_observer_failed and not image_generation_failed:
+            elif (
+                not vision_observer_failed
+                and not image_generation_failed
+                and not dedicated_image_generation_succeeded
+            ):
                 _note_agent_turn_success()
 
         initial_agent_result = agent_result
@@ -14361,11 +14416,7 @@ def _process_messages(messages: list) -> float:
 
             if staged_outbound_images and pending_failure_notice is not None:
                 agent_result = {
-                    "messages": [
-                        "图片已经生成。"
-                        if re.search(r"[\u4e00-\u9fff]", raw_user_content_for_lang)
-                        else "The image is ready."
-                    ]
+                    "messages": [_image_ready_reply(raw_user_content_for_lang)]
                 }
                 pending_failure_notice = None
                 pending_failure_is_parse_only = False
@@ -14400,11 +14451,7 @@ def _process_messages(messages: list) -> float:
                 else "The file is ready."
             ]
         if staged_outbound_images and not turn.messages:
-            turn.messages = [
-                "图片已经生成。"
-                if re.search(r"[\u4e00-\u9fff]", raw_user_content_for_lang)
-                else "The image is ready."
-            ]
+            turn.messages = [_image_ready_reply(raw_user_content_for_lang)]
         _reply_text = "\n\n".join(m for m in turn.messages if isinstance(m, str) and m.strip())
         _emit_debug_trace(
             "agent", "agent.reply", trace_id=trace_id,

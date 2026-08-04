@@ -133,8 +133,10 @@ CONSUMER_HEADERS = [
     _header(
         "X-Feedling-Consumer-Capabilities",
         _schema("string", maxLength=500),
-        "Comma-separated capabilities advertised by the current official resident poll.",
-        example="vision_observer_v1",
+        "Comma-separated capabilities advertised by the current official resident poll. "
+        "agent_image_generation_v1 means the configured agent entry exposes a callable "
+        "native image-generation tool; it is not inferred from VPS deployment alone.",
+        example="vision_observer_v1,agent_image_generation_v1",
     ),
 ]
 

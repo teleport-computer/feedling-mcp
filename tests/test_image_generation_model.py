@@ -106,6 +106,72 @@ def test_resident_config_exposes_text_only_main_and_dedicated_capability(monkeyp
     assert config["effective_status"] == "unsupported"
 
 
+def test_resident_config_uses_declared_agent_image_generation_capability(monkeypatch):
+    monkeypatch.setattr(
+        setup_core.vision_routing,
+        "runtime_capability",
+        lambda _store: {"runtime": "vps", "onboarding_route": "resident"},
+    )
+    monkeypatch.setattr(
+        setup_core.db,
+        "model_api_active_route",
+        lambda _uid: None,
+    )
+    monkeypatch.setattr(
+        setup_core.db,
+        "model_api_image_generation_route",
+        lambda _uid: None,
+    )
+    monkeypatch.setattr(
+        setup_core.vision_routing.chat_consumer,
+        "consumer_agent_runtime",
+        lambda _store: {"provider": "openai", "model": "gpt-5.6-sol"},
+    )
+    monkeypatch.setattr(
+        setup_core.vision_routing.chat_consumer,
+        "consumer_supports_capability",
+        lambda _store, capability: capability in {
+            setup_core.vision_routing.chat_consumer.IMAGE_GENERATION_CAPABILITY,
+            setup_core.vision_routing.chat_consumer.AGENT_IMAGE_GENERATION_CAPABILITY,
+        },
+    )
+
+    config = setup_core._image_generation_config_payload(_store())
+
+    assert config["main_model"]["image_generation_test_status"] == "ok"
+    assert config["main_model"]["last_image_generation_test_error"] == ""
+    assert config["effective_status"] == "ok"
+
+
+def test_resident_main_test_uses_declared_agent_capability(monkeypatch):
+    monkeypatch.setattr(
+        setup_core.vision_routing,
+        "runtime_capability",
+        lambda _store: {"runtime": "vps"},
+    )
+    monkeypatch.setattr(
+        setup_core.vision_routing.chat_consumer,
+        "consumer_supports_capability",
+        lambda _store, capability: (
+            capability
+            == setup_core.vision_routing.chat_consumer.AGENT_IMAGE_GENERATION_CAPABILITY
+        ),
+    )
+    monkeypatch.setattr(
+        setup_core,
+        "_image_generation_config_payload",
+        lambda _store: {"effective_status": "ok"},
+    )
+
+    body, status = setup_core.image_generation_main_test.__wrapped__(
+        _store(),
+        caller_api_key="caller-key",
+    )
+
+    assert status == 200
+    assert body == {"config": {"effective_status": "ok"}}
+
+
 def test_resident_generate_requires_a_pinned_image_route(monkeypatch):
     monkeypatch.setattr(
         image_generator.db,
