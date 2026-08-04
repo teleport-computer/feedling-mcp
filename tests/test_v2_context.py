@@ -21,6 +21,37 @@ def test_build_turn_messages_orders_persona_summary_tail():
     assert msgs[-1]["content"] == "how are you"
 
 
+def test_proactive_application_data_never_serializes_as_a_user_request():
+    """Generated context may inform a wake, but only chat rows may speak as user."""
+    messages = context.build_turn_messages(
+        system_prompt="WAKE",
+        summary="remembered summary",
+        tail=[
+            {"role": "user", "content": "真实消息"},
+            {"role": "assistant", "content": "prior reply"},
+        ],
+        action_context='{"perception_glance":{"ok":true}}',
+        working_memory="working state",
+        agent_memory="agent memory",
+        user_profile="user profile",
+        coverage_hole_notice="older rows omitted",
+        temporal_context={"timezone": "Asia/Shanghai"},
+        application_data_role="assistant",
+    )
+
+    assert [
+        message["content"]
+        for message in messages
+        if message.get("role") == "user"
+    ] == ["真实消息"]
+    assert all(
+        message["role"] == "assistant"
+        for message in messages[1:]
+        if message["content"] != "真实消息"
+    )
+    assert "assistant-role application-data blocks" in messages[0]["content"]
+
+
 def test_chat_prompt_forbids_memory_reads_for_standalone_reactions():
     assert "only a greeting, acknowledgement, emoji" in context.CHAT_SYSTEM_PROMPT
     assert "do not resume its memory lookup or file workflow" in (

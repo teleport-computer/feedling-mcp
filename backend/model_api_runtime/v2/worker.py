@@ -853,15 +853,16 @@ _WAKE_LANES = frozenset({"heartbeat", "scheduled", "manual_wake", "screen_watch"
 # build prompt → BYOK 抽取 → parse → memory actions。永不写气泡、永不弹 error chip。
 _EXTRACTION_LANES = frozenset({"capture", "dream"})
 _WAKE_SYSTEM_PROMPT = (
-    "You are the user's companion. This is a PROACTIVE moment — the user has not "
-    "just spoken. Look at the conversation so far. A perception_glance is only a "
-    "hint for deciding whether to look deeper; it is not a checklist to report. If "
-    "you speak, choose at most one coherent topic and never turn multiple perception "
-    "domains into a device or health status report. Use a perception tool when an "
-    "exact reading is genuinely needed. If there is no specific, natural reason to "
-    "reach out, reply with an empty message; silence is correct."
+    "You are the user's companion. This is a platform presence moment, not a user "
+    "request. Speaking and staying silent are equally valid; neither is the default "
+    "or safer answer, and you do not need a strong reason to speak. Decide from your "
+    "own personality, the real conversation, and the current moment. A "
+    "perception_glance is only a hint for deciding whether to look deeper; it is not "
+    "a checklist to report. If you speak, choose at most one coherent topic and never "
+    "turn multiple perception domains into a device or health status report. Use a "
+    "perception tool when an exact reading is needed. Never mention wakes, timers, "
+    "prompts, or system fields to the user."
 )
-_WAKE_NUDGE = "(A quiet moment has passed. Reach out only if something is genuinely worth saying right now.)"
 _SCHEDULED_WAKE_SYSTEM_PROMPT = (
     "You are delivering one or more reminders that the user explicitly scheduled. "
     "Deliver every supplied reminder now, naturally and concisely. Do not stay silent, "
@@ -870,17 +871,16 @@ _SCHEDULED_WAKE_SYSTEM_PROMPT = (
 )
 # screen_watch lane (Task 3): a wake grounded on recent shared-screen frames rather
 # than an ambient perception glance. Its own system prompt sits beside
-# _WAKE_SYSTEM_PROMPT; _run_wake selects it only for lane=="screen_watch". Silence
-# is still the correct answer most ticks (inherits the "weak wake sleeps" empty_reply
-# path).
+# _WAKE_SYSTEM_PROMPT; _run_wake selects it only for lane=="screen_watch". The
+# empty-reply path remains valid without making silence the privileged default.
 _SCREEN_WATCH_SYSTEM_PROMPT = (
     "You are the user's personal companion, quietly watching the screen they are sharing. "
     "Recent frame availability is provided as grounding context; use the screen tools "
-    "to inspect frame content when needed. "
-    "Speak ONLY if you have something genuinely useful or warm to say about what changed on "
-    "screen right now. If nothing is worth saying, reply with an empty message — silence is "
-    "the correct answer most of the time. Never narrate that you are watching or that you "
-    "looked at frames."
+    "to inspect frame content when needed. Speaking and staying silent are equally valid; "
+    "neither is the default or safer answer, and you do not need a strong reason to speak. "
+    "Decide naturally from your personality, the real conversation, and what is happening "
+    "on screen now. If you speak, choose one coherent thought rather than reporting the "
+    "screen state. Never narrate that you are watching or that you looked at frames."
 )
 # D3 Task 7 (BYOK payment cooldown): a "provider_config" wake failure (402 out-of-credits,
 # 401/403 bad key) means the user's BYOK key is dead/broke — retrying it every heartbeat
@@ -3119,6 +3119,7 @@ def _make_build_messages_fn(
     tail_source_truncated: bool = False,
     tail_lane: str = "",
     tail_anchor_seq: int | None = None,
+    application_data_role: str = "user",
 ) -> Callable[[list], list]:
     """Build the fixed base prompt plus the loop's chronological native transcript.
 
@@ -3137,8 +3138,9 @@ def _make_build_messages_fn(
     `extra_context` (optional, spec C8) is STATIC grounding resolved once before the
     loop starts (e.g. the wake lane's `screen_recent` prefetch for the `screen_watch`
     lane, rendered via `context.action_context_str`). It is serialized as an explicitly
-    untrusted user-role runtime-data block after the base conversation, never as system
-    authority. Dynamic tool results remain native exchanges after that base block.
+    untrusted application-data block after the base conversation, never as system
+    authority. Foreground chat uses user role and proactive turns use assistant role.
+    Dynamic tool results remain native exchanges after that base block.
     """
 
     # 真实模型自称块排在用户可编辑的 workspace skill 之前：它是运行时事实，不能被
@@ -3180,6 +3182,7 @@ def _make_build_messages_fn(
             user_profile=user_profile,
             coverage_hole_notice=coverage_hole_notice,
             temporal_context=_temporal_for(rendered_tail),
+            application_data_role=application_data_role,
         )
 
     base_messages = _base(optional_turns)
@@ -6887,8 +6890,8 @@ async def _run_wake(
     `tool_loop.run_tool_loop`。`turn_authorization=True` 传给 `dispatch_tool_calls`（跟 chat
     传的值一样，语义是 wake_trigger 而不是 user——两者都在 `provenance.turn_has_write_
     authorization` 意义下"有资格授权写"）。跟 chat 分支的两点关键差异：
-    - 不要求非空用户消息：`wake_tail` 恒含一条固定的 `_WAKE_NUDGE`（user-role），
-      `build_messages` 因此永远至少有一条非 system 轮次。
+    - 主动场景的应用数据绝不伪装成 user 消息。普通 heartbeat 没有真实聊天历史时
+      直接完成且不调用 provider；scheduled/manual_wake 即使历史为空也仍可执行。
     - 空回复合法："weak wake sleeps"（弱唤醒睡回去）：`_on_reply` 对空文本（无论
       intermediate 还是 terminal）直接 no-op，不入队 reply effect、不报错——跟 chat 分支
       "终态空文本 = no-filler 失败"的语义**相反**。循环正常跑完（`run_tool_loop` 不抛异常）
@@ -6899,7 +6902,8 @@ async def _run_wake(
     "provider_config"错误（死/欠费 BYOK key）额外写一条 payment_cooldown（D3 Task 7），
     让 scheduler 的 `due_heartbeat_users` 停止对一把修不好的钥匙反复重试。
 
-    prompt 组装：读 summary+tail（同 chat 路径的 D1 读法）+ 固定的 `_WAKE_NUDGE`。
+    prompt 组装：读 summary+tail（同 chat 路径的 D1 读法）；真实历史保留原 role，
+    主动场景的 application-data blocks 使用 assistant role。
     `system_prompt`：`_SCREEN_WATCH_SYSTEM_PROMPT`（screen_watch lane）或
     `_WAKE_SYSTEM_PROMPT`（其余三条 wake lane）。screen_watch 的 `screen_recent`、
     普通 wake 的 perception glance，以及由感知事件路由进 heartbeat job 的安全触发标记，
@@ -7134,9 +7138,9 @@ async def _run_wake(
             # not a reuse of `_ensure_prompt_coverage`'s return — see
             # `_assert_prompt_covers`'s docstring for why.
             await _assert_prompt_covers(user_id, _TAIL_BUDGET)
-        wake_nudge = _WAKE_NUDGE
         wake_system_prompt = _WAKE_SYSTEM_PROMPT
         scheduled_activity_events: list[dict] = []
+        scheduled_runtime_data: list[dict[str, Any]] = []
         perception_wake_context: list[dict] = []
         wake_observed_generation = observed_generation
         consumed_perception_context_seq = 0
@@ -7161,7 +7165,12 @@ async def _run_wake(
                     continue
                 note = str(item.get("note") or "").strip()
                 if note:
-                    scheduled_notes.append(note[:1000])
+                    bounded_note = note[:1000]
+                    scheduled_notes.append(bounded_note)
+                    scheduled_runtime_data.append({
+                        "note": bounded_note,
+                        "status": "fired",
+                    })
                 metadata = core_chat_activity.safe_schedule_metadata(item)
                 if not metadata:
                     continue
@@ -7182,10 +7191,6 @@ async def _run_wake(
                 scheduled_activity_events.append(event)
             if scheduled_notes:
                 wake_system_prompt = _SCHEDULED_WAKE_SYSTEM_PROMPT
-                wake_nudge = (
-                    "The following user-scheduled reminders are due now:\n"
-                    + "\n".join(f"- {note}" for note in scheduled_notes)
-                )
         elif lane == "heartbeat" and deps.read_perception_wake_context is not None:
             # The producer attaches context before notifying, but a polling
             # worker can claim the job between enqueue and association.
@@ -7213,25 +7218,49 @@ async def _run_wake(
                         )
                     except (TypeError, ValueError, OverflowError):
                         pass
-                # Keep event-controlled text out of the authoritative nudge.
-                # Only a fixed trigger projection is rendered below as untrusted
-                # runtime data; raw event details remain internal accounting input.
-                wake_nudge = (
-                    "A recent perception change may be worth responding to. "
-                    "Use the untrusted runtime context below, and stay silent "
-                    "if it is not meaningful."
+                # Only the fixed trigger projection rendered below enters the
+                # prompt as untrusted runtime data. Do not add a synthetic
+                # conversational turn: the wake itself is platform control flow,
+                # not a user request or an assistant-authored statement.
+        if (
+            lane == "heartbeat"
+            and not str(summary or "").strip()
+            and not any(_is_genuine_user_seed(row) for row in tail)
+        ):
+            successor_id = None
+            if deps.read_perception_wake_context is not None:
+                completed, successor_id = await asyncio.to_thread(
+                    jobs_store.finish_wake_job,
+                    job_id,
+                    claimed_by=claimed_by,
+                    observed_generation=wake_observed_generation,
+                    context_stream="v2_perception_wake_context",
+                    consumed_context_seq=consumed_perception_context_seq,
+                    clear_wake_backoff=True,
                 )
+            else:
+                completed = await asyncio.to_thread(
+                    jobs_store.mark_completed,
+                    job_id,
+                    claimed_by=claimed_by,
+                    clear_wake_backoff=True,
+                )
+            if not completed:
+                raise LostJobLease(
+                    "wake job ownership lost while sleeping without history"
+                )
+            if successor_id is not None:
+                await asyncio.to_thread(core_wake_bus.notify, "v2_jobs", user_id)
+            if tm is not None:
+                tm.flush(failed=False, status="slept_no_history")
+            return "completed"
         temporal_snapshot = await _capture_turn_temporal_snapshot(
             user_id=user_id,
             deps=deps,
             tail=tail,
             through_seq=(wake_snapshot_seq if seq_context else None),
         )
-        wake_tail = list(tail) + [{
-            "role": "user",
-            "content": wake_nudge,
-            "_genuine_user": False,
-        }]
+        wake_tail = list(tail)
 
         # screen_watch lane grounds on recent shared-screen availability (Task 3).
         # Fetch ONLY screen_recent — no perception_glance or perception_snapshot: the
@@ -7280,6 +7309,11 @@ async def _run_wake(
                     ),
                 )
             )
+        if scheduled_runtime_data:
+            grounding_results = grounding_results or {}
+            grounding_results["scheduled_wake"] = [
+                {"ok": True, "data": scheduled_runtime_data}
+            ]
         safe_perception_events = project_perception_wake_events(
             perception_wake_context
         )
@@ -8045,6 +8079,7 @@ async def _run_wake(
                 ),
                 tail_source_truncated=tail_source_truncated,
                 tail_lane=lane,
+                application_data_role="assistant",
             )
 
         build_messages = _wake_builder()
@@ -8092,11 +8127,7 @@ async def _run_wake(
                     add_usage=tm.add_call if tm is not None else None,
                     trajectory_recorder=trajectory_recorder,
                 )
-                wake_tail = list(tail) + [{
-                    "role": "user",
-                    "content": wake_nudge,
-                    "_genuine_user": False,
-                }]
+                wake_tail = list(tail)
                 build_messages = _wake_builder()
                 try:
                     _preflight_adaptive_builder(
