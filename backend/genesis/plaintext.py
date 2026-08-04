@@ -493,12 +493,18 @@ def _plaintext_job_metadata(
     client_job_id: str,
     input_hash: str,
     mode: str,
+    staged_id: str = "",
 ) -> dict:
     profile = prepared.get("profile") if isinstance(prepared.get("profile"), dict) else {}
     source_stats = prepared.get("source_stats") if isinstance(prepared.get("source_stats"), dict) else {}
     metadata: dict[str, Any] = {
         "ingest": "plaintext",
         "input_hash": input_hash,
+        # Staged payload backing this job; consumed on DONE so a failed job's retry
+        # can reuse it (see service.consume_staged_for_completed_job). Sourced from a
+        # trusted caller arg (plaintext_commit after it loaded the stage), NOT from the
+        # client payload — the public /plaintext direct-import path never sets it.
+        "staged_id": str(staged_id or ""),
         "client_job_id": client_job_id,
         "mode": mode if mode in _PLAINTEXT_MODES else "onboarding",
         "history_tier": str(profile.get("tier") or "small"),
@@ -2186,6 +2192,9 @@ def _run_plaintext_genesis_job(
             terminal_job = db.genesis_get_job(store.user_id, job_id)
             if str((terminal_job or {}).get("status") or "") == service.DONE_JOB_STATUS:
                 service.delete_genesis_checkpoint(store, job_id)
+                # Unified terminal chokepoint for every mode (V1 / V2 / add_memory /
+                # update_identity): release the staged materials only on success.
+                service.consume_staged_for_completed_job(store, job_id, job=terminal_job)
         except Exception:
             pass
 

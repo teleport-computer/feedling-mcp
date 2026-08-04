@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import logging
 import re
 import time
 from datetime import datetime, date
@@ -13,6 +14,8 @@ from typing import Any
 import httpx
 
 import db
+
+log = logging.getLogger(__name__)
 from bootstrap import gates as boot_gates
 from core import enclave as core_enclave
 from core import envelope as core_envelope
@@ -554,6 +557,45 @@ def mark_genesis_staged_consumed(store: UserStore, staged_id: str, job_id: str) 
         "job_id": _text(job_id, 100),
         "consumed_at": _now_iso(),
     })
+
+
+def consume_staged_for_completed_job(
+    store: UserStore, job_id: str, *, job: dict | None = None
+) -> None:
+    """Release the staged materials backing a plaintext genesis job once it is DONE.
+
+    Call only on success (the DONE terminal path). A FAILED job intentionally keeps
+    its staged payload so the client can retry the same materials with a different
+    model (re-committing the same staged_id).
+
+    Bounding the residue: `create_genesis_staged_payload` reaps a user's older stages
+    when a new one is created, so at most one *reachable* stage per account survives,
+    and `load_genesis_staged_payload` drops it once past its TTL. Note this TTL delete
+    is lazy (on next load), not a hard physical-storage bound: a user who fails and
+    never returns leaves one encrypted blob until they next stage/load. Bounded by
+    user count, not unbounded — but not a strict "≤TTL on disk" guarantee.
+
+    Pass ``job`` to reuse a terminal row already read by the caller and avoid a second
+    fetch. Best-effort: a missed consume is backstopped by the reap/TTL above.
+    """
+    if job is None:
+        try:
+            job = db.genesis_get_job(store.user_id, job_id)
+        except Exception:
+            log.warning("genesis consume-on-done: job read failed job_id=%s", job_id)
+            return
+    metadata = (job or {}).get("metadata")
+    if not isinstance(metadata, dict):
+        return
+    staged_id = str(metadata.get("staged_id") or "").strip()
+    if not staged_id:
+        return
+    try:
+        mark_genesis_staged_consumed(store, staged_id, job_id)
+    except Exception:
+        # Hygiene only; reap-on-next-stage + TTL still bound growth. Log so a
+        # persistent failure (which would strand materials) is observable.
+        log.warning("genesis consume-on-done failed job_id=%s staged_id=%s", job_id, staged_id)
 
 
 def write_genesis_checkpoint(store: UserStore, job_id: str, checkpoint_doc: dict) -> None:

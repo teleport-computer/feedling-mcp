@@ -784,7 +784,11 @@ def test_plaintext_estimate_stages_without_llm_and_returns_locked_contract(monke
     assert body["recommended_model"] == "anthropic/claude-haiku-4-5"
 
 
-def test_plaintext_commit_applies_job_model_override_and_consumes_stage(monkeypatch):
+def test_plaintext_commit_applies_job_model_override_without_consuming_stage(monkeypatch):
+    # Commit must NOT consume the staged payload: the job it starts can still fail
+    # asynchronously, and consuming now would leave a retry with no materials to
+    # re-run (staged_import_consumed 409). Consumption happens on DONE instead.
+    # The staged_id is threaded into the job metadata so completion can find it.
     staged_payload = {"format": "plaintext", "content": "User: hello"}
     captured = {}
     monkeypatch.setattr(
@@ -793,7 +797,8 @@ def test_plaintext_commit_applies_job_model_override_and_consumes_stage(monkeypa
     )
     monkeypatch.setattr(
         plaintext.service, "mark_genesis_staged_consumed",
-        lambda _store, staged_id, job_id: captured.update(consumed=(staged_id, job_id)),
+        lambda *_args: (_ for _ in ()).throw(
+            AssertionError("commit must not consume the stage")),
     )
     monkeypatch.setattr(plaintext.db, "genesis_list_jobs", lambda *_args, **_kwargs: [])
 
@@ -826,7 +831,8 @@ def test_plaintext_commit_applies_job_model_override_and_consumes_stage(monkeypa
 
     assert resp.status_code == 202
     assert captured["metadata"]["distill_model"] == "anthropic/claude-haiku-4-5"
-    assert captured["consumed"] == ("staged_1", "job_commit")
+    # staged_id threaded into metadata so consume-on-DONE can release it later.
+    assert captured["metadata"]["staged_id"] == "staged_1"
     assert captured["queued_output"]["materials"] == [{
         "kind": "chat_history",
         "status": "queued",
@@ -889,6 +895,123 @@ def test_plaintext_commit_active_job_returns_409_without_consuming_stage(monkeyp
         "error": "import_job_active",
         "active_job_id": "job_active",
     }
+
+
+def test_consume_staged_for_completed_job_releases_recorded_stage(monkeypatch):
+    # On DONE, the staged payload recorded in job metadata is released.
+    captured = {}
+    monkeypatch.setattr(
+        service.db, "genesis_get_job",
+        lambda _uid, _jid: {
+            "job_id": "job_done", "status": "done",
+            "metadata": {"ingest": "plaintext", "staged_id": "staged_42"},
+        },
+    )
+    monkeypatch.setattr(
+        service, "mark_genesis_staged_consumed",
+        lambda _store, staged_id, job_id: captured.update(consumed=(staged_id, job_id)),
+    )
+    service.consume_staged_for_completed_job(_store(), "job_done")
+    assert captured["consumed"] == ("staged_42", "job_done")
+
+
+def test_consume_staged_for_completed_job_noop_without_staged_id(monkeypatch):
+    # Older jobs (or an already-released stage) carry no staged_id → no-op, no raise.
+    monkeypatch.setattr(
+        service.db, "genesis_get_job",
+        lambda _uid, _jid: {"job_id": "job_x", "metadata": {"ingest": "plaintext"}},
+    )
+    monkeypatch.setattr(
+        service, "mark_genesis_staged_consumed",
+        lambda *_args: (_ for _ in ()).throw(AssertionError("must not consume")),
+    )
+    service.consume_staged_for_completed_job(_store(), "job_x")
+
+
+def test_plaintext_commit_retry_rebinds_staged_id_on_reused_failed_job(monkeypatch):
+    # A re-staged retry (stage_B) that reuses the original failed job must re-bind the
+    # job's staged_id to stage_B, so consume-on-DONE releases the live stage — not the
+    # already-reaped stage_A recorded on the first attempt.
+    materials = {"format": "plaintext", "content": "User: retry me"}
+    monkeypatch.setattr(plaintext.service, "load_genesis_staged_payload", lambda *_a: materials)
+    failed = {
+        "job_id": "genesis_failed", "status": "failed",
+        "metadata": {
+            "ingest": "plaintext",
+            "input_hash": plaintext.history_import._history_import_payload_hash(materials),
+            "mode": "onboarding", "staged_id": "stage_A",
+        },
+    }
+    monkeypatch.setattr(plaintext.db, "genesis_list_jobs", lambda *_a, **_k: [failed])
+    patched = {}
+    monkeypatch.setattr(
+        plaintext.db, "genesis_patch_job_metadata",
+        lambda _u, _j, patch: patched.update(patch) or {**failed, "metadata": {**failed["metadata"], **patch}},
+    )
+    monkeypatch.setattr(
+        plaintext.db, "genesis_set_job_status",
+        lambda *_a, **_k: {**failed, "status": "processing"},
+    )
+    monkeypatch.setattr(plaintext, "_start_plaintext_genesis_job", lambda *_a, **_k: True)
+    monkeypatch.setattr(plaintext.service, "write_genesis_state", lambda *_a, **_k: None)
+
+    resp = _client(monkeypatch).post(
+        "/v1/genesis/imports/plaintext/commit", json={"staged_id": "stage_B"})
+
+    assert resp.status_code == 202
+    assert patched["staged_id"] == "stage_B"
+
+
+def test_plaintext_commit_reused_done_job_consumes_current_stage(monkeypatch):
+    # Identical materials already distilled (DONE): no worker runs, so the current
+    # request's stage is released immediately rather than stranded.
+    materials = {"format": "plaintext", "content": "User: hello"}
+    monkeypatch.setattr(plaintext.service, "load_genesis_staged_payload", lambda *_a: materials)
+    done = {
+        "job_id": "genesis_done", "status": "done",
+        "metadata": {
+            "ingest": "plaintext",
+            "input_hash": plaintext.history_import._history_import_payload_hash(materials),
+        },
+    }
+    monkeypatch.setattr(plaintext.db, "genesis_list_jobs", lambda *_a, **_k: [done])
+    consumed = {}
+    monkeypatch.setattr(
+        genesis_core.service, "mark_genesis_staged_consumed",
+        lambda _s, staged_id, job_id: consumed.update(v=(staged_id, job_id)),
+    )
+
+    resp = _client(monkeypatch).post(
+        "/v1/genesis/imports/plaintext/commit", json={"staged_id": "stage_now"})
+
+    assert resp.status_code == 200
+    assert consumed["v"] == ("stage_now", "genesis_done")
+
+
+def test_plaintext_direct_import_ignores_client_staged_id(monkeypatch):
+    # The public /plaintext direct-import path must NOT record a client-supplied
+    # staged_id into job metadata (that would let a client tombstone another of their
+    # own stages). Only plaintext_commit's trusted arg sets it.
+    captured = {}
+    monkeypatch.setattr(plaintext.db, "genesis_list_jobs", lambda *_a, **_k: [])
+
+    def fake_create(_store, payload, **_kwargs):
+        captured["metadata"] = payload["metadata"]
+        return ({"job_id": "job_direct", "status": "processing", "metadata": payload["metadata"]}, 201)
+
+    monkeypatch.setattr(plaintext.service, "create_import_job", fake_create)
+    monkeypatch.setattr(plaintext.db, "genesis_set_job_status",
+                        lambda *_a, **k: {"job_id": "job_direct", "status": "processing",
+                                          "metadata": captured["metadata"], "output": k.get("output")})
+    monkeypatch.setattr(plaintext.service, "write_genesis_state", lambda *_a, **_k: None)
+    monkeypatch.setattr(plaintext, "_start_plaintext_genesis_job", lambda *_a, **_k: True)
+
+    resp = _client(monkeypatch).post(
+        "/v1/genesis/imports/plaintext",
+        json={"format": "plaintext", "content": "User: hi", "staged_id": "victim_stage"})
+
+    assert resp.status_code == 202
+    assert captured["metadata"]["staged_id"] == ""
 
 
 def test_plaintext_commit_rejects_invalid_distill_model(monkeypatch):
