@@ -17,6 +17,11 @@ on:
         required: false
         default: "dry-run"
         type: string
+      env:
+        description: "test or prod"
+        required: false
+        default: "test"
+        type: string
 
 permissions:
   contents: read
@@ -39,14 +44,15 @@ jobs:
       - name: Run recovery (dry-run unless apply=APPLY)
         env:
           TEST_DATABASE_URL: ${{ secrets.TEST_DATABASE_URL }}
+          PROD_DATABASE_URL: ${{ secrets.DATABASE_URL }}
         run: |
           set -euo pipefail
           if [ "${{ inputs.apply }}" = "APPLY" ]; then
             python3 tools/recover_memory_dream_churn.py \
-              --env test --user-id "${{ inputs.user_id }}" \
+              --env "${{ inputs.env }}" --user-id "${{ inputs.user_id }}" \
               --apply --confirm-user-id "${{ inputs.user_id }}" \
               --confirm-churn-stopped
           else
             python3 tools/recover_memory_dream_churn.py \
-              --env test --user-id "${{ inputs.user_id }}"
+              --env "${{ inputs.env }}" --user-id "${{ inputs.user_id }}"
           fi

@@ -130,7 +130,7 @@ def recovery_plan(
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--env", choices=("test",), required=True)
+    parser.add_argument("--env", choices=("test", "prod"), required=True)
     parser.add_argument("--user-id", required=True)
     parser.add_argument("--apply", action="store_true")
     parser.add_argument("--confirm-user-id", default="")
