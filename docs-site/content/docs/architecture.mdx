@@ -343,6 +343,18 @@ enter model-visible runtime data. Exact readings and private text do not enter
 the initial prompt; they become model-visible only through an authorized tool
 read.
 
+Wake-producing perception signals use a durable per-user, per-signal baseline.
+The comparison and baseline update occur atomically, so the first observation
+and stale or replayed source events do not enqueue a wake. Only a fresh
+allowlisted transition can append wake context to the durable job.
+
+Foreground Chat serializes application-data blocks with a user role. Proactive
+turns use an assistant role for the same explicitly untrusted blocks, preventing
+platform wake control or scheduled reminder payloads from masquerading as a
+new user request. An ordinary heartbeat with neither summary coverage nor a
+genuine user row completes without a provider call; scheduled and manual wakes
+remain valid without prior history.
+
 Exact device, environment, activity, health, calendar, reminder, photo, and
 shared-screen data cross the decrypt boundary only through an authorized tool
 read. After an explicit text-bearing private read, later web, MCP, and `task`

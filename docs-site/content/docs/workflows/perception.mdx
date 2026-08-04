@@ -129,6 +129,12 @@ The response confirms classification and processing, not that a proactive wake
 was emitted. Wake policy, user settings, activation state, freshness ordering,
 and debounce can suppress downstream notification independently.
 
+Runtime V2 keeps a durable baseline for each wake-producing signal. The first
+accepted observation establishes that baseline and does not wake the model.
+Updates are compared and recorded atomically; an older or replayed source event
+is ignored, so it cannot produce a delayed arrival or unlock message later.
+Only a fresh allowlisted transition is eligible for a wake.
+
 Legacy compatibility producers use the same dedicated wake controls as Runtime
 V2: photos map to `photo_added`, location/Wi-Fi/region arrival signals map to
 `arrived_at_anchor`, and a return after a long device lock maps to
@@ -191,6 +197,12 @@ glance made only of availability and change booleans. Exact readings and private
 remain tool-only. A perception-triggered heartbeat adds only the triggering event type;
 it does not attach an unrelated device, weather, or health report. Scheduled reminders
 remain reminder-only, and screen watch remains isolated to safe screen metadata.
+
+Proactive runtime and temporal context is labeled as application data rather
+than presented as a new user message. An ordinary heartbeat does not call the
+model until the account has genuine conversation history. Once history exists,
+heartbeat and screen-watch moments leave speaking and staying silent as equal
+model choices; scheduled reminders remain explicit delivery requests.
 
 ## Collection items
 

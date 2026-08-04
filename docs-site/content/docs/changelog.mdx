@@ -10,6 +10,19 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **Hosted Runtime V2 restores the proactive-presence semantics used by Runtime
+  V1.** Automatic wake context is no longer serialized as a synthetic user
+  message, and speaking and staying silent are treated as equally valid for
+  heartbeat and screen-watch moments. Scheduled reminder text is supplied as
+  labeled application data, while an ordinary heartbeat for an account with no
+  genuine conversation history completes without calling the model.
+
+- **Runtime V2 perception wakes now use durable per-signal baselines.** The
+  first observation establishes a baseline without waking the model, and stale
+  or replayed source events cannot manufacture a later change. Only a fresh,
+  allowlisted transition can enqueue its corresponding proactive wake, which
+  prevents delayed arrival or unlock notices from old sensor data.
+
 - Changed Hosted Runtime V2 perception grounding to keep foreground chat
   readings tool-only and give proactive wake a boolean-only glance.
   Perception-triggered wake messages no longer receive unrelated exact battery,
