@@ -14,6 +14,21 @@
 3. **模型本性**:BYOK 弱模型(Flash/Mini)裸 API 上天生不爱调工具 ——
    prompt 治不了,靠 harness 绕(确定性预取 / tool_choice 强制)。
 
+## 进展(2026-08-05 全面审计后)
+
+- ✅ P0-1 persona 注入(95bbd545)、P0-2 wake attention_facts+禁令(a53a2923,
+  叠加志豪 PR #158 的 nudge 移除/语义恢复/感知 baseline/画像闸)。
+- ✅ test 开关归一「常态全开」:CAPTURE/PROFILE/DETERMINISTIC 硬编码 1,
+  PUSH/SELF_THINKING 显式声明(86f0763c/ecb5c055/b49d8b2c;守门测试改为
+  按环境分派,prod/pre 原样)。
+- ✅ 四路全环节审计结论:**wake/感知链 ~95% 对齐**(self-loop guard V2 反超
+  V1:原子化;collision 90s/backoff/付费冷却均对齐);**记忆写路径基本对齐**
+  (共享 capture prompt/去重/校验栈);**工具面 10 项缺口** + 2 个小缺口
+  (DND 不拦心跳、capture 缺设备事件触发)→ 已打包 Batch-2 派 codex4
+  (mailbox f19f0bd6),明细见该信。
+- 保留不改(V2 优于 V1,已判定):dream rationale+独立二审、确定性注入、
+  缓存稳定前缀、撞车门事务化、身份 list 三操作、web 工具描述。
+
 ## 债务清单
 
 ### P0-1 人设注入缺失(最大单一因素)ⓘ无隐私增量
