@@ -16,7 +16,10 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
 from memory import actions as memory_actions  # noqa: E402
 from memory.capture_prompt_v1 import parse_capture_cards  # noqa: E402
-from memory.dream_prompt_v1 import parse_dream_consolidations  # noqa: E402
+from memory.dream_prompt_v1 import (  # noqa: E402
+    build_dream_prompt,
+    parse_dream_consolidations,
+)
 from model_api_runtime.v2 import extraction  # noqa: E402
 
 
@@ -267,6 +270,14 @@ def test_dream_live_rig_shape_persists_all_structural_merges(monkeypatch):
         {"id": "birthday", "summary": "家人生日", "content": "妈妈生日是五月十二日。"},
         {"id": "insomnia", "summary": "最近失眠", "content": "连续三晚凌晨两点后才睡着。"},
     ]
+    shared_prompt = build_dream_prompt(
+        ai_name="小柒",
+        user_name="阿霖",
+        cards=json.dumps(candidates, ensure_ascii=False),
+        recent_conversations="[]",
+    )
+    assert "坚持骑行" in shared_prompt and "最近失眠" in shared_prompt
+    assert "两件独立的事，不能合并" in shared_prompt
     moments = [_old_card(user_id, card["id"]) for card in candidates]
     saved = _install_storage(monkeypatch, moments)
     pairings = [
