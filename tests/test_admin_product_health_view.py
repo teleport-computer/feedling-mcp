@@ -210,8 +210,6 @@ _BUILDER_ATTRS: dict[str, tuple[str, object]] = {
 
 
 def _stub_health_builders(monkeypatch, counters: dict, **overrides) -> None:
-    # raising=False：与 db 层并行落地，dispatch/渲染测试不依赖 db builder
-    # 已存在——stub 即 contract。
     for name, (attr, payload_fn) in _BUILDER_ATTRS.items():
         fn = overrides.get(name)
         if fn is None:
@@ -220,7 +218,7 @@ def _stub_health_builders(monkeypatch, counters: dict, **overrides) -> None:
                 counters[_name] = counters.get(_name, 0) + 1
                 return _payload()
 
-        monkeypatch.setattr(admin_core.db, attr, fn, raising=False)
+        monkeypatch.setattr(admin_core.db, attr, fn)
 
 
 _H2_QUESTIONS = ("用户留下来了吗", "新用户能激活吗", "强度是真的吗", "还缺什么证据")

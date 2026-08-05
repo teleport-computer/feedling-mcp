@@ -248,16 +248,6 @@ def _stub_builders(monkeypatch, counters, **overrides):
         )
 
 
-@pytest.fixture(autouse=True)
-def _reset_page_cache_failure_state():
-    # conftest's _reset_admin_page_cache predates the failure-cooldown dict;
-    # clear it here so a cooldown recorded by one test cannot leak into the
-    # next within the 5s window.
-    yield
-    with admin_core._page_cache_lock:
-        admin_core._page_cache_last_failure.clear()
-
-
 def test_page_html_cache_hits_within_ttl_and_skips_builders(monkeypatch):
     counters: dict[str, int] = {}
     _stub_builders(monkeypatch, counters)

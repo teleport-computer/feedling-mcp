@@ -133,6 +133,33 @@ def _overview_builder(name: str, failure_msg: str, fn, **kwargs) -> dict | None:
         return None
 
 
+# 单个 builder 卡死（连接池 checkout 悬挂、语句无超时）不能把请求线程连同
+# per-key build 锁一起挂死——挂起不抛异常，失败冷却也永远不会触发。整页共用
+# 一个 deadline 而不是每个 future 各等一轮，最坏等待就是一个超时窗。
+_BUILDER_RESULT_TIMEOUT_SEC = 30.0
+
+
+def _collect_builder_results(
+    futures: dict[str, concurrent.futures.Future],
+) -> dict[str, dict | None]:
+    deadline = time.monotonic() + _BUILDER_RESULT_TIMEOUT_SEC
+    results: dict[str, dict | None] = {}
+    for name, future in futures.items():
+        try:
+            results[name] = future.result(timeout=max(0.0, deadline - time.monotonic()))
+        except concurrent.futures.TimeoutError:
+            # 已在跑的线程无法被取消（继续占一个 admin-ops 槽直到 DB 放行），
+            # 但排队未启动的可以拦下来，别让它们白白再占池子。
+            future.cancel()
+            log.error(
+                "[admin:perf] builder=%s timed out after %.0fs; section degrades",
+                name,
+                _BUILDER_RESULT_TIMEOUT_SEC,
+            )
+            results[name] = None
+    return results
+
+
 def _build_page_html(query_string: str) -> str:
     # Mirror admin_data_track_page's view dispatch.
     with bind(query_string):
@@ -184,7 +211,7 @@ def _build_page_html(query_string: str) -> str:
                 name: executor.submit(_overview_builder, name, failure_msg, fn, **kwargs)
                 for name, (failure_msg, fn, kwargs) in specs.items()
             }
-            results = {name: future.result() for name, future in futures.items()}
+            results = _collect_builder_results(futures)
             # 渲染留在调用线程（bind 之内）：渲染层还要读 request.args。
             return data_track._render_ops_overview_page(
                 results["imports"],
@@ -247,7 +274,7 @@ def _build_page_html(query_string: str) -> str:
                 name: executor.submit(_overview_builder, name, failure_msg, fn, **kwargs)
                 for name, (failure_msg, fn, kwargs) in specs.items()
             }
-            results = {name: future.result() for name, future in futures.items()}
+            results = _collect_builder_results(futures)
             return data_track._render_product_health_page(
                 results["retention"],
                 results["activation"],

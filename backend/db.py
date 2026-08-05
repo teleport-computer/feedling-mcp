@@ -2593,20 +2593,36 @@ def _ph_median(vals) -> float | None:
     return (float(xs[n // 2 - 1]) + float(xs[n // 2])) / 2.0
 
 
+def _ph_created_at_sql(conn) -> str:
+    """``users.created_at`` 的严格 CASE 解析表达式（naive 文本一律按 UTC）。
+
+    健康页的注册周要与 funnel（同用 ``_admin_utc_text_timestamp_sql``）逐周
+    对齐做 coverage 比较：裸 ``::timestamptz`` 会按 session TimeZone 解释
+    naive 文本（非 UTC 会把用户挪进另一个北京周、coverage 永远 False），
+    且正则前缀守不住坏值——SQL 不保证谓词求值顺序，``2026-13-40`` 这类值
+    过得了前缀正则却会炸 cast。CASE 把 cast 锁在校验之后，两个问题一次解决。
+    """
+    return _admin_utc_text_timestamp_sql(
+        "created_at",
+        supports_input_validation=conn.info.server_version >= 160000,
+    )
+
+
 def _ph_weekly_registrations(conn, *, tz: str, since_monday: date) -> dict[str, int]:
     """每北京周注册数（{monday_iso: n}），一次有界 users 小扫描。
 
-    由 ``_CREATED_AT_ISO`` 正则守护，malformed created_at 行静默掉出——
-    与 growth/retention 同口径：live 注册数随删号回缩，是已知下界。
+    malformed created_at 行解析为 NULL 静默掉出——与 funnel 同一把尺：
+    live 注册数随删号回缩，是已知下界。
     """
+    ca = _ph_created_at_sql(conn)
     rows = conn.execute(
         f"""
-        SELECT to_char((date_trunc('week', timezone(%s, created_at::timestamptz)))::date,
+        SELECT to_char((date_trunc('week', timezone(%s, {ca})))::date,
                        'YYYY-MM-DD') AS w,
                COUNT(*)::int
         FROM users
-        WHERE {_CREATED_AT_ISO}
-          AND (date_trunc('week', timezone(%s, created_at::timestamptz)))::date >= %s::date
+        WHERE ({ca}) IS NOT NULL
+          AND (date_trunc('week', timezone(%s, {ca})))::date >= %s::date
         GROUP BY 1
         """,
         (tz, tz, since_monday.isoformat()),
@@ -2738,14 +2754,15 @@ def admin_product_health_w4_split(*, tz: str = "Asia/Shanghai") -> dict:
     newest = this_monday - timedelta(days=7 * 5)
     oldest = this_monday - timedelta(days=7 * 12)
     with get_pool().connection() as conn:
+        ca = _ph_created_at_sql(conn)
         rows = conn.execute(
             f"""
             WITH cohort AS (
                 SELECT user_id,
-                       (date_trunc('week', timezone(%s, created_at::timestamptz)))::date
+                       (date_trunc('week', timezone(%s, {ca})))::date
                            AS cohort_monday
                 FROM users
-                WHERE {_CREATED_AT_ISO}
+                WHERE ({ca}) IS NOT NULL
             ),
             bounded AS (
                 SELECT user_id, cohort_monday,
@@ -2938,7 +2955,7 @@ def admin_product_health_growth_accounting_weekly(
 
     三个有界查询 + Python 集合代数：①每周活跃 (user, monday) 对来自
     ``app_session_end``（0078 部分索引的 ts 范围扫，含 baseline 多取一周）；
-    ②全量 user→注册周映射（users 小扫描，``_CREATED_AT_ISO`` 守护）；
+    ②全量 user→注册周映射（users 小扫描，严格 CASE 解析守护）；
     ③horizon 内注册用户的 t3（首次非 fallback 真回复）epoch。
     churned(w)=上周活跃本周不活跃，resurrected(w)=本周活跃上周不活跃且非本周
     新注册。newly_activated 只统计 horizon 内注册的用户——horizon 之前注册、
@@ -2965,13 +2982,14 @@ def admin_product_health_growth_accounting_weekly(
             """,
             (tz, baseline_e),
         ).fetchall()
+        ca = _ph_created_at_sql(conn)
         cohort_rows = conn.execute(
             f"""
             SELECT user_id,
-                   to_char((date_trunc('week', timezone(%s, created_at::timestamptz)))::date,
+                   to_char((date_trunc('week', timezone(%s, {ca})))::date,
                            'YYYY-MM-DD')
             FROM users
-            WHERE {_CREATED_AT_ISO}
+            WHERE ({ca}) IS NOT NULL
             """,
             (tz,),
         ).fetchall()
@@ -2984,8 +3002,8 @@ def admin_product_health_growth_accounting_weekly(
                   NOT IN ('foreground_fallback','proactive_fallback')
               AND cm.user_id IN (
                   SELECT user_id FROM users
-                  WHERE {_CREATED_AT_ISO}
-                    AND (date_trunc('week', timezone(%s, created_at::timestamptz)))::date
+                  WHERE ({ca}) IS NOT NULL
+                    AND (date_trunc('week', timezone(%s, {ca})))::date
                         >= %s::date
               )
             GROUP BY cm.user_id
