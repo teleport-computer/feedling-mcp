@@ -10,6 +10,13 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **`POST /v1/chat/message` now accepts `context_refs`, carrying Garden
+  "talk in chat" memory references on the resident line.** Same plaintext
+  routing contract as the hosted send: only `type: "memory"` entries are
+  honored, ids only are persisted as `quoted_memory_ids` (capped at eight),
+  and the enclave expands them into decrypted memory context for the
+  resident consumer. Requests without `context_refs` are unchanged.
+
 - **Hosted Genesis no longer silently completes a non-empty long-term-memory
   import with zero cards.** Keep-all imports now fail with
   `distill_empty_output` and remediation copy directing the user to switch
