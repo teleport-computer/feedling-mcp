@@ -188,13 +188,16 @@ perception_* 工具(app 域注意:snapshot 只有 15 分钟内最近事件,轨�
 种子卡**(自产卡不进签名,杜绝自反馈循环);或用户在聊天里要求整理 →
 `memory_organize` 工具(force 语义,双层开关 fail-closed,关闭态返回
 "整理功能暂时关闭")。
-**执行**(重设计 97d4adce,产品哲学=**演进合并而非去重**):
+**执行**(重设计 97d4adce;2026-08-05 阀门重构=**出口只拦「明显不对」,
+不判内容质量**,usr_a40e 墓碑卡复盘,Seven 拍板):
 1. 两段式全文 fetch(60k 预算)——模型看到卡**全文**;
-2. 提案必须带 rationale;
-3. **每条合并提案独立二审**(_review_dream_consolidations,worker.py:223):
-   同 BYOK 单独小调用,标准=同一事件/承诺/计划/偏好/线索的连续演进,
-   **明写"文字相似不是必要条件"**(dream_prompt_v1.py:103-121,含京都例);
-   no/超时/解析失败只丢该条(fail-closed);
+2. 提案必须带 rationale;目标卡必须真实存在、不能被两条提案重复退休;
+3. **确定性出口闸**(memory/dream_gates.py + card_text.py,V1/V2 共享一份):
+   卡 id 泄漏(result 硬字段含花园真实卡 id → 与内容闸同路打回重问)、
+   墓碑短语(「已被+hex」/「superseded by+hex」)、爆炸半径保险丝
+   (单晚退休 > 活跃卡 80% 且 ≥10 张 → 整个 job 失败,不部分执行);
+   **旧的逐提案语义审查员与 15% 增量栅栏已拆**——弱模型自审自查既误放也误杀,
+   还每条提案多烧一次 BYOK;内容对不对交还模型自主;
 4. 同 run 内不碰自产卡;>20 动作分批;无数量闸、无文本相似闸(Seven 拍板撤除);
 5. supersede=软退休(status/superseded_by/is_archived,信封保留可恢复,
    actions.py:833-853);delete=硬删(不可恢复)。

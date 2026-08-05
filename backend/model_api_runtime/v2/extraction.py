@@ -11,8 +11,6 @@
 
 from __future__ import annotations
 
-import math
-import re
 from typing import Any, Awaitable, Callable, NamedTuple
 
 import provider_client
@@ -20,40 +18,6 @@ import provider_client
 _MAX_TOKENS = 1500
 _TEMPERATURE = 0.3
 _TIMEOUT_SEC = 90.0
-
-def _semantic_text(card: dict) -> str:
-    values: list[str] = []
-    for key in ("title", "summary", "description", "content"):
-        value = str(card.get(key) or "").strip()
-        if value and value not in values:
-            values.append(value)
-    return " ".join(values)
-
-
-def _normalized_semantic_text(card: dict) -> str:
-    return "".join(re.findall(r"[\w]", _semantic_text(card).lower(), flags=re.UNICODE))
-
-
-def _has_substantive_increment(old_card: dict, result: dict) -> bool:
-    """Conservative deterministic fence for one-card Dream rewrites.
-
-    A 1:1 ``thicken``/``supersede`` must contain materially more text *and*
-    genuinely new 3-character sequences.  Paraphrases and lossy summaries are
-    rejected; multi-card merges use the separate all-targets-present fence.
-    """
-
-    old_text = _normalized_semantic_text(old_card)
-    new_text = _normalized_semantic_text(result)
-    if not old_text or not new_text:
-        return False
-    min_growth = max(24, math.ceil(len(old_text) * 0.15))
-    if len(new_text) < len(old_text) + min_growth:
-        return False
-    old_grams = {old_text[i : i + 3] for i in range(max(0, len(old_text) - 2))}
-    new_grams = {new_text[i : i + 3] for i in range(max(0, len(new_text) - 2))}
-    min_novel = max(6, math.ceil(len(old_grams) * 0.10))
-    return len(new_grams - old_grams) >= min_novel
-
 
 class ParseRetry(NamedTuple):
     """「解析/语义结果不合格 → 原样打回去重问一次」的注入点。
@@ -408,15 +372,12 @@ def consolidations_to_actions(
             policy_rejections += 1
             continue
         if guarded:
+            # 2026-08-05 复盘只保留结构性判据:目标卡必须真实存在、不能被两条
+            # 提案重复退休。语义审查员与 15% 增量栅栏(内容质量判断)已拆除 ——
+            # 出口硬闸移到 parse 层(卡id泄漏/墓碑短语)与 worker 层(爆炸半径保险丝)。
             old_cards = [by_id.get(memory_id) for memory_id in card_ids]
-            if (
-                any(card is None for card in old_cards)
-                or any(memory_id in used_ids for memory_id in card_ids)
-                or consolidation.get("_review_approved") is not True
-                or (
-                    len(card_ids) == 1
-                    and not _has_substantive_increment(old_cards[0], result)
-                )
+            if any(card is None for card in old_cards) or any(
+                memory_id in used_ids for memory_id in card_ids
             ):
                 policy_rejections += 1
                 continue
@@ -437,9 +398,6 @@ def consolidations_to_actions(
                 "dream_op": op,
                 "dream_card_ids": card_ids,
                 "dream_rationale": rationale,
-                "dream_review_reason": str(
-                    consolidation.get("_review_reason") or ""
-                )[:1000],
                 "source_chat_message_ids": list(source_ids),
             }
         )

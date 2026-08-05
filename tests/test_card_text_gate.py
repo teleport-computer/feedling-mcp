@@ -311,3 +311,42 @@ def test_legit_bucket_not_cleaned():
         bucket, _t, reasons = sanitize_card_labels(bucket=b, threads=[])
         assert bucket == b, b
         assert not reasons, b
+
+
+# ---------------------------------------------------------------------------
+# 墓碑短语闸(2026-08-05 usr_a40e 事故:「已被 <卡id> 取代——原文」写进可见字段)
+# ---------------------------------------------------------------------------
+
+
+def test_tombstone_marker_rejects_hard_fields():
+    err = card_text_rejection(
+        summary="已被 c42ebb9618ae447df9d52107ea15de85 取代——绿豆汤偏好",
+        content="正常正文。",
+    )
+    assert err == "summary_tombstone_marker"
+    err = card_text_rejection(
+        summary="正常标题",
+        content="superseded by 1a1f94f9fdc9ec86 —— old friendship note.",
+    )
+    assert err == "content_tombstone_marker"
+
+
+def test_tombstone_marker_requires_hex_id_not_bare_prose():
+    # 正常散文里的「取代」不误伤:短语必须跟着 ≥8 位 hex 才算。
+    assert card_text_rejection(
+        summary="换了新手机", content="旧手机已被新手机取代,数据迁移顺利。"
+    ) is None
+    assert card_text_rejection(
+        summary="团队调整", content="他的职位已被同事接替,他觉得释然。"
+    ) is None
+
+
+def test_tombstone_marker_cleaned_from_soft_fields():
+    bucket, threads, reasons = sanitize_card_labels(
+        bucket="已被 c42ebb9618ae447d 取代",
+        threads=["饮食", "已被 c42ebb9618ae447d 取代——旧线索"],
+    )
+    assert bucket == ""
+    assert threads == ["饮食"]
+    assert "bucket_tombstone_marker" in reasons
+    assert "threads_tombstone_marker" in reasons

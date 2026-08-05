@@ -8549,7 +8549,12 @@ def memory_lane_health(*, within_hours: int = 24) -> dict:
     拉低成功率；只有 ``failed``（解析/provider 真错误）和 ``expired``（reaper 判定
     卡死回收）计入失败侧。
 
-    返回形状与 ``wake_success_stats`` 一致，便于并排读。"""
+    返回形状与 ``wake_success_stats`` 一致，便于并排读。
+
+    ``failed_reasons``（2026-08-05 dream 阀门重构）：失败侧按 ``last_error`` 首段
+    细分。dream 的出口闸从「按提案静默丢」改成了「明显不对就让整个 job 失败」
+    （``dream_blast_radius_exceeded`` / ``invalid_card_content*``），不细分的话
+    「保险丝在熔断」和「provider 在挂」在成功率上长得一模一样——阀门必须有刻度。"""
     with _pool().connection() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -8561,6 +8566,19 @@ def memory_lane_health(*, within_hours: int = 24) -> dict:
                 (int(within_hours),),
             )
             rows = cur.fetchall()
+            cur.execute(
+                # last_error 本身就是脱敏短码(extraction_failed:xxx),整串聚合
+                # 才能把 dream_blast_radius_exceeded 和 provider 挂掉分开看。
+                "SELECT lane, "
+                "COALESCE(NULLIF(left(last_error, 120), ''), 'unknown'), "
+                "count(*) FROM agent_jobs "
+                "WHERE lane IN ('capture','dream') AND status='failed' "
+                "AND finished_at IS NOT NULL "
+                "AND finished_at > now() - make_interval(hours => %s) "
+                "GROUP BY 1, 2",
+                (int(within_hours),),
+            )
+            reason_rows = cur.fetchall()
     completed = failed = expired = 0
     by_lane: dict[str, dict[str, int]] = {}
     for lane, status, count in rows:
@@ -8572,6 +8590,9 @@ def memory_lane_health(*, within_hours: int = 24) -> dict:
             failed += count
         elif status == "expired":
             expired += count
+    failed_reasons: dict[str, dict[str, int]] = {}
+    for lane, reason, count in reason_rows:
+        failed_reasons.setdefault(lane, {})[str(reason)] = int(count)
     denom = completed + failed + expired
     return {
         "completed": completed,
@@ -8579,6 +8600,7 @@ def memory_lane_health(*, within_hours: int = 24) -> dict:
         "expired": expired,
         "success_rate": (completed / denom) if denom else None,
         "by_lane": by_lane,
+        "failed_reasons": failed_reasons,
     }
 
 

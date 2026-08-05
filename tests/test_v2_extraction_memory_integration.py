@@ -252,7 +252,9 @@ def test_dream_apply_has_no_four_retired_card_cap(monkeypatch):
     )
 
 
-def test_dream_live_rig_shape_persists_only_duplicate_merge(monkeypatch):
+def test_dream_live_rig_shape_persists_all_structural_merges(monkeypatch):
+    """2026-08-05 阀门重构:语义审查员已拆,mapper 只做结构判据(目标存在、不重复)。
+    模型判定的四组合并全部落库 —— 内容对不对交还给模型自主,出口只拦「明显不对」。"""
     user_id = "dream-live-rig-user"
     store = types.SimpleNamespace(user_id=user_id)
     candidates = [
@@ -278,8 +280,7 @@ def test_dream_live_rig_shape_persists_only_duplicate_merge(monkeypatch):
             {
                 "op": "merge",
                 "card_ids": pair,
-                "rationale": "批处理模型声称它们属于同一线索",
-                **({"_review_approved": True} if pair == pairings[0] else {}),
+                "rationale": "模型判定它们属于同一线索",
                 "result": {"summary": "模型合并结果", "content": "模型合并后的正文。"},
             }
             for pair in pairings
@@ -292,12 +293,11 @@ def test_dream_live_rig_shape_persists_only_duplicate_merge(monkeypatch):
 
     body, status = memory_actions._execute_memory_actions(store, None, actions)
 
-    assert status == 200 and body["applied_count"] == 1
-    assert superseded == 2
-    assert len(saved) == 9
+    assert status == 200 and body["applied_count"] == 4
+    assert superseded == 8
+    assert len(saved) == 12                     # 8 张退休旧卡 + 4 张合并新卡
     by_id = {item["id"]: item for item in saved}
-    assert by_id["freeze-a"]["status"] == "superseded"
-    assert by_id["freeze-b"]["status"] == "superseded"
-    for memory_id in ("cycling", "coffee", "kyoto", "project", "birthday", "insomnia"):
-        assert by_id[memory_id]["status"] == "active"
-    assert sum(1 for item in saved if item.get("status") == "active") == 7
+    for pair in pairings:
+        for memory_id in pair:
+            assert by_id[memory_id]["status"] == "superseded"
+    assert sum(1 for item in saved if item.get("status") == "active") == 4

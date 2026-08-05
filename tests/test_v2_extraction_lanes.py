@@ -121,8 +121,6 @@ def test_extraction_lane_applies_actions_and_completes(monkeypatch, lane):
         assert provider_config is _BYOK          # BYOK-only
         if lane == "capture":
             return ([{"action": "add", "summary": "s", "content": "c"}], None)
-        if "独立的记忆整理审查员" in prompt:
-            return ({"approved": True, "reason": "同一京都计划的演进"}, None)
         return ([{
             "op": "merge",
             "card_ids": ["old-a", "old-b"],
@@ -160,80 +158,103 @@ def test_extraction_lane_applies_actions_and_completes(monkeypatch, lane):
     assert _job_row(job_id)[0] == "completed"
 
 
-def test_dream_semantic_review_accepts_duplicate_and_evolution_but_rejects_unrelated(
-    monkeypatch,
-):
+def test_dream_blast_radius_fuse_fails_whole_job(monkeypatch):
+    """2026-08-05 阀门重构:语义审查员已拆,834→1 的最后防线是确定性保险丝——
+    单晚要退休的卡 > 活跃卡 80% 且 ≥10 张 → 整个 job 失败,不部分执行。"""
+    uid = "u_x_dream_fuse"
+    _seed_v2(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, "dream")
+    job = jobs_store.claim_next_job("w")
+
     cards = [
-        {"id": "food-a", "summary": "小波爱吃冻干", "content": "每天吃鸡肉冻干。"},
-        {"id": "food-b", "summary": "小波爱吃冻干", "content": "冻干是日常零食。"},
-        {"id": "plan", "summary": "想去京都看红叶", "content": "希望秋天成行。"},
-        {"id": "ticket", "summary": "订了京都机票", "content": "11 月飞关西。"},
-        {"id": "cycling", "summary": "周末骑行", "content": "沿江骑四十公里。"},
-        {"id": "insomnia", "summary": "最近失眠", "content": "凌晨两点后才睡。"},
+        {"id": f"card-{i}", "summary": f"S{i}", "content": f"C{i}"}
+        for i in range(15)
     ]
-    proposals = [
-        {"op": "merge", "card_ids": ["food-a", "food-b"], "rationale": "同一偏好", "result": {}},
-        {"op": "merge", "card_ids": ["plan", "ticket"], "rationale": "同一计划演进", "result": {}},
-        {"op": "merge", "card_ids": ["cycling", "insomnia"], "rationale": "都和健康有关", "result": {}},
-    ]
-    prompts = []
 
-    async def _review(_uid, **kwargs):
-        prompt = kwargs["prompt"]
-        prompts.append(prompt)
-        if '"cycling"' in prompt:
-            return {"approved": False, "reason": "两个独立事实"}, None
-        return {"approved": True, "reason": "同一事件或线索"}, None
+    async def _fake_extract(*, provider_config, prompt, parse, **kw):
+        # 13/15 = 87% > 80% 且 ≥10 张 → 熔断
+        return ([
+            {
+                "op": "merge",
+                "card_ids": [f"card-{i}", f"card-{i + 1}"],
+                "rationale": "同一线索的演进",
+                "result": {"summary": "合并摘要", "content": "合并后的完整正文。"},
+            }
+            for i in range(0, 12, 2)
+        ] + [{
+            "op": "supersede",
+            "card_ids": ["card-12"],
+            "rationale": "同一事实的更新",
+            "result": {"summary": "更新摘要", "content": "更新后的完整正文。"},
+        }], None)
 
-    monkeypatch.setattr(worker, "_extract_with_provider_health", _review)
-    approved = asyncio.run(worker._review_dream_consolidations(
-        "review-user",
-        proposals,
-        card_items=cards,
-        provider_config=_BYOK,
-        job_id="job-review",
-        claimed_by=None,
-    ))
+    monkeypatch.setattr(extraction, "extract", _fake_extract)
+    applied = {}
 
-    assert len(prompts) == 3  # one fresh provider call per proposal
-    assert [row["card_ids"] for row in approved] == [
-        ["food-a", "food-b"],
-        ["plan", "ticket"],
-    ]
-    assert all(row["_review_approved"] is True for row in approved)
+    deps = _deps(
+        read_memory_context=lambda _uid: {
+            "ai_name": "小克", "user_name": "Z", "buckets": "B",
+            "threads": "T", "identity": "I", "cards": "C",
+            "card_items": cards,
+        },
+        apply_memory_actions=lambda _uid, actions: applied.update(n=len(actions)) or {"status": "ok"},
+    )
+
+    status = asyncio.run(worker.process_job(
+        job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"))
+
+    assert status == "failed"
+    assert applied == {}                       # 熔断在任何写入之前
+    row = _job_row(job_id)
+    assert row == ("failed", "extraction_failed:dream_blast_radius_exceeded")
 
 
-def test_dream_semantic_review_failure_rejects_one_proposal_and_continues(monkeypatch):
+def test_dream_below_fuse_threshold_applies_normally(monkeypatch):
+    uid = "u_x_dream_no_fuse"
+    _seed_v2(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, "dream")
+    job = jobs_store.claim_next_job("w")
+
     cards = [
-        {"id": "a", "summary": "A"},
-        {"id": "b", "summary": "B"},
-        {"id": "c", "summary": "C"},
-        {"id": "d", "summary": "D"},
+        {"id": f"card-{i}", "summary": f"S{i}", "content": f"C{i}"}
+        for i in range(15)
     ]
-    proposals = [
-        {"op": "merge", "card_ids": ["a", "b"], "rationale": "第一条", "result": {}},
-        {"op": "merge", "card_ids": ["c", "d"], "rationale": "第二条", "result": {}},
-    ]
-    calls = {"n": 0}
 
-    async def _review(_uid, **_kwargs):
-        calls["n"] += 1
-        if calls["n"] == 1:
-            return None, "provider_call_failed:upstream_unavailable"
-        return {"approved": True, "reason": "第二条通过"}, None
+    async def _fake_extract(*, provider_config, prompt, parse, **kw):
+        # 退休 4 张(<10 张下限)→ 永不熔断
+        return ([
+            {
+                "op": "merge",
+                "card_ids": [f"card-{i}", f"card-{i + 1}"],
+                "rationale": "同一线索的演进",
+                "result": {"summary": "合并摘要", "content": "合并后的完整正文。"},
+            }
+            for i in range(0, 4, 2)
+        ], None)
 
-    monkeypatch.setattr(worker, "_extract_with_provider_health", _review)
-    approved = asyncio.run(worker._review_dream_consolidations(
-        "review-user",
-        proposals,
-        card_items=cards,
-        provider_config=_BYOK,
-        job_id="job-review",
-        claimed_by=None,
-    ))
+    monkeypatch.setattr(extraction, "extract", _fake_extract)
+    applied = {}
 
-    assert calls["n"] == 2
-    assert [row["card_ids"] for row in approved] == [["c", "d"]]
+    deps = _deps(
+        read_memory_context=lambda _uid: {
+            "ai_name": "小克", "user_name": "Z", "buckets": "B",
+            "threads": "T", "identity": "I", "cards": "C",
+            "card_items": cards,
+        },
+        apply_memory_actions=lambda _uid, actions: applied.update(n=len(actions)) or {"status": "ok"},
+    )
+
+    async def _profile_enqueue(*_a, **_k):
+        return True
+
+    monkeypatch.setattr(worker, "_enqueue_profile_if_due", _profile_enqueue)
+
+    status = asyncio.run(worker.process_job(
+        job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"))
+
+    assert status == "completed"
+    assert applied == {"n": 2}
+    assert _job_row(job_id)[0] == "completed"
 
 
 @pytest.mark.parametrize("lane", ["capture", "dream"])
@@ -257,8 +278,6 @@ def test_extraction_lane_records_whole_turn_metric_on_success(monkeypatch, lane)
         })
         if lane == "capture":
             return ([{"action": "add", "summary": "s", "content": "c"}], None)
-        if "独立的记忆整理审查员" in prompt:
-            return ({"approved": True, "reason": "同一京都计划的演进"}, None)
         return ([{
             "op": "merge",
             "card_ids": ["old-a", "old-b"],
@@ -281,7 +300,8 @@ def test_extraction_lane_records_whole_turn_metric_on_success(monkeypatch, lane)
             "FROM v2_turn_metrics WHERE job_id=%s", (job_id,)).fetchone()
     assert row is not None
     assert row[0] == lane
-    expected_calls = 2 if lane == "dream" else 1
+    # 2026-08-05 起 dream 不再有逐提案语义审查 —— 两条 lane 都只打一次 provider。
+    expected_calls = 1
     assert row[1] == 90 * expected_calls and row[2] == 9 * expected_calls
     assert row[3] == expected_calls
     assert row[4] is False
