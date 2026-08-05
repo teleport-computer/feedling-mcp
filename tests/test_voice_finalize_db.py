@@ -46,11 +46,11 @@ def test_call_rows_selected_and_deleted_others_kept():
         "voice_call_id": "vcall_other", "voice_turn_id": "t1",
     })
 
-    found = set(summary.call_message_ids(uid, call_id))
+    found = {msg_id for msg_id, _seq in summary.call_message_rows(uid, call_id)}
     assert found == {turn_user, turn_reply}
 
-    deleted = summary.delete_call_messages(uid, call_id)
-    assert deleted == 2
+    result = summary.delete_call_messages(uid, call_id)
+    assert result == {"deleted": 2, "retained_covered": 0, "remaining": 0}
     assert db.chat_get_strict(uid, turn_user) is None
     assert db.chat_get_strict(uid, turn_reply) is None
     # unrelated chat and other calls stay
@@ -73,8 +73,42 @@ def test_delete_never_touches_the_summary_row_and_is_idempotent():
         "voice_call_id": call_id,
     }, 200)
 
-    assert summary.delete_call_messages(uid, call_id) == 1
+    first = summary.delete_call_messages(uid, call_id)
+    assert (first["deleted"], first["remaining"]) == (1, 0)
     assert db.chat_get_strict(uid, smid) is not None
     # replayed cleanup deletes nothing further and keeps the summary
-    assert summary.delete_call_messages(uid, call_id) == 0
+    replay = summary.delete_call_messages(uid, call_id)
+    assert (replay["deleted"], replay["remaining"]) == (0, 0)
     assert db.chat_get_strict(uid, smid) is not None
+
+
+def test_rows_folded_by_compaction_are_retained_not_deleted():
+    # C1 guard: a voice row already covered by the V2 summary watermark is part
+    # of compaction's frozen ledger — deleting it would corrupt the frontier.
+    # It must be RETAINED (and not counted as a cleanup failure).
+    uid = _seed_user()
+    call_id = "vcall_" + uuid.uuid4().hex[:10]
+    early = _append(uid, {
+        "role": "user", "source": "model_api",
+        "voice_call_id": call_id, "voice_turn_id": "t1",
+    })
+    late = _append(uid, {
+        "role": "user", "source": "model_api",
+        "voice_call_id": call_id, "voice_turn_id": "t2",
+    })
+    with db.get_pool().connection() as conn:
+        early_seq = conn.execute(
+            "SELECT seq FROM chat_messages WHERE user_id=%s AND msg_id=%s",
+            (uid, early),
+        ).fetchone()[0]
+        conn.execute(
+            "INSERT INTO v2_conversation_summary (user_id, watermark_seq) "
+            "VALUES (%s, %s) ON CONFLICT (user_id) DO UPDATE "
+            "SET watermark_seq = EXCLUDED.watermark_seq",
+            (uid, int(early_seq)),
+        )
+
+    result = summary.delete_call_messages(uid, call_id)
+    assert result == {"deleted": 1, "retained_covered": 1, "remaining": 0}
+    assert db.chat_get_strict(uid, early) is not None   # folded row kept
+    assert db.chat_get_strict(uid, late) is None        # unfolded row deleted

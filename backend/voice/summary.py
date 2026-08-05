@@ -128,38 +128,85 @@ def persist_summary(store, text: str, message_id: str) -> bool:
     return True
 
 
-def call_message_ids(user_id: str, call_id: str) -> list[str]:
-    """Every chat row belonging to one voice call.
+def _compaction_covered_seq(user_id: str) -> int:
+    """Highest chat seq already folded into the V2 conversation summary.
 
-    Both the spoken user turn and IO's reply carry ``voice_call_id`` as
-    plaintext routing metadata, so one predicate covers the whole call.
+    Rows at-or-below this seq are part of compaction's frozen source ledger:
+    deleting one would desync the frontier's frozen counts and break later
+    summary reads. Conservative in the DELETE direction — when only a legacy
+    ``watermark_ts`` exists, a row exactly at the watermark is treated as
+    covered (kept), the opposite rounding of the GC helper which protects the
+    other direction.
     """
     with db.get_pool().connection() as conn:
+        row = conn.execute(
+            "SELECT COALESCE(watermark_seq, 0), watermark_ts "
+            "FROM v2_conversation_summary WHERE user_id = %s",
+            (str(user_id),),
+        ).fetchone()
+        if row is None:
+            return 0
+        covered = int(row[0] or 0)
+        watermark_ts = row[1]
+        if watermark_ts:
+            ts_row = conn.execute(
+                "SELECT COALESCE(MAX(seq), 0) FROM chat_messages "
+                "WHERE user_id = %s AND ts <= %s",
+                (str(user_id), float(watermark_ts)),
+            ).fetchone()
+            covered = max(covered, int(ts_row[0] or 0))
+    return covered
+
+
+def call_message_rows(user_id: str, call_id: str) -> list[tuple[str, int]]:
+    """(msg_id, seq) of every chat row belonging to one voice call. Both the
+    spoken user turn and IO's reply carry ``voice_call_id`` as plaintext
+    routing metadata, so one predicate covers the whole call."""
+    with db.get_pool().connection() as conn:
         rows = conn.execute(
-            "SELECT msg_id FROM chat_messages "
+            "SELECT msg_id, seq FROM chat_messages "
             "WHERE user_id = %s AND doc->>'voice_call_id' = %s",
             (str(user_id), str(call_id)),
         ).fetchall()
-    return [str(row[0]) for row in rows]
+    return [(str(r[0]), int(r[1] or 0)) for r in rows]
 
 
-def delete_call_messages(user_id: str, call_id: str) -> int:
+def delete_call_messages(user_id: str, call_id: str) -> dict:
     """Remove the call's per-turn rows once the summary is durable.
 
-    Uses the per-message primitive the verify-loop GC already deletes rows with.
-    After this, the raw back-and-forth is gone from history, from the model's
-    context, and from the capture window — only the summary remains.
+    Only rows NOT yet folded by V2 compaction are deleted (per-message
+    primitive, same one the verify-loop GC uses); a row already inside the
+    frozen summary segment is retained (``retained_covered``) because deleting
+    it would corrupt the compaction frontier — it no longer feeds future
+    context reads anyway. Returns counts so the route can verify completeness:
+    ``remaining`` > 0 means deletable rows survived (DB blips swallowed by
+    ``chat_delete``) and the finalize must NOT report success.
     """
+    smid = summary_message_id(call_id)
+    covered = _compaction_covered_seq(user_id)
     deleted = 0
-    for msg_id in call_message_ids(user_id, call_id):
-        if msg_id == summary_message_id(call_id):
+    retained_covered = 0
+    for msg_id, seq in call_message_rows(user_id, call_id):
+        if msg_id == smid:
+            continue
+        if seq <= covered:
+            retained_covered += 1
             continue
         try:
             if db.chat_delete(str(user_id), msg_id):
                 deleted += 1
-        except Exception:  # noqa: BLE001 — best effort, summary already durable
+        except Exception:  # noqa: BLE001 — counted below via the recheck
             continue
-    return deleted
+    remaining = sum(
+        1
+        for msg_id, seq in call_message_rows(user_id, call_id)
+        if msg_id != smid and seq > covered
+    )
+    return {
+        "deleted": deleted,
+        "retained_covered": retained_covered,
+        "remaining": remaining,
+    }
 
 
 def nudge_capture(store) -> None:

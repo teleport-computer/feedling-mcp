@@ -23,6 +23,7 @@ from asgi.deps import require_auth, require_scope
 from chat import idempotency as chat_idempotency
 from core import envelope as core_envelope
 from core import voice_token
+from core import wake_bus
 from hosted import chat_send_core
 from hosted import config_store as hosted_config_store
 from notices import catalog as notices_catalog
@@ -333,13 +334,32 @@ async def finalize_voice_call(
                 return {"error": "voice_summary_failed"}, 502
             if not voice_summary.persist_summary(store, text, mid):
                 return {"error": "voice_summary_not_persisted"}, 502
-            store.notify_chat_waiters()
-        deleted = voice_summary.delete_call_messages(user_id, call_id)
+        cleanup = voice_summary.delete_call_messages(user_id, call_id)
+        if cleanup["remaining"] > 0:
+            # Deletable rows survived (a DB blip inside chat_delete). The
+            # summary is durable, so a client retry re-enters via the
+            # idempotent replay path and re-runs only this cleanup.
+            log.warning(
+                "[voice.finalize] cleanup incomplete user=%s call=%s remaining=%d",
+                user_id[:12], call_id[:24], cleanup["remaining"],
+            )
+            return {"error": "voice_cleanup_incomplete"}, 502
+        # Prune this worker's hot cache and tell every other worker (same
+        # three steps clear_history performs after deleting rows).
+        with store.chat_lock:
+            store.chat_messages = [
+                m for m in store.chat_messages
+                if str(m.get("voice_call_id") or "") != call_id
+                or str(m.get("id") or "") == mid
+            ]
+        store.notify_chat_waiters()
+        wake_bus.notify("chat", user_id)
         voice_summary.nudge_capture(store)
         return {
             "status": "finalized",
             "summary_message_id": mid,
-            "deleted_turns": deleted,
+            "deleted_turns": cleanup["deleted"],
+            "retained_covered": cleanup["retained_covered"],
             "replayed": already,
         }, 200
 
