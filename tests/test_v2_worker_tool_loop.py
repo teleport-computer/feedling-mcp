@@ -360,12 +360,19 @@ def test_chat_worldbook_matches_current_turn_without_rewriting_user_text(
             "matched_names": ["Moon Court"],
         }
 
-    deps = _deps(messages=[{
+    turn_messages = [{
         "id": "m-worldbook",
         "ts": 10.0,
         "role": "user",
         "content": "Tell me about Luna",
-    }])
+    }]
+    deps = _deps(messages=turn_messages)
+    # Production prompt assembly reads the same current turn back through its
+    # history dependency. The suite's minimal `_deps` helper intentionally
+    # omits those readers, which would exercise the empty-context degradation
+    # path and make this integration assertion inspect a prompt with no tail.
+    deps.read_summary = lambda _uid: ("", 0.0, 0)
+    deps.read_tail = lambda _uid, _after_ts, _limit: list(turn_messages)
     deps.read_worldbook_context = read_worldbook
 
     status = asyncio.run(
