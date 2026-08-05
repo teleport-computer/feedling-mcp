@@ -896,6 +896,84 @@ def test_seq_reader_preserves_local_only_row_as_safe_placeholder(monkeypatch):
     }]
 
 
+def test_seq_reader_reads_plaintext_chat_row_without_enclave(monkeypatch):
+    monkeypatch.setattr(
+        serve_worker.db, "chat_messages_after_seq",
+        lambda *args, **kwargs: [{
+            "id": "plain", "seq": 12, "ts": 101.0, "role": "user",
+            "body": "hello from plaintext tier", "visibility": "shared",
+            "owner_user_id": "u",
+        }],
+    )
+    monkeypatch.setattr(serve_worker, "_mint_runtime_token", lambda uid: "rt")
+    monkeypatch.setattr(
+        serve_worker.core_enclave,
+        "_decrypt_envelope_via_enclave",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("plaintext chat rows must not call the enclave")
+        ),
+    )
+
+    out = serve_worker._read_messages_after_seq("u", 11, through_seq=12)
+
+    assert out == [{
+        "id": "plain", "seq": 12, "ts": 101.0, "role": "user",
+        "content": "hello from plaintext tier",
+    }]
+
+
+def test_chat_reader_prefers_ciphertext_when_plaintext_field_also_exists(monkeypatch):
+    monkeypatch.setattr(serve_worker, "_mint_runtime_token", lambda uid: "rt")
+    decrypted = []
+
+    def _decrypt(row, *_args, **_kwargs):
+        decrypted.append(row["id"])
+        return b"current encrypted body"
+
+    monkeypatch.setattr(
+        serve_worker.core_enclave, "_decrypt_envelope_via_enclave", _decrypt,
+    )
+
+    out = serve_worker._decrypt_chat_rows(
+        "u",
+        [{
+            "id": "mixed", "seq": 13, "ts": 102.0, "role": "openclaw",
+            "body_ct": "ciphertext", "K_enclave": "wrapped-key",
+            "body": "stale plaintext body", "reply_to_message_id": "plain",
+        }],
+        user_only=False,
+        preserve_unreadable=True,
+    )
+
+    assert decrypted == ["mixed"]
+    assert out == [{
+        "id": "mixed", "seq": 13, "ts": 102.0, "role": "assistant",
+        "content": "current encrypted body", "reply_to_message_id": "plain",
+    }]
+
+
+def test_chat_reader_does_not_fall_back_to_stale_body_when_enclave_key_is_missing(
+    monkeypatch,
+):
+    monkeypatch.setattr(serve_worker, "_mint_runtime_token", lambda uid: "rt")
+
+    out = serve_worker._decrypt_chat_rows(
+        "u",
+        [{
+            "id": "broken-mixed", "seq": 14, "ts": 103.0, "role": "user",
+            "body_ct": "ciphertext", "K_enclave": None,
+            "body": "stale plaintext body",
+        }],
+        user_only=True,
+        preserve_unreadable=True,
+    )
+
+    assert out == [{
+        "id": "broken-mixed", "seq": 14, "ts": 103.0, "role": "user",
+        "content": "[message unavailable]",
+    }]
+
+
 def test_main_module_has_entrypoint_guard():
     import inspect
 

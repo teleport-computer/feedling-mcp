@@ -774,7 +774,26 @@ def _decrypt_chat_rows(
                 token=token,
             )
         else:
-            if not m.get("body_ct") or m.get("K_enclave") is None:
+            # Chat rows are mixed-shape during the encryption-optional rollout:
+            # encrypted rows carry body_ct/K_enclave, while plaintext-tier rows
+            # carry body.  Route by the row's actual shape instead of assuming
+            # every prompt row needs enclave decryption.  The old ciphertext-
+            # only check turned every valid plaintext user message into
+            # "[message unavailable]", leaving the model to answer from stale
+            # assistant history (and potentially continue an unrelated tool
+            # workflow) even though the current message was stored correctly.
+            # Keep ciphertext authoritative when a malformed/mid-migration row
+            # also retains a stale plaintext field.  Missing K_enclave must stay
+            # unreadable instead of silently falling back to that stale body.
+            has_readable_shape = (
+                m.get("K_enclave") is not None
+                if m.get("body_ct")
+                else (
+                    m.get("body_b64") is not None
+                    or isinstance(m.get("body"), str)
+                )
+            )
+            if not has_readable_shape:
                 if not preserve_unreadable:
                     continue  # legacy ts path keeps the historical skip rule
                 item = {
