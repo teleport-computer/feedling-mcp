@@ -599,9 +599,20 @@ def test_runtime_view_renders_and_highlights_nav(client, monkeypatch):
 
 
 def test_runtime_view_appears_in_nav_of_other_views(client, monkeypatch):
+    # Dashboard IA v2: the default page is home with a 4-item primary nav
+    # (首页/产品健康/用户/诊断); runtime is reachable through the 诊断 hub and
+    # stays in the second-row nav of every diagnostic view.
     monkeypatch.setattr(_dt, "_runtime_health_summary", _fake_summary)
-    page = client.get("/admin/data-track", headers=_admin_headers()).get_data(as_text=True)
-    assert "view=runtime" in page
+    home = client.get("/admin/data-track", headers=_admin_headers()).get_data(as_text=True)
+    assert "view=diag" in home
+    hub = client.get(
+        "/admin/data-track?view=diag", headers=_admin_headers()
+    ).get_data(as_text=True)
+    assert "view=runtime" in hub
+    sibling = client.get(
+        "/admin/data-track?view=imports", headers=_admin_headers()
+    ).get_data(as_text=True)
+    assert "view=runtime" in sibling
 
 
 def test_runtime_view_falls_back_on_invalid_hours(client, monkeypatch):
