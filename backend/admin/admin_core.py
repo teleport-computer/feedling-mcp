@@ -14,11 +14,15 @@ via ``asgi.threadpool.run_db`` from the async routes.
 
 from __future__ import annotations
 
+import concurrent.futures
+import hashlib
 import json
 import logging
+import threading
 import time
 from dataclasses import replace
 from datetime import datetime, timezone
+from urllib.parse import parse_qsl, urlencode
 
 import db
 from accounts import registry
@@ -33,6 +37,22 @@ from model_api_runtime.v2 import jobs_store
 log = logging.getLogger("feedling.admin")
 InvalidDauDay = data_track.InvalidDauDay
 InvalidDataTrackUserId = data_track.InvalidDataTrackUserId
+
+
+def _timed(name: str, fn, *args, **kwargs):
+    """计时包装：成功失败都记耗时，异常原样上抛（失败域仍归调用方）。
+
+    只记 builder 名——查询串/入参可能带 admin_key，绝不能进日志。
+    """
+    start = time.monotonic()
+    try:
+        return fn(*args, **kwargs)
+    finally:
+        log.info(
+            "[admin:perf] builder=%s elapsed_ms=%d",
+            name,
+            int((time.monotonic() - start) * 1000),
+        )
 
 
 def normalize_data_track_user_id(raw_user_id: str) -> str:
@@ -83,49 +103,105 @@ def user_payload(query_string: str, user_id: str) -> tuple[dict, int]:
         return {"user": data_track._build_data_track_user(entry, include_detail=True)}, 200
 
 
-def page_html(query_string: str) -> str:
+# overview 扇出共用一个进程级线程池。每请求各开 7 个 worker 的旧写法，会让
+# 两个管理员在事故期间各看一个小时窗就向共享 16 连接 DB 池（db.get_pool() 与
+# jobs_store 同池）索要 14+ 条连接，把用户路由饿死。进程级上限 4 意味着无论
+# 多少并发管理员/窗口，dashboard builder 的总并发就是 4。绝不能 with 包裹
+# 每请求 shutdown——池要活过单个请求。
+_ops_executor_lock = threading.Lock()
+_ops_executor: concurrent.futures.ThreadPoolExecutor | None = None
+
+
+def _get_ops_executor() -> concurrent.futures.ThreadPoolExecutor:
+    global _ops_executor
+    with _ops_executor_lock:
+        if _ops_executor is None:
+            _ops_executor = concurrent.futures.ThreadPoolExecutor(
+                max_workers=4, thread_name_prefix="admin-ops"
+            )
+        return _ops_executor
+
+
+def _overview_builder(name: str, failure_msg: str, fn, **kwargs) -> dict | None:
+    # 每个 builder 是独立失败域：自己吞异常、自己记日志、缺数据用 None 表达
+    # （渲染层显示「取不到」，不伪装成健康）。跑在 worker 线程上，因此只准
+    # 用显式入参——contextvar 的 request 代理在 worker 线程里是空绑定。
+    try:
+        return _timed(name, fn, **kwargs)
+    except Exception:
+        log.exception(failure_msg)
+        return None
+
+
+def _build_page_html(query_string: str) -> str:
     # Mirror admin_data_track_page's view dispatch.
     with bind(query_string):
         view = (request.args.get("view") or "").strip().lower()
         if view == "overview":
+            # hours 必须在提交线程池之前算好：request 是 contextvar 代理，
+            # worker 线程读不到本请求的绑定。
             hours = data_track._ops_window_hours()
-            try:
-                imports = db.recent_genesis_import_health(within_hours=hours)
-            except Exception:
-                log.exception("admin operations overview import query failed")
-                imports = None
-            try:
-                chat = jobs_store.recent_chat_reliability(within_hours=hours)
-            except Exception:
-                log.exception("admin operations overview chat query failed")
-                chat = None
-            try:
-                runtime = jobs_store.recent_runtime_health(within_hours=hours)
-            except Exception:
-                log.exception("admin operations overview runtime query failed")
-                runtime = None
-            try:
-                product = db.recent_admin_product_kpis(within_hours=hours)
-            except Exception:
-                log.exception("admin operations overview product KPI query failed")
-                product = None
-            try:
-                usage = jobs_store.recent_token_usage_by_lane(within_hours=hours)
-            except Exception:
-                log.exception("admin operations overview usage query failed")
-                usage = None
+            specs: dict[str, tuple[str, object, dict]] = {
+                "imports": (
+                    "admin operations overview import query failed",
+                    db.recent_genesis_import_health,
+                    {"within_hours": hours},
+                ),
+                "chat": (
+                    "admin operations overview chat query failed",
+                    jobs_store.recent_chat_reliability,
+                    {"within_hours": hours},
+                ),
+                "runtime": (
+                    "admin operations overview runtime query failed",
+                    jobs_store.recent_runtime_health,
+                    {"within_hours": hours},
+                ),
+                "product": (
+                    "admin operations overview product KPI query failed",
+                    db.recent_admin_product_kpis,
+                    {"within_hours": hours},
+                ),
+                "usage": (
+                    "admin operations overview usage query failed",
+                    jobs_store.recent_token_usage_by_lane,
+                    {"within_hours": hours},
+                ),
+                # 上一个同长窗口（环比基线）：offset_hours 把窗口整体后移。
+                "prev_product": (
+                    "admin operations overview previous-window product KPI query failed",
+                    db.recent_admin_product_kpis,
+                    {"within_hours": hours, "offset_hours": hours},
+                ),
+                "prev_usage": (
+                    "admin operations overview previous-window usage query failed",
+                    jobs_store.recent_token_usage_by_lane,
+                    {"within_hours": hours, "offset_hours": hours},
+                ),
+            }
+            executor = _get_ops_executor()
+            futures = {
+                name: executor.submit(_overview_builder, name, failure_msg, fn, **kwargs)
+                for name, (failure_msg, fn, kwargs) in specs.items()
+            }
+            results = {name: future.result() for name, future in futures.items()}
+            # 渲染留在调用线程（bind 之内）：渲染层还要读 request.args。
             return data_track._render_ops_overview_page(
-                imports,
-                chat,
-                runtime,
-                product,
-                usage,
+                results["imports"],
+                results["chat"],
+                results["runtime"],
+                results["product"],
+                results["usage"],
+                prev_product=results["prev_product"],
+                prev_usage=results["prev_usage"],
                 within_hours=hours,
             )
         if view == "imports":
             hours = data_track._ops_window_hours()
             try:
-                report = db.recent_genesis_import_health(within_hours=hours)
+                report = _timed(
+                    "imports", db.recent_genesis_import_health, within_hours=hours
+                )
             except Exception:
                 log.exception("admin import health query failed")
                 report = None
@@ -133,7 +209,9 @@ def page_html(query_string: str) -> str:
         if view in {"chat", "latency"}:
             hours = data_track._ops_window_hours()
             try:
-                report = jobs_store.recent_chat_reliability(within_hours=hours)
+                report = _timed(
+                    "chat", jobs_store.recent_chat_reliability, within_hours=hours
+                )
             except Exception:
                 log.exception("admin chat reliability query failed")
                 report = None
@@ -172,22 +250,38 @@ def page_html(query_string: str) -> str:
             # 一起拖进降级页，是这页最坏的失败模式（它恰恰是出事时才被打开的那一
             # 页）。附加信息挂掉只让对应区块显「取不到」。
             try:
-                payload = data_track._runtime_health_summary(within_hours=hours)
+                payload = _timed(
+                    "runtime_health_summary",
+                    data_track._runtime_health_summary,
+                    within_hours=hours,
+                )
             except Exception:
                 logging.exception("runtime health summary failed")
                 return data_track._render_runtime_health_error_page()
             try:
-                tokens = data_track._runtime_token_by_lane(within_hours=hours)
+                tokens = _timed(
+                    "runtime_token_by_lane",
+                    data_track._runtime_token_by_lane,
+                    within_hours=hours,
+                )
             except Exception:
                 logging.exception("runtime token usage failed (health still served)")
                 tokens = None
             try:
-                delivery = data_track._runtime_delivery_health(within_hours=hours)
+                delivery = _timed(
+                    "runtime_delivery_health",
+                    data_track._runtime_delivery_health,
+                    within_hours=hours,
+                )
             except Exception:
                 logging.exception("runtime delivery health failed (health still served)")
                 delivery = None
             try:
-                user_report = data_track._runtime_user_report(within_hours=hours)
+                user_report = _timed(
+                    "runtime_user_report",
+                    data_track._runtime_user_report,
+                    within_hours=hours,
+                )
             except Exception:
                 logging.exception("runtime user report failed (health still served)")
                 user_report = None
@@ -202,6 +296,170 @@ def page_html(query_string: str) -> str:
                 return data_track._render_event_users_page(data_track._data_track_event_users_payload(event))
             return data_track._render_events_page(data_track._data_track_events_payload())
         return data_track._render_data_track_page(data_track._data_track_payload(include_users=True))
+
+
+# --------------------------------------------------------------------------- #
+# page_html 的 60s TTL 缓存（single-flight + stale-on-error）。
+# 只缓存列表/报表页；user_page（用户详情，可能带 reveal 参数）绝不进缓存；
+# view=debug（同样可能带 reveal 明文）整体绕过缓存。
+# key 是「规范化参数字典（first-value-wins，与 core.reqctx._Args 同口径）
+# **含 admin_key**」的 sha256 摘要：缓存结构里只存摘要、不存明文 secret，
+# 同时两条鉴权通道（查询串 admin_key vs 会话 cookie，见 routes_asgi）永不
+# 共享条目——否则 cookie 端生成的页会把 admin_key 从 key 端管理员的 19 个
+# 导航 href 里剥掉（点一下就 401），key 端生成的页会把明文 token 泄给
+# cookie 端浏览器。命中缓存必须带 cache-note 声明数据年龄：不许把旧数据
+# 伪装成刚生成的。TTL 过后条目仍可为 stale-on-error 服务，但超过硬保留期
+# （10 分钟）的条目在每次 get/put 时一律清除——什么都不许无限期活着。
+# --------------------------------------------------------------------------- #
+
+_PAGE_CACHE_TTL_SEC = 60.0
+_PAGE_CACHE_HARD_RETENTION_SEC = 600.0
+_PAGE_CACHE_FAILURE_COOLDOWN_SEC = 5.0
+_PAGE_CACHE_MAX_ENTRIES = 64
+# 全局锁只保护下面几个 dict 的结构，绝不在持有期间重建页面。
+_page_cache_lock = threading.Lock()
+_page_cache: dict[str, tuple[float, str]] = {}  # key -> (built_at monotonic, html)
+_page_cache_builds: dict[str, threading.Lock] = {}  # per-key single-flight 锁
+_page_cache_last_failure: dict[str, float] = {}  # key -> 最近一次重建失败时刻
+
+
+def _canonical_page_params(query_string: str) -> dict[str, str]:
+    # 与 core.reqctx._Args 完全同口径：parse_qsl 原始顺序 + setdefault，
+    # 重复参数取第一个值。缓存 key 必须等于渲染层实际看到的参数，否则
+    # ?view=dau&view=growth 与 ?view=growth&view=dau 会共享一个条目却
+    # 渲染出不同的页。
+    first: dict[str, str] = {}
+    for key, value in parse_qsl(query_string or "", keep_blank_values=True):
+        first.setdefault(key, value)
+    return first
+
+
+def _page_cache_key(query_string: str) -> str:
+    params = _canonical_page_params(query_string)
+    return hashlib.sha256(
+        urlencode(sorted(params.items())).encode("utf-8")
+    ).hexdigest()
+
+
+def _purge_hard_expired_locked(now: float) -> None:
+    # 调用方必须已持有 _page_cache_lock。
+    for key in [
+        key
+        for key, (built_at, _) in _page_cache.items()
+        if now - built_at >= _PAGE_CACHE_HARD_RETENTION_SEC
+    ]:
+        _page_cache.pop(key, None)
+        _page_cache_builds.pop(key, None)
+    for key in [
+        key
+        for key, failed_at in _page_cache_last_failure.items()
+        if now - failed_at >= _PAGE_CACHE_FAILURE_COOLDOWN_SEC
+    ]:
+        _page_cache_last_failure.pop(key, None)
+
+
+def _page_cache_get(key: str) -> tuple[float, str] | None:
+    with _page_cache_lock:
+        _purge_hard_expired_locked(time.monotonic())
+        return _page_cache.get(key)
+
+
+def _page_cache_put(key: str, built_at: float, page: str) -> None:
+    with _page_cache_lock:
+        _purge_hard_expired_locked(time.monotonic())
+        _page_cache[key] = (built_at, page)
+        _page_cache_last_failure.pop(key, None)
+        overflow = len(_page_cache) - _PAGE_CACHE_MAX_ENTRIES
+        if overflow > 0:
+            # 恶意查询串变体不能把缓存撑爆：按生成时间淘汰最旧的。
+            stale_keys = sorted(_page_cache, key=lambda k: _page_cache[k][0])[:overflow]
+            for stale_key in stale_keys:
+                _page_cache.pop(stale_key, None)
+                _page_cache_builds.pop(stale_key, None)
+        if len(_page_cache_builds) > _PAGE_CACHE_MAX_ENTRIES * 2:
+            # 重建异常路径已就地回收自己的锁条目，这里是兜底：清掉一切
+            # 没有对应缓存条目的孤儿锁。被回收的锁若仍有持有者/等待者，
+            # 最坏结果是同 key 多重建一次。
+            for stale_key in [k for k in _page_cache_builds if k not in _page_cache]:
+                _page_cache_builds.pop(stale_key, None)
+
+
+def _humanize_age_zh(age_sec: float) -> str:
+    seconds = max(0, int(age_sec))
+    if seconds < 120:
+        return f"{seconds} 秒前"
+    if seconds < 7200:
+        return f"{seconds // 60} 分钟前"
+    return f"{seconds // 3600} 小时前"
+
+
+def _with_cache_note(page: str, age_sec: float) -> str:
+    # 样式必须自包含（页面模板各自为政、没有 cache-note 的 CSS），位置必须
+    # 在 <main> 顶部——一条“这是缓存”的声明沉在一万像素高的页底等于没说。
+    note = (
+        "<div class='cache-note' style=\"display:inline-block;margin:10px 0;"
+        "padding:4px 10px;background:#f6f5f0;border:1px solid #dddcd4;"
+        "border-radius:6px;color:#68706a;font-size:12px;\">"
+        f"页面缓存 · 数据生成于 {_humanize_age_zh(age_sec)}</div>"
+    )
+    idx = page.find("<main")
+    if idx >= 0:
+        tag_end = page.find(">", idx)
+        if tag_end >= 0:
+            return page[: tag_end + 1] + note + page[tag_end + 1 :]
+    return note + page
+
+
+def page_html(query_string: str) -> str:
+    params = _canonical_page_params(query_string)
+    if (params.get("view") or "").strip().lower() == "debug":
+        # debug 视图可能带 reveal=<明文>，任何形式的驻留都不行——直接重建。
+        return _build_page_html(query_string)
+    key = _page_cache_key(query_string)
+    entry = _page_cache_get(key)
+    now = time.monotonic()
+    if entry is not None and now - entry[0] < _PAGE_CACHE_TTL_SEC:
+        return _with_cache_note(entry[1], now - entry[0])
+    with _page_cache_lock:
+        build_lock = _page_cache_builds.get(key)
+        if build_lock is None:
+            build_lock = threading.Lock()
+            _page_cache_builds[key] = build_lock
+    with build_lock:
+        # 等锁期间可能已有并发请求完成重建（single-flight：同 key 只重建一次）。
+        entry = _page_cache_get(key)
+        now = time.monotonic()
+        if entry is not None and now - entry[0] < _PAGE_CACHE_TTL_SEC:
+            return _with_cache_note(entry[1], now - entry[0])
+        with _page_cache_lock:
+            failed_at = _page_cache_last_failure.get(key)
+        if (
+            failed_at is not None
+            and now - failed_at < _PAGE_CACHE_FAILURE_COOLDOWN_SEC
+        ):
+            # 冷却期内不再逐个排队撞 DB 超时（N × timeout 的车队效应）：
+            # 有旧页就诚实地端旧页，没有就立刻失败，冷却期过了才许再试。
+            if entry is not None:
+                return _with_cache_note(entry[1], now - entry[0])
+            raise RuntimeError("admin page rebuild failed recently; retry shortly")
+        try:
+            page = _build_page_html(query_string)
+        except Exception:
+            with _page_cache_lock:
+                _page_cache_last_failure[key] = time.monotonic()
+                if key not in _page_cache:
+                    # 失败从不写 _page_cache；不就地回收锁条目的话，事故期间
+                    # 300 个各异的失败 key 就是 300 把孤儿锁。
+                    _page_cache_builds.pop(key, None)
+            if entry is not None:
+                # stale-on-error：旧页比 5xx 有用；诚实性由 cache-note 的年龄保证。
+                log.exception(
+                    "admin data-track page rebuild failed; serving stale cache"
+                )
+                return _with_cache_note(entry[1], time.monotonic() - entry[0])
+            raise
+        _page_cache_put(key, time.monotonic(), page)
+        return page
 
 
 def login_page(*, error: bool = False, next_url: str = "/admin/data-track") -> str:

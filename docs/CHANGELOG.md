@@ -47,6 +47,47 @@
 
 ## 记录正文（最新的在上面）
 
+## 2026-08-04 — Admin 运营总览提速 + 布局重做
+
+**[DONE] /admin/data-track 性能修复（overview 4.5s TTFB → 缓存命中亚秒）+ 运营总览布局按「问题→判定→证据」重排。**
+
+- 性能四件套：① `admin_onboarding_funnel` 新增 `registered_cutoff_ts`——
+  KPI 调用不再全量扫 `chat_messages`×2 / `user_logs` / `memory_moments`
+  （cohort user_id 过滤让里程碑 CTE 走既有 `(user_id,…)` 索引；`view=events`
+  的全量 funnel 页路径逐字节不变）；② overview 七个 report builder 并行
+  （ThreadPoolExecutor，逐 builder 失败域与日志语义保持原样，worker 线程
+  不碰 reqctx 绑定）；③ `page_html` 60s TTL 缓存（single-flight、
+  stale-on-error、5s 失败冷却、600s 硬保留清扫；key 是含 admin_key 的
+  first-value-wins 规范参数串的 sha256 摘要——按鉴权通道隔离缓存条目、
+  不落明文 secret，cookie 会话拿不到别人 query-key 构建的页面；
+  `view=debug`（可带 reveal 明文）完全绕过缓存；命中必带
+  「页面缓存 · 数据生成于 N 分钟前」诚实声明，置于 main 顶部）；④ 迁移 0078：`user_logs` app_session_end 部分索引
+  （CONCURRENTLY，沿用 0074 的 invalid-shell 防护）。另：全部 ops builder
+  加 `[admin:perf] builder=… elapsed_ms=…` 生产计时（codex 建议的第一步）。
+- 环比基线：`recent_admin_product_kpis` / `recent_token_usage_by_lane` 新增
+  `offset_hours`（前一窗口，半开区间；offset=0 行为与查询计划不变），
+  overview 指标卡带 ▲/▼ 环比（onboarding cohort 明确不做环比）。
+- 布局：四张问题卡改「比率大字 + 分数小字」且整卡可点进明细页；新增灰色
+  `unknown`（证据不足）一等档位，与琥珀 warn（测得需注意/结构性证据缺口）
+  分离——纯无证据不再显得像告警，chat 卡因 ACK 结构缺失仍保持 warn；每格
+  指标带 '?' 一行口径悬浮；三段长口径说明折叠为 `<details>`；导航 12 tab
+  分组为 质量/增长/系统。
+- 三方对抗审查（SQL 窗口 / 并发缓存 / 渲染 XSS+UX）后修复：跨鉴权通道
+  缓存互串（blocker）、7 线程 fan-out 打满共享 16 连接池（改共享 4 线程
+  `admin-ops` executor）、import 卡 100% 失败窗口误显「无样本」、重复扣费卡
+  测得候选仍显灰、6 个页面 nav 分组 CSS 缺失、环比 ≥10× 封顶、模型调用
+  环比改中性、offset 窗口上界改半开、funnel 查询失败改返 None（覆盖率
+  诚实显「未知」而非 0/0）。
+- 测试：`tests/test_admin_dashboard_perf.py` + `tests/test_admin_kpi_windows.py`
+  新增（funnel cohort 等价、offset 半开边界、缓存 single-flight/通道隔离/
+  debug 绕过/硬保留、失败域降级、日志与缓存 key 不含 admin_key）；conftest
+  增加 autouse 缓存清理 fixture。本地 PG14 上
+  `test_admin_usage.py` 的 44 个失败为存量 `pg_input_is_valid`（PG16 函数）
+  环境问题，与本改动无关（pristine origin/test 同样 44 失败）。
+- 后续（未做）：`ops_snapshot` 汇总表（把 dau/users 视图 12-18s 也压下来）；
+  客户端 ACK 采集（chat 卡变绿的前提，也是 fundraise「loop engagement」
+  指标的前提）。
+
 ## 2026-08-05 — V2→V1 颗粒度对齐总攻（Seven 全权委托,一日闭环）
 
 **[DONE] Runtime V2 体验收敛到 V1:人设注入、心跳自觉、工具面 parity、test 开关常态全开,live E2E 全绿。**

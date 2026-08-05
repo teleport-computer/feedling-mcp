@@ -1566,7 +1566,9 @@ END
 """
 
 
-def recent_admin_product_kpis(*, within_hours: int = 24) -> dict:
+def recent_admin_product_kpis(
+    *, within_hours: int = 24, offset_hours: int = 0
+) -> dict:
     """Rolling-window product/account KPIs for the Admin operations overview.
 
     This is intentionally *not* the daily DAU snapshot.  ``window_app_users``
@@ -1575,13 +1577,29 @@ def recent_admin_product_kpis(*, within_hours: int = 24) -> dict:
     on multiple days.  The dedicated DAU page remains the Beijing-calendar-day
     source of truth.
 
-    Onboarding reuses ``admin_onboarding_funnel``'s existing event milestones.
-    Its denominator is parseable accounts registered inside this same rolling
-    window, and "complete" means that cohort has reached first genuine reply
-    (t3) by query time.  If the funnel cannot cover the registration cohort,
-    the rate is returned as ``None`` rather than a fabricated zero.
+    ``offset_hours`` shifts the whole window into the past — bounds become
+    half-open [now - (offset+within)h, now - offset h) — for period-over-period
+    columns, matching ``recent_token_usage_by_lane`` so a row exactly on the
+    shared edge lands in exactly one window; 0 keeps today's closed trailing
+    window and behavior (including the query plan) unchanged.
+
+    Onboarding reuses ``admin_onboarding_funnel``'s existing event milestones,
+    scoped to this window via ``registered_cutoff_ts`` so it no longer walks
+    every user ever.  Its denominator is parseable accounts registered inside
+    this same rolling window, and "complete" means that cohort has reached
+    first genuine reply (t3) by query time.  If the funnel cannot cover the
+    registration cohort, the rate is returned as ``None`` rather than a
+    fabricated zero.
     """
     safe_hours = max(1, min(int(within_hours), 24 * 30))
+    safe_offset = max(0, min(int(offset_hours), 24 * 366))
+    # Upper-edge operator: offset=0 keeps the historical closed upper bound
+    # byte-for-byte (behavior and query plan unchanged); offset>0 goes
+    # half-open so the shared edge between adjacent windows is counted once.
+    # The three users of this operator (sessions CTE, registrations CTE, and
+    # the Python cohort filter below) must stay edge-consistent, or
+    # ``coverage_complete`` can flip spuriously for an edge registration.
+    upper_op = "<=" if safe_offset == 0 else "<"
     with get_pool().connection() as conn:
         registered_at_sql = _admin_utc_text_timestamp_sql(
             "users.created_at",
@@ -1590,7 +1608,9 @@ def recent_admin_product_kpis(*, within_hours: int = 24) -> dict:
         row = conn.execute(
             f"""
             WITH bounds AS (
-              SELECT extract(epoch FROM clock_timestamp())::double precision AS now_ts,
+              SELECT extract(epoch FROM (
+                       clock_timestamp() - make_interval(hours => %s)
+                     ))::double precision AS now_ts,
                      extract(epoch FROM (
                        clock_timestamp() - make_interval(hours => %s)
                      ))::double precision AS cutoff_ts
@@ -1600,7 +1620,7 @@ def recent_admin_product_kpis(*, within_hours: int = 24) -> dict:
               WHERE logs.stream='tracking_events'
                 AND logs.doc->>'type'='app_session_end'
                 AND logs.ts IS NOT NULL
-                AND logs.ts >= bounds.cutoff_ts AND logs.ts <= bounds.now_ts
+                AND logs.ts >= bounds.cutoff_ts AND logs.ts {upper_op} bounds.now_ts
             ), parsed_users AS (
               SELECT users.user_id,{registered_at_sql} AS registered_at
               FROM users
@@ -1610,7 +1630,7 @@ def recent_admin_product_kpis(*, within_hours: int = 24) -> dict:
               WHERE extract(epoch FROM parsed_users.registered_at)
                     >= bounds.cutoff_ts
                 AND extract(epoch FROM parsed_users.registered_at)
-                    <= bounds.now_ts
+                    {upper_op} bounds.now_ts
             )
             SELECT
               bounds.now_ts,
@@ -1626,25 +1646,35 @@ def recent_admin_product_kpis(*, within_hours: int = 24) -> dict:
               (SELECT count(*)::int FROM parsed_users) AS account_rows
             FROM bounds
             """,
-            (safe_hours,),
+            (safe_offset, safe_offset + safe_hours),
         ).fetchone()
 
     now_ts = float(row[0])
     cutoff_ts = float(row[1])
     new_registered = int(row[4] or 0)
-    funnel_rows = admin_onboarding_funnel()
+    funnel_rows = admin_onboarding_funnel(registered_cutoff_ts=cutoff_ts)
+    # The funnel only lower-bounds registrations, so keep the upper t0 cap
+    # (same ``upper_op`` edge as the SQL CTEs above): with offset_hours > 0 it
+    # drops users registered on/after the window's upper edge.
+    # ``admin_onboarding_funnel`` returns ``None`` on query failure — a funnel
+    # outage must surface as coverage_complete=False (未知), never as a valid
+    # empty cohort, even in a zero-registration window where the old
+    # ``[]``-on-error behavior made ``len(cohort) == 0 == new_registered``
+    # render a confident 0 / 0.
+    funnel_failed = funnel_rows is None
+    if safe_offset == 0:
+        def _t0_in_window(t0: float) -> bool:
+            return cutoff_ts <= t0 <= now_ts
+    else:
+        def _t0_in_window(t0: float) -> bool:
+            return cutoff_ts <= t0 < now_ts
     cohort = [
         item
-        for item in funnel_rows
-        if item.get("t0") is not None
-        and cutoff_ts <= float(item["t0"]) <= now_ts
+        for item in (funnel_rows or [])
+        if item.get("t0") is not None and _t0_in_window(float(item["t0"]))
     ]
-    # ``admin_onboarding_funnel`` historically catches query errors and returns
-    # ``[]``.  Compare its fleet row count as well as the window cohort so an
-    # outage cannot look like a valid empty cohort when accounts do exist.
     funnel_coverage_complete = (
-        len(funnel_rows) == int(row[6] or 0)
-        and len(cohort) == new_registered
+        not funnel_failed and len(cohort) == new_registered
     )
     configured = sum(1 for item in cohort if item.get("t1") is not None)
     content_ready = sum(1 for item in cohort if item.get("t2") is not None)
@@ -3145,9 +3175,15 @@ def admin_events_by_user(category: str, *, limit: int = 400) -> list[dict]:
     return []
 
 
-def admin_onboarding_funnel() -> list[dict]:
+def admin_onboarding_funnel(
+    *, registered_cutoff_ts: float | None = None
+) -> list[dict] | None:
     """Per-user onboarding milestone epochs for the funnel view. Each row:
     {user_id, route, t0, t1, t2, t3} (epoch seconds; None = not reached).
+    Returns ``None`` when the query fails — callers must distinguish an
+    outage from a genuinely empty cohort (``recent_admin_product_kpis`` maps
+    ``None`` to coverage_complete=False so a zero-registration window can't
+    render a confident 0 / 0 during a funnel outage).
 
     Milestones (route-aware):
       t0 registered = users.created_at
@@ -3157,39 +3193,60 @@ def admin_onboarding_funnel() -> list[dict]:
                       VPS: first chat/proactive activity (consumer online, 'B')
       t2 内容就绪    = API: onboarding-genesis job done; VPS: first memory card
       t3 首次真回复  = first non-fallback agent message ('A', both routes)
-    The caller aggregates conversion + median segment durations, split VPS/API."""
+    The caller aggregates conversion + median segment durations, split VPS/API.
+
+    ``registered_cutoff_ts`` (epoch seconds) narrows the cohort to users whose
+    parseable registered_at >= cutoff AND narrows every milestone CTE to those
+    users, turning the fleet-wide table scans into per-user index scans for the
+    windowed ops-overview caller. ``None`` keeps the fleet-wide funnel exactly
+    as before (the `view=events&event=onboarding` page depends on that)."""
     try:
         with get_pool().connection() as conn:
             registered_at_sql = _admin_utc_text_timestamp_sql(
                 "created_at",
                 supports_input_validation=conn.info.server_version >= 160000,
             )
+            if registered_cutoff_ts is None:
+                u_filter = ""
+                cohort_and = ""
+                cohort_where = ""
+                params = None
+            else:
+                # t0 is not visible inside its own CTE's WHERE, so the parse
+                # expression repeats; the cutoff itself stays a bound param.
+                u_filter = (
+                    "\n                      WHERE EXTRACT(EPOCH FROM "
+                    f"({registered_at_sql})) >= %s"
+                )
+                cohort_and = " AND user_id IN (SELECT user_id FROM u)"
+                cohort_where = " WHERE user_id IN (SELECT user_id FROM u)"
+                params = (float(registered_cutoff_ts),)
             rows = conn.execute(f"""
                 {_EVENTS_ROUTES_CTE},
                 u AS (SELECT user_id,
                         EXTRACT(EPOCH FROM ({registered_at_sql})) AS t0
-                      FROM users),
+                      FROM users{u_filter}),
                 gen_started AS (SELECT user_id, MIN(EXTRACT(EPOCH FROM updated_at)) AS t
                           FROM genesis_import_jobs
-                          WHERE COALESCE(NULLIF(metadata->>'mode',''),'onboarding')='onboarding'
+                          WHERE COALESCE(NULLIF(metadata->>'mode',''),'onboarding')='onboarding'{cohort_and}
                           GROUP BY user_id),
                 firstact AS (SELECT user_id, MIN(ts) AS t FROM (
-                             SELECT user_id, ts FROM chat_messages
-                             UNION ALL SELECT user_id, ts FROM user_logs WHERE stream='proactive_jobs'
+                             SELECT user_id, ts FROM chat_messages{cohort_where}
+                             UNION ALL SELECT user_id, ts FROM user_logs WHERE stream='proactive_jobs'{cohort_and}
                            ) a GROUP BY user_id),
                 gen AS (SELECT user_id, MIN(EXTRACT(EPOCH FROM updated_at)) AS t
                         FROM genesis_import_jobs
                         WHERE status IN ('done','completed')
-                          AND COALESCE(NULLIF(metadata->>'mode',''),'onboarding')='onboarding'
+                          AND COALESCE(NULLIF(metadata->>'mode',''),'onboarding')='onboarding'{cohort_and}
                         GROUP BY user_id),
                 mem AS (SELECT user_id,
                         MIN(EXTRACT(EPOCH FROM (COALESCE(NULLIF(doc->>'created_at',''), occurred_at))::timestamptz)) AS t
                         FROM memory_moments
-                        WHERE COALESCE(NULLIF(doc->>'created_at',''), occurred_at) ~ '^[0-9]{{4}}-[0-9]{{2}}-[0-9]{{2}}'
+                        WHERE COALESCE(NULLIF(doc->>'created_at',''), occurred_at) ~ '^[0-9]{{4}}-[0-9]{{2}}-[0-9]{{2}}'{cohort_and}
                         GROUP BY user_id),
                 reply AS (SELECT user_id, MIN(ts) AS t FROM chat_messages
                           WHERE doc->>'role' IN ('agent','openclaw')
-                            AND COALESCE(doc->>'source','') NOT IN ('foreground_fallback','proactive_fallback')
+                            AND COALESCE(doc->>'source','') NOT IN ('foreground_fallback','proactive_fallback'){cohort_and}
                           GROUP BY user_id)
                 SELECT u.user_id, COALESCE(r.route,'resident') AS route, u.t0,
                        CASE WHEN COALESCE(r.route,'resident')='model_api' THEN gen_started.t ELSE firstact.t END AS t1,
@@ -3202,14 +3259,14 @@ def admin_onboarding_funnel() -> list[dict]:
                 LEFT JOIN gen ON gen.user_id = u.user_id
                 LEFT JOIN mem ON mem.user_id = u.user_id
                 LEFT JOIN reply ON reply.user_id = u.user_id
-            """).fetchall()
+            """, params).fetchall()
         def f(v):
             return float(v) if v is not None else None
         return [{"user_id": r[0], "route": r[1], "t0": f(r[2]), "t1": f(r[3]),
                  "t2": f(r[4]), "t3": f(r[5])} for r in rows]
     except Exception as e:  # noqa: BLE001
         log.error("[db] admin_onboarding_funnel failed: %s", e)
-        return []
+        return None
 
 
 def admin_api_key_stats() -> dict:
