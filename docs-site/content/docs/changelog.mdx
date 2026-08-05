@@ -10,6 +10,13 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **Runtime V2 memory capture now supports both content-storage tiers.** Its
+  atomic capture journal accepts a plaintext `body` envelope only when the
+  account's effective encryption mode is off, continues to require the full
+  sealed envelope for encrypted accounts, and rejects mixed shapes. Profile
+  distillation also requests a JSON-only provider response, reducing failed
+  background retries that can delay a later turn for the same account.
+
 - **Runtime V2 Chat no longer fails during setup for plaintext-tier accounts.**
   Its internal trajectory recorder now carries compressed binary events in an
   explicit plaintext base64 wire when encryption is off, while encrypted

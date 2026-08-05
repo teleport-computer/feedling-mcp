@@ -1599,6 +1599,7 @@ _CAPTURE_PROVIDER_DB_KEEPALIVE_SEC = 15.0
 _CAPTURE_ENVELOPE_FIELDS = frozenset(
     {
         "id",
+        "body",
         "body_ct",
         "nonce",
         "K_user",
@@ -1726,6 +1727,8 @@ def _capture_owned_job_on_cursor(cur, job_id, user_id: str, claimed_by: str):
 
 
 def _validate_capture_actions(user_id: str, actions: list[dict]) -> list[dict]:
+    from core import envelope as core_envelope  # keep jobs_store import-light
+
     if not isinstance(actions, list) or len(actions) > 20:
         raise ValueError("capture actions must be a list of at most 20 items")
     normalized: list[dict] = []
@@ -1748,17 +1751,27 @@ def _validate_capture_actions(user_id: str, actions: list[dict]) -> list[dict]:
         ):
             raise ValueError("invalid capture memory identity")
         seen_ids.add(memory_id)
-        for field in (
-            "body_ct",
-            "nonce",
-            "K_user",
-            "K_enclave",
-            "visibility",
-            "occurred_at",
-            "type",
-        ):
+        for field in ("visibility", "occurred_at", "type"):
             if not envelope.get(field):
                 raise ValueError(f"capture envelope missing {field}")
+        has_ciphertext = bool(envelope.get("body_ct"))
+        has_plaintext_field = envelope.get("body") is not None
+        if has_ciphertext == has_plaintext_field:
+            raise ValueError("capture envelope content shape invalid")
+        if has_ciphertext:
+            for field in ("nonce", "K_user", "K_enclave"):
+                if not envelope.get(field):
+                    raise ValueError(f"capture envelope missing {field}")
+        else:
+            if not isinstance(envelope.get("body"), str) or not envelope["body"]:
+                raise ValueError("capture plaintext body invalid")
+            if core_envelope.resolve_content_encryption(str(user_id)) != "off":
+                raise ValueError("capture plaintext envelope not enabled")
+            if any(
+                envelope.get(field) is not None
+                for field in ("nonce", "K_user", "K_enclave")
+            ):
+                raise ValueError("capture plaintext envelope has crypto fields")
         if str(envelope["visibility"]) != "shared":
             raise ValueError("capture envelope must be shared")
         if str(envelope["type"]) not in {"moment", "quote", "fact", "event"}:
@@ -2026,6 +2039,7 @@ def _capture_same_memory(existing: dict, wanted: dict) -> bool:
         for key in (
             "id",
             "type",
+            "body",
             "body_ct",
             "nonce",
             "K_user",

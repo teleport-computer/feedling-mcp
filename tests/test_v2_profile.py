@@ -182,8 +182,19 @@ def test_generate_profile_single_call_returns_overlap_telemetry():
     assert result.provider_calls == 1
     assert result.overlap is not None and result.overlap.would_reject is True
     assert len(calls) == 1
+    assert calls[0][2]["response_format"] == {"type": "json_object"}
     assert usages == [{"input_tokens": 10}]
     assert events == [
+        (
+            "profile_provider_response_observed",
+            {
+                "provider_call": 1,
+                "reply_is_text": True,
+                "reply_chars": len(_reply("ＡＢＣＤefgh", "abcd-efgh")),
+                "has_json_object": True,
+                "stop_reason": "",
+            },
+        ),
         ("profile_overlap_observed", result.overlap.as_dict()),
     ]
 
@@ -219,7 +230,7 @@ def test_shape_error_bounces_once_with_content_free_correction():
     assert "SECRET-REPLY" not in correction
     assert "SOURCE-CONTEXT" not in correction
     assert "JSON" in correction
-    assert events[0] == (
+    assert events[1] == (
         "profile_parse_bounced",
         {"reason": "reply_not_json"},
     )
