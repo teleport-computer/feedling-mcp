@@ -138,7 +138,7 @@ dream 阀门重构 + 今晨反例句,全部通过实弹验证。** 另外抓到�
 | 解锁唤醒 | ✅ | allow_first_event 语义正确 |
 | 照片唤醒 | ✅ | 新增变化 → 唤醒 |
 | 三类唤醒各自的开关 | ✅ | 各拦各的,互不连带 |
-| 屏幕共享 | ⚠️ 部分 | DND 闸与开关独立性已验;帧内容与沉默语义需要真实共享会话,列为遗留 |
+| 屏幕共享 | ✅ 服务端半边 | 专属 system prompt(说/不说同等有效、永不叙述「我在看你屏幕」、永不提系统措辞)、SILENT 合法沉默、开关不连带、enqueue 前问 oracle 且只有真 enqueue 才推进 frame_id;**真实共享会话的帧内容仍需真机** |
 
 ---
 
@@ -166,12 +166,14 @@ dream 阀门重构 + 今晨反例句,全部通过实弹验证。** 另外抓到�
 2. `tools/e2e/continuity_probe.py` — 幂等用例从"固定 sleep 4 秒后数行"改成
    "轮询到期 + 拿到 1 行后再等 5 秒看有没有迟到的重复行"。**原因**:异步 ingest +
    部署窗 → 假阳性 PRODUCT_FAIL;改法既去假阳性,也不放过真重复。(同上 commit)
-3. 新增四个本地 rig 探针(commit `62c8bc66`):`switch_matrix_probe`(开关独立性)、
+3. 新增六个探针(commits `62c8bc66` / `5889f27e` / `cdb3f855`):`switch_matrix_probe`(开关独立性)、
    `wake_write_gate_probe`(wake 写权限分档)、`perception_wake_probe`(感知链四不变量
    + 跨进程一致性)、`idempotency_probe`(消息重复两族)。**原因**:这四面都是
    `docs/testing` 矩阵点名"必做"、但此前没有自动化覆盖的;这轮又恰好都动过
    (DND 闸动了调度查询、wake lane 动了 prompt 与沉默语义、PR#158 重造了感知链)。
-   全部只打本地 rig / 纯静态,不碰 test/prod。
+   另加 `screen_watch_probe`(屏幕共享 lane 的服务端语义:专属 prompt / 沉默合法 /
+   开关不连带 / 只有真 enqueue 才推进 frame_id)与 `worldbook_probe`(世界书
+   live 验收,打 test 部署态)。前五个只打本地 rig 或纯静态。
 
 **注意**:我做这些改动时 codex4 正在同一棵树上写世界书,我全程只 `git add` 我自己的
 文件,没有把他的半成品带进任何 commit(他也确认没动我的两个探针文件)。
