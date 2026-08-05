@@ -47,6 +47,73 @@
 
 ## 记录正文（最新的在上面）
 
+## 2026-08-04 — 新增 Admin「产品健康」view（留存/激活/强度/证据缺口）
+
+**[DONE] /admin/data-track?view=health：投资人级产品指标常态化进 dashboard，全部只用现库可证实的数。**
+
+- 四个问题分区：①用户留下来了吗（`retention_cohort_snapshot` 冻结 cohort
+  W1/W2/W4/W8 热力表——只读快照、未成熟显「—」不做实时补算；WAU/粘性/L1-L7
+  分布用 `app_session_end` 使用口径）；②新用户能激活吗（复用带 cutoff 的
+  onboarding funnel：cohort×t1/t2/t3 趋势 + 注册→首真回复中位时长 + W4
+  激活者-vs-全量留存分层，coverage 不完整显「未知」）；③强度是真的吗
+  （Top10% session/token 集中度——token 标注仅 V2 灰度；铁杆用户 census =
+  连续 4 周每周 ≥5 个 admitted **非心跳** 主动 job，V1+V2 wake 合并、
+  排除维护类/限流 skip/自主心跳；主动消息 24h 回复率右删失下界）；
+  ④还缺什么证据（常开缺口清单：session 来源标记、客户端已读 ACK、BYOK
+  自付不可见——各自阻塞哪个核心指标）。
+- 诚实性规则全页强制（两轮对抗审查后修复 9 处）：进行中的北京周不渲染
+  成已定数字（流失/净变化/激活率/铁杆数全部跳过或标「进行中·不可判定」）；
+  funnel 故障传导为「未知」而非 0；W4 激活标记冻结在 W4 窗口开始前
+  （成熟 cohort 不再回溯漂移）；session 与 token 集中度同用完整北京日窗口。
+- 复用 commit 868281284 的底座：共享 admin-ops executor 并行 8 个
+  builder（本地实测 2-30ms/个）、60s 缓存、`[admin:perf]` 计时、逐 builder
+  失败域。宽口径快照 vs 使用口径两把尺子在口径说明中显式声明，不可互读。
+- 测试：`tests/test_admin_product_health_view.py`（14 项：8 个 builder 的
+  种子数据语义 + 渲染诚实性/缓存/日志无 secret）。仍未做：0079 可选
+  `proactive_jobs` 部分索引（视 prod EXPLAIN）、`chat_messages(ts)` 索引
+  （回复率查询目前顺扫、60s 缓存兜底）。
+
+## 2026-08-04 — Admin 运营总览提速 + 布局重做
+
+**[DONE] /admin/data-track 性能修复（overview 4.5s TTFB → 缓存命中亚秒）+ 运营总览布局按「问题→判定→证据」重排。**
+
+- 性能四件套：① `admin_onboarding_funnel` 新增 `registered_cutoff_ts`——
+  KPI 调用不再全量扫 `chat_messages`×2 / `user_logs` / `memory_moments`
+  （cohort user_id 过滤让里程碑 CTE 走既有 `(user_id,…)` 索引；`view=events`
+  的全量 funnel 页路径逐字节不变）；② overview 七个 report builder 并行
+  （ThreadPoolExecutor，逐 builder 失败域与日志语义保持原样，worker 线程
+  不碰 reqctx 绑定）；③ `page_html` 60s TTL 缓存（single-flight、
+  stale-on-error、5s 失败冷却、600s 硬保留清扫；key 是含 admin_key 的
+  first-value-wins 规范参数串的 sha256 摘要——按鉴权通道隔离缓存条目、
+  不落明文 secret，cookie 会话拿不到别人 query-key 构建的页面；
+  `view=debug`（可带 reveal 明文）完全绕过缓存；命中必带
+  「页面缓存 · 数据生成于 N 分钟前」诚实声明，置于 main 顶部）；④ 迁移 0078：`user_logs` app_session_end 部分索引
+  （CONCURRENTLY，沿用 0074 的 invalid-shell 防护）。另：全部 ops builder
+  加 `[admin:perf] builder=… elapsed_ms=…` 生产计时（codex 建议的第一步）。
+- 环比基线：`recent_admin_product_kpis` / `recent_token_usage_by_lane` 新增
+  `offset_hours`（前一窗口，半开区间；offset=0 行为与查询计划不变），
+  overview 指标卡带 ▲/▼ 环比（onboarding cohort 明确不做环比）。
+- 布局：四张问题卡改「比率大字 + 分数小字」且整卡可点进明细页；新增灰色
+  `unknown`（证据不足）一等档位，与琥珀 warn（测得需注意/结构性证据缺口）
+  分离——纯无证据不再显得像告警，chat 卡因 ACK 结构缺失仍保持 warn；每格
+  指标带 '?' 一行口径悬浮；三段长口径说明折叠为 `<details>`；导航 tab
+  分组为 质量/增长/系统（加上产品健康后共 13 个）。
+- 三方对抗审查（SQL 窗口 / 并发缓存 / 渲染 XSS+UX）后修复：跨鉴权通道
+  缓存互串（blocker）、7 线程 fan-out 打满共享 16 连接池（改共享 4 线程
+  `admin-ops` executor）、import 卡 100% 失败窗口误显「无样本」、重复扣费卡
+  测得候选仍显灰、6 个页面 nav 分组 CSS 缺失、环比 ≥10× 封顶、模型调用
+  环比改中性、offset 窗口上界改半开、funnel 查询失败改返 None（覆盖率
+  诚实显「未知」而非 0/0）。
+- 测试：`tests/test_admin_dashboard_perf.py` + `tests/test_admin_kpi_windows.py`
+  新增（funnel cohort 等价、offset 半开边界、缓存 single-flight/通道隔离/
+  debug 绕过/硬保留、失败域降级、日志与缓存 key 不含 admin_key）；conftest
+  增加 autouse 缓存清理 fixture。本地 PG14 上
+  `test_admin_usage.py` 的 44 个失败为存量 `pg_input_is_valid`（PG16 函数）
+  环境问题，与本改动无关（pristine origin/test 同样 44 失败）。
+- 后续（未做）：`ops_snapshot` 汇总表（把 dau/users 视图 12-18s 也压下来）；
+  客户端 ACK 采集（chat 卡变绿的前提，也是 fundraise「loop engagement」
+  指标的前提）。
+
 ## 2026-08-05 — V2→V1 颗粒度对齐总攻（Seven 全权委托,一日闭环）
 
 **[DONE] Runtime V2 体验收敛到 V1:人设注入、心跳自觉、工具面 parity、test 开关常态全开,live E2E 全绿。**

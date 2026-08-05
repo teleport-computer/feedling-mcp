@@ -66,7 +66,9 @@ def test_0077_perception_signal_state_is_the_single_installed_head():
     cfg.set_main_option("script_location", str(backend / "alembic"))
     script = ScriptDirectory.from_config(cfg)
 
-    assert script.get_heads() == ["0077_perception_signal_state_v2"]
+    assert script.get_heads() == ["0078_admin_dashboard_indexes"]
+    head_migration = script.get_revision("0078_admin_dashboard_indexes")
+    assert head_migration.down_revision == "0077_perception_signal_state_v2"
     migration = script.get_revision("0077_perception_signal_state_v2")
     assert migration.down_revision == "0076_plaintext_job_exclusivity"
 
@@ -107,7 +109,7 @@ def test_0077_perception_signal_state_is_the_single_installed_head():
             "AND tc.table_name='perception_signal_state_v2'"
         ).fetchone()
 
-    assert installed_head == ("0077_perception_signal_state_v2",)
+    assert installed_head == ("0078_admin_dashboard_indexes",)
     assert columns == {
         "user_id": ("text", "NO"),
         "signal": ("text", "NO"),
@@ -169,7 +171,7 @@ def test_0075_usage_rollup_schema_is_installed_without_source_backfill():
             "AND tgrelid='v2_turn_metrics'::regclass"
         ).fetchone()[0]
 
-    assert head == ("0077_perception_signal_state_v2",)
+    assert head == ("0078_admin_dashboard_indexes",)
     assert tables == {
         "v2_usage_daily_users",
         "v2_usage_daily_dimensions",

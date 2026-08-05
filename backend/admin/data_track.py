@@ -1625,7 +1625,7 @@ def _data_track_request_filters() -> dict:
         raw_dir = "desc"
     raw_view = (request.args.get("view") or "users").strip().lower()
     if raw_view not in {
-        "users", "dau", "growth", "proactive", "debug", "events",
+        "users", "dau", "growth", "proactive", "debug", "events", "health",
         "overview", "imports", "chat", "latency", "runtime", "usage",
     }:
         raw_view = "users"
@@ -2472,12 +2472,63 @@ def _format_duration(seconds) -> str:
     return f"{hours // 24}d"
 
 
-def _render_metric(label: str, value) -> str:
+def _render_metric(label: str, value, *, hint: str = "", delta: str = "") -> str:
+    """``hint`` 是一行口径定义，渲染成 label 旁的 '?'（title 悬浮显示）；
+    ``delta`` 是**已渲染好的 HTML**，只允许来自 _render_delta——其余入参照旧
+    走 html.escape。两个新参数都有默认值，既有 2 参调用点不用改。"""
+    hint_html = (
+        f"<span class='hint' title='{html.escape(hint, quote=True)}'>?</span>"
+        if hint else ""
+    )
     return (
         "<div class='metric'>"
-        f"<div class='metric-value'>{html.escape(str(value))}</div>"
-        f"<div class='metric-label'>{html.escape(label)}</div>"
+        f"<div class='metric-value'>{html.escape(str(value))}{delta}</div>"
+        f"<div class='metric-label'>{html.escape(label)}{hint_html}</div>"
         "</div>"
+    )
+
+
+def _render_delta(current, previous, *, good_when: str = "up") -> str:
+    """环比上一窗口的小箭头。previous 为 None/0/非数值时返回空串——0 做分母
+    没有意义，而"没有上一窗口数据"不该渲染成 0% 假环比。good_when 指定方向
+    语义：'up' 涨是好事、'down' 跌是好事、'neutral' 无好坏（如 token 总量，
+    烧多烧少取决于业务，不预设立场）。"""
+    try:
+        prev = float(previous)
+        cur = float(current)
+    except (TypeError, ValueError):
+        return ""
+    if prev == 0:
+        return ""
+    pct = (cur - prev) / abs(prev) * 100
+    # 极端环比显示成倍数上限：上一窗口基数很小时，「▲ +7999900%」没人能
+    # 读，也会把整行挤爆。10 倍以上 / 0.1 倍以下只标方向和量级，中间照旧。
+    # 只对正基数做倍数换算——prev < 0 时 ratio 的正负号语义会翻转。
+    ratio = cur / prev if prev > 0 else None
+    if ratio is not None and ratio >= 10:
+        arrow = "▲ "
+        magnitude = "≥10×"
+    elif ratio is not None and ratio <= 0.1:
+        arrow = "▼ "
+        magnitude = "≤0.1×"
+    elif pct > 0:
+        arrow = "▲ +"
+        magnitude = f"{pct:.0f}%" if pct >= 9.95 else f"{pct:.1f}%"
+    elif pct < 0:
+        arrow = "▼ −"
+        magnitude = f"{-pct:.0f}%" if -pct >= 9.95 else f"{-pct:.1f}%"
+    else:
+        arrow = "±"
+        magnitude = "0%"
+    if good_when == "neutral" or pct == 0:
+        cls = "neutral"
+    elif good_when == "down":
+        cls = "good" if pct < 0 else "bad"
+    else:
+        cls = "good" if pct > 0 else "bad"
+    return (
+        f"<span class='delta {cls}' title='对比上一个同长度窗口'>"
+        f"{arrow}{magnitude}</span>"
     )
 
 
@@ -3048,10 +3099,21 @@ def _render_runtime_user_report(user_report: dict | None) -> str:
 </section>"""
 
 
+# 视图切换 nav 的分组样式。nav 由 _render_data_track_view_nav 渲染进所有
+# 视图页，但各页 <style> 各自独立，所以这两条规则必须出现在**每个**渲染
+# nav 的页面里——只放进 _RUNTIME_PAGE_CSS 会让 users / dau / growth /
+# proactive / events / debug 的分组间距和标签样式整体失效。
+# 普通字符串（非 f-string）；嵌进 f-string 模板时作为值插入，花括号安全。
+_NAV_GROUP_CSS = """
+    .nav-group { display:inline-flex; flex-wrap:wrap; align-items:center; gap:8px; margin-right:6px; }
+    .nav-group-label { color:var(--muted); font-size:11px; font-weight:700; letter-spacing:.06em; }
+"""
+
+
 # Runtime 视图共用这一份样式；其余视图仍保留各自布局，但统一使用同一组
 # sage / paper 基础色，避免红色同时表示“当前选中”和“故障”。
 # 普通字符串（非 f-string），花括号无需转义。
-_RUNTIME_PAGE_CSS = """
+_RUNTIME_PAGE_CSS = _NAV_GROUP_CSS + """
     :root { color-scheme: light; --fg:#1b201d; --muted:#68706a; --line:#dddcd4; --bg:#f5f4ef; --card:#fcfbf8; --accent:#416b56; --ok:#1d7a4d; --warn:#a05a00; --bad:#b7352b; }
     body { margin:0; background:var(--bg); color:var(--fg); font:14px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; }
     main { max-width:1280px; margin:0 auto; padding:28px 24px 48px; }
@@ -3079,6 +3141,15 @@ _RUNTIME_PAGE_CSS = """
     .pill.ok { color:var(--ok); background:#e7f3ed; }
     .pill.warn { color:var(--warn); background:#fff1db; }
     .pill.bad { color:var(--bad); background:#fff1ed; }
+    .pill.unknown { color:var(--muted); background:#ecebe3; border:1px solid var(--line); }
+    .hint { display:inline-block; margin-left:5px; width:14px; height:14px; line-height:14px; text-align:center; border:1px solid var(--line); border-radius:999px; background:var(--card); color:var(--muted); font-size:10px; text-transform:none; letter-spacing:0; cursor:help; }
+    .delta { margin-left:7px; font-size:12px; font-weight:700; letter-spacing:0; vertical-align:2px; white-space:nowrap; }
+    .delta.good { color:var(--ok); }
+    .delta.bad { color:var(--bad); }
+    .delta.neutral { color:var(--muted); }
+    .h2-sub { color:var(--muted); font-size:12px; font-weight:400; margin-left:6px; }
+    details.note-box summary { cursor:pointer; font-weight:700; color:#7a6a52; }
+    details.note-box[open] summary { margin-bottom:8px; }
     .health-strip { display:grid; grid-template-columns:repeat(3,1fr); gap:10px; margin:18px 0 8px; }
     .health-dimension { min-width:0; padding:15px; background:var(--card); border:1px solid var(--line); border-radius:8px; }
     .health-dimension.warn { background:#fff9ed; border-color:#ead7ad; }
@@ -3096,10 +3167,15 @@ _RUNTIME_PAGE_CSS = """
     .question-card.ok { border-top-color:var(--ok); background:#f7fbf8; }
     .question-card.warn { border-top-color:var(--warn); background:#fffaf1; }
     .question-card.bad { border-top-color:var(--bad); background:#fff5f2; }
+    .question-card.unknown { border-top-color:#c9c7bb; background:#f6f5f0; }
+    .question-card .question-link { display:block; color:inherit; text-decoration:none; }
     .question-top { display:flex; align-items:flex-start; justify-content:space-between; gap:10px; }
     .question-title { margin:0; color:var(--fg); font-size:14px; font-weight:780; }
     .question-value { margin:16px 0 4px; color:var(--fg); font-size:28px; line-height:1; font-weight:780; font-variant-numeric:tabular-nums; }
+    .question-fraction { margin:0 0 6px; color:var(--muted); font-size:12px; line-height:1.5; font-variant-numeric:tabular-nums; }
     .question-evidence { min-height:38px; color:var(--muted); font-size:12px; line-height:1.5; }
+    .question-drill { margin-top:10px; color:var(--accent); font-size:12px; font-weight:650; }
+    .question-card .question-link:hover .question-drill { text-decoration:underline; }
     .funnel-line { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:1px; overflow:hidden; margin:15px 0; border:1px solid var(--line); border-radius:9px; background:var(--line); }
     .funnel-step { background:var(--card); padding:14px; }
     .funnel-step b { display:block; margin:4px 0; font-size:24px; font-variant-numeric:tabular-nums; }
@@ -3577,21 +3653,24 @@ def _ops_window_links(active: str, hours: int) -> str:
 
 
 def _ops_status(level: str) -> str:
-    labels = {"ok": "正常", "warn": "证据不足 / 注意", "bad": "异常"}
+    # unknown 是一等档位：纯"没证据"（查询失败、窗口无样本、缺 p95）显灰，
+    # 与"有证据且测出问题"的黄/红分开——否则读者无法区分"该去修"和"该去补数据"。
+    labels = {"ok": "正常", "warn": "注意", "bad": "异常", "unknown": "证据不足"}
     normalized = level if level in labels else "warn"
     return f"<span class='pill {normalized}'>{labels[normalized]}</span>"
 
 
 def _ops_import_level(report: dict | None) -> tuple[str, list[str]]:
+    # 纯无证据（查询失败 / 窗口无样本）→ unknown；测得的边缘值才是 warn。
     if report is None:
-        return "warn", ["导入统计暂不可用"]
+        return "unknown", ["导入统计暂不可用"]
     started = int(report.get("started") or 0)
     completed = int(report.get("completed") or 0)
     failed = int(report.get("failed") or 0)
     stuck = int(report.get("stuck_over_15m") or 0)
     unverified = int(report.get("completed_unverified") or 0)
     if started == 0:
-        return "warn", ["窗口内没有导入样本"]
+        return "unknown", ["窗口内没有导入样本"]
     reasons: list[str] = []
     level = "ok"
     terminal = completed + failed
@@ -3615,14 +3694,17 @@ def _ops_import_level(report: dict | None) -> tuple[str, list[str]]:
 
 def _ops_chat_level(report: dict | None) -> tuple[str, list[str]]:
     if report is None:
-        return "warn", ["聊天统计暂不可用"]
+        return "unknown", ["聊天统计暂不可用"]
     outcomes = report.get("outcomes") or {}
     delivery = report.get("reply_delivery") or {}
     settled = int(report.get("settled_jobs") or 0)
     failed = int(outcomes.get("failed") or 0) + int(outcomes.get("expired") or 0)
     reasons: list[str] = []
-    level = "warn"  # Device receive/read ACK does not exist; never claim green.
+    # 有样本时基线是 warn 而非 unknown：客户端 ACK 结构性缺失，证据永远不闭环，
+    # 这是"测了但测不全"，不是"没测"。Never claim green.
+    level = "warn"
     if settled == 0:
+        level = "unknown"
         reasons.append("窗口内没有已结算 chat 样本")
     else:
         failure_rate = float(failed) / float(settled)
@@ -3645,10 +3727,10 @@ def _ops_chat_level(report: dict | None) -> tuple[str, list[str]]:
 
 def _ops_latency_level(report: dict | None) -> tuple[str, list[str]]:
     if report is None:
-        return "warn", ["延迟统计暂不可用"]
+        return "unknown", ["延迟统计暂不可用"]
     value = (report.get("latency") or {}).get("server_applied_p95_sec")
     if value is None:
-        return "warn", ["缺少发送到服务端 reply applied 的 p95 样本"]
+        return "unknown", ["缺少发送到服务端 reply applied 的 p95 样本"]
     seconds = float(value)
     if seconds >= 120:
         return "bad", [f"服务端交付 p95 {seconds:.0f}s"]
@@ -3686,12 +3768,18 @@ def _render_ops_overview_page(
     product: dict | None = None,
     usage: dict | None = None,
     *,
+    prev_product: dict | None = None,
+    prev_usage: dict | None = None,
     within_hours: int,
 ) -> str:
+    # prev_product / prev_usage 是**紧邻的上一个同长度窗口**的同构 payload，
+    # 只用来算环比箭头；admin_core 未传（旧签名）或取不到时为 None，
+    # _render_delta 对 None 返回空串，页面照常渲染。
     import_level, import_reasons = _ops_import_level(imports)
     chat_level, chat_reasons = _ops_chat_level(chat)
     latency_level, latency_reasons = _ops_latency_level(chat)
 
+    started = int((imports or {}).get("started") or 0)
     completed = int((imports or {}).get("completed") or 0)
     verified = int((imports or {}).get("artifact_verified") or 0)
     admitted = int(((chat or {}).get("outcomes") or {}).get("admitted") or 0)
@@ -3742,62 +3830,143 @@ def _render_ops_overview_page(
         usage_total.get("tokens_per_active_user_day") if usage_known else None
     )
 
+    prev_prod = prev_product or {}
+    prev_total = (prev_usage or {}).get("total") or {}
+    prev_model_calls = prev_total.get("model_calls")
+    prev_retries = prev_total.get("retries")
+    prev_retry_rate = (
+        float(prev_retries) / float(prev_model_calls)
+        if prev_retries is not None and prev_model_calls
+        else None
+    )
+
     def evidence(items: list[str]) -> str:
         return "；".join(html.escape(item) for item in items) or "当前证据通过"
 
+    def card(
+        *,
+        level: str,
+        title: str,
+        view: str,
+        value: str,
+        fraction_html: str,
+        evidence_html: str,
+    ) -> str:
+        # 整卡是一个到明细页的链接；href 走既有 helper，admin_key / hours
+        # 自动随 query 传播，本页不消费的共享参数照 _ops_window_links 清掉。
+        # fraction_html / evidence_html 是本函数内拼好的受信 HTML（其中的
+        # 动态值都已经过 _fmt_* / evidence() 的转义）。
+        href = _data_track_page_href(
+            view=view, hours=within_hours, user_id=None, **_RUNTIME_IGNORED_PARAMS
+        )
+        return (
+            f"<article class='question-card {level}'>"
+            f"<a class='question-link' href='{html.escape(href, quote=True)}'>"
+            f"<div class='question-top'><h2 class='question-title'>{html.escape(title)}</h2>{_ops_status(level)}</div>"
+            f"<div class='question-value'>{html.escape(value)}</div>"
+            f"<div class='question-fraction'>{fraction_html}</div>"
+            f"<div class='question-evidence'>{evidence_html}</div>"
+            "<div class='question-drill'>查看明细 →</div>"
+            "</a></article>"
+        )
+
+    # 大字标率、分数降级为小字：读者不用心算 41/69 是多少。分母为 0 时显
+    # 「无样本」而不是 0%——0% 是测出来的坏消息，无样本是没消息。
+    # 导入卡的样本门槛跟 _ops_import_level 用同一把尺：started == 0 才是
+    # 「无样本」；有 started 但 completed == 0（全部失败/卡住）是测出来的
+    # 0.0%，必须照实渲染成坏消息，不许显示成没消息。
+    import_rate = (
+        float(verified) / float(completed) if completed
+        else (0.0 if started else None)
+    )
+    chat_rate = float(applied) / float(admitted) if admitted else None
+    cards = "".join([
+        card(
+            level=import_level,
+            title="用户导入成功了吗？",
+            view="imports",
+            value=_fmt_ratio(import_rate) if started else "无样本",
+            fraction_html=(
+                f"{_fmt_count(verified)} / {_fmt_count(completed)}"
+                " · artifact 证据通过 / terminal completed"
+            ),
+            evidence_html=evidence(import_reasons),
+        ),
+        card(
+            level=chat_level,
+            title="用户真的收到回复了吗？",
+            view="chat",
+            value=_fmt_ratio(chat_rate) if admitted else "无样本",
+            fraction_html=(
+                f"{_fmt_count(applied)} / {_fmt_count(admitted)}"
+                " · 服务端 final reply applied / admitted Runtime turns"
+            ),
+            evidence_html=(
+                "客户端接收或已读 ACK：<b>不可用</b>。" + evidence(chat_reasons)
+            ),
+        ),
+        card(
+            level=latency_level,
+            title="回复有多慢？",
+            view="latency",
+            value=_fmt_duration_sec(p95),
+            fraction_html="发送到 final reply 服务端 applied 的 p95",
+            evidence_html=evidence(latency_reasons),
+        ),
+        card(
+            # 测到重复候选就是证据，必须转黄并把数字放进大字——灰色「不可
+            # 判定」只留给真的一个候选都没测到的窗口；provider 侧是否真扣
+            # 了两次费仍不可判定，这句诚实话保留在证据行里。
+            level="warn" if duplicate_effects else "unknown",
+            title="有重复调用或重复费用吗？",
+            view="chat",
+            value=(
+                f"重复候选 {_fmt_count(duplicate_effects)}"
+                if duplicate_effects else "不可判定"
+            ),
+            fraction_html=(
+                f"final reply effect 重复候选 {_fmt_count(duplicate_effects)} 个 job"
+                + (" · provider 扣费不可判定" if duplicate_effects else "")
+            ),
+            evidence_html=(
+                "这<b>不等于</b> provider 重复扣费。真实 provider attempt / "
+                "possibly-billed / authoritative cost 要等 P0-B 账本。"
+            ),
+        ),
+    ])
+
     body = f"""
-    <section class="ops-questions" aria-label="运营核心问题">
-      <article class="question-card {import_level}">
-        <div class="question-top"><h2 class="question-title">用户导入成功了吗？</h2>{_ops_status(import_level)}</div>
-        <div class="question-value">{_fmt_count(verified)} / {_fmt_count(completed)}</div>
-        <div class="question-evidence">artifact 证据通过 / terminal completed。{evidence(import_reasons)}</div>
-      </article>
-      <article class="question-card {chat_level}">
-        <div class="question-top"><h2 class="question-title">用户真的收到回复了吗？</h2>{_ops_status(chat_level)}</div>
-        <div class="question-value">{_fmt_count(applied)} / {_fmt_count(admitted)}</div>
-        <div class="question-evidence">服务端 final reply applied / admitted Runtime turns。客户端接收或已读 ACK：<b>不可用</b>。{evidence(chat_reasons)}</div>
-      </article>
-      <article class="question-card {latency_level}">
-        <div class="question-top"><h2 class="question-title">回复有多慢？</h2>{_ops_status(latency_level)}</div>
-        <div class="question-value">{_fmt_duration_sec(p95)}</div>
-        <div class="question-evidence">发送到 final reply 服务端 applied 的 p95。{evidence(latency_reasons)}</div>
-      </article>
-      <article class="question-card warn">
-        <div class="question-top"><h2 class="question-title">有重复调用或重复费用吗？</h2>{_ops_status('warn')}</div>
-        <div class="question-value">不可判定</div>
-        <div class="question-evidence">final reply effect 重复候选 {_fmt_count(duplicate_effects)} 个 job；这<b>不等于</b> provider 重复扣费。真实 provider attempt / possibly-billed / authoritative cost 要等 P0-B 账本。</div>
-      </article>
-    </section>
-    <div class="definition-line">四张卡只在证据真的闭环时变绿。当前客户端 ACK 与 provider 请求账本尚未闭环，所以不会用 0 或绿色冒充“确认没有问题”。</div>
-    <h2>产品活跃与 Onboarding</h2>
+    <section class="ops-questions" aria-label="运营核心问题">{cards}</section>
+    <div class="definition-line">四张卡的颜色：<b class="ok">绿</b>=证据闭环且正常；<b class="warn">黄</b>=有证据且需注意，或证据结构不完整（如缺客户端 ACK）；<b class="muted">灰</b>=证据不足、不可判定；<b class="bad">红</b>=异常。当前客户端 ACK 与 provider 请求账本尚未闭环，所以不会用 0 或绿色冒充“确认没有问题”。</div>
+    <h2>产品还有人用吗？ <span class="h2-sub">产品活跃与 Onboarding</span></h2>
     <section class="metrics">
-      {_render_metric('窗口内 App 活跃账号', _fmt_count((product or {}).get('window_app_users') if product is not None else None))}
-      {_render_metric('App sessions', _fmt_count((product or {}).get('app_sessions') if product is not None else None))}
-      {_render_metric('窗口新注册账号', _fmt_count((product or {}).get('new_registered_accounts') if product is not None else None))}
-      {_render_metric(onboarding_label, onboarding_value)}
+      {_render_metric('窗口内 App 活跃账号', _fmt_count((product or {}).get('window_app_users')), hint='窗口内至少上报一次 app_session_end 的去重账号，保守下限', delta=_render_delta((product or {}).get('window_app_users'), prev_prod.get('window_app_users')))}
+      {_render_metric('App sessions', _fmt_count((product or {}).get('app_sessions')), hint='窗口内 app_session_end 事件条数', delta=_render_delta((product or {}).get('app_sessions'), prev_prod.get('app_sessions')))}
+      {_render_metric('窗口新注册账号', _fmt_count((product or {}).get('new_registered_accounts')), hint='窗口内注册且注册时间可安全解析的账号数', delta=_render_delta((product or {}).get('new_registered_accounts'), prev_prod.get('new_registered_accounts')))}
+      {_render_metric(onboarding_label, onboarding_value, hint='窗口注册 cohort 截至本页生成时已产生首次非 fallback 真回复的比例；不同窗口的 cohort 不可比，不做环比')}
     </section>
-    <div class="note-box"><b>产品口径：</b>“窗口内 App 活跃账号”是所选滚动窗口内至少上报一次 <code>app_session_end</code> 的去重账号。iOS 前台 session 可能被系统杀掉而漏报，所以这是保守下限；24 小时档也不是北京自然日 DAU，7 天和 30 天更不是把每日 DAU 相加。自然日趋势看「DAU」。Onboarding 分母只取同一窗口内注册且时间可安全解析的账号，完成定义为截至本页生成时已产生首次非 fallback 真回复。{'<b>当前 cohort 事件覆盖不完整，因此完成率显示未知。</b>' if not onboarding_covered else ''}</div>
-    <h2>Hosted V2 模型用量</h2>
+    <details class="note-box"><summary>口径说明</summary><b>产品口径：</b>“窗口内 App 活跃账号”是所选滚动窗口内至少上报一次 <code>app_session_end</code> 的去重账号。iOS 前台 session 可能被系统杀掉而漏报，所以这是保守下限；24 小时档也不是北京自然日 DAU，7 天和 30 天更不是把每日 DAU 相加。自然日趋势看「DAU」。Onboarding 分母只取同一窗口内注册且时间可安全解析的账号，完成定义为截至本页生成时已产生首次非 fallback 真回复。{'<b>当前 cohort 事件覆盖不完整，因此完成率显示未知。</b>' if not onboarding_covered else ''}</details>
+    <h2>Hosted V2 在烧多少 Token？ <span class="h2-sub">Hosted V2 模型用量</span></h2>
     <section class="metrics">
-      {_render_metric('V2 模型活跃账号', _fmt_count(model_active_users))}
-      {_render_metric('V2 模型活跃用户日', _fmt_count(active_user_days))}
-      {_render_metric('V2 turns', _fmt_count(usage_total.get('turns') if usage_known else None))}
-      {_render_metric('模型调用', _fmt_count(model_calls))}
-      {_render_metric('重试 / 调用', f"{_fmt_count(retries)} / {_fmt_ratio(retry_rate)}")}
-      {_render_metric('窗口 Token 总量（已知下限）', _fmt_tokens_compact(known_tokens))}
-      {_render_metric('平均每个 V2 活跃用户日 Token', _fmt_tokens_compact(round(tokens_per_active_user_day) if tokens_per_active_user_day is not None else None))}
-      {_render_metric('Token usage 覆盖率', _fmt_ratio(usage_total.get('usage_coverage') if usage_known else None))}
+      {_render_metric('V2 模型活跃账号', _fmt_count(model_active_users), hint='v2_turn_metrics 中实际发生过模型调用的去重 user_id', delta=_render_delta(model_active_users, prev_total.get('model_active_users')))}
+      {_render_metric('V2 模型活跃用户日', _fmt_count(active_user_days), hint='按北京时间把 user_id × 日期去重', delta=_render_delta(active_user_days, prev_total.get('active_user_days')))}
+      {_render_metric('V2 turns', _fmt_count(usage_total.get('turns') if usage_known else None), hint='窗口内 Hosted V2 会话回合数', delta=_render_delta(usage_total.get('turns') if usage_known else None, prev_total.get('turns')))}
+      {_render_metric('模型调用', _fmt_count(model_calls), hint='provider 模型调用次数，含重试', delta=_render_delta(model_calls, prev_model_calls, good_when='neutral'))}
+      {_render_metric('重试 / 调用', f"{_fmt_count(retries)} / {_fmt_ratio(retry_rate)}", hint='重试次数与重试占调用比；重试同样烧钱', delta=_render_delta(retry_rate, prev_retry_rate, good_when='down'))}
+      {_render_metric('窗口 Token 总量（已知下限）', _fmt_tokens_compact(known_tokens), hint='provider 已上报 usage 的 token 合计，缺报只降覆盖率、不伪装成 0', delta=_render_delta(known_tokens, prev_total.get('total_tokens'), good_when='neutral'))}
+      {_render_metric('平均每个 V2 活跃用户日 Token', _fmt_tokens_compact(round(tokens_per_active_user_day) if tokens_per_active_user_day is not None else None), hint='已知 Token ÷ V2 活跃用户日，不是全产品人均', delta=_render_delta(tokens_per_active_user_day, prev_total.get('tokens_per_active_user_day'), good_when='neutral'))}
+      {_render_metric('Token usage 覆盖率', _fmt_ratio(usage_total.get('usage_coverage') if usage_known else None), hint='有 usage 上报的模型调用占比')}
     </section>
-    <div class="note-box"><b>V2 口径：</b>模型活跃账号来自本实例 <code>v2_turn_metrics</code> 中实际发生过模型调用的去重 user_id；活跃用户日按北京时间把 user_id × 日期去重，和上面的产品 App 活跃账号不是同一分母。Token 是 provider 已上报 usage 的已知下限，缺报会降低覆盖率，不会被伪装成 0；“平均每个活跃用户日 Token”是 Hosted V2 模型活跃口径，不能冒充全产品 App DAU 的人均用量。离线 self-host 与非 V2 路径不在这组数里。</div>
-    <h2>当前承载</h2>
+    <details class="note-box"><summary>口径说明</summary><b>V2 口径：</b>模型活跃账号来自本实例 <code>v2_turn_metrics</code> 中实际发生过模型调用的去重 user_id；活跃用户日按北京时间把 user_id × 日期去重，和上面的产品 App 活跃账号不是同一分母。Token 是 provider 已上报 usage 的已知下限，缺报会降低覆盖率，不会被伪装成 0；“平均每个活跃用户日 Token”是 Hosted V2 模型活跃口径，不能冒充全产品 App DAU 的人均用量。离线 self-host 与非 V2 路径不在这组数里。</details>
+    <h2>当前承载扛得住吗？ <span class="h2-sub">当前承载</span></h2>
     <section class="metrics">
-      {_render_metric('存活 worker', _fmt_count(live_workers))}
-      {_render_metric('可执行容量', _fmt_count(capacity))}
-      {_render_metric('在飞 job', _fmt_count(pool.get('inflight') if runtime is not None else None))}
-      {_render_metric('排队 pending', _fmt_count(pool.get('pending') if runtime is not None else None))}
-      {_render_metric('最老 pending', _fmt_duration_sec(pool.get('oldest_pending_age_sec') if runtime is not None else None))}
+      {_render_metric('存活 worker', _fmt_count(live_workers), hint='当前心跳存活的 runtime worker 数；此刻状态，不随窗口变化')}
+      {_render_metric('可执行容量', _fmt_count(capacity), hint='worker 并发可执行槽位合计')}
+      {_render_metric('在飞 job', _fmt_count(pool.get('inflight') if runtime is not None else None), hint='此刻正在执行的 job 数')}
+      {_render_metric('排队 pending', _fmt_count(pool.get('pending') if runtime is not None else None), hint='此刻排队待执行的 job 数')}
+      {_render_metric('最老 pending', _fmt_duration_sec(pool.get('oldest_pending_age_sec') if runtime is not None else None), hint='最老排队 job 已等待的时长；健康时为空')}
     </section>
-    <div class="note-box"><b>下一步看哪里：</b>导入证据与卡住任务看「记忆导入」；消息→Runtime→reply effect 看「聊天可靠性」；排队/执行/服务端交付分段看「延迟」；Token、provider、model 与重试看「Token 与模型」。本总览只覆盖本实例 Hosted Runtime V2 与 Genesis ledger，不代表离线 self-host 全量。</div>
+    <details class="note-box"><summary>下一步看哪里</summary><b>下一步看哪里：</b>导入证据与卡住任务看「记忆导入」；消息→Runtime→reply effect 看「聊天可靠性」；排队/执行/服务端交付分段看「延迟」；Token、provider、model 与重试看「Token 与模型」。本总览只覆盖本实例 Hosted Runtime V2 与 Genesis ledger，不代表离线 self-host 全量。</details>
     """
     return _ops_page(
         active="overview",
@@ -4972,21 +5141,42 @@ def _render_data_track_view_nav(
             f"{current}>{html.escape(label)}</a>"
         )
 
+    def nav_group(label: str, items: str) -> str:
+        return (
+            "<span class='nav-group'>"
+            f"<span class='nav-group-label'>{html.escape(label)}</span>{items}"
+            "</span>"
+        )
+
+    # 12 个平铺 tab 按值班意图分三簇；active 高亮逻辑在 nav_item 里，不受
+    # 分组影响，所有渲染此 nav 的视图行为一致。
     return (
         "<nav class='viewbar' aria-label='Data Track views'>"
-        f"{nav_item('overview', '总览')}"
-        f"{nav_item('imports', '记忆导入')}"
-        f"{nav_item('chat', '聊天可靠性')}"
-        f"{nav_item('latency', '延迟')}"
-        f"{nav_item('users', '用户')}"
-        f"{nav_item('dau', '日活与时长')}"
-        f"{nav_item('growth', '增长 & 留存')}"
-        f"{nav_item('proactive', '主动任务')}"
-        f"{nav_item('events', '事件采集')}"
-        f"{nav_item('runtime', '运行状态')}"
-        f"{nav_item('usage', 'Token 与模型')}"
-        f"{nav_item('debug', '调试')}"
-        "</nav>"
+        + nav_group(
+            "质量",
+            nav_item("overview", "总览")
+            + nav_item("imports", "记忆导入")
+            + nav_item("chat", "聊天可靠性")
+            + nav_item("latency", "延迟"),
+        )
+        + nav_group(
+            "增长",
+            nav_item("users", "用户")
+            + nav_item("dau", "日活与时长")
+            + nav_item("growth", "增长 & 留存")
+            # health 是固定周口径页，故意不进 hours/day 参数携带集合——带上
+            # 只会让 URL 看起来被过滤而页面根本不消费。
+            + nav_item("health", "产品健康")
+            + nav_item("proactive", "主动任务"),
+        )
+        + nav_group(
+            "系统",
+            nav_item("events", "事件采集")
+            + nav_item("runtime", "运行状态")
+            + nav_item("usage", "Token 与模型")
+            + nav_item("debug", "调试"),
+        )
+        + "</nav>"
     )
 
 
@@ -5229,6 +5419,7 @@ def _render_data_track_page(payload: dict) -> str:
     .pill.warn {{ color:var(--warn); background:#fff1db; }}
     pre {{ white-space:pre-wrap; word-break:break-word; background:var(--card); border:1px solid var(--line); border-radius:8px; padding:14px; }}
     .table-wrap {{ max-width:100%; overflow-x:auto; }}
+{_NAV_GROUP_CSS}
   </style>
 </head>
 <body>
@@ -5439,6 +5630,7 @@ def _render_data_track_dau_page(payload: dict) -> str:
     th {{ font-size:12px; color:var(--muted); text-transform:uppercase; letter-spacing:.06em; background:#f4ece5; }}
     tr:last-child td {{ border-bottom:0; }}
     a {{ color:var(--accent); text-decoration:none; }}
+{_NAV_GROUP_CSS}
   </style>
 </head>
 <body>
@@ -5517,7 +5709,7 @@ def _data_track_growth_payload() -> dict:
     }
 
 
-_GROWTH_STYLE = """
+_GROWTH_STYLE = _NAV_GROUP_CSS + """
     :root { color-scheme: light; --fg:#1b201d; --muted:#68706a; --line:#dddcd4; --bg:#f5f4ef; --card:#fcfbf8; --accent:#416b56; }
     body { margin:0; background:var(--bg); color:var(--fg); font:14px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; }
     main { max-width:1280px; margin:0 auto; padding:28px 24px 48px; }
@@ -5798,6 +5990,491 @@ def _render_data_track_growth_page(payload: dict) -> str:
 </html>"""
 
 
+# ---- 产品健康（?view=health）· 固定周口径，无 hours 窗口 --------------------
+
+# _RUNTIME_PAGE_CSS 没有 h3 规则，浏览器默认 h3 比本页 16px 的 h2 还大，
+# 层级会倒挂；只在本页补一条，不动共享样式。
+_HEALTH_PAGE_CSS = _RUNTIME_PAGE_CSS + """
+    h3 { font-size:14px; margin:20px 0 10px; }
+"""
+
+# 任一 builder 失败即整段坍缩成这一行——绝不把「查不到」渲染成 0。
+_HEALTH_UNAVAILABLE = (
+    "<div class='note-box'>统计暂不可用。页面不会把未知渲染成 0。</div>"
+)
+
+
+def _health_bj_this_monday() -> str:
+    """当前北京自然周的周一（ISO）。进行中的周在多处需要右删失处理。"""
+    today = datetime.now(ZoneInfo("Asia/Shanghai")).date()
+    return (today - timedelta(days=today.weekday())).isoformat()
+
+
+def _health_t3_matured(cohort_week: str) -> bool:
+    """注册周的 t3 激活窗是否已全部走完（注册周 7 天 + 3 天 t3 窗）。
+
+    coverage_complete 只说明漏斗行数对得上，不代表窗口走完；没成熟的周
+    t3 率是右删失下限，当定论展示就是把「还没来得及」渲染成 0%。
+    """
+    try:
+        week = date.fromisoformat(str(cohort_week))
+    except (TypeError, ValueError):
+        return False
+    today = datetime.now(ZoneInfo("Asia/Shanghai")).date()
+    return week + timedelta(days=10) <= today
+
+
+def _health_signed(value) -> str:
+    """净变化带符号显示；None（基线周判不了）→ —，与真实 0 区分。"""
+    if value is None:
+        return "—"
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        return "—"
+    return f"+{n:,}" if n > 0 else f"{n:,}"
+
+
+def _health_cohort_table(retention: dict | None) -> str:
+    if retention is None:
+        return _HEALTH_UNAVAILABLE
+    periods = [int(p) for p in (retention.get("periods") or [1, 2, 4, 8])]
+    head = "".join(f"<th>W{p}</th>" for p in periods)
+    rows = []
+    for c in retention.get("cohorts", []):
+        n = c.get("n")
+        cells = []
+        for p in periods:
+            cell = (c.get("cells") or {}).get(p)
+            pct = cell.get("pct") if isinstance(cell, dict) else None
+            if pct is None:
+                # 未成熟（cohort 距今不满 p 周）不是 0，判不了就是判不了。
+                cells.append("<td class='muted' title='cohort 尚未满该周数，未成熟'>—</td>")
+            else:
+                pct = float(pct)
+                cells.append(
+                    f"<td style='{_retention_cell_bg(pct)}'"
+                    f" title='{_fmt_count(cell.get('active'))}/{_fmt_count(n)} 活跃'>"
+                    f"{pct:.0f}%</td>"
+                )
+        rows.append(
+            f"<tr><td>{html.escape(str(c.get('cohort_week') or ''))}"
+            f"（n={_fmt_count(n)}）</td>{''.join(cells)}</tr>"
+        )
+    if not rows:
+        rows.append(
+            f"<tr><td colspan='{1 + len(periods)}' class='muted'>暂无注册周 cohort</td></tr>"
+        )
+    return (
+        "<div class='table-wrap'><table>"
+        f"<thead><tr><th>注册周（周一）</th>{head}</tr></thead>"
+        f"<tbody>{''.join(rows)}</tbody></table></div>"
+    )
+
+
+def _health_l_table(stickiness: dict | None) -> str:
+    if stickiness is None:
+        return _HEALTH_UNAVAILABLE
+    ld = stickiness.get("l_distribution") or {}
+    head = "".join(f"<th>L{k}</th>" for k in range(1, 8))
+    cells = "".join(f"<td>{_fmt_count(ld.get(k))}</td>" for k in range(1, 8))
+    return (
+        "<div class='table-wrap'><table>"
+        f"<thead><tr><th>近 7 完整日活跃天数</th>{head}</tr></thead>"
+        f"<tbody><tr><td class='muted'>用户数</td>{cells}</tr></tbody></table></div>"
+    )
+
+
+def _health_growth_table(growth: dict | None) -> str:
+    if growth is None:
+        return _HEALTH_UNAVAILABLE
+    this_monday = _health_bj_this_monday()
+    rows = []
+    for r in growth.get("rows", []):
+        week = str(r.get("week") or "")
+        # 进行中的本周要标出来：builder 已把流失/回流/净变化发成 None（→ —），
+        # 但不标注的话读者会把「—」误读成没数据而不是没走完。
+        tag = (
+            "<span class='muted' title='本周未走完，流失/回流/净变化不可判定'>"
+            "（进行中）</span>"
+            if week == this_monday else ""
+        )
+        rows.append(
+            "<tr>"
+            f"<td>{html.escape(week)}{tag}</td>"
+            f"<td>{_fmt_count(r.get('new_registered'))}</td>"
+            f"<td>{_fmt_count(r.get('newly_activated'))}</td>"
+            f"<td>{_fmt_count(r.get('active'))}</td>"
+            f"<td>{_fmt_count(r.get('churned'))}</td>"
+            f"<td>{_fmt_count(r.get('resurrected'))}</td>"
+            f"<td>{_health_signed(r.get('net_change'))}</td>"
+            "</tr>"
+        )
+    if not rows:
+        rows.append("<tr><td colspan='7' class='muted'>暂无足够周数做增长核算</td></tr>")
+    return (
+        "<div class='table-wrap'><table>"
+        "<thead><tr><th>周（周一）</th><th>新注册</th><th>新激活</th><th>活跃</th>"
+        "<th>流失</th><th>回流</th><th>净变化</th></tr></thead>"
+        f"<tbody>{''.join(rows)}</tbody></table></div>"
+    )
+
+
+def _health_activation_table(activation: dict | None) -> str:
+    if activation is None:
+        return _HEALTH_UNAVAILABLE
+
+    def pct_cell(count, n) -> str:
+        try:
+            c, total = int(count), int(n)
+        except (TypeError, ValueError):
+            return "<td class='muted'>—</td>"
+        if total <= 0:
+            return "<td class='muted'>—</td>"
+        return f"<td>{c / total * 100:.0f}%（{c:,}）</td>"
+
+    unknown = "<td class='muted' title='cohort 事件覆盖不完整，判不了'>未知</td>"
+    immature = (
+        "<td class='muted' title='注册周 + 3 天 t3 窗尚未走完，右删失，判不了'>"
+        "未成熟</td>"
+    )
+    rows = []
+    for c in activation.get("cohorts", []):
+        week = html.escape(str(c.get("cohort_week") or ""))
+        n = _fmt_count(c.get("n"))
+        if not c.get("coverage_complete"):
+            # 覆盖不完整的周渲染「未知」而不是 0%——缺证据 ≠ 没激活。
+            rows.append(f"<tr><td>{week}</td><td>{n}</td>{unknown * 4}</tr>")
+            continue
+        if not _health_t3_matured(c.get("cohort_week")):
+            # 窗口没走完的周（本周/上周）渲染「未成熟」——注册 3 天内还没
+            # 回复 ≠ 不会回复，确定性的 0% 是编出来的悲观。
+            rows.append(f"<tr><td>{week}</td><td>{n}</td>{immature * 4}</tr>")
+            continue
+        median_h = c.get("median_t0_t3_hours")
+        median = _funnel_dur(median_h * 3600 if median_h is not None else None)
+        rows.append(
+            f"<tr><td>{week}</td><td>{n}</td>"
+            f"{pct_cell(c.get('t1'), c.get('n'))}"
+            f"{pct_cell(c.get('t2'), c.get('n'))}"
+            f"{pct_cell(c.get('t3'), c.get('n'))}"
+            f"<td>{median}</td></tr>"
+        )
+    if not rows:
+        rows.append("<tr><td colspan='6' class='muted'>暂无注册周 cohort</td></tr>")
+    return (
+        "<div class='table-wrap'><table>"
+        "<thead><tr><th>注册周（周一）</th><th>n</th><th>t1 内激活</th>"
+        "<th>t2 内激活</th><th>t3 内激活</th><th>中位 t0→t3</th></tr></thead>"
+        f"<tbody>{''.join(rows)}</tbody></table></div>"
+    )
+
+
+def _health_w4_split_table(w4_split: dict | None) -> str:
+    if w4_split is None:
+        return _HEALTH_UNAVAILABLE
+
+    def rate_cell(rate, active) -> str:
+        if rate is None:
+            return "<td class='muted'>—</td>"
+        return f"<td>{_fmt_ratio(rate)}（{_fmt_count(active)}）</td>"
+
+    rows = []
+    for c in w4_split.get("cohorts", []):
+        ra = c.get("w4_rate_all")
+        rb = c.get("w4_rate_activated")
+        lift = (
+            f"×{float(rb) / float(ra):.1f}"
+            if ra is not None and rb is not None and float(ra) > 0
+            else "—"
+        )
+        rows.append(
+            "<tr>"
+            f"<td>{html.escape(str(c.get('cohort_week') or ''))}</td>"
+            f"<td>{_fmt_count(c.get('n_all'))}</td>"
+            f"<td>{_fmt_count(c.get('n_activated'))}</td>"
+            f"{rate_cell(ra, c.get('w4_all'))}"
+            f"{rate_cell(rb, c.get('w4_activated'))}"
+            f"<td>{lift}</td>"
+            "</tr>"
+        )
+    if not rows:
+        rows.append("<tr><td colspan='6' class='muted'>暂无可判 W4 的注册周 cohort</td></tr>")
+    return (
+        "<div class='table-wrap'><table>"
+        "<thead><tr><th>注册周（周一）</th><th>n 全量</th><th>n 激活者</th>"
+        "<th>W4 全量</th><th>W4 激活者</th><th>lift</th></tr></thead>"
+        f"<tbody>{''.join(rows)}</tbody></table></div>"
+    )
+
+
+def _health_power_tables(power: dict | None) -> str:
+    if power is None:
+        return _HEALTH_UNAVAILABLE
+    weekly_rows = []
+    # builder 拿 16 周只为判满 4 周连续；趋势表只展示最近 12 周。
+    for r in (power.get("weekly") or [])[:12]:
+        weekly_rows.append(
+            "<tr>"
+            f"<td>{html.escape(str(r.get('week') or ''))}</td>"
+            f"<td>{_fmt_count(r.get('qualifying_users'))}</td>"
+            f"<td>{_fmt_count(r.get('power_users'))}</td>"
+            "</tr>"
+        )
+    if not weekly_rows:
+        weekly_rows.append("<tr><td colspan='3' class='muted'>暂无周样本</td></tr>")
+    monthly_rows = []
+    for r in power.get("monthly") or []:
+        monthly_rows.append(
+            "<tr>"
+            f"<td>{html.escape(str(r.get('month') or ''))}</td>"
+            f"<td>{_fmt_count(r.get('power_users'))}</td>"
+            "</tr>"
+        )
+    if not monthly_rows:
+        monthly_rows.append("<tr><td colspan='2' class='muted'>暂无月度样本</td></tr>")
+    return (
+        "<div class='table-wrap'><table>"
+        "<thead><tr><th>周（周一）</th><th>当周达标（≥5 job）</th>"
+        "<th>铁杆（连续 4 周达标）</th></tr></thead>"
+        f"<tbody>{''.join(weekly_rows)}</tbody></table></div>"
+        "<div class='table-wrap'><table>"
+        "<thead><tr><th>月份</th><th>铁杆用户</th></tr></thead>"
+        f"<tbody>{''.join(monthly_rows)}</tbody></table></div>"
+    )
+
+
+def _health_reply_table(reply_rate: dict | None) -> str:
+    if reply_rate is None:
+        return _HEALTH_UNAVAILABLE
+    rows = []
+    for r in reply_rate.get("rows", []):
+        rows.append(
+            "<tr>"
+            f"<td>{html.escape(str(r.get('week') or ''))}</td>"
+            f"<td>{_fmt_count(r.get('proactive_msgs'))}</td>"
+            f"<td>{_fmt_count(r.get('replied_24h'))}</td>"
+            f"<td>{_fmt_count(r.get('users'))}</td>"
+            f"<td>{_fmt_ratio(r.get('reply_rate'))}</td>"
+            "</tr>"
+        )
+    if not rows:
+        rows.append("<tr><td colspan='5' class='muted'>暂无主动消息样本</td></tr>")
+    return (
+        "<div class='table-wrap'><table>"
+        "<thead><tr><th>周（周一）</th><th>主动消息</th><th>24h 内有回复</th>"
+        "<th>触达用户</th><th>回复率</th></tr></thead>"
+        f"<tbody>{''.join(rows)}</tbody></table></div>"
+    )
+
+
+def _render_product_health_page(
+    retention: dict | None,
+    activation: dict | None,
+    w4_split: dict | None,
+    stickiness: dict | None,
+    concentration: dict | None,
+    growth: dict | None,
+    power: dict | None,
+    reply_rate: dict | None,
+) -> str:
+    """产品健康（?view=health）。八个 builder 各自独立失败：None → 对应
+    tile 显 — / 表格坍缩成「统计暂不可用」，绝不 or 0。固定自然周口径，
+    没有 hours 窗口条。"""
+    # ---- ① 用户留下来了吗 ----
+    stick = stickiness or {}
+    window = stick.get("window") or {}
+    l5_plus = None
+    if stickiness is not None:
+        ld = stick.get("l_distribution") or {}
+        vals = [ld.get(k) for k in (5, 6, 7)]
+        if any(v is not None for v in vals):
+            l5_plus = sum(int(v) for v in vals if v is not None)
+    # W4 tile 用 w4_split 的使用口径（app_session_end），与宽口径 cohort 表
+    # 是两把尺子；取最新一个 W4 已可判的注册周。
+    w4_tile = "—"
+    if w4_split is not None:
+        for c in w4_split.get("cohorts", []):
+            if c.get("w4_rate_all") is not None:
+                w4_tile = (
+                    f"{_fmt_ratio(c.get('w4_rate_all'))}"
+                    f"（{str(c.get('cohort_week') or '')}）"
+                )
+                break
+    window_line = (
+        f"<div class='muted'>粘性窗口 {html.escape(str(window.get('start_day') or ''))}"
+        f" ～ {html.escape(str(window.get('end_day') or ''))}（近 7 个已完整北京自然日）</div>"
+        if stickiness is not None else ""
+    )
+    section1_tiles = "".join([
+        _render_metric(
+            "WAU（近 7 完整日）", _fmt_count(stick.get("wau")),
+            hint="近 7 个已完整北京自然日内至少上报一次 app_session_end 的去重账号；前台被杀会漏报，是保守下限",
+        ),
+        _render_metric(
+            "DAU/WAU 粘性", _fmt_ratio(stick.get("stickiness")),
+            hint="同窗口平均 DAU ÷ WAU；越高说明周活用户来得越频繁",
+        ),
+        _render_metric(
+            "最新成熟 cohort W4", w4_tile,
+            hint="最新一个已满 4 周的注册周 cohort 的第 4 周仍活跃占比（app_session_end 使用口径）",
+        ),
+        _render_metric(
+            "L5+ 重度用户", _fmt_count(l5_plus),
+            hint="近 7 完整日内活跃 ≥5 天的用户数；来自下方 L1–L7 分布",
+        ),
+    ])
+    section1 = f"""
+  <h2>用户留下来了吗？</h2>
+  {window_line}
+  <section class="metrics">{section1_tiles}</section>
+  <h3>周 cohort 留存（宽口径快照）</h3>
+  {_health_cohort_table(retention)}
+  <h3>L1–L7 活跃天数分布（近 7 完整日）</h3>
+  {_health_l_table(stickiness)}
+  <h3>每周增长核算（app_session_end 使用口径）</h3>
+  {_health_growth_table(growth)}
+  <details class="note-box"><summary>口径说明</summary>cohort 表的「活跃」是宽口径快照（聊天∪任何 tracking 事件、分母自首次冻结起防删除），而粘性/W4/增长核算用 app_session_end 使用口径——两把尺子不同，不可互读。增长核算最新一行是进行中的本周：流失/回流/净变化右删失显示 —（本周还没打开 ≠ 流失），新注册/新激活/活跃是到目前为止的下限；小样本仅方向性参考。</details>"""
+
+    # ---- ② 新用户能激活吗 ----
+    # coverage_complete 只保证漏斗行数对得上；「最新完整」tile 还要求 t3 窗
+    # 已走完，否则 cohorts[0]（进行中的本周）会把右删失的 0% 当定论展示。
+    latest_complete = next(
+        (
+            c for c in (activation or {}).get("cohorts", [])
+            if c.get("coverage_complete")
+            and _health_t3_matured(c.get("cohort_week"))
+        ),
+        None,
+    )
+    t3_tile = "—"
+    median_tile = "—"
+    if latest_complete is not None:
+        t3_tile = (
+            f"{_fmt_ratio(latest_complete.get('t3_rate'))}"
+            f"（{str(latest_complete.get('cohort_week') or '')}）"
+        )
+        median_h = latest_complete.get("median_t0_t3_hours")
+        median_tile = _funnel_dur(median_h * 3600 if median_h is not None else None)
+    cum_activated = None
+    if activation is not None:
+        # 只数 coverage_complete 的周——契约里 t3 恒为 int（漏斗故障时全 0），
+        # 不过滤的话漏斗断供会把 tile 渲染成自信的 0，且与 hint 的「覆盖不
+        # 完整的周不计入」自相矛盾。一个完整周都没有 → None → —。
+        complete = [
+            c for c in activation.get("cohorts", []) if c.get("coverage_complete")
+        ]
+        if complete:
+            cum_activated = sum(int(c.get("t3") or 0) for c in complete)
+    section2_tiles = "".join([
+        _render_metric(
+            "最新完整 cohort t3 激活率", t3_tile,
+            hint="最新一个事件覆盖完整、且 t3 窗（注册周+3 天）已走完的注册周 cohort 中，注册 3 天内产生首条非 fallback 真回复的比例；窗口没走完的周不当定论",
+        ),
+        _render_metric(
+            "注册→首次真回复中位时长", median_tile,
+            hint="同一 cohort 内注册到首条非 fallback 真回复的中位耗时",
+        ),
+        _render_metric(
+            "近 10 周累计激活数", _fmt_count(cum_activated),
+            hint="近 10 个注册周 cohort 中 3 天内激活的用户数合计；覆盖不完整的周不计入",
+        ),
+    ])
+    section2 = f"""
+  <h2>新用户能激活吗？</h2>
+  <section class="metrics">{section2_tiles}</section>
+  <h3>注册周激活漏斗</h3>
+  {_health_activation_table(activation)}
+  <h3>W4 留存 · 全量 vs 激活者</h3>
+  {_health_w4_split_table(w4_split)}
+  <details class="note-box"><summary>口径说明</summary>t3=首条非 fallback 真回复（可能是主动消息）；lift=激活者 W4 ÷ 全量 W4，「激活」只认 W4 窗口开始前的回复（激活须先于被预测的那周，成熟 cohort 数字永久冻结）。覆盖不完整的注册周渲染「未知」、t3 窗（注册周+3 天）没走完的渲染「未成熟」——都不算 0%。</details>"""
+
+    # ---- ③ 强度是真的吗 ----
+    conc_sessions = (concentration or {}).get("sessions") or {}
+    conc_tokens = (concentration or {}).get("tokens") or {}
+    sess_tile = "—"
+    token_tile = "—"
+    if concentration is not None:
+        sess_tile = (
+            f"{_fmt_ratio(conc_sessions.get('share'))}"
+            f" · n={_fmt_count(conc_sessions.get('users'))}"
+        )
+        token_tile = (
+            f"{_fmt_ratio(conc_tokens.get('share'))}"
+            f" · n={_fmt_count(conc_tokens.get('users'))}"
+        )
+    reply_rows = (reply_rate or {}).get("rows") or []
+    # builder 首行是进行中的本周（右删失半样本），tile 标称「最新完整周」
+    # 就必须跳过本周，取第一个严格早于本北京周一的行。
+    _bj_this_monday = _health_bj_this_monday()
+    latest_reply = next(
+        (r for r in reply_rows if str(r.get("week") or "") < _bj_this_monday),
+        None,
+    )
+    reply_tile = _fmt_ratio(latest_reply.get("reply_rate")) if latest_reply else "—"
+    # 铁杆 headline 同款跳过本周：进行中的周 ≥5 job 门槛周初必然没凑够，
+    # current（=weekly[0]）每周一都假性归零——那是删失不是流失。
+    latest_power = next(
+        (
+            r for r in (power or {}).get("weekly") or []
+            if str(r.get("week") or "") < _bj_this_monday
+        ),
+        None,
+    )
+    power_tile = _fmt_count((latest_power or {}).get("power_users"))
+    section3_tiles = "".join([
+        _render_metric(
+            "Top10% session 份额", sess_tile,
+            hint="近 28 个完整北京日内 app session 数最多的前 10% 用户贡献的 session 占比；n=窗口内有 session 的用户数",
+        ),
+        _render_metric(
+            "Top10% token 份额（Hosted V2 灰度）", token_tile,
+            hint="与 session 侧同一 28 个完整北京日窗口；仅 Hosted V2 灰度用户的模型 token 可见，BYOK 自付不可观测，不代表全体",
+        ),
+        _render_metric(
+            "最新完整周铁杆用户", power_tile,
+            hint="最近一个已完整走完的周里，连续 4 周每周 ≥5 个 admitted 用户侧主动 job 的用户数（V1+V2 wake 合并；自主心跳/presence tick、维护类与限流 skip 不计——那些量的是 agent 在线，不是人）",
+        ),
+        _render_metric(
+            "主动消息 24h 回复率（最新完整周）", reply_tile,
+            hint="主动消息发出后 24 小时内用户有发言的比例；服务端可见下限，相关非归因",
+        ),
+    ])
+    section3 = f"""
+  <h2>强度是真的吗？</h2>
+  <section class="metrics">{section3_tiles}</section>
+  <h3>铁杆用户趋势（近 12 周 + 月度）</h3>
+  {_health_power_tables(power)}
+  <h3>主动消息 24h 回复率（近 10 周）</h3>
+  {_health_reply_table(reply_rate)}
+  <details class="note-box"><summary>口径说明</summary>铁杆=连续 4 周每周≥5 个 admitted 用户侧主动 job（V1+V2 wake 合并；自主心跳/presence tick 不计——默认 cadence 下心跳一周 ~84 个，计入会让门槛对任何 agent 在线的用户躺满；维护类与限流 skip 同样不计）；headline 取最近完整周，进行中的本周周初必然偏低；回复率仅服务端下限、相关非归因；session 与 token 集中度同用近 28 个完整北京日窗口，token 仅 V2 灰度、BYOK 自付不可见。</details>"""
+
+    # ---- ④ 还缺什么证据 ----
+    # 这个 note-box 故意常开不折叠：缺口清单就是这一节的正文。
+    section4 = """
+  <h2>还缺什么证据？</h2>
+  <div class="note-box">
+    · 客户端 session 来源标记（自然打开 vs 推送拉起）未埋点——阻塞「主动消息拉活占比」与「人发起 session 数」两个核心指标<br>
+    · 客户端已读/点按 ACK 未埋点——「主动消息触达率」只能用本页 24h 回复率做下限<br>
+    · BYOK 自付 token 不可观测（全员自带 key；Hosted V2 为灰度）——「用户自掏多少钱」需线下调研补证。
+  </div>"""
+
+    return f"""<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>产品健康 · Feedling Data Track</title>
+<style>{_HEALTH_PAGE_CSS}</style></head><body><main>
+  <span class="ops-kicker">Operations / metadata only</span>
+  <h1>产品健康</h1>
+  <div class="muted">固定口径：北京时间自然周（周一起算）· 近 10–12 周 · 只展示当前数据库可证实的数字。</div>
+  {_render_data_track_view_nav("health")}
+  {section1}
+  {section2}
+  {section3}
+  {section4}
+</main></body></html>"""
+
+
 def _render_proactive_daily_page(payload: dict) -> str:
     summary = payload["summary"]
     rows = payload.get("rows", [])
@@ -5928,6 +6605,7 @@ def _render_proactive_daily_page(payload: dict) -> str:
     th,td {{ text-align:left; padding:10px 12px; border-bottom:1px solid var(--line); vertical-align:top; }}
     th {{ font-size:12px; color:var(--muted); text-transform:uppercase; letter-spacing:.06em; background:#f4ece5; }}
     tr:last-child td {{ border-bottom:0; }} a {{ color:var(--accent); text-decoration:none; }}
+{_NAV_GROUP_CSS}
   </style>
 </head>
 <body>
@@ -6319,6 +6997,7 @@ def _render_data_track_debug_page(payload: dict) -> str:
     pre {{ white-space:pre-wrap; word-break:break-word; background:#fff7f0; border:1px solid var(--line); border-radius:6px; padding:10px; max-height:360px; overflow:auto; }}
     .redacted-note,.reveal-note {{ border-radius:6px; padding:8px; margin:7px 0; }} .redacted-note {{ color:var(--muted); background:#f6efe8; border:1px solid var(--line); }} .reveal-note {{ color:#8a4a00; background:#fff8ed; border:1px solid #e8c59d; }}
     .stall {{ color:var(--warn); background:#fff8e8; border:1px solid #f0d7a5; border-radius:6px; padding:8px; margin-top:8px; }}
+{_NAV_GROUP_CSS}
   </style>
 </head>
 <body>
@@ -6604,6 +7283,7 @@ def _render_events_page(payload: dict) -> str:
   tr:last-child td {{ border-bottom:0; }} b {{ font-size:15px; }}
   .evt-desc {{ font-size:12px; color:var(--muted); line-height:1.5; margin-top:3px; max-width:520px; font-weight:400; text-transform:none; letter-spacing:0; }}
   .note-box {{ background:#fff8ef; border:1px solid #e8d8be; border-radius:8px; padding:12px 14px; margin:14px 0; font-size:13px; line-height:1.65; color:#5a4d3c; }}
+{_NAV_GROUP_CSS}
 </style></head><body><main>
   <h1>事件健康度</h1>
   <div class="muted">VPS=resident 自托管；API=model_api 托管。统计口径 = <b>{html.escape(str(payload.get('day') or ''))}</b> 当天（北京时间）。Generated {html.escape(_bj_iso(payload.get('generated_at')))}.</div>
@@ -6652,7 +7332,9 @@ def _data_track_onboarding_funnel_payload() -> dict:
     def blank():
         return {"reg": 0, "m1": 0, "m2": 0, "m3": 0, "s1": [], "s2": [], "s3": [], "total": []}
     buckets = {"vps": blank(), "api": blank()}
-    for r in db.admin_onboarding_funnel():
+    # 查询失败时 db 层返回 None（区别于「查到 0 行」的 []）；漏斗页对两者
+    # 都渲染空桶，不在这里崩。
+    for r in (db.admin_onboarding_funnel() or []):
         t0, t1, t2, t3 = r.get("t0"), r.get("t1"), r.get("t2"), r.get("t3")
         if t0 is None:
             continue
