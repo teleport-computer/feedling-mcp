@@ -54,6 +54,28 @@ _PROFILE_MAP_SYSTEM_PROMPT = (
 )
 
 
+@dataclass(frozen=True)
+class _ProfileOutputTool:
+    name: str
+    description: str
+    parameters: dict[str, Any]
+
+
+_PROFILE_OUTPUT_TOOL = _ProfileOutputTool(
+    name="emit_profile",
+    description="Return the distilled MEMORY and USER profile fields.",
+    parameters={
+        "type": "object",
+        "properties": {
+            "memory": {"type": "string", "maxLength": PROFILE_MEMORY_MAX_CHARS},
+            "user": {"type": "string", "maxLength": PROFILE_USER_MAX_CHARS},
+        },
+        "required": ["memory", "user"],
+        "additionalProperties": False,
+    },
+)
+
+
 class ProfileGenerationExhausted(RuntimeError):
     """A bounded profile map/reduce cannot finish within its call budget."""
 
@@ -495,6 +517,11 @@ async def generate_profile(
                 # instruction.  This is intentionally limited to the final
                 # two-field response: map summaries are bullet text.
                 call_kwargs["response_format"] = {"type": "json_object"}
+                call_kwargs["tools"] = [_PROFILE_OUTPUT_TOOL]
+                call_kwargs["tool_choice"] = {
+                    "type": "function",
+                    "function": {"name": _PROFILE_OUTPUT_TOOL.name},
+                }
             result = await llm(provider_config, messages, **call_kwargs)
         except Exception:
             if usage_out is not None:
@@ -503,6 +530,22 @@ async def generate_profile(
         if usage_out is not None:
             usage_out(result.get("usage") if isinstance(result, dict) else None)
         if json_object:
+            if isinstance(result, dict):
+                tool_calls = result.get("tool_calls")
+                if isinstance(tool_calls, list):
+                    matching = [
+                        call
+                        for call in tool_calls
+                        if isinstance(call, dict)
+                        and call.get("name") == _PROFILE_OUTPUT_TOOL.name
+                        and call.get("args_ok") is not False
+                        and isinstance(call.get("args"), dict)
+                    ]
+                    if len(matching) == 1:
+                        result = dict(result)
+                        result["reply"] = json.dumps(
+                            matching[0]["args"], ensure_ascii=False
+                        )
             reply = result.get("reply") if isinstance(result, dict) else None
             await _emit(
                 trajectory_out,

@@ -361,6 +361,31 @@ def test_openai_compat_payload_preserves_forced_tool_choice():
     assert payload["tool_choice"] is not choice
 
 
+def test_anthropic_payload_translates_forced_function_tool_choice():
+    payload, _url, _headers = pc._build_anthropic_payload(
+        model="claude-sonnet-4-5",
+        base_url="https://api.anthropic.com/v1",
+        key="sk-test",
+        messages=[{"role": "user", "content": "emit"}],
+        max_tokens=500,
+        temperature=0.2,
+        response_format={"type": "json_object"},
+        tools=[
+            ToolSpec(
+                name="emit_profile",
+                description="emit",
+                parameters={"type": "object", "properties": {}},
+            )
+        ],
+        tool_choice={
+            "type": "function",
+            "function": {"name": "emit_profile"},
+        },
+    )
+
+    assert payload["tool_choice"] == {"type": "tool", "name": "emit_profile"}
+
+
 def test_parse_openai_compat_body_result_shape():
     resp = FakeResponse(200, {
         "id": "chatcmpl-1",

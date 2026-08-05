@@ -183,6 +183,7 @@ def test_generate_profile_single_call_returns_overlap_telemetry():
     assert result.overlap is not None and result.overlap.would_reject is True
     assert len(calls) == 1
     assert calls[0][2]["response_format"] == {"type": "json_object"}
+    assert calls[0][2]["tool_choice"]["function"]["name"] == "emit_profile"
     assert usages == [{"input_tokens": 10}]
     assert events == [
         (
@@ -197,6 +198,34 @@ def test_generate_profile_single_call_returns_overlap_telemetry():
         ),
         ("profile_overlap_observed", result.overlap.as_dict()),
     ]
+
+
+def test_generate_profile_accepts_forced_tool_output_without_text_reply():
+    async def _llm(_config, _messages, **kwargs):
+        assert kwargs["tools"][0].name == "emit_profile"
+        return {
+            "reply": "",
+            "tool_calls": [
+                {
+                    "id": "tool-1",
+                    "name": "emit_profile",
+                    "args": {"memory": "长期事实", "user": "沟通方式"},
+                    "args_ok": True,
+                }
+            ],
+            "stop_reason": "tool_use",
+        }
+
+    result = asyncio.run(
+        profile.generate_profile(
+            provider_config=object(),
+            rendered_cards="cards",
+            llm=_llm,
+        )
+    )
+
+    assert result.fields == {"memory": "长期事实", "user": "沟通方式"}
+    assert result.provider_calls == 1
 
 
 def test_shape_error_bounces_once_with_content_free_correction():

@@ -14,7 +14,8 @@ change must not be interpreted as an API guarantee.
   atomic capture journal accepts a plaintext `body` envelope only when the
   account's effective encryption mode is off, continues to require the full
   sealed envelope for encrypted accounts, and rejects mixed shapes. Profile
-  distillation also requests a JSON-only provider response, reducing failed
+  distillation also forces its provider response through a typed output tool
+  instead of relying on a JSON formatting instruction, reducing failed
   background retries that can delay a later turn for the same account.
 
 - **Runtime V2 Chat no longer fails during setup for plaintext-tier accounts.**
