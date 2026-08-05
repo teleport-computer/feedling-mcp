@@ -47,6 +47,32 @@
 
 ## 记录正文（最新的在上面）
 
+## 2026-08-04 — 新增 Admin「产品健康」view（留存/激活/强度/证据缺口）
+
+**[DONE] /admin/data-track?view=health：投资人级产品指标常态化进 dashboard，全部只用现库可证实的数。**
+
+- 四个问题分区：①用户留下来了吗（`retention_cohort_snapshot` 冻结 cohort
+  W1/W2/W4/W8 热力表——只读快照、未成熟显「—」不做实时补算；WAU/粘性/L1-L7
+  分布用 `app_session_end` 使用口径）；②新用户能激活吗（复用带 cutoff 的
+  onboarding funnel：cohort×t1/t2/t3 趋势 + 注册→首真回复中位时长 + W4
+  激活者-vs-全量留存分层，coverage 不完整显「未知」）；③强度是真的吗
+  （Top10% session/token 集中度——token 标注仅 V2 灰度；铁杆用户 census =
+  连续 4 周每周 ≥5 个 admitted **非心跳** 主动 job，V1+V2 wake 合并、
+  排除维护类/限流 skip/自主心跳；主动消息 24h 回复率右删失下界）；
+  ④还缺什么证据（常开缺口清单：session 来源标记、客户端已读 ACK、BYOK
+  自付不可见——各自阻塞哪个核心指标）。
+- 诚实性规则全页强制（两轮对抗审查后修复 9 处）：进行中的北京周不渲染
+  成已定数字（流失/净变化/激活率/铁杆数全部跳过或标「进行中·不可判定」）；
+  funnel 故障传导为「未知」而非 0；W4 激活标记冻结在 W4 窗口开始前
+  （成熟 cohort 不再回溯漂移）；session 与 token 集中度同用完整北京日窗口。
+- 复用 commit 868281284 的底座：共享 admin-ops executor 并行 8 个
+  builder（本地实测 2-30ms/个）、60s 缓存、`[admin:perf]` 计时、逐 builder
+  失败域。宽口径快照 vs 使用口径两把尺子在口径说明中显式声明，不可互读。
+- 测试：`tests/test_admin_product_health_view.py`（14 项：8 个 builder 的
+  种子数据语义 + 渲染诚实性/缓存/日志无 secret）。仍未做：0079 可选
+  `proactive_jobs` 部分索引（视 prod EXPLAIN）、`chat_messages(ts)` 索引
+  （回复率查询目前顺扫、60s 缓存兜底）。
+
 ## 2026-08-04 — Admin 运营总览提速 + 布局重做
 
 **[DONE] /admin/data-track 性能修复（overview 4.5s TTFB → 缓存命中亚秒）+ 运营总览布局按「问题→判定→证据」重排。**

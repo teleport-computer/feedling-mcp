@@ -1625,7 +1625,7 @@ def _data_track_request_filters() -> dict:
         raw_dir = "desc"
     raw_view = (request.args.get("view") or "users").strip().lower()
     if raw_view not in {
-        "users", "dau", "growth", "proactive", "debug", "events",
+        "users", "dau", "growth", "proactive", "debug", "events", "health",
         "overview", "imports", "chat", "latency", "runtime", "usage",
     }:
         raw_view = "users"
@@ -5164,6 +5164,9 @@ def _render_data_track_view_nav(
             nav_item("users", "用户")
             + nav_item("dau", "日活与时长")
             + nav_item("growth", "增长 & 留存")
+            # health 是固定周口径页，故意不进 hours/day 参数携带集合——带上
+            # 只会让 URL 看起来被过滤而页面根本不消费。
+            + nav_item("health", "产品健康")
             + nav_item("proactive", "主动任务"),
         )
         + nav_group(
@@ -5985,6 +5988,491 @@ def _render_data_track_growth_page(payload: dict) -> str:
 </main>
 </body>
 </html>"""
+
+
+# ---- 产品健康（?view=health）· 固定周口径，无 hours 窗口 --------------------
+
+# _RUNTIME_PAGE_CSS 没有 h3 规则，浏览器默认 h3 比本页 16px 的 h2 还大，
+# 层级会倒挂；只在本页补一条，不动共享样式。
+_HEALTH_PAGE_CSS = _RUNTIME_PAGE_CSS + """
+    h3 { font-size:14px; margin:20px 0 10px; }
+"""
+
+# 任一 builder 失败即整段坍缩成这一行——绝不把「查不到」渲染成 0。
+_HEALTH_UNAVAILABLE = (
+    "<div class='note-box'>统计暂不可用。页面不会把未知渲染成 0。</div>"
+)
+
+
+def _health_bj_this_monday() -> str:
+    """当前北京自然周的周一（ISO）。进行中的周在多处需要右删失处理。"""
+    today = datetime.now(ZoneInfo("Asia/Shanghai")).date()
+    return (today - timedelta(days=today.weekday())).isoformat()
+
+
+def _health_t3_matured(cohort_week: str) -> bool:
+    """注册周的 t3 激活窗是否已全部走完（注册周 7 天 + 3 天 t3 窗）。
+
+    coverage_complete 只说明漏斗行数对得上，不代表窗口走完；没成熟的周
+    t3 率是右删失下限，当定论展示就是把「还没来得及」渲染成 0%。
+    """
+    try:
+        week = date.fromisoformat(str(cohort_week))
+    except (TypeError, ValueError):
+        return False
+    today = datetime.now(ZoneInfo("Asia/Shanghai")).date()
+    return week + timedelta(days=10) <= today
+
+
+def _health_signed(value) -> str:
+    """净变化带符号显示；None（基线周判不了）→ —，与真实 0 区分。"""
+    if value is None:
+        return "—"
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        return "—"
+    return f"+{n:,}" if n > 0 else f"{n:,}"
+
+
+def _health_cohort_table(retention: dict | None) -> str:
+    if retention is None:
+        return _HEALTH_UNAVAILABLE
+    periods = [int(p) for p in (retention.get("periods") or [1, 2, 4, 8])]
+    head = "".join(f"<th>W{p}</th>" for p in periods)
+    rows = []
+    for c in retention.get("cohorts", []):
+        n = c.get("n")
+        cells = []
+        for p in periods:
+            cell = (c.get("cells") or {}).get(p)
+            pct = cell.get("pct") if isinstance(cell, dict) else None
+            if pct is None:
+                # 未成熟（cohort 距今不满 p 周）不是 0，判不了就是判不了。
+                cells.append("<td class='muted' title='cohort 尚未满该周数，未成熟'>—</td>")
+            else:
+                pct = float(pct)
+                cells.append(
+                    f"<td style='{_retention_cell_bg(pct)}'"
+                    f" title='{_fmt_count(cell.get('active'))}/{_fmt_count(n)} 活跃'>"
+                    f"{pct:.0f}%</td>"
+                )
+        rows.append(
+            f"<tr><td>{html.escape(str(c.get('cohort_week') or ''))}"
+            f"（n={_fmt_count(n)}）</td>{''.join(cells)}</tr>"
+        )
+    if not rows:
+        rows.append(
+            f"<tr><td colspan='{1 + len(periods)}' class='muted'>暂无注册周 cohort</td></tr>"
+        )
+    return (
+        "<div class='table-wrap'><table>"
+        f"<thead><tr><th>注册周（周一）</th>{head}</tr></thead>"
+        f"<tbody>{''.join(rows)}</tbody></table></div>"
+    )
+
+
+def _health_l_table(stickiness: dict | None) -> str:
+    if stickiness is None:
+        return _HEALTH_UNAVAILABLE
+    ld = stickiness.get("l_distribution") or {}
+    head = "".join(f"<th>L{k}</th>" for k in range(1, 8))
+    cells = "".join(f"<td>{_fmt_count(ld.get(k))}</td>" for k in range(1, 8))
+    return (
+        "<div class='table-wrap'><table>"
+        f"<thead><tr><th>近 7 完整日活跃天数</th>{head}</tr></thead>"
+        f"<tbody><tr><td class='muted'>用户数</td>{cells}</tr></tbody></table></div>"
+    )
+
+
+def _health_growth_table(growth: dict | None) -> str:
+    if growth is None:
+        return _HEALTH_UNAVAILABLE
+    this_monday = _health_bj_this_monday()
+    rows = []
+    for r in growth.get("rows", []):
+        week = str(r.get("week") or "")
+        # 进行中的本周要标出来：builder 已把流失/回流/净变化发成 None（→ —），
+        # 但不标注的话读者会把「—」误读成没数据而不是没走完。
+        tag = (
+            "<span class='muted' title='本周未走完，流失/回流/净变化不可判定'>"
+            "（进行中）</span>"
+            if week == this_monday else ""
+        )
+        rows.append(
+            "<tr>"
+            f"<td>{html.escape(week)}{tag}</td>"
+            f"<td>{_fmt_count(r.get('new_registered'))}</td>"
+            f"<td>{_fmt_count(r.get('newly_activated'))}</td>"
+            f"<td>{_fmt_count(r.get('active'))}</td>"
+            f"<td>{_fmt_count(r.get('churned'))}</td>"
+            f"<td>{_fmt_count(r.get('resurrected'))}</td>"
+            f"<td>{_health_signed(r.get('net_change'))}</td>"
+            "</tr>"
+        )
+    if not rows:
+        rows.append("<tr><td colspan='7' class='muted'>暂无足够周数做增长核算</td></tr>")
+    return (
+        "<div class='table-wrap'><table>"
+        "<thead><tr><th>周（周一）</th><th>新注册</th><th>新激活</th><th>活跃</th>"
+        "<th>流失</th><th>回流</th><th>净变化</th></tr></thead>"
+        f"<tbody>{''.join(rows)}</tbody></table></div>"
+    )
+
+
+def _health_activation_table(activation: dict | None) -> str:
+    if activation is None:
+        return _HEALTH_UNAVAILABLE
+
+    def pct_cell(count, n) -> str:
+        try:
+            c, total = int(count), int(n)
+        except (TypeError, ValueError):
+            return "<td class='muted'>—</td>"
+        if total <= 0:
+            return "<td class='muted'>—</td>"
+        return f"<td>{c / total * 100:.0f}%（{c:,}）</td>"
+
+    unknown = "<td class='muted' title='cohort 事件覆盖不完整，判不了'>未知</td>"
+    immature = (
+        "<td class='muted' title='注册周 + 3 天 t3 窗尚未走完，右删失，判不了'>"
+        "未成熟</td>"
+    )
+    rows = []
+    for c in activation.get("cohorts", []):
+        week = html.escape(str(c.get("cohort_week") or ""))
+        n = _fmt_count(c.get("n"))
+        if not c.get("coverage_complete"):
+            # 覆盖不完整的周渲染「未知」而不是 0%——缺证据 ≠ 没激活。
+            rows.append(f"<tr><td>{week}</td><td>{n}</td>{unknown * 4}</tr>")
+            continue
+        if not _health_t3_matured(c.get("cohort_week")):
+            # 窗口没走完的周（本周/上周）渲染「未成熟」——注册 3 天内还没
+            # 回复 ≠ 不会回复，确定性的 0% 是编出来的悲观。
+            rows.append(f"<tr><td>{week}</td><td>{n}</td>{immature * 4}</tr>")
+            continue
+        median_h = c.get("median_t0_t3_hours")
+        median = _funnel_dur(median_h * 3600 if median_h is not None else None)
+        rows.append(
+            f"<tr><td>{week}</td><td>{n}</td>"
+            f"{pct_cell(c.get('t1'), c.get('n'))}"
+            f"{pct_cell(c.get('t2'), c.get('n'))}"
+            f"{pct_cell(c.get('t3'), c.get('n'))}"
+            f"<td>{median}</td></tr>"
+        )
+    if not rows:
+        rows.append("<tr><td colspan='6' class='muted'>暂无注册周 cohort</td></tr>")
+    return (
+        "<div class='table-wrap'><table>"
+        "<thead><tr><th>注册周（周一）</th><th>n</th><th>t1 内激活</th>"
+        "<th>t2 内激活</th><th>t3 内激活</th><th>中位 t0→t3</th></tr></thead>"
+        f"<tbody>{''.join(rows)}</tbody></table></div>"
+    )
+
+
+def _health_w4_split_table(w4_split: dict | None) -> str:
+    if w4_split is None:
+        return _HEALTH_UNAVAILABLE
+
+    def rate_cell(rate, active) -> str:
+        if rate is None:
+            return "<td class='muted'>—</td>"
+        return f"<td>{_fmt_ratio(rate)}（{_fmt_count(active)}）</td>"
+
+    rows = []
+    for c in w4_split.get("cohorts", []):
+        ra = c.get("w4_rate_all")
+        rb = c.get("w4_rate_activated")
+        lift = (
+            f"×{float(rb) / float(ra):.1f}"
+            if ra is not None and rb is not None and float(ra) > 0
+            else "—"
+        )
+        rows.append(
+            "<tr>"
+            f"<td>{html.escape(str(c.get('cohort_week') or ''))}</td>"
+            f"<td>{_fmt_count(c.get('n_all'))}</td>"
+            f"<td>{_fmt_count(c.get('n_activated'))}</td>"
+            f"{rate_cell(ra, c.get('w4_all'))}"
+            f"{rate_cell(rb, c.get('w4_activated'))}"
+            f"<td>{lift}</td>"
+            "</tr>"
+        )
+    if not rows:
+        rows.append("<tr><td colspan='6' class='muted'>暂无可判 W4 的注册周 cohort</td></tr>")
+    return (
+        "<div class='table-wrap'><table>"
+        "<thead><tr><th>注册周（周一）</th><th>n 全量</th><th>n 激活者</th>"
+        "<th>W4 全量</th><th>W4 激活者</th><th>lift</th></tr></thead>"
+        f"<tbody>{''.join(rows)}</tbody></table></div>"
+    )
+
+
+def _health_power_tables(power: dict | None) -> str:
+    if power is None:
+        return _HEALTH_UNAVAILABLE
+    weekly_rows = []
+    # builder 拿 16 周只为判满 4 周连续；趋势表只展示最近 12 周。
+    for r in (power.get("weekly") or [])[:12]:
+        weekly_rows.append(
+            "<tr>"
+            f"<td>{html.escape(str(r.get('week') or ''))}</td>"
+            f"<td>{_fmt_count(r.get('qualifying_users'))}</td>"
+            f"<td>{_fmt_count(r.get('power_users'))}</td>"
+            "</tr>"
+        )
+    if not weekly_rows:
+        weekly_rows.append("<tr><td colspan='3' class='muted'>暂无周样本</td></tr>")
+    monthly_rows = []
+    for r in power.get("monthly") or []:
+        monthly_rows.append(
+            "<tr>"
+            f"<td>{html.escape(str(r.get('month') or ''))}</td>"
+            f"<td>{_fmt_count(r.get('power_users'))}</td>"
+            "</tr>"
+        )
+    if not monthly_rows:
+        monthly_rows.append("<tr><td colspan='2' class='muted'>暂无月度样本</td></tr>")
+    return (
+        "<div class='table-wrap'><table>"
+        "<thead><tr><th>周（周一）</th><th>当周达标（≥5 job）</th>"
+        "<th>铁杆（连续 4 周达标）</th></tr></thead>"
+        f"<tbody>{''.join(weekly_rows)}</tbody></table></div>"
+        "<div class='table-wrap'><table>"
+        "<thead><tr><th>月份</th><th>铁杆用户</th></tr></thead>"
+        f"<tbody>{''.join(monthly_rows)}</tbody></table></div>"
+    )
+
+
+def _health_reply_table(reply_rate: dict | None) -> str:
+    if reply_rate is None:
+        return _HEALTH_UNAVAILABLE
+    rows = []
+    for r in reply_rate.get("rows", []):
+        rows.append(
+            "<tr>"
+            f"<td>{html.escape(str(r.get('week') or ''))}</td>"
+            f"<td>{_fmt_count(r.get('proactive_msgs'))}</td>"
+            f"<td>{_fmt_count(r.get('replied_24h'))}</td>"
+            f"<td>{_fmt_count(r.get('users'))}</td>"
+            f"<td>{_fmt_ratio(r.get('reply_rate'))}</td>"
+            "</tr>"
+        )
+    if not rows:
+        rows.append("<tr><td colspan='5' class='muted'>暂无主动消息样本</td></tr>")
+    return (
+        "<div class='table-wrap'><table>"
+        "<thead><tr><th>周（周一）</th><th>主动消息</th><th>24h 内有回复</th>"
+        "<th>触达用户</th><th>回复率</th></tr></thead>"
+        f"<tbody>{''.join(rows)}</tbody></table></div>"
+    )
+
+
+def _render_product_health_page(
+    retention: dict | None,
+    activation: dict | None,
+    w4_split: dict | None,
+    stickiness: dict | None,
+    concentration: dict | None,
+    growth: dict | None,
+    power: dict | None,
+    reply_rate: dict | None,
+) -> str:
+    """产品健康（?view=health）。八个 builder 各自独立失败：None → 对应
+    tile 显 — / 表格坍缩成「统计暂不可用」，绝不 or 0。固定自然周口径，
+    没有 hours 窗口条。"""
+    # ---- ① 用户留下来了吗 ----
+    stick = stickiness or {}
+    window = stick.get("window") or {}
+    l5_plus = None
+    if stickiness is not None:
+        ld = stick.get("l_distribution") or {}
+        vals = [ld.get(k) for k in (5, 6, 7)]
+        if any(v is not None for v in vals):
+            l5_plus = sum(int(v) for v in vals if v is not None)
+    # W4 tile 用 w4_split 的使用口径（app_session_end），与宽口径 cohort 表
+    # 是两把尺子；取最新一个 W4 已可判的注册周。
+    w4_tile = "—"
+    if w4_split is not None:
+        for c in w4_split.get("cohorts", []):
+            if c.get("w4_rate_all") is not None:
+                w4_tile = (
+                    f"{_fmt_ratio(c.get('w4_rate_all'))}"
+                    f"（{str(c.get('cohort_week') or '')}）"
+                )
+                break
+    window_line = (
+        f"<div class='muted'>粘性窗口 {html.escape(str(window.get('start_day') or ''))}"
+        f" ～ {html.escape(str(window.get('end_day') or ''))}（近 7 个已完整北京自然日）</div>"
+        if stickiness is not None else ""
+    )
+    section1_tiles = "".join([
+        _render_metric(
+            "WAU（近 7 完整日）", _fmt_count(stick.get("wau")),
+            hint="近 7 个已完整北京自然日内至少上报一次 app_session_end 的去重账号；前台被杀会漏报，是保守下限",
+        ),
+        _render_metric(
+            "DAU/WAU 粘性", _fmt_ratio(stick.get("stickiness")),
+            hint="同窗口平均 DAU ÷ WAU；越高说明周活用户来得越频繁",
+        ),
+        _render_metric(
+            "最新成熟 cohort W4", w4_tile,
+            hint="最新一个已满 4 周的注册周 cohort 的第 4 周仍活跃占比（app_session_end 使用口径）",
+        ),
+        _render_metric(
+            "L5+ 重度用户", _fmt_count(l5_plus),
+            hint="近 7 完整日内活跃 ≥5 天的用户数；来自下方 L1–L7 分布",
+        ),
+    ])
+    section1 = f"""
+  <h2>用户留下来了吗？</h2>
+  {window_line}
+  <section class="metrics">{section1_tiles}</section>
+  <h3>周 cohort 留存（宽口径快照）</h3>
+  {_health_cohort_table(retention)}
+  <h3>L1–L7 活跃天数分布（近 7 完整日）</h3>
+  {_health_l_table(stickiness)}
+  <h3>每周增长核算（app_session_end 使用口径）</h3>
+  {_health_growth_table(growth)}
+  <details class="note-box"><summary>口径说明</summary>cohort 表的「活跃」是宽口径快照（聊天∪任何 tracking 事件、分母自首次冻结起防删除），而粘性/W4/增长核算用 app_session_end 使用口径——两把尺子不同，不可互读。增长核算最新一行是进行中的本周：流失/回流/净变化右删失显示 —（本周还没打开 ≠ 流失），新注册/新激活/活跃是到目前为止的下限；小样本仅方向性参考。</details>"""
+
+    # ---- ② 新用户能激活吗 ----
+    # coverage_complete 只保证漏斗行数对得上；「最新完整」tile 还要求 t3 窗
+    # 已走完，否则 cohorts[0]（进行中的本周）会把右删失的 0% 当定论展示。
+    latest_complete = next(
+        (
+            c for c in (activation or {}).get("cohorts", [])
+            if c.get("coverage_complete")
+            and _health_t3_matured(c.get("cohort_week"))
+        ),
+        None,
+    )
+    t3_tile = "—"
+    median_tile = "—"
+    if latest_complete is not None:
+        t3_tile = (
+            f"{_fmt_ratio(latest_complete.get('t3_rate'))}"
+            f"（{str(latest_complete.get('cohort_week') or '')}）"
+        )
+        median_h = latest_complete.get("median_t0_t3_hours")
+        median_tile = _funnel_dur(median_h * 3600 if median_h is not None else None)
+    cum_activated = None
+    if activation is not None:
+        # 只数 coverage_complete 的周——契约里 t3 恒为 int（漏斗故障时全 0），
+        # 不过滤的话漏斗断供会把 tile 渲染成自信的 0，且与 hint 的「覆盖不
+        # 完整的周不计入」自相矛盾。一个完整周都没有 → None → —。
+        complete = [
+            c for c in activation.get("cohorts", []) if c.get("coverage_complete")
+        ]
+        if complete:
+            cum_activated = sum(int(c.get("t3") or 0) for c in complete)
+    section2_tiles = "".join([
+        _render_metric(
+            "最新完整 cohort t3 激活率", t3_tile,
+            hint="最新一个事件覆盖完整、且 t3 窗（注册周+3 天）已走完的注册周 cohort 中，注册 3 天内产生首条非 fallback 真回复的比例；窗口没走完的周不当定论",
+        ),
+        _render_metric(
+            "注册→首次真回复中位时长", median_tile,
+            hint="同一 cohort 内注册到首条非 fallback 真回复的中位耗时",
+        ),
+        _render_metric(
+            "近 10 周累计激活数", _fmt_count(cum_activated),
+            hint="近 10 个注册周 cohort 中 3 天内激活的用户数合计；覆盖不完整的周不计入",
+        ),
+    ])
+    section2 = f"""
+  <h2>新用户能激活吗？</h2>
+  <section class="metrics">{section2_tiles}</section>
+  <h3>注册周激活漏斗</h3>
+  {_health_activation_table(activation)}
+  <h3>W4 留存 · 全量 vs 激活者</h3>
+  {_health_w4_split_table(w4_split)}
+  <details class="note-box"><summary>口径说明</summary>t3=首条非 fallback 真回复（可能是主动消息）；lift=激活者 W4 ÷ 全量 W4，「激活」只认 W4 窗口开始前的回复（激活须先于被预测的那周，成熟 cohort 数字永久冻结）。覆盖不完整的注册周渲染「未知」、t3 窗（注册周+3 天）没走完的渲染「未成熟」——都不算 0%。</details>"""
+
+    # ---- ③ 强度是真的吗 ----
+    conc_sessions = (concentration or {}).get("sessions") or {}
+    conc_tokens = (concentration or {}).get("tokens") or {}
+    sess_tile = "—"
+    token_tile = "—"
+    if concentration is not None:
+        sess_tile = (
+            f"{_fmt_ratio(conc_sessions.get('share'))}"
+            f" · n={_fmt_count(conc_sessions.get('users'))}"
+        )
+        token_tile = (
+            f"{_fmt_ratio(conc_tokens.get('share'))}"
+            f" · n={_fmt_count(conc_tokens.get('users'))}"
+        )
+    reply_rows = (reply_rate or {}).get("rows") or []
+    # builder 首行是进行中的本周（右删失半样本），tile 标称「最新完整周」
+    # 就必须跳过本周，取第一个严格早于本北京周一的行。
+    _bj_this_monday = _health_bj_this_monday()
+    latest_reply = next(
+        (r for r in reply_rows if str(r.get("week") or "") < _bj_this_monday),
+        None,
+    )
+    reply_tile = _fmt_ratio(latest_reply.get("reply_rate")) if latest_reply else "—"
+    # 铁杆 headline 同款跳过本周：进行中的周 ≥5 job 门槛周初必然没凑够，
+    # current（=weekly[0]）每周一都假性归零——那是删失不是流失。
+    latest_power = next(
+        (
+            r for r in (power or {}).get("weekly") or []
+            if str(r.get("week") or "") < _bj_this_monday
+        ),
+        None,
+    )
+    power_tile = _fmt_count((latest_power or {}).get("power_users"))
+    section3_tiles = "".join([
+        _render_metric(
+            "Top10% session 份额", sess_tile,
+            hint="近 28 个完整北京日内 app session 数最多的前 10% 用户贡献的 session 占比；n=窗口内有 session 的用户数",
+        ),
+        _render_metric(
+            "Top10% token 份额（Hosted V2 灰度）", token_tile,
+            hint="与 session 侧同一 28 个完整北京日窗口；仅 Hosted V2 灰度用户的模型 token 可见，BYOK 自付不可观测，不代表全体",
+        ),
+        _render_metric(
+            "最新完整周铁杆用户", power_tile,
+            hint="最近一个已完整走完的周里，连续 4 周每周 ≥5 个 admitted 用户侧主动 job 的用户数（V1+V2 wake 合并；自主心跳/presence tick、维护类与限流 skip 不计——那些量的是 agent 在线，不是人）",
+        ),
+        _render_metric(
+            "主动消息 24h 回复率（最新完整周）", reply_tile,
+            hint="主动消息发出后 24 小时内用户有发言的比例；服务端可见下限，相关非归因",
+        ),
+    ])
+    section3 = f"""
+  <h2>强度是真的吗？</h2>
+  <section class="metrics">{section3_tiles}</section>
+  <h3>铁杆用户趋势（近 12 周 + 月度）</h3>
+  {_health_power_tables(power)}
+  <h3>主动消息 24h 回复率（近 10 周）</h3>
+  {_health_reply_table(reply_rate)}
+  <details class="note-box"><summary>口径说明</summary>铁杆=连续 4 周每周≥5 个 admitted 用户侧主动 job（V1+V2 wake 合并；自主心跳/presence tick 不计——默认 cadence 下心跳一周 ~84 个，计入会让门槛对任何 agent 在线的用户躺满；维护类与限流 skip 同样不计）；headline 取最近完整周，进行中的本周周初必然偏低；回复率仅服务端下限、相关非归因；session 与 token 集中度同用近 28 个完整北京日窗口，token 仅 V2 灰度、BYOK 自付不可见。</details>"""
+
+    # ---- ④ 还缺什么证据 ----
+    # 这个 note-box 故意常开不折叠：缺口清单就是这一节的正文。
+    section4 = """
+  <h2>还缺什么证据？</h2>
+  <div class="note-box">
+    · 客户端 session 来源标记（自然打开 vs 推送拉起）未埋点——阻塞「主动消息拉活占比」与「人发起 session 数」两个核心指标<br>
+    · 客户端已读/点按 ACK 未埋点——「主动消息触达率」只能用本页 24h 回复率做下限<br>
+    · BYOK 自付 token 不可观测（全员自带 key；Hosted V2 为灰度）——「用户自掏多少钱」需线下调研补证。
+  </div>"""
+
+    return f"""<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>产品健康 · Feedling Data Track</title>
+<style>{_HEALTH_PAGE_CSS}</style></head><body><main>
+  <span class="ops-kicker">Operations / metadata only</span>
+  <h1>产品健康</h1>
+  <div class="muted">固定口径：北京时间自然周（周一起算）· 近 10–12 周 · 只展示当前数据库可证实的数字。</div>
+  {_render_data_track_view_nav("health")}
+  {section1}
+  {section2}
+  {section3}
+  {section4}
+</main></body></html>"""
 
 
 def _render_proactive_daily_page(payload: dict) -> str:

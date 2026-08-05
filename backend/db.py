@@ -2557,6 +2557,682 @@ def admin_data_track_growth_accounting(
         return {"rows": [], "since_day": since_day}
 
 
+# --- 产品健康页（view=health）数据层 --------------------------------------- #
+# 周 = 北京 ISO 周，键是周一（与 SQL date_trunc('week', timezone(...)) 完全同
+# 约定，_bj_monday 是它的 Python 侧镜像）。这一组 builder 与旧 data-track
+# builder 的错误约定不同：查询失败直接 RAISE，由 admin_core 捕获成 None，
+# 渲染层显示「暂不可用」——绝不吞错返回一个看起来像真数据的空结构。
+# 未成熟/未知一律 None，None ≠ 0。
+
+
+def _bj_monday(d: date) -> date:
+    return d - timedelta(days=d.weekday())
+
+
+def _ph_zone(tz: str) -> ZoneInfo:
+    try:
+        return ZoneInfo(tz)
+    except Exception:
+        return ZoneInfo("Asia/Shanghai")
+
+
+def _ph_day_epoch(d: date, zone: ZoneInfo) -> float:
+    """北京日历日 ``d`` 当地 00:00 的 epoch。"""
+    return datetime.combine(d, datetime.min.time(), tzinfo=zone).timestamp()
+
+
+def _ph_median(vals) -> float | None:
+    # admin/data_track._funnel_median 的同款实现——依赖只能向下，db 层
+    # 不能向上 import 渲染包。
+    xs = sorted(v for v in vals if v is not None)
+    if not xs:
+        return None
+    n = len(xs)
+    if n % 2:
+        return float(xs[n // 2])
+    return (float(xs[n // 2 - 1]) + float(xs[n // 2])) / 2.0
+
+
+def _ph_weekly_registrations(conn, *, tz: str, since_monday: date) -> dict[str, int]:
+    """每北京周注册数（{monday_iso: n}），一次有界 users 小扫描。
+
+    由 ``_CREATED_AT_ISO`` 正则守护，malformed created_at 行静默掉出——
+    与 growth/retention 同口径：live 注册数随删号回缩，是已知下界。
+    """
+    rows = conn.execute(
+        f"""
+        SELECT to_char((date_trunc('week', timezone(%s, created_at::timestamptz)))::date,
+                       'YYYY-MM-DD') AS w,
+               COUNT(*)::int
+        FROM users
+        WHERE {_CREATED_AT_ISO}
+          AND (date_trunc('week', timezone(%s, created_at::timestamptz)))::date >= %s::date
+        GROUP BY 1
+        """,
+        (tz, tz, since_monday.isoformat()),
+    ).fetchall()
+    return {r[0]: int(r[1] or 0) for r in rows}
+
+
+_PH_PERIODS = (1, 2, 4, 8)
+
+
+def admin_product_health_weekly_cohort_retention(
+    *, tz: str = "Asia/Shanghai", weeks: int = 12,
+) -> dict:
+    """周注册 cohort 的 W1/W2/W4/W8 留存矩阵。
+
+    只读 ``retention_cohort_snapshot`` 冻结行（PK (cohort_week,period_index)
+    直接命中，period_index IN (1,2,4,8)，cohort_week 按 ISO 字符串下界过滤），
+    绝不落回 live 计算——周中 live 重算把没走完的周期压低成假流失。未冻结/
+    未成熟的格子 = None（未成熟），不是 0。horizon 内已有注册但还没有任何
+    冻结行的新 cohort 也发出（全 None 格子），注册数来自
+    ``_ph_weekly_registrations``；cohort_size==0 的 cohort 丢弃。分母用冻结
+    行 pinned 的 cohort_size（删号免疫）。newest first。
+    """
+    safe_weeks = max(1, min(int(weeks or 12), 16))
+    periods = list(_PH_PERIODS)
+    zone = _ph_zone(tz)
+    this_monday = _bj_monday(datetime.now(zone).date())
+    horizon = this_monday - timedelta(days=7 * (safe_weeks - 1))
+    with get_pool().connection() as conn:
+        frozen = conn.execute(
+            "SELECT cohort_week, period_index, cohort_size, active_count "
+            "FROM retention_cohort_snapshot "
+            "WHERE period_index = ANY(%s) AND cohort_week >= %s",
+            (periods, horizon.isoformat()),
+        ).fetchall()
+        reg = _ph_weekly_registrations(conn, tz=tz, since_monday=horizon)
+    cells_by_week: dict[str, dict[int, tuple[int, int]]] = {}
+    for week, p, size, active in frozen:
+        cells_by_week.setdefault(week, {})[int(p)] = (int(size or 0), int(active or 0))
+    cohorts: list[dict] = []
+    for week in sorted(set(cells_by_week) | set(reg), reverse=True):
+        frozen_cells = cells_by_week.get(week, {})
+        # pinned denominator 取最早冻结周期那行（freeze 侧保证各行一致）。
+        n = frozen_cells[min(frozen_cells)][0] if frozen_cells else reg.get(week, 0)
+        if n <= 0:
+            continue
+        cells: dict[int, dict | None] = {}
+        for p in periods:
+            if p in frozen_cells and frozen_cells[p][0] > 0:
+                size, active = frozen_cells[p]
+                cells[p] = {"pct": round(100.0 * active / size, 1), "active": active}
+            else:
+                cells[p] = None
+        cohorts.append({"cohort_week": week, "n": n, "cells": cells})
+    return {"periods": periods, "cohorts": cohorts}
+
+
+def admin_product_health_activation_weekly(
+    *, tz: str = "Asia/Shanghai", weeks: int = 10,
+) -> dict:
+    """每周注册 cohort 的激活漏斗（t1 配置/上线 → t2 内容就绪 → t3 首次真回复）。
+
+    复用 ``admin_onboarding_funnel(registered_cutoff_ts=horizon)``（走它自己的
+    per-user 索引路径）；它返回 list|None——None 是查询失败，此时所有 cohort
+    coverage_complete=False、t3_rate=None，绝不把故障渲染成 0 转化。每 cohort
+    的 coverage_complete = 漏斗覆盖行数 == 独立注册计数（``_ph_weekly_registrations``
+    小扫描）；不相等说明有 created_at 解析不了的账号，率不可信 → None。
+    median_t0_t3_hours 只统计 t3>=t0 的行。newest first。
+    """
+    safe_weeks = max(1, min(int(weeks or 10), 16))
+    zone = _ph_zone(tz)
+    this_monday = _bj_monday(datetime.now(zone).date())
+    horizon = this_monday - timedelta(days=7 * (safe_weeks - 1))
+    cutoff_ts = _ph_day_epoch(horizon, zone)
+    funnel = admin_onboarding_funnel(registered_cutoff_ts=cutoff_ts)
+    with get_pool().connection() as conn:
+        reg = _ph_weekly_registrations(conn, tz=tz, since_monday=horizon)
+    buckets: dict[str, list[dict]] = {}
+    for row in funnel or []:
+        t0 = row.get("t0")
+        if t0 is None:
+            continue
+        monday = _bj_monday(datetime.fromtimestamp(float(t0), zone).date())
+        if monday < horizon:
+            continue
+        buckets.setdefault(monday.isoformat(), []).append(row)
+    cohorts: list[dict] = []
+    for k in range(safe_weeks):
+        monday = (this_monday - timedelta(days=7 * k)).isoformat()
+        n = reg.get(monday, 0)
+        bucket = buckets.get(monday, [])
+        coverage = funnel is not None and len(bucket) == n
+        t3_hours = [
+            (float(r["t3"]) - float(r["t0"])) / 3600.0
+            for r in bucket
+            if r.get("t3") is not None and float(r["t3"]) >= float(r["t0"])
+        ]
+        t3 = sum(1 for r in bucket if r.get("t3") is not None)
+        cohorts.append({
+            "cohort_week": monday,
+            "n": n,
+            "t1": sum(1 for r in bucket if r.get("t1") is not None),
+            "t2": sum(1 for r in bucket if r.get("t2") is not None),
+            "t3": t3,
+            "t3_rate": (t3 / n) if (coverage and n) else None,
+            "median_t0_t3_hours": _ph_median(t3_hours),
+            "coverage_complete": coverage,
+        })
+    return {"cohorts": cohorts}
+
+
+def admin_product_health_w4_split(*, tz: str = "Asia/Shanghai") -> dict:
+    """已激活 vs 全量 cohort 的第 4 周仍活跃率（W4 窗口已完整走完的 cohort）。
+
+    cohort = 注册周一 ∈ [本周一-12w, 本周一-5w]（-5w 的 W4 窗 [W+28d,W+35d)
+    恰好在本周一收口，全部成熟）。W4 活跃只认 ``app_session_end``（对每个
+    cohort 用户在 ``logs_stream_ts_idx (user_id, stream, ts)`` 上 nested-loop
+    EXISTS）：纯聊天/网页用户计为不活跃——保守下界，与 view=growth 同一把尺。
+    activated = 存在非 fallback agent 真回复（role IN agent/openclaw 且 source
+    NOT IN foreground_fallback/proactive_fallback）**且 ts < W4 窗口开始**——
+    激活必须先于被预测的那周，否则 W4 之后才补的首条真回复会让成熟 cohort 的
+    率在两次刷新之间漂移、因果也倒置（激活预测留存变成留存招来激活）；有了
+    这个上界，成熟 cohort 的数字永久冻结。比率是 0..1 小数，分母为
+    0 时 None（不是 0%）。newest first，8 个 cohort 周全部发出（无注册周
+    n_all=0、率 None）。
+    """
+    zone = _ph_zone(tz)
+    this_monday = _bj_monday(datetime.now(zone).date())
+    newest = this_monday - timedelta(days=7 * 5)
+    oldest = this_monday - timedelta(days=7 * 12)
+    with get_pool().connection() as conn:
+        rows = conn.execute(
+            f"""
+            WITH cohort AS (
+                SELECT user_id,
+                       (date_trunc('week', timezone(%s, created_at::timestamptz)))::date
+                           AS cohort_monday
+                FROM users
+                WHERE {_CREATED_AT_ISO}
+            ),
+            bounded AS (
+                SELECT user_id, cohort_monday,
+                       EXTRACT(EPOCH FROM ((cohort_monday + 28)::timestamp AT TIME ZONE %s))
+                           AS w4_start,
+                       EXTRACT(EPOCH FROM ((cohort_monday + 35)::timestamp AT TIME ZONE %s))
+                           AS w4_end
+                FROM cohort
+                WHERE cohort_monday >= %s::date AND cohort_monday <= %s::date
+            ),
+            flagged AS (
+                SELECT b.cohort_monday,
+                       EXISTS (
+                           SELECT 1 FROM chat_messages cm
+                           WHERE cm.user_id = b.user_id
+                             AND cm.doc->>'role' IN ('agent','openclaw')
+                             AND COALESCE(cm.doc->>'source','')
+                                 NOT IN ('foreground_fallback','proactive_fallback')
+                             -- 激活必须先于 W4 窗口，见 docstring。
+                             AND cm.ts < b.w4_start
+                       ) AS activated,
+                       EXISTS (
+                           SELECT 1 FROM user_logs l
+                           WHERE l.user_id = b.user_id
+                             AND l.stream = 'tracking_events'
+                             AND l.ts >= b.w4_start AND l.ts < b.w4_end
+                             AND l.doc->>'type' = 'app_session_end'
+                       ) AS w4_active
+                FROM bounded b
+            )
+            SELECT to_char(cohort_monday, 'YYYY-MM-DD') AS week,
+                   COUNT(*)::int AS n_all,
+                   (COUNT(*) FILTER (WHERE activated))::int AS n_activated,
+                   (COUNT(*) FILTER (WHERE w4_active))::int AS w4_all,
+                   (COUNT(*) FILTER (WHERE activated AND w4_active))::int AS w4_activated
+            FROM flagged
+            GROUP BY cohort_monday
+            """,
+            (tz, tz, tz, oldest.isoformat(), newest.isoformat()),
+        ).fetchall()
+    by_week = {r[0]: (int(r[1]), int(r[2]), int(r[3]), int(r[4])) for r in rows}
+    cohorts: list[dict] = []
+    monday = newest
+    while monday >= oldest:
+        n_all, n_act, w4_all, w4_act = by_week.get(monday.isoformat(), (0, 0, 0, 0))
+        cohorts.append({
+            "cohort_week": monday.isoformat(),
+            "n_all": n_all,
+            "n_activated": n_act,
+            "w4_all": w4_all,
+            "w4_activated": w4_act,
+            "w4_rate_all": (w4_all / n_all) if n_all else None,
+            "w4_rate_activated": (w4_act / n_act) if n_act else None,
+        })
+        monday -= timedelta(days=7)
+    return {"cohorts": cohorts}
+
+
+def admin_product_health_stickiness(*, tz: str = "Asia/Shanghai") -> dict:
+    """最近 7 个完整北京日的 DAU/WAU 粘性 + L7 活跃天数分布。
+
+    活跃口径 = ``app_session_end``（真打开 app），谓词与 0078 部分索引
+    ``ix_user_logs_app_session_end_ts``（stream='tracking_events' AND
+    doc->>'type'='app_session_end'）逐字一致，ts 范围扫直接命中。今天（未走
+    完的日）不进窗口。stickiness = avg_dau/wau，wau==0 时 None（没人 ≠ 0%
+    粘性）。l_distribution 键 1..7 = 该周活跃恰好 N 天的用户数。
+    """
+    zone = _ph_zone(tz)
+    today = datetime.now(zone).date()
+    start_day = today - timedelta(days=7)
+    end_day = today - timedelta(days=1)
+    start_e = _ph_day_epoch(start_day, zone)
+    end_e = _ph_day_epoch(today, zone)
+    with get_pool().connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT user_id, (timezone(%s, to_timestamp(ts)))::date AS d
+            FROM user_logs
+            WHERE stream='tracking_events'
+              AND doc->>'type'='app_session_end'
+              AND ts >= %s AND ts < %s
+            GROUP BY user_id, d
+            """,
+            (tz, start_e, end_e),
+        ).fetchall()
+    days_by_user: dict[str, set] = {}
+    users_by_day: dict[str, set] = {}
+    for uid, d in rows:
+        key = d.isoformat() if hasattr(d, "isoformat") else str(d)
+        days_by_user.setdefault(uid, set()).add(key)
+        users_by_day.setdefault(key, set()).add(uid)
+    wau = len(days_by_user)
+    dau_series = [
+        len(users_by_day.get((start_day + timedelta(days=i)).isoformat(), ()))
+        for i in range(7)
+    ]
+    avg_dau = sum(dau_series) / 7.0
+    l_distribution = {i: 0 for i in range(1, 8)}
+    for day_set in days_by_user.values():
+        l_distribution[min(len(day_set), 7)] += 1
+    return {
+        "window": {"start_day": start_day.isoformat(), "end_day": end_day.isoformat()},
+        "wau": wau,
+        "avg_dau": avg_dau,
+        "dau_latest": dau_series[-1],
+        "stickiness": (avg_dau / wau) if wau else None,
+        "l_distribution": l_distribution,
+    }
+
+
+def admin_product_health_concentration(
+    *, tz: str = "Asia/Shanghai", days: int = 28,
+) -> dict:
+    """使用集中度：前 10% 用户占多少 sessions / tokens（trailing 28 天）。
+
+    sessions 侧 = 完整北京日窗口内每用户 ``app_session_end`` 计数（谓词与
+    0078 部分索引一致），NTILE(10) OVER (ORDER BY sessions DESC) 取第 1 个
+    十分位；小样本下前 10% ≈ 排名最靠前的 ~n/10 人。tokens 侧 =
+    ``v2_turn_metrics`` 每用户 sum(prompt+completion)，created_at 用与
+    sessions **同一对**完整北京日边界（并排展示的两个 share 必须同窗，进行
+    中的今天两边都不进），走 ``ix_v2_turn_metrics_created_at``；
+    HAVING sum>0）。tokens 只覆盖 Hosted V2 灰度：BYOK 自付费用户的消耗
+    服务器看不见，未上报的使用按 0 排名——share 是已知下限，不是全量。
+    ``users`` = 窗口内被统计的用户总数；share = top 10% 占比（0..1），总量
+    为 0 时 None（没有数据 ≠ 0% 集中）。
+    """
+    safe_days = max(1, min(int(days or 28), 90))
+    zone = _ph_zone(tz)
+    today = datetime.now(zone).date()
+    start_e = _ph_day_epoch(today - timedelta(days=safe_days), zone)
+    end_e = _ph_day_epoch(today, zone)
+    with get_pool().connection() as conn:
+        sess = conn.execute(
+            """
+            WITH per_user AS (
+                SELECT user_id, COUNT(*)::int AS n
+                FROM user_logs
+                WHERE stream='tracking_events'
+                  AND doc->>'type'='app_session_end'
+                  AND ts >= %s AND ts < %s
+                GROUP BY user_id
+            ),
+            ranked AS (
+                SELECT n, NTILE(10) OVER (ORDER BY n DESC) AS decile FROM per_user
+            )
+            SELECT COALESCE(SUM(n), 0)::bigint,
+                   COALESCE(SUM(n) FILTER (WHERE decile = 1), 0)::bigint,
+                   COUNT(*)::int
+            FROM ranked
+            """,
+            (start_e, end_e),
+        ).fetchone()
+        toks = conn.execute(
+            """
+            WITH per_user AS (
+                SELECT user_id,
+                       SUM(COALESCE(prompt_tokens,0) + COALESCE(completion_tokens,0))::bigint AS n
+                FROM v2_turn_metrics
+                WHERE created_at >= to_timestamp(%s) AND created_at < to_timestamp(%s)
+                GROUP BY user_id
+                HAVING SUM(COALESCE(prompt_tokens,0) + COALESCE(completion_tokens,0)) > 0
+            ),
+            ranked AS (
+                SELECT n, NTILE(10) OVER (ORDER BY n DESC) AS decile FROM per_user
+            )
+            SELECT COALESCE(SUM(n), 0)::bigint,
+                   COALESCE(SUM(n) FILTER (WHERE decile = 1), 0)::bigint,
+                   COUNT(*)::int
+            FROM ranked
+            """,
+            (start_e, end_e),
+        ).fetchone()
+
+    def _bucket(row) -> dict:
+        total, top, users = int(row[0] or 0), int(row[1] or 0), int(row[2] or 0)
+        return {
+            "total": total,
+            "top_decile": top,
+            "users": users,
+            "share": (top / total) if total else None,
+        }
+
+    return {"sessions": _bucket(sess), "tokens": _bucket(toks)}
+
+
+def admin_product_health_growth_accounting_weekly(
+    *, tz: str = "Asia/Shanghai", weeks: int = 10,
+) -> dict:
+    """周粒度增长核算：新注册 / 新激活 / 活跃 / 流失 / 复活 / 净变化。
+
+    三个有界查询 + Python 集合代数：①每周活跃 (user, monday) 对来自
+    ``app_session_end``（0078 部分索引的 ts 范围扫，含 baseline 多取一周）；
+    ②全量 user→注册周映射（users 小扫描，``_CREATED_AT_ISO`` 守护）；
+    ③horizon 内注册用户的 t3（首次非 fallback 真回复）epoch。
+    churned(w)=上周活跃本周不活跃，resurrected(w)=本周活跃上周不活跃且非本周
+    新注册。newly_activated 只统计 horizon 内注册的用户——horizon 之前注册、
+    现在才补 t3 的用户被排除（窗口外不取 t3，防无界扫描），是已知下界。
+    最老一行是 baseline：四个增量字段 None（无上周可比，不是 0）。最新一行
+    是进行中的本周：churned/resurrected/net_change 右删失（这周还没打开 app
+    ≠ 流失），同样发 None——new_registered/newly_activated/active 保留为
+    到目前为止的运行下界。共 weeks+1 行，newest first。
+    """
+    safe_weeks = max(1, min(int(weeks or 10), 16))
+    zone = _ph_zone(tz)
+    this_monday = _bj_monday(datetime.now(zone).date())
+    baseline = this_monday - timedelta(days=7 * safe_weeks)
+    baseline_e = _ph_day_epoch(baseline, zone)
+    with get_pool().connection() as conn:
+        act_rows = conn.execute(
+            """
+            SELECT DISTINCT user_id,
+                   (date_trunc('week', timezone(%s, to_timestamp(ts))))::date AS monday
+            FROM user_logs
+            WHERE stream='tracking_events'
+              AND doc->>'type'='app_session_end'
+              AND ts >= %s
+            """,
+            (tz, baseline_e),
+        ).fetchall()
+        cohort_rows = conn.execute(
+            f"""
+            SELECT user_id,
+                   to_char((date_trunc('week', timezone(%s, created_at::timestamptz)))::date,
+                           'YYYY-MM-DD')
+            FROM users
+            WHERE {_CREATED_AT_ISO}
+            """,
+            (tz,),
+        ).fetchall()
+        t3_rows = conn.execute(
+            f"""
+            SELECT cm.user_id, MIN(cm.ts)
+            FROM chat_messages cm
+            WHERE cm.doc->>'role' IN ('agent','openclaw')
+              AND COALESCE(cm.doc->>'source','')
+                  NOT IN ('foreground_fallback','proactive_fallback')
+              AND cm.user_id IN (
+                  SELECT user_id FROM users
+                  WHERE {_CREATED_AT_ISO}
+                    AND (date_trunc('week', timezone(%s, created_at::timestamptz)))::date
+                        >= %s::date
+              )
+            GROUP BY cm.user_id
+            """,
+            (tz, baseline.isoformat()),
+        ).fetchall()
+    active_by_week: dict[str, set] = {}
+    for uid, monday in act_rows:
+        key = monday.isoformat() if hasattr(monday, "isoformat") else str(monday)
+        active_by_week.setdefault(key, set()).add(uid)
+    cohort_of = {uid: week for uid, week in cohort_rows}
+    t3_week: dict[str, str] = {
+        uid: _bj_monday(datetime.fromtimestamp(float(ts), zone).date()).isoformat()
+        for uid, ts in t3_rows
+        if ts is not None
+    }
+    out_rows: list[dict] = []
+    prev: set | None = None
+    monday = baseline
+    while monday <= this_monday:
+        key = monday.isoformat()
+        cur = active_by_week.get(key, set())
+        new_registered = sum(1 for w in cohort_of.values() if w == key)
+        if prev is None:
+            out_rows.append({
+                "week": key, "new_registered": new_registered,
+                "newly_activated": None, "active": len(cur),
+                "churned": None, "resurrected": None, "net_change": None,
+            })
+        elif monday == this_monday:
+            # 进行中的本周：churn/resurrect/net 右删失（还有几天可回来），
+            # 与 baseline 同款 None——绝不把「还没打开」编成已流失。
+            out_rows.append({
+                "week": key,
+                "new_registered": new_registered,
+                "newly_activated": sum(1 for w in t3_week.values() if w == key),
+                "active": len(cur),
+                "churned": None, "resurrected": None, "net_change": None,
+            })
+        else:
+            resurrected = {
+                u for u in (cur - prev) if cohort_of.get(u) != key
+            }
+            out_rows.append({
+                "week": key,
+                "new_registered": new_registered,
+                "newly_activated": sum(1 for w in t3_week.values() if w == key),
+                "active": len(cur),
+                "churned": len(prev - cur),
+                "resurrected": len(resurrected),
+                "net_change": len(cur) - len(prev),
+            })
+        prev = cur
+        monday += timedelta(days=7)
+    out_rows.reverse()
+    return {"rows": out_rows}
+
+
+def admin_product_health_power_users(
+    *, tz: str = "Asia/Shanghai", weeks: int = 16,
+    min_jobs: int = 5, streak_weeks: int = 4,
+) -> dict:
+    """Power user：连续 streak_weeks 周、每周 >= min_jobs 个放行的用户侧主动 job。
+
+    自主心跳不算用户用量：默认 cadence 下心跳 ~12/天（86400/7200），任何
+    agent 在线的用户每周 ~84 个 tick，min_jobs=5 会被躺满——那量的是 agent
+    uptime，不是 engagement。所以 legacy V1（user_logs
+    stream='proactive_jobs'）在排除 maintenance kinds（job_kind→wake_kind→
+    trigger COALESCE 链 NOT IN memory_capture/dream/migrate）和被心跳闸拦下
+    的 skipped+heartbeat_throttled 之外，还整体剔除心跳/presence tick——
+    kind 链匹配与 ``admin_proactive_heartbeat_overspeed`` 逐字一致（presence
+    或 heartbeat%，但 heartbeat_broadcast_on 等用户动作除外）；Runtime V2
+    （agent_jobs）只认 lane IN scheduled/manual_wake，heartbeat lane 不进
+    census。被 gate block 的 V2 wake 不落行，天然全是 admitted。V2 wake
+    从不写 legacy 流，UNION ALL 不会双计。V1 分支没有 serving index（user_logs 全流按 ts 过滤，沿用既有
+    data-track 口径，页面有 60s 缓存兜底）；V2 分支同样按 created_at 范围扫。
+    power_users(w) = 在 w-(streak_weeks-1)..w 每一周都 >= min_jobs 的用户数；
+    取不满 streak 个前置周的最老几周 = None（不可判定 ≠ 0）。monthly = 每个
+    北京月取最后一个已完整走完且可判定的周的值，最近 3 个月。
+    """
+    safe_weeks = max(1, min(int(weeks or 16), 16))
+    safe_min = max(1, int(min_jobs or 5))
+    safe_streak = max(1, min(int(streak_weeks or 4), safe_weeks))
+    zone = _ph_zone(tz)
+    today = datetime.now(zone).date()
+    this_monday = _bj_monday(today)
+    horizon = this_monday - timedelta(days=7 * (safe_weeks - 1))
+    horizon_e = _ph_day_epoch(horizon, zone)
+    with get_pool().connection() as conn:
+        rows = conn.execute(
+            """
+            WITH jobs AS (
+                SELECT user_id,
+                       (date_trunc('week', timezone(%s, to_timestamp(ts))))::date AS monday
+                FROM user_logs
+                WHERE stream = 'proactive_jobs'
+                  AND ts IS NOT NULL AND ts >= %s
+                  AND COALESCE(NULLIF(doc->>'job_kind',''), NULLIF(doc->>'wake_kind',''),
+                               NULLIF(doc->>'trigger',''), 'unknown')
+                      NOT IN ('memory_capture','memory_dream','memory_migrate')
+                  AND NOT (COALESCE(doc->>'status','') = 'skipped'
+                           AND COALESCE(doc->>'status_reason','') = 'heartbeat_throttled')
+                  -- 自主心跳/presence tick 量的是 agent uptime 不是用户行为，
+                  -- 剔除；kind 链匹配与 overspeed 哨兵逐字一致。
+                  AND NOT (
+                    (
+                      COALESCE(NULLIF(doc->>'job_kind',''), NULLIF(doc->>'wake_kind',''),
+                               NULLIF(doc->>'trigger',''), 'unknown') = 'presence'
+                      OR COALESCE(NULLIF(doc->>'job_kind',''), NULLIF(doc->>'wake_kind',''),
+                                  NULLIF(doc->>'trigger',''), 'unknown') LIKE 'heartbeat%%'
+                    )
+                    AND COALESCE(NULLIF(doc->>'job_kind',''), NULLIF(doc->>'wake_kind',''),
+                                 NULLIF(doc->>'trigger',''), 'unknown')
+                        NOT IN ('screen_watch','scene_change','screen_tick',
+                                'broadcast_opened','heartbeat_broadcast_on')
+                  )
+
+                UNION ALL
+
+                SELECT user_id,
+                       (date_trunc('week', created_at AT TIME ZONE %s))::date AS monday
+                FROM agent_jobs
+                WHERE lane IN ('scheduled','manual_wake')
+                  AND created_at >= to_timestamp(%s)
+            )
+            SELECT to_char(monday, 'YYYY-MM-DD') AS week, user_id, COUNT(*)::int
+            FROM jobs
+            GROUP BY monday, user_id
+            """,
+            (tz, horizon_e, tz, horizon_e),
+        ).fetchall()
+    per_week: dict[str, dict[str, int]] = {}
+    for week, uid, n in rows:
+        per_week.setdefault(week, {})[uid] = int(n)
+    mondays = [this_monday - timedelta(days=7 * k) for k in range(safe_weeks)]
+    weekly: list[dict] = []
+    for k, monday in enumerate(mondays):
+        key = monday.isoformat()
+        qualifying = {u for u, n in per_week.get(key, {}).items() if n >= safe_min}
+        if k + safe_streak - 1 > safe_weeks - 1:
+            power = None  # streak 窗越过取数 horizon，不可判定。
+        else:
+            power = sum(
+                1 for u in qualifying
+                if all(
+                    per_week.get(mondays[k + j].isoformat(), {}).get(u, 0) >= safe_min
+                    for j in range(1, safe_streak)
+                )
+            )
+        weekly.append({
+            "week": key,
+            "qualifying_users": len(qualifying),
+            "power_users": power,
+        })
+    current = weekly[0]["power_users"] if weekly else None
+    monthly_pick: dict[str, int] = {}
+    for row, monday in zip(weekly, mondays):
+        # 只取已完整走完且可判定的周；weekly 按 newest first，所以每月第一次
+        # 命中即该月最后一个完整周。
+        if monday >= this_monday or row["power_users"] is None:
+            continue
+        month = monday.isoformat()[:7]
+        if month not in monthly_pick:
+            monthly_pick[month] = row["power_users"]
+    monthly = [
+        {"month": m, "power_users": monthly_pick[m]}
+        for m in sorted(monthly_pick, reverse=True)[:3]
+    ]
+    return {
+        "definition": {"min_jobs": safe_min, "streak_weeks": safe_streak},
+        "weekly": weekly,
+        "current": current,
+        "monthly": monthly,
+    }
+
+
+def admin_product_health_proactive_reply_rate(
+    *, tz: str = "Asia/Shanghai", weeks: int = 10,
+) -> dict:
+    """每周主动消息的 24h 内用户回复率（右删失，仅回复下限）。
+
+    一个 window function 扫 ``chat_messages``（ts >= horizon 下界；follow-up
+    不设上界，回复本身可以晚于窗口）：主动消息 = role agent/openclaw 且
+    source='agent_initiated_proactive'；回复 = 同用户下一条 user/human 消息
+    （source NOT IN verify_ping/resident_maintenance）且间隔 <= 86400s。
+    右删失：只统计 ts <= now-86400 的主动消息，保证每条被计数的消息都拥有过
+    完整 24h 窗口——当前周因此只含已成熟的消息。仅回复下限（客户端查看/点按
+    ACK 未埋点，看了没回不算）；相关窗口非归因——24h 内的回复未必是冲这条
+    消息来的。chat_messages 按此谓词无索引可用，接受一次有界 seq scan（既有
+    data-track 口径，页面有缓存）。reply_rate 为 0..1 小数，分母 0 → None。
+    newest first，horizon 内每周都发行。
+    """
+    safe_weeks = max(1, min(int(weeks or 10), 16))
+    zone = _ph_zone(tz)
+    this_monday = _bj_monday(datetime.now(zone).date())
+    horizon = this_monday - timedelta(days=7 * (safe_weeks - 1))
+    horizon_e = _ph_day_epoch(horizon, zone)
+    censor_e = time.time() - 86400.0
+    with get_pool().connection() as conn:
+        rows = conn.execute(
+            """
+            WITH m AS (
+                SELECT user_id, ts,
+                       doc->>'role' AS role,
+                       COALESCE(doc->>'source','') AS source
+                FROM chat_messages
+                WHERE ts >= %s
+            ),
+            nexted AS (
+                SELECT user_id, ts, role, source,
+                       MIN(CASE WHEN role IN ('user','human')
+                                 AND source NOT IN ('verify_ping','resident_maintenance')
+                                THEN ts END)
+                           OVER (PARTITION BY user_id ORDER BY ts
+                                 ROWS BETWEEN 1 FOLLOWING AND UNBOUNDED FOLLOWING)
+                           AS next_user_ts
+                FROM m
+            )
+            SELECT to_char((date_trunc('week', timezone(%s, to_timestamp(ts))))::date,
+                           'YYYY-MM-DD') AS week,
+                   COUNT(*)::int AS proactive_msgs,
+                   (COUNT(*) FILTER (WHERE next_user_ts IS NOT NULL
+                                       AND next_user_ts - ts <= 86400))::int AS replied_24h,
+                   COUNT(DISTINCT user_id)::int AS users
+            FROM nexted
+            WHERE role IN ('agent','openclaw')
+              AND source = 'agent_initiated_proactive'
+              AND ts <= %s
+            GROUP BY 1
+            """,
+            (horizon_e, tz, censor_e),
+        ).fetchall()
+    by_week = {r[0]: (int(r[1]), int(r[2]), int(r[3])) for r in rows}
+    out_rows: list[dict] = []
+    for k in range(safe_weeks):
+        key = (this_monday - timedelta(days=7 * k)).isoformat()
+        msgs, replied, users = by_week.get(key, (0, 0, 0))
+        out_rows.append({
+            "week": key,
+            "proactive_msgs": msgs,
+            "replied_24h": replied,
+            "users": users,
+            "reply_rate": (replied / msgs) if msgs else None,
+        })
+    return {"rows": out_rows}
+
+
 def freeze_completed_retention_cohorts(*, now_epoch: float | None = None,
                                        tz: str = "Asia/Shanghai") -> list[str]:
     """Freeze (cohort_week, period) cells whose week has fully ended.

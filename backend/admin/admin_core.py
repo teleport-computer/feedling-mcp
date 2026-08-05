@@ -196,6 +196,68 @@ def _build_page_html(query_string: str) -> str:
                 prev_usage=results["prev_usage"],
                 within_hours=hours,
             )
+        if view == "health":
+            # 产品健康页不吃 hours/day 窗口参数：留存/激活/粘性口径全部固定在
+            # db 层（周 cohort、28 天滚动窗），带窗参会让 URL 看起来可调实际
+            # 不可调。扇出走 overview 同一个进程级线程池与失败域约定。
+            specs: dict[str, tuple[str, object, dict]] = {
+                "retention": (
+                    "admin product-health retention query failed",
+                    db.admin_product_health_weekly_cohort_retention,
+                    {},
+                ),
+                "activation": (
+                    "admin product-health activation query failed",
+                    db.admin_product_health_activation_weekly,
+                    {},
+                ),
+                "w4_split": (
+                    "admin product-health w4_split query failed",
+                    db.admin_product_health_w4_split,
+                    {},
+                ),
+                "stickiness": (
+                    "admin product-health stickiness query failed",
+                    db.admin_product_health_stickiness,
+                    {},
+                ),
+                "concentration": (
+                    "admin product-health concentration query failed",
+                    db.admin_product_health_concentration,
+                    {},
+                ),
+                "growth": (
+                    "admin product-health growth query failed",
+                    db.admin_product_health_growth_accounting_weekly,
+                    {},
+                ),
+                "power": (
+                    "admin product-health power query failed",
+                    db.admin_product_health_power_users,
+                    {},
+                ),
+                "reply_rate": (
+                    "admin product-health reply_rate query failed",
+                    db.admin_product_health_proactive_reply_rate,
+                    {},
+                ),
+            }
+            executor = _get_ops_executor()
+            futures = {
+                name: executor.submit(_overview_builder, name, failure_msg, fn, **kwargs)
+                for name, (failure_msg, fn, kwargs) in specs.items()
+            }
+            results = {name: future.result() for name, future in futures.items()}
+            return data_track._render_product_health_page(
+                results["retention"],
+                results["activation"],
+                results["w4_split"],
+                results["stickiness"],
+                results["concentration"],
+                results["growth"],
+                results["power"],
+                results["reply_rate"],
+            )
         if view == "imports":
             hours = data_track._ops_window_hours()
             try:
