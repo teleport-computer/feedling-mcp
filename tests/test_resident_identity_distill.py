@@ -23,14 +23,25 @@ GOOD = json.dumps({
 
 
 def _patch(monkeypatch, replies):
-    calls = {"prompts": []}
-    def fake_call_agent(prompt, raw_text=True, trace_id=""):
+    calls = {"prompts": [], "isolated": []}
+    def fake_call_agent(prompt, raw_text=True, trace_id="", isolated_session=False):
         calls["prompts"].append(prompt)
+        calls["isolated"].append(isolated_session)
         return replies[min(len(calls["prompts"]) - 1, len(replies) - 1)]
     monkeypatch.setattr(crc, "call_agent", fake_call_agent)
     monkeypatch.setattr(crc, "_capture_agent_reply_text", lambda x: x)
     monkeypatch.setattr(crc, "_resident_existing_identity", lambda: {})
     return calls
+
+
+def test_derive_runs_in_isolated_session(monkeypatch):
+    # Resident report 2026-08-05: sharing the resumed chat session made chat
+    # context bleed into the derivation (schema drift) and made a repeat
+    # redistill get refused as a "duplicate request". Every attempt — including
+    # the bad-JSON retry — must run isolated.
+    calls = _patch(monkeypatch, ["不是 JSON", GOOD])
+    crc._resident_derive_identity("材料", "job-iso")
+    assert calls["isolated"] == [True, True]
 
 
 def test_derive_returns_full_persona_fields(monkeypatch):

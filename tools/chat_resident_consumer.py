@@ -111,6 +111,7 @@ import threading
 import time
 import unicodedata
 import urllib.parse
+import uuid
 import xml.etree.ElementTree as _ET
 import zipfile
 from pathlib import Path
@@ -6539,6 +6540,21 @@ def _prepare_cli_command(
             cmd = [cmd[0], "--print", *cmd[1:]]
         if not _has_claude_output_format(cmd):
             cmd = [cmd[0], "--output-format", "json", *cmd[1:]]
+        # Isolated turn (session_id_override — vision probe / dream review /
+        # identity distill): a bare `claude --print` with no session flag IS a
+        # fresh session, which is exactly the isolation being asked for. Never
+        # inject --resume here: claude's --print --resume accepts only a UUID
+        # claude itself generated (or an existing session title), so resuming
+        # the consumer-minted bounded label fails the very first turn outright
+        # (resident report 2026-08-05 — broke vision probes and dream reviews
+        # on claude-driver homes). Drivers that accept arbitrary ids (pi's
+        # create-if-missing --session-id, Hermes --resume) keep the override.
+        if session_id_override is not None:
+            if _has_claude_session_id(cmd):
+                # Operator template hard-codes --session-id: claude requires a
+                # UUID there too, so replace the bounded label bound by
+                # _ensure_explicit_cli_session_id with a throwaway real UUID.
+                cmd = _set_cli_option_value(cmd, "--session-id", str(uuid.uuid4()))
         # When THIS turn's message actually carries an injected recent-chat
         # transcript (see _foreground_agent_message), that transcript is the single
         # continuity source — do NOT also inject claude's fragile --resume, which
@@ -6546,7 +6562,7 @@ def _prepare_cli_command(
         # no transcript was injected (injection off, history unavailable, or first
         # turn), keep --resume as the fallback so continuity is never dropped on
         # both sides at once.
-        if (
+        elif (
             sid
             and not _has_cli_resume(cmd)
             and not _has_claude_session_id(cmd)
@@ -15197,7 +15213,14 @@ def _resident_derive_identity(document: str, job_id: str) -> dict | None:
     existing = _resident_existing_identity()
     prompt = _dp.build_resident_identity_prompt(document, existing_identity=existing or None)
     for attempt in (1, 2):
-        raw = str(_capture_agent_reply_text(call_agent(prompt, raw_text=True, trace_id=job_id)) or "").strip()
+        # isolated_session: derive in a clean context, like the vision probe and
+        # dream review. Sharing the resumed chat session made surrounding chat
+        # bleed into the derivation (schema drift: invented fields) and made a
+        # second redistill in the same session get refused as a "duplicate
+        # request" in prose instead of JSON (resident report 2026-08-05).
+        raw = str(_capture_agent_reply_text(call_agent(
+            prompt, raw_text=True, trace_id=job_id, isolated_session=True,
+        )) or "").strip()
         payload = _dp.parse_identity_payload(raw)
         if payload is not None:
             incremental = _resident_incremental_payload(payload, existing)

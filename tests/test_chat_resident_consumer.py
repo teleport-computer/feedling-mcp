@@ -2313,6 +2313,91 @@ def test_prepare_claude_cli_injects_stored_resume(monkeypatch):
     assert stdin_msg == "hello"
 
 
+# --------------------------------------------------------------------------- #
+# Isolated-session driver matrix (resident report 2026-08-05). These pin the
+# PRODUCT (the argv actually handed to the driver), not the intent flag: the
+# earlier tests asserted only that isolated_session=True was passed to a mocked
+# call_agent, which let a claude command that could never run ship green.
+# claude's --print --resume accepts only a real UUID it generated itself (or an
+# existing session title), so the consumer-minted bounded label must never be
+# fed back to claude — a bare `claude --print` IS the fresh session. pi and
+# Hermes accept arbitrary ids and keep using the minted override.
+# --------------------------------------------------------------------------- #
+
+def _fail_session_store_reads(monkeypatch):
+    def _boom():  # isolated turns must never touch the shared session store
+        raise AssertionError("isolated turn read the shared session store")
+    monkeypatch.setattr(crc, "_load_agent_session_id", _boom)
+    monkeypatch.setattr(
+        crc, "_save_agent_session_id",
+        lambda sid: (_ for _ in ()).throw(
+            AssertionError("isolated turn wrote the shared session store")),
+    )
+
+
+def test_prepare_claude_cli_isolated_session_gets_no_session_flags(monkeypatch):
+    monkeypatch.setattr(crc, "AGENT_CLI_CMD", 'claude -p "{message}"')
+    monkeypatch.setattr(crc, "FOREGROUND_CHAT_CONTEXT_MODE", "off")
+    monkeypatch.setattr(crc, "_resolve_cli_executable", lambda cmd: cmd)
+    _fail_session_store_reads(monkeypatch)
+
+    cmd, stdin_msg = crc._prepare_cli_command(
+        "hello", session_id_override=crc._new_agent_session_id()
+    )
+
+    assert "--resume" not in cmd          # the exact first-turn crash
+    assert "--session-id" not in cmd      # bare --print = fresh session
+    assert "--print" in cmd or "-p" in cmd
+    assert stdin_msg == "hello"
+
+
+def test_prepare_claude_cli_isolated_session_template_session_id_becomes_uuid(monkeypatch):
+    import uuid as _uuid
+    monkeypatch.setattr(
+        crc, "AGENT_CLI_CMD",
+        'claude -p --session-id feedling-io-fixed "{message}"',
+    )
+    monkeypatch.setattr(crc, "FOREGROUND_CHAT_CONTEXT_MODE", "off")
+    monkeypatch.setattr(crc, "_resolve_cli_executable", lambda cmd: cmd)
+    _fail_session_store_reads(monkeypatch)
+
+    cmd, _ = crc._prepare_cli_command(
+        "hello", session_id_override=crc._new_agent_session_id()
+    )
+
+    assert "--resume" not in cmd
+    sid_value = crc._cli_flag_value(cmd, "--session-id")
+    _uuid.UUID(sid_value)  # claude rejects anything that isn't a real UUID
+
+
+def test_prepare_pi_cli_isolated_session_keeps_minted_override(monkeypatch):
+    monkeypatch.setattr(crc, "AGENT_CLI_CMD", 'pi --mode json "{message}"')
+    monkeypatch.setattr(crc, "_resolve_cli_executable", lambda cmd: cmd)
+    _fail_session_store_reads(monkeypatch)
+
+    override = crc._new_agent_session_id()
+    cmd, _ = crc._prepare_cli_command("hello", session_id_override=override)
+
+    # pi --session-id is create-if-missing: the minted label is valid there,
+    # and it must NOT be persisted as the shared session (store write raises).
+    assert crc._cli_flag_value(cmd, "--session-id") == override
+    assert "--resume" not in cmd
+
+
+def test_prepare_claude_cli_shared_session_still_resumes(monkeypatch):
+    # Regression net for the fix: the SHARED path (no override) keeps claude's
+    # stored-UUID --resume continuity byte-identical to before.
+    sid = "123e4567-e89b-12d3-a456-426614174000"
+    monkeypatch.setattr(crc, "AGENT_CLI_CMD", 'claude -p "{message}"')
+    monkeypatch.setattr(crc, "FOREGROUND_CHAT_CONTEXT_MODE", "off")
+    monkeypatch.setattr(crc, "_load_agent_session_id", lambda: sid)
+    monkeypatch.setattr(crc, "_resolve_cli_executable", lambda cmd: cmd)
+
+    cmd, _ = crc._prepare_cli_command("hello")
+
+    assert cmd[:3] == ["claude", "--resume", sid]
+
+
 def test_warn_if_hermes_cli_may_drift_logs_profile_and_turns(monkeypatch, caplog):
     monkeypatch.setattr(crc, "AGENT_MODE", "cli")
     monkeypatch.setattr(
