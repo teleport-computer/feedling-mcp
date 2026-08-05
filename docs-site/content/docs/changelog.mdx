@@ -85,6 +85,15 @@ change must not be interpreted as an API guarantee.
   Perception-triggered wake messages no longer receive unrelated exact battery,
   weather, activity, sleep, or health values in their initial prompt.
 
+- **Plaintext memory writes reject tombstone-style notes.** A plaintext
+  `memory.add`, upgrade, or `memory.supersede` whose summary or content is a
+  bookkeeping note — "已被 … 取代" or "superseded by" followed by an
+  internal-id-like hex string — now fails with an item-level
+  `memory_card_tombstone` instead of being stored, and a rejected supersede
+  leaves every targeted card active. This closes the freehand agent-tool path
+  that bypassed the structured extraction gates; ordinary prose about
+  replacement without a hex id is unaffected.
+
 - **Hosted Dream maintenance now applies deterministic exit gates instead of
   content-quality judgment.** Runtime V2 fetches complete candidate card bodies
   instead of reconstructing them from one-line summaries. Every consolidation

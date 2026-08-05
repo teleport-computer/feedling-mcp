@@ -280,6 +280,17 @@ being stored or rewritten, while later valid actions in the same batch still
 run. Use the values published in the OpenAPI schema; omit optional metadata
 when none applies.
 
+Plaintext card text is validated for obviously-wrong content. A plaintext
+`memory.add`, upgrade, or `memory.supersede` whose summary or content is a
+tombstone-style bookkeeping note — the phrase "已被 … 取代" or "superseded by"
+followed by an internal hex id — fails with an item-level
+`memory_card_tombstone` (HTTP 400 for that item) instead of being stored, and a
+rejected supersede leaves every targeted card active. Card fields must carry
+the memory content itself; card retirement bookkeeping is recorded by the
+server, never written into visible text. Ordinary prose about something being
+replaced is unaffected: the rejection requires an internal-id-like hex string
+next to the phrase.
+
 This example adds one encrypted card, retypes an existing card, supersedes an
 outdated card with a new encrypted card, and deletes a fourth card:
 

@@ -302,3 +302,43 @@ def test_mixed_batch_continues_after_bad_card_and_keeps_success_effects(
     assert {
         effect["memory_id"] for effect in body["effects"]
     } == {"mem_batch_1", "mem_batch_2"}
+
+
+def test_tombstone_supersede_rejected_at_endpoint_and_old_card_stays_active(api_key):
+    """公开路由契约(2026-08-06 usr_a40e 徒手 patch 潮):明文 supersede 带
+    「已被 <卡id> 取代」墓碑注记 → 400 memory_card_tombstone,且旧卡保持 active。"""
+    client = make_client()
+    headers = {"X-API-Key": api_key}
+    user_id = registry._resolve_user(api_key)
+    db.memory_upsert(user_id, "mem_tomb_target", "2026-08-01T00:00:00Z", {
+        "id": "mem_tomb_target",
+        "type": "fact",
+        "status": "active",
+        "occurred_at": "2026-08-01T00:00:00Z",
+        "owner_user_id": user_id,
+        "body_ct": "ciphertext",
+        "nonce": "nonce",
+        "K_user": "wrapped",
+        "visibility": "shared",
+    })
+
+    tomb = "已被 c42ebb9618ae447df9d52107ea15de85 取代——绿豆汤偏好"
+    res = client.post(
+        "/v1/memory/actions",
+        headers=headers,
+        json={"actions": [{
+            "type": "memory.supersede",
+            "supersedes": "mem_tomb_target",
+            "memory": {"type": "fact", "title": tomb, "summary": tomb, "content": tomb},
+            "capture_mode": "state",
+        }]},
+    )
+    assert res.status_code == 400, res.get_json(silent=True)
+    body = res.get_json()
+    assert body["error"] == "memory_card_tombstone"
+    assert body["results"][0]["error"] == "memory_card_tombstone"
+
+    # 旧卡必须还活着 —— 拒收发生在退休之前。
+    moments = db.memory_load(user_id)
+    target = next(m for m in moments if m.get("id") == "mem_tomb_target")
+    assert str(target.get("status") or "active") == "active"
