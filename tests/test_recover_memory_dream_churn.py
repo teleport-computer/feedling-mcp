@@ -41,7 +41,7 @@ def test_recovery_restores_originals_and_soft_retires_dream_cards():
 
     assert plan == {
         "restore_non_dream_superseded": 2,
-        "retire_memory_dream": 1,
+        "retire_churn_cards": 1,
         "untouched": 1,
         "hard_deletes": 0,
     }
@@ -133,7 +133,7 @@ def test_window_recovery_uses_created_and_archived_boundaries_symmetrically():
     assert by_id["new-dream-already-superseded"]["status"] == "superseded"
     assert plan == {
         "restore_non_dream_superseded": 2,
-        "retire_memory_dream": 2,
+        "retire_churn_cards": 2,
         "untouched": 2,
         "hard_deletes": 0,
     }
@@ -237,3 +237,48 @@ def test_window_created_by_source_groups_and_respects_since():
     # 不带窗时全量分组
     grouped_all = recovery.window_created_by_source(docs, since=None)
     assert set(grouped_all) == {"resident_patch", "memory_dream", "memory_capture"}
+
+
+def test_retire_sources_extends_to_resident_patch_and_absorb():
+    """usr_a40e 徒手 patch 潮:窗内新建的 resident_patch 墓碑必须能被退休,
+    且被它吃掉的原卡照常恢复;窗前的同源老卡不动。"""
+    since = recovery._iso_datetime("2026-08-04")
+    docs = [
+        # 窗内徒手墓碑(active)→ 退休
+        {"id": "patch-tomb", "source": "resident_patch", "status": "active",
+         "created_at": "2026-08-04T18:03:15Z"},
+        # 窗内 absorb(已被后续墓碑顶掉)→ 保持退休(retire 分支优先于 restore)
+        {"id": "absorb-mid", "source": "resident_absorb", "status": "superseded",
+         "created_at": "2026-08-04T18:02:44Z", "is_archived": True,
+         "archived_at": "2026-08-04T18:03:11Z", "superseded_by": "patch-tomb"},
+        # 窗前老卡、窗内被吃 → 恢复
+        {"id": "old-dream", "source": "memory_dream", "status": "superseded",
+         "created_at": "2026-07-18T00:00:00Z", "is_archived": True,
+         "archived_at": "2026-08-04T18:03:15Z", "superseded_by": "patch-tomb"},
+        # 窗前 patch 老卡、没被动 → 不动
+        {"id": "old-patch", "source": "resident_patch", "status": "active",
+         "created_at": "2026-08-01T03:56:09Z"},
+    ]
+    updated, plan = recovery.recovery_plan(
+        docs, now_iso="2026-08-06T00:00:00Z", since=since,
+        retire_sources={"memory_dream", "resident_patch", "resident_absorb"},
+    )
+    by_id = {doc["id"]: doc for doc in updated}
+
+    assert plan["retire_churn_cards"] >= 1
+    assert by_id["patch-tomb"]["status"] == "superseded"
+    assert by_id["patch-tomb"]["archive_reason"] == recovery.INCIDENT_REASON
+    assert by_id["absorb-mid"]["status"] == "superseded"      # 不复活窗内嫌疑卡
+    assert by_id["old-dream"]["status"] == "active"           # 被吃原卡恢复
+    assert by_id["old-patch"]["status"] == "active"           # 窗前老卡不动
+    assert "archive_reason" not in by_id["old-patch"]
+
+
+def test_default_retire_sources_stay_dream_only():
+    docs = [
+        {"id": "patch-active", "source": "resident_patch", "status": "active",
+         "created_at": "2026-08-05T00:00:00Z"},
+    ]
+    updated, plan = recovery.recovery_plan(docs, now_iso="2026-08-06T00:00:00Z")
+    assert updated[0]["status"] == "active"                   # 默认行为不变
+    assert plan["retire_churn_cards"] == 0

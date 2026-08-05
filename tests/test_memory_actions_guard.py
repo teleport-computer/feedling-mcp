@@ -133,3 +133,52 @@ def test_migrate_polluted_bucket_gets_localized_default():
     assert err is None
     assert len(upgrades) == 1
     assert upgrades[0]["bucket"] == "未分类"       # 脏桶 → 就地降级(不是空串)
+
+
+# --- 拒绝路径:墓碑注记 → 400(2026-08-06 usr_a40e 徒手 patch 潮) -----------
+
+
+def test_supersede_rejects_tombstone_note():
+    # usr_a40e 实况形状:agent 徒手 memory-patch 把「已被 <卡id> 取代」写成新卡。
+    body, effects, code = actions._memory_supersede_action(None, None, {
+        "type": "memory.supersede",
+        "supersedes": ["c42ebb9618ae447df9d52107ea15de85"],
+        "memory": {
+            "type": "fact",
+            "title": "已被 c42ebb9618ae447df9d52107ea15de85 取代——绿豆汤偏好",
+            "summary": "已被 c42ebb9618ae447df9d52107ea15de85 取代——绿豆汤偏好",
+            "content": "已被 c42ebb9618ae447df9d52107ea15de85 取代——饮食禁忌详情。",
+        },
+    })
+    assert code == 400
+    assert body.get("error") == "memory_card_tombstone"
+
+
+def test_add_rejects_tombstone_note():
+    body, _effects, code = actions._memory_add_action(None, {
+        "type": "fact",
+        "memory": {
+            "summary": "superseded by 1a1f94f9fdc9ec86 — old note",
+            "content": "superseded by 1a1f94f9fdc9ec86 — merged elsewhere.",
+            "title": "superseded by 1a1f94f9fdc9ec86",
+        },
+    })
+    assert code == 400
+    assert body.get("error") == "memory_card_tombstone"
+
+
+def test_supersede_prose_about_replacement_without_hex_not_rejected_by_tombstone_gate():
+    # 正常散文「已被新手机取代」不带 hex id —— 不许被墓碑闸拦。store=None:
+    # 通过闸后会在碰 DB 时炸,借 AttributeError 证明「没有在闸上被拒」。
+    import pytest
+    with pytest.raises(AttributeError):
+        actions._memory_supersede_action(None, None, {
+            "type": "memory.supersede",
+            "supersedes": ["some_old_card_id_1234"],
+            "memory": {
+                "type": "fact",
+                "title": "换了新手机",
+                "summary": "换了新手机",
+                "content": "旧手机已被新手机取代,数据迁移顺利。",
+            },
+        })

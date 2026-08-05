@@ -198,15 +198,24 @@ def plan_rows(
 
 
 def recovery_plan(
-    docs: list[dict[str, Any]], *, now_iso: str, since: datetime | None = None
+    docs: list[dict[str, Any]],
+    *,
+    now_iso: str,
+    since: datetime | None = None,
+    retire_sources: frozenset[str] | set[str] = frozenset({"memory_dream"}),
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """``retire_sources``(2026-08-06,usr_a40e):窗内新建、来源在此集合内的卡
+    一律软退休。默认只有 memory_dream(向后兼容);usr_a40e 的墓碑主力是 agent
+    徒手 memory-patch 写的 ``resident_patch`` 卡(伴随 ``resident_absorb``),
+    不扩集合就会出现「墓碑留下、被吃原卡又被恢复」的并存态。"""
+    retire_set = frozenset(retire_sources or ()) or frozenset({"memory_dream"})
     restored = 0
     retired_dream = 0
     untouched = 0
     updated: list[dict[str, Any]] = []
     for original in docs:
         doc = dict(original)
-        dream_created_in_window = _is_dream(doc) and (
+        dream_created_in_window = _source(doc) in retire_set and (
             since is None or _at_or_after(doc.get("created_at"), since)
         )
         superseded_in_window = (
@@ -239,7 +248,7 @@ def recovery_plan(
         updated.append(doc)
     return updated, {
         "restore_non_dream_superseded": restored,
-        "retire_memory_dream": retired_dream,
+        "retire_churn_cards": retired_dream,
         "untouched": untouched,
         "hard_deletes": 0,
     }
@@ -254,6 +263,15 @@ def _parser() -> argparse.ArgumentParser:
         type=_iso_datetime,
         default=None,
         help="Only undo churn at or after this ISO date/time (inclusive).",
+    )
+    parser.add_argument(
+        "--retire-source",
+        action="append",
+        default=[],
+        help=(
+            "Card source to soft-retire when created inside the window "
+            "(repeatable; default: memory_dream)."
+        ),
     )
     parser.add_argument("--apply", action="store_true")
     parser.add_argument("--confirm-user-id", default="")
@@ -289,7 +307,15 @@ def main() -> int:
                 (args.user_id,),
             ).fetchall()
             changes = [dict(row["doc"] or {}) for row in change_rows]
-            updated, plan = recovery_plan(docs, now_iso=now_iso, since=args.since)
+            retire_sources = frozenset(
+                str(value or "").strip()
+                for value in (args.retire_source or [])
+                if str(value or "").strip()
+            ) or frozenset({"memory_dream"})
+            updated, plan = recovery_plan(
+                docs, now_iso=now_iso, since=args.since,
+                retire_sources=retire_sources,
+            )
             report = {
                 "environment": args.env,
                 "user_id": args.user_id,
@@ -299,6 +325,7 @@ def main() -> int:
                     if args.since is not None
                     else None
                 ),
+                "retire_sources": sorted(retire_sources),
                 "before": summarize(docs),
                 "plan": plan,
                 "plan_rows": plan_rows(docs, updated),
