@@ -9244,6 +9244,18 @@ def chat_settle_failed_input(
     return True
 
 
+def v2_turn_failure_supersede_enabled() -> bool:
+    """Kill switch (default ON) for same-turn failure supersede-on-success.
+
+    一轮先失败(失败气泡已投递、父消息被盖上 reply_error_class)、随后重试成功时,
+    成功回复的落库事务会清掉同一 turn 粘住的失败章。出问题时设
+    FEEDLING_V2_TURN_FAILURE_SUPERSEDE=0 快速止血,不用回滚部署。
+    """
+    return os.environ.get(
+        "FEEDLING_V2_TURN_FAILURE_SUPERSEDE", "1"
+    ).strip().lower() not in {"0", "false", "off", "no"}
+
+
 def chat_append_effect_with_cursor(
     user_id: str,
     msg_id: str,
@@ -9293,6 +9305,7 @@ def chat_append_effect_with_cursor(
 
     effect_doc = _normalize_chat_body_doc(doc)
     replied_user_ids: list[str] = []
+    superseded_turn_cleanup: list[tuple[str, str]] = []
     persisted_runtime_doc: dict | None = None
     replied_fields = {
         "reply_status": "replied",
@@ -9464,6 +9477,79 @@ def chat_append_effect_with_cursor(
                         )
                     persisted_reply_doc = existing_doc
 
+                # Same-turn failure supersede(先失败后成功的那一半;先成功后失败由
+                # require_cursor_advance 挡住): 这条真回复(非失败载体)明确回答了
+                # parent,而 parent 之前被同 turn 的失败气泡盖了 reply_error_class
+                # ——按「最终结果说了算」清掉失败章、把 reply_message_id 改指真回复,
+                # 并把旧失败载体上的 turn_failure_* 一并剥掉(否则客户端增量/重载会
+                # 把失败重新映射回 parent)。严格按本 parent 键定位,绝不跨 turn:
+                # 别的 turn 的真实失败不受影响。仅在首次 insert 时执行,幂等重放跳过。
+                if (
+                    inserted
+                    and not failure_error_class
+                    and v2_turn_failure_supersede_enabled()
+                ):
+                    superseded_parent_id = str(
+                        effect_doc.get("reply_to_message_id") or ""
+                    ).strip()
+                    if superseded_parent_id:
+                        cur.execute(
+                            "SELECT doc->>'reply_message_id' FROM chat_messages "
+                            "WHERE user_id=%s AND msg_id=%s "
+                            "  AND doc->>'role' IN ('user','human') "
+                            "  AND COALESCE(doc->>'reply_error_class','')<>'' "
+                            "FOR UPDATE",
+                            (user_id, superseded_parent_id),
+                        )
+                        stamped = cur.fetchone()
+                        if stamped is not None:
+                            superseded_carrier_id = str(
+                                (next(iter(stamped.values()))
+                                 if isinstance(stamped, dict) else stamped[0])
+                                or ""
+                            ).strip()
+                            cur.execute(
+                                "UPDATE chat_messages SET doc=(doc "
+                                " - 'reply_error_class' - 'reply_blame' "
+                                " - 'reply_user_text' - 'reply_failure_model' "
+                                " - 'reply_failure_provider') || %s "
+                                "WHERE user_id=%s AND msg_id=%s",
+                                (
+                                    Jsonb(
+                                        {
+                                            "reply_status": "replied",
+                                            "reply_message_id": msg_id,
+                                            "replied_by": "hosted_runtime_v2",
+                                            "replied_at": f"{float(ts):.3f}",
+                                        }
+                                    ),
+                                    user_id,
+                                    superseded_parent_id,
+                                ),
+                            )
+                            if superseded_carrier_id:
+                                # 只剥指回同一 parent 的失败载体,防错删无关消息。
+                                cur.execute(
+                                    "UPDATE chat_messages SET doc=(doc "
+                                    " - 'turn_failure_error_class' "
+                                    " - 'turn_failure_blame' "
+                                    " - 'turn_failure_user_text' "
+                                    " - 'turn_failure_model' "
+                                    " - 'turn_failure_provider') "
+                                    "WHERE user_id=%s AND msg_id=%s "
+                                    "  AND doc->>'reply_to_message_id'=%s "
+                                    "  AND COALESCE("
+                                    "      doc->>'turn_failure_error_class','')<>''",
+                                    (
+                                        user_id,
+                                        superseded_carrier_id,
+                                        superseded_parent_id,
+                                    ),
+                                )
+                            superseded_turn_cleanup.append(
+                                (superseded_parent_id, superseded_carrier_id)
+                            )
+
                 if cursor_seq is not None:
                     # V2 -> resident rollback bridge. Link every still-unanswered
                     # user input consumed through this final reply to the
@@ -9511,6 +9597,37 @@ def chat_append_effect_with_cursor(
                 "WHERE user_id=%s AND msg_id=ANY(%s)",
                 (Jsonb(replied_fields), user_id, replied_user_ids),
             )
+        if superseded_turn_cleanup:
+            from tee_shadow import mirror
+            for parent_id, carrier_id in superseded_turn_cleanup:
+                mirror.execute(
+                    "UPDATE chat_messages SET doc=(doc "
+                    " - 'reply_error_class' - 'reply_blame' "
+                    " - 'reply_user_text' - 'reply_failure_model' "
+                    " - 'reply_failure_provider') || %s "
+                    "WHERE user_id=%s AND msg_id=%s",
+                    (
+                        Jsonb(
+                            {
+                                "reply_status": "replied",
+                                "reply_message_id": msg_id,
+                                "replied_by": "hosted_runtime_v2",
+                                "replied_at": f"{float(ts):.3f}",
+                            }
+                        ),
+                        user_id,
+                        parent_id,
+                    ),
+                )
+                if carrier_id:
+                    mirror.execute(
+                        "UPDATE chat_messages SET doc=(doc "
+                        " - 'turn_failure_error_class' - 'turn_failure_blame' "
+                        " - 'turn_failure_user_text' - 'turn_failure_model' "
+                        " - 'turn_failure_provider') "
+                        "WHERE user_id=%s AND msg_id=%s",
+                        (user_id, carrier_id),
+                    )
         if persisted_runtime_doc is not None:
             _mirror_persisted_blob(
                 user_id, "model_api_runtime", persisted_runtime_doc)

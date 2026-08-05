@@ -2911,6 +2911,18 @@ def _deliver_terminal_failure_reply(row: dict) -> bool:
             raise RuntimeError("terminal failure reply id collision")
         return _ack_terminal_failure_reply(job_id)
 
+    # Same-turn supersede gate: 这个 parent 已经被一条真回复(reply_message_id 有值
+    # 且没有失败章)回答过了,再投这条迟到的失败气泡只会自相矛盾——按「最终结果
+    # 说了算」直接 ack 不投递。严格按本 parent 判定,别的 turn 的真实失败照常投。
+    if db.v2_turn_failure_supersede_enabled():
+        parent = db.chat_get_strict(user_id, parent_id)
+        if (
+            parent is not None
+            and str(parent.get("reply_message_id") or "").strip()
+            and not str(parent.get("reply_error_class") or "").strip()
+        ):
+            return _ack_terminal_failure_reply(job_id)
+
     failure_identity: dict[str, str] = {}
     with _pool().connection() as conn:
         with conn.cursor(row_factory=dict_row) as cur:
@@ -3589,6 +3601,23 @@ def chat_turn_activity_rows(user_id: str, turn_id: str) -> tuple[list[dict], lis
             )
             events = [dict(row) for row in cur.fetchall()]
     return jobs, events
+
+
+def turn_answered_by_real_reply(user_id: str, turn_id: str) -> bool:
+    """True iff a real (non-failure-carrier) assistant reply answers this turn.
+
+    Durable reply evidence for the activity projection: job status 单独不可信
+    (completed 可能是没发回复的 handoff),这里只认「reply_to_message_id 指回该
+    turn、且不带 turn_failure_* 章」的已落库回复。"""
+    with _pool().connection() as conn:
+        cur = conn.execute(
+            "SELECT 1 FROM chat_messages WHERE user_id=%s "
+            "AND doc->>'reply_to_message_id'=%s "
+            "AND doc->>'role' NOT IN ('user','human') "
+            "AND COALESCE(doc->>'turn_failure_error_class','')='' LIMIT 1",
+            (str(user_id), str(turn_id)),
+        )
+        return cur.fetchone() is not None
 
 
 def status_events_for_job(user_id: str, job_id: int) -> list[dict]:
