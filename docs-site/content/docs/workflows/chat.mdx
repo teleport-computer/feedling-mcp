@@ -391,6 +391,24 @@ does not wake the resident consumer again. An invalid UUID returns
 
 For `content_type: "file"`, `file_name` and `file_mime` are optional metadata.
 
+To attach user-selected memory references to the turn (the Garden "talk in
+chat" flow), pass `context_refs` beside the envelope — the same plaintext
+routing shape as the hosted send. Only entries with `type: "memory"` are
+honored; the server persists the ids (at most eight) as `quoted_memory_ids` on
+the stored message, and the enclave expands them into decrypted memory context
+for the resident consumer. Titles are client display metadata and are not
+stored.
+
+```json
+{
+  "envelope": { "...": "encrypted user text" },
+  "content_type": "text",
+  "context_refs": [
+    { "type": "memory", "id": "mom_7f20d39af321", "title": "Morning routine" }
+  ]
+}
+```
+
 To send **text alongside an image or file** (a caption), encrypt that text as its
 own envelope and pass it as `caption_envelope` — the same E2E `EncryptedEnvelope`
 shape as the main `envelope`, wrapped to the enclave (`K_enclave`) so it can be

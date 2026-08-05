@@ -19,6 +19,12 @@ change must not be interpreted as an API guarantee.
   already folded by Runtime V2 compaction are retained and reported as
   `retained_covered`). The live-call flow — identity, memory, tools, and
   per-turn streaming — is unchanged.
+- **`POST /v1/chat/message` now accepts `context_refs`, carrying Garden
+  "talk in chat" memory references on the resident line.** Same plaintext
+  routing contract as the hosted send: only `type: "memory"` entries are
+  honored, ids only are persisted as `quoted_memory_ids` (capped at eight),
+  and the enclave expands them into decrypted memory context for the
+  resident consumer. Requests without `context_refs` are unchanged.
 
 - **Hosted Genesis no longer silently completes a non-empty long-term-memory
   import with zero cards.** Keep-all imports now fail with

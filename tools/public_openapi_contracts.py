@@ -1186,6 +1186,12 @@ COMPONENT_SCHEMAS: dict[str, dict[str, Any]] = {
                 "allOf": [{"$ref": "#/components/schemas/EncryptedEnvelope"}],
                 "description": "Optional separately-encrypted user text sent alongside an image/file (content_type image or file). Same E2E envelope shape as the main `envelope`; the enclave decrypts it into the message's plaintext content so the agent sees the caption. Ignored for content_type=text.",
             },
+            "context_refs": {
+                "type": "array",
+                "maxItems": 8,
+                "description": "Optional plaintext routing metadata: memory references the user explicitly attached to this turn (Garden 「talk in chat」). Same contract as the hosted send: only the first eight entries are considered, only type=memory is honored, and ids only are persisted (as quoted_memory_ids) for the enclave to expand into decrypted memory context. Titles are for client display and are not stored.",
+                "items": {"$ref": "#/components/schemas/ChatContextReference"},
+            },
         },
         "additionalProperties": True,
     },
