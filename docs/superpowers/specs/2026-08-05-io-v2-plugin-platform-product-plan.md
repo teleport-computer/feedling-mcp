@@ -176,7 +176,101 @@ Core 内新增统一的 **Capability Host**，负责：
 
 首版插件代码仍可与现有 Runtime V2 一起部署。插件化首先意味着权限、数据和生命周期边界成立，不意味着立即拆成微服务。
 
-### 6.2 插件不能直接修改 prompt
+### 6.2 标准插件接口与 Input/Output
+
+所有插件必须实现同一套生命周期与运行接口。概念接口如下：
+
+```text
+manifest()                         → PluginManifest
+enable(plugin_context)            → PluginResult
+disable(plugin_context)           → PluginResult
+handle(plugin_input, context)     → PluginOutput[]
+health()                           → PluginHealth
+```
+
+`PluginContext` 不是后端内部对象的集合。它只提供用户已授权的 capability，例如读取指定资源、申请模型执行、写入本插件数据或发送受控通知。插件不能直接获得数据库连接、模型密钥、通知服务或其他插件实例。
+
+#### 标准 Input：固定信封 + 类型化 payload
+
+所有运行输入共享一个固定外层：
+
+```json
+{
+  "event_id": "evt_123",
+  "type": "chat.turn.completed",
+  "schema_version": 1,
+  "occurred_at": "2026-08-05T10:00:00Z",
+  "user_id": "usr_123",
+  "source": "core.chat",
+  "trace_id": "trace_123",
+  "state_epoch": 8,
+  "payload": {},
+  "resource_refs": []
+}
+```
+
+固定外层负责事件路由、租户归属、幂等、追踪、状态校验和协议版本；`payload` 则由 `type + schema_version` 对应的 schema 定义。例如：
+
+- `chat.turn.completed.v1`；
+- `perception.scene_changed.v1`；
+- `timer.wake_due.v1`；
+- `plugin.memory.created.v1`。
+
+Input 由 Host 创建，插件不能自行指定或改写 `user_id`、`source`、`trace_id` 和 `state_epoch`。敏感内容默认通过 `resource_refs` 引用；插件只有在执行时再次通过 capability 授权，才能读取引用对应的数据。
+
+这套设计不是把所有输入塞进一个万能 JSON。统一的是信封和运行语义，业务 payload 仍然保持强类型和独立版本。
+
+#### 标准 Output：插件提交申请，Core 执行副作用
+
+插件输出同样使用固定信封：
+
+```json
+{
+  "output_id": "out_123",
+  "type": "effect.request",
+  "schema_version": 1,
+  "plugin_id": "io.inner-thought",
+  "caused_by": "evt_123",
+  "state_epoch": 8,
+  "idempotency_key": "inner-thought:evt_123:notify",
+  "payload": {
+    "effect": "notification.send",
+    "arguments": {}
+  }
+}
+```
+
+首版支持四类 Output：
+
+| Output 类型 | 用途 |
+|---|---|
+| `context.contribution` | 向当前 Agent turn 提供结构化上下文 |
+| `effect.request` | 申请写记忆、修改身份、安排任务或发送消息 |
+| `event.emit` | 产生一个可被其他插件订阅的标准事件 |
+| `ui.projection` | 向 App 提供标准卡片、摘要或状态数据 |
+
+返回空数组是合法的 `noop`：表示插件正确处理了 Input，但判断无需产生任何结果。
+
+Output 只描述意图，不代表副作用已经发生。Host 收到 Output 后必须：
+
+1. 校验 Output schema 和声明来源；
+2. 再次检查插件状态、权限、预算和 `state_epoch`；
+3. 使用 `idempotency_key` 防止重复执行；
+4. 由 Core 执行获准的写入、调度或发送；
+5. 将执行成功、拒绝或失败记录为结构化结果事件。
+
+因此插件不能直接写数据库、拼接最终 prompt 或发送通知。未来插件改为独立进程或第三方沙箱时，只需把本地方法调用替换为 RPC，Input/Output 契约无需推翻。
+
+#### 版本与错误规则
+
+- JSON Schema 是跨运行时的协议真相；Python、Swift 等类型从 schema 生成或做一致性校验。
+- `api_version` 管插件与 Host 的整体兼容性，`schema_version` 管单个 Input/Output 类型。
+- 同一 schema version 只允许增加可选字段；删除字段、改变含义或改变类型必须升级版本。
+- Host 遇到未知类型、未知版本、字段超限或非法资源引用时必须拒绝，不能猜测兼容。
+- 标准错误至少包含 `code`、`retryable`、`user_visible` 和内部 `details_ref`；敏感 payload 不进入错误文本。
+- 可重试错误必须沿用同一个 `event_id` 或 `idempotency_key`，避免重复副作用。
+
+### 6.3 插件不能直接修改 prompt
 
 Identity 和 Memory Garden 等插件只能返回结构化的“上下文贡献”。Core 的 Context Assembler 负责：
 
@@ -187,7 +281,7 @@ Identity 和 Memory Garden 等插件只能返回结构化的“上下文贡献�
 
 插件不能自行拼接 system prompt，也不能绕过 Core 调用其他插件。这能避免某个插件无限占用上下文，或通过隐藏路径扩大权限。
 
-### 6.3 插件数据隔离
+### 6.4 插件数据隔离
 
 数据按“用户 + 插件 namespace”进行逻辑隔离：
 
@@ -201,7 +295,7 @@ plugin.inner-thought
 
 这不要求首版把现有数据全部迁入一张通用插件表。Identity、Memory、Perception 等现有专用表可以继续保留，但必须通过统一访问层标明数据所有者和插件 namespace，并接受 Capability Host 的权限检查。
 
-### 6.4 统一事件流
+### 6.5 统一事件流
 
 前台聊天和后台事件共享同一套授权机制：
 
@@ -218,7 +312,7 @@ plugin.inner-thought
 
 后台链路中，iOS 信号先由 Perception 归一化和降噪，再由 Event Router 决定是否投递给 Inner Thought。原始设备信号不能直接唤醒模型。
 
-### 6.5 防止“关闭后仍然发生”
+### 6.6 防止“关闭后仍然发生”
 
 每个用户的插件状态带有递增的 `state_epoch`：
 
@@ -229,7 +323,7 @@ plugin.inner-thought
 
 因此，即使用户停用插件时某个任务已经在模型侧运行，它也不能在稍后写入记忆或发送主动消息。
 
-### 6.6 为未来第三方插件预留什么
+### 6.7 为未来第三方插件预留什么
 
 首版提前稳定以下协议：
 

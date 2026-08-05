@@ -1,7 +1,5 @@
 # IO V2：让用户决定自己的 IO 拥有什么能力
 
-> Showcase 简版｜建议讲述时长：3–5 分钟
-
 ## 一句话
 
 IO V2 会把 Identity、Memory Garden、iOS Perception、Inner Thought 从默认捆绑的功能，变成用户可以自主开启和停用的官方插件。
@@ -122,6 +120,39 @@ flowchart TB
 检查会发生两次：执行前一次，提交结果前再一次。
 
 因此，即使用户关闭 Inner Thought 时有一个后台任务正在运行，它稍后返回的结果也不能继续写入记忆或给用户发消息。
+
+## 所有插件说同一种语言
+
+每个插件都实现相同的标准接口：
+
+```text
+manifest · enable · disable · handle · health
+```
+
+真正运行时采用“统一信封 + 类型化 payload”。统一信封负责身份、版本、追踪、幂等和权限；Identity、Memory、Perception 等插件仍可拥有各自的强类型业务数据。
+
+```mermaid
+flowchart LR
+    SOURCE["聊天 / 感知 / 定时器"] --> INPUT["标准 Input<br/>type · version · trace · epoch<br/>typed payload · resource refs"]
+    INPUT --> PLUGIN["插件 handle"]
+    PLUGIN --> OUTPUT["标准 Output<br/>来源 · 因果 · 幂等键<br/>typed payload"]
+    OUTPUT --> HOST{"Capability Host<br/>再次授权与校验"}
+    HOST -->|允许| EFFECT["Core 执行<br/>上下文 · 写入 · 事件 · UI/消息"]
+    HOST -->|拒绝| DROP["不产生副作用"]
+```
+
+标准 Input 包含事件类型、schema 版本、来源、追踪 ID、`state_epoch`、类型化 payload 和资源引用。敏感数据尽量只给引用，插件需要时再申请读取。
+
+标准 Output 只有四类：
+
+- `context.contribution`：贡献上下文；
+- `effect.request`：申请写入、调度或发送；
+- `event.emit`：产生标准事件；
+- `ui.projection`：提供标准 App 展示数据。
+
+关键点是：**Output 是插件提交的申请，不是已经发生的副作用。** 插件不能直接写数据库、修改最终 prompt 或发送通知；Core 校验通过后才真正执行。
+
+这样首版可以在同一 Runtime 内运行官方插件，未来改成独立进程或第三方沙箱时，也能继续沿用同一套 Input/Output 协议。
 
 ## 插件如何组合
 
