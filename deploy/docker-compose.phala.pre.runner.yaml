@@ -39,6 +39,8 @@ x-agent-runner-env: &agent-runner-env
   # Must flip atomically with DATABASE_URL during Phase-4 promotion. Child
   # processes inherit it and perform the same read-only TEE-head assertion.
   FEEDLING_DATABASE_SCHEMA: "${FEEDLING_DATABASE_SCHEMA:-rds}"
+  # Keep V1 reply writes aligned with the Pre API's per-user plaintext gate.
+  FEEDLING_PLAINTEXT_WRITES_ACCEPTED: "1"
   AGENT_RUNTIME_USERS: "${AGENT_RUNTIME_USERS:-}"
   AGENT_RUNTIME_AUTODISCOVER: "${AGENT_RUNTIME_AUTODISCOVER:-}"
   FEEDLING_RUNTIME_TOKEN_SECRET: "${FEEDLING_RUNTIME_TOKEN_SECRET:-}"

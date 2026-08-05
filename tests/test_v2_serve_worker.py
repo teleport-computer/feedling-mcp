@@ -137,6 +137,74 @@ def test_temporal_snapshot_uses_perception_then_china_default(monkeypatch):
     )
 
 
+def test_wake_attention_snapshot_uses_frozen_24h_frontier(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        serve_worker.db,
+        "chat_visible_proactive_stats",
+        lambda user_id, *, since_ts, through_seq=None: (
+            calls.append((user_id, since_ts, through_seq))
+            or {
+                "visible_proactive_count_24h": 5,
+                "last_visible_proactive_message_ts": 950.0,
+            }
+        ),
+    )
+
+    snapshot = serve_worker._read_wake_attention_snapshot(
+        "u-wake",
+        now_ts=100_000.0,
+        through_seq=42,
+    )
+
+    assert snapshot["visible_proactive_count_24h"] == 5
+    assert calls == [("u-wake", 13_600.0, 42)]
+
+
+def test_visible_proactive_stats_count_v1_and_v2_rows_at_frozen_frontier():
+    import conftest
+    import db
+
+    uid = "u-wake-attention-stats"
+    conftest.seed_user(uid)
+    with db.get_pool().connection() as conn:
+        conn.execute("DELETE FROM chat_messages WHERE user_id=%s", (uid,))
+    rows = [
+        ("old", 13_599.0, {"role": "openclaw", "wake_kind": "heartbeat"}),
+        (
+            "v1",
+            20_000.0,
+            {"role": "openclaw", "source": "agent_initiated_proactive"},
+        ),
+        ("v2", 30_000.0, {"role": "openclaw", "wake_kind": "heartbeat"}),
+        ("ordinary", 40_000.0, {"role": "openclaw", "source": "model_api"}),
+        ("late", 50_000.0, {"role": "openclaw", "wake_kind": "screen_watch"}),
+    ]
+    for message_id, sent_at, metadata in rows:
+        db.chat_append(
+            uid,
+            message_id,
+            sent_at,
+            {"id": message_id, "ts": sent_at, **metadata},
+            max_messages=0,
+        )
+    stored = db.chat_messages_after_seq(uid, 0, limit=10)
+    through_v2 = next(row["seq"] for row in stored if row["id"] == "v2")
+
+    assert db.chat_visible_proactive_stats(
+        uid,
+        since_ts=13_600.0,
+        through_seq=through_v2,
+    ) == {
+        "visible_proactive_count_24h": 2,
+        "last_visible_proactive_message_ts": 30_000.0,
+    }
+    assert db.chat_visible_proactive_stats(uid, since_ts=13_600.0) == {
+        "visible_proactive_count_24h": 3,
+        "last_visible_proactive_message_ts": 50_000.0,
+    }
+
+
 def test_observe_photo_prefers_selected_dedicated_route(monkeypatch):
     main_config = object()
     dedicated_config = object()

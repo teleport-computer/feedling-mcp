@@ -277,6 +277,10 @@ services:
       # Runtime-token secret shared by backend, enclave, and pooled V2 worker.
       FEEDLING_RUNTIME_TOKEN_SECRET: "${FEEDLING_RUNTIME_TOKEN_SECRET:-}"
       FEEDLING_RUNTIME_TOKEN_SECRET_PREVIOUS: "${FEEDLING_RUNTIME_TOKEN_SECRET_PREVIOUS:-}"
+      # One V1 runner CVM is part of Pre's dual-runtime topology. Public runner
+      # health must fail on a missing/stale heartbeat instead of failing because
+      # the expected inventory was never declared.
+      FEEDLING_EXPECTED_RUNNER_COUNT: "1"
       FEEDLING_PERCEPTION_REBASELINE_UNKNOWN_KEYS: "${FEEDLING_PERCEPTION_REBASELINE_UNKNOWN_KEYS:-0}"
     ports:
       - "5001:5001"
@@ -309,6 +313,9 @@ services:
       FEEDLING_ENCLAVE_URL: "https://enclave:5003"
       DATABASE_URL: "${DATABASE_URL:-}"
       FEEDLING_DATABASE_SCHEMA: "${FEEDLING_DATABASE_SCHEMA:-rds}"
+      # Must match backend: otherwise whoami advertises effective=off while V2
+      # fail-safe encrypts every reply from this separate process.
+      FEEDLING_PLAINTEXT_WRITES_ACCEPTED: "1"
       FEEDLING_RUNTIME_TOKEN_SECRET: "${FEEDLING_RUNTIME_TOKEN_SECRET:-}"
       FEEDLING_V2_MAX_WORKERS: "4"
       FEEDLING_V2_FLEET_IDENTITY_REQUIRED: "1"

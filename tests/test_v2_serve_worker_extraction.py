@@ -19,6 +19,27 @@ def test_memory_context_degrades_each_field_independently(monkeypatch):
     assert isinstance(ctx["threads"], str)
 
 
+def test_memory_context_uses_plaintext_identity_names(monkeypatch):
+    serve_worker.wire_assembly()
+    monkeypatch.setattr(serve_worker, "_mint_runtime_token", lambda _uid: "token")
+    monkeypatch.setattr(
+        serve_worker,
+        "_load_identity_card",
+        lambda _store, *, runtime_token: (
+            '{"agent_name":"pre c","user_preferred_name":"Seven"}'
+        ),
+    )
+    monkeypatch.setattr("memory.memory_core.buckets", lambda *a, **k: ({"buckets": []}, 200))
+    monkeypatch.setattr("memory.memory_core.threads", lambda *a, **k: ({"threads": []}, 200))
+    monkeypatch.setattr("memory.memory_core.index", lambda *a, **k: ({"items": []}, 200))
+
+    ctx = serve_worker._read_memory_context("u-identity")
+
+    assert ctx["ai_name"] == "pre c"
+    assert ctx["user_name"] == "Seven"
+    assert '"agent_name":"pre c"' in ctx["identity"]
+
+
 def test_dream_context_fetches_full_cards_without_cross_run_cooldown(monkeypatch):
     serve_worker.wire_assembly()
     monkeypatch.setattr(serve_worker, "_mint_runtime_token", lambda _uid: "token")

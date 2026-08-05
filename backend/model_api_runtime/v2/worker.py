@@ -781,7 +781,13 @@ _OUTBOUND_SAFE_PERCEPTION_SIGNALS = frozenset(
     {"steps", "sleep", "vitals", "activity", "body", "metabolic"}
 )
 _TEXT_BEARING_MEDIA_READ_TOOLS = frozenset(
-    {"screen_recent", "screen_read", "photo_recent", "photo_read"}
+    {
+        "screen_recent",
+        "screen_read",
+        "photo_recent",
+        "photo_read",
+        "perception_recent_apps",
+    }
 )
 
 
@@ -856,12 +862,14 @@ _WAKE_SYSTEM_PROMPT = (
     "You are the user's companion. This is a platform presence moment, not a user "
     "request. Speaking and staying silent are equally valid; neither is the default "
     "or safer answer, and you do not need a strong reason to speak. Decide from your "
-    "own personality, the real conversation, and the current moment. A "
+    "own personality, the real conversation, and the current moment. Use the "
+    "attention_facts in temporal context to avoid interrupting an active conversation "
+    "or repeating yourself when you have appeared often or recently. A "
     "perception_glance is only a hint for deciding whether to look deeper; it is not "
     "a checklist to report. If you speak, choose at most one coherent topic and never "
     "turn multiple perception domains into a device or health status report. Use a "
-    "perception tool when an exact reading is needed. Never mention wakes, timers, "
-    "prompts, or system fields to the user."
+    "perception tool when an exact reading is needed. Never mention this wake or any "
+    "system wording to the user."
 )
 _SCHEDULED_WAKE_SYSTEM_PROMPT = (
     "You are delivering one or more reminders that the user explicitly scheduled. "
@@ -879,8 +887,10 @@ _SCREEN_WATCH_SYSTEM_PROMPT = (
     "to inspect frame content when needed. Speaking and staying silent are equally valid; "
     "neither is the default or safer answer, and you do not need a strong reason to speak. "
     "Decide naturally from your personality, the real conversation, and what is happening "
-    "on screen now. If you speak, choose one coherent thought rather than reporting the "
-    "screen state. Never narrate that you are watching or that you looked at frames."
+    "on screen now. Use attention_facts to avoid interrupting or repeating yourself. If you "
+    "speak, choose one coherent thought rather than reporting the screen state. Never mention "
+    "this wake or any system wording, and never narrate that you are watching or that you "
+    "looked at frames."
 )
 # D3 Task 7 (BYOK payment cooldown): a "provider_config" wake failure (402 out-of-credits,
 # 401/403 bad key) means the user's BYOK key is dead/broke — retrying it every heartbeat
@@ -1204,6 +1214,10 @@ class TurnDeps:
     # Production resolves registry timezone -> perception fallback -> UTC and
     # bounds the genuine-user timestamp to the turn's frozen prompt frontier.
     read_temporal_snapshot: Callable[..., dict] | None = None
+    # Wake-only content-free social-attention metadata. Kept separate from the
+    # ordinary temporal reader so foreground Chat does not pay an extra count
+    # query. Production returns recent visible proactive count + latest ts.
+    read_wake_attention_snapshot: Callable[..., dict] | None = None
     # user_id -> (summary_plaintext, watermark_ts, version)：读取该用户当前会话摘要（enclave
     # 解密明文）；从未压缩过时 ("", 0.0, 0)（D1：turn 看 摘要+尾巴 而不是全量重放）。默认
     # None：worker.py 自身不 import hosted，测试/其他调用方不必提供；生产装配见
@@ -3172,6 +3186,12 @@ def _make_build_messages_fn(
                 "last_user_message_ts"
             ),
             tail=rendered_tail,
+            visible_proactive_count_24h=temporal_snapshot.get(
+                "visible_proactive_count_24h"
+            ),
+            last_visible_proactive_message_ts=temporal_snapshot.get(
+                "last_visible_proactive_message_ts"
+            ),
         )
 
     def _base(selected_turns: list[list[dict]]) -> list:
@@ -3862,9 +3882,16 @@ def _memory_tool_actions(raw_actions) -> list[dict]:
             or a.get("memory_id")
             or ""
         ).strip()
+        reason = str(a.get("reason") or "").strip()[:1000]
+        if not reason:
+            reason = "Written by the agent via the memory_write tool."
         if op in ("delete", "remove"):
             if target:
-                out.append({"type": "memory.delete", "memory_id": target})
+                out.append({
+                    "type": "memory.delete",
+                    "memory_id": target,
+                    "reason": reason,
+                })
             continue
         if op in ("update", "supersede", "merge", "patch") and not target:
             # Never turn an invalid targeted mutation into a new memory.add.
@@ -3884,7 +3911,7 @@ def _memory_tool_actions(raw_actions) -> list[dict]:
             ),
         }
         base = {
-            "reason": "Written by the agent via the memory_write tool.",
+            "reason": reason,
             "capture_mode": "agent_tool",
         }
         if op in ("update", "supersede", "merge", "patch"):
@@ -7321,6 +7348,15 @@ async def _run_wake(
             tail=tail,
             through_seq=(wake_snapshot_seq if seq_context else None),
         )
+        if deps.read_wake_attention_snapshot is not None:
+            attention_snapshot = await asyncio.to_thread(
+                deps.read_wake_attention_snapshot,
+                user_id,
+                now_ts=float(temporal_snapshot["now_ts"]),
+                through_seq=(wake_snapshot_seq if seq_context else None),
+            )
+            if isinstance(attention_snapshot, dict):
+                temporal_snapshot.update(attention_snapshot)
         wake_tail = list(tail)
 
         # screen_watch lane grounds on recent shared-screen availability (Task 3).

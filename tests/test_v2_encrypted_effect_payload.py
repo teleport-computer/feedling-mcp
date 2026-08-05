@@ -94,6 +94,21 @@ def test_identity_nudge_effect_mapping_op_cannot_be_overridden_by_model_args():
 
 # --- Item 1: frozen relationship anchor round-trips producer -> validator ------
 
+
+def test_validate_memory_delete_accepts_optional_audit_reason():
+    serve_worker._validate_decrypted_tool_effect(
+        "memory",
+        {
+            "effect_id": "e",
+            "actions": [{
+                "type": "memory.delete",
+                "memory_id": "m1",
+                "reason": "user corrected this memory",
+            }],
+        },
+    )
+
+
 def test_identity_effect_mapping_freezes_relationship_anchor():
     from datetime import date, timedelta
     effect_type, payload = worker._write_tool_effect_payload(

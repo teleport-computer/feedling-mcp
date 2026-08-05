@@ -17,6 +17,7 @@ CAPABILITIES: dict[str, Callable[..., CapabilityResult]] = {
     "memory_write": lambda store, **kw: memory.write(store, **kw),
     "memory_search": lambda store, **kw: memory.search(store, **kw),
     "perception_snapshot": lambda store, **kw: perception.snapshot(store, **kw),
+    "perception_recent_apps": lambda store, **kw: perception.recent_apps(store, **kw),
     "perception_trend": lambda store, **kw: perception.trend(store, **kw),
     "perception_history": lambda store, **kw: perception.history(store, **kw),
     "perception_glance": lambda store, **kw: perception.glance(store, **kw),

@@ -4935,8 +4935,14 @@ def recent_chat_reliability(
     }
 
 
-def recent_token_usage_by_lane(*, within_hours: int = 24) -> dict:
+def recent_token_usage_by_lane(
+    *, within_hours: int = 24, offset_hours: int = 0
+) -> dict:
     """按 lane 的 token 开销汇总（content-free），喂 admin 值班台。
+
+    ``offset_hours`` 把窗口整体后移成 [now-(offset+within)h, now-offset h)，
+    供环比对照列使用；0 时刻意不加上界——保持既有行为（含查询计划）逐字节
+    不变。返回结构不区分两种情况。
 
     与 ``recent_runtime_health`` 的延迟分位数口径**相反**：那里只算成功回合
     （失败超时会把 p95 拉到与故障同源的高位），这里算全部回合——失败回合照样
@@ -4963,6 +4969,16 @@ def recent_token_usage_by_lane(*, within_hours: int = 24) -> dict:
     ``usage_coverage``，而不是被记成零 token 混进总量假装正常。
     """
     safe_hours = max(1, min(int(within_hours), 24 * 366))
+    safe_offset = max(0, min(int(offset_hours), 24 * 366))
+    if safe_offset:
+        window_sql = (
+            "WHERE created_at >= now() - make_interval(hours => %s) "
+            "AND created_at < now() - make_interval(hours => %s) "
+        )
+        window_params = (safe_offset + safe_hours, safe_offset)
+    else:
+        window_sql = "WHERE created_at >= now() - make_interval(hours => %s) "
+        window_params = (safe_hours,)
 
     with _pool().connection() as conn:
         with conn.cursor(row_factory=dict_row) as cur:
@@ -4985,9 +5001,9 @@ def recent_token_usage_by_lane(*, within_hours: int = 24) -> dict:
                 "  sum(cache_read_tokens)::bigint AS cache_read_tokens,"
                 "  sum(cache_miss_tokens)::bigint AS cache_miss_tokens "
                 "FROM v2_turn_metrics "
-                "WHERE created_at >= now() - make_interval(hours => %s) "
+                + window_sql +
                 "GROUP BY GROUPING SETS ((lane), ())",
-                (safe_hours,),
+                window_params,
             )
             rows = cur.fetchall()
 
@@ -10401,7 +10417,7 @@ _LATEST_GENUINE_USER_SEQ_SQL = (
 
 
 def due_heartbeat_users(*, now: float | None = None, limit: int = 500) -> list[str]:
-    """到期需要心跳唤醒的 user_id 列表（next_heartbeat_at 已到且不在 BYOK 支付冷却
+    """到期需要心跳唤醒的 user_id 列表（next_heartbeat_at 已到、未开启 DND 且不在 BYOK 支付冷却
     窗口内），按 next_heartbeat_at 升序（最该醒的排前面），供 D3 调度器 poll 后逐个
     enqueue_job(..., 'heartbeat')。now 可注入 epoch 浮点数用于确定性测试；
     None → 用 DB now()（镜像 reap_stuck_jobs 的 to_timestamp(%s) 约定）。"""
@@ -10416,6 +10432,12 @@ def due_heartbeat_users(*, now: float | None = None, limit: int = 500) -> list[s
                 "AND (schedule.payment_cooldown_until IS NULL "
                 "     OR schedule.payment_cooldown_until "
                 "        <= COALESCE(to_timestamp(%s), now())) "
+                "AND NOT EXISTS ("
+                "    SELECT 1 FROM user_blobs AS settings "
+                "    WHERE settings.user_id=schedule.user_id "
+                "      AND settings.kind='proactive_settings' "
+                "      AND settings.doc @> '{\"dnd\": true}'::jsonb"
+                ") "
                 "AND (schedule.proactive_backoff_until IS NULL "
                 "     OR schedule.proactive_backoff_until "
                 "        <= COALESCE(to_timestamp(%s), now()) "
@@ -10428,7 +10450,7 @@ def due_heartbeat_users(*, now: float | None = None, limit: int = 500) -> list[s
 
 
 def due_screen_watch_users(*, now: float | None = None, limit: int = 500) -> list[str]:
-    """到期需要屏幕监看唤醒的 user_id 列表（next_screen_watch_at 已到且不在 BYOK 支付
+    """到期需要屏幕监看唤醒的 user_id 列表（next_screen_watch_at 已到、未开启 DND 且不在 BYOK 支付
     冷却窗口内），按 next_screen_watch_at 升序，供 D3 调度器 poll 后逐个
     enqueue_job(..., 'screen_watch')。镜像 due_heartbeat_users 的每一处语义（NULL 不
     算到期；now 可注入 epoch 浮点数用于确定性测试；payment_cooldown_until 排除——
@@ -10437,12 +10459,18 @@ def due_screen_watch_users(*, now: float | None = None, limit: int = 500) -> lis
     with _pool().connection() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT user_id FROM v2_wake_schedule "
-                "WHERE next_screen_watch_at IS NOT NULL "
-                "AND next_screen_watch_at <= COALESCE(to_timestamp(%s), now()) "
-                "AND (payment_cooldown_until IS NULL "
-                "     OR payment_cooldown_until <= COALESCE(to_timestamp(%s), now())) "
-                "ORDER BY next_screen_watch_at LIMIT %s",
+                "SELECT schedule.user_id FROM v2_wake_schedule AS schedule "
+                "WHERE schedule.next_screen_watch_at IS NOT NULL "
+                "AND schedule.next_screen_watch_at <= COALESCE(to_timestamp(%s), now()) "
+                "AND (schedule.payment_cooldown_until IS NULL "
+                "     OR schedule.payment_cooldown_until <= COALESCE(to_timestamp(%s), now())) "
+                "AND NOT EXISTS ("
+                "    SELECT 1 FROM user_blobs AS settings "
+                "    WHERE settings.user_id=schedule.user_id "
+                "      AND settings.kind='proactive_settings' "
+                "      AND settings.doc @> '{\"dnd\": true}'::jsonb"
+                ") "
+                "ORDER BY schedule.next_screen_watch_at LIMIT %s",
                 (ts, ts, int(limit)),
             )
             return [row[0] for row in cur.fetchall()]

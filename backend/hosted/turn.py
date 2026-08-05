@@ -153,8 +153,11 @@ def _memory_quality_card_issues(
     *,
     archive_language: str = "",
 ) -> list[str]:
-    title = str(inner.get("title") or "").strip()
-    desc = str(inner.get("description") or "").strip()
+    # Typed-memory cards use title/description; the v1 plaintext Garden uses
+    # summary/content.  Both shapes coexist during migration and quality checks
+    # must judge the actual text instead of flagging every v1 card as empty.
+    title = str(inner.get("title") or inner.get("summary") or "").strip()
+    desc = str(inner.get("description") or inner.get("content") or "").strip()
     context = str(inner.get("context") or "").strip()
     mem_type = str(moment.get("type") or inner.get("type") or "fact")
     issues: list[str] = []

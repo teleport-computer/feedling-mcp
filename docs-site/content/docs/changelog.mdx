@@ -10,6 +10,13 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **Plaintext and encrypted accounts now render the same identity and memory
+  metadata and receive the same Runtime V2 identity context.** Structured
+  plaintext `body` values are consumed directly while historical `body_ct`
+  records continue through the decrypt service. Runtime V1 and V2 reply writers
+  also share the deployment's plaintext-write gate, so the wire shape returned
+  by Chat remains consistent with `content_encryption_effective`.
+
 - **The plaintext tier now covers the remaining active content producers.**
   Runtime V2 standalone workers receive the same per-user shape resolver as the
   API process, and plaintext trajectories are accepted by the application
@@ -60,11 +67,32 @@ change must not be interpreted as an API guarantee.
   functional testing through the default-off deployment gate; test and
   production still report an effective value of `on` for every user. See
   [architecture](/docs/architecture#content-encryption-is-a-per-user-preference).
+- **Do Not Disturb now suppresses Runtime V2 heartbeat and screen-watch
+  scheduling.** Due-query polling excludes accounts whose proactive settings
+  have `dnd` enabled and resumes automatically when DND is turned off.
+
+- **Hosted Runtime V2 exposes finer-grained perception and memory tools.** The
+  model can now read the permission-gated recent app open/close trajectory,
+  request ambient or sensitive memory-index views, include archived or
+  superseded cards when fetching, and attach audit reasons to memory writes.
+  Tool guidance also distinguishes a recent app event from current app usage,
+  explains rolling perception baselines, accepts relative scheduled-wake times,
+  and routes requested screen pixels through the native visual observer.
+
+- **Hosted Runtime V2 now carries the complete genesis persona into every Chat
+  and proactive wake turn.** The encrypted persona is decrypted just in time
+  for the turn and placed in the trusted system prefix without profile or
+  context truncation. Accounts that have not completed genesis keep the generic
+  companion prompt, and a persona update takes effect on the next turn.
+
 - **Hosted Runtime V2 restores the proactive-presence semantics used by Runtime
   V1.** Automatic wake context is no longer serialized as a synthetic user
   message, and speaking and staying silent are treated as equally valid for
-  heartbeat and screen-watch moments. Scheduled reminder text is supplied as
-  labeled application data, while an ordinary heartbeat for an account with no
+  heartbeat and screen-watch moments. Those turns now receive content-free
+  attention facts for the last user-message age, recent-tail freshness, and the
+  number of visible proactive messages in the preceding 24 hours. Scheduled
+  reminder text is supplied as labeled application data and retains its
+  must-deliver semantics, while an ordinary heartbeat for an account with no
   genuine conversation history completes without calling the model.
 
 - **Runtime V2 perception wakes now use durable per-signal baselines.** The

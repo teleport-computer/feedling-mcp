@@ -79,7 +79,6 @@ from genesis import daemon as genesis_daemon
 from hosted import config_store as hosted_config_store
 from hosted import mcp_tools
 from hosted import vision_observer
-from identity import identity_core
 from memory import memory_core
 from model_api_runtime.v2 import context as v2_context
 from model_api_runtime.v2 import compaction as v2_compaction
@@ -127,6 +126,96 @@ import provider_client
 log = logging.getLogger("feedling.runtime_v2.serve_worker")
 
 
+def _load_genesis_persona(store, *, runtime_token: str) -> str:
+    """JIT-read this user's complete genesis persona for one model turn.
+
+    Runtime V1 reads the same ``genesis_persona.content_envelope`` and sends the
+    resulting Markdown as trusted system text on every freshly spawned turn.
+    V2 keeps that behavior: no truncation or profile rollout gate, and absent,
+    legacy, malformed, or temporarily undecryptable blobs leave the existing
+    generic companion prompt unchanged.
+    """
+    user_id = str(getattr(store, "user_id", "") or "")
+    if not user_id:
+        return ""
+    try:
+        blob = db.get_blob(user_id, "genesis_persona")
+    except Exception as exc:  # noqa: BLE001 — absence must not fail the turn
+        log.warning(
+            "genesis persona blob read failed for %s: %s",
+            user_id,
+            type(exc).__name__,
+        )
+        return ""
+    if not isinstance(blob, dict):
+        return ""
+    envelope = blob.get("content_envelope")
+    if not isinstance(envelope, dict):
+        return ""
+    try:
+        raw = core_envelope.read_envelope_body(
+            envelope,
+            None,
+            purpose="genesis_persona",
+            runtime_token=str(runtime_token or ""),
+        )
+        return raw.decode("utf-8")
+    except Exception as exc:  # noqa: BLE001 — mirror Runtime V1 fallback
+        log.warning(
+            "genesis persona decrypt failed for %s: %s",
+            user_id,
+            type(exc).__name__,
+        )
+        return ""
+
+
+def _load_identity_card(store, *, runtime_token: str) -> str:
+    """Return the current identity-card JSON for encrypted and plaintext rows.
+
+    Genesis persona is the long-form baseline, while the identity card is the
+    live authority for the companion name and later profile patches.  Reading
+    both on every turn keeps V2 aligned with Identity writes and with the two
+    coexisting content shapes.
+    """
+    user_id = str(getattr(store, "user_id", "") or "")
+    if not user_id:
+        return ""
+    try:
+        identity = db.get_blob(user_id, "identity")
+        if not isinstance(identity, dict):
+            return ""
+        raw = core_envelope.read_envelope_body(
+            identity,
+            None,
+            purpose="identity_prompt",
+            runtime_token=str(runtime_token or ""),
+        )
+        parsed = json.loads(raw.decode("utf-8"))
+        if not isinstance(parsed, dict):
+            return ""
+        return json.dumps(parsed, ensure_ascii=False, sort_keys=True)
+    except Exception as exc:  # noqa: BLE001 — identity absence must not fail a turn
+        log.warning(
+            "identity card read failed for %s: %s",
+            user_id,
+            type(exc).__name__,
+        )
+        return ""
+
+
+def _identity_prompt_block(identity_json: str) -> str:
+    if not identity_json:
+        return ""
+    return (
+        "<feedling-current-identity>\n"
+        "This is your current authoritative companion identity. Follow its "
+        "agent name, self-description, voice, boundaries, and user-addressing "
+        "preferences.\n"
+        f"{identity_json}\n"
+        "</feedling-current-identity>"
+    )
+
+
 def _load_workspace_prompt(store, *, runtime_token: str) -> dict:
     """Render one authoritative workspace prompt snapshot for a turn.
 
@@ -141,6 +230,17 @@ def _load_workspace_prompt(store, *, runtime_token: str) -> dict:
         store, runtime_token=str(runtime_token or "")
     )
     trusted_system_blocks: list[str] = []
+    persona = _load_genesis_persona(store, runtime_token=runtime_token).strip()
+    if persona:
+        # Persona first, matching V1's persona-before-tools ordering. It remains
+        # inside context.py's single cache-stable system-role prefix and is
+        # deliberately not subject to runtime-data or profile truncation.
+        trusted_system_blocks.append(persona)
+    identity_block = _identity_prompt_block(
+        _load_identity_card(store, runtime_token=runtime_token)
+    )
+    if identity_block:
+        trusted_system_blocks.append(identity_block)
     for block in render_trusted_prefix_blocks(
         backend,
         include_working_memory=False,
@@ -1103,6 +1203,20 @@ def _read_temporal_snapshot(
     }
 
 
+def _read_wake_attention_snapshot(
+    user_id: str,
+    *,
+    now_ts: float,
+    through_seq: int | None = None,
+) -> dict:
+    """Read content-free V1/V2 proactive frequency at the frozen wake frontier."""
+    return db.chat_visible_proactive_stats(
+        user_id,
+        since_ts=float(now_ts) - 86_400.0,
+        through_seq=through_seq,
+    )
+
+
 def _summary_metadata_frontier(state: dict) -> list:
     """Validate canonical provenance without decrypting every retained node."""
     opened = [
@@ -1581,7 +1695,6 @@ def _fire_scheduled_for_user(user_id: str) -> int:
     ):
         return 0
 
-    from proactive.controls_v2 import WakeControlDecisionV2
     from proactive.scheduled_wake_v2 import (
         DBScheduledWakeStoreV2,
         ScheduledWakeServiceV2,
@@ -2123,9 +2236,8 @@ def _read_memory_context(user_id: str, *, full_cards: bool = False) -> dict:
     enclave readside（用 runtime token 认证，服务器不本地解密）；runtime token 铸造失败
     也只让这三项降级（token=""，post_enclave 会 raise 被各自 try 吞掉），不影响 identity。
 
-    identity 是 E2E 信封，服务器侧拿不到明文人格文本 —— 只取 get_identity 暴露的顶层
-    非敏感明文（如有），否则降级为 ""。ai_name/user_name 同样无服务器侧明文来源，保持 ""，
-    由 prompt builder fallback（"我"/"TA"）。"""
+    identity 与记忆一样按行形状读取：密文经 enclave，明文 body 本地读取。
+    agent_name/user_preferred_name 同步作为抽取 prompt 的说话人标签。"""
     store = core_store.get_store(user_id)
     try:
         token = _mint_runtime_token(user_id)
@@ -2222,12 +2334,13 @@ def _read_memory_context(user_id: str, *, full_cards: bool = False) -> dict:
     except Exception as e:  # noqa: BLE001 — 单项降级
         log.warning("[v2.serve_worker] memory index unavailable for %s: %s", user_id, e)
     try:
-        body, status = identity_core.get_identity(store)
-        ident = body.get("identity") if isinstance(body, dict) else None
-        if status == 200 and isinstance(ident, dict):
-            # E2E 信封：服务器侧只有顶层非敏感明文（summary/title 若曾以明文写入），否则 ""。
-            ctx["identity"] = str(
-                ident.get("summary") or ident.get("title") or ""
+        identity_json = _load_identity_card(store, runtime_token=token)
+        if identity_json:
+            ctx["identity"] = identity_json
+            ident = json.loads(identity_json)
+            ctx["ai_name"] = str(ident.get("agent_name") or "").strip()
+            ctx["user_name"] = str(
+                ident.get("user_preferred_name") or ""
             ).strip()
     except Exception as e:  # noqa: BLE001 — 单项降级
         log.warning("[v2.serve_worker] identity unavailable for %s: %s", user_id, e)
@@ -3485,8 +3598,12 @@ def _validate_decrypted_tool_effect(effect_type: str, payload: dict) -> None:
             action_type = str(action.get("type") or "")
             if action_type == "memory.delete":
                 if (
-                    set(action) != {"type", "memory_id"}
+                    set(action) not in (
+                        {"type", "memory_id"},
+                        {"type", "memory_id", "reason"},
+                    )
                     or not str(action.get("memory_id") or "").strip()
+                    or not isinstance(action.get("reason", ""), str)
                 ):
                     raise RuntimeError("invalid encrypted memory delete")
                 continue
@@ -3816,6 +3933,7 @@ def build_production_deps() -> v2_worker.TurnDeps:
         read_compaction_tail_after_seq=_read_compaction_tail_after_seq,
         read_recent_turns=_read_recent_turns,
         read_temporal_snapshot=_read_temporal_snapshot,
+        read_wake_attention_snapshot=_read_wake_attention_snapshot,
         read_summary=_read_summary,
         read_summary_with_seq=_read_summary_with_seq,
         write_summary=_write_summary,

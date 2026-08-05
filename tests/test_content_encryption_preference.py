@@ -208,17 +208,27 @@ def test_plaintext_write_gate_defaults_closed():
     assert core_envelope._plaintext_writes_accepted({key: " 1 "}) is True
 
 
-def test_pre_manifest_is_the_only_manifest_that_opens_plaintext_gate():
-    """The rollout is pre-only; merging this code cannot open test or prod."""
+def test_pre_processes_share_the_plaintext_gate_and_other_envs_stay_closed():
+    """Every Pre reply writer must agree with whoami; test/prod stay closed."""
     from pathlib import Path
+
+    import yaml
 
     root = Path(__file__).resolve().parents[1]
     key = "FEEDLING_PLAINTEXT_WRITES_ACCEPTED"
     pre = (root / "deploy/docker-compose.phala.pre.yaml").read_text()
+    pre_runner = (root / "deploy/docker-compose.phala.pre.runner.yaml").read_text()
     test = (root / "deploy/docker-compose.phala.test.yaml").read_text()
     prod = (root / "deploy/docker-compose.phala.yaml").read_text()
 
-    assert f'{key}: "1"' in pre
+    pre_compose = yaml.safe_load(pre)
+    for service in ("backend", "serve-worker"):
+        assert pre_compose["services"][service]["environment"][key] == "1"
+    assert pre_compose["services"]["backend"]["environment"][
+        "FEEDLING_EXPECTED_RUNNER_COUNT"
+    ] == "1"
+    runner_compose = yaml.safe_load(pre_runner)
+    assert runner_compose["x-agent-runner-env"][key] == "1"
     assert key not in test
     assert key not in prod
 

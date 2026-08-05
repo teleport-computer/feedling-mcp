@@ -380,6 +380,39 @@ def test_temporal_context_invalid_timezone_falls_back_to_china_default():
     assert temporal["timezone"] == context.DEFAULT_TIMEZONE
 
 
+def test_wake_temporal_context_includes_social_attention_facts():
+    now = datetime(2026, 7, 26, 12, 0, tzinfo=timezone.utc).timestamp()
+    temporal = context.build_temporal_context(
+        now_ts=now,
+        timezone_name="Asia/Shanghai",
+        last_user_message_ts=now - 120,
+        tail=[
+            {"role": "user", "content": "hi", "ts": now - 120},
+            {"role": "assistant", "content": "hey", "ts": now - 30},
+        ],
+        visible_proactive_count_24h=7,
+        last_visible_proactive_message_ts=now - 30,
+    )
+
+    assert temporal["attention_facts"] == {
+        "last_message_age_sec": 30,
+        "last_user_message_age_sec": 120,
+        "last_visible_proactive_age_sec": 30,
+        "tail_freshness": "fresh",
+        "tail_included_messages": 2,
+        "visible_proactive_count_24h": 7,
+    }
+
+    stale = context.build_temporal_context(
+        now_ts=now,
+        timezone_name="Asia/Shanghai",
+        last_user_message_ts=now - 30_000,
+        tail=[{"role": "user", "content": "old", "ts": now - 30_000}],
+        visible_proactive_count_24h=0,
+    )
+    assert stale["attention_facts"]["tail_freshness"] == "stale"
+
+
 def test_temporal_context_unknown_timezone_defaults_to_china_not_utc():
     # The screenshot bug: tz unknown → current_local_time degraded to UTC
     # (20:55 "晚上9点") while the message-content anchor showed the correct

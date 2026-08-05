@@ -50,18 +50,39 @@ def test_write_tools_have_object_params():
         assert specs[w].parameters["type"] == "object"
 
 
-def test_memory_index_exposes_partition_filters_without_offset():
+def test_memory_index_exposes_partition_and_sensitivity_filters_without_offset():
     spec = next(
         item for item in tool_schema.build_tool_specs() if item.name == "memory_index"
     )
 
-    assert set(spec.parameters["properties"]) == {"limit", "bucket", "thread"}
+    assert set(spec.parameters["properties"]) == {
+        "limit", "bucket", "thread", "ambient", "include_sensitive"
+    }
     assert "offset" not in spec.parameters["properties"]
     assert tool_schema.validate_tool_args(
         "memory_index", {"bucket": "旅行", "thread": "京都"}
     ) is None
     assert "memory_search" in spec.description
     assert "memory_organize" in spec.description
+
+
+def test_recent_apps_and_memory_fetch_parity_parameters_are_model_facing():
+    specs = {item.name: item for item in tool_schema.build_tool_specs()}
+    assert set(specs["perception_recent_apps"].parameters["properties"]) == {
+        "limit", "hours"
+    }
+    assert set(specs["memory_fetch"].parameters["properties"]) == {
+        "ids", "limit", "include_archived", "include_superseded"
+    }
+    assert tool_schema.validate_tool_args(
+        "memory_fetch",
+        {
+            "ids": ["m1"],
+            "limit": 20,
+            "include_archived": True,
+            "include_superseded": False,
+        },
+    ) is None
 
 
 def test_identity_patch_exposes_agent_name_so_a_rename_is_discoverable():
@@ -75,8 +96,17 @@ def test_identity_patch_exposes_agent_name_so_a_rename_is_discoverable():
     spec = next(s for s in tool_schema.build_tool_specs() if s.name == "identity_patch")
     assert spec.parameters["properties"]["agent_name"] == {"type": "string"}
     assert "agent_name" in spec.description
-    # top-level agent_name alone is a complete, valid call
+    # Replay validation remains backward-compatible for an already-enqueued old call.
     assert tool_schema.validate_tool_args("identity_patch", {"agent_name": "老6"}) is None
+    # Live model validation applies D4 before enqueue so the model can self-correct.
+    assert "self_introduction" in tool_schema.validate_tool_args(
+        "identity_patch", {"agent_name": "老6"}, live_model_call=True
+    )
+    assert tool_schema.validate_tool_args(
+        "identity_patch",
+        {"agent_name": "老6", "self_introduction": "我是老6"},
+        live_model_call=True,
+    ) is None
 
 
 def test_identity_patch_validator_accepts_every_shape_the_old_code_accepted():
@@ -189,3 +219,17 @@ def test_identity_patch_description_advertises_list_fields_and_ops():
     assert "add_" in d and "remove_" in d and "replace_" in d
     # at least one of the newly-reachable list fields is named
     assert "boundaries" in d
+    assert "only one method" in d
+    assert "D4" in d
+
+
+def test_memory_write_reason_and_relative_wake_are_described_and_valid():
+    specs = {item.name: item for item in tool_schema.build_tool_specs()}
+    assert "reason" in specs["memory_write"].parameters["properties"]["actions"]["items"]["properties"]
+    assert tool_schema.validate_tool_args(
+        "memory_write",
+        {"actions": [{
+            "op": "delete", "target_id": "m1", "reason": "user corrected this"
+        }]},
+    ) is None
+    assert "in 2 hours" in specs["schedule_wake"].description
