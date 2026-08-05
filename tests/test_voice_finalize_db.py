@@ -58,6 +58,33 @@ def test_call_rows_selected_and_deleted_others_kept():
     assert db.chat_get_strict(uid, other_call) is not None
 
 
+def test_untagged_reply_rows_are_deleted_via_reply_to_parent():
+    # Live-verified shape: only the spoken USER row carries voice_call_id; the
+    # assistant reply carries only reply_to_message_id. The reply must still be
+    # cleaned up, and the roll-call recheck must count IT, not re-query by the
+    # (now deleted) parent tag.
+    uid = _seed_user()
+    call_id = "vcall_" + uuid.uuid4().hex[:10]
+    turn = _append(uid, {
+        "role": "user", "source": "chat",
+        "voice_call_id": call_id, "voice_turn_id": "t1",
+    })
+    reply = _append(uid, {
+        "role": "openclaw", "source": "chat",
+        "reply_to_message_id": turn,   # no voice_call_id — the real shape
+    })
+    unrelated_reply = _append(uid, {
+        "role": "openclaw", "source": "chat",
+        "reply_to_message_id": "someone-else",
+    })
+
+    result = summary.delete_call_messages(uid, call_id)
+    assert result == {"deleted": 2, "retained_covered": 0, "remaining": 0}
+    assert db.chat_get_strict(uid, turn) is None
+    assert db.chat_get_strict(uid, reply) is None
+    assert db.chat_get_strict(uid, unrelated_reply) is not None
+
+
 def test_delete_never_touches_the_summary_row_and_is_idempotent():
     uid = _seed_user()
     call_id = "vcall_" + uuid.uuid4().hex[:10]

@@ -159,16 +159,33 @@ def _compaction_covered_seq(user_id: str) -> int:
 
 
 def call_message_rows(user_id: str, call_id: str) -> list[tuple[str, int]]:
-    """(msg_id, seq) of every chat row belonging to one voice call. Both the
-    spoken user turn and IO's reply carry ``voice_call_id`` as plaintext
-    routing metadata, so one predicate covers the whole call."""
+    """(msg_id, seq) of every chat row belonging to one voice call.
+
+    Only the SPOKEN USER turn carries ``voice_call_id``; the assistant reply is
+    persisted by the ordinary agent path and carries only
+    ``reply_to_message_id`` pointing at that user row (verified live: openclaw
+    reply rows have no voice metadata). So the call's rows are the tagged rows
+    PLUS every reply whose parent is one of them.
+    """
     with db.get_pool().connection() as conn:
         rows = conn.execute(
             "SELECT msg_id, seq FROM chat_messages "
             "WHERE user_id = %s AND doc->>'voice_call_id' = %s",
             (str(user_id), str(call_id)),
         ).fetchall()
-    return [(str(r[0]), int(r[1] or 0)) for r in rows]
+        tagged = [(str(r[0]), int(r[1] or 0)) for r in rows]
+        parent_ids = [m for m, _s in tagged]
+        if parent_ids:
+            reply_rows = conn.execute(
+                "SELECT msg_id, seq FROM chat_messages "
+                "WHERE user_id = %s "
+                "AND doc->>'reply_to_message_id' = ANY(%s)",
+                (str(user_id), parent_ids),
+            ).fetchall()
+            tagged.extend(
+                (str(r[0]), int(r[1] or 0)) for r in reply_rows
+            )
+    return tagged
 
 
 def delete_call_messages(user_id: str, call_id: str) -> dict:
@@ -184,24 +201,36 @@ def delete_call_messages(user_id: str, call_id: str) -> dict:
     """
     smid = summary_message_id(call_id)
     covered = _compaction_covered_seq(user_id)
+    # Snapshot the full row set FIRST: once the tagged user rows are deleted,
+    # their replies can no longer be found through the parent predicate, so the
+    # recheck must roll-call this same list rather than re-run the query.
+    targets = [
+        (msg_id, seq)
+        for msg_id, seq in call_message_rows(user_id, call_id)
+        if msg_id != smid
+    ]
     deleted = 0
     retained_covered = 0
-    for msg_id, seq in call_message_rows(user_id, call_id):
-        if msg_id == smid:
-            continue
+    deletable: list[str] = []
+    for msg_id, seq in targets:
         if seq <= covered:
             retained_covered += 1
             continue
+        deletable.append(msg_id)
         try:
             if db.chat_delete(str(user_id), msg_id):
                 deleted += 1
         except Exception:  # noqa: BLE001 — counted below via the recheck
             continue
-    remaining = sum(
-        1
-        for msg_id, seq in call_message_rows(user_id, call_id)
-        if msg_id != smid and seq > covered
-    )
+    remaining = 0
+    if deletable:
+        with db.get_pool().connection() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) FROM chat_messages "
+                "WHERE user_id = %s AND msg_id = ANY(%s)",
+                (str(user_id), deletable),
+            ).fetchone()
+        remaining = int(row[0] or 0)
     return {
         "deleted": deleted,
         "retained_covered": retained_covered,
