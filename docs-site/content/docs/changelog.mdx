@@ -10,6 +10,11 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **Hosted Genesis retries no longer reuse completed imports that produced no
+  durable memories or identity artifact.** Retrying identical staged material
+  after such an incomplete historical result now creates a new processing job
+  instead of returning the empty result as successfully completed.
+
 - **Runtime V2 memory capture now supports both content-storage tiers.** Its
   atomic capture journal accepts a plaintext `body` envelope only when the
   account's effective encryption mode is off, continues to require the full

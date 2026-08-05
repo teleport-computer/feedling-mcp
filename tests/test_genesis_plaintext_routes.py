@@ -545,6 +545,7 @@ def test_plaintext_import_reuses_done_job_without_restart(monkeypatch):
     existing = {
         "job_id": "genesis_done",
         "status": "done",
+        "memory_action_count": 1,
         "metadata": {"ingest": "plaintext", "input_hash": input_hash},
     }
     monkeypatch.setattr(plaintext.db, "genesis_list_jobs", lambda *_args, **_kwargs: [existing])
@@ -969,6 +970,7 @@ def test_plaintext_commit_reused_done_job_consumes_current_stage(monkeypatch):
     monkeypatch.setattr(plaintext.service, "load_genesis_staged_payload", lambda *_a: materials)
     done = {
         "job_id": "genesis_done", "status": "done",
+        "memory_action_count": 1,
         "metadata": {
             "ingest": "plaintext",
             "input_hash": plaintext.history_import._history_import_payload_hash(materials),
@@ -986,6 +988,62 @@ def test_plaintext_commit_reused_done_job_consumes_current_stage(monkeypatch):
 
     assert resp.status_code == 200
     assert consumed["v"] == ("stage_now", "genesis_done")
+
+
+def test_plaintext_commit_done_without_artifact_evidence_creates_new_job(monkeypatch):
+    materials = {"format": "plaintext", "content": "User: retry poisoned import"}
+    input_hash = plaintext.history_import._history_import_payload_hash(materials)
+    poisoned = {
+        "job_id": "genesis_poisoned",
+        "status": "done",
+        "memory_action_count": 0,
+        "identity_status": "",
+        "persona_ref": "",
+        "metadata": {
+            "ingest": "plaintext",
+            "input_hash": input_hash,
+            "mode": "onboarding",
+        },
+    }
+    monkeypatch.setattr(plaintext.service, "load_genesis_staged_payload", lambda *_a: materials)
+    monkeypatch.setattr(plaintext.db, "genesis_list_jobs", lambda *_a, **_k: [poisoned])
+
+    created = {}
+
+    def fake_create(_store, payload, **_kwargs):
+        created["job"] = {
+            "job_id": "genesis_retry",
+            "status": "processing",
+            "metadata": payload["metadata"],
+        }
+        return created["job"], 201
+
+    monkeypatch.setattr(plaintext.service, "create_import_job", fake_create)
+    monkeypatch.setattr(
+        plaintext.db,
+        "genesis_set_job_status",
+        lambda *_a, **kwargs: {**created["job"], "output": kwargs.get("output")},
+    )
+    monkeypatch.setattr(plaintext.service, "write_genesis_state", lambda *_a, **_k: None)
+    started = {}
+    monkeypatch.setattr(
+        plaintext,
+        "_start_plaintext_genesis_job",
+        lambda _store, _key, job, **_kwargs: started.update(job=job) or True,
+    )
+    monkeypatch.setattr(
+        genesis_core.service,
+        "mark_genesis_staged_consumed",
+        lambda *_a: (_ for _ in ()).throw(AssertionError("poisoned done must not consume retry stage")),
+    )
+
+    resp = _client(monkeypatch).post(
+        "/v1/genesis/imports/plaintext/commit", json={"staged_id": "stage_retry"})
+
+    assert resp.status_code == 202
+    assert resp.get_json()["job"]["job_id"] == "genesis_retry"
+    assert started["job"]["job_id"] == "genesis_retry"
+    assert created["job"]["job_id"] != poisoned["job_id"]
 
 
 def test_plaintext_direct_import_ignores_client_staged_id(monkeypatch):

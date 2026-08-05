@@ -106,7 +106,15 @@ def _seed_done_plaintext_job(uid: str, input_hash: str) -> None:
             "metadata": {"ingest": "plaintext", "input_hash": input_hash, "mode": "onboarding"},
         },
     )
-    db.genesis_set_job_status(uid, "plaindone", status=genesis_service.DONE_JOB_STATUS)
+    db.genesis_complete_job(
+        uid,
+        "plaindone",
+        output={"stage": "genesis_done"},
+        memory_action_count=1,
+        identity_status="",
+        persona_ref="",
+        persona_sha256="",
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -544,11 +552,15 @@ def test_plaintext_reuses_done_job_200_parity(user, monkeypatch):
 
 
 def test_plaintext_update_identity_without_identity_enqueues_202_parity(user, monkeypatch):
-    _uid, api_key = user
+    uid, api_key = user
     payload = {"mode": "update_identity", "ai_persona_content": "Name: Joy", "client_job_id": "identity-x"}
     monkeypatch.setattr(genesis_routes, "_start_plaintext_genesis_job", lambda *_args, **_kwargs: True)
     f = _flask("POST", "/v1/genesis/imports/plaintext", headers=_headers(api_key), json_body=payload)
+    # Flask and ASGI are alternate adapters, not two concurrent requests in
+    # this parity test. Clear the first adapter's active job before exercising
+    # the second; a real duplicate while processing correctly returns 409.
+    _reset_genesis(uid)
     a = _asgi("POST", "/v1/genesis/imports/plaintext", headers=_headers(api_key), json_body=payload)
     assert f[0] == a[0] == 202
-    assert _norm(f) == _norm(a)
+    assert _norm(f, drop={"job_id"}) == _norm(a, drop={"job_id"})
     assert f[1]["status"] == "processing"

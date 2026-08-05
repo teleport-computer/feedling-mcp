@@ -185,8 +185,14 @@ def run_processing_cell(cell: HostedCell, pool: dict[str, str], *, large: bool =
         # -- 防重:同 stage 再提交 / 处理中另开一单 --------------------------
         def _double_commit():
             r = c.post("/v1/genesis/imports/plaintext/commit", json={"staged_id": staged_id})
-            ok = r.status_code == 409 and r.json().get("error") == "staged_import_consumed"
-            return (PASS if ok else PRODUCT_FAIL), f"HTTP {r.status_code} {r.text[:80]}"
+            body = r.json() if r.status_code < 500 else {}
+            err = body.get("error")
+            # 4f9e3d1d 起 staged 只在 DONE 时 consume(失败重试要复用材料),
+            # 处理中的重复提交撞活跃 job 闸;更早的部署则撞 consumed。两者都算防住。
+            ok = r.status_code == 409 and (
+                (err == "import_job_active" and body.get("active_job_id") == job_id)
+                or err == "staged_import_consumed")
+            return (PASS if ok else PRODUCT_FAIL), f"HTTP {r.status_code} {str(body)[:90]}"
         p.guard("double_commit_rejected", _double_commit)
 
         def _concurrent_commit():
