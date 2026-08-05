@@ -10,6 +10,12 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **Runtime V2 Chat now applies matching World Book entries.** Matches use the
+  current user turn and enter the prompt as a standalone, untrusted setting-data
+  block rather than changing the user's message. Oversized matched context is
+  deterministically truncated with a visible marker; proactive wake lanes remain
+  unchanged for Runtime V1 parity.
+
 - **Dream more clearly keeps merely related memories separate.** Its shared V1
   and Runtime V2 consolidation guidance now gives a concrete example that a
   cycling habit and recent insomnia remain independent memories even though

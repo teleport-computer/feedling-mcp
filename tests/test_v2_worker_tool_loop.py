@@ -28,6 +28,7 @@ from capabilities import registry as cap_registry
 from core import envelope as core_envelope
 from core import store as core_store
 from model_api_runtime.v2 import cursor as v2_cursor
+from model_api_runtime.v2 import context as v2_context
 from model_api_runtime.v2 import effect_id as v2_effect_id
 from model_api_runtime.v2 import effect_outbox as v2_effect_outbox
 from model_api_runtime.v2 import jobs_store
@@ -332,6 +333,80 @@ def test_single_round_plain_text_writes_exactly_one_bubble(monkeypatch):
     assert row[1] is False  # not failed
     assert row[2] == "ok"
     assert _job_status_row(job_id)[0] == "completed"
+
+
+def test_chat_worldbook_matches_current_turn_without_rewriting_user_text(
+    monkeypatch,
+):
+    monkeypatch.setenv("FEEDLING_V2_SELF_THINKING", "off")
+    uid = "u_toolloop_worldbook"
+    conftest.seed_user(uid)
+    _reset(uid)
+    jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("w-worldbook")
+    _patch_real_write(monkeypatch)
+
+    calls = _script_provider(monkeypatch, [_text_round("The queen remembers you.")])
+    observed: dict = {}
+
+    def read_worldbook(user_id, messages, *, runtime_token):
+        observed.update({
+            "user_id": user_id,
+            "messages": messages,
+            "runtime_token": runtime_token,
+        })
+        return {
+            "block": "<world_book>\nLuna is queen of the Moon Court.\n</world_book>",
+            "matched_names": ["Moon Court"],
+        }
+
+    deps = _deps(messages=[{
+        "id": "m-worldbook",
+        "ts": 10.0,
+        "role": "user",
+        "content": "Tell me about Luna",
+    }])
+    deps.read_worldbook_context = read_worldbook
+
+    status = asyncio.run(
+        worker.process_job(
+            job,
+            deps,
+            provider_config=_BYOK,
+            api_key=None,
+            runtime_token="rt",
+        )
+    )
+
+    assert status == "completed"
+    assert observed == {
+        "user_id": uid,
+        "messages": [{"role": "user", "content": "Tell me about Luna"}],
+        "runtime_token": "rt",
+    }
+    provider_messages = calls[0]["messages"]
+    worldbook_messages = [
+        message
+        for message in provider_messages
+        if isinstance(message, dict)
+        and str(message.get("content") or "").startswith(
+            v2_context.WORLD_BOOK_CONTEXT_HEADER + "\n"
+        )
+    ]
+    assert len(worldbook_messages) == 1
+    assert worldbook_messages[0]["role"] == "user"
+    assert "Luna is queen of the Moon Court." in worldbook_messages[0]["content"]
+    assert [
+        message
+        for message in provider_messages
+        if isinstance(message, dict)
+        and message.get("content") == "Tell me about Luna"
+    ] == [{"role": "user", "content": "Tell me about Luna"}]
+    assert all(
+        "Luna is queen" not in str(message.get("content") or "")
+        for message in provider_messages
+        if isinstance(message, dict) and message.get("role") == "system"
+    )
 
 
 def test_self_thinking_on_suppresses_native_reasoning(monkeypatch):

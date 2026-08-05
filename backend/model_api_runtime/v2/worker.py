@@ -1186,6 +1186,10 @@ class TurnDeps:
     read_perception_wake_context: Callable[[str, int], list[dict]] | None = None
     # Pending timer identity lets follow-ups use a backend-confirmed wake_id.
     read_pending_scheduled_wake_context: Callable[[str], dict] | None = None
+    # Chat-only World Book match. The assembly callback decrypts and matches the
+    # user's entries against this turn's current user text, returning
+    # {"block": str, "matched_names": [...]}. Wake lanes never call it.
+    read_worldbook_context: Callable[..., dict] | None = None
     # (user_id, actions) -> result dict：把抽取产出的 memory.add/memory.supersede action 落库
     # （走既有 /v1/memory/actions 同路径的服务端实现）。None 时跳过持久化、仍干净 mark_completed
     # （让 handler 无 DB/enclave 也可单测）。
@@ -3020,6 +3024,7 @@ def _make_build_messages_fn(
     working_memory: str = "",
     agent_memory: str = "",
     user_profile: str = "",
+    worldbook_context: str = "",
     coverage_hole_notice: str = "",
     provider_config: Any = None,
     temporal_context: dict[str, Any] | None = None,
@@ -3085,7 +3090,11 @@ def _make_build_messages_fn(
             ),
         )
 
-    def _base(selected_turns: list[list[dict]]) -> list:
+    def _base(
+        selected_turns: list[list[dict]],
+        *,
+        worldbook_char_cap: int = context.WORLD_BOOK_CONTEXT_CHAR_CAP,
+    ) -> list:
         rendered_tail = _flatten_turns(selected_turns) + required_tail
         return context.build_turn_messages(
             system_prompt=system_prompt,
@@ -3097,6 +3106,8 @@ def _make_build_messages_fn(
             working_memory=working_memory,
             agent_memory=agent_memory,
             user_profile=user_profile,
+            worldbook_context=worldbook_context,
+            worldbook_context_char_cap=worldbook_char_cap,
             coverage_hole_notice=coverage_hole_notice,
             temporal_context=_temporal_for(rendered_tail),
             application_data_role=application_data_role,
@@ -3174,9 +3185,16 @@ def _make_build_messages_fn(
                         "content": content,
                     })
 
-            def _candidate(count: int) -> tuple[list, Any]:
+            def _candidate(
+                count: int,
+                *,
+                worldbook_char_cap: int,
+            ) -> tuple[list, Any]:
                 selected = eligible_optional[-count:] if count else []
-                messages = _base(selected) + rendered_transcript
+                messages = _base(
+                    selected,
+                    worldbook_char_cap=worldbook_char_cap,
+                ) + rendered_transcript
                 plan = v2_prompt_frontier.plan_provider_round(
                     model_limit=model_limit,
                     messages=messages,
@@ -3188,14 +3206,53 @@ def _make_build_messages_fn(
                 )
                 return messages, plan
 
+            # World Book is optional bounded setting context. If the fixed cap
+            # does not fit alongside required history/transcript, binary-search
+            # the largest prefix whose explicit truncation marker does fit. The
+            # marker-only form (cap=0) is the minimum; if even that cannot fit,
+            # the required frontier still fails loud instead of dropping it.
+            full_worldbook_cap = min(
+                len(str(worldbook_context or "").strip()),
+                context.WORLD_BOOK_CONTEXT_CHAR_CAP,
+            )
+            effective_worldbook_cap = full_worldbook_cap
+            try:
+                best_messages, best_plan = _candidate(
+                    0,
+                    worldbook_char_cap=effective_worldbook_cap,
+                )
+            except v2_prompt_frontier.PromptFrontierExhausted:
+                if not str(worldbook_context or "").strip():
+                    raise
+                low_worldbook, high_worldbook = 0, full_worldbook_cap
+                best_worldbook: tuple[int, list, Any] | None = None
+                while low_worldbook <= high_worldbook:
+                    middle = (low_worldbook + high_worldbook) // 2
+                    try:
+                        messages, plan = _candidate(
+                            0,
+                            worldbook_char_cap=middle,
+                        )
+                    except v2_prompt_frontier.PromptFrontierExhausted:
+                        high_worldbook = middle - 1
+                    else:
+                        best_worldbook = (middle, messages, plan)
+                        low_worldbook = middle + 1
+                if best_worldbook is None:
+                    raise
+                effective_worldbook_cap, best_messages, best_plan = best_worldbook
+
             # Required-only must fit. It is the structural failure boundary:
-            # summary, exact core, and native transcript are never clipped.
-            best_messages, best_plan = _candidate(0)
+            # summary, exact core, native transcript, and at least the explicit
+            # World Book truncation marker are never silently clipped.
             low, high, best = 1, len(eligible_optional), 0
             while low <= high:
                 middle = (low + high) // 2
                 try:
-                    messages, plan = _candidate(middle)
+                    messages, plan = _candidate(
+                        middle,
+                        worldbook_char_cap=effective_worldbook_cap,
+                    )
                 except v2_prompt_frontier.PromptFrontierExhausted:
                     high = middle - 1
                 else:
@@ -3220,6 +3277,10 @@ def _make_build_messages_fn(
                 "fallback": fallback,
                 "anchor_trimmed": anchor_trimmed,
                 "source_truncated": bool(tail_source_truncated),
+                "worldbook_truncated": bool(worldbook_context) and (
+                    effective_worldbook_cap
+                    < len(str(worldbook_context).strip())
+                ),
             }
 
         build_messages.plan_provider_round = plan_provider_round
@@ -10432,6 +10493,36 @@ async def process_job(
         else:
             summary, tail = "", []
 
+        worldbook_context = ""
+        if lane == "chat" and deps.read_worldbook_context is not None:
+            worldbook_match_messages = [
+                {
+                    "role": "user",
+                    "content": context.text_of(row.get("content")),
+                }
+                for row in coalesced
+                if context.text_of(row.get("content")).strip()
+            ]
+            if worldbook_match_messages:
+                try:
+                    async with enclave_sem:
+                        worldbook_result = await asyncio.to_thread(
+                            deps.read_worldbook_context,
+                            user_id,
+                            worldbook_match_messages,
+                            runtime_token=runtime_token,
+                        )
+                    if isinstance(worldbook_result, dict):
+                        worldbook_context = str(
+                            worldbook_result.get("block") or ""
+                        ).strip()
+                except Exception as exc:  # noqa: BLE001 — V1 parity: best effort
+                    log.warning(
+                        "[v2.worldbook] match unavailable user=%s code=%s",
+                        user_id,
+                        type(exc).__name__.lower(),
+                    )
+
         temporal_snapshot = await _capture_turn_temporal_snapshot(
             user_id=user_id,
             deps=deps,
@@ -11512,6 +11603,7 @@ async def process_job(
                 working_memory=working_memory,
                 agent_memory=agent_memory,
                 user_profile=user_profile,
+                worldbook_context=worldbook_context,
                 coverage_hole_notice=coverage_hole_notice,
                 provider_config=provider_config,
                 temporal_snapshot=temporal_snapshot,
