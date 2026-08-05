@@ -10,6 +10,10 @@ identical ``data_track`` code path executes off the event loop.
 
 Every entry point is blocking (sync ``db.py`` under the hood) and must be invoked
 via ``asgi.threadpool.run_db`` from the async routes.
+
+``page_html`` is the single HTML dispatcher for every ``view=`` (运营总览/
+产品健康/imports/chat/latency/runtime/usage/dau/growth/proactive/events/
+debug/users)，并在此层做 60s digest-key 缓存与 builder 扇出。
 """
 
 from __future__ import annotations
