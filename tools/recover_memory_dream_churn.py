@@ -111,6 +111,88 @@ def summarize(docs: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def _change_day(entry: dict[str, Any]) -> str:
+    """UTC day (YYYY-MM-DD) of one memory_changes row; '' when unparseable."""
+    raw = str(entry.get("ts") or "").strip()
+    try:
+        return _iso_datetime(raw).date().isoformat()
+    except argparse.ArgumentTypeError:
+        return ""
+
+
+def change_log_report(changes: list[dict[str, Any]]) -> dict[str, Any]:
+    """只读侦查:硬删流水 + supersede 按天分布(usr_a40e 复原调查,2026-08-06)。
+
+    回答两个执行前必答的问题:①用户那 5 次硬删发生在什么时候、删的是哪些卡
+    (是不是他自己清掉了墓碑);②哪些晚上在吃卡、每晚吃几张(污染起点不用猜)。
+    只输出 id/时间/动作元数据,绝不输出卡片内容字段。"""
+    hard_deletes = [
+        {
+            "ts": str(entry.get("ts") or ""),
+            "memory_id": str(entry.get("memory_id") or ""),
+            "reason": str(entry.get("reason") or "")[:200],
+        }
+        for entry in changes
+        if str(entry.get("action") or "").strip().lower() == "delete"
+    ]
+    supersede_by_day: dict[str, dict[str, Any]] = {}
+    for entry in changes:
+        if str(entry.get("action") or "").strip().lower() != "supersede":
+            continue
+        day = _change_day(entry) or "unknown"
+        bucket = supersede_by_day.setdefault(
+            day, {"count": 0, "retired_cards": 0, "by_capture_mode": {}}
+        )
+        bucket["count"] += 1
+        bucket["retired_cards"] += len(entry.get("supersedes") or [])
+        mode = str(entry.get("capture_mode") or "unknown").strip() or "unknown"
+        bucket["by_capture_mode"][mode] = bucket["by_capture_mode"].get(mode, 0) + 1
+    return {
+        "hard_deletes": hard_deletes,
+        "supersede_by_day": dict(sorted(supersede_by_day.items())),
+    }
+
+
+def window_created_by_source(
+    docs: list[dict[str, Any]], *, since: datetime | None
+) -> dict[str, Any]:
+    """窗内新建卡按来源分组(id+created_at)。resident_patch(agent 徒手 memory-patch)
+    不在本工具的退休范围内,但必须被看见 —— 决定要不要扩范围靠这份清单。"""
+    grouped: dict[str, list[dict[str, str]]] = {}
+    for doc in docs:
+        if since is not None and not _at_or_after(doc.get("created_at"), since):
+            continue
+        grouped.setdefault(_source(doc), []).append({
+            "id": str(doc.get("id") or ""),
+            "created_at": str(doc.get("created_at") or ""),
+            "status": str(doc.get("status") or "active"),
+        })
+    return {source: rows for source, rows in sorted(grouped.items())}
+
+
+def plan_rows(
+    docs: list[dict[str, Any]], updated: list[dict[str, Any]]
+) -> list[dict[str, str]]:
+    """逐卡计划清单(只列会被改动的行;只有元数据,无内容字段)。"""
+    rows: list[dict[str, str]] = []
+    for before, after in zip(docs, updated):
+        if before == after:
+            continue
+        planned = (
+            "restore"
+            if str(after.get("status") or "").lower() == "active"
+            else "retire"
+        )
+        rows.append({
+            "id": str(after.get("id") or ""),
+            "planned": planned,
+            "source": _source(after),
+            "created_at": str(after.get("created_at") or ""),
+            "was_superseded_by": str(before.get("superseded_by") or ""),
+        })
+    return rows
+
+
 def recovery_plan(
     docs: list[dict[str, Any]], *, now_iso: str, since: datetime | None = None
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
@@ -196,6 +278,13 @@ def main() -> int:
                 (args.user_id,),
             ).fetchall()
             docs = [dict(row["doc"] or {}) for row in rows]
+            # 变更流水只读:硬删时间线 + supersede 按天(执行前的证据面)。
+            change_rows = conn.execute(
+                "SELECT doc FROM user_logs "
+                "WHERE user_id = %s AND stream = 'memory_changes' ORDER BY seq",
+                (args.user_id,),
+            ).fetchall()
+            changes = [dict(row["doc"] or {}) for row in change_rows]
             updated, plan = recovery_plan(docs, now_iso=now_iso, since=args.since)
             report = {
                 "environment": args.env,
@@ -208,6 +297,11 @@ def main() -> int:
                 ),
                 "before": summarize(docs),
                 "plan": plan,
+                "plan_rows": plan_rows(docs, updated),
+                "change_log": change_log_report(changes),
+                "window_created_by_source": window_created_by_source(
+                    docs, since=args.since
+                ),
                 "after": summarize(updated),
             }
             print(json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True))

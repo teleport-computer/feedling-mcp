@@ -149,3 +149,87 @@ def test_since_date_is_inclusive_utc_and_workflow_forwards_it():
     ).read_text()
     assert "since:" in workflow
     assert 'recovery_args+=(--since "$RECOVERY_SINCE")' in workflow
+
+
+# ---------------------------------------------------------------------------
+# 只读侦查输出(2026-08-06,usr_a40e 复原调查):硬删流水 / supersede 按天 /
+# 逐卡计划清单 / 窗内新建卡按来源。全部纯函数,不改 recovery_plan 行为。
+# ---------------------------------------------------------------------------
+
+
+def test_change_log_report_lists_hard_deletes_and_supersedes_by_day():
+    changes = [
+        {"action": "delete", "ts": "2026-08-05T01:10:00Z", "memory_id": "tomb-1"},
+        {"action": "delete", "ts": "2026-08-05T01:11:00Z", "memory_id": "tomb-2"},
+        {"action": "insert", "ts": "2026-08-04T18:00:00Z", "memory_id": "cap-1"},
+        {
+            "action": "supersede", "ts": "2026-08-04T18:03:00Z", "memory_id": "new-1",
+            "supersedes": ["old-1", "old-2"], "capture_mode": "memory_dream",
+        },
+        {
+            "action": "supersede", "ts": "2026-08-05T18:05:00Z", "memory_id": "new-2",
+            "supersedes": ["old-3"],
+        },
+        {"action": "supersede", "ts": "not-a-date", "memory_id": "new-3", "supersedes": []},
+    ]
+
+    report = recovery.change_log_report(changes)
+
+    assert [row["memory_id"] for row in report["hard_deletes"]] == ["tomb-1", "tomb-2"]
+    assert report["supersede_by_day"]["2026-08-04"] == {
+        "count": 1, "retired_cards": 2, "by_capture_mode": {"memory_dream": 1},
+    }
+    assert report["supersede_by_day"]["2026-08-05"] == {
+        "count": 1, "retired_cards": 1, "by_capture_mode": {"unknown": 1},
+    }
+    assert report["supersede_by_day"]["unknown"]["count"] == 1
+
+
+def test_change_log_report_never_leaks_content_fields():
+    changes = [{
+        "action": "delete", "ts": "2026-08-05T01:10:00Z", "memory_id": "m1",
+        "summary": "secret text", "content": "secret body",
+    }]
+    report = recovery.change_log_report(changes)
+    flat = str(report)
+    assert "secret" not in flat
+
+
+def test_plan_rows_lists_only_changed_docs_with_metadata_only():
+    docs = [
+        {"id": "orig", "source": "memory_capture", "status": "superseded",
+         "is_archived": True, "archived_at": "2026-08-04T18:03:00Z",
+         "superseded_by": "dream-1", "created_at": "2026-07-20T00:00:00Z",
+         "summary": "secret original"},
+        {"id": "dream-1", "source": "memory_dream", "status": "active",
+         "created_at": "2026-08-04T18:03:00Z", "summary": "secret tombstone"},
+        {"id": "calm", "source": "memory_capture", "status": "active",
+         "created_at": "2026-07-01T00:00:00Z"},
+    ]
+    updated, _plan = recovery.recovery_plan(docs, now_iso="2026-08-06T00:00:00Z")
+    rows = recovery.plan_rows(docs, updated)
+
+    assert {row["id"]: row["planned"] for row in rows} == {
+        "orig": "restore", "dream-1": "retire",
+    }
+    assert all("summary" not in row and "content" not in row for row in rows)
+    restored = next(row for row in rows if row["id"] == "orig")
+    assert restored["was_superseded_by"] == "dream-1"
+
+
+def test_window_created_by_source_groups_and_respects_since():
+    since = recovery._iso_datetime("2026-08-01")
+    docs = [
+        {"id": "patch-new", "source": "resident_patch",
+         "created_at": "2026-08-05T18:05:00Z", "status": "active"},
+        {"id": "dream-new", "source": "memory_dream",
+         "created_at": "2026-08-04T18:03:00Z", "status": "active"},
+        {"id": "old-capture", "source": "memory_capture",
+         "created_at": "2026-07-20T00:00:00Z", "status": "active"},
+    ]
+    grouped = recovery.window_created_by_source(docs, since=since)
+    assert set(grouped) == {"resident_patch", "memory_dream"}
+    assert grouped["resident_patch"][0]["id"] == "patch-new"
+    # 不带窗时全量分组
+    grouped_all = recovery.window_created_by_source(docs, since=None)
+    assert set(grouped_all) == {"resident_patch", "memory_dream", "memory_capture"}
