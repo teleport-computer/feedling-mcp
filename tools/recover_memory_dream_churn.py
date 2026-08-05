@@ -125,12 +125,16 @@ def change_log_report(changes: list[dict[str, Any]]) -> dict[str, Any]:
 
     回答两个执行前必答的问题:①用户那 5 次硬删发生在什么时候、删的是哪些卡
     (是不是他自己清掉了墓碑);②哪些晚上在吃卡、每晚吃几张(污染起点不用猜)。
-    只输出 id/时间/动作元数据,绝不输出卡片内容字段。"""
+    只输出 id/时间/动作元数据,绝不输出卡片内容字段。
+    ⚠️ ``reason`` 刻意不输出:它是模型/客户端写的自由文本(≤500 字,
+    worker._memory_tool_actions 透传模型给的 a.reason),完全可能含卡片内容,
+    而这份报告会整体打进 GitHub Actions 日志(codex2 gatekeep P1,2026-08-05)。
+    这里只给 content-free 的 ``has_reason`` 存在位。"""
     hard_deletes = [
         {
             "ts": str(entry.get("ts") or ""),
             "memory_id": str(entry.get("memory_id") or ""),
-            "reason": str(entry.get("reason") or "")[:200],
+            "has_reason": bool(str(entry.get("reason") or "").strip()),
         }
         for entry in changes
         if str(entry.get("action") or "").strip().lower() == "delete"

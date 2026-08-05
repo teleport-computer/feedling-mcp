@@ -186,13 +186,17 @@ def test_change_log_report_lists_hard_deletes_and_supersedes_by_day():
 
 
 def test_change_log_report_never_leaks_content_fields():
+    # reason 是模型可写的自由文本(≤500 字)——真实的泄漏入口,必须只降为存在位
+    # (codex2 gatekeep P1 2026-08-05:summary/content 之外漏了 reason)。
     changes = [{
         "action": "delete", "ts": "2026-08-05T01:10:00Z", "memory_id": "m1",
         "summary": "secret text", "content": "secret body",
+        "reason": "secret user content",
     }]
     report = recovery.change_log_report(changes)
     flat = str(report)
     assert "secret" not in flat
+    assert report["hard_deletes"][0]["has_reason"] is True
 
 
 def test_plan_rows_lists_only_changed_docs_with_metadata_only():
