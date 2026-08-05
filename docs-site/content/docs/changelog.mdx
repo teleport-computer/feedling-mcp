@@ -10,6 +10,11 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **Hosted Genesis retries no longer reuse completed imports that produced no
+  durable memories or identity artifact.** Retrying identical staged material
+  after such an incomplete historical result now creates a new processing job
+  instead of returning the empty result as successfully completed.
+
 - **Do Not Disturb now suppresses Runtime V2 heartbeat and screen-watch
   scheduling.** Due-query polling excludes accounts whose proactive settings
   have `dnd` enabled and resumes automatically when DND is turned off.

@@ -106,7 +106,15 @@ def _seed_done_plaintext_job(uid: str, input_hash: str) -> None:
             "metadata": {"ingest": "plaintext", "input_hash": input_hash, "mode": "onboarding"},
         },
     )
-    db.genesis_set_job_status(uid, "plaindone", status=genesis_service.DONE_JOB_STATUS)
+    db.genesis_complete_job(
+        uid,
+        "plaindone",
+        output={"stage": "genesis_done"},
+        memory_action_count=1,
+        identity_status="",
+        persona_ref="",
+        persona_sha256="",
+    )
 
 
 # --------------------------------------------------------------------------- #
