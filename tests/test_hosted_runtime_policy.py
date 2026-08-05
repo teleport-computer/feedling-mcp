@@ -598,9 +598,14 @@ def test_main_compose_serve_worker_wires_memory_maintenance_producers():
     ):
         compose = yaml.safe_load((ROOT / "deploy" / name).read_text())
         env = compose["services"]["serve-worker"]["environment"]
-        assert env["FEEDLING_V2_CAPTURE_ENABLED"] == (
-            "${FEEDLING_V2_CAPTURE_ENABLED:-1}"
-        ), name
+        # test 环境 memory lanes 常态全开（86f0763c 把 capture/profile 硬编码
+        # 成 1，与 dream 同一批 normal-on 改动）；prod/pre 仍必须保持可参数化。
+        expected_capture = (
+            "1"
+            if name == "docker-compose.phala.test.yaml"
+            else "${FEEDLING_V2_CAPTURE_ENABLED:-1}"
+        )
+        assert env["FEEDLING_V2_CAPTURE_ENABLED"] == expected_capture, name
         expected_dream = (
             "1"
             if name == "docker-compose.phala.test.yaml"
