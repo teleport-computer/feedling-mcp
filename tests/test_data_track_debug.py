@@ -71,7 +71,12 @@ def test_genesis_stats_surfaces_state_and_recent_jobs(monkeypatch):
             "identity_status": "",
             "error": "",
             "updated_at": "2026-07-05T12:00:00Z",
-            "metadata": {"mode": "onboarding", "history_count": 42, "window_count": 3},
+            "metadata": {
+                "mode": "onboarding",
+                "history_count": 42,
+                "window_count": 3,
+                "distill_model": "gemini-3-flash-preview",
+            },
             "output": {"stage": "plaintext_queued"},
         },
         {
@@ -93,6 +98,9 @@ def test_genesis_stats_surfaces_state_and_recent_jobs(monkeypatch):
     assert stats["job_count"] == 2
     assert stats["latest_job"]["job_id"] == "gen_123"
     assert stats["latest_job"]["metadata"]["history_count"] == 42
+    assert stats["latest_job"]["distill_model"] == "gemini-3-flash-preview"
+    assert stats["latest_job"]["metadata"]["distill_model"] == "gemini-3-flash-preview"
+    assert stats["jobs"][0]["distill_model"] == "gemini-3-flash-preview"
 
 
 def test_fast_proactive_snapshot_keeps_expired_out_of_failed_count():

@@ -603,6 +603,58 @@ def test_foreground_combined_map_retries_once_when_empty(monkeypatch):
     assert output["voice_candidates"][0]["behavior_notes_candidates"] == ["直说"]
 
 
+def test_keep_all_empty_maps_return_bounded_raw_diagnostics_without_checkpointing():
+    raw = '{"fact_candidates":[],"explanation":"没有提取到候选"}'
+    llm = _FakeLLM([raw, raw])
+    checkpointed = []
+
+    output = worker.build_foreground_output_from_texts(
+        user_id="usr_1",
+        job_id="job_1",
+        runtime=types.SimpleNamespace(),
+        chunk_texts=["用户长期居住在上海，也一直从事产品设计。"],
+        source_kind="memory_summary_import",
+        llm=llm,
+        write_core=False,
+        keep_all=True,
+        on_map_completed=lambda idx, mapped: checkpointed.append((idx, mapped)),
+    )
+
+    assert output["all_fact_candidates"] == []
+    assert checkpointed == []
+    assert [item["discard_reason"] for item in output["map_diagnostics"]] == [
+        "empty_fact_candidates",
+        "empty_fact_candidates",
+    ]
+    assert output["map_diagnostics"][0]["raw_output_snippet"] == raw
+    assert output["map_diagnostics"][0]["raw_output_chars"] == len(raw)
+
+
+def test_keep_all_retry_ignores_legacy_empty_map_checkpoint():
+    llm = _FakeLLM([
+        '{"fact_candidates":[{"about":"user","summary":"用户长期居住在上海"}]}'
+    ])
+    checkpointed = []
+
+    output = worker.build_foreground_output_from_texts(
+        user_id="usr_1",
+        job_id="job_1",
+        runtime=types.SimpleNamespace(),
+        chunk_texts=["用户长期居住在上海。"],
+        source_kind="memory_summary_import",
+        llm=llm,
+        write_core=False,
+        keep_all=True,
+        resume_map_outputs={0: {"fact_candidates": []}},
+        on_map_completed=lambda idx, mapped: checkpointed.append((idx, mapped)),
+    )
+
+    assert llm.calls == 1
+    assert output["all_fact_candidates"][0]["summary"] == "用户长期居住在上海"
+    assert checkpointed[0][0] == 0
+    assert output["map_diagnostics"][0]["discard_reason"] == "empty_checkpoint_ignored"
+
+
 def test_fact_write_retries_once_when_empty(monkeypatch):
     calls = []
 

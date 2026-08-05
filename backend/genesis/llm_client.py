@@ -3,6 +3,8 @@
 The caller supplies a runtime ProviderConfig whose api_key has been decrypted
 inside the CVM/enclave path. This module never persists that key or LLM reply
 text; only request metadata, response hashes, lengths, and usage are recorded.
+The plaintext worker may separately retain a bounded reply excerpt in the
+user-owned Genesis job output when a map result is discarded for diagnostics.
 """
 
 from __future__ import annotations

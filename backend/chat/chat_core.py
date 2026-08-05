@@ -626,6 +626,35 @@ def message_body(store: UserStore, message_id: str) -> tuple[dict, int]:
 # POST /v1/chat/message  (user sends a v1 ciphertext envelope)
 # --------------------------------------------------------------------------- #
 
+def _quoted_memory_ids_from_context_refs(payload: dict) -> str:
+    """Comma-joined memory ids from the request's plaintext ``context_refs``.
+
+    Same contract as the hosted send path: the client passes ``context_refs``
+    outside the envelope, only ids of ``type == "memory"`` are persisted, and
+    the enclave expands them into decrypted cards on read. Mirrored here
+    rather than imported — ``chat`` sits below ``hosted`` in the layering and
+    must not import it — so every normalization step must stay in lockstep
+    with hosted/context.py ``_context_refs_from_payload`` + chat_send_core's
+    memory filter: ``contextRefs`` alias, slice to 8 BEFORE filtering,
+    stripped type, id truncated to 160.
+    """
+    refs = payload.get("context_refs") or payload.get("contextRefs") or []
+    if not isinstance(refs, list):
+        return ""
+    ids: list[str] = []
+    for ref in refs[:8]:
+        if not isinstance(ref, dict):
+            continue
+        ref_type = str(ref.get("type") or "").strip()
+        ref_id = str(ref.get("id") or "").strip()
+        if ref_type != "memory" or not ref_id:
+            continue
+        # Truncation can expose trailing whitespace; hosted strips again at
+        # its filter stage, so mirror that too.
+        ids.append(ref_id[:160].strip())
+    return ",".join(ids)
+
+
 def write_message(store: UserStore, payload: dict) -> tuple[dict, int]:
     """User sends a chat message as a v1 ciphertext envelope.
 
@@ -678,6 +707,11 @@ def write_message(store: UserStore, payload: dict) -> tuple[dict, int]:
         cap_env = payload.get("caption_envelope")
         if isinstance(cap_env, dict):
             file_extra.update(chat_service._chat_caption_extra_from_envelope(cap_env))
+    # Garden「talk in chat」memory references ride the same plaintext-routing
+    # layer as client_msg_id; absent refs leave the message record unchanged.
+    quoted_memory_ids = _quoted_memory_ids_from_context_refs(payload)
+    if quoted_memory_ids:
+        file_extra["quoted_memory_ids"] = quoted_memory_ids
     inserted = True
     if client_msg_id is not None:
         msg, inserted = store.append_chat_idempotent(

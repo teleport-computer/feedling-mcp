@@ -476,6 +476,7 @@ def _safe_genesis_metadata(raw: dict | None) -> dict:
         "support_count",
         "warning_count",
         "content_bytes",
+        "distill_model",
     }
     out: dict = {}
     for key in allowed:
@@ -488,6 +489,7 @@ def _safe_genesis_metadata(raw: dict | None) -> dict:
 def _safe_genesis_job(job: dict | None) -> dict:
     raw = job if isinstance(job, dict) else {}
     output = raw.get("output") if isinstance(raw.get("output"), dict) else {}
+    metadata = _safe_genesis_metadata(raw.get("metadata"))
     return {
         "job_id": str(raw.get("job_id") or ""),
         "status": str(raw.get("status") or ""),
@@ -502,7 +504,8 @@ def _safe_genesis_job(job: dict | None) -> dict:
         "created_at": str(raw.get("created_at") or ""),
         "updated_at": str(raw.get("updated_at") or ""),
         "completed_at": str(raw.get("completed_at") or ""),
-        "metadata": _safe_genesis_metadata(raw.get("metadata")),
+        "distill_model": str(metadata.get("distill_model") or "")[:160],
+        "metadata": metadata,
         "stage": str(output.get("stage") or "")[:80],
     }
 

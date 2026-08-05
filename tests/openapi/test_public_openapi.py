@@ -196,8 +196,10 @@ def test_public_operation_and_parameter_inventory(
     # health endpoint (from test); +2 = V1 web execution endpoints
     # (POST /v1/agent/web/{search,fetch}, both with bodies) → 164 ops, 77 bodies;
     # Genesis plaintext estimate + commit add two body-bearing operations.
-    assert len(operations) == 166
-    assert sum("requestBody" in operation for operation in operations.values()) == 79
+    # 167 since POST /v1/voice/finalize (hangup: client transcript in the body
+    # -> one voice_call_summary row replaces the call's per-turn rows), 80 bodies.
+    assert len(operations) == 167
+    assert sum("requestBody" in operation for operation in operations.values()) == 80
 
     query_operations = {
         key for key, operation in operations.items() if _parameters(operation, "query")

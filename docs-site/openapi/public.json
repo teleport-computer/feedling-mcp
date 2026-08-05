@@ -2258,7 +2258,7 @@
           }
         },
         "x-feedling-contract-level": "compatibility",
-        "description": "Queue an asynchronous plaintext import and immediately publish every material as queued with its total window count. Every processing frame preserves the complete material list while item progress advances. Identity may become ready while processing continues; done is published only after every material window completes. Only one plaintext import can process per account; a concurrent submission returns 409 import_job_active with active_job_id. A same-host abandoned worker is detected by its exited process and failed immediately as worker_restarted; remote or legacy owners use a bounded heartbeat lease so a live rolling-deploy worker is not killed. A failed matching client_job_id or input is resumed from its encrypted per-window checkpoint, while a completed match returns the existing job. In update_identity mode, the uploaded role card creates an identity when absent or updates the existing card while preserving its relationship anchor by default."
+        "description": "Queue an asynchronous plaintext import and immediately publish every material as queued with its total window count. Every processing frame preserves the complete material list while item progress advances. Identity may become ready while processing continues; done is published only after every material window completes. A non-empty keep-all memory import that produces zero cards fails as distill_empty_output; its job output may include up to six discarded-map diagnostics, each with a reason and a model-output excerpt capped at 500 characters. Only one plaintext import can process per account; a concurrent submission returns 409 import_job_active with active_job_id. A same-host abandoned worker is detected by its exited process and failed immediately as worker_restarted; remote or legacy owners use a bounded heartbeat lease so a live rolling-deploy worker is not killed. A failed matching client_job_id or input is resumed from its encrypted per-window checkpoint, while a completed match returns the existing job. In update_identity mode, the uploaded role card creates an identity when absent or updates the existing card while preserving its relationship anchor by default."
       }
     },
     "/v1/genesis/imports/plaintext/commit": {
@@ -2394,7 +2394,7 @@
           }
         },
         "x-feedling-contract-level": "compatibility",
-        "description": "Parse and encrypt-stage plaintext onboarding material without calling an LLM. Returns per-material window and conservative token estimates plus an optional fast-model recommendation for Anthropic, DeepSeek, Gemini, OpenAI, OpenRouter, or compatible relay configurations. The staged payload expires and must be committed by staged_id."
+        "description": "Parse and encrypt-stage plaintext onboarding material without calling an LLM. Returns per-material window and conservative token estimates plus an optional fast-model recommendation for Anthropic, DeepSeek, Gemini, OpenAI, OpenRouter, or compatible relay configurations. Compatible-relay recommendations exclude Gemini Flash model IDs while leaving Gemini Pro and non-Gemini Flash names eligible. The staged payload expires and must be committed by staged_id."
       }
     },
     "/v1/genesis/imports/{job_id}": {
@@ -8019,6 +8019,49 @@
         "x-feedling-contract-level": "compatibility"
       }
     },
+    "/v1/voice/finalize": {
+      "post": {
+        "summary": "Finalize Voice Call",
+        "description": "Hangup: replace this call's per-turn chat rows with ONE summary.\n\nThe live call itself is untouched (per-turn voice keeps the normal chat\nlane: same identity, memory and tools). The client sends the call's\nplaintext transcript (chat rows are ciphertext the server cannot read);\nthe summary runs on the user's OWN model, is durably persisted as a single\n``voice_call_summary`` row, and only then are the call's per-turn rows\ndeleted — so the raw back-and-forth stops occupying history/context and\nmemory capture distils from the summary instead.\n\nIdempotent: the summary message id derives from ``call_id``; a retried\nfinalize finds the row and just re-runs the (idempotent) cleanup. On any\nsummary failure the per-turn rows are KEPT (nothing is lost) and the\nclient may retry.",
+        "operationId": "finalize_voice_call_v1_voice_finalize_post",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GenericJsonResponse"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Error response.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "Other"
+        ],
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/FreeFormJsonObject"
+              }
+            }
+          }
+        },
+        "x-feedling-contract-level": "compatibility"
+      }
+    },
     "/v1/voice/sessions": {
       "post": {
         "summary": "Create Voice Session",
@@ -9781,6 +9824,14 @@
               }
             ],
             "description": "Optional separately-encrypted user text sent alongside an image/file (content_type image or file). Same E2E envelope shape as the main `envelope`; the enclave decrypts it into the message's plaintext content so the agent sees the caption. Ignored for content_type=text."
+          },
+          "context_refs": {
+            "type": "array",
+            "maxItems": 8,
+            "description": "Optional plaintext routing metadata: memory references the user explicitly attached to this turn (Garden 「talk in chat」). Same contract as the hosted send: only the first eight entries are considered, only type=memory is honored, and ids only are persisted (as quoted_memory_ids) for the enclave to expand into decrypted memory context. Titles are for client display and are not stored.",
+            "items": {
+              "$ref": "#/components/schemas/ChatContextReference"
+            }
           }
         },
         "additionalProperties": true
