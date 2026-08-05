@@ -23,6 +23,9 @@ CAPTURE_LIVE_SOURCES = frozenset({
     "model_api",
     "live_activity",
     "agent_initiated_proactive",
+    # The single post-call summary written at voice-call hangup (the call's
+    # per-turn rows are deleted then); this row is the call's memory input.
+    "voice_call_summary",
 })
 CAPTURE_TERMINAL_STATUSES = frozenset({"completed", "failed", "skipped"})
 

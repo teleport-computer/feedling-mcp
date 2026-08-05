@@ -198,6 +198,8 @@ if not _provisioned:
         # 留在可收集列表里，否则连它也会被忽略。
         "test_tee_registry_guard_enforced.py",
         "test_self_thinking_parse.py",
+        # Voice hangup summary prompt builder. Pure — no DB.
+        "test_voice_summary.py",
     }
     collect_ignore = sorted(
         f
