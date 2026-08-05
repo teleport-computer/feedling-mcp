@@ -8019,6 +8019,49 @@
         "x-feedling-contract-level": "compatibility"
       }
     },
+    "/v1/voice/finalize": {
+      "post": {
+        "summary": "Finalize Voice Call",
+        "description": "Hangup: replace this call's per-turn chat rows with ONE summary.\n\nThe live call itself is untouched (per-turn voice keeps the normal chat\nlane: same identity, memory and tools). The client sends the call's\nplaintext transcript (chat rows are ciphertext the server cannot read);\nthe summary runs on the user's OWN model, is durably persisted as a single\n``voice_call_summary`` row, and only then are the call's per-turn rows\ndeleted — so the raw back-and-forth stops occupying history/context and\nmemory capture distils from the summary instead.\n\nIdempotent: the summary message id derives from ``call_id``; a retried\nfinalize finds the row and just re-runs the (idempotent) cleanup. On any\nsummary failure the per-turn rows are KEPT (nothing is lost) and the\nclient may retry.",
+        "operationId": "finalize_voice_call_v1_voice_finalize_post",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GenericJsonResponse"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Error response.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "Other"
+        ],
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/FreeFormJsonObject"
+              }
+            }
+          }
+        },
+        "x-feedling-contract-level": "compatibility"
+      }
+    },
     "/v1/voice/sessions": {
       "post": {
         "summary": "Create Voice Session",
