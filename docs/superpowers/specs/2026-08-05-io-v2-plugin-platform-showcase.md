@@ -40,6 +40,33 @@ Core 始终提供账户、模型连接、安全和基础聊天。即使关闭全
 
 新用户会看到 Identity + Memory Garden 的推荐组合；感知和后台思考则分别说明权限，由用户自主决定是否开启。
 
+```mermaid
+flowchart TB
+    U["用户"] --> PC["插件中心<br/>选择、授权、停用"]
+
+    subgraph CORE["始终可用：IO Core"]
+        CHAT["基础聊天"]
+        HOST["Capability Host<br/>状态 · 权限 · 依赖 · 预算"]
+        SAFE["账户 · 模型 · 安全"]
+        SAFE --> CHAT
+        CHAT --> HOST
+    end
+
+    PC --> HOST
+
+    subgraph PLUGINS["用户自主组合：官方插件"]
+        ID["Identity<br/>人格与关系"]
+        MEM["Memory Garden<br/>长期记忆"]
+        PER["iOS Perception<br/>设备情境"]
+        THOUGHT["Inner Thought<br/>后台思考"]
+    end
+
+    HOST <--> ID
+    HOST <--> MEM
+    HOST <--> PER
+    HOST <--> THOUGHT
+```
+
 ## 用户会看到什么
 
 V2 增加一个统一的“插件中心”。
@@ -55,20 +82,41 @@ V2 增加一个统一的“插件中心”。
 
 用户只负责选择能力，不需要搭工作流，也不需要决定插件执行顺序。
 
+```mermaid
+flowchart TB
+    A["用户打开插件详情"] --> B["查看价值、权限和停用后果"]
+    B --> C{"用户选择"}
+
+    C -->|启用| D["检查权限与必需依赖"]
+    D --> E{"检查通过？"}
+    E -->|是| F["初始化插件"]
+    F --> G["原子切换为已启用"]
+    E -->|否| H["保持停用并解释原因"]
+
+    C -->|停用| I["说明受影响的依赖插件"]
+    I --> J["禁止新调用并撤销运行权限"]
+    J --> K["取消待执行任务"]
+    K --> L["冻结数据，不删除"]
+    L --> M["切换为已停用"]
+```
+
 ## 它如何真正做到“关闭”
 
 V2 不会只增加几个 UI 开关。
 
 Core 中会新增统一的 **Capability Host**。所有插件读取数据、贡献上下文、处理事件、运行后台任务或发送消息，都必须经过它检查：
 
-```text
-事件进入
-  → 插件是否启用
-  → 用户是否授权
-  → 当前预算是否允许
-  → 插件执行
-  → 产物再次检查
-  → 写入或发送
+```mermaid
+flowchart TB
+    EVENT["聊天 / iOS 信号 / 定时任务"] --> GATE1{"执行前检查<br/>已启用？已授权？预算允许？"}
+    GATE1 -->|否| DROP1["拒绝或静默忽略<br/>纯聊天不受影响"]
+    GATE1 -->|是| RUN["执行插件<br/>携带当前 state_epoch"]
+    RUN --> GATE2{"提交前再次检查<br/>状态、权限和 epoch 仍有效？"}
+    GATE2 -->|否| DROP2["丢弃迟到产物<br/>不写库、不通知"]
+    GATE2 -->|是| EFFECT{"允许的产物类型"}
+    EFFECT --> CONTEXT["贡献上下文"]
+    EFFECT --> STORE["写入插件数据"]
+    EFFECT --> SEND["发送受控消息"]
 ```
 
 检查会发生两次：执行前一次，提交结果前再一次。
