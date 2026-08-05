@@ -63,6 +63,16 @@ def _is_dream(doc: dict[str, Any]) -> bool:
     )
 
 
+def _matches_retire_sources(doc: dict[str, Any], retire_set: frozenset[str]) -> bool:
+    """source / capture_mode 任一命中即算(与旧 _is_dream 同判据,codex2 P1/P2:
+    只看 _source() 优先值会让 {source: memory_capture, capture_mode: memory_dream}
+    从旧默认行为里静默漏掉)。"""
+    return any(
+        str(doc.get(key) or "").strip() in retire_set
+        for key in ("source", "capture_mode")
+    )
+
+
 def _is_active(doc: dict[str, Any]) -> bool:
     return (
         str(doc.get("status") or "active").strip().lower() == "active"
@@ -215,7 +225,7 @@ def recovery_plan(
     updated: list[dict[str, Any]] = []
     for original in docs:
         doc = dict(original)
-        dream_created_in_window = _source(doc) in retire_set and (
+        dream_created_in_window = _matches_retire_sources(doc, retire_set) and (
             since is None or _at_or_after(doc.get("created_at"), since)
         )
         superseded_in_window = (

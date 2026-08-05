@@ -282,3 +282,16 @@ def test_default_retire_sources_stay_dream_only():
     updated, plan = recovery.recovery_plan(docs, now_iso="2026-08-06T00:00:00Z")
     assert updated[0]["status"] == "active"                   # 默认行为不变
     assert plan["retire_churn_cards"] == 0
+
+
+def test_retire_matches_capture_mode_field_like_old_is_dream():
+    # codex2 P1/P2:{source: memory_capture, capture_mode: memory_dream} 旧 _is_dream
+    # 命中 → 泛化后必须仍命中,默认语义不许回退。
+    docs = [{
+        "id": "mixed-fields", "source": "memory_capture",
+        "capture_mode": "memory_dream", "status": "active",
+        "created_at": "2026-08-05T00:00:00Z",
+    }]
+    updated, plan = recovery.recovery_plan(docs, now_iso="2026-08-06T00:00:00Z")
+    assert updated[0]["status"] == "superseded"
+    assert plan["retire_churn_cards"] == 1

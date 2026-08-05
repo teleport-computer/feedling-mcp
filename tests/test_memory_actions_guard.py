@@ -182,3 +182,28 @@ def test_supersede_prose_about_replacement_without_hex_not_rejected_by_tombstone
                 "content": "旧手机已被新手机取代,数据迁移顺利。",
             },
         })
+
+
+def test_tombstone_gate_survives_guard_kill_switch(monkeypatch):
+    """codex2 P1:FEEDLING_MEMORY_CARD_GUARD=0 只许关协议残片检测,
+    墓碑闸必须无条件 —— 止血关协议闸时不许顺手重开 usr_a40e 事故路。"""
+    monkeypatch.setattr(actions.card_guard, "guard_enabled", lambda: False)
+    tomb = "已被 c42ebb9618ae447df9d52107ea15de85 取代——绿豆汤偏好"
+
+    body, _e, code = actions._memory_supersede_action(None, None, {
+        "type": "memory.supersede", "supersedes": ["x"],
+        "memory": {"type": "fact", "title": tomb, "summary": tomb, "content": tomb},
+    })
+    assert (code, body.get("error")) == (400, "memory_card_tombstone")
+
+    body, _e, code = actions._memory_add_action(None, {
+        "type": "fact",
+        "memory": {"title": tomb, "summary": tomb, "content": tomb},
+    })
+    assert (code, body.get("error")) == (400, "memory_card_tombstone")
+
+    body, _e, code = actions._memory_upgrade_action(None, None, {
+        "memory_id": "m1",
+        "v1": {"summary": tomb, "content": tomb},
+    })
+    assert (code, body.get("error")) == (400, "memory_card_tombstone")
