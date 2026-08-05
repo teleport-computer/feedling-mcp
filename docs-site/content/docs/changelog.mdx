@@ -10,6 +10,13 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **Runtime V2 no longer treats an intentional silent heartbeat as a failed
+  response.** A model response containing a complete self-thinking block and no
+  public text now completes ordinary heartbeat, manual-wake, and screen-watch
+  jobs without publishing a bubble or arming proactive failure backoff.
+  Scheduled reminders still require public text, while malformed or truncated
+  thinking markup remains a fail-closed error.
+
 - **Voice calls now end in a single summary instead of per-turn chat rows.**
   New public endpoint `POST /v1/voice/finalize`: the client posts the call
   transcript at hang-up; the user's own model writes one `voice_call_summary`

@@ -369,6 +369,38 @@ def test_self_thinking_on_suppresses_native_reasoning(monkeypatch):
     assert calls[0].get("include_reasoning") is not True
 
 
+def test_chat_thinking_only_keeps_existing_required_reply_fallback(monkeypatch):
+    monkeypatch.delenv("FEEDLING_V2_SELF_THINKING", raising=False)
+    uid = "u_toolloop_selfthink_only"
+    conftest.seed_user(uid)
+    _reset(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("w-selfthink-only")
+    _stub_envelope_build(monkeypatch)
+    _patch_real_write(monkeypatch)
+    _script_provider(monkeypatch, [_text_round("<think>只想了但没回答</think>")])
+
+    status = asyncio.run(
+        worker.process_job(
+            job,
+            _deps(messages=[{
+                "id": "m1", "ts": 10.0, "role": "user", "content": "在吗"
+            }]),
+            provider_config=_BYOK,
+            api_key=None,
+            runtime_token="rt",
+        )
+    )
+
+    assert status == "completed"
+    bubbles = _bubbles(uid)
+    assert len(bubbles) == 1
+    assert bubbles[0]["body_ct"] == worker._DEGENERATE_REPLY_FALLBACK
+    assert bubbles[0]["turn_failure_error_class"] == "upstream_unavailable"
+    assert bubbles[0]["thinking_body_ct"] == "（思考没写完）"
+    assert _job_status_row(job_id)[0] == "completed"
+
+
 def test_degenerate_terminal_reply_becomes_attributed_fallback(monkeypatch):
     uid = "u_toolloop_degenerate_fallback"
     conftest.seed_user(uid)

@@ -7692,6 +7692,16 @@ async def _run_wake(
                 if _wst_status == _st_wake.COMPLETE:
                     text = _wst_reply
                     _wake_self_thinking_text = _wst_thinking
+                elif _wst_status == _st_wake.SILENT:
+                    # A clean thinking-only response is an intentional weak-wake
+                    # sleep, not malformed protocol. There is no reply effect to
+                    # attach a thinking envelope to, so discard the private summary
+                    # and complete without a bubble. Scheduled reminders are the
+                    # exception: their must-deliver contract still requires text.
+                    text = ""
+                    if final and lane == "scheduled":
+                        raise TurnError("empty_reply")
+                    return
                 elif _wst_status == _st_wake.FAILED:
                     if final:
                         raise TurnError(_MALFORMED_SELF_THINKING_REASON)
@@ -10993,10 +11003,12 @@ async def process_job(
                 if _st_status == self_thinking.COMPLETE:
                     text = _st_reply
                     self_thinking_text = _st_thinking
-                elif _st_status == self_thinking.FAILED:
-                    # Untrustworthy structure → honest fallback bubble + a marker in
-                    # the thinking channel. Non-empty text keeps it off the
-                    # empty_reply failure path so the marker rides the reply effect.
+                elif _st_status in {self_thinking.SILENT, self_thinking.FAILED}:
+                    # Foreground chat must always answer, so both malformed protocol
+                    # and a clean thinking-only response keep the pre-existing FAILED
+                    # behavior: honest fallback bubble + thinking-failed marker.
+                    # Non-empty text keeps it off the empty_reply failure path so the
+                    # marker rides the reply effect.
                     text = _DEGENERATE_REPLY_FALLBACK
                     self_thinking_failed = True
                 # ABSENT: text unchanged
