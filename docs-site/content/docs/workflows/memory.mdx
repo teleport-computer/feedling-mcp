@@ -35,28 +35,33 @@ cards does not change the total or refresh the timestamp.
 
 Hosted Dream maintenance reads complete decrypted candidate cards, stopping
 before the next whole card when the configured prompt budget is reached. Every
-proposed consolidation must explain its rationale, then a fresh independent
-call to the account's configured BYOK model reviews that proposal and its source
-cards. Only an explicit `yes` with a reason can proceed. A `no`, timeout,
-provider failure, or malformed review drops that proposal without blocking the
-remaining proposals. Text overlap is not required: cards may be consolidated
-when they describe the same event or the evolution of one plan, while cards
-that merely share a broad topic remain separate.
+proposed consolidation must explain its rationale. Text overlap is not
+required: cards may be consolidated when they describe the same event or the
+evolution of one plan, while cards that merely share a broad topic remain
+separate. The model's consolidation judgment is not second-guessed by another
+model call: Dream applies only deterministic exit gates. A proposal is rejected
+when its result text contains an internal card id or a tombstone-style note
+(for example "superseded by \<id\>") instead of real memory content — those
+rejections are bounced back to the model once for a rewrite. A run that would
+retire more than 80% of the active garden (and at least 10 cards) fails as a
+whole without applying anything; both thresholds are deployment-configurable.
 
 Dream does not impose a per-run consolidation count, a per-proposal retired-card
-count, or a cross-run cooldown. It still rejects repeated use of one source card
-within a run, and a one-card rewrite must add substantive information. Every
-proposal is bound to the card snapshot captured before the run and all approved
-actions are applied afterward, so a card created by the current run cannot be
-fed back into that same run. Rejected operations leave every original card
-active, and accepted operations supersede rather than hard-delete source cards.
-Automatic scheduling continues to advance only when new non-Dream cards are
-added; new conversation turns alone do not schedule another Dream run.
+count, a cross-run cooldown, or any content-quality judgment on rewrites. It
+still rejects repeated use of one source card within a run and proposals that
+target unknown cards. Every proposal is bound to the card snapshot captured
+before the run and all accepted actions are applied afterward, so a card
+created by the current run cannot be fed back into that same run. Rejected
+operations leave every original card active, and accepted operations supersede
+rather than hard-delete source cards. Automatic scheduling continues to advance
+only when new non-Dream cards are added; new conversation turns alone do not
+schedule another Dream run.
 
 In Runtime V2 chat, the model-facing `memory_organize` tool can force-enqueue a
 Dream run when the user explicitly asks to organize or consolidate their
 memories. It bypasses the automatic scheduler's night window, minimum interval,
-and new-material gates, but not Dream's review and soft-deletion safeguards.
+and new-material gates, but not Dream's deterministic exit gates and
+soft-deletion safeguards.
 Repeated requests coalesce with an active Dream job. If the deployment-wide or
 user-level Dream switch is off, the tool returns an explainable disabled result.
 Resident V1 agents have the equivalent `io_cli.py memory-organize` command,

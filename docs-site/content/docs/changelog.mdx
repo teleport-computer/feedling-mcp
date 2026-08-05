@@ -60,25 +60,29 @@ change must not be interpreted as an API guarantee.
   Perception-triggered wake messages no longer receive unrelated exact battery,
   weather, activity, sleep, or health values in their initial prompt.
 
-- **Hosted Dream maintenance now uses proposal rationale plus independent
-  semantic review.** Runtime V2 fetches complete candidate card bodies instead
-  of reconstructing them from one-line summaries. Every consolidation must
-  include a rationale and receive an isolated second yes/no judgment from the
-  account's BYOK model; a negative, failed, timed-out, or malformed judgment
-  rejects only that proposal. This replaces the temporary text-overlap,
-  five-consolidation, four-retired-card, and seven-day cooldown fences, allowing
-  low-overlap evolution such as a travel plan becoming a booked ticket while
-  keeping merely related events separate. One-card rewrites still require
-  substantive new information, one source card cannot be reused within a run,
-  and all actions remain soft supersedes bound to the pre-run card snapshot.
+- **Hosted Dream maintenance now applies deterministic exit gates instead of
+  content-quality judgment.** Runtime V2 fetches complete candidate card bodies
+  instead of reconstructing them from one-line summaries. Every consolidation
+  must include a rationale, may not reuse a source card within a run, and may
+  not target unknown cards. Consolidation content itself is not second-guessed:
+  the earlier per-proposal semantic-review call and the substantive-increment
+  requirement for one-card rewrites were removed, so low-overlap evolution such
+  as a travel plan becoming a booked ticket merges without an extra model
+  judgment, and a shorter-but-more-accurate rewrite is accepted. In their place
+  Dream rejects (and bounces back for one rewrite) any result whose visible
+  fields contain an internal card id or a tombstone-style note, and a run that
+  would retire more than a configurable share of the active garden (default
+  80% and at least 10 cards) fails as a whole without applying anything. All
+  actions remain soft supersedes bound to the pre-run card snapshot, and
   Dream's durable automatic trigger advances only on new non-Dream cards.
 
 - **Users can explicitly wake a full Memory Dream organization from chat.**
   Runtime V2 exposes `memory_organize` only for an explicit user request and
   force-enqueues a single-flight Dream job without granting direct merge access
   to the chat turn. It bypasses automatic timing and new-material gates but
-  retains rationale review, soft supersedes, and the deployment/user Dream
-  switches; a disabled switch returns a clear disabled state. Resident V1 has
+  retains the rationale requirement, deterministic exit gates, soft
+  supersedes, and the deployment/user Dream switches; a disabled switch returns
+  a clear disabled state. Resident V1 has
   the equivalent `memory-organize` CLI verb over `POST /v1/dream/tick` with
   `force: true`.
 
