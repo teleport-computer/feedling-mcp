@@ -160,7 +160,10 @@ parses and encrypted-stages the upload without making an LLM call, then returns
 per-material `windows` / `est_tokens`, `est_total_tokens`, and an optional
 `recommended_model`. Dedicated Anthropic, DeepSeek, Gemini, OpenAI, and
 OpenRouter configurations receive provider-specific fast-model defaults;
-compatible relays use a bounded model-catalog probe. `POST
+compatible relays use a bounded model-catalog probe. Gemini Flash model IDs are
+excluded from compatible-relay recommendations because they can return empty
+Genesis maps through that protocol; Gemini Pro and non-Gemini models whose IDs
+contain `flash` remain eligible. `POST
 /v1/genesis/imports/plaintext/commit` accepts the
 returned `staged_id` and an optional `distill_model`. The override applies only
 to that Genesis job; the configured chat model is unchanged. Missing, consumed,
@@ -195,6 +198,13 @@ The worker uses the first real model request as a canary with a default
 Malformed JSON response bodies are reported as `model_bad_json`. Other provider
 configuration failures retain their specific error class and remediation
 guidance.
+For a non-empty long-term-memory (`keep_all`) import, producing zero memory
+cards fails the job as `distill_empty_output` instead of publishing `done`.
+Discarded map attempts add at most six diagnostics to the user-owned job
+output. Each diagnostic includes a discard reason and at most 500 characters
+of the model reply, plus its original length and truncation flag. Empty map
+results are not checkpointed as completed keep-all windows, so a retry with a
+different model runs those windows again.
 Later provider timeout failures make at most two attempts. This timeout cap does
 not reduce the existing three-attempt budget for provider `429` and retryable
 `5xx` responses.

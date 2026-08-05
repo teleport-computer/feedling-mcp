@@ -10,6 +10,15 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **Hosted Genesis no longer silently completes a non-empty long-term-memory
+  import with zero cards.** Keep-all imports now fail with
+  `distill_empty_output` and remediation copy directing the user to switch
+  models. The job output retains up to six discarded map diagnostics with a
+  reason and a 500-character model-output excerpt. Compatible-relay model
+  recommendations temporarily exclude Gemini Flash IDs while leaving Gemini
+  Pro and non-Gemini Flash names eligible. Admin data-track Genesis jobs now
+  include the selected `distill_model`.
+
 - **Hosted Genesis retries no longer reuse completed imports that produced no
   durable memories or identity artifact.** Retrying identical staged material
   after such an incomplete historical result now creates a new processing job

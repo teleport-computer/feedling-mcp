@@ -85,6 +85,14 @@ def test_classify_model_empty_output_from_all_fact_maps_failed():
     ) == "model_empty_output"
 
 
+def test_classify_distill_empty_output_and_friendly_copy():
+    error = "plaintext_import_failed:GenesisWorkerError:distill_empty_output:keep_all_nonempty"
+    assert service.classify_genesis_error(error) == "distill_empty_output"
+    copy = service.genesis_failure_required_text(error)
+    assert "换模型" in copy
+    assert "switch models" in copy
+
+
 def test_classify_provider_timeout_from_httpx_exception_type_name():
     # real worker._fetch_provider_key wrap: f"...:{type(e).__name__}"
     assert service.classify_genesis_error(

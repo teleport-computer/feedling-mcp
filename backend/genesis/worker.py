@@ -627,6 +627,7 @@ def _complete_json(
     max_tokens: int,
     idempotency_key: str,
     temperature: float = 0.2,
+    raw_outputs: list[str] | None = None,
 ) -> dict:
     result = llm.complete(
         user_id=user_id,
@@ -639,6 +640,8 @@ def _complete_json(
         idempotency_key=idempotency_key,
         temperature=temperature,
     )
+    if raw_outputs is not None:
+        raw_outputs.append(result.text)
     try:
         return _json_object(result.text, task_id=task_id)
     except GenesisWorkerError as first_error:
@@ -655,6 +658,8 @@ def _complete_json(
             idempotency_key=f"{idempotency_key}:json_repair",
             temperature=0.0,
         )
+        if raw_outputs is not None:
+            raw_outputs.append(repair.text)
         try:
             return _json_object(repair.text, task_id=task_id)
         except GenesisWorkerError as repair_error:
@@ -674,6 +679,8 @@ def _complete_json_retry_empty(
     is_empty,
     temperature: float = 0.2,
     max_attempts: int = 2,
+    empty_reason: str = "empty_parsed_output",
+    on_discarded: Callable[[dict], None] | None = None,
 ) -> dict:
     attempts = max(1, int(max_attempts))
     last: dict = {}
@@ -681,17 +688,20 @@ def _complete_json_retry_empty(
     for attempt in range(attempts):
         suffix = "" if attempt == 0 else f"-empty-retry-{attempt}"
         key_suffix = "" if attempt == 0 else f":empty_retry:{attempt}"
+        attempt_task_id = f"{task_id}{suffix}"
+        raw_outputs: list[str] = []
         try:
             last = _complete_json(
                 llm,
                 user_id=user_id,
                 job_id=job_id,
-                task_id=f"{task_id}{suffix}",
+                task_id=attempt_task_id,
                 runtime=runtime,
                 messages=messages,
                 max_tokens=max_tokens,
                 idempotency_key=f"{idempotency_key}{key_suffix}",
                 temperature=temperature,
+                raw_outputs=raw_outputs,
             )
         except provider_client.ProviderError as e:
             if provider_client.classify_provider_error(e) == "provider_config":
@@ -704,13 +714,58 @@ def _complete_json_retry_empty(
             # the chunk instead.
             raise
         except GenesisWorkerError as e:  # bad/invalid JSON — treat as transient
+            _emit_map_discard_diagnostic(
+                on_discarded,
+                task_id=attempt_task_id,
+                reason=_map_discard_reason(e),
+                raw_output=raw_outputs[-1] if raw_outputs else "",
+            )
             last_exc = e
             continue
         if not is_empty(last):
             return last  # got usable content — success
+        _emit_map_discard_diagnostic(
+            on_discarded,
+            task_id=attempt_task_id,
+            reason=empty_reason,
+            raw_output=raw_outputs[-1] if raw_outputs else "",
+        )
     if last_exc is not None and not last:
         raise last_exc  # every attempt errored, nothing usable — surface the last error
     return last  # got a result at some point (possibly empty) — let caller handle it
+
+
+def _map_discard_reason(exc: BaseException) -> str:
+    lower = str(exc or "").lower()
+    if "invalid_json_after_repair" in lower:
+        return "invalid_json_after_repair"
+    if "json_not_object" in lower:
+        return "json_not_object"
+    if "invalid_json" in lower:
+        return "invalid_json"
+    return type(exc).__name__
+
+
+def _emit_map_discard_diagnostic(
+    callback: Callable[[dict], None] | None,
+    *,
+    task_id: str,
+    reason: str,
+    raw_output: str,
+) -> None:
+    if callback is None:
+        return
+    raw = str(raw_output or "").strip()
+    try:
+        callback({
+            "task_id": str(task_id or "")[:120],
+            "discard_reason": str(reason or "unknown")[:120],
+            "raw_output_snippet": raw[:500],
+            "raw_output_chars": len(raw),
+            "raw_output_truncated": len(raw) > 500,
+        })
+    except Exception:
+        pass
 
 
 def _combined_map_empty(output: dict) -> bool:
@@ -1506,14 +1561,30 @@ def build_foreground_output_from_texts(
 
     fact_candidates: list[dict] = []
     voice_candidates: list[dict] = []
+    map_diagnostics: list[dict] = []
     history_windows_total = 0
     history_windows_failed = 0
     for idx, text in enumerate(chunk_texts):
         is_history = source_family == "history"
         if is_history:
             history_windows_total += 1
+        diagnostic_count_before = len(map_diagnostics)
+
+        def record_discarded(diagnostic: dict, *, chunk_index: int = idx) -> None:
+            if len(map_diagnostics) >= 6:
+                return
+            map_diagnostics.append({"chunk_index": chunk_index, **diagnostic})
+
         try:
             cached = (resume_map_outputs or {}).get(idx)
+            if keep_all and isinstance(cached, dict) and _fact_map_output_empty(cached):
+                _emit_map_discard_diagnostic(
+                    record_discarded,
+                    task_id=f"fact-map-{idx}",
+                    reason="empty_checkpoint_ignored",
+                    raw_output=json.dumps(cached, ensure_ascii=False, separators=(",", ":")),
+                )
+                cached = None
             if isinstance(cached, dict):
                 facts = cached
                 if include_voice_candidates and is_history and genesis_combined_map_enabled():
@@ -1529,6 +1600,8 @@ def build_foreground_output_from_texts(
                     max_tokens=2400,
                     idempotency_key=f"{shared_prefix}:combined_map:{idx}",
                     is_empty=_combined_map_empty,
+                    empty_reason="empty_combined_map",
+                    on_discarded=record_discarded,
                 )
                 voice_candidates.append(_voice_candidate_from_combined_map(facts))
             else:
@@ -1546,16 +1619,36 @@ def build_foreground_output_from_texts(
                     max_tokens=1800,
                     idempotency_key=f"{shared_prefix}:fact_map:{idx}",   # SAME key as background -> cache shared
                     is_empty=_fact_map_output_empty,
+                    empty_reason="empty_fact_candidates",
+                    on_discarded=record_discarded,
                 )
-            if cached is None and on_map_completed is not None:
+            if (
+                cached is None
+                and on_map_completed is not None
+                and not (keep_all and _fact_map_output_empty(facts))
+            ):
                 on_map_completed(idx, facts)
         except provider_client.ProviderError as e:
             if provider_client.classify_provider_error(e) == "provider_config":
                 raise  # hard error (402/401/403/quota/key) -> caller aborts
+            if len(map_diagnostics) == diagnostic_count_before:
+                _emit_map_discard_diagnostic(
+                    record_discarded,
+                    task_id=f"fact-map-{idx}",
+                    reason=provider_client.classify_provider_error(e),
+                    raw_output="",
+                )
             if is_history:
                 history_windows_failed += 1  # transient exhausted -> skip this chunk, keep going
             continue
-        except GenesisWorkerError:
+        except GenesisWorkerError as e:
+            if len(map_diagnostics) == diagnostic_count_before:
+                _emit_map_discard_diagnostic(
+                    record_discarded,
+                    task_id=f"fact-map-{idx}",
+                    reason=_map_discard_reason(e),
+                    raw_output="",
+                )
             if is_history:
                 history_windows_failed += 1
             continue
@@ -1582,6 +1675,7 @@ def build_foreground_output_from_texts(
         "all_fact_candidates": fact_candidates,
         "core_fact_candidates": core,
         "voice_candidates": voice_candidates,
+        "map_diagnostics": map_diagnostics,
         "history_windows_total": history_windows_total,
         "history_windows_failed": history_windows_failed,
     }
