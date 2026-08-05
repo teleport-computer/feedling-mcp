@@ -47,6 +47,17 @@
 
 ## 记录正文（最新的在上面）
 
+## 2026-08-05 — Pre 明文用户 Runtime V2 Chat 启动失败修复
+
+### [DONE] Flight recorder 的二进制明文 wire 补齐
+
+- 根因：开启 `FEEDLING_PLAINTEXT_WRITES_ACCEPTED=1` 后，V2 trajectory 的 zlib
+  二进制载荷误走只接受 UTF-8 的普通明文信封构造器，第一条 `turn_started` 轨迹
+  即抛 `trajectory_encryption_failed:plaintext_body_not_utf8`，模型调用数始终为 0。
+- 修复：明文档 trajectory 用带版本前缀的 Base64 文本承载压缩字节，review 时
+  严格校验并还原；密文档继续使用原 `body_ct` 信封。新增二进制 round-trip 和
+  非法编码拒绝测试。
+
 ## 2026-08-05 — Pre 明文/密文双线身份与记忆兼容修复
 
 ### [DONE] 客户端展示、Runtime V2 上下文与回复写入形状重新对齐

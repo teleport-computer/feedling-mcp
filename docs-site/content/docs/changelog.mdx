@@ -10,6 +10,12 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **Runtime V2 Chat no longer fails during setup for plaintext-tier accounts.**
+  Its internal trajectory recorder now carries compressed binary events in an
+  explicit plaintext base64 wire when encryption is off, while encrypted
+  accounts retain the existing sealed trajectory envelope. This fixes a
+  deployment-only mismatch that prevented the model call from starting.
+
 - **Plaintext and encrypted accounts now render the same identity and memory
   metadata and receive the same Runtime V2 identity context.** Structured
   plaintext `body` values are consumed directly while historical `body_ct`

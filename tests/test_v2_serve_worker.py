@@ -563,6 +563,55 @@ def test_wire_assembly_makes_off_account_v2_writes_plaintext(monkeypatch):
     }
 
 
+def test_plaintext_trajectory_round_trips_compressed_binary(monkeypatch):
+    user_id = "u_v2_plain_trajectory"
+    payload = b"feedling-v2-trajectory-json-zlib-v1\x00\xff\x00compressed"
+    monkeypatch.setattr(
+        serve_worker.core_store,
+        "get_store",
+        lambda _user_id: SimpleNamespace(user_id=user_id),
+    )
+    monkeypatch.setattr(
+        serve_worker.core_envelope,
+        "resolve_content_encryption",
+        lambda _user_id: "off",
+    )
+
+    envelope = serve_worker._seal_trajectory_payload(
+        user_id,
+        payload,
+        "trajectory-plain",
+    )
+
+    assert set(envelope) == {"body", "id", "owner_user_id", "visibility"}
+    assert envelope["body"].startswith(
+        serve_worker._TRAJECTORY_PLAINTEXT_B64_PREFIX
+    )
+    assert jobs_store._validate_trajectory_envelope(user_id, envelope) == envelope
+    assert serve_worker._open_trajectory_payload(user_id, envelope, "") == payload
+
+
+def test_plaintext_trajectory_rejects_unmarked_or_invalid_base64():
+    base = {
+        "id": "trajectory-bad",
+        "owner_user_id": "u_v2_plain_trajectory_bad",
+        "visibility": "shared",
+    }
+    with pytest.raises(RuntimeError, match="trajectory_plaintext_encoding_invalid"):
+        serve_worker._open_trajectory_payload(
+            base["owner_user_id"], {**base, "body": "unmarked"}, ""
+        )
+    with pytest.raises(RuntimeError, match="trajectory_plaintext_encoding_invalid"):
+        serve_worker._open_trajectory_payload(
+            base["owner_user_id"],
+            {
+                **base,
+                "body": serve_worker._TRAJECTORY_PLAINTEXT_B64_PREFIX + "%%%",
+            },
+            "",
+        )
+
+
 def test_health_app_healthz_ok():
     from starlette.testclient import TestClient
 

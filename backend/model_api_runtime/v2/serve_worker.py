@@ -3824,13 +3824,30 @@ def _apply_pending_effects_for_user(user_id: str) -> dict:
     )
 
 
+_TRAJECTORY_PLAINTEXT_B64_PREFIX = "feedling-v2-trajectory-b64-v1:"
+
+
 def _seal_trajectory_payload(
     user_id: str,
     plaintext: bytes,
     item_id: str,
 ) -> dict:
-    """Seal flight-recorder content before any database write."""
+    """Build the per-user trajectory wire shape before any database write.
+
+    Trajectory payloads are compressed binary, unlike the UTF-8 documents
+    accepted by ``_build_shared_envelope_for_store``.  The plaintext tier
+    therefore stores those bytes as explicitly prefixed base64 text; encrypted
+    accounts retain the existing shared envelope unchanged.
+    """
     store = core_store.get_store(str(user_id))
+    if core_envelope.resolve_content_encryption(store.user_id) == "off":
+        return {
+            "body": _TRAJECTORY_PLAINTEXT_B64_PREFIX
+            + base64.b64encode(bytes(plaintext)).decode("ascii"),
+            "id": str(item_id),
+            "owner_user_id": store.user_id,
+            "visibility": "shared",
+        }
     envelope, error = core_envelope._build_shared_envelope_for_store(
         store,
         bytes(plaintext),
@@ -3849,6 +3866,17 @@ def _open_trajectory_payload(
     """Open one event only inside the trusted worker for offline review."""
     if str(envelope.get("owner_user_id") or "") != str(user_id):
         raise RuntimeError("trajectory_owner_mismatch")
+    body = envelope.get("body")
+    if isinstance(body, str):
+        if not body.startswith(_TRAJECTORY_PLAINTEXT_B64_PREFIX):
+            raise RuntimeError("trajectory_plaintext_encoding_invalid")
+        try:
+            return base64.b64decode(
+                body[len(_TRAJECTORY_PLAINTEXT_B64_PREFIX) :],
+                validate=True,
+            )
+        except (ValueError, TypeError) as exc:
+            raise RuntimeError("trajectory_plaintext_encoding_invalid") from exc
     return core_envelope.read_envelope_body(
         envelope,
         None,
