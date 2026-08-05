@@ -9,9 +9,12 @@ regex scrub):
              byte-identical, thinking "" (UI shows no thinking block).
   COMPLETE : exactly one clean leading <tag>…</tag>, matched, non-nested, followed
              by a NON-empty reply → thinking = sanitized block, reply = the rest.
+  SILENT   : exactly one clean leading block with no public reply → sanitized
+             thinking plus an empty reply, so lane policy can distinguish a
+             legitimate weak-wake sleep from malformed protocol.
   FAILED   : anything the parser cannot resolve to a clean (thinking, reply) split
-             — truncation anywhere in the opener/closer, mismatched/nested tags, a
-             clean block with no public reply, a leading close tag. thinking "" and
+             — truncation anywhere in the opener/closer, mismatched/nested tags, or
+             a leading close tag. thinking "" and
              reply "" (the caller shows a "thinking failed" marker + a generic
              failure bubble). A raw <think fragment or private thinking content
              must NEVER surface as the reply.
@@ -25,10 +28,12 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "backend"))
 from core import self_thinking as st  # noqa: E402
 
-ABSENT, COMPLETE, FAILED = st.ABSENT, st.COMPLETE, st.FAILED
+ABSENT, COMPLETE, SILENT, FAILED = st.ABSENT, st.COMPLETE, st.SILENT, st.FAILED
 
 
 # --- ABSENT: no leading protocol → reply untouched ---------------------------
@@ -132,10 +137,24 @@ def test_unclosed_block_is_failed_not_promoted_to_reply():
     assert reply == "" and "secret" not in reply
 
 
-def test_clean_block_but_no_reply_is_failed():
+def test_clean_block_but_no_reply_is_silent_with_sanitized_thinking():
     status, thinking, reply = st.split_thinking("<think>只想了一下</think>")
-    assert status == FAILED
+    assert status == SILENT
+    assert thinking == "只想了一下"
     assert reply == ""
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("普通回复", ABSENT),
+        ("<think>想一下</think>正文", COMPLETE),
+        ("<think>想一下</think>", SILENT),
+        ("<think>没写完", FAILED),
+    ],
+)
+def test_parse_outcome_four_quadrants(text, expected):
+    assert st.split_thinking(text)[0] == expected
 
 
 def test_leading_close_tag_is_failed():

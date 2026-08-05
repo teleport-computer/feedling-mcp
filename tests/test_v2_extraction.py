@@ -6,6 +6,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
 import pytest
 
+from memory.dream_prompt_v1 import build_dream_prompt
 from model_api_runtime.v2 import extraction, worker
 
 
@@ -595,6 +596,19 @@ def test_dream_guard_accepts_low_text_overlap_evolution_after_review():
     )
 
     assert len(actions) == 1 and superseded == 2
+
+
+def test_dream_prompt_pairs_evolution_example_with_independent_health_example():
+    prompt = build_dream_prompt(
+        ai_name="小柒",
+        user_name="阿霖",
+        cards="[]",
+        recent_conversations="[]",
+    )
+
+    assert "想去京都看红叶" in prompt and "已经订了京都机票" in prompt
+    assert "坚持骑行" in prompt and "最近失眠" in prompt
+    assert "两件独立的事，不能合并" in prompt
 
 
 def test_dream_guard_rejects_rationale_free_proposal():
