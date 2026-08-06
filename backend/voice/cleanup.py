@@ -1,14 +1,13 @@
-"""Hangup summary: replace a finished call's per-turn chat rows with ONE summary.
+"""Hangup bookkeeping: the transcript card, and retiring the per-turn rows.
 
-Scope note: the live call is UNCHANGED — voice turns still run through the
-normal chat lane with the user's identity, memory and tools. This module only
-runs at hangup: it summarizes the call with the user's own model, appends one
-``voice_call_summary`` row, deletes that call's per-turn rows (so the raw
-back-and-forth stops occupying chat history and the model's context), and nudges
-memory capture, whose window then sees the summary.
+Formerly ``voice/summary.py``. The model-written 1-3 sentence summary is gone
+(2026-08-07): it cost a second provider call per call AND was the only thing
+memory ever saw, so a whole conversation was distilled from three sentences.
+The chat stream now carries a mechanical preview card whose body lives in
+``voice_transcripts``; Capture reads the archive, not the card.
 
-The transcript comes from the client: chat rows are ciphertext the server cannot
-read, while the app already holds the call's plaintext captions.
+What survives from the summary era is the part that was never about summaries:
+deleting the call's per-turn rows without breaking compaction coverage.
 """
 
 from __future__ import annotations
@@ -16,95 +15,41 @@ from __future__ import annotations
 import uuid
 
 import db
-import provider_client
 from core import envelope as core_envelope
-from hosted import config_store as hosted_config_store
-from proactive import proactive_core
-from voice import results
 
 
 # Deterministic namespace: a retried finalize derives the SAME summary message
 # id, so a replay collapses onto one row instead of writing a second summary.
-_SUMMARY_NS = uuid.UUID("6f9b2c41-7d3a-4e59-9c21-8a1e0d5f4b77")
-
-_SUMMARY_SYSTEM = (
-    "You are the user's AI companion. You just finished a voice call with them. "
-    "Write ONE short summary of the call for the chat history — what was "
-    "discussed, any decisions or todos, and the emotional tone. Write in the "
-    "user's own language, in the second person ('you'), 1-3 sentences. Do not "
-    "add greetings or ask questions; output only the summary."
-)
+_TRANSCRIPT_NS = uuid.UUID("6f9b2c41-7d3a-4e59-9c21-8a1e0d5f4b77")
 
 
-def summary_message_id(call_id: str) -> str:
-    return str(uuid.uuid5(_SUMMARY_NS, f"voice_call_summary:{call_id}"))
+def transcript_card_message_id(call_id: str) -> str:
+    """Deterministic id for a call's chat card — makes finalize replay-safe.
 
-
-def build_summary_messages(turns: list[dict]) -> list[dict]:
-    """Render the client-supplied transcript into provider chat messages.
-
-    ``turns`` is ``[{"role": "user"|"assistant", "text": str}, ...]`` in order.
+    Namespace deliberately unchanged from the summary era: a call can only ever
+    have had one or the other, and reusing it means a client that retries an
+    old finalize lands on the same row instead of creating a duplicate card.
     """
-    lines: list[str] = []
-    for turn in turns:
-        if not isinstance(turn, dict):
-            continue
-        text = str(turn.get("text") or "").strip()
-        if not text:
-            continue
-        role = str(turn.get("role") or "").strip().lower()
-        speaker = "User" if role == "user" else "Assistant"
-        lines.append(f"{speaker}: {text}")
-    return [
-        {"role": "system", "content": _SUMMARY_SYSTEM},
-        {
-            "role": "user",
-            "content": "Summarize this voice call:\n\n" + "\n".join(lines),
-        },
-    ]
+    return str(uuid.uuid5(_TRANSCRIPT_NS, f"voice_call_summary:{call_id}"))
 
 
-def generate_summary(store, turns: list[dict]) -> str:
-    """Summarize the call with the USER'S OWN model (BYOK, enclave-decrypted).
+def persist_transcript_card(store, preview: str, message_id: str, call_id: str,
+                            *, turn_count: int = 0, duration_sec: int = 0) -> bool:
+    """Durably append exactly one ``voice_call_transcript`` chat row.
 
-    Mirrors how every other server-side one-shot resolves a provider; raises on
-    an unusable provider config so the caller can leave the call unsummarized
-    (and the per-turn rows intact) rather than losing the call.
-    """
-    token = results.mint_enclave_token(store.user_id)
-    runtime = hosted_config_store._load_runtime_provider_config(
-        store, None, runtime_token=token
-    )
-    if isinstance(runtime, tuple):
-        raise RuntimeError(
-            f"voice_summary_provider_unavailable:{runtime[1].get('error')}"
-        )
-    result = provider_client.reliable_chat_completion(
-        runtime,
-        build_summary_messages(turns),
-        max_tokens=400,
-        temperature=None,
-        timeout=45.0,
-        include_reasoning=False,
-        max_attempts=2,
-        base_delay_sec=0.5,
-    )
-    text = str((result or {}).get("reply") or "").strip()
-    if not text:
-        raise RuntimeError("voice_summary_empty")
-    return text
-
-
-def persist_summary(store, text: str, message_id: str, call_id: str) -> bool:
-    """Durably append exactly one ``voice_call_summary`` chat row.
+    ``preview`` is bounded (see ``transcript_store.PREVIEW_MAX_CHARS``) and is
+    ALL the chat stream ever carries for this call: the prompt tail is budgeted
+    in tokens, and an oversized single row makes compaction raise
+    ``compaction_message_exceeds_char_budget``, which would take the user's
+    ordinary text chat down with it. The full text belongs in the archive.
 
     Returns True only when the row is durably present. Idempotent via the
-    deterministic ``message_id``; ``strict=True`` uses the durable append that
-    raises on a DB failure instead of silently dropping the summary. The caller
-    must not delete the per-turn rows unless this returns True.
+    deterministic ``message_id``; ``strict=True`` raises on a DB failure rather
+    than silently dropping the card. The caller must not delete the per-turn
+    rows unless this returns True.
     """
-    text = str(text or "").strip()
-    if not text:
+    preview = str(preview or "").strip()
+    if not preview:
         return False
     try:
         if db.chat_get_strict(store.user_id, str(message_id)) is not None:
@@ -112,17 +57,21 @@ def persist_summary(store, text: str, message_id: str, call_id: str) -> bool:
     except Exception:  # noqa: BLE001 — unknown, fall through to the write
         pass
     env, _err = core_envelope._build_shared_envelope_for_store(
-        store, text.encode("utf-8"), item_id=str(message_id)
+        store, preview.encode("utf-8"), item_id=str(message_id)
     )
     if env is None:
         return False
     try:
         store.append_chat(
             "openclaw",
-            "voice_call_summary",
+            "voice_call_transcript",
             env,
             content_type="text",
-            extra={"voice_call_id": str(call_id)},
+            extra={
+                "voice_call_id": str(call_id),
+                "voice_turn_count": max(0, int(turn_count or 0)),
+                "voice_duration_sec": max(0, int(duration_sec or 0)),
+            },
             strict=True,
         )
     except Exception:  # noqa: BLE001 — failed, or raced a concurrent replay
@@ -204,7 +153,7 @@ def delete_call_messages(user_id: str, call_id: str) -> dict:
     ``remaining`` > 0 means deletable rows survived (DB blips swallowed by
     ``chat_delete``) and the finalize must NOT report success.
     """
-    smid = summary_message_id(call_id)
+    smid = transcript_card_message_id(call_id)
     covered = _compaction_covered_seq(user_id)
     # Snapshot the full row set FIRST: once the tagged user rows are deleted,
     # their replies can no longer be found through the parent predicate, so the
@@ -241,13 +190,3 @@ def delete_call_messages(user_id: str, call_id: str) -> dict:
         "retained_covered": retained_covered,
         "remaining": remaining,
     }
-
-
-def nudge_capture(store) -> None:
-    """Process the capture window now that it holds the summary. Runtime-aware
-    (V2 job pool vs resident legacy queue); best-effort — the normal quiet /
-    boundary sweep is the correctness backstop."""
-    try:
-        proactive_core.capture_force(store)
-    except Exception:  # noqa: BLE001 — nudge only
-        pass

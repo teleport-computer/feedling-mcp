@@ -106,6 +106,16 @@ PARAMS: dict[str, dict] = {
     },
     # memory.fetch(store, ...) -> memory_core.fetch: payload.get("ids") must be a
     # list of non-empty strings.
+    "voice_transcript_list": {
+        "type": "object",
+        "properties": {"limit": _INT},
+        "required": [],
+    },
+    "voice_transcript_read": {
+        "type": "object",
+        "properties": {"call_id": _STR, "offset": _INT},
+        "required": ["call_id"],
+    },
     "memory_fetch": {
         "type": "object",
         "properties": {
@@ -340,6 +350,17 @@ DESCRIPTIONS: dict[str, str] = {
                       "all-memory overview, and do not repeat it after one discovery "
                       "result. For a user-requested bulk rewrite or cleanup, call "
                       "memory_organize."),
+    "voice_transcript_list": (
+        "List this user's archived voice calls, newest first: call_id, when it "
+        "happened, how long it ran, how many turns. Metadata only — no words "
+        "are returned. Use it to find WHICH call to open."),
+    "voice_transcript_read": (
+        "Read what was actually said in one archived voice call, by call_id. "
+        "Memory cards distilled from a call carry that call's voice_call_id, so "
+        "this is how you check the original wording behind a memory instead of "
+        "trusting the card's summary of it. Paged: pass the returned "
+        "next_offset to continue. You do NOT need this for the call that just "
+        "ended — its memory was already written from the full transcript."),
     "memory_fetch": ("Fetch the most relevant ids chosen from the current index/search "
                      "step, usually 1–3 cards (guidance, not a hard cap). Related cards "
                      "may expand the returned set up to limit; use include_archived or "

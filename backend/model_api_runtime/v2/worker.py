@@ -539,8 +539,25 @@ if "FEEDLING_V2_TAIL_BUDGET_MSGS" in os.environ:
     )
 _CAPTURE_BATCH_LIMIT = 60
 _CAPTURE_PROMPT_RAW_ROLES = frozenset({"user", "openclaw"})
+# MUST stay a superset-compatible mirror of
+# capture_scheduler.CAPTURE_LIVE_SOURCES (locked by
+# tests/test_capture_source_whitelists_agree.py). A source that TRIGGERS capture
+# but is missing here is silently dropped from the prompt: capture then runs on
+# an empty window, writes nothing, and still advances the cursor past those
+# rows. That is exactly what happened to voice_call_summary on V2 between
+# 2026-08-05 and 2026-08-07 — every V2 user's voice memory was lost in silence.
 _CAPTURE_PROMPT_SOURCES = frozenset(
-    {"chat", "model_api", "live_activity", "agent_initiated_proactive"}
+    {"chat", "model_api", "live_activity", "agent_initiated_proactive",
+     "voice_call_transcript"}
+)
+_VOICE_TRANSCRIPT_SOURCE = "voice_call_transcript"
+# 单通电话渲染进 capture 窗口的字符预算。**必须大于通话时长上限能产出的字数**，
+# 否则采样会永久丢中段 —— 那等于宣称「从每句话 capture」却做不到。现行上限
+# 3600 秒（iOS ElevenLabsAgentClient），一小时中文口语约 9000 字，30000 留三倍
+# 余量。tests/test_voice_transcript_budget.py 锁死这个关系。采样只是"预算真被
+# 突破时不要静默失败"的兜底，正常路径不可达；走到那里会打 warning，不静默。
+_VOICE_TRANSCRIPT_PROMPT_CHARS = _positive_int_env(
+    "FEEDLING_V2_VOICE_TRANSCRIPT_PROMPT_CHARS", "30000"
 )
 _COMPACTION_BATCH = _positive_int_env("FEEDLING_V2_COMPACTION_BATCH_MSGS", "200")
 # A message-count cap alone is not a prompt-size bound: 200 maximum-size chat
@@ -1190,6 +1207,9 @@ class TurnDeps:
     # Dream-specific reader may fetch full selected card bodies.  When absent,
     # tests/legacy assembly fall back to read_memory_context.
     read_dream_memory_context: Callable[[str], dict] | None = None
+    # (user_id, call_id) -> 归档的通话全文明文。缺省 None = 不展开通话卡
+    # （老部署/测试注入）。生产实现在 serve_worker,走 enclave 解密。
+    read_voice_transcript: Callable[[str, str], str] | None = None
     # user_id -> (all rendered Garden cards, exact card count). Unlike
     # read_memory_context this is fail-loud and rejects any truncated read.
     read_profile_cards: Callable[[str], tuple[str, int]] | None = None
@@ -4728,6 +4748,43 @@ async def _persist_batch_cap(user_id: str, value: int) -> None:
         await asyncio.to_thread(db.v2_set_effective_batch_cap, user_id, int(value))
     except Exception as exc:  # noqa: BLE001
         log.debug("[v2.worker] batch cap persist failed for %s: %s", user_id, exc)
+
+
+def _bounded_voice_transcript(text: str, *, budget: int) -> str:
+    """把一通电话的全文压进预算：超了就头尾采样并说明中间省了多少。"""
+    text = str(text or "").strip()
+    if len(text) <= budget:
+        return text
+    head_budget = int(budget * 0.6)
+    tail_budget = max(0, budget - head_budget)
+    head = text[:head_budget].rstrip()
+    tail = text[-tail_budget:].lstrip() if tail_budget else ""
+    omitted = len(text) - len(head) - len(tail)
+    log.warning(
+        "[v2.worker] voice transcript exceeded capture budget: %d chars, %d omitted "
+        "(raise FEEDLING_V2_VOICE_TRANSCRIPT_PROMPT_CHARS)", len(text), omitted)
+    return f"{head}\n…（中间约 {omitted} 字省略，完整记录见通话详情）…\n{tail}"
+
+
+def _render_capture_line(message: dict, voice_transcripts: dict,
+                         *, user_name: str, ai_name: str) -> str:
+    """一条 capture 窗口行。通话卡展开成全文，其余按原样渲染。"""
+    call_id = str(message.get("voice_call_id") or "").strip()
+    if (
+        call_id
+        and str(message.get("source") or "") == _VOICE_TRANSCRIPT_SOURCE
+        and call_id in voice_transcripts
+    ):
+        body = _bounded_voice_transcript(
+            voice_transcripts[call_id], budget=_VOICE_TRANSCRIPT_PROMPT_CHARS
+        )
+        turns = message.get("voice_turn_count")
+        header = "【语音通话逐字记录" + (f"，共 {turns} 轮" if turns else "") + "】"
+        return f"{header}\n{body}"
+    label = transcript_speaker_label(
+        str(message.get("role") or ""), user_name=user_name, ai_name=ai_name
+    )
+    return f"- {label}: {context.text_of(message.get('content'))}"
 
 
 def _bounded_compaction_prefix(
@@ -8836,6 +8893,8 @@ async def _run_extraction(
     """
     extraction_status_recorded = False
     capture_window: dict[str, Any] = {}
+    # call_id -> 该通电话的全文明文。只在 capture lane 填充（见 enclave_sem 闸内）。
+    voice_transcripts: dict[str, str] = {}
 
     async def _ensure_capture_not_halted(stage: str) -> None:
         """Bypass the polling cache at disclosure and durable-write boundaries."""
@@ -9018,6 +9077,31 @@ async def _run_extraction(
                 )
             else:
                 tail = []
+            # 通话转写:聊天流里只有一张有界预览卡，全文在 voice_transcripts。
+            # 在闸内一并取回，渲染窗口时替换掉预览——这样 Capture 蒸的是整通
+            # 电话，而 prompt 尾巴仍然只背那张小卡。
+            if lane == "capture" and deps.read_voice_transcript is not None:
+                for message in tail:
+                    call_id = str(message.get("voice_call_id") or "").strip()
+                    if not call_id or str(message.get("source") or "") != _VOICE_TRANSCRIPT_SOURCE:
+                        continue
+                    if call_id in voice_transcripts:
+                        continue
+                    try:
+                        voice_transcripts[call_id] = await asyncio.to_thread(
+                            deps.read_voice_transcript, user_id, call_id
+                        )
+                    except Exception as e:  # noqa: BLE001
+                        # 绝不降级用预览：那会把整通电话蒸成开头几句，并且照常
+                        # 推进游标——记忆永久丢失且无人知晓。宁可整个 job 失败
+                        # 重试（游标不动，下次重来）。
+                        log.warning(
+                            "[v2.worker] voice transcript unavailable user=%s call=%s: %s",
+                            user_id[:12], call_id[:24], str(e)[:160],
+                        )
+                        raise RuntimeError(
+                            f"capture_voice_transcript_unavailable:{call_id}"
+                        ) from e
         if lane == "capture" and deps.read_capture_state is not None and tail:
             last = tail[-1]
             last_id = str(last.get("id") or "")
@@ -9080,14 +9164,27 @@ async def _run_extraction(
         speaker_user_name = ctx.get("user_name", "")
         speaker_ai_name = ctx.get("ai_name", "")
         window = "\n".join(
-            f"- {transcript_speaker_label(str(m.get('role') or ''), user_name=speaker_user_name, ai_name=speaker_ai_name)}: "
-            f"{context.text_of(m.get('content'))}"
+            _render_capture_line(
+                m, voice_transcripts,
+                user_name=speaker_user_name, ai_name=speaker_ai_name,
+            )
             for m in prompt_tail
         ).strip()
         source_ids = [str(m.get("id")) for m in prompt_tail if m.get("id")]
 
         if lane == "capture":
-            parse, to_actions = parse_capture_cards, v2_extraction.cards_to_actions
+            # 溯源只在**能证明**归属时打:窗口里恰好一通电话,且没有别的可捕捉
+            # 内容。挂断即触发 capture,所以这是常态。混合窗口(通话 + 文字聊天)
+            # 一律不打 —— 那时无法判断某张卡到底来自哪一边,盖章就是假精度。
+            _sole_call_id = ""
+            if len(voice_transcripts) == 1 and len(prompt_tail) == 1:
+                _sole_call_id = next(iter(voice_transcripts))
+            parse = parse_capture_cards
+
+            def to_actions(*args, _call_id=_sole_call_id, **kwargs):
+                return v2_extraction.cards_to_actions(
+                    *args, voice_call_id=_call_id, **kwargs
+                )
             # 内容闸打回后的第二问：放宽成「只丢占位符那几张、干净的照收」，
             # 不让一张脏卡把整个窗口的落卡清零。
             parse_retry = v2_extraction.ParseRetry(

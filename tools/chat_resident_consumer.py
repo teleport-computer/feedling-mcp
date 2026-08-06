@@ -430,7 +430,23 @@ CAPTURE_HISTORY_LIMIT = int(os.environ.get("FEEDLING_CAPTURE_HISTORY_LIMIT", "16
 # One shared budget across format and semantic correction. A format bounce
 # consumes it, so semantic validation can never multiply a job into four calls.
 CAPTURE_AGENT_REASK_BUDGET = 1
-CAPTURE_WINDOW_MAX_CHARS = int(os.environ.get("FEEDLING_CAPTURE_WINDOW_MAX_CHARS", "12000"))
+# 12000 → 40000（2026-08-07）：这道截断是 text[-N:]，从尾部保留。通话转写进窗口后，
+# 12000 装不下一通电话 + 同窗口的文字聊天，会把前面的文字**静默**砍掉。
+# 40000 = 转写预算 30000 + 文字聊天 10000。
+CAPTURE_WINDOW_MAX_CHARS = int(os.environ.get("FEEDLING_CAPTURE_WINDOW_MAX_CHARS", "40000"))
+
+
+
+
+# 单通电话展开进窗口的预算。**必须大于通话时长上限能产出的字数**，否则采样会
+# 永久丢掉中段 —— 那等于宣称「从每句话 capture」却做不到。现行上限 3600 秒
+# （iOS ElevenLabsAgentClient.configVersion 12），一小时中文口语约 9000 字，
+# 30000 留三倍余量。tests/test_voice_transcript_budget.py 锁死这个关系：谁调大
+# 通话时长而不调这里，测试会红。采样只是"预算真被突破时不要静默失败"的兜底。
+CAPTURE_VOICE_TRANSCRIPT_MAX_CHARS = int(
+    os.environ.get("FEEDLING_CAPTURE_VOICE_TRANSCRIPT_MAX_CHARS", "30000")
+)
+VOICE_TRANSCRIPT_SOURCE = "voice_call_transcript"
 CAPTURE_CONTEXT_MAX_CHARS = int(os.environ.get("FEEDLING_CAPTURE_CONTEXT_MAX_CHARS", "4000"))
 DREAM_MEMORY_INDEX_LIMIT = int(os.environ.get("FEEDLING_DREAM_MEMORY_INDEX_LIMIT", "0"))
 DREAM_FETCH_BATCH_SIZE = int(os.environ.get("FEEDLING_DREAM_FETCH_BATCH_SIZE", "100"))
@@ -11692,10 +11708,49 @@ def _capture_window_messages(job: dict) -> list[dict]:
     return selected
 
 
+def _capture_voice_transcript_text(call_id: str) -> str:
+    """归档的通话全文明文。复用既有取数 + enclave 解密两条路，无新信任面。
+
+    抛异常即"拿不到"。调用方**绝不可以**退回那张有界预览卡：那会把整通电话
+    蒸成开头几句，而 capture 照常推进游标 —— 记忆永久丢失且无人知晓。
+    """
+    body = _capture_get_json(f"/v1/voice/transcripts/{urllib.parse.quote(str(call_id))}")
+    envelope = body.get("transcript") if isinstance(body, dict) else None
+    if not isinstance(envelope, dict):
+        raise RuntimeError(f"voice_transcript_unavailable:{call_id}")
+    return _decrypt_envelope(envelope).decode("utf-8")
+
+
+def _bounded_voice_transcript(text: str) -> str:
+    """把一通电话压进自己的预算：超了头尾采样并说明中间省了多少。"""
+    text = str(text or "").strip()
+    budget = CAPTURE_VOICE_TRANSCRIPT_MAX_CHARS
+    if len(text) <= budget:
+        return text
+    head_budget = int(budget * 0.6)
+    tail_budget = max(0, budget - head_budget)
+    head = text[:head_budget].rstrip()
+    tail = text[-tail_budget:].lstrip() if tail_budget else ""
+    omitted = len(text) - len(head) - len(tail)
+    log.warning(
+        "voice transcript exceeded capture budget: %d chars, %d omitted "
+        "(raise FEEDLING_CAPTURE_VOICE_TRANSCRIPT_MAX_CHARS)", len(text), omitted)
+    return f"{head}\n…（中间约 {omitted} 字省略，完整记录见通话详情）…\n{tail}"
+
+
 def _capture_window_text(messages: list[dict], *, user_label: str = "TA", agent_label: str = "我") -> str:
     lines: list[str] = []
     for msg in messages:
         ts = _message_ts_for_context(msg)
+        call_id = str(msg.get("voice_call_id") or "").strip()
+        if call_id and str(msg.get("source") or "") == VOICE_TRANSCRIPT_SOURCE:
+            # 聊天流里只有有界预览卡，全文在归档表里。展开它，Capture 才是在
+            # 蒸整通电话而不是开头几句。取不到就让整个 job 失败重试（游标不动）。
+            body = _bounded_voice_transcript(_capture_voice_transcript_text(call_id))
+            turns = msg.get("voice_turn_count")
+            header = "【语音通话逐字记录" + (f"，共 {turns} 轮" if turns else "") + "】"
+            lines.append(f"- [{_format_message_time(ts)}] {header}\n{body}")
+            continue
         lines.append(
             f"- [{_format_message_time(ts)}] "
             f"{_capture_message_role(msg, user_label=user_label, agent_label=agent_label)}: "
@@ -11781,7 +11836,7 @@ def _memory_agent_parse_with_bounce(
     return retried, "bounced_ok"
 
 
-def _capture_build_envelope(card: dict, *, occurred_at: str, source: str = "memory_capture", item_id: str = "") -> dict:
+def _capture_build_envelope(card: dict, *, occurred_at: str, source: str = "memory_capture", item_id: str = "", voice_call_id: str = "") -> dict:
     if not _ENCRYPTION_AVAILABLE:
         raise RuntimeError("capture_encryption_unavailable")
     if not _refresh_whoami_for_encrypted_reply():
@@ -11800,6 +11855,9 @@ def _capture_build_envelope(card: dict, *, occurred_at: str, source: str = "memo
         "bucket": str(card.get("bucket") or "").strip(),
         "threads": list(card.get("threads") or []),
     }
+    # 通话溯源(与 V2 extraction._inner_from_card 同形)。放加密正文,服务端看不见。
+    if voice_call_id:
+        inner["voice_call_id"] = str(voice_call_id)[:96]
     envelope = _build_envelope(
         plaintext=json.dumps(inner, ensure_ascii=False, separators=(",", ":")).encode("utf-8"),
         owner_user_id=user_id,
@@ -11826,6 +11884,18 @@ def _capture_build_envelope(card: dict, *, occurred_at: str, source: str = "memo
 def _capture_actions_from_cards(cards: list[dict], *, job: dict, messages: list[dict]) -> tuple[list[dict], int, int]:
     occurred_at = _capture_occurred_at(job, messages)
     source_ids = [_capture_message_id(msg) for msg in messages if _capture_message_id(msg)]
+    # 溯源只在**能证明**归属时打:窗口里恰好一通电话,且没有别的内容。挂断即
+    # 触发 capture,所以这是常态。混合窗口一律不打 —— 无法判断某张卡来自哪边,
+    # 盖章就是假精度(与 V2 worker 同规则)。
+    _call_ids = {
+        str(m.get("voice_call_id") or "").strip()
+        for m in messages
+        if str(m.get("source") or "") == VOICE_TRANSCRIPT_SOURCE
+        and str(m.get("voice_call_id") or "").strip()
+    }
+    voice_call_id = (
+        next(iter(_call_ids)) if len(_call_ids) == 1 and len(messages) == 1 else ""
+    )
     actions: list[dict] = []
     cards_added = 0
     cards_superseded = 0
@@ -11837,7 +11907,8 @@ def _capture_actions_from_cards(cards: list[dict], *, job: dict, messages: list[
         # source of repeated duplicate cards.
         if action in {"merge", "supersede"} and not target_id:
             continue
-        envelope = _capture_build_envelope(card, occurred_at=occurred_at)
+        envelope = _capture_build_envelope(
+            card, occurred_at=occurred_at, voice_call_id=voice_call_id)
         base = {
             "envelope": envelope,
             "reason": "Memory captured from a completed chat window.",
@@ -11934,9 +12005,33 @@ def _process_capture_jobs(jobs: list) -> float:
             # literal "user:"). Fetched only when there IS a window — an empty
             # window keeps the fast-fail path without burning identity calls.
             identity, ai_name, user_name, identity_text = _capture_identity_context()
-            window_text = _capture_window_text(
-                messages, user_label=user_name, agent_label=ai_name
-            )
+            try:
+                window_text = _capture_window_text(
+                    messages, user_label=user_name, agent_label=ai_name
+                )
+            except Exception as exc:  # noqa: BLE001
+                # 取归档全文失败(backend/enclave 抖动)。这条 job 已经 claim 并标
+                # realizing,异常直接冒出去会把它留在 realizing、还会打断整批 job。
+                # 显式标 failed:游标不动,下一轮重新 claim 重跑 —— 这才是注释里
+                # 承诺的"整个 job 失败重试",也才真的没有"退回预览"这条路。
+                log.warning("capture window build failed id=%s: %s", job_id, exc)
+                update_proactive_job_status(
+                    job_id,
+                    "failed",
+                    "capture_window_build_failed",
+                    extra={
+                        "capture_result": {
+                            "status": "failed",
+                            "reason": "capture_window_build_failed",
+                            "detail": str(exc)[:200],
+                        },
+                        "capture_window": window,
+                        "cards_added": 0,
+                        "cards_superseded": 0,
+                        "noop_reason": "capture_window_build_failed",
+                    },
+                )
+                continue
         if not window_text:
             update_proactive_job_status(
                 job_id,
