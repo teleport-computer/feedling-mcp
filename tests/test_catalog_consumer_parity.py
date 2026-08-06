@@ -81,8 +81,9 @@ def _consumer_blame_map() -> dict[str, str]:
     error_class -> blame 全集（同源纪律：不重新发明，只是把已知代码路径的
     结果收集成 dict）。"""
     out = {klass: blame for klass, blame, _text, _pat in crc._ERROR_CLASS_RULES}
-    # classify_agent_error 里硬编码（非规则表）的三类：
+    # classify_agent_error 里硬编码（非规则表）的几类：
     out.setdefault("turn_timeout", "system")
+    out.setdefault("provider_empty_reply", "provider_transient")
     out.setdefault("reply_parse_failed", "system")
     out.setdefault("model_not_found", "user_provider")  # 裸 404+model 分支，和规则表一致
     out.setdefault("unknown", "system")
