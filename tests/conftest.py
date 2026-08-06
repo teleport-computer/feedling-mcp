@@ -390,6 +390,9 @@ def _reset_admin_page_cache():
         mod._page_cache.clear()
         mod._page_cache_builds.clear()
         mod._page_cache_last_failure.clear()
+    # verdicts JSON 的 30s 缓存同理：不清会把上一个测试的判定喂给下一个。
+    with mod._verdicts_cache_lock:
+        mod._verdicts_cache = None
 
 
 @pytest.fixture(autouse=True)

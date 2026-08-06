@@ -3338,14 +3338,28 @@ def admin_home_queue(*, tz: str = "Asia/Shanghai") -> dict:
             """,
             (window_e, stale_e),
         ).fetchall()
+        # 只列近 14 天有过任何活动的账号：user_blobs 没有更新时间列，历史
+        # 遗留的坏配置会把队列灌满（prod 首日 20 条截断的教训）——弃用账号
+        # 的配置问题不是"需要你"的工单。两条活动臂各有索引可走
+        # （ix_chat_messages_ts / 0078 的 app_session_end 部分索引）。
+        active_e = now - 14 * 86400.0
         pending = conn.execute(
             """
-            SELECT user_id,
-                   lower(COALESCE(NULLIF(doc->>'test_status',''),'(none)')) AS st
-            FROM user_blobs
-            WHERE kind = 'model_api'
-              AND lower(COALESCE(NULLIF(doc->>'test_status',''),'(none)')) <> 'ok'
+            SELECT b.user_id,
+                   lower(COALESCE(NULLIF(b.doc->>'test_status',''),'(none)')) AS st
+            FROM user_blobs b
+            WHERE b.kind = 'model_api'
+              AND lower(COALESCE(NULLIF(b.doc->>'test_status',''),'(none)')) <> 'ok'
+              AND b.user_id IN (
+                  SELECT user_id FROM chat_messages WHERE ts >= %s
+                  UNION
+                  SELECT user_id FROM user_logs
+                  WHERE stream = 'tracking_events'
+                    AND doc->>'type' = 'app_session_end'
+                    AND ts >= %s
+              )
             """,
+            (active_e, active_e),
         ).fetchall()
     for uid, last_ts in stalled:
         waited_h = (now - float(last_ts)) / 3600.0

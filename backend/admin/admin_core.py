@@ -683,14 +683,22 @@ def page_html(query_string: str) -> str:
         return page
 
 
+# verdicts JSON 的 30s TTL 缓存。最初设计"逐请求重建"，prod 实测（2026-08-06）
+# 每次 5-8s——agent 轮询会持续压库。不复用 page_html 的 HTML 缓存（那层的陈旧
+# 声明是往 <main> 插 cache-note），JSON 用自己的显式通道：payload 带
+# ``cached`` + ``cache_age_sec``，机器消费方永远知道判定的年龄。
+_VERDICTS_CACHE_TTL_SEC = 30.0
+_verdicts_cache_lock = threading.Lock()      # 只护缓存元组的读写
+_verdicts_build_lock = threading.Lock()      # single-flight：同刻只重建一次
+_verdicts_cache: tuple[float, dict] | None = None
+
+
 def verdicts_payload(query_string: str) -> dict:
     """GET /v1/admin/data-track/verdicts 的机读体检 payload。
 
-    有意 **不** 走 page_html 的 60s 页缓存：那层只服务 HTML（cache-note 是
-    往 ``<main>`` 里插 HTML 声明数据年龄的），JSON 没有对应的「这是旧数据」
-    通道——把缓存过的判定不加声明地喂给机器消费方，比喂给人更危险。底层
-    查询全部有界、又都在共享 4-worker 执行器上限流，事故期间的总并发依旧
-    被执行器封顶，逐请求重建的代价可接受。
+    30s TTL 缓存 + single-flight；命中缓存的响应带 ``cached=true`` 与
+    ``cache_age_sec``——把旧判定不加声明地喂给机器消费方比喂给人更危险，
+    所以陈旧声明是 payload 的一等字段而不是 HTTP 头。
 
     诚实性约定：``queue``/``pulse`` 在 builder 失败时输出 ``null`` 而不是
     空表/零值——空队列是「没有人卡住」的断言，查询失败给不出这个断言。
@@ -699,6 +707,33 @@ def verdicts_payload(query_string: str) -> dict:
     # builder 口径全部固定（无 hours/day 参数），暂不消费查询串；保留参数
     # 是为了与兄弟 payload 入口同形、给未来加过滤留位。
     del query_string
+    now = time.monotonic()
+    with _verdicts_cache_lock:
+        cached = _verdicts_cache
+    if cached is not None and now - cached[0] < _VERDICTS_CACHE_TTL_SEC:
+        out = dict(cached[1])
+        out["cached"] = True
+        out["cache_age_sec"] = int(now - cached[0])
+        return out
+    with _verdicts_build_lock:
+        with _verdicts_cache_lock:
+            cached = _verdicts_cache
+        now = time.monotonic()
+        if cached is not None and now - cached[0] < _VERDICTS_CACHE_TTL_SEC:
+            out = dict(cached[1])
+            out["cached"] = True
+            out["cache_age_sec"] = int(now - cached[0])
+            return out
+        payload = _build_verdicts_payload()
+        with _verdicts_cache_lock:
+            globals()["_verdicts_cache"] = (time.monotonic(), payload)
+        out = dict(payload)
+        out["cached"] = False
+        out["cache_age_sec"] = 0
+        return out
+
+
+def _build_verdicts_payload() -> dict:
     results = _run_home_builders(_VERDICTS_BUILDERS)
     system = compose_system_verdict(results["imports"], results["chat"])
     soft = results["soft_verdicts"]
