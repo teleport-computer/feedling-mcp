@@ -213,13 +213,20 @@ async def extract(
     return retry_value, None
 
 
-def _inner_from_card(card: dict) -> dict:
-    return {
+def _inner_from_card(card: dict, *, voice_call_id: str = "") -> dict:
+    inner = {
         "summary": str(card.get("summary") or "").strip(),
         "content": str(card.get("content") or "").strip(),
         "bucket": str(card.get("bucket") or "").strip(),
         "threads": list(card.get("threads") or []),
     }
+    # 溯源提示:这张卡来自一个含该通电话的 capture 窗口,agent 可据此调
+    # voice_transcript_read 回看原文。只在窗口"恰好含一通电话"时打——多通电话
+    # 的窗口无法判断某张卡属于哪一通,给了就是假精度。放在加密正文里(不放
+    # envelope 明文):服务端因此看不见"哪张卡来自哪通电话"。
+    if voice_call_id:
+        inner["voice_call_id"] = str(voice_call_id)[:96]
+    return inner
 
 
 def _memory_envelope_from_card(
@@ -229,6 +236,7 @@ def _memory_envelope_from_card(
     source: str,
     build_envelope: Callable[[dict], dict],
     default_type: str,
+    voice_call_id: str = "",
 ) -> dict:
     """Seal one card body and attach the plaintext metadata the real memory
     action validator requires.
@@ -241,7 +249,7 @@ def _memory_envelope_from_card(
     when = str(occurred_at or "").strip()
     if not when:
         raise ValueError("memory_occurred_at_required")
-    envelope = dict(build_envelope(_inner_from_card(card)) or {})
+    envelope = dict(build_envelope(_inner_from_card(card, voice_call_id=voice_call_id)) or {})
     envelope.update(
         {
             "type": str(card.get("type") or default_type).strip().lower()
@@ -265,6 +273,7 @@ def _to_actions(
     build_envelope: Callable[[dict], dict],
     capture_mode: str,
     reason: str,
+    voice_call_id: str = "",
 ) -> tuple[list[dict], int, int]:
     actions: list[dict] = []
     added = 0
@@ -283,6 +292,7 @@ def _to_actions(
                 source="memory_capture",
                 build_envelope=build_envelope,
                 default_type="event",
+                voice_call_id=voice_call_id,
             ),
             "reason": reason,
             "capture_mode": capture_mode,
@@ -310,12 +320,14 @@ def _to_actions(
     return actions, added, superseded
 
 
-def cards_to_actions(cards, *, occurred_at, source_ids, build_envelope):
+def cards_to_actions(cards, *, occurred_at, source_ids, build_envelope,
+                     voice_call_id: str = ""):
     return _to_actions(
         cards,
         occurred_at=occurred_at,
         source_ids=source_ids,
         build_envelope=build_envelope,
+        voice_call_id=voice_call_id,
         capture_mode="memory_capture",
         reason="Memory captured from a completed chat window.",
     )

@@ -431,6 +431,14 @@ CAPTURE_HISTORY_LIMIT = int(os.environ.get("FEEDLING_CAPTURE_HISTORY_LIMIT", "16
 # consumes it, so semantic validation can never multiply a job into four calls.
 CAPTURE_AGENT_REASK_BUDGET = 1
 CAPTURE_WINDOW_MAX_CHARS = int(os.environ.get("FEEDLING_CAPTURE_WINDOW_MAX_CHARS", "12000"))
+# 单通电话展开进窗口的预算。必须显著小于 CAPTURE_WINDOW_MAX_CHARS：上面那道
+# 截断是 text[-N:]（从尾部保留），一通没有自我约束的长电话会把它前面的文字
+# 聊天连同转写开头一起静默砍掉。8000 给一小时通话（约 9000 字）留了采样余地，
+# 也给同窗口的文字消息留了 4000。
+CAPTURE_VOICE_TRANSCRIPT_MAX_CHARS = int(
+    os.environ.get("FEEDLING_CAPTURE_VOICE_TRANSCRIPT_MAX_CHARS", "8000")
+)
+VOICE_TRANSCRIPT_SOURCE = "voice_call_transcript"
 CAPTURE_CONTEXT_MAX_CHARS = int(os.environ.get("FEEDLING_CAPTURE_CONTEXT_MAX_CHARS", "4000"))
 DREAM_MEMORY_INDEX_LIMIT = int(os.environ.get("FEEDLING_DREAM_MEMORY_INDEX_LIMIT", "0"))
 DREAM_FETCH_BATCH_SIZE = int(os.environ.get("FEEDLING_DREAM_FETCH_BATCH_SIZE", "100"))
@@ -11692,10 +11700,46 @@ def _capture_window_messages(job: dict) -> list[dict]:
     return selected
 
 
+def _capture_voice_transcript_text(call_id: str) -> str:
+    """归档的通话全文明文。复用既有取数 + enclave 解密两条路，无新信任面。
+
+    抛异常即"拿不到"。调用方**绝不可以**退回那张有界预览卡：那会把整通电话
+    蒸成开头几句，而 capture 照常推进游标 —— 记忆永久丢失且无人知晓。
+    """
+    body = _capture_get_json(f"/v1/voice/transcripts/{urllib.parse.quote(str(call_id))}")
+    envelope = body.get("transcript") if isinstance(body, dict) else None
+    if not isinstance(envelope, dict):
+        raise RuntimeError(f"voice_transcript_unavailable:{call_id}")
+    return _decrypt_envelope(envelope).decode("utf-8")
+
+
+def _bounded_voice_transcript(text: str) -> str:
+    """把一通电话压进自己的预算：超了头尾采样并说明中间省了多少。"""
+    text = str(text or "").strip()
+    budget = CAPTURE_VOICE_TRANSCRIPT_MAX_CHARS
+    if len(text) <= budget:
+        return text
+    head_budget = int(budget * 0.6)
+    tail_budget = max(0, budget - head_budget)
+    head = text[:head_budget].rstrip()
+    tail = text[-tail_budget:].lstrip() if tail_budget else ""
+    omitted = len(text) - len(head) - len(tail)
+    return f"{head}\n…（中间约 {omitted} 字省略，完整记录见通话详情）…\n{tail}"
+
+
 def _capture_window_text(messages: list[dict], *, user_label: str = "TA", agent_label: str = "我") -> str:
     lines: list[str] = []
     for msg in messages:
         ts = _message_ts_for_context(msg)
+        call_id = str(msg.get("voice_call_id") or "").strip()
+        if call_id and str(msg.get("source") or "") == VOICE_TRANSCRIPT_SOURCE:
+            # 聊天流里只有有界预览卡，全文在归档表里。展开它，Capture 才是在
+            # 蒸整通电话而不是开头几句。取不到就让整个 job 失败重试（游标不动）。
+            body = _bounded_voice_transcript(_capture_voice_transcript_text(call_id))
+            turns = msg.get("voice_turn_count")
+            header = "【语音通话逐字记录" + (f"，共 {turns} 轮" if turns else "") + "】"
+            lines.append(f"- [{_format_message_time(ts)}] {header}\n{body}")
+            continue
         lines.append(
             f"- [{_format_message_time(ts)}] "
             f"{_capture_message_role(msg, user_label=user_label, agent_label=agent_label)}: "
@@ -11781,7 +11825,7 @@ def _memory_agent_parse_with_bounce(
     return retried, "bounced_ok"
 
 
-def _capture_build_envelope(card: dict, *, occurred_at: str, source: str = "memory_capture", item_id: str = "") -> dict:
+def _capture_build_envelope(card: dict, *, occurred_at: str, source: str = "memory_capture", item_id: str = "", voice_call_id: str = "") -> dict:
     if not _ENCRYPTION_AVAILABLE:
         raise RuntimeError("capture_encryption_unavailable")
     if not _refresh_whoami_for_encrypted_reply():
@@ -11800,6 +11844,9 @@ def _capture_build_envelope(card: dict, *, occurred_at: str, source: str = "memo
         "bucket": str(card.get("bucket") or "").strip(),
         "threads": list(card.get("threads") or []),
     }
+    # 通话溯源(与 V2 extraction._inner_from_card 同形)。放加密正文,服务端看不见。
+    if voice_call_id:
+        inner["voice_call_id"] = str(voice_call_id)[:96]
     envelope = _build_envelope(
         plaintext=json.dumps(inner, ensure_ascii=False, separators=(",", ":")).encode("utf-8"),
         owner_user_id=user_id,
@@ -11826,6 +11873,14 @@ def _capture_build_envelope(card: dict, *, occurred_at: str, source: str = "memo
 def _capture_actions_from_cards(cards: list[dict], *, job: dict, messages: list[dict]) -> tuple[list[dict], int, int]:
     occurred_at = _capture_occurred_at(job, messages)
     source_ids = [_capture_message_id(msg) for msg in messages if _capture_message_id(msg)]
+    # 窗口恰好含一通电话时给卡片打溯源提示;多通无法判断某张卡属于哪一通,不打。
+    _call_ids = {
+        str(m.get("voice_call_id") or "").strip()
+        for m in messages
+        if str(m.get("source") or "") == VOICE_TRANSCRIPT_SOURCE
+        and str(m.get("voice_call_id") or "").strip()
+    }
+    voice_call_id = next(iter(_call_ids)) if len(_call_ids) == 1 else ""
     actions: list[dict] = []
     cards_added = 0
     cards_superseded = 0
@@ -11837,7 +11892,8 @@ def _capture_actions_from_cards(cards: list[dict], *, job: dict, messages: list[
         # source of repeated duplicate cards.
         if action in {"merge", "supersede"} and not target_id:
             continue
-        envelope = _capture_build_envelope(card, occurred_at=occurred_at)
+        envelope = _capture_build_envelope(
+            card, occurred_at=occurred_at, voice_call_id=voice_call_id)
         base = {
             "envelope": envelope,
             "reason": "Memory captured from a completed chat window.",

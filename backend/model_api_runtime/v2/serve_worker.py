@@ -857,8 +857,29 @@ def _decrypt_chat_rows(
                 raw_role in {"user", "openclaw"}
                 and source in capture_scheduler.CAPTURE_LIVE_SOURCES
             )
+            # 通话卡的反查键：worker 用它把有界预览换成归档的全文转写。
+            call_id = str(m.get("voice_call_id") or "").strip()
+            if call_id:
+                item["voice_call_id"] = call_id[:96]
+                turn_count = m.get("voice_turn_count")
+                if turn_count:
+                    item["voice_turn_count"] = int(turn_count)
         out.append(item)
     return out
+
+
+def _read_voice_transcript(user_id: str, call_id: str) -> str:
+    """归档的通话全文明文，经 enclave 解密。
+
+    抛异常即代表"拿不到"——调用方（worker 的 capture lane）必须让整个 job 失败
+    重试，绝不可以退回那张 500 字预览：那会把整通电话蒸成开头几句，并且照常推进
+    游标，记忆永久丢失且无人知晓。
+    """
+    from voice import transcript_store
+
+    return transcript_store.load_plaintext(
+        user_id, call_id, runtime_token=_mint_runtime_token(user_id)
+    )
 
 
 def _read_messages_after_seq(
@@ -3879,6 +3900,7 @@ def build_production_deps() -> v2_worker.TurnDeps:
         read_compaction_tail=_read_compaction_tail,
         read_tail_after_seq=_read_tail_after_seq,
         read_compaction_tail_after_seq=_read_compaction_tail_after_seq,
+        read_voice_transcript=_read_voice_transcript,
         read_recent_turns=_read_recent_turns,
         read_temporal_snapshot=_read_temporal_snapshot,
         read_wake_attention_snapshot=_read_wake_attention_snapshot,

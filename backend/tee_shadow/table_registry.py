@@ -189,6 +189,11 @@ REGISTRY: dict[str, Entry] = {
         SKIP, "TEE 同步自身的控制面/指标表，必须住在 RDS——复制到被它监控的库里没有意义"),
     "tee_reconcile_state": Entry(SKIP, "TEE reconcile 的控制面状态，同上，必须住 RDS"),
     "tee_reconcile_cursors": Entry(SKIP, "TEE reconcile 的游标，同上，必须住 RDS"),
+    "voice_transcripts": Entry(
+        CIPHERTEXT,
+        "通话全文转写归档；标准 content envelope 的持久用户资产，与 chat_messages / "
+        "memory_moments 同型。切读 TEE 后用户仍要能回看通话记录，所以必须复制",
+    ),
     "voice_turn_results": Entry(
         SKIP,
         "voice SSE 的 900 秒 AES-GCM 临时交接缓冲；非标准 content envelope，过期即删，"

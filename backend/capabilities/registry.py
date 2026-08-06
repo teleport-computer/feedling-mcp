@@ -3,7 +3,8 @@ from __future__ import annotations
 
 from typing import Callable
 
-from capabilities import memory, perception, screen, photo, identity, chat, web, wake, workspace
+from capabilities import memory
+from capabilities import voice, perception, screen, photo, identity, chat, web, wake, workspace
 from capabilities import errors
 from capabilities.types import CapabilityResult, err
 
@@ -14,6 +15,8 @@ CAPABILITIES: dict[str, Callable[..., CapabilityResult]] = {
     "identity_nudge": lambda store, **kw: identity.nudge(store, **kw),
     "memory_index": lambda store, **kw: memory.index(store, **kw),
     "memory_fetch": lambda store, **kw: memory.fetch(store, **kw),
+    "voice_transcript_list": lambda store, **kw: voice.transcript_list(store, **kw),
+    "voice_transcript_read": lambda store, **kw: voice.transcript_read(store, **kw),
     "memory_write": lambda store, **kw: memory.write(store, **kw),
     "memory_search": lambda store, **kw: memory.search(store, **kw),
     "perception_snapshot": lambda store, **kw: perception.snapshot(store, **kw),

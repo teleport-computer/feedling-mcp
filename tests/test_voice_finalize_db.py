@@ -1,5 +1,5 @@
 """DB-backed tests for hangup cleanup: a finished call's per-turn chat rows are
-selected by voice_call_id and deleted, leaving unrelated chat and the summary
+selected by voice_call_id and deleted, leaving unrelated chat and the transcript card
 row untouched. (The summary write itself needs user key material + a live
 model; that half is covered by the local e2e.)"""
 
@@ -13,7 +13,7 @@ from types import SimpleNamespace
 
 import db
 from voice import routes_asgi
-from voice import summary
+from voice import cleanup as summary
 from voice import transcript_memory
 
 
@@ -90,18 +90,18 @@ def test_untagged_reply_rows_are_deleted_via_reply_to_parent():
     assert db.chat_get_strict(uid, unrelated_reply) is not None
 
 
-def test_delete_never_touches_the_summary_row_and_is_idempotent():
+def test_delete_never_touches_the_transcript_card_and_is_idempotent():
     uid = _seed_user()
     call_id = "vcall_" + uuid.uuid4().hex[:10]
     _append(uid, {
         "role": "user", "source": "model_api",
         "voice_call_id": call_id, "voice_turn_id": "t1",
     })
-    # Simulate the durable summary row: same call_id metadata, but its msg_id is
-    # the deterministic summary id, which delete must skip.
-    smid = summary.summary_message_id(call_id)
+    # Simulate the durable transcript card row: same call_id metadata, but its msg_id is
+    # the deterministic card id, which delete must skip.
+    smid = summary.transcript_card_message_id(call_id)
     db.chat_append_strict(uid, smid, time.time(), {
-        "id": smid, "role": "openclaw", "source": "voice_call_summary",
+        "id": smid, "role": "openclaw", "source": "voice_call_transcript",
         "voice_call_id": call_id,
     }, 200)
 
@@ -174,7 +174,7 @@ def _run_finalize(monkeypatch, uid: str, call_id: str, *, capture=None):
         if db.chat_get_strict(uid, mid) is None:
             db.chat_append_strict(uid, mid, time.time(), {
                 "id": mid, "role": "openclaw",
-                "source": "voice_call_summary", "voice_call_id": cid,
+                "source": "voice_call_transcript", "voice_call_id": cid,
             }, 200)
         return True
 
@@ -257,10 +257,10 @@ def test_replay_finalize_nudges_instead_of_transcript_capture(monkeypatch):
         "role": "user", "source": "model_api",
         "voice_call_id": call_id, "voice_turn_id": "t1",
     })
-    smid = summary.summary_message_id(call_id)
+    smid = summary.transcript_card_message_id(call_id)
     db.chat_append_strict(uid, smid, time.time(), {
         "id": smid, "role": "openclaw",
-        "source": "voice_call_summary", "voice_call_id": call_id,
+        "source": "voice_call_transcript", "voice_call_id": call_id,
     }, 200)
 
     status, body, calls = _run_finalize(monkeypatch, uid, call_id, capture=None)
