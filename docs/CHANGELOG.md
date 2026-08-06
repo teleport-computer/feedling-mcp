@@ -47,6 +47,154 @@
 
 ## 记录正文（最新的在上面）
 
+## 2026-08-06 — Admin dashboard IA v2：首页 + 导航 13→4 + 统一漏斗
+
+**[DONE] /admin/data-track 默认页改为「首页」：判定条 + 用户队列 + 产品脉搏 + 事件流 + 成本行；导航收敛为 首页/产品健康/用户/诊断 四项。**
+
+- 设计原则落地：频率决定层级（每天看的在首屏零点击，出事才看的 11 个
+  诊断页收进 `view=diag` 枢纽 + 二级行，旧 URL 全部不变）；名单强于比率
+  （「需要你的用户」直接列出 有去无回/onboarding 卡住/模型配置待处理 的
+  具体用户行，封顶 20 + truncated 标记；resident 掉线检测因在内存态、
+  页面如实标注缺口）；无趋势不成信息（脉搏卡全部带 7 日 sparkline）。
+- 状态条四灯：系统 = 既有三把 `_ops_*_level` 尺子取最差（bad>warn>
+  unknown>ok，合成在 admin_core——db 不许 import data_track）；增长 =
+  WAU 环比（带 min-n 护栏，小分母不告警）；成本 = token 3× 中位数跑飞
+  检测；数据完整性 = **永远灰**直到 ACK/session 来源缺口闭合。
+- 统一漏斗 `admin_funnel_snapshot`：注册→已连接→内容就绪→首次真回复→
+  W1 仍活跃，严格单调、28 天窗口带前窗对照、W1 未成熟显 None；首页迷你
+  版 + 用户页完整版（带逐级掉落与前窗），替换掉用户页原来那组**不单调
+  的独立行为百分比条**（原数据保留在折叠的人群记账 details 里）。
+- 新 JSON 端点 `GET /v1/admin/data-track/verdicts`（admin 鉴权同级、不进
+  页面缓存）：给 agent 读的判定 + 队列 + 脉搏，与页面同一套 builder。
+- 两轮对抗审查修复 10 处（3 major：主动消息把"有去无回"误清；成本判定
+  绿灯却给"可判定天数不足"理由；激活率标题渲染进行中周为定数。7 minor
+  含 min-n 护栏、成熟死 cohort W1 显 0 不显 —、非有限数崩页、孤儿 CSS、
+  user_id 转义口径统一等）。种子舰队端到端验证（412 账号）：首页冷构
+  ~25ms vs 用户页 ~100ms（本地）。测试 296 通过；`test_asgi_admin` 两个
+  parity 失败为存量（cache-note vs 旧断言，已另立任务）。
+
+## 2026-08-05 — Dream 阀门重构：拆内容闸、只留确定性「明显不对」闸（V1/V2 同步）
+
+**[DECISION]+[DONE] usr_a40e 墓碑卡事故复盘，Seven 定产品哲学：出口只拦「明显不对」，绝不判内容质量、绝不拒绝内容上的可能性。**
+
+- 现场：deepseek-v4-pro 把 dream supersede 语义理解反，把「已被 <卡id> 取代——原文」
+  记账注记写进新卡 summary/content；占位符闸（实义文字，过）、语义审查员（同一弱模型
+  自审自查，放行）、15% 增量栅栏（多卡合并绕过）三道防线全没拦住，花园展示出墓碑卡。
+- **拆**（两条 lane 同步，V1 consumer + V2 extraction/worker）：
+  - 15% 增量栅栏（`_has_substantive_increment` 两份拷贝）——内容质量判断，
+    「更短但更准」的合法改写会被判死；
+  - 逐提案语义审查员（`_review_dream_consolidations` 两份实现 + review prompt/parser）
+    ——既误放（本次）也误杀（fail-closed 连审查调用挂了都毙提案），每条提案还多烧
+    一次用户 BYOK 调用。
+- **加**（共享一份，不再两处复制）：
+  - `memory/dream_gates.py`：卡 id 泄漏闸（result 硬字段含花园真实卡 id → 与内容闸
+    同路打回重问，零误伤）+ 爆炸半径保险丝（单晚退休 > 活跃卡 80% 且 ≥10 张 →
+    整个 job 失败不部分执行；env `FEEDLING_DREAM_FUSE_RATIO`/`FEEDLING_DREAM_FUSE_MIN_CARDS`）；
+  - `card_text.py` 墓碑短语闸（`已被/superseded by + ≥8位hex`，capture/dream 全 lane
+    兜底；裸「取代」散文不误伤）；
+  - dream prompt 红线补一句：result 写新卡内容本身、绝不出现卡 id（仅一句，
+    prompt 不膨胀——硬约束在出口代码里，见复盘讨论）。
+- **刻度**：`memory_lane_health` 增加 `failed_reasons`（按 `last_error` 细分，
+  「保险丝熔断」和「provider 挂」分开看）；V2 dream 记 `dream_funnel` trajectory
+  （proposals/applied/superseding）；V1 `dream_result` 增 `active_cards`+`content_gate`。
+- 测试：`test_dream_gates.py` 新增（含 **V1/V2 跨 lane 一致性锁**：同一份
+  consolidations 两条 lane 必须退休同一批卡）；lanes/integration/consumer 各测试
+  迁到新语义；673+ 相关用例全绿。
+- 待办：usr_a40e 花园复原（recover CLI 走 Actions，时间窗定位墓碑批次，dry-run
+  清单过目后 apply）——修复部署 prod 之后做，防止下一晚 dream 再产墓碑。
+
+## 2026-08-04 — 新增 Admin「产品健康」view（留存/激活/强度/证据缺口）
+
+**[DONE] /admin/data-track?view=health：投资人级产品指标常态化进 dashboard，全部只用现库可证实的数。**
+
+- 四个问题分区：①用户留下来了吗（`retention_cohort_snapshot` 冻结 cohort
+  W1/W2/W4/W8 热力表——只读快照、未成熟显「—」不做实时补算；WAU/粘性/L1-L7
+  分布用 `app_session_end` 使用口径）；②新用户能激活吗（复用带 cutoff 的
+  onboarding funnel：cohort×t1/t2/t3 趋势 + 注册→首真回复中位时长 + W4
+  激活者-vs-全量留存分层，coverage 不完整显「未知」）；③强度是真的吗
+  （Top10% session/token 集中度——token 标注仅 V2 灰度；铁杆用户 census =
+  连续 4 周每周 ≥5 个 admitted **非心跳** 主动 job，V1+V2 wake 合并、
+  排除维护类/限流 skip/自主心跳；主动消息 24h 回复率右删失下界）；
+  ④还缺什么证据（常开缺口清单：session 来源标记、客户端已读 ACK、BYOK
+  自付不可见——各自阻塞哪个核心指标）。
+- 诚实性规则全页强制（两轮对抗审查后修复 9 处）：进行中的北京周不渲染
+  成已定数字（流失/净变化/激活率/铁杆数全部跳过或标「进行中·不可判定」）；
+  funnel 故障传导为「未知」而非 0；W4 激活标记冻结在 W4 窗口开始前
+  （成熟 cohort 不再回溯漂移）；session 与 token 集中度同用完整北京日窗口。
+- 复用 commit 868281284 的底座：共享 admin-ops executor 并行 8 个
+  builder（本地实测 2-30ms/个）、60s 缓存、`[admin:perf]` 计时、逐 builder
+  失败域。宽口径快照 vs 使用口径两把尺子在口径说明中显式声明，不可互读。
+- 测试：`tests/test_admin_product_health_view.py`（14 项：8 个 builder 的
+  种子数据语义 + 渲染诚实性/缓存/日志无 secret）。仍未做：0079 可选
+  `proactive_jobs` 部分索引（视 prod EXPLAIN）、`chat_messages(ts)` 索引
+  （回复率查询目前顺扫、60s 缓存兜底）。
+
+## 2026-08-04 — Admin 运营总览提速 + 布局重做
+
+**[DONE] /admin/data-track 性能修复（overview 4.5s TTFB → 缓存命中亚秒）+ 运营总览布局按「问题→判定→证据」重排。**
+
+- 性能四件套：① `admin_onboarding_funnel` 新增 `registered_cutoff_ts`——
+  KPI 调用不再全量扫 `chat_messages`×2 / `user_logs` / `memory_moments`
+  （cohort user_id 过滤让里程碑 CTE 走既有 `(user_id,…)` 索引；`view=events`
+  的全量 funnel 页路径逐字节不变）；② overview 七个 report builder 并行
+  （ThreadPoolExecutor，逐 builder 失败域与日志语义保持原样，worker 线程
+  不碰 reqctx 绑定）；③ `page_html` 60s TTL 缓存（single-flight、
+  stale-on-error、5s 失败冷却、600s 硬保留清扫；key 是含 admin_key 的
+  first-value-wins 规范参数串的 sha256 摘要——按鉴权通道隔离缓存条目、
+  不落明文 secret，cookie 会话拿不到别人 query-key 构建的页面；
+  `view=debug`（可带 reveal 明文）完全绕过缓存；命中必带
+  「页面缓存 · 数据生成于 N 分钟前」诚实声明，置于 main 顶部）；④ 迁移 0078：`user_logs` app_session_end 部分索引
+  （CONCURRENTLY，沿用 0074 的 invalid-shell 防护）。另：全部 ops builder
+  加 `[admin:perf] builder=… elapsed_ms=…` 生产计时（codex 建议的第一步）。
+- 环比基线：`recent_admin_product_kpis` / `recent_token_usage_by_lane` 新增
+  `offset_hours`（前一窗口，半开区间；offset=0 行为与查询计划不变），
+  overview 指标卡带 ▲/▼ 环比（onboarding cohort 明确不做环比）。
+- 布局：四张问题卡改「比率大字 + 分数小字」且整卡可点进明细页；新增灰色
+  `unknown`（证据不足）一等档位，与琥珀 warn（测得需注意/结构性证据缺口）
+  分离——纯无证据不再显得像告警，chat 卡因 ACK 结构缺失仍保持 warn；每格
+  指标带 '?' 一行口径悬浮；三段长口径说明折叠为 `<details>`；导航 tab
+  分组为 质量/增长/系统（加上产品健康后共 13 个）。
+- 三方对抗审查（SQL 窗口 / 并发缓存 / 渲染 XSS+UX）后修复：跨鉴权通道
+  缓存互串（blocker）、7 线程 fan-out 打满共享 16 连接池（改共享 4 线程
+  `admin-ops` executor）、import 卡 100% 失败窗口误显「无样本」、重复扣费卡
+  测得候选仍显灰、6 个页面 nav 分组 CSS 缺失、环比 ≥10× 封顶、模型调用
+  环比改中性、offset 窗口上界改半开、funnel 查询失败改返 None（覆盖率
+  诚实显「未知」而非 0/0）。
+- 测试：`tests/test_admin_dashboard_perf.py` + `tests/test_admin_kpi_windows.py`
+  新增（funnel cohort 等价、offset 半开边界、缓存 single-flight/通道隔离/
+  debug 绕过/硬保留、失败域降级、日志与缓存 key 不含 admin_key）；conftest
+  增加 autouse 缓存清理 fixture。本地 PG14 上
+  `test_admin_usage.py` 的 44 个失败为存量 `pg_input_is_valid`（PG16 函数）
+  环境问题，与本改动无关（pristine origin/test 同样 44 失败）。
+- 后续（未做）：`ops_snapshot` 汇总表（把 dau/users 视图 12-18s 也压下来）；
+  客户端 ACK 采集（chat 卡变绿的前提，也是 fundraise「loop engagement」
+  指标的前提）。
+
+## 2026-08-05 — V2→V1 颗粒度对齐总攻（Seven 全权委托,一日闭环）
+
+**[DONE] Runtime V2 体验收敛到 V1:人设注入、心跳自觉、工具面 parity、test 开关常态全开,live E2E 全绿。**
+
+- 根因框架(三旋钮):①信息食谱——V2 原本**完全没有人设注入**(`persona`
+  一词在 v2 runtime 不存在),已补(95bbd545,每 turn JIT 解密全文进 system
+  前缀);②harness——wake 补 attention_facts+系统措辞禁令(a53a2923,叠加
+  志豪 PR #158 的伪 user nudge 移除/wake 语义恢复/感知 baseline);③模型
+  本性——弱模型不爱调工具,靠确定性注入兜底(保留的 V2 结构优势)。
+- 工具面 parity(3f9d375d):新增 perception_recent_apps;memory_index 补
+  ambient/include_sensitive、memory_fetch 补 limit/archived/superseded、
+  memory_write 补 reason 审计;D4 改名校验前移;V1 agent_tools_prompt.md 的
+  产品措辞逐条搬进工具描述。chat_image_read 判定为有意 limitation(P2 提案
+  =vision-observer 模式)。DND 现在拦 heartbeat/screen_watch(d8b33a26)。
+- test compose 定为「常态全开」:CAPTURE/PROFILE/DETERMINISTIC 硬编码 1
+  (86f0763c/ecb5c055),守门测试按环境分派;**prod/pre 一字未动**。
+- live E2E(本地 rig+真 deepseek-chat):人设首轮零工具在场✓、wake 无泄漏
+  /无第三人称✓、DND 闸✓、capture 3 张精准卡✓、profile state=ok✓。两个
+  假阴性已分诊(空料输入不写卡/不产画像=正确保守;会话中途改人设名被对话
+  连续性带跑=V1 同病,验收看注入层)。
+- 文档:docs/RUNTIME_V2_FLOWS.md(全流程报告,每 lane 触发→流程→prompt→
+  副作用→V1 差异)、docs/RUNTIME_V2_PARITY.md(债务台账)。
+- 遗留(归 Seven):prod 放 V2/用户迁回、PROFILE 上 prod、chat_image_read
+  P2、reminder 列表 API P2。
+
 ## 2026-07-31 — V2 照片唤醒按需读取真实图片
 
 **[FIX] V2 模型调用 `photo_read(include_image=true)` 后，现在会看到安全的视觉观察文本，而不再只有照片元数据。**

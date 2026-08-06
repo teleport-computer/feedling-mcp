@@ -408,8 +408,10 @@ def test_user_detail_daily_usage_json_page_and_events_limit(client):
 
 def test_uid_lookup_form_strip_validation_and_admin_key_passthrough(client):
     user_id, _ = _register(client)
+    # view=users is now explicit: the bare /admin/data-track default is the
+    # home page (dashboard IA v2), and the uid-lookup form lives on Users.
     page = client.get(
-        "/admin/data-track?admin_key=admin-test-token",
+        "/admin/data-track?admin_key=admin-test-token&view=users",
         headers=_admin_headers(),
     )
     body = page.get_data(as_text=True)
@@ -573,11 +575,17 @@ def test_admin_data_track_sorts_before_pagination(client):
         low_chat_high_memory,
     ]
 
-    page = client.get("/admin/data-track?sort=chat&dir=desc", headers=_admin_headers())
+    # view=users is now explicit (bare /admin/data-track renders the home page);
+    # the users-page primary nav is 首页/产品健康/用户/诊断 — the 11 legacy
+    # views (日活与时长 etc.) moved behind the 诊断 hub.
+    page = client.get(
+        "/admin/data-track?view=users&sort=chat&dir=desc", headers=_admin_headers()
+    )
     assert page.status_code == 200, page.get_data(as_text=True)
     html = page.get_data(as_text=True)
     assert "Chat desc" in html
-    assert "日活与时长" in html
+    assert "诊断" in html
+    assert "产品健康" in html
     assert "Memory asc" in html
     assert "Proactive desc" in html
 
@@ -768,8 +776,10 @@ def test_admin_runtime_state_filter_is_strict_and_links_preserve_query(client):
                 (user_id, runtime_state),
             )
 
+    # view=users is explicit now that the bare page defaults to home; the JSON
+    # API ignores it, and the rendered links must keep carrying it.
     query = (
-        "runtime_state=v2&q=usr_&sort=chat&dir=asc&limit=1&offset=0"
+        "runtime_state=v2&q=usr_&sort=chat&dir=asc&limit=1&offset=0&view=users"
     )
     response = client.get(
         f"/v1/admin/data-track/users?{query}",
@@ -798,11 +808,11 @@ def test_admin_runtime_state_filter_is_strict_and_links_preserve_query(client):
     assert 'lang="zh-CN"' in rendered
     assert (
         f"/admin/data-track/users/{v2_user}?admin_key=admin-test-token"
-        "&q=usr_&limit=1&offset=0&sort=chat&dir=asc&runtime_state=v2"
+        "&q=usr_&limit=1&offset=0&sort=chat&dir=asc&view=users&runtime_state=v2"
     ) in rendered
     assert (
         "/admin/data-track?admin_key=admin-test-token&q=usr_&limit=1&offset=0"
-        "&sort=chat&dir=asc&runtime_state=draining"
+        "&sort=chat&dir=asc&view=users&runtime_state=draining"
     ) in rendered
 
 
@@ -1017,7 +1027,10 @@ def test_admin_data_track_page_uses_plain_language(client, monkeypatch):
             "cache_miss_tokens": 4_000,
         },
     )
-    page = client.get("/admin/data-track", headers=_admin_headers()).get_data(as_text=True)
+    # view=users is now explicit — the bare /admin/data-track default is home.
+    page = client.get(
+        "/admin/data-track?view=users", headers=_admin_headers()
+    ).get_data(as_text=True)
     assert "激活用户（真正用起来的人）" in page
     assert "累计注册行（含重装孤儿·非人数）" in page
     assert "怎么读这些数" in page          # the explainer note-box

@@ -545,6 +545,7 @@ def test_plaintext_import_reuses_done_job_without_restart(monkeypatch):
     existing = {
         "job_id": "genesis_done",
         "status": "done",
+        "memory_action_count": 1,
         "metadata": {"ingest": "plaintext", "input_hash": input_hash},
     }
     monkeypatch.setattr(plaintext.db, "genesis_list_jobs", lambda *_args, **_kwargs: [existing])
@@ -969,6 +970,7 @@ def test_plaintext_commit_reused_done_job_consumes_current_stage(monkeypatch):
     monkeypatch.setattr(plaintext.service, "load_genesis_staged_payload", lambda *_a: materials)
     done = {
         "job_id": "genesis_done", "status": "done",
+        "memory_action_count": 1,
         "metadata": {
             "ingest": "plaintext",
             "input_hash": plaintext.history_import._history_import_payload_hash(materials),
@@ -986,6 +988,62 @@ def test_plaintext_commit_reused_done_job_consumes_current_stage(monkeypatch):
 
     assert resp.status_code == 200
     assert consumed["v"] == ("stage_now", "genesis_done")
+
+
+def test_plaintext_commit_done_without_artifact_evidence_creates_new_job(monkeypatch):
+    materials = {"format": "plaintext", "content": "User: retry poisoned import"}
+    input_hash = plaintext.history_import._history_import_payload_hash(materials)
+    poisoned = {
+        "job_id": "genesis_poisoned",
+        "status": "done",
+        "memory_action_count": 0,
+        "identity_status": "",
+        "persona_ref": "",
+        "metadata": {
+            "ingest": "plaintext",
+            "input_hash": input_hash,
+            "mode": "onboarding",
+        },
+    }
+    monkeypatch.setattr(plaintext.service, "load_genesis_staged_payload", lambda *_a: materials)
+    monkeypatch.setattr(plaintext.db, "genesis_list_jobs", lambda *_a, **_k: [poisoned])
+
+    created = {}
+
+    def fake_create(_store, payload, **_kwargs):
+        created["job"] = {
+            "job_id": "genesis_retry",
+            "status": "processing",
+            "metadata": payload["metadata"],
+        }
+        return created["job"], 201
+
+    monkeypatch.setattr(plaintext.service, "create_import_job", fake_create)
+    monkeypatch.setattr(
+        plaintext.db,
+        "genesis_set_job_status",
+        lambda *_a, **kwargs: {**created["job"], "output": kwargs.get("output")},
+    )
+    monkeypatch.setattr(plaintext.service, "write_genesis_state", lambda *_a, **_k: None)
+    started = {}
+    monkeypatch.setattr(
+        plaintext,
+        "_start_plaintext_genesis_job",
+        lambda _store, _key, job, **_kwargs: started.update(job=job) or True,
+    )
+    monkeypatch.setattr(
+        genesis_core.service,
+        "mark_genesis_staged_consumed",
+        lambda *_a: (_ for _ in ()).throw(AssertionError("poisoned done must not consume retry stage")),
+    )
+
+    resp = _client(monkeypatch).post(
+        "/v1/genesis/imports/plaintext/commit", json={"staged_id": "stage_retry"})
+
+    assert resp.status_code == 202
+    assert resp.get_json()["job"]["job_id"] == "genesis_retry"
+    assert started["job"]["job_id"] == "genesis_retry"
+    assert created["job"]["job_id"] != poisoned["job_id"]
 
 
 def test_plaintext_direct_import_ignores_client_staged_id(monkeypatch):
@@ -1052,6 +1110,29 @@ def test_recommended_distill_model_catalog_priority(monkeypatch):
 
     assert plaintext._recommended_distill_model(_store(), "key") == "vendor/haiku-fast"
     assert captured["total_budget_sec"] == 3.0
+
+
+def test_recommended_distill_model_skips_only_openai_compatible_gemini_flash(monkeypatch):
+    runtime = plaintext.provider_client.ProviderConfig(
+        "openai_compatible", "chat-model", "secret", "https://relay.example/v1")
+    monkeypatch.setattr(
+        plaintext.hosted_config_store,
+        "_load_runtime_provider_config",
+        lambda *_args: runtime,
+    )
+    monkeypatch.setattr(
+        plaintext.provider_client,
+        "list_provider_models",
+        lambda *_args, **_kwargs: {"models": [
+            {"id": "gemini-3-flash-preview"},
+            {"id": "gemini-3.1-pro-preview"},
+        ]},
+    )
+
+    assert plaintext._recommended_distill_model(_store(), "key") == "gemini-3.1-pro-preview"
+    assert plaintext._openai_compatible_gemini_flash("gemini-3.5-flash") is True
+    assert plaintext._openai_compatible_gemini_flash("gemini-3.1-pro-preview") is False
+    assert plaintext._openai_compatible_gemini_flash("deepseek-v4-flash") is False
 
 
 @pytest.mark.parametrize(
@@ -1423,6 +1504,40 @@ def test_plaintext_material_cards_come_from_durable_map_outputs(monkeypatch):
         "windows_total": 1,
         "cards": 2,
     }]
+
+
+def test_plaintext_map_diagnostics_are_bounded_in_job_output(monkeypatch):
+    statuses = []
+    monkeypatch.setattr(
+        plaintext.db,
+        "genesis_set_job_status",
+        lambda *_args, **kwargs: statuses.append(kwargs) or None,
+    )
+    progress = plaintext._PlaintextCheckpointProgress(
+        _store(),
+        "api-key",
+        "job-diagnostics",
+        [{
+            "source_kind": "memory_summary_import",
+            "source_family": "memory_summary",
+            "chunk_texts": ["window"],
+        }],
+    )
+
+    progress.record_map_diagnostics(1, "memory_summary", [{
+        "chunk_index": 0,
+        "task_id": "fact-map-0",
+        "discard_reason": "empty_fact_candidates",
+        "raw_output_snippet": "x" * 800,
+        "raw_output_chars": 800,
+        "raw_output_truncated": True,
+    }])
+
+    diagnostic = statuses[-1]["output"]["map_diagnostics"][0]
+    assert diagnostic["discard_reason"] == "empty_fact_candidates"
+    assert len(diagnostic["raw_output_snippet"]) == 500
+    assert diagnostic["raw_output_chars"] == 800
+    assert diagnostic["raw_output_truncated"] is True
 
 
 def test_plaintext_background_runner_routes_sources_and_merges_with_firewall(monkeypatch):
@@ -1825,6 +1940,92 @@ def test_add_memory_mode_writes_only_memory(monkeypatch):
     }
     assert calls["completed"]["memory_action_count"] == 1
     assert calls["completed"]["identity_status"] == "skipped"
+
+
+def test_add_memory_keep_all_zero_cards_fails_with_map_diagnostics(monkeypatch):
+    store = _store()
+    calls: dict = {"statuses": []}
+    monkeypatch.setattr(
+        plaintext.hosted_config_store,
+        "_load_runtime_provider_config",
+        lambda *_args: "runtime",
+    )
+    monkeypatch.setattr(
+        plaintext.db,
+        "genesis_set_job_status",
+        lambda *_args, **kwargs: calls["statuses"].append(kwargs) or {
+            "job_id": "job_add_empty", "status": kwargs.get("status", "processing")
+        },
+    )
+    monkeypatch.setattr(plaintext.service, "write_genesis_state", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        plaintext.worker,
+        "build_foreground_output_from_texts",
+        lambda **_kwargs: {
+            "source_kind": "memory_summary_import",
+            "source_family": "memory_summary",
+            "all_fact_candidates": [],
+            "core_fact_candidates": [],
+            "map_diagnostics": [{
+                "chunk_index": 0,
+                "task_id": "fact-map-0-empty-retry-1",
+                "discard_reason": "empty_fact_candidates",
+                "raw_output_snippet": '{"fact_candidates":[]}',
+                "raw_output_chars": 22,
+                "raw_output_truncated": False,
+            }],
+        },
+    )
+    monkeypatch.setattr(
+        plaintext.worker,
+        "build_memory_output_from_fact_candidates",
+        lambda **_kwargs: {"memories": [], "identity": {}},
+    )
+    monkeypatch.setattr(
+        plaintext.service,
+        "apply_memory_outputs",
+        lambda *_args, **_kwargs: (0, []),
+    )
+    monkeypatch.setattr(
+        plaintext.db,
+        "genesis_complete_job",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("zero-card keep_all job must not complete")
+        ),
+    )
+    monkeypatch.setattr(
+        plaintext.service,
+        "mark_failed",
+        lambda _store, job_id, error, **_kwargs: calls.update(
+            {"failed_job_id": job_id, "error": error}
+        ),
+    )
+
+    plaintext._run_plaintext_genesis_job(
+        store,
+        "api_key",
+        "job_add_empty",
+        mode="add_memory",
+        source_groups=[{
+            "source_kind": "memory_summary_import",
+            "source_family": "memory_summary",
+            "chunk_texts": ["用户长期居住在上海，也一直从事产品设计。"],
+        }],
+    )
+
+    assert calls["failed_job_id"] == "job_add_empty"
+    assert "distill_empty_output" in calls["error"]
+    assert plaintext.service.classify_genesis_error(calls["error"]) == "distill_empty_output"
+    failed_output = next(
+        item["output"] for item in reversed(calls["statuses"])
+        if (item.get("output") or {}).get("stage") == "plaintext_add_memory_failed"
+    )
+    assert failed_output["distill_diagnostics"] == {
+        "reason": "keep_all_zero_cards",
+        "map_candidate_count": 0,
+        "raw_memory_count": 0,
+    }
+    assert failed_output["map_diagnostics"][0]["raw_output_snippet"] == '{"fact_candidates":[]}'
 
 
 def test_update_identity_mode_replaces_identity_without_writing_memory(monkeypatch):

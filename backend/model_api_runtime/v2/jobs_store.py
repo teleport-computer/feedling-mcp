@@ -2911,6 +2911,18 @@ def _deliver_terminal_failure_reply(row: dict) -> bool:
             raise RuntimeError("terminal failure reply id collision")
         return _ack_terminal_failure_reply(job_id)
 
+    # Same-turn supersede gate: 这个 parent 已经被一条真回复(reply_message_id 有值
+    # 且没有失败章)回答过了,再投这条迟到的失败气泡只会自相矛盾——按「最终结果
+    # 说了算」直接 ack 不投递。严格按本 parent 判定,别的 turn 的真实失败照常投。
+    if db.v2_turn_failure_supersede_enabled():
+        parent = db.chat_get_strict(user_id, parent_id)
+        if (
+            parent is not None
+            and str(parent.get("reply_message_id") or "").strip()
+            and not str(parent.get("reply_error_class") or "").strip()
+        ):
+            return _ack_terminal_failure_reply(job_id)
+
     failure_identity: dict[str, str] = {}
     with _pool().connection() as conn:
         with conn.cursor(row_factory=dict_row) as cur:
@@ -3589,6 +3601,23 @@ def chat_turn_activity_rows(user_id: str, turn_id: str) -> tuple[list[dict], lis
             )
             events = [dict(row) for row in cur.fetchall()]
     return jobs, events
+
+
+def turn_answered_by_real_reply(user_id: str, turn_id: str) -> bool:
+    """True iff a real (non-failure-carrier) assistant reply answers this turn.
+
+    Durable reply evidence for the activity projection: job status 单独不可信
+    (completed 可能是没发回复的 handoff),这里只认「reply_to_message_id 指回该
+    turn、且不带 turn_failure_* 章」的已落库回复。"""
+    with _pool().connection() as conn:
+        cur = conn.execute(
+            "SELECT 1 FROM chat_messages WHERE user_id=%s "
+            "AND doc->>'reply_to_message_id'=%s "
+            "AND doc->>'role' NOT IN ('user','human') "
+            "AND COALESCE(doc->>'turn_failure_error_class','')='' LIMIT 1",
+            (str(user_id), str(turn_id)),
+        )
+        return cur.fetchone() is not None
 
 
 def status_events_for_job(user_id: str, job_id: int) -> list[dict]:
@@ -4922,8 +4951,14 @@ def recent_chat_reliability(
     }
 
 
-def recent_token_usage_by_lane(*, within_hours: int = 24) -> dict:
+def recent_token_usage_by_lane(
+    *, within_hours: int = 24, offset_hours: int = 0
+) -> dict:
     """按 lane 的 token 开销汇总（content-free），喂 admin 值班台。
+
+    ``offset_hours`` 把窗口整体后移成 [now-(offset+within)h, now-offset h)，
+    供环比对照列使用；0 时刻意不加上界——保持既有行为（含查询计划）逐字节
+    不变。返回结构不区分两种情况。
 
     与 ``recent_runtime_health`` 的延迟分位数口径**相反**：那里只算成功回合
     （失败超时会把 p95 拉到与故障同源的高位），这里算全部回合——失败回合照样
@@ -4950,6 +4985,16 @@ def recent_token_usage_by_lane(*, within_hours: int = 24) -> dict:
     ``usage_coverage``，而不是被记成零 token 混进总量假装正常。
     """
     safe_hours = max(1, min(int(within_hours), 24 * 366))
+    safe_offset = max(0, min(int(offset_hours), 24 * 366))
+    if safe_offset:
+        window_sql = (
+            "WHERE created_at >= now() - make_interval(hours => %s) "
+            "AND created_at < now() - make_interval(hours => %s) "
+        )
+        window_params = (safe_offset + safe_hours, safe_offset)
+    else:
+        window_sql = "WHERE created_at >= now() - make_interval(hours => %s) "
+        window_params = (safe_hours,)
 
     with _pool().connection() as conn:
         with conn.cursor(row_factory=dict_row) as cur:
@@ -4972,9 +5017,9 @@ def recent_token_usage_by_lane(*, within_hours: int = 24) -> dict:
                 "  sum(cache_read_tokens)::bigint AS cache_read_tokens,"
                 "  sum(cache_miss_tokens)::bigint AS cache_miss_tokens "
                 "FROM v2_turn_metrics "
-                "WHERE created_at >= now() - make_interval(hours => %s) "
+                + window_sql +
                 "GROUP BY GROUPING SETS ((lane), ())",
-                (safe_hours,),
+                window_params,
             )
             rows = cur.fetchall()
 
@@ -8533,7 +8578,12 @@ def memory_lane_health(*, within_hours: int = 24) -> dict:
     拉低成功率；只有 ``failed``（解析/provider 真错误）和 ``expired``（reaper 判定
     卡死回收）计入失败侧。
 
-    返回形状与 ``wake_success_stats`` 一致，便于并排读。"""
+    返回形状与 ``wake_success_stats`` 一致，便于并排读。
+
+    ``failed_reasons``（2026-08-05 dream 阀门重构）：失败侧按 ``last_error`` 首段
+    细分。dream 的出口闸从「按提案静默丢」改成了「明显不对就让整个 job 失败」
+    （``dream_blast_radius_exceeded`` / ``invalid_card_content*``），不细分的话
+    「保险丝在熔断」和「provider 在挂」在成功率上长得一模一样——阀门必须有刻度。"""
     with _pool().connection() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -8545,6 +8595,19 @@ def memory_lane_health(*, within_hours: int = 24) -> dict:
                 (int(within_hours),),
             )
             rows = cur.fetchall()
+            cur.execute(
+                # last_error 本身就是脱敏短码(extraction_failed:xxx),整串聚合
+                # 才能把 dream_blast_radius_exceeded 和 provider 挂掉分开看。
+                "SELECT lane, "
+                "COALESCE(NULLIF(left(last_error, 120), ''), 'unknown'), "
+                "count(*) FROM agent_jobs "
+                "WHERE lane IN ('capture','dream') AND status='failed' "
+                "AND finished_at IS NOT NULL "
+                "AND finished_at > now() - make_interval(hours => %s) "
+                "GROUP BY 1, 2",
+                (int(within_hours),),
+            )
+            reason_rows = cur.fetchall()
     completed = failed = expired = 0
     by_lane: dict[str, dict[str, int]] = {}
     for lane, status, count in rows:
@@ -8556,6 +8619,9 @@ def memory_lane_health(*, within_hours: int = 24) -> dict:
             failed += count
         elif status == "expired":
             expired += count
+    failed_reasons: dict[str, dict[str, int]] = {}
+    for lane, reason, count in reason_rows:
+        failed_reasons.setdefault(lane, {})[str(reason)] = int(count)
     denom = completed + failed + expired
     return {
         "completed": completed,
@@ -8563,6 +8629,7 @@ def memory_lane_health(*, within_hours: int = 24) -> dict:
         "expired": expired,
         "success_rate": (completed / denom) if denom else None,
         "by_lane": by_lane,
+        "failed_reasons": failed_reasons,
     }
 
 
@@ -10388,7 +10455,7 @@ _LATEST_GENUINE_USER_SEQ_SQL = (
 
 
 def due_heartbeat_users(*, now: float | None = None, limit: int = 500) -> list[str]:
-    """到期需要心跳唤醒的 user_id 列表（next_heartbeat_at 已到且不在 BYOK 支付冷却
+    """到期需要心跳唤醒的 user_id 列表（next_heartbeat_at 已到、未开启 DND 且不在 BYOK 支付冷却
     窗口内），按 next_heartbeat_at 升序（最该醒的排前面），供 D3 调度器 poll 后逐个
     enqueue_job(..., 'heartbeat')。now 可注入 epoch 浮点数用于确定性测试；
     None → 用 DB now()（镜像 reap_stuck_jobs 的 to_timestamp(%s) 约定）。"""
@@ -10403,6 +10470,12 @@ def due_heartbeat_users(*, now: float | None = None, limit: int = 500) -> list[s
                 "AND (schedule.payment_cooldown_until IS NULL "
                 "     OR schedule.payment_cooldown_until "
                 "        <= COALESCE(to_timestamp(%s), now())) "
+                "AND NOT EXISTS ("
+                "    SELECT 1 FROM user_blobs AS settings "
+                "    WHERE settings.user_id=schedule.user_id "
+                "      AND settings.kind='proactive_settings' "
+                "      AND settings.doc @> '{\"dnd\": true}'::jsonb"
+                ") "
                 "AND (schedule.proactive_backoff_until IS NULL "
                 "     OR schedule.proactive_backoff_until "
                 "        <= COALESCE(to_timestamp(%s), now()) "
@@ -10415,7 +10488,7 @@ def due_heartbeat_users(*, now: float | None = None, limit: int = 500) -> list[s
 
 
 def due_screen_watch_users(*, now: float | None = None, limit: int = 500) -> list[str]:
-    """到期需要屏幕监看唤醒的 user_id 列表（next_screen_watch_at 已到且不在 BYOK 支付
+    """到期需要屏幕监看唤醒的 user_id 列表（next_screen_watch_at 已到、未开启 DND 且不在 BYOK 支付
     冷却窗口内），按 next_screen_watch_at 升序，供 D3 调度器 poll 后逐个
     enqueue_job(..., 'screen_watch')。镜像 due_heartbeat_users 的每一处语义（NULL 不
     算到期；now 可注入 epoch 浮点数用于确定性测试；payment_cooldown_until 排除——
@@ -10424,12 +10497,18 @@ def due_screen_watch_users(*, now: float | None = None, limit: int = 500) -> lis
     with _pool().connection() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT user_id FROM v2_wake_schedule "
-                "WHERE next_screen_watch_at IS NOT NULL "
-                "AND next_screen_watch_at <= COALESCE(to_timestamp(%s), now()) "
-                "AND (payment_cooldown_until IS NULL "
-                "     OR payment_cooldown_until <= COALESCE(to_timestamp(%s), now())) "
-                "ORDER BY next_screen_watch_at LIMIT %s",
+                "SELECT schedule.user_id FROM v2_wake_schedule AS schedule "
+                "WHERE schedule.next_screen_watch_at IS NOT NULL "
+                "AND schedule.next_screen_watch_at <= COALESCE(to_timestamp(%s), now()) "
+                "AND (schedule.payment_cooldown_until IS NULL "
+                "     OR schedule.payment_cooldown_until <= COALESCE(to_timestamp(%s), now())) "
+                "AND NOT EXISTS ("
+                "    SELECT 1 FROM user_blobs AS settings "
+                "    WHERE settings.user_id=schedule.user_id "
+                "      AND settings.kind='proactive_settings' "
+                "      AND settings.doc @> '{\"dnd\": true}'::jsonb"
+                ") "
+                "ORDER BY schedule.next_screen_watch_at LIMIT %s",
                 (ts, ts, int(limit)),
             )
             return [row[0] for row in cur.fetchall()]

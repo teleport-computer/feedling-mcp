@@ -28,6 +28,7 @@ from capabilities import registry as cap_registry
 from core import envelope as core_envelope
 from core import store as core_store
 from model_api_runtime.v2 import cursor as v2_cursor
+from model_api_runtime.v2 import context as v2_context
 from model_api_runtime.v2 import effect_id as v2_effect_id
 from model_api_runtime.v2 import effect_outbox as v2_effect_outbox
 from model_api_runtime.v2 import jobs_store
@@ -334,6 +335,87 @@ def test_single_round_plain_text_writes_exactly_one_bubble(monkeypatch):
     assert _job_status_row(job_id)[0] == "completed"
 
 
+def test_chat_worldbook_matches_current_turn_without_rewriting_user_text(
+    monkeypatch,
+):
+    monkeypatch.setenv("FEEDLING_V2_SELF_THINKING", "off")
+    uid = "u_toolloop_worldbook"
+    conftest.seed_user(uid)
+    _reset(uid)
+    jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("w-worldbook")
+    _patch_real_write(monkeypatch)
+
+    calls = _script_provider(monkeypatch, [_text_round("The queen remembers you.")])
+    observed: dict = {}
+
+    def read_worldbook(user_id, messages, *, runtime_token):
+        observed.update({
+            "user_id": user_id,
+            "messages": messages,
+            "runtime_token": runtime_token,
+        })
+        return {
+            "block": "<world_book>\nLuna is queen of the Moon Court.\n</world_book>",
+            "matched_names": ["Moon Court"],
+        }
+
+    turn_messages = [{
+        "id": "m-worldbook",
+        "ts": 10.0,
+        "role": "user",
+        "content": "Tell me about Luna",
+    }]
+    deps = _deps(messages=turn_messages)
+    # Production prompt assembly reads the same current turn back through its
+    # history dependency. The suite's minimal `_deps` helper intentionally
+    # omits those readers, which would exercise the empty-context degradation
+    # path and make this integration assertion inspect a prompt with no tail.
+    deps.read_summary = lambda _uid: ("", 0.0, 0)
+    deps.read_tail = lambda _uid, _after_ts, _limit: list(turn_messages)
+    deps.read_worldbook_context = read_worldbook
+
+    status = asyncio.run(
+        worker.process_job(
+            job,
+            deps,
+            provider_config=_BYOK,
+            api_key=None,
+            runtime_token="rt",
+        )
+    )
+
+    assert status == "completed"
+    assert observed == {
+        "user_id": uid,
+        "messages": [{"role": "user", "content": "Tell me about Luna"}],
+        "runtime_token": "rt",
+    }
+    provider_messages = calls[0]["messages"]
+    worldbook_messages = [
+        message
+        for message in provider_messages
+        if isinstance(message, dict)
+        and str(message.get("content") or "").startswith(
+            v2_context.WORLD_BOOK_CONTEXT_HEADER + "\n"
+        )
+    ]
+    assert len(worldbook_messages) == 1
+    assert worldbook_messages[0]["role"] == "user"
+    assert "Luna is queen of the Moon Court." in worldbook_messages[0]["content"]
+    assert [
+        message
+        for message in provider_messages
+        if isinstance(message, dict)
+        and message.get("content") == "Tell me about Luna"
+    ] == [{"role": "user", "content": "Tell me about Luna"}]
+    assert all(
+        "Luna is queen" not in str(message.get("content") or "")
+        for message in provider_messages
+        if isinstance(message, dict) and message.get("role") == "system"
+    )
+
+
 def test_self_thinking_on_suppresses_native_reasoning(monkeypatch):
     """Self-authored thinking ON (shipped default): even an explicit
     include_reasoning request is suppressed at the provider, so a reasoning-capable
@@ -367,6 +449,38 @@ def test_self_thinking_on_suppresses_native_reasoning(monkeypatch):
     assert len(calls) == 1
     # The point: native reasoning was NOT requested despite include_reasoning=True.
     assert calls[0].get("include_reasoning") is not True
+
+
+def test_chat_thinking_only_keeps_existing_required_reply_fallback(monkeypatch):
+    monkeypatch.delenv("FEEDLING_V2_SELF_THINKING", raising=False)
+    uid = "u_toolloop_selfthink_only"
+    conftest.seed_user(uid)
+    _reset(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("w-selfthink-only")
+    _stub_envelope_build(monkeypatch)
+    _patch_real_write(monkeypatch)
+    _script_provider(monkeypatch, [_text_round("<think>只想了但没回答</think>")])
+
+    status = asyncio.run(
+        worker.process_job(
+            job,
+            _deps(messages=[{
+                "id": "m1", "ts": 10.0, "role": "user", "content": "在吗"
+            }]),
+            provider_config=_BYOK,
+            api_key=None,
+            runtime_token="rt",
+        )
+    )
+
+    assert status == "completed"
+    bubbles = _bubbles(uid)
+    assert len(bubbles) == 1
+    assert bubbles[0]["body_ct"] == worker._DEGENERATE_REPLY_FALLBACK
+    assert bubbles[0]["turn_failure_error_class"] == "upstream_unavailable"
+    assert bubbles[0]["thinking_body_ct"] == "（思考没写完）"
+    assert _job_status_row(job_id)[0] == "completed"
 
 
 def test_degenerate_terminal_reply_becomes_attributed_fallback(monkeypatch):

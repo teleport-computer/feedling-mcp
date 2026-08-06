@@ -38,14 +38,14 @@ def _clean_agent_jobs_table():
     yield
 
 
-def _insert_job(user_id, lane, status, *, finished_hours_ago=1.0):
+def _insert_job(user_id, lane, status, *, finished_hours_ago=1.0, last_error=None):
     # make_interval's `hours` arg is INT, so pass elapsed time via `secs`
     # (double precision) instead of casting a fractional hour count to hours.
     with db.get_pool().connection() as conn:
         conn.execute(
-            "INSERT INTO agent_jobs (user_id, lane, status, finished_at) "
-            "VALUES (%s, %s, %s, now() - make_interval(secs => %s))",
-            (user_id, lane, status, float(finished_hours_ago) * 3600.0),
+            "INSERT INTO agent_jobs (user_id, lane, status, finished_at, last_error) "
+            "VALUES (%s, %s, %s, now() - make_interval(secs => %s), %s)",
+            (user_id, lane, status, float(finished_hours_ago) * 3600.0, last_error),
         )
 
 
@@ -172,6 +172,28 @@ def test_memory_lane_health_and_wake_do_not_contaminate_each_other():
     assert set(memory["by_lane"]) == {"capture", "dream"}
 
 
+def test_memory_lane_health_breaks_down_failure_reasons():
+    """「保险丝在熔断」和「provider 在挂」必须分开看(2026-08-05 dream 阀门重构)。
+
+    出口闸从「按提案静默丢」改成「明显不对就让整个 job 失败」之后,失败侧不细分
+    的话这两种情况在成功率上长得一模一样,阀门就没有刻度。"""
+    seed_user("u_mem_reasons")
+    _insert_job("u_mem_reasons", "dream", "failed",
+                last_error="extraction_failed:dream_blast_radius_exceeded")
+    _insert_job("u_mem_reasons", "dream", "failed",
+                last_error="extraction_failed:upstream_unavailable")
+    _insert_job("u_mem_reasons", "capture", "failed", last_error=None)
+    _insert_job("u_mem_reasons", "dream", "completed")
+
+    stats = jobs_store.memory_lane_health()
+
+    assert stats["failed_reasons"]["dream"] == {
+        "extraction_failed:dream_blast_radius_exceeded": 1,
+        "extraction_failed:upstream_unavailable": 1,
+    }
+    assert stats["failed_reasons"]["capture"] == {"unknown": 1}
+
+
 def test_memory_lane_health_is_explicit_when_nothing_ran():
     """没有历史时 success_rate 是 None，不是 0。
 
@@ -181,5 +203,5 @@ def test_memory_lane_health_is_explicit_when_nothing_ran():
 
     assert stats == {
         "completed": 0, "failed": 0, "expired": 0,
-        "success_rate": None, "by_lane": {},
+        "success_rate": None, "by_lane": {}, "failed_reasons": {},
     }

@@ -746,16 +746,25 @@ def plaintext_import(
     if existing and str(existing.get("status") or "") == "processing":
         existing = plaintext_helpers._fail_stale_plaintext_job(store, existing) or existing
     if existing and str(existing.get("status") or "") == service.DONE_JOB_STATUS:
-        # Identical materials already distilled successfully. No worker runs (and thus
-        # no DONE terminal callback), so release THIS request's stage right here — the
-        # outcome is already known-good.
-        if trusted_staged_id:
-            try:
-                service.mark_genesis_staged_consumed(
-                    store, trusted_staged_id, str(existing.get("job_id") or ""))
-            except Exception:
-                pass  # reap/TTL backstop
-        return _job_response(existing, extra={"status": "done"}), 200
+        identity_written = (
+            str(existing.get("identity_status") or "").strip().lower()
+            in {"initialized", "updated", "already_initialized"}
+            or bool(str(existing.get("persona_ref") or "").strip())
+        )
+        if int(existing.get("memory_action_count") or 0) > 0 or identity_written:
+            # Identical materials already distilled successfully. No worker runs (and
+            # thus no DONE terminal callback), so release THIS request's stage right
+            # here — durable artifact evidence makes the outcome known-good.
+            if trusted_staged_id:
+                try:
+                    service.mark_genesis_staged_consumed(
+                        store, trusted_staged_id, str(existing.get("job_id") or ""))
+                except Exception:
+                    pass  # reap/TTL backstop
+            return _job_response(existing, extra={"status": "done"}), 200
+        # Historical bugs could mark an import done before writing any artifact. Treat
+        # that row exactly like a hash miss so the retry gets a fresh job and checkpoint.
+        existing = None
 
     # Fast-path the stable 409 response. The partial unique index remains the
     # authoritative cross-worker race guard between this read and insertion.

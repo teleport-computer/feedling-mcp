@@ -41,6 +41,7 @@ _MEMORY_TOOL_ACTION = {
         "content": _STR,
         "bucket": _STR,
         "target_id": _STR,
+        "reason": _STR,
     },
     "required": ["op"],
     "additionalProperties": False,
@@ -87,7 +88,13 @@ PARAMS: dict[str, dict] = {
     # "limit" is inspected directly (memory_core.index reads payload.get("limit")).
     "memory_index": {
         "type": "object",
-        "properties": {"limit": _INT, "bucket": _STR, "thread": _STR},
+        "properties": {
+            "limit": _INT,
+            "bucket": _STR,
+            "thread": _STR,
+            "ambient": _BOOL,
+            "include_sensitive": _BOOL,
+        },
         "required": [],
     },
     # memory.search(store, ...): params.get("query") (required, non-empty) + optional
@@ -101,7 +108,12 @@ PARAMS: dict[str, dict] = {
     # list of non-empty strings.
     "memory_fetch": {
         "type": "object",
-        "properties": {"ids": {"type": "array", "items": _STR}},
+        "properties": {
+            "ids": {"type": "array", "items": _STR},
+            "limit": _INT,
+            "include_archived": _BOOL,
+            "include_superseded": _BOOL,
+        },
         "required": ["ids"],
     },
     # memory.write: the model emits PLAINTEXT cards; the worker's
@@ -122,6 +134,12 @@ PARAMS: dict[str, dict] = {
     "perception_snapshot": {
         "type": "object",
         "properties": {"signals": {"type": "array", "items": _STR}},
+        "required": [],
+    },
+    # perception.recent_apps: params.get("limit"), params.get("hours").
+    "perception_recent_apps": {
+        "type": "object",
+        "properties": {"limit": _INT, "hours": {"type": "number"}},
         "required": [],
     },
     # perception.trend: params.get("signal"), params.get("field"), params.get("days").
@@ -182,7 +200,7 @@ PARAMS: dict[str, dict] = {
     },
 
     # -- wake.py (backed by proactive/scheduled_wake_v2.py) --
-    # wake.schedule: params.get("at") (required, ISO-ish time string), optional
+    # wake.schedule: params.get("at") (required, ISO-ish or relative time string), optional
     # "tz" / "reason" strings and repeat=daily|weekly. NOTE: the field is
     # "at", not "when".
     "schedule_wake": {
@@ -290,7 +308,10 @@ DESCRIPTIONS: dict[str, str] = {
                        "and list fields signature, boundaries, do_not_say, "
                        "stable_definitions. Edit a list field by whole-list replacement "
                        "or with op keys add_<field>/remove_<field>/replace_<field> "
-                       "(e.g. add_signature, remove_boundaries). To recalibrate how "
+                       "(e.g. add_signature, remove_boundaries). For each list field, "
+                       "use only one method in a call: whole replacement, add, remove, "
+                       "or replace. D4 rename rule: changing agent_name requires "
+                       "self_introduction in the same call. To recalibrate how "
                        "long you and the user have known each other, set the "
                        "'relationship_days' argument directly — e.g. identity_patch(relationship_days=300). "
                        "This is the day number AS THE USER SEES AND SAYS IT (the '第 N 天' shown "
@@ -303,7 +324,9 @@ DESCRIPTIONS: dict[str, str] = {
                        "first to see the current dimensions and values. Optional "
                        "'reason'. To add or rename dimensions, use identity_patch."),
     "memory_index": ("Browse memory-card summaries, optionally filtered by one exact "
-                     "bucket or thread and capped by limit. Do not indiscriminately pull "
+                     "bucket or thread and capped by limit. Set ambient/include_sensitive "
+                     "only when that broader or sensitive recall is genuinely needed. "
+                     "Do not indiscriminately pull "
                      "the whole Garden. For an open-ended overview, inspect the returned "
                      "total/returned counts and browse bucket by bucket (or thread by "
                      "thread) until the partition counts reconcile with total. For a "
@@ -317,22 +340,44 @@ DESCRIPTIONS: dict[str, str] = {
                       "all-memory overview, and do not repeat it after one discovery "
                       "result. For a user-requested bulk rewrite or cleanup, call "
                       "memory_organize."),
-    "memory_fetch": "Fetch specific memory cards by their ids.",
+    "memory_fetch": ("Fetch the most relevant ids chosen from the current index/search "
+                     "step, usually 1–3 cards (guidance, not a hard cap). Related cards "
+                     "may expand the returned set up to limit; use include_archived or "
+                     "include_superseded only when historical versions are needed."),
     "memory_write": ("Write, update, or delete memory cards. Each action needs an "
                      "'op': 'add' (supply a one-line 'summary' AND full 'content', "
                      "optional 'bucket'), 'update' (supply 'target_id' plus new "
-                     "'summary'/'content'), or 'delete' (supply 'target_id'). Get "
+                     "'summary'/'content'), or 'delete' (supply 'target_id'). Each action "
+                     "may include an audit 'reason'. Get "
                      "target_ids from memory_search/memory_index first."),
-    "perception_snapshot": "Read the latest perception snapshot for the given signals.",
-    "perception_trend": "Read a trend summary for a perception signal over recent days.",
+    "perception_snapshot": ("Read the latest perception snapshot for the given signals. "
+                            "The app field is only the latest open/close event observed "
+                            "within 15 minutes; never claim it is the app currently in use. "
+                            "Use perception_recent_apps for an activity trajectory."),
+    "perception_recent_apps": ("Read the merged app open/close trajectory, newest first, "
+                               "with event, minutes_ago, and category. Use hours to bound "
+                               "the time window and check minutes_ago before saying 'just "
+                               "now'. apps=[] means no data; disabled=true means access is "
+                               "off, not that no apps were used."),
+    "perception_trend": ("Read a trend summary for a perception signal over recent days. "
+                         "Interpret the rolling baseline as the usual level and delta as "
+                         "the current change from that baseline; do not conflate them."),
     "perception_history": "Read raw historical values for a perception signal over recent days.",
     "screen_recent": "List recent screen-share frame metadata.",
-    "screen_read": "Read (decrypt) a specific screen-share frame, or the latest one if no frame_id is given.",
+    "screen_read": ("Read a specific screen-share frame, or the latest one if no frame_id "
+                    "is given. Start without include_image for caption/OCR. If pixels are "
+                    "needed, set include_image=true; Runtime V2 inspects them through its "
+                    "native vision observer and returns an untrusted visual_observation "
+                    "instead of a local image_file path."),
     "photo_recent": "List recent photos, optionally capped by limit.",
-    "photo_read": "Read a specific photo by id, optionally including its decrypted image.",
+    "photo_read": ("Read a specific photo by id. Set include_image=true only when metadata "
+                   "is insufficient; Runtime V2 inspects the decrypted pixels through its "
+                   "native vision observer and returns an untrusted visual_observation "
+                   "instead of a local image_file path."),
     "web_search": "Search the live public web for current information such as news, weather, prices, or recent events, or anything past your training data that you are not sure is current. Prefer this over guessing or telling the user you cannot access the internet.",
     "web_fetch": "Fetch a specific URL and return its main text content. Use when the user provides a link, or to read a page found through web_search.",
-    "schedule_wake": ("Schedule a future self-wake at a given time, with optional "
+    "schedule_wake": ("Schedule a future self-wake at an ISO timestamp or a relative "
+                      "time such as 'in 2 hours', '+30m', or '两小时后', with optional "
                       "timezone, reason, and repeat ('daily' every 24 hours or "
                       "'weekly' every 7 days)."),
     "cancel_wake": "Cancel a previously scheduled self-wake by its wake_id.",
@@ -446,12 +491,14 @@ def _validate_value(value, schema: dict, *, path: str) -> str | None:
     return None
 
 
-def validate_tool_args(name: str, args) -> str | None:
+def validate_tool_args(name: str, args, *, live_model_call: bool = False) -> str | None:
     """Return ``None`` when args satisfy a model-facing tool's schema.
 
     This is intentionally dependency-free and covers the complete schema
     vocabulary currently emitted by this module: object/array/scalar types,
-    required fields, array items, and closed top-level objects.
+    required fields, array items, and closed top-level objects. ``live_model_call``
+    enables forward-only semantic checks that must not reject an older encrypted
+    effect during replay.
     """
     schema = PARAMS.get(name)
     if schema is None:
@@ -470,6 +517,10 @@ def validate_tool_args(name: str, args) -> str | None:
         # (see capabilities.identity.merge_patch_fields).
         from capabilities import identity as cap_identity
         merged = cap_identity.merge_patch_fields(args)
+        if live_model_call:
+            pairing_error = cap_identity.rename_pairing_error(args)
+            if pairing_error:
+                return pairing_error
         # Emptiness gate == origin/test baseline, with EXACTLY ONE addition:
         # relationship_days counts by PRESENCE of the key (round-4). Rationale:
         #   * relationship_days -> present == content (0 = "we met today" is valid;

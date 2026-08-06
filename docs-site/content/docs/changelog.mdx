@@ -10,11 +10,80 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **Runtime V2 Chat now applies matching World Book entries.** Matches use the
+  current user turn and enter the prompt as a standalone, untrusted setting-data
+  block rather than changing the user's message. Oversized matched context is
+  deterministically truncated with a visible marker; proactive wake lanes remain
+  unchanged for Runtime V1 parity.
+
+- **Dream more clearly keeps merely related memories separate.** Its shared V1
+  and Runtime V2 consolidation guidance now gives a concrete example that a
+  cycling habit and recent insomnia remain independent memories even though
+  both concern health; genuine evolution of one plan remains mergeable.
+
+- **Runtime V2 no longer treats an intentional silent heartbeat as a failed
+  response.** A model response containing a complete self-thinking block and no
+  public text now completes ordinary heartbeat, manual-wake, and screen-watch
+  jobs without publishing a bubble or arming proactive failure backoff.
+  Scheduled reminders still require public text, while malformed or truncated
+  thinking markup remains a fail-closed error.
+
+- **Voice calls now end in a single summary instead of per-turn chat rows.**
+  New public endpoint `POST /v1/voice/finalize`: the client posts the call
+  transcript at hang-up; the user's own model writes one `voice_call_summary`
+  chat message and the call's per-turn rows are deleted only after the summary
+  is durable (idempotent replays return the same `summary_message_id`; on
+  summary failure nothing is deleted and the request may be retried; rows
+  already folded by Runtime V2 compaction are retained and reported as
+  `retained_covered`). The live-call flow — identity, memory, tools, and
+  per-turn streaming — is unchanged.
+- **`POST /v1/chat/message` now accepts `context_refs`, carrying Garden
+  "talk in chat" memory references on the resident line.** Same plaintext
+  routing contract as the hosted send: only `type: "memory"` entries are
+  honored, ids only are persisted as `quoted_memory_ids` (capped at eight),
+  and the enclave expands them into decrypted memory context for the
+  resident consumer. Requests without `context_refs` are unchanged.
+
+- **Hosted Genesis no longer silently completes a non-empty long-term-memory
+  import with zero cards.** Keep-all imports now fail with
+  `distill_empty_output` and remediation copy directing the user to switch
+  models. The job output retains up to six discarded map diagnostics with a
+  reason and a 500-character model-output excerpt. Compatible-relay model
+  recommendations temporarily exclude Gemini Flash IDs while leaving Gemini
+  Pro and non-Gemini Flash names eligible. Admin data-track Genesis jobs now
+  include the selected `distill_model`.
+
+- **Hosted Genesis retries no longer reuse completed imports that produced no
+  durable memories or identity artifact.** Retrying identical staged material
+  after such an incomplete historical result now creates a new processing job
+  instead of returning the empty result as successfully completed.
+
+- **Do Not Disturb now suppresses Runtime V2 heartbeat and screen-watch
+  scheduling.** Due-query polling excludes accounts whose proactive settings
+  have `dnd` enabled and resumes automatically when DND is turned off.
+
+- **Hosted Runtime V2 exposes finer-grained perception and memory tools.** The
+  model can now read the permission-gated recent app open/close trajectory,
+  request ambient or sensitive memory-index views, include archived or
+  superseded cards when fetching, and attach audit reasons to memory writes.
+  Tool guidance also distinguishes a recent app event from current app usage,
+  explains rolling perception baselines, accepts relative scheduled-wake times,
+  and routes requested screen pixels through the native visual observer.
+
+- **Hosted Runtime V2 now carries the complete genesis persona into every Chat
+  and proactive wake turn.** The encrypted persona is decrypted just in time
+  for the turn and placed in the trusted system prefix without profile or
+  context truncation. Accounts that have not completed genesis keep the generic
+  companion prompt, and a persona update takes effect on the next turn.
+
 - **Hosted Runtime V2 restores the proactive-presence semantics used by Runtime
   V1.** Automatic wake context is no longer serialized as a synthetic user
   message, and speaking and staying silent are treated as equally valid for
-  heartbeat and screen-watch moments. Scheduled reminder text is supplied as
-  labeled application data, while an ordinary heartbeat for an account with no
+  heartbeat and screen-watch moments. Those turns now receive content-free
+  attention facts for the last user-message age, recent-tail freshness, and the
+  number of visible proactive messages in the preceding 24 hours. Scheduled
+  reminder text is supplied as labeled application data and retains its
+  must-deliver semantics, while an ordinary heartbeat for an account with no
   genuine conversation history completes without calling the model.
 
 - **Runtime V2 perception wakes now use durable per-signal baselines.** The
@@ -34,25 +103,38 @@ change must not be interpreted as an API guarantee.
   Perception-triggered wake messages no longer receive unrelated exact battery,
   weather, activity, sleep, or health values in their initial prompt.
 
-- **Hosted Dream maintenance now uses proposal rationale plus independent
-  semantic review.** Runtime V2 fetches complete candidate card bodies instead
-  of reconstructing them from one-line summaries. Every consolidation must
-  include a rationale and receive an isolated second yes/no judgment from the
-  account's BYOK model; a negative, failed, timed-out, or malformed judgment
-  rejects only that proposal. This replaces the temporary text-overlap,
-  five-consolidation, four-retired-card, and seven-day cooldown fences, allowing
-  low-overlap evolution such as a travel plan becoming a booked ticket while
-  keeping merely related events separate. One-card rewrites still require
-  substantive new information, one source card cannot be reused within a run,
-  and all actions remain soft supersedes bound to the pre-run card snapshot.
+- **Plaintext memory writes reject tombstone-style notes.** A plaintext
+  `memory.add`, upgrade, or `memory.supersede` whose summary or content is a
+  bookkeeping note — "已被 … 取代" or "superseded by" followed by an
+  internal-id-like hex string — now fails with an item-level
+  `memory_card_tombstone` instead of being stored, and a rejected supersede
+  leaves every targeted card active. This closes the freehand agent-tool path
+  that bypassed the structured extraction gates; ordinary prose about
+  replacement without a hex id is unaffected.
+
+- **Hosted Dream maintenance now applies deterministic exit gates instead of
+  content-quality judgment.** Runtime V2 fetches complete candidate card bodies
+  instead of reconstructing them from one-line summaries. Every consolidation
+  must include a rationale, may not reuse a source card within a run, and may
+  not target unknown cards. Consolidation content itself is not second-guessed:
+  the earlier per-proposal semantic-review call and the substantive-increment
+  requirement for one-card rewrites were removed, so low-overlap evolution such
+  as a travel plan becoming a booked ticket merges without an extra model
+  judgment, and a shorter-but-more-accurate rewrite is accepted. In their place
+  Dream rejects (and bounces back for one rewrite) any result whose visible
+  fields contain an internal card id or a tombstone-style note, and a run that
+  would retire more than a configurable share of the active garden (default
+  80% and at least 10 cards) fails as a whole without applying anything. All
+  actions remain soft supersedes bound to the pre-run card snapshot, and
   Dream's durable automatic trigger advances only on new non-Dream cards.
 
 - **Users can explicitly wake a full Memory Dream organization from chat.**
   Runtime V2 exposes `memory_organize` only for an explicit user request and
   force-enqueues a single-flight Dream job without granting direct merge access
   to the chat turn. It bypasses automatic timing and new-material gates but
-  retains rationale review, soft supersedes, and the deployment/user Dream
-  switches; a disabled switch returns a clear disabled state. Resident V1 has
+  retains the rationale requirement, deterministic exit gates, soft
+  supersedes, and the deployment/user Dream switches; a disabled switch returns
+  a clear disabled state. Resident V1 has
   the equivalent `memory-organize` CLI verb over `POST /v1/dream/tick` with
   `force: true`.
 

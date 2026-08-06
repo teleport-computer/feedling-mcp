@@ -118,11 +118,55 @@ from workspace.sandbox import (
     configured_sandbox_provider,
 )
 from workspace.service import production_backend as production_workspace_backend
+from worldbook import worldbook_core
 import db
 import memory_readside_core
 import provider_client
 
 log = logging.getLogger("feedling.runtime_v2.serve_worker")
+
+
+def _load_genesis_persona(store, *, runtime_token: str) -> str:
+    """JIT-decrypt this user's complete genesis persona for one model turn.
+
+    Runtime V1 reads the same ``genesis_persona.content_envelope`` and sends the
+    resulting Markdown as trusted system text on every freshly spawned turn.
+    V2 keeps that behavior: no truncation or profile rollout gate, and absent,
+    legacy, malformed, or temporarily undecryptable blobs leave the existing
+    generic companion prompt unchanged.
+    """
+    user_id = str(getattr(store, "user_id", "") or "")
+    if not user_id:
+        return ""
+    try:
+        blob = db.get_blob(user_id, "genesis_persona")
+    except Exception as exc:  # noqa: BLE001 — absence must not fail the turn
+        log.warning(
+            "genesis persona blob read failed for %s: %s",
+            user_id,
+            type(exc).__name__,
+        )
+        return ""
+    if not isinstance(blob, dict):
+        return ""
+    envelope = blob.get("content_envelope")
+    if not (isinstance(envelope, dict) and envelope.get("body_ct")):
+        return ""
+    try:
+        raw = core_enclave._decrypt_envelope_via_enclave(
+            envelope,
+            None,
+            purpose="genesis_persona",
+            runtime_token=str(runtime_token or ""),
+        )
+        return raw.decode("utf-8")
+    except Exception as exc:  # noqa: BLE001 — mirror Runtime V1 fallback
+        log.warning(
+            "genesis persona decrypt failed for %s: %s",
+            user_id,
+            type(exc).__name__,
+        )
+        return ""
 
 
 def _load_workspace_prompt(store, *, runtime_token: str) -> dict:
@@ -139,6 +183,12 @@ def _load_workspace_prompt(store, *, runtime_token: str) -> dict:
         store, runtime_token=str(runtime_token or "")
     )
     trusted_system_blocks: list[str] = []
+    persona = _load_genesis_persona(store, runtime_token=runtime_token).strip()
+    if persona:
+        # Persona first, matching V1's persona-before-tools ordering. It remains
+        # inside context.py's single cache-stable system-role prefix and is
+        # deliberately not subject to runtime-data or profile truncation.
+        trusted_system_blocks.append(persona)
     for block in render_trusted_prefix_blocks(
         backend,
         include_working_memory=False,
@@ -1080,6 +1130,20 @@ def _read_temporal_snapshot(
             through_seq=through_seq,
         ),
     }
+
+
+def _read_wake_attention_snapshot(
+    user_id: str,
+    *,
+    now_ts: float,
+    through_seq: int | None = None,
+) -> dict:
+    """Read content-free V1/V2 proactive frequency at the frozen wake frontier."""
+    return db.chat_visible_proactive_stats(
+        user_id,
+        since_ts=float(now_ts) - 86_400.0,
+        through_seq=through_seq,
+    )
 
 
 def _summary_metadata_frontier(state: dict) -> list:
@@ -3464,8 +3528,12 @@ def _validate_decrypted_tool_effect(effect_type: str, payload: dict) -> None:
             action_type = str(action.get("type") or "")
             if action_type == "memory.delete":
                 if (
-                    set(action) != {"type", "memory_id"}
+                    set(action) not in (
+                        {"type", "memory_id"},
+                        {"type", "memory_id", "reason"},
+                    )
                     or not str(action.get("memory_id") or "").strip()
+                    or not isinstance(action.get("reason", ""), str)
                 ):
                     raise RuntimeError("invalid encrypted memory delete")
                 continue
@@ -3725,6 +3793,24 @@ def _read_capture_state(user_id: str) -> dict:
     )
 
 
+def _read_worldbook_context(
+    user_id: str,
+    messages: list[dict],
+    *,
+    runtime_token: str,
+) -> dict:
+    """Match this foreground turn against the user's encrypted World Book."""
+    body, status = worldbook_core.match(
+        core_store.get_store(str(user_id)),
+        {"messages": list(messages or [])},
+        api_key=None,
+        runtime_token=str(runtime_token or ""),
+    )
+    if status != 200:
+        raise RuntimeError("worldbook_match_failed")
+    return body
+
+
 def _record_extraction_status(
     user_id: str,
     lane: str,
@@ -3795,6 +3881,7 @@ def build_production_deps() -> v2_worker.TurnDeps:
         read_compaction_tail_after_seq=_read_compaction_tail_after_seq,
         read_recent_turns=_read_recent_turns,
         read_temporal_snapshot=_read_temporal_snapshot,
+        read_wake_attention_snapshot=_read_wake_attention_snapshot,
         read_summary=_read_summary,
         read_summary_with_seq=_read_summary_with_seq,
         write_summary=_write_summary,
@@ -3813,6 +3900,7 @@ def build_production_deps() -> v2_worker.TurnDeps:
         read_scheduled_wake_context=_read_scheduled_wake_context,
         read_perception_wake_context=_read_perception_wake_context,
         read_pending_scheduled_wake_context=_read_pending_scheduled_wake_context,
+        read_worldbook_context=_read_worldbook_context,
         apply_memory_actions=_apply_memory_actions,
         build_memory_envelope=_build_memory_envelope,
         read_capture_state=_read_capture_state,

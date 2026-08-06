@@ -455,13 +455,22 @@ def _recommended_distill_model(store, api_key: str | None) -> str | None:
     ids = [
         str(item.get("id") or "")
         for item in catalog.get("models") or []
-        if isinstance(item, dict) and "thinking" not in str(item.get("id") or "").lower()
+        if (
+            isinstance(item, dict)
+            and "thinking" not in str(item.get("id") or "").lower()
+            and not _openai_compatible_gemini_flash(str(item.get("id") or ""))
+        )
     ]
     for needle in ("haiku", "flash", "mini"):
         match = next((model_id for model_id in ids if needle in model_id.lower()), "")
         if match:
             return match
     return None
+
+
+def _openai_compatible_gemini_flash(model_id: str) -> bool:
+    normalized = str(model_id or "").strip().lower()
+    return "gemini" in normalized and "flash" in normalized
 
 
 def _distill_model_override(value: Any) -> str:
@@ -601,6 +610,38 @@ class _PlaintextCheckpointProgress:
             source_pass=source_pass,
         )
 
+    def record_map_diagnostics(
+        self, source_pass: int, source_family: str, diagnostics: list[dict]
+    ) -> None:
+        if not diagnostics:
+            return
+        existing = (
+            self.doc.get("map_diagnostics")
+            if isinstance(self.doc.get("map_diagnostics"), list)
+            else []
+        )
+        safe = list(existing)
+        for raw in diagnostics:
+            if not isinstance(raw, dict) or len(safe) >= 6:
+                break
+            safe.append({
+                "source_pass": max(1, int(source_pass)),
+                "source_family": str(source_family or "")[:80],
+                "chunk_index": max(0, int(raw.get("chunk_index") or 0)),
+                "task_id": str(raw.get("task_id") or "")[:120],
+                "discard_reason": str(raw.get("discard_reason") or "unknown")[:120],
+                "raw_output_snippet": str(raw.get("raw_output_snippet") or "")[:500],
+                "raw_output_chars": max(0, int(raw.get("raw_output_chars") or 0)),
+                "raw_output_truncated": bool(raw.get("raw_output_truncated")),
+            })
+        self.doc["map_diagnostics"] = safe
+        service.write_genesis_checkpoint(self.store, self.job_id, self.doc)
+        self.publish(
+            stage="plaintext_reducer",
+            source_family=source_family,
+            source_pass=source_pass,
+        )
+
     def record_non_map_group(
         self, source_pass: int, source_family: str, *, cards: int = 0
     ) -> None:
@@ -683,6 +724,9 @@ class _PlaintextCheckpointProgress:
             "materials": self.materials(active_pass=source_pass),
             "identity_ready": bool(self.doc.get("identity_ready")),
         }
+        diagnostics = self.doc.get("map_diagnostics")
+        if isinstance(diagnostics, list) and diagnostics:
+            output["map_diagnostics"] = diagnostics[:6]
         if source_family:
             output["source_family"] = source_family
         if source_pass:
@@ -1264,6 +1308,19 @@ def _run_plaintext_genesis_v2(
             resume_map_outputs=resume_map_outputs,
             on_map_completed=on_map_completed,
         )
+        if progress and isinstance(reduce.get("map_diagnostics"), list):
+            mapped_diagnostics: list[dict] = []
+            for diagnostic in reduce["map_diagnostics"]:
+                if not isinstance(diagnostic, dict):
+                    continue
+                local_index = int(diagnostic.get("chunk_index") or 0)
+                full_index = (
+                    checkpoint_indices[local_index]
+                    if 0 <= local_index < len(checkpoint_indices)
+                    else local_index
+                )
+                mapped_diagnostics.append({**diagnostic, "chunk_index": full_index})
+            progress.record_map_diagnostics(idx, group_family, mapped_diagnostics)
         foreground_reduces.append(reduce)
         voice_candidates.extend([c for c in (reduce.get("voice_candidates") or []) if isinstance(c, dict)])
         if idx == fg_idx:
@@ -1797,6 +1854,12 @@ def _run_plaintext_add_memory_job(
                 if progress else None
             ),
         )
+        if progress:
+            progress.record_map_diagnostics(
+                idx,
+                group_family,
+                output.get("map_diagnostics") if isinstance(output.get("map_diagnostics"), list) else [],
+            )
         if not first_output:
             first_output = output
         candidates = output.get("all_fact_candidates") or output.get("core_fact_candidates") or []
@@ -1824,6 +1887,31 @@ def _run_plaintext_add_memory_job(
         preserve_dates=keep_all_job,
         fallback_occurred_at=str((relationship_anchor or {}).get("relationship_started_at") or "").strip(),
     )
+    if keep_all_job and mem_count == 0:
+        distill_diagnostics = {
+            "reason": "keep_all_zero_cards",
+            "map_candidate_count": len(fact_candidates),
+            "raw_memory_count": raw_count,
+        }
+        if progress:
+            progress.publish(
+                stage="plaintext_add_memory_failed",
+                status="processing",
+                extra={"distill_diagnostics": distill_diagnostics},
+            )
+        else:
+            db.genesis_set_job_status(
+                store.user_id,
+                job_id,
+                status="processing",
+                output={
+                    "stage": "plaintext_add_memory_failed",
+                    "distill_diagnostics": distill_diagnostics,
+                },
+            )
+        raise worker.GenesisWorkerError(
+            "distill_empty_output:keep_all_nonempty:zero_memory_cards"
+        )
     dropped = raw_count - mem_count
     if dropped > 0:
         notices_core.emit(store, source="genesis", error_class="genesis_partial",

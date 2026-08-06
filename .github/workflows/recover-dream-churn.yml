@@ -27,6 +27,11 @@ on:
         required: false
         default: ""
         type: string
+      retire_sources:
+        description: "Comma-separated card sources to retire inside the window (default memory_dream)"
+        required: false
+        default: "memory_dream"
+        type: string
 
 permissions:
   contents: read
@@ -51,6 +56,7 @@ jobs:
           TEST_DATABASE_URL: ${{ secrets.TEST_DATABASE_URL }}
           PROD_DATABASE_URL: ${{ secrets.DATABASE_URL }}
           RECOVERY_SINCE: ${{ inputs.since }}
+          RECOVERY_RETIRE_SOURCES: ${{ inputs.retire_sources }}
         run: |
           set -euo pipefail
           recovery_args=(
@@ -60,6 +66,11 @@ jobs:
           if [ -n "$RECOVERY_SINCE" ]; then
             recovery_args+=(--since "$RECOVERY_SINCE")
           fi
+          IFS=',' read -ra retire_sources <<< "${RECOVERY_RETIRE_SOURCES:-memory_dream}"
+          for retire_source in "${retire_sources[@]}"; do
+            retire_source="$(echo "$retire_source" | xargs)"
+            [ -n "$retire_source" ] && recovery_args+=(--retire-source "$retire_source")
+          done
           if [ "${{ inputs.apply }}" = "APPLY" ]; then
             python3 tools/recover_memory_dream_churn.py "${recovery_args[@]}" \
               --apply --confirm-user-id "${{ inputs.user_id }}" \

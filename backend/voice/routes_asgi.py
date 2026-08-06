@@ -23,6 +23,7 @@ from asgi.deps import require_auth, require_scope
 from chat import idempotency as chat_idempotency
 from core import envelope as core_envelope
 from core import voice_token
+from core import wake_bus
 from hosted import chat_send_core
 from hosted import config_store as hosted_config_store
 from notices import catalog as notices_catalog
@@ -276,6 +277,94 @@ async def create_voice_session(
         "gateway_url": gateway_url,
         "expires_at": expires_at,
     }
+
+
+@router.post("/v1/voice/finalize")
+async def finalize_voice_call(
+    request: Request, auth: AuthResult = Depends(require_auth)
+):
+    """Hangup: replace this call's per-turn chat rows with ONE summary.
+
+    The live call itself is untouched (per-turn voice keeps the normal chat
+    lane: same identity, memory and tools). The client sends the call's
+    plaintext transcript (chat rows are ciphertext the server cannot read);
+    the summary runs on the user's OWN model, is durably persisted as a single
+    ``voice_call_summary`` row, and only then are the call's per-turn rows
+    deleted — so the raw back-and-forth stops occupying history/context and
+    memory capture distils from the summary instead.
+
+    Idempotent: the summary message id derives from ``call_id``; a retried
+    finalize finds the row and just re-runs the (idempotent) cleanup. On any
+    summary failure the per-turn rows are KEPT (nothing is lost) and the
+    client may retry.
+    """
+    from core import store as core_store
+    from voice import summary as voice_summary
+
+    payload = (await asgi_http.read_json_silent(request)) or {}
+    if not isinstance(payload, dict):
+        return JSONResponse({"error": "invalid_request"}, status_code=400)
+    call_id = str(payload.get("call_id") or "").strip()
+    turns = payload.get("turns")
+    if not call_id or not call_id.startswith("vcall_") or len(call_id) > 96:
+        return JSONResponse({"error": "call_id_required"}, status_code=400)
+    if not isinstance(turns, list) or not any(
+        isinstance(t, dict) and str(t.get("text") or "").strip() for t in turns
+    ):
+        return JSONResponse({"error": "turns_required"}, status_code=400)
+    if len(json.dumps(turns)) > 120_000:
+        return JSONResponse({"error": "transcript_too_long"}, status_code=413)
+    user_id = auth.user_id
+    mid = voice_summary.summary_message_id(call_id)
+
+    def _finalize() -> tuple[dict, int]:
+        store = core_store.get_store(user_id)
+        import db as _db
+
+        # Idempotent replay: summary already durable -> just redo the cleanup.
+        already = _db.chat_get_strict(user_id, mid) is not None
+        if not already:
+            try:
+                text = voice_summary.generate_summary(store, turns)
+            except Exception as exc:  # noqa: BLE001 — keep rows, let client retry
+                log.warning(
+                    "[voice.finalize] summary failed user=%s call=%s: %s",
+                    user_id[:12], call_id[:24], str(exc)[:120],
+                )
+                return {"error": "voice_summary_failed"}, 502
+            if not voice_summary.persist_summary(store, text, mid, call_id):
+                return {"error": "voice_summary_not_persisted"}, 502
+        cleanup = voice_summary.delete_call_messages(user_id, call_id)
+        if cleanup["remaining"] > 0:
+            # Deletable rows survived (a DB blip inside chat_delete). The
+            # summary is durable, so a client retry re-enters via the
+            # idempotent replay path and re-runs only this cleanup.
+            log.warning(
+                "[voice.finalize] cleanup incomplete user=%s call=%s remaining=%d",
+                user_id[:12], call_id[:24], cleanup["remaining"],
+            )
+            return {"error": "voice_cleanup_incomplete"}, 502
+        # Prune this worker's hot cache and tell every other worker (same
+        # three steps clear_history performs after deleting rows).
+        with store.chat_lock:
+            store.chat_messages = [
+                m for m in store.chat_messages
+                if str(m.get("voice_call_id") or "") != call_id
+                or str(m.get("id") or "") == mid
+            ]
+        store.notify_chat_waiters()
+        wake_bus.notify("chat", user_id)
+        voice_summary.nudge_capture(store)
+        return {
+            "status": "finalized",
+            "summary_message_id": mid,
+            "deleted_turns": cleanup["deleted"],
+            "retained_covered": cleanup["retained_covered"],
+            "replayed": already,
+        }, 200
+
+    body, status = await asyncio.to_thread(_finalize)
+    return JSONResponse(body, status_code=status)
 
 
 @router.post("/v1/voice/chat/completions")

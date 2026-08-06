@@ -523,9 +523,74 @@ def test_proactive_policy_does_not_bias_the_model_toward_silence():
     assert "speaking and staying silent are equally valid" in prompt
     assert "do not need a strong reason" in prompt
     assert "not a user request" in prompt
+    assert "attention_facts" in prompt
+    assert "never mention this wake or any system wording" in prompt
     assert "only if" not in prompt
     assert "genuinely worth saying" not in prompt
     assert "silence is correct" not in prompt
+
+
+def test_wake_injects_attention_facts_as_non_user_application_data(monkeypatch):
+    uid = "u_wake_attention_facts"
+    conftest.seed_user(uid)
+    _reset(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, "heartbeat")
+    claimed_by = _claim(job_id)
+    provider_calls = []
+
+    async def _provider(_config, messages, *, tools=None, **_kwargs):
+        provider_calls.append(messages)
+        return _text_round("")
+
+    monkeypatch.setattr(provider_client, "chat_completion_async", _provider)
+    deps = _wake_deps(
+        tail=[
+            {
+                "id": "m1",
+                "ts": 900.0,
+                "role": "user",
+                "content": "hi",
+            }
+        ]
+    )
+    deps.read_temporal_snapshot = lambda *_args, **_kwargs: {
+        "timezone": "UTC",
+        "last_user_message_ts": 900.0,
+    }
+    deps.read_wake_attention_snapshot = lambda *_args, **_kwargs: {
+        "visible_proactive_count_24h": 8,
+        "last_visible_proactive_message_ts": 990.0,
+    }
+    monkeypatch.setattr(worker.time, "time", lambda: 1_000.0)
+
+    status = asyncio.run(
+        worker._run_wake(
+            job_id,
+            uid,
+            "heartbeat",
+            deps,
+            _BYOK,
+            worker.ENCLAVE_SEMAPHORE,
+            claimed_by,
+        )
+    )
+
+    assert status == "completed"
+    assert len(provider_calls) == 1
+    temporal_message = next(
+        message
+        for message in provider_calls[0]
+        if str(message.get("content")).startswith(
+            worker.context.TEMPORAL_CONTEXT_HEADER + "\n"
+        )
+    )
+    assert temporal_message["role"] == "assistant"
+    assert '"visible_proactive_count_24h":8' in temporal_message["content"]
+    assert not any(
+        message["role"] == "user"
+        and "attention_facts" in str(message.get("content"))
+        for message in provider_calls[0]
+    )
 
 
 def test_run_wake_degenerate_reply_fails_silently(monkeypatch):
@@ -575,6 +640,78 @@ def test_run_wake_degenerate_reply_fails_silently(monkeypatch):
         "wake_failed:degenerate_reply_suppressed",
     )
     assert not any(event["kind"] == "error" for event in _status_events(uid))
+
+
+def test_heartbeat_thinking_only_is_successful_silence_without_backoff(
+    monkeypatch,
+):
+    monkeypatch.delenv("FEEDLING_V2_SELF_THINKING", raising=False)
+    uid = "u_wake_thinking_only"
+    conftest.seed_user(uid)
+    _reset(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, "heartbeat")
+    claimed_by = _claim(job_id)
+    _script_provider(monkeypatch, [_text_round("<think>这次不打扰她了</think>")])
+    writes = []
+    monkeypatch.setattr(
+        worker,
+        "_write_encrypted_reply",
+        lambda *_args, **_kwargs: writes.append(True),
+    )
+    deps = _wake_deps(
+        tail=[{"id": "m1", "ts": 1.0, "role": "user", "content": "hi"}]
+    )
+
+    status = asyncio.run(
+        worker._run_wake(
+            job_id,
+            uid,
+            "heartbeat",
+            deps,
+            _BYOK,
+            worker.ENCLAVE_SEMAPHORE,
+            claimed_by,
+        )
+    )
+
+    assert status == "completed"
+    assert _job_status(job_id) == ("completed", None)
+    assert writes == []
+    schedule = jobs_store.get_wake_schedule(uid)
+    assert schedule is None or schedule["proactive_backoff_until"] is None
+
+
+def test_scheduled_thinking_only_remains_a_must_deliver_failure(monkeypatch):
+    monkeypatch.delenv("FEEDLING_V2_SELF_THINKING", raising=False)
+    uid = "u_scheduled_thinking_only"
+    conftest.seed_user(uid)
+    _reset(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, "scheduled")
+    claimed_by = _claim(job_id)
+    _script_provider(monkeypatch, [_text_round("<think>提醒必须送达</think>")])
+    writes = []
+    monkeypatch.setattr(
+        worker,
+        "_write_encrypted_reply",
+        lambda *_args, **_kwargs: writes.append(True),
+    )
+
+    status = asyncio.run(
+        worker._run_wake(
+            job_id,
+            uid,
+            "scheduled",
+            _wake_deps(tail=[]),
+            _BYOK,
+            worker.ENCLAVE_SEMAPHORE,
+            claimed_by,
+        )
+    )
+
+    assert status == "failed"
+    assert _job_status(job_id) == ("failed", "wake_failed:empty_reply")
+    assert writes == []
+    assert jobs_store.get_wake_schedule(uid)["proactive_backoff_until"] is not None
 
 
 def test_run_scheduled_wake_prompts_with_the_exact_due_reminders(monkeypatch):

@@ -26,12 +26,17 @@ def test_read_resolves_latest_then_decrypts(monkeypatch):
     assert seen == {"frame_id": "f1", "include_image": "false"}
 
 
-def test_read_binary_body_exposes_meta_only(monkeypatch):
+def test_read_binary_body_exposes_b64_only_for_native_vision_bridge(monkeypatch):
     monkeypatch.setattr(screen_read_core, "frame_decrypt",
                         lambda *a, **k: ScreenResult(status=200, raw_body=b"\xff\xd8", media_type="image/jpeg"))
     r = cap_screen.read("STORE", params={"frame_id": "f2", "include_image": True})
     assert r.ok is True
-    assert r.data == {"media_type": "image/jpeg", "has_binary": True}
+    assert r.data == {
+        "frame_id": "f2",
+        "media_type": "image/jpeg",
+        "has_image": True,
+        "image_b64": "/9g=",
+    }
 
 
 def test_recent_caps_large_frame_list(monkeypatch):

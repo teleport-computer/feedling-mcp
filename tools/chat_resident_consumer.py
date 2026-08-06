@@ -111,6 +111,7 @@ import threading
 import time
 import unicodedata
 import urllib.parse
+import uuid
 import xml.etree.ElementTree as _ET
 import zipfile
 from pathlib import Path
@@ -147,6 +148,7 @@ from memory.capture_prompt_v1 import (
 )
 from identity.user_naming import transcript_speaker_label
 from memory import card_guard
+from memory import dream_gates as memory_dream_gates
 from memory.prompts_v1 import normalize_bucket_language
 from memory.card_text import (
     count_user_token_residuals,
@@ -154,10 +156,8 @@ from memory.card_text import (
 )
 from memory.dream_prompt_v1 import (
     build_dream_prompt,
-    build_dream_review_prompt,
     build_dream_retry_prompt,
     parse_dream_consolidations,
-    parse_dream_review,
 )
 from memory.migrate_prompt_v1 import build_migrate_prompt, parse_migrated_cards
 from chat.reply_language import (
@@ -6539,6 +6539,21 @@ def _prepare_cli_command(
             cmd = [cmd[0], "--print", *cmd[1:]]
         if not _has_claude_output_format(cmd):
             cmd = [cmd[0], "--output-format", "json", *cmd[1:]]
+        # Isolated turn (session_id_override — vision probe / dream review /
+        # identity distill): a bare `claude --print` with no session flag IS a
+        # fresh session, which is exactly the isolation being asked for. Never
+        # inject --resume here: claude's --print --resume accepts only a UUID
+        # claude itself generated (or an existing session title), so resuming
+        # the consumer-minted bounded label fails the very first turn outright
+        # (resident report 2026-08-05 — broke vision probes and dream reviews
+        # on claude-driver homes). Drivers that accept arbitrary ids (pi's
+        # create-if-missing --session-id, Hermes --resume) keep the override.
+        if session_id_override is not None:
+            if _has_claude_session_id(cmd):
+                # Operator template hard-codes --session-id: claude requires a
+                # UUID there too, so replace the bounded label bound by
+                # _ensure_explicit_cli_session_id with a throwaway real UUID.
+                cmd = _set_cli_option_value(cmd, "--session-id", str(uuid.uuid4()))
         # When THIS turn's message actually carries an injected recent-chat
         # transcript (see _foreground_agent_message), that transcript is the single
         # continuity source — do NOT also inject claude's fragile --resume, which
@@ -6546,7 +6561,7 @@ def _prepare_cli_command(
         # no transcript was injected (injection off, history unavailable, or first
         # turn), keep --resume as the fallback so continuity is never dropped on
         # both sides at once.
-        if (
+        elif (
             sid
             and not _has_cli_resume(cmd)
             and not _has_claude_session_id(cmd)
@@ -12240,17 +12255,20 @@ def _dream_actions_from_consolidations(
     card_map: dict[str, dict],
     occurred_at: str,
 ) -> tuple[list[dict], int, int, int, int, int]:
+    # 2026-08-05 复盘只保留结构性判据(rationale 非空、目标卡真实存在、不重复退休)。
+    # 语义审查员与 15% 增量栅栏(内容质量判断)已拆除;出口硬闸移到 parse 层
+    # (内容闸+卡id泄漏闸)与本函数末尾的爆炸半径保险丝。与 V2 的
+    # extraction.consolidations_to_actions 保持同一套判据,不再各自漂移。
     actions: list[dict] = []
     cards_merged = 0
     cards_thickened = 0
     cards_superseded = 0
     organized_ids: set[str] = set()
     merged_count = 0
+    used_ids: set[str] = set()
     for row in consolidations:
         op = str(row.get("op") or "").strip().lower()
         if not str(row.get("rationale") or "").strip():
-            continue
-        if row.get("_review_approved") is not True:
             continue
         card_ids = [
             str(memory_id or "").strip()
@@ -12260,10 +12278,11 @@ def _dream_actions_from_consolidations(
         card_ids = list(dict.fromkeys(card_ids))
         if not card_ids:
             continue
-        if len(card_ids) == 1 and not _dream_has_substantive_increment(
-            card_map.get(card_ids[0]) or {}, row.get("result") or {}
-        ):
-            continue
+        if any(memory_id not in card_map for memory_id in card_ids):
+            continue  # 目标卡必须是这轮真实喂进 prompt 的卡
+        if any(memory_id in used_ids for memory_id in card_ids):
+            continue  # 一张卡只能被一条提案退休
+        used_ids.update(card_ids)
         organized_ids.update(card_ids)
         if op == "merge":
             merged_count += max(0, len(card_ids) - 1)
@@ -12287,7 +12306,6 @@ def _dream_actions_from_consolidations(
             "dream_op": op,
             "dream_card_ids": card_ids,
             "dream_rationale": str(row.get("rationale") or "")[:1000],
-            "dream_review_reason": str(row.get("_review_reason") or "")[:1000],
         })
         if op == "merge":
             cards_merged += 1
@@ -12296,97 +12314,11 @@ def _dream_actions_from_consolidations(
         cards_superseded += len(card_ids)
     if consolidations and not actions:
         raise ValueError("dream_no_memory_actions")
+    if memory_dream_gates.blast_radius_exceeded(cards_superseded, len(card_map)):
+        # 爆炸半径保险丝:单晚要退休的卡超过花园的绝大部分 = 规模明显不对
+        # (834→1 事故的最后防线)。整个 job 失败等人查,不部分执行。
+        raise ValueError("dream_blast_radius_exceeded")
     return actions, cards_merged, cards_thickened, cards_superseded, len(organized_ids), merged_count
-
-
-def _dream_semantic_text(card: dict) -> str:
-    values: list[str] = []
-    for key in ("title", "summary", "description", "content"):
-        value = str(card.get(key) or "").strip()
-        if value and value not in values:
-            values.append(value)
-    return "".join(re.findall(r"[\w]", " ".join(values).lower(), flags=re.UNICODE))
-
-
-def _dream_has_substantive_increment(old_card: dict, result: dict) -> bool:
-    """Keep the deterministic 1:1 anti-churn fence used by the V2 lane."""
-
-    old_text = _dream_semantic_text(old_card)
-    new_text = _dream_semantic_text(result)
-    if not old_text or not new_text:
-        return False
-    min_growth = max(24, (len(old_text) * 15 + 99) // 100)
-    if len(new_text) < len(old_text) + min_growth:
-        return False
-    old_grams = {old_text[index : index + 3] for index in range(max(0, len(old_text) - 2))}
-    new_grams = {new_text[index : index + 3] for index in range(max(0, len(new_text) - 2))}
-    min_novel = max(6, (len(old_grams) * 10 + 99) // 100)
-    return len(new_grams - old_grams) >= min_novel
-
-
-def _dream_review_consolidations(
-    consolidations: list[dict],
-    *,
-    card_map: dict[str, dict],
-    job_id: str,
-) -> list[dict]:
-    """Run one isolated V1 agent review per Dream proposal, fail-closed."""
-
-    approved: list[dict] = []
-    for index, row in enumerate(consolidations):
-        if not isinstance(row, dict):
-            continue
-        rationale = str(row.get("rationale") or "").strip()
-        card_ids = list(
-            dict.fromkeys(
-                str(memory_id or "").strip()
-                for memory_id in (row.get("card_ids") or [])
-                if str(memory_id or "").strip()
-            )
-        )
-        source_cards = [card_map.get(memory_id) for memory_id in card_ids]
-        if not rationale or not card_ids or any(card is None for card in source_cards):
-            log.warning(
-                "dream semantic review skipped invalid proposal id=%s index=%d",
-                job_id,
-                index,
-            )
-            continue
-        try:
-            prompt = build_dream_review_prompt(
-                consolidation=row,
-                source_cards=[card for card in source_cards if card is not None],
-            )
-            raw = call_agent(
-                prompt,
-                raw_text=True,
-                trace_id=f"dream-review:{job_id}:{index}",
-                lane="background",
-                isolated_session=True,
-            )
-            _note_agent_turn_success()
-            review, error = parse_dream_review(_capture_agent_reply_text(raw))
-        except Exception as exc:  # noqa: BLE001 — reject this proposal, keep reviewing
-            log.warning(
-                "dream semantic review failed id=%s index=%d code=%s",
-                job_id,
-                index,
-                type(exc).__name__,
-            )
-            continue
-        if error or not isinstance(review, dict) or review.get("approved") is not True:
-            log.warning(
-                "dream semantic review rejected id=%s index=%d code=%s",
-                job_id,
-                index,
-                str(error or "review_no")[:120],
-            )
-            continue
-        accepted = dict(row)
-        accepted["_review_approved"] = True
-        accepted["_review_reason"] = str(review.get("reason") or "")[:1000]
-        approved.append(accepted)
-    return approved
 
 
 def _process_dream_jobs(jobs: list) -> float:
@@ -12439,10 +12371,15 @@ def _process_dream_jobs(jobs: list) -> float:
             cards=cards_text,
             recent_conversations=recent_text,
         )
+        # known_ids = 喂进 prompt 的那批卡的 id:result 字段里出现任何一个即
+        # 「把整理注记当成内容」(usr_a40e 墓碑卡),与内容闸同路打回重问。
+        dream_known_ids = frozenset(card_map)
         try:
             (consolidations, questions, err), bounce = _memory_agent_parse_with_bounce(
                 prompt,
-                parse=parse_dream_consolidations,
+                parse=lambda raw, strict=True: parse_dream_consolidations(
+                    raw, strict=strict, known_ids=dream_known_ids
+                ),
                 build_retry_prompt=build_dream_retry_prompt,
                 lane="dream",
                 job_id=job_id,
@@ -12507,29 +12444,9 @@ def _process_dream_jobs(jobs: list) -> float:
             )
             log.info("dream job completed noop id=%s questions=%d", job_id, len(questions))
             continue
-        consolidations = _dream_review_consolidations(
-            consolidations,
-            card_map=card_map,
-            job_id=job_id,
-        )
-        if not consolidations:
-            update_proactive_job_status(
-                job_id,
-                "completed",
-                "dream_semantic_review_rejected",
-                extra={
-                    "dream_result": {
-                        "status": "noop",
-                        "reason": "dream_semantic_review_rejected",
-                        "job_kind": "memory_dream",
-                    },
-                    "cards_merged": 0,
-                    "cards_superseded": 0,
-                    "questions": questions,
-                    "noop_reason": "dream_semantic_review_rejected",
-                },
-            )
-            continue
+        # 2026-08-05 复盘拆掉了这里的逐提案语义审查(弱模型自审自查既误放也
+        # 误杀,每条提案还多烧一次调用)。出口防线现在全部是确定性的:parse 层
+        # 的内容闸+卡id泄漏闸、mapper 的结构判据、爆炸半径保险丝。
         try:
             occurred_at = _format_message_time(time.time())
             (
@@ -12616,11 +12533,15 @@ def _process_dream_jobs(jobs: list) -> float:
                 else "dream_memory_actions_applied"
             ),
             extra={
+                # content_gate 与 proposals/applied 构成 dream funnel 刻度:
+                # 阀门到底吃掉了多少提案,靠这几个数说话,不再是玄学。
+                "content_gate": bounce or None,
                 "dream_result": {
                     "status": observation["status"],
                     "job_kind": "memory_dream",
                     "consolidations": len(consolidations),
                     "actions": len(actions),
+                    "active_cards": len(card_map),
                     "questions": len(questions),
                     "cards_thickened": cards_thickened,
                     "organized_count": organized_count,
@@ -15197,7 +15118,14 @@ def _resident_derive_identity(document: str, job_id: str) -> dict | None:
     existing = _resident_existing_identity()
     prompt = _dp.build_resident_identity_prompt(document, existing_identity=existing or None)
     for attempt in (1, 2):
-        raw = str(_capture_agent_reply_text(call_agent(prompt, raw_text=True, trace_id=job_id)) or "").strip()
+        # isolated_session: derive in a clean context, like the vision probe and
+        # dream review. Sharing the resumed chat session made surrounding chat
+        # bleed into the derivation (schema drift: invented fields) and made a
+        # second redistill in the same session get refused as a "duplicate
+        # request" in prose instead of JSON (resident report 2026-08-05).
+        raw = str(_capture_agent_reply_text(call_agent(
+            prompt, raw_text=True, trace_id=job_id, isolated_session=True,
+        )) or "").strip()
         payload = _dp.parse_identity_payload(raw)
         if payload is not None:
             incremental = _resident_incremental_payload(payload, existing)

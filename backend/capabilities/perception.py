@@ -30,6 +30,18 @@ def snapshot(store, *, api_key=None, runtime_token=None, params=None) -> Capabil
                  store=store, signals_raw=_csv(params.get("signals")))
 
 
+def recent_apps(store, *, api_key=None, runtime_token=None, params=None) -> CapabilityResult:
+    """Return the permission-gated merged app open/close trajectory."""
+    params = params or {}
+    return _wrap(
+        perception_core.recent_apps_payload,
+        default_msg="recent app activity unavailable",
+        store=store,
+        limit_raw=params.get("limit"),
+        hours_raw=params.get("hours"),
+    )
+
+
 def trend(store, *, api_key=None, runtime_token=None, params=None) -> CapabilityResult:
     params = params or {}
     return _wrap(perception_core.perception_trend_payload,

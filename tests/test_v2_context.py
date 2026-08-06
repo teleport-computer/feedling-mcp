@@ -5,6 +5,7 @@ import sys
 from datetime import datetime, timezone
 sys.path.insert(0, str(pathlib.Path(__file__).parent.parent / "backend"))
 from model_api_runtime.v2 import context, worker
+import worldbook_readside_core
 
 def test_build_turn_messages_orders_persona_summary_tail():
     tail = [
@@ -117,6 +118,157 @@ def test_summary_prompt_injection_never_gets_system_role():
 def test_build_turn_messages_no_summary_skips_summary_block():
     msgs = context.build_turn_messages(system_prompt="SYS", summary="", tail=[{"id":"1","ts":1.0,"role":"user","content":"hi"}])
     assert [m["role"] for m in msgs] == ["system","user"]
+
+
+def _worldbook_entry(
+    entry_id: str,
+    *,
+    name: str,
+    content: str,
+    keywords: list[str] | None = None,
+    always_on: bool = False,
+) -> dict:
+    return {
+        "id": entry_id,
+        "name": name,
+        "content": content,
+        "keywords": list(keywords or []),
+        "enabled": True,
+        "alwaysOn": always_on,
+    }
+
+
+def test_worldbook_match_is_a_standalone_untrusted_data_block():
+    entries = [
+        _worldbook_entry(
+            "moon",
+            name="Moon Court",
+            content="Luna is queen of the Moon Court.",
+            keywords=["luna"],
+        ),
+        _worldbook_entry(
+            "mars",
+            name="Mars Archive",
+            content="Mars is ruled by an archivist.",
+            keywords=["mars"],
+        ),
+    ]
+    matched = worldbook_readside_core.build_block(
+        entries,
+        [{"role": "user", "content": "Tell me about Luna"}],
+    )
+
+    messages = context.build_turn_messages(
+        system_prompt="TRUSTED SYSTEM",
+        summary="",
+        tail=[{"role": "user", "content": "Tell me about Luna"}],
+        worldbook_context=matched["block"],
+    )
+
+    assert matched["matched_names"] == ["Moon Court"]
+    assert len(messages) == 3
+    assert messages[1]["role"] == "user"
+    assert messages[1]["content"].startswith(
+        context.WORLD_BOOK_CONTEXT_HEADER + "\n"
+    )
+    assert "Luna is queen of the Moon Court." in messages[1]["content"]
+    assert "Mars is ruled by an archivist." not in messages[1]["content"]
+    assert messages[2] == {"role": "user", "content": "Tell me about Luna"}
+    assert "Luna is queen" not in messages[0]["content"]
+
+
+def test_worldbook_multiple_matches_keep_matcher_order():
+    entries = [
+        _worldbook_entry(
+            "always",
+            name="Constant",
+            content="The sky is violet.",
+            always_on=True,
+        ),
+        _worldbook_entry(
+            "keyword",
+            name="Harbor",
+            content="The harbor closes at dusk.",
+            keywords=["harbor"],
+        ),
+    ]
+
+    matched = worldbook_readside_core.build_block(
+        entries,
+        [{"role": "user", "content": "Walk to the harbor"}],
+    )
+
+    assert matched["matched_names"] == ["Constant", "Harbor"]
+    assert matched["block"].index("The sky is violet.") < matched["block"].index(
+        "The harbor closes at dusk."
+    )
+
+
+def test_worldbook_long_block_is_deterministically_truncated_with_marker():
+    raw = "<world_book>\n" + ("setting " * 5_000) + "\n</world_book>"
+    cap = 700
+
+    first = context.build_turn_messages(
+        system_prompt="S",
+        summary="",
+        tail=[{"role": "user", "content": "continue"}],
+        worldbook_context=raw,
+        worldbook_context_char_cap=cap,
+    )
+    second = context.build_turn_messages(
+        system_prompt="S",
+        summary="",
+        tail=[{"role": "user", "content": "continue"}],
+        worldbook_context=raw,
+        worldbook_context_char_cap=cap,
+    )
+
+    assert first == second
+    worldbook_message = first[1]
+    assert context.WORLD_BOOK_TRUNCATION_MARKER.strip() in worldbook_message["content"]
+    assert raw not in worldbook_message["content"]
+    assert len(worldbook_message["content"]) <= len(
+        context.WORLD_BOOK_CONTEXT_HEADER + "\n"
+    ) + cap
+
+
+def test_unmatched_or_unconfigured_worldbook_keeps_prompt_byte_identical():
+    kwargs = {
+        "system_prompt": "S",
+        "summary": "stable summary",
+        "tail": [{"role": "user", "content": "Tell me about Venus"}],
+    }
+    unmatched = worldbook_readside_core.build_block(
+        [
+            _worldbook_entry(
+                "mars",
+                name="Mars Archive",
+                content="Mars is red.",
+                keywords=["mars"],
+            )
+        ],
+        kwargs["tail"],
+    )
+
+    baseline = context.build_turn_messages(**kwargs)
+    with_unmatched = context.build_turn_messages(
+        **kwargs,
+        worldbook_context=unmatched["block"],
+    )
+    with_unconfigured = context.build_turn_messages(
+        **kwargs,
+        worldbook_context="",
+    )
+
+    assert unmatched["block"] == ""
+    assert baseline == with_unmatched == with_unconfigured
+    assert json.dumps(baseline, ensure_ascii=False, separators=(",", ":")).encode() == (
+        json.dumps(
+            with_unconfigured,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode()
+    )
 
 def test_build_turn_messages_appends_action_context_last():
     msgs = context.build_turn_messages(system_prompt="S", summary="", tail=[{"id":"1","ts":1.0,"role":"user","content":"q"}], action_context="TOOLS: x")
@@ -378,6 +530,39 @@ def test_temporal_context_invalid_timezone_falls_back_to_china_default():
     )
     assert temporal["timezone"] == "Asia/Shanghai"
     assert temporal["timezone"] == context.DEFAULT_TIMEZONE
+
+
+def test_wake_temporal_context_includes_social_attention_facts():
+    now = datetime(2026, 7, 26, 12, 0, tzinfo=timezone.utc).timestamp()
+    temporal = context.build_temporal_context(
+        now_ts=now,
+        timezone_name="Asia/Shanghai",
+        last_user_message_ts=now - 120,
+        tail=[
+            {"role": "user", "content": "hi", "ts": now - 120},
+            {"role": "assistant", "content": "hey", "ts": now - 30},
+        ],
+        visible_proactive_count_24h=7,
+        last_visible_proactive_message_ts=now - 30,
+    )
+
+    assert temporal["attention_facts"] == {
+        "last_message_age_sec": 30,
+        "last_user_message_age_sec": 120,
+        "last_visible_proactive_age_sec": 30,
+        "tail_freshness": "fresh",
+        "tail_included_messages": 2,
+        "visible_proactive_count_24h": 7,
+    }
+
+    stale = context.build_temporal_context(
+        now_ts=now,
+        timezone_name="Asia/Shanghai",
+        last_user_message_ts=now - 30_000,
+        tail=[{"role": "user", "content": "old", "ts": now - 30_000}],
+        visible_proactive_count_24h=0,
+    )
+    assert stale["attention_facts"]["tail_freshness"] == "stale"
 
 
 def test_temporal_context_unknown_timezone_defaults_to_china_not_utc():

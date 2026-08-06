@@ -32,6 +32,21 @@ def test_snapshot_maps_agent_route_error(monkeypatch):
     assert r.error["retryable"] is False
 
 
+def test_recent_apps_threads_limit_and_hours_to_shared_payload(monkeypatch):
+    seen = {}
+
+    def fake(store, *, limit_raw, hours_raw):
+        seen.update(store=store, limit=limit_raw, hours=hours_raw)
+        return {"ok": True, "apps": [{"app": "Maps"}], "count": 1}
+
+    monkeypatch.setattr(perception_core, "recent_apps_payload", fake)
+    result = cap_perc.recent_apps("STORE", params={"limit": 7, "hours": 2.5})
+
+    assert result.ok is True
+    assert result.data["apps"] == [{"app": "Maps"}]
+    assert seen == {"store": "STORE", "limit": 7, "hours": 2.5}
+
+
 def test_trend_threads_params(monkeypatch):
     seen = {}
     def fake(store, *, signal_raw, field_raw, days_raw):

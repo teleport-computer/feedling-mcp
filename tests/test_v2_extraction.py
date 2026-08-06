@@ -6,6 +6,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
 import pytest
 
+from memory.dream_prompt_v1 import build_dream_prompt
 from model_api_runtime.v2 import extraction, worker
 
 
@@ -499,14 +500,12 @@ def _merge(ids, *, content="合并后的正文包含两张旧卡的全部具体�
     return {
         "op": "merge",
         "card_ids": list(ids),
-        "rationale": "独立二审确认属于同一事件或同一线索的演进",
-        "_review_approved": True,
-        "_review_reason": "来源卡属于同一事件线索",
+        "rationale": "同一事件或同一线索的演进",
         "result": {"summary": "合并摘要", "content": content},
     }
 
 
-def test_dream_guard_has_no_quantity_cap_after_independent_review():
+def test_dream_guard_has_no_quantity_cap():
     cards = [_existing(f"m{i}") for i in range(13)]
     consolidations = [_merge([f"m{i}", f"m{i + 1}"]) for i in range(0, 12, 2)]
 
@@ -544,32 +543,14 @@ def test_dream_guard_rejects_unknown_and_overlapping_targets():
     assert superseded == 2
 
 
-def test_dream_guard_rejects_lossy_one_to_one_rewrite():
+def test_dream_one_to_one_rewrite_is_not_content_judged():
+    # 2026-08-05 复盘:15% 增量栅栏(内容质量判断)已拆除。一次「更精炼但更准」
+    # 的 1:1 改写是合法整理,mapper 不再评判文本长没长、够不够新。
     card = _existing("m1")
     actions, added, superseded = extraction.consolidations_to_actions(
         [{"op": "thicken", "card_ids": ["m1"],
-          "rationale": "同一卡片补充细节", "_review_approved": True, "result": {
-            "summary": "改写摘要", "content": "更短的改写。",
-        }}],
-        occurred_at="2026-08-01T00:00:00Z",
-        source_ids=[],
-        build_envelope=_env,
-        existing_cards=[card],
-    )
-
-    assert (actions, added, superseded) == ([], 0, 0)
-
-
-def test_dream_guard_accepts_one_to_one_only_with_substantive_increment():
-    card = _existing("m1")
-    new_detail = (
-        card["content"]
-        + " 新增事实：从 2026 年 7 月起固定使用浅烘豆，并记录了研磨刻度、水粉比和冲煮时长。"
-    )
-    actions, _added, superseded = extraction.consolidations_to_actions(
-        [{"op": "thicken", "card_ids": ["m1"],
-          "rationale": "同一卡片补充新的冲煮事实", "_review_approved": True, "result": {
-            "summary": card["summary"], "content": new_detail,
+          "rationale": "同一卡片改写得更准确", "result": {
+            "summary": "改写摘要", "content": "更短但更准的改写。",
         }}],
         occurred_at="2026-08-01T00:00:00Z",
         source_ids=[],
@@ -617,22 +598,32 @@ def test_dream_guard_accepts_low_text_overlap_evolution_after_review():
     assert len(actions) == 1 and superseded == 2
 
 
-def test_dream_guard_rejects_unreviewed_or_rationale_free_proposal():
+def test_dream_prompt_pairs_evolution_example_with_independent_health_example():
+    prompt = build_dream_prompt(
+        ai_name="小柒",
+        user_name="阿霖",
+        cards="[]",
+        recent_conversations="[]",
+    )
+
+    assert "想去京都看红叶" in prompt and "已经订了京都机票" in prompt
+    assert "坚持骑行" in prompt and "最近失眠" in prompt
+    assert "两件独立的事，不能合并" in prompt
+
+
+def test_dream_guard_rejects_rationale_free_proposal():
     cards = [_existing("m1"), _existing("m2")]
-    unreviewed = _merge(["m1", "m2"])
-    unreviewed.pop("_review_approved")
     no_rationale = _merge(["m1", "m2"])
     no_rationale["rationale"] = ""
 
-    for proposal in (unreviewed, no_rationale):
-        actions, added, superseded = extraction.consolidations_to_actions(
-            [proposal],
-            occurred_at="2026-08-03T00:00:00Z",
-            source_ids=[],
-            build_envelope=_env,
-            existing_cards=cards,
-        )
-        assert (actions, added, superseded) == ([], 0, 0)
+    actions, added, superseded = extraction.consolidations_to_actions(
+        [no_rationale],
+        occurred_at="2026-08-03T00:00:00Z",
+        source_ids=[],
+        build_envelope=_env,
+        existing_cards=cards,
+    )
+    assert (actions, added, superseded) == ([], 0, 0)
 
 
 def test_nonempty_actions_require_occurred_at():

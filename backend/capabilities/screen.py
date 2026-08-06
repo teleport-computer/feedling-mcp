@@ -1,6 +1,8 @@
 """Screen capabilities — facade over backend/screen/screen_read_core.py."""
 from __future__ import annotations
 
+import base64
+
 from screen import screen_read_core
 
 from capabilities import errors
@@ -39,4 +41,11 @@ def read(store, *, api_key=None, runtime_token=None, params=None) -> CapabilityR
     include_image = "true" if params.get("include_image") else "false"
     res = screen_read_core.frame_decrypt(store, frame_id, include_image=include_image,
                                          api_key=api_key, runtime_token=runtime_token)
+    if res.status == 200 and params.get("include_image") and res.raw_body is not None:
+        return ok(data={
+            "frame_id": str(frame_id),
+            "media_type": res.media_type,
+            "has_image": True,
+            "image_b64": base64.b64encode(res.raw_body).decode("ascii"),
+        })
     return _norm(res, default_msg="screen read unavailable")

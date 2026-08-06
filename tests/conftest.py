@@ -198,6 +198,8 @@ if not _provisioned:
         # 留在可收集列表里，否则连它也会被忽略。
         "test_tee_registry_guard_enforced.py",
         "test_self_thinking_parse.py",
+        # Voice hangup summary prompt builder. Pure — no DB.
+        "test_voice_summary.py",
     }
     collect_ignore = sorted(
         f
@@ -365,6 +367,29 @@ def _reset_enclave_http_client():
     core_enclave.reset_http_client()
     yield
     core_enclave.reset_http_client()
+
+
+@pytest.fixture(autouse=True)
+def _reset_admin_page_cache():
+    """Clear admin_core's 60s page-html TTL cache between tests.
+
+    The cache is module-level state keyed on a sha256 digest of the
+    canonical (first-value-wins) query params **including** ``admin_key``,
+    so within one pytest process a page built (or monkeypatched) by an
+    earlier test would otherwise be served to a later test hitting the same
+    effective key — with the cache note appended and the later test's
+    builders never running. Clearing between tests keeps the cache's
+    production semantics (TTL, single-flight, stale-on-error) fully
+    testable inside a single test.
+    """
+    yield
+    mod = sys.modules.get("admin.admin_core")
+    if mod is None:
+        return
+    with mod._page_cache_lock:
+        mod._page_cache.clear()
+        mod._page_cache_builds.clear()
+        mod._page_cache_last_failure.clear()
 
 
 @pytest.fixture(autouse=True)

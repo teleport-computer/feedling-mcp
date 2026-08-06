@@ -217,6 +217,63 @@ def test_production_deps_wire_workspace_prompt_loader():
     )
 
 
+def test_workspace_prompt_jit_injects_complete_genesis_persona(monkeypatch):
+    persona_versions = [
+        "# Persona\n" + ("voice line\n" * 300),
+        "# Persona v2\nnew voice",
+    ]
+    decrypt_calls = []
+
+    monkeypatch.setattr(
+        serve_worker.db,
+        "get_blob",
+        lambda user_id, name: {
+            "content_envelope": {"body_ct": "ciphertext", "version": len(decrypt_calls)}
+        },
+    )
+    monkeypatch.setattr(
+        serve_worker.core_enclave,
+        "_decrypt_envelope_via_enclave",
+        lambda envelope, api_key, *, purpose, runtime_token: (
+            decrypt_calls.append((envelope, api_key, purpose, runtime_token))
+            or persona_versions[len(decrypt_calls) - 1].encode("utf-8")
+        ),
+    )
+    monkeypatch.setattr(
+        serve_worker,
+        "production_workspace_backend",
+        lambda *_args, **_kwargs: InMemoryWorkspaceBackend(),
+    )
+
+    store = SimpleNamespace(user_id="u-persona")
+    first = serve_worker._load_workspace_prompt(store, runtime_token="rt-1")
+    second = serve_worker._load_workspace_prompt(store, runtime_token="rt-2")
+
+    assert first["trusted_system_blocks"][0] == persona_versions[0].strip()
+    assert len(first["trusted_system_blocks"][0]) > 2_000
+    assert second["trusted_system_blocks"][0] == persona_versions[1].strip()
+    assert [call[2:] for call in decrypt_calls] == [
+        ("genesis_persona", "rt-1"),
+        ("genesis_persona", "rt-2"),
+    ]
+
+
+def test_workspace_prompt_without_genesis_persona_keeps_existing_shape(monkeypatch):
+    monkeypatch.setattr(serve_worker.db, "get_blob", lambda *_args: None)
+    monkeypatch.setattr(
+        serve_worker,
+        "production_workspace_backend",
+        lambda *_args, **_kwargs: InMemoryWorkspaceBackend(),
+    )
+
+    rendered = serve_worker._load_workspace_prompt(
+        SimpleNamespace(user_id="u-no-persona"),
+        runtime_token="rt",
+    )
+
+    assert rendered == {"trusted_system_blocks": (), "working_memory": ""}
+
+
 def test_sandbox_is_lazy_and_artifact_ingest_never_uses_host_filesystem():
     backend = InMemoryWorkspaceBackend()
     provider = MemoryTestSandboxProvider()

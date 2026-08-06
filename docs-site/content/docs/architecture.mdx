@@ -178,9 +178,23 @@ account's chat route, provider URL, or credential.
    through the same resident or Hosted Runtime V2 path used by typed messages,
    including the same conversation history, persona, memory, and tools.
 4. Assistant text streams back over an OpenAI-compatible SSE response for
-   ElevenLabs to synthesize. The user and assistant turns remain in ordinary
-   Chat history in their original order, so the call is not imported a second
-   time after hang-up.
+   ElevenLabs to synthesize. During the call the user and assistant turns are
+   persisted as ordinary Chat rows in their original order.
+5. At hang-up the client posts the call transcript to
+   `POST /v1/voice/finalize`. The user's own model writes ONE
+   `voice_call_summary` chat message (deterministic id, idempotent retries),
+   and only after that summary is durable are the call's per-turn rows
+   deleted — so the raw back-and-forth stops occupying chat history and model
+   context, and memory capture distils from the summary instead of the
+   fragments. Rows already folded into the Runtime V2 conversation summary are
+   retained (deleting them would desync compaction's frozen ledger); they no
+   longer feed future context reads. If the summary cannot be generated or
+   persisted, nothing is deleted and the client may retry. Transcript trust
+   boundary: the transcript is client-supplied plaintext (chat rows are
+   ciphertext the server cannot read); an authenticated user can therefore
+   only shape their own summary and delete their own call rows. Known
+   limitation: a resident (self-hosted) runtime's persistent agent session may
+   still remember in-call content until its session naturally rotates.
 
 Deployment prerequisite: the API service must set
 `FEEDLING_VOICE_GATEWAY_PUBLIC_URL` to the externally reachable HTTPS origin

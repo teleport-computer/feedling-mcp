@@ -2313,6 +2313,91 @@ def test_prepare_claude_cli_injects_stored_resume(monkeypatch):
     assert stdin_msg == "hello"
 
 
+# --------------------------------------------------------------------------- #
+# Isolated-session driver matrix (resident report 2026-08-05). These pin the
+# PRODUCT (the argv actually handed to the driver), not the intent flag: the
+# earlier tests asserted only that isolated_session=True was passed to a mocked
+# call_agent, which let a claude command that could never run ship green.
+# claude's --print --resume accepts only a real UUID it generated itself (or an
+# existing session title), so the consumer-minted bounded label must never be
+# fed back to claude — a bare `claude --print` IS the fresh session. pi and
+# Hermes accept arbitrary ids and keep using the minted override.
+# --------------------------------------------------------------------------- #
+
+def _fail_session_store_reads(monkeypatch):
+    def _boom():  # isolated turns must never touch the shared session store
+        raise AssertionError("isolated turn read the shared session store")
+    monkeypatch.setattr(crc, "_load_agent_session_id", _boom)
+    monkeypatch.setattr(
+        crc, "_save_agent_session_id",
+        lambda sid: (_ for _ in ()).throw(
+            AssertionError("isolated turn wrote the shared session store")),
+    )
+
+
+def test_prepare_claude_cli_isolated_session_gets_no_session_flags(monkeypatch):
+    monkeypatch.setattr(crc, "AGENT_CLI_CMD", 'claude -p "{message}"')
+    monkeypatch.setattr(crc, "FOREGROUND_CHAT_CONTEXT_MODE", "off")
+    monkeypatch.setattr(crc, "_resolve_cli_executable", lambda cmd: cmd)
+    _fail_session_store_reads(monkeypatch)
+
+    cmd, stdin_msg = crc._prepare_cli_command(
+        "hello", session_id_override=crc._new_agent_session_id()
+    )
+
+    assert "--resume" not in cmd          # the exact first-turn crash
+    assert "--session-id" not in cmd      # bare --print = fresh session
+    assert "--print" in cmd or "-p" in cmd
+    assert stdin_msg == "hello"
+
+
+def test_prepare_claude_cli_isolated_session_template_session_id_becomes_uuid(monkeypatch):
+    import uuid as _uuid
+    monkeypatch.setattr(
+        crc, "AGENT_CLI_CMD",
+        'claude -p --session-id feedling-io-fixed "{message}"',
+    )
+    monkeypatch.setattr(crc, "FOREGROUND_CHAT_CONTEXT_MODE", "off")
+    monkeypatch.setattr(crc, "_resolve_cli_executable", lambda cmd: cmd)
+    _fail_session_store_reads(monkeypatch)
+
+    cmd, _ = crc._prepare_cli_command(
+        "hello", session_id_override=crc._new_agent_session_id()
+    )
+
+    assert "--resume" not in cmd
+    sid_value = crc._cli_flag_value(cmd, "--session-id")
+    _uuid.UUID(sid_value)  # claude rejects anything that isn't a real UUID
+
+
+def test_prepare_pi_cli_isolated_session_keeps_minted_override(monkeypatch):
+    monkeypatch.setattr(crc, "AGENT_CLI_CMD", 'pi --mode json "{message}"')
+    monkeypatch.setattr(crc, "_resolve_cli_executable", lambda cmd: cmd)
+    _fail_session_store_reads(monkeypatch)
+
+    override = crc._new_agent_session_id()
+    cmd, _ = crc._prepare_cli_command("hello", session_id_override=override)
+
+    # pi --session-id is create-if-missing: the minted label is valid there,
+    # and it must NOT be persisted as the shared session (store write raises).
+    assert crc._cli_flag_value(cmd, "--session-id") == override
+    assert "--resume" not in cmd
+
+
+def test_prepare_claude_cli_shared_session_still_resumes(monkeypatch):
+    # Regression net for the fix: the SHARED path (no override) keeps claude's
+    # stored-UUID --resume continuity byte-identical to before.
+    sid = "123e4567-e89b-12d3-a456-426614174000"
+    monkeypatch.setattr(crc, "AGENT_CLI_CMD", 'claude -p "{message}"')
+    monkeypatch.setattr(crc, "FOREGROUND_CHAT_CONTEXT_MODE", "off")
+    monkeypatch.setattr(crc, "_load_agent_session_id", lambda: sid)
+    monkeypatch.setattr(crc, "_resolve_cli_executable", lambda cmd: cmd)
+
+    cmd, _ = crc._prepare_cli_command("hello")
+
+    assert cmd[:3] == ["claude", "--resume", sid]
+
+
 def test_warn_if_hermes_cli_may_drift_logs_profile_and_turns(monkeypatch, caplog):
     monkeypatch.setattr(crc, "AGENT_MODE", "cli")
     monkeypatch.setattr(
@@ -3176,8 +3261,6 @@ def _install_dream_job_harness(monkeypatch, agent_reply):
 
     def _agent(prompt, *_args, **_kwargs):
         captured["prompts"].append(prompt)
-        if "独立的记忆整理审查员" in prompt:
-            return '{"decision":"yes","reason":"来源卡属于同一条连续线索"}'
         return agent_reply
 
     def _fail_post(*_args, **_kwargs):
@@ -3254,57 +3337,81 @@ def _dream_final_status(captured):
     return captured["statuses"][-1]
 
 
-def test_v1_dream_semantic_review_is_isolated_and_rejects_no(monkeypatch):
-    calls = []
-
-    def _agent(prompt, **kwargs):
-        calls.append((prompt, kwargs))
-        return '{"decision":"no","reason":"只是同属健康主题"}'
-
-    monkeypatch.setattr(crc, "call_agent", _agent)
-    reviewed = crc._dream_review_consolidations(
-        [{
-            "op": "merge",
-            "card_ids": ["cycling", "sleep"],
-            "rationale": "都和健康有关",
-            "result": {"summary": "健康", "content": "骑行与失眠。"},
-        }],
-        card_map={
-            "cycling": {"id": "cycling", "content": "周末沿江骑行。"},
-            "sleep": {"id": "sleep", "content": "失眠时听白噪音。"},
+def _patch_dream_envelope(monkeypatch):
+    monkeypatch.setattr(crc, "_ENCRYPTION_AVAILABLE", True)
+    monkeypatch.setattr(crc, "_refresh_whoami_for_encrypted_reply", lambda: True)
+    monkeypatch.setattr(
+        crc,
+        "_whoami_cache",
+        {"user_id": "usr_dream", "user_pk": b"u" * 32, "enclave_pk": b"e" * 32},
+    )
+    monkeypatch.setattr(
+        crc,
+        "_build_envelope",
+        lambda **kwargs: {
+            "v": 1, "id": "env", "visibility": kwargs["visibility"],
+            "owner_user_id": kwargs["owner_user_id"],
+            "body_ct": "ct", "nonce": "n", "K_user": "ku", "K_enclave": "ke",
         },
-        job_id="dream-review-v1",
     )
 
-    assert reviewed == []
-    assert calls[0][1]["isolated_session"] is True
-    assert calls[0][1]["raw_text"] is True
 
-
-def test_v1_dream_semantic_review_failure_drops_one_and_continues(monkeypatch):
-    responses = iter([
-        RuntimeError("provider timeout"),
-        '{"decision":"yes","reason":"同一京都计划的演进"}',
-    ])
-
-    def _agent(*_args, **_kwargs):
-        response = next(responses)
-        if isinstance(response, Exception):
-            raise response
-        return response
-
-    monkeypatch.setattr(crc, "call_agent", _agent)
-    reviewed = crc._dream_review_consolidations(
-        [
-            {"op": "merge", "card_ids": ["a", "b"], "rationale": "第一条", "result": {}},
-            {"op": "merge", "card_ids": ["c", "d"], "rationale": "第二条", "result": {}},
-        ],
-        card_map={key: {"id": key, "content": key} for key in ("a", "b", "c", "d")},
-        job_id="dream-review-v1-continue",
+def test_v1_dream_actions_reject_unknown_and_duplicate_targets(monkeypatch):
+    _patch_dream_envelope(monkeypatch)
+    """2026-08-05 阀门重构:语义审查员已拆;结构判据(目标真实存在、不重复退休)
+    落进 _dream_actions_from_consolidations,与 V2 mapper 同一套。"""
+    card_map = {
+        "m1": {"id": "m1", "content": "旧卡一"},
+        "m2": {"id": "m2", "content": "旧卡二"},
+        "m3": {"id": "m3", "content": "旧卡三"},
+    }
+    rows = [
+        {"op": "merge", "card_ids": ["m1", "m2"], "rationale": "同一线索",
+         "result": {"summary": "合并", "content": "合并正文。"}},
+        {"op": "merge", "card_ids": ["m2", "m3"], "rationale": "重复退休 m2",
+         "result": {"summary": "合并", "content": "合并正文。"}},
+        {"op": "merge", "card_ids": ["missing", "m3"], "rationale": "目标不存在",
+         "result": {"summary": "合并", "content": "合并正文。"}},
+    ]
+    actions, *_rest = crc._dream_actions_from_consolidations(
+        rows, card_map=card_map, occurred_at="2026-08-05T00:00:00Z",
     )
+    assert [a["supersedes"] for a in actions] == [["m1", "m2"]]
+    assert "dream_review_reason" not in actions[0]
 
-    assert [row["card_ids"] for row in reviewed] == [["c", "d"]]
-    assert reviewed[0]["_review_reason"] == "同一京都计划的演进"
+
+def test_v1_dream_one_to_one_rewrite_is_not_content_judged(monkeypatch):
+    _patch_dream_envelope(monkeypatch)
+    # 15% 增量栅栏已拆:更短但更准的 1:1 改写是合法整理。
+    card_map = {"m1": {"id": "m1", "content": "很长很长的旧卡正文,包含大量细节描述。" * 3}}
+    actions, *_rest = crc._dream_actions_from_consolidations(
+        [{"op": "supersede", "card_ids": ["m1"], "rationale": "改写得更准",
+          "result": {"summary": "精炼摘要", "content": "更短但更准。"}}],
+        card_map=card_map, occurred_at="2026-08-05T00:00:00Z",
+    )
+    assert len(actions) == 1
+
+
+def test_v1_dream_blast_radius_fuse_trips_on_garden_scale_rewrite(monkeypatch):
+    _patch_dream_envelope(monkeypatch)
+    card_map = {f"m{i}": {"id": f"m{i}", "content": f"卡{i}"} for i in range(15)}
+    rows = [
+        {"op": "merge", "card_ids": [f"m{i}", f"m{i + 1}"], "rationale": "同一线索",
+         "result": {"summary": "合并", "content": "合并正文。"}}
+        for i in range(0, 12, 2)
+    ] + [
+        {"op": "supersede", "card_ids": ["m12"], "rationale": "更新",
+         "result": {"summary": "更新", "content": "更新正文。"}},
+    ]
+    with pytest.raises(ValueError, match="dream_blast_radius_exceeded"):
+        crc._dream_actions_from_consolidations(
+            rows, card_map=card_map, occurred_at="2026-08-05T00:00:00Z",
+        )
+    # 13/15=87%>80% 且 ≥10 张 → 熔断;退休 4 张(<10 下限)则永不熔断
+    actions, *_rest = crc._dream_actions_from_consolidations(
+        rows[:2], card_map=card_map, occurred_at="2026-08-05T00:00:00Z",
+    )
+    assert len(actions) == 2
 
 
 def test_capture_get_json_disables_tls_verification_for_enclave_only(monkeypatch):
