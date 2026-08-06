@@ -300,6 +300,7 @@ async def finalize_voice_call(
     """
     from core import store as core_store
     from voice import summary as voice_summary
+    from voice import transcript_memory as voice_transcript_memory
 
     payload = (await asgi_http.read_json_silent(request)) or {}
     if not isinstance(payload, dict):
@@ -354,7 +355,35 @@ async def finalize_voice_call(
             ]
         store.notify_chat_waiters()
         wake_bus.notify("chat", user_id)
-        voice_summary.nudge_capture(store)
+        # Memory: distil from the FULL transcript (same capture machinery, run
+        # directly over the client-supplied turns), not from the summary. Only
+        # on the fresh path — a replay's first attempt already ran it, and
+        # re-running capture on retry would double-write cards. Known corner:
+        # a first attempt that persisted the summary but 502'd on cleanup
+        # replays here WITHOUT transcript capture; the summary-window nudge
+        # below is the backstop so that call's memory is degraded, not lost.
+        # Memory never fails the request — summary/cleanup define the HTTP
+        # result exactly as before.
+        memory_mode = "skipped"
+        if not already:
+            captured = False
+            try:
+                captured = voice_transcript_memory.capture_from_transcript(
+                    store, turns, call_id=call_id
+                )
+            except Exception as exc:  # noqa: BLE001 — memory is best-effort
+                log.warning(
+                    "[voice.finalize] transcript capture failed user=%s "
+                    "call=%s: %s",
+                    user_id[:12], call_id[:24], str(exc)[:160],
+                )
+            memory_mode = "transcript" if captured else "fallback"
+        if memory_mode != "transcript":
+            voice_summary.nudge_capture(store)
+        log.info(
+            "[voice.finalize] memory=%s user=%s call=%s replay=%s",
+            memory_mode, user_id[:12], call_id[:24], already,
+        )
         return {
             "status": "finalized",
             "summary_message_id": mid,
