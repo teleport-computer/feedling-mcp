@@ -47,6 +47,62 @@
 
 ## 记录正文（最新的在上面）
 
+## 2026-08-06 — Admin dashboard IA v2：首页 + 导航 13→4 + 统一漏斗
+
+**[DONE] /admin/data-track 默认页改为「首页」：判定条 + 用户队列 + 产品脉搏 + 事件流 + 成本行；导航收敛为 首页/产品健康/用户/诊断 四项。**
+
+- 设计原则落地：频率决定层级（每天看的在首屏零点击，出事才看的 11 个
+  诊断页收进 `view=diag` 枢纽 + 二级行，旧 URL 全部不变）；名单强于比率
+  （「需要你的用户」直接列出 有去无回/onboarding 卡住/模型配置待处理 的
+  具体用户行，封顶 20 + truncated 标记；resident 掉线检测因在内存态、
+  页面如实标注缺口）；无趋势不成信息（脉搏卡全部带 7 日 sparkline）。
+- 状态条四灯：系统 = 既有三把 `_ops_*_level` 尺子取最差（bad>warn>
+  unknown>ok，合成在 admin_core——db 不许 import data_track）；增长 =
+  WAU 环比（带 min-n 护栏，小分母不告警）；成本 = token 3× 中位数跑飞
+  检测；数据完整性 = **永远灰**直到 ACK/session 来源缺口闭合。
+- 统一漏斗 `admin_funnel_snapshot`：注册→已连接→内容就绪→首次真回复→
+  W1 仍活跃，严格单调、28 天窗口带前窗对照、W1 未成熟显 None；首页迷你
+  版 + 用户页完整版（带逐级掉落与前窗），替换掉用户页原来那组**不单调
+  的独立行为百分比条**（原数据保留在折叠的人群记账 details 里）。
+- 新 JSON 端点 `GET /v1/admin/data-track/verdicts`（admin 鉴权同级、不进
+  页面缓存）：给 agent 读的判定 + 队列 + 脉搏，与页面同一套 builder。
+- 两轮对抗审查修复 10 处（3 major：主动消息把"有去无回"误清；成本判定
+  绿灯却给"可判定天数不足"理由；激活率标题渲染进行中周为定数。7 minor
+  含 min-n 护栏、成熟死 cohort W1 显 0 不显 —、非有限数崩页、孤儿 CSS、
+  user_id 转义口径统一等）。种子舰队端到端验证（412 账号）：首页冷构
+  ~25ms vs 用户页 ~100ms（本地）。测试 296 通过；`test_asgi_admin` 两个
+  parity 失败为存量（cache-note vs 旧断言，已另立任务）。
+
+## 2026-08-05 — Dream 阀门重构：拆内容闸、只留确定性「明显不对」闸（V1/V2 同步）
+
+**[DECISION]+[DONE] usr_a40e 墓碑卡事故复盘，Seven 定产品哲学：出口只拦「明显不对」，绝不判内容质量、绝不拒绝内容上的可能性。**
+
+- 现场：deepseek-v4-pro 把 dream supersede 语义理解反，把「已被 <卡id> 取代——原文」
+  记账注记写进新卡 summary/content；占位符闸（实义文字，过）、语义审查员（同一弱模型
+  自审自查，放行）、15% 增量栅栏（多卡合并绕过）三道防线全没拦住，花园展示出墓碑卡。
+- **拆**（两条 lane 同步，V1 consumer + V2 extraction/worker）：
+  - 15% 增量栅栏（`_has_substantive_increment` 两份拷贝）——内容质量判断，
+    「更短但更准」的合法改写会被判死；
+  - 逐提案语义审查员（`_review_dream_consolidations` 两份实现 + review prompt/parser）
+    ——既误放（本次）也误杀（fail-closed 连审查调用挂了都毙提案），每条提案还多烧
+    一次用户 BYOK 调用。
+- **加**（共享一份，不再两处复制）：
+  - `memory/dream_gates.py`：卡 id 泄漏闸（result 硬字段含花园真实卡 id → 与内容闸
+    同路打回重问，零误伤）+ 爆炸半径保险丝（单晚退休 > 活跃卡 80% 且 ≥10 张 →
+    整个 job 失败不部分执行；env `FEEDLING_DREAM_FUSE_RATIO`/`FEEDLING_DREAM_FUSE_MIN_CARDS`）；
+  - `card_text.py` 墓碑短语闸（`已被/superseded by + ≥8位hex`，capture/dream 全 lane
+    兜底；裸「取代」散文不误伤）；
+  - dream prompt 红线补一句：result 写新卡内容本身、绝不出现卡 id（仅一句，
+    prompt 不膨胀——硬约束在出口代码里，见复盘讨论）。
+- **刻度**：`memory_lane_health` 增加 `failed_reasons`（按 `last_error` 细分，
+  「保险丝熔断」和「provider 挂」分开看）；V2 dream 记 `dream_funnel` trajectory
+  （proposals/applied/superseding）；V1 `dream_result` 增 `active_cards`+`content_gate`。
+- 测试：`test_dream_gates.py` 新增（含 **V1/V2 跨 lane 一致性锁**：同一份
+  consolidations 两条 lane 必须退休同一批卡）；lanes/integration/consumer 各测试
+  迁到新语义；673+ 相关用例全绿。
+- 待办：usr_a40e 花园复原（recover CLI 走 Actions，时间窗定位墓碑批次，dry-run
+  清单过目后 apply）——修复部署 prod 之后做，防止下一晚 dream 再产墓碑。
+
 ## 2026-08-04 — 新增 Admin「产品健康」view（留存/激活/强度/证据缺口）
 
 **[DONE] /admin/data-track?view=health：投资人级产品指标常态化进 dashboard，全部只用现库可证实的数。**

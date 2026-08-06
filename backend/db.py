@@ -3251,6 +3251,584 @@ def admin_product_health_proactive_reply_rate(
     return {"rows": out_rows}
 
 
+# --- 首页（view=home）数据层 ----------------------------------------------- #
+# 与产品健康页同一套错误约定：查询失败直接 RAISE，由 admin_core 捕获成
+# None，渲染层显示「暂不可用」——绝不吞错返回一个看起来像真数据的空结构。
+# 未成熟/未上报一律 None，None ≠ 0。所有查询有界（<=28d 或 <=8d），
+# 绝不做全舰队 per-user store 加载。
+
+
+_HOME_QUEUE_SEVERITY = {
+    # bad-first 排序：越小越糟。offline 在 v1 里不产出（resident 轮询状态
+    # 只活在进程内 registry，DB 侧看不见——渲染层的说明文案负责把这个缺口
+    # 讲老实），reason_code 仍保留在 contract 里给渲染层。
+    "stalled_no_reply": 0,
+    "onboarding_stuck": 1,
+    "model_config_pending": 2,
+}
+
+
+def admin_home_queue(*, tz: str = "Asia/Shanghai") -> dict:
+    """首页「需要你的用户」队列：谁此刻卡住了、为什么。
+
+    三个有界来源，全部单条 SQL、无全舰队 per-user 加载：
+      stalled_no_reply     72h 内 chat_messages 一次有界扫（该谓词无索引可用，
+                           与 proactive_reply_rate 同款接受有界 seq scan）：
+                           最后一条用户消息（source 排除 verify_ping/
+                           resident_maintenance）之后没有任何真回复，且该消息
+                           已 >30min（避免把正在进行的对话标成卡住）。「真回复」
+                           与 admin_ops_dashboard 的 real_replies 同一把尺：
+                           剔除 foreground_fallback/proactive_fallback，也剔除
+                           agent_initiated_proactive——主动消息不是「对用户的
+                           回复」，定时主动消息落下来不许把还在等回复的用户
+                           从队列里洗掉。
+      onboarding_stuck     admin_onboarding_funnel(registered_cutoff_ts=now-14d)
+                           （走它自己的 per-user 索引路径）里 t0 已 >24h、t3
+                           仍 None 的用户；funnel 返回 None（查询故障）时直接
+                           RAISE——故障不许伪装成「没人卡住」。注意 t3 沿用
+                           funnel 的既有口径（主动消息也算首次触达，可以点亮
+                           t3）——这是 onboarding 里程碑语义，故意与上面
+                           stalled 的「真回复」尺不同；一个用户可以 t3 已达
+                           但仍因 stalled_no_reply 在队列里。
+      model_config_pending user_blobs kind='model_api' 且 test_status 非 ok
+                           （PK (user_id,kind) 无法按 kind 单独索引，表小，
+                           有界小扫描），带上状态原文。
+
+    同一用户命中多个原因只保留最糟的一条（severity 见
+    ``_HOME_QUEUE_SEVERITY``）。排序 bad-first，再按 since_epoch 升序
+    （等得最久的最靠前，None 垫底）。封顶 20 行 + truncated 标记。
+    since_epoch=None 表示该原因没有可靠的起始时刻（不是 epoch 0）。
+    """
+    now = time.time()
+    window_e = now - 72 * 3600.0
+    stale_e = now - 1800.0
+    best: dict[str, dict] = {}
+
+    def offer(row: dict) -> None:
+        cur = best.get(row["user_id"])
+        if cur is None or (_HOME_QUEUE_SEVERITY[row["reason_code"]]
+                           < _HOME_QUEUE_SEVERITY[cur["reason_code"]]):
+            best[row["user_id"]] = row
+
+    with get_pool().connection() as conn:
+        stalled = conn.execute(
+            """
+            WITH lu AS (
+                SELECT user_id, MAX(ts) AS last_user_ts
+                FROM chat_messages
+                WHERE ts >= %s
+                  AND doc->>'role' IN ('user','human')
+                  AND COALESCE(doc->>'source','')
+                      NOT IN ('verify_ping','resident_maintenance')
+                GROUP BY user_id
+            )
+            SELECT lu.user_id, lu.last_user_ts
+            FROM lu
+            WHERE lu.last_user_ts <= %s
+              AND NOT EXISTS (
+                  SELECT 1 FROM chat_messages cm
+                  WHERE cm.user_id = lu.user_id
+                    AND cm.ts > lu.last_user_ts
+                    AND cm.doc->>'role' IN ('agent','openclaw')
+                    AND COALESCE(cm.doc->>'source','')
+                        NOT IN ('foreground_fallback','proactive_fallback',
+                                'agent_initiated_proactive')
+              )
+            ORDER BY lu.last_user_ts ASC
+            """,
+            (window_e, stale_e),
+        ).fetchall()
+        pending = conn.execute(
+            """
+            SELECT user_id,
+                   lower(COALESCE(NULLIF(doc->>'test_status',''),'(none)')) AS st
+            FROM user_blobs
+            WHERE kind = 'model_api'
+              AND lower(COALESCE(NULLIF(doc->>'test_status',''),'(none)')) <> 'ok'
+            """,
+        ).fetchall()
+    for uid, last_ts in stalled:
+        waited_h = (now - float(last_ts)) / 3600.0
+        offer({
+            "user_id": uid,
+            "reason_code": "stalled_no_reply",
+            "reason_text": "发了消息但没等到真回复",
+            "since_epoch": float(last_ts),
+            "detail": f"最后一条用户消息已等待 {waited_h:.1f} 小时，未见真回复（fallback/主动消息不算）",
+        })
+    funnel = admin_onboarding_funnel(registered_cutoff_ts=now - 14 * 86400.0)
+    if funnel is None:
+        raise RuntimeError("admin_onboarding_funnel unavailable (home queue)")
+    for r in funnel:
+        t0 = r.get("t0")
+        if t0 is None or r.get("t3") is not None or float(t0) > now - 86400.0:
+            continue
+        days = (now - float(t0)) / 86400.0
+        marks = "、".join(
+            f"{k} {'已达' if r.get(k) is not None else '未达'}" for k in ("t1", "t2")
+        )
+        offer({
+            "user_id": r["user_id"],
+            "reason_code": "onboarding_stuck",
+            "reason_text": "注册超过 24h 仍未拿到首次真回复",
+            "since_epoch": float(t0),
+            "detail": f"{r.get('route') or 'resident'} 路线，注册 {days:.1f} 天；{marks}",
+        })
+    for uid, st in pending:
+        offer({
+            "user_id": uid,
+            "reason_code": "model_config_pending",
+            "reason_text": "模型 API 配置未验证通过",
+            "since_epoch": None,  # user_blobs 无更新时间列——没有就是 None，不编。
+            "detail": f"test_status={st}",
+        })
+    rows = sorted(
+        best.values(),
+        key=lambda r: (
+            _HOME_QUEUE_SEVERITY[r["reason_code"]],
+            r["since_epoch"] is None,
+            r["since_epoch"] or 0.0,
+        ),
+    )
+    return {"rows": rows[:20], "truncated": len(rows) > 20}
+
+
+def admin_home_pulse(*, tz: str = "Asia/Shanghai") -> dict:
+    """首页「产品脉搏」：7 日活跃 spark、WAU 对比、最新成熟 W4、近 4 周激活率。
+
+    daily_actives 与 view=dau 的 session_dau 同源同口径（真打开 app 的
+    ``app_session_end`` 独立用户数）：完整北京日已冻结的走
+    ``dau_daily_snapshot``（PK day 直接命中），未冻结的落回 live（0078 部分
+    索引 ``ix_user_logs_app_session_end_ts`` 的 ts 范围扫）。只发 7 个完整日，
+    今天不进——进行中的日不渲染成定局。oldest first（sparkline 时序）。
+
+    wau/prev_wau = 最近 7 个完整日 vs 再前 7 日的独立活跃用户数。埋点最早
+    一条 ``app_session_end`` 晚于对比窗起点时 prev_wau=None（窗口没被覆盖
+    ≠ 0 人活跃）。latest_mature_w4 只读 ``retention_cohort_snapshot`` 冻结行
+    （period_index=4，PK 命中），没有任何成熟 cohort 时 None。
+    activation_recent 复用 ``admin_product_health_activation_weekly``
+    （不复制 SQL），最近 4 个 cohort 周 newest first，t3_rate 不可信时 None。
+    """
+    zone = _ph_zone(tz)
+    today = datetime.now(zone).date()
+    start_day = today - timedelta(days=7)
+    start_e = _ph_day_epoch(start_day, zone)
+    prev_start_e = _ph_day_epoch(today - timedelta(days=14), zone)
+    end_e = _ph_day_epoch(today, zone)
+    days = [(start_day + timedelta(days=i)).isoformat() for i in range(7)]
+    with get_pool().connection() as conn:
+        snap = dict(conn.execute(
+            "SELECT day, session_dau FROM dau_daily_snapshot "
+            "WHERE day >= %s AND day <= %s",
+            (days[0], days[-1]),
+        ).fetchall())
+        live = dict(conn.execute(
+            """
+            SELECT to_char(timezone(%s, to_timestamp(ts)), 'YYYY-MM-DD') AS day,
+                   COUNT(DISTINCT user_id)::int
+            FROM user_logs
+            WHERE stream='tracking_events'
+              AND doc->>'type'='app_session_end'
+              AND ts >= %s AND ts < %s
+            GROUP BY 1
+            """,
+            (tz, start_e, end_e),
+        ).fetchall())
+        wau_row = conn.execute(
+            """
+            SELECT
+              (COUNT(DISTINCT user_id) FILTER (WHERE ts >= %s))::int,
+              (COUNT(DISTINCT user_id) FILTER (WHERE ts < %s))::int,
+              MIN(ts)
+            FROM user_logs
+            WHERE stream='tracking_events'
+              AND doc->>'type'='app_session_end'
+              AND ts >= %s AND ts < %s
+            """,
+            (start_e, start_e, prev_start_e, end_e),
+        ).fetchone()
+        oldest_row = conn.execute(
+            "SELECT MIN(ts) FROM user_logs "
+            "WHERE stream='tracking_events' AND doc->>'type'='app_session_end'",
+        ).fetchone()
+        w4 = conn.execute(
+            """
+            SELECT cohort_week, cohort_size, active_count
+            FROM retention_cohort_snapshot
+            WHERE period_index = 4 AND cohort_size > 0
+            ORDER BY cohort_week DESC
+            LIMIT 1
+            """,
+        ).fetchone()
+    wau = int(wau_row[0] or 0)
+    prev_wau: int | None = int(wau_row[1] or 0)
+    oldest_ts = oldest_row[0]
+    if oldest_ts is None or float(oldest_ts) > prev_start_e:
+        # 埋点历史没覆盖到对比窗——「没数据」≠「0 人活跃」。
+        prev_wau = None
+    latest_w4 = None
+    if w4 is not None:
+        week, size, active = w4[0], int(w4[1]), int(w4[2] or 0)
+        latest_w4 = {"cohort_week": week,
+                     "pct": round(100.0 * active / size, 1), "n": size}
+    activation = admin_product_health_activation_weekly(tz=tz, weeks=4)
+    activation_recent = [
+        {"cohort_week": c["cohort_week"], "t3_rate": c["t3_rate"], "n": c["n"]}
+        for c in activation["cohorts"][:4]
+    ]
+    return {
+        "daily_actives": [
+            {"day": d, "dau": int(snap[d] if d in snap else live.get(d, 0))}
+            for d in days
+        ],
+        "wau": wau,
+        "prev_wau": prev_wau,
+        "latest_mature_w4": latest_w4,
+        "activation_recent": activation_recent,
+    }
+
+
+def admin_home_feed(*, tz: str = "Asia/Shanghai", limit: int = 12) -> dict:
+    """首页「今天发生了什么」：48h 内注册 / 首次真回复 / 导入失败事件流。
+
+    三个有界查询：注册走 users 小扫描（created_at 严格 CASE 解析，malformed
+    行静默掉出——与 funnel 同一把尺）；首次真回复先取窗口内有真回复的候选
+    用户（48h 有界扫），再对候选做 per-user MIN（chat_user_seq_idx/PK 的
+    per-user 索引路径），MIN 落在窗口内才算「首次」——绝不全表求每人 MIN。
+    导入失败读 genesis_import_jobs（status='failed'，updated_at 窗口内，
+    per-user 计数聚合成一条事件）。newest first，封顶 ``limit``（<=50）。
+    """
+    safe_limit = max(1, min(int(limit or 12), 50))
+    now = time.time()
+    window_e = now - 48 * 3600.0
+    events: list[dict] = []
+    with get_pool().connection() as conn:
+        ca = _ph_created_at_sql(conn)
+        regs = conn.execute(
+            f"""
+            SELECT user_id, EXTRACT(EPOCH FROM ({ca}))
+            FROM users
+            WHERE ({ca}) IS NOT NULL
+              AND EXTRACT(EPOCH FROM ({ca})) >= %s
+            """,
+            (window_e,),
+        ).fetchall()
+        replies = conn.execute(
+            """
+            WITH cand AS (
+                SELECT DISTINCT user_id FROM chat_messages
+                WHERE ts >= %s
+                  AND doc->>'role' IN ('agent','openclaw')
+                  AND COALESCE(doc->>'source','')
+                      NOT IN ('foreground_fallback','proactive_fallback')
+            )
+            SELECT cm.user_id, MIN(cm.ts) AS t
+            FROM chat_messages cm
+            WHERE cm.user_id IN (SELECT user_id FROM cand)
+              AND cm.doc->>'role' IN ('agent','openclaw')
+              AND COALESCE(cm.doc->>'source','')
+                  NOT IN ('foreground_fallback','proactive_fallback')
+            GROUP BY cm.user_id
+            HAVING MIN(cm.ts) >= %s
+            """,
+            (window_e, window_e),
+        ).fetchall()
+        fails = conn.execute(
+            """
+            SELECT user_id, COUNT(*)::int,
+                   MAX(EXTRACT(EPOCH FROM updated_at))
+            FROM genesis_import_jobs
+            WHERE status = 'failed' AND updated_at >= to_timestamp(%s)
+            GROUP BY user_id
+            """,
+            (window_e,),
+        ).fetchall()
+    for uid, t in regs:
+        events.append({"epoch": float(t), "kind": "registration",
+                       "user_id": uid, "text": "新用户注册"})
+    for uid, t in replies:
+        events.append({"epoch": float(t), "kind": "first_reply",
+                       "user_id": uid, "text": "首次收到真回复"})
+    for uid, n, t in fails:
+        events.append({"epoch": float(t), "kind": "import_failed",
+                       "user_id": uid, "text": f"记忆导入失败 {int(n)} 次"})
+    events.sort(key=lambda e: e["epoch"], reverse=True)
+    return {"events": events[:safe_limit]}
+
+
+def admin_home_cost(*, tz: str = "Asia/Shanghai") -> dict:
+    """首页「成本一行」：token/日 spark + 人均 + runaway 哨兵。
+
+    一次 ``v2_turn_metrics`` 有界扫（8 个北京日 = 7 完整 + 今天，
+    ``ix_v2_turn_metrics_created_at`` 范围扫）。tokens 只覆盖 Hosted V2
+    灰度，BYOK 自付费消耗服务器看不见——数字是已知下限。某日一条上报了
+    usage 的 turn 都没有 → tokens=None（未上报 ≠ 0）。daily_tokens 为
+    7 个完整日 oldest first；today_so_far 是进行中的今天，单列不混进 spark。
+
+    per_active_user_day = 完整日已上报 tokens 之和 / 各日上报用户数之和
+    （分母 0 → None）。coverage = 全窗口上报 usage 的 turn 占比（无 turn →
+    None）。runaway = 最新完整日 > 3 × 前 6 个完整日中位数（严格大于，恰好
+    3 倍不算）；完整日中可判定天数 <4、最新完整日未上报、或 coverage=None
+    时 runaway=None（数据不足不许报警也不许报平安）。
+    """
+    zone = _ph_zone(tz)
+    today = datetime.now(zone).date()
+    start_e = _ph_day_epoch(today - timedelta(days=7), zone)
+    end_e = _ph_day_epoch(today + timedelta(days=1), zone)
+    with get_pool().connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT to_char(timezone(%s, created_at), 'YYYY-MM-DD') AS day,
+                   COUNT(*)::int AS turns,
+                   (COUNT(*) FILTER (WHERE prompt_tokens IS NOT NULL
+                                        OR completion_tokens IS NOT NULL))::int
+                       AS reported,
+                   COALESCE(SUM(COALESCE(prompt_tokens,0)
+                                + COALESCE(completion_tokens,0))
+                            FILTER (WHERE prompt_tokens IS NOT NULL
+                                       OR completion_tokens IS NOT NULL),
+                            0)::bigint AS tokens,
+                   (COUNT(DISTINCT user_id)
+                        FILTER (WHERE prompt_tokens IS NOT NULL
+                                   OR completion_tokens IS NOT NULL))::int
+                       AS users_reported
+            FROM v2_turn_metrics
+            WHERE created_at >= to_timestamp(%s)
+              AND created_at < to_timestamp(%s)
+            GROUP BY 1
+            """,
+            (tz, start_e, end_e),
+        ).fetchall()
+    by_day = {r[0]: (int(r[1]), int(r[2]), int(r[3]), int(r[4])) for r in rows}
+
+    def _tokens(day_iso: str) -> int | None:
+        turns, reported, tokens, _ = by_day.get(day_iso, (0, 0, 0, 0))
+        return int(tokens) if reported > 0 else None
+
+    complete_days = [(today - timedelta(days=7 - i)).isoformat() for i in range(7)]
+    daily_tokens = [{"day": d, "tokens": _tokens(d)} for d in complete_days]
+    total_turns = sum(by_day.get(d, (0, 0, 0, 0))[0]
+                      for d in complete_days + [today.isoformat()])
+    total_reported = sum(by_day.get(d, (0, 0, 0, 0))[1]
+                         for d in complete_days + [today.isoformat()])
+    coverage = (total_reported / total_turns) if total_turns else None
+    tok_sum = sum(row["tokens"] for row in daily_tokens
+                  if row["tokens"] is not None)
+    user_days = sum(by_day.get(d, (0, 0, 0, 0))[3] for d in complete_days)
+    per_active = (tok_sum / user_days) if user_days else None
+    latest = daily_tokens[-1]["tokens"]
+    priors = [row["tokens"] for row in daily_tokens[:-1]
+              if row["tokens"] is not None]
+    known_days = sum(1 for row in daily_tokens if row["tokens"] is not None)
+    if coverage is None or latest is None or known_days < 4:
+        runaway: bool | None = None
+    else:
+        med = _ph_median(priors)
+        runaway = None if med is None else bool(latest > 3.0 * med)
+    return {
+        "daily_tokens": daily_tokens,
+        "today_so_far": _tokens(today.isoformat()),
+        "per_active_user_day": per_active,
+        "runaway": runaway,
+        "coverage": coverage,
+    }
+
+
+def admin_home_soft_verdicts(*, tz: str = "Asia/Shanghai") -> dict:
+    """首页状态条的 growth/cost/evidence 三枚软判定（system 由 admin_core
+    用它自己够得着的 _ops_*_level 组合——db 层不许向上 import 渲染包）。
+
+    每枚 {"level": ok|warn|unknown|bad, "reasons": [中文...]}，诚实分层：
+    ok 只给「证据闭合且健康」；测得的恶化给 warn/bad；没证据给 unknown。
+      growth   WAU 环比跌 >=20% → warn、>=40% → bad——但只在基线有判定力时
+               （prev_wau >= 8，或绝对流失 >= 3 人）；prod 舰队 intentionally
+               tiny，5→3 这种单人级波动是噪声不是回归，报 unknown 并附原始
+               数字。上周基线缺失（埋点没覆盖到）→ unknown；最近 3 个完整
+               cohort 周激活率严格连降 → warn。数据复用 ``admin_home_pulse``
+               （有界查询，不复制 SQL）。
+      cost     runaway=True → bad；coverage 缺失或 <0.8 → unknown（上报覆盖
+               不足时的成本数字不可信，不许绿）；runaway=None（可判定天数
+               不足，哨兵没跑起来）→ unknown——「哨兵没证据」不许渲染成
+               绿；只有 runaway=False（测得无放量）才 ok。复用
+               ``admin_home_cost``。
+      evidence 永远 unknown：客户端已读 ACK、session 来源标记两项埋点缺口
+               没闭合之前，这枚灯不许变绿——灰是诚实，绿是撒谎。coverage
+               <0.95 时追加一条覆盖缺口理由。
+    """
+    zone = _ph_zone(tz)
+    this_monday = _bj_monday(datetime.now(zone).date()).isoformat()
+    pulse = admin_home_pulse(tz=tz)
+    cost = admin_home_cost(tz=tz)
+    rank = {"bad": 3, "warn": 2, "unknown": 1, "ok": 0}
+
+    # -- growth ------------------------------------------------------------ #
+    g_level, g_reasons = "ok", []
+    wau, prev = pulse["wau"], pulse["prev_wau"]
+    if prev is None:
+        g_level = "unknown"
+        g_reasons.append("上一周活跃基线缺失（埋点未覆盖到对比窗），无法环比")
+    elif prev > 0:
+        drop = (prev - wau) / prev
+        if drop >= 0.20:
+            # 小基线护栏：舰队 intentionally tiny，1 个人歇一周就能把百分比
+            # 打穿阈值。基线 <8 且绝对流失 <3 人时，环比不具判定力——报
+            # unknown 并保留原始人数，不装红黄。
+            if prev < 8 and (prev - wau) < 3:
+                g_level = "unknown"
+                g_reasons.append(
+                    f"基线过小（{prev}→{wau}），环比不具判定力"
+                )
+            elif drop >= 0.40:
+                g_level = "bad"
+                g_reasons.append(f"7 日活跃较上周下降 {drop * 100:.0f}%（{prev}→{wau}）")
+            else:
+                g_level = "warn"
+                g_reasons.append(f"7 日活跃较上周下降 {drop * 100:.0f}%（{prev}→{wau}）")
+    elif wau == 0:
+        g_level = "unknown"
+        g_reasons.append("连续两周无活跃用户，无环比基线")
+    completed = [c for c in pulse["activation_recent"]
+                 if c["cohort_week"] != this_monday][:3]
+    rates = [c["t3_rate"] for c in completed]
+    if len(rates) == 3 and all(r is not None for r in rates) \
+            and rates[0] < rates[1] < rates[2]:
+        if rank["warn"] > rank[g_level]:
+            g_level = "warn"
+        g_reasons.append("激活率（t3）连续 3 个完整 cohort 周下降")
+    if g_level == "ok" and not g_reasons:
+        g_reasons.append("WAU 环比与激活率均无恶化信号")
+
+    # -- cost -------------------------------------------------------------- #
+    coverage = cost["coverage"]
+    if cost["runaway"] is True:
+        c_level = "bad"
+        c_reasons = ["最新完整日 token 用量超过前 6 日中位数的 3 倍"]
+    elif coverage is None or coverage < 0.8:
+        c_level = "unknown"
+        c_reasons = ["token 上报覆盖率缺失，成本数字不可信"
+                     if coverage is None else
+                     f"token 上报覆盖率 {coverage * 100:.0f}% < 80%，成本数字不可信"]
+    elif cost["runaway"] is False:
+        c_level = "ok"
+        c_reasons = ["近 7 个完整日无 runaway 迹象"]
+    else:
+        # runaway=None：可判定天数不足，哨兵根本没跑起来。「没证据」是灰
+        # 不是绿——绿灯配「判不了」的理由是自相矛盾（每次新部署的头几天
+        # 都会走到这里）。
+        c_level = "unknown"
+        c_reasons = ["可判定完整日不足（<4 天有上报），runaway 哨兵未触发判定"]
+
+    # -- evidence（结构性缺口未闭合前永远灰）--------------------------------- #
+    e_reasons = ["客户端已读 ACK 未埋点", "session 来源标记未埋点"]
+    if coverage is None:
+        e_reasons.append("token 上报覆盖率未知")
+    elif coverage < 0.95:
+        e_reasons.append(f"token 上报覆盖率 {coverage * 100:.0f}% < 95%")
+    return {
+        "growth": {"level": g_level, "reasons": g_reasons},
+        "cost": {"level": c_level, "reasons": c_reasons},
+        "evidence": {"level": "unknown", "reasons": e_reasons},
+    }
+
+
+def admin_funnel_snapshot(*, tz: str = "Asia/Shanghai") -> dict:
+    """近 28 个完整北京日注册 cohort 的单调激活漏斗（+ 前一个 28 日对比）。
+
+    cohort 与里程碑复用 ``admin_onboarding_funnel(registered_cutoff_ts=
+    now-56d)``（per-user 索引路径；返回 None 即 RAISE——故障不许渲染成空
+    漏斗），t0 用同一把严格解析尺。计数强制嵌套（stage k 必须已达全部前置
+    里程碑），漏斗因此构造性单调——单个里程碑集合并不天然嵌套（VPS 路线
+    t2 可先于 t1），非嵌套计数会画出「变宽的漏斗」。
+
+    w1_retained：只统计个人 W1 窗 [t0+7d, t0+14d) 已完整走完（t0<=now-14d，
+    必然落在窗口前 21 天内）且已达 first_reply 的用户（保持嵌套单调），
+    活跃证据 = 个人窗内任一 ``app_session_end``（0078 部分索引上的
+    per-user nested-loop EXISTS）。成熟与否按 cohort 判：cohort 里没有任何
+    人的 W1 窗走完 → None（未成熟 ≠ 0 留存）；一旦有人成熟，w1 就是实测
+    计数——成熟 cohort 无人到达 first_reply 时是定局的 0，不是「判不了」
+    （灰掉一个测得的全灭等于把激活失败说成不成熟）。
+    已知下限：活跃证据来自 live ``user_logs``，tracking_events 每次追加都
+    按 TRACK_EVENT_MAX(=2000) per-user 裁剪、且随删号级联消失——重度用户
+    发满 2000 条后，几周前的 W1 证据可能已被裁掉，w1_retained 只会偏低不会
+    偏高（与 dau_daily_snapshot/retention 快照当年冻结的动机同一类；后续
+    如要根治应冻结 per-user W1 命中事实，见 0017 先例）。
+    prev = 前一个 28 日窗同款；该窗零注册时 prev=None
+    （没有可比对象，不发全零假漏斗）。
+    """
+    zone = _ph_zone(tz)
+    today = datetime.now(zone).date()
+    now = time.time()
+    cur_start_e = _ph_day_epoch(today - timedelta(days=28), zone)
+    cur_end_e = _ph_day_epoch(today, zone)
+    prev_start_e = _ph_day_epoch(today - timedelta(days=56), zone)
+    funnel = admin_onboarding_funnel(registered_cutoff_ts=prev_start_e)
+    if funnel is None:
+        raise RuntimeError("admin_onboarding_funnel unavailable (funnel snapshot)")
+
+    def _window(rows: list[dict], start_e: float, end_e: float) -> dict:
+        cohort = [r for r in rows
+                  if r.get("t0") is not None and start_e <= float(r["t0"]) < end_e]
+        connected = [r for r in cohort if r.get("t1") is not None]
+        content = [r for r in connected if r.get("t2") is not None]
+        replied = [r for r in content if r.get("t3") is not None]
+        w1_eligible = [r for r in replied if float(r["t0"]) + 14 * 86400.0 <= now]
+        # 成熟度看 cohort 而不是 replied：成熟 cohort 里 replied 为空时
+        # w1 是测得的 0（激活全灭），不是「窗口没走完」。
+        cohort_matured = any(
+            float(r["t0"]) + 14 * 86400.0 <= now for r in cohort
+        )
+        return {
+            "cohort": cohort, "connected": connected, "content": content,
+            "replied": replied, "w1_eligible": w1_eligible,
+            "cohort_matured": cohort_matured,
+        }
+
+    cur = _window(funnel, cur_start_e, cur_end_e)
+    prev = _window(funnel, prev_start_e, cur_start_e)
+    eligible = cur["w1_eligible"] + prev["w1_eligible"]
+    retained_uids: set[str] = set()
+    if eligible:
+        uids = [r["user_id"] for r in eligible]
+        w_starts = [float(r["t0"]) + 7 * 86400.0 for r in eligible]
+        w_ends = [float(r["t0"]) + 14 * 86400.0 for r in eligible]
+        with get_pool().connection() as conn:
+            hit = conn.execute(
+                """
+                SELECT c.user_id
+                FROM unnest(%s::text[], %s::float8[], %s::float8[])
+                     AS c(user_id, w_start, w_end)
+                WHERE EXISTS (
+                    SELECT 1 FROM user_logs l
+                    WHERE l.user_id = c.user_id
+                      AND l.stream = 'tracking_events'
+                      AND l.ts >= c.w_start AND l.ts < c.w_end
+                      AND l.doc->>'type' = 'app_session_end'
+                )
+                """,
+                (uids, w_starts, w_ends),
+            ).fetchall()
+        retained_uids = {r[0] for r in hit}
+
+    def _stages(w: dict) -> list[dict]:
+        w1: int | None = None
+        if w["cohort_matured"]:
+            w1 = sum(1 for r in w["w1_eligible"]
+                     if r["user_id"] in retained_uids)
+        return [
+            {"id": "registered", "label": "注册", "count": len(w["cohort"])},
+            {"id": "connected", "label": "已连接(t1)", "count": len(w["connected"])},
+            {"id": "content_ready", "label": "内容就绪(t2)", "count": len(w["content"])},
+            {"id": "first_reply", "label": "首次真回复(t3)", "count": len(w["replied"])},
+            {"id": "w1_retained", "label": "W1 仍活跃", "count": w1},
+        ]
+
+    return {
+        "stages": _stages(cur),
+        "window_days": 28,
+        "prev": {"stages": _stages(prev)} if prev["cohort"] else None,
+    }
+
+
 def freeze_completed_retention_cohorts(*, now_epoch: float | None = None,
                                        tz: str = "Asia/Shanghai") -> list[str]:
     """Freeze (cohort_week, period) cells whose week has fully ended.

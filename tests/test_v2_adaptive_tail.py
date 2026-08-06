@@ -208,6 +208,27 @@ def test_required_only_overflow_is_not_hidden_by_optional_eviction():
         _plan(builder, tokens=32768)
 
 
+def test_adaptive_frontier_truncates_worldbook_with_explicit_marker():
+    worldbook = "<world_book>\n" + ("world detail " * 3_000) + "\n</world_book>"
+    builder = worker._make_build_messages_fn(
+        system_prompt="system",
+        summary="covered",
+        tail=_turn(40, chars=64),
+        optional_tail_turns=[_turn(1, chars=400)],
+        tail_target_turns=2,
+        tail_lane="chat",
+        worldbook_context=worldbook,
+    )
+
+    messages, _frontier, stats = _plan(builder, tokens=8192)
+    rendered = "\n".join(str(item.get("content")) for item in messages)
+
+    assert stats["worldbook_truncated"] is True
+    assert "WORLD BOOK CONTEXT TRUNCATED TO FIT THE PROMPT BUDGET" in rendered
+    assert "turn-40-user" in rendered
+    assert "turn-40-assistant" in rendered
+
+
 def test_targeted_catchup_compacts_exactly_through_safe_boundary(monkeypatch):
     rows = [
         _row(seq, "user" if seq % 2 else "assistant", f"row-{seq}")

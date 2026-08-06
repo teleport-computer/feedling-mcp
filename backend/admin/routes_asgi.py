@@ -10,6 +10,9 @@ exception handler renders the identical fixed 401/503 bodies
 (``asgi.responses.ERROR_BODIES``); a 401 therefore returns JSON on the HTML
 routes too, exactly as Flask's ``errorhandler(401)`` does.
 
+``GET /v1/admin/data-track/verdicts`` is ASGI-native (no Flask twin): the
+machine-readable home health check, admin-gated exactly like its siblings.
+
 Each handler's body is produced by the same ``admin.data_track`` functions the
 Flask routes call — via ``admin.admin_core``, which runs them inside a throwaway
 Flask request context so ``request.args`` is read from the ASGI query string —
@@ -195,6 +198,20 @@ async def data_track_growth(request: Request):
 async def data_track_debug(request: Request):
     _require_admin(request)
     payload = await threadpool.run_db(admin_core.debug_payload, request.url.query)
+    return JSONResponse(payload)
+
+
+@router.get("/v1/admin/data-track/verdicts")
+async def data_track_verdicts(request: Request):
+    # ASGI-native (no Flask twin): machine-readable home verdicts — system/
+    # growth/cost/evidence + queue + pulse, same builders as view=home.
+    # Deliberately NOT page-cached: the 60s cache is HTML-only (its honesty
+    # mechanism, the cache-note, is injected into <main>), JSON has no channel
+    # to declare data age; the underlying queries are all bounded and already
+    # throttled by the shared 4-worker admin-ops executor. Rationale continues
+    # in admin_core.verdicts_payload's docstring.
+    _require_admin(request)
+    payload = await threadpool.run_db(admin_core.verdicts_payload, request.url.query)
     return JSONResponse(payload)
 
 

@@ -109,12 +109,11 @@ from memory.card_text import (
     count_user_token_residuals,
     is_card_format_error,
 )
+from memory import dream_gates as memory_dream_gates
 from memory.dream_prompt_v1 import (
     build_dream_prompt,
-    build_dream_review_prompt,
     build_dream_retry_prompt,
     parse_dream_consolidations,
-    parse_dream_review,
 )
 
 log = logging.getLogger("feedling.runtime_v2.worker")
@@ -218,115 +217,6 @@ async def _extract_with_provider_health(
             user_id, latency_ms=(time.monotonic() - started) * 1000.0
         )
     return result
-
-
-async def _review_dream_consolidations(
-    user_id: str,
-    consolidations: list[dict],
-    *,
-    card_items: list[dict],
-    provider_config: Any,
-    job_id,
-    claimed_by: str | None,
-    tm: "TurnMetrics | None" = None,
-    trajectory_recorder: "v2_trajectory.TrajectoryRecorder | None" = None,
-) -> list[dict]:
-    """Independently review each Dream proposal with a fresh BYOK call.
-
-    A review failure rejects only that proposal. Lease loss is different: a
-    stale worker must stop the whole job before any write. The approved marker
-    is internal and is required again by the deterministic mapper.
-    """
-
-    by_id = {
-        str(card.get("id") or "").strip(): card
-        for card in card_items
-        if isinstance(card, dict) and str(card.get("id") or "").strip()
-    }
-    approved: list[dict] = []
-    for index, consolidation in enumerate(consolidations):
-        if not isinstance(consolidation, dict):
-            continue
-        rationale = str(consolidation.get("rationale") or "").strip()
-        card_ids = list(
-            dict.fromkeys(
-                str(memory_id or "").strip()
-                for memory_id in (consolidation.get("card_ids") or [])
-                if str(memory_id or "").strip()
-            )
-        )
-        source_cards = [by_id.get(memory_id) for memory_id in card_ids]
-        reject_code = ""
-        review: dict | None = None
-        if not rationale:
-            reject_code = "rationale_missing"
-        elif not card_ids or any(card is None for card in source_cards):
-            reject_code = "source_card_unavailable"
-        else:
-            if claimed_by and not await asyncio.to_thread(
-                jobs_store.renew_job_lease,
-                job_id,
-                claimed_by,
-                ttl_sec=jobs_store.RUNNING_TTL_SEC,
-            ):
-                raise LostJobLease("dream ownership lost before semantic review")
-            prompt = build_dream_review_prompt(
-                consolidation=consolidation,
-                source_cards=[card for card in source_cards if card is not None],
-            )
-            _report_turn_progress(f"dream_review_{index}_start")
-            review_result, review_error = await _extract_with_provider_health(
-                user_id,
-                provider_config=provider_config,
-                prompt=prompt,
-                parse=parse_dream_review,
-                max_tokens=300,
-                progress_cb=lambda stage, attempt, proposal=index: _report_turn_progress(
-                    f"dream_review_{proposal}_{stage}_{attempt}"
-                ),
-                usage_out=tm.add_call if tm is not None else None,
-                trajectory_out=(
-                    trajectory_recorder.record
-                    if trajectory_recorder is not None
-                    else None
-                ),
-            )
-            _report_turn_progress(f"dream_review_{index}_complete")
-            if review_error:
-                reject_code = str(review_error)[:120]
-            elif not isinstance(review_result, dict):
-                reject_code = "review_result_invalid"
-            elif review_result.get("approved") is not True:
-                reject_code = "review_no"
-                review = review_result
-            else:
-                review = review_result
-        await _record_trajectory(
-            trajectory_recorder,
-            "dream_semantic_review",
-            {
-                "proposal_index": index,
-                "target_count": len(card_ids),
-                "approved": bool(review and review.get("approved") is True),
-                "reject_code": reject_code,
-            },
-            best_effort=True,
-        )
-        if not review or review.get("approved") is not True:
-            log.warning(
-                "[v2.worker] dream proposal rejected by semantic review "
-                "user=%s proposal=%d targets=%d code=%s",
-                user_id,
-                index,
-                len(card_ids),
-                reject_code or "review_no",
-            )
-            continue
-        accepted = dict(consolidation)
-        accepted["_review_approved"] = True
-        accepted["_review_reason"] = str(review.get("reason") or "")[:1000]
-        approved.append(accepted)
-    return approved
 
 
 def _positive_int_env(name: str, default: str) -> int:
@@ -1060,6 +950,7 @@ _EXTRACTION_FAILURE_REASONS = frozenset(
         "capture_provider_call_cancelled",
         "capture_provider_fence_incomplete",
         "capture_provider_result_invalid",
+        "dream_blast_radius_exceeded",
         "dream_no_memory_actions",
         "empty_reply",
         "extraction_memory_writer_unavailable",
@@ -1295,6 +1186,10 @@ class TurnDeps:
     read_perception_wake_context: Callable[[str, int], list[dict]] | None = None
     # Pending timer identity lets follow-ups use a backend-confirmed wake_id.
     read_pending_scheduled_wake_context: Callable[[str], dict] | None = None
+    # Chat-only World Book match. The assembly callback decrypts and matches the
+    # user's entries against this turn's current user text, returning
+    # {"block": str, "matched_names": [...]}. Wake lanes never call it.
+    read_worldbook_context: Callable[..., dict] | None = None
     # (user_id, actions) -> result dict：把抽取产出的 memory.add/memory.supersede action 落库
     # （走既有 /v1/memory/actions 同路径的服务端实现）。None 时跳过持久化、仍干净 mark_completed
     # （让 handler 无 DB/enclave 也可单测）。
@@ -3129,6 +3024,7 @@ def _make_build_messages_fn(
     working_memory: str = "",
     agent_memory: str = "",
     user_profile: str = "",
+    worldbook_context: str = "",
     coverage_hole_notice: str = "",
     provider_config: Any = None,
     temporal_context: dict[str, Any] | None = None,
@@ -3194,7 +3090,11 @@ def _make_build_messages_fn(
             ),
         )
 
-    def _base(selected_turns: list[list[dict]]) -> list:
+    def _base(
+        selected_turns: list[list[dict]],
+        *,
+        worldbook_char_cap: int = context.WORLD_BOOK_CONTEXT_CHAR_CAP,
+    ) -> list:
         rendered_tail = _flatten_turns(selected_turns) + required_tail
         return context.build_turn_messages(
             system_prompt=system_prompt,
@@ -3206,6 +3106,8 @@ def _make_build_messages_fn(
             working_memory=working_memory,
             agent_memory=agent_memory,
             user_profile=user_profile,
+            worldbook_context=worldbook_context,
+            worldbook_context_char_cap=worldbook_char_cap,
             coverage_hole_notice=coverage_hole_notice,
             temporal_context=_temporal_for(rendered_tail),
             application_data_role=application_data_role,
@@ -3283,9 +3185,16 @@ def _make_build_messages_fn(
                         "content": content,
                     })
 
-            def _candidate(count: int) -> tuple[list, Any]:
+            def _candidate(
+                count: int,
+                *,
+                worldbook_char_cap: int,
+            ) -> tuple[list, Any]:
                 selected = eligible_optional[-count:] if count else []
-                messages = _base(selected) + rendered_transcript
+                messages = _base(
+                    selected,
+                    worldbook_char_cap=worldbook_char_cap,
+                ) + rendered_transcript
                 plan = v2_prompt_frontier.plan_provider_round(
                     model_limit=model_limit,
                     messages=messages,
@@ -3297,14 +3206,53 @@ def _make_build_messages_fn(
                 )
                 return messages, plan
 
+            # World Book is optional bounded setting context. If the fixed cap
+            # does not fit alongside required history/transcript, binary-search
+            # the largest prefix whose explicit truncation marker does fit. The
+            # marker-only form (cap=0) is the minimum; if even that cannot fit,
+            # the required frontier still fails loud instead of dropping it.
+            full_worldbook_cap = min(
+                len(str(worldbook_context or "").strip()),
+                context.WORLD_BOOK_CONTEXT_CHAR_CAP,
+            )
+            effective_worldbook_cap = full_worldbook_cap
+            try:
+                best_messages, best_plan = _candidate(
+                    0,
+                    worldbook_char_cap=effective_worldbook_cap,
+                )
+            except v2_prompt_frontier.PromptFrontierExhausted:
+                if not str(worldbook_context or "").strip():
+                    raise
+                low_worldbook, high_worldbook = 0, full_worldbook_cap
+                best_worldbook: tuple[int, list, Any] | None = None
+                while low_worldbook <= high_worldbook:
+                    middle = (low_worldbook + high_worldbook) // 2
+                    try:
+                        messages, plan = _candidate(
+                            0,
+                            worldbook_char_cap=middle,
+                        )
+                    except v2_prompt_frontier.PromptFrontierExhausted:
+                        high_worldbook = middle - 1
+                    else:
+                        best_worldbook = (middle, messages, plan)
+                        low_worldbook = middle + 1
+                if best_worldbook is None:
+                    raise
+                effective_worldbook_cap, best_messages, best_plan = best_worldbook
+
             # Required-only must fit. It is the structural failure boundary:
-            # summary, exact core, and native transcript are never clipped.
-            best_messages, best_plan = _candidate(0)
+            # summary, exact core, native transcript, and at least the explicit
+            # World Book truncation marker are never silently clipped.
             low, high, best = 1, len(eligible_optional), 0
             while low <= high:
                 middle = (low + high) // 2
                 try:
-                    messages, plan = _candidate(middle)
+                    messages, plan = _candidate(
+                        middle,
+                        worldbook_char_cap=effective_worldbook_cap,
+                    )
                 except v2_prompt_frontier.PromptFrontierExhausted:
                     high = middle - 1
                 else:
@@ -3329,6 +3277,10 @@ def _make_build_messages_fn(
                 "fallback": fallback,
                 "anchor_trimmed": anchor_trimmed,
                 "source_truncated": bool(tail_source_truncated),
+                "worldbook_truncated": bool(worldbook_context) and (
+                    effective_worldbook_cap
+                    < len(str(worldbook_context).strip())
+                ),
             }
 
         build_messages.plan_provider_round = plan_provider_round
@@ -7801,6 +7753,16 @@ async def _run_wake(
                 if _wst_status == _st_wake.COMPLETE:
                     text = _wst_reply
                     _wake_self_thinking_text = _wst_thinking
+                elif _wst_status == _st_wake.SILENT:
+                    # A clean thinking-only response is an intentional weak-wake
+                    # sleep, not malformed protocol. There is no reply effect to
+                    # attach a thinking envelope to, so discard the private summary
+                    # and complete without a bubble. Scheduled reminders are the
+                    # exception: their must-deliver contract still requires text.
+                    text = ""
+                    if final and lane == "scheduled":
+                        raise TurnError("empty_reply")
+                    return
                 elif _wst_status == _st_wake.FAILED:
                     if final:
                         raise TurnError(_MALFORMED_SELF_THINKING_REASON)
@@ -9120,14 +9082,25 @@ async def _run_extraction(
             )
             # parse_dream_consolidations 返回 (consolidations, questions, err)。
             # questions 属于「主动提问」= wake 语义，本轮明确丢弃（spec §5.3）。
+            # known_ids = 喂进 prompt 的那批卡的 id:result 字段里出现任何一个
+            # 即「把整理注记当成内容」(usr_a40e 墓碑卡),与内容闸同路打回重问。
+            dream_known_ids = frozenset(
+                str(card.get("id") or "").strip()
+                for card in (ctx.get("card_items") or [])
+                if isinstance(card, dict) and str(card.get("id") or "").strip()
+            )
             parse, to_actions = (
-                parse_dream_consolidations,
+                lambda reply: parse_dream_consolidations(
+                    reply, known_ids=dream_known_ids
+                ),
                 v2_extraction.consolidations_to_actions,
             )
             parse_retry = v2_extraction.ParseRetry(
                 should_retry=is_card_format_error,
                 build_prompt=build_dream_retry_prompt,
-                parse=lambda reply: parse_dream_consolidations(reply, strict=False),
+                parse=lambda reply: parse_dream_consolidations(
+                    reply, strict=False, known_ids=dream_known_ids
+                ),
             )
 
         if lane == "capture" and not prompt_tail:
@@ -9308,17 +9281,9 @@ async def _run_extraction(
             _report_turn_progress("extraction_provider_complete")
         if reason:
             raise RuntimeError(reason)
-        if lane == "dream" and items:
-            items = await _review_dream_consolidations(
-                user_id,
-                list(items),
-                card_items=list(ctx.get("card_items") or []),
-                provider_config=provider_config,
-                job_id=job_id,
-                claimed_by=claimed_by,
-                tm=tm,
-                trajectory_recorder=trajectory_recorder,
-            )
+        # 2026-08-05 复盘拆掉了这里的逐提案语义审查(弱模型自审自查既误放也误杀,
+        # 每条提案还多烧一次 BYOK 调用)。出口防线现在全部是确定性的:parse 层的
+        # 内容闸+卡id泄漏闸、mapper 的结构判据、下方的爆炸半径保险丝。
         if not items and lane != "capture":
             await _complete_extraction(item_count=0)
             if tm is not None:
@@ -9399,11 +9364,36 @@ async def _run_extraction(
             }
             if lane == "dream" and "card_items" in ctx:
                 # Bind every destructive result to the exact full-text cards
-                # disclosed for this run.  Unknown, overlapping, fresh Dream
-                # output, and lossy 1:1 rewrites are rejected deterministically
-                # by the pure mapper before any write reaches Memory Garden.
+                # disclosed for this run.  Unknown and overlapping targets are
+                # rejected deterministically by the pure mapper before any
+                # write reaches Memory Garden.
                 action_kwargs["existing_cards"] = list(ctx.get("card_items") or [])
             actions, _added, _superseded = to_actions(items, **action_kwargs)
+            if lane == "dream":
+                # 爆炸半径保险丝:单晚要退休的卡超过花园的绝大部分 = 规模明显
+                # 不对(834→1 事故的最后防线),整个 job 失败等人查,不部分执行。
+                active_count = len(ctx.get("card_items") or [])
+                if memory_dream_gates.blast_radius_exceeded(
+                    _superseded, active_count
+                ):
+                    await _record_trajectory(
+                        trajectory_recorder,
+                        "dream_blast_radius_fuse",
+                        {"retiring": _superseded, "active": active_count},
+                        best_effort=True,
+                    )
+                    raise RuntimeError("dream_blast_radius_exceeded")
+                if trajectory_recorder is not None:
+                    # dream funnel 刻度:阀门到底吃掉了多少提案,靠这个数说话。
+                    await trajectory_recorder.record(
+                        "dream_funnel",
+                        {
+                            "proposals": len(items),
+                            "applied": len(actions),
+                            "superseding": _superseded,
+                            "active_cards": active_count,
+                        },
+                    )
         if claimed_by and not await asyncio.to_thread(
             jobs_store.renew_job_lease,
             job_id,
@@ -10503,6 +10493,36 @@ async def process_job(
         else:
             summary, tail = "", []
 
+        worldbook_context = ""
+        if lane == "chat" and deps.read_worldbook_context is not None:
+            worldbook_match_messages = [
+                {
+                    "role": "user",
+                    "content": context.text_of(row.get("content")),
+                }
+                for row in coalesced
+                if context.text_of(row.get("content")).strip()
+            ]
+            if worldbook_match_messages:
+                try:
+                    async with enclave_sem:
+                        worldbook_result = await asyncio.to_thread(
+                            deps.read_worldbook_context,
+                            user_id,
+                            worldbook_match_messages,
+                            runtime_token=runtime_token,
+                        )
+                    if isinstance(worldbook_result, dict):
+                        worldbook_context = str(
+                            worldbook_result.get("block") or ""
+                        ).strip()
+                except Exception as exc:  # noqa: BLE001 — V1 parity: best effort
+                    log.warning(
+                        "[v2.worldbook] match unavailable user=%s code=%s",
+                        user_id,
+                        type(exc).__name__.lower(),
+                    )
+
         temporal_snapshot = await _capture_turn_temporal_snapshot(
             user_id=user_id,
             deps=deps,
@@ -11074,10 +11094,12 @@ async def process_job(
                 if _st_status == self_thinking.COMPLETE:
                     text = _st_reply
                     self_thinking_text = _st_thinking
-                elif _st_status == self_thinking.FAILED:
-                    # Untrustworthy structure → honest fallback bubble + a marker in
-                    # the thinking channel. Non-empty text keeps it off the
-                    # empty_reply failure path so the marker rides the reply effect.
+                elif _st_status in {self_thinking.SILENT, self_thinking.FAILED}:
+                    # Foreground chat must always answer, so both malformed protocol
+                    # and a clean thinking-only response keep the pre-existing FAILED
+                    # behavior: honest fallback bubble + thinking-failed marker.
+                    # Non-empty text keeps it off the empty_reply failure path so the
+                    # marker rides the reply effect.
                     text = _DEGENERATE_REPLY_FALLBACK
                     self_thinking_failed = True
                 # ABSENT: text unchanged
@@ -11581,6 +11603,7 @@ async def process_job(
                 working_memory=working_memory,
                 agent_memory=agent_memory,
                 user_profile=user_profile,
+                worldbook_context=worldbook_context,
                 coverage_hole_notice=coverage_hole_notice,
                 provider_config=provider_config,
                 temporal_snapshot=temporal_snapshot,

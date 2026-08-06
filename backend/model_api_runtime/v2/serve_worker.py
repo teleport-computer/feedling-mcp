@@ -118,6 +118,7 @@ from workspace.sandbox import (
     configured_sandbox_provider,
 )
 from workspace.service import production_backend as production_workspace_backend
+from worldbook import worldbook_core
 import db
 import memory_readside_core
 import provider_client
@@ -3792,6 +3793,24 @@ def _read_capture_state(user_id: str) -> dict:
     )
 
 
+def _read_worldbook_context(
+    user_id: str,
+    messages: list[dict],
+    *,
+    runtime_token: str,
+) -> dict:
+    """Match this foreground turn against the user's encrypted World Book."""
+    body, status = worldbook_core.match(
+        core_store.get_store(str(user_id)),
+        {"messages": list(messages or [])},
+        api_key=None,
+        runtime_token=str(runtime_token or ""),
+    )
+    if status != 200:
+        raise RuntimeError("worldbook_match_failed")
+    return body
+
+
 def _record_extraction_status(
     user_id: str,
     lane: str,
@@ -3881,6 +3900,7 @@ def build_production_deps() -> v2_worker.TurnDeps:
         read_scheduled_wake_context=_read_scheduled_wake_context,
         read_perception_wake_context=_read_perception_wake_context,
         read_pending_scheduled_wake_context=_read_pending_scheduled_wake_context,
+        read_worldbook_context=_read_worldbook_context,
         apply_memory_actions=_apply_memory_actions,
         build_memory_envelope=_build_memory_envelope,
         read_capture_state=_read_capture_state,

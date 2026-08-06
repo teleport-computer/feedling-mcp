@@ -11,9 +11,10 @@ identical ``data_track`` code path executes off the event loop.
 Every entry point is blocking (sync ``db.py`` under the hood) and must be invoked
 via ``asgi.threadpool.run_db`` from the async routes.
 
-``page_html`` is the single HTML dispatcher for every ``view=`` (运营总览/
-产品健康/imports/chat/latency/runtime/usage/dau/growth/proactive/events/
-debug/users)，并在此层做 60s digest-key 缓存与 builder 扇出。
+``page_html`` is the single HTML dispatcher for every ``view=`` (首页 home/
+诊断枢纽 diag/运营总览/产品健康/imports/chat/latency/runtime/usage/dau/
+growth/proactive/events/debug/users)，并在此层做 60s digest-key 缓存与
+builder 扇出。默认视图（``view`` 缺省或未知）是首页 home——users 不再兜底。
 """
 
 from __future__ import annotations
@@ -162,6 +163,106 @@ def _collect_builder_results(
             )
             results[name] = None
     return results
+
+
+# --------------------------------------------------------------------------- #
+# 首页（``view`` 缺省 / home / 未知 —— 新默认页）与 verdicts JSON 共用的
+# builder 扇出。首页没有 hours 窗口条：系统体检固定看最近 24 小时（与
+# /v1/admin/data-track/verdicts 同口径），其余口径（周 cohort、28 天漏斗、
+# 8 个北京日）全部固定在 db builder 内部。
+# --------------------------------------------------------------------------- #
+
+_HOME_WITHIN_HOURS = 24
+
+# 系统体检的合成序：坏消息压过没消息，没消息压过好消息（bad>warn>unknown>ok
+# 是「该不该点进去看」的排序，不是健康度排序——unknown 排在 warn 之下是因为
+# warn 是测出来的问题、unknown 只是没证据）。
+_SYSTEM_LEVEL_ORDER = {"ok": 0, "unknown": 1, "warn": 2, "bad": 3}
+
+
+def compose_system_verdict(imports: dict | None, chat: dict | None) -> dict:
+    """用三把既有的 ``data_track._ops_*_level`` 尺子合成「系统」判定。
+
+    取最坏级别、合并理由（去重保序——chat 与 latency 同源，理由可能撞车）。
+    合成必须发生在 admin_core：db.py 不许 import data_track（依赖方向），
+    而这三把尺子属于 data_track——admin_core 是唯一同时够得到两边的层。
+    未识别的级别按 warn 计：宁可让人多看一眼，不许悄悄降级成 ok。
+    """
+    parts = (
+        data_track._ops_import_level(imports),
+        data_track._ops_chat_level(chat),
+        data_track._ops_latency_level(chat),
+    )
+    level = "ok"
+    reasons: list[str] = []
+    for part_level, part_reasons in parts:
+        normalized = part_level if part_level in _SYSTEM_LEVEL_ORDER else "warn"
+        if _SYSTEM_LEVEL_ORDER[normalized] > _SYSTEM_LEVEL_ORDER[level]:
+            level = normalized
+        for reason in part_reasons:
+            if reason not in reasons:
+                reasons.append(reason)
+    return {"level": level, "reasons": reasons}
+
+
+_HOME_PAGE_BUILDERS = (
+    "queue", "pulse", "feed", "cost", "soft_verdicts", "funnel", "imports", "chat",
+)
+_VERDICTS_BUILDERS = ("queue", "pulse", "soft_verdicts", "imports", "chat")
+
+
+def _run_home_builders(names: tuple[str, ...]) -> dict[str, dict | None]:
+    # 与 overview/health 同一套约定：共享 4-worker 进程级执行器、每个 builder
+    # 独立失败域（失败 -> None -> 渲染层「暂不可用」，绝不伪造 0）、整页共用
+    # 一个 30s deadline。所有查询都是有界的（72h/48h/14d/28d/8 天），home 的
+    # 8 个 builder 在 4 个 worker 上排队即可，不需要更大的池。
+    specs: dict[str, tuple[str, object, dict]] = {
+        "queue": ("admin home queue query failed", db.admin_home_queue, {}),
+        "pulse": ("admin home pulse query failed", db.admin_home_pulse, {}),
+        "feed": ("admin home feed query failed", db.admin_home_feed, {}),
+        "cost": ("admin home cost query failed", db.admin_home_cost, {}),
+        "soft_verdicts": (
+            "admin home soft verdicts query failed",
+            db.admin_home_soft_verdicts,
+            {},
+        ),
+        "funnel": (
+            "admin home funnel snapshot query failed",
+            db.admin_funnel_snapshot,
+            {},
+        ),
+        "imports": (
+            "admin home import health query failed",
+            db.recent_genesis_import_health,
+            {"within_hours": _HOME_WITHIN_HOURS},
+        ),
+        "chat": (
+            "admin home chat reliability query failed",
+            jobs_store.recent_chat_reliability,
+            {"within_hours": _HOME_WITHIN_HOURS},
+        ),
+    }
+    executor = _get_ops_executor()
+    futures = {
+        name: executor.submit(_overview_builder, name, failure_msg, fn, **kwargs)
+        for name, (failure_msg, fn, kwargs) in specs.items()
+        if name in names
+    }
+    return _collect_builder_results(futures)
+
+
+def _build_home_page() -> str:
+    results = _run_home_builders(_HOME_PAGE_BUILDERS)
+    system_verdict = compose_system_verdict(results["imports"], results["chat"])
+    return data_track._render_home_page(
+        system_verdict,
+        results["soft_verdicts"],
+        results["queue"],
+        results["pulse"],
+        results["feed"],
+        results["cost"],
+        results["funnel"],
+    )
 
 
 def _build_page_html(query_string: str) -> str:
@@ -388,7 +489,34 @@ def _build_page_html(query_string: str) -> str:
             if event:
                 return data_track._render_event_users_page(data_track._data_track_event_users_payload(event))
             return data_track._render_events_page(data_track._data_track_events_payload())
-        return data_track._render_data_track_page(data_track._data_track_payload(include_users=True))
+        if view == "users":
+            # 用户页（不再是默认页）：漏斗快照走共享执行器、沿用首页同一
+            # 失败域约定（失败 -> None -> 渲染层「暂不可用」）。用户列表
+            # payload 要读 request.args（过滤/分页/排序），必须留在调用线程
+            # （contextvar 绑定不跨 worker 线程）——正好与漏斗查询并行。
+            executor = _get_ops_executor()
+            futures = {
+                "funnel": executor.submit(
+                    _overview_builder,
+                    "funnel",
+                    "admin users funnel snapshot query failed",
+                    db.admin_funnel_snapshot,
+                )
+            }
+            payload = data_track._data_track_payload(include_users=True)
+            results = _collect_builder_results(futures)
+            return data_track._render_data_track_page(
+                payload, funnel=results["funnel"]
+            )
+        if view == "diag":
+            # 诊断枢纽：11 个旧视图的卡片索引（何时来看），纯静态、无 builder。
+            return data_track._render_diag_hub_page()
+        # ``view`` 缺省 / home / 未知 -> 首页（新默认）。缓存 key 已含 view，
+        # 因此裸 /admin/data-track 与 ?view=home 是两个 key、各缓存一份相同
+        # 内容——已核实并接受：60s TTL、64 条上限下代价是一份页面字符串，比
+        # 在缓存 key 层做视图别名归一更简单，也不会引入「别名归一与渲染层
+        # 不一致」这类新错法。
+        return _build_home_page()
 
 
 # --------------------------------------------------------------------------- #
@@ -553,6 +681,41 @@ def page_html(query_string: str) -> str:
             raise
         _page_cache_put(key, time.monotonic(), page)
         return page
+
+
+def verdicts_payload(query_string: str) -> dict:
+    """GET /v1/admin/data-track/verdicts 的机读体检 payload。
+
+    有意 **不** 走 page_html 的 60s 页缓存：那层只服务 HTML（cache-note 是
+    往 ``<main>`` 里插 HTML 声明数据年龄的），JSON 没有对应的「这是旧数据」
+    通道——把缓存过的判定不加声明地喂给机器消费方，比喂给人更危险。底层
+    查询全部有界、又都在共享 4-worker 执行器上限流，事故期间的总并发依旧
+    被执行器封顶，逐请求重建的代价可接受。
+
+    诚实性约定：``queue``/``pulse`` 在 builder 失败时输出 ``null`` 而不是
+    空表/零值——空队列是「没有人卡住」的断言，查询失败给不出这个断言。
+    软性判定缺失时对应键降级为 unknown（灰，不是绿）。
+    """
+    # builder 口径全部固定（无 hours/day 参数），暂不消费查询串；保留参数
+    # 是为了与兄弟 payload 入口同形、给未来加过滤留位。
+    del query_string
+    results = _run_home_builders(_VERDICTS_BUILDERS)
+    system = compose_system_verdict(results["imports"], results["chat"])
+    soft = results["soft_verdicts"]
+    verdicts: dict[str, dict] = {"system": system}
+    for name in ("growth", "cost", "evidence"):
+        verdict = (soft or {}).get(name)
+        verdicts[name] = (
+            verdict
+            if isinstance(verdict, dict) and verdict.get("level")
+            else {"level": "unknown", "reasons": ["软性判定暂不可用"]}
+        )
+    return {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "verdicts": verdicts,
+        "queue": results["queue"],
+        "pulse": results["pulse"],
+    }
 
 
 def login_page(*, error: bool = False, next_url: str = "/admin/data-track") -> str:
