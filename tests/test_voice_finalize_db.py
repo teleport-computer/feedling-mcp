@@ -14,7 +14,6 @@ from types import SimpleNamespace
 import db
 from voice import routes_asgi
 from voice import cleanup as summary
-from voice import transcript_memory
 
 
 def _seed_user() -> str:
@@ -147,20 +146,21 @@ def test_rows_folded_by_compaction_are_retained_not_deleted():
 
 
 # --------------------------------------------------------------------------- #
-# finalize route: memory step routing (transcript capture vs summary nudge)
+# finalize route: archive -> bounded card -> cleanup -> capture nudge
 # --------------------------------------------------------------------------- #
 
-def _run_finalize(monkeypatch, uid: str, call_id: str, *, capture=None):
-    """Drive the real finalize route against the DB with the memory/model seams
-    stubbed. ``capture`` is the stub for capture_from_transcript (None keeps a
-    guard that fails the test if it is reached). Returns (status, body, calls)."""
-    calls = {"capture": 0, "nudge": 0}
+def _run_finalize(monkeypatch, uid: str, call_id: str):
+    """Drive the real finalize route against the DB with only the archive write
+    and the capture nudge stubbed (both need key material / a live runtime).
+    Returns (status, body, calls)."""
+    calls = {"archived": 0, "nudge": 0}
     payload = {
         "call_id": call_id,
         "turns": [
             {"role": "user", "text": "这周都在加班赶项目"},
             {"role": "assistant", "text": "记得照顾好自己"},
         ],
+        "duration_sec": 240,
     }
 
     async def _read_json(_request):
@@ -168,9 +168,17 @@ def _run_finalize(monkeypatch, uid: str, call_id: str, *, capture=None):
 
     monkeypatch.setattr(routes_asgi.asgi_http, "read_json_silent", _read_json)
     monkeypatch.setattr(routes_asgi.wake_bus, "notify", lambda *_a, **_k: None)
-    monkeypatch.setattr(summary, "generate_summary", lambda _s, _t: "总结一下")
 
-    def _persist(_store, _text, mid, cid):
+    from voice import transcript_store
+
+    def _persist(_store, cid, text, *, turn_count, duration_sec, chat_message_id=""):
+        calls["archived"] += 1
+        return {"call_id": cid, "turn_count": turn_count,
+                "duration_sec": duration_sec, "char_count": len(text)}
+
+    monkeypatch.setattr(transcript_store, "persist", _persist)
+
+    def _card(_store, preview, mid, cid, *, turn_count=0, duration_sec=0):
         if db.chat_get_strict(uid, mid) is None:
             db.chat_append_strict(uid, mid, time.time(), {
                 "id": mid, "role": "openclaw",
@@ -178,18 +186,12 @@ def _run_finalize(monkeypatch, uid: str, call_id: str, *, capture=None):
             }, 200)
         return True
 
-    monkeypatch.setattr(summary, "persist_summary", _persist)
+    monkeypatch.setattr(summary, "persist_transcript_card", _card)
 
-    def _capture(_store, _turns, *, call_id=""):
-        calls["capture"] += 1
-        if capture is None:
-            raise AssertionError("capture_from_transcript must not run here")
-        return capture()
+    from proactive import proactive_core
 
-    monkeypatch.setattr(transcript_memory, "capture_from_transcript", _capture)
     monkeypatch.setattr(
-        summary,
-        "nudge_capture",
+        proactive_core, "capture_force",
         lambda _store: calls.__setitem__("nudge", calls["nudge"] + 1),
     )
     response = asyncio.run(
@@ -200,7 +202,9 @@ def _run_finalize(monkeypatch, uid: str, call_id: str, *, capture=None):
     return response.status_code, json.loads(response.body), calls
 
 
-def test_fresh_finalize_runs_transcript_capture_once_and_skips_nudge(monkeypatch):
+def test_fresh_finalize_archives_once_and_nudges_capture(monkeypatch):
+    """The archive must happen exactly once, and Capture must be kicked so the
+    call's memory does not wait out the 20-minute quiet window."""
     uid = _seed_user()
     call_id = "vcall_" + uuid.uuid4().hex[:10]
     _append(uid, {
@@ -208,14 +212,18 @@ def test_fresh_finalize_runs_transcript_capture_once_and_skips_nudge(monkeypatch
         "voice_call_id": call_id, "voice_turn_id": "t1",
     })
 
-    status, body, calls = _run_finalize(
-        monkeypatch, uid, call_id, capture=lambda: True
-    )
+    status, body, calls = _run_finalize(monkeypatch, uid, call_id)
     assert (status, body["status"], body["replayed"]) == (200, "finalized", False)
-    assert calls == {"capture": 1, "nudge": 0}
+    assert calls == {"archived": 1, "nudge": 1}
+    # Old clients read summary_message_id; it is dual-written for one release.
+    assert body["transcript_message_id"] == body["summary_message_id"]
 
 
-def test_fresh_finalize_falls_back_to_nudge_when_capture_declines(monkeypatch):
+def test_replayed_finalize_does_not_archive_again(monkeypatch):
+    """A retry (card already durable) must not re-archive — the archive insert
+    is ON CONFLICT DO NOTHING anyway, but re-running the model-free path twice
+    would still be a lie in the logs. Capture may be nudged again: it is
+    cursor-driven, so a second nudge cannot double-distil."""
     uid = _seed_user()
     call_id = "vcall_" + uuid.uuid4().hex[:10]
     _append(uid, {
@@ -223,46 +231,7 @@ def test_fresh_finalize_falls_back_to_nudge_when_capture_declines(monkeypatch):
         "voice_call_id": call_id, "voice_turn_id": "t1",
     })
 
-    status, body, calls = _run_finalize(
-        monkeypatch, uid, call_id, capture=lambda: False
-    )
-    assert (status, body["status"]) == (200, "finalized")
-    assert calls == {"capture": 1, "nudge": 1}
-
-
-def test_fresh_finalize_falls_back_to_nudge_when_capture_raises(monkeypatch):
-    uid = _seed_user()
-    call_id = "vcall_" + uuid.uuid4().hex[:10]
-    _append(uid, {
-        "role": "user", "source": "model_api",
-        "voice_call_id": call_id, "voice_turn_id": "t1",
-    })
-
-    def _boom():
-        raise RuntimeError("provider down")
-
-    status, body, calls = _run_finalize(monkeypatch, uid, call_id, capture=_boom)
-    # Memory errors never fail the request: summary/cleanup define the result.
-    assert (status, body["status"]) == (200, "finalized")
-    assert calls == {"capture": 1, "nudge": 1}
-
-
-def test_replay_finalize_nudges_instead_of_transcript_capture(monkeypatch):
-    # Replay: the summary row is already durable (first attempt persisted it but
-    # e.g. 502'd on cleanup). Transcript capture must NOT re-run — the
-    # summary-window nudge is the memory backstop on this path.
-    uid = _seed_user()
-    call_id = "vcall_" + uuid.uuid4().hex[:10]
-    _append(uid, {
-        "role": "user", "source": "model_api",
-        "voice_call_id": call_id, "voice_turn_id": "t1",
-    })
-    smid = summary.transcript_card_message_id(call_id)
-    db.chat_append_strict(uid, smid, time.time(), {
-        "id": smid, "role": "openclaw",
-        "source": "voice_call_transcript", "voice_call_id": call_id,
-    }, 200)
-
-    status, body, calls = _run_finalize(monkeypatch, uid, call_id, capture=None)
-    assert (status, body["status"], body["replayed"]) == (200, "finalized", True)
-    assert calls == {"capture": 0, "nudge": 1}
+    _run_finalize(monkeypatch, uid, call_id)
+    status, body, calls = _run_finalize(monkeypatch, uid, call_id)
+    assert (status, body["replayed"]) == (200, True)
+    assert calls["archived"] == 0
