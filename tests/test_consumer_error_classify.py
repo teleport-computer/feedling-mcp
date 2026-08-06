@@ -355,6 +355,106 @@ def test_parse_failed_marker_set_by_call_agent_sanitize_branch():
 # ---------------------------------------------------------------------------
 
 
+# --- 生产边界:真实 helper + 只 mock transport/subprocess ---------------
+# codex2 gatekeep(2026-08-06)抓到的假绿:上一版只用 lambda 直接返回 ""，
+# 而生产 helper 在**返回之前**就抛异常，分叉根本执行不到 —— 核心工单场景
+# (OpenAI 200 + content:"") 仍然归 system。这几条必须调真实 helper。
+
+
+class _FakeJsonResp:
+    """200 + 指定 JSON body。**刻意不叫 _FakeResp** —— 本文件已有一个同名的
+    状态码版(_FakeResp(503)),重名会静默覆盖它、废掉别的用例的 5xx 分支。"""
+
+    def __init__(self, payload):
+        self._payload = payload
+        self.status_code = 200
+        self.text = ""
+        self.headers = {}
+
+    def raise_for_status(self):
+        return None
+
+    def json(self):
+        return self._payload
+
+
+def _classify_raised(fn):
+    try:
+        fn()
+    except BaseException as exc:  # noqa: BLE001 — 分类器的输入就是异常
+        return crc.classify_agent_error(exc)
+    raise AssertionError("helper did not raise")
+
+
+def test_openai_http_200_with_empty_content_is_provider_empty_reply(monkeypatch):
+    # 核心工单形状(usr_7f30d63f):中转 200 + assistant content 为空。
+    monkeypatch.setattr(crc, "AGENT_HTTP_URL", "http://relay.local/v1/chat")
+    monkeypatch.setattr(
+        crc._HTTP, "post",
+        lambda *_a, **_k: _FakeJsonResp(
+            {"choices": [{"message": {"role": "assistant", "content": ""}}]}))
+    notice = _classify_raised(lambda: crc._call_agent_http_openai("hi"))
+    assert notice.error_class == "provider_empty_reply"
+    assert notice.blame == "provider_transient"
+
+
+def test_simple_http_200_with_empty_reply_field_is_provider_empty_reply(monkeypatch):
+    monkeypatch.setattr(crc, "AGENT_HTTP_URL", "http://relay.local/chat")
+    monkeypatch.setattr(
+        crc._HTTP, "post", lambda *_a, **_k: _FakeJsonResp({"response": ""}))
+    notice = _classify_raised(lambda: crc._call_agent_http_simple("hi"))
+    assert notice.error_class == "provider_empty_reply"
+    assert notice.blame == "provider_transient"
+
+
+def test_simple_http_unrecognized_body_stays_unknown(monkeypatch):
+    # 字段完全不认识 = 协议不匹配,不是「provider 给了空」——归因不许顺手扩大。
+    monkeypatch.setattr(crc, "AGENT_HTTP_URL", "http://relay.local/chat")
+    monkeypatch.setattr(
+        crc._HTTP, "post", lambda *_a, **_k: _FakeJsonResp({"totally_other": 1}))
+    notice = _classify_raised(lambda: crc._call_agent_http_simple("hi"))
+    assert notice.error_class == "unknown"
+    assert notice.blame == "system"
+
+
+def test_cli_exit_zero_without_assistant_output_is_provider_empty_reply(monkeypatch):
+    import subprocess as _sp
+
+    # 可执行文件存在性预检跑在 _run_cli_subprocess 之前,所以要给真实路径;
+    # 进程本身不会被执行(下面 mock 掉了 subprocess 包装器)。
+    monkeypatch.setattr(crc, "AGENT_CLI_CMD", "/bin/echo {message}")
+    monkeypatch.setattr(crc, "_agent_cli_cwd", lambda: None)
+    monkeypatch.setattr(crc, "_agent_cli_cwd_error", "")
+    monkeypatch.setattr(
+        crc, "_run_cli_subprocess",
+        lambda *_a, **_k: _sp.CompletedProcess(
+            args=["/bin/echo"], returncode=0, stdout="", stderr=""))
+    notice = _classify_raised(lambda: crc.call_agent_cli("hi", lane="chat"))
+    assert notice.error_class == "provider_empty_reply"
+    assert notice.blame == "provider_transient"
+
+
+def test_pi_empty_reply_with_quota_detail_still_classifies_as_quota(monkeypatch):
+    """空回复标记绝不许遮蔽 detail 里更具体的分类(codex2 要求)。
+
+    pi 退出码永远是 0，配额/鉴权错误只在 detail 里 —— 分类器把空回复判定排在
+    规则表之后，所以这条仍然是 quota_insufficient/user_provider。"""
+    exc = RuntimeError(
+        f"{crc.EMPTY_PROVIDER_REPLY_MARK}: pi agent produced no reply: "
+        "403 insufficient_user_quota: your credit balance is too low")
+    notice = crc.classify_agent_error(exc)
+    assert notice.error_class == "quota_insufficient"
+    assert notice.blame == "user_provider"
+
+
+def test_pi_empty_reply_without_detail_is_provider_empty_reply():
+    exc = RuntimeError(
+        f"{crc.EMPTY_PROVIDER_REPLY_MARK}: pi agent produced no reply: ")
+    notice = crc.classify_agent_error(exc)
+    assert notice.error_class == "provider_empty_reply"
+    assert notice.blame == "provider_transient"
+
+
 def test_call_agent_raw_empty_marks_provider_empty_reply(monkeypatch):
     # 原始回复本来就是空 → provider 给的空,归 provider_empty_reply。
     monkeypatch.setattr(crc, "AGENT_MODE", "http")

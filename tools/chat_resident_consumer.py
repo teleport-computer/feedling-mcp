@@ -790,6 +790,13 @@ CONSUMER_ERROR_CLASSES = frozenset(
 )
 
 
+# transport 成功、响应协议可识别、但 assistant 内容为空时,helper 抛的异常带这个
+# 前缀 —— 归因走 provider 而不是我们(usr_7f30d63f 2026-08-07)。**必须由 helper
+# 抛出点铸造**:生产链路里 helper 在返回前就抛异常,call_agent 拿不到那个空 body,
+# 只在 call_agent 里判空是死代码(codex2 gatekeep 用真实 helper 形状复现)。
+EMPTY_PROVIDER_REPLY_MARK = "empty provider reply"
+
+
 def classify_agent_error(exc: BaseException) -> AgentErrorNotice:
     """三层错误来源（claude/codex CLI 经 _cli_error_detail、stderr 兜底）已汇聚成
     异常文本；这里只做只读分类，永不抛出。"""
@@ -823,14 +830,6 @@ def classify_agent_error(exc: BaseException) -> AgentErrorNotice:
         return AgentErrorNotice("turn_timeout", "system",
                                 "这轮回复超时了，稍后再试。", detail)
     text = str(exc)
-    if "empty provider reply" in text:
-        # 2026-08-07(usr_7f30d63f 分诊):模型/中转返回 200 但内容为空(断流、
-        # 配额紧张时的假成功等)。这不是我们的解析问题 —— 归 provider,
-        # 别再把中转抽风包装成「系统出了问题」让用户来找我们。
-        return AgentErrorNotice(
-            "provider_empty_reply", "provider_transient",
-            "你的模型服务这次返回了空回复，稍后再试；反复出现请检查模型渠道或中转的稳定性。",
-            detail)
     if "no usable reply" in text:
         return AgentErrorNotice("reply_parse_failed", "system",
                                 "系统处理回复时出了问题，我们会尽快排查。", detail)
@@ -842,6 +841,18 @@ def classify_agent_error(exc: BaseException) -> AgentErrorNotice:
     for klass, blame, user_text, pat in _ERROR_CLASS_RULES:
         if pat.search(text):
             return AgentErrorNotice(klass, blame, user_text, detail)
+    # 「空回复」判定**必须排在规则表之后**:pi 退出码永远是 0，API 错误(配额/鉴权/
+    # 断流)只体现在 detail 里，那条异常同时带空回复标记和错误详情 —— 先判空会把
+    # quota_insufficient 之类更具体的分类整个遮蔽掉(codex2 gatekeep 2026-08-06)。
+    # 规则表没命中 = 真的只是「成功但没内容」，那才归 provider 的瞬时问题。
+    if EMPTY_PROVIDER_REPLY_MARK in text:
+        # 2026-08-07(usr_7f30d63f 分诊):模型/中转返回 200 但内容为空(断流、
+        # 配额紧张时的假成功等)。这不是我们的解析问题 —— 归 provider,
+        # 别再把中转抽风包装成「系统出了问题」让用户来找我们。
+        return AgentErrorNotice(
+            "provider_empty_reply", "provider_transient",
+            "你的模型服务这次返回了空回复，稍后再试；反复出现请检查模型渠道或中转的稳定性。",
+            detail)
     # 404 需与 model 同现才算模型错（裸 404 归 upstream_unavailable 太粗、归 auth 又错）
     if re.search(r"\b404\b", text) and "model" in lowered:
         return AgentErrorNotice("model_not_found", "user_provider",
@@ -927,7 +938,7 @@ def _consume_reply_parse_failed() -> str:
 def _reply_parse_failure_exc(reason: str) -> ValueError:
     """把 _consume_reply_parse_failed 的短码铸成分类器认识的异常文本。"""
     if reason == "provider_empty_reply":
-        return ValueError("agent received empty provider reply")
+        return ValueError(f"agent received {EMPTY_PROVIDER_REPLY_MARK}")
     return ValueError("agent produced no usable reply after sanitization")
 
 
@@ -5439,6 +5450,13 @@ def _call_agent_http_simple(
             return body
         if turn.messages:
             return turn.messages[0]
+        # 已知回复字段**存在但内容为空** = provider 给了空回复;字段完全不认识
+        # 才是协议不匹配(保持原来的 unknown 归因,那确实要人来看)。
+        if any(field in body for field in _JSON_REPLY_FIELDS):
+            raise ValueError(
+                f"{EMPTY_PROVIDER_REPLY_MARK}: reply field present but empty "
+                f"in: {sorted(f for f in _JSON_REPLY_FIELDS if f in body)}"
+            )
         raise ValueError(f"response field not found in: {list(body.keys())}")
     if isinstance(body, str):
         return body.strip()
@@ -5497,7 +5515,12 @@ def _call_agent_http_openai(
         return body
     if turn.messages:
         return turn.messages[0]
-    raise ValueError("OpenAI-compatible response has no usable reply text")
+    # 到这里 body 已确认是 dict(上面非 dict 已抛),即 transport 成功、协议可识别、
+    # 只是 assistant 内容为空 —— 中转在配额紧张/上游抽风时的典型「假成功」形状。
+    raise ValueError(
+        f"{EMPTY_PROVIDER_REPLY_MARK}: openai-compatible response carried no "
+        "assistant text"
+    )
 
 
 def call_agent_http(
@@ -7313,8 +7336,11 @@ def call_agent_cli(
         # pi's ONLY valid reply source — falling through to the generic extractor
         # would return the user's own echoed message as the reply. Surface the
         # error instead (verified against real pi 0.80.3 output, 2026-07-02).
+        # 标记 + 原 detail 一起带上:pi 退出码永远是 0,API 错误(配额/鉴权/断流)
+        # 只在 detail 里,而分类器把空回复判定排在规则表**之后** —— detail 有错误
+        # 特征时仍然命中 quota_insufficient 等更具体的类,不会被空回复遮蔽。
         raise RuntimeError(
-            "pi agent produced no reply: "
+            f"{EMPTY_PROVIDER_REPLY_MARK}: pi agent produced no reply: "
             f"{_cli_error_detail(result.stdout or '', result.stderr or '')}"
         )
 
@@ -7387,6 +7413,13 @@ def call_agent_cli(
         return raw
     text = _extract_text_from_cli_output(raw)
     if not text:
+        if result.returncode == 0:
+            # 进程正常退出却没有任何 assistant 输出 = 模型/中转给了空回复,
+            # 不是我们的解析问题。非 0 退出是真的进程失败,保留原归因。
+            raise ValueError(
+                f"{EMPTY_PROVIDER_REPLY_MARK}: cli agent exited 0 with no "
+                "assistant output"
+            )
         raise ValueError(
             f"cli agent produced no usable output (exit={result.returncode})"
         )
@@ -7732,6 +7765,10 @@ def call_agent(
     # 归因分叉:原始回复本来就没有实质文本 = provider 给的空(断流/假成功),
     # 有过内容、被清洗/解析掏空才算我们的(usr_7f30d63f 2026-08-07:中转抽风
     # 曾被一律记成 system,用户拿着「系统出了问题」来找我们)。
+    # ⚠️ 生产链路里**主判定在 helper 层**(带 EMPTY_PROVIDER_REPLY_MARK 抛出):
+    # call_agent_http/cli 拿到空 body 时会先抛,根本不会返回到这里。这条分叉覆盖的
+    # 是「helper 返回了内容、随后被 _suppress_torn_protocol_leaks 掏空」那一支,
+    # 以及仍会返回空串的 raw_text 路径。两处都要有,少任何一处都会漏归因。
     raw_body = raw if isinstance(raw, str) else _raw_assistant_text(raw)
     failure_class = (
         "provider_empty_reply" if not str(raw_body or "").strip()
