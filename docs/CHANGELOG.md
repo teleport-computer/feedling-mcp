@@ -47,6 +47,23 @@
 
 ## 记录正文（最新的在上面）
 
+## 2026-08-06 — Dashboard prod 首日热路径修补
+
+**[DONE] IA v2 上 prod 首日实测（首页 ~8s、产品健康顶 30s deadline、verdicts 每次 5-8s）暴露三处，全部修复。**
+
+- 迁移 0079：`chat_messages(ts)` 普通索引 + `user_logs(ts) WHERE
+  stream='proactive_jobs'` 部分索引——都是 0078 时"等 prod EXPLAIN"的
+  存量 follow-up，证据到齐即落地。服务首页队列/事件流、产品健康回复率、
+  铁杆 census（此前 30s 超时主因）与既有主动任务日报。
+- 首页队列 model_config_pending 加近 14 天活动过滤（chat ∪
+  app_session_end，两臂都有索引）：prod 首日 20 条截断，多为弃置账号的
+  历史坏配置——幽灵账号不是"需要你"的工单。
+- verdicts JSON 加 30s TTL 缓存 + single-flight：原"逐请求重建"假设在
+  prod 数据量下不成立（agent 轮询持续压库）；诚实通道改为 payload 一等
+  字段 `cached`/`cache_age_sec`（HTML 有 cache-note，JSON 有这个）。
+- 测试 297 通过（含 0079 head-pin 更新、队列幽灵过滤回归、缓存语义翻转）。
+
+
 ## 2026-08-06 — Admin dashboard IA v2：首页 + 导航 13→4 + 统一漏斗
 
 **[DONE] /admin/data-track 默认页改为「首页」：判定条 + 用户队列 + 产品脉搏 + 事件流 + 成本行；导航收敛为 首页/产品健康/用户/诊断 四项。**

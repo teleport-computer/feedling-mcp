@@ -464,7 +464,8 @@ def test_system_verdict_from_real_rulers_over_fixture_reports():
 
 
 # --------------------------------------------------------------------------- #
-# verdicts_payload + GET /v1/admin/data-track/verdicts (JSON, not page-cached)
+# verdicts_payload + GET /v1/admin/data-track/verdicts（JSON，30s TTL 缓存，
+# 陈旧声明走 payload 一等字段 cached/cache_age_sec）
 # --------------------------------------------------------------------------- #
 
 
@@ -492,11 +493,27 @@ def test_verdicts_payload_contract_shape(monkeypatch):
     assert counters.get("cost") is None
     assert counters.get("funnel") is None
 
-    # NOT page-cached (JSON has no cache-note channel to declare data age):
-    # a second call re-runs every builder.
-    admin_core.verdicts_payload("")
+    # Fresh build declares itself fresh.
+    assert payload["cached"] is False
+    assert payload["cache_age_sec"] == 0
+
+    # 30s TTL cache: a second call within the window re-runs NO builder and
+    # declares its staleness explicitly — the JSON honesty channel that the
+    # HTML cache-note provides for pages.
+    second = admin_core.verdicts_payload("")
+    assert counters["queue"] == 1
+    assert counters["imports"] == 1
+    assert second["cached"] is True
+    assert second["cache_age_sec"] >= 0
+    assert second["verdicts"] == payload["verdicts"]
+
+    # Expiring the cache forces a rebuild.
+    with admin_core._verdicts_cache_lock:
+        built_at, cached_payload = admin_core._verdicts_cache
+        admin_core._verdicts_cache = (built_at - 3600.0, cached_payload)
+    third = admin_core.verdicts_payload("")
     assert counters["queue"] == 2
-    assert counters["imports"] == 2
+    assert third["cached"] is False
 
 
 def test_verdicts_payload_failure_honesty(monkeypatch):
@@ -564,7 +581,8 @@ def test_verdicts_route_admin_gated_shape_and_clean_logs(monkeypatch, caplog):
     assert via_header.status_code == 200
     assert via_query.status_code == 200
     body = via_header.json()
-    assert set(body) == {"generated_at", "verdicts", "queue", "pulse"}
+    assert set(body) == {"generated_at", "verdicts", "queue", "pulse",
+                         "cached", "cache_age_sec"}
     assert set(body["verdicts"]) == {"system", "growth", "cost", "evidence"}
     assert body["verdicts"]["evidence"]["level"] == "unknown"
     assert body["queue"]["rows"][0]["user_id"] == "usr_stuck1"
@@ -1005,3 +1023,40 @@ def test_invalid_uid_back_link_returns_to_users_view():
     # view=users，不许把人丢回首页。
     page = dt._render_invalid_data_track_user_page("lol/../etc")
     assert "view=users" in page
+
+
+@requires_pg
+def test_queue_model_config_pending_requires_recent_activity(clean_hmfx_rows):
+    """历史遗留的坏配置不进队列：prod 首日 20 条截断的教训——弃用账号的
+    model_api test_status 永远非 ok，若不按近 14 天活动过滤会把队列灌满，
+    真正需要处理的用户反而被 truncated 挤掉。"""
+    now = time.time()
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            "DELETE FROM user_blobs WHERE user_id LIKE 'u_hmfx_%'"
+        )
+        # 活跃用户 + 坏配置：应在队列。近期活动 = 已被真回复的对话，
+        # 不落 stalled 口径（stalled 严重级更高会盖掉 model_config_pending）。
+        _hmfx_user(conn, "u_hmfx_cfg_active", now - 40 * 86400)
+        _hmfx_msg(conn, "u_hmfx_cfg_active", now - 2 * 86400, "user")
+        _hmfx_msg(conn, "u_hmfx_cfg_active", now - 2 * 86400 + 60, "agent")
+        conn.execute(
+            "INSERT INTO user_blobs (user_id, kind, doc) VALUES "
+            "('u_hmfx_cfg_active', 'model_api', %s)",
+            (_json.dumps({"test_status": "failed"}),),
+        )
+        # 幽灵用户 + 坏配置：40 天没有任何活动，不该占队列。
+        _hmfx_user(conn, "u_hmfx_cfg_ghost", now - 40 * 86400)
+        conn.execute(
+            "INSERT INTO user_blobs (user_id, kind, doc) VALUES "
+            "('u_hmfx_cfg_ghost', 'model_api', %s)",
+            (_json.dumps({"test_status": "failed"}),),
+        )
+    try:
+        codes = {r["user_id"]: r["reason_code"]
+                 for r in db.admin_home_queue()["rows"]}
+        assert codes.get("u_hmfx_cfg_active") == "model_config_pending"
+        assert "u_hmfx_cfg_ghost" not in codes
+    finally:
+        with db.get_pool().connection() as conn:
+            conn.execute("DELETE FROM user_blobs WHERE user_id LIKE 'u_hmfx_%'")
