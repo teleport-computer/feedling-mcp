@@ -798,6 +798,12 @@ CONSUMER_ERROR_CLASSES = frozenset(
 # **provider 自己的文本**送进来 —— 裸英文短语("empty provider reply")可被上游
 # 报错原样命中而劫持归因(自审 2026-08-07)。
 EMPTY_PROVIDER_REPLY_MARK = "feedling:empty_provider_reply"
+# 与上面成对:provider **给过**原始 assistant 文本,是我们自己的清洗规则
+# (_sanitize_reply_text:纯英文推理不当回复、协议残片压制等)把它清空的。
+# 归 system —— 这是本批唯一的归因边界,谁把内容弄没的谁背锅。
+# 判据必须取在 **parse 之前**:_agent_turn_from_raw 内部就跑 sanitizer,
+# 拿它的输出回头判空,永远分不出这两种情况(codex2 gatekeep R3)。
+SANITIZED_TO_EMPTY_MARK = "feedling:sanitized_to_empty"
 
 
 def _empty_reply_diagnostics(body: Any) -> str:
@@ -885,6 +891,10 @@ def classify_agent_error(exc: BaseException) -> AgentErrorNotice:
     # 断流)只体现在 detail 里，那条异常同时带空回复标记和错误详情 —— 先判空会把
     # quota_insufficient 之类更具体的分类整个遮蔽掉(codex2 gatekeep 2026-08-06)。
     # 规则表没命中 = 真的只是「成功但没内容」，那才归 provider 的瞬时问题。
+    if SANITIZED_TO_EMPTY_MARK in text:
+        # provider 给过文本、我们清空的 —— 归 system,与下面成对。
+        return AgentErrorNotice("reply_parse_failed", "system",
+                                "系统处理回复时出了问题，我们会尽快排查。", detail)
     if EMPTY_PROVIDER_REPLY_MARK in text:
         # 2026-08-07(usr_7f30d63f 分诊):模型/中转返回 200 但内容为空(断流、
         # 配额紧张时的假成功等)。这不是我们的解析问题 —— 归 provider,
@@ -5492,11 +5502,18 @@ def _call_agent_http_simple(
             return turn.messages[0]
         # 已知回复字段**存在但内容为空** = provider 给了空回复;字段完全不认识
         # 才是协议不匹配(保持原来的 unknown 归因,那确实要人来看)。
+        # 与 openai 分支同理:先查原始 assistant 文本,区分「没给」和「我们清空了」。
         if any(field in body for field in _JSON_REPLY_FIELDS):
+            present = sorted(f for f in _JSON_REPLY_FIELDS if f in body)
+            diagnostics = _empty_reply_diagnostics(body)
+            if str(_raw_assistant_text(body) or "").strip():
+                raise ValueError(
+                    f"{SANITIZED_TO_EMPTY_MARK}: reply field {present} was "
+                    f"emptied by our sanitizer {diagnostics}".strip()
+                )
             raise ValueError(
                 f"{EMPTY_PROVIDER_REPLY_MARK}: reply field present but empty "
-                f"in: {sorted(f for f in _JSON_REPLY_FIELDS if f in body)} "
-                f"{_empty_reply_diagnostics(body)}".strip()
+                f"in: {present} {diagnostics}".strip()
             )
         raise ValueError(f"response field not found in: {list(body.keys())}")
     if isinstance(body, str):
@@ -5556,12 +5573,21 @@ def _call_agent_http_openai(
         return body
     if turn.messages:
         return turn.messages[0]
-    # 到这里 body 已确认是 dict(上面非 dict 已抛),即 transport 成功、协议可识别、
-    # 只是 assistant 内容为空 —— 中转在配额紧张/上游抽风时的典型「假成功」形状。
+    # 到这里 body 已确认是 dict(上面非 dict 已抛)、且 turn 是空的。分两种:
+    # provider 压根没给文本(空回复)vs 给了、被我们的 sanitizer 清空(我们的)。
+    # **必须查原始 assistant 文本**:上面的 turn 是 _agent_turn_from_raw 的产物,
+    # 那里面已经跑过 sanitizer,拿它判等于把两种情况混成一种(codex2 gatekeep R3)。
+    diagnostics = _empty_reply_diagnostics(body)
+    if str(_raw_assistant_text(body) or "").strip():
+        raise ValueError(
+            f"{SANITIZED_TO_EMPTY_MARK}: openai-compatible assistant text was "
+            f"emptied by our sanitizer {diagnostics}".strip()
+        )
+    # 真的没给内容 —— 中转在配额紧张/上游抽风时的典型「假成功」形状。
     # 带上 body 的协议层诊断:200+{"error":insufficient_quota} 这种要让规则表先命中。
     raise ValueError(
         f"{EMPTY_PROVIDER_REPLY_MARK}: openai-compatible response carried no "
-        f"assistant text {_empty_reply_diagnostics(body)}".strip()
+        f"assistant text {diagnostics}".strip()
     )
 
 
@@ -7777,16 +7803,16 @@ def call_agent(
         # lines and would behead a pretty-printed JSON object).
         return raw if isinstance(raw, str) else _raw_assistant_text(raw)
 
-    turn = _agent_turn_from_raw(raw)
-    # 快照必须取在压制**之前**:压制之后再回头判空,就分不清「模型本来就没说话」
-    # 和「模型说了、被我们剥干净了」。早先用 _raw_assistant_text(raw) 重新提取,
-    # 那是给记忆车道写的窄提取器(只认 choices/response/reply/content/text),
-    # 读不到 top-level messages 与 actions —— 于是 torn-leak 被压制的那两种 body
-    # 形状(正是本机制要覆盖的原始 bug 形状)被误判成 provider 空回复,把我们自己
-    # 的协议压制甩锅给用户的中转(自审 2026-08-07 BLOCKER)。
-    model_said_something = bool(
-        turn.messages or turn.actions or turn.thinking_summary or turn.tool_calls
+    # 快照必须取在 **_agent_turn_from_raw 之前** —— 那个函数内部就跑 sanitizer,
+    # 拿它的产物回头判空,「模型没说话」和「模型说了、被我们清空/剥干净」会混成
+    # 同一种(codex2 gatekeep 连抓两轮:先是压制之后判、再是 parse 之后判)。
+    #   · raw 是 str:provider 给的内容就是它本身,判 strip 即可;
+    #   · raw 是 dict:helper 只在 turn 非空时才返回 body(见两个 _call_agent_http_*
+    #     的返回条件),所以走到这里的 dict 必然带过内容,剩下的空只能是我们压制掉的。
+    model_said_something = (
+        bool(str(raw).strip()) if isinstance(raw, str) else True
     )
+    turn = _agent_turn_from_raw(raw)
     _suppress_torn_protocol_leaks(turn, lane=lane)
     if turn.actions or turn.messages or turn.thinking_summary or turn.tool_calls:
         body: dict[str, Any] = {

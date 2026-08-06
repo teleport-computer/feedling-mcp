@@ -499,6 +499,54 @@ def test_torn_leak_suppression_is_ours_not_the_providers(monkeypatch, body):
     assert crc._consume_reply_parse_failed() == "reply_parse_failed"
 
 
+# provider **给过**文本、被我们的 sanitizer 清空的稳定样本:纯英文推理旁白,
+# _sanitize_reply_text 按规则把它整段清掉(同源见
+# tests/test_chat_resident_consumer.py::test_sanitize_reply_text_pure_english_reasoning_returns_empty)。
+_SANITIZER_EATS_THIS = (
+    'The user wrote "sweet!" ...\nI think it is best to respond ...'
+)
+
+
+def test_openai_sanitized_to_empty_is_ours_not_the_providers(monkeypatch):
+    """provider 说了话、我们清空的 → system。归因边界的另一半(codex2 R3)。
+
+    这是本批被连抓两轮的同一个洞:_agent_turn_from_raw **内部就跑 sanitizer**,
+    拿它的产物回头判空,「没说话」和「说了被我们清空」永远分不开。"""
+    monkeypatch.setattr(crc, "AGENT_HTTP_URL", "http://relay.local/v1/chat")
+    monkeypatch.setattr(
+        crc._HTTP, "post",
+        lambda *_a, **_k: _FakeJsonResp({"choices": [
+            {"message": {"role": "assistant", "content": _SANITIZER_EATS_THIS}}]}))
+    notice = _classify_raised(lambda: crc._call_agent_http_openai("hi"))
+    assert notice.error_class == "reply_parse_failed"
+    assert notice.blame == "system"
+
+
+def test_simple_sanitized_to_empty_is_ours_not_the_providers(monkeypatch):
+    monkeypatch.setattr(crc, "AGENT_HTTP_URL", "http://relay.local/chat")
+    monkeypatch.setattr(
+        crc._HTTP, "post",
+        lambda *_a, **_k: _FakeJsonResp({"response": _SANITIZER_EATS_THIS}))
+    notice = _classify_raised(lambda: crc._call_agent_http_simple("hi"))
+    assert notice.error_class == "reply_parse_failed"
+    assert notice.blame == "system"
+
+
+def test_call_agent_str_raw_sanitized_to_empty_stays_ours(monkeypatch):
+    """CLI 返回非空文本、被 call_agent 这一层的 parse/sanitize 清空 → 仍归 system。
+
+    快照取在 _agent_turn_from_raw **之前**,否则这条也会被甩给 provider。"""
+    monkeypatch.setattr(crc, "AGENT_MODE", "http")
+    monkeypatch.setattr(crc, "call_agent_http",
+                        lambda *_a, **_k: _SANITIZER_EATS_THIS)
+    monkeypatch.setattr(crc, "_call_with_resident_busy_poll",
+                        lambda invoke, lane: invoke())
+    monkeypatch.setattr(crc, "SEND_FALLBACK_ON_AGENT_ERROR", True)
+    out = crc.call_agent("hi", lane="chat")
+    assert out == [crc.FALLBACK_REPLY]
+    assert crc._consume_reply_parse_failed() == "reply_parse_failed"
+
+
 @pytest.mark.parametrize(("body", "expected"), [
     # one-api/new-api 中转配额耗尽的标准形状:HTTP 200 + error 体。
     ({"error": {"message": "insufficient_quota: your credit balance is too low"}},
