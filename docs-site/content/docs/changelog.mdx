@@ -28,15 +28,28 @@ change must not be interpreted as an API guarantee.
   Scheduled reminders still require public text, while malformed or truncated
   thinking markup remains a fail-closed error.
 
-- **Voice calls now end in a single summary instead of per-turn chat rows.**
-  New public endpoint `POST /v1/voice/finalize`: the client posts the call
-  transcript at hang-up; the user's own model writes one `voice_call_summary`
-  chat message and the call's per-turn rows are deleted only after the summary
-  is durable (idempotent replays return the same `summary_message_id`; on
-  summary failure nothing is deleted and the request may be retried; rows
-  already folded by Runtime V2 compaction are retained and reported as
-  `retained_covered`). The live-call flow — identity, memory, tools, and
-  per-turn streaming — is unchanged.
+- **Voice calls are now archived in full, and memory is distilled from the
+  whole call.** At hang-up `POST /v1/voice/finalize` archives the complete
+  transcript (permanent, sealed to the account's content key) and leaves ONE
+  bounded preview card in chat; the per-turn rows are deleted only after the
+  archive is durable. Memory then runs through the ordinary capture pipeline
+  over the archived full text. This replaces the earlier behaviour where a
+  model-written 1–3 sentence summary was both the chat artifact and the only
+  thing memory ever saw — anything not in those sentences was lost. The
+  response now returns `transcript_message_id`; `summary_message_id` is still
+  sent as a deprecated alias for one release. Idempotent replays are judged on
+  the archive; rows already folded by Runtime V2 compaction are retained and
+  reported as `retained_covered`.
+
+- **New public endpoints for reading archived calls.**
+  `GET /v1/voice/transcripts` lists a caller's calls (metadata only — no
+  words), and `GET /v1/voice/transcripts/{call_id}` returns one call's sealed
+  envelope for the client to decrypt locally. The server never returns
+  transcript plaintext. Calls are retained until the account is deleted;
+  clearing chat history does not remove them.
+
+- **Voice call length raised from 5 minutes to 1 hour.** The previous cap was
+  shorter than the voice provider's own default and had no product rationale.
 - **`POST /v1/chat/message` now accepts `context_refs`, carrying Garden
   "talk in chat" memory references on the resident line.** Same plaintext
   routing contract as the hosted send: only `type: "memory"` entries are

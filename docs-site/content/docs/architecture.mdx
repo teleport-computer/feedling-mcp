@@ -181,15 +181,25 @@ account's chat route, provider URL, or credential.
    ElevenLabs to synthesize. During the call the user and assistant turns are
    persisted as ordinary Chat rows in their original order.
 5. At hang-up the client posts the call transcript to
-   `POST /v1/voice/finalize`. The user's own model writes ONE
-   `voice_call_summary` chat message (deterministic id, idempotent retries),
-   and only after that summary is durable are the call's per-turn rows
-   deleted — so the raw back-and-forth stops occupying chat history and model
-   context, and memory capture distils from the summary instead of the
-   fragments. Rows already folded into the Runtime V2 conversation summary are
-   retained (deleting them would desync compaction's frozen ledger); they no
-   longer feed future context reads. If the summary cannot be generated or
-   persisted, nothing is deleted and the client may retry. Transcript trust
+   `POST /v1/voice/finalize`. The full transcript is archived — permanently,
+   sealed to the account's content key — and the chat stream keeps ONE bounded
+   preview card (`voice_call_transcript`, deterministic id, idempotent
+   retries). Only after the archive is durable are the call's per-turn rows
+   deleted, so the raw back-and-forth stops occupying chat history and model
+   context. Memory then runs the ordinary capture pipeline, which renders the
+   ARCHIVED FULL transcript into its window in place of that card — a call is
+   distilled from everything that was said, not from a précis of it. Rows
+   already folded into the Runtime V2 conversation summary are retained
+   (deleting them would desync compaction's frozen ledger); they no longer
+   feed future context reads. If the archive or the card cannot be persisted,
+   nothing is deleted and the client may retry.
+6. Archived calls stay readable: `GET /v1/voice/transcripts` lists them and
+   `GET /v1/voice/transcripts/{call_id}` returns the sealed envelope for the
+   client to open locally. The agent reaches the same archive through the
+   `voice_transcript_list` / `voice_transcript_read` tools, and memory cards
+   distilled from a call carry that call's id so it can go back to the source.
+   The server stores and serves ciphertext; it never holds the transcript
+   after the finalize request that archived it. Transcript trust
    boundary: the transcript is client-supplied plaintext (chat rows are
    ciphertext the server cannot read); an authenticated user can therefore
    only shape their own summary and delete their own call rows. Known

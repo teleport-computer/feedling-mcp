@@ -430,13 +430,21 @@ CAPTURE_HISTORY_LIMIT = int(os.environ.get("FEEDLING_CAPTURE_HISTORY_LIMIT", "16
 # One shared budget across format and semantic correction. A format bounce
 # consumes it, so semantic validation can never multiply a job into four calls.
 CAPTURE_AGENT_REASK_BUDGET = 1
-CAPTURE_WINDOW_MAX_CHARS = int(os.environ.get("FEEDLING_CAPTURE_WINDOW_MAX_CHARS", "12000"))
-# 单通电话展开进窗口的预算。必须显著小于 CAPTURE_WINDOW_MAX_CHARS：上面那道
-# 截断是 text[-N:]（从尾部保留），一通没有自我约束的长电话会把它前面的文字
-# 聊天连同转写开头一起静默砍掉。8000 给一小时通话（约 9000 字）留了采样余地，
-# 也给同窗口的文字消息留了 4000。
+# 12000 → 40000（2026-08-07）：这道截断是 text[-N:]，从尾部保留。通话转写进窗口后，
+# 12000 装不下一通电话 + 同窗口的文字聊天，会把前面的文字**静默**砍掉。
+# 40000 = 转写预算 30000 + 文字聊天 10000。
+CAPTURE_WINDOW_MAX_CHARS = int(os.environ.get("FEEDLING_CAPTURE_WINDOW_MAX_CHARS", "40000"))
+
+
+
+
+# 单通电话展开进窗口的预算。**必须大于通话时长上限能产出的字数**，否则采样会
+# 永久丢掉中段 —— 那等于宣称「从每句话 capture」却做不到。现行上限 3600 秒
+# （iOS ElevenLabsAgentClient.configVersion 12），一小时中文口语约 9000 字，
+# 30000 留三倍余量。tests/test_voice_transcript_budget.py 锁死这个关系：谁调大
+# 通话时长而不调这里，测试会红。采样只是"预算真被突破时不要静默失败"的兜底。
 CAPTURE_VOICE_TRANSCRIPT_MAX_CHARS = int(
-    os.environ.get("FEEDLING_CAPTURE_VOICE_TRANSCRIPT_MAX_CHARS", "8000")
+    os.environ.get("FEEDLING_CAPTURE_VOICE_TRANSCRIPT_MAX_CHARS", "30000")
 )
 VOICE_TRANSCRIPT_SOURCE = "voice_call_transcript"
 CAPTURE_CONTEXT_MAX_CHARS = int(os.environ.get("FEEDLING_CAPTURE_CONTEXT_MAX_CHARS", "4000"))
@@ -11724,6 +11732,9 @@ def _bounded_voice_transcript(text: str) -> str:
     head = text[:head_budget].rstrip()
     tail = text[-tail_budget:].lstrip() if tail_budget else ""
     omitted = len(text) - len(head) - len(tail)
+    log.warning(
+        "voice transcript exceeded capture budget: %d chars, %d omitted "
+        "(raise FEEDLING_CAPTURE_VOICE_TRANSCRIPT_MAX_CHARS)", len(text), omitted)
     return f"{head}\n…（中间约 {omitted} 字省略，完整记录见通话详情）…\n{tail}"
 
 
@@ -11873,14 +11884,18 @@ def _capture_build_envelope(card: dict, *, occurred_at: str, source: str = "memo
 def _capture_actions_from_cards(cards: list[dict], *, job: dict, messages: list[dict]) -> tuple[list[dict], int, int]:
     occurred_at = _capture_occurred_at(job, messages)
     source_ids = [_capture_message_id(msg) for msg in messages if _capture_message_id(msg)]
-    # 窗口恰好含一通电话时给卡片打溯源提示;多通无法判断某张卡属于哪一通,不打。
+    # 溯源只在**能证明**归属时打:窗口里恰好一通电话,且没有别的内容。挂断即
+    # 触发 capture,所以这是常态。混合窗口一律不打 —— 无法判断某张卡来自哪边,
+    # 盖章就是假精度(与 V2 worker 同规则)。
     _call_ids = {
         str(m.get("voice_call_id") or "").strip()
         for m in messages
         if str(m.get("source") or "") == VOICE_TRANSCRIPT_SOURCE
         and str(m.get("voice_call_id") or "").strip()
     }
-    voice_call_id = next(iter(_call_ids)) if len(_call_ids) == 1 else ""
+    voice_call_id = (
+        next(iter(_call_ids)) if len(_call_ids) == 1 and len(messages) == 1 else ""
+    )
     actions: list[dict] = []
     cards_added = 0
     cards_superseded = 0
@@ -11990,9 +12005,33 @@ def _process_capture_jobs(jobs: list) -> float:
             # literal "user:"). Fetched only when there IS a window — an empty
             # window keeps the fast-fail path without burning identity calls.
             identity, ai_name, user_name, identity_text = _capture_identity_context()
-            window_text = _capture_window_text(
-                messages, user_label=user_name, agent_label=ai_name
-            )
+            try:
+                window_text = _capture_window_text(
+                    messages, user_label=user_name, agent_label=ai_name
+                )
+            except Exception as exc:  # noqa: BLE001
+                # 取归档全文失败(backend/enclave 抖动)。这条 job 已经 claim 并标
+                # realizing,异常直接冒出去会把它留在 realizing、还会打断整批 job。
+                # 显式标 failed:游标不动,下一轮重新 claim 重跑 —— 这才是注释里
+                # 承诺的"整个 job 失败重试",也才真的没有"退回预览"这条路。
+                log.warning("capture window build failed id=%s: %s", job_id, exc)
+                update_proactive_job_status(
+                    job_id,
+                    "failed",
+                    "capture_window_build_failed",
+                    extra={
+                        "capture_result": {
+                            "status": "failed",
+                            "reason": "capture_window_build_failed",
+                            "detail": str(exc)[:200],
+                        },
+                        "capture_window": window,
+                        "cards_added": 0,
+                        "cards_superseded": 0,
+                        "noop_reason": "capture_window_build_failed",
+                    },
+                )
+                continue
         if not window_text:
             update_proactive_job_status(
                 job_id,

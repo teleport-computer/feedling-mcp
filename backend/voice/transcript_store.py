@@ -1,5 +1,12 @@
 """Permanent per-call transcript archive: render, persist, read back.
 
+Rows here are written ONCE and never updated. That is not incidental: the TEE
+replicator copies this table on a ``created_at`` cursor with no requeue, so an
+in-place edit after the row has been copied would leave the TEE shadow
+permanently stale. ``chat_message_id`` is therefore supplied at INSERT time
+(the card id is deterministic from ``call_id``, so the caller knows it before
+either row exists) rather than stamped afterwards.
+
 The full call transcript is archived at hangup and kept forever. Three readers:
 
 - **the user** — Settings lists their calls; the client fetches the envelope and
@@ -112,19 +119,26 @@ def persist(store, call_id: str, text: str, *, turn_count: int,
     }
 
 
-def stamp_chat_message_id(user_id: str, call_id: str, chat_message_id: str) -> None:
-    """Back-link the archive to its chat card. Best-effort: the card is
-    reachable from the archive list either way, this only saves a lookup."""
+def exists(user_id: str, call_id: str) -> bool:
+    """这通电话归档过没有 —— 幂等判据必须问归档表本身。
+
+    不能拿"聊天里已有那张卡"代替:卡的 id 沿用了摘要时代的 uuid5 命名空间,
+    所以一条**旧版本写下的 voice_call_summary 行**会让新版本误判"已处理",
+    于是跳过归档、照常删掉逐轮行 —— 客户端明明又把全文送来了,却被丢掉,
+    而且是永久的(逐轮行也没了)。这个窗口真实存在:旧版本落了摘要行但
+    cleanup 502 / 响应丢失,用户升级后客户端重试。
+    """
     try:
         with db.get_pool().connection() as conn:
-            conn.execute(
-                "UPDATE voice_transcripts SET chat_message_id = %s "
-                "WHERE user_id = %s AND call_id = %s AND chat_message_id = ''",
-                (str(chat_message_id or "")[:160], str(user_id), str(call_id)),
-            )
-    except Exception as exc:  # noqa: BLE001 — cosmetic back-link only
-        log.warning("[voice.transcript] stamp failed user=%s call=%s: %s",
+            row = conn.execute(
+                "SELECT 1 FROM voice_transcripts WHERE user_id = %s AND call_id = %s",
+                (str(user_id), str(call_id)),
+            ).fetchone()
+        return row is not None
+    except Exception as exc:  # noqa: BLE001 — 未知即当作"没归档",宁可重写一次
+        log.warning("[voice.transcript] exists check failed user=%s call=%s: %s",
                     str(user_id)[:12], str(call_id)[:24], str(exc)[:120])
+        return False
 
 
 def get_envelope(user_id: str, call_id: str) -> dict | None:

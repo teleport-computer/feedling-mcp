@@ -551,9 +551,11 @@ _CAPTURE_PROMPT_SOURCES = frozenset(
      "voice_call_transcript"}
 )
 _VOICE_TRANSCRIPT_SOURCE = "voice_call_transcript"
-# 单通电话渲染进 capture 窗口的字符预算。一小时通话约 9000 汉字，远在预算内；
-# 这道闸是给上下文很小的模型兜底——没有它，规则「取不到全文就不蒸」会让这类
-# 用户的游标永久卡在反复失败上。超预算时头尾采样并显式标注省略。
+# 单通电话渲染进 capture 窗口的字符预算。**必须大于通话时长上限能产出的字数**，
+# 否则采样会永久丢中段 —— 那等于宣称「从每句话 capture」却做不到。现行上限
+# 3600 秒（iOS ElevenLabsAgentClient），一小时中文口语约 9000 字，30000 留三倍
+# 余量。tests/test_voice_transcript_budget.py 锁死这个关系。采样只是"预算真被
+# 突破时不要静默失败"的兜底，正常路径不可达；走到那里会打 warning，不静默。
 _VOICE_TRANSCRIPT_PROMPT_CHARS = _positive_int_env(
     "FEEDLING_V2_VOICE_TRANSCRIPT_PROMPT_CHARS", "30000"
 )
@@ -4758,6 +4760,9 @@ def _bounded_voice_transcript(text: str, *, budget: int) -> str:
     head = text[:head_budget].rstrip()
     tail = text[-tail_budget:].lstrip() if tail_budget else ""
     omitted = len(text) - len(head) - len(tail)
+    log.warning(
+        "[v2.worker] voice transcript exceeded capture budget: %d chars, %d omitted "
+        "(raise FEEDLING_V2_VOICE_TRANSCRIPT_PROMPT_CHARS)", len(text), omitted)
     return f"{head}\n…（中间约 {omitted} 字省略，完整记录见通话详情）…\n{tail}"
 
 
@@ -9168,10 +9173,12 @@ async def _run_extraction(
         source_ids = [str(m.get("id")) for m in prompt_tail if m.get("id")]
 
         if lane == "capture":
-            # 窗口恰好含一通电话时,给卡片打上溯源提示;多通无法判断归属,不打。
-            _sole_call_id = (
-                next(iter(voice_transcripts)) if len(voice_transcripts) == 1 else ""
-            )
+            # 溯源只在**能证明**归属时打:窗口里恰好一通电话,且没有别的可捕捉
+            # 内容。挂断即触发 capture,所以这是常态。混合窗口(通话 + 文字聊天)
+            # 一律不打 —— 那时无法判断某张卡到底来自哪一边,盖章就是假精度。
+            _sole_call_id = ""
+            if len(voice_transcripts) == 1 and len(prompt_tail) == 1:
+                _sole_call_id = next(iter(voice_transcripts))
             parse = parse_capture_cards
 
             def to_actions(*args, _call_id=_sole_call_id, **kwargs):

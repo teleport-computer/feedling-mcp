@@ -341,9 +341,14 @@ async def finalize_voice_call(
         store = core_store.get_store(user_id)
         import db as _db
 
-        # Idempotent replay: card already durable -> just redo cleanup + nudge.
-        already = _db.chat_get_strict(user_id, mid) is not None
-        if not already:
+        # Idempotent replay. The judge is the ARCHIVE, not the chat card: the
+        # card id reuses the summary era's uuid5 namespace, so a row written by
+        # an older build would otherwise read as "already handled" and this
+        # request would delete the per-turn rows without ever storing the
+        # transcript the client just re-sent — losing the call for good.
+        archived = transcript_store.exists(user_id, call_id)
+        already = archived and _db.chat_get_strict(user_id, mid) is not None
+        if not archived:
             text = transcript_store.render_transcript(turns)
             if not text:
                 return {"error": "turns_required"}, 400
@@ -363,7 +368,14 @@ async def finalize_voice_call(
                     user_id[:12], call_id[:24], str(exc)[:160],
                 )
                 return {"error": "voice_transcript_not_archived"}, 502
-            if not voice_cleanup.persist_transcript_card(
+            if _db.chat_get_strict(user_id, mid) is not None:
+                # 旧版本留下的摘要行占着这个 id。归档刚补上了,但那行的 source
+                # 仍是 voice_call_summary —— 它读得出来、也不会被 capture 展开
+                # (source 不在白名单里)。保留它而不是覆写:改写用户可见的历史
+                # 比留一条旧卡更糟,而这通电话的记忆本来也早就蒸过了。
+                log.info("[voice.finalize] legacy summary row kept user=%s call=%s",
+                         user_id[:12], call_id[:24])
+            elif not voice_cleanup.persist_transcript_card(
                 store, transcript_store.build_preview(text), mid, call_id,
                 turn_count=stats["turn_count"], duration_sec=stats["duration_sec"],
             ):
