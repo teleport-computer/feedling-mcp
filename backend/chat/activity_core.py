@@ -22,7 +22,20 @@ def read_turn_activity(store: UserStore, turn_id: str) -> tuple[dict, int]:
         return {"error": "invalid_turn_id"}, 400
     jobs, rows = jobs_store.chat_turn_activity_rows(store.user_id, normalized)
     if jobs:
-        return chat_activity.turn_response(normalized, jobs, rows), 200
+        # 只有存在失败 job 时才多查一次「真回复证据」——一轮先失败后成功的,失败
+        # 不再透出(见 chat_activity.turn_response 的 turn_answered)。
+        turn_answered = False
+        if any(
+            str(job.get("status") or "").strip().lower()
+            in ("failed", "cancelled", "discarded", "expired")
+            for job in jobs
+        ):
+            turn_answered = jobs_store.turn_answered_by_real_reply(
+                store.user_id, normalized
+            )
+        return chat_activity.turn_response(
+            normalized, jobs, rows, turn_answered=turn_answered
+        ), 200
     parent, resident_rows = activity_store.resident_turn_rows(store.user_id, normalized)
     if parent is None:
         return {"error": "turn_activity_not_found"}, 404

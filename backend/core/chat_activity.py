@@ -240,7 +240,13 @@ def _turn_failure(
     return None
 
 
-def turn_response(turn_id: str, jobs: Iterable[Mapping[str, Any]], rows: Iterable[Mapping[str, Any]]) -> dict:
+def turn_response(
+    turn_id: str,
+    jobs: Iterable[Mapping[str, Any]],
+    rows: Iterable[Mapping[str, Any]],
+    *,
+    turn_answered: bool = False,
+) -> dict:
     source_jobs = list(jobs)
     job_list = [
         {
@@ -261,7 +267,9 @@ def turn_response(turn_id: str, jobs: Iterable[Mapping[str, Any]], rows: Iterabl
         "jobs": job_list,
         "events": project_tool_events(row_list),
     }
-    failure = _turn_failure(source_jobs, row_list)
+    # turn_answered=真回复证据(见 jobs_store.turn_answered_by_real_reply):一轮
+    # 先失败后重试成功时,失败 job 仍在 jobs 列表里,但最终结果是成功——失败让位。
+    failure = None if turn_answered else _turn_failure(source_jobs, row_list)
     if failure is not None:
         failure["message_id"] = turn_id
         response["failure"] = failure
