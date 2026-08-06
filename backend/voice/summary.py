@@ -95,7 +95,7 @@ def generate_summary(store, turns: list[dict]) -> str:
     return text
 
 
-def persist_summary(store, text: str, message_id: str) -> bool:
+def persist_summary(store, text: str, message_id: str, call_id: str) -> bool:
     """Durably append exactly one ``voice_call_summary`` chat row.
 
     Returns True only when the row is durably present. Idempotent via the
@@ -118,7 +118,12 @@ def persist_summary(store, text: str, message_id: str) -> bool:
         return False
     try:
         store.append_chat(
-            "openclaw", "voice_call_summary", env, content_type="text", strict=True
+            "openclaw",
+            "voice_call_summary",
+            env,
+            content_type="text",
+            extra={"voice_call_id": str(call_id)},
+            strict=True,
         )
     except Exception:  # noqa: BLE001 — failed, or raced a concurrent replay
         try:

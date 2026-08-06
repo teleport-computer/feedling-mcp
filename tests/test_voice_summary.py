@@ -35,3 +35,32 @@ def test_summary_message_id_is_deterministic_per_call():
     a = summary.summary_message_id("vcall_abc")
     assert a == summary.summary_message_id("vcall_abc")
     assert a != summary.summary_message_id("vcall_def")
+
+
+def test_persisted_summary_keeps_its_voice_call_id(monkeypatch):
+    captured = {}
+
+    class Store:
+        user_id = "u_voice_summary"
+
+        def append_chat(self, role, source, envelope, **kwargs):
+            captured.update(
+                role=role,
+                source=source,
+                envelope=envelope,
+                **kwargs,
+            )
+
+    monkeypatch.setattr(summary.db, "chat_get_strict", lambda *_args: None)
+    monkeypatch.setattr(
+        summary.core_envelope,
+        "_build_shared_envelope_for_store",
+        lambda *_args, **_kwargs: ({"id": "summary-id"}, None),
+    )
+
+    assert summary.persist_summary(
+        Store(), "通话总结", "summary-id", "vcall_abc"
+    )
+    assert captured["role"] == "openclaw"
+    assert captured["source"] == "voice_call_summary"
+    assert captured["extra"] == {"voice_call_id": "vcall_abc"}

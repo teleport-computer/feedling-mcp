@@ -332,7 +332,7 @@ async def finalize_voice_call(
                     user_id[:12], call_id[:24], str(exc)[:120],
                 )
                 return {"error": "voice_summary_failed"}, 502
-            if not voice_summary.persist_summary(store, text, mid):
+            if not voice_summary.persist_summary(store, text, mid, call_id):
                 return {"error": "voice_summary_not_persisted"}, 502
         cleanup = voice_summary.delete_call_messages(user_id, call_id)
         if cleanup["remaining"] > 0:
