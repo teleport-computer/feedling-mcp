@@ -228,7 +228,13 @@ def classify_upstream(text: str) -> str:
     """把上游/运行时错误文本分类到 chat 上游 error_class；未命中返 ""（调用方
     决定兜底，如 genesis 落 genesis_failed）。与 consumer classify_agent_error 的
     规则表等价（不含 turn_timeout/reply_parse_failed 那两个凭异常类型/特定串判定
-    的分支——那两类不会出现在 genesis/import 的错误文本里）。"""
+    的分支——那两类不会出现在 genesis/import 的错误文本里）。
+    ⚠️ 刻意不含 ``provider_empty_reply``:那个类由 consumer 侧的
+    ``EMPTY_PROVIDER_REPLY_MARK`` 在 helper 抛出点铸造,backend 从不铸它,
+    所以这里没有对应规则(同 turn_timeout / reply_parse_failed 的既有排除)。
+    若将来 backend 也开始产这个标记,记得两边一起加,否则
+    test_classify_upstream_mirrors_consumer_on_samples 会红。
+    """
     t = text or ""
     lowered = t.lower()
     if "resident_never_claimed" in lowered:

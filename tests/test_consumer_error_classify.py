@@ -9,6 +9,8 @@ import sys
 import types
 from pathlib import Path
 
+import pytest
+
 _ENV_DEFAULTS = {
     "FEEDLING_API_URL": "http://localhost:5001",
     "FEEDLING_API_KEY": "test_key_00000000",
@@ -465,6 +467,97 @@ def test_call_agent_raw_empty_marks_provider_empty_reply(monkeypatch):
     out = crc.call_agent("hi", lane="chat")
     assert out == [crc.FALLBACK_REPLY]
     assert crc._consume_reply_parse_failed() == "provider_empty_reply"
+
+
+# 撕裂协议泄漏的真实形状(与 test_consumer_torn_protocol_leak.py 同源):
+# 模型把 JSON 撕成两半,HEAD 落进 reasoning、TAIL 落进可见字段。
+_TORN_HEAD = '{"messages":[],"actions":[{"type":"pro'
+_TORN_TAIL = 'active.sleep","reason":"7点了 还在睡 不打扰了 醒了会找我"}]}'
+
+
+@pytest.mark.parametrize("body", [
+    {"messages": [_TORN_TAIL], "provider_reasoning": _TORN_HEAD},
+    {"actions": [{"type": "proactive.send_message", "text": _TORN_TAIL}],
+     "provider_reasoning": _TORN_HEAD},
+    {"choices": [{"message": {"content": _TORN_TAIL}}],
+     "provider_reasoning": _TORN_HEAD},
+])
+def test_torn_leak_suppression_is_ours_not_the_providers(monkeypatch, body):
+    """协议泄漏被我们压制掏空 → 必须留在 system,绝不能甩锅给中转。
+
+    自审 2026-08-07 抓到的 BLOCKER:早先用 _raw_assistant_text(raw) 回头判空,
+    那是记忆车道的窄提取器(不读 top-level messages / actions),于是前两种 body
+    (其中 actions 那种正是原始 torn-leak bug 形状)被误判成 provider 空回复。
+    这里跑**真实压制器**,三种 body 形状都必须归 system。"""
+    monkeypatch.setattr(crc, "AGENT_MODE", "http")
+    monkeypatch.setattr(crc, "call_agent_http", lambda *_a, **_k: body)
+    monkeypatch.setattr(crc, "_call_with_resident_busy_poll",
+                        lambda invoke, lane: invoke())
+    monkeypatch.setattr(crc, "SEND_FALLBACK_ON_AGENT_ERROR", True)
+    out = crc.call_agent("hi", lane="proactive")
+    assert out == [crc.FALLBACK_REPLY]
+    assert crc._consume_reply_parse_failed() == "reply_parse_failed"
+
+
+@pytest.mark.parametrize(("body", "expected"), [
+    # one-api/new-api 中转配额耗尽的标准形状:HTTP 200 + error 体。
+    ({"error": {"message": "insufficient_quota: your credit balance is too low"}},
+     "quota_insufficient"),
+    ({"error": {"message": "invalid api key provided"}}, "auth_invalid"),
+    # 内容策略拦截:choices 在但 finish_reason 说明了原因。
+    ({"choices": [{"finish_reason": "content_filter",
+                   "message": {"content": ""}}]}, "content_filtered"),
+    # 什么诊断都没有 = 真的只是「成功但没内容」。
+    ({"choices": [{"message": {"role": "assistant", "content": ""}}]},
+     "provider_empty_reply"),
+])
+def test_openai_200_body_diagnostics_beat_the_empty_mark(monkeypatch, body, expected):
+    """200 + 空内容时,body 里的协议诊断必须还能被规则表捞走(自审 P1)。
+
+    不带诊断的话,一个余额为零的用户会被告知「稍后再试、检查中转稳定性」——
+    正是 blame 纪律要避免的误导。"""
+    monkeypatch.setattr(crc, "AGENT_HTTP_URL", "http://relay.local/v1/chat")
+    monkeypatch.setattr(
+        crc._HTTP, "post", lambda *_a, **_k: _FakeJsonResp(body))
+    notice = _classify_raised(lambda: crc._call_agent_http_openai("hi"))
+    assert notice.error_class == expected
+
+
+def test_simple_200_error_body_still_classifies_by_rules(monkeypatch):
+    monkeypatch.setattr(crc, "AGENT_HTTP_URL", "http://relay.local/chat")
+    monkeypatch.setattr(
+        crc._HTTP, "post",
+        lambda *_a, **_k: _FakeJsonResp(
+            {"error": "insufficient_quota: balance too low", "response": ""}))
+    notice = _classify_raised(lambda: crc._call_agent_http_simple("hi"))
+    assert notice.error_class == "quota_insufficient"
+
+
+def test_cli_stdout_present_is_never_called_a_provider_empty_reply(monkeypatch):
+    """stdout 里有东西就绝不算「provider 给了空回复」(自审 P2 的成对用例)。
+
+    判据刻意写成看 stdout 而不是看 returncode:非 0 退出在更上游就抛掉了,
+    returncode 在这里恒为 0,拿它判等于无条件把所有落到此处的情况甩给 provider。
+    现实中 _extract_text_from_cli_output 对任何非空 stdout 都能兜出文本,
+    所以这一支根本不抛 —— 正是我们要的:有内容就当回复,别误报成空。"""
+    import subprocess as _sp
+
+    monkeypatch.setattr(crc, "AGENT_CLI_CMD", "/bin/echo {message}")
+    monkeypatch.setattr(crc, "_agent_cli_cwd", lambda: None)
+    monkeypatch.setattr(crc, "_agent_cli_cwd_error", "")
+    monkeypatch.setattr(
+        crc, "_run_cli_subprocess",
+        lambda *_a, **_k: _sp.CompletedProcess(
+            args=["/bin/echo"], returncode=0,
+            stdout='{"unknown_field": "x"}', stderr=""))
+    out = crc.call_agent_cli("hi", lane="chat")
+    assert crc.EMPTY_PROVIDER_REPLY_MARK not in str(out)
+
+
+def test_provider_text_cannot_hijack_the_empty_mark():
+    """标记带 feedling: 命名空间 —— provider 自己的英文报错不该劫持归因(自审 NIT)。"""
+    exc = RuntimeError("pi: upstream said empty provider reply, retrying")
+    assert crc.classify_agent_error(exc).error_class != "provider_empty_reply"
 
 
 def test_call_agent_sanitized_to_empty_stays_reply_parse_failed(monkeypatch):

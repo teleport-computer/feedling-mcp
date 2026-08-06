@@ -110,8 +110,9 @@ change must not be interpreted as an API guarantee.
   provider-transient blame and copy that points at the user's model channel,
   instead of the system-blame "something went wrong on our side" message.
   Replies that contained real text but were emptied by protocol-leak
-  sanitization keep the system attribution. Applies to both the resident V1
-  agent path and Runtime V2 chat/wake lanes.
+  sanitization keep the system attribution, as does exhausting the server's own
+  tool-call budget without producing a reply. Applies to the resident V1 agent
+  path and to Runtime V2 chat, wake, and memory-extraction lanes.
 
 - **Plaintext memory writes reject tombstone-style notes.** A plaintext
   `memory.add`, upgrade, or `memory.supersede` whose summary or content is a

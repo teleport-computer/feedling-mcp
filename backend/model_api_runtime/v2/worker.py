@@ -812,6 +812,16 @@ _DEGENERATE_REPLY_ERROR_CLASS = "upstream_unavailable"
 _PROTOCOL_FRAGMENT_ERROR_CLASS = "upstream_unavailable"
 _PROTOCOL_FRAGMENT_REASON = "protocol_fragment_suppressed"
 _MALFORMED_SELF_THINKING_REASON = "malformed_self_thinking_suppressed"
+# 工具循环把我们自己的 _TURN_MAX_LLM_CALLS 预算跑光却始终没产出终局文本。
+# 这是**我们的配置上限**,不是 provider 给了空回复 —— 单独一个 reason,才能既
+# 不误告用户「去查你的中转」,又能在 admin 上和真正的空回复分开看
+# (自审 2026-08-07 P1;原先与 empty_reply 混在一条 raise 里)。
+_TOOL_BUDGET_EXHAUSTED_REASON = "tool_budget_exhausted"
+# scheduled 提醒的必达合约要求有正文,但模型这轮**只产出了一个格式完全正确的
+# <think> 块**、被我们按开关剥掉了 —— 与「格式坏掉」(_MALFORMED_SELF_THINKING)
+# 和「provider 什么都没给」(empty_reply)都不是一回事,单列一个 reason 才能在
+# admin 上分辨。归 system:内容是模型给过的,是我们剥空的(自审 2026-08-07 P2)。
+_THINKING_ONLY_NO_REPLY_REASON = "thinking_only_no_reply"
 
 
 def _torn_protocol_evidence(text: str, reasoning: str, *, lane: str) -> str:
@@ -905,6 +915,8 @@ def _safe_failure_code(scope: str, exc: BaseException) -> str:
             "no_user_messages",
             _PROTOCOL_FRAGMENT_REASON,
             _MALFORMED_SELF_THINKING_REASON,
+            _TOOL_BUDGET_EXHAUSTED_REASON,
+            _THINKING_ONLY_NO_REPLY_REASON,
         }:
             kind = raw
         elif raw == _COVERAGE_INCOMPLETE or raw.startswith(
@@ -1005,8 +1017,11 @@ def _turn_failure_error_class(exc: BaseException) -> str:
         "degenerate_reply_suppressed",
         _PROTOCOL_FRAGMENT_REASON,
         _MALFORMED_SELF_THINKING_REASON,
+        _TOOL_BUDGET_EXHAUSTED_REASON,
+        _THINKING_ONLY_NO_REPLY_REASON,
     }:
-        # 这三个是我们主动剥掉/压制的 —— 归 system 不变。
+        # 这几个都是我们自己造成的(主动剥掉/压制,或跑光我们设定的工具预算)
+        # —— 归 system 不变。
         return "reply_parse_failed"
     if isinstance(exc, TurnError) and (
         str(exc) == _COVERAGE_INCOMPLETE
@@ -7766,7 +7781,11 @@ async def _run_wake(
                     # exception: their must-deliver contract still requires text.
                     text = ""
                     if final and lane == "scheduled":
-                        raise TurnError("empty_reply")
+                        # 走到这里说明模型**给过**一个完整的 <think> 块、被我们剥空了
+                        # (还是我们自己的 kill switch 决定剥不剥)——按本批定的判据
+                        # 「给过内容、被我们掏空 = 我们的」,归 system,不许说成
+                        # 「你的模型服务返回了空回复」(自审 2026-08-07 P2)。
+                        raise TurnError(_THINKING_ONLY_NO_REPLY_REASON)
                     return
                 elif _wst_status == _st_wake.FAILED:
                     if final:
@@ -11814,7 +11833,7 @@ async def process_job(
             # exactly like the already-fixed BUG-4. Raise the same signal
             # `_on_reply` uses so it falls into the outer except below:
             # mark_failed + terminal error status + tm.flush(failed=True).
-            raise TurnError("empty_reply")
+            raise TurnError(_TOOL_BUDGET_EXHAUSTED_REASON)
         if seq_native:
             if not final_job_completed_atomically:
                 source_status = await asyncio.to_thread(

@@ -709,7 +709,9 @@ def test_scheduled_thinking_only_remains_a_must_deliver_failure(monkeypatch):
     )
 
     assert status == "failed"
-    assert _job_status(job_id) == ("failed", "wake_failed:empty_reply")
+    # 2026-08-07:持久码从 empty_reply 拆出来 —— 模型给过完整 <think>、是我们
+    # 剥空的,与「provider 什么都没给」必须能在 admin 上分开看(归因仍是 system)。
+    assert _job_status(job_id) == ("failed", "wake_failed:thinking_only_no_reply")
     assert writes == []
     assert jobs_store.get_wake_schedule(uid)["proactive_backoff_until"] is not None
 

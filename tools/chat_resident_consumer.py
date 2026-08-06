@@ -791,10 +791,50 @@ CONSUMER_ERROR_CLASSES = frozenset(
 
 
 # transport 成功、响应协议可识别、但 assistant 内容为空时,helper 抛的异常带这个
-# 前缀 —— 归因走 provider 而不是我们(usr_7f30d63f 2026-08-07)。**必须由 helper
+# 标记 —— 归因走 provider 而不是我们(usr_7f30d63f 2026-08-07)。**必须由 helper
 # 抛出点铸造**:生产链路里 helper 在返回前就抛异常,call_agent 拿不到那个空 body,
 # 只在 call_agent 里判空是死代码(codex2 gatekeep 用真实 helper 形状复现)。
-EMPTY_PROVIDER_REPLY_MARK = "empty provider reply"
+# 刻意带 ``feedling:`` 命名空间:分类器用子串匹配,而 pi 的 _cli_error_detail 会把
+# **provider 自己的文本**送进来 —— 裸英文短语("empty provider reply")可被上游
+# 报错原样命中而劫持归因(自审 2026-08-07)。
+EMPTY_PROVIDER_REPLY_MARK = "feedling:empty_provider_reply"
+
+
+def _empty_reply_diagnostics(body: Any) -> str:
+    """从「200 但没内容」的响应体里榨出可分类的诊断串(不含用户内容)。
+
+    为什么必须带:one-api/new-api 这类中转在配额耗尽时的标准形状是
+    **HTTP 200 + {"error": {...}}**(或 choices[].finish_reason=content_filter),
+    body 里明明写着 insufficient_quota,而空回复标记排在规则表之后 —— 只要把这些
+    诊断字段渲进异常文本,规则表就能先命中 quota_insufficient/content_filtered
+    等更准的类;不带的话,一个余额为零的用户会被告知「稍后再试、检查中转稳定性」,
+    正是 blame 纪律要避免的误导(自审 2026-08-07 P1)。
+
+    只取协议层字段(error/message/code/type/finish_reason),绝不渲染
+    assistant 内容;整体截断,避免把 provider 的 HTML 错误页灌进日志。"""
+    if not isinstance(body, dict):
+        return ""
+    parts: list[str] = []
+    err = body.get("error")
+    if isinstance(err, dict):
+        for key in ("message", "code", "type"):
+            value = str(err.get(key) or "").strip()
+            if value:
+                parts.append(f"{key}={value[:160]}")
+    elif isinstance(err, str) and err.strip():
+        parts.append(f"error={err.strip()[:160]}")
+    for key in ("message", "detail", "code"):
+        value = body.get(key)
+        if isinstance(value, str) and value.strip():
+            parts.append(f"{key}={value.strip()[:160]}")
+    choices = body.get("choices")
+    if isinstance(choices, list):
+        for choice in choices[:3]:
+            if isinstance(choice, dict):
+                reason = str(choice.get("finish_reason") or "").strip()
+                if reason:
+                    parts.append(f"finish_reason={reason[:40]}")
+    return " ".join(parts)[:400]
 
 
 def classify_agent_error(exc: BaseException) -> AgentErrorNotice:
@@ -5455,7 +5495,8 @@ def _call_agent_http_simple(
         if any(field in body for field in _JSON_REPLY_FIELDS):
             raise ValueError(
                 f"{EMPTY_PROVIDER_REPLY_MARK}: reply field present but empty "
-                f"in: {sorted(f for f in _JSON_REPLY_FIELDS if f in body)}"
+                f"in: {sorted(f for f in _JSON_REPLY_FIELDS if f in body)} "
+                f"{_empty_reply_diagnostics(body)}".strip()
             )
         raise ValueError(f"response field not found in: {list(body.keys())}")
     if isinstance(body, str):
@@ -5517,9 +5558,10 @@ def _call_agent_http_openai(
         return turn.messages[0]
     # 到这里 body 已确认是 dict(上面非 dict 已抛),即 transport 成功、协议可识别、
     # 只是 assistant 内容为空 —— 中转在配额紧张/上游抽风时的典型「假成功」形状。
+    # 带上 body 的协议层诊断:200+{"error":insufficient_quota} 这种要让规则表先命中。
     raise ValueError(
         f"{EMPTY_PROVIDER_REPLY_MARK}: openai-compatible response carried no "
-        "assistant text"
+        f"assistant text {_empty_reply_diagnostics(body)}".strip()
     )
 
 
@@ -7413,13 +7455,16 @@ def call_agent_cli(
         return raw
     text = _extract_text_from_cli_output(raw)
     if not text:
-        if result.returncode == 0:
-            # 进程正常退出却没有任何 assistant 输出 = 模型/中转给了空回复,
-            # 不是我们的解析问题。非 0 退出是真的进程失败,保留原归因。
+        # 判据看 **stdout 有没有东西**,不是看 returncode:非 0 退出在更上游
+        # (call_agent_cli 的退出码检查)就已经抛掉了,这里 returncode 恒为 0,
+        # 拿它当判据的话 else 是死代码,「stdout 有内容但我们的提取器读不懂」
+        # 会被一起甩锅给 provider(自审 2026-08-07 P2)。
+        if not (result.stdout or "").strip():
             raise ValueError(
                 f"{EMPTY_PROVIDER_REPLY_MARK}: cli agent exited 0 with no "
                 "assistant output"
             )
+        # stdout 有内容、只是我们提取不出来 —— 这是我们的解析问题,归 system。
         raise ValueError(
             f"cli agent produced no usable output (exit={result.returncode})"
         )
@@ -7733,6 +7778,15 @@ def call_agent(
         return raw if isinstance(raw, str) else _raw_assistant_text(raw)
 
     turn = _agent_turn_from_raw(raw)
+    # 快照必须取在压制**之前**:压制之后再回头判空,就分不清「模型本来就没说话」
+    # 和「模型说了、被我们剥干净了」。早先用 _raw_assistant_text(raw) 重新提取,
+    # 那是给记忆车道写的窄提取器(只认 choices/response/reply/content/text),
+    # 读不到 top-level messages 与 actions —— 于是 torn-leak 被压制的那两种 body
+    # 形状(正是本机制要覆盖的原始 bug 形状)被误判成 provider 空回复,把我们自己
+    # 的协议压制甩锅给用户的中转(自审 2026-08-07 BLOCKER)。
+    model_said_something = bool(
+        turn.messages or turn.actions or turn.thinking_summary or turn.tool_calls
+    )
     _suppress_torn_protocol_leaks(turn, lane=lane)
     if turn.actions or turn.messages or turn.thinking_summary or turn.tool_calls:
         body: dict[str, Any] = {
@@ -7762,17 +7816,15 @@ def call_agent(
         if turn.runtime_debug:
             log.debug("agent runtime debug keys: %s", sorted(turn.runtime_debug.keys()))
         return body
-    # 归因分叉:原始回复本来就没有实质文本 = provider 给的空(断流/假成功),
-    # 有过内容、被清洗/解析掏空才算我们的(usr_7f30d63f 2026-08-07:中转抽风
+    # 归因分叉:模型本来就没给出任何内容 = provider 给的空(断流/假成功),
+    # 给过内容、被我们压制/解析掏空才算我们的(usr_7f30d63f 2026-08-07:中转抽风
     # 曾被一律记成 system,用户拿着「系统出了问题」来找我们)。
     # ⚠️ 生产链路里**主判定在 helper 层**(带 EMPTY_PROVIDER_REPLY_MARK 抛出):
     # call_agent_http/cli 拿到空 body 时会先抛,根本不会返回到这里。这条分叉覆盖的
-    # 是「helper 返回了内容、随后被 _suppress_torn_protocol_leaks 掏空」那一支,
-    # 以及仍会返回空串的 raw_text 路径。两处都要有,少任何一处都会漏归因。
-    raw_body = raw if isinstance(raw, str) else _raw_assistant_text(raw)
+    # 是「helper 返回了内容、随后被 _suppress_torn_protocol_leaks 掏空」那一支。
+    # 两处都要有,少任何一处都会漏归因。
     failure_class = (
-        "provider_empty_reply" if not str(raw_body or "").strip()
-        else "reply_parse_failed"
+        "reply_parse_failed" if model_said_something else "provider_empty_reply"
     )
     if SEND_FALLBACK_ON_AGENT_ERROR:
         _turn_reply_parse_failed = failure_class
