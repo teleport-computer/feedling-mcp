@@ -28,6 +28,7 @@ ERROR_CLASSES = frozenset({
     "rate_limited",
     "upstream_unavailable",
     "turn_timeout",
+    "provider_empty_reply",
     "reply_parse_failed",
     "unknown",
     # genesis-only classes (Phase C / C1) — not part of the 11-class chat parity
@@ -86,6 +87,9 @@ _CATALOG: dict[str, tuple[str, str]] = {
         "provider_transient", "你的模型服务暂时不可用，稍后会自动恢复。"),
     "turn_timeout": (
         "system", "这轮回复超时了，稍后再试。"),
+    "provider_empty_reply": (
+        "provider_transient",
+        "你的模型服务这次返回了空回复，稍后再试；反复出现请检查模型渠道或中转的稳定性。"),
     "reply_parse_failed": (
         "system", "系统处理回复时出了问题，我们会尽快排查。"),
     "unknown": (

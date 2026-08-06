@@ -996,12 +996,17 @@ def _turn_failure_error_class(exc: BaseException) -> str:
         return "context_overflow"
     if isinstance(exc, (asyncio.TimeoutError, TimeoutError)):
         return "turn_timeout"
+    if isinstance(exc, TurnError) and str(exc) == "empty_reply":
+        # 模型/provider 没给出任何可用文本(空终局、断流、预算耗尽无气泡)——
+        # 三个 raise 点全是 provider/模型行为,不是我们的解析问题;归 provider,
+        # 别把中转抽风包装成「系统出了问题」(usr_7f30d63f 2026-08-07)。
+        return "provider_empty_reply"
     if isinstance(exc, TurnError) and str(exc) in {
         "degenerate_reply_suppressed",
-        "empty_reply",
         _PROTOCOL_FRAGMENT_REASON,
         _MALFORMED_SELF_THINKING_REASON,
     }:
+        # 这三个是我们主动剥掉/压制的 —— 归 system 不变。
         return "reply_parse_failed"
     if isinstance(exc, TurnError) and (
         str(exc) == _COVERAGE_INCOMPLETE
@@ -12041,6 +12046,7 @@ async def process_job(
                 "rate_limited": "vision_model_rate_limited",
                 "upstream_unavailable": "vision_model_unavailable",
                 "turn_timeout": "vision_model_unavailable",
+                "provider_empty_reply": "vision_model_empty_response",
                 "reply_parse_failed": "vision_model_empty_response",
             }.get(classified)
             # Pixels being present does not prove an unrelated tool, storage,

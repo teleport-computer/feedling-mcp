@@ -780,11 +780,13 @@ _ERROR_CLASS_RULES = (
 
 # 机读全集导出，供 backend/notices/catalog.py 的一致性测试比对（spec Phase B /
 # B3）：_ERROR_CLASS_RULES 里的规则类 + classify_agent_error 硬编码分支里的
-# turn_timeout / reply_parse_failed / model_not_found（裸 404+model）/ unknown。
-# 只是把已有分类逻辑的 error_class 取值收成集合，不改分类逻辑本身。
+# turn_timeout / provider_empty_reply / reply_parse_failed / model_not_found
+# （裸 404+model）/ unknown。只是把已有分类逻辑的 error_class 取值收成集合，
+# 不改分类逻辑本身。
 CONSUMER_ERROR_CLASSES = frozenset(
     {klass for klass, _blame, _text, _pat in _ERROR_CLASS_RULES}
-    | {"turn_timeout", "reply_parse_failed", "model_not_found", "unknown"}
+    | {"turn_timeout", "provider_empty_reply", "reply_parse_failed",
+       "model_not_found", "unknown"}
 )
 
 
@@ -821,6 +823,14 @@ def classify_agent_error(exc: BaseException) -> AgentErrorNotice:
         return AgentErrorNotice("turn_timeout", "system",
                                 "这轮回复超时了，稍后再试。", detail)
     text = str(exc)
+    if "empty provider reply" in text:
+        # 2026-08-07(usr_7f30d63f 分诊):模型/中转返回 200 但内容为空(断流、
+        # 配额紧张时的假成功等)。这不是我们的解析问题 —— 归 provider,
+        # 别再把中转抽风包装成「系统出了问题」让用户来找我们。
+        return AgentErrorNotice(
+            "provider_empty_reply", "provider_transient",
+            "你的模型服务这次返回了空回复，稍后再试；反复出现请检查模型渠道或中转的稳定性。",
+            detail)
     if "no usable reply" in text:
         return AgentErrorNotice("reply_parse_failed", "system",
                                 "系统处理回复时出了问题，我们会尽快排查。", detail)
@@ -896,18 +906,29 @@ PROVIDER_HEALTH_SUCCESS_REPORT_INTERVAL_SEC = 15 * 60
 _provider_health_success_reported_at = 0.0
 
 # 组件2：call_agent 清洗为空时（SEND_FALLBACK_ON_AGENT_ERROR=true）不抛异常，
-# 靠这个模块级标记让前台调用方知道本轮其实失败了，要补发 reply_parse_failed 通知。
-# 每次成功读取（前台 else 分支）后立即清零。
-_turn_reply_parse_failed = False
+# 靠这个模块级标记让前台调用方知道本轮其实失败了，要补发失败通知。
+# 值是 error_class 短码：""=无失败；"provider_empty_reply"=原始回复本来就是空
+# （中转/模型给的假成功，归 provider）；"reply_parse_failed"=原始回复有内容、
+# 清洗/解析后才空（可能是我们的问题，归 system）。每次成功读取后立即清零。
+# 归因边界(2026-08-07,usr_7f30d63f):清洗前就空 → 别把中转抽风记在自己头上。
+_turn_reply_parse_failed = ""
 
 
-def _consume_reply_parse_failed() -> bool:
-    """读取并清零清洗失败标记。call_agent 是多车道共享的，标记只对"刚刚这一次
-    调用"有意义——谁调用谁消费，绝不许悬挂到别的车道/回合（审查发现的串扰源）。"""
+def _consume_reply_parse_failed() -> str:
+    """读取并清零清洗失败标记（""=本轮没失败，真值=error_class 短码）。
+    call_agent 是多车道共享的，标记只对"刚刚这一次调用"有意义——谁调用谁消费，
+    绝不许悬挂到别的车道/回合（审查发现的串扰源）。"""
     global _turn_reply_parse_failed
     was = _turn_reply_parse_failed
-    _turn_reply_parse_failed = False
+    _turn_reply_parse_failed = ""
     return was
+
+
+def _reply_parse_failure_exc(reason: str) -> ValueError:
+    """把 _consume_reply_parse_failed 的短码铸成分类器认识的异常文本。"""
+    if reason == "provider_empty_reply":
+        return ValueError("agent received empty provider reply")
+    return ValueError("agent produced no usable reply after sanitization")
 
 
 def _reset_system_notice_state() -> None:
@@ -7641,7 +7662,7 @@ def call_agent(
     # one. Previously only ever SET here; leak suppression now empties turns more
     # often, so an explicit per-turn reset keeps the signal turn-scoped.
     global _turn_reply_parse_failed
-    _turn_reply_parse_failed = False
+    _turn_reply_parse_failed = ""
 
     def _invoke() -> Any:
         if AGENT_MODE == "http":
@@ -7708,10 +7729,18 @@ def call_agent(
         if turn.runtime_debug:
             log.debug("agent runtime debug keys: %s", sorted(turn.runtime_debug.keys()))
         return body
+    # 归因分叉:原始回复本来就没有实质文本 = provider 给的空(断流/假成功),
+    # 有过内容、被清洗/解析掏空才算我们的(usr_7f30d63f 2026-08-07:中转抽风
+    # 曾被一律记成 system,用户拿着「系统出了问题」来找我们)。
+    raw_body = raw if isinstance(raw, str) else _raw_assistant_text(raw)
+    failure_class = (
+        "provider_empty_reply" if not str(raw_body or "").strip()
+        else "reply_parse_failed"
+    )
     if SEND_FALLBACK_ON_AGENT_ERROR:
-        _turn_reply_parse_failed = True
+        _turn_reply_parse_failed = failure_class
         return [FALLBACK_REPLY]
-    raise ValueError("agent produced no usable reply after sanitization")
+    raise _reply_parse_failure_exc(failure_class)
 
 
 def _resident_foreground_chat_message_v2(content: str) -> str:
@@ -12708,7 +12737,7 @@ def _process_proactive_jobs(jobs: list) -> float:
         # The turn reached the agent — open the across-batch coalescing window so
         # the rest of this burst folds instead of repeating it.
         _note_proactive_turn_ran(job_id)
-        if _consume_reply_parse_failed():
+        if (parse_failure_class := _consume_reply_parse_failed()):
             # Parse failure means call_agent already swapped agent_result for
             # FALLBACK_REPLY — a foreground-only line ("你稍后再发一次…") that
             # reads as an unsolicited error bubble on a turn the user never
@@ -12716,7 +12745,7 @@ def _process_proactive_jobs(jobs: list) -> float:
             # policy as the agent_call_failed branch above): report + fail the
             # job, post nothing.
             _notify_agent_turn_failure(
-                ValueError("agent produced no usable reply after sanitization"),
+                _reply_parse_failure_exc(parse_failure_class),
                 foreground=False,
             )
             update_proactive_job_status(job_id, "failed", "agent_reply_parse_failed")
@@ -13873,9 +13902,11 @@ def _process_messages(messages: list) -> float:
                 _commit_io_cli_catalog_injection()
             if voice_stream_update is not None:
                 voice_stream_update.complete()
-            if not vision_observer_failed and _consume_reply_parse_failed():
-                pending_failure_notice = ValueError(
-                    "agent produced no usable reply after sanitization"
+            if not vision_observer_failed and (
+                parse_failure_class := _consume_reply_parse_failed()
+            ):
+                pending_failure_notice = _reply_parse_failure_exc(
+                    parse_failure_class
                 )
                 pending_failure_is_parse_only = True
             elif not vision_observer_failed:
@@ -13897,11 +13928,9 @@ def _process_messages(messages: list) -> float:
                         trace_id=trace_id,
                         lane="chat",
                     )
-                    if _consume_reply_parse_failed():
+                    if (retry_failure_class := _consume_reply_parse_failed()):
                         pending_failure_is_parse_only = True
-                        raise ValueError(
-                            "file delivery retry produced no usable reply"
-                        )
+                        raise _reply_parse_failure_exc(retry_failure_class)
                     agent_result = retry_result
                 except Exception as exc:
                     log.error("outbound file completion retry failed: %s", exc)

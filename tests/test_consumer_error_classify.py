@@ -344,18 +344,69 @@ def test_notify_never_raises(monkeypatch):
 
 def test_parse_failed_marker_set_by_call_agent_sanitize_branch():
     # call_agent 清洗为空时不抛异常（SEND_FALLBACK_ON_AGENT_ERROR 默认 true），
-    # 靠模块级标记让前台调用方知道要补发 reply_parse_failed 通知（spec §组件2）
-    crc._turn_reply_parse_failed = False
+    # 靠模块级标记让前台调用方知道要补发失败通知（spec §组件2）
+    crc._turn_reply_parse_failed = ""
     assert hasattr(crc, "_turn_reply_parse_failed")
+
+
+# ---------------------------------------------------------------------------
+# 空回复归因分叉(2026-08-07,usr_7f30d63f:中转返回 200+空内容曾一律记 system,
+# 用户拿着「系统出了问题」来找我们;真凶是他的中转断流/假成功)
+# ---------------------------------------------------------------------------
+
+
+def test_call_agent_raw_empty_marks_provider_empty_reply(monkeypatch):
+    # 原始回复本来就是空 → provider 给的空,归 provider_empty_reply。
+    monkeypatch.setattr(crc, "AGENT_MODE", "http")
+    monkeypatch.setattr(crc, "call_agent_http", lambda *_a, **_k: "")
+    monkeypatch.setattr(crc, "_call_with_resident_busy_poll",
+                        lambda invoke, lane: invoke())
+    monkeypatch.setattr(crc, "SEND_FALLBACK_ON_AGENT_ERROR", True)
+    out = crc.call_agent("hi", lane="chat")
+    assert out == [crc.FALLBACK_REPLY]
+    assert crc._consume_reply_parse_failed() == "provider_empty_reply"
+
+
+def test_call_agent_sanitized_to_empty_stays_reply_parse_failed(monkeypatch):
+    # 原始回复有内容、清洗/解析后才空 → 可能是我们的问题,保持 system 归因。
+    # 直接 monkeypatch 清洗器把 turn 掏空 —— 测的是归因分叉本身,
+    # 不依赖泄漏启发式对具体样本的判定。
+    monkeypatch.setattr(crc, "AGENT_MODE", "http")
+    monkeypatch.setattr(
+        crc, "call_agent_http", lambda *_a, **_k: "一段有实质内容的原始回复")
+
+    def _empty_turn(turn, lane=""):
+        turn.actions = []
+        turn.messages = []
+        turn.tool_calls = []
+        turn.thinking_summary = ""
+
+    monkeypatch.setattr(crc, "_suppress_torn_protocol_leaks", _empty_turn)
+    monkeypatch.setattr(crc, "_call_with_resident_busy_poll",
+                        lambda invoke, lane: invoke())
+    monkeypatch.setattr(crc, "SEND_FALLBACK_ON_AGENT_ERROR", True)
+    out = crc.call_agent("hi", lane="chat")
+    assert out == [crc.FALLBACK_REPLY]
+    assert crc._consume_reply_parse_failed() == "reply_parse_failed"
+
+
+def test_classifier_maps_empty_provider_reply_to_provider_transient():
+    n = crc.classify_agent_error(crc._reply_parse_failure_exc("provider_empty_reply"))
+    assert n.error_class == "provider_empty_reply"
+    assert n.blame == "provider_transient"
+    assert "系统" not in n.user_text          # 不再让用户以为是我们的问题
+    n2 = crc.classify_agent_error(crc._reply_parse_failure_exc("reply_parse_failed"))
+    assert n2.error_class == "reply_parse_failed"
+    assert n2.blame == "system"
 
 
 def test_parse_failed_marker_consumed_not_dangling():
     # 串扰修复：标记是 call_agent 多车道共享的，谁调用谁消费——绝不允许悬挂到
     # 别的车道/回合（proactive/verify_probe 置位后前台却读到旧值的 bug）。
-    crc._turn_reply_parse_failed = True
-    assert crc._consume_reply_parse_failed() is True
-    assert crc._turn_reply_parse_failed is False
-    assert crc._consume_reply_parse_failed() is False
+    crc._turn_reply_parse_failed = "reply_parse_failed"
+    assert crc._consume_reply_parse_failed() == "reply_parse_failed"
+    assert crc._turn_reply_parse_failed == ""
+    assert crc._consume_reply_parse_failed() == ""
 
 
 def test_provider_incompatible_classified():

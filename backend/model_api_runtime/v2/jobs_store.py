@@ -174,7 +174,7 @@ def _terminal_error_class(error: object, error_class: object = "") -> str:
     if "prompt_frontier_exhausted" in code:
         return "context_overflow"
     if code.endswith(":empty_reply"):
-        return "reply_parse_failed"
+        return "provider_empty_reply"
     return "unknown"
 
 
