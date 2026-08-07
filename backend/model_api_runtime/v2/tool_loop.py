@@ -90,17 +90,36 @@ def _search_result_urls(content: str) -> set[str]:
 # 伴侣「声称已经画了图」的说法。只用来识别**谎报**(说了却没有 media),
 # 不用来判断用户想不想要图 —— 那个判断权归伴侣自己。
 # 宁可漏判也不要误判:漏判只是少了一句纠正,误判会把伴侣一句正常的话当成谎话。
+# 只认**完成态的断言**,并排除失败/条件/说明语气。误判的代价比漏判高得多:
+# 漏判只是少一次纠正,误判会把伴侣一句诚实的失败说明("图片生成失败了")当成
+# 谎话打回去,等于逼它把真话改成假话。
+# codex 审出的三个反例都必须放行:「图片生成失败了」「图像生成需要配置模型」
+# 「Here is the image generation guide」。
+_IMAGE_CLAIM_NEGATION_RE = re.compile(
+    r"(失败|没有?(成功|生成|画)|不能|无法|需要配置|未能|出错|报错"
+    r"|fail|error|could ?n['’]?t|cannot|can['’]?t|unable|not (be )?(able|support))",
+    re.IGNORECASE,
+)
 _IMAGE_CLAIM_RE = re.compile(
-    r"(已经?(为你)?(画|生成|做)好了?|画好了|生成好了|图(片|像)?(已经)?(生成|画好|做好)"
-    r"|here('| i)s (the|your) (image|picture|illustration)"
-    r"|i('ve| have) (just )?(created|generated|drawn|made) (the|an?|your) "
-    r"(image|picture|illustration))",
+    r"("
+    r"(图片?|图像|插画|画像)\s*(已经|已)\s*(生成|画好|做好|完成)"
+    r"|(已经|已)\s*(为你|给你)?\s*(生成|画|做)(好|完)了"
+    r"|图\s*(已经|已)\s*(发|给)"
+    # 「the image」后面若接 generation/guide/model 之类,说的是功能不是成品。
+    r"|here\s+(is|are)\s+(the|your)\s+(images?|pictures?|illustrations?|artworks?)"
+    r"(?!\s+(generation|generator|guide|model|feature|setting|config|option))\b"
+    r"|i\s*['’]?\s*(ve|have)\s+(just\s+)?(created|generated|drawn|made)\s+"
+    r"(the|an?|your)\s+(images?|pictures?|illustrations?)"
+    r")",
     re.IGNORECASE,
 )
 
 
 def _claims_image_delivered(text: str) -> bool:
-    return bool(_IMAGE_CLAIM_RE.search(str(text or "")))
+    text = str(text or "")
+    if _IMAGE_CLAIM_NEGATION_RE.search(text):
+        return False
+    return bool(_IMAGE_CLAIM_RE.search(text))
 
 
 def _positive_limit(value, *, name: str) -> int:
@@ -325,12 +344,10 @@ async def run_tool_loop(
     newly folded user messages then update or cancel the requirement before each
     later provider round.
 
-    ``required_image_generation_prompt`` is the equivalent guard for an explicit
-    image-creation request. If a weak/text-only main model returns a placeholder
-    instead of calling ``generate_image``, the loop discards that text and routes
-    the original request through ``on_image_reply``. This keeps delivery truthful
-    and lets the image adapter return the same structured configuration failure
-    regardless of which conversation model the user selected."""
+    Image generation belongs to the companion: it decides when to call
+    ``generate_image`` and writes the prompt itself. The loop only carries its
+    words alongside the picture, hands generation failures back as tool results,
+    and bounces an unbacked "I made the image" claim exactly once."""
     max_tool_calls_per_round = _positive_limit(
         max_tool_calls_per_round, name="max_tool_calls_per_round"
     )
@@ -947,7 +964,11 @@ async def run_tool_loop(
                     "画面描述写进 prompt;"
                     "(2) 你并不打算画 —— 照实说,不要用文字假装图已经存在。"
                 )
-                if attempts < max_calls - 1:
+                # 只要还有下一轮就纠正 —— 哪怕那是留给「工具禁用终局回复」的
+                # 最后一轮:让它把话说诚实,比让谎话原样发出去重要。
+                # (原来是 attempts < max_calls - 1:max_calls=2 时首轮谎报根本
+                # 不打回,谎话直接发给用户 —— codex 审出。)
+                if attempts < max_calls:
                     _progress("image_claim_retry_boundary")
                     continue
 
@@ -1313,15 +1334,13 @@ async def run_tool_loop(
             )
             if on_image_reply is None:
                 raise RuntimeError("generate_image callback is unavailable")
+            # 生成与发布必须分开捕获。合在一个 try 里会把「图画好了但发布出问题」
+            # (FinalReplySuperseded / 丢租约 / 落库失败)误报成「生图失败」写进
+            # transcript —— 伴侣下一轮会以为没画成而**再画一次、再付一次钱**。
             try:
                 media = tuple(await on_image_reply(dict(tc.args)))
                 if not media:
                     raise RuntimeError("generate_image returned no media")
-                # 带上伴侣这一轮说的话。它调了工具不代表它没话说 ——「这是我想象
-                # 中自己的样子」和那张图本来就是一次表达的两半,发空字符串等于
-                # 把人写好的话吞掉。之前这里硬编码 "",所以**即使模型正确调用了
-                # 工具**,用户也只收到一张孤零零的图。
-                await on_reply(pr.text or "", final=True, media=media)
             except Exception as exc:
                 await _tool_event(
                     tc, "tool_call_error", {"error": type(exc).__name__}
@@ -1345,6 +1364,8 @@ async def run_tool_loop(
                     tc, "tool_call_result", {"result": image_result}
                 )
                 continue
+            # 发布阶段:图已经存在,异常走既有的发布语义(不能当成生图失败)。
+            await on_reply(pr.text or "", final=True, media=media)
             image_result = ToolResult(
                 call_id=tc.id,
                 content="ok: image delivered",

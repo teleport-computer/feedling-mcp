@@ -59,6 +59,11 @@ def test_claim_detector_is_conservative():
     innocents = [
         "我想画一张给你看", "你想要什么样的图?", "这张图让我想起那天",
         "我画不了图,但可以描述给你听",
+        # 以下三条来自 codex 审查的实测反例(2026-08-07):第一版检测把它们
+        # 全判成谎报 —— 那等于逼伴侣把诚实的失败说明改成假话。
+        "图片生成失败了,请稍后再试",
+        "图像生成需要配置模型",
+        "Here is the image generation guide",
     ]
     for text in claims:
         assert tool_loop._claims_image_delivered(text), f"漏判谎报: {text}"
