@@ -461,7 +461,11 @@ async def finalize_voice_call(
         archived = transcript_store.exists(user_id, call_id)
         already = archived and _db.chat_get_strict(user_id, mid) is not None
         if not archived:
-            text = transcript_store.render_transcript(turns)
+            # 真名优先:这份记录用户会亲眼读,Capture 也拿它当输入,两处都该看到
+            # TA 给伴侣起的名字而不是中性标签。取不到才退回既有兜底。
+            speaker_user, speaker_ai = transcript_store.resolve_speaker_names(store)
+            text = transcript_store.render_transcript(
+                turns, user_name=speaker_user, ai_name=speaker_ai)
             if not text:
                 return {"error": "turns_required"}, 400
             try:

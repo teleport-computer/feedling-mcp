@@ -34,6 +34,7 @@ from psycopg.types.json import Jsonb
 import db
 from core import enclave as core_enclave
 from core import envelope as core_envelope
+from identity import identity_core
 from identity import user_naming
 
 log = logging.getLogger("feedling.voice.transcript_store")
@@ -45,6 +46,26 @@ log = logging.getLogger("feedling.voice.transcript_store")
 PREVIEW_MAX_CHARS = 500
 _PREVIEW_HEAD_CHARS = 300
 _PREVIEW_TAIL_CHARS = 160
+
+
+def resolve_speaker_names(store, *, runtime_token: str = "") -> tuple[str, str]:
+    """(user_name, ai_name) —— 归档要用真名,不是「对方 / 我」。
+
+    通话逐字记录是**用户会亲眼读的东西**(设置页的通话记录),而且它是 Capture 的
+    输入。两处都该看到 TA 给自己伴侣起的名字,而不是一串中性标签。名字取不到时
+    退回 transcript_speaker_label 的既有兜底(见那里两次事故的注释)。
+    """
+    user_name = ""
+    ai_name = ""
+    try:
+        body, status = identity_core.get_identity(store)
+        card = body.get("identity") if isinstance(body, dict) else None
+        if status == 200 and isinstance(card, dict):
+            ai_name = str(card.get("agent_name") or "").strip()[:80]
+            user_name = str(card.get("user_preferred_name") or "").strip()[:80]
+    except Exception as exc:  # noqa: BLE001 — 名字是锦上添花,拿不到就用兜底
+        log.warning("[voice.transcript] identity unavailable: %s", str(exc)[:120])
+    return user_name, ai_name
 
 
 def render_transcript(turns: list[dict], *, user_name: str = "", ai_name: str = "") -> str:
