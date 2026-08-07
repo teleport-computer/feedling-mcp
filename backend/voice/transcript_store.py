@@ -68,14 +68,61 @@ def resolve_speaker_names(store, *, runtime_token: str = "") -> tuple[str, str]:
     return user_name, ai_name
 
 
-def render_transcript(turns: list[dict], *, user_name: str = "", ai_name: str = "") -> str:
-    """Render client turns into the established capture-window line shape.
+# 通话转写的说话人标签。**两侧都用真名**,取不到才用这两个中性词。
+#
+# 为什么不复用 transcript_speaker_label:那个函数是给「AI 回看聊天窗口」写的,
+# 所以 AI 那侧是「我」、用户那侧是「对方」——第一人称锚在 AI 身上。而通话记录
+# 有**两种读者**:用户在设置页读它(第一人称该是用户自己),Capture 读它时第一
+# 人称又该是伴侣。任何一种第一人称写法都会让另一方读错(把对方的话当成自己说的
+# ——正是 "user:" 教坏模型那类事故)。
+#
+# 解法是两侧都不用第一人称:用真名,并在消费端加一行说明谁是谁。这样同一份文本
+# 对两种读者都无歧义,也不必存两份。
+VOICE_UNKNOWN_AGENT_LABEL = "伴侣"
+VOICE_UNKNOWN_PERSON_LABEL = "本人"
 
-    Same ``- {label}: {text}`` form the V2 capture handler uses, via
-    ``user_naming.transcript_speaker_label`` — the literal role string must
-    never reach a model (the "user:" 标签教坏模型 incident). Server-side there
-    is no plaintext name source, so labels fall back to 「对方」/「我」 exactly
-    like V2's hosted path.
+
+def speaker_labels(user_name: str = "", ai_name: str = "") -> tuple[str, str]:
+    """(用户侧标签, AI 侧标签) —— 消费端拿它去写那行说明。"""
+    person = " ".join(str(user_name or "").split())
+    if not person or person == "TA":
+        person = VOICE_UNKNOWN_PERSON_LABEL
+    agent = " ".join(str(ai_name or "").split()) or VOICE_UNKNOWN_AGENT_LABEL
+    return person, agent
+
+
+def capture_window_header(*, turn_count=None, user_name: str = "",
+                          ai_name: str = "") -> str:
+    """Capture 窗口里那通电话的抬头。**V2 与 resident 共用这一份** —— 各写一份
+    正是标签当年漏掉的原因。
+
+    做两件事:
+    1. 说清谁是谁(转写两侧都是真名,不带第一人称);
+    2. 换尺子。capture 提示词里那句「宁少勿多、只留一到两件」是为闲聊窗口写的,
+       对一通电话是错的量纲 —— 实测 12 件明确值得记的事只留下 2 件
+       (2026-08-07 探针)。不改提示词本身(那会影响所有 capture),只在这里把
+       「这段是什么」讲明白。
+    """
+    person, agent = speaker_labels(user_name, ai_name)
+    turns_note = f"，共 {turn_count} 轮" if turn_count else ""
+    return (
+        f"【语音通话逐字记录{turns_note}】\n"
+        f"（说话人：「{agent}」是你，「{person}」是 TA。）\n"
+        "以下是一通完整电话的逐字记录，不是一段闲聊。\n"
+        "电话的信息密度远高于日常对话：TA 会在一通里一口气讲很多件彼此独立的事"
+        "——承诺与计划、家人、身体、工作进展、习惯的改变、在意的传统。\n"
+        "**上面那条「宁少勿多、只留一到两件」是为闲聊窗口写的，不适用于这里。**"
+        "请把这通电话当成一份清单逐件过：TA 明确讲出来的每一件事，只要三个月后"
+        "还可能重要、或 TA 会希望你记得，就各自成卡。同一件事的多个侧面仍然合成"
+        "一张厚卡，但不同的事**不要**为了凑数量少而合并。"
+    )
+
+
+def render_transcript(turns: list[dict], *, user_name: str = "", ai_name: str = "") -> str:
+    """把客户端 turns 渲染成 ``- {说话人}: {内容}`` 的逐行文本。
+
+    两侧都用真名(取不到用「本人」/「伴侣」),不用第一人称 —— 见上面常量处的
+    说明。原始 role 字面量永远不进文本(``user:`` 教坏模型的那个事故)。
     """
     lines: list[str] = []
     for turn in turns or []:
@@ -85,9 +132,12 @@ def render_transcript(turns: list[dict], *, user_name: str = "", ai_name: str = 
         if not text:
             continue
         role = str(turn.get("role") or "").strip().lower()
-        label = user_naming.transcript_speaker_label(
-            role, user_name=user_name, ai_name=ai_name
+        # 再 sanitize 一次(纵深防御):把「用户」/「user」当名字传进来,也不能
+        # 变成 "用户: …" 那一行。
+        person, agent = speaker_labels(
+            user_naming.sanitize_user_name(user_name), ai_name
         )
+        label = person if role == "user" else agent
         lines.append(f"- {label}: {text}")
     return "\n".join(lines).strip()
 

@@ -54,6 +54,7 @@ from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable
 
 import db
+from voice import transcript_store as voice_transcript_store
 import provider_attempt_ledger
 import provider_client
 import provider_health
@@ -4791,20 +4792,10 @@ def _render_capture_line(message: dict, voice_transcripts: dict,
         body = _bounded_voice_transcript(
             voice_transcripts[call_id], budget=_VOICE_TRANSCRIPT_PROMPT_CHARS
         )
-        turns = message.get("voice_turn_count")
-        # 通话不是聊天窗口。capture 的提示词里那句「宁少勿多、只留一到两件」是
-        # 为 20 分钟闲聊写的,对一通电话是错的量纲:实测 12 件明确值得记的事
-        # 只留下 2 件(2026-08-07 探针)。这里不改提示词(那会影响所有 capture),
-        # 只把「这段是什么」告诉模型,让它自己把尺子换过来。
-        header = (
-            "【语音通话逐字记录" + (f"，共 {turns} 轮" if turns else "") + "】\n"
-            "以下是一通完整电话的逐字记录，不是一段闲聊。\n"
-            "电话的信息密度远高于日常对话：TA 会在一通里一口气讲很多件彼此独立的"
-            "事——承诺与计划、家人、身体、工作进展、习惯的改变、在意的传统。\n"
-            "**上面那条「宁少勿多、只留一到两件」是为闲聊窗口写的，不适用于这里。**"
-            "请把这通电话当成一份清单逐件过：TA 明确讲出来的每一件事，只要三个月后"
-            "还可能重要、或 TA 会希望你记得，就各自成卡。同一件事的多个侧面仍然合成"
-            "一张厚卡，但不同的事**不要**为了凑数量少而合并。"
+        # 抬头(谁是谁 + 换尺子)与 resident 共用同一份实现,别在这里另写。
+        header = voice_transcript_store.capture_window_header(
+            turn_count=message.get("voice_turn_count"),
+            user_name=user_name, ai_name=ai_name,
         )
         return f"{header}\n{body}"
     label = transcript_speaker_label(
