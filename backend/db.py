@@ -3828,12 +3828,16 @@ def admin_funnel_snapshot(*, tz: str = "Asia/Shanghai") -> dict:
         if w["cohort_matured"]:
             w1 = sum(1 for r in w["w1_eligible"]
                      if r["user_id"] in retained_uids)
+        # eligible 必须随 payload 下发：渲染层若拿 t3 总数当分母，会把
+        # 「W1 窗口还没到期」的人算成「流失」（prod 2026-08-07 实景：
+        # t3=124 里大半注册不满 14 天，却渲染成 ↓40%·流失 75）。
         return [
             {"id": "registered", "label": "注册", "count": len(w["cohort"])},
             {"id": "connected", "label": "已连接(t1)", "count": len(w["connected"])},
             {"id": "content_ready", "label": "内容就绪(t2)", "count": len(w["content"])},
             {"id": "first_reply", "label": "首次真回复(t3)", "count": len(w["replied"])},
-            {"id": "w1_retained", "label": "W1 仍活跃", "count": w1},
+            {"id": "w1_retained", "label": "次周仍活跃（第 8–14 天）",
+             "count": w1, "eligible": len(w["w1_eligible"])},
         ]
 
     return {

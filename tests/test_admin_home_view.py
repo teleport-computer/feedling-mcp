@@ -1060,3 +1060,85 @@ def test_queue_model_config_pending_requires_recent_activity(clean_hmfx_rows):
     finally:
         with db.get_pool().connection() as conn:
             conn.execute("DELETE FROM user_blobs WHERE user_id LIKE 'u_hmfx_%'")
+
+
+def test_queue_same_reason_rows_collapse_beyond_three():
+    """同因刷屏折叠：一个注册波全卡同一步时，只露前 3 条，其余进
+    <details>——prod 首日 8 条同款 onboarding_stuck 把 stalled 挤下屏的教训。"""
+    if not hasattr(dt, "_home_queue_section"):
+        pytest.skip("home queue renderer not present")
+    rows = [
+        {
+            "user_id": f"usr_wave{i}",
+            "reason_code": "onboarding_stuck",
+            "reason_text": "注册超过 24h 仍未拿到首次真回复",
+            "since_epoch": time.time() - 86400 * 13,
+            "detail": "resident 路线",
+        }
+        for i in range(5)
+    ] + [
+        {
+            "user_id": "usr_urgent",
+            "reason_code": "stalled_no_reply",
+            "reason_text": "发了消息但没等到真回复",
+            "since_epoch": time.time() - 3600 * 5,
+            "detail": "等待 5 小时",
+        }
+    ]
+    html_out = dt._home_queue_section({"rows": rows, "truncated": False})
+    assert "usr_urgent" in html_out
+    assert "usr_wave0" in html_out and "usr_wave2" in html_out
+    assert "还有 2 个" in html_out  # wave3/wave4 折叠
+    assert html_out.count("<details>") == 1
+
+
+def test_delta_small_sample_renders_neutral():
+    """样本量小的环比不染红绿：17→4 的 −76% 是真数字、假信号。"""
+    if not hasattr(dt, "_render_delta"):
+        pytest.skip("delta helper not present")
+    small = dt._render_delta(4, 17)
+    assert "neutral" in small and "76" in small
+    big = dt._render_delta(40, 170)
+    assert "bad" in big  # 量级足够，照常染色
+
+
+def test_import_card_headline_uses_terminal_denominator():
+    """红卡不许顶 90% 大数字：分母是终态（completed+failed），不是善终。
+    prod 2026-08-07 实景 9/10 verified/completed 配 23.1% 失败率。"""
+    imports = _imports()
+    imports.update({"started": 13, "completed": 10, "failed": 3,
+                    "artifact_verified": 9})
+    page = dt._render_ops_overview_page(
+        imports, _chat(), _runtime(), _product(), _usage(),
+        within_hours=24,
+    )
+    assert "69.2%" in page
+    assert "9 / 13" in page  # 分数行也换终态分母（其他 tile 可合法出现 90%）
+    assert "终态（completed+failed）" in page
+
+
+def test_funnel_w1_conversion_uses_eligible_denominator():
+    """W1 的分母是「窗口已走完的人」：拿 t3 总数当分母会把注册不满 14 天
+    的人算成流失（prod 实景 t3=124/w1=49 被标成 ↓40%·流失 75）。"""
+    if not hasattr(dt, "_render_funnel"):
+        pytest.skip("funnel renderer not present")
+    funnel = {
+        "stages": [
+            {"id": "registered", "label": "注册", "count": 340},
+            {"id": "connected", "label": "已连接(t1)", "count": 147},
+            {"id": "content_ready", "label": "内容就绪(t2)", "count": 127},
+            {"id": "first_reply", "label": "首次真回复(t3)", "count": 124},
+            {"id": "w1_retained", "label": "次周仍活跃（第 8–14 天）",
+             "count": 49, "eligible": 91},
+        ],
+        "window_days": 28,
+        "prev": None,
+    }
+    out = dt._render_funnel(funnel, compact=True)
+    assert "已走完 W1 窗的 91 人中流失 42" in out
+    assert "33 人窗口未到期不计" in out
+    assert "流失 75" not in out
+    # eligible=0：显「暂不可判」，不编百分比。
+    funnel["stages"][-1].update({"count": 0, "eligible": 0})
+    out0 = dt._render_funnel(funnel, compact=True)
+    assert "暂不可判（无人走完 W1 窗）" in out0
