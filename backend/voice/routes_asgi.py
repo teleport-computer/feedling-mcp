@@ -10,6 +10,7 @@ import logging
 import os
 import secrets
 import time
+import unicodedata
 import uuid
 from urllib.parse import urlparse
 
@@ -34,6 +35,18 @@ log = logging.getLogger("feedling.voice.gateway")
 
 _VOICE_NAMESPACE = uuid.UUID("c1673607-3107-4554-87a1-5a8f55b70023")
 _VOICE_BUFFER_TEXT = "... "
+_VOICE_NOISE_MARKERS = frozenset({
+    "backgroundnoise",
+    "inaudible",
+    "music",
+    "silence",
+    "无声",
+    "杂音",
+    "背景噪音",
+    "背景杂音",
+    "静音",
+    "噪音",
+})
 
 
 def _gateway_url(request: Request) -> str | None:
@@ -102,6 +115,21 @@ def _last_user_turn(payload: dict) -> tuple[str, int] | None:
     if not text:
         return None
     return text, len(user_messages)
+
+
+def _normalized_voice_marker(text: str) -> str:
+    return "".join(
+        character.casefold()
+        for character in text.strip()
+        if unicodedata.category(character)[0] not in {"P", "S", "Z"}
+    )
+
+
+def _is_meaningful_voice_message(text: str) -> bool:
+    marker = _normalized_voice_marker(text)
+    if not marker or marker in _VOICE_NOISE_MARKERS:
+        return False
+    return any(character.isalnum() for character in marker)
 
 
 def _voice_turn_id(user_turn_index: int) -> str:
@@ -517,6 +545,12 @@ async def voice_chat_completions(request: Request):
     request_id = "chatcmpl-" + hashlib.sha256(
         f"{call_id}:{turn_id}".encode("utf-8")
     ).hexdigest()[:24]
+    if not _is_meaningful_voice_message(message):
+        log.info(
+            "[voice.gateway] turn ignored user=%s reason=non_speech",
+            user_id[:12],
+        )
+        return _streaming_text_response(request_id, "")
 
     from core import store as core_store
 

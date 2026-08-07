@@ -127,6 +127,19 @@ def test_gateway_extracts_only_latest_user_turn():
     assert routes_asgi._last_user_turn({"messages": []}) is None
 
 
+@pytest.mark.parametrize(
+    "message",
+    ["...", "……", "（背景杂音）", "[silence]", "【background noise】"],
+)
+def test_gateway_ignores_non_speech_voice_transcripts(message):
+    assert routes_asgi._is_meaningful_voice_message(message) is False
+
+
+@pytest.mark.parametrize("message", ["嗯。", "把音量调大一点", "测试 123"])
+def test_gateway_keeps_short_meaningful_voice_transcripts(message):
+    assert routes_asgi._is_meaningful_voice_message(message) is True
+
+
 def test_asr_revision_keeps_the_same_logical_voice_turn():
     first = routes_asgi._voice_turn_id(2)
     corrected = routes_asgi._voice_turn_id(2)
@@ -315,6 +328,49 @@ def test_io_rejection_is_streamed_instead_of_dropping_the_call():
 
     body = asyncio.run(collect())
     assert body.count("data: [DONE]") == 1
+
+
+def test_ignored_voice_turn_returns_an_empty_streaming_completion():
+    response = routes_asgi._streaming_text_response("chatcmpl-test", "")
+
+    async def collect() -> str:
+        chunks = [chunk async for chunk in response.body_iterator]
+        return "".join(chunks)
+
+    body = asyncio.run(collect())
+    assert '"content"' not in body
+    assert body.count("data: [DONE]") == 1
+
+
+def test_gateway_does_not_persist_or_run_non_speech_turn(monkeypatch):
+    async def read_payload(_request):
+        return {
+            "elevenlabs_extra_body": {
+                "io_voice_token": "signed-token",
+                "io_call_id": "call-1",
+            },
+            "messages": [{"role": "user", "content": "..."}],
+        }
+
+    monkeypatch.setattr(routes_asgi.asgi_http, "read_json_silent", read_payload)
+    monkeypatch.setattr(routes_asgi.results, "secret", lambda: b"voice-secret")
+    monkeypatch.setattr(
+        routes_asgi.voice_token,
+        "verify",
+        lambda _secret, _token: {"call_id": "call-1", "user_id": "user-1"},
+    )
+
+    response = asyncio.run(
+        routes_asgi.voice_chat_completions(SimpleNamespace())
+    )
+
+    async def collect() -> str:
+        chunks = [chunk async for chunk in response.body_iterator]
+        return "".join(chunks)
+
+    body = asyncio.run(collect())
+    assert response.status_code == 200
+    assert '"content"' not in body
 
 
 class _Result:
