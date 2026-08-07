@@ -28,6 +28,7 @@ from hosted import chat_send_core
 from hosted import config_store as hosted_config_store
 from notices import catalog as notices_catalog
 from voice import results
+from voice.message_filter import is_meaningful_voice_message
 
 router = APIRouter()
 log = logging.getLogger("feedling.voice.gateway")
@@ -517,6 +518,12 @@ async def voice_chat_completions(request: Request):
     request_id = "chatcmpl-" + hashlib.sha256(
         f"{call_id}:{turn_id}".encode("utf-8")
     ).hexdigest()[:24]
+    if not is_meaningful_voice_message(message):
+        log.info(
+            "[voice.gateway] turn ignored user=%s reason=non_speech",
+            user_id[:12],
+        )
+        return _streaming_text_response(request_id, "")
 
     from core import store as core_store
 

@@ -16,6 +16,9 @@ from voice import routes_asgi
 from voice import cleanup as summary
 
 
+_STUBBED_ARCHIVED_CALLS: set[tuple[str, str]] = set()
+
+
 def _seed_user() -> str:
     uid = "u_" + uuid.uuid4().hex[:12]
     with db.get_pool().connection() as conn:
@@ -171,8 +174,17 @@ def _run_finalize(monkeypatch, uid: str, call_id: str):
 
     from voice import transcript_store
 
+    monkeypatch.setattr(
+        transcript_store,
+        "exists",
+        lambda archived_uid, archived_call_id: (
+            str(archived_uid), str(archived_call_id)
+        ) in _STUBBED_ARCHIVED_CALLS,
+    )
+
     def _persist(_store, cid, text, *, turn_count, duration_sec, chat_message_id=""):
         calls["archived"] += 1
+        _STUBBED_ARCHIVED_CALLS.add((str(uid), str(cid)))
         return {"call_id": cid, "turn_count": turn_count,
                 "duration_sec": duration_sec, "char_count": len(text)}
 

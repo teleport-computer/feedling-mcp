@@ -4701,12 +4701,11 @@ def _surface_terminal_error(deps: TurnDeps, user_id: str, job_id, message: str) 
 
 
 def _compaction_message_chars(message: dict) -> int:
-    """Rendered size of one row in ``compaction._render_old_messages``.
+    """Conservative source-row size for a compaction batch.
 
-    Keep this deliberately in lock-step with that renderer (``role: content``
-    plus one line separator).  It is a conservative one-character overcount
-    for the final row, which is preferable to letting a batch exceed its
-    configured request budget.
+    The renderer omits UI-only voice artifacts with batch-level parent
+    correlation. Sizing their stored text here can only make a batch smaller;
+    it can never let a provider request exceed its configured budget.
     """
     return (
         len(str(message.get("role") or ""))

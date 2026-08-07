@@ -504,6 +504,8 @@ class UserStore:
                 "include_reasoning",
                 "voice_call_id",
                 "voice_turn_id",
+                "voice_turn_count",
+                "voice_duration_sec",
                 "caption_v",
                 "caption_id",
                 "caption_body_ct",
@@ -557,6 +559,13 @@ class UserStore:
                 elif isinstance(value, bool):
                     msg[key] = value
                 elif key == "file_byte_count" and isinstance(value, int) and value > 0:
+                    msg[key] = value
+                elif (
+                    key in {"voice_turn_count", "voice_duration_sec"}
+                    and isinstance(value, int)
+                    and not isinstance(value, bool)
+                    and value >= 0
+                ):
                     msg[key] = value
                 elif key == "activity_events" and isinstance(value, list):
                     msg[key] = [
@@ -706,6 +715,8 @@ class UserStore:
                 "include_reasoning",
                 "voice_call_id",
                 "voice_turn_id",
+                "voice_turn_count",
+                "voice_duration_sec",
                 "caption_v",
                 "caption_id",
                 "caption_body_ct",
@@ -757,6 +768,13 @@ class UserStore:
                 elif isinstance(value, bool):
                     msg[key] = value
                 elif key == "file_byte_count" and isinstance(value, int) and value > 0:
+                    msg[key] = value
+                elif (
+                    key in {"voice_turn_count", "voice_duration_sec"}
+                    and isinstance(value, int)
+                    and not isinstance(value, bool)
+                    and value >= 0
+                ):
                     msg[key] = value
                 elif key == "activity_events" and isinstance(value, list):
                     msg[key] = [
