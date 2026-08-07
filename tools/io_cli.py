@@ -2046,8 +2046,12 @@ def main():
                          help="材料文件路径(UTF-8 文本);与 --material-text 二选一;"
                               "敏感材料优先用这个(不会出现在 ps 里)")
     ird_grp.add_argument("--material-text", dest="material_text", default=None,
+                         # 用 ASCII 的 [!] 而不是 ⚠️:help 文本会被 io_cli_catalog
+                         # 以子进程 --help 的形式读出来,子进程 stdout 用系统 locale
+                         # 编码。中文 Windows 是 cp936(GBK),U+26A0 不在 GBK 里 →
+                         # 子进程 UnicodeEncodeError → 整个 catalog 构建失败。
                          help="材料原文,直接传文本;与 --material-file 二选一;"
-                              "⚠️ 会明文出现在本机 ps 输出里,敏感材料改用 --material-file")
+                              "[!] 会明文出现在本机 ps 输出里,敏感材料改用 --material-file")
     ird.set_defaults(func=cmd_identity_redistill)
 
     ii = sub.add_parser(
