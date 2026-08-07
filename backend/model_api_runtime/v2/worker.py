@@ -10470,11 +10470,6 @@ async def process_job(
             if lane == "chat" and mutation_recovery_barrier is None
             else None
         )
-        required_image_generation_prompt = (
-            context.required_image_generation_prompt(coalesced)
-            if lane == "chat" and mutation_recovery_barrier is None
-            else None
-        )
         if not coalesced and lane == "chat":
             # 无未回复消息（已被别的回合吃掉，或是竞态下的重复 claim）——干净收尾，不落 filler。
             completed, successor_id = await asyncio.to_thread(
@@ -12066,15 +12061,6 @@ async def process_job(
                 else None
             ),
             on_file_requirement_changed=_on_file_requirement_changed,
-            required_image_generation_prompt=required_image_generation_prompt,
-            image_requirement_messages=(
-                coalesced if mutation_recovery_barrier is None else ()
-            ),
-            resolve_required_image_generation_prompt=(
-                context.required_image_generation_prompt
-                if mutation_recovery_barrier is None
-                else None
-            ),
             fold_new_messages=fold_new_messages,
             add_usage=tm.add_call,
             max_calls=(

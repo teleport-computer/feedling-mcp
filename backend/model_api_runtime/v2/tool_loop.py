@@ -87,6 +87,22 @@ def _search_result_urls(content: str) -> set[str]:
     return urls
 
 
+# 伴侣「声称已经画了图」的说法。只用来识别**谎报**(说了却没有 media),
+# 不用来判断用户想不想要图 —— 那个判断权归伴侣自己。
+# 宁可漏判也不要误判:漏判只是少了一句纠正,误判会把伴侣一句正常的话当成谎话。
+_IMAGE_CLAIM_RE = re.compile(
+    r"(已经?(为你)?(画|生成|做)好了?|画好了|生成好了|图(片|像)?(已经)?(生成|画好|做好)"
+    r"|here('| i)s (the|your) (image|picture|illustration)"
+    r"|i('ve| have) (just )?(created|generated|drawn|made) (the|an?|your) "
+    r"(image|picture|illustration))",
+    re.IGNORECASE,
+)
+
+
+def _claims_image_delivered(text: str) -> bool:
+    return bool(_IMAGE_CLAIM_RE.search(str(text or "")))
+
+
 def _positive_limit(value, *, name: str) -> int:
     try:
         parsed = int(value)
@@ -253,9 +269,6 @@ async def run_tool_loop(
     file_requirement_messages=(),
     resolve_required_file_suffixes=None,
     on_file_requirement_changed=None,
-    required_image_generation_prompt: str | None = None,
-    image_requirement_messages=(),
-    resolve_required_image_generation_prompt=None,
     outbound_blocking_read_tool_names=None,
     outbound_blocking_read_tool_predicate=None,
     max_tool_calls_per_round: int = DEFAULT_MAX_TOOL_CALLS_PER_ROUND,
@@ -383,21 +396,6 @@ async def run_tool_loop(
         for message in file_requirement_messages
         if isinstance(message, dict)
     ]
-    image_requirement_message_state = [
-        dict(message)
-        for message in image_requirement_messages
-        if isinstance(message, dict)
-    ]
-    resolved_image_generation_prompt = str(
-        required_image_generation_prompt or ""
-    ).strip()
-    if resolve_required_image_generation_prompt is not None:
-        resolved_image_generation_prompt = str(
-            resolve_required_image_generation_prompt(
-                image_requirement_message_state
-            )
-            or ""
-        ).strip()
 
     def _normalize_file_requirement(value) -> tuple[bool, frozenset[str]]:
         suffixes = frozenset(
@@ -423,6 +421,8 @@ async def run_tool_loop(
     file_delivery_retry_used = False
     required_file_missing_recorded = False
     file_delivery_fallback_text = ""
+    image_claim_bounces = 0
+    image_claim_retry_instruction = ""
     file_delivery_fallback_reasoning = ""
     file_delivery_recovery_needed = False
     workspace_write_applied = False
@@ -579,21 +579,15 @@ async def run_tool_loop(
                         file_delivery_fallback_reasoning = ""
                         if on_file_requirement_changed is not None:
                             await on_file_requirement_changed()
-                if resolve_required_image_generation_prompt is not None:
-                    image_requirement_message_state.extend(
-                        dict(message)
-                        for message in folded
-                        if isinstance(message, dict)
-                    )
-                    resolved_image_generation_prompt = str(
-                        resolve_required_image_generation_prompt(
-                            image_requirement_message_state
-                        )
-                        or ""
-                    ).strip()
 
         messages = build_messages(list(transcript))
-        if delivery_retry_instruction:
+        # 两道"打回重答"共用同一条注入通道:文件投递缺失、以及生图谎报。
+        # 各自都只打回一次,之后照常吐 —— 再纠缠就是拿 runtime 跟模型较劲。
+        pending_retry_instruction = "\n\n".join(
+            part for part in (delivery_retry_instruction,
+                              image_claim_retry_instruction) if part
+        )
+        if pending_retry_instruction:
             # Keep provider-native tool exchanges intact. They are dataclasses,
             # not mappings, and must survive unchanged so the next provider
             # round can replay the exact assistant/tool-result transcript.
@@ -609,12 +603,12 @@ async def run_tool_loop(
                 messages[0]["content"] = (
                     str(messages[0].get("content") or "").rstrip()
                     + "\n\n"
-                    + delivery_retry_instruction
+                    + pending_retry_instruction
                 )
             else:
                 messages.insert(
                     0,
-                    {"role": "system", "content": delivery_retry_instruction},
+                    {"role": "system", "content": pending_retry_instruction},
                 )
         # Reserve the final provider attempt for a tools-disabled terminal reply.
         # A 400/422 tool-schema rejection or repeated malformed call also forces
@@ -922,45 +916,41 @@ async def run_tool_loop(
         # A tools-disabled request is terminal even if a broken relay invents a
         # tool call anyway.  Never execute an undeclared call; use only its text.
         if tools is None or not pr.tool_calls:
-            if resolved_image_generation_prompt and not pr.media:
-                if on_image_reply is None:
-                    raise RuntimeError("generate_image callback is unavailable")
+            # 伴侣声称画好了却一张图都没有 —— 打回去让它自己纠正。
+            #
+            # 这里原本是一道**正则意图闸**:用关键词判断「用户是不是在要图」,
+            # 模型没调工具就拿**用户原话**去生图,并把模型那轮文字整个丢掉。
+            # 拆掉的理由是它替伴侣做了本该由伴侣做的判断:「这时候有张图就更好了」
+            # 这类含蓄请求正则一定判否(想画也画不成);拿用户原话当 prompt,画出来
+            # 的东西不带伴侣的理解(不知道「自画像」里的「自」是谁);伴侣自己突然
+            # 想画一张更是完全没有入口。**决定权归伴侣。**
+            #
+            # 但「说了没做」必须处理 —— 处理方式是**退回给它重答**,而不是我们替它
+            # 补一张图或把话吞掉:它自己可以选择真去调工具,或者老实说没画成。
+            # 只退一次(和 capture 的格式打回同一个预算观),再撒谎就是模型的问题,
+            # 照原样发出并留痕,不再纠缠。
+            if (
+                pr.text
+                and not pr.media
+                and image_claim_bounces < 1
+                and _claims_image_delivered(pr.text)
+            ):
+                image_claim_bounces += 1
                 await _trajectory(
-                    "required_image_generation_fallback",
-                    {
-                        "round": attempts,
-                        "discarded_text_chars": len(pr.text),
-                    },
+                    "image_claim_without_media_bounced",
+                    {"round": attempts, "text_chars": len(pr.text)},
                 )
-                media = tuple(
-                    await on_image_reply(
-                        {"prompt": resolved_image_generation_prompt}
-                    )
+                image_claim_retry_instruction = (
+                    "上一轮你说图已经生成/画好了,但这一轮没有任何图片真的被生成。"
+                    "请二选一,不要再声称已生成:"
+                    "(1) 你确实想给出这张图 —— 调用 generate_image 工具,把完整的"
+                    "画面描述写进 prompt;"
+                    "(2) 你并不打算画 —— 照实说,不要用文字假装图已经存在。"
                 )
-                if not media:
-                    raise RuntimeError("generate_image returned no media")
-                try:
-                    await on_reply("", final=True, media=media)
-                except FinalReplySuperseded:
-                    reasoning_fragments.clear()
-                    seen_reasoning_fragments.clear()
-                    _progress("final_reply_superseded")
-                    await _trajectory(
-                        "final_reply_superseded",
-                        {"round": attempts},
-                    )
-                    if attempts < max_calls:
-                        continue
-                    return LoopOutcome(
-                        "", attempts, "input_advanced", replied_intermediate
-                    )
-                return LoopOutcome(
-                    "",
-                    attempts,
-                    "final_media",
-                    replied_intermediate,
-                    delivered_media_count=len(media),
-                )
+                if attempts < max_calls - 1:
+                    _progress("image_claim_retry_boundary")
+                    continue
+
             requirement_met = (
                 not file_delivery_required
                 or (
@@ -1327,12 +1317,34 @@ async def run_tool_loop(
                 media = tuple(await on_image_reply(dict(tc.args)))
                 if not media:
                     raise RuntimeError("generate_image returned no media")
-                await on_reply("", final=True, media=media)
+                # 带上伴侣这一轮说的话。它调了工具不代表它没话说 ——「这是我想象
+                # 中自己的样子」和那张图本来就是一次表达的两半,发空字符串等于
+                # 把人写好的话吞掉。之前这里硬编码 "",所以**即使模型正确调用了
+                # 工具**,用户也只收到一张孤零零的图。
+                await on_reply(pr.text or "", final=True, media=media)
             except Exception as exc:
                 await _tool_event(
                     tc, "tool_call_error", {"error": type(exc).__name__}
                 )
-                raise
+                # 生图失败**不打断这一轮** —— 把结构化失败交回给伴侣,让它自己
+                # 决定怎么跟用户说(换个描述再试、或者老实讲这次没画成)。
+                # 原来这里直接 raise,整轮炸掉:用户既没有图、也没有一句解释,
+                # 而伴侣根本不知道发生过什么。工具失败是它该知道的事实,不是
+                # runtime 替它隐藏的意外。
+                image_result = ToolResult(
+                    call_id=tc.id,
+                    content=(
+                        "error: image generation failed ("
+                        + str(getattr(exc, "error_code", "") or type(exc).__name__)
+                        + "). 图没有生成。请如实告诉用户,或换一个更清楚的画面"
+                        "描述再调一次;不要声称图已经生成。"
+                    ),
+                )
+                reply_results[tc.id] = image_result
+                await _tool_event(
+                    tc, "tool_call_result", {"result": image_result}
+                )
+                continue
             image_result = ToolResult(
                 call_id=tc.id,
                 content="ok: image delivered",
