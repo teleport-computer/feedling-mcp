@@ -728,6 +728,77 @@ def test_pending_final_reply_recovers_before_any_new_provider_call(monkeypatch):
     assert effect_status == "applied"
 
 
+def test_cancelled_voice_final_effect_is_discarded_and_settles_job():
+    uid = "u_atomic_cancelled_voice_effect"
+    conftest.seed_user(uid)
+    _reset(uid)
+    call_id = "vcall_cancelled_v2"
+    db.voice_call_create_active(uid, call_id)
+    db.chat_append_strict(
+        uid,
+        "voice-user",
+        100.0,
+        {
+            "id": "voice-user",
+            "role": "user",
+            "source": "chat",
+            "body_ct": "voice-ciphertext",
+            "voice_call_id": call_id,
+            "voice_turn_id": "1",
+        },
+        5000,
+    )
+    input_seq = db.chat_seq_for_msg_id(uid, "voice-user")
+    assert input_seq is not None
+    job_id, _ = jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("cancel-worker")
+    assert job is not None and int(job["id"]) == job_id
+    assert jobs_store.mark_running(job_id, claimed_by="cancel-worker")
+    generation = db.get_runtime_generation(uid)
+    effect_id = effect_outbox.enqueue_effect(
+        job_id=job_id,
+        user_id=uid,
+        effect_type=effect_outbox.FINAL_REPLY_EFFECT_TYPE,
+        ordinal=0,
+        expected_generation=generation,
+        payload={
+            "envelope": _envelope("d" * 32, body="late-reply"),
+            "reply_through_seq": input_seq,
+            "reply_to_message_id": "voice-user",
+            "voice_call_id": call_id,
+            "voice_turn_id": "1",
+            effect_outbox.FINAL_REPLY_FENCE_KEY: {
+                "claimed_by": "cancel-worker",
+                "input_generation": 0,
+                "through_seq": input_seq,
+            },
+        },
+    )
+    assert db.voice_call_cancel(uid, call_id, "user_hangup") == {
+        "status": "cancelled",
+        "replayed": False,
+    }
+
+    result = serve_worker._apply_pending_effects_for_user(uid)
+
+    disposition = effect_outbox.get_effect_disposition(
+        effect_id,
+        user_id=uid,
+        job_id=job_id,
+        effect_type=effect_outbox.FINAL_REPLY_EFFECT_TYPE,
+    )
+    assert result["discarded"] == 1
+    assert disposition == {
+        "status": "discarded",
+        "last_error": effect_outbox.FINAL_REPLY_VOICE_CALL_ENDED,
+    }
+    assert jobs_store.get_job_status(
+        job_id, user_id=uid, claimed_by="cancel-worker"
+    ) == "completed"
+    assert cursor.load_seq(core_store.get_store(uid)) == input_seq
+    assert db.chat_seq_for_msg_id(uid, "d" * 32) is None
+
+
 def test_final_reply_effect_surfaces_sealed_thinking(monkeypatch):
     """A reply effect whose payload carries a sealed ``thinking`` sub-envelope
     lands its provider chain-of-thought on the same chat row (thinking_body_ct +

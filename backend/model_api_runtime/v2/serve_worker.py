@@ -849,8 +849,16 @@ def _decrypt_chat_rows(
         reply_to_message_id = str(m.get("reply_to_message_id") or "").strip()
         if role == "assistant" and reply_to_message_id:
             item["reply_to_message_id"] = reply_to_message_id
+        source = str(m.get("source") or "").strip()
+        call_id = str(m.get("voice_call_id") or "").strip()
+        # Normal prompt readers need just enough plaintext routing metadata to
+        # recognize the UI-only archive card and old ASR-noise rows. Capture's
+        # broader metadata contract remains below.
+        if source == "voice_call_transcript":
+            item["source"] = source
+        if call_id:
+            item["voice_call_id"] = call_id[:96]
         if include_capture_metadata:
-            source = str(m.get("source") or "")
             item["source"] = source
             item["raw_role"] = raw_role
             item["capture_eligible"] = (
@@ -858,12 +866,11 @@ def _decrypt_chat_rows(
                 and source in capture_scheduler.CAPTURE_LIVE_SOURCES
             )
             # 通话卡的反查键：worker 用它把有界预览换成归档的全文转写。
-            call_id = str(m.get("voice_call_id") or "").strip()
             if call_id:
-                item["voice_call_id"] = call_id[:96]
-                turn_count = m.get("voice_turn_count")
-                if turn_count:
-                    item["voice_turn_count"] = int(turn_count)
+                for key in ("voice_turn_count", "voice_duration_sec"):
+                    value = m.get(key)
+                    if isinstance(value, int) and not isinstance(value, bool):
+                        item[key] = max(0, value)
         out.append(item)
     return out
 
@@ -2685,7 +2692,12 @@ def _reply_payload_sequence(payload: dict) -> list[dict]:
             or _reply_message_fields(raw_followup)[0] != "file"
         ):
             raise RuntimeError("invalid reply followup")
-        sequence.append(dict(raw_followup))
+        followup = dict(raw_followup)
+        for key in ("voice_call_id", "voice_turn_id"):
+            value = str(payload.get(key) or "").strip()
+            if value:
+                followup[key] = value
+        sequence.append(followup)
     return sequence
 
 

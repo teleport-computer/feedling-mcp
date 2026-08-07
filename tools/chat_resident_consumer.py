@@ -168,6 +168,7 @@ from chat.reply_language import (
 from core.downloadable_reply import sanitize_downloadable_reply
 from model_api_runtime.v2 import context as downloadable_file_context
 from model_api_runtime.v2 import document_render as downloadable_document_render
+from voice.message_filter import conversation_rows as _conversation_rows
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -10494,7 +10495,7 @@ def _chat_context_line(msg: dict, *, now: float, stale: bool) -> str:
 
 def _clean_messages_for_proactive_context(history: list[dict] | None) -> list[dict]:
     cleaned: list[dict] = []
-    for msg in history or []:
+    for msg in _conversation_rows(history or []):
         if not isinstance(msg, dict):
             continue
         role = str(msg.get("role") or "").strip().lower()
@@ -12473,7 +12474,7 @@ def _dream_recent_conversations_context(*, user_label: str = "TA", agent_label: 
     except Exception as e:
         log.warning("dream recent conversation fetch failed: %s", e)
         return "（这几天没有可读对话）"
-    live = _capture_live_history(history)
+    live = _capture_live_history(_conversation_rows(history or []))
     if not live:
         return "（这几天没有新对话）"
     lines: list[str] = []

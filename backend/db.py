@@ -8020,6 +8020,150 @@ def _lock_chat_user_fence_on_cursor(
     )
 
 
+def _lock_voice_call_on_cursor(cur, user_id: str, call_id: str) -> None:
+    cur.execute(
+        "SELECT pg_advisory_xact_lock(hashtextextended("
+        "'voice-call:' || %s || ':' || %s, 0))",
+        (str(user_id), str(call_id)),
+    )
+
+
+def voice_call_status_on_cursor(
+    cur, user_id: str, call_id: str, *, lock: bool = False
+) -> str:
+    """Read a call's durable lifecycle inside an existing transaction."""
+    if lock:
+        _lock_voice_call_on_cursor(cur, user_id, call_id)
+    cur.execute(
+        "SELECT status FROM voice_call_sessions "
+        "WHERE user_id=%s AND call_id=%s" + (" FOR UPDATE" if lock else ""),
+        (str(user_id), str(call_id)),
+    )
+    row = cur.fetchone()
+    if row is None:
+        return ""
+    return str(row["status"] if isinstance(row, dict) else row[0])
+
+
+def voice_call_status(user_id: str, call_id: str) -> str:
+    with get_pool().connection() as conn:
+        with conn.cursor() as cur:
+            return voice_call_status_on_cursor(cur, user_id, call_id)
+
+
+def voice_call_create_active(user_id: str, call_id: str) -> None:
+    """Persist session ownership before its signed gateway token is returned."""
+    with get_pool().connection() as conn:
+        conn.execute(
+            "INSERT INTO voice_call_sessions (user_id,call_id,status) "
+            "VALUES (%s,%s,'active') ON CONFLICT (user_id,call_id) DO NOTHING",
+            (str(user_id), str(call_id)),
+        )
+
+
+def voice_call_cancel(user_id: str, call_id: str, reason: str) -> dict:
+    """Install a cancellation tombstone under the shared chat write fence."""
+    with get_pool().connection() as conn:
+        with conn.transaction():
+            with conn.cursor() as cur:
+                _lock_chat_user_fence_on_cursor(cur, user_id)
+                _lock_voice_call_on_cursor(cur, user_id, call_id)
+                cur.execute(
+                    "SELECT status,cancel_reason FROM voice_call_sessions "
+                    "WHERE user_id=%s AND call_id=%s FOR UPDATE",
+                    (str(user_id), str(call_id)),
+                )
+                row = cur.fetchone()
+                if row is None:
+                    cur.execute(
+                        "INSERT INTO voice_call_sessions "
+                        "(user_id,call_id,status,cancel_reason,ended_at) "
+                        "VALUES (%s,%s,'cancelled',%s,now())",
+                        (str(user_id), str(call_id), str(reason)),
+                    )
+                    return {"status": "cancelled", "replayed": False}
+                status = str(row["status"] if isinstance(row, dict) else row[0])
+                if status in {"finalizing", "finalized"}:
+                    return {"status": status, "replayed": True}
+                if status == "cancelled":
+                    return {"status": "cancelled", "replayed": True}
+                cur.execute(
+                    "UPDATE voice_call_sessions SET status='cancelled',"
+                    "cancel_reason=%s,ended_at=now() "
+                    "WHERE user_id=%s AND call_id=%s",
+                    (str(reason), str(user_id), str(call_id)),
+                )
+                return {"status": "cancelled", "replayed": False}
+
+
+def voice_call_begin_finalize(user_id: str, call_id: str) -> dict:
+    """Claim finalize before any archive/card write can race with cancel."""
+    with get_pool().connection() as conn:
+        with conn.transaction():
+            with conn.cursor() as cur:
+                _lock_chat_user_fence_on_cursor(cur, user_id)
+                _lock_voice_call_on_cursor(cur, user_id, call_id)
+                cur.execute(
+                    "SELECT status FROM voice_call_sessions "
+                    "WHERE user_id=%s AND call_id=%s FOR UPDATE",
+                    (str(user_id), str(call_id)),
+                )
+                row = cur.fetchone()
+                if row is None:
+                    cur.execute(
+                        "INSERT INTO voice_call_sessions "
+                        "(user_id,call_id,status) VALUES (%s,%s,'finalizing')",
+                        (str(user_id), str(call_id)),
+                    )
+                    return {"status": "finalizing", "replayed": False}
+                status = str(row["status"] if isinstance(row, dict) else row[0])
+                if status == "cancelled":
+                    return {"status": "cancelled", "replayed": True}
+                if status in {"finalizing", "finalized"}:
+                    return {"status": status, "replayed": True}
+                cur.execute(
+                    "UPDATE voice_call_sessions SET status='finalizing' "
+                    "WHERE user_id=%s AND call_id=%s",
+                    (str(user_id), str(call_id)),
+                )
+                return {"status": "finalizing", "replayed": False}
+
+
+def voice_call_mark_finalized(user_id: str, call_id: str) -> dict:
+    """Finalize without ever reviving a call whose cancel tombstone won."""
+    with get_pool().connection() as conn:
+        with conn.transaction():
+            with conn.cursor() as cur:
+                _lock_chat_user_fence_on_cursor(cur, user_id)
+                _lock_voice_call_on_cursor(cur, user_id, call_id)
+                cur.execute(
+                    "SELECT status FROM voice_call_sessions "
+                    "WHERE user_id=%s AND call_id=%s FOR UPDATE",
+                    (str(user_id), str(call_id)),
+                )
+                row = cur.fetchone()
+                if row is None:
+                    cur.execute(
+                        "INSERT INTO voice_call_sessions "
+                        "(user_id,call_id,status,ended_at) "
+                        "VALUES (%s,%s,'finalized',now())",
+                        (str(user_id), str(call_id)),
+                    )
+                    return {"status": "finalized", "replayed": False}
+                status = str(row["status"] if isinstance(row, dict) else row[0])
+                if status == "cancelled":
+                    return {"status": "cancelled", "replayed": True}
+                if status == "finalized":
+                    return {"status": "finalized", "replayed": True}
+                cur.execute(
+                    "UPDATE voice_call_sessions SET status='finalized',"
+                    "cancel_reason='',ended_at=now() "
+                    "WHERE user_id=%s AND call_id=%s",
+                    (str(user_id), str(call_id)),
+                )
+                return {"status": "finalized", "replayed": False}
+
+
 def _lock_capture_consent_on_cursor(cur, user_id: str) -> None:
     """Serialize proactive Capture consent changes with the effect commit."""
     cur.execute(
@@ -8803,6 +8947,25 @@ class ResidentReplyRejected(RuntimeError):
         super().__init__(self.reason)
 
 
+class VoiceCallReplySuppressed(RuntimeError):
+    """A call ended before an asynchronous assistant reply could commit."""
+
+    def __init__(self, status: str):
+        self.status = str(status)
+        super().__init__(f"voice_call_{self.status}")
+
+
+def _voice_reply_context_on_cursor(cur, user_id: str, parent_doc: dict) -> dict:
+    call_id = str((parent_doc or {}).get("voice_call_id") or "").strip()
+    turn_id = str((parent_doc or {}).get("voice_turn_id") or "").strip()
+    if not call_id or not turn_id:
+        return {}
+    status = voice_call_status_on_cursor(cur, user_id, call_id, lock=True)
+    if status in {"finalizing", "cancelled", "finalized"}:
+        raise VoiceCallReplySuppressed(status)
+    return {"voice_call_id": call_id, "voice_turn_id": turn_id}
+
+
 def _same_reply_envelope(existing_doc, requested_doc) -> bool:
     existing_delivery_id = str(
         (existing_doc or {}).get("resident_delivery_id") or ""
@@ -8818,6 +8981,7 @@ def _same_reply_envelope(existing_doc, requested_doc) -> bool:
         stable_delivery_fields = (
             "id", "role", "source", "visibility", "owner_user_id",
             "content_type", "reply_to_message_id", "resident_delivery_id",
+            "voice_call_id", "voice_turn_id",
         )
         return (
             existing_delivery_id == requested_delivery_id
@@ -8830,6 +8994,7 @@ def _same_reply_envelope(existing_doc, requested_doc) -> bool:
         "id", "role", "source", "v", "body_ct", "nonce",
         "K_user", "K_enclave", "enclave_pk_fpr", "visibility",
         "owner_user_id", "content_type", "reply_to_message_id",
+        "voice_call_id", "voice_turn_id",
     )
     if not isinstance(existing_doc, dict) or not isinstance(requested_doc, dict):
         return False
@@ -8941,6 +9106,14 @@ def chat_append_resident_reply(
                 )
                 if not isinstance(parent_doc, dict) or parent_doc.get("role") != "user":
                     raise ResidentReplyRejected("reply_parent_not_user")
+
+                # The parent is the authoritative correlation source. Copy its
+                # call/turn ids onto the assistant row, and reject a late write
+                # after cancel/finalize while holding the same chat fence used
+                # by the lifecycle transition.
+                reply_doc.update(
+                    _voice_reply_context_on_cursor(cur, user_id, parent_doc)
+                )
 
                 prior_reply_id = str(parent_doc.get("reply_message_id") or "")
                 already_replied = (
@@ -9353,6 +9526,15 @@ def chat_append_effect_with_cursor(
         with conn.transaction():
             with conn.cursor() as cur:
                 _lock_chat_user_fence_on_cursor(cur, user_id)
+                voice_call_id = str(
+                    effect_doc.get("voice_call_id") or ""
+                ).strip()
+                if voice_call_id:
+                    voice_status = voice_call_status_on_cursor(
+                        cur, user_id, voice_call_id, lock=True
+                    )
+                    if voice_status in {"finalizing", "cancelled", "finalized"}:
+                        raise VoiceCallReplySuppressed(voice_status)
                 # Lock/materialize the cursor row before deciding whether a
                 # resident reply raced this V2 turn. If any newly-consumed user
                 # input was answered after V2 assembled its prompt, abort before
@@ -10329,20 +10511,42 @@ def chat_finalize_reply_once(
     mirrors only the parent's plaintext metadata; the encrypted reply remains
     exclusively on the normal decrypting TEE-replicator path.
     """
+    persisted_reply = dict(reply_doc)
+    persisted_reply["reply_to_message_id"] = str(parent_msg_id)
     with get_pool().connection() as conn:
-        row = conn.execute(
-            _CHAT_FINALIZE_REPLY_ONCE_SQL,
-            (
-                Jsonb(replied_fields),
-                user_id,
-                parent_msg_id,
-                user_id,
-                reply_msg_id,
-                reply_ts,
-                Jsonb(reply_doc),
-                user_id,
-            ),
-        ).fetchone()
+        with conn.transaction():
+            with conn.cursor() as cur:
+                _lock_chat_user_fence_on_cursor(cur, user_id)
+                cur.execute(
+                    "SELECT doc FROM chat_messages "
+                    "WHERE user_id=%s AND msg_id=%s FOR UPDATE",
+                    (user_id, parent_msg_id),
+                )
+                parent_row = cur.fetchone()
+                if parent_row is None:
+                    return None
+                parent = (
+                    parent_row["doc"]
+                    if isinstance(parent_row, dict)
+                    else parent_row[0]
+                )
+                persisted_reply.update(
+                    _voice_reply_context_on_cursor(cur, user_id, parent)
+                )
+                cur.execute(
+                    _CHAT_FINALIZE_REPLY_ONCE_SQL,
+                    (
+                        Jsonb(replied_fields),
+                        user_id,
+                        parent_msg_id,
+                        user_id,
+                        reply_msg_id,
+                        reply_ts,
+                        Jsonb(persisted_reply),
+                        user_id,
+                    ),
+                )
+                row = cur.fetchone()
     if row is None:
         return None
     # The encrypted reply row is intentionally NOT mirrored here.  The normal
@@ -10379,7 +10583,24 @@ def chat_finalize_reply_sequence_once(
     with get_pool().connection() as conn:
         with conn.transaction():
             with conn.cursor() as cur:
+                _lock_chat_user_fence_on_cursor(cur, user_id)
                 _lock_chat_r2_lifecycle_on_cursor(cur, user_id)
+                cur.execute(
+                    "SELECT doc FROM chat_messages "
+                    "WHERE user_id=%s AND msg_id=%s FOR UPDATE",
+                    (user_id, parent_msg_id),
+                )
+                source_row = cur.fetchone()
+                if source_row is None:
+                    return None
+                source_doc = (
+                    source_row["doc"]
+                    if isinstance(source_row, dict)
+                    else source_row[0]
+                )
+                voice_context = _voice_reply_context_on_cursor(
+                    cur, user_id, source_doc
+                )
                 cur.execute(
                     "UPDATE chat_messages SET doc = doc || %s "
                     "WHERE user_id = %s AND msg_id = %s "
@@ -10393,6 +10614,11 @@ def chat_finalize_reply_sequence_once(
                     return None
                 parent_doc = parent_row[0]
                 for reply_msg_id, reply_ts, reply_doc in replies:
+                    persisted_reply = {
+                        **reply_doc,
+                        "reply_to_message_id": str(parent_msg_id),
+                        **voice_context,
+                    }
                     cur.execute(
                         "INSERT INTO chat_messages (user_id, msg_id, ts, doc) "
                         "VALUES (%s, %s, %s, %s) RETURNING doc",
@@ -10400,7 +10626,7 @@ def chat_finalize_reply_sequence_once(
                             user_id,
                             reply_msg_id,
                             reply_ts,
-                            Jsonb(reply_doc),
+                            Jsonb(persisted_reply),
                         ),
                     )
                     inserted_docs.append(cur.fetchone()[0])

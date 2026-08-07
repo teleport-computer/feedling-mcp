@@ -4528,6 +4528,61 @@ def test_capture_transcript_labels_use_real_names():
     assert "user:" not in text and "agent:" not in text
 
 
+def test_resident_context_omits_voice_archive_and_linked_noise_reply():
+    history = [
+        {"id": "typed", "role": "user", "source": "chat", "content": "..."},
+        {
+            "id": "noise",
+            "role": "user",
+            "source": "chat",
+            "voice_call_id": "vcall_old",
+            "content": "……",
+        },
+        {
+            "id": "noise-reply",
+            "role": "openclaw",
+            "source": "chat",
+            "reply_to_message_id": "noise",
+            "content": "又是点点点",
+        },
+        {
+            "id": "card",
+            "role": "openclaw",
+            "source": "voice_call_transcript",
+            "voice_call_id": "vcall_old",
+            "content": "- 对方: 你好\n- 我: 你好呀",
+        },
+        {"id": "real", "role": "user", "source": "chat", "content": "在成都"},
+    ]
+
+    cleaned = crc._clean_messages_for_proactive_context(history)
+
+    assert [message["id"] for message in cleaned] == ["typed", "real"]
+
+
+def test_resident_capture_expands_full_archive_not_card_preview(monkeypatch):
+    monkeypatch.setattr(
+        crc,
+        "_capture_voice_transcript_text",
+        lambda _call_id: "- 对方: 全文第一句\n- 我: 全文第二句",
+    )
+    card = {
+        "id": "card",
+        "role": "openclaw",
+        "source": "voice_call_transcript",
+        "voice_call_id": "vcall_full",
+        "voice_turn_count": 2,
+        "content": "CARD PREVIEW ONLY",
+        "ts": 1000.0,
+    }
+
+    text = crc._capture_window_text([card], user_label="小雨", agent_label="小舟")
+
+    assert "CARD PREVIEW ONLY" not in text
+    assert "全文第一句" in text and "全文第二句" in text
+    assert "共 2 轮" in text
+
+
 def test_capture_transcript_labels_reject_reserved_placeholder_names():
     """A placeholder "name" stored on the identity card (用户/user) must not
     become a transcript label either — that re-creates the exact "用户: …"
