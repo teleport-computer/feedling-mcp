@@ -5890,6 +5890,112 @@ def test_claude_turn_from_stream_empty_when_no_success_result():
     assert crc._claude_turn_from_stream(raw) == ("", "")
 
 
+def test_claude_actual_models_uses_only_structured_stream_metadata():
+    raw = "\n".join([
+        json.dumps({
+            "type": "assistant",
+            "message": {
+                "model": "claude-fable-5",
+                "content": [{"type": "text", "text": "我是 Opus 4.8"}],
+            },
+        }),
+        json.dumps({
+            "type": "result",
+            "subtype": "success",
+            "result": "I am claude-sonnet-4-6",
+            "modelUsage": {
+                "claude-fable-5": {"inputTokens": 1},
+                "claude-haiku-4-5": {"inputTokens": 1},
+            },
+        }),
+    ])
+
+    assert crc._claude_actual_models_from_stream(raw) == {
+        "claude-fable-5",
+        "claude-haiku-4-5",
+    }
+
+
+@pytest.mark.parametrize(
+    ("configured", "actual", "matches"),
+    [
+        ("fable", {"claude-fable-5"}, True),
+        ("opus", {"claude-opus-4-8"}, True),
+        ("sonnet", {"claude-sonnet-4-6"}, True),
+        ("haiku", {"claude-haiku-4-5"}, True),
+        ("claude-fable-5", {"claude-fable-5"}, True),
+        ("claude-fable-5", {"claude-opus-4-8"}, False),
+        ("claude-sonnet-4-6", {"claude-sonnet-4-6-20260801"}, False),
+    ],
+)
+def test_claude_configured_model_matches_structured_actual(configured, actual, matches):
+    assert crc._claude_configured_model_matches(configured, actual) is matches
+
+
+def test_call_agent_cli_rejects_claude_model_mismatch_and_clears_session(monkeypatch):
+    monkeypatch.setattr(crc, "AGENT_CLI_CMD", "claude --model claude-fable-5 -p {message}")
+    monkeypatch.setattr(crc, "AGENT_RUNTIME_METADATA", {
+        "provider": "anthropic",
+        "model": "claude-fable-5",
+        "input_modalities": ["text"],
+    })
+    monkeypatch.setattr(crc, "_resolve_cli_executable", lambda cmd: cmd)
+    monkeypatch.setattr(crc, "_load_agent_session_id", lambda: "")
+    cleared = []
+    monkeypatch.setattr(crc, "_clear_agent_session_id", cleared.append)
+
+    class _R:
+        returncode = 0
+        stdout = json.dumps({
+            "type": "result",
+            "subtype": "success",
+            "session_id": "wrong-model-session",
+            "result": "我记得你喜欢蓝色。",
+            "modelUsage": {"claude-opus-4-8": {"inputTokens": 42}},
+        })
+        stderr = ""
+
+    monkeypatch.setattr(crc.subprocess, "run", lambda *a, **kw: _R())
+
+    with pytest.raises(RuntimeError, match=r"model_mismatch: configured=claude-fable-5 actual=claude-opus-4-8"):
+        crc.call_agent_cli("请调用工具读取我喜欢的颜色")
+
+    assert cleared and "model mismatch" in cleared[0]
+
+
+def test_call_agent_cli_allows_claude_success_without_model_metadata(monkeypatch, caplog):
+    monkeypatch.setattr(crc, "AGENT_CLI_CMD", "claude --model claude-fable-5 -p {message}")
+    monkeypatch.setattr(crc, "AGENT_RUNTIME_METADATA", {
+        "provider": "anthropic",
+        "model": "claude-fable-5",
+        "input_modalities": ["text"],
+    })
+    monkeypatch.setattr(crc, "_resolve_cli_executable", lambda cmd: cmd)
+    monkeypatch.setattr(crc, "_load_agent_session_id", lambda: "")
+
+    class _R:
+        returncode = 0
+        stdout = json.dumps({
+            "type": "result", "subtype": "success", "result": "蓝色。",
+        })
+        stderr = ""
+
+    monkeypatch.setattr(crc.subprocess, "run", lambda *a, **kw: _R())
+
+    assert crc.call_agent_cli("我喜欢的颜色是什么？") == "蓝色。"
+    assert "no structured actual-model metadata" in caplog.text
+
+
+def test_model_mismatch_is_a_system_runtime_error():
+    notice = crc.classify_agent_error(RuntimeError(
+        "model_mismatch: configured=claude-fable-5 actual=claude-opus-4-8"
+    ))
+
+    assert notice.error_class == "model_mismatch"
+    assert notice.blame == "system"
+    assert notice.user_text == "当前运行时没有成功加载所选模型，请重新选择模型或稍后重试。"
+
+
 def test_call_agent_cli_claude_tool_turn_delivers_only_final_answer(monkeypatch):
     """End-to-end: a claude tool turn yields ONE bubble (the answer), the pre-tool
     preamble is gone, and native thinking rides the disclosure — so the foreground

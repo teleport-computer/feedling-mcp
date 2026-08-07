@@ -20,6 +20,7 @@ ERROR_CLASSES = frozenset({
     "quota_insufficient",
     "auth_invalid",
     "model_not_found",
+    "model_mismatch",
     "cli_config_invalid",
     "vision_model_required",
     "provider_incompatible",
@@ -70,6 +71,8 @@ _CATALOG: dict[str, tuple[str, str]] = {
         "user_provider", "API Key 无效或已过期，请到设置里重新保存。"),
     "model_not_found": (
         "user_provider", "模型名不可用，请检查设置里的模型名。"),
+    "model_mismatch": (
+        "system", "当前运行时没有成功加载所选模型，请重新选择模型或稍后重试。"),
     "cli_config_invalid": (
         "user_provider", "Agent 启动命令配置有误（缺少 {message} 占位符），消息传不到模型。请修正 AGENT_CLI_CMD。"),
     "vision_model_required": (
@@ -183,6 +186,7 @@ def user_text_for(error_class: str, **ctx) -> str:
 # tests/test_catalog_consumer_parity.py::test_classify_upstream_mirrors_consumer
 # 用代表串锁两份不漂移。次序即优先级。
 _UPSTREAM_RULES = (
+    ("model_mismatch", re.compile(r"\bmodel_mismatch\b", re.I)),
     # genesis/import worker 的 provider 错误把状态码编在 ``provider_http_<code>``
     # slug 里（下划线是 \w，\b<code>\b 形态永远打不中），按类补 slug 匹配。
     ("quota_insufficient", re.compile(

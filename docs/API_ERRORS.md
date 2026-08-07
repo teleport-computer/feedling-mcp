@@ -388,6 +388,7 @@ enclave 报错通常会重新包一层自己的 slug（如 `model_api_key_decryp
 
 | error_class | 状态码 | blame | severity | 触发场景 |
 |---|---|---|---|---|
+| `model_mismatch` | — | system | error | chat：Runtime V1 Claude Code 的结构化回执显示实际模型与用户配置不同；终止本轮并清理错误模型会话，避免静默降级污染后续对话 |
 | `vision_model_required` | — | user_provider | error | chat：主模型拒绝图片输入且没有成功产出回复；引导用户添加或切换支持视觉的模型，不误报成服务暂时不可用 |
 | `provider_incompatible` | — | user_provider | error | chat：Runtime V2 provider/tool loop 把上游「不支持某参数/工具」类错误分类上报（`classify_upstream`/`_ERROR_CLASS_RULES` 命中） |
 | `context_overflow` | — | user_provider | error | chat：这轮对话超出模型上下文窗口 |

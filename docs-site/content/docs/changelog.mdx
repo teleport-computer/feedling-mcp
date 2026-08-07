@@ -10,6 +10,12 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **Runtime V1 now pins and verifies the selected Claude model.** Managed
+  Claude Code commands pass the configured route through `--model`, model
+  changes rotate resident sessions, and structured Claude output that proves a
+  different model served the turn is rejected as `model_mismatch` instead of
+  silently returning a reply from the wrong model.
+
 - **Failed voice calls now have an explicit, idempotent cancellation path.**
   `POST /v1/voice/cancel` installs a durable per-call tombstone, clears
   unarchived turn/result rows, and suppresses late resident or Hosted Runtime
