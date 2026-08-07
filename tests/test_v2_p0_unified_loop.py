@@ -140,8 +140,19 @@ def _script_provider(monkeypatch, responses):
     it = iter(responses)
     calls = []
 
-    async def _fake(config, messages, *, tools=None):
-        calls.append({"messages": messages, "tools": tools})
+    async def _fake(
+        config,
+        messages,
+        *,
+        tools=None,
+        allow_image_output=False,
+    ):
+        assert allow_image_output is True
+        calls.append({
+            "messages": messages,
+            "tools": tools,
+            "allow_image_output": allow_image_output,
+        })
         return next(it)
 
     monkeypatch.setattr(provider_client, "chat_completion_async", _fake)
