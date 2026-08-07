@@ -21,7 +21,9 @@
 from __future__ import annotations
 
 import argparse
+import os
 import sys
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
@@ -38,6 +40,9 @@ _ASK = "给我画一张你自己吧,我想看看你想象中自己长什么样�
 _IMPLICIT = "今天下了好大的雨,我在窗边坐了一下午。这种时候要是有张画就好了。"
 
 
+DEBUG = os.environ.get("PROBE_DEBUG") == "1"
+
+
 def _icon(ok: bool) -> str:
     return "✅" if ok else "❌"
 
@@ -52,12 +57,25 @@ def _reply_after(client: E2EClient, since: float, *, timeout: float = 240.0):
     if msg is None:
         return None, "", []
     text = client.decrypt_reply(msg)
-    media = client.get("/v1/chat/history", params={"limit": 20}).json().get("messages", [])
-    images = [
-        m for m in media
-        if str(m.get("content_type") or "") == "image"
-        and float(m.get("ts") or 0) >= since
-    ]
+    # 图行与文字行是**一起提交**的,但客户端可能先观察到文字行。给它一点落地时间,
+    # 否则会把"图还没被观察到"误判成"没有图"。
+    images: list = []
+    for _attempt in range(6):
+        body = client.get("/v1/chat/history", params={"limit": 30}).json()
+        rows = body.get("messages") or []
+        images = [
+            m for m in rows
+            if str(m.get("content_type") or "") == "image"
+            and float(m.get("ts") or 0) >= since - 1.0
+        ]
+        if images:
+            break
+        time.sleep(2)
+    if DEBUG:
+        print(f"    [debug] rows={len(rows)} "
+              f"types={[(m.get('content_type'), str(m.get('ts'))[:14]) for m in rows][-6:]} "
+              f"since={since} images={len(images)}")
+        print(f"    [debug] reply={text[:120]!r}")
     return msg, text, images
 
 
