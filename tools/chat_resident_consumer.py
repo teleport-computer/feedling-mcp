@@ -171,6 +171,10 @@ from chat.reply_language import (
 )
 from core.downloadable_reply import sanitize_downloadable_reply
 from model_api_runtime.v2 import context as downloadable_file_context
+# 谎报检测**与 V2 共用同一份实现**,不在这里另抄一份正则。两条 lane 各写一份,
+# 正是当年字面 `user:` 标签只修了 V2、漏掉托管路径的根因(worker.py:9047 注释
+# 记录的那次事故)。谁改判定,两条 lane 一起变。
+from model_api_runtime.v2.tool_loop import _claims_image_delivered
 from model_api_runtime.v2 import document_render as downloadable_document_render
 from voice.message_filter import conversation_rows as _conversation_rows
 from voice import transcript_store as _voice_transcript_store
@@ -1462,14 +1466,6 @@ AGENT_RUNTIME_METADATA = _agent_runtime_metadata()
 def _agent_image_generation_enabled() -> bool:
     """Whether this exact resident entry exposes a callable image tool."""
     return _env_bool("FEEDLING_AGENT_IMAGE_GENERATION")
-
-
-def _should_use_agent_image_generation(exc: ImageGenerationFailure) -> bool:
-    """Fall through only when no dedicated route was selected."""
-    return bool(
-        exc.error_class == "image_generation_model_required"
-        and _agent_image_generation_enabled()
-    )
 
 
 def _agent_entry_signature() -> str:
@@ -8140,6 +8136,18 @@ def _outbound_file_retry_prompt(
     )
 
 
+def _image_claim_retry_prompt() -> str:
+    """谎报打回的指令。与 V2 (`tool_loop._IMAGE_CLAIM_RETRY_INSTRUCTION`) 同义:
+    给一次明确的纠正机会,二选一,**不替它决定选哪个**。"""
+    return (
+        "上一轮你说图已经生成/画好了,但这一轮没有任何图片真的被生成。"
+        "请二选一,不要再声称已生成:"
+        f"(1) 你确实想给出这张图 —— 运行 `python {_IO_CLI_PATH} generate-image "
+        "--prompt \"<完整的画面描述>\"`,再用 send-image 交付;"
+        "(2) 你并不打算画 —— 照实说,不要用文字假装图已经存在。"
+    )
+
+
 def _outbound_file_failure_reply(text: str) -> str:
     if re.search(r"[\u4e00-\u9fff]", str(text or "")):
         return "这次没能生成你要求的可下载文件，请稍后再试。"
@@ -14194,7 +14202,6 @@ def _process_messages(messages: list) -> float:
         # (含蓄请求判不出、它自己想画没入口);②拿用户原话当 prompt(画出来的
         # 东西不带它的理解);③成功后用系统写死的「图片已经生成。」当回复,
         # 连模型都没过——那是替它说话,比让它闭嘴更糟。
-        image_generation_failed: ImageGenerationFailure | None = None
         if outbound_file_turn_active:
             try:
                 _begin_outbound_file_turn(trace_id, outbound_file_requirement)
@@ -14222,11 +14229,6 @@ def _process_messages(messages: list) -> float:
                     ]
                 }
                 pending_failure_notice = vision_observer_failed
-            elif image_generation_failed:
-                _discard_io_cli_catalog_pending_injection()
-                failure_notice = classify_agent_error(image_generation_failed)
-                agent_result = {"messages": [failure_notice.user_text]}
-                pending_failure_notice = image_generation_failed
             elif use_runtime_v2:
                 agent_result = call_agent(
                     _resident_foreground_chat_message_v2(content),
@@ -14294,26 +14296,19 @@ def _process_messages(messages: list) -> float:
             # session id now (Codex review I10); see _commit_io_cli_catalog_
             # injection's docstring for why this must not wait on parse
             # success.
-            if (
-                not vision_observer_failed
-                and not image_generation_failed
-            ):
+            if not vision_observer_failed:
                 _commit_io_cli_catalog_injection()
             if voice_stream_update is not None:
                 voice_stream_update.complete()
             if (
                 not vision_observer_failed
-                and not image_generation_failed
                 and (parse_failure_class := _consume_reply_parse_failed())
             ):
                 pending_failure_notice = _reply_parse_failure_exc(
                     parse_failure_class
                 )
                 pending_failure_is_parse_only = True
-            elif (
-                not vision_observer_failed
-                and not image_generation_failed
-            ):
+            elif not vision_observer_failed:
                 _note_agent_turn_success()
 
         initial_agent_result = agent_result
@@ -14339,6 +14334,43 @@ def _process_messages(messages: list) -> float:
                 except Exception as exc:
                     log.error("outbound file completion retry failed: %s", exc)
                     pending_failure_notice = exc
+
+            # 谎报打回:它说图画好了,但这一轮一张图都没 stage。给**一次**明确的
+            # 纠正机会(真去画,或者照实说),之后不再纠缠 —— 再撒谎就照原样发出
+            # 并留痕,那是模型的问题,不是 runtime 该继续较劲的事。
+            # 必须在 `_finish_outbound_attachment_turn` **之前**判:staging 一旦
+            # 收摊,它就算被打回、真去调 send-image 也交付不出去。
+            # 之前这条只有提示词、没有运行时控制流 —— prod 主链路上模型谎报会
+            # 照常发布,V1/V2 的产品基线不一致(codex 审出)。
+            if pending_failure_notice is None and not _staged_outbound_image_snapshot(
+                trace_id
+            ):
+                claimed = _split_agent_turn(agent_result)
+                claimed_text = "\n\n".join(
+                    m for m in claimed.messages if isinstance(m, str)
+                )
+                if _claims_image_delivered(claimed_text):
+                    _emit_debug_trace(
+                        "agent",
+                        "image_claim_without_media_bounced",
+                        trace_id=trace_id,
+                        summary="reply claimed an image that was never staged",
+                    )
+                    try:
+                        retry_result = call_agent(
+                            _image_claim_retry_prompt(),
+                            trace_id=trace_id,
+                            lane="chat",
+                        )
+                        if (retry_failure_class := _consume_reply_parse_failed()):
+                            pending_failure_is_parse_only = True
+                            raise _reply_parse_failure_exc(retry_failure_class)
+                        agent_result = retry_result
+                    except Exception as exc:
+                        # 打回失败不能吃掉原来那一轮:宁可把它原话发出去(留痕),
+                        # 也不要让用户什么都收不到。
+                        log.error("image claim retry failed: %s", exc)
+                        agent_result = initial_agent_result
 
             staged_outbound_files, staged_outbound_images = (
                 _finish_outbound_attachment_turn(trace_id)
@@ -14758,6 +14790,19 @@ def _staged_outbound_file_snapshot(turn_id: str) -> list[StagedChatFile]:
         return list(_staged_outbound_files)
 
 
+def _staged_outbound_image_snapshot(turn_id: str) -> list[StagedChatImage]:
+    """本回合到目前为止已 stage 的图 —— **不关闭 staging**。
+
+    谎报打回必须在 staging 还开着的时候判:一旦
+    `_finish_outbound_attachment_turn` 收了摊,伴侣就算被打回、真去调
+    send-image 也交付不出去(no_active_chat_turn)。
+    """
+    with _outbound_file_lock:
+        if str(turn_id or "") != _active_outbound_file_turn_id:
+            return []
+        return list(_staged_outbound_images)
+
+
 def _finish_outbound_attachment_turn(
     turn_id: str,
 ) -> tuple[list[StagedChatFile], list[StagedChatImage]]:
@@ -14783,117 +14828,6 @@ def _finish_outbound_file_turn(turn_id: str) -> list[StagedChatFile]:
     """Backward-compatible file-only test/helper surface."""
     files, _images = _finish_outbound_attachment_turn(turn_id)
     return files
-
-
-def _generate_and_stage_dedicated_images(
-    turn_id: str,
-    prompt: str,
-    *,
-    raw_user_text: str,
-) -> int:
-    """Call the user's pinned image route and stage its bounded media."""
-    try:
-        response = _HTTP.post(
-            f"{FEEDLING_API_URL}/v1/image-generation/generate",
-            json={"prompt": str(prompt or "")[:8000]},
-            headers=_HEADERS,
-            timeout=180,
-        )
-    except Exception as exc:
-        raise ImageGenerationFailure(
-            "image_generation_unavailable",
-            detail=type(exc).__name__,
-            raw_user_text=raw_user_text,
-        ) from exc
-
-    try:
-        body = response.json()
-    except Exception:
-        body = {}
-    if response.status_code != 200:
-        error_class = str(
-            body.get("error_class") or body.get("error") or "image_generation_failed"
-        )
-        if not error_class.startswith("image_generation_"):
-            error_class = "image_generation_failed"
-        raise ImageGenerationFailure(
-            error_class,
-            status_code=response.status_code,
-            detail="dedicated_route",
-            raw_user_text=raw_user_text,
-            model=str(body.get("model") or ""),
-            provider=str(body.get("provider") or ""),
-        )
-
-    raw_images = body.get("images")
-    if not isinstance(raw_images, list) or not raw_images:
-        raise ImageGenerationFailure(
-            "image_generation_invalid_output",
-            status_code=response.status_code,
-            detail="images_missing",
-            raw_user_text=raw_user_text,
-            model=str(body.get("model") or ""),
-            provider=str(body.get("provider") or ""),
-        )
-
-    staged: list[StagedChatImage] = []
-    try:
-        for index, raw in enumerate(
-            raw_images[: generated_image.MAX_GENERATED_IMAGES_PER_REPLY],
-            start=1,
-        ):
-            if not isinstance(raw, dict):
-                raise ValueError("generated_image_invalid")
-            normalized = generated_image.normalize_generated_image(
-                generated_image.decode_base64_image(
-                    str(raw.get("data_base64") or "")
-                ),
-                declared_mime=str(raw.get("mime_type") or ""),
-                name=str(raw.get("name") or ""),
-                index=index,
-            )
-            staged.append(StagedChatImage(
-                source_path=f"generated:{turn_id}:{index}",
-                name=normalized.name,
-                mime_type=normalized.mime_type,
-                data=normalized.data,
-            ))
-    except ValueError as exc:
-        raise ImageGenerationFailure(
-            "image_generation_invalid_output",
-            status_code=response.status_code,
-            detail=str(exc)[:80],
-            raw_user_text=raw_user_text,
-            model=str(body.get("model") or ""),
-            provider=str(body.get("provider") or ""),
-        ) from exc
-
-    with _outbound_file_lock:
-        if str(turn_id or "") != _active_outbound_file_turn_id:
-            raise ImageGenerationFailure(
-                "image_generation_failed",
-                detail="chat_turn_finished",
-                raw_user_text=raw_user_text,
-            )
-        remaining = max(
-            0,
-            generated_image.MAX_GENERATED_IMAGES_PER_REPLY
-            - len(_staged_outbound_images),
-        )
-        _staged_outbound_images.extend(staged[:remaining])
-    if not staged:
-        raise ImageGenerationFailure(
-            "image_generation_invalid_output",
-            detail="images_empty",
-            raw_user_text=raw_user_text,
-        )
-    log.info(
-        "dedicated image generation staged count=%d provider=%s model=%s",
-        len(staged[:remaining]),
-        _sanitize_thinking_meta(body.get("provider"), max_len=80),
-        _sanitize_thinking_meta(body.get("model"), max_len=96),
-    )
-    return len(staged[:remaining])
 
 
 def _safe_outbound_file_name(raw: str) -> str:

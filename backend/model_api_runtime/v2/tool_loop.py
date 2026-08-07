@@ -87,39 +87,96 @@ def _search_result_urls(content: str) -> set[str]:
     return urls
 
 
-# 伴侣「声称已经画了图」的说法。只用来识别**谎报**(说了却没有 media),
-# 不用来判断用户想不想要图 —— 那个判断权归伴侣自己。
-# 宁可漏判也不要误判:漏判只是少了一句纠正,误判会把伴侣一句正常的话当成谎话。
-# 只认**完成态的断言**,并排除失败/条件/说明语气。误判的代价比漏判高得多:
-# 漏判只是少一次纠正,误判会把伴侣一句诚实的失败说明("图片生成失败了")当成
-# 谎话打回去,等于逼它把真话改成假话。
-# codex 审出的三个反例都必须放行:「图片生成失败了」「图像生成需要配置模型」
-# 「Here is the image generation guide」。
-_IMAGE_CLAIM_NEGATION_RE = re.compile(
-    r"(失败|没有?(成功|生成|画)|不能|无法|需要配置|未能|出错|报错"
-    r"|fail|error|could ?n['’]?t|cannot|can['’]?t|unable|not (be )?(able|support))",
+# 判断按**小句**做,不按整段。整段判断有三个治不好的毛病(codex 两轮审出):
+#   1. 一句里的「失败」会赦免另一句里的谎报(「图生成失败了。不过图已经画好了」);
+#   2. 表达不了「完成的不是图,是提示词/思路」——「已经为你做好了图片生成提示词」;
+#   3. 表达不了引用与假设——「如果我说『图片已经生成』,那是在骗你」。
+# 小句级判断天然解决:每个小句自己带着自己的否定、引用、宾语。
+# ⚠️ 切分必须**保留结尾标点**。第一版用 [。！？!?] 当分隔符,切完小句里根本没有
+# 问号 —— 于是任何"疑问句检测"都不可能生效,「图片已经生成了吗?」被判成谎报。
+# codex 第三轮审出;根因是切分,不是词表不够。
+_CLAUSE_RE = re.compile(r"[^。！？!?;；\n,，]+[。！？!?;；\n,，]?")
+
+# 引号里的内容是**被谈论的话**,不是此刻的断言:
+#   「你想让我说"图片已经生成"吗?」「"图片已经生成"只是一个示例。」
+_QUOTED_RE = re.compile(r"[「『\"'“”‘’]([^「』\"'“”‘’]{0,60})[」』\"'“”‘’]")
+_META_RE = re.compile(
+    r"(示例|例子|举例|比如|原话|引用|假装|placeholder|example|for instance)",
     re.IGNORECASE,
 )
+# 疑问不是断言。中文靠句末语气词或问号,英文靠助动词/疑问词开头。
+_QUESTION_RE = re.compile(
+    r"[?？]|(吗|呢|么)\s*[。.]?\s*$"
+    r"|^\s*(are|is|do|does|did|would|will|can|could|shall|should|have|has"
+    r"|why|what|how)\b",
+    re.IGNORECASE,
+)
+
+# 这个小句在谈**别的产物**,不是图本身。命中即整句放行。
+_NOT_AN_IMAGE_RE = re.compile(
+    r"(提示词|prompt|思路|构思|方案|描述|计划|草案|框架|步骤|流程"
+    r"|教程|指南|guide|说明|文档|功能|设置|选项|配置|模型|服务|接口"
+    r"|description|plan|idea|outline|draft|tutorial|instruction)",
+    re.IGNORECASE,
+)
+# 否定 / 未完成 / 假设 —— 这些小句不是在断言「图已经在这儿」。
+_NOT_A_CLAIM_RE = re.compile(
+    r"(失败|没有|没能|未能|不能|无法|出错|报错|需要|如果|要是|假如|假设"
+    r"|并没|尚未|还没|不是|别|骗|谎"
+    r"|fail|error|cannot|can['’]?t|could ?n['’]?t|unable|do(es)?\s+not"
+    r"|don['’]?t|did ?n['’]?t|have ?n['’]?t|has ?n['’]?t|not\s+yet|yet\b"
+    r"|if\s+i|suppose|would|unsupported|not\s+(be\s+)?(able|support))",
+    re.IGNORECASE,
+)
+_IMAGE_NOUN = r"(?:自画像|画像|插画|图片|图像|图)"
 _IMAGE_CLAIM_RE = re.compile(
     r"("
-    r"(图片?|图像|插画|画像)\s*(已经|已)\s*(生成|画好|做好|完成)"
-    r"|(已经|已)\s*(为你|给你)?\s*(生成|画|做)(好|完)了"
-    r"|图\s*(已经|已)\s*(发|给)"
-    # 「the image」后面若接 generation/guide/model 之类,说的是功能不是成品。
-    r"|here\s+(is|are)\s+(the|your)\s+(images?|pictures?|illustrations?|artworks?)"
-    r"(?!\s+(generation|generator|guide|model|feature|setting|config|option))\b"
-    r"|i\s*['’]?\s*(ve|have)\s+(just\s+)?(created|generated|drawn|made)\s+"
-    r"(the|an?|your)\s+(images?|pictures?|illustrations?)"
+    # 图 + (已经) + 完成动词:「图片已经生成」「图片生成好了」
+    rf"{_IMAGE_NOUN}\s*(?:也|都)?\s*(?:已经|已)\s*(?:生成|画|做|完成|发|给)"
+    rf"|{_IMAGE_NOUN}\s*(?:生成好|生成完|画好|画完|做好|做完|完成)了"
+    # (已经)(为你) + 完成动词 + 了 + 图:「已经为你生成了一张图片」
+    rf"|(?:已经|已)\s*(?:为你|给你)?\s*(?:生成|画|做)(?:好|完)?了\s*"
+    rf"(?:一|这|那)?\s*[张幅副]?\s*{_IMAGE_NOUN}"
+    # 无宾语完成态「已经为你画好了」,**只在小句末尾**命中。不在末尾就说明后面
+    # 跟着别的宾语(「已经为你做好了准备」)——那类宾语是开集,靠词表挡不住,
+    # 只有位置挡得住。
+    r"|(?:已经|已)\s*(?:为你|给你)?\s*(?:生成|画|做)(?:好|完)了\s*[。.]?\s*$"
+    # 英文。连字符要一起挡("image-generation guide"),所以边界用 (?![\w-])。
+    r"|here\s*(?:['’]?s|\s+is|\s+are)\s+(?:the|your|a|an)?\s*"
+    r"(?:images?|pictures?|illustrations?|artworks?|drawings?)(?![\w-])"
+    r"|i\s*['’]?\s*(?:ve|have)\s+(?:just\s+)?(?:created|generated|drawn|made)\s+"
+    r"(?:the|an?|your)?\s*(?:images?|pictures?|illustrations?|drawings?)(?![\w-])"
     r")",
     re.IGNORECASE,
 )
 
 
 def _claims_image_delivered(text: str) -> bool:
-    text = str(text or "")
-    if _IMAGE_CLAIM_NEGATION_RE.search(text):
-        return False
-    return bool(_IMAGE_CLAIM_RE.search(text))
+    """这段话是不是在断言「图已经存在」?
+
+    只用来识别**谎报**(说了却没有 media),不用来判断用户想不想要图 ——
+    那个判断权归伴侣自己。
+
+    宁可漏判也不要误判:漏判只是少一次纠正;误判会把伴侣一句诚实的失败说明
+    ("图片生成失败了")当成谎话打回去,**等于逼它把真话改成假话**。
+
+    按**小句**判,不按整段 —— 整段判断有三个治不好的毛病:
+      1. 一句里的「失败」会赦免另一句里的谎报;
+      2. 表达不了「完成的不是图,是提示词/思路」;
+      3. 表达不了引用与假设。
+    """
+    for raw_clause in _CLAUSE_RE.findall(str(text or "")):
+        clause = raw_clause.strip()
+        if not clause:
+            continue
+        if _QUESTION_RE.search(clause) or _META_RE.search(clause):
+            continue
+        if _NOT_A_CLAIM_RE.search(clause) or _NOT_AN_IMAGE_RE.search(clause):
+            continue
+        # 引号内容剥掉再判:引号里的是被谈论的话,不是此刻的断言。
+        if _IMAGE_CLAIM_RE.search(_QUOTED_RE.sub(" ", clause)):
+            return True
+    return False
 
 
 def _positive_limit(value, *, name: str) -> int:
@@ -1326,6 +1383,7 @@ async def run_tool_loop(
                 tc, "tool_call_result", {"result": file_result}
             )
 
+        image_final_superseded = False
         for tc in image_reply_calls:
             await _tool_event(tc, "tool_call_started", {})
             await _trajectory(
@@ -1365,7 +1423,28 @@ async def run_tool_loop(
                 )
                 continue
             # 发布阶段:图已经存在,异常走既有的发布语义(不能当成生图失败)。
-            await on_reply(pr.text or "", final=True, media=media)
+            # FinalReplySuperseded 必须和**文本终局同款**处理(见 :1118):用户在
+            # 我们生图期间又说话了,这一轮的回复已经不该发。若放它冒泡,worker 会
+            # 当成一次通用失败 —— mark_failed + 给用户一个报错气泡,而文本终局
+            # 在同样情形下是安静地折进下一轮。生图耗时长,撞上 late input 的概率
+            # 比文本高得多,这条差异会被真实用户高频撞到。codex 审出。
+            try:
+                await on_reply(pr.text or "", final=True, media=media)
+            except FinalReplySuperseded:
+                reasoning_fragments.clear()
+                seen_reasoning_fragments.clear()
+                _progress("final_reply_superseded")
+                await _trajectory(
+                    "final_reply_superseded",
+                    {"round": attempts, "had_media": True},
+                )
+                if attempts < max_calls:
+                    # 注意:这里在 `for tc in image_reply_calls` 里,单纯 break 会
+                    # 掉进下面的 tool dispatch 继续跑这一轮。要的是**外层重来**,
+                    # 所以置标志位,退出图片循环后立刻 continue 外层。
+                    image_final_superseded = True
+                    break
+                return LoopOutcome("", attempts, "input_advanced", replied_intermediate)
             image_result = ToolResult(
                 call_id=tc.id,
                 content="ok: image delivered",
@@ -1380,6 +1459,10 @@ async def run_tool_loop(
                 replied_intermediate,
                 delivered_media_count=len(media),
             )
+
+        if image_final_superseded:
+            # 用户在生图期间又说话了:这一轮作废,回外层用新的对话重答。
+            continue
 
         if other_calls:
             await _trajectory(

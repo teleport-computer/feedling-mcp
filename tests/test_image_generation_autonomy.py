@@ -8,8 +8,15 @@
 现在:工具交给它,何时调、prompt 怎么写都由它决定;它的话照常发;失败如实交回。
 """
 import inspect
+import sys
+from pathlib import Path
 
-from model_api_runtime.v2 import context, tool_loop
+# 自带路径引导。少了这两行,这个文件在没设 PYTHONPATH 的 pytest 调用下直接
+# ModuleNotFoundError —— 而它一旦被登记进 conftest 的 _PURE_UNIT(无 PG 也收集),
+# 就从"静默忽略"变成"collection error",**补救比原状更糟**。codex 审出。
+sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
+
+from model_api_runtime.v2 import context, tool_loop  # noqa: E402
 
 
 def test_no_regex_gate_decides_whether_the_user_wants_an_image():
@@ -64,6 +71,12 @@ def test_claim_detector_is_conservative():
         "图片生成失败了,请稍后再试",
         "图像生成需要配置模型",
         "Here is the image generation guide",
+        # codex 第三轮实测反例:疑问、裸引用、示例。
+        "你想让我说“图片已经生成”吗?",
+        "图片已经生成了吗?",
+        "“图片已经生成”只是一个示例。",
+        "Heres the image?",
+        "已经为你做好了准备",
     ]
     for text in claims:
         assert tool_loop._claims_image_delivered(text), f"漏判谎报: {text}"

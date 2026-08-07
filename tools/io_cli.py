@@ -555,6 +555,12 @@ def cmd_cancel_wake(args):
     _emit({"ok": False, "http_status": status, "error": body}, 1)
 
 
+_IMAGE_FAILURE_HINT = (
+    "图没有生成。请如实告诉用户,或换一个更清楚的画面描述再调一次;"
+    "不要声称图已经生成。"
+)
+
+
 def cmd_generate_image(args):
     """用用户配置的专用生图模型画一张图,存到出站目录。POST /v1/image-generation/generate。
 
@@ -571,28 +577,39 @@ def cmd_generate_image(args):
     if status != 200:
         # 失败如实交回:伴侣据此自己跟用户解释,或换个描述再试。
         _emit({"ok": False, "http_status": status, "error": body,
-               "hint": "图没有生成。请如实告诉用户,或换一个更清楚的画面描述再试;"
-                       "不要声称图已经生成。"}, 1)
-    media = (body or {}).get("media") or []
-    if not media:
-        _emit({"ok": False, "error": "image route returned no media"}, 1)
+               "hint": _IMAGE_FAILURE_HINT}, 1)
+    # 后端契约(hosted/image_generator.py:162)是 images[].data_base64/mime_type/name。
+    # 早先这里照 media[].data_b64/mime 写 —— 字段全不对,任何一次真实调用都会
+    # 停在 "returned no media",伴侣会以为是模型不会画。codex 审出。
+    images = (body or {}).get("images") or []
+    if not images:
+        _emit({"ok": False, "error": "image route returned no images",
+               "hint": _IMAGE_FAILURE_HINT}, 1)
+    # 必须落在 $FEEDLING_HOME/outbound-files:send-image 经 IPC 只接受这个目录
+    # (consumer 的 path_outside_outbound_dir 闸)。写 /tmp 的话生成永远交付不出去,
+    # 而且 hosted 多用户共享 /tmp 还会串图。
+    outbound = Path(_resident_ipc_home()) / "outbound-files"
+    try:
+        outbound.mkdir(parents=True, exist_ok=True)
+    except Exception as exc:  # noqa: BLE001
+        _emit({"ok": False, "error": f"could not prepare outbound dir: {str(exc)[:120]}"}, 1)
     saved = []
-    outbound = _env("FEEDLING_OUTBOUND_FILE_DIR") or "/tmp"
-    for idx, item in enumerate(media):
-        b64 = str((item or {}).get("data_b64") or "")
+    for idx, item in enumerate(images, start=1):
+        b64 = str((item or {}).get("data_base64") or "")
         if not b64:
             continue
-        mime = str((item or {}).get("mime") or "image/png")
+        mime = str((item or {}).get("mime_type") or "image/png")
         ext = {"image/png": "png", "image/jpeg": "jpg", "image/webp": "webp"}.get(mime, "png")
-        path = os.path.join(outbound, f"generated_{int(time.time())}_{idx}.{ext}")
+        # 唯一文件名:秒级时间戳在连续两次生图/多用户共享目录下会互相覆盖。
+        path = outbound / f"generated_{uuid.uuid4().hex[:12]}_{idx}.{ext}"
         try:
-            with open(path, "wb") as fh:
-                fh.write(base64.b64decode(b64))
+            path.write_bytes(base64.b64decode(b64))
         except Exception as exc:  # noqa: BLE001
             _emit({"ok": False, "error": f"could not save image: {str(exc)[:120]}"}, 1)
-        saved.append(path)
+        saved.append(str(path))
     if not saved:
-        _emit({"ok": False, "error": "image route returned no usable bytes"}, 1)
+        _emit({"ok": False, "error": "image route returned no usable bytes",
+               "hint": _IMAGE_FAILURE_HINT}, 1)
     _emit({"ok": True, "paths": saved,
            "next": "call send-image --path <path> to deliver it"})
 

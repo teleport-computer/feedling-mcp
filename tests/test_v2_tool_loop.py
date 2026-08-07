@@ -1643,3 +1643,48 @@ def test_unbacked_image_claim_is_bounced_once_then_let_through(monkeypatch):
     assert published and published[-1][0] == "图片已经生成", (
         "第二次仍撒谎就照原样发出 —— 那是模型的问题,不是 runtime 继续纠缠的理由"
     )
+
+
+def test_superseded_image_final_folds_like_a_text_final_not_a_turn_failure(monkeypatch):
+    """用户在生图期间又说话了 —— 这一轮要安静地折进下一轮,不是报错。
+
+    文本终局撞上 late input 时走 fold/retry(tool_loop:1118);图片终局起初让
+    FinalReplySuperseded 直接冒泡,worker 会当成通用失败 —— mark_failed + 给用户
+    一个报错气泡。**生图耗时长,撞上 late input 的概率比文本高得多**,这条差异
+    会被真实用户高频撞到。codex 审出。
+    """
+    provider = _ScriptedProvider([
+        {"reply": "给你画了一张", "tool_calls": [
+            {"id": "c1", "name": "generate_image", "args": {"prompt": "a cat"}}],
+         "usage": {}},
+        {"reply": "刚说到哪儿了?", "tool_calls": [], "usage": {}},
+    ])
+    monkeypatch.setattr(provider_client, "chat_completion_async", provider)
+    published = []
+    dispatched = _RecordingDispatch()
+
+    async def on_image_reply(args):
+        return (ProviderMedia("image/png", "aW1hZ2U=", "result.png"),)
+
+    async def on_reply(text, *, final, reasoning="", media=()):
+        if media and not published:
+            # 第一次带图的终局被抢占(用户已经说了新话)
+            raise tool_loop.FinalReplySuperseded()
+        published.append((text, final, tuple(media)))
+
+    outcome = asyncio.run(
+        tool_loop.run_tool_loop(
+            provider_config=_TEST_PROVIDER_CONFIG,
+            build_messages=_RecordingBuildMessages(),
+            dispatch_tools=dispatched,
+            on_reply=on_reply,
+            fold_new_messages=_RecordingFold([]),
+            add_usage=_noop_add_usage,
+            on_image_reply=on_image_reply,
+            max_calls=3,
+        )
+    )
+
+    # 被抢占的那轮**没有**变成异常,而是回到外层重答了新的对话
+    assert published == [("刚说到哪儿了?", True, ())]
+    assert outcome.stop_reason != "final_media"
