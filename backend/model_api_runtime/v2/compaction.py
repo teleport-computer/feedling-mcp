@@ -16,6 +16,8 @@ from __future__ import annotations
 import re
 from typing import Any, Awaitable, Callable
 
+from voice.message_filter import conversation_rows
+
 # Provider output limits are not a storage or trust boundary: a buggy adapter,
 # test double, or non-conforming endpoint can return more than ``max_tokens``.
 # Keep every incremental append small enough to inspect and prompt safely.  A
@@ -171,14 +173,14 @@ def _report_reject(reject_out: Callable[[str], None] | None, code: str) -> None:
 
 
 def _render_message_lines(old_messages: list[dict[str, Any]]) -> list[str]:
-    """One ``role: content`` line per source row — the single rendering of record.
+    """One ``role: content`` line per conversational row.
 
-    ``worker._compaction_message_chars`` sizes batches against this exact shape,
-    and :func:`_verbatim_fold` reuses it so a deterministic leaf and a model
-    summary are built from byte-identical source text.
+    UI-only transcript cards and rejected voice transport artifacts remain in
+    the caller's exact source batch for watermark/count coverage, but none of
+    their preview/reply text is disclosed or frozen into future summaries.
     """
     lines = []
-    for m in old_messages:
+    for m in conversation_rows(old_messages):
         role = str(m.get("role") or "")
         content = str(m.get("content") or "")
         lines.append(f"{role}: {content}")
@@ -214,11 +216,12 @@ def _verbatim_fold(
     """
     if not old_messages:
         return None
-    if not any(str(m.get("content") or "").strip() for m in old_messages):
+    visible_messages = conversation_rows(old_messages)
+    if not any(str(m.get("content") or "").strip() for m in visible_messages):
         # Contentless rows keep their existing outcome so the caller's
         # quarantine path — not this shortcut — decides what happens to them.
         return None
-    lines = _render_message_lines(old_messages)
+    lines = _render_message_lines(visible_messages)
     if sum(len(line) + 1 for line in lines) > max_chars:
         return None
 
@@ -305,11 +308,19 @@ async def compact(
     这里绝不部分接纳畸形输出：调用方以“返回值是否变化”决定是否推进 watermark，
     因此任何验证失败都必须保留原摘要，确保未被可靠摘要的消息仍留在待折叠区间。
     """
+    visible_messages = conversation_rows(old_messages)
+    if old_messages and not visible_messages:
+        new_bullets = deterministic_fold(source_message_count=len(old_messages))
+        if not current_summary.strip():
+            return new_bullets
+        separator = "" if current_summary.endswith("\n") else "\n"
+        return current_summary + separator + new_bullets
+
     user_content = (
         "现有摘要（勿重复）：\n"
         f"{current_summary}\n\n"
         "需要归纳的更早对话：\n"
-        f"{_render_old_messages(old_messages)}"
+        f"{_render_old_messages(visible_messages)}"
     )
     messages = [
         {"role": "system", "content": _SYSTEM_PROMPT},
@@ -358,7 +369,13 @@ async def compact_segment(
     is accurate rather than a missing measurement.
     """
 
-    verbatim = _verbatim_fold(old_messages, max_chars=verbatim_max_chars)
+    visible_messages = conversation_rows(old_messages)
+    if old_messages and not visible_messages:
+        return deterministic_fold(source_message_count=len(old_messages))
+
+    verbatim = _verbatim_fold(
+        visible_messages, max_chars=verbatim_max_chars
+    )
     if verbatim is not None:
         return verbatim
 
@@ -366,7 +383,10 @@ async def compact_segment(
         {"role": "system", "content": _SEGMENT_SYSTEM_PROMPT},
         {
             "role": "user",
-            "content": "需要归纳的连续旧消息：\n" + _render_old_messages(old_messages),
+            "content": (
+                "需要归纳的连续旧消息：\n"
+                + _render_old_messages(visible_messages)
+            ),
         },
     ]
     try:

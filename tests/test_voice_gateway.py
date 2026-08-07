@@ -23,6 +23,7 @@ from enclave.routes import chat as enclave_chat
 from hosted import chat_send_core
 from voice import results
 from voice import routes_asgi
+from voice.message_filter import is_meaningful_voice_message
 
 
 def test_internal_voice_delta_requires_voice_reply_scope():
@@ -132,12 +133,12 @@ def test_gateway_extracts_only_latest_user_turn():
     ["...", "……", "（背景杂音）", "[silence]", "【background noise】"],
 )
 def test_gateway_ignores_non_speech_voice_transcripts(message):
-    assert routes_asgi._is_meaningful_voice_message(message) is False
+    assert is_meaningful_voice_message(message) is False
 
 
 @pytest.mark.parametrize("message", ["嗯。", "把音量调大一点", "测试 123"])
 def test_gateway_keeps_short_meaningful_voice_transcripts(message):
-    assert routes_asgi._is_meaningful_voice_message(message) is True
+    assert is_meaningful_voice_message(message) is True
 
 
 def test_asr_revision_keeps_the_same_logical_voice_turn():
