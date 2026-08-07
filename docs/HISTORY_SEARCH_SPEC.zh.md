@@ -86,7 +86,9 @@ history_fetch(message_id: string, before?: int, after?: int)
 首调用固定快照并编入 cursor：`snapshot_through_seq`（当时 chat_max_seq）、
 `summary_watermark_seq`、runtime generation、归一化 query/start/end、
 当前扫描 phase + phase 内 resume 位置、cursor 版本 + 过期时间。
-cursor 由 enclave HMAC 认证（防模型/中间层篡改）；**用户身份永远来自认证
+cursor 由 CVM 信任域内的部署级 secret 做 HMAC 认证（实现：worker 侧签名/校验，
+key = HMAC(FEEDLING_RUNTIME_TOKEN_SECRET, 独立 domain 标签)；worker 与 enclave
+同域同 secret，威胁对象是模型/中间层篡改，不变）；**用户身份永远来自认证
 上下文，不来自 cursor**；user 不匹配即拒。
 
 扫描顺序按请求形态分流（不是固定串行）：

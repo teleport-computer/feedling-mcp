@@ -10796,3 +10796,90 @@ def chat_history_candidate_rows(
                 }
                 for row in cur.fetchall()
             ]
+
+
+def _history_full_row(seq, msg_id, ts, doc) -> dict:
+    """doc 与权威关系列合并（同 db.chat_messages_after_seq 的契约）：
+    ``msg_id``/``ts``/``seq`` 覆盖 doc 里可能过期的副本。"""
+    return {**dict(doc or {}), "id": str(msg_id), "ts": float(ts), "seq": int(seq)}
+
+
+def chat_history_rows_by_seqs(user_id, seqs) -> list[dict]:
+    """给定 seq 集合的**完整密文行**（含 body_ct/K_enclave/caption_*），seq 降序。
+
+    候选选择走 chat_history_candidate_rows（元数据）在前，这里只按 seq 精确
+    取回密文供 enclave 批量解密；可见性谓词再套一遍属防御（两次查询之间行
+    不可变，谓词幂等）。附件行 body 密文的剥离（caption-only 契约，spec §7）
+    由 readside 协调层在投影时做——本函数保持"取回原行"的单一职责。
+    """
+    wanted = sorted({int(s) for s in seqs}, reverse=True)
+    if not wanted:
+        return []
+    if wanted[-1] < 0:
+        raise ValueError("history row seqs must be >= 0")
+    with _pool().connection() as conn:
+        rows = conn.execute(
+            "SELECT seq,msg_id,ts,doc FROM chat_messages "
+            "WHERE user_id=%s AND seq=ANY(%s) "
+            f"AND {_HISTORY_VISIBLE_PREDICATE} "
+            "ORDER BY seq DESC",
+            (str(user_id), wanted),
+        ).fetchall()
+    return [_history_full_row(r[0], r[1], r[2], r[3]) for r in rows]
+
+
+def chat_history_anchor_row(user_id, message_id) -> dict | None:
+    """history_fetch 的锚点行（完整密文行）。
+
+    不存在与不可见（角色/合成流量排除）统一返回 None——调用方按
+    ``not_found_or_not_visible`` 报，不区分（spec §3.2：不靠 message_id
+    难猜当权限控制）。
+    """
+    with _pool().connection() as conn:
+        row = conn.execute(
+            "SELECT seq,msg_id,ts,doc FROM chat_messages "
+            "WHERE user_id=%s AND msg_id=%s "
+            f"AND {_HISTORY_VISIBLE_PREDICATE} "
+            "LIMIT 1",
+            (str(user_id), str(message_id)),
+        ).fetchone()
+    if row is None:
+        return None
+    return _history_full_row(row[0], row[1], row[2], row[3])
+
+
+def chat_history_neighbor_rows(
+    user_id, anchor_seq: int, *, before: int, after: int
+) -> tuple[list[dict], list[dict]]:
+    """锚点邻居（该用户 seq 序取，客户端时间戳不可靠——spec §3.2）。
+
+    返回 ``(before_rows, after_rows)``，两侧都按**旧→新**排列（返回结构的
+    展示序）；可见性谓词与候选查询完全同一套。
+    """
+    anchor = int(anchor_seq)
+    if anchor < 0:
+        raise ValueError("anchor_seq must be >= 0")
+    n_before = max(0, int(before))
+    n_after = max(0, int(after))
+    older: list[dict] = []
+    newer: list[dict] = []
+    with _pool().connection() as conn:
+        if n_before:
+            rows = conn.execute(
+                "SELECT seq,msg_id,ts,doc FROM chat_messages "
+                "WHERE user_id=%s AND seq<%s "
+                f"AND {_HISTORY_VISIBLE_PREDICATE} "
+                "ORDER BY seq DESC LIMIT %s",
+                (str(user_id), anchor, n_before),
+            ).fetchall()
+            older = [_history_full_row(r[0], r[1], r[2], r[3]) for r in reversed(rows)]
+        if n_after:
+            rows = conn.execute(
+                "SELECT seq,msg_id,ts,doc FROM chat_messages "
+                "WHERE user_id=%s AND seq>%s "
+                f"AND {_HISTORY_VISIBLE_PREDICATE} "
+                "ORDER BY seq ASC LIMIT %s",
+                (str(user_id), anchor, n_after),
+            ).fetchall()
+            newer = [_history_full_row(r[0], r[1], r[2], r[3]) for r in rows]
+    return older, newer
