@@ -8147,6 +8147,13 @@ def _outbound_file_failure_reply(text: str) -> str:
 
 
 def _image_ready_reply(text: str) -> str:
+    """图已经发出去、但伴侣一个字都没说时的兜底。
+
+    ⚠️ 只在**它确实没说话**时用(有些 CLI driver 调完工具就不再出文本),绝不能
+    拿它去顶替伴侣真说了的话 —— 那是替它说话,比让它闭嘴更糟。
+    2026-08-08 之前专用生图那条路正是这么干的:runtime 抢先画完图,然后用这句
+    写死的话当回复,模型全程没参与。
+    """
     if re.search(r"[\u4e00-\u9fff]", str(text or "")):
         return "图片已经生成。"
     return "The image is ready."
@@ -14181,50 +14188,19 @@ def _process_messages(messages: list) -> float:
         )
         staged_outbound_files: list[StagedChatFile] = []
         staged_outbound_images: list[StagedChatImage] = []
-        image_generation_prompt = (
-            downloadable_file_context.required_image_generation_prompt([
-                {"role": "user", "content": raw_user_content_for_lang}
-            ])
-            if outbound_file_turn_active
-            else None
-        )
+        # 专用生图不再由 runtime 抢先跑一发。伴侣自己用 generate-image 调用户
+        # 配置的生图模型(prompt 它自己写),再用 send-image 交付 —— 与它原生产出
+        # 的图走同一条路。删掉的那段会:①用正则替它判断"用户是不是在要图"
+        # (含蓄请求判不出、它自己想画没入口);②拿用户原话当 prompt(画出来的
+        # 东西不带它的理解);③成功后用系统写死的「图片已经生成。」当回复,
+        # 连模型都没过——那是替它说话,比让它闭嘴更糟。
         image_generation_failed: ImageGenerationFailure | None = None
-        dedicated_image_generation_succeeded = False
         if outbound_file_turn_active:
             try:
                 _begin_outbound_file_turn(trace_id, outbound_file_requirement)
             except OSError as exc:
                 outbound_file_turn_active = False
                 log.error("cannot prepare outbound file directory: %s", exc)
-        if outbound_file_turn_active and image_generation_prompt:
-            try:
-                _generate_and_stage_dedicated_images(
-                    trace_id,
-                    image_generation_prompt,
-                    raw_user_text=raw_user_content_for_lang,
-                )
-                dedicated_image_generation_succeeded = True
-            except ImageGenerationFailure as exc:
-                if _should_use_agent_image_generation(exc):
-                    content += (
-                        "\n\n[IO runtime fact — not user-authored: no dedicated "
-                        "image route is selected, but this resident declares a "
-                        "native image-generation capability. Use that capability "
-                        "now, then deliver its PNG, JPEG, or WebP with the "
-                        "send-image command described above. Do not claim image "
-                        "generation is unsupported without attempting it.]"
-                    )
-                    log.info(
-                        "dedicated image route absent; falling through to resident "
-                        "native image generation"
-                    )
-                else:
-                    image_generation_failed = exc
-                    log.info(
-                        "dedicated image generation unavailable class=%s status=%s",
-                        exc.error_class,
-                        exc.status_code,
-                    )
         # 本回合失败时待发的 system 通知。不在失败当场发，而是等下面的回复写入被
         # 服务端接受（posted_any）后再发（Codex review）：claim 过期 failover 时另
         # 一个 consumer 已回复，本家的兜底会被 already_answered 409 拒——通知若先
@@ -14251,13 +14227,6 @@ def _process_messages(messages: list) -> float:
                 failure_notice = classify_agent_error(image_generation_failed)
                 agent_result = {"messages": [failure_notice.user_text]}
                 pending_failure_notice = image_generation_failed
-            elif dedicated_image_generation_succeeded:
-                # The dedicated route already has the result; keep the atomic
-                # reply path without waiting for another resident-model turn.
-                _discard_io_cli_catalog_pending_injection()
-                agent_result = {
-                    "messages": [_image_ready_reply(raw_user_content_for_lang)]
-                }
             elif use_runtime_v2:
                 agent_result = call_agent(
                     _resident_foreground_chat_message_v2(content),
@@ -14328,7 +14297,6 @@ def _process_messages(messages: list) -> float:
             if (
                 not vision_observer_failed
                 and not image_generation_failed
-                and not dedicated_image_generation_succeeded
             ):
                 _commit_io_cli_catalog_injection()
             if voice_stream_update is not None:
@@ -14336,7 +14304,6 @@ def _process_messages(messages: list) -> float:
             if (
                 not vision_observer_failed
                 and not image_generation_failed
-                and not dedicated_image_generation_succeeded
                 and (parse_failure_class := _consume_reply_parse_failed())
             ):
                 pending_failure_notice = _reply_parse_failure_exc(
@@ -14346,7 +14313,6 @@ def _process_messages(messages: list) -> float:
             elif (
                 not vision_observer_failed
                 and not image_generation_failed
-                and not dedicated_image_generation_succeeded
             ):
                 _note_agent_turn_success()
 

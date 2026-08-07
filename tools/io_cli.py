@@ -555,6 +555,48 @@ def cmd_cancel_wake(args):
     _emit({"ok": False, "http_status": status, "error": body}, 1)
 
 
+def cmd_generate_image(args):
+    """用用户配置的专用生图模型画一张图,存到出站目录。POST /v1/image-generation/generate。
+
+    伴侣自己决定什么时候画、prompt 怎么写 —— 这个动词只是把能力交到它手上。
+    成功后仍要用 send-image 交付,和它自己产出的图走同一条投递路径。
+    """
+    api_url, auth = _require_backend()
+    prompt = str(args.prompt or "").strip()
+    if not prompt:
+        _emit({"ok": False, "error": "generate-image needs a non-empty --prompt"}, 2)
+    status, body = _http_json(
+        "POST", f"{api_url}/v1/image-generation/generate", auth,
+        payload={"prompt": prompt[:8000]}, timeout=180)
+    if status != 200:
+        # 失败如实交回:伴侣据此自己跟用户解释,或换个描述再试。
+        _emit({"ok": False, "http_status": status, "error": body,
+               "hint": "图没有生成。请如实告诉用户,或换一个更清楚的画面描述再试;"
+                       "不要声称图已经生成。"}, 1)
+    media = (body or {}).get("media") or []
+    if not media:
+        _emit({"ok": False, "error": "image route returned no media"}, 1)
+    saved = []
+    outbound = _env("FEEDLING_OUTBOUND_FILE_DIR") or "/tmp"
+    for idx, item in enumerate(media):
+        b64 = str((item or {}).get("data_b64") or "")
+        if not b64:
+            continue
+        mime = str((item or {}).get("mime") or "image/png")
+        ext = {"image/png": "png", "image/jpeg": "jpg", "image/webp": "webp"}.get(mime, "png")
+        path = os.path.join(outbound, f"generated_{int(time.time())}_{idx}.{ext}")
+        try:
+            with open(path, "wb") as fh:
+                fh.write(base64.b64decode(b64))
+        except Exception as exc:  # noqa: BLE001
+            _emit({"ok": False, "error": f"could not save image: {str(exc)[:120]}"}, 1)
+        saved.append(path)
+    if not saved:
+        _emit({"ok": False, "error": "image route returned no usable bytes"}, 1)
+    _emit({"ok": True, "paths": saved,
+           "next": "call send-image --path <path> to deliver it"})
+
+
 def cmd_voice_transcript_list(args):
     """Archived voice calls, newest first (metadata only). GET /v1/voice/transcripts."""
     api_url, auth = _require_backend()
@@ -1858,6 +1900,11 @@ def main():
     mf.add_argument("--include-archived", dest="include_archived", action="store_true", help="include archived cards in results")
     mf.add_argument("--include-superseded", dest="include_superseded", action="store_true", help="include superseded/corrected versions")
     mf.set_defaults(func=cmd_memory_fetch)
+
+    gi = sub.add_parser("generate-image",
+                        help="Draw an image with the user's dedicated image model.")
+    gi.add_argument("--prompt", required=True, help="complete visual description")
+    gi.set_defaults(func=cmd_generate_image)
 
     vtl = sub.add_parser("voice-transcript-list",
                          help="Archived voice calls, newest first (metadata only).")
