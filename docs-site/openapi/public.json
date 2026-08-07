@@ -7977,6 +7977,49 @@
         "x-feedling-contract-level": "documented"
       }
     },
+    "/v1/voice/cancel": {
+      "post": {
+        "summary": "Cancel Voice Call",
+        "description": "Idempotently end a voice call that will not be archived. The durable tombstone suppresses late resident and Hosted Runtime V2 replies before chat insertion, removes unarchived per-turn rows and encrypted voice handoff state, and makes repeated cancellation safe. If finalize already claimed the call, cancellation returns that lifecycle state without deleting rows or downgrading the archive.",
+        "operationId": "cancel_voice_call_v1_voice_cancel_post",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GenericJsonResponse"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Error response.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "Other"
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/VoiceCallCancelRequest"
+              }
+            }
+          }
+        },
+        "x-feedling-contract-level": "documented"
+      }
+    },
     "/v1/voice/chat/completions": {
       "post": {
         "summary": "Voice Chat Completions",
@@ -8489,6 +8532,27 @@
           }
         },
         "title": "ValidationError"
+      },
+      "VoiceCallCancelRequest": {
+        "type": "object",
+        "required": [
+          "call_id",
+          "reason"
+        ],
+        "properties": {
+          "call_id": {
+            "type": "string",
+            "pattern": "^vcall_",
+            "maxLength": 96
+          },
+          "reason": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 64,
+            "description": "Bounded client cancellation reason, for example user_hangup, connect_failed, transcript_empty, or app_terminated."
+          }
+        },
+        "additionalProperties": false
       },
       "ModelApiModelsRequest": {
         "type": "object",

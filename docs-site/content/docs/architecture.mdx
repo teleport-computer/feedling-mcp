@@ -193,7 +193,13 @@ account's chat route, provider URL, or credential.
    (deleting them would desync compaction's frozen ledger); they no longer
    feed future context reads. If the archive or the card cannot be persisted,
    nothing is deleted and the client may retry.
-6. Archived calls stay readable: `GET /v1/voice/transcripts` lists them and
+6. If a failed or empty call will not be archived, the client calls
+   `POST /v1/voice/cancel` with its `call_id` and a bounded reason. The
+   idempotent cancellation tombstone removes unarchived turn rows and stops
+   late resident or Runtime V2 replies before they can enter ordinary Chat.
+   Finalize claims its lifecycle state before writing the archive, so a
+   concurrent cancel cannot downgrade or partially delete a successful call.
+7. Archived calls stay readable: `GET /v1/voice/transcripts` lists them and
    `GET /v1/voice/transcripts/{call_id}` returns the sealed envelope for the
    client to open locally. The agent reaches the same archive through the
    `voice_transcript_list` / `voice_transcript_read` tools, and memory cards

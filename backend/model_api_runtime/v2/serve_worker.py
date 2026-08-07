@@ -2692,7 +2692,12 @@ def _reply_payload_sequence(payload: dict) -> list[dict]:
             or _reply_message_fields(raw_followup)[0] != "file"
         ):
             raise RuntimeError("invalid reply followup")
-        sequence.append(dict(raw_followup))
+        followup = dict(raw_followup)
+        for key in ("voice_call_id", "voice_turn_id"):
+            value = str(payload.get(key) or "").strip()
+            if value:
+                followup[key] = value
+        sequence.append(followup)
     return sequence
 
 

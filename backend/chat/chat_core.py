@@ -1084,15 +1084,24 @@ def write_response(
                 followup["ts"] = previous_ts + 0.000001
             previous_ts = float(followup["ts"])
             candidates.append(followup)
-        finalized = (
-            store.finalize_chat_reply_sequence_once(
-                reply_to_message_id, candidates, replied_fields
+        try:
+            finalized = (
+                store.finalize_chat_reply_sequence_once(
+                    reply_to_message_id, candidates, replied_fields
+                )
+                if file_followups
+                else store.finalize_chat_reply_once(
+                    reply_to_message_id, candidate, replied_fields
+                )
             )
-            if file_followups
-            else store.finalize_chat_reply_once(
-                reply_to_message_id, candidate, replied_fields
-            )
-        )
+        except db.VoiceCallReplySuppressed as exc:
+            # A resident may finish after the phone has hung up. This is an
+            # accepted terminal disposition, not a transport error that should
+            # keep the local consumer retrying the same stale answer forever.
+            return {
+                "status": "ignored",
+                "reason": str(exc),
+            }, 200
         if finalized is None:
             # The parent already carries a committed reply. finalize never
             # overwrites the winner, so distinguish an idempotent replay of the

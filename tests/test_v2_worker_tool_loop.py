@@ -259,6 +259,8 @@ def _late_input_deps(uid: str, written: list[str]) -> worker.TurnDeps:
                 "ts": row["ts"],
                 "role": row.get("role"),
                 "content": row.get("test_plaintext", ""),
+                "voice_call_id": row.get("voice_call_id", ""),
+                "voice_turn_id": row.get("voice_turn_id", ""),
             }
             for row in rows
             if row.get("role") == "user"
@@ -944,6 +946,9 @@ def test_voice_turn_publishes_all_applied_bubbles_once_in_order(monkeypatch):
     assert [
         base64.b64decode(row["body_ct"]).decode("utf-8") for row in bubbles
     ] == ["这是第一条。", "这是第二条。"]
+    assert all(row["voice_call_id"] == "voice-call-1" for row in bubbles)
+    assert all(row["voice_turn_id"] == "voice-turn-1" for row in bubbles)
+    assert bubbles[-1]["reply_to_message_id"] == "voice-user-1"
     assert len(published) == 1
     published_user, published_turn = published[0]
     assert published_user == uid

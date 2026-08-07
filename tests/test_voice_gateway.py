@@ -18,11 +18,13 @@ ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(ROOT / "backend"))
 
 from core import voice_token
+from core import store as core_store
 import db
 from enclave.routes import chat as enclave_chat
 from hosted import chat_send_core
 from voice import results
 from voice import routes_asgi
+from voice import cleanup as voice_cleanup
 from voice.message_filter import is_meaningful_voice_message
 
 
@@ -343,6 +345,100 @@ def test_ignored_voice_turn_returns_an_empty_streaming_completion():
     assert body.count("data: [DONE]") == 1
 
 
+def test_cancel_route_does_not_clean_when_finalize_already_won(monkeypatch):
+    async def read_payload(_request):
+        return {"call_id": "vcall_race", "reason": "user_hangup"}
+
+    monkeypatch.setattr(routes_asgi.asgi_http, "read_json_silent", read_payload)
+    monkeypatch.setattr(
+        db,
+        "voice_call_cancel",
+        lambda *_args: {"status": "finalizing", "replayed": True},
+    )
+    monkeypatch.setattr(
+        results,
+        "delete_call_state",
+        lambda *_args: pytest.fail("finalize winner must keep handoff rows"),
+    )
+    monkeypatch.setattr(
+        voice_cleanup,
+        "delete_call_messages",
+        lambda *_args: pytest.fail("finalize winner must keep chat rows"),
+    )
+    monkeypatch.setattr(
+        core_store,
+        "get_store",
+        lambda *_args: pytest.fail("finalize winner must not reload chat"),
+    )
+
+    response = asyncio.run(
+        routes_asgi.cancel_voice_call(
+            SimpleNamespace(),
+            auth=SimpleNamespace(user_id="user-1"),
+        )
+    )
+
+    assert response.status_code == 200
+    assert json.loads(response.body) == {
+        "status": "finalizing",
+        "call_id": "vcall_race",
+        "replayed": True,
+        "deleted": 0,
+        "retained_covered": 0,
+        "remaining": 0,
+    }
+
+
+def test_replayed_cancel_route_remains_idempotent_and_cleans(monkeypatch):
+    async def read_payload(_request):
+        return {"call_id": "vcall_repeat", "reason": "connect_failed"}
+
+    class Store:
+        def __init__(self):
+            self.reloaded = False
+            self.notified = False
+
+        def reload(self):
+            self.reloaded = True
+
+        def notify_chat_waiters(self):
+            self.notified = True
+
+    store = Store()
+    monkeypatch.setattr(routes_asgi.asgi_http, "read_json_silent", read_payload)
+    monkeypatch.setattr(
+        db,
+        "voice_call_cancel",
+        lambda *_args: {"status": "cancelled", "replayed": True},
+    )
+    monkeypatch.setattr(
+        results,
+        "delete_call_state",
+        lambda *_args: {"results_deleted": 0, "streams_deleted": 0},
+    )
+    monkeypatch.setattr(
+        voice_cleanup,
+        "delete_call_messages",
+        lambda *_args: {"deleted": 0, "retained_covered": 0, "remaining": 0},
+    )
+    monkeypatch.setattr(core_store, "get_store", lambda *_args: store)
+    monkeypatch.setattr(routes_asgi.wake_bus, "notify", lambda *_args: None)
+
+    response = asyncio.run(
+        routes_asgi.cancel_voice_call(
+            SimpleNamespace(),
+            auth=SimpleNamespace(user_id="user-1"),
+        )
+    )
+
+    body = json.loads(response.body)
+    assert response.status_code == 200
+    assert body["status"] == "cancelled"
+    assert body["replayed"] is True
+    assert store.reloaded is True
+    assert store.notified is True
+
+
 def test_gateway_does_not_persist_or_run_non_speech_turn(monkeypatch):
     async def read_payload(_request):
         return {
@@ -377,6 +473,7 @@ def test_gateway_does_not_persist_or_run_non_speech_turn(monkeypatch):
 class _Result:
     def __init__(self, row):
         self.row = row
+        self.rowcount = 0
 
     def fetchone(self):
         return self.row
@@ -389,12 +486,19 @@ class _Connection:
     def __init__(self):
         self.rows = {}
         self.stream_rows = {}
+        self.call_statuses = {}
 
     @contextmanager
     def transaction(self):
         yield self
 
     def execute(self, sql, params=None):
+        if sql.startswith("SELECT pg_advisory_xact_lock"):
+            return _Result((None,))
+        if sql.startswith("SELECT status FROM voice_call_sessions"):
+            user_id, call_id = params
+            status = self.call_statuses.get((user_id, call_id))
+            return _Result((status,) if status else None)
         if sql.startswith("DELETE FROM voice_turn_results"):
             now = time.time()
             self.rows = {
@@ -521,6 +625,31 @@ def test_voice_reply_handoff_is_encrypted_and_idempotent(monkeypatch):
         turn_id="turn-1",
         message_id="message-duplicate",
         text="重复回答",
+    )
+
+
+def test_cancelled_call_rejects_late_result_handoff(monkeypatch):
+    pool = _Pool()
+    pool.conn.call_statuses[("user-1", "call-1")] = "cancelled"
+    monkeypatch.setenv("FEEDLING_VOICE_TOKEN_SECRET", "test-voice-secret")
+    monkeypatch.setattr(results.db, "get_pool", lambda: pool)
+
+    assert not results.store_reply(
+        "user-1",
+        call_id="call-1",
+        turn_id="turn-1",
+        message_id="late-message",
+        text="迟到回答",
+    )
+    assert results.load_reply(
+        "user-1", call_id="call-1", turn_id="turn-1"
+    ) is None
+    assert not results.store_stream_text(
+        "user-1",
+        call_id="call-1",
+        turn_id="turn-1",
+        segment=0,
+        text="迟到流",
     )
 
 
