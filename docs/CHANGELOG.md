@@ -47,6 +47,58 @@
 
 ## 记录正文（最新的在上面）
 
+## 2026-08-07 — Dashboard 卡片语义修正（prod 第二日实景反馈）
+
+**[FEEDBACK] 四处「数字对不上/误导」全部修正，根因都是口径与分母。**
+
+- 导入卡红灯顶 90% 大数字：分母从 completed 改为终态（completed+failed）
+  ——失败的导入到不了 completed，旧分母把 3 个失败藏进大数字（9/10=90%
+  配 23.1% 失败率的自相矛盾）。started>0 但无终态时显「—」不显 0%。
+- 漏斗 W1 假流失：builder 的 w1_eligible（窗口已走完人数）现在随 payload
+  下发，转化行分母用它——旧渲染拿 t3 总数当分母，把「注册不满 14 天、
+  窗口未到期」的人标成流失（实景 ↓40%·流失 75，实际 91 人成熟、33 人
+  未到期）。标签改「次周仍活跃（第 8–14 天）」防误读成 WAU。
+- 同词不同尺加标尺名：用户页判定句「近1日活跃」改「近1日发过消息」
+  （滚动 24h 真人消息），与「日活与时长」页 打开过App DAU（北京自然日）
+  是两把尺、无需对上——hint 里显式写明；产品健康 WAU 标签补「打开过
+  App」。chat/延迟卡「无样本」标注 Hosted V2 通道（V1/BYOK 不经此路径，
+  不代表没人聊天）。
+- 小样本环比不染色（两侧 <20 中性灰，17→4 的 −76% 红是真数字假信号）；
+  首页队列同因 >3 条折叠（注册波刷屏把 stalled 挤下屏）。
+- 测试 299 通过（含四组新回归）。
+
+
+## 2026-08-07 — 空回复归因：中转抽风不再算作「系统出了问题」
+
+**[DONE] prod 用户 usr_7f30d63f 报「今天好几次接不上」，分诊查实是他的中转不稳，但我们的错误归因把锅背到了自己头上。**
+
+- 现场：他的中转 08-05 上午配额爆掉后开始间歇返回 **HTTP 200 + 空内容**
+  （断流 / 配额紧张时的假成功）。我们清洗后为空 → 一律 `reply_parse_failed`
+  （blame=system，文案「系统处理回复时出了问题」）→ 用户自然来找我们。
+  同一场中转故障，前半场（规矩报错）归因正确，后半场（假成功）归因错误。
+- **归因边界**：模型本来就没给内容 = provider（新类 `provider_empty_reply`，
+  blame=provider_transient）；给过内容、被我们的清洗/压制掏空 = 我们
+  （`reply_parse_failed` 不变）。
+- 落点：标记由**四个 helper 抛出点**铸造（openai / simple / cli generic / pi）
+  —— 生产 helper 在返回前就抛异常，只在 `call_agent` 里判空是死代码；
+  分类器把空回复判定排在 `_ERROR_CLASS_RULES` **之后**，且抛出时带上 body 的
+  协议层诊断（`error.message` / `finish_reason`），这样 `200 + insufficient_quota`
+  这种中转标准形状仍然命中 `quota_insufficient` 而不是被空回复遮蔽。
+- V2 侧：`TurnError("empty_reply")` 归 provider；但 **`tool_budget_exhausted`
+  拆成独立 reason**（跑光的是我们自己的 `_TURN_MAX_LLM_CALLS`，不是中转的错），
+  wake `scheduled` 的 self-thinking SILENT 也归 system（模型给过完整 `<think>`、
+  是我们剥空的）。
+- 三轮 gatekeep（codex2 两轮 + 一次独立对抗预检）抓到的关键缺陷：①第一版
+  测试用 lambda 返回 `""` 绕过真实 helper 边界＝假绿，核心工单场景根本没修到；
+  ②`_raw_assistant_text` 是记忆车道的窄提取器（不读 top-level messages/actions），
+  拿它回头判空会把**我们自己的协议泄漏压制**误判成 provider 空回复 —— 改为在
+  压制**之前**快照；③标记加 `feedling:` 命名空间，否则 pi 透传的 provider 文本
+  可能原样命中而劫持归因。
+- 文档：`docs/FRONTEND_ERROR_CONTRACT.md`、`docs/API_ERRORS.md` 的 error_class
+  闭集，以及 docs-site changelog（用户可见文案变更）同批更新。
+- ⚠️ 用户可见变化：按 §2.3 显示矩阵，`provider_transient` 隐藏兜底气泡、只出
+  失败横幅（与 `rate_limited` / `upstream_unavailable` 同阵营，非本批新增形态）。
+
 ## 2026-08-06 — Dashboard prod 首日热路径修补
 
 **[DONE] IA v2 上 prod 首日实测（首页 ~8s、产品健康顶 30s deadline、verdicts 每次 5-8s）暴露三处，全部修复。**

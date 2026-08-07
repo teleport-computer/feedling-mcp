@@ -2523,14 +2523,19 @@ def _render_delta(current, previous, *, good_when: str = "up") -> str:
     else:
         arrow = "±"
         magnitude = "0%"
-    if good_when == "neutral" or pct == 0:
+    # 小样本不染色：新注册 17→4 渲染成红色 −76% 是统计噪声吓人（prod
+    # 2026-08-07 实景）。两侧都 < 20 时箭头和数值照显，但颜色中性——数字是
+    # 真的，好坏判断在这个样本量下不是。任一侧 ≥ 20 说明量级足够，照常染色。
+    small_base = abs(prev) < 20 and abs(cur) < 20
+    if good_when == "neutral" or pct == 0 or small_base:
         cls = "neutral"
     elif good_when == "down":
         cls = "good" if pct < 0 else "bad"
     else:
         cls = "good" if pct > 0 else "bad"
+    title = "对比上一个同长度窗口" + ("；样本量小（两侧均 <20），方向仅供参考" if small_base else "")
     return (
-        f"<span class='delta {cls}' title='对比上一个同长度窗口'>"
+        f"<span class='delta {cls}' title='{title}'>"
         f"{arrow}{magnitude}</span>"
     )
 
@@ -2716,12 +2721,35 @@ def _render_funnel(funnel: dict | None, *, compact: bool) -> str:
         label = html.escape(str(stage.get("label") or stage.get("id") or ""))
         if idx > 0:
             # 阶段间的逐级转化行：上一阶段无样本/未知就老实说，不编百分比。
+            # 带 eligible 的阶段（W1）分母必须用「窗口已走完的人」——拿 t3
+            # 总数当分母会把注册不满 14 天的人算成流失（prod 实景：t3=124
+            # 大半未到期，却标成 ↓40%·流失 75）。
+            eligible_raw = stage.get("eligible")
+            try:
+                eligible = int(eligible_raw) if eligible_raw is not None else None
+            except (TypeError, ValueError):
+                eligible = None
             if prev_count is None:
                 conv = "<span class='muted'>—</span>"
             elif prev_count == 0:
                 conv = "<span class='muted'>无样本</span>"
             elif count is None:
                 conv = "<span class='muted'>暂不可判</span>"
+            elif eligible is not None:
+                if eligible <= 0:
+                    conv = "<span class='muted'>暂不可判（无人走完 W1 窗）</span>"
+                else:
+                    pct = count / eligible * 100
+                    drop = max(0, eligible - count)
+                    immature = max(0, prev_count - eligible)
+                    imm_note = (
+                        f"；{immature:,} 人窗口未到期不计" if immature else ""
+                    )
+                    conv = (
+                        f"↓ {pct:.0f}%<span class='muted'>"
+                        f" · 已走完 W1 窗的 {eligible:,} 人中流失 {drop:,}"
+                        f"{imm_note}</span>"
+                    )
             else:
                 pct = count / prev_count * 100
                 drop = prev_count - count
@@ -3939,7 +3967,7 @@ def _ops_chat_level(report: dict | None) -> tuple[str, list[str]]:
     level = "warn"
     if settled == 0:
         level = "unknown"
-        reasons.append("窗口内没有已结算 chat 样本")
+        reasons.append("Hosted V2 chat 通道窗口内无已结算样本（V1/BYOK 聊天不经此通道，不代表没人聊天）")
     else:
         failure_rate = float(failed) / float(settled)
         if failure_rate >= 0.15:
@@ -3964,7 +3992,7 @@ def _ops_latency_level(report: dict | None) -> tuple[str, list[str]]:
         return "unknown", ["延迟统计暂不可用"]
     value = (report.get("latency") or {}).get("server_applied_p95_sec")
     if value is None:
-        return "unknown", ["缺少发送到服务端 reply applied 的 p95 样本"]
+        return "unknown", ["Hosted V2 通道缺少 reply applied 的 p95 样本（V1/BYOK 不经此通道）"]
     seconds = float(value)
     if seconds >= 120:
         return "bad", [f"服务端交付 p95 {seconds:.0f}s"]
@@ -4015,6 +4043,7 @@ def _render_ops_overview_page(
 
     started = int((imports or {}).get("started") or 0)
     completed = int((imports or {}).get("completed") or 0)
+    import_failed = int((imports or {}).get("failed") or 0)
     verified = int((imports or {}).get("artifact_verified") or 0)
     admitted = int(((chat or {}).get("outcomes") or {}).get("admitted") or 0)
     applied = int(((chat or {}).get("reply_delivery") or {}).get("final_applied_jobs") or 0)
@@ -4107,11 +4136,16 @@ def _render_ops_overview_page(
     # 大字标率、分数降级为小字：读者不用心算 41/69 是多少。分母为 0 时显
     # 「无样本」而不是 0%——0% 是测出来的坏消息，无样本是没消息。
     # 导入卡的样本门槛跟 _ops_import_level 用同一把尺：started == 0 才是
-    # 「无样本」；有 started 但 completed == 0（全部失败/卡住）是测出来的
-    # 0.0%，必须照实渲染成坏消息，不许显示成没消息。
+    # 「无样本」。
+    # 分母必须是**终态**（completed + failed）：失败的导入到不了 completed，
+    # 用 verified/completed 会让红卡顶着 90% 的大数字（prod 2026-08-07 实景：
+    # 9/10=90% 配 23.1% 终态失败率）——回答「导入成功了吗」的分母是所有
+    # 有结局的导入，不是所有善终的导入。
+    import_terminal = completed + import_failed
+    # started>0 且 terminal==0（全部还在跑/卡住）：率不可算，显「—」交给
+    # evidence 行的卡住理由说话——0.0% 是测出来的坏消息，这里还没有终态。
     import_rate = (
-        float(verified) / float(completed) if completed
-        else (0.0 if started else None)
+        float(verified) / float(import_terminal) if import_terminal else None
     )
     chat_rate = float(applied) / float(admitted) if admitted else None
     cards = "".join([
@@ -4119,10 +4153,13 @@ def _render_ops_overview_page(
             level=import_level,
             title="用户导入成功了吗？",
             view="imports",
-            value=_fmt_ratio(import_rate) if started else "无样本",
+            value=(
+                (_fmt_ratio(import_rate) if import_terminal else "—")
+                if started else "无样本"
+            ),
             fraction_html=(
-                f"{_fmt_count(verified)} / {_fmt_count(completed)}"
-                " · artifact 证据通过 / terminal completed"
+                f"{_fmt_count(verified)} / {_fmt_count(import_terminal)}"
+                " · artifact 证据通过 / 终态（completed+failed）"
             ),
             evidence_html=evidence(import_reasons),
         ),
@@ -5511,8 +5548,8 @@ def _home_queue_section(queue: dict | None) -> str:
             "<div class='queue-empty'>没有人卡住。</div>" + offline_note
         )
     now = time.time()
-    body_rows: list[str] = []
-    for row in rows:
+
+    def queue_tr(row: dict) -> str:
         user_id = str(row.get("user_id") or "")
         reason_code = str(row.get("reason_code") or "")
         pill_cls, fallback_label = _HOME_QUEUE_REASON_META.get(
@@ -5532,7 +5569,7 @@ def _home_queue_section(queue: dict | None) -> str:
         # safe=''：user_id 里万一混进 '/'，默认 safe='/' 会让它逃出
         # /users/<id> 路径段——与 imports 页同一硬化（见 _render_import 链接）。
         user_url = f"/admin/data-track/users/{quote(user_id, safe='')}{qs_suffix}"
-        body_rows.append(
+        return (
             "<tr>"
             f"<td><a href='{html.escape(user_url, quote=True)}'>{html.escape(user_id)}</a></td>"
             f"<td><span class='pill {pill_cls}'>{html.escape(reason_text)}</span></td>"
@@ -5540,6 +5577,32 @@ def _home_queue_section(queue: dict | None) -> str:
             f"<td class='muted'>{html.escape(detail)}</td>"
             "</tr>"
         )
+
+    # 同因折叠：一个注册波卡在同一步会把队列刷屏（prod 首日 8+ 条同款
+    # 「13d · t1 未达」把更急的 stalled 挤下屏）。每个原因先露前 3 条，
+    # 其余收进可展开行——工单的价值在多样性，不在同因复读。
+    by_reason: dict[str, list[dict]] = {}
+    for row in rows:
+        by_reason.setdefault(str(row.get("reason_code") or ""), []).append(row)
+    body_rows: list[str] = []
+    for reason_code, reason_rows in by_reason.items():
+        for row in reason_rows[:3]:
+            body_rows.append(queue_tr(row))
+        rest = reason_rows[3:]
+        if rest:
+            _, fallback_label = _HOME_QUEUE_REASON_META.get(
+                reason_code, ("warn", reason_code or "未知原因")
+            )
+            label = (
+                str(rest[0].get("reason_text") or "").strip() or fallback_label
+            )
+            inner = "".join(queue_tr(row) for row in rest)
+            body_rows.append(
+                "<tr class='queue-more'><td colspan='4'>"
+                f"<details><summary>还有 {len(rest)} 个「{html.escape(label)}」用户</summary>"
+                f"<table class='queue-table'><tbody>{inner}</tbody></table>"
+                "</details></td></tr>"
+            )
     truncated_note = (
         "<div class='muted'>只显示最严重 / 最早的前 20 条。</div>"
         if queue.get("truncated") else ""
@@ -6016,9 +6079,9 @@ def _render_data_track_page(payload: dict, funnel: dict | None = None) -> str:
     verdict_line = (
         "<div class='verdict-line'>"
         f"<b>{activated}</b> 个激活真人用户 · "
-        f"<b>{int(summary.get('human_active_1d') or 0)}</b> 个近1日活跃 · "
+        f"<b>{int(summary.get('human_active_1d') or 0)}</b> 个近1日发过消息 · "
         f"<b>{queue_ish}</b> 个在队列"
-        "<span class='hint' title='激活=写过记忆或发过消息的账号行；近1日活跃=近 1 天有真人发消息；"
+        "<span class='hint' title='激活=写过记忆或发过消息的账号行；近1日发过消息=滚动 24h 内有真人消息（比「日活与时长」页的 打开过App DAU 严格，两者不同尺，无需对上）；"
         "在队列=连接掉线+有去无回+模型配置待处理（与首页「需要你的用户」口径近似但非同源，"
         "首页按消息表逐用户判定）'>?</span>"
         "</div>"
@@ -7016,7 +7079,7 @@ def _render_product_health_page(
     )
     section1_tiles = "".join([
         _render_metric(
-            "WAU（近 7 完整日）", _fmt_count(stick.get("wau")),
+            "WAU·打开过 App（近 7 完整日）", _fmt_count(stick.get("wau")),
             hint="近 7 个已完整北京自然日内至少上报一次 app_session_end 的去重账号；前台被杀会漏报，是保守下限",
         ),
         _render_metric(

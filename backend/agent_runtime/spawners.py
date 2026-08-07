@@ -51,6 +51,11 @@ _IO_CLI_VERBS = (
     "perception-recent-apps",
     "perception-trend",
     "perception-history",
+    # 通话转写:记忆卡带 voice_call_id,agent 据此回看原文。两条动词必须同时
+    # 在这里和 V2 的 capabilities/tool_schema.py 上,只落一边 = 该 lane 的
+    # agent 根本调不到(prod 绝大多数用户在 V1 这条路上)。
+    "voice-transcript-list",
+    "voice-transcript-read",
     "memory-index",
     "memory-fetch",
     # identity-read/-write are the rename path. Without identity-write --agent-name
@@ -140,6 +145,8 @@ _AGENT_PROMPT_FALLBACK_COMMANDS = (
     "python {io_cli} perception-recent-apps [--limit <n>] [--hours <n>]\n"
     "python {io_cli} perception-trend <signal> [--field <field>] [--days <n>]\n"
     "python {io_cli} perception-history <signal> [--days <n>]\n"
+    "python {io_cli} voice-transcript-list [--limit <n>]\n"
+    "python {io_cli} voice-transcript-read --call-id <call_id> [--offset <n>]\n"
     "python {io_cli} memory-index [--query <text>] [--limit <n>] [--bucket <name>] [--thread <tag>] [--ambient] [--include-sensitive]\n"
     "python {io_cli} memory-fetch <id> [<id> ...] [--limit <n>] [--include-archived] [--include-superseded]\n"
     "python {io_cli} memory-write [--summary <text>] [--content <text>] [--bucket <name>] [--threads <tag>] [--importance <0-1>] [--pulse <0-1>] [--type <fact|event|quote|moment>] [--source <label>]\n"

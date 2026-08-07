@@ -555,6 +555,64 @@ def cmd_cancel_wake(args):
     _emit({"ok": False, "http_status": status, "error": body}, 1)
 
 
+def cmd_voice_transcript_list(args):
+    """Archived voice calls, newest first (metadata only). GET /v1/voice/transcripts."""
+    api_url, auth = _require_backend()
+    status, body = _http_json(
+        "GET", f"{api_url}/v1/voice/transcripts?limit={int(args.limit)}", auth)
+    if status == 200:
+        _emit({"ok": True, **body})
+    _emit({"ok": False, "http_status": status, "error": body}, 1)
+
+
+def cmd_voice_transcript_read(args):
+    """One archived call's words, paged. GET /v1/voice/transcripts/<call_id>.
+
+    The endpoint returns the envelope; decryption is the consumer's job, so this
+    verb goes through the same enclave decrypt path memory-fetch uses.
+    """
+    api_url, auth = _require_backend()
+    call_id = str(args.call_id or "").strip()
+    if not call_id.startswith("vcall_"):
+        _emit({"ok": False, "error": "voice-transcript-read needs a real call_id "
+                                     "(run voice-transcript-list first)"}, 2)
+    status, body = _http_json(
+        "GET", f"{api_url}/v1/voice/transcripts/{urllib.parse.quote(call_id)}", auth)
+    if status != 200:
+        _emit({"ok": False, "http_status": status, "error": body}, 1)
+    envelope = body.get("transcript") if isinstance(body, dict) else None
+    if not isinstance(envelope, dict):
+        _emit({"ok": False, "error": "transcript envelope missing"}, 1)
+    # 归档表存的是信封;明文只在 enclave 里出现。走通用 /v1/envelope/decrypt
+    # ——与 chat/memory 同一条 crypto 路径,不新增信任面。
+    enclave_url = _env("FEEDLING_ENCLAVE_URL")
+    if not enclave_url:
+        _emit({"ok": False, "error": "FEEDLING_ENCLAVE_URL not set; cannot decrypt transcript"}, 2)
+    dec_status, dec_body = _http_json(
+        "POST", f"{enclave_url.rstrip('/')}/v1/envelope/decrypt", auth,
+        payload={"envelope": envelope}, insecure=True)
+    if dec_status != 200 or not isinstance(dec_body, dict):
+        _emit({"ok": False, "http_status": dec_status,
+               "error": dec_body or "envelope decrypt failed"}, 1)
+    try:
+        text = base64.b64decode(dec_body.get("plaintext_b64") or "").decode("utf-8")
+    except Exception as exc:  # noqa: BLE001
+        _emit({"ok": False, "error": f"transcript decode failed: {str(exc)[:120]}"}, 1)
+    offset = max(0, int(args.offset or 0))
+    page = text[offset:offset + 6000]
+    _emit({
+        "ok": True,
+        "call_id": call_id,
+        "text": page,
+        "offset": offset,
+        "next_offset": (offset + len(page)) if offset + len(page) < len(text) else None,
+        "total_chars": len(text),
+        "turn_count": body.get("turn_count"),
+        "duration_sec": body.get("duration_sec"),
+        "created_at": body.get("created_at"),
+    })
+
+
 def cmd_memory_fetch(args):
     """Verbatim decrypted memory cards by id (plaintext-safe). POST /v1/memory/fetch."""
     api_url, auth = _require_backend()
@@ -1778,6 +1836,17 @@ def main():
     mf.add_argument("--include-archived", dest="include_archived", action="store_true", help="include archived cards in results")
     mf.add_argument("--include-superseded", dest="include_superseded", action="store_true", help="include superseded/corrected versions")
     mf.set_defaults(func=cmd_memory_fetch)
+
+    vtl = sub.add_parser("voice-transcript-list",
+                         help="Archived voice calls, newest first (metadata only).")
+    vtl.add_argument("--limit", type=int, default=20, help="maximum calls to list")
+    vtl.set_defaults(func=cmd_voice_transcript_list)
+
+    vtr = sub.add_parser("voice-transcript-read",
+                         help="What was said in one archived voice call (paged).")
+    vtr.add_argument("--call-id", dest="call_id", required=True, help="call id from voice-transcript-list")
+    vtr.add_argument("--offset", type=int, default=0, help="character offset to continue from")
+    vtr.set_defaults(func=cmd_voice_transcript_read)
 
     sr = sub.add_parser("screen-recent", help="Recent screen frame metadata (no pixels).")
     sr.add_argument("--limit", type=int, default=10, help="maximum number of frames to return")

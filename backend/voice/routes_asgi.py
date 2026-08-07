@@ -64,6 +64,13 @@ def _gateway_url(request: Request) -> str | None:
     return url
 
 
+def _positive_int(value) -> int:
+    try:
+        return max(0, int(value or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
 def _content_text(content) -> str:
     if isinstance(content, str):
         return content.strip()
@@ -283,23 +290,35 @@ async def create_voice_session(
 async def finalize_voice_call(
     request: Request, auth: AuthResult = Depends(require_auth)
 ):
-    """Hangup: replace this call's per-turn chat rows with ONE summary.
+    """Hangup: archive the full transcript, leave ONE small card, run Capture.
 
-    The live call itself is untouched (per-turn voice keeps the normal chat
-    lane: same identity, memory and tools). The client sends the call's
-    plaintext transcript (chat rows are ciphertext the server cannot read);
-    the summary runs on the user's OWN model, is durably persisted as a single
-    ``voice_call_summary`` row, and only then are the call's per-turn rows
-    deleted — so the raw back-and-forth stops occupying history/context and
-    memory capture distils from the summary instead.
+    The live call is untouched (per-turn voice rides the normal chat lane: same
+    identity, memory and tools). At hangup the client sends the call's plaintext
+    transcript (chat rows are ciphertext the server cannot read) and three
+    things happen, in this order:
 
-    Idempotent: the summary message id derives from ``call_id``; a retried
-    finalize finds the row and just re-runs the (idempotent) cleanup. On any
-    summary failure the per-turn rows are KEPT (nothing is lost) and the
-    client may retry.
+    1. the FULL transcript is archived to ``voice_transcripts`` — permanent,
+       E2E-sealed, readable from Settings and by the agent's transcript tools;
+    2. one bounded preview card (``voice_call_transcript``) replaces the call's
+       per-turn rows in the chat stream, so neither the prompt tail nor the
+       history carries a whole call;
+    3. Capture is forced. It renders the archived FULL text into its window in
+       place of this card, so memory is distilled from everything that was said
+       — through the ordinary capture pipeline, not a parallel one.
+
+    There is deliberately no summary: a 1-3 sentence model-written précis was
+    both a second model call and a lossy memory input. The card's preview is
+    mechanical (head + tail), the archive holds the rest.
+
+    Idempotent: the card's message id derives from ``call_id``; a retried
+    finalize finds the row and re-runs only the (idempotent) cleanup and
+    capture nudge. On any archive/card failure the per-turn rows are KEPT
+    (nothing is lost) and the client may retry.
     """
     from core import store as core_store
-    from voice import summary as voice_summary
+    from proactive import proactive_core
+    from voice import cleanup as voice_cleanup
+    from voice import transcript_store
 
     payload = (await asgi_http.read_json_silent(request)) or {}
     if not isinstance(payload, dict):
@@ -315,26 +334,53 @@ async def finalize_voice_call(
     if len(json.dumps(turns)) > 120_000:
         return JSONResponse({"error": "transcript_too_long"}, status_code=413)
     user_id = auth.user_id
-    mid = voice_summary.summary_message_id(call_id)
+    duration_sec = _positive_int(payload.get("duration_sec"))
+    mid = voice_cleanup.transcript_card_message_id(call_id)
 
     def _finalize() -> tuple[dict, int]:
         store = core_store.get_store(user_id)
         import db as _db
 
-        # Idempotent replay: summary already durable -> just redo the cleanup.
-        already = _db.chat_get_strict(user_id, mid) is not None
-        if not already:
+        # Idempotent replay. The judge is the ARCHIVE, not the chat card: the
+        # card id reuses the summary era's uuid5 namespace, so a row written by
+        # an older build would otherwise read as "already handled" and this
+        # request would delete the per-turn rows without ever storing the
+        # transcript the client just re-sent — losing the call for good.
+        archived = transcript_store.exists(user_id, call_id)
+        already = archived and _db.chat_get_strict(user_id, mid) is not None
+        if not archived:
+            text = transcript_store.render_transcript(turns)
+            if not text:
+                return {"error": "turns_required"}, 400
             try:
-                text = voice_summary.generate_summary(store, turns)
+                # Archive FIRST. The per-turn rows below are the only other copy
+                # of this call, so nothing may delete them until the archive is
+                # durable. Unlike a summary this cannot degrade — it either
+                # stores every word or fails the request.
+                stats = transcript_store.persist(
+                    store, call_id, text,
+                    turn_count=len(turns), duration_sec=duration_sec,
+                    chat_message_id=mid,
+                )
             except Exception as exc:  # noqa: BLE001 — keep rows, let client retry
                 log.warning(
-                    "[voice.finalize] summary failed user=%s call=%s: %s",
-                    user_id[:12], call_id[:24], str(exc)[:120],
+                    "[voice.finalize] archive failed user=%s call=%s: %s",
+                    user_id[:12], call_id[:24], str(exc)[:160],
                 )
-                return {"error": "voice_summary_failed"}, 502
-            if not voice_summary.persist_summary(store, text, mid, call_id):
-                return {"error": "voice_summary_not_persisted"}, 502
-        cleanup = voice_summary.delete_call_messages(user_id, call_id)
+                return {"error": "voice_transcript_not_archived"}, 502
+            if _db.chat_get_strict(user_id, mid) is not None:
+                # 旧版本留下的摘要行占着这个 id。归档刚补上了,但那行的 source
+                # 仍是 voice_call_summary —— 它读得出来、也不会被 capture 展开
+                # (source 不在白名单里)。保留它而不是覆写:改写用户可见的历史
+                # 比留一条旧卡更糟,而这通电话的记忆本来也早就蒸过了。
+                log.info("[voice.finalize] legacy summary row kept user=%s call=%s",
+                         user_id[:12], call_id[:24])
+            elif not voice_cleanup.persist_transcript_card(
+                store, transcript_store.build_preview(text), mid, call_id,
+                turn_count=stats["turn_count"], duration_sec=stats["duration_sec"],
+            ):
+                return {"error": "voice_transcript_card_not_persisted"}, 502
+        cleanup = voice_cleanup.delete_call_messages(user_id, call_id)
         if cleanup["remaining"] > 0:
             # Deletable rows survived (a DB blip inside chat_delete). The
             # summary is durable, so a client retry re-enters via the
@@ -345,7 +391,9 @@ async def finalize_voice_call(
             )
             return {"error": "voice_cleanup_incomplete"}, 502
         # Prune this worker's hot cache and tell every other worker (same
-        # three steps clear_history performs after deleting rows).
+        # three steps clear_history performs after deleting rows). The
+        # transcript card itself must survive — it is what stands in for
+        # the call from here on.
         with store.chat_lock:
             store.chat_messages = [
                 m for m in store.chat_messages
@@ -354,9 +402,29 @@ async def finalize_voice_call(
             ]
         store.notify_chat_waiters()
         wake_bus.notify("chat", user_id)
-        voice_summary.nudge_capture(store)
+        # Memory: one ordinary Capture round over the window that now contains
+        # this call's card. The capture handler swaps that card for the archived
+        # FULL transcript, so memory sees everything that was said — same
+        # prompt, parser, consent gate and card writer as every other capture.
+        # Safe to re-run on replay: capture is cursor-driven, so once the
+        # frontier has passed this card it cannot be distilled twice.
+        try:
+            proactive_core.capture_force(store)
+        except Exception as exc:  # noqa: BLE001 — a nudge, never the HTTP result
+            log.warning(
+                "[voice.finalize] capture nudge failed user=%s call=%s: %s",
+                user_id[:12], call_id[:24], str(exc)[:160],
+            )
+        log.info(
+            "[voice.finalize] archived user=%s call=%s turns=%d replay=%s",
+            user_id[:12], call_id[:24], len(turns), already,
+        )
         return {
             "status": "finalized",
+            "transcript_message_id": mid,
+            # Deprecated alias: shipped clients read summary_message_id. Dual
+            # written for one release so an older build keeps working; drop it
+            # once the transcript-card build is the floor.
             "summary_message_id": mid,
             "deleted_turns": cleanup["deleted"],
             "retained_covered": cleanup["retained_covered"],
@@ -365,6 +433,48 @@ async def finalize_voice_call(
 
     body, status = await asyncio.to_thread(_finalize)
     return JSONResponse(body, status_code=status)
+
+
+@router.get("/v1/voice/transcripts")
+async def list_voice_transcripts(
+    request: Request, auth: AuthResult = Depends(require_auth)
+):
+    """Newest-first list of this user's archived calls, WITHOUT the bodies.
+
+    Settings renders this; the agent's ``voice_transcript_list`` tool reads the
+    same shape. Metadata only — pulling a body is an explicit second call so a
+    listing can never blow anyone's context.
+    """
+    from voice import transcript_store
+
+    limit = _positive_int(request.query_params.get("limit")) or 50
+    items = await threadpool.run_db(
+        transcript_store.list_metadata, auth.user_id, limit=limit
+    )
+    return JSONResponse({"items": items, "count": len(items)})
+
+
+@router.get("/v1/voice/transcripts/{call_id}")
+async def get_voice_transcript(
+    call_id: str, auth: AuthResult = Depends(require_auth)
+):
+    """One archived call as its raw v1 envelope — the client decrypts locally.
+
+    Same posture as ``/v1/memory/list``: the server hands back ciphertext it
+    cannot read. Server-side readers (Capture, the agent tools) go through
+    ``transcript_store.load_plaintext`` and the enclave instead.
+    """
+    from voice import transcript_store
+
+    call_id = str(call_id or "").strip()
+    if not call_id.startswith("vcall_") or len(call_id) > 96:
+        return JSONResponse({"error": "call_id_required"}, status_code=400)
+    row = await threadpool.run_db(
+        transcript_store.get_envelope, auth.user_id, call_id
+    )
+    if row is None:
+        return JSONResponse({"error": "voice_transcript_not_found"}, status_code=404)
+    return JSONResponse(row)
 
 
 @router.post("/v1/voice/chat/completions")

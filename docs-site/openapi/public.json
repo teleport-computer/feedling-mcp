@@ -8022,7 +8022,7 @@
     "/v1/voice/finalize": {
       "post": {
         "summary": "Finalize Voice Call",
-        "description": "Hangup: replace this call's per-turn chat rows with ONE summary.\n\nThe live call itself is untouched (per-turn voice keeps the normal chat\nlane: same identity, memory and tools). The client sends the call's\nplaintext transcript (chat rows are ciphertext the server cannot read);\nthe summary runs on the user's OWN model, is durably persisted as a single\n``voice_call_summary`` row, and only then are the call's per-turn rows\ndeleted — so the raw back-and-forth stops occupying history/context and\nmemory capture distils from the summary instead.\n\nIdempotent: the summary message id derives from ``call_id``; a retried\nfinalize finds the row and just re-runs the (idempotent) cleanup. On any\nsummary failure the per-turn rows are KEPT (nothing is lost) and the\nclient may retry.",
+        "description": "Hangup: archive the full transcript, leave ONE small card, run Capture.\n\nThe live call is untouched (per-turn voice rides the normal chat lane: same\nidentity, memory and tools). At hangup the client sends the call's plaintext\ntranscript (chat rows are ciphertext the server cannot read) and three\nthings happen, in this order:\n\n1. the FULL transcript is archived to ``voice_transcripts`` — permanent,\n   E2E-sealed, readable from Settings and by the agent's transcript tools;\n2. one bounded preview card (``voice_call_transcript``) replaces the call's\n   per-turn rows in the chat stream, so neither the prompt tail nor the\n   history carries a whole call;\n3. Capture is forced. It renders the archived FULL text into its window in\n   place of this card, so memory is distilled from everything that was said\n   — through the ordinary capture pipeline, not a parallel one.\n\nThere is deliberately no summary: a 1-3 sentence model-written précis was\nboth a second model call and a lossy memory input. The card's preview is\nmechanical (head + tail), the archive holds the rest.\n\nIdempotent: the card's message id derives from ``call_id``; a retried\nfinalize finds the row and re-runs only the (idempotent) cleanup and\ncapture nudge. On any archive/card failure the per-turn rows are KEPT\n(nothing is lost) and the client may retry.",
         "operationId": "finalize_voice_call_v1_voice_finalize_post",
         "responses": {
           "200": {
@@ -8102,6 +8102,93 @@
           }
         },
         "x-feedling-contract-level": "compatibility"
+      }
+    },
+    "/v1/voice/transcripts": {
+      "get": {
+        "summary": "List Voice Transcripts",
+        "description": "Newest-first list of this user's archived calls, WITHOUT the bodies.\n\nSettings renders this; the agent's ``voice_transcript_list`` tool reads the\nsame shape. Metadata only — pulling a body is an explicit second call so a\nlisting can never blow anyone's context.",
+        "operationId": "list_voice_transcripts_v1_voice_transcripts_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GenericJsonResponse"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Error response.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "Other"
+        ],
+        "x-feedling-contract-level": "documented"
+      }
+    },
+    "/v1/voice/transcripts/{call_id}": {
+      "get": {
+        "summary": "Get Voice Transcript",
+        "description": "One archived call as its raw v1 envelope — the client decrypts locally.\n\nSame posture as ``/v1/memory/list``: the server hands back ciphertext it\ncannot read. Server-side readers (Capture, the agent tools) go through\n``transcript_store.load_plaintext`` and the enclave instead.",
+        "operationId": "get_voice_transcript_v1_voice_transcripts__call_id__get",
+        "parameters": [
+          {
+            "name": "call_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Call Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GenericJsonResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid path or request parameter.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Error response.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "Other"
+        ],
+        "x-feedling-contract-level": "documented"
       }
     },
     "/v1/web/settings": {

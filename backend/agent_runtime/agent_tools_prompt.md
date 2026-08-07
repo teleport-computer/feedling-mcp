@@ -64,6 +64,20 @@ Two empty cases, don't conflate them:
 - `disabled: true` with a `reason` — the user switched app perception off.
   Say you can't see it, don't imply they haven't used anything.
 
+## Voice call transcripts
+
+Voice calls are archived word for word. A memory card distilled from a call
+carries that call's `voice_call_id`.
+
+- `voice-transcript-list` — which calls exist (when, how long, how many turns).
+- `voice-transcript-read --call-id <id>` — what was actually said, paged; pass
+  the returned `next_offset` to continue.
+
+Reach for this when a memory card is too terse to answer the question and you
+want the original wording, or when the user asks about "that call". You do NOT
+need it for a call that just ended — its memory was already written from the
+full transcript.
+
 ## Memory (strict two-step: index → fetch)
 
 Use memory when the user asks about stored facts, names, preferences, identity,

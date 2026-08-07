@@ -539,8 +539,25 @@ if "FEEDLING_V2_TAIL_BUDGET_MSGS" in os.environ:
     )
 _CAPTURE_BATCH_LIMIT = 60
 _CAPTURE_PROMPT_RAW_ROLES = frozenset({"user", "openclaw"})
+# MUST stay a superset-compatible mirror of
+# capture_scheduler.CAPTURE_LIVE_SOURCES (locked by
+# tests/test_capture_source_whitelists_agree.py). A source that TRIGGERS capture
+# but is missing here is silently dropped from the prompt: capture then runs on
+# an empty window, writes nothing, and still advances the cursor past those
+# rows. That is exactly what happened to voice_call_summary on V2 between
+# 2026-08-05 and 2026-08-07 — every V2 user's voice memory was lost in silence.
 _CAPTURE_PROMPT_SOURCES = frozenset(
-    {"chat", "model_api", "live_activity", "agent_initiated_proactive"}
+    {"chat", "model_api", "live_activity", "agent_initiated_proactive",
+     "voice_call_transcript"}
+)
+_VOICE_TRANSCRIPT_SOURCE = "voice_call_transcript"
+# 单通电话渲染进 capture 窗口的字符预算。**必须大于通话时长上限能产出的字数**，
+# 否则采样会永久丢中段 —— 那等于宣称「从每句话 capture」却做不到。现行上限
+# 3600 秒（iOS ElevenLabsAgentClient），一小时中文口语约 9000 字，30000 留三倍
+# 余量。tests/test_voice_transcript_budget.py 锁死这个关系。采样只是"预算真被
+# 突破时不要静默失败"的兜底，正常路径不可达；走到那里会打 warning，不静默。
+_VOICE_TRANSCRIPT_PROMPT_CHARS = _positive_int_env(
+    "FEEDLING_V2_VOICE_TRANSCRIPT_PROMPT_CHARS", "30000"
 )
 _COMPACTION_BATCH = _positive_int_env("FEEDLING_V2_COMPACTION_BATCH_MSGS", "200")
 # A message-count cap alone is not a prompt-size bound: 200 maximum-size chat
@@ -812,6 +829,16 @@ _DEGENERATE_REPLY_ERROR_CLASS = "upstream_unavailable"
 _PROTOCOL_FRAGMENT_ERROR_CLASS = "upstream_unavailable"
 _PROTOCOL_FRAGMENT_REASON = "protocol_fragment_suppressed"
 _MALFORMED_SELF_THINKING_REASON = "malformed_self_thinking_suppressed"
+# 工具循环把我们自己的 _TURN_MAX_LLM_CALLS 预算跑光却始终没产出终局文本。
+# 这是**我们的配置上限**,不是 provider 给了空回复 —— 单独一个 reason,才能既
+# 不误告用户「去查你的中转」,又能在 admin 上和真正的空回复分开看
+# (自审 2026-08-07 P1;原先与 empty_reply 混在一条 raise 里)。
+_TOOL_BUDGET_EXHAUSTED_REASON = "tool_budget_exhausted"
+# scheduled 提醒的必达合约要求有正文,但模型这轮**只产出了一个格式完全正确的
+# <think> 块**、被我们按开关剥掉了 —— 与「格式坏掉」(_MALFORMED_SELF_THINKING)
+# 和「provider 什么都没给」(empty_reply)都不是一回事,单列一个 reason 才能在
+# admin 上分辨。归 system:内容是模型给过的,是我们剥空的(自审 2026-08-07 P2)。
+_THINKING_ONLY_NO_REPLY_REASON = "thinking_only_no_reply"
 
 
 def _torn_protocol_evidence(text: str, reasoning: str, *, lane: str) -> str:
@@ -905,6 +932,8 @@ def _safe_failure_code(scope: str, exc: BaseException) -> str:
             "no_user_messages",
             _PROTOCOL_FRAGMENT_REASON,
             _MALFORMED_SELF_THINKING_REASON,
+            _TOOL_BUDGET_EXHAUSTED_REASON,
+            _THINKING_ONLY_NO_REPLY_REASON,
         }:
             kind = raw
         elif raw == _COVERAGE_INCOMPLETE or raw.startswith(
@@ -996,12 +1025,20 @@ def _turn_failure_error_class(exc: BaseException) -> str:
         return "context_overflow"
     if isinstance(exc, (asyncio.TimeoutError, TimeoutError)):
         return "turn_timeout"
+    if isinstance(exc, TurnError) and str(exc) == "empty_reply":
+        # 模型/provider 没给出任何可用文本(空终局、断流、预算耗尽无气泡)——
+        # 三个 raise 点全是 provider/模型行为,不是我们的解析问题;归 provider,
+        # 别把中转抽风包装成「系统出了问题」(usr_7f30d63f 2026-08-07)。
+        return "provider_empty_reply"
     if isinstance(exc, TurnError) and str(exc) in {
         "degenerate_reply_suppressed",
-        "empty_reply",
         _PROTOCOL_FRAGMENT_REASON,
         _MALFORMED_SELF_THINKING_REASON,
+        _TOOL_BUDGET_EXHAUSTED_REASON,
+        _THINKING_ONLY_NO_REPLY_REASON,
     }:
+        # 这几个都是我们自己造成的(主动剥掉/压制,或跑光我们设定的工具预算)
+        # —— 归 system 不变。
         return "reply_parse_failed"
     if isinstance(exc, TurnError) and (
         str(exc) == _COVERAGE_INCOMPLETE
@@ -1170,6 +1207,9 @@ class TurnDeps:
     # Dream-specific reader may fetch full selected card bodies.  When absent,
     # tests/legacy assembly fall back to read_memory_context.
     read_dream_memory_context: Callable[[str], dict] | None = None
+    # (user_id, call_id) -> 归档的通话全文明文。缺省 None = 不展开通话卡
+    # （老部署/测试注入）。生产实现在 serve_worker,走 enclave 解密。
+    read_voice_transcript: Callable[[str, str], str] | None = None
     # user_id -> (all rendered Garden cards, exact card count). Unlike
     # read_memory_context this is fail-loud and rejects any truncated read.
     read_profile_cards: Callable[[str], tuple[str, int]] | None = None
@@ -4710,6 +4750,43 @@ async def _persist_batch_cap(user_id: str, value: int) -> None:
         log.debug("[v2.worker] batch cap persist failed for %s: %s", user_id, exc)
 
 
+def _bounded_voice_transcript(text: str, *, budget: int) -> str:
+    """把一通电话的全文压进预算：超了就头尾采样并说明中间省了多少。"""
+    text = str(text or "").strip()
+    if len(text) <= budget:
+        return text
+    head_budget = int(budget * 0.6)
+    tail_budget = max(0, budget - head_budget)
+    head = text[:head_budget].rstrip()
+    tail = text[-tail_budget:].lstrip() if tail_budget else ""
+    omitted = len(text) - len(head) - len(tail)
+    log.warning(
+        "[v2.worker] voice transcript exceeded capture budget: %d chars, %d omitted "
+        "(raise FEEDLING_V2_VOICE_TRANSCRIPT_PROMPT_CHARS)", len(text), omitted)
+    return f"{head}\n…（中间约 {omitted} 字省略，完整记录见通话详情）…\n{tail}"
+
+
+def _render_capture_line(message: dict, voice_transcripts: dict,
+                         *, user_name: str, ai_name: str) -> str:
+    """一条 capture 窗口行。通话卡展开成全文，其余按原样渲染。"""
+    call_id = str(message.get("voice_call_id") or "").strip()
+    if (
+        call_id
+        and str(message.get("source") or "") == _VOICE_TRANSCRIPT_SOURCE
+        and call_id in voice_transcripts
+    ):
+        body = _bounded_voice_transcript(
+            voice_transcripts[call_id], budget=_VOICE_TRANSCRIPT_PROMPT_CHARS
+        )
+        turns = message.get("voice_turn_count")
+        header = "【语音通话逐字记录" + (f"，共 {turns} 轮" if turns else "") + "】"
+        return f"{header}\n{body}"
+    label = transcript_speaker_label(
+        str(message.get("role") or ""), user_name=user_name, ai_name=ai_name
+    )
+    return f"- {label}: {context.text_of(message.get('content'))}"
+
+
 def _bounded_compaction_prefix(
     messages: list[dict],
     *,
@@ -7761,7 +7838,11 @@ async def _run_wake(
                     # exception: their must-deliver contract still requires text.
                     text = ""
                     if final and lane == "scheduled":
-                        raise TurnError("empty_reply")
+                        # 走到这里说明模型**给过**一个完整的 <think> 块、被我们剥空了
+                        # (还是我们自己的 kill switch 决定剥不剥)——按本批定的判据
+                        # 「给过内容、被我们掏空 = 我们的」,归 system,不许说成
+                        # 「你的模型服务返回了空回复」(自审 2026-08-07 P2)。
+                        raise TurnError(_THINKING_ONLY_NO_REPLY_REASON)
                     return
                 elif _wst_status == _st_wake.FAILED:
                     if final:
@@ -8812,6 +8893,8 @@ async def _run_extraction(
     """
     extraction_status_recorded = False
     capture_window: dict[str, Any] = {}
+    # call_id -> 该通电话的全文明文。只在 capture lane 填充（见 enclave_sem 闸内）。
+    voice_transcripts: dict[str, str] = {}
 
     async def _ensure_capture_not_halted(stage: str) -> None:
         """Bypass the polling cache at disclosure and durable-write boundaries."""
@@ -8994,6 +9077,31 @@ async def _run_extraction(
                 )
             else:
                 tail = []
+            # 通话转写:聊天流里只有一张有界预览卡，全文在 voice_transcripts。
+            # 在闸内一并取回，渲染窗口时替换掉预览——这样 Capture 蒸的是整通
+            # 电话，而 prompt 尾巴仍然只背那张小卡。
+            if lane == "capture" and deps.read_voice_transcript is not None:
+                for message in tail:
+                    call_id = str(message.get("voice_call_id") or "").strip()
+                    if not call_id or str(message.get("source") or "") != _VOICE_TRANSCRIPT_SOURCE:
+                        continue
+                    if call_id in voice_transcripts:
+                        continue
+                    try:
+                        voice_transcripts[call_id] = await asyncio.to_thread(
+                            deps.read_voice_transcript, user_id, call_id
+                        )
+                    except Exception as e:  # noqa: BLE001
+                        # 绝不降级用预览：那会把整通电话蒸成开头几句，并且照常
+                        # 推进游标——记忆永久丢失且无人知晓。宁可整个 job 失败
+                        # 重试（游标不动，下次重来）。
+                        log.warning(
+                            "[v2.worker] voice transcript unavailable user=%s call=%s: %s",
+                            user_id[:12], call_id[:24], str(e)[:160],
+                        )
+                        raise RuntimeError(
+                            f"capture_voice_transcript_unavailable:{call_id}"
+                        ) from e
         if lane == "capture" and deps.read_capture_state is not None and tail:
             last = tail[-1]
             last_id = str(last.get("id") or "")
@@ -9056,14 +9164,27 @@ async def _run_extraction(
         speaker_user_name = ctx.get("user_name", "")
         speaker_ai_name = ctx.get("ai_name", "")
         window = "\n".join(
-            f"- {transcript_speaker_label(str(m.get('role') or ''), user_name=speaker_user_name, ai_name=speaker_ai_name)}: "
-            f"{context.text_of(m.get('content'))}"
+            _render_capture_line(
+                m, voice_transcripts,
+                user_name=speaker_user_name, ai_name=speaker_ai_name,
+            )
             for m in prompt_tail
         ).strip()
         source_ids = [str(m.get("id")) for m in prompt_tail if m.get("id")]
 
         if lane == "capture":
-            parse, to_actions = parse_capture_cards, v2_extraction.cards_to_actions
+            # 溯源只在**能证明**归属时打:窗口里恰好一通电话,且没有别的可捕捉
+            # 内容。挂断即触发 capture,所以这是常态。混合窗口(通话 + 文字聊天)
+            # 一律不打 —— 那时无法判断某张卡到底来自哪一边,盖章就是假精度。
+            _sole_call_id = ""
+            if len(voice_transcripts) == 1 and len(prompt_tail) == 1:
+                _sole_call_id = next(iter(voice_transcripts))
+            parse = parse_capture_cards
+
+            def to_actions(*args, _call_id=_sole_call_id, **kwargs):
+                return v2_extraction.cards_to_actions(
+                    *args, voice_call_id=_call_id, **kwargs
+                )
             # 内容闸打回后的第二问：放宽成「只丢占位符那几张、干净的照收」，
             # 不让一张脏卡把整个窗口的落卡清零。
             parse_retry = v2_extraction.ParseRetry(
@@ -11809,7 +11930,7 @@ async def process_job(
             # exactly like the already-fixed BUG-4. Raise the same signal
             # `_on_reply` uses so it falls into the outer except below:
             # mark_failed + terminal error status + tm.flush(failed=True).
-            raise TurnError("empty_reply")
+            raise TurnError(_TOOL_BUDGET_EXHAUSTED_REASON)
         if seq_native:
             if not final_job_completed_atomically:
                 source_status = await asyncio.to_thread(
@@ -12041,6 +12162,7 @@ async def process_job(
                 "rate_limited": "vision_model_rate_limited",
                 "upstream_unavailable": "vision_model_unavailable",
                 "turn_timeout": "vision_model_unavailable",
+                "provider_empty_reply": "vision_model_empty_response",
                 "reply_parse_failed": "vision_model_empty_response",
             }.get(classified)
             # Pixels being present does not prove an unrelated tool, storage,

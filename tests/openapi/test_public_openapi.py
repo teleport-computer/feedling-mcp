@@ -197,8 +197,12 @@ def test_public_operation_and_parameter_inventory(
     # (POST /v1/agent/web/{search,fetch}, both with bodies) → 164 ops, 77 bodies;
     # Genesis plaintext estimate + commit add two body-bearing operations.
     # 167 since POST /v1/voice/finalize (hangup: client transcript in the body
-    # -> one voice_call_summary row replaces the call's per-turn rows), 80 bodies.
-    assert len(operations) == 167
+    # -> one card row replaces the call's per-turn rows), 80 bodies.
+    # 169 since the voice transcript archive became readable: GET
+    # /v1/voice/transcripts (list, metadata only) and GET
+    # /v1/voice/transcripts/{call_id} (one sealed envelope, decrypted on the
+    # client). Both bodyless, so the body count is unchanged.
+    assert len(operations) == 169
     assert sum("requestBody" in operation for operation in operations.values()) == 80
 
     query_operations = {

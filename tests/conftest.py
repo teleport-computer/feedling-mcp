@@ -199,7 +199,7 @@ if not _provisioned:
         "test_tee_registry_guard_enforced.py",
         "test_self_thinking_parse.py",
         # Voice hangup summary prompt builder. Pure — no DB.
-        "test_voice_summary.py",
+        "test_voice_cleanup.py",
     }
     collect_ignore = sorted(
         f

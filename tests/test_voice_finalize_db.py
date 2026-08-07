@@ -1,15 +1,19 @@
 """DB-backed tests for hangup cleanup: a finished call's per-turn chat rows are
-selected by voice_call_id and deleted, leaving unrelated chat and the summary
+selected by voice_call_id and deleted, leaving unrelated chat and the transcript card
 row untouched. (The summary write itself needs user key material + a live
 model; that half is covered by the local e2e.)"""
 
 from __future__ import annotations
 
+import asyncio
+import json
 import time
 import uuid
+from types import SimpleNamespace
 
 import db
-from voice import summary
+from voice import routes_asgi
+from voice import cleanup as summary
 
 
 def _seed_user() -> str:
@@ -85,18 +89,18 @@ def test_untagged_reply_rows_are_deleted_via_reply_to_parent():
     assert db.chat_get_strict(uid, unrelated_reply) is not None
 
 
-def test_delete_never_touches_the_summary_row_and_is_idempotent():
+def test_delete_never_touches_the_transcript_card_and_is_idempotent():
     uid = _seed_user()
     call_id = "vcall_" + uuid.uuid4().hex[:10]
     _append(uid, {
         "role": "user", "source": "model_api",
         "voice_call_id": call_id, "voice_turn_id": "t1",
     })
-    # Simulate the durable summary row: same call_id metadata, but its msg_id is
-    # the deterministic summary id, which delete must skip.
-    smid = summary.summary_message_id(call_id)
+    # Simulate the durable transcript card row: same call_id metadata, but its msg_id is
+    # the deterministic card id, which delete must skip.
+    smid = summary.transcript_card_message_id(call_id)
     db.chat_append_strict(uid, smid, time.time(), {
-        "id": smid, "role": "openclaw", "source": "voice_call_summary",
+        "id": smid, "role": "openclaw", "source": "voice_call_transcript",
         "voice_call_id": call_id,
     }, 200)
 
@@ -139,3 +143,95 @@ def test_rows_folded_by_compaction_are_retained_not_deleted():
     assert result == {"deleted": 1, "retained_covered": 1, "remaining": 0}
     assert db.chat_get_strict(uid, early) is not None   # folded row kept
     assert db.chat_get_strict(uid, late) is None        # unfolded row deleted
+
+
+# --------------------------------------------------------------------------- #
+# finalize route: archive -> bounded card -> cleanup -> capture nudge
+# --------------------------------------------------------------------------- #
+
+def _run_finalize(monkeypatch, uid: str, call_id: str):
+    """Drive the real finalize route against the DB with only the archive write
+    and the capture nudge stubbed (both need key material / a live runtime).
+    Returns (status, body, calls)."""
+    calls = {"archived": 0, "nudge": 0}
+    payload = {
+        "call_id": call_id,
+        "turns": [
+            {"role": "user", "text": "这周都在加班赶项目"},
+            {"role": "assistant", "text": "记得照顾好自己"},
+        ],
+        "duration_sec": 240,
+    }
+
+    async def _read_json(_request):
+        return payload
+
+    monkeypatch.setattr(routes_asgi.asgi_http, "read_json_silent", _read_json)
+    monkeypatch.setattr(routes_asgi.wake_bus, "notify", lambda *_a, **_k: None)
+
+    from voice import transcript_store
+
+    def _persist(_store, cid, text, *, turn_count, duration_sec, chat_message_id=""):
+        calls["archived"] += 1
+        return {"call_id": cid, "turn_count": turn_count,
+                "duration_sec": duration_sec, "char_count": len(text)}
+
+    monkeypatch.setattr(transcript_store, "persist", _persist)
+
+    def _card(_store, preview, mid, cid, *, turn_count=0, duration_sec=0):
+        if db.chat_get_strict(uid, mid) is None:
+            db.chat_append_strict(uid, mid, time.time(), {
+                "id": mid, "role": "openclaw",
+                "source": "voice_call_transcript", "voice_call_id": cid,
+            }, 200)
+        return True
+
+    monkeypatch.setattr(summary, "persist_transcript_card", _card)
+
+    from proactive import proactive_core
+
+    monkeypatch.setattr(
+        proactive_core, "capture_force",
+        lambda _store: calls.__setitem__("nudge", calls["nudge"] + 1),
+    )
+    response = asyncio.run(
+        routes_asgi.finalize_voice_call(
+            SimpleNamespace(), SimpleNamespace(user_id=uid)
+        )
+    )
+    return response.status_code, json.loads(response.body), calls
+
+
+def test_fresh_finalize_archives_once_and_nudges_capture(monkeypatch):
+    """The archive must happen exactly once, and Capture must be kicked so the
+    call's memory does not wait out the 20-minute quiet window."""
+    uid = _seed_user()
+    call_id = "vcall_" + uuid.uuid4().hex[:10]
+    _append(uid, {
+        "role": "user", "source": "model_api",
+        "voice_call_id": call_id, "voice_turn_id": "t1",
+    })
+
+    status, body, calls = _run_finalize(monkeypatch, uid, call_id)
+    assert (status, body["status"], body["replayed"]) == (200, "finalized", False)
+    assert calls == {"archived": 1, "nudge": 1}
+    # Old clients read summary_message_id; it is dual-written for one release.
+    assert body["transcript_message_id"] == body["summary_message_id"]
+
+
+def test_replayed_finalize_does_not_archive_again(monkeypatch):
+    """A retry (card already durable) must not re-archive — the archive insert
+    is ON CONFLICT DO NOTHING anyway, but re-running the model-free path twice
+    would still be a lie in the logs. Capture may be nudged again: it is
+    cursor-driven, so a second nudge cannot double-distil."""
+    uid = _seed_user()
+    call_id = "vcall_" + uuid.uuid4().hex[:10]
+    _append(uid, {
+        "role": "user", "source": "model_api",
+        "voice_call_id": call_id, "voice_turn_id": "t1",
+    })
+
+    _run_finalize(monkeypatch, uid, call_id)
+    status, body, calls = _run_finalize(monkeypatch, uid, call_id)
+    assert (status, body["replayed"]) == (200, True)
+    assert calls["archived"] == 0

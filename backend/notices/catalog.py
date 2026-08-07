@@ -28,6 +28,7 @@ ERROR_CLASSES = frozenset({
     "rate_limited",
     "upstream_unavailable",
     "turn_timeout",
+    "provider_empty_reply",
     "reply_parse_failed",
     "unknown",
     # genesis-only classes (Phase C / C1) — not part of the 11-class chat parity
@@ -86,6 +87,9 @@ _CATALOG: dict[str, tuple[str, str]] = {
         "provider_transient", "你的模型服务暂时不可用，稍后会自动恢复。"),
     "turn_timeout": (
         "system", "这轮回复超时了，稍后再试。"),
+    "provider_empty_reply": (
+        "provider_transient",
+        "你的模型服务这次返回了空回复，稍后再试；反复出现请检查模型渠道或中转的稳定性。"),
     "reply_parse_failed": (
         "system", "系统处理回复时出了问题，我们会尽快排查。"),
     "unknown": (
@@ -224,7 +228,13 @@ def classify_upstream(text: str) -> str:
     """把上游/运行时错误文本分类到 chat 上游 error_class；未命中返 ""（调用方
     决定兜底，如 genesis 落 genesis_failed）。与 consumer classify_agent_error 的
     规则表等价（不含 turn_timeout/reply_parse_failed 那两个凭异常类型/特定串判定
-    的分支——那两类不会出现在 genesis/import 的错误文本里）。"""
+    的分支——那两类不会出现在 genesis/import 的错误文本里）。
+    ⚠️ 刻意不含 ``provider_empty_reply``:那个类由 consumer 侧的
+    ``EMPTY_PROVIDER_REPLY_MARK`` 在 helper 抛出点铸造,backend 从不铸它,
+    所以这里没有对应规则(同 turn_timeout / reply_parse_failed 的既有排除)。
+    若将来 backend 也开始产这个标记,记得两边一起加,否则
+    test_classify_upstream_mirrors_consumer_on_samples 会红。
+    """
     t = text or ""
     lowered = t.lower()
     if "resident_never_claimed" in lowered:
