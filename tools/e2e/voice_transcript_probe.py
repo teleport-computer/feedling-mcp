@@ -26,30 +26,41 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 from tools.e2e.client import E2EClient  # noqa: E402
 from tools.e2e.config import load_keys  # noqa: E402
 
-# 锚点刻意分散在通话的开头/中段/结尾。中段那个是核心:预览只取头尾,所以
-# 「中段锚点成卡」是"确实蒸了全文"的唯一硬证据。
-_ANCHOR_HEAD = "封面定稿用了黛蓝色的海"
-_ANCHOR_MIDDLE = "下周三要去上海参加插画展"
-_ANCHOR_TAIL = "明天带年糕去宠物医院"
+# 一通"信息密度高"的真实通话:12 件彼此独立、都值得记住的事,分散在全程。
+# 与上一版(3 个锚点 + 160 轮废话)的区别是关键:那一版在考"模型会不会从废话里
+# 挑重点"(答案是会,而且只挑最重要的一件);这一版在考**产品真正的问题** ——
+# 当一通电话里确实有很多值得记的事,记忆会全都留下,还是照样只留一两张?
+_FACTS = [
+    ("绘本封面定稿,用了黛蓝色的海", "黛蓝"),
+    ("下周三要去上海参加插画展", "插画展"),
+    ("橘猫年糕这两天不吃饭,明天去宠物医院", "年糕"),
+    ("手腕腱鞘炎复发,医生让画一小时歇十分钟", "腱鞘炎"),
+    ("妈妈下个月来杭州住两周", "妈妈"),
+    ("换了新的数位板,牌子是 Wacom", "数位板"),
+    ("答应了出版社月底交第二本的样稿", "样稿"),
+    ("最近改成早上六点起床画画", "六点"),
+    ("咖啡戒了,改喝大麦茶", "大麦茶"),
+    ("冬至一定要吃芝麻馅汤圆,这是家里的传统", "汤圆"),
+    ("上周把工作室搬到了朝南的房间", "工作室"),
+    ("想在明年春天办一次个人小展", "个人小展"),
+]
 
 
 def _turns() -> list[dict]:
-    turns = [
-        {"role": "user", "text": f"喂,今天{_ANCHOR_HEAD},终于交稿了。"},
-        {"role": "assistant", "text": "恭喜!黛蓝的海一定很好看。"},
+    """把 12 件事自然地铺进一通电话,中间夹少量闲聊。"""
+    turns: list[dict] = [
+        {"role": "user", "text": "喂,今天有空,想跟你多聊会儿。"},
+        {"role": "assistant", "text": "好啊,我在听。"},
     ]
-    # 填充,把中段锚点推到预览取不到的位置
-    for i in range(40):
-        turns.append({"role": "user", "text": f"对了还有件小事,第{i}件,不太重要。"})
-        turns.append({"role": "assistant", "text": f"嗯,记下了第{i}件。"})
-    turns.append({"role": "user", "text": f"重要的是,{_ANCHOR_MIDDLE},记得提醒我订高铁票。"})
-    turns.append({"role": "assistant", "text": "好,下周三上海插画展,会提醒你订票。"})
-    for i in range(40):
-        turns.append({"role": "user", "text": f"还有些琐事,第{i}条,随便说说。"})
-        turns.append({"role": "assistant", "text": f"好的,第{i}条我听着。"})
+    for i, (fact, _anchor) in enumerate(_FACTS):
+        turns.append({"role": "user", "text": f"{fact}。"})
+        turns.append({"role": "assistant", "text": "嗯,记下了。"})
+        if i % 3 == 2:
+            turns.append({"role": "user", "text": "对了随便说说,今天天气还不错。"})
+            turns.append({"role": "assistant", "text": "是啊,适合出去走走。"})
     turns += [
-        {"role": "user", "text": f"最后,{_ANCHOR_TAIL},它这两天不吃饭。"},
-        {"role": "assistant", "text": "记得带它去检查,别拖。"},
+        {"role": "user", "text": "差不多就这些,先挂了。"},
+        {"role": "assistant", "text": "好,注意休息。"},
     ]
     return turns
 
@@ -129,11 +140,17 @@ def main() -> int:
                     break
         blob = str(cards_found)
         check("C. 花园落卡", bool(cards_found), f"卡数={len(cards_found)}")
-        check("C2. 头部锚点成卡", _ANCHOR_HEAD[:4] in blob or "黛蓝" in blob, _ANCHOR_HEAD)
-        check("C3. **中段锚点成卡(证明蒸的是全文而非预览)**",
-              "上海" in blob or "插画展" in blob, _ANCHOR_MIDDLE)
-        check("C4. 尾部锚点成卡", "年糕" in blob or "宠物医院" in blob, _ANCHOR_TAIL)
-
+        hit = [a for _f, a in _FACTS if a in blob]
+        miss = [a for _f, a in _FACTS if a not in blob]
+        coverage = len(hit) / len(_FACTS)
+        print(f"     命中 {len(hit)}/{len(_FACTS)}: {hit}")
+        print(f"     漏掉: {miss}")
+        # 核心断言:信息密度高的通话必须产出多张卡。只出一两张说明记忆按"挑最
+        # 重要的一件"在工作,那对一小时的通话是不可接受的稀疏。
+        check("C2. 多张卡(信息密集的通话不该只留一两张)", len(cards_found) >= 5,
+              f"卡数={len(cards_found)}")
+        check("C3. 事实覆盖率 ≥ 50%", coverage >= 0.5,
+              f"{len(hit)}/{len(_FACTS)} = {coverage:.0%}")
         if cards_found:
             ids = [i.get("id") for i in cards_found[:5] if i.get("id")]
             r = c.post("/v1/memory/fetch", json={"ids": ids})

@@ -4788,7 +4788,17 @@ def _render_capture_line(message: dict, voice_transcripts: dict,
             voice_transcripts[call_id], budget=_VOICE_TRANSCRIPT_PROMPT_CHARS
         )
         turns = message.get("voice_turn_count")
-        header = "【语音通话逐字记录" + (f"，共 {turns} 轮" if turns else "") + "】"
+        # 通话不是聊天窗口。capture 的提示词里那句「宁少勿多、只留一到两件」是
+        # 为 20 分钟闲聊写的,对一通电话是错的量纲:实测 12 件明确值得记的事
+        # 只留下 2 件(2026-08-07 探针)。这里不改提示词(那会影响所有 capture),
+        # 只把「这段是什么」告诉模型,让它自己把尺子换过来。
+        header = (
+            "【语音通话逐字记录" + (f"，共 {turns} 轮" if turns else "") + "】\n"
+            "以下是一通完整电话的逐字记录，不是一段闲聊。电话的信息密度通常远高于"
+            "日常对话：一通里可能有好几件彼此独立、都值得记住的事（承诺、计划、"
+            "家人、身体、习惯的改变……）。请逐件判断，不要为了「宁少勿多」把它们"
+            "归纳成一两张卡；但同一件事的多个侧面仍然应该合成一张厚卡。"
+        )
         return f"{header}\n{body}"
     label = transcript_speaker_label(
         str(message.get("role") or ""), user_name=user_name, ai_name=ai_name

@@ -11749,7 +11749,17 @@ def _capture_window_text(messages: list[dict], *, user_label: str = "TA", agent_
             # 蒸整通电话而不是开头几句。取不到就让整个 job 失败重试（游标不动）。
             body = _bounded_voice_transcript(_capture_voice_transcript_text(call_id))
             turns = msg.get("voice_turn_count")
-            header = "【语音通话逐字记录" + (f"，共 {turns} 轮" if turns else "") + "】"
+            # 通话不是聊天窗口。capture 的提示词里那句「宁少勿多、只留一到两件」是
+            # 为 20 分钟闲聊写的,对一通电话是错的量纲:实测 12 件明确值得记的事
+            # 只留下 2 件(2026-08-07 探针)。这里不改提示词(那会影响所有 capture),
+            # 只把「这段是什么」告诉模型,让它自己把尺子换过来。
+            header = (
+                "【语音通话逐字记录" + (f"，共 {turns} 轮" if turns else "") + "】\n"
+                "以下是一通完整电话的逐字记录，不是一段闲聊。电话的信息密度通常远高于"
+                "日常对话：一通里可能有好几件彼此独立、都值得记住的事（承诺、计划、"
+                "家人、身体、习惯的改变……）。请逐件判断，不要为了「宁少勿多」把它们"
+                "归纳成一两张卡；但同一件事的多个侧面仍然应该合成一张厚卡。"
+            )
             lines.append(f"- [{_format_message_time(ts)}] {header}\n{body}")
             continue
         lines.append(
