@@ -555,6 +555,65 @@ def cmd_cancel_wake(args):
     _emit({"ok": False, "http_status": status, "error": body}, 1)
 
 
+_IMAGE_FAILURE_HINT = (
+    "图没有生成。请如实告诉用户,或换一个更清楚的画面描述再调一次;"
+    "不要声称图已经生成。"
+)
+
+
+def cmd_generate_image(args):
+    """用用户配置的专用生图模型画一张图,存到出站目录。POST /v1/image-generation/generate。
+
+    伴侣自己决定什么时候画、prompt 怎么写 —— 这个动词只是把能力交到它手上。
+    成功后仍要用 send-image 交付,和它自己产出的图走同一条投递路径。
+    """
+    api_url, auth = _require_backend()
+    prompt = str(args.prompt or "").strip()
+    if not prompt:
+        _emit({"ok": False, "error": "generate-image needs a non-empty --prompt"}, 2)
+    status, body = _http_json(
+        "POST", f"{api_url}/v1/image-generation/generate", auth,
+        payload={"prompt": prompt[:8000]}, timeout=180)
+    if status != 200:
+        # 失败如实交回:伴侣据此自己跟用户解释,或换个描述再试。
+        _emit({"ok": False, "http_status": status, "error": body,
+               "hint": _IMAGE_FAILURE_HINT}, 1)
+    # 后端契约(hosted/image_generator.py:162)是 images[].data_base64/mime_type/name。
+    # 早先这里照 media[].data_b64/mime 写 —— 字段全不对,任何一次真实调用都会
+    # 停在 "returned no media",伴侣会以为是模型不会画。codex 审出。
+    images = (body or {}).get("images") or []
+    if not images:
+        _emit({"ok": False, "error": "image route returned no images",
+               "hint": _IMAGE_FAILURE_HINT}, 1)
+    # 必须落在 $FEEDLING_HOME/outbound-files:send-image 经 IPC 只接受这个目录
+    # (consumer 的 path_outside_outbound_dir 闸)。写 /tmp 的话生成永远交付不出去,
+    # 而且 hosted 多用户共享 /tmp 还会串图。
+    outbound = Path(_resident_ipc_home()) / "outbound-files"
+    try:
+        outbound.mkdir(parents=True, exist_ok=True)
+    except Exception as exc:  # noqa: BLE001
+        _emit({"ok": False, "error": f"could not prepare outbound dir: {str(exc)[:120]}"}, 1)
+    saved = []
+    for idx, item in enumerate(images, start=1):
+        b64 = str((item or {}).get("data_base64") or "")
+        if not b64:
+            continue
+        mime = str((item or {}).get("mime_type") or "image/png")
+        ext = {"image/png": "png", "image/jpeg": "jpg", "image/webp": "webp"}.get(mime, "png")
+        # 唯一文件名:秒级时间戳在连续两次生图/多用户共享目录下会互相覆盖。
+        path = outbound / f"generated_{uuid.uuid4().hex[:12]}_{idx}.{ext}"
+        try:
+            path.write_bytes(base64.b64decode(b64))
+        except Exception as exc:  # noqa: BLE001
+            _emit({"ok": False, "error": f"could not save image: {str(exc)[:120]}"}, 1)
+        saved.append(str(path))
+    if not saved:
+        _emit({"ok": False, "error": "image route returned no usable bytes",
+               "hint": _IMAGE_FAILURE_HINT}, 1)
+    _emit({"ok": True, "paths": saved,
+           "next": "call send-image --path <path> to deliver it"})
+
+
 def cmd_voice_transcript_list(args):
     """Archived voice calls, newest first (metadata only). GET /v1/voice/transcripts."""
     api_url, auth = _require_backend()
@@ -1858,6 +1917,11 @@ def main():
     mf.add_argument("--include-archived", dest="include_archived", action="store_true", help="include archived cards in results")
     mf.add_argument("--include-superseded", dest="include_superseded", action="store_true", help="include superseded/corrected versions")
     mf.set_defaults(func=cmd_memory_fetch)
+
+    gi = sub.add_parser("generate-image",
+                        help="Draw an image with the user's dedicated image model.")
+    gi.add_argument("--prompt", required=True, help="complete visual description")
+    gi.set_defaults(func=cmd_generate_image)
 
     vtl = sub.add_parser("voice-transcript-list",
                          help="Archived voice calls, newest first (metadata only).")

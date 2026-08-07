@@ -10,6 +10,19 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **The companion now decides when to generate an image.** Image generation is
+  no longer triggered by keyword matching on the user's message, and a dedicated
+  image route no longer bypasses the main model. The companion calls an image
+  tool itself — `generate_image` on Runtime V2, `io_cli.py generate-image` on
+  Runtime V1 and self-hosted CLI residents — writes its own prompt, and its
+  accompanying words are delivered together with the picture in one reply
+  instead of being discarded. It may also generate an image without an explicit
+  request. Generation failures are returned to the companion as a tool result so
+  it can explain them in its own words rather than ending the turn; a reply that
+  claims an image was produced when none was is returned once for correction,
+  and is then delivered as written. `POST /v1/image-generation/generate` and the
+  existing encrypted image-delivery path are unchanged.
+
 - **Failed voice calls now have an explicit, idempotent cancellation path.**
   `POST /v1/voice/cancel` installs a durable per-call tombstone, clears
   unarchived turn/result rows, and suppresses late resident or Hosted Runtime

@@ -1525,53 +1525,18 @@ def test_generate_image_tool_publishes_terminal_media(monkeypatch):
     assert outcome.delivered_media_count == 1
 
 
-def test_generate_image_tool_failure_does_not_publish_text(monkeypatch):
-    provider = _ScriptedProvider(
-        [
-            {
-                "reply": "Image",
-                "tool_calls": [
-                    {
-                        "id": "image-call-1",
-                        "name": "generate_image",
-                        "args": {"prompt": "a small red robot"},
-                    }
-                ],
-                "usage": {},
-            }
-        ]
-    )
-    monkeypatch.setattr(provider_client, "chat_completion_async", provider)
-    published = []
+def test_image_tool_call_publishes_the_companion_words_with_the_picture(monkeypatch):
+    """图和话是一次表达的两半。
 
-    async def unavailable(_args):
-        raise RuntimeError("image generation model required")
-
-    async def on_reply(text, *, final, reasoning="", media=()):
-        published.append((text, final, tuple(media)))
-
-    with pytest.raises(RuntimeError, match="image generation model required"):
-        asyncio.run(
-            tool_loop.run_tool_loop(
-                provider_config=_TEST_PROVIDER_CONFIG,
-                build_messages=_RecordingBuildMessages(),
-                dispatch_tools=_RecordingDispatch(),
-                on_reply=on_reply,
-                fold_new_messages=_RecordingFold([]),
-                add_usage=_noop_add_usage,
-                on_image_reply=unavailable,
-                max_calls=2,
-            )
-        )
-
-    # The provider's accompanying "Image" text is preamble, never a chat bubble.
-    assert published == []
-
-
-def test_required_image_generation_routes_text_placeholder_to_image_callback(monkeypatch):
-    provider = _ScriptedProvider(
-        [{"reply": "Image", "tool_calls": [], "usage": {}}]
-    )
+    这里原本硬编码空字符串,所以**即使模型正确调用了工具**,用户也只收到一张
+    孤零零的图(2026-08-08 修)。
+    """
+    provider = _ScriptedProvider([{
+        "reply": "这是我想象中自己的样子",
+        "tool_calls": [{"id": "c1", "name": "generate_image",
+                        "args": {"prompt": "a quiet self portrait"}}],
+        "usage": {},
+    }])
     monkeypatch.setattr(provider_client, "chat_completion_async", provider)
     published = []
     image_calls = []
@@ -1592,49 +1557,134 @@ def test_required_image_generation_routes_text_placeholder_to_image_callback(mon
             fold_new_messages=_RecordingFold([]),
             add_usage=_noop_add_usage,
             on_image_reply=on_image_reply,
-            required_image_generation_prompt="生成一张海边日落图片",
             max_calls=2,
         )
     )
 
-    assert image_calls == [{"prompt": "生成一张海边日落图片"}]
-    assert published == [
-        (
-            "",
-            True,
-            (ProviderMedia("image/png", "aW1hZ2U=", "result.png"),),
-        )
-    ]
+    # prompt 由伴侣自己写,不是用户原话
+    assert image_calls == [{"prompt": "a quiet self portrait"}]
+    assert published == [(
+        "这是我想象中自己的样子", True,
+        (ProviderMedia("image/png", "aW1hZ2U=", "result.png"),),
+    )]
     assert outcome.stop_reason == "final_media"
-    assert outcome.delivered_media_count == 1
 
 
-def test_required_image_generation_failure_never_publishes_placeholder(monkeypatch):
-    provider = _ScriptedProvider(
-        [{"reply": "Image", "tool_calls": [], "usage": {}}]
-    )
+def test_image_generation_failure_is_handed_back_instead_of_killing_the_turn(monkeypatch):
+    """失败是伴侣该知道的事实,不是 runtime 替它隐藏的意外。
+
+    原来直接 raise 打断整轮:用户既没有图也没有一句解释,而它根本不知道发生过
+    什么。现在结构化失败回灌成工具结果,它下一轮自己跟用户解释。
+    """
+    provider = _ScriptedProvider([
+        {"reply": "", "tool_calls": [{"id": "c1", "name": "generate_image",
+                                      "args": {"prompt": "a cat"}}], "usage": {}},
+        {"reply": "抱歉,这次没画成", "tool_calls": [], "usage": {}},
+    ])
     monkeypatch.setattr(provider_client, "chat_completion_async", provider)
     published = []
 
-    async def unavailable(_args):
-        raise RuntimeError("image generation model required")
+    async def on_image_reply(args):
+        raise RuntimeError("image route exploded")
 
     async def on_reply(text, *, final, reasoning="", media=()):
         published.append((text, final, tuple(media)))
 
-    with pytest.raises(RuntimeError, match="image generation model required"):
-        asyncio.run(
-            tool_loop.run_tool_loop(
-                provider_config=_TEST_PROVIDER_CONFIG,
-                build_messages=_RecordingBuildMessages(),
-                dispatch_tools=_RecordingDispatch(),
-                on_reply=on_reply,
-                fold_new_messages=_RecordingFold([]),
-                add_usage=_noop_add_usage,
-                on_image_reply=unavailable,
-                required_image_generation_prompt="draw a small red robot image",
-                max_calls=2,
-            )
+    asyncio.run(
+        tool_loop.run_tool_loop(
+            provider_config=_TEST_PROVIDER_CONFIG,
+            build_messages=_RecordingBuildMessages(),
+            dispatch_tools=_RecordingDispatch(),
+            on_reply=on_reply,
+            fold_new_messages=_RecordingFold([]),
+            add_usage=_noop_add_usage,
+            on_image_reply=on_image_reply,
+            max_calls=3,
         )
+    )
 
-    assert published == []
+    assert any("没画成" in text for text, _f, _m in published), (
+        "生图失败必须交回给伴侣,让它自己说 —— 而不是打断整轮"
+    )
+
+
+def test_unbacked_image_claim_is_bounced_once_then_let_through(monkeypatch):
+    """说了没做要纠正,但**只纠正一次**;再撒谎照原样发出,不拿 runtime 跟模型较劲。"""
+    provider = _ScriptedProvider([
+        {"reply": "图片已经生成", "tool_calls": [], "usage": {}},
+        {"reply": "图片已经生成", "tool_calls": [], "usage": {}},
+    ])
+    monkeypatch.setattr(provider_client, "chat_completion_async", provider)
+    published = []
+
+    async def on_reply(text, *, final, reasoning="", media=()):
+        published.append((text, final, tuple(media)))
+
+    asyncio.run(
+        tool_loop.run_tool_loop(
+            provider_config=_TEST_PROVIDER_CONFIG,
+            build_messages=_RecordingBuildMessages(),
+            dispatch_tools=_RecordingDispatch(),
+            on_reply=on_reply,
+            fold_new_messages=_RecordingFold([]),
+            add_usage=_noop_add_usage,
+            on_image_reply=None,
+            max_calls=2,
+        )
+    )
+
+    assert len(provider.calls) == 2, "谎报必须打回一次(而不是零次或无限次)"
+    # 纠正指令确实注入了,而不是空转一轮
+    second_round = provider.calls[1]["config"] if False else provider.calls[1]
+    assert any(
+        "不要用文字假装图已经存在" in str(m.get("content", ""))
+        for m in second_round["messages"] if isinstance(m, dict)
+    ), "打回那一轮必须把纠正说清楚"
+    assert published and published[-1][0] == "图片已经生成", (
+        "第二次仍撒谎就照原样发出 —— 那是模型的问题,不是 runtime 继续纠缠的理由"
+    )
+
+
+def test_superseded_image_final_folds_like_a_text_final_not_a_turn_failure(monkeypatch):
+    """用户在生图期间又说话了 —— 这一轮要安静地折进下一轮,不是报错。
+
+    文本终局撞上 late input 时走 fold/retry(tool_loop:1118);图片终局起初让
+    FinalReplySuperseded 直接冒泡,worker 会当成通用失败 —— mark_failed + 给用户
+    一个报错气泡。**生图耗时长,撞上 late input 的概率比文本高得多**,这条差异
+    会被真实用户高频撞到。codex 审出。
+    """
+    provider = _ScriptedProvider([
+        {"reply": "给你画了一张", "tool_calls": [
+            {"id": "c1", "name": "generate_image", "args": {"prompt": "a cat"}}],
+         "usage": {}},
+        {"reply": "刚说到哪儿了?", "tool_calls": [], "usage": {}},
+    ])
+    monkeypatch.setattr(provider_client, "chat_completion_async", provider)
+    published = []
+    dispatched = _RecordingDispatch()
+
+    async def on_image_reply(args):
+        return (ProviderMedia("image/png", "aW1hZ2U=", "result.png"),)
+
+    async def on_reply(text, *, final, reasoning="", media=()):
+        if media and not published:
+            # 第一次带图的终局被抢占(用户已经说了新话)
+            raise tool_loop.FinalReplySuperseded()
+        published.append((text, final, tuple(media)))
+
+    outcome = asyncio.run(
+        tool_loop.run_tool_loop(
+            provider_config=_TEST_PROVIDER_CONFIG,
+            build_messages=_RecordingBuildMessages(),
+            dispatch_tools=dispatched,
+            on_reply=on_reply,
+            fold_new_messages=_RecordingFold([]),
+            add_usage=_noop_add_usage,
+            on_image_reply=on_image_reply,
+            max_calls=3,
+        )
+    )
+
+    # 被抢占的那轮**没有**变成异常,而是回到外层重答了新的对话
+    assert published == [("刚说到哪儿了?", True, ())]
+    assert outcome.stop_reason != "final_media"
