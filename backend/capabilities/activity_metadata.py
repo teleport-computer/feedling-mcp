@@ -6,6 +6,8 @@ from typing import Any, Mapping
 from memory.prompts_v1 import COMMON_BUCKETS_V1
 
 
+_HISTORY_TOOL_NAMES = frozenset({"history_search", "history_fetch"})
+
 _MEMORY_CATEGORY_KEYS = (
     "work",
     "growth",
@@ -78,3 +80,30 @@ def memory_result_metadata(tool_name: str, result: Mapping[str, Any]) -> dict:
         {"key": key, "count": counts[key]} for key in ordered_keys
     ]
     return metadata
+
+
+def history_result_metadata(tool_name: str, result: Mapping[str, Any]) -> dict:
+    """Content-free raw-row accounting for the chat turn's history budget.
+
+    The worker's ``_HistoryTurnBudget`` accumulates rows across provider
+    rounds (spec §5) but only ever sees the executor's ``ToolResult``; this
+    projects the trusted capability payload's counters into result metadata
+    without retaining any decrypted text. ``history_search`` charges the
+    enclave-confirmed ``scanned_count``; ``history_fetch`` charges the
+    anchor plus every neighbor row it decrypted.
+    """
+    if str(tool_name) not in _HISTORY_TOOL_NAMES:
+        return {}
+    if not isinstance(result, Mapping) or result.get("ok") is not True:
+        return {}
+    data = result.get("data")
+    if not isinstance(data, Mapping):
+        return {}
+    if str(tool_name) == "history_search":
+        scanned = data.get("scanned_count")
+        rows = scanned if isinstance(scanned, int) and not isinstance(scanned, bool) else 0
+    else:
+        before = data.get("before") if isinstance(data.get("before"), list) else []
+        after = data.get("after") if isinstance(data.get("after"), list) else []
+        rows = 1 + len(before) + len(after)
+    return {"history_scanned_rows": max(0, rows)}

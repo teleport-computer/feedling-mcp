@@ -15,6 +15,7 @@ from typing import Any
 
 from capabilities import registry as cap_registry
 from capabilities import tool_schema
+from capabilities import history as cap_history
 from capabilities import identity as cap_identity
 from capabilities import activity_metadata
 from model_api_runtime.v2 import provenance as _prov
@@ -118,6 +119,15 @@ async def dispatch_tool_calls(
     observe_photo=None,
     read_parallelism: int = 4,
     identity_write_authorization: bool = True,
+    # History tools' dispatch gate (spec §6): catalog omission is the
+    # provider-facing control; this flag is the independent fail-closed
+    # boundary. Default False means every caller that does not explicitly
+    # opt in (wake lane, subagents, direct/broken-relay callers) rejects
+    # history calls even when the tool names are otherwise valid reads.
+    # Only the chat lane passes True, and only while the kill switch is ON —
+    # so with the switch OFF, or for any non-history tool, the gate branch
+    # below never changes behavior.
+    history_tools_allowed: bool = False,
 ) -> list[ToolResult]:
     """Dispatch provider tool_calls (spec C3). READ_ACTIONS run inline-parallel (their content
     feeds back to the model); WRITE_ACTIONS pass the provenance write_gate then are ENQUEUED as
@@ -143,6 +153,13 @@ async def dispatch_tool_calls(
             )
             results_by_id[tc.id] = ToolResult(
                 call_id=tc.id, content=content
+            )
+        elif tc.name in cap_history.HISTORY_TOOL_NAMES and not history_tools_allowed:
+            # Dispatch half of the history double gate. Same word as the
+            # facade's kill-switch rejection so the model sees one stable
+            # vocabulary regardless of which layer stopped the call.
+            results_by_id[tc.id] = ToolResult(
+                call_id=tc.id, content="error: tool_not_allowed"
             )
         elif tc.name in cap_registry.READ_ACTIONS:
             reads.append(tc)
@@ -206,7 +223,11 @@ async def dispatch_tool_calls(
                         },
                     }
             content = _summarize_capability_result(data, tool_name=tc.name)
-            metadata = activity_metadata.memory_result_metadata(tc.name, data) or None
+            metadata = (
+                activity_metadata.memory_result_metadata(tc.name, data)
+                or activity_metadata.history_result_metadata(tc.name, data)
+                or None
+            )
         except Exception:  # noqa: BLE001 — isolate one bad read; never expose its exception
             # Read calls are independent and side-effect-free.  A capability bug or
             # adapter failure must not discard successful sibling results or fail the

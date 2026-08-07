@@ -59,6 +59,7 @@ import provider_client
 import provider_health
 from notices import catalog as notices_catalog
 from provider_types import MCP_TRANSPORT_FAILURE_ERROR, ToolExchange, ToolResult
+from capabilities import history as cap_history
 from capabilities import registry as cap_registry
 from capabilities import tool_schema as cap_tool_schema
 from core import chat_activity as core_chat_activity
@@ -488,6 +489,14 @@ if not math.isfinite(MCP_TURN_WALL_BUDGET_SEC) or MCP_TURN_WALL_BUDGET_SEC <= 0:
     raise RuntimeError(
         "FEEDLING_V2_MCP_TURN_WALL_BUDGET_SEC must be positive and finite"
     )
+# History tools' cumulative per-chat-turn budget (spec §5): raw rows OR wall
+# seconds, whichever exhausts first,累计跨 provider round（两工具合计）。
+# Exhaustion is not a turn failure — later history calls get a short error
+# while every other tool keeps working.
+HISTORY_TURN_MAX_ROWS = _positive_int_env("FEEDLING_V2_HISTORY_TURN_MAX_ROWS", "1500")
+HISTORY_TURN_MAX_WALL_SEC = _positive_float_env(
+    "FEEDLING_V2_HISTORY_TURN_MAX_WALL_SEC", "8"
+)
 # 跨所有 job 共享的 enclave 并发闸（provider-key 解密 + chat 解密 + capability 调用都过它）。治 R3。
 ENCLAVE_CONCURRENCY = _positive_int_env("FEEDLING_V2_ENCLAVE_CONCURRENCY", "2")
 ENCLAVE_SEMAPHORE = asyncio.Semaphore(ENCLAVE_CONCURRENCY)
@@ -676,6 +685,11 @@ _PRIVATE_READ_TOOLS = frozenset(
         "memory_index",
         "memory_search",
         "memory_fetch",
+        # Raw chat history is the most private read of all (spec §6): once the
+        # model has observed it, later outbound web/MCP/task calls are fenced
+        # for the rest of the turn via tool_loop's shared private-read boundary.
+        cap_history.HISTORY_SEARCH_TOOL,
+        cap_history.HISTORY_FETCH_TOOL,
         cap_tool_schema.PROVIDER_USAGE_TOOL,
     }
 )
@@ -1408,6 +1422,89 @@ class _McpTurnWallBudget:
     def finish_call(self, started_at: float) -> None:
         elapsed = max(0.0, float(self.clock()) - float(started_at))
         self.used_sec = min(self.limit_sec, self.used_sec + elapsed)
+
+
+@dataclass
+class _HistoryTurnBudget:
+    """Cumulative history-tool budget shared by one chat turn (spec §5).
+
+    Raw rows and wall seconds accumulate across provider rounds for BOTH
+    history tools combined; whichever limit is reached first stops later
+    history calls (short error, never a turn failure). ``lock`` keeps history
+    calls serial through the executor even if a future dispatcher overlaps
+    platform reads — today the per-round single-call gate plus strictly
+    sequential provider rounds already imply serial execution, so the lock is
+    a cheap invariant, not the mechanism. Rows are charged from the trusted
+    capability metadata (``history_scanned_rows``); wall time is charged
+    around the whole executor dispatch, which deliberately over-counts DB and
+    transport time — conservative in the same direction as
+    ``_McpTurnWallBudget``.
+    """
+
+    max_rows: int
+    max_wall_sec: float
+    clock: Callable[[], float] = time.monotonic
+    used_rows: int = 0
+    used_sec: float = 0.0
+
+    def __post_init__(self) -> None:
+        self.max_rows = int(self.max_rows)
+        self.max_wall_sec = float(self.max_wall_sec)
+        if self.max_rows <= 0:
+            raise ValueError("history turn row budget must be positive")
+        if not math.isfinite(self.max_wall_sec) or self.max_wall_sec <= 0:
+            raise ValueError("history turn wall budget must be positive and finite")
+        self.lock = asyncio.Lock()
+
+    def exhausted(self) -> bool:
+        return self.used_rows >= self.max_rows or self.used_sec >= self.max_wall_sec
+
+    def start_call(self) -> float:
+        return float(self.clock())
+
+    def finish_call(self, started_at: float, *, scanned_rows: int = 0) -> None:
+        elapsed = max(0.0, float(self.clock()) - float(started_at))
+        self.used_sec += elapsed
+        self.used_rows += max(0, int(scanned_rows))
+
+
+_HISTORY_ROUND_LIMIT_ERROR = (
+    "error: history_round_limit; only one history call is allowed per round — "
+    "re-issue this call in the next round"
+)
+_HISTORY_TURN_BUDGET_ERROR = (
+    "error: history_turn_budget_exhausted; continue with next_cursor in a "
+    "later turn"
+)
+
+
+def _history_round_blocked_results(tool_calls, *, budget) -> dict[str, ToolResult]:
+    """Round half of the spec §5 history gate, decided in provider order.
+
+    Returns ``{call_id: ToolResult}`` for history calls that must NOT dispatch
+    this round: every history call once the turn budget is exhausted, otherwise
+    every history call after the first. Deciding on the whole batch here (not
+    per-coroutine) keeps "which call was first" deterministic under the mixed
+    dispatcher's read overlap. Non-history calls are never touched, so with the
+    feature disabled this function returns an empty mapping and the round
+    behaves exactly as before.
+    """
+    blocked: dict[str, ToolResult] = {}
+    seen_allowed = False
+    for tc in tool_calls:
+        if str(getattr(tc, "name", "")) not in cap_history.HISTORY_TOOL_NAMES:
+            continue
+        if budget is not None and budget.exhausted():
+            blocked[str(tc.id)] = ToolResult(
+                call_id=tc.id, content=_HISTORY_TURN_BUDGET_ERROR
+            )
+        elif seen_allowed:
+            blocked[str(tc.id)] = ToolResult(
+                call_id=tc.id, content=_HISTORY_ROUND_LIMIT_ERROR
+            )
+        else:
+            seen_allowed = True
+    return blocked
 
 
 def _mcp_mutating_names_for_turn(mcp_turn) -> frozenset[str]:
@@ -7589,6 +7686,13 @@ async def _run_wake(
         wake_disabled_tool_names = wake_disabled_web_tool_names | {
             cap_tool_schema.PROVIDER_USAGE_TOOL,
             cap_tool_schema.MEMORY_ORGANIZE_TOOL,
+            # History tools are chat-lane only (spec §6 offer gate): the
+            # proactive companion must never browse raw history on its own.
+            # Withheld unconditionally — not tied to the kill switch — and the
+            # executor's dispatch gate (history_tools_allowed defaults False)
+            # backstops any direct call that skips this catalog.
+            cap_history.HISTORY_SEARCH_TOOL,
+            cap_history.HISTORY_FETCH_TOOL,
         }
 
         dispatch_task_batch = _make_task_batch_dispatcher(
@@ -10852,15 +10956,32 @@ async def process_job(
             if provider_usage_halted
             else frozenset()
         )
+        # History kill switch, offer-time half (spec §6). Resolved ONCE per
+        # turn so the offer gate and the dispatch gate below cannot disagree
+        # mid-turn; default ON — this is a rollback valve, not a feature gate.
+        history_tools_offered = cap_history.enabled()
+        disabled_history_tool_names = (
+            frozenset()
+            if history_tools_offered
+            else frozenset(cap_history.HISTORY_TOOL_NAMES)
+        )
         disabled_tool_names_for_turn = (
             frozenset(disabled_mutation_tool_names)
             | disabled_web_tool_names
             | disabled_provider_usage_tool_names
+            | disabled_history_tool_names
         )
         # Shared across every provider round in this chat turn. A per-dispatch
         # budget would reset whenever the model asks for another tool batch and
         # would therefore fail to bound the whole-turn MCP contribution.
         mcp_wall_budget = _McpTurnWallBudget(MCP_TURN_WALL_BUDGET_SEC)
+        # Same lifetime for the history row/wall budget (spec §5): one object
+        # spans every provider round, so paging with next_cursor inside a turn
+        # keeps accumulating instead of resetting per round.
+        history_turn_budget = _HistoryTurnBudget(
+            max_rows=HISTORY_TURN_MAX_ROWS,
+            max_wall_sec=HISTORY_TURN_MAX_WALL_SEC,
+        )
 
         pending_schedule_results = None
         if deps.read_pending_scheduled_wake_context is not None:
@@ -10932,12 +11053,56 @@ async def process_job(
             for tc in tool_calls:
                 action_digest.setdefault(tc.name, {"ok": 0, "count": 0})["count"] += 1
 
+            async def _dispatch_history_one(tc) -> ToolResult:
+                # History reads only (never a write): serial lock + cumulative
+                # turn accounting (spec §5). The batch-level round gate below
+                # admits at most one history call per provider round; the lock
+                # keeps the serial invariant explicit anyway. Rows come back
+                # via the trusted capability metadata channel; wall time is
+                # charged around the whole dispatch. The re-check under the
+                # lock covers a budget exhausted by an earlier round after the
+                # round gate already ran.
+                async with history_turn_budget.lock:
+                    if history_turn_budget.exhausted():
+                        return ToolResult(
+                            call_id=tc.id, content=_HISTORY_TURN_BUDGET_ERROR
+                        )
+                    started_at = history_turn_budget.start_call()
+                    scanned_rows = 0
+                    try:
+                        (result,) = await v2_executor.dispatch_tool_calls(
+                            [tc],
+                            store=store,
+                            api_key=api_key,
+                            runtime_token=runtime_token,
+                            enclave_sem=enclave_sem,
+                            turn_authorization=(mutation_recovery_barrier is None),
+                            enqueue_write_effect=_enqueue_write_effect,
+                            before_write=_before_write,
+                            observe_photo=observe_photo,
+                            read_parallelism=1,
+                            # Dispatch half of the double gate: chat lane, and
+                            # only while the switch resolved ON for this turn.
+                            history_tools_allowed=history_tools_offered,
+                        )
+                        rows = (result.metadata or {}).get("history_scanned_rows")
+                        if isinstance(rows, int) and not isinstance(rows, bool):
+                            scanned_rows = rows
+                    finally:
+                        effect_reservations.mark_ready(tc)
+                        history_turn_budget.finish_call(
+                            started_at, scanned_rows=scanned_rows
+                        )
+                return result
+
             async def _dispatch_platform_one(tc) -> ToolResult:
                 # One call per coroutine lets platform reads share the exact same
                 # worker-level gate as MCP reads. Executor still owns validation,
                 # provenance, encrypted outbox writes, and terminal write failures.
                 if tc.name == cap_tool_schema.MEMORY_ORGANIZE_TOOL:
                     return await _dispatch_memory_organize_tool(user_id, tc)
+                if tc.name in cap_history.HISTORY_TOOL_NAMES:
+                    return await _dispatch_history_one(tc)
                 try:
                     (result,) = await v2_executor.dispatch_tool_calls(
                         [tc],
@@ -11147,6 +11312,36 @@ async def process_job(
                             "phase": "mutation_recovery_blocked",
                             "result": result,
                         },
+                    )
+
+            # Round half of the history gate (spec §5): at most one history
+            # call per provider round, and none once the turn budget is spent.
+            # Decided on the batch in provider order (deterministic under read
+            # overlap); blocked calls never reach the executor. Same
+            # blocked_by_id merge as mutation recovery above.
+            history_blocked = _history_round_blocked_results(
+                dispatchable_calls, budget=history_turn_budget
+            )
+            if history_blocked:
+                blocked_by_id.update(history_blocked)
+                dispatchable_calls = [
+                    tc
+                    for tc in dispatchable_calls
+                    if str(tc.id) not in history_blocked
+                ]
+                for tc in tool_calls:
+                    result = history_blocked.get(str(tc.id))
+                    if result is None:
+                        continue
+                    await chat_tool_activity_callback(
+                        tc,
+                        "tool_call_started",
+                        {"phase": "history_budget_blocked"},
+                    )
+                    await chat_tool_activity_callback(
+                        tc,
+                        "tool_call_result",
+                        {"phase": "history_budget_blocked", "result": result},
                     )
 
             dispatched = await _dispatch_mixed_tool_calls(
