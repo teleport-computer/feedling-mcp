@@ -47,6 +47,17 @@
 
 ## 记录正文（最新的在上面）
 
+## 2026-08-07 — 语音挂断取消与迟到回复隔离
+
+**[DONE] 失败通话不再把迟到 AI 回复写进普通聊天。**
+
+- 新增幂等 `POST /v1/voice/cancel` 和持久 call lifecycle tombstone；取消会
+  清理未归档逐轮消息及临时语音结果。
+- Resident 与 Hosted Runtime V2 都在最终消息事务内检查 lifecycle，并把
+  `voice_call_id`、`voice_turn_id`、`reply_to_message_id` 完整落到回复行。
+- finalize 在写 archive/card 前先取得 lifecycle；cancel 与 finalize 只会有
+  一个赢家，不会出现 cancelled 状态却残留半套归档。
+
 ## 2026-08-07 — Dashboard 卡片语义修正（prod 第二日实景反馈）
 
 **[FEEDBACK] 四处「数字对不上/误导」全部修正，根因都是口径与分母。**

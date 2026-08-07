@@ -10,6 +10,13 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **Failed voice calls now have an explicit, idempotent cancellation path.**
+  `POST /v1/voice/cancel` installs a durable per-call tombstone, clears
+  unarchived turn/result rows, and suppresses late resident or Hosted Runtime
+  V2 replies before chat insertion. Finalize and cancel claim one lifecycle
+  winner before archive writes, so cancellation cannot downgrade a call whose
+  archive already won.
+
 - **Runtime V2 Chat now applies matching World Book entries.** Matches use the
   current user turn and enter the prompt as a standalone, untrusted setting-data
   block rather than changing the user's message. Oversized matched context is

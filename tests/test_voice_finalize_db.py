@@ -6,12 +6,15 @@ model; that half is covered by the local e2e.)"""
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import json
+import threading
 import time
 import uuid
 from types import SimpleNamespace
 
 import db
+import pytest
 from voice import routes_asgi
 from voice import cleanup as summary
 
@@ -34,6 +37,171 @@ def _append(uid: str, doc: dict) -> str:
     msg_id = uuid.uuid4().hex
     db.chat_append_strict(uid, msg_id, time.time(), dict(doc, id=msg_id), 200)
     return msg_id
+
+
+def test_resident_voice_reply_is_correlated_and_cancelled_reply_is_suppressed():
+    uid = _seed_user()
+    active_call = "vcall_" + uuid.uuid4().hex[:10]
+    db.voice_call_create_active(uid, active_call)
+    active_parent = _append(uid, {
+        "role": "user",
+        "source": "chat",
+        "voice_call_id": active_call,
+        "voice_turn_id": "1",
+    })
+    reply_doc = {
+        "id": "resident-" + uuid.uuid4().hex,
+        "role": "openclaw",
+        "source": "chat",
+        "body_ct": "ciphertext",
+    }
+    finalized = db.chat_finalize_reply_once(
+        uid,
+        active_parent,
+        reply_doc["id"],
+        time.time() + 1,
+        reply_doc,
+        {
+            "reply_status": "replied",
+            "reply_message_id": reply_doc["id"],
+        },
+    )
+    assert finalized is not None
+    _parent, persisted = finalized
+    assert persisted["reply_to_message_id"] == active_parent
+    assert persisted["voice_call_id"] == active_call
+    assert persisted["voice_turn_id"] == "1"
+
+    cancelled_call = "vcall_" + uuid.uuid4().hex[:10]
+    db.voice_call_create_active(uid, cancelled_call)
+    cancelled_parent = _append(uid, {
+        "role": "user",
+        "source": "chat",
+        "voice_call_id": cancelled_call,
+        "voice_turn_id": "2",
+    })
+    assert db.voice_call_cancel(uid, cancelled_call, "user_hangup")["status"] == (
+        "cancelled"
+    )
+    late_reply_id = "resident-" + uuid.uuid4().hex
+    with pytest.raises(db.VoiceCallReplySuppressed, match="voice_call_cancelled"):
+        db.chat_finalize_reply_once(
+            uid,
+            cancelled_parent,
+            late_reply_id,
+            time.time() + 1,
+            {
+                "id": late_reply_id,
+                "role": "openclaw",
+                "source": "chat",
+                "body_ct": "late",
+            },
+            {
+                "reply_status": "replied",
+                "reply_message_id": late_reply_id,
+            },
+        )
+    assert db.chat_get_strict(uid, late_reply_id) is None
+
+
+def test_finalized_voice_call_cannot_be_downgraded_by_cancel():
+    uid = _seed_user()
+    call_id = "vcall_" + uuid.uuid4().hex[:10]
+    db.voice_call_create_active(uid, call_id)
+
+    assert db.voice_call_mark_finalized(uid, call_id) == {
+        "status": "finalized",
+        "replayed": False,
+    }
+    assert db.voice_call_cancel(uid, call_id, "user_hangup") == {
+        "status": "finalized",
+        "replayed": True,
+    }
+    assert db.voice_call_status(uid, call_id) == "finalized"
+
+
+def test_cancel_and_finalize_claim_one_lifecycle_winner_before_archive():
+    uid = _seed_user()
+
+    cancel_wins = "vcall_" + uuid.uuid4().hex[:10]
+    db.voice_call_create_active(uid, cancel_wins)
+    assert db.voice_call_cancel(uid, cancel_wins, "connect_failed") == {
+        "status": "cancelled",
+        "replayed": False,
+    }
+    assert db.voice_call_cancel(uid, cancel_wins, "connect_failed") == {
+        "status": "cancelled",
+        "replayed": True,
+    }
+    assert db.voice_call_begin_finalize(uid, cancel_wins)["status"] == "cancelled"
+
+    finalize_wins = "vcall_" + uuid.uuid4().hex[:10]
+    db.voice_call_create_active(uid, finalize_wins)
+    assert db.voice_call_begin_finalize(uid, finalize_wins) == {
+        "status": "finalizing",
+        "replayed": False,
+    }
+    assert db.voice_call_cancel(uid, finalize_wins, "user_hangup") == {
+        "status": "finalizing",
+        "replayed": True,
+    }
+    assert db.voice_call_mark_finalized(uid, finalize_wins)["status"] == (
+        "finalized"
+    )
+    assert db.voice_call_status(uid, finalize_wins) == "finalized"
+
+
+def test_cancel_serializes_with_inflight_resident_reply_before_cleanup():
+    uid = _seed_user()
+    call_id = "vcall_" + uuid.uuid4().hex[:10]
+    db.voice_call_create_active(uid, call_id)
+    parent_id = _append(uid, {
+        "role": "user",
+        "source": "chat",
+        "voice_call_id": call_id,
+        "voice_turn_id": "1",
+    })
+    reply_id = "resident-" + uuid.uuid4().hex
+    barrier = threading.Barrier(2)
+
+    def post_reply():
+        barrier.wait()
+        try:
+            return db.chat_finalize_reply_once(
+                uid,
+                parent_id,
+                reply_id,
+                time.time() + 1,
+                {
+                    "id": reply_id,
+                    "role": "openclaw",
+                    "source": "chat",
+                    "body_ct": "answer",
+                },
+                {"reply_status": "replied", "reply_message_id": reply_id},
+            )
+        except db.VoiceCallReplySuppressed:
+            return None
+
+    def cancel():
+        barrier.wait()
+        return db.voice_call_cancel(uid, call_id, "user_hangup")
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+        reply_future = pool.submit(post_reply)
+        cancel_future = pool.submit(cancel)
+        reply_result = reply_future.result(timeout=5)
+        cancel_result = cancel_future.result(timeout=5)
+
+    assert cancel_result["status"] == "cancelled"
+    cleanup = summary.delete_call_messages(uid, call_id)
+    assert cleanup["remaining"] == 0
+    assert db.chat_get_strict(uid, parent_id) is None
+    assert db.chat_get_strict(uid, reply_id) is None
+    # Either reply committed before cancel took the call lock and cleanup saw
+    # it, or cancel won and the reply woke up suppressed. There is no third
+    # ordering where a reply appears after cleanup.
+    assert reply_result is None or reply_result[1]["voice_call_id"] == call_id
 
 
 def test_call_rows_selected_and_deleted_others_kept():

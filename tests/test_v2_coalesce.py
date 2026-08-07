@@ -98,6 +98,20 @@ def test_seq_native_path_preserves_current_image_routing_metadata():
     }]
 
 
+def test_seq_native_path_preserves_complete_voice_correlation():
+    message = {
+        **_msg("voice-1", "user", 100.0, "你好"),
+        "seq": 11,
+        "voice_call_id": "vcall_123",
+        "voice_turn_id": "1",
+    }
+
+    coalesced, _ = v2_coalesce.coalesce_pending([message], since_seq=10)
+
+    assert coalesced[0]["voice_call_id"] == "vcall_123"
+    assert coalesced[0]["voice_turn_id"] == "1"
+
+
 def test_seq_native_path_fails_closed_on_missing_identity():
     import pytest
 

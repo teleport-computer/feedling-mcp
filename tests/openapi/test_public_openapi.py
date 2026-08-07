@@ -202,8 +202,10 @@ def test_public_operation_and_parameter_inventory(
     # /v1/voice/transcripts (list, metadata only) and GET
     # /v1/voice/transcripts/{call_id} (one sealed envelope, decrypted on the
     # client). Both bodyless, so the body count is unchanged.
-    assert len(operations) == 169
-    assert sum("requestBody" in operation for operation in operations.values()) == 80
+    # 170 since POST /v1/voice/cancel; its required JSON body installs the
+    # durable call tombstone used to suppress late resident/V2 replies.
+    assert len(operations) == 170
+    assert sum("requestBody" in operation for operation in operations.values()) == 81
 
     query_operations = {
         key for key, operation in operations.items() if _parameters(operation, "query")

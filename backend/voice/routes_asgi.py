@@ -279,12 +279,93 @@ async def create_voice_session(
         )
     except RuntimeError:
         return JSONResponse({"error": "voice_gateway_not_configured"}, status_code=503)
+    try:
+        import db as _db
+
+        await threadpool.run_db(
+            _db.voice_call_create_active, auth.user_id, call_id
+        )
+    except Exception as exc:  # noqa: BLE001 — no token without its tombstone row
+        log.warning(
+            "[voice.session] lifecycle create failed user=%s type=%s",
+            auth.user_id[:12],
+            type(exc).__name__,
+        )
+        return JSONResponse({"error": "voice_session_unavailable"}, status_code=503)
     return {
         "call_id": call_id,
         "token": token,
         "gateway_url": gateway_url,
         "expires_at": expires_at,
     }
+
+
+@router.post("/v1/voice/cancel")
+async def cancel_voice_call(
+    request: Request, auth: AuthResult = Depends(require_auth)
+):
+    """Idempotently end an unarchived call and suppress every late reply."""
+    from core import store as core_store
+    import db as _db
+    from voice import cleanup as voice_cleanup
+
+    payload = (await asgi_http.read_json_silent(request)) or {}
+    if not isinstance(payload, dict):
+        return JSONResponse({"error": "invalid_request"}, status_code=400)
+    call_id = str(payload.get("call_id") or "").strip()
+    reason = str(payload.get("reason") or "").strip()
+    if not call_id.startswith("vcall_") or len(call_id) > 96:
+        return JSONResponse({"error": "call_id_required"}, status_code=400)
+    if (
+        not reason
+        or len(reason) > 64
+        or any(not char.isprintable() for char in reason)
+    ):
+        return JSONResponse({"error": "cancel_reason_required"}, status_code=400)
+
+    user_id = auth.user_id
+
+    def _cancel() -> tuple[dict, int]:
+        lifecycle = _db.voice_call_cancel(user_id, call_id, reason)
+        if lifecycle["status"] in {"finalizing", "finalized"}:
+            return {
+                "status": lifecycle["status"],
+                "call_id": call_id,
+                "replayed": True,
+                "deleted": 0,
+                "retained_covered": 0,
+                "remaining": 0,
+            }, 200
+        handoff = results.delete_call_state(user_id, call_id)
+        cleanup = voice_cleanup.delete_call_messages(user_id, call_id)
+        store = core_store.get_store(user_id)
+        # Reload from the authoritative rows: older assistant messages may be
+        # discoverable only through reply_to_message_id and carry no call id in
+        # this worker's stale cache.
+        store.reload()
+        store.notify_chat_waiters()
+        wake_bus.notify("chat", user_id)
+        if cleanup["remaining"] > 0:
+            return {
+                "error": "voice_cleanup_incomplete",
+                "call_id": call_id,
+                **cleanup,
+                **handoff,
+            }, 502
+        log.info(
+            "[voice.cancel] ended user=%s call=%s reason=%s replay=%s",
+            user_id[:12], call_id[:24], reason, lifecycle["replayed"],
+        )
+        return {
+            "status": "cancelled",
+            "call_id": call_id,
+            "replayed": bool(lifecycle["replayed"]),
+            **cleanup,
+            **handoff,
+        }, 200
+
+    body, status = await asyncio.to_thread(_cancel)
+    return JSONResponse(body, status_code=status)
 
 
 @router.post("/v1/voice/finalize")
@@ -339,8 +420,12 @@ async def finalize_voice_call(
     mid = voice_cleanup.transcript_card_message_id(call_id)
 
     def _finalize() -> tuple[dict, int]:
-        store = core_store.get_store(user_id)
         import db as _db
+
+        lifecycle = _db.voice_call_begin_finalize(user_id, call_id)
+        if lifecycle["status"] == "cancelled":
+            return {"error": "voice_call_cancelled"}, 409
+        store = core_store.get_store(user_id)
 
         # Idempotent replay. The judge is the ARCHIVE, not the chat card: the
         # card id reuses the summary era's uuid5 namespace, so a row written by
@@ -381,6 +466,9 @@ async def finalize_voice_call(
                 turn_count=stats["turn_count"], duration_sec=stats["duration_sec"],
             ):
                 return {"error": "voice_transcript_card_not_persisted"}, 502
+        lifecycle = _db.voice_call_mark_finalized(user_id, call_id)
+        if lifecycle["status"] == "cancelled":
+            return {"error": "voice_call_cancelled"}, 409
         cleanup = voice_cleanup.delete_call_messages(user_id, call_id)
         if cleanup["remaining"] > 0:
             # Deletable rows survived (a DB blip inside chat_delete). The
@@ -525,6 +613,15 @@ async def voice_chat_completions(request: Request):
         )
         return _streaming_text_response(request_id, "")
 
+    import db as _db
+
+    if await threadpool.run_db(_db.voice_call_status, user_id, call_id) in {
+        "finalizing",
+        "cancelled",
+        "finalized",
+    }:
+        return _streaming_text_response(request_id, "")
+
     from core import store as core_store
 
     store = await threadpool.run_db(core_store.get_store, user_id)
@@ -592,8 +689,21 @@ async def voice_chat_completions(request: Request):
         first_real_content_at: float | None = None
         buffer_count = 1
         next_keepalive = time.monotonic() + 3.5
+        next_lifecycle_check = time.monotonic()
         reply = None
         while time.monotonic() < deadline:
+            now = time.monotonic()
+            if now >= next_lifecycle_check:
+                status = await threadpool.run_db(
+                    _db.voice_call_status, user_id, call_id
+                )
+                if status in {"finalizing", "cancelled", "finalized"}:
+                    log.info(
+                        "[voice.gateway] stream stopped user=%s status=%s",
+                        user_id[:12], status,
+                    )
+                    break
+                next_lifecycle_check = now + 0.6
             snapshots = await threadpool.run_db(
                 results.load_stream_texts,
                 user_id,
@@ -654,12 +764,19 @@ async def voice_chat_completions(request: Request):
                 buffer_count += 1
                 next_keepalive = now + 3.5
             await asyncio.sleep(0.15)
-        if reply is None:
+        lifecycle_status = await threadpool.run_db(
+            _db.voice_call_status, user_id, call_id
+        )
+        if reply is None and lifecycle_status not in {
+            "finalizing",
+            "cancelled",
+            "finalized",
+        }:
             reply = {
                 "message_id": "",
                 "text": notices_catalog.user_text_for("turn_timeout"),
             }
-        text = str(reply.get("text") or "")
+        text = str((reply or {}).get("text") or "")
         latest_segment = max(streamed_by_segment, default=-1)
         streamed_final = streamed_by_segment.get(latest_segment, "")
         remaining = _final_suffix(streamed_final, text)

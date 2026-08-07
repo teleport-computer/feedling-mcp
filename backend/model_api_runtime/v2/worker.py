@@ -4487,6 +4487,16 @@ def _reply_effect_extra(payload: dict) -> dict:
                 "turn_failure_user_text": notices_catalog.user_text_for(error_class),
             }
         )
+    call_id = str(payload.get("voice_call_id") or "").strip()
+    turn_id = str(payload.get("voice_turn_id") or "").strip()
+    if bool(call_id) != bool(turn_id):
+        raise ValueError("incomplete voice reply correlation")
+    if call_id:
+        if len(call_id) > 96 or len(turn_id) > 128:
+            raise ValueError("invalid voice reply correlation")
+        extra.update(
+            {"voice_call_id": call_id, "voice_turn_id": turn_id}
+        )
     return extra
 
 
@@ -10019,6 +10029,8 @@ async def process_job(
     push_slot: dict | None = None
     voice_reply_slot: dict | None = None
     voice_reply_parts: list[str] = []
+    voice_call_context: dict[str, str] = {}
+    voice_call_ended_atomically = False
     lease_keepalive_stop = asyncio.Event()
     lease_keepalive_task: asyncio.Task | None = None
 
@@ -10351,6 +10363,14 @@ async def process_job(
         reply_parent_message_id = (
             str(coalesced[0].get("id") or "") if coalesced else ""
         )
+        if coalesced:
+            call_id = str(coalesced[0].get("voice_call_id") or "").strip()
+            turn_id = str(coalesced[0].get("voice_turn_id") or "").strip()
+            if call_id and turn_id:
+                voice_call_context = {
+                    "voice_call_id": call_id,
+                    "voice_turn_id": turn_id,
+                }
         # A recovery turn is deliberately mutation-free. Keeping the hard file
         # completion guard active here creates an impossible state: the guard
         # demands workspace_write while the recovery barrier withholds it, so
@@ -11195,6 +11215,7 @@ async def process_job(
             reasoning: str = "",
         ) -> None:
             nonlocal final_job_completed_atomically, voice_reply_slot
+            nonlocal voice_call_ended_atomically
             file_reply = text if isinstance(text, WorkspaceFileReply) else None
             text = "" if file_reply is not None else str(text or "").strip()
             # Self-authored thinking (all models incl. relay). Peel a leading
@@ -11357,6 +11378,8 @@ async def process_job(
                 payload["turn_failure_error_class"] = turn_failure_error_class
             if final and reply_parent_message_id:
                 payload["reply_to_message_id"] = reply_parent_message_id
+            if voice_call_context:
+                payload.update(voice_call_context)
             if final:
                 try:
                     status_rows = await asyncio.to_thread(
@@ -11524,6 +11547,15 @@ async def process_job(
                     },
                     best_effort=True,
                 )
+                if (
+                    status == "discarded"
+                    and last_error
+                    == v2_effect_outbox.FINAL_REPLY_VOICE_CALL_ENDED
+                ):
+                    if final:
+                        final_job_completed_atomically = True
+                        voice_call_ended_atomically = True
+                    return
                 if status == "applied":
                     # 覆盖式：一个回合可能吐多条气泡，只有最后一条会成为推送。构建槽位
                     # 本身也是 best-effort：某些非 seq_native / 测试注入的 payload 不
@@ -11887,6 +11919,19 @@ async def process_job(
                 tm.record_prompt_frontier_exhaustion
             ),
         )
+        if voice_call_ended_atomically:
+            try:
+                await asyncio.to_thread(_emit_status, user_id, job_id, "done")
+            except Exception as exc:  # noqa: BLE001 — lifecycle already settled
+                log.warning(
+                    "[v2.worker] cancelled voice done status failed "
+                    "user=%s job=%s code=%s",
+                    user_id,
+                    job_id,
+                    type(exc).__name__.lower(),
+                )
+            tm.flush(failed=False, status="voice_call_ended")
+            return "completed"
         if outcome.stop_reason == "input_advanced":
             # The hard provider-call budget remains authoritative. The stale
             # final effect was already terminally discarded without dispatch;

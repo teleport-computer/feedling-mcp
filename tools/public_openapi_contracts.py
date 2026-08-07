@@ -352,6 +352,28 @@ OPERATION_PARAMETERS[("put", "/v1/genesis/imports/{job_id}/chunks/{seq}")] = [
 
 
 COMPONENT_SCHEMAS: dict[str, dict[str, Any]] = {
+    "VoiceCallCancelRequest": {
+        "type": "object",
+        "required": ["call_id", "reason"],
+        "properties": {
+            "call_id": {
+                "type": "string",
+                "pattern": "^vcall_",
+                "maxLength": 96,
+            },
+            "reason": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 64,
+                "description": (
+                    "Bounded client cancellation reason, for example "
+                    "user_hangup, connect_failed, transcript_empty, or "
+                    "app_terminated."
+                ),
+            },
+        },
+        "additionalProperties": False,
+    },
     "ModelApiModelsRequest": {
         "type": "object",
         "description": (
@@ -1911,6 +1933,7 @@ COMPONENT_SCHEMAS: dict[str, dict[str, Any]] = {
 
 
 PRECISE_JSON_BODIES: dict[Operation, str] = {
+    ("post", "/v1/voice/cancel"): "VoiceCallCancelRequest",
     ("post", "/v1/web/settings"): "WebSettingsUpdateRequest",
     ("post", "/v1/agent/web/search"): "WebSearchRequest",
     ("post", "/v1/agent/web/fetch"): "WebFetchRequest",
@@ -2004,6 +2027,14 @@ SPECIAL_REQUEST_BODIES: dict[Operation, dict[str, Any]] = {
 
 
 OPERATION_DESCRIPTIONS: dict[Operation, str] = {
+    ("post", "/v1/voice/cancel"): (
+        "Idempotently end a voice call that will not be archived. The durable "
+        "tombstone suppresses late resident and Hosted Runtime V2 replies "
+        "before chat insertion, removes unarchived per-turn rows and encrypted "
+        "voice handoff state, and makes repeated cancellation safe. If finalize "
+        "already claimed the call, cancellation returns that lifecycle state "
+        "without deleting rows or downgrading the archive."
+    ),
     ("post", "/v1/agent/web/search"): (
         "Run a keyless web search (DuckDuckGo HTML scrape) and return ranked "
         "results. Cloud-only: requires a hosted per-user runtime token carrying "
