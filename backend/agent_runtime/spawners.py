@@ -644,9 +644,9 @@ def _default_cli_cmd(driver: str, home: str, io_cli: str = _IO_CLI, model: str =
 
     For claude we pre-grant the io_cli verbs (so an unattended
     ``claude -p`` runs them without an interactive permission prompt) and append
-    the how-to as a system prompt from the per-user home. ``model`` /
-    ``reasoning_effort`` are only used by the pi driver (claude reads model from
-    env, codex from config.toml).
+    the how-to as a system prompt from the per-user home. ``model`` is passed
+    explicitly to claude and pi; ``reasoning_effort`` is only used by pi (codex
+    reads its model from config.toml).
     Operators can override the whole thing per roster entry via ``cli_cmd``.
     """
     if driver == "pi":
@@ -752,8 +752,10 @@ def _default_cli_cmd(driver: str, home: str, io_cli: str = _IO_CLI, model: str =
         )
     grant = ",".join(_claude_allow_rules(io_cli, home))
     prompt_file = f"{home}/{_AGENT_PROMPT_BASENAME}"
+    model_id = (model or "").strip()
+    model_part = f"--model {shlex.quote(model_id)} " if model_id else ""
     return (
-        f"claude {_CLAUDE_PERMISSION_FLAG} {_attach_dirs_add_dir(home)} "
+        f"claude {model_part}{_CLAUDE_PERMISSION_FLAG} {_attach_dirs_add_dir(home)} "
         f"--allowed-tools '{grant}' {_CLAUDE_DISALLOWED_WEB_TOOLS} "
         f"--append-system-prompt-file {prompt_file} {{mcp}} -p {{message}}"
     )
@@ -783,7 +785,8 @@ _CLAUDE_PERMISSION_FLAG = "--permission-mode acceptEdits"
 _CLAUDE_DISALLOWED_WEB_TOOLS = "--disallowed-tools WebSearch,WebFetch"
 
 
-def _default_thinking_claude_cmd(home: str, io_cli: str = _IO_CLI) -> str:
+def _default_thinking_claude_cmd(home: str, io_cli: str = _IO_CLI,
+                                 model: str = "") -> str:
     """Claude Code exposes thinking blocks in stream-json output."""
     # Same allowlist as the non-thinking claude cmd: io_cli verbs + Read on the
     # decrypted-image dir. Without the Read rule a thinking model (deepseek /
@@ -791,8 +794,11 @@ def _default_thinking_claude_cmd(home: str, io_cli: str = _IO_CLI) -> str:
     # its own Read of the chat image ("I need permission to see the image").
     grant = ",".join(_claude_allow_rules(io_cli, home))
     prompt_file = f"{home}/{_AGENT_PROMPT_BASENAME}"
+    model_id = (model or "").strip()
+    model_part = f"--model {shlex.quote(model_id)} " if model_id else ""
     return (
-        f"claude {_CLAUDE_PERMISSION_FLAG} {_attach_dirs_add_dir(home)} --verbose "
+        f"claude {model_part}{_CLAUDE_PERMISSION_FLAG} "
+        f"{_attach_dirs_add_dir(home)} --verbose "
         f"--output-format stream-json --include-partial-messages --effort high "
         f"--allowed-tools '{grant}' {_CLAUDE_DISALLOWED_WEB_TOOLS} "
         f"--append-system-prompt-file {prompt_file} {{mcp}} -p {{message}}"
@@ -1065,17 +1071,21 @@ def consumer_env(base_env: dict, entry: dict, *, user_id: str, home: str) -> dic
     mutated.
     """
     driver = (entry.get("driver") or "claude").strip().lower()
+    model = str(entry.get("model") or "").strip()
+    provider = str(entry.get("provider") or "").strip()
     env = dict(base_env)
     # Stage D zero-roster entries carry no api_key — the consumer authenticates
     # with the runtime-token file instead (FEEDLING_RUNTIME_TOKEN_FILE below).
     env["FEEDLING_API_KEY"] = entry.get("api_key", "")
+    env["FEEDLING_AGENT_PROVIDER"] = provider
+    env["FEEDLING_AGENT_MODEL_ID"] = model
     env["AGENT_MODE"] = entry.get("agent_mode", "cli")
     cli_cmd = entry.get("cli_cmd")
     if not cli_cmd and driver == "claude" and _claude_cli_should_stream_thinking(entry):
-        cli_cmd = _default_thinking_claude_cmd(home)
+        cli_cmd = _default_thinking_claude_cmd(home, model=model)
     env["AGENT_CLI_CMD"] = cli_cmd or _default_cli_cmd(
         driver, home,
-        model=str(entry.get("model") or "") if driver == "pi" else "",
+        model=model if driver in {"claude", "pi"} else "",
         reasoning_effort=str(entry.get("reasoning_effort") or "") if driver == "pi" else "")
     # Per-user isolation: separate checkpoint, agent session, image temp dir, and
     # a per-user agent home (Claude/Codex) so nothing is shared across users.
@@ -1152,7 +1162,6 @@ def consumer_env(base_env: dict, entry: dict, *, user_id: str, home: str) -> dic
         env["CLAUDE_CONFIG_DIR"] = f"{home}/claude-home"
         if entry.get("provider_key"):
             env["ANTHROPIC_API_KEY"] = entry["provider_key"]
-        model = (entry.get("model") or "").strip()
         if model:
             env["ANTHROPIC_MODEL"] = model
         # Non-anthropic claude-wire providers (deepseek) must point the CLI at
