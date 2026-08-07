@@ -10,6 +10,16 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **Runtime V2 Chat can search its own older conversation history on demand.**
+  Two chat-only agent tools let the agent keyword-search messages beyond its
+  visible context and read a small window around a match. Original messages
+  remain the retrieval source of truth (summaries only prioritize scanning);
+  decryption and matching stay inside the enclave under strict row/byte/time
+  budgets; attachment binaries are never read for search. A turn that reads
+  history loses outbound web/MCP/task tools for the next round, proactive wake
+  lanes never see these tools, and a deployment kill switch (default on) can
+  remove the capability without touching the normal chat path.
+
 - **Runtime V2 Chat now applies matching World Book entries.** Matches use the
   current user turn and enter the prompt as a standalone, untrusted setting-data
   block rather than changing the user's message. Oversized matched context is
