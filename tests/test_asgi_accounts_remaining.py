@@ -41,6 +41,7 @@ from accounts import registry  # noqa: E402
 from asgi_test_client import make_client  # noqa: E402
 from core import config as core_config  # noqa: E402
 from core import store as core_store  # noqa: E402
+from db import get_pool  # noqa: E402
 
 
 def _b64(raw: bytes) -> str:
@@ -54,7 +55,8 @@ def clean(tmp_path, monkeypatch):
     registry._users[:] = []
     registry._key_to_user.clear()
     core_store._stores.clear()
-    accounts_recover._recover_challenges.clear()
+    with get_pool().connection() as conn:
+        conn.execute("DELETE FROM account_recover_challenges")
     registry._save_users()
     return tmp_path
 

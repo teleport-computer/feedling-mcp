@@ -848,6 +848,7 @@ jobs:
             tests/test_v2_usage_rollup.py \
             tests/test_admin_proactive_observability.py \
             tests/test_wake_support_indexes_migration.py \
+            tests/test_account_recover_challenges_migration.py \
             tests/test_v2_first_chat_activation_backfill.py \
             tests/test_pre_runtime_preflight.py \
             tests/test_pre_test_migration_convergence.py \
