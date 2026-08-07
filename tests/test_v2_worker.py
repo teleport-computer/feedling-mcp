@@ -130,7 +130,8 @@ def test_prompt_frontier_failures_use_stable_content_free_status_codes():
             ),
             "vision_model_required",
         ),
-        (worker.TurnError("empty_reply"), "reply_parse_failed"),
+        # 2026-08-07:空回复=模型/provider 行为(三个 raise 点全是),归 provider。
+        (worker.TurnError("empty_reply"), "provider_empty_reply"),
         (RuntimeError("opaque internal failure"), "unknown"),
     ],
 )

@@ -381,6 +381,10 @@ enclave 报错通常会重新包一层自己的 slug（如 `model_api_key_decryp
 > （`tools/chat_resident_consumer.py` `_ERROR_CLASS_RULES` 同源），未在本次
 > 新增，不重复列。下表保留 Phase C 后加入的目录项；其中 `runner_*` 三项只是
 > 已冻结的历史 resident/supervisor 通知兼容值，Runtime V2 不再产生它们。
+>
+> `provider_empty_reply`（blame=provider_transient，2026-08-07 新增）同属 chat
+> 上游类：transport 成功、响应协议可识别，但 assistant 内容为空。与
+> `reply_parse_failed`（system）按「谁把内容弄没的」分界。
 
 | error_class | 状态码 | blame | severity | 触发场景 |
 |---|---|---|---|---|

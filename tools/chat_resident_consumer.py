@@ -430,7 +430,23 @@ CAPTURE_HISTORY_LIMIT = int(os.environ.get("FEEDLING_CAPTURE_HISTORY_LIMIT", "16
 # One shared budget across format and semantic correction. A format bounce
 # consumes it, so semantic validation can never multiply a job into four calls.
 CAPTURE_AGENT_REASK_BUDGET = 1
-CAPTURE_WINDOW_MAX_CHARS = int(os.environ.get("FEEDLING_CAPTURE_WINDOW_MAX_CHARS", "12000"))
+# 12000 → 40000（2026-08-07）：这道截断是 text[-N:]，从尾部保留。通话转写进窗口后，
+# 12000 装不下一通电话 + 同窗口的文字聊天，会把前面的文字**静默**砍掉。
+# 40000 = 转写预算 30000 + 文字聊天 10000。
+CAPTURE_WINDOW_MAX_CHARS = int(os.environ.get("FEEDLING_CAPTURE_WINDOW_MAX_CHARS", "40000"))
+
+
+
+
+# 单通电话展开进窗口的预算。**必须大于通话时长上限能产出的字数**，否则采样会
+# 永久丢掉中段 —— 那等于宣称「从每句话 capture」却做不到。现行上限 3600 秒
+# （iOS ElevenLabsAgentClient.configVersion 12），一小时中文口语约 9000 字，
+# 30000 留三倍余量。tests/test_voice_transcript_budget.py 锁死这个关系：谁调大
+# 通话时长而不调这里，测试会红。采样只是"预算真被突破时不要静默失败"的兜底。
+CAPTURE_VOICE_TRANSCRIPT_MAX_CHARS = int(
+    os.environ.get("FEEDLING_CAPTURE_VOICE_TRANSCRIPT_MAX_CHARS", "30000")
+)
+VOICE_TRANSCRIPT_SOURCE = "voice_call_transcript"
 CAPTURE_CONTEXT_MAX_CHARS = int(os.environ.get("FEEDLING_CAPTURE_CONTEXT_MAX_CHARS", "4000"))
 DREAM_MEMORY_INDEX_LIMIT = int(os.environ.get("FEEDLING_DREAM_MEMORY_INDEX_LIMIT", "0"))
 DREAM_FETCH_BATCH_SIZE = int(os.environ.get("FEEDLING_DREAM_FETCH_BATCH_SIZE", "100"))
@@ -780,12 +796,67 @@ _ERROR_CLASS_RULES = (
 
 # 机读全集导出，供 backend/notices/catalog.py 的一致性测试比对（spec Phase B /
 # B3）：_ERROR_CLASS_RULES 里的规则类 + classify_agent_error 硬编码分支里的
-# turn_timeout / reply_parse_failed / model_not_found（裸 404+model）/ unknown。
-# 只是把已有分类逻辑的 error_class 取值收成集合，不改分类逻辑本身。
+# turn_timeout / provider_empty_reply / reply_parse_failed / model_not_found
+# （裸 404+model）/ unknown。只是把已有分类逻辑的 error_class 取值收成集合，
+# 不改分类逻辑本身。
 CONSUMER_ERROR_CLASSES = frozenset(
     {klass for klass, _blame, _text, _pat in _ERROR_CLASS_RULES}
-    | {"turn_timeout", "reply_parse_failed", "model_not_found", "unknown"}
+    | {"turn_timeout", "provider_empty_reply", "reply_parse_failed",
+       "model_not_found", "unknown"}
 )
+
+
+# transport 成功、响应协议可识别、但 assistant 内容为空时,helper 抛的异常带这个
+# 标记 —— 归因走 provider 而不是我们(usr_7f30d63f 2026-08-07)。**必须由 helper
+# 抛出点铸造**:生产链路里 helper 在返回前就抛异常,call_agent 拿不到那个空 body,
+# 只在 call_agent 里判空是死代码(codex2 gatekeep 用真实 helper 形状复现)。
+# 刻意带 ``feedling:`` 命名空间:分类器用子串匹配,而 pi 的 _cli_error_detail 会把
+# **provider 自己的文本**送进来 —— 裸英文短语("empty provider reply")可被上游
+# 报错原样命中而劫持归因(自审 2026-08-07)。
+EMPTY_PROVIDER_REPLY_MARK = "feedling:empty_provider_reply"
+# 与上面成对:provider **给过**原始 assistant 文本,是我们自己的清洗规则
+# (_sanitize_reply_text:纯英文推理不当回复、协议残片压制等)把它清空的。
+# 归 system —— 这是本批唯一的归因边界,谁把内容弄没的谁背锅。
+# 判据必须取在 **parse 之前**:_agent_turn_from_raw 内部就跑 sanitizer,
+# 拿它的输出回头判空,永远分不出这两种情况(codex2 gatekeep R3)。
+SANITIZED_TO_EMPTY_MARK = "feedling:sanitized_to_empty"
+
+
+def _empty_reply_diagnostics(body: Any) -> str:
+    """从「200 但没内容」的响应体里榨出可分类的诊断串(不含用户内容)。
+
+    为什么必须带:one-api/new-api 这类中转在配额耗尽时的标准形状是
+    **HTTP 200 + {"error": {...}}**(或 choices[].finish_reason=content_filter),
+    body 里明明写着 insufficient_quota,而空回复标记排在规则表之后 —— 只要把这些
+    诊断字段渲进异常文本,规则表就能先命中 quota_insufficient/content_filtered
+    等更准的类;不带的话,一个余额为零的用户会被告知「稍后再试、检查中转稳定性」,
+    正是 blame 纪律要避免的误导(自审 2026-08-07 P1)。
+
+    只取协议层字段(error/message/code/type/finish_reason),绝不渲染
+    assistant 内容;整体截断,避免把 provider 的 HTML 错误页灌进日志。"""
+    if not isinstance(body, dict):
+        return ""
+    parts: list[str] = []
+    err = body.get("error")
+    if isinstance(err, dict):
+        for key in ("message", "code", "type"):
+            value = str(err.get(key) or "").strip()
+            if value:
+                parts.append(f"{key}={value[:160]}")
+    elif isinstance(err, str) and err.strip():
+        parts.append(f"error={err.strip()[:160]}")
+    for key in ("message", "detail", "code"):
+        value = body.get(key)
+        if isinstance(value, str) and value.strip():
+            parts.append(f"{key}={value.strip()[:160]}")
+    choices = body.get("choices")
+    if isinstance(choices, list):
+        for choice in choices[:3]:
+            if isinstance(choice, dict):
+                reason = str(choice.get("finish_reason") or "").strip()
+                if reason:
+                    parts.append(f"finish_reason={reason[:40]}")
+    return " ".join(parts)[:400]
 
 
 def classify_agent_error(exc: BaseException) -> AgentErrorNotice:
@@ -832,6 +903,22 @@ def classify_agent_error(exc: BaseException) -> AgentErrorNotice:
     for klass, blame, user_text, pat in _ERROR_CLASS_RULES:
         if pat.search(text):
             return AgentErrorNotice(klass, blame, user_text, detail)
+    # 「空回复」判定**必须排在规则表之后**:pi 退出码永远是 0，API 错误(配额/鉴权/
+    # 断流)只体现在 detail 里，那条异常同时带空回复标记和错误详情 —— 先判空会把
+    # quota_insufficient 之类更具体的分类整个遮蔽掉(codex2 gatekeep 2026-08-06)。
+    # 规则表没命中 = 真的只是「成功但没内容」，那才归 provider 的瞬时问题。
+    if SANITIZED_TO_EMPTY_MARK in text:
+        # provider 给过文本、我们清空的 —— 归 system,与下面成对。
+        return AgentErrorNotice("reply_parse_failed", "system",
+                                "系统处理回复时出了问题，我们会尽快排查。", detail)
+    if EMPTY_PROVIDER_REPLY_MARK in text:
+        # 2026-08-07(usr_7f30d63f 分诊):模型/中转返回 200 但内容为空(断流、
+        # 配额紧张时的假成功等)。这不是我们的解析问题 —— 归 provider,
+        # 别再把中转抽风包装成「系统出了问题」让用户来找我们。
+        return AgentErrorNotice(
+            "provider_empty_reply", "provider_transient",
+            "你的模型服务这次返回了空回复，稍后再试；反复出现请检查模型渠道或中转的稳定性。",
+            detail)
     # 404 需与 model 同现才算模型错（裸 404 归 upstream_unavailable 太粗、归 auth 又错）
     if re.search(r"\b404\b", text) and "model" in lowered:
         return AgentErrorNotice("model_not_found", "user_provider",
@@ -896,18 +983,29 @@ PROVIDER_HEALTH_SUCCESS_REPORT_INTERVAL_SEC = 15 * 60
 _provider_health_success_reported_at = 0.0
 
 # 组件2：call_agent 清洗为空时（SEND_FALLBACK_ON_AGENT_ERROR=true）不抛异常，
-# 靠这个模块级标记让前台调用方知道本轮其实失败了，要补发 reply_parse_failed 通知。
-# 每次成功读取（前台 else 分支）后立即清零。
-_turn_reply_parse_failed = False
+# 靠这个模块级标记让前台调用方知道本轮其实失败了，要补发失败通知。
+# 值是 error_class 短码：""=无失败；"provider_empty_reply"=原始回复本来就是空
+# （中转/模型给的假成功，归 provider）；"reply_parse_failed"=原始回复有内容、
+# 清洗/解析后才空（可能是我们的问题，归 system）。每次成功读取后立即清零。
+# 归因边界(2026-08-07,usr_7f30d63f):清洗前就空 → 别把中转抽风记在自己头上。
+_turn_reply_parse_failed = ""
 
 
-def _consume_reply_parse_failed() -> bool:
-    """读取并清零清洗失败标记。call_agent 是多车道共享的，标记只对"刚刚这一次
-    调用"有意义——谁调用谁消费，绝不许悬挂到别的车道/回合（审查发现的串扰源）。"""
+def _consume_reply_parse_failed() -> str:
+    """读取并清零清洗失败标记（""=本轮没失败，真值=error_class 短码）。
+    call_agent 是多车道共享的，标记只对"刚刚这一次调用"有意义——谁调用谁消费，
+    绝不许悬挂到别的车道/回合（审查发现的串扰源）。"""
     global _turn_reply_parse_failed
     was = _turn_reply_parse_failed
-    _turn_reply_parse_failed = False
+    _turn_reply_parse_failed = ""
     return was
+
+
+def _reply_parse_failure_exc(reason: str) -> ValueError:
+    """把 _consume_reply_parse_failed 的短码铸成分类器认识的异常文本。"""
+    if reason == "provider_empty_reply":
+        return ValueError(f"agent received {EMPTY_PROVIDER_REPLY_MARK}")
+    return ValueError("agent produced no usable reply after sanitization")
 
 
 def _reset_system_notice_state() -> None:
@@ -5418,6 +5516,21 @@ def _call_agent_http_simple(
             return body
         if turn.messages:
             return turn.messages[0]
+        # 已知回复字段**存在但内容为空** = provider 给了空回复;字段完全不认识
+        # 才是协议不匹配(保持原来的 unknown 归因,那确实要人来看)。
+        # 与 openai 分支同理:先查原始 assistant 文本,区分「没给」和「我们清空了」。
+        if any(field in body for field in _JSON_REPLY_FIELDS):
+            present = sorted(f for f in _JSON_REPLY_FIELDS if f in body)
+            diagnostics = _empty_reply_diagnostics(body)
+            if str(_raw_assistant_text(body) or "").strip():
+                raise ValueError(
+                    f"{SANITIZED_TO_EMPTY_MARK}: reply field {present} was "
+                    f"emptied by our sanitizer {diagnostics}".strip()
+                )
+            raise ValueError(
+                f"{EMPTY_PROVIDER_REPLY_MARK}: reply field present but empty "
+                f"in: {present} {diagnostics}".strip()
+            )
         raise ValueError(f"response field not found in: {list(body.keys())}")
     if isinstance(body, str):
         return body.strip()
@@ -5476,7 +5589,22 @@ def _call_agent_http_openai(
         return body
     if turn.messages:
         return turn.messages[0]
-    raise ValueError("OpenAI-compatible response has no usable reply text")
+    # 到这里 body 已确认是 dict(上面非 dict 已抛)、且 turn 是空的。分两种:
+    # provider 压根没给文本(空回复)vs 给了、被我们的 sanitizer 清空(我们的)。
+    # **必须查原始 assistant 文本**:上面的 turn 是 _agent_turn_from_raw 的产物,
+    # 那里面已经跑过 sanitizer,拿它判等于把两种情况混成一种(codex2 gatekeep R3)。
+    diagnostics = _empty_reply_diagnostics(body)
+    if str(_raw_assistant_text(body) or "").strip():
+        raise ValueError(
+            f"{SANITIZED_TO_EMPTY_MARK}: openai-compatible assistant text was "
+            f"emptied by our sanitizer {diagnostics}".strip()
+        )
+    # 真的没给内容 —— 中转在配额紧张/上游抽风时的典型「假成功」形状。
+    # 带上 body 的协议层诊断:200+{"error":insufficient_quota} 这种要让规则表先命中。
+    raise ValueError(
+        f"{EMPTY_PROVIDER_REPLY_MARK}: openai-compatible response carried no "
+        f"assistant text {diagnostics}".strip()
+    )
 
 
 def call_agent_http(
@@ -7292,8 +7420,11 @@ def call_agent_cli(
         # pi's ONLY valid reply source — falling through to the generic extractor
         # would return the user's own echoed message as the reply. Surface the
         # error instead (verified against real pi 0.80.3 output, 2026-07-02).
+        # 标记 + 原 detail 一起带上:pi 退出码永远是 0,API 错误(配额/鉴权/断流)
+        # 只在 detail 里,而分类器把空回复判定排在规则表**之后** —— detail 有错误
+        # 特征时仍然命中 quota_insufficient 等更具体的类,不会被空回复遮蔽。
         raise RuntimeError(
-            "pi agent produced no reply: "
+            f"{EMPTY_PROVIDER_REPLY_MARK}: pi agent produced no reply: "
             f"{_cli_error_detail(result.stdout or '', result.stderr or '')}"
         )
 
@@ -7366,6 +7497,16 @@ def call_agent_cli(
         return raw
     text = _extract_text_from_cli_output(raw)
     if not text:
+        # 判据看 **stdout 有没有东西**,不是看 returncode:非 0 退出在更上游
+        # (call_agent_cli 的退出码检查)就已经抛掉了,这里 returncode 恒为 0,
+        # 拿它当判据的话 else 是死代码,「stdout 有内容但我们的提取器读不懂」
+        # 会被一起甩锅给 provider(自审 2026-08-07 P2)。
+        if not (result.stdout or "").strip():
+            raise ValueError(
+                f"{EMPTY_PROVIDER_REPLY_MARK}: cli agent exited 0 with no "
+                "assistant output"
+            )
+        # stdout 有内容、只是我们提取不出来 —— 这是我们的解析问题,归 system。
         raise ValueError(
             f"cli agent produced no usable output (exit={result.returncode})"
         )
@@ -7641,7 +7782,7 @@ def call_agent(
     # one. Previously only ever SET here; leak suppression now empties turns more
     # often, so an explicit per-turn reset keeps the signal turn-scoped.
     global _turn_reply_parse_failed
-    _turn_reply_parse_failed = False
+    _turn_reply_parse_failed = ""
 
     def _invoke() -> Any:
         if AGENT_MODE == "http":
@@ -7678,6 +7819,15 @@ def call_agent(
         # lines and would behead a pretty-printed JSON object).
         return raw if isinstance(raw, str) else _raw_assistant_text(raw)
 
+    # 快照必须取在 **_agent_turn_from_raw 之前** —— 那个函数内部就跑 sanitizer,
+    # 拿它的产物回头判空,「模型没说话」和「模型说了、被我们清空/剥干净」会混成
+    # 同一种(codex2 gatekeep 连抓两轮:先是压制之后判、再是 parse 之后判)。
+    #   · raw 是 str:provider 给的内容就是它本身,判 strip 即可;
+    #   · raw 是 dict:helper 只在 turn 非空时才返回 body(见两个 _call_agent_http_*
+    #     的返回条件),所以走到这里的 dict 必然带过内容,剩下的空只能是我们压制掉的。
+    model_said_something = (
+        bool(str(raw).strip()) if isinstance(raw, str) else True
+    )
     turn = _agent_turn_from_raw(raw)
     _suppress_torn_protocol_leaks(turn, lane=lane)
     if turn.actions or turn.messages or turn.thinking_summary or turn.tool_calls:
@@ -7708,10 +7858,20 @@ def call_agent(
         if turn.runtime_debug:
             log.debug("agent runtime debug keys: %s", sorted(turn.runtime_debug.keys()))
         return body
+    # 归因分叉:模型本来就没给出任何内容 = provider 给的空(断流/假成功),
+    # 给过内容、被我们压制/解析掏空才算我们的(usr_7f30d63f 2026-08-07:中转抽风
+    # 曾被一律记成 system,用户拿着「系统出了问题」来找我们)。
+    # ⚠️ 生产链路里**主判定在 helper 层**(带 EMPTY_PROVIDER_REPLY_MARK 抛出):
+    # call_agent_http/cli 拿到空 body 时会先抛,根本不会返回到这里。这条分叉覆盖的
+    # 是「helper 返回了内容、随后被 _suppress_torn_protocol_leaks 掏空」那一支。
+    # 两处都要有,少任何一处都会漏归因。
+    failure_class = (
+        "reply_parse_failed" if model_said_something else "provider_empty_reply"
+    )
     if SEND_FALLBACK_ON_AGENT_ERROR:
-        _turn_reply_parse_failed = True
+        _turn_reply_parse_failed = failure_class
         return [FALLBACK_REPLY]
-    raise ValueError("agent produced no usable reply after sanitization")
+    raise _reply_parse_failure_exc(failure_class)
 
 
 def _resident_foreground_chat_message_v2(content: str) -> str:
@@ -11548,10 +11708,49 @@ def _capture_window_messages(job: dict) -> list[dict]:
     return selected
 
 
+def _capture_voice_transcript_text(call_id: str) -> str:
+    """归档的通话全文明文。复用既有取数 + enclave 解密两条路，无新信任面。
+
+    抛异常即"拿不到"。调用方**绝不可以**退回那张有界预览卡：那会把整通电话
+    蒸成开头几句，而 capture 照常推进游标 —— 记忆永久丢失且无人知晓。
+    """
+    body = _capture_get_json(f"/v1/voice/transcripts/{urllib.parse.quote(str(call_id))}")
+    envelope = body.get("transcript") if isinstance(body, dict) else None
+    if not isinstance(envelope, dict):
+        raise RuntimeError(f"voice_transcript_unavailable:{call_id}")
+    return _decrypt_envelope(envelope).decode("utf-8")
+
+
+def _bounded_voice_transcript(text: str) -> str:
+    """把一通电话压进自己的预算：超了头尾采样并说明中间省了多少。"""
+    text = str(text or "").strip()
+    budget = CAPTURE_VOICE_TRANSCRIPT_MAX_CHARS
+    if len(text) <= budget:
+        return text
+    head_budget = int(budget * 0.6)
+    tail_budget = max(0, budget - head_budget)
+    head = text[:head_budget].rstrip()
+    tail = text[-tail_budget:].lstrip() if tail_budget else ""
+    omitted = len(text) - len(head) - len(tail)
+    log.warning(
+        "voice transcript exceeded capture budget: %d chars, %d omitted "
+        "(raise FEEDLING_CAPTURE_VOICE_TRANSCRIPT_MAX_CHARS)", len(text), omitted)
+    return f"{head}\n…（中间约 {omitted} 字省略，完整记录见通话详情）…\n{tail}"
+
+
 def _capture_window_text(messages: list[dict], *, user_label: str = "TA", agent_label: str = "我") -> str:
     lines: list[str] = []
     for msg in messages:
         ts = _message_ts_for_context(msg)
+        call_id = str(msg.get("voice_call_id") or "").strip()
+        if call_id and str(msg.get("source") or "") == VOICE_TRANSCRIPT_SOURCE:
+            # 聊天流里只有有界预览卡，全文在归档表里。展开它，Capture 才是在
+            # 蒸整通电话而不是开头几句。取不到就让整个 job 失败重试（游标不动）。
+            body = _bounded_voice_transcript(_capture_voice_transcript_text(call_id))
+            turns = msg.get("voice_turn_count")
+            header = "【语音通话逐字记录" + (f"，共 {turns} 轮" if turns else "") + "】"
+            lines.append(f"- [{_format_message_time(ts)}] {header}\n{body}")
+            continue
         lines.append(
             f"- [{_format_message_time(ts)}] "
             f"{_capture_message_role(msg, user_label=user_label, agent_label=agent_label)}: "
@@ -11637,7 +11836,7 @@ def _memory_agent_parse_with_bounce(
     return retried, "bounced_ok"
 
 
-def _capture_build_envelope(card: dict, *, occurred_at: str, source: str = "memory_capture", item_id: str = "") -> dict:
+def _capture_build_envelope(card: dict, *, occurred_at: str, source: str = "memory_capture", item_id: str = "", voice_call_id: str = "") -> dict:
     if not _ENCRYPTION_AVAILABLE:
         raise RuntimeError("capture_encryption_unavailable")
     if not _refresh_whoami_for_encrypted_reply():
@@ -11656,6 +11855,9 @@ def _capture_build_envelope(card: dict, *, occurred_at: str, source: str = "memo
         "bucket": str(card.get("bucket") or "").strip(),
         "threads": list(card.get("threads") or []),
     }
+    # 通话溯源(与 V2 extraction._inner_from_card 同形)。放加密正文,服务端看不见。
+    if voice_call_id:
+        inner["voice_call_id"] = str(voice_call_id)[:96]
     envelope = _build_envelope(
         plaintext=json.dumps(inner, ensure_ascii=False, separators=(",", ":")).encode("utf-8"),
         owner_user_id=user_id,
@@ -11682,6 +11884,18 @@ def _capture_build_envelope(card: dict, *, occurred_at: str, source: str = "memo
 def _capture_actions_from_cards(cards: list[dict], *, job: dict, messages: list[dict]) -> tuple[list[dict], int, int]:
     occurred_at = _capture_occurred_at(job, messages)
     source_ids = [_capture_message_id(msg) for msg in messages if _capture_message_id(msg)]
+    # 溯源只在**能证明**归属时打:窗口里恰好一通电话,且没有别的内容。挂断即
+    # 触发 capture,所以这是常态。混合窗口一律不打 —— 无法判断某张卡来自哪边,
+    # 盖章就是假精度(与 V2 worker 同规则)。
+    _call_ids = {
+        str(m.get("voice_call_id") or "").strip()
+        for m in messages
+        if str(m.get("source") or "") == VOICE_TRANSCRIPT_SOURCE
+        and str(m.get("voice_call_id") or "").strip()
+    }
+    voice_call_id = (
+        next(iter(_call_ids)) if len(_call_ids) == 1 and len(messages) == 1 else ""
+    )
     actions: list[dict] = []
     cards_added = 0
     cards_superseded = 0
@@ -11693,7 +11907,8 @@ def _capture_actions_from_cards(cards: list[dict], *, job: dict, messages: list[
         # source of repeated duplicate cards.
         if action in {"merge", "supersede"} and not target_id:
             continue
-        envelope = _capture_build_envelope(card, occurred_at=occurred_at)
+        envelope = _capture_build_envelope(
+            card, occurred_at=occurred_at, voice_call_id=voice_call_id)
         base = {
             "envelope": envelope,
             "reason": "Memory captured from a completed chat window.",
@@ -11790,9 +12005,33 @@ def _process_capture_jobs(jobs: list) -> float:
             # literal "user:"). Fetched only when there IS a window — an empty
             # window keeps the fast-fail path without burning identity calls.
             identity, ai_name, user_name, identity_text = _capture_identity_context()
-            window_text = _capture_window_text(
-                messages, user_label=user_name, agent_label=ai_name
-            )
+            try:
+                window_text = _capture_window_text(
+                    messages, user_label=user_name, agent_label=ai_name
+                )
+            except Exception as exc:  # noqa: BLE001
+                # 取归档全文失败(backend/enclave 抖动)。这条 job 已经 claim 并标
+                # realizing,异常直接冒出去会把它留在 realizing、还会打断整批 job。
+                # 显式标 failed:游标不动,下一轮重新 claim 重跑 —— 这才是注释里
+                # 承诺的"整个 job 失败重试",也才真的没有"退回预览"这条路。
+                log.warning("capture window build failed id=%s: %s", job_id, exc)
+                update_proactive_job_status(
+                    job_id,
+                    "failed",
+                    "capture_window_build_failed",
+                    extra={
+                        "capture_result": {
+                            "status": "failed",
+                            "reason": "capture_window_build_failed",
+                            "detail": str(exc)[:200],
+                        },
+                        "capture_window": window,
+                        "cards_added": 0,
+                        "cards_superseded": 0,
+                        "noop_reason": "capture_window_build_failed",
+                    },
+                )
+                continue
         if not window_text:
             update_proactive_job_status(
                 job_id,
@@ -12708,7 +12947,7 @@ def _process_proactive_jobs(jobs: list) -> float:
         # The turn reached the agent — open the across-batch coalescing window so
         # the rest of this burst folds instead of repeating it.
         _note_proactive_turn_ran(job_id)
-        if _consume_reply_parse_failed():
+        if (parse_failure_class := _consume_reply_parse_failed()):
             # Parse failure means call_agent already swapped agent_result for
             # FALLBACK_REPLY — a foreground-only line ("你稍后再发一次…") that
             # reads as an unsolicited error bubble on a turn the user never
@@ -12716,7 +12955,7 @@ def _process_proactive_jobs(jobs: list) -> float:
             # policy as the agent_call_failed branch above): report + fail the
             # job, post nothing.
             _notify_agent_turn_failure(
-                ValueError("agent produced no usable reply after sanitization"),
+                _reply_parse_failure_exc(parse_failure_class),
                 foreground=False,
             )
             update_proactive_job_status(job_id, "failed", "agent_reply_parse_failed")
@@ -13873,9 +14112,11 @@ def _process_messages(messages: list) -> float:
                 _commit_io_cli_catalog_injection()
             if voice_stream_update is not None:
                 voice_stream_update.complete()
-            if not vision_observer_failed and _consume_reply_parse_failed():
-                pending_failure_notice = ValueError(
-                    "agent produced no usable reply after sanitization"
+            if not vision_observer_failed and (
+                parse_failure_class := _consume_reply_parse_failed()
+            ):
+                pending_failure_notice = _reply_parse_failure_exc(
+                    parse_failure_class
                 )
                 pending_failure_is_parse_only = True
             elif not vision_observer_failed:
@@ -13897,11 +14138,9 @@ def _process_messages(messages: list) -> float:
                         trace_id=trace_id,
                         lane="chat",
                     )
-                    if _consume_reply_parse_failed():
+                    if (retry_failure_class := _consume_reply_parse_failed()):
                         pending_failure_is_parse_only = True
-                        raise ValueError(
-                            "file delivery retry produced no usable reply"
-                        )
+                        raise _reply_parse_failure_exc(retry_failure_class)
                     agent_result = retry_result
                 except Exception as exc:
                     log.error("outbound file completion retry failed: %s", exc)
