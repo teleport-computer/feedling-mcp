@@ -9855,6 +9855,83 @@ class RuntimeControlChangedError(RuntimeError):
     """The hosted-runtime ownership tuple changed before a fenced write."""
 
 
+def _voice_revision_identity(doc: dict) -> tuple[str, str] | None:
+    """Validated non-sensitive grouping key for a current voice revision."""
+    if not isinstance(doc, dict):
+        return None
+    if str(doc.get("role") or "") not in {"user", "human"}:
+        return None
+    if str(doc.get("voice_turn_status") or "") != "current":
+        return None
+    call_id = str(doc.get("voice_call_id") or "").strip()
+    logical_turn_id = str(doc.get("voice_logical_turn_id") or "").strip()
+    if (
+        not call_id
+        or not logical_turn_id
+        or len(call_id) > 96
+        or len(logical_turn_id) > 128
+    ):
+        return None
+    return call_id, logical_turn_id
+
+
+def _supersede_previous_voice_revisions_on_cursor(
+    cur,
+    *,
+    user_id: str,
+    new_msg_id: str,
+    doc: dict,
+) -> list[str]:
+    """Retire older ASR revisions while the chat lifecycle row is locked."""
+    identity = _voice_revision_identity(doc)
+    if identity is None:
+        return []
+    call_id, logical_turn_id = identity
+    fields = {
+        "voice_turn_status": "superseded",
+        "voice_superseded_by": str(new_msg_id),
+    }
+    cur.execute(
+        "UPDATE chat_messages SET doc=doc || %s "
+        "WHERE user_id=%s AND msg_id<>%s "
+        "AND doc->>'role' IN ('user','human') "
+        "AND doc->>'voice_call_id'=%s "
+        "AND COALESCE(NULLIF(doc->>'voice_logical_turn_id',''),"
+        "             doc->>'voice_turn_id','')=%s "
+        "AND COALESCE(doc->>'voice_turn_status','current')<>'superseded' "
+        "RETURNING msg_id",
+        (Jsonb(fields), user_id, new_msg_id, call_id, logical_turn_id),
+    )
+    return [
+        str(row["msg_id"] if isinstance(row, dict) else row[0])
+        for row in cur.fetchall()
+    ]
+
+
+def _mirror_superseded_voice_revisions(
+    user_id: str,
+    superseded_ids: list[str],
+    *,
+    new_msg_id: str,
+) -> None:
+    if not superseded_ids:
+        return
+    from tee_shadow import mirror
+
+    fields = Jsonb({
+        "voice_turn_status": "superseded",
+        "voice_superseded_by": str(new_msg_id),
+    })
+    mirror.execute_many([
+        (
+            "UPDATE chat_messages SET doc=doc || %s "
+            "WHERE user_id=%s AND msg_id=%s",
+            (fields, user_id, msg_id),
+        )
+        for msg_id in superseded_ids
+    ])
+
+
 def chat_append_and_enqueue(
     user_id: str, msg_id: str, ts: float, doc: dict, max_messages: int, lane: str,
     *, reason=None, trace_id=None, expected_generation: int | None = None,
@@ -9924,7 +10001,7 @@ def chat_append_and_enqueue(
             "runtime-control CAS requires expected state, mode, and generation")
     priority = jobs_store.LANE_PRIORITY.get(lane, 0)
 
-    def _attempt() -> tuple[int, int | None, int, bool]:
+    def _attempt() -> tuple[int, int | None, int, bool, list[str]]:
         with get_pool().connection() as conn:
             with conn.transaction():
                 with conn.cursor() as fence_cur:
@@ -9957,6 +10034,12 @@ def chat_append_and_enqueue(
                     ):
                         raise RuntimeControlChangedError(
                             "hosted runtime control changed before enqueue")
+                if _voice_revision_identity(doc) is not None:
+                    # Keep the established runtime-row -> profile-row -> chat
+                    # lifecycle lock order, then serialize distinct revision
+                    # client ids before retiring the prior one.
+                    with conn.cursor() as voice_cur:
+                        _lock_chat_r2_lifecycle_on_cursor(voice_cur, user_id)
                 if client_msg_id is not None:
                     # Length-prefix the user id so concatenation is unambiguous
                     # without a NUL byte (PostgreSQL text rejects U+0000). This
@@ -9976,8 +10059,14 @@ def chat_append_and_enqueue(
                         (user_id, client_msg_id, idempotency_window_sec),
                     ).fetchone()
                     if duplicate is not None:
-                        return int(duplicate[0]), None, 0, False
+                        return int(duplicate[0]), None, 0, False, []
                 with conn.cursor() as mc:
+                    superseded_ids = _supersede_previous_voice_revisions_on_cursor(
+                        mc,
+                        user_id=user_id,
+                        new_msg_id=msg_id,
+                        doc=doc,
+                    )
                     seq, storage_generation = _chat_insert_on_cursor(
                         mc, user_id, msg_id, ts, doc, max_messages,
                         coverage_gated=True,
@@ -9988,14 +10077,19 @@ def chat_append_and_enqueue(
                         priority=priority, deadline_at=None,
                         expected_generation=expected_generation,
                     )
-        return seq, job_id, storage_generation, True
+        return seq, job_id, storage_generation, True, superseded_ids
 
     def _finish(
-        result: tuple[int, int | None, int, bool],
+        result: tuple[int, int | None, int, bool, list[str]],
     ) -> tuple[int, int | None]:
-        seq, job_id, storage_generation, inserted = result
+        seq, job_id, storage_generation, inserted, superseded_ids = result
         if not inserted:
             return seq, None
+        _mirror_superseded_voice_revisions(
+            user_id,
+            superseded_ids,
+            new_msg_id=msg_id,
+        )
         # The primary message+job transaction is already committed. Offload the
         # new row's body without touching any older durable source row.
         _offload_chat_body_after_commit(
@@ -10256,6 +10350,7 @@ def chat_append_idempotent(
 
     row = None
     storage_generation: int | None = None
+    superseded_ids: list[str] = []
     with get_pool().connection() as conn:
         with conn.transaction():
             with conn.cursor() as cur:
@@ -10283,6 +10378,13 @@ def chat_append_idempotent(
                 if row is not None:
                     return row[0], False
 
+                superseded_ids = _supersede_previous_voice_revisions_on_cursor(
+                    cur,
+                    user_id=user_id,
+                    new_msg_id=msg_id,
+                    doc=doc,
+                )
+
                 # Preserve normal msg-id semantics: an envelope-id collision
                 # updates the same row, exactly like chat_append.  Reusing the
                 # shared primitive also pins storage_generation and applies the
@@ -10304,6 +10406,12 @@ def chat_append_idempotent(
 
     if row is None or storage_generation is None:
         raise RuntimeError("chat_idempotent_insert_returned_no_row")
+
+    _mirror_superseded_voice_revisions(
+        user_id,
+        superseded_ids,
+        new_msg_id=msg_id,
+    )
 
     # Only the transaction winner gets here. The shared offload primitive
     # commits an exact-key cleanup guard before PUT and pins every later CAS to
@@ -10460,6 +10568,7 @@ _CHAT_FINALIZE_REPLY_ONCE_SQL = (
     "  WHERE user_id = %s AND msg_id = %s "
     "    AND (doc->>'reply_status') IS DISTINCT FROM 'replied' "
     "    AND COALESCE(doc->>'reply_message_id','') = '' "
+    "    AND COALESCE(doc->>'voice_turn_status','') <> 'superseded' "
     "  RETURNING doc AS parent_doc"
     "), inserted AS ("
     "  INSERT INTO chat_messages (user_id, msg_id, ts, doc) "
@@ -10606,6 +10715,7 @@ def chat_finalize_reply_sequence_once(
                     "WHERE user_id = %s AND msg_id = %s "
                     "AND (doc->>'reply_status') IS DISTINCT FROM 'replied' "
                     "AND COALESCE(doc->>'reply_message_id','') = '' "
+                    "AND COALESCE(doc->>'voice_turn_status','') <> 'superseded' "
                     "RETURNING doc",
                     (Jsonb(replied_fields), user_id, parent_msg_id),
                 )
@@ -10754,6 +10864,7 @@ def chat_try_claim_reply(
         # this worker last refreshed. Mirrors _chat_message_claimable.
         "  AND (doc->>'reply_status') IS DISTINCT FROM 'replied' "
         "  AND COALESCE(doc->>'reply_message_id','') = '' "
+        "  AND COALESCE(doc->>'voice_turn_status','') <> 'superseded' "
         f"{unanswered_tail_sql}"
         "  AND ("
         "    COALESCE(doc->>'reply_claimed_by','') = '' "

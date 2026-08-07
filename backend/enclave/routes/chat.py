@@ -31,6 +31,9 @@ def _attach_chat_metadata(source: dict, target: dict) -> None:
     for key, limit in (
         ("voice_call_id", 96),
         ("voice_turn_id", 128),
+        ("voice_logical_turn_id", 128),
+        ("voice_turn_status", 24),
+        ("voice_superseded_by", 160),
         ("reply_to_message_id", 128),
     ):
         value = source.get(key)

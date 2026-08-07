@@ -150,6 +150,8 @@ def store_reply_for_parent(
     text: str,
 ) -> bool:
     parent = db.chat_get_strict(str(user_id), str(parent_message_id)) or {}
+    if str(parent.get("voice_turn_status") or "") == "superseded":
+        return False
     call_id = str(parent.get("voice_call_id") or "")
     turn_id = str(parent.get("voice_turn_id") or "")
     if not call_id or not turn_id:
@@ -267,6 +269,8 @@ def store_stream_text_for_parent(
     is_final: bool = False,
 ) -> bool:
     parent = db.chat_get_strict(str(user_id), str(parent_message_id)) or {}
+    if str(parent.get("voice_turn_status") or "") == "superseded":
+        return False
     call_id = str(parent.get("voice_call_id") or "")
     turn_id = str(parent.get("voice_turn_id") or "")
     if not call_id or not turn_id:
@@ -297,3 +301,12 @@ def delete_call_state(user_id: str, call_id: str) -> dict:
         "results_deleted": max(0, int(result.rowcount or 0)),
         "streams_deleted": max(0, int(stream.rowcount or 0)),
     }
+
+
+def is_current_voice_turn(user_id: str, *, parent_message_id: str) -> bool:
+    parent = db.chat_get_strict(str(user_id), str(parent_message_id)) or {}
+    return bool(
+        str(parent.get("role") or "") in {"user", "human"}
+        and str(parent.get("voice_call_id") or "").strip()
+        and str(parent.get("voice_turn_status") or "") != "superseded"
+    )

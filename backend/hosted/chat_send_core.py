@@ -37,7 +37,16 @@ def _voice_metadata(voice_context: dict | None) -> dict[str, str]:
     turn_id = str(voice_context.get("turn_id") or "").strip()
     if not call_id or not turn_id or len(call_id) > 96 or len(turn_id) > 128:
         return {}
-    return {"voice_call_id": call_id, "voice_turn_id": turn_id}
+    metadata = {"voice_call_id": call_id, "voice_turn_id": turn_id}
+    logical_turn_id = str(
+        voice_context.get("logical_turn_id") or ""
+    ).strip()
+    if logical_turn_id and len(logical_turn_id) <= 128:
+        metadata.update({
+            "voice_logical_turn_id": logical_turn_id,
+            "voice_turn_status": "current",
+        })
+    return metadata
 
 
 def model_api_chat_send_core(
