@@ -41,6 +41,9 @@ CLI mode:
                         auto-injects --resume on later turns.
   AGENT_CLI_PATH        Optional colon-separated executable search path added
                         before PATH. Useful for systemd services.
+  FEEDLING_AGENT_IMAGE_GENERATION
+                        Set true only when the configured resident agent exposes
+                        a callable native image-generation capability.
 
 Optional:
   CHECKPOINT_FILE       Path to persist last-processed timestamp.
@@ -134,6 +137,7 @@ except ImportError:
     _ENCRYPTION_AVAILABLE = False
 
 import provider_client
+import generated_image
 
 # Shared torn-protocol-JSON leak detector (backend/core, pure). backend/ is on
 # sys.path via the insert above, so it imports as a top-level `core.*` name.
@@ -222,6 +226,16 @@ class StagedChatFile:
     data: bytes
 
 
+@dataclass(frozen=True)
+class StagedChatImage:
+    """One resident-generated image waiting for its chat reply transaction."""
+
+    source_path: str
+    name: str
+    mime_type: str
+    data: bytes
+
+
 @dataclass
 class ProactiveChatContext:
     text: str = ""
@@ -284,6 +298,7 @@ AGENT_CLI_CMD = os.environ.get("AGENT_CLI_CMD", "")
 # single-flight chat lane forever.
 AGENT_TURN_TIMEOUT_SEC = max(30, int(os.environ.get("FEEDLING_AGENT_TURN_TIMEOUT_SEC", "300")))
 AGENT_CLI_PATH = os.environ.get("AGENT_CLI_PATH", "")
+AGENT_IMAGE_GENERATION_CAPABILITY = "agent_image_generation_v1"
 
 CHECKPOINT_API_KEY_FINGERPRINT = hashlib.sha1(FEEDLING_API_KEY.encode()).hexdigest()[:10]
 CHECKPOINT_FILE = Path(
@@ -687,6 +702,28 @@ class VisionObserverFailure(RuntimeError):
         self.provider = _sanitize_thinking_meta(provider, max_len=80)
 
 
+class ImageGenerationFailure(RuntimeError):
+    """Safe failure contract returned by the dedicated image route."""
+
+    def __init__(
+        self,
+        error_class: str,
+        *,
+        status_code: int | None = None,
+        detail: str = "",
+        raw_user_text: str = "",
+        model: str = "",
+        provider: str = "",
+    ):
+        super().__init__(error_class)
+        self.error_class = error_class[:64] or "image_generation_failed"
+        self.status_code = status_code
+        self.detail = detail[:160]
+        self.raw_user_text = raw_user_text
+        self.model = _sanitize_thinking_meta(model, max_len=96)
+        self.provider = _sanitize_thinking_meta(provider, max_len=80)
+
+
 def _vision_failure_user_text(error_class: str, raw_user_text: str) -> str:
     raw = raw_user_text or ""
     has_cjk = bool(re.search(r"[\u4e00-\u9fff]", raw))
@@ -730,6 +767,44 @@ def _vision_failure_user_text(error_class: str, raw_user_text: str) -> str:
         "vision_model_failed": "The vision model could not process this image. Retry or choose another model.",
     }
     fallback = "视觉模型处理失败，请重试。" if chinese else "The vision model could not process this image. Try again."
+    return (zh if chinese else en).get(error_class, fallback)
+
+
+def _image_generation_failure_user_text(error_class: str, raw_user_text: str) -> str:
+    raw = raw_user_text or ""
+    has_cjk = bool(re.search(r"[\u4e00-\u9fff]", raw))
+    has_latin = bool(re.search(r"[A-Za-z]", raw))
+    archive_language = str(
+        globals().get("_whoami_cache", {}).get("archive_language") or ""
+    ).strip().lower()
+    chinese = has_cjk or (not has_latin and archive_language.startswith("zh"))
+    zh = {
+        "image_generation_model_required": "当前模型不能生成图片，请到设置里添加生图模型。",
+        "image_generation_model_incompatible": "当前生图模型无法生成图片，请到设置里更换模型。",
+        "image_generation_auth_invalid": "生图模型的 API Key 无效或已过期，请到设置里重新保存。",
+        "image_generation_quota_insufficient": "生图模型服务额度不足，充值后再试。",
+        "image_generation_model_not_found": "当前生图模型不可用，请到设置里更换模型。",
+        "image_generation_model_not_ready": "生图模型尚未准备好，请到设置里重新保存或更换模型。",
+        "image_generation_rate_limited": "生图模型请求太多，请稍等几分钟再试。",
+        "image_generation_unavailable": "生图模型暂时无法连接，请稍后重试。",
+        "image_generation_invalid_output": "生图模型没有返回有效图片，请重试或更换模型。",
+        "image_generation_invalid_prompt": "这次生图请求没有正确送达，我们会尽快排查。",
+        "image_generation_failed": "图片生成失败，请重试；如果仍失败，请更换模型。",
+    }
+    en = {
+        "image_generation_model_required": "Your current model can't generate images. Add an image generation model in Settings.",
+        "image_generation_model_incompatible": "This image generation model can't create images. Choose another model in Settings.",
+        "image_generation_auth_invalid": "The image generation API key is invalid or expired. Save it again in Settings.",
+        "image_generation_quota_insufficient": "The image generation service has insufficient quota. Add credit and try again.",
+        "image_generation_model_not_found": "The image generation model is unavailable. Choose another model in Settings.",
+        "image_generation_model_not_ready": "The image generation model isn't ready. Save it again or choose another model in Settings.",
+        "image_generation_rate_limited": "The image generation service is rate limited. Try again in a few minutes.",
+        "image_generation_unavailable": "The image generation service is temporarily unavailable. Try again later.",
+        "image_generation_invalid_output": "The image generation model returned no valid image. Try again or choose another model.",
+        "image_generation_invalid_prompt": "This image request wasn't delivered correctly. We'll investigate.",
+        "image_generation_failed": "Image generation failed. Try again or choose another model.",
+    }
+    fallback = "图片生成失败，请重试。" if chinese else "Image generation failed. Try again."
     return (zh if chinese else en).get(error_class, fallback)
 
 _ERROR_CLASS_RULES = (
@@ -803,8 +878,16 @@ _ERROR_CLASS_RULES = (
 # 不改分类逻辑本身。
 CONSUMER_ERROR_CLASSES = frozenset(
     {klass for klass, _blame, _text, _pat in _ERROR_CLASS_RULES}
-    | {"turn_timeout", "provider_empty_reply", "reply_parse_failed",
-       "model_not_found", "unknown"}
+    | {
+        "turn_timeout", "provider_empty_reply", "reply_parse_failed",
+        "model_not_found", "unknown",
+        "image_generation_model_required", "image_generation_model_incompatible",
+        "image_generation_auth_invalid", "image_generation_quota_insufficient",
+        "image_generation_model_not_found", "image_generation_model_not_ready",
+        "image_generation_rate_limited", "image_generation_unavailable",
+        "image_generation_invalid_output", "image_generation_invalid_prompt",
+        "image_generation_failed",
+    }
 )
 
 
@@ -886,6 +969,37 @@ def classify_agent_error(exc: BaseException) -> AgentErrorNotice:
             exc.error_class,
             blame,
             _vision_failure_user_text(exc.error_class, exc.raw_user_text),
+            " · ".join(detail_parts)[:200],
+        )
+
+    if isinstance(exc, ImageGenerationFailure):
+        blame = (
+            "user_provider"
+            if exc.error_class in {
+                "image_generation_model_required",
+                "image_generation_model_incompatible",
+                "image_generation_auth_invalid",
+                "image_generation_quota_insufficient",
+                "image_generation_model_not_found",
+                "image_generation_model_not_ready",
+            }
+            else (
+                "system"
+                if exc.error_class == "image_generation_invalid_prompt"
+                else "provider_transient"
+            )
+        )
+        detail_parts = [exc.error_class]
+        if exc.status_code is not None:
+            detail_parts.append(f"HTTP {exc.status_code}")
+        if exc.detail:
+            detail_parts.append(exc.detail)
+        return AgentErrorNotice(
+            exc.error_class,
+            blame,
+            _image_generation_failure_user_text(
+                exc.error_class, exc.raw_user_text
+            ),
             " · ".join(detail_parts)[:200],
         )
 
@@ -1345,6 +1459,19 @@ def _agent_runtime_metadata(
 AGENT_RUNTIME_METADATA = _agent_runtime_metadata()
 
 
+def _agent_image_generation_enabled() -> bool:
+    """Whether this exact resident entry exposes a callable image tool."""
+    return _env_bool("FEEDLING_AGENT_IMAGE_GENERATION")
+
+
+def _should_use_agent_image_generation(exc: ImageGenerationFailure) -> bool:
+    """Fall through only when no dedicated route was selected."""
+    return bool(
+        exc.error_class == "image_generation_model_required"
+        and _agent_image_generation_enabled()
+    )
+
+
 def _agent_entry_signature() -> str:
     """Stable, secret-free identity for the configured model entry."""
     payload = json.dumps(
@@ -1360,18 +1487,22 @@ def _agent_entry_signature() -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
 
 
-def _consumer_capabilities(hosted: bool) -> str:
+def _consumer_capabilities(hosted: bool = False) -> str:
     """Comma-separated ``X-Feedling-Consumer-Capabilities`` value.
 
-    Vision caps are advertised on every line. ``web_search_v1`` / ``web_fetch_v1``
-    are a CLOUD-ONLY product: only the HOSTED consumer (per-user runtime token)
-    advertises them. VPS / self-hosted residents must NOT — they use their own
-    model provider's built-in web capability, so our web tools are never offered
-    to them. The settings page keys ``_runtime_supported`` off this header, so
-    omitting the web caps makes web read ``effective = false`` for self-hosted
-    accounts, which is exactly the intended product boundary.
+    Vision and dedicated image-generation caps are advertised on every line.
+    The native agent image capability is advertised only when this exact entry
+    is configured to expose it.
+    ``web_search_v1`` / ``web_fetch_v1`` are a CLOUD-ONLY product: only the
+    HOSTED consumer (per-user runtime token) advertises them. VPS / self-hosted
+    residents must NOT — they use their own model provider's built-in web
+    capability, so our web tools are never offered to them. The settings page
+    keys ``_runtime_supported`` off this header, so omitting the web caps makes
+    web read ``effective = false`` for self-hosted accounts.
     """
-    caps = ["vision_observer_v1", "vision_probe_v2"]
+    caps = ["vision_observer_v1", "vision_probe_v2", "image_generation_v1"]
+    if _agent_image_generation_enabled():
+        caps.append(AGENT_IMAGE_GENERATION_CAPABILITY)
     if hosted:
         caps += ["web_search_v1", "web_fetch_v1"]
     return ",".join(caps)
@@ -7955,7 +8086,12 @@ def _outbound_file_prompt_block() -> str:
         "send-file returns ok. Do at most one lightweight check that the output "
         "opens and has the requested format; do not repeatedly render, screenshot, "
         "or tune fonts unless the user explicitly asks for layout QA. Tutorial "
-        "questions alone do not require a file."
+        "questions alone do not require a file. "
+        "GENERATED IMAGE DELIVERY: When an image capability produces a PNG, "
+        "JPEG, or WebP, save it under the same outbound directory and run "
+        f"`python {_IO_CLI_PATH} send-image --path <image_path> "
+        "[--name <display_name>]`. It will appear directly as a chat image. "
+        "Never expose a local path or claim delivery unless send-image returns ok."
     )
 
 
@@ -8008,6 +8144,12 @@ def _outbound_file_failure_reply(text: str) -> str:
     if re.search(r"[\u4e00-\u9fff]", str(text or "")):
         return "这次没能生成你要求的可下载文件，请稍后再试。"
     return "I couldn't generate the requested downloadable file this time. Please try again."
+
+
+def _image_ready_reply(text: str) -> str:
+    if re.search(r"[\u4e00-\u9fff]", str(text or "")):
+        return "图片已经生成。"
+    return "The image is ready."
 
 
 def _sanitize_outbound_file_reply(
@@ -10179,6 +10321,7 @@ def post_reply(
     turn_failure_model: str = "",
     turn_failure_provider: str = "",
     file_followups: list[StagedChatFile] | None = None,
+    image_followups: list[StagedChatImage] | None = None,
 ) -> dict:
     """Post agent reply as a v1 ciphertext envelope.
 
@@ -10236,6 +10379,22 @@ def post_reply(
                         "file_byte_count": len(file_item.data),
                     }
                 )
+            sealed_image_followups = []
+            for image_item in image_followups or []:
+                image_envelope = _build_envelope(
+                    plaintext=bytes(image_item.data),
+                    owner_user_id=seal_user_id,
+                    user_pk_bytes=seal_user_pk,
+                    enclave_pk_bytes=seal_enc_pk,
+                    visibility=visibility,
+                )
+                sealed_image_followups.append(
+                    {
+                        "envelope": image_envelope,
+                        "image_mime": image_item.mime_type,
+                        "image_byte_count": len(image_item.data),
+                    }
+                )
             thinking_envelope = None
             safe_thinking = _sanitize_thinking_summary(thinking_summary)
             if safe_thinking:
@@ -10287,6 +10446,8 @@ def post_reply(
                 body["reply_to_message_id"] = reply_to_message_id
             if sealed_file_followups:
                 body["file_followups"] = sealed_file_followups
+            if sealed_image_followups:
+                body["image_followups"] = sealed_image_followups
             if gate_decision_id:
                 body["gate_decision_id"] = gate_decision_id
             if proactive_job_id:
@@ -10323,9 +10484,9 @@ def post_reply(
                 resp = _HTTP.post(url, json=_sealed_body(), headers=_HEADERS, timeout=15)
         return _handle_post_reply_response(resp)
 
-    if file_followups:
-        log.error("cannot post encrypted file followups without envelope encryption")
-        return {"error": "file_followup_encryption_unavailable"}
+    if file_followups or image_followups:
+        log.error("cannot post encrypted reply followups without envelope encryption")
+        return {"error": "reply_followup_encryption_unavailable"}
 
     # Encryption unavailable — plaintext path (will 400 on v1 backends).
     log.error(
@@ -14019,12 +14180,51 @@ def _process_messages(messages: list) -> float:
             else None
         )
         staged_outbound_files: list[StagedChatFile] = []
+        staged_outbound_images: list[StagedChatImage] = []
+        image_generation_prompt = (
+            downloadable_file_context.required_image_generation_prompt([
+                {"role": "user", "content": raw_user_content_for_lang}
+            ])
+            if outbound_file_turn_active
+            else None
+        )
+        image_generation_failed: ImageGenerationFailure | None = None
+        dedicated_image_generation_succeeded = False
         if outbound_file_turn_active:
             try:
                 _begin_outbound_file_turn(trace_id, outbound_file_requirement)
             except OSError as exc:
                 outbound_file_turn_active = False
                 log.error("cannot prepare outbound file directory: %s", exc)
+        if outbound_file_turn_active and image_generation_prompt:
+            try:
+                _generate_and_stage_dedicated_images(
+                    trace_id,
+                    image_generation_prompt,
+                    raw_user_text=raw_user_content_for_lang,
+                )
+                dedicated_image_generation_succeeded = True
+            except ImageGenerationFailure as exc:
+                if _should_use_agent_image_generation(exc):
+                    content += (
+                        "\n\n[IO runtime fact — not user-authored: no dedicated "
+                        "image route is selected, but this resident declares a "
+                        "native image-generation capability. Use that capability "
+                        "now, then deliver its PNG, JPEG, or WebP with the "
+                        "send-image command described above. Do not claim image "
+                        "generation is unsupported without attempting it.]"
+                    )
+                    log.info(
+                        "dedicated image route absent; falling through to resident "
+                        "native image generation"
+                    )
+                else:
+                    image_generation_failed = exc
+                    log.info(
+                        "dedicated image generation unavailable class=%s status=%s",
+                        exc.error_class,
+                        exc.status_code,
+                    )
         # 本回合失败时待发的 system 通知。不在失败当场发，而是等下面的回复写入被
         # 服务端接受（posted_any）后再发（Codex review）：claim 过期 failover 时另
         # 一个 consumer 已回复，本家的兜底会被 already_answered 409 拒——通知若先
@@ -14046,6 +14246,18 @@ def _process_messages(messages: list) -> float:
                     ]
                 }
                 pending_failure_notice = vision_observer_failed
+            elif image_generation_failed:
+                _discard_io_cli_catalog_pending_injection()
+                failure_notice = classify_agent_error(image_generation_failed)
+                agent_result = {"messages": [failure_notice.user_text]}
+                pending_failure_notice = image_generation_failed
+            elif dedicated_image_generation_succeeded:
+                # The dedicated route already has the result; keep the atomic
+                # reply path without waiting for another resident-model turn.
+                _discard_io_cli_catalog_pending_injection()
+                agent_result = {
+                    "messages": [_image_ready_reply(raw_user_content_for_lang)]
+                }
             elif use_runtime_v2:
                 agent_result = call_agent(
                     _resident_foreground_chat_message_v2(content),
@@ -14103,7 +14315,7 @@ def _process_messages(messages: list) -> float:
                 _notify_agent_turn_failure(e, foreground=True)
                 log.warning("agent error fallback disabled by env; this user turn will not get a visible reply")
                 if outbound_file_turn_active:
-                    _finish_outbound_file_turn(trace_id)
+                    _finish_outbound_attachment_turn(trace_id)
                 latest = max(latest, ts)
                 continue
         else:
@@ -14113,18 +14325,29 @@ def _process_messages(messages: list) -> float:
             # session id now (Codex review I10); see _commit_io_cli_catalog_
             # injection's docstring for why this must not wait on parse
             # success.
-            if not vision_observer_failed:
+            if (
+                not vision_observer_failed
+                and not image_generation_failed
+                and not dedicated_image_generation_succeeded
+            ):
                 _commit_io_cli_catalog_injection()
             if voice_stream_update is not None:
                 voice_stream_update.complete()
-            if not vision_observer_failed and (
-                parse_failure_class := _consume_reply_parse_failed()
+            if (
+                not vision_observer_failed
+                and not image_generation_failed
+                and not dedicated_image_generation_succeeded
+                and (parse_failure_class := _consume_reply_parse_failed())
             ):
                 pending_failure_notice = _reply_parse_failure_exc(
                     parse_failure_class
                 )
                 pending_failure_is_parse_only = True
-            elif not vision_observer_failed:
+            elif (
+                not vision_observer_failed
+                and not image_generation_failed
+                and not dedicated_image_generation_succeeded
+            ):
                 _note_agent_turn_success()
 
         initial_agent_result = agent_result
@@ -14151,7 +14374,9 @@ def _process_messages(messages: list) -> float:
                     log.error("outbound file completion retry failed: %s", exc)
                     pending_failure_notice = exc
 
-            staged_outbound_files = _finish_outbound_file_turn(trace_id)
+            staged_outbound_files, staged_outbound_images = (
+                _finish_outbound_attachment_turn(trace_id)
+            )
             still_missing = _missing_outbound_file_suffixes(
                 outbound_file_requirement, staged_outbound_files
             )
@@ -14179,12 +14404,22 @@ def _process_messages(messages: list) -> float:
                             _outbound_file_failure_reply(raw_user_content_for_lang)
                         ]
                     }
-            elif staged_outbound_files and pending_failure_is_parse_only:
+            elif (
+                staged_outbound_files or staged_outbound_images
+            ) and pending_failure_is_parse_only:
                 # A successfully staged file is itself a usable model result.
                 # Some CLI drivers emit no separate assistant text after the
                 # send-file tool call; synthesize the short confirmation below
                 # without misclassifying the completed turn as an agent error.
                 pending_failure_notice = None
+                _note_agent_turn_success()
+
+            if staged_outbound_images and pending_failure_notice is not None:
+                agent_result = {
+                    "messages": [_image_ready_reply(raw_user_content_for_lang)]
+                }
+                pending_failure_notice = None
+                pending_failure_is_parse_only = False
                 _note_agent_turn_success()
 
         turn = _split_agent_turn(agent_result)
@@ -14195,7 +14430,9 @@ def _process_messages(messages: list) -> float:
                 continue
             sanitized, removed = _sanitize_outbound_file_reply(
                 message,
-                attachment_staged=bool(staged_outbound_files),
+                attachment_staged=bool(
+                    staged_outbound_files or staged_outbound_images
+                ),
             )
             stripped_file_citation = stripped_file_citation or removed
             if sanitized.strip():
@@ -14213,6 +14450,8 @@ def _process_messages(messages: list) -> float:
                 if re.search(r"[\u4e00-\u9fff]", raw_user_content_for_lang)
                 else "The file is ready."
             ]
+        if staged_outbound_images and not turn.messages:
+            turn.messages = [_image_ready_reply(raw_user_content_for_lang)]
         _reply_text = "\n\n".join(m for m in turn.messages if isinstance(m, str) and m.strip())
         _emit_debug_trace(
             "agent", "agent.reply", trace_id=trace_id,
@@ -14336,6 +14575,8 @@ def _process_messages(messages: list) -> float:
                     )
                 if idx == 0 and staged_outbound_files:
                     post_kwargs["file_followups"] = staged_outbound_files
+                if idx == 0 and staged_outbound_images:
+                    post_kwargs["image_followups"] = staged_outbound_images
                 result = post_reply(reply, **post_kwargs)
                 if isinstance(result, dict) and result.get("error"):
                     if result.get("error") in {
@@ -14525,6 +14766,7 @@ _outbound_file_lock = threading.Lock()
 _active_outbound_file_turn_id = ""
 _active_outbound_file_suffixes: tuple[str, ...] | None = None
 _staged_outbound_files: list[StagedChatFile] = []
+_staged_outbound_images: list[StagedChatImage] = []
 
 
 def _begin_outbound_file_turn(
@@ -14540,6 +14782,7 @@ def _begin_outbound_file_turn(
         _active_outbound_file_turn_id = str(turn_id or "")
         _active_outbound_file_suffixes = required_suffixes
         _staged_outbound_files.clear()
+        _staged_outbound_images.clear()
 
 
 def _staged_outbound_file_snapshot(turn_id: str) -> list[StagedChatFile]:
@@ -14549,21 +14792,142 @@ def _staged_outbound_file_snapshot(turn_id: str) -> list[StagedChatFile]:
         return list(_staged_outbound_files)
 
 
-def _finish_outbound_file_turn(turn_id: str) -> list[StagedChatFile]:
+def _finish_outbound_attachment_turn(
+    turn_id: str,
+) -> tuple[list[StagedChatFile], list[StagedChatImage]]:
     global _active_outbound_file_turn_id, _active_outbound_file_suffixes
     with _outbound_file_lock:
         if str(turn_id or "") != _active_outbound_file_turn_id:
-            return []
-        staged = list(_staged_outbound_files)
+            return [], []
+        staged_files = list(_staged_outbound_files)
+        staged_images = list(_staged_outbound_images)
         _staged_outbound_files.clear()
+        _staged_outbound_images.clear()
         _active_outbound_file_turn_id = ""
         _active_outbound_file_suffixes = None
-    for item in staged:
+    for item in [*staged_files, *staged_images]:
         try:
             Path(item.source_path).unlink(missing_ok=True)
         except OSError:
             pass
-    return staged
+    return staged_files, staged_images
+
+
+def _finish_outbound_file_turn(turn_id: str) -> list[StagedChatFile]:
+    """Backward-compatible file-only test/helper surface."""
+    files, _images = _finish_outbound_attachment_turn(turn_id)
+    return files
+
+
+def _generate_and_stage_dedicated_images(
+    turn_id: str,
+    prompt: str,
+    *,
+    raw_user_text: str,
+) -> int:
+    """Call the user's pinned image route and stage its bounded media."""
+    try:
+        response = _HTTP.post(
+            f"{FEEDLING_API_URL}/v1/image-generation/generate",
+            json={"prompt": str(prompt or "")[:8000]},
+            headers=_HEADERS,
+            timeout=180,
+        )
+    except Exception as exc:
+        raise ImageGenerationFailure(
+            "image_generation_unavailable",
+            detail=type(exc).__name__,
+            raw_user_text=raw_user_text,
+        ) from exc
+
+    try:
+        body = response.json()
+    except Exception:
+        body = {}
+    if response.status_code != 200:
+        error_class = str(
+            body.get("error_class") or body.get("error") or "image_generation_failed"
+        )
+        if not error_class.startswith("image_generation_"):
+            error_class = "image_generation_failed"
+        raise ImageGenerationFailure(
+            error_class,
+            status_code=response.status_code,
+            detail="dedicated_route",
+            raw_user_text=raw_user_text,
+            model=str(body.get("model") or ""),
+            provider=str(body.get("provider") or ""),
+        )
+
+    raw_images = body.get("images")
+    if not isinstance(raw_images, list) or not raw_images:
+        raise ImageGenerationFailure(
+            "image_generation_invalid_output",
+            status_code=response.status_code,
+            detail="images_missing",
+            raw_user_text=raw_user_text,
+            model=str(body.get("model") or ""),
+            provider=str(body.get("provider") or ""),
+        )
+
+    staged: list[StagedChatImage] = []
+    try:
+        for index, raw in enumerate(
+            raw_images[: generated_image.MAX_GENERATED_IMAGES_PER_REPLY],
+            start=1,
+        ):
+            if not isinstance(raw, dict):
+                raise ValueError("generated_image_invalid")
+            normalized = generated_image.normalize_generated_image(
+                generated_image.decode_base64_image(
+                    str(raw.get("data_base64") or "")
+                ),
+                declared_mime=str(raw.get("mime_type") or ""),
+                name=str(raw.get("name") or ""),
+                index=index,
+            )
+            staged.append(StagedChatImage(
+                source_path=f"generated:{turn_id}:{index}",
+                name=normalized.name,
+                mime_type=normalized.mime_type,
+                data=normalized.data,
+            ))
+    except ValueError as exc:
+        raise ImageGenerationFailure(
+            "image_generation_invalid_output",
+            status_code=response.status_code,
+            detail=str(exc)[:80],
+            raw_user_text=raw_user_text,
+            model=str(body.get("model") or ""),
+            provider=str(body.get("provider") or ""),
+        ) from exc
+
+    with _outbound_file_lock:
+        if str(turn_id or "") != _active_outbound_file_turn_id:
+            raise ImageGenerationFailure(
+                "image_generation_failed",
+                detail="chat_turn_finished",
+                raw_user_text=raw_user_text,
+            )
+        remaining = max(
+            0,
+            generated_image.MAX_GENERATED_IMAGES_PER_REPLY
+            - len(_staged_outbound_images),
+        )
+        _staged_outbound_images.extend(staged[:remaining])
+    if not staged:
+        raise ImageGenerationFailure(
+            "image_generation_invalid_output",
+            detail="images_empty",
+            raw_user_text=raw_user_text,
+        )
+    log.info(
+        "dedicated image generation staged count=%d provider=%s model=%s",
+        len(staged[:remaining]),
+        _sanitize_thinking_meta(body.get("provider"), max_len=80),
+        _sanitize_thinking_meta(body.get("model"), max_len=96),
+    )
+    return len(staged[:remaining])
 
 
 def _safe_outbound_file_name(raw: str) -> str:
@@ -14691,6 +15055,81 @@ def _handle_stage_file_ipc(msg: dict) -> dict:
                     "request_id": request_id,
                 }
             _staged_outbound_files.append(item)
+    return {
+        "ok": True,
+        "staged": True,
+        "name": item.name,
+        "mime": item.mime_type,
+        "byte_count": len(item.data),
+        "request_id": request_id,
+    }
+
+
+def _handle_stage_image_ipc(msg: dict) -> dict:
+    """Validate and stage one binary raster result from the active agent turn."""
+    request_id = str(msg.get("request_id") or "").strip()
+    raw_path = str(msg.get("path") or "").strip()
+    if not request_id:
+        return {"ok": False, "error": "request_id_required"}
+    if not raw_path:
+        return {"ok": False, "error": "path_required", "request_id": request_id}
+
+    with _outbound_file_lock:
+        active_turn_id = _active_outbound_file_turn_id
+    if not active_turn_id:
+        return {"ok": False, "error": "no_active_chat_turn", "request_id": request_id}
+
+    source_path = Path(raw_path)
+    if not source_path.is_absolute():
+        source_path = OUTBOUND_FILE_DIR / source_path
+    try:
+        resolved_dir = OUTBOUND_FILE_DIR.resolve()
+        resolved_path = source_path.resolve(strict=True)
+        resolved_path.relative_to(resolved_dir)
+    except (OSError, ValueError):
+        return {
+            "ok": False,
+            "error": "path_outside_outbound_dir",
+            "request_id": request_id,
+        }
+
+    try:
+        source_data = resolved_path.read_bytes()
+        normalized = generated_image.normalize_generated_image(
+            source_data,
+            name=str(msg.get("name") or resolved_path.name),
+            index=len(_staged_outbound_images) + 1,
+        )
+    except (OSError, ValueError) as exc:
+        return {"ok": False, "error": str(exc), "request_id": request_id}
+
+    item = StagedChatImage(
+        source_path=str(resolved_path),
+        name=normalized.name,
+        mime_type=normalized.mime_type,
+        data=normalized.data,
+    )
+    with _outbound_file_lock:
+        if active_turn_id != _active_outbound_file_turn_id:
+            return {"ok": False, "error": "chat_turn_finished", "request_id": request_id}
+        for existing in _staged_outbound_images:
+            if existing.source_path == item.source_path:
+                item = existing
+                break
+        else:
+            if len(_staged_outbound_images) >= generated_image.MAX_GENERATED_IMAGES_PER_REPLY:
+                return {
+                    "ok": False,
+                    "error": "too_many_staged_images",
+                    "request_id": request_id,
+                }
+            if len(_staged_outbound_files) + len(_staged_outbound_images) >= 8:
+                return {
+                    "ok": False,
+                    "error": "too_many_staged_attachments",
+                    "request_id": request_id,
+                }
+            _staged_outbound_images.append(item)
     return {
         "ok": True,
         "staged": True,
@@ -14975,6 +15414,8 @@ def _redistill_ipc_serve_forever(sock_path: Path) -> None:
             op = str(obj.get("op") or "") if isinstance(obj, dict) else ""
             if op == "stage_file":
                 reply = _handle_stage_file_ipc(obj)
+            elif op == "stage_image":
+                reply = _handle_stage_image_ipc(obj)
             elif op == "redistill" and not _HOSTED:
                 reply = _handle_redistill_ipc(obj)
             else:

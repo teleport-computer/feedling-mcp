@@ -579,6 +579,7 @@ def test_agent_home_files_seeds_prompt_and_claude_permission_allow():
     assert any("io_cli.py memory-index" in rule for rule in allow)
     assert any("io_cli.py identity-write" in rule for rule in allow)  # 7.D post-respawn tool + rename
     assert any("io_cli.py send-file" in rule for rule in allow)
+    assert any("io_cli.py send-image" in rule for rule in allow)
     assert any("Write(//agent-data/users/u/outbound-files/**)" == rule for rule in allow)
     # identity-read: the agent could write its own card but not read it, so a rename
     # was a blind write and "你叫什么" had to be guessed. Granting the read closes both.

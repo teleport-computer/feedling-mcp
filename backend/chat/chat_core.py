@@ -33,6 +33,7 @@ import uuid
 
 import db
 import debug_trace
+import generated_image
 from accounts import onboarding as accounts_onboarding
 from bootstrap import gates as boot_gates
 from chat import consumer as chat_consumer
@@ -910,6 +911,61 @@ def write_response(
                     },
                 )
             )
+    raw_image_followups = payload.get("image_followups")
+    image_followups: list[tuple[dict, dict]] = []
+    if raw_image_followups is not None:
+        if (
+            content_type != "text"
+            or not isinstance(raw_image_followups, list)
+            or not raw_image_followups
+            or len(raw_image_followups) > generated_image.MAX_GENERATED_IMAGES_PER_REPLY
+            or len(raw_image_followups) + len(file_followups) > 8
+        ):
+            return {"error": "invalid image_followups"}, 400
+        for raw_followup in raw_image_followups:
+            if not isinstance(raw_followup, dict):
+                return {"error": "invalid image_followup"}, 400
+            followup_envelope = raw_followup.get("envelope")
+            if not isinstance(followup_envelope, dict):
+                return {"error": "image_followup envelope required"}, 400
+            missing = [
+                field for field in _ENVELOPE_REQUIRED
+                if not followup_envelope.get(field)
+            ]
+            if missing:
+                return {
+                    "error": "image_followup_envelope_missing_fields",
+                    "detail": missing,
+                }, 400
+            if followup_envelope["visibility"] not in ("shared", "local_only"):
+                return {"error": "invalid image_followup visibility"}, 400
+            if (
+                followup_envelope["visibility"] == "shared"
+                and not followup_envelope.get("K_enclave")
+            ):
+                return {"error": "shared image_followup requires K_enclave"}, 400
+            conflict = _stale_key_conflict(store, followup_envelope)
+            if conflict is not None:
+                return conflict
+            image_mime = str(raw_followup.get("image_mime") or "").strip().lower()
+            image_byte_count = raw_followup.get("image_byte_count")
+            if image_mime not in {"image/jpeg", "image/png", "image/webp"}:
+                return {"error": "invalid image_followup mime"}, 400
+            if (
+                type(image_byte_count) is not int
+                or image_byte_count <= 0
+                or image_byte_count > generated_image.MAX_GENERATED_IMAGE_STORED_BYTES
+            ):
+                return {"error": "invalid image_followup size"}, 400
+            image_followups.append(
+                (
+                    followup_envelope,
+                    {
+                        "image_mime": image_mime,
+                        "image_byte_count": image_byte_count,
+                    },
+                )
+            )
     thinking_envelope = payload.get("thinking_envelope")
     thinking_extra: dict = {}
     if thinking_envelope is not None:
@@ -954,8 +1010,8 @@ def write_response(
         proactive_service.PROACTIVE_JOB_SOURCE,
     }:
         return {"error": "invalid source"}, 400
-    if file_followups and source != "chat":
-        return {"error": "file_followups are chat-only"}, 400
+    if (file_followups or image_followups) and source != "chat":
+        return {"error": "reply followups are chat-only"}, 400
     # role: 消费者可声明 "system"（技术通知气泡，spec 2026-07-06-upstream-error-
     # surfacing）。白名单外一律落 openclaw——新增 role 前先过 spec 的 role 审计表。
     role = str(payload.get("role") or "openclaw").strip()
@@ -1004,9 +1060,13 @@ def write_response(
         parent = db.chat_get_strict(store.user_id, reply_to_message_id) or {}
         if str(parent.get("voice_turn_status") or "") == "superseded":
             return {"error": "voice_turn_superseded"}, 409
-    if file_followups and not reply_to_message_id:
-        return {"error": "file_followups require reply_to_message_id"}, 400
+    if (file_followups or image_followups) and not reply_to_message_id:
+        return {"error": "reply followups require reply_to_message_id"}, 400
     if reply_to_message_id and role != "system":
+        reply_part_count = 1 + len(file_followups) + len(image_followups)
+        if reply_part_count > 1:
+            extra["reply_part_index"] = 0
+            extra["reply_part_count"] = reply_part_count
         resident_activity = chat_activity_projection.project_tool_events(
             chat_activity_store.resident_activity_rows(store.user_id, reply_to_message_id)
         )
@@ -1082,6 +1142,25 @@ def write_response(
                 extra={
                     **followup_extra,
                     "reply_to_message_id": reply_to_message_id,
+                    "reply_part_index": len(candidates),
+                    "reply_part_count": reply_part_count,
+                },
+            )
+            if float(followup["ts"]) <= previous_ts:
+                followup["ts"] = previous_ts + 0.000001
+            previous_ts = float(followup["ts"])
+            candidates.append(followup)
+        for followup_envelope, followup_extra in image_followups:
+            followup = store._build_chat_message(
+                role,
+                source,
+                followup_envelope,
+                content_type="image",
+                extra={
+                    **followup_extra,
+                    "reply_to_message_id": reply_to_message_id,
+                    "reply_part_index": len(candidates),
+                    "reply_part_count": reply_part_count,
                 },
             )
             if float(followup["ts"]) <= previous_ts:
@@ -1093,7 +1172,7 @@ def write_response(
                 store.finalize_chat_reply_sequence_once(
                     reply_to_message_id, candidates, replied_fields
                 )
-                if file_followups
+                if file_followups or image_followups
                 else store.finalize_chat_reply_once(
                     reply_to_message_id, candidate, replied_fields
                 )
@@ -1134,7 +1213,11 @@ def write_response(
                     }, 200
             return {"error": "already_answered", "reply_status": "replied"}, 409
         _parent_doc, finalized_reply = finalized
-        msg = finalized_reply[0] if file_followups else finalized_reply
+        msg = (
+            finalized_reply[0]
+            if file_followups or image_followups
+            else finalized_reply
+        )
         _maybe_mark_first_chat_ok(store, reply_to_message_id)
     else:
         # System notices bypass reply exclusivity by design, as do ordinary

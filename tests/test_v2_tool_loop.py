@@ -19,7 +19,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 import pytest
 
 import provider_client
-from provider_types import ToolExchange, ToolResult
+from provider_types import ProviderMedia, ToolExchange, ToolResult
 from model_api_runtime.v2 import executor as v2_executor
 from model_api_runtime.v2 import tool_loop
 
@@ -135,6 +135,100 @@ def test_empty_tool_calls_is_final_reply_no_dispatch(monkeypatch):
     assert outcome.stop_reason == "final_text"
     assert outcome.replied_intermediate is False
     assert progress == ["round_boundary", "provider_start", "provider_complete"]
+
+
+def test_provider_image_is_a_terminal_reply_without_synthetic_text(monkeypatch):
+    provider = _ScriptedProvider(
+        [
+            {
+                "reply": "",
+                "tool_calls": [],
+                "media": [
+                    {
+                        "mime_type": "image/png",
+                        "data_base64": "aW1hZ2U=",
+                        "name": "result.png",
+                    }
+                ],
+                "usage": {},
+            }
+        ]
+    )
+    monkeypatch.setattr(provider_client, "chat_completion_async", provider)
+    published = []
+    trajectory = []
+
+    async def on_reply(text, *, final, reasoning="", media=()):
+        published.append((text, final, reasoning, media))
+
+    async def on_trajectory(kind, payload):
+        trajectory.append((kind, payload))
+
+    outcome = asyncio.run(
+        tool_loop.run_tool_loop(
+            provider_config=_TEST_PROVIDER_CONFIG,
+            build_messages=_RecordingBuildMessages(),
+            dispatch_tools=_RecordingDispatch(),
+            on_reply=on_reply,
+            fold_new_messages=_RecordingFold([]),
+            add_usage=_noop_add_usage,
+            max_calls=2,
+            allow_image_output=True,
+            on_trajectory_event=on_trajectory,
+        )
+    )
+
+    assert provider.calls[0]["allow_image_output"] is True
+    assert published[0][0:3] == ("", True, "")
+    assert len(published[0][3]) == 1
+    assert outcome.stop_reason == "final_media"
+    assert outcome.delivered_media_count == 1
+    response_event = next(payload for kind, payload in trajectory if kind == "provider_response")
+    assert response_event["response"]["media"] == [
+        {"mime_type": "image/png", "encoded_chars": 8}
+    ]
+
+
+def test_provider_media_mixed_with_function_calls_falls_back_without_tools(monkeypatch):
+    provider = _ScriptedProvider(
+        [
+            {
+                "reply": "",
+                "tool_calls": [
+                    {"id": "mixed-call", "name": "workspace_list", "args": {}}
+                ],
+                "media": [
+                    {
+                        "mime_type": "image/png",
+                        "data_base64": "aW1hZ2U=",
+                    }
+                ],
+                "usage": {},
+            },
+            {"reply": "bounded fallback", "tool_calls": [], "usage": {}},
+        ]
+    )
+    monkeypatch.setattr(provider_client, "chat_completion_async", provider)
+    dispatch = _RecordingDispatch()
+
+    outcome = asyncio.run(
+        tool_loop.run_tool_loop(
+            provider_config=_TEST_PROVIDER_CONFIG,
+            build_messages=_RecordingBuildMessages(),
+            dispatch_tools=dispatch,
+            on_reply=_RecordingReply(),
+            fold_new_messages=_RecordingFold([[]]),
+            add_usage=_noop_add_usage,
+            max_calls=3,
+            allow_image_output=True,
+        )
+    )
+
+    assert dispatch.calls == []
+    assert provider.calls[0]["allow_image_output"] is True
+    assert provider.calls[1]["tools"] is None
+    assert "allow_image_output" not in provider.calls[1]
+    assert outcome.final_text == "bounded fallback"
 
 
 def test_transient_empty_provider_response_retries_inside_same_round(monkeypatch):
@@ -1271,8 +1365,8 @@ def test_tool_schema_rejection_gets_exactly_one_tools_disabled_fallback(monkeypa
         def __init__(self):
             self.calls = []
 
-        async def __call__(self, config, messages, *, tools=None):
-            self.calls.append(tools)
+        async def __call__(self, config, messages, *, tools=None, **kwargs):
+            self.calls.append({"tools": tools, **kwargs})
             if len(self.calls) == 1:
                 raise provider_client.ProviderError("tools rejected", status_code=status_code)
             return {"reply": "fallback answer", "tool_calls": [], "usage": {}}
@@ -1287,10 +1381,13 @@ def test_tool_schema_rejection_gets_exactly_one_tools_disabled_fallback(monkeypa
         dispatch_tools=_RecordingDispatch(), on_reply=reply,
         fold_new_messages=_RecordingFold([[]]), add_usage=usage.append,
         max_calls=5,
+        allow_image_output=True,
     ))
 
-    assert provider.calls[0] is not None
-    assert provider.calls[1] is None
+    assert provider.calls[0]["tools"] is not None
+    assert provider.calls[0]["allow_image_output"] is True
+    assert provider.calls[1]["tools"] is None
+    assert "allow_image_output" not in provider.calls[1]
     assert len(provider.calls) == 2
     assert usage == [None, {}]
     assert reply.calls == [("fallback answer", True)]
@@ -1372,3 +1469,172 @@ def test_budget_exhausted_with_zero_max_calls_produces_no_reply(monkeypatch):
     assert outcome.replied_intermediate is False
     # This is exactly the shape worker.py's chat-path BUG-2 guard checks:
     assert not outcome.replied_intermediate and not (outcome.final_text or "").strip()
+
+
+def test_generate_image_tool_publishes_terminal_media(monkeypatch):
+    provider = _ScriptedProvider(
+        [
+            {
+                "reply": "",
+                "tool_calls": [
+                    {
+                        "id": "image-call-1",
+                        "name": "generate_image",
+                        "args": {"prompt": "a small red robot"},
+                    }
+                ],
+                "usage": {},
+            }
+        ]
+    )
+    monkeypatch.setattr(provider_client, "chat_completion_async", provider)
+    published = []
+    image_calls = []
+    dispatch = _RecordingDispatch()
+
+    async def on_image_reply(args):
+        image_calls.append(args)
+        return (ProviderMedia("image/png", "aW1hZ2U=", "result.png"),)
+
+    async def on_reply(text, *, final, reasoning="", media=()):
+        published.append((text, final, tuple(media)))
+
+    outcome = asyncio.run(
+        tool_loop.run_tool_loop(
+            provider_config=_TEST_PROVIDER_CONFIG,
+            build_messages=_RecordingBuildMessages(),
+            dispatch_tools=dispatch,
+            on_reply=on_reply,
+            fold_new_messages=_RecordingFold([]),
+            add_usage=_noop_add_usage,
+            on_image_reply=on_image_reply,
+            max_calls=2,
+        )
+    )
+
+    assert image_calls == [{"prompt": "a small red robot"}]
+    assert dispatch.calls == []
+    assert published == [
+        (
+            "",
+            True,
+            (ProviderMedia("image/png", "aW1hZ2U=", "result.png"),),
+        )
+    ]
+    assert outcome.stop_reason == "final_media"
+    assert outcome.delivered_media_count == 1
+
+
+def test_generate_image_tool_failure_does_not_publish_text(monkeypatch):
+    provider = _ScriptedProvider(
+        [
+            {
+                "reply": "Image",
+                "tool_calls": [
+                    {
+                        "id": "image-call-1",
+                        "name": "generate_image",
+                        "args": {"prompt": "a small red robot"},
+                    }
+                ],
+                "usage": {},
+            }
+        ]
+    )
+    monkeypatch.setattr(provider_client, "chat_completion_async", provider)
+    published = []
+
+    async def unavailable(_args):
+        raise RuntimeError("image generation model required")
+
+    async def on_reply(text, *, final, reasoning="", media=()):
+        published.append((text, final, tuple(media)))
+
+    with pytest.raises(RuntimeError, match="image generation model required"):
+        asyncio.run(
+            tool_loop.run_tool_loop(
+                provider_config=_TEST_PROVIDER_CONFIG,
+                build_messages=_RecordingBuildMessages(),
+                dispatch_tools=_RecordingDispatch(),
+                on_reply=on_reply,
+                fold_new_messages=_RecordingFold([]),
+                add_usage=_noop_add_usage,
+                on_image_reply=unavailable,
+                max_calls=2,
+            )
+        )
+
+    # The provider's accompanying "Image" text is preamble, never a chat bubble.
+    assert published == []
+
+
+def test_required_image_generation_routes_text_placeholder_to_image_callback(monkeypatch):
+    provider = _ScriptedProvider(
+        [{"reply": "Image", "tool_calls": [], "usage": {}}]
+    )
+    monkeypatch.setattr(provider_client, "chat_completion_async", provider)
+    published = []
+    image_calls = []
+
+    async def on_image_reply(args):
+        image_calls.append(args)
+        return (ProviderMedia("image/png", "aW1hZ2U=", "result.png"),)
+
+    async def on_reply(text, *, final, reasoning="", media=()):
+        published.append((text, final, tuple(media)))
+
+    outcome = asyncio.run(
+        tool_loop.run_tool_loop(
+            provider_config=_TEST_PROVIDER_CONFIG,
+            build_messages=_RecordingBuildMessages(),
+            dispatch_tools=_RecordingDispatch(),
+            on_reply=on_reply,
+            fold_new_messages=_RecordingFold([]),
+            add_usage=_noop_add_usage,
+            on_image_reply=on_image_reply,
+            required_image_generation_prompt="生成一张海边日落图片",
+            max_calls=2,
+        )
+    )
+
+    assert image_calls == [{"prompt": "生成一张海边日落图片"}]
+    assert published == [
+        (
+            "",
+            True,
+            (ProviderMedia("image/png", "aW1hZ2U=", "result.png"),),
+        )
+    ]
+    assert outcome.stop_reason == "final_media"
+    assert outcome.delivered_media_count == 1
+
+
+def test_required_image_generation_failure_never_publishes_placeholder(monkeypatch):
+    provider = _ScriptedProvider(
+        [{"reply": "Image", "tool_calls": [], "usage": {}}]
+    )
+    monkeypatch.setattr(provider_client, "chat_completion_async", provider)
+    published = []
+
+    async def unavailable(_args):
+        raise RuntimeError("image generation model required")
+
+    async def on_reply(text, *, final, reasoning="", media=()):
+        published.append((text, final, tuple(media)))
+
+    with pytest.raises(RuntimeError, match="image generation model required"):
+        asyncio.run(
+            tool_loop.run_tool_loop(
+                provider_config=_TEST_PROVIDER_CONFIG,
+                build_messages=_RecordingBuildMessages(),
+                dispatch_tools=_RecordingDispatch(),
+                on_reply=on_reply,
+                fold_new_messages=_RecordingFold([]),
+                add_usage=_noop_add_usage,
+                on_image_reply=unavailable,
+                required_image_generation_prompt="draw a small red robot image",
+                max_calls=2,
+            )
+        )
+
+    assert published == []

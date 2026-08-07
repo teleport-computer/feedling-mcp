@@ -273,6 +273,23 @@ change must not be interpreted as an API guarantee.
   error codes still distinguish incompatible image input, invalid credentials,
   quota, rate limits, and temporary provider failures.
 
+- **VPS image generation is now capability-based.** A resident can advertise
+  `agent_image_generation_v1` when its configured agent entry actually exposes
+  a callable image tool. Dedicated image routes still take precedence; without
+  one, capable residents receive the request directly, while residents that do
+  not advertise the capability continue to receive image-model setup guidance.
+  When a dedicated route succeeds, its prepared image is delivered immediately
+  through the existing atomic reply path instead of waiting for a second main-
+  model turn.
+
+- **Generated images can now appear directly in Chat.** Runtime V2 normalizes
+  inline image results from supported provider responses, while CLI residents
+  can stage PNG, JPEG, or WebP output with `send-image`. Images are validated,
+  size-bounded, encrypted separately, and committed atomically with the reply as
+  native `content_type=image` rows. The public resident response contract adds
+  `image_followups`; remote provider URLs and local filesystem paths are never
+  exposed as image delivery.
+
 - **Hosted visual failures are easier to diagnose without exposing user
   content.** Per-user admin detail now includes bounded model-route runtime
   error metadata and the newest 20 notice summaries through explicit

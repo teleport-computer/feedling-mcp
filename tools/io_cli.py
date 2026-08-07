@@ -1357,6 +1357,28 @@ def cmd_send_file(args):
     _emit({"ok": False, **{key: value for key, value in reply.items() if key != "ok"}}, exit_code)
 
 
+def cmd_send_image(args):
+    """Stage one generated raster image for direct display in the current chat."""
+    raw_path = str(args.path or "").strip()
+    if not raw_path:
+        _emit({"ok": False, "error": "path_required"}, 2)
+    source_path = Path(raw_path)
+    if not source_path.is_absolute():
+        source_path = Path(_resident_ipc_home()) / "outbound-files" / source_path
+    reply = _resident_ipc_call(
+        "stage_image",
+        {"path": str(source_path), "name": str(args.name or "").strip()},
+    )
+    if reply.get("ok"):
+        _emit({"ok": True, **{key: value for key, value in reply.items() if key != "ok"}})
+    exit_code = 2 if reply.get("error") in {
+        "consumer_not_running",
+        "no_active_chat_turn",
+        "path_outside_outbound_dir",
+    } else 1
+    _emit({"ok": False, **{key: value for key, value in reply.items() if key != "ok"}}, exit_code)
+
+
 def cmd_identity_redistill(args):
     """Hand fresh material to the resident consumer for a FULL identity
     redistill (whole-card replace), over the local resident-consumer IPC
@@ -1885,6 +1907,21 @@ def main():
     sf.add_argument("--path", required=True, help="UTF-8 source path inside the outbound-files directory")
     sf.add_argument("--name", required=True, help="download filename with the requested suffix")
     sf.set_defaults(func=cmd_send_file)
+
+    si = sub.add_parser(
+        "send-image",
+        help="Stage a generated image for direct display in the current chat.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Write a PNG, JPEG, or WebP image under $FEEDLING_HOME/outbound-files, "
+            "then pass its path here. The image is validated and shown as a normal "
+            "chat image bubble.\n"
+            f"{D3_SOURCING_RULE}"
+        ),
+    )
+    si.add_argument("--path", required=True, help="image path inside the outbound-files directory")
+    si.add_argument("--name", default="", help="optional safe display filename")
+    si.set_defaults(func=cmd_send_image)
 
     sw = sub.add_parser("schedule-wake", help="Ask to be woken at a later time (native self-wake).")
     sw.add_argument("--at", required=True, help="When to wake: ISO time (e.g. 2026-06-29T18:00) or a relative spec.")

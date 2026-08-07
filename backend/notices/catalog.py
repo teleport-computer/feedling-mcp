@@ -60,6 +60,17 @@ ERROR_CLASSES = frozenset({
     "vision_model_empty_response",
     "vision_model_not_ready",
     "vision_model_failed",
+    "image_generation_model_required",
+    "image_generation_model_incompatible",
+    "image_generation_auth_invalid",
+    "image_generation_quota_insufficient",
+    "image_generation_model_not_found",
+    "image_generation_model_not_ready",
+    "image_generation_rate_limited",
+    "image_generation_unavailable",
+    "image_generation_invalid_output",
+    "image_generation_invalid_prompt",
+    "image_generation_failed",
 })
 
 # error_class -> (blame, user_text)
@@ -137,6 +148,28 @@ _CATALOG: dict[str, tuple[str, str]] = {
         "user_provider", "视觉模型尚未准备好，请到设置里重新保存或更换模型。"),
     "vision_model_failed": (
         "provider_transient", "视觉模型处理失败，请重试；如果仍失败，请更换模型。"),
+    "image_generation_model_required": (
+        "user_provider", "当前模型不能生成图片，请到设置里添加生图模型。"),
+    "image_generation_model_incompatible": (
+        "user_provider", "当前生图模型无法生成图片，请到设置里更换模型。"),
+    "image_generation_auth_invalid": (
+        "user_provider", "生图模型的 API Key 无效或已过期，请到设置里重新保存。"),
+    "image_generation_quota_insufficient": (
+        "user_provider", "生图模型服务额度不足，充值后再试。"),
+    "image_generation_model_not_found": (
+        "user_provider", "当前生图模型不可用，请到设置里更换模型。"),
+    "image_generation_model_not_ready": (
+        "user_provider", "生图模型尚未准备好，请到设置里重新保存或更换模型。"),
+    "image_generation_rate_limited": (
+        "provider_transient", "生图模型请求太多，请稍等几分钟再试。"),
+    "image_generation_unavailable": (
+        "provider_transient", "生图模型暂时无法连接，请稍后重试。"),
+    "image_generation_invalid_output": (
+        "provider_transient", "生图模型没有返回有效图片，请重试或更换模型。"),
+    "image_generation_invalid_prompt": (
+        "system", "这次生图请求没有正确送达，我们会尽快排查。"),
+    "image_generation_failed": (
+        "provider_transient", "图片生成失败，请重试；如果仍失败，请更换模型。"),
 }
 
 _FALLBACK_BLAME = "system"
@@ -166,14 +199,58 @@ def blame_for(error_class: str) -> str:
 
 def user_text_for(error_class: str, **ctx) -> str:
     """Return stable fallback text, localized where the caller has a locale."""
-    if (
-        error_class == "vision_model_required"
-        and str(ctx.get("language") or "").strip().lower().startswith("en")
-    ):
-        return (
-            "Your current model can't process images, so it didn't receive this "
-            "picture. Switch models, or add a dedicated vision model in Settings."
-        )
+    if str(ctx.get("language") or "").strip().lower().startswith("en"):
+        if error_class == "vision_model_required":
+            return (
+                "Your current model can't process images, so it didn't receive this "
+                "picture. Switch models, or add a dedicated vision model in Settings."
+            )
+        image_generation_text = {
+            "image_generation_model_required": (
+                "Your current model can't generate images. Add an image generation "
+                "model in Settings."
+            ),
+            "image_generation_model_incompatible": (
+                "This image generation model can't create images. Choose another "
+                "model in Settings."
+            ),
+            "image_generation_auth_invalid": (
+                "The image generation API key is invalid or expired. Save it again "
+                "in Settings."
+            ),
+            "image_generation_quota_insufficient": (
+                "The image generation service has insufficient quota. Add credit and "
+                "try again."
+            ),
+            "image_generation_model_not_found": (
+                "The image generation model is unavailable. Choose another model in "
+                "Settings."
+            ),
+            "image_generation_model_not_ready": (
+                "The image generation model isn't ready. Save it again or choose "
+                "another model in Settings."
+            ),
+            "image_generation_rate_limited": (
+                "The image generation service is rate limited. Try again in a few "
+                "minutes."
+            ),
+            "image_generation_unavailable": (
+                "The image generation service is temporarily unavailable. Try again "
+                "later."
+            ),
+            "image_generation_invalid_output": (
+                "The image generation model returned no valid image. Try again or "
+                "choose another model."
+            ),
+            "image_generation_invalid_prompt": (
+                "This image request wasn't delivered correctly. We'll investigate."
+            ),
+            "image_generation_failed": (
+                "Image generation failed. Try again or choose another model."
+            ),
+        }.get(error_class)
+        if image_generation_text is not None:
+            return image_generation_text
     entry = _CATALOG.get(error_class)
     return entry[1] if entry is not None else _FALLBACK_USER_TEXT
 

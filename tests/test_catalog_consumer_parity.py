@@ -65,6 +65,25 @@ def test_vision_model_required_catalog_guidance_is_bilingual():
     )
 
 
+def test_image_generation_configuration_catalog_is_actionable_and_bilingual():
+    classes = {
+        "image_generation_model_required",
+        "image_generation_model_incompatible",
+        "image_generation_auth_invalid",
+        "image_generation_quota_insufficient",
+        "image_generation_model_not_found",
+        "image_generation_model_not_ready",
+    }
+    assert classes <= catalog.ERROR_CLASSES
+    for error_class in classes:
+        assert catalog.blame_for(error_class) == "user_provider"
+        assert catalog.user_text_for(error_class, language="zh-Hans")
+        assert catalog.user_text_for(error_class, language="en-US")
+        assert catalog.user_text_for(
+            error_class, language="en-US"
+        ) != catalog.user_text_for(error_class, language="zh-Hans")
+
+
 def test_resident_decrypt_maintenance_classes_are_registered_as_user_environment():
     classes = {
         "resident_decrypt_source_unavailable",
@@ -87,6 +106,15 @@ def _consumer_blame_map() -> dict[str, str]:
     out.setdefault("reply_parse_failed", "system")
     out.setdefault("model_not_found", "user_provider")  # 裸 404+model 分支，和规则表一致
     out.setdefault("unknown", "system")
+    # Dedicated image generation failures bypass the generic regex rules.
+    # Ask the real classifier for their blame so this parity lock follows the
+    # same branch the resident consumer executes at runtime.
+    for error_class in crc.CONSUMER_ERROR_CLASSES:
+        if error_class.startswith("image_generation_"):
+            notice = crc.classify_agent_error(
+                crc.ImageGenerationFailure(error_class)
+            )
+            out[error_class] = notice.blame
     return out
 
 

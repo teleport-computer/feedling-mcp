@@ -200,3 +200,14 @@ verify 回包 gate 竞态等三层修复曾处于"已修未部署"状态，确�
   测试调用，docstring 的幻影调用方声明已当轮修正）。**oracle 判保留**：`db.chat_newest_ts`
   （selfheal_blocked_by_nonempty_page 用它断言 raw-max-ts 一致性；其在
   fail-open 测试里的僵尸 monkeypatch 已当轮修正为 chat_count_since）。
+
+### #16 PI resident 原生生图工具 ⬜ P2 · 中等
+
+- **现状**：PI coding agent 默认工具集中没有生图工具。即使底层 provider 或
+  主模型能够调用生图接口，resident 也不能据此声明原生生图能力。
+- **方向**：提供并维护官方 PI extension，注册稳定的 `generate_image` 工具，
+  复用用户已配置的 provider credential，把结果规范化为 PNG/JPEG/WebP 后通过
+  `io_cli.py send-image` 交付；安装/升级流程需覆盖普通用户入住与 resident 自更新。
+- **能力协商**：extension 实际可用后才声明 `agent_image_generation_v1`。继续保留
+  “专用生图模型优先 → resident 原生能力 → 添加生图模型卡片”的路由顺序，并补
+  PI/Codex/Claude 等不同 CLI、工具缺失、鉴权失败和产物未送达的端到端测试。

@@ -39,6 +39,8 @@ EXPECTED_BODYLESS_POSTS = {
     ("post", "/v1/model_api/test"),
     ("post", "/v1/model_api/routes/{route_id}/activate"),
     ("post", "/v1/model_api/routes/{route_id}/test"),
+    ("post", "/v1/image-generation/main/test"),
+    ("post", "/v1/image-generation/routes/{route_id}/test"),
     ("post", "/v1/vision/main/test"),
     ("post", "/v1/vision/routes/{route_id}/test"),
     ("post", "/v1/proactive/scheduled/fire"),
@@ -70,6 +72,9 @@ EXPECTED_API_KEY_ONLY_OPERATIONS = {
 
 EXPECTED_CORE_BODY_REFS = {
     ("post", "/v1/model_api/chat/send"): "HostedChatSendRequest",
+    ("put", "/v1/image-generation/config"): "ImageGenerationConfigUpdateRequest",
+    ("post", "/v1/image-generation/config"): "ImageGenerationRouteCreateRequest",
+    ("post", "/v1/image-generation/generate"): "ImageGenerationRequest",
     ("put", "/v1/vision/config"): "VisionConfigUpdateRequest",
     ("post", "/v1/vision/config"): "VisionRouteCreateRequest",
     ("post", "/v1/vision/observe"): "VisionObserveRequest",
@@ -204,8 +209,12 @@ def test_public_operation_and_parameter_inventory(
     # client). Both bodyless, so the body count is unchanged.
     # 170 since POST /v1/voice/cancel; its required JSON body installs the
     # durable call tombstone used to suppress late resident/V2 replies.
-    assert len(operations) == 170
-    assert sum("requestBody" in operation for operation in operations.values()) == 81
+    # Image-generation routing adds GET/PUT/POST config plus two bodyless
+    # validators; only the two config mutations carry request bodies.
+    # The authenticated resident generation exchange adds one prompt-bearing
+    # operation.
+    assert len(operations) == 176
+    assert sum("requestBody" in operation for operation in operations.values()) == 84
 
     query_operations = {
         key for key, operation in operations.items() if _parameters(operation, "query")
