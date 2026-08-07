@@ -151,6 +151,17 @@ def main() -> int:
               f"卡数={len(cards_found)}")
         check("C3. 事实覆盖率 ≥ 50%", coverage >= 0.5,
               f"{len(hit)}/{len(_FACTS)} = {coverage:.0%}")
+        # 归属核对:转写里用户那一侧是「我」,只有抬头一行说明它不是模型自己。
+        # 标签出现几十次、说明只有一次 —— 必须实测模型有没有把用户做的事写成
+        # 自己做的(「我完成了封面」「我要去上海」),这是换成第一人称的唯一风险。
+        misattributed = [
+            str(i.get("summary") or "")[:60] for i in cards_found
+            if any(bad in str(i) for bad in
+                   ("我完成", "我要去", "我答应", "我的妈妈", "我养的", "我搬到"))
+        ]
+        check("D0. 无张冠李戴(模型没把 TA 做的事写成自己做的)",
+              not misattributed, str(misattributed[:3]) or "干净")
+
         if cards_found:
             ids = [i.get("id") for i in cards_found[:5] if i.get("id")]
             r = c.post("/v1/memory/fetch", json={"ids": ids})

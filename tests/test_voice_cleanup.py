@@ -88,32 +88,31 @@ def test_rendered_transcript_never_leaks_the_literal_role():
     assert "明天提醒我" in rendered
 
 
-def test_transcript_uses_real_names_on_both_sides():
-    """通话记录有两种读者:用户在设置页读它,Capture 读它来蒸记忆。任何一侧写成
-    第一人称,另一方就会读错(把对方的话当成自己说的 —— 正是 "user:" 教坏模型
-    那类事故)。所以两侧都用真名,由抬头说明谁是谁。"""
+def test_transcript_uses_first_person_for_user_and_name_for_companion():
+    """用户侧「我」(这份记录首先是给用户看的),伴侣侧用它自己的名字。"""
     rendered = transcript_store.render_transcript(
         [{"role": "user", "text": "今天封面定稿了"},
          {"role": "assistant", "text": "恭喜"}],
-        user_name="晓婷", ai_name="小满",
+        ai_name="小满",
     )
-    assert "- 晓婷: 今天封面定稿了" in rendered
+    assert "- 我: 今天封面定稿了" in rendered
     assert "- 小满: 恭喜" in rendered
-    assert "我:" not in rendered and "对方:" not in rendered
 
 
-def test_transcript_falls_back_to_neutral_labels_not_first_person():
+def test_companion_falls_back_to_TA_like_the_identity_card():
+    """身份卡没名字时默认就是「TA」,这里保持一致,别自造第三种叫法。"""
     rendered = transcript_store.render_transcript(
-        [{"role": "user", "text": "在吗"}, {"role": "assistant", "text": "在"}],
-    )
-    assert "- 本人: 在吗" in rendered
-    assert "- 伴侣: 在" in rendered
+        [{"role": "user", "text": "在吗"}, {"role": "assistant", "text": "在"}])
+    assert "- 我: 在吗" in rendered
+    assert "- TA: 在" in rendered
 
 
-def test_capture_header_names_both_sides_and_overrides_the_terse_rule():
-    header = transcript_store.capture_window_header(
-        turn_count=24, user_name="晓婷", ai_name="小满")
-    assert "「小满」是你" in header and "「晓婷」是 TA" in header
+def test_capture_header_spells_out_who_is_who():
+    """标签出现几十次、说明只有一次,所以说明必须毫不含糊地指出「我」不是模型
+    自己 —— 否则模型会把用户做的事写成自己做的。"""
+    header = transcript_store.capture_window_header(turn_count=24, ai_name="小满")
+    assert "「我」是" in header and "不是你" in header
+    assert "「小满」才是你自己" in header
     # 「宁少勿多」是为闲聊窗口写的;不显式推翻它,一通电话只会留下一两张卡。
     assert "不适用于这里" in header
 

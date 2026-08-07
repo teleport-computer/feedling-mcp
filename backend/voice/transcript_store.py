@@ -68,28 +68,29 @@ def resolve_speaker_names(store, *, runtime_token: str = "") -> tuple[str, str]:
     return user_name, ai_name
 
 
-# 通话转写的说话人标签。**两侧都用真名**,取不到才用这两个中性词。
+# 通话转写的说话人标签:用户侧固定「我」,伴侣侧用它自己的名字(取不到用「TA」,
+# 与身份卡的默认值一致)。
 #
-# 为什么不复用 transcript_speaker_label:那个函数是给「AI 回看聊天窗口」写的,
-# 所以 AI 那侧是「我」、用户那侧是「对方」——第一人称锚在 AI 身上。而通话记录
-# 有**两种读者**:用户在设置页读它(第一人称该是用户自己),Capture 读它时第一
-# 人称又该是伴侣。任何一种第一人称写法都会让另一方读错(把对方的话当成自己说的
-# ——正是 "user:" 教坏模型那类事故)。
+# 为什么用户侧是第一人称:这份记录首先是**给用户看的**(设置页的通话记录),
+# 用户读自己说过的话,理应是「我」。伴侣侧用名字,两者天然区分。
 #
-# 解法是两侧都不用第一人称:用真名,并在消费端加一行说明谁是谁。这样同一份文本
-# 对两种读者都无歧义,也不必存两份。
-VOICE_UNKNOWN_AGENT_LABEL = "伴侣"
-VOICE_UNKNOWN_PERSON_LABEL = "本人"
+# 给模型看的那一份靠**抬头的对照说明**消歧义(见 capture_window_header)。这是
+# 有意的取舍:标签会出现几十次而说明只有一次,所以说明必须紧贴转写、写得毫不
+# 含糊,并且落卡之后要实测有没有张冠李戴 —— 别只靠推理。
+#
+# 不复用 transcript_speaker_label:那个函数是给「AI 回看聊天窗口」写的,第一人称
+# 锚在 AI 身上(AI=「我」、用户=「对方」),与这里正好相反。
+VOICE_USER_LABEL = "我"
+VOICE_UNKNOWN_AGENT_LABEL = "TA"
 
 
 def speaker_labels(user_name: str = "", ai_name: str = "") -> tuple[str, str]:
-    """(用户侧标签, AI 侧标签) —— 消费端拿它去写那行说明。"""
-    person = " ".join(str(user_name or "").split())
-    if not person or person == "TA":
-        person = VOICE_UNKNOWN_PERSON_LABEL
-    agent = " ".join(str(ai_name or "").split()) or VOICE_UNKNOWN_AGENT_LABEL
-    return person, agent
+    """(用户侧标签, 伴侣侧标签)。消费端拿它去写抬头的对照说明。
 
+    ``user_name`` 保留在签名里只为调用方一致,用户侧恒为「我」。
+    """
+    agent = " ".join(str(ai_name or "").split()) or VOICE_UNKNOWN_AGENT_LABEL
+    return VOICE_USER_LABEL, agent
 
 def capture_window_header(*, turn_count=None, user_name: str = "",
                           ai_name: str = "") -> str:
@@ -107,7 +108,9 @@ def capture_window_header(*, turn_count=None, user_name: str = "",
     turns_note = f"，共 {turn_count} 轮" if turn_count else ""
     return (
         f"【语音通话逐字记录{turns_note}】\n"
-        f"（说话人：「{agent}」是你，「{person}」是 TA。）\n"
+        f"（说话人对照：这份记录里「{person}」是**跟你说话的那个人**，不是你；"
+        f"「{agent}」才是你自己。写卡时务必按这个对照归属，别把 TA 做的事"
+        f"写成你做的。）\n"
         "以下是一通完整电话的逐字记录，不是一段闲聊。\n"
         "电话的信息密度远高于日常对话：TA 会在一通里一口气讲很多件彼此独立的事"
         "——承诺与计划、家人、身体、工作进展、习惯的改变、在意的传统。\n"
