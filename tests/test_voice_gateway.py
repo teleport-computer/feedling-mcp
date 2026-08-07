@@ -150,6 +150,23 @@ def test_asr_revision_keeps_the_same_logical_voice_turn():
     assert first == corrected == "2"
     assert routes_asgi._voice_turn_id(3) != first
 
+    first_delivery = routes_asgi._voice_revision_turn_id(
+        "call-1", first, "可以啊", secret_key=b"voice-secret"
+    )
+    corrected_delivery = routes_asgi._voice_revision_turn_id(
+        "call-1",
+        corrected,
+        "可以啊，今天什么时候日落？",
+        secret_key=b"voice-secret",
+    )
+    retry_delivery = routes_asgi._voice_revision_turn_id(
+        "call-1", first, "可以啊", secret_key=b"voice-secret"
+    )
+
+    assert first_delivery == retry_delivery
+    assert corrected_delivery != first_delivery
+    assert "可以" not in first_delivery
+
 
 def test_gateway_extracts_session_context_from_elevenlabs_extra_body():
     payload = {
@@ -219,6 +236,16 @@ def test_voice_metadata_requires_a_complete_bounded_pair():
     assert chat_send_core._voice_metadata(
         {"call_id": " call ", "turn_id": " turn "}
     ) == {"voice_call_id": "call", "voice_turn_id": "turn"}
+    assert chat_send_core._voice_metadata({
+        "call_id": "call",
+        "turn_id": "turn.revision",
+        "logical_turn_id": "turn",
+    }) == {
+        "voice_call_id": "call",
+        "voice_turn_id": "turn.revision",
+        "voice_logical_turn_id": "turn",
+        "voice_turn_status": "current",
+    }
     assert chat_send_core._voice_metadata(
         {"call_id": "c" * 97, "turn_id": "turn"}
     ) == {}
@@ -242,6 +269,8 @@ def test_enclave_history_preserves_voice_routing_metadata(monkeypatch):
             "content_type": "text",
             "voice_call_id": " call-1 ",
             "voice_turn_id": " turn-1 ",
+            "voice_logical_turn_id": " logical-1 ",
+            "voice_turn_status": " current ",
         }],
         "user-1",
         object(),
@@ -250,6 +279,8 @@ def test_enclave_history_preserves_voice_routing_metadata(monkeypatch):
     assert errors == []
     assert messages[0]["voice_call_id"] == "call-1"
     assert messages[0]["voice_turn_id"] == "turn-1"
+    assert messages[0]["voice_logical_turn_id"] == "logical-1"
+    assert messages[0]["voice_turn_status"] == "current"
 
 
 def test_failed_voice_turn_uses_the_normal_chat_failure_copy(monkeypatch):
@@ -303,7 +334,8 @@ def test_resident_voice_turn_enters_the_normal_chat_lane(monkeypatch):
         message="你好",
         client_msg_id="00000000-0000-0000-0000-000000000001",
         call_id="call-1",
-        turn_id="turn-1",
+        turn_id="turn-1.revision-1",
+        logical_turn_id="turn-1",
     )
 
     assert status == 202
@@ -312,7 +344,9 @@ def test_resident_voice_turn_enters_the_normal_chat_lane(monkeypatch):
     assert captured["source"] == "chat"
     assert captured["extra"] == {
         "voice_call_id": "call-1",
-        "voice_turn_id": "turn-1",
+        "voice_turn_id": "turn-1.revision-1",
+        "voice_logical_turn_id": "turn-1",
+        "voice_turn_status": "current",
     }
     assert captured["notified"] is True
 

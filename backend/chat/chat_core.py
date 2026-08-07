@@ -1000,6 +1000,10 @@ def write_response(
         extra["push_live_activity_requested"] = bool(payload.get("push_live_activity"))
     turn_failure_error_class = str(payload.get("turn_failure_error_class") or "")[:64]
     reply_to_message_id = _reply_to_message_id(payload)
+    if reply_to_message_id and role != "system":
+        parent = db.chat_get_strict(store.user_id, reply_to_message_id) or {}
+        if str(parent.get("voice_turn_status") or "") == "superseded":
+            return {"error": "voice_turn_superseded"}, 409
     if file_followups and not reply_to_message_id:
         return {"error": "file_followups require reply_to_message_id"}, 400
     if reply_to_message_id and role != "system":
@@ -1114,6 +1118,10 @@ def write_response(
             # self-heal the idempotent first-chat activation marker in case the
             # original process committed the reply but died before writing it.
             parent_doc = db.chat_get_strict(store.user_id, reply_to_message_id)
+            if str((parent_doc or {}).get("voice_turn_status") or "") == (
+                "superseded"
+            ):
+                return {"error": "voice_turn_superseded"}, 409
             winner_reply_id = str((parent_doc or {}).get("reply_message_id") or "")
             if winner_reply_id and winner_reply_id == str(candidate.get("id") or ""):
                 winner = db.chat_get_strict(store.user_id, winner_reply_id)

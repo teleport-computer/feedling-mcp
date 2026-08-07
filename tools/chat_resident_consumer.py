@@ -14334,9 +14334,15 @@ def _process_messages(messages: list) -> float:
                     post_kwargs["file_followups"] = staged_outbound_files
                 result = post_reply(reply, **post_kwargs)
                 if isinstance(result, dict) and result.get("error"):
-                    if result.get("error") == "bootstrap_incomplete":
+                    if result.get("error") in {
+                        "bootstrap_incomplete",
+                        "voice_turn_superseded",
+                    }:
                         terminal_response_error = True
-                        log.error("reply rejected by bootstrap gate; advancing past this dead-end message")
+                        log.info(
+                            "reply terminally skipped reason=%s; advancing past message",
+                            result.get("error"),
+                        )
                         continue
                     raise RuntimeError(str(result)[:500])
                 posted_any = True
