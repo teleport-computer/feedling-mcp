@@ -200,6 +200,10 @@ if not _provisioned:
         "test_self_thinking_parse.py",
         # Voice hangup summary prompt builder. Pure — no DB.
         "test_voice_cleanup.py",
+        # History-search 纯逻辑内核（planner/cursor/归一化）。Pure — 只
+        # import model_api_runtime.v2.history_search（零 IO 模块），无 DB。
+        # DB 侧的 test_v2_history_search_store.py 不在此名单。
+        "test_v2_history_search_unit.py",
     }
     collect_ignore = sorted(
         f

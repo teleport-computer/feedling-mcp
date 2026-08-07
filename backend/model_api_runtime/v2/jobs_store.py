@@ -10682,3 +10682,117 @@ def set_chat_tail_anchor(user_id: str, anchor_seq: int) -> None:
             "updated_at=now()",
             (str(user_id), value),
         )
+
+
+# ---------------------------------------------------------------------------
+# History search（只读；见 model_api_runtime/v2/history_search.py 的纯逻辑内核）
+# ---------------------------------------------------------------------------
+
+# History-search 可见性 contract（spec §7）：只回用户可见的双方消息。角色白名
+# 单 user/human/openclaw；合成流量（verify_ping / resident_maintenance，写法同
+# db._CHAT_COVERAGE_SOURCE_PREDICATE）在 SQL LIMIT 之前排除，Python 侧后过滤会
+# 让一段长合成行序列把真实候选挤出窗口（同 chat_capture_messages_after_seq 的
+# 教训）。
+_HISTORY_VISIBLE_PREDICATE = (
+    # assistant 侧三个历史 role 都要含（serve_worker._ASSISTANT_ROLES：V1 时代
+    # 写 'agent'，部分路径写 'assistant'，现行 'openclaw'）——漏掉前两个会让老
+    # 用户的历史回复整段搜不到。
+    "doc->>'role' IN ('user','human','openclaw','assistant','agent') "
+    "AND COALESCE(doc->>'source','') "
+    "NOT IN ('verify_ping','resident_maintenance')"
+)
+
+
+def list_level0_summary_leaves(user_id, *, through_seq: int) -> list[dict]:
+    """History-search 扫描提示专用：end_seq<=through_seq 的全部 level-0 叶子。
+
+    刻意不复用 get_summary_frontier_state 的 canonical cover——那个查询会把被
+    更高层 checkpoint 覆盖的子节点排除掉，而扫描提示恰恰需要每片叶子的精确
+    start/end 范围（spec §4）。返回的 summary_envelope 仍是密文，由调用方送
+    enclave 解密后做归一化子串匹配；legacy_opaque 叶子（start_seq=0，无精确
+    source witness）也一并返回，但绝不参与命中段的范围推断——其覆盖的原文可能
+    已被旧 retention 清理，raw 兜底扫不到时置 coverage_gap。
+
+    按 end_seq 降序返回（recent-first 的提示扫描顺序）。只读、无锁；叶子段
+    append-only，end_seq<=snapshot 过滤即天然自洽。
+    """
+    upper = int(through_seq)
+    if upper < 0:
+        raise ValueError("through_seq must be >= 0")
+    with _pool().connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "SELECT segment_id,format_version,coverage_kind,level,"
+                "start_seq,end_seq,source_message_count,"
+                "legacy_opaque_through_seq,summary_envelope "
+                "FROM v2_conversation_summary_segments "
+                "WHERE user_id=%s AND level=0 AND end_seq<=%s "
+                "ORDER BY end_seq DESC,start_seq DESC",
+                (str(user_id), upper),
+            )
+            return [dict(row) for row in cur.fetchall()]
+
+
+def chat_history_candidate_rows(
+    user_id,
+    *,
+    min_seq: int,
+    max_seq: int,
+    start_ts: float | None = None,
+    end_ts: float | None = None,
+    limit: int,
+) -> list[dict]:
+    """一个降序候选窗口的**元数据**（绝不返回、也不解密正文）。
+
+    planner（history_search.next_batch）给出 seq ∈ [min_seq, max_seq]，这里取
+    其中最新的 ``limit`` 条可见候选，按 seq 降序（=扫描优先级顺序）返回。
+    可见性过滤全部发生在 SQL LIMIT 之前（见 _HISTORY_VISIBLE_PREDICATE）；
+    时间范围 start inclusive / end exclusive（spec §3.1）。
+
+    每行只带：seq / msg_id / ts / role / content_type / has_ciphertext。
+    ``has_ciphertext`` 镜像 serve_worker._decrypt_chat_rows 的可读性判据
+    （body_ct 非空且 K_enclave 非空）：False 的行（本地-only、R2 指针化的
+    图片/文件正文等）不可在本路径解密，调用方计入 unavailable_count 或按
+    content_type 走 caption 分支——图片/文件二进制正文（R2）绝不读。
+    """
+    lower = int(min_seq)
+    upper = int(max_seq)
+    if lower < 0 or upper < 0:
+        raise ValueError("history candidate seq bounds must be >= 0")
+    bounded = max(1, min(int(limit), 1000))
+    if upper < lower:
+        return []
+    predicate = (
+        "WHERE user_id=%s AND seq>=%s AND seq<=%s "
+        f"AND {_HISTORY_VISIBLE_PREDICATE} "
+    )
+    params: list = [str(user_id), lower, upper]
+    if start_ts is not None:
+        predicate += "AND ts>=%s "
+        params.append(float(start_ts))
+    if end_ts is not None:
+        predicate += "AND ts<%s "
+        params.append(float(end_ts))
+    with _pool().connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "SELECT seq,msg_id,ts,doc->>'role' AS role,"
+                "COALESCE(doc->>'content_type','') AS content_type,"
+                "(COALESCE(doc->>'body_ct','')<>'' "
+                " AND doc->>'K_enclave' IS NOT NULL) AS has_ciphertext "
+                "FROM chat_messages "
+                + predicate
+                + "ORDER BY seq DESC LIMIT %s",
+                (*params, bounded),
+            )
+            return [
+                {
+                    "seq": int(row["seq"]),
+                    "msg_id": str(row["msg_id"]),
+                    "ts": float(row["ts"]),
+                    "role": str(row["role"] or ""),
+                    "content_type": str(row["content_type"] or ""),
+                    "has_ciphertext": bool(row["has_ciphertext"]),
+                }
+                for row in cur.fetchall()
+            ]
