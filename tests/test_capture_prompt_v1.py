@@ -53,20 +53,43 @@ def test_prompt_naming_rule_uses_known_name():
     assert "提到 Seven 就用「Seven」" in p
     assert '永远不要用"用户"/"user"' in p
     # TA is an instruction/transcript marker only — outputs must not use it.
-    assert "不要用「TA」指代对方" in p
+    assert "不要用「TA」指代本人" in p
 
 
 def test_prompt_naming_rule_without_name_uses_relationship_referent():
-    """No name yet → omit the subject, or use neutral 对方 when necessary."""
+    """No name yet → omit the subject; 对方 is the LAST resort, not the default.
+
+    2026-08-09: the old rule degraded to 「对方」 whenever ``user_name`` was
+    empty and flatly banned 他/她 as "gender guessing".  usr_144b never typed a
+    name into settings (she only ever talked to her partner), so every card
+    about her said 「对方」 — including the ones capture had originally written
+    correctly as 「她」.  "Field not filled in" is not "we don't know who this
+    person is": an evidence-backed pronoun is not a guess.
+    """
     p = build_capture_prompt(
         ai_name="", user_name="", buckets="", threads="", identity="", window="",
     )
     assert "优先省略主语" in p
-    assert "确实需要主语时只用中性的「对方」" in p
-    assert "猜测性别的他/她" in p
+    # 有依据就可以用 他/她,「对方」只兜最后一档。
+    assert "就用「他」或「她」" in p
+    assert "有依据的判断不是猜测" in p
+    assert "只有确实看不出来" in p
+    assert "退到中性的「对方」" in p
+    # 仍然禁的三样,一样都不能松。
     assert "第二人称「你」" in p
     assert '永远不要用"用户"/"user"' in p
-    assert "不要用「TA」指代对方" in p
+    assert "不要用「TA」指代本人" in p
+
+
+def test_capture_prompt_marks_对方_as_a_placeholder_label_not_a_referent():
+    """转写标签 > prompt(2026-07-27 教训):名字未知时每一行都标「对方:」,
+    模型会照抄标签。所以放开称呼规则的同时必须点明这个标签只是占位。"""
+    p = build_capture_prompt(
+        ai_name="", user_name="", buckets="", threads="", identity="",
+        window="- 对方: 老公我到家了",
+    )
+    assert "只是个占位标签" in p
+    assert "不是你该沿用的称呼" in p
 
 
 def test_reserved_placeholder_names_are_treated_as_unknown():

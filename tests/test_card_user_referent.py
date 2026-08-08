@@ -81,7 +81,44 @@ def test_naming_rule_forbids_the_system_labels():
     for rule in (known, unknown):
         assert "用户" in rule and "user" in rule  # 明确点名禁用
     assert "小雨" in known
-    assert "对方" in unknown  # 名字未知时的中性替代
+    assert "对方" in unknown  # 名字未知、性别也判断不出来时的最后一档
+
+
+def test_naming_rule_allows_evidence_backed_pronouns_when_name_is_unknown():
+    """判据 = 「没有任何可靠的称呼/性别依据」,不是「user_name 字段为空」。
+
+    usr_144b(2026-08-09)从没在设置里填过名字,于是每张卡都叫她「对方」——
+    包括 capture 当初读着对话写对的那些。字段没填 ≠ 不知道这个人是谁。
+    """
+    unknown = _naming_rule("")
+    assert "就用「他」或「她」" in unknown
+    assert "有依据的判断不是猜测" in unknown
+    assert "已经写对的「他」/「她」也保留不动" in unknown
+    # 「对方」必须排在 他/她 之后,是兜底而不是首选。
+    assert unknown.index("就用「他」或「她」") < unknown.index("退到中性的「对方」")
+    # 松的只有性别代词这一项,三个系统称谓一个都不许松。
+    assert "「TA」" in unknown and "第二人称「你」" in unknown
+
+
+def test_rewriter_upgrades_pronouns_to_a_known_name_but_never_downgrades_them():
+    """确定性层看不见身份卡和对话,没有判断性别的证据。
+
+    所以它只有资格把 他/她 **升级**成已知真名,没有资格把它降级成「对方」。
+    「TA」/「你」是另一回事:prompt 明令禁这两个词,任何情况下都要改掉。
+    """
+    # 名字已知 → 代词上调成真名(这条旧行为保留)。
+    assert rewrite_user_reference("她终于去看医生了", "小雨", subject="user") == \
+        "小雨终于去看医生了"
+    # 名字未知 → 代词原样保留,绝不降级成「对方」。
+    assert rewrite_user_reference("她终于去看医生了", "", subject="user") == \
+        "她终于去看医生了"
+    assert rewrite_user_reference("He finally saw a doctor.", "", subject="user") == \
+        "He finally saw a doctor."
+    # 「TA」/「你」不受影响 —— 名字未知时照样退到「对方」。
+    assert rewrite_user_reference("TA终于去看医生了", "", subject="user") == \
+        "对方终于去看医生了"
+    assert rewrite_user_reference("你终于去看医生了", "", subject="user") == \
+        "对方终于去看医生了"
 
 
 # --- ③ 残留计数 + 「为什么不在写入路径上跑改写」 ----------------------------
