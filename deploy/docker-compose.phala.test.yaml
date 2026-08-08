@@ -335,6 +335,8 @@ services:
       # Runtime-token secret shared by backend, enclave, and pooled V2 worker.
       FEEDLING_RUNTIME_TOKEN_SECRET: "${FEEDLING_RUNTIME_TOKEN_SECRET:-}"
       FEEDLING_RUNTIME_TOKEN_SECRET_PREVIOUS: "${FEEDLING_RUNTIME_TOKEN_SECRET_PREVIOUS:-}"
+      # Test has one dedicated runner CVM (deploy/test-runner-cvm-id.txt).
+      FEEDLING_EXPECTED_RUNNER_COUNT: "1"
       FEEDLING_PERCEPTION_REBASELINE_UNKNOWN_KEYS: "${FEEDLING_PERCEPTION_REBASELINE_UNKNOWN_KEYS:-0}"
     ports:
       - "5001:5001"
