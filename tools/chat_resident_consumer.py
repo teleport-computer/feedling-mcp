@@ -812,6 +812,9 @@ def _image_generation_failure_user_text(error_class: str, raw_user_text: str) ->
     return (zh if chinese else en).get(error_class, fallback)
 
 _ERROR_CLASS_RULES = (
+    ("model_mismatch", "system",
+     "当前运行时没有成功加载所选模型，请重新选择模型或稍后重试。",
+     re.compile(r"\bmodel_mismatch\b", re.I)),
     # 次序即优先级：quota 必须先于 auth/rate（403+「额度」语义是余额不是权限）
     ("quota_insufficient", "user_provider",
      "模型服务额度不足，充值后再发消息即可恢复。",
@@ -5065,6 +5068,72 @@ def _claude_turn_from_stream(raw: str) -> tuple[str, str]:
     return reply, reasoning
 
 
+def _claude_actual_models_from_stream(raw: str) -> set[str]:
+    """Return model ids reported by Claude Code's structured output only.
+
+    Assistant prose is intentionally ignored: self-identification is promptable
+    and cannot prove which upstream model served the turn. Claude Code reports
+    the fact in ``assistant.message.model`` and terminal ``modelUsage`` keys.
+    """
+    models: set[str] = set()
+
+    def _add(value: Any) -> None:
+        model = str(value or "").strip().lower()
+        if model and len(model) <= 200 and re.fullmatch(r"[a-z0-9._:/-]+", model):
+            models.add(model)
+
+    for obj in _json_objects_from_cli_output(raw):
+        if not isinstance(obj, dict):
+            continue
+        if str(obj.get("type") or "").strip() == "assistant":
+            message = obj.get("message")
+            if isinstance(message, dict):
+                _add(message.get("model"))
+        if str(obj.get("type") or "").strip() == "result":
+            usage = obj.get("modelUsage")
+            if isinstance(usage, dict):
+                for model in usage:
+                    _add(model)
+    return models
+
+
+def _claude_configured_model_matches(configured: str, actual: set[str]) -> bool:
+    """Match Claude CLI family aliases loosely and full route ids exactly."""
+    expected = str(configured or "").strip().lower()
+    normalized_actual = {
+        str(model).strip().lower() for model in actual if str(model).strip()
+    }
+    if expected in {"fable", "opus", "sonnet", "haiku"}:
+        return any(
+            expected in model.split("/")[-1].split(":")[-1]
+            for model in normalized_actual
+        )
+    return expected in normalized_actual
+
+
+def _validate_claude_actual_model(raw: str) -> None:
+    """Reject proven model drift while tolerating old output without metadata."""
+    configured = str(AGENT_RUNTIME_METADATA.get("model") or "").strip()
+    if not configured:
+        return
+    actual = _claude_actual_models_from_stream(raw)
+    if not actual:
+        log.warning(
+            "claude success had no structured actual-model metadata; configured=%s",
+            configured[:200],
+        )
+        return
+    if _claude_configured_model_matches(configured, actual):
+        return
+    actual_text = ",".join(sorted(actual))[:400]
+    _clear_agent_session_id(
+        f"claude model mismatch configured={configured[:200]} actual={actual_text}"
+    )
+    raise RuntimeError(
+        f"model_mismatch: configured={configured[:200]} actual={actual_text}"
+    )
+
+
 def _attach_provider_reasoning(
     reply: str,
     reasoning: str,
@@ -7382,6 +7451,11 @@ def call_agent_cli(
         ))
 
     raw_transport = (result.stdout or "") + "\n" + (result.stderr or "")
+    if result.returncode == 0 and _is_claude_code_cmd(cmd):
+        # Claude Code can silently choose its own default despite ANTHROPIC_MODEL.
+        # Validate the CLI's structured receipt before persisting the session, so
+        # a wrong-model session can never contaminate the next turn.
+        _validate_claude_actual_model(result.stdout or "")
     if _is_pi_cmd(cmd):
         # pi's session id is resident-owned (--session-id, created on first use);
         # pi events carry no session_id field to scrape, and stream scraping could
@@ -7451,6 +7525,7 @@ def call_agent_cli(
             # failed session right after we cleared the stale one — the next
             # turn would --resume straight back into a dead session.
             if result.returncode == 0:
+                _validate_claude_actual_model(result.stdout or "")
                 observed_sid = _extract_session_id(raw_transport) or command_sid
                 if observed_sid:
                     _save_agent_session_id(observed_sid)

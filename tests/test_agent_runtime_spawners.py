@@ -1016,6 +1016,56 @@ def test_pi_default_cli_cmd_model_matches_models_json_entry_id():
         assert sent == f"{spawners._PI_PROVIDER_ID}/{entry_id}", model
 
 
+def test_claude_default_cli_cmd_selects_exact_route_model():
+    argv = shlex.split(
+        spawners._default_cli_cmd(
+            "claude", "/h", model="claude-fable-5",
+        )
+    )
+
+    assert argv[argv.index("--model") + 1] == "claude-fable-5"
+    assert "--fallback-model" not in argv
+
+
+def test_claude_default_cli_cmd_quotes_model_as_one_token():
+    model = "custom model alias"
+    argv = shlex.split(spawners._default_cli_cmd("claude", "/h", model=model))
+
+    assert argv[argv.index("--model") + 1] == model
+
+
+def test_claude_thinking_cli_cmd_selects_exact_route_model():
+    argv = shlex.split(
+        spawners._default_thinking_claude_cmd(
+            "/h", model="claude-opus-4-8",
+        )
+    )
+
+    assert argv[argv.index("--model") + 1] == "claude-opus-4-8"
+    assert "--fallback-model" not in argv
+
+
+def test_consumer_env_pins_claude_route_model_in_argv_and_metadata():
+    env = spawners.consumer_env(
+        {"PATH": "/bin"},
+        {
+            "api_key": "fk",
+            "provider": "anthropic",
+            "provider_key": "sk-ant",
+            "driver": "claude",
+            "model": "claude-fable-5",
+        },
+        user_id="u_1",
+        home="/agent-data/users/u_1",
+    )
+    argv = shlex.split(env["AGENT_CLI_CMD"])
+
+    assert argv[argv.index("--model") + 1] == "claude-fable-5"
+    assert env["ANTHROPIC_MODEL"] == "claude-fable-5"
+    assert env["FEEDLING_AGENT_PROVIDER"] == "anthropic"
+    assert env["FEEDLING_AGENT_MODEL_ID"] == "claude-fable-5"
+
+
 def test_pi_home_writes_models_json():
     files = spawners.agent_home_files("/h", driver="pi", provider="openrouter",
                                       model="x", reasoning_effort="high")

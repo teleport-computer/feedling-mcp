@@ -133,6 +133,7 @@ def test_classify_upstream_mirrors_consumer_on_samples():
     from notices import catalog
     from tools.chat_resident_consumer import classify_agent_error
     samples = [
+        "model_mismatch: configured=claude-fable-5 actual=claude-opus-4-8",
         "insufficient_quota: your credit balance is too low",
         "401 invalid x-api-key",
         "429 too many requests",
