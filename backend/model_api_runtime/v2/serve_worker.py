@@ -120,8 +120,10 @@ from workspace.sandbox import (
 from workspace.service import production_backend as production_workspace_backend
 from worldbook import worldbook_core
 import db
+import generated_image
 import memory_readside_core
 import provider_client
+from provider_types import ProviderResponse
 
 log = logging.getLogger("feedling.runtime_v2.serve_worker")
 
@@ -2057,7 +2059,124 @@ def _read_files(user_id: str, message_ids: list[str]) -> dict[str, dict]:
     return out
 
 
-# Candidate count and whole-card prompt budget for one Dream run.  Selected
+async def _generate_image_for_chat(
+    user_id: str,
+    prompt: str,
+    *,
+    main_provider_config: provider_client.ProviderConfig,
+    api_key: str | None,
+    runtime_token: str,
+):
+    """Resolve the user's optional image route and return normalized media."""
+    selected = await asyncio.to_thread(db.model_api_image_generation_route, user_id)
+    route = selected
+    config = main_provider_config
+    if selected is not None:
+        if str(selected.get("image_generation_test_status") or "") != "ok":
+            raise v2_worker.ImageGenerationUnavailable(
+                "image generation route is not ready",
+                error_code="image_generation_model_not_ready",
+                model=str(selected.get("model") or ""),
+                provider=str(selected.get("provider") or ""),
+            )
+        envelope = selected.get("api_key_envelope")
+        if not isinstance(envelope, dict):
+            raise v2_worker.ImageGenerationUnavailable(
+                "image generation credential is missing",
+                error_code="image_generation_model_not_ready",
+                model=str(selected.get("model") or ""),
+                provider=str(selected.get("provider") or ""),
+            )
+        try:
+            provider_key = await asyncio.to_thread(
+                core_enclave._decrypt_envelope_via_enclave,
+                envelope,
+                api_key,
+                purpose="model_api_provider_key",
+                runtime_token=runtime_token,
+            )
+            config = provider_client.ProviderConfig(
+                str(selected.get("provider") or ""),
+                str(selected.get("model") or ""),
+                provider_key.decode("utf-8"),
+                str(selected.get("base_url") or ""),
+                context_window_tokens=selected.get("context_window_tokens"),
+                reasoning_effort=str(selected.get("reasoning_effort") or ""),
+            )
+        except v2_worker.ImageGenerationUnavailable:
+            raise
+        except Exception as exc:  # noqa: BLE001 - stable failure below
+            raise v2_worker.ImageGenerationUnavailable(
+                "image generation credential could not be opened",
+                error_code="image_generation_auth_invalid",
+                model=str(selected.get("model") or ""),
+                provider=str(selected.get("provider") or ""),
+            ) from exc
+
+    try:
+        result = await provider_client.generate_image_async(config, prompt)
+        media = ProviderResponse.from_result(result).media
+        if not media:
+            raise provider_client.ProviderError("image_generation_invalid_output")
+    except Exception as exc:  # noqa: BLE001 - stable capability surface
+        classified = provider_client.classify_provider_error(exc)
+        incompatible = classified in {"provider_config", "provider_incompatible"} or (
+            str(exc).strip().lower()
+            in {"image_generation_model_unsupported", "image_generation_invalid_output"}
+        )
+        code = {
+            "auth_invalid": "image_generation_auth_invalid",
+            "quota_insufficient": "image_generation_quota_insufficient",
+            "model_not_found": "image_generation_model_not_found",
+            "rate_limited": "image_generation_rate_limited",
+            "upstream_unavailable": "image_generation_unavailable",
+            "turn_timeout": "image_generation_unavailable",
+        }.get(classified, "image_generation_failed")
+        if incompatible:
+            code = (
+                "image_generation_model_incompatible"
+                if selected is not None
+                else "image_generation_model_required"
+            )
+        if isinstance(route, dict) and route.get("id"):
+            await asyncio.to_thread(
+                db.model_api_route_mark_image_generation_test,
+                user_id,
+                str(route["id"]),
+                status="unsupported" if incompatible else "failed",
+                error=code,
+            )
+        elif selected is None:
+            active = await asyncio.to_thread(db.model_api_active_route, user_id)
+            if isinstance(active, dict) and active.get("id"):
+                await asyncio.to_thread(
+                    db.model_api_route_mark_image_generation_test,
+                    user_id,
+                    str(active["id"]),
+                    status="unsupported" if incompatible else "failed",
+                    error=code,
+                )
+        raise v2_worker.ImageGenerationUnavailable(
+            "image generation failed",
+            error_code=code,
+            model=str(getattr(config, "model", "") or ""),
+            provider=str(getattr(config, "provider", "") or ""),
+        ) from exc
+
+    target = route
+    if target is None:
+        target = await asyncio.to_thread(db.model_api_active_route, user_id)
+    if isinstance(target, dict) and target.get("id"):
+        await asyncio.to_thread(
+            db.model_api_route_mark_image_generation_test,
+            user_id,
+            str(target["id"]),
+            status="ok",
+        )
+    return media
+
+
+# Candidate count and whole-card prompt budget for one Dream run. Selected
 # cards are never field-truncated: once the bounded prompt cannot fit another
 # complete fetched card, it stops and leaves that card for a later run.
 _MEMORY_CARDS_LIMIT = int(os.environ.get("FEEDLING_V2_MEMORY_CARDS_LIMIT", "60"))
@@ -2631,14 +2750,32 @@ def _reply_message_fields(payload: dict) -> tuple[str, dict]:
     raw = payload.get("message_extra")
     if raw is None:
         return "text", {}
-    if not isinstance(raw, dict) or set(raw) != {
+    if not isinstance(raw, dict):
+        raise RuntimeError("invalid reply message metadata")
+    content_type = raw.get("content_type")
+    if content_type == "image":
+        if set(raw) != {"content_type", "image_mime", "image_byte_count"}:
+            raise RuntimeError("invalid image reply metadata")
+        mime_type = str(raw.get("image_mime") or "").strip().lower()
+        if mime_type not in {"image/jpeg", "image/png", "image/webp"}:
+            raise RuntimeError("invalid image reply mime")
+        byte_count = raw.get("image_byte_count")
+        if (
+            type(byte_count) is not int
+            or byte_count <= 0
+            or byte_count > generated_image.MAX_GENERATED_IMAGE_STORED_BYTES
+        ):
+            raise RuntimeError("invalid image reply size")
+        return "image", {
+            "image_mime": mime_type,
+            "image_byte_count": byte_count,
+        }
+    if content_type != "file" or set(raw) != {
         "content_type",
         "file_name",
         "file_mime",
         "file_byte_count",
     }:
-        raise RuntimeError("invalid reply message metadata")
-    if raw.get("content_type") != "file":
         raise RuntimeError("unsupported reply content type")
     name = v2_worker._safe_download_name(
         "/workspace/" + str(raw.get("file_name") or "")
@@ -2667,7 +2804,7 @@ def _reply_message_fields(payload: dict) -> tuple[str, dict]:
 
 
 def _reply_payload_sequence(payload: dict) -> list[dict]:
-    """Validate a final text reply followed by its downloadable file cards."""
+    """Validate one final reply group and its encrypted media/file parts."""
     if v2_worker.REPLY_FOLLOWUPS_KEY not in payload:
         return [payload]
     raw_followups = payload.get(v2_worker.REPLY_FOLLOWUPS_KEY)
@@ -2680,8 +2817,8 @@ def _reply_payload_sequence(payload: dict) -> list[dict]:
 
     primary = dict(payload)
     primary.pop(v2_worker.REPLY_FOLLOWUPS_KEY, None)
-    if _reply_message_fields(primary)[0] != "text":
-        raise RuntimeError("reply followups require a text primary")
+    if _reply_message_fields(primary)[0] not in {"text", "image"}:
+        raise RuntimeError("reply followups require a text or image primary")
 
     sequence = [primary]
     for raw_followup in raw_followups:
@@ -2689,7 +2826,7 @@ def _reply_payload_sequence(payload: dict) -> list[dict]:
             not isinstance(raw_followup, dict)
             or set(raw_followup) != {"envelope", "message_extra"}
             or not isinstance(raw_followup.get("envelope"), dict)
-            or _reply_message_fields(raw_followup)[0] != "file"
+            or _reply_message_fields(raw_followup)[0] not in {"file", "image"}
         ):
             raise RuntimeError("invalid reply followup")
         followup = dict(raw_followup)
@@ -2800,6 +2937,9 @@ def _sink_reply_in_transaction(user_id: str, payload: dict, connection):
     records = []
     previous_ts: float | None = None
     last_index = len(message_payloads) - 1
+    grouped_reply = len(message_payloads) > 1 or any(
+        _reply_message_fields(item)[0] == "image" for item in message_payloads
+    )
     for index, message_payload in enumerate(message_payloads):
         envelope = message_payload.get("envelope")
         if not isinstance(envelope, dict):
@@ -2814,6 +2954,9 @@ def _sink_reply_in_transaction(user_id: str, payload: dict, connection):
                 job_id=int(message_payload["activity_job_id"]),
             )
         build_extra = {**reply_extra, **activity_extra, **message_extra}
+        if grouped_reply:
+            build_extra["reply_part_index"] = index
+            build_extra["reply_part_count"] = len(message_payloads)
         if reply_parent_id:
             build_extra["reply_to_message_id"] = reply_parent_id
         wake_kind = str(message_payload.get("wake_kind") or "")
@@ -3924,6 +4067,7 @@ def build_production_deps() -> v2_worker.TurnDeps:
         append_summary_segment=_append_summary_segment,
         append_summary_checkpoint=_append_summary_checkpoint,
         read_images=_read_images,
+        generate_image=_generate_image_for_chat,
         read_vision_observations=_read_vision_observations,
         observe_photo=_observe_photo,
         read_files=_read_files,

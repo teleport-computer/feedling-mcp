@@ -321,6 +321,17 @@ def test_process_messages_image_turn_no_caption_uses_placeholder(tmp_path):
     )
 
 
+# ── 已删除:四条测「runtime 抢先生图」的用例 ──────────────────────────────
+# test_dedicated_image_route_failure_keeps_stable_settings_guidance
+# test_native_agent_fallback_only_applies_when_dedicated_route_is_absent
+# test_dedicated_image_route_stages_generated_media
+# test_dedicated_image_success_delivers_without_waiting_for_main_model
+#
+# 最后一条的名字就是被废除的那个反模式本身:"delivers without waiting for
+# main model" —— 图不经过主模型就直接发给用户,回复是系统写死的一句话。
+# 现在生图由伴侣自己调用 generate-image 发起,它的话和图一起送达。
+# 新行为的用例见 test_resident_image_autonomy.py。
+
 def test_dedicated_vision_sends_only_observation_to_main_model(tmp_path):
     crc._seen_ids.clear()
     crc._seen_ids_order.clear()

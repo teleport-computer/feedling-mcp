@@ -10,6 +10,19 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **The companion now decides when to generate an image.** Image generation is
+  no longer triggered by keyword matching on the user's message, and a dedicated
+  image route no longer bypasses the main model. The companion calls an image
+  tool itself — `generate_image` on Runtime V2, `io_cli.py generate-image` on
+  Runtime V1 and self-hosted CLI residents — writes its own prompt, and its
+  accompanying words are delivered together with the picture in one reply
+  instead of being discarded. It may also generate an image without an explicit
+  request. Generation failures are returned to the companion as a tool result so
+  it can explain them in its own words rather than ending the turn; a reply that
+  claims an image was produced when none was is returned once for correction,
+  and is then delivered as written. `POST /v1/image-generation/generate` and the
+  existing encrypted image-delivery path are unchanged.
+
 - **Failed voice calls now have an explicit, idempotent cancellation path.**
   `POST /v1/voice/cancel` installs a durable per-call tombstone, clears
   unarchived turn/result rows, and suppresses late resident or Hosted Runtime
@@ -272,6 +285,23 @@ change must not be interpreted as an API guarantee.
   non-empty reply with contradictory colors remains unsupported. Stable visual
   error codes still distinguish incompatible image input, invalid credentials,
   quota, rate limits, and temporary provider failures.
+
+- **VPS image generation is now capability-based.** A resident can advertise
+  `agent_image_generation_v1` when its configured agent entry actually exposes
+  a callable image tool. Dedicated image routes still take precedence; without
+  one, capable residents receive the request directly, while residents that do
+  not advertise the capability continue to receive image-model setup guidance.
+  When a dedicated route succeeds, its prepared image is delivered immediately
+  through the existing atomic reply path instead of waiting for a second main-
+  model turn.
+
+- **Generated images can now appear directly in Chat.** Runtime V2 normalizes
+  inline image results from supported provider responses, while CLI residents
+  can stage PNG, JPEG, or WebP output with `send-image`. Images are validated,
+  size-bounded, encrypted separately, and committed atomically with the reply as
+  native `content_type=image` rows. The public resident response contract adds
+  `image_followups`; remote provider URLs and local filesystem paths are never
+  exposed as image delivery.
 
 - **Hosted visual failures are easier to diagnose without exposing user
   content.** Per-user admin detail now includes bounded model-route runtime

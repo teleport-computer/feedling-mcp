@@ -42,6 +42,35 @@ def _voice_rows() -> list[dict]:
             "content": "- 对方: 你好\n- 我: 你好呀",
         },
         {
+            "id": "voice-old-revision",
+            "role": "user",
+            "source": "chat",
+            "voice_call_id": "vcall_live",
+            "voice_turn_id": "2.old",
+            "voice_logical_turn_id": "2",
+            # Simulate the brief primary-to-TEE mirror lag: ordering still
+            # makes the later revision authoritative before this flips.
+            "voice_turn_status": "current",
+            "content": "可以啊",
+        },
+        {
+            "id": "voice-old-reply",
+            "role": "assistant",
+            "source": "model_api",
+            "reply_to_message_id": "voice-old-revision",
+            "content": "那试一条语音吧",
+        },
+        {
+            "id": "voice-current-revision",
+            "role": "user",
+            "source": "chat",
+            "voice_call_id": "vcall_live",
+            "voice_turn_id": "2.current",
+            "voice_logical_turn_id": "2",
+            "voice_turn_status": "current",
+            "content": "可以啊，今天什么时候日落？",
+        },
+        {
             "id": "real-chat",
             "role": "user",
             "source": "chat",
@@ -53,6 +82,7 @@ def _voice_rows() -> list[dict]:
 def test_conversation_rows_keep_typed_dots_but_drop_voice_artifacts():
     assert [row["id"] for row in conversation_rows(_voice_rows())] == [
         "typed-dots",
+        "voice-current-revision",
         "real-chat",
     ]
 
@@ -90,6 +120,8 @@ def test_future_compaction_omits_voice_artifact_content_but_keeps_coverage():
     assert out == "- 用户今天在成都"
     assert "- 对方: 你好" not in request
     assert "又是点点点" not in request
+    assert "那试一条语音吧" not in request
+    assert "可以啊，今天什么时候日落？" in request
     assert "今天在成都" in request
 
     calls.clear()

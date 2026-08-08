@@ -29,9 +29,16 @@ from content_encryption import build_envelope  # noqa: E402
 # provisioning/teardown on api.feedling.app would create (then hard-delete)
 # accounts in the real user registry — api.feedling.app is NOT in the allowlist.
 TEST_API = os.environ.get("FEEDLING_E2E_API", "https://test-api.feedling.app")
+# The custom-domain entrypoint, NOT the gateway `-5003s.` passthrough. Both are
+# documented in deploy/docker-compose.phala.test.yaml, but the passthrough host
+# is app_id-derived and therefore dies on every redeploy to a new CVM: the
+# hardcoded one here stopped answering (TLS handshake timeout) while
+# test-enclave.feedling.app returned 200 (verified 2026-08-08). Anything that
+# needs a decrypt source — notably a locally run resident consumer — silently
+# fails to start on the stale host, so keep the stable domain as the default.
 TEST_ENCLAVE = os.environ.get(
     "FEEDLING_E2E_ENCLAVE",
-    "https://173c7f49aeb54acb424676b17b17f78e5e2b2938-5003s.dstack-pha-prod9.phala.network",
+    "https://test-enclave.feedling.app",
 )
 # Test-family hosts only. pre-api is the Runtime V2 qualification target
 # (2026-07-21); prod stays out → any provisioning against it is refused.

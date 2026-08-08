@@ -310,6 +310,10 @@ _FILE_FORMAT_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     (".rtf", re.compile(r"(?:\.rtf\b|\brtf\b)")),
 )
 
+# Conservative completion guard for explicit image-creation requests. The model
+# still owns prompt interpretation; this only prevents a text placeholder such
+# as "Image" from satisfying a request that clearly asks IO to create a visual.
+
 
 def _norm_role(role: Any) -> str:
     return "assistant" if str(role or "") in _ASSISTANT_ROLES else "user"

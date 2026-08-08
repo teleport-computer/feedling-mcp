@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import hmac
 import ipaddress
 import json
 import logging
@@ -110,6 +111,25 @@ def _voice_turn_id(user_turn_index: int) -> str:
     return str(max(1, user_turn_index))
 
 
+def _voice_revision_turn_id(
+    call_id: str,
+    logical_turn_id: str,
+    message: str,
+    *,
+    secret_key: bytes,
+) -> str:
+    """Stable opaque delivery id for one exact ASR revision.
+
+    ElevenLabs can issue another Custom LLM request for the same logical user
+    turn after a short pause.  The logical id groups those revisions; this
+    content-bound id isolates their reply streams and transport idempotency.
+    HMAC keeps short spoken phrases out of plaintext routing metadata.
+    """
+    label = f"{call_id}\n{logical_turn_id}\n{message}".encode("utf-8")
+    digest = hmac.new(secret_key, label, hashlib.sha256).hexdigest()[:20]
+    return f"{logical_turn_id}.{digest}"
+
+
 def _voice_session_context(payload: dict) -> tuple[str, str, str, list[str]]:
     """Read per-call fields from ElevenLabs' custom LLM envelope."""
     extra = payload.get("elevenlabs_extra_body")
@@ -191,6 +211,7 @@ def _resident_voice_send_core(
     client_msg_id: str,
     call_id: str,
     turn_id: str,
+    logical_turn_id: str,
 ) -> tuple[dict, int]:
     """Put a voice transcript through the same lane as resident text chat."""
     envelope, envelope_error = core_envelope._build_shared_envelope_for_store(
@@ -209,7 +230,12 @@ def _resident_voice_send_core(
         envelope,
         client_msg_id=client_msg_id,
         window_sec=chat_idempotency.CLIENT_MSG_ID_WINDOW_SEC,
-        extra={"voice_call_id": call_id, "voice_turn_id": turn_id},
+        extra={
+            "voice_call_id": call_id,
+            "voice_turn_id": turn_id,
+            "voice_logical_turn_id": logical_turn_id,
+            "voice_turn_status": "current",
+        },
     )
     if inserted:
         store.notify_chat_waiters()
@@ -435,7 +461,11 @@ async def finalize_voice_call(
         archived = transcript_store.exists(user_id, call_id)
         already = archived and _db.chat_get_strict(user_id, mid) is not None
         if not archived:
-            text = transcript_store.render_transcript(turns)
+            # 真名优先:这份记录用户会亲眼读,Capture 也拿它当输入,两处都该看到
+            # TA 给伴侣起的名字而不是中性标签。取不到才退回既有兜底。
+            speaker_user, speaker_ai = transcript_store.resolve_speaker_names(store)
+            text = transcript_store.render_transcript(
+                turns, user_name=speaker_user, ai_name=speaker_ai)
             if not text:
                 return {"error": "turns_required"}, 400
             try:
@@ -600,7 +630,13 @@ async def voice_chat_completions(request: Request):
     if len(message) > 12000:
         return JSONResponse({"error": "message_too_long"}, status_code=413)
 
-    turn_id = _voice_turn_id(user_turn_index)
+    logical_turn_id = _voice_turn_id(user_turn_index)
+    turn_id = _voice_revision_turn_id(
+        call_id,
+        logical_turn_id,
+        message,
+        secret_key=results.secret(),
+    )
     client_msg_id = str(uuid.uuid5(_VOICE_NAMESPACE, f"{call_id}:{turn_id}"))
     user_id = str(claims["user_id"])
     request_id = "chatcmpl-" + hashlib.sha256(
@@ -645,6 +681,7 @@ async def voice_chat_completions(request: Request):
                 client_msg_id=client_msg_id,
                 call_id=call_id,
                 turn_id=turn_id,
+                logical_turn_id=logical_turn_id,
             )
         else:
             body, status = await threadpool.run_db(
@@ -653,7 +690,11 @@ async def voice_chat_completions(request: Request):
                 api_key=None,
                 runtime_tok=results.mint_enclave_token(user_id),
                 payload={"message": message, "client_msg_id": client_msg_id},
-                voice_context={"call_id": call_id, "turn_id": turn_id},
+                voice_context={
+                    "call_id": call_id,
+                    "turn_id": turn_id,
+                    "logical_turn_id": logical_turn_id,
+                },
             )
     if status >= 400:
         code = str(body.get("error") or "unknown")
@@ -690,6 +731,7 @@ async def voice_chat_completions(request: Request):
         buffer_count = 1
         next_keepalive = time.monotonic() + 3.5
         next_lifecycle_check = time.monotonic()
+        next_revision_check = time.monotonic()
         reply = None
         while time.monotonic() < deadline:
             now = time.monotonic()
@@ -704,12 +746,49 @@ async def voice_chat_completions(request: Request):
                     )
                     break
                 next_lifecycle_check = now + 0.6
+            if now >= next_revision_check:
+                current = await threadpool.run_db(
+                    results.is_current_voice_turn,
+                    user_id,
+                    parent_message_id=message_id,
+                )
+                if not current:
+                    yield _sse_chunk(request_id, finish="stop")
+                    yield "data: [DONE]\n\n"
+                    log.info(
+                        "[voice.gateway] stream superseded user=%s",
+                        user_id[:12],
+                    )
+                    return
+                next_revision_check = now + 0.5
             snapshots = await threadpool.run_db(
                 results.load_stream_texts,
                 user_id,
                 call_id=call_id,
                 turn_id=turn_id,
             )
+            has_new_stream_text = any(
+                _incremental_suffix(
+                    streamed_by_segment.get(int(snapshot.get("segment") or 0), ""),
+                    str(snapshot.get("text") or ""),
+                )
+                for snapshot in snapshots
+            )
+            if has_new_stream_text:
+                current = await threadpool.run_db(
+                    results.is_current_voice_turn,
+                    user_id,
+                    parent_message_id=message_id,
+                )
+                if not current:
+                    yield _sse_chunk(request_id, finish="stop")
+                    yield "data: [DONE]\n\n"
+                    log.info(
+                        "[voice.gateway] stream superseded before content user=%s",
+                        user_id[:12],
+                    )
+                    return
+                next_revision_check = time.monotonic() + 0.5
             for snapshot in snapshots:
                 segment = int(snapshot.get("segment") or 0)
                 text = str(snapshot.get("text") or "")
@@ -776,6 +855,20 @@ async def voice_chat_completions(request: Request):
                 "message_id": "",
                 "text": notices_catalog.user_text_for("turn_timeout"),
             }
+        if lifecycle_status not in {"finalizing", "cancelled", "finalized"}:
+            current = await threadpool.run_db(
+                results.is_current_voice_turn,
+                user_id,
+                parent_message_id=message_id,
+            )
+            if not current:
+                yield _sse_chunk(request_id, finish="stop")
+                yield "data: [DONE]\n\n"
+                log.info(
+                    "[voice.gateway] stream superseded before final user=%s",
+                    user_id[:12],
+                )
+                return
         text = str((reply or {}).get("text") or "")
         latest_segment = max(streamed_by_segment, default=-1)
         streamed_final = streamed_by_segment.get(latest_segment, "")

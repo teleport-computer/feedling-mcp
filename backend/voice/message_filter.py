@@ -57,16 +57,41 @@ def conversation_rows(rows: Iterable[dict]) -> list[dict]:
 
     A punctuation/noise-only row is suppressed only when it carries
     ``voice_call_id``. A user who intentionally types ``...`` in text chat is
-    therefore unchanged. Replies explicitly linked to a suppressed voice row
-    are removed with their parent.
+    therefore unchanged. For one voice call/logical turn, only the newest ASR
+    revision is kept even if shadow metadata replication is still catching up.
+    Replies explicitly linked to a suppressed voice row are removed with their
+    parent.
     """
     materialized = [row for row in rows if isinstance(row, dict)]
+    latest_voice_user_id_by_turn: dict[tuple[str, str], str] = {}
+    for row in materialized:
+        role = str(row.get("role") or "").strip().lower()
+        call_id = str(row.get("voice_call_id") or "").strip()
+        logical_turn_id = str(
+            row.get("voice_logical_turn_id") or row.get("voice_turn_id") or ""
+        ).strip()
+        row_id = str(row.get("id") or "").strip()
+        if role in {"user", "human"} and call_id and logical_turn_id and row_id:
+            latest_voice_user_id_by_turn[(call_id, logical_turn_id)] = row_id
+
     rejected_voice_user_ids = {
         str(row.get("id") or "").strip()
         for row in materialized
         if str(row.get("role") or "").strip().lower() in {"user", "human"}
         and str(row.get("voice_call_id") or "").strip()
-        and not is_meaningful_voice_message(_content_text(row.get("content")))
+        and (
+            str(row.get("voice_turn_status") or "").strip() == "superseded"
+            or not is_meaningful_voice_message(_content_text(row.get("content")))
+            or latest_voice_user_id_by_turn.get((
+                str(row.get("voice_call_id") or "").strip(),
+                str(
+                    row.get("voice_logical_turn_id")
+                    or row.get("voice_turn_id")
+                    or ""
+                ).strip(),
+            ))
+            != str(row.get("id") or "").strip()
+        )
         and str(row.get("id") or "").strip()
     }
 

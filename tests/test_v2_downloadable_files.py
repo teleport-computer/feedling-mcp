@@ -16,7 +16,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 import provider_client
 import conftest
 import db
-from provider_types import ToolExchange, ToolResult
+from provider_types import ProviderMedia, ToolExchange, ToolResult
 from core import store as core_store
 from hosted import file_text
 from model_api_runtime.v2 import document_render
@@ -965,6 +965,260 @@ def test_reply_metadata_rejects_unbounded_or_forged_values():
                     "file_name": "x.md",
                     "file_mime": "text/markdown",
                     "file_byte_count": worker._WORKSPACE_FILE_MAX_BYTES + 1,
+                }
+            }
+        )
+
+
+def test_reply_payload_sequence_accepts_image_primary_and_image_followups():
+    payload = {
+        "envelope": {"id": "a" * 32},
+        "message_extra": {
+            "content_type": "image",
+            "image_mime": "image/png",
+            "image_byte_count": 100,
+        },
+        worker.REPLY_FOLLOWUPS_KEY: [
+            {
+                "envelope": {"id": "b" * 32},
+                "message_extra": {
+                    "content_type": "image",
+                    "image_mime": "image/webp",
+                    "image_byte_count": 200,
+                },
+            }
+        ],
+    }
+    sequence = serve_worker._reply_payload_sequence(payload)
+    assert [serve_worker._reply_message_fields(item)[0] for item in sequence] == [
+        "image",
+        "image",
+    ]
+
+
+def test_process_job_commits_single_generated_image_without_empty_followups(
+    monkeypatch,
+):
+    user_id = "u_v2_single_generated_image"
+    conftest.seed_user(user_id)
+    with db.get_pool().connection() as connection:
+        connection.execute("DELETE FROM agent_jobs")
+        connection.execute(
+            "DELETE FROM v2_effect_outbox WHERE user_id=%s", (user_id,)
+        )
+        connection.execute(
+            "DELETE FROM chat_messages WHERE user_id=%s", (user_id,)
+        )
+    conftest.set_v2_runtime_owner(user_id)
+
+    db.chat_append_strict(
+        user_id,
+        "image-request",
+        1.0,
+        {
+            "id": "image-request",
+            "role": "user",
+            "source": "model_api",
+            "body_ct": "cipher-request",
+            "nonce": "n",
+            "K_user": "k",
+            "K_enclave": "e",
+        },
+        5000,
+    )
+    input_seq = db.chat_seq_for_msg_id(user_id, "image-request")
+    assert input_seq is not None
+
+    job_id, _ = jobs_store.enqueue_job(user_id, "chat")
+    job = jobs_store.claim_next_job("image-worker")
+    assert job is not None and job["id"] == job_id
+
+    def build_envelope(store, plaintext, *, item_id=None):
+        return (
+            {
+                "v": 1,
+                "id": item_id,
+                "owner_user_id": store.user_id,
+                "body_ct": base64.b64encode(plaintext).decode("ascii"),
+                "nonce": "n",
+                "K_user": "k",
+            },
+            "",
+        )
+
+    monkeypatch.setattr(
+        worker.core_envelope,
+        "_build_shared_envelope_for_store",
+        build_envelope,
+    )
+
+    def apply_effects(uid):
+        return effect_outbox.apply_pending_effects(
+            uid,
+            dispatch=lambda _effect_type, _payload: None,
+            dispatch_reply_in_transaction=(
+                lambda _effect_type, payload, connection:
+                serve_worker._sink_reply_in_transaction(uid, payload, connection)
+            ),
+        )
+
+    image_bytes = base64.b64decode(
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk"
+        "+A8AAQUBAScY42YAAAAASUVORK5CYII="
+    )
+
+    async def direct_loop(**kwargs):
+        await kwargs["on_reply"](
+            "",
+            final=True,
+            media=(
+                ProviderMedia(
+                    mime_type="image/png",
+                    data_base64=base64.b64encode(image_bytes).decode("ascii"),
+                    name="result.png",
+                ),
+            ),
+        )
+        return tool_loop.LoopOutcome(
+            final_text="",
+            rounds=1,
+            stop_reason="final_media",
+            replied_intermediate=False,
+            delivered_media_count=1,
+        )
+
+    monkeypatch.setattr(worker.v2_tool_loop, "run_tool_loop", direct_loop)
+
+    def read_after_seq(_uid, after_seq):
+        if after_seq >= input_seq:
+            return []
+        return [
+            {
+                "id": "image-request",
+                "seq": input_seq,
+                "ts": 1.0,
+                "role": "user",
+                "content": "生成一张图片",
+            }
+        ]
+
+    deps = worker.TurnDeps(
+        read_messages=lambda _uid: read_after_seq(_uid, 0),
+        read_messages_after_seq=read_after_seq,
+        resolve_provider=lambda _uid: (_PROVIDER, {}),
+        mint_enclave_token=lambda _uid: "rt-image",
+        apply_pending_effects=apply_effects,
+    )
+
+    status = asyncio.run(
+        worker.process_job(
+            job,
+            deps,
+            provider_config=_PROVIDER,
+            api_key=None,
+            runtime_token="rt-image",
+        )
+    )
+
+    assert status == "completed"
+    with db.get_pool().connection() as connection:
+        reply = connection.execute(
+            "SELECT doc FROM chat_messages WHERE user_id=%s "
+            "AND doc->>'role'='openclaw'",
+            (user_id,),
+        ).fetchone()[0]
+        effect = connection.execute(
+            "SELECT payload FROM v2_effect_outbox WHERE job_id=%s",
+            (job_id,),
+        ).fetchone()[0]
+    assert reply["content_type"] == "image"
+    assert reply["image_mime"] == "image/png"
+    assert base64.b64decode(reply["body_ct"]).startswith(b"\x89PNG\r\n\x1a\n")
+    assert worker.REPLY_FOLLOWUPS_KEY not in effect
+
+
+def test_transactional_image_reply_group_persists_primary_part_metadata(monkeypatch):
+    captured = []
+
+    class Store:
+        def _build_chat_message(
+            self, role, source, envelope, content_type="text", extra=None
+        ):
+            captured.append((envelope["id"], content_type, dict(extra or {})))
+            return {"id": envelope["id"], "ts": float(len(captured))}
+
+        def reload_chat_strict(self):
+            pass
+
+        def notify_chat_waiters(self):
+            pass
+
+    class Connection:
+        def execute(self, *args):
+            pass
+
+    monkeypatch.setattr(serve_worker.core_store, "get_store", lambda user_id: Store())
+    monkeypatch.setattr(
+        serve_worker.db,
+        "chat_append_effect_with_cursor",
+        lambda *args, **kwargs: (len(captured), False, lambda: None),
+    )
+    monkeypatch.setattr(
+        serve_worker.capture_scheduler,
+        "refresh_capture_state_from_chat",
+        lambda *args, **kwargs: None,
+    )
+
+    payload = {
+        "envelope": {"id": "a" * 32},
+        "message_extra": {
+            "content_type": "image",
+            "image_mime": "image/png",
+            "image_byte_count": 100,
+        },
+        "reply_to_message_id": "user-message",
+        worker.REPLY_FOLLOWUPS_KEY: [
+            {
+                "envelope": {"id": "b" * 32},
+                "message_extra": {
+                    "content_type": "image",
+                    "image_mime": "image/webp",
+                    "image_byte_count": 200,
+                },
+            }
+        ],
+    }
+    post_commit = serve_worker._sink_reply_in_transaction(
+        "user-1", payload, Connection()
+    )
+
+    assert [(kind, extra["reply_part_index"]) for _, kind, extra in captured] == [
+        ("image", 0),
+        ("image", 1),
+    ]
+    assert all(extra["reply_part_count"] == 2 for _, _, extra in captured)
+    assert all(extra["reply_to_message_id"] == "user-message" for _, _, extra in captured)
+    assert callable(post_commit)
+
+
+def test_reply_image_metadata_rejects_svg_and_oversized_payloads():
+    with pytest.raises(RuntimeError, match="mime"):
+        serve_worker._reply_message_fields(
+            {
+                "message_extra": {
+                    "content_type": "image",
+                    "image_mime": "image/svg+xml",
+                    "image_byte_count": 100,
+                }
+            }
+        )
+    with pytest.raises(RuntimeError, match="size"):
+        serve_worker._reply_message_fields(
+            {
+                "message_extra": {
+                    "content_type": "image",
+                    "image_mime": "image/png",
+                    "image_byte_count": 2_000_001,
                 }
             }
         )

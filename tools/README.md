@@ -224,6 +224,19 @@ AGENT_MODE=cli
 AGENT_CLI_CMD=mycli ask {message}
 ```
 
+If the configured CLI exposes a callable native image-generation tool, declare
+that exact resident capability explicitly:
+
+```
+FEEDLING_AGENT_IMAGE_GENERATION=true
+```
+
+Do not set this merely because the selected language model or provider can
+generate images through some separate API. The agent entry itself must be able
+to invoke the tool and write a PNG, JPEG, or WebP for `io_cli.py send-image`.
+When declared, a missing dedicated image route falls through to the resident's
+native tool; a user-selected dedicated image route still takes precedence.
+
 A known-good **claude** command that can actually see chat images (assumes
 `IMAGE_TEMP_DIR=/home/agent/images`; adjust the path to yours — see the vision
 notes below for why `--add-dir` and the `//` are required):

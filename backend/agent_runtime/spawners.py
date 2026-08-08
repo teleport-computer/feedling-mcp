@@ -83,6 +83,11 @@ _IO_CLI_VERBS = (
     # agent loops "waiting for permission approval" instead of showing the image.
     "chat-image",
     "send-file",
+    "send-image",
+    # 用用户配置的专用生图模型画图。**由伴侣自己决定何时调、prompt 怎么写** ——
+    # 2026-08-08 之前这条能力只能被一道正则闸触发(判断"用户是不是在要图"),
+    # 含蓄请求判不出来、伴侣自己想画也没有入口。
+    "generate-image",
     # memory-write/-patch/-delete + schedule-wake/cancel-wake (T13): parity with
     # the VPS/OpenClaw io_cli surface — writing memory cards and self-scheduling a
     # wake are otherwise silently unavailable to hosted claude even though io_cli
@@ -160,6 +165,8 @@ _AGENT_PROMPT_FALLBACK_COMMANDS = (
     "python {io_cli} photo-read --id <photo_id> [--include-image]\n"
     "python {io_cli} chat-image --id <message_id>\n"
     "python {io_cli} send-file --path <source_path> --name <download_name>\n"
+    "python {io_cli} generate-image --prompt <complete visual description>\n"
+    "python {io_cli} send-image --path <image_path> [--name <display_name>]\n"
     "python {io_cli} schedule-wake --at <time> [--reason <text>] [--tz <tz>]\n"
     "python {io_cli} cancel-wake --wake-id <id> [--reason <text>]\n"
     "python {io_cli} web-search <query> [--limit <n>]\n"

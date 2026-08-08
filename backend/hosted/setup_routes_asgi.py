@@ -39,6 +39,7 @@ from hosted import config_store
 from hosted import setup_core
 from chat import consumer as chat_consumer
 from hosted import usage_core
+from hosted import image_generator
 from hosted import vision_observer
 
 router = APIRouter()
@@ -160,6 +161,99 @@ async def vision_observe(request: Request, auth: AuthResult = Depends(require_au
     )
     body, status = await threadpool.run_db(
         vision_observer.observe_pinned_message,
+        auth.store,
+        payload,
+        caller_api_key=caller_api_key,
+        caller_runtime_token=caller_runtime_token,
+    )
+    return JSONResponse(body, status_code=status)
+
+
+@router.get("/v1/image-generation/config")
+async def image_generation_config_get(auth: AuthResult = Depends(require_auth)):
+    body, status = await threadpool.run_db(
+        setup_core.image_generation_config_get,
+        auth.store,
+    )
+    return JSONResponse(body, status_code=status)
+
+
+@router.put("/v1/image-generation/config")
+async def image_generation_config_set(
+    request: Request,
+    auth: AuthResult = Depends(require_auth),
+):
+    payload = (await asgi_http.read_json_silent(request)) or {}
+    caller_api_key = auth_core.extract_api_key(request.headers, request.query_params)
+    body, status = await threadpool.run_db(
+        setup_core.image_generation_config_set,
+        auth.store,
+        payload,
+        caller_api_key=caller_api_key,
+    )
+    return JSONResponse(body, status_code=status)
+
+
+@router.post("/v1/image-generation/config")
+async def image_generation_route_configure(
+    request: Request,
+    auth: AuthResult = Depends(require_auth),
+):
+    payload = (await asgi_http.read_json_silent(request)) or {}
+    caller_api_key = auth_core.extract_api_key(request.headers, request.query_params)
+    body, status = await threadpool.run_db(
+        setup_core.image_generation_route_configure,
+        auth.store,
+        payload,
+        caller_api_key=caller_api_key,
+    )
+    return JSONResponse(body, status_code=status)
+
+
+@router.post("/v1/image-generation/main/test")
+async def image_generation_main_test(
+    request: Request,
+    auth: AuthResult = Depends(require_auth),
+):
+    caller_api_key = auth_core.extract_api_key(request.headers, request.query_params)
+    body, status = await threadpool.run_db(
+        setup_core.image_generation_main_test,
+        auth.store,
+        caller_api_key=caller_api_key,
+    )
+    return JSONResponse(body, status_code=status)
+
+
+@router.post("/v1/image-generation/routes/{route_id}/test")
+async def image_generation_route_test(
+    route_id: str,
+    request: Request,
+    auth: AuthResult = Depends(require_auth),
+):
+    caller_api_key = auth_core.extract_api_key(request.headers, request.query_params)
+    body, status = await threadpool.run_db(
+        setup_core.image_generation_route_test,
+        auth.store,
+        route_id,
+        caller_api_key=caller_api_key,
+    )
+    return JSONResponse(body, status_code=status)
+
+
+@router.post("/v1/image-generation/generate")
+async def image_generation_generate(
+    request: Request,
+    auth: AuthResult = Depends(require_auth),
+):
+    payload = (await asgi_http.read_json_silent(request)) or {}
+    caller_api_key = auth_core.extract_api_key(request.headers, request.query_params)
+    caller_runtime_token = (
+        auth_core.extract_runtime_token(request.headers) or ""
+        if auth.runtime_token_claims is not None
+        else ""
+    )
+    body, status = await threadpool.run_db(
+        image_generator.generate_with_pinned_route,
         auth.store,
         payload,
         caller_api_key=caller_api_key,

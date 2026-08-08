@@ -22,6 +22,7 @@ from capabilities import registry
 
 REPLY_TOOL = "reply"
 FILE_REPLY_TOOL = "send_file"
+IMAGE_REPLY_TOOL = "generate_image"
 TASK_TOOL = "task"
 PROVIDER_USAGE_TOOL = "provider_usage"
 MEMORY_ORGANIZE_TOOL = "memory_organize"
@@ -287,6 +288,11 @@ PARAMS: dict[str, dict] = {
         "properties": {"path": _STR, "revision": _INT},
         "required": ["path", "revision"],
     },
+    IMAGE_REPLY_TOOL: {
+        "type": "object",
+        "properties": {"prompt": _STR},
+        "required": ["prompt"],
+    },
 
     # -- runtime-native provider_usage tool (chat-lane only; see worker.py
     # _SUBAGENT_ALLOWED_TOOLS / _PRIVATE_READ_TOOLS / _run_wake disabled set) --
@@ -436,6 +442,14 @@ DESCRIPTIONS: dict[str, str] = {
         "Do not call this merely because a conversational answer contains a list "
         "or structured text. Host filesystem paths and /artifacts, /skills, or "
         "/memory entries are not accepted."
+    ),
+    IMAGE_REPLY_TOOL: (
+        "Generate and deliver a real image in the chat. Call this whenever the user "
+        "asks you to draw, create, design, or generate an image, illustration, poster, "
+        "avatar, photo, or other visual. Put the complete visual instruction in prompt. "
+        "Never answer such a request with the word 'Image', a Markdown placeholder, a "
+        "fake URL, or a claim that an image was created. This tool either delivers "
+        "validated image bytes or returns a structured configuration failure."
     ),
     PROVIDER_USAGE_TOOL: (
         "查询当前 AI 服务商账户的余额与用量（只读）。仅在用户明确询问余额、用量、"
@@ -596,6 +610,8 @@ def validate_tool_args(name: str, args, *, live_model_call: bool = False) -> str
         type(args.get("revision")) is not int or args["revision"] <= 0
     ):
         return "send_file revision must be a positive integer"
+    if name == IMAGE_REPLY_TOOL and not str(args.get("prompt") or "").strip():
+        return "generate_image requires a non-empty prompt"
     return None
 
 
@@ -609,6 +625,7 @@ def build_tool_specs() -> list[ToolSpec]:
         TASK_TOOL,
         REPLY_TOOL,
         FILE_REPLY_TOOL,
+        IMAGE_REPLY_TOOL,
         PROVIDER_USAGE_TOOL,
         MEMORY_ORGANIZE_TOOL,
     ):
