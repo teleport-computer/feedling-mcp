@@ -172,7 +172,7 @@ def gate_enabled() -> bool:
     }
 
 
-def strip_all_thinking(text: str) -> tuple[str, str, str]:
+def strip_all_thinking(text: str, *, sanitize: bool = True) -> tuple[str, str, str]:
     """全文剥离版，返回 ``(status, thinking, reply)``，状态常量与
     :func:`split_thinking` 完全相同，方便调用点按 kill switch 二选一。
 
@@ -180,6 +180,10 @@ def strip_all_thinking(text: str) -> tuple[str, str, str]:
     在结尾复查残留。剥完只要正文里还剩任何 think 类标签，就返回 ``FAILED``
     （thinking/reply 都为空），由调用方决定发兜底话还是静默——绝不把带标签的
     残文端给用户。
+
+    ``sanitize=False`` 时思考按原样（保留换行、不截断）返回，交给调用方自己
+    格式化。V1 consumer 用这条：它有自己的摘要器（保留换行、上限 700），本次
+    统一剥离**判据**，不该顺带改掉它的展示格式。
     """
     raw = str(text or "")
     if not _RESIDUE.search(raw):
@@ -220,7 +224,8 @@ def strip_all_thinking(text: str) -> tuple[str, str, str]:
         return FAILED, "", ""
 
     reply = re.sub(r"\n{3,}", "\n\n", reply).strip()
-    thinking = _sanitize("\n\n".join(blocks))
+    joined = "\n".join(blocks)
+    thinking = _sanitize(joined) if sanitize else joined.strip()
     if not reply:
         return SILENT, thinking, ""
     return COMPLETE, thinking, reply

@@ -3637,8 +3637,24 @@ def _split_tagged_thinking(text: str) -> tuple[str, str]:
     Structured reasoning fields remain the preferred path. This only handles
     plain terminal text where an upstream wrapper serialized reasoning as
     `<think>...</think>`, `<reasoning>...</reasoning>`, or `<thought>...</thought>`.
+
+    2026-08-08 起委托 ``core.self_thinking`` 的共享内核：此前 V1/V2 各一套判据、
+    各漏各的——这条正则要求开闭成对，一个孤立的 `</think>`（开标签在上游被吃掉）
+    配不上对，于是整段思考原样进了用户气泡（prod 实例）。闸关掉时保留下面的
+    原正则行为，逐字节不变。
     """
     raw = str(text or "")
+    from core import self_thinking as _st
+
+    if _st.gate_enabled():
+        # sanitize=False：本次统一的是剥离**判据**，V1 的展示格式（保留换行、
+        # 上限 700，由下游 _sanitize_thinking_summary 负责）不跟着变。
+        status, thinking, reply = _st.strip_all_thinking(raw, sanitize=False)
+        if status == _st.FAILED:
+            # 失败关闭：宁可这轮没有可发内容，也不把带标签的残文端给用户。
+            return "", thinking
+        return reply, thinking
+
     blocks: list[str] = []
 
     def _collect(match: re.Match) -> str:
