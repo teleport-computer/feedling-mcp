@@ -410,11 +410,16 @@ def test_pi_vision_rejection_rotates_session_before_showing_model_guidance(
     assert crc._load_agent_session_id() == ""
 
 
+@pytest.mark.parametrize(
+    "resident_chat_v2_profile",
+    [False, True],
+    ids=["legacy-resident-profile", "v2-resident-profile"],
+)
 @pytest.mark.parametrize("dedicated_image", [False, True])
 def test_pi_text_only_turn_recovers_from_session_with_rejected_image(
-    tmp_path, monkeypatch, dedicated_image
+    tmp_path, monkeypatch, dedicated_image, resident_chat_v2_profile
 ):
-    """Text and dedicated-observation turns retry once in a clean Pi session."""
+    """Both resident V1 prompt profiles retry once in a clean Pi session."""
     crc._seen_ids.clear()
     crc._seen_ids_order.clear()
     crc._agent_session_id_cache.clear()
@@ -445,7 +450,11 @@ def test_pi_text_only_turn_recovers_from_session_with_rejected_image(
         str(tmp_path / "session-{user_id}.json"),
     )
     monkeypatch.setitem(crc._whoami_cache, "user_id", "pi-session-recovery")
-    monkeypatch.setattr(crc, "_resident_chat_runtime_v2_enabled", lambda: False)
+    monkeypatch.setattr(
+        crc,
+        "_resident_chat_runtime_v2_enabled",
+        lambda: resident_chat_v2_profile,
+    )
     monkeypatch.setattr(crc, "_prepend_io_cli_capability_catalog", lambda text: text)
     monkeypatch.setattr(crc, "_worldbook_context_for_foreground", lambda _text: "")
     monkeypatch.setattr(crc, "_note_agent_turn_success", lambda: None)
@@ -501,53 +510,6 @@ def test_pi_text_only_turn_recovers_from_session_with_rejected_image(
         assert "咋了" in calls[1]["message"]
     assert replies[0][0] == "现在能正常回复文字了。"
     assert not replies[0][1].get("turn_failure_error_class")
-
-
-def test_runtime_v2_vision_failure_does_not_rotate_pi_session(tmp_path, monkeypatch):
-    """V2 owns its context and must not trigger the V1 Pi-session recovery."""
-    crc._seen_ids.clear()
-    crc._seen_ids_order.clear()
-    crc._agent_session_id_cache.clear()
-    crc._agent_session_meta_cache.clear()
-    msg = {
-        "id": "v2-vision-failure-01",
-        "role": "user",
-        "content": "继续聊文字",
-        "content_type": "text",
-        "ts": 9370.0,
-    }
-
-    monkeypatch.setattr(crc, "AGENT_MODE", "cli")
-    monkeypatch.setattr(
-        crc, "AGENT_CLI_CMD", "pi --mode json --session-id {session_id}"
-    )
-    monkeypatch.setattr(
-        crc,
-        "AGENT_SESSION_FILE_TEMPLATE",
-        str(tmp_path / "session-{user_id}.json"),
-    )
-    monkeypatch.setitem(crc._whoami_cache, "user_id", "v2-session-owner")
-    monkeypatch.setattr(crc, "_resident_chat_runtime_v2_enabled", lambda: True)
-    monkeypatch.setattr(crc, "_resident_foreground_chat_message_v2", lambda text: text)
-    monkeypatch.setattr(crc, "_prepend_io_cli_capability_catalog", lambda text: text)
-    monkeypatch.setattr(crc, "_foreground_agent_message", lambda text, **_kwargs: text)
-    monkeypatch.setattr(crc, "_worldbook_context_for_foreground", lambda _text: "")
-    monkeypatch.setattr(
-        crc,
-        "call_agent",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(
-            RuntimeError("unknown variant `image_url`, expected `text`")
-        ),
-    )
-    monkeypatch.setattr(
-        crc, "post_reply", lambda *_args, **_kwargs: {"id": "reply-v2-failure"}
-    )
-
-    crc._save_agent_session_id("unrelated-pi-session")
-    result_ts = crc._process_messages([msg])
-
-    assert result_ts == pytest.approx(9370.0)
-    assert crc._load_agent_session_id() == "unrelated-pi-session"
 
 
 def test_dedicated_vision_observer_failure_never_calls_main_model(tmp_path):
