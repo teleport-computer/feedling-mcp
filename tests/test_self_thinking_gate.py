@@ -159,6 +159,56 @@ def test_proactive_send_message_strips_thinking():
     assert sanitize_visible_message_text_v2(mixed) == "宝宝，中午了。"
 
 
+def test_longer_xml_tag_names_are_not_our_protocol():
+    """`<thought-process>` 这类合法标签名不能被前缀误判（Codex review 实测）。"""
+    for raw in (
+        "<thought-process>public</thought-process>",
+        "<thinking-panel>x</thinking-panel>",
+        "<reasoning.step>y</reasoning.step>",
+        "<think:inner>z</think:inner>",
+    ):
+        status, _thinking, reply = st.strip_all_thinking(raw)
+        assert status == st.ABSENT, raw
+        assert reply == raw
+
+
+def test_complete_block_plus_extra_lone_close_fails_closed():
+    """完整块之后又冒出带内容的孤立闭标签 —— 结构已乱，不能把正文吞进思考。"""
+    status, thinking, reply = st.strip_all_thinking("<think>A</think>正文甲</think>正文乙")
+    assert status == st.FAILED
+    assert reply == "" and thinking == ""
+
+
+def test_strip_tag_markers_keeps_text():
+    assert st.strip_tag_markers("<think>秘密没写完") == "秘密没写完"
+    assert st.strip_tag_markers("甲</think>乙") == "甲乙"
+
+
+def test_safety_strip_survives_self_thinking_disabled(monkeypatch):
+    """关掉 FEEDLING_V2_SELF_THINKING 不能顺带关掉安全剥离（Codex review Critical）。
+
+    这里锁的是判定式本身：闸开时无论 self-thinking 开关如何，都必须走剥离。
+    """
+    monkeypatch.setenv("FEEDLING_V2_SELF_THINKING", "0")
+    monkeypatch.delenv("FEEDLING_THINK_GATE", raising=False)
+    assert st.enabled() is False
+    assert st.gate_enabled() is True
+    # worker 的判定式：(gate_on or st_on) —— 关掉 self-thinking 后仍然为真。
+    assert (st.gate_enabled() or st.enabled()) is True
+
+    monkeypatch.setenv("FEEDLING_THINK_GATE", "0")
+    assert (st.gate_enabled() or st.enabled()) is False
+
+
+def test_history_row_scrub_failed_row_loses_tags_keeps_text():
+    from model_api_runtime.v2 import serve_worker
+
+    rows = [{"role": "assistant", "content": "正文甲</think>正文乙</think>正文丙"}]
+    out = serve_worker._scrub_leaked_thinking_rows(rows)
+    assert "</think" not in out[0]["content"]
+    assert "正文甲" in out[0]["content"]
+
+
 def test_history_row_scrub_removes_leaked_think():
     """历史里那几条漏掉的消息，喂回模型之前必须擦干净，否则模型照抄。"""
     from model_api_runtime.v2 import serve_worker

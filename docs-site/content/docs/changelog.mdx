@@ -10,6 +10,15 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **Thinking-leak gate.** A model's own `<think>` block could reach the user's
+  chat bubble on three delivery paths: Runtime V2 chat stripped only the first
+  block of a reply, resident V1 required a matched open/close pair and passed an
+  orphaned closing tag through verbatim, and proactive messages had no stripping
+  at all. All four delivery points and the assistant history replayed to the
+  model now share one strip step that fails closed when a block cannot be
+  cleanly resolved. New `FEEDLING_THINK_GATE` environment variable, on by
+  default, documented in Self-hosting. Turning off `FEEDLING_V2_SELF_THINKING`
+  no longer disables this gate.
 - **Runtime V1 now pins and verifies the selected Claude model family.** Managed
   Claude Code commands pass the configured route through `--model`, and model
   changes rotate resident sessions. A Claude Code fallback to another Claude

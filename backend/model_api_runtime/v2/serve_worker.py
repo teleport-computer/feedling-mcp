@@ -1024,7 +1024,12 @@ def _scrub_leaked_thinking_rows(rows: list[dict]) -> list[dict]:
     我们根本没要求它写 think，它是从历史里学的）。
 
     只碰 assistant 行：用户自己打的字里出现标签是他的自由，不是我们的协议。
-    剥离失败（FAILED）时保留原文——入口只做修正、不做删除，真正的把关在出口。
+
+    剥离失败（FAILED）时**不能原样保留**——那等于把可抄的格式继续摆在模型面前
+    （Codex review 2026-08-08 Important #2）。但也不整行换占位符：那些文字本来
+    就已经发到用户眼前过了，抹掉整行只会平白打断对话连贯性。折中是只删标签壳、
+    保留文字，格式没了、内容还在。行的 id/ts/seq 一律原样保留，compaction /
+    capture 的水位连续性不受影响。
     """
     from core import self_thinking as _st
 
@@ -1037,8 +1042,11 @@ def _scrub_leaked_thinking_rows(rows: list[dict]) -> list[dict]:
             out.append(row)
             continue
         status, _thinking, stripped = _st.strip_all_thinking(content)
-        if status in (_st.ABSENT, _st.FAILED):
+        if status == _st.ABSENT:
             out.append(row)
+            continue
+        if status == _st.FAILED:
+            out.append({**row, "content": _st.strip_tag_markers(content)})
             continue
         out.append({**row, "content": stripped})
     return out
@@ -1135,11 +1143,17 @@ def _read_recent_turns(
         through_seq=through_seq,
     )
     raw_rows = list(window.get("rows") or [])
-    decrypted = _decrypt_chat_rows(
-        user_id,
-        raw_rows,
-        user_only=False,
-        preserve_unreadable=True,
+    # 这条窗口会作为 optional replay 回到 prompt（worker 的 optional_tail_turns），
+    # 所以和 _read_tail_window_after_seq 一样要过闸——只擦 tail 不擦这里的话，
+    # summary 水位之前的旧泄漏行会继续被 replay 回去教模型模仿
+    # （Codex review 2026-08-08 Important #1）。
+    decrypted = _scrub_leaked_thinking_rows(
+        _decrypt_chat_rows(
+            user_id,
+            raw_rows,
+            user_only=False,
+            preserve_unreadable=True,
+        )
     )
     raw_by_seq = {int(row["seq"]): row for row in raw_rows}
     for row in decrypted:

@@ -151,17 +151,22 @@ def split_thinking(text: str) -> tuple[str, str, str]:
 
 _GATE_ENV_FLAG = "FEEDLING_THINK_GATE"
 
+# 标签名边界。**不能用 `\b`**：`\b` 在 `t` 和 `-` 之间成立，于是 `<thought-process>`
+# 这种合法 XML/JSX 标签会被 _RESIDUE 判成残留、又不被 _PAIRED_BLOCK 接受，整条回复
+# 白白失败关闭（Codex review 2026-08-08 实测）。XML 名称允许 `-` `.` `:`，所以边界
+# 必须显式排掉这些字符。
+_NAME_END = r"(?![\w:.-])"
 # 一整对同名标签。开闭必须同名（`(?P=tag)`），否则 <think>…</reasoning> 这种
 # 错配会被当成一块合法协议剥掉。
 _PAIRED_BLOCK = re.compile(
-    rf"<\s*(?P<tag>{_TAG_ALT})\s*>(?P<body>.*?)<\s*/\s*(?P=tag)\s*>",
+    rf"<\s*(?P<tag>{_TAG_ALT}){_NAME_END}\s*>(?P<body>.*?)<\s*/\s*(?P=tag){_NAME_END}\s*>",
     re.IGNORECASE | re.DOTALL,
 )
 # 剥完之后判定「还有没有残留」。任何开或闭标签都算。
-_RESIDUE = re.compile(rf"<\s*/?\s*(?:{_TAG_ALT})\b", re.IGNORECASE)
+_RESIDUE = re.compile(rf"<\s*/?\s*(?:{_TAG_ALT}){_NAME_END}", re.IGNORECASE)
 # 孤立闭标签：按本协议思考永远写在最前面，所以一个配不上对的 </think> 说明它
 # 前面的全是思考（开标签在上游某处被吃掉了）。
-_LONE_CLOSE = re.compile(rf"<\s*/\s*(?:{_TAG_ALT})\s*>", re.IGNORECASE)
+_LONE_CLOSE = re.compile(rf"<\s*/\s*(?:{_TAG_ALT}){_NAME_END}\s*>", re.IGNORECASE)
 
 
 def gate_enabled() -> bool:
@@ -170,6 +175,17 @@ def gate_enabled() -> bool:
     return os.environ.get(_GATE_ENV_FLAG, "1").strip().lower() not in {
         "0", "false", "no", "off",
     }
+
+
+# 只删标签壳、保留文字。给「历史入口」的 FAILED 兜底用：那种行结构已经乱到
+# 分不清哪段是思考，但它的文字本来就已经发到用户眼前过了，删掉整行会平白打断
+# 对话连贯性。入口真正要断的是「模型看到可抄的格式」，删掉标签壳就够了。
+_TAG_MARKER = re.compile(rf"<\s*/?\s*(?:{_TAG_ALT})(?![\w:.-])\s*>", re.IGNORECASE)
+
+
+def strip_tag_markers(text: str) -> str:
+    """删掉 think 类标签本身，保留标签之间的文字。"""
+    return re.sub(r"\n{3,}", "\n\n", _TAG_MARKER.sub("", str(text or ""))).strip()
 
 
 def strip_all_thinking(text: str, *, sanitize: bool = True) -> tuple[str, str, str]:
@@ -212,6 +228,12 @@ def strip_all_thinking(text: str, *, sanitize: bool = True) -> tuple[str, str, s
         # head 里还带标签 = 开闭错配（<think>…</reasoning>）或多层残骸，不是
         # 「开标签被上游吃掉」那种可救的形状。失败关闭，别把带标签的文本当思考。
         if _RESIDUE.search(head):
+            return FAILED, "", ""
+        if blocks and head:
+            # 已经剥出过完整块，却还剩一个带内容的孤立闭标签——这不是「开标签被
+            # 吃掉」，而是结构本身就乱了。此时把 head 当思考会把真正的正文吞进
+            # 推理过程（`<think>A</think>正文甲</think>正文乙` → 正文甲消失，
+            # Codex review 2026-08-08 实测）。失败关闭。
             return FAILED, "", ""
         if head:
             blocks.insert(0, head)
