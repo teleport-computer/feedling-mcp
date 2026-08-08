@@ -10,6 +10,32 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **Runtime V1 now pins and verifies the selected Claude model.** Managed
+  Claude Code commands pass the configured route through `--model`, model
+  changes rotate resident sessions, and structured Claude output that proves a
+  different model served the turn is rejected as `model_mismatch` instead of
+  silently returning a reply from the wrong model.
+
+- **The companion now decides when to generate an image.** Image generation is
+  no longer triggered by keyword matching on the user's message, and a dedicated
+  image route no longer bypasses the main model. The companion calls an image
+  tool itself — `generate_image` on Runtime V2, `io_cli.py generate-image` on
+  Runtime V1 and self-hosted CLI residents — writes its own prompt, and its
+  accompanying words are delivered together with the picture in one reply
+  instead of being discarded. It may also generate an image without an explicit
+  request. Generation failures are returned to the companion as a tool result so
+  it can explain them in its own words rather than ending the turn; a reply that
+  claims an image was produced when none was is returned once for correction,
+  and is then delivered as written. `POST /v1/image-generation/generate` and the
+  existing encrypted image-delivery path are unchanged.
+
+- **Failed voice calls now have an explicit, idempotent cancellation path.**
+  `POST /v1/voice/cancel` installs a durable per-call tombstone, clears
+  unarchived turn/result rows, and suppresses late resident or Hosted Runtime
+  V2 replies before chat insertion. Finalize and cancel claim one lifecycle
+  winner before archive writes, so cancellation cannot downgrade a call whose
+  archive already won.
+
 - **Runtime V2 Chat now applies matching World Book entries.** Matches use the
   current user turn and enter the prompt as a standalone, untrusted setting-data
   block rather than changing the user's message. Oversized matched context is
@@ -28,15 +54,28 @@ change must not be interpreted as an API guarantee.
   Scheduled reminders still require public text, while malformed or truncated
   thinking markup remains a fail-closed error.
 
-- **Voice calls now end in a single summary instead of per-turn chat rows.**
-  New public endpoint `POST /v1/voice/finalize`: the client posts the call
-  transcript at hang-up; the user's own model writes one `voice_call_summary`
-  chat message and the call's per-turn rows are deleted only after the summary
-  is durable (idempotent replays return the same `summary_message_id`; on
-  summary failure nothing is deleted and the request may be retried; rows
-  already folded by Runtime V2 compaction are retained and reported as
-  `retained_covered`). The live-call flow — identity, memory, tools, and
-  per-turn streaming — is unchanged.
+- **Voice calls are now archived in full, and memory is distilled from the
+  whole call.** At hang-up `POST /v1/voice/finalize` archives the complete
+  transcript (permanent, sealed to the account's content key) and leaves ONE
+  bounded preview card in chat; the per-turn rows are deleted only after the
+  archive is durable. Memory then runs through the ordinary capture pipeline
+  over the archived full text. This replaces the earlier behaviour where a
+  model-written 1–3 sentence summary was both the chat artifact and the only
+  thing memory ever saw — anything not in those sentences was lost. The
+  response now returns `transcript_message_id`; `summary_message_id` is still
+  sent as a deprecated alias for one release. Idempotent replays are judged on
+  the archive; rows already folded by Runtime V2 compaction are retained and
+  reported as `retained_covered`.
+
+- **New public endpoints for reading archived calls.**
+  `GET /v1/voice/transcripts` lists a caller's calls (metadata only — no
+  words), and `GET /v1/voice/transcripts/{call_id}` returns one call's sealed
+  envelope for the client to decrypt locally. The server never returns
+  transcript plaintext. Calls are retained until the account is deleted;
+  clearing chat history does not remove them.
+
+- **Voice call length raised from 5 minutes to 1 hour.** The previous cap was
+  shorter than the voice provider's own default and had no product rationale.
 - **`POST /v1/chat/message` now accepts `context_refs`, carrying Garden
   "talk in chat" memory references on the resident line.** Same plaintext
   routing contract as the hosted send: only `type: "memory"` entries are
@@ -102,6 +141,25 @@ change must not be interpreted as an API guarantee.
   readings tool-only and give proactive wake a boolean-only glance.
   Perception-triggered wake messages no longer receive unrelated exact battery,
   weather, activity, sleep, or health values in their initial prompt.
+
+- **Empty provider replies are now attributed to the provider, not the
+  system.** When a model or relay returns a successful response with no usable
+  text (empty terminal reply, mid-stream cut, quota-pressure fake success), the
+  failure notice now uses the `provider_empty_reply` class with
+  provider-transient blame and copy that points at the user's model channel,
+  instead of the system-blame "something went wrong on our side" message.
+  Replies that contained real text but were emptied by protocol-leak
+  sanitization keep the system attribution, as does exhausting the server's own
+  tool-call budget without producing a reply. Applies to the resident V1 agent
+  path and to Runtime V2 chat, wake, and memory-extraction lanes.
+
+- **Runtime V2 can recover once from a reasoning-only provider response.** A
+  successful foreground response with reasoning or a normal stop reason but no
+  visible text or client tool call gets one bounded correction while preserving
+  the currently allowed tool catalog. A relay response with no text, tool call,
+  reasoning, or stop reason now fails immediately as `provider_empty_reply`
+  instead of repeating the same billed request or reporting a network outage.
+  Intentional Runtime V2 wake silence is unchanged.
 
 - **Plaintext memory writes reject tombstone-style notes.** A plaintext
   `memory.add`, upgrade, or `memory.supersede` whose summary or content is a
@@ -241,6 +299,23 @@ change must not be interpreted as an API guarantee.
   non-empty reply with contradictory colors remains unsupported. Stable visual
   error codes still distinguish incompatible image input, invalid credentials,
   quota, rate limits, and temporary provider failures.
+
+- **VPS image generation is now capability-based.** A resident can advertise
+  `agent_image_generation_v1` when its configured agent entry actually exposes
+  a callable image tool. Dedicated image routes still take precedence; without
+  one, capable residents receive the request directly, while residents that do
+  not advertise the capability continue to receive image-model setup guidance.
+  When a dedicated route succeeds, its prepared image is delivered immediately
+  through the existing atomic reply path instead of waiting for a second main-
+  model turn.
+
+- **Generated images can now appear directly in Chat.** Runtime V2 normalizes
+  inline image results from supported provider responses, while CLI residents
+  can stage PNG, JPEG, or WebP output with `send-image`. Images are validated,
+  size-bounded, encrypted separately, and committed atomically with the reply as
+  native `content_type=image` rows. The public resident response contract adds
+  `image_followups`; remote provider URLs and local filesystem paths are never
+  exposed as image delivery.
 
 - **Hosted visual failures are easier to diagnose without exposing user
   content.** Per-user admin detail now includes bounded model-route runtime

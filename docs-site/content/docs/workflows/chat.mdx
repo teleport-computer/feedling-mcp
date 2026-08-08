@@ -356,6 +356,26 @@ ordering without partial success.
 Source and rendered output are each limited to 1,000,000 bytes, and staging
 rejects paths outside the per-user outbound directory.
 
+The companion decides when a generated image belongs in the conversation — an
+explicit request, a moment an image would serve better than words, or simply
+because it wants to make one. It writes the image prompt itself and its reply
+text is delivered together with the picture. Runtime V2 exposes this as the
+`generate_image` tool; Runtime V1 and CLI residents use `io_cli.py
+generate-image`, which draws with the account's selected image route and writes
+the result into the private outbound directory for `send-image`. A generation
+failure is returned to the companion so it can explain it, rather than ending
+the turn.
+
+CLI residents can publish generated PNG, JPEG, and WebP results with
+`send-image`. The command accepts only files inside the same private outbound
+directory, validates and bounds their decoded pixels, and sends up to four
+images through encrypted `image_followups`. The backend commits the text and
+image rows together; clients receive ordinary `content_type=image` messages and
+render them directly in the Chat list. Provider-native Runtime V2 image outputs
+use the same encrypted image-message path. Remote provider URLs are not fetched.
+Generated images are normalized to a maximum 1568-pixel long edge and
+2,000,000 stored bytes.
+
 ### 1. The client stores a user message
 
 Encrypt the user text or attachment and post the complete envelope:

@@ -133,6 +133,14 @@ def test_pi_runtime_metadata_reads_exact_model_modalities(tmp_path, monkeypatch)
     }
 
 
+def test_consumer_advertises_native_image_generation_only_when_enabled(monkeypatch):
+    monkeypatch.delenv("FEEDLING_AGENT_IMAGE_GENERATION", raising=False)
+    assert crc.AGENT_IMAGE_GENERATION_CAPABILITY not in crc._consumer_capabilities()
+
+    monkeypatch.setenv("FEEDLING_AGENT_IMAGE_GENERATION", "true")
+    assert crc.AGENT_IMAGE_GENERATION_CAPABILITY in crc._consumer_capabilities()
+
+
 def test_runtime_model_identity_uses_configured_fact(monkeypatch):
     monkeypatch.setattr(
         crc,
@@ -4528,6 +4536,61 @@ def test_capture_transcript_labels_use_real_names():
     assert "user:" not in text and "agent:" not in text
 
 
+def test_resident_context_omits_voice_archive_and_linked_noise_reply():
+    history = [
+        {"id": "typed", "role": "user", "source": "chat", "content": "..."},
+        {
+            "id": "noise",
+            "role": "user",
+            "source": "chat",
+            "voice_call_id": "vcall_old",
+            "content": "……",
+        },
+        {
+            "id": "noise-reply",
+            "role": "openclaw",
+            "source": "chat",
+            "reply_to_message_id": "noise",
+            "content": "又是点点点",
+        },
+        {
+            "id": "card",
+            "role": "openclaw",
+            "source": "voice_call_transcript",
+            "voice_call_id": "vcall_old",
+            "content": "- 对方: 你好\n- 我: 你好呀",
+        },
+        {"id": "real", "role": "user", "source": "chat", "content": "在成都"},
+    ]
+
+    cleaned = crc._clean_messages_for_proactive_context(history)
+
+    assert [message["id"] for message in cleaned] == ["typed", "real"]
+
+
+def test_resident_capture_expands_full_archive_not_card_preview(monkeypatch):
+    monkeypatch.setattr(
+        crc,
+        "_capture_voice_transcript_text",
+        lambda _call_id: "- 对方: 全文第一句\n- 我: 全文第二句",
+    )
+    card = {
+        "id": "card",
+        "role": "openclaw",
+        "source": "voice_call_transcript",
+        "voice_call_id": "vcall_full",
+        "voice_turn_count": 2,
+        "content": "CARD PREVIEW ONLY",
+        "ts": 1000.0,
+    }
+
+    text = crc._capture_window_text([card], user_label="小雨", agent_label="小舟")
+
+    assert "CARD PREVIEW ONLY" not in text
+    assert "全文第一句" in text and "全文第二句" in text
+    assert "共 2 轮" in text
+
+
 def test_capture_transcript_labels_reject_reserved_placeholder_names():
     """A placeholder "name" stored on the identity card (用户/user) must not
     become a transcript label either — that re-creates the exact "用户: …"
@@ -5833,6 +5896,112 @@ def test_claude_turn_from_stream_empty_when_no_success_result():
     raw = json.dumps({"type": "assistant", "message": {"content": [
         {"type": "text", "text": "partial"}]}})
     assert crc._claude_turn_from_stream(raw) == ("", "")
+
+
+def test_claude_actual_models_uses_only_structured_stream_metadata():
+    raw = "\n".join([
+        json.dumps({
+            "type": "assistant",
+            "message": {
+                "model": "claude-fable-5",
+                "content": [{"type": "text", "text": "我是 Opus 4.8"}],
+            },
+        }),
+        json.dumps({
+            "type": "result",
+            "subtype": "success",
+            "result": "I am claude-sonnet-4-6",
+            "modelUsage": {
+                "claude-fable-5": {"inputTokens": 1},
+                "claude-haiku-4-5": {"inputTokens": 1},
+            },
+        }),
+    ])
+
+    assert crc._claude_actual_models_from_stream(raw) == {
+        "claude-fable-5",
+        "claude-haiku-4-5",
+    }
+
+
+@pytest.mark.parametrize(
+    ("configured", "actual", "matches"),
+    [
+        ("fable", {"claude-fable-5"}, True),
+        ("opus", {"claude-opus-4-8"}, True),
+        ("sonnet", {"claude-sonnet-4-6"}, True),
+        ("haiku", {"claude-haiku-4-5"}, True),
+        ("claude-fable-5", {"claude-fable-5"}, True),
+        ("claude-fable-5", {"claude-opus-4-8"}, False),
+        ("claude-sonnet-4-6", {"claude-sonnet-4-6-20260801"}, False),
+    ],
+)
+def test_claude_configured_model_matches_structured_actual(configured, actual, matches):
+    assert crc._claude_configured_model_matches(configured, actual) is matches
+
+
+def test_call_agent_cli_rejects_claude_model_mismatch_and_clears_session(monkeypatch):
+    monkeypatch.setattr(crc, "AGENT_CLI_CMD", "claude --model claude-fable-5 -p {message}")
+    monkeypatch.setattr(crc, "AGENT_RUNTIME_METADATA", {
+        "provider": "anthropic",
+        "model": "claude-fable-5",
+        "input_modalities": ["text"],
+    })
+    monkeypatch.setattr(crc, "_resolve_cli_executable", lambda cmd: cmd)
+    monkeypatch.setattr(crc, "_load_agent_session_id", lambda: "")
+    cleared = []
+    monkeypatch.setattr(crc, "_clear_agent_session_id", cleared.append)
+
+    class _R:
+        returncode = 0
+        stdout = json.dumps({
+            "type": "result",
+            "subtype": "success",
+            "session_id": "wrong-model-session",
+            "result": "我记得你喜欢蓝色。",
+            "modelUsage": {"claude-opus-4-8": {"inputTokens": 42}},
+        })
+        stderr = ""
+
+    monkeypatch.setattr(crc.subprocess, "run", lambda *a, **kw: _R())
+
+    with pytest.raises(RuntimeError, match=r"model_mismatch: configured=claude-fable-5 actual=claude-opus-4-8"):
+        crc.call_agent_cli("请调用工具读取我喜欢的颜色")
+
+    assert cleared and "model mismatch" in cleared[0]
+
+
+def test_call_agent_cli_allows_claude_success_without_model_metadata(monkeypatch, caplog):
+    monkeypatch.setattr(crc, "AGENT_CLI_CMD", "claude --model claude-fable-5 -p {message}")
+    monkeypatch.setattr(crc, "AGENT_RUNTIME_METADATA", {
+        "provider": "anthropic",
+        "model": "claude-fable-5",
+        "input_modalities": ["text"],
+    })
+    monkeypatch.setattr(crc, "_resolve_cli_executable", lambda cmd: cmd)
+    monkeypatch.setattr(crc, "_load_agent_session_id", lambda: "")
+
+    class _R:
+        returncode = 0
+        stdout = json.dumps({
+            "type": "result", "subtype": "success", "result": "蓝色。",
+        })
+        stderr = ""
+
+    monkeypatch.setattr(crc.subprocess, "run", lambda *a, **kw: _R())
+
+    assert crc.call_agent_cli("我喜欢的颜色是什么？") == "蓝色。"
+    assert "no structured actual-model metadata" in caplog.text
+
+
+def test_model_mismatch_is_a_system_runtime_error():
+    notice = crc.classify_agent_error(RuntimeError(
+        "model_mismatch: configured=claude-fable-5 actual=claude-opus-4-8"
+    ))
+
+    assert notice.error_class == "model_mismatch"
+    assert notice.blame == "system"
+    assert notice.user_text == "当前运行时没有成功加载所选模型，请重新选择模型或稍后重试。"
 
 
 def test_call_agent_cli_claude_tool_turn_delivers_only_final_answer(monkeypatch):

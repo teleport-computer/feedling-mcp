@@ -86,6 +86,44 @@ def test_v1_reply_persists_confirmed_activity_events(store, monkeypatch):
     assert persisted["activity_events"][0]["memory_count"] == 2
 
 
+def test_chat_core_rejects_reply_to_superseded_voice_revision(store):
+    parent = store.append_chat(
+        "user",
+        "chat",
+        _envelope(store.user_id, "superseded_voice_parent"),
+        extra={
+            "voice_call_id": "call-pause-continuation",
+            "voice_turn_id": "2.partial",
+            "voice_logical_turn_id": "2",
+            "voice_turn_status": "current",
+        },
+    )
+    db.chat_update_metadata(
+        store.user_id,
+        parent["id"],
+        {
+            "voice_turn_status": "superseded",
+            "voice_superseded_by": "newer_voice_parent",
+        },
+    )
+
+    body, status = chat_core.write_response(
+        store,
+        {
+            "envelope": _envelope(store.user_id, "superseded_voice_reply"),
+            "source": "chat",
+            "reply_to_message_id": parent["id"],
+        },
+        consumer_id="resident-stale",
+        consumer_info={},
+        allow_verify_reply=False,
+    )
+
+    assert status == 409
+    assert body == {"error": "voice_turn_superseded"}
+    assert db.chat_get_strict(store.user_id, "superseded_voice_reply") is None
+
+
 @pytest.fixture()
 def store(backend_env):
     res = make_client().post(
@@ -358,7 +396,10 @@ def test_finalize_insert_collision_rolls_back_parent_and_retry_is_safe(store):
     retried_parent, retried_reply = retried
     assert retried_parent["reply_status"] == "replied"
     assert retried_parent["reply_message_id"] == candidate["id"]
-    assert retried_reply == candidate
+    assert retried_reply == {
+        **candidate,
+        "reply_to_message_id": parent["id"],
+    }
 
 
 def test_finalize_post_commit_never_trims_durable_chat_source(store):
@@ -437,6 +478,7 @@ def test_finalize_reply_row_shape_matches_append_chat(store, monkeypatch):
 
     normalized_control = {**control, "id": "normalized"}
     normalized_atomic = {**atomic, "id": "normalized"}
+    assert normalized_atomic.pop("reply_to_message_id") == parent["id"]
     assert normalized_atomic == normalized_control
     assert atomic["ts"] == fixed_now
     assert atomic["source"] == "chat"
@@ -511,6 +553,7 @@ def test_finalize_reply_image_matches_append_r2_pointer_semantics(
         "body_key": "normalized",
         "ts": 0,
     }
+    assert normalized_atomic.pop("reply_to_message_id") == parent["id"]
     assert normalized_atomic == normalized_control
     assert [upload[1] for upload in uploads] == [control["id"], candidate["id"]]
 

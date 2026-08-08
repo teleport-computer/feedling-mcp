@@ -155,7 +155,7 @@ def test_chat_turn_over_budget_enqueues_maintenance_then_compaction_advances_wat
 
     monkeypatch.setattr(cap_registry, "run_capability", lambda *a, **k: _FakeCapResult())
 
-    async def _fake_chat_completion(config, messages, *, tools=None):
+    async def _fake_chat_completion(config, messages, *, tools=None, **kwargs):
         # Terminal plain-text round (Task 7): no tool_calls -> that text IS the
         # chat turn's final reply through the unified tool_loop.run_tool_loop.
         return {"reply": "model reply", "tool_calls": [],

@@ -39,6 +39,8 @@ EXPECTED_BODYLESS_POSTS = {
     ("post", "/v1/model_api/test"),
     ("post", "/v1/model_api/routes/{route_id}/activate"),
     ("post", "/v1/model_api/routes/{route_id}/test"),
+    ("post", "/v1/image-generation/main/test"),
+    ("post", "/v1/image-generation/routes/{route_id}/test"),
     ("post", "/v1/vision/main/test"),
     ("post", "/v1/vision/routes/{route_id}/test"),
     ("post", "/v1/proactive/scheduled/fire"),
@@ -70,6 +72,9 @@ EXPECTED_API_KEY_ONLY_OPERATIONS = {
 
 EXPECTED_CORE_BODY_REFS = {
     ("post", "/v1/model_api/chat/send"): "HostedChatSendRequest",
+    ("put", "/v1/image-generation/config"): "ImageGenerationConfigUpdateRequest",
+    ("post", "/v1/image-generation/config"): "ImageGenerationRouteCreateRequest",
+    ("post", "/v1/image-generation/generate"): "ImageGenerationRequest",
     ("put", "/v1/vision/config"): "VisionConfigUpdateRequest",
     ("post", "/v1/vision/config"): "VisionRouteCreateRequest",
     ("post", "/v1/vision/observe"): "VisionObserveRequest",
@@ -197,9 +202,19 @@ def test_public_operation_and_parameter_inventory(
     # (POST /v1/agent/web/{search,fetch}, both with bodies) → 164 ops, 77 bodies;
     # Genesis plaintext estimate + commit add two body-bearing operations.
     # 167 since POST /v1/voice/finalize (hangup: client transcript in the body
-    # -> one voice_call_summary row replaces the call's per-turn rows), 80 bodies.
-    assert len(operations) == 167
-    assert sum("requestBody" in operation for operation in operations.values()) == 80
+    # -> one card row replaces the call's per-turn rows), 80 bodies.
+    # 169 since the voice transcript archive became readable: GET
+    # /v1/voice/transcripts (list, metadata only) and GET
+    # /v1/voice/transcripts/{call_id} (one sealed envelope, decrypted on the
+    # client). Both bodyless, so the body count is unchanged.
+    # 170 since POST /v1/voice/cancel; its required JSON body installs the
+    # durable call tombstone used to suppress late resident/V2 replies.
+    # Image-generation routing adds GET/PUT/POST config plus two bodyless
+    # validators; only the two config mutations carry request bodies.
+    # The authenticated resident generation exchange adds one prompt-bearing
+    # operation.
+    assert len(operations) == 176
+    assert sum("requestBody" in operation for operation in operations.values()) == 84
 
     query_operations = {
         key for key, operation in operations.items() if _parameters(operation, "query")

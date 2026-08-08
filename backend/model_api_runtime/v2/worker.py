@@ -54,11 +54,18 @@ from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable
 
 import db
+import generated_image
 import provider_attempt_ledger
 import provider_client
 import provider_health
+from voice import transcript_store as voice_transcript_store
 from notices import catalog as notices_catalog
-from provider_types import MCP_TRANSPORT_FAILURE_ERROR, ToolExchange, ToolResult
+from provider_types import (
+    MCP_TRANSPORT_FAILURE_ERROR,
+    ProviderMedia,
+    ToolExchange,
+    ToolResult,
+)
 from capabilities import registry as cap_registry
 from capabilities import tool_schema as cap_tool_schema
 from core import chat_activity as core_chat_activity
@@ -173,8 +180,14 @@ async def _record_provider_failure(
     await asyncio.to_thread(
         provider_health.record_failure,
         user_id,
-        error_class=provider_health.error_class_for_exception(exc),
+        error_class=_provider_health_error_class(exc),
     )
+
+
+def _provider_health_error_class(exc: BaseException) -> str:
+    if isinstance(exc, v2_tool_loop.ProviderEmptyReply):
+        return "provider_empty_reply"
+    return provider_health.error_class_for_exception(exc)
 
 
 async def _record_provider_failure_class(
@@ -539,8 +552,25 @@ if "FEEDLING_V2_TAIL_BUDGET_MSGS" in os.environ:
     )
 _CAPTURE_BATCH_LIMIT = 60
 _CAPTURE_PROMPT_RAW_ROLES = frozenset({"user", "openclaw"})
+# MUST stay a superset-compatible mirror of
+# capture_scheduler.CAPTURE_LIVE_SOURCES (locked by
+# tests/test_capture_source_whitelists_agree.py). A source that TRIGGERS capture
+# but is missing here is silently dropped from the prompt: capture then runs on
+# an empty window, writes nothing, and still advances the cursor past those
+# rows. That is exactly what happened to voice_call_summary on V2 between
+# 2026-08-05 and 2026-08-07 — every V2 user's voice memory was lost in silence.
 _CAPTURE_PROMPT_SOURCES = frozenset(
-    {"chat", "model_api", "live_activity", "agent_initiated_proactive"}
+    {"chat", "model_api", "live_activity", "agent_initiated_proactive",
+     "voice_call_transcript"}
+)
+_VOICE_TRANSCRIPT_SOURCE = "voice_call_transcript"
+# 单通电话渲染进 capture 窗口的字符预算。**必须大于通话时长上限能产出的字数**，
+# 否则采样会永久丢中段 —— 那等于宣称「从每句话 capture」却做不到。现行上限
+# 3600 秒（iOS ElevenLabsAgentClient），一小时中文口语约 9000 字，30000 留三倍
+# 余量。tests/test_voice_transcript_budget.py 锁死这个关系。采样只是"预算真被
+# 突破时不要静默失败"的兜底，正常路径不可达；走到那里会打 warning，不静默。
+_VOICE_TRANSCRIPT_PROMPT_CHARS = _positive_int_env(
+    "FEEDLING_V2_VOICE_TRANSCRIPT_PROMPT_CHARS", "30000"
 )
 _COMPACTION_BATCH = _positive_int_env("FEEDLING_V2_COMPACTION_BATCH_MSGS", "200")
 # A message-count cap alone is not a prompt-size bound: 200 maximum-size chat
@@ -659,6 +689,10 @@ _PRIVATE_READ_TOOLS = frozenset(
         "memory_index",
         "memory_search",
         "memory_fetch",
+        # 通话逐字记录是用户说过的原话,私密程度不低于记忆卡。读完之后这一轮不
+        # 该再有出站通道(web/MCP),否则原话可以被原样带出去。
+        # list 只返回元信息(时间/时长/轮数),不含内容,故不入此集合。
+        "voice_transcript_read",
         cap_tool_schema.PROVIDER_USAGE_TOOL,
     }
 )
@@ -812,6 +846,16 @@ _DEGENERATE_REPLY_ERROR_CLASS = "upstream_unavailable"
 _PROTOCOL_FRAGMENT_ERROR_CLASS = "upstream_unavailable"
 _PROTOCOL_FRAGMENT_REASON = "protocol_fragment_suppressed"
 _MALFORMED_SELF_THINKING_REASON = "malformed_self_thinking_suppressed"
+# 工具循环把我们自己的 _TURN_MAX_LLM_CALLS 预算跑光却始终没产出终局文本。
+# 这是**我们的配置上限**,不是 provider 给了空回复 —— 单独一个 reason,才能既
+# 不误告用户「去查你的中转」,又能在 admin 上和真正的空回复分开看
+# (自审 2026-08-07 P1;原先与 empty_reply 混在一条 raise 里)。
+_TOOL_BUDGET_EXHAUSTED_REASON = "tool_budget_exhausted"
+# scheduled 提醒的必达合约要求有正文,但模型这轮**只产出了一个格式完全正确的
+# <think> 块**、被我们按开关剥掉了 —— 与「格式坏掉」(_MALFORMED_SELF_THINKING)
+# 和「provider 什么都没给」(empty_reply)都不是一回事,单列一个 reason 才能在
+# admin 上分辨。归 system:内容是模型给过的,是我们剥空的(自审 2026-08-07 P2)。
+_THINKING_ONLY_NO_REPLY_REASON = "thinking_only_no_reply"
 
 
 def _torn_protocol_evidence(text: str, reasoning: str, *, lane: str) -> str:
@@ -891,12 +935,31 @@ class DedicatedVisionUnavailable(RuntimeError):
         self.provider = str(provider or "")[:80]
 
 
+class ImageGenerationUnavailable(RuntimeError):
+    """The selected image-generation route could not produce valid media."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        error_code: str = "image_generation_failed",
+        model: str = "",
+        provider: str = "",
+    ):
+        super().__init__(message)
+        self.error_code = str(error_code or "image_generation_failed")[:64]
+        self.model = str(model or "")[:96]
+        self.provider = str(provider or "")[:80]
+
+
 def _safe_failure_code(scope: str, exc: BaseException) -> str:
     """Stable plaintext error code that never embeds exception messages."""
     if isinstance(exc, WorkspacePromptUnavailable):
         kind = "workspace_prompt_unavailable"
-    elif isinstance(exc, DedicatedVisionUnavailable):
+    elif isinstance(exc, (DedicatedVisionUnavailable, ImageGenerationUnavailable)):
         kind = exc.error_code
+    elif isinstance(exc, v2_tool_loop.ProviderEmptyReply):
+        kind = "empty_reply"
     elif isinstance(exc, TurnError):
         raw = str(exc)
         if raw in {
@@ -905,6 +968,8 @@ def _safe_failure_code(scope: str, exc: BaseException) -> str:
             "no_user_messages",
             _PROTOCOL_FRAGMENT_REASON,
             _MALFORMED_SELF_THINKING_REASON,
+            _TOOL_BUDGET_EXHAUSTED_REASON,
+            _THINKING_ONLY_NO_REPLY_REASON,
         }:
             kind = raw
         elif raw == _COVERAGE_INCOMPLETE or raw.startswith(
@@ -985,7 +1050,7 @@ def _extraction_failure_code(exc: BaseException) -> str:
 
 def _turn_failure_error_class(exc: BaseException) -> str:
     """Classify V2 foreground failures through the shared notice catalog."""
-    if isinstance(exc, DedicatedVisionUnavailable):
+    if isinstance(exc, (DedicatedVisionUnavailable, ImageGenerationUnavailable)):
         return exc.error_code
     if isinstance(exc, v2_prompt_frontier.PromptFrontierExhausted):
         # An unaudited default is our conservative local ceiling, not the
@@ -996,12 +1061,23 @@ def _turn_failure_error_class(exc: BaseException) -> str:
         return "context_overflow"
     if isinstance(exc, (asyncio.TimeoutError, TimeoutError)):
         return "turn_timeout"
+    if (
+        isinstance(exc, v2_tool_loop.ProviderEmptyReply)
+        or (isinstance(exc, TurnError) and str(exc) == "empty_reply")
+    ):
+        # 模型/provider 没给出任何可用文本(空终局、断流、预算耗尽无气泡)——
+        # raise 点全是 provider/模型行为,不是我们的解析问题;归 provider,
+        # 别把中转抽风包装成「系统出了问题」(usr_7f30d63f 2026-08-07)。
+        return "provider_empty_reply"
     if isinstance(exc, TurnError) and str(exc) in {
         "degenerate_reply_suppressed",
-        "empty_reply",
         _PROTOCOL_FRAGMENT_REASON,
         _MALFORMED_SELF_THINKING_REASON,
+        _TOOL_BUDGET_EXHAUSTED_REASON,
+        _THINKING_ONLY_NO_REPLY_REASON,
     }:
+        # 这几个都是我们自己造成的(主动剥掉/压制,或跑光我们设定的工具预算)
+        # —— 归 system 不变。
         return "reply_parse_failed"
     if isinstance(exc, TurnError) and (
         str(exc) == _COVERAGE_INCOMPLETE
@@ -1144,6 +1220,10 @@ class TurnDeps:
     # read_tail，b64 会进摘要器 prompt，且该用户历史上每张图都会被解密一次。默认 None：
     # worker.py 自身不 import hosted/capabilities 的装配细节；生产装配见 serve_worker。
     read_images: Callable[[str, list[str]], dict[str, dict]] | None = None
+    # (user_id, prompt, main config, auth) -> tuple[ProviderMedia, ...]. The
+    # assembly tier resolves the optional dedicated route and decrypts only its
+    # credential. The model-facing tool stays provider-neutral.
+    generate_image: Callable[..., Any] | None = None
     # Assembly-owned V2 image observer. Dedicated rows never return raw pixels
     # through ``read_images`` to the main provider.
     read_vision_observations: Callable[
@@ -1170,6 +1250,9 @@ class TurnDeps:
     # Dream-specific reader may fetch full selected card bodies.  When absent,
     # tests/legacy assembly fall back to read_memory_context.
     read_dream_memory_context: Callable[[str], dict] | None = None
+    # (user_id, call_id) -> 归档的通话全文明文。缺省 None = 不展开通话卡
+    # （老部署/测试注入）。生产实现在 serve_worker,走 enclave 解密。
+    read_voice_transcript: Callable[[str, str], str] | None = None
     # user_id -> (all rendered Garden cards, exact card count). Unlike
     # read_memory_context this is fail-loud and rejects any truncated read.
     read_profile_cards: Callable[[str], tuple[str, int]] | None = None
@@ -3172,6 +3255,7 @@ def _make_build_messages_fn(
             safety_margin_tokens: int | None,
             utf8_bytes_per_token: float,
             image_reserve_tokens: int,
+            system_suffix: str = "",
         ) -> tuple[list, Any, dict]:
             rendered_transcript: list = []
             for item in transcript:
@@ -3195,6 +3279,10 @@ def _make_build_messages_fn(
                     selected,
                     worldbook_char_cap=worldbook_char_cap,
                 ) + rendered_transcript
+                messages = v2_tool_loop._with_system_suffix(
+                    messages,
+                    system_suffix,
+                )
                 plan = v2_prompt_frontier.plan_provider_round(
                     model_limit=model_limit,
                     messages=messages,
@@ -4269,6 +4357,15 @@ class WorkspaceFileReply:
     data: bytes
 
 
+@dataclass(frozen=True)
+class GeneratedImageReply:
+    """One validated provider image ready for encrypted chat publication."""
+
+    name: str
+    mime_type: str
+    data: bytes
+
+
 def _safe_download_name(path: str) -> str:
     """Return a bounded display filename while preserving a useful suffix."""
     base = posixpath.basename(str(path or "").strip())
@@ -4345,6 +4442,25 @@ def _workspace_file_reply_from_result(result: dict) -> WorkspaceFileReply:
         name=name,
         mime_type=mime_type,
         data=data,
+    )
+
+
+def _generated_image_reply_from_provider(
+    media: ProviderMedia,
+    *,
+    index: int,
+) -> GeneratedImageReply:
+    decoded = generated_image.decode_base64_image(media.data_base64)
+    normalized = generated_image.normalize_generated_image(
+        decoded,
+        declared_mime=media.mime_type,
+        name=media.name,
+        index=index,
+    )
+    return GeneratedImageReply(
+        name=normalized.name,
+        mime_type=normalized.mime_type,
+        data=normalized.data,
     )
 
 
@@ -4446,6 +4562,16 @@ def _reply_effect_extra(payload: dict) -> dict:
                 "turn_failure_blame": notices_catalog.blame_for(error_class),
                 "turn_failure_user_text": notices_catalog.user_text_for(error_class),
             }
+        )
+    call_id = str(payload.get("voice_call_id") or "").strip()
+    turn_id = str(payload.get("voice_turn_id") or "").strip()
+    if bool(call_id) != bool(turn_id):
+        raise ValueError("incomplete voice reply correlation")
+    if call_id:
+        if len(call_id) > 96 or len(turn_id) > 128:
+            raise ValueError("invalid voice reply correlation")
+        extra.update(
+            {"voice_call_id": call_id, "voice_turn_id": turn_id}
         )
     return extra
 
@@ -4559,6 +4685,31 @@ def _build_encrypted_file_reply_effect_payload(
     }
 
 
+def _build_encrypted_image_reply_effect_payload(
+    store,
+    image_reply: GeneratedImageReply,
+    *,
+    effect_id: str,
+) -> dict:
+    """Seal one normalized image into a deterministic Chat image message."""
+    item_id = hashlib.sha256(effect_id.encode("utf-8")).hexdigest()[:32]
+    envelope, error = core_envelope._build_shared_envelope_for_store(
+        store,
+        bytes(image_reply.data),
+        item_id=item_id,
+    )
+    if envelope is None:
+        raise RuntimeError(error or "image reply envelope build failed")
+    return {
+        "envelope": envelope,
+        "message_extra": {
+            "content_type": "image",
+            "image_mime": image_reply.mime_type,
+            "image_byte_count": len(image_reply.data),
+        },
+    }
+
+
 def _tool_effect_item_id(effect_id: str) -> str:
     """Return the row-bound envelope id for a deterministic tool effect."""
     return hashlib.sha256(f"v2-tool-effect:{effect_id}".encode("utf-8")).hexdigest()[
@@ -4661,12 +4812,11 @@ def _surface_terminal_error(deps: TurnDeps, user_id: str, job_id, message: str) 
 
 
 def _compaction_message_chars(message: dict) -> int:
-    """Rendered size of one row in ``compaction._render_old_messages``.
+    """Conservative source-row size for a compaction batch.
 
-    Keep this deliberately in lock-step with that renderer (``role: content``
-    plus one line separator).  It is a conservative one-character overcount
-    for the final row, which is preferable to letting a batch exceed its
-    configured request budget.
+    The renderer omits UI-only voice artifacts with batch-level parent
+    correlation. Sizing their stored text here can only make a batch smaller;
+    it can never let a provider request exceed its configured budget.
     """
     return (
         len(str(message.get("role") or ""))
@@ -4708,6 +4858,46 @@ async def _persist_batch_cap(user_id: str, value: int) -> None:
         await asyncio.to_thread(db.v2_set_effective_batch_cap, user_id, int(value))
     except Exception as exc:  # noqa: BLE001
         log.debug("[v2.worker] batch cap persist failed for %s: %s", user_id, exc)
+
+
+def _bounded_voice_transcript(text: str, *, budget: int) -> str:
+    """把一通电话的全文压进预算：超了就头尾采样并说明中间省了多少。"""
+    text = str(text or "").strip()
+    if len(text) <= budget:
+        return text
+    head_budget = int(budget * 0.6)
+    tail_budget = max(0, budget - head_budget)
+    head = text[:head_budget].rstrip()
+    tail = text[-tail_budget:].lstrip() if tail_budget else ""
+    omitted = len(text) - len(head) - len(tail)
+    log.warning(
+        "[v2.worker] voice transcript exceeded capture budget: %d chars, %d omitted "
+        "(raise FEEDLING_V2_VOICE_TRANSCRIPT_PROMPT_CHARS)", len(text), omitted)
+    return f"{head}\n…（中间约 {omitted} 字省略，完整记录见通话详情）…\n{tail}"
+
+
+def _render_capture_line(message: dict, voice_transcripts: dict,
+                         *, user_name: str, ai_name: str) -> str:
+    """一条 capture 窗口行。通话卡展开成全文，其余按原样渲染。"""
+    call_id = str(message.get("voice_call_id") or "").strip()
+    if (
+        call_id
+        and str(message.get("source") or "") == _VOICE_TRANSCRIPT_SOURCE
+        and call_id in voice_transcripts
+    ):
+        body = _bounded_voice_transcript(
+            voice_transcripts[call_id], budget=_VOICE_TRANSCRIPT_PROMPT_CHARS
+        )
+        # 抬头(谁是谁 + 换尺子)与 resident 共用同一份实现,别在这里另写。
+        header = voice_transcript_store.capture_window_header(
+            turn_count=message.get("voice_turn_count"),
+            user_name=user_name, ai_name=ai_name,
+        )
+        return f"{header}\n{body}"
+    label = transcript_speaker_label(
+        str(message.get("role") or ""), user_name=user_name, ai_name=ai_name
+    )
+    return f"- {label}: {context.text_of(message.get('content'))}"
 
 
 def _bounded_compaction_prefix(
@@ -7761,7 +7951,11 @@ async def _run_wake(
                     # exception: their must-deliver contract still requires text.
                     text = ""
                     if final and lane == "scheduled":
-                        raise TurnError("empty_reply")
+                        # 走到这里说明模型**给过**一个完整的 <think> 块、被我们剥空了
+                        # (还是我们自己的 kill switch 决定剥不剥)——按本批定的判据
+                        # 「给过内容、被我们掏空 = 我们的」,归 system,不许说成
+                        # 「你的模型服务返回了空回复」(自审 2026-08-07 P2)。
+                        raise TurnError(_THINKING_ONLY_NO_REPLY_REASON)
                     return
                 elif _wst_status == _st_wake.FAILED:
                     if final:
@@ -8812,6 +9006,8 @@ async def _run_extraction(
     """
     extraction_status_recorded = False
     capture_window: dict[str, Any] = {}
+    # call_id -> 该通电话的全文明文。只在 capture lane 填充（见 enclave_sem 闸内）。
+    voice_transcripts: dict[str, str] = {}
 
     async def _ensure_capture_not_halted(stage: str) -> None:
         """Bypass the polling cache at disclosure and durable-write boundaries."""
@@ -8994,6 +9190,31 @@ async def _run_extraction(
                 )
             else:
                 tail = []
+            # 通话转写:聊天流里只有一张有界预览卡，全文在 voice_transcripts。
+            # 在闸内一并取回，渲染窗口时替换掉预览——这样 Capture 蒸的是整通
+            # 电话，而 prompt 尾巴仍然只背那张小卡。
+            if lane == "capture" and deps.read_voice_transcript is not None:
+                for message in tail:
+                    call_id = str(message.get("voice_call_id") or "").strip()
+                    if not call_id or str(message.get("source") or "") != _VOICE_TRANSCRIPT_SOURCE:
+                        continue
+                    if call_id in voice_transcripts:
+                        continue
+                    try:
+                        voice_transcripts[call_id] = await asyncio.to_thread(
+                            deps.read_voice_transcript, user_id, call_id
+                        )
+                    except Exception as e:  # noqa: BLE001
+                        # 绝不降级用预览：那会把整通电话蒸成开头几句，并且照常
+                        # 推进游标——记忆永久丢失且无人知晓。宁可整个 job 失败
+                        # 重试（游标不动，下次重来）。
+                        log.warning(
+                            "[v2.worker] voice transcript unavailable user=%s call=%s: %s",
+                            user_id[:12], call_id[:24], str(e)[:160],
+                        )
+                        raise RuntimeError(
+                            f"capture_voice_transcript_unavailable:{call_id}"
+                        ) from e
         if lane == "capture" and deps.read_capture_state is not None and tail:
             last = tail[-1]
             last_id = str(last.get("id") or "")
@@ -9056,14 +9277,27 @@ async def _run_extraction(
         speaker_user_name = ctx.get("user_name", "")
         speaker_ai_name = ctx.get("ai_name", "")
         window = "\n".join(
-            f"- {transcript_speaker_label(str(m.get('role') or ''), user_name=speaker_user_name, ai_name=speaker_ai_name)}: "
-            f"{context.text_of(m.get('content'))}"
+            _render_capture_line(
+                m, voice_transcripts,
+                user_name=speaker_user_name, ai_name=speaker_ai_name,
+            )
             for m in prompt_tail
         ).strip()
         source_ids = [str(m.get("id")) for m in prompt_tail if m.get("id")]
 
         if lane == "capture":
-            parse, to_actions = parse_capture_cards, v2_extraction.cards_to_actions
+            # 溯源只在**能证明**归属时打:窗口里恰好一通电话,且没有别的可捕捉
+            # 内容。挂断即触发 capture,所以这是常态。混合窗口(通话 + 文字聊天)
+            # 一律不打 —— 那时无法判断某张卡到底来自哪一边,盖章就是假精度。
+            _sole_call_id = ""
+            if len(voice_transcripts) == 1 and len(prompt_tail) == 1:
+                _sole_call_id = next(iter(voice_transcripts))
+            parse = parse_capture_cards
+
+            def to_actions(*args, _call_id=_sole_call_id, **kwargs):
+                return v2_extraction.cards_to_actions(
+                    *args, voice_call_id=_call_id, **kwargs
+                )
             # 内容闸打回后的第二问：放宽成「只丢占位符那几张、干净的照收」，
             # 不让一张脏卡把整个窗口的落卡清零。
             parse_retry = v2_extraction.ParseRetry(
@@ -9899,6 +10133,8 @@ async def process_job(
     push_slot: dict | None = None
     voice_reply_slot: dict | None = None
     voice_reply_parts: list[str] = []
+    voice_call_context: dict[str, str] = {}
+    voice_call_ended_atomically = False
     lease_keepalive_stop = asyncio.Event()
     lease_keepalive_task: asyncio.Task | None = None
 
@@ -10231,6 +10467,14 @@ async def process_job(
         reply_parent_message_id = (
             str(coalesced[0].get("id") or "") if coalesced else ""
         )
+        if coalesced:
+            call_id = str(coalesced[0].get("voice_call_id") or "").strip()
+            turn_id = str(coalesced[0].get("voice_turn_id") or "").strip()
+            if call_id and turn_id:
+                voice_call_context = {
+                    "voice_call_id": call_id,
+                    "voice_turn_id": turn_id,
+                }
         # A recovery turn is deliberately mutation-free. Keeping the hard file
         # completion guard active here creates an impossible state: the guard
         # demands workspace_write while the recovery barrier withholds it, so
@@ -11073,10 +11317,33 @@ async def process_job(
             *,
             final: bool,
             reasoning: str = "",
+            media: tuple[ProviderMedia, ...] = (),
         ) -> None:
             nonlocal final_job_completed_atomically, voice_reply_slot
+            nonlocal voice_call_ended_atomically
             file_reply = text if isinstance(text, WorkspaceFileReply) else None
             text = "" if file_reply is not None else str(text or "").strip()
+            image_replies: list[GeneratedImageReply] = []
+            if media:
+                if file_reply is not None or not final:
+                    raise RuntimeError("generated images require a terminal reply")
+                if len(media) > generated_image.MAX_GENERATED_IMAGES_PER_REPLY:
+                    raise RuntimeError("too many generated images")
+                for index, item in enumerate(media, start=1):
+                    image_replies.append(
+                        await asyncio.to_thread(
+                            _generated_image_reply_from_provider,
+                            item,
+                            index=index,
+                        )
+                    )
+                log.info(
+                    "[v2.image] normalized generated images user=%s job=%s count=%d bytes=%d",
+                    user_id,
+                    job_id,
+                    len(image_replies),
+                    sum(len(item.data) for item in image_replies),
+                )
             # Self-authored thinking (all models incl. relay). Peel a leading
             # <think> block into a SEPARATE channel and reply with the clean body.
             # The provider's native ``reasoning`` is left UNCHANGED here so the
@@ -11139,14 +11406,14 @@ async def process_job(
                 text = _DEGENERATE_REPLY_FALLBACK
                 turn_failure_error_class = _PROTOCOL_FRAGMENT_ERROR_CLASS
                 reasoning = ""
-            if final and not text:
+            if final and not text and not image_replies:
                 # BUG-4 no-filler: chat lane always replies — an empty terminal
                 # text is a model/provider failure here (unlike wake, where
                 # silence is legitimate), so this becomes a mark_failed via the
                 # outer except below. The terminal outbox, not the model loop,
                 # owns the attributed failure bubble.
                 raise TurnError("empty_reply")
-            if not text and file_reply is None:
+            if not text and file_reply is None and not image_replies:
                 return  # empty intermediate reply{} call: no bubble, not an error
             if file_reply is None:
                 text, removed_internal_reference = sanitize_downloadable_reply(
@@ -11194,13 +11461,22 @@ async def process_job(
                         "claimed_by": claimed_by,
                     }
             elif seq_native:
-                payload = await asyncio.to_thread(
-                    _build_encrypted_reply_effect_payload,
-                    store,
-                    text,
-                    effect_id=effect_id,
-                    reply_through_seq=(cursor_box["seq"] if final else None),
-                )
+                if image_replies and not text:
+                    payload = await asyncio.to_thread(
+                        _build_encrypted_image_reply_effect_payload,
+                        store,
+                        image_replies[0],
+                        effect_id=effect_id,
+                    )
+                    payload["reply_through_seq"] = int(cursor_box["seq"])
+                else:
+                    payload = await asyncio.to_thread(
+                        _build_encrypted_reply_effect_payload,
+                        store,
+                        text,
+                        effect_id=effect_id,
+                        reply_through_seq=(cursor_box["seq"] if final else None),
+                    )
                 if final:
                     # Reply content is encrypted; the owner id and two integers
                     # are only non-sensitive routing metadata. The outbox
@@ -11221,7 +11497,7 @@ async def process_job(
                     payload[v2_effect_outbox.REPLY_SOURCE_FENCE_KEY] = {
                         "claimed_by": claimed_by,
                     }
-                if final and pending_file_replies:
+                if final and (pending_file_replies or image_replies):
                     followups = []
                     for index, pending_file in enumerate(pending_file_replies):
                         followups.append(
@@ -11231,12 +11507,25 @@ async def process_job(
                                 pending_file,
                                 effect_id=f"{effect_id}:file:{index}",
                             )
-                    )
-                    payload[REPLY_FOLLOWUPS_KEY] = followups
+                        )
+                    image_followups = image_replies if text else image_replies[1:]
+                    for index, pending_image in enumerate(image_followups):
+                        followups.append(
+                            await asyncio.to_thread(
+                                _build_encrypted_image_reply_effect_payload,
+                                store,
+                                pending_image,
+                                effect_id=f"{effect_id}:image:{index}",
+                            )
+                        )
+                    if followups:
+                        payload[REPLY_FOLLOWUPS_KEY] = followups
             if turn_failure_error_class:
                 payload["turn_failure_error_class"] = turn_failure_error_class
             if final and reply_parent_message_id:
                 payload["reply_to_message_id"] = reply_parent_message_id
+            if voice_call_context:
+                payload.update(voice_call_context)
             if final:
                 try:
                     status_rows = await asyncio.to_thread(
@@ -11404,6 +11693,15 @@ async def process_job(
                     },
                     best_effort=True,
                 )
+                if (
+                    status == "discarded"
+                    and last_error
+                    == v2_effect_outbox.FINAL_REPLY_VOICE_CALL_ENDED
+                ):
+                    if final:
+                        final_job_completed_atomically = True
+                        voice_call_ended_atomically = True
+                    return
                 if status == "applied":
                     # 覆盖式：一个回合可能吐多条气泡，只有最后一条会成为推送。构建槽位
                     # 本身也是 best-effort：某些非 seq_native / 测试注入的 payload 不
@@ -11415,7 +11713,10 @@ async def process_job(
                     try:
                         push_slot = {
                             "msg_id": str(payload["envelope"]["id"]),
-                            "body": (text or file_reply.name)[:240],
+                            "body": (
+                                text
+                                or (file_reply.name if file_reply is not None else "图片")
+                            )[:240],
                             "is_wake": False,
                             # Chat lane is never a wake — send an empty lane rather
                             # than the job's own lane=="chat" bookkeeping value, so
@@ -11552,6 +11853,56 @@ async def process_job(
             if key not in pending_file_keys:
                 pending_file_keys.add(key)
                 pending_file_replies.append(file_reply)
+
+        async def _on_image_reply(args: dict) -> tuple[ProviderMedia, ...]:
+            prompt = str(args.get("prompt") or "").strip()
+            if not prompt:
+                raise ImageGenerationUnavailable(
+                    "image prompt missing",
+                    error_code="image_generation_invalid_prompt",
+                )
+            if deps.generate_image is None:
+                raise ImageGenerationUnavailable(
+                    "image generation is not configured",
+                    error_code="image_generation_model_required",
+                    model=str(getattr(provider_config, "model", "") or ""),
+                    provider=str(getattr(provider_config, "provider", "") or ""),
+                )
+            try:
+                generated = await deps.generate_image(
+                    user_id,
+                    prompt,
+                    main_provider_config=provider_config,
+                    api_key=api_key,
+                    runtime_token=runtime_token,
+                )
+            except ImageGenerationUnavailable:
+                raise
+            except Exception as exc:  # noqa: BLE001 - stable chat failure below
+                classified = _turn_failure_error_class(exc)
+                code = {
+                    "auth_invalid": "image_generation_auth_invalid",
+                    "quota_insufficient": "image_generation_quota_insufficient",
+                    "model_not_found": "image_generation_model_not_found",
+                    "provider_incompatible": "image_generation_model_required",
+                    "rate_limited": "image_generation_rate_limited",
+                    "upstream_unavailable": "image_generation_unavailable",
+                    "turn_timeout": "image_generation_unavailable",
+                    "reply_parse_failed": "image_generation_invalid_output",
+                }.get(classified, "image_generation_failed")
+                raise ImageGenerationUnavailable(
+                    "image generation failed",
+                    error_code=code,
+                    model=str(getattr(provider_config, "model", "") or ""),
+                    provider=str(getattr(provider_config, "provider", "") or ""),
+                ) from exc
+            media = tuple(generated or ())
+            if not media or any(not isinstance(item, ProviderMedia) for item in media):
+                raise ImageGenerationUnavailable(
+                    "image generation returned invalid media",
+                    error_code="image_generation_invalid_output",
+                )
+            return media
         # Pass THIS turn's enclave_sem through explicitly (not the closure's module-level
         # default) — process_job may have been called with an injected/test semaphore
         # (e.g. tests/test_v2_worker.py's _CountingSemaphore), and the per-round fold must
@@ -11707,12 +12058,14 @@ async def process_job(
             provider_config=provider_config,
             include_reasoning=turn_include_reasoning,
             suppress_native_reasoning=_self_thinking_v2.enabled(),
+            allow_image_output=True,
             build_messages=build_messages,
             dispatch_tools=_dispatch_tools,
             on_reply=_on_reply,
             on_file_reply=(
                 _on_file_reply if deps.load_workspace_file is not None else None
             ),
+            on_image_reply=_on_image_reply,
             on_tool_event=chat_tool_activity_callback,
             required_file_suffixes=required_file_suffixes,
             file_requirement_messages=(
@@ -11767,6 +12120,19 @@ async def process_job(
                 tm.record_prompt_frontier_exhaustion
             ),
         )
+        if voice_call_ended_atomically:
+            try:
+                await asyncio.to_thread(_emit_status, user_id, job_id, "done")
+            except Exception as exc:  # noqa: BLE001 — lifecycle already settled
+                log.warning(
+                    "[v2.worker] cancelled voice done status failed "
+                    "user=%s job=%s code=%s",
+                    user_id,
+                    job_id,
+                    type(exc).__name__.lower(),
+                )
+            tm.flush(failed=False, status="voice_call_ended")
+            return "completed"
         if outcome.stop_reason == "input_advanced":
             # The hard provider-call budget remains authoritative. The stale
             # final effect was already terminally discarded without dispatch;
@@ -11798,7 +12164,11 @@ async def process_job(
                 user_id,
                 job_id,
             )
-        if not outcome.replied_intermediate and not (outcome.final_text or "").strip():
+        if (
+            not outcome.replied_intermediate
+            and not (outcome.final_text or "").strip()
+            and outcome.delivered_media_count <= 0
+        ):
             # BUG-4 no-filler class: the loop returned WITHOUT ever producing a
             # bubble — budget_exhausted (max_calls reached with no terminal
             # final_text call), or a misbehaving last round that returns
@@ -11809,7 +12179,7 @@ async def process_job(
             # exactly like the already-fixed BUG-4. Raise the same signal
             # `_on_reply` uses so it falls into the outer except below:
             # mark_failed + terminal error status + tm.flush(failed=True).
-            raise TurnError("empty_reply")
+            raise TurnError(_TOOL_BUDGET_EXHAUSTED_REASON)
         if seq_native:
             if not final_job_completed_atomically:
                 source_status = await asyncio.to_thread(
@@ -12041,6 +12411,7 @@ async def process_job(
                 "rate_limited": "vision_model_rate_limited",
                 "upstream_unavailable": "vision_model_unavailable",
                 "turn_timeout": "vision_model_unavailable",
+                "provider_empty_reply": "vision_model_empty_response",
                 "reply_parse_failed": "vision_model_empty_response",
             }.get(classified)
             # Pixels being present does not prove an unrelated tool, storage,
@@ -12072,7 +12443,10 @@ async def process_job(
             claimed_by=claimed_by,
             error_class=_turn_failure_error_class(failure_exc),
         )
-        if owned and isinstance(failure_exc, DedicatedVisionUnavailable):
+        if owned and isinstance(
+            failure_exc,
+            (DedicatedVisionUnavailable, ImageGenerationUnavailable),
+        ):
             identity = {}
             if failure_exc.model:
                 identity["failure_model"] = failure_exc.model
@@ -12085,12 +12459,16 @@ async def process_job(
                         user_id,
                         "error",
                         job_id=job_id,
-                        label="视觉模型调用失败",
+                        label=(
+                            "生图模型调用失败"
+                            if isinstance(failure_exc, ImageGenerationUnavailable)
+                            else "视觉模型调用失败"
+                        ),
                         detail=identity,
                     )
                 except Exception as exc:  # noqa: BLE001 -- outbox still owns visibility
                     log.warning(
-                        "[v2.worker] vision failure identity event failed job=%s code=%s",
+                        "[v2.worker] capability failure identity event failed job=%s code=%s",
                         job_id,
                         type(exc).__name__.lower(),
                     )

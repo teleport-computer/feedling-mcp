@@ -2,8 +2,8 @@
 
 No I/O, no DB, no LLM calls — just deterministic message-list construction
 from a system prompt, an optional **untrusted** conversation summary, a
-verbatim message tail, and an optional untrusted runtime-data block. Stdlib
-only.
+verbatim message tail, and an optional untrusted runtime-data block. It depends
+only on stdlib and the pure shared voice-row classifier.
 """
 from __future__ import annotations
 
@@ -14,6 +14,8 @@ import unicodedata
 from datetime import datetime, timezone
 from typing import Any, Sequence
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+from voice.message_filter import conversation_rows
 
 # Fallback timezone when the user's IANA zone is unknown or invalid. Defaults to
 # Asia/Shanghai (most users are in China) and matches the resident consumer's
@@ -308,6 +310,10 @@ _FILE_FORMAT_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     (".rtf", re.compile(r"(?:\.rtf\b|\brtf\b)")),
 )
 
+# Conservative completion guard for explicit image-creation requests. The model
+# still owns prompt interpretation; this only prevents a text placeholder such
+# as "Image" from satisfying a request that clearly asks IO to create a visual.
+
 
 def _norm_role(role: Any) -> str:
     return "assistant" if str(role or "") in _ASSISTANT_ROLES else "user"
@@ -588,7 +594,7 @@ def build_turn_messages(
             "content": WORLD_BOOK_CONTEXT_HEADER + "\n" + bounded_worldbook,
         })
 
-    for m in tail:
+    for m in conversation_rows(tail):
         content = m.get("content")
         if not _has_payload(content):
             continue

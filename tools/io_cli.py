@@ -555,6 +555,123 @@ def cmd_cancel_wake(args):
     _emit({"ok": False, "http_status": status, "error": body}, 1)
 
 
+_IMAGE_FAILURE_HINT = (
+    "图没有生成。请如实告诉用户,或换一个更清楚的画面描述再调一次;"
+    "不要声称图已经生成。"
+)
+
+
+def cmd_generate_image(args):
+    """用用户配置的专用生图模型画一张图,存到出站目录。POST /v1/image-generation/generate。
+
+    伴侣自己决定什么时候画、prompt 怎么写 —— 这个动词只是把能力交到它手上。
+    成功后仍要用 send-image 交付,和它自己产出的图走同一条投递路径。
+    """
+    api_url, auth = _require_backend()
+    prompt = str(args.prompt or "").strip()
+    if not prompt:
+        _emit({"ok": False, "error": "generate-image needs a non-empty --prompt"}, 2)
+    status, body = _http_json(
+        "POST", f"{api_url}/v1/image-generation/generate", auth,
+        payload={"prompt": prompt[:8000]}, timeout=180)
+    if status != 200:
+        # 失败如实交回:伴侣据此自己跟用户解释,或换个描述再试。
+        _emit({"ok": False, "http_status": status, "error": body,
+               "hint": _IMAGE_FAILURE_HINT}, 1)
+    # 后端契约(hosted/image_generator.py:162)是 images[].data_base64/mime_type/name。
+    # 早先这里照 media[].data_b64/mime 写 —— 字段全不对,任何一次真实调用都会
+    # 停在 "returned no media",伴侣会以为是模型不会画。codex 审出。
+    images = (body or {}).get("images") or []
+    if not images:
+        _emit({"ok": False, "error": "image route returned no images",
+               "hint": _IMAGE_FAILURE_HINT}, 1)
+    # 必须落在 $FEEDLING_HOME/outbound-files:send-image 经 IPC 只接受这个目录
+    # (consumer 的 path_outside_outbound_dir 闸)。写 /tmp 的话生成永远交付不出去,
+    # 而且 hosted 多用户共享 /tmp 还会串图。
+    outbound = Path(_resident_ipc_home()) / "outbound-files"
+    try:
+        outbound.mkdir(parents=True, exist_ok=True)
+    except Exception as exc:  # noqa: BLE001
+        _emit({"ok": False, "error": f"could not prepare outbound dir: {str(exc)[:120]}"}, 1)
+    saved = []
+    for idx, item in enumerate(images, start=1):
+        b64 = str((item or {}).get("data_base64") or "")
+        if not b64:
+            continue
+        mime = str((item or {}).get("mime_type") or "image/png")
+        ext = {"image/png": "png", "image/jpeg": "jpg", "image/webp": "webp"}.get(mime, "png")
+        # 唯一文件名:秒级时间戳在连续两次生图/多用户共享目录下会互相覆盖。
+        path = outbound / f"generated_{uuid.uuid4().hex[:12]}_{idx}.{ext}"
+        try:
+            path.write_bytes(base64.b64decode(b64))
+        except Exception as exc:  # noqa: BLE001
+            _emit({"ok": False, "error": f"could not save image: {str(exc)[:120]}"}, 1)
+        saved.append(str(path))
+    if not saved:
+        _emit({"ok": False, "error": "image route returned no usable bytes",
+               "hint": _IMAGE_FAILURE_HINT}, 1)
+    _emit({"ok": True, "paths": saved,
+           "next": "call send-image --path <path> to deliver it"})
+
+
+def cmd_voice_transcript_list(args):
+    """Archived voice calls, newest first (metadata only). GET /v1/voice/transcripts."""
+    api_url, auth = _require_backend()
+    status, body = _http_json(
+        "GET", f"{api_url}/v1/voice/transcripts?limit={int(args.limit)}", auth)
+    if status == 200:
+        _emit({"ok": True, **body})
+    _emit({"ok": False, "http_status": status, "error": body}, 1)
+
+
+def cmd_voice_transcript_read(args):
+    """One archived call's words, paged. GET /v1/voice/transcripts/<call_id>.
+
+    The endpoint returns the envelope; decryption is the consumer's job, so this
+    verb goes through the same enclave decrypt path memory-fetch uses.
+    """
+    api_url, auth = _require_backend()
+    call_id = str(args.call_id or "").strip()
+    if not call_id.startswith("vcall_"):
+        _emit({"ok": False, "error": "voice-transcript-read needs a real call_id "
+                                     "(run voice-transcript-list first)"}, 2)
+    status, body = _http_json(
+        "GET", f"{api_url}/v1/voice/transcripts/{urllib.parse.quote(call_id)}", auth)
+    if status != 200:
+        _emit({"ok": False, "http_status": status, "error": body}, 1)
+    envelope = body.get("transcript") if isinstance(body, dict) else None
+    if not isinstance(envelope, dict):
+        _emit({"ok": False, "error": "transcript envelope missing"}, 1)
+    # 归档表存的是信封;明文只在 enclave 里出现。走通用 /v1/envelope/decrypt
+    # ——与 chat/memory 同一条 crypto 路径,不新增信任面。
+    enclave_url = _env("FEEDLING_ENCLAVE_URL")
+    if not enclave_url:
+        _emit({"ok": False, "error": "FEEDLING_ENCLAVE_URL not set; cannot decrypt transcript"}, 2)
+    dec_status, dec_body = _http_json(
+        "POST", f"{enclave_url.rstrip('/')}/v1/envelope/decrypt", auth,
+        payload={"envelope": envelope}, insecure=True)
+    if dec_status != 200 or not isinstance(dec_body, dict):
+        _emit({"ok": False, "http_status": dec_status,
+               "error": dec_body or "envelope decrypt failed"}, 1)
+    try:
+        text = base64.b64decode(dec_body.get("plaintext_b64") or "").decode("utf-8")
+    except Exception as exc:  # noqa: BLE001
+        _emit({"ok": False, "error": f"transcript decode failed: {str(exc)[:120]}"}, 1)
+    offset = max(0, int(args.offset or 0))
+    page = text[offset:offset + 6000]
+    _emit({
+        "ok": True,
+        "call_id": call_id,
+        "text": page,
+        "offset": offset,
+        "next_offset": (offset + len(page)) if offset + len(page) < len(text) else None,
+        "total_chars": len(text),
+        "turn_count": body.get("turn_count"),
+        "duration_sec": body.get("duration_sec"),
+        "created_at": body.get("created_at"),
+    })
+
+
 def cmd_memory_fetch(args):
     """Verbatim decrypted memory cards by id (plaintext-safe). POST /v1/memory/fetch."""
     api_url, auth = _require_backend()
@@ -1299,6 +1416,28 @@ def cmd_send_file(args):
     _emit({"ok": False, **{key: value for key, value in reply.items() if key != "ok"}}, exit_code)
 
 
+def cmd_send_image(args):
+    """Stage one generated raster image for direct display in the current chat."""
+    raw_path = str(args.path or "").strip()
+    if not raw_path:
+        _emit({"ok": False, "error": "path_required"}, 2)
+    source_path = Path(raw_path)
+    if not source_path.is_absolute():
+        source_path = Path(_resident_ipc_home()) / "outbound-files" / source_path
+    reply = _resident_ipc_call(
+        "stage_image",
+        {"path": str(source_path), "name": str(args.name or "").strip()},
+    )
+    if reply.get("ok"):
+        _emit({"ok": True, **{key: value for key, value in reply.items() if key != "ok"}})
+    exit_code = 2 if reply.get("error") in {
+        "consumer_not_running",
+        "no_active_chat_turn",
+        "path_outside_outbound_dir",
+    } else 1
+    _emit({"ok": False, **{key: value for key, value in reply.items() if key != "ok"}}, exit_code)
+
+
 def cmd_identity_redistill(args):
     """Hand fresh material to the resident consumer for a FULL identity
     redistill (whole-card replace), over the local resident-consumer IPC
@@ -1779,6 +1918,22 @@ def main():
     mf.add_argument("--include-superseded", dest="include_superseded", action="store_true", help="include superseded/corrected versions")
     mf.set_defaults(func=cmd_memory_fetch)
 
+    gi = sub.add_parser("generate-image",
+                        help="Draw an image with the user's dedicated image model.")
+    gi.add_argument("--prompt", required=True, help="complete visual description")
+    gi.set_defaults(func=cmd_generate_image)
+
+    vtl = sub.add_parser("voice-transcript-list",
+                         help="Archived voice calls, newest first (metadata only).")
+    vtl.add_argument("--limit", type=int, default=20, help="maximum calls to list")
+    vtl.set_defaults(func=cmd_voice_transcript_list)
+
+    vtr = sub.add_parser("voice-transcript-read",
+                         help="What was said in one archived voice call (paged).")
+    vtr.add_argument("--call-id", dest="call_id", required=True, help="call id from voice-transcript-list")
+    vtr.add_argument("--offset", type=int, default=0, help="character offset to continue from")
+    vtr.set_defaults(func=cmd_voice_transcript_read)
+
     sr = sub.add_parser("screen-recent", help="Recent screen frame metadata (no pixels).")
     sr.add_argument("--limit", type=int, default=10, help="maximum number of frames to return")
     sr.set_defaults(func=cmd_screen_recent)
@@ -1816,6 +1971,21 @@ def main():
     sf.add_argument("--path", required=True, help="UTF-8 source path inside the outbound-files directory")
     sf.add_argument("--name", required=True, help="download filename with the requested suffix")
     sf.set_defaults(func=cmd_send_file)
+
+    si = sub.add_parser(
+        "send-image",
+        help="Stage a generated image for direct display in the current chat.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Write a PNG, JPEG, or WebP image under $FEEDLING_HOME/outbound-files, "
+            "then pass its path here. The image is validated and shown as a normal "
+            "chat image bubble.\n"
+            f"{D3_SOURCING_RULE}"
+        ),
+    )
+    si.add_argument("--path", required=True, help="image path inside the outbound-files directory")
+    si.add_argument("--name", default="", help="optional safe display filename")
+    si.set_defaults(func=cmd_send_image)
 
     sw = sub.add_parser("schedule-wake", help="Ask to be woken at a later time (native self-wake).")
     sw.add_argument("--at", required=True, help="When to wake: ISO time (e.g. 2026-06-29T18:00) or a relative spec.")
@@ -1940,8 +2110,12 @@ def main():
                          help="材料文件路径(UTF-8 文本);与 --material-text 二选一;"
                               "敏感材料优先用这个(不会出现在 ps 里)")
     ird_grp.add_argument("--material-text", dest="material_text", default=None,
+                         # 用 ASCII 的 [!] 而不是 ⚠️:help 文本会被 io_cli_catalog
+                         # 以子进程 --help 的形式读出来,子进程 stdout 用系统 locale
+                         # 编码。中文 Windows 是 cp936(GBK),U+26A0 不在 GBK 里 →
+                         # 子进程 UnicodeEncodeError → 整个 catalog 构建失败。
                          help="材料原文,直接传文本;与 --material-file 二选一;"
-                              "⚠️ 会明文出现在本机 ps 输出里,敏感材料改用 --material-file")
+                              "[!] 会明文出现在本机 ps 输出里,敏感材料改用 --material-file")
     ird.set_defaults(func=cmd_identity_redistill)
 
     ii = sub.add_parser(
