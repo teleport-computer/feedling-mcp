@@ -1015,6 +1015,35 @@ def _read_tail_window(
     return _decrypt_chat_rows(user_id, rows, user_only=False)
 
 
+def _scrub_leaked_thinking_rows(rows: list[dict]) -> list[dict]:
+    """把历史里 assistant 行残留的 ``<think>`` 擦掉再喂回模型。
+
+    正常情况下思考封在**另一个**信封里，模型永远看不到；历史正文里带标签的行
+    是「漏出去时原样存下来」的异常。不擦的话模型每轮都看到可抄的样板，于是继续
+    写、继续漏——这是本 bug 自我强化的那一环（2026-08-08：主动消息那条 lane
+    我们根本没要求它写 think，它是从历史里学的）。
+
+    只碰 assistant 行：用户自己打的字里出现标签是他的自由，不是我们的协议。
+    剥离失败（FAILED）时保留原文——入口只做修正、不做删除，真正的把关在出口。
+    """
+    from core import self_thinking as _st
+
+    if not _st.gate_enabled():
+        return rows
+    out: list[dict] = []
+    for row in rows:
+        content = row.get("content")
+        if str(row.get("role") or "") != "assistant" or not isinstance(content, str):
+            out.append(row)
+            continue
+        status, _thinking, stripped = _st.strip_all_thinking(content)
+        if status in (_st.ABSENT, _st.FAILED):
+            out.append(row)
+            continue
+        out.append({**row, "content": stripped})
+    return out
+
+
 def _read_tail_window_after_seq(
     user_id: str,
     after_seq: int,
@@ -1034,12 +1063,14 @@ def _read_tail_window_after_seq(
         through_seq=through_seq,
         exclude_synthetic_sources=exclude_synthetic_sources,
     )
-    return _decrypt_chat_rows(
-        user_id,
-        rows,
-        user_only=False,
-        preserve_unreadable=True,
-        include_capture_metadata=include_capture_metadata,
+    return _scrub_leaked_thinking_rows(
+        _decrypt_chat_rows(
+            user_id,
+            rows,
+            user_only=False,
+            preserve_unreadable=True,
+            include_capture_metadata=include_capture_metadata,
+        )
     )
 
 
