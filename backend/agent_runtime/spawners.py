@@ -763,6 +763,7 @@ def _default_cli_cmd(driver: str, home: str, io_cli: str = _IO_CLI, model: str =
     model_part = f"--model {shlex.quote(model_id)} " if model_id else ""
     return (
         f"claude {model_part}{_CLAUDE_PERMISSION_FLAG} {_attach_dirs_add_dir(home)} "
+        "--output-format json "
         f"--allowed-tools '{grant}' {_CLAUDE_DISALLOWED_WEB_TOOLS} "
         f"--append-system-prompt-file {prompt_file} {{mcp}} -p {{message}}"
     )

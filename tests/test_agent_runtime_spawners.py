@@ -1027,6 +1027,16 @@ def test_claude_default_cli_cmd_selects_exact_route_model():
     assert "--fallback-model" not in argv
 
 
+def test_claude_default_cli_cmd_emits_structured_json_receipt():
+    argv = shlex.split(
+        spawners._default_cli_cmd(
+            "claude", "/h", model="claude-fable-5",
+        )
+    )
+
+    assert argv[argv.index("--output-format") + 1] == "json"
+
+
 def test_claude_default_cli_cmd_quotes_model_as_one_token():
     model = "custom model alias"
     argv = shlex.split(spawners._default_cli_cmd("claude", "/h", model=model))
