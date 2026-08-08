@@ -478,8 +478,13 @@ def test_mapping_caps_tools_and_reports_what_it_dropped():
     """Silent truncation would present as 'tools come and go' — the hardest
     class of bug to triage, and indistinguishable from the symptom this whole
     feature exists to fix ('the AI can't see my tool')."""
-    out = _harness("mapping", _servers(("s", [f"t{i:03d}" for i in range(60)])))
-    assert len(out["mapped"]) == 50
+    probe = _harness("mapping", _servers(("s", ["t000"])))
+    cap = probe["cap"]  # 从桥拿上限,别在测试里抄魔数(改常量时会静默失配)
+    total = cap + 10
+    out = _harness(
+        "mapping", _servers(("s", [f"t{i:03d}" for i in range(total)]))
+    )
+    assert len(out["mapped"]) == cap
     assert len(out["dropped"]) == 10
     assert all(d.startswith("s/") for d in out["dropped"])
 
@@ -709,3 +714,78 @@ def test_extension_bounds_a_slow_but_alive_server_to_the_total_budget(tmp_path):
         assert elapsed < 5, f"took {elapsed}s — budget was not enforced"
     finally:
         srv.shutdown()
+
+
+# ── 轮转公平分配(2026-08-09 换掉字母序截断)─────────────────────────────
+
+
+def _big(name, count):
+    return {"name": name, "tools": [
+        {"name": f"t{i:03d}", "description": "d" * 40,
+         "inputSchema": {"type": "object", "properties": {}}}
+        for i in range(count)
+    ]}
+
+
+def test_a_huge_server_cannot_starve_a_small_one():
+    """一台 200 个工具的服务器不能把 4 个工具的那台挤成 0。
+
+    这是 usr_1baf(2026-08-09)的真实症状:旧实现把所有工具排成一列后按
+    **服务器名**截断,`tavily` 字母序排最后 → 一个工具都没注册上。
+    用户看到的是「连接测试通过,AI 却说搜不到」—— 探针直连服务器确实成功,
+    而伴侣真的看不到它的工具,两件事发生在两个进程里。
+    """
+    out = _harness("mapping", json.dumps([_big("gardenforum", 200),
+                                          _big("tavily", 4)]))
+    assert len(out["mapped"]) == out["cap"]
+    kept = {m["server"] for m in out["mapped"]}
+    assert "tavily" in kept, "小服务器被整台饿死了"
+    assert out["per_server"].count("tavily:4/4") == 1, out["per_server"]
+
+
+def test_the_reported_users_exact_configuration_keeps_every_server():
+    """她的真实配置(6 台 107 个工具):每台都要有代表工具。"""
+    servers = [_big("game", 8), _big("gaodemap", 12), _big("gardenforum", 25),
+               _big("luckin-coffee", 30), _big("mcdonalds", 28), _big("tavily", 4)]
+    out = _harness("mapping", json.dumps(servers))
+    assert len(out["mapped"]) == out["cap"]
+    for name in ("game", "gaodemap", "gardenforum", "luckin-coffee",
+                 "mcdonalds", "tavily"):
+        assert f"{name}:0/" not in out["per_server"], (
+            f"{name} 被饿死:{out['per_server']}"
+        )
+    # 工具少的那几台应当**全部**拿到
+    assert "tavily:4/4" in out["per_server"]
+    assert "game:8/8" in out["per_server"]
+
+
+def test_allocation_is_deterministic_regardless_of_handshake_order():
+    """握手完成的先后不能影响分配结果 —— 否则模型每轮看到的工具面都在变,
+    它记住的工具下一轮就调不出来了。"""
+    servers = [_big("aaa", 60), _big("bbb", 60), _big("ccc", 60)]
+    first = _harness("mapping", json.dumps(servers))
+    shuffled = _harness("mapping", json.dumps(list(reversed(servers))))
+    assert [m["piName"] for m in first["mapped"]] == \
+           [m["piName"] for m in shuffled["mapped"]]
+
+
+def test_nothing_is_lost_when_the_total_fits_under_the_cap():
+    servers = [_big("a", 3), _big("b", 5)]
+    out = _harness("mapping", json.dumps(servers))
+    assert len(out["mapped"]) == 8
+    assert out["dropped"] == []
+    assert "a:3/3" in out["per_server"] and "b:5/5" in out["per_server"]
+
+
+def test_schema_bytes_counts_utf8_not_utf16_code_units():
+    """中文/emoji 的描述必须按 UTF-8 字节算。
+
+    `String.length` 数的是 UTF-16 码元,中文会少算一半以上 —— 而这个指标
+    存在的意义就是判断「工具面是不是太大」,量错了就没意义(codex 审出)。
+    """
+    servers = json.dumps([{"name": "s", "tools": [
+        {"name": "weather", "description": "查询天气🌤️",
+         "inputSchema": {"type": "object", "properties": {}}}]}])
+    out = _harness("mapping", servers)
+    # "查询天气🌤️" = UTF-16 长度 7,UTF-8 21 字节;加上 schema 的 JSON
+    assert out["schema_bytes"] > 21, out["schema_bytes"]

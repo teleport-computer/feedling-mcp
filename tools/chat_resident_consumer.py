@@ -5374,6 +5374,98 @@ def _run_cli_subprocess(
     )
 
 
+_USER_MCP_SURFACE_RE = re.compile(
+    r"\[user_mcp\] surface servers=(\d+) registered=(\d+) dropped=(\d+) "
+    r"cap=(\d+) bytes=(\d+) detail=(\S*)"
+)
+_USER_MCP_DROPPED_RE = re.compile(r"\[user_mcp\] tool cap \d+ reached — dropped \d+: (.+)")
+
+
+def _trace_user_mcp_surface(
+    stderr: str, *, trace_id: str, lane: str, is_pi: bool, attempt: str = "first"
+) -> None:
+    """把桥这一轮实际注册的 MCP 工具面写进 debug trace。
+
+    为什么必须有:在此之前「模型这一轮到底看得到哪些 MCP 工具」在生产上**完全
+    不可观测** —— 桥只往自己的 stderr 打日志,MCP 工具调用也不经 io_cli(所以
+    `agent.tool.call` 里永远看不到它们)。用户报「链接测试通过、AI 却说搜不到」
+    时,我们连"工具有没有被注册进去"都答不上来,只能猜(usr_1baf 2026-08-09)。
+
+    静默失败面有三层,这条 trace 让每一层都留声:
+      ① 桥根本没加载(没有 surface 行)→ MCP 这一轮压根没接上;
+      ② 服务器握手失败(detail 里该服务器是 :0)→ 连上了但没工具;
+      ③ 撞到工具上限(dropped>0)→ 有工具被裁,看 per_server 的「注册数/发现数」
+         就知道是哪台被削了顶(轮转分配保证每台都有代表工具,不会整台饿死)。
+    """
+    if not is_pi:
+        # 这条埋点是 pi 专属:claude 走 `--mcp-config` 交给 CLI 自己管、
+        # codex 走 config.toml,**都不经过我们的桥**。在函数入口就返回,
+        # 而不是只在 missing 分支判 —— 否则 claude 的 stderr 里若恰好出现
+        # 一行同形文本,就会伪造出一条 resolved 事件(codex 审出)。
+        return
+    text = str(stderr or "")
+    # 取**最后**一条,不是第一条:一轮正常只有一行,但桥若被重跑(或将来多次
+    # 握手)会有多行,而第一条配上后面那条的丢弃名单就是张冠李戴。
+    # 这个错我自己写出来过,被端到端喂真实输出时撞出来的。
+    surface_matches = list(_USER_MCP_SURFACE_RE.finditer(text))
+    match = surface_matches[-1] if surface_matches else None
+    if not match:
+        # 没有 surface 行有两种可能:这一轮没注入桥(非 chat 通道 / 无启用的
+        # 服务器),或者桥启动就失败了。前者是正常的,所以只在 chat 通道且
+        # 确实有启用服务器时才当成异常记一笔。
+        enabled = [
+            s for s in (_user_mcp_applied.get("servers") or []) if s.get("enabled")
+        ]
+        # ⚠️ 只有 pi 会产 surface 行:claude 走 `--mcp-config` 交给 CLI 自己管,
+        # codex 走 config.toml —— 两者都**不经过我们的桥**,自然没有这一行。
+        # 不加这个判据的话,每个用 claude/codex + MCP 的用户**每一轮**都会刷一条
+        # 假 error,把 200 条的 trace 环冲掉 —— 跟这个埋点的目的正好相反。
+        # (我自己写出来过这个 bug,commit 前验出来的。)
+        if is_pi and lane == "chat" and enabled:
+            _emit_debug_trace(
+                "agent", "mcp.surface.missing", status="error", trace_id=trace_id,
+                summary="user MCP bridge produced no tool surface",
+                explain=("这一轮有启用的 MCP 服务器,桥却没有报告工具面 —— "
+                         "桥可能没被注入或启动失败,模型看不到任何 MCP 工具"),
+                detail={
+                    "driver": "pi", "lane": lane, "attempt": attempt,
+                    "enabled_servers": [s.get("name") for s in enabled],
+                },
+            )
+        return
+    servers, registered, dropped, cap, schema_bytes, per_server = match.groups()
+    dropped_names = ""
+    if int(dropped):
+        # 只在本轮确实有丢弃时才去找名单,且同样取最后一条。
+        drop_matches = list(_USER_MCP_DROPPED_RE.finditer(text))
+        if drop_matches:
+            dropped_names = drop_matches[-1].group(1)[:600]
+    _emit_debug_trace(
+        "agent",
+        "mcp.surface.resolved",
+        status="error" if int(dropped) else "ok",
+        trace_id=trace_id,
+        summary=(f"MCP 工具面 {registered} 个"
+                 + (f",丢弃 {dropped} 个" if int(dropped) else "")),
+        explain=(f"模型这一轮能看到 {registered} 个 MCP 工具"
+                 + (f";另有 {dropped} 个因超过 {cap} 上限被裁掉 —— "
+                    "分配是**轮转公平**的(每台各拿一个再拿第二个),"
+                    "所以裁掉的是工具最多那几台的尾部,每台仍有代表工具。"
+                    "detail.per_server 是「注册数/发现数」" if int(dropped) else "")),
+        detail={
+            "driver": "pi",
+            "servers": int(servers), "registered": int(registered),
+            "dropped": int(dropped), "cap": int(cap),
+            # 数量之外的另一半成本:工具面的总 schema 字节数。工具翻倍会显著
+            # 抬高请求体与上下文占用,也会拖垮弱模型的选择率(codex 提)。
+            "schema_bytes": int(schema_bytes),
+            # `服务器:注册数/发现数` —— 注册数才回答「它到底进没进去」。
+            "per_server": per_server[:400], "dropped_names": dropped_names,
+            "lane": lane, "attempt": attempt,
+        },
+    )
+
+
 def _pi_display_thinking_summary(text: str) -> str:
     """Project one provider thinking block into its own short step heading."""
     value = str(text or "").replace("\r\n", "\n").strip()
@@ -7483,6 +7575,14 @@ def call_agent_cli(
         ))
 
     raw_transport = (result.stdout or "") + "\n" + (result.stderr or "")
+    # 每次 CLI 尝试都记一次。原本我只记首次,理由是「重试跑同一条命令、同一份
+    # 配置,工具面相同」—— 这是错的:重试会**新起一个进程、重做 MCP 握手**,
+    # 首次可能 tavily:0/4(那台没连上)而重试 4/4,反之亦然。重试本来就少见,
+    # 多一两条事件淹不掉 200 条的环(codex 审出)。
+    _trace_user_mcp_surface(
+        result.stderr or "", trace_id=trace_id, lane=lane,
+        is_pi=_is_pi_cmd(cmd), attempt="first",
+    )
     if result.returncode == 0 and _is_claude_code_cmd(cmd):
         # Claude Code can silently choose its own default despite ANTHROPIC_MODEL.
         # Validate the CLI's structured receipt before persisting the session, so
@@ -7551,6 +7651,10 @@ def call_agent_cli(
                 ))
             _log_cli_turn_timing(cmd, result, int((time.monotonic() - _turn_t0) * 1000))
             raw_transport = (result.stdout or "") + "\n" + (result.stderr or "")
+            _trace_user_mcp_surface(
+                result.stderr or "", trace_id=trace_id, lane=lane,
+                is_pi=_is_pi_cmd(cmd), attempt="stale_resume_retry",
+            )
             # Persist the fresh session so the NEXT turn resumes it — but ONLY
             # from a SUCCESSFUL retry: claude's failure result JSON can still
             # carry a session_id, and saving that would re-persist a sid for a
@@ -7609,6 +7713,10 @@ def call_agent_cli(
                 ))
             _log_cli_turn_timing(cmd, result, int((time.monotonic() - _turn_t0) * 1000))
             raw_transport = (result.stdout or "") + "\n" + (result.stderr or "")
+            _trace_user_mcp_surface(
+                result.stderr or "", trace_id=trace_id, lane=lane,
+                is_pi=_is_pi_cmd(cmd), attempt="stream_cut_retry",
+            )
             if observed_sid and not isolated_session:
                 _record_agent_session_turn(
                     observed_sid,

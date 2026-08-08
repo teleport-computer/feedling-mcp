@@ -17,6 +17,14 @@ change must not be interpreted as an API guarantee.
   model calls without duplicating memory cards. Interrupted workers also emit
   content-free cause, progress, elapsed-time, model, tier, and checkpoint-size
   diagnostics; interruption and retry policy itself is unchanged.
+- **A large MCP server can no longer starve a smaller one.** When the connected
+  servers together expose more tools than one turn can carry, the tools kept are
+  now allocated round-robin across servers instead of taken in server-name order,
+  so every connected server keeps a share; only the largest ones are trimmed.
+  Previously a single big server could consume the whole budget and a server
+  later in the alphabet would contribute no tools at all — its connection test
+  passed while the companion genuinely could not see any of its tools. The
+  per-turn cap is also raised from 50 to 100.
 
 - **Voice calls no longer end with a protocol error when a turn produces no
   speech.** A turn that is deliberately silent — transport noise, a call that

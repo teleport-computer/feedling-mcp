@@ -214,6 +214,9 @@ if not _provisioned:
         # test_v2_tool_loop.py 里,不登记等于白写。
         "test_v2_tool_loop.py",
         "test_chat_resident_consumer_image.py",
+        # MCP 工具面可观测性(2026-08-09)。纯:只解析字符串 + 读两个 JS 源文件。
+        "test_user_mcp_surface_trace.py",
+        "test_voice_context_regressions.py",
     }
     collect_ignore = sorted(
         f
