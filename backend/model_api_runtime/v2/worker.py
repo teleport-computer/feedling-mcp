@@ -11945,7 +11945,7 @@ async def process_job(
 
         def _chat_builder():
             return _make_build_messages_fn(
-                system_prompt=context.chat_system_prompt(),
+                system_prompt=context.chat_system_prompt(provider_config),
                 summary=summary,
                 tail=tail,
                 extra_context=turn_extra_context,
