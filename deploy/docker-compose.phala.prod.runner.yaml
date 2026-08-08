@@ -51,7 +51,7 @@ services:
   # process-specific lease ownership remains independent.
   # No per-runner config: every prod runner CVM deploys this identical compose.
   agent-runner:
-    image: ghcr.io/teleport-computer/feedling-agent-runner:dcc4786   # CI pins the sha
+    image: ghcr.io/teleport-computer/feedling-agent-runner:63aa5cc   # CI pins the sha
     command: ["python", "-u", "backend/agent_runtime/supervisor.py"]
     restart: unless-stopped
     environment:
