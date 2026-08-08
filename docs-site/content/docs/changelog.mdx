@@ -10,6 +10,15 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **Runtime V2 now supports stricter Anthropic-compatible models during chat and
+  multi-step tool use.** Fable 5 is allowed to answer without the optional
+  self-thinking bubble instead of being forced into a visible chain-of-thought
+  format that it refuses. Native tool definitions also remain visible while
+  their matching `tool_use` / `tool_result` history is in the turn, so models
+  such as Opus 4.8 can continue a real tool workflow without treating earlier
+  results as fabricated. Repeated memory discovery is still executed at most
+  once per mode.
+
 - **Runtime V1 now pins and verifies the selected Claude model family.** Managed
   Claude Code commands pass the configured route through `--model`, and model
   changes rotate resident sessions. A Claude Code fallback to another Claude
