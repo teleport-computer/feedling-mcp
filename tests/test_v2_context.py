@@ -4,6 +4,7 @@ import pathlib
 import sys
 from datetime import datetime, timezone
 from types import SimpleNamespace
+import pytest
 sys.path.insert(0, str(pathlib.Path(__file__).parent.parent / "backend"))
 from core import self_thinking
 from model_api_runtime.v2 import context, worker
@@ -71,6 +72,20 @@ def test_chat_system_prompt_omits_self_thinking_for_namespaced_fable(monkeypatch
 
     assert prompt == context.CHAT_SYSTEM_PROMPT
     assert self_thinking.INSTRUCTION not in prompt
+
+
+@pytest.mark.parametrize(
+    "model",
+    ["claude-fable-50", "foo-claude-fable-5-bar"],
+)
+def test_chat_system_prompt_keeps_self_thinking_for_non_fable_boundaries(
+    monkeypatch, model
+):
+    monkeypatch.delenv("FEEDLING_V2_SELF_THINKING", raising=False)
+
+    prompt = context.chat_system_prompt(SimpleNamespace(model=model))
+
+    assert self_thinking.INSTRUCTION in prompt
 
 
 def test_ordered_reply_tail_restores_causal_order_and_hides_later_users():

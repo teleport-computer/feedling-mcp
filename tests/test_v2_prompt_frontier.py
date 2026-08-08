@@ -10,7 +10,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).parent.parent / "backend"))
 from model_api_runtime.v2 import prompt_frontier as frontier
 from model_api_runtime.v2 import tool_loop
 import provider_client
-from provider_types import ToolResult, ToolSpec
+from provider_types import ToolCall, ToolExchange, ToolResult, ToolSpec
 
 
 def _model_limit(context_window_tokens: int = 2_048) -> frontier.ModelPromptLimit:
@@ -429,6 +429,57 @@ def test_optional_tool_catalog_is_omitted_whole_and_reported():
     assert plan.included_components == ("messages",)
     assert plan.omitted_optional_components == ("tool_schemas",)
     assert plan.status == "fits_optional_omitted"
+
+
+def test_historical_tool_schema_is_required_when_optional_catalog_does_not_fit():
+    messages = [
+        {"role": "user", "content": "find my memories"},
+        ToolExchange(
+            calls=(ToolCall(id="m1", name="memory_index", args={}),),
+            results=(ToolResult(call_id="m1", content="one memory"),),
+        ),
+    ]
+    tools = [
+        ToolSpec("memory_index", "list memories", {"type": "object"}),
+        ToolSpec("large_optional", "z" * 5_000, {"type": "object"}),
+    ]
+
+    plan = frontier.plan_provider_round(
+        model_limit=_model_limit(4_096),
+        messages=messages,
+        tools=tools,
+        required_tool_names={"memory_index"},
+        output_reserve_tokens=128,
+        safety_margin_tokens=128,
+    )
+
+    assert "required_tool_schemas" in plan.included_components
+    assert "tool_schemas" in plan.omitted_optional_components
+
+
+def test_historical_tool_schema_fails_closed_when_required_frontier_is_exhausted():
+    messages = [
+        {"role": "user", "content": "find my memories"},
+        ToolExchange(
+            calls=(ToolCall(id="m1", name="memory_index", args={}),),
+            results=(ToolResult(call_id="m1", content="one memory"),),
+        ),
+    ]
+    tools = [
+        ToolSpec("memory_index", "z" * 5_000, {"type": "object"}),
+    ]
+
+    with pytest.raises(frontier.PromptFrontierExhausted) as caught:
+        frontier.plan_provider_round(
+            model_limit=_model_limit(4_096),
+            messages=messages,
+            tools=tools,
+            required_tool_names={"memory_index"},
+            output_reserve_tokens=128,
+            safety_margin_tokens=128,
+        )
+
+    assert "required_tool_schemas" in caught.value.required_components
 
 
 def test_duplicate_component_names_fail_instead_of_producing_ambiguous_metrics():

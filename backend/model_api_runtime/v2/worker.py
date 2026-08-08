@@ -3255,6 +3255,7 @@ def _make_build_messages_fn(
             safety_margin_tokens: int | None,
             utf8_bytes_per_token: float,
             image_reserve_tokens: int,
+            required_tool_names=(),
             system_suffix: str = "",
         ) -> tuple[list, Any, dict]:
             rendered_transcript: list = []
@@ -3287,6 +3288,7 @@ def _make_build_messages_fn(
                     model_limit=model_limit,
                     messages=messages,
                     tools=tools,
+                    required_tool_names=required_tool_names,
                     output_reserve_tokens=output_reserve_tokens,
                     safety_margin_tokens=safety_margin_tokens,
                     utf8_bytes_per_token=utf8_bytes_per_token,
@@ -5522,6 +5524,7 @@ def _preflight_adaptive_builder(
     planner(
         transcript=[],
         tools=None,
+        required_tool_names=(),
         model_limit=model_limit,
         output_reserve_tokens=PROMPT_OUTPUT_RESERVE_TOKENS,
         safety_margin_tokens=PROMPT_SAFETY_MARGIN_TOKENS,

@@ -212,7 +212,7 @@ def _supports_mandatory_self_thinking(provider_config: Any) -> bool:
     if provider_config is None:
         return True
     model = str(getattr(provider_config, "model", "") or "").strip().lower()
-    return "claude-fable-5" not in model
+    return model.rsplit("/", 1)[-1] != "claude-fable-5"
 
 
 def chat_system_prompt(provider_config: Any = None) -> str:

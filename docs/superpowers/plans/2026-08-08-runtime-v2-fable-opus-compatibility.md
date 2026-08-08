@@ -224,6 +224,20 @@ git add backend/model_api_runtime/v2/tool_loop.py tests/test_v2_tool_loop.py
 git commit -m "fix(v2): preserve native tool schemas across rounds"
 ```
 
+- [ ] **Step 7: Preserve referenced schemas through prompt-frontier degradation**
+
+Code review identified a second removal path: the prompt frontier may omit the
+entire optional catalog after a native exchange increases the next round's
+prompt size. Split completed memory-discovery schemas into a required
+`required_tool_schemas` component and keep the remaining catalog optional. When
+the optional component is omitted, send only those required schemas. Add tests
+covering same-request `ToolExchange` + schema coexistence, required-schema
+budgeting, and fail-closed admission when required content cannot fit.
+
+Also tighten Fable detection to an exact model basename match and add negative
+boundary cases so similarly named models retain the existing self-thinking
+behavior.
+
 ---
 
 ### Task 3: Document and verify the complete V2 compatibility change

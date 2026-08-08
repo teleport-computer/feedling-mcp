@@ -30,7 +30,7 @@
 
 ### 采用：V2 定向能力判断 + 保持历史工具 schema
 
-Fable 5 在 V2 chat prompt 组装时跳过强制 self-thinking 指令；Opus 4.8 使用同一 provider-neutral 工具循环，但已进入原生 transcript 的 memory discovery schema 不再从后续 `tools` 中删除。重复执行继续由已有 dispatch guard 阻止。
+Fable 5 在 V2 chat prompt 组装时跳过强制 self-thinking 指令；Opus 4.8 使用同一 provider-neutral 工具循环，但已进入原生 transcript 的 memory discovery schema 不再从后续 `tools` 中删除。若 prompt frontier 因预算不足省略其余可选工具目录，历史引用的 discovery schema 会作为 required component 保留；重复执行继续由已有 dispatch guard 阻止。
 
 该方案在 provider call 前消除已知冲突，没有额外付费请求，并且不改变其他模型行为。
 
@@ -51,7 +51,7 @@ Opus 5 已在测试环境完整通过聊天和 tool call，没有证据支持扩
 规则如下：
 
 - 全局 `FEEDLING_V2_SELF_THINKING` 关闭时，所有模型都不追加。
-- 模型标识按小写匹配 `claude-fable-5`；允许前面存在 provider namespace，例如 `anthropic/claude-fable-5`。匹配时不追加强制 `<think>` 指令。
+- 模型标识按小写精确匹配 namespace 后的 `claude-fable-5`；例如 `anthropic/claude-fable-5` 会命中，而 `claude-fable-50` 不会。匹配时不追加强制 `<think>` 指令。
 - 其他模型维持当前行为。
 - provider 不作为唯一判据：同一个 Fable 模型通过 Anthropic、OpenRouter 或自定义 relay 接入时，公开思维链兼容性不应改变。
 
@@ -74,6 +74,8 @@ Opus 5 已在测试环境完整通过聊天和 tool call，没有证据支持扩
 
 因此本次只改变“向模型展示 schema”，不改变执行次数、权限、provenance fence 或工具结果内容。
 
+Prompt frontier 继续允许整份未引用工具目录作为 optional component 降级，但会把 `completed_memory_discovery_tools` 对应的 schema 拆成 `required_tool_schemas`。如果 required native transcript 加其引用 schema 已经超预算，回合在 provider call 前明确失败；如果只有其余目录超预算，则只发送历史引用 schema，避免发送“有 `tool_use/tool_result`、无对应定义”的不一致请求。
+
 ### 3. 空回复恢复语义
 
 现有 `ProviderEmptyReply`、语义纠正重试、trajectory 事件和用户提示保持不变。本修复让两个已知冲突在空回复恢复之前消失，但不弱化其他 provider 异常的保护。
@@ -86,6 +88,7 @@ Fable 仍可能因其他安全原因返回真正的 `refusal`；这种情况继�
 
 - 全局 self-thinking 开启时，`claude-fable-5` 的 V2 chat prompt 不包含 `self_thinking.INSTRUCTION`。
 - namespace 形式的 Fable 5 model id 同样不包含该指令。
+- 相似但不同的模型名（例如 `claude-fable-50`）仍保留现有 self-thinking 行为。
 - Opus 5 仍包含该指令。
 - 未传 `provider_config` 的调用维持当前行为。
 
@@ -95,11 +98,13 @@ Fable 仍可能因其他安全原因返回真正的 `refusal`；这种情况继�
 - 模型第二次请求 `memory_index` 时，真实 dispatcher 仍只调用一次，第二次收到固定的 `already completed` 结果。
 - 同一 batch 的重复 discovery 仍只执行一次。
 - Anthropic native `ToolExchange` 在 schema 保持可见时可继续编码为相邻的 assistant `tool_use` 和 user `tool_result`。
+- frontier 省略可选目录时，历史引用的 discovery schema 与 native `ToolExchange` 仍在同一个 provider request 中；若两者作为 required components 也无法容纳，则 fail closed。
 
 ### 回归范围
 
 - `tests/test_v2_context.py`
 - `tests/test_v2_tool_loop.py`
+- `tests/test_v2_prompt_frontier.py`
 - `tests/test_v2_worker_tool_loop.py`
 - 现有 provider Anthropic wire 测试
 - Runtime V2 定向测试集合

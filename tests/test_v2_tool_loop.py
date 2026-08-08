@@ -107,6 +107,7 @@ class _AdaptiveBuildMessages(_RecordingBuildMessages):
         *,
         transcript,
         tools,
+        required_tool_names,
         model_limit,
         output_reserve_tokens,
         safety_margin_tokens,
@@ -121,6 +122,7 @@ class _AdaptiveBuildMessages(_RecordingBuildMessages):
             model_limit=model_limit,
             messages=messages,
             tools=tools,
+            required_tool_names=required_tool_names,
             output_reserve_tokens=output_reserve_tokens,
             safety_margin_tokens=safety_margin_tokens,
             utf8_bytes_per_token=utf8_bytes_per_token,
@@ -986,9 +988,14 @@ def test_memory_discovery_schema_remains_visible_after_first_result(monkeypatch)
     ])
     monkeypatch.setattr(provider_client, "chat_completion_async", provider)
 
+    class TranscriptBuildMessages(_RecordingBuildMessages):
+        def __call__(self, transcript):
+            self.calls.append(list(transcript))
+            return [{"role": "user", "content": "turn"}, *transcript]
+
     outcome = asyncio.run(tool_loop.run_tool_loop(
         provider_config=_TEST_PROVIDER_CONFIG,
-        build_messages=_RecordingBuildMessages(),
+        build_messages=TranscriptBuildMessages(),
         dispatch_tools=_RecordingDispatch(),
         on_reply=_RecordingReply(),
         fold_new_messages=_RecordingFold([[]]),
@@ -1000,6 +1007,82 @@ def test_memory_discovery_schema_remains_visible_after_first_result(monkeypatch)
     second_names = {spec.name for spec in provider.calls[1]["tools"]}
     assert {"memory_index", "memory_search"}.issubset(first_names)
     assert {"memory_index", "memory_search"}.issubset(second_names)
+    assert any(
+        isinstance(message, ToolExchange)
+        and message.calls[0].name == "memory_index"
+        for message in provider.calls[1]["messages"]
+    )
+    assert outcome.final_text == "direct answer"
+
+
+def test_frontier_keeps_historical_memory_schema_when_optional_catalog_is_omitted(
+    monkeypatch,
+):
+    provider = _ScriptedProvider([
+        {
+            "reply": "",
+            "tool_calls": [{"id": "m1", "name": "memory_index", "args": {}}],
+            "usage": {},
+        },
+        {"reply": "direct answer", "tool_calls": [], "usage": {}},
+    ])
+    monkeypatch.setattr(provider_client, "chat_completion_async", provider)
+    planner_required_names = []
+
+    def forced_frontier(*, required_tool_names, model_limit, **_kwargs):
+        required = set(required_tool_names)
+        planner_required_names.append(required)
+        components = [tool_loop.prompt_frontier.PromptComponent("message_context", 1)]
+        if required:
+            components.extend([
+                tool_loop.prompt_frontier.PromptComponent(
+                    "required_tool_schemas", 1, required=True
+                ),
+                tool_loop.prompt_frontier.PromptComponent(
+                    "tool_schemas", 10_000_000, required=False, priority=1
+                ),
+            ])
+        else:
+            components.append(
+                tool_loop.prompt_frontier.PromptComponent(
+                    "tool_schemas", 1, required=False, priority=1
+                )
+            )
+        return tool_loop.prompt_frontier.plan_prompt(
+            model_limit=model_limit,
+            components=components,
+            output_reserve_tokens=128,
+            safety_margin_tokens=128,
+        )
+
+    monkeypatch.setattr(
+        tool_loop.prompt_frontier,
+        "plan_provider_round",
+        forced_frontier,
+    )
+
+    class TranscriptBuildMessages(_RecordingBuildMessages):
+        def __call__(self, transcript):
+            self.calls.append(list(transcript))
+            return [{"role": "user", "content": "turn"}, *transcript]
+
+    outcome = asyncio.run(tool_loop.run_tool_loop(
+        provider_config=_TEST_PROVIDER_CONFIG,
+        build_messages=TranscriptBuildMessages(),
+        dispatch_tools=_RecordingDispatch(),
+        on_reply=_RecordingReply(),
+        fold_new_messages=_RecordingFold([[]]),
+        add_usage=_noop_add_usage,
+        max_calls=4,
+    ))
+
+    assert planner_required_names == [set(), {"memory_index"}]
+    assert {spec.name for spec in provider.calls[1]["tools"]} == {"memory_index"}
+    assert any(
+        isinstance(message, ToolExchange)
+        and message.calls[0].name == "memory_index"
+        for message in provider.calls[1]["messages"]
+    )
     assert outcome.final_text == "direct answer"
 
 

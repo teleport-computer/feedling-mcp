@@ -817,6 +817,7 @@ async def run_tool_loop(
                 messages, frontier_plan, tail_window = adaptive_planner(
                     transcript=list(transcript),
                     tools=tools,
+                    required_tool_names=completed_memory_discovery_tools,
                     model_limit=model_prompt_limit,
                     output_reserve_tokens=prompt_output_reserve_tokens,
                     safety_margin_tokens=prompt_safety_margin_tokens,
@@ -829,6 +830,7 @@ async def run_tool_loop(
                     model_limit=model_prompt_limit,
                     messages=messages,
                     tools=tools,
+                    required_tool_names=completed_memory_discovery_tools,
                     output_reserve_tokens=prompt_output_reserve_tokens,
                     safety_margin_tokens=prompt_safety_margin_tokens,
                     utf8_bytes_per_token=prompt_estimator_utf8_bytes_per_token,
@@ -847,10 +849,15 @@ async def run_tool_loop(
             except Exception:
                 pass
         if "tool_schemas" in frontier_plan.omitted_optional_components:
-            # Schemas are atomic and optional: omitting the whole catalog is a
-            # valid weak-model/text-only degradation. Required conversation and
-            # native tool exchanges are never clipped to make room.
-            tools = None
+            # Once a memory discovery result is present in the required native
+            # transcript, keep that matching schema even when the remaining
+            # optional catalog no longer fits. This avoids a provider-visible
+            # call/result history whose tool definition has disappeared.
+            tools = [
+                spec
+                for spec in (tools or [])
+                if spec.name in completed_memory_discovery_tools
+            ] or None
         if before_provider_call is not None:
             before_provider_call()
         await _trajectory(
