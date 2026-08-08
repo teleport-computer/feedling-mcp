@@ -146,12 +146,14 @@ def _script_provider(monkeypatch, responses):
         *,
         tools=None,
         allow_image_output=False,
+        **kwargs,
     ):
         assert allow_image_output is True
         calls.append({
             "messages": messages,
             "tools": tools,
             "allow_image_output": allow_image_output,
+            **kwargs,
         })
         return next(it)
 
@@ -543,7 +545,7 @@ def test_p0_four_providers_two_reads_dispatch_and_reply_by_call_id(monkeypatch, 
         {"reply": "done", "tool_calls": [], "usage": {}},
     ])
 
-    async def _fake_chat_completion_async(config, messages, *, tools=None):
+    async def _fake_chat_completion_async(config, messages, *, tools=None, **kwargs):
         return next(provider)
 
     monkeypatch.setattr(provider_client, "chat_completion_async", _fake_chat_completion_async)

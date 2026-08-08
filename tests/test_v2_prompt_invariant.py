@@ -630,7 +630,7 @@ def test_process_job_chat_turn_runs_inline_catchup_before_replying(monkeypatch):
     monkeypatch.setattr(cap_registry, "run_capability", lambda *a, **k: _FakeCapResult())
     monkeypatch.setattr(worker, "_write_encrypted_reply", lambda store, text: {"id": "r"})
 
-    async def _fake_chat_completion(config, msgs, *, tools=None):
+    async def _fake_chat_completion(config, msgs, *, tools=None, **kwargs):
         return {"reply": "model reply", "tool_calls": [],
                 "usage": {"prompt_tokens": 1, "completion_tokens": 1}}
 

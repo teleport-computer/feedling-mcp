@@ -99,6 +99,36 @@ class _RecordingBuildMessages:
         return [{"role": "user", "content": "turn"}]
 
 
+class _AdaptiveBuildMessages(_RecordingBuildMessages):
+    """Production-shaped builder whose planner owns the final message list."""
+
+    def plan_provider_round(
+        self,
+        *,
+        transcript,
+        tools,
+        model_limit,
+        output_reserve_tokens,
+        safety_margin_tokens,
+        utf8_bytes_per_token,
+        image_reserve_tokens,
+        system_suffix="",
+    ):
+        messages = [{"role": "system", "content": "base"}]
+        if system_suffix:
+            messages[0]["content"] += "\n\n" + system_suffix
+        plan = tool_loop.prompt_frontier.plan_provider_round(
+            model_limit=model_limit,
+            messages=messages,
+            tools=tools,
+            output_reserve_tokens=output_reserve_tokens,
+            safety_margin_tokens=safety_margin_tokens,
+            utf8_bytes_per_token=utf8_bytes_per_token,
+            image_reserve_tokens=image_reserve_tokens,
+        )
+        return messages, plan, None
+
+
 def _noop_add_usage(usage):
     pass
 
@@ -248,7 +278,7 @@ def test_transient_empty_provider_response_retries_inside_same_round(monkeypatch
     on_reply = _RecordingReply()
     outcome = asyncio.run(tool_loop.run_tool_loop(
         provider_config=_TEST_PROVIDER_CONFIG,
-        build_messages=_RecordingBuildMessages(),
+        build_messages=_AdaptiveBuildMessages(),
         dispatch_tools=_RecordingDispatch(),
         on_reply=on_reply,
         fold_new_messages=_RecordingFold([]),
@@ -260,6 +290,259 @@ def test_transient_empty_provider_response_retries_inside_same_round(monkeypatch
     assert outcome.rounds == 1
     assert outcome.final_text == "recovered"
     assert on_reply.calls == [("recovered", True)]
+
+
+def test_foreground_abnormal_empty_completion_fails_without_retry(monkeypatch):
+    """A structurally valid but content-free success is a V2 policy failure.
+
+    This catches parser strictness regressing and turning one abnormal HTTP 200
+    completion into two identical, billed reliable-wrapper attempts.
+    """
+    provider = _ScriptedProvider([{
+        "reply": "",
+        "reasoning": "",
+        "stop_reason": "",
+        "tool_calls": [],
+        "usage": {"prompt_tokens": 18504, "completion_tokens": 3},
+    }])
+    monkeypatch.setattr(provider_client, "chat_completion_async", provider)
+
+    with pytest.raises(tool_loop.ProviderEmptyReply, match="empty_reply"):
+        asyncio.run(tool_loop.run_tool_loop(
+            provider_config=_TEST_PROVIDER_CONFIG,
+            build_messages=_RecordingBuildMessages(),
+            dispatch_tools=_RecordingDispatch(),
+            on_reply=_RecordingReply(),
+            fold_new_messages=_RecordingFold([]),
+            add_usage=_noop_add_usage,
+            max_calls=5,
+        ))
+
+    assert len(provider.calls) == 1
+    assert provider.calls[0]["require_reply"] is False
+
+
+def test_foreground_semantic_empty_response_gets_one_correction(monkeypatch):
+    """Thinking-only output gets one temporary correction, without surfacing it."""
+    provider = _ScriptedProvider([
+        {
+            "reply": "",
+            "reasoning": "private first attempt",
+            "stop_reason": "max_tokens",
+            "tool_calls": [],
+            "usage": {"completion_tokens": 4096},
+        },
+        {
+            "reply": "recovered",
+            "reasoning": "final reasoning",
+            "stop_reason": "end_turn",
+            "tool_calls": [],
+            "usage": {"completion_tokens": 4},
+        },
+    ])
+    monkeypatch.setattr(provider_client, "chat_completion_async", provider)
+    published = []
+
+    async def publish(text, *, final, reasoning=""):
+        published.append((text, final, reasoning))
+
+    outcome = asyncio.run(tool_loop.run_tool_loop(
+        provider_config=_TEST_PROVIDER_CONFIG,
+        build_messages=_AdaptiveBuildMessages(),
+        dispatch_tools=_RecordingDispatch(),
+        on_reply=publish,
+        fold_new_messages=_RecordingFold([]),
+        add_usage=_noop_add_usage,
+        max_calls=5,
+    ))
+
+    assert outcome.final_text == "recovered"
+    assert published == [("recovered", True, "final reasoning")]
+    assert len(provider.calls) == 2
+    correction = provider.calls[1]["messages"][0]
+    assert correction["role"] == "system"
+    assert "Do not return a thinking-only response" in correction["content"]
+
+
+def test_semantic_empty_correction_retains_real_tool_flow(monkeypatch):
+    """Recovery must not disable the safe catalog or break native exchanges."""
+    provider = _ScriptedProvider([
+        {
+            "reply": "",
+            "reasoning": "I should inspect memory first.",
+            "stop_reason": "other",
+            "tool_calls": [],
+            "usage": {"completion_tokens": 4096},
+        },
+        {
+            "reply": "",
+            "reasoning": "",
+            "stop_reason": "tool_use",
+            "tool_calls": [{
+                "id": "memory-1",
+                "name": "memory_index",
+                "args": {"limit": 1},
+            }],
+            "usage": {"completion_tokens": 20},
+        },
+        {
+            "reply": "memory-grounded answer",
+            "reasoning": "",
+            "stop_reason": "end_turn",
+            "tool_calls": [],
+            "usage": {"completion_tokens": 8},
+        },
+    ])
+    monkeypatch.setattr(provider_client, "chat_completion_async", provider)
+    dispatch = _RecordingDispatch("one memory")
+    build_messages = _RecordingBuildMessages()
+
+    outcome = asyncio.run(tool_loop.run_tool_loop(
+        provider_config=_TEST_PROVIDER_CONFIG,
+        build_messages=build_messages,
+        dispatch_tools=dispatch,
+        on_reply=_RecordingReply(),
+        fold_new_messages=_RecordingFold([[], []]),
+        add_usage=_noop_add_usage,
+        max_calls=5,
+    ))
+
+    assert "memory_index" in {spec.name for spec in provider.calls[1]["tools"]}
+    assert len(dispatch.calls) == 1
+    assert [tc.name for tc in dispatch.calls[0]] == ["memory_index"]
+    assert any(isinstance(item, ToolExchange) for item in build_messages.calls[2])
+    assert outcome.final_text == "memory-grounded answer"
+
+
+def test_second_semantic_empty_response_terminates_without_third_correction(
+    monkeypatch,
+):
+    provider = _ScriptedProvider([
+        {
+            "reply": "",
+            "reasoning": "first private attempt",
+            "stop_reason": "max_tokens",
+            "tool_calls": [],
+            "usage": {"completion_tokens": 4096},
+        },
+        {
+            "reply": "",
+            "reasoning": "second private attempt",
+            "stop_reason": "max_tokens",
+            "tool_calls": [],
+            "usage": {"completion_tokens": 4096},
+        },
+    ])
+    monkeypatch.setattr(provider_client, "chat_completion_async", provider)
+    provider_successes = []
+    provider_failures = []
+
+    async def on_provider_success():
+        provider_successes.append(True)
+
+    async def on_provider_failure(exc):
+        provider_failures.append(exc)
+
+    with pytest.raises(tool_loop.ProviderEmptyReply, match="empty_reply"):
+        asyncio.run(tool_loop.run_tool_loop(
+            provider_config=_TEST_PROVIDER_CONFIG,
+            build_messages=_RecordingBuildMessages(),
+            dispatch_tools=_RecordingDispatch(),
+            on_reply=_RecordingReply(),
+            fold_new_messages=_RecordingFold([[]]),
+            add_usage=_noop_add_usage,
+            max_calls=5,
+            on_provider_success=on_provider_success,
+            on_provider_failure=on_provider_failure,
+        ))
+
+    assert len(provider.calls) == 2
+    assert provider_successes == []
+    assert len(provider_failures) == 1
+    assert isinstance(provider_failures[0], tool_loop.ProviderEmptyReply)
+
+
+def test_empty_response_trajectory_records_only_content_free_shape(monkeypatch):
+    provider = _ScriptedProvider([
+        {
+            "reply": "",
+            "reasoning": "private trajectory content",
+            "stop_reason": "private trajectory content " * 100,
+            "tool_calls": [],
+            "usage": {"completion_tokens": 4096},
+        },
+        {
+            "reply": "recovered",
+            "reasoning": "",
+            "stop_reason": "end_turn",
+            "tool_calls": [],
+            "usage": {"completion_tokens": 5},
+        },
+    ])
+    monkeypatch.setattr(provider_client, "chat_completion_async", provider)
+    events = []
+
+    async def record(event_kind, payload):
+        events.append((event_kind, payload))
+
+    asyncio.run(tool_loop.run_tool_loop(
+        provider_config=_TEST_PROVIDER_CONFIG,
+        build_messages=_RecordingBuildMessages(),
+        dispatch_tools=_RecordingDispatch(),
+        on_reply=_RecordingReply(),
+        fold_new_messages=_RecordingFold([]),
+        add_usage=_noop_add_usage,
+        max_calls=5,
+        on_trajectory_event=record,
+    ))
+
+    empty_events = [
+        payload for kind, payload in events if kind == "empty_provider_response"
+    ]
+    assert empty_events == [{
+        "round": 1,
+        "reason": "empty_provider_success",
+        "response_shape": {
+            "stop_reason": "other",
+            "has_visible_text": False,
+            "reasoning_present": True,
+            "tool_call_count": 0,
+            "completion_tokens": 4096,
+        },
+        "action": "semantic_correction",
+    }]
+    assert "private trajectory content" not in str(empty_events)
+    assert "messages" not in str(empty_events)
+
+
+def test_usable_provider_success_survives_response_trajectory_failure(monkeypatch):
+    provider = _ScriptedProvider([
+        {"reply": "usable", "tool_calls": [], "usage": {}},
+    ])
+    monkeypatch.setattr(provider_client, "chat_completion_async", provider)
+    successes = []
+
+    async def on_provider_success():
+        successes.append(True)
+
+    async def record(event_kind, _payload):
+        if event_kind == "provider_response":
+            raise RuntimeError("trajectory unavailable")
+
+    with pytest.raises(RuntimeError, match="trajectory unavailable"):
+        asyncio.run(tool_loop.run_tool_loop(
+            provider_config=_TEST_PROVIDER_CONFIG,
+            build_messages=_RecordingBuildMessages(),
+            dispatch_tools=_RecordingDispatch(),
+            on_reply=_RecordingReply(),
+            fold_new_messages=_RecordingFold([]),
+            add_usage=_noop_add_usage,
+            max_calls=2,
+            on_provider_success=on_provider_success,
+            on_trajectory_event=record,
+        ))
+
+    assert successes == [True]
 
 
 def test_reasoning_route_requests_and_publishes_provider_reasoning(monkeypatch):
@@ -1403,7 +1686,7 @@ def test_provider_call_exception_still_counts_a_model_call(monkeypatch):
     provider call would flush model_calls=0."""
 
     class _RaisingProvider:
-        async def __call__(self, config, messages, *, tools=None):
+        async def __call__(self, config, messages, *, tools=None, **kwargs):
             raise RuntimeError("boom: provider unreachable")
 
     monkeypatch.setattr(provider_client, "chat_completion_async", _RaisingProvider())

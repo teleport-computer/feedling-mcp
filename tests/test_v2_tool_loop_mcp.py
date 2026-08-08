@@ -41,7 +41,7 @@ def _run(
         extra_mutating_tool_names = {
             spec.name for spec in (extra_tool_specs or ())}
 
-    async def _provider(_config, _messages, *, tools=None):
+    async def _provider(_config, _messages, *, tools=None, **kwargs):
         provider_tools.append(tools)
         return next(responses)
 

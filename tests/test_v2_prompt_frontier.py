@@ -519,7 +519,7 @@ def test_tool_loop_rejects_unconfigured_custom_limit_before_provider_io(monkeypa
     monkeypatch.setenv(frontier._UNAUDITED_DEFAULT_ENV, "0")
     calls = []
 
-    async def provider(_config, _messages, *, tools=None):
+    async def provider(_config, _messages, *, tools=None, **kwargs):
         calls.append(tools)
         return {"reply": "not reached", "tool_calls": [], "usage": {}}
 
@@ -568,7 +568,7 @@ def test_round_frontier_stops_aggregate_native_transcript_before_provider_call(
         for index in range(1, 5)
     ]
 
-    async def provider(_config, messages, *, tools=None):
+    async def provider(_config, messages, *, tools=None, **kwargs):
         calls.append((list(messages), tools))
         return scripted.pop(0)
 
@@ -616,7 +616,7 @@ def test_round_frontier_stops_aggregate_native_transcript_before_provider_call(
 def test_late_input_is_in_required_frontier_before_first_provider_call(monkeypatch):
     calls = []
 
-    async def provider(_config, _messages, *, tools=None):
+    async def provider(_config, _messages, *, tools=None, **kwargs):
         calls.append(tools)
         return {"reply": "not reached", "tool_calls": [], "usage": {}}
 
@@ -652,7 +652,7 @@ def test_tool_catalog_is_counted_and_omitted_whole_when_only_it_does_not_fit(
 ):
     calls = []
 
-    async def provider(_config, messages, *, tools=None):
+    async def provider(_config, messages, *, tools=None, **kwargs):
         calls.append((list(messages), tools))
         return {"reply": "text-only", "tool_calls": [], "usage": {}}
 
@@ -719,7 +719,7 @@ def test_adaptive_round_reports_tail_window_to_metrics_and_trajectory(monkeypatc
                 "source_truncated": False,
             }
 
-    async def provider(_config, messages, *, tools=None):
+    async def provider(_config, messages, *, tools=None, **kwargs):
         calls.append((messages, tools))
         return {"reply": "ok", "tool_calls": [], "usage": {}}
 
@@ -775,7 +775,7 @@ def test_adaptive_required_exhaustion_is_counted_and_still_raised(monkeypatch):
                 limit_source="provider_metadata",
             )
 
-    async def provider(_config, messages, *, tools=None):
+    async def provider(_config, messages, *, tools=None, **kwargs):
         provider_calls.append(messages)
         return {"reply": "not reached", "tool_calls": [], "usage": {}}
 

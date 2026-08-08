@@ -2,23 +2,25 @@
 
 **日期：** 2026-08-07
 
-**状态：** 已批准设计
+**状态：** 已实现，待测试环境验收
 
 **范围：** Runtime V2 前台聊天、Provider 响应解析、加密轨迹遥测
 
-**已复现 Provider / 模型：** 测试环境 Anthropic `claude-fable-5`
+**已复现 Provider / 模型：** Anthropic Fable 5、OpenRouter Fable 5 / Opus 4.8
 
 ## 摘要
 
 当 Provider 返回 HTTP 200，且响应结构合法，但既没有可见文本，也没有标准客户端
-`tool_use` 时，Runtime V2 前台聊天目前会失败。Anthropic Fable 5 在完整 V2 提示词和
-工具目录下能够稳定复现。Provider 解析器会在 V2 工具循环检查成功响应之前抛出异常，
-随后这个没有 HTTP 状态码的解析异常又被误分类为 `upstream_unavailable`。
+`tool_use` 时，Runtime V2 前台聊天会失败。已观察到两种不同响应形态：Anthropic 直连
+Fable 5 的失败很可能是 thinking-only；OpenRouter 在历史复杂账户上则返回
+`finish_reason=null`、无 reasoning、只有 2–3 个 completion token 的异常空 completion。
+两者过去都会在 Provider 解析器中先抛出无 HTTP 状态码的异常，随后被误分类为
+`upstream_unavailable`。
 
-修复后，由 V2 负责前台空响应策略。Provider 解析器把结构合法的无文本响应返回给
-V2，V2 工具循环使用原工具目录执行最多一次、有明确上限的语义纠正。如果纠正响应仍
-为空，则通过现有 `provider_empty_reply` 路径结束。本次修改不会改变非 V2 调用方的
-默认行为。
+修复后，由 V2 负责前台空响应策略。带 reasoning 或正常 stop reason 的语义空回复使用
+当前安全过滤后的工具目录执行最多一次纠正；没有 reasoning 和 stop reason 的异常空
+completion 立即失败，不重复发送相同请求。两种终态都通过现有
+`provider_empty_reply` 用户提示结束。本次修改不会改变非 V2 调用方的默认行为。
 
 ## 用户可见问题
 
@@ -34,18 +36,20 @@ V2，V2 工具循环使用原工具目录执行最多一次、有明确上限的
 
 | Provider 和模型 | 前台聊天 | 工具行为 | 结果 |
 | --- | --- | --- | --- |
-| Anthropic Opus 4.8 | 成功 | 成功 | 兼容 |
-| Anthropic Opus 5 | 成功 | 成功 | 兼容 |
-| OpenRouter Opus 4.8 | 成功 | 成功 | 兼容 |
-| OpenRouter Opus 5 | 成功 | 成功 | 兼容 |
-| Anthropic Fable 5 | 失败 | 没有工具事件 | 能复现本问题 |
+| Anthropic Opus 4.8 / Opus 5 | 成功 | 成功 | 回归基线兼容 |
+| OpenRouter 新建简单账户 | 成功 | 成功 | 同模型可正常工作 |
+| OpenRouter 历史复杂账户，Fable 5 / Opus 4.8 | 失败 | 没有工具事件 | 异常空 completion |
+| Anthropic Fable 5 | 失败 | 没有工具事件 | 疑似 thinking-only |
 | Anthropic Fable 5，精简合成提示词 | 成功 | 返回 `thinking` 和 `tool_use` | 支持工具调用 |
-| OpenRouter Fable 5 | 未运行 | 未运行 | 当前 Key 的模型目录中不存在 |
 
-在真实 Fable 5 V2 turn 中，加密 attempt trace 记录了两次上游 HTTP 200。两次都以
-`postprocess_error` 结束，并抛出
+在真实 Anthropic Fable 5 V2 turn 中，加密 attempt trace 记录了两次上游 HTTP 200。
+两次都以 `postprocess_error` 结束，并抛出
 `ProviderError("provider response had no usable reply text")`。V2 turn 记录了一个失败的
 逻辑模型调用，没有任何工具事件。
+
+OpenRouter 的失败响应保留了更明确的内容无关形态：HTTP 200、`finish_reason=null`、没有
+可见文本、工具调用或 reasoning，native completion token 为 2–3。Fable 5 与 Opus 4.8
+在同一历史复杂账户上都失败，因此不能把故障归结为 Fable 模型不支持工具。
 
 ### 已确认事实
 
@@ -57,20 +61,24 @@ V2，V2 工具循环使用原工具目录执行最多一次、有明确上限的
 - 故障发生在本地响应后处理阶段。
 - 真实 V2 请求没有进入工具执行阶段。
 - Fable 5 在精简合成提示词下能产生合法客户端 `tool_use`。
+- OpenRouter 异常空 completion 与模型无关，至少 Fable 5 和 Opus 4.8 均可复现。
+- V2 前台工具循环显式使用 `max_attempts=2`；此前一次逻辑调用最多发送两次相同请求。
 
 ### 推断边界
 
-真实 V2 响应很可能只有 thinking，或者包含某种成功的内容块，但该内容块没有被识别为
-可见文本或客户端 `tool_use`。另一个最小化 Fable 5 请求已明确产生过 thinking-only
-响应。
+Anthropic 直连的真实 V2 响应很可能只有 thinking，或者包含某种成功的内容块，但该
+内容块没有被识别为可见文本或客户端 `tool_use`。另一个最小化 Fable 5 请求已明确产生
+过 thinking-only 响应。
 
-失败的生产形态响应正文没有保存在 attempt trace 中，因此无法确认其精确内容块序列。
-实现必须基于与 Provider 无关的条件——“结构合法的成功响应，但没有可见文本，也没有
-客户端工具调用”——而不能基于 Fable 特例假设。
+Anthropic 失败的生产形态响应正文没有保存在 attempt trace 中，因此无法确认其精确内容
+块序列。OpenRouter 失败与复杂 assembled prompt 形态存在强相关，但合成的大 prompt 仍可
+成功，因此这不是已确认的上游根因。实现必须基于与 Provider 无关的 response shape，
+而不能基于 Fable、账户年龄或 prompt 大小特例。
 
 ## 根因
 
-前台响应策略放在了错误的层级。
+上游为什么对特定真实 prompt 返回异常空 completion 尚未确认；本地已确认的产品故障是
+前台响应策略放在了错误的层级，并把响应形态问题误当成可重试 transport 故障。
 
 1. Anthropic 返回结构合法的 HTTP 200 响应。
 2. `provider_client._parse_anthropic_body()` 尝试提取客户端工具调用。
@@ -78,7 +86,8 @@ V2，V2 工具循环使用原工具目录执行最多一次、有明确上限的
 4. 它抛出 `ProviderError("provider response had no usable reply text")`。
 5. 该错误产生于 HTTP 200 之后，因此没有 HTTP 状态码。
 6. `classify_provider_error()` 将无状态码的响应形态错误归类为 transient。
-7. V2 将 transient Provider 故障映射为 `upstream_unavailable`。
+7. V2 的 reliable wrapper 以 `max_attempts=2` 重发一次相同请求。
+8. V2 将最终 transient Provider 故障映射为 `upstream_unavailable`。
 
 这使 `tool_loop.run_tool_loop()` 无法看到响应的 `stop_reason`、reasoning 是否存在、原生
 assistant turn 或内容块形态，因此既不能纠正响应，也无法准确分类。
@@ -148,7 +157,7 @@ AND Provider 响应具有合法成功结构
 
 即使存在 reasoning，也不能视为可用的前台回复。
 
-### 一次性纠正
+### Response-shape 分流与一次性纠正
 
 工具循环增加等价的 turn 内状态：
 
@@ -157,15 +166,21 @@ empty_response_recovery_used = False
 empty_response_retry_instruction = ""
 ```
 
-前台 turn 第一次遇到空成功时：
+前台 turn 遇到空成功时先做内容无关分流：
 
-1. 记录加密 `protocol_fallback` 轨迹事件，reason 为
+- `reasoning` 或非空 `stop_reason` 存在：语义空回复，可使用一次纠正机会；
+- 两者都不存在：异常空 completion，立即抛出 `ProviderEmptyReply("empty_reply")`；
+- `completion_tokens` 只作辅助诊断，不参与语义/异常分类。
+
+第一次可纠正的语义空成功按以下步骤处理：
+
+1. 记录加密 `empty_provider_response` 轨迹事件，reason 为
    `empty_provider_success`。
 2. 标记本 turn 已使用恢复机会。
 3. 清除这次不可用响应累计的 reasoning。
 4. 从同一份按时间排序的 transcript 重新构建 prompt。
 5. 临时把下方纠正指令追加到 system message。
-6. 保留相同的工具目录。
+6. 保留该轮按既有安全边界过滤后的工具目录；已经禁用的工具不会重新启用。
 7. 从现有 turn 调用预算中消耗下一次调用。
 
 纠正指令：
@@ -182,16 +197,19 @@ response.
 
 ### 纠正时保留工具
 
-纠正请求继续携带原工具目录。如果禁用工具，会破坏真正需要记忆、网络、workspace、定时
-任务或 MCP 能力的请求，并可能诱导模型声称完成了实际上没有执行的操作。
+纠正请求继续携带当前安全状态允许的工具目录。恢复逻辑本身不禁用工具，也不会绕过
+prompt frontier、外部内容隔离、mutation outcome unknown 或其他既有策略重新启用工具。
+无条件禁用工具会破坏真正需要记忆、网络、workspace、定时任务或 MCP 能力的请求，并
+可能诱导模型声称完成了实际上没有执行的操作。
 
 现有 tools-disabled terminal fallback 仍然只用于非法、未声明、重复 ID、混合 mutation /
 reply、超预算的工具交换，以及满足条件的工具 schema 拒绝。
 
 ### 最终行为
 
-如果纠正响应仍为空，工具循环不再重试。它将空的 terminal candidate 交给现有前台回复
-边界，由该边界抛出 `TurnError("empty_reply")`。Worker 已经会将其映射为
+如果纠正响应仍为空，工具循环不再重试，直接抛出内容无关的
+`ProviderEmptyReply("empty_reply")`。异常空 completion 在第一次响应后就走同一终态。
+Worker 将该异常映射为稳定状态码 `turn_failed:empty_reply` 和用户提示类
 `provider_empty_reply`。
 
 不需要新增公共错误类型。
@@ -225,7 +243,7 @@ transport attempt 数量。
 | HTTP 400 或 422 不兼容 | `provider_incompatible` |
 | HTTP 429 | `rate_limited` |
 | HTTP 5xx 或网络故障 | `upstream_unavailable` |
-| 两次合法成功都没有文本或工具调用 | `provider_empty_reply` |
+| 首次异常空 completion，或纠正后仍为空 | `provider_empty_reply` |
 | 本地解析或协议实现错误 | `reply_parse_failed` |
 
 第一次空成功不报告为 Provider 故障，因为 V2 仍有一次有界恢复机会。
@@ -238,23 +256,23 @@ transport attempt 数量。
 ```json
 {
   "stop_reason": "max_tokens",
-  "content_block_types": ["thinking"],
   "has_visible_text": false,
   "reasoning_present": true,
   "tool_call_count": 0,
-  "recovery_used": true
+  "completion_tokens": 4096
 }
 ```
 
-具体字段取决于各 Provider 解析器可获得的信息。字段必须不含内容且有大小上限。可以记录
-未知内容块的名称，但不能把内容块正文复制到明文日志。
+具体字段取决于各 Provider 解析器可获得的信息。字段必须不含内容且有大小上限；
+`stop_reason` 只保留已知枚举值，其他非空值统一记录为 `other`。可以记录未知内容块的
+名称，但不能把内容块正文复制到明文日志。
 
 预期加密事件序列：
 
 ```text
 provider_request
 provider_response
-protocol_fallback(reason=empty_provider_success)
+empty_provider_response(action=semantic_correction)
 provider_request(recovery=true)
 provider_response
 ```
@@ -272,11 +290,11 @@ provider_response
 
 ## 测试方案
 
-### Provider 解析器测试
+### Provider 解析器回归
 
-- Anthropic thinking-only 配合 `require_reply=False` 时返回结构化结果。
-- Anthropic thinking-only 配合 `require_reply=True` 时，非 V2 调用方继续得到现有错误。
-- Anthropic 只有工具调用、没有文本的响应在 `require_reply=True` 下继续合法。
+- 复用既有 `require_reply=False` 结构化空结果测试。
+- 非 V2 调用方的默认 `require_reply=True` 行为不变。
+- 只有工具调用、没有文本的响应继续合法。
 - 非法 2xx 响应在 `require_reply=False` 下仍然失败。
 - 同时包含 text 和 thinking 的响应行为不变。
 - 其他 Provider wire 的合法空响应解析不发生回归。
@@ -284,6 +302,7 @@ provider_response
 ### 工具循环测试
 
 - thinking-only 后返回可见文本，turn 成功完成。
+- 无 reasoning、无 stop reason 的异常空 completion 只调用 Provider 一次。
 - thinking-only 后返回 `memory_index`，真实分发工具，随后返回最终文本。
 - 纠正调用保留原工具名称和 schema。
 - 纠正指令只出现在纠正请求中，不进入持久 transcript。
@@ -320,13 +339,11 @@ provider_response
 
 主要实现：
 
-- `backend/provider_client.py`
 - `backend/model_api_runtime/v2/tool_loop.py`
-- `backend/model_api_runtime/v2/worker.py`，仅在错误分类或 trajectory 接线确有需要时修改
+- `backend/model_api_runtime/v2/worker.py`
 
 测试：
 
-- `tests/test_provider_client.py`
 - `tests/test_v2_tool_loop.py`
 - `tests/test_v2_worker.py`
 - 现有 V2 trajectory 测试模块

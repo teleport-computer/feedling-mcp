@@ -169,11 +169,13 @@ def test_reconciled_human_message_is_replied_and_advances_seq_cursor(monkeypatch
         *,
         tools=None,
         allow_image_output=False,
+        **kwargs,
     ):
         provider_calls.append({
             "messages": messages,
             "tools": tools,
             "allow_image_output": allow_image_output,
+            **kwargs,
         })
         return {
             "reply": "reply to human",

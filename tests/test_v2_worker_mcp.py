@@ -75,10 +75,12 @@ def _script_provider(monkeypatch, responses):
         *,
         tools=None,
         allow_image_output=False,
+        **kwargs,
     ):
         calls.append({
             "tools": tools,
             "allow_image_output": allow_image_output,
+            **kwargs,
         })
         return next(it)
 
@@ -417,6 +419,7 @@ def test_platform_write_is_exactly_applied_before_later_round_mcp_mutation(
         *,
         tools=None,
         allow_image_output=False,
+        **kwargs,
     ):
         nonlocal provider_calls
         assert allow_image_output is True

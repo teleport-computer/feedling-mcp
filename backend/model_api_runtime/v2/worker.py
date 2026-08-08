@@ -180,8 +180,14 @@ async def _record_provider_failure(
     await asyncio.to_thread(
         provider_health.record_failure,
         user_id,
-        error_class=provider_health.error_class_for_exception(exc),
+        error_class=_provider_health_error_class(exc),
     )
+
+
+def _provider_health_error_class(exc: BaseException) -> str:
+    if isinstance(exc, v2_tool_loop.ProviderEmptyReply):
+        return "provider_empty_reply"
+    return provider_health.error_class_for_exception(exc)
 
 
 async def _record_provider_failure_class(
@@ -952,6 +958,8 @@ def _safe_failure_code(scope: str, exc: BaseException) -> str:
         kind = "workspace_prompt_unavailable"
     elif isinstance(exc, (DedicatedVisionUnavailable, ImageGenerationUnavailable)):
         kind = exc.error_code
+    elif isinstance(exc, v2_tool_loop.ProviderEmptyReply):
+        kind = "empty_reply"
     elif isinstance(exc, TurnError):
         raw = str(exc)
         if raw in {
@@ -1053,9 +1061,12 @@ def _turn_failure_error_class(exc: BaseException) -> str:
         return "context_overflow"
     if isinstance(exc, (asyncio.TimeoutError, TimeoutError)):
         return "turn_timeout"
-    if isinstance(exc, TurnError) and str(exc) == "empty_reply":
+    if (
+        isinstance(exc, v2_tool_loop.ProviderEmptyReply)
+        or (isinstance(exc, TurnError) and str(exc) == "empty_reply")
+    ):
         # 模型/provider 没给出任何可用文本(空终局、断流、预算耗尽无气泡)——
-        # 三个 raise 点全是 provider/模型行为,不是我们的解析问题;归 provider,
+        # raise 点全是 provider/模型行为,不是我们的解析问题;归 provider,
         # 别把中转抽风包装成「系统出了问题」(usr_7f30d63f 2026-08-07)。
         return "provider_empty_reply"
     if isinstance(exc, TurnError) and str(exc) in {
@@ -3244,6 +3255,7 @@ def _make_build_messages_fn(
             safety_margin_tokens: int | None,
             utf8_bytes_per_token: float,
             image_reserve_tokens: int,
+            system_suffix: str = "",
         ) -> tuple[list, Any, dict]:
             rendered_transcript: list = []
             for item in transcript:
@@ -3267,6 +3279,10 @@ def _make_build_messages_fn(
                     selected,
                     worldbook_char_cap=worldbook_char_cap,
                 ) + rendered_transcript
+                messages = v2_tool_loop._with_system_suffix(
+                    messages,
+                    system_suffix,
+                )
                 plan = v2_prompt_frontier.plan_provider_round(
                     model_limit=model_limit,
                     messages=messages,
