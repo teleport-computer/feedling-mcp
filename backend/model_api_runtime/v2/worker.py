@@ -6451,6 +6451,8 @@ def _safe_download_name(path: str) -> str:
 
 def _workspace_file_mime(name: str, declared: str = "") -> str:
     """Choose a safe MIME for generated workspace files sent without rendering."""
+    if str(name or "").casefold().endswith(".io.html"):
+        return "text/html"
     explicit = str(declared or "").strip().lower()
     if explicit.startswith("text/") or explicit in {
         "application/json",
@@ -6486,10 +6488,15 @@ def _workspace_file_reply_from_result(result: dict) -> WorkspaceFileReply:
     content = result.get("content")
     if not isinstance(content, str):
         raise ValueError("send_file requires UTF-8 workspace source content")
-    source_data = content.encode("utf-8")
-    if not source_data or len(source_data) > _WORKSPACE_FILE_MAX_BYTES:
-        raise ValueError("workspace file is empty or too large")
     name = _safe_download_name(path)
+    maximum_bytes = (
+        cap_tool_schema.SHARED_WORK_MAX_BYTES
+        if name.casefold().endswith(".io.html")
+        else _WORKSPACE_FILE_MAX_BYTES
+    )
+    source_data = content.encode("utf-8")
+    if not source_data or len(source_data) > maximum_bytes:
+        raise ValueError("workspace file is empty or too large")
     rendered = v2_document_render.render_download(name, content)
     if rendered is None:
         data = source_data
@@ -6498,7 +6505,7 @@ def _workspace_file_reply_from_result(result: dict) -> WorkspaceFileReply:
         )
     else:
         data, mime_type = rendered
-    if not data or len(data) > _WORKSPACE_FILE_MAX_BYTES:
+    if not data or len(data) > maximum_bytes:
         raise ValueError("rendered workspace file is empty or too large")
     return WorkspaceFileReply(
         path=path,
