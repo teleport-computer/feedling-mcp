@@ -44,6 +44,7 @@ from memory.source_policy import (  # noqa: E402
     RESIDENT_ABSORB_SOURCE,
     RESIDENT_PATCH_SOURCE,
 )
+from core import chat_activity as _chat_activity  # noqa: E402
 
 try:
     from identity import card_policy as _card_policy  # single source, pure stdlib
@@ -341,6 +342,35 @@ def _memory_activity_metadata(tool_name, output):
     return metadata
 
 
+def _image_generation_activity_result_code(output):
+    """Extract one server-authored code without retaining the response body."""
+    if not isinstance(output, dict):
+        return ""
+    candidates = [output.get("error_class"), output.get("error_code")]
+    error = output.get("error")
+    if isinstance(error, dict):
+        candidates.extend(
+            error.get(key) for key in ("error_class", "error_code", "error", "code")
+        )
+    else:
+        candidates.append(error)
+    for candidate in candidates:
+        code = _chat_activity.image_generation_result_code(candidate)
+        if code:
+            return code
+    return ""
+
+
+def _activity_result_code(tool_name, output, exit_code):
+    if int(exit_code or 0) == 0:
+        return "ok"
+    if tool_name == "generate_image":
+        code = _image_generation_activity_result_code(output)
+        if code:
+            return code
+    return "tool_error"
+
+
 def _emit_turn_activity(args, activity_id, state, *, dur_ms=None, exit_code=0):
     """Best-effort V1 activity event; never sends arguments or result bodies."""
     try:
@@ -361,7 +391,9 @@ def _emit_turn_activity(args, activity_id, state, *, dur_ms=None, exit_code=0):
         if dur_ms is not None:
             payload["duration_ms"] = round(float(dur_ms), 1)
         if state != "running":
-            payload["result_code"] = "ok" if int(exit_code or 0) == 0 else "tool_error"
+            payload["result_code"] = _activity_result_code(
+                tool_name, _LAST_TOOL_OUTPUT, exit_code
+            )
             if int(exit_code or 0) == 0:
                 payload.update(_memory_activity_metadata(tool_name, _LAST_TOOL_OUTPUT))
         url = (

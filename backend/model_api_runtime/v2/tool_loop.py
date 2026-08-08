@@ -1511,14 +1511,14 @@ async def run_tool_loop(
                 if not media:
                     raise RuntimeError("generate_image returned no media")
             except Exception as exc:
-                await _tool_event(
-                    tc, "tool_call_error", {"error": type(exc).__name__}
-                )
                 # 生图失败**不打断这一轮** —— 把结构化失败交回给伴侣,让它自己
                 # 决定怎么跟用户说(换个描述再试、或者老实讲这次没画成)。
                 # 原来这里直接 raise,整轮炸掉:用户既没有图、也没有一句解释,
                 # 而伴侣根本不知道发生过什么。工具失败是它该知道的事实,不是
                 # runtime 替它隐藏的意外。
+                image_error_code = str(
+                    getattr(exc, "error_code", "") or "image_generation_failed"
+                )[:64]
                 image_result = ToolResult(
                     call_id=tc.id,
                     content=(
@@ -1527,6 +1527,7 @@ async def run_tool_loop(
                         + "). 图没有生成。请如实告诉用户,或换一个更清楚的画面"
                         "描述再调一次;不要声称图已经生成。"
                     ),
+                    metadata={"image_generation_result_code": image_error_code},
                 )
                 reply_results[tc.id] = image_result
                 await _tool_event(
