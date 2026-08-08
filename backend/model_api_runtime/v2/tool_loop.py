@@ -744,11 +744,32 @@ async def run_tool_loop(
         )
         if retry_instructions:
             messages = _with_system_suffix(messages, retry_instructions)
-        # Reserve the final provider attempt for a tools-disabled terminal reply.
-        # A 400/422 tool-schema rejection or repeated malformed call also forces
-        # this same one-shot fallback; the fallback itself is never retried.
+        # Reserve the final provider attempt for a terminal reply. Providers with
+        # a real tool_choice=none keep schemas referenced by their native history;
+        # other wires omit tools as before. A 400/422 schema rejection or repeated
+        # malformed call also forces this bounded fallback.
         terminal_text_round = force_text_fallback or attempts == max_calls - 1
-        if terminal_text_round:
+        historical_tool_names = {
+            call.name
+            for item in transcript
+            if isinstance(item, ToolExchange)
+            for call in item.calls
+            if call.name
+        }
+        provider_name = str(
+            getattr(provider_config, "provider", "") or ""
+        ).strip().lower()
+        terminal_schema_guard = (
+            terminal_text_round
+            and bool(historical_tool_names)
+            and provider_name
+            in {"anthropic", "openrouter", "openai_compatible", "deepseek"}
+        )
+        if terminal_schema_guard:
+            tools = [
+                spec for spec in turn_catalog if spec.name in historical_tool_names
+            ] or None
+        elif terminal_text_round:
             tools = None
         elif (
             external_content_seen or mutation_outcome_unknown or outbound_tools_blocked
@@ -791,15 +812,6 @@ async def run_tool_loop(
             tools = [spec for spec in turn_catalog if spec.name not in blocked_tools]
         else:
             tools = turn_catalog
-        if tools is not None and completed_memory_discovery_tools:
-            # Each discovery mode may run once. A keyword search can legitimately
-            # miss while memory_index still finds the user's saved cards, so do
-            # not suppress both after only one observation.
-            tools = [
-                spec
-                for spec in tools
-                if spec.name not in completed_memory_discovery_tools
-            ]
         requirement_already_met = (
             not file_delivery_required
             or (
@@ -809,7 +821,12 @@ async def run_tool_loop(
             )
         )
         forced_delivery_tool = ""
-        if tools is not None and file_delivery_required and not requirement_already_met:
+        if (
+            not terminal_text_round
+            and tools is not None
+            and file_delivery_required
+            and not requirement_already_met
+        ):
             # Keep the recovery path narrow enough for weaker tool-using models.
             tools = [spec for spec in tools if spec.name in _FILE_DELIVERY_TOOLS]
             if file_delivery_recovery_needed:
@@ -820,12 +837,18 @@ async def run_tool_loop(
                 )
                 tools = [spec for spec in tools if spec.name == forced_delivery_tool]
         tail_window = None
+        required_schema_names = (
+            historical_tool_names
+            if terminal_schema_guard
+            else completed_memory_discovery_tools
+        )
         adaptive_planner = getattr(build_messages, "plan_provider_round", None)
         try:
             if callable(adaptive_planner):
                 messages, frontier_plan, tail_window = adaptive_planner(
                     transcript=list(transcript),
                     tools=tools,
+                    required_tool_names=required_schema_names,
                     model_limit=model_prompt_limit,
                     output_reserve_tokens=prompt_output_reserve_tokens,
                     safety_margin_tokens=prompt_safety_margin_tokens,
@@ -838,6 +861,7 @@ async def run_tool_loop(
                     model_limit=model_prompt_limit,
                     messages=messages,
                     tools=tools,
+                    required_tool_names=required_schema_names,
                     output_reserve_tokens=prompt_output_reserve_tokens,
                     safety_margin_tokens=prompt_safety_margin_tokens,
                     utf8_bytes_per_token=prompt_estimator_utf8_bytes_per_token,
@@ -856,10 +880,15 @@ async def run_tool_loop(
             except Exception:
                 pass
         if "tool_schemas" in frontier_plan.omitted_optional_components:
-            # Schemas are atomic and optional: omitting the whole catalog is a
-            # valid weak-model/text-only degradation. Required conversation and
-            # native tool exchanges are never clipped to make room.
-            tools = None
+            # Once a memory discovery result is present in the required native
+            # transcript, keep that matching schema even when the remaining
+            # optional catalog no longer fits. This avoids a provider-visible
+            # call/result history whose tool definition has disappeared.
+            tools = [
+                spec
+                for spec in (tools or [])
+                if spec.name in required_schema_names
+            ] or None
         if before_provider_call is not None:
             before_provider_call()
         await _trajectory(
@@ -880,10 +909,13 @@ async def run_tool_loop(
             # parser return any structurally valid success so an abnormal HTTP
             # 200 is not retried as though it were a transient network failure.
             provider_kwargs = {"tools": tools, "require_reply": False}
+            if terminal_schema_guard and tools is not None:
+                provider_kwargs["tool_choice"] = "none"
             if allow_image_output and not terminal_text_round:
                 provider_kwargs["allow_image_output"] = True
             if (
                 forced_delivery_tool
+                and not terminal_text_round
                 and tools is not None
                 and str(getattr(provider_config, "provider", "")).strip().lower()
                 == "openrouter"
@@ -1299,24 +1331,29 @@ async def run_tool_loop(
         # Provider media is terminal output. Do not silently discard or retain
         # its large inline payload when a broken relay also invents function
         # calls in the same turn; fall back once with every tool disabled.
-        malformed = bool(pr.media) or any(
-            not tc.id
-            or not tc.name
-            or not tc.args_ok
-            or (
-                tc.name not in offered_names
-                and tc.name not in completed_memory_discovery_tools
+        malformed = (
+            (terminal_text_round and bool(pr.tool_calls))
+            or bool(pr.media)
+            or any(
+                not tc.id
+                or not tc.name
+                or not tc.args_ok
+                or (
+                    tc.name not in offered_names
+                    and tc.name not in completed_memory_discovery_tools
+                )
+                or (
+                    external_content_seen
+                    and tc.name == "web_fetch"
+                    and str(tc.args.get("url") or "").strip()
+                    not in allowed_fetch_urls
+                )
+                or (
+                    tc.name not in mcp_names
+                    and tool_schema.validate_tool_args(tc.name, tc.args) is not None
+                )
+                for tc in pr.tool_calls
             )
-            or (
-                external_content_seen
-                and tc.name == "web_fetch"
-                and str(tc.args.get("url") or "").strip() not in allowed_fetch_urls
-            )
-            or (
-                tc.name not in mcp_names
-                and tool_schema.validate_tool_args(tc.name, tc.args) is not None
-            )
-            for tc in pr.tool_calls
         )
         image_reply_calls = [
             tc for tc in pr.tool_calls if tc.name == tool_schema.IMAGE_REPLY_TOOL
@@ -1513,14 +1550,14 @@ async def run_tool_loop(
                 if not media:
                     raise RuntimeError("generate_image returned no media")
             except Exception as exc:
-                await _tool_event(
-                    tc, "tool_call_error", {"error": type(exc).__name__}
-                )
                 # 生图失败**不打断这一轮** —— 把结构化失败交回给伴侣,让它自己
                 # 决定怎么跟用户说(换个描述再试、或者老实讲这次没画成)。
                 # 原来这里直接 raise,整轮炸掉:用户既没有图、也没有一句解释,
                 # 而伴侣根本不知道发生过什么。工具失败是它该知道的事实,不是
                 # runtime 替它隐藏的意外。
+                image_error_code = str(
+                    getattr(exc, "error_code", "") or "image_generation_failed"
+                )[:64]
                 image_result = ToolResult(
                     call_id=tc.id,
                     content=(
@@ -1529,6 +1566,7 @@ async def run_tool_loop(
                         + "). 图没有生成。请如实告诉用户,或换一个更清楚的画面"
                         "描述再调一次;不要声称图已经生成。"
                     ),
+                    metadata={"image_generation_result_code": image_error_code},
                 )
                 reply_results[tc.id] = image_result
                 await _tool_event(

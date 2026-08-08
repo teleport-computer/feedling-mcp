@@ -208,13 +208,21 @@ ORDERED_REPLY_TARGET_POLICY = (
 )
 
 
-def chat_system_prompt() -> str:
+def _supports_mandatory_self_thinking(provider_config: Any) -> bool:
+    if provider_config is None:
+        return True
+    model = str(getattr(provider_config, "model", "") or "").strip().lower()
+    return model.rsplit("/", 1)[-1] != "claude-fable-5"
+
+
+def chat_system_prompt(provider_config: Any = None) -> str:
     """CHAT_SYSTEM_PROMPT, plus the self-authored-thinking instruction when the
-    self-thinking kill switch is on (v1). Appended as a suffix so the cache-stable
-    prefix is unchanged when the switch is off (byte-identical to today)."""
+    self-thinking kill switch is on and the selected V2 model supports it.
+    Appended as a suffix so the cache-stable prefix is unchanged when the switch
+    is off (byte-identical to today)."""
     from core import self_thinking
 
-    if self_thinking.enabled():
+    if self_thinking.enabled() and _supports_mandatory_self_thinking(provider_config):
         return CHAT_SYSTEM_PROMPT + self_thinking.INSTRUCTION
     return CHAT_SYSTEM_PROMPT
 

@@ -231,6 +231,64 @@ def test_running_activity_does_not_retry_or_delay_tool(monkeypatch):
     assert calls[0][1]["timeout"] == 2.0
 
 
+def test_generate_image_activity_keeps_actionable_failure_code(monkeypatch):
+    calls = []
+    monkeypatch.setenv("FEEDLING_TRACE_ID", "turn-image-required")
+    monkeypatch.setenv("FEEDLING_API_URL", "http://backend.test")
+    monkeypatch.setenv("FEEDLING_API_KEY", "k")
+    monkeypatch.setattr(
+        io_cli,
+        "_LAST_TOOL_OUTPUT",
+        {
+            "ok": False,
+            "http_status": 409,
+            "error": {"error": "image_generation_model_required"},
+        },
+    )
+    monkeypatch.setattr(
+        io_cli,
+        "_http_json",
+        lambda *args, **kwargs: calls.append(kwargs["payload"])
+        or (200, {"status": "ok"}),
+    )
+
+    io_cli._emit_turn_activity(
+        types.SimpleNamespace(verb="generate-image"),
+        "v1:image-1",
+        "failure",
+        exit_code=1,
+    )
+
+    assert calls[-1]["result_code"] == "image_generation_model_required"
+
+
+def test_non_image_tool_failure_stays_generic(monkeypatch):
+    calls = []
+    monkeypatch.setenv("FEEDLING_TRACE_ID", "turn-generic-error")
+    monkeypatch.setenv("FEEDLING_API_URL", "http://backend.test")
+    monkeypatch.setenv("FEEDLING_API_KEY", "k")
+    monkeypatch.setattr(
+        io_cli,
+        "_LAST_TOOL_OUTPUT",
+        {"error": "image_generation_model_required"},
+    )
+    monkeypatch.setattr(
+        io_cli,
+        "_http_json",
+        lambda *args, **kwargs: calls.append(kwargs["payload"])
+        or (200, {"status": "ok"}),
+    )
+
+    io_cli._emit_turn_activity(
+        types.SimpleNamespace(verb="workspace-export"),
+        "v1:generic-1",
+        "failure",
+        exit_code=1,
+    )
+
+    assert calls[-1]["result_code"] == "tool_error"
+
+
 def test_memory_activity_metadata_custom_bucket_falls_back_to_total():
     assert io_cli._memory_activity_metadata(
         "memory_fetch",

@@ -275,7 +275,7 @@ def test_web_observation_revokes_durable_writes_for_later_rounds(monkeypatch):
     assert cap_registry.WRITE_ACTIONS <= first_names
     assert cap_registry.WRITE_ACTIONS.isdisjoint(second_names)
     assert tool_loop.provenance.EXTERNAL_READS.isdisjoint(second_names)
-    assert provider_tools[2] is None
+    assert {spec.name for spec in provider_tools[2]} == {"web_fetch"}
     assert [tc.name for tc in dispatched] == ["web_fetch"]
     assert replies == [("safe final", True)]
     assert outcome.final_text == "safe final"

@@ -19,6 +19,15 @@ change must not be interpreted as an API guarantee.
   cleanly resolved. New `FEEDLING_THINK_GATE` environment variable, on by
   default, documented in Self-hosting. Turning off `FEEDLING_V2_SELF_THINKING`
   no longer disables this gate.
+- **Runtime V2 now supports stricter Anthropic-compatible models during chat and
+  multi-step tool use.** Fable 5 is allowed to answer without the optional
+  self-thinking bubble instead of being forced into a visible chain-of-thought
+  format that it refuses. Native tool definitions also remain visible while
+  their matching `tool_use` / `tool_result` history is in the turn, so models
+  such as Opus 4.8 can continue a real tool workflow without treating earlier
+  results as fabricated. Repeated memory discovery is still executed at most
+  once per mode.
+
 - **Runtime V1 now pins and verifies the selected Claude model family.** Managed
   Claude Code commands pass the configured route through `--model`, and model
   changes rotate resident sessions. A Claude Code fallback to another Claude
@@ -38,6 +47,13 @@ change must not be interpreted as an API guarantee.
   claims an image was produced when none was is returned once for correction,
   and is then delivered as written. `POST /v1/image-generation/generate` and the
   existing encrypted image-delivery path are unchanged.
+
+- **Image-model setup failures remain actionable without replacing the
+  companion's reply.** Runtime V1, Runtime V2, and CLI residents now preserve an
+  allowlisted `image_generation_*` code on the failed `generate_image` activity
+  event. Clients can use the final image-generation attempt in a completed turn
+  to offer model setup while still displaying the companion's own words. A later
+  successful attempt or a temporary provider failure does not request setup.
 
 - **Failed voice calls now have an explicit, idempotent cancellation path.**
   `POST /v1/voice/cancel` installs a durable per-call tombstone, clears

@@ -2420,6 +2420,7 @@ def _make_chat_tool_activity_callback(
             )
         result = payload.get("result")
         result_content = result.content if isinstance(result, ToolResult) else ""
+        result_metadata = result.metadata if isinstance(result, ToolResult) else {}
         effect = effect_evidence_by_call.get(str(tc.id)) or {}
         detail: dict[str, Any] = {
             "activity_id": invocation_ids[object_key],
@@ -2436,6 +2437,12 @@ def _make_chat_tool_activity_callback(
             detail["result_code"] = core_chat_activity.result_code(
                 result_content, effect
             )
+            if str(tc.name or "") == cap_tool_schema.IMAGE_REPLY_TOOL:
+                image_code = core_chat_activity.image_generation_result_code(
+                    (result_metadata or {}).get("image_generation_result_code")
+                )
+                if image_code:
+                    detail["result_code"] = image_code
         for key, target, limit in (
             ("effect_id", "effect_id", 160),
             ("effect_type", "effect_type", 80),
@@ -3255,6 +3262,7 @@ def _make_build_messages_fn(
             safety_margin_tokens: int | None,
             utf8_bytes_per_token: float,
             image_reserve_tokens: int,
+            required_tool_names=(),
             system_suffix: str = "",
         ) -> tuple[list, Any, dict]:
             rendered_transcript: list = []
@@ -3287,6 +3295,7 @@ def _make_build_messages_fn(
                     model_limit=model_limit,
                     messages=messages,
                     tools=tools,
+                    required_tool_names=required_tool_names,
                     output_reserve_tokens=output_reserve_tokens,
                     safety_margin_tokens=safety_margin_tokens,
                     utf8_bytes_per_token=utf8_bytes_per_token,
@@ -5522,6 +5531,7 @@ def _preflight_adaptive_builder(
     planner(
         transcript=[],
         tools=None,
+        required_tool_names=(),
         model_limit=model_limit,
         output_reserve_tokens=PROMPT_OUTPUT_RESERVE_TOKENS,
         safety_margin_tokens=PROMPT_SAFETY_MARGIN_TOKENS,
@@ -11965,7 +11975,7 @@ async def process_job(
 
         def _chat_builder():
             return _make_build_messages_fn(
-                system_prompt=context.chat_system_prompt(),
+                system_prompt=context.chat_system_prompt(provider_config),
                 summary=summary,
                 tail=tail,
                 extra_context=turn_extra_context,
