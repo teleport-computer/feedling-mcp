@@ -110,6 +110,7 @@ def test_create_import_job_drops_plaintext_metadata(monkeypatch):
             "timeline_span_days": 7,
             "distill_model": "claude-haiku-4-5",
             "plaintext_worker_instance": "client-spoof",
+            "staged_id": "client-spoof-stage",
         },
     })
 
@@ -119,6 +120,7 @@ def test_create_import_job_drops_plaintext_metadata(monkeypatch):
     assert metadata["timeline_span_days"] == 7
     assert metadata["distill_model"] == "claude-haiku-4-5"
     assert "plaintext_worker_instance" not in metadata
+    assert "staged_id" not in metadata
     assert metadata["privacy_copy"] == service.PRIVACY_COPY
     assert "transcript" not in metadata
     assert "ai_persona" not in metadata
@@ -142,6 +144,7 @@ def test_create_import_job_persists_only_trusted_worker_owner_metadata(monkeypat
             "plaintext_worker_host": "host-a",
             "plaintext_worker_pid": 123,
             "plaintext_worker_instance": "instance-a",
+            "staged_id": "staged_trusted",
             "transcript": "must-not-persist",
         },
     )
@@ -149,6 +152,7 @@ def test_create_import_job_persists_only_trusted_worker_owner_metadata(monkeypat
     assert saved["metadata"]["plaintext_worker_host"] == "host-a"
     assert saved["metadata"]["plaintext_worker_pid"] == 123
     assert saved["metadata"]["plaintext_worker_instance"] == "instance-a"
+    assert saved["metadata"]["staged_id"] == "staged_trusted"
     assert "transcript" not in saved["metadata"]
 
 
@@ -1327,6 +1331,7 @@ def test_genesis_checkpoint_persists_only_encrypted_content(monkeypatch):
     assert stored["kind"] == "genesis_checkpoint:job_1"
     assert "secret" not in json.dumps(stored["doc"])
     assert stored["doc"]["encrypted"] is True
+    assert stored["doc"]["checkpoint_bytes"] == len(raw_seen["raw"])
 
 
 def test_genesis_checkpoint_load_verifies_and_decrypts(monkeypatch):

@@ -10,6 +10,14 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **Genesis plaintext retries reuse completed persona-voice mapping.** The
+  estimate/commit flow now retains its opaque staged-upload pointer in trusted
+  job metadata until completion, and both fact-map and voice-map window results
+  are stored in the encrypted checkpoint. Manual retries skip those completed
+  model calls without duplicating memory cards. Interrupted workers also emit
+  content-free cause, progress, elapsed-time, model, tier, and checkpoint-size
+  diagnostics; interruption and retry policy itself is unchanged.
+
 - **Voice calls no longer end with a protocol error when a turn produces no
   speech.** A turn that is deliberately silent — transport noise, a call that
   already ended, an ASR revision that superseded it — now returns a valid
