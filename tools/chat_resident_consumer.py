@@ -5096,22 +5096,29 @@ def _claude_actual_models_from_stream(raw: str) -> set[str]:
     return models
 
 
+def _is_claude_family_model(model: str) -> bool:
+    """Return whether a route or receipt id identifies the Claude family."""
+    value = str(model or "").strip().lower()
+    if value in {"fable", "opus", "sonnet", "haiku"}:
+        return True
+    return bool(re.search(r"(?:^|[./:])claude(?:[-._:]|$)", value))
+
+
 def _claude_configured_model_matches(configured: str, actual: set[str]) -> bool:
-    """Match Claude CLI family aliases loosely and full route ids exactly."""
+    """Allow Claude-family fallback while rejecting cross-family drift."""
     expected = str(configured or "").strip().lower()
     normalized_actual = {
         str(model).strip().lower() for model in actual if str(model).strip()
     }
-    if expected in {"fable", "opus", "sonnet", "haiku"}:
-        return any(
-            expected in model.split("/")[-1].split(":")[-1]
-            for model in normalized_actual
+    if _is_claude_family_model(expected):
+        return bool(normalized_actual) and all(
+            _is_claude_family_model(model) for model in normalized_actual
         )
     return expected in normalized_actual
 
 
 def _validate_claude_actual_model(raw: str) -> None:
-    """Reject proven model drift while tolerating old output without metadata."""
+    """Allow Claude-family fallback and reject proven cross-family drift."""
     configured = str(AGENT_RUNTIME_METADATA.get("model") or "").strip()
     if not configured:
         return
@@ -5122,9 +5129,15 @@ def _validate_claude_actual_model(raw: str) -> None:
             configured[:200],
         )
         return
-    if _claude_configured_model_matches(configured, actual):
-        return
     actual_text = ",".join(sorted(actual))[:400]
+    if _claude_configured_model_matches(configured, actual):
+        if configured.strip().lower() not in actual:
+            log.warning(
+                "claude family fallback allowed configured=%s actual=%s",
+                configured[:200],
+                actual_text,
+            )
+        return
     _clear_agent_session_id(
         f"claude model mismatch configured={configured[:200]} actual={actual_text}"
     )
@@ -14294,7 +14307,12 @@ def _process_messages(messages: list) -> float:
         content = _foreground_agent_message(content, current_ts=ts)
         session_bound_content = content
 
-        use_runtime_v2 = _resident_chat_runtime_v2_enabled() and not (image_payloads or image_paths)
+        # This flag selects the resident V1 chat profile; it does not transfer
+        # session ownership to the pooled Runtime V2 worker.
+        use_resident_chat_v2_profile = (
+            _resident_chat_runtime_v2_enabled()
+            and not (image_payloads or image_paths)
+        )
         attempt_kwargs = (
             {"attempt_trigger": attempt_trigger}
             if attempt_trigger != "first"
@@ -14330,7 +14348,7 @@ def _process_messages(messages: list) -> float:
         pending_failure_is_parse_only = False
 
         def _dispatch_foreground_agent(turn_content: str) -> Any:
-            if use_runtime_v2:
+            if use_resident_chat_v2_profile:
                 return call_agent(
                     _resident_foreground_chat_message_v2(turn_content),
                     trace_id=trace_id, lane="chat",
@@ -14374,8 +14392,7 @@ def _process_messages(messages: list) -> float:
                     agent_result = _dispatch_foreground_agent(content)
                 except Exception as first_error:
                     pi_vision_rejection = (
-                        not use_runtime_v2
-                        and AGENT_MODE == "cli"
+                        AGENT_MODE == "cli"
                         and _cli_template_is_pi()
                         and _vision_probe_error_code(first_error)
                         == "vision_model_required"
@@ -14402,6 +14419,9 @@ def _process_messages(messages: list) -> float:
                         detail={
                             "current_images": has_current_images,
                             "retried": not has_current_images,
+                            "resident_chat_v2_profile": (
+                                use_resident_chat_v2_profile
+                            ),
                         },
                     )
                     if has_current_images:
@@ -14626,7 +14646,7 @@ def _process_messages(messages: list) -> float:
             content_excerpt={"reply": _reply_text[:3000], "thinking": (turn.thinking_summary or "")[:2000]},
         )
         actions, replies = turn.actions, turn.messages
-        if use_runtime_v2:
+        if use_resident_chat_v2_profile:
             actions = [
                 action for action in actions
                 if _proactive_action_type(action).removeprefix("proactive.") != "needs_background"

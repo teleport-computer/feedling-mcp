@@ -6038,15 +6038,18 @@ def test_claude_actual_models_uses_only_structured_stream_metadata():
         ("sonnet", {"claude-sonnet-4-6"}, True),
         ("haiku", {"claude-haiku-4-5"}, True),
         ("claude-fable-5", {"claude-fable-5"}, True),
-        ("claude-fable-5", {"claude-opus-4-8"}, False),
-        ("claude-sonnet-4-6", {"claude-sonnet-4-6-20260801"}, False),
+        ("claude-fable-5", {"claude-opus-4-8"}, True),
+        ("fable", {"claude-opus-4-8"}, True),
+        ("claude-sonnet-4-6", {"claude-sonnet-4-6-20260801"}, True),
+        ("claude-fable-5", {"deepseek-chat"}, False),
+        ("claude-fable-5", {"claude-opus-4-8", "deepseek-chat"}, False),
     ],
 )
 def test_claude_configured_model_matches_structured_actual(configured, actual, matches):
     assert crc._claude_configured_model_matches(configured, actual) is matches
 
 
-def test_call_agent_cli_rejects_claude_model_mismatch_and_clears_session(monkeypatch):
+def test_call_agent_cli_allows_claude_family_model_fallback(monkeypatch, caplog):
     monkeypatch.setattr(crc, "AGENT_CLI_CMD", "claude --model claude-fable-5 -p {message}")
     monkeypatch.setattr(crc, "AGENT_RUNTIME_METADATA", {
         "provider": "anthropic",
@@ -6071,10 +6074,10 @@ def test_call_agent_cli_rejects_claude_model_mismatch_and_clears_session(monkeyp
 
     monkeypatch.setattr(crc.subprocess, "run", lambda *a, **kw: _R())
 
-    with pytest.raises(RuntimeError, match=r"model_mismatch: configured=claude-fable-5 actual=claude-opus-4-8"):
-        crc.call_agent_cli("请调用工具读取我喜欢的颜色")
-
-    assert cleared and "model mismatch" in cleared[0]
+    assert crc.call_agent_cli("请调用工具读取我喜欢的颜色") == "我记得你喜欢蓝色。"
+    assert cleared == []
+    assert "claude family fallback allowed" in caplog.text
+    assert "configured=claude-fable-5 actual=claude-opus-4-8" in caplog.text
 
 
 def test_call_agent_cli_allows_claude_success_without_model_metadata(monkeypatch, caplog):

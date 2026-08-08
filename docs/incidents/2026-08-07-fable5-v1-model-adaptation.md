@@ -4,7 +4,13 @@
 **测试用户**：`usr_6491814d52abdf99`（test）
 **涉及运行时**：Runtime V1 resident、Claude Code CLI
 **涉及供应商**：Anthropic 直连
-**报告状态**：首选安全修复已部署 test；Opus/Sonnet 通过，Fable 5 仍 fail-closed 暂不兼容
+**报告状态**：Claude Code 已回滚至 2.1.195；Claude 家族内 fallback 允许，跨家族错配仍 fail-closed
+
+> **2026-08-08 后续决策**：Claude Code/Anthropic 调用链可能把所请求的
+> Claude 型号切换为另一个 Claude 型号。Runtime V1 现在允许这种 Claude
+> 家族内 fallback，并记录 configured/actual model；只有实际回执落到非 Claude
+> 家族时才产生 `model_mismatch`。本文后续“所有型号错配均 fail-closed”的描述
+> 保留为当时排查和首版修复记录，不再代表当前策略。
 
 ---
 
