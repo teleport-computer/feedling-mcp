@@ -476,6 +476,7 @@ def _safe_genesis_metadata(raw: dict | None) -> dict:
         "support_count",
         "warning_count",
         "content_bytes",
+        "distill_model",
     }
     out: dict = {}
     for key in allowed:
@@ -488,6 +489,7 @@ def _safe_genesis_metadata(raw: dict | None) -> dict:
 def _safe_genesis_job(job: dict | None) -> dict:
     raw = job if isinstance(job, dict) else {}
     output = raw.get("output") if isinstance(raw.get("output"), dict) else {}
+    metadata = _safe_genesis_metadata(raw.get("metadata"))
     return {
         "job_id": str(raw.get("job_id") or ""),
         "status": str(raw.get("status") or ""),
@@ -502,7 +504,8 @@ def _safe_genesis_job(job: dict | None) -> dict:
         "created_at": str(raw.get("created_at") or ""),
         "updated_at": str(raw.get("updated_at") or ""),
         "completed_at": str(raw.get("completed_at") or ""),
-        "metadata": _safe_genesis_metadata(raw.get("metadata")),
+        "distill_model": str(metadata.get("distill_model") or "")[:160],
+        "metadata": metadata,
         "stage": str(output.get("stage") or "")[:80],
     }
 
@@ -2520,14 +2523,19 @@ def _render_delta(current, previous, *, good_when: str = "up") -> str:
     else:
         arrow = "±"
         magnitude = "0%"
-    if good_when == "neutral" or pct == 0:
+    # 小样本不染色：新注册 17→4 渲染成红色 −76% 是统计噪声吓人（prod
+    # 2026-08-07 实景）。两侧都 < 20 时箭头和数值照显，但颜色中性——数字是
+    # 真的，好坏判断在这个样本量下不是。任一侧 ≥ 20 说明量级足够，照常染色。
+    small_base = abs(prev) < 20 and abs(cur) < 20
+    if good_when == "neutral" or pct == 0 or small_base:
         cls = "neutral"
     elif good_when == "down":
         cls = "good" if pct < 0 else "bad"
     else:
         cls = "good" if pct > 0 else "bad"
+    title = "对比上一个同长度窗口" + ("；样本量小（两侧均 <20），方向仅供参考" if small_base else "")
     return (
-        f"<span class='delta {cls}' title='对比上一个同长度窗口'>"
+        f"<span class='delta {cls}' title='{title}'>"
         f"{arrow}{magnitude}</span>"
     )
 
@@ -2596,6 +2604,205 @@ def _fmt_tokens_compact(value) -> str:
     if abs_n >= 1_000:
         return f"{n / 1_000:.1f}k"
     return str(n)
+
+
+def _spark(values: list, *, good_when: str = "neutral") -> str:
+    """64×20 内联 SVG 折线 sparkline，纯静态无 JS。
+
+    None 是「缺数据」不是 0：缺的点断成缺口，绝不画成落零——和
+    _fmt_count 的未知≠0 语义一致。全缺时渲染灰 — 占位。描边一律
+    currentColor，颜色只由 wrapper class 给（.spark / .good / .bad），
+    嵌进什么底色的页面都不用改 SVG 本身。good_when 只决定首尾趋势的
+    好坏着色：'up' 涨绿跌红、'down' 反之、'neutral' 一律灰（如 token
+    总量，烧多烧少不预设立场）。"""
+    width, height, pad = 64.0, 20.0, 2.5
+    pts: list[float | None] = []
+    for v in values or []:
+        if v is None:
+            pts.append(None)
+            continue
+        try:
+            pts.append(float(v))
+        except (TypeError, ValueError):
+            pts.append(None)
+    known = [p for p in pts if p is not None]
+    if not known:
+        return "<span class='spark spark-empty' title='暂无样本'>—</span>"
+    lo, hi = min(known), max(known)
+    span = hi - lo
+    n = len(pts)
+
+    def px(i: int) -> float:
+        if n <= 1:
+            return width / 2
+        return pad + (width - 2 * pad) * (i / (n - 1))
+
+    def py(v: float) -> float:
+        if span <= 0:
+            return height / 2
+        return pad + (height - 2 * pad) * (1 - (v - lo) / span)
+
+    segments: list[list[tuple[float, float]]] = []
+    run: list[tuple[float, float]] = []
+    for i, p in enumerate(pts):
+        if p is None:
+            if run:
+                segments.append(run)
+                run = []
+            continue
+        run.append((px(i), py(p)))
+    if run:
+        segments.append(run)
+    parts: list[str] = []
+    for seg in segments:
+        if len(seg) == 1:
+            # 缺口两侧的孤点画成小圆点，否则单点段在 polyline 里不可见。
+            cx, cy = seg[0]
+            parts.append(
+                f"<circle cx='{cx:.1f}' cy='{cy:.1f}' r='1.6' fill='currentColor'/>"
+            )
+        else:
+            attr = " ".join(f"{x:.1f},{y:.1f}" for x, y in seg)
+            parts.append(
+                f"<polyline points='{attr}' fill='none' stroke='currentColor'"
+                " stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'/>"
+            )
+    cls = ""
+    if good_when in ("up", "down"):
+        first = next(p for p in pts if p is not None)
+        last = next(p for p in reversed(pts) if p is not None)
+        if last != first:
+            rising = last > first
+            good = rising if good_when == "up" else not rising
+            cls = " good" if good else " bad"
+    return (
+        f"<span class='spark{cls}' aria-hidden='true'>"
+        f"<svg viewBox='0 0 64 20' width='64' height='20'>{''.join(parts)}</svg>"
+        "</span>"
+    )
+
+
+def _render_funnel(funnel: dict | None, *, compact: bool) -> str:
+    """水平激活漏斗（admin_funnel_snapshot 的渲染面）。
+
+    条宽一律按「本阶段 ÷ 第一阶段」算，阶段间标注逐级转化率与流失数——
+    这是单调漏斗（同一 28 天注册 cohort 的里程碑子集），和 users 页旧的
+    「行为口径独立占比」不同，后者各分母互不包含、数字可以不单调。
+    count 为 None（如 W1 窗口尚无人走完）显 —，不画成 0 宽的假流失；
+    第一阶段为 0 时所有比例显「无样本」，不做除零。compact=True 给首页
+    （不叠上一窗口）；False 给用户页，每阶段追加上一 28 天窗口的灰色
+    对照数。funnel 为 None（builder 失败/未接线）整段坍缩成暂不可用。"""
+    if funnel is None:
+        return "<div class='muted'>漏斗暂不可用。页面不会把未知渲染成 0。</div>"
+    stages = [s for s in (funnel.get("stages") or []) if isinstance(s, dict)]
+    if not stages:
+        return "<div class='muted'>漏斗暂不可用。页面不会把未知渲染成 0。</div>"
+    window_days = int(funnel.get("window_days") or 0)
+    prev_by_id: dict[str, dict] = {}
+    if not compact:
+        for s in ((funnel.get("prev") or {}).get("stages") or []):
+            if isinstance(s, dict):
+                prev_by_id[str(s.get("id") or "")] = s
+
+    def _count(stage: dict):
+        raw = stage.get("count")
+        if raw is None:
+            return None
+        try:
+            return max(0, int(raw))
+        except (TypeError, ValueError):
+            return None
+
+    base = _count(stages[0])
+    rows: list[str] = []
+    prev_count = None
+    for idx, stage in enumerate(stages):
+        count = _count(stage)
+        label = html.escape(str(stage.get("label") or stage.get("id") or ""))
+        if idx > 0:
+            # 阶段间的逐级转化行：上一阶段无样本/未知就老实说，不编百分比。
+            # 带 eligible 的阶段（W1）分母必须用「窗口已走完的人」——拿 t3
+            # 总数当分母会把注册不满 14 天的人算成流失（prod 实景：t3=124
+            # 大半未到期，却标成 ↓40%·流失 75）。
+            eligible_raw = stage.get("eligible")
+            try:
+                eligible = int(eligible_raw) if eligible_raw is not None else None
+            except (TypeError, ValueError):
+                eligible = None
+            if prev_count is None:
+                conv = "<span class='muted'>—</span>"
+            elif prev_count == 0:
+                conv = "<span class='muted'>无样本</span>"
+            elif count is None:
+                conv = "<span class='muted'>暂不可判</span>"
+            elif eligible is not None:
+                if eligible <= 0:
+                    conv = "<span class='muted'>暂不可判（无人走完 W1 窗）</span>"
+                else:
+                    pct = count / eligible * 100
+                    drop = max(0, eligible - count)
+                    immature = max(0, prev_count - eligible)
+                    imm_note = (
+                        f"；{immature:,} 人窗口未到期不计" if immature else ""
+                    )
+                    conv = (
+                        f"↓ {pct:.0f}%<span class='muted'>"
+                        f" · 已走完 W1 窗的 {eligible:,} 人中流失 {drop:,}"
+                        f"{imm_note}</span>"
+                    )
+            else:
+                pct = count / prev_count * 100
+                drop = prev_count - count
+                conv = f"↓ {pct:.0f}%<span class='muted'> · 流失 {drop:,}</span>"
+            rows.append(f"<div class='hfunnel-conv'>{conv}</div>")
+        if count is None:
+            width_pct = 0.0
+            num = "<span class='muted' title='窗口尚未走完或查询失败，判不了'>—</span>"
+        elif base is None or base <= 0:
+            width_pct = 0.0
+            num = f"{count:,}"
+        else:
+            width_pct = max(0.0, min(100.0, count / base * 100))
+            num = f"{count:,}"
+        prev_html = ""
+        if not compact:
+            prev_stage = prev_by_id.get(str(stage.get("id") or ""))
+            prev_val = _count(prev_stage) if prev_stage else None
+            prev_html = (
+                f"<span class='hfunnel-prev muted' title='上一个 {window_days} 天窗口的同阶段'>"
+                f"上期 {prev_val:,}</span>"
+                if prev_val is not None else
+                "<span class='hfunnel-prev muted' title='上一个窗口取不到'>上期 —</span>"
+            )
+        rows.append(
+            "<div class='hfunnel-stage'>"
+            f"<div class='hfunnel-label'>{label}</div>"
+            f"<div class='hfunnel-bar'><span style='width:{width_pct:.1f}%'></span></div>"
+            f"<div class='hfunnel-num'>{num}{prev_html}</div>"
+            "</div>"
+        )
+        prev_count = count
+    caption = (
+        f"<div class='hfunnel-caption muted'>近 {window_days} 个完整北京日注册 cohort"
+        "（同一批人逐级往下，单调）；W1 活跃证据来自可被裁剪/删号级联的 live 埋点，"
+        "计数为已知下限</div>"
+        if window_days else ""
+    )
+    return f"<div class='hfunnel'>{caption}{''.join(rows)}</div>"
+
+
+def _home_rel_time(epoch) -> str:
+    """epoch → 「3h前」相对时间；None/非数值 → —（未知≠刚刚）。"""
+    try:
+        e = float(epoch)
+    except (TypeError, ValueError):
+        return "—"
+    if e <= 0:
+        return "—"
+    delta = time.time() - e
+    if delta < 60:
+        return "刚刚"
+    return f"{_format_duration(int(delta))}前"
 
 
 # ---- Runtime 健康值班台 ----------------------------------------------------
@@ -3107,6 +3314,8 @@ def _render_runtime_user_report(user_report: dict | None) -> str:
 _NAV_GROUP_CSS = """
     .nav-group { display:inline-flex; flex-wrap:wrap; align-items:center; gap:8px; margin-right:6px; }
     .nav-group-label { color:var(--muted); font-size:11px; font-weight:700; letter-spacing:.06em; }
+    .viewbar-diag { margin-top:-8px; padding:8px 10px; border:1px dashed var(--line); border-radius:8px; }
+    .viewbar-diag .sort-button { min-height:34px; padding:5px 10px; font-size:12px; }
 """
 
 
@@ -3187,6 +3396,59 @@ _RUNTIME_PAGE_CSS = _NAV_GROUP_CSS + """
     @media (max-width:940px) { .ops-questions { grid-template-columns:1fr 1fr; } }
     @media (max-width:760px) { .health-strip,.ops-questions,.funnel-line { grid-template-columns:1fr; } }
 """
+
+
+# 首页/诊断枢纽/用户页新增组件（sparkline、水平漏斗、队列、事件流、脉搏卡、
+# 诊断卡）的共享样式。users 页的 <style> 是独立 f-string 且 :root 没定义
+# --bad，所以这里所有语义色都带字面量兜底——共享块必须在**每个**嵌它的页面
+# 里都渲染正确，而不是只在 _RUNTIME_PAGE_CSS 家族里正确。
+# 普通字符串（非 f-string）；嵌进 f-string 模板时作为值插入，花括号安全。
+_HOME_WIDGET_CSS = """
+    .h2-sub { color:var(--muted); font-size:12px; font-weight:400; margin-left:6px; }
+    .spark { display:inline-block; margin-left:8px; color:var(--muted); vertical-align:middle; }
+    .spark.good { color:var(--ok,#1d7a4d); }
+    .spark.bad { color:var(--bad,#b7352b); }
+    .spark svg { display:block; }
+    .spark-empty { color:var(--muted); font-size:12px; margin-left:8px; }
+    .hfunnel { background:var(--card); border:1px solid var(--line); border-radius:9px; padding:14px 16px; margin:10px 0 18px; }
+    .hfunnel-caption { font-size:12px; margin-bottom:10px; }
+    .hfunnel-stage { display:grid; grid-template-columns:150px minmax(0,1fr) minmax(90px,auto); gap:10px; align-items:center; }
+    .hfunnel-label { font-size:13px; }
+    .hfunnel-bar { height:14px; background:#eee3d9; border-radius:4px; overflow:hidden; }
+    .hfunnel-bar span { display:block; height:100%; background:var(--accent); }
+    .hfunnel-num { font-size:14px; font-weight:700; font-variant-numeric:tabular-nums; white-space:nowrap; text-align:right; }
+    .hfunnel-prev { font-weight:400; font-size:12px; margin-left:6px; }
+    .hfunnel-conv { margin:4px 0 4px 160px; color:var(--fg); font-size:12px; font-variant-numeric:tabular-nums; }
+    .verdict-line { margin:16px 0 6px; font-size:15px; }
+    .verdict-line b { font-size:22px; font-variant-numeric:tabular-nums; }
+    .queue-table td .pill { margin-right:6px; }
+    .queue-empty { padding:14px 16px; background:var(--card); border:1px solid var(--line); border-radius:9px; color:var(--ok,#1d7a4d); font-weight:650; margin:10px 0; }
+    .feed-list { list-style:none; margin:10px 0 18px; padding:0; background:var(--card); border:1px solid var(--line); border-radius:9px; overflow:hidden; }
+    .feed-list li { display:flex; flex-wrap:wrap; gap:8px; align-items:center; padding:9px 14px; border-bottom:1px solid var(--line); font-size:13px; }
+    .feed-list li:last-child { border-bottom:0; }
+    .feed-time { min-width:52px; color:var(--muted); font-variant-numeric:tabular-nums; }
+    .pulse-cards { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:10px; margin:10px 0 18px; }
+    .pulse-card { display:block; background:var(--card); border:1px solid var(--line); border-radius:9px; padding:15px; color:inherit; text-decoration:none; }
+    .pulse-card:hover { border-color:var(--accent); }
+    .pulse-value { font-size:26px; font-weight:780; font-variant-numeric:tabular-nums; }
+    .pulse-sub { margin-top:6px; color:var(--muted); font-size:12px; }
+    .diag-cards { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:10px; margin:16px 0; }
+    .diag-card { display:block; background:var(--card); border:1px solid var(--line); border-radius:9px; padding:15px; color:inherit; text-decoration:none; }
+    .diag-card:hover { border-color:var(--accent); }
+    .diag-card h3 { margin:0 0 6px; font-size:14px; }
+    .diag-card p { margin:0; color:var(--muted); font-size:12px; line-height:1.5; }
+    .diag-card .diag-when { color:var(--accent); font-weight:700; }
+    .cost-line { display:flex; flex-wrap:wrap; gap:18px; align-items:center; background:var(--card); border:1px solid var(--line); border-radius:9px; padding:14px 16px; margin:10px 0 18px; }
+    .cost-item { font-size:12px; color:var(--muted); }
+    .cost-item b { display:block; color:var(--fg); font-size:18px; font-variant-numeric:tabular-nums; }
+    @media (max-width:760px) {
+      .pulse-cards,.diag-cards { grid-template-columns:1fr; }
+      .hfunnel-stage { grid-template-columns:90px minmax(0,1fr) minmax(70px,auto); }
+      .hfunnel-conv { margin-left:100px; }
+    }
+"""
+
+_HOME_PAGE_CSS = _RUNTIME_PAGE_CSS + _HOME_WIDGET_CSS
 
 
 def _render_runtime_health_page(
@@ -3705,7 +3967,7 @@ def _ops_chat_level(report: dict | None) -> tuple[str, list[str]]:
     level = "warn"
     if settled == 0:
         level = "unknown"
-        reasons.append("窗口内没有已结算 chat 样本")
+        reasons.append("Hosted V2 chat 通道窗口内无已结算样本（V1/BYOK 聊天不经此通道，不代表没人聊天）")
     else:
         failure_rate = float(failed) / float(settled)
         if failure_rate >= 0.15:
@@ -3730,7 +3992,7 @@ def _ops_latency_level(report: dict | None) -> tuple[str, list[str]]:
         return "unknown", ["延迟统计暂不可用"]
     value = (report.get("latency") or {}).get("server_applied_p95_sec")
     if value is None:
-        return "unknown", ["缺少发送到服务端 reply applied 的 p95 样本"]
+        return "unknown", ["Hosted V2 通道缺少 reply applied 的 p95 样本（V1/BYOK 不经此通道）"]
     seconds = float(value)
     if seconds >= 120:
         return "bad", [f"服务端交付 p95 {seconds:.0f}s"]
@@ -3781,6 +4043,7 @@ def _render_ops_overview_page(
 
     started = int((imports or {}).get("started") or 0)
     completed = int((imports or {}).get("completed") or 0)
+    import_failed = int((imports or {}).get("failed") or 0)
     verified = int((imports or {}).get("artifact_verified") or 0)
     admitted = int(((chat or {}).get("outcomes") or {}).get("admitted") or 0)
     applied = int(((chat or {}).get("reply_delivery") or {}).get("final_applied_jobs") or 0)
@@ -3873,11 +4136,16 @@ def _render_ops_overview_page(
     # 大字标率、分数降级为小字：读者不用心算 41/69 是多少。分母为 0 时显
     # 「无样本」而不是 0%——0% 是测出来的坏消息，无样本是没消息。
     # 导入卡的样本门槛跟 _ops_import_level 用同一把尺：started == 0 才是
-    # 「无样本」；有 started 但 completed == 0（全部失败/卡住）是测出来的
-    # 0.0%，必须照实渲染成坏消息，不许显示成没消息。
+    # 「无样本」。
+    # 分母必须是**终态**（completed + failed）：失败的导入到不了 completed，
+    # 用 verified/completed 会让红卡顶着 90% 的大数字（prod 2026-08-07 实景：
+    # 9/10=90% 配 23.1% 终态失败率）——回答「导入成功了吗」的分母是所有
+    # 有结局的导入，不是所有善终的导入。
+    import_terminal = completed + import_failed
+    # started>0 且 terminal==0（全部还在跑/卡住）：率不可算，显「—」交给
+    # evidence 行的卡住理由说话——0.0% 是测出来的坏消息，这里还没有终态。
     import_rate = (
-        float(verified) / float(completed) if completed
-        else (0.0 if started else None)
+        float(verified) / float(import_terminal) if import_terminal else None
     )
     chat_rate = float(applied) / float(admitted) if admitted else None
     cards = "".join([
@@ -3885,10 +4153,13 @@ def _render_ops_overview_page(
             level=import_level,
             title="用户导入成功了吗？",
             view="imports",
-            value=_fmt_ratio(import_rate) if started else "无样本",
+            value=(
+                (_fmt_ratio(import_rate) if import_terminal else "—")
+                if started else "无样本"
+            ),
             fraction_html=(
-                f"{_fmt_count(verified)} / {_fmt_count(completed)}"
-                " · artifact 证据通过 / terminal completed"
+                f"{_fmt_count(verified)} / {_fmt_count(import_terminal)}"
+                " · artifact 证据通过 / 终态（completed+failed）"
             ),
             evidence_html=evidence(import_reasons),
         ),
@@ -5088,11 +5359,35 @@ def _render_usage_error_page(
 </main></body></html>"""
 
 
+# 诊断二级导航的 11 个遗留视图。顺序即渲染顺序；所有旧 URL 原样可用，
+# 这里只是把它们从一级导航挪进「诊断」抽屉。
+_DIAG_NAV_ITEMS = (
+    ("overview", "总览"),
+    ("imports", "记忆导入"),
+    ("chat", "聊天可靠性"),
+    ("latency", "延迟"),
+    ("dau", "日活与时长"),
+    ("growth", "增长 & 留存"),
+    ("proactive", "主动任务"),
+    ("events", "事件采集"),
+    ("runtime", "运行状态"),
+    ("usage", "Token 与模型"),
+    ("debug", "调试"),
+)
+_DIAG_NAV_VIEW_IDS = frozenset(view for view, _ in _DIAG_NAV_ITEMS)
+
+
 def _render_data_track_view_nav(
     active: str,
     usage_query: admin_usage.UsageQuery | None = None,
     usage_drilldown_user_id: str | None = None,
 ) -> str:
+    # 一级导航只留 4 个值班入口：首页 / 产品健康 / 用户 / 诊断。首页是新
+    # 默认视图（view 缺省即首页），所以 home 的链接不带 view 参数；users
+    # 从默认位退下来后必须显式携带 view=users。11 个遗留诊断视图只在当前
+    # 就处于诊断族（或诊断枢纽页）时展开成第二行，active 高亮不变。
+    in_diag = active == "diag" or active in _DIAG_NAV_VIEW_IDS
+
     def nav_item(view: str, label: str) -> str:
         cls = "sort-button active" if active == view else "sort-button"
         if view == "usage":
@@ -5106,7 +5401,7 @@ def _render_data_track_view_nav(
                 href = _usage_page_href(usage_query, offset=0)
         else:
             href = _data_track_page_href(
-                view=None if view == "users" else view,
+                view=None if view == "home" else view,
                 offset=0,
                 # A Usage drill-down's user_id belongs to its analytics cohort.
                 # Do not leak it into unrelated views where user_id has another
@@ -5121,9 +5416,9 @@ def _render_data_track_view_nav(
                     else None
                 ),
                 # The four operations views and Runtime share the rolling
-                # hours window.  Other pages have their own day/days contracts;
-                # carrying hours there only makes URLs look filtered when they
-                # are not.
+                # hours window.  Other pages (home/diag/health included) have
+                # their own contracts; carrying hours there only makes URLs
+                # look filtered when they are not.
                 hours=(
                     request.args.get("hours")
                     if view in {"overview", "imports", "chat", "latency", "runtime"}
@@ -5141,43 +5436,499 @@ def _render_data_track_view_nav(
             f"{current}>{html.escape(label)}</a>"
         )
 
-    def nav_group(label: str, items: str) -> str:
+    def diag_entry_item() -> str:
+        # 「诊断」入口在整个诊断族里都保持点亮（否则从二级行进入某个遗留
+        # 视图后一级导航看起来什么都没选中），aria-current 只给枢纽页本身。
+        cls = "sort-button active" if in_diag else "sort-button"
+        href = _data_track_page_href(
+            view="diag",
+            offset=0,
+            user_id=None if active == "usage" else request.args.get("user_id"),
+            runtime_state=None,
+            hours=None,
+            day=None,
+        )
+        current = " aria-current='page'" if active == "diag" else ""
         return (
-            "<span class='nav-group'>"
-            f"<span class='nav-group-label'>{html.escape(label)}</span>{items}"
-            "</span>"
+            f"<a class='{cls}' href='{html.escape(href, quote=True)}'"
+            f"{current}>诊断</a>"
         )
 
-    # 12 个平铺 tab 按值班意图分三簇；active 高亮逻辑在 nav_item 里，不受
-    # 分组影响，所有渲染此 nav 的视图行为一致。
-    return (
+    primary = (
         "<nav class='viewbar' aria-label='Data Track views'>"
-        + nav_group(
-            "质量",
-            nav_item("overview", "总览")
-            + nav_item("imports", "记忆导入")
-            + nav_item("chat", "聊天可靠性")
-            + nav_item("latency", "延迟"),
-        )
-        + nav_group(
-            "增长",
-            nav_item("users", "用户")
-            + nav_item("dau", "日活与时长")
-            + nav_item("growth", "增长 & 留存")
-            # health 是固定周口径页，故意不进 hours/day 参数携带集合——带上
-            # 只会让 URL 看起来被过滤而页面根本不消费。
-            + nav_item("health", "产品健康")
-            + nav_item("proactive", "主动任务"),
-        )
-        + nav_group(
-            "系统",
-            nav_item("events", "事件采集")
-            + nav_item("runtime", "运行状态")
-            + nav_item("usage", "Token 与模型")
-            + nav_item("debug", "调试"),
-        )
+        + nav_item("home", "首页")
+        # health 是固定周口径页，故意不进 hours/day 参数携带集合——带上
+        # 只会让 URL 看起来被过滤而页面根本不消费。
+        + nav_item("health", "产品健康")
+        + nav_item("users", "用户")
+        + diag_entry_item()
         + "</nav>"
     )
+    if not in_diag:
+        return primary
+    second = (
+        "<nav class='viewbar viewbar-diag' aria-label='诊断视图'>"
+        "<span class='nav-group-label'>诊断视图</span>"
+        + "".join(nav_item(view, label) for view, label in _DIAG_NAV_ITEMS)
+        + "</nav>"
+    )
+    return primary + second
+
+
+# 队列原因 → (pill 档位, 兜底文案)。stalled_no_reply 是「用户在等我们」，
+# 直接 bad；其余是「流程卡住」级别的 warn。offline 在 v1 结构性缺席（见
+# _render_home_page 的说明框），保留只为 db 契约里的 reason_code 全集。
+_HOME_QUEUE_REASON_META = {
+    "stalled_no_reply": ("bad", "等回复没等到"),
+    "onboarding_stuck": ("warn", "onboarding 卡住"),
+    "model_config_pending": ("warn", "模型配置待处理"),
+    "offline": ("warn", "疑似掉线"),
+}
+
+_HOME_FEED_KIND_META = {
+    "registration": ("注册", "ok"),
+    "first_reply": ("首次真回复", "ok"),
+    "import_failed": ("导入失败", "bad"),
+}
+
+
+def _home_status_card(
+    title: str,
+    verdict: dict | None,
+    href: str,
+    drill: str,
+    *,
+    card_id: str = "",
+    max_reasons: int = 3,
+) -> str:
+    """首页状态灯（复用 question-card 视觉与 pill 档位，含灰 unknown）。"""
+    level = str((verdict or {}).get("level") or "unknown").strip().lower()
+    if level not in ("ok", "warn", "bad", "unknown"):
+        level = "unknown"
+    reasons = [str(r) for r in ((verdict or {}).get("reasons") or []) if str(r).strip()]
+    if verdict is None:
+        level = "unknown"
+        reasons = ["统计暂不可用"]
+    if not reasons:
+        reasons = ["窗口内未见异常"] if level == "ok" else ["（无原因说明）"]
+    evidence = "<br>".join(html.escape(r) for r in reasons[:max_reasons])
+    if len(reasons) > max_reasons:
+        evidence += f"<br><span class='muted'>…共 {len(reasons)} 条</span>"
+    id_attr = f" id='{html.escape(card_id, quote=True)}'" if card_id else ""
+    return (
+        f"<article class='question-card {level}'{id_attr}>"
+        f"<a class='question-link' href='{html.escape(href, quote=True)}'>"
+        f"<div class='question-top'><h3 class='question-title'>{html.escape(title)}</h3>"
+        f"{_ops_status(level)}</div>"
+        f"<div class='question-evidence'>{evidence}</div>"
+        f"<div class='question-drill'>{html.escape(drill)}</div>"
+        "</a></article>"
+    )
+
+
+def _home_queue_section(queue: dict | None) -> str:
+    # 用户详情链接沿用 users 页的 qs 透传模式（admin_key 等跟着走）；view
+    # 参数属于当前页，不带进详情页。
+    qs = _data_track_qs(view=None)
+    qs_suffix = f"?{qs}" if qs else ""
+    offline_note = (
+        "<div class='note-box'><b>掉线检测未接入：</b>resident 轮询在线状态只存在于"
+        "进程内存 registry、不落库，本队列查不到，所以「疑似掉线」这一类 v1 先空缺"
+        "——列表里没有掉线项<b>不等于</b>没人掉线。单个用户的连接状态看"
+        "「用户」页的连接列。</div>"
+    )
+    if queue is None:
+        return (
+            "<div class='note-box'><b>队列暂不可用。</b>查询失败按未知处理，"
+            "不会渲染成「没有人卡住」。</div>" + offline_note
+        )
+    rows = [r for r in (queue.get("rows") or []) if isinstance(r, dict)]
+    if not rows:
+        return (
+            "<div class='queue-empty'>没有人卡住。</div>" + offline_note
+        )
+    now = time.time()
+
+    def queue_tr(row: dict) -> str:
+        user_id = str(row.get("user_id") or "")
+        reason_code = str(row.get("reason_code") or "")
+        pill_cls, fallback_label = _HOME_QUEUE_REASON_META.get(
+            reason_code, ("warn", reason_code or "未知原因")
+        )
+        reason_text = str(row.get("reason_text") or "").strip() or fallback_label
+        since_epoch = row.get("since_epoch")
+        try:
+            stuck_for = (
+                _format_duration(int(now - float(since_epoch)))
+                if since_epoch is not None and float(since_epoch) > 0
+                else "—"
+            )
+        except (TypeError, ValueError):
+            stuck_for = "—"
+        detail = str(row.get("detail") or "")
+        # safe=''：user_id 里万一混进 '/'，默认 safe='/' 会让它逃出
+        # /users/<id> 路径段——与 imports 页同一硬化（见 _render_import 链接）。
+        user_url = f"/admin/data-track/users/{quote(user_id, safe='')}{qs_suffix}"
+        return (
+            "<tr>"
+            f"<td><a href='{html.escape(user_url, quote=True)}'>{html.escape(user_id)}</a></td>"
+            f"<td><span class='pill {pill_cls}'>{html.escape(reason_text)}</span></td>"
+            f"<td>{html.escape(stuck_for)}</td>"
+            f"<td class='muted'>{html.escape(detail)}</td>"
+            "</tr>"
+        )
+
+    # 同因折叠：一个注册波卡在同一步会把队列刷屏（prod 首日 8+ 条同款
+    # 「13d · t1 未达」把更急的 stalled 挤下屏）。每个原因先露前 3 条，
+    # 其余收进可展开行——工单的价值在多样性，不在同因复读。
+    by_reason: dict[str, list[dict]] = {}
+    for row in rows:
+        by_reason.setdefault(str(row.get("reason_code") or ""), []).append(row)
+    body_rows: list[str] = []
+    for reason_code, reason_rows in by_reason.items():
+        for row in reason_rows[:3]:
+            body_rows.append(queue_tr(row))
+        rest = reason_rows[3:]
+        if rest:
+            _, fallback_label = _HOME_QUEUE_REASON_META.get(
+                reason_code, ("warn", reason_code or "未知原因")
+            )
+            label = (
+                str(rest[0].get("reason_text") or "").strip() or fallback_label
+            )
+            inner = "".join(queue_tr(row) for row in rest)
+            body_rows.append(
+                "<tr class='queue-more'><td colspan='4'>"
+                f"<details><summary>还有 {len(rest)} 个「{html.escape(label)}」用户</summary>"
+                f"<table class='queue-table'><tbody>{inner}</tbody></table>"
+                "</details></td></tr>"
+            )
+    truncated_note = (
+        "<div class='muted'>只显示最严重 / 最早的前 20 条。</div>"
+        if queue.get("truncated") else ""
+    )
+    return (
+        "<div class='table-wrap'><table class='queue-table'>"
+        "<thead><tr><th>用户</th><th>原因</th><th>卡了多久</th><th>细节</th></tr></thead>"
+        f"<tbody>{''.join(body_rows)}</tbody></table></div>"
+        + truncated_note + offline_note
+    )
+
+
+def _home_pulse_section(pulse: dict | None) -> str:
+    if pulse is None:
+        return (
+            "<div class='note-box'><b>产品脉搏暂不可用。</b>页面不会把未知渲染成 0；"
+            "完整口径看「产品健康」页。</div>"
+        )
+    health_href = html.escape(_data_track_page_href(view="health"), quote=True)
+    daily = [d for d in (pulse.get("daily_actives") or []) if isinstance(d, dict)]
+    dau_values = [d.get("dau") for d in daily]
+    wau = pulse.get("wau")
+    prev_wau = pulse.get("prev_wau")
+    latest_day = daily[-1] if daily else {}
+    wau_sub = (
+        f"最新完整日 {html.escape(str(latest_day.get('day') or ''))} · DAU {_fmt_count(latest_day.get('dau'))}"
+        if daily else "暂无完整日样本"
+    )
+    w4 = pulse.get("latest_mature_w4")
+    if isinstance(w4, dict):
+        # db 契约里 pct 已是 0–100 百分数（retention 快照口径），不是 0–1
+        # 比率——不能过 _fmt_ratio 再乘一次 100。
+        try:
+            w4_value = f"{float(w4.get('pct')):.1f}%"
+        except (TypeError, ValueError):
+            w4_value = "—"
+        w4_sub = (
+            f"注册周 {html.escape(str(w4.get('cohort_week') or ''))}"
+            f" · n={_fmt_count(w4.get('n'))}"
+        )
+    else:
+        w4_value = "—"
+        w4_sub = "暂无已成熟的注册周 cohort"
+    activation = [
+        c for c in (pulse.get("activation_recent") or []) if isinstance(c, dict)
+    ]
+    # activation_recent[0] 永远是进行中的北京周（health builder 的 k=0）：
+    # 周二看它 t3_rate 会因右删失塌向 0%，再随周走完「恢复」——进行中的周
+    # 不渲染成定局（与 db 侧 growth 判定剔除 this_monday 同一把尺），头条
+    # 只取已完整的周，折线上进行中的周留成缺口。
+    this_monday = _health_bj_this_monday()
+    act_headline = next(
+        (c for c in activation
+         if str(c.get("cohort_week")) != this_monday
+         and c.get("t3_rate") is not None),
+        None,
+    )
+    if act_headline is not None:
+        act_value = _fmt_ratio(act_headline.get("t3_rate"))
+        act_sub = (
+            f"注册周 {html.escape(str(act_headline.get('cohort_week') or ''))}"
+            f" · n={_fmt_count(act_headline.get('n'))}"
+        )
+    else:
+        act_value = "—"
+        act_sub = "暂无可判的完整注册周 cohort（右删失显 —，不当 0）"
+    act_spark_values = [
+        None if str(c.get("cohort_week")) == this_monday else c.get("t3_rate")
+        for c in reversed(activation)
+    ]
+
+    def card(value_html: str, spark_html: str, delta_html: str, label: str, hint: str, sub: str) -> str:
+        hint_html = f"<span class='hint' title='{html.escape(hint, quote=True)}'>?</span>"
+        return (
+            f"<a class='pulse-card' href='{health_href}'>"
+            f"<div><span class='pulse-value'>{value_html}</span>{delta_html}{spark_html}</div>"
+            f"<div class='metric-label'>{html.escape(label)}{hint_html}</div>"
+            f"<div class='pulse-sub'>{sub}</div>"
+            "</a>"
+        )
+
+    cards = "".join([
+        card(
+            _fmt_count(wau),
+            _spark(dau_values, good_when="up"),
+            _render_delta(wau, prev_wau),
+            "7日活跃真人",
+            "近 7 个已完整北京自然日的去重活跃账号（与 DAU 页同源）；环比对上一个 7 完整日窗口；折线是逐日 DAU",
+            wau_sub,
+        ),
+        card(
+            w4_value,
+            "",
+            "",
+            "最新成熟 W4",
+            "最新一个已满 4 周的注册周 cohort 第 4 周仍活跃占比（留存快照口径）；没有成熟 cohort 时显 —，不当 0",
+            w4_sub,
+        ),
+        card(
+            act_value,
+            _spark(act_spark_values, good_when="up"),
+            "",
+            "激活率（t3）",
+            "最新已完整注册周 cohort 中注册后产生首条非 fallback 真回复（t3，不限天数）的比例；进行中的周右删失不当定局；覆盖不完整的周是缺口不是 0；折线为近 4 个 cohort（进行中的周留空）",
+            act_sub,
+        ),
+    ])
+    return f"<div class='pulse-cards'>{cards}</div>"
+
+
+def _home_feed_section(feed: dict | None) -> str:
+    qs = _data_track_qs(view=None)
+    qs_suffix = f"?{qs}" if qs else ""
+    if feed is None:
+        return "<div class='note-box'><b>事件流暂不可用。</b>查询失败按未知处理。</div>"
+    events = [e for e in (feed.get("events") or []) if isinstance(e, dict)]
+    if not events:
+        return "<div class='muted'>过去 48 小时没有注册 / 首次真回复 / 导入失败事件。</div>"
+    items: list[str] = []
+    for ev in events:
+        kind = str(ev.get("kind") or "")
+        label, pill_cls = _HOME_FEED_KIND_META.get(kind, (kind or "事件", "warn"))
+        user_id = str(ev.get("user_id") or "")
+        user_url = f"/admin/data-track/users/{quote(user_id, safe='')}{qs_suffix}"
+        text = str(ev.get("text") or "")
+        items.append(
+            "<li>"
+            f"<span class='feed-time'>{html.escape(_home_rel_time(ev.get('epoch')))}</span>"
+            f"<span class='pill {pill_cls}'>{html.escape(label)}</span>"
+            f"<a href='{html.escape(user_url, quote=True)}'>{html.escape(user_id)}</a>"
+            f"<span class='muted'>{html.escape(text)}</span>"
+            "</li>"
+        )
+    return f"<ul class='feed-list'>{''.join(items)}</ul>"
+
+
+def _home_cost_section(cost: dict | None) -> str:
+    usage_href = html.escape(_usage_page_href(), quote=True)
+    if cost is None:
+        return (
+            "<div class='note-box'><b>成本统计暂不可用。</b>Token 明细看"
+            f" <a href='{usage_href}'>Token 与模型</a>。</div>"
+        )
+    daily = [d for d in (cost.get("daily_tokens") or []) if isinstance(d, dict)]
+    token_values = [d.get("tokens") for d in daily]
+    runaway = cost.get("runaway")
+    if runaway is True:
+        runaway_html = "<span class='pill bad'>放量异常</span>"
+    elif runaway is False:
+        runaway_html = "<span class='pill ok'>未见放量</span>"
+    else:
+        runaway_html = "<span class='pill unknown'>样本不足，判不了</span>"
+    coverage = cost.get("coverage")
+    coverage_note = ""
+    try:
+        if coverage is not None and float(coverage) < 0.8:
+            coverage_note = (
+                "<span class='muted'>usage 缺报较多，以上都是已知下限，不是全量。</span>"
+            )
+    except (TypeError, ValueError):
+        pass
+    per_active = cost.get("per_active_user_day")
+    try:
+        # OverflowError：round(float('inf')) 会炸——契约上游今天只产有限值，
+        # 但本渲染面的承诺是任何一格坏都只降级成 —，绝不带崩整页（首页是
+        # 裸 URL 默认页）。
+        per_active_f = float(per_active)
+        if not math.isfinite(per_active_f):
+            raise ValueError("non-finite per_active_user_day")
+        per_active_value = _fmt_tokens_compact(round(per_active_f))
+    except (TypeError, ValueError, OverflowError):
+        per_active_value = "—"
+    hint = (
+        "<span class='hint' title='v2_turn_metrics 近 8 个北京日；tokens 为 provider 已上报"
+        " usage 的合计，缺报显 —（绝不伪装成 0）；放量判定=最新完整日 > 3×前 6 个完整日中位数，"
+        "样本不足显「判不了」'>?</span>"
+    )
+    return (
+        "<div class='cost-line'>"
+        f"<div class='cost-item'>近 7 日 token 走势{hint}{_spark(token_values, good_when='neutral')}</div>"
+        f"<div class='cost-item'>今日已用（进行中）<b>{_fmt_tokens_compact(cost.get('today_so_far'))}</b></div>"
+        f"<div class='cost-item'>每活跃用户日<b>{per_active_value}</b></div>"
+        f"<div class='cost-item'>放量判定<b>{runaway_html}</b></div>"
+        f"<div class='cost-item'>usage 覆盖率<b>{_fmt_ratio(coverage)}</b></div>"
+        f"<div class='cost-item'><a href='{usage_href}'>去 Token 与模型 →</a></div>"
+        "</div>"
+        + coverage_note
+    )
+
+
+def _render_home_page(
+    system_verdict: dict | None,
+    soft_verdicts: dict | None,
+    queue: dict | None,
+    pulse: dict | None,
+    feed: dict | None,
+    cost: dict | None,
+    funnel: dict | None,
+) -> str:
+    """值班首页（新的默认视图）。七个入参各自独立失败：None → 对应板块
+    渲染「暂不可用」，绝不 or 0、绝不装健康。system_verdict 由 admin_core
+    用 _ops_import_level/_ops_chat_level/_ops_latency_level 合成后传入
+    （db 层不 import 本模块，依赖方向不倒挂）；soft_verdicts 是 db 侧
+    admin_home_soft_verdicts 的 growth/cost/evidence 三灯。"""
+    soft = soft_verdicts if isinstance(soft_verdicts, dict) else None
+    growth_verdict = (soft or {}).get("growth") if soft else None
+    cost_verdict = (soft or {}).get("cost") if soft else None
+    evidence_verdict = (soft or {}).get("evidence") if soft else None
+    status_cards = "".join([
+        _home_status_card(
+            "系统",
+            system_verdict,
+            _data_track_page_href(view="overview"),
+            "去运营总览 →",
+        ),
+        _home_status_card(
+            "增长",
+            growth_verdict,
+            _data_track_page_href(view="health"),
+            "去产品健康 →",
+        ),
+        _home_status_card(
+            "成本",
+            cost_verdict,
+            _usage_page_href(),
+            "去 Token 与模型 →",
+        ),
+        # 数据完整性灯的「链接」就是它自己的原因清单：缺口是长期结构性
+        # 事实（灰，不会绿），没有更深的钻取页可去。
+        _home_status_card(
+            "数据完整性",
+            evidence_verdict,
+            "#evidence-reasons",
+            "缺口清单（长期）",
+            card_id="evidence-reasons",
+            max_reasons=6,
+        ),
+    ])
+    users_href = html.escape(
+        _data_track_page_href(view="users", offset=0), quote=True
+    )
+    definitions = (
+        "<details class='note-box'><summary>口径说明（本页全部数字）</summary>"
+        "<b>状态灯：</b>系统=运营总览的导入/聊天/延迟三灯取最差档（24h 窗）；增长/成本/数据完整性来自"
+        " DB 侧软判定。灰=没证据、黄=测得需关注或证据结构性不闭环、红=测得已坏、绿=证据闭环且健康——"
+        "数据完整性在客户端已读 ACK 与 session 来源埋点补齐前恒为灰。"
+        "<b>队列：</b>等回复没等到=近 72h 内用户末条消息（剔除 verify_ping/resident_maintenance）之后无"
+        "真回复（fallback 与定时主动消息都不算「对用户的回复」）、且已超 30 分钟；"
+        "onboarding 卡住=近 14 天注册、t0 后 24h 仍无 t3（t3 沿用漏斗口径，主动消息可点亮）；"
+        "模型配置待处理=model_api 测试状态非 ok；同一用户取最重原因去重，最多 20 条。"
+        "<b>脉搏：</b>7 日活跃与逐日折线取已完整北京自然日（与 DAU 页同源）；W4 来自留存快照；"
+        "激活率取最新可判注册周 cohort，右删失显 — 不当 0。"
+        "<b>漏斗：</b>近 28 个完整北京日注册 cohort 的单调里程碑，W1 需个人窗口走完才计；"
+        "W1 活跃证据取自会被裁剪（per-user 上限 2000 条）与删号级联的 live 埋点流，是已知下限。"
+        "<b>事件流：</b>近 48h 的注册 / 首次真回复 / 导入失败，服务端视角。"
+        "<b>成本：</b>v2_turn_metrics 近 8 个北京日已知下限；缺报显 —；放量=最新完整日 > 3×前 6 完整日"
+        "中位数；进行中的今天单独标注、不参与判定。"
+        "</details>"
+    )
+    return f"""<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>首页 · Feedling Data Track</title>
+<style>{_HOME_PAGE_CSS}</style></head><body><main>
+  <span class="ops-kicker">Operations / metadata only</span>
+  <h1>Feedling 值班首页</h1>
+  <div class="muted">先看四个灯，再看谁卡住；每块都能点进对应诊断页。生成于 {html.escape(_bj_iso(time.time()))}（北京时间）。</div>
+  {_render_data_track_view_nav("home")}
+  <section class="ops-questions">{status_cards}</section>
+  <h2>需要你的用户</h2>
+  {_home_queue_section(queue)}
+  <h2>产品脉搏 <span class="h2-sub">点卡片进「产品健康」</span></h2>
+  {_home_pulse_section(pulse)}
+  <h2>激活漏斗 <span class="h2-sub"><a href='{users_href}'>去「用户」页看上一窗口对照 →</a></span></h2>
+  {_render_funnel(funnel, compact=True)}
+  <h2>今天发生了什么 <span class="h2-sub">近 48 小时</span></h2>
+  {_home_feed_section(feed)}
+  <h2>成本一行</h2>
+  {_home_cost_section(cost)}
+  {definitions}
+</main></body></html>"""
+
+
+# 诊断枢纽（?view=diag）：11 张卡各配一行「何时来看」。文案是分诊指南
+# 而不是功能清单——值班员该凭症状选门诊。
+_DIAG_HUB_CARDS = (
+    ("overview", "总览", "值班第一眼：导入 / 聊天 / 延迟三个红绿灯加产品 KPI 环比，判断今天要不要深挖。"),
+    ("imports", "记忆导入", "用户说「导入没反应 / 卡住了」：看终态成功率、artifact 证据链和卡住任务。"),
+    ("chat", "聊天可靠性", "用户说「发了没回」：查 admitted → final reply 服务端 applied 的交付链断在哪。"),
+    ("latency", "延迟", "用户说「回得慢」：排队 / 模型处理 / 整轮 / 服务端交付四段 p95、p99 定位瓶颈。"),
+    ("dau", "日活与时长", "想看北京自然日 DAU 与前台使用时长的逐日趋势与冻结快照。"),
+    ("growth", "增长 & 留存", "看周注册、留存热力图与增长核算总账（流失 / 回流 / 净变化）。"),
+    ("proactive", "主动任务", "主动消息发没发出去：wake 成功率、各 lane 失败原因、超速用户。"),
+    ("events", "事件采集", "怀疑客户端埋点断流：各事件类别的量级、成功率与当日走势。"),
+    ("runtime", "运行状态", "Runtime V2 值班台：worker 池、lane 失败率、交付积压与用户交付可靠性。"),
+    ("usage", "Token 与模型", "谁在烧 token：provider / model 拆分、重试率与缓存命中，成本异常先来这。"),
+    ("debug", "调试", "单用户单轮 trace 级排查（含 reveal 明文开关），其他页都定位不了时的最后一站。"),
+)
+
+
+def _render_diag_hub_page() -> str:
+    """诊断枢纽页。11 个遗留视图的 URL 原样不变，这里只是导航壳。"""
+    cards: list[str] = []
+    for view, label, when in _DIAG_HUB_CARDS:
+        href = (
+            _usage_page_href()
+            if view == "usage"
+            else _data_track_page_href(view=view, offset=0)
+        )
+        cards.append(
+            f"<a class='diag-card' href='{html.escape(href, quote=True)}'>"
+            f"<h3>{html.escape(label)}</h3>"
+            f"<p><span class='diag-when'>何时来看：</span>{html.escape(when)}</p>"
+            "</a>"
+        )
+    return f"""<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>诊断 · Feedling Data Track</title>
+<style>{_HOME_PAGE_CSS}</style></head><body><main>
+  <span class="ops-kicker">Operations / metadata only</span>
+  <h1>诊断</h1>
+  <div class="muted">按症状选门诊；11 个诊断视图的旧链接全部原样可用。</div>
+  {_render_data_track_view_nav("diag")}
+  <div class="diag-cards">{''.join(cards)}</div>
+</main></body></html>"""
 
 
 def _memory_source_split(by_source: dict) -> tuple[int, int]:
@@ -5197,7 +5948,9 @@ def _memory_source_split(by_source: dict) -> tuple[int, int]:
     return onb, live
 
 
-def _render_data_track_page(payload: dict) -> str:
+def _render_data_track_page(payload: dict, funnel: dict | None = None) -> str:
+    # funnel = db.admin_funnel_snapshot 的产物（admin_core 扇出后传入）；
+    # 未传 / builder 失败 → None → _render_funnel 渲染「暂不可用」。
     summary = payload["summary"]
     users = payload.get("users", [])
     pagination = payload.get("pagination", {})
@@ -5210,7 +5963,8 @@ def _render_data_track_page(payload: dict) -> str:
     def sort_button(metric: str, direction: str, label: str) -> str:
         active = current_sort == metric and current_dir == direction
         cls = "sort-button active" if active else "sort-button"
-        href = _data_track_page_href(sort=metric, dir=direction, offset=0, view=None)
+        # users 不再是默认视图（view 缺省=首页），本页自链必须显式 view=users。
+        href = _data_track_page_href(sort=metric, dir=direction, offset=0, view="users")
         return f"<a class='{cls}' href='{html.escape(href, quote=True)}'>{html.escape(label)}</a>"
 
     sort_controls = "".join([
@@ -5227,9 +5981,9 @@ def _render_data_track_page(payload: dict) -> str:
         prev_offset = pagination.get("prev_offset")
         next_offset = pagination.get("next_offset")
         if prev_offset is not None:
-            pager_links.append(f"<a class='sort-button' href='{html.escape(_data_track_page_href(offset=prev_offset, view=None), quote=True)}'>Prev</a>")
+            pager_links.append(f"<a class='sort-button' href='{html.escape(_data_track_page_href(offset=prev_offset, view='users'), quote=True)}'>Prev</a>")
         if next_offset is not None:
-            pager_links.append(f"<a class='sort-button' href='{html.escape(_data_track_page_href(offset=next_offset, view=None), quote=True)}'>Next</a>")
+            pager_links.append(f"<a class='sort-button' href='{html.escape(_data_track_page_href(offset=next_offset, view='users'), quote=True)}'>Next</a>")
         if pager_links:
             pager = f"<div class='pager'>{''.join(pager_links)}</div>"
     rows_html = []
@@ -5318,8 +6072,25 @@ def _render_data_track_page(payload: dict) -> str:
             summary.get("provider_needs_user_action", 0),
         ),
     ])
-    # Ground-truth activation funnel (behaviour-based, not stage-label-based).
-    funnel_steps = [
+    # 头屏判决句：三个数都来自本 payload。「在队列」这里只能用 payload 已有
+    # 的近似口径（掉线 + 有去无回 + 模型配置待处理）；首页队列是逐用户按消息
+    # 表判定的独立 builder，两者近似但非同源，hint 里说清楚。
+    queue_ish = off + stalled + int(summary.get("provider_needs_user_action") or 0)
+    verdict_line = (
+        "<div class='verdict-line'>"
+        f"<b>{activated}</b> 个激活真人用户 · "
+        f"<b>{int(summary.get('human_active_1d') or 0)}</b> 个近1日发过消息 · "
+        f"<b>{queue_ish}</b> 个在队列"
+        "<span class='hint' title='激活=写过记忆或发过消息的账号行；近1日发过消息=滚动 24h 内有真人消息（比「日活与时长」页的 打开过App DAU 严格，两者不同尺，无需对上）；"
+        "在队列=连接掉线+有去无回+模型配置待处理（与首页「需要你的用户」口径近似但非同源，"
+        "首页按消息表逐用户判定）'>?</span>"
+        "</div>"
+    )
+    # 旧「Activation funnel」六格条形图退役：各分母互不包含（有记忆⊅发过
+    # 消息），画成漏斗视觉上暗示单调递减，实际可以反超。真正的单调漏斗由
+    # admin_funnel_snapshot（同一 28 天注册 cohort 的里程碑子集）供给，用
+    # _render_funnel 渲染；这些独立占比仍有用，收进下方「人群与账号行记账」。
+    behavior_steps = [
         ("registered", "注册行（含重装孤儿·非人数）"),
         ("has_memory", "有记忆"),
         ("sent_first_message", "发过消息"),
@@ -5327,15 +6098,21 @@ def _render_data_track_page(payload: dict) -> str:
         ("active_3d", "近3天活跃"),
         ("active_1d", "近1天活跃"),
     ]
-    funnel_html = "".join(
-        f"<div class='fn-step'><div class='fn-num'>{int(fn.get(k) or 0)}</div>"
-        f"<div class='fn-bar'><span style='width:{(int(fn.get(k) or 0)/reg)*100:.0f}%'></span></div>"
-        f"<div class='fn-label'>{html.escape(label)} · {_pct(fn.get(k))}</div></div>"
-        for k, label in funnel_steps
+    behavior_lines = "".join(
+        f"<div>{html.escape(label)}：{int(fn.get(k) or 0)} · {_pct(fn.get(k))}</div>"
+        for k, label in behavior_steps
     )
-    funnel_section = (
-        "<h2>Activation funnel（真实使用漏斗 · 基于行为,不看 stage 标签）</h2>"
-        f"<section class='funnel'>{funnel_html}</section>"
+    accounting_details = (
+        "<details class='note-box'><summary>人群与账号行记账（全部口径数字）</summary>"
+        "<b>怎么读这些数：</b>"
+        "「<b>激活用户</b>」= 写过记忆或发过消息的人，<b>最接近真实用户数</b>。"
+        "「<b>累计注册行</b>」= 装过 app、生成过密钥的账户行累计；同一个人重装 / 换机 / 抹机后"
+        " app 会静默注册一个新号、旧号变孤儿不删，所以它<b>不是人数</b>、会远大于发出的邀请/邮件数。"
+        "删除账户是硬删（行直接消失），因此没有、也无法有「已删除账户数」这个指标。"
+        f"<section class='metrics'>{metrics}</section>"
+        "<b>行为口径独立占比</b>（各项分母=注册行；口径互不包含，<b>不构成漏斗</b>，数字可以不单调）："
+        f"{behavior_lines}"
+        "</details>"
     )
     runtime_filter_links = []
     selected_runtime_state = str(filters.get("runtime_state") or "")
@@ -5347,7 +6124,7 @@ def _render_data_track_page(payload: dict) -> str:
     ):
         cls = "sort-button active" if selected_runtime_state == state else "sort-button"
         href = _data_track_page_href(
-            view=None, runtime_state=state or None, offset=0
+            view="users", runtime_state=state or None, offset=0
         )
         runtime_filter_links.append(
             f"<a class='{cls}' href='{html.escape(href, quote=True)}'>{html.escape(label)}</a>"
@@ -5396,12 +6173,6 @@ def _render_data_track_page(payload: dict) -> str:
     .metric {{ background:var(--card); border:1px solid var(--line); border-radius:8px; padding:14px; }}
     .metric-value {{ font-size:24px; font-weight:700; }}
     .metric-label {{ color:var(--muted); font-size:12px; text-transform:uppercase; letter-spacing:.08em; }}
-    .funnel {{ display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:10px; margin:8px 0 22px; }}
-    .fn-step {{ background:var(--card); border:1px solid var(--line); border-radius:8px; padding:12px; }}
-    .fn-num {{ font-size:22px; font-weight:700; }}
-    .fn-bar {{ height:6px; background:#eee3d9; border-radius:4px; margin:6px 0; overflow:hidden; }}
-    .fn-bar span {{ display:block; height:100%; background:var(--accent); }}
-    .fn-label {{ color:var(--muted); font-size:12px; }}
     .note-box {{ background:#fff8ef; border:1px solid #e8d8be; border-radius:8px; padding:12px 14px; margin:16px 0 4px; font-size:13px; line-height:1.6; color:#5a4d3c; }}
 	    .toolbar {{ display:flex; gap:10px; align-items:center; margin:18px 0; }}
 	    .viewbar,.sortbar,.pager {{ display:flex; flex-wrap:wrap; gap:8px; align-items:center; margin:10px 0 18px; }}
@@ -5419,7 +6190,11 @@ def _render_data_track_page(payload: dict) -> str:
     .pill.warn {{ color:var(--warn); background:#fff1db; }}
     pre {{ white-space:pre-wrap; word-break:break-word; background:var(--card); border:1px solid var(--line); border-radius:8px; padding:14px; }}
     .table-wrap {{ max-width:100%; overflow-x:auto; }}
+    .hint {{ display:inline-block; margin-left:5px; width:14px; height:14px; line-height:14px; text-align:center; border:1px solid var(--line); border-radius:999px; background:var(--card); color:var(--muted); font-size:10px; text-transform:none; letter-spacing:0; cursor:help; vertical-align:3px; }}
+    details.note-box summary {{ cursor:pointer; font-weight:700; color:#7a6a52; }}
+    details.note-box[open] summary {{ margin-bottom:8px; }}
 {_NAV_GROUP_CSS}
+{_HOME_WIDGET_CSS}
   </style>
 </head>
 <body>
@@ -5427,21 +6202,17 @@ def _render_data_track_page(payload: dict) -> str:
 	  <h1>Feedling Beta Data Track</h1>
 	  <div class="muted">Generated {html.escape(_bj_iso(summary["generated_at"]))}. Metadata only; encrypted content is not read or rendered.</div>
 	  <div class="muted">Showing {html.escape(str(pagination.get("returned", len(users))))} of {html.escape(str(pagination.get("total", summary["users_total"])))} filtered users. Since {html.escape(str(filters.get("since") or "all time"))}.</div>
-	  <div class="note-box">
-	    <b>怎么读这些数：</b>
-	    「<b>激活用户</b>」= 写过记忆或发过消息的人，<b>最接近真实用户数</b>。
-	    「<b>累计注册行</b>」= 装过 app、生成过密钥的账户行累计；同一个人重装 / 换机 / 抹机后
-	    app 会静默注册一个新号、旧号变孤儿不删，所以它<b>不是人数</b>、会远大于发出的邀请/邮件数。
-	    删除账户是硬删（行直接消失），因此没有、也无法有「已删除账户数」这个指标。
-	  </div>
 	  {_render_data_track_view_nav("users")}
-		  <section class="metrics">{metrics}</section>
+	  {verdict_line}
+	  <h2>激活漏斗 <span class="h2-sub">近 28 完整日注册 cohort · 含上一窗口对照</span></h2>
+	  {_render_funnel(funnel, compact=False)}
+	  {accounting_details}
 		  {runtime_population_section}
-		  {funnel_section}
 		  {app_usage_section}
 	  <h2>Beta users</h2>
 	  <form class="toolbar" method="get" action="/admin/data-track/users">
 	    <input name="admin_key" type="hidden" value="{html.escape(request.args.get('admin_key', ''), quote=True)}">
+	    <input name="view" type="hidden" value="users">
 	    <input name="uid" placeholder="输入 UID 直查（usr_…）" autocomplete="off">
 	    <button type="submit">打开用户详情</button>
 	  </form>
@@ -6308,7 +7079,7 @@ def _render_product_health_page(
     )
     section1_tiles = "".join([
         _render_metric(
-            "WAU（近 7 完整日）", _fmt_count(stick.get("wau")),
+            "WAU·打开过 App（近 7 完整日）", _fmt_count(stick.get("wau")),
             hint="近 7 个已完整北京自然日内至少上报一次 app_session_end 的去重账号；前台被杀会漏报，是保守下限",
         ),
         _render_metric(
@@ -7677,7 +8448,9 @@ def _render_user_daily_usage(user: dict) -> str:
 
 
 def _render_invalid_data_track_user_page(raw_user_id: str) -> str:
-    back_qs = _data_track_qs(uid=None)
+    # 强制 view=users：UID 直查表单长在用户页，默认视图切成首页后，裸
+    # qs 的返回链接会把人丢回首页、弄丢表单——回用户页永远是对的去处。
+    back_qs = _data_track_qs(uid=None, view="users")
     back = f"/admin/data-track?{back_qs}" if back_qs else "/admin/data-track"
     supplied = str(raw_user_id or "").strip()
     return f"""<!doctype html>

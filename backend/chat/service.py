@@ -426,6 +426,8 @@ def _float_meta(value, default: float = 0.0) -> float:
 def _chat_message_claimable(msg: dict, consumer_id: str, now: float) -> bool:
     if msg.get("role") != "user":
         return False
+    if str(msg.get("voice_turn_status") or "").strip() == "superseded":
+        return False
     if msg.get("reply_status") == "replied" or msg.get("reply_message_id"):
         return False
     claimed_by = str(msg.get("reply_claimed_by") or "").strip()

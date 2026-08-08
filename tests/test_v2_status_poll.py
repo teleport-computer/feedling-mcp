@@ -44,7 +44,7 @@ def test_build_response_defaults_are_empty_and_backward_compatible():
     assert set(resp.keys()) == {
         "messages", "runtime_v2", "client_release", "user_mcp", "timed_out",
         "consumer_id", "claimed", "agent_status_events", "status_cursor",
-        "vision_probe",
+        "vision_probe", "web_policy",
     }
 
 

@@ -93,6 +93,12 @@ def test_prompt_frontier_failures_use_stable_content_free_status_codes():
     assert worker._turn_failure_error_class(
         worker.TurnError("prompt_coverage_incomplete:reply_empty")
     ) == "unknown"
+    assert worker._safe_failure_code(
+        "turn_failed", worker.v2_tool_loop.ProviderEmptyReply("empty_reply")
+    ) == "turn_failed:empty_reply"
+    assert worker._provider_health_error_class(
+        worker.v2_tool_loop.ProviderEmptyReply("empty_reply")
+    ) == "provider_empty_reply"
 
 
 @pytest.mark.parametrize(
@@ -130,7 +136,12 @@ def test_prompt_frontier_failures_use_stable_content_free_status_codes():
             ),
             "vision_model_required",
         ),
-        (worker.TurnError("empty_reply"), "reply_parse_failed"),
+        # 2026-08-07: 空回复属于模型/provider 行为，统一归 provider。
+        (worker.TurnError("empty_reply"), "provider_empty_reply"),
+        (
+            worker.v2_tool_loop.ProviderEmptyReply("empty_reply"),
+            "provider_empty_reply",
+        ),
         (RuntimeError("opaque internal failure"), "unknown"),
     ],
 )

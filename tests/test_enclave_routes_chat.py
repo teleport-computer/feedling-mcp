@@ -124,6 +124,36 @@ def test_history_reads_plaintext_tier_text_without_crypto_fields(client, monkeyp
     assert body["decrypt_errors"] == []
 
 
+def test_history_carries_voice_card_display_and_reply_metadata(client, monkeypatch):
+    _wire(monkeypatch, [
+        {
+            "id": "voice-card",
+            "role": "openclaw",
+            "ts": 1.0,
+            "v": 1,
+            "source": "voice_call_transcript",
+            "K_enclave": "x",
+            "body_ct": "x",
+            "nonce": "x",
+            "owner_user_id": "usr_a",
+            "voice_call_id": "vcall_1",
+            "voice_turn_count": 12,
+            "voice_duration_sec": 340,
+            "reply_to_message_id": "voice-parent",
+        },
+    ])
+    monkeypatch.setattr(envmod, "decrypt_envelope", lambda *_args: b"preview")
+
+    message = client.get(
+        "/v1/chat/history", headers={"X-API-Key": "k"}
+    ).get_json()["messages"][0]
+
+    assert message["voice_call_id"] == "vcall_1"
+    assert message["voice_turn_count"] == 12
+    assert message["voice_duration_sec"] == 340
+    assert message["reply_to_message_id"] == "voice-parent"
+
+
 def test_history_decrypts_resident_maintenance_message(client, monkeypatch):
     prompt = "【Feedling 系统维护提醒】\n请更新 resident consumer。"
     _wire(monkeypatch, [

@@ -1839,3 +1839,39 @@ def test_kill_switch_unwires_the_push_dep(monkeypatch):
     monkeypatch.setenv("FEEDLING_V2_PUSH_ENABLED", "0")
     deps = serve_worker.build_production_deps()
     assert deps.send_reply_push is None
+
+
+def test_worldbook_reader_forwards_current_turn_and_runtime_token(monkeypatch):
+    store = object()
+    observed = {}
+    monkeypatch.setattr(serve_worker.core_store, "get_store", lambda uid: store)
+
+    def match(candidate_store, payload, *, api_key, runtime_token):
+        observed.update({
+            "store": candidate_store,
+            "payload": payload,
+            "api_key": api_key,
+            "runtime_token": runtime_token,
+        })
+        return {"block": "<world_book>matched</world_book>"}, 200
+
+    monkeypatch.setattr(serve_worker.worldbook_core, "match", match)
+    messages = [{"role": "user", "content": "current turn"}]
+
+    result = serve_worker._read_worldbook_context(
+        "u-worldbook",
+        messages,
+        runtime_token="runtime-secret",
+    )
+
+    assert result == {"block": "<world_book>matched</world_book>"}
+    assert observed == {
+        "store": store,
+        "payload": {"messages": messages},
+        "api_key": None,
+        "runtime_token": "runtime-secret",
+    }
+    assert (
+        serve_worker.build_production_deps().read_worldbook_context
+        is serve_worker._read_worldbook_context
+    )

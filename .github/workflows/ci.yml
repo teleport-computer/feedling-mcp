@@ -474,6 +474,7 @@ jobs:
           filters: |
             cvm:
               - 'backend/**'
+              - 'tools/chat_resident_consumer.py'
               - 'tools/deploy_canary.py'
               - 'deploy/attestation-gate.sh'
               - 'deploy/Dockerfile'

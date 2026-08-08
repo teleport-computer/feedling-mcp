@@ -22,6 +22,7 @@ from capabilities import registry
 
 REPLY_TOOL = "reply"
 FILE_REPLY_TOOL = "send_file"
+IMAGE_REPLY_TOOL = "generate_image"
 TASK_TOOL = "task"
 PROVIDER_USAGE_TOOL = "provider_usage"
 MEMORY_ORGANIZE_TOOL = "memory_organize"
@@ -106,6 +107,16 @@ PARAMS: dict[str, dict] = {
     },
     # memory.fetch(store, ...) -> memory_core.fetch: payload.get("ids") must be a
     # list of non-empty strings.
+    "voice_transcript_list": {
+        "type": "object",
+        "properties": {"limit": _INT},
+        "required": [],
+    },
+    "voice_transcript_read": {
+        "type": "object",
+        "properties": {"call_id": _STR, "offset": _INT},
+        "required": ["call_id"],
+    },
     "memory_fetch": {
         "type": "object",
         "properties": {
@@ -277,6 +288,11 @@ PARAMS: dict[str, dict] = {
         "properties": {"path": _STR, "revision": _INT},
         "required": ["path", "revision"],
     },
+    IMAGE_REPLY_TOOL: {
+        "type": "object",
+        "properties": {"prompt": _STR},
+        "required": ["prompt"],
+    },
 
     # -- runtime-native provider_usage tool (chat-lane only; see worker.py
     # _SUBAGENT_ALLOWED_TOOLS / _PRIVATE_READ_TOOLS / _run_wake disabled set) --
@@ -340,6 +356,17 @@ DESCRIPTIONS: dict[str, str] = {
                       "all-memory overview, and do not repeat it after one discovery "
                       "result. For a user-requested bulk rewrite or cleanup, call "
                       "memory_organize."),
+    "voice_transcript_list": (
+        "List this user's archived voice calls, newest first: call_id, when it "
+        "happened, how long it ran, how many turns. Metadata only — no words "
+        "are returned. Use it to find WHICH call to open."),
+    "voice_transcript_read": (
+        "Read what was actually said in one archived voice call, by call_id. "
+        "Memory cards distilled from a call carry that call's voice_call_id, so "
+        "this is how you check the original wording behind a memory instead of "
+        "trusting the card's summary of it. Paged: pass the returned "
+        "next_offset to continue. You do NOT need this for the call that just "
+        "ended — its memory was already written from the full transcript."),
     "memory_fetch": ("Fetch the most relevant ids chosen from the current index/search "
                      "step, usually 1–3 cards (guidance, not a hard cap). Related cards "
                      "may expand the returned set up to limit; use include_archived or "
@@ -415,6 +442,14 @@ DESCRIPTIONS: dict[str, str] = {
         "Do not call this merely because a conversational answer contains a list "
         "or structured text. Host filesystem paths and /artifacts, /skills, or "
         "/memory entries are not accepted."
+    ),
+    IMAGE_REPLY_TOOL: (
+        "Generate and deliver a real image in the chat. Call this whenever the user "
+        "asks you to draw, create, design, or generate an image, illustration, poster, "
+        "avatar, photo, or other visual. Put the complete visual instruction in prompt. "
+        "Never answer such a request with the word 'Image', a Markdown placeholder, a "
+        "fake URL, or a claim that an image was created. This tool either delivers "
+        "validated image bytes or returns a structured configuration failure."
     ),
     PROVIDER_USAGE_TOOL: (
         "查询当前 AI 服务商账户的余额与用量（只读）。仅在用户明确询问余额、用量、"
@@ -575,6 +610,8 @@ def validate_tool_args(name: str, args, *, live_model_call: bool = False) -> str
         type(args.get("revision")) is not int or args["revision"] <= 0
     ):
         return "send_file revision must be a positive integer"
+    if name == IMAGE_REPLY_TOOL and not str(args.get("prompt") or "").strip():
+        return "generate_image requires a non-empty prompt"
     return None
 
 
@@ -588,6 +625,7 @@ def build_tool_specs() -> list[ToolSpec]:
         TASK_TOOL,
         REPLY_TOOL,
         FILE_REPLY_TOOL,
+        IMAGE_REPLY_TOOL,
         PROVIDER_USAGE_TOOL,
         MEMORY_ORGANIZE_TOOL,
     ):

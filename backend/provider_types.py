@@ -83,12 +83,22 @@ class Usage:
 
 
 @dataclass(frozen=True)
+class ProviderMedia:
+    """One provider-native inline image result awaiting chat normalization."""
+
+    mime_type: str
+    data_base64: str
+    name: str = ""
+
+
+@dataclass(frozen=True)
 class ProviderResponse:
     text: str
     tool_calls: list[ToolCall]
     usage: Usage
     raw: dict
     assistant_turn: NativeAssistantTurn | None = None
+    media: tuple[ProviderMedia, ...] = ()
 
     @classmethod
     def from_result(cls, result: dict) -> "ProviderResponse":
@@ -120,5 +130,21 @@ class ProviderResponse:
                 wire=str(raw_turn["wire"]), payload=raw_turn["payload"])
         else:
             assistant_turn = None
-        return cls(text=str(result.get("reply") or ""), tool_calls=calls,
-                   usage=usage, raw=result, assistant_turn=assistant_turn)
+        raw_media = result.get("media") or []
+        media = tuple(
+            ProviderMedia(
+                mime_type=str(item.get("mime_type") or ""),
+                data_base64=str(item.get("data_base64") or ""),
+                name=str(item.get("name") or ""),
+            )
+            for item in raw_media
+            if isinstance(item, dict) and item.get("data_base64")
+        )
+        return cls(
+            text=str(result.get("reply") or ""),
+            tool_calls=calls,
+            usage=usage,
+            raw=result,
+            assistant_turn=assistant_turn,
+            media=media,
+        )

@@ -381,9 +381,14 @@ enclave 报错通常会重新包一层自己的 slug（如 `model_api_key_decryp
 > （`tools/chat_resident_consumer.py` `_ERROR_CLASS_RULES` 同源），未在本次
 > 新增，不重复列。下表保留 Phase C 后加入的目录项；其中 `runner_*` 三项只是
 > 已冻结的历史 resident/supervisor 通知兼容值，Runtime V2 不再产生它们。
+>
+> `provider_empty_reply`（blame=provider_transient，2026-08-07 新增）同属 chat
+> 上游类：transport 成功、响应协议可识别，但 assistant 内容为空。与
+> `reply_parse_failed`（system）按「谁把内容弄没的」分界。
 
 | error_class | 状态码 | blame | severity | 触发场景 |
 |---|---|---|---|---|
+| `model_mismatch` | — | system | error | chat：Runtime V1 Claude Code 的结构化回执显示实际模型与用户配置不同；终止本轮并清理错误模型会话，避免静默降级污染后续对话 |
 | `vision_model_required` | — | user_provider | error | chat：主模型拒绝图片输入且没有成功产出回复；引导用户添加或切换支持视觉的模型，不误报成服务暂时不可用 |
 | `provider_incompatible` | — | user_provider | error | chat：Runtime V2 provider/tool loop 把上游「不支持某参数/工具」类错误分类上报（`classify_upstream`/`_ERROR_CLASS_RULES` 命中） |
 | `context_overflow` | — | user_provider | error | chat：这轮对话超出模型上下文窗口 |

@@ -204,7 +204,7 @@ def test_worker_child_loop_reuses_route_but_isolates_and_restricts_tools(
         ]
     )
 
-    async def fake_provider(config, messages, *, tools=None):
+    async def fake_provider(config, messages, *, tools=None, **kwargs):
         provider_calls.append(
             {
                 "config": config,
@@ -323,7 +323,7 @@ def test_worker_subagent_budget_is_shared_across_parent_task_batches(
     )
     provider_calls = []
 
-    async def fake_provider(config, messages, *, tools=None):
+    async def fake_provider(config, messages, *, tools=None, **kwargs):
         provider_calls.append((config, messages, tools))
         return {
             "reply": "bounded child result",
@@ -405,7 +405,7 @@ def test_worker_child_private_read_blocks_later_outbound_web(
         ]
     )
 
-    async def fake_provider(_config, _messages, *, tools=None):
+    async def fake_provider(_config, _messages, *, tools=None, **kwargs):
         offered.append(tools)
         return next(responses)
 
@@ -499,7 +499,7 @@ def test_worker_child_forged_mutation_gets_text_fallback_without_dispatch(
         ]
     )
 
-    async def fake_provider(_config, _messages, *, tools=None):
+    async def fake_provider(_config, _messages, *, tools=None, **kwargs):
         offered.append(tools)
         return next(responses)
 
@@ -581,7 +581,7 @@ def test_child_loses_web_when_the_parent_lane_disabled_it(
         ]
     )
 
-    async def fake_provider(config, messages, *, tools=None):
+    async def fake_provider(config, messages, *, tools=None, **kwargs):
         provider_calls.append(
             {
                 "config": config,

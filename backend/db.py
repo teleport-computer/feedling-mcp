@@ -3331,6 +3331,602 @@ def admin_product_health_proactive_reply_rate(
     return {"rows": out_rows}
 
 
+# --- 首页（view=home）数据层 ----------------------------------------------- #
+# 与产品健康页同一套错误约定：查询失败直接 RAISE，由 admin_core 捕获成
+# None，渲染层显示「暂不可用」——绝不吞错返回一个看起来像真数据的空结构。
+# 未成熟/未上报一律 None，None ≠ 0。所有查询有界（<=28d 或 <=8d），
+# 绝不做全舰队 per-user store 加载。
+
+
+_HOME_QUEUE_SEVERITY = {
+    # bad-first 排序：越小越糟。offline 在 v1 里不产出（resident 轮询状态
+    # 只活在进程内 registry，DB 侧看不见——渲染层的说明文案负责把这个缺口
+    # 讲老实），reason_code 仍保留在 contract 里给渲染层。
+    "stalled_no_reply": 0,
+    "onboarding_stuck": 1,
+    "model_config_pending": 2,
+}
+
+
+def admin_home_queue(*, tz: str = "Asia/Shanghai") -> dict:
+    """首页「需要你的用户」队列：谁此刻卡住了、为什么。
+
+    三个有界来源，全部单条 SQL、无全舰队 per-user 加载：
+      stalled_no_reply     72h 内 chat_messages 一次有界扫（该谓词无索引可用，
+                           与 proactive_reply_rate 同款接受有界 seq scan）：
+                           最后一条用户消息（source 排除 verify_ping/
+                           resident_maintenance）之后没有任何真回复，且该消息
+                           已 >30min（避免把正在进行的对话标成卡住）。「真回复」
+                           与 admin_ops_dashboard 的 real_replies 同一把尺：
+                           剔除 foreground_fallback/proactive_fallback，也剔除
+                           agent_initiated_proactive——主动消息不是「对用户的
+                           回复」，定时主动消息落下来不许把还在等回复的用户
+                           从队列里洗掉。
+      onboarding_stuck     admin_onboarding_funnel(registered_cutoff_ts=now-14d)
+                           （走它自己的 per-user 索引路径）里 t0 已 >24h、t3
+                           仍 None 的用户；funnel 返回 None（查询故障）时直接
+                           RAISE——故障不许伪装成「没人卡住」。注意 t3 沿用
+                           funnel 的既有口径（主动消息也算首次触达，可以点亮
+                           t3）——这是 onboarding 里程碑语义，故意与上面
+                           stalled 的「真回复」尺不同；一个用户可以 t3 已达
+                           但仍因 stalled_no_reply 在队列里。
+      model_config_pending user_blobs kind='model_api' 且 test_status 非 ok
+                           （PK (user_id,kind) 无法按 kind 单独索引，表小，
+                           有界小扫描），带上状态原文。
+
+    同一用户命中多个原因只保留最糟的一条（severity 见
+    ``_HOME_QUEUE_SEVERITY``）。排序 bad-first，再按 since_epoch 升序
+    （等得最久的最靠前，None 垫底）。封顶 20 行 + truncated 标记。
+    since_epoch=None 表示该原因没有可靠的起始时刻（不是 epoch 0）。
+    """
+    now = time.time()
+    window_e = now - 72 * 3600.0
+    stale_e = now - 1800.0
+    best: dict[str, dict] = {}
+
+    def offer(row: dict) -> None:
+        cur = best.get(row["user_id"])
+        if cur is None or (_HOME_QUEUE_SEVERITY[row["reason_code"]]
+                           < _HOME_QUEUE_SEVERITY[cur["reason_code"]]):
+            best[row["user_id"]] = row
+
+    with get_pool().connection() as conn:
+        stalled = conn.execute(
+            """
+            WITH lu AS (
+                SELECT user_id, MAX(ts) AS last_user_ts
+                FROM chat_messages
+                WHERE ts >= %s
+                  AND doc->>'role' IN ('user','human')
+                  AND COALESCE(doc->>'source','')
+                      NOT IN ('verify_ping','resident_maintenance')
+                GROUP BY user_id
+            )
+            SELECT lu.user_id, lu.last_user_ts
+            FROM lu
+            WHERE lu.last_user_ts <= %s
+              AND NOT EXISTS (
+                  SELECT 1 FROM chat_messages cm
+                  WHERE cm.user_id = lu.user_id
+                    AND cm.ts > lu.last_user_ts
+                    AND cm.doc->>'role' IN ('agent','openclaw')
+                    AND COALESCE(cm.doc->>'source','')
+                        NOT IN ('foreground_fallback','proactive_fallback',
+                                'agent_initiated_proactive')
+              )
+            ORDER BY lu.last_user_ts ASC
+            """,
+            (window_e, stale_e),
+        ).fetchall()
+        # 只列近 14 天有过任何活动的账号：user_blobs 没有更新时间列，历史
+        # 遗留的坏配置会把队列灌满（prod 首日 20 条截断的教训）——弃用账号
+        # 的配置问题不是"需要你"的工单。两条活动臂各有索引可走
+        # （ix_chat_messages_ts / 0078 的 app_session_end 部分索引）。
+        active_e = now - 14 * 86400.0
+        pending = conn.execute(
+            """
+            SELECT b.user_id,
+                   lower(COALESCE(NULLIF(b.doc->>'test_status',''),'(none)')) AS st
+            FROM user_blobs b
+            WHERE b.kind = 'model_api'
+              AND lower(COALESCE(NULLIF(b.doc->>'test_status',''),'(none)')) <> 'ok'
+              AND b.user_id IN (
+                  SELECT user_id FROM chat_messages WHERE ts >= %s
+                  UNION
+                  SELECT user_id FROM user_logs
+                  WHERE stream = 'tracking_events'
+                    AND doc->>'type' = 'app_session_end'
+                    AND ts >= %s
+              )
+            """,
+            (active_e, active_e),
+        ).fetchall()
+    for uid, last_ts in stalled:
+        waited_h = (now - float(last_ts)) / 3600.0
+        offer({
+            "user_id": uid,
+            "reason_code": "stalled_no_reply",
+            "reason_text": "发了消息但没等到真回复",
+            "since_epoch": float(last_ts),
+            "detail": f"最后一条用户消息已等待 {waited_h:.1f} 小时，未见真回复（fallback/主动消息不算）",
+        })
+    funnel = admin_onboarding_funnel(registered_cutoff_ts=now - 14 * 86400.0)
+    if funnel is None:
+        raise RuntimeError("admin_onboarding_funnel unavailable (home queue)")
+    for r in funnel:
+        t0 = r.get("t0")
+        if t0 is None or r.get("t3") is not None or float(t0) > now - 86400.0:
+            continue
+        days = (now - float(t0)) / 86400.0
+        marks = "、".join(
+            f"{k} {'已达' if r.get(k) is not None else '未达'}" for k in ("t1", "t2")
+        )
+        offer({
+            "user_id": r["user_id"],
+            "reason_code": "onboarding_stuck",
+            "reason_text": "注册超过 24h 仍未拿到首次真回复",
+            "since_epoch": float(t0),
+            "detail": f"{r.get('route') or 'resident'} 路线，注册 {days:.1f} 天；{marks}",
+        })
+    for uid, st in pending:
+        offer({
+            "user_id": uid,
+            "reason_code": "model_config_pending",
+            "reason_text": "模型 API 配置未验证通过",
+            "since_epoch": None,  # user_blobs 无更新时间列——没有就是 None，不编。
+            "detail": f"test_status={st}",
+        })
+    rows = sorted(
+        best.values(),
+        key=lambda r: (
+            _HOME_QUEUE_SEVERITY[r["reason_code"]],
+            r["since_epoch"] is None,
+            r["since_epoch"] or 0.0,
+        ),
+    )
+    return {"rows": rows[:20], "truncated": len(rows) > 20}
+
+
+def admin_home_pulse(*, tz: str = "Asia/Shanghai") -> dict:
+    """首页「产品脉搏」：7 日活跃 spark、WAU 对比、最新成熟 W4、近 4 周激活率。
+
+    daily_actives 与 view=dau 的 session_dau 同源同口径（真打开 app 的
+    ``app_session_end`` 独立用户数）：完整北京日已冻结的走
+    ``dau_daily_snapshot``（PK day 直接命中），未冻结的落回 live（0078 部分
+    索引 ``ix_user_logs_app_session_end_ts`` 的 ts 范围扫）。只发 7 个完整日，
+    今天不进——进行中的日不渲染成定局。oldest first（sparkline 时序）。
+
+    wau/prev_wau = 最近 7 个完整日 vs 再前 7 日的独立活跃用户数。埋点最早
+    一条 ``app_session_end`` 晚于对比窗起点时 prev_wau=None（窗口没被覆盖
+    ≠ 0 人活跃）。latest_mature_w4 只读 ``retention_cohort_snapshot`` 冻结行
+    （period_index=4，PK 命中），没有任何成熟 cohort 时 None。
+    activation_recent 复用 ``admin_product_health_activation_weekly``
+    （不复制 SQL），最近 4 个 cohort 周 newest first，t3_rate 不可信时 None。
+    """
+    zone = _ph_zone(tz)
+    today = datetime.now(zone).date()
+    start_day = today - timedelta(days=7)
+    start_e = _ph_day_epoch(start_day, zone)
+    prev_start_e = _ph_day_epoch(today - timedelta(days=14), zone)
+    end_e = _ph_day_epoch(today, zone)
+    days = [(start_day + timedelta(days=i)).isoformat() for i in range(7)]
+    with get_pool().connection() as conn:
+        snap = dict(conn.execute(
+            "SELECT day, session_dau FROM dau_daily_snapshot "
+            "WHERE day >= %s AND day <= %s",
+            (days[0], days[-1]),
+        ).fetchall())
+        live = dict(conn.execute(
+            """
+            SELECT to_char(timezone(%s, to_timestamp(ts)), 'YYYY-MM-DD') AS day,
+                   COUNT(DISTINCT user_id)::int
+            FROM user_logs
+            WHERE stream='tracking_events'
+              AND doc->>'type'='app_session_end'
+              AND ts >= %s AND ts < %s
+            GROUP BY 1
+            """,
+            (tz, start_e, end_e),
+        ).fetchall())
+        wau_row = conn.execute(
+            """
+            SELECT
+              (COUNT(DISTINCT user_id) FILTER (WHERE ts >= %s))::int,
+              (COUNT(DISTINCT user_id) FILTER (WHERE ts < %s))::int,
+              MIN(ts)
+            FROM user_logs
+            WHERE stream='tracking_events'
+              AND doc->>'type'='app_session_end'
+              AND ts >= %s AND ts < %s
+            """,
+            (start_e, start_e, prev_start_e, end_e),
+        ).fetchone()
+        oldest_row = conn.execute(
+            "SELECT MIN(ts) FROM user_logs "
+            "WHERE stream='tracking_events' AND doc->>'type'='app_session_end'",
+        ).fetchone()
+        w4 = conn.execute(
+            """
+            SELECT cohort_week, cohort_size, active_count
+            FROM retention_cohort_snapshot
+            WHERE period_index = 4 AND cohort_size > 0
+            ORDER BY cohort_week DESC
+            LIMIT 1
+            """,
+        ).fetchone()
+    wau = int(wau_row[0] or 0)
+    prev_wau: int | None = int(wau_row[1] or 0)
+    oldest_ts = oldest_row[0]
+    if oldest_ts is None or float(oldest_ts) > prev_start_e:
+        # 埋点历史没覆盖到对比窗——「没数据」≠「0 人活跃」。
+        prev_wau = None
+    latest_w4 = None
+    if w4 is not None:
+        week, size, active = w4[0], int(w4[1]), int(w4[2] or 0)
+        latest_w4 = {"cohort_week": week,
+                     "pct": round(100.0 * active / size, 1), "n": size}
+    activation = admin_product_health_activation_weekly(tz=tz, weeks=4)
+    activation_recent = [
+        {"cohort_week": c["cohort_week"], "t3_rate": c["t3_rate"], "n": c["n"]}
+        for c in activation["cohorts"][:4]
+    ]
+    return {
+        "daily_actives": [
+            {"day": d, "dau": int(snap[d] if d in snap else live.get(d, 0))}
+            for d in days
+        ],
+        "wau": wau,
+        "prev_wau": prev_wau,
+        "latest_mature_w4": latest_w4,
+        "activation_recent": activation_recent,
+    }
+
+
+def admin_home_feed(*, tz: str = "Asia/Shanghai", limit: int = 12) -> dict:
+    """首页「今天发生了什么」：48h 内注册 / 首次真回复 / 导入失败事件流。
+
+    三个有界查询：注册走 users 小扫描（created_at 严格 CASE 解析，malformed
+    行静默掉出——与 funnel 同一把尺）；首次真回复先取窗口内有真回复的候选
+    用户（48h 有界扫），再对候选做 per-user MIN（chat_user_seq_idx/PK 的
+    per-user 索引路径），MIN 落在窗口内才算「首次」——绝不全表求每人 MIN。
+    导入失败读 genesis_import_jobs（status='failed'，updated_at 窗口内，
+    per-user 计数聚合成一条事件）。newest first，封顶 ``limit``（<=50）。
+    """
+    safe_limit = max(1, min(int(limit or 12), 50))
+    now = time.time()
+    window_e = now - 48 * 3600.0
+    events: list[dict] = []
+    with get_pool().connection() as conn:
+        ca = _ph_created_at_sql(conn)
+        regs = conn.execute(
+            f"""
+            SELECT user_id, EXTRACT(EPOCH FROM ({ca}))
+            FROM users
+            WHERE ({ca}) IS NOT NULL
+              AND EXTRACT(EPOCH FROM ({ca})) >= %s
+            """,
+            (window_e,),
+        ).fetchall()
+        replies = conn.execute(
+            """
+            WITH cand AS (
+                SELECT DISTINCT user_id FROM chat_messages
+                WHERE ts >= %s
+                  AND doc->>'role' IN ('agent','openclaw')
+                  AND COALESCE(doc->>'source','')
+                      NOT IN ('foreground_fallback','proactive_fallback')
+            )
+            SELECT cm.user_id, MIN(cm.ts) AS t
+            FROM chat_messages cm
+            WHERE cm.user_id IN (SELECT user_id FROM cand)
+              AND cm.doc->>'role' IN ('agent','openclaw')
+              AND COALESCE(cm.doc->>'source','')
+                  NOT IN ('foreground_fallback','proactive_fallback')
+            GROUP BY cm.user_id
+            HAVING MIN(cm.ts) >= %s
+            """,
+            (window_e, window_e),
+        ).fetchall()
+        fails = conn.execute(
+            """
+            SELECT user_id, COUNT(*)::int,
+                   MAX(EXTRACT(EPOCH FROM updated_at))
+            FROM genesis_import_jobs
+            WHERE status = 'failed' AND updated_at >= to_timestamp(%s)
+            GROUP BY user_id
+            """,
+            (window_e,),
+        ).fetchall()
+    for uid, t in regs:
+        events.append({"epoch": float(t), "kind": "registration",
+                       "user_id": uid, "text": "新用户注册"})
+    for uid, t in replies:
+        events.append({"epoch": float(t), "kind": "first_reply",
+                       "user_id": uid, "text": "首次收到真回复"})
+    for uid, n, t in fails:
+        events.append({"epoch": float(t), "kind": "import_failed",
+                       "user_id": uid, "text": f"记忆导入失败 {int(n)} 次"})
+    events.sort(key=lambda e: e["epoch"], reverse=True)
+    return {"events": events[:safe_limit]}
+
+
+def admin_home_cost(*, tz: str = "Asia/Shanghai") -> dict:
+    """首页「成本一行」：token/日 spark + 人均 + runaway 哨兵。
+
+    一次 ``v2_turn_metrics`` 有界扫（8 个北京日 = 7 完整 + 今天，
+    ``ix_v2_turn_metrics_created_at`` 范围扫）。tokens 只覆盖 Hosted V2
+    灰度，BYOK 自付费消耗服务器看不见——数字是已知下限。某日一条上报了
+    usage 的 turn 都没有 → tokens=None（未上报 ≠ 0）。daily_tokens 为
+    7 个完整日 oldest first；today_so_far 是进行中的今天，单列不混进 spark。
+
+    per_active_user_day = 完整日已上报 tokens 之和 / 各日上报用户数之和
+    （分母 0 → None）。coverage = 全窗口上报 usage 的 turn 占比（无 turn →
+    None）。runaway = 最新完整日 > 3 × 前 6 个完整日中位数（严格大于，恰好
+    3 倍不算）；完整日中可判定天数 <4、最新完整日未上报、或 coverage=None
+    时 runaway=None（数据不足不许报警也不许报平安）。
+    """
+    zone = _ph_zone(tz)
+    today = datetime.now(zone).date()
+    start_e = _ph_day_epoch(today - timedelta(days=7), zone)
+    end_e = _ph_day_epoch(today + timedelta(days=1), zone)
+    with get_pool().connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT to_char(timezone(%s, created_at), 'YYYY-MM-DD') AS day,
+                   COUNT(*)::int AS turns,
+                   (COUNT(*) FILTER (WHERE prompt_tokens IS NOT NULL
+                                        OR completion_tokens IS NOT NULL))::int
+                       AS reported,
+                   COALESCE(SUM(COALESCE(prompt_tokens,0)
+                                + COALESCE(completion_tokens,0))
+                            FILTER (WHERE prompt_tokens IS NOT NULL
+                                       OR completion_tokens IS NOT NULL),
+                            0)::bigint AS tokens,
+                   (COUNT(DISTINCT user_id)
+                        FILTER (WHERE prompt_tokens IS NOT NULL
+                                   OR completion_tokens IS NOT NULL))::int
+                       AS users_reported
+            FROM v2_turn_metrics
+            WHERE created_at >= to_timestamp(%s)
+              AND created_at < to_timestamp(%s)
+            GROUP BY 1
+            """,
+            (tz, start_e, end_e),
+        ).fetchall()
+    by_day = {r[0]: (int(r[1]), int(r[2]), int(r[3]), int(r[4])) for r in rows}
+
+    def _tokens(day_iso: str) -> int | None:
+        turns, reported, tokens, _ = by_day.get(day_iso, (0, 0, 0, 0))
+        return int(tokens) if reported > 0 else None
+
+    complete_days = [(today - timedelta(days=7 - i)).isoformat() for i in range(7)]
+    daily_tokens = [{"day": d, "tokens": _tokens(d)} for d in complete_days]
+    total_turns = sum(by_day.get(d, (0, 0, 0, 0))[0]
+                      for d in complete_days + [today.isoformat()])
+    total_reported = sum(by_day.get(d, (0, 0, 0, 0))[1]
+                         for d in complete_days + [today.isoformat()])
+    coverage = (total_reported / total_turns) if total_turns else None
+    tok_sum = sum(row["tokens"] for row in daily_tokens
+                  if row["tokens"] is not None)
+    user_days = sum(by_day.get(d, (0, 0, 0, 0))[3] for d in complete_days)
+    per_active = (tok_sum / user_days) if user_days else None
+    latest = daily_tokens[-1]["tokens"]
+    priors = [row["tokens"] for row in daily_tokens[:-1]
+              if row["tokens"] is not None]
+    known_days = sum(1 for row in daily_tokens if row["tokens"] is not None)
+    if coverage is None or latest is None or known_days < 4:
+        runaway: bool | None = None
+    else:
+        med = _ph_median(priors)
+        runaway = None if med is None else bool(latest > 3.0 * med)
+    return {
+        "daily_tokens": daily_tokens,
+        "today_so_far": _tokens(today.isoformat()),
+        "per_active_user_day": per_active,
+        "runaway": runaway,
+        "coverage": coverage,
+    }
+
+
+def admin_home_soft_verdicts(*, tz: str = "Asia/Shanghai") -> dict:
+    """首页状态条的 growth/cost/evidence 三枚软判定（system 由 admin_core
+    用它自己够得着的 _ops_*_level 组合——db 层不许向上 import 渲染包）。
+
+    每枚 {"level": ok|warn|unknown|bad, "reasons": [中文...]}，诚实分层：
+    ok 只给「证据闭合且健康」；测得的恶化给 warn/bad；没证据给 unknown。
+      growth   WAU 环比跌 >=20% → warn、>=40% → bad——但只在基线有判定力时
+               （prev_wau >= 8，或绝对流失 >= 3 人）；prod 舰队 intentionally
+               tiny，5→3 这种单人级波动是噪声不是回归，报 unknown 并附原始
+               数字。上周基线缺失（埋点没覆盖到）→ unknown；最近 3 个完整
+               cohort 周激活率严格连降 → warn。数据复用 ``admin_home_pulse``
+               （有界查询，不复制 SQL）。
+      cost     runaway=True → bad；coverage 缺失或 <0.8 → unknown（上报覆盖
+               不足时的成本数字不可信，不许绿）；runaway=None（可判定天数
+               不足，哨兵没跑起来）→ unknown——「哨兵没证据」不许渲染成
+               绿；只有 runaway=False（测得无放量）才 ok。复用
+               ``admin_home_cost``。
+      evidence 永远 unknown：客户端已读 ACK、session 来源标记两项埋点缺口
+               没闭合之前，这枚灯不许变绿——灰是诚实，绿是撒谎。coverage
+               <0.95 时追加一条覆盖缺口理由。
+    """
+    zone = _ph_zone(tz)
+    this_monday = _bj_monday(datetime.now(zone).date()).isoformat()
+    pulse = admin_home_pulse(tz=tz)
+    cost = admin_home_cost(tz=tz)
+    rank = {"bad": 3, "warn": 2, "unknown": 1, "ok": 0}
+
+    # -- growth ------------------------------------------------------------ #
+    g_level, g_reasons = "ok", []
+    wau, prev = pulse["wau"], pulse["prev_wau"]
+    if prev is None:
+        g_level = "unknown"
+        g_reasons.append("上一周活跃基线缺失（埋点未覆盖到对比窗），无法环比")
+    elif prev > 0:
+        drop = (prev - wau) / prev
+        if drop >= 0.20:
+            # 小基线护栏：舰队 intentionally tiny，1 个人歇一周就能把百分比
+            # 打穿阈值。基线 <8 且绝对流失 <3 人时，环比不具判定力——报
+            # unknown 并保留原始人数，不装红黄。
+            if prev < 8 and (prev - wau) < 3:
+                g_level = "unknown"
+                g_reasons.append(
+                    f"基线过小（{prev}→{wau}），环比不具判定力"
+                )
+            elif drop >= 0.40:
+                g_level = "bad"
+                g_reasons.append(f"7 日活跃较上周下降 {drop * 100:.0f}%（{prev}→{wau}）")
+            else:
+                g_level = "warn"
+                g_reasons.append(f"7 日活跃较上周下降 {drop * 100:.0f}%（{prev}→{wau}）")
+    elif wau == 0:
+        g_level = "unknown"
+        g_reasons.append("连续两周无活跃用户，无环比基线")
+    completed = [c for c in pulse["activation_recent"]
+                 if c["cohort_week"] != this_monday][:3]
+    rates = [c["t3_rate"] for c in completed]
+    if len(rates) == 3 and all(r is not None for r in rates) \
+            and rates[0] < rates[1] < rates[2]:
+        if rank["warn"] > rank[g_level]:
+            g_level = "warn"
+        g_reasons.append("激活率（t3）连续 3 个完整 cohort 周下降")
+    if g_level == "ok" and not g_reasons:
+        g_reasons.append("WAU 环比与激活率均无恶化信号")
+
+    # -- cost -------------------------------------------------------------- #
+    coverage = cost["coverage"]
+    if cost["runaway"] is True:
+        c_level = "bad"
+        c_reasons = ["最新完整日 token 用量超过前 6 日中位数的 3 倍"]
+    elif coverage is None or coverage < 0.8:
+        c_level = "unknown"
+        c_reasons = ["token 上报覆盖率缺失，成本数字不可信"
+                     if coverage is None else
+                     f"token 上报覆盖率 {coverage * 100:.0f}% < 80%，成本数字不可信"]
+    elif cost["runaway"] is False:
+        c_level = "ok"
+        c_reasons = ["近 7 个完整日无 runaway 迹象"]
+    else:
+        # runaway=None：可判定天数不足，哨兵根本没跑起来。「没证据」是灰
+        # 不是绿——绿灯配「判不了」的理由是自相矛盾（每次新部署的头几天
+        # 都会走到这里）。
+        c_level = "unknown"
+        c_reasons = ["可判定完整日不足（<4 天有上报），runaway 哨兵未触发判定"]
+
+    # -- evidence（结构性缺口未闭合前永远灰）--------------------------------- #
+    e_reasons = ["客户端已读 ACK 未埋点", "session 来源标记未埋点"]
+    if coverage is None:
+        e_reasons.append("token 上报覆盖率未知")
+    elif coverage < 0.95:
+        e_reasons.append(f"token 上报覆盖率 {coverage * 100:.0f}% < 95%")
+    return {
+        "growth": {"level": g_level, "reasons": g_reasons},
+        "cost": {"level": c_level, "reasons": c_reasons},
+        "evidence": {"level": "unknown", "reasons": e_reasons},
+    }
+
+
+def admin_funnel_snapshot(*, tz: str = "Asia/Shanghai") -> dict:
+    """近 28 个完整北京日注册 cohort 的单调激活漏斗（+ 前一个 28 日对比）。
+
+    cohort 与里程碑复用 ``admin_onboarding_funnel(registered_cutoff_ts=
+    now-56d)``（per-user 索引路径；返回 None 即 RAISE——故障不许渲染成空
+    漏斗），t0 用同一把严格解析尺。计数强制嵌套（stage k 必须已达全部前置
+    里程碑），漏斗因此构造性单调——单个里程碑集合并不天然嵌套（VPS 路线
+    t2 可先于 t1），非嵌套计数会画出「变宽的漏斗」。
+
+    w1_retained：只统计个人 W1 窗 [t0+7d, t0+14d) 已完整走完（t0<=now-14d，
+    必然落在窗口前 21 天内）且已达 first_reply 的用户（保持嵌套单调），
+    活跃证据 = 个人窗内任一 ``app_session_end``（0078 部分索引上的
+    per-user nested-loop EXISTS）。成熟与否按 cohort 判：cohort 里没有任何
+    人的 W1 窗走完 → None（未成熟 ≠ 0 留存）；一旦有人成熟，w1 就是实测
+    计数——成熟 cohort 无人到达 first_reply 时是定局的 0，不是「判不了」
+    （灰掉一个测得的全灭等于把激活失败说成不成熟）。
+    已知下限：活跃证据来自 live ``user_logs``，tracking_events 每次追加都
+    按 TRACK_EVENT_MAX(=2000) per-user 裁剪、且随删号级联消失——重度用户
+    发满 2000 条后，几周前的 W1 证据可能已被裁掉，w1_retained 只会偏低不会
+    偏高（与 dau_daily_snapshot/retention 快照当年冻结的动机同一类；后续
+    如要根治应冻结 per-user W1 命中事实，见 0017 先例）。
+    prev = 前一个 28 日窗同款；该窗零注册时 prev=None
+    （没有可比对象，不发全零假漏斗）。
+    """
+    zone = _ph_zone(tz)
+    today = datetime.now(zone).date()
+    now = time.time()
+    cur_start_e = _ph_day_epoch(today - timedelta(days=28), zone)
+    cur_end_e = _ph_day_epoch(today, zone)
+    prev_start_e = _ph_day_epoch(today - timedelta(days=56), zone)
+    funnel = admin_onboarding_funnel(registered_cutoff_ts=prev_start_e)
+    if funnel is None:
+        raise RuntimeError("admin_onboarding_funnel unavailable (funnel snapshot)")
+
+    def _window(rows: list[dict], start_e: float, end_e: float) -> dict:
+        cohort = [r for r in rows
+                  if r.get("t0") is not None and start_e <= float(r["t0"]) < end_e]
+        connected = [r for r in cohort if r.get("t1") is not None]
+        content = [r for r in connected if r.get("t2") is not None]
+        replied = [r for r in content if r.get("t3") is not None]
+        w1_eligible = [r for r in replied if float(r["t0"]) + 14 * 86400.0 <= now]
+        # 成熟度看 cohort 而不是 replied：成熟 cohort 里 replied 为空时
+        # w1 是测得的 0（激活全灭），不是「窗口没走完」。
+        cohort_matured = any(
+            float(r["t0"]) + 14 * 86400.0 <= now for r in cohort
+        )
+        return {
+            "cohort": cohort, "connected": connected, "content": content,
+            "replied": replied, "w1_eligible": w1_eligible,
+            "cohort_matured": cohort_matured,
+        }
+
+    cur = _window(funnel, cur_start_e, cur_end_e)
+    prev = _window(funnel, prev_start_e, cur_start_e)
+    eligible = cur["w1_eligible"] + prev["w1_eligible"]
+    retained_uids: set[str] = set()
+    if eligible:
+        uids = [r["user_id"] for r in eligible]
+        w_starts = [float(r["t0"]) + 7 * 86400.0 for r in eligible]
+        w_ends = [float(r["t0"]) + 14 * 86400.0 for r in eligible]
+        with get_pool().connection() as conn:
+            hit = conn.execute(
+                """
+                SELECT c.user_id
+                FROM unnest(%s::text[], %s::float8[], %s::float8[])
+                     AS c(user_id, w_start, w_end)
+                WHERE EXISTS (
+                    SELECT 1 FROM user_logs l
+                    WHERE l.user_id = c.user_id
+                      AND l.stream = 'tracking_events'
+                      AND l.ts >= c.w_start AND l.ts < c.w_end
+                      AND l.doc->>'type' = 'app_session_end'
+                )
+                """,
+                (uids, w_starts, w_ends),
+            ).fetchall()
+        retained_uids = {r[0] for r in hit}
+
+    def _stages(w: dict) -> list[dict]:
+        w1: int | None = None
+        if w["cohort_matured"]:
+            w1 = sum(1 for r in w["w1_eligible"]
+                     if r["user_id"] in retained_uids)
+        # eligible 必须随 payload 下发：渲染层若拿 t3 总数当分母，会把
+        # 「W1 窗口还没到期」的人算成「流失」（prod 2026-08-07 实景：
+        # t3=124 里大半注册不满 14 天，却渲染成 ↓40%·流失 75）。
+        return [
+            {"id": "registered", "label": "注册", "count": len(w["cohort"])},
+            {"id": "connected", "label": "已连接(t1)", "count": len(w["connected"])},
+            {"id": "content_ready", "label": "内容就绪(t2)", "count": len(w["content"])},
+            {"id": "first_reply", "label": "首次真回复(t3)", "count": len(w["replied"])},
+            {"id": "w1_retained", "label": "次周仍活跃（第 8–14 天）",
+             "count": w1, "eligible": len(w["w1_eligible"])},
+        ]
+
+    return {
+        "stages": _stages(cur),
+        "window_days": 28,
+        "prev": {"stages": _stages(prev)} if prev["cohort"] else None,
+    }
+
+
 def freeze_completed_retention_cohorts(*, now_epoch: float | None = None,
                                        tz: str = "Asia/Shanghai") -> list[str]:
     """Freeze (cohort_week, period) cells whose week has fully ended.
@@ -7581,6 +8177,150 @@ def _lock_chat_user_fence_on_cursor(
     )
 
 
+def _lock_voice_call_on_cursor(cur, user_id: str, call_id: str) -> None:
+    cur.execute(
+        "SELECT pg_advisory_xact_lock(hashtextextended("
+        "'voice-call:' || %s || ':' || %s, 0))",
+        (str(user_id), str(call_id)),
+    )
+
+
+def voice_call_status_on_cursor(
+    cur, user_id: str, call_id: str, *, lock: bool = False
+) -> str:
+    """Read a call's durable lifecycle inside an existing transaction."""
+    if lock:
+        _lock_voice_call_on_cursor(cur, user_id, call_id)
+    cur.execute(
+        "SELECT status FROM voice_call_sessions "
+        "WHERE user_id=%s AND call_id=%s" + (" FOR UPDATE" if lock else ""),
+        (str(user_id), str(call_id)),
+    )
+    row = cur.fetchone()
+    if row is None:
+        return ""
+    return str(row["status"] if isinstance(row, dict) else row[0])
+
+
+def voice_call_status(user_id: str, call_id: str) -> str:
+    with get_pool().connection() as conn:
+        with conn.cursor() as cur:
+            return voice_call_status_on_cursor(cur, user_id, call_id)
+
+
+def voice_call_create_active(user_id: str, call_id: str) -> None:
+    """Persist session ownership before its signed gateway token is returned."""
+    with get_pool().connection() as conn:
+        conn.execute(
+            "INSERT INTO voice_call_sessions (user_id,call_id,status) "
+            "VALUES (%s,%s,'active') ON CONFLICT (user_id,call_id) DO NOTHING",
+            (str(user_id), str(call_id)),
+        )
+
+
+def voice_call_cancel(user_id: str, call_id: str, reason: str) -> dict:
+    """Install a cancellation tombstone under the shared chat write fence."""
+    with get_pool().connection() as conn:
+        with conn.transaction():
+            with conn.cursor() as cur:
+                _lock_chat_user_fence_on_cursor(cur, user_id)
+                _lock_voice_call_on_cursor(cur, user_id, call_id)
+                cur.execute(
+                    "SELECT status,cancel_reason FROM voice_call_sessions "
+                    "WHERE user_id=%s AND call_id=%s FOR UPDATE",
+                    (str(user_id), str(call_id)),
+                )
+                row = cur.fetchone()
+                if row is None:
+                    cur.execute(
+                        "INSERT INTO voice_call_sessions "
+                        "(user_id,call_id,status,cancel_reason,ended_at) "
+                        "VALUES (%s,%s,'cancelled',%s,now())",
+                        (str(user_id), str(call_id), str(reason)),
+                    )
+                    return {"status": "cancelled", "replayed": False}
+                status = str(row["status"] if isinstance(row, dict) else row[0])
+                if status in {"finalizing", "finalized"}:
+                    return {"status": status, "replayed": True}
+                if status == "cancelled":
+                    return {"status": "cancelled", "replayed": True}
+                cur.execute(
+                    "UPDATE voice_call_sessions SET status='cancelled',"
+                    "cancel_reason=%s,ended_at=now() "
+                    "WHERE user_id=%s AND call_id=%s",
+                    (str(reason), str(user_id), str(call_id)),
+                )
+                return {"status": "cancelled", "replayed": False}
+
+
+def voice_call_begin_finalize(user_id: str, call_id: str) -> dict:
+    """Claim finalize before any archive/card write can race with cancel."""
+    with get_pool().connection() as conn:
+        with conn.transaction():
+            with conn.cursor() as cur:
+                _lock_chat_user_fence_on_cursor(cur, user_id)
+                _lock_voice_call_on_cursor(cur, user_id, call_id)
+                cur.execute(
+                    "SELECT status FROM voice_call_sessions "
+                    "WHERE user_id=%s AND call_id=%s FOR UPDATE",
+                    (str(user_id), str(call_id)),
+                )
+                row = cur.fetchone()
+                if row is None:
+                    cur.execute(
+                        "INSERT INTO voice_call_sessions "
+                        "(user_id,call_id,status) VALUES (%s,%s,'finalizing')",
+                        (str(user_id), str(call_id)),
+                    )
+                    return {"status": "finalizing", "replayed": False}
+                status = str(row["status"] if isinstance(row, dict) else row[0])
+                if status == "cancelled":
+                    return {"status": "cancelled", "replayed": True}
+                if status in {"finalizing", "finalized"}:
+                    return {"status": status, "replayed": True}
+                cur.execute(
+                    "UPDATE voice_call_sessions SET status='finalizing' "
+                    "WHERE user_id=%s AND call_id=%s",
+                    (str(user_id), str(call_id)),
+                )
+                return {"status": "finalizing", "replayed": False}
+
+
+def voice_call_mark_finalized(user_id: str, call_id: str) -> dict:
+    """Finalize without ever reviving a call whose cancel tombstone won."""
+    with get_pool().connection() as conn:
+        with conn.transaction():
+            with conn.cursor() as cur:
+                _lock_chat_user_fence_on_cursor(cur, user_id)
+                _lock_voice_call_on_cursor(cur, user_id, call_id)
+                cur.execute(
+                    "SELECT status FROM voice_call_sessions "
+                    "WHERE user_id=%s AND call_id=%s FOR UPDATE",
+                    (str(user_id), str(call_id)),
+                )
+                row = cur.fetchone()
+                if row is None:
+                    cur.execute(
+                        "INSERT INTO voice_call_sessions "
+                        "(user_id,call_id,status,ended_at) "
+                        "VALUES (%s,%s,'finalized',now())",
+                        (str(user_id), str(call_id)),
+                    )
+                    return {"status": "finalized", "replayed": False}
+                status = str(row["status"] if isinstance(row, dict) else row[0])
+                if status == "cancelled":
+                    return {"status": "cancelled", "replayed": True}
+                if status == "finalized":
+                    return {"status": "finalized", "replayed": True}
+                cur.execute(
+                    "UPDATE voice_call_sessions SET status='finalized',"
+                    "cancel_reason='',ended_at=now() "
+                    "WHERE user_id=%s AND call_id=%s",
+                    (str(user_id), str(call_id)),
+                )
+                return {"status": "finalized", "replayed": False}
+
+
 def _lock_capture_consent_on_cursor(cur, user_id: str) -> None:
     """Serialize proactive Capture consent changes with the effect commit."""
     cur.execute(
@@ -8663,6 +9403,25 @@ class ResidentReplyRejected(RuntimeError):
         super().__init__(self.reason)
 
 
+class VoiceCallReplySuppressed(RuntimeError):
+    """A call ended before an asynchronous assistant reply could commit."""
+
+    def __init__(self, status: str):
+        self.status = str(status)
+        super().__init__(f"voice_call_{self.status}")
+
+
+def _voice_reply_context_on_cursor(cur, user_id: str, parent_doc: dict) -> dict:
+    call_id = str((parent_doc or {}).get("voice_call_id") or "").strip()
+    turn_id = str((parent_doc or {}).get("voice_turn_id") or "").strip()
+    if not call_id or not turn_id:
+        return {}
+    status = voice_call_status_on_cursor(cur, user_id, call_id, lock=True)
+    if status in {"finalizing", "cancelled", "finalized"}:
+        raise VoiceCallReplySuppressed(status)
+    return {"voice_call_id": call_id, "voice_turn_id": turn_id}
+
+
 def _same_reply_envelope(existing_doc, requested_doc) -> bool:
     existing_delivery_id = str(
         (existing_doc or {}).get("resident_delivery_id") or ""
@@ -8678,6 +9437,7 @@ def _same_reply_envelope(existing_doc, requested_doc) -> bool:
         stable_delivery_fields = (
             "id", "role", "source", "visibility", "owner_user_id",
             "content_type", "reply_to_message_id", "resident_delivery_id",
+            "voice_call_id", "voice_turn_id",
         )
         return (
             existing_delivery_id == requested_delivery_id
@@ -8693,6 +9453,7 @@ def _same_reply_envelope(existing_doc, requested_doc) -> bool:
         # 明文行的正文（v6）。密文行有 body_ct 在清单里兜着，明文行漏了它就会
         # 把「同 id 不同正文」判成同一条而静默丢弃后者。
         "body",
+        "voice_call_id", "voice_turn_id",
     )
     if not isinstance(existing_doc, dict) or not isinstance(requested_doc, dict):
         return False
@@ -8830,6 +9591,14 @@ def chat_append_resident_reply(
                 )
                 if not isinstance(parent_doc, dict) or parent_doc.get("role") != "user":
                     raise ResidentReplyRejected("reply_parent_not_user")
+
+                # The parent is the authoritative correlation source. Copy its
+                # call/turn ids onto the assistant row, and reject a late write
+                # after cancel/finalize while holding the same chat fence used
+                # by the lifecycle transition.
+                reply_doc.update(
+                    _voice_reply_context_on_cursor(cur, user_id, parent_doc)
+                )
 
                 prior_reply_id = str(parent_doc.get("reply_message_id") or "")
                 already_replied = (
@@ -9151,6 +9920,18 @@ def chat_settle_failed_input(
     return True
 
 
+def v2_turn_failure_supersede_enabled() -> bool:
+    """Kill switch (default ON) for same-turn failure supersede-on-success.
+
+    一轮先失败(失败气泡已投递、父消息被盖上 reply_error_class)、随后重试成功时,
+    成功回复的落库事务会清掉同一 turn 粘住的失败章。出问题时设
+    FEEDLING_V2_TURN_FAILURE_SUPERSEDE=0 快速止血,不用回滚部署。
+    """
+    return os.environ.get(
+        "FEEDLING_V2_TURN_FAILURE_SUPERSEDE", "1"
+    ).strip().lower() not in {"0", "false", "off", "no"}
+
+
 def chat_append_effect_with_cursor(
     user_id: str,
     msg_id: str,
@@ -9200,6 +9981,7 @@ def chat_append_effect_with_cursor(
 
     effect_doc = _normalize_chat_body_doc(doc)
     replied_user_ids: list[str] = []
+    superseded_turn_cleanup: list[tuple[str, str]] = []
     persisted_runtime_doc: dict | None = None
     replied_fields = {
         "reply_status": "replied",
@@ -9229,6 +10011,15 @@ def chat_append_effect_with_cursor(
         with conn.transaction():
             with conn.cursor() as cur:
                 _lock_chat_user_fence_on_cursor(cur, user_id)
+                voice_call_id = str(
+                    effect_doc.get("voice_call_id") or ""
+                ).strip()
+                if voice_call_id:
+                    voice_status = voice_call_status_on_cursor(
+                        cur, user_id, voice_call_id, lock=True
+                    )
+                    if voice_status in {"finalizing", "cancelled", "finalized"}:
+                        raise VoiceCallReplySuppressed(voice_status)
                 # Lock/materialize the cursor row before deciding whether a
                 # resident reply raced this V2 turn. If any newly-consumed user
                 # input was answered after V2 assembled its prompt, abort before
@@ -9371,6 +10162,79 @@ def chat_append_effect_with_cursor(
                         )
                     persisted_reply_doc = existing_doc
 
+                # Same-turn failure supersede(先失败后成功的那一半;先成功后失败由
+                # require_cursor_advance 挡住): 这条真回复(非失败载体)明确回答了
+                # parent,而 parent 之前被同 turn 的失败气泡盖了 reply_error_class
+                # ——按「最终结果说了算」清掉失败章、把 reply_message_id 改指真回复,
+                # 并把旧失败载体上的 turn_failure_* 一并剥掉(否则客户端增量/重载会
+                # 把失败重新映射回 parent)。严格按本 parent 键定位,绝不跨 turn:
+                # 别的 turn 的真实失败不受影响。仅在首次 insert 时执行,幂等重放跳过。
+                if (
+                    inserted
+                    and not failure_error_class
+                    and v2_turn_failure_supersede_enabled()
+                ):
+                    superseded_parent_id = str(
+                        effect_doc.get("reply_to_message_id") or ""
+                    ).strip()
+                    if superseded_parent_id:
+                        cur.execute(
+                            "SELECT doc->>'reply_message_id' FROM chat_messages "
+                            "WHERE user_id=%s AND msg_id=%s "
+                            "  AND doc->>'role' IN ('user','human') "
+                            "  AND COALESCE(doc->>'reply_error_class','')<>'' "
+                            "FOR UPDATE",
+                            (user_id, superseded_parent_id),
+                        )
+                        stamped = cur.fetchone()
+                        if stamped is not None:
+                            superseded_carrier_id = str(
+                                (next(iter(stamped.values()))
+                                 if isinstance(stamped, dict) else stamped[0])
+                                or ""
+                            ).strip()
+                            cur.execute(
+                                "UPDATE chat_messages SET doc=(doc "
+                                " - 'reply_error_class' - 'reply_blame' "
+                                " - 'reply_user_text' - 'reply_failure_model' "
+                                " - 'reply_failure_provider') || %s "
+                                "WHERE user_id=%s AND msg_id=%s",
+                                (
+                                    Jsonb(
+                                        {
+                                            "reply_status": "replied",
+                                            "reply_message_id": msg_id,
+                                            "replied_by": "hosted_runtime_v2",
+                                            "replied_at": f"{float(ts):.3f}",
+                                        }
+                                    ),
+                                    user_id,
+                                    superseded_parent_id,
+                                ),
+                            )
+                            if superseded_carrier_id:
+                                # 只剥指回同一 parent 的失败载体,防错删无关消息。
+                                cur.execute(
+                                    "UPDATE chat_messages SET doc=(doc "
+                                    " - 'turn_failure_error_class' "
+                                    " - 'turn_failure_blame' "
+                                    " - 'turn_failure_user_text' "
+                                    " - 'turn_failure_model' "
+                                    " - 'turn_failure_provider') "
+                                    "WHERE user_id=%s AND msg_id=%s "
+                                    "  AND doc->>'reply_to_message_id'=%s "
+                                    "  AND COALESCE("
+                                    "      doc->>'turn_failure_error_class','')<>''",
+                                    (
+                                        user_id,
+                                        superseded_carrier_id,
+                                        superseded_parent_id,
+                                    ),
+                                )
+                            superseded_turn_cleanup.append(
+                                (superseded_parent_id, superseded_carrier_id)
+                            )
+
                 if cursor_seq is not None:
                     # V2 -> resident rollback bridge. Link every still-unanswered
                     # user input consumed through this final reply to the
@@ -9418,6 +10282,37 @@ def chat_append_effect_with_cursor(
                 "WHERE user_id=%s AND msg_id=ANY(%s)",
                 (Jsonb(replied_fields), user_id, replied_user_ids),
             )
+        if superseded_turn_cleanup:
+            from tee_shadow import mirror
+            for parent_id, carrier_id in superseded_turn_cleanup:
+                mirror.execute(
+                    "UPDATE chat_messages SET doc=(doc "
+                    " - 'reply_error_class' - 'reply_blame' "
+                    " - 'reply_user_text' - 'reply_failure_model' "
+                    " - 'reply_failure_provider') || %s "
+                    "WHERE user_id=%s AND msg_id=%s",
+                    (
+                        Jsonb(
+                            {
+                                "reply_status": "replied",
+                                "reply_message_id": msg_id,
+                                "replied_by": "hosted_runtime_v2",
+                                "replied_at": f"{float(ts):.3f}",
+                            }
+                        ),
+                        user_id,
+                        parent_id,
+                    ),
+                )
+                if carrier_id:
+                    mirror.execute(
+                        "UPDATE chat_messages SET doc=(doc "
+                        " - 'turn_failure_error_class' - 'turn_failure_blame' "
+                        " - 'turn_failure_user_text' - 'turn_failure_model' "
+                        " - 'turn_failure_provider') "
+                        "WHERE user_id=%s AND msg_id=%s",
+                        (user_id, carrier_id),
+                    )
         if persisted_runtime_doc is not None:
             _mirror_persisted_blob(
                 user_id, "model_api_runtime", persisted_runtime_doc)
@@ -9443,6 +10338,83 @@ def chat_append(user_id: str, msg_id: str, ts: float, doc: dict, max_messages: i
 
 class RuntimeControlChangedError(RuntimeError):
     """The hosted-runtime ownership tuple changed before a fenced write."""
+
+
+def _voice_revision_identity(doc: dict) -> tuple[str, str] | None:
+    """Validated non-sensitive grouping key for a current voice revision."""
+    if not isinstance(doc, dict):
+        return None
+    if str(doc.get("role") or "") not in {"user", "human"}:
+        return None
+    if str(doc.get("voice_turn_status") or "") != "current":
+        return None
+    call_id = str(doc.get("voice_call_id") or "").strip()
+    logical_turn_id = str(doc.get("voice_logical_turn_id") or "").strip()
+    if (
+        not call_id
+        or not logical_turn_id
+        or len(call_id) > 96
+        or len(logical_turn_id) > 128
+    ):
+        return None
+    return call_id, logical_turn_id
+
+
+def _supersede_previous_voice_revisions_on_cursor(
+    cur,
+    *,
+    user_id: str,
+    new_msg_id: str,
+    doc: dict,
+) -> list[str]:
+    """Retire older ASR revisions while the chat lifecycle row is locked."""
+    identity = _voice_revision_identity(doc)
+    if identity is None:
+        return []
+    call_id, logical_turn_id = identity
+    fields = {
+        "voice_turn_status": "superseded",
+        "voice_superseded_by": str(new_msg_id),
+    }
+    cur.execute(
+        "UPDATE chat_messages SET doc=doc || %s "
+        "WHERE user_id=%s AND msg_id<>%s "
+        "AND doc->>'role' IN ('user','human') "
+        "AND doc->>'voice_call_id'=%s "
+        "AND COALESCE(NULLIF(doc->>'voice_logical_turn_id',''),"
+        "             doc->>'voice_turn_id','')=%s "
+        "AND COALESCE(doc->>'voice_turn_status','current')<>'superseded' "
+        "RETURNING msg_id",
+        (Jsonb(fields), user_id, new_msg_id, call_id, logical_turn_id),
+    )
+    return [
+        str(row["msg_id"] if isinstance(row, dict) else row[0])
+        for row in cur.fetchall()
+    ]
+
+
+def _mirror_superseded_voice_revisions(
+    user_id: str,
+    superseded_ids: list[str],
+    *,
+    new_msg_id: str,
+) -> None:
+    if not superseded_ids:
+        return
+    from tee_shadow import mirror
+
+    fields = Jsonb({
+        "voice_turn_status": "superseded",
+        "voice_superseded_by": str(new_msg_id),
+    })
+    mirror.execute_many([
+        (
+            "UPDATE chat_messages SET doc=doc || %s "
+            "WHERE user_id=%s AND msg_id=%s",
+            (fields, user_id, msg_id),
+        )
+        for msg_id in superseded_ids
+    ])
 
 
 def chat_append_and_enqueue(
@@ -9514,7 +10486,7 @@ def chat_append_and_enqueue(
             "runtime-control CAS requires expected state, mode, and generation")
     priority = jobs_store.LANE_PRIORITY.get(lane, 0)
 
-    def _attempt() -> tuple[int, int | None, int, bool]:
+    def _attempt() -> tuple[int, int | None, int, bool, list[str]]:
         with get_pool().connection() as conn:
             with conn.transaction():
                 with conn.cursor() as fence_cur:
@@ -9547,6 +10519,12 @@ def chat_append_and_enqueue(
                     ):
                         raise RuntimeControlChangedError(
                             "hosted runtime control changed before enqueue")
+                if _voice_revision_identity(doc) is not None:
+                    # Keep the established runtime-row -> profile-row -> chat
+                    # lifecycle lock order, then serialize distinct revision
+                    # client ids before retiring the prior one.
+                    with conn.cursor() as voice_cur:
+                        _lock_chat_r2_lifecycle_on_cursor(voice_cur, user_id)
                 if client_msg_id is not None:
                     # Length-prefix the user id so concatenation is unambiguous
                     # without a NUL byte (PostgreSQL text rejects U+0000). This
@@ -9566,8 +10544,14 @@ def chat_append_and_enqueue(
                         (user_id, client_msg_id, idempotency_window_sec),
                     ).fetchone()
                     if duplicate is not None:
-                        return int(duplicate[0]), None, 0, False
+                        return int(duplicate[0]), None, 0, False, []
                 with conn.cursor() as mc:
+                    superseded_ids = _supersede_previous_voice_revisions_on_cursor(
+                        mc,
+                        user_id=user_id,
+                        new_msg_id=msg_id,
+                        doc=doc,
+                    )
                     seq, storage_generation = _chat_insert_on_cursor(
                         mc, user_id, msg_id, ts, doc, max_messages,
                         coverage_gated=True,
@@ -9578,14 +10562,19 @@ def chat_append_and_enqueue(
                         priority=priority, deadline_at=None,
                         expected_generation=expected_generation,
                     )
-        return seq, job_id, storage_generation, True
+        return seq, job_id, storage_generation, True, superseded_ids
 
     def _finish(
-        result: tuple[int, int | None, int, bool],
+        result: tuple[int, int | None, int, bool, list[str]],
     ) -> tuple[int, int | None]:
-        seq, job_id, storage_generation, inserted = result
+        seq, job_id, storage_generation, inserted, superseded_ids = result
         if not inserted:
             return seq, None
+        _mirror_superseded_voice_revisions(
+            user_id,
+            superseded_ids,
+            new_msg_id=msg_id,
+        )
         # The primary message+job transaction is already committed. Offload the
         # new row's body without touching any older durable source row.
         _offload_chat_body_after_commit(
@@ -9846,6 +10835,7 @@ def chat_append_idempotent(
 
     row = None
     storage_generation: int | None = None
+    superseded_ids: list[str] = []
     with get_pool().connection() as conn:
         with conn.transaction():
             with conn.cursor() as cur:
@@ -9873,6 +10863,13 @@ def chat_append_idempotent(
                 if row is not None:
                     return row[0], False
 
+                superseded_ids = _supersede_previous_voice_revisions_on_cursor(
+                    cur,
+                    user_id=user_id,
+                    new_msg_id=msg_id,
+                    doc=doc,
+                )
+
                 # Preserve normal msg-id semantics: an envelope-id collision
                 # updates the same row, exactly like chat_append.  Reusing the
                 # shared primitive also pins storage_generation and applies the
@@ -9894,6 +10891,12 @@ def chat_append_idempotent(
 
     if row is None or storage_generation is None:
         raise RuntimeError("chat_idempotent_insert_returned_no_row")
+
+    _mirror_superseded_voice_revisions(
+        user_id,
+        superseded_ids,
+        new_msg_id=msg_id,
+    )
 
     # Only the transaction winner gets here. The shared offload primitive
     # commits an exact-key cleanup guard before PUT and pins every later CAS to
@@ -10050,6 +11053,7 @@ _CHAT_FINALIZE_REPLY_ONCE_SQL = (
     "  WHERE user_id = %s AND msg_id = %s "
     "    AND (doc->>'reply_status') IS DISTINCT FROM 'replied' "
     "    AND COALESCE(doc->>'reply_message_id','') = '' "
+    "    AND COALESCE(doc->>'voice_turn_status','') <> 'superseded' "
     "  RETURNING doc AS parent_doc"
     "), inserted AS ("
     "  INSERT INTO chat_messages (user_id, msg_id, ts, doc) "
@@ -10101,20 +11105,42 @@ def chat_finalize_reply_once(
     mirrors only the parent's plaintext metadata; the encrypted reply remains
     exclusively on the normal decrypting TEE-replicator path.
     """
+    persisted_reply = dict(reply_doc)
+    persisted_reply["reply_to_message_id"] = str(parent_msg_id)
     with get_pool().connection() as conn:
-        row = conn.execute(
-            _CHAT_FINALIZE_REPLY_ONCE_SQL,
-            (
-                Jsonb(replied_fields),
-                user_id,
-                parent_msg_id,
-                user_id,
-                reply_msg_id,
-                reply_ts,
-                Jsonb(reply_doc),
-                user_id,
-            ),
-        ).fetchone()
+        with conn.transaction():
+            with conn.cursor() as cur:
+                _lock_chat_user_fence_on_cursor(cur, user_id)
+                cur.execute(
+                    "SELECT doc FROM chat_messages "
+                    "WHERE user_id=%s AND msg_id=%s FOR UPDATE",
+                    (user_id, parent_msg_id),
+                )
+                parent_row = cur.fetchone()
+                if parent_row is None:
+                    return None
+                parent = (
+                    parent_row["doc"]
+                    if isinstance(parent_row, dict)
+                    else parent_row[0]
+                )
+                persisted_reply.update(
+                    _voice_reply_context_on_cursor(cur, user_id, parent)
+                )
+                cur.execute(
+                    _CHAT_FINALIZE_REPLY_ONCE_SQL,
+                    (
+                        Jsonb(replied_fields),
+                        user_id,
+                        parent_msg_id,
+                        user_id,
+                        reply_msg_id,
+                        reply_ts,
+                        Jsonb(persisted_reply),
+                        user_id,
+                    ),
+                )
+                row = cur.fetchone()
     if row is None:
         return None
     # The encrypted reply row is intentionally NOT mirrored here.  The normal
@@ -10151,12 +11177,30 @@ def chat_finalize_reply_sequence_once(
     with get_pool().connection() as conn:
         with conn.transaction():
             with conn.cursor() as cur:
+                _lock_chat_user_fence_on_cursor(cur, user_id)
                 _lock_chat_r2_lifecycle_on_cursor(cur, user_id)
+                cur.execute(
+                    "SELECT doc FROM chat_messages "
+                    "WHERE user_id=%s AND msg_id=%s FOR UPDATE",
+                    (user_id, parent_msg_id),
+                )
+                source_row = cur.fetchone()
+                if source_row is None:
+                    return None
+                source_doc = (
+                    source_row["doc"]
+                    if isinstance(source_row, dict)
+                    else source_row[0]
+                )
+                voice_context = _voice_reply_context_on_cursor(
+                    cur, user_id, source_doc
+                )
                 cur.execute(
                     "UPDATE chat_messages SET doc = doc || %s "
                     "WHERE user_id = %s AND msg_id = %s "
                     "AND (doc->>'reply_status') IS DISTINCT FROM 'replied' "
                     "AND COALESCE(doc->>'reply_message_id','') = '' "
+                    "AND COALESCE(doc->>'voice_turn_status','') <> 'superseded' "
                     "RETURNING doc",
                     (Jsonb(replied_fields), user_id, parent_msg_id),
                 )
@@ -10165,6 +11209,11 @@ def chat_finalize_reply_sequence_once(
                     return None
                 parent_doc = parent_row[0]
                 for reply_msg_id, reply_ts, reply_doc in replies:
+                    persisted_reply = {
+                        **reply_doc,
+                        "reply_to_message_id": str(parent_msg_id),
+                        **voice_context,
+                    }
                     cur.execute(
                         "INSERT INTO chat_messages (user_id, msg_id, ts, doc) "
                         "VALUES (%s, %s, %s, %s) RETURNING doc",
@@ -10172,7 +11221,7 @@ def chat_finalize_reply_sequence_once(
                             user_id,
                             reply_msg_id,
                             reply_ts,
-                            Jsonb(reply_doc),
+                            Jsonb(persisted_reply),
                         ),
                     )
                     inserted_docs.append(cur.fetchone()[0])
@@ -10283,6 +11332,7 @@ def chat_try_claim_reply(
         # this worker last refreshed. Mirrors _chat_message_claimable.
         "  AND (doc->>'reply_status') IS DISTINCT FROM 'replied' "
         "  AND COALESCE(doc->>'reply_message_id','') = '' "
+        "  AND COALESCE(doc->>'voice_turn_status','') <> 'superseded' "
         f"{unanswered_tail_sql}"
         "  AND ("
         "    COALESCE(doc->>'reply_claimed_by','') = '' "
@@ -10949,11 +11999,13 @@ _ROUTE_COLUMNS = """
     r.id::text, r.credential_id::text, c.provider, r.model, c.label,
     c.api_key_hint, c.base_url, c.supports_responses,
     COALESCE(r.reasoning_effort, ''), r.context_window_tokens,
-    r.is_active, r.is_vision, r.test_status,
+    r.is_active, r.is_vision, r.is_image_generation, r.test_status,
     COALESCE(to_char(r.last_test_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'), ''),
     r.last_test_error, r.vision_test_status,
     COALESCE(to_char(r.last_vision_test_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'), ''),
-    r.last_vision_test_error, r.last_runtime_error, r.last_runtime_error_class,
+    r.last_vision_test_error, r.image_generation_test_status,
+    COALESCE(to_char(r.last_image_generation_test_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'), ''),
+    r.last_image_generation_test_error, r.last_runtime_error, r.last_runtime_error_class,
     COALESCE(to_char(r.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'), ''),
     COALESCE(to_char(r.updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'), '')
 """
@@ -10966,11 +12018,15 @@ def _route_row_to_dict(row: tuple) -> dict:
         "supports_responses": bool(row[7]), "reasoning_effort": row[8],
         "context_window_tokens": int(row[9]) if row[9] is not None else None,
         "is_active": bool(row[10]), "is_vision": bool(row[11]),
-        "test_status": row[12], "last_test_at": row[13], "last_test_error": row[14],
-        "vision_test_status": row[15], "last_vision_test_at": row[16],
-        "last_vision_test_error": row[17], "last_runtime_error": row[18],
-        "last_runtime_error_class": row[19],
-        "created_at": row[20], "updated_at": row[21],
+        "is_image_generation": bool(row[12]),
+        "test_status": row[13], "last_test_at": row[14], "last_test_error": row[15],
+        "vision_test_status": row[16], "last_vision_test_at": row[17],
+        "last_vision_test_error": row[18],
+        "image_generation_test_status": row[19],
+        "last_image_generation_test_at": row[20],
+        "last_image_generation_test_error": row[21],
+        "last_runtime_error": row[22], "last_runtime_error_class": row[23],
+        "created_at": row[24], "updated_at": row[25],
     }
 
 
@@ -11123,6 +12179,9 @@ def model_api_credential_update(user_id: str, credential_id: str, *,
                         "UPDATE model_api_routes SET "
                         "vision_test_status = 'untested', "
                         "last_vision_test_error = '', last_vision_test_at = NULL, "
+                        "image_generation_test_status = 'untested', "
+                        "last_image_generation_test_error = '', "
+                        "last_image_generation_test_at = NULL, "
                         "updated_at = now() "
                         "WHERE user_id = %s AND credential_id = %s",
                         (user_id, credential_id),
@@ -11287,6 +12346,27 @@ def model_api_vision_route(user_id: str) -> dict | None:
         return out
     except Exception as e:
         log.error("[db] model_api_vision_route(%s) failed: %s", user_id, e)
+        return None
+
+
+def model_api_image_generation_route(user_id: str) -> dict | None:
+    """Return the dedicated image-generation route with its encrypted credential."""
+    try:
+        with get_pool().connection() as conn:
+            row = conn.execute(
+                f"SELECT {_ROUTE_COLUMNS}, c.api_key_envelope "
+                "FROM model_api_routes r "
+                "JOIN model_api_credentials c ON c.id = r.credential_id "
+                "WHERE r.user_id = %s AND r.is_image_generation",
+                (user_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        out = _route_row_to_dict(row)
+        out["api_key_envelope"] = row[-1]
+        return out
+    except Exception as e:
+        log.error("[db] model_api_image_generation_route(%s) failed: %s", user_id, e)
         return None
 
 
@@ -11483,6 +12563,81 @@ def model_api_route_clear_vision(user_id: str) -> bool:
         return True
     except Exception as e:
         log.error("[db] model_api_route_clear_vision(%s) failed: %s", user_id, e)
+        return False
+
+
+def model_api_route_set_image_generation(user_id: str, route_id: str) -> bool:
+    """Atomically assign one saved route as the user's image generator."""
+    try:
+        with get_pool().connection() as conn:
+            with conn.transaction():
+                target = conn.execute(
+                    "SELECT 1 FROM model_api_routes "
+                    "WHERE user_id = %s AND id = %s FOR UPDATE",
+                    (user_id, route_id),
+                ).fetchone()
+                if target is None:
+                    return False
+                conn.execute(
+                    "UPDATE model_api_routes SET is_image_generation = FALSE, "
+                    "updated_at = now() WHERE user_id = %s "
+                    "AND is_image_generation AND id != %s",
+                    (user_id, route_id),
+                )
+                cur = conn.execute(
+                    "UPDATE model_api_routes SET is_image_generation = TRUE, "
+                    "updated_at = now() WHERE user_id = %s AND id = %s",
+                    (user_id, route_id),
+                )
+        return cur.rowcount > 0
+    except Exception as e:
+        log.error(
+            "[db] model_api_route_set_image_generation(%s,%s) failed: %s",
+            user_id,
+            route_id,
+            e,
+        )
+        return False
+
+
+def model_api_route_clear_image_generation(user_id: str) -> bool:
+    try:
+        with get_pool().connection() as conn:
+            conn.execute(
+                "UPDATE model_api_routes SET is_image_generation = FALSE, "
+                "updated_at = now() WHERE user_id = %s AND is_image_generation",
+                (user_id,),
+            )
+        return True
+    except Exception as e:
+        log.error("[db] model_api_route_clear_image_generation(%s) failed: %s", user_id, e)
+        return False
+
+
+def model_api_route_mark_image_generation_test(
+    user_id: str,
+    route_id: str,
+    *,
+    status: str,
+    error: str = "",
+) -> bool:
+    try:
+        with get_pool().connection() as conn:
+            cur = conn.execute(
+                "UPDATE model_api_routes SET image_generation_test_status = %s, "
+                "last_image_generation_test_error = %s, "
+                "last_image_generation_test_at = now(), updated_at = now() "
+                "WHERE user_id = %s AND id = %s",
+                (str(status or "untested")[:32], str(error or "")[:240], user_id, route_id),
+            )
+        return cur.rowcount > 0
+    except Exception as e:
+        log.error(
+            "[db] model_api_route_mark_image_generation_test(%s,%s) failed: %s",
+            user_id,
+            route_id,
+            e,
+        )
         return False
 
 

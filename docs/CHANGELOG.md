@@ -47,6 +47,142 @@
 
 ## 记录正文（最新的在上面）
 
+## 2026-08-07 — 语音挂断取消与迟到回复隔离
+
+**[DONE] 失败通话不再把迟到 AI 回复写进普通聊天。**
+
+- 新增幂等 `POST /v1/voice/cancel` 和持久 call lifecycle tombstone；取消会
+  清理未归档逐轮消息及临时语音结果。
+- Resident 与 Hosted Runtime V2 都在最终消息事务内检查 lifecycle，并把
+  `voice_call_id`、`voice_turn_id`、`reply_to_message_id` 完整落到回复行。
+- finalize 在写 archive/card 前先取得 lifecycle；cancel 与 finalize 只会有
+  一个赢家，不会出现 cancelled 状态却残留半套归档。
+
+## 2026-08-07 — Dashboard 卡片语义修正（prod 第二日实景反馈）
+
+**[FEEDBACK] 四处「数字对不上/误导」全部修正，根因都是口径与分母。**
+
+- 导入卡红灯顶 90% 大数字：分母从 completed 改为终态（completed+failed）
+  ——失败的导入到不了 completed，旧分母把 3 个失败藏进大数字（9/10=90%
+  配 23.1% 失败率的自相矛盾）。started>0 但无终态时显「—」不显 0%。
+- 漏斗 W1 假流失：builder 的 w1_eligible（窗口已走完人数）现在随 payload
+  下发，转化行分母用它——旧渲染拿 t3 总数当分母，把「注册不满 14 天、
+  窗口未到期」的人标成流失（实景 ↓40%·流失 75，实际 91 人成熟、33 人
+  未到期）。标签改「次周仍活跃（第 8–14 天）」防误读成 WAU。
+- 同词不同尺加标尺名：用户页判定句「近1日活跃」改「近1日发过消息」
+  （滚动 24h 真人消息），与「日活与时长」页 打开过App DAU（北京自然日）
+  是两把尺、无需对上——hint 里显式写明；产品健康 WAU 标签补「打开过
+  App」。chat/延迟卡「无样本」标注 Hosted V2 通道（V1/BYOK 不经此路径，
+  不代表没人聊天）。
+- 小样本环比不染色（两侧 <20 中性灰，17→4 的 −76% 红是真数字假信号）；
+  首页队列同因 >3 条折叠（注册波刷屏把 stalled 挤下屏）。
+- 测试 299 通过（含四组新回归）。
+
+
+## 2026-08-07 — 空回复归因：中转抽风不再算作「系统出了问题」
+
+**[DONE] prod 用户 usr_7f30d63f 报「今天好几次接不上」，分诊查实是他的中转不稳，但我们的错误归因把锅背到了自己头上。**
+
+- 现场：他的中转 08-05 上午配额爆掉后开始间歇返回 **HTTP 200 + 空内容**
+  （断流 / 配额紧张时的假成功）。我们清洗后为空 → 一律 `reply_parse_failed`
+  （blame=system，文案「系统处理回复时出了问题」）→ 用户自然来找我们。
+  同一场中转故障，前半场（规矩报错）归因正确，后半场（假成功）归因错误。
+- **归因边界**：模型本来就没给内容 = provider（新类 `provider_empty_reply`，
+  blame=provider_transient）；给过内容、被我们的清洗/压制掏空 = 我们
+  （`reply_parse_failed` 不变）。
+- 落点：标记由**四个 helper 抛出点**铸造（openai / simple / cli generic / pi）
+  —— 生产 helper 在返回前就抛异常，只在 `call_agent` 里判空是死代码；
+  分类器把空回复判定排在 `_ERROR_CLASS_RULES` **之后**，且抛出时带上 body 的
+  协议层诊断（`error.message` / `finish_reason`），这样 `200 + insufficient_quota`
+  这种中转标准形状仍然命中 `quota_insufficient` 而不是被空回复遮蔽。
+- V2 侧：`TurnError("empty_reply")` 归 provider；但 **`tool_budget_exhausted`
+  拆成独立 reason**（跑光的是我们自己的 `_TURN_MAX_LLM_CALLS`，不是中转的错），
+  wake `scheduled` 的 self-thinking SILENT 也归 system（模型给过完整 `<think>`、
+  是我们剥空的）。
+- 三轮 gatekeep（codex2 两轮 + 一次独立对抗预检）抓到的关键缺陷：①第一版
+  测试用 lambda 返回 `""` 绕过真实 helper 边界＝假绿，核心工单场景根本没修到；
+  ②`_raw_assistant_text` 是记忆车道的窄提取器（不读 top-level messages/actions），
+  拿它回头判空会把**我们自己的协议泄漏压制**误判成 provider 空回复 —— 改为在
+  压制**之前**快照；③标记加 `feedling:` 命名空间，否则 pi 透传的 provider 文本
+  可能原样命中而劫持归因。
+- 文档：`docs/FRONTEND_ERROR_CONTRACT.md`、`docs/API_ERRORS.md` 的 error_class
+  闭集，以及 docs-site changelog（用户可见文案变更）同批更新。
+- ⚠️ 用户可见变化：按 §2.3 显示矩阵，`provider_transient` 隐藏兜底气泡、只出
+  失败横幅（与 `rate_limited` / `upstream_unavailable` 同阵营，非本批新增形态）。
+
+## 2026-08-06 — Dashboard prod 首日热路径修补
+
+**[DONE] IA v2 上 prod 首日实测（首页 ~8s、产品健康顶 30s deadline、verdicts 每次 5-8s）暴露三处，全部修复。**
+
+- 迁移 0079：`chat_messages(ts)` 普通索引 + `user_logs(ts) WHERE
+  stream='proactive_jobs'` 部分索引——都是 0078 时"等 prod EXPLAIN"的
+  存量 follow-up，证据到齐即落地。服务首页队列/事件流、产品健康回复率、
+  铁杆 census（此前 30s 超时主因）与既有主动任务日报。
+- 首页队列 model_config_pending 加近 14 天活动过滤（chat ∪
+  app_session_end，两臂都有索引）：prod 首日 20 条截断，多为弃置账号的
+  历史坏配置——幽灵账号不是"需要你"的工单。
+- verdicts JSON 加 30s TTL 缓存 + single-flight：原"逐请求重建"假设在
+  prod 数据量下不成立（agent 轮询持续压库）；诚实通道改为 payload 一等
+  字段 `cached`/`cache_age_sec`（HTML 有 cache-note，JSON 有这个）。
+- 测试 297 通过（含 0079 head-pin 更新、队列幽灵过滤回归、缓存语义翻转）。
+
+
+## 2026-08-06 — Admin dashboard IA v2：首页 + 导航 13→4 + 统一漏斗
+
+**[DONE] /admin/data-track 默认页改为「首页」：判定条 + 用户队列 + 产品脉搏 + 事件流 + 成本行；导航收敛为 首页/产品健康/用户/诊断 四项。**
+
+- 设计原则落地：频率决定层级（每天看的在首屏零点击，出事才看的 11 个
+  诊断页收进 `view=diag` 枢纽 + 二级行，旧 URL 全部不变）；名单强于比率
+  （「需要你的用户」直接列出 有去无回/onboarding 卡住/模型配置待处理 的
+  具体用户行，封顶 20 + truncated 标记；resident 掉线检测因在内存态、
+  页面如实标注缺口）；无趋势不成信息（脉搏卡全部带 7 日 sparkline）。
+- 状态条四灯：系统 = 既有三把 `_ops_*_level` 尺子取最差（bad>warn>
+  unknown>ok，合成在 admin_core——db 不许 import data_track）；增长 =
+  WAU 环比（带 min-n 护栏，小分母不告警）；成本 = token 3× 中位数跑飞
+  检测；数据完整性 = **永远灰**直到 ACK/session 来源缺口闭合。
+- 统一漏斗 `admin_funnel_snapshot`：注册→已连接→内容就绪→首次真回复→
+  W1 仍活跃，严格单调、28 天窗口带前窗对照、W1 未成熟显 None；首页迷你
+  版 + 用户页完整版（带逐级掉落与前窗），替换掉用户页原来那组**不单调
+  的独立行为百分比条**（原数据保留在折叠的人群记账 details 里）。
+- 新 JSON 端点 `GET /v1/admin/data-track/verdicts`（admin 鉴权同级、不进
+  页面缓存）：给 agent 读的判定 + 队列 + 脉搏，与页面同一套 builder。
+- 两轮对抗审查修复 10 处（3 major：主动消息把"有去无回"误清；成本判定
+  绿灯却给"可判定天数不足"理由；激活率标题渲染进行中周为定数。7 minor
+  含 min-n 护栏、成熟死 cohort W1 显 0 不显 —、非有限数崩页、孤儿 CSS、
+  user_id 转义口径统一等）。种子舰队端到端验证（412 账号）：首页冷构
+  ~25ms vs 用户页 ~100ms（本地）。测试 296 通过；`test_asgi_admin` 两个
+  parity 失败为存量（cache-note vs 旧断言，已另立任务）。
+
+## 2026-08-05 — Dream 阀门重构：拆内容闸、只留确定性「明显不对」闸（V1/V2 同步）
+
+**[DECISION]+[DONE] usr_a40e 墓碑卡事故复盘，Seven 定产品哲学：出口只拦「明显不对」，绝不判内容质量、绝不拒绝内容上的可能性。**
+
+- 现场：deepseek-v4-pro 把 dream supersede 语义理解反，把「已被 <卡id> 取代——原文」
+  记账注记写进新卡 summary/content；占位符闸（实义文字，过）、语义审查员（同一弱模型
+  自审自查，放行）、15% 增量栅栏（多卡合并绕过）三道防线全没拦住，花园展示出墓碑卡。
+- **拆**（两条 lane 同步，V1 consumer + V2 extraction/worker）：
+  - 15% 增量栅栏（`_has_substantive_increment` 两份拷贝）——内容质量判断，
+    「更短但更准」的合法改写会被判死；
+  - 逐提案语义审查员（`_review_dream_consolidations` 两份实现 + review prompt/parser）
+    ——既误放（本次）也误杀（fail-closed 连审查调用挂了都毙提案），每条提案还多烧
+    一次用户 BYOK 调用。
+- **加**（共享一份，不再两处复制）：
+  - `memory/dream_gates.py`：卡 id 泄漏闸（result 硬字段含花园真实卡 id → 与内容闸
+    同路打回重问，零误伤）+ 爆炸半径保险丝（单晚退休 > 活跃卡 80% 且 ≥10 张 →
+    整个 job 失败不部分执行；env `FEEDLING_DREAM_FUSE_RATIO`/`FEEDLING_DREAM_FUSE_MIN_CARDS`）；
+  - `card_text.py` 墓碑短语闸（`已被/superseded by + ≥8位hex`，capture/dream 全 lane
+    兜底；裸「取代」散文不误伤）；
+  - dream prompt 红线补一句：result 写新卡内容本身、绝不出现卡 id（仅一句，
+    prompt 不膨胀——硬约束在出口代码里，见复盘讨论）。
+- **刻度**：`memory_lane_health` 增加 `failed_reasons`（按 `last_error` 细分，
+  「保险丝熔断」和「provider 挂」分开看）；V2 dream 记 `dream_funnel` trajectory
+  （proposals/applied/superseding）；V1 `dream_result` 增 `active_cards`+`content_gate`。
+- 测试：`test_dream_gates.py` 新增（含 **V1/V2 跨 lane 一致性锁**：同一份
+  consolidations 两条 lane 必须退休同一批卡）；lanes/integration/consumer 各测试
+  迁到新语义；673+ 相关用例全绿。
+- 待办：usr_a40e 花园复原（recover CLI 走 Actions，时间窗定位墓碑批次，dry-run
+  清单过目后 apply）——修复部署 prod 之后做，防止下一晚 dream 再产墓碑。
+
 ## 2026-08-05 — Pre 明文用户 Runtime V2 Chat 启动失败修复
 
 ### [DONE] Flight recorder 的二进制明文 wire 补齐
@@ -83,6 +219,7 @@
 - 首次 base backup、direct-TLS、强制 WAL switch 与归档零失败均已验证。
 - pre compose/CI 接入独立 TEE DSN；PG deploy、TEE migrate、备份监控新增 pre lane。
   双写默认关闭，等 pre 应用部署与连通验证后再开启回填。
+
 ## 2026-08-04 — 新增 Admin「产品健康」view（留存/激活/强度/证据缺口）
 
 **[DONE] /admin/data-track?view=health：投资人级产品指标常态化进 dashboard，全部只用现库可证实的数。**
@@ -183,59 +320,6 @@
 - 优先使用用户配置的专用视觉路由；未配置时复用当前回合的主模型路由。专用路由失败时不会静默回退，避免意外跨越用户选择的信任边界。
 - chat、wake 和只读子任务共用同一按需观察链路；模型未调用 `photo_read` 时不会读取或观察照片。
 - 变更仅限 V2 后端，V1 路径与 iOS 授权/UI 行为不变。
-
-## 2026-07-31 — Task 1.3 backend 协议完成，生产迁移仍锁住
-
-### [DONE] R2 plaintext pointer、原子迁移与三形状读写已落地
-
-- 新增 raw object helper 与 `plaintext_v1` pointer：
-  `body_object_format + body_size_bytes + body_sha256`。成功水合只向公共读取出口交付
-  `body_b64`，并在交付前核 raw byte length 与 SHA-256；未知 marker、坏 base64 与
-  完整性不符全部 fail closed。
-- 新写只允许 effective `off` 用户的 image/file 使用 `body_b64`；text、加密档、
-  `local_only`、混合 crypto 字段与超限 decoded bytes 均拒绝。重体 offload 复用
-  versioned key、upload guard、per-key advisory lock 与 CAS，encrypted `body_ct`
-  路径保持兼容。
-- backfill 支持 live JSONB CAS 与 archive 事务内 delete+insert，不放宽 archive
-  immutable UPDATE trigger。CAS 输家/进程崩溃留下的新对象由 durable cleanup 回收，
-  旧权威对象不会被覆盖；CLI 缺省 inventory-only，apply 需双参数确认和部署环境 gate。
-- TEE replicator 对 plaintext pointer 原样保留、仅解密独立 thinking/caption；
-  live/archive 替换都进入 requeue。verify 改用 archive `source_seq` 对账，并抽样 GET
-  plaintext R2 对象核 size/hash，避免两库同指坏对象时假绿。
-- 公共 OpenAPI、Chat workflow、architecture、self-host trust model 与 Unreleased
-  changelog 同步更新。生产 apply 仍等待 iOS `body_b64` 支持和强更窗口。
-
-## 2026-07-31 — Task 1.3 回退为只读盘点；补明文行复制终态
-
-### [BLOCKER] R2 聊天重体不能靠原地覆盖完成明文化
-
-- 接手审计发现 `backfill_chat_bodies_to_plaintext.py` 首版不能安全真跑：
-  `get_chat_body()` 返回重新 base64 的密文，`put_chat_body()` 又会 base64 解码并生成
-  另一个 key，既可能改坏普通文本，也覆盖不到数据库里持久化的 versioned
-  `body_key`。更关键的是，数据库行仍是密文 pointer 形状，读侧会继续把对象装回
-  `body_ct`；原地覆盖还有「对象已改、行未改」时不可恢复的崩溃窗口。
-- 工具改成 inventory-only，`--apply` 在任何数据库/R2 访问前硬拒绝。Task 1.3 重新
-  标为 blocker：先定义明文 pointer（含二进制策略），再实现
-  「新 key 写明文 → CAS 切 pointer/形状 → 旧 key durable cleanup」，并同时覆盖
-  `chat_messages` / `chat_message_archive`、app 读侧、replicator 与 verify。
-- **设计草案已形成**：推荐持久化
-  `body_object_format="plaintext_v1" + body_size_bytes + body_sha256`，读取线形新增
-  `body_b64` 承载 file/image 明文字节；迁移逐 key 复用现有 upload guard、advisory
-  lock、CAS 与 cleanup。archive 保持 UPDATE 不可变，迁移用事务内 delete+insert。
-  由此修正阶段顺序：代码可先落，生产 apply 必须等 iOS 支持 `body_b64` 并完成强更。
-- **[DECISION] 2026-07-31 四项推荐方案全部拍板**：允许明文档 image/file raw
-  bytes 明文存在 R2；采用 `body_b64` public wire shape；archive 用事务内
-  delete+insert；plaintext pointer 强制 size + SHA-256 校验。批准设计不等于批准
-  生产数据操作，apply gate 不变。
-- 同轮补上 Phase 2 终态漏测：显式明文档的新 `body` 行进入 TEE replicator 时直搬，
-  不铸 token、不触碰 enclave；chat 的 plaintext thinking/caption 会规范化成嵌套
-  形状，混合的加密子信封仍会解密。R2 瞬时水合失败继续按既有语义冻结游标重试，
-  不会被误分成 `PendingDeviceMigration` 后跳过。
-- 合并 `origin/test` 时加密面守卫抓到新 `v2_agent_profile`。通用 builder 本身已按
-  effective preference 路由，旧守卫把它当强制 primitive 属误报，已收窄为只抓直接
-  `build_envelope()`；profile validator/read 的确仍写死 `body_ct`，已改为每字段
-  `body_ct|body` 路由，明文 profile 读取不铸 token、不触碰 enclave。
-- 定向回归 80 passed；相关文件 pyflakes 干净。
 
 ## 2026-07-30 — Runtime 值班台补审计的三条实质缺口：capture 语义、完整窗口、端到端交付
 

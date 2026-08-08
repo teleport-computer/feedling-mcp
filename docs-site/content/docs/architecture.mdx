@@ -206,9 +206,41 @@ account's chat route, provider URL, or credential.
    through the same resident or Hosted Runtime V2 path used by typed messages,
    including the same conversation history, persona, memory, and tools.
 4. Assistant text streams back over an OpenAI-compatible SSE response for
-   ElevenLabs to synthesize. The user and assistant turns remain in ordinary
-   Chat history in their original order, so the call is not imported a second
-   time after hang-up.
+   ElevenLabs to synthesize. During the call the user and assistant turns are
+   persisted as ordinary Chat rows in their original order.
+5. At hang-up the client posts the call transcript to
+   `POST /v1/voice/finalize`. The full transcript is archived — permanently,
+   using the account's effective content-encryption tier — and the chat stream keeps ONE bounded
+   preview card (`voice_call_transcript`, deterministic id, idempotent
+   retries). Only after the archive is durable are the call's per-turn rows
+   deleted, so the raw back-and-forth stops occupying chat history and model
+   context. Memory then runs the ordinary capture pipeline, which renders the
+   ARCHIVED FULL transcript into its window in place of that card — a call is
+   distilled from everything that was said, not from a précis of it. Rows
+   already folded into the Runtime V2 conversation summary are retained
+   (deleting them would desync compaction's frozen ledger); they no longer
+   feed future context reads. If the archive or the card cannot be persisted,
+   nothing is deleted and the client may retry.
+6. If a failed or empty call will not be archived, the client calls
+   `POST /v1/voice/cancel` with its `call_id` and a bounded reason. The
+   idempotent cancellation tombstone removes unarchived turn rows and stops
+   late resident or Runtime V2 replies before they can enter ordinary Chat.
+   Finalize claims its lifecycle state before writing the archive, so a
+   concurrent cancel cannot downgrade or partially delete a successful call.
+7. Archived calls stay readable: `GET /v1/voice/transcripts` lists them and
+   `GET /v1/voice/transcripts/{call_id}` returns the shape-aware content envelope
+   (ciphertext for encrypted-tier accounts, plaintext for plaintext-tier
+   accounts). The agent reaches the same archive through the
+   `voice_transcript_list` / `voice_transcript_read` tools, and memory cards
+   distilled from a call carry that call's id so it can go back to the source.
+   For encrypted-tier accounts the server stores and serves ciphertext; for
+   plaintext-tier accounts the promoted TEE database stores the plaintext
+   envelope under the same tenant-bound schema. Transcript trust
+   boundary: the transcript is client-supplied plaintext (chat rows are
+   ciphertext the server cannot read); an authenticated user can therefore
+   only shape their own summary and delete their own call rows. Known
+   limitation: a resident (self-hosted) runtime's persistent agent session may
+   still remember in-call content until its session naturally rotates.
 
 Deployment prerequisite: the API service must set
 `FEEDLING_VOICE_GATEWAY_PUBLIC_URL` to the externally reachable HTTPS origin

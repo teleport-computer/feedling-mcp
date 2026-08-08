@@ -1372,12 +1372,12 @@
             "name": "X-Feedling-Consumer-Capabilities",
             "in": "header",
             "required": false,
-            "description": "Comma-separated capabilities advertised by the current official resident poll.",
+            "description": "Comma-separated capabilities advertised by the current official resident poll. agent_image_generation_v1 means the configured agent entry exposes a callable native image-generation tool; it is not inferred from VPS deployment alone.",
             "schema": {
               "type": "string",
               "maxLength": 500
             },
-            "example": "vision_observer_v1"
+            "example": "vision_observer_v1,agent_image_generation_v1"
           },
           {
             "name": "X-Feedling-Consumer-Compat-Commit",
@@ -1511,12 +1511,12 @@
             "name": "X-Feedling-Consumer-Capabilities",
             "in": "header",
             "required": false,
-            "description": "Comma-separated capabilities advertised by the current official resident poll.",
+            "description": "Comma-separated capabilities advertised by the current official resident poll. agent_image_generation_v1 means the configured agent entry exposes a callable native image-generation tool; it is not inferred from VPS deployment alone.",
             "schema": {
               "type": "string",
               "maxLength": 500
             },
-            "example": "vision_observer_v1"
+            "example": "vision_observer_v1,agent_image_generation_v1"
           }
         ],
         "requestBody": {
@@ -1530,7 +1530,7 @@
           }
         },
         "x-feedling-contract-level": "documented",
-        "description": "Store an agent reply as a v1 ciphertext envelope (plus optional thinking envelope and encrypted file_followups). A text primary and its file cards commit as one ordered transaction. Replies carrying reply_to_message_id are finalized atomically across backend workers: exactly one request inserts the reply and marks the parent answered, while a losing contender returns 409 already_answered without storing its reply. A hidden source=verify_ping reply is accepted only when reply_to_message_id identifies an outstanding verify ping exactly. role=system notices bypass reply exclusivity. Labeled envelopes sealed to a key that is no longer the user's registered content key are rejected with 409 content_pk_fpr_mismatch — the writer should re-fetch whoami, re-seal, and retry once."
+        "description": "Store an agent reply as a v1 ciphertext envelope plus optional thinking and encrypted file/image followups. A text primary and its attachment rows commit as one ordered transaction; generated images are returned as native content_type=image Chat messages. Replies carrying reply_to_message_id are finalized atomically across backend workers: exactly one request inserts the reply and marks the parent answered, while a losing contender returns 409 already_answered without storing its reply. A hidden source=verify_ping reply is accepted only when reply_to_message_id identifies an outstanding verify ping exactly. role=system notices bypass reply exclusivity. Labeled envelopes sealed to a key that is no longer the user's registered content key are rejected with 409 content_pk_fpr_mismatch — the writer should re-fetch whoami, re-seal, and retry once."
       }
     },
     "/v1/chat/turn-activity/{turn_id}": {
@@ -2258,7 +2258,7 @@
           }
         },
         "x-feedling-contract-level": "compatibility",
-        "description": "Queue an asynchronous plaintext import and immediately publish every material as queued with its total window count. Every processing frame preserves the complete material list while item progress advances. Identity may become ready while processing continues; done is published only after every material window completes. Only one plaintext import can process per account; a concurrent submission returns 409 import_job_active with active_job_id. A same-host abandoned worker is detected by its exited process and failed immediately as worker_restarted; remote or legacy owners use a bounded heartbeat lease so a live rolling-deploy worker is not killed. A failed matching client_job_id or input is resumed from its encrypted per-window checkpoint, while a completed match returns the existing job. In update_identity mode, the uploaded role card creates an identity when absent or updates the existing card while preserving its relationship anchor by default."
+        "description": "Queue an asynchronous plaintext import and immediately publish every material as queued with its total window count. Every processing frame preserves the complete material list while item progress advances. Identity may become ready while processing continues; done is published only after every material window completes. A non-empty keep-all memory import that produces zero cards fails as distill_empty_output; its job output may include up to six discarded-map diagnostics, each with a reason and a model-output excerpt capped at 500 characters. Only one plaintext import can process per account; a concurrent submission returns 409 import_job_active with active_job_id. A same-host abandoned worker is detected by its exited process and failed immediately as worker_restarted; remote or legacy owners use a bounded heartbeat lease so a live rolling-deploy worker is not killed. A failed matching client_job_id or input is resumed from its encrypted per-window checkpoint, while a completed match returns the existing job. In update_identity mode, the uploaded role card creates an identity when absent or updates the existing card while preserving its relationship anchor by default."
       }
     },
     "/v1/genesis/imports/plaintext/commit": {
@@ -2394,7 +2394,7 @@
           }
         },
         "x-feedling-contract-level": "compatibility",
-        "description": "Parse and encrypt-stage plaintext onboarding material without calling an LLM. Returns per-material window and conservative token estimates plus an optional fast-model recommendation for Anthropic, DeepSeek, Gemini, OpenAI, OpenRouter, or compatible relay configurations. The staged payload expires and must be committed by staged_id."
+        "description": "Parse and encrypt-stage plaintext onboarding material without calling an LLM. Returns per-material window and conservative token estimates plus an optional fast-model recommendation for Anthropic, DeepSeek, Gemini, OpenAI, OpenRouter, or compatible relay configurations. Compatible-relay recommendations exclude Gemini Flash model IDs while leaving Gemini Pro and non-Gemini Flash names eligible. The staged payload expires and must be committed by staged_id."
       }
     },
     "/v1/genesis/imports/{job_id}": {
@@ -3385,6 +3385,250 @@
           "Identity"
         ],
         "x-feedling-contract-level": "documented"
+      }
+    },
+    "/v1/image-generation/config": {
+      "get": {
+        "summary": "Image Generation Config Get",
+        "operationId": "image_generation_config_get_v1_image_generation_config_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GenericJsonResponse"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Error response.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "Other"
+        ],
+        "x-feedling-contract-level": "documented",
+        "description": "Return the effective image-generation route, candidate routes, and validation state. The response mirrors vision routing semantics: follow_main uses the active chat route and dedicated pins a separately validated route."
+      },
+      "put": {
+        "summary": "Image Generation Config Set",
+        "operationId": "image_generation_config_set_v1_image_generation_config_put",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GenericJsonResponse"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Error response.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "Other"
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ImageGenerationConfigUpdateRequest"
+              }
+            }
+          }
+        },
+        "x-feedling-contract-level": "documented",
+        "description": "Select follow_main or a dedicated image-generation route. The selected route is validated for real image output before the change is committed."
+      },
+      "post": {
+        "summary": "Image Generation Route Configure",
+        "operationId": "image_generation_route_configure_v1_image_generation_config_post",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GenericJsonResponse"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Error response.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "Other"
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ImageGenerationRouteCreateRequest"
+              }
+            }
+          }
+        },
+        "x-feedling-contract-level": "documented",
+        "description": "Create, validate, and select a dedicated image-generation route using an existing credential or a newly supplied provider key."
+      }
+    },
+    "/v1/image-generation/generate": {
+      "post": {
+        "summary": "Image Generation Generate",
+        "operationId": "image_generation_generate_v1_image_generation_generate_post",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GenericJsonResponse"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Error response.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "Other"
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ImageGenerationRequest"
+              }
+            }
+          }
+        },
+        "x-feedling-contract-level": "documented"
+      }
+    },
+    "/v1/image-generation/main/test": {
+      "post": {
+        "summary": "Image Generation Main Test",
+        "operationId": "image_generation_main_test_v1_image_generation_main_test_post",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GenericJsonResponse"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Error response.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "Other"
+        ],
+        "x-feedling-contract-level": "documented",
+        "description": "Validate the active main route for real image generation and return the refreshed effective configuration."
+      }
+    },
+    "/v1/image-generation/routes/{route_id}/test": {
+      "post": {
+        "summary": "Image Generation Route Test",
+        "operationId": "image_generation_route_test_v1_image_generation_routes__route_id__test_post",
+        "parameters": [
+          {
+            "name": "route_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Route Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GenericJsonResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid path or request parameter.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Error response.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "Other"
+        ],
+        "x-feedling-contract-level": "documented",
+        "description": "Validate one saved route for real image generation and persist its capability result."
       }
     },
     "/v1/mcp/envelopes": {
@@ -7979,10 +8223,96 @@
         "x-feedling-contract-level": "documented"
       }
     },
+    "/v1/voice/cancel": {
+      "post": {
+        "summary": "Cancel Voice Call",
+        "description": "Idempotently end a voice call that will not be archived. The durable tombstone suppresses late resident and Hosted Runtime V2 replies before chat insertion, removes unarchived per-turn rows and encrypted voice handoff state, and makes repeated cancellation safe. If finalize already claimed the call, cancellation returns that lifecycle state without deleting rows or downgrading the archive.",
+        "operationId": "cancel_voice_call_v1_voice_cancel_post",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GenericJsonResponse"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Error response.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "Other"
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/VoiceCallCancelRequest"
+              }
+            }
+          }
+        },
+        "x-feedling-contract-level": "documented"
+      }
+    },
     "/v1/voice/chat/completions": {
       "post": {
         "summary": "Voice Chat Completions",
         "operationId": "voice_chat_completions_v1_voice_chat_completions_post",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GenericJsonResponse"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Error response.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "Other"
+        ],
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/FreeFormJsonObject"
+              }
+            }
+          }
+        },
+        "x-feedling-contract-level": "compatibility"
+      }
+    },
+    "/v1/voice/finalize": {
+      "post": {
+        "summary": "Finalize Voice Call",
+        "description": "Hangup: archive the full transcript, leave ONE small card, run Capture.\n\nThe live call is untouched (per-turn voice rides the normal chat lane: same\nidentity, memory and tools). At hangup the client sends the call's plaintext\ntranscript (chat rows are ciphertext the server cannot read) and three\nthings happen, in this order:\n\n1. the FULL transcript is archived to ``voice_transcripts`` — permanent,\n   E2E-sealed, readable from Settings and by the agent's transcript tools;\n2. one bounded preview card (``voice_call_transcript``) replaces the call's\n   per-turn rows in the chat stream, so neither the prompt tail nor the\n   history carries a whole call;\n3. Capture is forced. It renders the archived FULL text into its window in\n   place of this card, so memory is distilled from everything that was said\n   — through the ordinary capture pipeline, not a parallel one.\n\nThere is deliberately no summary: a 1-3 sentence model-written précis was\nboth a second model call and a lossy memory input. The card's preview is\nmechanical (head + tail), the archive holds the rest.\n\nIdempotent: the card's message id derives from ``call_id``; a retried\nfinalize finds the row and re-runs only the (idempotent) cleanup and\ncapture nudge. On any archive/card failure the per-turn rows are KEPT\n(nothing is lost) and the client may retry.",
+        "operationId": "finalize_voice_call_v1_voice_finalize_post",
         "responses": {
           "200": {
             "description": "Successful Response",
@@ -8061,6 +8391,93 @@
           }
         },
         "x-feedling-contract-level": "compatibility"
+      }
+    },
+    "/v1/voice/transcripts": {
+      "get": {
+        "summary": "List Voice Transcripts",
+        "description": "Newest-first list of this user's archived calls, WITHOUT the bodies.\n\nSettings renders this; the agent's ``voice_transcript_list`` tool reads the\nsame shape. Metadata only — pulling a body is an explicit second call so a\nlisting can never blow anyone's context.",
+        "operationId": "list_voice_transcripts_v1_voice_transcripts_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GenericJsonResponse"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Error response.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "Other"
+        ],
+        "x-feedling-contract-level": "documented"
+      }
+    },
+    "/v1/voice/transcripts/{call_id}": {
+      "get": {
+        "summary": "Get Voice Transcript",
+        "description": "One archived call as its raw v1 envelope — the client decrypts locally.\n\nSame posture as ``/v1/memory/list``: the server hands back ciphertext it\ncannot read. Server-side readers (Capture, the agent tools) go through\n``transcript_store.load_plaintext`` and the enclave instead.",
+        "operationId": "get_voice_transcript_v1_voice_transcripts__call_id__get",
+        "parameters": [
+          {
+            "name": "call_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Call Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GenericJsonResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid path or request parameter.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Error response.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "Other"
+        ],
+        "x-feedling-contract-level": "documented"
       }
     },
     "/v1/web/settings": {
@@ -8361,6 +8778,27 @@
           }
         },
         "title": "ValidationError"
+      },
+      "VoiceCallCancelRequest": {
+        "type": "object",
+        "required": [
+          "call_id",
+          "reason"
+        ],
+        "properties": {
+          "call_id": {
+            "type": "string",
+            "pattern": "^vcall_",
+            "maxLength": 96
+          },
+          "reason": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 64,
+            "description": "Bounded client cancellation reason, for example user_hangup, connect_failed, transcript_empty, or app_terminated."
+          }
+        },
+        "additionalProperties": false
       },
       "ModelApiModelsRequest": {
         "type": "object",
@@ -9537,6 +9975,114 @@
         ],
         "additionalProperties": false
       },
+      "ImageGenerationConfigUpdateRequest": {
+        "type": "object",
+        "required": [
+          "mode"
+        ],
+        "properties": {
+          "mode": {
+            "type": "string",
+            "enum": [
+              "follow_main",
+              "dedicated"
+            ]
+          },
+          "route_id": {
+            "type": "string",
+            "format": "uuid",
+            "description": "Required when mode is dedicated."
+          }
+        },
+        "if": {
+          "properties": {
+            "mode": {
+              "const": "dedicated"
+            }
+          },
+          "required": [
+            "mode"
+          ]
+        },
+        "then": {
+          "required": [
+            "route_id"
+          ]
+        },
+        "additionalProperties": false
+      },
+      "ImageGenerationRouteCreateRequest": {
+        "type": "object",
+        "required": [
+          "model"
+        ],
+        "properties": {
+          "provider": {
+            "type": "string"
+          },
+          "model": {
+            "type": "string",
+            "minLength": 1
+          },
+          "api_key": {
+            "type": "string",
+            "minLength": 1,
+            "writeOnly": true
+          },
+          "credential_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "label": {
+            "type": "string"
+          },
+          "base_url": {
+            "type": "string",
+            "format": "uri"
+          },
+          "context_window_tokens": {
+            "type": "integer",
+            "minimum": 8192
+          }
+        },
+        "oneOf": [
+          {
+            "required": [
+              "api_key"
+            ],
+            "not": {
+              "required": [
+                "credential_id"
+              ]
+            }
+          },
+          {
+            "required": [
+              "credential_id"
+            ],
+            "not": {
+              "required": [
+                "api_key"
+              ]
+            }
+          }
+        ],
+        "additionalProperties": false
+      },
+      "ImageGenerationRequest": {
+        "type": "object",
+        "required": [
+          "prompt"
+        ],
+        "properties": {
+          "prompt": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 8000
+          }
+        },
+        "additionalProperties": false
+      },
       "VisionObserveRequest": {
         "type": "object",
         "required": [
@@ -9856,6 +10402,14 @@
               }
             ],
             "description": "Optional shape-aware user text sent alongside an image/file. It follows content_encryption_effective independently of the binary main envelope. Ignored for content_type=text."
+          },
+          "context_refs": {
+            "type": "array",
+            "maxItems": 8,
+            "description": "Optional plaintext routing metadata: memory references the user explicitly attached to this turn (Garden 「talk in chat」). Same contract as the hosted send: only the first eight entries are considered, only type=memory is honored, and ids only are persisted (as quoted_memory_ids) for the enclave to expand into decrypted memory context. Titles are for client display and are not stored.",
+            "items": {
+              "$ref": "#/components/schemas/ChatContextReference"
+            }
           }
         },
         "additionalProperties": true
@@ -9886,6 +10440,33 @@
             "type": "integer",
             "minimum": 1,
             "maximum": 1000000
+          }
+        },
+        "additionalProperties": false
+      },
+      "ChatImageFollowup": {
+        "type": "object",
+        "required": [
+          "envelope",
+          "image_mime",
+          "image_byte_count"
+        ],
+        "properties": {
+          "envelope": {
+            "$ref": "#/components/schemas/EncryptedEnvelope"
+          },
+          "image_mime": {
+            "type": "string",
+            "enum": [
+              "image/jpeg",
+              "image/png",
+              "image/webp"
+            ]
+          },
+          "image_byte_count": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 2000000
           }
         },
         "additionalProperties": false
@@ -9937,6 +10518,15 @@
               "$ref": "#/components/schemas/ChatFileFollowup"
             },
             "description": "Optional encrypted download cards committed atomically after a text primary. Chat source only; reply_to_message_id is required. The order in this array is the display order below the primary reply."
+          },
+          "image_followups": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 4,
+            "items": {
+              "$ref": "#/components/schemas/ChatImageFollowup"
+            },
+            "description": "Optional encrypted generated images committed atomically after a text primary. Each row is returned as content_type=image and renders directly in Chat. Chat source only; reply_to_message_id is required."
           },
           "turn_failure_error_class": {
             "type": "string",

@@ -5,10 +5,24 @@ V2 云端为注册表制无需本模块;VPS 线(consumer)长期使用。0727 合
 本模块在 consumer 前台回合中调用,生成 io_cli 命令清单并注入 prompt。
 目录通过实时子进程调用 io_cli --help 生成,永不教用户"没有的东西"。
 """
+import os
 import re
 import subprocess
 import sys
 from typing import Optional
+
+# 目录构建靠子进程 `--help`,而 `text=True` 两侧都用系统 locale 编码:中文
+# Windows 是 cp936(GBK)。help 文本里只要出现一个 GBK 装不下的字符(2026-08-08
+# 一位自建用户报的正是 identity-redistill 里的 ⚠️ U+26A0),子进程就
+# UnicodeEncodeError 退出 → build_catalog 返回 None → agent **每一轮都丢掉整个
+# 工具目录**,只剩 D3 一行,而且完全静默。这里两侧都钉死 UTF-8:子进程用
+# PYTHONIOENCODING 写、父进程按 UTF-8 读,errors="replace" 保证再脏的字节也
+# 只是花掉一个字符,不会让整份目录消失。
+_UTF8_PIPE = {
+    "encoding": "utf-8",
+    "errors": "replace",
+    "env": {**os.environ, "PYTHONIOENCODING": "utf-8"},
+}
 
 # D8 软引导 + D3 来源规则 — the shared text for both. Module-level constants
 # (not inlined into build_catalog's header) so every OTHER place that needs to
@@ -49,8 +63,8 @@ def build_catalog(io_cli_path: str, python: str = sys.executable) -> Optional[st
         result = subprocess.run(
             [python, io_cli_path, "--help"],
             capture_output=True,
-            text=True,
             timeout=10,
+            **_UTF8_PIPE,
         )
         if result.returncode != 0:
             return None
@@ -147,8 +161,8 @@ def build_catalog(io_cli_path: str, python: str = sys.executable) -> Optional[st
             result = subprocess.run(
                 [python, io_cli_path, verb, "--help"],
                 capture_output=True,
-                text=True,
                 timeout=10,
+                **_UTF8_PIPE,
             )
             if result.returncode != 0:
                 return None

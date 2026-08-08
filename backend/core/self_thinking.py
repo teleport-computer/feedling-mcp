@@ -15,6 +15,8 @@ the caller can fail closed. Hard invariants:
     the user-visible reply (same risk class as the protocol-JSON tail leak);
   * private thinking content is NEVER promoted to the reply when the block cannot
     be cleanly resolved;
+  * a clean thinking-only response is distinct from malformed protocol so wake
+    lanes can treat intentional silence as success without weakening leak guards;
   * with the feature off (or ABSENT) the reply is byte-identical to today.
 """
 from __future__ import annotations
@@ -26,7 +28,8 @@ import unicodedata
 # Parse outcomes.
 ABSENT = "absent"       # no leading <think> → reply is the original text
 COMPLETE = "complete"   # clean <tag>…</tag> + non-empty reply
-FAILED = "failed"       # unresolvable (truncated/mismatched/nested/no reply)
+SILENT = "silent"       # clean <tag>…</tag> + intentionally empty public reply
+FAILED = "failed"       # unresolvable (truncated/mismatched/nested)
 
 MAX_THINKING_CHARS = 240
 
@@ -133,5 +136,5 @@ def split_thinking(text: str) -> tuple[str, str, str]:
     if _ANY_TAG.search(inner):
         return FAILED, "", ""
     if not reply:
-        return FAILED, "", ""  # clean block but no public reply
+        return SILENT, _sanitize(inner), ""
     return COMPLETE, _sanitize(inner), reply

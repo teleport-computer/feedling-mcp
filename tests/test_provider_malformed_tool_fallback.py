@@ -94,7 +94,7 @@ def test_malformed_wire_uses_exactly_one_tools_disabled_fallback(
     provider_tools = []
     decoded_calls = []
 
-    async def _provider(_config, _messages, *, tools=None):
+    async def _provider(_config, _messages, *, tools=None, **kwargs):
         provider_tools.append(tools)
         if tools is None:
             return {"reply": "plain fallback", "tool_calls": [], "usage": {}}
@@ -141,7 +141,7 @@ def test_content_400_raises_without_a_wasted_tools_disabled_retry(monkeypatch):
     case); the loop must raise on the first call and never retry with tools=None."""
     seen_tools = []
 
-    async def _provider(_config, _messages, *, tools=None):
+    async def _provider(_config, _messages, *, tools=None, **kwargs):
         seen_tools.append(tools)
         raise provider_client.ProviderError(
             "provider_http_400: Invalid value: 'input_text'. "
@@ -180,7 +180,7 @@ def test_tool_schema_400_still_falls_back_to_text(monkeypatch):
     fallback's intended purpose is preserved."""
     seen_tools = []
 
-    async def _provider(_config, _messages, *, tools=None):
+    async def _provider(_config, _messages, *, tools=None, **kwargs):
         seen_tools.append(tools)
         if tools is None:
             return {"reply": "text without tools", "tool_calls": [], "usage": {}}
@@ -241,7 +241,7 @@ def test_web_observation_revokes_durable_writes_for_later_rounds(monkeypatch):
         {"reply": "safe final", "tool_calls": [], "usage": {}},
     ])
 
-    async def _provider(_config, _messages, *, tools=None):
+    async def _provider(_config, _messages, *, tools=None, **kwargs):
         provider_tools.append(tools)
         return next(responses)
 
@@ -304,7 +304,7 @@ def test_web_search_allows_only_exact_returned_url_for_followup_fetch(monkeypatc
         {"reply": "grounded answer", "tool_calls": [], "usage": {}},
     ])
 
-    async def _provider(_config, _messages, *, tools=None):
+    async def _provider(_config, _messages, *, tools=None, **kwargs):
         provider_tools.append(tools)
         return next(responses)
 
@@ -375,7 +375,7 @@ def test_web_search_result_cannot_redirect_model_to_fresh_fetch_url(monkeypatch)
         {"reply": "safe fallback", "tool_calls": [], "usage": {}},
     ])
 
-    async def _provider(_config, _messages, *, tools=None):
+    async def _provider(_config, _messages, *, tools=None, **kwargs):
         return next(responses)
 
     dispatched = []
@@ -425,7 +425,7 @@ def test_reply_and_durable_write_same_batch_fail_closed(monkeypatch):
         {"reply": "I couldn't safely apply that change.", "tool_calls": [], "usage": {}},
     ])
 
-    async def _provider(_config, _messages, *, tools=None):
+    async def _provider(_config, _messages, *, tools=None, **kwargs):
         provider_tools.append(tools)
         return next(responses)
 

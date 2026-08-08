@@ -172,3 +172,113 @@ def test_write_message_file_persists_caption_alongside_name(store):
     m = next(x for x in store.chat_messages if x["id"] == "envfile2")
     assert m["file_name"] == "plan.md"
     assert m.get("caption_body_ct") == cap["body_ct"]
+
+
+# --------------------------------------------------------------------------- #
+# context_refs → quoted_memory_ids (Garden「talk in chat」on the resident line).
+# Same plaintext-routing contract as the hosted path in chat_send_core: only
+# memory ids are persisted; the enclave expands them into cards on read.
+# --------------------------------------------------------------------------- #
+
+def test_write_message_persists_quoted_memory_ids(store):
+    payload = {
+        "envelope": _env(store.user_id, "envq1"),
+        "context_refs": [{"type": "memory", "id": "mom_dog", "title": "养了蛋子"}],
+    }
+    body, status = chat_core.write_message(store, payload)
+    assert status == 200, body
+    m = next(x for x in store.chat_messages if x["id"] == "envq1")
+    assert m.get("quoted_memory_ids") == "mom_dog"
+
+
+def test_write_message_quoted_ids_filter_cap_and_junk(store):
+    refs = [
+        {"type": "memory", "id": f"m{i}"} for i in range(10)  # sliced to 8
+    ] + [
+        {"type": "screen", "id": "not_memory"},  # non-memory type ignored
+        {"type": "memory", "id": "   "},         # blank id ignored
+        "junk", 42, None,                        # malformed entries ignored
+    ]
+    payload = {"envelope": _env(store.user_id, "envq2"), "context_refs": refs}
+    body, status = chat_core.write_message(store, payload)
+    assert status == 200, body
+    m = next(x for x in store.chat_messages if x["id"] == "envq2")
+    assert m.get("quoted_memory_ids") == ",".join(f"m{i}" for i in range(8))
+
+
+def test_write_message_quoted_ids_hosted_parity(store):
+    # Normalization must stay in lockstep with hosted _context_refs_from_payload:
+    # slice-to-8 happens BEFORE filtering (a memory ref hiding behind 8 junk
+    # entries is dropped, as on hosted), type is stripped, ids truncate to 160,
+    # and the camelCase contextRefs alias is accepted.
+    behind_junk = [{"type": "screen", "id": f"s{i}"} for i in range(8)]
+    behind_junk.append({"type": "memory", "id": "mom_ninth"})
+    payload = {"envelope": _env(store.user_id, "envq5"), "context_refs": behind_junk}
+    body, status = chat_core.write_message(store, payload)
+    assert status == 200, body
+    m = next(x for x in store.chat_messages if x["id"] == "envq5")
+    assert not m.get("quoted_memory_ids")
+
+    long_id = "x" * 161
+    payload = {
+        "envelope": _env(store.user_id, "envq6"),
+        "contextRefs": [{"type": " memory ", "id": long_id}],
+    }
+    body, status = chat_core.write_message(store, payload)
+    assert status == 200, body
+    m = next(x for x in store.chat_messages if x["id"] == "envq6")
+    assert m.get("quoted_memory_ids") == "x" * 160
+
+    # Truncation exposing trailing whitespace must strip again, as hosted does
+    # at its filter stage ("x"*159 + " y" → cut at 160 → "x"*159 + " " → strip).
+    payload = {
+        "envelope": _env(store.user_id, "envq7"),
+        "context_refs": [{"type": "memory", "id": "x" * 159 + " y"}],
+    }
+    body, status = chat_core.write_message(store, payload)
+    assert status == 200, body
+    m = next(x for x in store.chat_messages if x["id"] == "envq7")
+    assert m.get("quoted_memory_ids") == "x" * 159
+
+
+def test_quoted_ids_normalization_matches_hosted_pipeline():
+    # Anti-drift guard: run the exact hosted pipeline (normalize → memory
+    # filter, hosted/context.py + chat_send_core) against the chat_core mirror
+    # over a corpus of tricky inputs. Tests may import both layers even though
+    # chat itself must not import hosted.
+    from hosted import context as hosted_context
+
+    corpus = [
+        [],
+        "not_a_list",
+        [{"type": "memory", "id": "m1"}],
+        [{"type": " memory ", "id": "  m2  "}],
+        [{"type": "screen", "id": "s"}] * 8 + [{"type": "memory", "id": "m9"}],
+        [{"type": "memory", "id": f"m{i}"} for i in range(12)],
+        [{"type": "memory", "id": "x" * 161}],
+        [{"type": "memory", "id": "x" * 159 + " y"}],
+        [{"type": "memory", "id": "   "}, "junk", 42, None, {"id": "no_type"}],
+    ]
+    for refs in corpus:
+        for key in ("context_refs", "contextRefs"):
+            payload = {key: refs}
+            hosted_refs = hosted_context._context_refs_from_payload(payload)
+            hosted_ids = [
+                str(r.get("id") or "").strip()
+                for r in hosted_refs
+                if r.get("type") == "memory" and str(r.get("id") or "").strip()
+            ]
+            expected = ",".join(hosted_ids[:8])
+            got = chat_core._quoted_memory_ids_from_context_refs(payload)
+            assert got == expected, f"drift for {key}={refs!r}: {got!r} != {expected!r}"
+
+
+def test_write_message_without_context_refs_unchanged(store):
+    # The normal path must stay byte-identical: no refs (or malformed
+    # container) → the quoted_memory_ids key is never written.
+    for marker, extra in (("envq3", {}), ("envq4", {"context_refs": "oops"})):
+        payload = {"envelope": _env(store.user_id, marker), **extra}
+        body, status = chat_core.write_message(store, payload)
+        assert status == 200, body
+        m = next(x for x in store.chat_messages if x["id"] == marker)
+        assert "quoted_memory_ids" not in m or not m["quoted_memory_ids"]

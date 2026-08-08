@@ -17,6 +17,7 @@ def test_all_action_types_registered():
         "web_search", "web_fetch",
         "schedule_wake", "cancel_wake",
         "workspace_list", "workspace_read", "workspace_write", "workspace_delete",
+        "voice_transcript_list", "voice_transcript_read",
     }
     assert set(registry.CAPABILITIES) == expected
     assert registry.WRITE_ACTIONS == frozenset({
@@ -38,7 +39,7 @@ def test_run_capability_unknown():
 
 
 def test_capabilities_is_a_real_populated_dict():
-    assert len(registry.CAPABILITIES) == 26
+    assert len(registry.CAPABILITIES) == 28
     assert set(registry.CAPABILITIES.keys()) == {
         "identity_get", "identity_patch", "identity_nudge", "memory_index", "memory_fetch", "memory_write",
         "memory_search",
@@ -48,6 +49,7 @@ def test_capabilities_is_a_real_populated_dict():
         "web_search", "web_fetch",
         "schedule_wake", "cancel_wake",
         "workspace_list", "workspace_read", "workspace_write", "workspace_delete",
+        "voice_transcript_list", "voice_transcript_read",
     }
-    assert len(list(registry.CAPABILITIES.items())) == 26
+    assert len(list(registry.CAPABILITIES.items())) == 28
     assert bool(registry.CAPABILITIES) is True

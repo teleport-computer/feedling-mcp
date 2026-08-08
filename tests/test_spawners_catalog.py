@@ -23,6 +23,7 @@ NEW_VERBS = (
     "schedule-wake",
     "cancel-wake",
     "send-file",
+    "send-image",
 )
 
 

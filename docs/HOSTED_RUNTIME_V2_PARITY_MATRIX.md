@@ -86,7 +86,7 @@ untrusted binary is parsed. Runtime V2 does not currently expose a generic shell
 or arbitrary code-execution tool. The detailed facade and enclave mapping lives in
 [`docs/superpowers/specs/runtime-v2-parity-matrix.md`](superpowers/specs/runtime-v2-parity-matrix.md).
 
-| Lane | Status | Note |
+| Lane / capability | Status | Note |
 |---|---|---|
 | Chat | ✅ | Unified native loop with durable reply/effect handling |
 | Manual, heartbeat, scheduled wake | ✅ | Same native loop as chat |
@@ -96,6 +96,7 @@ or arbitrary code-execution tool. The detailed facade and enclave mapping lives 
 | Memory Dream | ➖ | Native `op/card_ids/result` consolidations map to multi-card supersede actions and pass the real Garden validator, but activation is a separate optional product lane rather than a Runtime V2 release requirement. All managed defaults keep it off. This Dream organizes memory cards and is not runtime failure replay. |
 | Genesis import | ✅ | Rehomed under `serve-worker` with a dedicated heartbeat |
 | Trajectory review | ✅ | Encrypted capture is always on and retained until account deletion; Chat Clear preserves it. Provider-backed offline review is opt-in/default-off, globally capped, tools-disabled, and has no live effect surfaces; operators have a separate default-off, exact-job, runner-local audited inspector. |
+| Foreground World Book grounding | ✅ | Chat matches the current user turn through the shared enclave read side and adds matched entries as a standalone untrusted user-role setting-data block. The block is prompt-budgeted and deterministically truncated with an explicit marker; wake lanes remain unchanged for V1 parity. |
 
 ## Incident-hardened guards — ported?
 

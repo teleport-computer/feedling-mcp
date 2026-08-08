@@ -193,7 +193,14 @@ GET /v1/notices?include_resolved=<bool, 默认 true>
 - 语义：不算对用户消息的回复（不影响已回复状态）、不推送（兜底话术那条已推过）、失败重试期间不会重复出现（服务端已做排他与去抖）。
 
 回合错误的 error_class 全集（同时会双写进通知中心）：
-`quota_insufficient` · `auth_invalid` · `model_not_found` · `vision_model_required` · `rate_limited` · `upstream_unavailable` · `turn_timeout` · `reply_parse_failed` · `unknown`
+`quota_insufficient` · `auth_invalid` · `model_not_found` · `vision_model_required` · `rate_limited` · `upstream_unavailable` · `turn_timeout` · `provider_empty_reply` · `reply_parse_failed` · `unknown`
+
+> `provider_empty_reply`（provider_transient，2026-08-07 新增）：模型/中转
+> transport 成功、协议可识别，但 assistant 内容为空（断流、配额紧张时的 200
+> 假成功）。与 `reply_parse_failed`（system）的分界是**谁把内容弄没的**：
+> 模型本来就没给 → provider；给过、被我们的清洗/压制掏空 → 我们。
+> 按 §2.3 显示矩阵，它与其它 `provider_transient` 类一样隐藏兜底气泡、
+> 只出失败横幅（老版按未知 slug 兜底即可）。
 
 计划新增（Phase C 同批；老版按未知 slug 兜底即可）：
 - `provider_incompatible`（user_provider）——上游不兼容请求格式（如部分中转/xAI 拒收工具 schema）

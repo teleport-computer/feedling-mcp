@@ -11,8 +11,6 @@
 
 from __future__ import annotations
 
-import math
-import re
 from typing import Any, Awaitable, Callable, NamedTuple
 
 import provider_client
@@ -20,40 +18,6 @@ import provider_client
 _MAX_TOKENS = 1500
 _TEMPERATURE = 0.3
 _TIMEOUT_SEC = 90.0
-
-def _semantic_text(card: dict) -> str:
-    values: list[str] = []
-    for key in ("title", "summary", "description", "content"):
-        value = str(card.get(key) or "").strip()
-        if value and value not in values:
-            values.append(value)
-    return " ".join(values)
-
-
-def _normalized_semantic_text(card: dict) -> str:
-    return "".join(re.findall(r"[\w]", _semantic_text(card).lower(), flags=re.UNICODE))
-
-
-def _has_substantive_increment(old_card: dict, result: dict) -> bool:
-    """Conservative deterministic fence for one-card Dream rewrites.
-
-    A 1:1 ``thicken``/``supersede`` must contain materially more text *and*
-    genuinely new 3-character sequences.  Paraphrases and lossy summaries are
-    rejected; multi-card merges use the separate all-targets-present fence.
-    """
-
-    old_text = _normalized_semantic_text(old_card)
-    new_text = _normalized_semantic_text(result)
-    if not old_text or not new_text:
-        return False
-    min_growth = max(24, math.ceil(len(old_text) * 0.15))
-    if len(new_text) < len(old_text) + min_growth:
-        return False
-    old_grams = {old_text[i : i + 3] for i in range(max(0, len(old_text) - 2))}
-    new_grams = {new_text[i : i + 3] for i in range(max(0, len(new_text) - 2))}
-    min_novel = max(6, math.ceil(len(old_grams) * 0.10))
-    return len(new_grams - old_grams) >= min_novel
-
 
 class ParseRetry(NamedTuple):
     """「解析/语义结果不合格 → 原样打回去重问一次」的注入点。
@@ -249,13 +213,20 @@ async def extract(
     return retry_value, None
 
 
-def _inner_from_card(card: dict) -> dict:
-    return {
+def _inner_from_card(card: dict, *, voice_call_id: str = "") -> dict:
+    inner = {
         "summary": str(card.get("summary") or "").strip(),
         "content": str(card.get("content") or "").strip(),
         "bucket": str(card.get("bucket") or "").strip(),
         "threads": list(card.get("threads") or []),
     }
+    # 溯源提示:这张卡来自一个含该通电话的 capture 窗口,agent 可据此调
+    # voice_transcript_read 回看原文。只在窗口"恰好含一通电话"时打——多通电话
+    # 的窗口无法判断某张卡属于哪一通,给了就是假精度。放在加密正文里(不放
+    # envelope 明文):服务端因此看不见"哪张卡来自哪通电话"。
+    if voice_call_id:
+        inner["voice_call_id"] = str(voice_call_id)[:96]
+    return inner
 
 
 def _memory_envelope_from_card(
@@ -265,6 +236,7 @@ def _memory_envelope_from_card(
     source: str,
     build_envelope: Callable[[dict], dict],
     default_type: str,
+    voice_call_id: str = "",
 ) -> dict:
     """Seal one card body and attach the plaintext metadata the real memory
     action validator requires.
@@ -277,7 +249,7 @@ def _memory_envelope_from_card(
     when = str(occurred_at or "").strip()
     if not when:
         raise ValueError("memory_occurred_at_required")
-    envelope = dict(build_envelope(_inner_from_card(card)) or {})
+    envelope = dict(build_envelope(_inner_from_card(card, voice_call_id=voice_call_id)) or {})
     envelope.update(
         {
             "type": str(card.get("type") or default_type).strip().lower()
@@ -301,6 +273,7 @@ def _to_actions(
     build_envelope: Callable[[dict], dict],
     capture_mode: str,
     reason: str,
+    voice_call_id: str = "",
 ) -> tuple[list[dict], int, int]:
     actions: list[dict] = []
     added = 0
@@ -319,6 +292,7 @@ def _to_actions(
                 source="memory_capture",
                 build_envelope=build_envelope,
                 default_type="event",
+                voice_call_id=voice_call_id,
             ),
             "reason": reason,
             "capture_mode": capture_mode,
@@ -346,12 +320,14 @@ def _to_actions(
     return actions, added, superseded
 
 
-def cards_to_actions(cards, *, occurred_at, source_ids, build_envelope):
+def cards_to_actions(cards, *, occurred_at, source_ids, build_envelope,
+                     voice_call_id: str = ""):
     return _to_actions(
         cards,
         occurred_at=occurred_at,
         source_ids=source_ids,
         build_envelope=build_envelope,
+        voice_call_id=voice_call_id,
         capture_mode="memory_capture",
         reason="Memory captured from a completed chat window.",
     )
@@ -408,15 +384,12 @@ def consolidations_to_actions(
             policy_rejections += 1
             continue
         if guarded:
+            # 2026-08-05 复盘只保留结构性判据:目标卡必须真实存在、不能被两条
+            # 提案重复退休。语义审查员与 15% 增量栅栏(内容质量判断)已拆除 ——
+            # 出口硬闸移到 parse 层(卡id泄漏/墓碑短语)与 worker 层(爆炸半径保险丝)。
             old_cards = [by_id.get(memory_id) for memory_id in card_ids]
-            if (
-                any(card is None for card in old_cards)
-                or any(memory_id in used_ids for memory_id in card_ids)
-                or consolidation.get("_review_approved") is not True
-                or (
-                    len(card_ids) == 1
-                    and not _has_substantive_increment(old_cards[0], result)
-                )
+            if any(card is None for card in old_cards) or any(
+                memory_id in used_ids for memory_id in card_ids
             ):
                 policy_rejections += 1
                 continue
@@ -437,9 +410,6 @@ def consolidations_to_actions(
                 "dream_op": op,
                 "dream_card_ids": card_ids,
                 "dream_rationale": rationale,
-                "dream_review_reason": str(
-                    consolidation.get("_review_reason") or ""
-                )[:1000],
                 "source_chat_message_ids": list(source_ids),
             }
         )

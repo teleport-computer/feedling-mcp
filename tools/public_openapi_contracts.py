@@ -27,6 +27,8 @@ BODYLESS_OPERATIONS: set[Operation] = {
     ("post", "/v1/model_api/test"),
     ("post", "/v1/model_api/routes/{route_id}/activate"),
     ("post", "/v1/model_api/routes/{route_id}/test"),
+    ("post", "/v1/image-generation/main/test"),
+    ("post", "/v1/image-generation/routes/{route_id}/test"),
     ("post", "/v1/vision/main/test"),
     ("post", "/v1/vision/routes/{route_id}/test"),
     ("post", "/v1/proactive/scheduled/fire"),
@@ -131,8 +133,10 @@ CONSUMER_HEADERS = [
     _header(
         "X-Feedling-Consumer-Capabilities",
         _schema("string", maxLength=500),
-        "Comma-separated capabilities advertised by the current official resident poll.",
-        example="vision_observer_v1",
+        "Comma-separated capabilities advertised by the current official resident poll. "
+        "agent_image_generation_v1 means the configured agent entry exposes a callable "
+        "native image-generation tool; it is not inferred from VPS deployment alone.",
+        example="vision_observer_v1,agent_image_generation_v1",
     ),
 ]
 
@@ -352,6 +356,28 @@ OPERATION_PARAMETERS[("put", "/v1/genesis/imports/{job_id}/chunks/{seq}")] = [
 
 
 COMPONENT_SCHEMAS: dict[str, dict[str, Any]] = {
+    "VoiceCallCancelRequest": {
+        "type": "object",
+        "required": ["call_id", "reason"],
+        "properties": {
+            "call_id": {
+                "type": "string",
+                "pattern": "^vcall_",
+                "maxLength": 96,
+            },
+            "reason": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 64,
+                "description": (
+                    "Bounded client cancellation reason, for example "
+                    "user_hangup, connect_failed, transcript_empty, or "
+                    "app_terminated."
+                ),
+            },
+        },
+        "additionalProperties": False,
+    },
     "ModelApiModelsRequest": {
         "type": "object",
         "description": (
@@ -1101,6 +1127,47 @@ COMPONENT_SCHEMAS: dict[str, dict[str, Any]] = {
         ],
         "additionalProperties": False,
     },
+    "ImageGenerationConfigUpdateRequest": {
+        "type": "object",
+        "required": ["mode"],
+        "properties": {
+            "mode": {"type": "string", "enum": ["follow_main", "dedicated"]},
+            "route_id": {
+                "type": "string",
+                "format": "uuid",
+                "description": "Required when mode is dedicated.",
+            },
+        },
+        "if": {"properties": {"mode": {"const": "dedicated"}}, "required": ["mode"]},
+        "then": {"required": ["route_id"]},
+        "additionalProperties": False,
+    },
+    "ImageGenerationRouteCreateRequest": {
+        "type": "object",
+        "required": ["model"],
+        "properties": {
+            "provider": {"type": "string"},
+            "model": {"type": "string", "minLength": 1},
+            "api_key": {"type": "string", "minLength": 1, "writeOnly": True},
+            "credential_id": {"type": "string", "format": "uuid"},
+            "label": {"type": "string"},
+            "base_url": {"type": "string", "format": "uri"},
+            "context_window_tokens": {"type": "integer", "minimum": 8192},
+        },
+        "oneOf": [
+            {"required": ["api_key"], "not": {"required": ["credential_id"]}},
+            {"required": ["credential_id"], "not": {"required": ["api_key"]}},
+        ],
+        "additionalProperties": False,
+    },
+    "ImageGenerationRequest": {
+        "type": "object",
+        "required": ["prompt"],
+        "properties": {
+            "prompt": {"type": "string", "minLength": 1, "maxLength": 8000},
+        },
+        "additionalProperties": False,
+    },
     "VisionObserveRequest": {
         "type": "object",
         "required": ["message_id", "route_id"],
@@ -1256,6 +1323,12 @@ COMPONENT_SCHEMAS: dict[str, dict[str, Any]] = {
                 "allOf": [{"$ref": "#/components/schemas/EncryptedEnvelope"}],
                 "description": "Optional shape-aware user text sent alongside an image/file. It follows content_encryption_effective independently of the binary main envelope. Ignored for content_type=text.",
             },
+            "context_refs": {
+                "type": "array",
+                "maxItems": 8,
+                "description": "Optional plaintext routing metadata: memory references the user explicitly attached to this turn (Garden 「talk in chat」). Same contract as the hosted send: only the first eight entries are considered, only type=memory is honored, and ids only are persisted (as quoted_memory_ids) for the enclave to expand into decrypted memory context. Titles are for client display and are not stored.",
+                "items": {"$ref": "#/components/schemas/ChatContextReference"},
+            },
         },
         "additionalProperties": True,
     },
@@ -1270,6 +1343,23 @@ COMPONENT_SCHEMAS: dict[str, dict[str, Any]] = {
                 "type": "integer",
                 "minimum": 1,
                 "maximum": 1000000,
+            },
+        },
+        "additionalProperties": False,
+    },
+    "ChatImageFollowup": {
+        "type": "object",
+        "required": ["envelope", "image_mime", "image_byte_count"],
+        "properties": {
+            "envelope": {"$ref": "#/components/schemas/EncryptedEnvelope"},
+            "image_mime": {
+                "type": "string",
+                "enum": ["image/jpeg", "image/png", "image/webp"],
+            },
+            "image_byte_count": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 2000000,
             },
         },
         "additionalProperties": False,
@@ -1305,6 +1395,13 @@ COMPONENT_SCHEMAS: dict[str, dict[str, Any]] = {
                 "maxItems": 8,
                 "items": {"$ref": "#/components/schemas/ChatFileFollowup"},
                 "description": "Optional encrypted download cards committed atomically after a text primary. Chat source only; reply_to_message_id is required. The order in this array is the display order below the primary reply.",
+            },
+            "image_followups": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": 4,
+                "items": {"$ref": "#/components/schemas/ChatImageFollowup"},
+                "description": "Optional encrypted generated images committed atomically after a text primary. Each row is returned as content_type=image and renders directly in Chat. Chat source only; reply_to_message_id is required.",
             },
             "turn_failure_error_class": {
                 "type": "string",
@@ -1986,6 +2083,7 @@ COMPONENT_SCHEMAS: dict[str, dict[str, Any]] = {
 
 
 PRECISE_JSON_BODIES: dict[Operation, str] = {
+    ("post", "/v1/voice/cancel"): "VoiceCallCancelRequest",
     ("post", "/v1/web/settings"): "WebSettingsUpdateRequest",
     ("post", "/v1/agent/web/search"): "WebSearchRequest",
     ("post", "/v1/agent/web/fetch"): "WebFetchRequest",
@@ -1998,6 +2096,9 @@ PRECISE_JSON_BODIES: dict[Operation, str] = {
     ("post", "/v1/model_api/chat/send"): "HostedChatSendRequest",
     ("post", "/v1/model_api/models"): "ModelApiModelsRequest",
     ("post", "/v1/model_api/runtime_error"): "ModelApiRuntimeErrorRequest",
+    ("put", "/v1/image-generation/config"): "ImageGenerationConfigUpdateRequest",
+    ("post", "/v1/image-generation/config"): "ImageGenerationRouteCreateRequest",
+    ("post", "/v1/image-generation/generate"): "ImageGenerationRequest",
     ("put", "/v1/vision/config"): "VisionConfigUpdateRequest",
     ("post", "/v1/vision/config"): "VisionRouteCreateRequest",
     ("post", "/v1/vision/observe"): "VisionObserveRequest",
@@ -2079,6 +2180,14 @@ SPECIAL_REQUEST_BODIES: dict[Operation, dict[str, Any]] = {
 
 
 OPERATION_DESCRIPTIONS: dict[Operation, str] = {
+    ("post", "/v1/voice/cancel"): (
+        "Idempotently end a voice call that will not be archived. The durable "
+        "tombstone suppresses late resident and Hosted Runtime V2 replies "
+        "before chat insertion, removes unarchived per-turn rows and encrypted "
+        "voice handoff state, and makes repeated cancellation safe. If finalize "
+        "already claimed the call, cancellation returns that lifecycle state "
+        "without deleting rows or downgrading the archive."
+    ),
     ("post", "/v1/agent/web/search"): (
         "Run a keyless web search (DuckDuckGo HTML scrape) and return ranked "
         "results. Cloud-only: requires a hosted per-user runtime token carrying "
@@ -2115,11 +2224,16 @@ OPERATION_DESCRIPTIONS: dict[Operation, str] = {
     ("get", "/v1/onboarding/validate"): "Return ordered onboarding checks. Resident routes include a decrypt_source step between resident_consumer and live_loop, with status, checked_at_epoch, reason, policy, and remediation fields.",
     ("get", "/v1/chat/poll"): "Long-poll and optionally claim resident chat work. Official residents report their running commit and may report an intentionally skipped compatible backend target with X-Feedling-Consumer-Compat-Commit. They also report decrypt-source status and its confirmation time on every poll heartbeat with X-Feedling-Decrypt-Status and X-Feedling-Decrypt-Checked-At.",
     ("post", "/v1/chat/message"): "Store a user chat message as a v1 ciphertext envelope; the server never decrypts it. If the envelope carries a content_pk_fpr label that does not match the user's currently registered content key, the write is rejected with 409 content_pk_fpr_mismatch (re-fetch whoami and re-seal); unlabeled envelopes are accepted for compatibility.",
-    ("post", "/v1/chat/response"): "Store an agent reply as a v1 ciphertext envelope (plus optional thinking envelope and encrypted file_followups). A text primary and its file cards commit as one ordered transaction. Replies carrying reply_to_message_id are finalized atomically across backend workers: exactly one request inserts the reply and marks the parent answered, while a losing contender returns 409 already_answered without storing its reply. A hidden source=verify_ping reply is accepted only when reply_to_message_id identifies an outstanding verify ping exactly. role=system notices bypass reply exclusivity. Labeled envelopes sealed to a key that is no longer the user's registered content key are rejected with 409 content_pk_fpr_mismatch — the writer should re-fetch whoami, re-seal, and retry once.",
+    ("post", "/v1/chat/response"): "Store an agent reply as a v1 ciphertext envelope plus optional thinking and encrypted file/image followups. A text primary and its attachment rows commit as one ordered transaction; generated images are returned as native content_type=image Chat messages. Replies carrying reply_to_message_id are finalized atomically across backend workers: exactly one request inserts the reply and marks the parent answered, while a losing contender returns 409 already_answered without storing its reply. A hidden source=verify_ping reply is accepted only when reply_to_message_id identifies an outstanding verify ping exactly. role=system notices bypass reply exclusivity. Labeled envelopes sealed to a key that is no longer the user's registered content key are rejected with 409 content_pk_fpr_mismatch — the writer should re-fetch whoami, re-seal, and retry once.",
     ("post", "/v1/chat/verify_loop"): "Insert a hidden liveness ping and wait for its exact hidden reply (source=verify_ping and reply_to_message_id equal to this ping). loop_alive reports whether the reply arrived; passing additionally requires resident decrypt health to satisfy the onboarding policy before sticky live-loop verification is recorded.",
     ("post", "/v1/model_api/chat/send"): "Queue an asynchronous hosted-agent turn. A successful response is always 202 and never contains a plaintext assistant reply.",
     ("post", "/v1/model_api/models"): "列出某 provider 在该凭据下可见的模型清单（实时拉取，非 io 兼容性保证）。unsupported / partial 时客户端退回手填。",
     ("post", "/v1/model_api/runtime_error"): "Record or clear the resident runtime's latest provider error. provider_result=success refreshes provider health immediately; provider_result=failure applies error_class to the provider-health policy.",
+    ("get", "/v1/image-generation/config"): "Return the effective image-generation route, candidate routes, and validation state. The response mirrors vision routing semantics: follow_main uses the active chat route and dedicated pins a separately validated route.",
+    ("put", "/v1/image-generation/config"): "Select follow_main or a dedicated image-generation route. The selected route is validated for real image output before the change is committed.",
+    ("post", "/v1/image-generation/config"): "Create, validate, and select a dedicated image-generation route using an existing credential or a newly supplied provider key.",
+    ("post", "/v1/image-generation/main/test"): "Validate the active main route for real image generation and return the refreshed effective configuration.",
+    ("post", "/v1/image-generation/routes/{route_id}/test"): "Validate one saved route for real image generation and persist its capability result.",
     ("post", "/v1/vision/main/test"): "Validate the effective main model's image-input capability. Model API routes use explicit catalog metadata when available and otherwise perform a real two-image probe, returning a terminal 200 status. Resident runtimes start a hidden isolated two-image probe and return 202 testing; poll GET /v1/vision/config until effective_status leaves testing. Residents without the hidden-probe capability receive 409 vision_resident_update_required.",
     ("get", "/v1/model_api/usage"): (
         "Query the caller's active model_api provider for balance/usage, live on every call — "
@@ -2146,8 +2260,8 @@ OPERATION_DESCRIPTIONS: dict[Operation, str] = {
     ("post", "/v1/access/claim-token"): "Consume a one-time link token and issue an additional API key. Existing keys remain active.",
     ("post", "/v1/account/recover/verify"): "Verify keypair possession and issue an additional API key for the existing account. Existing keys remain active.",
     ("post", "/v1/account/reset"): "Permanently delete the account, its data, and all of its API keys. This is not a per-key revocation endpoint.",
-    ("post", "/v1/genesis/imports/plaintext"): "Queue an asynchronous plaintext import and immediately publish every material as queued with its total window count. Every processing frame preserves the complete material list while item progress advances. Identity may become ready while processing continues; done is published only after every material window completes. Only one plaintext import can process per account; a concurrent submission returns 409 import_job_active with active_job_id. A same-host abandoned worker is detected by its exited process and failed immediately as worker_restarted; remote or legacy owners use a bounded heartbeat lease so a live rolling-deploy worker is not killed. A failed matching client_job_id or input is resumed from its encrypted per-window checkpoint, while a completed match returns the existing job. In update_identity mode, the uploaded role card creates an identity when absent or updates the existing card while preserving its relationship anchor by default.",
-    ("post", "/v1/genesis/imports/plaintext/estimate"): "Parse and encrypt-stage plaintext onboarding material without calling an LLM. Returns per-material window and conservative token estimates plus an optional fast-model recommendation for Anthropic, DeepSeek, Gemini, OpenAI, OpenRouter, or compatible relay configurations. The staged payload expires and must be committed by staged_id.",
+    ("post", "/v1/genesis/imports/plaintext"): "Queue an asynchronous plaintext import and immediately publish every material as queued with its total window count. Every processing frame preserves the complete material list while item progress advances. Identity may become ready while processing continues; done is published only after every material window completes. A non-empty keep-all memory import that produces zero cards fails as distill_empty_output; its job output may include up to six discarded-map diagnostics, each with a reason and a model-output excerpt capped at 500 characters. Only one plaintext import can process per account; a concurrent submission returns 409 import_job_active with active_job_id. A same-host abandoned worker is detected by its exited process and failed immediately as worker_restarted; remote or legacy owners use a bounded heartbeat lease so a live rolling-deploy worker is not killed. A failed matching client_job_id or input is resumed from its encrypted per-window checkpoint, while a completed match returns the existing job. In update_identity mode, the uploaded role card creates an identity when absent or updates the existing card while preserving its relationship anchor by default.",
+    ("post", "/v1/genesis/imports/plaintext/estimate"): "Parse and encrypt-stage plaintext onboarding material without calling an LLM. Returns per-material window and conservative token estimates plus an optional fast-model recommendation for Anthropic, DeepSeek, Gemini, OpenAI, OpenRouter, or compatible relay configurations. Compatible-relay recommendations exclude Gemini Flash model IDs while leaving Gemini Pro and non-Gemini Flash names eligible. The staged payload expires and must be committed by staged_id.",
     ("post", "/v1/genesis/imports/plaintext/commit"): "Commit one encrypted staged plaintext import and start asynchronous processing. An optional distill_model overrides only this job's model; provider, base URL, credential, and the account chat model remain unchanged.",
     ("get", "/v1/mcp/servers"): "List the caller's user-configured MCP servers. Secrets (url, headers, ca_pem) are never returned; url_hint is the hostname only and header_names lists header keys only.",
     ("post", "/v1/mcp/servers"): (

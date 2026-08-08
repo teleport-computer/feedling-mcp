@@ -2584,7 +2584,7 @@ def test_usage_user_page_keeps_drilldown_path_in_presets_filters_and_sorts(
     assert (kind, status) == ("html", 200)
     expected_path = f"/admin/data-track/users/{user_id}"
 
-    nav_start = body.index("<nav class='viewbar'")
+    nav_start = body.index("<nav class='viewbar viewbar-diag'")
     nav_end = body.index("</nav>", nav_start)
     usage_nav = re.search(
         r"href='([^']+)'[^>]*>Token 与模型</a>",

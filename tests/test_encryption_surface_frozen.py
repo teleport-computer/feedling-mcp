@@ -63,6 +63,13 @@ ALLOWLISTED_MIGRATIONS = {
     # （加密档用户的行仍须完整），而守卫做的是文本匹配、认不出 `OR 明文分支`。
     # 登记在此而非放松 pattern：pattern 一旦放松，真正的新增强制约束也会溜过去。
     "0072_relax_v2_envelope_shape.py",
+    # Voice transcript archives use the same ciphertext-OR-plaintext predicate.
+    # 0080 creates the runtime table and TEE 0012/0016 create or upgrade its
+    # promoted-primary counterpart; all three retain an explicit plaintext OR
+    # branch and are text-scanner false positives for the same reason as 0072.
+    "0080_voice_transcripts.py",
+    "0012_voice_transcripts.py",
+    "0016_merge_image_voice_pre.py",
     # TEE 0013 restores the same primary-runtime CHECK after the plaintext
     # migration has completed.  Its predicate explicitly accepts the exact
     # plaintext body shape as an OR branch, just like RDS 0072; the scanner only
