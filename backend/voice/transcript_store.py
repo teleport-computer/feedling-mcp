@@ -80,17 +80,21 @@ def resolve_speaker_names(store, *, runtime_token: str = "") -> tuple[str, str]:
 #
 # 不复用 transcript_speaker_label:那个函数是给「AI 回看聊天窗口」写的,第一人称
 # 锚在 AI 身上(AI=「我」、用户=「对方」),与这里正好相反。
-VOICE_USER_LABEL = "我"
-VOICE_UNKNOWN_AGENT_LABEL = "TA"
+# 标签与 speaker_labels 的**唯一定义**已经移到纯模块 voice.message_filter:
+# v2/context.py 只能依赖 stdlib + 那个纯模块(不能 import 本文件,本文件要 db),
+# 而它也需要同一套标签去渲染通话记录块。这里只做转出,绝不再抄一份 ——
+# 各写一份正是 2026-07-17 字面 `user:` 标签只修了一条 lane 的根因。
+from voice.message_filter import (  # noqa: E402
+    VOICE_UNKNOWN_AGENT_LABEL,
+    VOICE_USER_LABEL,
+    speaker_labels,
+)
 
-
-def speaker_labels(user_name: str = "", ai_name: str = "") -> tuple[str, str]:
-    """(用户侧标签, 伴侣侧标签)。消费端拿它去写抬头的对照说明。
-
-    ``user_name`` 保留在签名里只为调用方一致,用户侧恒为「我」。
-    """
-    agent = " ".join(str(ai_name or "").split()) or VOICE_UNKNOWN_AGENT_LABEL
-    return VOICE_USER_LABEL, agent
+__all_speaker_exports__ = (
+    VOICE_USER_LABEL,
+    VOICE_UNKNOWN_AGENT_LABEL,
+    speaker_labels,
+)
 
 def capture_window_header(*, turn_count=None, user_name: str = "",
                           ai_name: str = "") -> str:

@@ -36,6 +36,18 @@ log = logging.getLogger("feedling.voice.gateway")
 
 _VOICE_NAMESPACE = uuid.UUID("c1673607-3107-4554-87a1-5a8f55b70023")
 _VOICE_BUFFER_TEXT = "... "
+# 「这一轮不说话」也必须是一个**带正文**的 completion。
+#
+# 2026-08-08 线上事故:噪音轮/生命周期已结束/本轮被更新的 ASR 取代这三条路径都
+# 返回了一个零 content 的 SSE 流(只有 role 块 + finish 块)。ElevenLabs 的
+# Custom LLM 拿到没有任何正文的 completion 会判协议错误
+# —— `1002 custom_llm_error: LLM Cascade Error` —— 然后**杀掉整通电话**,
+# 用户侧看到的是「暂时无法通话」。客户端日志里的前一行正是
+# `ignored control-only agent response`。
+#
+# 一个空格在 TTS 里不发声,语义正好是「这一轮没有话要说」,同时协议合法。
+# 绝不要在这里放真实文案:那等于替伴侣说了它没说过的话。
+_VOICE_SILENT_TURN_TEXT = " "
 
 
 def _gateway_url(request: Request) -> str | None:
@@ -267,10 +279,16 @@ def _voice_error_text(body: dict) -> str:
 
 
 def _streaming_text_response(request_id: str, text: str) -> StreamingResponse:
+    # 空文本会退化成一个**零 content 块**的流,ElevenLabs 判协议错误并拆掉整通
+    # 电话(见 _VOICE_SILENT_TURN_TEXT)。保证放在这里而不是各调用点:调用点是
+    # 开集(噪音轮/生命周期已结束/以后还会有别的"这一轮不说话"),漏一个就是
+    # 一次线上事故。主流程那个生成器不受影响 —— 它开头无条件发 "... " 缓冲块。
+    body = text if text else _VOICE_SILENT_TURN_TEXT
+
     async def stream():
         yield _sse_chunk(request_id, role="assistant")
-        for offset in range(0, len(text), 18):
-            yield _sse_chunk(request_id, content=text[offset : offset + 18])
+        for offset in range(0, len(body), 18):
+            yield _sse_chunk(request_id, content=body[offset : offset + 18])
             await asyncio.sleep(0)
         yield _sse_chunk(request_id, finish="stop")
         yield "data: [DONE]\n\n"
@@ -334,6 +352,7 @@ async def cancel_voice_call(
     from core import store as core_store
     import db as _db
     from voice import cleanup as voice_cleanup
+    from voice import transcript_store
 
     payload = (await asgi_http.read_json_silent(request)) or {}
     if not isinstance(payload, dict):
@@ -361,6 +380,28 @@ async def cancel_voice_call(
                 "deleted": 0,
                 "retained_covered": 0,
                 "remaining": 0,
+            }, 200
+        # 守卫:客户端只在**它自己看到的** SDK 转写列表为空时才发 cancel
+        # (VoiceCallTerminationPolicy: turns.isEmpty ? .cancel : .finalize)。
+        # 那份列表落定晚于服务端落行:说完立刻挂断/切后台时,服务端明明已有真实
+        # 逐轮行和伴侣的回复,客户端仍会判成"空通话"。此时无条件删行 =
+        # **整通电话永久消失**,而且墓碑之后会一直 409 挡住任何补救性 finalize。
+        # 所以:有行、又没归档过 → 只写墓碑(止住迟到回复),行留着等 finalize。
+        existing_rows = voice_cleanup.call_message_rows(user_id, call_id)
+        if existing_rows and not transcript_store.exists(user_id, call_id):
+            log.warning(
+                "[voice.cancel] kept %d row(s) user=%s call=%s — client reported "
+                "an empty call but the server has real turns and no archive",
+                len(existing_rows), user_id[:12], call_id[:16],
+            )
+            return {
+                "status": lifecycle["status"],
+                "call_id": call_id,
+                "replayed": False,
+                "deleted": 0,
+                "retained_covered": 0,
+                "remaining": len(existing_rows),
+                "rows_kept_for_finalize": True,
             }, 200
         handoff = results.delete_call_state(user_id, call_id)
         cleanup = voice_cleanup.delete_call_messages(user_id, call_id)
@@ -647,7 +688,7 @@ async def voice_chat_completions(request: Request):
             "[voice.gateway] turn ignored user=%s reason=non_speech",
             user_id[:12],
         )
-        return _streaming_text_response(request_id, "")
+        return _streaming_text_response(request_id, _VOICE_SILENT_TURN_TEXT)
 
     import db as _db
 
@@ -656,7 +697,7 @@ async def voice_chat_completions(request: Request):
         "cancelled",
         "finalized",
     }:
-        return _streaming_text_response(request_id, "")
+        return _streaming_text_response(request_id, _VOICE_SILENT_TURN_TEXT)
 
     from core import store as core_store
 

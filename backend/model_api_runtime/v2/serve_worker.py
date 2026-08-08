@@ -860,6 +860,18 @@ def _decrypt_chat_rows(
             item["source"] = source
         if call_id:
             item["voice_call_id"] = call_id[:96]
+            # 这三个字段以前只在 capture 分支带出来,于是 V2 的**普通 prompt 路径**
+            # 拿到的通话行永远没有 turn id。两个后果都是 P0,且只在 V2 上表现:
+            #   ① voice.message_filter 的「只保留最新 ASR 修订」判据取不到 key,
+            #      把通话中的**每一轮**用户话连同回复一起判成被取代 → 尾巴全空;
+            #   ② coalesce 要求 call_id + turn_id 齐全才透传 correlation,缺一个
+            #      就整组丢弃 → PR #165 的「挂断后抑制迟到回复」在 V2 上从未武装。
+            # resident 视图一直带着它们,所以两条 bug 都只咬 V2 —— 又是一次
+            # 「只修了一条 lane」。
+            for key in ("voice_turn_id", "voice_logical_turn_id", "voice_turn_status"):
+                value = m.get(key)
+                if isinstance(value, str) and value.strip():
+                    item[key] = value.strip()[:128]
         if include_capture_metadata:
             item["source"] = source
             item["raw_role"] = raw_role

@@ -4536,7 +4536,7 @@ def test_capture_transcript_labels_use_real_names():
     assert "user:" not in text and "agent:" not in text
 
 
-def test_resident_context_omits_voice_archive_and_linked_noise_reply():
+def test_resident_context_omits_voice_noise_but_keeps_the_call_record():
     history = [
         {"id": "typed", "role": "user", "source": "chat", "content": "..."},
         {
@@ -4565,7 +4565,14 @@ def test_resident_context_omits_voice_archive_and_linked_noise_reply():
 
     cleaned = crc._clean_messages_for_proactive_context(history)
 
-    assert [message["id"] for message in cleaned] == ["typed", "real"]
+    # 噪音行与挂在它下面的回复照旧挡住;**通话卡要留下**。
+    # 这条原本断言卡也被丢掉。2026-08-08 定案:整个删掉的代价是挂断之后伴侣在
+    # 普通聊天里完全不知道刚才通过话 —— 用户接着打字说「刚才电话里说的那个」,
+    # 模型没有任何上下文。卡改成换身份保留(不再冒充 assistant 说过的话)。
+    assert [message["id"] for message in cleaned] == ["typed", "card", "real"]
+    card_row = next(m for m in cleaned if m["id"] == "card")
+    assert card_row["role"] == crc._VOICE_CALL_RECORD_ROLE
+    assert "不是你说过的话" in str(card_row.get("content") or "")
 
 
 def test_resident_capture_expands_full_archive_not_card_preview(monkeypatch):

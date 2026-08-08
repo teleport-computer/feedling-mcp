@@ -15,7 +15,7 @@ from datetime import datetime, timezone
 from typing import Any, Sequence
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from voice.message_filter import conversation_rows
+from voice.message_filter import VOICE_CALL_RECORD_ROLE, conversation_rows
 
 # Fallback timezone when the user's IANA zone is unknown or invalid. Defaults to
 # Asia/Shanghai (most users are in China) and matches the resident consumer's
@@ -605,6 +605,13 @@ def build_turn_messages(
     for m in conversation_rows(tail):
         content = m.get("content")
         if not _has_payload(content):
+            continue
+        if str(m.get("role") or "") == VOICE_CALL_RECORD_ROLE:
+            # 通话记录既不是伴侣自己说的话,也不是用户这一轮的输入。
+            # 走应用数据身份(和世界书/时间上下文同一约定),抬头在正文里。
+            # 注意不能落到 _norm_role:未知 role 会被归成 "user",
+            # 那等于让模型以为这段是用户说的。
+            messages.append({"role": application_data_role, "content": content})
             continue
         messages.append({"role": _norm_role(m.get("role")), "content": content})
 

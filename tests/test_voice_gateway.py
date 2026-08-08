@@ -367,7 +367,17 @@ def test_io_rejection_is_streamed_instead_of_dropping_the_call():
     assert body.count("data: [DONE]") == 1
 
 
-def test_ignored_voice_turn_returns_an_empty_streaming_completion():
+def test_ignored_voice_turn_still_returns_a_protocol_valid_completion():
+    """一轮「不说话」仍然必须是**带正文**的 completion。
+
+    这条用例原本锁的是相反的行为(`'"content"' not in body`)——而那正是
+    2026-08-08 的线上故障:ElevenLabs 的 Custom LLM 拿到零 content 的 completion
+    判协议错误 `1002 custom_llm_error: LLM Cascade Error`,**杀掉整通电话**,
+    用户侧显示「暂时无法通话」。
+
+    保留的意图不变(噪音轮不打扰主模型、不发真实文案);变的只是「什么都不发」
+    改成「发一个 TTS 不发声的最小正文」。
+    """
     response = routes_asgi._streaming_text_response("chatcmpl-test", "")
 
     async def collect() -> str:
@@ -375,8 +385,20 @@ def test_ignored_voice_turn_returns_an_empty_streaming_completion():
         return "".join(chunks)
 
     body = asyncio.run(collect())
-    assert '"content"' not in body
+    assert '"content"' in body, (
+        "零 content 的 completion 会被 ElevenLabs 判协议错误并拆掉整通电话"
+    )
     assert body.count("data: [DONE]") == 1
+    # 不能借机说任何实际内容 —— 那等于替伴侣说它没说过的话
+    payloads = [
+        json.loads(line[6:])
+        for line in body.splitlines()
+        if line.startswith("data: ") and line.strip() != "data: [DONE]"
+    ]
+    spoken = "".join(
+        (p["choices"][0]["delta"] or {}).get("content") or "" for p in payloads
+    )
+    assert not spoken.strip(), f"静音轮不应包含可听内容,实际={spoken!r}"
 
 
 def test_cancel_route_does_not_clean_when_finalize_already_won(monkeypatch):
@@ -501,7 +523,10 @@ def test_gateway_does_not_persist_or_run_non_speech_turn(monkeypatch):
 
     body = asyncio.run(collect())
     assert response.status_code == 200
-    assert '"content"' not in body
+    # 这条用例的价值在上面:非语音轮**不落库、不跑模型**。至于流本身,
+    # 它必须仍是协议合法的(带正文),否则 ElevenLabs 会拆掉整通电话 ——
+    # 见 test_ignored_voice_turn_still_returns_a_protocol_valid_completion。
+    assert '"content"' in body
 
 
 class _Result:

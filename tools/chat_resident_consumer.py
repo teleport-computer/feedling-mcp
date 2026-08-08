@@ -176,7 +176,10 @@ from model_api_runtime.v2 import context as downloadable_file_context
 # 记录的那次事故)。谁改判定,两条 lane 一起变。
 from model_api_runtime.v2.tool_loop import _claims_image_delivered
 from model_api_runtime.v2 import document_render as downloadable_document_render
-from voice.message_filter import conversation_rows as _conversation_rows
+from voice.message_filter import (
+    VOICE_CALL_RECORD_ROLE as _VOICE_CALL_RECORD_ROLE,
+    conversation_rows as _conversation_rows,
+)
 from voice import transcript_store as _voice_transcript_store
 
 # ---------------------------------------------------------------------------
@@ -11937,7 +11940,13 @@ def _capture_live_history(history: list[dict] | None) -> list[dict]:
         if source == "verify_ping":
             continue
         role = str(msg.get("role") or "").strip().lower()
-        if role not in {"user", "openclaw", "assistant", "agent"}:
+        # voice_call_record 是 _conversation_rows 换身份后的通话卡(dream 那条路
+        # 会先过滤再进来)。不放行的话 dream 的「这几天聊了什么」里永远没有电话。
+        # capture 那条路拿的是**原始行**(role=openclaw),不经过滤器,因此不受影响
+        # —— 它仍然会把卡展开成归档全文。
+        if role not in {
+            "user", "openclaw", "assistant", "agent", _VOICE_CALL_RECORD_ROLE,
+        }:
             continue
         text = _capture_message_text(msg)
         if not text or "__VERIFY_PING__" in text:
