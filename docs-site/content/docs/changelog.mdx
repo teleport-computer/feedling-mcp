@@ -39,6 +39,13 @@ change must not be interpreted as an API guarantee.
   and is then delivered as written. `POST /v1/image-generation/generate` and the
   existing encrypted image-delivery path are unchanged.
 
+- **Image-model setup failures remain actionable without replacing the
+  companion's reply.** Runtime V1, Runtime V2, and CLI residents now preserve an
+  allowlisted `image_generation_*` code on the failed `generate_image` activity
+  event. Clients can use the final image-generation attempt in a completed turn
+  to offer model setup while still displaying the companion's own words. A later
+  successful attempt or a temporary provider failure does not request setup.
+
 - **Failed voice calls now have an explicit, idempotent cancellation path.**
   `POST /v1/voice/cancel` installs a durable per-call tombstone, clears
   unarchived turn/result rows, and suppresses late resident or Hosted Runtime

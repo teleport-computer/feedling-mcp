@@ -2095,12 +2095,19 @@ def test_image_generation_failure_is_handed_back_instead_of_killing_the_turn(mon
     ])
     monkeypatch.setattr(provider_client, "chat_completion_async", provider)
     published = []
+    tool_events = []
+
+    class _ConfiguredRouteMissing(RuntimeError):
+        error_code = "image_generation_model_required"
 
     async def on_image_reply(args):
-        raise RuntimeError("image route exploded")
+        raise _ConfiguredRouteMissing("image route missing")
 
     async def on_reply(text, *, final, reasoning="", media=()):
         published.append((text, final, tuple(media)))
+
+    async def on_tool_event(call, event_kind, payload):
+        tool_events.append((call.name, event_kind, payload))
 
     asyncio.run(
         tool_loop.run_tool_loop(
@@ -2111,6 +2118,7 @@ def test_image_generation_failure_is_handed_back_instead_of_killing_the_turn(mon
             fold_new_messages=_RecordingFold([]),
             add_usage=_noop_add_usage,
             on_image_reply=on_image_reply,
+            on_tool_event=on_tool_event,
             max_calls=3,
         )
     )
@@ -2118,6 +2126,14 @@ def test_image_generation_failure_is_handed_back_instead_of_killing_the_turn(mon
     assert any("没画成" in text for text, _f, _m in published), (
         "生图失败必须交回给伴侣,让它自己说 —— 而不是打断整轮"
     )
+    assert [kind for _name, kind, _payload in tool_events] == [
+        "tool_call_started",
+        "tool_call_result",
+    ]
+    image_result = tool_events[-1][2]["result"]
+    assert image_result.metadata == {
+        "image_generation_result_code": "image_generation_model_required"
+    }
 
 
 def test_unbacked_image_claim_is_bounced_once_then_let_through(monkeypatch):
