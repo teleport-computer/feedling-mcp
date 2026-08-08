@@ -45,9 +45,16 @@ _VOICE_BUFFER_TEXT = "... "
 # 用户侧看到的是「暂时无法通话」。客户端日志里的前一行正是
 # `ignored control-only agent response`。
 #
-# 一个空格在 TTS 里不发声,语义正好是「这一轮没有话要说」,同时协议合法。
+# 用 ElevenLabs **自己文档里的**缓冲串,而不是一个空格。
+# 理由是证据而非推测:主流程每一轮开头都无条件发这个串(见 _VOICE_BUFFER_TEXT
+# 的用法),线上每一通正常电话都经过它 —— 所以我们**已知**它不会被判成空、
+# 不会杀通话。空格没有这个证据,而且 ElevenLabs 完全可能把纯空白 trim 掉后
+# 仍判成「没有文本」(codex 提的风险,我无法在不真打一通电话的情况下证伪)。
 # 绝不要在这里放真实文案:那等于替伴侣说了它没说过的话。
-_VOICE_SILENT_TURN_TEXT = " "
+#
+# ⚠️ 更正的长期做法是 ElevenLabs 的 Skip Turn 系统工具(语义上就是"这轮不说话"),
+# 需要改 agent 配置 + 返回工具调用,不在本批。
+_VOICE_SILENT_TURN_TEXT = _VOICE_BUFFER_TEXT
 
 
 def _gateway_url(request: Request) -> str | None:
@@ -352,7 +359,6 @@ async def cancel_voice_call(
     from core import store as core_store
     import db as _db
     from voice import cleanup as voice_cleanup
-    from voice import transcript_store
 
     payload = (await asgi_http.read_json_silent(request)) or {}
     if not isinstance(payload, dict):
@@ -381,28 +387,18 @@ async def cancel_voice_call(
                 "retained_covered": 0,
                 "remaining": 0,
             }, 200
-        # 守卫:客户端只在**它自己看到的** SDK 转写列表为空时才发 cancel
-        # (VoiceCallTerminationPolicy: turns.isEmpty ? .cancel : .finalize)。
-        # 那份列表落定晚于服务端落行:说完立刻挂断/切后台时,服务端明明已有真实
-        # 逐轮行和伴侣的回复,客户端仍会判成"空通话"。此时无条件删行 =
-        # **整通电话永久消失**,而且墓碑之后会一直 409 挡住任何补救性 finalize。
-        # 所以:有行、又没归档过 → 只写墓碑(止住迟到回复),行留着等 finalize。
-        existing_rows = voice_cleanup.call_message_rows(user_id, call_id)
-        if existing_rows and not transcript_store.exists(user_id, call_id):
-            log.warning(
-                "[voice.cancel] kept %d row(s) user=%s call=%s — client reported "
-                "an empty call but the server has real turns and no archive",
-                len(existing_rows), user_id[:12], call_id[:16],
-            )
-            return {
-                "status": lifecycle["status"],
-                "call_id": call_id,
-                "replayed": False,
-                "deleted": 0,
-                "retained_covered": 0,
-                "remaining": len(existing_rows),
-                "rows_kept_for_finalize": True,
-            }, 200
+        # ⚠️ 已知风险(2026-08-09,**未修**,待 Seven 定产品语义):
+        # 客户端只按**它自己看到的** SDK 转写列表判空
+        # (VoiceCallTerminationPolicy: turns.isEmpty ? .cancel : .finalize),
+        # 而那份列表落定晚于服务端落行。说完立刻挂断/切后台时,服务端可能已有真实
+        # 逐轮行和伴侣的回复,却仍收到 cancel → 这些行被删,整通电话消失。
+        #
+        # 我曾加过一道「有行且无归档就只写墓碑、不删行」的守卫,**已撤**:
+        # `voice_call_cancel` 在守卫之前就把状态写成 cancelled,而
+        # `voice_call_begin_finalize` 见到 cancelled 会永远返回 cancelled、
+        # 路由 409 —— 留下的行**永远等不到那个 finalize**,守卫承诺的事做不到
+        # (codex 审出)。正确修法需要一个可恢复的中间态或让客户端改判据,
+        # 属产品语义决定,不在本批。
         handoff = results.delete_call_state(user_id, call_id)
         cleanup = voice_cleanup.delete_call_messages(user_id, call_id)
         store = core_store.get_store(user_id)

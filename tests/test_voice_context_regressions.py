@@ -180,8 +180,75 @@ def test_a_silent_turn_still_carries_content_so_the_call_survives():
             out += delta.get("content") or ""
         return out
 
-    assert asyncio.run(content_of("")), (
+    silent = asyncio.run(content_of(""))
+    assert silent, (
         "空文本产生了零 content 的流 —— ElevenLabs 会判协议错误并杀掉整通电话"
+    )
+    # 必须用 ElevenLabs 自己文档里的缓冲串:线上每一通正常电话都以它开头,
+    # 所以**已知**它不会被判成空。裸空格没有这个证据,可能被 trim 后仍判无文本。
+    assert silent == routes_asgi._VOICE_BUFFER_TEXT
+    # 但绝不能是真实语义内容
+    assert not silent.strip(" ." ) or silent.strip() == "...", (
+        f"静音轮不该包含实际话语,实际={silent!r}"
     )
     # 真实文案照常原样送达
     assert asyncio.run(content_of("模型暂时不可用")) == "模型暂时不可用"
+
+
+# ── 5. 最终 prompt 里的标签(不是过滤器的输出) ─────────────────────────
+
+
+def test_v1_final_prompt_does_not_label_the_call_record_as_companion_speech():
+    """换了 role 还不够 —— **最终渲染层**也得认这个 role。
+
+    codex 审出:`conversation_rows` 把 role 换成 voice_call_record 之后,
+    resident 的 `_message_role_for_context` 仍把「所有非 user 的行」归成 agent,
+    `_capture_message_role` 经 `transcript_speaker_label` 同样归给 AI ——
+    于是记录块在最终 prompt 里又变回了「伴侣自己说的话」。
+
+    **修了过滤层、漏了渲染层,正是这批改动本身在批评的那个错误。**
+    所以这条断言必须打在**边界**上(最终标签),不能只打在过滤器输出上。
+    """
+    import os
+
+    os.environ.setdefault("FEEDLING_API_URL", "http://localhost:5001")
+    os.environ.setdefault("FEEDLING_API_KEY", "test_key_00000000")
+    os.environ.setdefault("AGENT_MODE", "http")
+    os.environ.setdefault("AGENT_HTTP_URL", "http://localhost:8080/chat")
+    os.environ.setdefault(
+        "CHECKPOINT_FILE", "/tmp/feedling_test_voice_regressions_checkpoint.json"
+    )
+    import tools.chat_resident_consumer as crc
+
+    record = crc._conversation_rows([_card()])[0]
+
+    for label in (
+        crc._message_role_for_context(record),
+        crc._capture_message_role(record, user_label="小雨", agent_label="年年"),
+    ):
+        assert label not in {"agent", "年年", "我"}, (
+            f"通话记录被标成了伴侣自己的发言({label!r})"
+        )
+        assert label not in {"user", "小雨", "对方"}, (
+            f"通话记录被标成了用户的发言({label!r})"
+        )
+
+
+def test_cancel_does_not_promise_an_archive_it_cannot_deliver():
+    """cancel 不许声称"行留着等 finalize" —— 那个 finalize 到不了。
+
+    `voice_call_cancel` 先把状态写成 cancelled;`voice_call_begin_finalize`
+    见到 cancelled 会**永远**返回 cancelled,finalize 路由 409。所以任何
+    "保留行等后续 finalize 归档"的说法都是假承诺(codex 审出,已撤回该守卫)。
+
+    这条锁的是:要么别留、要么先设计出可恢复的中间态 —— 不能只留个安慰。
+    """
+    from pathlib import Path as _Path
+
+    source = (
+        _Path(__file__).parent.parent / "backend" / "voice" / "routes_asgi.py"
+    ).read_text(encoding="utf-8")
+    assert "rows_kept_for_finalize" not in source, (
+        "cancel 又在承诺一个到不了的 finalize;"
+        "要恢复这条路必须先有可恢复的生命周期状态"
+    )

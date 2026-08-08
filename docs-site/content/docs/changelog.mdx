@@ -22,11 +22,6 @@ change must not be interpreted as an API guarantee.
   removed from the prompt entirely. Memory distillation is unchanged and still
   reads the archived full transcript.
 
-- **`POST /v1/voice/cancel` no longer deletes real turn rows.** When the server
-  holds turn rows for a call that was never archived, cancellation installs its
-  tombstone but keeps the rows so a later finalize can still archive them; the
-  response reports `rows_kept_for_finalize`.
-
 - **Thinking-leak gate.** A model's own `<think>` block could reach the user's
   chat bubble on three delivery paths: Runtime V2 chat stripped only the first
   block of a reply, resident V1 required a matched open/close pair and passed an

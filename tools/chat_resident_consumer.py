@@ -10733,6 +10733,11 @@ def _message_ts_for_context(msg: dict) -> float:
 
 
 def _message_role_for_context(msg: dict) -> str:
+    if str(msg.get("role") or "") == _VOICE_CALL_RECORD_ROLE:
+        # 通话记录块不是伴侣说过的话。这里原本把**所有**非 user 的行归成 "agent",
+        # 于是过滤层换过身份的记录块在最终 prompt 里又变回了「我说的」——
+        # 修了过滤层漏了渲染层,正是这批改动本身在批评的那个错误。
+        return "通话记录"
     role = "user" if msg.get("role") == "user" else "agent"
     if msg.get("source") == PROACTIVE_JOB_SOURCE:
         role = "agent(proactive)"

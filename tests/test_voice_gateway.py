@@ -398,7 +398,10 @@ def test_ignored_voice_turn_still_returns_a_protocol_valid_completion():
     spoken = "".join(
         (p["choices"][0]["delta"] or {}).get("content") or "" for p in payloads
     )
-    assert not spoken.strip(), f"静音轮不应包含可听内容,实际={spoken!r}"
+    # 用的是 ElevenLabs 自己文档里的缓冲串(线上每通正常电话都以它开头,
+    # 所以已知不会被判成空),而不是任何实际话语。
+    assert spoken == routes_asgi._VOICE_BUFFER_TEXT
+    assert not spoken.strip(" ."), f"静音轮不应包含实际话语,实际={spoken!r}"
 
 
 def test_cancel_route_does_not_clean_when_finalize_already_won(monkeypatch):

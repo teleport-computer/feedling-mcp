@@ -200,11 +200,8 @@ account's chat route, provider URL, or credential.
    own speech.
 6. If a failed or empty call will not be archived, the client calls
    `POST /v1/voice/cancel` with its `call_id` and a bounded reason. The
-   idempotent cancellation tombstone stops late resident or Runtime V2 replies
-   before they can enter ordinary Chat. It removes unarchived turn rows only
-   when the server actually has none worth keeping: if real turn rows exist and
-   the call was never archived, the rows are retained so a later finalize can
-   still archive them, and the response reports `rows_kept_for_finalize`.
+   idempotent cancellation tombstone removes unarchived turn rows and stops
+   late resident or Runtime V2 replies before they can enter ordinary Chat.
    Finalize claims its lifecycle state before writing the archive, so a
    concurrent cancel cannot downgrade or partially delete a successful call.
 7. Archived calls stay readable: `GET /v1/voice/transcripts` lists them and

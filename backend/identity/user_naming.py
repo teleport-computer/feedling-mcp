@@ -45,6 +45,11 @@ def _naming_rule(user_name: str) -> str:
     )
 
 
+# 通话记录块的中性标签。它不是任何一方的发言,而是一段归档材料。
+VOICE_CALL_RECORD_ROLE = "voice_call_record"
+VOICE_CALL_RECORD_LABEL = "通话记录"
+
+
 def transcript_speaker_label(role: str, *, user_name: str, ai_name: str = "") -> str:
     """转写里一行的说话人标签。**永远不要**用原始 role 值。
 
@@ -58,7 +63,13 @@ def transcript_speaker_label(role: str, *, user_name: str, ai_name: str = "") ->
     名字未知时退到中性的「对方」(UNKNOWN_PERSON_LABEL),既不退回 ``user``,
     也不用内部标记 ``TA``——prompt 正是禁止模型这么叫本人的。
     """
-    if str(role or "").strip().lower() == "user":
+    normalized = str(role or "").strip().lower()
+    if normalized == VOICE_CALL_RECORD_ROLE:
+        # 通话记录块既不是本人也不是伴侣说的话,它是一段**归档材料**。
+        # 落到下面任一分支都会把整段归给某一方 —— 归给伴侣尤其糟:
+        # 那正是 2026-07-17 那次事故的形状(把对方做的事写成自己做的)。
+        return VOICE_CALL_RECORD_LABEL
+    if normalized == "user":
         # 再 sanitize 一次(纵深防御):把 用户/user 当"名字"传进来,
         # 也不能变成 "用户: …" 这一行。
         name = sanitize_user_name(user_name)
