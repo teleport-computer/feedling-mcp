@@ -508,9 +508,16 @@ def test_v2_combined_background_completes_every_material_window(monkeypatch):
             assert (source_pass, source_family) == (1, "history")
             return dict(self.outputs)
 
+        def resume_voice_outputs(self, source_pass, source_family):
+            assert (source_pass, source_family) == (1, "history")
+            return {}
+
         def record_map(self, source_pass, source_family, chunk_index, output):
             assert (source_pass, source_family) == (1, "history")
             self.outputs[chunk_index] = output
+
+        def record_voice(self, source_pass, source_family, chunk_index, output):
+            raise AssertionError("voice mapping is disabled in this test")
 
         def materials(self):
             done = len(self.outputs)

@@ -371,6 +371,7 @@ INTERNAL_JOB_METADATA_KEYS = {
     "plaintext_worker_host",
     "plaintext_worker_pid",
     "plaintext_worker_instance",
+    "staged_id",
 }
 
 
@@ -630,6 +631,7 @@ def write_genesis_checkpoint(store: UserStore, job_id: str, checkpoint_doc: dict
         "encrypted": True,
         "content_envelope": envelope,
         "sha256": digest,
+        "checkpoint_bytes": len(raw),
         "task_count": len(checkpoint_doc.get("tasks") or {}),
         "updated_at": _now_iso(),
     })

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
+import time
 import types
 from pathlib import Path
 
@@ -10,6 +12,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
 from genesis import genesis_core, plaintext, service  # noqa: E402
+import conftest  # noqa: E402
 from urllib.parse import urlparse  # noqa: E402
 
 _FAIL_STALE_PLAINTEXT_JOB = plaintext._fail_stale_plaintext_job
@@ -785,13 +788,17 @@ def test_plaintext_estimate_stages_without_llm_and_returns_locked_contract(monke
     assert body["recommended_model"] == "anthropic/claude-haiku-4-5"
 
 
-def test_plaintext_commit_applies_job_model_override_without_consuming_stage(monkeypatch):
+@pytest.mark.skipif(not os.environ.get("DATABASE_URL"), reason="needs PG")
+def test_plaintext_commit_persists_trusted_staged_id_in_real_job_row(monkeypatch):
     # Commit must NOT consume the staged payload: the job it starts can still fail
     # asynchronously, and consuming now would leave a retry with no materials to
     # re-run (staged_import_consumed 409). Consumption happens on DONE instead.
     # The staged_id is threaded into the job metadata so completion can find it.
     staged_payload = {"format": "plaintext", "content": "User: hello"}
-    captured = {}
+    user_id = "usr_plaintext_commit_staged_pg"
+    conftest.seed_user(user_id)
+    with plaintext.db.get_pool().connection() as conn:
+        conn.execute("DELETE FROM genesis_import_jobs WHERE user_id=%s", (user_id,))
     monkeypatch.setattr(
         plaintext.service, "load_genesis_staged_payload",
         lambda *_args: staged_payload,
@@ -801,40 +808,26 @@ def test_plaintext_commit_applies_job_model_override_without_consuming_stage(mon
         lambda *_args: (_ for _ in ()).throw(
             AssertionError("commit must not consume the stage")),
     )
-    monkeypatch.setattr(plaintext.db, "genesis_list_jobs", lambda *_args, **_kwargs: [])
-
-    def fake_create(_store, payload, **_kwargs):
-        captured["metadata"] = payload["metadata"]
-        return ({"job_id": "job_commit", "status": "processing", "metadata": payload["metadata"]}, 201)
-
-    monkeypatch.setattr(plaintext.service, "create_import_job", fake_create)
-
-    def set_status(*_args, **kwargs):
-        captured["queued_output"] = kwargs["output"]
-        return {
-            "job_id": "job_commit",
-            "status": "processing",
-            "metadata": captured["metadata"],
-            "output": kwargs["output"],
-        }
-
-    monkeypatch.setattr(
-        plaintext.db, "genesis_set_job_status",
-        set_status,
-    )
     monkeypatch.setattr(plaintext.service, "write_genesis_state", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(plaintext, "_start_plaintext_genesis_job", lambda *_args, **_kwargs: True)
 
-    resp = _client(monkeypatch).post("/v1/genesis/imports/plaintext/commit", json={
+    resp = _CoreClient(_store(user_id)).post("/v1/genesis/imports/plaintext/commit", json={
         "staged_id": "staged_1",
         "distill_model": "anthropic/claude-haiku-4-5",
     })
 
     assert resp.status_code == 202
-    assert captured["metadata"]["distill_model"] == "anthropic/claude-haiku-4-5"
-    # staged_id threaded into metadata so consume-on-DONE can release it later.
-    assert captured["metadata"]["staged_id"] == "staged_1"
-    assert captured["queued_output"]["materials"] == [{
+    job_id = resp.get_json()["job"]["job_id"]
+    with plaintext.db.get_pool().connection() as conn:
+        persisted = conn.execute(
+            "SELECT metadata FROM genesis_import_jobs WHERE user_id=%s AND job_id=%s",
+            (user_id, job_id),
+        ).fetchone()[0]
+    assert persisted["distill_model"] == "anthropic/claude-haiku-4-5"
+    # This assertion crosses the real create_import_job filtering + PG persistence
+    # boundary. Mocking create_import_job here would recreate the old false-green test.
+    assert persisted["staged_id"] == "staged_1"
+    queued_materials = [{
         "kind": "chat_history",
         "status": "queued",
         "windows_done": 0,
@@ -842,7 +835,7 @@ def test_plaintext_commit_applies_job_model_override_without_consuming_stage(mon
         "cards": 0,
     }]
     response_materials = resp.get_json()["job"]["output"]["materials"]
-    assert response_materials == captured["queued_output"]["materials"]
+    assert response_materials == queued_materials
 
 
 @pytest.mark.parametrize(
@@ -1293,6 +1286,14 @@ def test_plaintext_dead_same_host_owner_is_recovered_immediately(monkeypatch):
         lambda *_args, **kwargs: captured.update(kwargs) or failed,
     )
     monkeypatch.setattr(plaintext.service, "write_genesis_state", lambda *_args, **_kwargs: None)
+    traces = []
+    monkeypatch.setattr(
+        plaintext,
+        "_trace_genesis",
+        lambda _store, event_type, **kwargs: traces.append((event_type, kwargs)),
+    )
+    checkpoint_blob = {"checkpoint_bytes": 4567, "content_envelope": {"body_ct": "ciphertext"}}
+    monkeypatch.setattr(plaintext.db, "get_blob_strict", lambda *_args: checkpoint_blob)
     monkeypatch.setattr(
         plaintext,
         "_fail_stale_plaintext_job",
@@ -1305,6 +1306,17 @@ def test_plaintext_dead_same_host_owner_is_recovered_immediately(monkeypatch):
     assert captured["force"] is True
     assert captured["expected_worker_instance"] == "old-instance"
     assert captured["error"] == "plaintext_worker_restarted"
+    interrupted = next(kwargs for event, kwargs in traces if event == "genesis.plaintext.interrupted")
+    assert interrupted["status"] == "error"
+    assert interrupted["detail"] == {
+        "cause": "owner_pid_dead",
+        "windows_done": 0,
+        "windows_total": 0,
+        "elapsed_sec": 0,
+        "history_tier": "",
+        "distill_model": "",
+        "checkpoint_bytes": 4567,
+    }
 
 
 def test_plaintext_live_same_host_owner_keeps_stale_lease_guard(monkeypatch):
@@ -1334,6 +1346,88 @@ def test_plaintext_live_same_host_owner_keeps_stale_lease_guard(monkeypatch):
     assert plaintext._fail_stale_plaintext_job(_store(), processing) is None
     assert captured["force"] is False
     assert captured["expected_worker_instance"] == "other-live-instance"
+
+
+def test_plaintext_aged_heartbeat_interruption_trace_reports_progress(monkeypatch):
+    processing = {
+        "job_id": "job_heartbeat_aged",
+        "status": "processing",
+        "updated_at": time.time() - 180,
+        "metadata": {
+            "ingest": "plaintext",
+            "history_tier": "large",
+            "distill_model": "anthropic/claude-haiku-4.5",
+        },
+        "output": {
+            "materials": [
+                {"windows_done": 40, "windows_total": 50},
+                {"windows_done": 5, "windows_total": 17},
+            ],
+        },
+    }
+    failed = {**processing, "status": "failed", "error": "plaintext_stale_timeout:120s"}
+    monkeypatch.setattr(plaintext, "_plaintext_stale_sec", lambda: 120)
+    monkeypatch.setattr(plaintext, "_plaintext_owner_process_is_dead", lambda _metadata: False)
+    monkeypatch.setattr(
+        plaintext.db,
+        "genesis_fail_stale_plaintext_job",
+        lambda *_args, **_kwargs: failed,
+    )
+    monkeypatch.setattr(plaintext.service, "write_genesis_state", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        plaintext.db,
+        "get_blob_strict",
+        lambda *_args: {"checkpoint_bytes": 98765, "content_envelope": {"body_ct": "ciphertext"}},
+    )
+    traces = []
+    monkeypatch.setattr(
+        plaintext,
+        "_trace_genesis",
+        lambda _store, event_type, **kwargs: traces.append((event_type, kwargs)),
+    )
+    monkeypatch.setattr(plaintext, "_fail_stale_plaintext_job", _FAIL_STALE_PLAINTEXT_JOB)
+
+    assert plaintext._fail_stale_plaintext_job(_store(), processing) == failed
+
+    detail = next(kwargs["detail"] for event, kwargs in traces if event == "genesis.plaintext.interrupted")
+    assert detail["cause"] == "heartbeat_aged"
+    assert detail["windows_done"] == 45
+    assert detail["windows_total"] == 67
+    assert detail["elapsed_sec"] >= 180
+    assert detail["history_tier"] == "large"
+    assert detail["distill_model"] == "anthropic/claude-haiku-4.5"
+    assert detail["checkpoint_bytes"] == 98765
+    assert "content_envelope" not in detail
+
+
+def test_plaintext_interruption_trace_uses_unknown_without_age_evidence(monkeypatch):
+    processing = {
+        "job_id": "job_unknown_interrupt",
+        "status": "processing",
+        "metadata": {"ingest": "plaintext"},
+    }
+    failed = {**processing, "status": "failed", "error": "plaintext_stale_timeout:120s"}
+    monkeypatch.setattr(plaintext, "_plaintext_owner_process_is_dead", lambda _metadata: False)
+    monkeypatch.setattr(
+        plaintext.db,
+        "genesis_fail_stale_plaintext_job",
+        lambda *_args, **_kwargs: failed,
+    )
+    monkeypatch.setattr(plaintext.service, "write_genesis_state", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(plaintext.db, "get_blob_strict", lambda *_args: None)
+    traces = []
+    monkeypatch.setattr(
+        plaintext,
+        "_trace_genesis",
+        lambda _store, event_type, **kwargs: traces.append((event_type, kwargs)),
+    )
+    monkeypatch.setattr(plaintext, "_fail_stale_plaintext_job", _FAIL_STALE_PLAINTEXT_JOB)
+
+    assert plaintext._fail_stale_plaintext_job(_store(), processing) == failed
+    detail = next(kwargs["detail"] for event, kwargs in traces if event == "genesis.plaintext.interrupted")
+    assert detail["cause"] == "unknown"
+    assert detail["elapsed_sec"] == 0
+    assert detail["checkpoint_bytes"] == 0
 
 
 def test_plaintext_job_heartbeat_renews_processing_lease(monkeypatch):
@@ -1408,6 +1502,7 @@ def test_plaintext_background_runner_distills_and_applies(monkeypatch):
     def fake_build(**kwargs):
         calls["build"] = kwargs
         kwargs["on_map_completed"](0, {"fact_candidates": []})
+        kwargs["on_voice_completed"](0, {"behavior_notes_candidates": []})
         return {"memories": [], "identity": {}, "voice": {}, "persona": {}}
 
     monkeypatch.setattr(plaintext.worker, "build_reducer_output_from_texts", fake_build)
@@ -1434,6 +1529,7 @@ def test_plaintext_background_runner_distills_and_applies(monkeypatch):
     assert calls["build"]["chunk_texts"] == ["window 1"]
     assert calls["build"]["source_kind"] == "history_import"
     assert calls["build"]["runtime"].model == "fast-genesis-model"
+    assert calls["build"]["resume_voice_outputs"] == {}
     assert chat_runtime.model == "chat-model"
     assert calls["applied"]["memories"] == []
     assert calls["statuses"][-1]["processed_chunks"] == 1
@@ -1504,6 +1600,168 @@ def test_plaintext_material_cards_come_from_durable_map_outputs(monkeypatch):
         "windows_total": 1,
         "cards": 2,
     }]
+
+
+def test_plaintext_voice_checkpoint_resumes_without_map_calls_and_preserves_candidate_count(monkeypatch):
+    monkeypatch.delenv("FEEDLING_GENESIS_VOICE_CHECKPOINT_ENABLED", raising=False)
+    source_groups = [{
+        "source_kind": "history_import",
+        "source_family": "history",
+        "chunk_texts": ["window 0", "window 1", "window 2"],
+    }]
+    progress = plaintext._PlaintextCheckpointProgress(
+        _store(), "api-key", "job-voice-resume", source_groups,
+    )
+    reduce_candidate_counts = []
+    monkeypatch.setattr(
+        plaintext.worker,
+        "_voice_reduce",
+        lambda _llm, **kwargs: reduce_candidate_counts.append(len(kwargs["candidates"]))
+        or {"behavior_notes": [], "exemplars": []},
+    )
+
+    class FakeLLM:
+        def __init__(self):
+            self.calls = []
+
+        def complete(self, **kwargs):
+            self.calls.append(kwargs["task_id"])
+            if kwargs["task_id"] == "persona-build":
+                return types.SimpleNamespace(
+                    text="## 你是谁\n\nMira",
+                    usage={}, cached=False, output_ref=kwargs["task_id"],
+                )
+            idx = int(kwargs["task_id"].rsplit("-", 1)[1])
+            return types.SimpleNamespace(
+                text=json.dumps({"behavior_notes_candidates": [f"note-{idx}"]}),
+                usage={}, cached=False, output_ref=kwargs["task_id"],
+            )
+
+    first_llm = FakeLLM()
+    plaintext.worker.build_reducer_output_from_texts(
+        user_id="usr_plaintext",
+        job_id="job-voice-resume",
+        runtime=types.SimpleNamespace(),
+        chunk_texts=source_groups[0]["chunk_texts"],
+        source_kind="history_import",
+        include_memory=False,
+        llm=first_llm,
+        on_voice_completed=lambda idx, mapped: progress.record_voice(1, "history", idx, mapped),
+    )
+    resumed = plaintext._PlaintextCheckpointProgress(
+        _store(), "api-key", "job-voice-resume", source_groups,
+    )
+    second_llm = FakeLLM()
+    plaintext.worker.build_reducer_output_from_texts(
+        user_id="usr_plaintext",
+        job_id="job-voice-resume",
+        runtime=types.SimpleNamespace(),
+        chunk_texts=source_groups[0]["chunk_texts"],
+        source_kind="history_import",
+        include_memory=False,
+        llm=second_llm,
+        resume_voice_outputs=resumed.resume_voice_outputs(1, "history"),
+    )
+
+    assert [task for task in first_llm.calls if task.startswith("voice-map-")] == [
+        "voice-map-0", "voice-map-1", "voice-map-2",
+    ]
+    assert [task for task in second_llm.calls if task.startswith("voice-map-")] == []
+    assert reduce_candidate_counts == [3, 3]
+    assert len(resumed.resume_voice_outputs(1, "history")) == 3
+    assert all(key.startswith("plaintext-voice:") for key in resumed.doc["voice_outputs"])
+    assert all(not key.startswith("plaintext-map:") for key in resumed.doc["voice_outputs"])
+
+
+def test_plaintext_voice_checkpoint_old_document_without_voice_outputs_reruns(monkeypatch):
+    monkeypatch.delenv("FEEDLING_GENESIS_VOICE_CHECKPOINT_ENABLED", raising=False)
+    source_groups = [{"source_family": "history", "chunk_texts": ["a", "b"]}]
+    monkeypatch.setattr(
+        plaintext.service,
+        "load_genesis_checkpoint",
+        lambda *_args, **_kwargs: {"v": 1, "tasks": {}, "map_outputs": {}},
+    )
+    progress = plaintext._PlaintextCheckpointProgress(
+        _store(), "api-key", "job-old-checkpoint", source_groups,
+    )
+    assert progress.resume_voice_outputs(1, "history") == {}
+    voice_calls = []
+    monkeypatch.setattr(
+        plaintext.worker,
+        "_complete_json",
+        lambda _llm, **kwargs: voice_calls.append(kwargs["task_id"])
+        or {"behavior_notes_candidates": [], "exemplar_candidates": []},
+    )
+    monkeypatch.setattr(
+        plaintext.worker,
+        "_voice_reduce",
+        lambda *_args, **_kwargs: {"behavior_notes": [], "exemplars": []},
+    )
+    monkeypatch.setattr(plaintext.worker, "_complete_text", lambda *_args, **_kwargs: "persona")
+    plaintext.worker.build_reducer_output_from_texts(
+        user_id="usr_plaintext",
+        job_id="job-old-checkpoint",
+        runtime=types.SimpleNamespace(),
+        chunk_texts=["a", "b"],
+        source_kind="history_import",
+        include_memory=False,
+        llm=types.SimpleNamespace(),
+        resume_voice_outputs=progress.resume_voice_outputs(1, "history"),
+    )
+    assert voice_calls == ["voice-map-0", "voice-map-1"]
+
+
+def test_plaintext_voice_checkpoint_kill_switch_forces_rerun(monkeypatch):
+    monkeypatch.setenv("FEEDLING_GENESIS_VOICE_CHECKPOINT_ENABLED", "0")
+    source_groups = [{"source_family": "history", "chunk_texts": ["a"]}]
+    progress = plaintext._PlaintextCheckpointProgress(
+        _store(), "api-key", "job-voice-disabled", source_groups,
+    )
+    progress.record_voice(1, "history", 0, {"behavior_notes_candidates": ["cached"]})
+    assert progress.resume_voice_outputs(1, "history") == {}
+    assert "voice_outputs" not in progress.doc
+    voice_calls = []
+    monkeypatch.setattr(
+        plaintext.worker,
+        "_complete_json",
+        lambda _llm, **kwargs: voice_calls.append(kwargs["task_id"])
+        or {"behavior_notes_candidates": [], "exemplar_candidates": []},
+    )
+    monkeypatch.setattr(
+        plaintext.worker,
+        "_voice_reduce",
+        lambda *_args, **_kwargs: {"behavior_notes": [], "exemplars": []},
+    )
+    monkeypatch.setattr(plaintext.worker, "_complete_text", lambda *_args, **_kwargs: "persona")
+    plaintext.worker.build_reducer_output_from_texts(
+        user_id="usr_plaintext",
+        job_id="job-voice-disabled",
+        runtime=types.SimpleNamespace(),
+        chunk_texts=["a"],
+        source_kind="history_import",
+        include_memory=False,
+        llm=types.SimpleNamespace(),
+        resume_voice_outputs=progress.resume_voice_outputs(1, "history"),
+    )
+    assert voice_calls == ["voice-map-0"]
+
+
+def test_plaintext_voice_checkpoint_67_windows_stays_bounded(monkeypatch):
+    monkeypatch.delenv("FEEDLING_GENESIS_VOICE_CHECKPOINT_ENABLED", raising=False)
+    source_groups = [{"source_family": "history", "chunk_texts": [f"w-{i}" for i in range(67)]}]
+    progress = plaintext._PlaintextCheckpointProgress(
+        _store(), "api-key", "job-voice-67", source_groups,
+    )
+    for idx in range(67):
+        progress.record_voice(1, "history", idx, {
+            "behavior_notes_candidates": [f"note-{idx}"],
+            "exemplar_candidates": [{"turns": [{"role": "ta", "text": f"reply-{idx}"}]}],
+        })
+    checkpoint_bytes = len(json.dumps(
+        progress.doc, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8"))
+    assert len(progress.resume_voice_outputs(1, "history")) == 67
+    assert checkpoint_bytes < 128 * 1024
 
 
 def test_plaintext_map_diagnostics_are_bounded_in_job_output(monkeypatch):
@@ -1691,7 +1949,7 @@ def test_plaintext_background_runner_routes_sources_and_merges_with_firewall(mon
 
 def test_plaintext_retry_uses_checkpoint_and_skips_completed_maps(monkeypatch):
     store = _store()
-    calls = {"maps": 0, "reduces": 0, "failures": []}
+    calls = {"maps": 0, "reduces": 0, "failures": [], "cards": 0}
     monkeypatch.setattr(plaintext.worker, "genesis_v2_enabled", lambda: True)
     monkeypatch.setattr(plaintext.worker, "genesis_combined_map_enabled", lambda: True)
     monkeypatch.setattr(plaintext.hosted_config_store, "_load_runtime_provider_config", lambda *_args: "runtime")
@@ -1740,7 +1998,12 @@ def test_plaintext_retry_uses_checkpoint_and_skips_completed_maps(monkeypatch):
     monkeypatch.setattr(plaintext.lightweight_identity, "derive_from_support", lambda *_args, **_kwargs: {})
     monkeypatch.setattr(plaintext.lightweight_identity, "has_signal", lambda *_args: False)
     monkeypatch.setattr(plaintext, "_append_plaintext_onboarding_greeting", lambda *_args, **_kwargs: "hi")
-    monkeypatch.setattr(plaintext.service, "apply_reducer_output", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        plaintext.service,
+        "apply_reducer_output",
+        lambda _store, _api_key, _job_id, output, **_kwargs:
+        calls.update(cards=calls["cards"] + len(output.get("memories") or [])),
+    )
     monkeypatch.setattr(
         plaintext.db,
         "genesis_complete_job",
@@ -1766,6 +2029,7 @@ def test_plaintext_retry_uses_checkpoint_and_skips_completed_maps(monkeypatch):
     assert calls["maps"] == 1
     assert calls["reduces"] == 2
     assert len(calls["failures"]) == 1
+    assert calls["cards"] == 1
 
 
 def test_plaintext_relationship_anchor_uses_earliest_timestamp_when_no_date():
