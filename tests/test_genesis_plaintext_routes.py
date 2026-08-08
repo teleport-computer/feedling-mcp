@@ -2678,3 +2678,28 @@ def test_sealed_import_rejection_logs_breadcrumb(monkeypatch, caplog):
     assert "reason=sealed_envelope_incomplete" in msg
     assert "body_ct_bytes" in msg          # structural fact recorded (ciphertext length)
     assert "QUJD" not in msg               # never the (cipher)payload itself
+
+
+# --------------------------------------------------------------------------- #
+# Staged payload TTL == the retry window (usr_3b73f1cb0a9ec975, 2026-08-06).
+#
+# Retry re-commits the SAME staged_id, so this TTL is literally how long the
+# retry button can still work. At 24h a user whose long import failed while they
+# were away came back the next evening to a button that could only answer 410.
+# --------------------------------------------------------------------------- #
+
+def test_staged_ttl_default_covers_more_than_a_day(monkeypatch):
+    monkeypatch.delenv("FEEDLING_GENESIS_STAGED_TTL_SEC", raising=False)
+    ttl = plaintext._staged_ttl_sec()
+
+    assert ttl == 259200                      # 72h
+    assert ttl > 86400, "a <=24h window strands the come-back-tomorrow user"
+
+
+def test_staged_ttl_env_override_and_floor(monkeypatch):
+    monkeypatch.setenv("FEEDLING_GENESIS_STAGED_TTL_SEC", "600")
+    assert plaintext._staged_ttl_sec() == 600
+    monkeypatch.setenv("FEEDLING_GENESIS_STAGED_TTL_SEC", "5")
+    assert plaintext._staged_ttl_sec() == 60   # floor
+    monkeypatch.setenv("FEEDLING_GENESIS_STAGED_TTL_SEC", "not-a-number")
+    assert plaintext._staged_ttl_sec() == 259200

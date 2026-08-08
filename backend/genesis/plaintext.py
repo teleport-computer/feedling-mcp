@@ -296,11 +296,26 @@ def _prepare_plaintext_import(payload: dict) -> dict:
     }
 
 
+_STAGED_TTL_DEFAULT_SEC = 259200  # 72h
+
+
 def _staged_ttl_sec() -> int:
+    """How long a staged upload stays retryable.
+
+    Retry re-commits the SAME staged_id, so this TTL is exactly the window in
+    which the retry button can still work; past it `load_genesis_staged_payload`
+    deletes the blob and commit answers 410. 24h was too short for the shape we
+    actually see — a long import fails while the user is away, and they come
+    back the next evening to a button that can only fail
+    (usr_3b73f1cb0a9ec975, 2026-08-06). 72h covers "came back a day or two
+    later" while staying bounded: `create_genesis_staged_payload` reaps a user's
+    previous stage and a DONE job consumes its own, so only failed/abandoned
+    imports hold a blob at all — at most one per account."""
     try:
-        return max(60, int(os.environ.get("FEEDLING_GENESIS_STAGED_TTL_SEC", "86400")))
+        return max(60, int(os.environ.get(
+            "FEEDLING_GENESIS_STAGED_TTL_SEC", str(_STAGED_TTL_DEFAULT_SEC))))
     except (TypeError, ValueError):
-        return 86400
+        return _STAGED_TTL_DEFAULT_SEC
 
 
 def _plaintext_stale_sec() -> int:

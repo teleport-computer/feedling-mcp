@@ -171,23 +171,52 @@ GENESIS_ERROR_HINTS_EN: dict[str, str] = {
 }
 
 
-def genesis_failure_required_text(error: str) -> str:
+# Plaintext-path overrides. The generic hints describe the SEALED chunk import,
+# where a dead worker's job really is auto-recovered
+# (db.genesis_reclaim_orphaned_processing_jobs requeues received_chunks > 0 rows
+# back to 'uploaded'). Plaintext imports have no such path — they run in a
+# thread inside the request-handling process and nothing re-drives them — so
+# telling that user "已自动重新排队" is simply false, and it reads as "sit and
+# wait" exactly when the only way forward is to tap retry. usr_3b73f1cb0a9ec975
+# (2026-08-06) sat on that sentence for two days. Keep this map to codes whose
+# generic wording is wrong for plaintext; everything else falls through.
+GENESIS_ERROR_HINTS_PLAINTEXT: dict[str, str] = {
+    "worker_restarted": "服务重启打断了生成",
+}
+GENESIS_ERROR_HINTS_PLAINTEXT_EN: dict[str, str] = {
+    "worker_restarted": "a service restart interrupted the job",
+}
+
+
+def genesis_failure_required_text(error: str, *, ingest: str = "") -> str:
     """Bilingual, cause-aware `required` line for the onboarding checklist.
 
     Replaces the old static "Start onboarding again with the latest app build"
     — which named the wrong fix for every real failure cause (usr_9037eaa8,
     2026-07-24: five provider-timeout jobs answered with "update the app").
-    Imported materials survive a failed job, so the action is always "fix the
-    cause, then restart Genesis", never a reinstall/update."""
+
+    ``ingest`` is the job's ``metadata.ingest`` when the caller has the row
+    ("plaintext" for the estimate/commit onboarding flow, empty/other for the
+    sealed chunk import). It only selects wording — never behaviour.
+
+    The closing clause used to assert "已上传的材料不会丢" unconditionally. That
+    is only true inside the staged payload's TTL; past it the blob is deleted on
+    the next load and retry answers 410, so the promise inverted into a lie for
+    precisely the users who came back a day later."""
     code = classify_genesis_error(error)
-    zh = GENESIS_ERROR_HINTS.get(code, GENESIS_ERROR_HINTS["internal"])
-    en = GENESIS_ERROR_HINTS_EN.get(code, GENESIS_ERROR_HINTS_EN["internal"])
+    plaintext = str(ingest or "").strip().lower() == "plaintext"
+    zh = (GENESIS_ERROR_HINTS_PLAINTEXT if plaintext else {}).get(
+        code, GENESIS_ERROR_HINTS.get(code, GENESIS_ERROR_HINTS["internal"]))
+    en = (GENESIS_ERROR_HINTS_PLAINTEXT_EN if plaintext else {}).get(
+        code, GENESIS_ERROR_HINTS_EN.get(code, GENESIS_ERROR_HINTS_EN["internal"]))
     # User-facing vocabulary: "文件解读", never the internal term "蒸馏"
     # (Seven, 2026-07-24).
     return (
-        f"文件解读失败:{zh}。处理后在 App 里重新发起导入即可,已上传的材料不会丢。"
-        f" / Reading your onboarding materials failed: {en}. Then restart the "
-        "import from the app — your uploaded materials are kept."
+        f"文件解读失败:{zh}。请在 App 里重新发起导入;材料会保留几天,"
+        "过期后需要重新选择文件。"
+        f" / Reading your onboarding materials failed: {en}. Restart the import "
+        "from the app — your uploaded materials are kept for a few days, after "
+        "which you will need to pick the file again."
     )
 
 _BAD_API_KEY_STATUS = frozenset({401, 403})
