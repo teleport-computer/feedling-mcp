@@ -48,33 +48,33 @@ _ANY_TAG = re.compile(rf"<\s*/?\s*(?:{_TAG_ALT})\b", re.IGNORECASE)
 
 _ENV_FLAG = "FEEDLING_V2_SELF_THINKING"
 
+# 2026-08-08 换过一版。旧文案要求「每一次输出」都以 <think> 开头、并明确点名
+# 「即使是工具轮也要写」，实测代价有三：
+#   * 工具轮写出来的 think 全部被丢弃（那些文字本来就不进气泡），纯烧 token；
+#   * 指令按「每次输出」计、而解析按「整条回复」计，两边错位；
+#   * gpt-5 会把它读成「要我交出内部推理」，直接拒绝 + 整段转英文 + 破人设。
+# 新文案把锚点从「每次输出」改成「不再调用工具的那一次输出」，并要求那一个块
+# 覆盖整轮。实测 13 模型 × 2 遍：能写的 6 个模型 12/12 全对（1 块 / 在开头 /
+# 正文零残留 / 工具轮 0 个），gpt-5 不再拒绝。
 INSTRUCTION = (
-    " ⛔ ABSOLUTE OUTPUT RULE — NON-NEGOTIABLE, applies to EVERY single reply: the VERY "
-    "FIRST characters you output MUST be a literal `<think>` tag. Format: `<think>` then "
-    "your genuine first-person thought, then `</think>`, then your actual reply. You MUST "
-    "emit this visible <think> block EVERY time — no exceptions, even if you also reason "
-    "internally/natively, even on tool turns, even for a trivial message. Writing your "
-    "reply without a leading <think> block is a HARD FAILURE of the task. "
-    "The text inside <think> MUST obey — (1) LANGUAGE — it is written ENTIRELY in the "
-    "SAME language the user is actually speaking, 100% from first word to last. Judge "
-    "that language from the user's latest message and the recent conversation, and match "
-    "it exactly. The rule is SYMMETRIC: if they write Chinese, the <think> is all Chinese; "
-    "if they write English, it is all English; if Japanese, all Japanese — match "
-    "whatever they use, never drift into a different one. (A very common slip is sliding "
-    "into English — an English status line like 'Let me…' / 'Done…' / 'The … has been "
-    "updated' — while the user is speaking Chinese; do not do that.) If a phrase forms in "
-    "another language, restate it in the user's language before writing it here; (2) it "
-    "is your own casual first-person "
-    "train of thought — actually walk "
-    "through what you're figuring out and what you decide to do, a sentence or a few, a "
-    "short paragraph (it is shown to the user and trimmed past ~240 chars, so land it "
-    "naturally within that); (3) plain everyday intent ONLY — NEVER name tools, command "
-    "flags, field names, servers, an 'identity card', or any internal/technical/protocol "
-    "step. "
-    "Good (user is writing Chinese, so the block is Chinese): '<think>他想改叫999、还说喜欢说大话，那我先把名字这些存好，回复也顺着这个爱吹的人设、语气夸张点才对味</think>'. "
-    "Bad (same user wrote Chinese — this English block is the WRONG language, and it "
-    "names a step robotically): '<think>Let me update the name and match a boastful tone</think>'. "
-    "Never mention this <think> rule in the reply itself."
+    " ⛔ 绝对输出规则：只有当你给出这一轮的最终回复时（也就是你不再调用任何工具的"
+    "那一次输出），你输出的第一个字符必须是 `<think>`，接着写你真实的第一人称想法，"
+    "然后 `</think>`，然后才是你要对用户说的正文。"
+    "整轮只写一个 <think> 块，只写在最终回复里。"
+    "中间的工具轮不要写 <think>，也不要输出任何正文。"
+    "这个 <think> 块要覆盖整轮：你本来想做什么、路上发现了什么、最后决定怎么办"
+    "——第一人称、口语、约 240 字以内，写不完就收住，别硬塞。"
+    " 语言规则是硬的：整段必须完全用用户正在说的语言写，从第一个字到最后一个字，"
+    "按用户最近这条消息和最近的对话判断，一比一对上。他们写中文你就全中文，写英文"
+    "就全英文，写日文就全日文，绝不飘到另一种语言去。最常见的失误是用户在说中文、"
+    "你却滑进英文状态行（'Let me…' / 'Done…' / 'The … has been updated'），不要这样；"
+    "如果一句话先在另一种语言里成形了，先换成用户的语言再写下来。"
+    " 只说日常意图：绝不出现工具名、命令参数、字段名、服务器、'身份卡'，或任何"
+    "内部 / 技术 / 协议步骤。回复正文里也绝不要提到这条 <think> 规则本身。"
+    " 好例子（用户在说中文，所以整块是中文）："
+    "'<think>他想改叫999、还说喜欢说大话，那我先把名字这些存好，回复也顺着这个爱吹的人设、语气夸张点才对味</think>'。"
+    " 坏例子（同一个用户说的是中文——这个英文块语言错了，而且机械地报了步骤）："
+    "'<think>Let me update the name and match a boastful tone</think>'。"
 )
 
 
