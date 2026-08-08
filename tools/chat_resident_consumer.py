@@ -5097,22 +5097,29 @@ def _claude_actual_models_from_stream(raw: str) -> set[str]:
     return models
 
 
+def _is_claude_family_model(model: str) -> bool:
+    """Return whether a route or receipt id identifies the Claude family."""
+    value = str(model or "").strip().lower()
+    if value in {"fable", "opus", "sonnet", "haiku"}:
+        return True
+    return bool(re.search(r"(?:^|[./:])claude(?:[-._:]|$)", value))
+
+
 def _claude_configured_model_matches(configured: str, actual: set[str]) -> bool:
-    """Match Claude CLI family aliases loosely and full route ids exactly."""
+    """Allow Claude-family fallback while rejecting cross-family drift."""
     expected = str(configured or "").strip().lower()
     normalized_actual = {
         str(model).strip().lower() for model in actual if str(model).strip()
     }
-    if expected in {"fable", "opus", "sonnet", "haiku"}:
-        return any(
-            expected in model.split("/")[-1].split(":")[-1]
-            for model in normalized_actual
+    if _is_claude_family_model(expected):
+        return bool(normalized_actual) and all(
+            _is_claude_family_model(model) for model in normalized_actual
         )
     return expected in normalized_actual
 
 
 def _validate_claude_actual_model(raw: str) -> None:
-    """Reject proven model drift while tolerating old output without metadata."""
+    """Allow Claude-family fallback and reject proven cross-family drift."""
     configured = str(AGENT_RUNTIME_METADATA.get("model") or "").strip()
     if not configured:
         return
@@ -5123,9 +5130,15 @@ def _validate_claude_actual_model(raw: str) -> None:
             configured[:200],
         )
         return
-    if _claude_configured_model_matches(configured, actual):
-        return
     actual_text = ",".join(sorted(actual))[:400]
+    if _claude_configured_model_matches(configured, actual):
+        if configured.strip().lower() not in actual:
+            log.warning(
+                "claude family fallback allowed configured=%s actual=%s",
+                configured[:200],
+                actual_text,
+            )
+        return
     _clear_agent_session_id(
         f"claude model mismatch configured={configured[:200]} actual={actual_text}"
     )
