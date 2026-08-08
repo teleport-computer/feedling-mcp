@@ -466,7 +466,7 @@ def test_worker_child_private_read_blocks_later_outbound_web(
     assert capability_calls == ["workspace_read"]
     assert {spec.name for spec in offered[0]} == worker._SUBAGENT_ALLOWED_TOOLS
     assert {spec.name for spec in offered[1]}.isdisjoint({"web_search", "web_fetch"})
-    assert offered[2] is None
+    assert {spec.name for spec in offered[2]} == {"workspace_read"}
 
 
 def test_worker_child_forged_mutation_gets_text_fallback_without_dispatch(

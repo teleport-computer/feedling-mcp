@@ -929,10 +929,10 @@ def test_reply_special_tool_is_immediate_and_continues(monkeypatch):
     assert outcome.rounds == 2
 
 
-def test_budget_bound_last_call_omits_tools_and_terminates(monkeypatch):
+def test_budget_bound_last_call_keeps_history_schema_and_forbids_tools(monkeypatch):
     """If every round returns a tool_call, the loop's LAST provider call
-    (call_idx == max_calls-1) is made with tools=None so it always terminates with
-    model text — never a filler bubble, never exceeding max_calls provider calls."""
+    keeps the schema referenced by native history but sets tool_choice=none, so
+    strict providers can validate the transcript without extending the loop."""
     provider = _ScriptedProvider([
         {
             "reply": "looking 1",
@@ -944,14 +944,19 @@ def test_budget_bound_last_call_omits_tools_and_terminates(monkeypatch):
             "tool_calls": [{"id": "2", "name": "memory_search", "args": {"query": "b"}}],
             "usage": {},
         },
-        # last call: tools=None -> model cannot return tool_calls, must terminate.
+        # last call: schema remains visible but tool_choice=none forces text.
         {"reply": "final terminal text", "tool_calls": [], "usage": {}},
     ])
     monkeypatch.setattr(provider_client, "chat_completion_async", provider)
 
     on_reply = _RecordingReply()
     dispatch = _RecordingDispatch()
-    build_messages = _RecordingBuildMessages()
+    class TranscriptBuildMessages(_RecordingBuildMessages):
+        def __call__(self, transcript):
+            self.calls.append(list(transcript))
+            return [{"role": "user", "content": "turn"}, *transcript]
+
+    build_messages = TranscriptBuildMessages()
     fold = _RecordingFold([])
 
     outcome = asyncio.run(tool_loop.run_tool_loop(
@@ -967,12 +972,147 @@ def test_budget_bound_last_call_omits_tools_and_terminates(monkeypatch):
     assert len(provider.calls) == 3
     assert provider.calls[0]["tools"] is not None
     assert provider.calls[1]["tools"] is not None
-    assert provider.calls[2]["tools"] is None  # last call: tools omitted
+    assert {spec.name for spec in provider.calls[2]["tools"]} == {"memory_search"}
+    assert provider.calls[2]["tool_choice"] == "none"
+    assert any(
+        isinstance(message, ToolExchange)
+        and message.calls[0].name == "memory_search"
+        for message in provider.calls[2]["messages"]
+    )
     assert outcome.final_text == "final terminal text"
     assert outcome.rounds == 3
     assert outcome.stop_reason == "final_text"
     # never a filler: the terminal text is exactly what the model said.
     assert on_reply.calls[-1] == ("final terminal text", True)
+
+
+def test_terminal_tool_choice_none_is_never_dispatched_if_provider_ignores_it(
+    monkeypatch,
+):
+    provider = _ScriptedProvider([
+        {
+            "reply": "",
+            "tool_calls": [{"id": "g1", "name": "identity_get", "args": {}}],
+            "usage": {},
+        },
+        {
+            "reply": "",
+            "tool_calls": [{"id": "g2", "name": "identity_get", "args": {}}],
+            "usage": {},
+        },
+    ])
+    monkeypatch.setattr(provider_client, "chat_completion_async", provider)
+    dispatch = _RecordingDispatch()
+
+    outcome = asyncio.run(tool_loop.run_tool_loop(
+        provider_config=_TEST_PROVIDER_CONFIG,
+        build_messages=_RecordingBuildMessages(),
+        dispatch_tools=dispatch,
+        on_reply=_RecordingReply(),
+        fold_new_messages=_RecordingFold([[]]),
+        add_usage=_noop_add_usage,
+        max_calls=2,
+    ))
+
+    assert len(dispatch.calls) == 1
+    assert [tc.id for tc in dispatch.calls[0]] == ["g1"]
+    assert provider.calls[1]["tool_choice"] == "none"
+    assert outcome.stop_reason == "budget_exhausted"
+
+
+def test_terminal_history_schema_survives_late_file_requirement(monkeypatch):
+    provider = _ScriptedProvider([
+        {
+            "reply": "",
+            "tool_calls": [{"id": "i1", "name": "identity_get", "args": {}}],
+            "usage": {},
+        },
+        {"reply": "I could not create the file.", "tool_calls": [], "usage": {}},
+    ])
+    monkeypatch.setattr(provider_client, "chat_completion_async", provider)
+
+    async def on_file(path, revision):
+        return None
+
+    def required_suffixes(messages):
+        if any("file please" in str(message.get("content") or "") for message in messages):
+            return (".md",)
+        return None
+
+    outcome = asyncio.run(tool_loop.run_tool_loop(
+        provider_config=_TEST_PROVIDER_CONFIG,
+        build_messages=_RecordingBuildMessages(),
+        dispatch_tools=_RecordingDispatch(),
+        on_reply=_RecordingReply(),
+        on_file_reply=on_file,
+        file_requirement_messages=(),
+        resolve_required_file_suffixes=required_suffixes,
+        fold_new_messages=_RecordingFold([
+            [{"role": "user", "content": "file please"}],
+        ]),
+        add_usage=_noop_add_usage,
+        max_calls=2,
+    ))
+
+    assert {spec.name for spec in provider.calls[1]["tools"]} == {"identity_get"}
+    assert provider.calls[1]["tool_choice"] == "none"
+    assert outcome.stop_reason == "required_file_missing"
+
+
+def test_terminal_file_recovery_cannot_override_tool_choice_none(monkeypatch):
+    provider = _ScriptedProvider([
+        {
+            "reply": "",
+            "tool_calls": [{
+                "id": "w1",
+                "name": "workspace_write",
+                "args": {
+                    "path": "/workspace/summary.md",
+                    "content": "summary",
+                    "expected_revision": 0,
+                },
+            }],
+            "usage": {},
+        },
+        {"reply": "I will create it.", "tool_calls": [], "usage": {}},
+        {
+            "reply": "",
+            "tool_calls": [{"id": "bad", "name": "workspace_write", "args": {}}],
+            "usage": {},
+        },
+        {"reply": "I could not create the file.", "tool_calls": [], "usage": {}},
+    ])
+    monkeypatch.setattr(provider_client, "chat_completion_async", provider)
+    dispatch = _RecordingDispatch("error: write rejected")
+
+    async def on_file(path, revision):
+        return None
+
+    config = provider_client.ProviderConfig(
+        provider="openrouter",
+        model="anthropic/claude-opus-4.8",
+        api_key="test-key",
+    )
+    outcome = asyncio.run(tool_loop.run_tool_loop(
+        provider_config=config,
+        build_messages=_RecordingBuildMessages(),
+        dispatch_tools=dispatch,
+        on_reply=_RecordingReply(),
+        on_file_reply=on_file,
+        required_file_suffixes=(".md",),
+        fold_new_messages=_RecordingFold([[], [], []]),
+        add_usage=_noop_add_usage,
+        max_calls=4,
+    ))
+
+    assert len(dispatch.calls) == 1
+    assert provider.calls[2]["tool_choice"] == {
+        "type": "function",
+        "function": {"name": "workspace_write"},
+    }
+    assert {spec.name for spec in provider.calls[3]["tools"]} == {"workspace_write"}
+    assert provider.calls[3]["tool_choice"] == "none"
+    assert outcome.stop_reason == "required_file_missing"
 
 
 def test_memory_discovery_schema_remains_visible_after_first_result(monkeypatch):
@@ -1362,7 +1502,8 @@ def test_budget_bound_last_call_also_disables_reasoning(monkeypatch):
 
     assert provider.calls[0]["include_reasoning"] is True
     assert provider.calls[1]["include_reasoning"] is True
-    assert provider.calls[2]["tools"] is None
+    assert {spec.name for spec in provider.calls[2]["tools"]} == {"memory_search"}
+    assert provider.calls[2]["tool_choice"] == "none"
     assert "include_reasoning" not in provider.calls[2]
     assert outcome.final_text == "final terminal text"
 
@@ -1607,7 +1748,13 @@ def test_per_turn_tool_call_ceiling_rejects_only_the_overflow_batch(monkeypatch)
     ))
 
     assert [[tc.id for tc in batch] for batch in dispatch.calls] == [["c1"], ["c2"]]
-    assert [call["tools"] is None for call in provider.calls] == [False, False, False, True]
+    assert [call["tools"] is None for call in provider.calls] == [
+        False,
+        False,
+        False,
+        False,
+    ]
+    assert provider.calls[-1]["tool_choice"] == "none"
     assert outcome.final_text == "turn fallback"
 
 

@@ -238,6 +238,15 @@ Also tighten Fable detection to an exact model basename match and add negative
 boundary cases so similarly named models retain the existing self-thinking
 behavior.
 
+- [ ] **Step 8: Preserve schemas on the bounded terminal round**
+
+Deployed E2E showed Anthropic Opus 4.8 could consume several valid tool rounds
+and then return empty on the final `tools=None` request, recreating the same
+native-history/schema mismatch. For wires with a documented no-tool choice,
+retain only schemas referenced by the transcript, count them as required, and
+send `tool_choice=none`. Encode Anthropic's native `{"type":"none"}` form and
+reject any terminal tool call locally without dispatch as defense in depth.
+
 ---
 
 ### Task 3: Document and verify the complete V2 compatibility change

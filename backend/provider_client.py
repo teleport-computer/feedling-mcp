@@ -2965,6 +2965,7 @@ def _build_anthropic_payload(
     include_reasoning: bool = False,
     tools: "list[ToolSpec] | None" = None,
     prompt_cache_key: str = "",
+    tool_choice: str | dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], str, dict[str, str]]:
     cacheable_system_parts = [
         _content_text(message.get("content"))
@@ -3005,6 +3006,8 @@ def _build_anthropic_payload(
         payload["system"] = system
     if tools:
         payload["tools"] = _encode_tools_anthropic(tools)
+        if tool_choice == "none" or tool_choice == {"type": "none"}:
+            payload["tool_choice"] = {"type": "none"}
     # The opaque affinity key itself is intentionally not sent on Anthropic's
     # wire.  ``cache_control`` lives on the stable system/message content block
     # above; top-level cache_control is not part of the Messages API schema.
@@ -4244,6 +4247,7 @@ async def _chat_completion_async_impl(
             include_reasoning=include_reasoning,
             tools=tools,
             prompt_cache_key=config.prompt_cache_key,
+            tool_choice=tool_choice,
         )
 
         async def post_anthropic(request_payload: dict[str, Any]) -> httpx.Response:

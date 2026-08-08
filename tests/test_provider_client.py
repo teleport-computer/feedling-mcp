@@ -361,6 +361,29 @@ def test_openai_compat_payload_preserves_forced_tool_choice():
     assert payload["tool_choice"] is not choice
 
 
+def test_anthropic_payload_encodes_tool_choice_none_with_tools():
+    payload, _url, _headers = pc._build_anthropic_payload(
+        model="claude-opus-4-8",
+        base_url="https://api.anthropic.com/v1",
+        key="sk-ant-test",
+        messages=[{"role": "user", "content": "answer now"}],
+        max_tokens=700,
+        temperature=None,
+        response_format=None,
+        tools=[
+            ToolSpec(
+                "memory_index",
+                "list memories",
+                {"type": "object", "properties": {}},
+            )
+        ],
+        tool_choice="none",
+    )
+
+    assert payload["tools"][0]["name"] == "memory_index"
+    assert payload["tool_choice"] == {"type": "none"}
+
+
 def test_parse_openai_compat_body_result_shape():
     resp = FakeResponse(200, {
         "id": "chatcmpl-1",

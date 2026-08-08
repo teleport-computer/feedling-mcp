@@ -76,6 +76,8 @@ Opus 5 已在测试环境完整通过聊天和 tool call，没有证据支持扩
 
 Prompt frontier 继续允许整份未引用工具目录作为 optional component 降级，但会把 `completed_memory_discovery_tools` 对应的 schema 拆成 `required_tool_schemas`。如果 required native transcript 加其引用 schema 已经超预算，回合在 provider call 前明确失败；如果只有其余目录超预算，则只发送历史引用 schema，避免发送“有 `tool_use/tool_result`、无对应定义”的不一致请求。
 
+预算终止轮同样不得破坏该一致性。对明确支持 `tool_choice=none` 的 Anthropic 和 OpenAI-compatible wire，终止轮保留 native transcript 引用的 schema，把它们计为 required，并禁止模型继续调用；Anthropic Messages wire 编码为 `{"type":"none"}`。其他尚未接线该能力的 wire 继续使用 `tools=None`。即使异常 relay 无视 `none` 返回工具调用，终止轮也只判为 malformed，不进入 dispatcher。
+
 ### 3. 空回复恢复语义
 
 现有 `ProviderEmptyReply`、语义纠正重试、trajectory 事件和用户提示保持不变。本修复让两个已知冲突在空回复恢复之前消失，但不弱化其他 provider 异常的保护。
@@ -99,6 +101,7 @@ Fable 仍可能因其他安全原因返回真正的 `refusal`；这种情况继�
 - 同一 batch 的重复 discovery 仍只执行一次。
 - Anthropic native `ToolExchange` 在 schema 保持可见时可继续编码为相邻的 assistant `tool_use` 和 user `tool_result`。
 - frontier 省略可选目录时，历史引用的 discovery schema 与 native `ToolExchange` 仍在同一个 provider request 中；若两者作为 required components 也无法容纳，则 fail closed。
+- 支持 `tool_choice=none` 的终止轮同时携带 native history、引用 schema 和禁止工具选择；异常 provider 返回的终止轮 tool call 不会执行。
 
 ### 回归范围
 
