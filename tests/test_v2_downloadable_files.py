@@ -166,7 +166,7 @@ def test_file_capable_chat_uses_v2_output_budget_without_changing_global_default
     )
 
     assert default_max == 700
-    assert seen_kwargs == [{"max_tokens": 4096}]
+    assert seen_kwargs == [{"require_reply": False, "max_tokens": 4096}]
 
     seen_kwargs.clear()
     asyncio.run(
@@ -183,7 +183,7 @@ def test_file_capable_chat_uses_v2_output_budget_without_changing_global_default
         )
     )
 
-    assert seen_kwargs == [{}]
+    assert seen_kwargs == [{"require_reply": False}]
 
 
 def test_send_file_is_chat_only_and_invokes_explicit_callback(monkeypatch):

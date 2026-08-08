@@ -49,6 +49,36 @@ _FILE_DELIVERY_TOOLS = frozenset(
         tool_schema.FILE_REPLY_TOOL,
     }
 )
+_EMPTY_RESPONSE_CORRECTION = (
+    "The previous response completed without visible text or a client tool call. "
+    "Complete the user's request now. Return either non-empty visible answer text "
+    "or a valid call to one of the offered client tools. Do not return a "
+    "thinking-only response."
+)
+_CONTENT_FREE_STOP_REASONS = frozenset(
+    {
+        "blocklist",
+        "content_filter",
+        "end_turn",
+        "function_call",
+        "image_safety",
+        "language",
+        "length",
+        "malformed_function_call",
+        "max_tokens",
+        "other",
+        "pause_turn",
+        "prohibited_content",
+        "recitation",
+        "refusal",
+        "safety",
+        "spii",
+        "stop",
+        "stop_sequence",
+        "tool_calls",
+        "tool_use",
+    }
+)
 
 
 def _catalog():
@@ -207,6 +237,50 @@ class FinalReplySuperseded(RuntimeError):
     """
 
 
+class ProviderEmptyReply(RuntimeError):
+    """A structurally valid provider success had no foreground-usable output."""
+
+
+def _empty_response_shape(pr: ProviderResponse) -> dict[str, object]:
+    """Return content-free diagnostics for a provider success with no output."""
+    raw_stop_reason = str(pr.raw.get("stop_reason") or "").strip().lower()
+    return {
+        "stop_reason": (
+            raw_stop_reason
+            if raw_stop_reason in _CONTENT_FREE_STOP_REASONS
+            else ("other" if raw_stop_reason else "")
+        ),
+        "has_visible_text": bool(pr.text.strip()),
+        "reasoning_present": bool(str(pr.raw.get("reasoning") or "").strip()),
+        "tool_call_count": len(pr.tool_calls),
+        "completion_tokens": pr.usage.completion_tokens,
+    }
+
+
+def _with_system_suffix(messages: list, suffix: str) -> list:
+    """Append a transient system suffix while preserving native exchanges."""
+    instruction = str(suffix or "").strip()
+    if not instruction:
+        return messages
+    updated = [
+        dict(message) if isinstance(message, dict) else message
+        for message in messages
+    ]
+    if (
+        updated
+        and isinstance(updated[0], dict)
+        and updated[0].get("role") == "system"
+    ):
+        updated[0]["content"] = (
+            str(updated[0].get("content") or "").rstrip()
+            + "\n\n"
+            + instruction
+        )
+    else:
+        updated.insert(0, {"role": "system", "content": instruction})
+    return updated
+
+
 async def run_tool_loop(
     *,
     provider_config,
@@ -362,6 +436,8 @@ async def run_tool_loop(
     reasoning_fragments: list[str] = []
     seen_reasoning_fragments: set[str] = set()
     force_text_fallback = False
+    empty_response_recovery_used = False
+    empty_response_retry_instruction = ""
     external_content_seen = False
     mutation_outcome_unknown = False
     outbound_tools_blocked = False
@@ -551,29 +627,16 @@ async def run_tool_loop(
                             await on_file_requirement_changed()
 
         messages = build_messages(list(transcript))
-        if delivery_retry_instruction:
-            # Keep provider-native tool exchanges intact. They are dataclasses,
-            # not mappings, and must survive unchanged so the next provider
-            # round can replay the exact assistant/tool-result transcript.
-            messages = [
-                dict(message) if isinstance(message, dict) else message
-                for message in messages
-            ]
-            if (
-                messages
-                and isinstance(messages[0], dict)
-                and messages[0].get("role") == "system"
-            ):
-                messages[0]["content"] = (
-                    str(messages[0].get("content") or "").rstrip()
-                    + "\n\n"
-                    + delivery_retry_instruction
-                )
-            else:
-                messages.insert(
-                    0,
-                    {"role": "system", "content": delivery_retry_instruction},
-                )
+        retry_instructions = "\n\n".join(
+            instruction
+            for instruction in (
+                delivery_retry_instruction,
+                empty_response_retry_instruction,
+            )
+            if instruction
+        )
+        if retry_instructions:
+            messages = _with_system_suffix(messages, retry_instructions)
         # Reserve the final provider attempt for a tools-disabled terminal reply.
         # A 400/422 tool-schema rejection or repeated malformed call also forces
         # this same one-shot fallback; the fallback itself is never retried.
@@ -661,6 +724,7 @@ async def run_tool_loop(
                     safety_margin_tokens=prompt_safety_margin_tokens,
                     utf8_bytes_per_token=prompt_estimator_utf8_bytes_per_token,
                     image_reserve_tokens=prompt_image_reserve_tokens,
+                    system_suffix=retry_instructions,
                 )
             else:
                 frontier_plan = prompt_frontier.plan_provider_round(
@@ -705,11 +769,11 @@ async def run_tool_loop(
         attempts += 1
         _progress("provider_start")
         try:
-            provider_kwargs = {"tools": tools}
-            if not require_reply:
-                # Only send the non-default so every existing caller's wire
-                # stays byte-identical.
-                provider_kwargs["require_reply"] = False
+            # V2 owns the lane-specific empty-response policy. Let the provider
+            # parser return any structurally valid success so an abnormal HTTP
+            # 200 is not retried by the reliable transport wrapper as though it
+            # were a transient network failure.
+            provider_kwargs = {"tools": tools, "require_reply": False}
             if (
                 forced_delivery_tool
                 and tools is not None
@@ -842,7 +906,11 @@ async def run_tool_loop(
             raise
         _progress("provider_complete")
         add_usage(result.get("usage"))
-        if on_provider_success is not None:
+        raw_has_usable_output = bool(
+            str(result.get("reply") or "").strip()
+            or result.get("tool_calls")
+        )
+        if (not require_reply or raw_has_usable_output) and on_provider_success is not None:
             try:
                 await on_provider_success()
             except Exception:
@@ -856,6 +924,49 @@ async def run_tool_loop(
         # ProviderResponse.raw keeps its input mapping alive.
         result = provider_client.without_runtime_provider_attempt_trace(result)
         pr = ProviderResponse.from_result(result)
+
+        if require_reply and not pr.text.strip() and not pr.tool_calls:
+            semantic_empty = bool(
+                str(pr.raw.get("reasoning") or "").strip()
+                or str(pr.raw.get("stop_reason") or "").strip()
+            )
+            can_correct = (
+                semantic_empty
+                and not empty_response_recovery_used
+                and attempts < max_calls - 1
+            )
+            await _trajectory(
+                "empty_provider_response",
+                {
+                    "round": attempts,
+                    "reason": "empty_provider_success",
+                    "response_shape": _empty_response_shape(pr),
+                    "action": (
+                        "semantic_correction"
+                        if can_correct
+                        else "fail_provider_empty_reply"
+                    ),
+                },
+            )
+            if can_correct:
+                empty_response_recovery_used = True
+                empty_response_retry_instruction = _EMPTY_RESPONSE_CORRECTION
+                reasoning_fragments.clear()
+                seen_reasoning_fragments.clear()
+                _progress("empty_response_retry_boundary")
+                continue
+            exc = ProviderEmptyReply("empty_reply")
+            if on_provider_failure is not None:
+                try:
+                    await on_provider_failure(exc)
+                except Exception:
+                    pass
+            raise exc
+
+        # The correction is a one-round system suffix, not transcript. Once the
+        # provider returns usable text or a tool call, later native tool rounds
+        # proceed with their original safety-filtered catalog and transcript.
+        empty_response_retry_instruction = ""
         _capture_reasoning(pr.raw)
 
         # A tools-disabled request is terminal even if a broken relay invents a

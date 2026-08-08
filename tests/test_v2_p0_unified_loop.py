@@ -140,7 +140,7 @@ def _script_provider(monkeypatch, responses):
     it = iter(responses)
     calls = []
 
-    async def _fake(config, messages, *, tools=None):
+    async def _fake(config, messages, *, tools=None, **kwargs):
         calls.append({"messages": messages, "tools": tools})
         return next(it)
 
@@ -532,7 +532,7 @@ def test_p0_four_providers_two_reads_dispatch_and_reply_by_call_id(monkeypatch, 
         {"reply": "done", "tool_calls": [], "usage": {}},
     ])
 
-    async def _fake_chat_completion_async(config, messages, *, tools=None):
+    async def _fake_chat_completion_async(config, messages, *, tools=None, **kwargs):
         return next(provider)
 
     monkeypatch.setattr(provider_client, "chat_completion_async", _fake_chat_completion_async)

@@ -69,7 +69,7 @@ def _script_provider(monkeypatch, responses):
     it = iter(responses)
     calls = []
 
-    async def _fake(config, messages, *, tools=None):
+    async def _fake(config, messages, *, tools=None, **kwargs):
         calls.append({"tools": tools})
         return next(it)
 
@@ -402,7 +402,7 @@ def test_platform_write_is_exactly_applied_before_later_round_mcp_mutation(
 
     provider_calls = 0
 
-    async def _provider(config, messages, *, tools=None):
+    async def _provider(config, messages, *, tools=None, **kwargs):
         nonlocal provider_calls
         provider_calls += 1
         if provider_calls == 1:

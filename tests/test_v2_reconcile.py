@@ -163,7 +163,7 @@ def test_reconciled_human_message_is_replied_and_advances_seq_cursor(monkeypatch
 
     provider_calls = []
 
-    async def _provider(config, messages, *, tools=None):
+    async def _provider(config, messages, *, tools=None, **kwargs):
         provider_calls.append({"messages": messages, "tools": tools})
         return {
             "reply": "reply to human",

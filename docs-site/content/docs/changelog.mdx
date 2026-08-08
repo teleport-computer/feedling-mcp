@@ -134,6 +134,14 @@ change must not be interpreted as an API guarantee.
   tool-call budget without producing a reply. Applies to the resident V1 agent
   path and to Runtime V2 chat, wake, and memory-extraction lanes.
 
+- **Runtime V2 can recover once from a reasoning-only provider response.** A
+  successful foreground response with reasoning or a normal stop reason but no
+  visible text or client tool call gets one bounded correction while preserving
+  the currently allowed tool catalog. A relay response with no text, tool call,
+  reasoning, or stop reason now fails immediately as `provider_empty_reply`
+  instead of repeating the same billed request or reporting a network outage.
+  Intentional Runtime V2 wake silence is unchanged.
+
 - **Plaintext memory writes reject tombstone-style notes.** A plaintext
   `memory.add`, upgrade, or `memory.supersede` whose summary or content is a
   bookkeeping note — "已被 … 取代" or "superseded by" followed by an
