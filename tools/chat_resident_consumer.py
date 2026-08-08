@@ -14259,7 +14259,12 @@ def _process_messages(messages: list) -> float:
         content = _foreground_agent_message(content, current_ts=ts)
         session_bound_content = content
 
-        use_runtime_v2 = _resident_chat_runtime_v2_enabled() and not (image_payloads or image_paths)
+        # This flag selects the resident V1 chat profile; it does not transfer
+        # session ownership to the pooled Runtime V2 worker.
+        use_resident_chat_v2_profile = (
+            _resident_chat_runtime_v2_enabled()
+            and not (image_payloads or image_paths)
+        )
         attempt_kwargs = (
             {"attempt_trigger": attempt_trigger}
             if attempt_trigger != "first"
@@ -14295,7 +14300,7 @@ def _process_messages(messages: list) -> float:
         pending_failure_is_parse_only = False
 
         def _dispatch_foreground_agent(turn_content: str) -> Any:
-            if use_runtime_v2:
+            if use_resident_chat_v2_profile:
                 return call_agent(
                     _resident_foreground_chat_message_v2(turn_content),
                     trace_id=trace_id, lane="chat",
@@ -14339,8 +14344,7 @@ def _process_messages(messages: list) -> float:
                     agent_result = _dispatch_foreground_agent(content)
                 except Exception as first_error:
                     pi_vision_rejection = (
-                        not use_runtime_v2
-                        and AGENT_MODE == "cli"
+                        AGENT_MODE == "cli"
                         and _cli_template_is_pi()
                         and _vision_probe_error_code(first_error)
                         == "vision_model_required"
@@ -14367,6 +14371,9 @@ def _process_messages(messages: list) -> float:
                         detail={
                             "current_images": has_current_images,
                             "retried": not has_current_images,
+                            "resident_chat_v2_profile": (
+                                use_resident_chat_v2_profile
+                            ),
                         },
                     )
                     if has_current_images:
@@ -14591,7 +14598,7 @@ def _process_messages(messages: list) -> float:
             content_excerpt={"reply": _reply_text[:3000], "thinking": (turn.thinking_summary or "")[:2000]},
         )
         actions, replies = turn.actions, turn.messages
-        if use_runtime_v2:
+        if use_resident_chat_v2_profile:
             actions = [
                 action for action in actions
                 if _proactive_action_type(action).removeprefix("proactive.") != "needs_background"
