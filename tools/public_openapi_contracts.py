@@ -1373,7 +1373,15 @@ COMPONENT_SCHEMAS: dict[str, dict[str, Any]] = {
             "tool_name": {"type": "string", "maxLength": 120},
             "state": {"type": "string", "enum": ["running", "success", "failure"]},
             "duration_ms": {"type": "number", "minimum": 0},
-            "result_code": {"type": "string", "maxLength": 64},
+            "result_code": {
+                "type": "string",
+                "maxLength": 64,
+                "description": (
+                    "Display-safe result token. Failed generate_image events "
+                    "preserve an allowlisted image_generation_* code; result "
+                    "bodies are never included."
+                ),
+            },
             "memory_count": {"type": "integer", "minimum": 0, "maximum": 1000},
             "memory_categories": {
                 "type": "array",

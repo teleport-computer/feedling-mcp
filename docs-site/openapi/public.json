@@ -10506,7 +10506,8 @@
           },
           "result_code": {
             "type": "string",
-            "maxLength": 64
+            "maxLength": 64,
+            "description": "Display-safe result token. Failed generate_image events preserve an allowlisted image_generation_* code; result bodies are never included."
           },
           "memory_count": {
             "type": "integer",

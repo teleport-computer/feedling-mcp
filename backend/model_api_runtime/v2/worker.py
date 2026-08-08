@@ -2420,6 +2420,7 @@ def _make_chat_tool_activity_callback(
             )
         result = payload.get("result")
         result_content = result.content if isinstance(result, ToolResult) else ""
+        result_metadata = result.metadata if isinstance(result, ToolResult) else {}
         effect = effect_evidence_by_call.get(str(tc.id)) or {}
         detail: dict[str, Any] = {
             "activity_id": invocation_ids[object_key],
@@ -2436,6 +2437,12 @@ def _make_chat_tool_activity_callback(
             detail["result_code"] = core_chat_activity.result_code(
                 result_content, effect
             )
+            if str(tc.name or "") == cap_tool_schema.IMAGE_REPLY_TOOL:
+                image_code = core_chat_activity.image_generation_result_code(
+                    (result_metadata or {}).get("image_generation_result_code")
+                )
+                if image_code:
+                    detail["result_code"] = image_code
         for key, target, limit in (
             ("effect_id", "effect_id", 160),
             ("effect_type", "effect_type", 80),
