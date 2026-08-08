@@ -14242,6 +14242,9 @@ def _process_messages(messages: list) -> float:
         # interaction) so the agent never carries a stale, e.g. overnight, frame.
         content = _prepend_time_anchor_foreground(content, ts)
         content = _prepend_runtime_model_identity(content)
+        # Preserve the pre-session prompt so a poisoned Pi session can rotate;
+        # rebuilding adds only the safe text transcript, never historical pixels.
+        session_independent_content = content
         # VPS/self-hosted CLI resident only (no-op for hosted / http-backend):
         # live io_cli command catalog, once per resume-capable session or every
         # turn for codex. Must run BEFORE _foreground_agent_message below so the
@@ -14254,6 +14257,7 @@ def _process_messages(messages: list) -> float:
         # (v2, image, plain) carries the same context. Wraps the time-anchored
         # content so the transcript sits above this turn's grounded message.
         content = _foreground_agent_message(content, current_ts=ts)
+        session_bound_content = content
 
         use_runtime_v2 = _resident_chat_runtime_v2_enabled() and not (image_payloads or image_paths)
         attempt_kwargs = (
@@ -14289,6 +14293,32 @@ def _process_messages(messages: list) -> float:
         # 发就成了重复错误气泡。让通知与回复共享同一份排他性。
         pending_failure_notice: BaseException | None = None
         pending_failure_is_parse_only = False
+
+        def _dispatch_foreground_agent(turn_content: str) -> Any:
+            if use_runtime_v2:
+                return call_agent(
+                    _resident_foreground_chat_message_v2(turn_content),
+                    trace_id=trace_id, lane="chat",
+                    stream_update=voice_stream_update,
+                    **attempt_kwargs)
+            if image_payloads or image_paths:
+                return call_agent(
+                    turn_content,
+                    images=image_payloads,
+                    image_paths=image_paths,
+                    trace_id=trace_id,
+                    lane="chat",
+                    stream_update=voice_stream_update,
+                    **attempt_kwargs,
+                )
+            return call_agent(
+                turn_content,
+                trace_id=trace_id,
+                lane="chat",
+                stream_update=voice_stream_update,
+                **attempt_kwargs,
+            )
+
         try:
             # Discard any parse-failed marker left dangling by another lane
             # (proactive / verify_probe) running earlier in this single-threaded
@@ -14304,30 +14334,55 @@ def _process_messages(messages: list) -> float:
                     ]
                 }
                 pending_failure_notice = vision_observer_failed
-            elif use_runtime_v2:
-                agent_result = call_agent(
-                    _resident_foreground_chat_message_v2(content),
-                    trace_id=trace_id, lane="chat",
-                    stream_update=voice_stream_update,
-                    **attempt_kwargs)
-            elif image_payloads or image_paths:
-                agent_result = call_agent(
-                    content,
-                    images=image_payloads,
-                    image_paths=image_paths,
-                    trace_id=trace_id,
-                    lane="chat",
-                    stream_update=voice_stream_update,
-                    **attempt_kwargs,
-                )
             else:
-                agent_result = call_agent(
-                    content,
-                    trace_id=trace_id,
-                    lane="chat",
-                    stream_update=voice_stream_update,
-                    **attempt_kwargs,
-                )
+                try:
+                    agent_result = _dispatch_foreground_agent(content)
+                except Exception as first_error:
+                    pi_vision_rejection = (
+                        not use_runtime_v2
+                        and AGENT_MODE == "cli"
+                        and _cli_template_is_pi()
+                        and _vision_probe_error_code(first_error)
+                        == "vision_model_required"
+                    )
+                    if not pi_vision_rejection:
+                        raise
+
+                    # Pi replays session blocks on later turns, so one rejected
+                    # image otherwise makes subsequent text-only turns fail too.
+                    _discard_io_cli_catalog_pending_injection()
+                    _clear_agent_session_id("Pi session retained rejected image input")
+
+                    has_current_images = bool(image_payloads or image_paths)
+                    _emit_debug_trace(
+                        "agent", "agent.session.vision_rejection_rotate",
+                        trace_id=trace_id,
+                        summary="Pi session rotated after vision rejection",
+                        explain=(
+                            "Pi 会话残留了主模型拒绝的图片——已轮换会话"
+                            + ("，本轮仍含原图，等待用户配置识图模型"
+                               if has_current_images
+                               else "，用纯文本安全上下文重试本轮")
+                        ),
+                        detail={
+                            "current_images": has_current_images,
+                            "retried": not has_current_images,
+                        },
+                    )
+                    if has_current_images:
+                        raise
+
+                    suffix = (
+                        content[len(session_bound_content):]
+                        if content.startswith(session_bound_content)
+                        else ""
+                    )
+                    content = _prepend_io_cli_capability_catalog(
+                        session_independent_content
+                    )
+                    content = _foreground_agent_message(content, current_ts=ts)
+                    content += suffix
+                    agent_result = _dispatch_foreground_agent(content)
         except Exception as e:
             log.error("agent call failed; posting user-visible fallback: %s", e)
             if content_type == "image" and not isinstance(e, VisionObserverFailure):

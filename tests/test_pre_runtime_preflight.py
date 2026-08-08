@@ -88,3 +88,13 @@ def test_test_main_deploy_waits_for_the_same_release_unit_preflight():
         "Build and verify the test E2B template",
     ):
         assert required in preflight
+
+
+def test_test_deploys_when_the_hosted_v1_consumer_changes():
+    source = WORKFLOW.read_text()
+    detection = _job(
+        source,
+        "detect-cvm-changes-test",
+        "validate-test-runtime-prerequisites",
+    )
+    assert "tools/chat_resident_consumer.py" in detection
