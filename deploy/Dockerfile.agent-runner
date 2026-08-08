@@ -40,7 +40,7 @@ RUN apt-get update \
 #    to the claude driver's Anthropic wire on 2026-07-14 (spawners.py:556,:834).
 #    Exact pin only (pi
 #    iterates fast; bump explicitly after reviewing its output-protocol changes).
-RUN npm install -g @anthropic-ai/claude-code@2.1.195 @openai/codex@0.142.4 \
+RUN npm install -g @anthropic-ai/claude-code@2.1.220 @openai/codex@0.142.4 \
         @earendil-works/pi-coding-agent@0.80.3
 
 # Python deps: reuse the backend's hash-locked set so the resident consumer's
