@@ -138,3 +138,89 @@ def split_thinking(text: str) -> tuple[str, str, str]:
     if not reply:
         return SILENT, _sanitize(inner), ""
     return COMPLETE, _sanitize(inner), reply
+
+
+# ---------------------------------------------------------------------------
+# 全文剥离闸（2026-08-08）。split_thinking 只认开头第一块——那是当初 Codex review
+# 要求的保守设计，为了不误剥正文里被引用的标签。线上证明它漏了两种形状：
+#   * 开头剥完后面还有一整块（gpt-5.4 一轮写了两个块）
+#   * 开标签被上游吃掉，只剩孤立闭标签（pi + 中转站）
+# 两种都从「不认识就原样放行」这个 fail-open 缺口漏进了用户气泡。
+# 本节改为 fail-CLOSED，并由四个对外出口 + 一个历史入口共用。
+# ---------------------------------------------------------------------------
+
+_GATE_ENV_FLAG = "FEEDLING_THINK_GATE"
+
+# 一整对同名标签。开闭必须同名（`(?P=tag)`），否则 <think>…</reasoning> 这种
+# 错配会被当成一块合法协议剥掉。
+_PAIRED_BLOCK = re.compile(
+    rf"<\s*(?P<tag>{_TAG_ALT})\s*>(?P<body>.*?)<\s*/\s*(?P=tag)\s*>",
+    re.IGNORECASE | re.DOTALL,
+)
+# 剥完之后判定「还有没有残留」。任何开或闭标签都算。
+_RESIDUE = re.compile(rf"<\s*/?\s*(?:{_TAG_ALT})\b", re.IGNORECASE)
+# 孤立闭标签：按本协议思考永远写在最前面，所以一个配不上对的 </think> 说明它
+# 前面的全是思考（开标签在上游某处被吃掉了）。
+_LONE_CLOSE = re.compile(rf"<\s*/\s*(?:{_TAG_ALT})\s*>", re.IGNORECASE)
+
+
+def gate_enabled() -> bool:
+    """泄漏闸的 kill switch。默认开——关掉只用于线上出问题时立刻止血，
+    不是灰度门。关掉后调用方必须逐字回到本次改动前的行为。"""
+    return os.environ.get(_GATE_ENV_FLAG, "1").strip().lower() not in {
+        "0", "false", "no", "off",
+    }
+
+
+def strip_all_thinking(text: str) -> tuple[str, str, str]:
+    """全文剥离版，返回 ``(status, thinking, reply)``，状态常量与
+    :func:`split_thinking` 完全相同，方便调用点按 kill switch 二选一。
+
+    与 split_thinking 的唯一区别是扫描范围：那个只认开头第一块，这个扫全文并
+    在结尾复查残留。剥完只要正文里还剩任何 think 类标签，就返回 ``FAILED``
+    （thinking/reply 都为空），由调用方决定发兜底话还是静默——绝不把带标签的
+    残文端给用户。
+    """
+    raw = str(text or "")
+    if not _RESIDUE.search(raw):
+        # 逐字节不变的快路径。没有标签就绝不碰，是 kill switch 之外的第二道保险。
+        return ABSENT, "", raw
+
+    blocks: list[str] = []
+
+    def _take(match: "re.Match[str]") -> str:
+        body = match.group("body") or ""
+        # 块里还有别的标签，说明结构已经乱了，不当作可信思考内容——留在原地，
+        # 由下面的残留检查失败关闭。
+        if _ANY_TAG.search(body):
+            return match.group(0)
+        if body.strip():
+            blocks.append(body.strip())
+        return "\n"
+
+    reply = _PAIRED_BLOCK.sub(_take, raw)
+
+    # 孤立闭标签：它之前的一切当思考。只处理第一个——出现多个说明结构已乱，
+    # 同样交给残留检查失败关闭。
+    lone = _LONE_CLOSE.search(reply)
+    if lone is not None:
+        head = reply[: lone.start()].strip()
+        # head 里还带标签 = 开闭错配（<think>…</reasoning>）或多层残骸，不是
+        # 「开标签被上游吃掉」那种可救的形状。失败关闭，别把带标签的文本当思考。
+        if _RESIDUE.search(head):
+            return FAILED, "", ""
+        if head:
+            blocks.insert(0, head)
+        reply = reply[lone.end():]
+
+    if _RESIDUE.search(reply):
+        return FAILED, "", ""
+    if not blocks:
+        # 有标签、却一块内容都没剥出来（例如只有一个空标签对）——同样不可信。
+        return FAILED, "", ""
+
+    reply = re.sub(r"\n{3,}", "\n\n", reply).strip()
+    thinking = _sanitize("\n\n".join(blocks))
+    if not reply:
+        return SILENT, thinking, ""
+    return COMPLETE, thinking, reply
