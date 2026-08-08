@@ -7939,7 +7939,13 @@ async def _run_wake(
             _wake_self_thinking_on = _st_wake.enabled()
             _wake_self_thinking_text = ""
             if _wake_self_thinking_on and text:
-                _wst_status, _wst_thinking, _wst_reply = _st_wake.split_thinking(text)
+                # 与聊天出口同一道闸。SILENT 语义（只写思考 = 这轮不说话）不变。
+                _wake_split = (
+                    _st_wake.strip_all_thinking
+                    if _st_wake.gate_enabled()
+                    else _st_wake.split_thinking
+                )
+                _wst_status, _wst_thinking, _wst_reply = _wake_split(text)
                 if _wst_status == _st_wake.COMPLETE:
                     text = _wst_reply
                     _wake_self_thinking_text = _wst_thinking
@@ -11357,7 +11363,15 @@ async def process_job(
             self_thinking_text = ""
             self_thinking_failed = False
             if self_thinking_on and file_reply is None and text:
-                _st_status, _st_thinking, _st_reply = self_thinking.split_thinking(text)
+                # 闸开着走全文剥离（2026-08-08：只剥开头一块会漏掉第二块，线上
+                # gpt-5.4 一轮写了两个块，第二块原样进了气泡）；关掉时逐字回到
+                # 旧行为，这是 kill switch 的全部意义。
+                _st_split = (
+                    self_thinking.strip_all_thinking
+                    if self_thinking.gate_enabled()
+                    else self_thinking.split_thinking
+                )
+                _st_status, _st_thinking, _st_reply = _st_split(text)
                 if _st_status == self_thinking.COMPLETE:
                     text = _st_reply
                     self_thinking_text = _st_thinking
