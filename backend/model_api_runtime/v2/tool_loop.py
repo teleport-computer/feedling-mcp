@@ -791,15 +791,6 @@ async def run_tool_loop(
             tools = [spec for spec in turn_catalog if spec.name not in blocked_tools]
         else:
             tools = turn_catalog
-        if tools is not None and completed_memory_discovery_tools:
-            # Each discovery mode may run once. A keyword search can legitimately
-            # miss while memory_index still finds the user's saved cards, so do
-            # not suppress both after only one observation.
-            tools = [
-                spec
-                for spec in tools
-                if spec.name not in completed_memory_discovery_tools
-            ]
         requirement_already_met = (
             not file_delivery_required
             or (

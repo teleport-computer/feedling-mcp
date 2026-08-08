@@ -973,7 +973,7 @@ def test_budget_bound_last_call_omits_tools_and_terminates(monkeypatch):
     assert on_reply.calls[-1] == ("final terminal text", True)
 
 
-def test_each_memory_discovery_mode_is_offered_only_until_its_first_result(monkeypatch):
+def test_memory_discovery_schema_remains_visible_after_first_result(monkeypatch):
     provider = _ScriptedProvider([
         {
             "reply": "",
@@ -999,8 +999,7 @@ def test_each_memory_discovery_mode_is_offered_only_until_its_first_result(monke
     first_names = {spec.name for spec in provider.calls[0]["tools"]}
     second_names = {spec.name for spec in provider.calls[1]["tools"]}
     assert {"memory_index", "memory_search"}.issubset(first_names)
-    assert "memory_index" not in second_names
-    assert "memory_search" in second_names
+    assert {"memory_index", "memory_search"}.issubset(second_names)
     assert outcome.final_text == "direct answer"
 
 
