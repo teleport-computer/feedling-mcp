@@ -32,8 +32,20 @@ change must not be interpreted as an API guarantee.
   so every connected server keeps a share; only the largest ones are trimmed.
   Previously a single big server could consume the whole budget and a server
   later in the alphabet would contribute no tools at all — its connection test
-  passed while the companion genuinely could not see any of its tools. The
+  passed while the companion genuinely could not see any of its tools. This now
+  applies to both runtimes: the self-hosted bridge and Hosted Runtime V2, whose
+  catalog was still filled in server-name order. The self-hosted bridge's
   per-turn cap is also raised from 50 to 100.
+- **A self-hosted `claude` agent now receives the MCP servers you enabled in the
+  app.** A hand-written `AGENT_CLI_CMD` without the `{mcp}` placeholder — the
+  form the operator documentation previously showed — never passed
+  `--mcp-config`, so no app-configured server reached the agent even though its
+  connection test passed. Chat turns now get the server list and a matching
+  pre-approval for its tools. A command that already sets `--mcp-config` is left
+  untouched, and one that pins its own `--allowed-tools` keeps it and is told in
+  the log which `mcp__<name>__*` rules to add. Other self-hosted runtimes
+  (`codex`, hermes, OpenClaw) were unaffected: they read MCP from their own
+  config files.
 
 - **Voice calls no longer end with a protocol error when a turn produces no
   speech.** A turn that is deliberately silent — transport noise, a call that

@@ -148,10 +148,14 @@ def test_catalog_permutations_produce_identical_provider_tool_bytes(monkeypatch)
     second = asyncio.run(
         mcp_tools.load_turn_mcp(STORE, api_key="k", runtime_token="rt"))
 
+    # Round-robin across servers (alpha, beta, alpha), NOT all of alpha then
+    # all of beta — that name-order fill is what starved whole servers past the
+    # cap. The order is still fully deterministic, which is what this test is
+    # actually guarding.
     expected_names = [
         "mcp__alpha__able",
-        "mcp__alpha__zeta",
         "mcp__beta__middle",
+        "mcp__alpha__zeta",
     ]
     assert [spec.name for spec in first.tool_specs] == expected_names
     assert first.tool_specs == second.tool_specs
@@ -174,7 +178,11 @@ def test_catalog_permutations_produce_identical_provider_tool_bytes(monkeypatch)
         ).encode("utf-8")
         assert first_bytes == second_bytes
 
-    nested = first.tool_specs[1].parameters
+    # Look the nested-schema tool up by name rather than by catalog position:
+    # the assertion is about schema canonicalization, not about where the
+    # allocator happens to place the tool.
+    by_name = {spec.name: spec for spec in first.tool_specs}
+    nested = by_name["mcp__alpha__zeta"].parameters
     assert list(nested) == ["properties", "required", "type"]
     assert list(nested["properties"]) == ["alpha", "nested"]
     assert nested["required"] == ["alpha", "nested"]
@@ -814,3 +822,106 @@ def test_auto_ca_fetch_returns_none_skips_server(monkeypatch):
     turn = asyncio.run(mcp_tools.load_turn_mcp(STORE, api_key="k", runtime_token="rt"))
     assert turn.is_empty
     assert not mcp_tools.is_mcp_tool("")
+
+
+def test_small_server_is_not_starved_by_a_large_one(monkeypatch):
+    """The real usr_1baf config: 6 servers, 107 tools, a 64-tool budget.
+
+    The old allocator sorted every candidate by server name and truncated, so
+    `mcdonalds` and `tavily` fell past the cut and reached the model with ZERO
+    tools while the app showed them enabled and green. Round-robin must give
+    every server at least a share, and a server smaller than its fair slice
+    (tavily: 4 tools) must come through whole.
+    """
+    sizes = {"gardenforum": 25, "luckin-coffee": 30, "mcdonalds": 28,
+             "gaodemap": 12, "game": 8, "tavily": 4}
+    assert sum(sizes.values()) > mcp_tools.MAX_MCP_TOOLS_PER_TURN
+
+    async def fake_list(url, headers, *, ca_pem=None, transport=None, mcp_transport=None):
+        server = url.removeprefix("https://").removesuffix(".example.com")
+        return [
+            {"name": f"{server}_tool_{i:02d}",
+             "inputSchema": {"type": "object", "properties": {}}}
+            for i in range(sizes[server])
+        ]
+
+    _patch(
+        monkeypatch,
+        servers=_servers(*sizes),
+        decrypt=lambda env, api_key, runtime_token: {
+            "url": f"https://{env['id'].removeprefix('env_')}.example.com",
+            "headers": {}},
+        list_tools=fake_list,
+    )
+    turn = asyncio.run(mcp_tools.load_turn_mcp(STORE, api_key="k", runtime_token="rt"))
+
+    kept = {name: 0 for name in sizes}
+    for spec in turn.tool_specs:
+        for name in sizes:
+            if spec.name.startswith(f"mcp__{name}__"):
+                kept[name] += 1
+                break
+    assert len(turn.tool_specs) == mcp_tools.MAX_MCP_TOOLS_PER_TURN
+    assert all(kept[name] > 0 for name in sizes), kept
+    # A server offering fewer tools than its fair share loses nothing at all.
+    assert kept["tavily"] == sizes["tavily"], kept
+    # Only the big servers get trimmed.
+    assert kept["luckin-coffee"] < sizes["luckin-coffee"]
+
+
+def test_char_cap_skips_the_overflowing_tool_and_keeps_allocating(monkeypatch):
+    """A char-cap overflow must reject one candidate, not end allocation.
+
+    The two caps are not symmetric: hitting the count cap means nothing more
+    can fit, but hitting the char cap only means THIS candidate does not — a
+    smaller one still can. Treating them the same starves every server still
+    holding candidates for a reason that has nothing to do with them.
+
+    Mutation-checked: making an overflow end the allocation takes `small` from
+    20 kept tools to 12, so this test fails on that variant. (Merely breaking
+    the current round instead of continuing it is NOT a behavioural change —
+    the outer loop re-enters and every candidate is still tried.)
+    """
+    # Bulk must be STRUCTURAL: prose (title/description/examples) is stripped by
+    # _sanitize_schema_node, so a schema padded with text arrives tiny. Property
+    # names survive — 60 of them, near the 64-char name limit, lands each tool
+    # around 5k chars: big enough that the 65536 catalog budget runs out partway
+    # through, small enough to stay under the 8192 per-schema cap (which would
+    # drop the tool through a different path and prove nothing).
+    def _fat_schema(i: int) -> dict:
+        return {"type": "object", "properties": {
+            f"p{i:03d}_{'x' * 52}_{j:02d}": {"type": "string"}
+            for j in range(60)
+        }}
+
+    small_count = 20
+
+    async def fake_list(url, headers, *, ca_pem=None, transport=None, mcp_transport=None):
+        server = url.removeprefix("https://").removesuffix(".example.com")
+        if server == "big":
+            return [{"name": f"fat_{i:03d}", "inputSchema": _fat_schema(i)}
+                    for i in range(30)]
+        return [
+            {"name": f"small_{i:03d}",
+             "inputSchema": {"type": "object", "properties": {}}}
+            for i in range(small_count)
+        ]
+
+    _patch(
+        monkeypatch,
+        servers=_servers("big", "small"),
+        decrypt=lambda env, api_key, runtime_token: {
+            "url": f"https://{env['id'].removeprefix('env_')}.example.com",
+            "headers": {}},
+        list_tools=fake_list,
+    )
+    turn = asyncio.run(mcp_tools.load_turn_mcp(STORE, api_key="k", runtime_token="rt"))
+    names = [spec.name for spec in turn.tool_specs]
+    big_kept = sum(1 for n in names if n.startswith("mcp__big__"))
+    small_kept = sum(1 for n in names if n.startswith("mcp__small__"))
+
+    # The fat server must actually have overflowed, or this proves nothing.
+    assert big_kept < 30, (big_kept, small_kept)
+    # Every small tool survives — the ones allocated in rounds AFTER the first
+    # overflow are exactly what a `break` implementation would have lost.
+    assert small_kept == small_count, (big_kept, small_kept)
