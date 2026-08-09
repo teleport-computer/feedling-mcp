@@ -47,6 +47,28 @@
 
 ## 记录正文（最新的在上面）
 
+## 2026-08-09 — 地址不是 API 端点时,别把它说成「API key 未通过测试」
+
+**[DONE] 用户报障:两个中转站都提示 key 未通过测试;实测两站完全健康,真因是 base_url 漏了结尾的 `/v1`。**
+
+- 我们把 **URL 问题的报错说成了 key 问题**,用户一直在换 key。判据落在
+  `setup_core._looks_like_wrong_api_endpoint`,四个入口(保存配置 / 手动测试 /
+  加路由 / 改凭证)统一走 `_provider_test_failed_body`,避免同一错误从不同入口
+  说法不一。
+- 判定为地址问题时把 `status_code` 清成 `null`:客户端会把 provider 的 404
+  映射成「模型不存在」,不清就是换一句话继续指错方向。原始错误仍写进
+  `route.test_error`。
+- **⚠️ 判据必须按状态码收窄(codex2 gatekeep 抓到的 blocker)**:我原先断言
+  「真错误一律是 JSON」,但 relay/WAF/计费层会用 **HTML 页面**返回
+  401/402/429/5xx —— 本仓 `tests/test_catalog_consumer_parity.py:158-161`
+  就存着这样的样本。HTML 只在 **404** 时才算地址问题,其余状态码原样透传,
+  否则额度不足/鉴权失败/限流会被一并说成地址错误,比原来的错更严重。
+- 刻意**不**自动补 `/v1`:6 个 provider 里 gemini(`/v1beta`)、bedrock、
+  deepseek 本就不是 `/v1` 结尾;且 `base_url` 属敏感字段、admin 不下发,
+  改一个看不见影响面的东西等于拿存量用户赌。也不替用户拼具体地址(有的站
+  要 `/api/v1`、`/openai/v1`,猜错让用户照抄后更迷惑)。
+- 不需要 iOS 改动:复用 `provider_test_failed` 老 slug,现有 App 直接显示 detail。
+
 ## 2026-08-08 — 思维链泄漏统一闸
 
 **问题**：模型自己写的 `<think>` 心里话漏进用户聊天气泡。**三个出口各漏各的**，
