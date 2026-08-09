@@ -91,12 +91,12 @@ def test_naming_rule_allows_evidence_backed_pronouns_when_name_is_unknown():
     包括 capture 当初读着对话写对的那些。字段没填 ≠ 不知道这个人是谁。
     """
     unknown = _naming_rule("")
-    assert "就用「他」或「她」" in unknown
-    assert "有依据的判断不是猜测" in unknown
-    assert "已经写对的「他」/「她」也保留不动" in unknown
-    # 「对方」必须排在 他/她 之后,是兜底而不是首选。
-    assert unknown.index("就用「他」或「她」") < unknown.index("退到中性的「对方」")
-    # 松的只有性别代词这一项,三个系统称谓一个都不许松。
+    # 判断性别 → 用他/她;判断不出来才「对方」。次序不能反,「对方」是兜底不是首选。
+    assert "判断性别" in unknown and "用「他」或「她」" in unknown
+    assert "线索不足以判断，才用中性的「对方」" in unknown
+    assert unknown.index("用「他」或「她」") < unknown.index("中性的「对方」")
+    # 旧规则明禁性别代词;放开的只有这一项,三个系统称谓一个都不许松。
+    assert "猜测性别" not in unknown
     assert "「TA」" in unknown and "第二人称「你」" in unknown
 
 

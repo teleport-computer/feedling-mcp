@@ -70,11 +70,10 @@ def test_prompt_naming_rule_without_name_uses_relationship_referent():
         ai_name="", user_name="", buckets="", threads="", identity="", window="",
     )
     assert "优先省略主语" in p
-    # 有依据就可以用 他/她,「对方」只兜最后一档。
-    assert "就用「他」或「她」" in p
-    assert "有依据的判断不是猜测" in p
-    assert "只有确实看不出来" in p
-    assert "退到中性的「对方」" in p
+    # 线索够就用 他/她,「对方」只兜最后一档。
+    assert "判断性别" in p and "用「他」或「她」" in p
+    assert "线索不足以判断，才用中性的「对方」" in p
+    assert "猜测性别" not in p
     # 仍然禁的三样,一样都不能松。
     assert "第二人称「你」" in p
     assert '永远不要用"用户"/"user"' in p
@@ -88,8 +87,8 @@ def test_capture_prompt_marks_对方_as_a_placeholder_label_not_a_referent():
         ai_name="", user_name="", buckets="", threads="", identity="",
         window="- 对方: 老公我到家了",
     )
-    assert "只是个占位标签" in p
-    assert "不是你该沿用的称呼" in p
+    assert "那只是标签" in p
+    assert "卡里怎么称呼，按上面那条规则判断" in p
 
 
 def test_reserved_placeholder_names_are_treated_as_unknown():

@@ -45,7 +45,7 @@ def test_prompt_naming_rule_and_backfill_instruction():
     assert "不要用「TA」指代本人" in flat
     # Backfill is scoped: only TA that refers to the PERSON gets rewritten;
     # TA correctly referring to the AI (the app-surface meaning) is preserved.
-    assert '指代本人的"用户"/"user"/「TA」/「你」改成已知名字' in flat
+    assert '指代本人的"用户"/"user"/「TA」/「你」/「对方」按上面那条' in flat
     assert "指代你（AI）的「TA」" in flat and "保留不动" in flat
     p2 = build_dream_prompt(ai_name="", user_name="", cards="", recent_conversations="")
     assert "优先省略主语" in p2
@@ -65,10 +65,11 @@ def test_dream_backfill_does_not_downgrade_correct_pronouns():
         ai_name="小柒", user_name="", cards="", recent_conversations="",
     ).replace("\n", "").replace(" ", "")
     assert "猜测性别的他或她" not in flat, "追溯改写清单里不能再有性别代词"
-    assert "旧卡里已经写着的「他」/「她」保留不动" in flat
-    assert "把它改成「对方」是净损失" in flat
-    # 转写/旧卡里的「对方」是占位标签,不是可沿用的称呼(2026-07-27 标签>prompt)。
-    assert "只是名字未知时的占位标签" in flat
+    assert "旧卡里已经在用的「他」/「她」保留不动" in flat
+    # 反过来:旧卡里的「对方」进了改写清单 —— 线索够就该上调成 他/她,
+    # 存量脏卡靠 dream 自愈,不用单独回填。
+    assert "/「对方」按上面那条" in flat
+    assert "没名字但线索够就用「他」/「她」" in flat
 
 
 def test_reserved_placeholder_user_name_treated_as_unknown():
