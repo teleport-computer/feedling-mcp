@@ -94,6 +94,18 @@ deletes them, and the 5,000-message constant bounds only a process-local hot
 window. Only explicit Chat clear or account deletion removes this conversation
 data.
 
+Runtime V2 chat turns may retrieve older ledger content on demand through two
+chat-only agent tools (`history_search`, `history_fetch`). Retrieval is
+search-first: summary leaves serve only as scan-priority hints, matching runs
+against decrypted original messages inside the enclave in bounded batches, and
+attachments contribute caption text only — object-storage bodies are never
+decrypted for search. Every call is bounded by row, byte, and deadline budgets
+with an authenticated resumable cursor, and an incomplete scan is reported as
+incomplete rather than as an empty result. These tools are never offered to
+proactive wake lanes or subagents; a turn that reads history drops outbound
+web/MCP/task tools for the following round, and a deployment kill switch
+removes the capability entirely without touching the normal chat path.
+
 Deployments may opt into deterministic Runtime V2 coverage accounting as an
 independent precursor to the bounded Memory/User profile rollout. In that mode,
 maintenance and synchronous prompt catch-up advance the same exact source

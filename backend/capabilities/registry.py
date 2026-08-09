@@ -4,6 +4,7 @@ from __future__ import annotations
 from typing import Callable
 
 from capabilities import memory
+from capabilities import history
 from capabilities import voice, perception, screen, photo, identity, chat, web, wake, workspace
 from capabilities import errors
 from capabilities.types import CapabilityResult, err
@@ -19,6 +20,8 @@ CAPABILITIES: dict[str, Callable[..., CapabilityResult]] = {
     "voice_transcript_read": lambda store, **kw: voice.transcript_read(store, **kw),
     "memory_write": lambda store, **kw: memory.write(store, **kw),
     "memory_search": lambda store, **kw: memory.search(store, **kw),
+    "history_search": lambda store, **kw: history.search(store, **kw),
+    "history_fetch": lambda store, **kw: history.fetch(store, **kw),
     "perception_snapshot": lambda store, **kw: perception.snapshot(store, **kw),
     "perception_recent_apps": lambda store, **kw: perception.recent_apps(store, **kw),
     "perception_trend": lambda store, **kw: perception.trend(store, **kw),

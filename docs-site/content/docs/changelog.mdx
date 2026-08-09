@@ -10,6 +10,15 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **Runtime V2 Chat can search its own older conversation history on demand.**
+  Two chat-only agent tools let the agent keyword-search messages beyond its
+  visible context and read a small window around a match. Original messages
+  remain the retrieval source of truth (summaries only prioritize scanning);
+  decryption and matching stay inside the enclave under strict row/byte/time
+  budgets; attachment binaries are never read for search. A turn that reads
+  history loses outbound web/MCP/task tools for the next round, proactive wake
+  lanes never see these tools, and a deployment kill switch (default on) can
+  remove the capability without touching the normal chat path.
 - **Genesis plaintext retries reuse completed persona-voice mapping.** The
   estimate/commit flow now retains its opaque staged-upload pointer in trusted
   job metadata until completion, and both fact-map and voice-map window results
