@@ -32,7 +32,11 @@ log = logging.getLogger("feedling.hosted.mcp_tools")
 
 MCP_TOOL_PREFIX = "mcp__"
 MAX_MCP_TOOLS_PER_TURN = 64
-MAX_MCP_TOOL_SCHEMA_CHARS = 8192
+# 2026-08-10 上调:同一天开始 schema 里带上说明/enum/default,体积自然变大。
+# 不上调的话,原来能用的工具会**新**撞上这道闸而被丢掉 —— 而丢弃只有一行
+# log.warning,又是一次静默失败。丢弃数现在也进 summary(见 _allocate_round_robin),
+# 所以真撞上了运维看得见。
+MAX_MCP_TOOL_SCHEMA_CHARS = 32768
 MAX_MCP_TOOL_CATALOG_CHARS = 65536
 MAX_PROVIDER_TOOL_NAME_CHARS = 64
 _PROVIDER_TOOL_NAME_RE = re.compile(r"^[A-Za-z0-9_-]+$")
@@ -190,11 +194,18 @@ def _canonicalize_schema(value, *, parent_key: str | None = None):
 
 
 def _sanitize_schema_node(value, *, depth: int = 0) -> dict | None:
-    """Keep structural JSON-Schema data while dropping prompt-bearing prose.
+    """把远端 schema 规整成 provider 一定收得下的形状 —— 但**不再剥说明**。
 
-    MCP catalog metadata is remote content shown before the first model call.
-    Descriptions, examples, defaults, regexes, refs, and enum strings are not
-    needed for server-side validation and can carry arbitrary instructions.
+    2026-08-10 Seven 定稿:参数说明也要原样给模型。原本这里只留结构
+    (type/properties/required/数值边界),把 description/title/enum/default/
+    examples/pattern 全剥掉——模型看到的是 `{address: 字符串, city: 字符串}`,
+    不知道该填什么;`enum` 被剥掉更要命,本来只能填 celsius/fahrenheit 的参数
+    变成"随便填个字符串"。而 pi 桥那条路一直是**整个原样透传**的,
+    又是同一个产品两条路给模型看的东西完全不同。
+
+    保留的仍然是**结构校验**:深度上限、属性数量上限、类型白名单、属性名正则。
+    那道闸挡的是「畸形 schema 让 provider 整个拒收」——一个坏工具会连累这一轮
+    **所有**工具,和注入是两回事,不能一起放开。
     """
     if not isinstance(value, dict) or depth > 6:
         return None
@@ -245,6 +256,29 @@ def _sanitize_schema_node(value, *, depth: int = 0) -> dict | None:
         clean["additionalProperties"] = value["additionalProperties"]
     if value.get("format") in _SCHEMA_FORMATS:
         clean["format"] = value["format"]
+    # 说明性字段:原样带上。模型靠它们知道参数是什么、能填什么。
+    for key in ("description", "title"):
+        text = value.get(key)
+        if isinstance(text, str) and text.strip():
+            clean[key] = text
+    # enum / default / examples 是**取值**信息,对"填得对"和说明同样关键。
+    # 只做可 JSON 序列化的基本类型检查,不改内容。
+    raw_enum = value.get("enum")
+    if isinstance(raw_enum, list) and raw_enum and len(raw_enum) <= 128 and all(
+        item is None or isinstance(item, (str, int, float, bool))
+        for item in raw_enum
+    ):
+        clean["enum"] = list(raw_enum)
+    if isinstance(value.get("pattern"), str):
+        clean["pattern"] = value["pattern"]
+    for key in ("default", "examples"):
+        item = value.get(key)
+        if isinstance(item, (str, int, float, bool, list, dict)):
+            try:
+                json.dumps(item)
+            except (TypeError, ValueError):
+                continue
+            clean[key] = item
     for key in (
         "minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum",
         "minLength", "maxLength", "minItems", "maxItems", "minProperties",
@@ -406,6 +440,9 @@ async def load_turn_mcp(
     # provider-facing catalog independent of server/tools-list ordering.
     candidates: list[_CatalogCandidate] = []
     seen_qualified_names: set[str] = set()
+    # 因 schema 太大 / 结构非法被整个丢掉的工具。以前只有 log.warning ——
+    # 模型少了一个工具,而运维在 admin 里什么都看不到。
+    schema_rejected: list[str] = []
     for r in results:
         if r is None:
             continue
@@ -426,6 +463,7 @@ async def load_turn_mcp(
                     name,
                     raw,
                 )
+                schema_rejected.append(f"{name}/{raw}")
                 continue
             schema_chars = _serialized_chars(parameters)
             if (
@@ -433,6 +471,7 @@ async def load_turn_mcp(
                 or schema_chars > MAX_MCP_TOOL_SCHEMA_CHARS
             ):
                 log.warning("mcp tool %r/%r skipped: schema too large", name, raw)
+                schema_rejected.append(f"{name}/{raw}")
                 continue
             # 原样透传服务器写的说明。
             #
@@ -493,10 +532,14 @@ async def load_turn_mcp(
                 serialized_chars=candidate_chars,
             ))
 
-    return _allocate_round_robin(candidates)
+    return _allocate_round_robin(candidates, schema_rejected=schema_rejected)
 
 
-def _allocate_round_robin(candidates: list[_CatalogCandidate]) -> McpTurn:
+def _allocate_round_robin(
+    candidates: list[_CatalogCandidate],
+    *,
+    schema_rejected: list[str] | None = None,
+) -> McpTurn:
     """Fill the turn's tool budget round-robin across servers, not in name order.
 
     The previous allocator sorted every candidate into one list keyed by server
@@ -579,6 +622,10 @@ def _allocate_round_robin(candidates: list[_CatalogCandidate]) -> McpTurn:
             f"{name}:{kept[name]}/{len(by_server[name])}" for name in names
         ),
         "servers": len(names),
+        # 连候选都没进来的:schema 太大或结构非法,整个工具消失。
+        # 和「进了候选但被上限裁掉」是两种不同的失踪,分开报才诊断得动。
+        "schema_rejected": len(schema_rejected or []),
+        "schema_rejected_names": ",".join((schema_rejected or [])[:10]),
     }
 
     # Never truncate silently: the count cap used to drop whole servers with no
