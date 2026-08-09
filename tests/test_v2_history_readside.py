@@ -1303,6 +1303,27 @@ def test_store_anchor_and_neighbors_visibility_and_order():
     assert available == {"before": 1, "after": 2}
 
 
+def test_neighbor_window_is_one_statement_so_rows_and_counts_share_a_snapshot():
+    """取行与计数必须在**同一条语句**里，否则 omitted_* 又会开始撒谎。
+
+    连接池是 autocommit（READ COMMITTED），每条语句各取一次快照；而
+    chat_messages 并非 append-only（存在单条删除路径）。拆成两条 SQL 时，
+    并发删除落在中间就会出现"取回的行已消失、计数数到后面补位的行"，
+    ``available - len(rows)`` 于是凭空造出 omitted——正是这个字段要根除的
+    谎报。并发时序难以在测试里稳定复现，所以这里锁住它的**充分条件**：
+    一条语句、四个分支共享快照。有人把它拆回多条时这里会红。
+    """
+    jobs_store = history_readside.jobs_store
+    sql = jobs_store._neighbor_window_sql()
+    assert sql.count(";") == 0, "必须是单条语句"
+    for branch in ("before_rows", "after_rows", "before_probe", "after_probe"):
+        assert branch in sql, f"缺少 CTE 分支 {branch}"
+    # 四个分支共用同一份可见性谓词（谓词不一致 = 计数与取行口径不同 = 新谎报）
+    assert sql.count(jobs_store._HISTORY_VISIBLE_PREDICATE) == 4
+    # 每个分支各自 LIMIT，计数在请求窗口处提前终止，不会全表扫
+    assert sql.count("LIMIT") == 4
+
+
 def test_store_neighbor_rows_report_how_many_exist_in_the_requested_window():
     """预算钳窄了取回条数时，store 仍要如实说出**请求窗口里真有几条**。
 

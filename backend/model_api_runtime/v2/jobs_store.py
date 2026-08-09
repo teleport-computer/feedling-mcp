@@ -10848,35 +10848,49 @@ def chat_history_anchor_row(user_id, message_id) -> dict | None:
     return _history_full_row(row[0], row[1], row[2], row[3])
 
 
-def _neighbor_available_counts(
-    conn, user_id, anchor: int, *, before: int, after: int
-) -> dict:
-    """请求窗口内每侧**实际存在**多少条可见邻居（只数，不取任何内容）。
+def _neighbor_window_sql() -> str:
+    """One statement: both neighbour windows and both existence counts.
 
-    这是 ``omitted_before``/``omitted_after`` 唯一诚实的来源。没有它，调用方
-    只能拿"取回条数 vs 预算钳制值"去猜：钳到 0 的那一侧永远猜成"后面还有"，
-    正好取完的那一侧也分不清"就这么多"和"还有更多"——两种都会让模型为不存在
-    的邻居白翻一页。
+    取行与计数**必须在同一个 statement snapshot 内**。分成多条 SQL 是不够的：
+    连接池是 ``autocommit=True``（``db._pool``），READ COMMITTED 下每条语句各
+    取一次快照；而 ``chat_messages`` 也**不是** append-only（存在单条删除路径，
+    见 ``db.py`` 的 chat 删除）。并发删除落在两条语句之间时，取行看到的那批已
+    消失、计数却数到后面补位的行，``available - len(rows)`` 就会算出一个凭空的
+    ``omitted_*``——正是这个字段要根除的谎报。一条 CTE 里的所有分支共享同一个
+    快照，这种错位在原理上就不存在（顺带把 fetch 的往返从三次降到一次）。
 
-    与取行查询同谓词、同连接（chat_messages 是 append-only，同连接内两次读到
-    的可见集合一致）。``LIMIT`` 让计数在请求窗口处提前终止：结果就是
-    ``min(请求条数, 实际条数)``，永远不会全表扫。
+    每个 CTE 分支都自带 ``LIMIT``，在请求窗口处提前终止；计数结果因此是
+    ``min(请求条数, 实际条数)``，永不全表扫。四个分支共用同一份可见性谓词。
     """
-    counts = {"before": 0, "after": 0}
-    for side, comparison, order in (
-        ("before", "seq<%s", "DESC"), ("after", "seq>%s", "ASC"),
-    ):
-        wanted = int(before if side == "before" else after)
-        if wanted <= 0:
-            continue
-        counts[side] = int(conn.execute(
-            "SELECT count(*) FROM ("
-            f"SELECT 1 FROM chat_messages WHERE user_id=%s AND {comparison} "
-            f"AND {_HISTORY_VISIBLE_PREDICATE} "
-            f"ORDER BY seq {order} LIMIT %s) probe",
-            (str(user_id), anchor, wanted),
-        ).fetchone()[0])
-    return counts
+    pred = _HISTORY_VISIBLE_PREDICATE
+    return (
+        "WITH before_rows AS ("
+        f" SELECT seq,msg_id,ts,doc FROM chat_messages"
+        f" WHERE user_id=%(uid)s AND seq<%(anchor)s AND {pred}"
+        "  ORDER BY seq DESC LIMIT %(n_before)s"
+        "), after_rows AS ("
+        f" SELECT seq,msg_id,ts,doc FROM chat_messages"
+        f" WHERE user_id=%(uid)s AND seq>%(anchor)s AND {pred}"
+        "  ORDER BY seq ASC LIMIT %(n_after)s"
+        "), before_probe AS ("
+        f" SELECT 1 FROM chat_messages"
+        f" WHERE user_id=%(uid)s AND seq<%(anchor)s AND {pred}"
+        "  ORDER BY seq DESC LIMIT %(want_before)s"
+        "), after_probe AS ("
+        f" SELECT 1 FROM chat_messages"
+        f" WHERE user_id=%(uid)s AND seq>%(anchor)s AND {pred}"
+        "  ORDER BY seq ASC LIMIT %(want_after)s"
+        ")"
+        " SELECT 'before' AS side, seq, msg_id, ts, doc FROM before_rows"
+        " UNION ALL"
+        " SELECT 'after', seq, msg_id, ts, doc FROM after_rows"
+        " UNION ALL"
+        " SELECT 'count_before', (SELECT count(*) FROM before_probe),"
+        "        NULL, NULL, NULL"
+        " UNION ALL"
+        " SELECT 'count_after', (SELECT count(*) FROM after_probe),"
+        "        NULL, NULL, NULL"
+    )
 
 
 def chat_history_neighbor_rows(
@@ -10896,7 +10910,8 @@ def chat_history_neighbor_rows(
     返回 ``(before_rows, after_rows, available)``：前两项按**旧→新**排列（返回
     结构的展示序），``available`` 是 ``{"before": n, "after": n}``——请求窗口内
     实际存在多少条可见邻居。调用方据此算 ``omitted_*``，**不许**从"取回条数"
-    反推（见 ``_neighbor_available_counts``）。可见性谓词与候选查询完全同一套。
+    反推。取行与计数在**同一条语句**里完成，共享一个快照（见
+    ``_neighbor_window_sql``）；可见性谓词与候选查询完全同一套。
     """
     anchor = int(anchor_seq)
     if anchor < 0:
@@ -10910,25 +10925,30 @@ def chat_history_neighbor_rows(
                      else int(after_requested))
     older: list[dict] = []
     newer: list[dict] = []
+    available = {"before": 0, "after": 0}
+    if not (n_before or n_after or want_before or want_after):
+        return older, newer, available
     with _pool().connection() as conn:
-        if n_before:
-            rows = conn.execute(
-                "SELECT seq,msg_id,ts,doc FROM chat_messages "
-                "WHERE user_id=%s AND seq<%s "
-                f"AND {_HISTORY_VISIBLE_PREDICATE} "
-                "ORDER BY seq DESC LIMIT %s",
-                (str(user_id), anchor, n_before),
-            ).fetchall()
-            older = [_history_full_row(r[0], r[1], r[2], r[3]) for r in reversed(rows)]
-        if n_after:
-            rows = conn.execute(
-                "SELECT seq,msg_id,ts,doc FROM chat_messages "
-                "WHERE user_id=%s AND seq>%s "
-                f"AND {_HISTORY_VISIBLE_PREDICATE} "
-                "ORDER BY seq ASC LIMIT %s",
-                (str(user_id), anchor, n_after),
-            ).fetchall()
-            newer = [_history_full_row(r[0], r[1], r[2], r[3]) for r in rows]
-        available = _neighbor_available_counts(
-            conn, user_id, anchor, before=want_before, after=want_after)
+        rows = conn.execute(
+            _neighbor_window_sql(),
+            {
+                "uid": str(user_id),
+                "anchor": anchor,
+                "n_before": n_before,
+                "n_after": n_after,
+                "want_before": want_before,
+                "want_after": want_after,
+            },
+        ).fetchall()
+    for side, seq, msg_id, ts, doc in rows:
+        if side == "before":
+            older.append(_history_full_row(seq, msg_id, ts, doc))
+        elif side == "after":
+            newer.append(_history_full_row(seq, msg_id, ts, doc))
+        elif side == "count_before":
+            available["before"] = int(seq or 0)
+        elif side == "count_after":
+            available["after"] = int(seq or 0)
+    # before 分支按 seq DESC 取（要最靠近锚点的 N 条），展示序是旧→新。
+    older.reverse()
     return older, newer, available
