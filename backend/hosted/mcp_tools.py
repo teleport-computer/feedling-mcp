@@ -479,26 +479,86 @@ async def load_turn_mcp(
                 serialized_chars=candidate_chars,
             ))
 
+    return _allocate_round_robin(candidates)
+
+
+def _allocate_round_robin(candidates: list[_CatalogCandidate]) -> McpTurn:
+    """Fill the turn's tool budget round-robin across servers, not in name order.
+
+    The previous allocator sorted every candidate into one list keyed by server
+    name and truncated at the caps. That starves whole servers by alphabet: with
+    six connected servers offering 107 tools, ``mcdonalds`` and ``tavily`` landed
+    past the cut and reached the model with ZERO tools each — the user sees them
+    enabled and green in the app while the agent cannot see a single tool, and
+    the model then invents a reason ("I don't have a search tool"). The pi bridge
+    hit the identical bug against the identical user config and fixed it this way
+    (``tools/pi_mcp_bridge/tool_mapping.js``); this is the same allocation for the
+    hosted V2 catalog, so both runtimes now behave the same.
+
+    Round-robin means every server lands at least one tool before any server
+    lands its second, so a small server is never starved by a large one; only
+    the largest get trimmed. Determinism is preserved exactly as before —
+    servers sorted by name, tools sorted within a server, fixed rounds — so the
+    provider-facing catalog bytes stay stable for a given input.
+
+    BOTH caps are enforced in the same pass. The count cap stops allocation
+    outright; the char cap only skips the one candidate that would overflow and
+    keeps trying smaller ones (a single huge schema must not end the round for
+    everyone else). The cursor advances before the char check, so a repeatedly
+    skipped candidate can never spin the loop.
+    """
+    by_server: dict[str, list[_CatalogCandidate]] = {}
+    for item in candidates:
+        by_server.setdefault(item.server, []).append(item)
+    for items in by_server.values():
+        items.sort(key=lambda c: (c.raw_name, c.spec.name))
+    names = sorted(by_server)
+
     specs: list[ToolSpec] = []
     routes: dict[str, _Route] = {}
     catalog_chars = 0
-    for item in sorted(
-        candidates,
-        key=lambda candidate: (
-            candidate.server,
-            candidate.raw_name,
-            candidate.spec.name,
-        ),
-    ):
-        if len(specs) >= MAX_MCP_TOOLS_PER_TURN:
-            break
-        if (
-            catalog_chars + item.serialized_chars
-            > MAX_MCP_TOOL_CATALOG_CHARS
-        ):
-            log.warning("mcp tool catalog cap reached; tool skipped")
-            continue
-        specs.append(item.spec)
-        routes[item.spec.name] = item.route
-        catalog_chars += item.serialized_chars
+    kept: dict[str, int] = {name: 0 for name in names}
+    dropped_chars = 0
+    cursor = {name: 0 for name in names}
+    progressed = True
+    while progressed and len(specs) < MAX_MCP_TOOLS_PER_TURN:
+        progressed = False
+        for server in names:
+            if len(specs) >= MAX_MCP_TOOLS_PER_TURN:
+                break
+            index = cursor[server]
+            items = by_server[server]
+            if index >= len(items):
+                continue
+            cursor[server] = index + 1
+            progressed = True
+            item = items[index]
+            if (
+                catalog_chars + item.serialized_chars
+                > MAX_MCP_TOOL_CATALOG_CHARS
+            ):
+                dropped_chars += 1
+                continue
+            specs.append(item.spec)
+            routes[item.spec.name] = item.route
+            catalog_chars += item.serialized_chars
+            kept[server] += 1
+
+    # Never truncate silently: the count cap used to drop whole servers with no
+    # log line at all, which is exactly why this took a user report to find.
+    # Report kept/offered PER SERVER and post-allocation — a total alone cannot
+    # answer "which server did the model lose", and reporting the offered count
+    # would name a server whose tools were all dropped as if it were fine.
+    if len(specs) < len(candidates):
+        log.warning(
+            "mcp catalog capped: kept=%d offered=%d count_cap=%d "
+            "char_cap_skips=%d detail=%s",
+            len(specs),
+            len(candidates),
+            MAX_MCP_TOOLS_PER_TURN,
+            dropped_chars,
+            ",".join(
+                f"{name}:{kept[name]}/{len(by_server[name])}" for name in names
+            ),
+        )
     return McpTurn(specs, routes)

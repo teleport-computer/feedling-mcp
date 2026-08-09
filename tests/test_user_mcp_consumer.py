@@ -1209,3 +1209,80 @@ def test_user_mcp_file_written_atomically_at_0600(monkeypatch, tmp_path):
 
     assert (str(mcp), 0o600) in seen, "USER_MCP_FILE must use _atomic_write_text"
     assert (mcp.stat().st_mode & 0o777) == 0o600
+
+
+# ---------------------------------------------------------------------------
+# Self-hosted claude templates with no {mcp} placeholder
+# ---------------------------------------------------------------------------
+
+
+def _applied(monkeypatch, *names):
+    monkeypatch.setattr(
+        c, "_user_mcp_applied",
+        {"fingerprint": "sha256:x",
+         "servers": [{"name": n, "enabled": True,
+                      "url": f"https://{n}.example.com", "headers": {}}
+                     for n in names]},
+    )
+
+
+def test_selfhosted_claude_without_placeholder_gets_config_and_grant(
+    monkeypatch, tmp_path
+):
+    """tools/README.md's Claude example has no {mcp}; wire it anyway.
+
+    Both flags must be =-bound: they are variadic, so a bare
+    `--mcp-config <path>` eats the positional prompt that follows.
+    """
+    cfg = tmp_path / "mcp.json"
+    cfg.write_text("{}")
+    monkeypatch.setattr(c, "USER_MCP_FILE", str(cfg))
+    _applied(monkeypatch, "ombre", "jira")
+
+    cmd = ["claude", "--print", "--output-format", "json", "the prompt"]
+    out = c._inject_claude_user_mcp(cmd, "chat")
+
+    assert out[0] == "claude"
+    assert f"--mcp-config={cfg}" in out
+    assert "--allowed-tools=mcp__jira__*,mcp__ombre__*" in out
+    # No bare variadic form anywhere — that is the prompt-swallowing trap.
+    assert "--mcp-config" not in out
+    assert "--allowed-tools" not in out
+    assert out[-1] == "the prompt"
+
+
+def test_selfhosted_injection_is_a_pure_bypass(monkeypatch, tmp_path):
+    """Every non-applicable case returns the argv unchanged, byte for byte."""
+    cfg = tmp_path / "mcp.json"
+    cfg.write_text("{}")
+    monkeypatch.setattr(c, "USER_MCP_FILE", str(cfg))
+    base = ["claude", "--print", "the prompt"]
+
+    _applied(monkeypatch, "ombre")
+    assert c._inject_claude_user_mcp(base, "background") == base   # not chat
+    assert c._inject_claude_user_mcp(["codex", "exec", "x"], "chat") == \
+        ["codex", "exec", "x"]                                     # not claude
+    already = ["claude", "--mcp-config=/own.json", "p"]
+    assert c._inject_claude_user_mcp(already, "chat") == already    # operator's
+
+    monkeypatch.setattr(c, "_user_mcp_applied", {"servers": []})
+    assert c._inject_claude_user_mcp(base, "chat") == base          # none enabled
+
+    _applied(monkeypatch, "ombre")
+    monkeypatch.setattr(c, "USER_MCP_FILE", str(tmp_path / "missing.json"))
+    assert c._inject_claude_user_mcp(base, "chat") == base          # no file
+
+
+def test_selfhosted_claude_keeps_operator_allowed_tools(monkeypatch, tmp_path):
+    """An operator-pinned allowlist is never rewritten — servers still wired."""
+    cfg = tmp_path / "mcp.json"
+    cfg.write_text("{}")
+    monkeypatch.setattr(c, "USER_MCP_FILE", str(cfg))
+    _applied(monkeypatch, "ombre")
+
+    cmd = ["claude", "--allowed-tools=Bash", "--print", "p"]
+    out = c._inject_claude_user_mcp(cmd, "chat")
+
+    assert f"--mcp-config={cfg}" in out
+    assert "--allowed-tools=Bash" in out
+    assert not any(t.startswith("--allowed-tools=mcp__") for t in out)

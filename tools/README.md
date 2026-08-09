@@ -345,8 +345,16 @@ before running it as a service.
 
 ```
 AGENT_CLI_PATH=/home/openclaw/.npm-global/bin:/home/openclaw/.local/bin
-AGENT_CLI_CMD=claude --print --output-format json "{message}"
+AGENT_CLI_CMD=claude --print --output-format json {mcp} "{message}"
 ```
+
+`{mcp}` is what carries the MCP servers you enabled in the app. On a chat turn
+the consumer expands it to `--mcp-config <file>`; on background turns, and when
+you have no enabled servers, it expands to nothing. **A command without it still
+works** — the consumer injects the same wiring itself when it sees a `claude`
+command with no placeholder — but keep the placeholder if you care where the
+flags land, and see "user MCP with a hand-written Claude command" below for the
+one case the injection deliberately leaves alone.
 
 The consumer reads Claude Code's `session_id` from JSON output and injects
 `--resume <session_id>` on later turns. Do not use `--continue`: it means
@@ -454,6 +462,31 @@ hermes 下一回合启动时经 `discover_mcp_tools` 自动发现并注册为 `m
 禁用 MCP，配了也不生效。正规 HTTPS 与自签 CA 均支持（自签走 `SSL_CERT_FILE` 注入
 的 concat 信任库）。物化会先把既有 config.yaml 备份成 `config.yaml.feedling-bak`
 （pyyaml round-trip 不保留注释）。
+
+### Claude 用户的 MCP（手写命令的那种）
+
+hermes / OpenClaw / codex 是从各自的配置文件里读 MCP 的，命令行怎么写都不影响。
+**claude 不是**——它只认命令行上的 `--mcp-config`，所以一条没有 `{mcp}` 的
+`AGENT_CLI_CMD` 会让 app 里配的 server 一台都到不了 agent。旧版文档的示例就没有
+这个占位符，所以照抄过的命令都中招：app 里显示"已连接、发现 N 个工具"（那是控制面
+探针直连服务器测的，确实成功），而 agent 从头到尾不知道这些 server 存在，模型只能
+自己编一个说法（"我没有搜索工具"／"我没有权限"）。
+
+现在 consumer 会在 chat 轮**自动补上**两个 `=` 绑定的参数：
+
+    --mcp-config=<file>                 让 server 真的存在
+    --allowed-tools=mcp__<name>__*      让调用被预先批准
+
+两个都必须补：实测只给 `--mcp-config`，调用会进 `permission_denials`，模型回
+"这个工具需要授权"。托管用户不受影响，因为他们的授权规则本来就在我们生成的
+`settings.json` 里；自托管没有那个文件。
+
+**唯一不自动处理的情况**：你自己在命令里写了 `--allowed-tools`。这时 consumer 只补
+`--mcp-config`，不动你的 allowlist（合并语义不该由我们替你猜，覆盖又可能收掉你依赖
+的工具），并打一条 warning 告诉你该加哪几条规则。把 `mcp__<name>__*` 加进你的
+`--allowed-tools` 或 `settings.json` 即可。
+
+已经写了 `--mcp-config` 的命令，consumer 一律不碰——那是你自己接管了。
 
 ---
 
