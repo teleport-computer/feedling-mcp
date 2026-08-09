@@ -501,11 +501,18 @@ def _allocate_round_robin(candidates: list[_CatalogCandidate]) -> McpTurn:
     servers sorted by name, tools sorted within a server, fixed rounds — so the
     provider-facing catalog bytes stay stable for a given input.
 
-    BOTH caps are enforced in the same pass. The count cap stops allocation
-    outright; the char cap only skips the one candidate that would overflow and
-    keeps trying smaller ones (a single huge schema must not end the round for
-    everyone else). The cursor advances before the char check, so a repeatedly
-    skipped candidate can never spin the loop.
+    BOTH caps are enforced in the same pass, and they are NOT symmetric:
+
+    - The count cap ends allocation — nothing more can fit, by definition.
+    - The char cap must NOT. It rejects the one candidate that would overflow
+      and allocation continues, because a later candidate can still be small
+      enough to fit. Ending the round-robin on the first oversized schema
+      starves every server still holding candidates for a reason that has
+      nothing to do with them (measured on the regression case: a server drops
+      from 20 tools to 12).
+
+    The cursor advances BEFORE the char check, so a repeatedly rejected
+    candidate can never spin the loop.
     """
     by_server: dict[str, list[_CatalogCandidate]] = {}
     for item in candidates:

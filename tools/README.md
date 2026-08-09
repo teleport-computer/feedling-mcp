@@ -472,14 +472,20 @@ hermes / OpenClaw / codex 是从各自的配置文件里读 MCP 的，命令行�
 探针直连服务器测的，确实成功），而 agent 从头到尾不知道这些 server 存在，模型只能
 自己编一个说法（"我没有搜索工具"／"我没有权限"）。
 
-现在 consumer 会在 chat 轮**自动补上**两个 `=` 绑定的参数：
+现在 chat 轮一定会带上两个 `=` 绑定的参数——有 `{mcp}` 的由占位符展开，没有的由
+consumer 直接注入：
 
     --mcp-config=<file>                 让 server 真的存在
     --allowed-tools=mcp__<name>__*      让调用被预先批准
 
-两个都必须补：实测只给 `--mcp-config`，调用会进 `permission_denials`，模型回
+两个都必须有：实测只给 `--mcp-config`，调用会进 `permission_denials`，模型回
 "这个工具需要授权"。托管用户不受影响，因为他们的授权规则本来就在我们生成的
 `settings.json` 里；自托管没有那个文件。
+
+用 `=` 绑定是因为这两个 flag 都是变参：手敲这条命令时，裸的
+`--mcp-config <path>` 会把后面的提示词当成配置文件路径，claude 直接 exit 1
+（`Invalid MCP configuration`）。consumer 自己是把提示词走 stdin 的，走不到这个坑，
+但绑定值让任何模板形状都不会踩。
 
 **唯一不自动处理的情况**：你自己在命令里写了 `--allowed-tools`。这时 consumer 只补
 `--mcp-config`，不动你的 allowlist（合并语义不该由我们替你猜，覆盖又可能收掉你依赖

@@ -91,8 +91,9 @@ def test_mcp_value_claude_and_codex(monkeypatch, tmp_path):
 
     # claude → --mcp-config only on chat lane
     monkeypatch.setattr(c, "AGENT_CLI_CMD", tpl_claude)
+    # tpl_claude pins its own allowlist → config only, no injected grant.
     assert c._user_mcp_cli_value(tpl_claude, "chat") == \
-        f"--mcp-config {tmp_path}/mcp.json"
+        f"--mcp-config={tmp_path}/mcp.json"
     assert c._user_mcp_cli_value(tpl_claude, "background") == ""
 
     # codex → per-server `enabled=false` override only on non-chat (background)
@@ -200,11 +201,35 @@ def test_render_cli_template_injects_mcp_config(monkeypatch, tmp_path):
     monkeypatch.setattr(c, "AGENT_CLI_CMD",
                         "claude {mcp} -p {message}")
     cmd, _ = c._render_cli_template("hello", "sid-1", lane="chat")
-    assert "--mcp-config" in cmd
-    assert f"{tmp_path}/mcp.json" in cmd
+    # =-bound: the flags are variadic and the documented self-hosted template
+    # ends in a positional prompt, which a bare `--mcp-config <path>` eats.
+    assert f"--mcp-config={tmp_path}/mcp.json" in cmd
+    # This template pins no allowlist, so the grant rides along — without it the
+    # servers exist but every call lands in permission_denials.
+    assert "--allowed-tools=mcp__jira__*" in cmd
+    assert not any(t == "--mcp-config" for t in cmd)
     # background lane collapses the placeholder to nothing
     cmd_bg, _ = c._render_cli_template("hello", "sid-1", lane="background")
-    assert "--mcp-config" not in cmd_bg
+    assert not any(str(t).startswith("--mcp-config") for t in cmd_bg)
+    assert not any(str(t).startswith("--allowed-tools=mcp__") for t in cmd_bg)
+
+
+def test_render_cli_template_keeps_operator_allowlist(monkeypatch, tmp_path):
+    """A template with its own allowlist (hosted's shape) gets no grant added."""
+    monkeypatch.setattr(
+        c, "_user_mcp_applied",
+        {"fingerprint": "sha256:x",
+         "servers": [{"name": "jira", "enabled": True, "url": "u", "headers": {}}]})
+    monkeypatch.setattr(c, "USER_MCP_FILE", str(tmp_path / "mcp.json"))
+    for flag in ("--allowed-tools", "--allowedTools"):
+        # Both spellings are real: the repo templates use one, the official CLI
+        # docs the other. Missing a spelling means injecting a duplicate flag.
+        monkeypatch.setattr(
+            c, "AGENT_CLI_CMD", f"claude {flag} 'Bash' {{mcp}} -p {{message}}")
+        cmd, _ = c._render_cli_template("hello", "sid-1", lane="chat")
+        assert f"--mcp-config={tmp_path}/mcp.json" in cmd, flag
+        assert not any(str(t).startswith("--allowed-tools=mcp__") for t in cmd), flag
+        assert not any(str(t).startswith("--allowedTools=mcp__") for t in cmd), flag
 
 
 # ---------------------------------------------------------------------------
@@ -1286,3 +1311,38 @@ def test_selfhosted_claude_keeps_operator_allowed_tools(monkeypatch, tmp_path):
     assert f"--mcp-config={cfg}" in out
     assert "--allowed-tools=Bash" in out
     assert not any(t.startswith("--allowed-tools=mcp__") for t in out)
+
+
+def test_documented_selfhosted_claude_line_is_wired_and_authorized(
+    monkeypatch, tmp_path
+):
+    """The exact AGENT_CLI_CMD tools/README.md tells self-hosted operators to use.
+
+    Regression for the real product-path failure: wiring the servers without a
+    grant leaves every call in permission_denials, which the model reports as
+    missing permission. A self-hosted operator has no settings.json from us to
+    carry the rules, so the grant has to ride on the command.
+
+    The =-bound form is asserted too. The consumer pipes the prompt via stdin
+    for claude/codex/pi (`_driver_reads_stdin`), so the variadic flags have no
+    positional left to swallow HERE — but the same documented line run by hand
+    does exit 1 with "Invalid MCP configuration", and the bound form is correct
+    for every template shape rather than only the ones that pipe.
+    """
+    cfg = tmp_path / "mcp.json"
+    cfg.write_text("{}")
+    monkeypatch.setattr(c, "USER_MCP_FILE", str(cfg))
+    _applied(monkeypatch, "ombre")
+    monkeypatch.setattr(
+        c, "AGENT_CLI_CMD",
+        'claude --print --output-format json {mcp} "{message}"')
+
+    cmd, stdin_msg = c._render_cli_template("hello there", "sid-1", lane="chat")
+
+    assert f"--mcp-config={cfg}" in cmd
+    assert "--allowed-tools=mcp__ombre__*" in cmd
+    # Nothing bare: a bare flag would consume the prompt that follows it.
+    assert not any(t in ("--mcp-config", "--allowed-tools") for t in cmd)
+    # claude reads the prompt from stdin, so it is not in argv at all.
+    assert stdin_msg == "hello there"
+    assert "hello there" not in cmd

@@ -6590,6 +6590,24 @@ def _inject_codex_images(cmd: list[str], image_paths: list[str]) -> list[str]:
     return [*cmd[:insert_at], *flags, *cmd[insert_at:]]
 
 
+def _cmd_has_allowed_tools(cmd: list[str]) -> bool:
+    """True when the argv already pins a claude tool allowlist.
+
+    Both spellings are accepted by the CLI and both appear in the wild: the
+    official docs write ``--allowedTools`` while this repo's own templates use
+    ``--allowed-tools``. Matching only one of them means an operator using the
+    other gets a SECOND allowlist flag injected, which is exactly the
+    "how do duplicate flags merge" question we refuse to guess at — and a wrong
+    guess there can revoke a tool they depend on. Both bare and ``=``-bound
+    forms count.
+    """
+    return any(
+        t in ("--allowed-tools", "--allowedTools")
+        or t.startswith(("--allowed-tools=", "--allowedTools="))
+        for t in cmd
+    )
+
+
 def _inject_claude_user_mcp(cmd: list[str], lane: str) -> list[str]:
     """Wire the app-configured MCP servers into a self-hosted ``claude`` command
     whose template has no ``{mcp}`` placeholder.
@@ -6618,11 +6636,12 @@ def _inject_claude_user_mcp(cmd: list[str], lane: str) -> list[str]:
         only ``mcp__ombre__*`` granted — so injecting it cannot cost the agent a
         tool it had before.
 
-    ⚠️ BOTH are emitted in the ``=``-bound form. Both flags are variadic, so the
-    bare ``--mcp-config <path>`` form swallows the following positional prompt
-    (observed: claude tried to open the prompt text as a config file and exited
-    1 with "Invalid MCP configuration"). Same trap, same fix as
-    ``_inject_codex_images``.
+    ⚠️ BOTH are emitted in the ``=``-bound form. Both flags are variadic, so a
+    bare ``--mcp-config <path>`` swallows a following positional prompt —
+    reproduced by hand, though not reachable through this function today since
+    ``_driver_reads_stdin`` pipes the prompt for claude. Binding the value
+    removes the hazard for any template shape rather than relying on that.
+    Same trap, same fix as ``_inject_codex_images``.
 
     Pure bypass: with no enabled server, no materialized file, a non-chat lane,
     a non-claude driver, or an operator who already wired ``--mcp-config``, the
@@ -6647,8 +6666,7 @@ def _inject_claude_user_mcp(cmd: list[str], lane: str) -> list[str]:
         # replies down entirely rather than merely losing MCP tools.
         return cmd
     flags = [f"--mcp-config={USER_MCP_FILE}"]
-    if any(t == "--allowed-tools" or t.startswith("--allowed-tools=")
-           for t in cmd):
+    if _cmd_has_allowed_tools(cmd):
         # The operator pinned their own allowlist. A second flag's merge
         # semantics are not something to guess at, and silently replacing their
         # allowlist could revoke a tool they rely on. Give them the servers and
@@ -10083,8 +10101,11 @@ def _user_mcp_cli_value(template: str, lane: str) -> str:
     """Resolve the ``{mcp}`` placeholder for one CLI turn.
 
     - No ``{mcp}`` slot in the template, or no enabled server → empty.
-    - claude → ``--mcp-config <file>`` ONLY on the chat lane (foreground turns
-      may call user MCP tools; background/proactive turns must not).
+    - claude → ``--mcp-config=<file>`` ONLY on the chat lane (foreground turns
+      may call user MCP tools; background/proactive turns must not), plus
+      ``--allowed-tools=mcp__<name>__*`` when the template pins no allowlist of
+      its own. Both ``=``-bound — the flags are variadic and would otherwise
+      swallow a trailing positional prompt.
     - codex  → per-server ``-c mcp_servers.<name>.enabled=false`` overrides ONLY
       on non-chat lanes. codex has no way to enable a subset per-turn, so its
       user MCP servers are configured in config.toml (available on chat turns)
@@ -10139,7 +10160,32 @@ def _user_mcp_cli_value(template: str, lane: str) -> str:
         return " ".join(
             f"-c mcp_servers.{name}.enabled=false" for name in names if name
         )
-    return f"--mcp-config {USER_MCP_FILE}" if lane == "chat" else ""
+    if lane != "chat":
+        return ""
+    # =-bound, NOT the bare ``--mcp-config <path>`` form this used to emit.
+    # The flag is variadic, so a template whose prompt is a trailing positional
+    # would have it swallowed — claude then opens the message text as a config
+    # file and exits 1 with "Invalid MCP configuration" (reproduced by running
+    # the documented line by hand). The consumer itself pipes the prompt via
+    # stdin for claude/codex/pi (``_driver_reads_stdin``), so no rendered
+    # command hits this today; the bound form is correct by construction for
+    # every template shape instead of only the ones that happen to pipe.
+    value = f"--mcp-config={USER_MCP_FILE}"
+    if _cmd_has_allowed_tools(shlex.split(template)):
+        # Hosted templates (agent_runtime.spawners) always pin their own
+        # allowlist, and so may an operator; theirs wins untouched. Hosted
+        # additionally carries the ``mcp__<name>__*`` rules in the settings.json
+        # we materialize, so it is already authorized.
+        return value
+    # Self-hosted with no allowlist of its own has no settings.json from us
+    # either, so wiring the servers without a grant just moves the failure from
+    # "tool doesn't exist" to "tool call denied" (verified: the call lands in
+    # permission_denials and the model reports it as missing permission).
+    grant = ",".join(
+        f"mcp__{s['name']}__*"
+        for s in sorted(enabled_servers, key=lambda s: s.get("name") or "")
+    )
+    return f"{value} --allowed-tools={grant}"
 
 
 def poll_proactive_jobs(since: float) -> dict:

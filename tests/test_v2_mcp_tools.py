@@ -869,29 +869,47 @@ def test_small_server_is_not_starved_by_a_large_one(monkeypatch):
     assert kept["luckin-coffee"] < sizes["luckin-coffee"]
 
 
-def test_one_oversized_schema_does_not_end_allocation_for_everyone(monkeypatch):
-    """The char cap skips the offending tool only; smaller ones still get in.
+def test_char_cap_skips_the_overflowing_tool_and_keeps_allocating(monkeypatch):
+    """A char-cap overflow must reject one candidate, not end allocation.
 
-    A single fat schema must not act like the count cap and stop the round —
-    that would starve every server ordered after it for an unrelated reason.
+    The two caps are not symmetric: hitting the count cap means nothing more
+    can fit, but hitting the char cap only means THIS candidate does not — a
+    smaller one still can. Treating them the same starves every server still
+    holding candidates for a reason that has nothing to do with them.
+
+    Mutation-checked: making an overflow end the allocation takes `small` from
+    20 kept tools to 12, so this test fails on that variant. (Merely breaking
+    the current round instead of continuing it is NOT a behavioural change —
+    the outer loop re-enters and every candidate is still tried.)
     """
-    fat = "x" * (mcp_tools.MAX_MCP_TOOL_SCHEMA_CHARS // 2)
+    # Bulk must be STRUCTURAL: prose (title/description/examples) is stripped by
+    # _sanitize_schema_node, so a schema padded with text arrives tiny. Property
+    # names survive — 60 of them, near the 64-char name limit, lands each tool
+    # around 5k chars: big enough that the 65536 catalog budget runs out partway
+    # through, small enough to stay under the 8192 per-schema cap (which would
+    # drop the tool through a different path and prove nothing).
+    def _fat_schema(i: int) -> dict:
+        return {"type": "object", "properties": {
+            f"p{i:03d}_{'x' * 52}_{j:02d}": {"type": "string"}
+            for j in range(60)
+        }}
+
+    small_count = 20
 
     async def fake_list(url, headers, *, ca_pem=None, transport=None, mcp_transport=None):
         server = url.removeprefix("https://").removesuffix(".example.com")
         if server == "big":
-            return [
-                {"name": f"fat_{i:03d}",
-                 "inputSchema": {"type": "object",
-                                 "properties": {f"p{fat}": {"type": "string"}}}}
-                for i in range(40)
-            ]
-        return [{"name": "small",
-                 "inputSchema": {"type": "object", "properties": {}}}]
+            return [{"name": f"fat_{i:03d}", "inputSchema": _fat_schema(i)}
+                    for i in range(30)]
+        return [
+            {"name": f"small_{i:03d}",
+             "inputSchema": {"type": "object", "properties": {}}}
+            for i in range(small_count)
+        ]
 
     _patch(
         monkeypatch,
-        servers=_servers("big", "zsmall"),
+        servers=_servers("big", "small"),
         decrypt=lambda env, api_key, runtime_token: {
             "url": f"https://{env['id'].removeprefix('env_')}.example.com",
             "headers": {}},
@@ -899,4 +917,11 @@ def test_one_oversized_schema_does_not_end_allocation_for_everyone(monkeypatch):
     )
     turn = asyncio.run(mcp_tools.load_turn_mcp(STORE, api_key="k", runtime_token="rt"))
     names = [spec.name for spec in turn.tool_specs]
-    assert "mcp__zsmall__small" in names, names
+    big_kept = sum(1 for n in names if n.startswith("mcp__big__"))
+    small_kept = sum(1 for n in names if n.startswith("mcp__small__"))
+
+    # The fat server must actually have overflowed, or this proves nothing.
+    assert big_kept < 30, (big_kept, small_kept)
+    # Every small tool survives — the ones allocated in rounds AFTER the first
+    # overflow are exactly what a `break` implementation would have lost.
+    assert small_kept == small_count, (big_kept, small_kept)

@@ -34,16 +34,26 @@
 → app 里配的 server 一台都到不了 agent。app 显示"已连接、发现 N 个工具"是控制面探针
 直连服务器测的，和 agent 走的是两条路，所以绿灯和"看不到"能同时成立。
 
-consumer 现在在 chat 轮自动补两个参数，文档也补上了占位符。
+chat 轮现在一定带上两个参数：模板有 `{mcp}` 的由占位符展开，没有的由 consumer 注入。
+文档的示例也补上了占位符。
+
+> **Codex code review 抓到的 Critical（已修）**：初版只让「没有 `{mcp}`」的命令补授权，
+> 而我同时把文档示例改成了推荐 `{mcp}`——`{mcp}` 那条分支只展开 `--mcp-config`、不带授权。
+> 等于旧文档的命令修好了，**照新文档配的反而仍然只接线不授权**。现在两条分支统一。
 
 **为什么是两个参数**（实测，claude-code 2.1.217 + 真实 MCP server，以磁盘落文件为准）：
 只给 `--mcp-config`，调用进 `permission_denials`，模型回"这个工具需要授权"——
 和用户原话一致。托管用户不中招是因为授权规则在我们生成的 `settings.json` 里，
 自托管没有那个文件。
 
-**两个都必须 `=` 绑定**：两个 flag 都是变参，`--mcp-config <path>` 会把后面的
-positional prompt 吞掉（实测 claude 拿提示词当配置文件路径去打开，exit 1
-"Invalid MCP configuration"）。同一个坑、同一个解法，见 `_inject_codex_images`。
+**两个都用 `=` 绑定**：两个 flag 都是变参，裸 `--mcp-config <path>` 会把后面的
+positional prompt 吞掉——手敲那条文档命令实测 claude 拿提示词当配置文件路径去打开，
+exit 1 "Invalid MCP configuration"。
+
+⚠️ **准确说**：consumer 自己对 claude/codex/pi 是把提示词走 **stdin** 的
+（`_driver_reads_stdin`），所以这个吞参数在产品路径上走不到——真正的 Critical 是
+**缺授权**。`=` 绑定是让任何模板形状都不踩，不是在修一个正在发生的故障。
+（初稿把它写成了产品路径故障，过头了，这里更正。）
 
 旁路性：非 chat 轮 / 非 claude / 没有启用的 server / 配置文件不存在 /
 operator 自己写了 `--mcp-config` —— 任一条成立，argv 逐字节不变。
