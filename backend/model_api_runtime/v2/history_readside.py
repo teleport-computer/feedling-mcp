@@ -20,7 +20,7 @@ import hashlib
 import hmac
 import os
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import httpx
 
@@ -32,6 +32,12 @@ from model_api_runtime.v2 import history_search, jobs_store
 _ASSISTANT_ROLES = frozenset({"openclaw", "assistant", "agent"})
 
 SNIPPET_MAX_CHARS = 240  # spec §3.1
+
+# history_fetch 的邻居上限（各方向），spec §3.2。默认刻意不对称——before 15 /
+# after 4，线索几乎总在前文里，对称分配等于把一半预算浪费在后文。
+FETCH_NEIGHBORS_MAX = 15
+FETCH_BEFORE_DEFAULT = 15
+FETCH_AFTER_DEFAULT = 4
 
 # cursor 签名 key 的 domain-separation 标签。风格对齐 serve_worker 的
 # prompt-cache 派生（"feedling:v2:prompt-cache:v3"）。
@@ -75,6 +81,23 @@ class HistorySearchBudget:
     snippet_max_chars: int = SNIPPET_MAX_CHARS
     fetch_max_chars_per_message: int = 2000
     cursor_ttl_seconds: float = float(history_search.DEFAULT_CURSOR_TTL_SECONDS)
+
+
+def clamp_to_remaining(
+    budget: HistorySearchBudget, *, max_rows: int, deadline_ms: int
+) -> HistorySearchBudget:
+    """把单次调用的闸压到回合剩余额度以内（spec §5，只降不升）。
+
+    回合闸（1500 行 / 8s）只在调用**之间**检查是不够的：剩 1 行时放行一次
+    完整的 512 行扫描，一个回合最坏就能扫 2011 行。剩余额度必须在调用前钳进
+    单次 budget。下限保 1：0 会让扫描循环空转一圈却什么都不做，而"剩 0"这种
+    情况本来就该被 exhausted 拦在更前面。
+    """
+    return replace(
+        budget,
+        call_max_rows=max(1, min(int(budget.call_max_rows), int(max_rows))),
+        call_deadline_ms=max(1, min(int(budget.call_deadline_ms), int(deadline_ms))),
+    )
 
 
 def _post_enclave_history(runtime_token: str | None, operation: str, payload: dict) -> dict:
@@ -146,6 +169,21 @@ def _payload_ciphertext_size(row_payload: dict) -> int:
         str(row_payload.get("caption_body_ct") or ""))
 
 
+_CIPHERTEXT_PAYLOAD_FIELDS = frozenset(_TEXT_ENVELOPE_FIELDS) | frozenset(_CAPTION_FIELDS)
+
+
+def _oversize_placeholder(row_payload: dict) -> dict:
+    """一行自身就超字节闸时送出的无密文占位。
+
+    密文一个字节都不送（这正是闸要挡的东西），但这一行仍然要出现在批里：
+    enclave 把它记成 checked + unavailable 并推进 ``last_checked_seq``，
+    cursor 才越得过去。整批直接不发它 = 下一页从同一位置重来 = 死循环。
+    """
+    out = {k: v for k, v in row_payload.items() if k not in _CIPHERTEXT_PAYLOAD_FIELDS}
+    out["oversize"] = True
+    return out
+
+
 def _model_role(raw_role: str) -> str:
     return "assistant" if str(raw_role).strip().lower() in _ASSISTANT_ROLES else "user"
 
@@ -177,10 +215,18 @@ def _leaf_hint_ranges(
     picked: list[dict] = []
     used = 0
     for leaf in leaves:
-        if len(picked) >= budget.leaf_call_max_leaves or used >= budget.leaf_call_max_bytes:
-            break
         env = leaf.get("summary_envelope")
-        used += len(str((env or {}).get("body_ct") or "")) if isinstance(env, dict) else 0
+        size = len(str(env.get("body_ct") or "")) if isinstance(env, dict) else 0
+        # 同 raw 行：字节判定在这片叶子进批之前（先加后判会放一整片超支）。
+        if len(picked) >= budget.leaf_call_max_leaves or (
+            picked and used + size > budget.leaf_call_max_bytes
+        ):
+            break
+        if size > budget.leaf_call_max_bytes:
+            # 单叶自身超闸：直接不送（叶子只是扫描优先级提示，没有 cursor 要
+            # 推进），它覆盖的那段由 raw 兜底 phase 扫。
+            continue
+        used += size
         picked.append({
             "segment_id": leaf.get("segment_id"),
             "coverage_kind": leaf.get("coverage_kind"),
@@ -204,6 +250,31 @@ def _leaf_hint_ranges(
     return ranges, legacy_hit
 
 
+def _touches_legacy_coverage(
+    touched: list[tuple[int, int]], legacy_leaves: list[dict], *, snapshot: int
+) -> bool:
+    """本次扫描的区间是否与任何 legacy_opaque 覆盖区相交（spec §4）。
+
+    legacy 叶子的契约（summary_frontier）：``start_seq==0``、覆盖到
+    ``legacy_opaque_through_seq``，且它永远排在 canonical frontier 最前——
+    其覆盖区内不可能存在精确 source witness，所以"触及"即等价于"这段范围里
+    扫不到不代表不存在"。
+    """
+    if not legacy_leaves or not touched:
+        return False
+    for leaf in legacy_leaves:
+        through = max(
+            int(leaf.get("legacy_opaque_through_seq") or 0),
+            int(leaf.get("end_seq") or 0),
+        )
+        hi = min(through, int(snapshot))
+        if hi < 1:
+            continue
+        if any(lo_t <= hi and 1 <= hi_t for lo_t, hi_t in touched):
+            return True
+    return False
+
+
 def run_history_search(
     user_id: str,
     *,
@@ -212,7 +283,7 @@ def run_history_search(
     start: str | None = None,
     end: str | None = None,
     cursor: str | None = None,
-    limit: int = 3,
+    limit: int | None = None,
     runtime_token: str | None = None,
     budget: HistorySearchBudget | None = None,
     now: float | None = None,
@@ -228,8 +299,11 @@ def run_history_search(
     now_ts = time.time() if now is None else float(now)
     post = post_enclave or (
         lambda operation, payload: _post_enclave_history(runtime_token, operation, payload))
+    # ``limit is None`` = 调用方省略（默认 3）；显式传值在带 cursor 时是契约
+    # 冲突（见下面的 verify_cursor_request），所以这里必须保住"有没有传"的
+    # 信号，不能提前折叠成默认值。
     try:
-        limit_n = int(limit)
+        limit_n = 3 if limit is None else int(limit)
     except (TypeError, ValueError):
         raise history_search.HistorySearchInputError("invalid_limit") from None
     limit_n = max(1, min(limit_n, 5))
@@ -239,7 +313,8 @@ def run_history_search(
         cur = history_search.decode_cursor(cursor, key=cursor_hmac_key, now=now_ts)
         history_search.verify_cursor_binding(
             cur, user_id=str(user_id), runtime_generation=generation)
-        history_search.verify_cursor_request(cur, query=query, start=start, end=end)
+        history_search.verify_cursor_request(
+            cur, query=query, start=start, end=end, limit=limit)
         normalized_query = cur.query
         start_ts, end_ts = cur.start_ts, cur.end_ts
         snapshot = int(cur.snapshot_through_seq)
@@ -260,7 +335,15 @@ def run_history_search(
     # 叶子列表在 query / 纯时间两种模式都取：query 模式做提示扫描，两种模式
     # 都要 legacy_opaque 元数据做 coverage_gap 判定（旧 retention 清理过的
     # 区间，raw 扫不到不等于"历史里没有"）。
-    leaves = jobs_store.list_level0_summary_leaves(str(user_id), through_seq=snapshot)
+    #
+    # 上界钳到 min(snapshot, watermark)——不是 snapshot（cursor 契约，见
+    # _leaf_hint_ranges 的确定性要求）：翻页期间并发 compaction 会在
+    # (watermark, snapshot] 里追加新叶，它们 end_seq 更大、排在最前面，会挤
+    # 占本就只有 64 片的叶预算、把原命中段顶出去 → 下一页重算出的命中集合与
+    # 上一页不同 → _covered_intervals 变形 → recent 兜底回头重扫已返回过的
+    # 区间。快照钉死 watermark 就是为了让「哪些叶子属于这次搜索」固定下来。
+    leaves = jobs_store.list_level0_summary_leaves(
+        str(user_id), through_seq=min(snapshot, watermark))
     _exact_leaves, legacy_leaves = _leaf_partition(leaves)
     leaf_hit_ranges: tuple[tuple[int, int], ...] = ()
     if normalized_query:
@@ -285,6 +368,10 @@ def run_history_search(
     matches: list[dict] = []
     scanned = 0
     unavailable = 0
+    # 本次调用实际扫描到的 seq 区间（coverage_gap 的判据，见下）。记的是
+    # planner 窗口里真正推进过的部分，不是"返回了行"的部分——一个候选行都
+    # 没有的窗口同样算触及过（那正是原文被清理掉的样子）。
+    touched: list[tuple[int, int]] = []
     deadline = time.monotonic() + budget.call_deadline_ms / 1000.0
     while (
         len(matches) < limit_n
@@ -308,6 +395,7 @@ def run_history_search(
             limit=batch.limit,
         )
         if not candidates:
+            touched.append((batch.min_seq, batch.max_seq))
             state = history_search.advance_scan_state(
                 shape, state, batch, exhausted=True)
             continue
@@ -315,14 +403,22 @@ def run_history_search(
             str(user_id), [row["seq"] for row in candidates])
         # 字节预算截前缀（降序 = 最新优先）：没送进去的低位候选留给下一页——
         # advance 用 last_checked_seq 恢复，正好落在截断点上。
+        # 判定必须在这一行**加进批之前**：先加后判等于每批都允许超支一整行，
+        # 首条 5 MiB 的密文就这样穿过 512 KiB 的闸飞向 enclave。
         payload_rows: list[dict] = []
         used_bytes = 0
         for row in full_rows:
             projected = _row_payload(row)
-            payload_rows.append(projected)
-            used_bytes += _payload_ciphertext_size(projected)
-            if used_bytes >= budget.raw_batch_bytes:
+            size = _payload_ciphertext_size(projected)
+            if payload_rows and used_bytes + size > budget.raw_batch_bytes:
                 break
+            if size > budget.raw_batch_bytes:
+                # 这一行自己就超闸：只送不含密文的占位（见 _oversize_placeholder），
+                # 本批到此为止。
+                payload_rows.append(_oversize_placeholder(projected))
+                break
+            payload_rows.append(projected)
+            used_bytes += size
         response = post("scan", {
             "rows": payload_rows,
             "query": normalized_query,
@@ -357,26 +453,25 @@ def run_history_search(
             and len(candidates) < batch.limit
         )
         if covered_whole_window:
+            touched.append((batch.min_seq, batch.max_seq))
             state = history_search.advance_scan_state(
                 shape, state, batch, exhausted=True)
         else:
+            touched.append((int(last_checked), batch.max_seq))
             state = history_search.advance_scan_state(
                 shape, state, batch, last_checked_seq=int(last_checked))
 
     scan_done = history_search.scan_complete(state)
 
     # coverage_gap（spec §4）：legacy_opaque 叶子覆盖的原文可能已被旧 retention
-    # 清理——其覆盖区一条可见 raw 行都不剩时，扫完也不能声称"历史里没有"。
-    coverage_gap = False
-    if legacy_leaves:
-        legacy_through = max(
-            max(int(l.get("legacy_opaque_through_seq") or 0), int(l.get("end_seq") or 0))
-            for l in legacy_leaves
-        )
-        if legacy_through >= 1:
-            probe = jobs_store.chat_history_candidate_rows(
-                str(user_id), min_seq=1, max_seq=min(legacy_through, snapshot), limit=1)
-            coverage_gap = not probe
+    # 清理，而它没有精确 source witness，"扫不到"和"本来就没有"分不开。
+    #
+    # 保守语义：本次扫描**触及**任何 legacy 覆盖区间即置 gap。曾经用一条
+    # LIMIT 1 探针问"这段还剩没剩行"，那只能发现整段被全清——覆盖 1–900 而
+    # 实际只剩 700–900 时探针照样命中，于是返回 complete=true，模型据此回答
+    # "历史里没有"。部分清理才是 retention 的常见形态，探针因此删掉。
+    coverage_gap = _touches_legacy_coverage(
+        touched, legacy_leaves, snapshot=snapshot)
 
     # 语义三态（spec §3.1）：complete=true 扫完且无缺口；complete=false+cursor
     # 还能翻页；complete=false 无 cursor 且 coverage_gap=true → 原文已不存在，
@@ -422,8 +517,8 @@ def run_history_fetch(
     user_id: str,
     *,
     message_id: str,
-    before: int = 2,
-    after: int = 2,
+    before: int = 15,
+    after: int = 4,
     runtime_token: str | None = None,
     budget: HistorySearchBudget | None = None,
     post_enclave=None,
@@ -431,14 +526,16 @@ def run_history_fetch(
     """单窗口锚点取回（spec §3.2）。
 
     锚点不可见/不存在统一返回 ``{"error": "not_found_or_not_visible"}``；
-    序列化总闸（≤1600 字符）与结构化缩减在批次 3 的 facade。
+    序列化总闸（≤4500 字符）与结构化缩减在 facade（capabilities/history.py）。
+    邻居数各钳 [0,15]，请求行数上限 31——31 条不保证都进最终 payload，装不下
+    多少由 facade 如实报进 ``omitted_before``/``omitted_after``。
     """
     budget = budget or HistorySearchBudget()
     post = post_enclave or (
         lambda operation, payload: _post_enclave_history(runtime_token, operation, payload))
     try:
-        n_before = max(0, min(int(before), 4))
-        n_after = max(0, min(int(after), 4))
+        n_before = max(0, min(int(before), FETCH_NEIGHBORS_MAX))
+        n_after = max(0, min(int(after), FETCH_NEIGHBORS_MAX))
     except (TypeError, ValueError):
         raise history_search.HistorySearchInputError("invalid_neighbor_count") from None
 

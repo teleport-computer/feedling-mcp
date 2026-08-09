@@ -24,12 +24,15 @@ executor 喂回模型的失败结果**只暴露 error code、不回显 message**
 """
 from __future__ import annotations
 
+import contextlib
+import contextvars
 import json
 import os
 
 from model_api_runtime.v2 import history_readside, history_search
 
 from capabilities import errors
+from capabilities import result_budget
 from capabilities.types import CapabilityResult, ok, err
 
 HISTORY_SEARCH_TOOL = "history_search"
@@ -39,20 +42,41 @@ HISTORY_TOOL_NAMES = frozenset({HISTORY_SEARCH_TOOL, HISTORY_FETCH_TOOL})
 ENABLED_ENV = "FEEDLING_V2_HISTORY_TOOLS_ENABLED"
 
 # 目标序列化尺寸（json.dumps(ensure_ascii=False) 的字符数，与 executor 的渲染
-# 完全同一种序列化）。search 1800 < executor 2000 单结果闸；fetch 1600（spec
-# §3.2 的完整 payload 限制）。注意 tool_loop 的同批 8000 字符水位在 8 个大结果
-# 混合时可把单结果额度压到 ~1000——每 round 只许 1 个 history 调用（worker 的
-# round gate）让其余 7 个都是 history 的概率为零，但**不能**保证兄弟结果总和
-# ≤6200；水位裁剪对 >1000 字符的结果仍是残余风险（cursor 本身可达 1024 字符，
-# 目标压到 1000 以下不可行）。
-SEARCH_RESULT_MAX_CHARS_ENV = "FEEDLING_V2_HISTORY_SEARCH_RESULT_MAX_CHARS"
-FETCH_RESULT_MAX_CHARS_ENV = "FEEDLING_V2_HISTORY_FETCH_RESULT_MAX_CHARS"
-DEFAULT_SEARCH_RESULT_MAX_CHARS = 1800
-DEFAULT_FETCH_RESULT_MAX_CHARS = 1600
+# 完全同一种序列化）。**数值不在这里定**——它们属于共享预算策略
+# ``capabilities/result_budget.py``（spec §3.3），executor 的单结果闸和
+# tool_loop 的同批水位读的是同一份。facade 只负责"按这个目标做结构化缩减"，
+# 自己无权决定预算：只在这一层放宽，下游两道切串闸会原样砍回去。
+SEARCH_RESULT_MAX_CHARS_ENV = result_budget.HISTORY_SEARCH_RESULT_MAX_CHARS_ENV
+FETCH_RESULT_MAX_CHARS_ENV = result_budget.HISTORY_FETCH_RESULT_MAX_CHARS_ENV
+DEFAULT_SEARCH_RESULT_MAX_CHARS = (
+    result_budget.DEFAULT_HISTORY_SEARCH_RESULT_MAX_CHARS)
+DEFAULT_FETCH_RESULT_MAX_CHARS = (
+    result_budget.DEFAULT_HISTORY_FETCH_RESULT_MAX_CHARS)
 
 # facade 层的 dispatch 拒绝（开关关闭）。executor 的 lane 拒绝用同一个词面，
 # 模型两处看到的都是 "error: tool_not_allowed"。
 TOOL_NOT_ALLOWED = "tool_not_allowed"
+
+
+# 回合剩余额度 → 本次调用的上限（spec §5）。worker 的 _HistoryTurnBudget 在
+# dispatch 之前 reserve 出剩余额度并用 ``call_limits`` 钉住这一次调用；
+# capability 在这里读。走 contextvar 而不是参数，是因为 run_capability 的签名
+# 对全部 capability 共用，为一个工具加一个 kwarg 会波及所有实现；contextvar
+# 由**可信的 worker** 设置，模型参数永远进不来，且 asyncio.to_thread 会把
+# 上下文带进执行线程。未设置（wake/subagent/直连/测试）= 纯 env 预算，行为不变。
+_CALL_LIMITS: contextvars.ContextVar[tuple[int, int] | None] = contextvars.ContextVar(
+    "feedling_history_call_limits", default=None
+)
+
+
+@contextlib.contextmanager
+def call_limits(*, max_rows: int, deadline_ms: int):
+    """Pin one history call's ceiling to what is left of the chat turn."""
+    token = _CALL_LIMITS.set((int(max_rows), int(deadline_ms)))
+    try:
+        yield
+    finally:
+        _CALL_LIMITS.reset(token)
 
 
 def enabled() -> bool:
@@ -84,7 +108,7 @@ def _budget_from_env() -> history_readside.HistorySearchBudget:
     cursor 确定性要求（history_readside._leaf_hint_ranges 的注释）：同一部署内
     这些值保持稳定，翻页期间重算的叶子命中段才一致；env 只该在部署级设置。
     """
-    return history_readside.HistorySearchBudget(
+    budget = history_readside.HistorySearchBudget(
         leaf_call_max_leaves=_int_env("FEEDLING_V2_HISTORY_LEAF_CALL_MAX_LEAVES", 64),
         leaf_call_max_bytes=_int_env(
             "FEEDLING_V2_HISTORY_LEAF_CALL_MAX_BYTES", 256 * 1024),
@@ -101,14 +125,19 @@ def _budget_from_env() -> history_readside.HistorySearchBudget:
             "FEEDLING_V2_HISTORY_CURSOR_TTL_SECONDS",
             float(history_search.DEFAULT_CURSOR_TTL_SECONDS)),
     )
+    limits = _CALL_LIMITS.get()
+    if limits is not None:
+        budget = history_readside.clamp_to_remaining(
+            budget, max_rows=limits[0], deadline_ms=limits[1])
+    return budget
 
 
 def _search_result_max_chars() -> int:
-    return _int_env(SEARCH_RESULT_MAX_CHARS_ENV, DEFAULT_SEARCH_RESULT_MAX_CHARS)
+    return result_budget.for_tool(HISTORY_SEARCH_TOOL).result_cap
 
 
 def _fetch_result_max_chars() -> int:
-    return _int_env(FETCH_RESULT_MAX_CHARS_ENV, DEFAULT_FETCH_RESULT_MAX_CHARS)
+    return result_budget.for_tool(HISTORY_FETCH_TOOL).result_cap
 
 
 def _rendered_chars(payload) -> int:
@@ -153,15 +182,34 @@ def _truncate_item_content(item: dict, cap: int) -> None:
         item["content_truncated"] = True
 
 
-_NEIGHBOR_CONTENT_SHRINK_STEPS = (300, 150)
-_ANCHOR_CONTENT_SHRINK_STEPS = (800, 400, 200, 100)
+# 骨架里每条消息保留的短摘录长度：够模型看出"这里有哪些消息、大概在说什么"，
+# 不够的部分由第 ② 步按远近补回来。
+_FETCH_EXCERPT_CHARS = 60
+
+
+def _neighbors_nearest_first(out: dict) -> list[dict]:
+    """锚点 → 贴身邻居 → 更远，交替向外。第 ② 步的补全顺序。"""
+    ordered: list[dict] = []
+    if isinstance(out.get("anchor"), dict):
+        ordered.append(out["anchor"])
+    before, after = out["before"], out["after"]
+    for step in range(max(len(before), len(after))):
+        if step < len(before):
+            ordered.append(before[len(before) - 1 - step])
+        if step < len(after):
+            ordered.append(after[step])
+    return ordered
 
 
 def _shrink_fetch_result(result: dict, *, max_chars: int) -> dict:
-    """序列化前把 fetch 结果缩到 ``max_chars`` 内（spec §3.2）。
+    """序列化前把 fetch 结果缩到 ``max_chars`` 内（spec §3.2 的缩减顺序）。
 
-    顺序：① 邻居正文逐级截短 → ② 砍最远的邻居（before 头部最旧 / after 尾部
-    最新，长边优先）→ ③ 最后才截锚点正文——锚点是这次调用的目的，尽量保全。
+    ① 先保证**所有**消息的结构 + 短摘录都在（让模型看得到这里有哪些消息）；
+    ② 再按离锚点由近到远补全正文；
+    ③ 最后才丢最远的消息，并如实计入 ``omitted_before``/``omitted_after``。
+
+    顺序不能反：先砍最远邻居会恰好砍掉这次把窗口放宽到 15 想找回的前文线索
+    ——"那家餐厅"的来龙去脉常常就在七八轮之前。锚点永远不丢。
     绝不序列化后切串。
     """
     out = dict(result)
@@ -169,25 +217,53 @@ def _shrink_fetch_result(result: dict, *, max_chars: int) -> dict:
     out["anchor"] = dict(anchor) if isinstance(anchor, dict) else anchor
     out["before"] = [dict(i) for i in (result.get("before") or [])]
     out["after"] = [dict(i) for i in (result.get("after") or [])]
+    # 计数字段常驻：模型必须能区分"就这么多"和"删过"，不能靠字段在不在猜。
+    out["omitted_before"] = 0
+    out["omitted_after"] = 0
     if _rendered_chars(out) <= max_chars:
         return out
-    for cap in _NEIGHBOR_CONTENT_SHRINK_STEPS:
-        for item in out["before"] + out["after"]:
-            _truncate_item_content(item, cap)
-        if _rendered_chars(out) <= max_chars:
-            return out
-    while out["before"] or out["after"]:
+
+    # ① 全员降到短摘录。原文（连同 enclave 给的 content_truncated）留一份，
+    # 第 ② 步按远近原样补回去。
+    originals = {
+        id(item): (item.get("content"), item.get("content_truncated"))
+        for item in _neighbors_nearest_first(out)
+        if isinstance(item.get("content"), str)
+    }
+    for item in _neighbors_nearest_first(out):
+        _truncate_item_content(item, _FETCH_EXCERPT_CHARS)
+
+    # ③（骨架都装不下才走）丢最远的：before 头部最旧 / after 尾部最新，长边
+    # 优先，锚点永不参与。
+    while _rendered_chars(out) > max_chars and (out["before"] or out["after"]):
         if out["before"] and len(out["before"]) >= len(out["after"]):
             out["before"].pop(0)
+            out["omitted_before"] += 1
         else:
             out["after"].pop()
-        if _rendered_chars(out) <= max_chars:
-            return out
-    if isinstance(out["anchor"], dict):
-        for cap in _ANCHOR_CONTENT_SHRINK_STEPS:
+            out["omitted_after"] += 1
+    if _rendered_chars(out) > max_chars and isinstance(out["anchor"], dict):
+        # 只剩锚点还超：截它的摘录（这是最后一道，锚点本身绝不删）。
+        for cap in (48, 24, 0):
             _truncate_item_content(out["anchor"], cap)
             if _rendered_chars(out) <= max_chars:
-                return out
+                break
+        return out
+
+    # ② 由近及远补全正文；某条补不进去不影响继续试更远的短消息。
+    for item in _neighbors_nearest_first(out):
+        content, truncated_flag = originals.get(id(item), (None, None))
+        if not isinstance(content, str) or content == item.get("content"):
+            continue
+        excerpt = item.get("content")
+        item["content"] = content
+        if truncated_flag is None:
+            item.pop("content_truncated", None)
+        else:
+            item["content_truncated"] = truncated_flag
+        if _rendered_chars(out) > max_chars:
+            item["content"] = excerpt
+            item["content_truncated"] = True
     return out
 
 
@@ -219,7 +295,6 @@ def search(store, *, api_key=None, runtime_token=None, params=None) -> Capabilit
         cursor_key = history_readside.derive_cursor_hmac_key()
     except RuntimeError:
         return err(errors.UNAVAILABLE, "history cursor key unavailable", retryable=False)
-    limit = params.get("limit")
     try:
         result = history_readside.run_history_search(
             str(store.user_id),
@@ -228,7 +303,10 @@ def search(store, *, api_key=None, runtime_token=None, params=None) -> Capabilit
             start=params.get("start"),
             end=params.get("end"),
             cursor=params.get("cursor"),
-            limit=3 if limit is None else limit,
+            # 原样传 None（= 模型省略了 limit）。折叠成默认值会让"续页只传
+            # cursor"的契约检查看不出模型到底传没传，cursor+limit 就会被静默
+            # 接受并改掉页大小。
+            limit=params.get("limit"),
             runtime_token=runtime_token,
             budget=_budget_from_env(),
         )
@@ -261,8 +339,11 @@ def fetch(store, *, api_key=None, runtime_token=None, params=None) -> Capability
         result = history_readside.run_history_fetch(
             str(store.user_id),
             message_id=message_id,
-            before=2 if before is None else before,
-            after=2 if after is None else after,
+            # spec §3.2 的不对称默认（before 15 / after 4）。
+            before=(history_readside.FETCH_BEFORE_DEFAULT
+                    if before is None else before),
+            after=(history_readside.FETCH_AFTER_DEFAULT
+                   if after is None else after),
             runtime_token=runtime_token,
             budget=_budget_from_env(),
         )

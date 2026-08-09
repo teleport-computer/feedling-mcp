@@ -604,10 +604,18 @@ def verify_cursor_request(
     query: str | None = None,
     start: str | None = None,
     end: str | None = None,
+    limit: int | None = None,
 ) -> None:
     """带 cursor 的调用只该传 cursor（spec §3.1）；显式重传的参数必须与
-    payload 记录严格一致，否则 ``cursor_mismatch``。None = 省略 = 通过。"""
+    payload 记录严格一致，否则 ``cursor_mismatch``。None = 省略 = 通过。
 
+    ``limit`` 是唯一没有"一致"可言的参数：它不进 cursor payload（页大小不属于
+    快照），所以续页重传任何值都只能是"改页大小"——包括恰好等于首调用值的那
+    个，因为签发方无从核对。一律按 mismatch 拒，词面与其余冲突一致。
+    """
+
+    if limit is not None:
+        raise CursorMismatch("limit")
     if query is not None and normalize_query(query) != cursor.query:
         raise CursorMismatch("query")
     if start is not None and parse_rfc3339_utc(start) != cursor.start_ts:

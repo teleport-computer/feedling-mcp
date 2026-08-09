@@ -36,7 +36,9 @@ _LEAF_ROWS_HARD_MAX = 256
 _LEAF_BYTES_HARD_MAX = 1 << 20          # 1 MiB 摘要密文
 _SCAN_ROWS_HARD_MAX = 512               # spec §5 单调用 raw 上限
 _SCAN_BYTES_HARD_MAX = 2 << 20          # 2 MiB
-_FETCH_ROWS_HARD_MAX = 16               # 1 anchor + 4 before + 4 after 的富余
+# 1 anchor + 15 before + 15 after = spec §3.2 的请求上限 31，再留一点富余。
+# 这个数字装不下上游窗口时，所有上游放宽都会被这里静默砍回去。
+_FETCH_ROWS_HARD_MAX = 32
 _SNIPPET_HARD_MAX = 240                 # spec §3.1
 _DEADLINE_MS_HARD_MAX = 30_000
 _FETCH_CONTENT_HARD_MAX = 4_000
@@ -182,16 +184,26 @@ async def v1_history_leaf_hints(request: Request):
         for leaf in leaves:
             if not isinstance(leaf, dict):
                 continue
-            if checked >= max_leaves or used_bytes >= max_bytes:
+            env = leaf.get("summary_envelope")
+            size = (
+                len(str(env.get("body_ct") or "")) if isinstance(env, dict) else 0
+            )
+            # 字节闸判在这片叶子**进批之前**（同 /scan）：先加后判等于每批都
+            # 允许超支一整片，一片超大摘要就能把闸穿过去。
+            if checked >= max_leaves or (checked and used_bytes + size > max_bytes):
                 # 先到者停（spec §5）；没扫到的叶子由调用方的 raw 兜底覆盖。
                 truncated = True
                 break
             checked += 1
-            env = leaf.get("summary_envelope")
-            if isinstance(env, dict):
-                used_bytes += len(str(env.get("body_ct") or ""))
+            used_bytes += size
             if not isinstance(env, dict) or not env.get("K_enclave"):
                 unavailable += 1
+                continue
+            if size > max_bytes:
+                # 单叶自身就装不下：不解密（这类明文可能极大），按不可用计，
+                # 它覆盖的那段由调用方的 raw 兜底扫。
+                unavailable += 1
+                truncated = True
                 continue
             try:
                 text = envelope.decrypt_envelope(
@@ -271,7 +283,11 @@ async def v1_history_scan(request: Request):
         for row in rows:
             if not isinstance(row, dict):
                 continue
-            if checked >= max_rows or used_bytes >= max_bytes:
+            size = _ciphertext_size(row)
+            # 字节闸判在这一行**进批之前**：先加后判等于每批都允许超支一整
+            # 行，首条 5 MiB 的密文能直接穿过 512 KiB 的闸。第一行永远放行
+            # （否则批批空转），它自身超限的情况在下面单独处理。
+            if checked >= max_rows or (checked and used_bytes + size > max_bytes):
                 truncated = True
                 stopped = "budget"
                 break
@@ -279,11 +295,18 @@ async def v1_history_scan(request: Request):
                 stopped = "deadline"
                 break
             checked += 1
-            used_bytes += _ciphertext_size(row)
+            used_bytes += size
             seq = int(row.get("seq") or 0)
             # 本行进入检查即推进 last_checked_seq：解密失败（unavailable）也算
             # "检查过"，否则 cursor 会永远卡在一条坏行前面重扫。
             last_checked_seq = seq
+            if size > max_bytes or row.get("oversize"):
+                # 单行自身就装不下（``oversize`` = 调用方已按同一规则剥掉密文
+                # 送来的占位）：绝不解密——这类明文可达 MB 级。算检查过 +
+                # unavailable，cursor 才能越过它；否则下一页撞上同一行，死循环。
+                unavailable += 1
+                truncated = True
+                continue
             text = _decrypt_row_text(row, user_id or "", content_sk)
             if text is None:
                 unavailable += 1

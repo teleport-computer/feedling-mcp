@@ -367,6 +367,17 @@ def test_cursor_condition_mismatch_vs_consistent_resend():
         hs.verify_cursor_request(decoded, end="2026-03-01T00:00:00Z")
 
 
+def test_cursor_paging_rejects_any_explicit_limit():
+    """续页只传 cursor（spec §3.1）：limit 不进 cursor payload，重传任何值都
+    会改页大小 → 一律 cursor_mismatch，词面与 query/start/end 冲突一致。"""
+    decoded = hs.decode_cursor(hs.encode_cursor(_cursor(), key=KEY), key=KEY, now=1.0)
+    hs.verify_cursor_request(decoded)            # 省略 limit：合法
+    hs.verify_cursor_request(decoded, limit=None)
+    for bad in (1, 3, 5):
+        with pytest.raises(hs.CursorMismatch):
+            hs.verify_cursor_request(decoded, limit=bad)
+
+
 def test_cursor_long_cjk_query_roundtrip_within_limit():
     # 128 个不重复汉字（可压缩性差的近似）仍在 1024 内往返
     query = "".join(chr(0x4E00 + i) for i in range(128))

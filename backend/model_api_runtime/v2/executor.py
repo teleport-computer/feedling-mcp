@@ -18,6 +18,7 @@ from capabilities import tool_schema
 from capabilities import history as cap_history
 from capabilities import identity as cap_identity
 from capabilities import activity_metadata
+from capabilities import result_budget
 from model_api_runtime.v2 import provenance as _prov
 from provider_types import ToolResult
 from workspace.backends import WorkspaceError, model_writable_path
@@ -87,7 +88,13 @@ def _summarize_capability_result(data: dict, *, tool_name: str = "") -> str:
     if not payload:
         return "ok"
     rendered = json.dumps(payload, ensure_ascii=False)
-    if len(rendered) > _RESULT_CHAR_CAP:
+    # 共享预算策略（capabilities/result_budget.py）优先于通用闸。没有策略的
+    # 工具（=绝大多数）拿到的仍是 _RESULT_CHAR_CAP，行为不变。
+    policy = result_budget.for_tool(tool_name)
+    result_cap = policy.result_cap if policy is not None else _RESULT_CHAR_CAP
+    # atomic_json 的生产者在序列化前就结构化缩到了同一个 result_cap，所以下面
+    # 这段对它来说到不了；保留它只是不让任何 capability 无界地喂回来。
+    if len(rendered) > result_cap:
         marker = "...[truncated]"
         if str(tool_name) in {"memory_index", "memory_search"}:
             total = payload.get("total") if isinstance(payload, dict) else None
@@ -98,7 +105,7 @@ def _summarize_capability_result(data: dict, *, tool_name: str = "") -> str:
                     f"{returned} of {total} total cards. Use memory_index with "
                     "bucket or thread filters to browse partitions.]"
                 )
-        legacy_cap = _RESULT_CHAR_CAP + len("...[truncated]")
+        legacy_cap = result_cap + len("...[truncated]")
         prefix_cap = max(0, legacy_cap - len(marker))
         rendered = rendered[:prefix_cap] + marker
     return rendered

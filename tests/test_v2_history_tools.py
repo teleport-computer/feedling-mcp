@@ -256,10 +256,63 @@ def test_fetch_facade_not_found_and_defaults(monkeypatch):
     result = cap_history.fetch(_STORE, params={"message_id": "m1"})
     assert not result.ok
     assert result.error["code"] == "not_found_or_not_visible"
-    assert captured["before"] == 2 and captured["after"] == 2
+    assert captured["before"] == 15 and captured["after"] == 4
 
     missing = cap_history.fetch(_STORE, params={})
     assert not missing.ok and missing.error["code"] == cap_errors.INVALID
+
+
+def test_fetch_window_defaults_are_asymmetric(monkeypatch):
+    """spec §3.2：before 默认 15 / after 默认 4（线索几乎总在前文里）。"""
+    _patch_secret(monkeypatch)
+    monkeypatch.delenv(cap_history.ENABLED_ENV, raising=False)
+    captured = {}
+
+    def _fn(user_id, **kwargs):
+        captured.update(kwargs)
+        return {"anchor": None, "before": [], "after": [], "unavailable_count": 0}
+
+    monkeypatch.setattr(history_readside, "run_history_fetch", _fn)
+    cap_history.fetch(_STORE, params={"message_id": "m1"})
+    assert captured["before"] == 15 and captured["after"] == 4
+
+
+def test_fetch_neighbor_counts_clamped_to_15(monkeypatch):
+    """readside 侧钳 [0,15]（请求上限 31 条），越界不报错、按上限走。"""
+    posted = {}
+
+    def _post(op, payload):
+        posted["before"] = len(payload["before"])
+        posted["after"] = len(payload["after"])
+        return {"anchor": {"message_id": "a", "content": "x"},
+                "before": [], "after": [], "unavailable_count": 0}
+
+    monkeypatch.setattr(
+        history_readside.jobs_store, "chat_history_anchor_row",
+        lambda uid, mid: {"id": mid, "seq": 50, "ts": 1.0, "role": "user",
+                          "content_type": "text", "v": 1,
+                          "owner_user_id": uid, "body_ct": "c",
+                          "nonce": "n", "K_enclave": "k"})
+    asked = {}
+
+    def _neighbors(uid, seq, *, before, after):
+        asked["before"], asked["after"] = before, after
+        return [], []
+
+    monkeypatch.setattr(
+        history_readside.jobs_store, "chat_history_neighbor_rows", _neighbors)
+    history_readside.run_history_fetch(
+        "usr_a", message_id="m1", before=99, after=99, post_enclave=_post)
+    assert asked == {"before": 15, "after": 15}
+    history_readside.run_history_fetch(
+        "usr_a", message_id="m1", before=-3, after=-1, post_enclave=_post)
+    assert asked == {"before": 0, "after": 0}
+
+
+def test_fetch_tool_schema_documents_the_wider_window():
+    desc = tool_schema.DESCRIPTIONS["history_fetch"]
+    assert "0-15" in desc
+    assert "15" in desc and "4" in desc
 
 
 # ---------------------------------------------------------------------------
@@ -313,6 +366,61 @@ def _fetch_item(i: int, chars: int) -> dict:
     }
 
 
+def _wide_fetch_result(*, before=15, after=4, chars=300, anchor_chars=900) -> dict:
+    """spec §3.2 的请求上限形态：before 15 / after 4，anchor 只出现一次。"""
+    return {
+        "anchor": _fetch_item(0, anchor_chars),
+        "before": [_fetch_item(-i, chars) for i in range(before, 0, -1)],
+        "after": [_fetch_item(i, chars) for i in range(1, after + 1)],
+        "unavailable_count": 0,
+    }
+
+
+def test_fetch_shrink_keeps_every_message_before_dropping_any():
+    """spec §3.2 缩减顺序：①全员结构+短摘录 → ②近邻补全正文 → ③才丢最远的。
+
+    反过来（先砍最远邻居）恰好砍掉这次把窗口放宽到 15 想找回的前文线索。
+    """
+    result = _wide_fetch_result()
+    assert cap_history._rendered_chars(result) > 4500
+    shrunk = cap_history._shrink_fetch_result(result, max_chars=4500)
+    rendered = json.dumps(shrunk, ensure_ascii=False)
+    assert len(rendered) <= 4500
+    parsed = json.loads(rendered)
+    # ① 一条都没丢：19 条邻居的结构和摘录都在
+    assert len(parsed["before"]) == 15 and len(parsed["after"]) == 4
+    assert parsed["omitted_before"] == 0 and parsed["omitted_after"] == 0
+    assert all(item["content"] for item in parsed["before"] + parsed["after"])
+    # ② 锚点与贴身近邻拿到完整正文，最远的只剩摘录
+    assert parsed["anchor"]["content"] == "话" * 900
+    assert len(parsed["before"][-1]["content"]) > len(parsed["before"][0]["content"])
+
+
+def test_fetch_shrink_drops_farthest_only_when_skeleton_does_not_fit():
+    """骨架本身都装不下时才丢消息，并如实计入 omitted_*（锚点永不丢）。"""
+    result = _wide_fetch_result(chars=200, anchor_chars=200)
+    shrunk = cap_history._shrink_fetch_result(result, max_chars=1200)
+    rendered = json.dumps(shrunk, ensure_ascii=False)
+    assert len(rendered) <= 1200
+    parsed = json.loads(rendered)
+    assert parsed["anchor"]["message_id"] == "n_0"
+    assert parsed["omitted_before"] + parsed["omitted_after"] > 0
+    # 丢了多少如实报：两侧各自守恒
+    assert len(parsed["before"]) + parsed["omitted_before"] == 15
+    assert len(parsed["after"]) + parsed["omitted_after"] == 4
+    # 丢的是最远的：留下来的 before 尾部仍贴着锚点
+    if parsed["before"]:
+        assert parsed["before"][-1]["message_id"] == "n_-1"
+
+
+def test_fetch_shrink_reports_zero_omissions_when_nothing_is_cut():
+    small = {"anchor": _fetch_item(0, 10), "before": [], "after": [],
+             "unavailable_count": 0}
+    shrunk = cap_history._shrink_fetch_result(small, max_chars=4500)
+    assert shrunk["omitted_before"] == 0 and shrunk["omitted_after"] == 0
+    assert shrunk["anchor"] == small["anchor"]
+
+
 def test_fetch_result_shrinks_to_cap_anchor_last():
     result = {
         "anchor": _fetch_item(0, 900),
@@ -327,7 +435,10 @@ def test_fetch_result_shrinks_to_cap_anchor_last():
     parsed = json.loads(rendered)
     # 锚点是这次调用的目的：永远保留（正文最后才截）。
     assert parsed["anchor"]["message_id"] == "n_0"
-    assert len(parsed["before"]) + len(parsed["after"]) < 8
+    # 骨架装得下 → 8 条邻居一条不丢，只是正文缩成摘录（spec §3.2 缩减顺序）。
+    assert len(parsed["before"]) == 4 and len(parsed["after"]) == 4
+    assert parsed["omitted_before"] == 0 and parsed["omitted_after"] == 0
+    assert all(item["content_truncated"] for item in parsed["before"][:1])
 
 
 def test_fetch_result_neighbor_drop_farthest_first():
@@ -415,7 +526,8 @@ def test_executor_dispatches_history_when_allowed(monkeypatch):
         history_tools_allowed=True, run_capability=_run, monkeypatch=monkeypatch)
     parsed = json.loads(results[0].content)
     assert parsed["complete"] is True
-    assert results[0].metadata == {"history_scanned_rows": 42}
+    assert results[0].metadata == {
+        "history_scanned_rows": 42, "result_budget_kind": "history_search"}
 
 
 def test_history_result_survives_double_truncation_in_mixed_batch(monkeypatch):
@@ -454,6 +566,105 @@ def test_history_result_survives_double_truncation_in_mixed_batch(monkeypatch):
     parsed = json.loads(history_after.content)
     assert parsed["next_cursor"] == "c" * 1024
     assert [m["message_id"] for m in parsed["matches"]]
+
+
+def test_history_fetch_full_window_survives_worst_case_sibling_batch(monkeypatch):
+    """§3.3 协议测试，真实最坏批形：history_fetch 顶满 4500 + 7 个各 ≥2000
+    的兄弟。atomic_json 结果整额预留、逐字节不切；同批总量 ≤ 8000+2500。
+
+    不许用短 "ok" 结果凑数释放水位——那正好绕开了要测的东西。
+    """
+    shrunk = cap_history._shrink_fetch_result(
+        _wide_fetch_result(), max_chars=4500)
+
+    def _run(action_type, store, **kw):
+        assert action_type == "history_fetch"
+        return _FakeCapResult(data=shrunk)
+
+    (fetch_result,) = _dispatch(
+        [ToolCall(id="h1", name="history_fetch", args={"message_id": "m1"})],
+        history_tools_allowed=True, run_capability=_run, monkeypatch=monkeypatch)
+    # 第一层：executor 的单结果闸按共享策略抬到 4500，没有切串。
+    assert 2000 < len(fetch_result.content) <= 4500
+    assert "[truncated]" not in fetch_result.content
+    assert json.loads(fetch_result.content)["anchor"]["message_id"] == "n_0"
+
+    batch = [fetch_result] + [
+        ToolResult(call_id=f"w{i}", content=f"W{i}" * 1000) for i in range(7)
+    ]
+    assert len(batch) == 8
+    assert all(len(r.content) >= 2000 for r in batch[1:])
+    normalized = v2_tool_loop._normalize_tool_results(
+        batch,
+        per_result_cap=v2_tool_loop.DEFAULT_TOOL_RESULT_CHAR_CAP,
+        batch_cap=v2_tool_loop.DEFAULT_TOOL_BATCH_RESULT_CHAR_CAP,
+    )
+    after = {r.call_id: r.content for r in normalized}
+    # atomic_json：逐字节不动，仍是完整 JSON
+    assert after["h1"] == fetch_result.content
+    json.loads(after["h1"])
+    # 同批总预算抬到 8000+2500，兄弟们分摊剩下的（不是被压到 ~500）
+    total = sum(len(c) for c in after.values())
+    assert total <= 10500
+    for i in range(7):
+        assert len(after[f"w{i}"]) >= 700
+
+
+def test_history_search_result_survives_seven_maxed_siblings(monkeypatch):
+    """Codex 复现的最坏批形：~1700 字符 history_search + 7 个 2000 顶格兄弟。
+    旧水位分摊会把它砍到 ~1000（Unterminated string）。"""
+    shrunk = cap_history._shrink_search_result(
+        _search_result(matches=[_match(i) for i in range(5)],
+                       next_cursor="c" * 1024),
+        max_chars=1800)
+
+    def _run(action_type, store, **kw):
+        return _FakeCapResult(data=shrunk)
+
+    (history_result,) = _dispatch(
+        [ToolCall(id="h1", name="history_search", args={"query": "x"})],
+        history_tools_allowed=True, run_capability=_run, monkeypatch=monkeypatch)
+    assert len(history_result.content) > 1600  # 顶格 history 结果
+    batch = [history_result] + [
+        ToolResult(call_id=f"w{i}", content=f"W{i}" * 1000) for i in range(7)
+    ]
+    normalized = v2_tool_loop._normalize_tool_results(
+        batch,
+        per_result_cap=v2_tool_loop.DEFAULT_TOOL_RESULT_CHAR_CAP,
+        batch_cap=v2_tool_loop.DEFAULT_TOOL_BATCH_RESULT_CHAR_CAP,
+    )
+    history_after = next(r for r in normalized if r.call_id == "h1")
+    assert history_after.content == history_result.content
+    assert json.loads(history_after.content)["next_cursor"] == "c" * 1024
+
+
+def test_batch_without_history_results_is_byte_identical(monkeypatch):
+    """最小侵入证明：批里没有 history 结果时，分配结果逐字节不变。
+
+    直接对着水位算法本身核（``_result_quotas`` + 单结果闸），而不是抄一份
+    期望值——任何"顺手"改动共享路径的行为都会在这里现形。
+    """
+    contents = ["A" * 3000, "B" * 2500, "C" * 10, "D" * 1800, "E" * 900,
+                "F" * 5, "G" * 2000, "H" * 2000]
+    batch = [ToolResult(call_id=f"c{i}", content=c) for i, c in enumerate(contents)]
+    normalized = v2_tool_loop._normalize_tool_results(
+        batch,
+        per_result_cap=v2_tool_loop.DEFAULT_TOOL_RESULT_CHAR_CAP,
+        batch_cap=v2_tool_loop.DEFAULT_TOOL_BATCH_RESULT_CHAR_CAP,
+    )
+    capped = [
+        v2_tool_loop._truncate_result_content(
+            c, v2_tool_loop.DEFAULT_TOOL_RESULT_CHAR_CAP)
+        for c in contents
+    ]
+    quotas = v2_tool_loop._result_quotas(
+        [len(c) for c in capped], v2_tool_loop.DEFAULT_TOOL_BATCH_RESULT_CHAR_CAP)
+    expected = [
+        v2_tool_loop._truncate_result_content(c, q) for c, q in zip(capped, quotas)
+    ]
+    assert [r.content for r in normalized] == expected
+    assert sum(len(c) for c in expected) <= (
+        v2_tool_loop.DEFAULT_TOOL_BATCH_RESULT_CHAR_CAP)
 
 
 def test_error_results_are_json_free_and_stable(monkeypatch):
@@ -588,11 +799,11 @@ def test_history_round_gate_one_call_per_round():
 
 def test_history_turn_budget_accumulates_rows_across_rounds():
     budget = worker._HistoryTurnBudget(max_rows=1500, max_wall_sec=8)
-    started = budget.start_call()
-    budget.finish_call(started, scanned_rows=800)
+    budget.settle_call(budget.reserve_call(), scanned_rows=800)
     assert not budget.exhausted()
-    budget.finish_call(budget.start_call(), scanned_rows=800)
+    budget.settle_call(budget.reserve_call(), scanned_rows=800)
     assert budget.exhausted()  # 800+800 >= 1500，跨 round 累计
+    assert budget.reserve_call() is None
     calls = [ToolCall(id="h1", name="history_search", args={"query": "x"})]
     blocked = worker._history_round_blocked_results(calls, budget=budget)
     assert blocked["h1"].content == worker._HISTORY_TURN_BUDGET_ERROR
@@ -602,19 +813,90 @@ def test_history_turn_budget_wall_clock():
     now = [100.0]
     budget = worker._HistoryTurnBudget(
         max_rows=1500, max_wall_sec=8, clock=lambda: now[0])
-    started = budget.start_call()
+    lease = budget.reserve_call()
     now[0] += 5.0
-    budget.finish_call(started, scanned_rows=10)
+    budget.settle_call(lease, scanned_rows=10)
     assert not budget.exhausted()
-    started = budget.start_call()
+    lease = budget.reserve_call()
     now[0] += 3.5
-    budget.finish_call(started, scanned_rows=10)
+    budget.settle_call(lease, scanned_rows=10)
     assert budget.exhausted()  # 5s + 3.5s >= 8s
+
+
+def test_history_turn_budget_reserves_rows_before_the_call():
+    """1499/1500 行已用时，下一次调用只许扫 1 行——不是照样放行 512 行。
+
+    先调用后结算的旧写法把回合闸变成了"超限后才拦下一次"：单次上限 512、
+    回合上限 1500，实际最坏能扫到 2011 行。
+    """
+    budget = worker._HistoryTurnBudget(max_rows=1500, max_wall_sec=8)
+    budget.settle_call(budget.reserve_call(), scanned_rows=1499)
+    assert not budget.exhausted()
+    lease = budget.reserve_call()
+    assert lease is not None and lease.max_rows == 1
+    call_budget = history_readside.clamp_to_remaining(
+        history_readside.HistorySearchBudget(),
+        max_rows=lease.max_rows, deadline_ms=lease.deadline_ms)
+    assert call_budget.call_max_rows == 1          # 不是 512
+    assert call_budget.raw_batch_rows == 128       # 其余闸不动
+
+
+def test_history_turn_budget_reserves_wall_time_before_the_call():
+    """7.9s/8s 已用时，下一次调用的 deadline 只剩 100ms——不是照样给 2.5s。"""
+    now = [100.0]
+    budget = worker._HistoryTurnBudget(
+        max_rows=1500, max_wall_sec=8, clock=lambda: now[0])
+    lease = budget.reserve_call()
+    now[0] += 7.9
+    budget.settle_call(lease, scanned_rows=1)
+    assert not budget.exhausted()
+    lease = budget.reserve_call()
+    assert lease.deadline_ms == 100
+    call_budget = history_readside.clamp_to_remaining(
+        history_readside.HistorySearchBudget(),
+        max_rows=lease.max_rows, deadline_ms=lease.deadline_ms)
+    assert call_budget.call_deadline_ms == 100     # 不是 2500
+
+
+def test_clamp_to_remaining_never_raises_the_configured_budget():
+    base = history_readside.HistorySearchBudget(
+        call_max_rows=100, call_deadline_ms=500)
+    same = history_readside.clamp_to_remaining(
+        base, max_rows=10_000, deadline_ms=99_999)
+    assert same.call_max_rows == 100 and same.call_deadline_ms == 500
+
+
+def test_facade_applies_the_turn_call_clamp(monkeypatch):
+    """worker 把回合剩余额度通过可信通道钉进本次调用的 budget。"""
+    _patch_secret(monkeypatch)
+    monkeypatch.delenv(cap_history.ENABLED_ENV, raising=False)
+    captured = {}
+
+    def _fn(user_id, **kwargs):
+        captured.update(kwargs)
+        return _search_result(complete=True, next_cursor=None)
+
+    monkeypatch.setattr(history_readside, "run_history_search", _fn)
+    with cap_history.call_limits(max_rows=7, deadline_ms=120):
+        cap_history.search(_STORE, params={"query": "x"})
+    assert captured["budget"].call_max_rows == 7
+    assert captured["budget"].call_deadline_ms == 120
+    # 出了作用域立刻恢复（绝不泄漏给下一次调用）
+    cap_history.search(_STORE, params={"query": "x"})
+    assert captured["budget"].call_max_rows == 512
+    assert captured["budget"].call_deadline_ms == 2500
+
+
+def test_chat_lane_source_reserves_history_budget_before_dispatch():
+    source = inspect.getsource(worker.process_job)
+    assert "reserve_call()" in source
+    assert "settle_call(" in source
+    assert "cap_history.call_limits(" in source
 
 
 def test_history_round_gate_untouched_without_history_calls():
     budget = worker._HistoryTurnBudget(max_rows=1, max_wall_sec=0.001)
-    budget.finish_call(budget.start_call(), scanned_rows=5)
+    budget.settle_call(budget.reserve_call(), scanned_rows=5)
     calls = [
         ToolCall(id="m1", name="memory_search", args={"query": "x"}),
         ToolCall(id="w1", name="web_search", args={"query": "x"}),
@@ -641,15 +923,31 @@ def test_facade_switch_off_is_dispatch_denial_end_to_end(monkeypatch):
 def test_history_result_metadata_projection():
     search_ok = {"ok": True, "data": _search_result(scanned=7)}
     assert activity_metadata.history_result_metadata(
-        "history_search", search_ok) == {"history_scanned_rows": 7}
+        "history_search", search_ok) == {
+            "history_scanned_rows": 7, "result_budget_kind": "history_search"}
     fetch_ok = {"ok": True, "data": {
-        "anchor": {}, "before": [{}, {}], "after": [{}], "unavailable_count": 0}}
+        "anchor": {}, "before": [{}, {}], "after": [{}], "unavailable_count": 0,
+        "omitted_before": 0, "omitted_after": 0}}
     assert activity_metadata.history_result_metadata(
-        "history_fetch", fetch_ok) == {"history_scanned_rows": 4}
+        "history_fetch", fetch_ok) == {
+            "history_scanned_rows": 4, "result_budget_kind": "history_fetch"}
     assert activity_metadata.history_result_metadata(
         "memory_search", search_ok) == {}
     assert activity_metadata.history_result_metadata(
         "history_search", {"ok": False}) == {}
+
+
+def test_fetch_row_accounting_counts_messages_dropped_by_the_shrink():
+    """回合预算按**结构化缩减前**的真实扫描行数记账。
+
+    缩减丢掉的邻居已经在 enclave 里解密过了，按缩减后的列表记账 = 每次 fetch
+    都少算一截，窗口放宽到 31 条之后失真最大。
+    """
+    shrunk = {"ok": True, "data": {
+        "anchor": {}, "before": [{}, {}], "after": [{}],
+        "unavailable_count": 0, "omitted_before": 13, "omitted_after": 3}}
+    assert activity_metadata.history_result_metadata(
+        "history_fetch", shrunk)["history_scanned_rows"] == 1 + 3 + 16
 
 
 def test_turn_budget_rejects_invalid_config():

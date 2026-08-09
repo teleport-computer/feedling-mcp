@@ -1424,6 +1424,15 @@ class _McpTurnWallBudget:
         self.used_sec = min(self.limit_sec, self.used_sec + elapsed)
 
 
+@dataclass(frozen=True)
+class _HistoryCallLease:
+    """What one history call is allowed to spend, decided before it starts."""
+
+    max_rows: int
+    deadline_ms: int
+    started_at: float
+
+
 @dataclass
 class _HistoryTurnBudget:
     """Cumulative history-tool budget shared by one chat turn (spec §5).
@@ -1439,6 +1448,14 @@ class _HistoryTurnBudget:
     around the whole executor dispatch, which deliberately over-counts DB and
     transport time — conservative in the same direction as
     ``_McpTurnWallBudget``.
+
+    Reserve BEFORE the call, settle after (``reserve_call``/``settle_call``).
+    Only checking "is it exhausted?" up front turns the turn budget into a
+    limit on the call *after* the offending one: at 1499/1500 used rows the
+    next call would still be handed the full per-call 512, and at 7.9s/8s the
+    full 2.5s — so a turn could really scan 2011 rows in 10.4s. The lease
+    carries the remainder, and the facade clamps this call's per-call budget
+    down to it.
     """
 
     max_rows: int
@@ -1459,11 +1476,25 @@ class _HistoryTurnBudget:
     def exhausted(self) -> bool:
         return self.used_rows >= self.max_rows or self.used_sec >= self.max_wall_sec
 
-    def start_call(self) -> float:
-        return float(self.clock())
+    def remaining_rows(self) -> int:
+        return max(0, self.max_rows - self.used_rows)
 
-    def finish_call(self, started_at: float, *, scanned_rows: int = 0) -> None:
-        elapsed = max(0.0, float(self.clock()) - float(started_at))
+    def remaining_ms(self) -> int:
+        return max(0, round((self.max_wall_sec - self.used_sec) * 1000))
+
+    def reserve_call(self) -> _HistoryCallLease | None:
+        """Lease this turn's remaining budget to one call; None = exhausted."""
+        if self.exhausted():
+            return None
+        return _HistoryCallLease(
+            max_rows=self.remaining_rows(),
+            deadline_ms=self.remaining_ms(),
+            started_at=float(self.clock()),
+        )
+
+    def settle_call(self, lease: _HistoryCallLease, *, scanned_rows: int = 0) -> None:
+        """Charge what the call actually spent (rows come from trusted metadata)."""
+        elapsed = max(0.0, float(self.clock()) - float(lease.started_at))
         self.used_sec += elapsed
         self.used_rows += max(0, int(scanned_rows))
 
@@ -11063,35 +11094,44 @@ async def process_job(
                 # lock covers a budget exhausted by an earlier round after the
                 # round gate already ran.
                 async with history_turn_budget.lock:
-                    if history_turn_budget.exhausted():
+                    lease = history_turn_budget.reserve_call()
+                    if lease is None:
                         return ToolResult(
                             call_id=tc.id, content=_HISTORY_TURN_BUDGET_ERROR
                         )
-                    started_at = history_turn_budget.start_call()
                     scanned_rows = 0
                     try:
-                        (result,) = await v2_executor.dispatch_tool_calls(
-                            [tc],
-                            store=store,
-                            api_key=api_key,
-                            runtime_token=runtime_token,
-                            enclave_sem=enclave_sem,
-                            turn_authorization=(mutation_recovery_barrier is None),
-                            enqueue_write_effect=_enqueue_write_effect,
-                            before_write=_before_write,
-                            observe_photo=observe_photo,
-                            read_parallelism=1,
-                            # Dispatch half of the double gate: chat lane, and
-                            # only while the switch resolved ON for this turn.
-                            history_tools_allowed=history_tools_offered,
-                        )
+                        # The lease is what is left of the TURN, pushed down as
+                        # this call's ceiling: 1 remaining row must not buy
+                        # another full 512-row scan. cap_history reads it at the
+                        # capability boundary (trusted context, never args).
+                        with cap_history.call_limits(
+                            max_rows=lease.max_rows, deadline_ms=lease.deadline_ms
+                        ):
+                            (result,) = await v2_executor.dispatch_tool_calls(
+                                [tc],
+                                store=store,
+                                api_key=api_key,
+                                runtime_token=runtime_token,
+                                enclave_sem=enclave_sem,
+                                turn_authorization=(
+                                    mutation_recovery_barrier is None),
+                                enqueue_write_effect=_enqueue_write_effect,
+                                before_write=_before_write,
+                                observe_photo=observe_photo,
+                                read_parallelism=1,
+                                # Dispatch half of the double gate: chat lane,
+                                # and only while the switch resolved ON for
+                                # this turn.
+                                history_tools_allowed=history_tools_offered,
+                            )
                         rows = (result.metadata or {}).get("history_scanned_rows")
                         if isinstance(rows, int) and not isinstance(rows, bool):
                             scanned_rows = rows
                     finally:
                         effect_reservations.mark_ready(tc)
-                        history_turn_budget.finish_call(
-                            started_at, scanned_rows=scanned_rows
+                        history_turn_budget.settle_call(
+                            lease, scanned_rows=scanned_rows
                         )
                 return result
 

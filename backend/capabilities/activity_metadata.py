@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from typing import Any, Mapping
 
+from capabilities import result_budget
 from memory.prompts_v1 import COMMON_BUCKETS_V1
 
 
@@ -105,5 +106,23 @@ def history_result_metadata(tool_name: str, result: Mapping[str, Any]) -> dict:
     else:
         before = data.get("before") if isinstance(data.get("before"), list) else []
         after = data.get("after") if isinstance(data.get("after"), list) else []
-        rows = 1 + len(before) + len(after)
-    return {"history_scanned_rows": max(0, rows)}
+        # 加回结构化缩减丢掉的邻居：那些行**已经**在 enclave 里解密过了，
+        # 只是没进最终 payload。按缩减后的列表记账会让回合预算少算一截，正好
+        # 在窗口放宽到 31 条之后失真最大。
+        rows = 1 + len(before) + len(after) + _omitted(data)
+    return {
+        "history_scanned_rows": max(0, rows),
+        # 共享预算策略的类型标记（capabilities/result_budget.py）：executor 与
+        # tool_loop 据此认出"这是必须整额保住的 JSON 结果"。走可信 metadata
+        # 通道，provider 文本永远进不来。
+        result_budget.RESULT_KIND_METADATA_KEY: str(tool_name),
+    }
+
+
+def _omitted(data: Mapping[str, Any]) -> int:
+    total = 0
+    for key in ("omitted_before", "omitted_after"):
+        value = data.get(key)
+        if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+            total += value
+    return total

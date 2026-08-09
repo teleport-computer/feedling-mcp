@@ -121,7 +121,8 @@ PARAMS: dict[str, dict] = {
         "required": [],
     },
     # history.fetch(store, ...): params.get("message_id") (required) +
-    # before/after neighbor counts (each clamped to [0,4], default 2).
+    # before/after neighbor counts (each clamped to [0,15]; defaults are
+    # deliberately asymmetric — before 15, after 4, spec §3.2).
     "history_fetch": {
         "type": "object",
         "properties": {"message_id": _STR, "before": _INT, "after": _INT},
@@ -403,8 +404,12 @@ DESCRIPTIONS: dict[str, str] = {
     "history_fetch": (
         "Fetch ONE full history message by message_id (obtained from "
         "history_search) together with its neighbors in conversation order: "
-        "'before'/'after' counts 0-4 (default 2). Single window, no paging; "
-        "anchor appears exactly once, before/after are ordered old→new. "
+        "'before'/'after' counts 0-15, defaulting to 15 before and 4 after "
+        "(the clue you are after is almost always earlier in the "
+        "conversation). Single window, no paging; anchor appears exactly "
+        "once, before/after are ordered old→new. Messages that did not fit "
+        "the size budget are reported as omitted_before/omitted_after — "
+        "raise nothing, just narrow the window if you need more of each. "
         "not_found_or_not_visible means the id does not exist or cannot be "
         "read — do not retry with the same id."),
     "memory_fetch": ("Fetch the most relevant ids chosen from the current index/search "
