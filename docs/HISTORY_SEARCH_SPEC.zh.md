@@ -74,24 +74,56 @@ history_search(query?: string, start?: string, end?: string,
 history_fetch(message_id: string, before?: int, after?: int)
 ```
 
-- `before`/`after` 默认 **8**，各钳 [0,15]（窗口最多 31 条）。返回结构
-  （anchor 只出现一次，无分页）：
+- `before` 默认 **15**、`after` 默认 **4**，各钳 [0,15]（请求行数上限 31）。
+  **刻意不对称**：这个产品问题（"那家餐厅叫什么"）几乎总是往前找线索，
+  对称分配等于把一半预算浪费在后文。返回结构（anchor 只出现一次，无分页）：
 
 ```
-{ anchor: message, before: [旧→新], after: [旧→新], unavailable_count }
+{ anchor: message, before: [旧→新], after: [旧→新],
+  unavailable_count, omitted_before: int, omitted_after: int }
 ```
 
 - 邻居按该用户 seq 序取（客户端时间戳不可靠，不做游标）。
 - 锚点不可见或不存在统一返回 `not_found_or_not_visible`（不区分，
   不靠 message_id 难猜当权限控制）。
-- 限制单位是**完整序列化 payload**（≤**4500** 字符），超限先结构化缩减
-  （从最远的邻居开始砍、单条正文加 `content_truncated`），绝不序列化后切串。
-  **fetch 需要 executor 对本工具单独放宽单结果上限**（默认 `_RESULT_CHAR_CAP`
-  =2000 装不下），实现时给 history_fetch 配独立 cap，其余工具不变。
+- **31 是请求上限，不保证 31 条都进入最终 payload**：31 条即使正文全空，
+  JSON 骨架也约 3240 字符；平均正文 40 字时已逼近 4500，80 字时必然要删减。
+  实际返回条数由预算决定，删了多少必须用 `omitted_before/omitted_after` 如实报。
+- 限制单位是**完整序列化 payload**（≤**4500** 字符），超限**按此顺序**结构化缩减
+  （绝不序列化后切串）：
+  1. 先保证所有消息的结构 + 短摘录都在（让模型看得到"这里有哪些消息"）；
+  2. 再优先给近邻补全正文；
+  3. 最后才丢最远的消息，并计入 `omitted_*`。
+  ＊顺序不能反：先砍最远邻居会恰好砍掉这次放宽窗口想找回的前文线索。
+
+- **完整修改清单（缺一项就会被静默砍回去）**：tool_schema 参数范围与描述、
+  facade 默认/上限、readside 默认/上限、**enclave `_FETCH_ROWS_HARD_MAX`
+  （现为 16，装不下 31）**、executor per-tool cap、tool_loop 水位策略、协议测试。
   ＊修订理由（hx 2026-08-07）：原值前后各 2（≤9 条 /1600 字符）是照着 2000 字符
   硬顶倒推的技术约束，不是产品需求——真实场景里"那家餐厅"的来龙去脉常常在
-  七八轮之前，各 2 条经常正好卡在关键句之外。fetch 是模型确认要看才调的，
-  不存在滥用风险，4500 字符对上下文预算无压力。
+  七八轮之前，各 2 条经常正好卡在关键句之外。
+
+### 3.3 结果预算：共享策略，不是各层各写一份
+
+两道独立截断（executor 单结果 2000；tool_loop 单结果 2000 + 同批 8000 水位分摊、
+且是序列化后切字符串）意味着**只在 executor 加 per-tool cap 无效**——tool_loop
+仍会砍回 2000，最坏批形下砍到约 1000，JSON 必坏。
+
+因此定义一份**共享的可信预算策略**，executor 与 tool_loop 同读：
+
+```
+history_fetch:  result_cap=4500  atomic_json=true  extra_batch_budget=2500
+history_search: result_cap=1800  atomic_json=true
+```
+
+- `atomic_json=true` 的结果，水位分配时**先整额预留**，剩余额度再分给兄弟结果；
+  任何情况下不对它做字符串切割。
+- 同批总预算在含 history 结果时临时抬到 `8000 + 2500 = 10500`——否则 fetch 占
+  4500 后，另外 7 个结果每个只剩约 500，是实打实的产品退化。
+- facade 只负责"序列化前结构化缩减到 result_cap"并通过可信
+  `ToolResult.metadata` 标记类型；**它不能自己决定预算**，授权在共享策略。
+- 协议测试必须用真实最坏形态：`history_fetch 顶满 4500 + 7 个各 ≥2000 的兄弟`，
+  逐个 `json.loads`、总量 ≤10500。**不许用短 "ok" 结果凑数释放水位**。
 
 ## 4. 执行算法（search）
 
@@ -146,10 +178,9 @@ cover 查询会略过被 checkpoint 覆盖的子节点，不可复用）。
 
 超预算 = 正常返回 `complete=false + next_cursor`，绝不伪装成"没找到"。
 
-截断：executor 单结果 2000 字符外，tool_loop 还有**同批 8000 字符水位分摊**——
-8 个混合调用时单结果实际额度可能只剩 ~1000。因此 history 结果必须**序列化前
-结构化缩减**到预算内（砍 matches 条数/snippet 长度），并配「8 调用混合批、
-history 结果最大化、逐个 json.loads」的协议测试。
+截断：见 §3.3 的共享预算策略（executor 与 tool_loop 同读、atomic_json 整额
+预留、含 history 时同批预算抬到 10500）。要点重申：**只在 executor 加 per-tool
+cap 无效**，tool_loop 的水位分摊会把它砍回去。
 
 ## 6. 信任边界与开关
 
@@ -183,6 +214,9 @@ MongoDB Queryable Encryption 被 USENIX'23 打出实用攻击，**根因不是�
 - enclave 内部错误不得把待匹配文本回传到 enclave 外的日志。
 - 现有 activity metadata 已只投影 content-free 的 scanned_rows（符合要求），
   新增任何指标前对照本节自查。
+- **例外**：索引回填进度（§13）是必要的 durable 运维状态，可按用户持久化。
+  但调用量、命中分布、query 相关量仍不得按 user_id 长期留存；Bloom 饱和度、
+  不同 bigram 数这类也不许变成长寿命的用户画像指标。
 
 ## 7. 可见性 contract（search / fetch 完全同一套规则）
 
@@ -240,6 +274,11 @@ enclave 内部 route 不进公共 OpenAPI。
 - 明文 FTS5 索引 / 全量解密扫描 / 第一版向量检索：见 §2。
 - 单工具多形态（Hermes 风格）：与现有 memory 两工具心智不一致。
 - 第一版默认 OFF 分阶段开（Codex 二轮建议）：违反工作区开关纪律，见 §6。
+- fetch 前后各 8 的对称窗口（一度写进 spec）：改为 before=15/after=4——
+  这个产品问题几乎总是往前找线索，对称等于浪费一半预算（Codex 三轮）。
+- 整用户 64 KB Bloom 总表（一度设想）：会饱和、且覆盖不全时制造假阴性，见 §13.3。
+- "enclave 无持久化所以 B1 不可行"（我一度的判断）：**事实错误**，部署有共享
+  `/data`；B1 真正的成本是多进程单写者与恢复协议，见 §13.1。
 
 ## 12. V1 / 自托管线（批次 5，V2 之后）
 
@@ -257,60 +296,130 @@ V1 不 spawn worker、走 CLI + `io_cli` verb，所以接线形态不同、核�
   （历史检索不是 CLI 自带能力，预期无冲突，但接线时实测一遍）。
 - VPS 自托管随 consumer 自更新生效，hosted V1 随 runner 镜像重建生效。
 
-## 13. 第二阶段：加密 lexical sidecar（不在本期，但接口现在就留）
+## 13. 第二阶段：加密 lexical sidecar（不在本期，接口现在就留）
 
-**动机**：现在"先扫哪段"靠摘要匹配，摘要有损→常回落到顺序扫。历史到几万条时
-单次搜索翻页轮次上升。
+**动机**：现在"先扫哪段"对**摘要文本**匹配，而摘要按 `_SEGMENT_SYSTEM_PROMPT`
+只保留"决定/事实/偏好/承诺/未完成事项/重要语境"——具体实体（店名/书名/人名）
+系统性丢失，搜它必然 miss、只能顺序扫兜底。索引对**原文**建，是"精准定位"
+而不是"猜哪段可能有"。**这是修正确性缺陷，不只是提速。**
 
-**先决判断（调研 2026-08-07 修正）**：既然 enclave 内能见明文，**优先考虑
-在 enclave 内建普通全文索引、只在落盘时整体加密**（Element/Matrix 的 seshat =
-tantivy + EncryptedMmapDirectory 就是这个形态；微软 Always Encrypted 的演进也是
-从确定性加密走向 enclave 内解密而不是走 SSE）。这样 BM25/短语/模糊全部可用，
-检索质量不打折——比 Bloom 位图"只能回答有没有"强。
+### 13.1 方案选型（2026-08-07 定，Codex plan_review 同意）
 
-**取舍取决于 enclave 形态**（实现前必须先查清）：本项目 enclave 是无状态路由、
-无持久化磁盘时，完整倒排索引要存回后端 DB 再整索取回，体积可能不划算；此时退回
-Bloom 位图（每叶几 KB、只做预筛）。**两个方案二选一的判据是索引载入成本，不是
-安全性**——两者都在同一信任域内、落盘都加密。
+| 方案 | 结论 | 理由 |
+|---|---|---|
+| **B2 叶级 Bloom sidecar** | ✅ **当前选它** | 贴合现有不可变摘要叶 + 精确子串协议，改动边界最小，量级几 MB |
+| TEE Postgres bigram GIN | ⏳ 中长期最佳候选，见 §13.5 | 成熟度最高，但前置条件未满足 |
+| B1 enclave 内 Tantivy 全文索引 | ❌ 暂不选 | 能力最强但当前不需要 BM25/模糊；多进程单写者、崩溃恢复、密钥轮换成本最高 |
 
-**Bloom 方案（备选）**：compaction 生成摘要叶子时，顺带在 enclave 内对该批消息
-算字符 bigram 的 Bloom 位图（几 KB），加密与摘要同存。查询时在 enclave 内对
-query 算同样哈希，位图不命中 = **确定性排除**（只误报不漏报），命中才解密原文。
-预期把"500 段筛到 3 段"，解密量下降一到两个数量级。
-**注意**：有 TEE 时 Bloom 的作用是**省 I/O，不是省信任**，误报没有安全含义。
+**B1 被否的准确理由**（修正早前"enclave 无持久化所以不可行"的说法——**那句是错的**）：
+enclave 部署实际**有**共享挂载的 `/data`（`docker-compose.phala.yaml`），所以
+B1 技术上可行、不必每次从 PG 整索载入。真正的成本是：两个 enclave service ×
+每个约 4 个 gunicorn 进程共享同一索引目录，而 Tantivy 同一索引只允许一个
+`IndexWriter` → 必须自建单写者拓扑 + commit/reload/崩溃恢复/clear/索引版本/
+密钥轮换全套协议；且 BM25/模糊会改变现有"精确子串 + seq/cursor"的产品语义。
+**只有在实测确认需要排名/模糊/短语，或 B2 的 I/O 不达标时才做 B1 spike**，
+spike 必须先验证：单写者拓扑、50k/500k 消息冷启动、索引大小、commit/reload、
+密钥轮换。
 
-**泄漏面控制**：位图本身加密存储、只在 enclave 内比对；不得把可比对的盲索引
-token 暴露给数据库（否则新增词频/相等性/访问模式泄漏）。
+### 13.2 B2 参数（数字已修正，早前的估算是错的）
 
-**现在要留的接口**：§4 扫描顺序里"决定优先扫哪段"是一个可替换的过滤器
-（今天=摘要匹配，将来=位图匹配或 enclave 内索引），实现上保持这一步与
-"扫描/解密"解耦，换过滤器不动其余代码。存量老数据无索引 → 回落摘要路径。
+**修正 1 —— 叶大小**：`_COMPACTION_BATCH` 代码默认 200，但 test/pre/prod 三个
+compose 都覆盖成 **50**。所以 5 万条历史约 **1000 个叶**（不是 250 个）。
+**读部署配置，别读代码默认值。**
 
-**实现选型时的现成件结论**（调研 2026-08-07，结论是都不引）：
-- Bloom：rbloom 等库要求自带确定性哈希（Python `hash()` 有每进程 salt），
-  且其存档格式是无稳定性承诺的内部细节——把它变成我们的持久化 schema 不划算。
+**修正 2 —— 误报率必须按"单 bigram 查询"定**：早前按 p=5% 估算，但那是双
+bigram（"新荣记"→"新荣"+"荣记"，两者都要命中 → 0.25%）的算法。**最常见的
+查询是两个字**（"餐厅"/"电影"/"生日"），只有 **1 个** bigram，误报率就是 p 本身：
+p=5% 时 1000 个叶平均 **50 个误报叶**，根本不是"筛到 3 个"。
+
+修正后的取值：
+
+| 目标 | p | k | 每叶（n=8000 唯一 bigram 时） |
+|---|---|---|---|
+| 可用 | 1% | 7 | ≈9.36 KiB |
+| 接近"1000 筛到个位数" | 0.5% | 8 | ≈10.77 KiB |
+
+- **不要固定每叶大小**：按该叶实际唯一 bigram 数算 `m`；50 条的叶若只有约
+  2000 个唯一 bigram，p=1% 时约 2.34 KiB/叶，总量约 2.4 MB。
+  **n=8000 是未实测的假设值，实现前先统计真实分布。**
+- 加密头部存 `index_version / normalization_version / m / k / n`，缺一不可
+  （归一化规则变更 = 索引全体失效，必须能识别）。
+- 哈希：**一次 HMAC + double hashing 推导 k 个位置**，不要每个位置各算一次 HMAC。
+- **Bloom 命中后必须做原文精确子串复核**；归一化版本不一致 / 索引缺失 /
+  解密失败 → **一律回落顺序扫描，绝不返回"无结果"**。
+- 单字查询没有 bigram → 用不上索引，回落顺序扫；工具描述引导 ≥2 字关键词。
+- 中文切**字符 bigram**，不引 jieba（分词错误会永久漏召回）；**不要 trigram**
+  （中文多二字词，三元组让两字查询用不上索引）。
+
+### 13.3 分层：先实测再加，不做固定 64 KB 总表
+
+早前设想的"整用户 64 KB 总表先短路零结果查询"——**否决**：64 KiB 在 p=5% 下
+只能容纳约 8.4 万个唯一 bigram，5 万条消息很可能超出后快速饱和；更严重的是，
+总表只有在覆盖了当前快照 + tail + 新叶 + 全部回填之后，"不命中"才等价于
+"整个历史没有"，否则制造**假阴性**（最不能接受的错误）。
+
+正确顺序：① 先实现自适应叶级 Bloom，实测总 bitmap 读取/解密成本；② 确认
+1000 个小 blob 的读取次数确实是瓶颈时，再做**每 16~32 叶一组**的 group filter；
+③ 最多两层；④ **每层都带 `indexed_through_seq + generation + index_version`
+覆盖 witness**，覆盖不完整就继续查下一层或顺序扫。
+
+### 13.4 存量回填（hx 拍板必做）
+
+只覆盖上线后的新消息 = 只覆盖最不需要检索的部分（新消息还在 tail 里）。
+
+**🔴 不能塞进 maintenance lane**（已核实代码）：同用户同 lane 的 active job 会
+single-flight/coalesce，且 worker 见到 `lane == "maintenance"` 就**无条件**执行
+`_run_compaction`、不看 reason —— 回填要么被合并吞掉，要么 claim 成功后仍去跑
+压缩。必须新增独立 lane：
+
+- 新 lane `history_index_backfill`，优先级 **1**（低于 maintenance=10），独立 handler。
+- 全局最多一个回填批次持有 enclave semaphore（默认仅 2 个并发许可），**短批次
+  即释放**，不长期占用。
+- **进度 witness 不能只是一个整数 cursor**，必须是每叶一条 durable sidecar：
+  `(user_id, segment_id, index_version)` 唯一键 + `runtime/clear_generation`
+  + `source_start_seq / source_end_seq / source_message_count` + `encrypted_index`。
+  "完成"= sidecar 存在且 source witness 与当前不可变叶一致；用户级
+  `next_segment_id` 只能当调度提示。
+- 在线 compaction 最好把 summary leaf 与 index sidecar 放进**同一个 CAS 事务**；
+  做不到时宁可留下"未索引叶"让回填补，**绝不能先标完成**。
+- clear/delete 经 FK cascade + generation fence 清掉旧 sidecar。
+- 回填进度是必要的 durable 运维状态，可按用户存（§6.5 已开此例外）。
+
+### 13.5 中长期候选：TEE Postgres 明文影子库 + bigram GIN
+
+本仓已有一套**跑在 TEE CVM 里的 PostgreSQL 明文影子库**
+（`docs/TEE_POSTGRES_SHADOW_PROVISIONING.md`、`backend/tee_replicator/`），
+`chat_messages.doc` 已解密复制过去。在那里可以：对归一化正文生成字符 bigram
+数组 → 内建 GIN `array_ops` 索引 → 查询用数组 `@>` 要求全部 bigram 存在 →
+再对候选原文精确复核。并发、WAL、崩溃恢复、索引构建全由 PG 负责，比自维护
+Bloom schema 成熟得多。（不要用 `pg_trgm`：固定 trigram 服务不好两字中文。）
+
+**为什么现在不选**：该影子库当前是**异步、best-effort、fail-open**的旁路
+（文档明示"失败只计数，绝不拖垮主路径"），且 `sslmode=require` 只加密不验证
+服务端身份。影子库落后或有待解密行时，**不能用它证明"没有结果"**。
+前置条件：可信连接（验证服务端身份）+ 复制覆盖 witness（能证明"已同步到某
+seq"）。满足后它优于 B2，届时重新评估。
+
+### 13.6 现在就要留的接口
+
+§4 扫描顺序里"决定优先扫哪段"是一个**可替换的过滤器**（今天=摘要匹配，
+将来=Bloom 位图 / GIN 命中），实现上保持这一步与"扫描/解密"解耦，换过滤器
+不动其余代码。存量老数据无索引 → 回落摘要路径，混跑不冲突。
+
+### 13.7 启动条件（满足其一再做，不提前）
+
+真实用户历史普遍过 2 万条；或指标显示单次搜索平均翻页 > 2 轮。
+
+### 13.8 现成件结论（调研 2026-08-07：都不引）
+
+- Bloom：rbloom 等库要求自带确定性哈希（Python `hash()` 每进程 salt 不同），
+  且存档格式是无稳定性承诺的内部细节——不宜作为持久化 schema。
   `bytearray` + HMAC 派生位置，30 行以内自己写。
-- 盲索引：Python 无生产级库；核心就是 `HMAC(子密钥, 归一化词)[:N]`。要抄的是
+- 盲索引：Python 无生产级库；核心是 `HMAC(子密钥, 归一化词)[:N]`。要抄的是
   CipherSweet 文档的工程纪律（每列独立子密钥、必须截断、归一化字节级一致）。
-- 中文：**切字符 bigram，不引 jieba**——分词错误会永久漏召回，bigram 无死角；
-  这是 SQLite/PG 社区处理 CJK 的通行解法。**不要 trigram**（中文多为二字词，
-  三元组让两字查询用不上索引）。
-- 整套框架（Acra/CipherSweet/Clusion/CyborgDB）全部假设"服务端看不到明文"，
+- 整套框架（Acra/CipherSweet/Clusion/CyborgDB）都假设"服务端看不到明文"，
   与我们"服务端有可信区域"不同构，硬套是净增复杂度。
-- LLM agent + 加密历史检索的完整开源实现：**不存在**（agent memory 那一堆
-  全假设明文；Proton Lumo 闭源且未公开检索机制）。这块只能自己设计。
-
-**启动条件**（满足其一再做，不提前）：真实用户历史普遍过 2 万条；或指标显示
-单次搜索平均翻页 > 2 轮。
-
-**索引不只是提速，是修掉根子上的缺陷**（hx 2026-08-07 讨论确认）：现在第 ⑦ 步
-对**摘要文本**匹配，而摘要按 `_SEGMENT_SYSTEM_PROMPT` 只保留"决定/事实/偏好/
-承诺/未完成事项/重要语境"——具体实体（店名、书名、人名）极易被压掉，搜它必然
-miss、只能靠顺序扫兜底。索引是对**原文**建的，实体一定在指纹里，是"精准定位"
-而非"猜哪段可能有"。
-
-**存量历史必须回填**（hx 拍板）：只覆盖上线后的新消息等于只覆盖最不需要检索的
-那部分（新消息还在 tail 里）——老历史才是这个功能的主要目标。回填形态：
-低优先级后台 job（同 maintenance lane）限速重扫已有摘要叶的源消息，在 enclave
-内算指纹、加密存回；期间无指纹的叶自动回落摘要路径，混跑不冲突，逐段完成逐段
-切换。回填要能中断续跑、要有进度可观测（content-free 计数，见 §6.5）。
+- **完整开源实现**：截至调研日未发现可直接复用的成品（多租户服务端 TEE +
+  加密原始 agent 对话 + 现有 cursor/tool 协议）。但**存在可借鉴的拼图**：
+  Seshat（加密落盘的客户端全文索引）、Hermes Agent（对原始 session message
+  做 SQLite FTS5 检索 + 前后文窗口）。这是"没找到直接适配项"，不是"不存在"。
