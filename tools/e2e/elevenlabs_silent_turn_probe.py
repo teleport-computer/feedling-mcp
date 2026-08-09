@@ -13,6 +13,26 @@
 网关,用 WebSocket 真打一通,把会触发静音路径的词说进去,看连接是否存活。
 agent 用完即删(测试账号同理)。
 
+⚠️ **现状(2026-08-10):这个探针还没能跑通一通完整的电话。**
+
+已经确认对的:
+  - agent 建得出来,读回来 `custom_llm_extra_body: true`、`text_only` 允许覆盖、
+    `custom_llm.url` 指向测试网关 —— 配置本身没问题;
+  - WebSocket 协议走通了(错误信息从"连不上"变成了具体的字段校验错误);
+  - `text_only` 必须在 **init 的 conversation_config_override** 里开,
+    不是在 agent 配置里(第一版写错了,ElevenLabs 压根不把文字当用户输入);
+  - `source_info.source` 是枚举,不能自己编值。
+
+还没解决的:**连普通轮都拿不到回复**,ElevenLabs 报
+`custom_llm_error: Failed to generate response from custom LLM`,而服务端那侧
+只有 verify_ping、没有任何通话行 —— 说明请求没走到我们的网关(或在鉴权前就被拒)。
+下一步该查的是 text_only 模式下 `custom_llm_extra_body` 到底有没有被转发给
+Custom LLM(我们的网关从 `elevenlabs_extra_body` 里取 token,取不到就 401)。
+
+**所以静音轮那一环仍然没有被验证。** 判定逻辑已经写成:普通轮不通就报
+「什么都没验到」,绝不会拿它去下「最小正文不被接受」的结论 ——
+第一版就是这么误报的,而且那个结论完全是错的。
+
 用法:python3 -m tools.e2e.elevenlabs_silent_turn_probe [--keep]
 """
 from __future__ import annotations
@@ -56,7 +76,6 @@ def create_agent(key: str, gateway_url: str) -> str:
             "tts": {"model_id": "eleven_flash_v2_5"},
             "conversation": {
                 "max_duration_seconds": 300,
-                "text_only": True,
                 "client_events": [
                     "user_transcript", "agent_response", "interruption",
                 ],
@@ -82,7 +101,13 @@ def create_agent(key: str, gateway_url: str) -> str:
             "auth": {"enable_auth": False},
             "privacy": {"record_voice": False, "retention_days": 0,
                         "delete_audio": True},
-            "overrides": {"custom_llm_extra_body": True},
+            # 这两个 override 必须在 agent 上放行,init 里传的才会被接受。
+            "overrides": {
+                "custom_llm_extra_body": True,
+                "conversation_config_override": {
+                    "conversation": {"text_only": True},
+                },
+            },
         },
     }
     with _client() as http:
@@ -127,8 +152,15 @@ async def run_conversation(key: str, agent_id: str, session: dict,
         async with websockets.connect(
             url, max_size=8 * 1024 * 1024, ssl=ctx,
         ) as ws:
+            # text_only 必须在 **init 的 conversation_config_override** 里开,
+            # 不是在 agent 配置里 —— 照 Swift SDK 的 EventSerializer 的形状写。
+            # 第一版写在 agent 配置里,ElevenLabs 压根没把文字当用户输入处理:
+            # 两轮都发出去了、连 user_transcript 事件都没有,更别说调我们的网关。
             await ws.send(json.dumps({
                 "type": "conversation_initiation_client_data",
+                "conversation_config_override": {
+                    "conversation": {"text_only": True},
+                },
                 "custom_llm_extra_body": {
                     "io_voice_token": session["token"],
                     "io_call_id": session["call_id"],
