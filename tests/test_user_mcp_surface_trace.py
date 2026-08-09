@@ -155,13 +155,22 @@ def test_bridge_log_format_matches_what_the_parser_expects():
 def test_tool_cap_is_high_enough_for_a_realistic_multi_server_setup():
     """上限要能装下真实用户的配置。
 
-    usr_1baf 装了 6 个服务器,仅 gardenforum 一个就 25 个工具;旧上限 50
-    在这种配置下会把字母序靠后的 tavily 整个丢掉(2026-08-09 提到 100)。
+    usr_1baf 装了 6 个服务器共 107 个工具。50 那版会把字母序靠后的 tavily
+    整个丢掉;2026-08-10 统一到 **128**(实测得出,见
+    tools/e2e/tool_count_ceiling_probe.py),这套配置一个都不用裁。
+
+    这里读的是**当前**常量而不是写死数字 —— 写死的话调上限时测试会静默失配。
     """
     mapping = (
         Path(__file__).parent.parent / "tools" / "pi_mcp_bridge" / "tool_mapping.js"
     ).read_text(encoding="utf-8")
-    assert "export const MAX_TOOLS = 100;" in mapping
+    import re as _re
+
+    match = _re.search(r"export const MAX_TOOLS = (\d+);", mapping)
+    assert match, "找不到 MAX_TOOLS"
+    assert int(match.group(1)) >= 107, (
+        f"上限 {match.group(1)} 装不下本月工具最多的真实用户(107 个)"
+    )
 
 
 def test_multiple_surface_lines_do_not_cross_wire_the_dropped_list():

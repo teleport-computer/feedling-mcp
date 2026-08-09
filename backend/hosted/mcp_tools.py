@@ -31,7 +31,34 @@ from hosted import mcp_core, mcp_client, mcp_probe, mcp_ca_fetch
 log = logging.getLogger("feedling.hosted.mcp_tools")
 
 MCP_TOOL_PREFIX = "mcp__"
-MAX_MCP_TOOLS_PER_TURN = 64
+# 每轮交给模型的 MCP 工具数上限。**这个数是实测出来的,不是拍的**
+# (2026-08-10,tools/e2e/tool_count_ceiling_probe.py,可复跑)。
+#
+# 此前三条路三个值、且都没有依据:V2=64(2026-07-18 加,常量旁一行注释都没有)、
+# pi=50→100、claude/codex 无上限 —— 同一个用户换个 driver 行为就变。
+#
+# 实测(每档 3 次,易混淆模式:塞入预报/历史/空气质量等 6 个近义工具,
+# 逼模型真读说明才能选对;目标工具放在列表中间,防"选第一个"蒙对):
+#
+#   工具数   sonnet-4.6   gemini-flash   deepseek   sonnet prompt_tokens
+#      16      3/3           3/3          3/3           4,267
+#      64      3/3           3/3          3/3          12,475
+#     128      3/3           3/3          3/3          23,419
+#     300      3/3           3/3          3/3          52,830
+#     500      3/3           3/3          3/3          86,035   (简单模式)
+#
+# 三个结论:
+#   ① **没有硬墙** —— 一路到 500 个 / 225KB schema,openrouter(sonnet、
+#      gemini-flash)与 deepseek 直连都没拒收。原先担心的"撞 provider 函数上限
+#      导致整轮失败"在我们实际用的路上不存在。
+#   ② **选择准确率不是瓶颈** —— 弱模型在 300 个 + 6 个近义干扰项下仍全对。
+#   ③ 真正的代价是 **token,而且每轮都付**。所以阈值该按"愿意为工具面付多少
+#      上下文"来定,不是按"会不会坏"。
+#
+# 选 128 的理由:功能上远在任何边界之下;成本约 23k token(200k 窗口的 12%),
+# 且这是所有服务器开满的最坏情况;并且能把本月工具最多的真实用户
+# (usr_1baf,6 台共 107 个)**整个装下,一个都不用裁**。
+MAX_MCP_TOOLS_PER_TURN = 128
 # 2026-08-10 上调:同一天开始 schema 里带上说明/enum/default,体积自然变大。
 # 不上调的话,原来能用的工具会**新**撞上这道闸而被丢掉 —— 而丢弃只有一行
 # log.warning,又是一次静默失败。丢弃数现在也进 summary(见 _allocate_round_robin),

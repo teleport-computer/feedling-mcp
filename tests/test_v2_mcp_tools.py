@@ -935,17 +935,22 @@ def test_auto_ca_fetch_returns_none_skips_server(monkeypatch):
 
 
 def test_small_server_is_not_starved_by_a_large_one(monkeypatch):
-    """The real usr_1baf config: 6 servers, 107 tools, a 64-tool budget.
+    """预算绷紧时,大服务器不能把小的饿死。
 
-    The old allocator sorted every candidate by server name and truncated, so
-    `mcdonalds` and `tavily` fell past the cut and reached the model with ZERO
-    tools while the app showed them enabled and green. Round-robin must give
-    every server at least a share, and a server smaller than its fair slice
-    (tavily: 4 tools) must come through whole.
+    形状取自 usr_1baf 的真实配置(6 台、其中一台只有 4 个工具),但**规模按当前
+    上限缩放** —— 原版写死 107 个工具、断言它超过 64 的预算;2026-08-10 上限
+    统一到 128 之后那套真实配置一个都不用裁了,写死的样本会悄悄不再触发裁剪,
+    测试照绿而分配器根本没被验到。上限是会变的,样本必须跟着变。
+
+    旧分配器按服务器名排序后截断,`mcdonalds` 和 `tavily` 落在切口之后,
+    到模型手里是**零个工具**,而 App 里它们显示"已连接、绿灯"。
+    轮转必须让每台都有份,且小于自己那一份的服务器(tavily)要**完整**通过。
     """
-    sizes = {"gardenforum": 25, "luckin-coffee": 30, "mcdonalds": 28,
+    cap = mcp_tools.MAX_MCP_TOOLS_PER_TURN
+    big = cap // 3  # 三台大的就足以撑爆预算
+    sizes = {"gardenforum": big, "luckin-coffee": big + 5, "mcdonalds": big + 3,
              "gaodemap": 12, "game": 8, "tavily": 4}
-    assert sum(sizes.values()) > mcp_tools.MAX_MCP_TOOLS_PER_TURN
+    assert sum(sizes.values()) > cap, "样本没超过上限,裁剪根本不会发生"
 
     async def fake_list(url, headers, *, ca_pem=None, transport=None, mcp_transport=None):
         server = url.removeprefix("https://").removesuffix(".example.com")
@@ -1074,15 +1079,18 @@ def test_allocation_summary_reports_post_allocation_counts_per_server():
     summary = turn.summary
 
     assert summary["offered"] == 107
-    assert summary["kept"] == summary["count_cap"]
+    # 2026-08-10 上限统一到 128 之后,这套真实配置**一个都不用裁**了 ——
+    # 这正是把上限从实测数据推出来的意义:真实用户不该撞墙。
+    assert summary["kept"] == 107
     # 每台都要有代表工具 —— 旧的字母序截断把 mcdonalds 和 tavily 双双饿死到 0
     for server in ("game", "gaodemap", "gardenforum", "luckin-coffee",
                    "mcdonalds", "tavily"):
         assert f"{server}:0/" not in summary["per_server"], (
             f"{server} 被饿死:{summary['per_server']}"
         )
-    # 工具少的那台要全拿到
+    # 每一台都完整保留
     assert "tavily:4/4" in summary["per_server"]
+    assert "gardenforum:25/25" in summary["per_server"]
 
 
 def test_summary_is_empty_when_the_user_has_no_mcp_servers():
@@ -1090,3 +1098,31 @@ def test_summary_is_empty_when_the_user_has_no_mcp_servers():
     from hosted.mcp_tools import McpTurn
 
     assert McpTurn([], {}).summary == {}
+
+
+def test_both_runtimes_use_the_same_tool_cap():
+    """V2 与 pi 桥必须用**同一个**工具上限。
+
+    2026-08-10 之前是 64 / 100 / 无上限三个值,全都没有依据 —— 同一个用户换个
+    driver 行为就变。统一到 128 是实测出来的
+    (tools/e2e/tool_count_ceiling_probe.py:500 个工具没撞硬墙、弱模型 300 个
+    仍全对,真正的代价是每轮 token)。
+
+    这条测试存在的意义是**防漂**:两个常量分处 Python 和 JS,改一个忘一个不会
+    有任何报错,只会悄悄回到"两条路不一样"的老状态。
+    """
+    bridge = (
+        Path(__file__).parent.parent / "tools" / "pi_mcp_bridge" / "tool_mapping.js"
+    ).read_text(encoding="utf-8")
+    assert f"export const MAX_TOOLS = {mcp_tools.MAX_MCP_TOOLS_PER_TURN};" in bridge, (
+        f"pi 桥的上限和 V2 的 {mcp_tools.MAX_MCP_TOOLS_PER_TURN} 不一致了"
+    )
+
+
+def test_the_reported_users_whole_toolset_fits_without_trimming():
+    """本月工具最多的真实用户(usr_1baf,6 台共 107 个)必须一个都不用裁。
+
+    上限的意义是挡住病态情况,不是把真实用户裁掉。107 < 128 —— 如果哪天有人
+    把这个数调下去,这条会红。
+    """
+    assert mcp_tools.MAX_MCP_TOOLS_PER_TURN >= 107
