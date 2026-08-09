@@ -2434,3 +2434,38 @@ def test_real_key_failure_keeps_the_original_detail(client, monkeypatch):
     assert body["status_code"] == 401           # 保留,客户端据此说"鉴权失败"
     assert "Invalid token" in body["detail"]    # 原始信息不被吞掉
     assert "/v1" not in body["detail"]          # 不许对真 key 错误乱给地址建议
+
+
+@pytest.mark.parametrize(("exc", "label"), [
+    (provider_client.ProviderError("provider_http_401: relay auth html <!doctype html>",
+                                   status_code=401), "401 鉴权页(HTML)"),
+    (provider_client.ProviderError("provider_http_402: payment page html <html>",
+                                   status_code=402), "402 支付页(HTML)"),
+    (provider_client.ProviderError("provider_http_429: relay throttle html <html>",
+                                   status_code=429), "429 限流页(HTML)"),
+    (provider_client.ProviderError("provider_http_504: <!DOCTYPE html> gateway timeout",
+                                   status_code=504), "504 网关故障页(HTML)"),
+])
+def test_html_error_pages_that_are_not_404_keep_their_real_meaning(
+    client, monkeypatch, exc, label
+):
+    """relay/WAF/计费层会用 **HTML 页面**返回 401/402/429/5xx —— 本仓
+    tests/test_catalog_consumer_parity.py:158-161 就存着这样的样本。
+
+    把它们一并判成「地址错误」会让额度不足、鉴权失败、限流全部指错方向,
+    比原来的错更严重。所以 HTML 只在 404 时才算地址问题(codex2 gatekeep
+    2026-08-09 抓到:我原先的「真错误一律 JSON」是没验证的断言)。"""
+    _, api_key = _register(client)
+    monkeypatch.setattr(provider_client, "test_provider_key",
+                        lambda cfg: (_ for _ in ()).throw(exc))
+
+    r = client.post("/v1/model_api/setup", json={
+        "provider": "openai_compatible", "model": "gpt-4o-mini",
+        "api_key": "sk-whatever", "base_url": "https://relay.example.com/v1",
+    }, headers=_headers(api_key))
+
+    body = r.get_json()
+    assert body["error"] == "provider_test_failed", label
+    assert body["status_code"] == exc.status_code, f"{label}: 状态码必须保留"
+    assert "/v1" not in body["detail"], f"{label}: 不许被改写成地址建议"
+    assert str(exc) in body["detail"], f"{label}: 原始信息必须原样透传"

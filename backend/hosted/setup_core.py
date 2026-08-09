@@ -1580,8 +1580,16 @@ def image_generation_main_test(
 # 实测的两种形态(2026-08-09,用户报障的两个中转站,base_url 漏填 /v1):
 #   · HTTP 200 + 站点首页 HTML  → chat_completion 抛 "provider returned non-json response"
 #   · HTTP 404 + 错误页 HTML    → "provider_http_404: <!doctype html>..."
-# 真正的 key/额度/模型错误一律是 JSON,永远不含这些特征,所以零误伤。
-_WRONG_API_ENDPOINT_MARKERS = ("non-json response", "<!doctype", "<html")
+#
+# ⚠️ HTML 本身**不能**单独作为判据(codex2 gatekeep 2026-08-09)。我原以为
+# 「真错误一律 JSON」,但 relay/WAF/计费层完全可能用 HTML 页面返回 401/402/429/5xx
+# —— 本仓 tests/test_catalog_consumer_parity.py:158-161 就存着这样的样本
+# (provider_http_504/402/401/429 + HTML)。把它们一并判成「地址错误」,
+# 会让额度不足、鉴权失败、限流全部指错方向,比原来的错更严重。
+# 所以 HTML 只在 **404** 时才算地址问题:其它状态码即使 body 是网页,
+# 也一定是真实的 provider 语义错误,原样透传。
+_NON_JSON_MARKER = "non-json response"
+_HTML_MARKERS = ("<!doctype", "<html")
 
 # 刻意只给通用方向、不替用户拼出具体地址:有的中转站要 /api/v1、/openai/v1,
 # 猜一个"看起来很确定其实是蒙的"地址,用户照抄仍然不通,反而更迷惑(Seven 2026-08-09 拍板)。
@@ -1594,9 +1602,21 @@ _WRONG_API_ENDPOINT_HINT = (
 
 
 def _looks_like_wrong_api_endpoint(exc: BaseException) -> bool:
-    """这次失败是不是「地址根本不是 API 端点」而非「key 不对」。"""
+    """这次失败是不是「地址根本不是 API 端点」而非「key 不对」。
+
+    两条判据都刻意收得很窄(宁可漏判,不可错判 —— 错判会把额度/鉴权/限流
+    说成地址问题):
+      · ``non-json response``:只在 HTTP 已经成功(2xx,过了
+        ``_raise_for_provider_status``)却解析不出 JSON 时抛出,正是
+        「200 + 站点首页」那种形状,与状态码无关;
+      · HTML 页面:**仅当 status_code == 404**。404 网页 = 这个路径不存在;
+        401/402/429/5xx 的 HTML 是 relay 的鉴权/支付/限流/故障页,是真错误。
+    """
     text = str(exc or "").lower()
-    return any(marker in text for marker in _WRONG_API_ENDPOINT_MARKERS)
+    if _NON_JSON_MARKER in text:
+        return True
+    status = getattr(exc, "status_code", None)
+    return status == 404 and any(marker in text for marker in _HTML_MARKERS)
 
 
 def _provider_test_failed_body(exc: BaseException) -> dict:

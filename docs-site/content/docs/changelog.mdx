@@ -10,6 +10,16 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **A base URL that is not an API endpoint no longer reports as an API-key
+  failure.** When the configured relay base URL points at a web page rather than
+  the API (an HTTP 200 that returns the site's homepage, or a **404** HTML error
+  page), `provider_test_failed` now returns `"status_code": null` and a
+  bilingual `detail` telling the operator the endpoint usually needs to end with
+  `/v1` and that the API key is not the problem. Clients should display that
+  `detail` directly. HTML error pages carrying any other status
+  (401/402/429/5xx — relay auth, payment, throttle and gateway pages) keep their
+  original status code and detail unchanged.
+
 - **Runtime V2 Chat can search its own older conversation history on demand.**
   Two chat-only agent tools let the agent keyword-search messages beyond its
   visible context and read a small window around a match. Original messages
