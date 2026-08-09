@@ -5403,6 +5403,8 @@ def _trace_user_mcp_surface(
         # 而不是只在 missing 分支判 —— 否则 claude 的 stderr 里若恰好出现
         # 一行同形文本,就会伪造出一条 resolved 事件(codex 审出)。
         return
+
+
     text = str(stderr or "")
     # 取**最后**一条,不是第一条:一轮正常只有一行,但桥若被重跑(或将来多次
     # 握手)会有多行,而第一条配上后面那条的丢弃名单就是张冠李戴。
@@ -5462,6 +5464,69 @@ def _trace_user_mcp_surface(
             # `服务器:注册数/发现数` —— 注册数才回答「它到底进没进去」。
             "per_server": per_server[:400], "dropped_names": dropped_names,
             "lane": lane, "attempt": attempt,
+        },
+    )
+
+
+def _trace_user_mcp_wiring(cmd: list[str], *, trace_id: str, lane: str) -> None:
+    """claude / codex 这两条路的 MCP **接线**是否到位。
+
+    它们不经过我们的桥,所以拿不到「注册了几个工具」——那是 CLI 内部的事。
+    但**能**回答一个同样致命的问题:这一轮我们到底有没有把服务器交给它。
+    PR#174 修的正是这个洞:自托管 claude 的模板没有 `{mcp}` 占位符,
+    `--mcp-config` 一次都没下发,用户在 App 里配的服务器**一台都到不了 agent**,
+    而 App 的连接测试是绿的(那是控制面探针直连服务器测的,两条路)。
+
+    这条埋点让那种情况不用再靠用户报:trace 里直接写着 wired=false。
+    """
+    if lane != "chat":
+        return
+    is_claude = _is_claude_code_cmd(cmd)
+    is_codex = _is_codex_cmd(cmd)
+    if not (is_claude or is_codex):
+        return
+    enabled = [
+        s for s in (_user_mcp_applied.get("servers") or []) if s.get("enabled")
+    ]
+    if not enabled:
+        return
+    names = [str(s.get("name") or "") for s in enabled]
+    if is_claude:
+        wired = any(
+            t == "--mcp-config" or t.startswith("--mcp-config=") for t in cmd
+        )
+        mechanism = "--mcp-config"
+        # 授权是第二个必要条件:只接线不授权时调用会进 permission_denials,
+        # 模型回「这个工具需要授权」——和用户原话一致(PR#174 实测)。
+        authorized = _cmd_has_allowed_tools(cmd) or bool(
+            os.environ.get("CLAUDE_CONFIG_DIR", "")
+        )
+    else:
+        codex_home = os.environ.get("CODEX_HOME", "")
+        wired = bool(codex_home) and (Path(codex_home) / "config.toml").exists()
+        mechanism = "config.toml"
+        authorized = wired  # codex 的 MCP 授权就在同一份 config 里
+    _emit_debug_trace(
+        "agent",
+        "mcp.surface.wired" if wired else "mcp.surface.missing",
+        status="ok" if (wired and authorized) else "error",
+        trace_id=trace_id,
+        summary=(f"{len(names)} 台 MCP 服务器"
+                 + ("已接线" + ("" if authorized else ",但未授权")
+                    if wired else "**未接线**")),
+        explain=(
+            f"这一轮通过 {mechanism} 把 {len(names)} 台服务器交给 CLI"
+            if wired else
+            f"有 {len(names)} 台启用的 MCP 服务器,但这一轮**一台都没交给 CLI** —— "
+            f"{mechanism} 没有出现在命令里,模型看不到任何 MCP 工具"
+        ) + ("" if authorized or not wired else
+             ";但没有授权来源(既无 allowlist 参数也无 settings.json),"
+             "调用会被拒,模型通常会说「需要授权」"),
+        detail={
+            "driver": "claude" if is_claude else "codex",
+            "lane": lane, "mechanism": mechanism,
+            "wired": wired, "authorized": authorized,
+            "servers": names[:20],
         },
     )
 
@@ -6678,11 +6743,51 @@ def _inject_claude_user_mcp(cmd: list[str], lane: str) -> list[str]:
             ",".join(f"mcp__{s['name']}__*" for s in enabled),
         )
     else:
+        _warn_if_claude_allowlist_semantics_unverified()
         flags.append(
             "--allowed-tools="
             + ",".join(f"mcp__{s['name']}__*" for s in enabled)
         )
     return [cmd[0], *flags, *cmd[1:]]
+
+
+# 注入 --allowed-tools 的前提是它**不是排他白名单**(加了它,别的工具照样能用)。
+# 这一点是在 claude-code 2.1.217 上实测的:只授权 mcp__ombre__* 之后 Bash 仍然跑通。
+# 但自托管 operator 装的是什么版本我们不知道 —— 如果某个版本里它是排他的,
+# 注入就会**夺走 agent 原本有的工具**,把「少一个功能」变成「多一个故障」。
+# 所以在这里留声:实测版本写死在代码里,低于它就打一行 warning,
+# 而不是把这个假设只写在 PR 描述和「合入后建议」里(那样没人看得到)。
+_CLAUDE_ALLOWLIST_VERIFIED_VERSION = (2, 1, 217)
+_claude_allowlist_warned = False
+
+
+def _warn_if_claude_allowlist_semantics_unverified() -> None:
+    global _claude_allowlist_warned
+    if _claude_allowlist_warned:
+        return
+    raw = ""
+    try:
+        raw = subprocess.run(
+            ["claude", "--version"], capture_output=True, text=True, timeout=10
+        ).stdout
+    except Exception:  # noqa: BLE001 — 探不到版本不该影响回合
+        raw = ""
+    match = re.search(r"(\d+)\.(\d+)\.(\d+)", raw or "")
+    if not match:
+        return
+    version = tuple(int(g) for g in match.groups())
+    if version >= _CLAUDE_ALLOWLIST_VERIFIED_VERSION:
+        return
+    _claude_allowlist_warned = True
+    log.warning(
+        "[user_mcp] injecting --allowed-tools into claude %s, but the "
+        "'not an exclusive allowlist' behaviour was only measured on %s. "
+        "If this version treats it as exclusive, the agent loses every tool "
+        "outside mcp__*__*. Set your own --allowed-tools (it is left "
+        "untouched) or upgrade claude-code.",
+        ".".join(str(v) for v in version),
+        ".".join(str(v) for v in _CLAUDE_ALLOWLIST_VERIFIED_VERSION),
+    )
 
 
 def _cli_template_is_pi() -> bool:
@@ -7681,6 +7786,9 @@ def call_agent_cli(
         result.stderr or "", trace_id=trace_id, lane=lane,
         is_pi=_is_pi_cmd(cmd), attempt="first",
     )
+    # claude / codex 拿不到「注册了几个工具」(那是 CLI 内部的事),但能回答
+    # 同样致命的「这一轮到底有没有把服务器交给它」—— PR#174 修的正是这个洞。
+    _trace_user_mcp_wiring(cmd, trace_id=trace_id, lane=lane)
     if result.returncode == 0 and _is_claude_code_cmd(cmd):
         # Claude Code can silently choose its own default despite ANTHROPIC_MODEL.
         # Validate the CLI's structured receipt before persisting the session, so

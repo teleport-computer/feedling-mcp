@@ -925,3 +925,58 @@ def test_char_cap_skips_the_overflowing_tool_and_keeps_allocating(monkeypatch):
     # Every small tool survives — the ones allocated in rounds AFTER the first
     # overflow are exactly what a `break` implementation would have lost.
     assert small_kept == small_count, (big_kept, small_kept)
+
+
+# ── V2 的工具面必须可观测(2026-08-10)──────────────────────────────────
+
+
+def test_allocation_summary_reports_post_allocation_counts_per_server():
+    """`McpTurn.summary` 是 V2 这条路唯一能回答「模型看得到什么」的东西。
+
+    在此之前 V2 只有一行 `log.warning`,进不了 admin —— usr_1baf 报
+    「MCP 测试连接通过、AI 却说搜不到」时,pi 那条路已经有 mcp.surface.* 埋点
+    一眼能看到每台注册了几个,**V2 什么都没有**,只能读代码猜。
+
+    per_server 必须是**分配后**的注册数:只报发现数的话,一台被裁光的服务器
+    仍显示它有 N 个,恰好把这条埋点要回答的问题答错。
+    """
+    from hosted.mcp_tools import _allocate_round_robin, _CatalogCandidate
+    from provider_types import ToolSpec
+
+    def _mk(server, count):
+        return [
+            _CatalogCandidate(
+                server=server, raw_name=f"t{i:03d}",
+                spec=ToolSpec(name=f"mcp__{server}__t{i:03d}", description="d",
+                              parameters={"type": "object"}),
+                route=None, serialized_chars=120,
+            )
+            for i in range(count)
+        ]
+
+    # usr_1baf 的真实配置:6 台 107 个工具,超过 64 的上限
+    candidates = []
+    for server, count in (("game", 8), ("gaodemap", 12), ("gardenforum", 25),
+                          ("luckin-coffee", 30), ("mcdonalds", 28), ("tavily", 4)):
+        candidates += _mk(server, count)
+
+    turn = _allocate_round_robin(candidates)
+    summary = turn.summary
+
+    assert summary["offered"] == 107
+    assert summary["kept"] == summary["count_cap"]
+    # 每台都要有代表工具 —— 旧的字母序截断把 mcdonalds 和 tavily 双双饿死到 0
+    for server in ("game", "gaodemap", "gardenforum", "luckin-coffee",
+                   "mcdonalds", "tavily"):
+        assert f"{server}:0/" not in summary["per_server"], (
+            f"{server} 被饿死:{summary['per_server']}"
+        )
+    # 工具少的那台要全拿到
+    assert "tavily:4/4" in summary["per_server"]
+
+
+def test_summary_is_empty_when_the_user_has_no_mcp_servers():
+    """没有服务器时不该造出一份假摘要 —— 否则每轮都刷一条「0 个工具」的噪音。"""
+    from hosted.mcp_tools import McpTurn
+
+    assert McpTurn([], {}).summary == {}

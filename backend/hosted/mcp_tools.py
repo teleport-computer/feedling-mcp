@@ -23,7 +23,7 @@ import hashlib
 import json
 import logging
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from provider_types import MCP_TRANSPORT_FAILURE_ERROR, ToolResult, ToolSpec
 from hosted import mcp_core, mcp_client, mcp_probe, mcp_ca_fetch
@@ -89,6 +89,12 @@ class _CatalogCandidate:
 class McpTurn:
     tool_specs: list  # list[ToolSpec], namespaced
     routes: dict      # qualified_name -> _Route
+    # 本轮工具面的分配摘要。**不是给模型看的**,是给运维看的:
+    # 「这一轮模型到底看得到哪些 MCP 工具」以前在 V2 上完全不可观测,只有一行
+    # log.warning,进不了 admin。usr_1baf 那次就是因此只能靠用户报 + 猜
+    # (pi 那条路已有 mcp.surface.* 埋点,V2 一直没有 —— 又是一次只覆盖一条 lane)。
+    # serve_worker 拿它落 debug trace;字段与 pi 那侧对齐,方便同一套排查。
+    summary: dict = field(default_factory=dict)
 
     @property
     def is_empty(self) -> bool:
@@ -551,6 +557,22 @@ def _allocate_round_robin(candidates: list[_CatalogCandidate]) -> McpTurn:
             catalog_chars += item.serialized_chars
             kept[server] += 1
 
+    summary = {
+        "kept": len(specs),
+        "offered": len(candidates),
+        "count_cap": MAX_MCP_TOOLS_PER_TURN,
+        "char_cap": MAX_MCP_TOOL_CATALOG_CHARS,
+        "char_cap_skips": dropped_chars,
+        "catalog_chars": catalog_chars,
+        # `服务器:注册数/发现数` —— 必须是**分配后**的注册数。只报发现数的话,
+        # 一台服务器的工具全被裁掉时仍会显示它有 N 个,恰好把这条埋点要回答的
+        # 那个问题答错(pi 那侧栽过一次,这里不重蹈)。
+        "per_server": ",".join(
+            f"{name}:{kept[name]}/{len(by_server[name])}" for name in names
+        ),
+        "servers": len(names),
+    }
+
     # Never truncate silently: the count cap used to drop whole servers with no
     # log line at all, which is exactly why this took a user report to find.
     # Report kept/offered PER SERVER and post-allocation — a total alone cannot
@@ -568,4 +590,4 @@ def _allocate_round_robin(candidates: list[_CatalogCandidate]) -> McpTurn:
                 f"{name}:{kept[name]}/{len(by_server[name])}" for name in names
             ),
         )
-    return McpTurn(specs, routes)
+    return McpTurn(specs, routes, summary)

@@ -4087,6 +4087,55 @@ def _record_extraction_status(
     )
 
 
+async def _load_mcp_turn_observed(store, **kwargs):
+    """`mcp_tools.load_turn_mcp` + 把本轮工具面写进 admin 可见的 debug trace。
+
+    为什么包在装配层而不是 loader 里:loader 在 `hosted`,worker 是依赖洁净的
+    (不能碰 db/hosted)—— serve_worker 才是既能拿到 loader、又能写诊断的那一层。
+
+    为什么必须有:在此之前 V2 这条路只有一行 `log.warning`,进不了 admin。
+    usr_1baf(2026-08-09)报「MCP 测试连接通过、AI 却说搜不到」时,pi 那条路已经
+    有 mcp.surface.* 埋点、一眼能看到每台注册了几个,**V2 这条什么都没有**,
+    只能靠读代码猜。事件名与 pi 侧刻意保持一致,同一套排查方法两条 lane 通用。
+    """
+    turn = await mcp_tools.load_turn_mcp(store, **kwargs)
+    try:
+        summary = dict(getattr(turn, "summary", None) or {})
+        if summary:
+            dropped = max(0, int(summary.get("offered") or 0)
+                          - int(summary.get("kept") or 0))
+            await asyncio.to_thread(
+                _emit_v2_debug_trace,
+                store,
+                "mcp.surface.resolved",
+                status="error" if dropped else "ok",
+                summary=(f"MCP 工具面 {summary.get('kept')} 个"
+                         + (f",裁掉 {dropped} 个" if dropped else "")),
+                explain=(
+                    f"模型这一轮能看到 {summary.get('kept')} 个 MCP 工具"
+                    + (f";另有 {dropped} 个因超过上限被裁掉 —— 分配是**轮转公平**"
+                       "的(每台各拿一个再拿第二个),裁掉的是工具最多那几台的尾部,"
+                       "每台仍有代表工具。detail.per_server 是「注册数/发现数」"
+                       if dropped else "")
+                ),
+                detail={"driver": "v2", "lane": "chat", **summary},
+            )
+    except Exception as exc:  # noqa: BLE001 — 诊断绝不能影响回合
+        log.warning("[v2.mcp] surface trace failed: %s", type(exc).__name__)
+    return turn
+
+
+def _emit_v2_debug_trace(store, event_type: str, *, status: str,
+                         summary: str, explain: str, detail: dict) -> None:
+    from diagnostics import diagnostics_core
+
+    diagnostics_core.emit_trace_event_payload(store, {"event": {
+        "subsystem": "agent", "type": event_type, "status": status,
+        "summary": summary, "explain": explain, "detail": detail,
+        "actor": "hosted_v2",
+    }})
+
+
 def build_production_deps() -> v2_worker.TurnDeps:
     return v2_worker.TurnDeps(
         read_messages=_read_messages,
@@ -4149,7 +4198,7 @@ def build_production_deps() -> v2_worker.TurnDeps:
         capture_enabled=_capture_enabled_for_user,
         dream_enabled=_dream_enabled_for_user,
         apply_pending_effects=_apply_pending_effects_for_user,
-        load_mcp_turn=mcp_tools.load_turn_mcp,
+        load_mcp_turn=_load_mcp_turn_observed,
         load_workspace_prompt=_load_workspace_prompt,
         load_workspace_file=_load_workspace_file,
         seal_trajectory_payload=_seal_trajectory_payload,
