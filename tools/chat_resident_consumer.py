@@ -156,7 +156,7 @@ from memory import dream_gates as memory_dream_gates
 from memory.prompts_v1 import normalize_bucket_language
 from memory.card_text import (
     count_user_token_residuals,
-    is_card_format_error,
+    is_retryable_parse_error,
 )
 from memory.dream_prompt_v1 import (
     build_dream_prompt,
@@ -525,6 +525,26 @@ FOREGROUND_CHAT_CONTEXT_HEADER = os.environ.get(
 )
 FALLBACK_REPLY = os.environ.get(
     "FALLBACK_REPLY", "我这会儿有点慢，刚刚没接上。你稍后再发一次，我会继续接。"
+)
+# 前台聊天的硬不变量:用户在等,这一轮**必须**产出可见文字。thinking 不算,
+# tool_call 也不算。空了就原地重调模型,重调用完还空才发 FALLBACK_REPLY。
+#
+# 为什么必须在前台单独立一条:唤醒/心跳/屏幕/感知车道「只思考不说话」是**合法
+# 结果**(V2 的 2f187175 `accept thinking-only wake silence` 就是这个语义),所以
+# 抽取层(_call_agent_http_* / CLI 分支)刻意把 thinking_summary/tool_calls 当作
+# "这轮有效"而放行。前台继承了那条放行,于是:
+#   usr_0724 2026-08-08~09,MiniMax-M3 连着几轮只吐 reasoning 不吐正文
+#   → turn.messages == [] → replies == [] → 下面 posted_any 那段
+#     `if replies and not posted_any` 因为 replies 为空整段跳过
+#   → 不重试、不兜底、checkpoint 照常前进,消息被判"已回答"永久丢失。
+# 用户连发十几条五个多小时收不到任何回复、也看不到任何报错(她的解读是"你不理
+# 我了")。前台唯一正确的语义是:出不来字就重试,重试不出来就说人话,绝不沉默。
+#
+# 原地重试是安全的:走到这里我们**确知一个字都没发出去**(posted_any=False),
+# 不存在重复发送 —— 这和已有的 lease 过期重试不是一回事,那条是给"可能已经发出
+# 去了"的写失败用的。
+FOREGROUND_EMPTY_REPLY_RETRIES = max(
+    0, int(os.environ.get("FOREGROUND_EMPTY_REPLY_RETRIES", "2"))
 )
 # Canned reply for /v1/chat/verify_loop liveness pings — see the short-circuit
 # in _process_messages. The server GCs both the ping and this reply once the
@@ -8569,6 +8589,27 @@ def _image_claim_retry_prompt() -> str:
     )
 
 
+def _empty_reply_retry_prompt(text: str) -> str:
+    """前台空回合的纠偏指令(见 FOREGROUND_EMPTY_REPLY_RETRIES)。
+
+    与 `_image_claim_retry_prompt` 同款:给一次明确的纠正机会,只点明缺什么,
+    **不替它决定说什么** —— 这是伴侣的话,不是我们的。裸重调一遍很可能撞同一个
+    坑(重推理模型把整轮都花在 reasoning 里),所以必须带上这句。
+    """
+    if re.search(r"[一-鿿]", str(text or "")):
+        return (
+            "上一轮你只在心里想了,没有输出任何给对方看到的文字 —— 对方那边是"
+            "一片空白,还在等你。这一轮请直接把要说的话说出来:正文不能为空,"
+            "也不要只调工具或只写思考。"
+        )
+    return (
+        "Last turn you only thought — nothing visible was sent, so the other "
+        "person is staring at silence and still waiting. This turn, say it out "
+        "loud: the visible reply must not be empty, and must not be only a tool "
+        "call or reasoning."
+    )
+
+
 def _outbound_file_failure_reply(text: str) -> str:
     if re.search(r"[\u4e00-\u9fff]", str(text or "")):
         return "这次没能生成你要求的可下载文件，请稍后再试。"
@@ -12454,7 +12495,11 @@ def _memory_agent_parse_with_bounce(
     _note_agent_turn_success()
     parsed = parse(reply_text, strict=True)
     err = parsed[-1]
-    if not is_card_format_error(err):
+    # 谓词与 V2 的 ParseRetry.should_retry 是同一个(memory.card_text)。两条 lane
+    # 必须共用一份判据,否则同一个模型在托管和自建上会得到不同的重问行为 ——
+    # json_decode_error 以前不在重问范围,注释说它「各有自己的退避路径」,实测那条
+    # 路是空的:usr_450ee421e16a3b5a 连续 6 次失败,reask_count 全是 0。
+    if not is_retryable_parse_error(err):
         return parsed, ""
     log.warning(
         "%s content gate bounced id=%s reason=%s — re-asking once", lane, job_id, err
@@ -14942,36 +14987,116 @@ def _process_messages(messages: list) -> float:
                 pending_failure_is_parse_only = False
                 _note_agent_turn_success()
 
-        turn = _split_agent_turn(agent_result)
-        sanitized_messages: list[str] = []
-        stripped_file_citation = False
-        for message in turn.messages:
-            if not isinstance(message, str):
-                continue
-            sanitized, removed = _sanitize_outbound_file_reply(
-                message,
-                attachment_staged=bool(
-                    staged_outbound_files or staged_outbound_images
-                ),
-            )
-            stripped_file_citation = stripped_file_citation or removed
-            if sanitized.strip():
-                sanitized_messages.append(sanitized)
-        if stripped_file_citation:
-            log.warning("removed internal file reference from visible reply")
-            turn.messages = sanitized_messages
-            if not staged_outbound_files:
-                turn.messages = [
-                    _outbound_file_failure_reply(raw_user_content_for_lang)
+        def _finalize_turn(result):
+            """agent_result → 清洗后的 turn。抽成函数是为了让空回合重试走**同一
+            条**清洗链:重试出来的回复若换一条更宽松的路进库,就等于给重试开了后
+            门,线上会冒出"只有重试那次才漏内部文件引用"这种查不出来的差异。"""
+            finalized = _split_agent_turn(result)
+            sanitized_messages: list[str] = []
+            stripped_file_citation = False
+            for message in finalized.messages:
+                if not isinstance(message, str):
+                    continue
+                sanitized, removed = _sanitize_outbound_file_reply(
+                    message,
+                    attachment_staged=bool(
+                        staged_outbound_files or staged_outbound_images
+                    ),
+                )
+                stripped_file_citation = stripped_file_citation or removed
+                if sanitized.strip():
+                    sanitized_messages.append(sanitized)
+            if stripped_file_citation:
+                log.warning("removed internal file reference from visible reply")
+                finalized.messages = sanitized_messages
+                if not staged_outbound_files:
+                    finalized.messages = [
+                        _outbound_file_failure_reply(raw_user_content_for_lang)
+                    ]
+            if staged_outbound_files and not finalized.messages:
+                finalized.messages = [
+                    "文件已经准备好了。"
+                    if re.search(r"[\u4e00-\u9fff]", raw_user_content_for_lang)
+                    else "The file is ready."
                 ]
-        if staged_outbound_files and not turn.messages:
-            turn.messages = [
-                "文件已经准备好了。"
-                if re.search(r"[\u4e00-\u9fff]", raw_user_content_for_lang)
-                else "The file is ready."
-            ]
-        if staged_outbound_images and not turn.messages:
-            turn.messages = [_image_ready_reply(raw_user_content_for_lang)]
+            if staged_outbound_images and not finalized.messages:
+                finalized.messages = [_image_ready_reply(raw_user_content_for_lang)]
+            return finalized
+
+        turn = _finalize_turn(agent_result)
+
+        # ---- 前台不变量:出不来字就重试,重试不出来就说人话,绝不沉默 ---------
+        # 判据是「可见文字」。actions 也算数(动作会经 rewrite_reply_for_outcomes
+        # 变成一句诚实的回复),但 thinking_summary / tool_calls **不算** —— 那正
+        # 是 usr_0724 那三轮的形状:模型想完了、工具也调了,就是一个字没说。
+        # 已带失败通知的回合不进这里:那条路自己会发兜底,再重试等于把一次上游
+        # 故障放大成三次。维护车道也不进:那是内部回合,没有人在等,给它糊一句
+        # 「我这会儿有点慢」等于往用户聊天流里塞一条不属于对话的气泡。
+        if (
+            not turn.messages
+            and not turn.actions
+            and pending_failure_notice is None
+            and source != RESIDENT_MAINTENANCE_SOURCE
+        ):
+            for attempt in range(1, FOREGROUND_EMPTY_REPLY_RETRIES + 1):
+                log.warning(
+                    "foreground turn produced no visible reply "
+                    "(thinking=%s tool_calls=%s); retrying %d/%d",
+                    bool(turn.thinking_summary), bool(turn.tool_calls),
+                    attempt, FOREGROUND_EMPTY_REPLY_RETRIES,
+                )
+                _emit_debug_trace(
+                    "agent", "agent.reply.empty_retry", status="error",
+                    trace_id=trace_id,
+                    summary=(f"empty visible reply; retry {attempt}/"
+                             f"{FOREGROUND_EMPTY_REPLY_RETRIES}"),
+                    explain="模型这一轮只思考没说话，用户还在等；正在重试。",
+                    detail={
+                        "attempt": attempt,
+                        "max_attempts": FOREGROUND_EMPTY_REPLY_RETRIES,
+                        "had_thinking": bool(turn.thinking_summary),
+                        "had_tool_calls": bool(turn.tool_calls),
+                        "thinking_kind": turn.thinking_kind or "",
+                    },
+                    content_excerpt={
+                        "thinking": (turn.thinking_summary or "")[:2000]
+                    },
+                )
+                try:
+                    retry_result = _dispatch_foreground_agent(
+                        content
+                        + "\n\n"
+                        + _empty_reply_retry_prompt(raw_user_content_for_lang)
+                    )
+                except Exception as exc:
+                    # 重试自己炸了:别把它记成新的一类失败,按空回复收口走下面的
+                    # 兜底 —— 用户要的是一句话,不是一份更精确的验尸报告。
+                    log.error("empty-reply retry raised: %s", exc)
+                    _consume_reply_parse_failed()
+                    break
+                retry_failure_class = _consume_reply_parse_failed()
+                turn = _finalize_turn(retry_result)
+                if turn.messages or turn.actions:
+                    log.info(
+                        "empty-reply retry %d recovered a visible reply", attempt
+                    )
+                    _note_agent_turn_success()
+                    break
+                if retry_failure_class:
+                    break
+            if not turn.messages and not turn.actions:
+                # 重试用尽仍然一个字都没有。用户发了一条,就必须收到一条 ——
+                # 归 provider_empty_reply(模型压根没给正文),横幅才不会赖我们。
+                log.error(
+                    "foreground turn still empty after %d retries; sending fallback",
+                    FOREGROUND_EMPTY_REPLY_RETRIES,
+                )
+                turn.messages = [FALLBACK_REPLY]
+                pending_failure_notice = _reply_parse_failure_exc(
+                    "provider_empty_reply"
+                )
+                pending_failure_is_parse_only = True
+
         _reply_text = "\n\n".join(m for m in turn.messages if isinstance(m, str) and m.strip())
         _emit_debug_trace(
             "agent", "agent.reply", trace_id=trace_id,
