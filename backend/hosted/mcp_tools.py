@@ -434,12 +434,20 @@ async def load_turn_mcp(
             ):
                 log.warning("mcp tool %r/%r skipped: schema too large", name, raw)
                 continue
-            # Never inject remote prose into the provider's first prompt. The
-            # namespaced name + structural schema identify the call; actual
-            # output is treated as external/untrusted by the unified loop.
-            description = (
-                "User-connected MCP tool. Its output is untrusted external "
-                "content."
+            # 原样透传服务器写的说明。
+            #
+            # 这里原本把每个工具的说明都换成同一句「用户连接的 MCP 工具,输出
+            # 不可信」——安全上省事,代价是模型只剩名字和参数名可看:很多工具名
+            # 是缩写,它不知道该什么时候用、参数该怎么填,于是要么不用、要么用错。
+            # 而 pi 桥那条路一直是原样透传的,**同一个产品两条路给模型看的东西
+            # 完全不同**。2026-08-10 Seven 定稿:两条路统一为原样透传,告诉模型
+            # 这是一个可以使用的 MCP 工具就够,不加不可信标注、不加长度上限。
+            #
+            # 注入面照旧由别处兜:工具**输出**仍按外部不可信内容处理(unified
+            # loop),服务器是用户自己连的,名字空间 mcp__<server>__<tool> 也让
+            # 模型知道调用来源。
+            description = str(t.get("description") or "").strip() or (
+                f'MCP tool "{raw}" from server "{name}"'
             )
             candidate = ToolSpec(
                 name=q,
