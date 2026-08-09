@@ -526,6 +526,46 @@ FOREGROUND_CHAT_CONTEXT_HEADER = os.environ.get(
 FALLBACK_REPLY = os.environ.get(
     "FALLBACK_REPLY", "我这会儿有点慢，刚刚没接上。你稍后再发一次，我会继续接。"
 )
+# 同一句的英文。此前只有中文,自建的英文用户失败一次就收到一句中文
+# (2026-08-10 顺手修)。所有兜底文案都走 _fallback_reply_for,别再直接引用
+# FALLBACK_REPLY —— 直接引用就是漏掉英文分支的那条路。
+FALLBACK_REPLY_EN = os.environ.get(
+    "FALLBACK_REPLY_EN",
+    "I'm running slow and didn't catch that one. Send it again in a bit — "
+    "I'll pick it up.",
+)
+
+
+def _looks_chinese(text: Any) -> bool:
+    return bool(re.search(r"[一-鿿]", str(text or "")))
+
+
+def _fallback_reply_for(lang_anchor: Any = "") -> str:
+    """通用兜底(超时/5xx/限流/流断)。锚点是**用户原话**,不是拼装后的 prompt。"""
+    return FALLBACK_REPLY if _looks_chinese(lang_anchor) else FALLBACK_REPLY_EN
+
+
+def _empty_reply_fallback(lang_anchor: Any = "") -> str:
+    """「只思考没说出来」专用兜底(见 FOREGROUND_EMPTY_REPLY_RETRIES)。
+
+    刻意**不复用**通用那句:通用句覆盖 401/429/403/超时等一大票失败,那些情况
+    模型往往压根没跑起来,说「我开始想了」就是编。这一类我们确知模型收到了、
+    也确实产出了 reasoning,只是正文没出来 —— 所以可以照实说,而且照实说比
+    「我这会儿有点慢」对用户有用得多(Seven 2026-08-10:用户根本不知道发生了
+    什么)。技术归因不挤进这句话:失败横幅 turn_failure_* 是独立通道。
+    不提「系统」「网络」——我们并不知道是哪一段断的,也不该把用户自己的中转
+    问题说成我们的系统不稳。
+    """
+    if _looks_chinese(lang_anchor):
+        return (
+            "我收到你的消息了，也开始想怎么回你，可是话到一半断了，没能发出来。"
+            "让你等了。再跟我说一次，我在。"
+        )
+    return (
+        "I got your message and started writing back, but it got cut off "
+        "before anything reached you. Sorry for the wait — say it again? "
+        "I'm here."
+    )
 # 前台聊天的硬不变量:用户在等,这一轮**必须**产出可见文字。thinking 不算,
 # tool_call 也不算。空了就原地重调模型,重调用完还空才发 FALLBACK_REPLY。
 #
@@ -1222,7 +1262,9 @@ def _notify_agent_turn_failure(exc: BaseException, *, foreground: bool) -> None:
         log.exception("system notice emit failed (non-fatal)")
 
 
-def _turn_failure_reply_text(notice: "AgentErrorNotice") -> str:
+def _turn_failure_reply_text(
+    notice: "AgentErrorNotice", lang_anchor: Any = "",
+) -> str:
     """前台失败时那条用户可见气泡该说什么。
 
     `blame=user_provider` 的错误（余额耗尽 / key 失效 / 模型名被上游下线 / 上下文超限）
@@ -1235,7 +1277,7 @@ def _turn_failure_reply_text(notice: "AgentErrorNotice") -> str:
     因为对它们来说「稍后再发一次」是真话。"""
     if notice is not None and notice.blame == "user_provider":
         return notice.user_text
-    return FALLBACK_REPLY
+    return _fallback_reply_for(lang_anchor)
 
 
 def _suppress_duplicate_upstream_banner(notice: "AgentErrorNotice") -> None:
@@ -14843,7 +14885,7 @@ def _process_messages(messages: list) -> float:
                 # 否则用户被引导去重试一个永远不会成功的调用（见
                 # _turn_failure_reply_text）。
                 failure_notice = classify_agent_error(e)
-                agent_result = [_turn_failure_reply_text(failure_notice)]
+                agent_result = [_turn_failure_reply_text(failure_notice, raw_user_content_for_lang)]
                 if failure_notice.blame == "user_provider":
                     _suppress_duplicate_upstream_banner(failure_notice)
                 pending_failure_notice = e
@@ -14875,6 +14917,13 @@ def _process_messages(messages: list) -> float:
                     parse_failure_class
                 )
                 pending_failure_is_parse_only = True
+                # call_agent 那条兜底(清洗后为空)只拿得到**拼装后的 prompt**,
+                # 用它判语言正是 I5 明令禁止的(catalog/转写头里全是中文)。所以
+                # 它固定返回中文,由这里 —— 唯一握着用户原话的地方 —— 归一。
+                if agent_result == [FALLBACK_REPLY]:
+                    agent_result = [
+                        _fallback_reply_for(raw_user_content_for_lang)
+                    ]
             elif not vision_observer_failed:
                 _note_agent_turn_success()
 
@@ -15091,7 +15140,23 @@ def _process_messages(messages: list) -> float:
                     "foreground turn still empty after %d retries; sending fallback",
                     FOREGROUND_EMPTY_REPLY_RETRIES,
                 )
-                turn.messages = [FALLBACK_REPLY]
+                # 这条是这类失败在看板上**唯一**的信号:agent.reply 那条记的是
+                # status=ok(它确实解析成功了,只是解析出 0 条),stalled_turns 也
+                # 数不到 —— usr_0724 的三轮在 admin 面上长得跟正常回合一模一样,
+                # 所以这个 bug 过去有多少次我们根本查不出来。
+                _emit_debug_trace(
+                    "agent", "agent.reply.empty_exhausted", status="error",
+                    trace_id=trace_id,
+                    summary="empty visible reply after "
+                            f"{FOREGROUND_EMPTY_REPLY_RETRIES} retries",
+                    explain="重试后模型仍然只思考不说话，已发兜底回复。",
+                    detail={
+                        "max_attempts": FOREGROUND_EMPTY_REPLY_RETRIES,
+                        "had_thinking": bool(turn.thinking_summary),
+                        "thinking_kind": turn.thinking_kind or "",
+                    },
+                )
+                turn.messages = [_empty_reply_fallback(raw_user_content_for_lang)]
                 pending_failure_notice = _reply_parse_failure_exc(
                     "provider_empty_reply"
                 )
@@ -15180,7 +15245,7 @@ def _process_messages(messages: list) -> float:
                     "(degenerate punctuation fragment only)"
                 )
                 if SEND_FALLBACK_ON_AGENT_ERROR:
-                    replies = [FALLBACK_REPLY]
+                    replies = [_fallback_reply_for(raw_user_content_for_lang)]
                     pending_failure_notice = stream_cut
                 else:
                     _notify_agent_turn_failure(stream_cut, foreground=True)
