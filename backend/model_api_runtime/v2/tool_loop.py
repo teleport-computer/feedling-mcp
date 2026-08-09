@@ -50,6 +50,36 @@ _FILE_DELIVERY_TOOLS = frozenset(
         tool_schema.FILE_REPLY_TOOL,
     }
 )
+_EMPTY_RESPONSE_CORRECTION = (
+    "The previous response completed without visible text or a client tool call. "
+    "Complete the user's request now. Return either non-empty visible answer text "
+    "or a valid call to one of the offered client tools. Do not return a "
+    "thinking-only response."
+)
+_CONTENT_FREE_STOP_REASONS = frozenset(
+    {
+        "blocklist",
+        "content_filter",
+        "end_turn",
+        "function_call",
+        "image_safety",
+        "language",
+        "length",
+        "malformed_function_call",
+        "max_tokens",
+        "other",
+        "pause_turn",
+        "prohibited_content",
+        "recitation",
+        "refusal",
+        "safety",
+        "spii",
+        "stop",
+        "stop_sequence",
+        "tool_calls",
+        "tool_use",
+    }
+)
 
 
 def _catalog():
@@ -86,6 +116,98 @@ def _search_result_urls(content: str) -> set[str]:
         if isinstance(value, str) and value.strip():
             urls.add(value.strip())
     return urls
+
+
+# 判断按**小句**做,不按整段。整段判断有三个治不好的毛病(codex 两轮审出):
+#   1. 一句里的「失败」会赦免另一句里的谎报(「图生成失败了。不过图已经画好了」);
+#   2. 表达不了「完成的不是图,是提示词/思路」——「已经为你做好了图片生成提示词」;
+#   3. 表达不了引用与假设——「如果我说『图片已经生成』,那是在骗你」。
+# 小句级判断天然解决:每个小句自己带着自己的否定、引用、宾语。
+# ⚠️ 切分必须**保留结尾标点**。第一版用 [。！？!?] 当分隔符,切完小句里根本没有
+# 问号 —— 于是任何"疑问句检测"都不可能生效,「图片已经生成了吗?」被判成谎报。
+# codex 第三轮审出;根因是切分,不是词表不够。
+_CLAUSE_RE = re.compile(r"[^。！？!?;；\n,，]+[。！？!?;；\n,，]?")
+
+# 引号里的内容是**被谈论的话**,不是此刻的断言:
+#   「你想让我说"图片已经生成"吗?」「"图片已经生成"只是一个示例。」
+_QUOTED_RE = re.compile(r"[「『\"'“”‘’]([^「』\"'“”‘’]{0,60})[」』\"'“”‘’]")
+_META_RE = re.compile(
+    r"(示例|例子|举例|比如|原话|引用|假装|placeholder|example|for instance)",
+    re.IGNORECASE,
+)
+# 疑问不是断言。中文靠句末语气词或问号,英文靠助动词/疑问词开头。
+_QUESTION_RE = re.compile(
+    r"[?？]|(吗|呢|么)\s*[。.]?\s*$"
+    r"|^\s*(are|is|do|does|did|would|will|can|could|shall|should|have|has"
+    r"|why|what|how)\b",
+    re.IGNORECASE,
+)
+
+# 这个小句在谈**别的产物**,不是图本身。命中即整句放行。
+_NOT_AN_IMAGE_RE = re.compile(
+    r"(提示词|prompt|思路|构思|方案|描述|计划|草案|框架|步骤|流程"
+    r"|教程|指南|guide|说明|文档|功能|设置|选项|配置|模型|服务|接口"
+    r"|description|plan|idea|outline|draft|tutorial|instruction)",
+    re.IGNORECASE,
+)
+# 否定 / 未完成 / 假设 —— 这些小句不是在断言「图已经在这儿」。
+_NOT_A_CLAIM_RE = re.compile(
+    r"(失败|没有|没能|未能|不能|无法|出错|报错|需要|如果|要是|假如|假设"
+    r"|并没|尚未|还没|不是|别|骗|谎"
+    r"|fail|error|cannot|can['’]?t|could ?n['’]?t|unable|do(es)?\s+not"
+    r"|don['’]?t|did ?n['’]?t|have ?n['’]?t|has ?n['’]?t|not\s+yet|yet\b"
+    r"|if\s+i|suppose|would|unsupported|not\s+(be\s+)?(able|support))",
+    re.IGNORECASE,
+)
+_IMAGE_NOUN = r"(?:自画像|画像|插画|图片|图像|图)"
+_IMAGE_CLAIM_RE = re.compile(
+    r"("
+    # 图 + (已经) + 完成动词:「图片已经生成」「图片生成好了」
+    rf"{_IMAGE_NOUN}\s*(?:也|都)?\s*(?:已经|已)\s*(?:生成|画|做|完成|发|给)"
+    rf"|{_IMAGE_NOUN}\s*(?:生成好|生成完|画好|画完|做好|做完|完成)了"
+    # (已经)(为你) + 完成动词 + 了 + 图:「已经为你生成了一张图片」
+    rf"|(?:已经|已)\s*(?:为你|给你)?\s*(?:生成|画|做)(?:好|完)?了\s*"
+    rf"(?:一|这|那)?\s*[张幅副]?\s*{_IMAGE_NOUN}"
+    # 无宾语完成态「已经为你画好了」,**只在小句末尾**命中。不在末尾就说明后面
+    # 跟着别的宾语(「已经为你做好了准备」)——那类宾语是开集,靠词表挡不住,
+    # 只有位置挡得住。
+    r"|(?:已经|已)\s*(?:为你|给你)?\s*(?:生成|画|做)(?:好|完)了\s*[。.]?\s*$"
+    # 英文。连字符要一起挡("image-generation guide"),所以边界用 (?![\w-])。
+    r"|here\s*(?:['’]?s|\s+is|\s+are)\s+(?:the|your|a|an)?\s*"
+    r"(?:images?|pictures?|illustrations?|artworks?|drawings?)(?![\w-])"
+    r"|i\s*['’]?\s*(?:ve|have)\s+(?:just\s+)?(?:created|generated|drawn|made)\s+"
+    r"(?:the|an?|your)?\s*(?:images?|pictures?|illustrations?|drawings?)(?![\w-])"
+    r")",
+    re.IGNORECASE,
+)
+
+
+def _claims_image_delivered(text: str) -> bool:
+    """这段话是不是在断言「图已经存在」?
+
+    只用来识别**谎报**(说了却没有 media),不用来判断用户想不想要图 ——
+    那个判断权归伴侣自己。
+
+    宁可漏判也不要误判:漏判只是少一次纠正;误判会把伴侣一句诚实的失败说明
+    ("图片生成失败了")当成谎话打回去,**等于逼它把真话改成假话**。
+
+    按**小句**判,不按整段 —— 整段判断有三个治不好的毛病:
+      1. 一句里的「失败」会赦免另一句里的谎报;
+      2. 表达不了「完成的不是图,是提示词/思路」;
+      3. 表达不了引用与假设。
+    """
+    for raw_clause in _CLAUSE_RE.findall(str(text or "")):
+        clause = raw_clause.strip()
+        if not clause:
+            continue
+        if _QUESTION_RE.search(clause) or _META_RE.search(clause):
+            continue
+        if _NOT_A_CLAIM_RE.search(clause) or _NOT_AN_IMAGE_RE.search(clause):
+            continue
+        # 引号内容剥掉再判:引号里的是被谈论的话,不是此刻的断言。
+        if _IMAGE_CLAIM_RE.search(_QUOTED_RE.sub(" ", clause)):
+            return True
+    return False
 
 
 def _positive_limit(value, *, name: str) -> int:
@@ -264,6 +386,7 @@ class LoopOutcome:
     rounds: int
     stop_reason: str
     replied_intermediate: bool
+    delivered_media_count: int = 0
 
 
 class FinalReplySuperseded(RuntimeError):
@@ -275,6 +398,50 @@ class FinalReplySuperseded(RuntimeError):
     intermediate ``reply{}`` bubble never uses this signal: those bubbles are
     intentionally immediate and remain visible while the turn continues.
     """
+
+
+class ProviderEmptyReply(RuntimeError):
+    """A structurally valid provider success had no foreground-usable output."""
+
+
+def _empty_response_shape(pr: ProviderResponse) -> dict[str, object]:
+    """Return content-free diagnostics for a provider success with no output."""
+    raw_stop_reason = str(pr.raw.get("stop_reason") or "").strip().lower()
+    return {
+        "stop_reason": (
+            raw_stop_reason
+            if raw_stop_reason in _CONTENT_FREE_STOP_REASONS
+            else ("other" if raw_stop_reason else "")
+        ),
+        "has_visible_text": bool(pr.text.strip()),
+        "reasoning_present": bool(str(pr.raw.get("reasoning") or "").strip()),
+        "tool_call_count": len(pr.tool_calls),
+        "completion_tokens": pr.usage.completion_tokens,
+    }
+
+
+def _with_system_suffix(messages: list, suffix: str) -> list:
+    """Append a transient system suffix while preserving native exchanges."""
+    instruction = str(suffix or "").strip()
+    if not instruction:
+        return messages
+    updated = [
+        dict(message) if isinstance(message, dict) else message
+        for message in messages
+    ]
+    if (
+        updated
+        and isinstance(updated[0], dict)
+        and updated[0].get("role") == "system"
+    ):
+        updated[0]["content"] = (
+            str(updated[0].get("content") or "").rstrip()
+            + "\n\n"
+            + instruction
+        )
+    else:
+        updated.insert(0, {"role": "system", "content": instruction})
+    return updated
 
 
 async def run_tool_loop(
@@ -314,7 +481,9 @@ async def run_tool_loop(
     # response that means "nothing to say" (`required = require_reply and not
     # tool_calls`), and the wake fails silently.
     require_reply: bool = True,
+    allow_image_output: bool = False,
     on_file_reply=None,
+    on_image_reply=None,
     on_tool_event=None,
     required_file_suffixes: tuple[str, ...] | None = None,
     file_requirement_messages=(),
@@ -374,7 +543,12 @@ async def run_tool_loop(
     completion retry before the provider's terminal text is published normally.
     Chat callers may also provide ``file_requirement_messages`` plus a resolver;
     newly folded user messages then update or cancel the requirement before each
-    later provider round."""
+    later provider round.
+
+    Image generation belongs to the companion: it decides when to call
+    ``generate_image`` and writes the prompt itself. The loop only carries its
+    words alongside the picture, hands generation failures back as tool results,
+    and bounces an unbacked "I made the image" claim exactly once."""
     max_tool_calls_per_round = _positive_limit(
         max_tool_calls_per_round, name="max_tool_calls_per_round"
     )
@@ -432,6 +606,8 @@ async def run_tool_loop(
     reasoning_fragments: list[str] = []
     seen_reasoning_fragments: set[str] = set()
     force_text_fallback = False
+    empty_response_recovery_used = False
+    empty_response_retry_instruction = ""
     external_content_seen = False
     mutation_outcome_unknown = False
     outbound_tools_blocked = False
@@ -465,6 +641,8 @@ async def run_tool_loop(
     file_delivery_retry_used = False
     required_file_missing_recorded = False
     file_delivery_fallback_text = ""
+    image_claim_bounces = 0
+    image_claim_retry_instruction = ""
     file_delivery_fallback_reasoning = ""
     file_delivery_recovery_needed = False
     workspace_write_applied = False
@@ -512,6 +690,8 @@ async def run_tool_loop(
         disabled_names.add(tool_schema.REPLY_TOOL)
     if on_file_reply is None:
         disabled_names.add(tool_schema.FILE_REPLY_TOOL)
+    if on_image_reply is None:
+        disabled_names.add(tool_schema.IMAGE_REPLY_TOOL)
     turn_catalog = [
         spec
         for spec in (_catalog() + list(extra_tool_specs or []))
@@ -621,34 +801,45 @@ async def run_tool_loop(
                             await on_file_requirement_changed()
 
         messages = build_messages(list(transcript))
-        if delivery_retry_instruction:
-            # Keep provider-native tool exchanges intact. They are dataclasses,
-            # not mappings, and must survive unchanged so the next provider
-            # round can replay the exact assistant/tool-result transcript.
-            messages = [
-                dict(message) if isinstance(message, dict) else message
-                for message in messages
-            ]
-            if (
-                messages
-                and isinstance(messages[0], dict)
-                and messages[0].get("role") == "system"
-            ):
-                messages[0]["content"] = (
-                    str(messages[0].get("content") or "").rstrip()
-                    + "\n\n"
-                    + delivery_retry_instruction
-                )
-            else:
-                messages.insert(
-                    0,
-                    {"role": "system", "content": delivery_retry_instruction},
-                )
-        # Reserve the final provider attempt for a tools-disabled terminal reply.
-        # A 400/422 tool-schema rejection or repeated malformed call also forces
-        # this same one-shot fallback; the fallback itself is never retried.
+        # 三道有界纠正共用同一条临时 system suffix 注入通道：文件投递缺失、
+        # 生图谎报，以及语义空回复。各自最多打回一次，不写入 transcript。
+        retry_instructions = "\n\n".join(
+            instruction
+            for instruction in (
+                delivery_retry_instruction,
+                image_claim_retry_instruction,
+                empty_response_retry_instruction,
+            )
+            if instruction
+        )
+        if retry_instructions:
+            messages = _with_system_suffix(messages, retry_instructions)
+        # Reserve the final provider attempt for a terminal reply. Providers with
+        # a real tool_choice=none keep schemas referenced by their native history;
+        # other wires omit tools as before. A 400/422 schema rejection or repeated
+        # malformed call also forces this bounded fallback.
         terminal_text_round = force_text_fallback or attempts == max_calls - 1
-        if terminal_text_round:
+        historical_tool_names = {
+            call.name
+            for item in transcript
+            if isinstance(item, ToolExchange)
+            for call in item.calls
+            if call.name
+        }
+        provider_name = str(
+            getattr(provider_config, "provider", "") or ""
+        ).strip().lower()
+        terminal_schema_guard = (
+            terminal_text_round
+            and bool(historical_tool_names)
+            and provider_name
+            in {"anthropic", "openrouter", "openai_compatible", "deepseek"}
+        )
+        if terminal_schema_guard:
+            tools = [
+                spec for spec in turn_catalog if spec.name in historical_tool_names
+            ] or None
+        elif terminal_text_round:
             tools = None
         elif (
             external_content_seen or mutation_outcome_unknown or outbound_tools_blocked
@@ -691,15 +882,6 @@ async def run_tool_loop(
             tools = [spec for spec in turn_catalog if spec.name not in blocked_tools]
         else:
             tools = turn_catalog
-        if tools is not None and completed_memory_discovery_tools:
-            # Each discovery mode may run once. A keyword search can legitimately
-            # miss while memory_index still finds the user's saved cards, so do
-            # not suppress both after only one observation.
-            tools = [
-                spec
-                for spec in tools
-                if spec.name not in completed_memory_discovery_tools
-            ]
         requirement_already_met = (
             not file_delivery_required
             or (
@@ -709,7 +891,12 @@ async def run_tool_loop(
             )
         )
         forced_delivery_tool = ""
-        if tools is not None and file_delivery_required and not requirement_already_met:
+        if (
+            not terminal_text_round
+            and tools is not None
+            and file_delivery_required
+            and not requirement_already_met
+        ):
             # Keep the recovery path narrow enough for weaker tool-using models.
             tools = [spec for spec in tools if spec.name in _FILE_DELIVERY_TOOLS]
             if file_delivery_recovery_needed:
@@ -720,23 +907,31 @@ async def run_tool_loop(
                 )
                 tools = [spec for spec in tools if spec.name == forced_delivery_tool]
         tail_window = None
+        required_schema_names = (
+            historical_tool_names
+            if terminal_schema_guard
+            else completed_memory_discovery_tools
+        )
         adaptive_planner = getattr(build_messages, "plan_provider_round", None)
         try:
             if callable(adaptive_planner):
                 messages, frontier_plan, tail_window = adaptive_planner(
                     transcript=list(transcript),
                     tools=tools,
+                    required_tool_names=required_schema_names,
                     model_limit=model_prompt_limit,
                     output_reserve_tokens=prompt_output_reserve_tokens,
                     safety_margin_tokens=prompt_safety_margin_tokens,
                     utf8_bytes_per_token=prompt_estimator_utf8_bytes_per_token,
                     image_reserve_tokens=prompt_image_reserve_tokens,
+                    system_suffix=retry_instructions,
                 )
             else:
                 frontier_plan = prompt_frontier.plan_provider_round(
                     model_limit=model_prompt_limit,
                     messages=messages,
                     tools=tools,
+                    required_tool_names=required_schema_names,
                     output_reserve_tokens=prompt_output_reserve_tokens,
                     safety_margin_tokens=prompt_safety_margin_tokens,
                     utf8_bytes_per_token=prompt_estimator_utf8_bytes_per_token,
@@ -755,10 +950,15 @@ async def run_tool_loop(
             except Exception:
                 pass
         if "tool_schemas" in frontier_plan.omitted_optional_components:
-            # Schemas are atomic and optional: omitting the whole catalog is a
-            # valid weak-model/text-only degradation. Required conversation and
-            # native tool exchanges are never clipped to make room.
-            tools = None
+            # Once a memory discovery result is present in the required native
+            # transcript, keep that matching schema even when the remaining
+            # optional catalog no longer fits. This avoids a provider-visible
+            # call/result history whose tool definition has disappeared.
+            tools = [
+                spec
+                for spec in (tools or [])
+                if spec.name in required_schema_names
+            ] or None
         if before_provider_call is not None:
             before_provider_call()
         await _trajectory(
@@ -775,13 +975,17 @@ async def run_tool_loop(
         attempts += 1
         _progress("provider_start")
         try:
-            provider_kwargs = {"tools": tools}
-            if not require_reply:
-                # Only send the non-default so every existing caller's wire
-                # stays byte-identical.
-                provider_kwargs["require_reply"] = False
+            # V2 owns the lane-specific empty-response policy. Let the provider
+            # parser return any structurally valid success so an abnormal HTTP
+            # 200 is not retried as though it were a transient network failure.
+            provider_kwargs = {"tools": tools, "require_reply": False}
+            if terminal_schema_guard and tools is not None:
+                provider_kwargs["tool_choice"] = "none"
+            if allow_image_output and not terminal_text_round:
+                provider_kwargs["allow_image_output"] = True
             if (
                 forced_delivery_tool
+                and not terminal_text_round
                 and tools is not None
                 and str(getattr(provider_config, "provider", "")).strip().lower()
                 == "openrouter"
@@ -912,25 +1116,134 @@ async def run_tool_loop(
             raise
         _progress("provider_complete")
         add_usage(result.get("usage"))
-        if on_provider_success is not None:
+        raw_has_usable_output = bool(
+            str(result.get("reply") or "").strip()
+            or result.get("tool_calls")
+            or result.get("media")
+        )
+        if (not require_reply or raw_has_usable_output) and on_provider_success is not None:
             try:
                 await on_provider_success()
             except Exception:
                 pass
+        trajectory_result = result
+        if result.get("media"):
+            trajectory_result = dict(result)
+            trajectory_result["media"] = [
+                {
+                    "mime_type": str(item.get("mime_type") or ""),
+                    "encoded_chars": len(str(item.get("data_base64") or "")),
+                }
+                for item in result.get("media") or []
+                if isinstance(item, dict)
+            ]
+            raw_turn = result.get("assistant_turn")
+            if isinstance(raw_turn, dict):
+                trajectory_result["assistant_turn"] = {
+                    "wire": str(raw_turn.get("wire") or ""),
+                    "payload": "[generated image omitted]",
+                }
         await _trajectory(
             "provider_response",
-            {"round": attempts, "response": result},
+            {"round": attempts, "response": trajectory_result},
         )
         # Exact wire attempts are now durably encrypted. Do not retain large
         # prompt/image bodies through the following tool batch merely because
         # ProviderResponse.raw keeps its input mapping alive.
         result = provider_client.without_runtime_provider_attempt_trace(result)
         pr = ProviderResponse.from_result(result)
+
+        if (
+            require_reply
+            and not pr.text.strip()
+            and not pr.tool_calls
+            and not pr.media
+        ):
+            semantic_empty = bool(
+                str(pr.raw.get("reasoning") or "").strip()
+                or str(pr.raw.get("stop_reason") or "").strip()
+            )
+            can_correct = (
+                semantic_empty
+                and not empty_response_recovery_used
+                and attempts < max_calls - 1
+            )
+            await _trajectory(
+                "empty_provider_response",
+                {
+                    "round": attempts,
+                    "reason": "empty_provider_success",
+                    "response_shape": _empty_response_shape(pr),
+                    "action": (
+                        "semantic_correction"
+                        if can_correct
+                        else "fail_provider_empty_reply"
+                    ),
+                },
+            )
+            if can_correct:
+                empty_response_recovery_used = True
+                empty_response_retry_instruction = _EMPTY_RESPONSE_CORRECTION
+                reasoning_fragments.clear()
+                seen_reasoning_fragments.clear()
+                _progress("empty_response_retry_boundary")
+                continue
+            exc = ProviderEmptyReply("empty_reply")
+            if on_provider_failure is not None:
+                try:
+                    await on_provider_failure(exc)
+                except Exception:
+                    pass
+            raise exc
+
+        # The correction is a one-round system suffix, not transcript. Once the
+        # provider returns usable text or a tool call, later native tool rounds
+        # proceed with their original safety-filtered catalog and transcript.
+        empty_response_retry_instruction = ""
         _capture_reasoning(pr.raw)
 
         # A tools-disabled request is terminal even if a broken relay invents a
         # tool call anyway.  Never execute an undeclared call; use only its text.
         if tools is None or not pr.tool_calls:
+            # 伴侣声称画好了却一张图都没有 —— 打回去让它自己纠正。
+            #
+            # 这里原本是一道**正则意图闸**:用关键词判断「用户是不是在要图」,
+            # 模型没调工具就拿**用户原话**去生图,并把模型那轮文字整个丢掉。
+            # 拆掉的理由是它替伴侣做了本该由伴侣做的判断:「这时候有张图就更好了」
+            # 这类含蓄请求正则一定判否(想画也画不成);拿用户原话当 prompt,画出来
+            # 的东西不带伴侣的理解(不知道「自画像」里的「自」是谁);伴侣自己突然
+            # 想画一张更是完全没有入口。**决定权归伴侣。**
+            #
+            # 但「说了没做」必须处理 —— 处理方式是**退回给它重答**,而不是我们替它
+            # 补一张图或把话吞掉:它自己可以选择真去调工具,或者老实说没画成。
+            # 只退一次(和 capture 的格式打回同一个预算观),再撒谎就是模型的问题,
+            # 照原样发出并留痕,不再纠缠。
+            if (
+                pr.text
+                and not pr.media
+                and image_claim_bounces < 1
+                and _claims_image_delivered(pr.text)
+            ):
+                image_claim_bounces += 1
+                await _trajectory(
+                    "image_claim_without_media_bounced",
+                    {"round": attempts, "text_chars": len(pr.text)},
+                )
+                image_claim_retry_instruction = (
+                    "上一轮你说图已经生成/画好了,但这一轮没有任何图片真的被生成。"
+                    "请二选一,不要再声称已生成:"
+                    "(1) 你确实想给出这张图 —— 调用 generate_image 工具,把完整的"
+                    "画面描述写进 prompt;"
+                    "(2) 你并不打算画 —— 照实说,不要用文字假装图已经存在。"
+                )
+                # 只要还有下一轮就纠正 —— 哪怕那是留给「工具禁用终局回复」的
+                # 最后一轮:让它把话说诚实,比让谎话原样发出去重要。
+                # (原来是 attempts < max_calls - 1:max_calls=2 时首轮谎报根本
+                # 不打回,谎话直接发给用户 —— codex 审出。)
+                if attempts < max_calls:
+                    _progress("image_claim_retry_boundary")
+                    continue
+
             requirement_met = (
                 not file_delivery_required
                 or (
@@ -1037,11 +1350,13 @@ async def run_tool_loop(
                 # the rejected assistant text in the transcript: the next round
                 # must answer the newly folded conversation, not critique a
                 # response the user never saw.
-                await on_reply(
-                    pr.text,
-                    final=True,
-                    reasoning=_merged_reasoning(),
-                )
+                reply_kwargs = {
+                    "final": True,
+                    "reasoning": _merged_reasoning(),
+                }
+                if pr.media:
+                    reply_kwargs["media"] = pr.media
+                await on_reply(pr.text, **reply_kwargs)
             except FinalReplySuperseded:
                 reasoning_fragments.clear()
                 seen_reasoning_fragments.clear()
@@ -1053,7 +1368,13 @@ async def run_tool_loop(
                 if attempts < max_calls:
                     continue
                 return LoopOutcome("", attempts, "input_advanced", replied_intermediate)
-            return LoopOutcome(pr.text, attempts, "final_text", replied_intermediate)
+            return LoopOutcome(
+                pr.text,
+                attempts,
+                "final_media" if pr.media else "final_text",
+                replied_intermediate,
+                delivered_media_count=len(pr.media),
+            )
 
         call_ids = [tc.id for tc in pr.tool_calls]
         argument_sizes = [
@@ -1077,36 +1398,55 @@ async def run_tool_loop(
             or tool_calls_used + len(pr.tool_calls) > max_tool_calls_per_turn
         )
         offered_names = {spec.name for spec in tools}
-        malformed = any(
-            not tc.id
-            or not tc.name
-            or not tc.args_ok
-            or (
-                tc.name not in offered_names
-                and tc.name not in completed_memory_discovery_tools
+        # Provider media is terminal output. Do not silently discard or retain
+        # its large inline payload when a broken relay also invents function
+        # calls in the same turn; fall back once with every tool disabled.
+        malformed = (
+            (terminal_text_round and bool(pr.tool_calls))
+            or bool(pr.media)
+            or any(
+                not tc.id
+                or not tc.name
+                or not tc.args_ok
+                or (
+                    tc.name not in offered_names
+                    and tc.name not in completed_memory_discovery_tools
+                )
+                or (
+                    external_content_seen
+                    and tc.name == "web_fetch"
+                    and str(tc.args.get("url") or "").strip()
+                    not in allowed_fetch_urls
+                )
+                or (
+                    tc.name not in mcp_names
+                    and tool_schema.validate_tool_args(tc.name, tc.args) is not None
+                )
+                for tc in pr.tool_calls
             )
-            or (
-                external_content_seen
-                and tc.name == "web_fetch"
-                and str(tc.args.get("url") or "").strip() not in allowed_fetch_urls
-            )
-            or (
-                tc.name not in mcp_names
-                and tool_schema.validate_tool_args(tc.name, tc.args) is not None
-            )
-            for tc in pr.tool_calls
         )
+        image_reply_calls = [
+            tc for tc in pr.tool_calls if tc.name == tool_schema.IMAGE_REPLY_TOOL
+        ]
         mixed_reply_write = any(
-            tc.name in {tool_schema.REPLY_TOOL, tool_schema.FILE_REPLY_TOOL}
+            tc.name in {
+                tool_schema.REPLY_TOOL,
+                tool_schema.FILE_REPLY_TOOL,
+                tool_schema.IMAGE_REPLY_TOOL,
+            }
             for tc in pr.tool_calls
         ) and any(
             tc.name in _PLATFORM_MUTATION_TOOLS or tc.name in mutating_mcp_names
             for tc in pr.tool_calls
         )
+        invalid_image_batch = bool(image_reply_calls) and (
+            len(image_reply_calls) != 1 or len(pr.tool_calls) != 1
+        )
         if (
             malformed
             or len(set(call_ids)) != len(call_ids)
             or mixed_reply_write
+            or invalid_image_batch
             or over_tool_call_budget
             or oversized_tool_exchange
         ):
@@ -1142,7 +1482,11 @@ async def run_tool_loop(
         file_reply_calls = [
             tc for tc in pr.tool_calls if tc.name == tool_schema.FILE_REPLY_TOOL
         ]
-        loop_reply_tools = {tool_schema.REPLY_TOOL, tool_schema.FILE_REPLY_TOOL}
+        loop_reply_tools = {
+            tool_schema.REPLY_TOOL,
+            tool_schema.FILE_REPLY_TOOL,
+            tool_schema.IMAGE_REPLY_TOOL,
+        }
         other_calls = [tc for tc in pr.tool_calls if tc.name not in loop_reply_tools]
         reply_results: dict[str, ToolResult] = {}
         repeated_memory_calls = []
@@ -1258,6 +1602,88 @@ async def run_tool_loop(
             await _tool_event(
                 tc, "tool_call_result", {"result": file_result}
             )
+
+        image_final_superseded = False
+        for tc in image_reply_calls:
+            await _tool_event(tc, "tool_call_started", {})
+            await _trajectory(
+                "image_reply_planned",
+                {"round": attempts, "call_id": tc.id},
+            )
+            if on_image_reply is None:
+                raise RuntimeError("generate_image callback is unavailable")
+            # 生成与发布必须分开捕获。合在一个 try 里会把「图画好了但发布出问题」
+            # (FinalReplySuperseded / 丢租约 / 落库失败)误报成「生图失败」写进
+            # transcript —— 伴侣下一轮会以为没画成而**再画一次、再付一次钱**。
+            try:
+                media = tuple(await on_image_reply(dict(tc.args)))
+                if not media:
+                    raise RuntimeError("generate_image returned no media")
+            except Exception as exc:
+                # 生图失败**不打断这一轮** —— 把结构化失败交回给伴侣,让它自己
+                # 决定怎么跟用户说(换个描述再试、或者老实讲这次没画成)。
+                # 原来这里直接 raise,整轮炸掉:用户既没有图、也没有一句解释,
+                # 而伴侣根本不知道发生过什么。工具失败是它该知道的事实,不是
+                # runtime 替它隐藏的意外。
+                image_error_code = str(
+                    getattr(exc, "error_code", "") or "image_generation_failed"
+                )[:64]
+                image_result = ToolResult(
+                    call_id=tc.id,
+                    content=(
+                        "error: image generation failed ("
+                        + str(getattr(exc, "error_code", "") or type(exc).__name__)
+                        + "). 图没有生成。请如实告诉用户,或换一个更清楚的画面"
+                        "描述再调一次;不要声称图已经生成。"
+                    ),
+                    metadata={"image_generation_result_code": image_error_code},
+                )
+                reply_results[tc.id] = image_result
+                await _tool_event(
+                    tc, "tool_call_result", {"result": image_result}
+                )
+                continue
+            # 发布阶段:图已经存在,异常走既有的发布语义(不能当成生图失败)。
+            # FinalReplySuperseded 必须和**文本终局同款**处理(见 :1118):用户在
+            # 我们生图期间又说话了,这一轮的回复已经不该发。若放它冒泡,worker 会
+            # 当成一次通用失败 —— mark_failed + 给用户一个报错气泡,而文本终局
+            # 在同样情形下是安静地折进下一轮。生图耗时长,撞上 late input 的概率
+            # 比文本高得多,这条差异会被真实用户高频撞到。codex 审出。
+            try:
+                await on_reply(pr.text or "", final=True, media=media)
+            except FinalReplySuperseded:
+                reasoning_fragments.clear()
+                seen_reasoning_fragments.clear()
+                _progress("final_reply_superseded")
+                await _trajectory(
+                    "final_reply_superseded",
+                    {"round": attempts, "had_media": True},
+                )
+                if attempts < max_calls:
+                    # 注意:这里在 `for tc in image_reply_calls` 里,单纯 break 会
+                    # 掉进下面的 tool dispatch 继续跑这一轮。要的是**外层重来**,
+                    # 所以置标志位,退出图片循环后立刻 continue 外层。
+                    image_final_superseded = True
+                    break
+                return LoopOutcome("", attempts, "input_advanced", replied_intermediate)
+            image_result = ToolResult(
+                call_id=tc.id,
+                content="ok: image delivered",
+            )
+            await _tool_event(
+                tc, "tool_call_result", {"result": image_result}
+            )
+            return LoopOutcome(
+                "",
+                attempts,
+                "final_media",
+                replied_intermediate,
+                delivered_media_count=len(media),
+            )
+
+        if image_final_superseded:
+            # 用户在生图期间又说话了:这一轮作废,回外层用新的对话重答。
+            continue
 
         if other_calls:
             await _trajectory(

@@ -18,11 +18,13 @@ ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(ROOT / "backend"))
 
 from core import voice_token
+from core import store as core_store
 import db
 from enclave.routes import chat as enclave_chat
 from hosted import chat_send_core
 from voice import results
 from voice import routes_asgi
+from voice import cleanup as voice_cleanup
 from voice.message_filter import is_meaningful_voice_message
 
 
@@ -148,6 +150,23 @@ def test_asr_revision_keeps_the_same_logical_voice_turn():
     assert first == corrected == "2"
     assert routes_asgi._voice_turn_id(3) != first
 
+    first_delivery = routes_asgi._voice_revision_turn_id(
+        "call-1", first, "可以啊", secret_key=b"voice-secret"
+    )
+    corrected_delivery = routes_asgi._voice_revision_turn_id(
+        "call-1",
+        corrected,
+        "可以啊，今天什么时候日落？",
+        secret_key=b"voice-secret",
+    )
+    retry_delivery = routes_asgi._voice_revision_turn_id(
+        "call-1", first, "可以啊", secret_key=b"voice-secret"
+    )
+
+    assert first_delivery == retry_delivery
+    assert corrected_delivery != first_delivery
+    assert "可以" not in first_delivery
+
 
 def test_gateway_extracts_session_context_from_elevenlabs_extra_body():
     payload = {
@@ -217,6 +236,16 @@ def test_voice_metadata_requires_a_complete_bounded_pair():
     assert chat_send_core._voice_metadata(
         {"call_id": " call ", "turn_id": " turn "}
     ) == {"voice_call_id": "call", "voice_turn_id": "turn"}
+    assert chat_send_core._voice_metadata({
+        "call_id": "call",
+        "turn_id": "turn.revision",
+        "logical_turn_id": "turn",
+    }) == {
+        "voice_call_id": "call",
+        "voice_turn_id": "turn.revision",
+        "voice_logical_turn_id": "turn",
+        "voice_turn_status": "current",
+    }
     assert chat_send_core._voice_metadata(
         {"call_id": "c" * 97, "turn_id": "turn"}
     ) == {}
@@ -240,6 +269,8 @@ def test_enclave_history_preserves_voice_routing_metadata(monkeypatch):
             "content_type": "text",
             "voice_call_id": " call-1 ",
             "voice_turn_id": " turn-1 ",
+            "voice_logical_turn_id": " logical-1 ",
+            "voice_turn_status": " current ",
         }],
         "user-1",
         object(),
@@ -248,6 +279,8 @@ def test_enclave_history_preserves_voice_routing_metadata(monkeypatch):
     assert errors == []
     assert messages[0]["voice_call_id"] == "call-1"
     assert messages[0]["voice_turn_id"] == "turn-1"
+    assert messages[0]["voice_logical_turn_id"] == "logical-1"
+    assert messages[0]["voice_turn_status"] == "current"
 
 
 def test_failed_voice_turn_uses_the_normal_chat_failure_copy(monkeypatch):
@@ -301,7 +334,8 @@ def test_resident_voice_turn_enters_the_normal_chat_lane(monkeypatch):
         message="你好",
         client_msg_id="00000000-0000-0000-0000-000000000001",
         call_id="call-1",
-        turn_id="turn-1",
+        turn_id="turn-1.revision-1",
+        logical_turn_id="turn-1",
     )
 
     assert status == 202
@@ -310,7 +344,9 @@ def test_resident_voice_turn_enters_the_normal_chat_lane(monkeypatch):
     assert captured["source"] == "chat"
     assert captured["extra"] == {
         "voice_call_id": "call-1",
-        "voice_turn_id": "turn-1",
+        "voice_turn_id": "turn-1.revision-1",
+        "voice_logical_turn_id": "turn-1",
+        "voice_turn_status": "current",
     }
     assert captured["notified"] is True
 
@@ -331,7 +367,17 @@ def test_io_rejection_is_streamed_instead_of_dropping_the_call():
     assert body.count("data: [DONE]") == 1
 
 
-def test_ignored_voice_turn_returns_an_empty_streaming_completion():
+def test_ignored_voice_turn_still_returns_a_protocol_valid_completion():
+    """一轮「不说话」仍然必须是**带正文**的 completion。
+
+    这条用例原本锁的是相反的行为(`'"content"' not in body`)——而那正是
+    2026-08-08 的线上故障:ElevenLabs 的 Custom LLM 拿到零 content 的 completion
+    判协议错误 `1002 custom_llm_error: LLM Cascade Error`,**杀掉整通电话**,
+    用户侧显示「暂时无法通话」。
+
+    保留的意图不变(噪音轮不打扰主模型、不发真实文案);变的只是「什么都不发」
+    改成「发一个 TTS 不发声的最小正文」。
+    """
     response = routes_asgi._streaming_text_response("chatcmpl-test", "")
 
     async def collect() -> str:
@@ -339,8 +385,117 @@ def test_ignored_voice_turn_returns_an_empty_streaming_completion():
         return "".join(chunks)
 
     body = asyncio.run(collect())
-    assert '"content"' not in body
+    assert '"content"' in body, (
+        "零 content 的 completion 会被 ElevenLabs 判协议错误并拆掉整通电话"
+    )
     assert body.count("data: [DONE]") == 1
+    # 不能借机说任何实际内容 —— 那等于替伴侣说它没说过的话
+    payloads = [
+        json.loads(line[6:])
+        for line in body.splitlines()
+        if line.startswith("data: ") and line.strip() != "data: [DONE]"
+    ]
+    spoken = "".join(
+        (p["choices"][0]["delta"] or {}).get("content") or "" for p in payloads
+    )
+    # 用的是 ElevenLabs 自己文档里的缓冲串(线上每通正常电话都以它开头,
+    # 所以已知不会被判成空),而不是任何实际话语。
+    assert spoken == routes_asgi._VOICE_BUFFER_TEXT
+    assert not spoken.strip(" ."), f"静音轮不应包含实际话语,实际={spoken!r}"
+
+
+def test_cancel_route_does_not_clean_when_finalize_already_won(monkeypatch):
+    async def read_payload(_request):
+        return {"call_id": "vcall_race", "reason": "user_hangup"}
+
+    monkeypatch.setattr(routes_asgi.asgi_http, "read_json_silent", read_payload)
+    monkeypatch.setattr(
+        db,
+        "voice_call_cancel",
+        lambda *_args: {"status": "finalizing", "replayed": True},
+    )
+    monkeypatch.setattr(
+        results,
+        "delete_call_state",
+        lambda *_args: pytest.fail("finalize winner must keep handoff rows"),
+    )
+    monkeypatch.setattr(
+        voice_cleanup,
+        "delete_call_messages",
+        lambda *_args: pytest.fail("finalize winner must keep chat rows"),
+    )
+    monkeypatch.setattr(
+        core_store,
+        "get_store",
+        lambda *_args: pytest.fail("finalize winner must not reload chat"),
+    )
+
+    response = asyncio.run(
+        routes_asgi.cancel_voice_call(
+            SimpleNamespace(),
+            auth=SimpleNamespace(user_id="user-1"),
+        )
+    )
+
+    assert response.status_code == 200
+    assert json.loads(response.body) == {
+        "status": "finalizing",
+        "call_id": "vcall_race",
+        "replayed": True,
+        "deleted": 0,
+        "retained_covered": 0,
+        "remaining": 0,
+    }
+
+
+def test_replayed_cancel_route_remains_idempotent_and_cleans(monkeypatch):
+    async def read_payload(_request):
+        return {"call_id": "vcall_repeat", "reason": "connect_failed"}
+
+    class Store:
+        def __init__(self):
+            self.reloaded = False
+            self.notified = False
+
+        def reload(self):
+            self.reloaded = True
+
+        def notify_chat_waiters(self):
+            self.notified = True
+
+    store = Store()
+    monkeypatch.setattr(routes_asgi.asgi_http, "read_json_silent", read_payload)
+    monkeypatch.setattr(
+        db,
+        "voice_call_cancel",
+        lambda *_args: {"status": "cancelled", "replayed": True},
+    )
+    monkeypatch.setattr(
+        results,
+        "delete_call_state",
+        lambda *_args: {"results_deleted": 0, "streams_deleted": 0},
+    )
+    monkeypatch.setattr(
+        voice_cleanup,
+        "delete_call_messages",
+        lambda *_args: {"deleted": 0, "retained_covered": 0, "remaining": 0},
+    )
+    monkeypatch.setattr(core_store, "get_store", lambda *_args: store)
+    monkeypatch.setattr(routes_asgi.wake_bus, "notify", lambda *_args: None)
+
+    response = asyncio.run(
+        routes_asgi.cancel_voice_call(
+            SimpleNamespace(),
+            auth=SimpleNamespace(user_id="user-1"),
+        )
+    )
+
+    body = json.loads(response.body)
+    assert response.status_code == 200
+    assert body["status"] == "cancelled"
+    assert body["replayed"] is True
+    assert store.reloaded is True
+    assert store.notified is True
 
 
 def test_gateway_does_not_persist_or_run_non_speech_turn(monkeypatch):
@@ -371,12 +526,16 @@ def test_gateway_does_not_persist_or_run_non_speech_turn(monkeypatch):
 
     body = asyncio.run(collect())
     assert response.status_code == 200
-    assert '"content"' not in body
+    # 这条用例的价值在上面:非语音轮**不落库、不跑模型**。至于流本身,
+    # 它必须仍是协议合法的(带正文),否则 ElevenLabs 会拆掉整通电话 ——
+    # 见 test_ignored_voice_turn_still_returns_a_protocol_valid_completion。
+    assert '"content"' in body
 
 
 class _Result:
     def __init__(self, row):
         self.row = row
+        self.rowcount = 0
 
     def fetchone(self):
         return self.row
@@ -389,12 +548,19 @@ class _Connection:
     def __init__(self):
         self.rows = {}
         self.stream_rows = {}
+        self.call_statuses = {}
 
     @contextmanager
     def transaction(self):
         yield self
 
     def execute(self, sql, params=None):
+        if sql.startswith("SELECT pg_advisory_xact_lock"):
+            return _Result((None,))
+        if sql.startswith("SELECT status FROM voice_call_sessions"):
+            user_id, call_id = params
+            status = self.call_statuses.get((user_id, call_id))
+            return _Result((status,) if status else None)
         if sql.startswith("DELETE FROM voice_turn_results"):
             now = time.time()
             self.rows = {
@@ -521,6 +687,31 @@ def test_voice_reply_handoff_is_encrypted_and_idempotent(monkeypatch):
         turn_id="turn-1",
         message_id="message-duplicate",
         text="重复回答",
+    )
+
+
+def test_cancelled_call_rejects_late_result_handoff(monkeypatch):
+    pool = _Pool()
+    pool.conn.call_statuses[("user-1", "call-1")] = "cancelled"
+    monkeypatch.setenv("FEEDLING_VOICE_TOKEN_SECRET", "test-voice-secret")
+    monkeypatch.setattr(results.db, "get_pool", lambda: pool)
+
+    assert not results.store_reply(
+        "user-1",
+        call_id="call-1",
+        turn_id="turn-1",
+        message_id="late-message",
+        text="迟到回答",
+    )
+    assert results.load_reply(
+        "user-1", call_id="call-1", turn_id="turn-1"
+    ) is None
+    assert not results.store_stream_text(
+        "user-1",
+        call_id="call-1",
+        turn_id="turn-1",
+        segment=0,
+        text="迟到流",
     )
 
 

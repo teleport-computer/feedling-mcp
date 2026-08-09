@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import hmac
 import ipaddress
 import json
 import logging
@@ -35,6 +36,25 @@ log = logging.getLogger("feedling.voice.gateway")
 
 _VOICE_NAMESPACE = uuid.UUID("c1673607-3107-4554-87a1-5a8f55b70023")
 _VOICE_BUFFER_TEXT = "... "
+# 「这一轮不说话」也必须是一个**带正文**的 completion。
+#
+# 2026-08-08 线上事故:噪音轮/生命周期已结束/本轮被更新的 ASR 取代这三条路径都
+# 返回了一个零 content 的 SSE 流(只有 role 块 + finish 块)。ElevenLabs 的
+# Custom LLM 拿到没有任何正文的 completion 会判协议错误
+# —— `1002 custom_llm_error: LLM Cascade Error` —— 然后**杀掉整通电话**,
+# 用户侧看到的是「暂时无法通话」。客户端日志里的前一行正是
+# `ignored control-only agent response`。
+#
+# 用 ElevenLabs **自己文档里的**缓冲串,而不是一个空格。
+# 理由是证据而非推测:主流程每一轮开头都无条件发这个串(见 _VOICE_BUFFER_TEXT
+# 的用法),线上每一通正常电话都经过它 —— 所以我们**已知**它不会被判成空、
+# 不会杀通话。空格没有这个证据,而且 ElevenLabs 完全可能把纯空白 trim 掉后
+# 仍判成「没有文本」(codex 提的风险,我无法在不真打一通电话的情况下证伪)。
+# 绝不要在这里放真实文案:那等于替伴侣说了它没说过的话。
+#
+# ⚠️ 更正的长期做法是 ElevenLabs 的 Skip Turn 系统工具(语义上就是"这轮不说话"),
+# 需要改 agent 配置 + 返回工具调用,不在本批。
+_VOICE_SILENT_TURN_TEXT = _VOICE_BUFFER_TEXT
 
 
 def _gateway_url(request: Request) -> str | None:
@@ -108,6 +128,25 @@ def _last_user_turn(payload: dict) -> tuple[str, int] | None:
 def _voice_turn_id(user_turn_index: int) -> str:
     """Keep ASR revisions of the same utterance in one logical voice turn."""
     return str(max(1, user_turn_index))
+
+
+def _voice_revision_turn_id(
+    call_id: str,
+    logical_turn_id: str,
+    message: str,
+    *,
+    secret_key: bytes,
+) -> str:
+    """Stable opaque delivery id for one exact ASR revision.
+
+    ElevenLabs can issue another Custom LLM request for the same logical user
+    turn after a short pause.  The logical id groups those revisions; this
+    content-bound id isolates their reply streams and transport idempotency.
+    HMAC keeps short spoken phrases out of plaintext routing metadata.
+    """
+    label = f"{call_id}\n{logical_turn_id}\n{message}".encode("utf-8")
+    digest = hmac.new(secret_key, label, hashlib.sha256).hexdigest()[:20]
+    return f"{logical_turn_id}.{digest}"
 
 
 def _voice_session_context(payload: dict) -> tuple[str, str, str, list[str]]:
@@ -191,6 +230,7 @@ def _resident_voice_send_core(
     client_msg_id: str,
     call_id: str,
     turn_id: str,
+    logical_turn_id: str,
 ) -> tuple[dict, int]:
     """Put a voice transcript through the same lane as resident text chat."""
     envelope, envelope_error = core_envelope._build_shared_envelope_for_store(
@@ -209,7 +249,12 @@ def _resident_voice_send_core(
         envelope,
         client_msg_id=client_msg_id,
         window_sec=chat_idempotency.CLIENT_MSG_ID_WINDOW_SEC,
-        extra={"voice_call_id": call_id, "voice_turn_id": turn_id},
+        extra={
+            "voice_call_id": call_id,
+            "voice_turn_id": turn_id,
+            "voice_logical_turn_id": logical_turn_id,
+            "voice_turn_status": "current",
+        },
     )
     if inserted:
         store.notify_chat_waiters()
@@ -241,10 +286,16 @@ def _voice_error_text(body: dict) -> str:
 
 
 def _streaming_text_response(request_id: str, text: str) -> StreamingResponse:
+    # 空文本会退化成一个**零 content 块**的流,ElevenLabs 判协议错误并拆掉整通
+    # 电话(见 _VOICE_SILENT_TURN_TEXT)。保证放在这里而不是各调用点:调用点是
+    # 开集(噪音轮/生命周期已结束/以后还会有别的"这一轮不说话"),漏一个就是
+    # 一次线上事故。主流程那个生成器不受影响 —— 它开头无条件发 "... " 缓冲块。
+    body = text if text else _VOICE_SILENT_TURN_TEXT
+
     async def stream():
         yield _sse_chunk(request_id, role="assistant")
-        for offset in range(0, len(text), 18):
-            yield _sse_chunk(request_id, content=text[offset : offset + 18])
+        for offset in range(0, len(body), 18):
+            yield _sse_chunk(request_id, content=body[offset : offset + 18])
             await asyncio.sleep(0)
         yield _sse_chunk(request_id, finish="stop")
         yield "data: [DONE]\n\n"
@@ -279,12 +330,105 @@ async def create_voice_session(
         )
     except RuntimeError:
         return JSONResponse({"error": "voice_gateway_not_configured"}, status_code=503)
+    try:
+        import db as _db
+
+        await threadpool.run_db(
+            _db.voice_call_create_active, auth.user_id, call_id
+        )
+    except Exception as exc:  # noqa: BLE001 — no token without its tombstone row
+        log.warning(
+            "[voice.session] lifecycle create failed user=%s type=%s",
+            auth.user_id[:12],
+            type(exc).__name__,
+        )
+        return JSONResponse({"error": "voice_session_unavailable"}, status_code=503)
     return {
         "call_id": call_id,
         "token": token,
         "gateway_url": gateway_url,
         "expires_at": expires_at,
     }
+
+
+@router.post("/v1/voice/cancel")
+async def cancel_voice_call(
+    request: Request, auth: AuthResult = Depends(require_auth)
+):
+    """Idempotently end an unarchived call and suppress every late reply."""
+    from core import store as core_store
+    import db as _db
+    from voice import cleanup as voice_cleanup
+
+    payload = (await asgi_http.read_json_silent(request)) or {}
+    if not isinstance(payload, dict):
+        return JSONResponse({"error": "invalid_request"}, status_code=400)
+    call_id = str(payload.get("call_id") or "").strip()
+    reason = str(payload.get("reason") or "").strip()
+    if not call_id.startswith("vcall_") or len(call_id) > 96:
+        return JSONResponse({"error": "call_id_required"}, status_code=400)
+    if (
+        not reason
+        or len(reason) > 64
+        or any(not char.isprintable() for char in reason)
+    ):
+        return JSONResponse({"error": "cancel_reason_required"}, status_code=400)
+
+    user_id = auth.user_id
+
+    def _cancel() -> tuple[dict, int]:
+        lifecycle = _db.voice_call_cancel(user_id, call_id, reason)
+        if lifecycle["status"] in {"finalizing", "finalized"}:
+            return {
+                "status": lifecycle["status"],
+                "call_id": call_id,
+                "replayed": True,
+                "deleted": 0,
+                "retained_covered": 0,
+                "remaining": 0,
+            }, 200
+        # ⚠️ 已知风险(2026-08-09,**未修**,待 Seven 定产品语义):
+        # 客户端只按**它自己看到的** SDK 转写列表判空
+        # (VoiceCallTerminationPolicy: turns.isEmpty ? .cancel : .finalize),
+        # 而那份列表落定晚于服务端落行。说完立刻挂断/切后台时,服务端可能已有真实
+        # 逐轮行和伴侣的回复,却仍收到 cancel → 这些行被删,整通电话消失。
+        #
+        # 我曾加过一道「有行且无归档就只写墓碑、不删行」的守卫,**已撤**:
+        # `voice_call_cancel` 在守卫之前就把状态写成 cancelled,而
+        # `voice_call_begin_finalize` 见到 cancelled 会永远返回 cancelled、
+        # 路由 409 —— 留下的行**永远等不到那个 finalize**,守卫承诺的事做不到
+        # (codex 审出)。正确修法需要一个可恢复的中间态或让客户端改判据,
+        # 属产品语义决定,不在本批。
+        handoff = results.delete_call_state(user_id, call_id)
+        cleanup = voice_cleanup.delete_call_messages(user_id, call_id)
+        store = core_store.get_store(user_id)
+        # Reload from the authoritative rows: older assistant messages may be
+        # discoverable only through reply_to_message_id and carry no call id in
+        # this worker's stale cache.
+        store.reload()
+        store.notify_chat_waiters()
+        wake_bus.notify("chat", user_id)
+        if cleanup["remaining"] > 0:
+            return {
+                "error": "voice_cleanup_incomplete",
+                "call_id": call_id,
+                **cleanup,
+                **handoff,
+            }, 502
+        log.info(
+            "[voice.cancel] ended user=%s call=%s reason=%s replay=%s",
+            user_id[:12], call_id[:24], reason, lifecycle["replayed"],
+        )
+        return {
+            "status": "cancelled",
+            "call_id": call_id,
+            "replayed": bool(lifecycle["replayed"]),
+            **cleanup,
+            **handoff,
+        }, 200
+
+    body, status = await asyncio.to_thread(_cancel)
+    return JSONResponse(body, status_code=status)
 
 
 @router.post("/v1/voice/finalize")
@@ -339,8 +483,12 @@ async def finalize_voice_call(
     mid = voice_cleanup.transcript_card_message_id(call_id)
 
     def _finalize() -> tuple[dict, int]:
-        store = core_store.get_store(user_id)
         import db as _db
+
+        lifecycle = _db.voice_call_begin_finalize(user_id, call_id)
+        if lifecycle["status"] == "cancelled":
+            return {"error": "voice_call_cancelled"}, 409
+        store = core_store.get_store(user_id)
 
         # Idempotent replay. The judge is the ARCHIVE, not the chat card: the
         # card id reuses the summary era's uuid5 namespace, so a row written by
@@ -350,7 +498,11 @@ async def finalize_voice_call(
         archived = transcript_store.exists(user_id, call_id)
         already = archived and _db.chat_get_strict(user_id, mid) is not None
         if not archived:
-            text = transcript_store.render_transcript(turns)
+            # 真名优先:这份记录用户会亲眼读,Capture 也拿它当输入,两处都该看到
+            # TA 给伴侣起的名字而不是中性标签。取不到才退回既有兜底。
+            speaker_user, speaker_ai = transcript_store.resolve_speaker_names(store)
+            text = transcript_store.render_transcript(
+                turns, user_name=speaker_user, ai_name=speaker_ai)
             if not text:
                 return {"error": "turns_required"}, 400
             try:
@@ -381,6 +533,9 @@ async def finalize_voice_call(
                 turn_count=stats["turn_count"], duration_sec=stats["duration_sec"],
             ):
                 return {"error": "voice_transcript_card_not_persisted"}, 502
+        lifecycle = _db.voice_call_mark_finalized(user_id, call_id)
+        if lifecycle["status"] == "cancelled":
+            return {"error": "voice_call_cancelled"}, 409
         cleanup = voice_cleanup.delete_call_messages(user_id, call_id)
         if cleanup["remaining"] > 0:
             # Deletable rows survived (a DB blip inside chat_delete). The
@@ -512,7 +667,13 @@ async def voice_chat_completions(request: Request):
     if len(message) > 12000:
         return JSONResponse({"error": "message_too_long"}, status_code=413)
 
-    turn_id = _voice_turn_id(user_turn_index)
+    logical_turn_id = _voice_turn_id(user_turn_index)
+    turn_id = _voice_revision_turn_id(
+        call_id,
+        logical_turn_id,
+        message,
+        secret_key=results.secret(),
+    )
     client_msg_id = str(uuid.uuid5(_VOICE_NAMESPACE, f"{call_id}:{turn_id}"))
     user_id = str(claims["user_id"])
     request_id = "chatcmpl-" + hashlib.sha256(
@@ -523,7 +684,16 @@ async def voice_chat_completions(request: Request):
             "[voice.gateway] turn ignored user=%s reason=non_speech",
             user_id[:12],
         )
-        return _streaming_text_response(request_id, "")
+        return _streaming_text_response(request_id, _VOICE_SILENT_TURN_TEXT)
+
+    import db as _db
+
+    if await threadpool.run_db(_db.voice_call_status, user_id, call_id) in {
+        "finalizing",
+        "cancelled",
+        "finalized",
+    }:
+        return _streaming_text_response(request_id, _VOICE_SILENT_TURN_TEXT)
 
     from core import store as core_store
 
@@ -548,6 +718,7 @@ async def voice_chat_completions(request: Request):
                 client_msg_id=client_msg_id,
                 call_id=call_id,
                 turn_id=turn_id,
+                logical_turn_id=logical_turn_id,
             )
         else:
             body, status = await threadpool.run_db(
@@ -556,7 +727,11 @@ async def voice_chat_completions(request: Request):
                 api_key=None,
                 runtime_tok=results.mint_enclave_token(user_id),
                 payload={"message": message, "client_msg_id": client_msg_id},
-                voice_context={"call_id": call_id, "turn_id": turn_id},
+                voice_context={
+                    "call_id": call_id,
+                    "turn_id": turn_id,
+                    "logical_turn_id": logical_turn_id,
+                },
             )
     if status >= 400:
         code = str(body.get("error") or "unknown")
@@ -592,14 +767,65 @@ async def voice_chat_completions(request: Request):
         first_real_content_at: float | None = None
         buffer_count = 1
         next_keepalive = time.monotonic() + 3.5
+        next_lifecycle_check = time.monotonic()
+        next_revision_check = time.monotonic()
         reply = None
         while time.monotonic() < deadline:
+            now = time.monotonic()
+            if now >= next_lifecycle_check:
+                status = await threadpool.run_db(
+                    _db.voice_call_status, user_id, call_id
+                )
+                if status in {"finalizing", "cancelled", "finalized"}:
+                    log.info(
+                        "[voice.gateway] stream stopped user=%s status=%s",
+                        user_id[:12], status,
+                    )
+                    break
+                next_lifecycle_check = now + 0.6
+            if now >= next_revision_check:
+                current = await threadpool.run_db(
+                    results.is_current_voice_turn,
+                    user_id,
+                    parent_message_id=message_id,
+                )
+                if not current:
+                    yield _sse_chunk(request_id, finish="stop")
+                    yield "data: [DONE]\n\n"
+                    log.info(
+                        "[voice.gateway] stream superseded user=%s",
+                        user_id[:12],
+                    )
+                    return
+                next_revision_check = now + 0.5
             snapshots = await threadpool.run_db(
                 results.load_stream_texts,
                 user_id,
                 call_id=call_id,
                 turn_id=turn_id,
             )
+            has_new_stream_text = any(
+                _incremental_suffix(
+                    streamed_by_segment.get(int(snapshot.get("segment") or 0), ""),
+                    str(snapshot.get("text") or ""),
+                )
+                for snapshot in snapshots
+            )
+            if has_new_stream_text:
+                current = await threadpool.run_db(
+                    results.is_current_voice_turn,
+                    user_id,
+                    parent_message_id=message_id,
+                )
+                if not current:
+                    yield _sse_chunk(request_id, finish="stop")
+                    yield "data: [DONE]\n\n"
+                    log.info(
+                        "[voice.gateway] stream superseded before content user=%s",
+                        user_id[:12],
+                    )
+                    return
+                next_revision_check = time.monotonic() + 0.5
             for snapshot in snapshots:
                 segment = int(snapshot.get("segment") or 0)
                 text = str(snapshot.get("text") or "")
@@ -654,12 +880,33 @@ async def voice_chat_completions(request: Request):
                 buffer_count += 1
                 next_keepalive = now + 3.5
             await asyncio.sleep(0.15)
-        if reply is None:
+        lifecycle_status = await threadpool.run_db(
+            _db.voice_call_status, user_id, call_id
+        )
+        if reply is None and lifecycle_status not in {
+            "finalizing",
+            "cancelled",
+            "finalized",
+        }:
             reply = {
                 "message_id": "",
                 "text": notices_catalog.user_text_for("turn_timeout"),
             }
-        text = str(reply.get("text") or "")
+        if lifecycle_status not in {"finalizing", "cancelled", "finalized"}:
+            current = await threadpool.run_db(
+                results.is_current_voice_turn,
+                user_id,
+                parent_message_id=message_id,
+            )
+            if not current:
+                yield _sse_chunk(request_id, finish="stop")
+                yield "data: [DONE]\n\n"
+                log.info(
+                    "[voice.gateway] stream superseded before final user=%s",
+                    user_id[:12],
+                )
+                return
+        text = str((reply or {}).get("text") or "")
         latest_segment = max(streamed_by_segment, default=-1)
         streamed_final = streamed_by_segment.get(latest_segment, "")
         remaining = _final_suffix(streamed_final, text)

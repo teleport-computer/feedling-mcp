@@ -120,8 +120,10 @@ from workspace.sandbox import (
 from workspace.service import production_backend as production_workspace_backend
 from worldbook import worldbook_core
 import db
+import generated_image
 import memory_readside_core
 import provider_client
+from provider_types import ProviderResponse
 
 log = logging.getLogger("feedling.runtime_v2.serve_worker")
 
@@ -858,6 +860,18 @@ def _decrypt_chat_rows(
             item["source"] = source
         if call_id:
             item["voice_call_id"] = call_id[:96]
+            # 这三个字段以前只在 capture 分支带出来,于是 V2 的**普通 prompt 路径**
+            # 拿到的通话行永远没有 turn id。两个后果都是 P0,且只在 V2 上表现:
+            #   ① voice.message_filter 的「只保留最新 ASR 修订」判据取不到 key,
+            #      把通话中的**每一轮**用户话连同回复一起判成被取代 → 尾巴全空;
+            #   ② coalesce 要求 call_id + turn_id 齐全才透传 correlation,缺一个
+            #      就整组丢弃 → PR #165 的「挂断后抑制迟到回复」在 V2 上从未武装。
+            # resident 视图一直带着它们,所以两条 bug 都只咬 V2 —— 又是一次
+            # 「只修了一条 lane」。
+            for key in ("voice_turn_id", "voice_logical_turn_id", "voice_turn_status"):
+                value = m.get(key)
+                if isinstance(value, str) and value.strip():
+                    item[key] = value.strip()[:128]
         if include_capture_metadata:
             item["source"] = source
             item["raw_role"] = raw_role
@@ -1013,6 +1027,43 @@ def _read_tail_window(
     return _decrypt_chat_rows(user_id, rows, user_only=False)
 
 
+def _scrub_leaked_thinking_rows(rows: list[dict]) -> list[dict]:
+    """把历史里 assistant 行残留的 ``<think>`` 擦掉再喂回模型。
+
+    正常情况下思考封在**另一个**信封里，模型永远看不到；历史正文里带标签的行
+    是「漏出去时原样存下来」的异常。不擦的话模型每轮都看到可抄的样板，于是继续
+    写、继续漏——这是本 bug 自我强化的那一环（2026-08-08：主动消息那条 lane
+    我们根本没要求它写 think，它是从历史里学的）。
+
+    只碰 assistant 行：用户自己打的字里出现标签是他的自由，不是我们的协议。
+
+    剥离失败（FAILED）时**不能原样保留**——那等于把可抄的格式继续摆在模型面前
+    （Codex review 2026-08-08 Important #2）。但也不整行换占位符：那些文字本来
+    就已经发到用户眼前过了，抹掉整行只会平白打断对话连贯性。折中是只删标签壳、
+    保留文字，格式没了、内容还在。行的 id/ts/seq 一律原样保留，compaction /
+    capture 的水位连续性不受影响。
+    """
+    from core import self_thinking as _st
+
+    if not _st.gate_enabled():
+        return rows
+    out: list[dict] = []
+    for row in rows:
+        content = row.get("content")
+        if str(row.get("role") or "") != "assistant" or not isinstance(content, str):
+            out.append(row)
+            continue
+        status, _thinking, stripped = _st.strip_all_thinking(content)
+        if status == _st.ABSENT:
+            out.append(row)
+            continue
+        if status == _st.FAILED:
+            out.append({**row, "content": _st.strip_tag_markers(content)})
+            continue
+        out.append({**row, "content": stripped})
+    return out
+
+
 def _read_tail_window_after_seq(
     user_id: str,
     after_seq: int,
@@ -1032,12 +1083,14 @@ def _read_tail_window_after_seq(
         through_seq=through_seq,
         exclude_synthetic_sources=exclude_synthetic_sources,
     )
-    return _decrypt_chat_rows(
-        user_id,
-        rows,
-        user_only=False,
-        preserve_unreadable=True,
-        include_capture_metadata=include_capture_metadata,
+    return _scrub_leaked_thinking_rows(
+        _decrypt_chat_rows(
+            user_id,
+            rows,
+            user_only=False,
+            preserve_unreadable=True,
+            include_capture_metadata=include_capture_metadata,
+        )
     )
 
 
@@ -1102,11 +1155,17 @@ def _read_recent_turns(
         through_seq=through_seq,
     )
     raw_rows = list(window.get("rows") or [])
-    decrypted = _decrypt_chat_rows(
-        user_id,
-        raw_rows,
-        user_only=False,
-        preserve_unreadable=True,
+    # 这条窗口会作为 optional replay 回到 prompt（worker 的 optional_tail_turns），
+    # 所以和 _read_tail_window_after_seq 一样要过闸——只擦 tail 不擦这里的话，
+    # summary 水位之前的旧泄漏行会继续被 replay 回去教模型模仿
+    # （Codex review 2026-08-08 Important #1）。
+    decrypted = _scrub_leaked_thinking_rows(
+        _decrypt_chat_rows(
+            user_id,
+            raw_rows,
+            user_only=False,
+            preserve_unreadable=True,
+        )
     )
     raw_by_seq = {int(row["seq"]): row for row in raw_rows}
     for row in decrypted:
@@ -2057,7 +2116,124 @@ def _read_files(user_id: str, message_ids: list[str]) -> dict[str, dict]:
     return out
 
 
-# Candidate count and whole-card prompt budget for one Dream run.  Selected
+async def _generate_image_for_chat(
+    user_id: str,
+    prompt: str,
+    *,
+    main_provider_config: provider_client.ProviderConfig,
+    api_key: str | None,
+    runtime_token: str,
+):
+    """Resolve the user's optional image route and return normalized media."""
+    selected = await asyncio.to_thread(db.model_api_image_generation_route, user_id)
+    route = selected
+    config = main_provider_config
+    if selected is not None:
+        if str(selected.get("image_generation_test_status") or "") != "ok":
+            raise v2_worker.ImageGenerationUnavailable(
+                "image generation route is not ready",
+                error_code="image_generation_model_not_ready",
+                model=str(selected.get("model") or ""),
+                provider=str(selected.get("provider") or ""),
+            )
+        envelope = selected.get("api_key_envelope")
+        if not isinstance(envelope, dict):
+            raise v2_worker.ImageGenerationUnavailable(
+                "image generation credential is missing",
+                error_code="image_generation_model_not_ready",
+                model=str(selected.get("model") or ""),
+                provider=str(selected.get("provider") or ""),
+            )
+        try:
+            provider_key = await asyncio.to_thread(
+                core_enclave._decrypt_envelope_via_enclave,
+                envelope,
+                api_key,
+                purpose="model_api_provider_key",
+                runtime_token=runtime_token,
+            )
+            config = provider_client.ProviderConfig(
+                str(selected.get("provider") or ""),
+                str(selected.get("model") or ""),
+                provider_key.decode("utf-8"),
+                str(selected.get("base_url") or ""),
+                context_window_tokens=selected.get("context_window_tokens"),
+                reasoning_effort=str(selected.get("reasoning_effort") or ""),
+            )
+        except v2_worker.ImageGenerationUnavailable:
+            raise
+        except Exception as exc:  # noqa: BLE001 - stable failure below
+            raise v2_worker.ImageGenerationUnavailable(
+                "image generation credential could not be opened",
+                error_code="image_generation_auth_invalid",
+                model=str(selected.get("model") or ""),
+                provider=str(selected.get("provider") or ""),
+            ) from exc
+
+    try:
+        result = await provider_client.generate_image_async(config, prompt)
+        media = ProviderResponse.from_result(result).media
+        if not media:
+            raise provider_client.ProviderError("image_generation_invalid_output")
+    except Exception as exc:  # noqa: BLE001 - stable capability surface
+        classified = provider_client.classify_provider_error(exc)
+        incompatible = classified in {"provider_config", "provider_incompatible"} or (
+            str(exc).strip().lower()
+            in {"image_generation_model_unsupported", "image_generation_invalid_output"}
+        )
+        code = {
+            "auth_invalid": "image_generation_auth_invalid",
+            "quota_insufficient": "image_generation_quota_insufficient",
+            "model_not_found": "image_generation_model_not_found",
+            "rate_limited": "image_generation_rate_limited",
+            "upstream_unavailable": "image_generation_unavailable",
+            "turn_timeout": "image_generation_unavailable",
+        }.get(classified, "image_generation_failed")
+        if incompatible:
+            code = (
+                "image_generation_model_incompatible"
+                if selected is not None
+                else "image_generation_model_required"
+            )
+        if isinstance(route, dict) and route.get("id"):
+            await asyncio.to_thread(
+                db.model_api_route_mark_image_generation_test,
+                user_id,
+                str(route["id"]),
+                status="unsupported" if incompatible else "failed",
+                error=code,
+            )
+        elif selected is None:
+            active = await asyncio.to_thread(db.model_api_active_route, user_id)
+            if isinstance(active, dict) and active.get("id"):
+                await asyncio.to_thread(
+                    db.model_api_route_mark_image_generation_test,
+                    user_id,
+                    str(active["id"]),
+                    status="unsupported" if incompatible else "failed",
+                    error=code,
+                )
+        raise v2_worker.ImageGenerationUnavailable(
+            "image generation failed",
+            error_code=code,
+            model=str(getattr(config, "model", "") or ""),
+            provider=str(getattr(config, "provider", "") or ""),
+        ) from exc
+
+    target = route
+    if target is None:
+        target = await asyncio.to_thread(db.model_api_active_route, user_id)
+    if isinstance(target, dict) and target.get("id"):
+        await asyncio.to_thread(
+            db.model_api_route_mark_image_generation_test,
+            user_id,
+            str(target["id"]),
+            status="ok",
+        )
+    return media
+
+
+# Candidate count and whole-card prompt budget for one Dream run. Selected
 # cards are never field-truncated: once the bounded prompt cannot fit another
 # complete fetched card, it stops and leaves that card for a later run.
 _MEMORY_CARDS_LIMIT = int(os.environ.get("FEEDLING_V2_MEMORY_CARDS_LIMIT", "60"))
@@ -2631,14 +2807,32 @@ def _reply_message_fields(payload: dict) -> tuple[str, dict]:
     raw = payload.get("message_extra")
     if raw is None:
         return "text", {}
-    if not isinstance(raw, dict) or set(raw) != {
+    if not isinstance(raw, dict):
+        raise RuntimeError("invalid reply message metadata")
+    content_type = raw.get("content_type")
+    if content_type == "image":
+        if set(raw) != {"content_type", "image_mime", "image_byte_count"}:
+            raise RuntimeError("invalid image reply metadata")
+        mime_type = str(raw.get("image_mime") or "").strip().lower()
+        if mime_type not in {"image/jpeg", "image/png", "image/webp"}:
+            raise RuntimeError("invalid image reply mime")
+        byte_count = raw.get("image_byte_count")
+        if (
+            type(byte_count) is not int
+            or byte_count <= 0
+            or byte_count > generated_image.MAX_GENERATED_IMAGE_STORED_BYTES
+        ):
+            raise RuntimeError("invalid image reply size")
+        return "image", {
+            "image_mime": mime_type,
+            "image_byte_count": byte_count,
+        }
+    if content_type != "file" or set(raw) != {
         "content_type",
         "file_name",
         "file_mime",
         "file_byte_count",
     }:
-        raise RuntimeError("invalid reply message metadata")
-    if raw.get("content_type") != "file":
         raise RuntimeError("unsupported reply content type")
     name = v2_worker._safe_download_name(
         "/workspace/" + str(raw.get("file_name") or "")
@@ -2667,7 +2861,7 @@ def _reply_message_fields(payload: dict) -> tuple[str, dict]:
 
 
 def _reply_payload_sequence(payload: dict) -> list[dict]:
-    """Validate a final text reply followed by its downloadable file cards."""
+    """Validate one final reply group and its encrypted media/file parts."""
     if v2_worker.REPLY_FOLLOWUPS_KEY not in payload:
         return [payload]
     raw_followups = payload.get(v2_worker.REPLY_FOLLOWUPS_KEY)
@@ -2680,8 +2874,8 @@ def _reply_payload_sequence(payload: dict) -> list[dict]:
 
     primary = dict(payload)
     primary.pop(v2_worker.REPLY_FOLLOWUPS_KEY, None)
-    if _reply_message_fields(primary)[0] != "text":
-        raise RuntimeError("reply followups require a text primary")
+    if _reply_message_fields(primary)[0] not in {"text", "image"}:
+        raise RuntimeError("reply followups require a text or image primary")
 
     sequence = [primary]
     for raw_followup in raw_followups:
@@ -2689,10 +2883,15 @@ def _reply_payload_sequence(payload: dict) -> list[dict]:
             not isinstance(raw_followup, dict)
             or set(raw_followup) != {"envelope", "message_extra"}
             or not isinstance(raw_followup.get("envelope"), dict)
-            or _reply_message_fields(raw_followup)[0] != "file"
+            or _reply_message_fields(raw_followup)[0] not in {"file", "image"}
         ):
             raise RuntimeError("invalid reply followup")
-        sequence.append(dict(raw_followup))
+        followup = dict(raw_followup)
+        for key in ("voice_call_id", "voice_turn_id"):
+            value = str(payload.get(key) or "").strip()
+            if value:
+                followup[key] = value
+        sequence.append(followup)
     return sequence
 
 
@@ -2795,6 +2994,9 @@ def _sink_reply_in_transaction(user_id: str, payload: dict, connection):
     records = []
     previous_ts: float | None = None
     last_index = len(message_payloads) - 1
+    grouped_reply = len(message_payloads) > 1 or any(
+        _reply_message_fields(item)[0] == "image" for item in message_payloads
+    )
     for index, message_payload in enumerate(message_payloads):
         envelope = message_payload.get("envelope")
         if not isinstance(envelope, dict):
@@ -2809,6 +3011,9 @@ def _sink_reply_in_transaction(user_id: str, payload: dict, connection):
                 job_id=int(message_payload["activity_job_id"]),
             )
         build_extra = {**reply_extra, **activity_extra, **message_extra}
+        if grouped_reply:
+            build_extra["reply_part_index"] = index
+            build_extra["reply_part_count"] = len(message_payloads)
         if reply_parent_id:
             build_extra["reply_to_message_id"] = reply_parent_id
         wake_kind = str(message_payload.get("wake_kind") or "")
@@ -3919,6 +4124,7 @@ def build_production_deps() -> v2_worker.TurnDeps:
         append_summary_segment=_append_summary_segment,
         append_summary_checkpoint=_append_summary_checkpoint,
         read_images=_read_images,
+        generate_image=_generate_image_for_chat,
         read_vision_observations=_read_vision_observations,
         observe_photo=_observe_photo,
         read_files=_read_files,

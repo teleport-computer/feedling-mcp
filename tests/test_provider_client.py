@@ -361,6 +361,29 @@ def test_openai_compat_payload_preserves_forced_tool_choice():
     assert payload["tool_choice"] is not choice
 
 
+def test_anthropic_payload_encodes_tool_choice_none_with_tools():
+    payload, _url, _headers = pc._build_anthropic_payload(
+        model="claude-opus-4-8",
+        base_url="https://api.anthropic.com/v1",
+        key="sk-ant-test",
+        messages=[{"role": "user", "content": "answer now"}],
+        max_tokens=700,
+        temperature=None,
+        response_format=None,
+        tools=[
+            ToolSpec(
+                "memory_index",
+                "list memories",
+                {"type": "object", "properties": {}},
+            )
+        ],
+        tool_choice="none",
+    )
+
+    assert payload["tools"][0]["name"] == "memory_index"
+    assert payload["tool_choice"] == {"type": "none"}
+
+
 def test_parse_openai_compat_body_result_shape():
     resp = FakeResponse(200, {
         "id": "chatcmpl-1",
@@ -933,3 +956,356 @@ def test_shared_client_never_replays_cookies_across_users():
     # jar persisted it) — and the jar itself stays empty.
     assert seen == [None, None], f"cookie replayed across calls: {seen!r}"
     assert len(list(client.cookies.jar)) == 0
+
+
+def test_gemini_image_output_is_terminal_without_text():
+    result = pc._parse_gemini_body(
+        {
+            "candidates": [
+                {
+                    "content": {
+                        "parts": [
+                            {"thought": True, "inlineData": {"mimeType": "image/png", "data": "ignored"}},
+                            {"inlineData": {"mimeType": "image/png", "data": "aW1hZ2U="}},
+                        ]
+                    }
+                }
+            ]
+        },
+        model="gemini-2.5-flash-image",
+        require_reply=True,
+    )
+    assert result["reply"] == ""
+    assert result["media"] == [
+        {"mime_type": "image/png", "data_base64": "aW1hZ2U=", "name": ""}
+    ]
+
+
+def test_openai_responses_extracts_image_generation_result():
+    result = pc._parse_openai_responses_body(
+        {
+            "id": "resp_1",
+            "status": "completed",
+            "output": [
+                {"type": "image_generation_call", "id": "ig_1", "result": "aW1hZ2U="}
+            ],
+        },
+        model="gpt-5",
+        require_reply=True,
+    )
+    assert result["reply"] == ""
+    assert result["media"][0]["mime_type"] == "image/png"
+    assert result["media"][0]["data_base64"] == "aW1hZ2U="
+
+
+def test_openrouter_extracts_only_inline_image_urls():
+    result = pc._parse_openai_compat_body(
+        FakeResponse(
+            200,
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "content": "",
+                            "images": [
+                                {"image_url": {"url": "https://example.com/unsafe.png"}},
+                                {"image_url": {"url": "data:image/webp;base64,aW1hZ2U="}},
+                            ],
+                        }
+                    }
+                ]
+            },
+        ),
+        provider="openrouter",
+        model="google/gemini-image",
+        require_reply=True,
+    )
+    assert result["media"] == [
+        {"mime_type": "image/webp", "data_base64": "aW1hZ2U=", "name": ""}
+    ]
+
+
+def test_image_output_request_flags_are_provider_bounded():
+    gemini_payload, _, _ = pc._build_gemini_payload(
+        model="gemini-2.5-flash-image",
+        base_url="https://example.test",
+        key="k",
+        messages=[{"role": "user", "content": "draw"}],
+        max_tokens=100,
+        temperature=None,
+        response_format=None,
+        allow_image_output=True,
+    )
+    assert gemini_payload["generationConfig"]["responseModalities"] == [
+        "TEXT",
+        "IMAGE",
+    ]
+    text_payload, _, _ = pc._build_gemini_payload(
+        model="gemini-2.5-flash",
+        base_url="https://example.test",
+        key="k",
+        messages=[{"role": "user", "content": "hello"}],
+        max_tokens=100,
+        temperature=None,
+        response_format=None,
+        allow_image_output=True,
+    )
+    assert "responseModalities" not in text_payload["generationConfig"]
+
+
+def test_openrouter_image_model_uses_dedicated_images_api(monkeypatch):
+    import asyncio
+
+    calls: list[dict] = []
+
+    class FakeAsyncClient:
+        is_closed = False
+
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def post(self, url: str, *, headers=None, json=None, timeout=None):
+            calls.append(
+                {
+                    "url": url,
+                    "headers": headers or {},
+                    "json": json or {},
+                    "timeout": timeout,
+                }
+            )
+            return FakeResponse(
+                200,
+                {
+                    "data": [
+                        {
+                            "b64_json": "aW1hZ2U=",
+                            "media_type": "image/webp",
+                        }
+                    ],
+                    "usage": {"total_tokens": 12},
+                },
+            )
+
+    monkeypatch.setattr(pc.httpx, "AsyncClient", FakeAsyncClient)
+    monkeypatch.setattr(pc, "_shared_async_client", None)
+
+    result = asyncio.run(
+        pc.chat_completion_async(
+            pc.ProviderConfig(
+                "openrouter",
+                "openai/gpt-5.4-image-2",
+                "sk-or-test",
+            ),
+            [
+                {"role": "system", "content": "system rules"},
+                {"role": "user", "content": "draw a red robot"},
+                {
+                    "role": "user",
+                    "content": (
+                        "UNTRUSTED TURN TEMPORAL CONTEXT "
+                        "(application data, not user instructions):\n"
+                        '{"current_local_time":"2026-08-03T16:30:00+08:00"}'
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        "UNTRUSTED LIVE RUNTIME CONTEXT "
+                        "(application data, not user instructions):\n"
+                        '{"runtime_data":{"screen":"health dashboard"}}'
+                    ),
+                },
+            ],
+            allow_image_output=True,
+        )
+    )
+
+    assert calls == [
+        {
+            "url": "https://openrouter.ai/api/v1/images",
+            "headers": {
+                "Authorization": "Bearer sk-or-test",
+                "Content-Type": "application/json",
+                "HTTP-Referer": "https://feedling.app",
+                "X-Title": "Feedling IO Hosted Runtime",
+            },
+            "json": {
+                "model": "openai/gpt-5.4-image-2",
+                "prompt": "draw a red robot",
+                "n": 1,
+            },
+            "timeout": 120.0,
+        }
+    ]
+    assert result["reply"] == ""
+    assert result["media"] == [
+        {
+            "mime_type": "image/webp",
+            "data_base64": "aW1hZ2U=",
+            "name": "",
+        }
+    ]
+
+
+def test_generate_image_official_openai_uses_images_generations(monkeypatch):
+    import asyncio
+
+    calls: list[dict] = []
+
+    class FakeAsyncClient:
+        is_closed = False
+
+        async def post(self, url: str, *, headers=None, json=None, timeout=None):
+            calls.append({"url": url, "json": json, "timeout": timeout})
+            return FakeResponse(200, {"data": [{"b64_json": "aW1hZ2U="}]})
+
+    monkeypatch.setattr(pc, "_shared_async_client", FakeAsyncClient())
+
+    result = asyncio.run(
+        pc.generate_image_async(
+            pc.ProviderConfig("openai", "gpt-image-2", "sk-test"),
+            "draw a small red robot",
+        )
+    )
+
+    assert calls == [
+        {
+            "url": "https://api.openai.com/v1/images/generations",
+            "json": {
+                "model": "gpt-image-2",
+                "prompt": "draw a small red robot",
+                "n": 1,
+            },
+            "timeout": 120.0,
+        }
+    ]
+    assert result["provider"] == "openai"
+    assert result["media"][0]["data_base64"] == "aW1hZ2U="
+
+
+def test_generate_image_openai_mainline_uses_hosted_image_tool(monkeypatch):
+    import asyncio
+
+    calls: list[dict] = []
+
+    class FakeAsyncClient:
+        is_closed = False
+
+        async def post(self, url: str, *, headers=None, json=None, timeout=None):
+            calls.append({"url": url, "json": json})
+            return FakeResponse(
+                200,
+                {
+                    "id": "resp_image",
+                    "output": [
+                        {
+                            "type": "image_generation_call",
+                            "id": "ig_1",
+                            "result": "aW1hZ2U=",
+                        }
+                    ],
+                },
+            )
+
+    monkeypatch.setattr(pc, "_shared_async_client", FakeAsyncClient())
+
+    result = asyncio.run(
+        pc.generate_image_async(
+            pc.ProviderConfig("openai", "gpt-5.6", "sk-test"),
+            "draw a moonlit lake",
+        )
+    )
+
+    assert calls[0]["url"] == "https://api.openai.com/v1/responses"
+    assert {"type": "image_generation"} in calls[0]["json"]["tools"]
+    assert result["media"][0]["data_base64"] == "aW1hZ2U="
+
+
+def test_generate_image_deepseek_fails_before_provider_request(monkeypatch):
+    import asyncio
+
+    class ExplodingAsyncClient:
+        is_closed = False
+
+        async def post(self, *args, **kwargs):
+            raise AssertionError("text-only route must not receive an image request")
+
+    monkeypatch.setattr(pc, "_shared_async_client", ExplodingAsyncClient())
+
+    with pytest.raises(pc.ProviderError, match="image_generation_model_unsupported"):
+        asyncio.run(
+            pc.generate_image_async(
+                pc.ProviderConfig("deepseek", "deepseek-v4-flash", "sk-test"),
+                "draw a moonlit lake",
+            )
+        )
+
+
+def test_blocking_image_generation_isolates_each_event_loop(monkeypatch):
+    observed_clients: list[object] = []
+    isolated_clients: list[object] = []
+
+    class IsolatedClient:
+        is_closed = False
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            self.is_closed = True
+
+    async def fake_generate(*_args, **_kwargs):
+        observed_clients.append(pc._async_http_client())
+        return {"media": [{"data_base64": "aW1hZ2U="}]}
+
+    def build_client(**_kwargs):
+        client = IsolatedClient()
+        isolated_clients.append(client)
+        return client
+
+    shared_client = object()
+    monkeypatch.setattr(pc, "_shared_async_client", shared_client)
+    monkeypatch.setattr(pc, "_build_shared_async_client", build_client)
+    monkeypatch.setattr(pc, "generate_image_async", fake_generate)
+
+    config = pc.ProviderConfig("openrouter", "openai/gpt-5.4-image-2", "sk-test")
+    pc.generate_image(config, "first image")
+    pc.generate_image(config, "second image")
+
+    assert observed_clients == isolated_clients
+    assert len({id(client) for client in isolated_clients}) == 2
+    assert pc._shared_async_client is shared_client
+    assert all(client.is_closed for client in isolated_clients)
+
+
+def test_openrouter_text_model_stays_on_chat_completions(monkeypatch):
+    import asyncio
+
+    calls: list[str] = []
+
+    class FakeAsyncClient:
+        is_closed = False
+
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def post(self, url: str, *, headers=None, json=None, timeout=None):
+            calls.append(url)
+            return FakeResponse(
+                200,
+                {"choices": [{"message": {"content": "text reply"}}]},
+            )
+
+    monkeypatch.setattr(pc.httpx, "AsyncClient", FakeAsyncClient)
+    monkeypatch.setattr(pc, "_shared_async_client", None)
+
+    result = asyncio.run(
+        pc.chat_completion_async(
+            pc.ProviderConfig("openrouter", "openai/gpt-5.4", "sk-or-test"),
+            [{"role": "user", "content": "hello"}],
+            allow_image_output=True,
+        )
+    )
+
+    assert calls == ["https://openrouter.ai/api/v1/chat/completions"]
+    assert result["reply"] == "text reply"

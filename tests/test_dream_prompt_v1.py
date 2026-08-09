@@ -42,15 +42,34 @@ def test_prompt_naming_rule_and_backfill_instruction():
     assert "提到 Seven 就用「Seven」" in p
     flat = p.replace("\n", "").replace(" ", "")
     assert '永远不要用"用户"/"user"' in flat
-    assert "不要用「TA」指代对方" in flat
+    assert "不要用「TA」指代本人" in flat
     # Backfill is scoped: only TA that refers to the PERSON gets rewritten;
     # TA correctly referring to the AI (the app-surface meaning) is preserved.
-    assert '指代对方本人的"用户"/"user"/「TA」/「你」/猜测性别的他或她' in flat
-    assert "名字未知时优先省略主语" in flat
-    assert "中性的「对方」" in flat
+    assert '指代本人的"用户"/"user"/「TA」/「你」/「对方」按上面那条' in flat
     assert "指代你（AI）的「TA」" in flat and "保留不动" in flat
     p2 = build_dream_prompt(ai_name="", user_name="", cards="", recent_conversations="")
     assert "优先省略主语" in p2
+
+
+def test_dream_backfill_does_not_downgrade_correct_pronouns():
+    """Dream must NOT rewrite an already-correct 「她」 into 「对方」.
+
+    usr_144b, 2026-08-09: capture read the transcript and wrote 「陪她分析母亲
+    王福英的住院检验报告」; that night dream followed its own backfill clause
+    (「把…猜测性别的他或她改成…名字未知时…中性的「对方」」) and produced
+    「陪对方分析…」 — a self-declared soulmate calling her 「对方」 in its own
+    memory.  The backfill list must no longer contain gender pronouns, and the
+    prompt must say correct ones are kept.
+    """
+    flat = build_dream_prompt(
+        ai_name="小柒", user_name="", cards="", recent_conversations="",
+    ).replace("\n", "").replace(" ", "")
+    assert "猜测性别的他或她" not in flat, "追溯改写清单里不能再有性别代词"
+    assert "旧卡里已经在用的「他」/「她」保留不动" in flat
+    # 反过来:旧卡里的「对方」进了改写清单 —— 线索够就该上调成 他/她,
+    # 存量脏卡靠 dream 自愈,不用单独回填。
+    assert "/「对方」按上面那条" in flat
+    assert "没名字但线索够就用「他」/「她」" in flat
 
 
 def test_reserved_placeholder_user_name_treated_as_unknown():

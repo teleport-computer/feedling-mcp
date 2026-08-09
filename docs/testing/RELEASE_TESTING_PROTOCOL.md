@@ -30,7 +30,7 @@
 | 环境 | 用途 | 入口 |
 |---|---|---|
 | 本地 pytest + 真 PG | L0/L1 单元与集成 | `FEEDLING_TEST_PG=postgresql://…@127.0.0.1:5432/postgres`，`env -u FEEDLING_API_KEY -u FEEDLING_API_URL python3 -m pytest` |
-| **test 环境** | L1/L2 全部 E2E | `https://test-api.feedling.app`；enclave `https://173c7f49aeb54acb424676b17b17f78e5e2b2938-5003s.dstack-pha-prod9.phala.network`（in-enclave TLS，verify=False） |
+| **test 环境** | L1/L2 全部 E2E | `https://test-api.feedling.app`；enclave `https://test-enclave.feedling.app`（自定义域入口）。⚠️ 网关 `-5003s.` passthrough 主机名由 app_id 派生，每次换 CVM 重部署就失效——2026-08-08 实测旧地址 TLS 握手超时、自定义域 200。凡是需要解密源的环节（尤其本地起 resident consumer）用旧地址会直接启动失败。 |
 | prod | L3 验收 + 只读排查 | `https://api.feedling.app`（admin 只读；**绝不在 prod 造测试数据**） |
 
 ### 1.2 Provider key 池（Seven 已批全套建池）

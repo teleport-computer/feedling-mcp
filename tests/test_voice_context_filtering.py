@@ -42,6 +42,35 @@ def _voice_rows() -> list[dict]:
             "content": "- 对方: 你好\n- 我: 你好呀",
         },
         {
+            "id": "voice-old-revision",
+            "role": "user",
+            "source": "chat",
+            "voice_call_id": "vcall_live",
+            "voice_turn_id": "2.old",
+            "voice_logical_turn_id": "2",
+            # Simulate the brief primary-to-TEE mirror lag: ordering still
+            # makes the later revision authoritative before this flips.
+            "voice_turn_status": "current",
+            "content": "可以啊",
+        },
+        {
+            "id": "voice-old-reply",
+            "role": "assistant",
+            "source": "model_api",
+            "reply_to_message_id": "voice-old-revision",
+            "content": "那试一条语音吧",
+        },
+        {
+            "id": "voice-current-revision",
+            "role": "user",
+            "source": "chat",
+            "voice_call_id": "vcall_live",
+            "voice_turn_id": "2.current",
+            "voice_logical_turn_id": "2",
+            "voice_turn_status": "current",
+            "content": "可以啊，今天什么时候日落？",
+        },
+        {
             "id": "real-chat",
             "role": "user",
             "source": "chat",
@@ -50,25 +79,47 @@ def _voice_rows() -> list[dict]:
     ]
 
 
-def test_conversation_rows_keep_typed_dots_but_drop_voice_artifacts():
+def test_conversation_rows_keep_typed_dots_and_the_call_record_but_drop_artifacts():
+    """噪音行与旧 ASR 修订仍然要挡住;**通话卡要留下**。
+
+    这条原本断言卡也被丢掉。2026-08-08 定案:卡被整个删掉的代价是挂断之后伴侣
+    在普通聊天里完全不知道刚才通过话 —— 用户接着打字说「刚才电话里说的那个」,
+    模型没有任何上下文。卡改成换身份保留(见 test_voice_context_regressions)。
+    """
     assert [row["id"] for row in conversation_rows(_voice_rows())] == [
         "typed-dots",
+        "archive-card",
+        "voice-current-revision",
         "real-chat",
     ]
 
 
-def test_v2_prompt_never_replays_archive_preview_or_voice_noise_reply():
+def test_v2_prompt_never_replays_voice_noise_and_labels_the_call_record():
     messages = context.build_turn_messages(
         system_prompt="SYS",
         summary="",
         tail=_voice_rows(),
     )
     rendered = "\n".join(str(message.get("content") or "") for message in messages)
-    assert "- 对方: 你好" not in rendered
+    # 噪音行与它的回复照旧挡住
     assert "又是点点点" not in rendered
     assert "……" not in rendered
     assert "..." in rendered  # ordinary typed chat is untouched
     assert "今天在成都" in rendered
+
+    # 通话记录进 prompt,但**必须带抬头**,而且不能以伴侣自己的身份出现。
+    # 卡的正文是双方混合的预览,原样 replay 会让模型把用户的话当成自己说的
+    # —— 与 2026-07-17 字面 `user:` 标签事故同族。
+    assert "- 对方: 你好" in rendered, "通话记录不该从 prompt 里整个消失"
+    card_messages = [
+        m for m in messages if "- 对方: 你好" in str(m.get("content") or "")
+    ]
+    assert len(card_messages) == 1
+    block = str(card_messages[0]["content"])
+    assert "不是你说过的话" in block, "必须声明这不是伴侣自己的发言"
+    assert block.index("不是你说过的话") < block.index("- 对方: 你好"), (
+        "抬头必须在逐字记录之前,否则模型先读到对话体再读到说明"
+    )
 
 
 def test_future_compaction_omits_voice_artifact_content_but_keeps_coverage():
@@ -88,12 +139,19 @@ def test_future_compaction_omits_voice_artifact_content_but_keeps_coverage():
     )
     request = str(calls)
     assert out == "- 用户今天在成都"
-    assert "- 对方: 你好" not in request
     assert "又是点点点" not in request
+    # 通话记录也要进滚动摘要:否则压缩之后那通电话就彻底不存在了。
+    assert "- 对方: 你好" in request, "通话记录不该被排除在压缩输入之外"
+    assert "那试一条语音吧" not in request
+    assert "可以啊，今天什么时候日落？" in request
     assert "今天在成都" in request
 
     calls.clear()
-    hidden_only = _voice_rows()[1:4]
+    # 只含**真正不可见**的行:噪音用户行 + 挂在它下面的回复。
+    # 原来这里切的是 [1:4](多含一张通话卡),那时卡也被丢弃所以整段确实为空;
+    # 现在卡是**可见内容**(它代表真实发生过的一通电话),含卡的段落理应正常
+    # 走摘要而不是被确定性折叠掉 —— 那才是「整段不可见」这条捷径的本意。
+    hidden_only = _voice_rows()[1:3]
     deterministic = asyncio.run(
         compaction.compact_segment(
             provider_config=object(),

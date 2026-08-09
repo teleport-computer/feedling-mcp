@@ -10,17 +10,16 @@ from hosted import config_store as hosted_config_store
 
 def runtime_capability(store) -> dict:
     onboarding_route = accounts_onboarding._load_onboarding_route(store)
-    if onboarding_route == "model_api":
-        try:
-            if hosted_config_store.hosted_runtime_v2_enabled_strict(store):
-                return {
-                    "available": True,
-                    "runtime": "v2",
-                    "onboarding_route": onboarding_route,
-                    "unavailable_reason": "",
-                }
-        except Exception:
-            pass
+    try:
+        if hosted_config_store.hosted_runtime_v2_enabled_strict(store):
+            return {
+                "available": True,
+                "runtime": "v2",
+                "onboarding_route": onboarding_route,
+                "unavailable_reason": "",
+            }
+    except Exception:
+        pass
 
     try:
         resident_ready = chat_consumer.consumer_supports_capability(

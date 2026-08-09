@@ -11,9 +11,15 @@ import re
 
 _RESERVED_USER_NAMES = frozenset({"ta", "user", "用户"})
 
-# 名字未知时,**模型可见文本**里对本人的中性称呼。内部未知标记仍是 "TA"
-# (sanitize_user_name 的返回),但「TA」不能出现在模型看得见的地方 ——
+# 名字未知**且性别也看不出来**时,模型可见文本里对本人的中性称呼。内部未知标记
+# 仍是 "TA"(sanitize_user_name 的返回),但「TA」不能出现在模型看得见的地方 ——
 # _naming_rule 正是禁止模型这么叫本人的。
+#
+# 触发条件是「没有任何可靠的称呼/性别线索」,**不是**「user_name 字段为空」
+# (2026-08-09 改;旧判据把"字段没填"当成"不知道这个人是谁",usr_144b 从没填过
+# 名字,于是 capture 读对话写对的「陪她分析母亲的检验报告」被当晚 dream 追溯
+# 改成「陪对方分析…」)。性别判断交给看得见身份卡、旧卡和对话的模型,不在这层
+# 做确定性推断 —— 见 rewrite_user_reference 里代词那段。
 UNKNOWN_PERSON_LABEL = "对方"
 UNKNOWN_PERSON_LABEL_EN = "The person"
 
@@ -38,11 +44,17 @@ def _naming_rule(user_name: str) -> str:
         )
     return (
         "如果材料里明确出现了本人希望被称呼的名字，就用那个名字；"
-        "否则优先省略主语（例如「常在深夜写代码，累了会突然沉默」），"
-        "确实需要主语时只用中性的「对方」。"
-        "不要用「用户」/\"user\"、指代本人的「TA」、猜测性别的他/她，"
+        "没有名字时优先省略主语（例如「常在深夜写代码，累了会突然沉默」）。"
+        "需要主语时，按身份卡、你和 TA 的关系、旧卡和对话里的线索判断性别，"
+        "用「他」或「她」；线索不足以判断，才用中性的「对方」。"
+        "不要用「用户」/\"user\"、指代本人的「TA」，"
         "也不要用第二人称「你」来指代本人。"
     )
+
+
+# 通话记录块的中性标签。它不是任何一方的发言,而是一段归档材料。
+VOICE_CALL_RECORD_ROLE = "voice_call_record"
+VOICE_CALL_RECORD_LABEL = "通话记录"
 
 
 def transcript_speaker_label(role: str, *, user_name: str, ai_name: str = "") -> str:
@@ -58,7 +70,13 @@ def transcript_speaker_label(role: str, *, user_name: str, ai_name: str = "") ->
     名字未知时退到中性的「对方」(UNKNOWN_PERSON_LABEL),既不退回 ``user``,
     也不用内部标记 ``TA``——prompt 正是禁止模型这么叫本人的。
     """
-    if str(role or "").strip().lower() == "user":
+    normalized = str(role or "").strip().lower()
+    if normalized == VOICE_CALL_RECORD_ROLE:
+        # 通话记录块既不是本人也不是伴侣说的话,它是一段**归档材料**。
+        # 落到下面任一分支都会把整段归给某一方 —— 归给伴侣尤其糟:
+        # 那正是 2026-07-17 那次事故的形状(把对方做的事写成自己做的)。
+        return VOICE_CALL_RECORD_LABEL
+    if normalized == "user":
         # 再 sanitize 一次(纵深防御):把 用户/user 当"名字"传进来,
         # 也不能变成 "用户: …" 这一行。
         name = sanitize_user_name(user_name)
@@ -141,14 +159,31 @@ def rewrite_user_reference(text: str, user_name: str, subject: str = "") -> str:
         raw,
     )
     if str(subject or "") == "user":
+        # 「TA」/「你」指代本人:任何情况下都改掉 —— prompt 明令禁的就是这两个词,
+        # 名字未知时退到「对方」也仍然好过留着内部标记。
         raw = re.sub(
-            r"(^|[。！？.!?]\s*)(?:TA|你|他|她)(?=[\u4e00-\u9fff])",
+            r"(^|[。！？.!?]\s*)(?:TA|你)(?=[\u4e00-\u9fff])",
             lambda match: match.group(1) + zh_referent,
             raw,
         )
         raw = re.sub(
-            r"(?i)(^|[.!?]\s+)(?:you|he|she)\b",
+            r"(?i)(^|[.!?]\s+)(?:you)\b",
             lambda match: match.group(1) + en_referent,
             raw,
         )
+        # 他/她:只在**知道真名**时上调成真名(名字比代词好)。名字未知时保留不动 ——
+        # 把一个有依据的「她」降级成「对方」正是 2026-08-09 撤掉的那条判据
+        # (见 UNKNOWN_PERSON_LABEL 上方)。这一层是确定性的、看不见身份卡与对话,
+        # 手上没有任何判断性别的证据,所以它没资格改写代词,只有资格升级成真名。
+        if name != "TA":
+            raw = re.sub(
+                r"(^|[。！？.!?]\s*)(?:他|她)(?=[一-鿿])",
+                lambda match: match.group(1) + zh_referent,
+                raw,
+            )
+            raw = re.sub(
+                r"(?i)(^|[.!?]\s+)(?:he|she)\b",
+                lambda match: match.group(1) + en_referent,
+                raw,
+            )
     return raw

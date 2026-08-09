@@ -93,6 +93,12 @@ def test_prompt_frontier_failures_use_stable_content_free_status_codes():
     assert worker._turn_failure_error_class(
         worker.TurnError("prompt_coverage_incomplete:reply_empty")
     ) == "unknown"
+    assert worker._safe_failure_code(
+        "turn_failed", worker.v2_tool_loop.ProviderEmptyReply("empty_reply")
+    ) == "turn_failed:empty_reply"
+    assert worker._provider_health_error_class(
+        worker.v2_tool_loop.ProviderEmptyReply("empty_reply")
+    ) == "provider_empty_reply"
 
 
 @pytest.mark.parametrize(
@@ -130,8 +136,12 @@ def test_prompt_frontier_failures_use_stable_content_free_status_codes():
             ),
             "vision_model_required",
         ),
-        # 2026-08-07:空回复=模型/provider 行为(三个 raise 点全是),归 provider。
+        # 2026-08-07: 空回复属于模型/provider 行为，统一归 provider。
         (worker.TurnError("empty_reply"), "provider_empty_reply"),
+        (
+            worker.v2_tool_loop.ProviderEmptyReply("empty_reply"),
+            "provider_empty_reply",
+        ),
         (RuntimeError("opaque internal failure"), "unknown"),
     ],
 )
@@ -183,14 +193,14 @@ def _script_provider(monkeypatch, responses):
     scripted results in order. Each `responses[i]` is a dict `{"reply": str,
     "tool_calls": [...], "usage": {...}|None}` matching the wire contract
     `provider_types.ProviderResponse.from_result` reads. Returns the list of
-    captured `{"messages": ..., "tools": ...}` call records so a test can
+    captured provider call records so a test can
     assert what the model actually saw each round (e.g. that a prior round's
     tool observation was folded in)."""
     it = iter(responses)
     calls = []
 
-    async def _fake(config, messages, *, tools=None, **_kwargs):
-        calls.append({"messages": messages, "tools": tools})
+    async def _fake(config, messages, *, tools=None, **kwargs):
+        calls.append({"messages": messages, "tools": tools, **kwargs})
         return next(it)
 
     monkeypatch.setattr(provider_client, "chat_completion_async", _fake)
@@ -1916,9 +1926,9 @@ def test_chat_turn_always_replies_even_when_model_only_calls_tools(monkeypatch):
     plan that never asked for `final_response` could silently swallow the turn
     (fixed back then by forcing `wants_reply=True` for the chat lane). In the
     unified tool loop this can no longer happen BY CONSTRUCTION:
-    `tool_loop.run_tool_loop`'s last round always omits `tools` (forcing plain
-    text — Global Constraints), so a model that just keeps calling tools every
-    round still gets forced to a real reply at the `_TURN_MAX_LLM_CALLS`
+    `tool_loop.run_tool_loop`'s last round keeps referenced schemas but sets
+    `tool_choice=none`, so a model that just keeps calling tools every round
+    still gets forced to a real reply at the `_TURN_MAX_LLM_CALLS`
     budget — never a placeholder, never a silent swallow."""
     uid = "u_w_loop_bug4"
     conftest.seed_user(uid)
@@ -1942,7 +1952,8 @@ def test_chat_turn_always_replies_even_when_model_only_calls_tools(monkeypatch):
 
     assert status == "completed"
     assert len(calls) == n            # ran to the budget, no early silent stop
-    assert calls[-1]["tools"] is None  # last round forced plain text
+    assert {spec.name for spec in calls[-1]["tools"]} == {"memory_index"}
+    assert calls[-1]["tool_choice"] == "none"
     assert written.get("text") == "MODEL REPLY"       # forced reply at the cap — no silent swallow
 
 
@@ -1983,8 +1994,8 @@ def test_turn_llm_call_budget_binds_even_with_continuous_new_input(monkeypatch):
     hold even when new user messages keep arriving mid-turn (the per-round
     fold — Task 6/7's replacement for the old outer replan mechanism) and the
     model keeps asking for tools every round: the turn must still terminate at
-    EXACTLY the budget, forced to plain text on the last round (`tools=None`),
-    never running away past it."""
+    EXACTLY the budget, forced to plain text on the last round
+    (`tool_choice=none`), never running away past it."""
     uid = "u_w_loop_budget"
     conftest.seed_user(uid)
     _reset(uid)

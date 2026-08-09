@@ -330,6 +330,53 @@ def test_result_classifier_never_turns_error_body_into_metadata():
     assert chat_activity.result_code("private customer record") == "ok"
 
 
+def test_image_generation_result_code_is_allowlisted():
+    assert chat_activity.image_generation_result_code(
+        "image_generation_model_required"
+    ) == "image_generation_model_required"
+    assert chat_activity.image_generation_result_code("private_customer_record") == ""
+
+
+def test_chat_tool_callback_keeps_image_generation_failure_code(monkeypatch):
+    captured = []
+    monkeypatch.setattr(
+        worker.jobs_store,
+        "append_status_event",
+        lambda _user_id, _kind, **kwargs: captured.append(kwargs["detail"]),
+    )
+    callback = worker._make_chat_tool_activity_callback(
+        user_id="usr_image_failure",
+        job_id=17,
+        attempt_identity=1,
+        recorder=None,
+        effect_evidence_by_call={},
+    )
+    call = SimpleNamespace(id="call-image", name="generate_image")
+
+    async def run():
+        await callback(call, "tool_call_started", {})
+        await callback(
+            call,
+            "tool_call_result",
+            {
+                "result": ToolResult(
+                    call_id="call-image",
+                    content="error: private provider detail",
+                    metadata={
+                        "image_generation_result_code": (
+                            "image_generation_model_required"
+                        )
+                    },
+                )
+            },
+        )
+
+    asyncio.run(run())
+    assert captured[-1]["state"] == "failure"
+    assert captured[-1]["result_code"] == "image_generation_model_required"
+    assert "private provider detail" not in repr(captured)
+
+
 def _memory_result(*buckets):
     return {
         "ok": True,

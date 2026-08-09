@@ -194,6 +194,12 @@ REGISTRY: dict[str, Entry] = {
         "通话全文转写归档；标准 content envelope 的持久用户资产，与 chat_messages / "
         "memory_moments 同型。切读 TEE 后用户仍要能回看通话记录，所以必须复制",
     ),
+    "voice_call_sessions": Entry(
+        SKIP,
+        "语音通话取消/finalize 的 RDS 并发控制面；只保存 call id、状态与结束原因，"
+        "回复落库 fence 必须和 RDS chat 写事务共库加锁，复制到 TEE 既不能参与互斥"
+        "也不是持久用户资产",
+    ),
     "voice_turn_results": Entry(
         SKIP,
         "voice SSE 的 900 秒 AES-GCM 临时交接缓冲；非标准 content envelope，过期即删，"

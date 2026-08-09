@@ -133,6 +133,14 @@ def test_pi_runtime_metadata_reads_exact_model_modalities(tmp_path, monkeypatch)
     }
 
 
+def test_consumer_advertises_native_image_generation_only_when_enabled(monkeypatch):
+    monkeypatch.delenv("FEEDLING_AGENT_IMAGE_GENERATION", raising=False)
+    assert crc.AGENT_IMAGE_GENERATION_CAPABILITY not in crc._consumer_capabilities()
+
+    monkeypatch.setenv("FEEDLING_AGENT_IMAGE_GENERATION", "true")
+    assert crc.AGENT_IMAGE_GENERATION_CAPABILITY in crc._consumer_capabilities()
+
+
 def test_runtime_model_identity_uses_configured_fact(monkeypatch):
     monkeypatch.setattr(
         crc,
@@ -4528,7 +4536,7 @@ def test_capture_transcript_labels_use_real_names():
     assert "user:" not in text and "agent:" not in text
 
 
-def test_resident_context_omits_voice_archive_and_linked_noise_reply():
+def test_resident_context_omits_voice_noise_but_keeps_the_call_record():
     history = [
         {"id": "typed", "role": "user", "source": "chat", "content": "..."},
         {
@@ -4557,7 +4565,14 @@ def test_resident_context_omits_voice_archive_and_linked_noise_reply():
 
     cleaned = crc._clean_messages_for_proactive_context(history)
 
-    assert [message["id"] for message in cleaned] == ["typed", "real"]
+    # 噪音行与挂在它下面的回复照旧挡住;**通话卡要留下**。
+    # 这条原本断言卡也被丢掉。2026-08-08 定案:整个删掉的代价是挂断之后伴侣在
+    # 普通聊天里完全不知道刚才通过话 —— 用户接着打字说「刚才电话里说的那个」,
+    # 模型没有任何上下文。卡改成换身份保留(不再冒充 assistant 说过的话)。
+    assert [message["id"] for message in cleaned] == ["typed", "card", "real"]
+    card_row = next(m for m in cleaned if m["id"] == "card")
+    assert card_row["role"] == crc._VOICE_CALL_RECORD_ROLE
+    assert "不是你说过的话" in str(card_row.get("content") or "")
 
 
 def test_resident_capture_expands_full_archive_not_card_preview(monkeypatch):
@@ -5888,6 +5903,115 @@ def test_claude_turn_from_stream_empty_when_no_success_result():
     raw = json.dumps({"type": "assistant", "message": {"content": [
         {"type": "text", "text": "partial"}]}})
     assert crc._claude_turn_from_stream(raw) == ("", "")
+
+
+def test_claude_actual_models_uses_only_structured_stream_metadata():
+    raw = "\n".join([
+        json.dumps({
+            "type": "assistant",
+            "message": {
+                "model": "claude-fable-5",
+                "content": [{"type": "text", "text": "我是 Opus 4.8"}],
+            },
+        }),
+        json.dumps({
+            "type": "result",
+            "subtype": "success",
+            "result": "I am claude-sonnet-4-6",
+            "modelUsage": {
+                "claude-fable-5": {"inputTokens": 1},
+                "claude-haiku-4-5": {"inputTokens": 1},
+            },
+        }),
+    ])
+
+    assert crc._claude_actual_models_from_stream(raw) == {
+        "claude-fable-5",
+        "claude-haiku-4-5",
+    }
+
+
+@pytest.mark.parametrize(
+    ("configured", "actual", "matches"),
+    [
+        ("fable", {"claude-fable-5"}, True),
+        ("opus", {"claude-opus-4-8"}, True),
+        ("sonnet", {"claude-sonnet-4-6"}, True),
+        ("haiku", {"claude-haiku-4-5"}, True),
+        ("claude-fable-5", {"claude-fable-5"}, True),
+        ("claude-fable-5", {"claude-opus-4-8"}, True),
+        ("fable", {"claude-opus-4-8"}, True),
+        ("claude-sonnet-4-6", {"claude-sonnet-4-6-20260801"}, True),
+        ("claude-fable-5", {"deepseek-chat"}, False),
+        ("claude-fable-5", {"claude-opus-4-8", "deepseek-chat"}, False),
+    ],
+)
+def test_claude_configured_model_matches_structured_actual(configured, actual, matches):
+    assert crc._claude_configured_model_matches(configured, actual) is matches
+
+
+def test_call_agent_cli_allows_claude_family_model_fallback(monkeypatch, caplog):
+    monkeypatch.setattr(crc, "AGENT_CLI_CMD", "claude --model claude-fable-5 -p {message}")
+    monkeypatch.setattr(crc, "AGENT_RUNTIME_METADATA", {
+        "provider": "anthropic",
+        "model": "claude-fable-5",
+        "input_modalities": ["text"],
+    })
+    monkeypatch.setattr(crc, "_resolve_cli_executable", lambda cmd: cmd)
+    monkeypatch.setattr(crc, "_load_agent_session_id", lambda: "")
+    cleared = []
+    monkeypatch.setattr(crc, "_clear_agent_session_id", cleared.append)
+
+    class _R:
+        returncode = 0
+        stdout = json.dumps({
+            "type": "result",
+            "subtype": "success",
+            "session_id": "wrong-model-session",
+            "result": "我记得你喜欢蓝色。",
+            "modelUsage": {"claude-opus-4-8": {"inputTokens": 42}},
+        })
+        stderr = ""
+
+    monkeypatch.setattr(crc.subprocess, "run", lambda *a, **kw: _R())
+
+    assert crc.call_agent_cli("请调用工具读取我喜欢的颜色") == "我记得你喜欢蓝色。"
+    assert cleared == []
+    assert "claude family fallback allowed" in caplog.text
+    assert "configured=claude-fable-5 actual=claude-opus-4-8" in caplog.text
+
+
+def test_call_agent_cli_allows_claude_success_without_model_metadata(monkeypatch, caplog):
+    monkeypatch.setattr(crc, "AGENT_CLI_CMD", "claude --model claude-fable-5 -p {message}")
+    monkeypatch.setattr(crc, "AGENT_RUNTIME_METADATA", {
+        "provider": "anthropic",
+        "model": "claude-fable-5",
+        "input_modalities": ["text"],
+    })
+    monkeypatch.setattr(crc, "_resolve_cli_executable", lambda cmd: cmd)
+    monkeypatch.setattr(crc, "_load_agent_session_id", lambda: "")
+
+    class _R:
+        returncode = 0
+        stdout = json.dumps({
+            "type": "result", "subtype": "success", "result": "蓝色。",
+        })
+        stderr = ""
+
+    monkeypatch.setattr(crc.subprocess, "run", lambda *a, **kw: _R())
+
+    assert crc.call_agent_cli("我喜欢的颜色是什么？") == "蓝色。"
+    assert "no structured actual-model metadata" in caplog.text
+
+
+def test_model_mismatch_is_a_system_runtime_error():
+    notice = crc.classify_agent_error(RuntimeError(
+        "model_mismatch: configured=claude-fable-5 actual=claude-opus-4-8"
+    ))
+
+    assert notice.error_class == "model_mismatch"
+    assert notice.blame == "system"
+    assert notice.user_text == "当前运行时没有成功加载所选模型，请重新选择模型或稍后重试。"
 
 
 def test_call_agent_cli_claude_tool_turn_delivers_only_final_answer(monkeypatch):

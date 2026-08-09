@@ -44,6 +44,7 @@ from memory.source_policy import (  # noqa: E402
     RESIDENT_ABSORB_SOURCE,
     RESIDENT_PATCH_SOURCE,
 )
+from core import chat_activity as _chat_activity  # noqa: E402
 
 try:
     from identity import card_policy as _card_policy  # single source, pure stdlib
@@ -341,6 +342,35 @@ def _memory_activity_metadata(tool_name, output):
     return metadata
 
 
+def _image_generation_activity_result_code(output):
+    """Extract one server-authored code without retaining the response body."""
+    if not isinstance(output, dict):
+        return ""
+    candidates = [output.get("error_class"), output.get("error_code")]
+    error = output.get("error")
+    if isinstance(error, dict):
+        candidates.extend(
+            error.get(key) for key in ("error_class", "error_code", "error", "code")
+        )
+    else:
+        candidates.append(error)
+    for candidate in candidates:
+        code = _chat_activity.image_generation_result_code(candidate)
+        if code:
+            return code
+    return ""
+
+
+def _activity_result_code(tool_name, output, exit_code):
+    if int(exit_code or 0) == 0:
+        return "ok"
+    if tool_name == "generate_image":
+        code = _image_generation_activity_result_code(output)
+        if code:
+            return code
+    return "tool_error"
+
+
 def _emit_turn_activity(args, activity_id, state, *, dur_ms=None, exit_code=0):
     """Best-effort V1 activity event; never sends arguments or result bodies."""
     try:
@@ -361,7 +391,9 @@ def _emit_turn_activity(args, activity_id, state, *, dur_ms=None, exit_code=0):
         if dur_ms is not None:
             payload["duration_ms"] = round(float(dur_ms), 1)
         if state != "running":
-            payload["result_code"] = "ok" if int(exit_code or 0) == 0 else "tool_error"
+            payload["result_code"] = _activity_result_code(
+                tool_name, _LAST_TOOL_OUTPUT, exit_code
+            )
             if int(exit_code or 0) == 0:
                 payload.update(_memory_activity_metadata(tool_name, _LAST_TOOL_OUTPUT))
         url = (
@@ -553,6 +585,65 @@ def cmd_cancel_wake(args):
     if status == 200:
         _emit({"ok": True, **body})
     _emit({"ok": False, "http_status": status, "error": body}, 1)
+
+
+_IMAGE_FAILURE_HINT = (
+    "图没有生成。请如实告诉用户,或换一个更清楚的画面描述再调一次;"
+    "不要声称图已经生成。"
+)
+
+
+def cmd_generate_image(args):
+    """用用户配置的专用生图模型画一张图,存到出站目录。POST /v1/image-generation/generate。
+
+    伴侣自己决定什么时候画、prompt 怎么写 —— 这个动词只是把能力交到它手上。
+    成功后仍要用 send-image 交付,和它自己产出的图走同一条投递路径。
+    """
+    api_url, auth = _require_backend()
+    prompt = str(args.prompt or "").strip()
+    if not prompt:
+        _emit({"ok": False, "error": "generate-image needs a non-empty --prompt"}, 2)
+    status, body = _http_json(
+        "POST", f"{api_url}/v1/image-generation/generate", auth,
+        payload={"prompt": prompt[:8000]}, timeout=180)
+    if status != 200:
+        # 失败如实交回:伴侣据此自己跟用户解释,或换个描述再试。
+        _emit({"ok": False, "http_status": status, "error": body,
+               "hint": _IMAGE_FAILURE_HINT}, 1)
+    # 后端契约(hosted/image_generator.py:162)是 images[].data_base64/mime_type/name。
+    # 早先这里照 media[].data_b64/mime 写 —— 字段全不对,任何一次真实调用都会
+    # 停在 "returned no media",伴侣会以为是模型不会画。codex 审出。
+    images = (body or {}).get("images") or []
+    if not images:
+        _emit({"ok": False, "error": "image route returned no images",
+               "hint": _IMAGE_FAILURE_HINT}, 1)
+    # 必须落在 $FEEDLING_HOME/outbound-files:send-image 经 IPC 只接受这个目录
+    # (consumer 的 path_outside_outbound_dir 闸)。写 /tmp 的话生成永远交付不出去,
+    # 而且 hosted 多用户共享 /tmp 还会串图。
+    outbound = Path(_resident_ipc_home()) / "outbound-files"
+    try:
+        outbound.mkdir(parents=True, exist_ok=True)
+    except Exception as exc:  # noqa: BLE001
+        _emit({"ok": False, "error": f"could not prepare outbound dir: {str(exc)[:120]}"}, 1)
+    saved = []
+    for idx, item in enumerate(images, start=1):
+        b64 = str((item or {}).get("data_base64") or "")
+        if not b64:
+            continue
+        mime = str((item or {}).get("mime_type") or "image/png")
+        ext = {"image/png": "png", "image/jpeg": "jpg", "image/webp": "webp"}.get(mime, "png")
+        # 唯一文件名:秒级时间戳在连续两次生图/多用户共享目录下会互相覆盖。
+        path = outbound / f"generated_{uuid.uuid4().hex[:12]}_{idx}.{ext}"
+        try:
+            path.write_bytes(base64.b64decode(b64))
+        except Exception as exc:  # noqa: BLE001
+            _emit({"ok": False, "error": f"could not save image: {str(exc)[:120]}"}, 1)
+        saved.append(str(path))
+    if not saved:
+        _emit({"ok": False, "error": "image route returned no usable bytes",
+               "hint": _IMAGE_FAILURE_HINT}, 1)
+    _emit({"ok": True, "paths": saved,
+           "next": "call send-image --path <path> to deliver it"})
 
 
 def cmd_voice_transcript_list(args):
@@ -1357,6 +1448,28 @@ def cmd_send_file(args):
     _emit({"ok": False, **{key: value for key, value in reply.items() if key != "ok"}}, exit_code)
 
 
+def cmd_send_image(args):
+    """Stage one generated raster image for direct display in the current chat."""
+    raw_path = str(args.path or "").strip()
+    if not raw_path:
+        _emit({"ok": False, "error": "path_required"}, 2)
+    source_path = Path(raw_path)
+    if not source_path.is_absolute():
+        source_path = Path(_resident_ipc_home()) / "outbound-files" / source_path
+    reply = _resident_ipc_call(
+        "stage_image",
+        {"path": str(source_path), "name": str(args.name or "").strip()},
+    )
+    if reply.get("ok"):
+        _emit({"ok": True, **{key: value for key, value in reply.items() if key != "ok"}})
+    exit_code = 2 if reply.get("error") in {
+        "consumer_not_running",
+        "no_active_chat_turn",
+        "path_outside_outbound_dir",
+    } else 1
+    _emit({"ok": False, **{key: value for key, value in reply.items() if key != "ok"}}, exit_code)
+
+
 def cmd_identity_redistill(args):
     """Hand fresh material to the resident consumer for a FULL identity
     redistill (whole-card replace), over the local resident-consumer IPC
@@ -1837,6 +1950,11 @@ def main():
     mf.add_argument("--include-superseded", dest="include_superseded", action="store_true", help="include superseded/corrected versions")
     mf.set_defaults(func=cmd_memory_fetch)
 
+    gi = sub.add_parser("generate-image",
+                        help="Draw an image with the user's dedicated image model.")
+    gi.add_argument("--prompt", required=True, help="complete visual description")
+    gi.set_defaults(func=cmd_generate_image)
+
     vtl = sub.add_parser("voice-transcript-list",
                          help="Archived voice calls, newest first (metadata only).")
     vtl.add_argument("--limit", type=int, default=20, help="maximum calls to list")
@@ -1885,6 +2003,21 @@ def main():
     sf.add_argument("--path", required=True, help="UTF-8 source path inside the outbound-files directory")
     sf.add_argument("--name", required=True, help="download filename with the requested suffix")
     sf.set_defaults(func=cmd_send_file)
+
+    si = sub.add_parser(
+        "send-image",
+        help="Stage a generated image for direct display in the current chat.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Write a PNG, JPEG, or WebP image under $FEEDLING_HOME/outbound-files, "
+            "then pass its path here. The image is validated and shown as a normal "
+            "chat image bubble.\n"
+            f"{D3_SOURCING_RULE}"
+        ),
+    )
+    si.add_argument("--path", required=True, help="image path inside the outbound-files directory")
+    si.add_argument("--name", default="", help="optional safe display filename")
+    si.set_defaults(func=cmd_send_image)
 
     sw = sub.add_parser("schedule-wake", help="Ask to be woken at a later time (native self-wake).")
     sw.add_argument("--at", required=True, help="When to wake: ISO time (e.g. 2026-06-29T18:00) or a relative spec.")
@@ -2009,8 +2142,12 @@ def main():
                          help="材料文件路径(UTF-8 文本);与 --material-text 二选一;"
                               "敏感材料优先用这个(不会出现在 ps 里)")
     ird_grp.add_argument("--material-text", dest="material_text", default=None,
+                         # 用 ASCII 的 [!] 而不是 ⚠️:help 文本会被 io_cli_catalog
+                         # 以子进程 --help 的形式读出来,子进程 stdout 用系统 locale
+                         # 编码。中文 Windows 是 cp936(GBK),U+26A0 不在 GBK 里 →
+                         # 子进程 UnicodeEncodeError → 整个 catalog 构建失败。
                          help="材料原文,直接传文本;与 --material-file 二选一;"
-                              "⚠️ 会明文出现在本机 ps 输出里,敏感材料改用 --material-file")
+                              "[!] 会明文出现在本机 ps 输出里,敏感材料改用 --material-file")
     ird.set_defaults(func=cmd_identity_redistill)
 
     ii = sub.add_parser(

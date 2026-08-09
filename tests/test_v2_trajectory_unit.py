@@ -551,7 +551,7 @@ def test_tool_loop_records_request_response_tools_results_and_replies(monkeypatc
         ]
     )
 
-    async def provider(_config, _messages, *, tools=None):
+    async def provider(_config, _messages, *, tools=None, **kwargs):
         return next(responses)
 
     async def dispatch(calls):
@@ -607,7 +607,7 @@ def test_tool_loop_records_request_response_tools_results_and_replies(monkeypatc
 
 
 def test_provider_failure_leaves_a_partial_request_error_trajectory(monkeypatch):
-    async def provider(_config, _messages, *, tools=None):
+    async def provider(_config, _messages, *, tools=None, **kwargs):
         error = RuntimeError("upstream private diagnostic")
         error.feedling_provider_attempt_trace = {
             "version": 1,

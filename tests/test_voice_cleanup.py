@@ -86,3 +86,46 @@ def test_rendered_transcript_never_leaks_the_literal_role():
     assert "user:" not in rendered.lower()
     assert "assistant:" not in rendered.lower()
     assert "明天提醒我" in rendered
+
+
+def test_transcript_uses_first_person_for_user_and_name_for_companion():
+    """用户侧「我」(这份记录首先是给用户看的),伴侣侧用它自己的名字。"""
+    rendered = transcript_store.render_transcript(
+        [{"role": "user", "text": "今天封面定稿了"},
+         {"role": "assistant", "text": "恭喜"}],
+        ai_name="小满",
+    )
+    assert "- 我: 今天封面定稿了" in rendered
+    assert "- 小满: 恭喜" in rendered
+
+
+def test_companion_falls_back_to_TA_like_the_identity_card():
+    """身份卡没名字时默认就是「TA」,这里保持一致,别自造第三种叫法。"""
+    rendered = transcript_store.render_transcript(
+        [{"role": "user", "text": "在吗"}, {"role": "assistant", "text": "在"}])
+    assert "- 我: 在吗" in rendered
+    assert "- TA: 在" in rendered
+
+
+def test_capture_header_spells_out_who_is_who():
+    """标签出现几十次、说明只有一次,所以说明必须毫不含糊地指出「我」不是模型
+    自己 —— 否则模型会把用户做的事写成自己做的。"""
+    header = transcript_store.capture_window_header(turn_count=24, ai_name="小满")
+    assert "「我」是" in header and "不是你" in header
+    assert "「小满」才是你自己" in header
+    # 「宁少勿多」是为闲聊窗口写的;不显式推翻它,一通电话只会留下一两张卡。
+    assert "不适用于这里" in header
+
+
+def test_both_lanes_share_one_header_implementation():
+    """V2 与 resident 各写一份标签,正是当年 "user:" 事故漏掉托管路径的原因。"""
+    from pathlib import Path
+
+    repo = Path(__file__).resolve().parent.parent
+    for path in ("backend/model_api_runtime/v2/worker.py",
+                 "tools/chat_resident_consumer.py"):
+        text = (repo / path).read_text()
+        assert "capture_window_header(" in text, f"{path} 没有调共享抬头"
+        assert "【语音通话逐字记录" not in text, (
+            f"{path} 自己拼了抬头字面量 —— 必须调 transcript_store.capture_window_header"
+        )

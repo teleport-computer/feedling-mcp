@@ -54,11 +54,18 @@ from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable
 
 import db
+import generated_image
 import provider_attempt_ledger
 import provider_client
 import provider_health
+from voice import transcript_store as voice_transcript_store
 from notices import catalog as notices_catalog
-from provider_types import MCP_TRANSPORT_FAILURE_ERROR, ToolExchange, ToolResult
+from provider_types import (
+    MCP_TRANSPORT_FAILURE_ERROR,
+    ProviderMedia,
+    ToolExchange,
+    ToolResult,
+)
 from capabilities import history as cap_history
 from capabilities import registry as cap_registry
 from capabilities import result_budget as cap_result_budget
@@ -175,8 +182,14 @@ async def _record_provider_failure(
     await asyncio.to_thread(
         provider_health.record_failure,
         user_id,
-        error_class=provider_health.error_class_for_exception(exc),
+        error_class=_provider_health_error_class(exc),
     )
+
+
+def _provider_health_error_class(exc: BaseException) -> str:
+    if isinstance(exc, v2_tool_loop.ProviderEmptyReply):
+        return "provider_empty_reply"
+    return provider_health.error_class_for_exception(exc)
 
 
 async def _record_provider_failure_class(
@@ -705,6 +718,10 @@ _PRIVATE_READ_TOOLS = frozenset(
         "memory_index",
         "memory_search",
         "memory_fetch",
+        # 通话逐字记录是用户说过的原话,私密程度不低于记忆卡。读完之后这一轮不
+        # 该再有出站通道(web/MCP),否则原话可以被原样带出去。
+        # list 只返回元信息(时间/时长/轮数),不含内容,故不入此集合。
+        "voice_transcript_read",
         # Raw chat history is the most private read of all (spec §6): once the
         # model has observed it, later outbound web/MCP/task calls are fenced
         # for the rest of the turn via tool_loop's shared private-read boundary.
@@ -952,12 +969,31 @@ class DedicatedVisionUnavailable(RuntimeError):
         self.provider = str(provider or "")[:80]
 
 
+class ImageGenerationUnavailable(RuntimeError):
+    """The selected image-generation route could not produce valid media."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        error_code: str = "image_generation_failed",
+        model: str = "",
+        provider: str = "",
+    ):
+        super().__init__(message)
+        self.error_code = str(error_code or "image_generation_failed")[:64]
+        self.model = str(model or "")[:96]
+        self.provider = str(provider or "")[:80]
+
+
 def _safe_failure_code(scope: str, exc: BaseException) -> str:
     """Stable plaintext error code that never embeds exception messages."""
     if isinstance(exc, WorkspacePromptUnavailable):
         kind = "workspace_prompt_unavailable"
-    elif isinstance(exc, DedicatedVisionUnavailable):
+    elif isinstance(exc, (DedicatedVisionUnavailable, ImageGenerationUnavailable)):
         kind = exc.error_code
+    elif isinstance(exc, v2_tool_loop.ProviderEmptyReply):
+        kind = "empty_reply"
     elif isinstance(exc, TurnError):
         raw = str(exc)
         if raw in {
@@ -1048,7 +1084,7 @@ def _extraction_failure_code(exc: BaseException) -> str:
 
 def _turn_failure_error_class(exc: BaseException) -> str:
     """Classify V2 foreground failures through the shared notice catalog."""
-    if isinstance(exc, DedicatedVisionUnavailable):
+    if isinstance(exc, (DedicatedVisionUnavailable, ImageGenerationUnavailable)):
         return exc.error_code
     if isinstance(exc, v2_prompt_frontier.PromptFrontierExhausted):
         # An unaudited default is our conservative local ceiling, not the
@@ -1059,9 +1095,12 @@ def _turn_failure_error_class(exc: BaseException) -> str:
         return "context_overflow"
     if isinstance(exc, (asyncio.TimeoutError, TimeoutError)):
         return "turn_timeout"
-    if isinstance(exc, TurnError) and str(exc) == "empty_reply":
+    if (
+        isinstance(exc, v2_tool_loop.ProviderEmptyReply)
+        or (isinstance(exc, TurnError) and str(exc) == "empty_reply")
+    ):
         # 模型/provider 没给出任何可用文本(空终局、断流、预算耗尽无气泡)——
-        # 三个 raise 点全是 provider/模型行为,不是我们的解析问题;归 provider,
+        # raise 点全是 provider/模型行为,不是我们的解析问题;归 provider,
         # 别把中转抽风包装成「系统出了问题」(usr_7f30d63f 2026-08-07)。
         return "provider_empty_reply"
     if isinstance(exc, TurnError) and str(exc) in {
@@ -1215,6 +1254,10 @@ class TurnDeps:
     # read_tail，b64 会进摘要器 prompt，且该用户历史上每张图都会被解密一次。默认 None：
     # worker.py 自身不 import hosted/capabilities 的装配细节；生产装配见 serve_worker。
     read_images: Callable[[str, list[str]], dict[str, dict]] | None = None
+    # (user_id, prompt, main config, auth) -> tuple[ProviderMedia, ...]. The
+    # assembly tier resolves the optional dedicated route and decrypts only its
+    # credential. The model-facing tool stays provider-neutral.
+    generate_image: Callable[..., Any] | None = None
     # Assembly-owned V2 image observer. Dedicated rows never return raw pixels
     # through ``read_images`` to the main provider.
     read_vision_observations: Callable[
@@ -2596,6 +2639,7 @@ def _make_chat_tool_activity_callback(
             )
         result = payload.get("result")
         result_content = result.content if isinstance(result, ToolResult) else ""
+        result_metadata = result.metadata if isinstance(result, ToolResult) else {}
         effect = effect_evidence_by_call.get(str(tc.id)) or {}
         detail: dict[str, Any] = {
             "activity_id": invocation_ids[object_key],
@@ -2612,6 +2656,12 @@ def _make_chat_tool_activity_callback(
             detail["result_code"] = core_chat_activity.result_code(
                 result_content, effect
             )
+            if str(tc.name or "") == cap_tool_schema.IMAGE_REPLY_TOOL:
+                image_code = core_chat_activity.image_generation_result_code(
+                    (result_metadata or {}).get("image_generation_result_code")
+                )
+                if image_code:
+                    detail["result_code"] = image_code
         for key, target, limit in (
             ("effect_id", "effect_id", 160),
             ("effect_type", "effect_type", 80),
@@ -3431,6 +3481,8 @@ def _make_build_messages_fn(
             safety_margin_tokens: int | None,
             utf8_bytes_per_token: float,
             image_reserve_tokens: int,
+            required_tool_names=(),
+            system_suffix: str = "",
         ) -> tuple[list, Any, dict]:
             rendered_transcript: list = []
             for item in transcript:
@@ -3454,10 +3506,15 @@ def _make_build_messages_fn(
                     selected,
                     worldbook_char_cap=worldbook_char_cap,
                 ) + rendered_transcript
+                messages = v2_tool_loop._with_system_suffix(
+                    messages,
+                    system_suffix,
+                )
                 plan = v2_prompt_frontier.plan_provider_round(
                     model_limit=model_limit,
                     messages=messages,
                     tools=tools,
+                    required_tool_names=required_tool_names,
                     output_reserve_tokens=output_reserve_tokens,
                     safety_margin_tokens=safety_margin_tokens,
                     utf8_bytes_per_token=utf8_bytes_per_token,
@@ -4528,6 +4585,15 @@ class WorkspaceFileReply:
     data: bytes
 
 
+@dataclass(frozen=True)
+class GeneratedImageReply:
+    """One validated provider image ready for encrypted chat publication."""
+
+    name: str
+    mime_type: str
+    data: bytes
+
+
 def _safe_download_name(path: str) -> str:
     """Return a bounded display filename while preserving a useful suffix."""
     base = posixpath.basename(str(path or "").strip())
@@ -4604,6 +4670,25 @@ def _workspace_file_reply_from_result(result: dict) -> WorkspaceFileReply:
         name=name,
         mime_type=mime_type,
         data=data,
+    )
+
+
+def _generated_image_reply_from_provider(
+    media: ProviderMedia,
+    *,
+    index: int,
+) -> GeneratedImageReply:
+    decoded = generated_image.decode_base64_image(media.data_base64)
+    normalized = generated_image.normalize_generated_image(
+        decoded,
+        declared_mime=media.mime_type,
+        name=media.name,
+        index=index,
+    )
+    return GeneratedImageReply(
+        name=normalized.name,
+        mime_type=normalized.mime_type,
+        data=normalized.data,
     )
 
 
@@ -4705,6 +4790,16 @@ def _reply_effect_extra(payload: dict) -> dict:
                 "turn_failure_blame": notices_catalog.blame_for(error_class),
                 "turn_failure_user_text": notices_catalog.user_text_for(error_class),
             }
+        )
+    call_id = str(payload.get("voice_call_id") or "").strip()
+    turn_id = str(payload.get("voice_turn_id") or "").strip()
+    if bool(call_id) != bool(turn_id):
+        raise ValueError("incomplete voice reply correlation")
+    if call_id:
+        if len(call_id) > 96 or len(turn_id) > 128:
+            raise ValueError("invalid voice reply correlation")
+        extra.update(
+            {"voice_call_id": call_id, "voice_turn_id": turn_id}
         )
     return extra
 
@@ -4814,6 +4909,31 @@ def _build_encrypted_file_reply_effect_payload(
             "file_name": file_reply.name,
             "file_mime": file_reply.mime_type,
             "file_byte_count": len(file_reply.data),
+        },
+    }
+
+
+def _build_encrypted_image_reply_effect_payload(
+    store,
+    image_reply: GeneratedImageReply,
+    *,
+    effect_id: str,
+) -> dict:
+    """Seal one normalized image into a deterministic Chat image message."""
+    item_id = hashlib.sha256(effect_id.encode("utf-8")).hexdigest()[:32]
+    envelope, error = core_envelope._build_shared_envelope_for_store(
+        store,
+        bytes(image_reply.data),
+        item_id=item_id,
+    )
+    if envelope is None:
+        raise RuntimeError(error or "image reply envelope build failed")
+    return {
+        "envelope": envelope,
+        "message_extra": {
+            "content_type": "image",
+            "image_mime": image_reply.mime_type,
+            "image_byte_count": len(image_reply.data),
         },
     }
 
@@ -4996,8 +5116,11 @@ def _render_capture_line(message: dict, voice_transcripts: dict,
         body = _bounded_voice_transcript(
             voice_transcripts[call_id], budget=_VOICE_TRANSCRIPT_PROMPT_CHARS
         )
-        turns = message.get("voice_turn_count")
-        header = "【语音通话逐字记录" + (f"，共 {turns} 轮" if turns else "") + "】"
+        # 抬头(谁是谁 + 换尺子)与 resident 共用同一份实现,别在这里另写。
+        header = voice_transcript_store.capture_window_header(
+            turn_count=message.get("voice_turn_count"),
+            user_name=user_name, ai_name=ai_name,
+        )
         return f"{header}\n{body}"
     label = transcript_speaker_label(
         str(message.get("role") or ""), user_name=user_name, ai_name=ai_name
@@ -5627,6 +5750,7 @@ def _preflight_adaptive_builder(
     planner(
         transcript=[],
         tools=None,
+        required_tool_names=(),
         model_limit=model_limit,
         output_reserve_tokens=PROMPT_OUTPUT_RESERVE_TOKENS,
         safety_margin_tokens=PROMPT_SAFETY_MARGIN_TOKENS,
@@ -8049,9 +8173,17 @@ async def _run_wake(
             from core import self_thinking as _st_wake
 
             _wake_self_thinking_on = _st_wake.enabled()
+            # 与聊天出口同样解耦：关掉 self-thinking 不能顺带关掉安全剥离
+            # （Codex review 2026-08-08 Critical）。SILENT 语义不变。
+            _wake_gate_on = _st_wake.gate_enabled()
             _wake_self_thinking_text = ""
-            if _wake_self_thinking_on and text:
-                _wst_status, _wst_thinking, _wst_reply = _st_wake.split_thinking(text)
+            if (_wake_gate_on or _wake_self_thinking_on) and text:
+                _wake_split = (
+                    _st_wake.strip_all_thinking
+                    if _wake_gate_on
+                    else _st_wake.split_thinking
+                )
+                _wst_status, _wst_thinking, _wst_reply = _wake_split(text)
                 if _wst_status == _st_wake.COMPLETE:
                     text = _wst_reply
                     _wake_self_thinking_text = _wst_thinking
@@ -10245,6 +10377,8 @@ async def process_job(
     push_slot: dict | None = None
     voice_reply_slot: dict | None = None
     voice_reply_parts: list[str] = []
+    voice_call_context: dict[str, str] = {}
+    voice_call_ended_atomically = False
     lease_keepalive_stop = asyncio.Event()
     lease_keepalive_task: asyncio.Task | None = None
 
@@ -10577,6 +10711,14 @@ async def process_job(
         reply_parent_message_id = (
             str(coalesced[0].get("id") or "") if coalesced else ""
         )
+        if coalesced:
+            call_id = str(coalesced[0].get("voice_call_id") or "").strip()
+            turn_id = str(coalesced[0].get("voice_turn_id") or "").strip()
+            if call_id and turn_id:
+                voice_call_context = {
+                    "voice_call_id": call_id,
+                    "voice_turn_id": turn_id,
+                }
         # A recovery turn is deliberately mutation-free. Keeping the hard file
         # completion guard active here creates an impossible state: the guard
         # demands workspace_write while the recovery barrier withholds it, so
@@ -11522,10 +11664,33 @@ async def process_job(
             *,
             final: bool,
             reasoning: str = "",
+            media: tuple[ProviderMedia, ...] = (),
         ) -> None:
             nonlocal final_job_completed_atomically, voice_reply_slot
+            nonlocal voice_call_ended_atomically
             file_reply = text if isinstance(text, WorkspaceFileReply) else None
             text = "" if file_reply is not None else str(text or "").strip()
+            image_replies: list[GeneratedImageReply] = []
+            if media:
+                if file_reply is not None or not final:
+                    raise RuntimeError("generated images require a terminal reply")
+                if len(media) > generated_image.MAX_GENERATED_IMAGES_PER_REPLY:
+                    raise RuntimeError("too many generated images")
+                for index, item in enumerate(media, start=1):
+                    image_replies.append(
+                        await asyncio.to_thread(
+                            _generated_image_reply_from_provider,
+                            item,
+                            index=index,
+                        )
+                    )
+                log.info(
+                    "[v2.image] normalized generated images user=%s job=%s count=%d bytes=%d",
+                    user_id,
+                    job_id,
+                    len(image_replies),
+                    sum(len(item.data) for item in image_replies),
+                )
             # Self-authored thinking (all models incl. relay). Peel a leading
             # <think> block into a SEPARATE channel and reply with the clean body.
             # The provider's native ``reasoning`` is left UNCHANGED here so the
@@ -11536,10 +11701,22 @@ async def process_job(
             from core import self_thinking
 
             self_thinking_on = self_thinking.enabled()
+            # 安全剥离与「要不要写/展示自写 thinking」必须解耦：FEEDLING_V2_SELF_THINKING
+            # 是公开支持的自托管配置，关掉它时模型仍然可能自己写 <think>（主动消息那条
+            # lane 就是实证：我们从没要求它写，它照写），此时若跳过剥离就等于把心里话
+            # 原样发给用户（Codex review 2026-08-08 Critical）。
+            # 因此：闸开 → 一律全文剥离；闸关但 self-thinking 开 → 旧行为；两者都关
+            # → 完全不处理。展示与否仍然只看 self_thinking_on。
+            _st_gate_on = self_thinking.gate_enabled()
             self_thinking_text = ""
             self_thinking_failed = False
-            if self_thinking_on and file_reply is None and text:
-                _st_status, _st_thinking, _st_reply = self_thinking.split_thinking(text)
+            if (_st_gate_on or self_thinking_on) and file_reply is None and text:
+                _st_split = (
+                    self_thinking.strip_all_thinking
+                    if _st_gate_on
+                    else self_thinking.split_thinking
+                )
+                _st_status, _st_thinking, _st_reply = _st_split(text)
                 if _st_status == self_thinking.COMPLETE:
                     text = _st_reply
                     self_thinking_text = _st_thinking
@@ -11588,14 +11765,14 @@ async def process_job(
                 text = _DEGENERATE_REPLY_FALLBACK
                 turn_failure_error_class = _PROTOCOL_FRAGMENT_ERROR_CLASS
                 reasoning = ""
-            if final and not text:
+            if final and not text and not image_replies:
                 # BUG-4 no-filler: chat lane always replies — an empty terminal
                 # text is a model/provider failure here (unlike wake, where
                 # silence is legitimate), so this becomes a mark_failed via the
                 # outer except below. The terminal outbox, not the model loop,
                 # owns the attributed failure bubble.
                 raise TurnError("empty_reply")
-            if not text and file_reply is None:
+            if not text and file_reply is None and not image_replies:
                 return  # empty intermediate reply{} call: no bubble, not an error
             if file_reply is None:
                 text, removed_internal_reference = sanitize_downloadable_reply(
@@ -11643,13 +11820,22 @@ async def process_job(
                         "claimed_by": claimed_by,
                     }
             elif seq_native:
-                payload = await asyncio.to_thread(
-                    _build_encrypted_reply_effect_payload,
-                    store,
-                    text,
-                    effect_id=effect_id,
-                    reply_through_seq=(cursor_box["seq"] if final else None),
-                )
+                if image_replies and not text:
+                    payload = await asyncio.to_thread(
+                        _build_encrypted_image_reply_effect_payload,
+                        store,
+                        image_replies[0],
+                        effect_id=effect_id,
+                    )
+                    payload["reply_through_seq"] = int(cursor_box["seq"])
+                else:
+                    payload = await asyncio.to_thread(
+                        _build_encrypted_reply_effect_payload,
+                        store,
+                        text,
+                        effect_id=effect_id,
+                        reply_through_seq=(cursor_box["seq"] if final else None),
+                    )
                 if final:
                     # Reply content is encrypted; the owner id and two integers
                     # are only non-sensitive routing metadata. The outbox
@@ -11670,7 +11856,7 @@ async def process_job(
                     payload[v2_effect_outbox.REPLY_SOURCE_FENCE_KEY] = {
                         "claimed_by": claimed_by,
                     }
-                if final and pending_file_replies:
+                if final and (pending_file_replies or image_replies):
                     followups = []
                     for index, pending_file in enumerate(pending_file_replies):
                         followups.append(
@@ -11680,12 +11866,25 @@ async def process_job(
                                 pending_file,
                                 effect_id=f"{effect_id}:file:{index}",
                             )
-                    )
-                    payload[REPLY_FOLLOWUPS_KEY] = followups
+                        )
+                    image_followups = image_replies if text else image_replies[1:]
+                    for index, pending_image in enumerate(image_followups):
+                        followups.append(
+                            await asyncio.to_thread(
+                                _build_encrypted_image_reply_effect_payload,
+                                store,
+                                pending_image,
+                                effect_id=f"{effect_id}:image:{index}",
+                            )
+                        )
+                    if followups:
+                        payload[REPLY_FOLLOWUPS_KEY] = followups
             if turn_failure_error_class:
                 payload["turn_failure_error_class"] = turn_failure_error_class
             if final and reply_parent_message_id:
                 payload["reply_to_message_id"] = reply_parent_message_id
+            if voice_call_context:
+                payload.update(voice_call_context)
             if final:
                 try:
                     status_rows = await asyncio.to_thread(
@@ -11853,6 +12052,15 @@ async def process_job(
                     },
                     best_effort=True,
                 )
+                if (
+                    status == "discarded"
+                    and last_error
+                    == v2_effect_outbox.FINAL_REPLY_VOICE_CALL_ENDED
+                ):
+                    if final:
+                        final_job_completed_atomically = True
+                        voice_call_ended_atomically = True
+                    return
                 if status == "applied":
                     # 覆盖式：一个回合可能吐多条气泡，只有最后一条会成为推送。构建槽位
                     # 本身也是 best-effort：某些非 seq_native / 测试注入的 payload 不
@@ -11864,7 +12072,10 @@ async def process_job(
                     try:
                         push_slot = {
                             "msg_id": str(payload["envelope"]["id"]),
-                            "body": (text or file_reply.name)[:240],
+                            "body": (
+                                text
+                                or (file_reply.name if file_reply is not None else "图片")
+                            )[:240],
                             "is_wake": False,
                             # Chat lane is never a wake — send an empty lane rather
                             # than the job's own lane=="chat" bookkeeping value, so
@@ -12001,6 +12212,56 @@ async def process_job(
             if key not in pending_file_keys:
                 pending_file_keys.add(key)
                 pending_file_replies.append(file_reply)
+
+        async def _on_image_reply(args: dict) -> tuple[ProviderMedia, ...]:
+            prompt = str(args.get("prompt") or "").strip()
+            if not prompt:
+                raise ImageGenerationUnavailable(
+                    "image prompt missing",
+                    error_code="image_generation_invalid_prompt",
+                )
+            if deps.generate_image is None:
+                raise ImageGenerationUnavailable(
+                    "image generation is not configured",
+                    error_code="image_generation_model_required",
+                    model=str(getattr(provider_config, "model", "") or ""),
+                    provider=str(getattr(provider_config, "provider", "") or ""),
+                )
+            try:
+                generated = await deps.generate_image(
+                    user_id,
+                    prompt,
+                    main_provider_config=provider_config,
+                    api_key=api_key,
+                    runtime_token=runtime_token,
+                )
+            except ImageGenerationUnavailable:
+                raise
+            except Exception as exc:  # noqa: BLE001 - stable chat failure below
+                classified = _turn_failure_error_class(exc)
+                code = {
+                    "auth_invalid": "image_generation_auth_invalid",
+                    "quota_insufficient": "image_generation_quota_insufficient",
+                    "model_not_found": "image_generation_model_not_found",
+                    "provider_incompatible": "image_generation_model_required",
+                    "rate_limited": "image_generation_rate_limited",
+                    "upstream_unavailable": "image_generation_unavailable",
+                    "turn_timeout": "image_generation_unavailable",
+                    "reply_parse_failed": "image_generation_invalid_output",
+                }.get(classified, "image_generation_failed")
+                raise ImageGenerationUnavailable(
+                    "image generation failed",
+                    error_code=code,
+                    model=str(getattr(provider_config, "model", "") or ""),
+                    provider=str(getattr(provider_config, "provider", "") or ""),
+                ) from exc
+            media = tuple(generated or ())
+            if not media or any(not isinstance(item, ProviderMedia) for item in media):
+                raise ImageGenerationUnavailable(
+                    "image generation returned invalid media",
+                    error_code="image_generation_invalid_output",
+                )
+            return media
         # Pass THIS turn's enclave_sem through explicitly (not the closure's module-level
         # default) — process_job may have been called with an injected/test semaphore
         # (e.g. tests/test_v2_worker.py's _CountingSemaphore), and the per-round fold must
@@ -12043,7 +12304,7 @@ async def process_job(
 
         def _chat_builder():
             return _make_build_messages_fn(
-                system_prompt=context.chat_system_prompt(),
+                system_prompt=context.chat_system_prompt(provider_config),
                 summary=summary,
                 tail=tail,
                 extra_context=turn_extra_context,
@@ -12156,12 +12417,14 @@ async def process_job(
             provider_config=provider_config,
             include_reasoning=turn_include_reasoning,
             suppress_native_reasoning=_self_thinking_v2.enabled(),
+            allow_image_output=True,
             build_messages=build_messages,
             dispatch_tools=_dispatch_tools,
             on_reply=_on_reply,
             on_file_reply=(
                 _on_file_reply if deps.load_workspace_file is not None else None
             ),
+            on_image_reply=_on_image_reply,
             on_tool_event=chat_tool_activity_callback,
             required_file_suffixes=required_file_suffixes,
             file_requirement_messages=(
@@ -12216,6 +12479,19 @@ async def process_job(
                 tm.record_prompt_frontier_exhaustion
             ),
         )
+        if voice_call_ended_atomically:
+            try:
+                await asyncio.to_thread(_emit_status, user_id, job_id, "done")
+            except Exception as exc:  # noqa: BLE001 — lifecycle already settled
+                log.warning(
+                    "[v2.worker] cancelled voice done status failed "
+                    "user=%s job=%s code=%s",
+                    user_id,
+                    job_id,
+                    type(exc).__name__.lower(),
+                )
+            tm.flush(failed=False, status="voice_call_ended")
+            return "completed"
         if outcome.stop_reason == "input_advanced":
             # The hard provider-call budget remains authoritative. The stale
             # final effect was already terminally discarded without dispatch;
@@ -12247,7 +12523,11 @@ async def process_job(
                 user_id,
                 job_id,
             )
-        if not outcome.replied_intermediate and not (outcome.final_text or "").strip():
+        if (
+            not outcome.replied_intermediate
+            and not (outcome.final_text or "").strip()
+            and outcome.delivered_media_count <= 0
+        ):
             # BUG-4 no-filler class: the loop returned WITHOUT ever producing a
             # bubble — budget_exhausted (max_calls reached with no terminal
             # final_text call), or a misbehaving last round that returns
@@ -12522,7 +12802,10 @@ async def process_job(
             claimed_by=claimed_by,
             error_class=_turn_failure_error_class(failure_exc),
         )
-        if owned and isinstance(failure_exc, DedicatedVisionUnavailable):
+        if owned and isinstance(
+            failure_exc,
+            (DedicatedVisionUnavailable, ImageGenerationUnavailable),
+        ):
             identity = {}
             if failure_exc.model:
                 identity["failure_model"] = failure_exc.model
@@ -12535,12 +12818,16 @@ async def process_job(
                         user_id,
                         "error",
                         job_id=job_id,
-                        label="视觉模型调用失败",
+                        label=(
+                            "生图模型调用失败"
+                            if isinstance(failure_exc, ImageGenerationUnavailable)
+                            else "视觉模型调用失败"
+                        ),
                         detail=identity,
                     )
                 except Exception as exc:  # noqa: BLE001 -- outbox still owns visibility
                     log.warning(
-                        "[v2.worker] vision failure identity event failed job=%s code=%s",
+                        "[v2.worker] capability failure identity event failed job=%s code=%s",
                         job_id,
                         type(exc).__name__.lower(),
                     )

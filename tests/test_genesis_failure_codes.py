@@ -312,3 +312,63 @@ def test_error_hints_en_mirror_keys_and_required_text_is_cause_aware():
     unknown_line = service.genesis_failure_required_text("mystery blowup ~~ xyz")
     assert service.GENESIS_ERROR_HINTS["internal"] in unknown_line
     assert service.GENESIS_ERROR_HINTS_EN["internal"] in unknown_line
+
+
+# --------------------------------------------------------------------------- #
+# Path-aware failure copy (usr_3b73f1cb0a9ec975, 2026-08-06).
+#
+# The generic hints describe the SEALED chunk import, where a dead worker's job
+# really is auto-recovered. Plaintext imports have no such path, so the generic
+# "已自动重新排队" told that user to sit and wait when the only way forward was
+# to tap retry — he sat on it for two days. These pin the split so a later edit
+# cannot quietly re-broadcast the sealed wording to plaintext users.
+# --------------------------------------------------------------------------- #
+
+_RESTART_ERROR = "genesis_stale_timeout:1800s"
+
+
+def test_plaintext_restart_copy_does_not_claim_auto_requeue():
+    line = service.genesis_failure_required_text(_RESTART_ERROR, ingest="plaintext")
+
+    # The false promise, in both languages.
+    assert "已自动重新排队" not in line
+    assert "re-queued" not in line.lower()
+    # Still names the real cause and stays bilingual.
+    assert service.GENESIS_ERROR_HINTS_PLAINTEXT["worker_restarted"] in line
+    assert service.GENESIS_ERROR_HINTS_PLAINTEXT_EN["worker_restarted"] in line
+
+
+def test_sealed_restart_copy_keeps_the_auto_requeue_wording():
+    # Not a symmetric edit: the sealed path DOES requeue
+    # (db.genesis_reclaim_orphaned_processing_jobs), so its wording is accurate
+    # and must not be collateral damage of the plaintext fix.
+    line = service.genesis_failure_required_text(_RESTART_ERROR)
+
+    assert service.GENESIS_ERROR_HINTS["worker_restarted"] in line
+    assert service.GENESIS_ERROR_HINTS_EN["worker_restarted"] in line
+    assert "已自动重新排队" in line
+
+
+def test_plaintext_override_map_is_key_mirrored_and_scoped():
+    assert (set(service.GENESIS_ERROR_HINTS_PLAINTEXT.keys())
+            == set(service.GENESIS_ERROR_HINTS_PLAINTEXT_EN.keys()))
+    # Overrides may only shadow codes that exist in the generic catalog.
+    assert set(service.GENESIS_ERROR_HINTS_PLAINTEXT).issubset(service.GENESIS_ERROR_HINTS)
+    # Codes without an override fall through to the shared wording on both paths.
+    for error, code in (("provider_http_401", "bad_api_key"),
+                        ("mystery blowup ~~ xyz", "internal")):
+        assert code not in service.GENESIS_ERROR_HINTS_PLAINTEXT
+        assert (service.genesis_failure_required_text(error, ingest="plaintext")
+                == service.genesis_failure_required_text(error))
+
+
+def test_failure_copy_never_promises_materials_are_kept_forever():
+    # The old closing clause asserted "已上传的材料不会丢" unconditionally, which
+    # inverts into a lie once the staged payload TTL passes and the blob is
+    # deleted (retry then answers 410). The line must set a bounded expectation.
+    for ingest in ("plaintext", ""):
+        line = service.genesis_failure_required_text(_RESTART_ERROR, ingest=ingest)
+        assert "已上传的材料不会丢" not in line
+        assert "materials are kept." not in line
+        assert "过期后需要重新选择文件" in line
+        assert "pick the file again" in line.lower()

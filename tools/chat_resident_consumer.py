@@ -41,6 +41,9 @@ CLI mode:
                         auto-injects --resume on later turns.
   AGENT_CLI_PATH        Optional colon-separated executable search path added
                         before PATH. Useful for systemd services.
+  FEEDLING_AGENT_IMAGE_GENERATION
+                        Set true only when the configured resident agent exposes
+                        a callable native image-generation capability.
 
 Optional:
   CHECKPOINT_FILE       Path to persist last-processed timestamp.
@@ -134,6 +137,7 @@ except ImportError:
     _ENCRYPTION_AVAILABLE = False
 
 import provider_client
+import generated_image
 
 # Shared torn-protocol-JSON leak detector (backend/core, pure). backend/ is on
 # sys.path via the insert above, so it imports as a top-level `core.*` name.
@@ -167,8 +171,16 @@ from chat.reply_language import (
 )
 from core.downloadable_reply import sanitize_downloadable_reply
 from model_api_runtime.v2 import context as downloadable_file_context
+# 谎报检测**与 V2 共用同一份实现**,不在这里另抄一份正则。两条 lane 各写一份,
+# 正是当年字面 `user:` 标签只修了 V2、漏掉托管路径的根因(worker.py:9047 注释
+# 记录的那次事故)。谁改判定,两条 lane 一起变。
+from model_api_runtime.v2.tool_loop import _claims_image_delivered
 from model_api_runtime.v2 import document_render as downloadable_document_render
-from voice.message_filter import conversation_rows as _conversation_rows
+from voice.message_filter import (
+    VOICE_CALL_RECORD_ROLE as _VOICE_CALL_RECORD_ROLE,
+    conversation_rows as _conversation_rows,
+)
+from voice import transcript_store as _voice_transcript_store
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -214,6 +226,16 @@ class AgentTurn:
 @dataclass(frozen=True)
 class StagedChatFile:
     """One resident-generated file waiting for the primary chat reply commit."""
+
+    source_path: str
+    name: str
+    mime_type: str
+    data: bytes
+
+
+@dataclass(frozen=True)
+class StagedChatImage:
+    """One resident-generated image waiting for its chat reply transaction."""
 
     source_path: str
     name: str
@@ -283,6 +305,7 @@ AGENT_CLI_CMD = os.environ.get("AGENT_CLI_CMD", "")
 # single-flight chat lane forever.
 AGENT_TURN_TIMEOUT_SEC = max(30, int(os.environ.get("FEEDLING_AGENT_TURN_TIMEOUT_SEC", "300")))
 AGENT_CLI_PATH = os.environ.get("AGENT_CLI_PATH", "")
+AGENT_IMAGE_GENERATION_CAPABILITY = "agent_image_generation_v1"
 
 CHECKPOINT_API_KEY_FINGERPRINT = hashlib.sha1(FEEDLING_API_KEY.encode()).hexdigest()[:10]
 CHECKPOINT_FILE = Path(
@@ -686,6 +709,28 @@ class VisionObserverFailure(RuntimeError):
         self.provider = _sanitize_thinking_meta(provider, max_len=80)
 
 
+class ImageGenerationFailure(RuntimeError):
+    """Safe failure contract returned by the dedicated image route."""
+
+    def __init__(
+        self,
+        error_class: str,
+        *,
+        status_code: int | None = None,
+        detail: str = "",
+        raw_user_text: str = "",
+        model: str = "",
+        provider: str = "",
+    ):
+        super().__init__(error_class)
+        self.error_class = error_class[:64] or "image_generation_failed"
+        self.status_code = status_code
+        self.detail = detail[:160]
+        self.raw_user_text = raw_user_text
+        self.model = _sanitize_thinking_meta(model, max_len=96)
+        self.provider = _sanitize_thinking_meta(provider, max_len=80)
+
+
 def _vision_failure_user_text(error_class: str, raw_user_text: str) -> str:
     raw = raw_user_text or ""
     has_cjk = bool(re.search(r"[\u4e00-\u9fff]", raw))
@@ -731,7 +776,48 @@ def _vision_failure_user_text(error_class: str, raw_user_text: str) -> str:
     fallback = "视觉模型处理失败，请重试。" if chinese else "The vision model could not process this image. Try again."
     return (zh if chinese else en).get(error_class, fallback)
 
+
+def _image_generation_failure_user_text(error_class: str, raw_user_text: str) -> str:
+    raw = raw_user_text or ""
+    has_cjk = bool(re.search(r"[\u4e00-\u9fff]", raw))
+    has_latin = bool(re.search(r"[A-Za-z]", raw))
+    archive_language = str(
+        globals().get("_whoami_cache", {}).get("archive_language") or ""
+    ).strip().lower()
+    chinese = has_cjk or (not has_latin and archive_language.startswith("zh"))
+    zh = {
+        "image_generation_model_required": "当前模型不能生成图片，请到设置里添加生图模型。",
+        "image_generation_model_incompatible": "当前生图模型无法生成图片，请到设置里更换模型。",
+        "image_generation_auth_invalid": "生图模型的 API Key 无效或已过期，请到设置里重新保存。",
+        "image_generation_quota_insufficient": "生图模型服务额度不足，充值后再试。",
+        "image_generation_model_not_found": "当前生图模型不可用，请到设置里更换模型。",
+        "image_generation_model_not_ready": "生图模型尚未准备好，请到设置里重新保存或更换模型。",
+        "image_generation_rate_limited": "生图模型请求太多，请稍等几分钟再试。",
+        "image_generation_unavailable": "生图模型暂时无法连接，请稍后重试。",
+        "image_generation_invalid_output": "生图模型没有返回有效图片，请重试或更换模型。",
+        "image_generation_invalid_prompt": "这次生图请求没有正确送达，我们会尽快排查。",
+        "image_generation_failed": "图片生成失败，请重试；如果仍失败，请更换模型。",
+    }
+    en = {
+        "image_generation_model_required": "Your current model can't generate images. Add an image generation model in Settings.",
+        "image_generation_model_incompatible": "This image generation model can't create images. Choose another model in Settings.",
+        "image_generation_auth_invalid": "The image generation API key is invalid or expired. Save it again in Settings.",
+        "image_generation_quota_insufficient": "The image generation service has insufficient quota. Add credit and try again.",
+        "image_generation_model_not_found": "The image generation model is unavailable. Choose another model in Settings.",
+        "image_generation_model_not_ready": "The image generation model isn't ready. Save it again or choose another model in Settings.",
+        "image_generation_rate_limited": "The image generation service is rate limited. Try again in a few minutes.",
+        "image_generation_unavailable": "The image generation service is temporarily unavailable. Try again later.",
+        "image_generation_invalid_output": "The image generation model returned no valid image. Try again or choose another model.",
+        "image_generation_invalid_prompt": "This image request wasn't delivered correctly. We'll investigate.",
+        "image_generation_failed": "Image generation failed. Try again or choose another model.",
+    }
+    fallback = "图片生成失败，请重试。" if chinese else "Image generation failed. Try again."
+    return (zh if chinese else en).get(error_class, fallback)
+
 _ERROR_CLASS_RULES = (
+    ("model_mismatch", "system",
+     "当前运行时没有成功加载所选模型，请重新选择模型或稍后重试。",
+     re.compile(r"\bmodel_mismatch\b", re.I)),
     # 次序即优先级：quota 必须先于 auth/rate（403+「额度」语义是余额不是权限）
     ("quota_insufficient", "user_provider",
      "模型服务额度不足，充值后再发消息即可恢复。",
@@ -802,8 +888,16 @@ _ERROR_CLASS_RULES = (
 # 不改分类逻辑本身。
 CONSUMER_ERROR_CLASSES = frozenset(
     {klass for klass, _blame, _text, _pat in _ERROR_CLASS_RULES}
-    | {"turn_timeout", "provider_empty_reply", "reply_parse_failed",
-       "model_not_found", "unknown"}
+    | {
+        "turn_timeout", "provider_empty_reply", "reply_parse_failed",
+        "model_not_found", "unknown",
+        "image_generation_model_required", "image_generation_model_incompatible",
+        "image_generation_auth_invalid", "image_generation_quota_insufficient",
+        "image_generation_model_not_found", "image_generation_model_not_ready",
+        "image_generation_rate_limited", "image_generation_unavailable",
+        "image_generation_invalid_output", "image_generation_invalid_prompt",
+        "image_generation_failed",
+    }
 )
 
 
@@ -885,6 +979,37 @@ def classify_agent_error(exc: BaseException) -> AgentErrorNotice:
             exc.error_class,
             blame,
             _vision_failure_user_text(exc.error_class, exc.raw_user_text),
+            " · ".join(detail_parts)[:200],
+        )
+
+    if isinstance(exc, ImageGenerationFailure):
+        blame = (
+            "user_provider"
+            if exc.error_class in {
+                "image_generation_model_required",
+                "image_generation_model_incompatible",
+                "image_generation_auth_invalid",
+                "image_generation_quota_insufficient",
+                "image_generation_model_not_found",
+                "image_generation_model_not_ready",
+            }
+            else (
+                "system"
+                if exc.error_class == "image_generation_invalid_prompt"
+                else "provider_transient"
+            )
+        )
+        detail_parts = [exc.error_class]
+        if exc.status_code is not None:
+            detail_parts.append(f"HTTP {exc.status_code}")
+        if exc.detail:
+            detail_parts.append(exc.detail)
+        return AgentErrorNotice(
+            exc.error_class,
+            blame,
+            _image_generation_failure_user_text(
+                exc.error_class, exc.raw_user_text
+            ),
             " · ".join(detail_parts)[:200],
         )
 
@@ -1344,6 +1469,11 @@ def _agent_runtime_metadata(
 AGENT_RUNTIME_METADATA = _agent_runtime_metadata()
 
 
+def _agent_image_generation_enabled() -> bool:
+    """Whether this exact resident entry exposes a callable image tool."""
+    return _env_bool("FEEDLING_AGENT_IMAGE_GENERATION")
+
+
 def _agent_entry_signature() -> str:
     """Stable, secret-free identity for the configured model entry."""
     payload = json.dumps(
@@ -1359,18 +1489,22 @@ def _agent_entry_signature() -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
 
 
-def _consumer_capabilities(hosted: bool) -> str:
+def _consumer_capabilities(hosted: bool = False) -> str:
     """Comma-separated ``X-Feedling-Consumer-Capabilities`` value.
 
-    Vision caps are advertised on every line. ``web_search_v1`` / ``web_fetch_v1``
-    are a CLOUD-ONLY product: only the HOSTED consumer (per-user runtime token)
-    advertises them. VPS / self-hosted residents must NOT — they use their own
-    model provider's built-in web capability, so our web tools are never offered
-    to them. The settings page keys ``_runtime_supported`` off this header, so
-    omitting the web caps makes web read ``effective = false`` for self-hosted
-    accounts, which is exactly the intended product boundary.
+    Vision and dedicated image-generation caps are advertised on every line.
+    The native agent image capability is advertised only when this exact entry
+    is configured to expose it.
+    ``web_search_v1`` / ``web_fetch_v1`` are a CLOUD-ONLY product: only the
+    HOSTED consumer (per-user runtime token) advertises them. VPS / self-hosted
+    residents must NOT — they use their own model provider's built-in web
+    capability, so our web tools are never offered to them. The settings page
+    keys ``_runtime_supported`` off this header, so omitting the web caps makes
+    web read ``effective = false`` for self-hosted accounts.
     """
-    caps = ["vision_observer_v1", "vision_probe_v2"]
+    caps = ["vision_observer_v1", "vision_probe_v2", "image_generation_v1"]
+    if _agent_image_generation_enabled():
+        caps.append(AGENT_IMAGE_GENERATION_CAPABILITY)
     if hosted:
         caps += ["web_search_v1", "web_fetch_v1"]
     return ",".join(caps)
@@ -3506,8 +3640,24 @@ def _split_tagged_thinking(text: str) -> tuple[str, str]:
     Structured reasoning fields remain the preferred path. This only handles
     plain terminal text where an upstream wrapper serialized reasoning as
     `<think>...</think>`, `<reasoning>...</reasoning>`, or `<thought>...</thought>`.
+
+    2026-08-08 起委托 ``core.self_thinking`` 的共享内核：此前 V1/V2 各一套判据、
+    各漏各的——这条正则要求开闭成对，一个孤立的 `</think>`（开标签在上游被吃掉）
+    配不上对，于是整段思考原样进了用户气泡（prod 实例）。闸关掉时保留下面的
+    原正则行为，逐字节不变。
     """
     raw = str(text or "")
+    from core import self_thinking as _st
+
+    if _st.gate_enabled():
+        # sanitize=False：本次统一的是剥离**判据**，V1 的展示格式（保留换行、
+        # 上限 700，由下游 _sanitize_thinking_summary 负责）不跟着变。
+        status, thinking, reply = _st.strip_all_thinking(raw, sanitize=False)
+        if status == _st.FAILED:
+            # 失败关闭：宁可这轮没有可发内容，也不把带标签的残文端给用户。
+            return "", thinking
+        return reply, thinking
+
     blocks: list[str] = []
 
     def _collect(match: re.Match) -> str:
@@ -4937,6 +5087,85 @@ def _claude_turn_from_stream(raw: str) -> tuple[str, str]:
     return reply, reasoning
 
 
+def _claude_actual_models_from_stream(raw: str) -> set[str]:
+    """Return model ids reported by Claude Code's structured output only.
+
+    Assistant prose is intentionally ignored: self-identification is promptable
+    and cannot prove which upstream model served the turn. Claude Code reports
+    the fact in ``assistant.message.model`` and terminal ``modelUsage`` keys.
+    """
+    models: set[str] = set()
+
+    def _add(value: Any) -> None:
+        model = str(value or "").strip().lower()
+        if model and len(model) <= 200 and re.fullmatch(r"[a-z0-9._:/-]+", model):
+            models.add(model)
+
+    for obj in _json_objects_from_cli_output(raw):
+        if not isinstance(obj, dict):
+            continue
+        if str(obj.get("type") or "").strip() == "assistant":
+            message = obj.get("message")
+            if isinstance(message, dict):
+                _add(message.get("model"))
+        if str(obj.get("type") or "").strip() == "result":
+            usage = obj.get("modelUsage")
+            if isinstance(usage, dict):
+                for model in usage:
+                    _add(model)
+    return models
+
+
+def _is_claude_family_model(model: str) -> bool:
+    """Return whether a route or receipt id identifies the Claude family."""
+    value = str(model or "").strip().lower()
+    if value in {"fable", "opus", "sonnet", "haiku"}:
+        return True
+    return bool(re.search(r"(?:^|[./:])claude(?:[-._:]|$)", value))
+
+
+def _claude_configured_model_matches(configured: str, actual: set[str]) -> bool:
+    """Allow Claude-family fallback while rejecting cross-family drift."""
+    expected = str(configured or "").strip().lower()
+    normalized_actual = {
+        str(model).strip().lower() for model in actual if str(model).strip()
+    }
+    if _is_claude_family_model(expected):
+        return bool(normalized_actual) and all(
+            _is_claude_family_model(model) for model in normalized_actual
+        )
+    return expected in normalized_actual
+
+
+def _validate_claude_actual_model(raw: str) -> None:
+    """Allow Claude-family fallback and reject proven cross-family drift."""
+    configured = str(AGENT_RUNTIME_METADATA.get("model") or "").strip()
+    if not configured:
+        return
+    actual = _claude_actual_models_from_stream(raw)
+    if not actual:
+        log.warning(
+            "claude success had no structured actual-model metadata; configured=%s",
+            configured[:200],
+        )
+        return
+    actual_text = ",".join(sorted(actual))[:400]
+    if _claude_configured_model_matches(configured, actual):
+        if configured.strip().lower() not in actual:
+            log.warning(
+                "claude family fallback allowed configured=%s actual=%s",
+                configured[:200],
+                actual_text,
+            )
+        return
+    _clear_agent_session_id(
+        f"claude model mismatch configured={configured[:200]} actual={actual_text}"
+    )
+    raise RuntimeError(
+        f"model_mismatch: configured={configured[:200]} actual={actual_text}"
+    )
+
+
 def _attach_provider_reasoning(
     reply: str,
     reasoning: str,
@@ -5142,6 +5371,98 @@ def _run_cli_subprocess(
         returncode,
         stdout="".join(stdout_parts),
         stderr="".join(stderr_parts),
+    )
+
+
+_USER_MCP_SURFACE_RE = re.compile(
+    r"\[user_mcp\] surface servers=(\d+) registered=(\d+) dropped=(\d+) "
+    r"cap=(\d+) bytes=(\d+) detail=(\S*)"
+)
+_USER_MCP_DROPPED_RE = re.compile(r"\[user_mcp\] tool cap \d+ reached — dropped \d+: (.+)")
+
+
+def _trace_user_mcp_surface(
+    stderr: str, *, trace_id: str, lane: str, is_pi: bool, attempt: str = "first"
+) -> None:
+    """把桥这一轮实际注册的 MCP 工具面写进 debug trace。
+
+    为什么必须有:在此之前「模型这一轮到底看得到哪些 MCP 工具」在生产上**完全
+    不可观测** —— 桥只往自己的 stderr 打日志,MCP 工具调用也不经 io_cli(所以
+    `agent.tool.call` 里永远看不到它们)。用户报「链接测试通过、AI 却说搜不到」
+    时,我们连"工具有没有被注册进去"都答不上来,只能猜(usr_1baf 2026-08-09)。
+
+    静默失败面有三层,这条 trace 让每一层都留声:
+      ① 桥根本没加载(没有 surface 行)→ MCP 这一轮压根没接上;
+      ② 服务器握手失败(detail 里该服务器是 :0)→ 连上了但没工具;
+      ③ 撞到工具上限(dropped>0)→ 有工具被裁,看 per_server 的「注册数/发现数」
+         就知道是哪台被削了顶(轮转分配保证每台都有代表工具,不会整台饿死)。
+    """
+    if not is_pi:
+        # 这条埋点是 pi 专属:claude 走 `--mcp-config` 交给 CLI 自己管、
+        # codex 走 config.toml,**都不经过我们的桥**。在函数入口就返回,
+        # 而不是只在 missing 分支判 —— 否则 claude 的 stderr 里若恰好出现
+        # 一行同形文本,就会伪造出一条 resolved 事件(codex 审出)。
+        return
+    text = str(stderr or "")
+    # 取**最后**一条,不是第一条:一轮正常只有一行,但桥若被重跑(或将来多次
+    # 握手)会有多行,而第一条配上后面那条的丢弃名单就是张冠李戴。
+    # 这个错我自己写出来过,被端到端喂真实输出时撞出来的。
+    surface_matches = list(_USER_MCP_SURFACE_RE.finditer(text))
+    match = surface_matches[-1] if surface_matches else None
+    if not match:
+        # 没有 surface 行有两种可能:这一轮没注入桥(非 chat 通道 / 无启用的
+        # 服务器),或者桥启动就失败了。前者是正常的,所以只在 chat 通道且
+        # 确实有启用服务器时才当成异常记一笔。
+        enabled = [
+            s for s in (_user_mcp_applied.get("servers") or []) if s.get("enabled")
+        ]
+        # ⚠️ 只有 pi 会产 surface 行:claude 走 `--mcp-config` 交给 CLI 自己管,
+        # codex 走 config.toml —— 两者都**不经过我们的桥**,自然没有这一行。
+        # 不加这个判据的话,每个用 claude/codex + MCP 的用户**每一轮**都会刷一条
+        # 假 error,把 200 条的 trace 环冲掉 —— 跟这个埋点的目的正好相反。
+        # (我自己写出来过这个 bug,commit 前验出来的。)
+        if is_pi and lane == "chat" and enabled:
+            _emit_debug_trace(
+                "agent", "mcp.surface.missing", status="error", trace_id=trace_id,
+                summary="user MCP bridge produced no tool surface",
+                explain=("这一轮有启用的 MCP 服务器,桥却没有报告工具面 —— "
+                         "桥可能没被注入或启动失败,模型看不到任何 MCP 工具"),
+                detail={
+                    "driver": "pi", "lane": lane, "attempt": attempt,
+                    "enabled_servers": [s.get("name") for s in enabled],
+                },
+            )
+        return
+    servers, registered, dropped, cap, schema_bytes, per_server = match.groups()
+    dropped_names = ""
+    if int(dropped):
+        # 只在本轮确实有丢弃时才去找名单,且同样取最后一条。
+        drop_matches = list(_USER_MCP_DROPPED_RE.finditer(text))
+        if drop_matches:
+            dropped_names = drop_matches[-1].group(1)[:600]
+    _emit_debug_trace(
+        "agent",
+        "mcp.surface.resolved",
+        status="error" if int(dropped) else "ok",
+        trace_id=trace_id,
+        summary=(f"MCP 工具面 {registered} 个"
+                 + (f",丢弃 {dropped} 个" if int(dropped) else "")),
+        explain=(f"模型这一轮能看到 {registered} 个 MCP 工具"
+                 + (f";另有 {dropped} 个因超过 {cap} 上限被裁掉 —— "
+                    "分配是**轮转公平**的(每台各拿一个再拿第二个),"
+                    "所以裁掉的是工具最多那几台的尾部,每台仍有代表工具。"
+                    "detail.per_server 是「注册数/发现数」" if int(dropped) else "")),
+        detail={
+            "driver": "pi",
+            "servers": int(servers), "registered": int(registered),
+            "dropped": int(dropped), "cap": int(cap),
+            # 数量之外的另一半成本:工具面的总 schema 字节数。工具翻倍会显著
+            # 抬高请求体与上下文占用,也会拖垮弱模型的选择率(codex 提)。
+            "schema_bytes": int(schema_bytes),
+            # `服务器:注册数/发现数` —— 注册数才回答「它到底进没进去」。
+            "per_server": per_server[:400], "dropped_names": dropped_names,
+            "lane": lane, "attempt": attempt,
+        },
     )
 
 
@@ -7254,6 +7575,19 @@ def call_agent_cli(
         ))
 
     raw_transport = (result.stdout or "") + "\n" + (result.stderr or "")
+    # 每次 CLI 尝试都记一次。原本我只记首次,理由是「重试跑同一条命令、同一份
+    # 配置,工具面相同」—— 这是错的:重试会**新起一个进程、重做 MCP 握手**,
+    # 首次可能 tavily:0/4(那台没连上)而重试 4/4,反之亦然。重试本来就少见,
+    # 多一两条事件淹不掉 200 条的环(codex 审出)。
+    _trace_user_mcp_surface(
+        result.stderr or "", trace_id=trace_id, lane=lane,
+        is_pi=_is_pi_cmd(cmd), attempt="first",
+    )
+    if result.returncode == 0 and _is_claude_code_cmd(cmd):
+        # Claude Code can silently choose its own default despite ANTHROPIC_MODEL.
+        # Validate the CLI's structured receipt before persisting the session, so
+        # a wrong-model session can never contaminate the next turn.
+        _validate_claude_actual_model(result.stdout or "")
     if _is_pi_cmd(cmd):
         # pi's session id is resident-owned (--session-id, created on first use);
         # pi events carry no session_id field to scrape, and stream scraping could
@@ -7317,12 +7651,17 @@ def call_agent_cli(
                 ))
             _log_cli_turn_timing(cmd, result, int((time.monotonic() - _turn_t0) * 1000))
             raw_transport = (result.stdout or "") + "\n" + (result.stderr or "")
+            _trace_user_mcp_surface(
+                result.stderr or "", trace_id=trace_id, lane=lane,
+                is_pi=_is_pi_cmd(cmd), attempt="stale_resume_retry",
+            )
             # Persist the fresh session so the NEXT turn resumes it — but ONLY
             # from a SUCCESSFUL retry: claude's failure result JSON can still
             # carry a session_id, and saving that would re-persist a sid for a
             # failed session right after we cleared the stale one — the next
             # turn would --resume straight back into a dead session.
             if result.returncode == 0:
+                _validate_claude_actual_model(result.stdout or "")
                 observed_sid = _extract_session_id(raw_transport) or command_sid
                 if observed_sid:
                     _save_agent_session_id(observed_sid)
@@ -7374,6 +7713,10 @@ def call_agent_cli(
                 ))
             _log_cli_turn_timing(cmd, result, int((time.monotonic() - _turn_t0) * 1000))
             raw_transport = (result.stdout or "") + "\n" + (result.stderr or "")
+            _trace_user_mcp_surface(
+                result.stderr or "", trace_id=trace_id, lane=lane,
+                is_pi=_is_pi_cmd(cmd), attempt="stream_cut_retry",
+            )
             if observed_sid and not isolated_session:
                 _record_agent_session_turn(
                     observed_sid,
@@ -7954,7 +8297,12 @@ def _outbound_file_prompt_block() -> str:
         "send-file returns ok. Do at most one lightweight check that the output "
         "opens and has the requested format; do not repeatedly render, screenshot, "
         "or tune fonts unless the user explicitly asks for layout QA. Tutorial "
-        "questions alone do not require a file."
+        "questions alone do not require a file. "
+        "GENERATED IMAGE DELIVERY: When an image capability produces a PNG, "
+        "JPEG, or WebP, save it under the same outbound directory and run "
+        f"`python {_IO_CLI_PATH} send-image --path <image_path> "
+        "[--name <display_name>]`. It will appear directly as a chat image. "
+        "Never expose a local path or claim delivery unless send-image returns ok."
     )
 
 
@@ -8003,10 +8351,35 @@ def _outbound_file_retry_prompt(
     )
 
 
+def _image_claim_retry_prompt() -> str:
+    """谎报打回的指令。与 V2 (`tool_loop._IMAGE_CLAIM_RETRY_INSTRUCTION`) 同义:
+    给一次明确的纠正机会,二选一,**不替它决定选哪个**。"""
+    return (
+        "上一轮你说图已经生成/画好了,但这一轮没有任何图片真的被生成。"
+        "请二选一,不要再声称已生成:"
+        f"(1) 你确实想给出这张图 —— 运行 `python {_IO_CLI_PATH} generate-image "
+        "--prompt \"<完整的画面描述>\"`,再用 send-image 交付;"
+        "(2) 你并不打算画 —— 照实说,不要用文字假装图已经存在。"
+    )
+
+
 def _outbound_file_failure_reply(text: str) -> str:
     if re.search(r"[\u4e00-\u9fff]", str(text or "")):
         return "这次没能生成你要求的可下载文件，请稍后再试。"
     return "I couldn't generate the requested downloadable file this time. Please try again."
+
+
+def _image_ready_reply(text: str) -> str:
+    """图已经发出去、但伴侣一个字都没说时的兜底。
+
+    ⚠️ 只在**它确实没说话**时用(有些 CLI driver 调完工具就不再出文本),绝不能
+    拿它去顶替伴侣真说了的话 —— 那是替它说话,比让它闭嘴更糟。
+    2026-08-08 之前专用生图那条路正是这么干的:runtime 抢先画完图,然后用这句
+    写死的话当回复,模型全程没参与。
+    """
+    if re.search(r"[\u4e00-\u9fff]", str(text or "")):
+        return "图片已经生成。"
+    return "The image is ready."
 
 
 def _sanitize_outbound_file_reply(
@@ -10178,6 +10551,7 @@ def post_reply(
     turn_failure_model: str = "",
     turn_failure_provider: str = "",
     file_followups: list[StagedChatFile] | None = None,
+    image_followups: list[StagedChatImage] | None = None,
 ) -> dict:
     """Post agent reply as a v1 ciphertext envelope.
 
@@ -10235,6 +10609,22 @@ def post_reply(
                         "file_byte_count": len(file_item.data),
                     }
                 )
+            sealed_image_followups = []
+            for image_item in image_followups or []:
+                image_envelope = _build_envelope(
+                    plaintext=bytes(image_item.data),
+                    owner_user_id=seal_user_id,
+                    user_pk_bytes=seal_user_pk,
+                    enclave_pk_bytes=seal_enc_pk,
+                    visibility=visibility,
+                )
+                sealed_image_followups.append(
+                    {
+                        "envelope": image_envelope,
+                        "image_mime": image_item.mime_type,
+                        "image_byte_count": len(image_item.data),
+                    }
+                )
             thinking_envelope = None
             safe_thinking = _sanitize_thinking_summary(thinking_summary)
             if safe_thinking:
@@ -10286,6 +10676,8 @@ def post_reply(
                 body["reply_to_message_id"] = reply_to_message_id
             if sealed_file_followups:
                 body["file_followups"] = sealed_file_followups
+            if sealed_image_followups:
+                body["image_followups"] = sealed_image_followups
             if gate_decision_id:
                 body["gate_decision_id"] = gate_decision_id
             if proactive_job_id:
@@ -10322,9 +10714,9 @@ def post_reply(
                 resp = _HTTP.post(url, json=_sealed_body(), headers=_HEADERS, timeout=15)
         return _handle_post_reply_response(resp)
 
-    if file_followups:
-        log.error("cannot post encrypted file followups without envelope encryption")
-        return {"error": "file_followup_encryption_unavailable"}
+    if file_followups or image_followups:
+        log.error("cannot post encrypted reply followups without envelope encryption")
+        return {"error": "reply_followup_encryption_unavailable"}
 
     # Encryption unavailable — plaintext path (will 400 on v1 backends).
     log.error(
@@ -10449,6 +10841,11 @@ def _message_ts_for_context(msg: dict) -> float:
 
 
 def _message_role_for_context(msg: dict) -> str:
+    if str(msg.get("role") or "") == _VOICE_CALL_RECORD_ROLE:
+        # 通话记录块不是伴侣说过的话。这里原本把**所有**非 user 的行归成 "agent",
+        # 于是过滤层换过身份的记录块在最终 prompt 里又变回了「我说的」——
+        # 修了过滤层漏了渲染层,正是这批改动本身在批评的那个错误。
+        return "通话记录"
     role = "user" if msg.get("role") == "user" else "agent"
     if msg.get("source") == PROACTIVE_JOB_SOURCE:
         role = "agent(proactive)"
@@ -11656,7 +12053,13 @@ def _capture_live_history(history: list[dict] | None) -> list[dict]:
         if source == "verify_ping":
             continue
         role = str(msg.get("role") or "").strip().lower()
-        if role not in {"user", "openclaw", "assistant", "agent"}:
+        # voice_call_record 是 _conversation_rows 换身份后的通话卡(dream 那条路
+        # 会先过滤再进来)。不放行的话 dream 的「这几天聊了什么」里永远没有电话。
+        # capture 那条路拿的是**原始行**(role=openclaw),不经过滤器,因此不受影响
+        # —— 它仍然会把卡展开成归档全文。
+        if role not in {
+            "user", "openclaw", "assistant", "agent", _VOICE_CALL_RECORD_ROLE,
+        }:
             continue
         text = _capture_message_text(msg)
         if not text or "__VERIFY_PING__" in text:
@@ -11748,8 +12151,11 @@ def _capture_window_text(messages: list[dict], *, user_label: str = "TA", agent_
             # 聊天流里只有有界预览卡，全文在归档表里。展开它，Capture 才是在
             # 蒸整通电话而不是开头几句。取不到就让整个 job 失败重试（游标不动）。
             body = _bounded_voice_transcript(_capture_voice_transcript_text(call_id))
-            turns = msg.get("voice_turn_count")
-            header = "【语音通话逐字记录" + (f"，共 {turns} 轮" if turns else "") + "】"
+            # 抬头(谁是谁 + 换尺子)与 V2 共用同一份实现,别在这里另写。
+            header = _voice_transcript_store.capture_window_header(
+                turn_count=msg.get("voice_turn_count"),
+                user_name=user_label, ai_name=agent_label,
+            )
             lines.append(f"- [{_format_message_time(ts)}] {header}\n{body}")
             continue
         lines.append(
@@ -13987,6 +14393,9 @@ def _process_messages(messages: list) -> float:
         # interaction) so the agent never carries a stale, e.g. overnight, frame.
         content = _prepend_time_anchor_foreground(content, ts)
         content = _prepend_runtime_model_identity(content)
+        # Preserve the pre-session prompt so a poisoned Pi session can rotate;
+        # rebuilding adds only the safe text transcript, never historical pixels.
+        session_independent_content = content
         # VPS/self-hosted CLI resident only (no-op for hosted / http-backend):
         # live io_cli command catalog, once per resume-capable session or every
         # turn for codex. Must run BEFORE _foreground_agent_message below so the
@@ -13999,8 +14408,14 @@ def _process_messages(messages: list) -> float:
         # (v2, image, plain) carries the same context. Wraps the time-anchored
         # content so the transcript sits above this turn's grounded message.
         content = _foreground_agent_message(content, current_ts=ts)
+        session_bound_content = content
 
-        use_runtime_v2 = _resident_chat_runtime_v2_enabled() and not (image_payloads or image_paths)
+        # This flag selects the resident V1 chat profile; it does not transfer
+        # session ownership to the pooled Runtime V2 worker.
+        use_resident_chat_v2_profile = (
+            _resident_chat_runtime_v2_enabled()
+            and not (image_payloads or image_paths)
+        )
         attempt_kwargs = (
             {"attempt_trigger": attempt_trigger}
             if attempt_trigger != "first"
@@ -14015,6 +14430,13 @@ def _process_messages(messages: list) -> float:
             else None
         )
         staged_outbound_files: list[StagedChatFile] = []
+        staged_outbound_images: list[StagedChatImage] = []
+        # 专用生图不再由 runtime 抢先跑一发。伴侣自己用 generate-image 调用户
+        # 配置的生图模型(prompt 它自己写),再用 send-image 交付 —— 与它原生产出
+        # 的图走同一条路。删掉的那段会:①用正则替它判断"用户是不是在要图"
+        # (含蓄请求判不出、它自己想画没入口);②拿用户原话当 prompt(画出来的
+        # 东西不带它的理解);③成功后用系统写死的「图片已经生成。」当回复,
+        # 连模型都没过——那是替它说话,比让它闭嘴更糟。
         if outbound_file_turn_active:
             try:
                 _begin_outbound_file_turn(trace_id, outbound_file_requirement)
@@ -14027,6 +14449,32 @@ def _process_messages(messages: list) -> float:
         # 发就成了重复错误气泡。让通知与回复共享同一份排他性。
         pending_failure_notice: BaseException | None = None
         pending_failure_is_parse_only = False
+
+        def _dispatch_foreground_agent(turn_content: str) -> Any:
+            if use_resident_chat_v2_profile:
+                return call_agent(
+                    _resident_foreground_chat_message_v2(turn_content),
+                    trace_id=trace_id, lane="chat",
+                    stream_update=voice_stream_update,
+                    **attempt_kwargs)
+            if image_payloads or image_paths:
+                return call_agent(
+                    turn_content,
+                    images=image_payloads,
+                    image_paths=image_paths,
+                    trace_id=trace_id,
+                    lane="chat",
+                    stream_update=voice_stream_update,
+                    **attempt_kwargs,
+                )
+            return call_agent(
+                turn_content,
+                trace_id=trace_id,
+                lane="chat",
+                stream_update=voice_stream_update,
+                **attempt_kwargs,
+            )
+
         try:
             # Discard any parse-failed marker left dangling by another lane
             # (proactive / verify_probe) running earlier in this single-threaded
@@ -14042,30 +14490,57 @@ def _process_messages(messages: list) -> float:
                     ]
                 }
                 pending_failure_notice = vision_observer_failed
-            elif use_runtime_v2:
-                agent_result = call_agent(
-                    _resident_foreground_chat_message_v2(content),
-                    trace_id=trace_id, lane="chat",
-                    stream_update=voice_stream_update,
-                    **attempt_kwargs)
-            elif image_payloads or image_paths:
-                agent_result = call_agent(
-                    content,
-                    images=image_payloads,
-                    image_paths=image_paths,
-                    trace_id=trace_id,
-                    lane="chat",
-                    stream_update=voice_stream_update,
-                    **attempt_kwargs,
-                )
             else:
-                agent_result = call_agent(
-                    content,
-                    trace_id=trace_id,
-                    lane="chat",
-                    stream_update=voice_stream_update,
-                    **attempt_kwargs,
-                )
+                try:
+                    agent_result = _dispatch_foreground_agent(content)
+                except Exception as first_error:
+                    pi_vision_rejection = (
+                        AGENT_MODE == "cli"
+                        and _cli_template_is_pi()
+                        and _vision_probe_error_code(first_error)
+                        == "vision_model_required"
+                    )
+                    if not pi_vision_rejection:
+                        raise
+
+                    # Pi replays session blocks on later turns, so one rejected
+                    # image otherwise makes subsequent text-only turns fail too.
+                    _discard_io_cli_catalog_pending_injection()
+                    _clear_agent_session_id("Pi session retained rejected image input")
+
+                    has_current_images = bool(image_payloads or image_paths)
+                    _emit_debug_trace(
+                        "agent", "agent.session.vision_rejection_rotate",
+                        trace_id=trace_id,
+                        summary="Pi session rotated after vision rejection",
+                        explain=(
+                            "Pi 会话残留了主模型拒绝的图片——已轮换会话"
+                            + ("，本轮仍含原图，等待用户配置识图模型"
+                               if has_current_images
+                               else "，用纯文本安全上下文重试本轮")
+                        ),
+                        detail={
+                            "current_images": has_current_images,
+                            "retried": not has_current_images,
+                            "resident_chat_v2_profile": (
+                                use_resident_chat_v2_profile
+                            ),
+                        },
+                    )
+                    if has_current_images:
+                        raise
+
+                    suffix = (
+                        content[len(session_bound_content):]
+                        if content.startswith(session_bound_content)
+                        else ""
+                    )
+                    content = _prepend_io_cli_capability_catalog(
+                        session_independent_content
+                    )
+                    content = _foreground_agent_message(content, current_ts=ts)
+                    content += suffix
+                    agent_result = _dispatch_foreground_agent(content)
         except Exception as e:
             log.error("agent call failed; posting user-visible fallback: %s", e)
             if content_type == "image" and not isinstance(e, VisionObserverFailure):
@@ -14099,7 +14574,7 @@ def _process_messages(messages: list) -> float:
                 _notify_agent_turn_failure(e, foreground=True)
                 log.warning("agent error fallback disabled by env; this user turn will not get a visible reply")
                 if outbound_file_turn_active:
-                    _finish_outbound_file_turn(trace_id)
+                    _finish_outbound_attachment_turn(trace_id)
                 latest = max(latest, ts)
                 continue
         else:
@@ -14113,8 +14588,9 @@ def _process_messages(messages: list) -> float:
                 _commit_io_cli_catalog_injection()
             if voice_stream_update is not None:
                 voice_stream_update.complete()
-            if not vision_observer_failed and (
-                parse_failure_class := _consume_reply_parse_failed()
+            if (
+                not vision_observer_failed
+                and (parse_failure_class := _consume_reply_parse_failed())
             ):
                 pending_failure_notice = _reply_parse_failure_exc(
                     parse_failure_class
@@ -14147,7 +14623,46 @@ def _process_messages(messages: list) -> float:
                     log.error("outbound file completion retry failed: %s", exc)
                     pending_failure_notice = exc
 
-            staged_outbound_files = _finish_outbound_file_turn(trace_id)
+            # 谎报打回:它说图画好了,但这一轮一张图都没 stage。给**一次**明确的
+            # 纠正机会(真去画,或者照实说),之后不再纠缠 —— 再撒谎就照原样发出
+            # 并留痕,那是模型的问题,不是 runtime 该继续较劲的事。
+            # 必须在 `_finish_outbound_attachment_turn` **之前**判:staging 一旦
+            # 收摊,它就算被打回、真去调 send-image 也交付不出去。
+            # 之前这条只有提示词、没有运行时控制流 —— prod 主链路上模型谎报会
+            # 照常发布,V1/V2 的产品基线不一致(codex 审出)。
+            if pending_failure_notice is None and not _staged_outbound_image_snapshot(
+                trace_id
+            ):
+                claimed = _split_agent_turn(agent_result)
+                claimed_text = "\n\n".join(
+                    m for m in claimed.messages if isinstance(m, str)
+                )
+                if _claims_image_delivered(claimed_text):
+                    _emit_debug_trace(
+                        "agent",
+                        "image_claim_without_media_bounced",
+                        trace_id=trace_id,
+                        summary="reply claimed an image that was never staged",
+                    )
+                    try:
+                        retry_result = call_agent(
+                            _image_claim_retry_prompt(),
+                            trace_id=trace_id,
+                            lane="chat",
+                        )
+                        if (retry_failure_class := _consume_reply_parse_failed()):
+                            pending_failure_is_parse_only = True
+                            raise _reply_parse_failure_exc(retry_failure_class)
+                        agent_result = retry_result
+                    except Exception as exc:
+                        # 打回失败不能吃掉原来那一轮:宁可把它原话发出去(留痕),
+                        # 也不要让用户什么都收不到。
+                        log.error("image claim retry failed: %s", exc)
+                        agent_result = initial_agent_result
+
+            staged_outbound_files, staged_outbound_images = (
+                _finish_outbound_attachment_turn(trace_id)
+            )
             still_missing = _missing_outbound_file_suffixes(
                 outbound_file_requirement, staged_outbound_files
             )
@@ -14175,12 +14690,22 @@ def _process_messages(messages: list) -> float:
                             _outbound_file_failure_reply(raw_user_content_for_lang)
                         ]
                     }
-            elif staged_outbound_files and pending_failure_is_parse_only:
+            elif (
+                staged_outbound_files or staged_outbound_images
+            ) and pending_failure_is_parse_only:
                 # A successfully staged file is itself a usable model result.
                 # Some CLI drivers emit no separate assistant text after the
                 # send-file tool call; synthesize the short confirmation below
                 # without misclassifying the completed turn as an agent error.
                 pending_failure_notice = None
+                _note_agent_turn_success()
+
+            if staged_outbound_images and pending_failure_notice is not None:
+                agent_result = {
+                    "messages": [_image_ready_reply(raw_user_content_for_lang)]
+                }
+                pending_failure_notice = None
+                pending_failure_is_parse_only = False
                 _note_agent_turn_success()
 
         turn = _split_agent_turn(agent_result)
@@ -14191,7 +14716,9 @@ def _process_messages(messages: list) -> float:
                 continue
             sanitized, removed = _sanitize_outbound_file_reply(
                 message,
-                attachment_staged=bool(staged_outbound_files),
+                attachment_staged=bool(
+                    staged_outbound_files or staged_outbound_images
+                ),
             )
             stripped_file_citation = stripped_file_citation or removed
             if sanitized.strip():
@@ -14209,6 +14736,8 @@ def _process_messages(messages: list) -> float:
                 if re.search(r"[\u4e00-\u9fff]", raw_user_content_for_lang)
                 else "The file is ready."
             ]
+        if staged_outbound_images and not turn.messages:
+            turn.messages = [_image_ready_reply(raw_user_content_for_lang)]
         _reply_text = "\n\n".join(m for m in turn.messages if isinstance(m, str) and m.strip())
         _emit_debug_trace(
             "agent", "agent.reply", trace_id=trace_id,
@@ -14220,7 +14749,7 @@ def _process_messages(messages: list) -> float:
             content_excerpt={"reply": _reply_text[:3000], "thinking": (turn.thinking_summary or "")[:2000]},
         )
         actions, replies = turn.actions, turn.messages
-        if use_runtime_v2:
+        if use_resident_chat_v2_profile:
             actions = [
                 action for action in actions
                 if _proactive_action_type(action).removeprefix("proactive.") != "needs_background"
@@ -14332,11 +14861,19 @@ def _process_messages(messages: list) -> float:
                     )
                 if idx == 0 and staged_outbound_files:
                     post_kwargs["file_followups"] = staged_outbound_files
+                if idx == 0 and staged_outbound_images:
+                    post_kwargs["image_followups"] = staged_outbound_images
                 result = post_reply(reply, **post_kwargs)
                 if isinstance(result, dict) and result.get("error"):
-                    if result.get("error") == "bootstrap_incomplete":
+                    if result.get("error") in {
+                        "bootstrap_incomplete",
+                        "voice_turn_superseded",
+                    }:
                         terminal_response_error = True
-                        log.error("reply rejected by bootstrap gate; advancing past this dead-end message")
+                        log.info(
+                            "reply terminally skipped reason=%s; advancing past message",
+                            result.get("error"),
+                        )
                         continue
                     raise RuntimeError(str(result)[:500])
                 posted_any = True
@@ -14515,6 +15052,7 @@ _outbound_file_lock = threading.Lock()
 _active_outbound_file_turn_id = ""
 _active_outbound_file_suffixes: tuple[str, ...] | None = None
 _staged_outbound_files: list[StagedChatFile] = []
+_staged_outbound_images: list[StagedChatImage] = []
 
 
 def _begin_outbound_file_turn(
@@ -14530,6 +15068,7 @@ def _begin_outbound_file_turn(
         _active_outbound_file_turn_id = str(turn_id or "")
         _active_outbound_file_suffixes = required_suffixes
         _staged_outbound_files.clear()
+        _staged_outbound_images.clear()
 
 
 def _staged_outbound_file_snapshot(turn_id: str) -> list[StagedChatFile]:
@@ -14539,21 +15078,44 @@ def _staged_outbound_file_snapshot(turn_id: str) -> list[StagedChatFile]:
         return list(_staged_outbound_files)
 
 
-def _finish_outbound_file_turn(turn_id: str) -> list[StagedChatFile]:
-    global _active_outbound_file_turn_id, _active_outbound_file_suffixes
+def _staged_outbound_image_snapshot(turn_id: str) -> list[StagedChatImage]:
+    """本回合到目前为止已 stage 的图 —— **不关闭 staging**。
+
+    谎报打回必须在 staging 还开着的时候判:一旦
+    `_finish_outbound_attachment_turn` 收了摊,伴侣就算被打回、真去调
+    send-image 也交付不出去(no_active_chat_turn)。
+    """
     with _outbound_file_lock:
         if str(turn_id or "") != _active_outbound_file_turn_id:
             return []
-        staged = list(_staged_outbound_files)
+        return list(_staged_outbound_images)
+
+
+def _finish_outbound_attachment_turn(
+    turn_id: str,
+) -> tuple[list[StagedChatFile], list[StagedChatImage]]:
+    global _active_outbound_file_turn_id, _active_outbound_file_suffixes
+    with _outbound_file_lock:
+        if str(turn_id or "") != _active_outbound_file_turn_id:
+            return [], []
+        staged_files = list(_staged_outbound_files)
+        staged_images = list(_staged_outbound_images)
         _staged_outbound_files.clear()
+        _staged_outbound_images.clear()
         _active_outbound_file_turn_id = ""
         _active_outbound_file_suffixes = None
-    for item in staged:
+    for item in [*staged_files, *staged_images]:
         try:
             Path(item.source_path).unlink(missing_ok=True)
         except OSError:
             pass
-    return staged
+    return staged_files, staged_images
+
+
+def _finish_outbound_file_turn(turn_id: str) -> list[StagedChatFile]:
+    """Backward-compatible file-only test/helper surface."""
+    files, _images = _finish_outbound_attachment_turn(turn_id)
+    return files
 
 
 def _safe_outbound_file_name(raw: str) -> str:
@@ -14681,6 +15243,81 @@ def _handle_stage_file_ipc(msg: dict) -> dict:
                     "request_id": request_id,
                 }
             _staged_outbound_files.append(item)
+    return {
+        "ok": True,
+        "staged": True,
+        "name": item.name,
+        "mime": item.mime_type,
+        "byte_count": len(item.data),
+        "request_id": request_id,
+    }
+
+
+def _handle_stage_image_ipc(msg: dict) -> dict:
+    """Validate and stage one binary raster result from the active agent turn."""
+    request_id = str(msg.get("request_id") or "").strip()
+    raw_path = str(msg.get("path") or "").strip()
+    if not request_id:
+        return {"ok": False, "error": "request_id_required"}
+    if not raw_path:
+        return {"ok": False, "error": "path_required", "request_id": request_id}
+
+    with _outbound_file_lock:
+        active_turn_id = _active_outbound_file_turn_id
+    if not active_turn_id:
+        return {"ok": False, "error": "no_active_chat_turn", "request_id": request_id}
+
+    source_path = Path(raw_path)
+    if not source_path.is_absolute():
+        source_path = OUTBOUND_FILE_DIR / source_path
+    try:
+        resolved_dir = OUTBOUND_FILE_DIR.resolve()
+        resolved_path = source_path.resolve(strict=True)
+        resolved_path.relative_to(resolved_dir)
+    except (OSError, ValueError):
+        return {
+            "ok": False,
+            "error": "path_outside_outbound_dir",
+            "request_id": request_id,
+        }
+
+    try:
+        source_data = resolved_path.read_bytes()
+        normalized = generated_image.normalize_generated_image(
+            source_data,
+            name=str(msg.get("name") or resolved_path.name),
+            index=len(_staged_outbound_images) + 1,
+        )
+    except (OSError, ValueError) as exc:
+        return {"ok": False, "error": str(exc), "request_id": request_id}
+
+    item = StagedChatImage(
+        source_path=str(resolved_path),
+        name=normalized.name,
+        mime_type=normalized.mime_type,
+        data=normalized.data,
+    )
+    with _outbound_file_lock:
+        if active_turn_id != _active_outbound_file_turn_id:
+            return {"ok": False, "error": "chat_turn_finished", "request_id": request_id}
+        for existing in _staged_outbound_images:
+            if existing.source_path == item.source_path:
+                item = existing
+                break
+        else:
+            if len(_staged_outbound_images) >= generated_image.MAX_GENERATED_IMAGES_PER_REPLY:
+                return {
+                    "ok": False,
+                    "error": "too_many_staged_images",
+                    "request_id": request_id,
+                }
+            if len(_staged_outbound_files) + len(_staged_outbound_images) >= 8:
+                return {
+                    "ok": False,
+                    "error": "too_many_staged_attachments",
+                    "request_id": request_id,
+                }
+            _staged_outbound_images.append(item)
     return {
         "ok": True,
         "staged": True,
@@ -14965,6 +15602,8 @@ def _redistill_ipc_serve_forever(sock_path: Path) -> None:
             op = str(obj.get("op") or "") if isinstance(obj, dict) else ""
             if op == "stage_file":
                 reply = _handle_stage_file_ipc(obj)
+            elif op == "stage_image":
+                reply = _handle_stage_image_ipc(obj)
             elif op == "redistill" and not _HOSTED:
                 reply = _handle_redistill_ipc(obj)
             else:

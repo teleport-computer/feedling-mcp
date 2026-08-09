@@ -975,7 +975,9 @@ def _build_reducer_output(
     user_name: str = "",
     llm: GenesisLLMClient | None = None,
     resume_map_outputs: dict[int, dict] | None = None,
+    resume_voice_outputs: dict[int, dict] | None = None,
     on_map_completed: Callable[[int, dict], None] | None = None,
+    on_voice_completed: Callable[[int, dict], None] | None = None,
 ) -> dict:
     llm = llm or GenesisLLMClient()
     idempotency_prefix = _idempotency_prefix(job_id, key_prefix)
@@ -1062,16 +1064,22 @@ def _build_reducer_output(
     for idx, text in enumerate(chunk_texts):
         if include_persona_voice and source_family == "history":
             try:
-                voice = _complete_json(
-                    llm,
-                    user_id=user_id,
-                    job_id=job_id,
-                    task_id=f"voice-map-{idx}",
-                    runtime=runtime,
-                    messages=prompts.voice_map_messages(text),
-                    max_tokens=1800,
-                    idempotency_key=f"{idempotency_prefix}:voice_map:{idx}",
-                )
+                cached_voice = (resume_voice_outputs or {}).get(idx)
+                if isinstance(cached_voice, dict):
+                    voice = cached_voice
+                else:
+                    voice = _complete_json(
+                        llm,
+                        user_id=user_id,
+                        job_id=job_id,
+                        task_id=f"voice-map-{idx}",
+                        runtime=runtime,
+                        messages=prompts.voice_map_messages(text),
+                        max_tokens=1800,
+                        idempotency_key=f"{idempotency_prefix}:voice_map:{idx}",
+                    )
+                    if on_voice_completed is not None:
+                        on_voice_completed(idx, voice)
                 voice_candidates.append(voice)
             except (provider_client.ProviderError, GenesisWorkerError) as e:
                 # Voice is an enhancement; one chunk failing to map (after the
@@ -1229,7 +1237,9 @@ def build_reducer_output_from_texts(
     user_name: str = "",
     llm: GenesisLLMClient | None = None,
     resume_map_outputs: dict[int, dict] | None = None,
+    resume_voice_outputs: dict[int, dict] | None = None,
     on_map_completed: Callable[[int, dict], None] | None = None,
+    on_voice_completed: Callable[[int, dict], None] | None = None,
 ) -> dict:
     """Public wrapper for trusted in-memory Genesis inputs.
 
@@ -1253,7 +1263,9 @@ def build_reducer_output_from_texts(
         user_name=user_name,
         llm=llm,
         resume_map_outputs=resume_map_outputs,
+        resume_voice_outputs=resume_voice_outputs,
         on_map_completed=on_map_completed,
+        on_voice_completed=on_voice_completed,
     )
 
 

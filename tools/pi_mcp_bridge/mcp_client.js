@@ -23,6 +23,35 @@ export const PROTOCOL_VERSION = "2025-03-26";
 // memory guard.
 export const MAX_SSE_BYTES = 262144;
 
+
+/** 有界读取响应体。超过上限即中止,不把剩下的字节读进内存。 */
+async function _readBounded(resp, limit) {
+  if (!resp.body || typeof resp.body.getReader !== "function") {
+    // 测试里的 fetch 替身通常只实现 text();退回去但仍然截断。
+    const text = await resp.text();
+    return text.length > limit ? text.slice(0, limit) : text;
+  }
+  const reader = resp.body.getReader();
+  const decoder = new TextDecoder();
+  let out = "";
+  let seen = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    seen += value.byteLength;
+    out += decoder.decode(value, { stream: true });
+    if (seen > limit) {
+      try {
+        await reader.cancel();
+      } catch (_e) {
+        // 取消失败无所谓,我们已经不再读了。
+      }
+      break;
+    }
+  }
+  return out;
+}
+
 /**
  * Pick the MCP transport for one materialized server entry. Mirrors
  * user_mcp_materialize.effective_transport: explicit type wins, otherwise
@@ -87,8 +116,12 @@ export class McpClient {
         signal: controller.signal,
         redirect: "error", // same posture as mcp_probe.py: no redirect chasing
       });
-      // Always drain the body, even for notifications, so the socket is freed.
-      const body = await resp.text();
+      // Always drain the body, even for notifications, so the socket is freed —
+      // but **bounded**. SSE 那侧一直有 MAX_SSE_BYTES 上限,这条普通 HTTP 路径
+      // 却是无界 `resp.text()`:一个恶意或有 bug 的服务器用一个巨大的
+      // tools/list 响应就能把 agent 进程撑爆,而且发生在任何 schema 体积统计
+      // 之前(codex 审出的不对称)。同一个客户端里两条路必须同一个标准。
+      const body = await _readBounded(resp, MAX_SSE_BYTES);
       const sid = resp.headers.get("mcp-session-id");
       if (sid) this.sessionHeaders["Mcp-Session-Id"] = sid;
       // Notifications are fire-and-forget. The MCP spec requires sending

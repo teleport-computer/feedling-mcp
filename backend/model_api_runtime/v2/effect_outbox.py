@@ -45,6 +45,7 @@ FINALIZED_JOB_IDS_KEY = "finalized_job_ids"
 FINAL_REPLY_INPUT_ADVANCED = "input_generation_advanced"
 FINAL_REPLY_INVALID_FENCE = "invalid_final_reply_fence"
 FINAL_REPLY_SOURCE_JOB_INACTIVE = "source_job_not_active"
+FINAL_REPLY_VOICE_CALL_ENDED = "voice_call_ended"
 WAKE_REPLY_CHAT_COLLISION = "wake_chat_collision"
 EFFECT_RUNTIME_STATE_CHANGED = "runtime_state_not_v2"
 EFFECT_RUNTIME_GENERATION_CHANGED = "runtime_generation_advanced"
@@ -914,6 +915,20 @@ def apply_pending_effects(
                             if (
                                 deferred_dispatch_error is None
                                 and final_reply_discard_reason is None
+                                and str(effect_type) in _REPLY_EFFECT_TYPES
+                            ):
+                                voice_call_id = str(
+                                    payload.get("voice_call_id") or ""
+                                ).strip()
+                                if voice_call_id and db.voice_call_status_on_cursor(
+                                    cur, user_id, voice_call_id, lock=True
+                                ) in {"finalizing", "cancelled", "finalized"}:
+                                    final_reply_discard_reason = (
+                                        FINAL_REPLY_VOICE_CALL_ENDED
+                                    )
+                            if (
+                                deferred_dispatch_error is None
+                                and final_reply_discard_reason is None
                                 and not perception_glance_fingerprint_valid
                             ):
                                 final_reply_discard_reason = (
@@ -958,6 +973,49 @@ def apply_pending_effects(
                                 deferred_dispatch_error is None
                                 and final_reply_discard_reason is not None
                             ):
+                                if (
+                                    final_reply_discard_reason
+                                    == FINAL_REPLY_VOICE_CALL_ENDED
+                                    and reply_mode in {"final", "legacy_final"}
+                                ):
+                                    candidate_job_id = (
+                                        _complete_final_reply_job_on_cursor(
+                                            cur,
+                                            user_id=user_id,
+                                            job_id=job_id,
+                                            claimed_by=final_reply_claimed_by,
+                                            input_generation=(
+                                                final_reply_input_generation
+                                            ),
+                                            perception_glance_fingerprint=(
+                                                perception_glance_fingerprint
+                                            ),
+                                        )
+                                    )
+                                    finalized_job_id_in_transaction = (
+                                        candidate_job_id
+                                    )
+                                    persisted_runtime_doc = (
+                                        db._advance_blob_int_on_cursor(
+                                            cur,
+                                            user_id,
+                                            "model_api_runtime",
+                                            "v2_reply_cursor_seq",
+                                            int(
+                                                payload.get(
+                                                    "reply_through_seq"
+                                                )
+                                                or 0
+                                            ),
+                                        )
+                                    )
+                                    post_commit_reply = lambda doc=(
+                                        persisted_runtime_doc
+                                    ): db._mirror_persisted_blob(
+                                        user_id,
+                                        "model_api_runtime",
+                                        doc,
+                                    )
                                 if (
                                     reply_mode == "legacy_final"
                                     and final_reply_discard_reason
