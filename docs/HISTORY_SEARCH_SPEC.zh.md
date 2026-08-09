@@ -1,6 +1,6 @@
 # History Search Spec — 模型侧历史聊天记录检索（V2 + V1）
 
-状态：V2 三批已实现（待修 code review 六项）；V1 待做（§12）。
+状态：V2 三批已实现，code review 两轮（7 项 + 预算边界 3 项）已修完；V1 待做（§12）。
 基线 `origin/test`（4df93df7）。
 背景调研与决策记录见工作区（io 根目录）`FEATURE_LOG.md`「历史聊天检索」一节
 （该文件不在本仓库内）。
@@ -89,6 +89,17 @@ history_fetch(message_id: string, before?: int, after?: int)
 - **31 是请求上限，不保证 31 条都进入最终 payload**：31 条即使正文全空，
   JSON 骨架也约 3240 字符；平均正文 40 字时已逼近 4500，80 字时必然要删减。
   实际返回条数由预算决定，删了多少必须用 `omitted_before/omitted_after` 如实报。
+- **回合租约同样约束 fetch**（§5 是「两工具合计」，不是「只管 search」）：
+  - `deadline_ms` **必须随 payload 转发给 enclave**，enclave 在逐行解密循环里检查
+    ——和 `/scan` 同一套机制（外层 `to_thread` 的取消停不掉同步解密线程）。
+    超时没解成的邻居计入 `omitted_*`，**不是** `unavailable`（它们压根没被碰过）。
+  - 邻居条数按剩余额度钳：`min(请求窗口, max(剩余额度 - 1, 2))`，锚点单独占 1 行。
+    **保底 2 不是 0**：额度只剩一两行时把 fetch 削成"只回锚点"等于白跑一次
+    （锚点原文模型多半已从 search 的 snippet 看过），而"剩 0"本该被回合
+    exhausted 拦在更前面。**额度优先给 `before`**——线索几乎总在前文里。
+  - 三处删减（预算钳 / enclave deadline / facade 结构化缩减）**累加**进同一对
+    `omitted_*` 计数，facade 绝不把它重置成 0。
+  - 记账取**缩减前**的行数，且预算钳掉的行也照扣：偏保守，且只在回合尾部发生。
 - 限制单位是**完整序列化 payload**（≤**4500** 字符），超限**按此顺序**结构化缩减
   （绝不序列化后切串）：
   1. 先保证所有消息的结构 + 短摘录都在（让模型看得到"这里有哪些消息"）；
@@ -124,6 +135,28 @@ history_search: result_cap=1800  atomic_json=true
   `ToolResult.metadata` 标记类型；**它不能自己决定预算**，授权在共享策略。
 - 协议测试必须用真实最坏形态：`history_fetch 顶满 4500 + 7 个各 ≥2000 的兄弟`，
   逐个 `json.loads`、总量 ≤10500。**不许用短 "ok" 结果凑数释放水位**。
+
+**这两个数字 env 可调，因此必须在启动期交叉校验**（`validate_result_caps`，
+worker import 时对着该部署真实的 `tool_batch_result_char_cap` 跑一次，不满足
+直接 `RuntimeError` 起不来）。两个方向各有一个洞，都实测复现过：
+
+| 坏配置 | 后果 |
+|---|---|
+| `result_cap` 太小（极端如 `1`） | 结构化缩减压不到——最小合法骨架就有几百字符（search 还得容下最长 1024 的 `next_cursor`）→ facade 交出超限对象 → 下游切串 → `"{...[truncated]"` **非法 JSON** |
+| `result_cap` 太大（如 fetch `12000`） | atomic 结果被**整额预留**，而同批预算只抬到 `batch_cap + extra_batch_budget` → 实测总量 10995，突破 10500 总闸。调小通用 `batch_cap` 是同一个不等式的另一边 |
+
+校验的三条不等式：`result_cap ≥ 最小合法骨架`、
+`result_cap ≤ batch_cap + extra_batch_budget`（逐个）、
+`Σ result_cap ≤ batch_cap + Σ extra_batch_budget`（同批多个 atomic 的纵深防御）。
+
+**atomic 路径永不切串**（三层，逐层兜底）：
+1. facade 缩减后**复核一次长度**，仍超 → 返回完整、稳定、合法 JSON 的错误结果
+   `result_budget_exceeded`，绝不把超限对象交下去；
+2. executor 的单结果闸遇到 atomic 违约 → 整体替换为同一条错误结果，
+   **不调用通用 `_truncate_result_content`**；
+3. tool_loop 在水位分配**之前**替换掉超限的 atomic 结果，
+   让下游无从预留或切割一个坏 payload。
+   ＊非 atomic 工具（其余全部）三处行为逐字节不变。
 
 ## 4. 执行算法（search）
 
@@ -178,9 +211,28 @@ cover 查询会略过被 checkpoint 覆盖的子节点，不可复用）。
 
 超预算 = 正常返回 `complete=false + next_cursor`，绝不伪装成"没找到"。
 
+**回合额度先租后结（reserve → settle）**，不是只在调用之间查一次「用完没」：
+剩 1 行时仍放行一次完整 512 行扫描，一个回合最坏就能扫 2011 行。lease 携带
+剩余额度，capability 在调用前把它钳进本次 budget——**search 和 fetch 都要真的
+花掉它**（fetch 的花法见 §3.2）。
+
+**结算是三态，不是两态**（否则预算可被绕过）：
+
+| 情况 | 扣多少 |
+|---|---|
+| 成功 + 可信 metadata（`history_scanned_rows`） | 按实际值（含**可信的实际 0**） |
+| 明确未触达扫描的错误 | 0 —— 本地参数校验、kill switch / dispatch gate 拒绝、cursor 拒绝、锚点查空。判据只有一条：**该错误码的所有产生点都在第一次 enclave POST 之前**；拿不准就不许列进豁免名单 |
+| **已进入执行但用量未知** | **按本次 lease 上限保守结算** |
+
+第三档是必须的：capability 异常会被 executor 刻意吞成 `capability_failed`
+（隔离单个坏读，不拖垮整轮），metadata 也就跟着没了。实测复现——租出 1500 →
+metadata 缺失 → 计费 0 → 下一次仍租出 1500，多轮快速失败即可突破 1500 累计闸。
+**宁可多扣，不许白嫖。**
+
 截断：见 §3.3 的共享预算策略（executor 与 tool_loop 同读、atomic_json 整额
-预留、含 history 时同批预算抬到 10500）。要点重申：**只在 executor 加 per-tool
-cap 无效**，tool_loop 的水位分摊会把它砍回去。
+预留、含 history 时同批预算抬到 10500、启动期交叉校验、atomic 违约整体换错误
+结果）。要点重申：**只在 executor 加 per-tool cap 无效**，tool_loop 的水位分摊
+会把它砍回去。
 
 ## 6. 信任边界与开关
 

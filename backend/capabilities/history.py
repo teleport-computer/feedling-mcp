@@ -57,6 +57,37 @@ DEFAULT_FETCH_RESULT_MAX_CHARS = (
 # 模型两处看到的都是 "error: tool_not_allowed"。
 TOOL_NOT_ALLOWED = "tool_not_allowed"
 
+# 「这次调用一行原文都没读过」的完整错误码清单（spec §5 的保守结算）。
+#
+# 回合预算按**可信 metadata** 结算；拿不到计数时（capability 异常被 executor
+# 吞成 capability_failed、metadata 通道丢了）必须按 lease 上限保守扣，否则多轮
+# 快速失败就能绕过 1500 行累计闸。这个集合是那条规则的唯一豁免：这些码全部
+# 在第一次 enclave POST **之前**就返回了，扣它们等于凭空惩罚一次打字错误。
+#
+# 判据只有一条：**这个码的所有产生点都在 enclave 调用之前**。拿不准就别加进来
+# ——漏加的代价是多扣几行，错加的代价是预算闸被绕过。
+PRE_SCAN_ERROR_CODES = frozenset({
+    TOOL_NOT_ALLOWED,               # kill switch / executor dispatch gate
+    errors.INVALID,                 # facade 本地参数校验（message_id 缺失等）
+    # ⚠️ 这是本列表里唯一的**通用**错误码，也是唯一有漂移风险的一项：豁免的前提
+    # 是它当前仅有的两个生产者（cursor key 缺失、enclave 无 history 路由 404）都在
+    # 任何扫描之前返回。**给 history 新增任何 UNAVAILABLE 返回点之前，先确认它同样
+    # 在扫描前返回；只要有一个可能扫描过，就必须把本行删掉**——否则失败路径会按
+    # 0 行结算，重试即可绕过回合预算（正是本轮修的第 2 项）。
+    errors.UNAVAILABLE,             # cursor key 缺失 / enclave 无 history 路由(404)
+    "cursor_invalid",
+    "cursor_mismatch",
+    "missing_query_or_time_range",
+    "invalid_limit",
+    "invalid_neighbor_count",
+    "query_empty",
+    "query_too_long",
+    "invalid_time",
+    "invalid_time_range",
+    "cursor_overflow",
+    "not_found_or_not_visible",     # 锚点查空，fetch 根本没发出去
+})
+
 
 # 回合剩余额度 → 本次调用的上限（spec §5）。worker 的 _HistoryTurnBudget 在
 # dispatch 之前 reserve 出剩余额度并用 ``call_limits`` 钉住这一次调用；
@@ -218,8 +249,11 @@ def _shrink_fetch_result(result: dict, *, max_chars: int) -> dict:
     out["before"] = [dict(i) for i in (result.get("before") or [])]
     out["after"] = [dict(i) for i in (result.get("after") or [])]
     # 计数字段常驻：模型必须能区分"就这么多"和"删过"，不能靠字段在不在猜。
-    out["omitted_before"] = 0
-    out["omitted_after"] = 0
+    # 从 readside 报上来的基数起算，**不是从 0 重置**：预算钳掉的行（回合租约
+    # 只剩几行）和 enclave 因 deadline 没解成的行也已经"删过"了，重置等于把这
+    # 两类删减吞掉，模型会以为窗口是完整的。
+    out["omitted_before"] = max(0, int(result.get("omitted_before") or 0))
+    out["omitted_after"] = max(0, int(result.get("omitted_after") or 0))
     if _rendered_chars(out) <= max_chars:
         return out
 
@@ -265,6 +299,29 @@ def _shrink_fetch_result(result: dict, *, max_chars: int) -> dict:
             item["content"] = excerpt
             item["content_truncated"] = True
     return out
+
+
+def _shrunk_or_error(shrunk: dict, *, max_chars: int, kind: str) -> CapabilityResult:
+    """缩减后复核一次尺寸：还超就返回错误结果，绝不把超限对象交下去。
+
+    结构化缩减是有下界的——``next_cursor``（search 的三态语义载体）和锚点
+    （fetch 的调用目的）永远不丢。cap 被配到那个下界以下时，缩减尽了力仍然
+    超限，而下游两道闸都是**序列化后切串**：交下去等于让模型收到半截 JSON
+    （``"{...[truncated]"``），既解析不了、也看不出发生了什么。
+
+    此时唯一正确的输出是一条完整、稳定、合法的错误结果：模型至少知道"这次
+    取回失败了"，可以换更窄的窗口重试。启动期的
+    ``result_budget.validate_result_caps`` 已经把会走到这里的配置挡在门外，
+    这层是纵深防御（env 在运行期被改、或未来新增 atomic 生产者时仍然兜得住）。
+    """
+    rendered = _rendered_chars(shrunk)
+    if rendered <= max_chars:
+        return ok(data=errors.cap_data(shrunk))
+    return err(
+        result_budget.OVERFLOW_ERROR_CODE,
+        f"{kind} result does not fit its configured budget",
+        retryable=False,
+    )
 
 
 def _infra_err(exc: RuntimeError, *, default_msg: str) -> CapabilityResult:
@@ -319,8 +376,10 @@ def search(store, *, api_key=None, runtime_token=None, params=None) -> Capabilit
                    retryable=False)
     except RuntimeError as exc:
         return _infra_err(exc, default_msg="history search unavailable")
-    return ok(data=errors.cap_data(
-        _shrink_search_result(result, max_chars=_search_result_max_chars())))
+    max_chars = _search_result_max_chars()
+    return _shrunk_or_error(
+        _shrink_search_result(result, max_chars=max_chars),
+        max_chars=max_chars, kind=HISTORY_SEARCH_TOOL)
 
 
 def fetch(store, *, api_key=None, runtime_token=None, params=None) -> CapabilityResult:
@@ -356,5 +415,7 @@ def fetch(store, *, api_key=None, runtime_token=None, params=None) -> Capability
         # 锚点不可见/不存在统一 not_found_or_not_visible（不区分，权限语义）。
         return err(str(result["error"]), "message not found or not visible",
                    retryable=False)
-    return ok(data=errors.cap_data(
-        _shrink_fetch_result(result, max_chars=_fetch_result_max_chars())))
+    max_chars = _fetch_result_max_chars()
+    return _shrunk_or_error(
+        _shrink_fetch_result(result, max_chars=max_chars),
+        max_chars=max_chars, kind=HISTORY_FETCH_TOOL)

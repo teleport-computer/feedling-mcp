@@ -15,11 +15,14 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import os
+import subprocess
 import sys
 from pathlib import Path
 from types import SimpleNamespace
 
-sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
+_BACKEND = Path(__file__).parent.parent / "backend"
+sys.path.insert(0, str(_BACKEND))
 
 import pytest  # noqa: E402
 
@@ -28,6 +31,7 @@ from provider_types import ToolCall, ToolResult, ToolSpec  # noqa: E402
 from capabilities import errors as cap_errors  # noqa: E402
 from capabilities import history as cap_history  # noqa: E402
 from capabilities import registry as cap_registry  # noqa: E402
+from capabilities import result_budget  # noqa: E402
 from capabilities import tool_schema  # noqa: E402
 from capabilities import activity_metadata  # noqa: E402
 from model_api_runtime.v2 import executor as v2_executor  # noqa: E402
@@ -679,6 +683,117 @@ def test_error_results_are_json_free_and_stable(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# D2. 共享预算策略的配置校验 + atomic 违约兜底（§3.3）
+# ---------------------------------------------------------------------------
+
+
+def test_shipped_defaults_pass_the_cross_check():
+    """默认配置（1800 / 4500+2500 / 8000）自洽——这条绿了才说明校验没写反。"""
+    result_budget.validate_result_caps(batch_cap=worker.TOOL_BATCH_RESULT_CHAR_CAP)
+
+
+def test_minimum_skeletons_track_the_real_cursor_ceiling():
+    """骨架下界必须容得下 next_cursor（缩减唯一不能丢的可变长字段）。"""
+    assert result_budget._CURSOR_MAX_CHARS == history_search.CURSOR_MAX_CHARS
+    assert (result_budget.MIN_RESULT_CAPS["history_search"]
+            > history_search.CURSOR_MAX_CHARS)
+
+
+def test_result_cap_below_the_minimum_skeleton_is_rejected(monkeypatch):
+    """cap=1：结构化缩减压不到 1 字符，facade 只能交出超限对象 → 下游切串
+    → ``"{...[truncated]"`` 非法 JSON。这种配置必须在启动期就死。"""
+    monkeypatch.setenv(result_budget.HISTORY_FETCH_RESULT_MAX_CHARS_ENV, "1")
+    with pytest.raises(RuntimeError, match="HISTORY_FETCH_RESULT_MAX_CHARS"):
+        result_budget.validate_result_caps(batch_cap=8000)
+
+
+def test_result_cap_that_overflows_the_raised_batch_budget_is_rejected(monkeypatch):
+    """cap=12000：atomic 整额预留 > 8000+2500，同批总量突破 10500 总闸。"""
+    monkeypatch.setenv(result_budget.HISTORY_FETCH_RESULT_MAX_CHARS_ENV, "12000")
+    with pytest.raises(RuntimeError, match="HISTORY_FETCH_RESULT_MAX_CHARS"):
+        result_budget.validate_result_caps(batch_cap=8000)
+
+
+def test_lowering_the_generic_batch_cap_is_rejected_too(monkeypatch):
+    """反向同理：通用 batch cap 调小到装不下 atomic 结果，也是同一个洞。"""
+    with pytest.raises(RuntimeError, match="TOOL_BATCH_RESULT_CHAR_CAP"):
+        result_budget.validate_result_caps(batch_cap=1000)
+
+
+def test_two_atomic_results_cannot_jointly_overflow_the_batch(monkeypatch):
+    """每个都合规、加起来不合规也要拦（round gate 之外的纵深防御）。"""
+    monkeypatch.setenv(result_budget.HISTORY_SEARCH_RESULT_MAX_CHARS_ENV, "6500")
+    with pytest.raises(RuntimeError, match="TOOL_BATCH_RESULT_CHAR_CAP"):
+        result_budget.validate_result_caps(batch_cap=8000)
+
+
+def test_worker_fails_fast_at_import_on_a_broken_result_cap():
+    """真·启动期：坏配置下 import worker 必须炸，而不是安静地上线。"""
+    env = dict(os.environ)
+    env["PYTHONPATH"] = str(_BACKEND)
+    env["FEEDLING_V2_HISTORY_FETCH_RESULT_MAX_CHARS"] = "12000"
+    proc = subprocess.run(
+        [sys.executable, "-c", "from model_api_runtime.v2 import worker"],
+        capture_output=True, text=True, env=env, timeout=120)
+    assert proc.returncode != 0
+    assert "FEEDLING_V2_HISTORY_FETCH_RESULT_MAX_CHARS" in proc.stderr
+
+
+def test_executor_replaces_an_over_cap_atomic_result_instead_of_slicing_it():
+    """atomic 路径绝不走通用切串闸：策略违约整体换成合法的错误结果。"""
+    oversized = {"ok": True, "data": {"anchor": {"content": "x" * 9000}}}
+    rendered = v2_executor._summarize_capability_result(
+        oversized, tool_name="history_fetch")
+    assert rendered == f"error: {result_budget.OVERFLOW_ERROR_CODE}"
+    assert "[truncated]" not in rendered
+    # 非 atomic 工具照旧切串，行为逐字节不变
+    plain = v2_executor._summarize_capability_result(
+        {"ok": True, "data": {"text": "x" * 9000}}, tool_name="web_search")
+    assert plain.endswith("...[truncated]")
+
+
+def test_tool_loop_replaces_an_over_cap_atomic_result_instead_of_slicing_it():
+    huge = ToolResult(
+        call_id="h1", content="{" + "x" * 9000 + "}",
+        metadata={result_budget.RESULT_KIND_METADATA_KEY: "history_fetch"})
+    (out,) = v2_tool_loop._normalize_tool_results(
+        [huge],
+        per_result_cap=v2_tool_loop.DEFAULT_TOOL_RESULT_CHAR_CAP,
+        batch_cap=v2_tool_loop.DEFAULT_TOOL_BATCH_RESULT_CHAR_CAP)
+    assert out.content == f"error: {result_budget.OVERFLOW_ERROR_CODE}"
+    assert out.metadata == huge.metadata
+
+
+def test_fetch_facade_returns_a_stable_error_when_the_shrink_cannot_fit(monkeypatch):
+    """缩减后仍超限 → 完整、稳定、合法 JSON 的错误结果，绝不进字符串截断。"""
+    _patch_secret(monkeypatch)
+    monkeypatch.delenv(cap_history.ENABLED_ENV, raising=False)
+    monkeypatch.setenv(result_budget.HISTORY_FETCH_RESULT_MAX_CHARS_ENV, "1")
+    monkeypatch.setattr(
+        history_readside, "run_history_fetch",
+        lambda uid, **kw: _wide_fetch_result())
+    result = cap_history.fetch(_STORE, params={"message_id": "m1"})
+    assert not result.ok
+    assert result.error["code"] == result_budget.OVERFLOW_ERROR_CODE
+    rendered = v2_executor._summarize_capability_result(
+        result.to_dict(), tool_name="history_fetch")
+    assert rendered == f"error: {result_budget.OVERFLOW_ERROR_CODE}"
+
+
+def test_search_facade_returns_a_stable_error_when_the_shrink_cannot_fit(monkeypatch):
+    """search 同理：next_cursor 不能丢，所以极小 cap 下必然压不进去。"""
+    _patch_secret(monkeypatch)
+    monkeypatch.delenv(cap_history.ENABLED_ENV, raising=False)
+    monkeypatch.setenv(result_budget.HISTORY_SEARCH_RESULT_MAX_CHARS_ENV, "20")
+    monkeypatch.setattr(
+        history_readside, "run_history_search",
+        lambda uid, **kw: _search_result(matches=[_match(0)]))
+    result = cap_history.search(_STORE, params={"query": "x"})
+    assert not result.ok
+    assert result.error["code"] == result_budget.OVERFLOW_ERROR_CODE
+
+
+# ---------------------------------------------------------------------------
 # E. 出站隔离（§8.5，真实 tool_loop）
 # ---------------------------------------------------------------------------
 
@@ -892,6 +1007,75 @@ def test_chat_lane_source_reserves_history_budget_before_dispatch():
     assert "reserve_call()" in source
     assert "settle_call(" in source
     assert "cap_history.call_limits(" in source
+    # 结算走同一个判定函数（保守兜底在里面），不是就地读 metadata
+    assert "_history_rows_charged(" in source
+
+
+def test_history_call_with_unknown_usage_is_charged_its_whole_lease():
+    """已经开跑却拿不到可信计数 → 按 lease 上限保守结算（spec §5）。
+
+    旧写法 ``scanned_rows = 0``：capability 抛异常被 executor 吞成
+    ``error: capability_failed``（或 metadata 通道丢了）时，这一次扫描按 0 行
+    入账，下一次仍然租出满额 1500——多轮快速失败就能突破回合累计闸。
+    宁可多扣，不许白嫖。
+    """
+    budget = worker._HistoryTurnBudget(max_rows=1500, max_wall_sec=8)
+    lease = budget.reserve_call()
+    assert lease.max_rows == 1500
+    swallowed = ToolResult(call_id="h1", content="error: capability_failed")
+    budget.settle_call(
+        lease, scanned_rows=worker._history_rows_charged(swallowed, lease))
+    assert budget.exhausted()
+    assert budget.reserve_call() is None
+
+
+def test_history_partial_lease_charge_shrinks_the_next_lease():
+    """租出 400 → 用量未知 → 下一次 lease 必须相应缩小，而不是照样 1500。"""
+    budget = worker._HistoryTurnBudget(max_rows=1500, max_wall_sec=8)
+    budget.settle_call(budget.reserve_call(), scanned_rows=1100)
+    lease = budget.reserve_call()
+    assert lease.max_rows == 400
+    lost = ToolResult(call_id="h2", content="error: capability_failed")
+    budget.settle_call(lease, scanned_rows=worker._history_rows_charged(lost, lease))
+    assert budget.used_rows == 1500
+    assert budget.reserve_call() is None
+
+
+def test_history_errors_that_never_reached_the_scan_settle_at_zero():
+    """本地校验 / kill switch / dispatch gate / 锚点未命中 = 0 行，不许乱扣。"""
+    budget = worker._HistoryTurnBudget(max_rows=1500, max_wall_sec=8)
+    lease = budget.reserve_call()
+    for content in (
+        "error: tool_not_allowed",                       # kill switch / dispatch gate
+        f"error: {cap_errors.INVALID}",                  # facade 本地参数校验
+        "error: cursor_invalid",
+        "error: cursor_mismatch",
+        "error: missing_query_or_time_range",
+        "error: invalid_limit",
+        "error: invalid_neighbor_count",
+        "error: not_found_or_not_visible",               # 锚点查空，未发 enclave
+        "error: invalid args for history_search: bad",   # tool_schema 校验
+        "error: unparseable args for history_search",
+        "error: unknown tool history_search",
+    ):
+        result = ToolResult(call_id="h", content=content)
+        assert worker._history_rows_charged(result, lease) == 0, content
+
+
+def test_history_trusted_metadata_still_settles_the_actual_rows():
+    budget = worker._HistoryTurnBudget(max_rows=1500, max_wall_sec=8)
+    lease = budget.reserve_call()
+    ok_result = ToolResult(
+        call_id="h1", content='{"matches": []}',
+        metadata={"history_scanned_rows": 12,
+                  "result_budget_kind": "history_search"})
+    assert worker._history_rows_charged(ok_result, lease) == 12
+    # 可信的实际 0（扫完了但一行都没检查）仍然记 0
+    zero_result = ToolResult(
+        call_id="h2", content='{"matches": []}',
+        metadata={"history_scanned_rows": 0,
+                  "result_budget_kind": "history_search"})
+    assert worker._history_rows_charged(zero_result, lease) == 0
 
 
 def test_history_round_gate_untouched_without_history_calls():

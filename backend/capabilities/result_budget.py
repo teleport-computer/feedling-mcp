@@ -30,9 +30,13 @@ Provider-supplied text can never reach this channel.
 
 Values are env-overridable so a deployment can dial them back without a code
 change; the override is read at call time so all three layers always agree.
+An override that breaks the contract is rejected at process start by
+``validate_result_caps`` — see its docstring for the two ways a "harmless"
+number silently produces invalid JSON or blows the batch total.
 """
 from __future__ import annotations
 
+import json
 import os
 from dataclasses import dataclass
 from typing import Any, Mapping
@@ -40,11 +44,66 @@ from typing import Any, Mapping
 # metadata key carrying the trusted result kind (set at the capability boundary).
 RESULT_KIND_METADATA_KEY = "result_budget_kind"
 
+# Stable code for "the producer could not meet its own atomic contract".  Every
+# layer that would otherwise slice an atomic JSON payload emits exactly this
+# instead — one short, valid, parseable result rather than a broken object.
+OVERFLOW_ERROR_CODE = "result_budget_exceeded"
+OVERFLOW_RESULT_CONTENT = f"error: {OVERFLOW_ERROR_CODE}"
+
 HISTORY_SEARCH_RESULT_MAX_CHARS_ENV = "FEEDLING_V2_HISTORY_SEARCH_RESULT_MAX_CHARS"
 HISTORY_FETCH_RESULT_MAX_CHARS_ENV = "FEEDLING_V2_HISTORY_FETCH_RESULT_MAX_CHARS"
 DEFAULT_HISTORY_SEARCH_RESULT_MAX_CHARS = 1800
 DEFAULT_HISTORY_FETCH_RESULT_MAX_CHARS = 4500
 DEFAULT_HISTORY_FETCH_EXTRA_BATCH_CHARS = 2500
+
+# history_search.CURSOR_MAX_CHARS.  Duplicated as a plain number on purpose:
+# model_api_runtime already imports this module (executor / tool_loop), so
+# importing back into model_api_runtime here would close the loop.  A unit test
+# asserts the two stay equal.
+_CURSOR_MAX_CHARS = 1024
+
+
+def _skeleton_chars(payload: Any) -> int:
+    """Rendered size under the exact serialization every layer measures with."""
+    return len(json.dumps(payload, ensure_ascii=False))
+
+
+# Smallest payload each producer's structural shrink can still emit.  A cap
+# below this is unsatisfiable: the facade shrinks as far as it can, is still
+# over, and hands a too-large object to a string-slicing layer downstream.
+#
+# ``next_cursor`` is the reason search's floor is large: the three-state
+# semantics hang off it (spec §3.1), so the shrink may never drop it, and it is
+# variable-length up to the cursor ceiling.  Truncation must never be able to
+# masquerade as "the scan finished".
+MIN_RESULT_CAPS: Mapping[str, int] = {
+    "history_search": _skeleton_chars({
+        "matches": [],
+        "complete": False,
+        "scanned_count": 0,
+        "unavailable_count": 0,
+        "coverage_gap": False,
+        "next_cursor": "x" * _CURSOR_MAX_CHARS,
+    }),
+    # anchor is never dropped (spec §3.2), and its excerpt shrinks to "" at
+    # worst; the neighbor lists and the two omission counters always stay.
+    "history_fetch": _skeleton_chars({
+        "anchor": {
+            "message_id": "x" * 64,
+            "ts": 1720000000.0,
+            "role": "assistant",
+            "content": "",
+            "content_truncated": True,
+            "unavailable": True,
+            "content_type": "file",
+        },
+        "before": [], "after": [],
+        "unavailable_count": 0,
+        "omitted_before": 0, "omitted_after": 0,
+    }),
+}
+
+ATOMIC_TOOL_NAMES = tuple(MIN_RESULT_CAPS)
 
 
 @dataclass(frozen=True)
@@ -92,3 +151,67 @@ def for_metadata(metadata: Mapping[str, Any] | None) -> ResultBudget | None:
     if not isinstance(metadata, Mapping):
         return None
     return for_tool(metadata.get(RESULT_KIND_METADATA_KEY))
+
+
+_ENV_BY_TOOL = {
+    "history_search": HISTORY_SEARCH_RESULT_MAX_CHARS_ENV,
+    "history_fetch": HISTORY_FETCH_RESULT_MAX_CHARS_ENV,
+}
+_BATCH_CAP_ENV = "FEEDLING_V2_TOOL_BATCH_RESULT_CHAR_CAP"
+
+
+def validate_result_caps(*, batch_cap: int) -> None:
+    """Fail fast on a result-cap configuration that cannot hold its contract.
+
+    Called once at process start (worker module import) with the deployment's
+    real ``tool_batch_result_char_cap``.  Two independent ways a plausible
+    number silently breaks the model's input:
+
+    1. **Too small.**  ``result_cap=1`` cannot be met by any structural shrink
+       — the smallest legal payload is already hundreds of characters.  The
+       facade emits an over-cap object, the string-slicing layer below cuts it
+       to ``"{...[truncated]"``, and the model receives invalid JSON.
+    2. **Too large.**  An atomic result is reserved *in full* by the batch
+       water-fill, and the batch budget only rises by that policy's
+       ``extra_batch_budget``.  A ``result_cap`` above
+       ``batch_cap + extra_batch_budget`` therefore pushes the whole batch past
+       the ceiling spec §3.3 promises (10500 by default).  Lowering the generic
+       ``batch_cap`` breaks the same inequality from the other side.
+
+    Both are configuration mistakes, not runtime conditions: refusing to start
+    is strictly better than shipping a deployment whose tool results are
+    unparseable or whose prompt budget is quietly blown.
+    """
+    batch_cap = int(batch_cap)
+    policies = {name: for_tool(name) for name in ATOMIC_TOOL_NAMES}
+    for name, policy in policies.items():
+        if policy is None:  # pragma: no cover — ATOMIC_TOOL_NAMES is the source
+            continue
+        env_name = _ENV_BY_TOOL[name]
+        minimum = MIN_RESULT_CAPS[name]
+        if policy.result_cap < minimum:
+            raise RuntimeError(
+                f"{env_name} is below the smallest legal {name} payload "
+                f"({policy.result_cap} < {minimum}); the structural shrink "
+                "cannot meet it and the result would be string-truncated into "
+                "invalid JSON"
+            )
+        if not policy.atomic_json:  # pragma: no cover — both are atomic today
+            continue
+        room = batch_cap + int(policy.extra_batch_budget)
+        if policy.result_cap > room:
+            raise RuntimeError(
+                f"{env_name} ({policy.result_cap}) exceeds what a batch can "
+                f"reserve for one atomic result ({_BATCH_CAP_ENV}={batch_cap} "
+                f"+ extra {policy.extra_batch_budget} = {room}); raise "
+                f"{_BATCH_CAP_ENV} or lower {env_name}"
+            )
+    atomic = [p for p in policies.values() if p is not None and p.atomic_json]
+    total_caps = sum(p.result_cap for p in atomic)
+    total_room = batch_cap + sum(p.extra_batch_budget for p in atomic)
+    if total_caps > total_room:
+        raise RuntimeError(
+            f"atomic result caps total {total_caps}, more than a batch "
+            f"carrying all of them can hold ({_BATCH_CAP_ENV}={batch_cap} "
+            f"+ extras = {total_room})"
+        )

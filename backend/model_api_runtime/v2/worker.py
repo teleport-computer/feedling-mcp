@@ -61,6 +61,7 @@ from notices import catalog as notices_catalog
 from provider_types import MCP_TRANSPORT_FAILURE_ERROR, ToolExchange, ToolResult
 from capabilities import history as cap_history
 from capabilities import registry as cap_registry
+from capabilities import result_budget as cap_result_budget
 from capabilities import tool_schema as cap_tool_schema
 from core import chat_activity as core_chat_activity
 from core import envelope as core_envelope
@@ -466,6 +467,11 @@ if (
     raise RuntimeError(
         "FEEDLING_V2_TOOL_BATCH_RESULT_CHAR_CAP is too small for stable errors"
     )
+# Atomic-JSON producers (history tools) are reserved in full by the batch
+# water-fill and are never string-sliced, so their per-tool caps and this
+# batch cap have to be consistent with each other. Checked here, once, against
+# the deployment's real numbers — see capabilities/result_budget.py.
+cap_result_budget.validate_result_caps(batch_cap=TOOL_BATCH_RESULT_CHAR_CAP)
 # This is a true wall deadline around the whole async MCP call, including time
 # waiting for the per-round read gate. Unlike synchronous platform capabilities,
 # MCP's httpx coroutine is cancellable and therefore safe to wrap in wait_for.
@@ -1497,6 +1503,53 @@ class _HistoryTurnBudget:
         elapsed = max(0.0, float(self.clock()) - float(lease.started_at))
         self.used_sec += elapsed
         self.used_rows += max(0, int(scanned_rows))
+
+
+# executor 自己产生的、带自由文本尾巴的三种拒绝（全部在 capability 之前）。
+_HISTORY_PRE_SCAN_ERROR_PREFIXES = (
+    "error: unparseable args for ",
+    "error: unknown tool ",
+    "error: invalid args for ",
+)
+
+
+def _history_never_reached_the_scan(content: str) -> bool:
+    """这条 ToolResult 是否证明「一行原文都没读过」。
+
+    只认 executor / capability 自己写的稳定错误词面——provider 文本永远进不了
+    ``ToolResult.content`` 的这几种形态（失败结果只回显错误码，见
+    ``executor._summarize_capability_result``）。
+    """
+    text = str(content or "")
+    if any(text.startswith(prefix) for prefix in _HISTORY_PRE_SCAN_ERROR_PREFIXES):
+        return True
+    if not text.startswith("error: "):
+        return False
+    return text[len("error: "):].strip() in cap_history.PRE_SCAN_ERROR_CODES
+
+
+def _history_rows_charged(result, lease: _HistoryCallLease) -> int:
+    """这次 history 调用要向回合预算扣多少 raw 行（spec §5）。
+
+    三态，不是两态：
+
+    * 可信 metadata 有计数 → 按实际值（含**可信的实际 0**）。
+    * 明确未触达扫描的错误 → 0（``PRE_SCAN_ERROR_CODES`` 与 executor 的三种
+      参数拒绝，全部发生在第一次 enclave POST 之前）。
+    * 其余「已经开跑但用量未知」→ **按 lease 上限保守结算**。
+
+    第三档是这个函数存在的理由。以前拿不到 metadata 就记 0：capability 抛异常
+    被 executor 吞成 ``error: capability_failed``（executor 刻意隔离单个坏读，
+    不让它拖垮整轮）时，enclave 可能已经解了 1500 行，账上却是 0，下一次照样
+    租出满额——多轮快速失败即可突破回合累计闸。宁可多扣，不许白嫖。
+    """
+    metadata = getattr(result, "metadata", None) or {}
+    rows = metadata.get("history_scanned_rows")
+    if isinstance(rows, int) and not isinstance(rows, bool):
+        return max(0, rows)
+    if _history_never_reached_the_scan(getattr(result, "content", "")):
+        return 0
+    return max(0, int(lease.max_rows))
 
 
 _HISTORY_ROUND_LIMIT_ERROR = (
@@ -11099,7 +11152,10 @@ async def process_job(
                         return ToolResult(
                             call_id=tc.id, content=_HISTORY_TURN_BUDGET_ERROR
                         )
-                    scanned_rows = 0
+                    # Conservative default, replaced only once the call
+                    # returns and its usage is actually known: an exception on
+                    # the way out (cancellation) must not settle as free.
+                    scanned_rows = int(lease.max_rows)
                     try:
                         # The lease is what is left of the TURN, pushed down as
                         # this call's ceiling: 1 remaining row must not buy
@@ -11125,9 +11181,7 @@ async def process_job(
                                 # this turn.
                                 history_tools_allowed=history_tools_offered,
                             )
-                        rows = (result.metadata or {}).get("history_scanned_rows")
-                        if isinstance(rows, int) and not isinstance(rows, bool):
-                            scanned_rows = rows
+                        scanned_rows = _history_rows_charged(result, lease)
                     finally:
                         effect_reservations.mark_ready(tc)
                         history_turn_budget.settle_call(

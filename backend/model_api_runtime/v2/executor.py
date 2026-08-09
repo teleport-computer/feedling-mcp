@@ -92,8 +92,12 @@ def _summarize_capability_result(data: dict, *, tool_name: str = "") -> str:
     # 工具（=绝大多数）拿到的仍是 _RESULT_CHAR_CAP，行为不变。
     policy = result_budget.for_tool(tool_name)
     result_cap = policy.result_cap if policy is not None else _RESULT_CHAR_CAP
-    # atomic_json 的生产者在序列化前就结构化缩到了同一个 result_cap，所以下面
-    # 这段对它来说到不了；保留它只是不让任何 capability 无界地喂回来。
+    # atomic_json 的生产者在序列化前就结构化缩到了同一个 result_cap（facade 自
+    # 己还会复核一遍），所以正常情况下到不了这里。真到了 = 生产者违约，此时
+    # **绝不能切串**：半截 JSON 比没有结果更糟（模型解析失败、还看不出发生了
+    # 什么）。整体换成一条短、稳定、合法的错误结果。
+    if policy is not None and policy.atomic_json and len(rendered) > result_cap:
+        return result_budget.OVERFLOW_RESULT_CONTENT
     if len(rendered) > result_cap:
         marker = "...[truncated]"
         if str(tool_name) in {"memory_index", "memory_search"}:

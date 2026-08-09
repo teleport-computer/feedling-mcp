@@ -528,7 +528,12 @@ def run_history_fetch(
     锚点不可见/不存在统一返回 ``{"error": "not_found_or_not_visible"}``；
     序列化总闸（≤4500 字符）与结构化缩减在 facade（capabilities/history.py）。
     邻居数各钳 [0,15]，请求行数上限 31——31 条不保证都进最终 payload，装不下
-    多少由 facade 如实报进 ``omitted_before``/``omitted_after``。
+    多少如实报进 ``omitted_before``/``omitted_after``。
+
+    **回合租约在这里必须真的花掉**（spec §5 的「两工具合计」）：
+    ``budget.call_deadline_ms`` 转发给 enclave 做逐行止损，
+    ``budget.call_max_rows`` 钳邻居条数。只把 lease 收进 budget 就丢掉，
+    等于回合闸只约束 search，fetch 想扫多少扫多少。
     """
     budget = budget or HistorySearchBudget()
     post = post_enclave or (
@@ -539,16 +544,25 @@ def run_history_fetch(
     except (TypeError, ValueError):
         raise history_search.HistorySearchInputError("invalid_neighbor_count") from None
 
+    # 锚点单独占 1 行。保底 2 而不是 0：额度只剩一两行时把 fetch 削成"只回锚点"
+    # 等于白跑一次（锚点的原文模型多半已经从 search 的 snippet 看过了），而
+    # "剩 0"这种情况本来就该被回合 exhausted 拦在更前面。
+    # 优先 before——这个产品问题（"那家餐厅叫什么"）几乎总是往前找线索。
+    neighbor_allowance = max(int(budget.call_max_rows) - 1, 2)
+    keep_before = min(n_before, neighbor_allowance)
+    keep_after = min(n_after, max(0, neighbor_allowance - keep_before))
+
     anchor = jobs_store.chat_history_anchor_row(str(user_id), str(message_id))
     if anchor is None:
         return {"error": "not_found_or_not_visible"}
     older, newer = jobs_store.chat_history_neighbor_rows(
-        str(user_id), int(anchor["seq"]), before=n_before, after=n_after)
+        str(user_id), int(anchor["seq"]), before=keep_before, after=keep_after)
     response = post("fetch", {
         "anchor": _row_payload(anchor),
         "before": [_row_payload(row) for row in older],
         "after": [_row_payload(row) for row in newer],
         "max_chars_per_message": budget.fetch_max_chars_per_message,
+        "deadline_ms": max(1, int(budget.call_deadline_ms)),
     })
     anchor_item = response.get("anchor")
     before_items = response.get("before") if isinstance(response.get("before"), list) else []
@@ -558,4 +572,24 @@ def run_history_fetch(
         "before": [_fetch_item(i) for i in before_items if isinstance(i, dict)],
         "after": [_fetch_item(i) for i in after_items if isinstance(i, dict)],
         "unavailable_count": int(response.get("unavailable_count") or 0),
+        # 预算钳掉的 + enclave 侧（deadline / hard cap）没解成的，合并如实上报。
+        # facade 的结构化缩减会在这个基数上继续累加，不是从 0 重置。
+        "omitted_before": (
+            _budget_omitted(n_before, keep_before, len(older))
+            + max(0, int(response.get("omitted_before") or 0))),
+        "omitted_after": (
+            _budget_omitted(n_after, keep_after, len(newer))
+            + max(0, int(response.get("omitted_after") or 0))),
     }
+
+
+def _budget_omitted(requested: int, kept: int, returned: int) -> int:
+    """预算钳掉了几条——但只在那些行**确实存在**时才算。
+
+    store 返回不足 ``kept`` 条 = 这个方向上的历史本来就到头了，钳制没有真的
+    藏起任何东西；这时报"删了 13 条"是假信号，模型会以为还有前文可挖、白翻一页。
+    返回满 ``kept`` 条时无法区分"正好这么多"和"还有更多"，取保守的后者。
+    """
+    if returned < kept:
+        return 0
+    return max(0, int(requested) - int(kept))

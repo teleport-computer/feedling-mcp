@@ -92,6 +92,13 @@ def history_result_metadata(tool_name: str, result: Mapping[str, Any]) -> dict:
     without retaining any decrypted text. ``history_search`` charges the
     enclave-confirmed ``scanned_count``; ``history_fetch`` charges the
     anchor plus every neighbor row it decrypted.
+
+    ``omitted_*`` now also carries rows the *lease* clamped away before the
+    enclave ever saw them, so those are charged too. Deliberately conservative
+    and bounded: neighbor clamping only kicks in once the turn has fewer than
+    ~16 rows left, where over-charging by at most 19 rows simply tips a budget
+    that is about to be exhausted anyway. Under-charging is the dangerous
+    direction (see the worker's ``_history_rows_charged``).
     """
     if str(tool_name) not in _HISTORY_TOOL_NAMES:
         return {}

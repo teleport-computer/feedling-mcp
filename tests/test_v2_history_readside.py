@@ -434,6 +434,57 @@ def test_fetch_hard_cap_fits_the_full_31_row_window(client, _authed, monkeypatch
     assert body["anchor"]["message_id"] == "m100"
 
 
+def test_fetch_deadline_checked_inside_the_neighbor_loop(
+    client, _authed, monkeypatch
+):
+    """fetch 也必须逐行看 deadline（spec §5），不只 scan。
+
+    没有超时保护的解密循环 = enclave 可以被一次调用长时间占住；外层
+    ``anyio.to_thread`` 的取消停不掉一个正在同步解密的线程，唯一可靠的止损点
+    就在这个循环里——和 /scan 同一套机制、同一个可注入时钟。
+    """
+    anchor = _text_row(100)
+    before = [_text_row(seq) for seq in range(85, 100)]   # 15 条，旧→新
+    after = [_text_row(seq) for seq in range(101, 116)]   # 15 条，旧→新
+    _patch_decrypt(
+        monkeypatch, {r["id"]: b"hi" for r in [anchor] + before + after})
+    # 时钟序列：deadline 基点 0.0 → 头两个邻居放行 → 之后一律超时。
+    ticks = iter([0.0, 0.0, 0.0])
+    monkeypatch.setattr(history_routes, "_monotonic", lambda: next(ticks, 99.0))
+    r = client.post(
+        "/v1/history/fetch",
+        json={"anchor": anchor, "before": before, "after": after,
+              "deadline_ms": 1000},
+        headers={"X-API-Key": "k"},
+    )
+    body = r.get_json()
+    assert body["stopped"] == "deadline"
+    # 锚点永远解密（1 行的下界，同 /scan 的"首行永远放行"）
+    assert body["anchor"]["message_id"] == "m100"
+    # 由近及远处理：停下时保住的是贴身邻居，不是最远的
+    assert [i["message_id"] for i in body["before"]] == ["m99"]
+    assert [i["message_id"] for i in body["after"]] == ["m101"]
+    # 没来得及解密的如实上报（不是 unavailable——它们压根没被碰过）
+    assert body["omitted_before"] == 14
+    assert body["omitted_after"] == 14
+    assert body["unavailable_count"] == 0
+
+
+def test_fetch_reports_zero_omissions_when_the_whole_window_fits(
+    client, _authed, monkeypatch
+):
+    anchor = _text_row(5)
+    _patch_decrypt(monkeypatch, {anchor["id"]: b"hi"})
+    r = client.post(
+        "/v1/history/fetch",
+        json={"anchor": anchor, "before": [], "after": []},
+        headers={"X-API-Key": "k"},
+    )
+    body = r.get_json()
+    assert body["stopped"] == "complete"
+    assert body["omitted_before"] == 0 and body["omitted_after"] == 0
+
+
 def test_fetch_anchor_must_be_object(client, _authed):
     r = client.post("/v1/history/fetch", json={"anchor": "m1"},
                     headers={"X-API-Key": "k"})
@@ -901,8 +952,115 @@ def test_run_history_fetch_not_found_and_structure(monkeypatch):
     assert out["anchor"]["message_id"] == "m5"
     assert "seq" not in out["anchor"]
     assert out["before"][0]["role"] == "assistant"  # openclaw → assistant
+    # 窗口完整装下时不报删减（模型必须能区分"就这么多"和"删过"）
+    assert out["omitted_before"] == 0 and out["omitted_after"] == 0
     assert out["after"][0]["content"] == "newer body"
     assert out["unavailable_count"] == 0
+
+
+def _patch_fetch_store(monkeypatch, *, anchor_seq=50):
+    anchor_row = _text_row(anchor_seq)
+    monkeypatch.setattr(
+        history_readside.jobs_store, "chat_history_anchor_row",
+        lambda uid, mid: dict(anchor_row))
+    asked: dict = {}
+
+    def _neighbors(uid, seq, *, before, after):
+        asked["before"], asked["after"] = before, after
+        return (
+            [_text_row(s) for s in range(seq - before, seq)],
+            [_text_row(s) for s in range(seq + 1, seq + 1 + after)],
+        )
+
+    monkeypatch.setattr(
+        history_readside.jobs_store, "chat_history_neighbor_rows", _neighbors)
+    return asked
+
+
+def _echo_fetch_post(sent: dict, *, omitted_before=0, omitted_after=0):
+    def _post(op, payload):
+        assert op == "fetch"
+        sent["deadline_ms"] = payload.get("deadline_ms")
+        sent["before"] = len(payload["before"])
+        sent["after"] = len(payload["after"])
+        return {
+            "anchor": {"message_id": payload["anchor"]["id"], "seq": 0,
+                       "ts": 1.0, "role": "user", "content": "a"},
+            "before": [], "after": [], "unavailable_count": 0,
+            "omitted_before": omitted_before, "omitted_after": omitted_after,
+        }
+    return _post
+
+
+def test_run_history_fetch_spends_the_lease_rows_and_deadline(monkeypatch):
+    """回合租约必须真的作用到 fetch（spec §5 的「两工具合计」）。
+
+    以前 fetch 只把 lease 收进 budget 就丢掉了：不转发 deadline、按原始
+    before/after 拉满行。结果是回合闸只约束 search，fetch 想扫多少扫多少。
+    """
+    asked = _patch_fetch_store(monkeypatch)
+    sent: dict = {}
+    out = history_readside.run_history_fetch(
+        "usr_a", message_id="m50", before=15, after=4,
+        budget=history_readside.HistorySearchBudget(
+            call_max_rows=1, call_deadline_ms=1),
+        post_enclave=_echo_fetch_post(sent))
+    # deadline 必须转发到 enclave，否则那一侧根本无从止损
+    assert sent["deadline_ms"] == 1
+    # 行数也钳：锚点单独占 1 行，邻居保底 2（优先 before——线索在前文里）
+    assert asked == {"before": 2, "after": 0}
+    assert sent["before"] == 2 and sent["after"] == 0
+    # 钳掉的如实告诉模型
+    assert out["omitted_before"] == 13
+    assert out["omitted_after"] == 4
+
+
+def test_run_history_fetch_full_lease_keeps_the_whole_window(monkeypatch):
+    """额度充足时窗口一行不少（钳制只在剩余额度真的不够时生效）。"""
+    asked = _patch_fetch_store(monkeypatch)
+    sent: dict = {}
+    out = history_readside.run_history_fetch(
+        "usr_a", message_id="m50", before=15, after=4,
+        post_enclave=_echo_fetch_post(sent))
+    assert asked == {"before": 15, "after": 4}
+    assert sent["deadline_ms"] == 2500
+    assert out["omitted_before"] == 0 and out["omitted_after"] == 0
+
+
+def test_run_history_fetch_merges_enclave_side_omissions(monkeypatch):
+    """enclave 因 deadline / hard cap 少解的行，和预算钳掉的行合并上报。"""
+    _patch_fetch_store(monkeypatch)
+    sent: dict = {}
+    out = history_readside.run_history_fetch(
+        "usr_a", message_id="m50", before=15, after=4,
+        budget=history_readside.HistorySearchBudget(call_max_rows=6),
+        post_enclave=_echo_fetch_post(sent, omitted_before=3, omitted_after=1))
+    # 预算钳：邻居额度 5 → before 5 / after 0；enclave 又少解 3 条 before
+    assert sent["before"] == 5 and sent["after"] == 0
+    assert out["omitted_before"] == (15 - 5) + 3
+    assert out["omitted_after"] == 4 + 1
+
+
+def test_run_history_fetch_does_not_invent_neighbors_that_never_existed(monkeypatch):
+    """钳制只在那些行**确实存在**时才报 omitted，否则是假信号。
+
+    锚点贴着历史开头时 before 本来就没那么多行；报"删了 13 条"会让模型以为
+    还有前文可挖，白翻一页。
+    """
+    monkeypatch.setattr(
+        history_readside.jobs_store, "chat_history_anchor_row",
+        lambda uid, mid: _text_row(2))
+    monkeypatch.setattr(
+        history_readside.jobs_store, "chat_history_neighbor_rows",
+        # 请求 2 条 before，只存在 1 条
+        lambda uid, seq, *, before, after: ([_text_row(1)], []))
+    sent: dict = {}
+    out = history_readside.run_history_fetch(
+        "usr_a", message_id="m2", before=15, after=4,
+        budget=history_readside.HistorySearchBudget(call_max_rows=1),
+        post_enclave=_echo_fetch_post(sent))
+    assert out["omitted_before"] == 0     # 到头了，没藏东西
+    assert out["omitted_after"] == 4      # 一条都没查过 → 保守报满
 
 
 def test_post_enclave_history_version_skew_and_http_errors(monkeypatch):

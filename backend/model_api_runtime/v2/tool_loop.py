@@ -200,12 +200,31 @@ def _normalize_tool_results(
     water-fill runs, and the batch budget rises by that policy's
     ``extra_batch_budget``.  They are never string-truncated: their producer
     already shrank them structurally, and cutting a JSON payload mid-string
-    makes the whole result unparseable for the model.
+    makes the whole result unparseable for the model.  An atomic result that
+    arrives *over* its own cap is a producer contract violation, not something
+    to slice: it is replaced wholesale by one short, valid error result before
+    the water-fill sees it, so nothing downstream can reserve or cut a broken
+    payload.  (``worker`` rejects the configurations that would make this
+    reachable at start-up; this is the defence-in-depth half.)
 
     A batch with no such result takes exactly the path it always took — same
     per-result cap, same batch cap, same quotas, byte for byte.
     """
     policies = [result_budget.for_metadata(result.metadata) for result in results]
+    results = [
+        ToolResult(
+            call_id=result.call_id,
+            content=result_budget.OVERFLOW_RESULT_CONTENT,
+            metadata=result.metadata,
+        )
+        if (
+            policy is not None
+            and policy.atomic_json
+            and len(result.content) > policy.result_cap
+        )
+        else result
+        for result, policy in zip(results, policies)
+    ]
     markers = []
     for result in results:
         metadata = result.metadata or {}

@@ -346,8 +346,13 @@ async def v1_history_scan(request: Request):
 async def v1_history_fetch(request: Request):
     """解密锚点 + 邻居行（调用方已按 seq 序选好），结构照 spec §3.2。
 
-    序列化 payload 的 1600 字符总闸和结构化缩减属批次 3 的 facade；这里只按
+    序列化 payload 的总闸和结构化缩减属 facade；这里只按
     ``max_chars_per_message`` 截单条正文并标 ``content_truncated``。
+
+    ``deadline_ms`` 与 /scan 同一套机制（spec §5）：外层 ``anyio.to_thread``
+    的取消停不掉一个正在同步解密的线程，唯一可靠的止损点在逐行循环里。没来得
+    及解密的邻居计入 ``omitted_before``/``omitted_after``——它们**不是**
+    unavailable（压根没被碰过），调用方要如实转达给模型。
     """
     ctx = auth.extract_auth(request)
     user_id, error = await auth.resolve_read_caller(ctx)
@@ -369,11 +374,17 @@ async def v1_history_fetch(request: Request):
     max_chars = _clamped_int(
         payload, "max_chars_per_message",
         default=2000, lo=80, hard_max=_FETCH_CONTENT_HARD_MAX)
+    deadline_ms = _clamped_int(
+        payload, "deadline_ms", default=2500, lo=1, hard_max=_DEADLINE_MS_HARD_MAX)
     # 邻居 clamp 保留离锚点最近的行：before 是旧→新（尾部贴锚点），after 是
-    # 旧→新（头部贴锚点）。
+    # 旧→新（头部贴锚点）。砍掉的计入 omitted_*，绝不静默消失。
     keep = max(0, _FETCH_ROWS_HARD_MAX - 1)
-    before = [r for r in before if isinstance(r, dict)][-(keep // 2):]
-    after = [r for r in after if isinstance(r, dict)][:keep - len(before)]
+    raw_before = [r for r in before if isinstance(r, dict)]
+    raw_after = [r for r in after if isinstance(r, dict)]
+    before = raw_before[-(keep // 2):] if keep // 2 else []
+    after = raw_after[:max(0, keep - len(before))]
+    hard_omitted_before = len(raw_before) - len(before)
+    hard_omitted_after = len(raw_after) - len(after)
 
     def _work():
         unavailable = 0
@@ -400,17 +411,46 @@ async def v1_history_fetch(request: Request):
             item["content_truncated"] = len(content) > max_chars
             return item
 
+        deadline = _monotonic() + deadline_ms / 1000.0
+        # 锚点无条件解密：它就是这次调用的目的，1 行的工作量本身就是下界
+        # （同 /scan 的"首行永远放行"，否则批批空转）。
         anchor_item = _item(anchor)
-        before_items = [_item(row) for row in before]
-        after_items = [_item(row) for row in after]
-        return anchor_item, before_items, after_items, unavailable
+        picked_before: list[dict | None] = [None] * len(before)
+        picked_after: list[dict | None] = [None] * len(after)
+        stopped = "complete"
+        # 由近及远交替向外：deadline 砍在半路时保住的是贴身邻居，而且剩下的
+        # 两段仍然紧贴锚点连续（facade 的缩减顺序也是同一个方向）。
+        for step in range(max(len(before), len(after))):
+            for bucket, source, index in (
+                (picked_before, before, len(before) - 1 - step),
+                (picked_after, after, step),
+            ):
+                if not 0 <= index < len(source):
+                    continue
+                if _monotonic() >= deadline:
+                    stopped = "deadline"
+                    break
+                bucket[index] = _item(source[index])
+            if stopped == "deadline":
+                break
+        before_items = [i for i in picked_before if i is not None]
+        after_items = [i for i in picked_after if i is not None]
+        return (
+            anchor_item, before_items, after_items, unavailable, stopped,
+            len(before) - len(before_items), len(after) - len(after_items),
+        )
 
-    anchor_item, before_items, after_items, unavailable = (
-        await anyio.to_thread.run_sync(_work))
+    (
+        anchor_item, before_items, after_items, unavailable, stopped,
+        skipped_before, skipped_after,
+    ) = await anyio.to_thread.run_sync(_work)
     return JSONResponse({
         "user_id": user_id,
         "anchor": anchor_item,
         "before": before_items,
         "after": after_items,
         "unavailable_count": unavailable,
+        "stopped": stopped,
+        "omitted_before": hard_omitted_before + skipped_before,
+        "omitted_after": hard_omitted_after + skipped_after,
     })
