@@ -116,7 +116,7 @@ from memory.capture_prompt_v1 import (
 from identity.user_naming import transcript_speaker_label
 from memory.card_text import (
     count_user_token_residuals,
-    is_card_format_error,
+    is_retryable_parse_error,
 )
 from memory import dream_gates as memory_dream_gates
 from memory.dream_prompt_v1 import (
@@ -9545,7 +9545,7 @@ async def _run_extraction(
             # 内容闸打回后的第二问：放宽成「只丢占位符那几张、干净的照收」，
             # 不让一张脏卡把整个窗口的落卡清零。
             parse_retry = v2_extraction.ParseRetry(
-                should_retry=is_card_format_error,
+                should_retry=is_retryable_parse_error,
                 build_prompt=build_capture_retry_prompt,
                 parse=lambda reply: parse_capture_cards(reply, strict=False),
                 semantic_reasons=capture_semantic_retry_reasons,
@@ -9574,7 +9574,7 @@ async def _run_extraction(
                 v2_extraction.consolidations_to_actions,
             )
             parse_retry = v2_extraction.ParseRetry(
-                should_retry=is_card_format_error,
+                should_retry=is_retryable_parse_error,
                 build_prompt=build_dream_retry_prompt,
                 parse=lambda reply: parse_dream_consolidations(
                     reply, strict=False, known_ids=dream_known_ids

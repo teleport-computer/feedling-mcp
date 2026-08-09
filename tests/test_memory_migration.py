@@ -220,6 +220,19 @@ def test_parse_no_json_marks_all_unmigrated():
     assert set(unmigrated) == {"m1", "m2"}
 
 
+def test_parse_migration_ignores_fake_json_inside_thinking():
+    raw = (
+        '<think>草稿 {"upgrades": [not valid]}</think>'
+        '{"upgrades":[{"id":"m1","summary":"标题",'
+        '"content":"正文"}]}'
+    )
+    upgrades, unmigrated, error = mp.parse_migrated_cards(
+        raw, allowed_ids={"m1"}
+    )
+    assert error is None and unmigrated == []
+    assert [item["id"] for item in upgrades] == ["m1"]
+
+
 # --- enqueue guard (single-flight across maintenance) ---------------------
 
 class _FakeStore:

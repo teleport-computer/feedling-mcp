@@ -10,6 +10,13 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **Memory extraction no longer mistakes model thinking for its JSON result.**
+  Capture, Dream, legacy-card migration, and resident identity distillation now
+  remove well-formed thinking blocks before locating the result object while
+  retaining the previous raw-text fallback for malformed output. Hosted
+  Capture and Dream may re-ask once after a JSON decoding error; truncated or
+  prose-only responses remain non-retryable parse failures.
+
 - **Runtime V2 Chat can search its own older conversation history on demand.**
   Two chat-only agent tools let the agent keyword-search messages beyond its
   visible context and read a small window around a match. Original messages

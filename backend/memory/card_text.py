@@ -12,13 +12,14 @@
 不合格 = 整行打回;**软字段**(bucket/threads)不合格 = 就地清洗(丢掉那一条),
 但在 strict 模式下同样会触发一次重试 —— 软字段抄模板是「模型在复述骨架」的强信号。
 
-模块保持纯函数、零 I/O、只依赖 stdlib,以便 resident 与 V2 两条运行时共用一份判据。
+模块保持纯函数、零 I/O,以便 resident 与 V2 两条运行时共用一份判据。
 """
 from __future__ import annotations
 
 import re
 import unicodedata
 
+from core import self_thinking
 from memory import card_guard
 from memory.prompts_v1 import normalize_bucket_language
 
@@ -66,6 +67,55 @@ MIN_CONTENT_CHARS = 2
 
 _FORMAT_ERROR_PREFIX = "invalid_card_content"
 _AFTER_RETRY_ERROR_PREFIX = "invalid_card_content_after_retry"
+
+
+def _first_balanced_json_object(raw: str) -> str:
+    """Return the first balanced ``{...}`` block, preserving legacy leniency."""
+    text = str(raw or "").strip()
+    if text.startswith("```"):
+        # Agents sometimes wrap JSON in a leading ```json fence despite the
+        # instruction. Preserve the three former parsers' exact tolerance.
+        text = text.split("```", 2)[1] if text.count("```") >= 2 else text.strip("`")
+        if text.lstrip().lower().startswith("json"):
+            text = text.lstrip()[4:]
+    start = text.find("{")
+    if start < 0:
+        return ""
+    depth = 0
+    for index in range(start, len(text)):
+        if text[index] == "{":
+            depth += 1
+        elif text[index] == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start:index + 1]
+    return ""
+
+
+def extract_json_block(raw: str) -> str:
+    """Extract JSON from model output without mistaking thinking for the reply.
+
+    Some thinking-capable relays mix ``<think>`` blocks into the same text as
+    the requested JSON. Reasoning naturally contains brace-shaped drafts, so
+    scanning the raw string from its first ``{`` can select a balanced but
+    invalid pseudo-object and discard the valid public reply that follows.
+
+    Scan the reply after the shared thinking parser removes all well-formed
+    thinking blocks. If that yields no object—or the thinking parser fails
+    closed and returns an empty reply—scan the original text as a compatibility
+    fallback. The fallback is important: parser lanes are intentionally more
+    permissive than the user-visible reply path and must not reject any shape
+    the legacy extractor could parse.
+    """
+    text = str(raw or "")
+    status, _thinking, reply = self_thinking.strip_all_thinking(
+        text, sanitize=False
+    )
+    if status != self_thinking.FAILED:
+        extracted = _first_balanced_json_object(reply)
+        if extracted:
+            return extracted
+    return _first_balanced_json_object(text)
 
 
 def _is_substantive_char(ch: str) -> bool:
@@ -236,6 +286,20 @@ def is_card_format_error(err: str | None) -> bool:
     再打回就成了死循环。
     """
     return bool(err) and str(err).split(":", 1)[0] == _FORMAT_ERROR_PREFIX
+
+
+def is_retryable_parse_error(err: str | None) -> bool:
+    """Whether a memory parser failure deserves one corrective model call.
+
+    Keep :func:`is_card_format_error` narrow because other callers use it to
+    identify content-gate failures specifically. Capture and Dream retry one
+    additional parse shape: a balanced object that failed JSON decoding. This
+    commonly means a thinking model put a pseudo-JSON draft before its valid
+    answer. ``no_json_object`` remains non-retryable because truncation and pure
+    prose have their own provider failure paths.
+    """
+    prefix = str(err or "").split(":", 1)[0]
+    return is_card_format_error(err) or prefix == "json_decode_error"
 
 
 _REASON_TEXT = {
