@@ -1061,8 +1061,7 @@ def model_api_setup(store, payload: dict, *, caller_api_key: str | None) -> tupl
             f"[model_api:{store.user_id}] setup FAILED provider={provider} "
             f"model={model} status_code={e.status_code} detail={str(e)[:160]}"
         )
-        return {"error": "provider_test_failed", "detail": str(e),
-                "status_code": e.status_code}, 400
+        return _provider_test_failed_body(e), 400
 
     # `supports_responses` is retired transport metadata: nothing in the backend
     # reads it (not even spawners.consumer_env), and /responses has exactly one
@@ -1575,6 +1574,48 @@ def image_generation_main_test(
     return {"config": _image_generation_config_payload(store)}, 200
 
 
+# provider 回的不是 API 响应而是网页 —— 几乎必然是 base_url 少了结尾的路径段
+# (绝大多数中转站要以 /v1 结尾),不是 key 的问题。
+#
+# 实测的两种形态(2026-08-09,用户报障的两个中转站,base_url 漏填 /v1):
+#   · HTTP 200 + 站点首页 HTML  → chat_completion 抛 "provider returned non-json response"
+#   · HTTP 404 + 错误页 HTML    → "provider_http_404: <!doctype html>..."
+# 真正的 key/额度/模型错误一律是 JSON,永远不含这些特征,所以零误伤。
+_WRONG_API_ENDPOINT_MARKERS = ("non-json response", "<!doctype", "<html")
+
+# 刻意只给通用方向、不替用户拼出具体地址:有的中转站要 /api/v1、/openai/v1,
+# 猜一个"看起来很确定其实是蒙的"地址,用户照抄仍然不通,反而更迷惑(Seven 2026-08-09 拍板)。
+_WRONG_API_ENDPOINT_HINT = (
+    "这个地址返回的是网页,不是 API 接口响应 —— 通常是接口地址结尾缺少 /v1。"
+    "请补上后重试(不是 API Key 的问题)。 / This address returned a web page, "
+    "not an API response — the endpoint usually needs to end with /v1. "
+    "Fix the address and retry; the API key is not the problem."
+)
+
+
+def _looks_like_wrong_api_endpoint(exc: BaseException) -> bool:
+    """这次失败是不是「地址根本不是 API 端点」而非「key 不对」。"""
+    text = str(exc or "").lower()
+    return any(marker in text for marker in _WRONG_API_ENDPOINT_MARKERS)
+
+
+def _provider_test_failed_body(exc: BaseException) -> dict:
+    """provider key 自测失败的统一响应体 —— 四个入口(保存配置 / 手动测试 /
+    加路由 / 改凭证)共用一份判据,否则同一个错误从不同入口进来说法会不一样。
+
+    ⚠️ 判成「地址不是 API 端点」时把 ``status_code`` 清成 ``None``:客户端
+    (FeedlingAPI.providerTestFailureMessage)会把 provider 的 404 映射成
+    「模型不存在」,而这里的 404 来自站点网页而不是模型缺失 —— 带着它回去
+    等于换一句话继续把用户往错方向支。原始错误照常写进 route.test_error,
+    排查不受影响。"""
+    if _looks_like_wrong_api_endpoint(exc):
+        return {"error": "provider_test_failed",
+                "detail": _WRONG_API_ENDPOINT_HINT,
+                "status_code": None}
+    return {"error": "provider_test_failed", "detail": str(exc),
+            "status_code": getattr(exc, "status_code", None)}
+
+
 def _test_active_route(store, route: dict, api_key: str | None) -> tuple[dict, int] | None:
     """Decrypt the active route's envelope via the enclave and test the provider key,
     writing the ok/failed result back to the route row. Returns ``None`` on success
@@ -1629,8 +1670,7 @@ def _test_active_route(store, route: dict, api_key: str | None) -> tuple[dict, i
         # 'failed' — a latent staleness, not a lie told to this caller.
         db.model_api_route_mark_test(store.user_id, route["id"], status="failed",
                                      error=str(e)[:240])
-        return {"error": "provider_test_failed", "detail": str(e),
-                "status_code": e.status_code}, 400
+        return _provider_test_failed_body(e), 400
     # Must check: returning None here tells model_api_test() "success" -> 200. If
     # this write silently fails, test_status never flips to 'ok', so the route can
     # stay excluded from the agent-runtime roster (which gates on test_status='ok')
@@ -1945,8 +1985,7 @@ def _test_route_or_error(store, route: dict, caller_api_key: str | None):
             f"[model_api:{store.user_id}] route test FAILED provider={route['provider']} "
             f"model={route['model']} status_code={e.status_code} detail={str(e)[:160]}"
         )
-        return {"error": "provider_test_failed", "detail": str(e),
-                "status_code": e.status_code}, 400
+        return _provider_test_failed_body(e), 400
     # Must check: model_api_route_activate() treats a None return here as "test
     # passed" and immediately flips is_active=True. If this write silently fails,
     # test_status never reaches 'ok', so the just-"activated" route is excluded from
@@ -2372,8 +2411,7 @@ def model_api_credential_patch(store, credential_id: str, payload: dict, *,
             ))
         except provider_client.ProviderError as e:
             # 不落库：旧 key 与旧 test_status 都保持原样，用户不会掉出 roster。
-            return {"error": "provider_test_failed", "detail": str(e),
-                    "status_code": e.status_code}, 400
+            return _provider_test_failed_body(e), 400
 
     active_key_change = bool(
         active and active["credential_id"] == credential_id

@@ -2379,3 +2379,58 @@ def test_chat_response_accepts_verify_ping_reply_to_pending_ping(client, monkeyp
         headers=_headers(api_key),
     )
     assert res.status_code == 200, res.get_data(as_text=True)
+
+
+# ---------------------------------------------------------------------------
+# base_url 指向的不是 API 端点(用户报障 2026-08-09:两个中转站都提示
+# "API key 未通过测试",实测两站都健康,真因是 base_url 漏了结尾的 /v1)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(("exc", "label"), [
+    (provider_client.ProviderError("provider returned non-json response"),
+     "HTTP 200 + 站点首页 HTML"),
+    (provider_client.ProviderError(
+        "provider_http_404: <!doctype html>\n<html lang=\"zh\">", status_code=404),
+     "HTTP 404 + 错误页 HTML"),
+])
+def test_non_api_endpoint_points_at_the_url_not_the_key(client, monkeypatch, exc, label):
+    """地址不是 API 端点时,提示必须指向地址而不是 key。
+
+    ⚠️ 同时锁死 status_code 被清成 None:客户端把 provider 的 404 映射成
+    「模型不存在」,带着 404 回去等于换一句话继续把用户往错方向支。"""
+    _, api_key = _register(client)
+    monkeypatch.setattr(provider_client, "test_provider_key",
+                        lambda cfg: (_ for _ in ()).throw(exc))
+
+    r = client.post("/v1/model_api/setup", json={
+        "provider": "openai_compatible", "model": "gpt-4o-mini",
+        "api_key": "sk-whatever", "base_url": "https://relay.example.com",
+    }, headers=_headers(api_key))
+
+    assert r.status_code == 400, label
+    body = r.get_json()
+    assert body["error"] == "provider_test_failed", label
+    assert body["status_code"] is None, f"{label}: 404 必须清掉,否则客户端说成模型不存在"
+    assert "/v1" in body["detail"], label
+    assert "不是 API Key 的问题" in body["detail"], label
+
+
+def test_real_key_failure_keeps_the_original_detail(client, monkeypatch):
+    """真的 key 无效(provider 回 JSON)→ 判据不许命中,原始信息原样透传。"""
+    _, api_key = _register(client)
+    monkeypatch.setattr(provider_client, "test_provider_key",
+                        lambda cfg: (_ for _ in ()).throw(
+                            provider_client.ProviderError(
+                                "provider_http_401: Invalid token", status_code=401)))
+
+    r = client.post("/v1/model_api/setup", json={
+        "provider": "openai_compatible", "model": "gpt-4o-mini",
+        "api_key": "sk-bad", "base_url": "https://relay.example.com/v1",
+    }, headers=_headers(api_key))
+
+    body = r.get_json()
+    assert body["error"] == "provider_test_failed"
+    assert body["status_code"] == 401           # 保留,客户端据此说"鉴权失败"
+    assert "Invalid token" in body["detail"]    # 原始信息不被吞掉
+    assert "/v1" not in body["detail"]          # 不许对真 key 错误乱给地址建议
