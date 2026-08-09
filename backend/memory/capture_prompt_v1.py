@@ -23,6 +23,7 @@ from identity.user_naming import _naming_rule, sanitize_user_name
 from memory.card_text import (
     build_format_retry_prompt,
     card_text_rejection,
+    extract_json_block,
     format_error,
     sanitize_card_labels,
 )
@@ -121,32 +122,6 @@ CAPTURE_TYPES = ("event", "fact", "quote", "moment")
 _DEFAULT_CAPTURE_TYPE = "event"
 
 
-def _extract_json_block(raw: str) -> str:
-    """Pull the first balanced {...} JSON object out of an agent reply.
-
-    Agents sometimes wrap JSON in prose or a ```json fence despite the
-    instruction. Be forgiving: find the outermost balanced braces.
-    """
-    text = (raw or "").strip()
-    if text.startswith("```"):
-        # strip a leading ```json / ``` fence and its closing fence
-        text = text.split("```", 2)[1] if text.count("```") >= 2 else text.strip("`")
-        if text.lstrip().lower().startswith("json"):
-            text = text.lstrip()[4:]
-    start = text.find("{")
-    if start < 0:
-        return ""
-    depth = 0
-    for i in range(start, len(text)):
-        if text[i] == "{":
-            depth += 1
-        elif text[i] == "}":
-            depth -= 1
-            if depth == 0:
-                return text[start : i + 1]
-    return ""
-
-
 def _clamp01(value) -> float:
     try:
         f = float(value)
@@ -176,7 +151,7 @@ def parse_capture_cards(
     """
     import json
 
-    block = _extract_json_block(raw)
+    block = extract_json_block(raw)
     if not block:
         return [], "no_json_object"
     try:

@@ -14,7 +14,7 @@
 from __future__ import annotations
 
 from memory import card_guard
-from memory.card_text import sanitize_card_labels
+from memory.card_text import extract_json_block, sanitize_card_labels
 from memory.prompts_v1 import COMMON_BUCKETS_GUIDANCE_V1
 
 _MIGRATE_PROMPT_TEMPLATE = """你是 {ai_name}——{user_name} 的伴侣。现在是一段安静的时间，没人在和你说话。
@@ -79,26 +79,6 @@ def build_migrate_prompt(
     )
 
 
-def _extract_json_block(raw: str) -> str:
-    text = (raw or "").strip()
-    if text.startswith("```"):
-        text = text.split("```", 2)[1] if text.count("```") >= 2 else text.strip("`")
-        if text.lstrip().lower().startswith("json"):
-            text = text.lstrip()[4:]
-    start = text.find("{")
-    if start < 0:
-        return ""
-    depth = 0
-    for i in range(start, len(text)):
-        if text[i] == "{":
-            depth += 1
-        elif text[i] == "}":
-            depth -= 1
-            if depth == 0:
-                return text[start : i + 1]
-    return ""
-
-
 def parse_migrated_cards(
     raw: str,
     *,
@@ -124,7 +104,7 @@ def parse_migrated_cards(
     def _unmigrated(seen: set[str]) -> list[str]:
         return sorted(all_ids - seen) if all_ids is not None else []
 
-    block = _extract_json_block(raw)
+    block = extract_json_block(raw)
     if not block:
         return [], _unmigrated(set()), "no_json_object"
     try:

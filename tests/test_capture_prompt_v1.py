@@ -15,6 +15,8 @@ from memory.capture_prompt_v1 import (  # noqa: E402
     capture_semantic_retry_reasons,
     parse_capture_cards,
 )
+from memory.card_text import extract_json_block  # noqa: E402
+from core import self_thinking  # noqa: E402
 
 _FENCE = "`" * 3
 
@@ -152,6 +154,47 @@ def test_parse_handles_prose_wrapped_and_clamps():
     assert err is None and len(cards) == 1
     assert cards[0]["action"] == "merge" and cards[0]["target_id"] == "mom_1"
     assert cards[0]["importance"] == 1.0 and cards[0]["pulse"] == 0.0
+
+
+def test_parse_ignores_balanced_fake_json_inside_thinking():
+    """Prod regression: a thinking relay put brace-shaped reasoning before JSON.
+
+    The legacy extractor stopped at the first balanced braces, so this exact
+    shape returned ``json_decode_error`` even though the public reply was valid.
+    """
+    raw = (
+        '<think>先试草稿 {"cards": [not valid]}，再给正式答案。</think>\n'
+        '{"cards":[{"action":"add","summary":"记得按时休息",'
+        '"content":"她说最近连续熬夜，希望以后提醒她早点休息。"}]}'
+    )
+
+    cards, err = parse_capture_cards(raw)
+
+    assert err is None
+    assert [card["summary"] for card in cards] == ["记得按时休息"]
+
+
+def test_parse_thinking_without_braces_keeps_existing_behavior():
+    raw = '<think>我先判断这件事值得长期记住。</think>{"cards": []}'
+    cards, err = parse_capture_cards(raw)
+    assert cards == [] and err is None
+
+
+def test_parse_truncated_json_stays_no_json_object():
+    cards, err = parse_capture_cards('{"cards":[{"action":"add"}')
+    assert cards == [] and err == "no_json_object"
+
+
+def test_extract_json_falls_back_to_raw_when_thinking_strip_fails():
+    raw = (
+        '<think>outer <thinking>nested</thinking></think>'
+        '{"cards": []}'
+    )
+    status, _thinking, reply = self_thinking.strip_all_thinking(
+        raw, sanitize=False
+    )
+    assert status == self_thinking.FAILED and reply == ""
+    assert extract_json_block(raw) == '{"cards": []}'
 
 
 def test_parse_garbage_returns_reason():
