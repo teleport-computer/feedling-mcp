@@ -13,6 +13,8 @@ monkeypatch envelope.decrypt_envelope）。
 
 from __future__ import annotations
 
+import random
+import string
 import sys
 from pathlib import Path
 
@@ -610,6 +612,81 @@ def test_run_history_search_requires_query_or_range(monkeypatch):
             "usr_a", cursor_hmac_key=_KEY, post_enclave=lambda op, p: {})
 
 
+def test_cursor_overflow_is_raised_only_after_the_scan_already_ran(monkeypatch):
+    """``cursor_overflow`` 是**扫描后**的编码失败，不是入参校验失败。
+
+    它由 ``encode_cursor`` 在扫描循环结束后抛出（history_search.encode_cursor
+    的长度兜底）。这条测试钉死那个时序：enclave 已经解过行，错误才发生——
+    所以回合预算绝不能把它当"一行都没读过"豁免掉（见 worker 侧的同名回归）。
+    """
+    _patch_store(monkeypatch)
+    posts: list[str] = []
+
+    def fake_post(op, payload):
+        posts.append(op)
+        rows = payload["rows"]
+        return {
+            "hits": [{"message_id": rows[0]["id"], "seq": rows[0]["seq"],
+                      "ts": 1.0, "role": "user", "snippet": "x",
+                      "content_truncated": False}],
+            "checked_count": len(rows), "unavailable_count": 0,
+            "last_checked_seq": rows[-1]["seq"], "stopped": "hits",
+            "truncated": False,
+        }
+
+    # 超长且不可压缩的 user_id 把 cursor payload 顶过 CURSOR_MAX_CHARS
+    # （Codex 的复现形态：user_id 是 TEXT 列，长度不由这层保证）。
+    long_uid = "".join(
+        random.Random(7).choices(string.ascii_letters + string.digits, k=2000))
+    with pytest.raises(history_search.HistorySearchInputError) as excinfo:
+        history_readside.run_history_search(
+            long_uid, cursor_hmac_key=_KEY, query="target", limit=1,
+            post_enclave=fake_post)
+    assert excinfo.value.code == "cursor_overflow"
+    assert posts.count("scan") >= 1  # 扫描确实跑过了
+
+
+def test_route_missing_after_a_successful_scan_is_no_longer_pre_scan(monkeypatch):
+    """已经扫过之后再出 enclave 404 → 不许再报 route-missing 那个词面。
+
+    ``enclave_history_capability_unavailable`` 会被 facade 翻成
+    ``capability_unavailable``，而那是 PRE_SCAN_ERROR_CODES 里的豁免码（结算
+    0 行）。第一次投递就 404（真正的版本错位）保持原样；跑过之后再 404 必须
+    降级成普通 upstream 错误，才能按 lease 满额扣。
+    """
+    _patch_store(monkeypatch)
+    posts: list[str] = []
+
+    def fake_post(op, payload):
+        posts.append(op)
+        if posts.count("scan") > 1:
+            raise RuntimeError("enclave_history_capability_unavailable")
+        rows = payload["rows"]
+        return {"hits": [], "checked_count": len(rows), "unavailable_count": 0,
+                "last_checked_seq": rows[-1]["seq"] if rows else None,
+                "stopped": "exhausted", "truncated": False}
+
+    with pytest.raises(RuntimeError) as excinfo:
+        history_readside.run_history_search(
+            "usr_a", cursor_hmac_key=_KEY, query="target",
+            post_enclave=fake_post)
+    assert posts.count("scan") == 2
+    assert str(excinfo.value) == "enclave_error_after_scan"
+
+    # 第一次投递就 404 = 真的版本错位，词面保持不变（那时确实一行都没读过）。
+    posts.clear()
+
+    def always_404(op, payload):
+        posts.append(op)
+        raise RuntimeError("enclave_history_capability_unavailable")
+
+    with pytest.raises(RuntimeError) as excinfo:
+        history_readside.run_history_search(
+            "usr_a", cursor_hmac_key=_KEY, query="target",
+            post_enclave=always_404)
+    assert str(excinfo.value) == "enclave_history_capability_unavailable"
+
+
 def test_run_history_search_cross_user_cursor_rejected(monkeypatch):
     _patch_store(monkeypatch, candidate_fn=lambda uid, **kw: [])
     fake_post = lambda op, payload: {  # noqa: E731
@@ -931,8 +1008,9 @@ def test_run_history_fetch_not_found_and_structure(monkeypatch):
         lambda uid, mid: dict(anchor_row))
     monkeypatch.setattr(
         history_readside.jobs_store, "chat_history_neighbor_rows",
-        lambda uid, anchor_seq, *, before, after: (
-            [_text_row(4, role="openclaw")], [_text_row(6)]))
+        lambda uid, anchor_seq, *, before, after, **kw: (
+            [_text_row(4, role="openclaw")], [_text_row(6)],
+            {"before": 1, "after": 1}))
 
     def fake_post(op, payload):
         assert op == "fetch"
@@ -958,18 +1036,35 @@ def test_run_history_fetch_not_found_and_structure(monkeypatch):
     assert out["unavailable_count"] == 0
 
 
-def _patch_fetch_store(monkeypatch, *, anchor_seq=50):
+def _patch_fetch_store(monkeypatch, *, anchor_seq=50,
+                       exists_before=999, exists_after=999):
+    """假 store。``exists_*`` = 该侧真正存在多少条邻居（默认"历史很长"）。
+
+    真 store 现在同时给出**请求窗口内实际可见的条数**（witness），omitted_* 只
+    能由它算出来——这里如实模拟那个契约，别再让假 store 谎报"要多少有多少"。
+    """
     anchor_row = _text_row(anchor_seq)
     monkeypatch.setattr(
         history_readside.jobs_store, "chat_history_anchor_row",
         lambda uid, mid: dict(anchor_row))
     asked: dict = {}
 
-    def _neighbors(uid, seq, *, before, after):
+    def _neighbors(uid, seq, *, before, after,
+                   before_requested=None, after_requested=None):
         asked["before"], asked["after"] = before, after
+        took_before = min(before, exists_before)
+        took_after = min(after, exists_after)
         return (
-            [_text_row(s) for s in range(seq - before, seq)],
-            [_text_row(s) for s in range(seq + 1, seq + 1 + after)],
+            [_text_row(s) for s in range(seq - took_before, seq)],
+            [_text_row(s) for s in range(seq + 1, seq + 1 + took_after)],
+            {
+                "before": min(
+                    before if before_requested is None else before_requested,
+                    exists_before),
+                "after": min(
+                    after if after_requested is None else after_requested,
+                    exists_after),
+            },
         )
 
     monkeypatch.setattr(
@@ -1042,25 +1137,53 @@ def test_run_history_fetch_merges_enclave_side_omissions(monkeypatch):
 
 
 def test_run_history_fetch_does_not_invent_neighbors_that_never_existed(monkeypatch):
-    """钳制只在那些行**确实存在**时才报 omitted，否则是假信号。
+    """omitted_* 只能来自 store 的真实 witness，不许从"没取满"推断。
 
-    锚点贴着历史开头时 before 本来就没那么多行；报"删了 13 条"会让模型以为
-    还有前文可挖，白翻一页。
+    锚点贴着历史两头时，请求窗口里本来就没那么多行；报"删了 13 条 / 4 条"会让
+    模型以为还有前后文可挖，白翻一页。**一条都没查过的那一侧也一样**——
+    ``keep_after=0`` 时旧写法恒报满 4 条，哪怕锚点就是最后一条消息。
     """
-    monkeypatch.setattr(
-        history_readside.jobs_store, "chat_history_anchor_row",
-        lambda uid, mid: _text_row(2))
-    monkeypatch.setattr(
-        history_readside.jobs_store, "chat_history_neighbor_rows",
-        # 请求 2 条 before，只存在 1 条
-        lambda uid, seq, *, before, after: ([_text_row(1)], []))
+    _patch_fetch_store(monkeypatch, anchor_seq=2, exists_before=1, exists_after=0)
     sent: dict = {}
     out = history_readside.run_history_fetch(
         "usr_a", message_id="m2", before=15, after=4,
         budget=history_readside.HistorySearchBudget(call_max_rows=1),
         post_enclave=_echo_fetch_post(sent))
+    assert sent["before"] == 1 and sent["after"] == 0
     assert out["omitted_before"] == 0     # 到头了，没藏东西
-    assert out["omitted_after"] == 4      # 一条都没查过 → 保守报满
+    assert out["omitted_after"] == 0      # 锚点后面根本没有消息
+
+
+def test_run_history_fetch_reports_the_side_it_never_asked_about(monkeypatch):
+    """反过来：after 侧确实有消息、只是预算没给额度 → 必须如实报满。
+
+    与上一条成对——这两条一起才钉死"报的是真实缺口"，不是"永远 0"或"永远满"。
+    """
+    _patch_fetch_store(monkeypatch, exists_before=999, exists_after=999)
+    sent: dict = {}
+    out = history_readside.run_history_fetch(
+        "usr_a", message_id="m50", before=15, after=4,
+        budget=history_readside.HistorySearchBudget(call_max_rows=1),
+        post_enclave=_echo_fetch_post(sent))
+    assert sent["before"] == 2 and sent["after"] == 0
+    assert out["omitted_before"] == 13
+    assert out["omitted_after"] == 4
+
+
+def test_run_history_fetch_full_window_that_is_all_there_is_reports_zero(monkeypatch):
+    """``returned == kept`` 不等于"后面还有"：正好取完时不许报缺口。
+
+    预算充足、请求 4 条 after 而历史上就剩 4 条 → omitted_after 必须是 0。
+    旧写法在 ``returned == kept`` 时一律取保守的"还有更多"，于是钳到 0 的那一侧
+    恒报满、正好取完的那一侧也可能虚报。
+    """
+    _patch_fetch_store(monkeypatch, exists_before=15, exists_after=4)
+    sent: dict = {}
+    out = history_readside.run_history_fetch(
+        "usr_a", message_id="m50", before=15, after=4,
+        post_enclave=_echo_fetch_post(sent))
+    assert sent["before"] == 15 and sent["after"] == 4
+    assert out["omitted_before"] == 0 and out["omitted_after"] == 0
 
 
 def test_post_enclave_history_version_skew_and_http_errors(monkeypatch):
@@ -1172,7 +1295,45 @@ def test_store_anchor_and_neighbors_visibility_and_order():
     assert jobs_store.chat_history_anchor_row(uid, "ghost") is None
     assert jobs_store.chat_history_anchor_row(uid, f"{uid}-m3") is None
 
-    older, newer = jobs_store.chat_history_neighbor_rows(
+    older, newer, available = jobs_store.chat_history_neighbor_rows(
         uid, seqs[1], before=2, after=2)
     assert [row["seq"] for row in older] == [seqs[0]]  # 旧→新
     assert [row["seq"] for row in newer] == [seqs[2], s4]  # system 行被跳过
+    # 取多少就报多少存在（可见性谓词同一套：system 行不算数）
+    assert available == {"before": 1, "after": 2}
+
+
+def test_store_neighbor_rows_report_how_many_exist_in_the_requested_window():
+    """预算钳窄了取回条数时，store 仍要如实说出**请求窗口里真有几条**。
+
+    这是 ``omitted_before/omitted_after`` 唯一诚实的来源：光看"取回 < 钳制值"
+    分不清"到头了"和"还有更多"，从"取回 == 钳制值"更推不出"没取的那些都存在"。
+    """
+    _, _, _, jobs_store = _db_modules()
+    uid = "u_hist_neighbor_witness"
+    _db_reset(uid)
+    seqs = [_db_append(uid, i, ts=float(i)) for i in range(9)]
+    anchor = seqs[6]
+
+    # 预算只允许取 2 条 before / 0 条 after，但窗口请求的是 15 / 4
+    older, newer, available = jobs_store.chat_history_neighbor_rows(
+        uid, anchor, before=2, after=0, before_requested=15, after_requested=4)
+    assert [row["seq"] for row in older] == [seqs[4], seqs[5]]
+    assert newer == []
+    # before 侧只有 6 条真的存在（钳到 15 也拿不出更多）；after 侧有 2 条
+    assert available == {"before": 6, "after": 2}
+
+    # 请求窗口比历史短时按请求窗口封顶（"最近 n 条里有几条"）
+    _, _, capped = jobs_store.chat_history_neighbor_rows(
+        uid, anchor, before=1, after=1, before_requested=3, after_requested=1)
+    assert capped == {"before": 3, "after": 1}
+
+    # 一侧到头：锚点贴着历史开头 → before 侧一条都不存在
+    _, _, edge = jobs_store.chat_history_neighbor_rows(
+        uid, seqs[0], before=0, after=0, before_requested=15, after_requested=4)
+    assert edge == {"before": 0, "after": 4}
+
+    # 请求 0 条 = 不问，不发查询
+    _, _, none_asked = jobs_store.chat_history_neighbor_rows(
+        uid, anchor, before=0, after=0)
+    assert none_asked == {"before": 0, "after": 0}

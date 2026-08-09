@@ -99,6 +99,15 @@ history_fetch(message_id: string, before?: int, after?: int)
     exhausted 拦在更前面。**额度优先给 `before`**——线索几乎总在前文里。
   - 三处删减（预算钳 / enclave deadline / facade 结构化缩减）**累加**进同一对
     `omitted_*` 计数，facade 绝不把它重置成 0。
+  - 🔴 **`omitted_*` 的语义是「请求窗口里真实存在、但这次没给你」，不是
+    「请求数 − 返回数」。** 预算钳掉那部分必须由 store 给出的**真实 witness**
+    算出来——每侧在请求窗口内实际可见的行数（`chat_history_neighbor_rows` 的
+    第三个返回值），`omitted = available − 本次取回`。
+    **不许从"取回条数 vs 钳制值"反推**，那在两个方向上都会说谎：
+    额度不足时 `keep_after` 常被钳到 0，"没取满就是还有"会让锚点明明是最后
+    一条消息、却报 `omitted_after=4`；而"取满了就假设后面还有"又分不清
+    "正好只有这些"和"确实还有更多"。两种假信号都诱导模型为不存在的邻居白翻
+    一页，与本字段的契约直接冲突。
   - 记账取**缩减前**的行数，且预算钳掉的行也照扣：偏保守，且只在回合尾部发生。
 - 限制单位是**完整序列化 payload**（≤**4500** 字符），超限**按此顺序**结构化缩减
   （绝不序列化后切串）：
@@ -138,7 +147,9 @@ history_search: result_cap=1800  atomic_json=true
 
 **这两个数字 env 可调，因此必须在启动期交叉校验**（`validate_result_caps`，
 worker import 时对着该部署真实的 `tool_batch_result_char_cap` 跑一次，不满足
-直接 `RuntimeError` 起不来）。两个方向各有一个洞，都实测复现过：
+直接 `RuntimeError` 起不来）。**只校验当前真的开着的 atomic 生产者**——关掉的
+功能不该拦住启动，理由见 §6 的 kill switch 一条。两个方向各有一个洞，
+都实测复现过：
 
 | 坏配置 | 后果 |
 |---|---|
@@ -221,13 +232,24 @@ cover 查询会略过被 checkpoint 覆盖的子节点，不可复用）。
 | 情况 | 扣多少 |
 |---|---|
 | 成功 + 可信 metadata（`history_scanned_rows`） | 按实际值（含**可信的实际 0**） |
-| 明确未触达扫描的错误 | 0 —— 本地参数校验、kill switch / dispatch gate 拒绝、cursor 拒绝、锚点查空。判据只有一条：**该错误码的所有产生点都在第一次 enclave POST 之前**；拿不准就不许列进豁免名单 |
+| 明确未触达扫描的错误 | 0 —— 本地参数校验、kill switch / dispatch gate 拒绝、cursor **解码**拒绝、锚点查空。判据只有一条：**该错误码的所有产生点都在第一次 enclave POST 之前**；拿不准就不许列进豁免名单 |
 | **已进入执行但用量未知** | **按本次 lease 上限保守结算** |
 
 第三档是必须的：capability 异常会被 executor 刻意吞成 `capability_failed`
 （隔离单个坏读，不拖垮整轮），metadata 也就跟着没了。实测复现——租出 1500 →
 metadata 缺失 → 计费 0 → 下一次仍租出 1500，多轮快速失败即可突破 1500 累计闸。
 **宁可多扣，不许白嫖。**
+
+豁免名单要**逐项 witness**（指到具体 raise/return 点），"看着像入参错误"不算
+证据。两个踩过的反例，都写在 `capabilities/history.PRE_SCAN_ERROR_CODES` 边上：
+
+- `cursor_overflow` **不是** pre-scan：它由 `encode_cursor` 抛出，而那是扫描
+  循环**结束之后**才调用的。误列进名单后，"enclave 已扫 N 行 → cursor 编码
+  超长 → 结算 0 行"，同一个超长 `user_id` 反复调用即可绕过回合累计闸。
+- `capability_unavailable` 能留在名单里，前提是 readside 主动闭合：
+  enclave 的 route-missing（404）词面在**第一次 `/scan` 投递成功之后**不再
+  逃出来（改抛普通 upstream 错误 → 按 lease 满额扣）。那段代码是本条豁免
+  成立的前提。
 
 截断：见 §3.3 的共享预算策略（executor 与 tool_loop 同读、atomic_json 整额
 预留、含 history 时同批预算抬到 10500、启动期交叉校验、atomic 违约整体换错误
@@ -244,6 +266,14 @@ metadata 缺失 → 计费 0 → 下一次仍租出 1500，多轮快速失败即
     （`tool_not_allowed`）——目录隐藏挡不住直接调用/错误接线。
 - kill switch：`FEEDLING_V2_HISTORY_TOOLS_ENABLED`，**默认 ON**（回滚闸）。
   关掉 = 目录消失 + dispatch 拒绝，正常路径逐字节不变。
+  ＊**「逐字节不变」包含「照旧启动得起来」**：§3.3 的 atomic cap 交叉校验
+  只在 history 当前开启时执行。否则一个在 history 出现之前完全合法的
+  `tool_batch_result_char_cap`（只需 ≥ `8×64`）会让 worker 在关掉功能之后
+  仍然 import 失败——那时闸门已经关不掉任何东西了。实测复现：
+  `FEEDLING_V2_HISTORY_TOOLS_ENABLED=0` + `..._TOOL_BATCH_RESULT_CHAR_CAP=1000`。
+  ＊开关是**调用时读**的，所以"关着启动、之后被打开"这条路必须在开启处
+  （offer/dispatch 的单点解析）重跑同一份校验；验不过就当没开
+  （fail-closed，工具消失），而不是抛异常打断整个回合。
   ＊Codex 建议第一版默认 OFF 分阶段开——被否决：违反工作区「开关默认 ON」
   纪律（有过默认 OFF 上线数天没生效的事故）。版本错位窗口靠同镜像同 commit
   部署 + 明确报错兜底：enclave 无对应 route 时工具返回 capability-unavailable

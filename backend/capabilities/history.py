@@ -66,15 +66,48 @@ TOOL_NOT_ALLOWED = "tool_not_allowed"
 #
 # 判据只有一条：**这个码的所有产生点都在 enclave 调用之前**。拿不准就别加进来
 # ——漏加的代价是多扣几行，错加的代价是预算闸被绕过。
+#
+# 🔎 逐项 witness（2026-08-09 重新逐个核过；改这张表时必须重新走一遍，
+#    "看着像入参错误"不算证据，要指到具体 raise/return 点）：
+#
+#   tool_not_allowed             本模块 search()/fetch() 的第一行；executor 的
+#                                dispatch gate（executor.py 的 history 分支）。
+#                                两处都在进入 readside 之前。
+#   capability_invalid_input     本模块 fetch() 的 message_id 空校验；以及
+#     (errors.INVALID)           HistorySearchInputError 的空 code 兜底——
+#                                history_search 的每个 raise 都带非空 slug，
+#                                所以这条实际只由前者产生。均在 readside 之前。
+#   capability_unavailable       ①本模块 search() 的 derive_cursor_hmac_key()
+#     (errors.UNAVAILABLE)       失败（还没碰 store/enclave）；
+#                                ②_infra_err 把 enclave 的
+#                                ``enclave_history_capability_unavailable``
+#                                （HTTP 404 = 镜像没带 history 路由）翻成它。
+#                                ②的产生点是 _post_enclave_history，而它在
+#                                leaf-hints / scan / fetch 三处都会被调到——
+#                                单看这里**推不出**"一定在扫描前"。所以 readside
+#                                在第一次 scan 投递成功之后就不再让这个码逃出来
+#                                （run_history_search 里改抛 enclave_error_after_scan
+#                                → 走 UPSTREAM → 按 lease 满额扣）。**那段代码是
+#                                本行豁免成立的前提，别删。**
+#   cursor_invalid / cursor_mismatch
+#                                decode_cursor / verify_cursor_binding /
+#                                verify_cursor_request，全在扫描循环之前。
+#   missing_query_or_time_range / invalid_limit
+#                                run_history_search 进循环前的参数分支。
+#   query_empty / query_too_long normalize_query（同上，循环前）。
+#   invalid_time / invalid_time_range
+#                                parse_rfc3339_utc / normalize_time_range（同上）。
+#   invalid_neighbor_count       run_history_fetch 钳邻居数时，早于 store 查询。
+#   not_found_or_not_visible     run_history_fetch 锚点查空，fetch POST 根本没发。
+#
+# ❌ **cursor_overflow 不在这里**（2026-08-09 移除）：它由 encode_cursor 抛出，
+#    而 encode_cursor 在扫描循环**结束之后**才调用（history_readside 的
+#    next_cursor 分支）。曾经错列在此，于是"enclave 已扫过 N 行 → cursor 编码
+#    超长 → 结算 0 行"，同一个超长 user_id 反复调用即可绕过回合累计预算。
 PRE_SCAN_ERROR_CODES = frozenset({
-    TOOL_NOT_ALLOWED,               # kill switch / executor dispatch gate
-    errors.INVALID,                 # facade 本地参数校验（message_id 缺失等）
-    # ⚠️ 这是本列表里唯一的**通用**错误码，也是唯一有漂移风险的一项：豁免的前提
-    # 是它当前仅有的两个生产者（cursor key 缺失、enclave 无 history 路由 404）都在
-    # 任何扫描之前返回。**给 history 新增任何 UNAVAILABLE 返回点之前，先确认它同样
-    # 在扫描前返回；只要有一个可能扫描过，就必须把本行删掉**——否则失败路径会按
-    # 0 行结算，重试即可绕过回合预算（正是本轮修的第 2 项）。
-    errors.UNAVAILABLE,             # cursor key 缺失 / enclave 无 history 路由(404)
+    TOOL_NOT_ALLOWED,
+    errors.INVALID,
+    errors.UNAVAILABLE,
     "cursor_invalid",
     "cursor_mismatch",
     "missing_query_or_time_range",
@@ -84,8 +117,7 @@ PRE_SCAN_ERROR_CODES = frozenset({
     "query_too_long",
     "invalid_time",
     "invalid_time_range",
-    "cursor_overflow",
-    "not_found_or_not_visible",     # 锚点查空，fetch 根本没发出去
+    "not_found_or_not_visible",
 })
 
 

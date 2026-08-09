@@ -372,6 +372,9 @@ def run_history_search(
     # planner 窗口里真正推进过的部分，不是"返回了行"的部分——一个候选行都
     # 没有的窗口同样算触及过（那正是原文被清理掉的样子）。
     touched: list[tuple[int, int]] = []
+    # 成功投递过几次 /scan。只用来判定「此后的 enclave 错误还能不能算
+    # pre-scan」，见循环里的 except 分支。
+    scan_posts = 0
     deadline = time.monotonic() + budget.call_deadline_ms / 1000.0
     while (
         len(matches) < limit_n
@@ -419,15 +422,26 @@ def run_history_search(
                 break
             payload_rows.append(projected)
             used_bytes += size
-        response = post("scan", {
-            "rows": payload_rows,
-            "query": normalized_query,
-            "stop_after_hits": limit_n - len(matches),
-            "deadline_ms": max(1, remaining_ms),
-            "max_rows": budget.raw_batch_rows,
-            "max_ciphertext_bytes": budget.raw_batch_bytes,
-            "snippet_max_chars": budget.snippet_max_chars,
-        })
+        try:
+            response = post("scan", {
+                "rows": payload_rows,
+                "query": normalized_query,
+                "stop_after_hits": limit_n - len(matches),
+                "deadline_ms": max(1, remaining_ms),
+                "max_rows": budget.raw_batch_rows,
+                "max_ciphertext_bytes": budget.raw_batch_bytes,
+                "snippet_max_chars": budget.snippet_max_chars,
+            })
+        except RuntimeError as exc:
+            # 一旦有过成功的 scan 投递，本次调用就**已经解密过原文**，此后再冒出
+            # 的 enclave 错误绝不能带上 route-missing 那个词面：facade 会把它翻成
+            # capability_unavailable，而那是 PRE_SCAN_ERROR_CODES 里的豁免码
+            # （结算 0 行）。换成普通 upstream 错误 → 按 lease 满额保守结算。
+            # 版本错位的真实形态是「第一次投递就 404」，那条路径不受影响。
+            if scan_posts and str(exc) == "enclave_history_capability_unavailable":
+                raise RuntimeError("enclave_error_after_scan") from exc
+            raise
+        scan_posts += 1
         checked = int(response.get("checked_count") or 0)
         scanned += checked
         unavailable += int(response.get("unavailable_count") or 0)
@@ -555,8 +569,13 @@ def run_history_fetch(
     anchor = jobs_store.chat_history_anchor_row(str(user_id), str(message_id))
     if anchor is None:
         return {"error": "not_found_or_not_visible"}
-    older, newer = jobs_store.chat_history_neighbor_rows(
-        str(user_id), int(anchor["seq"]), before=keep_before, after=keep_after)
+    # ``before_requested``/``after_requested`` 是模型要的窗口，``before``/``after``
+    # 是预算钳后真正取密文的条数。store 用前者数出「这个窗口里真有几条」，
+    # omitted_* 只认这个 witness（见 _omitted_by_budget）。
+    older, newer, available = jobs_store.chat_history_neighbor_rows(
+        str(user_id), int(anchor["seq"]),
+        before=keep_before, after=keep_after,
+        before_requested=n_before, after_requested=n_after)
     response = post("fetch", {
         "anchor": _row_payload(anchor),
         "before": [_row_payload(row) for row in older],
@@ -575,21 +594,25 @@ def run_history_fetch(
         # 预算钳掉的 + enclave 侧（deadline / hard cap）没解成的，合并如实上报。
         # facade 的结构化缩减会在这个基数上继续累加，不是从 0 重置。
         "omitted_before": (
-            _budget_omitted(n_before, keep_before, len(older))
+            _omitted_by_budget(available.get("before"), len(older))
             + max(0, int(response.get("omitted_before") or 0))),
         "omitted_after": (
-            _budget_omitted(n_after, keep_after, len(newer))
+            _omitted_by_budget(available.get("after"), len(newer))
             + max(0, int(response.get("omitted_after") or 0))),
     }
 
 
-def _budget_omitted(requested: int, kept: int, returned: int) -> int:
-    """预算钳掉了几条——但只在那些行**确实存在**时才算。
+def _omitted_by_budget(available, sent: int) -> int:
+    """预算钳掉了几条 = 请求窗口里**真实存在**的条数 − 这次取回的条数。
 
-    store 返回不足 ``kept`` 条 = 这个方向上的历史本来就到头了，钳制没有真的
-    藏起任何东西；这时报"删了 13 条"是假信号，模型会以为还有前文可挖、白翻一页。
-    返回满 ``kept`` 条时无法区分"正好这么多"和"还有更多"，取保守的后者。
+    ``available`` 是 store 数出来的 witness（``chat_history_neighbor_rows`` 的
+    第三个返回值），不是从"取回条数"推断的。推断在两个方向上都会说谎：
+
+    * ``keep_after == 0``（低余额时 before 优先，after 一条都不取）——按"没取满
+      就是还有"推，恒报 ``omitted_after = 4``，哪怕锚点就是最后一条消息；
+    * ``returned == kept``——分不清"正好只有这些"和"后面确实还有"。
+
+    两种假信号都会让模型为不存在的邻居再翻一页，与 ``omitted_*`` 的契约
+    （"实际因预算删掉了多少"）直接冲突。
     """
-    if returned < kept:
-        return 0
-    return max(0, int(requested) - int(kept))
+    return max(0, int(available or 0) - int(sent))

@@ -160,12 +160,22 @@ _ENV_BY_TOOL = {
 _BATCH_CAP_ENV = "FEEDLING_V2_TOOL_BATCH_RESULT_CHAR_CAP"
 
 
-def validate_result_caps(*, batch_cap: int) -> None:
+def validate_result_caps(
+    *, batch_cap: int, tool_names=ATOMIC_TOOL_NAMES
+) -> None:
     """Fail fast on a result-cap configuration that cannot hold its contract.
 
     Called once at process start (worker module import) with the deployment's
-    real ``tool_batch_result_char_cap``.  Two independent ways a plausible
-    number silently breaks the model's input:
+    real ``tool_batch_result_char_cap``.
+
+    ``tool_names`` narrows the check to the atomic producers that are actually
+    live.  A producer behind a kill switch imposes no contract while it is off:
+    validating it anyway would make the switch unable to restore the pre-feature
+    startup behaviour, which is the one thing a rollback valve must do.  The
+    caller that turns such a producer back on is responsible for re-running this
+    check (see the worker's ``_history_tools_enabled_for_turn``).
+
+    Two independent ways a plausible number silently breaks the model's input:
 
     1. **Too small.**  ``result_cap=1`` cannot be met by any structural shrink
        — the smallest legal payload is already hundreds of characters.  The
@@ -183,7 +193,7 @@ def validate_result_caps(*, batch_cap: int) -> None:
     unparseable or whose prompt budget is quietly blown.
     """
     batch_cap = int(batch_cap)
-    policies = {name: for_tool(name) for name in ATOMIC_TOOL_NAMES}
+    policies = {name: for_tool(name) for name in tool_names}
     for name, policy in policies.items():
         if policy is None:  # pragma: no cover — ATOMIC_TOOL_NAMES is the source
             continue

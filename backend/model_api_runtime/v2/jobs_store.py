@@ -10848,19 +10848,66 @@ def chat_history_anchor_row(user_id, message_id) -> dict | None:
     return _history_full_row(row[0], row[1], row[2], row[3])
 
 
+def _neighbor_available_counts(
+    conn, user_id, anchor: int, *, before: int, after: int
+) -> dict:
+    """请求窗口内每侧**实际存在**多少条可见邻居（只数，不取任何内容）。
+
+    这是 ``omitted_before``/``omitted_after`` 唯一诚实的来源。没有它，调用方
+    只能拿"取回条数 vs 预算钳制值"去猜：钳到 0 的那一侧永远猜成"后面还有"，
+    正好取完的那一侧也分不清"就这么多"和"还有更多"——两种都会让模型为不存在
+    的邻居白翻一页。
+
+    与取行查询同谓词、同连接（chat_messages 是 append-only，同连接内两次读到
+    的可见集合一致）。``LIMIT`` 让计数在请求窗口处提前终止：结果就是
+    ``min(请求条数, 实际条数)``，永远不会全表扫。
+    """
+    counts = {"before": 0, "after": 0}
+    for side, comparison, order in (
+        ("before", "seq<%s", "DESC"), ("after", "seq>%s", "ASC"),
+    ):
+        wanted = int(before if side == "before" else after)
+        if wanted <= 0:
+            continue
+        counts[side] = int(conn.execute(
+            "SELECT count(*) FROM ("
+            f"SELECT 1 FROM chat_messages WHERE user_id=%s AND {comparison} "
+            f"AND {_HISTORY_VISIBLE_PREDICATE} "
+            f"ORDER BY seq {order} LIMIT %s) probe",
+            (str(user_id), anchor, wanted),
+        ).fetchone()[0])
+    return counts
+
+
 def chat_history_neighbor_rows(
-    user_id, anchor_seq: int, *, before: int, after: int
-) -> tuple[list[dict], list[dict]]:
+    user_id,
+    anchor_seq: int,
+    *,
+    before: int,
+    after: int,
+    before_requested: int | None = None,
+    after_requested: int | None = None,
+) -> tuple[list[dict], list[dict], dict]:
     """锚点邻居（该用户 seq 序取，客户端时间戳不可靠——spec §3.2）。
 
-    返回 ``(before_rows, after_rows)``，两侧都按**旧→新**排列（返回结构的
-    展示序）；可见性谓词与候选查询完全同一套。
+    ``before``/``after`` = 这次真正取回密文的条数（已被回合预算钳过）；
+    ``before_requested``/``after_requested`` = 模型请求的窗口大小（省略则同上）。
+
+    返回 ``(before_rows, after_rows, available)``：前两项按**旧→新**排列（返回
+    结构的展示序），``available`` 是 ``{"before": n, "after": n}``——请求窗口内
+    实际存在多少条可见邻居。调用方据此算 ``omitted_*``，**不许**从"取回条数"
+    反推（见 ``_neighbor_available_counts``）。可见性谓词与候选查询完全同一套。
     """
     anchor = int(anchor_seq)
     if anchor < 0:
         raise ValueError("anchor_seq must be >= 0")
     n_before = max(0, int(before))
     n_after = max(0, int(after))
+    # 请求窗口至少要覆盖真的取回的条数，否则 available 会小于返回行数。
+    want_before = max(n_before, 0 if before_requested is None
+                      else int(before_requested))
+    want_after = max(n_after, 0 if after_requested is None
+                     else int(after_requested))
     older: list[dict] = []
     newer: list[dict] = []
     with _pool().connection() as conn:
@@ -10882,4 +10929,6 @@ def chat_history_neighbor_rows(
                 (str(user_id), anchor, n_after),
             ).fetchall()
             newer = [_history_full_row(r[0], r[1], r[2], r[3]) for r in rows]
-    return older, newer
+        available = _neighbor_available_counts(
+            conn, user_id, anchor, before=want_before, after=want_after)
+    return older, newer, available

@@ -299,9 +299,9 @@ def test_fetch_neighbor_counts_clamped_to_15(monkeypatch):
                           "nonce": "n", "K_enclave": "k"})
     asked = {}
 
-    def _neighbors(uid, seq, *, before, after):
+    def _neighbors(uid, seq, *, before, after, **kw):
         asked["before"], asked["after"] = before, after
-        return [], []
+        return [], [], {"before": 0, "after": 0}
 
     monkeypatch.setattr(
         history_readside.jobs_store, "chat_history_neighbor_rows", _neighbors)
@@ -739,6 +739,73 @@ def test_worker_fails_fast_at_import_on_a_broken_result_cap():
     assert "FEEDLING_V2_HISTORY_FETCH_RESULT_MAX_CHARS" in proc.stderr
 
 
+def _import_worker(**env_overrides) -> subprocess.CompletedProcess:
+    env = dict(os.environ)
+    env["PYTHONPATH"] = str(_BACKEND)
+    env.update({k: str(v) for k, v in env_overrides.items()})
+    return subprocess.run(
+        [sys.executable, "-c", "from model_api_runtime.v2 import worker"],
+        capture_output=True, text=True, env=env, timeout=120)
+
+
+def test_kill_switch_off_restores_the_pre_history_startup_contract():
+    """关掉 history 之后，worker 必须能照旧启动（kill switch 的全部意义）。
+
+    batch cap 1000 满足历史上的通用下限（8×64=512），在 history 出现之前是一个
+    完全合法的部署配置。如果 import 期无条件跑 atomic 校验，关掉开关也救不回
+    ——回滚闸失效，只能改回环境变量或回滚代码重新部署。
+    """
+    proc = _import_worker(
+        FEEDLING_V2_HISTORY_TOOLS_ENABLED="0",
+        FEEDLING_V2_TOOL_BATCH_RESULT_CHAR_CAP="1000",
+    )
+    assert proc.returncode == 0, proc.stderr[-2000:]
+
+
+def test_kill_switch_on_still_fails_fast_on_the_same_config():
+    """反向：开关开着时同一份配置仍然必须在启动期炸（校验不是被删掉了）。"""
+    proc = _import_worker(
+        FEEDLING_V2_HISTORY_TOOLS_ENABLED="1",
+        FEEDLING_V2_TOOL_BATCH_RESULT_CHAR_CAP="1000",
+    )
+    assert proc.returncode != 0
+    assert "TOOL_BATCH_RESULT_CHAR_CAP" in proc.stderr
+
+
+def test_disabled_history_skips_the_atomic_cap_validation():
+    """校验入口本身可以按"这次要验哪些 atomic 生产者"收窄。"""
+    result_budget.validate_result_caps(batch_cap=1000, tool_names=())
+    with pytest.raises(RuntimeError):
+        result_budget.validate_result_caps(
+            batch_cap=1000, tool_names=result_budget.ATOMIC_TOOL_NAMES)
+
+
+def test_turning_history_on_inside_a_running_process_revalidates_the_caps(
+        monkeypatch):
+    """闭合另一条路：关着启动、之后被打开。
+
+    ``cap_history.enabled()`` 是**调用时**读 env 的，所以「关着启动」的进程里
+    import 期那道校验已经跳过了。开启这一侧必须自己再验一次，验不过就当没开
+    （fail-closed），否则模型会收到一个注定被切成半截 JSON 的结果。
+    """
+    monkeypatch.setenv(cap_history.ENABLED_ENV, "1")
+    assert worker._history_tools_enabled_for_turn() is True
+
+    monkeypatch.setenv(result_budget.HISTORY_FETCH_RESULT_MAX_CHARS_ENV, "999999")
+    assert worker._history_tools_enabled_for_turn() is False
+
+    # 开关本身关掉时同样是 False，且**不会**因为坏配置抛异常打断整个回合
+    monkeypatch.setenv(cap_history.ENABLED_ENV, "0")
+    assert worker._history_tools_enabled_for_turn() is False
+
+
+def test_offer_and_dispatch_gates_read_the_revalidated_switch():
+    """offer/dispatch 单点解析必须走那个联合判定，不是裸 cap_history.enabled()。"""
+    source = inspect.getsource(worker.process_job)
+    assert "_history_tools_enabled_for_turn()" in source
+    assert "history_tools_allowed=history_tools_offered" in source
+
+
 def test_executor_replaces_an_over_cap_atomic_result_instead_of_slicing_it():
     """atomic 路径绝不走通用切串闸：策略违约整体换成合法的错误结果。"""
     oversized = {"ok": True, "data": {"anchor": {"content": "x" * 9000}}}
@@ -1060,6 +1127,23 @@ def test_history_errors_that_never_reached_the_scan_settle_at_zero():
     ):
         result = ToolResult(call_id="h", content=content)
         assert worker._history_rows_charged(result, lease) == 0, content
+
+
+def test_cursor_overflow_after_a_real_scan_is_charged_its_whole_lease():
+    """``cursor_overflow`` 不是入参校验错误，是**扫完之后**编码 cursor 才失败。
+
+    见 test_v2_history_readside 的时序回归：enclave 已经解过行，
+    ``encode_cursor`` 才因长度兜底抛出。把它当 pre-scan 豁免（结算 0 行）等于
+    给了一条绕过回合累计预算的路——同一个超长 user_id 可以反复触发。
+    """
+    assert "cursor_overflow" not in cap_history.PRE_SCAN_ERROR_CODES
+    budget = worker._HistoryTurnBudget(max_rows=1500, max_wall_sec=8)
+    lease = budget.reserve_call()
+    overflowed = ToolResult(call_id="h1", content="error: cursor_overflow")
+    assert worker._history_rows_charged(overflowed, lease) == 1500
+    budget.settle_call(
+        lease, scanned_rows=worker._history_rows_charged(overflowed, lease))
+    assert budget.exhausted()
 
 
 def test_history_trusted_metadata_still_settles_the_actual_rows():

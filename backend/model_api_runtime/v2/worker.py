@@ -471,7 +471,21 @@ if (
 # water-fill and are never string-sliced, so their per-tool caps and this
 # batch cap have to be consistent with each other. Checked here, once, against
 # the deployment's real numbers — see capabilities/result_budget.py.
-cap_result_budget.validate_result_caps(batch_cap=TOOL_BATCH_RESULT_CHAR_CAP)
+#
+# Only while history is actually on. The kill switch has to restore the exact
+# pre-history startup contract, and a batch cap that was legal before the
+# history tools existed (it only had to clear MAX_TOOL_CALLS_PER_ROUND ×
+# MIN_TOOL_RESULT_ERROR_QUOTA) must not keep the worker from booting once the
+# feature is switched off — otherwise the valve cannot roll anything back.
+# The switch is read at call time, so a process that boots with history off and
+# is turned on later re-runs this check there; see
+# ``_history_tools_enabled_for_turn``.
+cap_result_budget.validate_result_caps(
+    batch_cap=TOOL_BATCH_RESULT_CHAR_CAP,
+    tool_names=(
+        cap_result_budget.ATOMIC_TOOL_NAMES if cap_history.enabled() else ()
+    ),
+)
 # This is a true wall deadline around the whole async MCP call, including time
 # waiting for the per-round read gate. Unlike synchronous platform capabilities,
 # MCP's httpx coroutine is cancellable and therefore safe to wrap in wait_for.
@@ -1503,6 +1517,30 @@ class _HistoryTurnBudget:
         elapsed = max(0.0, float(self.clock()) - float(lease.started_at))
         self.used_sec += elapsed
         self.used_rows += max(0, int(scanned_rows))
+
+
+def _history_tools_enabled_for_turn() -> bool:
+    """History 这一轮到底开不开：kill switch + atomic cap 配置的联合判定。
+
+    两件事必须放在一起，因为**开关是调用时读 env 的**：一个「关着启动」的进程
+    里，import 期那道 atomic cap 校验被跳过了（关掉的功能不该拦住启动，见那里
+    的注释）；如果之后有人把开关打开，就会绕过校验，模型收到的 history 结果会
+    在下游被切成半截 JSON。所以开启这一侧自己再验一次。
+
+    验不过就**当作没开**（fail-closed），而不是抛异常：坏配置只该让这两个工具
+    消失，不该打断整个聊天回合。
+    """
+    if not cap_history.enabled():
+        return False
+    try:
+        cap_result_budget.validate_result_caps(
+            batch_cap=TOOL_BATCH_RESULT_CHAR_CAP,
+            tool_names=cap_result_budget.ATOMIC_TOOL_NAMES,
+        )
+    except RuntimeError as exc:
+        log.error("[v2.history] tools withheld — result cap config: %s", exc)
+        return False
+    return True
 
 
 # executor 自己产生的、带自由文本尾巴的三种拒绝（全部在 capability 之前）。
@@ -11043,7 +11081,9 @@ async def process_job(
         # History kill switch, offer-time half (spec §6). Resolved ONCE per
         # turn so the offer gate and the dispatch gate below cannot disagree
         # mid-turn; default ON — this is a rollback valve, not a feature gate.
-        history_tools_offered = cap_history.enabled()
+        # Includes the atomic-cap re-check for the "booted off, switched on
+        # later" path that import-time validation cannot cover.
+        history_tools_offered = _history_tools_enabled_for_turn()
         disabled_history_tool_names = (
             frozenset()
             if history_tools_offered
