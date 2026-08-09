@@ -23,6 +23,7 @@ from memory import card_guard, dream_gates
 from memory.card_text import (
     build_format_retry_prompt,
     card_text_rejection,
+    extract_json_block,
     format_error,
     sanitize_card_labels,
 )
@@ -125,26 +126,6 @@ def build_dream_prompt(
     )
 
 
-def _extract_json_block(raw: str) -> str:
-    text = (raw or "").strip()
-    if text.startswith("```"):
-        text = text.split("```", 2)[1] if text.count("```") >= 2 else text.strip("`")
-        if text.lstrip().lower().startswith("json"):
-            text = text.lstrip()[4:]
-    start = text.find("{")
-    if start < 0:
-        return ""
-    depth = 0
-    for i in range(start, len(text)):
-        if text[i] == "{":
-            depth += 1
-        elif text[i] == "}":
-            depth -= 1
-            if depth == 0:
-                return text[start : i + 1]
-    return ""
-
-
 def _clamp01(value) -> float:
     try:
         f = float(value)
@@ -182,7 +163,7 @@ def parse_dream_consolidations(
     「明显不对」,绝不判内容质量)拆掉了语义审查员和 15% 增量栅栏;本闸与
     card_text 的墓碑短语闸是替代 —— 确定性、跑在出口、对模型不可见。
     """
-    block = _extract_json_block(raw)
+    block = extract_json_block(raw)
     if not block:
         return [], [], "no_json_object"
     try:

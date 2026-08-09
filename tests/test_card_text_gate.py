@@ -23,6 +23,7 @@ from memory.card_text import (  # noqa: E402
     card_text_rejection,
     format_error,
     is_card_format_error,
+    is_retryable_parse_error,
     placeholder_reason,
     sanitize_card_labels,
     substantive_len,
@@ -143,6 +144,11 @@ def test_format_error_and_predicate():
     # 这些各有自己的失败路径,重问同一段 prompt 没有意义
     for other in (None, "", "no_json_object", "empty_reply", "provider_call_failed:TimeoutError"):
         assert not is_card_format_error(other)
+
+    assert is_retryable_parse_error(err)
+    assert is_retryable_parse_error("json_decode_error:JSONDecodeError")
+    assert not is_card_format_error("json_decode_error:JSONDecodeError")
+    assert not is_retryable_parse_error("no_json_object")
 
 
 # --- 现场两张卡的回归 --------------------------------------------------------
