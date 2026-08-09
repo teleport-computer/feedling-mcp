@@ -35,6 +35,17 @@
    **(b) 别停在自问——真去改坏一次（变异验证）**：把刚写的修复逐处改回旧行为，
    跑一遍，看**对应那条**用例是否精确变红。这批最后一轮就是这么确认测试会咬人的
    （两处修复各自点亮各自的用例）。成本一分钟，换掉"我觉得这测试有效"这句感觉。
+   ⚠️ **变异要用备份文件还原，绝不能用 `git checkout -- <file>`**：那条命令回到的是
+   HEAD，会把**你自己那次还没提交的修复一起抹掉**。2026-08-09 我连着栽两次——变异
+   "还原"之后测试确实绿了，绿的却是**没有修复的原始代码**；等下一次变异 replace
+   匹配不上才发现修复早没了。正确姿势：`cp <file> /tmp/x.bak` → 改坏 → 跑 → `cp` 回来
+   （回来后再跑一次确认全绿，别默认还原成功）。
+   **(b') 复现用例本身也要证明它是"因为 bug 而红"**：红灯和绿灯一样会骗人。
+   2026-08-09 写记忆解析的复现时，我的卡片夹具漏了 `action` 字段，那张卡**无论有没有
+   这个 bug 都会被丢掉**——测试确实红，但红的原因跟被查的缺陷毫无关系，差点拿它去
+   验收。判据：**同一条用例在"不触发缺陷的输入"上必须是绿的**（我最后是让"思维链里
+   不含大括号"和"JSON 前有散文"两条护栏先绿，才敢信那两条红）。
+   §6 那条"先确认你的用例真能让它复现"管的是修完之后，这条管的是写用例的当下。
    **(c) 的"前一步"要一直追到我们代码的入口**，不是追到某个看起来够早的函数：
    这批同一个洞连修三次都没到底——先以为在 `call_agent` 判空够早（helper 返回前
    就抛了），再提到"压制之前"（`_agent_turn_from_raw` 内部还有 sanitizer），
@@ -66,7 +77,7 @@
 |---|---|:--:|:--:|:--:|---|
 | **A. 纯后端逻辑** | `service/` `core/` `actions/` | ✅ | — | — | pyflakes；对应 `test_<域>_*.py` 补/更新 |
 | **B. 新增/改路由** | `*/routes_asgi.py` | ✅ | — | ⚠️ 视情况 | PR 描述**列出路由变更**（url_map 是回归基线）；补 `test_asgi_<域>.py` |
-| **C. 错误返回 / slug** | 任何返回 `{"error":...}` 的地方 | ✅ | — | — | **同 PR 登记 `docs/API_ERRORS.md`**（有守卫测试）；slug 冻结、语义变更走新 slug |
+| **C. 错误返回 / slug** | 任何返回 `{"error":...}` 的地方 | ✅ | — | — | **同 PR 登记 `docs/API_ERRORS.md`**（有守卫测试）；slug 冻结、语义变更走新 slug。**别把「长得像」的失败合并成同一个码**——区分度就是下次事故的分诊能力：`no_json_object`（压根没拿到平衡的 JSON 对象:截断/纯散文）与 `json_decode_error`（拿到了平衡对象但它非法 ⇒ **我们抓错了 span**）看着都是"解析失败",但它们指向完全不同的真因;2026-08-09 正是靠这个区分,一眼把「模型输出被截断」排除、锁定「提取器扫进了思维链」。**新增/合并错误码时自问:如果只看 admin 上这个码,我还能不能分辨真因?** 合并前先补一条测试把两个码各自钉住(样板 `tests/test_memory_parse_thinking_leak.py`) |
 | **D. 加密 / 信封 / 账号链路** | `content_encryption.py` `model_api` setup·send、`enclave_app.py`、`/v1/envelope/*` | ✅ | ✅ **必跑** | ⚠️ 建议 | `tools/e2e_encryption_test.py` / `v1_envelope_roundtrip_test.py`；确认"服务端永不见明文" |
 | **E. Provider / driver（含思维链）** | `agent_runtime/spawners.py` `provider_client.py` | ✅（`test_hosted_agent_runtime_driver.py` 等） | ✅ 各 provider | ✅ **必跑** | 部署 CVM 后读 trace：`thinking_present` / `reasoning_output_tokens` / `AGENT_CLI_CMD`；**按模型家族分层验**（Anthropic/OpenAI/Gemini/中转 wire 各不同） |
 | **F. 消费端 consumer / proactive** | `tools/chat_resident_consumer.py` `backend/proactive/*` | ✅（sanitize 等单元断言） | — | ✅ **必跑** | **改完必 `systemctl --user restart feedling-chat-resident`**（否则跑旧内存态）；发消息验不泄漏协议碎片；**并发写自查**（"两个同时到会怎样？"）+ 确定性并发测试（Event gate 模式，禁 sleep 碰运气，样板 `test_debug_trace.py::test_flush_pending_waits_for_worker_in_flight_batch`）；**开关独立性矩阵**（Seven 2026-07-26 定：心跳/照片/到达/解锁/定时/屏幕共享**相互无连带**）——动了 `proactive/controls_v2.py::evaluate_wake_control_v2` 或任一唤醒源，必须逐个关单个开关、断言**只有它那条路被拦、其余全通**（实测 44 活跃用户里 6 个是"心跳关+屏幕共享开"，任何连带都会当场砍掉他们的功能）；consumer 耦合测试集一次跑齐：`grep -l -E 'chat_resident_consumer' tests/test_*.py`（34 个文件，基线 1100 passed / 1 skipped）；**动了定时唤醒（`scheduled_wake_v2` / `schedule_wake` 工具面）必跑 `NO_PROXY='*' python3 -m tools.e2e.repeat_wake_probe`** —— 重复提醒的验收标准是「明天真的响、说停真的停」，那句话跨调度器+存储+上下文注入三层，单测证明不了；探针四格里最要紧的是**用已 fired 的旧 id 能整串取消**（否则用户关不掉一个每天响的提醒） |
@@ -75,6 +86,7 @@
 | **F4. 卡里怎么称呼本人（称谓 / 转写标签）** | `backend/identity/user_naming.py`、三条写入路各自的 prompt（capture / dream / `hosted/history_import.py`）、V1 consumer 与 V2 worker 的转写标签 | ✅（`test_card_user_referent.py`：三条路都带规则 + 转写标签绝不写 "User"） | — | ✅ **必跑** | **改规则必须三条路一起改**（蒸馏 / 落卡 / 做梦），只改一条 = 另两条继续泄漏；**根因通常在转写标签不在 prompt**（V2 曾漏传 `user_name`，把本人标成 `user:`，模型照抄进卡）。live 验：`/v1/history_import/upload`（托管蒸馏，**必传 `relationship_started_at` 或 `fresh_start=true`**，否则 job 直接 failed）用**不设名字**的账号跑——有名字时泄漏率本来就 0，测不出东西；素材里要混真产品词（「用户留存」）确认**没被误杀**。**确定性改写器不可上写入路**（`rewrite_user_reference`：锚点是开集，产品散文近 100% 被改坏，2026-07-26 已撤，`test_deterministic_rewriter_is_not_wired_into_the_daily_card_path` 锁死）。⚠️ 已知缺口：V2 的 dream 没有 force 旁路（夜间窗+新卡数+最小间隔三闸），做梦这条路目前**只有单测、无 live 覆盖** |
 | **F5. CLI driver 会话 / argv 准备** | `tools/chat_resident_consumer.py` 的 `_prepare_cli_command` / `call_agent_cli`、`--resume`/`--session-id`/`isolated_session` 相关 | ✅（驱动矩阵） | — | ⚠️ 真实二进制 smoke | **测试必须断言「交给驱动的最终 argv」（产物），不能只断言意图 flag**——2026-08-05 前 isolated_session 的两个测试都 mock 掉 call_agent、只断言 `isolated_session=True` 传到了，于是一条根本跑不起来的 claude 命令绿着上线六天（claude 的 `--print --resume` 只认它**自己生成的 UUID** / 已存在 session title，consumer 自造的 bounded 标签首轮必炸；vision probe 与 dream 语义 review 在 claude-driver 家庭因此**全部静默失败**，探针 verdict 被 CLI 错误污染成 `vision_model_failed`）。四个驱动的会话语义各不相同，改会话逻辑必须逐驱动过矩阵：**claude** 最严（session id 只认自产 UUID；隔离 = **不给任何会话旗标**，裸 `claude --print` 即全新会话）、**pi** `--session-id` 是 create-if-missing、收任意串、**hermes** `--resume` 收任意串、**codex** 无 resume 天然每轮全新。验收两件套：①单测钉 argv（样板 `test_prepare_claude_cli_isolated_session_*`，含「隔离轮不得读写共享会话存储」的反断言）；②对**真实 claude 二进制**先跑**负向对照**（手工构造修复前的失败形状、确认报错逐字复现——证明 E2E 踩的是真路径，不是假绿），再跑正向 smoke：隔离首轮成功 + 共享 `--resume` 跨轮召回 + 隔离轮看不到聊天上下文 + 共享 sid 不被搅动（修复参照 1965546c）。**驱动语义有分歧时优先拿 claude 做负向对照**——它反复是最特殊的那个（另见 F 行 claude 工具面泄漏） |
 | **F6. 喂给模型的文本是子进程产物(io_cli 目录等)** | `tools/io_cli.py` 任何 `help=`/`epilog=`、`tools/io_cli_catalog.py` | ✅（`test_io_cli_catalog.py`，含 GBK locale 用例） | — | ⚠️ 自建用户环境 | **帮助文本里的一个字符能让整份工具目录静默消失**：`build_catalog` 是逐 verb 跑 `--help` 的子进程，`text=True` 两侧都用**系统 locale** 编码。中文 Windows 是 cp936(GBK)，help 里出现一个 GBK 装不下的字符（2026-08-08 自建用户报的 `identity-redistill` 里的 ⚠️ U+26A0）→ 子进程 UnicodeEncodeError → `build_catalog` 返回 None → consumer 回退到只剩 D3 一行的 fallback，**agent 每一轮都丢掉整个 4KB 工具目录**（失败路径**故意不缓存**，所以每轮重试、每轮再失败），全程无日志、无报错，用户只看到「AI 好像不会用工具了」。三条纪律：①**符号一律用 ASCII**（`[!]` 不要 `⚠️`）——中文散文没问题，GBK 覆盖得了，坏的是 emoji/特殊符号；②**跨进程读文本必须钉死编码**（子进程 `PYTHONIOENCODING=utf-8` + 父进程 `encoding='utf-8', errors='replace'`），别依赖 locale；③**回归用例要模拟目标 locale 真跑一遍构建**，并做负向对照证明它在修复前会红（`test_catalog_survives_a_gbk_locale`）。同族问句：**这段文本最终会被谁、在什么编码下读一遍？** |
+| **F7. 会话级指令 / 后台 lane 共用聊天会话** | 前台 dispatch 里任何**常驻**指令注入（`core/self_thinking.INSTRUCTION` 这类）、以及所有不带 `isolated_session` 的 `call_agent` 后台调用（capture / dream / migrate / identity 蒸馏 / 探针） | ✅ | — | ✅ **必跑** | **「我只注入在前台」不等于「后台不受影响」——真正决定作用域的是会话,不是 prompt。** 前台注入的常驻指令(自研思维链那条写着「⛔ 绝对输出规则:最终回复第一个字符必须是 `<think>`」)会留在**续接会话**里,而后台 lane 用的是**同一个会话**,于是模型在 capture 轮照样照办。**两次事故同一形状**:①2026-08-05 identity-redistill 在聊天会话里蒸馏 → schema 漂移 + 第二次被模型当「重复请求」拒答;②2026-08-09 capture/dream → 回复带 `<think>`,而记忆解析器从第一个 `{` 扫平衡括号,**capture 的 prompt 恰恰要求输出 JSON,模型思维链里天然全是大括号** → 抓到「平衡但非法」的片段 → `json_decode_error`,全 prod 56 次/11 用户,capture 失败头号原因。**纪律**:①加任何**常驻**指令时,列出「哪些 lane 共用这个会话」,别只看注入点——注释写「background lanes are never asked to emit X」而实际会被要求,正是第二次事故的原文;②修好一个 lane 后**必须横向扫一遍**同族(`grep -n "isolated_session" tools/chat_resident_consumer.py` 看谁**没有**带),第一次只修 identity 没横扫,capture 就是漏网的;③**解析层要自己扛得住**,不能只靠「我们不注入」——受影响用户里有 `-thinking` 中转,我们一个字不注入它照样内联推理,所以剥离必须做在解析入口(`card_text.extract_json_block`),且 strip 失败时**回退原文**(否则把今天能解析的搞挂)。验收:全栈探针 `tools/e2e/memory_thinking_leak_probe.py`,断言**用户能看见的东西**(花园里到底多没多出那张卡),不是只断言字符串解析成功 |
 | **G. DB schema / migration** | 建表 / 改列 / reset 路径 | ✅（`test_*_migration.py` `test_account_reset_purges_all_tables.py`） | — | ⚠️ | prod 用户极少，clean reinstall 迁移可接受（**须任务明确授权**）；reset 必须 CASCADE 清干净 |
 | **H. compose / enclave / 链上不变量** | `deploy/docker-compose*.yaml` `enclave_app.py` compose 段 | ✅ | ✅（envelope roundtrip） | — | **compose 任何字面量变更 → `compose_hash` 变 → 重新上链**（`deploy/DEPLOYMENTS.md`） |
 | **I. CVM runner 镜像 / 部署** | `deploy/Dockerfile.agent-runner` bump | — | — | ✅ **必跑** | `phala inspect` 确认 image tag == 目标 hash；`deploy/verify-remote.sh`；litellm 版本没变=桥行为没变 |
@@ -177,6 +189,18 @@
 - **判"环境挂了"前先验域名存在性**（`dig @1.1.1.1 <域名>`）：本机 VPN 的 fake-IP（198.18.x）会把 **NXDOMAIN 域名也"接住"**——TCP 能连、TLS 握手被掐，形状和"ingress 半死"一模一样。2026-08-01 排查 test"宕机"烧了半小时才发现 `api.feedling.dev` 压根不存在（正典是 `test-api.feedling.app`）。同时**恢复验证必须打正典公网域名**——拿网关内侧/旧域名验"已恢复"会误报（codex3 同日踩过）。
 - **连续 push test = 连环整 CVM 重部署窗**：每次 push 触发全量 phala 重部署，公网断数分钟（TCP 通 / TLS 断 / `phala ps` 空 = **部署切换态的正常表现**，不是崩溃）；多人接连 push 会把窗叠成"持续宕机"假象。定性前先对 CI deploy run 时间线；**部署窗内绝不手动重启容器**（会和部署控制器打架，把可恢复状态搞成真事故）。跑 e2e 前确认没人在连环 push。
 - **e2e 断言别写死单一状态码**（register 是 201 不是 200，写 `st == 200` 白炸一轮还留孤儿号）；孤儿号凭证**先落盘再断言**，任何一步炸了都能凭 creds 文件善后。test 环境 e2e 全配方(域名/信封大写 `K_user`/vision 路由须先 warmup 让 runner 注册能力头)见 `tools/e2e` 与 Router entry msa53tbe。
+- **共享工作树里随时可能躺着别人未提交的活**：切分支/合并前先 `git status`——2026-08-09
+  合并时发现 `tools/chat_resident_consumer.py` 有并行会话 +12 行未提交(空回复归因那批),
+  `git checkout` 会直接报错或覆盖掉。**正确做法是开一个独立 worktree 去合并/推送**
+  (`git worktree add /tmp/x <branch>`),共享树原样不动;**别用 `git stash`**——那会把
+  别人的活从他眼前挪走,他不知道。同族前案见 §2-S(合并吃掉对向修复)与 worktree 纪律。
+- **用户可见的动作,"点了没反应"和"点了报错"是两种事故,后者才是可修的**：iOS 的重试
+  按钮开头是 `guard let staged = stagedID else { return }` ——静默 return,不报错、不提示、
+  不留日志,用户按到天荒地老屏幕上什么都不变(2026-08-09 usr_3b73 的形状)。验收任何
+  用户动作时,**必须有一条用例断言「按下之后有可见变化」**,哪怕那个变化是一句错误文案。
+  配套:**该动作必须有埋点**——修之前重试完全没埋点,于是「用户到底点没点过重试」这个
+  问题**从数据上无法回答**,我据此下过一个不可证伪的论断(说他从没重试过)。没有埋点的
+  用户动作,事后你只能猜。
 
 ---
 
@@ -200,8 +224,15 @@
 [ ] 新增"没有就拒"的必填/门禁：客户端能传（有证据）+ 存量行有出路 + 拒绝分支可观测
 [ ] 在平行运行时里重写了老 lane：老 lane 的事故守卫逐条核对，parity 矩阵已登记
 [ ] 动了工具 schema / 工具调用指令：弱模型档 + 多轮真实上下文验过，判据是 effects/trace 不是模型的话
+[ ] 修的是"某一处"的缺陷：**已横向扫过同族还有谁在裸奔**，结论写进 PR/交接（哪怕结论是"只有这一处"）
 [ ] asgi_app.py diff 仅装配/注入（理想零 diff）；无向上 import；无 app.py facade 引用
 ```
+
+> **为什么单列"横向扫同族"**：2026-08-05 修好 identity-redistill 的共享会话渗漏后没有
+> 横扫，四天后同一个病在 capture/dream 上以 `json_decode_error` 的形状炸出来，影响 11 个
+> 用户。修复一处的成本里，本来就该含一句 `grep`。同族问句：**这个判据/这段代码还有几份
+> 拷贝？还有谁走同一条会话 / 同一个共享函数 / 同一份白名单？**（另见 §2-N 同一口径两套
+> 实现、§2-F7 会话渗漏、§2-V 白名单要 grep 写入端）
 
 ---
 
