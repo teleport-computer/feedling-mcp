@@ -233,3 +233,26 @@ def test_memory_write_reason_and_relative_wake_are_described_and_valid():
         }]},
     ) is None
     assert "in 2 hours" in specs["schedule_wake"].description
+
+
+def test_memory_search_shares_the_index_filters_it_already_consumes():
+    """memory_search 和 memory_index 共用 memory_index_core,那个 core 一直在消费
+    bucket / thread / include_sensitive —— index 的 schema 开了,search 漏了。
+
+    后果:搜索不能限定在某个桶或某条线索里,只能拿回宽泛结果自己挑。
+    V1 的 `memory-index --query` 本来可以组合这些条件,V2 拆成 search 之后丢了。
+
+    ambient 刻意不开:search 强制带 query,走 exact-query 分支,ambient_top_n
+    不参与候选限制(Codex 2026-08-10 核实),开了也是个哑参数。
+    """
+    spec = next(
+        item for item in tool_schema.build_tool_specs() if item.name == "memory_search"
+    )
+
+    assert set(spec.parameters["properties"]) == {
+        "query", "limit", "bucket", "thread", "include_sensitive"
+    }
+    assert tool_schema.validate_tool_args(
+        "memory_search",
+        {"query": "骑行", "bucket": "爱好", "thread": "自行车", "include_sensitive": True},
+    ) is None

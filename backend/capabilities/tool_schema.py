@@ -111,9 +111,20 @@ PARAMS: dict[str, dict] = {
     },
     # memory.search(store, ...): params.get("query") (required, non-empty) + optional
     # limit (passed through like index).
+    # memory.search 和 memory.index 走同一个 memory_index_core，那个 core 一直在
+    # 消费 bucket / thread / include_sensitive；index 的 schema 开了这几个、search
+    # 漏了，于是搜索没法限定在某个桶或线索里。V1 的 `memory-index --query` 本来
+    # 能组合这些条件。ambient 刻意不开：search 强制带 query，走 exact-query 分支，
+    # ambient_top_n 不参与候选限制，开了也是哑参数。
     "memory_search": {
         "type": "object",
-        "properties": {"query": _STR, "limit": _INT},
+        "properties": {
+            "query": _STR,
+            "limit": _INT,
+            "bucket": _STR,
+            "thread": _STR,
+            "include_sensitive": _BOOL,
+        },
         "required": ["query"],
     },
     # -- history.py (backed by model_api_runtime/v2/history_readside.py) --
