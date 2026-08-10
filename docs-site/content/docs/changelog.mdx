@@ -10,16 +10,30 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **Account deletion now removes Runtime V2 rollout controls.** Account reset,
+  administrator deletion, and application-managed registry removals clear the
+  deleted user's Runtime V2 allowlist record regardless of whether it came from
+  automatic new-user routing or an administrator pin. Other users and resident
+  routing behavior are unchanged.
+
 - **Foreground Chat now stays grounded in an active screen share.** When the
   newest encrypted screen frame is no more than 90 seconds old, each foreground
   turn can attach up to six uniformly sampled frames that arrived after the
-  previous Chat attachment. Raw pixels are sent only when the active model route
-  passed the real image control probe; otherwise the model receives only an
-  availability marker and may use an authorized screen read. Screen frames are
+  previous Chat attachment. Hosted Runtime V2 sends raw pixels unless the active
+  model route is explicitly known to be image-unsupported; an untested or
+  missing probe is no longer treated as evidence that the model is text-only.
+  The official resident path retains its setup-probe requirement. Screen frames are
   explicitly untrusted application data, and any turn that receives pixels has
   outbound web, MCP, and child-task access fenced from its first model call. If
   the provider rejects those frames, Chat retries once without them and records
   that route as image-unsupported instead of failing the user's text turn.
+  Runtime operations now also report screen-watch turns, turns that produced a
+  visible reply, their speaking rate, frames pushed, and input tokens by lane.
+
+- **Runtime V2 wake turns can persist memories with their server-frozen event
+  time.** The encrypted-effect validator now accepts the current memory payload,
+  including optional bucket, thread, importance, and pulse metadata, instead of
+  rejecting it as a legacy shape immediately before the memory sink.
 
 - **New Model API users can enter Runtime V2 through a cutoff-based default.**
   Only newly registered accounts with a successfully tested and active Model API

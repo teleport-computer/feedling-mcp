@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import sys
 import threading
@@ -10,7 +11,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
-from model_api_runtime.v2 import serve_worker  # noqa: E402
+import provider_client  # noqa: E402
+from model_api_runtime.v2 import screen_chat, serve_worker, tool_loop, worker  # noqa: E402
 from screen.screen_read_core import ScreenResult  # noqa: E402
 
 
@@ -122,3 +124,127 @@ def test_screen_frame_batch_is_bounded_to_six(monkeypatch):
     assert set(batch["frames"]) == set(seen)
     assert batch["cache_hits"] == 0
     assert batch["cache_misses"] == 6
+
+
+def test_screen_pixel_gate_blocks_only_explicit_unsupported():
+    assert worker._screen_vision_allows_pixels(
+        {"vision_test_status": "ok"}
+    )
+    assert worker._screen_vision_allows_pixels(
+        {"vision_test_status": "untested"}
+    )
+    assert worker._screen_vision_allows_pixels(
+        {"vision_test_status": "failed"}
+    )
+    assert worker._screen_vision_allows_pixels(None)
+    assert worker._screen_vision_allows_pixels({})
+    assert not worker._screen_vision_allows_pixels(
+        {"vision_test_status": "unsupported"}
+    )
+
+
+def test_untested_rejection_learns_unsupported_and_closes_next_turn(
+    monkeypatch,
+):
+    verdict = {
+        "id": "route-1",
+        "vision_test_status": "untested",
+        "updated_at": "2026-08-10T12:00:00Z",
+    }
+    marks = []
+
+    def _mark(user_id, route_id, **kwargs):
+        marks.append((user_id, route_id, kwargs))
+        verdict["vision_test_status"] = kwargs["status"]
+        return True
+
+    monkeypatch.setattr(
+        worker.db, "model_api_route_mark_vision_test", _mark
+    )
+
+    responses = [
+        provider_client.ProviderError("images rejected", status_code=415),
+        {"reply": "text fallback", "tool_calls": [], "usage": {}},
+        {"reply": "next turn", "tool_calls": [], "usage": {}},
+    ]
+    calls = []
+
+    async def _provider(config, messages, *, tools=None, **kwargs):
+        calls.append(list(messages))
+        item = responses.pop(0)
+        if isinstance(item, BaseException):
+            raise item
+        return item
+
+    monkeypatch.setattr(provider_client, "chat_completion_async", _provider)
+    tagged = {
+        "role": "user",
+        "content": [{
+            "type": "image_url",
+            "image_url": {"url": "data:image/jpeg;base64,AAAA"},
+        }],
+        screen_chat.MESSAGE_TAG: True,
+    }
+    plain = {"role": "user", "content": "hello"}
+
+    async def _dispatch(_calls):
+        return []
+
+    async def _reply(_text, *, final, **_kwargs):
+        return None
+
+    async def _fold():
+        return []
+
+    async def _learn(_exc):
+        await asyncio.to_thread(
+            worker._mark_screen_route_vision_unsupported,
+            "u1",
+            dict(verdict),
+        )
+
+    config = provider_client.ProviderConfig(
+        provider="anthropic", model="vision-test", api_key="test"
+    )
+    assert worker._screen_vision_allows_pixels(verdict)
+    asyncio.run(tool_loop.run_tool_loop(
+        provider_config=config,
+        build_messages=lambda _transcript: [tagged, plain],
+        dispatch_tools=_dispatch,
+        on_reply=_reply,
+        fold_new_messages=_fold,
+        add_usage=lambda _usage: None,
+        max_calls=2,
+        tagged_image_message_key=screen_chat.MESSAGE_TAG,
+        on_tagged_images_rejected=_learn,
+    ))
+
+    assert verdict["vision_test_status"] == "unsupported"
+    assert marks == [(
+        "u1",
+        "route-1",
+        {
+            "status": "unsupported",
+            "error": "vision_model_incompatible",
+            "expected_updated_at": "2026-08-10T12:00:00Z",
+        },
+    )]
+    assert tagged in calls[0]
+    assert tagged not in calls[1]
+
+    # The next foreground turn observes the learned verdict and never attaches
+    # the screen block, so the provider receives only one text request.
+    next_messages = [tagged, plain] if worker._screen_vision_allows_pixels(verdict) else [plain]
+    asyncio.run(tool_loop.run_tool_loop(
+        provider_config=config,
+        build_messages=lambda _transcript: next_messages,
+        dispatch_tools=_dispatch,
+        on_reply=_reply,
+        fold_new_messages=_fold,
+        add_usage=lambda _usage: None,
+        max_calls=1,
+        tagged_image_message_key=screen_chat.MESSAGE_TAG,
+        on_tagged_images_rejected=_learn,
+    ))
+    assert len(calls) == 3
+    assert tagged not in calls[2]

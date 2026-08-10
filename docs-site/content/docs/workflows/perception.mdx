@@ -192,10 +192,12 @@ In a foreground conversation, ordinary current perception readings are not
 inserted into the initial model prompt. The agent uses perception tools when a
 question depends on current device, environment, activity, health, calendar,
 reminder, or photo data. Live screen sharing is the narrow exception: when its
-newest encrypted frame is at most 90 seconds old and the active model route has
-passed the randomized image-control probe, foreground Chat may attach up to six
-new frames. Without that `ok` verdict, Chat exposes only that sharing is active
-and leaves exact screen data behind the authorized screen-read path.
+newest encrypted frame is at most 90 seconds old, foreground Chat may attach up
+to six new frames. Hosted Runtime V2 admits an untested or missing route verdict
+optimistically and blocks only an explicit image-unsupported verdict; a
+confirmed provider rejection is learned after a successful text-only retry and
+prevents pixel attachment on later turns. The official resident path admits
+pixels only after its propagated setup probe reports `ok`.
 
 During an ordinary proactive heartbeat, the runtime may provide a low-resolution
 glance made only of availability and change booleans. Exact readings and private text

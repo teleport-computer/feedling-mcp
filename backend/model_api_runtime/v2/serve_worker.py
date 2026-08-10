@@ -4111,19 +4111,36 @@ def _validate_decrypted_tool_effect(effect_type: str, payload: dict) -> None:
             memory = action.get("memory")
             if not isinstance(memory, dict):
                 raise RuntimeError("invalid encrypted memory payload")
-            if set(memory) == {"summary", "content", "bucket", "threads"}:
+            memory_fields = set(memory)
+            current_required = {"summary", "content", "occurred_at"}
+            current_allowed = current_required | {
+                "bucket", "threads", "importance", "pulse"
+            }
+            if current_required <= memory_fields <= current_allowed:
                 if (
                     not str(memory.get("summary") or "").strip()
                     or not str(memory.get("content") or "").strip()
+                    or not str(memory.get("occurred_at") or "").strip()
                 ):
                     raise RuntimeError("invalid encrypted memory content")
-                if not isinstance(memory.get("bucket"), str):
+                if "bucket" in memory and not isinstance(memory.get("bucket"), str):
                     raise RuntimeError("invalid encrypted memory bucket")
-                threads = memory.get("threads")
-                if not isinstance(threads, list) or not all(
-                    isinstance(thread, str) for thread in threads
-                ):
-                    raise RuntimeError("invalid encrypted memory threads")
+                if "threads" in memory:
+                    threads = memory.get("threads")
+                    if not isinstance(threads, list) or not all(
+                        isinstance(thread, str) for thread in threads
+                    ):
+                        raise RuntimeError("invalid encrypted memory threads")
+                for score in ("importance", "pulse"):
+                    if score not in memory:
+                        continue
+                    value = memory.get(score)
+                    if (
+                        isinstance(value, bool)
+                        or not isinstance(value, (int, float))
+                        or not math.isfinite(float(value))
+                    ):
+                        raise RuntimeError("invalid encrypted memory score")
             else:
                 # Deploy compatibility for encrypted_v1 rows produced before
                 # the model-facing op/summary/content vocabulary landed.
