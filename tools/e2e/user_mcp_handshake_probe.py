@@ -137,7 +137,13 @@ def observation_complete(events: list[dict], runtime: str) -> bool:
     classifying a run whose runtime we never confirmed.
     """
     types = {str(e.get("type") or "") for e in events}
-    return terminal_event_type(runtime) in types and "agent.model.call.done" in types
+    if terminal_event_type(runtime) not in types:
+        return False
+    # V2 emits no `agent.model.call.done` at all — its runtime receipt rides on
+    # the surface event's own `driver` field. Requiring the V1 receipt here made
+    # every V2 run wait out the timeout and then report "no observation", which
+    # is the third time this probe demanded a V1-only signal on the V2 path.
+    return runtime != "resident" or "agent.model.call.done" in types
 
 
 def classify(events: list[dict], *, runtime: str, expect: str,
@@ -156,8 +162,12 @@ def classify(events: list[dict], *, runtime: str, expect: str,
     seen = {str(e.get("type") or ""): e for e in events}
     driver = ""
     for e in events:
-        if str(e.get("type") or "") == "agent.model.call.done":
-            driver = str((e.get("detail") or {}).get("driver") or "")
+        etype = str(e.get("type") or "")
+        # V1 reports the runtime on the CLI turn receipt; V2 has no such event
+        # and stamps `driver` into its surface trace instead. Read both, or the
+        # V2 path can never confirm what it measured.
+        if etype in ("agent.model.call.done", "mcp.surface.resolved"):
+            driver = str((e.get("detail") or {}).get("driver") or "") or driver
     kinds = sorted({str(e.get("type") or "") for e in events
                     if str(e.get("type") or "").startswith("mcp.")})
     out.append(f"observed driver={driver or '?'} events={kinds}")
