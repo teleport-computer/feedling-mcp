@@ -788,8 +788,8 @@ def _screen_share_grounding(user_id: str) -> dict:
        和 serve_worker 的屏幕监看生产者同一条路 —— 这个函数在**每个聊天回合**都跑,
        一次 enclave 往返会锤死共享解密代理的容量。
     ② **只回布尔与秒数**。frame_id / caption / 窗口标题一律不进这个可用性块。
-       视觉探针为 ok 时,调用方另走有界推帧路径,把像素标成不可信应用数据,并在
-       第一轮 provider 调用之前先建立出站执行栅栏。
+       只要当前路由没有明确的 unsupported 反证,调用方就另走有界推帧路径,把
+       像素标成不可信应用数据,并在第一轮 provider 调用之前先建立出站执行栅栏。
 
     共享没在进行(或读取失败)时返回 {},调用方据此整块省略 —— 不共享的用户
     prompt 一个字都不变,provider 侧的前缀缓存不受影响。
@@ -808,6 +808,36 @@ def _screen_share_grounding(user_id: str) -> dict:
     if age < 0 or age > _SCREEN_SHARE_LIVE_SEC:
         return {}
     return {"active": True, "latest_frame_age_sec": int(age)}
+
+
+def _screen_vision_allows_pixels(verdict: Any) -> bool:
+    """Optimistically admit pixels unless this route is known unsupported.
+
+    ``untested`` and a missing verdict are the normal first-turn state. The
+    provider fallback strips only our tagged screen block, retries the user's
+    text once, and persists ``unsupported`` after that retry succeeds, so lack
+    of a probe is not evidence that pixels must be silently withheld.
+    """
+    if not isinstance(verdict, dict):
+        return True
+    return str(verdict.get("vision_test_status") or "").strip().lower() != (
+        "unsupported"
+    )
+
+
+def _mark_screen_route_vision_unsupported(user_id: str, verdict: Any) -> bool:
+    """Persist a learned rejection behind the exact route-version fence."""
+    if not isinstance(verdict, dict) or not verdict.get("id"):
+        return False
+    return bool(
+        db.model_api_route_mark_vision_test(
+            user_id,
+            str(verdict["id"]),
+            status="unsupported",
+            error="vision_model_incompatible",
+            expected_updated_at=str(verdict.get("updated_at") or ""),
+        )
+    )
 
 
 def _read_blocks_later_outbound(tool_call) -> bool:
@@ -12431,8 +12461,7 @@ async def process_job(
             )
         if (
             screen_share_state
-            and isinstance(screen_vision_verdict, dict)
-            and screen_vision_verdict.get("vision_test_status") == "ok"
+            and _screen_vision_allows_pixels(screen_vision_verdict)
             and deps.read_screen_frames is not None
         ):
             try:
@@ -12491,16 +12520,10 @@ async def process_job(
                 )
 
         async def _on_screen_images_rejected(_exc: BaseException) -> None:
-            verdict = screen_vision_verdict
-            if not isinstance(verdict, dict) or not verdict.get("id"):
-                return
             await asyncio.to_thread(
-                db.model_api_route_mark_vision_test,
+                _mark_screen_route_vision_unsupported,
                 user_id,
-                str(verdict["id"]),
-                status="unsupported",
-                error="vision_model_incompatible",
-                expected_updated_at=str(verdict.get("updated_at") or ""),
+                screen_vision_verdict,
             )
         turn_extra_context = (
             context.action_context_str(grounding_results) if grounding_results else ""

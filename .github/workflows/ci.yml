@@ -201,9 +201,9 @@ jobs:
       - name: Guard top-level pytest discovery coverage
         run: |
           export LC_ALL=C
-          rg --files tests -g 'test_*.py' | awk -F/ 'NF == 2' | sort \
+          find tests -maxdepth 1 -type f -name 'test_*.py' -print | sort \
             > /tmp/feedling-all-tests.txt
-          rg -o 'tests/test_[A-Za-z0-9_]+\.py' .github/workflows/ci.yml | sort -u \
+          grep -oE 'tests/test_[A-Za-z0-9_]+\.py' .github/workflows/ci.yml | sort -u \
             > /tmp/feedling-named-tests.txt
           grep -l -E \
             'tools\.chat_resident_consumer|chat_resident_consumer as|import chat_resident_consumer|from tools import chat_resident_consumer|chat_resident_consumer\.py' \
@@ -211,6 +211,8 @@ jobs:
             > /tmp/feedling-consumer-tests.txt
           sort -u /tmp/feedling-named-tests.txt /tmp/feedling-consumer-tests.txt \
             > /tmp/feedling-covered-tests.txt
+          comm -12 /tmp/feedling-all-tests.txt /tmp/feedling-covered-tests.txt \
+            > /tmp/feedling-covered-top-level-tests.txt
           comm -23 /tmp/feedling-all-tests.txt /tmp/feedling-covered-tests.txt \
             > /tmp/feedling-uncovered-tests.txt
           comm -23 /tmp/feedling-uncovered-tests.txt \
@@ -219,6 +221,7 @@ jobs:
           comm -13 /tmp/feedling-uncovered-tests.txt \
             .github/pytest-uncovered-baseline.txt \
             > /tmp/feedling-now-covered-tests.txt
+          echo "Top-level pytest discovery: $(wc -l < /tmp/feedling-all-tests.txt) total, $(wc -l < /tmp/feedling-covered-top-level-tests.txt) covered, $(wc -l < /tmp/feedling-uncovered-tests.txt) baseline-uncovered"
           echo "::group::Top-level pytest files outside explicit/consumer discovery"
           sed -n '1,9999p' /tmp/feedling-uncovered-tests.txt
           echo "::endgroup::"
