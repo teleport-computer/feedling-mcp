@@ -2228,6 +2228,9 @@ def model_api_route_activate(store, route_id: str, *, caller_api_key: str | None
     policy_error = _apply_runtime_policy_or_error(store)
     if policy_error is not None:
         return policy_error
+    cohort_error = _apply_new_user_v2_default_or_error(store)
+    if cohort_error is not None:
+        return cohort_error
     accounts_onboarding._save_onboarding_route(store, "model_api")
     # V2 provider config is pinned once per turn. The fence+restore above bumps
     # its generation around activation, so a turn on the old route can spend

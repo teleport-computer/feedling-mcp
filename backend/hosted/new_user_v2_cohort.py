@@ -102,6 +102,15 @@ def pin_resident(store) -> None:
     )
 
 
+def _require_tested_active_route(store) -> None:
+    """Fail closed unless the current active route is proven runnable."""
+    route = config_store.load_active_route(store)
+    if route is None or route.get("test_status") != "ok":
+        raise RuntimeError(
+            "new-user V2 cohort requires a tested active route"
+        )
+
+
 def apply_default(store) -> str:
     """Apply the new-user default without overriding an explicit rollout pin."""
     if config_store.hosted_runtime_policy() != config_store.HOSTED_RUNTIME_POLICY_DUAL:
@@ -114,11 +123,7 @@ def apply_default(store) -> str:
         if not decision.eligible:
             _log(store.user_id, decision.reason)
             return decision.reason
-        route = config_store.load_active_route(store)
-        if route is None or route.get("test_status") != "ok":
-            raise RuntimeError(
-                "new-user V2 cohort requires a tested active route"
-            )
+        _require_tested_active_route(store)
         inserted = db.insert_runtime_allowlist_if_absent(
             store.user_id,
             "v2",
@@ -129,16 +134,28 @@ def apply_default(store) -> str:
         # authoritative decision, regardless of which writer won the insert.
         existing = db.get_runtime_allowlist_entry(store.user_id)
 
-    if not existing or existing["updated_by"] != AUTO_UPDATED_BY:
+    if not existing:
         _log(store.user_id, "explicit_pin")
         return "explicit_pin"
-    if existing["desired"] != "v2":
-        _log(store.user_id, "automatic_resident_pin")
-        return "automatic_resident_pin"
-    if config_store.load_active_route(store) is None:
-        raise RuntimeError("new-user V2 cohort requires an active route")
 
-    _log(store.user_id, "record_created" if inserted else "record_already_present")
+    is_automatic = existing["updated_by"] == AUTO_UPDATED_BY
+    if existing["desired"] != "v2":
+        outcome = "automatic_resident_pin" if is_automatic else "explicit_pin"
+        _log(store.user_id, outcome)
+        return outcome
+
+    # Both automatic admission and an explicit V2 pin are synchronous
+    # ownership decisions.  Keep the row untouched, but do not report setup or
+    # activation success until its tested route and fence have converged.
+    _require_tested_active_route(store)
+
+    if is_automatic:
+        _log(
+            store.user_id,
+            "record_created" if inserted else "record_already_present",
+        )
+    else:
+        _log(store.user_id, "explicit_v2_pin")
     config_store.set_hosted_runtime_mode(
         store, config_store.HOSTED_RUNTIME_MODE_DB_ACTION_V2
     )
