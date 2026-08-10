@@ -63,6 +63,11 @@ ALLOWLISTED_MIGRATIONS = {
     # （加密档用户的行仍须完整），而守卫做的是文本匹配、认不出 `OR 明文分支`。
     # 登记在此而非放松 pattern：pattern 一旦放松，真正的新增强制约束也会溜过去。
     "0072_relax_v2_envelope_shape.py",
+    # 0080 is the historical envelope-only voice archive constraint.  Follow-up
+    # 0085 replaces it with the same envelope-OR-plaintext predicate used by
+    # 0072; the scanner sees the old migration but cannot model later DDL.
+    "0080_voice_transcripts.py",
+    "0085_relax_voice_transcript_shape.py",
     # TEE 0013 restores the same primary-runtime CHECK after the plaintext
     # migration has completed.  Its predicate explicitly accepts the exact
     # plaintext body shape as an OR branch, just like RDS 0072; the scanner only

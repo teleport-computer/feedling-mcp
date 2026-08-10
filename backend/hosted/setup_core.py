@@ -9,8 +9,8 @@ E2E / enclave boundary (unchanged): ``/v1/model_api/key_envelope`` returns the
 caller's OWN ``api_key_envelope`` ciphertext — the server never decrypts it; only
 the enclave can. ``model_api_setup`` seals a freshly-supplied provider key into a
 shared envelope via ``core.envelope._build_shared_envelope_for_store`` and, when
-reusing a saved key, decrypts the existing envelope ONLY through the enclave
-(``core.enclave._decrypt_envelope_via_enclave``). These functions take
+reusing a saved key, reads the existing row through the shared shape router.
+Encrypted rows still cross the enclave boundary; plaintext rows are read locally. These functions take
 already-parsed params + the store and the caller's credential as explicit
 arguments — they never read ``flask.request`` — so no new server-side plaintext
 is ever introduced here. Module-level references (``provider_client``,
@@ -791,10 +791,9 @@ def _test_route_image_generation_or_error(
     if not isinstance(envelope, dict):
         return {"error": "model_api_key_envelope_missing"}, 404
     try:
-        provider_key = core_enclave._decrypt_envelope_via_enclave(
+        provider_key = core_envelope.decrypt_provider_key_envelope(
             envelope,
             caller_api_key,
-            purpose="model_api_provider_key",
         ).decode("utf-8")
     except Exception:
         return {"error": "model_api_key_decrypt_failed"}, 400

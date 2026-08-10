@@ -569,7 +569,7 @@ def _file_row(m, *, mid, ts, role, token) -> dict:
 
     文件消息的明文是**原始文件字节**（`chat_send_core`: `user_plaintext = file_parse["bytes"]`，
     `content_type="file"`）。没有这个分支，这一行会掉进下面通用的
-    `_decrypt_envelope_via_enclave(...).decode("utf-8")`，一个 PDF 立刻 `UnicodeDecodeError`
+    通用内容解密分支，一个 PDF 立刻 `UnicodeDecodeError`
     —— 而它会**抛出整个 `_read_tail`**，连带打死该用户的 chat / wake / extraction /
     compaction 四条路径（compaction 用 limit=10_000 调同一个函数）。
 
@@ -1073,7 +1073,7 @@ def _read_messages(user_id: str, after_seq: int = 0) -> list[dict]:
     shared ``core.store`` cache with a seq key.
 
     服务器永不本地解密——每条信封走 enclave /v1/envelope/decrypt。 The full stored
-    message dict is forwarded to ``_decrypt_envelope_via_enclave`` (not a
+    message dict is forwarded to the shared envelope reader (not a
     hand-picked subset) — the enclave's AEAD additional-data is
     ``owner_user_id||v||id``, so dropping ``id`` would fail AEAD verification.
 
@@ -1533,7 +1533,7 @@ def _decrypt_summary_text(
     itself cannot be opened and must never be downgraded to best effort.
     """
     try:
-        raw = core_enclave._decrypt_envelope_via_enclave(
+        raw = core_envelope.read_envelope_body(
             envelope,
             None,
             purpose=purpose,
@@ -1747,7 +1747,7 @@ def _select_agent_profile_for_turn(
         nonlocal token
         if token is None:
             token = _mint_runtime_token(user_id)
-        return core_enclave._decrypt_envelope_via_enclave(
+        return core_envelope.read_envelope_body(
             envelope,
             None,
             purpose=f"v2_profile_{field}_read",
@@ -2503,10 +2503,9 @@ async def _generate_image_for_chat(
             )
         try:
             provider_key = await asyncio.to_thread(
-                core_enclave._decrypt_envelope_via_enclave,
+                core_envelope.decrypt_provider_key_envelope,
                 envelope,
                 api_key,
-                purpose="model_api_provider_key",
                 runtime_token=runtime_token,
             )
             config = provider_client.ProviderConfig(

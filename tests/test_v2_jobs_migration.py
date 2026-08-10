@@ -66,7 +66,12 @@ def test_screen_chat_and_plaintext_are_merged_into_the_single_installed_head():
     cfg.set_main_option("script_location", str(backend / "alembic"))
     script = ScriptDirectory.from_config(cfg)
 
-    assert script.get_heads() == ["0084_merge_screen_plaintext"]
+    assert script.get_heads() == ["0085_relax_voice_transcript_shape"]
+    voice_shape = script.get_revision("0085_relax_voice_transcript_shape")
+    assert voice_shape.down_revision == "0084_merge_screen_plaintext"
+    assert "transcript_envelope ? 'body'" in voice_shape.module._shape_check(
+        "transcript_envelope"
+    )
     assert set(
         script.get_revision("0084_merge_screen_plaintext").down_revision
     ) == {
@@ -135,7 +140,7 @@ def test_perception_signal_schema_is_installed_at_the_merged_head():
             "AND tc.table_name='perception_signal_state_v2'"
         ).fetchone()
 
-    assert installed_head == ("0084_merge_screen_plaintext",)
+    assert installed_head == ("0085_relax_voice_transcript_shape",)
     assert columns == {
         "user_id": ("text", "NO"),
         "signal": ("text", "NO"),
@@ -200,7 +205,7 @@ def test_0075_usage_rollup_schema_is_installed_without_source_backfill():
             "AND tgrelid='v2_turn_metrics'::regclass"
         ).fetchone()[0]
 
-    assert heads == {"0084_merge_screen_plaintext"}
+    assert heads == {"0085_relax_voice_transcript_shape"}
     assert tables == {
         "v2_usage_daily_users",
         "v2_usage_daily_dimensions",
