@@ -593,6 +593,23 @@ def test_last_init_wins_when_a_turn_was_retried():
     assert kw["detail"]["verdict"] == {"tavily": "ok"}
 
 
+def test_calls_from_a_superseded_attempt_do_not_leak_into_the_final_verdict():
+    """「最后一个 init 说了算」必须**连它的调用证据一起**换掉。
+
+    只换 init、留着上一次的 call_ok,会让第一次尝试的成功调用把第二次(真正
+    回答的那次)报的 failed 复活,产出自相矛盾的一对:
+    init_status=failed 而 verdict=recovered。我把注释写成了这样,代码却没做
+    (codex 审出)。
+    """
+    raw = (_stream([{"name": "s", "status": "pending"}], [("s", True)])
+           + _stream([{"name": "s", "status": "failed"}]))
+    _kind, kw = _registered(raw, enabled=("s",))[0]
+    assert kw["detail"]["init_status"] == {"s": "failed"}
+    assert kw["detail"]["called_ok"] == [], "被取代那次的调用不该留下"
+    assert kw["detail"]["verdict"] == {"s": "failed"}
+    assert kw["status"] == "error"
+
+
 def test_a_server_name_containing_a_double_underscore_is_attributed_correctly():
     """服务器名允许含 `__`(mcp_core 的 _NAME_RE 是 [a-z0-9_-]{1,32})。
 

@@ -112,45 +112,112 @@ def _agent_events(admin: httpx.Client, api: str, user_id: str) -> list[dict]:
 
 
 
+# V1 and V2 answer different questions, so they can express different verdicts.
+# "recovered"/"inconclusive" only exist for the claude CLI, whose surface can
+# change mid-turn; V2 loads the catalogue synchronously, so a server either made
+# it or did not. Asking V2 for a verdict it cannot produce must be refused
+# outright rather than silently passing (codex 审出).
+_V2_EXPECTATIONS = ("ok", "failed", "any")
+
+
+def terminal_event_type(runtime: str) -> str:
+    """Which MCP event means "this turn's surface has been reported".
+
+    V2 never emits ``mcp.surface.registered`` — waiting for it made every
+    healthy V2 run burn the full --trace-timeout before classifying.
+    """
+    return "mcp.surface.registered" if runtime == "resident" else "mcp.surface.resolved"
+
+
+def observation_complete(events: list[dict], runtime: str) -> bool:
+    """True once BOTH receipts are in.
+
+    The driver receipt matters as much as the MCP event: trace posts are
+    independent daemon threads, so stopping at the MCP event alone can leave us
+    classifying a run whose runtime we never confirmed.
+    """
+    types = {str(e.get("type") or "") for e in events}
+    return terminal_event_type(runtime) in types and "agent.model.call.done" in types
+
+
 def classify(events: list[dict], *, runtime: str, expect: str,
              server_count: int) -> tuple[int, list[str]]:
     """Turn the trace into an exit code. Pure, so it can be tested without a CVM.
 
     Kept out of ``main`` on purpose: the previous version inlined every check,
-    which is how two of the fixes it claimed to make regressed unnoticed —
-    there was nothing a test could call.
+    which is how fixes it claimed to make regressed unnoticed — there was
+    nothing a test could call.
+
+    Exit codes: 0 match, 1 real mismatch, 2 misuse, 3 no usable observation.
+    The 1-vs-3 split is the point: "the servers misbehaved" and "we never
+    managed to look" must not be reported the same way.
     """
     out: list[str] = []
-    seen = {e["type"]: e for e in events}
+    seen = {str(e.get("type") or ""): e for e in events}
     driver = ""
     for e in events:
-        if e.get("type") == "agent.model.call.done":
+        if str(e.get("type") or "") == "agent.model.call.done":
             driver = str((e.get("detail") or {}).get("driver") or "")
-    kinds = sorted({e["type"] for e in events if str(e.get("type", "")).startswith("mcp.")})
+    kinds = sorted({str(e.get("type") or "") for e in events
+                    if str(e.get("type") or "").startswith("mcp.")})
     out.append(f"observed driver={driver or '?'} events={kinds}")
 
-    # Confirm we measured the system we meant to: driver "v2" means the turn
-    # never went near the claude CLI.
     want_driver = "claude" if runtime == "resident" else "v2"
-    if driver and driver != want_driver:
+    if not driver:
+        # No model.call.done at all: we never confirmed which runtime answered,
+        # so nothing below can be attributed. Not a pass (codex 审出).
+        out.append("FAIL 没有 agent.model.call.done —— 没确认这一轮是哪个运行时跑的,"
+                   "后面的判定无从归属")
+        return 3, out
+    if driver != want_driver:
         out.append(f"FAIL 实际跑在 driver={driver},要测的是 {want_driver} —— 结果不能用")
         return 1, out
 
     if runtime != "resident":
-        # V2 loads the catalogue synchronously from the envelopes inside the
-        # worker; there is no consumer materialize/wire step at all. Requiring
-        # those here made --runtime v2 exit 3 unconditionally, even on a
-        # perfectly healthy run (codex 审出).
+        if expect not in _V2_EXPECTATIONS:
+            out.append(f"FAIL --expect {expect} 是 V1 才有的判定,V2 表达不了")
+            return 2, out
         if "mcp.surface.resolved" not in seen:
             out.append("FAIL 没有 mcp.surface.resolved(V2 的工具面埋点)")
             return 3, out
         detail = seen["mcp.surface.resolved"].get("detail") or {}
         out.append(f"resolved: {json.dumps(detail, ensure_ascii=False)}")
-        skipped = detail.get("skipped") or []
-        if expect == "ok" and skipped:
-            out.append(f"FAIL 有整台服务器没进工具面:{skipped}")
+        if "expected" not in detail:
+            # Pre-97511545 shape: the event exists but carries no baseline.
+            # Same distinction as the V1 side — "ship it first", not "MCP broke".
+            out.append("FAIL resolved 里没有 expected 字段 —— 部署的 backend 早于"
+                       "整台失败可观测那批,先发版再测")
+            return 3, out
+        failure_kind = str(detail.get("surface_failure_kind") or "")
+        if failure_kind:
+            # The config list itself could not be read, so this turn observed
+            # nothing about the servers. Reporting it as a per-server verdict
+            # would be inventing evidence.
+            out.append(f"FAIL 配置列表本轮读不出来({failure_kind}) —— "
+                       f"这一轮对服务器没有任何观测")
+            return 3, out
+        expected = int(detail.get("expected") or 0)
+        resolved = int(detail.get("resolved") or 0)
+        skipped = [s for s in (detail.get("skipped") or []) if isinstance(s, dict)]
+        if expected != server_count:
+            out.append(f"FAIL 运行时看到 {expected} 台,我们配了 {server_count} 台")
             return 1, out
-        out.append("PASS")
+        if resolved + len(skipped) != expected:
+            # An internally inconsistent summary means the numbers cannot be
+            # trusted at all — reading a verdict out of them would be worse
+            # than admitting we have nothing.
+            out.append(f"FAIL 计数对不上:resolved={resolved} + skipped="
+                       f"{len(skipped)} != expected={expected}")
+            return 3, out
+        names = ",".join(f"{s.get('name')}:{s.get('kind')}" for s in skipped[:10])
+        if expect == "ok" and skipped:
+            out.append(f"FAIL 有整台服务器没进工具面:{names}")
+            return 1, out
+        if expect == "failed" and not skipped:
+            out.append("FAIL 期望有整台失败,但每台都进了工具面")
+            return 1, out
+        out.append(f"PASS resolved={resolved}/{expected}"
+                   + (f",未就绪:{names}" if skipped else ""))
         return 0, out
 
     if "mcp.materialize.applied" not in seen:
@@ -170,6 +237,13 @@ def classify(events: list[dict], *, runtime: str, expect: str,
     if not wired.get("wired"):
         out.append("FAIL 服务器没有交给 CLI")
         return 1, out
+    if wired.get("has_grant_rule") is False:
+        # This probe was built for the wired-but-unapproved failure too. A
+        # connected init with no call does not prove the model may invoke it —
+        # and has_grant_rule=false is positive proof a grant is MISSING, even
+        # though true cannot prove one is effective (codex 审出).
+        out.append(f"FAIL 有服务器没有任何授权规则:{wired.get('ungranted')}")
+        return 1, out
 
     if "mcp.surface.registered" not in seen:
         out.append("FAIL 没等到 mcp.surface.registered —— 没有观测不等于没有问题")
@@ -178,13 +252,16 @@ def classify(events: list[dict], *, runtime: str, expect: str,
     out.append(f"registered: {json.dumps(reg, ensure_ascii=False)}")
     verdicts = reg.get("verdict") or {}
     if not verdicts:
-        # Distinct from a mismatch: the event exists but carries the pre-C-prime
-        # shape. That means the DEPLOYED consumer is older than this probe, not
-        # that the servers misbehaved — calling it a verdict mismatch would send
-        # someone debugging MCP when the answer is "ship the consumer first".
+        # The event exists but carries the pre-C-prime shape. That means the
+        # DEPLOYED consumer is older than this probe, not that the servers
+        # misbehaved — calling it a verdict mismatch would send someone
+        # debugging MCP when the answer is "ship the consumer first".
         out.append("FAIL registered 里没有 verdict 字段 —— 部署的 consumer 早于"
                    "两阶段判据(C-prime),先发版再测")
         return 3, out
+    if len(verdicts) != server_count:
+        out.append(f"FAIL 判定覆盖 {len(verdicts)} 台,我们配了 {server_count} 台")
+        return 1, out
     if expect != "any":
         bad = {n: v for n, v in verdicts.items() if v != expect}
         if bad:
@@ -301,7 +378,11 @@ def main() -> int:
         events: list[dict] = []
         while time.time() < deadline:
             events = _agent_events(admin, args.api, c.user_id)
-            if any(e["type"] == "mcp.surface.registered" for e in events):
+            # Both receipts, and the right one per runtime: V2 never emits
+            # `registered`, so waiting on it burned the whole timeout on every
+            # healthy V2 run; and stopping at the MCP event alone can leave the
+            # driver receipt still in flight (codex 审出).
+            if observation_complete(events, args.runtime):
                 break
             time.sleep(5)
 

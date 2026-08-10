@@ -5813,9 +5813,17 @@ def _trace_user_mcp_registered(raw: str, cmd: list[str], *,
             continue
         etype = str(obj.get("type") or "").strip()
         if etype == "system" and str(obj.get("subtype") or "").strip() == "init":
-            # Last init wins: a retried attempt re-runs the handshake in a new
-            # process, and the earlier one no longer describes this turn.
+            # Last init wins: a retried attempt re-runs the handshake in a NEW
+            # process, and the earlier one no longer describes this turn — so
+            # its tool calls must go with it. Keeping them let a first attempt's
+            # successful call resurrect a server that the attempt which actually
+            # answered had reported `failed`, producing the impossible pair
+            # "init_status: failed" + "verdict: recovered" (codex 审出). The
+            # comment above used to claim this while the code did the opposite.
             init = obj
+            call_ok.clear()
+            call_err.clear()
+            pending_use.clear()
             continue
         content = (obj.get("message") or {}).get("content")
         if not isinstance(content, list):
