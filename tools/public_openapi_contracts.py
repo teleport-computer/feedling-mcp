@@ -1373,7 +1373,15 @@ COMPONENT_SCHEMAS: dict[str, dict[str, Any]] = {
             "tool_name": {"type": "string", "maxLength": 120},
             "state": {"type": "string", "enum": ["running", "success", "failure"]},
             "duration_ms": {"type": "number", "minimum": 0},
-            "result_code": {"type": "string", "maxLength": 64},
+            "result_code": {
+                "type": "string",
+                "maxLength": 64,
+                "description": (
+                    "Display-safe result token. Failed generate_image events "
+                    "preserve an allowlisted image_generation_* code; result "
+                    "bodies are never included."
+                ),
+            },
             "memory_count": {"type": "integer", "minimum": 0, "maximum": 1000},
             "memory_categories": {
                 "type": "array",
@@ -2351,18 +2359,6 @@ RESPONSE_OVERRIDES: dict[Operation, dict[str, Any]] = {
                     "schema": {"$ref": "#/components/schemas/WebSettingsResponse"}
                 }
             },
-        },
-    },
-    ("get", "/healthz"): {
-        "503": {
-            "description": (
-                "A critical dependency is unavailable — PostgreSQL is "
-                "unreachable or the connection pool cannot hand out a "
-                "connection in time. The body has the same shape as the 200 "
-                "response, with top-level \"status\": \"unhealthy\" and the "
-                "failing entry under \"checks\"."
-            ),
-            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/GenericJsonResponse"}}},
         },
     },
     ("get", "/healthz/runner"): {

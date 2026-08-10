@@ -6,6 +6,11 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
 import pytest
 
+from memory.capture_prompt_v1 import (
+    build_capture_retry_prompt,
+    parse_capture_cards,
+)
+from memory.card_text import is_retryable_parse_error
 from memory.dream_prompt_v1 import build_dream_prompt
 from model_api_runtime.v2 import extraction, worker
 
@@ -144,6 +149,34 @@ def test_extract_bounces_format_error_once_and_recovers(monkeypatch):
     assert parsed == ["clean"] and err is None
     # 第二问必须带着原 prompt 的上下文 + 具体哪里没填
     assert prompts == ["P", "P|redo:invalid_card_content:content_empty"]
+
+
+def test_extract_reasks_once_after_json_decode_error(monkeypatch):
+    fake, prompts = _stub_provider([
+        '{"cards": [not valid]}',
+        '{"cards": []}',
+    ])
+    monkeypatch.setattr(
+        extraction.provider_client, "reliable_chat_completion_async", fake
+    )
+
+    parsed, err = asyncio.run(extraction.extract(
+        provider_config=object(),
+        prompt="P",
+        parse=parse_capture_cards,
+        parse_retry=extraction.ParseRetry(
+            should_retry=is_retryable_parse_error,
+            build_prompt=build_capture_retry_prompt,
+            parse=lambda reply: parse_capture_cards(reply, strict=False),
+        ),
+    ))
+
+    assert parsed == [] and err is None
+    assert len(prompts) == 2
+
+
+def test_v2_worker_uses_the_shared_retryable_parse_predicate():
+    assert worker.is_retryable_parse_error is is_retryable_parse_error
 
 
 def test_extract_bounces_at_most_once(monkeypatch):

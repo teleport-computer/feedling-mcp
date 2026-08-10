@@ -36,6 +36,25 @@ log = logging.getLogger("feedling.voice.gateway")
 
 _VOICE_NAMESPACE = uuid.UUID("c1673607-3107-4554-87a1-5a8f55b70023")
 _VOICE_BUFFER_TEXT = "... "
+# 「这一轮不说话」也必须是一个**带正文**的 completion。
+#
+# 2026-08-08 线上事故:噪音轮/生命周期已结束/本轮被更新的 ASR 取代这三条路径都
+# 返回了一个零 content 的 SSE 流(只有 role 块 + finish 块)。ElevenLabs 的
+# Custom LLM 拿到没有任何正文的 completion 会判协议错误
+# —— `1002 custom_llm_error: LLM Cascade Error` —— 然后**杀掉整通电话**,
+# 用户侧看到的是「暂时无法通话」。客户端日志里的前一行正是
+# `ignored control-only agent response`。
+#
+# 用 ElevenLabs **自己文档里的**缓冲串,而不是一个空格。
+# 理由是证据而非推测:主流程每一轮开头都无条件发这个串(见 _VOICE_BUFFER_TEXT
+# 的用法),线上每一通正常电话都经过它 —— 所以我们**已知**它不会被判成空、
+# 不会杀通话。空格没有这个证据,而且 ElevenLabs 完全可能把纯空白 trim 掉后
+# 仍判成「没有文本」(codex 提的风险,我无法在不真打一通电话的情况下证伪)。
+# 绝不要在这里放真实文案:那等于替伴侣说了它没说过的话。
+#
+# ⚠️ 更正的长期做法是 ElevenLabs 的 Skip Turn 系统工具(语义上就是"这轮不说话"),
+# 需要改 agent 配置 + 返回工具调用,不在本批。
+_VOICE_SILENT_TURN_TEXT = _VOICE_BUFFER_TEXT
 
 
 def _gateway_url(request: Request) -> str | None:
@@ -266,11 +285,39 @@ def _voice_error_text(body: dict) -> str:
     return notices_catalog.user_text_for(code)
 
 
+def _empty_call_note(duration_sec: int, reason: str) -> str:
+    """一句内容都没有的通话,归档里留下的那行字。
+
+    Seven 2026-08-10 定稿:**所有通话一律归档**,没聊出内容的也要,写明大致
+    时长和情况就行。以前这种通话是被直接删掉的 —— 用户事后完全无从知道自己
+    那天打过电话,而"遗漏"是这条链上最不能接受的失败。
+    """
+    seconds = max(0, int(duration_sec or 0))
+    if seconds >= 60:
+        span = f"约 {max(1, round(seconds / 60))} 分钟"
+    elif seconds > 0:
+        span = f"{seconds} 秒"
+    else:
+        span = "很短"
+    tail = "（通话未能正常建立）" if reason in {
+        "connect_failed", "fail", "runtime_error",
+    } else ""
+    return (
+        f"（这通电话持续了{span},没有产生可记录的对话内容。{tail}）"
+    )
+
+
 def _streaming_text_response(request_id: str, text: str) -> StreamingResponse:
+    # 空文本会退化成一个**零 content 块**的流,ElevenLabs 判协议错误并拆掉整通
+    # 电话(见 _VOICE_SILENT_TURN_TEXT)。保证放在这里而不是各调用点:调用点是
+    # 开集(噪音轮/生命周期已结束/以后还会有别的"这一轮不说话"),漏一个就是
+    # 一次线上事故。主流程那个生成器不受影响 —— 它开头无条件发 "... " 缓冲块。
+    body = text if text else _VOICE_SILENT_TURN_TEXT
+
     async def stream():
         yield _sse_chunk(request_id, role="assistant")
-        for offset in range(0, len(text), 18):
-            yield _sse_chunk(request_id, content=text[offset : offset + 18])
+        for offset in range(0, len(body), 18):
+            yield _sse_chunk(request_id, content=body[offset : offset + 18])
             await asyncio.sleep(0)
         yield _sse_chunk(request_id, finish="stop")
         yield "data: [DONE]\n\n"
@@ -334,6 +381,7 @@ async def cancel_voice_call(
     from core import store as core_store
     import db as _db
     from voice import cleanup as voice_cleanup
+    from voice import transcript_store
 
     payload = (await asgi_http.read_json_silent(request)) or {}
     if not isinstance(payload, dict):
@@ -348,20 +396,93 @@ async def cancel_voice_call(
         or any(not char.isprintable() for char in reason)
     ):
         return JSONResponse({"error": "cancel_reason_required"}, status_code=400)
+    # 归档也需要这两个:时长写进空通话的说明,mid 是那张卡的确定性 id
+    # (与 finalize 同一个命名空间,所以两条路写出来的卡是同一张)。
+    duration_sec = _positive_int(payload.get("duration_sec"))
+    mid = voice_cleanup.transcript_card_message_id(call_id)
 
     user_id = auth.user_id
 
     def _cancel() -> tuple[dict, int]:
-        lifecycle = _db.voice_call_cancel(user_id, call_id, reason)
-        if lifecycle["status"] in {"finalizing", "finalized"}:
+        # ⚠️ 2026-08-10 起 cancel **不再是「删掉」,而是「用服务器自己有的内容归档」**。
+        #
+        # 客户端只按**它自己看到的** SDK 转写列表判空
+        # (VoiceCallTerminationPolicy: turns.isEmpty ? .cancel : .finalize),
+        # 而那份列表落定晚于服务端落行:说完立刻挂断/切后台时,服务端明明已经有
+        # 真实的一问一答。旧实现在这里把那些行直接删掉 —— **整通电话永久消失**,
+        # 而且墓碑之后一直 409 挡住任何补救。Seven 定稿:所有通话一律归档,
+        # 一句内容都没有的也归档一条说明,**绝不允许遗漏或删除**。
+        #
+        # 所以这里走的是 finalize 的同一把生命周期锁:cancel 只是「finalize,
+        # 但转写由服务端自己重建」。这样也不再需要那个「留着行等后续 finalize」
+        # 的可恢复中间态 —— 归档当场就完成了。
+        lifecycle = _db.voice_call_begin_finalize(user_id, call_id)
+        if lifecycle.get("replayed") and lifecycle["status"] in {
+            "finalizing", "finalized",
+        }:
+            # 只在**别人正占着**时退让。判据是 replayed 而不是光看状态:
+            # begin_finalize 自己抢到时也返回 "finalizing"(replayed=False),
+            # 按状态判的话正在进行的 finalize 会被当成"还没人做",cancel 接着
+            # 归档同一通 —— 双重归档 + 和它抢行。既有用例
+            # test_cancel_route_does_not_clean_when_finalize_already_won 当场抓到。
+            #
+            # ⚠️ status == "cancelled" 故意**不**在这里退:那是旧版本(或一次中途
+            # 崩掉的取消)留下的状态,重放必须继续往下收敛 —— 缺归档就补归档、
+            # 该清的清干净。退让会让那种通话永远停在半成品状态。
             return {
-                "status": lifecycle["status"],
-                "call_id": call_id,
-                "replayed": True,
-                "deleted": 0,
-                "retained_covered": 0,
-                "remaining": 0,
+                "status": lifecycle["status"], "call_id": call_id,
+                "replayed": True, "deleted": 0,
+                "retained_covered": 0, "remaining": 0,
             }, 200
+        store = core_store.get_store(user_id)
+        if not transcript_store.exists(user_id, call_id):
+            runtime_token = results.mint_enclave_token(user_id)
+            turns = voice_cleanup.transcript_turns_from_rows(
+                user_id, call_id, runtime_token=runtime_token,
+            )
+            speaker_user, speaker_ai = transcript_store.resolve_speaker_names(
+                store, runtime_token=runtime_token,
+            )
+            text = transcript_store.render_transcript(
+                turns, user_name=speaker_user, ai_name=speaker_ai,
+            )
+            if not text:
+                # 一句话都没有的通话也要归档。留一条说明,而不是当它没发生过:
+                # 用户看到「这通电话没聊出什么」远好于电话凭空消失,而且以后
+                # 也能回答「我那天是不是打过一个电话」。
+                text = _empty_call_note(duration_sec, reason)
+            try:
+                stats = transcript_store.persist(
+                    store, call_id, text,
+                    turn_count=len(turns), duration_sec=duration_sec,
+                    chat_message_id=mid,
+                )
+            except Exception as exc:  # noqa: BLE001 — 归档不成就什么都别动
+                log.warning(
+                    "[voice.cancel] archive failed user=%s call=%s: %s",
+                    user_id[:12], call_id[:24], str(exc)[:160],
+                )
+                return {"error": "voice_transcript_not_archived"}, 502
+            # 卡也要写。只归档不写卡的话,逐轮行删掉之后用户在聊天里**什么都
+            # 看不到** —— 归档是存了,但对用户而言这通电话依然消失了,
+            # 而"遗漏"正是这条链上最不能接受的失败。
+            if _db.chat_get_strict(user_id, mid) is None and (
+                not voice_cleanup.persist_transcript_card(
+                    store, transcript_store.build_preview(text), mid, call_id,
+                    turn_count=stats["turn_count"],
+                    duration_sec=stats["duration_sec"],
+                )
+            ):
+                return {"error": "voice_transcript_card_not_persisted"}, 502
+            log.info(
+                "[voice.cancel] archived-instead-of-deleted user=%s call=%s "
+                "turns=%d reason=%s",
+                user_id[:12], call_id[:24], len(turns), reason[:32],
+            )
+        # 归档 + 卡都落好了,这通电话到此为止是**已归档**,不是"已取消"。
+        # 标成 finalized 而不是 cancelled:后者会让任何补救性 finalize 永远 409,
+        # 而现在已经没有什么需要补救了。
+        _db.voice_call_mark_finalized(user_id, call_id)
         handoff = results.delete_call_state(user_id, call_id)
         cleanup = voice_cleanup.delete_call_messages(user_id, call_id)
         store = core_store.get_store(user_id)
@@ -647,7 +768,7 @@ async def voice_chat_completions(request: Request):
             "[voice.gateway] turn ignored user=%s reason=non_speech",
             user_id[:12],
         )
-        return _streaming_text_response(request_id, "")
+        return _streaming_text_response(request_id, _VOICE_SILENT_TURN_TEXT)
 
     import db as _db
 
@@ -656,7 +777,7 @@ async def voice_chat_completions(request: Request):
         "cancelled",
         "finalized",
     }:
-        return _streaming_text_response(request_id, "")
+        return _streaming_text_response(request_id, _VOICE_SILENT_TURN_TEXT)
 
     from core import store as core_store
 

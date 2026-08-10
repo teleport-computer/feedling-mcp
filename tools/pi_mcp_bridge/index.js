@@ -24,7 +24,7 @@
 
 import { readFileSync } from "node:fs";
 import { McpClient, SseMcpClient, effectiveTransport } from "./mcp_client.js";
-import { buildToolTable, MAX_TOOLS } from "./tool_mapping.js";
+import { buildToolTable, MAX_TOOLS, schemaBytes, surfaceCounts } from "./tool_mapping.js";
 
 // Matches mcp_probe.py's _CONNECT_TIMEOUT — same servers, same patience.
 // This is a PER-POST budget (mcp_client.js's _post() starts a fresh
@@ -135,6 +135,19 @@ export default async function feedlingUserMcpBridge(pi) {
     });
 
     const { mapped, dropped } = buildToolTable(connected);
+    // 无条件输出一行结构化的工具面摘要。以前只有「丢弃时」才打日志,于是
+    // 「这一轮模型到底看得到哪些 MCP 工具」在生产上**完全不可观测** ——
+    // 用户报「AI 说搜不到」时,我们连"工具有没有被注册进去"都答不上来。
+    // consumer 会解析这一行并写进 debug trace(admin 可见)。
+    // detail 是 `服务器:注册数/发现数` —— 必须报**注册后**的数字。
+    // 只报发现数的话,一台服务器的工具全被丢掉时日志照样写着 tavily:4,
+    // 恰好把这条埋点要回答的问题答错(codex 审出)。
+    const perServer = surfaceCounts(connected, mapped);
+    console.error(
+      `[user_mcp] surface servers=${connected.length} `
+      + `registered=${mapped.length} dropped=${dropped.length} `
+      + `cap=${MAX_TOOLS} bytes=${schemaBytes(mapped)} `
+      + `detail=${perServer || "(none)"}`);
     if (dropped.length) {
       console.error(
         `[user_mcp] tool cap ${MAX_TOOLS} reached — dropped ${dropped.length}: `

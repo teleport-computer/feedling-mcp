@@ -1,27 +1,22 @@
-"""Native /healthz router — liveness + dependency readiness probe.
+"""Native /healthz router — process liveness + in-memory readiness probe.
 
 Public, no-auth. Backward compatible: the legacy ``ok`` / ``mode`` fields are
 still present so old probes keep working. On top of that it now reports the
-real state of the backend's critical dependencies so an external heartbeat can
-distinguish healthy / degraded / down without SSHing into the CVM:
+process-local state so an external heartbeat can distinguish healthy from
+degraded without SSHing into the CVM:
 
-- ``status``: "healthy" | "degraded" | "unhealthy" — the tri-state roll-up.
-- HTTP code: 200 when the process can serve, 503 when a *critical* dependency
-  (the primary Postgres) is down. Prod's backend container has no orchestrator
-  healthcheck (see deploy/docker-compose.phala.yaml), so a 503 here reports an
-  outage — it does NOT trigger a container restart.
+- ``status``: "healthy" | "degraded" — the process-local roll-up.
+- HTTP code: 200 whenever the process can serve the probe.
 - ``checks.*``: per-component detail for the heartbeat to key on.
 
 Status policy:
-- ``db`` is the only *critical* check. SELECT 1 failing (or the pool unable to
-  hand out a connection within 2s) → unhealthy → 503.
-- Degraded (still 200): pool saturated (a request is waiting or 0 available),
-  the in-memory user registry loaded 0 users (the past lifespan-missing-
-  load_users → global-401 failure mode), or the wake-bus listener is enabled
-  but not actually listening.
+- Degraded (still 200): the in-memory user registry loaded 0 users (the past
+  lifespan-missing-load_users → global-401 failure mode), or the wake-bus
+  listener is enabled but not actually listening.
 
-The synchronous DB work runs in the threadpool so the 2s probe never blocks the
-event loop of this async worker.
+The probe deliberately performs no database I/O and does not inspect the
+business connection pool. A saturated pool must not make the liveness endpoint
+wait behind user traffic or return a false outage.
 """
 
 from __future__ import annotations
@@ -30,7 +25,6 @@ import os
 import time
 
 from fastapi import APIRouter
-from starlette.concurrency import run_in_threadpool
 from starlette.responses import JSONResponse
 
 router = APIRouter()
@@ -59,36 +53,6 @@ def _worker() -> dict:
     except Exception:  # noqa: BLE001 — worker id is cosmetic, never fail health
         pass
     return {"id": wid, "pid": os.getpid()}
-
-
-def _db_checks() -> tuple[dict, dict]:
-    """Return ``(db_check, db_pool_check)``. ``db`` is critical; pool saturation
-    is a degraded signal. Runs synchronous DB I/O — call from the threadpool."""
-    import db
-
-    probe = db.health_probe(timeout=2.0)
-    db_check: dict = {
-        "status": "ok" if probe["ok"] else "down",
-        "latency_ms": probe["latency_ms"],
-    }
-    if not probe["ok"]:
-        db_check["error"] = probe["error"]
-
-    try:
-        stats = db.get_pool().get_stats()
-        available = stats.get("pool_available")
-        waiting = stats.get("requests_waiting", 0) or 0
-        saturated = waiting > 0 or available == 0
-        pool_check: dict = {
-            "status": "saturated" if saturated else "ok",
-            "size": stats.get("pool_size"),
-            "available": available,
-            "waiting": waiting,
-            "max": stats.get("pool_max"),
-        }
-    except Exception as e:  # noqa: BLE001
-        pool_check = {"status": "unknown", "error": str(e)[:200]}
-    return db_check, pool_check
 
 
 def _registry_check() -> dict:
@@ -121,11 +85,8 @@ def _wake_bus_check() -> dict:
 
 
 def _gather_checks() -> dict:
-    """All synchronous checks in one threadpool hop (keeps the event loop free)."""
-    db_check, pool_check = _db_checks()
+    """Return the process-local checks without touching external dependencies."""
     return {
-        "db": db_check,
-        "db_pool": pool_check,
         "registry": _registry_check(),
         "wake_bus": _wake_bus_check(),
     }
@@ -133,24 +94,17 @@ def _gather_checks() -> dict:
 
 @router.get("/healthz")
 async def healthz():
-    """Liveness + readiness probe. Public, no auth — used by heartbeats/compose."""
-    checks = await run_in_threadpool(_gather_checks)
+    """Process liveness probe. Public, no auth — used by heartbeats/compose."""
+    checks = _gather_checks()
 
-    critical_ok = checks["db"]["status"] == "ok"
     degraded = (
-        checks["db_pool"].get("status") == "saturated"
-        or checks["registry"].get("status") == "empty"
+        checks["registry"].get("status") == "empty"
         or checks["wake_bus"].get("status") == "not_listening"
     )
-    if not critical_ok:
-        status = "unhealthy"
-    elif degraded:
-        status = "degraded"
-    else:
-        status = "healthy"
+    status = "degraded" if degraded else "healthy"
 
     body = {
-        "ok": critical_ok,  # legacy field: true iff serving (200)
+        "ok": True,
         "mode": "multi_tenant",  # legacy field
         "status": status,
         "release": _release(),
@@ -158,4 +112,4 @@ async def healthz():
         "worker": _worker(),
         "checks": checks,
     }
-    return JSONResponse(body, status_code=200 if critical_ok else 503)
+    return JSONResponse(body, status_code=200)

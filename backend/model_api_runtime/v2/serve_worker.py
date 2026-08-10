@@ -860,6 +860,18 @@ def _decrypt_chat_rows(
             item["source"] = source
         if call_id:
             item["voice_call_id"] = call_id[:96]
+            # 这三个字段以前只在 capture 分支带出来,于是 V2 的**普通 prompt 路径**
+            # 拿到的通话行永远没有 turn id。两个后果都是 P0,且只在 V2 上表现:
+            #   ① voice.message_filter 的「只保留最新 ASR 修订」判据取不到 key,
+            #      把通话中的**每一轮**用户话连同回复一起判成被取代 → 尾巴全空;
+            #   ② coalesce 要求 call_id + turn_id 齐全才透传 correlation,缺一个
+            #      就整组丢弃 → PR #165 的「挂断后抑制迟到回复」在 V2 上从未武装。
+            # resident 视图一直带着它们,所以两条 bug 都只咬 V2 —— 又是一次
+            # 「只修了一条 lane」。
+            for key in ("voice_turn_id", "voice_logical_turn_id", "voice_turn_status"):
+                value = m.get(key)
+                if isinstance(value, str) and value.strip():
+                    item[key] = value.strip()[:128]
         if include_capture_metadata:
             item["source"] = source
             item["raw_role"] = raw_role
@@ -1015,6 +1027,43 @@ def _read_tail_window(
     return _decrypt_chat_rows(user_id, rows, user_only=False)
 
 
+def _scrub_leaked_thinking_rows(rows: list[dict]) -> list[dict]:
+    """把历史里 assistant 行残留的 ``<think>`` 擦掉再喂回模型。
+
+    正常情况下思考封在**另一个**信封里，模型永远看不到；历史正文里带标签的行
+    是「漏出去时原样存下来」的异常。不擦的话模型每轮都看到可抄的样板，于是继续
+    写、继续漏——这是本 bug 自我强化的那一环（2026-08-08：主动消息那条 lane
+    我们根本没要求它写 think，它是从历史里学的）。
+
+    只碰 assistant 行：用户自己打的字里出现标签是他的自由，不是我们的协议。
+
+    剥离失败（FAILED）时**不能原样保留**——那等于把可抄的格式继续摆在模型面前
+    （Codex review 2026-08-08 Important #2）。但也不整行换占位符：那些文字本来
+    就已经发到用户眼前过了，抹掉整行只会平白打断对话连贯性。折中是只删标签壳、
+    保留文字，格式没了、内容还在。行的 id/ts/seq 一律原样保留，compaction /
+    capture 的水位连续性不受影响。
+    """
+    from core import self_thinking as _st
+
+    if not _st.gate_enabled():
+        return rows
+    out: list[dict] = []
+    for row in rows:
+        content = row.get("content")
+        if str(row.get("role") or "") != "assistant" or not isinstance(content, str):
+            out.append(row)
+            continue
+        status, _thinking, stripped = _st.strip_all_thinking(content)
+        if status == _st.ABSENT:
+            out.append(row)
+            continue
+        if status == _st.FAILED:
+            out.append({**row, "content": _st.strip_tag_markers(content)})
+            continue
+        out.append({**row, "content": stripped})
+    return out
+
+
 def _read_tail_window_after_seq(
     user_id: str,
     after_seq: int,
@@ -1034,12 +1083,14 @@ def _read_tail_window_after_seq(
         through_seq=through_seq,
         exclude_synthetic_sources=exclude_synthetic_sources,
     )
-    return _decrypt_chat_rows(
-        user_id,
-        rows,
-        user_only=False,
-        preserve_unreadable=True,
-        include_capture_metadata=include_capture_metadata,
+    return _scrub_leaked_thinking_rows(
+        _decrypt_chat_rows(
+            user_id,
+            rows,
+            user_only=False,
+            preserve_unreadable=True,
+            include_capture_metadata=include_capture_metadata,
+        )
     )
 
 
@@ -1104,11 +1155,17 @@ def _read_recent_turns(
         through_seq=through_seq,
     )
     raw_rows = list(window.get("rows") or [])
-    decrypted = _decrypt_chat_rows(
-        user_id,
-        raw_rows,
-        user_only=False,
-        preserve_unreadable=True,
+    # 这条窗口会作为 optional replay 回到 prompt（worker 的 optional_tail_turns），
+    # 所以和 _read_tail_window_after_seq 一样要过闸——只擦 tail 不擦这里的话，
+    # summary 水位之前的旧泄漏行会继续被 replay 回去教模型模仿
+    # （Codex review 2026-08-08 Important #1）。
+    decrypted = _scrub_leaked_thinking_rows(
+        _decrypt_chat_rows(
+            user_id,
+            raw_rows,
+            user_only=False,
+            preserve_unreadable=True,
+        )
     )
     raw_by_seq = {int(row["seq"]): row for row in raw_rows}
     for row in decrypted:
@@ -4030,6 +4087,55 @@ def _record_extraction_status(
     )
 
 
+async def _load_mcp_turn_observed(store, **kwargs):
+    """`mcp_tools.load_turn_mcp` + 把本轮工具面写进 admin 可见的 debug trace。
+
+    为什么包在装配层而不是 loader 里:loader 在 `hosted`,worker 是依赖洁净的
+    (不能碰 db/hosted)—— serve_worker 才是既能拿到 loader、又能写诊断的那一层。
+
+    为什么必须有:在此之前 V2 这条路只有一行 `log.warning`,进不了 admin。
+    usr_1baf(2026-08-09)报「MCP 测试连接通过、AI 却说搜不到」时,pi 那条路已经
+    有 mcp.surface.* 埋点、一眼能看到每台注册了几个,**V2 这条什么都没有**,
+    只能靠读代码猜。事件名与 pi 侧刻意保持一致,同一套排查方法两条 lane 通用。
+    """
+    turn = await mcp_tools.load_turn_mcp(store, **kwargs)
+    try:
+        summary = dict(getattr(turn, "summary", None) or {})
+        if summary:
+            dropped = max(0, int(summary.get("offered") or 0)
+                          - int(summary.get("kept") or 0))
+            await asyncio.to_thread(
+                _emit_v2_debug_trace,
+                store,
+                "mcp.surface.resolved",
+                status="error" if dropped else "ok",
+                summary=(f"MCP 工具面 {summary.get('kept')} 个"
+                         + (f",裁掉 {dropped} 个" if dropped else "")),
+                explain=(
+                    f"模型这一轮能看到 {summary.get('kept')} 个 MCP 工具"
+                    + (f";另有 {dropped} 个因超过上限被裁掉 —— 分配是**轮转公平**"
+                       "的(每台各拿一个再拿第二个),裁掉的是工具最多那几台的尾部,"
+                       "每台仍有代表工具。detail.per_server 是「注册数/发现数」"
+                       if dropped else "")
+                ),
+                detail={"driver": "v2", "lane": "chat", **summary},
+            )
+    except Exception as exc:  # noqa: BLE001 — 诊断绝不能影响回合
+        log.warning("[v2.mcp] surface trace failed: %s", type(exc).__name__)
+    return turn
+
+
+def _emit_v2_debug_trace(store, event_type: str, *, status: str,
+                         summary: str, explain: str, detail: dict) -> None:
+    from diagnostics import diagnostics_core
+
+    diagnostics_core.emit_trace_event_payload(store, {"event": {
+        "subsystem": "agent", "type": event_type, "status": status,
+        "summary": summary, "explain": explain, "detail": detail,
+        "actor": "hosted_v2",
+    }})
+
+
 def build_production_deps() -> v2_worker.TurnDeps:
     return v2_worker.TurnDeps(
         read_messages=_read_messages,
@@ -4092,7 +4198,7 @@ def build_production_deps() -> v2_worker.TurnDeps:
         capture_enabled=_capture_enabled_for_user,
         dream_enabled=_dream_enabled_for_user,
         apply_pending_effects=_apply_pending_effects_for_user,
-        load_mcp_turn=mcp_tools.load_turn_mcp,
+        load_mcp_turn=_load_mcp_turn_observed,
         load_workspace_prompt=_load_workspace_prompt,
         load_workspace_file=_load_workspace_file,
         seal_trajectory_payload=_seal_trajectory_payload,

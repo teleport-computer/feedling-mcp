@@ -10,11 +10,101 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
-- **Runtime V1 now pins and verifies the selected Claude model.** Managed
-  Claude Code commands pass the configured route through `--model`, model
-  changes rotate resident sessions, and structured Claude output that proves a
-  different model served the turn is rejected as `model_mismatch` instead of
-  silently returning a reply from the wrong model.
+- **Runtime V1 Fable 5 chat no longer requires visible chain-of-thought.**
+  Fable 5 routes running through pi, including OpenRouter and compatible relays,
+  now skip the mandatory `<think>` response format that the model refuses. Pi's
+  native reasoning setting is unchanged, and other models keep the existing
+  self-thinking behavior.
+- **Memory extraction no longer mistakes model thinking for its JSON result.**
+  Capture, Dream, legacy-card migration, and resident identity distillation now
+  remove well-formed thinking blocks before locating the result object while
+  retaining the previous raw-text fallback for malformed output. Hosted
+  Capture and Dream may re-ask once after a JSON decoding error; truncated or
+  prose-only responses remain non-retryable parse failures.
+
+- **A base URL that is not an API endpoint no longer reports as an API-key
+  failure.** When the configured relay base URL points at a web page rather than
+  the API (an HTTP 200 that returns the site's homepage, or a **404** HTML error
+  page), `provider_test_failed` now returns `"status_code": null` and a
+  bilingual `detail` telling the operator the endpoint usually needs to end with
+  `/v1` and that the API key is not the problem. Clients should display that
+  `detail` directly. HTML error pages carrying any other status
+  (401/402/429/5xx — relay auth, payment, throttle and gateway pages) keep their
+  original status code and detail unchanged.
+
+- **Runtime V2 Chat can search its own older conversation history on demand.**
+  Two chat-only agent tools let the agent keyword-search messages beyond its
+  visible context and read a small window around a match. Original messages
+  remain the retrieval source of truth (summaries only prioritize scanning);
+  decryption and matching stay inside the enclave under strict row/byte/time
+  budgets; attachment binaries are never read for search. A turn that reads
+  history loses outbound web/MCP/task tools for the next round, proactive wake
+  lanes never see these tools, and a deployment kill switch (default on) can
+  remove the capability without touching the normal chat path.
+- **Genesis plaintext retries reuse completed persona-voice mapping.** The
+  estimate/commit flow now retains its opaque staged-upload pointer in trusted
+  job metadata until completion, and both fact-map and voice-map window results
+  are stored in the encrypted checkpoint. Manual retries skip those completed
+  model calls without duplicating memory cards. Interrupted workers also emit
+  content-free cause, progress, elapsed-time, model, tier, and checkpoint-size
+  diagnostics; interruption and retry policy itself is unchanged.
+- **A large MCP server can no longer starve a smaller one.** When the connected
+  servers together expose more tools than one turn can carry, the tools kept are
+  now allocated round-robin across servers instead of taken in server-name order,
+  so every connected server keeps a share; only the largest ones are trimmed.
+  Previously a single big server could consume the whole budget and a server
+  later in the alphabet would contribute no tools at all — its connection test
+  passed while the companion genuinely could not see any of its tools. This now
+  applies to both runtimes: the self-hosted bridge and Hosted Runtime V2, whose
+  catalog was still filled in server-name order. The self-hosted bridge's
+  per-turn cap is also raised from 50 to 100.
+- **A self-hosted `claude` agent now receives the MCP servers you enabled in the
+  app.** A hand-written `AGENT_CLI_CMD` without the `{mcp}` placeholder — the
+  form the operator documentation previously showed — never passed
+  `--mcp-config`, so no app-configured server reached the agent even though its
+  connection test passed. Chat turns now get the server list and a matching
+  pre-approval for its tools. A command that already sets `--mcp-config` is left
+  untouched, and one that pins its own `--allowed-tools` keeps it and is told in
+  the log which `mcp__<name>__*` rules to add. Other self-hosted runtimes
+  (`codex`, hermes, OpenClaw) were unaffected: they read MCP from their own
+  config files.
+
+- **Voice calls no longer end with a protocol error when a turn produces no
+  speech.** A turn that is deliberately silent — transport noise, a call that
+  already ended, an ASR revision that superseded it — now returns a valid
+  completion instead of one with no content at all, which ElevenLabs rejected
+  as a Custom LLM failure and used to terminate the whole call.
+
+- **A finished call stays in ordinary conversation context.** Its preview card
+  is replayed as a labelled call-record block that names the speakers and
+  states the transcript is not the companion's own speech, rather than being
+  removed from the prompt entirely. Memory distillation is unchanged and still
+  reads the archived full transcript.
+
+- **Thinking-leak gate.** A model's own `<think>` block could reach the user's
+  chat bubble on three delivery paths: Runtime V2 chat stripped only the first
+  block of a reply, resident V1 required a matched open/close pair and passed an
+  orphaned closing tag through verbatim, and proactive messages had no stripping
+  at all. All four delivery points and the assistant history replayed to the
+  model now share one strip step that fails closed when a block cannot be
+  cleanly resolved. New `FEEDLING_THINK_GATE` environment variable, on by
+  default, documented in Self-hosting. Turning off `FEEDLING_V2_SELF_THINKING`
+  no longer disables this gate.
+- **Runtime V2 now supports stricter Anthropic-compatible models during chat and
+  multi-step tool use.** Fable 5 is allowed to answer without the optional
+  self-thinking bubble instead of being forced into a visible chain-of-thought
+  format that it refuses. Native tool definitions also remain visible while
+  their matching `tool_use` / `tool_result` history is in the turn, so models
+  such as Opus 4.8 can continue a real tool workflow without treating earlier
+  results as fabricated. Repeated memory discovery is still executed at most
+  once per mode.
+
+- **Runtime V1 now pins and verifies the selected Claude model family.** Managed
+  Claude Code commands pass the configured route through `--model`, and model
+  changes rotate resident sessions. A Claude Code fallback to another Claude
+  model is allowed and logged with both configured and actual model IDs;
+  structured output that proves a non-Claude model served a Claude route is
+  rejected as `model_mismatch`.
 
 - **The companion now decides when to generate an image.** Image generation is
   no longer triggered by keyword matching on the user's message, and a dedicated
@@ -28,6 +118,13 @@ change must not be interpreted as an API guarantee.
   claims an image was produced when none was is returned once for correction,
   and is then delivered as written. `POST /v1/image-generation/generate` and the
   existing encrypted image-delivery path are unchanged.
+
+- **Image-model setup failures remain actionable without replacing the
+  companion's reply.** Runtime V1, Runtime V2, and CLI residents now preserve an
+  allowlisted `image_generation_*` code on the failed `generate_image` activity
+  event. Clients can use the final image-generation attempt in a completed turn
+  to offer model setup while still displaying the companion's own words. A later
+  successful attempt or a temporary provider failure does not request setup.
 
 - **Failed voice calls now have an explicit, idempotent cancellation path.**
   `POST /v1/voice/cancel` installs a durable per-call tombstone, clears
@@ -981,16 +1078,14 @@ change must not be interpreted as an API guarantee.
   Unlabeled envelopes are accepted unchanged, so existing clients are
   unaffected. This closes the failure mode where a writer with a stale key
   seals messages the owner's device can never decrypt.
-- Expand `GET /healthz` from a fixed liveness stub into a structured
-  liveness-and-dependency probe. Responses now carry a top-level `status`
-  (`healthy`, `degraded`, or `unhealthy`), a `checks` object with per-component
-  detail, and release/uptime metadata, while preserving the legacy `ok` /
-  `mode` / `ready` fields. The backend checks PostgreSQL (`SELECT 1`),
-  connection-pool saturation, the in-memory user registry, and the cross-worker
-  wake-bus listener, and returns HTTP 503 when PostgreSQL is unreachable. The
-  enclave reports readiness, release, and TLS posture from cached boot state
-  without performing any cryptography. The documented response schema is
-  unchanged (a generic JSON object).
+- `GET /healthz` is now a pool-independent process-liveness probe. It keeps the
+  structured status, release/uptime metadata, legacy fields, in-memory user
+  registry check, and cross-worker wake-bus check, but no longer executes
+  `SELECT 1`, inspects the business connection pool, returns DB-related 503s, or
+  includes `checks.db` / `checks.db_pool`. This prevents saturated user traffic
+  from delaying the health probe or creating a false outage. PostgreSQL
+  readiness now requires a separate authenticated synthetic read/write probe.
+  The documented response schema remains a generic JSON object.
 - `POST /v1/mcp/servers` now accepts `http://` URLs and loopback/private-network
   and raw-IP hosts — this backend never dials the URL itself, only your agent
   does when it calls a tool, so none of those forms were ever a new attack

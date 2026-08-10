@@ -809,18 +809,20 @@ def test_transient_failure_reply_keeps_fallback():
     """会自愈的错误（5xx/限流/流断）——「稍后再发一次」对它们是真话，保持不变。"""
     notice = _cls(RuntimeError("cli agent exited 1: 503 upstream overloaded"))
     assert notice.blame == "provider_transient"
-    assert crc._turn_failure_reply_text(notice) == crc.FALLBACK_REPLY
+    assert crc._turn_failure_reply_text(notice, "再试一次") == crc.FALLBACK_REPLY
+    assert crc._turn_failure_reply_text(notice, "try again") == crc.FALLBACK_REPLY_EN
 
 
 def test_system_failure_reply_keeps_fallback():
     """我们自己的锅同样保持兜底：绝不能引导用户去改配置（误导，见 dded 案例）。"""
     notice = _cls(subprocess.TimeoutExpired(cmd="agent", timeout=300))
     assert notice.blame == "system"
-    assert crc._turn_failure_reply_text(notice) == crc.FALLBACK_REPLY
+    assert crc._turn_failure_reply_text(notice, "再试一次") == crc.FALLBACK_REPLY
+    assert crc._turn_failure_reply_text(notice, "try again") == crc.FALLBACK_REPLY_EN
 
 
 def test_none_notice_falls_back():
-    assert crc._turn_failure_reply_text(None) == crc.FALLBACK_REPLY
+    assert crc._turn_failure_reply_text(None) == crc.FALLBACK_REPLY_EN
 
 
 def test_actionable_reply_suppresses_duplicate_banner():

@@ -302,13 +302,23 @@ provider-facing truncation. `memory_categories` is optional: it is present only 
 returned item has one of the canonical bilingual memory buckets and its counts
 sum to `memory_count`. If any bucket is custom or unknown, the category list is
 omitted and clients should show the total only. Raw bucket labels, summaries,
-memory content, and query text never enter activity metadata.
+memory content, and query text never enter activity metadata. Successful
+`history_search` and `history_fetch` calls likewise record only a content-free
+scanned-row count; matched snippets, message bodies, and query text never enter
+activity metadata.
 
 Every executed Runtime V2 platform, MCP, `reply`, and `send_file` call uses the
 same started/result/error activity boundary. Repeated memory-discovery calls
 that are deterministically rejected by the loop are recorded as confirmed
 results too. Zero-result discovery is retained, and each turn returns at most
 100 projected events.
+
+For `generate_image`, an allowlisted configuration or provider failure keeps its
+specific `image_generation_*` value in `result_code`; the tool result body is
+still excluded. A client that offers image-model setup should inspect only the
+final `generate_image` attempt in a completed turn. A later successful attempt,
+or a temporary error such as rate limiting or upstream unavailability, must not
+be presented as missing configuration.
 
 Completed tool events are also attached to the assistant history item's
 `activity_events` metadata, so clients can render the execution record below

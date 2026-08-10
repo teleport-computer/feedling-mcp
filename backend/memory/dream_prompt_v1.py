@@ -23,6 +23,7 @@ from memory import card_guard, dream_gates
 from memory.card_text import (
     build_format_retry_prompt,
     card_text_rejection,
+    extract_json_block,
     format_error,
     sanitize_card_labels,
 )
@@ -65,9 +66,10 @@ _DREAM_PROMPT_TEMPLATE = """你是 {ai_name}——{user_name} 的伴侣。现在
   贴合，再从这些通用桶里挑，仍不贴合才起一个具体的新桶——
   {common_buckets}
 · 称呼：{naming_rule}这些卡是 TA 会亲眼看到的记忆——写进卡里的字段永远不要用
-  "用户"/"user"这类系统称谓，也不要用「TA」指代对方（「TA」只是这份指令里的标记）；
-  整理旧卡时顺手把指代对方本人的"用户"/"user"/「TA」/「你」/猜测性别的他或她
-  改成已知名字；名字未知时优先省略主语，确实需要主语才用中性的「对方」——
+  "用户"/"user"这类系统称谓，也不要用「TA」指代本人（「TA」只是这份指令里的标记）；
+  整理旧卡时，把旧卡里指代本人的"用户"/"user"/「TA」/「你」/「对方」按上面那条
+  称呼规则重写一遍：有名字用名字，没名字但线索够就用「他」/「她」，都判断不出来
+  才留「对方」。旧卡里已经在用的「他」/「她」保留不动。
   卡里若有指代你（AI）的「TA」，那是 TA 视角对你的叫法，保留不动。
   字段里最好整个不出现「用户」/"user"：确实要写产品术语就去掉这个前缀
   （写「界面」「留存」，而不是「用户界面」「用户留存」），免得分不清那个「用户」
@@ -124,26 +126,6 @@ def build_dream_prompt(
     )
 
 
-def _extract_json_block(raw: str) -> str:
-    text = (raw or "").strip()
-    if text.startswith("```"):
-        text = text.split("```", 2)[1] if text.count("```") >= 2 else text.strip("`")
-        if text.lstrip().lower().startswith("json"):
-            text = text.lstrip()[4:]
-    start = text.find("{")
-    if start < 0:
-        return ""
-    depth = 0
-    for i in range(start, len(text)):
-        if text[i] == "{":
-            depth += 1
-        elif text[i] == "}":
-            depth -= 1
-            if depth == 0:
-                return text[start : i + 1]
-    return ""
-
-
 def _clamp01(value) -> float:
     try:
         f = float(value)
@@ -181,7 +163,7 @@ def parse_dream_consolidations(
     「明显不对」,绝不判内容质量)拆掉了语义审查员和 15% 增量栅栏;本闸与
     card_text 的墓碑短语闸是替代 —— 确定性、跑在出口、对模型不可见。
     """
-    block = _extract_json_block(raw)
+    block = extract_json_block(raw)
     if not block:
         return [], [], "no_json_object"
     try:

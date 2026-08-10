@@ -15,7 +15,7 @@ from datetime import datetime, timezone
 from typing import Any, Sequence
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from voice.message_filter import conversation_rows
+from voice.message_filter import VOICE_CALL_RECORD_ROLE, conversation_rows
 
 # Fallback timezone when the user's IANA zone is unknown or invalid. Defaults to
 # Asia/Shanghai (most users are in China) and matches the resident consumer's
@@ -208,13 +208,21 @@ ORDERED_REPLY_TARGET_POLICY = (
 )
 
 
-def chat_system_prompt() -> str:
+def _supports_mandatory_self_thinking(provider_config: Any) -> bool:
+    if provider_config is None:
+        return True
+    model = str(getattr(provider_config, "model", "") or "").strip().lower()
+    return model.rsplit("/", 1)[-1] != "claude-fable-5"
+
+
+def chat_system_prompt(provider_config: Any = None) -> str:
     """CHAT_SYSTEM_PROMPT, plus the self-authored-thinking instruction when the
-    self-thinking kill switch is on (v1). Appended as a suffix so the cache-stable
-    prefix is unchanged when the switch is off (byte-identical to today)."""
+    self-thinking kill switch is on and the selected V2 model supports it.
+    Appended as a suffix so the cache-stable prefix is unchanged when the switch
+    is off (byte-identical to today)."""
     from core import self_thinking
 
-    if self_thinking.enabled():
+    if self_thinking.enabled() and _supports_mandatory_self_thinking(provider_config):
         return CHAT_SYSTEM_PROMPT + self_thinking.INSTRUCTION
     return CHAT_SYSTEM_PROMPT
 
@@ -597,6 +605,13 @@ def build_turn_messages(
     for m in conversation_rows(tail):
         content = m.get("content")
         if not _has_payload(content):
+            continue
+        if str(m.get("role") or "") == VOICE_CALL_RECORD_ROLE:
+            # 通话记录既不是伴侣自己说的话,也不是用户这一轮的输入。
+            # 走应用数据身份(和世界书/时间上下文同一约定),抬头在正文里。
+            # 注意不能落到 _norm_role:未知 role 会被归成 "user",
+            # 那等于让模型以为这段是用户说的。
+            messages.append({"role": application_data_role, "content": content})
             continue
         messages.append({"role": _norm_role(m.get("role")), "content": content})
 

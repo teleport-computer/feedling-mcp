@@ -59,6 +59,15 @@ def test_parse_keeps_all_5_user_layer_fields_when_present():
     assert out["stable_definitions"] == ["老板=我上司", "deadline 一律指北京时间"]
 
 
+def test_parse_identity_ignores_fake_json_inside_thinking():
+    raw = (
+        '<think>草稿 {"agent_name": not valid}</think>'
+        '{"agent_name":"小明","dimensions":[]}'
+    )
+    out = dp.parse_identity_payload(raw)
+    assert out is not None and out["agent_name"] == "小明"
+
+
 def test_parse_material_without_user_layer_signal_leaves_them_absent():
     # Grounding + no-clobber: a distill output that never mentions these fields
     # simply doesn't carry them — the caller (server-side merge) preserves
