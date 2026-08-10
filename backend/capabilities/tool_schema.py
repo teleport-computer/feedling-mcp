@@ -22,6 +22,11 @@ from capabilities import registry
 # Card-writing rules live with the memory package (single source of truth shared
 # with the V1 guidance block); only the op names above are V2-specific.
 from memory import prompts_v1
+from perception.agent_fields import (
+    AGENT_PERCEPTION_SIGNALS,
+    AGENT_SIGNAL_FIELDS,
+    FAST_AGENT_PERCEPTION_SIGNALS,
+)
 
 REPLY_TOOL = "reply"
 FILE_REPLY_TOOL = "send_file"
@@ -36,6 +41,22 @@ _STR = {"type": "string"}
 _INT = {"type": "integer"}
 _BOOL = {"type": "boolean"}
 _NO_ARGS: dict = {"type": "object", "properties": {}}
+
+# Keep the provider-visible vocabulary tied to the same projection catalog the
+# capability executor consumes.  A copied enum silently drifts and turns an
+# otherwise healthy perception read into ``unknown_signals`` at runtime.
+_PERCEPTION_SIGNAL_ENUM = list(AGENT_PERCEPTION_SIGNALS)
+_PERCEPTION_FIELD_ENUM = sorted({
+    field
+    for fields in AGENT_SIGNAL_FIELDS.values()
+    for field in fields
+})
+_PERCEPTION_DEFAULTS = ", ".join(FAST_AGENT_PERCEPTION_SIGNALS)
+_PERCEPTION_DOMAINS = (
+    "time/battery, location, weather, motion/focus/audio/app context, "
+    "calendar/reminders, and health/activity data (steps, sleep, workout, "
+    "vitals, activity, body, metabolic, cycle, mood)"
+)
 
 _MEMORY_TOOL_ACTION = {
     "type": "object",
@@ -190,7 +211,12 @@ PARAMS: dict[str, dict] = {
     # perception.snapshot: params.get("signals") (list or csv string).
     "perception_snapshot": {
         "type": "object",
-        "properties": {"signals": {"type": "array", "items": _STR}},
+        "properties": {
+            "signals": {
+                "type": "array",
+                "items": {"type": "string", "enum": _PERCEPTION_SIGNAL_ENUM},
+            },
+        },
         "required": [],
     },
     # perception.recent_apps: params.get("limit"), params.get("hours").
@@ -202,13 +228,20 @@ PARAMS: dict[str, dict] = {
     # perception.trend: params.get("signal"), params.get("field"), params.get("days").
     "perception_trend": {
         "type": "object",
-        "properties": {"signal": _STR, "field": _STR, "days": _INT},
+        "properties": {
+            "signal": {"type": "string", "enum": _PERCEPTION_SIGNAL_ENUM},
+            "field": {"type": "string", "enum": _PERCEPTION_FIELD_ENUM},
+            "days": _INT,
+        },
         "required": [],
     },
     # perception.history: params.get("signal"), params.get("days").
     "perception_history": {
         "type": "object",
-        "properties": {"signal": _STR, "days": _INT},
+        "properties": {
+            "signal": {"type": "string", "enum": _PERCEPTION_SIGNAL_ENUM},
+            "days": _INT,
+        },
         "required": [],
     },
 
@@ -453,7 +486,11 @@ DESCRIPTIONS: dict[str, str] = {
                      "may include an audit 'reason'. Get "
                      "target_ids from memory_search/memory_index first.\n"
                      + prompts_v1.MEMORY_WRITE_RULES_V1),
-    "perception_snapshot": ("Read the latest perception snapshot for the given signals. "
+    "perception_snapshot": ("Read the latest perception snapshot for named signals across "
+                            + _PERCEPTION_DOMAINS + ". "
+                            "If signals is omitted, ONLY the fast defaults are returned: "
+                            + _PERCEPTION_DEFAULTS + ". Health and activity signals are "
+                            "never included by default; request them explicitly by name. "
                             "The app field is only the latest open/close event observed "
                             "within 15 minutes; never claim it is the app currently in use. "
                             "Use perception_recent_apps for an activity trajectory."),
@@ -462,10 +499,15 @@ DESCRIPTIONS: dict[str, str] = {
                                "the time window and check minutes_ago before saying 'just "
                                "now'. apps=[] means no data; disabled=true means access is "
                                "off, not that no apps were used."),
-    "perception_trend": ("Read a trend summary for a perception signal over recent days. "
+    "perception_trend": ("Read a numeric-field trend over recent days for one named signal "
+                         "from " + _PERCEPTION_DOMAINS + ". Snapshot defaults do not apply: "
+                         "always name the signal, and name the field when the signal has "
+                         "multiple numeric fields. "
                          "Interpret the rolling baseline as the usual level and delta as "
                          "the current change from that baseline; do not conflate them."),
-    "perception_history": "Read raw historical values for a perception signal over recent days.",
+    "perception_history": ("Read raw daily historical values over recent days for one named "
+                           "signal from " + _PERCEPTION_DOMAINS + ". Snapshot defaults do "
+                           "not apply: always request the signal explicitly."),
     "screen_recent": "List recent screen-share frame metadata.",
     "screen_read": ("Read a specific screen-share frame, or the latest one if no frame_id "
                     "is given. Start without include_image for caption/OCR. If pixels are "

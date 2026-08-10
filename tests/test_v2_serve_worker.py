@@ -511,6 +511,7 @@ def test_build_production_deps_returns_turndeps(monkeypatch):
     assert callable(deps.read_temporal_snapshot)
     assert callable(deps.read_summary_with_seq)
     assert callable(deps.has_genuine_user_history)
+    assert callable(deps.emit_debug_trace)
     monkeypatch.setattr(
         serve_worker.db,
         "chat_latest_genuine_user_ts",
@@ -524,6 +525,47 @@ def test_build_production_deps_returns_turndeps(monkeypatch):
     )
     assert deps.has_genuine_user_history("u-has-history") is True
 
+
+def test_v2_debug_trace_user_seam_resolves_store_and_preserves_duration(monkeypatch):
+    calls = []
+    store = object()
+    monkeypatch.setattr(
+        serve_worker.core_store,
+        "get_store",
+        lambda uid: (calls.append(uid), store)[1],
+    )
+    monkeypatch.setattr(
+        serve_worker,
+        "_emit_v2_debug_trace",
+        lambda resolved_store, event_type, **kwargs: calls.append(
+            (resolved_store, event_type, kwargs)
+        ),
+    )
+
+    serve_worker._emit_v2_debug_trace_for_user(
+        "usr_trace",
+        "agent.tool.call",
+        status="ok",
+        summary="V2 perception_snapshot ok",
+        explain="safe",
+        detail={"tool": "perception_snapshot"},
+        dur_ms=7.5,
+    )
+
+    assert calls == [
+        "usr_trace",
+        (
+            store,
+            "agent.tool.call",
+            {
+                "status": "ok",
+                "summary": "V2 perception_snapshot ok",
+                "explain": "safe",
+                "detail": {"tool": "perception_snapshot"},
+                "dur_ms": 7.5,
+            },
+        ),
+    ]
 
 def test_v2_mcp_mixed_reachable_and_unreachable_servers_are_traced_and_recorded(
     monkeypatch,
