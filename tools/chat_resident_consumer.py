@@ -5578,7 +5578,7 @@ def _trace_user_mcp_wiring(cmd: list[str], *, trace_id: str, lane: str) -> None:
         # 托管模板恒带 `--allowed-tools`(里面只有 io_cli 动词)、托管环境恒设
         # CLAUDE_CONFIG_DIR,所以旧判据对托管用户永远返回 true —— 它唯一该报的
         # 那个状态,恰恰是它报不出来的。
-        ungranted = _claude_mcp_servers_granted(cmd, names)
+        ungranted, partial_grants = _claude_mcp_grant_state(cmd, names)
         authorized = not ungranted
     else:
         codex_home = os.environ.get("CODEX_HOME", "")
@@ -5586,8 +5586,8 @@ def _trace_user_mcp_wiring(cmd: list[str], *, trace_id: str, lane: str) -> None:
         mechanism = "config.toml"
         authorized = wired  # codex 的 MCP 授权就在同一份 config 里
         # codex 没有「接线了但没授权」这个中间态(同一份 config 两件事一起做),
-        # 所以永远没有待授权名单 —— 但下面的 explain/detail 是两条路共用的。
-        ungranted = []
+        # 所以永远没有这两个名单 —— 但下面的 explain/detail 是两条路共用的。
+        ungranted, partial_grants = [], []
     _emit_debug_trace(
         "agent",
         "mcp.surface.wired" if wired else "mcp.surface.missing",
@@ -5604,19 +5604,28 @@ def _trace_user_mcp_wiring(cmd: list[str], *, trace_id: str, lane: str) -> None:
         ) + ("" if authorized or not wired else
              ";但这几台没有任何授权规则(allowlist 参数和 settings.json 里都没有 "
              "`mcp__<名字>__…`),调用会被拒,模型通常会说「需要授权」:"
-             + ",".join(ungranted[:10])),
+             + ",".join(ungranted[:10]))
+          + ("" if not partial_grants else
+             ";另有几台只授权了具体工具、不是整台(`mcp__<名字>__*`),"
+             "该服务器的其余工具仍会被拒:" + ",".join(partial_grants[:10])),
         detail={
             "driver": "claude" if is_claude else "codex",
             "lane": lane, "mechanism": mechanism,
-            "wired": wired, "authorized": authorized,
+            # ⚠️ 名字是 has_grant_rule 不是 authorized:这是对我们自己的 argv 和
+            # settings.json 做的**前置检查**,它能证明授权**缺失**(那才是要抓的
+            # 失败),但证明不了授权**有效** —— 最终判据是调用时的
+            # permission_denials(codex 审出:逐工具规则也会让整台被误判为已授权)。
+            "wired": wired, "has_grant_rule": authorized,
             "servers": names[:20],
             **({"ungranted": ungranted[:20]} if ungranted else {}),
+            **({"partial_grants": partial_grants[:20]} if partial_grants else {}),
         },
     )
 
 
 def _trace_user_mcp_registered(raw: str, cmd: list[str], *,
-                               trace_id: str, lane: str) -> None:
+                               trace_id: str, lane: str,
+                               attempt: str = "first") -> None:
     """What the CLI itself says it registered — the only postflight ground truth.
 
     ``_trace_user_mcp_wiring`` is a **preflight**: it reads our own argv and
@@ -5636,6 +5645,14 @@ def _trace_user_mcp_registered(raw: str, cmd: list[str], *,
 
     Registration is not approval: a registered tool can still be denied at call
     time (that lands in ``permission_denials``). Preflight covers the grant.
+
+    ⚠️ Emitted once per CLI **attempt**, same rule the pi surface trace follows:
+    a retry starts a NEW process that redoes the MCP handshake, and it replaces
+    ``result`` wholesale rather than appending to it. Tracing only the first
+    attempt reports a process whose output was thrown away — and when the first
+    attempt died before printing any init at all, it reports nothing while the
+    turn that actually answered goes unobserved. ``attempt`` labels which one,
+    so the last event for a trace_id is the one that produced the reply.
     """
     if lane != "chat" or not _is_claude_code_cmd(cmd):
         return
@@ -5669,10 +5686,14 @@ def _trace_user_mcp_registered(raw: str, cmd: list[str], *,
         if not name:
             continue
         registered.append(name)
-        # Claude reports per-server handshake state; anything that is not a
-        # positive connection means the model has that server's tools missing.
-        if status and status not in ("connected", "ok", "ready"):
-            failed.append(f"{name}:{status}")
+        # Exactly the SDK's own predicate — `s.status !== "connected"` is a
+        # failed server. Nothing else counts as working: an entry with no
+        # status, a bare string entry, and any status we don't recognise are
+        # all states we have no evidence about, and guessing them green is how
+        # a postflight built to catch false greens starts producing them.
+        # `ready`/`ok` were my invention, with no protocol basis (codex 审出)。
+        if status != "connected":
+            failed.append(f"{name}:{status or 'unknown'}")
     missing = [n for n in expected if n not in registered]
     ok = not missing and not failed
     _emit_debug_trace(
@@ -5693,6 +5714,9 @@ def _trace_user_mcp_registered(raw: str, cmd: list[str], *,
         detail={
             "expected": expected[:20], "registered": registered[:20],
             "missing": missing[:20], "failed": failed[:20],
+            # Which CLI attempt this describes. A turn can emit several; the
+            # last one is the process that produced the reply.
+            "attempt": attempt,
         },
     )
 
@@ -6857,8 +6881,17 @@ def _claude_mcp_grant_sources(cmd: list[str]) -> list[str]:
     for i, tok in enumerate(cmd):
         if tok.startswith(("--allowed-tools=", "--allowedTools=")):
             rules.extend(tok.split("=", 1)[1].split(","))
-        elif tok in ("--allowed-tools", "--allowedTools") and i + 1 < len(cmd):
-            rules.extend(cmd[i + 1].split(","))
+        elif tok in ("--allowed-tools", "--allowedTools"):
+            # Variadic: the official shape is `--allowedTools "r1" "r2"`, while
+            # this repo's templates pass one comma-joined value. Reading only
+            # the token that follows would drop every rule after the first and
+            # report those servers as ungranted. Over-reading is harmless here —
+            # this function only inspects argv, never rewrites it, so a stray
+            # non-rule token just fails to match any `mcp__<name>__` prefix.
+            for nxt in cmd[i + 1:]:
+                if nxt.startswith("-"):
+                    break
+                rules.extend(nxt.split(","))
     config_dir = os.environ.get("CLAUDE_CONFIG_DIR", "")
     if config_dir:
         try:
@@ -6874,17 +6907,32 @@ def _claude_mcp_grant_sources(cmd: list[str]) -> list[str]:
     return [r.strip() for r in rules if str(r).strip()]
 
 
-def _claude_mcp_servers_granted(cmd: list[str], names: list[str]) -> list[str]:
-    """Which of ``names`` have no allow rule covering them.
+def _claude_mcp_grant_state(cmd: list[str],
+                            names: list[str]) -> tuple[list[str], list[str]]:
+    """Split enabled servers into (no rule at all, only per-tool rules).
 
-    Prefix match on ``mcp__<name>__`` rather than equality, because a grant can
-    legitimately be written per-tool (``mcp__ombre__search``) instead of the
-    wildcard we emit — treating only ``mcp__<name>__*`` as authorized would
-    report a working per-tool grant as missing.
+    ``mcp__<name>__*`` is the only rule that covers a server's whole tool
+    surface. A per-tool rule (``mcp__ombre__search``) is a real grant, but it
+    grants exactly that one tool — calling it authorized would report a server
+    whose every OTHER tool is denied as fully fine, and would do the same for a
+    rule naming a tool that no longer exists. Neither is decidable from argv,
+    so this reports the SHAPE of the grant and leaves the verdict to what
+    actually happens at call time (``permission_denials``).
+
+    That is also why nothing here is called "authorized": this is a preflight
+    over our own files. It can prove a grant is MISSING — the failure worth
+    catching — but it cannot prove one works.
     """
     rules = _claude_mcp_grant_sources(cmd)
-    return [n for n in names
-            if not any(r.startswith(f"mcp__{n}__") for r in rules)]
+    ungranted, partial = [], []
+    for n in names:
+        prefix = f"mcp__{n}__"
+        matched = [r for r in rules if r.startswith(prefix)]
+        if not matched:
+            ungranted.append(n)
+        elif prefix + "*" not in matched:
+            partial.append(n)
+    return ungranted, partial
 
 
 def _inject_claude_user_mcp(cmd: list[str], lane: str) -> list[str]:
@@ -8006,7 +8054,7 @@ def call_agent_cli(
     # …and what the CLI reports it actually registered, which is the only
     # observation that settles it (preflight can only say we handed them over).
     _trace_user_mcp_registered(
-        result.stdout or "", cmd, trace_id=trace_id, lane=lane)
+        result.stdout or "", cmd, trace_id=trace_id, lane=lane, attempt="first")
     if result.returncode == 0 and _is_claude_code_cmd(cmd):
         # Claude Code can silently choose its own default despite ANTHROPIC_MODEL.
         # Validate the CLI's structured receipt before persisting the session, so
@@ -8079,6 +8127,17 @@ def call_agent_cli(
                 result.stderr or "", trace_id=trace_id, lane=lane,
                 is_pi=_is_pi_cmd(cmd), attempt="stale_resume_retry",
             )
+            # This retry rebuilt `cmd` (fresh session) and started a new process
+            # that redid the MCP handshake, and `result` was REPLACED rather than
+            # appended to. Both MCP traces therefore have to run again: the first
+            # attempt's argv is no longer the argv that answered, and its init
+            # event is gone with its stdout — when that attempt died before
+            # printing one, tracing only the first leaves the turn that actually
+            # replied completely unobserved (codex 审出).
+            _trace_user_mcp_wiring(cmd, trace_id=trace_id, lane=lane)
+            _trace_user_mcp_registered(
+                result.stdout or "", cmd, trace_id=trace_id, lane=lane,
+                attempt="stale_resume_retry")
             # Persist the fresh session so the NEXT turn resumes it — but ONLY
             # from a SUCCESSFUL retry: claude's failure result JSON can still
             # carry a session_id, and saving that would re-persist a sid for a

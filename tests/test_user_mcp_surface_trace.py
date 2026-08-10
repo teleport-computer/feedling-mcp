@@ -295,7 +295,7 @@ def test_claude_wired_but_unauthorized_is_still_an_error():
                        env={"CLAUDE_CONFIG_DIR": ""})[0]
     assert kind == "mcp.surface.wired"
     assert kw["status"] == "error"
-    assert kw["detail"]["authorized"] is False
+    assert kw["detail"]["has_grant_rule"] is False
     assert "需要授权" in kw["explain"]
 
 
@@ -306,7 +306,7 @@ def test_claude_fully_wired_is_ok():
     ])[0]
     assert kind == "mcp.surface.wired"
     assert kw["status"] == "ok"
-    assert kw["detail"]["authorized"] is True
+    assert kw["detail"]["has_grant_rule"] is True
 
 
 def test_claude_partial_grant_names_only_the_ungranted_server():
@@ -321,7 +321,7 @@ def test_claude_partial_grant_names_only_the_ungranted_server():
     ], env={"CLAUDE_CONFIG_DIR": ""})[0]
     assert kind == "mcp.surface.wired"
     assert kw["status"] == "error"
-    assert kw["detail"]["authorized"] is False
+    assert kw["detail"]["has_grant_rule"] is False
     assert kw["detail"]["ungranted"] == ["gaodemap"]
 
 
@@ -338,7 +338,7 @@ def test_hosted_claude_is_authorized_by_settings_json_not_by_a_flag(tmp_path):
                        env={"CLAUDE_CONFIG_DIR": str(tmp_path)})[0]
     assert kind == "mcp.surface.wired"
     assert kw["status"] == "ok"
-    assert kw["detail"]["authorized"] is True
+    assert kw["detail"]["has_grant_rule"] is True
 
 
 def test_hosted_shaped_grant_without_mcp_rules_is_reported_unauthorized(tmp_path):
@@ -358,20 +358,58 @@ def test_hosted_shaped_grant_without_mcp_rules_is_reported_unauthorized(tmp_path
     ], env={"CLAUDE_CONFIG_DIR": str(tmp_path)})[0]
     assert kind == "mcp.surface.wired", "接线本身是好的 —— 坏的是授权"
     assert kw["status"] == "error"
-    assert kw["detail"]["authorized"] is False
+    assert kw["detail"]["has_grant_rule"] is False
     # 排序后再比:名单顺序跟的是启用顺序,不是这条断言想锁的东西。
     assert sorted(kw["detail"]["ungranted"]) == ["gaodemap", "tavily"]
 
 
-def test_per_tool_grant_counts_as_authorized(tmp_path):
-    """授权可以逐个工具写而不是通配 —— 只认 `mcp__x__*` 会把能用的报成没授权。"""
+def test_per_tool_grant_is_reported_as_partial_not_as_full_authorization(tmp_path):
+    """逐工具授权是**真的**授权,但只授权了那一个工具。
+
+    把它当成整台已授权,等于把「这台服务器其余工具全被拒」报成一切正常;
+    一条指向已不存在的工具名的规则也会同样假绿。所以它单列 partial_grants,
+    既不算缺失(不误报),也不冒充完整授权(不假绿)——最终判据是调用时的
+    permission_denials(codex 审出)。
+    """
     (tmp_path / "settings.json").write_text(json.dumps({"permissions": {"allow": [
-        "mcp__tavily__search", "mcp__gaodemap__geocode",
+        "mcp__tavily__search", "mcp__gaodemap__*",
     ]}}))
     kind, kw = _wiring(["claude", "--mcp-config=/tmp/x.json", "--print"],
                        env={"CLAUDE_CONFIG_DIR": str(tmp_path)})[0]
+    assert kw["status"] == "ok", "有规则就不算缺失,不该报错"
+    assert kw["detail"]["partial_grants"] == ["tavily"]
+    assert "gaodemap" not in kw["detail"].get("partial_grants", [])
+    assert "ungranted" not in kw["detail"]
+    assert "只授权了具体工具" in kw["explain"]
+
+
+def test_detail_does_not_claim_authorization_it_cannot_prove(tmp_path):
+    """字段名不能叫 authorized —— 这是对我们自己文件做的前置检查。
+
+    它能证明授权**缺失**(要抓的失败),证明不了授权**有效**。名字叫 authorized
+    的话,读 trace 的人会拿它当「能调用」的结论,而真正的判据在 permission_denials。
+    """
+    (tmp_path / "settings.json").write_text(json.dumps({"permissions": {"allow": [
+        "mcp__tavily__*", "mcp__gaodemap__*",
+    ]}}))
+    _kind, kw = _wiring(["claude", "--mcp-config=/tmp/x.json", "--print"],
+                        env={"CLAUDE_CONFIG_DIR": str(tmp_path)})[0]
+    assert "authorized" not in kw["detail"]
+    assert kw["detail"]["has_grant_rule"] is True
+
+
+def test_variadic_allowlist_reads_every_value_not_just_the_first(tmp_path):
+    """`--allowedTools "r1" "r2"` 是官方形状(变参)。
+
+    只读紧跟的那一个 token,第二台就会被假报成 ungranted —— 而这个埋点的整个
+    意义就是分辨真缺失(codex 审出)。
+    """
+    _kind, kw = _wiring([
+        "claude", "--mcp-config=/tmp/x.json",
+        "--allowedTools", "mcp__tavily__*", "mcp__gaodemap__*", "--print",
+    ], env={"CLAUDE_CONFIG_DIR": ""})[0]
     assert kw["status"] == "ok"
-    assert kw["detail"]["authorized"] is True
+    assert kw["detail"]["has_grant_rule"] is True
 
 
 def test_space_separated_allowlist_value_is_read():
@@ -385,7 +423,7 @@ def test_space_separated_allowlist_value_is_read():
         "--allowed-tools", "mcp__tavily__*,mcp__gaodemap__*", "--print",
     ], env={"CLAUDE_CONFIG_DIR": ""})[0]
     assert kw["status"] == "ok"
-    assert kw["detail"]["authorized"] is True
+    assert kw["detail"]["has_grant_rule"] is True
 
 
 def test_codex_without_config_home_is_reported_as_not_wired():
@@ -417,14 +455,16 @@ def _init_line(servers):
     }) + "\n"
 
 
-def _registered(stdout, *, lane="chat", enabled=("tavily",), cmd=None):
+def _registered(stdout, *, lane="chat", enabled=("tavily",), cmd=None,
+                attempt="first"):
     captured = []
     applied = {"servers": [{"name": n, "enabled": True} for n in enabled]}
     with patch.object(crc, "_emit_debug_trace",
                       side_effect=lambda ss, t, **kw: captured.append((t, kw))), \
          patch.object(crc, "_user_mcp_applied", applied):
         crc._trace_user_mcp_registered(
-            stdout, list(cmd or ["claude", "--print"]), trace_id="t1", lane=lane)
+            stdout, list(cmd or ["claude", "--print"]), trace_id="t1", lane=lane,
+            attempt=attempt)
     return captured
 
 
@@ -449,16 +489,43 @@ def test_empty_mcp_servers_on_a_chat_turn_is_the_headline_failure():
     assert sorted(kw["detail"]["missing"]) == ["gaodemap", "tavily"]
 
 
-def test_a_server_that_failed_its_handshake_is_not_counted_as_working():
-    """注册上了但握手失败 —— 名字在列表里,工具却一个都没有。
+def test_only_connected_counts_as_working():
+    """判据就是 SDK 自己那条:`status !== "connected"` 即失败。
 
-    只数 len(mcp_servers) 会把这种情况判绿,而用户的体感和「没接上」一样。
+    我第一版还把 `ok` / `ready` / **空 status** 也当成功 —— 那三个在 claude 的
+    init 协议里没有任何依据,是我编的。没有依据的状态一律不许判绿,否则一个
+    专门用来抓假绿的 postflight 自己开始产假绿(codex 审出)。
     """
-    kind, kw = _registered(_init_line([
-        {"name": "tavily", "status": "failed"},
-    ]))[0]
+    for status in ("failed", "pending", "ready", "ok", "needs-auth", ""):
+        kind, kw = _registered(_init_line([
+            {"name": "tavily", "status": status},
+        ]))[0]
+        assert kw["status"] == "error", f"status={status!r} 不该判绿"
+        assert kw["detail"]["failed"] == [f"tavily:{status or 'unknown'}"]
+
+
+def test_an_entry_without_a_status_field_is_not_assumed_working():
+    """dict 缺 status、以及裸字符串条目 —— 都是「我们没有观测」,不是「好的」。"""
+    _kind, kw = _registered(_init_line([{"name": "tavily"}]))[0]
     assert kw["status"] == "error"
-    assert kw["detail"]["failed"] == ["tavily:failed"]
+    assert kw["detail"]["failed"] == ["tavily:unknown"]
+    _kind, kw = _registered(_init_line(["tavily"]))[0]
+    assert kw["status"] == "error"
+    assert kw["detail"]["failed"] == ["tavily:unknown"]
+
+
+def test_attempt_is_labelled_so_the_final_one_is_identifiable():
+    """每次 attempt 各记一条,标明是哪一次。
+
+    重试会新起进程重做握手,并且**整个替换** result(不是追加),所以只记首次
+    等于记了一个输出已经被丢弃的进程;首次若在打出 init 之前就死了,真正回答的
+    那一轮还完全没有观测(codex 审出)。
+    """
+    first = _registered(_init_line([{"name": "tavily", "status": "connected"}]))[0][1]
+    retry = _registered(_init_line([{"name": "tavily", "status": "connected"}]),
+                        attempt="stale_resume_retry")[0][1]
+    assert first["detail"]["attempt"] == "first"
+    assert retry["detail"]["attempt"] == "stale_resume_retry"
 
 
 def test_last_init_wins_when_a_turn_was_retried():
