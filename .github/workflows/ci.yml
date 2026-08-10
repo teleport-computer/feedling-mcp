@@ -226,8 +226,11 @@ jobs:
           sed -n '1,9999p' /tmp/feedling-uncovered-tests.txt
           echo "::endgroup::"
           if [[ -s /tmp/feedling-now-covered-tests.txt ]]; then
-            echo "::warning::Some baseline tests are now covered or removed; shrink .github/pytest-uncovered-baseline.txt"
+            # 曾经只是 ::warning::,于是「名单可以缩了」永远没人处理,名单只增不减。
+            # 硬失败逼着删掉已覆盖/已删除的条目,棘轮才咬得住。
+            echo "These baseline entries are now covered or no longer exist; remove them from .github/pytest-uncovered-baseline.txt:"
             sed -n '1,9999p' /tmp/feedling-now-covered-tests.txt
+            exit 1
           fi
           if [[ -s /tmp/feedling-new-uncovered-tests.txt ]]; then
             echo "New top-level pytest files are not exercised by an explicit CI list or resident-consumer discovery:"
@@ -263,6 +266,9 @@ jobs:
             tests/test_chat_activity_projection.py \
             tests/test_capabilities_tool_schema.py \
             tests/test_debug_trace.py \
+            tests/test_access_mode_runtime_sync_unit.py \
+            tests/test_admin_usage.py \
+            tests/test_pytest_coverage_ratchet.py \
             tests/test_mcp_client.py \
             tests/test_mcp_status.py \
             tests/test_user_mcp_core.py \

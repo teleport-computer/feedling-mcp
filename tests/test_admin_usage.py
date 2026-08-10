@@ -2736,11 +2736,42 @@ def test_usage_query_failure_is_local_and_runtime_remains_available(monkeypatch)
     assert "各 lane 健康" in runtime_body
 
 
+def _mounted_paths(routes, *, depth: int = 0) -> set[str]:
+    """Collect the real URL paths behind FastAPI's included routers.
+
+    ⚠️ 不要改回直读 `app.routes` 里的 `route.path`。这个应用的顶层 routes
+    **全部**是 `_IncludedRouter`(fastapi 0.139,`requirements.lock` 钉死的版本),
+    而 `_IncludedRouter` 没有 `.path` —— 实测 29 个顶层 route,零个带 path。
+
+    原断言 `route.path == "/admin/data-track"` 因此抛 AttributeError。
+    也别用 `getattr(route, "path", None)` 打发:那样断言会**永远为 False**,
+    只是把崩溃换成一句 `assert False`,更难查。真正的路径挂在
+    `original_router.routes` 上,要递归下去取。
+    """
+    found: set[str] = set()
+    if depth > 6:
+        return found
+    for route in routes:
+        path = getattr(route, "path", None)
+        if isinstance(path, str):
+            found.add(path)
+        nested = getattr(route, "routes", None)
+        if nested is None:
+            inner = getattr(route, "original_router", None)
+            nested = getattr(inner, "routes", None)
+        if nested:
+            found |= _mounted_paths(nested, depth=depth + 1)
+    return found
+
+
 def test_asgi_assembly_wires_usage_report_to_jobs_store():
     """ASGI assembly registers the admin page and installs the real snapshot."""
     import asgi_app
 
-    assert any(route.path == "/admin/data-track" for route in asgi_app.app.routes)
+    paths = _mounted_paths(asgi_app.app.routes)
+
+    assert paths, "一条路径都没收集到 —— 递归走错了,断言会变成空转"
+    assert "/admin/data-track" in paths
     assert _data_track._usage_report is jobs_store.usage_report_snapshot
 
 
