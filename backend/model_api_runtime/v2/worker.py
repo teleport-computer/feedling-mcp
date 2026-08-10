@@ -775,7 +775,7 @@ def _safe_eager_screen_metadata(data: object) -> dict:
 
 
 def _screen_share_grounding(user_id: str) -> dict:
-    """聊天回合的「用户此刻正在共享屏幕」提示 —— **只回可用性,不回内容**。
+    """聊天回合的屏幕共享健康提示 —— **只回状态,不回内容**。
 
     为什么需要它:`CHAT_SYSTEM_PROMPT` 早就写了「请求涉及 shared screen 就用 screen
     工具」,但同一句后半段是「无关对话别调这些工具」。模型**无从知道此刻有没有共享
@@ -787,12 +787,13 @@ def _screen_share_grounding(user_id: str) -> dict:
     ① **不碰 enclave**。走 `db.frame_list_meta`(服务端明文的 frame_id/ts 索引),
        和 serve_worker 的屏幕监看生产者同一条路 —— 这个函数在**每个聊天回合**都跑,
        一次 enclave 往返会锤死共享解密代理的容量。
-    ② **只回布尔与秒数**。frame_id / caption / 窗口标题一律不进这个可用性块。
+    ② **只回状态与秒数**。frame_id / caption / 窗口标题一律不进这个可用性块。
        只要当前路由没有明确的 unsupported 反证,调用方就另走有界推帧路径,把
        像素标成不可信应用数据,并在第一轮 provider 调用之前先建立出站执行栅栏。
 
-    共享没在进行(或读取失败)时返回 {},调用方据此整块省略 —— 不共享的用户
-    prompt 一个字都不变,provider 侧的前缀缓存不受影响。
+    设备仍报告开启、但帧超过五分钟未更新时返回 stalled 状态和重启建议，调用方
+    只把建议提供给模型，不解密旧帧。共享没在进行(或读取失败)时返回 {}，调用方
+    据此整块省略 —— 不共享的用户 prompt 一个字都不变，provider 侧前缀缓存不受影响。
     """
     return screen_read_core.screen_share_grounding(user_id)
 
@@ -12636,8 +12637,8 @@ async def process_job(
         grounding_results: dict[str, Any] = {}
         if pending_schedule_results:
             grounding_results.update(pending_schedule_results)
-        # 共享屏幕的可用性提示(见 _screen_share_grounding)。只在共享真的活着时
-        # 出现;不共享的用户这一块整个不存在,prompt 与改动前逐字节相同。
+        # 共享屏幕的健康提示(见 _screen_share_grounding)。live 时可推当前帧；
+        # stalled 时只给模型重启建议、不碰旧帧。不共享时整块不存在。
         screen_share_state = await asyncio.to_thread(
             _screen_share_grounding, user_id
         )
@@ -12645,15 +12646,16 @@ async def process_job(
             grounding_results["screen_share"] = [
                 {"ok": True, "data": screen_share_state}
             ]
+        screen_share_live = screen_share_state.get("active") is True
         screen_frame_message: dict[str, Any] | None = None
         pushed_screen_frame_ids: list[str] = []
         screen_vision_verdict = None
-        if screen_share_state:
+        if screen_share_live:
             screen_vision_verdict = await asyncio.to_thread(
                 db.model_api_active_route_vision_verdict, user_id
             )
         if (
-            screen_share_state
+            screen_share_live
             and _screen_vision_allows_pixels(screen_vision_verdict)
             and deps.read_screen_frames is not None
         ):

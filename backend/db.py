@@ -1067,6 +1067,26 @@ def admin_data_track_snapshot(user_ids: list[str]) -> dict[str, dict]:
             rows = conn.execute(
                 """
                 SELECT user_id,
+                       doc->'broadcast_state'->>'v' AS broadcast_state,
+                       doc->'broadcast_state'->>'ts' AS broadcast_state_ts,
+                       doc->'broadcast_active'->>'v' AS broadcast_active,
+                       doc->'broadcast_active'->>'ts' AS broadcast_active_ts
+                FROM user_blobs
+                WHERE user_id = ANY(%s) AND kind = 'perception_state'
+                """,
+                (ids,),
+            ).fetchall()
+            for uid, state, state_ts, active, active_ts in rows:
+                ensure(out, uid)["screen_broadcast"] = {
+                    "broadcast_state": state,
+                    "broadcast_state_ts": state_ts,
+                    "broadcast_active": active,
+                    "broadcast_active_ts": active_ts,
+                }
+
+            rows = conn.execute(
+                """
+                SELECT user_id,
                        COUNT(*)::int AS total,
                        MIN(NULLIF(doc->>'created_at', '')) AS first_created_at,
                        MAX(NULLIF(doc->>'created_at', '')) AS last_created_at,
@@ -12615,6 +12635,37 @@ def frame_exists(user_id: str, frame_id: str) -> bool:
     except Exception as e:
         log.error("[db] frame_exists(%s,%s) failed: %s", user_id, frame_id, e)
         return False
+
+
+def perception_broadcast_meta(user_id: str) -> dict:
+    """Return only the broadcast state/value cells needed for screen health.
+
+    The perception_state blob contains many unrelated user readings. Screen
+    liveness must not load or expose that document just to compare two
+    metadata timestamps, so this SQL projects only the four scalar fields.
+    """
+    try:
+        with get_pool().connection() as conn:
+            row = conn.execute(
+                "SELECT doc->'broadcast_state'->>'v', "
+                "       doc->'broadcast_state'->>'ts', "
+                "       doc->'broadcast_active'->>'v', "
+                "       doc->'broadcast_active'->>'ts' "
+                "FROM user_blobs "
+                "WHERE user_id = %s AND kind = 'perception_state'",
+                (user_id,),
+            ).fetchone()
+    except Exception as e:
+        log.error("[db] perception_broadcast_meta(%s) failed: %s", user_id, e)
+        return {}
+    if row is None:
+        return {}
+    return {
+        "broadcast_state": row[0],
+        "broadcast_state_ts": row[1],
+        "broadcast_active": row[2],
+        "broadcast_active_ts": row[3],
+    }
 
 
 def frame_get(user_id: str, frame_id: str) -> dict | None:

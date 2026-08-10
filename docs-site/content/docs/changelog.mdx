@@ -57,6 +57,11 @@ change must not be interpreted as an API guarantee.
 - **Screen-share diagnostics now expose metadata-only frame health.** The admin
   user detail view reports encrypted frame count, newest-frame time and age, and
   inline-versus-object-storage distribution without reading screen content.
+  When a fresh device report still says broadcasting but the newest frame is
+  over five minutes old, the API, Runtime V1, Runtime V2, and admin view now
+  agree that the connection is stalled. Chat asks the user to stop and restart
+  sharing instead of presenting the old frame as current or merely saying it
+  cannot be read. The stalled state never defaults to decrypting old pixels.
   Enclave logs now identify missing plaintext images on both screen read routes
   and AEAD verification failures using stable event names and identifiers only.
 

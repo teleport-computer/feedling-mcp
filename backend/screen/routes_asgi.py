@@ -76,6 +76,13 @@ async def get_sources(auth: AuthResult = Depends(require_auth)):
 
 @router.get("/v1/screen/frames")
 async def list_frames(request: Request, auth: AuthResult = Depends(require_auth)):
+    """List encrypted frame metadata and content-free screen-share health.
+
+    ``screen_share`` is live when the latest frame is recent, stalled when a
+    fresh device broadcast-on report has no frame update for over five minutes,
+    and otherwise an empty object. A stalled result includes restart guidance
+    and never treats the old frame as current screen content.
+    """
     result = await threadpool.run_db(
         screen_read_core.list_frames, auth.store, request.query_params.get("limit"))
     return _render(result)

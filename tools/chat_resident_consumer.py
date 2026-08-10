@@ -3579,6 +3579,25 @@ def _screen_context_for_message(content: str) -> tuple[str, list[dict[str, str]]
         "cache_misses": 0,
     }
     body = _fetch_screen_metadata_once("/v1/screen/frames?limit=100")
+    if not isinstance(body, dict):
+        return "", [], []
+    share_state_present = "screen_share" in body
+    share_state = body.get("screen_share")
+    share_state = share_state if isinstance(share_state, dict) else {}
+    if share_state.get("stalled") is True:
+        latest_age = share_state.get("latest_frame_age_sec")
+        return (
+            "[Feedling screen-sharing connection status]\n"
+            "screen_share.active: false\n"
+            "screen_share.stalled: true\n"
+            f"latest_frame_age_sec: {latest_age if latest_age is not None else 'unknown'}\n"
+            "The screen-sharing connection may have disconnected. Ask the user "
+            "to stop and restart screen sharing.",
+            [],
+            [],
+        )
+    if share_state_present and share_state.get("active") is not True:
+        return "", [], []
     frames = (body or {}).get("frames") if isinstance(body, dict) else None
     if not isinstance(frames, list) or not frames:
         return "", [], []
@@ -3590,10 +3609,8 @@ def _screen_context_for_message(content: str) -> tuple[str, list[dict[str, str]]
     if not str(latest.get("id") or latest.get("frame_id") or "").strip():
         return "", [], []
     latest_age = time.time() - latest_ts
-    if (
-        not latest_ts
-        or latest_age < 0
-        or latest_age > SCREEN_CONTEXT_MAX_AGE_SEC
+    if not share_state_present and (
+        not latest_ts or latest_age < 0 or latest_age > SCREEN_CONTEXT_MAX_AGE_SEC
     ):
         log.info(
             "screen context skipped — latest frame is stale age=%.1fs id=%s",
@@ -3601,6 +3618,11 @@ def _screen_context_for_message(content: str) -> tuple[str, list[dict[str, str]]
             str(latest.get("id") or latest.get("frame_id") or ""),
         )
         return "", [], []
+    if share_state_present:
+        try:
+            latest_age = float(share_state.get("latest_frame_age_sec"))
+        except (TypeError, ValueError):
+            return "", [], []
     active_signal = (
         "[Live Feedling screen-sharing availability]\n"
         "screen_share.active: true\n"

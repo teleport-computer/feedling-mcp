@@ -84,9 +84,10 @@ def read(store, *, api_key=None, runtime_token=None, params=None) -> CapabilityR
         include_pixels = bool(params.get("include_image"))
     else:
         user_id = str(getattr(store, "user_id", "") or "")
-        include_pixels = bool(
-            user_id and screen_read_core.screen_share_grounding(user_id)
+        share_state = (
+            screen_read_core.screen_share_grounding(user_id) if user_id else {}
         )
+        include_pixels = share_state.get("active") is True
     include_image = "true" if include_pixels else "false"
     res = screen_read_core.frame_decrypt(store, frame_id, include_image=include_image,
                                          api_key=api_key, runtime_token=runtime_token)

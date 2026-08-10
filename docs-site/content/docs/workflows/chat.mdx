@@ -163,6 +163,15 @@ relative age; the newest is explicitly marked as the current screen and the
 others as earlier in the same session. When no share is active, no pixel block
 is added and the text turn is never delayed.
 
+If the device still reports that its broadcast is active but the newest frame
+is more than five minutes old, Chat treats the connection as stalled rather
+than live. Runtime V1 and Hosted Runtime V2 both tell the model that the sharing
+connection may have disconnected and ask the user to stop and restart screen
+sharing. They do not decrypt, attach, or describe the old frame as the current
+screen. `GET /v1/screen/frames` exposes the same content-free decision in its
+`screen_share` object, including `stalled`, `latest_frame_age_sec`, and
+`suggested_action`; a stale broadcast report does not trigger this state.
+
 Hosted Runtime V2 withholds pixels only when the exact route has an explicit
 `unsupported` verdict. An `ok`, untested, failed, or absent verdict admits the
 sampled frames: not having run the optional control probe is not evidence that

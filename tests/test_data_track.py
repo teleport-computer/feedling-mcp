@@ -253,6 +253,58 @@ def test_admin_data_track_reports_screen_frame_storage_and_freshness(client):
     assert "R2 frames" in html_body
 
 
+def test_admin_data_track_warns_when_broadcast_is_on_but_frames_are_stale(client):
+    user_id, _ = _register(client)
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO frame_envelopes
+                (user_id, frame_id, ts, doc, env_meta, body_key)
+            VALUES
+                (%s, 'frame_stale', extract(epoch FROM now()) - 600,
+                 %s::jsonb, NULL, NULL)
+            """,
+            (user_id, json.dumps({"v": 1, "body_ct": "must-not-leak"})),
+        )
+        conn.execute(
+            """
+            INSERT INTO user_blobs (user_id, kind, doc)
+            VALUES (
+                %s,
+                'perception_state',
+                jsonb_build_object(
+                    'broadcast_state', jsonb_build_object(
+                        'v', 'on', 'ts', extract(epoch FROM now())
+                    ),
+                    'broadcast_active', jsonb_build_object(
+                        'v', true, 'ts', extract(epoch FROM now())
+                    )
+                )
+            )
+            ON CONFLICT (user_id, kind) DO UPDATE SET doc = EXCLUDED.doc
+            """,
+            (user_id,),
+        )
+
+    body = client.get(
+        "/v1/admin/data-track/users", headers=_admin_headers()
+    ).get_json()
+    frames = body["users"][0]["screen_frames"]
+
+    assert frames["broadcast_report_active"] is True
+    assert frames["broadcast_stalled"] is True
+    assert frames["latest_age_sec"] >= 599
+    assert "must-not-leak" not in json.dumps(body)
+
+    page = client.get(
+        f"/admin/data-track/users/{user_id}", headers=_admin_headers()
+    )
+    html_body = page.get_data(as_text=True)
+    assert page.status_code == 200
+    assert "屏幕共享连接可能已断开" in html_body
+    assert "停止后重新开启" in html_body
+
+
 def test_admin_data_track_surfaces_provider_health(client):
     user_id, _ = _register(client)
     with db.get_pool().connection() as conn:

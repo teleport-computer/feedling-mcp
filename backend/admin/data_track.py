@@ -26,6 +26,7 @@ from chat import consumer as chat_consumer
 from memory import service as memory_service
 from notices import core as notices_core
 from proactive import service as proactive_service
+from screen import screen_read_core
 from bootstrap import gates as boot_gates
 from core import store as core_store
 from core import util as core_util
@@ -763,10 +764,19 @@ def _data_track_chat_from_snapshot(snap: dict) -> dict:
 
 def _data_track_screen_frames_from_snapshot(snap: dict) -> dict:
     frames = dict(snap.get("screen_frames") or {})
+    broadcast = dict(snap.get("screen_broadcast") or {})
     latest_ts = frames.get("latest_ts")
     latest_epoch = core_util._to_epoch(latest_ts)
     latest_age_sec = (
         int(max(0, time.time() - latest_epoch)) if latest_epoch else None
+    )
+    broadcast_active = screen_read_core.broadcast_report_is_recently_active(
+        broadcast, now=time.time()
+    )
+    broadcast_stalled = bool(
+        broadcast_active
+        and latest_age_sec is not None
+        and latest_age_sec > screen_read_core.SCREEN_SHARE_STALLED_SEC
     )
     return {
         "total": int(frames.get("total") or 0),
@@ -774,6 +784,8 @@ def _data_track_screen_frames_from_snapshot(snap: dict) -> dict:
         "latest_age_sec": latest_age_sec,
         "inline_count": int(frames.get("inline_count") or 0),
         "r2_count": int(frames.get("r2_count") or 0),
+        "broadcast_report_active": broadcast_active,
+        "broadcast_stalled": broadcast_stalled,
     }
 
 
@@ -8806,11 +8818,19 @@ def _render_screen_frames(user: dict) -> str:
     age_value = (
         html.escape(_fmt_duration_sec(latest_age)) if latest_age is not None else "—"
     )
+    stalled_alert = (
+        "<div class='responder-alert'><strong>屏幕共享连接可能已断开</strong>："
+        "设备仍报告 broadcast=on，但屏幕帧已超过 5 分钟没有更新。"
+        "建议让用户停止后重新开启一次屏幕共享。</div>"
+        if frames.get("broadcast_stalled") is True
+        else ""
+    )
     return (
         "<h2 style='font-size:15px;margin:22px 0 6px'>屏幕帧</h2>"
         "<div class='ppmuted' style='font-size:12px;margin-bottom:6px'>"
         "仅展示密文帧元数据与存储分布，不读取或渲染屏幕内容。</div>"
-        "<section class='grid'>"
+        + stalled_alert
+        + "<section class='grid'>"
         f"<div class='card'><div class='value'>{int(frames.get('total') or 0)}</div>"
         "<div class='label'>frame count</div></div>"
         f"<div class='card'><div class='value'>{latest_value}</div>"

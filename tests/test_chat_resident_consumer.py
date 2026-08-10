@@ -1157,6 +1157,43 @@ def test_active_screen_share_without_ok_pixel_verdict_exposes_only_availability(
     assert calls == ["/v1/screen/frames?limit=100"]
 
 
+def test_stalled_screen_share_returns_restart_guidance_without_old_pixels(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        crc,
+        "_fetch_screen_metadata_once",
+        lambda _path: {
+            "frames": [{"id": "f-old", "ts": 1.0}],
+            "screen_share": {
+                "active": False,
+                "stalled": True,
+                "status": "broadcast_on_without_recent_frames",
+                "latest_frame_age_sec": 600,
+                "suggested_action": (
+                    "Ask the user to stop and restart screen sharing."
+                ),
+            },
+        },
+    )
+    monkeypatch.setattr(
+        crc,
+        "_fetch_screen_json",
+        lambda _path: (_ for _ in ()).throw(
+            AssertionError("stalled share must not decrypt an old frame")
+        ),
+    )
+
+    text, payloads, paths = crc._screen_context_for_message("你能看到吗")
+
+    assert "screen_share.active: false" in text
+    assert "screen_share.stalled: true" in text
+    assert "may have disconnected" in text
+    assert "stop and restart screen sharing" in text
+    assert payloads == []
+    assert paths == []
+
+
 def test_screen_decrypt_cache_is_keyed_by_frame_id(monkeypatch):
     calls = []
     monkeypatch.setattr(

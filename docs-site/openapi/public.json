@@ -7183,6 +7183,7 @@
     "/v1/screen/frames": {
       "get": {
         "summary": "List Frames",
+        "description": "List encrypted frame metadata and content-free screen-share health.\n\n``screen_share`` is live when the latest frame is recent, stalled when a\nfresh device broadcast-on report has no frame update for over five minutes,\nand otherwise an empty object. A stalled result includes restart guidance\nand never treats the old frame as current screen content.",
         "operationId": "list_frames_v1_screen_frames_get",
         "responses": {
           "200": {

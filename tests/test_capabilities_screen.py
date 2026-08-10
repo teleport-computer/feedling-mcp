@@ -1,6 +1,8 @@
 import json
+import logging
 import pathlib
 import sys
+import threading
 import types
 sys.path.insert(0, str(pathlib.Path(__file__).parent.parent / "backend"))  # noqa: E402
 
@@ -33,6 +35,138 @@ def test_shared_screen_grounding_rejects_stale_or_future_frames(monkeypatch):
             lambda _user_id, ts=frame_ts: [{"id": "f1", "ts": ts}],
         )
         assert screen_read_core.screen_share_grounding("u1") == {}
+
+
+def test_shared_screen_grounding_reports_fresh_broadcast_without_recent_frames(
+    monkeypatch,
+):
+    monkeypatch.setattr(screen_read_core.time, "time", lambda: 1_000.0)
+    monkeypatch.setattr(
+        screen_read_core.db,
+        "frame_list_meta",
+        lambda _user_id: [{"id": "f1", "ts": 699.0}],
+    )
+    monkeypatch.setattr(
+        screen_read_core.db,
+        "perception_broadcast_meta",
+        lambda _user_id: {
+            "broadcast_state": "broadcasting",
+            "broadcast_state_ts": "999.0",
+            "broadcast_active": "true",
+            "broadcast_active_ts": "999.0",
+        },
+    )
+
+    assert screen_read_core.screen_share_grounding("u1") == {
+        "active": False,
+        "stalled": True,
+        "status": "broadcast_on_without_recent_frames",
+        "latest_frame_age_sec": 301,
+        "suggested_action": "Ask the user to stop and restart screen sharing.",
+    }
+
+
+def test_shared_screen_grounding_ignores_old_or_inactive_broadcast(monkeypatch):
+    monkeypatch.setattr(screen_read_core.time, "time", lambda: 1_000.0)
+    monkeypatch.setattr(
+        screen_read_core.db,
+        "frame_list_meta",
+        lambda _user_id: [{"id": "f1", "ts": 600.0}],
+    )
+    reports = (
+        {
+            "broadcast_state": "on",
+            "broadcast_state_ts": 699.0,
+            "broadcast_active": True,
+            "broadcast_active_ts": 699.0,
+        },
+        {
+            "broadcast_state": "off",
+            "broadcast_state_ts": 999.0,
+            "broadcast_active": False,
+            "broadcast_active_ts": 999.0,
+        },
+    )
+    for report in reports:
+        monkeypatch.setattr(
+            screen_read_core.db,
+            "perception_broadcast_meta",
+            lambda _user_id, value=report: value,
+        )
+        assert screen_read_core.screen_share_grounding("u1") == {}
+
+
+def test_broadcast_freshness_uses_latest_recognized_status():
+    assert screen_read_core.broadcast_report_is_recently_active(
+        {
+            "broadcast_state": "on",
+            "broadcast_state_ts": 600.0,
+            "broadcast_active": False,
+            "broadcast_active_ts": 999.0,
+        },
+        now=1_000.0,
+    ) is False
+    assert screen_read_core.broadcast_report_is_recently_active(
+        {
+            "broadcast_state": "on",
+            "broadcast_state_ts": 999.0,
+            "broadcast_active": False,
+            "broadcast_active_ts": 1_000.0,
+        },
+        now=1_000.0,
+    ) is False
+
+
+def test_broadcast_freshness_tolerates_small_future_device_clock_skew(caplog):
+    report = {
+        "broadcast_state": "on",
+        "broadcast_state_ts": "1060.0",
+        "broadcast_active": "true",
+        "broadcast_active_ts": "1060.0",
+    }
+
+    assert screen_read_core.broadcast_report_is_recently_active(
+        report, now=1_000.0
+    ) is True
+
+    report["broadcast_state_ts"] = "1121.0"
+    report["broadcast_active_ts"] = "1121.0"
+    with caplog.at_level(logging.DEBUG, logger=screen_read_core.__name__):
+        assert screen_read_core.broadcast_report_is_recently_active(
+            report, now=1_000.0
+        ) is False
+    assert "device timestamp is 121.0s ahead" in caplog.text
+
+
+def test_list_frames_exposes_shared_grounding_contract(monkeypatch):
+    store = types.SimpleNamespace(
+        user_id="u1",
+        frames_lock=threading.RLock(),
+        frames_meta=[{"id": "f1", "filename": "f1.jpg", "ts": 699.0}],
+    )
+    stalled = {
+        "active": False,
+        "stalled": True,
+        "status": "broadcast_on_without_recent_frames",
+        "latest_frame_age_sec": 301,
+        "suggested_action": "Ask the user to stop and restart screen sharing.",
+    }
+    seen = {}
+
+    def fake_grounding(user_id, *, latest_frame_ts=None):
+        seen.update(user_id=user_id, latest_frame_ts=latest_frame_ts)
+        return stalled
+
+    monkeypatch.setattr(screen_read_core, "screen_share_grounding", fake_grounding)
+    monkeypatch.setattr(
+        screen_read_core.frames, "_frame_url", lambda _store, filename: f"/{filename}"
+    )
+
+    result = screen_read_core.list_frames(store, 20)
+
+    assert result.status == 200
+    assert result.json_body["screen_share"] == stalled
+    assert seen == {"user_id": "u1", "latest_frame_ts": 699.0}
 
 
 def test_recent_wraps_json_body(monkeypatch):
@@ -116,6 +250,31 @@ def test_inactive_share_default_explains_that_pixels_were_not_requested(monkeypa
     monkeypatch.setattr(screen_read_core, "frame_decrypt", fake_decrypt)
 
     result = cap_screen.read(store, params={"frame_id": "f-idle"})
+
+    assert seen["include_image"] == "false"
+    assert result.data["image_omitted_reason"] == "not_requested"
+
+
+def test_stalled_share_does_not_default_to_old_pixels(monkeypatch):
+    store = types.SimpleNamespace(user_id="u_stalled")
+    monkeypatch.setattr(
+        screen_read_core,
+        "screen_share_grounding",
+        lambda _user_id: {
+            "active": False,
+            "stalled": True,
+            "latest_frame_age_sec": 600,
+        },
+    )
+    seen = {}
+
+    def fake_decrypt(store, frame_id, *, include_image, api_key, runtime_token):
+        seen["include_image"] = include_image
+        return ScreenResult(status=200, json_body={"ocr_text": "old text"})
+
+    monkeypatch.setattr(screen_read_core, "frame_decrypt", fake_decrypt)
+
+    result = cap_screen.read(store, params={"frame_id": "f-old"})
 
     assert seen["include_image"] == "false"
     assert result.data["image_omitted_reason"] == "not_requested"
