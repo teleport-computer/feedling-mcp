@@ -93,6 +93,7 @@ from model_api_runtime.v2 import profile_store as v2_profile_store
 from model_api_runtime.v2 import reaper as v2_reaper
 from model_api_runtime.v2 import runner_identity
 from model_api_runtime.v2 import scheduler
+from model_api_runtime.v2 import screen_chat as v2_screen_chat
 from model_api_runtime.v2 import screen_watch
 from model_api_runtime.v2 import summary_frontier as v2_summary_frontier
 from model_api_runtime.v2 import usage_rollup
@@ -2147,7 +2148,7 @@ def _read_screen_frames(user_id: str, frame_ids: list[str]) -> dict[str, Any]:
     misses = 0
     # Sequential by design: all users share the same enclave decrypt proxy. The
     # worker's outer enclave_sem bounds cross-turn concurrency as well.
-    for frame_id in frame_ids[:6]:
+    for frame_id in frame_ids[: v2_screen_chat.MAX_PUSH_FRAMES]:
         value, hit = _read_screen_frame_cached(user_id, str(frame_id))
         hits += int(hit)
         misses += int(not hit)
