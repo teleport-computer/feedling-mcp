@@ -7,9 +7,9 @@ import os
 import time
 
 import db
+from asgi import health_executor
 from fastapi import APIRouter
 from hosted import agent_runtime_cutover
-from starlette.concurrency import run_in_threadpool
 from starlette.responses import JSONResponse
 
 logger = logging.getLogger(__name__)
@@ -91,7 +91,13 @@ async def runner_healthz():
         return _unhealthy("invalid_expected_runner_count")
 
     try:
-        instances = await run_in_threadpool(db.list_supervisor_instance_heartbeats)
+        instances = await health_executor.run(
+            db.list_supervisor_instance_heartbeats,
+            timeout=db.HEALTH_DB_ACQUIRE_TIMEOUT_SECONDS,
+            statement_timeout_ms=db.HEALTH_DB_STATEMENT_TIMEOUT_MS,
+        )
+    except health_executor.HealthCheckTimeout:
+        return _unhealthy("runner_health_check_timeout", expected=expected)
     except Exception:  # noqa: BLE001 - a probe must never expose DB internals
         logger.exception("runner health heartbeat query failed")
         return _unhealthy("runner_health_check_error", expected=expected)

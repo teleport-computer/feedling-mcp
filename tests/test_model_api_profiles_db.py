@@ -567,12 +567,14 @@ def test_route_columns_timestamps_are_utc_invariant_under_session_timezone(backe
         conn.execute("RESET TIME ZONE")
 
     # _ROUTE_COLUMNS' 0-indexed order after the V2 vision fields:
-    # 13=last_test_at, 16=last_vision_test_at, 20=created_at, 21=updated_at.
+    # 14=last_test_at, 17=last_vision_test_at, 20=last_image_generation_test_at,
+    # 24=created_at, 25=updated_at.
     for idx, name in (
-        (13, "last_test_at"),
-        (16, "last_vision_test_at"),
-        (20, "created_at"),
-        (21, "updated_at"),
+        (14, "last_test_at"),
+        (17, "last_vision_test_at"),
+        (20, "last_image_generation_test_at"),
+        (24, "created_at"),
+        (25, "updated_at"),
     ):
         assert baseline[idx] == shifted[idx], (
             f"{name} changed under SET TIME ZONE — to_char is reading the "
@@ -580,8 +582,8 @@ def test_route_columns_timestamps_are_utc_invariant_under_session_timezone(backe
             f"{baseline[idx]!r} != {shifted[idx]!r}"
         )
     # created_at/updated_at are never blank for a freshly-created route.
-    assert baseline[20] and baseline[20].endswith("Z")
-    assert baseline[21] and baseline[21].endswith("Z")
+    assert baseline[24] and baseline[24].endswith("Z")
+    assert baseline[25] and baseline[25].endswith("Z")
 
 
 def test_roster_supports_responses_bool_conversion_from_real_column(backend_env):

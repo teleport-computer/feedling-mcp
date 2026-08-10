@@ -222,6 +222,9 @@ if not _provisioned:
         # MCP 工具面可观测性(2026-08-09)。纯:只解析字符串 + 读两个 JS 源文件。
         "test_user_mcp_surface_trace.py",
         "test_voice_context_regressions.py",
+        "test_health_executor.py",
+        "test_db_health_timeouts.py",
+        "test_health_route_isolation.py",
     }
     collect_ignore = sorted(
         f

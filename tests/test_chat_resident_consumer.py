@@ -3649,7 +3649,10 @@ def test_capture_job_add_card_writes_envelope_without_chat_or_delivery(monkeypat
     assert captured["envelope_plaintexts"] == [{
         "summary": "Seven had a stressful meeting.",
         "content": "Seven said the meeting was stressful and mentioned elevated heart rate.",
-        "bucket": "work",
+        # 模型给的是小写 "work";1c8293cd 起大小写漂移会收敛到通用桶的规范形式,
+        # 所以落卡是 "Work"。上面 prompt 里的 "buckets: work" 是【输入】(用户现有
+        # 的桶),不归一化,保持原样。
+        "bucket": "Work",
         "threads": ["meeting"],
     }]
     assert captured["envelope_kwargs"][0]["visibility"] == "shared"
@@ -8486,6 +8489,57 @@ def test_call_agent_cli_heals_stale_claude_resume_once(monkeypatch, tmp_path):
     assert len(runs) == 2
     # the fresh session from the retry is persisted for the NEXT turn's --resume
     assert crc._load_agent_session_id() == "aaaaaaaa-bbbb-cccc-dddd-eeeeffff0000"
+
+
+def test_mcp_postflight_follows_the_retry_not_the_discarded_first_attempt(
+    monkeypatch, tmp_path,
+):
+    """stale-resume 自愈后,MCP 注册结果必须来自**真正回答的那个进程**。
+
+    这条埋点的整个价值是「模型这一轮到底看得到哪几台服务器」。重试会新起进程
+    重做 MCP 握手,并且整个**替换** result 而不是追加 —— 所以:
+      · 首次若在打出 init 之前就死了(下面就是这个形态),只记首次 = 这一轮
+        完全没有观测,而它明明成功回答了;
+      · 首次若打出过 init,记的也是一个输出已经被丢弃的进程。
+    两种都让硬证据失真。函数级测试盖不住这个:它把两个 init 拼进同一段 stdout,
+    而生产里第二次是**替换**(codex 审出)。
+    """
+    _stale_resume_env(monkeypatch, tmp_path, "usr_stale_mcp")
+    init = json.dumps({
+        "type": "system", "subtype": "init", "tools": ["Bash"],
+        "mcp_servers": [{"name": "tavily", "status": "connected"}],
+    })
+    runs, events = [], []
+
+    def fake_run(cmd, **kw):
+        runs.append(list(cmd))
+        if len(runs) == 1:
+            # dies during handshake — no init event at all
+            return subprocess.CompletedProcess(
+                cmd, 1, stdout="",
+                stderr=f"No conversation found with session ID: {_STALE_SID}",
+            )
+        return subprocess.CompletedProcess(
+            cmd, 0, stdout=init + "\n" + _CLAUDE_OK_TURN, stderr="")
+
+    monkeypatch.setattr(crc.subprocess, "run", fake_run)
+    monkeypatch.setattr(crc, "_user_mcp_applied",
+                        {"servers": [{"name": "tavily", "enabled": True}]})
+    monkeypatch.setattr(crc, "_emit_debug_trace",
+                        lambda ss, ty, **kw: events.append((ty, kw)))
+
+    # lane 必须显式给 chat:MCP 只在 chat 通道下发,默认的 background 通道
+    # 埋点会正确早退(第一版这里漏了,测出来是 0 条 —— 代码没错,是测试写错了)。
+    assert crc.call_agent_cli("hello", lane="chat") == "ok"
+    assert len(runs) == 2
+
+    registered = [kw for ty, kw in events if ty == "mcp.surface.registered"]
+    assert len(registered) == 1, (
+        "首次没有 init 事件时不该发,重试有了才发 —— 得到 "
+        f"{[kw['detail'] for kw in registered]}")
+    assert registered[0]["detail"]["registered"] == ["tavily"]
+    assert registered[0]["detail"]["attempt"] == "stale_resume_retry"
+    assert registered[0]["status"] == "ok"
 
 
 def test_call_agent_cli_stale_resume_retry_fails_raises_no_loop(monkeypatch, tmp_path):

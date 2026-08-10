@@ -16,6 +16,12 @@ change must not be interpreted as an API guarantee.
   resident route. Invalid or absent rollout configuration keeps the account
   resident.
 
+- **Runner health probe keeps reserved capacity under backend load.**
+  `GET /healthz/runner` now runs its blocking heartbeat database query outside
+  the ordinary ASGI thread pool, with bounded connection and SQL timeouts plus
+  a three-second route deadline. A deadline failure returns a structured HTTP
+  503 instead of leaving external monitors to time out.
+
 - **Runtime V1 Fable 5 chat no longer requires visible chain-of-thought.**
   Fable 5 routes running through pi, including OpenRouter and compatible relays,
   now skip the mandatory `<think>` response format that the model refuses. Pi's
