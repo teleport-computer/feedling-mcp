@@ -23,6 +23,11 @@ change must not be interpreted as an API guarantee.
   Runtime operations now also report screen-watch turns, turns that produced a
   visible reply, their speaking rate, frames pushed, and input tokens by lane.
 
+- **Runtime V2 wake turns can persist memories with their server-frozen event
+  time.** The encrypted-effect validator now accepts the current memory payload,
+  including optional bucket, thread, importance, and pulse metadata, instead of
+  rejecting it as a legacy shape immediately before the memory sink.
+
 - **New Model API users can enter Runtime V2 through a cutoff-based default.**
   Only newly registered accounts with a successfully tested and active Model API
   route are eligible; the default does not migrate older accounts or users on a
