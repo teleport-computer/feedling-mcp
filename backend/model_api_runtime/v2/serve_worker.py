@@ -1204,13 +1204,19 @@ def _read_recent_turns(
     # 所以和 _read_tail_window_after_seq 一样要过闸——只擦 tail 不擦这里的话，
     # summary 水位之前的旧泄漏行会继续被 replay 回去教模型模仿
     # （Codex review 2026-08-08 Important #1）。
-    decrypted = _scrub_leaked_thinking_rows(
-        _decrypt_chat_rows(
-            user_id,
-            raw_rows,
-            user_only=False,
-            preserve_unreadable=True,
-        )
+    # 引用记忆同理:这条窗口会 replay 回 prompt,不展开的话,引用轮一旦老化到
+    # summary 水位之前再被回放,模型重新只看到「你怎么看这个」——看不到「这个」是什么。
+    # 和上面那段擦泄漏是同一个道理:tail 和 recent-turn 两条 replay 路都要过。
+    decrypted = _expand_quoted_memories(
+        user_id,
+        _scrub_leaked_thinking_rows(
+            _decrypt_chat_rows(
+                user_id,
+                raw_rows,
+                user_only=False,
+                preserve_unreadable=True,
+            )
+        ),
     )
     raw_by_seq = {int(row["seq"]): row for row in raw_rows}
     for row in decrypted:
