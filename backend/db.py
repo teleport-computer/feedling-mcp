@@ -652,6 +652,14 @@ def normalize_user_cas(
     return read_ok, authoritative
 
 
+def _delete_runtime_allowlist_on_cursor(cur, user_id: str) -> None:
+    """Delete RDS-only runtime routing control in the caller's transaction."""
+    cur.execute(
+        "DELETE FROM v2_user_allowlist WHERE user_id = %s",
+        (user_id,),
+    )
+
+
 def save_all_users(users: list[dict]) -> None:
     """Persist an explicit whole-registry snapshot for tests/offline tooling.
 
@@ -707,6 +715,7 @@ def save_all_users(users: list[dict]) -> None:
                         _mark_chat_r2_inventory_pending_on_cursor(
                             cur, removed_id, advance_generation=True,
                         )
+                        _delete_runtime_allowlist_on_cursor(cur, removed_id)
                         # Preserve the global lifecycle -> users/chat lock order.
                         # A bulk users FOR UPDATE before lifecycle would deadlock
                         # against append/clear, which take the lifecycle fence
@@ -757,6 +766,7 @@ def delete_user(user_id: str) -> bool:
                 _mark_chat_r2_inventory_pending_on_cursor(
                     cur, user_id, advance_generation=True,
                 )
+                _delete_runtime_allowlist_on_cursor(cur, user_id)
                 cur.execute(sql, (user_id,))
     from tee_shadow import mirror
     mirror.execute(sql, (user_id,))
@@ -12805,10 +12815,15 @@ def log_prune_older_than(user_id: str, stream: str, cutoff_epoch: float) -> None
 
 
 def delete_user_data(user_id: str) -> None:
-    """Redundant DB belt: per-user 行现由 delete_user 的 CASCADE 原子清净
-    (0011)。仍被 content/content_core.py 的销号(account/reset)兜底路径调用；
-    删账号主路径不再依赖它做 R2。"""
+    """Redundant DB belt for CASCADE-owned data and explicit RDS controls.
+
+    Most per-user rows are deleted atomically by ``delete_user`` through the
+    0011 foreign keys.  RDS-only control tables without a users FK are listed
+    explicitly here.  Account reset/admin deletion retain this as a best-effort
+    cleanup belt; the authoritative delete path does not rely on it for R2.
+    """
     tables = (
+        "v2_user_allowlist",
         "v2_usage_daily_dimensions",
         "v2_usage_daily_users",
         "v2_conversation_summary_segments",
@@ -12844,6 +12859,7 @@ def delete_user_data(user_id: str) -> None:
     # added upstream after the TEE 19-table baseline; not replicated).
     tee_table_for = {"frame_envelopes": "frames"}
     _no_tee_tables = {
+        "v2_user_allowlist",
         "v2_usage_daily_dimensions",
         "v2_usage_daily_users",
         "v2_conversation_summary_segments",

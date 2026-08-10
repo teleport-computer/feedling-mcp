@@ -2,11 +2,12 @@ import uuid
 
 import db
 
-# 迁移后加了 FK 的、以及 genesis 子表：删 users 行必须全部级联清空
+# 删 users 行后必须清空的按 user_id 数据；无 FK 的控制表由应用事务显式删除
 _PER_USER_TABLES = [
     "chat_messages", "frame_envelopes", "memory_moments", "perception_daily",
     "perception_items", "perception_signal_state_v2", "user_blobs", "user_logs",
     "genesis_import_jobs", "genesis_import_chunks", "genesis_import_outputs",
+    "v2_user_allowlist",
 ]
 
 
@@ -58,6 +59,12 @@ def _seed_min_rows(conn, uid):
     conn.execute(
         "INSERT INTO genesis_import_outputs (user_id, job_id, output_type) "
         "VALUES (%s, 'job1', 'summary')",
+        (uid,),
+    )
+    conn.execute(
+        "INSERT INTO v2_user_allowlist "
+        "(user_id, desired, updated_by, note) "
+        "VALUES (%s, 'v2', 'admin', 'delete-test')",
         (uid,),
     )
 
@@ -117,3 +124,6 @@ def test_save_all_users_reflects_genuine_removals():
         assert conn.execute(
             "SELECT count(*) FROM user_blobs WHERE user_id = %s", (gone,)
         ).fetchone()[0] == 0, "removed user's per-user data should be cascade-deleted"
+        assert conn.execute(
+            "SELECT count(*) FROM v2_user_allowlist WHERE user_id = %s", (gone,)
+        ).fetchone()[0] == 0, "removed user's Runtime V2 allowlist should be deleted"
