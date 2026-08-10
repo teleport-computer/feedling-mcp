@@ -3649,7 +3649,10 @@ def test_capture_job_add_card_writes_envelope_without_chat_or_delivery(monkeypat
     assert captured["envelope_plaintexts"] == [{
         "summary": "Seven had a stressful meeting.",
         "content": "Seven said the meeting was stressful and mentioned elevated heart rate.",
-        "bucket": "work",
+        # 模型给的是小写 "work";1c8293cd 起大小写漂移会收敛到通用桶的规范形式,
+        # 所以落卡是 "Work"。上面 prompt 里的 "buckets: work" 是【输入】(用户现有
+        # 的桶),不归一化,保持原样。
+        "bucket": "Work",
         "threads": ["meeting"],
     }]
     assert captured["envelope_kwargs"][0]["visibility"] == "shared"
