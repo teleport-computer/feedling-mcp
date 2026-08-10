@@ -238,6 +238,8 @@ if not _provisioned:
         # 工具面目录契约(自带 sys.path 引导,只 import tool_schema/registry/
         # agent_fields/provider_types,零 DB 引用 —— 实测确认)。
         "test_capabilities_tool_schema.py",
+        # 豁免名单棘轮(2026-08-10)。纯:只读两个文本文件,自带 sys.path 引导。
+        "test_pytest_coverage_ratchet.py",
     }
     collect_ignore = sorted(
         f

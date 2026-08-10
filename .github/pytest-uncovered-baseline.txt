@@ -1,4 +1,3 @@
-tests/test_access_mode_runtime_sync_unit.py
 tests/test_access_modes.py
 tests/test_account_recover.py
 tests/test_account_reset_purges_all_tables.py
@@ -9,7 +8,6 @@ tests/test_admin_kpi_windows.py
 tests/test_admin_product_health_view.py
 tests/test_admin_runtime_allowlist.py
 tests/test_admin_tee_replication.py
-tests/test_admin_usage.py
 tests/test_agent_perception_route.py
 tests/test_agent_runtime_discovery.py
 tests/test_agent_runtime_genesis_gate.py
@@ -115,7 +113,6 @@ tests/test_data_track.py
 tests/test_data_track_debug.py
 tests/test_dau_snapshot_scheduler.py
 tests/test_db_health_timeouts.py
-tests/test_debug_trace.py
 tests/test_debug_trace_atomic.py
 tests/test_debug_trace_event_route.py
 tests/test_delete_user_cascades_all_tables.py
