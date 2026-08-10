@@ -70,7 +70,6 @@ tests/test_capabilities_perception.py
 tests/test_capabilities_photo.py
 tests/test_capabilities_registry.py
 tests/test_capabilities_screen.py
-tests/test_capabilities_tool_schema.py
 tests/test_capabilities_types.py
 tests/test_capability_html_extract.py
 tests/test_capability_wake.py
