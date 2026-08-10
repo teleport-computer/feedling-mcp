@@ -28,6 +28,60 @@ def test_health_executor_runs_two_checks_concurrently():
     assert asyncio.run(go()) == ["api", "runner"]
 
 
+def test_health_executor_limits_concurrency_to_two_workers():
+    first_started = threading.Event()
+    second_started = threading.Event()
+    third_started = threading.Event()
+    release = threading.Event()
+    workers_ready = threading.Barrier(2)
+
+    def blocked(value: str, started: threading.Event) -> str:
+        started.set()
+        workers_ready.wait(timeout=1.0)
+        release.wait(timeout=1.0)
+        return value
+
+    def third() -> str:
+        third_started.set()
+        return "third"
+
+    async def go():
+        tasks = [
+            asyncio.create_task(
+                health_executor.run(blocked, "first", first_started)
+            ),
+            asyncio.create_task(
+                health_executor.run(blocked, "second", second_started)
+            ),
+            asyncio.create_task(health_executor.run(third)),
+        ]
+        try:
+            await asyncio.gather(
+                asyncio.to_thread(first_started.wait),
+                asyncio.to_thread(second_started.wait),
+            )
+            assert not third_started.is_set()
+
+            release.set()
+            assert await asyncio.gather(*tasks) == ["first", "second", "third"]
+            assert third_started.is_set()
+        finally:
+            release.set()
+
+    asyncio.run(go())
+
+
+def test_health_executor_preserves_callable_timeout_error():
+    def raises_timeout() -> None:
+        raise TimeoutError("inner")
+
+    async def go():
+        with pytest.raises(TimeoutError, match="inner"):
+            await health_executor.run(raises_timeout)
+
+    asyncio.run(go())
+
+
 def test_health_executor_maps_outer_deadline_to_stable_exception():
     started = threading.Event()
     release = threading.Event()
