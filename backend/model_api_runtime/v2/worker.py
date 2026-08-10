@@ -82,6 +82,10 @@ from perception.glance import (
     perception_glance_fingerprint,
     project_perception_wake_events,
 )
+from perception.agent_fields import (
+    AGENT_PERCEPTION_SIGNALS,
+    FAST_AGENT_PERCEPTION_SIGNALS,
+)
 from model_api_runtime.v2 import coalesce as v2_coalesce
 from model_api_runtime.v2 import compaction as v2_compaction
 from model_api_runtime.v2 import context
@@ -1436,6 +1440,11 @@ class TurnDeps:
     seal_trajectory_payload: Callable[[str, bytes, str], dict] | None = None
     # (user_id, envelope, runtime_token) -> plaintext bytes
     open_trajectory_payload: Callable[[str, dict, str], bytes] | None = None
+    # Content-free admin/debug trace boundary. Production resolves the user's
+    # store and delegates to serve_worker._emit_v2_debug_trace; worker stays
+    # dependency-clean and tests may inject a collector. Observability is always
+    # best-effort and must never affect tool execution.
+    emit_debug_trace: Callable[..., None] | None = None
 
 
 class _EmptyMcpTurn:
@@ -2680,6 +2689,94 @@ def _make_tool_trajectory_callback(
     return _record
 
 
+_PERCEPTION_TRACE_TOOLS = frozenset({
+    "perception_snapshot",
+    "perception_history",
+    "perception_trend",
+})
+_PERCEPTION_TRACE_SIGNALS = frozenset(AGENT_PERCEPTION_SIGNALS)
+
+
+def _v2_tool_trace_detail(
+    tc,
+    *,
+    event_kind: str,
+    result: ToolResult | None,
+    duration_ms: float | None,
+) -> dict[str, Any]:
+    """Project one terminal tool boundary to content-free debug metadata."""
+    tool = core_chat_activity.safe_token(getattr(tc, "name", ""), max_len=120)
+    content = result.content if isinstance(result, ToolResult) else ""
+    metadata = result.metadata if isinstance(result, ToolResult) else {}
+    failed = (
+        event_kind == "tool_call_error"
+        or str(content or "").strip().lower().startswith("error:")
+    )
+    result_kind = "error" if failed else _generic_tool_result_kind(content)
+    error_code = "tool_error" if failed else ""
+    if tool in _PERCEPTION_TRACE_TOOLS and isinstance(metadata, dict):
+        projected_kind = str(metadata.get("perception_result_kind") or "")
+        if projected_kind in {"empty", "value", "error"}:
+            result_kind = projected_kind
+            failed = projected_kind == "error"
+        projected_code = core_chat_activity.safe_token(
+            metadata.get("perception_error_code"), max_len=64
+        ).lower()
+        if projected_code:
+            error_code = projected_code
+    detail: dict[str, Any] = {
+        "tool": tool,
+        "args": _v2_tool_trace_args(tc),
+        "result_status": "err" if failed else "ok",
+        "result_kind": result_kind,
+    }
+    if duration_ms is not None:
+        detail["dur_ms"] = duration_ms
+    if failed:
+        detail["error_code"] = error_code or "tool_error"
+    return detail
+
+
+def _v2_tool_trace_args(tc) -> dict[str, Any]:
+    """Keep only catalog-backed perception signal names, never user content."""
+    tool = str(getattr(tc, "name", "") or "")
+    if tool not in _PERCEPTION_TRACE_TOOLS:
+        return {}
+    raw_args = getattr(tc, "args", None)
+    args = raw_args if isinstance(raw_args, dict) else {}
+    if tool == "perception_snapshot":
+        raw_signals = args.get("signals")
+        if not isinstance(raw_signals, list) or not raw_signals:
+            return {
+                "signals": list(FAST_AGENT_PERCEPTION_SIGNALS),
+                "defaulted": True,
+            }
+        signals = [
+            value
+            for value in raw_signals
+            if isinstance(value, str) and value in _PERCEPTION_TRACE_SIGNALS
+        ]
+    else:
+        value = args.get("signal")
+        signals = (
+            [value]
+            if isinstance(value, str) and value in _PERCEPTION_TRACE_SIGNALS
+            else []
+        )
+    return {"signals": signals}
+
+
+def _generic_tool_result_kind(content: Any) -> str:
+    text = str(content or "").strip()
+    if not text or text.lower() == "ok":
+        return "empty"
+    try:
+        value = json.loads(text)
+    except (TypeError, ValueError):
+        return "value"
+    return "empty" if value in (None, "", [], {}) else "value"
+
+
 def _make_chat_tool_activity_callback(
     *,
     user_id: str,
@@ -2687,12 +2784,14 @@ def _make_chat_tool_activity_callback(
     attempt_identity: int,
     recorder: v2_trajectory.TrajectoryRecorder | None,
     effect_evidence_by_call: dict[str, dict],
+    emit_debug_trace: Callable[..., None] | None = None,
 ):
     """Write a display-safe status row at each confirmed V2 tool boundary."""
     trajectory_callback = _make_tool_trajectory_callback(
         recorder, effect_evidence_by_call
     )
     invocation_ids: dict[int, str] = {}
+    started_monotonic: dict[int, float] = {}
     ordinal = itertools.count(1)
 
     async def _record(tc, event_kind: str, payload: dict) -> None:
@@ -2704,6 +2803,8 @@ def _make_chat_tool_activity_callback(
             invocation_ids[object_key] = (
                 f"{job_id}:{int(attempt_identity)}:{next(ordinal)}"
             )
+        if event_kind == "tool_call_started":
+            started_monotonic[object_key] = time.monotonic()
         result = payload.get("result")
         result_content = result.content if isinstance(result, ToolResult) else ""
         result_metadata = result.metadata if isinstance(result, ToolResult) else {}
@@ -2715,6 +2816,16 @@ def _make_chat_tool_activity_callback(
             "state": core_chat_activity.event_state(event_kind, result_content),
         }
         duration = core_chat_activity.safe_duration_ms(payload.get("duration_ms"))
+        if (
+            duration is None
+            and event_kind in {"tool_call_result", "tool_call_error"}
+        ):
+            started_at = started_monotonic.get(object_key)
+            duration = core_chat_activity.safe_duration_ms(
+                (time.monotonic() - started_at) * 1000.0
+                if started_at is not None
+                else 0.0
+            )
         if duration is not None:
             detail["duration_ms"] = duration
         if event_kind == "tool_call_error":
@@ -2766,8 +2877,45 @@ def _make_chat_tool_activity_callback(
                 job_id,
                 type(exc).__name__.lower(),
             )
+        if (
+            emit_debug_trace is not None
+            and event_kind in {"tool_call_result", "tool_call_error"}
+        ):
+            trace_detail = _v2_tool_trace_detail(
+                tc,
+                event_kind=event_kind,
+                result=result,
+                duration_ms=duration,
+            )
+            try:
+                await asyncio.to_thread(
+                    emit_debug_trace,
+                    user_id,
+                    "agent.tool.call",
+                    status=(
+                        "ok" if trace_detail["result_status"] == "ok" else "error"
+                    ),
+                    summary=(
+                        f"V2 {trace_detail['tool']} {trace_detail['result_status']}"
+                    ),
+                    explain=(
+                        f"V2 tool {trace_detail['tool']} finished "
+                        f"{trace_detail['result_status']} in "
+                        f"{int(trace_detail.get('dur_ms') or 0)}ms"
+                    ),
+                    detail=trace_detail,
+                    dur_ms=duration,
+                )
+            except Exception as exc:  # noqa: BLE001 — diagnostics are best-effort
+                log.warning(
+                    "[v2.tool_trace] emit failed user=%s job=%s code=%s",
+                    user_id,
+                    job_id,
+                    type(exc).__name__.lower(),
+                )
         if event_kind in {"tool_call_result", "tool_call_error"}:
             invocation_ids.pop(object_key, None)
+            started_monotonic.pop(object_key, None)
 
     return _record
 
@@ -11401,6 +11549,7 @@ async def process_job(
             attempt_identity=int(job.get("attempt_count") or 0),
             recorder=trajectory_recorder,
             effect_evidence_by_call=effect_evidence_by_call,
+            emit_debug_trace=deps.emit_debug_trace,
         )
 
         async def _dispatch_tools(tool_calls):
