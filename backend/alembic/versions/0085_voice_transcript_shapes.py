@@ -5,14 +5,14 @@ therefore required every archive to be a dual-recipient envelope.  The shared
 writer now follows the user's effective preference, so plaintext-tier users
 need the same exact plaintext body shape accepted by the other content tables.
 
-Revision ID: 0085_relax_voice_transcript_shape
+Revision ID: 0085_voice_transcript_shapes
 Revises: 0084_merge_screen_plaintext
 """
 
 from alembic import op
 
 
-revision = "0085_relax_voice_transcript_shape"
+revision = "0085_voice_transcript_shapes"
 down_revision = "0084_merge_screen_plaintext"
 branch_labels = None
 depends_on = None
