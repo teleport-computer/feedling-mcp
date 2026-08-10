@@ -172,6 +172,32 @@ def test_explicit_false_keeps_active_share_text_only(monkeypatch):
     assert result.data["image_omitted_reason"] == "not_requested"
 
 
+def test_unexpected_image_is_never_silently_truncated(monkeypatch):
+    payload = {
+        "frame_id": "f-unexpected",
+        "image_b64": "b" * 4000,
+        "image_mime": "image/jpeg",
+    }
+    monkeypatch.setattr(
+        screen_read_core,
+        "frame_decrypt",
+        lambda *_args, **_kwargs: ScreenResult(
+            status=200,
+            raw_body=json.dumps(payload).encode(),
+            media_type="application/json",
+        ),
+    )
+
+    result = cap_screen.read(
+        "STORE", params={"frame_id": "f-unexpected", "include_image": False}
+    )
+
+    assert result.ok is True
+    assert result.data["image_b64"] == "b" * 4000
+    assert result.data["has_image"] is True
+    assert "image_omitted_reason" not in result.data
+
+
 def test_read_binary_body_exposes_b64_only_for_native_vision_bridge(monkeypatch):
     monkeypatch.setattr(screen_read_core, "frame_decrypt",
                         lambda *a, **k: ScreenResult(status=200, raw_body=b"\xff\xd8", media_type="image/jpeg"))

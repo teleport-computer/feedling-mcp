@@ -93,7 +93,6 @@ def read(store, *, api_key=None, runtime_token=None, params=None) -> CapabilityR
     _decode_json_proxy_body(res)
     if (
         res.status == 200
-        and include_pixels
         and isinstance(res.json_body, dict)
         and res.json_body.get("image_b64")
     ):

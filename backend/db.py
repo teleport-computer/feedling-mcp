@@ -1043,6 +1043,31 @@ def admin_data_track_snapshot(user_ids: list[str]) -> dict[str, dict]:
                 """
                 SELECT user_id,
                        COUNT(*)::int AS total,
+                       MAX(ts) AS latest_ts,
+                       COUNT(*) FILTER (
+                         WHERE body_key IS NULL
+                       )::int AS inline_count,
+                       COUNT(*) FILTER (
+                         WHERE body_key IS NOT NULL
+                       )::int AS r2_count
+                FROM frame_envelopes
+                WHERE user_id = ANY(%s)
+                GROUP BY user_id
+                """,
+                (ids,),
+            ).fetchall()
+            for uid, total, latest_ts, inline_count, r2_count in rows:
+                ensure(out, uid)["screen_frames"] = {
+                    "total": total,
+                    "latest_ts": latest_ts,
+                    "inline_count": inline_count,
+                    "r2_count": r2_count,
+                }
+
+            rows = conn.execute(
+                """
+                SELECT user_id,
+                       COUNT(*)::int AS total,
                        MIN(NULLIF(doc->>'created_at', '')) AS first_created_at,
                        MAX(NULLIF(doc->>'created_at', '')) AS last_created_at,
                        MIN(NULLIF(doc->>'occurred_at', '')) AS earliest_occurred_at,

@@ -748,6 +748,22 @@ def _data_track_chat_from_snapshot(snap: dict) -> dict:
     }
 
 
+def _data_track_screen_frames_from_snapshot(snap: dict) -> dict:
+    frames = dict(snap.get("screen_frames") or {})
+    latest_ts = frames.get("latest_ts")
+    latest_epoch = core_util._to_epoch(latest_ts)
+    latest_age_sec = (
+        int(max(0, time.time() - latest_epoch)) if latest_epoch else None
+    )
+    return {
+        "total": int(frames.get("total") or 0),
+        "latest_at": _data_track_iso(latest_ts),
+        "latest_age_sec": latest_age_sec,
+        "inline_count": int(frames.get("inline_count") or 0),
+        "r2_count": int(frames.get("r2_count") or 0),
+    }
+
+
 _SCREEN_PROACTIVE_KINDS = frozenset({
     "screen_watch", "scene_change", "screen_tick", "broadcast_opened",
     "heartbeat_broadcast_on",
@@ -1212,6 +1228,7 @@ def _build_data_track_user_fast(user_entry: dict, snap: dict) -> dict:
         },
         "last_activity_at": core_util._epoch_to_iso(latest_epoch),
         "chat": chat,
+        "screen_frames": _data_track_screen_frames_from_snapshot(snap),
         "memory": memory,
         "proactive": proactive,
         "connection": _connection_health(route, access_modes, chat),
@@ -1581,6 +1598,9 @@ def _build_data_track_user(user_entry: dict, *, include_detail: bool = False) ->
         )
         detail_snapshot = db.admin_data_track_snapshot([user_id]).get(user_id, {})
         row["app_usage"] = _data_track_app_usage_from_snapshot(detail_snapshot)
+        row["screen_frames"] = _data_track_screen_frames_from_snapshot(
+            detail_snapshot
+        )
         # Same key the list rows carry (_build_data_track_user_fast), so a
         # client reading one shape can read the other.
         row["user_mcp"] = _data_track_user_mcp_from_snapshot(detail_snapshot)
@@ -8655,6 +8675,35 @@ def _render_perception_freshness(user: dict) -> str:
     )
 
 
+def _render_screen_frames(user: dict) -> str:
+    frames = user.get("screen_frames")
+    if not isinstance(frames, dict):
+        return ""
+    latest_at = str(frames.get("latest_at") or "")
+    latest_age = frames.get("latest_age_sec")
+    latest_value = html.escape(_bj_iso(latest_at)) if latest_at else "从未收到"
+    age_value = (
+        html.escape(_fmt_duration_sec(latest_age)) if latest_age is not None else "—"
+    )
+    return (
+        "<h2 style='font-size:15px;margin:22px 0 6px'>屏幕帧</h2>"
+        "<div class='ppmuted' style='font-size:12px;margin-bottom:6px'>"
+        "仅展示密文帧元数据与存储分布，不读取或渲染屏幕内容。</div>"
+        "<section class='grid'>"
+        f"<div class='card'><div class='value'>{int(frames.get('total') or 0)}</div>"
+        "<div class='label'>frame count</div></div>"
+        f"<div class='card'><div class='value'>{latest_value}</div>"
+        "<div class='label'>latest frame</div></div>"
+        f"<div class='card'><div class='value'>{age_value}</div>"
+        "<div class='label'>latest age</div></div>"
+        f"<div class='card'><div class='value'>{int(frames.get('inline_count') or 0)}</div>"
+        "<div class='label'>inline frames</div></div>"
+        f"<div class='card'><div class='value'>{int(frames.get('r2_count') or 0)}</div>"
+        "<div class='label'>R2 frames</div></div>"
+        "</section>"
+    )
+
+
 def _render_user_daily_usage(user: dict) -> str:
     rows = list(user.get("daily_usage") or [])
     days = int(user.get("daily_usage_days") or len(rows) or 14)
@@ -8810,6 +8859,7 @@ def _render_user_detail_page(user: dict) -> str:
   </section>
   {responder_notice}
   <div class="muted">Responder 判据：{html.escape(str(responder.get('criteria') or 'unavailable'))}</div>
+  {_render_screen_frames(user)}
   {_render_user_daily_usage(user)}
   {_render_perception_permissions(user)}
   {_render_perception_freshness(user)}
