@@ -39,6 +39,7 @@ from memory import service as memory_service
 import provider_client
 from hosted import agent_runtime_cutover
 from hosted import config_store as hosted_config_store
+from hosted import new_user_v2_cohort
 from hosted import turn as hosted_turn
 from hosted import vision_routing
 from hosted import vision_observer
@@ -884,6 +885,19 @@ def _apply_runtime_policy_or_error(store) -> tuple[dict, int] | None:
     return None
 
 
+def _apply_new_user_v2_default_or_error(store) -> tuple[dict, int] | None:
+    """Converge eligible dual-policy Model API users before setup succeeds."""
+    try:
+        new_user_v2_cohort.apply_default(store)
+    except Exception as exc:  # noqa: BLE001 — control-plane failures fail closed
+        print(
+            f"[new-user-v2:{store.user_id}] outcome=convergence_failed "
+            f"error_type={type(exc).__name__}"
+        )
+        return {"error": "runtime_policy_unavailable"}, 503
+    return None
+
+
 def _runtime_should_restore_v2(store) -> bool:
     """Whether an active-config replacement should resume V2 after fencing."""
     forced_mode = hosted_config_store.forced_hosted_runtime_mode()
@@ -1172,6 +1186,9 @@ def model_api_setup(store, payload: dict, *, caller_api_key: str | None) -> tupl
     policy_error = _apply_runtime_policy_or_error(store)
     if policy_error is not None:
         return policy_error
+    cohort_error = _apply_new_user_v2_default_or_error(store)
+    if cohort_error is not None:
+        return cohort_error
     accounts_onboarding._save_onboarding_route(store, "model_api")
     print(f"[model_api:{store.user_id}] setup provider={provider} model={model}")
 
