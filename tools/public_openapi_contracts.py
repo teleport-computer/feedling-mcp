@@ -2364,11 +2364,11 @@ RESPONSE_OVERRIDES: dict[Operation, dict[str, Any]] = {
     ("get", "/healthz"): {
         "503": {
             "description": (
-                "A critical dependency is unavailable — PostgreSQL is "
-                "unreachable or the connection pool cannot hand out a "
-                "connection in time. The body has the same shape as the 200 "
-                "response, with top-level \"status\": \"unhealthy\" and the "
-                "failing entry under \"checks\"."
+                "A critical dependency is unavailable, or the isolated probe "
+                "exceeded its three-second health-check deadline. PostgreSQL "
+                "connection acquisition and health SQL are independently bounded. "
+                "The body has the same shape as the 200 response, with top-level "
+                "\"status\": \"unhealthy\" and the failing entry under \"checks\"."
             ),
             "content": {"application/json": {"schema": {"$ref": "#/components/schemas/GenericJsonResponse"}}},
         },
@@ -2376,7 +2376,9 @@ RESPONSE_OVERRIDES: dict[Operation, dict[str, Any]] = {
     ("get", "/healthz/runner"): {
         "503": {
             "description": (
-                "The runner fleet is unhealthy, unavailable, or misconfigured. "
+                "The aggregate runner fleet is unhealthy, unavailable, or "
+                "misconfigured, or its isolated probe exceeded its three-second "
+                "health-check deadline. "
                 "The body has the same shape as the 200 response, with top-level "
                 "\"status\": \"unhealthy\" and a down \"runner_fleet\" entry "
                 "under \"checks\"."
