@@ -237,6 +237,7 @@ async def dispatch_tool_calls(
             metadata = (
                 activity_metadata.memory_result_metadata(tc.name, data)
                 or activity_metadata.history_result_metadata(tc.name, data)
+                or activity_metadata.perception_result_metadata(tc.name, data)
                 or None
             )
         except Exception:  # noqa: BLE001 — isolate one bad read; never expose its exception

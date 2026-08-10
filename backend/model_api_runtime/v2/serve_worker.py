@@ -4508,14 +4508,23 @@ async def _load_mcp_turn_observed(store, **kwargs):
 
 
 def _emit_v2_debug_trace(store, event_type: str, *, status: str,
-                         summary: str, explain: str, detail: dict) -> None:
+                         summary: str, explain: str, detail: dict,
+                         dur_ms: float | None = None) -> None:
     from diagnostics import diagnostics_core
 
-    diagnostics_core.emit_trace_event_payload(store, {"event": {
+    event = {
         "subsystem": "agent", "type": event_type, "status": status,
         "summary": summary, "explain": explain, "detail": detail,
         "actor": "hosted_v2",
-    }})
+    }
+    if dur_ms is not None:
+        event["dur_ms"] = dur_ms
+    diagnostics_core.emit_trace_event_payload(store, {"event": event})
+
+
+def _emit_v2_debug_trace_for_user(user_id: str, event_type: str, **kwargs) -> None:
+    """Assembly seam for the dependency-clean V2 worker."""
+    _emit_v2_debug_trace(core_store.get_store(user_id), event_type, **kwargs)
 
 
 def build_production_deps() -> v2_worker.TurnDeps:
@@ -4586,6 +4595,7 @@ def build_production_deps() -> v2_worker.TurnDeps:
         load_workspace_file=_load_workspace_file,
         seal_trajectory_payload=_seal_trajectory_payload,
         open_trajectory_payload=_open_trajectory_payload,
+        emit_debug_trace=_emit_v2_debug_trace_for_user,
         send_reply_push=(
             _send_reply_push
             if os.environ.get("FEEDLING_V2_PUSH_ENABLED", "1").strip() != "0"

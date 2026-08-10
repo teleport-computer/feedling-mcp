@@ -2,6 +2,11 @@ import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 from capabilities import tool_schema, registry
+from perception.agent_fields import (
+    AGENT_PERCEPTION_SIGNALS,
+    AGENT_SIGNAL_FIELDS,
+    FAST_AGENT_PERCEPTION_SIGNALS,
+)
 from provider_types import ToolSpec
 
 
@@ -83,6 +88,40 @@ def test_recent_apps_and_memory_fetch_parity_parameters_are_model_facing():
             "include_superseded": False,
         },
     ) is None
+
+
+def test_perception_tool_schema_exposes_catalog_and_default_boundary():
+    signal_enum = list(AGENT_PERCEPTION_SIGNALS)
+    assert (
+        tool_schema.PARAMS["perception_snapshot"]["properties"]["signals"]
+        ["items"]["enum"]
+        == signal_enum
+    )
+    for name in ("perception_history", "perception_trend"):
+        assert (
+            tool_schema.PARAMS[name]["properties"]["signal"]["enum"]
+            == signal_enum
+        )
+    assert tool_schema.PARAMS["perception_trend"]["properties"]["field"]["enum"] == sorted({
+        field for fields in AGENT_SIGNAL_FIELDS.values() for field in fields
+    })
+
+    snapshot_description = tool_schema.DESCRIPTIONS["perception_snapshot"]
+    assert ", ".join(FAST_AGENT_PERCEPTION_SIGNALS) in snapshot_description
+    assert "Health and activity signals are never included by default" in snapshot_description
+    assert all(
+        signal in snapshot_description
+        for signal in ("steps", "sleep", "vitals", "metabolic", "mood")
+    )
+
+
+def test_perception_enum_rejects_unknown_model_guesses_before_dispatch():
+    assert tool_schema.validate_tool_args(
+        "perception_snapshot", {"signals": ["health"]}
+    ) == "args.signals[0] has unsupported value"
+    assert tool_schema.validate_tool_args(
+        "perception_trend", {"signal": "vitals", "field": "heart_rate"}
+    ) == "args.field has unsupported value"
 
 
 def test_identity_patch_exposes_agent_name_so_a_rename_is_discoverable():
