@@ -167,13 +167,19 @@ jobs:
             tests/test_screen_caption_flag.py \
             tests/test_enclave_frame_caption.py \
             tests/test_enclave_visual_plaintext.py \
+            tests/test_io_cli_web.py \
             tests/test_proactive_agent_protocol_v2.py \
             tests/test_runtime_v2_default_flag.py \
+            tests/test_screen_vision_verdict_runtime.py \
             tests/test_capture_prompt_v1.py \
             tests/test_dream_prompt_v1.py \
             tests/test_card_text_gate.py \
             tests/test_card_user_referent.py \
             tests/test_pi_mcp_bridge.py \
+            tests/test_v2_cache_retry_metrics.py \
+            tests/test_v2_screen_chat.py \
+            tests/test_v2_serve_worker_screen_frames.py \
+            tests/test_v2_wake_tool_loop.py \
             -v
 
       - name: Run resident consumer regression suite
@@ -192,6 +198,43 @@ jobs:
           printf 'Running %d resident consumer test files\n' "${#consumer_tests[@]}"
           python -m pytest "${consumer_tests[@]}" -v
 
+      - name: Guard top-level pytest discovery coverage
+        run: |
+          export LC_ALL=C
+          find tests -maxdepth 1 -type f -name 'test_*.py' -print | sort \
+            > /tmp/feedling-all-tests.txt
+          grep -oE 'tests/test_[A-Za-z0-9_]+\.py' .github/workflows/ci.yml | sort -u \
+            > /tmp/feedling-named-tests.txt
+          grep -l -E \
+            'tools\.chat_resident_consumer|chat_resident_consumer as|import chat_resident_consumer|from tools import chat_resident_consumer|chat_resident_consumer\.py' \
+            tests/test_*.py | sort \
+            > /tmp/feedling-consumer-tests.txt
+          sort -u /tmp/feedling-named-tests.txt /tmp/feedling-consumer-tests.txt \
+            > /tmp/feedling-covered-tests.txt
+          comm -12 /tmp/feedling-all-tests.txt /tmp/feedling-covered-tests.txt \
+            > /tmp/feedling-covered-top-level-tests.txt
+          comm -23 /tmp/feedling-all-tests.txt /tmp/feedling-covered-tests.txt \
+            > /tmp/feedling-uncovered-tests.txt
+          comm -23 /tmp/feedling-uncovered-tests.txt \
+            .github/pytest-uncovered-baseline.txt \
+            > /tmp/feedling-new-uncovered-tests.txt
+          comm -13 /tmp/feedling-uncovered-tests.txt \
+            .github/pytest-uncovered-baseline.txt \
+            > /tmp/feedling-now-covered-tests.txt
+          echo "Top-level pytest discovery: $(wc -l < /tmp/feedling-all-tests.txt) total, $(wc -l < /tmp/feedling-covered-top-level-tests.txt) covered, $(wc -l < /tmp/feedling-uncovered-tests.txt) baseline-uncovered"
+          echo "::group::Top-level pytest files outside explicit/consumer discovery"
+          sed -n '1,9999p' /tmp/feedling-uncovered-tests.txt
+          echo "::endgroup::"
+          if [[ -s /tmp/feedling-now-covered-tests.txt ]]; then
+            echo "::warning::Some baseline tests are now covered or removed; shrink .github/pytest-uncovered-baseline.txt"
+            sed -n '1,9999p' /tmp/feedling-now-covered-tests.txt
+          fi
+          if [[ -s /tmp/feedling-new-uncovered-tests.txt ]]; then
+            echo "New top-level pytest files are not exercised by an explicit CI list or resident-consumer discovery:"
+            sed -n '1,9999p' /tmp/feedling-new-uncovered-tests.txt
+            exit 1
+          fi
+
       - name: Run Hosted Runtime V2 safety and prompt-cache suites
         env:
           FEEDLING_TEST_PG: "postgresql://postgres:postgres@127.0.0.1:5432/postgres"
@@ -208,12 +251,14 @@ jobs:
             tests/test_hosted_runtime_mode.py \
             tests/test_chat_send_v2_enqueue.py \
             tests/test_model_api_chat_send_routing.py \
+            tests/test_model_api_profiles_db.py \
             tests/test_model_api_profiles_endpoints.py \
             tests/test_provider_prompt_cache.py \
             tests/test_prompt_cache_canary.py \
             tests/test_provider_usage_normalize.py \
             tests/test_provider_malformed_tool_fallback.py \
             tests/test_mcp_client.py \
+            tests/test_mcp_status.py \
             tests/test_user_mcp_core.py \
             tests/test_user_mcp_probe.py \
             tests/test_user_mcp_routes.py \

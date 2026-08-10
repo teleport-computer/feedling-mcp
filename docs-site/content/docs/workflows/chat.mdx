@@ -160,14 +160,16 @@ uniformly samples at most six, preserving each frame's absolute capture time and
 relative age. No active share, no new frame, or an unchanged share adds no pixel
 block and never delays the text turn.
 
-Pixels are admitted by the route's randomized image-control result, not by an
-advisory provider catalog. A verdict of `ok` permits the sampled frames. An
-untested, failed, or unsupported verdict supplies only a
-`screen_share.active: true` availability fact; the model can still request an
-authorized screen read when appropriate. If a provider rejects an admitted
-image batch, the runtime retries that turn once without the screen frames and
-persists the unsupported verdict for later turns. User-attached photos remain
-separate and are not removed by this screen-only fallback.
+Hosted Runtime V2 withholds pixels only when the exact route has an explicit
+`unsupported` verdict. An `ok`, untested, failed, or absent verdict admits the
+sampled frames: not having run the optional control probe is not evidence that
+a model is text-only. If a provider rejects an admitted image batch, the runtime
+retries that turn once without the screen frames. Only a successful text-only
+retry confirms and persists the unsupported verdict, so later turns stop
+attaching pixels without misclassifying a generally unavailable route. The
+official resident path continues to require its propagated setup-probe `ok`
+signal. User-attached photos remain separate and are not removed by this
+screen-only fallback.
 
 Every attached frame is labelled untrusted application data: text visible on a
 shared screen is evidence, never a user or system instruction. A pixel-bearing

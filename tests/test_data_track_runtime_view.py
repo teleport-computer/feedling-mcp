@@ -766,7 +766,7 @@ def test_render_runtime_health_page_token_columns_are_dash_without_data(bound_re
     # 只写 `assert "—" in html_out` 是无效断言——页面别处本来就有 —。
     # 数量是 3 而非 2：命中率与上报覆盖率已拆成两列（2026-07-30 审计）。
     # 新增控制/抑制拆分后，旧 payload 对这两列也只能显示未知（—）。
-    assert chat_row.count("<td class='muted'>—</td>") == 5
+    assert chat_row.count("<td class='muted'>—</td>") == 6
     # maintenance 的数字绝不能串到 chat 行上
     assert "951.2k" not in chat_row
 
@@ -789,7 +789,7 @@ def test_render_runtime_health_page_includes_token_only_lane(bound_request):
     # "压根没被健康查询看见"）。新表把控制/抑制与两种失败率拆开，故共有
     # 7 个 muted dash；样本/成功/失败/过期/系统故障五列不带 muted class，
     # 内容也必须是 — 而非 0。
-    assert row.count("<td class='muted'>—</td>") == 7
+    assert row.count("<td class='muted'>—</td>") == 8
     assert "<td>—</td>" in row  # 样本/成功/失败/过期这几列（不带 muted class）
     assert ">0<" not in row and "0 / 0" not in row
 
@@ -804,6 +804,26 @@ def test_render_runtime_health_page_token_only_lane_does_not_affect_health_level
         delivery={},
     )
     assert "综合告警档位（取三项最差）：<span class=\"ok\">正常</span>" in html_out
+
+
+def test_render_runtime_health_page_shows_screen_watch_open_rate(bound_request):
+    tokens = _tokens(
+        lane_name="screen_watch",
+        turns=5,
+        visible_reply_turns=2,
+        visible_reply_count=3,
+        visible_reply_rate=0.4,
+        input_tokens=600_000,
+        prompt_tokens=600_000,
+    )
+    html_out = _dt._render_runtime_health_page(
+        _payload([_lane(lane="screen_watch")]), tokens
+    )
+    row = _lane_row_html(html_out, "screen_watch")
+
+    assert "开口回合/回合" in html_out
+    assert "2 / 5 (40.0%)" in row
+    assert "600.0k" in row
 
 
 def test_render_runtime_health_page_tolerates_missing_tokens_arg(bound_request):
@@ -944,7 +964,7 @@ def test_render_runtime_health_page_separates_two_coverages(bound_request):
 def test_render_runtime_health_page_coverage_columns_dash_without_data(bound_request):
     html_out = _dt._render_runtime_health_page(_payload(), _tokens(lane_name="other"))
     # chat 行 token/命中/覆盖均未知；旧 payload 的控制/抑制列也未知。
-    assert _lane_row_html(html_out, "chat").count("<td class='muted'>—</td>") == 5
+    assert _lane_row_html(html_out, "chat").count("<td class='muted'>—</td>") == 6
 
 
 def test_runtime_page_links_drop_params_it_ignores():

@@ -78,6 +78,7 @@ from core import enclave as core_enclave  # noqa: F401 — 读侧已改走 core_
 from core import wake_bus as core_wake_bus
 from genesis import daemon as genesis_daemon
 from hosted import config_store as hosted_config_store
+from hosted import mcp_status
 from hosted import mcp_tools
 from hosted import vision_observer
 from memory import memory_core
@@ -4181,19 +4182,36 @@ def _validate_decrypted_tool_effect(effect_type: str, payload: dict) -> None:
             memory = action.get("memory")
             if not isinstance(memory, dict):
                 raise RuntimeError("invalid encrypted memory payload")
-            if set(memory) == {"summary", "content", "bucket", "threads"}:
+            memory_fields = set(memory)
+            current_required = {"summary", "content", "occurred_at"}
+            current_allowed = current_required | {
+                "bucket", "threads", "importance", "pulse"
+            }
+            if current_required <= memory_fields <= current_allowed:
                 if (
                     not str(memory.get("summary") or "").strip()
                     or not str(memory.get("content") or "").strip()
+                    or not str(memory.get("occurred_at") or "").strip()
                 ):
                     raise RuntimeError("invalid encrypted memory content")
-                if not isinstance(memory.get("bucket"), str):
+                if "bucket" in memory and not isinstance(memory.get("bucket"), str):
                     raise RuntimeError("invalid encrypted memory bucket")
-                threads = memory.get("threads")
-                if not isinstance(threads, list) or not all(
-                    isinstance(thread, str) for thread in threads
-                ):
-                    raise RuntimeError("invalid encrypted memory threads")
+                if "threads" in memory:
+                    threads = memory.get("threads")
+                    if not isinstance(threads, list) or not all(
+                        isinstance(thread, str) for thread in threads
+                    ):
+                        raise RuntimeError("invalid encrypted memory threads")
+                for score in ("importance", "pulse"):
+                    if score not in memory:
+                        continue
+                    value = memory.get(score)
+                    if (
+                        isinstance(value, bool)
+                        or not isinstance(value, (int, float))
+                        or not math.isfinite(float(value))
+                    ):
+                        raise RuntimeError("invalid encrypted memory score")
             else:
                 # Deploy compatibility for encrypted_v1 rows produced before
                 # the model-facing op/summary/content vocabulary landed.
@@ -4531,15 +4549,37 @@ async def _load_mcp_turn_observed(store, **kwargs):
         if summary:
             dropped = max(0, int(summary.get("offered") or 0)
                           - int(summary.get("kept") or 0))
+            skipped = [
+                item for item in (summary.get("skipped") or [])
+                if isinstance(item, dict)
+            ]
+            surface_failure = str(summary.get("surface_failure_kind") or "")
+            failed = bool(dropped or skipped or surface_failure)
+            expected = max(0, int(summary.get("expected") or 0))
+            resolved = max(0, int(summary.get("resolved") or 0))
+            skipped_text = ",".join(
+                f"{item.get('name')}:{item.get('kind')}"
+                for item in skipped[:10]
+            )
             await asyncio.to_thread(
                 _emit_v2_debug_trace,
                 store,
                 "mcp.surface.resolved",
-                status="error" if dropped else "ok",
-                summary=(f"MCP 工具面 {summary.get('kept')} 个"
-                         + (f",裁掉 {dropped} 个" if dropped else "")),
+                status="error" if failed else "ok",
+                summary=(
+                    f"MCP 配置列表读取失败({surface_failure})"
+                    if surface_failure else
+                    f"MCP 服务器 {resolved}/{expected} 台可用,"
+                    f"工具面 {summary.get('kept') or 0} 个"
+                    + (f",整台失败 {len(skipped)} 台" if skipped else "")
+                    + (f",裁掉 {dropped} 个" if dropped else "")
+                ),
                 explain=(
-                    f"模型这一轮能看到 {summary.get('kept')} 个 MCP 工具"
+                    ("MCP 配置列表本轮无法读取;没有服务器进入模型工具面。"
+                     if surface_failure else
+                     f"模型这一轮能看到 {summary.get('kept') or 0} 个 MCP 工具;"
+                     f"启用的 {expected} 台服务器中 {resolved} 台完成工具加载"
+                     + (f";整台未就绪:{skipped_text}" if skipped else ""))
                     + (f";另有 {dropped} 个因超过上限被裁掉 —— 分配是**轮转公平**"
                        "的(每台各拿一个再拿第二个),裁掉的是工具最多那几台的尾部,"
                        "每台仍有代表工具。detail.per_server 是「注册数/发现数」"
@@ -4549,6 +4589,20 @@ async def _load_mcp_turn_observed(store, **kwargs):
             )
     except Exception as exc:  # noqa: BLE001 — 诊断绝不能影响回合
         log.warning("[v2.mcp] surface trace failed: %s", type(exc).__name__)
+    # A config-list failure is not an observation of the enabled-server set;
+    # retaining the previous snapshot is more honest than clearing it. Every
+    # other result (including an empty enabled set) advances the bounded status.
+    if not str((getattr(turn, "summary", None) or {}).get(
+        "surface_failure_kind") or ""):
+        try:
+            await asyncio.to_thread(
+                mcp_status.record_runtime_results,
+                store,
+                getattr(turn, "server_results", None) or [],
+            )
+        except Exception as exc:  # noqa: BLE001 — diagnostics never fail a turn
+            log.warning("[v2.mcp] runtime status write failed: %s",
+                        type(exc).__name__)
     return turn
 
 

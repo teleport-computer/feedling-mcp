@@ -109,6 +109,49 @@ def test_validate_memory_delete_accepts_optional_audit_reason():
     )
 
 
+def test_validate_memory_add_accepts_frozen_time_and_optional_metadata():
+    serve_worker._validate_decrypted_tool_effect(
+        "memory",
+        {
+            "effect_id": "e",
+            "actions": [{
+                "type": "memory.add",
+                "memory": {
+                    "summary": "likes tea",
+                    "content": "likes tea",
+                    "occurred_at": "2026-08-10T23:00:00Z",
+                    "bucket": "preferences",
+                    "threads": ["tea"],
+                    "importance": 0.8,
+                    "pulse": 0.0,
+                },
+                "reason": "agent tool",
+                "capture_mode": "agent_tool",
+            }],
+        },
+    )
+
+
+@pytest.mark.parametrize("bad_score", [True, "0.5", float("inf")])
+def test_validate_memory_add_rejects_invalid_optional_score(bad_score):
+    with pytest.raises(RuntimeError, match="invalid encrypted memory score"):
+        serve_worker._validate_decrypted_tool_effect(
+            "memory",
+            {
+                "effect_id": "e",
+                "actions": [{
+                    "type": "memory.add",
+                    "memory": {
+                        "summary": "likes tea",
+                        "content": "likes tea",
+                        "occurred_at": "2026-08-10T23:00:00Z",
+                        "importance": bad_score,
+                    },
+                }],
+            },
+        )
+
+
 def test_identity_effect_mapping_freezes_relationship_anchor():
     from datetime import date, timedelta
     effect_type, payload = worker._write_tool_effect_payload(

@@ -511,9 +511,12 @@ and manual wakes remain valid without prior history.
 
 Exact device, environment, activity, health, calendar, reminder, and photo data
 cross the decrypt boundary only through an authorized tool read. Shared-screen
-pixels normally follow that rule too, with one foreground-Chat exception: a live
-share whose active route has an `ok` image-control verdict may contribute the
-bounded new-frame block described above. Screen content is evidence only and
+pixels normally follow that rule too, with one foreground-Chat exception:
+Hosted Runtime V2 may contribute the bounded new-frame block unless the exact
+active route is explicitly marked image-unsupported. Untested and absent probe
+states are admitted optimistically; a confirmed rejection is learned by the
+screen-only text fallback. The official resident path still requires a setup
+probe `ok` signal. Screen content is evidence only and
 cannot supply requirements or instructions. A turn receiving screen pixels has
 web, MCP, and `task` removed before its first provider call; an image-rejection
 retry stays behind the same fence. After any other explicit text-bearing private

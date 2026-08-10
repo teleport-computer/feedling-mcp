@@ -726,6 +726,21 @@ def test_no_enabled_servers_is_empty(monkeypatch):
     assert turn.is_empty and turn.tool_specs == []
 
 
+def test_envelope_list_failure_is_a_content_free_surface_failure(monkeypatch):
+    def fail(_store):
+        raise RuntimeError("database error containing private detail")
+
+    monkeypatch.setattr(mcp_tools.mcp_core, "envelopes_payload", fail)
+
+    turn = asyncio.run(
+        mcp_tools.load_turn_mcp(STORE, api_key="k", runtime_token="rt"))
+
+    assert turn.is_empty
+    assert turn.server_results == []
+    assert turn.summary == {"surface_failure_kind": "envelopes_unavailable"}
+    assert "private detail" not in json.dumps(turn.summary)
+
+
 def test_down_server_is_skipped_not_fatal(monkeypatch):
     async def boom_list(url, headers, *, ca_pem=None, transport=None, mcp_transport=None):
         raise mcp_client.ProbeError("timeout", "read timeout")
@@ -744,8 +759,18 @@ def test_down_server_is_skipped_not_fatal(monkeypatch):
 
     _patch(monkeypatch, servers=_servers("up", "down"), decrypt=decrypt, list_tools=mixed_list)
     turn = asyncio.run(mcp_tools.load_turn_mcp(STORE, api_key="k", runtime_token="rt"))
-    # the healthy server's tool survives; the down one is silently dropped
+    # The healthy server survives and the down one is now an explicit,
+    # content-free outcome rather than a silently discarded None.
     assert [s.name for s in turn.tool_specs] == ["mcp__up__ok"]
+    assert turn.summary["expected"] == 2
+    assert turn.summary["resolved"] == 1
+    assert turn.summary["skipped"] == [
+        {"name": "down", "kind": "timeout"},
+    ]
+    assert turn.server_results == [
+        {"name": "up", "kind": "available"},
+        {"name": "down", "kind": "timeout"},
+    ]
 
 
 def test_decrypt_failure_is_skipped_not_fatal(monkeypatch):
@@ -932,6 +957,34 @@ def test_auto_ca_fetch_returns_none_skips_server(monkeypatch):
     turn = asyncio.run(mcp_tools.load_turn_mcp(STORE, api_key="k", runtime_token="rt"))
     assert turn.is_empty
     assert not mcp_tools.is_mcp_tool("")
+
+
+def test_auto_ca_fetch_exception_skips_only_that_server(monkeypatch):
+    async def fake_list(url, headers, *, ca_pem=None, transport=None,
+                        mcp_transport=None):
+        raise mcp_client.ProbeError("tls", "private certificate detail")
+
+    async def fake_fetch(url, *, timeout=3.0):
+        raise RuntimeError("private fetch detail")
+
+    monkeypatch.setattr(
+        mcp_tools.mcp_ca_fetch, "fetch_anchor_for_url", fake_fetch)
+    _patch(
+        monkeypatch,
+        servers=_servers("x"),
+        decrypt=lambda env, api_key, runtime_token: {
+            "url": "https://x.example.com", "headers": {}},
+        list_tools=fake_list,
+    )
+
+    turn = asyncio.run(
+        mcp_tools.load_turn_mcp(STORE, api_key="k", runtime_token="rt"))
+
+    assert turn.is_empty
+    assert turn.summary["skipped"] == [
+        {"name": "x", "kind": "auto_ca_fetch_failed"},
+    ]
+    assert "private" not in json.dumps(turn.summary)
 
 
 def test_small_server_is_not_starved_by_a_large_one(monkeypatch):

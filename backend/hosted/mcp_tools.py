@@ -116,6 +116,23 @@ class _CatalogCandidate:
     serialized_chars: int
 
 
+@dataclass(frozen=True)
+class _ServerLoadResult:
+    """One configured server's content-free catalog-load outcome."""
+
+    name: str
+    kind: str
+    secret: dict | None = None
+    tools: tuple = ()
+
+    @property
+    def available(self) -> bool:
+        return self.kind == "available"
+
+    def public(self) -> dict:
+        return {"name": self.name, "kind": self.kind}
+
+
 @dataclass
 class McpTurn:
     tool_specs: list  # list[ToolSpec], namespaced
@@ -126,6 +143,9 @@ class McpTurn:
     # (pi 那条路已有 mcp.surface.* 埋点,V2 一直没有 —— 又是一次只覆盖一条 lane)。
     # serve_worker 拿它落 debug trace;字段与 pi 那侧对齐,方便同一套排查。
     summary: dict = field(default_factory=dict)
+    # 每台启用服务器的加载结果。只含 name + 稳定 kind,不含 URL/header/远端正文。
+    # 装配层用它维护 App 将来读取的最近状态,loader 本身不碰数据库。
+    server_results: list[dict] = field(default_factory=list)
 
     @property
     def is_empty(self) -> bool:
@@ -392,14 +412,16 @@ async def load_turn_mcp(
             "mcp envelopes load failed user=%s kind=envelopes_unavailable",
             getattr(store, "user_id", "?"),
         )
-        return McpTurn([], {})
+        return McpTurn([], {}, {
+            "surface_failure_kind": "envelopes_unavailable",
+        })
     if isinstance(payload, tuple):
         payload = payload[0]
     servers = [s for s in (payload.get("servers") or []) if s.get("enabled")]
     if not servers:
         return McpTurn([], {})
 
-    async def _one(srv):
+    async def _one(srv) -> _ServerLoadResult:
         name = str(srv.get("name") or "")
         try:
             if enclave_sem is None:
@@ -421,7 +443,7 @@ async def load_turn_mcp(
                 "mcp server skipped server=%r kind=config_decrypt_failed",
                 name,
             )
-            return None
+            return _ServerLoadResult(name, "config_decrypt_failed")
         try:
             tools = await mcp_client.list_tools(
                 secret["url"], secret.get("headers") or {},
@@ -438,28 +460,42 @@ async def load_turn_mcp(
                 and isinstance(exc, mcp_client.ProbeError)
                 and str(getattr(exc, "kind", "")) == "tls"
             ):
-                anchor = await mcp_ca_fetch.fetch_anchor_for_url(secret["url"])
+                try:
+                    anchor = await mcp_ca_fetch.fetch_anchor_for_url(secret["url"])
+                except Exception as fetch_exc:  # noqa: BLE001 — one bad server only
+                    kind = _stable_failure_kind(
+                        fetch_exc, fallback="auto_ca_fetch_failed")
+                    log.warning(
+                        "mcp server skipped server=%r kind=%s",
+                        name,
+                        kind,
+                    )
+                    return _ServerLoadResult(name, kind)
             if anchor is None:
+                kind = _stable_failure_kind(
+                    exc, fallback="transport_failure")
                 log.warning(
                     "mcp server skipped server=%r kind=%s",
                     name,
-                    _stable_failure_kind(exc, fallback="transport_failure"),
+                    kind,
                 )
-                return None
+                return _ServerLoadResult(name, kind)
             secret = {**secret, "ca_pem": anchor}
             try:
                 tools = await mcp_client.list_tools(
                     secret["url"], secret.get("headers") or {},
                     ca_pem=anchor, mcp_transport=secret.get("transport"))
             except Exception as retry_exc:  # noqa: BLE001 — anchor didn't help
+                kind = _stable_failure_kind(
+                    retry_exc, fallback="transport_failure")
                 log.warning(
                     "mcp server skipped server=%r kind=%s (after auto-ca)",
                     name,
-                    _stable_failure_kind(retry_exc, fallback="transport_failure"),
+                    kind,
                 )
-                return None
+                return _ServerLoadResult(name, kind)
             log.info("mcp server auto-ca pinned server=%r", name)
-        return (name, secret, tools)
+        return _ServerLoadResult(name, "available", secret, tuple(tools))
 
     results = await asyncio.gather(*[_one(s) for s in servers])
     # Resolve collisions in source order before sorting. This preserves the
@@ -470,10 +506,12 @@ async def load_turn_mcp(
     # 因 schema 太大 / 结构非法被整个丢掉的工具。以前只有 log.warning ——
     # 模型少了一个工具,而运维在 admin 里什么都看不到。
     schema_rejected: list[str] = []
-    for r in results:
-        if r is None:
+    for result in results:
+        if not result.available:
             continue
-        name, secret, tools = r
+        name = result.name
+        secret = result.secret or {}
+        tools = result.tools
         for t in tools:
             if not isinstance(t, dict):
                 continue
@@ -559,7 +597,18 @@ async def load_turn_mcp(
                 serialized_chars=candidate_chars,
             ))
 
-    return _allocate_round_robin(candidates, schema_rejected=schema_rejected)
+    turn = _allocate_round_robin(candidates, schema_rejected=schema_rejected)
+    turn.server_results = [result.public() for result in results]
+    skipped = [result.public() for result in results if not result.available]
+    turn.summary.update({
+        "expected": len(results),
+        "expected_servers": [result.name for result in results],
+        "resolved": sum(1 for result in results if result.available),
+        "skipped_count": len(skipped),
+        "skipped": skipped,
+        "server_results": list(turn.server_results),
+    })
+    return turn
 
 
 def _allocate_round_robin(

@@ -125,6 +125,16 @@ def test_screen_frame_and_visible_reply_metrics_are_content_free(pg_clean_metric
 
     assert row == (6, 4, 2, 1)
 
+    screen = jobs_store.recent_token_usage_by_lane(within_hours=24)["lanes"][
+        "screen_watch"
+    ]
+    assert screen["turns"] == 1
+    assert screen["screen_frames_pushed"] == 6
+    assert screen["visible_reply_turns"] == 1
+    assert screen["visible_reply_count"] == 1
+    assert screen["visible_reply_rate"] == 1.0
+    assert screen["input_tokens"] == screen["prompt_tokens"] == 10
+
 
 def test_token_metrics_accept_values_above_legacy_integer_range(pg_clean_metrics):
     uid = "u_wtm_bigint"

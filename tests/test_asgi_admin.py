@@ -388,6 +388,7 @@ _DELETE_TABLES = (
     "user_blobs",
     "agent_runtime_instances",
     "provider_health",
+    "v2_user_allowlist",
 )
 
 
@@ -417,6 +418,14 @@ def _seed_delete_rows(user_id: str) -> None:
         conn.execute(
             "INSERT INTO provider_health (user_id, provider_state) "
             "VALUES (%s, 'ok')",
+            (user_id,),
+        )
+        conn.execute(
+            "INSERT INTO v2_user_allowlist "
+            "(user_id, desired, updated_by, note) "
+            "VALUES (%s, 'resident', 'admin', 'admin-delete') "
+            "ON CONFLICT (user_id) DO UPDATE SET desired='resident', "
+            "updated_by='admin', note='admin-delete'",
             (user_id,),
         )
 
