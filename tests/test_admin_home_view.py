@@ -1230,3 +1230,30 @@ def test_growth_accounting_in_progress_day_not_settled():
     assert "0.10" not in page             # 当天 QR 不渲染
     assert "1.15" in page                 # 已冻结日照常
     assert "增长 QR" in page              # 更名防与财务速动比混淆
+
+
+def test_home_human_summary_clauses_and_degradation():
+    """顶部人话总结：数字与下方板块同源；缺哪块丢哪句，全缺不渲染。"""
+    if not hasattr(dt, "_home_human_summary"):
+        pytest.skip("human summary not present")
+    out = dt._home_human_summary(_pulse(), _story(), _queue())
+    assert "近 7 天 <b>12</b> 人在用" in out
+    assert "比上一周多 2 个" in out
+    assert "新来 100 个能留住 <b>18</b> 个" in out
+    assert "<b>2</b> 个人卡住等你" in out
+    # 空队列 = 明确的好消息，照说。
+    out_empty = dt._home_human_summary(_pulse(), _story(), {"rows": [], "truncated": False})
+    assert "没有人卡住" in out_empty
+    # 留存缺数：从句消失，不编数。
+    story = _story(); story["curve"]["d14"] = None
+    assert "能留住" not in dt._home_human_summary(_pulse(), story, _queue())
+    # 全缺：整行不渲染。
+    assert dt._home_human_summary(None, None, None) == ""
+
+
+def test_home_page_renders_human_summary(monkeypatch):
+    counters: dict[str, int] = {}
+    _stub_home_builders(monkeypatch, counters)
+    page = admin_core.page_html("view=home&admin_key=x")
+    assert "human-summary" in page
+    assert "人在用" in page

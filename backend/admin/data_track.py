@@ -3598,6 +3598,8 @@ _RUNTIME_PAGE_CSS = _NAV_GROUP_CSS + """
     .dimension-scope { margin-top:8px; color:var(--muted); font-size:11px; line-height:1.4; }
     .overall-summary { margin:12px 0 3px; color:var(--muted); font-size:13px; font-weight:650; }
     .table-wrap { max-width:100%; overflow-x:auto; }
+    .human-summary { font-size:17px; line-height:1.6; margin:14px 0 4px; padding:12px 16px; background:var(--card); border:1px solid var(--line); border-radius:8px; }
+    .human-summary b { font-size:19px; }
     .ops-kicker { color:var(--accent); font-size:11px; font-weight:800; letter-spacing:.11em; text-transform:uppercase; }
     .ops-window { display:flex; flex-wrap:wrap; align-items:center; gap:8px; margin:18px 0; }
     .ops-window-label { margin-right:3px; color:var(--muted); font-size:12px; }
@@ -5774,6 +5776,56 @@ def _home_status_card(
     )
 
 
+def _home_human_summary(
+    pulse: dict | None, story: dict | None, queue: dict | None
+) -> str:
+    """首页顶部的人话总结：一句话说完水位/留存/工单。
+
+    诚实规则同全站：某块数据缺失就整句丢掉对应从句，绝不编数；三块全缺
+    就不渲染这一行。数字全部与下方板块同源（脉搏 WAU、故事数字 D14、
+    队列行数），不另起口径。"""
+    clauses: list[str] = []
+    wau = (pulse or {}).get("wau")
+    prev_wau = (pulse or {}).get("prev_wau")
+    if wau is not None:
+        head = f"近 7 天 <b>{int(wau)}</b> 人在用"
+        try:
+            diff = int(wau) - int(prev_wau)
+        except (TypeError, ValueError):
+            diff = None
+        if diff is not None and diff != 0:
+            head += f"（比上一周{'多' if diff > 0 else '少'} {abs(diff)} 个）"
+        elif diff == 0:
+            head += "（和上一周持平）"
+        clauses.append(head)
+    d14 = ((story or {}).get("curve") or {}).get("d14")
+    if isinstance(d14, dict) and d14.get("pct") is not None:
+        try:
+            kept = int(round(float(d14["pct"])))
+            clauses.append(f"新来 100 个能留住 <b>{kept}</b> 个")
+        except (TypeError, ValueError):
+            pass
+    if queue is not None:
+        rows = [r for r in (queue.get("rows") or []) if isinstance(r, dict)]
+        if rows:
+            plus = "+" if queue.get("truncated") else ""
+            clauses.append(f"<b>{len(rows)}{plus}</b> 个人卡住等你")
+        else:
+            clauses.append("没有人卡住")
+    if not clauses:
+        return ""
+    hint = (
+        "在用=近 7 完整北京日打开过 App；留住=注册日 cohort 加权 D14；"
+        "卡住=下方「需要你的用户」名单。都和下方板块同源，缺数的从句直接省略。"
+    )
+    return (
+        "<div class='human-summary'>"
+        + "；".join(clauses)
+        + f"。<span class='hint' title='{html.escape(hint, quote=True)}'>?</span>"
+        "</div>"
+    )
+
+
 def _home_queue_section(queue: dict | None) -> str:
     # 用户详情链接沿用 users 页的 qs 透传模式（admin_key 等跟着走）；view
     # 参数属于当前页，不带进详情页。
@@ -6272,6 +6324,7 @@ def _render_home_page(
   <span class="ops-kicker">Operations / metadata only</span>
   <h1>Feedling 值班首页</h1>
   <div class="muted">先看四个灯，再看谁卡住；每块都能点进对应诊断页。生成于 {html.escape(_bj_iso(time.time()))}（北京时间）。</div>
+  {_home_human_summary(pulse, story, queue)}
   {_render_data_track_view_nav("home")}
   <section class="ops-questions">{status_cards}</section>
   <h2>需要你的用户</h2>
