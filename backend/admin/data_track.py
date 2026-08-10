@@ -651,6 +651,29 @@ def _data_track_app_usage_from_snapshot(snap: dict) -> dict:
     }
 
 
+def _data_track_user_mcp_from_snapshot(snap: dict) -> dict:
+    """Whether this user has MCP servers saved, and how many are switched ON.
+
+    Metadata only — the db aggregate counts in SQL so no encrypted envelope
+    (each server's url + auth headers) ever enters this process. ``configured``
+    answers a question the app cannot: its connection test is a control-plane
+    probe that dials the server directly and passes without saving anything, so
+    a user reporting "the test was green" is not evidence that anything was
+    stored. ``enabled_count`` separates the two failure shapes that look
+    identical from outside — a saved-but-switched-off server still advertises a
+    NON-empty fingerprint and materializes cleanly, yet reaches the agent as
+    zero servers, exactly like a broken apply chain would.
+    """
+    mcp = dict(snap.get("user_mcp") or {})
+    configured_count = int(mcp.get("configured_count") or 0)
+    return {
+        "configured": configured_count > 0,
+        "configured_count": configured_count,
+        "enabled_count": int(mcp.get("enabled_count") or 0),
+        "fingerprint": str(mcp.get("fingerprint") or ""),
+    }
+
+
 def _epoch_is_today_shanghai(epoch: float, now_epoch: float) -> bool:
     """True when ``epoch`` falls on the same Asia/Shanghai calendar day as
     ``now_epoch``. Explicit ZoneInfo — never the host's local TZ."""
@@ -1197,6 +1220,7 @@ def _build_data_track_user_fast(user_entry: dict, snap: dict) -> dict:
         "app_usage": _data_track_app_usage_from_snapshot(snap),
         "bootstrap_events": bootstrap_events,
         "history_import": history_import,
+        "user_mcp": _data_track_user_mcp_from_snapshot(snap),
     }
     row["responder"] = _effective_responder(
         route=route,
@@ -1557,6 +1581,9 @@ def _build_data_track_user(user_entry: dict, *, include_detail: bool = False) ->
         )
         detail_snapshot = db.admin_data_track_snapshot([user_id]).get(user_id, {})
         row["app_usage"] = _data_track_app_usage_from_snapshot(detail_snapshot)
+        # Same key the list rows carry (_build_data_track_user_fast), so a
+        # client reading one shape can read the other.
+        row["user_mcp"] = _data_track_user_mcp_from_snapshot(detail_snapshot)
         detail_blobs = detail_snapshot.get("blobs") or {}
         row["responder"] = _effective_responder(
             route=route,

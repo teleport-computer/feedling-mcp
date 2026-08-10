@@ -1587,3 +1587,68 @@ def test_connection_health_separates_never_connected_from_went_offline():
     # A live sighting outranks a missing/false binding flag: liveness is the
     # heartbeat, and the flag is the thing we stopped trusting.
     assert health(datetime.now().isoformat(), connected=False)["status"] == "ok"
+
+
+def test_admin_data_track_reports_user_mcp_counts_without_secrets(client):
+    """A saved-but-switched-off MCP server must be distinguishable from none.
+
+    Support cannot answer "did this user actually configure a server?" today:
+    the app's connection test is a control-plane probe that dials the server
+    directly and passes without storing anything, so "the test was green" is
+    not evidence. Worse, a server that is saved but toggled OFF still produces
+    a NON-empty fingerprint and materializes cleanly on the consumer, then
+    reaches the agent as zero servers — outwardly identical to a broken apply
+    chain. ``enabled_count`` is what separates those two.
+    """
+    from hosted import mcp_core
+
+    user_id, _ = _register(client)
+    servers = [
+        {"name": "alpha", "enabled": True,
+         "config_envelope": {"id": "env_alpha",
+                             "ciphertext": "ciphertext-that-must-not-leak"},
+         "url_hint": "alpha.example.com", "header_names": ["authorization"]},
+        {"name": "beta", "enabled": False,
+         "config_envelope": {"id": "env_beta",
+                             "ciphertext": "ciphertext-that-must-not-leak"},
+         "url_hint": "beta.example.com", "header_names": ["x-api-key"]},
+    ]
+    db.set_blob(user_id, mcp_core.USER_MCP_BLOB, {
+        "fingerprint": mcp_core.compute_fingerprint(servers),
+        "servers": servers,
+    })
+
+    res = client.get("/v1/admin/data-track/users", headers=_admin_headers())
+    assert res.status_code == 200, res.get_data(as_text=True)
+    body = res.get_json()
+    row = body["users"][0]
+
+    assert row["user_mcp"]["configured"] is True
+    assert row["user_mcp"]["configured_count"] == 2
+    assert row["user_mcp"]["enabled_count"] == 1, (
+        "the disabled server must not be counted as reaching the agent")
+    # Derived, never hardcoded: this is the exact string the consumer compares
+    # its applied fingerprint against, so a change to the basis must show up
+    # here rather than silently passing against a stale literal.
+    assert row["user_mcp"]["fingerprint"] == mcp_core.compute_fingerprint(servers)
+    assert row["user_mcp"]["fingerprint"], (
+        "servers exist, so the fingerprint is non-empty even with one disabled")
+
+    # The envelope holds the url + auth headers. Counting happens in SQL
+    # precisely so none of it enters the admin process.
+    dumped = json.dumps(body)
+    assert "ciphertext-that-must-not-leak" not in dumped
+    assert "alpha.example.com" not in dumped
+    assert "x-api-key" not in dumped
+
+
+def test_admin_data_track_user_mcp_absent_reads_as_not_configured(client):
+    """No blob at all is the third state, and must not look like a failure."""
+    _register(client)
+    res = client.get("/v1/admin/data-track/users", headers=_admin_headers())
+    assert res.status_code == 200, res.get_data(as_text=True)
+    row = res.get_json()["users"][0]
+    assert row["user_mcp"] == {
+        "configured": False, "configured_count": 0,
+        "enabled_count": 0, "fingerprint": "",
+    }

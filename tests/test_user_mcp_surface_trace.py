@@ -9,6 +9,7 @@
 
 这个文件锁住三层静默失败都会留声。
 """
+import json
 import os
 import sys
 import types
@@ -301,23 +302,90 @@ def test_claude_wired_but_unauthorized_is_still_an_error():
 def test_claude_fully_wired_is_ok():
     kind, kw = _wiring([
         "claude", "--mcp-config=/tmp/x.json",
-        "--allowed-tools=mcp__tavily__*", "--print",
+        "--allowed-tools=mcp__tavily__*,mcp__gaodemap__*", "--print",
     ])[0]
     assert kind == "mcp.surface.wired"
     assert kw["status"] == "ok"
     assert kw["detail"]["authorized"] is True
 
 
-def test_hosted_claude_is_authorized_by_settings_json_not_by_a_flag():
-    """托管路线没有 allowlist 参数也算授权 —— 规则在我们生成的 settings.json 里。
+def test_claude_partial_grant_names_only_the_ungranted_server():
+    """授权是逐台的:漏掉一台,那台的工具就调不了,不能整体判绿。
 
-    PR#174 的四格矩阵证明 settings.json 单独就够。不认这条的话,托管用户每轮
-    都会被误报成「未授权」,把真问题淹掉。
+    旧判据只问「有没有 --allowed-tools 这个参数」,所以两台里只授权一台也报
+    authorized=true —— 恰好把「某个工具用不了」这种局部失败盖掉。
     """
+    kind, kw = _wiring([
+        "claude", "--mcp-config=/tmp/x.json",
+        "--allowed-tools=mcp__tavily__*", "--print",
+    ], env={"CLAUDE_CONFIG_DIR": ""})[0]
+    assert kind == "mcp.surface.wired"
+    assert kw["status"] == "error"
+    assert kw["detail"]["authorized"] is False
+    assert kw["detail"]["ungranted"] == ["gaodemap"]
+
+
+def test_hosted_claude_is_authorized_by_settings_json_not_by_a_flag(tmp_path):
+    """托管路线没有 MCP 的 allowlist 参数也算授权 —— 规则在 settings.json 里。
+
+    2.1.217 的四格矩阵证明 settings.json 单独就够(两条来源是并集)。不认这条的
+    话,托管用户每轮都会被误报成「未授权」,把真问题淹掉。
+    """
+    (tmp_path / "settings.json").write_text(json.dumps({"permissions": {"allow": [
+        "mcp__tavily__*", "mcp__gaodemap__*", "Bash(io_cli:*)",
+    ]}}))
     kind, kw = _wiring(["claude", "--mcp-config=/tmp/x.json", "--print"],
-                       env={"CLAUDE_CONFIG_DIR": "/tmp"})[0]
+                       env={"CLAUDE_CONFIG_DIR": str(tmp_path)})[0]
     assert kind == "mcp.surface.wired"
     assert kw["status"] == "ok"
+    assert kw["detail"]["authorized"] is True
+
+
+def test_hosted_shaped_grant_without_mcp_rules_is_reported_unauthorized(tmp_path):
+    """托管形状:模板恒带 --allowed-tools、环境恒设 CLAUDE_CONFIG_DIR,
+    而两者都**不含任何 mcp 规则**。
+
+    旧判据(`有 --allowed-tools` OR `CLAUDE_CONFIG_DIR 非空`)对这个形状永远
+    返回 authorized=true —— 它唯一该报的状态,恰恰是它报不出来的。判据必须看
+    规则内容,不是看 flag / 环境变量存不存在。
+    """
+    (tmp_path / "settings.json").write_text(json.dumps({"permissions": {"allow": [
+        "Bash(io_cli:*)", "Read(//home/agent/images/**)",
+    ]}}))
+    kind, kw = _wiring([
+        "claude", "--mcp-config=/tmp/x.json",
+        "--allowed-tools=Bash(io_cli:*),Read(//home/agent/files/**)", "--print",
+    ], env={"CLAUDE_CONFIG_DIR": str(tmp_path)})[0]
+    assert kind == "mcp.surface.wired", "接线本身是好的 —— 坏的是授权"
+    assert kw["status"] == "error"
+    assert kw["detail"]["authorized"] is False
+    # 排序后再比:名单顺序跟的是启用顺序,不是这条断言想锁的东西。
+    assert sorted(kw["detail"]["ungranted"]) == ["gaodemap", "tavily"]
+
+
+def test_per_tool_grant_counts_as_authorized(tmp_path):
+    """授权可以逐个工具写而不是通配 —— 只认 `mcp__x__*` 会把能用的报成没授权。"""
+    (tmp_path / "settings.json").write_text(json.dumps({"permissions": {"allow": [
+        "mcp__tavily__search", "mcp__gaodemap__geocode",
+    ]}}))
+    kind, kw = _wiring(["claude", "--mcp-config=/tmp/x.json", "--print"],
+                       env={"CLAUDE_CONFIG_DIR": str(tmp_path)})[0]
+    assert kw["status"] == "ok"
+    assert kw["detail"]["authorized"] is True
+
+
+def test_space_separated_allowlist_value_is_read():
+    """`--allowed-tools <值>` 和 `--allowed-tools=<值>` 都得认。
+
+    两种写法在野外都有:本仓模板用 `=` 绑定,官方文档写分开。只解析一种,另一
+    种就会被读成「一条规则都没有」,把授权好的用户报成未授权。
+    """
+    kind, kw = _wiring([
+        "claude", "--mcp-config=/tmp/x.json",
+        "--allowed-tools", "mcp__tavily__*,mcp__gaodemap__*", "--print",
+    ], env={"CLAUDE_CONFIG_DIR": ""})[0]
+    assert kw["status"] == "ok"
+    assert kw["detail"]["authorized"] is True
 
 
 def test_codex_without_config_home_is_reported_as_not_wired():
@@ -334,3 +402,209 @@ def test_wiring_trace_is_silent_when_there_is_nothing_to_report():
     assert _wiring(["claude", "--print"], lane="proactive") == []
     assert _wiring(["claude", "--print"], enabled=()) == []
     assert _wiring(["pi", "--mode", "json"]) == []
+
+
+# --- postflight:CLI 自报的注册结果 ------------------------------------------
+# preflight(wiring)只能证明「我们交过去了」。真正回答「模型这一轮看得到哪几台」
+# 的是 claude 自己的 init 事件 —— 生产上一条 `mcp_servers: []` 正是这类问题的
+# 第一份硬证据(usr_98947,2026-08-10)。
+
+def _init_line(servers):
+    return json.dumps({
+        "type": "system", "subtype": "init",
+        "tools": ["Bash", "Read"], "mcp_servers": servers,
+        "model": "deepseek-v4-pro",
+    }) + "\n"
+
+
+def _registered(stdout, *, lane="chat", enabled=("tavily",), cmd=None):
+    captured = []
+    applied = {"servers": [{"name": n, "enabled": True} for n in enabled]}
+    with patch.object(crc, "_emit_debug_trace",
+                      side_effect=lambda ss, t, **kw: captured.append((t, kw))), \
+         patch.object(crc, "_user_mcp_applied", applied):
+        crc._trace_user_mcp_registered(
+            stdout, list(cmd or ["claude", "--print"]), trace_id="t1", lane=lane)
+    return captured
+
+
+def test_registered_reports_what_the_cli_actually_registered():
+    kind, kw = _registered(
+        _init_line([{"name": "tavily", "status": "connected"}]))[0]
+    assert kind == "mcp.surface.registered"
+    assert kw["status"] == "ok"
+    assert kw["detail"]["registered"] == ["tavily"]
+    assert kw["detail"]["missing"] == []
+
+
+def test_empty_mcp_servers_on_a_chat_turn_is_the_headline_failure():
+    """`mcp_servers: []` + 有启用的服务器 = 模型一台都看不到。
+
+    这是 usr_98947 那次的形态:App 里连接测试是绿的(控制面探针直连服务器,
+    另一条路),而 CLI 自报注册了零台。以前这条信息只存在于 stdout 里,没人看。
+    """
+    kind, kw = _registered(_init_line([]), enabled=("tavily", "gaodemap"))[0]
+    assert kind == "mcp.surface.registered"
+    assert kw["status"] == "error"
+    assert sorted(kw["detail"]["missing"]) == ["gaodemap", "tavily"]
+
+
+def test_a_server_that_failed_its_handshake_is_not_counted_as_working():
+    """注册上了但握手失败 —— 名字在列表里,工具却一个都没有。
+
+    只数 len(mcp_servers) 会把这种情况判绿,而用户的体感和「没接上」一样。
+    """
+    kind, kw = _registered(_init_line([
+        {"name": "tavily", "status": "failed"},
+    ]))[0]
+    assert kw["status"] == "error"
+    assert kw["detail"]["failed"] == ["tavily:failed"]
+
+
+def test_last_init_wins_when_a_turn_was_retried():
+    """重试会新起进程重做握手,前一次的结果不再描述这一轮。"""
+    raw = _init_line([]) + _init_line([{"name": "tavily", "status": "connected"}])
+    kind, kw = _registered(raw)[0]
+    assert kw["status"] == "ok"
+    assert kw["detail"]["registered"] == ["tavily"]
+
+
+def test_registered_trace_is_silent_where_an_empty_list_is_correct():
+    """非 chat 通道 / 没有启用的服务器 / 非 claude —— `[]` 都是**对**的。
+
+    MCP 只在 chat 通道下发,所以蒸馏、心跳这些轮次本来就该是空的。不判这几个
+    条件的话,每天每个用户都会刷出一堆假 error,把真信号淹掉 —— 这条埋点的
+    目的正好相反。
+    """
+    assert _registered(_init_line([]), lane="proactive") == []
+    assert _registered(_init_line([]), enabled=()) == []
+    assert _registered(_init_line([]), cmd=["pi", "run"]) == []
+
+
+def test_no_structured_init_means_no_observation_not_a_failure():
+    """输出里没有 init 事件时保持沉默 —— 我们没有观测,不能编一个出来。
+
+    对着整段 stdout 做正则是另一种编:工具回显里出现一句同形文本就会伪造出
+    一条事件(同一个坑在 pi 那条埋点上真发生过)。
+    """
+    assert _registered("not json at all\n") == []
+    assert _registered(json.dumps({"type": "result", "subtype": "success"})) == []
+
+
+# --- 配置刷新链:每一种失败都必须留声 ----------------------------------------
+# 这条链以前**整条静默**:keyless 兜底写 log.error、异常写 log.warning,两条都
+# 落在没人看的容器日志里,而用户那边只看到「AI 说用不了我的工具」。轮次级的
+# mcp.surface.* 也盖不住 —— 它们在「零台启用」时早退,而那正是静默失败的产物。
+
+def _apply(advertised, *, servers=None, fetch_exc=None, api_key="k",
+           paths_pinned=True, prior=None):
+    captured = []
+    servers = servers if servers is not None else []
+    payload = {"fingerprint": advertised,
+               "servers": [{"name": s["name"], "enabled": s["enabled"],
+                            "config_envelope": {"id": "e"}} for s in servers]}
+
+    def fake_fetch():
+        if fetch_exc:
+            raise fetch_exc
+        return payload
+
+    with patch.object(crc, "_emit_debug_trace",
+                      side_effect=lambda ss, t, **kw: captured.append((t, kw))), \
+         patch.object(crc, "_user_mcp_advertised", {"fingerprint": advertised}), \
+         patch.object(crc, "_user_mcp_applied",
+                      prior or {"fingerprint": None, "servers": []}), \
+         patch.object(crc, "_fetch_user_mcp_envelopes", fake_fetch), \
+         patch.object(crc, "_decrypt_envelope",
+                      lambda env: json.dumps({"url": "https://x", "headers": {}})), \
+         patch.object(crc, "_materialize_user_mcp", lambda *a, **k: None), \
+         patch.object(crc, "FEEDLING_API_KEY", api_key), \
+         patch.object(crc, "_USER_MCP_PATHS_PINNED", paths_pinned):
+        crc._maybe_apply_user_mcp()
+    return captured
+
+
+def _reset_materialize_dedup():
+    crc._user_mcp_trace_last = None
+
+
+def test_materialize_success_records_configured_and_enabled_counts():
+    _reset_materialize_dedup()
+    events = _apply("sha256:abc", servers=[
+        {"name": "tavily", "enabled": True},
+        {"name": "gaodemap", "enabled": False},
+    ])
+    assert len(events) == 1
+    kind, kw = events[0]
+    assert kind == "mcp.materialize.applied"
+    assert kw["status"] == "ok"
+    assert kw["detail"]["configured_count"] == 2
+    assert kw["detail"]["enabled_count"] == 1
+
+
+def test_all_servers_switched_off_is_called_out_in_the_explain():
+    """存了但一台都没开 —— 对用户来说和「配置没生效」一模一样。
+
+    这正是最难查的那种:fingerprint 非空、apply 成功、日志一切正常,而模型
+    看不到任何工具。不在文案里点破,读 trace 的人会以为没问题。
+    """
+    _reset_materialize_dedup()
+    kind, kw = _apply("sha256:off", servers=[
+        {"name": "tavily", "enabled": False},
+    ])[0]
+    assert kind == "mcp.materialize.applied"
+    assert kw["detail"]["enabled_count"] == 0
+    assert "没有一台是启用状态" in kw["explain"]
+
+
+def test_fetch_failure_is_traced_with_the_exception_type_only():
+    """失败要留声,但只留异常类型。
+
+    这里的失败是 fetch/decrypt/写盘,消息里可能带用户的 MCP url 或远端返回的
+    正文 —— 那些都不该进 trace。
+    """
+    _reset_materialize_dedup()
+    kind, kw = _apply("sha256:bad",
+                      fetch_exc=RuntimeError("https://secret.example/mcp 500 body"))[0]
+    assert kind == "mcp.materialize.failed"
+    assert kw["status"] == "error"
+    assert kw["detail"]["failure"] == "RuntimeError"
+    dumped = json.dumps(kw, ensure_ascii=False)
+    assert "secret.example" not in dumped
+
+
+def test_keyless_unpinned_paths_failsafe_is_traced():
+    """兜底关掉 user MCP 时也必须留声 —— 以前只有一行 log.error。"""
+    _reset_materialize_dedup()
+    kind, kw = _apply("sha256:x", api_key="", paths_pinned=False)[0]
+    assert kind == "mcp.materialize.failed"
+    assert kw["detail"]["failure"] == "paths_unpinned"
+
+
+def test_repeated_failures_on_the_same_fingerprint_emit_once():
+    """apply 每次 poll 都重试。不去重的话,一个持续失败的用户会把 200 条的
+    trace 环刷光 —— 恰好冲掉我们要读的那些轮次(一轮蒸馏就有 ~198 条)。"""
+    _reset_materialize_dedup()
+    first = _apply("sha256:same", fetch_exc=RuntimeError("boom"))
+    second = _apply("sha256:same", fetch_exc=RuntimeError("boom"))
+    assert len(first) == 1
+    assert second == [], "同一份配置的同一种失败只报一次"
+    # 换一份配置就是新状态,必须重新报
+    assert len(_apply("sha256:other", fetch_exc=RuntimeError("boom"))) == 1
+
+
+def test_recovery_after_a_failure_is_reported():
+    """失败后修好了要能看见,否则读 trace 的人停在最后一条 error 上。"""
+    _reset_materialize_dedup()
+    _apply("sha256:f", fetch_exc=RuntimeError("boom"))
+    kind, _kw = _apply("sha256:f", servers=[{"name": "tavily", "enabled": True}])[0]
+    assert kind == "mcp.materialize.applied"
+
+
+def test_empty_fingerprint_is_not_reported_as_a_fault():
+    """后端的 fingerprint 是对**已保存列表**算的,空 = 用户确实一台都没存。
+
+    那是正常状态。把它报成 error,读的人很快就会学会忽略这个事件。
+    """
+    _reset_materialize_dedup()
+    assert _apply("") == []

@@ -1233,6 +1233,43 @@ def admin_data_track_snapshot(user_ids: list[str]) -> dict[str, dict]:
             for uid, kind, doc in rows:
                 ensure(out, uid).setdefault("blobs", {})[kind] = doc
 
+            # User MCP: counts only, deliberately NOT added to the whitelist
+            # above. That query returns whole docs, and this blob carries one
+            # encrypted envelope per server (the url + auth headers live inside
+            # it) — counting in SQL keeps every envelope out of the admin
+            # process. The three fields are what triage actually needs:
+            #   - configured_count: did the user save a server at all? (the app's
+            #     connection test is a control-plane probe that succeeds without
+            #     saving anything, so "it tested fine" is not evidence of this);
+            #   - enabled_count: a saved-but-switched-off server still advertises
+            #     a NON-empty fingerprint and materializes cleanly, yet reaches
+            #     the agent as zero servers — indistinguishable from a broken
+            #     apply chain without this number;
+            #   - fingerprint: lines up against the one the consumer applied.
+            rows = conn.execute(
+                """
+                SELECT user_id,
+                       COALESCE(jsonb_array_length(
+                           CASE WHEN jsonb_typeof(doc->'servers') = 'array'
+                                THEN doc->'servers' END), 0) AS configured,
+                       COALESCE((
+                           SELECT COUNT(*) FROM jsonb_array_elements(
+                               CASE WHEN jsonb_typeof(doc->'servers') = 'array'
+                                    THEN doc->'servers' ELSE '[]'::jsonb END) s
+                           WHERE s->>'enabled' = 'true'), 0)::int AS enabled,
+                       COALESCE(doc->>'fingerprint', '') AS fingerprint
+                FROM user_blobs
+                WHERE user_id = ANY(%s) AND kind = 'user_mcp'
+                """,
+                (ids,),
+            ).fetchall()
+            for uid, configured, enabled, fingerprint in rows:
+                ensure(out, uid)["user_mcp"] = {
+                    "configured_count": int(configured),
+                    "enabled_count": int(enabled),
+                    "fingerprint": str(fingerprint or ""),
+                }
+
             rows = conn.execute(
                 """
                 SELECT wanted.user_id,

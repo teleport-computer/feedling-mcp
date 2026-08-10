@@ -5545,8 +5545,10 @@ def _trace_user_mcp_surface(
 def _trace_user_mcp_wiring(cmd: list[str], *, trace_id: str, lane: str) -> None:
     """claude / codex 这两条路的 MCP **接线**是否到位。
 
-    它们不经过我们的桥,所以拿不到「注册了几个工具」——那是 CLI 内部的事。
-    但**能**回答一个同样致命的问题:这一轮我们到底有没有把服务器交给它。
+    它们不经过我们的桥,所以这里拿不到「注册了几个工具」——那是 CLI 内部的事
+    (claude 的实际注册结果由 postflight 的 `_trace_user_mcp_registered` 从它
+    自报的 init 事件里读,两条埋点一前一后配着看)。这一条回答的是前半个问题:
+    这一轮我们到底有没有把服务器交给它、有没有授权。
     PR#174 修的正是这个洞:自托管 claude 的模板没有 `{mcp}` 占位符,
     `--mcp-config` 一次都没下发,用户在 App 里配的服务器**一台都到不了 agent**,
     而 App 的连接测试是绿的(那是控制面探针直连服务器测的,两条路)。
@@ -5572,14 +5574,20 @@ def _trace_user_mcp_wiring(cmd: list[str], *, trace_id: str, lane: str) -> None:
         mechanism = "--mcp-config"
         # 授权是第二个必要条件:只接线不授权时调用会进 permission_denials,
         # 模型回「这个工具需要授权」——和用户原话一致(PR#174 实测)。
-        authorized = _cmd_has_allowed_tools(cmd) or bool(
-            os.environ.get("CLAUDE_CONFIG_DIR", "")
-        )
+        # ⚠️ 判据必须看**规则内容**,不是「有没有那个 flag / 有没有那个环境变量」:
+        # 托管模板恒带 `--allowed-tools`(里面只有 io_cli 动词)、托管环境恒设
+        # CLAUDE_CONFIG_DIR,所以旧判据对托管用户永远返回 true —— 它唯一该报的
+        # 那个状态,恰恰是它报不出来的。
+        ungranted = _claude_mcp_servers_granted(cmd, names)
+        authorized = not ungranted
     else:
         codex_home = os.environ.get("CODEX_HOME", "")
         wired = bool(codex_home) and (Path(codex_home) / "config.toml").exists()
         mechanism = "config.toml"
         authorized = wired  # codex 的 MCP 授权就在同一份 config 里
+        # codex 没有「接线了但没授权」这个中间态(同一份 config 两件事一起做),
+        # 所以永远没有待授权名单 —— 但下面的 explain/detail 是两条路共用的。
+        ungranted = []
     _emit_debug_trace(
         "agent",
         "mcp.surface.wired" if wired else "mcp.surface.missing",
@@ -5594,13 +5602,97 @@ def _trace_user_mcp_wiring(cmd: list[str], *, trace_id: str, lane: str) -> None:
             f"有 {len(names)} 台启用的 MCP 服务器,但这一轮**一台都没交给 CLI** —— "
             f"{mechanism} 没有出现在命令里,模型看不到任何 MCP 工具"
         ) + ("" if authorized or not wired else
-             ";但没有授权来源(既无 allowlist 参数也无 settings.json),"
-             "调用会被拒,模型通常会说「需要授权」"),
+             ";但这几台没有任何授权规则(allowlist 参数和 settings.json 里都没有 "
+             "`mcp__<名字>__…`),调用会被拒,模型通常会说「需要授权」:"
+             + ",".join(ungranted[:10])),
         detail={
             "driver": "claude" if is_claude else "codex",
             "lane": lane, "mechanism": mechanism,
             "wired": wired, "authorized": authorized,
             "servers": names[:20],
+            **({"ungranted": ungranted[:20]} if ungranted else {}),
+        },
+    )
+
+
+def _trace_user_mcp_registered(raw: str, cmd: list[str], *,
+                               trace_id: str, lane: str) -> None:
+    """What the CLI itself says it registered — the only postflight ground truth.
+
+    ``_trace_user_mcp_wiring`` is a **preflight**: it reads our own argv and
+    grant files and answers "did we hand the servers over correctly". It cannot
+    see what happened next. Claude Code opens its run with a structured init
+    event that names every MCP server it actually registered::
+
+        {"type":"system","subtype":"init","tools":[...],"mcp_servers":[...]}
+
+    which settles in one field what preflight can only imply. It is also what
+    exposed the shape of this whole class of bug: a prod turn showing
+    ``mcp_servers: []`` while the app listed the server as connected.
+
+    Only judged on the chat lane with servers enabled — MCP is deliberately
+    chat-only, so an empty list anywhere else is correct, and reporting it
+    would bury the real signal under one false error per distillation.
+
+    Registration is not approval: a registered tool can still be denied at call
+    time (that lands in ``permission_denials``). Preflight covers the grant.
+    """
+    if lane != "chat" or not _is_claude_code_cmd(cmd):
+        return
+    expected = sorted(
+        str(s.get("name") or "")
+        for s in (_user_mcp_applied.get("servers") or []) if s.get("enabled")
+    )
+    expected = [n for n in expected if n]
+    if not expected:
+        return
+    init = None
+    for obj in _json_objects_from_cli_output(raw):
+        # Last init wins: a retried attempt re-runs the handshake in a new
+        # process, and the earlier one's result no longer describes this turn.
+        if (isinstance(obj, dict)
+                and str(obj.get("type") or "").strip() == "system"
+                and str(obj.get("subtype") or "").strip() == "init"):
+            init = obj
+    if init is None or not isinstance(init.get("mcp_servers"), list):
+        # Non-JSON output shape (or a CLI that stopped reporting it). Silence is
+        # right here: we have no observation, and inventing one from a regex
+        # over stdout is how a tool-output echo becomes a fake event.
+        return
+    registered, failed = [], []
+    for entry in init["mcp_servers"]:
+        if isinstance(entry, dict):
+            name = str(entry.get("name") or "")
+            status = str(entry.get("status") or "").strip().lower()
+        else:
+            name, status = str(entry), ""
+        if not name:
+            continue
+        registered.append(name)
+        # Claude reports per-server handshake state; anything that is not a
+        # positive connection means the model has that server's tools missing.
+        if status and status not in ("connected", "ok", "ready"):
+            failed.append(f"{name}:{status}")
+    missing = [n for n in expected if n not in registered]
+    ok = not missing and not failed
+    _emit_debug_trace(
+        "agent",
+        "mcp.surface.registered",
+        status="ok" if ok else "error",
+        trace_id=trace_id,
+        summary=(f"CLI 实际注册 {len(registered)}/{len(expected)} 台 MCP 服务器"
+                 + ("" if ok else ",有缺失")),
+        explain=(
+            "claude 自己报告的注册结果 —— 这是模型这一轮真正看得到的服务器。"
+            if ok else
+            "claude 自报的注册结果和我们交过去的对不上:"
+            + (f"没注册上 {','.join(missing[:10])};" if missing else "")
+            + (f"握手异常 {','.join(failed[:10])};" if failed else "")
+            + "模型看不到这些服务器的工具,通常会答「用不了」。"
+        ),
+        detail={
+            "expected": expected[:20], "registered": registered[:20],
+            "missing": missing[:20], "failed": failed[:20],
         },
     )
 
@@ -6747,6 +6839,54 @@ def _cmd_has_allowed_tools(cmd: list[str]) -> bool:
     )
 
 
+def _claude_mcp_grant_sources(cmd: list[str]) -> list[str]:
+    """Every allow rule claude will honour this turn, from BOTH grant sources.
+
+    The two are a union, not an override — measured on 2.1.217 with a real MCP
+    server across all four combinations (settings only / flag only / both /
+    neither); only "neither" is denied. So a rule found in either place counts.
+
+    Used to answer "is ``mcp__<name>__*`` actually granted", which the previous
+    predicate only pretended to answer: it checked that ``--allowed-tools``
+    EXISTED, or that ``CLAUDE_CONFIG_DIR`` was non-empty. Hosted templates
+    always carry the flag (with io_cli verbs and no MCP rule) and hosted env
+    always sets the dir, so it reported ``authorized=true`` unconditionally —
+    the one state it was built to detect was the one it could never report.
+    """
+    rules: list[str] = []
+    for i, tok in enumerate(cmd):
+        if tok.startswith(("--allowed-tools=", "--allowedTools=")):
+            rules.extend(tok.split("=", 1)[1].split(","))
+        elif tok in ("--allowed-tools", "--allowedTools") and i + 1 < len(cmd):
+            rules.extend(cmd[i + 1].split(","))
+    config_dir = os.environ.get("CLAUDE_CONFIG_DIR", "")
+    if config_dir:
+        try:
+            data = json.loads((Path(config_dir) / "settings.json").read_text())
+            perms = data.get("permissions") if isinstance(data, dict) else None
+            allow = perms.get("allow") if isinstance(perms, dict) else None
+            if isinstance(allow, list):
+                rules.extend(str(r) for r in allow)
+        except (OSError, ValueError):
+            # No settings file, unreadable, or not JSON — that source simply
+            # grants nothing. Never let a missing/malformed file break a turn.
+            pass
+    return [r.strip() for r in rules if str(r).strip()]
+
+
+def _claude_mcp_servers_granted(cmd: list[str], names: list[str]) -> list[str]:
+    """Which of ``names`` have no allow rule covering them.
+
+    Prefix match on ``mcp__<name>__`` rather than equality, because a grant can
+    legitimately be written per-tool (``mcp__ombre__search``) instead of the
+    wildcard we emit — treating only ``mcp__<name>__*`` as authorized would
+    report a working per-tool grant as missing.
+    """
+    rules = _claude_mcp_grant_sources(cmd)
+    return [n for n in names
+            if not any(r.startswith(f"mcp__{n}__") for r in rules)]
+
+
 def _inject_claude_user_mcp(cmd: list[str], lane: str) -> list[str]:
     """Wire the app-configured MCP servers into a self-hosted ``claude`` command
     whose template has no ``{mcp}`` placeholder.
@@ -7863,6 +8003,10 @@ def call_agent_cli(
     # claude / codex 拿不到「注册了几个工具」(那是 CLI 内部的事),但能回答
     # 同样致命的「这一轮到底有没有把服务器交给它」—— PR#174 修的正是这个洞。
     _trace_user_mcp_wiring(cmd, trace_id=trace_id, lane=lane)
+    # …and what the CLI reports it actually registered, which is the only
+    # observation that settles it (preflight can only say we handed them over).
+    _trace_user_mcp_registered(
+        result.stdout or "", cmd, trace_id=trace_id, lane=lane)
     if result.returncode == 0 and _is_claude_code_cmd(cmd):
         # Claude Code can silently choose its own default despite ANTHROPIC_MODEL.
         # Validate the CLI's structured receipt before persisting the session, so
@@ -9959,6 +10103,12 @@ def _resident_chat_runtime_v2_enabled() -> bool:
 
 _user_mcp_advertised: dict = {}      # last poll-advertised {"fingerprint": ...}
 _user_mcp_applied: dict = {"fingerprint": None, "servers": []}  # materialized state
+# Last (fingerprint, outcome) pair we emitted a materialize trace for. Apply
+# retries on EVERY poll while it keeps failing, and one turn already floods the
+# 200-event ring (~198 enclave calls on a single distillation) — an undeduped
+# event per poll would evict the very turns we need to read. Reset implicitly:
+# a new fingerprint or a different outcome is a different pair, so it emits.
+_user_mcp_trace_last: tuple[str, str] | None = None
 
 
 def _update_user_mcp_advertised(payload) -> None:
@@ -10254,6 +10404,59 @@ def _materialize_user_mcp(servers: list[dict], managed_names) -> None:
     _write_user_mcp_ca(servers)
 
 
+def _trace_user_mcp_materialize(
+    fingerprint: str, outcome: str, *, configured: int = 0, enabled: int = 0,
+    failure: str = "",
+) -> None:
+    """One event per state transition of the config-refresh chain.
+
+    Every failure mode here used to be invisible from the outside: the keyless
+    fail-safe writes a log.error, an exception writes a log.warning, and both
+    land in a container log nobody reads while the user sees only "the AI says
+    it can't use my tool". The turn-level ``mcp.surface.*`` traces can't cover
+    it either — they early-return when zero servers are enabled, which is
+    exactly the state a silently-failed apply produces.
+
+    Deliberately NOT emitted when the advertised fingerprint is empty: the
+    backend computes it over the SAVED list, so empty means the user genuinely
+    has no servers stored. That is a normal state, not a fault, and reporting
+    it would train whoever reads these to ignore the event.
+
+    detail carries counts and a failure enum only — never a url, header name,
+    envelope, or remote response body.
+    """
+    global _user_mcp_trace_last
+    if not fingerprint:
+        return
+    key = (fingerprint, outcome if not failure else f"{outcome}:{failure}")
+    if key == _user_mcp_trace_last:
+        return
+    _user_mcp_trace_last = key
+    ok = outcome == "applied"
+    _emit_debug_trace(
+        "agent",
+        f"mcp.materialize.{outcome}",
+        status="ok" if ok else "error",
+        summary=(f"MCP 配置已生效:{enabled}/{configured} 台启用"
+                 if ok else f"MCP 配置未能生效({failure or outcome})"),
+        explain=(
+            (f"这一份配置(fingerprint {fingerprint[:14]}…)已写入 agent 侧。"
+             + ("" if enabled else
+                "⚠️ 但**没有一台是启用状态** —— 模型这一轮看不到任何 MCP 工具,"
+                "表现和「配置没生效」完全一样,区别只在这里。"))
+            if ok else
+            "用户存了 MCP 服务器,但这一份配置没能落到 agent 侧 —— "
+            "模型看不到任何 MCP 工具。下次 poll 会重试。"
+        ),
+        detail={
+            "fingerprint": fingerprint[:14],
+            "configured_count": configured,
+            "enabled_count": enabled,
+            **({"failure": failure} if failure else {}),
+        },
+    )
+
+
 def _maybe_apply_user_mcp() -> None:
     """Re-materialize agent MCP config when the poll-advertised fingerprint moved.
     Failures log and retry on a later poll — never block chat."""
@@ -10272,6 +10475,7 @@ def _maybe_apply_user_mcp() -> None:
             "defaults would leak this user's MCP url/auth headers to every "
             "co-hosted agent. Fix the spawner to set USER_MCP_FILE/"
             "USER_MCP_CA_FILE/USER_MCP_CASTORE_FILE per user.")
+        _trace_user_mcp_materialize(target, "failed", failure="paths_unpinned")
         _user_mcp_applied = {"fingerprint": target, "servers": []}
         return
     try:
@@ -10301,9 +10505,14 @@ def _maybe_apply_user_mcp() -> None:
         names = [s["name"] for s in servers if s["enabled"]]
         log.info("[user_mcp] applied fingerprint=%s servers=%s",
                  target or "(empty)", names)
+        _trace_user_mcp_materialize(
+            target, "applied", configured=len(servers), enabled=len(names))
     except Exception as e:  # noqa: BLE001 — config refresh must never wedge chat
         log.warning("[user_mcp] apply failed (will retry next poll): %s: %s",
                     type(e).__name__, e)
+        # Exception type only. The failures here are fetch/decrypt/write, whose
+        # messages can quote a url or a remote body — neither belongs in a trace.
+        _trace_user_mcp_materialize(target, "failed", failure=type(e).__name__)
 
 
 def _user_mcp_cli_value(template: str, lane: str) -> str:
