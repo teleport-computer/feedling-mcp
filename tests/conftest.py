@@ -218,6 +218,7 @@ if not _provisioned:
         "test_user_mcp_surface_trace.py",
         "test_voice_context_regressions.py",
         "test_health_executor.py",
+        "test_db_health_timeouts.py",
     }
     collect_ignore = sorted(
         f
