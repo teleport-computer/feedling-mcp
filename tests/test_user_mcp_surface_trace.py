@@ -648,6 +648,27 @@ def test_keyless_unpinned_paths_failsafe_is_traced():
     assert kw["detail"]["failure"] == "paths_unpinned"
 
 
+def test_failure_copy_gives_the_action_that_matches_that_failure():
+    """排障文案必须对应各自的下一步动作,不能一律写「会重试」。
+
+    paths_unpinned 这条记下 fingerprint 就 return,下次 poll 因 fingerprint
+    相等直接早退 —— **本进程永远不会再试**;而这个标志是进程启动时定的,改完
+    env 也得重启。给出相反的动作比没有文案更坏:读的人会干等一个不会发生的重试
+    (codex 审出)。
+    """
+    _reset_materialize_dedup()
+    _kind, unpinned = _apply("sha256:u", api_key="", paths_pinned=False)[0]
+    assert "下次 poll 会重试" not in unpinned["explain"]
+    assert "不会重试" in unpinned["explain"]
+    assert "重启" in unpinned["explain"]
+
+    # 反过来:真正会重试的那一族,文案必须保留重试指引。
+    _reset_materialize_dedup()
+    _kind, transient = _apply("sha256:t", fetch_exc=RuntimeError("boom"))[0]
+    assert "下次 poll 会重试" in transient["explain"]
+    assert "重启" not in transient["explain"]
+
+
 def test_repeated_failures_on_the_same_fingerprint_emit_once():
     """apply 每次 poll 都重试。不去重的话,一个持续失败的用户会把 200 条的
     trace 环刷光 —— 恰好冲掉我们要读的那些轮次(一轮蒸馏就有 ~198 条)。"""

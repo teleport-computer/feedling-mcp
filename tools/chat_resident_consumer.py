@@ -10505,7 +10505,18 @@ def _trace_user_mcp_materialize(
                 "表现和「配置没生效」完全一样,区别只在这里。"))
             if ok else
             "用户存了 MCP 服务器,但这一份配置没能落到 agent 侧 —— "
-            "模型看不到任何 MCP 工具。下次 poll 会重试。"
+            "模型看不到任何 MCP 工具。"
+            # 下一步动作按失败种类分,不能一律写「会重试」:paths_unpinned 这条
+            # 记下 fingerprint 就 return,下次 poll 因 fingerprint 相等直接早退,
+            # **本进程永远不会再试**;而 _USER_MCP_PATHS_PINNED 是进程启动时定的,
+            # 改完 env 也必须重启才生效。排障文案给出相反的动作,比没有文案更坏
+            # (codex 审出)。
+            + ("spawner 没有为该用户钉 USER_MCP_FILE / USER_MCP_CA_FILE / "
+               "USER_MCP_CASTORE_FILE,共享 /tmp 默认路径会把这个用户解密后的 "
+               "MCP url 和鉴权头泄给同机其他 agent,所以这里主动关掉了 user MCP。"
+               "**本进程不会重试**:修 spawner 补上这三个 env,然后重启 consumer。"
+               if failure == "paths_unpinned" else
+               "下次 poll 会重试。")
         ),
         detail={
             "fingerprint": fingerprint[:14],
