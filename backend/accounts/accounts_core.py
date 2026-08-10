@@ -64,13 +64,19 @@ def _select_access_mode(store: UserStore, mode: str) -> dict:
     from hosted import config_store, new_user_v2_cohort
 
     mode = registry._normalize_access_mode(mode)
-    if mode != "resident":
-        # Non-resident selection remains route persistence only. In
-        # particular, selecting Model API is not rollout authority.
+    if mode not in onboarding.MODEL_API_ROUTES:
+        # Preserve the validation-only path without acquiring a control lock.
         return onboarding._save_onboarding_route(store, mode)
 
+    lock_acquired = False
     try:
         with db.hosted_runtime_config_mutation_lock(store.user_id):
+            lock_acquired = True
+            if mode != "resident":
+                # Non-resident selection remains route persistence only. In
+                # particular, selecting Model API is not rollout authority.
+                return onboarding._save_onboarding_route(store, mode)
+
             previous_route_doc = db.get_blob_strict(
                 store.user_id, "onboarding_route"
             )
@@ -111,7 +117,9 @@ def _select_access_mode(store: UserStore, mode: str) -> dict:
     except _RuntimeControlUnavailable:
         raise
     except Exception as exc:
-        raise _RuntimeControlUnavailable from exc
+        if mode == "resident" or not lock_acquired:
+            raise _RuntimeControlUnavailable from exc
+        raise
 
 
 def access_link_token_create(store: UserStore, payload: dict):
@@ -213,7 +221,9 @@ def access_link_token_claim(payload: dict):
             registry.persist_user(user_entry)
             principal_id = user_entry.get("principal_id", "")
         if make_active:
-            onboarding._save_onboarding_route(core_store.get_store(user_id), mode)
+            store = core_store.get_store(user_id)
+            with db.hosted_runtime_config_mutation_lock(user_id):
+                onboarding._save_onboarding_route(store, mode)
         match["used_at"] = datetime.now().isoformat()
         match["claimed_label"] = client_label
         accounts_access._save_access_link_tokens(accounts_access._trim_access_link_tokens(rows))
