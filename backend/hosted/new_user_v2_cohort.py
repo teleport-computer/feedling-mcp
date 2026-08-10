@@ -88,6 +88,11 @@ def apply_default(store) -> str:
         if not decision.eligible:
             _log(store.user_id, decision.reason)
             return decision.reason
+        route = config_store.load_active_route(store)
+        if route is None or route.get("test_status") != "ok":
+            raise RuntimeError(
+                "new-user V2 cohort requires a tested active route"
+            )
         inserted = db.insert_runtime_allowlist_if_absent(
             store.user_id,
             "v2",
