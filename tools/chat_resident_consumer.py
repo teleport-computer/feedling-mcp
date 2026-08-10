@@ -14219,26 +14219,11 @@ def _process_proactive_jobs(jobs: list) -> float:
             continue
 
         is_introduction = _is_introduction_job(job)
-        if is_introduction:
+        # 只做**便宜**的取值(读 job 自己的字段),好让日志和下面的资格闸都能用。
+        # 真正昂贵的那三样——屏幕取帧、感知摘要、世界书匹配——一律留到闸之后。
+        frame_ids = job.get("frame_ids")
+        if is_introduction or not isinstance(frame_ids, list):
             frame_ids = []
-            screen_payloads = []
-            screen_paths = []
-            message = _message_for_introduction_job(job)
-        else:
-            frame_ids = job.get("frame_ids")
-            if not isinstance(frame_ids, list):
-                frame_ids = []
-            screen_text, screen_payloads, screen_paths = _screen_context_for_frame_ids(frame_ids)
-            recent_context = recent_chat_context_for_proactive()
-            # Screen-watch is a light lane: skip the heavy cross-domain digest fetch
-            # (its prompt deliberately omits the board).
-            perception_digest = None if _is_screen_watch_job(job) else _proactive_perception_digest()
-            message = _message_for_proactive_job(
-                job,
-                screen_text=screen_text,
-                recent_chat_context=recent_context,
-                perception_digest=perception_digest,
-            )
         log.info(
             "proactive job [ts=%.3f] id=%s kind=%s intent=%s frames=%d",
             ts,
@@ -14248,6 +14233,17 @@ def _process_proactive_jobs(jobs: list) -> float:
             len(frame_ids),
         )
 
+        # ── 资格闸必须跑在昂贵的上下文构建**之前** ──────────────────────
+        # 这两道闸都是纯本地判断,而它们下面那段每次要打 3–4 个 HTTP(屏幕帧 /
+        # 感知摘要 / 世界书匹配,后者 timeout=20)。闸在后面时,一个**必然会被
+        # 跳过**的 job 也会把这些往返全付一遍。resident consumer 跑在用户自己的
+        # VPS 上,而这两道闸恰恰在「用户配置已经坏了」时最常命中。
+        # 位移是纯位移:闸的输入(is_introduction / job / job_id)在此都已就绪,
+        # 被推后的三个取用**全部只读**(`_screen_context_for_frame_ids` 走
+        # `_fetch_screen_json`;`_proactive_perception_digest` 读快照与 board,
+        # 自身 docstring 写明 best-effort 降级为空),不消费帧游标、不推进任何
+        # 水位,所以跳过它们不改变任何语义。(codex 复验 2026-08-10 提出。)
+        #
         # Failure backoff applies only to genuine idle proactive turns — never to
         # the first-greeting introduction or the screen-watch lane. The self-wake
         # LOOP guard is NOT here: it fires at the schedule point (where the agent
@@ -14272,6 +14268,24 @@ def _process_proactive_jobs(jobs: list) -> float:
                 job_id, "failed", "provider_payment_required: cooling down"
             )
             continue
+
+        # ── 闸已放行,现在才付昂贵的上下文构建 ────────────────────────
+        if is_introduction:
+            screen_payloads = []
+            screen_paths = []
+            message = _message_for_introduction_job(job)
+        else:
+            screen_text, screen_payloads, screen_paths = _screen_context_for_frame_ids(frame_ids)
+            recent_context = recent_chat_context_for_proactive()
+            # Screen-watch is a light lane: skip the heavy cross-domain digest fetch
+            # (its prompt deliberately omits the board).
+            perception_digest = None if _is_screen_watch_job(job) else _proactive_perception_digest()
+            message = _message_for_proactive_job(
+                job,
+                screen_text=screen_text,
+                recent_chat_context=recent_context,
+                perception_digest=perception_digest,
+            )
         update_proactive_job_status(job_id, "realizing")
         try:
             agent_result = call_agent(
