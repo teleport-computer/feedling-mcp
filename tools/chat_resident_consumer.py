@@ -3749,15 +3749,14 @@ def _worldbook_context_for_wake(job: dict) -> str:
     ⚠️ 不要复用 `_worldbook_context_for_foreground`——它 `if not text: return ""`
     早退，会让所有无信号的唤醒道一条 alwaysOn 都拿不到，正好抹掉本函数的目的。
 
-    ⚠️ **成本已知并接受(codex 复验 2026-08-10)**:本函数在每次主动唤醒都会打一次
-    `/v1/worldbook/match`。用户一条世界书都没有时 backend 200 早返,但只要存有任意
-    条目(哪怕全是 keyword-only),空 messages 仍会把全部条目送进 enclave 解密匹配;
-    resident 侧固定 `timeout=20`。更要紧的是**调用点在资格闸之前**——
-    `_process_proactive_jobs` 先构建整条消息,之后才判 proactive backoff / payment
-    cooldown,所以一个最终必然 skipped 的 job 也会白付这次往返。
-    这不是本函数引入的排序:同一段里的屏幕抓取、感知摘要早就在闸之前。把闸整体提到
-    昂贵构建之前是**独立的可靠性改进**,不在世界书这批里夹带(改动主动 job 生命周期
-    顺序,需要自己的回归面)。
+    成本说明:本函数在每次主动唤醒都会打一次 `/v1/worldbook/match`。用户一条世界书
+    都没有时 backend 200 早返,但只要存有任意条目(哪怕全是 keyword-only),空
+    messages 仍会把全部条目送进 enclave 解密匹配;resident 侧固定 `timeout=20`。
+
+    ✅ **调用点已在资格闸之后**(2026-08-10 后一批):`_process_proactive_jobs` 现在
+    先判 proactive backoff / payment cooldown,放行了才构建整条消息。所以必然被
+    skipped 的 job 不再白付这次往返。锁在
+    `tests/test_chat_resident_consumer.py::test_skipped_proactive_job_pays_no_context_fetches`。
     """
     messages: list[dict] = []
     if _is_scheduled_wake_job(job):
@@ -14260,11 +14259,16 @@ def _process_proactive_jobs(jobs: list) -> float:
         # 感知摘要 / 世界书匹配,后者 timeout=20)。闸在后面时,一个**必然会被
         # 跳过**的 job 也会把这些往返全付一遍。resident consumer 跑在用户自己的
         # VPS 上,而这两道闸恰恰在「用户配置已经坏了」时最常命中。
-        # 位移是纯位移:闸的输入(is_introduction / job / job_id)在此都已就绪,
-        # 被推后的三个取用**全部只读**(`_screen_context_for_frame_ids` 走
-        # `_fetch_screen_json`;`_proactive_perception_digest` 读快照与 board,
-        # 自身 docstring 写明 best-effort 降级为空),不消费帧游标、不推进任何
-        # 水位,所以跳过它们不改变任何语义。(codex 复验 2026-08-10 提出。)
+        # 闸的输入(is_introduction / job / job_id)在此都已就绪,所以能上提。
+        #
+        # 被推后的取用**不推进任何业务状态**——不消费帧游标、不动 health/cursor、
+        # 不写服务端状态(`_fetch_screen_json`、enclave history、感知快照与 board、
+        # worldbook match 全是读)。但**不能说成"纯只读/无副作用"**:
+        # `_screen_context_for_frame_ids` 会经 `_image_file_paths_from_payloads`
+        # **mkdir + 把解密后的屏幕截图写到本地临时文件**(:3141)。
+        # 也就是说旧顺序下,一个必然被跳过的 job 也会把用户的解密屏幕内容落盘一次。
+        # 前移因此不只是省往返,更是**不为不会发生的工作物化解密内容**——这比
+        # 省流量更值得。(codex 复验 2026-08-10 指出我原注释"纯位移"说过头了。)
         #
         # Failure backoff applies only to genuine idle proactive turns — never to
         # the first-greeting introduction or the screen-watch lane. The self-wake
