@@ -4533,7 +4533,21 @@ def test_generic_fallback_follows_the_user_language():
     """英文自建用户此前失败一次就收到一句中文(2026-08-10 顺手修)。"""
     assert crc._fallback_reply_for("晚安") == crc.FALLBACK_REPLY
     assert crc._fallback_reply_for("good night") == crc.FALLBACK_REPLY_EN
-    assert crc._fallback_reply_for("") == crc.FALLBACK_REPLY_EN
+
+
+@pytest.mark.parametrize("anchor", ["", None, "😭😭", "123", "？？？"])
+def test_no_language_signal_keeps_the_incumbent_chinese(anchor):
+    """没有语言信号时**不许翻转默认**。
+
+    判据是「有没有拉丁字母词」,不是「有没有中文」。第一版写反了(没中文就发
+    英文),`_turn_failure_reply_text(notice)` 这个不带锚点的老签名当场翻成英文,
+    在 CI 上打红 test_consumer_error_classify 三条 —— 那三条测的是通用失败气泡,
+    根本不该因为一个「顺手加双语」的改动而变。
+    """
+    assert crc._fallback_reply_for(anchor) == crc.FALLBACK_REPLY
+    assert crc._empty_reply_fallback(anchor) == crc._empty_reply_fallback("在吗")
+    # 不带锚点的老调用方(生产里确实存在)必须拿到原来那句。
+    assert crc._turn_failure_reply_text(None) == crc.FALLBACK_REPLY
 
 
 def _degenerate_test_harness(monkeypatch, agent_result):

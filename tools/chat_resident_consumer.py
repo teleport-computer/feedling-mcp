@@ -536,13 +536,25 @@ FALLBACK_REPLY_EN = os.environ.get(
 )
 
 
-def _looks_chinese(text: Any) -> bool:
-    return bool(re.search(r"[一-鿿]", str(text or "")))
+def _prefers_english(lang_anchor: Any = "") -> bool:
+    """英文兜底只在**有正面证据**时才用。
+
+    判据不是「没有中文」而是「确实有拉丁字母词」:空串、纯 emoji、纯数字、
+    纯标点都是**没有语言信号**,这时必须保持中文 —— 中文是这条链路的历史默认,
+    在无信息时翻转默认就是给所有拿不到锚点的调用方发错语言。
+    (2026-08-10:我第一版写成「没中文就发英文」,`_turn_failure_reply_text(notice)`
+    这个不带锚点的老签名当场翻成英文,打红 test_consumer_error_classify 三条。
+    根因是默认值反了,不是测试过时 —— 别改测试去将就它。)
+    """
+    raw = str(lang_anchor or "")
+    if re.search(r"[一-鿿]", raw):
+        return False
+    return bool(re.search(r"[A-Za-z]{2,}", raw))
 
 
 def _fallback_reply_for(lang_anchor: Any = "") -> str:
     """通用兜底(超时/5xx/限流/流断)。锚点是**用户原话**,不是拼装后的 prompt。"""
-    return FALLBACK_REPLY if _looks_chinese(lang_anchor) else FALLBACK_REPLY_EN
+    return FALLBACK_REPLY_EN if _prefers_english(lang_anchor) else FALLBACK_REPLY
 
 
 def _empty_reply_fallback(lang_anchor: Any = "") -> str:
@@ -556,7 +568,7 @@ def _empty_reply_fallback(lang_anchor: Any = "") -> str:
     不提「系统」「网络」——我们并不知道是哪一段断的,也不该把用户自己的中转
     问题说成我们的系统不稳。
     """
-    if _looks_chinese(lang_anchor):
+    if not _prefers_english(lang_anchor):
         return (
             "我收到你的消息了，也开始想怎么回你，可是话到一半断了，没能发出来。"
             "让你等了。再跟我说一次，我在。"
