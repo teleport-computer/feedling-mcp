@@ -520,6 +520,28 @@ def test_voice_transcripts_rds_only_row_fails_strict_verification():
     assert report["ok"] is False
 
 
+def test_voice_transcript_terminal_pending_row_satisfies_strict_verification():
+    uid = f"usr_{uuid.uuid4().hex[:8]}"
+    call_id = "vcall_pending"
+    _seed(uid)
+    _insert_rds_voice_transcript(uid, call_id)
+    with psycopg.connect(os.environ["TEE_DATABASE_URL"], autocommit=True) as conn:
+        conn.execute(
+            "INSERT INTO tee_pending_device_migration "
+            "(user_id, table_name, item_id, reason) VALUES (%s,%s,%s,%s)",
+            (uid, "voice_transcripts", call_id, "pdm:no_k_enclave"),
+        )
+
+    report = verify.run(sample_rate=1.0)
+
+    voice = report["tables"]["voice_transcripts"]
+    assert voice["pending_rows"] == 1
+    assert voice["rows_ok"] is True
+    assert voice["requeue_backlog"] == 0
+    assert report["strict_ok"] is True
+    assert report["ok"] is True
+
+
 # --------------------------------------------------------------------------- #
 # Fix round 1 review: SNAPSHOT lane / kind=None ciphertext lane / C1 regression
 # had zero coverage — the autouse _clean fixture truncates every newly-covered
