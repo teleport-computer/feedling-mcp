@@ -70,6 +70,32 @@ def enclave_forward_headers(*, api_key: str | None, runtime_token: str | None) -
     return {"X-API-Key": api_key} if api_key else {}
 
 
+SCREEN_SHARE_LIVE_SEC = 90.0
+
+
+def screen_share_grounding(user_id: str) -> dict:
+    """Return content-free live-share availability from the shared frame clock.
+
+    Foreground grounding and the ``screen_read`` default must never disagree
+    about whether sharing is active. Both therefore use this one metadata-only
+    predicate: the newest encrypted frame exists and is no more than 90 seconds
+    old. Frame ids and content never leave this helper.
+    """
+    try:
+        meta = db.frame_list_meta(user_id)
+    except Exception:
+        return {}
+    if not meta:
+        return {}
+    try:
+        age = time.time() - float(meta[-1].get("ts"))
+    except (TypeError, ValueError):
+        return {}
+    if age < 0 or age > SCREEN_SHARE_LIVE_SEC:
+        return {}
+    return {"active": True, "latest_frame_age_sec": int(age)}
+
+
 def _trace_enclave_proxy(
     store,
     event_type: str,

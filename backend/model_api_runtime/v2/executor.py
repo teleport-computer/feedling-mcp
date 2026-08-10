@@ -197,7 +197,6 @@ async def dispatch_tool_calls(
             )
             if (
                 tc.name in {"photo_read", "screen_read"}
-                and tc.args.get("include_image") is True
                 and data.get("ok")
             ):
                 payload = data.get("data") or {}
@@ -213,6 +212,7 @@ async def dispatch_tool_calls(
                             str(
                                 payload.get("image_media_type")
                                 or payload.get("media_type")
+                                or payload.get("image_mime")
                                 or "image/jpeg"
                             ),
                             image_b64,

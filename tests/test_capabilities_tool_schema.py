@@ -31,6 +31,13 @@ def test_reply_tool_schema_shape():
     assert reply.parameters["properties"]["text"]["type"] == "string"
 
 
+def test_screen_read_description_defaults_live_shares_to_pixels():
+    description = tool_schema.DESCRIPTIONS["screen_read"]
+    assert "active screen share" in description
+    assert "pixels by default" in description
+    assert "Start without include_image" not in description
+
+
 def test_task_tool_is_read_only_and_requires_a_nonempty_prompt():
     task = next(s for s in tool_schema.build_tool_specs() if s.name == "task")
     assert task.parameters["required"] == ["prompt"]

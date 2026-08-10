@@ -182,7 +182,7 @@ def test_screen_read_with_image_uses_native_observer_and_hides_pixels(monkeypatc
         turn_authorization=False,
         run_capability=lambda *_a, **_k: _FakeResult(True, {
             "frame_id": "f1",
-            "media_type": "image/png",
+            "image_mime": "image/png",
             "image_b64": "cGl4ZWxz",
         }),
         observe_photo=_observe_photo,
@@ -192,6 +192,36 @@ def test_screen_read_with_image_uses_native_observer_and_hides_pixels(monkeypatc
     assert seen == [("image/png", "cGl4ZWxz")]
     assert "a terminal window with green text" in results[0].content
     assert "cGl4ZWxz" not in results[0].content
+    assert enqueued == []
+
+
+def test_screen_read_default_pixels_also_use_observer_and_hide_base64(monkeypatch):
+    seen = []
+
+    async def _observe_photo(mime, image_b64):
+        seen.append((mime, image_b64))
+        return "the current screen shows a settings page"
+
+    results, enqueued = _run(
+        [ToolCall(
+            id="screen-default-image",
+            name="screen_read",
+            args={"frame_id": "f1"},
+        )],
+        turn_authorization=False,
+        run_capability=lambda *_a, **_k: _FakeResult(True, {
+            "frame_id": "f1",
+            "media_type": "image/png",
+            "image_b64": "cGl4ZWxz",
+        }),
+        observe_photo=_observe_photo,
+        monkeypatch=monkeypatch,
+    )
+
+    assert seen == [("image/png", "cGl4ZWxz")]
+    assert "the current screen shows a settings page" in results[0].content
+    assert "cGl4ZWxz" not in results[0].content
+    assert "image_b64" not in results[0].content
     assert enqueued == []
 
 

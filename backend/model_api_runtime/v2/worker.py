@@ -86,6 +86,7 @@ from perception.agent_fields import (
     AGENT_PERCEPTION_SIGNALS,
     FAST_AGENT_PERCEPTION_SIGNALS,
 )
+from screen import screen_read_core
 from model_api_runtime.v2 import coalesce as v2_coalesce
 from model_api_runtime.v2 import compaction as v2_compaction
 from model_api_runtime.v2 import context
@@ -773,11 +774,6 @@ def _safe_eager_screen_metadata(data: object) -> dict:
     return safe
 
 
-# 共享屏幕「此刻是否活着」的判据秒数。与 v2/screen_watch.FRESH_SEC 同源:iOS 约 30s
-# 一帧,>90s 没有新帧就当这次共享已经结束。
-_SCREEN_SHARE_LIVE_SEC = 90.0
-
-
 def _screen_share_grounding(user_id: str) -> dict:
     """聊天回合的「用户此刻正在共享屏幕」提示 —— **只回可用性,不回内容**。
 
@@ -798,20 +794,7 @@ def _screen_share_grounding(user_id: str) -> dict:
     共享没在进行(或读取失败)时返回 {},调用方据此整块省略 —— 不共享的用户
     prompt 一个字都不变,provider 侧的前缀缓存不受影响。
     """
-    try:
-        meta = db.frame_list_meta(user_id)
-    except Exception:
-        return {}
-    if not meta:
-        return {}
-    ts = meta[-1].get("ts")
-    try:
-        age = time.time() - float(ts)
-    except (TypeError, ValueError):
-        return {}
-    if age < 0 or age > _SCREEN_SHARE_LIVE_SEC:
-        return {}
-    return {"active": True, "latest_frame_age_sec": int(age)}
+    return screen_read_core.screen_share_grounding(user_id)
 
 
 def _screen_vision_allows_pixels(verdict: Any) -> bool:

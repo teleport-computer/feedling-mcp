@@ -510,10 +510,12 @@ DESCRIPTIONS: dict[str, str] = {
                            "not apply: always request the signal explicitly."),
     "screen_recent": "List recent screen-share frame metadata.",
     "screen_read": ("Read a specific screen-share frame, or the latest one if no frame_id "
-                    "is given. Start without include_image for caption/OCR. If pixels are "
-                    "needed, set include_image=true; Runtime V2 inspects them through its "
-                    "native vision observer and returns an untrusted visual_observation "
-                    "instead of a local image_file path."),
+                    "is given. During an active screen share, omitting include_image shows "
+                    "the pixels by default; set include_image=false only when text/OCR is "
+                    "explicitly sufficient. Outside an active share, pixels remain opt-in. "
+                    "Runtime V2 inspects pixels through its native vision observer and "
+                    "returns an untrusted visual_observation instead of a local image_file "
+                    "path."),
     "photo_recent": "List recent photos, optionally capped by limit.",
     "photo_read": ("Read a specific photo by id. Set include_image=true only when metadata "
                    "is insufficient; Runtime V2 inspects the decrypted pixels through its "
