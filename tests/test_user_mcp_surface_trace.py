@@ -593,6 +593,44 @@ def test_last_init_wins_when_a_turn_was_retried():
     assert kw["detail"]["verdict"] == {"tavily": "ok"}
 
 
+def test_a_server_name_containing_a_double_underscore_is_attributed_correctly():
+    """服务器名允许含 `__`(mcp_core 的 _NAME_RE 是 [a-z0-9_-]{1,32})。
+
+    按 `split("__")[1]` 归属的话,`mcp__foo__bar__do` 会被算到「foo」头上,
+    于是真正那台 `foo__bar` 的成功调用全部丢失、被判成 inconclusive ——
+    恰好把这条埋点最该抓的「恢复了」漏掉。我原来在这里写了条**相反**的注释,
+    没去核对过命名规则(codex 审出)。
+    """
+    raw = _stream([{"name": "foo__bar", "status": "pending"}],
+                  [("foo__bar", True)])
+    _kind, kw = _registered(raw, enabled=("foo__bar",))[0]
+    assert kw["detail"]["called_ok"] == ["foo__bar"]
+    assert kw["detail"]["verdict"] == {"foo__bar": "recovered"}
+
+
+def test_a_prefix_named_server_does_not_steal_another_servers_calls():
+    """两台都启用、名字互为前缀时,归属必须取**最长匹配**。"""
+    raw = _stream([{"name": "foo", "status": "connected"},
+                   {"name": "foo__bar", "status": "pending"}],
+                  [("foo__bar", True)])
+    _kind, kw = _registered(raw, enabled=("foo", "foo__bar"))[0]
+    assert kw["detail"]["called_ok"] == ["foo__bar"], "不能被短名字截胡"
+    assert kw["detail"]["verdict"] == {"foo": "ok", "foo__bar": "recovered"}
+
+
+def test_an_unseen_future_init_status_is_inconclusive_not_a_failure():
+    """Claude 将来新增一个状态时,不能让全体用户一夜变红。
+
+    硬失败必须是**闭集**;没见过的值是「没有证据」,不是「失败」——
+    这条实现原本和本函数自己的 docstring 相反(codex 用 `connecting` 复现)。
+    """
+    for status in ("connecting", "restarting", "somethingnew"):
+        _kind, kw = _registered(_stream([{"name": "s", "status": status}]),
+                                enabled=("s",))[0]
+        assert kw["status"] == "ok", f"{status} 不该判失败"
+        assert kw["detail"]["verdict"] == {"s": "inconclusive"}, status
+
+
 def test_registered_trace_is_silent_where_an_empty_list_is_correct():
     """非 chat 通道 / 没有启用的服务器 / 非 claude —— `[]` 都是**对**的。
 

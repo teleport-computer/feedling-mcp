@@ -5729,6 +5729,15 @@ def _trace_user_mcp_wiring(cmd: list[str], *, trace_id: str, lane: str) -> None:
     )
 
 
+# init states that are POSITIVE evidence of failure, as opposed to "we don't
+# know yet". Only these turn a server red without a failed tool call.
+# `absent` is ours, not Claude's: the server we handed over never appeared in
+# its list at all. Deliberately a closed set — a status we have never seen
+# (Claude adds one, a relay rewrites one) must fall through to inconclusive,
+# or the day the CLI ships a new state every user with MCP goes red at once.
+_MCP_INIT_HARD_FAILURES = frozenset({"failed", "needs-auth", "absent", "error"})
+
+
 def _trace_user_mcp_registered(raw: str, cmd: list[str], *,
                                trace_id: str, lane: str,
                                attempt: str = "first") -> None:
@@ -5792,6 +5801,9 @@ def _trace_user_mcp_registered(raw: str, cmd: list[str], *,
     expected = [n for n in expected if n]
     if not expected:
         return
+    # Longest first: attribution below matches a tool name against the servers
+    # we actually enabled, and "foo" is a prefix of "foo__bar".
+    expected_by_length = sorted(expected, key=len, reverse=True)
     init = None
     call_ok: set[str] = set()      # servers with at least one successful call
     call_err: set[str] = set()     # servers whose call came back is_error
@@ -5813,12 +5825,20 @@ def _trace_user_mcp_registered(raw: str, cmd: list[str], *,
                 continue
             btype = str(block.get("type") or "").strip()
             if btype == "tool_use":
-                # mcp__<server>__<tool>. Server names can't contain "__" (the
-                # backend's _NAME_RE is [a-z0-9_-] and the CLI joins on "__"),
-                # so splitting on it is safe.
+                # mcp__<server>__<tool>. Attribute by matching against the
+                # servers we actually enabled, LONGEST first — never by
+                # splitting on "__". The backend's name rule is
+                # ``[a-z0-9_-]{1,32}`` (mcp_core), which ALLOWS a double
+                # underscore, so ``mcp__foo__bar__do`` is ambiguous on its own:
+                # split() reads it as server "foo" and loses every call made to
+                # a server literally named "foo__bar". The comment that used to
+                # sit here claimed the opposite — asserted, never checked
+                # against the rule (codex 审出).
                 name = str(block.get("name") or "")
-                if name.startswith("mcp__") and name.count("__") >= 2:
-                    pending_use[str(block.get("id") or "")] = name.split("__")[1]
+                for srv in expected_by_length:
+                    if name.startswith(f"mcp__{srv}__"):
+                        pending_use[str(block.get("id") or "")] = srv
+                        break
             elif btype == "tool_result":
                 server = pending_use.pop(str(block.get("tool_use_id") or ""), "")
                 if not server:
@@ -5857,12 +5877,16 @@ def _trace_user_mcp_registered(raw: str, cmd: list[str], *,
             verdict[name] = "failed"
         elif started == "connected":
             verdict[name] = "ok"
-        elif started in ("pending", "unknown"):
-            # Never called, and startup was merely unfinished — we cannot tell
-            # whether the model chose not to use it or could not see it.
-            verdict[name] = "inconclusive"
+        elif started in _MCP_INIT_HARD_FAILURES:
+            verdict[name] = "failed"
         else:
-            verdict[name] = "failed"   # failed / needs-auth / absent
+            # Everything else — pending, a status we have never seen, one Claude
+            # adds next month — is "no evidence", not failure. The previous
+            # version sent every unrecognised value to `failed`, which
+            # contradicted this function's own docstring and would turn the
+            # whole fleet red the day the CLI introduces a new state
+            # (`connecting` reproduced it — codex 审出).
+            verdict[name] = "inconclusive"
 
     by = lambda v: [n for n in expected if verdict[n] == v]  # noqa: E731
     failed, recovered, inconclusive = by("failed"), by("recovered"), by("inconclusive")

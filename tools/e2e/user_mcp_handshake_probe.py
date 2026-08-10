@@ -111,6 +111,89 @@ def _agent_events(admin: httpx.Client, api: str, user_id: str) -> list[dict]:
     return [row for t in d.get("turns") or [] for row in t.get("rows") or []]
 
 
+
+def classify(events: list[dict], *, runtime: str, expect: str,
+             server_count: int) -> tuple[int, list[str]]:
+    """Turn the trace into an exit code. Pure, so it can be tested without a CVM.
+
+    Kept out of ``main`` on purpose: the previous version inlined every check,
+    which is how two of the fixes it claimed to make regressed unnoticed —
+    there was nothing a test could call.
+    """
+    out: list[str] = []
+    seen = {e["type"]: e for e in events}
+    driver = ""
+    for e in events:
+        if e.get("type") == "agent.model.call.done":
+            driver = str((e.get("detail") or {}).get("driver") or "")
+    kinds = sorted({e["type"] for e in events if str(e.get("type", "")).startswith("mcp.")})
+    out.append(f"observed driver={driver or '?'} events={kinds}")
+
+    # Confirm we measured the system we meant to: driver "v2" means the turn
+    # never went near the claude CLI.
+    want_driver = "claude" if runtime == "resident" else "v2"
+    if driver and driver != want_driver:
+        out.append(f"FAIL 实际跑在 driver={driver},要测的是 {want_driver} —— 结果不能用")
+        return 1, out
+
+    if runtime != "resident":
+        # V2 loads the catalogue synchronously from the envelopes inside the
+        # worker; there is no consumer materialize/wire step at all. Requiring
+        # those here made --runtime v2 exit 3 unconditionally, even on a
+        # perfectly healthy run (codex 审出).
+        if "mcp.surface.resolved" not in seen:
+            out.append("FAIL 没有 mcp.surface.resolved(V2 的工具面埋点)")
+            return 3, out
+        detail = seen["mcp.surface.resolved"].get("detail") or {}
+        out.append(f"resolved: {json.dumps(detail, ensure_ascii=False)}")
+        skipped = detail.get("skipped") or []
+        if expect == "ok" and skipped:
+            out.append(f"FAIL 有整台服务器没进工具面:{skipped}")
+            return 1, out
+        out.append("PASS")
+        return 0, out
+
+    if "mcp.materialize.applied" not in seen:
+        out.append("FAIL 配置没有落到 agent 侧(没有 mcp.materialize.applied)")
+        return 3, out
+    applied = seen["mcp.materialize.applied"].get("detail") or {}
+    out.append(f"materialize: {json.dumps(applied, ensure_ascii=False)}")
+    if int(applied.get("enabled_count") or 0) != server_count:
+        out.append(f"FAIL 启用数 {applied.get('enabled_count')} != {server_count}")
+        return 1, out
+
+    if "mcp.surface.wired" not in seen:
+        out.append("FAIL 没有 mcp.surface.wired")
+        return 3, out
+    wired = seen["mcp.surface.wired"].get("detail") or {}
+    out.append(f"wired: {json.dumps(wired, ensure_ascii=False)}")
+    if not wired.get("wired"):
+        out.append("FAIL 服务器没有交给 CLI")
+        return 1, out
+
+    if "mcp.surface.registered" not in seen:
+        out.append("FAIL 没等到 mcp.surface.registered —— 没有观测不等于没有问题")
+        return 3, out
+    reg = seen["mcp.surface.registered"].get("detail") or {}
+    out.append(f"registered: {json.dumps(reg, ensure_ascii=False)}")
+    verdicts = reg.get("verdict") or {}
+    if not verdicts:
+        # Distinct from a mismatch: the event exists but carries the pre-C-prime
+        # shape. That means the DEPLOYED consumer is older than this probe, not
+        # that the servers misbehaved — calling it a verdict mismatch would send
+        # someone debugging MCP when the answer is "ship the consumer first".
+        out.append("FAIL registered 里没有 verdict 字段 —— 部署的 consumer 早于"
+                   "两阶段判据(C-prime),先发版再测")
+        return 3, out
+    if expect != "any":
+        bad = {n: v for n, v in verdicts.items() if v != expect}
+        if bad:
+            out.append(f"FAIL 判定 {verdicts} 与 --expect {expect} 不符")
+            return 1, out
+    out.append(f"PASS 每台判定均为 {expect}:{verdicts}")
+    return 0, out
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--server", default=DEFAULT_SERVER)
@@ -133,6 +216,9 @@ def main() -> int:
     ap.add_argument("--timeout", type=float, default=240.0)
     ap.add_argument("--trace-timeout", type=float, default=90.0)
     args = ap.parse_args()
+    if args.copies < 1:
+        print("[probe] --copies 至少为 1", file=sys.stderr)
+        return 2
 
     # Built from --name: the old hardcoded deepwiki question meant passing a
     # different --server produced a turn about a repo that server knows nothing
@@ -171,7 +257,9 @@ def main() -> int:
         # control-plane probe the user actually sees. If it fails, this run
         # cannot speak to the reported scenario at all.
         t = c.post(f"/v1/mcp/servers/{names[0]}/test")
-        t_ok = t.status_code == 200 and (t.json() or {}).get("ok") is not False
+        # Strictly True. `is not False` would take a missing or null field as
+        # green — in a probe whose entire job is catching false greens.
+        t_ok = t.status_code == 200 and (t.json() or {}).get("ok") is True
         print(f"[probe] control-plane test: {t.status_code} {t.text[:200]}")
         if not t_ok:
             print("[probe] FAIL 控制面测试就没通过 —— 这一轮无法说明"
@@ -191,7 +279,17 @@ def main() -> int:
 
         sent = c.send_chat(ask)
         reply = c.wait_reply(sent, timeout=args.timeout)
-        text = c.message_text(reply) if reply else ""
+        if reply is None:
+            # Without a completed turn there is nothing to judge: the traces
+            # that follow would describe a turn that never finished. The
+            # previous version printed an empty string and carried on, so a
+            # timeout could still exit 0 whenever the verdict happened to
+            # match — the "it really exits non-zero" claim only ever covered
+            # the mismatch path (codex 审出).
+            print(f"[probe] FAIL {args.timeout:.0f}s 内没有拿到回复 —— "
+                  f"这一轮根本没跑完,后面的判据无从谈起")
+            return 3
+        text = c.message_text(reply)
         print(f"[probe] reply after {time.time() - sent:.0f}s: {text[:200]!r}")
         print("[probe] ↑ 仅供人看。判据在下面的 trace —— 模型会声称自己调用了"
               "从没碰过的工具。")
@@ -207,72 +305,11 @@ def main() -> int:
                 break
             time.sleep(5)
 
-        seen = {e["type"]: e for e in events}
-        driver = ""
-        for e in events:
-            if e["type"] == "agent.model.call.done":
-                driver = str((e.get("detail") or {}).get("driver") or "")
-        print(f"[probe] observed driver={driver or '?'} "
-              f"events={sorted({e['type'] for e in events if e['type'].startswith('mcp.')})}")
-
-        # Confirm we measured the system we meant to. driver "v2" means the turn
-        # never went near the claude CLI.
-        want_driver = "claude" if args.runtime == "resident" else "v2"
-        if driver and driver != want_driver:
-            print(f"[probe] FAIL 实际跑在 driver={driver},要测的是 {want_driver} "
-                  f"—— 结果不能用")
-            return 1
-
-        if "mcp.materialize.applied" not in seen:
-            print("[probe] FAIL 配置没有落到 agent 侧(没有 mcp.materialize.applied)")
-            return 3
-        applied = (seen["mcp.materialize.applied"].get("detail") or {})
-        print(f"[probe] materialize: {json.dumps(applied, ensure_ascii=False)}")
-        if int(applied.get("enabled_count") or 0) != len(names):
-            print(f"[probe] FAIL 启用数 {applied.get('enabled_count')} != {len(names)}")
-            return 1
-
-        if args.runtime == "resident":
-            if "mcp.surface.wired" not in seen:
-                print("[probe] FAIL 没有 mcp.surface.wired")
-                return 3
-            wired = seen["mcp.surface.wired"].get("detail") or {}
-            print(f"[probe] wired: {json.dumps(wired, ensure_ascii=False)}")
-            if not wired.get("wired"):
-                print("[probe] FAIL 服务器没有交给 CLI")
-                return 1
-
-            if "mcp.surface.registered" not in seen:
-                print(f"[probe] FAIL {args.trace_timeout:.0f}s 内没等到 "
-                      f"mcp.surface.registered —— 没有观测不等于没有问题")
-                return 3
-            reg = seen["mcp.surface.registered"].get("detail") or {}
-            print(f"[probe] registered: {json.dumps(reg, ensure_ascii=False)}")
-            verdicts = reg.get("verdict") or {}
-            if not verdicts:
-                # Distinct from a mismatch: the event exists but carries the
-                # pre-C-prime shape (registered/missing/failed, no per-server
-                # verdict). That means the DEPLOYED consumer is older than this
-                # probe, not that the servers misbehaved — reporting it as a
-                # verdict mismatch would send someone debugging MCP when the
-                # actual answer is "ship the consumer first".
-                print("[probe] FAIL registered 事件里没有 verdict 字段 —— "
-                      "部署的 consumer 早于两阶段判据(C-prime),先发版再测")
-                return 3
-            if args.expect != "any":
-                bad = {n: v for n, v in verdicts.items() if v != args.expect}
-                if bad:
-                    print(f"[probe] FAIL 判定 {verdicts} 与 --expect {args.expect} 不符")
-                    return 1
-            print(f"[probe] PASS 每台判定均为 {args.expect}:{verdicts}")
-        else:
-            if "mcp.surface.resolved" not in seen:
-                print("[probe] FAIL 没有 mcp.surface.resolved(V2 工具面)")
-                return 3
-            print(f"[probe] resolved: "
-                  f"{json.dumps(seen['mcp.surface.resolved'].get('detail') or {}, ensure_ascii=False)}")
-            print("[probe] PASS")
-        return 0
+        code, lines = classify(events, runtime=args.runtime,
+                               expect=args.expect, server_count=len(names))
+        for line in lines:
+            print(f"[probe] {line}")
+        return code
     finally:
         admin.close()
         if args.keep:
