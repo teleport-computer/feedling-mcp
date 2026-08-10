@@ -119,6 +119,7 @@
 | **F7. 会话级指令 / 后台 lane 共用聊天会话** | 前台 dispatch 里任何**常驻**指令注入（`core/self_thinking.INSTRUCTION` 这类）、以及所有不带 `isolated_session` 的 `call_agent` 后台调用（capture / dream / migrate / identity 蒸馏 / 探针） | ✅ | — | ✅ **必跑** | **「我只注入在前台」不等于「后台不受影响」——真正决定作用域的是会话,不是 prompt。** 前台注入的常驻指令(自研思维链那条写着「⛔ 绝对输出规则:最终回复第一个字符必须是 `<think>`」)会留在**续接会话**里,而后台 lane 用的是**同一个会话**,于是模型在 capture 轮照样照办。**两次事故同一形状**:①2026-08-05 identity-redistill 在聊天会话里蒸馏 → schema 漂移 + 第二次被模型当「重复请求」拒答;②2026-08-09 capture/dream → 回复带 `<think>`,而记忆解析器从第一个 `{` 扫平衡括号,**capture 的 prompt 恰恰要求输出 JSON,模型思维链里天然全是大括号** → 抓到「平衡但非法」的片段 → `json_decode_error`,全 prod 56 次/11 用户,capture 失败头号原因。**纪律**:①加任何**常驻**指令时,列出「哪些 lane 共用这个会话」,别只看注入点——注释写「background lanes are never asked to emit X」而实际会被要求,正是第二次事故的原文;②修好一个 lane 后**必须横向扫一遍**同族(`grep -n "isolated_session" tools/chat_resident_consumer.py` 看谁**没有**带),第一次只修 identity 没横扫,capture 就是漏网的;③**解析层要自己扛得住**,不能只靠「我们不注入」——受影响用户里有 `-thinking` 中转,我们一个字不注入它照样内联推理,所以剥离必须做在解析入口(`card_text.extract_json_block`),且 strip 失败时**回退原文**(否则把今天能解析的搞挂)。验收:全栈探针 `tools/e2e/memory_thinking_leak_probe.py`,断言**用户能看见的东西**(花园里到底多没多出那张卡),不是只断言字符串解析成功 |
 | **F8. 「沉默」也是一种输出（各车道的合法结果不同）** | 任何决定「这一轮要不要发东西」的判据：抽取层把 `thinking_summary`/`tool_calls` 当「本轮有效」的放行（`_call_agent_http_*` / CLI 分支）、`_split_agent_turn` 之后的空判、以及 `if replies` / `if messages` 这类**以非空为前提**的兜底分支 | ✅ | — | ✅ **必跑** | **对唤醒车道正确的放行，前台继承过来就是数据丢失。** 2026-08-08 usr_0724（MiniMax-M3 经中转）连着几轮只吐 reasoning 不吐正文：抽取层按「有 thinking 就算有效」放行——这**对心跳是对的**（runtime-v2 `2f187175` 专门定过「唤醒可以想完不说话」）——前台于是拿到 `turn.messages == []`；下游 `replies == []` 让退化碎片守卫（它嵌在 `if degenerate:` 里）根本不触发，`if replies and not posted_any` 的保-checkpoint 重试也整段跳过 → **消息被判「已回答」并永久丢失**。她五个多小时发了十几条，没有回复、没有报错、没有横幅。三条纪律：①**任何「这轮可以不发」的放行都必须带车道**，落笔时问一句「前台走到这里会怎样」；②**空集合会让 `if x and …` 的整条兜底静默跳过**——兜底要按「什么都没有」写，不能只按「内容不对」写（本仓两个守卫都只覆盖了后者）；③**失败形态是「什么都没有」的 bug 在看板上不可见**：`agent.reply` 记 `status=ok`（它确实解析成功了，只是解析出 0 条），`stalled_turns` 也数不到——全 prod 扫一个月才在采样里看见 3 次，真实次数无从得知。所以这类修复**必须同时加一条 error 级埋点**（这里是 `agent.reply.empty_retry` / `agent.reply.empty_exhausted`），否则连「以前发生过多少次」都答不了。验收：断言**用户真的收到了东西**，不要只断言「没崩」；前台车道的口径是埋点里有 `route.decided`。 |
 | **F9. 跨 V1/V2 共享的符号(改名 / 改签名)** | `backend/model_api_runtime/v2/*` 里被 `tools/chat_resident_consumer.py` import 的任何东西(反之亦然):选择器、判据函数、常量、payload 形状 | ✅ | — | ✅ **必跑** | **只验自己那一侧 = 把另一条运行时打断,而 prod 跑的往往是另一侧。** 2026-08-11:把 `uniformly_sample_new_frames` 改名成 `select_recent_session_frames`,V2 侧改齐、测试全绿、gatekeep 也过了(我用独立脚本打了 8 条边界),**但 `chat_resident_consumer.py:3612` 那个调用点没改** —— V1 在共享活跃的聊天回合直接 `AttributeError`。而 prod 事实上全是 V1(埋点扫一个月:V2 迹象 0、resident 258),这条一旦随 test→main 合过去,**每个开着屏幕共享的 prod 用户聊天当场崩**。没被拦住的原因:V2 的测试只测 V2 模块本身,consumer 那套虽然会跑,但**没有一条用例真的执行到那一行**。三条纪律:①**改名/改签名的当下就 `git grep -n "<旧符号>" -- tools/ backend/ tests/`**,不要等 review;gatekeep 方也把这条列为固定第一步(这次是我漏了)。②修完要加一条**真的会执行到那一行**的回归 —— 判据是「它调的是真函数,只 mock I/O 边界」,而不是「测试文件名里有那个模块」。③**共享符号最好别改名**;非改不可时,同一个 commit 里把两侧和测试一起改,别拆成两个提交(中间那一刻 test 分支是坏的)。同族:§O(共享判据 + 各自视图 → 判据在字段缺失的那条 lane 上静默失效)。 |
+| **F10. 「哪条车道拿到什么上下文」（注入面的覆盖）** | 任何往 prompt 里加/减一块上下文的地方：`v2/worker.py::_run_wake` 与 `process_job`、`v2/context.py::build_turn_messages`、consumer 的 `_message_for_proactive_job` 与前台 dispatch | ✅（**四条 wake lane 全参数化**，不是只测被改的那条） | — | ⚠️ 能强制触发的车道必跑 | **加上下文时必须逐车道显式决定，并写下依据**——不是"先给聊天，别的以后再说"。世界书接进来一年只接了前台聊天，于是同一个伴侣在聊天里说「影月初三」、心跳主动开口时说「8 月 11 日」，而世界书恰恰是为「设定一致」买的（2026-08-10 修）。三条纪律：①**先问这块上下文有没有两半语义**——世界书的 `alwaysOn`（世界常数，聊什么都成立）与关键词触发（需要**新鲜文本信号**）答案不同，一刀切开或一刀切关都是错的；②**没有新鲜信号的车道不要硬凑**：心跳手里只有几小时前的旧消息，拿陈旧关键词灌 24k 字设定是噪音不是接地；③**有新鲜输入但输入不可信的车道，宁可不用**——屏幕文本被刻意设成 pull-only 正是为了不让屏幕内容影响首轮 prompt，拿它去**选**注入哪条用户数据，就是绕过那道闸的 retrieval-selection 注入通道（codex 复验定性为「必要，不是过度谨慎」）。测试要**参数化全部车道**（含没改的那些），否则以后有人顺手把某条也打开，没有任何测试会红；断言要打在「传给匹配/检索层的输入」上，那正是各车道语义的分界。跨运行时(V2 / resident)有各自实现时，**标注与上限必须共用同一份定义**——两边各写一份必漂（本次发现 resident 前台早已漂成没有 UNTRUSTED 标注、且完全没有总量上限） |
 | **G. DB schema / migration** | 建表 / 改列 / reset 路径 | ✅（`test_*_migration.py` `test_account_reset_purges_all_tables.py`） | — | ⚠️ | prod 用户极少，clean reinstall 迁移可接受（**须任务明确授权**）；reset 必须 CASCADE 清干净 |
 | **H. compose / enclave / 链上不变量** | `deploy/docker-compose*.yaml` `enclave_app.py` compose 段 | ✅ | ✅（envelope roundtrip） | — | **compose 任何字面量变更 → `compose_hash` 变 → 重新上链**（`deploy/DEPLOYMENTS.md`） |
 | **I. CVM runner 镜像 / 部署** | `deploy/Dockerfile.agent-runner` bump | — | — | ✅ **必跑** | `phala inspect` 确认 image tag == 目标 hash；`deploy/verify-remote.sh`；litellm 版本没变=桥行为没变 |
@@ -321,6 +322,37 @@
   教训：`test_memory_capture_trace` 被当 fixture 问题挂了几天，实为 trace 异步化
   引入的真实读写竞态（生产 admin 同样读旧数据，修复 e4b38e39）。排查起手式：
   单跑 vs 全量差异、`git archive` 导出的干净树（别 stash 共享区）、进程内全局状态清单。
+
+### 6.1 先证明测量工具是好的，再谈被测对象坏没坏
+
+2026-08-10 一晚踩了八次，**全部**是"测量工具坏了"而不是"被测对象坏了"。这类事故
+一律长成同一副样子：**你看到一个结论，而那个结论其实来自一个根本没测量该事实的信号。**
+它比普通 bug 危险，因为它同时污染"改坏了"和"改好了"两个方向——当晚它三次让我
+差点把好东西报成坏的，也让两轮全量白跑却以为是绿的。
+
+| 陷阱 | 当晚实例 | 判据 |
+|---|---|---|
+| shell 退出码不是被测命令的 | 后台任务回报 `exit code 0`，那是命令串里最后一个 `tail` 的；pytest 其实被 3 个收集错误中断，**零测试执行** | **只认 pytest 自己那行 `N passed`**；没有那行就是没跑，不管退出码 |
+| zsh 不对未加引号的变量做词分割 | `IGN="--ignore=a --ignore=b"` 再 `$IGN` 展开 → 整串当**一个**参数，`--ignore` 静默失效，两轮全量都白跑 | 参数写字面量；或反查被忽略的文件是否真的没被收集 |
+| `git diff origin/test HEAD` ≠「我改了什么」 | 分支落后时它的语义是「把 origin 变成我」：报 19 files / **-998**，含删掉别人两个测试文件。**同一坑当晚踩两次**，第二次是在 codex 已明确指出之后 | 唯一口径 **`git show --stat <commit>`**；`origin/*` 是活动靶子，"我改了什么"不许以它为参照 |
+| baseline 与被测不在同一 commit | ①拿**还没跑完**的 baseline 比 → 50 条假新增；②两个 worktree 差 4 个提交（其中一个刚好改了那条测试的名字）→ 1 条假回归 | 比之前先 `git rev-parse` 核对两边**完全一致**，并确认 baseline 已跑完 |
+| 断言打在序列化后的文本上 | `json.dumps(messages)` 把 header 里的真实换行转义成 `\n` 两个字符，断言永远匹配不上 → 红三条，差点判「功能没接上」；dump 出真实消息一看，功能好端端的 | 在**消息正文/结构**里断言，别在 dump 出来的字符串里 |
+| 量错了对象 | `split(header)[1]` 当成"世界书正文"量长度，实际把后面整条 prompt 也算了进去（27010 vs 24000）——截断本身是好的 | 明确框定量的**起止两端**，不要只框起点 |
+| 单个 node id / `-k` 静默不收集 | `pytest x.py::test_y` → `2 warnings in 0.21s`，零收集（conftest 白名单）；`-k` 拼错同样静默 | 同第一条；**跑整个文件**能否收集是最快的判别法 |
+| 探针写死仓库路径 | 探针里 `REPO = "/Users/.../feedling-mcp-test"`，于是在任何 worktree 里跑它，import 的都是**主树**的代码；我在 worktree 加了个方法，跑起来照报 `no attribute` | 路径从 `__file__` 推；"在 worktree 改代码→跑探针→绿"这条链默认不成立 |
+
+**通用起手式**：任何"这里坏了"的结论落地之前，先回答一句 ——
+**我用来看见它的那个信号，真的测量它吗？** 当晚三次产品级误判（拿 V1 口径的数据面
+判 V2 用户、断言判"功能没接上"、量法判"截断没生效"）全栽在这一问上。
+
+### 6.2 定根因前，必须往上追一层调用
+
+`if not text: return` 只是**症状落点**；让它可达的是上一层 `require_reply=False`。
+只读症状那一行，会得出"这个洞没被修过"——而实际上恢复机制早就建好、也早就在 prod，
+只是**没接到那条道上**。2026-08-10 定时提醒静默丢失事故，就是这么被多绕了一圈。
+
+同族判据：同一个函数里若已有一条为某 lane / 某场景**破了例**的路径，而另一条同语义
+路径没破例，基本就是漏改，不是设计。
 
 ## 7. "完成"的定义（Definition of Done）
 
