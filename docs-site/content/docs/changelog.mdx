@@ -10,6 +10,11 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **Runtime V1 Fable 5 chat no longer requires visible chain-of-thought.**
+  Fable 5 routes running through pi, including OpenRouter and compatible relays,
+  now skip the mandatory `<think>` response format that the model refuses. Pi's
+  native reasoning setting is unchanged, and other models keep the existing
+  self-thinking behavior.
 - **Memory extraction no longer mistakes model thinking for its JSON result.**
   Capture, Dream, legacy-card migration, and resident identity distillation now
   remove well-formed thinking blocks before locating the result object while

@@ -8513,6 +8513,12 @@ def _prepend_runtime_model_identity(content: str) -> str:
     )
 
 
+def _supports_mandatory_self_thinking_v1() -> bool:
+    """Whether the configured model accepts the visible ``<think>`` protocol."""
+    model = str(AGENT_RUNTIME_METADATA.get("model") or "").strip().lower()
+    return model.rsplit("/", 1)[-1] != "claude-fable-5"
+
+
 # ---------------------------------------------------------------------------
 # io_cli capability catalog injection — VPS/self-hosted CLI resident only.
 # V2 云端无此注入(注册表制);VPS 线长期资产,0727 合并原样保留。
@@ -14708,7 +14714,10 @@ def _process_messages(messages: list) -> float:
         # <think> block into thinking_summary. Same kill switch as V2.
         from core import self_thinking as _self_thinking_v1
 
-        if _self_thinking_v1.enabled():
+        if (
+            _self_thinking_v1.enabled()
+            and _supports_mandatory_self_thinking_v1()
+        ):
             content = f"{_self_thinking_v1.INSTRUCTION.strip()}\n\n{content}"
         # Ground every foreground turn in the real current time (+ gap since last
         # interaction) so the agent never carries a stale, e.g. overnight, frame.

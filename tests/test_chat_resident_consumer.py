@@ -351,6 +351,59 @@ def test_process_messages_prompt_does_not_request_custom_thinking_summary(monkey
     assert "hidden chain-of-thought" not in captured["message"]
 
 
+@pytest.mark.parametrize(
+    ("runtime_metadata", "expects_instruction"),
+    [
+        ({"provider": "openrouter", "model": "claude-fable-5"}, False),
+        ({"provider": "openrouter", "model": "anthropic/claude-fable-5"}, False),
+        ({"provider": "openrouter", "model": "claude-fable-50"}, True),
+        ({"provider": "openrouter", "model": "foo-claude-fable-5-bar"}, True),
+        ({}, True),
+    ],
+)
+def test_v1_foreground_self_thinking_skips_only_exact_fable(
+    monkeypatch, runtime_metadata, expects_instruction
+):
+    """Catch V1 forcing Fable to expose reasoning while preserving near-matches."""
+    crc._seen_ids.clear()
+    crc._seen_ids_order.clear()
+    monkeypatch.delenv("FEEDLING_V2_SELF_THINKING", raising=False)
+    runtime_metadata = {**runtime_metadata, "input_modalities": ["text"]}
+    monkeypatch.setattr(
+        crc,
+        "AGENT_RUNTIME_METADATA",
+        runtime_metadata,
+    )
+    msg = {
+        "id": f"user-msg-fable-{runtime_metadata.get('model', 'legacy')}",
+        "role": "user",
+        "content": "hello",
+        "ts": 1112.75,
+    }
+    captured = {}
+
+    def fake_call(
+        message,
+        images=None,
+        image_paths=None,
+        trace_id="",
+        lane="background",
+        stream_update=None,
+    ):
+        captured["message"] = message
+        return {"messages": ["ok"]}
+
+    with patch.object(crc, "call_agent", side_effect=fake_call), \
+         patch.object(crc, "post_reply", return_value={"id": "reply-msg-fable"}):
+        result_ts = crc._process_messages([msg])
+
+    from core import self_thinking
+
+    assert result_ts == pytest.approx(1112.75)
+    instruction_present = self_thinking.INSTRUCTION.strip() in captured["message"]
+    assert instruction_present is expects_instruction
+
+
 def test_process_messages_v2_drops_needs_background_without_ack(monkeypatch):
     crc._seen_ids.clear()
     crc._seen_ids_order.clear()
