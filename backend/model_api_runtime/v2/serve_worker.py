@@ -438,6 +438,14 @@ _GENESIS_TOKEN_SCOPE = ["envelope_decrypt", "genesis"]
 _V2_WAKE_OWNER_ID = "hosted_runtime_v2"
 
 _IMAGE_MARKER = "[image]"
+# Provider failures that say "try again later", not "your setup is wrong". Only
+# these keep their own error code when image generation was attempted WITHOUT a
+# configured image route — everything else becomes the actionable
+# `image_generation_model_required`, because in that branch we were generating
+# with the chat model on spec.
+_IMAGE_TRANSIENT_CLASSES = frozenset({
+    "rate_limited", "upstream_unavailable", "turn_timeout", "quota_insufficient",
+})
 _UNAVAILABLE_CHAT_MARKER = "[message unavailable]"
 _USER_ROLES = frozenset({"user", "human"})
 
@@ -2170,11 +2178,30 @@ async def _generate_image_for_chat(
                 provider=str(selected.get("provider") or ""),
             ) from exc
 
+    # Route metadata only — never the prompt, which is user content.
+    _image_route_detail = {
+        "dedicated_route": selected is not None,
+        "provider": str(getattr(config, "provider", "") or ""),
+        "model": str(getattr(config, "model", "") or ""),
+    }
+    _image_store = core_store.get_store(user_id)
+    _emit_v2_debug_trace(
+        _image_store, "agent.image.generate.start", status="ok",
+        summary="image generation started",
+        explain="开始生成图片（记录用的是哪条路由，不含提示词）。",
+        detail=dict(_image_route_detail),
+    )
     try:
         result = await provider_client.generate_image_async(config, prompt)
         media = ProviderResponse.from_result(result).media
         if not media:
             raise provider_client.ProviderError("image_generation_invalid_output")
+        _emit_v2_debug_trace(
+            _image_store, "agent.image.generate.done", status="ok",
+            summary="image generation done",
+            explain="图片生成成功。",
+            detail={**_image_route_detail, "media_count": len(media)},
+        )
     except Exception as exc:  # noqa: BLE001 - stable capability surface
         classified = provider_client.classify_provider_error(exc)
         incompatible = classified in {"provider_config", "provider_incompatible"} or (
@@ -2195,6 +2222,30 @@ async def _generate_image_for_chat(
                 if selected is not None
                 else "image_generation_model_required"
             )
+        elif selected is None and classified not in _IMAGE_TRANSIENT_CLASSES:
+            # No image route configured, so `config` above is the CHAT model and
+            # this attempt was a guess. Whatever the text model happened to answer
+            # with, the one action that helps is the same: add an image model. The
+            # copy for that already exists (notices `image_generation_model_required`
+            # -> "当前模型不能生成图片，请到设置里添加生图模型。") — it just never
+            # reached anyone whose provider did not classify as incompatible.
+            # usr_7001b1df80e2024d (2026-08-10, deepseek-v4-flash via openrouter)
+            # got the generic "模型那边暂时没接上" instead and had no idea what to do.
+            # Transient classes keep their own code: a user whose MAIN model really
+            # can generate images (Gemini-shaped) must not be told to add a model
+            # just because the provider rate-limited them.
+            code = "image_generation_model_required"
+        _emit_v2_debug_trace(
+            _image_store, "agent.image.generate.failed", status="error",
+            summary=f"image generation failed: {code}",
+            explain="图片生成失败，记录归因用的错误码与分类（不含提示词）。",
+            detail={
+                **_image_route_detail,
+                "error_code": code,
+                "classified": classified,
+                "incompatible": incompatible,
+            },
+        )
         if isinstance(route, dict) and route.get("id"):
             await asyncio.to_thread(
                 db.model_api_route_mark_image_generation_test,

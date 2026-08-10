@@ -1231,6 +1231,14 @@ def _model_api_route_summaries(user_id: str) -> list[dict]:
             purposes.append("chat")
         if route.get("is_vision"):
             purposes.append("vision")
+        # image_generation was missing here while the column existed, so an
+        # image-gen route rendered as `purpose: []` — indistinguishable from a
+        # route with no job at all. Diagnosing usr_7001b1df80e2024d's "生图没引导
+        # 我加模型" (2026-08-10) from admin was impossible: the one fact that
+        # decides the whole branch (is there a dedicated image route?) was the
+        # one fact not projected. Read a projection as a projection.
+        if route.get("is_image_generation"):
+            purposes.append("image_generation")
         out.append({
             "purpose": purposes,
             "provider": str(route.get("provider") or "")[:80],
@@ -1238,6 +1246,12 @@ def _model_api_route_summaries(user_id: str) -> list[dict]:
             "vision_test_status": str(
                 route.get("vision_test_status") or "untested"
             )[:40],
+            "image_generation_test_status": str(
+                route.get("image_generation_test_status") or "untested"
+            )[:40],
+            "last_image_generation_test_error": str(
+                route.get("last_image_generation_test_error") or ""
+            )[:300],
             "last_vision_test_error": str(
                 route.get("last_vision_test_error") or ""
             )[:300],
