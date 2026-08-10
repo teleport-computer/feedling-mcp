@@ -80,7 +80,6 @@ tests/test_capture_dream_submit_seam.py
 tests/test_capture_failure_backoff.py
 tests/test_capture_source_whitelists_agree.py
 tests/test_card_guard.py
-tests/test_chat_activity_projection.py
 tests/test_chat_core_file_ingest.py
 tests/test_chat_core_introduction_trigger.py
 tests/test_chat_envelope_fpr_guard.py
