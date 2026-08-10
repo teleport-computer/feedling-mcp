@@ -86,6 +86,127 @@ def test_db_action_v2_enqueues_job_and_skips_resident(monkeypatch):
     assert trace_id == "u-msg-1"
 
 
+def test_db_action_v2_voice_revision_supersedes_partial_without_reenqueuing_retry(
+    monkeypatch,
+):
+    uid = "u_send_v2_voice_revision"
+    _seed(uid)
+    store = core_store.get_store(uid)
+    hosted_config_store.set_hosted_runtime_mode(store, "db_action_v2")
+
+    def _voice_envelope(_store, plaintext, **_kwargs):
+        msg_id = {
+            b"partial": "v2-voice-partial",
+            b"complete": "v2-voice-complete",
+        }[plaintext]
+        return {
+            "id": msg_id,
+            "body_ct": "c",
+            "nonce": "n",
+            "K_user": "k",
+        }, ""
+
+    monkeypatch.setattr(
+        chat_send_core.core_envelope,
+        "_build_shared_envelope_for_store",
+        _voice_envelope,
+    )
+    monkeypatch.setattr(
+        chat_send_core.agent_runtime_cutover,
+        "resolve_driver",
+        lambda _config: "claude",
+    )
+    monkeypatch.setattr(chat_send_core.jobs_store, "workers_alive", lambda **_kw: True)
+    monkeypatch.setattr(
+        chat_send_core.jobs_store,
+        "live_worker_capacity",
+        lambda **_kw: 1,
+    )
+    monkeypatch.setattr(chat_send_core.jobs_store, "inflight_job_count", lambda: 0)
+    monkeypatch.setattr(
+        chat_send_core.jobs_store,
+        "recent_mean_service_sec",
+        lambda **_kw: None,
+    )
+    monkeypatch.setattr(
+        chat_send_core.kill_switch,
+        "turns_halted",
+        lambda **_kw: False,
+    )
+    monkeypatch.setattr(chat_send_core.debug_trace, "trace_event", lambda *_a, **_kw: None)
+    monkeypatch.setattr(chat_send_core.core_wake_bus, "notify", lambda *_a, **_kw: None)
+
+    partial_body, partial_status = chat_send_core.model_api_chat_send_core(
+        store,
+        api_key="key",
+        runtime_tok="",
+        payload={
+            "message": "partial",
+            "client_msg_id": "00000000-0000-0000-0000-000000000001",
+        },
+        voice_context={
+            "call_id": "v2-call-pause",
+            "turn_id": "2.partial",
+            "logical_turn_id": "2",
+        },
+    )
+    complete_body, complete_status = chat_send_core.model_api_chat_send_core(
+        store,
+        api_key="key",
+        runtime_tok="",
+        payload={
+            "message": "complete",
+            "client_msg_id": "00000000-0000-0000-0000-000000000002",
+        },
+        voice_context={
+            "call_id": "v2-call-pause",
+            "turn_id": "2.complete",
+            "logical_turn_id": "2",
+        },
+    )
+
+    assert partial_status == 202, partial_body
+    assert complete_status == 202, complete_body
+    partial = db.chat_get_strict(uid, "v2-voice-partial")
+    complete = db.chat_get_strict(uid, "v2-voice-complete")
+    assert partial["voice_turn_status"] == "superseded"
+    assert partial["voice_superseded_by"] == "v2-voice-complete"
+    assert complete["voice_turn_status"] == "current"
+    with db.get_pool().connection() as conn:
+        job_before_retry = conn.execute(
+            "SELECT id,input_generation FROM agent_jobs "
+            "WHERE user_id=%s AND lane='chat' AND status='pending'",
+            (uid,),
+        ).fetchone()
+    assert job_before_retry is not None
+    assert int(job_before_retry[1]) == 1
+
+    retry_body, retry_status = chat_send_core.model_api_chat_send_core(
+        store,
+        api_key="key",
+        runtime_tok="",
+        payload={
+            "message": "complete",
+            "client_msg_id": "00000000-0000-0000-0000-000000000002",
+        },
+        voice_context={
+            "call_id": "v2-call-pause",
+            "turn_id": "2.complete",
+            "logical_turn_id": "2",
+        },
+    )
+
+    assert retry_status == 202, retry_body
+    with db.get_pool().connection() as conn:
+        job_after_retry = conn.execute(
+            "SELECT id,input_generation FROM agent_jobs "
+            "WHERE user_id=%s AND lane='chat' AND status='pending'",
+            (uid,),
+        ).fetchone()
+    assert job_after_retry == job_before_retry
+    assert db.chat_get_strict(uid, "v2-voice-complete")["voice_turn_status"] == "current"
+
+
 def test_runtime_mode_read_failure_refuses_before_persistence(monkeypatch):
     _seed("u_send_mode_db_failure")
     store = core_store.get_store("u_send_mode_db_failure")

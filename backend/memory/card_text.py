@@ -12,13 +12,14 @@
 不合格 = 整行打回;**软字段**(bucket/threads)不合格 = 就地清洗(丢掉那一条),
 但在 strict 模式下同样会触发一次重试 —— 软字段抄模板是「模型在复述骨架」的强信号。
 
-模块保持纯函数、零 I/O、只依赖 stdlib,以便 resident 与 V2 两条运行时共用一份判据。
+模块保持纯函数、零 I/O,以便 resident 与 V2 两条运行时共用一份判据。
 """
 from __future__ import annotations
 
 import re
 import unicodedata
 
+from core import self_thinking
 from memory import card_guard
 from memory.prompts_v1 import normalize_bucket_language
 
@@ -49,6 +50,16 @@ _PLACEHOLDER_WORD_RE = re.compile(
     re.IGNORECASE,
 )
 
+# 墓碑注记(2026-08-05 usr_a40e 事故):弱模型把 supersede 语义理解反,往用户可见
+# 字段里写「已被 <卡id> 取代——原文」这类记账文。**短语+hex 组合判**——裸判
+# 「已被…取代」会误伤正常散文(「旧手机已被新手机取代」),跟上一串 ≥8 位 hex
+# 才是系统 id 泄漏的强证据。花园内真实 id 的精确匹配在 dream_gates.known_id_in_text
+# (需要 card_map 上下文);这里是无上下文的兜底,capture/dream 四条 lane 全覆盖。
+_TOMBSTONE_MARKER_RE = re.compile(
+    r"(?:已被\s*[0-9a-f]{8,}|(?:superseded|replaced)\s+by\s+[0-9a-f]{8,})",
+    re.IGNORECASE,
+)
+
 # 下限刻意压到只能拦「明显没写」(单字残留),不评判写得好不好 —— 卡片写得薄是
 # 模型能力问题,不该由这道闸来判死;它只负责拦占位符和空壳。
 MIN_SUMMARY_CHARS = 2
@@ -56,6 +67,55 @@ MIN_CONTENT_CHARS = 2
 
 _FORMAT_ERROR_PREFIX = "invalid_card_content"
 _AFTER_RETRY_ERROR_PREFIX = "invalid_card_content_after_retry"
+
+
+def _first_balanced_json_object(raw: str) -> str:
+    """Return the first balanced ``{...}`` block, preserving legacy leniency."""
+    text = str(raw or "").strip()
+    if text.startswith("```"):
+        # Agents sometimes wrap JSON in a leading ```json fence despite the
+        # instruction. Preserve the three former parsers' exact tolerance.
+        text = text.split("```", 2)[1] if text.count("```") >= 2 else text.strip("`")
+        if text.lstrip().lower().startswith("json"):
+            text = text.lstrip()[4:]
+    start = text.find("{")
+    if start < 0:
+        return ""
+    depth = 0
+    for index in range(start, len(text)):
+        if text[index] == "{":
+            depth += 1
+        elif text[index] == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start:index + 1]
+    return ""
+
+
+def extract_json_block(raw: str) -> str:
+    """Extract JSON from model output without mistaking thinking for the reply.
+
+    Some thinking-capable relays mix ``<think>`` blocks into the same text as
+    the requested JSON. Reasoning naturally contains brace-shaped drafts, so
+    scanning the raw string from its first ``{`` can select a balanced but
+    invalid pseudo-object and discard the valid public reply that follows.
+
+    Scan the reply after the shared thinking parser removes all well-formed
+    thinking blocks. If that yields no object—or the thinking parser fails
+    closed and returns an empty reply—scan the original text as a compatibility
+    fallback. The fallback is important: parser lanes are intentionally more
+    permissive than the user-visible reply path and must not reject any shape
+    the legacy extractor could parse.
+    """
+    text = str(raw or "")
+    status, _thinking, reply = self_thinking.strip_all_thinking(
+        text, sanitize=False
+    )
+    if status != self_thinking.FAILED:
+        extracted = _first_balanced_json_object(reply)
+        if extracted:
+            return extracted
+    return _first_balanced_json_object(text)
 
 
 def _is_substantive_char(ch: str) -> bool:
@@ -86,6 +146,9 @@ def placeholder_reason(text: str) -> str | None:
     for fragment in _TEMPLATE_FRAGMENTS:
         if fragment in s:
             return "template_fragment"
+    if _TOMBSTONE_MARKER_RE.search(s):
+        # 「已被 c42ebb96… 取代」:整理动作的记账注记被当成了内容本身。
+        return "tombstone_marker"
     if substantive_len(s) == 0:
         # 纯标点/省略号/emoji:"..."、"…"、"。"、"— —"
         return "no_substantive_chars"
@@ -225,6 +288,20 @@ def is_card_format_error(err: str | None) -> bool:
     return bool(err) and str(err).split(":", 1)[0] == _FORMAT_ERROR_PREFIX
 
 
+def is_retryable_parse_error(err: str | None) -> bool:
+    """Whether a memory parser failure deserves one corrective model call.
+
+    Keep :func:`is_card_format_error` narrow because other callers use it to
+    identify content-gate failures specifically. Capture and Dream retry one
+    additional parse shape: a balanced object that failed JSON decoding. This
+    commonly means a thinking model put a pseudo-JSON draft before its valid
+    answer. ``no_json_object`` remains non-retryable because truncation and pure
+    prose have their own provider failure paths.
+    """
+    prefix = str(err or "").split(":", 1)[0]
+    return is_card_format_error(err) or prefix == "json_decode_error"
+
+
 _REASON_TEXT = {
     "summary_empty": "summary 是空的",
     "summary_bracket_placeholder": "summary 还是方括号占位(例如 [thickened summary])",
@@ -238,6 +315,10 @@ _REASON_TEXT = {
     "content_template_fragment": "content 抄了输出示例里的说明文字(例如「一段厚的正文」)",
     "content_no_substantive_chars": "content 只有省略号/标点,没有正文",
     "content_too_short": "content 太短,不是一段正文",
+    "summary_tombstone_marker": "summary 写成了「已被 <卡id> 取代」这类整理注记 —— 应该写合并/整理后的内容本身,卡片字段里永远不要出现卡 id",
+    "content_tombstone_marker": "content 写成了「已被 <卡id> 取代」这类整理注记 —— 应该写合并/整理后的完整正文,卡片字段里永远不要出现卡 id",
+    "summary_contains_card_id": "summary 里出现了内部卡 id —— 卡片字段是本人会看到的记忆内容,不要引用任何卡 id",
+    "content_contains_card_id": "content 里出现了内部卡 id —— 卡片字段是本人会看到的记忆内容,不要引用任何卡 id",
     "summary_protocol_leak": "summary 里混进了模型的原始输出/协议残片(harmony 标记、报错回显或撕裂的 JSON),不是真正的记忆内容",
     "content_protocol_leak": "content 里混进了模型的原始输出/协议残片,不是真正的记忆内容",
     "bucket_protocol_leak": "bucket 混进了协议残片/机器分类串",
@@ -270,14 +351,17 @@ def build_format_retry_prompt(prompt: str, err: str, *, empty_example: str) -> s
         f"{prompt}\n\n"
         "【上一次的输出被打回,请重做】\n"
         f"问题:{_problem_text(err)}。\n"
-        "这不是 JSON 语法错误 —— 是内容没写:你把上面输出示例里的占位符"
-        "(`...`、方括号里的说明、「一段厚的正文」之类)原样抄了回来,或者留了空。\n"
-        "这些卡是本人会亲眼看到的记忆,占位符会直接显示成空白卡片。\n"
+        "这不是 JSON 语法错误 —— 是字段里装的不是真内容:要么把输出示例里的占位符"
+        "(`...`、方括号里的说明、「一段厚的正文」之类)原样抄了回来或留了空,"
+        "要么写成了整理动作的注记(「已被 xxx 取代」、引用卡 id)。\n"
+        "这些卡是本人会亲眼看到的记忆:占位符会显示成空白卡片,"
+        "注记和卡 id 会显示成一张看不懂的坏卡。\n"
         "\n"
         "再来一次,仍然只输出 JSON,并且:\n"
         "· summary:一句真实的话,一眼看出这张卡是什么。不能是 `...`、`[...]`、空字符串。\n"
         "· content:完整的一段正文(至少一两句),写清楚发生了什么。不能只有省略号,"
         "也不能只是把 summary 重复一遍。\n"
+        "· 字段里写的是记忆内容本身 —— 不要写「已被 X 取代」这类说明,不要出现任何卡 id。\n"
         "· bucket / threads:写具体的词,不要照抄示例里的 `...`。\n"
         f"· 如果其实没有值得写的,就输出 {empty_example} —— 空结果完全可以接受,"
         "比填占位符好得多。\n"

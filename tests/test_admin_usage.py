@@ -2584,7 +2584,7 @@ def test_usage_user_page_keeps_drilldown_path_in_presets_filters_and_sorts(
     assert (kind, status) == ("html", 200)
     expected_path = f"/admin/data-track/users/{user_id}"
 
-    nav_start = body.index("<nav class='viewbar'")
+    nav_start = body.index("<nav class='viewbar viewbar-diag'")
     nav_end = body.index("</nav>", nav_start)
     usage_nav = re.search(
         r"href='([^']+)'[^>]*>Token 与模型</a>",
@@ -2736,10 +2736,11 @@ def test_usage_query_failure_is_local_and_runtime_remains_available(monkeypatch)
     assert "各 lane 健康" in runtime_body
 
 
-def test_usage_report_is_wired_to_jobs_store():
-    """Assembly must replace the content-free stub with the real snapshot."""
-    import asgi_app  # noqa: F401
+def test_asgi_assembly_wires_usage_report_to_jobs_store():
+    """ASGI assembly registers the admin page and installs the real snapshot."""
+    import asgi_app
 
+    assert any(route.path == "/admin/data-track" for route in asgi_app.app.routes)
     assert _data_track._usage_report is jobs_store.usage_report_snapshot
 
 

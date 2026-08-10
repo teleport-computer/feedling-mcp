@@ -15,6 +15,7 @@ from core import envelope as core_envelope
 from core import util as core_util
 from identity import service as identity_service
 from memory import card_guard
+from memory import card_text
 from memory import service as memory_service
 from memory.prompts_v1 import normalize_bucket_language
 from memory.source_policy import (
@@ -97,6 +98,20 @@ def _memory_duplicate_result(duplicate: dict) -> tuple[dict, list[dict], int]:
         "skipped": "duplicate_active",
         "duplicate_of": str(duplicate.get("id") or ""),
     }, [], 200
+
+
+def _memory_tombstone_reason(summary: str, content: str) -> str | None:
+    """明文写入路的墓碑注记闸(2026-08-06,usr_a40e 徒手 patch 潮)。
+
+    「已被 <卡id> 取代——原文」这类整理注记不是记忆内容。dream/capture 的结构化
+    parse 层已有同判据(card_text._TOMBSTONE_MARKER_RE),但 agent 徒手
+    io_cli memory-patch / memory-write 走的是这里的明文 actions 路,绕过 parse 层
+    —— usr_a40e 连续三晚的墓碑卡全部由这条路写入。判据=短语+hex 组合
+    (card_text.placeholder_reason 的 tombstone_marker),零误伤正常散文。"""
+    for field, value in (("summary", summary), ("content", content)):
+        if card_text.placeholder_reason(str(value or "")) == "tombstone_marker":
+            return f"{field}_tombstone_marker"
+    return None
 
 
 def _memory_action_text(value, max_chars: int) -> str:
@@ -435,6 +450,12 @@ def _memory_add_action(
         # 查的是【真正会被存的 content】(_memory_content_from_action 优先取 content 字段),
         # 不是 description —— 污染常在 content 里。硬字段用从严判据(强证据/≥2弱)防误杀。
         return {"status": "error", "error": "memory_card_polluted", "action": "memory.add"}, [], 400
+    if _memory_tombstone_reason(summary, _memory_content_from_action(raw, summary)):
+        # 「已被 <卡id> 取代」式整理注记不是内容 —— 拒收,让 agent 写内容本身。
+        # 刻意**不**挂 guard_enabled():那个开关的契约只管协议/harmony 残片检测,
+        # 结构化路的 tombstone_marker 同样无条件跑(card_text_rejection guard=False
+        # 也查 placeholder_reason)。挂上去=止血关协议闸时顺手重开本事故路(codex2 P1)。
+        return {"status": "error", "error": "memory_card_tombstone", "action": "memory.add"}, [], 400
     anchor_ids = raw.get("anchor_memory_ids") or action.get("anchor_memory_ids") or []
     if not isinstance(anchor_ids, list):
         return {"status": "error", "error": "anchor_memory_ids_must_be_list", "action": "memory.add"}, [], 400
@@ -642,6 +663,9 @@ def _memory_upgrade_action(store: UserStore, api_key: str | None, action: dict) 
         or card_guard.hard_field_pollution_reason(inner.get("content"))
     ):
         return {"status": "error", "error": "memory_card_polluted", "action": "memory.upgrade"}, [], 400
+    if _memory_tombstone_reason(inner.get("summary"), inner.get("content")):
+        # 无条件(不挂 guard_enabled,与 add 同理)。
+        return {"status": "error", "error": "memory_card_tombstone", "action": "memory.upgrade"}, [], 400
     old_body_hash = _memory_action_text(action.get("old_body_hash"), 80)
     envelope, env_err = _build_memory_envelope_for_store(store, inner, item_id=memory_id)
     if envelope is None:
@@ -760,6 +784,11 @@ def _memory_supersede_action(
         return {"status": "error", "error": "title_required", "action": "memory.supersede"}, [], 400
     if not description and mem_type not in {"quote", "event"}:
         return {"status": "error", "error": "description_required", "action": "memory.supersede"}, [], 400
+    if _memory_tombstone_reason(summary, _memory_content_from_action(raw, summary)):
+        # usr_a40e 事故主路:agent 徒手 memory-patch 把墓碑写成新卡、旧卡被退休。
+        # 拒收发生在退休旧卡之前 —— 原卡保持 active。无条件跑,不挂 guard_enabled()
+        # (那个开关只管协议残片检测;挂上去=止血时顺手重开本事故路,codex2 P1)。
+        return {"status": "error", "error": "memory_card_tombstone", "action": "memory.supersede"}, [], 400
     if card_guard.guard_enabled():
         if card_guard.hard_field_pollution_reason(summary) or card_guard.hard_field_pollution_reason(
             _memory_content_from_action(raw, summary)
@@ -767,6 +796,7 @@ def _memory_supersede_action(
             # 硬字段脏 → 整个 supersede 打回,旧卡保持 active(此处 return 在退休旧卡之前)。
             # 查真正会存的 content(不是 description),污染常在 content 里。
             return {"status": "error", "error": "memory_card_polluted", "action": "memory.supersede"}, [], 400
+
         if card_guard.bucket_pollution_reason(str(raw.get("bucket") or "")):
             # 脏桶视为「模型没给桶」→ 从 raw 剔除,让下面的合并继承旧卡的桶,而不是用残片覆盖。
             raw = {k: v for k, v in raw.items() if k != "bucket"}

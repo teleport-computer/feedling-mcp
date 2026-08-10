@@ -14,6 +14,21 @@ from typing import Any, Iterable, Mapping
 
 TOOL_ACTIVITY_KIND = "tool_activity"
 MAX_ACTIVITY_EVENTS = 100
+IMAGE_GENERATION_RESULT_CODES = frozenset({
+    "image_generation_model_required",
+    "image_generation_model_incompatible",
+    "image_generation_model_unsupported",
+    "image_generation_model_requires_test",
+    "image_generation_auth_invalid",
+    "image_generation_quota_insufficient",
+    "image_generation_model_not_found",
+    "image_generation_model_not_ready",
+    "image_generation_rate_limited",
+    "image_generation_unavailable",
+    "image_generation_invalid_output",
+    "image_generation_invalid_prompt",
+    "image_generation_failed",
+})
 MEMORY_CATEGORY_KEYS = frozenset({
     "work", "growth", "family", "friends", "pets", "relationship", "feelings",
     "preferences", "values", "health", "interests", "money", "food", "travel",
@@ -56,6 +71,12 @@ def result_code(result_content: Any, effect: Mapping[str, Any] | None = None) ->
     if lowered.startswith("queued:"):
         return "queued"
     return "ok"
+
+
+def image_generation_result_code(value: Any) -> str:
+    """Keep only runtime-owned image failure codes safe for UI decisions."""
+    code = safe_token(value, max_len=64).lower()
+    return code if code in IMAGE_GENERATION_RESULT_CODES else ""
 
 
 def event_state(event_kind: str, result_content: Any = "") -> str:
@@ -240,7 +261,13 @@ def _turn_failure(
     return None
 
 
-def turn_response(turn_id: str, jobs: Iterable[Mapping[str, Any]], rows: Iterable[Mapping[str, Any]]) -> dict:
+def turn_response(
+    turn_id: str,
+    jobs: Iterable[Mapping[str, Any]],
+    rows: Iterable[Mapping[str, Any]],
+    *,
+    turn_answered: bool = False,
+) -> dict:
     source_jobs = list(jobs)
     job_list = [
         {
@@ -261,7 +288,9 @@ def turn_response(turn_id: str, jobs: Iterable[Mapping[str, Any]], rows: Iterabl
         "jobs": job_list,
         "events": project_tool_events(row_list),
     }
-    failure = _turn_failure(source_jobs, row_list)
+    # turn_answered=真回复证据(见 jobs_store.turn_answered_by_real_reply):一轮
+    # 先失败后重试成功时,失败 job 仍在 jobs 列表里,但最终结果是成功——失败让位。
+    failure = None if turn_answered else _turn_failure(source_jobs, row_list)
     if failure is not None:
         failure["message_id"] = turn_id
         response["failure"] = failure

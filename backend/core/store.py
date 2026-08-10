@@ -491,6 +491,7 @@ class UserStore:
                 # enclave expands them into decrypted memory context on read.
                 "quoted_memory_ids",
                 "image_mime",
+                "image_byte_count",
                 # Hosted V1 follow-main capability-learning fence. The terminal
                 # reply transaction consumes both fields only for the stable
                 # vision_model_required class; they never alter image routing.
@@ -506,6 +507,11 @@ class UserStore:
                 "include_reasoning",
                 "voice_call_id",
                 "voice_turn_id",
+                "voice_logical_turn_id",
+                "voice_turn_status",
+                "voice_superseded_by",
+                "voice_turn_count",
+                "voice_duration_sec",
                 "caption_v",
                 "caption_id",
                 "caption_body_ct",
@@ -556,13 +562,28 @@ class UserStore:
                 "turn_failure_provider",
                 "terminal_failure_job_id",
                 "reply_to_message_id",
+                "reply_part_index",
+                "reply_part_count",
             ):
                 value = extra.get(key)
                 if isinstance(value, str) and value.strip():
                     msg[key] = value.strip()
                 elif isinstance(value, bool):
                     msg[key] = value
-                elif key == "file_byte_count" and isinstance(value, int) and value > 0:
+                elif key in {
+                    "file_byte_count",
+                    "image_byte_count",
+                    "reply_part_count",
+                } and isinstance(value, int) and value > 0:
+                    msg[key] = value
+                elif key == "reply_part_index" and isinstance(value, int) and value >= 0:
+                    msg[key] = value
+                elif (
+                    key in {"voice_turn_count", "voice_duration_sec"}
+                    and isinstance(value, int)
+                    and not isinstance(value, bool)
+                    and value >= 0
+                ):
                     msg[key] = value
                 elif key == "activity_events" and isinstance(value, list):
                     msg[key] = [
@@ -697,6 +718,7 @@ class UserStore:
                 # enclave expands them into decrypted memory context on read.
                 "quoted_memory_ids",
                 "image_mime",
+                "image_byte_count",
                 # Dedicated visual route proven at image-send time. Runtime V2
                 # resolves this exact caller-owned route so a concurrent Settings
                 # change cannot reroute pixels or expose them to the main model.
@@ -713,6 +735,11 @@ class UserStore:
                 "include_reasoning",
                 "voice_call_id",
                 "voice_turn_id",
+                "voice_logical_turn_id",
+                "voice_turn_status",
+                "voice_superseded_by",
+                "voice_turn_count",
+                "voice_duration_sec",
                 "caption_v",
                 "caption_id",
                 "caption_body_ct",
@@ -761,13 +788,28 @@ class UserStore:
                 "turn_failure_model",
                 "turn_failure_provider",
                 "terminal_failure_job_id",
+                "reply_part_index",
+                "reply_part_count",
             ):
                 value = extra.get(key)
                 if isinstance(value, str) and value.strip():
                     msg[key] = value.strip()
                 elif isinstance(value, bool):
                     msg[key] = value
-                elif key == "file_byte_count" and isinstance(value, int) and value > 0:
+                elif key in {
+                    "file_byte_count",
+                    "image_byte_count",
+                    "reply_part_count",
+                } and isinstance(value, int) and value > 0:
+                    msg[key] = value
+                elif key == "reply_part_index" and isinstance(value, int) and value >= 0:
+                    msg[key] = value
+                elif (
+                    key in {"voice_turn_count", "voice_duration_sec"}
+                    and isinstance(value, int)
+                    and not isinstance(value, bool)
+                    and value >= 0
+                ):
                     msg[key] = value
                 elif key == "activity_events" and isinstance(value, list):
                     msg[key] = [

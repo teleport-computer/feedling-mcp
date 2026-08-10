@@ -133,6 +133,14 @@ def test_pi_runtime_metadata_reads_exact_model_modalities(tmp_path, monkeypatch)
     }
 
 
+def test_consumer_advertises_native_image_generation_only_when_enabled(monkeypatch):
+    monkeypatch.delenv("FEEDLING_AGENT_IMAGE_GENERATION", raising=False)
+    assert crc.AGENT_IMAGE_GENERATION_CAPABILITY not in crc._consumer_capabilities()
+
+    monkeypatch.setenv("FEEDLING_AGENT_IMAGE_GENERATION", "true")
+    assert crc.AGENT_IMAGE_GENERATION_CAPABILITY in crc._consumer_capabilities()
+
+
 def test_runtime_model_identity_uses_configured_fact(monkeypatch):
     monkeypatch.setattr(
         crc,
@@ -341,6 +349,59 @@ def test_process_messages_prompt_does_not_request_custom_thinking_summary(monkey
     assert '"thinking_summary"' not in captured["message"]
     assert "display-safe" not in captured["message"]
     assert "hidden chain-of-thought" not in captured["message"]
+
+
+@pytest.mark.parametrize(
+    ("runtime_metadata", "expects_instruction"),
+    [
+        ({"provider": "openrouter", "model": "claude-fable-5"}, False),
+        ({"provider": "openrouter", "model": "anthropic/claude-fable-5"}, False),
+        ({"provider": "openrouter", "model": "claude-fable-50"}, True),
+        ({"provider": "openrouter", "model": "foo-claude-fable-5-bar"}, True),
+        ({}, True),
+    ],
+)
+def test_v1_foreground_self_thinking_skips_only_exact_fable(
+    monkeypatch, runtime_metadata, expects_instruction
+):
+    """Catch V1 forcing Fable to expose reasoning while preserving near-matches."""
+    crc._seen_ids.clear()
+    crc._seen_ids_order.clear()
+    monkeypatch.delenv("FEEDLING_V2_SELF_THINKING", raising=False)
+    runtime_metadata = {**runtime_metadata, "input_modalities": ["text"]}
+    monkeypatch.setattr(
+        crc,
+        "AGENT_RUNTIME_METADATA",
+        runtime_metadata,
+    )
+    msg = {
+        "id": f"user-msg-fable-{runtime_metadata.get('model', 'legacy')}",
+        "role": "user",
+        "content": "hello",
+        "ts": 1112.75,
+    }
+    captured = {}
+
+    def fake_call(
+        message,
+        images=None,
+        image_paths=None,
+        trace_id="",
+        lane="background",
+        stream_update=None,
+    ):
+        captured["message"] = message
+        return {"messages": ["ok"]}
+
+    with patch.object(crc, "call_agent", side_effect=fake_call), \
+         patch.object(crc, "post_reply", return_value={"id": "reply-msg-fable"}):
+        result_ts = crc._process_messages([msg])
+
+    from core import self_thinking
+
+    assert result_ts == pytest.approx(1112.75)
+    instruction_present = self_thinking.INSTRUCTION.strip() in captured["message"]
+    assert instruction_present is expects_instruction
 
 
 def test_process_messages_v2_drops_needs_background_without_ack(monkeypatch):
@@ -1263,7 +1324,8 @@ def test_agent_failure_posts_visible_fallback_by_default(monkeypatch):
 
     # Original contract, unweakened: the user-visible fallback must still go out.
     assert len(fallback_calls) == 1
-    assert fallback_calls[0].args[0] == crc.FALLBACK_REPLY
+    # 兜底语言跟用户走(2026-08-10):"msg1" 是英文,所以拿到英文那句。
+    assert fallback_calls[0].args[0] == crc._fallback_reply_for("msg1")
     assert fallback_calls[0].kwargs["reply_to_message_id"] == "agent-failure-1"
 
     # New contract: a suppressed-push system notice with the technical reason.
@@ -1431,7 +1493,8 @@ def test_agent_failure_fallback_posts_every_turn_banner_windowed(monkeypatch):
     fallback_calls = [c for c in mock_post.call_args_list if c.kwargs.get("role") != "system"]
     notice_calls = [c for c in mock_post.call_args_list if c.kwargs.get("role") == "system"]
 
-    assert [c.args[0] for c in fallback_calls] == [crc.FALLBACK_REPLY, crc.FALLBACK_REPLY]
+    en = crc._fallback_reply_for("msg1")
+    assert [c.args[0] for c in fallback_calls] == [en, en]
 
     assert len(notice_calls) == 1
     c = notice_calls[0]
@@ -2419,6 +2482,91 @@ def test_prepare_claude_cli_injects_stored_resume(monkeypatch):
     assert stdin_msg == "hello"
 
 
+# --------------------------------------------------------------------------- #
+# Isolated-session driver matrix (resident report 2026-08-05). These pin the
+# PRODUCT (the argv actually handed to the driver), not the intent flag: the
+# earlier tests asserted only that isolated_session=True was passed to a mocked
+# call_agent, which let a claude command that could never run ship green.
+# claude's --print --resume accepts only a real UUID it generated itself (or an
+# existing session title), so the consumer-minted bounded label must never be
+# fed back to claude — a bare `claude --print` IS the fresh session. pi and
+# Hermes accept arbitrary ids and keep using the minted override.
+# --------------------------------------------------------------------------- #
+
+def _fail_session_store_reads(monkeypatch):
+    def _boom():  # isolated turns must never touch the shared session store
+        raise AssertionError("isolated turn read the shared session store")
+    monkeypatch.setattr(crc, "_load_agent_session_id", _boom)
+    monkeypatch.setattr(
+        crc, "_save_agent_session_id",
+        lambda sid: (_ for _ in ()).throw(
+            AssertionError("isolated turn wrote the shared session store")),
+    )
+
+
+def test_prepare_claude_cli_isolated_session_gets_no_session_flags(monkeypatch):
+    monkeypatch.setattr(crc, "AGENT_CLI_CMD", 'claude -p "{message}"')
+    monkeypatch.setattr(crc, "FOREGROUND_CHAT_CONTEXT_MODE", "off")
+    monkeypatch.setattr(crc, "_resolve_cli_executable", lambda cmd: cmd)
+    _fail_session_store_reads(monkeypatch)
+
+    cmd, stdin_msg = crc._prepare_cli_command(
+        "hello", session_id_override=crc._new_agent_session_id()
+    )
+
+    assert "--resume" not in cmd          # the exact first-turn crash
+    assert "--session-id" not in cmd      # bare --print = fresh session
+    assert "--print" in cmd or "-p" in cmd
+    assert stdin_msg == "hello"
+
+
+def test_prepare_claude_cli_isolated_session_template_session_id_becomes_uuid(monkeypatch):
+    import uuid as _uuid
+    monkeypatch.setattr(
+        crc, "AGENT_CLI_CMD",
+        'claude -p --session-id feedling-io-fixed "{message}"',
+    )
+    monkeypatch.setattr(crc, "FOREGROUND_CHAT_CONTEXT_MODE", "off")
+    monkeypatch.setattr(crc, "_resolve_cli_executable", lambda cmd: cmd)
+    _fail_session_store_reads(monkeypatch)
+
+    cmd, _ = crc._prepare_cli_command(
+        "hello", session_id_override=crc._new_agent_session_id()
+    )
+
+    assert "--resume" not in cmd
+    sid_value = crc._cli_flag_value(cmd, "--session-id")
+    _uuid.UUID(sid_value)  # claude rejects anything that isn't a real UUID
+
+
+def test_prepare_pi_cli_isolated_session_keeps_minted_override(monkeypatch):
+    monkeypatch.setattr(crc, "AGENT_CLI_CMD", 'pi --mode json "{message}"')
+    monkeypatch.setattr(crc, "_resolve_cli_executable", lambda cmd: cmd)
+    _fail_session_store_reads(monkeypatch)
+
+    override = crc._new_agent_session_id()
+    cmd, _ = crc._prepare_cli_command("hello", session_id_override=override)
+
+    # pi --session-id is create-if-missing: the minted label is valid there,
+    # and it must NOT be persisted as the shared session (store write raises).
+    assert crc._cli_flag_value(cmd, "--session-id") == override
+    assert "--resume" not in cmd
+
+
+def test_prepare_claude_cli_shared_session_still_resumes(monkeypatch):
+    # Regression net for the fix: the SHARED path (no override) keeps claude's
+    # stored-UUID --resume continuity byte-identical to before.
+    sid = "123e4567-e89b-12d3-a456-426614174000"
+    monkeypatch.setattr(crc, "AGENT_CLI_CMD", 'claude -p "{message}"')
+    monkeypatch.setattr(crc, "FOREGROUND_CHAT_CONTEXT_MODE", "off")
+    monkeypatch.setattr(crc, "_load_agent_session_id", lambda: sid)
+    monkeypatch.setattr(crc, "_resolve_cli_executable", lambda cmd: cmd)
+
+    cmd, _ = crc._prepare_cli_command("hello")
+
+    assert cmd[:3] == ["claude", "--resume", sid]
+
+
 def test_warn_if_hermes_cli_may_drift_logs_profile_and_turns(monkeypatch, caplog):
     monkeypatch.setattr(crc, "AGENT_MODE", "cli")
     monkeypatch.setattr(
@@ -3282,8 +3430,6 @@ def _install_dream_job_harness(monkeypatch, agent_reply):
 
     def _agent(prompt, *_args, **_kwargs):
         captured["prompts"].append(prompt)
-        if "独立的记忆整理审查员" in prompt:
-            return '{"decision":"yes","reason":"来源卡属于同一条连续线索"}'
         return agent_reply
 
     def _fail_post(*_args, **_kwargs):
@@ -3360,57 +3506,81 @@ def _dream_final_status(captured):
     return captured["statuses"][-1]
 
 
-def test_v1_dream_semantic_review_is_isolated_and_rejects_no(monkeypatch):
-    calls = []
-
-    def _agent(prompt, **kwargs):
-        calls.append((prompt, kwargs))
-        return '{"decision":"no","reason":"只是同属健康主题"}'
-
-    monkeypatch.setattr(crc, "call_agent", _agent)
-    reviewed = crc._dream_review_consolidations(
-        [{
-            "op": "merge",
-            "card_ids": ["cycling", "sleep"],
-            "rationale": "都和健康有关",
-            "result": {"summary": "健康", "content": "骑行与失眠。"},
-        }],
-        card_map={
-            "cycling": {"id": "cycling", "content": "周末沿江骑行。"},
-            "sleep": {"id": "sleep", "content": "失眠时听白噪音。"},
+def _patch_dream_envelope(monkeypatch):
+    monkeypatch.setattr(crc, "_ENCRYPTION_AVAILABLE", True)
+    monkeypatch.setattr(crc, "_refresh_whoami_for_encrypted_reply", lambda: True)
+    monkeypatch.setattr(
+        crc,
+        "_whoami_cache",
+        {"user_id": "usr_dream", "user_pk": b"u" * 32, "enclave_pk": b"e" * 32},
+    )
+    monkeypatch.setattr(
+        crc,
+        "_build_envelope",
+        lambda **kwargs: {
+            "v": 1, "id": "env", "visibility": kwargs["visibility"],
+            "owner_user_id": kwargs["owner_user_id"],
+            "body_ct": "ct", "nonce": "n", "K_user": "ku", "K_enclave": "ke",
         },
-        job_id="dream-review-v1",
     )
 
-    assert reviewed == []
-    assert calls[0][1]["isolated_session"] is True
-    assert calls[0][1]["raw_text"] is True
 
-
-def test_v1_dream_semantic_review_failure_drops_one_and_continues(monkeypatch):
-    responses = iter([
-        RuntimeError("provider timeout"),
-        '{"decision":"yes","reason":"同一京都计划的演进"}',
-    ])
-
-    def _agent(*_args, **_kwargs):
-        response = next(responses)
-        if isinstance(response, Exception):
-            raise response
-        return response
-
-    monkeypatch.setattr(crc, "call_agent", _agent)
-    reviewed = crc._dream_review_consolidations(
-        [
-            {"op": "merge", "card_ids": ["a", "b"], "rationale": "第一条", "result": {}},
-            {"op": "merge", "card_ids": ["c", "d"], "rationale": "第二条", "result": {}},
-        ],
-        card_map={key: {"id": key, "content": key} for key in ("a", "b", "c", "d")},
-        job_id="dream-review-v1-continue",
+def test_v1_dream_actions_reject_unknown_and_duplicate_targets(monkeypatch):
+    _patch_dream_envelope(monkeypatch)
+    """2026-08-05 阀门重构:语义审查员已拆;结构判据(目标真实存在、不重复退休)
+    落进 _dream_actions_from_consolidations,与 V2 mapper 同一套。"""
+    card_map = {
+        "m1": {"id": "m1", "content": "旧卡一"},
+        "m2": {"id": "m2", "content": "旧卡二"},
+        "m3": {"id": "m3", "content": "旧卡三"},
+    }
+    rows = [
+        {"op": "merge", "card_ids": ["m1", "m2"], "rationale": "同一线索",
+         "result": {"summary": "合并", "content": "合并正文。"}},
+        {"op": "merge", "card_ids": ["m2", "m3"], "rationale": "重复退休 m2",
+         "result": {"summary": "合并", "content": "合并正文。"}},
+        {"op": "merge", "card_ids": ["missing", "m3"], "rationale": "目标不存在",
+         "result": {"summary": "合并", "content": "合并正文。"}},
+    ]
+    actions, *_rest = crc._dream_actions_from_consolidations(
+        rows, card_map=card_map, occurred_at="2026-08-05T00:00:00Z",
     )
+    assert [a["supersedes"] for a in actions] == [["m1", "m2"]]
+    assert "dream_review_reason" not in actions[0]
 
-    assert [row["card_ids"] for row in reviewed] == [["c", "d"]]
-    assert reviewed[0]["_review_reason"] == "同一京都计划的演进"
+
+def test_v1_dream_one_to_one_rewrite_is_not_content_judged(monkeypatch):
+    _patch_dream_envelope(monkeypatch)
+    # 15% 增量栅栏已拆:更短但更准的 1:1 改写是合法整理。
+    card_map = {"m1": {"id": "m1", "content": "很长很长的旧卡正文,包含大量细节描述。" * 3}}
+    actions, *_rest = crc._dream_actions_from_consolidations(
+        [{"op": "supersede", "card_ids": ["m1"], "rationale": "改写得更准",
+          "result": {"summary": "精炼摘要", "content": "更短但更准。"}}],
+        card_map=card_map, occurred_at="2026-08-05T00:00:00Z",
+    )
+    assert len(actions) == 1
+
+
+def test_v1_dream_blast_radius_fuse_trips_on_garden_scale_rewrite(monkeypatch):
+    _patch_dream_envelope(monkeypatch)
+    card_map = {f"m{i}": {"id": f"m{i}", "content": f"卡{i}"} for i in range(15)}
+    rows = [
+        {"op": "merge", "card_ids": [f"m{i}", f"m{i + 1}"], "rationale": "同一线索",
+         "result": {"summary": "合并", "content": "合并正文。"}}
+        for i in range(0, 12, 2)
+    ] + [
+        {"op": "supersede", "card_ids": ["m12"], "rationale": "更新",
+         "result": {"summary": "更新", "content": "更新正文。"}},
+    ]
+    with pytest.raises(ValueError, match="dream_blast_radius_exceeded"):
+        crc._dream_actions_from_consolidations(
+            rows, card_map=card_map, occurred_at="2026-08-05T00:00:00Z",
+        )
+    # 13/15=87%>80% 且 ≥10 张 → 熔断;退休 4 张(<10 下限)则永不熔断
+    actions, *_rest = crc._dream_actions_from_consolidations(
+        rows[:2], card_map=card_map, occurred_at="2026-08-05T00:00:00Z",
+    )
+    assert len(actions) == 2
 
 
 def test_capture_get_json_disables_tls_verification_for_enclave_only(monkeypatch):
@@ -3585,7 +3755,10 @@ def test_capture_job_add_card_writes_envelope_without_chat_or_delivery(monkeypat
     assert captured["envelope_plaintexts"] == [{
         "summary": "Seven had a stressful meeting.",
         "content": "Seven said the meeting was stressful and mentioned elevated heart rate.",
-        "bucket": "work",
+        # 模型给的是小写 "work";1c8293cd 起大小写漂移会收敛到通用桶的规范形式,
+        # 所以落卡是 "Work"。上面 prompt 里的 "buckets: work" 是【输入】(用户现有
+        # 的桶),不归一化,保持原样。
+        "bucket": "Work",
         "threads": ["meeting"],
     }]
     assert captured["envelope_kwargs"][0]["visibility"] == "shared"
@@ -4290,6 +4463,202 @@ def test_foreground_degenerate_with_fallback_disabled_posts_nothing(monkeypatch)
     assert result_ts == pytest.approx(5555.0)
 
 
+# ---------------------------------------------------------------------------
+# Foreground "thinking-only" guard (2026-08-10).
+#
+# Sibling of the degenerate-fragment guard above, and the SAME product rule: a
+# user is waiting, so silence is not an outcome. The hole this closes sits one
+# notch earlier — not "the reply was a bare 。" but "there was no reply at all".
+# A heavy-reasoning model (usr_0724, MiniMax-M3 over an openai_compatible relay)
+# burned whole turns inside the reasoning channel and emitted no assistant text.
+# The extractors deliberately let that through — thinking_summary / tool_calls
+# mark a turn "valid" because the WAKE lanes are allowed to think and stay quiet
+# (runtime-v2 2f187175 made that explicit) — and the foreground lane inherited
+# the pass. Downstream, `replies == []` meant the degenerate guard never fired
+# (it is nested under `if degenerate:`) and `if replies and not posted_any`
+# skipped the keep-checkpoint retry, so the message was marked answered and lost
+# FOREVER. 2026-08-08: she sent 15+ messages over five hours and got nothing —
+# no reply, no error, no banner. Foreground now retries with an explicit nudge,
+# then falls back out loud.
+# ---------------------------------------------------------------------------
+
+def _thinking_only(text="她说她想我了，我得回应一下"):
+    """Production shape of the bug: reasoning present, zero visible messages."""
+    return {"messages": [], "provider_reasoning": text}
+
+
+def test_thinking_only_turn_is_actually_empty():
+    """Guard the fixture itself: if this ever parsed to a message, every test
+    below would pass for the wrong reason."""
+    turn = crc._split_agent_turn(_thinking_only())
+    assert turn.messages == [] and turn.actions == []
+    assert turn.thinking_summary  # …but the model DID think
+
+
+def test_foreground_thinking_only_retries_and_recovers(monkeypatch):
+    """THE regression: think-only must not end the turn. Retry, and the user
+    gets the real reply — never the fallback line."""
+    crc._seen_ids.clear()
+    crc._seen_ids_order.clear()
+    calls = []
+
+    def fake_call_agent(message, **kwargs):
+        calls.append(message)
+        if len(calls) == 1:
+            return _thinking_only()
+        return {"messages": ["在呢在呢，刚走神了"]}
+
+    monkeypatch.setattr(crc, "call_agent", fake_call_agent)
+    with patch.object(crc, "post_reply", return_value={"id": "r1"}) as mock_post:
+        crc._process_messages(
+            [{"id": "u-think1", "role": "user", "content": "怎么还不回我", "ts": 100.0}]
+        )
+
+    posted = [c.args[0] for c in mock_post.call_args_list]
+    assert "在呢在呢，刚走神了" in posted
+    assert crc._empty_reply_fallback("怎么还不回我") not in posted, (
+        "a recovered turn must not also look like a failure"
+    )
+    assert len(calls) == 2, "exactly one retry was needed"
+    # The retry carries an explicit nudge — a bare re-call usually re-hits the
+    # same reasoning-only shape.
+    assert "没有输出任何给对方看到的文字" in calls[1]
+    assert "怎么还不回我" in calls[1], "retry must re-send the user's actual message"
+
+
+def test_empty_reply_retry_prompt_follows_the_user_language():
+    """The nudge rides along on a companion turn — an English-speaking user must
+    not get a Chinese instruction bleeding into their reply."""
+    assert "说出来" in crc._empty_reply_retry_prompt("在吗")
+    assert "say it out loud" in crc._empty_reply_retry_prompt("you there?")
+
+
+def test_foreground_thinking_only_exhausts_retries_then_falls_back(monkeypatch):
+    """Model never speaks → user still gets a bubble, blamed on the provider."""
+    crc._seen_ids.clear()
+    crc._seen_ids_order.clear()
+    calls = []
+
+    def fake_call_agent(message, **kwargs):
+        calls.append(message)
+        return _thinking_only()
+
+    monkeypatch.setattr(crc, "call_agent", fake_call_agent)
+    with (
+        patch.object(crc, "post_reply", return_value={"id": "r1"}) as mock_post,
+        patch.object(crc, "_emit_debug_trace") as mock_trace,
+    ):
+        result_ts = crc._process_messages(
+            [{"id": "u-think2", "role": "user", "content": "怎么还不回消息?", "ts": 200.0}]
+        )
+
+    posted = [c.args[0] for c in mock_post.call_args_list]
+    assert posted, "SILENCE — the exact bug this guard exists to prevent"
+    assert crc._empty_reply_fallback("怎么还不回消息?") in posted
+    assert len(calls) == 1 + crc.FOREGROUND_EMPTY_REPLY_RETRIES
+    # 归因:模型压根没给正文 = provider 的空回复,不是我们解析坏了。
+    kwargs = mock_post.call_args_list[0].kwargs
+    assert kwargs["turn_failure_error_class"] == "provider_empty_reply"
+    # Turn is resolved (a fallback went out), so the checkpoint may advance.
+    assert result_ts == pytest.approx(200.0)
+    # …and it must be VISIBLE on the dashboard. The agent.reply row for this
+    # turn is status=ok (it parsed fine — into zero messages) and stalled_turns
+    # misses it entirely, so without this trace the class stays invisible and
+    # we cannot tell how often it has been happening. (codex4 的恢复分支补的
+    # 这条断言,合过来。)
+    exhausted = [
+        call for call in mock_trace.call_args_list
+        if len(call.args) > 1 and call.args[1] == "agent.reply.empty_exhausted"
+    ]
+    assert len(exhausted) == 1
+    assert exhausted[0].kwargs["status"] == "error"
+    assert exhausted[0].kwargs["detail"]["max_attempts"] == (
+        crc.FOREGROUND_EMPTY_REPLY_RETRIES
+    )
+
+
+def test_empty_reply_fallback_says_what_actually_happened():
+    """Seven 2026-08-10: 「我这会儿有点慢」leaves the user with no idea what
+    happened. This class is the one case where we DO know — the model received
+    it and produced reasoning, the visible text just never came — so say that.
+    Deliberately NOT the generic line, which also covers 401/429/403 where the
+    model never ran and "I started thinking" would be a lie."""
+    zh = crc._empty_reply_fallback("在吗")
+    assert zh != crc.FALLBACK_REPLY, "must not reuse the generic failure line"
+    assert "收到你的消息" in zh and "断了" in zh
+    for blame_word in ("系统", "网络", "服务"):
+        assert blame_word not in zh, (
+            f"{blame_word!r} reads as 'our platform is broken' — we do not "
+            "actually know which hop cut out"
+        )
+    en = crc._empty_reply_fallback("you there?")
+    assert "got your message" in en and "cut off" in en
+
+
+def test_foreground_normal_reply_never_triggers_a_retry(monkeypatch):
+    """The guard must be invisible on the happy path — one call, one reply."""
+    crc._seen_ids.clear()
+    crc._seen_ids_order.clear()
+    calls = []
+
+    def fake_call_agent(message, **kwargs):
+        calls.append(message)
+        return {"messages": ["晚安，睡吧"]}
+
+    monkeypatch.setattr(crc, "call_agent", fake_call_agent)
+    with patch.object(crc, "post_reply", return_value={"id": "r1"}) as mock_post:
+        crc._process_messages(
+            [{"id": "u-ok", "role": "user", "content": "晚安", "ts": 300.0}]
+        )
+
+    assert len(calls) == 1
+    assert [c.args[0] for c in mock_post.call_args_list] == ["晚安，睡吧"]
+
+
+def test_foreground_retry_that_raises_still_falls_back_not_silent(monkeypatch):
+    """If the retry call itself explodes, the user still gets a line. A more
+    precise post-mortem is worth nothing to someone staring at silence."""
+    crc._seen_ids.clear()
+    crc._seen_ids_order.clear()
+    calls = []
+
+    def fake_call_agent(message, **kwargs):
+        calls.append(message)
+        if len(calls) == 1:
+            return _thinking_only()
+        raise RuntimeError("relay died mid-retry")
+
+    monkeypatch.setattr(crc, "call_agent", fake_call_agent)
+    with patch.object(crc, "post_reply", return_value={"id": "r1"}) as mock_post:
+        crc._process_messages(
+            [{"id": "u-think3", "role": "user", "content": "在吗", "ts": 400.0}]
+        )
+
+    posted = [c.args[0] for c in mock_post.call_args_list]
+    assert posted, "retry blowing up must not turn into silence"
+
+
+def test_generic_fallback_follows_the_user_language():
+    """英文自建用户此前失败一次就收到一句中文(2026-08-10 顺手修)。"""
+    assert crc._fallback_reply_for("晚安") == crc.FALLBACK_REPLY
+    assert crc._fallback_reply_for("good night") == crc.FALLBACK_REPLY_EN
+
+
+@pytest.mark.parametrize("anchor", ["", None, "😭😭", "123", "？？？"])
+def test_no_language_signal_keeps_the_incumbent_chinese(anchor):
+    """没有语言信号时**不许翻转默认**。
+
+    判据是「有没有拉丁字母词」,不是「有没有中文」。第一版写反了(没中文就发
+    英文),`_turn_failure_reply_text(notice)` 这个不带锚点的老签名当场翻成英文,
+    在 CI 上打红 test_consumer_error_classify 三条 —— 那三条测的是通用失败气泡,
+    根本不该因为一个「顺手加双语」的改动而变。
+    """
+    assert crc._fallback_reply_for(anchor) == crc.FALLBACK_REPLY
+    assert crc._empty_reply_fallback(anchor) == crc._empty_reply_fallback("在吗")
+    # 不带锚点的老调用方(生产里确实存在)必须拿到原来那句。
+    assert crc._turn_failure_reply_text(None) == crc.FALLBACK_REPLY
+
+
 def _degenerate_test_harness(monkeypatch, agent_result):
     crc._seen_ids.clear()
     crc._seen_ids_order.clear()
@@ -4525,6 +4894,68 @@ def test_capture_transcript_labels_use_real_names():
     assert "小雨: 我在看攻略" in text
     assert "小舟: 山路小心" in text
     assert "user:" not in text and "agent:" not in text
+
+
+def test_resident_context_omits_voice_noise_but_keeps_the_call_record():
+    history = [
+        {"id": "typed", "role": "user", "source": "chat", "content": "..."},
+        {
+            "id": "noise",
+            "role": "user",
+            "source": "chat",
+            "voice_call_id": "vcall_old",
+            "content": "……",
+        },
+        {
+            "id": "noise-reply",
+            "role": "openclaw",
+            "source": "chat",
+            "reply_to_message_id": "noise",
+            "content": "又是点点点",
+        },
+        {
+            "id": "card",
+            "role": "openclaw",
+            "source": "voice_call_transcript",
+            "voice_call_id": "vcall_old",
+            "content": "- 对方: 你好\n- 我: 你好呀",
+        },
+        {"id": "real", "role": "user", "source": "chat", "content": "在成都"},
+    ]
+
+    cleaned = crc._clean_messages_for_proactive_context(history)
+
+    # 噪音行与挂在它下面的回复照旧挡住;**通话卡要留下**。
+    # 这条原本断言卡也被丢掉。2026-08-08 定案:整个删掉的代价是挂断之后伴侣在
+    # 普通聊天里完全不知道刚才通过话 —— 用户接着打字说「刚才电话里说的那个」,
+    # 模型没有任何上下文。卡改成换身份保留(不再冒充 assistant 说过的话)。
+    assert [message["id"] for message in cleaned] == ["typed", "card", "real"]
+    card_row = next(m for m in cleaned if m["id"] == "card")
+    assert card_row["role"] == crc._VOICE_CALL_RECORD_ROLE
+    assert "不是你说过的话" in str(card_row.get("content") or "")
+
+
+def test_resident_capture_expands_full_archive_not_card_preview(monkeypatch):
+    monkeypatch.setattr(
+        crc,
+        "_capture_voice_transcript_text",
+        lambda _call_id: "- 对方: 全文第一句\n- 我: 全文第二句",
+    )
+    card = {
+        "id": "card",
+        "role": "openclaw",
+        "source": "voice_call_transcript",
+        "voice_call_id": "vcall_full",
+        "voice_turn_count": 2,
+        "content": "CARD PREVIEW ONLY",
+        "ts": 1000.0,
+    }
+
+    text = crc._capture_window_text([card], user_label="小雨", agent_label="小舟")
+
+    assert "CARD PREVIEW ONLY" not in text
+    assert "全文第一句" in text and "全文第二句" in text
+    assert "共 2 轮" in text
 
 
 def test_capture_transcript_labels_reject_reserved_placeholder_names():
@@ -5832,6 +6263,115 @@ def test_claude_turn_from_stream_empty_when_no_success_result():
     raw = json.dumps({"type": "assistant", "message": {"content": [
         {"type": "text", "text": "partial"}]}})
     assert crc._claude_turn_from_stream(raw) == ("", "")
+
+
+def test_claude_actual_models_uses_only_structured_stream_metadata():
+    raw = "\n".join([
+        json.dumps({
+            "type": "assistant",
+            "message": {
+                "model": "claude-fable-5",
+                "content": [{"type": "text", "text": "我是 Opus 4.8"}],
+            },
+        }),
+        json.dumps({
+            "type": "result",
+            "subtype": "success",
+            "result": "I am claude-sonnet-4-6",
+            "modelUsage": {
+                "claude-fable-5": {"inputTokens": 1},
+                "claude-haiku-4-5": {"inputTokens": 1},
+            },
+        }),
+    ])
+
+    assert crc._claude_actual_models_from_stream(raw) == {
+        "claude-fable-5",
+        "claude-haiku-4-5",
+    }
+
+
+@pytest.mark.parametrize(
+    ("configured", "actual", "matches"),
+    [
+        ("fable", {"claude-fable-5"}, True),
+        ("opus", {"claude-opus-4-8"}, True),
+        ("sonnet", {"claude-sonnet-4-6"}, True),
+        ("haiku", {"claude-haiku-4-5"}, True),
+        ("claude-fable-5", {"claude-fable-5"}, True),
+        ("claude-fable-5", {"claude-opus-4-8"}, True),
+        ("fable", {"claude-opus-4-8"}, True),
+        ("claude-sonnet-4-6", {"claude-sonnet-4-6-20260801"}, True),
+        ("claude-fable-5", {"deepseek-chat"}, False),
+        ("claude-fable-5", {"claude-opus-4-8", "deepseek-chat"}, False),
+    ],
+)
+def test_claude_configured_model_matches_structured_actual(configured, actual, matches):
+    assert crc._claude_configured_model_matches(configured, actual) is matches
+
+
+def test_call_agent_cli_allows_claude_family_model_fallback(monkeypatch, caplog):
+    monkeypatch.setattr(crc, "AGENT_CLI_CMD", "claude --model claude-fable-5 -p {message}")
+    monkeypatch.setattr(crc, "AGENT_RUNTIME_METADATA", {
+        "provider": "anthropic",
+        "model": "claude-fable-5",
+        "input_modalities": ["text"],
+    })
+    monkeypatch.setattr(crc, "_resolve_cli_executable", lambda cmd: cmd)
+    monkeypatch.setattr(crc, "_load_agent_session_id", lambda: "")
+    cleared = []
+    monkeypatch.setattr(crc, "_clear_agent_session_id", cleared.append)
+
+    class _R:
+        returncode = 0
+        stdout = json.dumps({
+            "type": "result",
+            "subtype": "success",
+            "session_id": "wrong-model-session",
+            "result": "我记得你喜欢蓝色。",
+            "modelUsage": {"claude-opus-4-8": {"inputTokens": 42}},
+        })
+        stderr = ""
+
+    monkeypatch.setattr(crc.subprocess, "run", lambda *a, **kw: _R())
+
+    assert crc.call_agent_cli("请调用工具读取我喜欢的颜色") == "我记得你喜欢蓝色。"
+    assert cleared == []
+    assert "claude family fallback allowed" in caplog.text
+    assert "configured=claude-fable-5 actual=claude-opus-4-8" in caplog.text
+
+
+def test_call_agent_cli_allows_claude_success_without_model_metadata(monkeypatch, caplog):
+    monkeypatch.setattr(crc, "AGENT_CLI_CMD", "claude --model claude-fable-5 -p {message}")
+    monkeypatch.setattr(crc, "AGENT_RUNTIME_METADATA", {
+        "provider": "anthropic",
+        "model": "claude-fable-5",
+        "input_modalities": ["text"],
+    })
+    monkeypatch.setattr(crc, "_resolve_cli_executable", lambda cmd: cmd)
+    monkeypatch.setattr(crc, "_load_agent_session_id", lambda: "")
+
+    class _R:
+        returncode = 0
+        stdout = json.dumps({
+            "type": "result", "subtype": "success", "result": "蓝色。",
+        })
+        stderr = ""
+
+    monkeypatch.setattr(crc.subprocess, "run", lambda *a, **kw: _R())
+
+    assert crc.call_agent_cli("我喜欢的颜色是什么？") == "蓝色。"
+    assert "no structured actual-model metadata" in caplog.text
+
+
+def test_model_mismatch_is_a_system_runtime_error():
+    notice = crc.classify_agent_error(RuntimeError(
+        "model_mismatch: configured=claude-fable-5 actual=claude-opus-4-8"
+    ))
+
+    assert notice.error_class == "model_mismatch"
+    assert notice.blame == "system"
+    assert notice.user_text == "当前运行时没有成功加载所选模型，请重新选择模型或稍后重试。"
 
 
 def test_call_agent_cli_claude_tool_turn_delivers_only_final_answer(monkeypatch):
@@ -8095,6 +8635,57 @@ def test_call_agent_cli_heals_stale_claude_resume_once(monkeypatch, tmp_path):
     assert len(runs) == 2
     # the fresh session from the retry is persisted for the NEXT turn's --resume
     assert crc._load_agent_session_id() == "aaaaaaaa-bbbb-cccc-dddd-eeeeffff0000"
+
+
+def test_mcp_postflight_follows_the_retry_not_the_discarded_first_attempt(
+    monkeypatch, tmp_path,
+):
+    """stale-resume 自愈后,MCP 注册结果必须来自**真正回答的那个进程**。
+
+    这条埋点的整个价值是「模型这一轮到底看得到哪几台服务器」。重试会新起进程
+    重做 MCP 握手,并且整个**替换** result 而不是追加 —— 所以:
+      · 首次若在打出 init 之前就死了(下面就是这个形态),只记首次 = 这一轮
+        完全没有观测,而它明明成功回答了;
+      · 首次若打出过 init,记的也是一个输出已经被丢弃的进程。
+    两种都让硬证据失真。函数级测试盖不住这个:它把两个 init 拼进同一段 stdout,
+    而生产里第二次是**替换**(codex 审出)。
+    """
+    _stale_resume_env(monkeypatch, tmp_path, "usr_stale_mcp")
+    init = json.dumps({
+        "type": "system", "subtype": "init", "tools": ["Bash"],
+        "mcp_servers": [{"name": "tavily", "status": "connected"}],
+    })
+    runs, events = [], []
+
+    def fake_run(cmd, **kw):
+        runs.append(list(cmd))
+        if len(runs) == 1:
+            # dies during handshake — no init event at all
+            return subprocess.CompletedProcess(
+                cmd, 1, stdout="",
+                stderr=f"No conversation found with session ID: {_STALE_SID}",
+            )
+        return subprocess.CompletedProcess(
+            cmd, 0, stdout=init + "\n" + _CLAUDE_OK_TURN, stderr="")
+
+    monkeypatch.setattr(crc.subprocess, "run", fake_run)
+    monkeypatch.setattr(crc, "_user_mcp_applied",
+                        {"servers": [{"name": "tavily", "enabled": True}]})
+    monkeypatch.setattr(crc, "_emit_debug_trace",
+                        lambda ss, ty, **kw: events.append((ty, kw)))
+
+    # lane 必须显式给 chat:MCP 只在 chat 通道下发,默认的 background 通道
+    # 埋点会正确早退(第一版这里漏了,测出来是 0 条 —— 代码没错,是测试写错了)。
+    assert crc.call_agent_cli("hello", lane="chat") == "ok"
+    assert len(runs) == 2
+
+    registered = [kw for ty, kw in events if ty == "mcp.surface.registered"]
+    assert len(registered) == 1, (
+        "首次没有 init 事件时不该发,重试有了才发 —— 得到 "
+        f"{[kw['detail'] for kw in registered]}")
+    assert registered[0]["detail"]["registered"] == ["tavily"]
+    assert registered[0]["detail"]["attempt"] == "stale_resume_retry"
+    assert registered[0]["status"] == "ok"
 
 
 def test_call_agent_cli_stale_resume_retry_fails_raises_no_loop(monkeypatch, tmp_path):

@@ -95,13 +95,21 @@ def test_upsert_overwrites_same_name(store, monkeypatch):
 
 
 def test_limits(store, monkeypatch):
+    """加到上限为止都能加,第 N+1 台被拒。
+
+    ⚠️ 数量**从常量取**,不写死:MAX_SERVERS 2026-08-10 从 10 提到 30
+    (它挡的"服务器数"和真实成本无关,真正的闸在工具层),写死 10 的话
+    调常量时这条会红,而它本该只关心"到上限就拒"这个行为。
+    这一轮已经因为写死常量红过四次了。
+    """
     _fake_envelope(monkeypatch)
-    for i in range(10):
+    limit = mcp_core.MAX_SERVERS
+    for i in range(limit):
         _, s = mcp_core.upsert_server(store, {
             "name": f"s{i}", "url": "https://a.example.com", "headers": {}})
         assert s == 200
     body, status = mcp_core.upsert_server(store, {
-        "name": "s10", "url": "https://a.example.com", "headers": {}})
+        "name": f"s{limit}", "url": "https://a.example.com", "headers": {}})
     assert status == 400 and body["error"]["kind"] == "too_many_servers"
 
 

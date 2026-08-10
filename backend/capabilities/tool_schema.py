@@ -19,9 +19,13 @@ from __future__ import annotations
 
 from provider_types import ToolSpec
 from capabilities import registry
+# Card-writing rules live with the memory package (single source of truth shared
+# with the V1 guidance block); only the op names above are V2-specific.
+from memory import prompts_v1
 
 REPLY_TOOL = "reply"
 FILE_REPLY_TOOL = "send_file"
+IMAGE_REPLY_TOOL = "generate_image"
 TASK_TOOL = "task"
 PROVIDER_USAGE_TOOL = "provider_usage"
 MEMORY_ORGANIZE_TOOL = "memory_organize"
@@ -104,8 +108,42 @@ PARAMS: dict[str, dict] = {
         "properties": {"query": _STR, "limit": _INT},
         "required": ["query"],
     },
+    # -- history.py (backed by model_api_runtime/v2/history_readside.py) --
+    # history.search(store, ...): params query/start/end/cursor/limit, all
+    # optional at the schema level — "query 与 (start|end) 至少给一个 / 续页只传
+    # cursor" 是跨字段约束，由 facade 以稳定 slug（missing_query_or_time_range
+    # / cursor_mismatch）拒绝，模型可据以自我修正。
+    "history_search": {
+        "type": "object",
+        "properties": {
+            "query": _STR,
+            "start": _STR,
+            "end": _STR,
+            "cursor": _STR,
+            "limit": _INT,
+        },
+        "required": [],
+    },
+    # history.fetch(store, ...): params.get("message_id") (required) +
+    # before/after neighbor counts (each clamped to [0,15]; defaults are
+    # deliberately asymmetric — before 15, after 4, spec §3.2).
+    "history_fetch": {
+        "type": "object",
+        "properties": {"message_id": _STR, "before": _INT, "after": _INT},
+        "required": ["message_id"],
+    },
     # memory.fetch(store, ...) -> memory_core.fetch: payload.get("ids") must be a
     # list of non-empty strings.
+    "voice_transcript_list": {
+        "type": "object",
+        "properties": {"limit": _INT},
+        "required": [],
+    },
+    "voice_transcript_read": {
+        "type": "object",
+        "properties": {"call_id": _STR, "offset": _INT},
+        "required": ["call_id"],
+    },
     "memory_fetch": {
         "type": "object",
         "properties": {
@@ -277,6 +315,11 @@ PARAMS: dict[str, dict] = {
         "properties": {"path": _STR, "revision": _INT},
         "required": ["path", "revision"],
     },
+    IMAGE_REPLY_TOOL: {
+        "type": "object",
+        "properties": {"prompt": _STR},
+        "required": ["prompt"],
+    },
 
     # -- runtime-native provider_usage tool (chat-lane only; see worker.py
     # _SUBAGENT_ALLOWED_TOOLS / _PRIVATE_READ_TOOLS / _run_wake disabled set) --
@@ -340,6 +383,44 @@ DESCRIPTIONS: dict[str, str] = {
                       "all-memory overview, and do not repeat it after one discovery "
                       "result. For a user-requested bulk rewrite or cleanup, call "
                       "memory_organize."),
+    "voice_transcript_list": (
+        "List this user's archived voice calls, newest first: call_id, when it "
+        "happened, how long it ran, how many turns. Metadata only — no words "
+        "are returned. Use it to find WHICH call to open."),
+    "voice_transcript_read": (
+        "Read what was actually said in one archived voice call, by call_id. "
+        "Memory cards distilled from a call carry that call's voice_call_id, so "
+        "this is how you check the original wording behind a memory instead of "
+        "trusting the card's summary of it. Paged: pass the returned "
+        "next_offset to continue. You do NOT need this for the call that just "
+        "ended — its memory was already written from the full transcript."),
+    "history_search": (
+        "Search the user's raw chat history (original message text from ANY "
+        "time period, beyond what is visible in context) by substring query "
+        "and/or RFC3339 time range. Use it when memory tools miss and the "
+        "user asks about the original wording of an earlier conversation. "
+        "First call: give 'query' and/or 'start'/'end' (start inclusive, end "
+        "exclusive, RFC3339 with explicit UTC offset; convert relative times "
+        "like 'last month' yourself). 'limit' 1-5, default 3. Results are in "
+        "scan-priority order, NOT time order. "
+        "三态语义：complete=true 扫完了；complete=false 且有 next_cursor → "
+        "还有可扫的，带 cursor 原样再调；complete=false 无 cursor 且 "
+        "coverage_gap=true → 有历史区间原文已不存在（legacy retention 清理），"
+        "结论不确定，不得回答\"历史里没有\"。"
+        "续页只传 cursor（其余参数必须省略）。unavailable_count counts rows "
+        "that could not be read (neither a hit nor proof of absence). Use "
+        "history_fetch with a returned message_id to read full context."),
+    "history_fetch": (
+        "Fetch ONE full history message by message_id (obtained from "
+        "history_search) together with its neighbors in conversation order: "
+        "'before'/'after' counts 0-15, defaulting to 15 before and 4 after "
+        "(the clue you are after is almost always earlier in the "
+        "conversation). Single window, no paging; anchor appears exactly "
+        "once, before/after are ordered old→new. Messages that did not fit "
+        "the size budget are reported as omitted_before/omitted_after — "
+        "raise nothing, just narrow the window if you need more of each. "
+        "not_found_or_not_visible means the id does not exist or cannot be "
+        "read — do not retry with the same id."),
     "memory_fetch": ("Fetch the most relevant ids chosen from the current index/search "
                      "step, usually 1–3 cards (guidance, not a hard cap). Related cards "
                      "may expand the returned set up to limit; use include_archived or "
@@ -349,7 +430,8 @@ DESCRIPTIONS: dict[str, str] = {
                      "optional 'bucket'), 'update' (supply 'target_id' plus new "
                      "'summary'/'content'), or 'delete' (supply 'target_id'). Each action "
                      "may include an audit 'reason'. Get "
-                     "target_ids from memory_search/memory_index first."),
+                     "target_ids from memory_search/memory_index first.\n"
+                     + prompts_v1.MEMORY_WRITE_RULES_V1),
     "perception_snapshot": ("Read the latest perception snapshot for the given signals. "
                             "The app field is only the latest open/close event observed "
                             "within 15 minutes; never claim it is the app currently in use. "
@@ -415,6 +497,14 @@ DESCRIPTIONS: dict[str, str] = {
         "Do not call this merely because a conversational answer contains a list "
         "or structured text. Host filesystem paths and /artifacts, /skills, or "
         "/memory entries are not accepted."
+    ),
+    IMAGE_REPLY_TOOL: (
+        "Generate and deliver a real image in the chat. Call this whenever the user "
+        "asks you to draw, create, design, or generate an image, illustration, poster, "
+        "avatar, photo, or other visual. Put the complete visual instruction in prompt. "
+        "Never answer such a request with the word 'Image', a Markdown placeholder, a "
+        "fake URL, or a claim that an image was created. This tool either delivers "
+        "validated image bytes or returns a structured configuration failure."
     ),
     PROVIDER_USAGE_TOOL: (
         "查询当前 AI 服务商账户的余额与用量（只读）。仅在用户明确询问余额、用量、"
@@ -575,6 +665,8 @@ def validate_tool_args(name: str, args, *, live_model_call: bool = False) -> str
         type(args.get("revision")) is not int or args["revision"] <= 0
     ):
         return "send_file revision must be a positive integer"
+    if name == IMAGE_REPLY_TOOL and not str(args.get("prompt") or "").strip():
+        return "generate_image requires a non-empty prompt"
     return None
 
 
@@ -588,6 +680,7 @@ def build_tool_specs() -> list[ToolSpec]:
         TASK_TOOL,
         REPLY_TOOL,
         FILE_REPLY_TOOL,
+        IMAGE_REPLY_TOOL,
         PROVIDER_USAGE_TOOL,
         MEMORY_ORGANIZE_TOOL,
     ):

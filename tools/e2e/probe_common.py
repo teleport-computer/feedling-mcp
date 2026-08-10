@@ -85,9 +85,18 @@ class Probe:
 
 
 # -- memory action helpers (plaintext write path; server encrypts) ----------
+# The write path enforces a source allowlist (memory/actions.py). "e2e_probe"
+# was never on it, so every probe write started failing 400 source_invalid once
+# the allowlist landed — the whole deep memory area went 7/8 red for a reason
+# that had nothing to do with the product (observed 2026-08-06). Probes must
+# write with a real product source; widening the allowlist for tests would
+# weaken the very validation it guards.
+_PROBE_SOURCE = "memory_capture"
+
+
 def mem_add(c, *, summary: str, content: str = "", mem_type: str = "fact",
             bucket: str = "", threads=None, importance=None, pulse=None,
-            source: str = "e2e_probe", occurred_at: str = "",
+            source: str = _PROBE_SOURCE, occurred_at: str = "",
             visibility: str = "") -> tuple[int, dict]:
     memory = {
         "type": mem_type, "summary": summary, "title": summary,
@@ -120,7 +129,7 @@ def mem_supersede(c, supersedes: str, *, summary: str, content: str = "",
                   bucket: str = "", threads=None) -> tuple[int, dict]:
     memory = {"type": "fact", "summary": summary, "title": summary,
               "content": content or summary, "description": content or summary,
-              "source": "e2e_probe"}
+              "source": _PROBE_SOURCE}
     if bucket:
         memory["bucket"] = bucket
     if threads:

@@ -83,6 +83,223 @@
 - 首次 base backup、direct-TLS、强制 WAL switch 与归档零失败均已验证。
 - pre compose/CI 接入独立 TEE DSN；PG deploy、TEE migrate、备份监控新增 pre lane。
   双写默认关闭，等 pre 应用部署与连通验证后再开启回填。
+## 2026-08-09 — 地址不是 API 端点时,别把它说成「API key 未通过测试」
+
+**[DONE] 用户报障:两个中转站都提示 key 未通过测试;实测两站完全健康,真因是 base_url 漏了结尾的 `/v1`。**
+
+- 我们把 **URL 问题的报错说成了 key 问题**,用户一直在换 key。判据落在
+  `setup_core._looks_like_wrong_api_endpoint`,四个入口(保存配置 / 手动测试 /
+  加路由 / 改凭证)统一走 `_provider_test_failed_body`,避免同一错误从不同入口
+  说法不一。
+- 判定为地址问题时把 `status_code` 清成 `null`:客户端会把 provider 的 404
+  映射成「模型不存在」,不清就是换一句话继续指错方向。原始错误仍写进
+  `route.test_error`。
+- **⚠️ 判据必须按状态码收窄(codex2 gatekeep 抓到的 blocker)**:我原先断言
+  「真错误一律是 JSON」,但 relay/WAF/计费层会用 **HTML 页面**返回
+  401/402/429/5xx —— 本仓 `tests/test_catalog_consumer_parity.py:158-161`
+  就存着这样的样本。HTML 只在 **404** 时才算地址问题,其余状态码原样透传,
+  否则额度不足/鉴权失败/限流会被一并说成地址错误,比原来的错更严重。
+- 刻意**不**自动补 `/v1`:6 个 provider 里 gemini(`/v1beta`)、bedrock、
+  deepseek 本就不是 `/v1` 结尾;且 `base_url` 属敏感字段、admin 不下发,
+  改一个看不见影响面的东西等于拿存量用户赌。也不替用户拼具体地址(有的站
+  要 `/api/v1`、`/openai/v1`,猜错让用户照抄后更迷惑)。
+- 不需要 iOS 改动:复用 `provider_test_failed` 老 slug,现有 App 直接显示 detail。
+
+## 2026-08-08 — 思维链泄漏统一闸
+
+**问题**：模型自己写的 `<think>` 心里话漏进用户聊天气泡。**三个出口各漏各的**，
+且三条路此前用的是**两套不同判据 + 一处没有**：
+
+| 出口 | 漏的形状 | 原因 |
+|---|---|---|
+| V2 聊天 | 模型一轮写了两个块 | 剥离器只处理开头第一块，第二块原样进气泡 |
+| V1 聊天 | 孤立的 `</think>`（开标签被上游吃掉） | 正则要求开闭成对，配不上对 → 整段原样放行 |
+| 主动消息 | 任何 think | **一处剥离都没有** |
+
+共同毛病是 **fail-open**：遇到不认识的形状就把原文端给用户。
+
+**自我繁殖**：漏出去的内容原样存进 `chat_messages` 正文（正常情况下思考封在
+**另一个**信封里、模型永远看不到），下一轮当历史喂回去 → 模型看到「我上一条就
+这么写的」→ 照抄 → 漏得更多。这解释了为什么主动消息那条 lane 我们**根本没在
+提示词里要求**它写 think，它却照写不误。
+
+**改动**
+
+- 新增 `core.self_thinking.strip_all_thinking()`：扫全文剥所有完整块 + 孤立闭
+  标签前缀，剥完仍有标签残留则 **fail-CLOSED**（返回 `FAILED`，调用方不发）。
+  `split_thinking()` 一行未动，只增不改。
+- 四个对外出口（V2 聊天 / V2 唤醒 / V1 聊天 / 主动消息）+ 一个历史入口全部改调
+  同一个函数，判据统一。
+- 指令换版：从「每一次输出都写、工具轮也写」改成「**只在不再调工具的那次输出
+  写一个块，内容覆盖整轮**」。13 模型 × 2 遍实测：能写的 6 个模型 12/12 全对
+  （1 块 / 在开头 / 正文零残留 / 工具轮 0 个）；`gpt-5` 在旧指令下会拒绝
+  （"抱歉，我不能分享我的内部推理" + 整段转英文），新指令下两遍都正常。
+
+**开关**：`FEEDLING_THINK_GATE`，**默认开**。关掉后五个调用点对同样的输入逐字回到
+改动前的**解析 / 出口 / 历史处理**行为，用于线上出问题时立刻止血 —— 是 kill switch，
+不是灰度门。**注意它不回滚提示词**：`INSTRUCTION` 归 `FEEDLING_V2_SELF_THINKING` 管，
+所以关掉本开关不等于系统整体回到基点（Codex review 2026-08-08 指出，原文案说成
+「逐字节回到改动前」是不成立的）。
+
+**与 `FEEDLING_V2_SELF_THINKING` 解耦**：安全剥离不再挂在 self-thinking 开关下。
+那是公开支持的自托管配置，关掉它时模型仍可能自己写 `<think>`（主动消息那条 lane
+就是实证：我们从没要求它写，它照写），此前的写法会在那种配置下完全跳过剥离，等于
+把心里话原样发给用户。现在的判定是「闸开 → 一律剥离；闸关但 self-thinking 开 →
+旧行为；两者都关 → 不处理」，而**展示与否**仍然只看 `FEEDLING_V2_SELF_THINKING`。
+
+**放弃的替代方案**：给模型一个专门的 think 工具走结构化交付（`tool_calls`）。
+实测 gpt-5.4 **不会**把正文和 think 工具调用放进同一次输出，会多一次 API 往返；
+2026-08-08 定为「先不做」。
+
+**已知取舍**
+
+1. **误剥**：用户或 io 正常聊天里提到 `</think>` 这几个字会被当协议残留剥掉。
+   低频，而泄漏每天都在发生 —— 优先堵漏（hx 2026-08-08 明确「误杀先不考虑」）。
+2. **4 个模型完全不写 think**（openrouter-deepseek-r1 / glm / 中转·哈吉米 /
+   中转·空悲切）→ 这些用户看不到「推理过程」。是"没有"不是"漏"，之后单独处理。
+3. V1 的展示格式**不变**（保留换行、上限 700）：内核提供 `sanitize=False`，本次
+   统一的是剥离**判据**，不顺带改展示。
+
+**上线状态**：⬜ 未上线。backend 部分随 test 分支 CI 自动出镜像 + 部署 CVM；
+`tools/chat_resident_consumer.py` **CI 不管**，必须手动上 VPS
+`systemctl restart feedling-chat-resident` 才生效。
+
+## 2026-08-07 — 语音挂断取消与迟到回复隔离
+
+**[DONE] 失败通话不再把迟到 AI 回复写进普通聊天。**
+
+- 新增幂等 `POST /v1/voice/cancel` 和持久 call lifecycle tombstone；取消会
+  清理未归档逐轮消息及临时语音结果。
+- Resident 与 Hosted Runtime V2 都在最终消息事务内检查 lifecycle，并把
+  `voice_call_id`、`voice_turn_id`、`reply_to_message_id` 完整落到回复行。
+- finalize 在写 archive/card 前先取得 lifecycle；cancel 与 finalize 只会有
+  一个赢家，不会出现 cancelled 状态却残留半套归档。
+
+## 2026-08-07 — Dashboard 卡片语义修正（prod 第二日实景反馈）
+
+**[FEEDBACK] 四处「数字对不上/误导」全部修正，根因都是口径与分母。**
+
+- 导入卡红灯顶 90% 大数字：分母从 completed 改为终态（completed+failed）
+  ——失败的导入到不了 completed，旧分母把 3 个失败藏进大数字（9/10=90%
+  配 23.1% 失败率的自相矛盾）。started>0 但无终态时显「—」不显 0%。
+- 漏斗 W1 假流失：builder 的 w1_eligible（窗口已走完人数）现在随 payload
+  下发，转化行分母用它——旧渲染拿 t3 总数当分母，把「注册不满 14 天、
+  窗口未到期」的人标成流失（实景 ↓40%·流失 75，实际 91 人成熟、33 人
+  未到期）。标签改「次周仍活跃（第 8–14 天）」防误读成 WAU。
+- 同词不同尺加标尺名：用户页判定句「近1日活跃」改「近1日发过消息」
+  （滚动 24h 真人消息），与「日活与时长」页 打开过App DAU（北京自然日）
+  是两把尺、无需对上——hint 里显式写明；产品健康 WAU 标签补「打开过
+  App」。chat/延迟卡「无样本」标注 Hosted V2 通道（V1/BYOK 不经此路径，
+  不代表没人聊天）。
+- 小样本环比不染色（两侧 <20 中性灰，17→4 的 −76% 红是真数字假信号）；
+  首页队列同因 >3 条折叠（注册波刷屏把 stalled 挤下屏）。
+- 测试 299 通过（含四组新回归）。
+
+
+## 2026-08-07 — 空回复归因：中转抽风不再算作「系统出了问题」
+
+**[DONE] prod 用户 usr_7f30d63f 报「今天好几次接不上」，分诊查实是他的中转不稳，但我们的错误归因把锅背到了自己头上。**
+
+- 现场：他的中转 08-05 上午配额爆掉后开始间歇返回 **HTTP 200 + 空内容**
+  （断流 / 配额紧张时的假成功）。我们清洗后为空 → 一律 `reply_parse_failed`
+  （blame=system，文案「系统处理回复时出了问题」）→ 用户自然来找我们。
+  同一场中转故障，前半场（规矩报错）归因正确，后半场（假成功）归因错误。
+- **归因边界**：模型本来就没给内容 = provider（新类 `provider_empty_reply`，
+  blame=provider_transient）；给过内容、被我们的清洗/压制掏空 = 我们
+  （`reply_parse_failed` 不变）。
+- 落点：标记由**四个 helper 抛出点**铸造（openai / simple / cli generic / pi）
+  —— 生产 helper 在返回前就抛异常，只在 `call_agent` 里判空是死代码；
+  分类器把空回复判定排在 `_ERROR_CLASS_RULES` **之后**，且抛出时带上 body 的
+  协议层诊断（`error.message` / `finish_reason`），这样 `200 + insufficient_quota`
+  这种中转标准形状仍然命中 `quota_insufficient` 而不是被空回复遮蔽。
+- V2 侧：`TurnError("empty_reply")` 归 provider；但 **`tool_budget_exhausted`
+  拆成独立 reason**（跑光的是我们自己的 `_TURN_MAX_LLM_CALLS`，不是中转的错），
+  wake `scheduled` 的 self-thinking SILENT 也归 system（模型给过完整 `<think>`、
+  是我们剥空的）。
+- 三轮 gatekeep（codex2 两轮 + 一次独立对抗预检）抓到的关键缺陷：①第一版
+  测试用 lambda 返回 `""` 绕过真实 helper 边界＝假绿，核心工单场景根本没修到；
+  ②`_raw_assistant_text` 是记忆车道的窄提取器（不读 top-level messages/actions），
+  拿它回头判空会把**我们自己的协议泄漏压制**误判成 provider 空回复 —— 改为在
+  压制**之前**快照；③标记加 `feedling:` 命名空间，否则 pi 透传的 provider 文本
+  可能原样命中而劫持归因。
+- 文档：`docs/FRONTEND_ERROR_CONTRACT.md`、`docs/API_ERRORS.md` 的 error_class
+  闭集，以及 docs-site changelog（用户可见文案变更）同批更新。
+- ⚠️ 用户可见变化：按 §2.3 显示矩阵，`provider_transient` 隐藏兜底气泡、只出
+  失败横幅（与 `rate_limited` / `upstream_unavailable` 同阵营，非本批新增形态）。
+
+## 2026-08-06 — Dashboard prod 首日热路径修补
+
+**[DONE] IA v2 上 prod 首日实测（首页 ~8s、产品健康顶 30s deadline、verdicts 每次 5-8s）暴露三处，全部修复。**
+
+- 迁移 0079：`chat_messages(ts)` 普通索引 + `user_logs(ts) WHERE
+  stream='proactive_jobs'` 部分索引——都是 0078 时"等 prod EXPLAIN"的
+  存量 follow-up，证据到齐即落地。服务首页队列/事件流、产品健康回复率、
+  铁杆 census（此前 30s 超时主因）与既有主动任务日报。
+- 首页队列 model_config_pending 加近 14 天活动过滤（chat ∪
+  app_session_end，两臂都有索引）：prod 首日 20 条截断，多为弃置账号的
+  历史坏配置——幽灵账号不是"需要你"的工单。
+- verdicts JSON 加 30s TTL 缓存 + single-flight：原"逐请求重建"假设在
+  prod 数据量下不成立（agent 轮询持续压库）；诚实通道改为 payload 一等
+  字段 `cached`/`cache_age_sec`（HTML 有 cache-note，JSON 有这个）。
+- 测试 297 通过（含 0079 head-pin 更新、队列幽灵过滤回归、缓存语义翻转）。
+
+
+## 2026-08-06 — Admin dashboard IA v2：首页 + 导航 13→4 + 统一漏斗
+
+**[DONE] /admin/data-track 默认页改为「首页」：判定条 + 用户队列 + 产品脉搏 + 事件流 + 成本行；导航收敛为 首页/产品健康/用户/诊断 四项。**
+
+- 设计原则落地：频率决定层级（每天看的在首屏零点击，出事才看的 11 个
+  诊断页收进 `view=diag` 枢纽 + 二级行，旧 URL 全部不变）；名单强于比率
+  （「需要你的用户」直接列出 有去无回/onboarding 卡住/模型配置待处理 的
+  具体用户行，封顶 20 + truncated 标记；resident 掉线检测因在内存态、
+  页面如实标注缺口）；无趋势不成信息（脉搏卡全部带 7 日 sparkline）。
+- 状态条四灯：系统 = 既有三把 `_ops_*_level` 尺子取最差（bad>warn>
+  unknown>ok，合成在 admin_core——db 不许 import data_track）；增长 =
+  WAU 环比（带 min-n 护栏，小分母不告警）；成本 = token 3× 中位数跑飞
+  检测；数据完整性 = **永远灰**直到 ACK/session 来源缺口闭合。
+- 统一漏斗 `admin_funnel_snapshot`：注册→已连接→内容就绪→首次真回复→
+  W1 仍活跃，严格单调、28 天窗口带前窗对照、W1 未成熟显 None；首页迷你
+  版 + 用户页完整版（带逐级掉落与前窗），替换掉用户页原来那组**不单调
+  的独立行为百分比条**（原数据保留在折叠的人群记账 details 里）。
+- 新 JSON 端点 `GET /v1/admin/data-track/verdicts`（admin 鉴权同级、不进
+  页面缓存）：给 agent 读的判定 + 队列 + 脉搏，与页面同一套 builder。
+- 两轮对抗审查修复 10 处（3 major：主动消息把"有去无回"误清；成本判定
+  绿灯却给"可判定天数不足"理由；激活率标题渲染进行中周为定数。7 minor
+  含 min-n 护栏、成熟死 cohort W1 显 0 不显 —、非有限数崩页、孤儿 CSS、
+  user_id 转义口径统一等）。种子舰队端到端验证（412 账号）：首页冷构
+  ~25ms vs 用户页 ~100ms（本地）。测试 296 通过；`test_asgi_admin` 两个
+  parity 失败为存量（cache-note vs 旧断言，已另立任务）。
+
+## 2026-08-05 — Dream 阀门重构：拆内容闸、只留确定性「明显不对」闸（V1/V2 同步）
+
+**[DECISION]+[DONE] usr_a40e 墓碑卡事故复盘，Seven 定产品哲学：出口只拦「明显不对」，绝不判内容质量、绝不拒绝内容上的可能性。**
+
+- 现场：deepseek-v4-pro 把 dream supersede 语义理解反，把「已被 <卡id> 取代——原文」
+  记账注记写进新卡 summary/content；占位符闸（实义文字，过）、语义审查员（同一弱模型
+  自审自查，放行）、15% 增量栅栏（多卡合并绕过）三道防线全没拦住，花园展示出墓碑卡。
+- **拆**（两条 lane 同步，V1 consumer + V2 extraction/worker）：
+  - 15% 增量栅栏（`_has_substantive_increment` 两份拷贝）——内容质量判断，
+    「更短但更准」的合法改写会被判死；
+  - 逐提案语义审查员（`_review_dream_consolidations` 两份实现 + review prompt/parser）
+    ——既误放（本次）也误杀（fail-closed 连审查调用挂了都毙提案），每条提案还多烧
+    一次用户 BYOK 调用。
+- **加**（共享一份，不再两处复制）：
+  - `memory/dream_gates.py`：卡 id 泄漏闸（result 硬字段含花园真实卡 id → 与内容闸
+    同路打回重问，零误伤）+ 爆炸半径保险丝（单晚退休 > 活跃卡 80% 且 ≥10 张 →
+    整个 job 失败不部分执行；env `FEEDLING_DREAM_FUSE_RATIO`/`FEEDLING_DREAM_FUSE_MIN_CARDS`）；
+  - `card_text.py` 墓碑短语闸（`已被/superseded by + ≥8位hex`，capture/dream 全 lane
+    兜底；裸「取代」散文不误伤）；
+  - dream prompt 红线补一句：result 写新卡内容本身、绝不出现卡 id（仅一句，
+    prompt 不膨胀——硬约束在出口代码里，见复盘讨论）。
+- **刻度**：`memory_lane_health` 增加 `failed_reasons`（按 `last_error` 细分，
+  「保险丝熔断」和「provider 挂」分开看）；V2 dream 记 `dream_funnel` trajectory
+  （proposals/applied/superseding）；V1 `dream_result` 增 `active_cards`+`content_gate`。
+- 测试：`test_dream_gates.py` 新增（含 **V1/V2 跨 lane 一致性锁**：同一份
+  consolidations 两条 lane 必须退休同一批卡）；lanes/integration/consumer 各测试
+  迁到新语义；673+ 相关用例全绿。
+- 待办：usr_a40e 花园复原（recover CLI 走 Actions，时间窗定位墓碑批次，dry-run
+  清单过目后 apply）——修复部署 prod 之后做，防止下一晚 dream 再产墓碑。
+
 ## 2026-08-04 — 新增 Admin「产品健康」view（留存/激活/强度/证据缺口）
 
 **[DONE] /admin/data-track?view=health：投资人级产品指标常态化进 dashboard，全部只用现库可证实的数。**

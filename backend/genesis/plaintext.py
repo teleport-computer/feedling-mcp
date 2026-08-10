@@ -296,11 +296,26 @@ def _prepare_plaintext_import(payload: dict) -> dict:
     }
 
 
+_STAGED_TTL_DEFAULT_SEC = 259200  # 72h
+
+
 def _staged_ttl_sec() -> int:
+    """How long a staged upload stays retryable.
+
+    Retry re-commits the SAME staged_id, so this TTL is exactly the window in
+    which the retry button can still work; past it `load_genesis_staged_payload`
+    deletes the blob and commit answers 410. 24h was too short for the shape we
+    actually see — a long import fails while the user is away, and they come
+    back the next evening to a button that can only fail
+    (usr_3b73f1cb0a9ec975, 2026-08-06). 72h covers "came back a day or two
+    later" while staying bounded: `create_genesis_staged_payload` reaps a user's
+    previous stage and a DONE job consumes its own, so only failed/abandoned
+    imports hold a blob at all — at most one per account."""
     try:
-        return max(60, int(os.environ.get("FEEDLING_GENESIS_STAGED_TTL_SEC", "86400")))
+        return max(60, int(os.environ.get(
+            "FEEDLING_GENESIS_STAGED_TTL_SEC", str(_STAGED_TTL_DEFAULT_SEC))))
     except (TypeError, ValueError):
-        return 86400
+        return _STAGED_TTL_DEFAULT_SEC
 
 
 def _plaintext_stale_sec() -> int:
@@ -318,6 +333,10 @@ def _plaintext_heartbeat_sec() -> int:
         ))
     except (TypeError, ValueError):
         return 15
+
+
+def _voice_checkpoint_enabled() -> bool:
+    return os.environ.get("FEEDLING_GENESIS_VOICE_CHECKPOINT_ENABLED", "1") != "0"
 
 
 def _plaintext_worker_metadata() -> dict[str, Any]:
@@ -365,6 +384,35 @@ def _plaintext_owner_process_is_dead(metadata: dict) -> bool:
     return False
 
 
+def _plaintext_checkpoint_bytes(user_id: str, job_id: str) -> int:
+    try:
+        blob = db.get_blob_strict(
+            user_id,
+            service._checkpoint_blob_kind(job_id),
+        )
+        if not isinstance(blob, dict):
+            return 0
+        return max(0, int(blob.get("checkpoint_bytes") or 0))
+    except Exception:
+        return 0
+
+
+def _plaintext_interruption_progress(job: dict) -> tuple[int, int]:
+    output = job.get("output") if isinstance(job.get("output"), dict) else {}
+    materials = output.get("materials") if isinstance(output.get("materials"), list) else []
+    windows_done = 0
+    windows_total = 0
+    for material in materials:
+        if not isinstance(material, dict):
+            continue
+        try:
+            windows_done += max(0, int(material.get("windows_done") or 0))
+            windows_total += max(0, int(material.get("windows_total") or 0))
+        except (TypeError, ValueError):
+            continue
+    return windows_done, windows_total
+
+
 def _fail_stale_plaintext_job(store, job: dict | None) -> dict | None:
     row = job if isinstance(job, dict) else {}
     if str(row.get("status") or "") != "processing":
@@ -375,6 +423,13 @@ def _fail_stale_plaintext_job(store, job: dict | None) -> dict | None:
     stale_sec = _plaintext_stale_sec()
     owner_instance = str(metadata.get("plaintext_worker_instance") or "")
     owner_dead = _plaintext_owner_process_is_dead(metadata)
+    elapsed_sec = service._claimed_age_sec(row)
+    if owner_dead:
+        interruption_cause = "owner_pid_dead"
+    elif elapsed_sec is not None and elapsed_sec >= stale_sec:
+        interruption_cause = "heartbeat_aged"
+    else:
+        interruption_cause = "unknown"
     failed = db.genesis_fail_stale_plaintext_job(
         store.user_id,
         str(row.get("job_id") or ""),
@@ -392,6 +447,25 @@ def _fail_stale_plaintext_job(store, job: dict | None) -> dict | None:
             service.write_genesis_state(store, failed, status=service.FAILED_JOB_STATUS)
         except Exception:  # noqa: BLE001
             pass
+        windows_done, windows_total = _plaintext_interruption_progress(failed)
+        failed_metadata = _metadata_for_job(failed)
+        job_id = str(failed.get("job_id") or row.get("job_id") or "")
+        _trace_genesis(
+            store,
+            "genesis.plaintext.interrupted",
+            job_id=job_id,
+            status="error",
+            summary="plaintext genesis worker interrupted",
+            detail={
+                "cause": interruption_cause,
+                "windows_done": windows_done,
+                "windows_total": windows_total,
+                "elapsed_sec": max(0, int(elapsed_sec or 0)),
+                "history_tier": str(failed_metadata.get("history_tier") or "")[:80],
+                "distill_model": str(failed_metadata.get("distill_model") or "")[:160],
+                "checkpoint_bytes": _plaintext_checkpoint_bytes(store.user_id, job_id),
+            },
+        )
     return failed
 
 
@@ -455,13 +529,22 @@ def _recommended_distill_model(store, api_key: str | None) -> str | None:
     ids = [
         str(item.get("id") or "")
         for item in catalog.get("models") or []
-        if isinstance(item, dict) and "thinking" not in str(item.get("id") or "").lower()
+        if (
+            isinstance(item, dict)
+            and "thinking" not in str(item.get("id") or "").lower()
+            and not _openai_compatible_gemini_flash(str(item.get("id") or ""))
+        )
     ]
     for needle in ("haiku", "flash", "mini"):
         match = next((model_id for model_id in ids if needle in model_id.lower()), "")
         if match:
             return match
     return None
+
+
+def _openai_compatible_gemini_flash(model_id: str) -> bool:
+    normalized = str(model_id or "").strip().lower()
+    return "gemini" in normalized and "flash" in normalized
 
 
 def _distill_model_override(value: Any) -> str:
@@ -550,8 +633,12 @@ def _plaintext_map_task_id(source_pass: int, source_family: str) -> str:
     return f"plaintext-map:{source_pass}:{source_family}"
 
 
+def _plaintext_voice_task_id(source_pass: int, source_family: str) -> str:
+    return f"plaintext-voice:{source_pass}:{source_family}"
+
+
 class _PlaintextCheckpointProgress:
-    """Encrypted map checkpoint plus the non-content progress projection."""
+    """Encrypted fact/voice map checkpoint plus the non-content progress projection."""
 
     def __init__(self, store, api_key: str | None, job_id: str, source_groups: list[dict]):
         self.store = store
@@ -561,6 +648,8 @@ class _PlaintextCheckpointProgress:
         loaded = service.load_genesis_checkpoint(store, api_key, job_id)
         self.doc = checkpoint.resume(loaded) if loaded else checkpoint.new_checkpoint()
         self.doc.setdefault("map_outputs", {})
+        if _voice_checkpoint_enabled():
+            self.doc.setdefault("voice_outputs", {})
         service.write_genesis_checkpoint(store, job_id, self.doc)
         self.publish(stage="plaintext_reducer")
 
@@ -578,6 +667,52 @@ class _PlaintextCheckpointProgress:
                 resumed[idx] = value
         return resumed
 
+    def resume_voice_outputs(self, source_pass: int, source_family: str) -> dict[int, dict]:
+        if not _voice_checkpoint_enabled():
+            return {}
+        task_id = _plaintext_voice_task_id(source_pass, source_family)
+        outputs = (
+            self.doc.get("voice_outputs")
+            if isinstance(self.doc.get("voice_outputs"), dict)
+            else {}
+        )
+        resumed: dict[int, dict] = {}
+        for idx in range(len(self.source_groups[source_pass - 1].get("chunk_texts") or [])):
+            key = checkpoint.task_key(task_id, idx)
+            value = outputs.get(key)
+            if checkpoint.is_task_done(self.doc, task_id, idx) and isinstance(value, dict):
+                resumed[idx] = value
+        return resumed
+
+    def record_voice(
+        self,
+        source_pass: int,
+        source_family: str,
+        chunk_index: int,
+        output: dict,
+    ) -> None:
+        if not _voice_checkpoint_enabled():
+            return
+        task_id = _plaintext_voice_task_id(source_pass, source_family)
+        key = checkpoint.task_key(task_id, chunk_index)
+        outputs = dict(self.doc.get("voice_outputs") or {})
+        outputs[key] = output
+        self.doc["voice_outputs"] = outputs
+        candidate_count = sum(
+            len(output.get(name) or [])
+            for name in ("behavior_notes_candidates", "exemplar_candidates")
+            if isinstance(output.get(name), list)
+        )
+        self.doc = checkpoint.upsert_task(
+            self.doc,
+            task_id=task_id,
+            chunk_id=chunk_index,
+            status=checkpoint.TASK_DONE,
+            source_pass=str(source_pass),
+            output_summary=f"voice_candidates={candidate_count}",
+        )
+        service.write_genesis_checkpoint(self.store, self.job_id, self.doc)
+
     def record_map(self, source_pass: int, source_family: str, chunk_index: int, output: dict) -> None:
         task_id = self._task_id(source_pass, source_family)
         key = checkpoint.task_key(task_id, chunk_index)
@@ -594,6 +729,38 @@ class _PlaintextCheckpointProgress:
         )
         # Durable checkpoint first, visible progress second. A crash can under-report
         # completed work, but can never report a window that cannot be resumed.
+        service.write_genesis_checkpoint(self.store, self.job_id, self.doc)
+        self.publish(
+            stage="plaintext_reducer",
+            source_family=source_family,
+            source_pass=source_pass,
+        )
+
+    def record_map_diagnostics(
+        self, source_pass: int, source_family: str, diagnostics: list[dict]
+    ) -> None:
+        if not diagnostics:
+            return
+        existing = (
+            self.doc.get("map_diagnostics")
+            if isinstance(self.doc.get("map_diagnostics"), list)
+            else []
+        )
+        safe = list(existing)
+        for raw in diagnostics:
+            if not isinstance(raw, dict) or len(safe) >= 6:
+                break
+            safe.append({
+                "source_pass": max(1, int(source_pass)),
+                "source_family": str(source_family or "")[:80],
+                "chunk_index": max(0, int(raw.get("chunk_index") or 0)),
+                "task_id": str(raw.get("task_id") or "")[:120],
+                "discard_reason": str(raw.get("discard_reason") or "unknown")[:120],
+                "raw_output_snippet": str(raw.get("raw_output_snippet") or "")[:500],
+                "raw_output_chars": max(0, int(raw.get("raw_output_chars") or 0)),
+                "raw_output_truncated": bool(raw.get("raw_output_truncated")),
+            })
+        self.doc["map_diagnostics"] = safe
         service.write_genesis_checkpoint(self.store, self.job_id, self.doc)
         self.publish(
             stage="plaintext_reducer",
@@ -683,6 +850,9 @@ class _PlaintextCheckpointProgress:
             "materials": self.materials(active_pass=source_pass),
             "identity_ready": bool(self.doc.get("identity_ready")),
         }
+        diagnostics = self.doc.get("map_diagnostics")
+        if isinstance(diagnostics, list) and diagnostics:
+            output["map_diagnostics"] = diagnostics[:6]
         if source_family:
             output["source_family"] = source_family
         if source_pass:
@@ -1264,6 +1434,19 @@ def _run_plaintext_genesis_v2(
             resume_map_outputs=resume_map_outputs,
             on_map_completed=on_map_completed,
         )
+        if progress and isinstance(reduce.get("map_diagnostics"), list):
+            mapped_diagnostics: list[dict] = []
+            for diagnostic in reduce["map_diagnostics"]:
+                if not isinstance(diagnostic, dict):
+                    continue
+                local_index = int(diagnostic.get("chunk_index") or 0)
+                full_index = (
+                    checkpoint_indices[local_index]
+                    if 0 <= local_index < len(checkpoint_indices)
+                    else local_index
+                )
+                mapped_diagnostics.append({**diagnostic, "chunk_index": full_index})
+            progress.record_map_diagnostics(idx, group_family, mapped_diagnostics)
         foreground_reduces.append(reduce)
         voice_candidates.extend([c for c in (reduce.get("voice_candidates") or []) if isinstance(c, dict)])
         if idx == fg_idx:
@@ -1588,9 +1771,17 @@ def _run_plaintext_background_enrichment(
             user_name=user_name,
             llm=llm,
             resume_map_outputs=(progress.resume_outputs(idx, group_family) if progress else None),
+            resume_voice_outputs=(
+                progress.resume_voice_outputs(idx, group_family) if progress else None
+            ),
             on_map_completed=(
                 (lambda chunk_index, mapped, source_pass=idx, family=group_family:
                  progress.record_map(source_pass, family, chunk_index, mapped))
+                if progress else None
+            ),
+            on_voice_completed=(
+                (lambda chunk_index, mapped, source_pass=idx, family=group_family:
+                 progress.record_voice(source_pass, family, chunk_index, mapped))
                 if progress else None
             ),
         )
@@ -1797,6 +1988,12 @@ def _run_plaintext_add_memory_job(
                 if progress else None
             ),
         )
+        if progress:
+            progress.record_map_diagnostics(
+                idx,
+                group_family,
+                output.get("map_diagnostics") if isinstance(output.get("map_diagnostics"), list) else [],
+            )
         if not first_output:
             first_output = output
         candidates = output.get("all_fact_candidates") or output.get("core_fact_candidates") or []
@@ -1824,6 +2021,31 @@ def _run_plaintext_add_memory_job(
         preserve_dates=keep_all_job,
         fallback_occurred_at=str((relationship_anchor or {}).get("relationship_started_at") or "").strip(),
     )
+    if keep_all_job and mem_count == 0:
+        distill_diagnostics = {
+            "reason": "keep_all_zero_cards",
+            "map_candidate_count": len(fact_candidates),
+            "raw_memory_count": raw_count,
+        }
+        if progress:
+            progress.publish(
+                stage="plaintext_add_memory_failed",
+                status="processing",
+                extra={"distill_diagnostics": distill_diagnostics},
+            )
+        else:
+            db.genesis_set_job_status(
+                store.user_id,
+                job_id,
+                status="processing",
+                output={
+                    "stage": "plaintext_add_memory_failed",
+                    "distill_diagnostics": distill_diagnostics,
+                },
+            )
+        raise worker.GenesisWorkerError(
+            "distill_empty_output:keep_all_nonempty:zero_memory_cards"
+        )
     dropped = raw_count - mem_count
     if dropped > 0:
         notices_core.emit(store, source="genesis", error_class="genesis_partial",
@@ -2108,9 +2330,14 @@ def _run_plaintext_genesis_job(
                 user_name=user_name,
                 llm=llm,
                 resume_map_outputs=progress.resume_outputs(idx, group_source_family),
+                resume_voice_outputs=progress.resume_voice_outputs(idx, group_source_family),
                 on_map_completed=(
                     lambda chunk_index, mapped, source_pass=idx, family=group_source_family:
                     progress.record_map(source_pass, family, chunk_index, mapped)
+                ),
+                on_voice_completed=(
+                    lambda chunk_index, mapped, source_pass=idx, family=group_source_family:
+                    progress.record_voice(source_pass, family, chunk_index, mapped)
                 ),
             )
             if progress and group_source_family in {"ai_persona", "memory_summary"}:

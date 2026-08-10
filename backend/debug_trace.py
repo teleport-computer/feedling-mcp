@@ -24,8 +24,23 @@ import db
 
 DEBUG_TRACE_BLOB = "v1_flow_trace"
 DEBUG_TRACE_FLAG_BLOB = "v1_flow_trace_enabled"
-_MAX_EVENTS = 500
-_MAX_EVENTS_VERBOSE = 200
+# Ring depth. Sized against the 48h TTL below: the point of the ring is to still
+# hold yesterday's failure when a tester reports it this morning.
+#
+# 2026-08-10: raised 500→2500 (verbose 200→1000) together with the bulk-decrypt
+# coalescing in core/enclave.py. The cap alone was never the real limit — 182 of
+# 200 retained events for an active user were per-row `v2_chat_read` decrypts, so
+# a single chat turn evicted the ring and the panel showed a 1-second window.
+# Noise removal buys ~10x; the depth increase buys the rest of the 48 hours.
+#
+# Cost: recording is default-on for every user, and the ring is ONE jsonb doc
+# rewritten under a row lock per flush — so depth is paid on every write, by
+# everyone. At ~400 bytes/event 2500 events is ~1MB worst case, and only for a
+# user who actually generates that much in 48h; a typical user stays far below
+# the cap and pays nothing extra. Do not raise this much further without moving
+# the ring to an append-only table — the rewrite cost is linear in depth.
+_MAX_EVENTS = 2500
+_MAX_EVENTS_VERBOSE = 1000
 _EXCERPT_FIELD_MAX = 2048
 _EXCERPT_EVENT_MAX = 8192
 _TRUNC_MARK = "…(truncated)"

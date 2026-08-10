@@ -694,6 +694,32 @@ def _trajectory_events_unpack(r: tuple) -> tuple:
     return (uid, item_id, sort_val, doc)
 
 
+# ---- voice_transcripts：PK (user_id, call_id)，envelope 是独立列，其余是普通
+# 业务列（与 v2_trajectory_events 同型，走 _pack_extra/_pop_extra 走私）。
+def _voice_transcripts_unpack(r: tuple) -> tuple:
+    """(user_id, call_id, chat_message_id, turn_count, duration_sec, char_count,
+    created_at, transcript_envelope) row -> (user_id, item_id, sort_val, doc')。
+
+    item_id 是 call_id（secrets.token_urlsafe 生成、PK 的一半，per-user 唯一）。
+    sort_val 是 created_at：归档行只写一次、此后永不改写，所以时间戳游标没有
+    "晚提交但更早取到 now()" 的跳过风险，也因此不需要 requeue。
+    """
+    (uid, call_id, chat_message_id, turn_count, duration_sec, char_count,
+     created_at, envelope) = r
+    sort_val = _iso(created_at) or ""
+    doc = _pack_extra(envelope, chat_message_id=chat_message_id,
+                      turn_count=turn_count, duration_sec=duration_sec,
+                      char_count=char_count)
+    return (uid, str(call_id), sort_val, doc)
+
+
+def _voice_transcripts_upsert_args(uid: str, iid: str, sort, doc: dict) -> tuple:
+    (chat_message_id, turn_count, duration_sec, char_count) = _pop_extra(
+        doc, "chat_message_id", "turn_count", "duration_sec", "char_count")
+    return (uid, iid, chat_message_id, turn_count, duration_sec, char_count,
+            sort, Jsonb(doc))
+
+
 def _trajectory_events_upsert_args(uid: str, iid: str, sort, doc: dict) -> tuple:
     (job_id, event_index, event_kind, idempotency_key, payload_bytes,
      truncated) = _pop_extra(doc, "job_id", "event_index", "event_kind",
@@ -727,6 +753,34 @@ _TABLES["v2_trajectory_events"] = _Table(
     requeue_delete_tee_sql=None,
     # 冷启动：created_at 是 TIMESTAMPTZ，"-infinity" 合法；第二列在 SQL 里已经
     # ::text 转型成字符串拼接，空串本身就是合法 TEXT 且排在任何非空拼接结果之前。
+    cursor_zero=("-infinity", ""),
+)
+
+
+_TABLES["voice_transcripts"] = _Table(
+    select_sql=("SELECT user_id, call_id, chat_message_id, turn_count, duration_sec, "
+                "char_count, created_at, transcript_envelope FROM voice_transcripts "
+                "WHERE (created_at, call_id) > (%s, %s) "
+                "ORDER BY created_at, call_id LIMIT %s"),
+    cursor_kind="text",
+    transform=lambda doc, decrypt: transforms.plaintext_envelope_column(
+        doc, decrypt, purpose=f"tee_replicate:voice_transcripts:{doc.get('id', '')}"),
+    upsert_sql=("INSERT INTO voice_transcripts "
+                "(user_id, call_id, chat_message_id, turn_count, duration_sec, "
+                "char_count, created_at, doc) VALUES (%s,%s,%s,%s,%s,%s,%s,%s) "
+                "ON CONFLICT (user_id, call_id) DO UPDATE SET "
+                "chat_message_id=EXCLUDED.chat_message_id, "
+                "turn_count=EXCLUDED.turn_count, duration_sec=EXCLUDED.duration_sec, "
+                "char_count=EXCLUDED.char_count, created_at=EXCLUDED.created_at, "
+                "doc=EXCLUDED.doc"),
+    unpack=_voice_transcripts_unpack,
+    upsert_args=_voice_transcripts_upsert_args,
+    # 归档行只在挂断时写一次、此后永不改写（全仓无 "UPDATE voice_transcripts"），
+    # 没有原地改写路径 → 不需要 requeue，与 v2_trajectory_events 同理。
+    requeue_fetch_sql=None,
+    requeue_delete_tee_sql=None,
+    prune_rds_keys_sql="SELECT user_id, call_id FROM voice_transcripts",
+    prune_tee_keys_sql="SELECT user_id, call_id FROM voice_transcripts",
     cursor_zero=("-infinity", ""),
 )
 

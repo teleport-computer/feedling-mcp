@@ -10,7 +10,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).parent.parent / "backend"))
 from model_api_runtime.v2 import prompt_frontier as frontier
 from model_api_runtime.v2 import tool_loop
 import provider_client
-from provider_types import ToolResult, ToolSpec
+from provider_types import ToolCall, ToolExchange, ToolResult, ToolSpec
 
 
 def _model_limit(context_window_tokens: int = 2_048) -> frontier.ModelPromptLimit:
@@ -431,6 +431,57 @@ def test_optional_tool_catalog_is_omitted_whole_and_reported():
     assert plan.status == "fits_optional_omitted"
 
 
+def test_historical_tool_schema_is_required_when_optional_catalog_does_not_fit():
+    messages = [
+        {"role": "user", "content": "find my memories"},
+        ToolExchange(
+            calls=(ToolCall(id="m1", name="memory_index", args={}),),
+            results=(ToolResult(call_id="m1", content="one memory"),),
+        ),
+    ]
+    tools = [
+        ToolSpec("memory_index", "list memories", {"type": "object"}),
+        ToolSpec("large_optional", "z" * 5_000, {"type": "object"}),
+    ]
+
+    plan = frontier.plan_provider_round(
+        model_limit=_model_limit(4_096),
+        messages=messages,
+        tools=tools,
+        required_tool_names={"memory_index"},
+        output_reserve_tokens=128,
+        safety_margin_tokens=128,
+    )
+
+    assert "required_tool_schemas" in plan.included_components
+    assert "tool_schemas" in plan.omitted_optional_components
+
+
+def test_historical_tool_schema_fails_closed_when_required_frontier_is_exhausted():
+    messages = [
+        {"role": "user", "content": "find my memories"},
+        ToolExchange(
+            calls=(ToolCall(id="m1", name="memory_index", args={}),),
+            results=(ToolResult(call_id="m1", content="one memory"),),
+        ),
+    ]
+    tools = [
+        ToolSpec("memory_index", "z" * 5_000, {"type": "object"}),
+    ]
+
+    with pytest.raises(frontier.PromptFrontierExhausted) as caught:
+        frontier.plan_provider_round(
+            model_limit=_model_limit(4_096),
+            messages=messages,
+            tools=tools,
+            required_tool_names={"memory_index"},
+            output_reserve_tokens=128,
+            safety_margin_tokens=128,
+        )
+
+    assert "required_tool_schemas" in caught.value.required_components
+
+
 def test_duplicate_component_names_fail_instead_of_producing_ambiguous_metrics():
     with pytest.raises(ValueError, match="must be unique"):
         frontier.plan_prompt(
@@ -519,7 +570,7 @@ def test_tool_loop_rejects_unconfigured_custom_limit_before_provider_io(monkeypa
     monkeypatch.setenv(frontier._UNAUDITED_DEFAULT_ENV, "0")
     calls = []
 
-    async def provider(_config, _messages, *, tools=None):
+    async def provider(_config, _messages, *, tools=None, **kwargs):
         calls.append(tools)
         return {"reply": "not reached", "tool_calls": [], "usage": {}}
 
@@ -568,7 +619,7 @@ def test_round_frontier_stops_aggregate_native_transcript_before_provider_call(
         for index in range(1, 5)
     ]
 
-    async def provider(_config, messages, *, tools=None):
+    async def provider(_config, messages, *, tools=None, **kwargs):
         calls.append((list(messages), tools))
         return scripted.pop(0)
 
@@ -586,9 +637,16 @@ def test_round_frontier_stops_aggregate_native_transcript_before_provider_call(
             ],
             provider_config=provider_client.ProviderConfig(
                 "custom",
-                "test-150k",
+                "test-160k",
                 "key",
-                context_window_tokens=150_000,
+                # 160K, not a knife-edge window: round 3's prompt is two 65K
+                # exchanges PLUS the real tool catalog. At 150K the catalog had
+                # ~2.4K bytes of slack, so any capability addition flipped
+                # round 3 into "omit atomic tool_schemas" (tools=None => an
+                # early terminal round) instead of the round-4 transcript
+                # exhaustion this test is about. The headroom keeps the tested
+                # boundary the aggregate transcript, not the catalog's size.
+                context_window_tokens=160_000,
             ),
             fold_before_first=True,
             tool_result_char_cap=65_000,
@@ -616,7 +674,7 @@ def test_round_frontier_stops_aggregate_native_transcript_before_provider_call(
 def test_late_input_is_in_required_frontier_before_first_provider_call(monkeypatch):
     calls = []
 
-    async def provider(_config, _messages, *, tools=None):
+    async def provider(_config, _messages, *, tools=None, **kwargs):
         calls.append(tools)
         return {"reply": "not reached", "tool_calls": [], "usage": {}}
 
@@ -652,7 +710,7 @@ def test_tool_catalog_is_counted_and_omitted_whole_when_only_it_does_not_fit(
 ):
     calls = []
 
-    async def provider(_config, messages, *, tools=None):
+    async def provider(_config, messages, *, tools=None, **kwargs):
         calls.append((list(messages), tools))
         return {"reply": "text-only", "tool_calls": [], "usage": {}}
 
@@ -719,7 +777,7 @@ def test_adaptive_round_reports_tail_window_to_metrics_and_trajectory(monkeypatc
                 "source_truncated": False,
             }
 
-    async def provider(_config, messages, *, tools=None):
+    async def provider(_config, messages, *, tools=None, **kwargs):
         calls.append((messages, tools))
         return {"reply": "ok", "tool_calls": [], "usage": {}}
 
@@ -775,7 +833,7 @@ def test_adaptive_required_exhaustion_is_counted_and_still_raised(monkeypatch):
                 limit_source="provider_metadata",
             )
 
-    async def provider(_config, messages, *, tools=None):
+    async def provider(_config, messages, *, tools=None, **kwargs):
         provider_calls.append(messages)
         return {"reply": "not reached", "tool_calls": [], "usage": {}}
 

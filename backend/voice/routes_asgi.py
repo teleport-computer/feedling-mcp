@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import hmac
 import ipaddress
 import json
 import logging
@@ -23,16 +24,37 @@ from asgi.deps import require_auth, require_scope
 from chat import idempotency as chat_idempotency
 from core import envelope as core_envelope
 from core import voice_token
+from core import wake_bus
 from hosted import chat_send_core
 from hosted import config_store as hosted_config_store
 from notices import catalog as notices_catalog
 from voice import results
+from voice.message_filter import is_meaningful_voice_message
 
 router = APIRouter()
 log = logging.getLogger("feedling.voice.gateway")
 
 _VOICE_NAMESPACE = uuid.UUID("c1673607-3107-4554-87a1-5a8f55b70023")
 _VOICE_BUFFER_TEXT = "... "
+# 「这一轮不说话」也必须是一个**带正文**的 completion。
+#
+# 2026-08-08 线上事故:噪音轮/生命周期已结束/本轮被更新的 ASR 取代这三条路径都
+# 返回了一个零 content 的 SSE 流(只有 role 块 + finish 块)。ElevenLabs 的
+# Custom LLM 拿到没有任何正文的 completion 会判协议错误
+# —— `1002 custom_llm_error: LLM Cascade Error` —— 然后**杀掉整通电话**,
+# 用户侧看到的是「暂时无法通话」。客户端日志里的前一行正是
+# `ignored control-only agent response`。
+#
+# 用 ElevenLabs **自己文档里的**缓冲串,而不是一个空格。
+# 理由是证据而非推测:主流程每一轮开头都无条件发这个串(见 _VOICE_BUFFER_TEXT
+# 的用法),线上每一通正常电话都经过它 —— 所以我们**已知**它不会被判成空、
+# 不会杀通话。空格没有这个证据,而且 ElevenLabs 完全可能把纯空白 trim 掉后
+# 仍判成「没有文本」(codex 提的风险,我无法在不真打一通电话的情况下证伪)。
+# 绝不要在这里放真实文案:那等于替伴侣说了它没说过的话。
+#
+# ⚠️ 更正的长期做法是 ElevenLabs 的 Skip Turn 系统工具(语义上就是"这轮不说话"),
+# 需要改 agent 配置 + 返回工具调用,不在本批。
+_VOICE_SILENT_TURN_TEXT = _VOICE_BUFFER_TEXT
 
 
 def _gateway_url(request: Request) -> str | None:
@@ -61,6 +83,13 @@ def _gateway_url(request: Request) -> str | None:
     if parsed.scheme != "https" and not allow_private:
         return None
     return url
+
+
+def _positive_int(value) -> int:
+    try:
+        return max(0, int(value or 0))
+    except (TypeError, ValueError):
+        return 0
 
 
 def _content_text(content) -> str:
@@ -99,6 +128,25 @@ def _last_user_turn(payload: dict) -> tuple[str, int] | None:
 def _voice_turn_id(user_turn_index: int) -> str:
     """Keep ASR revisions of the same utterance in one logical voice turn."""
     return str(max(1, user_turn_index))
+
+
+def _voice_revision_turn_id(
+    call_id: str,
+    logical_turn_id: str,
+    message: str,
+    *,
+    secret_key: bytes,
+) -> str:
+    """Stable opaque delivery id for one exact ASR revision.
+
+    ElevenLabs can issue another Custom LLM request for the same logical user
+    turn after a short pause.  The logical id groups those revisions; this
+    content-bound id isolates their reply streams and transport idempotency.
+    HMAC keeps short spoken phrases out of plaintext routing metadata.
+    """
+    label = f"{call_id}\n{logical_turn_id}\n{message}".encode("utf-8")
+    digest = hmac.new(secret_key, label, hashlib.sha256).hexdigest()[:20]
+    return f"{logical_turn_id}.{digest}"
 
 
 def _voice_session_context(payload: dict) -> tuple[str, str, str, list[str]]:
@@ -182,6 +230,7 @@ def _resident_voice_send_core(
     client_msg_id: str,
     call_id: str,
     turn_id: str,
+    logical_turn_id: str,
 ) -> tuple[dict, int]:
     """Put a voice transcript through the same lane as resident text chat."""
     envelope, envelope_error = core_envelope._build_shared_envelope_for_store(
@@ -200,7 +249,12 @@ def _resident_voice_send_core(
         envelope,
         client_msg_id=client_msg_id,
         window_sec=chat_idempotency.CLIENT_MSG_ID_WINDOW_SEC,
-        extra={"voice_call_id": call_id, "voice_turn_id": turn_id},
+        extra={
+            "voice_call_id": call_id,
+            "voice_turn_id": turn_id,
+            "voice_logical_turn_id": logical_turn_id,
+            "voice_turn_status": "current",
+        },
     )
     if inserted:
         store.notify_chat_waiters()
@@ -231,11 +285,39 @@ def _voice_error_text(body: dict) -> str:
     return notices_catalog.user_text_for(code)
 
 
+def _empty_call_note(duration_sec: int, reason: str) -> str:
+    """一句内容都没有的通话,归档里留下的那行字。
+
+    Seven 2026-08-10 定稿:**所有通话一律归档**,没聊出内容的也要,写明大致
+    时长和情况就行。以前这种通话是被直接删掉的 —— 用户事后完全无从知道自己
+    那天打过电话,而"遗漏"是这条链上最不能接受的失败。
+    """
+    seconds = max(0, int(duration_sec or 0))
+    if seconds >= 60:
+        span = f"约 {max(1, round(seconds / 60))} 分钟"
+    elif seconds > 0:
+        span = f"{seconds} 秒"
+    else:
+        span = "很短"
+    tail = "（通话未能正常建立）" if reason in {
+        "connect_failed", "fail", "runtime_error",
+    } else ""
+    return (
+        f"（这通电话持续了{span},没有产生可记录的对话内容。{tail}）"
+    )
+
+
 def _streaming_text_response(request_id: str, text: str) -> StreamingResponse:
+    # 空文本会退化成一个**零 content 块**的流,ElevenLabs 判协议错误并拆掉整通
+    # 电话(见 _VOICE_SILENT_TURN_TEXT)。保证放在这里而不是各调用点:调用点是
+    # 开集(噪音轮/生命周期已结束/以后还会有别的"这一轮不说话"),漏一个就是
+    # 一次线上事故。主流程那个生成器不受影响 —— 它开头无条件发 "... " 缓冲块。
+    body = text if text else _VOICE_SILENT_TURN_TEXT
+
     async def stream():
         yield _sse_chunk(request_id, role="assistant")
-        for offset in range(0, len(text), 18):
-            yield _sse_chunk(request_id, content=text[offset : offset + 18])
+        for offset in range(0, len(body), 18):
+            yield _sse_chunk(request_id, content=body[offset : offset + 18])
             await asyncio.sleep(0)
         yield _sse_chunk(request_id, finish="stop")
         yield "data: [DONE]\n\n"
@@ -270,12 +352,369 @@ async def create_voice_session(
         )
     except RuntimeError:
         return JSONResponse({"error": "voice_gateway_not_configured"}, status_code=503)
+    try:
+        import db as _db
+
+        await threadpool.run_db(
+            _db.voice_call_create_active, auth.user_id, call_id
+        )
+    except Exception as exc:  # noqa: BLE001 — no token without its tombstone row
+        log.warning(
+            "[voice.session] lifecycle create failed user=%s type=%s",
+            auth.user_id[:12],
+            type(exc).__name__,
+        )
+        return JSONResponse({"error": "voice_session_unavailable"}, status_code=503)
     return {
         "call_id": call_id,
         "token": token,
         "gateway_url": gateway_url,
         "expires_at": expires_at,
     }
+
+
+@router.post("/v1/voice/cancel")
+async def cancel_voice_call(
+    request: Request, auth: AuthResult = Depends(require_auth)
+):
+    """Idempotently end an unarchived call and suppress every late reply."""
+    from core import store as core_store
+    import db as _db
+    from voice import cleanup as voice_cleanup
+    from voice import transcript_store
+
+    payload = (await asgi_http.read_json_silent(request)) or {}
+    if not isinstance(payload, dict):
+        return JSONResponse({"error": "invalid_request"}, status_code=400)
+    call_id = str(payload.get("call_id") or "").strip()
+    reason = str(payload.get("reason") or "").strip()
+    if not call_id.startswith("vcall_") or len(call_id) > 96:
+        return JSONResponse({"error": "call_id_required"}, status_code=400)
+    if (
+        not reason
+        or len(reason) > 64
+        or any(not char.isprintable() for char in reason)
+    ):
+        return JSONResponse({"error": "cancel_reason_required"}, status_code=400)
+    # 归档也需要这两个:时长写进空通话的说明,mid 是那张卡的确定性 id
+    # (与 finalize 同一个命名空间,所以两条路写出来的卡是同一张)。
+    duration_sec = _positive_int(payload.get("duration_sec"))
+    mid = voice_cleanup.transcript_card_message_id(call_id)
+
+    user_id = auth.user_id
+
+    def _cancel() -> tuple[dict, int]:
+        # ⚠️ 2026-08-10 起 cancel **不再是「删掉」,而是「用服务器自己有的内容归档」**。
+        #
+        # 客户端只按**它自己看到的** SDK 转写列表判空
+        # (VoiceCallTerminationPolicy: turns.isEmpty ? .cancel : .finalize),
+        # 而那份列表落定晚于服务端落行:说完立刻挂断/切后台时,服务端明明已经有
+        # 真实的一问一答。旧实现在这里把那些行直接删掉 —— **整通电话永久消失**,
+        # 而且墓碑之后一直 409 挡住任何补救。Seven 定稿:所有通话一律归档,
+        # 一句内容都没有的也归档一条说明,**绝不允许遗漏或删除**。
+        #
+        # 所以这里走的是 finalize 的同一把生命周期锁:cancel 只是「finalize,
+        # 但转写由服务端自己重建」。这样也不再需要那个「留着行等后续 finalize」
+        # 的可恢复中间态 —— 归档当场就完成了。
+        lifecycle = _db.voice_call_begin_finalize(user_id, call_id)
+        if lifecycle.get("replayed") and lifecycle["status"] in {
+            "finalizing", "finalized",
+        }:
+            # 只在**别人正占着**时退让。判据是 replayed 而不是光看状态:
+            # begin_finalize 自己抢到时也返回 "finalizing"(replayed=False),
+            # 按状态判的话正在进行的 finalize 会被当成"还没人做",cancel 接着
+            # 归档同一通 —— 双重归档 + 和它抢行。既有用例
+            # test_cancel_route_does_not_clean_when_finalize_already_won 当场抓到。
+            #
+            # ⚠️ status == "cancelled" 故意**不**在这里退:那是旧版本(或一次中途
+            # 崩掉的取消)留下的状态,重放必须继续往下收敛 —— 缺归档就补归档、
+            # 该清的清干净。退让会让那种通话永远停在半成品状态。
+            return {
+                "status": lifecycle["status"], "call_id": call_id,
+                "replayed": True, "deleted": 0,
+                "retained_covered": 0, "remaining": 0,
+            }, 200
+        store = core_store.get_store(user_id)
+        if not transcript_store.exists(user_id, call_id):
+            runtime_token = results.mint_enclave_token(user_id)
+            turns = voice_cleanup.transcript_turns_from_rows(
+                user_id, call_id, runtime_token=runtime_token,
+            )
+            speaker_user, speaker_ai = transcript_store.resolve_speaker_names(
+                store, runtime_token=runtime_token,
+            )
+            text = transcript_store.render_transcript(
+                turns, user_name=speaker_user, ai_name=speaker_ai,
+            )
+            if not text:
+                # 一句话都没有的通话也要归档。留一条说明,而不是当它没发生过:
+                # 用户看到「这通电话没聊出什么」远好于电话凭空消失,而且以后
+                # 也能回答「我那天是不是打过一个电话」。
+                text = _empty_call_note(duration_sec, reason)
+            try:
+                stats = transcript_store.persist(
+                    store, call_id, text,
+                    turn_count=len(turns), duration_sec=duration_sec,
+                    chat_message_id=mid,
+                )
+            except Exception as exc:  # noqa: BLE001 — 归档不成就什么都别动
+                log.warning(
+                    "[voice.cancel] archive failed user=%s call=%s: %s",
+                    user_id[:12], call_id[:24], str(exc)[:160],
+                )
+                return {"error": "voice_transcript_not_archived"}, 502
+            # 卡也要写。只归档不写卡的话,逐轮行删掉之后用户在聊天里**什么都
+            # 看不到** —— 归档是存了,但对用户而言这通电话依然消失了,
+            # 而"遗漏"正是这条链上最不能接受的失败。
+            if _db.chat_get_strict(user_id, mid) is None and (
+                not voice_cleanup.persist_transcript_card(
+                    store, transcript_store.build_preview(text), mid, call_id,
+                    turn_count=stats["turn_count"],
+                    duration_sec=stats["duration_sec"],
+                )
+            ):
+                return {"error": "voice_transcript_card_not_persisted"}, 502
+            log.info(
+                "[voice.cancel] archived-instead-of-deleted user=%s call=%s "
+                "turns=%d reason=%s",
+                user_id[:12], call_id[:24], len(turns), reason[:32],
+            )
+        # 归档 + 卡都落好了,这通电话到此为止是**已归档**,不是"已取消"。
+        # 标成 finalized 而不是 cancelled:后者会让任何补救性 finalize 永远 409,
+        # 而现在已经没有什么需要补救了。
+        _db.voice_call_mark_finalized(user_id, call_id)
+        handoff = results.delete_call_state(user_id, call_id)
+        cleanup = voice_cleanup.delete_call_messages(user_id, call_id)
+        store = core_store.get_store(user_id)
+        # Reload from the authoritative rows: older assistant messages may be
+        # discoverable only through reply_to_message_id and carry no call id in
+        # this worker's stale cache.
+        store.reload()
+        store.notify_chat_waiters()
+        wake_bus.notify("chat", user_id)
+        if cleanup["remaining"] > 0:
+            return {
+                "error": "voice_cleanup_incomplete",
+                "call_id": call_id,
+                **cleanup,
+                **handoff,
+            }, 502
+        log.info(
+            "[voice.cancel] ended user=%s call=%s reason=%s replay=%s",
+            user_id[:12], call_id[:24], reason, lifecycle["replayed"],
+        )
+        return {
+            "status": "cancelled",
+            "call_id": call_id,
+            "replayed": bool(lifecycle["replayed"]),
+            **cleanup,
+            **handoff,
+        }, 200
+
+    body, status = await asyncio.to_thread(_cancel)
+    return JSONResponse(body, status_code=status)
+
+
+@router.post("/v1/voice/finalize")
+async def finalize_voice_call(
+    request: Request, auth: AuthResult = Depends(require_auth)
+):
+    """Hangup: archive the full transcript, leave ONE small card, run Capture.
+
+    The live call is untouched (per-turn voice rides the normal chat lane: same
+    identity, memory and tools). At hangup the client sends the call's plaintext
+    transcript (chat rows are ciphertext the server cannot read) and three
+    things happen, in this order:
+
+    1. the FULL transcript is archived to ``voice_transcripts`` — permanent,
+       E2E-sealed, readable from Settings and by the agent's transcript tools;
+    2. one bounded preview card (``voice_call_transcript``) replaces the call's
+       per-turn rows in the chat stream, so neither the prompt tail nor the
+       history carries a whole call;
+    3. Capture is forced. It renders the archived FULL text into its window in
+       place of this card, so memory is distilled from everything that was said
+       — through the ordinary capture pipeline, not a parallel one.
+
+    There is deliberately no summary: a 1-3 sentence model-written précis was
+    both a second model call and a lossy memory input. The card's preview is
+    mechanical (head + tail), the archive holds the rest.
+
+    Idempotent: the card's message id derives from ``call_id``; a retried
+    finalize finds the row and re-runs only the (idempotent) cleanup and
+    capture nudge. On any archive/card failure the per-turn rows are KEPT
+    (nothing is lost) and the client may retry.
+    """
+    from core import store as core_store
+    from proactive import proactive_core
+    from voice import cleanup as voice_cleanup
+    from voice import transcript_store
+
+    payload = (await asgi_http.read_json_silent(request)) or {}
+    if not isinstance(payload, dict):
+        return JSONResponse({"error": "invalid_request"}, status_code=400)
+    call_id = str(payload.get("call_id") or "").strip()
+    turns = payload.get("turns")
+    if not call_id or not call_id.startswith("vcall_") or len(call_id) > 96:
+        return JSONResponse({"error": "call_id_required"}, status_code=400)
+    if not isinstance(turns, list) or not any(
+        isinstance(t, dict) and str(t.get("text") or "").strip() for t in turns
+    ):
+        return JSONResponse({"error": "turns_required"}, status_code=400)
+    if len(json.dumps(turns)) > 120_000:
+        return JSONResponse({"error": "transcript_too_long"}, status_code=413)
+    user_id = auth.user_id
+    duration_sec = _positive_int(payload.get("duration_sec"))
+    mid = voice_cleanup.transcript_card_message_id(call_id)
+
+    def _finalize() -> tuple[dict, int]:
+        import db as _db
+
+        lifecycle = _db.voice_call_begin_finalize(user_id, call_id)
+        if lifecycle["status"] == "cancelled":
+            return {"error": "voice_call_cancelled"}, 409
+        store = core_store.get_store(user_id)
+
+        # Idempotent replay. The judge is the ARCHIVE, not the chat card: the
+        # card id reuses the summary era's uuid5 namespace, so a row written by
+        # an older build would otherwise read as "already handled" and this
+        # request would delete the per-turn rows without ever storing the
+        # transcript the client just re-sent — losing the call for good.
+        archived = transcript_store.exists(user_id, call_id)
+        already = archived and _db.chat_get_strict(user_id, mid) is not None
+        if not archived:
+            # 真名优先:这份记录用户会亲眼读,Capture 也拿它当输入,两处都该看到
+            # TA 给伴侣起的名字而不是中性标签。取不到才退回既有兜底。
+            speaker_user, speaker_ai = transcript_store.resolve_speaker_names(store)
+            text = transcript_store.render_transcript(
+                turns, user_name=speaker_user, ai_name=speaker_ai)
+            if not text:
+                return {"error": "turns_required"}, 400
+            try:
+                # Archive FIRST. The per-turn rows below are the only other copy
+                # of this call, so nothing may delete them until the archive is
+                # durable. Unlike a summary this cannot degrade — it either
+                # stores every word or fails the request.
+                stats = transcript_store.persist(
+                    store, call_id, text,
+                    turn_count=len(turns), duration_sec=duration_sec,
+                    chat_message_id=mid,
+                )
+            except Exception as exc:  # noqa: BLE001 — keep rows, let client retry
+                log.warning(
+                    "[voice.finalize] archive failed user=%s call=%s: %s",
+                    user_id[:12], call_id[:24], str(exc)[:160],
+                )
+                return {"error": "voice_transcript_not_archived"}, 502
+            if _db.chat_get_strict(user_id, mid) is not None:
+                # 旧版本留下的摘要行占着这个 id。归档刚补上了,但那行的 source
+                # 仍是 voice_call_summary —— 它读得出来、也不会被 capture 展开
+                # (source 不在白名单里)。保留它而不是覆写:改写用户可见的历史
+                # 比留一条旧卡更糟,而这通电话的记忆本来也早就蒸过了。
+                log.info("[voice.finalize] legacy summary row kept user=%s call=%s",
+                         user_id[:12], call_id[:24])
+            elif not voice_cleanup.persist_transcript_card(
+                store, transcript_store.build_preview(text), mid, call_id,
+                turn_count=stats["turn_count"], duration_sec=stats["duration_sec"],
+            ):
+                return {"error": "voice_transcript_card_not_persisted"}, 502
+        lifecycle = _db.voice_call_mark_finalized(user_id, call_id)
+        if lifecycle["status"] == "cancelled":
+            return {"error": "voice_call_cancelled"}, 409
+        cleanup = voice_cleanup.delete_call_messages(user_id, call_id)
+        if cleanup["remaining"] > 0:
+            # Deletable rows survived (a DB blip inside chat_delete). The
+            # summary is durable, so a client retry re-enters via the
+            # idempotent replay path and re-runs only this cleanup.
+            log.warning(
+                "[voice.finalize] cleanup incomplete user=%s call=%s remaining=%d",
+                user_id[:12], call_id[:24], cleanup["remaining"],
+            )
+            return {"error": "voice_cleanup_incomplete"}, 502
+        # Prune this worker's hot cache and tell every other worker (same
+        # three steps clear_history performs after deleting rows). The
+        # transcript card itself must survive — it is what stands in for
+        # the call from here on.
+        with store.chat_lock:
+            store.chat_messages = [
+                m for m in store.chat_messages
+                if str(m.get("voice_call_id") or "") != call_id
+                or str(m.get("id") or "") == mid
+            ]
+        store.notify_chat_waiters()
+        wake_bus.notify("chat", user_id)
+        # Memory: one ordinary Capture round over the window that now contains
+        # this call's card. The capture handler swaps that card for the archived
+        # FULL transcript, so memory sees everything that was said — same
+        # prompt, parser, consent gate and card writer as every other capture.
+        # Safe to re-run on replay: capture is cursor-driven, so once the
+        # frontier has passed this card it cannot be distilled twice.
+        try:
+            proactive_core.capture_force(store)
+        except Exception as exc:  # noqa: BLE001 — a nudge, never the HTTP result
+            log.warning(
+                "[voice.finalize] capture nudge failed user=%s call=%s: %s",
+                user_id[:12], call_id[:24], str(exc)[:160],
+            )
+        log.info(
+            "[voice.finalize] archived user=%s call=%s turns=%d replay=%s",
+            user_id[:12], call_id[:24], len(turns), already,
+        )
+        return {
+            "status": "finalized",
+            "transcript_message_id": mid,
+            # Deprecated alias: shipped clients read summary_message_id. Dual
+            # written for one release so an older build keeps working; drop it
+            # once the transcript-card build is the floor.
+            "summary_message_id": mid,
+            "deleted_turns": cleanup["deleted"],
+            "retained_covered": cleanup["retained_covered"],
+            "replayed": already,
+        }, 200
+
+    body, status = await asyncio.to_thread(_finalize)
+    return JSONResponse(body, status_code=status)
+
+
+@router.get("/v1/voice/transcripts")
+async def list_voice_transcripts(
+    request: Request, auth: AuthResult = Depends(require_auth)
+):
+    """Newest-first list of this user's archived calls, WITHOUT the bodies.
+
+    Settings renders this; the agent's ``voice_transcript_list`` tool reads the
+    same shape. Metadata only — pulling a body is an explicit second call so a
+    listing can never blow anyone's context.
+    """
+    from voice import transcript_store
+
+    limit = _positive_int(request.query_params.get("limit")) or 50
+    items = await threadpool.run_db(
+        transcript_store.list_metadata, auth.user_id, limit=limit
+    )
+    return JSONResponse({"items": items, "count": len(items)})
+
+
+@router.get("/v1/voice/transcripts/{call_id}")
+async def get_voice_transcript(
+    call_id: str, auth: AuthResult = Depends(require_auth)
+):
+    """One archived call as its raw v1 envelope — the client decrypts locally.
+
+    Same posture as ``/v1/memory/list``: the server hands back ciphertext it
+    cannot read. Server-side readers (Capture, the agent tools) go through
+    ``transcript_store.load_plaintext`` and the enclave instead.
+    """
+    from voice import transcript_store
+
+    call_id = str(call_id or "").strip()
+    if not call_id.startswith("vcall_") or len(call_id) > 96:
+        return JSONResponse({"error": "call_id_required"}, status_code=400)
+    row = await threadpool.run_db(
+        transcript_store.get_envelope, auth.user_id, call_id
+    )
+    if row is None:
+        return JSONResponse({"error": "voice_transcript_not_found"}, status_code=404)
+    return JSONResponse(row)
 
 
 @router.post("/v1/voice/chat/completions")
@@ -312,12 +751,33 @@ async def voice_chat_completions(request: Request):
     if len(message) > 12000:
         return JSONResponse({"error": "message_too_long"}, status_code=413)
 
-    turn_id = _voice_turn_id(user_turn_index)
+    logical_turn_id = _voice_turn_id(user_turn_index)
+    turn_id = _voice_revision_turn_id(
+        call_id,
+        logical_turn_id,
+        message,
+        secret_key=results.secret(),
+    )
     client_msg_id = str(uuid.uuid5(_VOICE_NAMESPACE, f"{call_id}:{turn_id}"))
     user_id = str(claims["user_id"])
     request_id = "chatcmpl-" + hashlib.sha256(
         f"{call_id}:{turn_id}".encode("utf-8")
     ).hexdigest()[:24]
+    if not is_meaningful_voice_message(message):
+        log.info(
+            "[voice.gateway] turn ignored user=%s reason=non_speech",
+            user_id[:12],
+        )
+        return _streaming_text_response(request_id, _VOICE_SILENT_TURN_TEXT)
+
+    import db as _db
+
+    if await threadpool.run_db(_db.voice_call_status, user_id, call_id) in {
+        "finalizing",
+        "cancelled",
+        "finalized",
+    }:
+        return _streaming_text_response(request_id, _VOICE_SILENT_TURN_TEXT)
 
     from core import store as core_store
 
@@ -342,6 +802,7 @@ async def voice_chat_completions(request: Request):
                 client_msg_id=client_msg_id,
                 call_id=call_id,
                 turn_id=turn_id,
+                logical_turn_id=logical_turn_id,
             )
         else:
             body, status = await threadpool.run_db(
@@ -350,7 +811,11 @@ async def voice_chat_completions(request: Request):
                 api_key=None,
                 runtime_tok=results.mint_enclave_token(user_id),
                 payload={"message": message, "client_msg_id": client_msg_id},
-                voice_context={"call_id": call_id, "turn_id": turn_id},
+                voice_context={
+                    "call_id": call_id,
+                    "turn_id": turn_id,
+                    "logical_turn_id": logical_turn_id,
+                },
             )
     if status >= 400:
         code = str(body.get("error") or "unknown")
@@ -386,14 +851,65 @@ async def voice_chat_completions(request: Request):
         first_real_content_at: float | None = None
         buffer_count = 1
         next_keepalive = time.monotonic() + 3.5
+        next_lifecycle_check = time.monotonic()
+        next_revision_check = time.monotonic()
         reply = None
         while time.monotonic() < deadline:
+            now = time.monotonic()
+            if now >= next_lifecycle_check:
+                status = await threadpool.run_db(
+                    _db.voice_call_status, user_id, call_id
+                )
+                if status in {"finalizing", "cancelled", "finalized"}:
+                    log.info(
+                        "[voice.gateway] stream stopped user=%s status=%s",
+                        user_id[:12], status,
+                    )
+                    break
+                next_lifecycle_check = now + 0.6
+            if now >= next_revision_check:
+                current = await threadpool.run_db(
+                    results.is_current_voice_turn,
+                    user_id,
+                    parent_message_id=message_id,
+                )
+                if not current:
+                    yield _sse_chunk(request_id, finish="stop")
+                    yield "data: [DONE]\n\n"
+                    log.info(
+                        "[voice.gateway] stream superseded user=%s",
+                        user_id[:12],
+                    )
+                    return
+                next_revision_check = now + 0.5
             snapshots = await threadpool.run_db(
                 results.load_stream_texts,
                 user_id,
                 call_id=call_id,
                 turn_id=turn_id,
             )
+            has_new_stream_text = any(
+                _incremental_suffix(
+                    streamed_by_segment.get(int(snapshot.get("segment") or 0), ""),
+                    str(snapshot.get("text") or ""),
+                )
+                for snapshot in snapshots
+            )
+            if has_new_stream_text:
+                current = await threadpool.run_db(
+                    results.is_current_voice_turn,
+                    user_id,
+                    parent_message_id=message_id,
+                )
+                if not current:
+                    yield _sse_chunk(request_id, finish="stop")
+                    yield "data: [DONE]\n\n"
+                    log.info(
+                        "[voice.gateway] stream superseded before content user=%s",
+                        user_id[:12],
+                    )
+                    return
+                next_revision_check = time.monotonic() + 0.5
             for snapshot in snapshots:
                 segment = int(snapshot.get("segment") or 0)
                 text = str(snapshot.get("text") or "")
@@ -448,12 +964,33 @@ async def voice_chat_completions(request: Request):
                 buffer_count += 1
                 next_keepalive = now + 3.5
             await asyncio.sleep(0.15)
-        if reply is None:
+        lifecycle_status = await threadpool.run_db(
+            _db.voice_call_status, user_id, call_id
+        )
+        if reply is None and lifecycle_status not in {
+            "finalizing",
+            "cancelled",
+            "finalized",
+        }:
             reply = {
                 "message_id": "",
                 "text": notices_catalog.user_text_for("turn_timeout"),
             }
-        text = str(reply.get("text") or "")
+        if lifecycle_status not in {"finalizing", "cancelled", "finalized"}:
+            current = await threadpool.run_db(
+                results.is_current_voice_turn,
+                user_id,
+                parent_message_id=message_id,
+            )
+            if not current:
+                yield _sse_chunk(request_id, finish="stop")
+                yield "data: [DONE]\n\n"
+                log.info(
+                    "[voice.gateway] stream superseded before final user=%s",
+                    user_id[:12],
+                )
+                return
+        text = str((reply or {}).get("text") or "")
         latest_segment = max(streamed_by_segment, default=-1)
         streamed_final = streamed_by_segment.get(latest_segment, "")
         remaining = _final_suffix(streamed_final, text)

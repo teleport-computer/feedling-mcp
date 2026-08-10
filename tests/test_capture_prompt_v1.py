@@ -15,6 +15,8 @@ from memory.capture_prompt_v1 import (  # noqa: E402
     capture_semantic_retry_reasons,
     parse_capture_cards,
 )
+from memory.card_text import extract_json_block  # noqa: E402
+from core import self_thinking  # noqa: E402
 
 _FENCE = "`" * 3
 
@@ -53,20 +55,42 @@ def test_prompt_naming_rule_uses_known_name():
     assert "提到 Seven 就用「Seven」" in p
     assert '永远不要用"用户"/"user"' in p
     # TA is an instruction/transcript marker only — outputs must not use it.
-    assert "不要用「TA」指代对方" in p
+    assert "不要用「TA」指代本人" in p
 
 
 def test_prompt_naming_rule_without_name_uses_relationship_referent():
-    """No name yet → omit the subject, or use neutral 对方 when necessary."""
+    """No name yet → omit the subject; 对方 is the LAST resort, not the default.
+
+    2026-08-09: the old rule degraded to 「对方」 whenever ``user_name`` was
+    empty and flatly banned 他/她 as "gender guessing".  usr_144b never typed a
+    name into settings (she only ever talked to her partner), so every card
+    about her said 「对方」 — including the ones capture had originally written
+    correctly as 「她」.  "Field not filled in" is not "we don't know who this
+    person is": an evidence-backed pronoun is not a guess.
+    """
     p = build_capture_prompt(
         ai_name="", user_name="", buckets="", threads="", identity="", window="",
     )
     assert "优先省略主语" in p
-    assert "确实需要主语时只用中性的「对方」" in p
-    assert "猜测性别的他/她" in p
+    # 线索够就用 他/她,「对方」只兜最后一档。
+    assert "判断性别" in p and "用「他」或「她」" in p
+    assert "线索不足以判断，才用中性的「对方」" in p
+    assert "猜测性别" not in p
+    # 仍然禁的三样,一样都不能松。
     assert "第二人称「你」" in p
     assert '永远不要用"用户"/"user"' in p
-    assert "不要用「TA」指代对方" in p
+    assert "不要用「TA」指代本人" in p
+
+
+def test_capture_prompt_marks_对方_as_a_placeholder_label_not_a_referent():
+    """转写标签 > prompt(2026-07-27 教训):名字未知时每一行都标「对方:」,
+    模型会照抄标签。所以放开称呼规则的同时必须点明这个标签只是占位。"""
+    p = build_capture_prompt(
+        ai_name="", user_name="", buckets="", threads="", identity="",
+        window="- 对方: 老公我到家了",
+    )
+    assert "那只是标签" in p
+    assert "卡里怎么称呼，按上面那条规则判断" in p
 
 
 def test_reserved_placeholder_names_are_treated_as_unknown():
@@ -130,6 +154,47 @@ def test_parse_handles_prose_wrapped_and_clamps():
     assert err is None and len(cards) == 1
     assert cards[0]["action"] == "merge" and cards[0]["target_id"] == "mom_1"
     assert cards[0]["importance"] == 1.0 and cards[0]["pulse"] == 0.0
+
+
+def test_parse_ignores_balanced_fake_json_inside_thinking():
+    """Prod regression: a thinking relay put brace-shaped reasoning before JSON.
+
+    The legacy extractor stopped at the first balanced braces, so this exact
+    shape returned ``json_decode_error`` even though the public reply was valid.
+    """
+    raw = (
+        '<think>先试草稿 {"cards": [not valid]}，再给正式答案。</think>\n'
+        '{"cards":[{"action":"add","summary":"记得按时休息",'
+        '"content":"她说最近连续熬夜，希望以后提醒她早点休息。"}]}'
+    )
+
+    cards, err = parse_capture_cards(raw)
+
+    assert err is None
+    assert [card["summary"] for card in cards] == ["记得按时休息"]
+
+
+def test_parse_thinking_without_braces_keeps_existing_behavior():
+    raw = '<think>我先判断这件事值得长期记住。</think>{"cards": []}'
+    cards, err = parse_capture_cards(raw)
+    assert cards == [] and err is None
+
+
+def test_parse_truncated_json_stays_no_json_object():
+    cards, err = parse_capture_cards('{"cards":[{"action":"add"}')
+    assert cards == [] and err == "no_json_object"
+
+
+def test_extract_json_falls_back_to_raw_when_thinking_strip_fails():
+    raw = (
+        '<think>outer <thinking>nested</thinking></think>'
+        '{"cards": []}'
+    )
+    status, _thinking, reply = self_thinking.strip_all_thinking(
+        raw, sanitize=False
+    )
+    assert status == self_thinking.FAILED and reply == ""
+    assert extract_json_block(raw) == '{"cards": []}'
 
 
 def test_parse_garbage_returns_reason():

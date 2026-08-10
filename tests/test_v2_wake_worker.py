@@ -642,6 +642,80 @@ def test_run_wake_degenerate_reply_fails_silently(monkeypatch):
     assert not any(event["kind"] == "error" for event in _status_events(uid))
 
 
+def test_heartbeat_thinking_only_is_successful_silence_without_backoff(
+    monkeypatch,
+):
+    monkeypatch.delenv("FEEDLING_V2_SELF_THINKING", raising=False)
+    uid = "u_wake_thinking_only"
+    conftest.seed_user(uid)
+    _reset(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, "heartbeat")
+    claimed_by = _claim(job_id)
+    _script_provider(monkeypatch, [_text_round("<think>这次不打扰她了</think>")])
+    writes = []
+    monkeypatch.setattr(
+        worker,
+        "_write_encrypted_reply",
+        lambda *_args, **_kwargs: writes.append(True),
+    )
+    deps = _wake_deps(
+        tail=[{"id": "m1", "ts": 1.0, "role": "user", "content": "hi"}]
+    )
+
+    status = asyncio.run(
+        worker._run_wake(
+            job_id,
+            uid,
+            "heartbeat",
+            deps,
+            _BYOK,
+            worker.ENCLAVE_SEMAPHORE,
+            claimed_by,
+        )
+    )
+
+    assert status == "completed"
+    assert _job_status(job_id) == ("completed", None)
+    assert writes == []
+    schedule = jobs_store.get_wake_schedule(uid)
+    assert schedule is None or schedule["proactive_backoff_until"] is None
+
+
+def test_scheduled_thinking_only_remains_a_must_deliver_failure(monkeypatch):
+    monkeypatch.delenv("FEEDLING_V2_SELF_THINKING", raising=False)
+    uid = "u_scheduled_thinking_only"
+    conftest.seed_user(uid)
+    _reset(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, "scheduled")
+    claimed_by = _claim(job_id)
+    _script_provider(monkeypatch, [_text_round("<think>提醒必须送达</think>")])
+    writes = []
+    monkeypatch.setattr(
+        worker,
+        "_write_encrypted_reply",
+        lambda *_args, **_kwargs: writes.append(True),
+    )
+
+    status = asyncio.run(
+        worker._run_wake(
+            job_id,
+            uid,
+            "scheduled",
+            _wake_deps(tail=[]),
+            _BYOK,
+            worker.ENCLAVE_SEMAPHORE,
+            claimed_by,
+        )
+    )
+
+    assert status == "failed"
+    # 2026-08-07:持久码从 empty_reply 拆出来 —— 模型给过完整 <think>、是我们
+    # 剥空的,与「provider 什么都没给」必须能在 admin 上分开看(归因仍是 system)。
+    assert _job_status(job_id) == ("failed", "wake_failed:thinking_only_no_reply")
+    assert writes == []
+    assert jobs_store.get_wake_schedule(uid)["proactive_backoff_until"] is not None
+
+
 def test_run_scheduled_wake_prompts_with_the_exact_due_reminders(monkeypatch):
     uid = "u_wake_scheduled_notes"
     conftest.seed_user(uid)

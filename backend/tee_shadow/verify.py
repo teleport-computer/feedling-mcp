@@ -117,6 +117,10 @@ _CIPHERTEXT_TABLES: dict[str, dict] = {
         rds_table="v2_workspace_entries", tee_table="v2_workspace_entries",
         item_col="path", pending_table="v2_workspace_entries",
         kind=None, strict=False),
+    "voice_transcripts": dict(
+        rds_table="voice_transcripts", tee_table="voice_transcripts",
+        item_col="call_id", pending_table="voice_transcripts", kind=None,
+    ),
 }
 
 

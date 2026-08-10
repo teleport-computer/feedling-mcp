@@ -133,3 +133,77 @@ def test_migrate_polluted_bucket_gets_localized_default():
     assert err is None
     assert len(upgrades) == 1
     assert upgrades[0]["bucket"] == "未分类"       # 脏桶 → 就地降级(不是空串)
+
+
+# --- 拒绝路径:墓碑注记 → 400(2026-08-06 usr_a40e 徒手 patch 潮) -----------
+
+
+def test_supersede_rejects_tombstone_note():
+    # usr_a40e 实况形状:agent 徒手 memory-patch 把「已被 <卡id> 取代」写成新卡。
+    body, effects, code = actions._memory_supersede_action(None, None, {
+        "type": "memory.supersede",
+        "supersedes": ["c42ebb9618ae447df9d52107ea15de85"],
+        "memory": {
+            "type": "fact",
+            "title": "已被 c42ebb9618ae447df9d52107ea15de85 取代——绿豆汤偏好",
+            "summary": "已被 c42ebb9618ae447df9d52107ea15de85 取代——绿豆汤偏好",
+            "content": "已被 c42ebb9618ae447df9d52107ea15de85 取代——饮食禁忌详情。",
+        },
+    })
+    assert code == 400
+    assert body.get("error") == "memory_card_tombstone"
+
+
+def test_add_rejects_tombstone_note():
+    body, _effects, code = actions._memory_add_action(None, {
+        "type": "fact",
+        "memory": {
+            "summary": "superseded by 1a1f94f9fdc9ec86 — old note",
+            "content": "superseded by 1a1f94f9fdc9ec86 — merged elsewhere.",
+            "title": "superseded by 1a1f94f9fdc9ec86",
+        },
+    })
+    assert code == 400
+    assert body.get("error") == "memory_card_tombstone"
+
+
+def test_supersede_prose_about_replacement_without_hex_not_rejected_by_tombstone_gate():
+    # 正常散文「已被新手机取代」不带 hex id —— 不许被墓碑闸拦。store=None:
+    # 通过闸后会在碰 DB 时炸,借 AttributeError 证明「没有在闸上被拒」。
+    import pytest
+    with pytest.raises(AttributeError):
+        actions._memory_supersede_action(None, None, {
+            "type": "memory.supersede",
+            "supersedes": ["some_old_card_id_1234"],
+            "memory": {
+                "type": "fact",
+                "title": "换了新手机",
+                "summary": "换了新手机",
+                "content": "旧手机已被新手机取代,数据迁移顺利。",
+            },
+        })
+
+
+def test_tombstone_gate_survives_guard_kill_switch(monkeypatch):
+    """codex2 P1:FEEDLING_MEMORY_CARD_GUARD=0 只许关协议残片检测,
+    墓碑闸必须无条件 —— 止血关协议闸时不许顺手重开 usr_a40e 事故路。"""
+    monkeypatch.setattr(actions.card_guard, "guard_enabled", lambda: False)
+    tomb = "已被 c42ebb9618ae447df9d52107ea15de85 取代——绿豆汤偏好"
+
+    body, _e, code = actions._memory_supersede_action(None, None, {
+        "type": "memory.supersede", "supersedes": ["x"],
+        "memory": {"type": "fact", "title": tomb, "summary": tomb, "content": tomb},
+    })
+    assert (code, body.get("error")) == (400, "memory_card_tombstone")
+
+    body, _e, code = actions._memory_add_action(None, {
+        "type": "fact",
+        "memory": {"title": tomb, "summary": tomb, "content": tomb},
+    })
+    assert (code, body.get("error")) == (400, "memory_card_tombstone")
+
+    body, _e, code = actions._memory_upgrade_action(None, None, {
+        "memory_id": "m1",
+        "v1": {"summary": tomb, "content": tomb},
+    })
+    assert (code, body.get("error")) == (400, "memory_card_tombstone")

@@ -7,9 +7,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "backend"))
 from memory.dream_prompt_v1 import (  # noqa: E402
     DREAM_OPS,
     build_dream_prompt,
-    build_dream_review_prompt,
     parse_dream_consolidations,
-    parse_dream_review,
 )
 
 _FENCE = "`" * 3
@@ -44,15 +42,34 @@ def test_prompt_naming_rule_and_backfill_instruction():
     assert "提到 Seven 就用「Seven」" in p
     flat = p.replace("\n", "").replace(" ", "")
     assert '永远不要用"用户"/"user"' in flat
-    assert "不要用「TA」指代对方" in flat
+    assert "不要用「TA」指代本人" in flat
     # Backfill is scoped: only TA that refers to the PERSON gets rewritten;
     # TA correctly referring to the AI (the app-surface meaning) is preserved.
-    assert '指代对方本人的"用户"/"user"/「TA」/「你」/猜测性别的他或她' in flat
-    assert "名字未知时优先省略主语" in flat
-    assert "中性的「对方」" in flat
+    assert '指代本人的"用户"/"user"/「TA」/「你」/「对方」按上面那条' in flat
     assert "指代你（AI）的「TA」" in flat and "保留不动" in flat
     p2 = build_dream_prompt(ai_name="", user_name="", cards="", recent_conversations="")
     assert "优先省略主语" in p2
+
+
+def test_dream_backfill_does_not_downgrade_correct_pronouns():
+    """Dream must NOT rewrite an already-correct 「她」 into 「对方」.
+
+    usr_144b, 2026-08-09: capture read the transcript and wrote 「陪她分析母亲
+    王福英的住院检验报告」; that night dream followed its own backfill clause
+    (「把…猜测性别的他或她改成…名字未知时…中性的「对方」」) and produced
+    「陪对方分析…」 — a self-declared soulmate calling her 「对方」 in its own
+    memory.  The backfill list must no longer contain gender pronouns, and the
+    prompt must say correct ones are kept.
+    """
+    flat = build_dream_prompt(
+        ai_name="小柒", user_name="", cards="", recent_conversations="",
+    ).replace("\n", "").replace(" ", "")
+    assert "猜测性别的他或她" not in flat, "追溯改写清单里不能再有性别代词"
+    assert "旧卡里已经在用的「他」/「她」保留不动" in flat
+    # 反过来:旧卡里的「对方」进了改写清单 —— 线索够就该上调成 他/她,
+    # 存量脏卡靠 dream 自愈,不用单独回填。
+    assert "/「对方」按上面那条" in flat
+    assert "没名字但线索够就用「他」/「她」" in flat
 
 
 def test_reserved_placeholder_user_name_treated_as_unknown():
@@ -76,6 +93,15 @@ def test_parse_normal_consolidation():
     assert c["rationale"] == "同一加班事件的连续记录"
     assert c["result"]["summary"] == "合并卡" and c["result"]["importance"] == 0.7
     assert qs == ["要不要问 TA X"]
+
+
+def test_parse_ignores_fake_json_inside_thinking():
+    raw = (
+        '<think>草稿 {"consolidations": [not valid]}</think>'
+        '{"consolidations": [], "questions_to_ask": []}'
+    )
+    cons, questions, err = parse_dream_consolidations(raw)
+    assert cons == [] and questions == [] and err is None
 
 
 def test_parse_empty_is_clean():
@@ -142,31 +168,70 @@ def test_parse_keeps_questions_even_when_no_consolidations():
 def test_dream_ops_are_merge_thicken_supersede():
     assert set(DREAM_OPS) == {"merge", "thicken", "supersede"}
 
+# ---------------------------------------------------------------------------
+# 2026-08-05 dream 阀门重构(usr_a40e 墓碑卡事故)
+# 语义审查员与 15% 增量栅栏已拆除;替代防线是确定性的卡id泄漏闸 + 墓碑短语闸。
+# ---------------------------------------------------------------------------
 
-def test_review_prompt_contains_source_cards_proposal_and_evolution_rule():
-    prompt = build_dream_review_prompt(
-        consolidation={
-            "op": "merge",
-            "card_ids": ["plan", "ticket"],
-            "rationale": "同一京都计划从意向推进到出票",
-            "result": {"summary": "11 月去京都", "content": "已经订票。"},
-        },
-        source_cards=[
-            {"id": "plan", "summary": "想去京都看红叶", "content": "计划秋天出发。"},
-            {"id": "ticket", "summary": "订了京都机票", "content": "航班在 11 月。"},
-        ],
+
+def test_prompt_forbids_tombstone_notes_and_card_ids():
+    p = build_dream_prompt(ai_name="", user_name="", cards="", recent_conversations="")
+    flat = p.replace("\n", "").replace(" ", "")
+    assert "新卡的内容本身" in flat
+    assert "已被X取代" in flat.replace("「", "").replace("」", "")
+    assert "绝不出现卡id" in flat
+
+
+def _consolidation_raw(summary: str, content: str) -> str:
+    import json as _json
+
+    return _json.dumps({
+        "consolidations": [{
+            "op": "supersede",
+            "card_ids": ["c42ebb9618ae447df9d52107ea15de85"],
+            "rationale": "同一饮食偏好的更新",
+            "result": {"bucket": "饮食", "threads": ["偏好"],
+                       "summary": summary, "content": content},
+        }],
+        "questions_to_ask": [],
+    }, ensure_ascii=False)
+
+
+def test_parse_bounces_result_containing_known_card_id():
+    known = {"c42ebb9618ae447df9d52107ea15de85", "1a1f94f9fdc9ec8649f81a7fbc0bee08"}
+    raw = _consolidation_raw(
+        "夏天常喝绿豆汤解暑",
+        "1a1f94f9fdc9ec8649f81a7fbc0bee08 记录的饮食禁忌合并到这里。",
     )
+    cons, _qs, err = parse_dream_consolidations(raw, known_ids=known)
+    assert cons == [] and err == "invalid_card_content:content_contains_card_id"
+    # 打回后的第二问它仍是唯一一行 → after_retry,job 必须失败
+    cons, _qs, err = parse_dream_consolidations(raw, strict=False, known_ids=known)
+    assert err == "invalid_card_content_after_retry:content_contains_card_id"
 
-    assert "同一事件" in prompt and "文字相似不是必要条件" in prompt
-    assert "想去京都看红叶" in prompt and "订了京都机票" in prompt
-    assert "同一京都计划从意向推进到出票" in prompt
+
+def test_parse_bounces_tombstone_marker_even_without_known_ids():
+    # usr_a40e 实况:短语+hex 兜底闸不依赖 card_map,known_ids 缺省也能拦。
+    raw = _consolidation_raw(
+        "已被 c42ebb9618ae447df9d52107ea15de85 取代——绿豆汤偏好",
+        "已被 c42ebb9618ae447df9d52107ea15de85 取代——饮食禁忌详情。",
+    )
+    cons, _qs, err = parse_dream_consolidations(raw)
+    assert cons == [] and err == "invalid_card_content:summary_tombstone_marker"
 
 
-def test_parse_review_requires_explicit_decision_and_reason():
-    yes, error = parse_dream_review('{"decision":"yes","reason":"同一京都计划的演进"}')
-    no, no_error = parse_dream_review('{"decision":"no","reason":"只是同属健康主题"}')
+def test_parse_clean_result_passes_with_known_ids_present():
+    known = {"c42ebb9618ae447df9d52107ea15de85"}
+    cons, _qs, err = parse_dream_consolidations(
+        _consolidation_raw("夏天常喝绿豆汤解暑", "最近很热,常煮绿豆汤,不加糖。"),
+        known_ids=known,
+    )
+    assert err is None and len(cons) == 1
 
-    assert error is None and yes == {"approved": True, "reason": "同一京都计划的演进"}
-    assert no_error is None and no == {"approved": False, "reason": "只是同属健康主题"}
-    assert parse_dream_review('{"decision":"yes","reason":""}')[1] == "dream_review_reason_required"
-    assert parse_dream_review('{"decision":"maybe","reason":"不确定"}')[1] == "dream_review_decision_required"
+
+def test_parse_prose_about_replacement_without_hex_is_not_bounced():
+    # 「旧手机已被新手机取代」是正常散文 —— 只有跟着 hex id 才算墓碑。
+    cons, _qs, err = parse_dream_consolidations(
+        _consolidation_raw("换了新手机", "旧手机已被新手机取代,数据迁移顺利。"),
+    )
+    assert err is None and len(cons) == 1

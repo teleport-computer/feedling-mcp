@@ -23,6 +23,14 @@ CAPTURE_LIVE_SOURCES = frozenset({
     "model_api",
     "live_activity",
     "agent_initiated_proactive",
+    # The one card written at voice-call hangup (the call's per-turn rows are
+    # deleted then). Capture swaps it for the archived FULL transcript when it
+    # renders the window — the card itself is only a bounded preview.
+    # NOTE: keep this set in sync with worker._CAPTURE_PROMPT_SOURCES; a source
+    # that triggers capture but is filtered out of the prompt makes capture spin
+    # on an empty window and advance the cursor anyway (that is exactly what
+    # voice_call_summary did on V2 from 2026-08-05 until this change).
+    "voice_call_transcript",
 })
 CAPTURE_TERMINAL_STATUSES = frozenset({"completed", "failed", "skipped"})
 

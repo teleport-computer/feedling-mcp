@@ -174,7 +174,7 @@ def _terminal_error_class(error: object, error_class: object = "") -> str:
     if "prompt_frontier_exhausted" in code:
         return "context_overflow"
     if code.endswith(":empty_reply"):
-        return "reply_parse_failed"
+        return "provider_empty_reply"
     return "unknown"
 
 
@@ -2938,6 +2938,18 @@ def _deliver_terminal_failure_reply(row: dict) -> bool:
             raise RuntimeError("terminal failure reply id collision")
         return _ack_terminal_failure_reply(job_id)
 
+    # Same-turn supersede gate: 这个 parent 已经被一条真回复(reply_message_id 有值
+    # 且没有失败章)回答过了,再投这条迟到的失败气泡只会自相矛盾——按「最终结果
+    # 说了算」直接 ack 不投递。严格按本 parent 判定,别的 turn 的真实失败照常投。
+    if db.v2_turn_failure_supersede_enabled():
+        parent = db.chat_get_strict(user_id, parent_id)
+        if (
+            parent is not None
+            and str(parent.get("reply_message_id") or "").strip()
+            and not str(parent.get("reply_error_class") or "").strip()
+        ):
+            return _ack_terminal_failure_reply(job_id)
+
     failure_identity: dict[str, str] = {}
     with _pool().connection() as conn:
         with conn.cursor(row_factory=dict_row) as cur:
@@ -3616,6 +3628,23 @@ def chat_turn_activity_rows(user_id: str, turn_id: str) -> tuple[list[dict], lis
             )
             events = [dict(row) for row in cur.fetchall()]
     return jobs, events
+
+
+def turn_answered_by_real_reply(user_id: str, turn_id: str) -> bool:
+    """True iff a real (non-failure-carrier) assistant reply answers this turn.
+
+    Durable reply evidence for the activity projection: job status 单独不可信
+    (completed 可能是没发回复的 handoff),这里只认「reply_to_message_id 指回该
+    turn、且不带 turn_failure_* 章」的已落库回复。"""
+    with _pool().connection() as conn:
+        cur = conn.execute(
+            "SELECT 1 FROM chat_messages WHERE user_id=%s "
+            "AND doc->>'reply_to_message_id'=%s "
+            "AND doc->>'role' NOT IN ('user','human') "
+            "AND COALESCE(doc->>'turn_failure_error_class','')='' LIMIT 1",
+            (str(user_id), str(turn_id)),
+        )
+        return cur.fetchone() is not None
 
 
 def status_events_for_job(user_id: str, job_id: int) -> list[dict]:
@@ -8576,7 +8605,12 @@ def memory_lane_health(*, within_hours: int = 24) -> dict:
     拉低成功率；只有 ``failed``（解析/provider 真错误）和 ``expired``（reaper 判定
     卡死回收）计入失败侧。
 
-    返回形状与 ``wake_success_stats`` 一致，便于并排读。"""
+    返回形状与 ``wake_success_stats`` 一致，便于并排读。
+
+    ``failed_reasons``（2026-08-05 dream 阀门重构）：失败侧按 ``last_error`` 首段
+    细分。dream 的出口闸从「按提案静默丢」改成了「明显不对就让整个 job 失败」
+    （``dream_blast_radius_exceeded`` / ``invalid_card_content*``），不细分的话
+    「保险丝在熔断」和「provider 在挂」在成功率上长得一模一样——阀门必须有刻度。"""
     with _pool().connection() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -8588,6 +8622,19 @@ def memory_lane_health(*, within_hours: int = 24) -> dict:
                 (int(within_hours),),
             )
             rows = cur.fetchall()
+            cur.execute(
+                # last_error 本身就是脱敏短码(extraction_failed:xxx),整串聚合
+                # 才能把 dream_blast_radius_exceeded 和 provider 挂掉分开看。
+                "SELECT lane, "
+                "COALESCE(NULLIF(left(last_error, 120), ''), 'unknown'), "
+                "count(*) FROM agent_jobs "
+                "WHERE lane IN ('capture','dream') AND status='failed' "
+                "AND finished_at IS NOT NULL "
+                "AND finished_at > now() - make_interval(hours => %s) "
+                "GROUP BY 1, 2",
+                (int(within_hours),),
+            )
+            reason_rows = cur.fetchall()
     completed = failed = expired = 0
     by_lane: dict[str, dict[str, int]] = {}
     for lane, status, count in rows:
@@ -8599,6 +8646,9 @@ def memory_lane_health(*, within_hours: int = 24) -> dict:
             failed += count
         elif status == "expired":
             expired += count
+    failed_reasons: dict[str, dict[str, int]] = {}
+    for lane, reason, count in reason_rows:
+        failed_reasons.setdefault(lane, {})[str(reason)] = int(count)
     denom = completed + failed + expired
     return {
         "completed": completed,
@@ -8606,6 +8656,7 @@ def memory_lane_health(*, within_hours: int = 24) -> dict:
         "expired": expired,
         "success_rate": (completed / denom) if denom else None,
         "by_lane": by_lane,
+        "failed_reasons": failed_reasons,
     }
 
 
@@ -10658,3 +10709,273 @@ def set_chat_tail_anchor(user_id: str, anchor_seq: int) -> None:
             "updated_at=now()",
             (str(user_id), value),
         )
+
+
+# ---------------------------------------------------------------------------
+# History search（只读；见 model_api_runtime/v2/history_search.py 的纯逻辑内核）
+# ---------------------------------------------------------------------------
+
+# History-search 可见性 contract（spec §7）：只回用户可见的双方消息。角色白名
+# 单 user/human/openclaw；合成流量（verify_ping / resident_maintenance，写法同
+# db._CHAT_COVERAGE_SOURCE_PREDICATE）在 SQL LIMIT 之前排除，Python 侧后过滤会
+# 让一段长合成行序列把真实候选挤出窗口（同 chat_capture_messages_after_seq 的
+# 教训）。
+_HISTORY_VISIBLE_PREDICATE = (
+    # assistant 侧三个历史 role 都要含（serve_worker._ASSISTANT_ROLES：V1 时代
+    # 写 'agent'，部分路径写 'assistant'，现行 'openclaw'）——漏掉前两个会让老
+    # 用户的历史回复整段搜不到。
+    "doc->>'role' IN ('user','human','openclaw','assistant','agent') "
+    "AND COALESCE(doc->>'source','') "
+    "NOT IN ('verify_ping','resident_maintenance')"
+)
+
+
+def list_level0_summary_leaves(user_id, *, through_seq: int) -> list[dict]:
+    """History-search 扫描提示专用：end_seq<=through_seq 的全部 level-0 叶子。
+
+    刻意不复用 get_summary_frontier_state 的 canonical cover——那个查询会把被
+    更高层 checkpoint 覆盖的子节点排除掉，而扫描提示恰恰需要每片叶子的精确
+    start/end 范围（spec §4）。返回的 summary_envelope 仍是密文，由调用方送
+    enclave 解密后做归一化子串匹配；legacy_opaque 叶子（start_seq=0，无精确
+    source witness）也一并返回，但绝不参与命中段的范围推断——其覆盖的原文可能
+    已被旧 retention 清理，raw 兜底扫不到时置 coverage_gap。
+
+    按 end_seq 降序返回（recent-first 的提示扫描顺序）。只读、无锁；叶子段
+    append-only，end_seq<=snapshot 过滤即天然自洽。
+    """
+    upper = int(through_seq)
+    if upper < 0:
+        raise ValueError("through_seq must be >= 0")
+    with _pool().connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "SELECT segment_id,format_version,coverage_kind,level,"
+                "start_seq,end_seq,source_message_count,"
+                "legacy_opaque_through_seq,summary_envelope "
+                "FROM v2_conversation_summary_segments "
+                "WHERE user_id=%s AND level=0 AND end_seq<=%s "
+                "ORDER BY end_seq DESC,start_seq DESC",
+                (str(user_id), upper),
+            )
+            return [dict(row) for row in cur.fetchall()]
+
+
+def chat_history_candidate_rows(
+    user_id,
+    *,
+    min_seq: int,
+    max_seq: int,
+    start_ts: float | None = None,
+    end_ts: float | None = None,
+    limit: int,
+) -> list[dict]:
+    """一个降序候选窗口的**元数据**（绝不返回、也不解密正文）。
+
+    planner（history_search.next_batch）给出 seq ∈ [min_seq, max_seq]，这里取
+    其中最新的 ``limit`` 条可见候选，按 seq 降序（=扫描优先级顺序）返回。
+    可见性过滤全部发生在 SQL LIMIT 之前（见 _HISTORY_VISIBLE_PREDICATE）；
+    时间范围 start inclusive / end exclusive（spec §3.1）。
+
+    每行只带：seq / msg_id / ts / role / content_type / has_ciphertext。
+    ``has_ciphertext`` 镜像 serve_worker._decrypt_chat_rows 的可读性判据
+    （body_ct 非空且 K_enclave 非空）：False 的行（本地-only、R2 指针化的
+    图片/文件正文等）不可在本路径解密，调用方计入 unavailable_count 或按
+    content_type 走 caption 分支——图片/文件二进制正文（R2）绝不读。
+    """
+    lower = int(min_seq)
+    upper = int(max_seq)
+    if lower < 0 or upper < 0:
+        raise ValueError("history candidate seq bounds must be >= 0")
+    bounded = max(1, min(int(limit), 1000))
+    if upper < lower:
+        return []
+    predicate = (
+        "WHERE user_id=%s AND seq>=%s AND seq<=%s "
+        f"AND {_HISTORY_VISIBLE_PREDICATE} "
+    )
+    params: list = [str(user_id), lower, upper]
+    if start_ts is not None:
+        predicate += "AND ts>=%s "
+        params.append(float(start_ts))
+    if end_ts is not None:
+        predicate += "AND ts<%s "
+        params.append(float(end_ts))
+    with _pool().connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "SELECT seq,msg_id,ts,doc->>'role' AS role,"
+                "COALESCE(doc->>'content_type','') AS content_type,"
+                "(COALESCE(doc->>'body_ct','')<>'' "
+                " AND doc->>'K_enclave' IS NOT NULL) AS has_ciphertext "
+                "FROM chat_messages "
+                + predicate
+                + "ORDER BY seq DESC LIMIT %s",
+                (*params, bounded),
+            )
+            return [
+                {
+                    "seq": int(row["seq"]),
+                    "msg_id": str(row["msg_id"]),
+                    "ts": float(row["ts"]),
+                    "role": str(row["role"] or ""),
+                    "content_type": str(row["content_type"] or ""),
+                    "has_ciphertext": bool(row["has_ciphertext"]),
+                }
+                for row in cur.fetchall()
+            ]
+
+
+def _history_full_row(seq, msg_id, ts, doc) -> dict:
+    """doc 与权威关系列合并（同 db.chat_messages_after_seq 的契约）：
+    ``msg_id``/``ts``/``seq`` 覆盖 doc 里可能过期的副本。"""
+    return {**dict(doc or {}), "id": str(msg_id), "ts": float(ts), "seq": int(seq)}
+
+
+def chat_history_rows_by_seqs(user_id, seqs) -> list[dict]:
+    """给定 seq 集合的**完整密文行**（含 body_ct/K_enclave/caption_*），seq 降序。
+
+    候选选择走 chat_history_candidate_rows（元数据）在前，这里只按 seq 精确
+    取回密文供 enclave 批量解密；可见性谓词再套一遍属防御（两次查询之间行
+    不可变，谓词幂等）。附件行 body 密文的剥离（caption-only 契约，spec §7）
+    由 readside 协调层在投影时做——本函数保持"取回原行"的单一职责。
+    """
+    wanted = sorted({int(s) for s in seqs}, reverse=True)
+    if not wanted:
+        return []
+    if wanted[-1] < 0:
+        raise ValueError("history row seqs must be >= 0")
+    with _pool().connection() as conn:
+        rows = conn.execute(
+            "SELECT seq,msg_id,ts,doc FROM chat_messages "
+            "WHERE user_id=%s AND seq=ANY(%s) "
+            f"AND {_HISTORY_VISIBLE_PREDICATE} "
+            "ORDER BY seq DESC",
+            (str(user_id), wanted),
+        ).fetchall()
+    return [_history_full_row(r[0], r[1], r[2], r[3]) for r in rows]
+
+
+def chat_history_anchor_row(user_id, message_id) -> dict | None:
+    """history_fetch 的锚点行（完整密文行）。
+
+    不存在与不可见（角色/合成流量排除）统一返回 None——调用方按
+    ``not_found_or_not_visible`` 报，不区分（spec §3.2：不靠 message_id
+    难猜当权限控制）。
+    """
+    with _pool().connection() as conn:
+        row = conn.execute(
+            "SELECT seq,msg_id,ts,doc FROM chat_messages "
+            "WHERE user_id=%s AND msg_id=%s "
+            f"AND {_HISTORY_VISIBLE_PREDICATE} "
+            "LIMIT 1",
+            (str(user_id), str(message_id)),
+        ).fetchone()
+    if row is None:
+        return None
+    return _history_full_row(row[0], row[1], row[2], row[3])
+
+
+def _neighbor_window_sql() -> str:
+    """One statement: both neighbour windows and both existence counts.
+
+    取行与计数**必须在同一个 statement snapshot 内**。分成多条 SQL 是不够的：
+    连接池是 ``autocommit=True``（``db._pool``），READ COMMITTED 下每条语句各
+    取一次快照；而 ``chat_messages`` 也**不是** append-only（存在单条删除路径，
+    见 ``db.py`` 的 chat 删除）。并发删除落在两条语句之间时，取行看到的那批已
+    消失、计数却数到后面补位的行，``available - len(rows)`` 就会算出一个凭空的
+    ``omitted_*``——正是这个字段要根除的谎报。一条 CTE 里的所有分支共享同一个
+    快照，这种错位在原理上就不存在（顺带把 fetch 的往返从三次降到一次）。
+
+    每个 CTE 分支都自带 ``LIMIT``，在请求窗口处提前终止；计数结果因此是
+    ``min(请求条数, 实际条数)``，永不全表扫。四个分支共用同一份可见性谓词。
+    """
+    pred = _HISTORY_VISIBLE_PREDICATE
+    return (
+        "WITH before_rows AS ("
+        f" SELECT seq,msg_id,ts,doc FROM chat_messages"
+        f" WHERE user_id=%(uid)s AND seq<%(anchor)s AND {pred}"
+        "  ORDER BY seq DESC LIMIT %(n_before)s"
+        "), after_rows AS ("
+        f" SELECT seq,msg_id,ts,doc FROM chat_messages"
+        f" WHERE user_id=%(uid)s AND seq>%(anchor)s AND {pred}"
+        "  ORDER BY seq ASC LIMIT %(n_after)s"
+        "), before_probe AS ("
+        f" SELECT 1 FROM chat_messages"
+        f" WHERE user_id=%(uid)s AND seq<%(anchor)s AND {pred}"
+        "  ORDER BY seq DESC LIMIT %(want_before)s"
+        "), after_probe AS ("
+        f" SELECT 1 FROM chat_messages"
+        f" WHERE user_id=%(uid)s AND seq>%(anchor)s AND {pred}"
+        "  ORDER BY seq ASC LIMIT %(want_after)s"
+        ")"
+        " SELECT 'before' AS side, seq, msg_id, ts, doc FROM before_rows"
+        " UNION ALL"
+        " SELECT 'after', seq, msg_id, ts, doc FROM after_rows"
+        " UNION ALL"
+        " SELECT 'count_before', (SELECT count(*) FROM before_probe),"
+        "        NULL, NULL, NULL"
+        " UNION ALL"
+        " SELECT 'count_after', (SELECT count(*) FROM after_probe),"
+        "        NULL, NULL, NULL"
+    )
+
+
+def chat_history_neighbor_rows(
+    user_id,
+    anchor_seq: int,
+    *,
+    before: int,
+    after: int,
+    before_requested: int | None = None,
+    after_requested: int | None = None,
+) -> tuple[list[dict], list[dict], dict]:
+    """锚点邻居（该用户 seq 序取，客户端时间戳不可靠——spec §3.2）。
+
+    ``before``/``after`` = 这次真正取回密文的条数（已被回合预算钳过）；
+    ``before_requested``/``after_requested`` = 模型请求的窗口大小（省略则同上）。
+
+    返回 ``(before_rows, after_rows, available)``：前两项按**旧→新**排列（返回
+    结构的展示序），``available`` 是 ``{"before": n, "after": n}``——请求窗口内
+    实际存在多少条可见邻居。调用方据此算 ``omitted_*``，**不许**从"取回条数"
+    反推。取行与计数在**同一条语句**里完成，共享一个快照（见
+    ``_neighbor_window_sql``）；可见性谓词与候选查询完全同一套。
+    """
+    anchor = int(anchor_seq)
+    if anchor < 0:
+        raise ValueError("anchor_seq must be >= 0")
+    n_before = max(0, int(before))
+    n_after = max(0, int(after))
+    # 请求窗口至少要覆盖真的取回的条数，否则 available 会小于返回行数。
+    want_before = max(n_before, 0 if before_requested is None
+                      else int(before_requested))
+    want_after = max(n_after, 0 if after_requested is None
+                     else int(after_requested))
+    older: list[dict] = []
+    newer: list[dict] = []
+    available = {"before": 0, "after": 0}
+    if not (n_before or n_after or want_before or want_after):
+        return older, newer, available
+    with _pool().connection() as conn:
+        rows = conn.execute(
+            _neighbor_window_sql(),
+            {
+                "uid": str(user_id),
+                "anchor": anchor,
+                "n_before": n_before,
+                "n_after": n_after,
+                "want_before": want_before,
+                "want_after": want_after,
+            },
+        ).fetchall()
+    for side, seq, msg_id, ts, doc in rows:
+        if side == "before":
+            older.append(_history_full_row(seq, msg_id, ts, doc))
+        elif side == "after":
+            newer.append(_history_full_row(seq, msg_id, ts, doc))
+        elif side == "count_before":
+            available["before"] = int(seq or 0)
+        elif side == "count_after":
+            available["after"] = int(seq or 0)
+    # before 分支按 seq DESC 取（要最靠近锚点的 N 条），展示序是旧→新。
+    older.reverse()
+    return older, newer, available

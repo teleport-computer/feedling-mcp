@@ -211,7 +211,11 @@ def memory_inner_to_v1(inner: dict, envelope: dict | None = None) -> dict:
             "threads": memory_readside_list(inner.get("threads"))[:8],
             **{
                 key: inner[key]
-                for key in ("is_sensitive", "sensitivity_class", "sensitive_scope")
+                for key in ("is_sensitive", "sensitivity_class", "sensitive_scope",
+                            # 通话溯源:agent 拿到它就能调 voice_transcript_read
+                            # 回看原文。这个 dict 是显式重建的,漏加 = 字段被
+                            # 静默剥掉,写进去也等于没写。
+                            "voice_call_id")
                 if key in inner
             },
         }
@@ -310,6 +314,10 @@ def build_memory_fetch_item(envelope: dict, inner: dict) -> dict:
         "updated_at": memory_readside_text(envelope.get("updated_at"), 80),
         "last_referenced_at": memory_readside_text(envelope.get("last_referenced_at"), 80),
         "is_sensitive": memory_readside_is_sensitive(envelope, adapted),
+        # 通话溯源。这个返回体是显式白名单,不加就到不了 agent —— 卡上写了也白写。
+        # 只放 fetch 不放 index:index 是选择器用的轻量投影,多一个不参与语义的 id
+        # 只是噪音;agent 在 fetch 到全文时看到它就够了。
+        "voice_call_id": memory_readside_text(adapted.get("voice_call_id"), 96),
     }
 
 

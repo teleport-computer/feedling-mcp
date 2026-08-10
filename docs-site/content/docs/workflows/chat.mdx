@@ -304,13 +304,23 @@ provider-facing truncation. `memory_categories` is optional: it is present only 
 returned item has one of the canonical bilingual memory buckets and its counts
 sum to `memory_count`. If any bucket is custom or unknown, the category list is
 omitted and clients should show the total only. Raw bucket labels, summaries,
-memory content, and query text never enter activity metadata.
+memory content, and query text never enter activity metadata. Successful
+`history_search` and `history_fetch` calls likewise record only a content-free
+scanned-row count; matched snippets, message bodies, and query text never enter
+activity metadata.
 
 Every executed Runtime V2 platform, MCP, `reply`, and `send_file` call uses the
 same started/result/error activity boundary. Repeated memory-discovery calls
 that are deterministically rejected by the loop are recorded as confirmed
 results too. Zero-result discovery is retained, and each turn returns at most
 100 projected events.
+
+For `generate_image`, an allowlisted configuration or provider failure keeps its
+specific `image_generation_*` value in `result_code`; the tool result body is
+still excluded. A client that offers image-model setup should inspect only the
+final `generate_image` attempt in a completed turn. A later successful attempt,
+or a temporary error such as rate limiting or upstream unavailability, must not
+be presented as missing configuration.
 
 Completed tool events are also attached to the assistant history item's
 `activity_events` metadata, so clients can render the execution record below
@@ -357,6 +367,26 @@ message inserts commit in one transaction, preserving text-first/card-below
 ordering without partial success.
 Source and rendered output are each limited to 1,000,000 bytes, and staging
 rejects paths outside the per-user outbound directory.
+
+The companion decides when a generated image belongs in the conversation — an
+explicit request, a moment an image would serve better than words, or simply
+because it wants to make one. It writes the image prompt itself and its reply
+text is delivered together with the picture. Runtime V2 exposes this as the
+`generate_image` tool; Runtime V1 and CLI residents use `io_cli.py
+generate-image`, which draws with the account's selected image route and writes
+the result into the private outbound directory for `send-image`. A generation
+failure is returned to the companion so it can explain it, rather than ending
+the turn.
+
+CLI residents can publish generated PNG, JPEG, and WebP results with
+`send-image`. The command accepts only files inside the same private outbound
+directory, validates and bounds their decoded pixels, and sends up to four
+images through encrypted `image_followups`. The backend commits the text and
+image rows together; clients receive ordinary `content_type=image` messages and
+render them directly in the Chat list. Provider-native Runtime V2 image outputs
+use the same encrypted image-message path. Remote provider URLs are not fetched.
+Generated images are normalized to a maximum 1568-pixel long edge and
+2,000,000 stored bytes.
 
 ### 1. The client stores a user message
 
@@ -419,6 +449,24 @@ The service may offload those decoded bytes to object storage as a
 `plaintext_v1` pointer. It verifies the persisted SHA-256 and byte length on
 read, then returns `body_b64`; internal object keys and hashes are never part of
 the public response.
+
+To attach user-selected memory references to the turn (the Garden "talk in
+chat" flow), pass `context_refs` beside the envelope — the same plaintext
+routing shape as the hosted send. Only entries with `type: "memory"` are
+honored; the server persists the ids (at most eight) as `quoted_memory_ids` on
+the stored message, and the enclave expands them into decrypted memory context
+for the resident consumer. Titles are client display metadata and are not
+stored.
+
+```json
+{
+  "envelope": { "...": "encrypted user text" },
+  "content_type": "text",
+  "context_refs": [
+    { "type": "memory", "id": "mom_7f20d39af321", "title": "Morning routine" }
+  ]
+}
+```
 
 To send **text alongside an image or file** (a caption), encrypt that text as its
 own envelope and pass it as `caption_envelope` — the same E2E `EncryptedEnvelope`

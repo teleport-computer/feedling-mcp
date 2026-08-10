@@ -66,3 +66,19 @@ def test_append_chat_text_turn_still_works(store):
     assert m["content_type"] == "text"
     assert "file_name" not in m
     assert "file_mime" not in m
+
+
+def test_append_chat_preserves_voice_archive_card_metadata(store):
+    msg = store.append_chat(
+        "openclaw",
+        "voice_call_transcript",
+        _env(store.user_id, "voicecard1"),
+        extra={
+            "voice_call_id": "vcall_1",
+            "voice_turn_count": 12,
+            "voice_duration_sec": 340,
+        },
+    )
+    assert msg["voice_call_id"] == "vcall_1"
+    assert msg["voice_turn_count"] == 12
+    assert msg["voice_duration_sec"] == 340

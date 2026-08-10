@@ -41,6 +41,9 @@ CLI mode:
                         auto-injects --resume on later turns.
   AGENT_CLI_PATH        Optional colon-separated executable search path added
                         before PATH. Useful for systemd services.
+  FEEDLING_AGENT_IMAGE_GENERATION
+                        Set true only when the configured resident agent exposes
+                        a callable native image-generation capability.
 
 Optional:
   CHECKPOINT_FILE       Path to persist last-processed timestamp.
@@ -111,6 +114,7 @@ import threading
 import time
 import unicodedata
 import urllib.parse
+import uuid
 import xml.etree.ElementTree as _ET
 import zipfile
 from pathlib import Path
@@ -132,7 +136,7 @@ try:
 except ImportError:
     _ENCRYPTION_AVAILABLE = False
 
-import provider_client
+import generated_image
 
 # Shared torn-protocol-JSON leak detector (backend/core, pure). backend/ is on
 # sys.path via the insert above, so it imports as a top-level `core.*` name.
@@ -147,17 +151,16 @@ from memory.capture_prompt_v1 import (
 )
 from identity.user_naming import transcript_speaker_label
 from memory import card_guard
+from memory import dream_gates as memory_dream_gates
 from memory.prompts_v1 import normalize_bucket_language
 from memory.card_text import (
     count_user_token_residuals,
-    is_card_format_error,
+    is_retryable_parse_error,
 )
 from memory.dream_prompt_v1 import (
     build_dream_prompt,
-    build_dream_review_prompt,
     build_dream_retry_prompt,
     parse_dream_consolidations,
-    parse_dream_review,
 )
 from memory.migrate_prompt_v1 import build_migrate_prompt, parse_migrated_cards
 from chat.reply_language import (
@@ -167,7 +170,16 @@ from chat.reply_language import (
 )
 from core.downloadable_reply import sanitize_downloadable_reply
 from model_api_runtime.v2 import context as downloadable_file_context
+# 谎报检测**与 V2 共用同一份实现**,不在这里另抄一份正则。两条 lane 各写一份,
+# 正是当年字面 `user:` 标签只修了 V2、漏掉托管路径的根因(worker.py:9047 注释
+# 记录的那次事故)。谁改判定,两条 lane 一起变。
+from model_api_runtime.v2.tool_loop import _claims_image_delivered
 from model_api_runtime.v2 import document_render as downloadable_document_render
+from voice.message_filter import (
+    VOICE_CALL_RECORD_ROLE as _VOICE_CALL_RECORD_ROLE,
+    conversation_rows as _conversation_rows,
+)
+from voice import transcript_store as _voice_transcript_store
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -213,6 +225,16 @@ class AgentTurn:
 @dataclass(frozen=True)
 class StagedChatFile:
     """One resident-generated file waiting for the primary chat reply commit."""
+
+    source_path: str
+    name: str
+    mime_type: str
+    data: bytes
+
+
+@dataclass(frozen=True)
+class StagedChatImage:
+    """One resident-generated image waiting for its chat reply transaction."""
 
     source_path: str
     name: str
@@ -282,6 +304,7 @@ AGENT_CLI_CMD = os.environ.get("AGENT_CLI_CMD", "")
 # single-flight chat lane forever.
 AGENT_TURN_TIMEOUT_SEC = max(30, int(os.environ.get("FEEDLING_AGENT_TURN_TIMEOUT_SEC", "300")))
 AGENT_CLI_PATH = os.environ.get("AGENT_CLI_PATH", "")
+AGENT_IMAGE_GENERATION_CAPABILITY = "agent_image_generation_v1"
 
 CHECKPOINT_API_KEY_FINGERPRINT = hashlib.sha1(FEEDLING_API_KEY.encode()).hexdigest()[:10]
 CHECKPOINT_FILE = Path(
@@ -430,7 +453,23 @@ CAPTURE_HISTORY_LIMIT = int(os.environ.get("FEEDLING_CAPTURE_HISTORY_LIMIT", "16
 # One shared budget across format and semantic correction. A format bounce
 # consumes it, so semantic validation can never multiply a job into four calls.
 CAPTURE_AGENT_REASK_BUDGET = 1
-CAPTURE_WINDOW_MAX_CHARS = int(os.environ.get("FEEDLING_CAPTURE_WINDOW_MAX_CHARS", "12000"))
+# 12000 → 40000（2026-08-07）：这道截断是 text[-N:]，从尾部保留。通话转写进窗口后，
+# 12000 装不下一通电话 + 同窗口的文字聊天，会把前面的文字**静默**砍掉。
+# 40000 = 转写预算 30000 + 文字聊天 10000。
+CAPTURE_WINDOW_MAX_CHARS = int(os.environ.get("FEEDLING_CAPTURE_WINDOW_MAX_CHARS", "40000"))
+
+
+
+
+# 单通电话展开进窗口的预算。**必须大于通话时长上限能产出的字数**，否则采样会
+# 永久丢掉中段 —— 那等于宣称「从每句话 capture」却做不到。现行上限 3600 秒
+# （iOS ElevenLabsAgentClient.configVersion 12），一小时中文口语约 9000 字，
+# 30000 留三倍余量。tests/test_voice_transcript_budget.py 锁死这个关系：谁调大
+# 通话时长而不调这里，测试会红。采样只是"预算真被突破时不要静默失败"的兜底。
+CAPTURE_VOICE_TRANSCRIPT_MAX_CHARS = int(
+    os.environ.get("FEEDLING_CAPTURE_VOICE_TRANSCRIPT_MAX_CHARS", "30000")
+)
+VOICE_TRANSCRIPT_SOURCE = "voice_call_transcript"
 CAPTURE_CONTEXT_MAX_CHARS = int(os.environ.get("FEEDLING_CAPTURE_CONTEXT_MAX_CHARS", "4000"))
 DREAM_MEMORY_INDEX_LIMIT = int(os.environ.get("FEEDLING_DREAM_MEMORY_INDEX_LIMIT", "0"))
 DREAM_FETCH_BATCH_SIZE = int(os.environ.get("FEEDLING_DREAM_FETCH_BATCH_SIZE", "100"))
@@ -485,6 +524,78 @@ FOREGROUND_CHAT_CONTEXT_HEADER = os.environ.get(
 )
 FALLBACK_REPLY = os.environ.get(
     "FALLBACK_REPLY", "我这会儿有点慢，刚刚没接上。你稍后再发一次，我会继续接。"
+)
+# 同一句的英文。此前只有中文,自建的英文用户失败一次就收到一句中文
+# (2026-08-10 顺手修)。所有兜底文案都走 _fallback_reply_for,别再直接引用
+# FALLBACK_REPLY —— 直接引用就是漏掉英文分支的那条路。
+FALLBACK_REPLY_EN = os.environ.get(
+    "FALLBACK_REPLY_EN",
+    "I'm running slow and didn't catch that one. Send it again in a bit — "
+    "I'll pick it up.",
+)
+
+
+def _prefers_english(lang_anchor: Any = "") -> bool:
+    """英文兜底只在**有正面证据**时才用。
+
+    判据不是「没有中文」而是「确实有拉丁字母词」:空串、纯 emoji、纯数字、
+    纯标点都是**没有语言信号**,这时必须保持中文 —— 中文是这条链路的历史默认,
+    在无信息时翻转默认就是给所有拿不到锚点的调用方发错语言。
+    (2026-08-10:我第一版写成「没中文就发英文」,`_turn_failure_reply_text(notice)`
+    这个不带锚点的老签名当场翻成英文,打红 test_consumer_error_classify 三条。
+    根因是默认值反了,不是测试过时 —— 别改测试去将就它。)
+    """
+    raw = str(lang_anchor or "")
+    if re.search(r"[一-鿿]", raw):
+        return False
+    return bool(re.search(r"[A-Za-z]{2,}", raw))
+
+
+def _fallback_reply_for(lang_anchor: Any = "") -> str:
+    """通用兜底(超时/5xx/限流/流断)。锚点是**用户原话**,不是拼装后的 prompt。"""
+    return FALLBACK_REPLY_EN if _prefers_english(lang_anchor) else FALLBACK_REPLY
+
+
+def _empty_reply_fallback(lang_anchor: Any = "") -> str:
+    """「只思考没说出来」专用兜底(见 FOREGROUND_EMPTY_REPLY_RETRIES)。
+
+    刻意**不复用**通用那句:通用句覆盖 401/429/403/超时等一大票失败,那些情况
+    模型往往压根没跑起来,说「我开始想了」就是编。这一类我们确知模型收到了、
+    也确实产出了 reasoning,只是正文没出来 —— 所以可以照实说,而且照实说比
+    「我这会儿有点慢」对用户有用得多(Seven 2026-08-10:用户根本不知道发生了
+    什么)。技术归因不挤进这句话:失败横幅 turn_failure_* 是独立通道。
+    不提「系统」「网络」——我们并不知道是哪一段断的,也不该把用户自己的中转
+    问题说成我们的系统不稳。
+    """
+    if not _prefers_english(lang_anchor):
+        return (
+            "我收到你的消息了，也开始想怎么回你，可是话到一半断了，没能发出来。"
+            "让你等了。再跟我说一次，我在。"
+        )
+    return (
+        "I got your message and started writing back, but it got cut off "
+        "before anything reached you. Sorry for the wait — say it again? "
+        "I'm here."
+    )
+# 前台聊天的硬不变量:用户在等,这一轮**必须**产出可见文字。thinking 不算,
+# tool_call 也不算。空了就原地重调模型,重调用完还空才发 FALLBACK_REPLY。
+#
+# 为什么必须在前台单独立一条:唤醒/心跳/屏幕/感知车道「只思考不说话」是**合法
+# 结果**(V2 的 2f187175 `accept thinking-only wake silence` 就是这个语义),所以
+# 抽取层(_call_agent_http_* / CLI 分支)刻意把 thinking_summary/tool_calls 当作
+# "这轮有效"而放行。前台继承了那条放行,于是:
+#   usr_0724 2026-08-08~09,MiniMax-M3 连着几轮只吐 reasoning 不吐正文
+#   → turn.messages == [] → replies == [] → 下面 posted_any 那段
+#     `if replies and not posted_any` 因为 replies 为空整段跳过
+#   → 不重试、不兜底、checkpoint 照常前进,消息被判"已回答"永久丢失。
+# 用户连发十几条五个多小时收不到任何回复、也看不到任何报错(她的解读是"你不理
+# 我了")。前台唯一正确的语义是:出不来字就重试,重试不出来就说人话,绝不沉默。
+#
+# 原地重试是安全的:走到这里我们**确知一个字都没发出去**(posted_any=False),
+# 不存在重复发送 —— 这和已有的 lease 过期重试不是一回事,那条是给"可能已经发出
+# 去了"的写失败用的。
+FOREGROUND_EMPTY_REPLY_RETRIES = max(
+    0, int(os.environ.get("FOREGROUND_EMPTY_REPLY_RETRIES", "2"))
 )
 # Canned reply for /v1/chat/verify_loop liveness pings — see the short-circuit
 # in _process_messages. The server GCs both the ping and this reply once the
@@ -669,6 +780,28 @@ class VisionObserverFailure(RuntimeError):
         self.provider = _sanitize_thinking_meta(provider, max_len=80)
 
 
+class ImageGenerationFailure(RuntimeError):
+    """Safe failure contract returned by the dedicated image route."""
+
+    def __init__(
+        self,
+        error_class: str,
+        *,
+        status_code: int | None = None,
+        detail: str = "",
+        raw_user_text: str = "",
+        model: str = "",
+        provider: str = "",
+    ):
+        super().__init__(error_class)
+        self.error_class = error_class[:64] or "image_generation_failed"
+        self.status_code = status_code
+        self.detail = detail[:160]
+        self.raw_user_text = raw_user_text
+        self.model = _sanitize_thinking_meta(model, max_len=96)
+        self.provider = _sanitize_thinking_meta(provider, max_len=80)
+
+
 def _vision_failure_user_text(error_class: str, raw_user_text: str) -> str:
     raw = raw_user_text or ""
     has_cjk = bool(re.search(r"[\u4e00-\u9fff]", raw))
@@ -714,7 +847,48 @@ def _vision_failure_user_text(error_class: str, raw_user_text: str) -> str:
     fallback = "视觉模型处理失败，请重试。" if chinese else "The vision model could not process this image. Try again."
     return (zh if chinese else en).get(error_class, fallback)
 
+
+def _image_generation_failure_user_text(error_class: str, raw_user_text: str) -> str:
+    raw = raw_user_text or ""
+    has_cjk = bool(re.search(r"[\u4e00-\u9fff]", raw))
+    has_latin = bool(re.search(r"[A-Za-z]", raw))
+    archive_language = str(
+        globals().get("_whoami_cache", {}).get("archive_language") or ""
+    ).strip().lower()
+    chinese = has_cjk or (not has_latin and archive_language.startswith("zh"))
+    zh = {
+        "image_generation_model_required": "当前模型不能生成图片，请到设置里添加生图模型。",
+        "image_generation_model_incompatible": "当前生图模型无法生成图片，请到设置里更换模型。",
+        "image_generation_auth_invalid": "生图模型的 API Key 无效或已过期，请到设置里重新保存。",
+        "image_generation_quota_insufficient": "生图模型服务额度不足，充值后再试。",
+        "image_generation_model_not_found": "当前生图模型不可用，请到设置里更换模型。",
+        "image_generation_model_not_ready": "生图模型尚未准备好，请到设置里重新保存或更换模型。",
+        "image_generation_rate_limited": "生图模型请求太多，请稍等几分钟再试。",
+        "image_generation_unavailable": "生图模型暂时无法连接，请稍后重试。",
+        "image_generation_invalid_output": "生图模型没有返回有效图片，请重试或更换模型。",
+        "image_generation_invalid_prompt": "这次生图请求没有正确送达，我们会尽快排查。",
+        "image_generation_failed": "图片生成失败，请重试；如果仍失败，请更换模型。",
+    }
+    en = {
+        "image_generation_model_required": "Your current model can't generate images. Add an image generation model in Settings.",
+        "image_generation_model_incompatible": "This image generation model can't create images. Choose another model in Settings.",
+        "image_generation_auth_invalid": "The image generation API key is invalid or expired. Save it again in Settings.",
+        "image_generation_quota_insufficient": "The image generation service has insufficient quota. Add credit and try again.",
+        "image_generation_model_not_found": "The image generation model is unavailable. Choose another model in Settings.",
+        "image_generation_model_not_ready": "The image generation model isn't ready. Save it again or choose another model in Settings.",
+        "image_generation_rate_limited": "The image generation service is rate limited. Try again in a few minutes.",
+        "image_generation_unavailable": "The image generation service is temporarily unavailable. Try again later.",
+        "image_generation_invalid_output": "The image generation model returned no valid image. Try again or choose another model.",
+        "image_generation_invalid_prompt": "This image request wasn't delivered correctly. We'll investigate.",
+        "image_generation_failed": "Image generation failed. Try again or choose another model.",
+    }
+    fallback = "图片生成失败，请重试。" if chinese else "Image generation failed. Try again."
+    return (zh if chinese else en).get(error_class, fallback)
+
 _ERROR_CLASS_RULES = (
+    ("model_mismatch", "system",
+     "当前运行时没有成功加载所选模型，请重新选择模型或稍后重试。",
+     re.compile(r"\bmodel_mismatch\b", re.I)),
     # 次序即优先级：quota 必须先于 auth/rate（403+「额度」语义是余额不是权限）
     ("quota_insufficient", "user_provider",
      "模型服务额度不足，充值后再发消息即可恢复。",
@@ -780,12 +954,75 @@ _ERROR_CLASS_RULES = (
 
 # 机读全集导出，供 backend/notices/catalog.py 的一致性测试比对（spec Phase B /
 # B3）：_ERROR_CLASS_RULES 里的规则类 + classify_agent_error 硬编码分支里的
-# turn_timeout / reply_parse_failed / model_not_found（裸 404+model）/ unknown。
-# 只是把已有分类逻辑的 error_class 取值收成集合，不改分类逻辑本身。
+# turn_timeout / provider_empty_reply / reply_parse_failed / model_not_found
+# （裸 404+model）/ unknown。只是把已有分类逻辑的 error_class 取值收成集合，
+# 不改分类逻辑本身。
 CONSUMER_ERROR_CLASSES = frozenset(
     {klass for klass, _blame, _text, _pat in _ERROR_CLASS_RULES}
-    | {"turn_timeout", "reply_parse_failed", "model_not_found", "unknown"}
+    | {
+        "turn_timeout", "provider_empty_reply", "reply_parse_failed",
+        "model_not_found", "unknown",
+        "image_generation_model_required", "image_generation_model_incompatible",
+        "image_generation_auth_invalid", "image_generation_quota_insufficient",
+        "image_generation_model_not_found", "image_generation_model_not_ready",
+        "image_generation_rate_limited", "image_generation_unavailable",
+        "image_generation_invalid_output", "image_generation_invalid_prompt",
+        "image_generation_failed",
+    }
 )
+
+
+# transport 成功、响应协议可识别、但 assistant 内容为空时,helper 抛的异常带这个
+# 标记 —— 归因走 provider 而不是我们(usr_7f30d63f 2026-08-07)。**必须由 helper
+# 抛出点铸造**:生产链路里 helper 在返回前就抛异常,call_agent 拿不到那个空 body,
+# 只在 call_agent 里判空是死代码(codex2 gatekeep 用真实 helper 形状复现)。
+# 刻意带 ``feedling:`` 命名空间:分类器用子串匹配,而 pi 的 _cli_error_detail 会把
+# **provider 自己的文本**送进来 —— 裸英文短语("empty provider reply")可被上游
+# 报错原样命中而劫持归因(自审 2026-08-07)。
+EMPTY_PROVIDER_REPLY_MARK = "feedling:empty_provider_reply"
+# 与上面成对:provider **给过**原始 assistant 文本,是我们自己的清洗规则
+# (_sanitize_reply_text:纯英文推理不当回复、协议残片压制等)把它清空的。
+# 归 system —— 这是本批唯一的归因边界,谁把内容弄没的谁背锅。
+# 判据必须取在 **parse 之前**:_agent_turn_from_raw 内部就跑 sanitizer,
+# 拿它的输出回头判空,永远分不出这两种情况(codex2 gatekeep R3)。
+SANITIZED_TO_EMPTY_MARK = "feedling:sanitized_to_empty"
+
+
+def _empty_reply_diagnostics(body: Any) -> str:
+    """从「200 但没内容」的响应体里榨出可分类的诊断串(不含用户内容)。
+
+    为什么必须带:one-api/new-api 这类中转在配额耗尽时的标准形状是
+    **HTTP 200 + {"error": {...}}**(或 choices[].finish_reason=content_filter),
+    body 里明明写着 insufficient_quota,而空回复标记排在规则表之后 —— 只要把这些
+    诊断字段渲进异常文本,规则表就能先命中 quota_insufficient/content_filtered
+    等更准的类;不带的话,一个余额为零的用户会被告知「稍后再试、检查中转稳定性」,
+    正是 blame 纪律要避免的误导(自审 2026-08-07 P1)。
+
+    只取协议层字段(error/message/code/type/finish_reason),绝不渲染
+    assistant 内容;整体截断,避免把 provider 的 HTML 错误页灌进日志。"""
+    if not isinstance(body, dict):
+        return ""
+    parts: list[str] = []
+    err = body.get("error")
+    if isinstance(err, dict):
+        for key in ("message", "code", "type"):
+            value = str(err.get(key) or "").strip()
+            if value:
+                parts.append(f"{key}={value[:160]}")
+    elif isinstance(err, str) and err.strip():
+        parts.append(f"error={err.strip()[:160]}")
+    for key in ("message", "detail", "code"):
+        value = body.get(key)
+        if isinstance(value, str) and value.strip():
+            parts.append(f"{key}={value.strip()[:160]}")
+    choices = body.get("choices")
+    if isinstance(choices, list):
+        for choice in choices[:3]:
+            if isinstance(choice, dict):
+                reason = str(choice.get("finish_reason") or "").strip()
+                if reason:
+                    parts.append(f"finish_reason={reason[:40]}")
+    return " ".join(parts)[:400]
 
 
 def classify_agent_error(exc: BaseException) -> AgentErrorNotice:
@@ -816,6 +1053,37 @@ def classify_agent_error(exc: BaseException) -> AgentErrorNotice:
             " · ".join(detail_parts)[:200],
         )
 
+    if isinstance(exc, ImageGenerationFailure):
+        blame = (
+            "user_provider"
+            if exc.error_class in {
+                "image_generation_model_required",
+                "image_generation_model_incompatible",
+                "image_generation_auth_invalid",
+                "image_generation_quota_insufficient",
+                "image_generation_model_not_found",
+                "image_generation_model_not_ready",
+            }
+            else (
+                "system"
+                if exc.error_class == "image_generation_invalid_prompt"
+                else "provider_transient"
+            )
+        )
+        detail_parts = [exc.error_class]
+        if exc.status_code is not None:
+            detail_parts.append(f"HTTP {exc.status_code}")
+        if exc.detail:
+            detail_parts.append(exc.detail)
+        return AgentErrorNotice(
+            exc.error_class,
+            blame,
+            _image_generation_failure_user_text(
+                exc.error_class, exc.raw_user_text
+            ),
+            " · ".join(detail_parts)[:200],
+        )
+
     detail = str(exc)[:200]
     if isinstance(exc, subprocess.TimeoutExpired):
         return AgentErrorNotice("turn_timeout", "system",
@@ -832,6 +1100,22 @@ def classify_agent_error(exc: BaseException) -> AgentErrorNotice:
     for klass, blame, user_text, pat in _ERROR_CLASS_RULES:
         if pat.search(text):
             return AgentErrorNotice(klass, blame, user_text, detail)
+    # 「空回复」判定**必须排在规则表之后**:pi 退出码永远是 0，API 错误(配额/鉴权/
+    # 断流)只体现在 detail 里，那条异常同时带空回复标记和错误详情 —— 先判空会把
+    # quota_insufficient 之类更具体的分类整个遮蔽掉(codex2 gatekeep 2026-08-06)。
+    # 规则表没命中 = 真的只是「成功但没内容」，那才归 provider 的瞬时问题。
+    if SANITIZED_TO_EMPTY_MARK in text:
+        # provider 给过文本、我们清空的 —— 归 system,与下面成对。
+        return AgentErrorNotice("reply_parse_failed", "system",
+                                "系统处理回复时出了问题，我们会尽快排查。", detail)
+    if EMPTY_PROVIDER_REPLY_MARK in text:
+        # 2026-08-07(usr_7f30d63f 分诊):模型/中转返回 200 但内容为空(断流、
+        # 配额紧张时的假成功等)。这不是我们的解析问题 —— 归 provider,
+        # 别再把中转抽风包装成「系统出了问题」让用户来找我们。
+        return AgentErrorNotice(
+            "provider_empty_reply", "provider_transient",
+            "你的模型服务这次返回了空回复，稍后再试；反复出现请检查模型渠道或中转的稳定性。",
+            detail)
     # 404 需与 model 同现才算模型错（裸 404 归 upstream_unavailable 太粗、归 auth 又错）
     if re.search(r"\b404\b", text) and "model" in lowered:
         return AgentErrorNotice("model_not_found", "user_provider",
@@ -896,18 +1180,29 @@ PROVIDER_HEALTH_SUCCESS_REPORT_INTERVAL_SEC = 15 * 60
 _provider_health_success_reported_at = 0.0
 
 # 组件2：call_agent 清洗为空时（SEND_FALLBACK_ON_AGENT_ERROR=true）不抛异常，
-# 靠这个模块级标记让前台调用方知道本轮其实失败了，要补发 reply_parse_failed 通知。
-# 每次成功读取（前台 else 分支）后立即清零。
-_turn_reply_parse_failed = False
+# 靠这个模块级标记让前台调用方知道本轮其实失败了，要补发失败通知。
+# 值是 error_class 短码：""=无失败；"provider_empty_reply"=原始回复本来就是空
+# （中转/模型给的假成功，归 provider）；"reply_parse_failed"=原始回复有内容、
+# 清洗/解析后才空（可能是我们的问题，归 system）。每次成功读取后立即清零。
+# 归因边界(2026-08-07,usr_7f30d63f):清洗前就空 → 别把中转抽风记在自己头上。
+_turn_reply_parse_failed = ""
 
 
-def _consume_reply_parse_failed() -> bool:
-    """读取并清零清洗失败标记。call_agent 是多车道共享的，标记只对"刚刚这一次
-    调用"有意义——谁调用谁消费，绝不许悬挂到别的车道/回合（审查发现的串扰源）。"""
+def _consume_reply_parse_failed() -> str:
+    """读取并清零清洗失败标记（""=本轮没失败，真值=error_class 短码）。
+    call_agent 是多车道共享的，标记只对"刚刚这一次调用"有意义——谁调用谁消费，
+    绝不许悬挂到别的车道/回合（审查发现的串扰源）。"""
     global _turn_reply_parse_failed
     was = _turn_reply_parse_failed
-    _turn_reply_parse_failed = False
+    _turn_reply_parse_failed = ""
     return was
+
+
+def _reply_parse_failure_exc(reason: str) -> ValueError:
+    """把 _consume_reply_parse_failed 的短码铸成分类器认识的异常文本。"""
+    if reason == "provider_empty_reply":
+        return ValueError(f"agent received {EMPTY_PROVIDER_REPLY_MARK}")
+    return ValueError("agent produced no usable reply after sanitization")
 
 
 def _reset_system_notice_state() -> None:
@@ -978,7 +1273,9 @@ def _notify_agent_turn_failure(exc: BaseException, *, foreground: bool) -> None:
         log.exception("system notice emit failed (non-fatal)")
 
 
-def _turn_failure_reply_text(notice: "AgentErrorNotice") -> str:
+def _turn_failure_reply_text(
+    notice: "AgentErrorNotice", lang_anchor: Any = "",
+) -> str:
     """前台失败时那条用户可见气泡该说什么。
 
     `blame=user_provider` 的错误（余额耗尽 / key 失效 / 模型名被上游下线 / 上下文超限）
@@ -991,7 +1288,7 @@ def _turn_failure_reply_text(notice: "AgentErrorNotice") -> str:
     因为对它们来说「稍后再发一次」是真话。"""
     if notice is not None and notice.blame == "user_provider":
         return notice.user_text
-    return FALLBACK_REPLY
+    return _fallback_reply_for(lang_anchor)
 
 
 def _suppress_duplicate_upstream_banner(notice: "AgentErrorNotice") -> None:
@@ -1245,6 +1542,11 @@ def _agent_runtime_metadata(
 AGENT_RUNTIME_METADATA = _agent_runtime_metadata()
 
 
+def _agent_image_generation_enabled() -> bool:
+    """Whether this exact resident entry exposes a callable image tool."""
+    return _env_bool("FEEDLING_AGENT_IMAGE_GENERATION")
+
+
 def _agent_entry_signature() -> str:
     """Stable, secret-free identity for the configured model entry."""
     payload = json.dumps(
@@ -1260,18 +1562,22 @@ def _agent_entry_signature() -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
 
 
-def _consumer_capabilities(hosted: bool) -> str:
+def _consumer_capabilities(hosted: bool = False) -> str:
     """Comma-separated ``X-Feedling-Consumer-Capabilities`` value.
 
-    Vision caps are advertised on every line. ``web_search_v1`` / ``web_fetch_v1``
-    are a CLOUD-ONLY product: only the HOSTED consumer (per-user runtime token)
-    advertises them. VPS / self-hosted residents must NOT — they use their own
-    model provider's built-in web capability, so our web tools are never offered
-    to them. The settings page keys ``_runtime_supported`` off this header, so
-    omitting the web caps makes web read ``effective = false`` for self-hosted
-    accounts, which is exactly the intended product boundary.
+    Vision and dedicated image-generation caps are advertised on every line.
+    The native agent image capability is advertised only when this exact entry
+    is configured to expose it.
+    ``web_search_v1`` / ``web_fetch_v1`` are a CLOUD-ONLY product: only the
+    HOSTED consumer (per-user runtime token) advertises them. VPS / self-hosted
+    residents must NOT — they use their own model provider's built-in web
+    capability, so our web tools are never offered to them. The settings page
+    keys ``_runtime_supported`` off this header, so omitting the web caps makes
+    web read ``effective = false`` for self-hosted accounts.
     """
-    caps = ["vision_observer_v1", "vision_probe_v2"]
+    caps = ["vision_observer_v1", "vision_probe_v2", "image_generation_v1"]
+    if _agent_image_generation_enabled():
+        caps.append(AGENT_IMAGE_GENERATION_CAPABILITY)
     if hosted:
         caps += ["web_search_v1", "web_fetch_v1"]
     return ",".join(caps)
@@ -3407,8 +3713,24 @@ def _split_tagged_thinking(text: str) -> tuple[str, str]:
     Structured reasoning fields remain the preferred path. This only handles
     plain terminal text where an upstream wrapper serialized reasoning as
     `<think>...</think>`, `<reasoning>...</reasoning>`, or `<thought>...</thought>`.
+
+    2026-08-08 起委托 ``core.self_thinking`` 的共享内核：此前 V1/V2 各一套判据、
+    各漏各的——这条正则要求开闭成对，一个孤立的 `</think>`（开标签在上游被吃掉）
+    配不上对，于是整段思考原样进了用户气泡（prod 实例）。闸关掉时保留下面的
+    原正则行为，逐字节不变。
     """
     raw = str(text or "")
+    from core import self_thinking as _st
+
+    if _st.gate_enabled():
+        # sanitize=False：本次统一的是剥离**判据**，V1 的展示格式（保留换行、
+        # 上限 700，由下游 _sanitize_thinking_summary 负责）不跟着变。
+        status, thinking, reply = _st.strip_all_thinking(raw, sanitize=False)
+        if status == _st.FAILED:
+            # 失败关闭：宁可这轮没有可发内容，也不把带标签的残文端给用户。
+            return "", thinking
+        return reply, thinking
+
     blocks: list[str] = []
 
     def _collect(match: re.Match) -> str:
@@ -4838,6 +5160,85 @@ def _claude_turn_from_stream(raw: str) -> tuple[str, str]:
     return reply, reasoning
 
 
+def _claude_actual_models_from_stream(raw: str) -> set[str]:
+    """Return model ids reported by Claude Code's structured output only.
+
+    Assistant prose is intentionally ignored: self-identification is promptable
+    and cannot prove which upstream model served the turn. Claude Code reports
+    the fact in ``assistant.message.model`` and terminal ``modelUsage`` keys.
+    """
+    models: set[str] = set()
+
+    def _add(value: Any) -> None:
+        model = str(value or "").strip().lower()
+        if model and len(model) <= 200 and re.fullmatch(r"[a-z0-9._:/-]+", model):
+            models.add(model)
+
+    for obj in _json_objects_from_cli_output(raw):
+        if not isinstance(obj, dict):
+            continue
+        if str(obj.get("type") or "").strip() == "assistant":
+            message = obj.get("message")
+            if isinstance(message, dict):
+                _add(message.get("model"))
+        if str(obj.get("type") or "").strip() == "result":
+            usage = obj.get("modelUsage")
+            if isinstance(usage, dict):
+                for model in usage:
+                    _add(model)
+    return models
+
+
+def _is_claude_family_model(model: str) -> bool:
+    """Return whether a route or receipt id identifies the Claude family."""
+    value = str(model or "").strip().lower()
+    if value in {"fable", "opus", "sonnet", "haiku"}:
+        return True
+    return bool(re.search(r"(?:^|[./:])claude(?:[-._:]|$)", value))
+
+
+def _claude_configured_model_matches(configured: str, actual: set[str]) -> bool:
+    """Allow Claude-family fallback while rejecting cross-family drift."""
+    expected = str(configured or "").strip().lower()
+    normalized_actual = {
+        str(model).strip().lower() for model in actual if str(model).strip()
+    }
+    if _is_claude_family_model(expected):
+        return bool(normalized_actual) and all(
+            _is_claude_family_model(model) for model in normalized_actual
+        )
+    return expected in normalized_actual
+
+
+def _validate_claude_actual_model(raw: str) -> None:
+    """Allow Claude-family fallback and reject proven cross-family drift."""
+    configured = str(AGENT_RUNTIME_METADATA.get("model") or "").strip()
+    if not configured:
+        return
+    actual = _claude_actual_models_from_stream(raw)
+    if not actual:
+        log.warning(
+            "claude success had no structured actual-model metadata; configured=%s",
+            configured[:200],
+        )
+        return
+    actual_text = ",".join(sorted(actual))[:400]
+    if _claude_configured_model_matches(configured, actual):
+        if configured.strip().lower() not in actual:
+            log.warning(
+                "claude family fallback allowed configured=%s actual=%s",
+                configured[:200],
+                actual_text,
+            )
+        return
+    _clear_agent_session_id(
+        f"claude model mismatch configured={configured[:200]} actual={actual_text}"
+    )
+    raise RuntimeError(
+        f"model_mismatch: configured={configured[:200]} actual={actual_text}"
+    )
+
+
 def _attach_provider_reasoning(
     reply: str,
     reasoning: str,
@@ -5043,6 +5444,279 @@ def _run_cli_subprocess(
         returncode,
         stdout="".join(stdout_parts),
         stderr="".join(stderr_parts),
+    )
+
+
+_USER_MCP_SURFACE_RE = re.compile(
+    r"\[user_mcp\] surface servers=(\d+) registered=(\d+) dropped=(\d+) "
+    r"cap=(\d+) bytes=(\d+) detail=(\S*)"
+)
+_USER_MCP_DROPPED_RE = re.compile(r"\[user_mcp\] tool cap \d+ reached — dropped \d+: (.+)")
+
+
+def _trace_user_mcp_surface(
+    stderr: str, *, trace_id: str, lane: str, is_pi: bool, attempt: str = "first"
+) -> None:
+    """把桥这一轮实际注册的 MCP 工具面写进 debug trace。
+
+    为什么必须有:在此之前「模型这一轮到底看得到哪些 MCP 工具」在生产上**完全
+    不可观测** —— 桥只往自己的 stderr 打日志,MCP 工具调用也不经 io_cli(所以
+    `agent.tool.call` 里永远看不到它们)。用户报「链接测试通过、AI 却说搜不到」
+    时,我们连"工具有没有被注册进去"都答不上来,只能猜(usr_1baf 2026-08-09)。
+
+    静默失败面有三层,这条 trace 让每一层都留声:
+      ① 桥根本没加载(没有 surface 行)→ MCP 这一轮压根没接上;
+      ② 服务器握手失败(detail 里该服务器是 :0)→ 连上了但没工具;
+      ③ 撞到工具上限(dropped>0)→ 有工具被裁,看 per_server 的「注册数/发现数」
+         就知道是哪台被削了顶(轮转分配保证每台都有代表工具,不会整台饿死)。
+    """
+    if not is_pi:
+        # 这条埋点是 pi 专属:claude 走 `--mcp-config` 交给 CLI 自己管、
+        # codex 走 config.toml,**都不经过我们的桥**。在函数入口就返回,
+        # 而不是只在 missing 分支判 —— 否则 claude 的 stderr 里若恰好出现
+        # 一行同形文本,就会伪造出一条 resolved 事件(codex 审出)。
+        return
+
+
+    text = str(stderr or "")
+    # 取**最后**一条,不是第一条:一轮正常只有一行,但桥若被重跑(或将来多次
+    # 握手)会有多行,而第一条配上后面那条的丢弃名单就是张冠李戴。
+    # 这个错我自己写出来过,被端到端喂真实输出时撞出来的。
+    surface_matches = list(_USER_MCP_SURFACE_RE.finditer(text))
+    match = surface_matches[-1] if surface_matches else None
+    if not match:
+        # 没有 surface 行有两种可能:这一轮没注入桥(非 chat 通道 / 无启用的
+        # 服务器),或者桥启动就失败了。前者是正常的,所以只在 chat 通道且
+        # 确实有启用服务器时才当成异常记一笔。
+        enabled = [
+            s for s in (_user_mcp_applied.get("servers") or []) if s.get("enabled")
+        ]
+        # ⚠️ 只有 pi 会产 surface 行:claude 走 `--mcp-config` 交给 CLI 自己管,
+        # codex 走 config.toml —— 两者都**不经过我们的桥**,自然没有这一行。
+        # 不加这个判据的话,每个用 claude/codex + MCP 的用户**每一轮**都会刷一条
+        # 假 error,把 200 条的 trace 环冲掉 —— 跟这个埋点的目的正好相反。
+        # (我自己写出来过这个 bug,commit 前验出来的。)
+        if is_pi and lane == "chat" and enabled:
+            _emit_debug_trace(
+                "agent", "mcp.surface.missing", status="error", trace_id=trace_id,
+                summary="user MCP bridge produced no tool surface",
+                explain=("这一轮有启用的 MCP 服务器,桥却没有报告工具面 —— "
+                         "桥可能没被注入或启动失败,模型看不到任何 MCP 工具"),
+                detail={
+                    "driver": "pi", "lane": lane, "attempt": attempt,
+                    "enabled_servers": [s.get("name") for s in enabled],
+                },
+            )
+        return
+    servers, registered, dropped, cap, schema_bytes, per_server = match.groups()
+    dropped_names = ""
+    if int(dropped):
+        # 只在本轮确实有丢弃时才去找名单,且同样取最后一条。
+        drop_matches = list(_USER_MCP_DROPPED_RE.finditer(text))
+        if drop_matches:
+            dropped_names = drop_matches[-1].group(1)[:600]
+    _emit_debug_trace(
+        "agent",
+        "mcp.surface.resolved",
+        status="error" if int(dropped) else "ok",
+        trace_id=trace_id,
+        summary=(f"MCP 工具面 {registered} 个"
+                 + (f",丢弃 {dropped} 个" if int(dropped) else "")),
+        explain=(f"模型这一轮能看到 {registered} 个 MCP 工具"
+                 + (f";另有 {dropped} 个因超过 {cap} 上限被裁掉 —— "
+                    "分配是**轮转公平**的(每台各拿一个再拿第二个),"
+                    "所以裁掉的是工具最多那几台的尾部,每台仍有代表工具。"
+                    "detail.per_server 是「注册数/发现数」" if int(dropped) else "")),
+        detail={
+            "driver": "pi",
+            "servers": int(servers), "registered": int(registered),
+            "dropped": int(dropped), "cap": int(cap),
+            # 数量之外的另一半成本:工具面的总 schema 字节数。工具翻倍会显著
+            # 抬高请求体与上下文占用,也会拖垮弱模型的选择率(codex 提)。
+            "schema_bytes": int(schema_bytes),
+            # `服务器:注册数/发现数` —— 注册数才回答「它到底进没进去」。
+            "per_server": per_server[:400], "dropped_names": dropped_names,
+            "lane": lane, "attempt": attempt,
+        },
+    )
+
+
+def _trace_user_mcp_wiring(cmd: list[str], *, trace_id: str, lane: str) -> None:
+    """claude / codex 这两条路的 MCP **接线**是否到位。
+
+    它们不经过我们的桥,所以这里拿不到「注册了几个工具」——那是 CLI 内部的事
+    (claude 的实际注册结果由 postflight 的 `_trace_user_mcp_registered` 从它
+    自报的 init 事件里读,两条埋点一前一后配着看)。这一条回答的是前半个问题:
+    这一轮我们到底有没有把服务器交给它、有没有授权。
+    PR#174 修的正是这个洞:自托管 claude 的模板没有 `{mcp}` 占位符,
+    `--mcp-config` 一次都没下发,用户在 App 里配的服务器**一台都到不了 agent**,
+    而 App 的连接测试是绿的(那是控制面探针直连服务器测的,两条路)。
+
+    这条埋点让那种情况不用再靠用户报:trace 里直接写着 wired=false。
+    """
+    if lane != "chat":
+        return
+    is_claude = _is_claude_code_cmd(cmd)
+    is_codex = _is_codex_cmd(cmd)
+    if not (is_claude or is_codex):
+        return
+    enabled = [
+        s for s in (_user_mcp_applied.get("servers") or []) if s.get("enabled")
+    ]
+    if not enabled:
+        return
+    names = [str(s.get("name") or "") for s in enabled]
+    if is_claude:
+        wired = any(
+            t == "--mcp-config" or t.startswith("--mcp-config=") for t in cmd
+        )
+        mechanism = "--mcp-config"
+        # 授权是第二个必要条件:只接线不授权时调用会进 permission_denials,
+        # 模型回「这个工具需要授权」——和用户原话一致(PR#174 实测)。
+        # ⚠️ 判据必须看**规则内容**,不是「有没有那个 flag / 有没有那个环境变量」:
+        # 托管模板恒带 `--allowed-tools`(里面只有 io_cli 动词)、托管环境恒设
+        # CLAUDE_CONFIG_DIR,所以旧判据对托管用户永远返回 true —— 它唯一该报的
+        # 那个状态,恰恰是它报不出来的。
+        ungranted, partial_grants = _claude_mcp_grant_state(cmd, names)
+        authorized = not ungranted
+    else:
+        codex_home = os.environ.get("CODEX_HOME", "")
+        wired = bool(codex_home) and (Path(codex_home) / "config.toml").exists()
+        mechanism = "config.toml"
+        authorized = wired  # codex 的 MCP 授权就在同一份 config 里
+        # codex 没有「接线了但没授权」这个中间态(同一份 config 两件事一起做),
+        # 所以永远没有这两个名单 —— 但下面的 explain/detail 是两条路共用的。
+        ungranted, partial_grants = [], []
+    _emit_debug_trace(
+        "agent",
+        "mcp.surface.wired" if wired else "mcp.surface.missing",
+        status="ok" if (wired and authorized) else "error",
+        trace_id=trace_id,
+        summary=(f"{len(names)} 台 MCP 服务器"
+                 + ("已接线" + ("" if authorized else ",但未授权")
+                    if wired else "**未接线**")),
+        explain=(
+            f"这一轮通过 {mechanism} 把 {len(names)} 台服务器交给 CLI"
+            if wired else
+            f"有 {len(names)} 台启用的 MCP 服务器,但这一轮**一台都没交给 CLI** —— "
+            f"{mechanism} 没有出现在命令里,模型看不到任何 MCP 工具"
+        ) + ("" if authorized or not wired else
+             ";但这几台没有任何授权规则(allowlist 参数和 settings.json 里都没有 "
+             "`mcp__<名字>__…`),调用会被拒,模型通常会说「需要授权」:"
+             + ",".join(ungranted[:10]))
+          + ("" if not partial_grants else
+             ";另有几台只授权了具体工具、不是整台(`mcp__<名字>__*`),"
+             "该服务器的其余工具仍会被拒:" + ",".join(partial_grants[:10])),
+        detail={
+            "driver": "claude" if is_claude else "codex",
+            "lane": lane, "mechanism": mechanism,
+            # ⚠️ 名字是 has_grant_rule 不是 authorized:这是对我们自己的 argv 和
+            # settings.json 做的**前置检查**,它能证明授权**缺失**(那才是要抓的
+            # 失败),但证明不了授权**有效** —— 最终判据是调用时的
+            # permission_denials(codex 审出:逐工具规则也会让整台被误判为已授权)。
+            "wired": wired, "has_grant_rule": authorized,
+            "servers": names[:20],
+            **({"ungranted": ungranted[:20]} if ungranted else {}),
+            **({"partial_grants": partial_grants[:20]} if partial_grants else {}),
+        },
+    )
+
+
+def _trace_user_mcp_registered(raw: str, cmd: list[str], *,
+                               trace_id: str, lane: str,
+                               attempt: str = "first") -> None:
+    """What the CLI itself says it registered — the only postflight ground truth.
+
+    ``_trace_user_mcp_wiring`` is a **preflight**: it reads our own argv and
+    grant files and answers "did we hand the servers over correctly". It cannot
+    see what happened next. Claude Code opens its run with a structured init
+    event that names every MCP server it actually registered::
+
+        {"type":"system","subtype":"init","tools":[...],"mcp_servers":[...]}
+
+    which settles in one field what preflight can only imply. It is also what
+    exposed the shape of this whole class of bug: a prod turn showing
+    ``mcp_servers: []`` while the app listed the server as connected.
+
+    Only judged on the chat lane with servers enabled — MCP is deliberately
+    chat-only, so an empty list anywhere else is correct, and reporting it
+    would bury the real signal under one false error per distillation.
+
+    Registration is not approval: a registered tool can still be denied at call
+    time (that lands in ``permission_denials``). Preflight covers the grant.
+
+    ⚠️ Emitted once per CLI **attempt**, same rule the pi surface trace follows:
+    a retry starts a NEW process that redoes the MCP handshake, and it replaces
+    ``result`` wholesale rather than appending to it. Tracing only the first
+    attempt reports a process whose output was thrown away — and when the first
+    attempt died before printing any init at all, it reports nothing while the
+    turn that actually answered goes unobserved. ``attempt`` labels which one,
+    so the last event for a trace_id is the one that produced the reply.
+    """
+    if lane != "chat" or not _is_claude_code_cmd(cmd):
+        return
+    expected = sorted(
+        str(s.get("name") or "")
+        for s in (_user_mcp_applied.get("servers") or []) if s.get("enabled")
+    )
+    expected = [n for n in expected if n]
+    if not expected:
+        return
+    init = None
+    for obj in _json_objects_from_cli_output(raw):
+        # Last init wins: a retried attempt re-runs the handshake in a new
+        # process, and the earlier one's result no longer describes this turn.
+        if (isinstance(obj, dict)
+                and str(obj.get("type") or "").strip() == "system"
+                and str(obj.get("subtype") or "").strip() == "init"):
+            init = obj
+    if init is None or not isinstance(init.get("mcp_servers"), list):
+        # Non-JSON output shape (or a CLI that stopped reporting it). Silence is
+        # right here: we have no observation, and inventing one from a regex
+        # over stdout is how a tool-output echo becomes a fake event.
+        return
+    registered, failed = [], []
+    for entry in init["mcp_servers"]:
+        if isinstance(entry, dict):
+            name = str(entry.get("name") or "")
+            status = str(entry.get("status") or "").strip().lower()
+        else:
+            name, status = str(entry), ""
+        if not name:
+            continue
+        registered.append(name)
+        # Exactly the SDK's own predicate — `s.status !== "connected"` is a
+        # failed server. Nothing else counts as working: an entry with no
+        # status, a bare string entry, and any status we don't recognise are
+        # all states we have no evidence about, and guessing them green is how
+        # a postflight built to catch false greens starts producing them.
+        # `ready`/`ok` were my invention, with no protocol basis (codex 审出)。
+        if status != "connected":
+            failed.append(f"{name}:{status or 'unknown'}")
+    missing = [n for n in expected if n not in registered]
+    ok = not missing and not failed
+    _emit_debug_trace(
+        "agent",
+        "mcp.surface.registered",
+        status="ok" if ok else "error",
+        trace_id=trace_id,
+        summary=(f"CLI 实际注册 {len(registered)}/{len(expected)} 台 MCP 服务器"
+                 + ("" if ok else ",有缺失")),
+        explain=(
+            "claude 自己报告的注册结果 —— 这是模型这一轮真正看得到的服务器。"
+            if ok else
+            "claude 自报的注册结果和我们交过去的对不上:"
+            + (f"没注册上 {','.join(missing[:10])};" if missing else "")
+            + (f"握手异常 {','.join(failed[:10])};" if failed else "")
+            + "模型看不到这些服务器的工具,通常会答「用不了」。"
+        ),
+        detail={
+            "expected": expected[:20], "registered": registered[:20],
+            "missing": missing[:20], "failed": failed[:20],
+            # Which CLI attempt this describes. A turn can emit several; the
+            # last one is the process that produced the reply.
+            "attempt": attempt,
+        },
     )
 
 
@@ -5418,6 +6092,21 @@ def _call_agent_http_simple(
             return body
         if turn.messages:
             return turn.messages[0]
+        # 已知回复字段**存在但内容为空** = provider 给了空回复;字段完全不认识
+        # 才是协议不匹配(保持原来的 unknown 归因,那确实要人来看)。
+        # 与 openai 分支同理:先查原始 assistant 文本,区分「没给」和「我们清空了」。
+        if any(field in body for field in _JSON_REPLY_FIELDS):
+            present = sorted(f for f in _JSON_REPLY_FIELDS if f in body)
+            diagnostics = _empty_reply_diagnostics(body)
+            if str(_raw_assistant_text(body) or "").strip():
+                raise ValueError(
+                    f"{SANITIZED_TO_EMPTY_MARK}: reply field {present} was "
+                    f"emptied by our sanitizer {diagnostics}".strip()
+                )
+            raise ValueError(
+                f"{EMPTY_PROVIDER_REPLY_MARK}: reply field present but empty "
+                f"in: {present} {diagnostics}".strip()
+            )
         raise ValueError(f"response field not found in: {list(body.keys())}")
     if isinstance(body, str):
         return body.strip()
@@ -5476,7 +6165,22 @@ def _call_agent_http_openai(
         return body
     if turn.messages:
         return turn.messages[0]
-    raise ValueError("OpenAI-compatible response has no usable reply text")
+    # 到这里 body 已确认是 dict(上面非 dict 已抛)、且 turn 是空的。分两种:
+    # provider 压根没给文本(空回复)vs 给了、被我们的 sanitizer 清空(我们的)。
+    # **必须查原始 assistant 文本**:上面的 turn 是 _agent_turn_from_raw 的产物,
+    # 那里面已经跑过 sanitizer,拿它判等于把两种情况混成一种(codex2 gatekeep R3)。
+    diagnostics = _empty_reply_diagnostics(body)
+    if str(_raw_assistant_text(body) or "").strip():
+        raise ValueError(
+            f"{SANITIZED_TO_EMPTY_MARK}: openai-compatible assistant text was "
+            f"emptied by our sanitizer {diagnostics}".strip()
+        )
+    # 真的没给内容 —— 中转在配额紧张/上游抽风时的典型「假成功」形状。
+    # 带上 body 的协议层诊断:200+{"error":insufficient_quota} 这种要让规则表先命中。
+    raise ValueError(
+        f"{EMPTY_PROVIDER_REPLY_MARK}: openai-compatible response carried no "
+        f"assistant text {diagnostics}".strip()
+    )
 
 
 def call_agent_http(
@@ -6140,6 +6844,213 @@ def _inject_codex_images(cmd: list[str], image_paths: list[str]) -> list[str]:
     return [*cmd[:insert_at], *flags, *cmd[insert_at:]]
 
 
+def _cmd_has_allowed_tools(cmd: list[str]) -> bool:
+    """True when the argv already pins a claude tool allowlist.
+
+    Both spellings are accepted by the CLI and both appear in the wild: the
+    official docs write ``--allowedTools`` while this repo's own templates use
+    ``--allowed-tools``. Matching only one of them means an operator using the
+    other gets a SECOND allowlist flag injected, which is exactly the
+    "how do duplicate flags merge" question we refuse to guess at — and a wrong
+    guess there can revoke a tool they depend on. Both bare and ``=``-bound
+    forms count.
+    """
+    return any(
+        t in ("--allowed-tools", "--allowedTools")
+        or t.startswith(("--allowed-tools=", "--allowedTools="))
+        for t in cmd
+    )
+
+
+def _claude_mcp_grant_sources(cmd: list[str]) -> list[str]:
+    """Every allow rule claude will honour this turn, from BOTH grant sources.
+
+    The two are a union, not an override — measured on 2.1.217 with a real MCP
+    server across all four combinations (settings only / flag only / both /
+    neither); only "neither" is denied. So a rule found in either place counts.
+
+    Used to answer "is ``mcp__<name>__*`` actually granted", which the previous
+    predicate only pretended to answer: it checked that ``--allowed-tools``
+    EXISTED, or that ``CLAUDE_CONFIG_DIR`` was non-empty. Hosted templates
+    always carry the flag (with io_cli verbs and no MCP rule) and hosted env
+    always sets the dir, so it reported ``authorized=true`` unconditionally —
+    the one state it was built to detect was the one it could never report.
+    """
+    rules: list[str] = []
+    for i, tok in enumerate(cmd):
+        if tok.startswith(("--allowed-tools=", "--allowedTools=")):
+            rules.extend(tok.split("=", 1)[1].split(","))
+        elif tok in ("--allowed-tools", "--allowedTools"):
+            # Variadic: the official shape is `--allowedTools "r1" "r2"`, while
+            # this repo's templates pass one comma-joined value. Reading only
+            # the token that follows would drop every rule after the first and
+            # report those servers as ungranted. Over-reading is harmless here —
+            # this function only inspects argv, never rewrites it, so a stray
+            # non-rule token just fails to match any `mcp__<name>__` prefix.
+            for nxt in cmd[i + 1:]:
+                if nxt.startswith("-"):
+                    break
+                rules.extend(nxt.split(","))
+    config_dir = os.environ.get("CLAUDE_CONFIG_DIR", "")
+    if config_dir:
+        try:
+            data = json.loads((Path(config_dir) / "settings.json").read_text())
+            perms = data.get("permissions") if isinstance(data, dict) else None
+            allow = perms.get("allow") if isinstance(perms, dict) else None
+            if isinstance(allow, list):
+                rules.extend(str(r) for r in allow)
+        except (OSError, ValueError):
+            # No settings file, unreadable, or not JSON — that source simply
+            # grants nothing. Never let a missing/malformed file break a turn.
+            pass
+    return [r.strip() for r in rules if str(r).strip()]
+
+
+def _claude_mcp_grant_state(cmd: list[str],
+                            names: list[str]) -> tuple[list[str], list[str]]:
+    """Split enabled servers into (no rule at all, only per-tool rules).
+
+    ``mcp__<name>__*`` is the only rule that covers a server's whole tool
+    surface. A per-tool rule (``mcp__ombre__search``) is a real grant, but it
+    grants exactly that one tool — calling it authorized would report a server
+    whose every OTHER tool is denied as fully fine, and would do the same for a
+    rule naming a tool that no longer exists. Neither is decidable from argv,
+    so this reports the SHAPE of the grant and leaves the verdict to what
+    actually happens at call time (``permission_denials``).
+
+    That is also why nothing here is called "authorized": this is a preflight
+    over our own files. It can prove a grant is MISSING — the failure worth
+    catching — but it cannot prove one works.
+    """
+    rules = _claude_mcp_grant_sources(cmd)
+    ungranted, partial = [], []
+    for n in names:
+        prefix = f"mcp__{n}__"
+        matched = [r for r in rules if r.startswith(prefix)]
+        if not matched:
+            ungranted.append(n)
+        elif prefix + "*" not in matched:
+            partial.append(n)
+    return ungranted, partial
+
+
+def _inject_claude_user_mcp(cmd: list[str], lane: str) -> list[str]:
+    """Wire the app-configured MCP servers into a self-hosted ``claude`` command
+    whose template has no ``{mcp}`` placeholder.
+
+    Hosted commands are generated by ``agent_runtime.spawners`` and always carry
+    ``{mcp}``, so they never reach this path. A self-hosted operator writes
+    ``AGENT_CLI_CMD`` by hand from ``tools/README.md``, whose Claude example is
+    just ``claude --print --output-format json "{message}"`` — no ``{mcp}``. With
+    no placeholder ``_user_mcp_cli_value`` returns "" and ``--mcp-config`` is
+    never passed, so every server the user enabled in the app is simply absent
+    from the agent. The app shows them connected (the control-plane probe dials
+    the server directly and succeeds) while the agent has never heard of them,
+    and the model then reports the gap in whatever words it invents. Adding the
+    placeholder to the docs only helps operators who rewrite their command;
+    this injection also fixes the ones already deployed.
+
+    Two flags are needed, verified against claude-code 2.1.217 with a real MCP
+    server and the filesystem as ground truth (``--mcp-config`` alone → the call
+    comes back in ``permission_denials`` and the model says the tool "needs
+    permission granted"):
+      - ``--mcp-config`` so the servers exist at all;
+      - ``--allowed-tools`` so the calls are pre-approved, because a self-hosted
+        operator has no ``CLAUDE_CONFIG_DIR`` settings.json from us to carry the
+        ``mcp__<name>__*`` rules. Measured on the same version: adding this flag
+        does NOT turn into an exclusive allowlist — a Bash call still ran with
+        only ``mcp__ombre__*`` granted — so injecting it cannot cost the agent a
+        tool it had before.
+
+    ⚠️ BOTH are emitted in the ``=``-bound form. Both flags are variadic, so a
+    bare ``--mcp-config <path>`` swallows a following positional prompt —
+    reproduced by hand, though not reachable through this function today since
+    ``_driver_reads_stdin`` pipes the prompt for claude. Binding the value
+    removes the hazard for any template shape rather than relying on that.
+    Same trap, same fix as ``_inject_codex_images``.
+
+    Pure bypass: with no enabled server, no materialized file, a non-chat lane,
+    a non-claude driver, or an operator who already wired ``--mcp-config``, the
+    argv is returned unchanged.
+    """
+    if lane != "chat" or not _is_claude_code_cmd(cmd):
+        return cmd
+    if any(t == "--mcp-config" or t.startswith("--mcp-config=") for t in cmd):
+        return cmd  # operator wired MCP themselves — they own it
+    # Sorted by name so the emitted argv is identical for a given server set
+    # regardless of the order the backend happened to return them in — same
+    # rule ``user_mcp_materialize._enabled`` applies to the settings.json rules.
+    enabled = sorted(
+        (s for s in _user_mcp_applied.get("servers") or [] if s.get("enabled")),
+        key=lambda s: s.get("name") or "",
+    )
+    if not enabled:
+        return cmd
+    if not Path(USER_MCP_FILE).exists():
+        # Same degrade-don't-kill rule the pi bridge uses: a missing config
+        # makes claude exit 1 before any model call, which would take chat
+        # replies down entirely rather than merely losing MCP tools.
+        return cmd
+    flags = [f"--mcp-config={USER_MCP_FILE}"]
+    if _cmd_has_allowed_tools(cmd):
+        # The operator pinned their own allowlist. A second flag's merge
+        # semantics are not something to guess at, and silently replacing their
+        # allowlist could revoke a tool they rely on. Give them the servers and
+        # tell them the one line to add.
+        log.warning(
+            "[user_mcp] claude command has its own --allowed-tools; user MCP "
+            "servers are wired but NOT pre-approved. Add %s to that flag or to "
+            "settings.json, or the agent's calls to them will be denied.",
+            ",".join(f"mcp__{s['name']}__*" for s in enabled),
+        )
+    else:
+        _warn_if_claude_allowlist_semantics_unverified()
+        flags.append(
+            "--allowed-tools="
+            + ",".join(f"mcp__{s['name']}__*" for s in enabled)
+        )
+    return [cmd[0], *flags, *cmd[1:]]
+
+
+# 注入 --allowed-tools 的前提是它**不是排他白名单**(加了它,别的工具照样能用)。
+# 这一点是在 claude-code 2.1.217 上实测的:只授权 mcp__ombre__* 之后 Bash 仍然跑通。
+# 但自托管 operator 装的是什么版本我们不知道 —— 如果某个版本里它是排他的,
+# 注入就会**夺走 agent 原本有的工具**,把「少一个功能」变成「多一个故障」。
+# 所以在这里留声:实测版本写死在代码里,低于它就打一行 warning,
+# 而不是把这个假设只写在 PR 描述和「合入后建议」里(那样没人看得到)。
+_CLAUDE_ALLOWLIST_VERIFIED_VERSION = (2, 1, 217)
+_claude_allowlist_warned = False
+
+
+def _warn_if_claude_allowlist_semantics_unverified() -> None:
+    global _claude_allowlist_warned
+    if _claude_allowlist_warned:
+        return
+    raw = ""
+    try:
+        raw = subprocess.run(
+            ["claude", "--version"], capture_output=True, text=True, timeout=10
+        ).stdout
+    except Exception:  # noqa: BLE001 — 探不到版本不该影响回合
+        raw = ""
+    match = re.search(r"(\d+)\.(\d+)\.(\d+)", raw or "")
+    if not match:
+        return
+    version = tuple(int(g) for g in match.groups())
+    if version >= _CLAUDE_ALLOWLIST_VERIFIED_VERSION:
+        return
+    _claude_allowlist_warned = True
+    log.warning(
+        "[user_mcp] injecting --allowed-tools into claude %s, but the "
+        "'not an exclusive allowlist' behaviour was only measured on %s. "
+        "If this version treats it as exclusive, the agent loses every tool "
+        "outside mcp__*__*. Set your own --allowed-tools (it is left "
+        "untouched) or upgrade claude-code.",
+        ".".join(str(v) for v in version),
+        ".".join(str(v) for v in _CLAUDE_ALLOWLIST_VERIFIED_VERSION),
+    )
+
+
 def _cli_template_is_pi() -> bool:
     """True when AGENT_CLI_CMD drives ``pi`` (so we attach images as @refs)."""
     return _is_pi_cmd(_cli_cmd_tokens())
@@ -6539,6 +7450,21 @@ def _prepare_cli_command(
             cmd = [cmd[0], "--print", *cmd[1:]]
         if not _has_claude_output_format(cmd):
             cmd = [cmd[0], "--output-format", "json", *cmd[1:]]
+        # Isolated turn (session_id_override — vision probe / dream review /
+        # identity distill): a bare `claude --print` with no session flag IS a
+        # fresh session, which is exactly the isolation being asked for. Never
+        # inject --resume here: claude's --print --resume accepts only a UUID
+        # claude itself generated (or an existing session title), so resuming
+        # the consumer-minted bounded label fails the very first turn outright
+        # (resident report 2026-08-05 — broke vision probes and dream reviews
+        # on claude-driver homes). Drivers that accept arbitrary ids (pi's
+        # create-if-missing --session-id, Hermes --resume) keep the override.
+        if session_id_override is not None:
+            if _has_claude_session_id(cmd):
+                # Operator template hard-codes --session-id: claude requires a
+                # UUID there too, so replace the bounded label bound by
+                # _ensure_explicit_cli_session_id with a throwaway real UUID.
+                cmd = _set_cli_option_value(cmd, "--session-id", str(uuid.uuid4()))
         # When THIS turn's message actually carries an injected recent-chat
         # transcript (see _foreground_agent_message), that transcript is the single
         # continuity source — do NOT also inject claude's fragile --resume, which
@@ -6546,7 +7472,7 @@ def _prepare_cli_command(
         # no transcript was injected (injection off, history unavailable, or first
         # turn), keep --resume as the fallback so continuity is never dropped on
         # both sides at once.
-        if (
+        elif (
             sid
             and not _has_cli_resume(cmd)
             and not _has_claude_session_id(cmd)
@@ -6578,6 +7504,9 @@ def _prepare_cli_command(
         cmd = _inject_codex_images(cmd, image_paths or [])
     if pi_native_images:
         cmd = _inject_pi_images(cmd, image_paths or [])
+    if "{mcp}" not in AGENT_CLI_CMD:
+        # Self-hosted claude templates written before the placeholder existed.
+        cmd = _inject_claude_user_mcp(cmd, lane)
 
     return _resolve_cli_executable(cmd), stdin_msg
 
@@ -7110,6 +8039,26 @@ def call_agent_cli(
         ))
 
     raw_transport = (result.stdout or "") + "\n" + (result.stderr or "")
+    # 每次 CLI 尝试都记一次。原本我只记首次,理由是「重试跑同一条命令、同一份
+    # 配置,工具面相同」—— 这是错的:重试会**新起一个进程、重做 MCP 握手**,
+    # 首次可能 tavily:0/4(那台没连上)而重试 4/4,反之亦然。重试本来就少见,
+    # 多一两条事件淹不掉 200 条的环(codex 审出)。
+    _trace_user_mcp_surface(
+        result.stderr or "", trace_id=trace_id, lane=lane,
+        is_pi=_is_pi_cmd(cmd), attempt="first",
+    )
+    # claude / codex 拿不到「注册了几个工具」(那是 CLI 内部的事),但能回答
+    # 同样致命的「这一轮到底有没有把服务器交给它」—— PR#174 修的正是这个洞。
+    _trace_user_mcp_wiring(cmd, trace_id=trace_id, lane=lane)
+    # …and what the CLI reports it actually registered, which is the only
+    # observation that settles it (preflight can only say we handed them over).
+    _trace_user_mcp_registered(
+        result.stdout or "", cmd, trace_id=trace_id, lane=lane, attempt="first")
+    if result.returncode == 0 and _is_claude_code_cmd(cmd):
+        # Claude Code can silently choose its own default despite ANTHROPIC_MODEL.
+        # Validate the CLI's structured receipt before persisting the session, so
+        # a wrong-model session can never contaminate the next turn.
+        _validate_claude_actual_model(result.stdout or "")
     if _is_pi_cmd(cmd):
         # pi's session id is resident-owned (--session-id, created on first use);
         # pi events carry no session_id field to scrape, and stream scraping could
@@ -7173,12 +8122,28 @@ def call_agent_cli(
                 ))
             _log_cli_turn_timing(cmd, result, int((time.monotonic() - _turn_t0) * 1000))
             raw_transport = (result.stdout or "") + "\n" + (result.stderr or "")
+            _trace_user_mcp_surface(
+                result.stderr or "", trace_id=trace_id, lane=lane,
+                is_pi=_is_pi_cmd(cmd), attempt="stale_resume_retry",
+            )
+            # This retry rebuilt `cmd` (fresh session) and started a new process
+            # that redid the MCP handshake, and `result` was REPLACED rather than
+            # appended to. Both MCP traces therefore have to run again: the first
+            # attempt's argv is no longer the argv that answered, and its init
+            # event is gone with its stdout — when that attempt died before
+            # printing one, tracing only the first leaves the turn that actually
+            # replied completely unobserved (codex 审出).
+            _trace_user_mcp_wiring(cmd, trace_id=trace_id, lane=lane)
+            _trace_user_mcp_registered(
+                result.stdout or "", cmd, trace_id=trace_id, lane=lane,
+                attempt="stale_resume_retry")
             # Persist the fresh session so the NEXT turn resumes it — but ONLY
             # from a SUCCESSFUL retry: claude's failure result JSON can still
             # carry a session_id, and saving that would re-persist a sid for a
             # failed session right after we cleared the stale one — the next
             # turn would --resume straight back into a dead session.
             if result.returncode == 0:
+                _validate_claude_actual_model(result.stdout or "")
                 observed_sid = _extract_session_id(raw_transport) or command_sid
                 if observed_sid:
                     _save_agent_session_id(observed_sid)
@@ -7230,6 +8195,10 @@ def call_agent_cli(
                 ))
             _log_cli_turn_timing(cmd, result, int((time.monotonic() - _turn_t0) * 1000))
             raw_transport = (result.stdout or "") + "\n" + (result.stderr or "")
+            _trace_user_mcp_surface(
+                result.stderr or "", trace_id=trace_id, lane=lane,
+                is_pi=_is_pi_cmd(cmd), attempt="stream_cut_retry",
+            )
             if observed_sid and not isolated_session:
                 _record_agent_session_turn(
                     observed_sid,
@@ -7277,8 +8246,11 @@ def call_agent_cli(
         # pi's ONLY valid reply source — falling through to the generic extractor
         # would return the user's own echoed message as the reply. Surface the
         # error instead (verified against real pi 0.80.3 output, 2026-07-02).
+        # 标记 + 原 detail 一起带上:pi 退出码永远是 0,API 错误(配额/鉴权/断流)
+        # 只在 detail 里,而分类器把空回复判定排在规则表**之后** —— detail 有错误
+        # 特征时仍然命中 quota_insufficient 等更具体的类,不会被空回复遮蔽。
         raise RuntimeError(
-            "pi agent produced no reply: "
+            f"{EMPTY_PROVIDER_REPLY_MARK}: pi agent produced no reply: "
             f"{_cli_error_detail(result.stdout or '', result.stderr or '')}"
         )
 
@@ -7351,6 +8323,16 @@ def call_agent_cli(
         return raw
     text = _extract_text_from_cli_output(raw)
     if not text:
+        # 判据看 **stdout 有没有东西**,不是看 returncode:非 0 退出在更上游
+        # (call_agent_cli 的退出码检查)就已经抛掉了,这里 returncode 恒为 0,
+        # 拿它当判据的话 else 是死代码,「stdout 有内容但我们的提取器读不懂」
+        # 会被一起甩锅给 provider(自审 2026-08-07 P2)。
+        if not (result.stdout or "").strip():
+            raise ValueError(
+                f"{EMPTY_PROVIDER_REPLY_MARK}: cli agent exited 0 with no "
+                "assistant output"
+            )
+        # stdout 有内容、只是我们提取不出来 —— 这是我们的解析问题,归 system。
         raise ValueError(
             f"cli agent produced no usable output (exit={result.returncode})"
         )
@@ -7626,7 +8608,7 @@ def call_agent(
     # one. Previously only ever SET here; leak suppression now empties turns more
     # often, so an explicit per-turn reset keeps the signal turn-scoped.
     global _turn_reply_parse_failed
-    _turn_reply_parse_failed = False
+    _turn_reply_parse_failed = ""
 
     def _invoke() -> Any:
         if AGENT_MODE == "http":
@@ -7663,6 +8645,15 @@ def call_agent(
         # lines and would behead a pretty-printed JSON object).
         return raw if isinstance(raw, str) else _raw_assistant_text(raw)
 
+    # 快照必须取在 **_agent_turn_from_raw 之前** —— 那个函数内部就跑 sanitizer,
+    # 拿它的产物回头判空,「模型没说话」和「模型说了、被我们清空/剥干净」会混成
+    # 同一种(codex2 gatekeep 连抓两轮:先是压制之后判、再是 parse 之后判)。
+    #   · raw 是 str:provider 给的内容就是它本身,判 strip 即可;
+    #   · raw 是 dict:helper 只在 turn 非空时才返回 body(见两个 _call_agent_http_*
+    #     的返回条件),所以走到这里的 dict 必然带过内容,剩下的空只能是我们压制掉的。
+    model_said_something = (
+        bool(str(raw).strip()) if isinstance(raw, str) else True
+    )
     turn = _agent_turn_from_raw(raw)
     _suppress_torn_protocol_leaks(turn, lane=lane)
     if turn.actions or turn.messages or turn.thinking_summary or turn.tool_calls:
@@ -7693,10 +8684,20 @@ def call_agent(
         if turn.runtime_debug:
             log.debug("agent runtime debug keys: %s", sorted(turn.runtime_debug.keys()))
         return body
+    # 归因分叉:模型本来就没给出任何内容 = provider 给的空(断流/假成功),
+    # 给过内容、被我们压制/解析掏空才算我们的(usr_7f30d63f 2026-08-07:中转抽风
+    # 曾被一律记成 system,用户拿着「系统出了问题」来找我们)。
+    # ⚠️ 生产链路里**主判定在 helper 层**(带 EMPTY_PROVIDER_REPLY_MARK 抛出):
+    # call_agent_http/cli 拿到空 body 时会先抛,根本不会返回到这里。这条分叉覆盖的
+    # 是「helper 返回了内容、随后被 _suppress_torn_protocol_leaks 掏空」那一支。
+    # 两处都要有,少任何一处都会漏归因。
+    failure_class = (
+        "reply_parse_failed" if model_said_something else "provider_empty_reply"
+    )
     if SEND_FALLBACK_ON_AGENT_ERROR:
-        _turn_reply_parse_failed = True
+        _turn_reply_parse_failed = failure_class
         return [FALLBACK_REPLY]
-    raise ValueError("agent produced no usable reply after sanitization")
+    raise _reply_parse_failure_exc(failure_class)
 
 
 def _resident_foreground_chat_message_v2(content: str) -> str:
@@ -7724,6 +8725,12 @@ def _prepend_runtime_model_identity(content: str) -> str:
         "the user asks about the model.]\n\n"
         f"{content}"
     )
+
+
+def _supports_mandatory_self_thinking_v1() -> bool:
+    """Whether the configured model accepts the visible ``<think>`` protocol."""
+    model = str(AGENT_RUNTIME_METADATA.get("model") or "").strip().lower()
+    return model.rsplit("/", 1)[-1] != "claude-fable-5"
 
 
 # ---------------------------------------------------------------------------
@@ -7778,7 +8785,12 @@ def _outbound_file_prompt_block() -> str:
         "send-file returns ok. Do at most one lightweight check that the output "
         "opens and has the requested format; do not repeatedly render, screenshot, "
         "or tune fonts unless the user explicitly asks for layout QA. Tutorial "
-        "questions alone do not require a file."
+        "questions alone do not require a file. "
+        "GENERATED IMAGE DELIVERY: When an image capability produces a PNG, "
+        "JPEG, or WebP, save it under the same outbound directory and run "
+        f"`python {_IO_CLI_PATH} send-image --path <image_path> "
+        "[--name <display_name>]`. It will appear directly as a chat image. "
+        "Never expose a local path or claim delivery unless send-image returns ok."
     )
 
 
@@ -7827,10 +8839,56 @@ def _outbound_file_retry_prompt(
     )
 
 
+def _image_claim_retry_prompt() -> str:
+    """谎报打回的指令。与 V2 (`tool_loop._IMAGE_CLAIM_RETRY_INSTRUCTION`) 同义:
+    给一次明确的纠正机会,二选一,**不替它决定选哪个**。"""
+    return (
+        "上一轮你说图已经生成/画好了,但这一轮没有任何图片真的被生成。"
+        "请二选一,不要再声称已生成:"
+        f"(1) 你确实想给出这张图 —— 运行 `python {_IO_CLI_PATH} generate-image "
+        "--prompt \"<完整的画面描述>\"`,再用 send-image 交付;"
+        "(2) 你并不打算画 —— 照实说,不要用文字假装图已经存在。"
+    )
+
+
+def _empty_reply_retry_prompt(text: str) -> str:
+    """前台空回合的纠偏指令(见 FOREGROUND_EMPTY_REPLY_RETRIES)。
+
+    与 `_image_claim_retry_prompt` 同款:给一次明确的纠正机会,只点明缺什么,
+    **不替它决定说什么** —— 这是伴侣的话,不是我们的。裸重调一遍很可能撞同一个
+    坑(重推理模型把整轮都花在 reasoning 里),所以必须带上这句。
+    """
+    if re.search(r"[一-鿿]", str(text or "")):
+        return (
+            "上一轮你只在心里想了,没有输出任何给对方看到的文字 —— 对方那边是"
+            "一片空白,还在等你。这一轮请直接把要说的话说出来:正文不能为空,"
+            "也不要只调工具或只写思考。"
+        )
+    return (
+        "Last turn you only thought — nothing visible was sent, so the other "
+        "person is staring at silence and still waiting. This turn, say it out "
+        "loud: the visible reply must not be empty, and must not be only a tool "
+        "call or reasoning."
+    )
+
+
 def _outbound_file_failure_reply(text: str) -> str:
     if re.search(r"[\u4e00-\u9fff]", str(text or "")):
         return "这次没能生成你要求的可下载文件，请稍后再试。"
     return "I couldn't generate the requested downloadable file this time. Please try again."
+
+
+def _image_ready_reply(text: str) -> str:
+    """图已经发出去、但伴侣一个字都没说时的兜底。
+
+    ⚠️ 只在**它确实没说话**时用(有些 CLI driver 调完工具就不再出文本),绝不能
+    拿它去顶替伴侣真说了的话 —— 那是替它说话,比让它闭嘴更糟。
+    2026-08-08 之前专用生图那条路正是这么干的:runtime 抢先画完图,然后用这句
+    写死的话当回复,模型全程没参与。
+    """
+    if re.search(r"[\u4e00-\u9fff]", str(text or "")):
+        return "图片已经生成。"
+    return "The image is ready."
 
 
 def _sanitize_outbound_file_reply(
@@ -7883,7 +8941,6 @@ def _prepend_io_cli_capability_catalog(content: str) -> str:
     fails before the model ever saw the prompt does not permanently skip the
     catalog for the rest of that session."""
     global _io_cli_catalog_cache, _io_cli_catalog_pending_session_id
-    global _web_advertised_session_id, _web_off_notice_session_id
     if _HOSTED or AGENT_MODE != "cli":
         return content
 
@@ -9112,6 +10169,12 @@ def _resident_chat_runtime_v2_enabled() -> bool:
 
 _user_mcp_advertised: dict = {}      # last poll-advertised {"fingerprint": ...}
 _user_mcp_applied: dict = {"fingerprint": None, "servers": []}  # materialized state
+# Last (fingerprint, outcome) pair we emitted a materialize trace for. Apply
+# retries on EVERY poll while it keeps failing, and one turn already floods the
+# 200-event ring (~198 enclave calls on a single distillation) — an undeduped
+# event per poll would evict the very turns we need to read. Reset implicitly:
+# a new fingerprint or a different outcome is a different pair, so it emits.
+_user_mcp_trace_last: tuple[str, str] | None = None
 
 
 def _update_user_mcp_advertised(payload) -> None:
@@ -9407,6 +10470,70 @@ def _materialize_user_mcp(servers: list[dict], managed_names) -> None:
     _write_user_mcp_ca(servers)
 
 
+def _trace_user_mcp_materialize(
+    fingerprint: str, outcome: str, *, configured: int = 0, enabled: int = 0,
+    failure: str = "",
+) -> None:
+    """One event per state transition of the config-refresh chain.
+
+    Every failure mode here used to be invisible from the outside: the keyless
+    fail-safe writes a log.error, an exception writes a log.warning, and both
+    land in a container log nobody reads while the user sees only "the AI says
+    it can't use my tool". The turn-level ``mcp.surface.*`` traces can't cover
+    it either — they early-return when zero servers are enabled, which is
+    exactly the state a silently-failed apply produces.
+
+    Deliberately NOT emitted when the advertised fingerprint is empty: the
+    backend computes it over the SAVED list, so empty means the user genuinely
+    has no servers stored. That is a normal state, not a fault, and reporting
+    it would train whoever reads these to ignore the event.
+
+    detail carries counts and a failure enum only — never a url, header name,
+    envelope, or remote response body.
+    """
+    global _user_mcp_trace_last
+    if not fingerprint:
+        return
+    key = (fingerprint, outcome if not failure else f"{outcome}:{failure}")
+    if key == _user_mcp_trace_last:
+        return
+    _user_mcp_trace_last = key
+    ok = outcome == "applied"
+    _emit_debug_trace(
+        "agent",
+        f"mcp.materialize.{outcome}",
+        status="ok" if ok else "error",
+        summary=(f"MCP 配置已生效:{enabled}/{configured} 台启用"
+                 if ok else f"MCP 配置未能生效({failure or outcome})"),
+        explain=(
+            (f"这一份配置(fingerprint {fingerprint[:14]}…)已写入 agent 侧。"
+             + ("" if enabled else
+                "⚠️ 但**没有一台是启用状态** —— 模型这一轮看不到任何 MCP 工具,"
+                "表现和「配置没生效」完全一样,区别只在这里。"))
+            if ok else
+            "用户存了 MCP 服务器,但这一份配置没能落到 agent 侧 —— "
+            "模型看不到任何 MCP 工具。"
+            # 下一步动作按失败种类分,不能一律写「会重试」:paths_unpinned 这条
+            # 记下 fingerprint 就 return,下次 poll 因 fingerprint 相等直接早退,
+            # **本进程永远不会再试**;而 _USER_MCP_PATHS_PINNED 是进程启动时定的,
+            # 改完 env 也必须重启才生效。排障文案给出相反的动作,比没有文案更坏
+            # (codex 审出)。
+            + ("spawner 没有为该用户钉 USER_MCP_FILE / USER_MCP_CA_FILE / "
+               "USER_MCP_CASTORE_FILE,共享 /tmp 默认路径会把这个用户解密后的 "
+               "MCP url 和鉴权头泄给同机其他 agent,所以这里主动关掉了 user MCP。"
+               "**本进程不会重试**:修 spawner 补上这三个 env,然后重启 consumer。"
+               if failure == "paths_unpinned" else
+               "下次 poll 会重试。")
+        ),
+        detail={
+            "fingerprint": fingerprint[:14],
+            "configured_count": configured,
+            "enabled_count": enabled,
+            **({"failure": failure} if failure else {}),
+        },
+    )
+
+
 def _maybe_apply_user_mcp() -> None:
     """Re-materialize agent MCP config when the poll-advertised fingerprint moved.
     Failures log and retry on a later poll — never block chat."""
@@ -9425,6 +10552,7 @@ def _maybe_apply_user_mcp() -> None:
             "defaults would leak this user's MCP url/auth headers to every "
             "co-hosted agent. Fix the spawner to set USER_MCP_FILE/"
             "USER_MCP_CA_FILE/USER_MCP_CASTORE_FILE per user.")
+        _trace_user_mcp_materialize(target, "failed", failure="paths_unpinned")
         _user_mcp_applied = {"fingerprint": target, "servers": []}
         return
     try:
@@ -9454,17 +10582,25 @@ def _maybe_apply_user_mcp() -> None:
         names = [s["name"] for s in servers if s["enabled"]]
         log.info("[user_mcp] applied fingerprint=%s servers=%s",
                  target or "(empty)", names)
+        _trace_user_mcp_materialize(
+            target, "applied", configured=len(servers), enabled=len(names))
     except Exception as e:  # noqa: BLE001 — config refresh must never wedge chat
         log.warning("[user_mcp] apply failed (will retry next poll): %s: %s",
                     type(e).__name__, e)
+        # Exception type only. The failures here are fetch/decrypt/write, whose
+        # messages can quote a url or a remote body — neither belongs in a trace.
+        _trace_user_mcp_materialize(target, "failed", failure=type(e).__name__)
 
 
 def _user_mcp_cli_value(template: str, lane: str) -> str:
     """Resolve the ``{mcp}`` placeholder for one CLI turn.
 
     - No ``{mcp}`` slot in the template, or no enabled server → empty.
-    - claude → ``--mcp-config <file>`` ONLY on the chat lane (foreground turns
-      may call user MCP tools; background/proactive turns must not).
+    - claude → ``--mcp-config=<file>`` ONLY on the chat lane (foreground turns
+      may call user MCP tools; background/proactive turns must not), plus
+      ``--allowed-tools=mcp__<name>__*`` when the template pins no allowlist of
+      its own. Both ``=``-bound — the flags are variadic and would otherwise
+      swallow a trailing positional prompt.
     - codex  → per-server ``-c mcp_servers.<name>.enabled=false`` overrides ONLY
       on non-chat lanes. codex has no way to enable a subset per-turn, so its
       user MCP servers are configured in config.toml (available on chat turns)
@@ -9519,7 +10655,32 @@ def _user_mcp_cli_value(template: str, lane: str) -> str:
         return " ".join(
             f"-c mcp_servers.{name}.enabled=false" for name in names if name
         )
-    return f"--mcp-config {USER_MCP_FILE}" if lane == "chat" else ""
+    if lane != "chat":
+        return ""
+    # =-bound, NOT the bare ``--mcp-config <path>`` form this used to emit.
+    # The flag is variadic, so a template whose prompt is a trailing positional
+    # would have it swallowed — claude then opens the message text as a config
+    # file and exits 1 with "Invalid MCP configuration" (reproduced by running
+    # the documented line by hand). The consumer itself pipes the prompt via
+    # stdin for claude/codex/pi (``_driver_reads_stdin``), so no rendered
+    # command hits this today; the bound form is correct by construction for
+    # every template shape instead of only the ones that happen to pipe.
+    value = f"--mcp-config={USER_MCP_FILE}"
+    if _cmd_has_allowed_tools(shlex.split(template)):
+        # Hosted templates (agent_runtime.spawners) always pin their own
+        # allowlist, and so may an operator; theirs wins untouched. Hosted
+        # additionally carries the ``mcp__<name>__*`` rules in the settings.json
+        # we materialize, so it is already authorized.
+        return value
+    # Self-hosted with no allowlist of its own has no settings.json from us
+    # either, so wiring the servers without a grant just moves the failure from
+    # "tool doesn't exist" to "tool call denied" (verified: the call lands in
+    # permission_denials and the model reports it as missing permission).
+    grant = ",".join(
+        f"mcp__{s['name']}__*"
+        for s in sorted(enabled_servers, key=lambda s: s.get("name") or "")
+    )
+    return f"{value} --allowed-tools={grant}"
 
 
 def poll_proactive_jobs(since: float) -> dict:
@@ -10011,6 +11172,7 @@ def post_reply(
     turn_failure_model: str = "",
     turn_failure_provider: str = "",
     file_followups: list[StagedChatFile] | None = None,
+    image_followups: list[StagedChatImage] | None = None,
 ) -> dict:
     """Post an agent reply using the account's effective envelope shape.
 
@@ -10094,6 +11256,30 @@ def post_reply(
                         "file_byte_count": len(file_item.data),
                     }
                 )
+            reply_image_followups = []
+            for image_item in image_followups or []:
+                if plaintext_tier:
+                    image_envelope = {
+                        "body_b64": base64.b64encode(bytes(image_item.data)).decode("ascii"),
+                        "body_size_bytes": len(image_item.data),
+                        "owner_user_id": seal_user_id,
+                        "visibility": "shared",
+                    }
+                else:
+                    image_envelope = _build_envelope(
+                        plaintext=bytes(image_item.data),
+                        owner_user_id=seal_user_id,
+                        user_pk_bytes=seal_user_pk,
+                        enclave_pk_bytes=seal_enc_pk,
+                        visibility=visibility,
+                    )
+                reply_image_followups.append(
+                    {
+                        "envelope": image_envelope,
+                        "image_mime": image_item.mime_type,
+                        "image_byte_count": len(image_item.data),
+                    }
+                )
             thinking_envelope = None
             safe_thinking = _sanitize_thinking_summary(thinking_summary)
             if safe_thinking:
@@ -10139,6 +11325,8 @@ def post_reply(
                 body["reply_to_message_id"] = reply_to_message_id
             if reply_file_followups:
                 body["file_followups"] = reply_file_followups
+            if reply_image_followups:
+                body["image_followups"] = reply_image_followups
             if gate_decision_id:
                 body["gate_decision_id"] = gate_decision_id
             if proactive_job_id:
@@ -10175,9 +11363,9 @@ def post_reply(
                 resp = _HTTP.post(url, json=_reply_body(), headers=_HEADERS, timeout=15)
         return _handle_post_reply_response(resp)
 
-    if file_followups:
-        log.error("cannot post encrypted file followups without envelope encryption")
-        return {"error": "file_followup_encryption_unavailable"}
+    if file_followups or image_followups:
+        log.error("cannot post encrypted reply followups without envelope encryption")
+        return {"error": "reply_followup_encryption_unavailable"}
 
     # Encryption unavailable — plaintext path (will 400 on v1 backends).
     log.error(
@@ -10302,6 +11490,11 @@ def _message_ts_for_context(msg: dict) -> float:
 
 
 def _message_role_for_context(msg: dict) -> str:
+    if str(msg.get("role") or "") == _VOICE_CALL_RECORD_ROLE:
+        # 通话记录块不是伴侣说过的话。这里原本把**所有**非 user 的行归成 "agent",
+        # 于是过滤层换过身份的记录块在最终 prompt 里又变回了「我说的」——
+        # 修了过滤层漏了渲染层,正是这批改动本身在批评的那个错误。
+        return "通话记录"
     role = "user" if msg.get("role") == "user" else "agent"
     if msg.get("source") == PROACTIVE_JOB_SOURCE:
         role = "agent(proactive)"
@@ -10348,7 +11541,7 @@ def _chat_context_line(msg: dict, *, now: float, stale: bool) -> str:
 
 def _clean_messages_for_proactive_context(history: list[dict] | None) -> list[dict]:
     cleaned: list[dict] = []
-    for msg in history or []:
+    for msg in _conversation_rows(history or []):
         if not isinstance(msg, dict):
             continue
         role = str(msg.get("role") or "").strip().lower()
@@ -11509,7 +12702,13 @@ def _capture_live_history(history: list[dict] | None) -> list[dict]:
         if source == "verify_ping":
             continue
         role = str(msg.get("role") or "").strip().lower()
-        if role not in {"user", "openclaw", "assistant", "agent"}:
+        # voice_call_record 是 _conversation_rows 换身份后的通话卡(dream 那条路
+        # 会先过滤再进来)。不放行的话 dream 的「这几天聊了什么」里永远没有电话。
+        # capture 那条路拿的是**原始行**(role=openclaw),不经过滤器,因此不受影响
+        # —— 它仍然会把卡展开成归档全文。
+        if role not in {
+            "user", "openclaw", "assistant", "agent", _VOICE_CALL_RECORD_ROLE,
+        }:
             continue
         text = _capture_message_text(msg)
         if not text or "__VERIFY_PING__" in text:
@@ -11562,10 +12761,52 @@ def _capture_window_messages(job: dict) -> list[dict]:
     return selected
 
 
+def _capture_voice_transcript_text(call_id: str) -> str:
+    """归档的通话全文明文。复用既有取数 + enclave 解密两条路，无新信任面。
+
+    抛异常即"拿不到"。调用方**绝不可以**退回那张有界预览卡：那会把整通电话
+    蒸成开头几句，而 capture 照常推进游标 —— 记忆永久丢失且无人知晓。
+    """
+    body = _capture_get_json(f"/v1/voice/transcripts/{urllib.parse.quote(str(call_id))}")
+    envelope = body.get("transcript") if isinstance(body, dict) else None
+    if not isinstance(envelope, dict):
+        raise RuntimeError(f"voice_transcript_unavailable:{call_id}")
+    return _decrypt_envelope(envelope).decode("utf-8")
+
+
+def _bounded_voice_transcript(text: str) -> str:
+    """把一通电话压进自己的预算：超了头尾采样并说明中间省了多少。"""
+    text = str(text or "").strip()
+    budget = CAPTURE_VOICE_TRANSCRIPT_MAX_CHARS
+    if len(text) <= budget:
+        return text
+    head_budget = int(budget * 0.6)
+    tail_budget = max(0, budget - head_budget)
+    head = text[:head_budget].rstrip()
+    tail = text[-tail_budget:].lstrip() if tail_budget else ""
+    omitted = len(text) - len(head) - len(tail)
+    log.warning(
+        "voice transcript exceeded capture budget: %d chars, %d omitted "
+        "(raise FEEDLING_CAPTURE_VOICE_TRANSCRIPT_MAX_CHARS)", len(text), omitted)
+    return f"{head}\n…（中间约 {omitted} 字省略，完整记录见通话详情）…\n{tail}"
+
+
 def _capture_window_text(messages: list[dict], *, user_label: str = "TA", agent_label: str = "我") -> str:
     lines: list[str] = []
     for msg in messages:
         ts = _message_ts_for_context(msg)
+        call_id = str(msg.get("voice_call_id") or "").strip()
+        if call_id and str(msg.get("source") or "") == VOICE_TRANSCRIPT_SOURCE:
+            # 聊天流里只有有界预览卡，全文在归档表里。展开它，Capture 才是在
+            # 蒸整通电话而不是开头几句。取不到就让整个 job 失败重试（游标不动）。
+            body = _bounded_voice_transcript(_capture_voice_transcript_text(call_id))
+            # 抬头(谁是谁 + 换尺子)与 V2 共用同一份实现,别在这里另写。
+            header = _voice_transcript_store.capture_window_header(
+                turn_count=msg.get("voice_turn_count"),
+                user_name=user_label, ai_name=agent_label,
+            )
+            lines.append(f"- [{_format_message_time(ts)}] {header}\n{body}")
+            continue
         lines.append(
             f"- [{_format_message_time(ts)}] "
             f"{_capture_message_role(msg, user_label=user_label, agent_label=agent_label)}: "
@@ -11628,7 +12869,11 @@ def _memory_agent_parse_with_bounce(
     _note_agent_turn_success()
     parsed = parse(reply_text, strict=True)
     err = parsed[-1]
-    if not is_card_format_error(err):
+    # 谓词与 V2 的 ParseRetry.should_retry 是同一个(memory.card_text)。两条 lane
+    # 必须共用一份判据,否则同一个模型在托管和自建上会得到不同的重问行为 ——
+    # json_decode_error 以前不在重问范围,注释说它「各有自己的退避路径」,实测那条
+    # 路是空的:usr_450ee421e16a3b5a 连续 6 次失败,reask_count 全是 0。
+    if not is_retryable_parse_error(err):
         return parsed, ""
     log.warning(
         "%s content gate bounced id=%s reason=%s — re-asking once", lane, job_id, err
@@ -11651,7 +12896,7 @@ def _memory_agent_parse_with_bounce(
     return retried, "bounced_ok"
 
 
-def _capture_build_envelope(card: dict, *, occurred_at: str, source: str = "memory_capture", item_id: str = "") -> dict:
+def _capture_build_envelope(card: dict, *, occurred_at: str, source: str = "memory_capture", item_id: str = "", voice_call_id: str = "") -> dict:
     if not _ENCRYPTION_AVAILABLE:
         raise RuntimeError("capture_encryption_unavailable")
     if not _refresh_whoami_for_encrypted_reply():
@@ -11670,6 +12915,9 @@ def _capture_build_envelope(card: dict, *, occurred_at: str, source: str = "memo
         "bucket": str(card.get("bucket") or "").strip(),
         "threads": list(card.get("threads") or []),
     }
+    # 通话溯源(与 V2 extraction._inner_from_card 同形)。放加密正文,服务端看不见。
+    if voice_call_id:
+        inner["voice_call_id"] = str(voice_call_id)[:96]
     envelope = _build_envelope(
         plaintext=json.dumps(inner, ensure_ascii=False, separators=(",", ":")).encode("utf-8"),
         owner_user_id=user_id,
@@ -11696,6 +12944,18 @@ def _capture_build_envelope(card: dict, *, occurred_at: str, source: str = "memo
 def _capture_actions_from_cards(cards: list[dict], *, job: dict, messages: list[dict]) -> tuple[list[dict], int, int]:
     occurred_at = _capture_occurred_at(job, messages)
     source_ids = [_capture_message_id(msg) for msg in messages if _capture_message_id(msg)]
+    # 溯源只在**能证明**归属时打:窗口里恰好一通电话,且没有别的内容。挂断即
+    # 触发 capture,所以这是常态。混合窗口一律不打 —— 无法判断某张卡来自哪边,
+    # 盖章就是假精度(与 V2 worker 同规则)。
+    _call_ids = {
+        str(m.get("voice_call_id") or "").strip()
+        for m in messages
+        if str(m.get("source") or "") == VOICE_TRANSCRIPT_SOURCE
+        and str(m.get("voice_call_id") or "").strip()
+    }
+    voice_call_id = (
+        next(iter(_call_ids)) if len(_call_ids) == 1 and len(messages) == 1 else ""
+    )
     actions: list[dict] = []
     cards_added = 0
     cards_superseded = 0
@@ -11707,7 +12967,8 @@ def _capture_actions_from_cards(cards: list[dict], *, job: dict, messages: list[
         # source of repeated duplicate cards.
         if action in {"merge", "supersede"} and not target_id:
             continue
-        envelope = _capture_build_envelope(card, occurred_at=occurred_at)
+        envelope = _capture_build_envelope(
+            card, occurred_at=occurred_at, voice_call_id=voice_call_id)
         base = {
             "envelope": envelope,
             "reason": "Memory captured from a completed chat window.",
@@ -11804,9 +13065,33 @@ def _process_capture_jobs(jobs: list) -> float:
             # literal "user:"). Fetched only when there IS a window — an empty
             # window keeps the fast-fail path without burning identity calls.
             identity, ai_name, user_name, identity_text = _capture_identity_context()
-            window_text = _capture_window_text(
-                messages, user_label=user_name, agent_label=ai_name
-            )
+            try:
+                window_text = _capture_window_text(
+                    messages, user_label=user_name, agent_label=ai_name
+                )
+            except Exception as exc:  # noqa: BLE001
+                # 取归档全文失败(backend/enclave 抖动)。这条 job 已经 claim 并标
+                # realizing,异常直接冒出去会把它留在 realizing、还会打断整批 job。
+                # 显式标 failed:游标不动,下一轮重新 claim 重跑 —— 这才是注释里
+                # 承诺的"整个 job 失败重试",也才真的没有"退回预览"这条路。
+                log.warning("capture window build failed id=%s: %s", job_id, exc)
+                update_proactive_job_status(
+                    job_id,
+                    "failed",
+                    "capture_window_build_failed",
+                    extra={
+                        "capture_result": {
+                            "status": "failed",
+                            "reason": "capture_window_build_failed",
+                            "detail": str(exc)[:200],
+                        },
+                        "capture_window": window,
+                        "cards_added": 0,
+                        "cards_superseded": 0,
+                        "noop_reason": "capture_window_build_failed",
+                    },
+                )
+                continue
         if not window_text:
             update_proactive_job_status(
                 job_id,
@@ -12248,7 +13533,7 @@ def _dream_recent_conversations_context(*, user_label: str = "TA", agent_label: 
     except Exception as e:
         log.warning("dream recent conversation fetch failed: %s", e)
         return "（这几天没有可读对话）"
-    live = _capture_live_history(history)
+    live = _capture_live_history(_conversation_rows(history or []))
     if not live:
         return "（这几天没有新对话）"
     lines: list[str] = []
@@ -12269,17 +13554,20 @@ def _dream_actions_from_consolidations(
     card_map: dict[str, dict],
     occurred_at: str,
 ) -> tuple[list[dict], int, int, int, int, int]:
+    # 2026-08-05 复盘只保留结构性判据(rationale 非空、目标卡真实存在、不重复退休)。
+    # 语义审查员与 15% 增量栅栏(内容质量判断)已拆除;出口硬闸移到 parse 层
+    # (内容闸+卡id泄漏闸)与本函数末尾的爆炸半径保险丝。与 V2 的
+    # extraction.consolidations_to_actions 保持同一套判据,不再各自漂移。
     actions: list[dict] = []
     cards_merged = 0
     cards_thickened = 0
     cards_superseded = 0
     organized_ids: set[str] = set()
     merged_count = 0
+    used_ids: set[str] = set()
     for row in consolidations:
         op = str(row.get("op") or "").strip().lower()
         if not str(row.get("rationale") or "").strip():
-            continue
-        if row.get("_review_approved") is not True:
             continue
         card_ids = [
             str(memory_id or "").strip()
@@ -12289,10 +13577,11 @@ def _dream_actions_from_consolidations(
         card_ids = list(dict.fromkeys(card_ids))
         if not card_ids:
             continue
-        if len(card_ids) == 1 and not _dream_has_substantive_increment(
-            card_map.get(card_ids[0]) or {}, row.get("result") or {}
-        ):
-            continue
+        if any(memory_id not in card_map for memory_id in card_ids):
+            continue  # 目标卡必须是这轮真实喂进 prompt 的卡
+        if any(memory_id in used_ids for memory_id in card_ids):
+            continue  # 一张卡只能被一条提案退休
+        used_ids.update(card_ids)
         organized_ids.update(card_ids)
         if op == "merge":
             merged_count += max(0, len(card_ids) - 1)
@@ -12316,7 +13605,6 @@ def _dream_actions_from_consolidations(
             "dream_op": op,
             "dream_card_ids": card_ids,
             "dream_rationale": str(row.get("rationale") or "")[:1000],
-            "dream_review_reason": str(row.get("_review_reason") or "")[:1000],
         })
         if op == "merge":
             cards_merged += 1
@@ -12325,97 +13613,11 @@ def _dream_actions_from_consolidations(
         cards_superseded += len(card_ids)
     if consolidations and not actions:
         raise ValueError("dream_no_memory_actions")
+    if memory_dream_gates.blast_radius_exceeded(cards_superseded, len(card_map)):
+        # 爆炸半径保险丝:单晚要退休的卡超过花园的绝大部分 = 规模明显不对
+        # (834→1 事故的最后防线)。整个 job 失败等人查,不部分执行。
+        raise ValueError("dream_blast_radius_exceeded")
     return actions, cards_merged, cards_thickened, cards_superseded, len(organized_ids), merged_count
-
-
-def _dream_semantic_text(card: dict) -> str:
-    values: list[str] = []
-    for key in ("title", "summary", "description", "content"):
-        value = str(card.get(key) or "").strip()
-        if value and value not in values:
-            values.append(value)
-    return "".join(re.findall(r"[\w]", " ".join(values).lower(), flags=re.UNICODE))
-
-
-def _dream_has_substantive_increment(old_card: dict, result: dict) -> bool:
-    """Keep the deterministic 1:1 anti-churn fence used by the V2 lane."""
-
-    old_text = _dream_semantic_text(old_card)
-    new_text = _dream_semantic_text(result)
-    if not old_text or not new_text:
-        return False
-    min_growth = max(24, (len(old_text) * 15 + 99) // 100)
-    if len(new_text) < len(old_text) + min_growth:
-        return False
-    old_grams = {old_text[index : index + 3] for index in range(max(0, len(old_text) - 2))}
-    new_grams = {new_text[index : index + 3] for index in range(max(0, len(new_text) - 2))}
-    min_novel = max(6, (len(old_grams) * 10 + 99) // 100)
-    return len(new_grams - old_grams) >= min_novel
-
-
-def _dream_review_consolidations(
-    consolidations: list[dict],
-    *,
-    card_map: dict[str, dict],
-    job_id: str,
-) -> list[dict]:
-    """Run one isolated V1 agent review per Dream proposal, fail-closed."""
-
-    approved: list[dict] = []
-    for index, row in enumerate(consolidations):
-        if not isinstance(row, dict):
-            continue
-        rationale = str(row.get("rationale") or "").strip()
-        card_ids = list(
-            dict.fromkeys(
-                str(memory_id or "").strip()
-                for memory_id in (row.get("card_ids") or [])
-                if str(memory_id or "").strip()
-            )
-        )
-        source_cards = [card_map.get(memory_id) for memory_id in card_ids]
-        if not rationale or not card_ids or any(card is None for card in source_cards):
-            log.warning(
-                "dream semantic review skipped invalid proposal id=%s index=%d",
-                job_id,
-                index,
-            )
-            continue
-        try:
-            prompt = build_dream_review_prompt(
-                consolidation=row,
-                source_cards=[card for card in source_cards if card is not None],
-            )
-            raw = call_agent(
-                prompt,
-                raw_text=True,
-                trace_id=f"dream-review:{job_id}:{index}",
-                lane="background",
-                isolated_session=True,
-            )
-            _note_agent_turn_success()
-            review, error = parse_dream_review(_capture_agent_reply_text(raw))
-        except Exception as exc:  # noqa: BLE001 — reject this proposal, keep reviewing
-            log.warning(
-                "dream semantic review failed id=%s index=%d code=%s",
-                job_id,
-                index,
-                type(exc).__name__,
-            )
-            continue
-        if error or not isinstance(review, dict) or review.get("approved") is not True:
-            log.warning(
-                "dream semantic review rejected id=%s index=%d code=%s",
-                job_id,
-                index,
-                str(error or "review_no")[:120],
-            )
-            continue
-        accepted = dict(row)
-        accepted["_review_approved"] = True
-        accepted["_review_reason"] = str(review.get("reason") or "")[:1000]
-        approved.append(accepted)
-    return approved
 
 
 def _process_dream_jobs(jobs: list) -> float:
@@ -12468,10 +13670,15 @@ def _process_dream_jobs(jobs: list) -> float:
             cards=cards_text,
             recent_conversations=recent_text,
         )
+        # known_ids = 喂进 prompt 的那批卡的 id:result 字段里出现任何一个即
+        # 「把整理注记当成内容」(usr_a40e 墓碑卡),与内容闸同路打回重问。
+        dream_known_ids = frozenset(card_map)
         try:
             (consolidations, questions, err), bounce = _memory_agent_parse_with_bounce(
                 prompt,
-                parse=parse_dream_consolidations,
+                parse=lambda raw, strict=True: parse_dream_consolidations(
+                    raw, strict=strict, known_ids=dream_known_ids
+                ),
                 build_retry_prompt=build_dream_retry_prompt,
                 lane="dream",
                 job_id=job_id,
@@ -12536,29 +13743,9 @@ def _process_dream_jobs(jobs: list) -> float:
             )
             log.info("dream job completed noop id=%s questions=%d", job_id, len(questions))
             continue
-        consolidations = _dream_review_consolidations(
-            consolidations,
-            card_map=card_map,
-            job_id=job_id,
-        )
-        if not consolidations:
-            update_proactive_job_status(
-                job_id,
-                "completed",
-                "dream_semantic_review_rejected",
-                extra={
-                    "dream_result": {
-                        "status": "noop",
-                        "reason": "dream_semantic_review_rejected",
-                        "job_kind": "memory_dream",
-                    },
-                    "cards_merged": 0,
-                    "cards_superseded": 0,
-                    "questions": questions,
-                    "noop_reason": "dream_semantic_review_rejected",
-                },
-            )
-            continue
+        # 2026-08-05 复盘拆掉了这里的逐提案语义审查(弱模型自审自查既误放也
+        # 误杀,每条提案还多烧一次调用)。出口防线现在全部是确定性的:parse 层
+        # 的内容闸+卡id泄漏闸、mapper 的结构判据、爆炸半径保险丝。
         try:
             occurred_at = _format_message_time(time.time())
             (
@@ -12645,11 +13832,15 @@ def _process_dream_jobs(jobs: list) -> float:
                 else "dream_memory_actions_applied"
             ),
             extra={
+                # content_gate 与 proposals/applied 构成 dream funnel 刻度:
+                # 阀门到底吃掉了多少提案,靠这几个数说话,不再是玄学。
+                "content_gate": bounce or None,
                 "dream_result": {
                     "status": observation["status"],
                     "job_kind": "memory_dream",
                     "consolidations": len(consolidations),
                     "actions": len(actions),
+                    "active_cards": len(card_map),
                     "questions": len(questions),
                     "cards_thickened": cards_thickened,
                     "organized_count": organized_count,
@@ -12816,7 +14007,7 @@ def _process_proactive_jobs(jobs: list) -> float:
         # The turn reached the agent — open the across-batch coalescing window so
         # the rest of this burst folds instead of repeating it.
         _note_proactive_turn_ran(job_id)
-        if _consume_reply_parse_failed():
+        if (parse_failure_class := _consume_reply_parse_failed()):
             # Parse failure means call_agent already swapped agent_result for
             # FALLBACK_REPLY — a foreground-only line ("你稍后再发一次…") that
             # reads as an unsolicited error bubble on a turn the user never
@@ -12824,7 +14015,7 @@ def _process_proactive_jobs(jobs: list) -> float:
             # policy as the agent_call_failed branch above): report + fail the
             # job, post nothing.
             _notify_agent_turn_failure(
-                ValueError("agent produced no usable reply after sanitization"),
+                _reply_parse_failure_exc(parse_failure_class),
                 foreground=False,
             )
             update_proactive_job_status(job_id, "failed", "agent_reply_parse_failed")
@@ -13849,12 +15040,18 @@ def _process_messages(messages: list) -> float:
         # <think> block into thinking_summary. Same kill switch as V2.
         from core import self_thinking as _self_thinking_v1
 
-        if _self_thinking_v1.enabled():
+        if (
+            _self_thinking_v1.enabled()
+            and _supports_mandatory_self_thinking_v1()
+        ):
             content = f"{_self_thinking_v1.INSTRUCTION.strip()}\n\n{content}"
         # Ground every foreground turn in the real current time (+ gap since last
         # interaction) so the agent never carries a stale, e.g. overnight, frame.
         content = _prepend_time_anchor_foreground(content, ts)
         content = _prepend_runtime_model_identity(content)
+        # Preserve the pre-session prompt so a poisoned Pi session can rotate;
+        # rebuilding adds only the safe text transcript, never historical pixels.
+        session_independent_content = content
         # VPS/self-hosted CLI resident only (no-op for hosted / http-backend):
         # live io_cli command catalog, once per resume-capable session or every
         # turn for codex. Must run BEFORE _foreground_agent_message below so the
@@ -13867,8 +15064,14 @@ def _process_messages(messages: list) -> float:
         # (v2, image, plain) carries the same context. Wraps the time-anchored
         # content so the transcript sits above this turn's grounded message.
         content = _foreground_agent_message(content, current_ts=ts)
+        session_bound_content = content
 
-        use_runtime_v2 = _resident_chat_runtime_v2_enabled() and not (image_payloads or image_paths)
+        # This flag selects the resident V1 chat profile; it does not transfer
+        # session ownership to the pooled Runtime V2 worker.
+        use_resident_chat_v2_profile = (
+            _resident_chat_runtime_v2_enabled()
+            and not (image_payloads or image_paths)
+        )
         attempt_kwargs = (
             {"attempt_trigger": attempt_trigger}
             if attempt_trigger != "first"
@@ -13883,6 +15086,13 @@ def _process_messages(messages: list) -> float:
             else None
         )
         staged_outbound_files: list[StagedChatFile] = []
+        staged_outbound_images: list[StagedChatImage] = []
+        # 专用生图不再由 runtime 抢先跑一发。伴侣自己用 generate-image 调用户
+        # 配置的生图模型(prompt 它自己写),再用 send-image 交付 —— 与它原生产出
+        # 的图走同一条路。删掉的那段会:①用正则替它判断"用户是不是在要图"
+        # (含蓄请求判不出、它自己想画没入口);②拿用户原话当 prompt(画出来的
+        # 东西不带它的理解);③成功后用系统写死的「图片已经生成。」当回复,
+        # 连模型都没过——那是替它说话,比让它闭嘴更糟。
         if outbound_file_turn_active:
             try:
                 _begin_outbound_file_turn(trace_id, outbound_file_requirement)
@@ -13895,6 +15105,32 @@ def _process_messages(messages: list) -> float:
         # 发就成了重复错误气泡。让通知与回复共享同一份排他性。
         pending_failure_notice: BaseException | None = None
         pending_failure_is_parse_only = False
+
+        def _dispatch_foreground_agent(turn_content: str) -> Any:
+            if use_resident_chat_v2_profile:
+                return call_agent(
+                    _resident_foreground_chat_message_v2(turn_content),
+                    trace_id=trace_id, lane="chat",
+                    stream_update=voice_stream_update,
+                    **attempt_kwargs)
+            if image_payloads or image_paths:
+                return call_agent(
+                    turn_content,
+                    images=image_payloads,
+                    image_paths=image_paths,
+                    trace_id=trace_id,
+                    lane="chat",
+                    stream_update=voice_stream_update,
+                    **attempt_kwargs,
+                )
+            return call_agent(
+                turn_content,
+                trace_id=trace_id,
+                lane="chat",
+                stream_update=voice_stream_update,
+                **attempt_kwargs,
+            )
+
         try:
             # Discard any parse-failed marker left dangling by another lane
             # (proactive / verify_probe) running earlier in this single-threaded
@@ -13910,30 +15146,57 @@ def _process_messages(messages: list) -> float:
                     ]
                 }
                 pending_failure_notice = vision_observer_failed
-            elif use_runtime_v2:
-                agent_result = call_agent(
-                    _resident_foreground_chat_message_v2(content),
-                    trace_id=trace_id, lane="chat",
-                    stream_update=voice_stream_update,
-                    **attempt_kwargs)
-            elif image_payloads or image_paths:
-                agent_result = call_agent(
-                    content,
-                    images=image_payloads,
-                    image_paths=image_paths,
-                    trace_id=trace_id,
-                    lane="chat",
-                    stream_update=voice_stream_update,
-                    **attempt_kwargs,
-                )
             else:
-                agent_result = call_agent(
-                    content,
-                    trace_id=trace_id,
-                    lane="chat",
-                    stream_update=voice_stream_update,
-                    **attempt_kwargs,
-                )
+                try:
+                    agent_result = _dispatch_foreground_agent(content)
+                except Exception as first_error:
+                    pi_vision_rejection = (
+                        AGENT_MODE == "cli"
+                        and _cli_template_is_pi()
+                        and _vision_probe_error_code(first_error)
+                        == "vision_model_required"
+                    )
+                    if not pi_vision_rejection:
+                        raise
+
+                    # Pi replays session blocks on later turns, so one rejected
+                    # image otherwise makes subsequent text-only turns fail too.
+                    _discard_io_cli_catalog_pending_injection()
+                    _clear_agent_session_id("Pi session retained rejected image input")
+
+                    has_current_images = bool(image_payloads or image_paths)
+                    _emit_debug_trace(
+                        "agent", "agent.session.vision_rejection_rotate",
+                        trace_id=trace_id,
+                        summary="Pi session rotated after vision rejection",
+                        explain=(
+                            "Pi 会话残留了主模型拒绝的图片——已轮换会话"
+                            + ("，本轮仍含原图，等待用户配置识图模型"
+                               if has_current_images
+                               else "，用纯文本安全上下文重试本轮")
+                        ),
+                        detail={
+                            "current_images": has_current_images,
+                            "retried": not has_current_images,
+                            "resident_chat_v2_profile": (
+                                use_resident_chat_v2_profile
+                            ),
+                        },
+                    )
+                    if has_current_images:
+                        raise
+
+                    suffix = (
+                        content[len(session_bound_content):]
+                        if content.startswith(session_bound_content)
+                        else ""
+                    )
+                    content = _prepend_io_cli_capability_catalog(
+                        session_independent_content
+                    )
+                    content = _foreground_agent_message(content, current_ts=ts)
+                    content += suffix
+                    agent_result = _dispatch_foreground_agent(content)
         except Exception as e:
             log.error("agent call failed; posting user-visible fallback: %s", e)
             if content_type == "image" and not isinstance(e, VisionObserverFailure):
@@ -13957,7 +15220,7 @@ def _process_messages(messages: list) -> float:
                 # 否则用户被引导去重试一个永远不会成功的调用（见
                 # _turn_failure_reply_text）。
                 failure_notice = classify_agent_error(e)
-                agent_result = [_turn_failure_reply_text(failure_notice)]
+                agent_result = [_turn_failure_reply_text(failure_notice, raw_user_content_for_lang)]
                 if failure_notice.blame == "user_provider":
                     _suppress_duplicate_upstream_banner(failure_notice)
                 pending_failure_notice = e
@@ -13967,7 +15230,7 @@ def _process_messages(messages: list) -> float:
                 _notify_agent_turn_failure(e, foreground=True)
                 log.warning("agent error fallback disabled by env; this user turn will not get a visible reply")
                 if outbound_file_turn_active:
-                    _finish_outbound_file_turn(trace_id)
+                    _finish_outbound_attachment_turn(trace_id)
                 latest = max(latest, ts)
                 continue
         else:
@@ -13981,11 +15244,21 @@ def _process_messages(messages: list) -> float:
                 _commit_io_cli_catalog_injection()
             if voice_stream_update is not None:
                 voice_stream_update.complete()
-            if not vision_observer_failed and _consume_reply_parse_failed():
-                pending_failure_notice = ValueError(
-                    "agent produced no usable reply after sanitization"
+            if (
+                not vision_observer_failed
+                and (parse_failure_class := _consume_reply_parse_failed())
+            ):
+                pending_failure_notice = _reply_parse_failure_exc(
+                    parse_failure_class
                 )
                 pending_failure_is_parse_only = True
+                # call_agent 那条兜底(清洗后为空)只拿得到**拼装后的 prompt**,
+                # 用它判语言正是 I5 明令禁止的(catalog/转写头里全是中文)。所以
+                # 它固定返回中文,由这里 —— 唯一握着用户原话的地方 —— 归一。
+                if agent_result == [FALLBACK_REPLY]:
+                    agent_result = [
+                        _fallback_reply_for(raw_user_content_for_lang)
+                    ]
             elif not vision_observer_failed:
                 _note_agent_turn_success()
 
@@ -14005,17 +15278,54 @@ def _process_messages(messages: list) -> float:
                         trace_id=trace_id,
                         lane="chat",
                     )
-                    if _consume_reply_parse_failed():
+                    if (retry_failure_class := _consume_reply_parse_failed()):
                         pending_failure_is_parse_only = True
-                        raise ValueError(
-                            "file delivery retry produced no usable reply"
-                        )
+                        raise _reply_parse_failure_exc(retry_failure_class)
                     agent_result = retry_result
                 except Exception as exc:
                     log.error("outbound file completion retry failed: %s", exc)
                     pending_failure_notice = exc
 
-            staged_outbound_files = _finish_outbound_file_turn(trace_id)
+            # 谎报打回:它说图画好了,但这一轮一张图都没 stage。给**一次**明确的
+            # 纠正机会(真去画,或者照实说),之后不再纠缠 —— 再撒谎就照原样发出
+            # 并留痕,那是模型的问题,不是 runtime 该继续较劲的事。
+            # 必须在 `_finish_outbound_attachment_turn` **之前**判:staging 一旦
+            # 收摊,它就算被打回、真去调 send-image 也交付不出去。
+            # 之前这条只有提示词、没有运行时控制流 —— prod 主链路上模型谎报会
+            # 照常发布,V1/V2 的产品基线不一致(codex 审出)。
+            if pending_failure_notice is None and not _staged_outbound_image_snapshot(
+                trace_id
+            ):
+                claimed = _split_agent_turn(agent_result)
+                claimed_text = "\n\n".join(
+                    m for m in claimed.messages if isinstance(m, str)
+                )
+                if _claims_image_delivered(claimed_text):
+                    _emit_debug_trace(
+                        "agent",
+                        "image_claim_without_media_bounced",
+                        trace_id=trace_id,
+                        summary="reply claimed an image that was never staged",
+                    )
+                    try:
+                        retry_result = call_agent(
+                            _image_claim_retry_prompt(),
+                            trace_id=trace_id,
+                            lane="chat",
+                        )
+                        if (retry_failure_class := _consume_reply_parse_failed()):
+                            pending_failure_is_parse_only = True
+                            raise _reply_parse_failure_exc(retry_failure_class)
+                        agent_result = retry_result
+                    except Exception as exc:
+                        # 打回失败不能吃掉原来那一轮:宁可把它原话发出去(留痕),
+                        # 也不要让用户什么都收不到。
+                        log.error("image claim retry failed: %s", exc)
+                        agent_result = initial_agent_result
+
+            staged_outbound_files, staged_outbound_images = (
+                _finish_outbound_attachment_turn(trace_id)
+            )
             still_missing = _missing_outbound_file_suffixes(
                 outbound_file_requirement, staged_outbound_files
             )
@@ -14043,7 +15353,9 @@ def _process_messages(messages: list) -> float:
                             _outbound_file_failure_reply(raw_user_content_for_lang)
                         ]
                     }
-            elif staged_outbound_files and pending_failure_is_parse_only:
+            elif (
+                staged_outbound_files or staged_outbound_images
+            ) and pending_failure_is_parse_only:
                 # A successfully staged file is itself a usable model result.
                 # Some CLI drivers emit no separate assistant text after the
                 # send-file tool call; synthesize the short confirmation below
@@ -14051,32 +15363,140 @@ def _process_messages(messages: list) -> float:
                 pending_failure_notice = None
                 _note_agent_turn_success()
 
-        turn = _split_agent_turn(agent_result)
-        sanitized_messages: list[str] = []
-        stripped_file_citation = False
-        for message in turn.messages:
-            if not isinstance(message, str):
-                continue
-            sanitized, removed = _sanitize_outbound_file_reply(
-                message,
-                attachment_staged=bool(staged_outbound_files),
-            )
-            stripped_file_citation = stripped_file_citation or removed
-            if sanitized.strip():
-                sanitized_messages.append(sanitized)
-        if stripped_file_citation:
-            log.warning("removed internal file reference from visible reply")
-            turn.messages = sanitized_messages
-            if not staged_outbound_files:
-                turn.messages = [
-                    _outbound_file_failure_reply(raw_user_content_for_lang)
+            if staged_outbound_images and pending_failure_notice is not None:
+                agent_result = {
+                    "messages": [_image_ready_reply(raw_user_content_for_lang)]
+                }
+                pending_failure_notice = None
+                pending_failure_is_parse_only = False
+                _note_agent_turn_success()
+
+        def _finalize_turn(result):
+            """agent_result → 清洗后的 turn。抽成函数是为了让空回合重试走**同一
+            条**清洗链:重试出来的回复若换一条更宽松的路进库,就等于给重试开了后
+            门,线上会冒出"只有重试那次才漏内部文件引用"这种查不出来的差异。"""
+            finalized = _split_agent_turn(result)
+            sanitized_messages: list[str] = []
+            stripped_file_citation = False
+            for message in finalized.messages:
+                if not isinstance(message, str):
+                    continue
+                sanitized, removed = _sanitize_outbound_file_reply(
+                    message,
+                    attachment_staged=bool(
+                        staged_outbound_files or staged_outbound_images
+                    ),
+                )
+                stripped_file_citation = stripped_file_citation or removed
+                if sanitized.strip():
+                    sanitized_messages.append(sanitized)
+            if stripped_file_citation:
+                log.warning("removed internal file reference from visible reply")
+                finalized.messages = sanitized_messages
+                if not staged_outbound_files:
+                    finalized.messages = [
+                        _outbound_file_failure_reply(raw_user_content_for_lang)
+                    ]
+            if staged_outbound_files and not finalized.messages:
+                finalized.messages = [
+                    "文件已经准备好了。"
+                    if re.search(r"[\u4e00-\u9fff]", raw_user_content_for_lang)
+                    else "The file is ready."
                 ]
-        if staged_outbound_files and not turn.messages:
-            turn.messages = [
-                "文件已经准备好了。"
-                if re.search(r"[\u4e00-\u9fff]", raw_user_content_for_lang)
-                else "The file is ready."
-            ]
+            if staged_outbound_images and not finalized.messages:
+                finalized.messages = [_image_ready_reply(raw_user_content_for_lang)]
+            return finalized
+
+        turn = _finalize_turn(agent_result)
+
+        # ---- 前台不变量:出不来字就重试,重试不出来就说人话,绝不沉默 ---------
+        # 判据是「可见文字」。actions 也算数(动作会经 rewrite_reply_for_outcomes
+        # 变成一句诚实的回复),但 thinking_summary / tool_calls **不算** —— 那正
+        # 是 usr_0724 那三轮的形状:模型想完了、工具也调了,就是一个字没说。
+        # 已带失败通知的回合不进这里:那条路自己会发兜底,再重试等于把一次上游
+        # 故障放大成三次。维护车道也不进:那是内部回合,没有人在等,给它糊一句
+        # 「我这会儿有点慢」等于往用户聊天流里塞一条不属于对话的气泡。
+        if (
+            not turn.messages
+            and not turn.actions
+            and pending_failure_notice is None
+            and source != RESIDENT_MAINTENANCE_SOURCE
+        ):
+            for attempt in range(1, FOREGROUND_EMPTY_REPLY_RETRIES + 1):
+                log.warning(
+                    "foreground turn produced no visible reply "
+                    "(thinking=%s tool_calls=%s); retrying %d/%d",
+                    bool(turn.thinking_summary), bool(turn.tool_calls),
+                    attempt, FOREGROUND_EMPTY_REPLY_RETRIES,
+                )
+                _emit_debug_trace(
+                    "agent", "agent.reply.empty_retry", status="error",
+                    trace_id=trace_id,
+                    summary=(f"empty visible reply; retry {attempt}/"
+                             f"{FOREGROUND_EMPTY_REPLY_RETRIES}"),
+                    explain="模型这一轮只思考没说话，用户还在等；正在重试。",
+                    detail={
+                        "attempt": attempt,
+                        "max_attempts": FOREGROUND_EMPTY_REPLY_RETRIES,
+                        "had_thinking": bool(turn.thinking_summary),
+                        "had_tool_calls": bool(turn.tool_calls),
+                        "thinking_kind": turn.thinking_kind or "",
+                    },
+                    content_excerpt={
+                        "thinking": (turn.thinking_summary or "")[:2000]
+                    },
+                )
+                try:
+                    retry_result = _dispatch_foreground_agent(
+                        content
+                        + "\n\n"
+                        + _empty_reply_retry_prompt(raw_user_content_for_lang)
+                    )
+                except Exception as exc:
+                    # 重试自己炸了:别把它记成新的一类失败,按空回复收口走下面的
+                    # 兜底 —— 用户要的是一句话,不是一份更精确的验尸报告。
+                    log.error("empty-reply retry raised: %s", exc)
+                    _consume_reply_parse_failed()
+                    break
+                retry_failure_class = _consume_reply_parse_failed()
+                turn = _finalize_turn(retry_result)
+                if turn.messages or turn.actions:
+                    log.info(
+                        "empty-reply retry %d recovered a visible reply", attempt
+                    )
+                    _note_agent_turn_success()
+                    break
+                if retry_failure_class:
+                    break
+            if not turn.messages and not turn.actions:
+                # 重试用尽仍然一个字都没有。用户发了一条,就必须收到一条 ——
+                # 归 provider_empty_reply(模型压根没给正文),横幅才不会赖我们。
+                log.error(
+                    "foreground turn still empty after %d retries; sending fallback",
+                    FOREGROUND_EMPTY_REPLY_RETRIES,
+                )
+                # 这条是这类失败在看板上**唯一**的信号:agent.reply 那条记的是
+                # status=ok(它确实解析成功了,只是解析出 0 条),stalled_turns 也
+                # 数不到 —— usr_0724 的三轮在 admin 面上长得跟正常回合一模一样,
+                # 所以这个 bug 过去有多少次我们根本查不出来。
+                _emit_debug_trace(
+                    "agent", "agent.reply.empty_exhausted", status="error",
+                    trace_id=trace_id,
+                    summary="empty visible reply after "
+                            f"{FOREGROUND_EMPTY_REPLY_RETRIES} retries",
+                    explain="重试后模型仍然只思考不说话，已发兜底回复。",
+                    detail={
+                        "max_attempts": FOREGROUND_EMPTY_REPLY_RETRIES,
+                        "had_thinking": bool(turn.thinking_summary),
+                        "thinking_kind": turn.thinking_kind or "",
+                    },
+                )
+                turn.messages = [_empty_reply_fallback(raw_user_content_for_lang)]
+                pending_failure_notice = _reply_parse_failure_exc(
+                    "provider_empty_reply"
+                )
+                pending_failure_is_parse_only = True
+
         _reply_text = "\n\n".join(m for m in turn.messages if isinstance(m, str) and m.strip())
         _emit_debug_trace(
             "agent", "agent.reply", trace_id=trace_id,
@@ -14088,7 +15508,7 @@ def _process_messages(messages: list) -> float:
             content_excerpt={"reply": _reply_text[:3000], "thinking": (turn.thinking_summary or "")[:2000]},
         )
         actions, replies = turn.actions, turn.messages
-        if use_runtime_v2:
+        if use_resident_chat_v2_profile:
             actions = [
                 action for action in actions
                 if _proactive_action_type(action).removeprefix("proactive.") != "needs_background"
@@ -14160,7 +15580,7 @@ def _process_messages(messages: list) -> float:
                     "(degenerate punctuation fragment only)"
                 )
                 if SEND_FALLBACK_ON_AGENT_ERROR:
-                    replies = [FALLBACK_REPLY]
+                    replies = [_fallback_reply_for(raw_user_content_for_lang)]
                     pending_failure_notice = stream_cut
                 else:
                     _notify_agent_turn_failure(stream_cut, foreground=True)
@@ -14200,11 +15620,19 @@ def _process_messages(messages: list) -> float:
                     )
                 if idx == 0 and staged_outbound_files:
                     post_kwargs["file_followups"] = staged_outbound_files
+                if idx == 0 and staged_outbound_images:
+                    post_kwargs["image_followups"] = staged_outbound_images
                 result = post_reply(reply, **post_kwargs)
                 if isinstance(result, dict) and result.get("error"):
-                    if result.get("error") == "bootstrap_incomplete":
+                    if result.get("error") in {
+                        "bootstrap_incomplete",
+                        "voice_turn_superseded",
+                    }:
                         terminal_response_error = True
-                        log.error("reply rejected by bootstrap gate; advancing past this dead-end message")
+                        log.info(
+                            "reply terminally skipped reason=%s; advancing past message",
+                            result.get("error"),
+                        )
                         continue
                     raise RuntimeError(str(result)[:500])
                 posted_any = True
@@ -14383,6 +15811,7 @@ _outbound_file_lock = threading.Lock()
 _active_outbound_file_turn_id = ""
 _active_outbound_file_suffixes: tuple[str, ...] | None = None
 _staged_outbound_files: list[StagedChatFile] = []
+_staged_outbound_images: list[StagedChatImage] = []
 
 
 def _begin_outbound_file_turn(
@@ -14398,6 +15827,7 @@ def _begin_outbound_file_turn(
         _active_outbound_file_turn_id = str(turn_id or "")
         _active_outbound_file_suffixes = required_suffixes
         _staged_outbound_files.clear()
+        _staged_outbound_images.clear()
 
 
 def _staged_outbound_file_snapshot(turn_id: str) -> list[StagedChatFile]:
@@ -14407,21 +15837,44 @@ def _staged_outbound_file_snapshot(turn_id: str) -> list[StagedChatFile]:
         return list(_staged_outbound_files)
 
 
-def _finish_outbound_file_turn(turn_id: str) -> list[StagedChatFile]:
-    global _active_outbound_file_turn_id, _active_outbound_file_suffixes
+def _staged_outbound_image_snapshot(turn_id: str) -> list[StagedChatImage]:
+    """本回合到目前为止已 stage 的图 —— **不关闭 staging**。
+
+    谎报打回必须在 staging 还开着的时候判:一旦
+    `_finish_outbound_attachment_turn` 收了摊,伴侣就算被打回、真去调
+    send-image 也交付不出去(no_active_chat_turn)。
+    """
     with _outbound_file_lock:
         if str(turn_id or "") != _active_outbound_file_turn_id:
             return []
-        staged = list(_staged_outbound_files)
+        return list(_staged_outbound_images)
+
+
+def _finish_outbound_attachment_turn(
+    turn_id: str,
+) -> tuple[list[StagedChatFile], list[StagedChatImage]]:
+    global _active_outbound_file_turn_id, _active_outbound_file_suffixes
+    with _outbound_file_lock:
+        if str(turn_id or "") != _active_outbound_file_turn_id:
+            return [], []
+        staged_files = list(_staged_outbound_files)
+        staged_images = list(_staged_outbound_images)
         _staged_outbound_files.clear()
+        _staged_outbound_images.clear()
         _active_outbound_file_turn_id = ""
         _active_outbound_file_suffixes = None
-    for item in staged:
+    for item in [*staged_files, *staged_images]:
         try:
             Path(item.source_path).unlink(missing_ok=True)
         except OSError:
             pass
-    return staged
+    return staged_files, staged_images
+
+
+def _finish_outbound_file_turn(turn_id: str) -> list[StagedChatFile]:
+    """Backward-compatible file-only test/helper surface."""
+    files, _images = _finish_outbound_attachment_turn(turn_id)
+    return files
 
 
 def _safe_outbound_file_name(raw: str) -> str:
@@ -14549,6 +16002,81 @@ def _handle_stage_file_ipc(msg: dict) -> dict:
                     "request_id": request_id,
                 }
             _staged_outbound_files.append(item)
+    return {
+        "ok": True,
+        "staged": True,
+        "name": item.name,
+        "mime": item.mime_type,
+        "byte_count": len(item.data),
+        "request_id": request_id,
+    }
+
+
+def _handle_stage_image_ipc(msg: dict) -> dict:
+    """Validate and stage one binary raster result from the active agent turn."""
+    request_id = str(msg.get("request_id") or "").strip()
+    raw_path = str(msg.get("path") or "").strip()
+    if not request_id:
+        return {"ok": False, "error": "request_id_required"}
+    if not raw_path:
+        return {"ok": False, "error": "path_required", "request_id": request_id}
+
+    with _outbound_file_lock:
+        active_turn_id = _active_outbound_file_turn_id
+    if not active_turn_id:
+        return {"ok": False, "error": "no_active_chat_turn", "request_id": request_id}
+
+    source_path = Path(raw_path)
+    if not source_path.is_absolute():
+        source_path = OUTBOUND_FILE_DIR / source_path
+    try:
+        resolved_dir = OUTBOUND_FILE_DIR.resolve()
+        resolved_path = source_path.resolve(strict=True)
+        resolved_path.relative_to(resolved_dir)
+    except (OSError, ValueError):
+        return {
+            "ok": False,
+            "error": "path_outside_outbound_dir",
+            "request_id": request_id,
+        }
+
+    try:
+        source_data = resolved_path.read_bytes()
+        normalized = generated_image.normalize_generated_image(
+            source_data,
+            name=str(msg.get("name") or resolved_path.name),
+            index=len(_staged_outbound_images) + 1,
+        )
+    except (OSError, ValueError) as exc:
+        return {"ok": False, "error": str(exc), "request_id": request_id}
+
+    item = StagedChatImage(
+        source_path=str(resolved_path),
+        name=normalized.name,
+        mime_type=normalized.mime_type,
+        data=normalized.data,
+    )
+    with _outbound_file_lock:
+        if active_turn_id != _active_outbound_file_turn_id:
+            return {"ok": False, "error": "chat_turn_finished", "request_id": request_id}
+        for existing in _staged_outbound_images:
+            if existing.source_path == item.source_path:
+                item = existing
+                break
+        else:
+            if len(_staged_outbound_images) >= generated_image.MAX_GENERATED_IMAGES_PER_REPLY:
+                return {
+                    "ok": False,
+                    "error": "too_many_staged_images",
+                    "request_id": request_id,
+                }
+            if len(_staged_outbound_files) + len(_staged_outbound_images) >= 8:
+                return {
+                    "ok": False,
+                    "error": "too_many_staged_attachments",
+                    "request_id": request_id,
+                }
+            _staged_outbound_images.append(item)
     return {
         "ok": True,
         "staged": True,
@@ -14833,6 +16361,8 @@ def _redistill_ipc_serve_forever(sock_path: Path) -> None:
             op = str(obj.get("op") or "") if isinstance(obj, dict) else ""
             if op == "stage_file":
                 reply = _handle_stage_file_ipc(obj)
+            elif op == "stage_image":
+                reply = _handle_stage_image_ipc(obj)
             elif op == "redistill" and not _HOSTED:
                 reply = _handle_redistill_ipc(obj)
             else:
@@ -15226,7 +16756,14 @@ def _resident_derive_identity(document: str, job_id: str) -> dict | None:
     existing = _resident_existing_identity()
     prompt = _dp.build_resident_identity_prompt(document, existing_identity=existing or None)
     for attempt in (1, 2):
-        raw = str(_capture_agent_reply_text(call_agent(prompt, raw_text=True, trace_id=job_id)) or "").strip()
+        # isolated_session: derive in a clean context, like the vision probe and
+        # dream review. Sharing the resumed chat session made surrounding chat
+        # bleed into the derivation (schema drift: invented fields) and made a
+        # second redistill in the same session get refused as a "duplicate
+        # request" in prose instead of JSON (resident report 2026-08-05).
+        raw = str(_capture_agent_reply_text(call_agent(
+            prompt, raw_text=True, trace_id=job_id, isolated_session=True,
+        )) or "").strip()
         payload = _dp.parse_identity_payload(raw)
         if payload is not None:
             incremental = _resident_incremental_payload(payload, existing)

@@ -10,6 +10,191 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **Runner health probe keeps reserved capacity under backend load.**
+  `GET /healthz/runner` now runs its blocking heartbeat database query outside
+  the ordinary ASGI thread pool, with bounded connection and SQL timeouts plus
+  a three-second route deadline. A deadline failure returns a structured HTTP
+  503 instead of leaving external monitors to time out.
+
+- **Runtime V1 Fable 5 chat no longer requires visible chain-of-thought.**
+  Fable 5 routes running through pi, including OpenRouter and compatible relays,
+  now skip the mandatory `<think>` response format that the model refuses. Pi's
+  native reasoning setting is unchanged, and other models keep the existing
+  self-thinking behavior.
+- **Memory extraction no longer mistakes model thinking for its JSON result.**
+  Capture, Dream, legacy-card migration, and resident identity distillation now
+  remove well-formed thinking blocks before locating the result object while
+  retaining the previous raw-text fallback for malformed output. Hosted
+  Capture and Dream may re-ask once after a JSON decoding error; truncated or
+  prose-only responses remain non-retryable parse failures.
+
+- **A base URL that is not an API endpoint no longer reports as an API-key
+  failure.** When the configured relay base URL points at a web page rather than
+  the API (an HTTP 200 that returns the site's homepage, or a **404** HTML error
+  page), `provider_test_failed` now returns `"status_code": null` and a
+  bilingual `detail` telling the operator the endpoint usually needs to end with
+  `/v1` and that the API key is not the problem. Clients should display that
+  `detail` directly. HTML error pages carrying any other status
+  (401/402/429/5xx — relay auth, payment, throttle and gateway pages) keep their
+  original status code and detail unchanged.
+
+- **Runtime V2 Chat can search its own older conversation history on demand.**
+  Two chat-only agent tools let the agent keyword-search messages beyond its
+  visible context and read a small window around a match. Original messages
+  remain the retrieval source of truth (summaries only prioritize scanning);
+  decryption and matching stay inside the enclave under strict row/byte/time
+  budgets; attachment binaries are never read for search. A turn that reads
+  history loses outbound web/MCP/task tools for the next round, proactive wake
+  lanes never see these tools, and a deployment kill switch (default on) can
+  remove the capability without touching the normal chat path.
+- **Genesis plaintext retries reuse completed persona-voice mapping.** The
+  estimate/commit flow now retains its opaque staged-upload pointer in trusted
+  job metadata until completion, and both fact-map and voice-map window results
+  are stored in the encrypted checkpoint. Manual retries skip those completed
+  model calls without duplicating memory cards. Interrupted workers also emit
+  content-free cause, progress, elapsed-time, model, tier, and checkpoint-size
+  diagnostics; interruption and retry policy itself is unchanged.
+- **A large MCP server can no longer starve a smaller one.** When the connected
+  servers together expose more tools than one turn can carry, the tools kept are
+  now allocated round-robin across servers instead of taken in server-name order,
+  so every connected server keeps a share; only the largest ones are trimmed.
+  Previously a single big server could consume the whole budget and a server
+  later in the alphabet would contribute no tools at all — its connection test
+  passed while the companion genuinely could not see any of its tools. This now
+  applies to both runtimes: the self-hosted bridge and Hosted Runtime V2, whose
+  catalog was still filled in server-name order. The self-hosted bridge's
+  per-turn cap is also raised from 50 to 100.
+- **A self-hosted `claude` agent now receives the MCP servers you enabled in the
+  app.** A hand-written `AGENT_CLI_CMD` without the `{mcp}` placeholder — the
+  form the operator documentation previously showed — never passed
+  `--mcp-config`, so no app-configured server reached the agent even though its
+  connection test passed. Chat turns now get the server list and a matching
+  pre-approval for its tools. A command that already sets `--mcp-config` is left
+  untouched, and one that pins its own `--allowed-tools` keeps it and is told in
+  the log which `mcp__<name>__*` rules to add. Other self-hosted runtimes
+  (`codex`, hermes, OpenClaw) were unaffected: they read MCP from their own
+  config files.
+
+- **Voice calls no longer end with a protocol error when a turn produces no
+  speech.** A turn that is deliberately silent — transport noise, a call that
+  already ended, an ASR revision that superseded it — now returns a valid
+  completion instead of one with no content at all, which ElevenLabs rejected
+  as a Custom LLM failure and used to terminate the whole call.
+
+- **A finished call stays in ordinary conversation context.** Its preview card
+  is replayed as a labelled call-record block that names the speakers and
+  states the transcript is not the companion's own speech, rather than being
+  removed from the prompt entirely. Memory distillation is unchanged and still
+  reads the archived full transcript.
+
+- **Thinking-leak gate.** A model's own `<think>` block could reach the user's
+  chat bubble on three delivery paths: Runtime V2 chat stripped only the first
+  block of a reply, resident V1 required a matched open/close pair and passed an
+  orphaned closing tag through verbatim, and proactive messages had no stripping
+  at all. All four delivery points and the assistant history replayed to the
+  model now share one strip step that fails closed when a block cannot be
+  cleanly resolved. New `FEEDLING_THINK_GATE` environment variable, on by
+  default, documented in Self-hosting. Turning off `FEEDLING_V2_SELF_THINKING`
+  no longer disables this gate.
+- **Runtime V2 now supports stricter Anthropic-compatible models during chat and
+  multi-step tool use.** Fable 5 is allowed to answer without the optional
+  self-thinking bubble instead of being forced into a visible chain-of-thought
+  format that it refuses. Native tool definitions also remain visible while
+  their matching `tool_use` / `tool_result` history is in the turn, so models
+  such as Opus 4.8 can continue a real tool workflow without treating earlier
+  results as fabricated. Repeated memory discovery is still executed at most
+  once per mode.
+
+- **Runtime V1 now pins and verifies the selected Claude model family.** Managed
+  Claude Code commands pass the configured route through `--model`, and model
+  changes rotate resident sessions. A Claude Code fallback to another Claude
+  model is allowed and logged with both configured and actual model IDs;
+  structured output that proves a non-Claude model served a Claude route is
+  rejected as `model_mismatch`.
+
+- **The companion now decides when to generate an image.** Image generation is
+  no longer triggered by keyword matching on the user's message, and a dedicated
+  image route no longer bypasses the main model. The companion calls an image
+  tool itself — `generate_image` on Runtime V2, `io_cli.py generate-image` on
+  Runtime V1 and self-hosted CLI residents — writes its own prompt, and its
+  accompanying words are delivered together with the picture in one reply
+  instead of being discarded. It may also generate an image without an explicit
+  request. Generation failures are returned to the companion as a tool result so
+  it can explain them in its own words rather than ending the turn; a reply that
+  claims an image was produced when none was is returned once for correction,
+  and is then delivered as written. `POST /v1/image-generation/generate` and the
+  existing encrypted image-delivery path are unchanged.
+
+- **Image-model setup failures remain actionable without replacing the
+  companion's reply.** Runtime V1, Runtime V2, and CLI residents now preserve an
+  allowlisted `image_generation_*` code on the failed `generate_image` activity
+  event. Clients can use the final image-generation attempt in a completed turn
+  to offer model setup while still displaying the companion's own words. A later
+  successful attempt or a temporary provider failure does not request setup.
+
+- **Failed voice calls now have an explicit, idempotent cancellation path.**
+  `POST /v1/voice/cancel` installs a durable per-call tombstone, clears
+  unarchived turn/result rows, and suppresses late resident or Hosted Runtime
+  V2 replies before chat insertion. Finalize and cancel claim one lifecycle
+  winner before archive writes, so cancellation cannot downgrade a call whose
+  archive already won.
+
+- **Runtime V2 Chat now applies matching World Book entries.** Matches use the
+  current user turn and enter the prompt as a standalone, untrusted setting-data
+  block rather than changing the user's message. Oversized matched context is
+  deterministically truncated with a visible marker; proactive wake lanes remain
+  unchanged for Runtime V1 parity.
+
+- **Dream more clearly keeps merely related memories separate.** Its shared V1
+  and Runtime V2 consolidation guidance now gives a concrete example that a
+  cycling habit and recent insomnia remain independent memories even though
+  both concern health; genuine evolution of one plan remains mergeable.
+
+- **Runtime V2 no longer treats an intentional silent heartbeat as a failed
+  response.** A model response containing a complete self-thinking block and no
+  public text now completes ordinary heartbeat, manual-wake, and screen-watch
+  jobs without publishing a bubble or arming proactive failure backoff.
+  Scheduled reminders still require public text, while malformed or truncated
+  thinking markup remains a fail-closed error.
+
+- **Voice calls are now archived in full, and memory is distilled from the
+  whole call.** At hang-up `POST /v1/voice/finalize` archives the complete
+  transcript (permanent, sealed to the account's content key) and leaves ONE
+  bounded preview card in chat; the per-turn rows are deleted only after the
+  archive is durable. Memory then runs through the ordinary capture pipeline
+  over the archived full text. This replaces the earlier behaviour where a
+  model-written 1–3 sentence summary was both the chat artifact and the only
+  thing memory ever saw — anything not in those sentences was lost. The
+  response now returns `transcript_message_id`; `summary_message_id` is still
+  sent as a deprecated alias for one release. Idempotent replays are judged on
+  the archive; rows already folded by Runtime V2 compaction are retained and
+  reported as `retained_covered`.
+
+- **New public endpoints for reading archived calls.**
+  `GET /v1/voice/transcripts` lists a caller's calls (metadata only — no
+  words), and `GET /v1/voice/transcripts/{call_id}` returns one call's sealed
+  envelope for the client to decrypt locally. The server never returns
+  transcript plaintext. Calls are retained until the account is deleted;
+  clearing chat history does not remove them.
+
+- **Voice call length raised from 5 minutes to 1 hour.** The previous cap was
+  shorter than the voice provider's own default and had no product rationale.
+- **`POST /v1/chat/message` now accepts `context_refs`, carrying Garden
+  "talk in chat" memory references on the resident line.** Same plaintext
+  routing contract as the hosted send: only `type: "memory"` entries are
+  honored, ids only are persisted as `quoted_memory_ids` (capped at eight),
+  and the enclave expands them into decrypted memory context for the
+  resident consumer. Requests without `context_refs` are unchanged.
+
+- **Hosted Genesis no longer silently completes a non-empty long-term-memory
+  import with zero cards.** Keep-all imports now fail with
+  `distill_empty_output` and remediation copy directing the user to switch
+  models. The job output retains up to six discarded map diagnostics with a
+  reason and a 500-character model-output excerpt. Compatible-relay model
+  recommendations temporarily exclude Gemini Flash IDs while leaving Gemini
+  Pro and non-Gemini Flash names eligible. Admin data-track Genesis jobs now
+  include the selected `distill_model`.
+
 - **Hosted Genesis retries no longer reuse completed imports that produced no
   durable memories or identity artifact.** Retrying identical staged material
   after such an incomplete historical result now creates a new processing job
@@ -131,25 +316,57 @@ change must not be interpreted as an API guarantee.
   Perception-triggered wake messages no longer receive unrelated exact battery,
   weather, activity, sleep, or health values in their initial prompt.
 
-- **Hosted Dream maintenance now uses proposal rationale plus independent
-  semantic review.** Runtime V2 fetches complete candidate card bodies instead
-  of reconstructing them from one-line summaries. Every consolidation must
-  include a rationale and receive an isolated second yes/no judgment from the
-  account's BYOK model; a negative, failed, timed-out, or malformed judgment
-  rejects only that proposal. This replaces the temporary text-overlap,
-  five-consolidation, four-retired-card, and seven-day cooldown fences, allowing
-  low-overlap evolution such as a travel plan becoming a booked ticket while
-  keeping merely related events separate. One-card rewrites still require
-  substantive new information, one source card cannot be reused within a run,
-  and all actions remain soft supersedes bound to the pre-run card snapshot.
+- **Empty provider replies are now attributed to the provider, not the
+  system.** When a model or relay returns a successful response with no usable
+  text (empty terminal reply, mid-stream cut, quota-pressure fake success), the
+  failure notice now uses the `provider_empty_reply` class with
+  provider-transient blame and copy that points at the user's model channel,
+  instead of the system-blame "something went wrong on our side" message.
+  Replies that contained real text but were emptied by protocol-leak
+  sanitization keep the system attribution, as does exhausting the server's own
+  tool-call budget without producing a reply. Applies to the resident V1 agent
+  path and to Runtime V2 chat, wake, and memory-extraction lanes.
+
+- **Runtime V2 can recover once from a reasoning-only provider response.** A
+  successful foreground response with reasoning or a normal stop reason but no
+  visible text or client tool call gets one bounded correction while preserving
+  the currently allowed tool catalog. A relay response with no text, tool call,
+  reasoning, or stop reason now fails immediately as `provider_empty_reply`
+  instead of repeating the same billed request or reporting a network outage.
+  Intentional Runtime V2 wake silence is unchanged.
+
+- **Plaintext memory writes reject tombstone-style notes.** A plaintext
+  `memory.add`, upgrade, or `memory.supersede` whose summary or content is a
+  bookkeeping note — "已被 … 取代" or "superseded by" followed by an
+  internal-id-like hex string — now fails with an item-level
+  `memory_card_tombstone` instead of being stored, and a rejected supersede
+  leaves every targeted card active. This closes the freehand agent-tool path
+  that bypassed the structured extraction gates; ordinary prose about
+  replacement without a hex id is unaffected.
+
+- **Hosted Dream maintenance now applies deterministic exit gates instead of
+  content-quality judgment.** Runtime V2 fetches complete candidate card bodies
+  instead of reconstructing them from one-line summaries. Every consolidation
+  must include a rationale, may not reuse a source card within a run, and may
+  not target unknown cards. Consolidation content itself is not second-guessed:
+  the earlier per-proposal semantic-review call and the substantive-increment
+  requirement for one-card rewrites were removed, so low-overlap evolution such
+  as a travel plan becoming a booked ticket merges without an extra model
+  judgment, and a shorter-but-more-accurate rewrite is accepted. In their place
+  Dream rejects (and bounces back for one rewrite) any result whose visible
+  fields contain an internal card id or a tombstone-style note, and a run that
+  would retire more than a configurable share of the active garden (default
+  80% and at least 10 cards) fails as a whole without applying anything. All
+  actions remain soft supersedes bound to the pre-run card snapshot, and
   Dream's durable automatic trigger advances only on new non-Dream cards.
 
 - **Users can explicitly wake a full Memory Dream organization from chat.**
   Runtime V2 exposes `memory_organize` only for an explicit user request and
   force-enqueues a single-flight Dream job without granting direct merge access
   to the chat turn. It bypasses automatic timing and new-material gates but
-  retains rationale review, soft supersedes, and the deployment/user Dream
-  switches; a disabled switch returns a clear disabled state. Resident V1 has
+  retains the rationale requirement, deterministic exit gates, soft
+  supersedes, and the deployment/user Dream switches; a disabled switch returns
+  a clear disabled state. Resident V1 has
   the equivalent `memory-organize` CLI verb over `POST /v1/dream/tick` with
   `force: true`.
 
@@ -256,6 +473,23 @@ change must not be interpreted as an API guarantee.
   non-empty reply with contradictory colors remains unsupported. Stable visual
   error codes still distinguish incompatible image input, invalid credentials,
   quota, rate limits, and temporary provider failures.
+
+- **VPS image generation is now capability-based.** A resident can advertise
+  `agent_image_generation_v1` when its configured agent entry actually exposes
+  a callable image tool. Dedicated image routes still take precedence; without
+  one, capable residents receive the request directly, while residents that do
+  not advertise the capability continue to receive image-model setup guidance.
+  When a dedicated route succeeds, its prepared image is delivered immediately
+  through the existing atomic reply path instead of waiting for a second main-
+  model turn.
+
+- **Generated images can now appear directly in Chat.** Runtime V2 normalizes
+  inline image results from supported provider responses, while CLI residents
+  can stage PNG, JPEG, or WebP output with `send-image`. Images are validated,
+  size-bounded, encrypted separately, and committed atomically with the reply as
+  native `content_type=image` rows. The public resident response contract adds
+  `image_followups`; remote provider URLs and local filesystem paths are never
+  exposed as image delivery.
 
 - **Hosted visual failures are easier to diagnose without exposing user
   content.** Per-user admin detail now includes bounded model-route runtime
@@ -921,16 +1155,14 @@ change must not be interpreted as an API guarantee.
   Unlabeled envelopes are accepted unchanged, so existing clients are
   unaffected. This closes the failure mode where a writer with a stale key
   seals messages the owner's device can never decrypt.
-- Expand `GET /healthz` from a fixed liveness stub into a structured
-  liveness-and-dependency probe. Responses now carry a top-level `status`
-  (`healthy`, `degraded`, or `unhealthy`), a `checks` object with per-component
-  detail, and release/uptime metadata, while preserving the legacy `ok` /
-  `mode` / `ready` fields. The backend checks PostgreSQL (`SELECT 1`),
-  connection-pool saturation, the in-memory user registry, and the cross-worker
-  wake-bus listener, and returns HTTP 503 when PostgreSQL is unreachable. The
-  enclave reports readiness, release, and TLS posture from cached boot state
-  without performing any cryptography. The documented response schema is
-  unchanged (a generic JSON object).
+- `GET /healthz` is now a pool-independent process-liveness probe. It keeps the
+  structured status, release/uptime metadata, legacy fields, in-memory user
+  registry check, and cross-worker wake-bus check, but no longer executes
+  `SELECT 1`, inspects the business connection pool, returns DB-related 503s, or
+  includes `checks.db` / `checks.db_pool`. This prevents saturated user traffic
+  from delaying the health probe or creating a false outage. PostgreSQL
+  readiness now requires a separate authenticated synthetic read/write probe.
+  The documented response schema remains a generic JSON object.
 - `POST /v1/mcp/servers` now accepts `http://` URLs and loopback/private-network
   and raw-IP hosts — this backend never dials the URL itself, only your agent
   does when it calls a tool, so none of those forms were ever a new attack

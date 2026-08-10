@@ -69,8 +69,19 @@ def _script_provider(monkeypatch, responses):
     it = iter(responses)
     calls = []
 
-    async def _fake(config, messages, *, tools=None):
-        calls.append({"tools": tools})
+    async def _fake(
+        config,
+        messages,
+        *,
+        tools=None,
+        allow_image_output=False,
+        **kwargs,
+    ):
+        calls.append({
+            "tools": tools,
+            "allow_image_output": allow_image_output,
+            **kwargs,
+        })
         return next(it)
 
     monkeypatch.setattr(provider_client, "chat_completion_async", _fake)
@@ -402,8 +413,16 @@ def test_platform_write_is_exactly_applied_before_later_round_mcp_mutation(
 
     provider_calls = 0
 
-    async def _provider(config, messages, *, tools=None):
+    async def _provider(
+        config,
+        messages,
+        *,
+        tools=None,
+        allow_image_output=False,
+        **kwargs,
+    ):
         nonlocal provider_calls
+        assert allow_image_output is True
         provider_calls += 1
         if provider_calls == 1:
             return {

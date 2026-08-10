@@ -142,8 +142,19 @@ def _idempotent(c: E2EClient):
         r = c.post("/v1/model_api/chat/send", json={"message": msg, "client_msg_id": cmid})
         codes.append(r.status_code)
         time.sleep(1)
-    time.sleep(4)
+    # Ingest is asynchronous (202): poll for the row instead of a fixed sleep. A
+    # flat 4s produced a false PRODUCT_FAIL ("0 user rows") right after a CVM
+    # deploy window on 2026-08-06; the same case passes locally with a generous
+    # wait. Keep waiting after delta reaches 1 is unnecessary, but a second
+    # duplicate row would appear within the same window, so re-check once.
+    deadline = time.time() + 45
     delta = _user_row_count(c) - before
+    while delta < 1 and time.time() < deadline:
+        time.sleep(3)
+        delta = _user_row_count(c) - before
+    if delta == 1:
+        time.sleep(5)  # give a late duplicate a chance to show up
+        delta = _user_row_count(c) - before
     # both POSTs must have satisfied the send contract (202), AND only one row lands
     if any(cd != 202 for cd in codes):
         return PRODUCT_FAIL, f"idempotent send had a non-202 attempt (codes={codes})"
