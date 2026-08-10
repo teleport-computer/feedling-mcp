@@ -318,6 +318,19 @@ def _memory_capture_validation_detail(store: UserStore, *, limit: int = 50) -> d
 
 
 def _proactive_stats(store: UserStore) -> dict:
+    """⚠️ 这个块读的是 **V1 口径**:`proactive_jobs` 日志 + `source ==
+    agent_initiated_proactive` 的聊天行。
+
+    Runtime V2 两样都不用:唤醒 job 在 `agent_jobs`(lane =
+    heartbeat/scheduled/manual_wake/screen_watch),回复行一律
+    `append_chat("openclaw", "model_api", …)`,靠行上的 `wake_kind` 标记才认得出是
+    主动开口。所以对 V2 用户,这里的 `heartbeat_jobs` / `proactive_messages` 会是
+    **结构性的 0**,而那堆 `pending` 是 V2 下无人排空的旧流死行
+    (`v2/serve_worker.py:_fire_scheduled_for_user` 注释里的 BUG-3)。
+
+    2026-08-10 我就是拿这块去判一个 V2 用户,差点报「你心跳十天没跑了」。调用方
+    `_build_data_track_user` 现在按运行时分流并显式标注口径,见 `_v2_proactive_stats`。
+    """
     decisions = store.list_gate_decisions(limit=0)
     jobs = store.list_proactive_jobs(limit=0)
     device_events = store.list_device_events(limit=0)
@@ -1422,6 +1435,108 @@ def _v2_chat_failures_detail(user_id: str) -> dict:
         return {"error": f"{type(e).__name__}:{str(e)[:120]}"}
 
 
+PROACTIVE_V1_LENS = "v1_proactive_jobs_log"
+PROACTIVE_V1_LENS_NOTE = (
+    "V1 口径:proactive_jobs 日志 + source=agent_initiated_proactive 的聊天行。"
+    "Runtime V2 的唤醒 job 在 agent_jobs、回复行 source 恒为 model_api,"
+    "因此 V2 用户在本块里的计数结构性为 0,pending 多为 V2 下无人排空的旧流死行。"
+    "V2 请看 v2_wake_activity / v2_wake_schedule。"
+)
+
+
+def _with_proactive_lens(block: dict) -> dict:
+    """给 V1 口径的 proactive 块贴上口径标注。
+
+    抽成函数而不是在调用点直接赋值,是为了让测试能真的绑住它——直接赋值的话,
+    测试只能自己造个 dict 再断言,production 删掉标注也照样绿(我第一版就是这么
+    写的,自己撞上了 TESTING.md 里那条「守卫本身在撒谎」)。
+
+    为什么必须标:V2 用户在这个块里看到的 0 是「没测量」而不是「没发生」,
+    不打标就会被读成故障——2026-08-10 我本人据此差点误报「心跳十天没跑」。
+    """
+    out = dict(block or {})
+    out["lens"] = PROACTIVE_V1_LENS
+    out["lens_note"] = PROACTIVE_V1_LENS_NOTE
+    return out
+
+
+def _v2_wake_activity_detail(user_id: str) -> dict:
+    """V2 主动唤醒的真实活动(按 lane)。
+
+    与 `proactive` 块互补且**不可互相替代**:那个块是 V1 口径,对 V2 用户结构性显示
+    0;这个块读的是 `agent_jobs`。两处的 lane 词汇也不同(见 `core/store.py` 的
+    `wake_kind` 注释:只有 screen_watch 重叠),不要跨着 join。
+    """
+    try:
+        from model_api_runtime.v2 import jobs_store as _v2_jobs_store
+        return _v2_jobs_store.wake_lane_activity_for_user(user_id)
+    except Exception as e:  # noqa: BLE001 — observability must never 500 the page
+        return {"error": f"{type(e).__name__}:{str(e)[:120]}"}
+
+
+def _v2_wake_schedule_detail(user_id: str, settings: dict | None) -> dict:
+    """`v2_wake_schedule` 那一行 + **「现在为什么不到期」的确定结论**。
+
+    这张表决定主动消息发不发,而 2026-08-10 之前它在管理端一个字段都看不到——
+    我只能靠读源码反推「是 NULL 还是支付冷却还是退避」。
+
+    `blocked_by` 交给 `jobs_store.heartbeat_due_diagnosis` 求值,**它跑的是
+    `due_heartbeat_users` 的同一份判据**(含 backoff 的真人发言逃生口)。
+    绝不在这里用 Python 重写一遍规则:support 面板给出的结论与调度器实际规则不一致,
+    就是又造了一个「看起来在测量、其实没有」的信号——正是本批要消灭的东西。
+
+    只出时间与计数,不出任何用户内容。
+    """
+    try:
+        from model_api_runtime.v2 import jobs_store as _v2_jobs_store
+
+        row = _v2_jobs_store.get_wake_schedule(str(user_id))
+        diagnosis = _v2_jobs_store.heartbeat_due_diagnosis(str(user_id))
+    except Exception as e:  # noqa: BLE001 — observability must never 500 the page
+        return {"error": f"{type(e).__name__}:{str(e)[:120]}"}
+
+    if row is None:
+        # 不要显示成空:「没有行」本身就是一个结论——调度器从没接管过这个用户,
+        # 心跳因此永远不会到期(`due_heartbeat_users` 要求 next_heartbeat_at 非空)。
+        return {
+            "present": False,
+            "blocked_by": ["no_schedule_row"],
+            "note": "该用户尚未被 V2 调度器接管过（无 v2_wake_schedule 行）",
+        }
+
+    def _epoch(key: str) -> float:
+        try:
+            return float(row.get(key) or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    def _iso(key: str) -> str:
+        value = _epoch(key)
+        return _data_track_iso(value) if value else ""
+
+    return {
+        "present": True,
+        "now": _data_track_iso(time.time()),
+        # ⚠️ 只列 `v2_wake_schedule` **真实存在**的列。我第一版凭印象写了
+        # `next_scheduled_at`,那一列根本不存在,于是永远是空字符串——一个空值会被
+        # 读成「这个用户没有定时任务」,和本批要修的病一模一样(codex 复验抓出)。
+        # 定时任务的真源是 `user_logs` 的 SCHEDULED_WAKE_STREAM（`due_scheduled_users`），
+        # 不在这张表里;本块不假装知道,见下面的 scheduled_timers_source。
+        "next_heartbeat_at": _iso("next_heartbeat_at"),
+        "next_capture_at": _iso("next_capture_at"),
+        "next_screen_watch_at": _iso("next_screen_watch_at"),
+        "payment_cooldown_until": _iso("payment_cooldown_until"),
+        "proactive_backoff_until": _iso("proactive_backoff_until"),
+        "proactive_fail_streak": int(row.get("proactive_fail_streak") or 0),
+        "proactive_fail_user_seq": int(row.get("proactive_fail_user_seq") or 0),
+        "self_wake_streak": int(row.get("self_wake_streak") or 0),
+        "dnd": bool((settings or {}).get("dnd", False)),
+        "scheduled_timers_source": "user_logs/scheduled_wake（不在 v2_wake_schedule 内）",
+        # 空列表 = 现在就该到期。非空 = 这些条件挡着,判据与调度器同源。
+        "blocked_by": list(diagnosis.get("blocked_by") or []),
+    }
+
+
 def _v2_profile_detail(user_id: str) -> dict:
     """Return the Runtime V2 profile's content-free support metadata only.
 
@@ -1517,7 +1632,7 @@ def _build_data_track_user(user_entry: dict, *, include_detail: bool = False) ->
     steps_done = sum(1 for s in steps if bool(s.get("passing")))
     chat = _chat_stats(store)
     memory = _memory_stats(store)
-    proactive = _proactive_stats(store)
+    proactive = _with_proactive_lens(_proactive_stats(store))
     push = _push_stats(store)
     events_limit = _data_track_query_int(
         "events_limit",
@@ -1628,6 +1743,12 @@ def _build_data_track_user(user_entry: dict, *, include_detail: bool = False) ->
         row["v2_profile"] = _v2_profile_detail(user_id)
         row["memory_capture_validation"] = _memory_capture_validation_detail(store)
         _ps = store.load_proactive_settings()
+        # 主动侧的 V2 真相:上面的 `proactive` 块是 V1 口径,对 V2 用户结构性显示 0
+        # (唤醒 job 在 agent_jobs、回复行 source 恒为 model_api)。这两个块补上
+        # 「真跑了多少」与「现在为什么不到期」——2026-08-10 少了它们,我拿 V1 口径
+        # 的 0 差点判成「心跳十天没跑」。
+        row["v2_wake_activity"] = _v2_wake_activity_detail(user_id)
+        row["v2_wake_schedule"] = _v2_wake_schedule_detail(user_id, _ps)
         row["perception_permissions"] = {
             # what the device reports it granted (free-form; keys are app-defined,
             # e.g. photos / screen / location / health / motion / calendar / audio)
