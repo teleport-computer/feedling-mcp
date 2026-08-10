@@ -113,7 +113,7 @@ def record_runtime_results(store, results, *, now: float | None = None) -> bool:
 
 
 def runtime_status_for_store(store) -> dict:
-    """Return the bounded content-free document for a future API projection."""
+    """Return the sanitized bounded document used by internal projections."""
     raw = db.get_blob(str(getattr(store, "user_id", "") or ""), RUNTIME_STATUS_BLOB)
     if not isinstance(raw, dict) or raw.get("version") != 1:
         return {"version": 1, "updated_at": 0, "servers": {}}
@@ -142,3 +142,21 @@ def runtime_status_for_store(store) -> dict:
         "updated_at": updated_at,
         "servers": servers,
     }
+
+
+def runtime_summaries_for_store(store) -> dict[str, dict]:
+    """Project bounded internal history into the public per-server summary."""
+    servers = runtime_status_for_store(store)["servers"]
+    summaries = {}
+    for name, status in servers.items():
+        recent = status["recent"]
+        if not recent:
+            continue
+        summaries[name] = {
+            "last_kind": status["last_kind"],
+            "last_at": status["last_at"],
+            "recent_ok": sum(
+                1 for row in recent if row["kind"] == "available"),
+            "recent_total": len(recent),
+        }
+    return summaries

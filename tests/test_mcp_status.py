@@ -57,6 +57,21 @@ def test_runtime_status_is_bounded_prunes_disabled_servers_and_never_persists_se
     assert len(doc["servers"]["safe"]["recent"]) == mcp_status.MAX_RECENT_TURNS
     assert len(doc["servers"]["flaky"]["recent"]) == mcp_status.MAX_RECENT_TURNS
     assert doc["servers"]["safe"]["recent"][0]["at"] == 1002
+    summaries = mcp_status.runtime_summaries_for_store(store)
+    assert summaries == {
+        "flaky": {
+            "last_kind": "timeout",
+            "last_at": 1011.0,
+            "recent_ok": 0,
+            "recent_total": 10,
+        },
+        "safe": {
+            "last_kind": "available",
+            "last_at": 1011.0,
+            "recent_ok": 10,
+            "recent_total": 10,
+        },
+    }
     dumped = json.dumps(doc)
     assert "must-not-persist" not in dumped
     assert "Bearer secret" not in dumped
