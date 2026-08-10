@@ -300,6 +300,19 @@ jobs:
             tests/test_v2_extraction.py \
             tests/test_v2_extraction_lanes.py \
             tests/test_v2_extraction_memory_integration.py \
+            tests/test_backfill_chat_bodies_to_plaintext.py \
+            tests/test_byok_plaintext_read_routing.py \
+            tests/test_content_encryption_preference.py \
+            tests/test_encryption_surface_frozen.py \
+            tests/test_envelope_storage_fields.py \
+            tests/test_no_fake_envelope_shapes.py \
+            tests/test_phase4_cutover.py \
+            tests/test_plaintext_memory_quality.py \
+            tests/test_read_side_shape_routing.py \
+            tests/test_swap_shape_transition.py \
+            tests/test_tee_carry_verbatim.py \
+            tests/test_uploaded_envelope_gate.py \
+            tests/test_write_side_format_routing.py \
             -v
 
   # Both rollout switches are default-off, so ordinary CI cannot exercise
