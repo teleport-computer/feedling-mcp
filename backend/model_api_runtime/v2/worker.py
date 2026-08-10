@@ -8755,7 +8755,23 @@ async def _run_wake(
                 # raising. Without this the lane failed 100% of the time on
                 # test with `wake_failed:providererror` while the provider
                 # answered 200 OK — the model simply had nothing to say.
-                require_reply=False,
+                #
+                # `scheduled` 是唯一的例外，它必须留在 require_reply=True 上。
+                # 这条道上的每个 timer 都带**到点交付义务**——无论是用户委托的
+                # （「20 秒后发消息给我」）还是 agent 自排的（`apply_turn_actions
+                # (..., self_wake=True)`，见 :7841）。沉默在这里不是「没什么可说」
+                # 而是提醒丢了：模型返空 → 落到下面的 `if not text: return` → job
+                # 记成 completed、无气泡、无失败、指标全绿，用户干等（usr_4ea3
+                # 2026-08-10，一晚上两次）。同一函数里「只给思考不给正文」那条
+                # 沉默路径早就为 scheduled 破了例（见 _THINKING_ONLY_NO_REPLY_REASON
+                # 处的 raise）——两条沉默路径必须同进同退，只堵一条等于没堵。
+                #
+                # 打开它拿到的是 tool_loop 已有的整条恢复链，而不是直接判死：
+                # 先追加 _EMPTY_RESPONSE_CORRECTION 重试一轮（多数抽风到此为止），
+                # 仍空才 ProviderEmptyReply → wake_failed:empty_reply。失败不会
+                # 重放定时器（mark_fired 在入队时就落，不等 job 成功），只会 arm
+                # 60s 起、1h 封顶的 proactive 退避，用户下次说话即清。
+                require_reply=(lane == "scheduled"),
                 on_provider_success=lambda: _record_provider_success(user_id),
                 on_provider_failure=lambda exc: _record_provider_failure(
                     user_id,

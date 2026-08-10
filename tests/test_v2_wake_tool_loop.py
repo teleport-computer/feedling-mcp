@@ -311,7 +311,12 @@ def test_wake_empty_tail_still_completes_no_no_user_messages_guard(monkeypatch):
 
     async def _fake(config, messages, *, tools=None, **_kwargs):
         seen["messages"] = messages
-        return _text_round("")
+        # 必须返**非空**正文。本用例测的是空 tail 下的 prompt 形状（不触发
+        # `no_user_messages` 闸、不造用户角色消息），空回复只是早期图省事的载体；
+        # scheduled 道打开 require_reply 之后，空回复本身就会让这一轮判失败，
+        # 载体会把被测意图整个盖掉。给了正文，`status == "completed"` 才真正只
+        # 由那个闸决定——闸一旦误触发，这里立刻红。
+        return _text_round("a scheduled nudge")
 
     monkeypatch.setattr(provider_client, "chat_completion_async", _fake)
 
