@@ -258,6 +258,7 @@ jobs:
             tests/test_provider_usage_normalize.py \
             tests/test_provider_malformed_tool_fallback.py \
             tests/test_mcp_client.py \
+            tests/test_mcp_status.py \
             tests/test_user_mcp_core.py \
             tests/test_user_mcp_probe.py \
             tests/test_user_mcp_routes.py \
