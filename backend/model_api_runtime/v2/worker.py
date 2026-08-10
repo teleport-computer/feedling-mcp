@@ -768,6 +768,47 @@ def _safe_eager_screen_metadata(data: object) -> dict:
     return safe
 
 
+# 共享屏幕「此刻是否活着」的判据秒数。与 v2/screen_watch.FRESH_SEC 同源:iOS 约 30s
+# 一帧,>90s 没有新帧就当这次共享已经结束。
+_SCREEN_SHARE_LIVE_SEC = 90.0
+
+
+def _screen_share_grounding(user_id: str) -> dict:
+    """聊天回合的「用户此刻正在共享屏幕」提示 —— **只回可用性,不回内容**。
+
+    为什么需要它:`CHAT_SYSTEM_PROMPT` 早就写了「请求涉及 shared screen 就用 screen
+    工具」,但同一句后半段是「无关对话别调这些工具」。模型**无从知道此刻有没有共享
+    在进行**,于是保守地不调 —— 用户的体感就是「它看不见我的屏幕」,而后端其实一直
+    收着帧(usr_7001b1df80e2024d 2026-08-10:共享在推流、开关全开,两小时 123 个回合
+    没有一次读屏)。补上这个信号,模型才有依据决定要不要 screen_read。
+
+    两条硬约束:
+    ① **不碰 enclave**。走 `db.frame_list_meta`(服务端明文的 frame_id/ts 索引),
+       和 serve_worker 的屏幕监看生产者同一条路 —— 这个函数在**每个聊天回合**都跑,
+       一次 enclave 往返会锤死共享解密代理的容量。
+    ② **只回布尔与秒数**。frame_id / caption / 窗口标题一律不进这里,与
+       `_safe_eager_screen_metadata` 同一条基线:屏幕内容是 pull-only,提前塞进第一
+       份 prompt 会让屏幕上的文字在执行栅栏生效前就选择一次对外调用。
+
+    共享没在进行(或读取失败)时返回 {},调用方据此整块省略 —— 不共享的用户
+    prompt 一个字都不变,provider 侧的前缀缓存不受影响。
+    """
+    try:
+        meta = db.frame_list_meta(user_id)
+    except Exception:
+        return {}
+    if not meta:
+        return {}
+    ts = meta[-1].get("ts")
+    try:
+        age = time.time() - float(ts)
+    except (TypeError, ValueError):
+        return {}
+    if age < 0 or age > _SCREEN_SHARE_LIVE_SEC:
+        return {}
+    return {"active": True, "latest_frame_age_sec": int(age)}
+
+
 def _read_blocks_later_outbound(tool_call) -> bool:
     """Argument-aware private/text read boundary for one completed tool call."""
     name = str(getattr(tool_call, "name", "") or "")
@@ -12321,6 +12362,15 @@ async def process_job(
         grounding_results: dict[str, Any] = {}
         if pending_schedule_results:
             grounding_results.update(pending_schedule_results)
+        # 共享屏幕的可用性提示(见 _screen_share_grounding)。只在共享真的活着时
+        # 出现;不共享的用户这一块整个不存在,prompt 与改动前逐字节相同。
+        screen_share_state = await asyncio.to_thread(
+            _screen_share_grounding, user_id
+        )
+        if screen_share_state:
+            grounding_results["screen_share"] = [
+                {"ok": True, "data": screen_share_state}
+            ]
         turn_extra_context = (
             context.action_context_str(grounding_results) if grounding_results else ""
         )
