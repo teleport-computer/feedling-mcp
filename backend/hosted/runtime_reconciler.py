@@ -84,24 +84,43 @@ def reconcile_once() -> dict:
         if now < not_before:
             stats["skipped_backoff"] += 1
             continue
-        desired = desired_for(uid, allow_map)
-        actual = _current_actual(uid)
-        if actual == desired:
-            _failures.pop(uid, None)
-            continue
-        if actual is None:
-            continue  # draining/不一致 tuple：转换中，下轮再看
+        desired = "unknown"
         try:
-            _flip_user(uid, desired)
+            with db.hosted_runtime_config_mutation_lock(uid):
+                # Scope discovery intentionally uses the full-map snapshot,
+                # but authority must be re-read after serialization.  Setup,
+                # resident compensation, and admin writes all share this lock.
+                current_entry = db.get_runtime_allowlist_entry(uid)
+                current_allow_map = (
+                    {uid: current_entry["desired"]}
+                    if current_entry is not None
+                    else {}
+                )
+                desired = desired_for(uid, current_allow_map)
+                actual = _current_actual(uid)
+                if actual == desired:
+                    _failures.pop(uid, None)
+                    continue
+                if actual is None:
+                    continue  # draining/不一致 tuple：转换中，下轮再看
+                # _flip_user reaches config_store.set_hosted_runtime_mode;
+                # ContextVar reentrancy keeps this one lock acquisition.
+                _flip_user(uid, desired)
             stats["flipped"] += 1
             _failures.pop(uid, None)
             log.info("[reconciler] flipped %s -> %s", uid, desired)
-        except Exception as e:  # noqa: BLE001 — 单用户失败不挡环
+        except Exception as exc:  # noqa: BLE001 — 单用户失败不挡环
             stats["failed"] += 1
             backoff = min(_BACKOFF_BASE_SEC * (2 ** fail_count), _BACKOFF_MAX_SEC)
             _failures[uid] = (fail_count + 1, now + backoff)
-            log.warning("[reconciler] flip %s -> %s failed (retry in %.0fs): %s",
-                        uid, desired, backoff, e)
+            log.warning(
+                "[reconciler] flip %s -> %s failed "
+                "(retry in %.0fs; error_type=%s)",
+                uid,
+                desired,
+                backoff,
+                type(exc).__name__,
+            )
     return stats
 
 

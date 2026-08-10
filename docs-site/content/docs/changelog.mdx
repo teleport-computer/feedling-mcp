@@ -10,6 +10,12 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **New Model API users can enter Runtime V2 through a cutoff-based default.**
+  Only newly registered accounts with a successfully tested and active Model API
+  route are eligible; the default does not migrate older accounts or users on a
+  resident route. Invalid or absent rollout configuration keeps the account
+  resident.
+
 - **Runner health probe keeps reserved capacity under backend load.**
   `GET /healthz/runner` now runs its blocking heartbeat database query outside
   the ordinary ASGI thread pool, with bounded connection and SQL timeouts plus

@@ -19,8 +19,10 @@ from __future__ import annotations
 import hmac
 import secrets
 import time
+from contextlib import nullcontext
 from datetime import datetime
 
+import db
 from accounts import access as accounts_access
 from accounts import onboarding, recover, registry
 from content_encryption import build_envelope
@@ -34,6 +36,10 @@ from core.store import UserStore
 # ---------------------------------------------------------------------------
 
 
+class _RuntimeControlUnavailable(RuntimeError):
+    """A resident selection could not converge its ownership state."""
+
+
 def access_modes_get(store: UserStore):
     return accounts_access._access_modes_payload(store), 200
 
@@ -42,28 +48,9 @@ def access_modes_switch(store: UserStore, payload: dict):
     mode = registry._normalize_access_mode(str(payload.get("access_mode") or payload.get("route") or ""))
     if mode not in registry.ACCESS_MODES:
         return {"error": "access_mode must be resident, model_api, or official_import"}, 400
-    previous_mode = onboarding._load_onboarding_route(store)
-    data = onboarding._save_onboarding_route(store, mode)
-    previous_runtime_mode = None
     try:
-        if mode == "resident":
-            from hosted import config_store
-
-            previous_runtime_mode = (
-                config_store.get_hosted_runtime_control_strict(store)[0]
-            )
-        _sync_hosted_runtime_for_access_mode(store, mode)
-    except Exception:
-        if previous_runtime_mode is not None:
-            try:
-                from hosted import config_store
-
-                config_store.set_hosted_runtime_mode(
-                    store, previous_runtime_mode
-                )
-            except Exception:
-                pass
-        onboarding._save_onboarding_route(store, previous_mode)
+        data = _select_access_mode(store, mode)
+    except _RuntimeControlUnavailable:
         return {"error": "runtime_control_unavailable"}, 503
     with registry._users_lock:
         user_entry = registry._find_user_entry_locked(store.user_id)
@@ -74,24 +61,66 @@ def access_modes_switch(store: UserStore, payload: dict):
     return accounts_access._access_modes_payload(store), 200
 
 
-def _sync_hosted_runtime_for_access_mode(store: UserStore, mode: str) -> None:
-    from hosted import config_store
+def _select_access_mode(store: UserStore, mode: str) -> dict:
+    from hosted import config_store, new_user_v2_cohort
 
-    if mode == "model_api":
-        # Selecting a provider route is not rollout authority. The allowlist
-        # reconciler is the sole writer for the resident -> V2 transition, so
-        # an unallowlisted user (and an allowlisted user not yet reconciled)
-        # remains on the resident fence.
-        return
-    if mode != "resident":
-        return
+    mode = registry._normalize_access_mode(mode)
+    if mode not in onboarding.MODEL_API_ROUTES:
+        # Preserve the validation-only path without acquiring a control lock.
+        return onboarding._save_onboarding_route(store, mode)
 
-    # Resident is the safe rollback direction and should take effect
-    # immediately. The caller snapshots the prior tuple before invoking this
-    # setter so a partial mutation can be compensated.
-    config_store.set_hosted_runtime_mode(
-        store, config_store.HOSTED_RUNTIME_MODE_RESIDENT
-    )
+    lock_acquired = False
+    try:
+        with db.hosted_runtime_config_mutation_lock(store.user_id):
+            lock_acquired = True
+            if mode != "resident":
+                # Non-resident selection remains route persistence only. In
+                # particular, selecting Model API is not rollout authority.
+                return onboarding._save_onboarding_route(store, mode)
+
+            previous_route_doc = db.get_blob_strict(
+                store.user_id, "onboarding_route"
+            )
+            previous_runtime_mode = (
+                config_store.get_hosted_runtime_control_strict(store)[0]
+            )
+            previous_allowlist = db.get_runtime_allowlist_entry(store.user_id)
+            try:
+                data = onboarding._save_onboarding_route(store, mode)
+                new_user_v2_cohort.pin_resident(store)
+            except Exception as transition_error:
+                compensation_error = None
+                try:
+                    new_user_v2_cohort.restore_allowlist(
+                        store.user_id, previous_allowlist
+                    )
+                except Exception as exc:
+                    compensation_error = exc
+                try:
+                    if previous_route_doc is None:
+                        db.delete_onboarding_route_strict(store.user_id)
+                    else:
+                        db.set_onboarding_route_strict(
+                            store.user_id, previous_route_doc
+                        )
+                except Exception as exc:
+                    compensation_error = compensation_error or exc
+                try:
+                    config_store.set_hosted_runtime_mode(
+                        store, previous_runtime_mode
+                    )
+                except Exception as exc:
+                    compensation_error = compensation_error or exc
+                raise _RuntimeControlUnavailable from (
+                    compensation_error or transition_error
+                )
+            return data
+    except _RuntimeControlUnavailable:
+        raise
+    except Exception as exc:
+        if mode == "resident" or not lock_acquired:
+            raise _RuntimeControlUnavailable from exc
+        raise
 
 
 def access_link_token_create(store: UserStore, payload: dict):
@@ -174,29 +203,55 @@ def access_link_token_claim(payload: dict):
         mode = registry._normalize_access_mode(str(match.get("access_mode") or ""))
         if mode not in registry.ACCESS_MODES:
             return {"error": "token_access_mode_invalid"}, 400
-        with registry._users_lock:
-            user_entry = registry._find_user_entry_locked(user_id)
-            if not user_entry:
-                return {"error": "user not found"}, 404
-            if public_key and not str(user_entry.get("public_key") or "").strip():
-                _, err = core_envelope._decode_content_public_key(public_key)
-                if err:
-                    return {"error": err}, 400
-                user_entry["public_key"] = public_key
-            if archive_language and not user_entry.get("archive_language"):
-                user_entry["archive_language"] = archive_language
-            issued = registry._issue_api_key_for_user_locked(
-                user_entry,
-                access_mode=mode,
-                label=client_label or str(match.get("label") or registry.ACCESS_MODE_LABELS.get(mode, mode)),
-            )
-            registry.persist_user(user_entry)
-            principal_id = user_entry.get("principal_id", "")
-        if make_active:
-            onboarding._save_onboarding_route(core_store.get_store(user_id), mode)
-        match["used_at"] = datetime.now().isoformat()
-        match["claimed_label"] = client_label
-        accounts_access._save_access_link_tokens(accounts_access._trim_access_link_tokens(rows))
+        runtime_lock = (
+            db.hosted_runtime_config_mutation_lock(user_id)
+            if make_active
+            else nullcontext()
+        )
+        try:
+            with runtime_lock:
+                # Validate the target user and any supplied public key before a
+                # route transition, but defer every user/key/token mutation
+                # until the resident ownership operation has succeeded.
+                with registry._users_lock:
+                    user_entry = registry._find_user_entry_locked(user_id)
+                    if not user_entry:
+                        return {"error": "user not found"}, 404
+                    if public_key and not str(user_entry.get("public_key") or "").strip():
+                        _, err = core_envelope._decode_content_public_key(public_key)
+                        if err:
+                            return {"error": err}, 400
+
+                if make_active:
+                    store = core_store.get_store(user_id)
+                    # The outer per-user lock is deliberately reentrant.  In
+                    # particular, a resident token must use the same durable
+                    # pin + compensated fence transition as every other
+                    # resident-selection surface.
+                    _select_access_mode(store, mode)
+
+                with registry._users_lock:
+                    user_entry = registry._find_user_entry_locked(user_id)
+                    if not user_entry:
+                        return {"error": "user not found"}, 404
+                    if public_key and not str(user_entry.get("public_key") or "").strip():
+                        user_entry["public_key"] = public_key
+                    if archive_language and not user_entry.get("archive_language"):
+                        user_entry["archive_language"] = archive_language
+                    issued = registry._issue_api_key_for_user_locked(
+                        user_entry,
+                        access_mode=mode,
+                        label=client_label or str(match.get("label") or registry.ACCESS_MODE_LABELS.get(mode, mode)),
+                    )
+                    registry.persist_user(user_entry)
+                    principal_id = user_entry.get("principal_id", "")
+                match["used_at"] = datetime.now().isoformat()
+                match["claimed_label"] = client_label
+                accounts_access._save_access_link_tokens(
+                    accounts_access._trim_access_link_tokens(rows)
+                )
+        except (db.HostedRuntimeConfigBusyError, _RuntimeControlUnavailable):
+            return {"error": "runtime_control_unavailable"}, 503
     print(f"[access:{user_id}] claimed mode={mode} key={issued['key_entry']['key_id']}")
     return {
         "status": "connected",
@@ -380,9 +435,13 @@ def onboarding_route_get(store: UserStore):
 
 def onboarding_route_post(store: UserStore, payload: dict):
     try:
-        data = onboarding._save_onboarding_route(store, str(payload.get("route") or ""))
+        data = _select_access_mode(
+            store, str(payload.get("route") or "")
+        )
     except ValueError as e:
         return {"error": str(e), "allowed": sorted(onboarding.MODEL_API_ROUTES)}, 400
+    except _RuntimeControlUnavailable:
+        return {"error": "runtime_control_unavailable"}, 503
     with registry._users_lock:
         user_entry = registry._find_user_entry_locked(store.user_id)
         if user_entry:

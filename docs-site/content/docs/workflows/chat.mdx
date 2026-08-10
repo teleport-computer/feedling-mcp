@@ -46,6 +46,12 @@ restores the most recently updated tested-ok route when one exists. Missing or
 legacy selector state fails closed for V1, so it cannot silently run beside an
 independent resident.
 
+For a newly registered Model API account admitted to Runtime V2, setup does not
+report success until both the tested active provider route and durable V2
+ownership are recorded. If that ownership transition cannot complete, setup
+fails closed with a retryable error rather than silently falling back to the
+resident path.
+
 ### 1. Send the turn
 
 At least one of `message`, `image_b64`, or `file_b64` is required. `message` is
