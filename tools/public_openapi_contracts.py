@@ -2361,18 +2361,6 @@ RESPONSE_OVERRIDES: dict[Operation, dict[str, Any]] = {
             },
         },
     },
-    ("get", "/healthz"): {
-        "503": {
-            "description": (
-                "A critical dependency is unavailable — PostgreSQL is "
-                "unreachable or the connection pool cannot hand out a "
-                "connection in time. The body has the same shape as the 200 "
-                "response, with top-level \"status\": \"unhealthy\" and the "
-                "failing entry under \"checks\"."
-            ),
-            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/GenericJsonResponse"}}},
-        },
-    },
     ("get", "/healthz/runner"): {
         "503": {
             "description": (

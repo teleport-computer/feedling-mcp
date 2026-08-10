@@ -36,31 +36,9 @@ def _asgi_get(path: str):
     return asyncio.run(go())
 
 
-class _FakePool:
-    """Stand-in for the psycopg pool so /healthz stats don't need a live DB."""
-
-    def __init__(self, stats):
-        self._stats = stats
-
-    def get_stats(self):
-        return self._stats
-
-
-_HEALTHY_STATS = {
-    "pool_size": 6,
-    "pool_available": 5,
-    "requests_waiting": 0,
-    "pool_max": 16,
-}
-
-
 @pytest.fixture()
 def healthy(monkeypatch):
-    """Patch every /healthz dependency into a healthy state (no live PG)."""
-    monkeypatch.setattr(db, "health_probe", lambda timeout=2.0: {
-        "ok": True, "latency_ms": 1.2, "error": None,
-    })
-    monkeypatch.setattr(db, "get_pool", lambda: _FakePool(dict(_HEALTHY_STATS)))
+    """Patch every process-local /healthz dependency into a healthy state."""
     monkeypatch.setattr(registry, "_users", [{"user_id": "u1"}, {"user_id": "u2"}])
     monkeypatch.setattr(wake_bus, "_listener_started", True)
     monkeypatch.setattr(wake_bus, "_enabled", lambda: True)
@@ -78,31 +56,31 @@ def test_healthz_healthy_shape(healthy):
     assert isinstance(body["uptime_s"], (int, float))
     assert "pid" in body["worker"]
     checks = body["checks"]
-    assert checks["db"]["status"] == "ok"
-    assert checks["db_pool"]["status"] == "ok"
+    assert set(checks) == {"registry", "wake_bus"}
     assert checks["registry"] == {"status": "ok", "users_loaded": 2}
     assert checks["wake_bus"]["status"] == "ok"
 
 
-def test_healthz_db_down_is_503_unhealthy(healthy, monkeypatch):
-    monkeypatch.setattr(db, "health_probe", lambda timeout=2.0: {
-        "ok": False, "latency_ms": 2000.0, "error": "pool timeout",
-    })
-    status, body = _asgi_get("/healthz")
-    assert status == 503
-    assert body["ok"] is False
-    assert body["status"] == "unhealthy"
-    assert body["checks"]["db"]["status"] == "down"
-    assert body["checks"]["db"]["error"] == "pool timeout"
+def test_healthz_does_not_touch_database(healthy, monkeypatch):
+    calls = []
 
+    def pool_timeout_probe(timeout=2.0):
+        calls.append(("health_probe", timeout))
+        return {"ok": False, "latency_ms": 2000.0, "error": "pool timeout"}
 
-def test_healthz_pool_saturated_is_degraded_200(healthy, monkeypatch):
-    saturated = dict(_HEALTHY_STATS, requests_waiting=3, pool_available=0)
-    monkeypatch.setattr(db, "get_pool", lambda: _FakePool(saturated))
+    def saturated_pool():
+        calls.append(("get_pool", None))
+        raise AssertionError("healthz must not inspect the DB pool")
+
+    monkeypatch.setattr(db, "health_probe", pool_timeout_probe)
+    monkeypatch.setattr(db, "get_pool", saturated_pool)
+
     status, body = _asgi_get("/healthz")
-    assert status == 200  # degraded still serves
-    assert body["status"] == "degraded"
-    assert body["checks"]["db_pool"]["status"] == "saturated"
+
+    assert status == 200
+    assert calls == []
+    assert "db" not in body["checks"]
+    assert "db_pool" not in body["checks"]
 
 
 def test_healthz_empty_registry_is_degraded(healthy, monkeypatch):

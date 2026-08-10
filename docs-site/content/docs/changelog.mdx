@@ -1078,16 +1078,14 @@ change must not be interpreted as an API guarantee.
   Unlabeled envelopes are accepted unchanged, so existing clients are
   unaffected. This closes the failure mode where a writer with a stale key
   seals messages the owner's device can never decrypt.
-- Expand `GET /healthz` from a fixed liveness stub into a structured
-  liveness-and-dependency probe. Responses now carry a top-level `status`
-  (`healthy`, `degraded`, or `unhealthy`), a `checks` object with per-component
-  detail, and release/uptime metadata, while preserving the legacy `ok` /
-  `mode` / `ready` fields. The backend checks PostgreSQL (`SELECT 1`),
-  connection-pool saturation, the in-memory user registry, and the cross-worker
-  wake-bus listener, and returns HTTP 503 when PostgreSQL is unreachable. The
-  enclave reports readiness, release, and TLS posture from cached boot state
-  without performing any cryptography. The documented response schema is
-  unchanged (a generic JSON object).
+- `GET /healthz` is now a pool-independent process-liveness probe. It keeps the
+  structured status, release/uptime metadata, legacy fields, in-memory user
+  registry check, and cross-worker wake-bus check, but no longer executes
+  `SELECT 1`, inspects the business connection pool, returns DB-related 503s, or
+  includes `checks.db` / `checks.db_pool`. This prevents saturated user traffic
+  from delaying the health probe or creating a false outage. PostgreSQL
+  readiness now requires a separate authenticated synthetic read/write probe.
+  The documented response schema remains a generic JSON object.
 - `POST /v1/mcp/servers` now accepts `http://` URLs and loopback/private-network
   and raw-IP hosts — this backend never dials the URL itself, only your agent
   does when it calls a tool, so none of those forms were ever a new attack
