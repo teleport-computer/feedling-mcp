@@ -55,13 +55,13 @@ def _wire(monkeypatch, *, frames, last_frame_id, chat_msgs, should_wake):
 
 
 def test_wakes_and_persists_the_frame_id(monkeypatch):
-    """fresh + changed + not-chatting + oracle=yes -> enqueue screen_watch, notify, and
+    """fresh + changed + oracle=yes -> enqueue screen_watch, notify, and
     persist last_screen_watch_frame_id=<latest> alongside the advanced next_at."""
     enqueue, notify, upsert = _wire(
         monkeypatch,
         frames=[{"filename": "frameNEW.env.json", "ts": _NOW, "app": None}],
         last_frame_id="frameOLD",
-        chat_msgs=[{"role": "user", "ts": _NOW - 1000}],  # 1000s ago > 180 -> not chatting
+        chat_msgs=[{"role": "user", "ts": _NOW - 1000}],
         should_wake=True,
     )
     assert serve_worker._tick_screen_watch_for_user("u_wake") == 1
@@ -75,25 +75,24 @@ def test_wakes_and_persists_the_frame_id(monkeypatch):
     assert kw["last_screen_watch_frame_id"] == "frameNEW"
 
 
-def test_chat_suppression_does_not_consume_the_frame_id(monkeypatch):
-    """The deliberate fix vs the resident: a frame suppressed by active chat must remain
-    'new' so it can still be seen once the user stops typing. should_watch -> (False,
-    "chatting"); enqueue NOT called AND upsert called WITHOUT last_screen_watch_frame_id."""
+def test_recent_chat_no_longer_suppresses_or_leaves_the_frame_unconsumed(monkeypatch):
+    """The removed 180-second gate must not survive in the assembled producer."""
     enqueue, notify, upsert = _wire(
         monkeypatch,
         frames=[{"filename": "frameNEW.env.json", "ts": _NOW, "app": None}],
         last_frame_id="frameOLD",
-        chat_msgs=[{"role": "user", "ts": _NOW - 10}],  # 10s ago < 180 -> chatting
-        should_wake=True,  # oracle would say yes, but gate suppresses first
+        chat_msgs=[{"role": "user", "ts": _NOW - 10}],
+        should_wake=True,
     )
-    assert serve_worker._tick_screen_watch_for_user("u_chat") == 0
-    assert enqueue == []
-    assert notify == []
-    # next_at still advanced, but the frame id is NOT consumed (kwarg absent entirely)
+    assert serve_worker._tick_screen_watch_for_user("u_chat") == 1
+    assert enqueue == [
+        ("u_chat", "screen_watch", {"reason": "screen_watch"})
+    ]
+    assert notify == [("v2_jobs", "u_chat")]
     assert len(upsert) == 1
     uid, kw = upsert[0]
     assert kw["next_screen_watch_at"] == _NOW + screen_watch.INTERVAL_SEC
-    assert "last_screen_watch_frame_id" not in kw
+    assert kw["last_screen_watch_frame_id"] == "frameNEW"
 
 
 def test_blocked_proactive_gate_never_enqueues(monkeypatch):

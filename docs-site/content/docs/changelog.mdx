@@ -10,6 +10,13 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **Hosted Runtime V2 now starts proactive screen watching for every eligible
+  account.** New Runtime V2 transitions arm the screen-watch schedule alongside
+  heartbeat, and worker startup repairs existing schedule rows whose
+  screen-watch clock was left empty. Existing non-empty wake clocks are
+  preserved, so the repair cannot pull a future heartbeat or screen check
+  forward.
+
 - **Account deletion now removes Runtime V2 rollout controls.** Account reset,
   administrator deletion, and application-managed registry removals clear the
   deleted user's Runtime V2 allowlist record regardless of whether it came from
