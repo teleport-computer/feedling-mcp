@@ -256,3 +256,25 @@ def test_memory_search_shares_the_index_filters_it_already_consumes():
         "memory_search",
         {"query": "骑行", "bucket": "爱好", "thread": "自行车", "include_sensitive": True},
     ) is None
+
+
+def test_identity_patch_description_names_the_irregular_replace_key():
+    """描述教模型 `replace_<field>`,list 字段列的是 "signature"(单数),
+    模型自然推出 `replace_signature` —— 而实现唯一认的是 `replace_signatures`(复数)。
+
+    未知 key 不会报错,会走到 identity/actions.py 的 `changed` 为空分支,
+    返回 200 + noop:true。于是模型以为改成功了,回头告诉用户「签名改好了」,
+    实际什么都没动(Codex 2026-08-10 发现,我读代码确认)。
+
+    这里断言的是描述里**逐字**出现真实 key,而不是去扫描自然语言猜字段名 ——
+    后者会把示例和普通名词误当字段(Codex 明确反对做通用扫描)。
+    """
+    from identity.actions import _LIST_OP_FIELDS
+
+    desc = tool_schema.DESCRIPTIONS["identity_patch"]
+    real_keys = {keys[2] for keys in _LIST_OP_FIELDS.values()}
+    irregular = {k for k in real_keys if not k.startswith("replace_") or k[len("replace_"):] not in _LIST_OP_FIELDS}
+
+    assert "replace_signatures" in irregular, "前提变了:signature 不再是不规则例外"
+    for key in irregular:
+        assert key in desc, f"描述必须逐字点名不规则的 {key},否则模型会按规则推错"
