@@ -275,6 +275,8 @@ jobs:
             tests/test_prod_runner_fleet_gate.py \
             tests/test_v2_turn_metrics.py \
             tests/test_v2_whole_turn_metric.py \
+            tests/test_admin_proactive_observability.py \
+            tests/test_wake_support_indexes_migration.py \
             tests/test_v2_jobs_migration.py \
             tests/test_v2_jobs_store.py \
             tests/test_capture_prompt_v1.py \
