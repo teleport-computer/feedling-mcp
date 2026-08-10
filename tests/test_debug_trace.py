@@ -196,13 +196,30 @@ def test_content_excerpt_field_truncation(monkeypatch):
 
 
 def test_verbose_ring_cap(monkeypatch):
+    """环深从模块读,样本按环深推导 —— 别写死。
+
+    这条曾写死 `== 200`。2026-08-10 把 verbose 环深从 200 提到 1000 之后它必然
+    失配,而 `test_debug_trace.py` 当时既不在 conftest 的 `_PURE_UNIT`、又在
+    `.github/pytest-uncovered-baseline.txt` 里 —— 两份名单都没有 ⇒ **CI 从来
+    不跑它**,于是那次改动带着一条红上线,没有任何人看见。
+
+    写死常量还有个更隐蔽的坏处:样本数(260)也是照着旧环深挑的。环深一变大,
+    样本就不再超限,闸根本不会被触发 —— 那时测试会**照常变绿**,而它其实什么
+    都没验到。所以样本必须由环深推出来,并显式断言确实超限。
+    """
     _reset_verbose(monkeypatch)
     store = FakeStore()
     debug_trace.set_enabled(store, True)
     monkeypatch.delenv("FEEDLING_DEBUG_VERBOSE", raising=False)
-    for i in range(260):
+
+    cap = debug_trace._MAX_EVENTS_VERBOSE
+    written = cap + 60
+    assert written > cap, "样本没超过环深,裁剪逻辑根本不会被触发"
+
+    for i in range(written):
         debug_trace.trace_event(store, subsystem="route", type=f"t{i}")
-    assert len(debug_trace.read_trace(store, limit=1000)) == 200  # verbose cap
+
+    assert len(debug_trace.read_trace(store, limit=written)) == cap
 
 
 class _FakeEnclaveResponse:
