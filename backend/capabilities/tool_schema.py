@@ -19,6 +19,9 @@ from __future__ import annotations
 
 from provider_types import ToolSpec
 from capabilities import registry
+# Card-writing rules live with the memory package (single source of truth shared
+# with the V1 guidance block); only the op names above are V2-specific.
+from memory import prompts_v1
 
 REPLY_TOOL = "reply"
 FILE_REPLY_TOOL = "send_file"
@@ -427,7 +430,8 @@ DESCRIPTIONS: dict[str, str] = {
                      "optional 'bucket'), 'update' (supply 'target_id' plus new "
                      "'summary'/'content'), or 'delete' (supply 'target_id'). Each action "
                      "may include an audit 'reason'. Get "
-                     "target_ids from memory_search/memory_index first."),
+                     "target_ids from memory_search/memory_index first.\n"
+                     + prompts_v1.MEMORY_WRITE_RULES_V1),
     "perception_snapshot": ("Read the latest perception snapshot for the given signals. "
                             "The app field is only the latest open/close event observed "
                             "within 15 minutes; never claim it is the app currently in use. "
