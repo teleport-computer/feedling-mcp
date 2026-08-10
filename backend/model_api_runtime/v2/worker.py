@@ -2881,13 +2881,13 @@ def _make_chat_tool_activity_callback(
             emit_debug_trace is not None
             and event_kind in {"tool_call_result", "tool_call_error"}
         ):
-            trace_detail = _v2_tool_trace_detail(
-                tc,
-                event_kind=event_kind,
-                result=result,
-                duration_ms=duration,
-            )
             try:
+                trace_detail = _v2_tool_trace_detail(
+                    tc,
+                    event_kind=event_kind,
+                    result=result,
+                    duration_ms=duration,
+                )
                 await asyncio.to_thread(
                     emit_debug_trace,
                     user_id,

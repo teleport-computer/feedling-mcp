@@ -344,6 +344,37 @@ def test_v2_tool_trace_never_promotes_arbitrary_error_tokens_to_codes():
         assert token not in repr(detail)
 
 
+def test_chat_tool_callback_survives_trace_projection_failure(monkeypatch):
+    persisted = []
+    emitted = []
+    monkeypatch.setattr(
+        worker.jobs_store,
+        "append_status_event",
+        lambda _user_id, _kind, **kwargs: persisted.append(kwargs["detail"]),
+    )
+    monkeypatch.setattr(
+        worker,
+        "_v2_tool_trace_detail",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("trace bug")),
+    )
+    callback = worker._make_chat_tool_activity_callback(
+        user_id="usr_trace_failure",
+        job_id=19,
+        attempt_identity=1,
+        recorder=None,
+        effect_evidence_by_call={},
+        emit_debug_trace=lambda *_args, **_kwargs: emitted.append(1),
+    )
+    call = ToolCall(id="call-safe", name="perception_snapshot", args={})
+
+    asyncio.run(callback(call, "tool_call_result", {
+        "result": ToolResult(call_id=call.id, content="ok"),
+    }))
+
+    assert persisted[0]["state"] == "success"
+    assert emitted == []
+
+
 def test_chat_tool_callback_keeps_invocation_ids_unique_across_rounds(monkeypatch):
     captured = []
     monkeypatch.setattr(
