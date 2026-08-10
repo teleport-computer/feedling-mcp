@@ -5585,7 +5585,14 @@ _hosted_runtime_config_lock_users: ContextVar[frozenset[str]] = ContextVar(
     "hosted_runtime_config_lock_users",
     default=frozenset(),
 )
-_hosted_runtime_config_connection_slots = threading.BoundedSemaphore(1)
+# Bound the number of long-lived, pool-external advisory-lock sessions without
+# serializing unrelated users behind one process-wide slot. Eight supports the
+# hosted-provider validation fan-out while remaining a small fixed addition to
+# each backend worker's ordinary connection pool budget.
+_HOSTED_RUNTIME_CONFIG_CONNECTION_SLOT_COUNT = 8
+_hosted_runtime_config_connection_slots = threading.BoundedSemaphore(
+    _HOSTED_RUNTIME_CONFIG_CONNECTION_SLOT_COUNT
+)
 _HOSTED_RUNTIME_CONFIG_LOCK_WAIT_SEC = 5.0
 
 
@@ -5598,10 +5605,12 @@ def hosted_runtime_config_mutation_lock(user_id: str):
     """Serialize one user's config mutation and runtime-generation rotation.
 
     The lock is session-level and pool-external because provider validation can
-    span a network call. A one-slot process-local semaphore is acquired *before*
+    span a network call. A bounded process-local semaphore is acquired *before*
     opening that connection, so a burst of settings requests waits in Python
-    rather than consuming one PostgreSQL session per waiter. Both the local and
-    cross-process waits are deadline-bounded. ContextVar reentrancy lets route
+    rather than consuming an unbounded PostgreSQL session per waiter. Different
+    users may use separate slots concurrently; the advisory lock remains the
+    authoritative per-user serializer. Both the local and cross-process waits
+    are deadline-bounded. ContextVar reentrancy lets route
     creation call route activation and lets setup call the runtime transition
     without trying to acquire the same advisory lock on a second connection.
     """

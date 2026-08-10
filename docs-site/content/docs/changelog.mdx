@@ -10,6 +10,13 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **Model API settings no longer serialize unrelated accounts.** Concurrent
+  provider validation for different users can now proceed through separate,
+  bounded database advisory-lock sessions. Mutations for the same account
+  remain serialized, and excess concurrent requests still fail with the
+  existing bounded `model_api_config_busy` response instead of exhausting the
+  database connection budget.
+
 - **Hosted Runtime V2 now starts proactive screen watching for every eligible
   account.** New Runtime V2 transitions arm the screen-watch schedule alongside
   heartbeat, and worker startup repairs existing schedule rows whose
