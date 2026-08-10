@@ -2364,7 +2364,9 @@ RESPONSE_OVERRIDES: dict[Operation, dict[str, Any]] = {
     ("get", "/healthz/runner"): {
         "503": {
             "description": (
-                "The runner fleet is unhealthy, unavailable, or misconfigured. "
+                "The aggregate runner fleet is unhealthy, unavailable, or "
+                "misconfigured, or its isolated probe exceeded its three-second "
+                "health-check deadline. "
                 "The body has the same shape as the 200 response, with top-level "
                 "\"status\": \"unhealthy\" and a down \"runner_fleet\" entry "
                 "under \"checks\"."

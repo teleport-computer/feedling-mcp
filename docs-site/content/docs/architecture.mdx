@@ -528,6 +528,13 @@ backend returns HTTP 200 whenever its worker can serve the request. The enclave
 probe reports readiness, release, and TLS posture from cached boot state without
 doing any cryptography. A `degraded` result still returns HTTP 200.
 
+`GET /healthz/runner` runs its blocking heartbeat database query on a
+per-backend-worker executor with two worker threads and a four-call outstanding
+admission cap, separate from ordinary ASGI blocking work. Connection acquisition
+and health SQL each have a one-second bound, and the route has a three-second
+deadline, so business-thread saturation cannot leave the runner probe queued
+until an external monitor times out.
+
 `/healthz` still does not, by itself, complete an enclave decrypt, verify a live
 runner, call a model provider, test object storage, start the screen WebSocket,
 or deliver a push notification. Readiness for those must be evaluated per

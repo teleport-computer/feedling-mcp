@@ -56,6 +56,8 @@ log = logging.getLogger("feedling.db")
 
 _pool: ConnectionPool | None = None
 _pool_lock = threading.Lock()
+HEALTH_DB_ACQUIRE_TIMEOUT_SECONDS = 1.0
+HEALTH_DB_STATEMENT_TIMEOUT_MS = 1000
 
 
 def _database_url() -> str:
@@ -159,7 +161,24 @@ def healthcheck() -> bool:
         return False
 
 
-def health_probe(timeout: float = 2.0) -> dict:
+@contextmanager
+def _local_statement_timeout(conn, timeout_ms: int | None):
+    if timeout_ms is None:
+        yield
+        return
+    with conn.transaction():
+        conn.execute(
+            "SELECT set_config('statement_timeout', %s, true)",
+            (f"{int(timeout_ms)}ms",),
+        )
+        yield
+
+
+def health_probe(
+    timeout: float = 2.0,
+    *,
+    statement_timeout_ms: int | None = None,
+) -> dict:
     """Fast liveness probe for /healthz.
 
     Acquire a pooled connection within ``timeout`` seconds and run ``SELECT 1``.
@@ -172,8 +191,13 @@ def health_probe(timeout: float = 2.0) -> dict:
     t0 = time.perf_counter()
     try:
         with get_pool().connection(timeout=timeout) as conn:
-            conn.execute("SELECT 1")
-        return {"ok": True, "latency_ms": round((time.perf_counter() - t0) * 1000, 1), "error": None}
+            with _local_statement_timeout(conn, statement_timeout_ms):
+                conn.execute("SELECT 1")
+        return {
+            "ok": True,
+            "latency_ms": round((time.perf_counter() - t0) * 1000, 1),
+            "error": None,
+        }
     except Exception as e:  # noqa: BLE001 — health must never raise
         return {
             "ok": False,
@@ -362,18 +386,24 @@ def set_supervisor_instance_heartbeat(owner: str, payload: dict) -> None:
     mirror.execute(sql, params)
 
 
-def list_supervisor_instance_heartbeats() -> list[dict]:
+def list_supervisor_instance_heartbeats(
+    *,
+    timeout: float | None = None,
+    statement_timeout_ms: int | None = None,
+) -> list[dict]:
     """All runner heartbeat rows. Each dict carries the typed flags plus ``ts``
     (the row's ``updated_at`` as an epoch float) so the caller can age-filter in
     pure code. Freshness/aggregation is the guard's job, not this query's. Raises
     on a DB error so the caller can fall back to the legacy key."""
-    with get_pool().connection() as conn:
-        rows = conn.execute(
-            "SELECT owner, host, shard_index, shard_count, max_children, "
-            "       active_children, host_all, gateway, version, "
-            "       extract(epoch FROM updated_at) AS ts, payload "
-            "FROM agent_runtime_supervisor_heartbeats"
-        ).fetchall()
+    connection_kwargs = {"timeout": timeout} if timeout is not None else {}
+    with get_pool().connection(**connection_kwargs) as conn:
+        with _local_statement_timeout(conn, statement_timeout_ms):
+            rows = conn.execute(
+                "SELECT owner, host, shard_index, shard_count, max_children, "
+                "       active_children, host_all, gateway, version, "
+                "       extract(epoch FROM updated_at) AS ts, payload "
+                "FROM agent_runtime_supervisor_heartbeats"
+            ).fetchall()
     out = []
     for r in rows:
         # ``pi`` has no promoted column (unlike host_all/gateway) — the supervisor
