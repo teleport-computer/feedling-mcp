@@ -235,6 +235,9 @@ if not _provisioned:
         "test_perception_tool_surface_contract.py",
         # agent.tool.call 的隐私断言(2026-08-10)。纯:直接调投影函数,不碰 DB。
         "test_v2_tool_trace_privacy.py",
+        # 工具面目录契约(自带 sys.path 引导,只 import tool_schema/registry/
+        # agent_fields/provider_types,零 DB 引用 —— 实测确认)。
+        "test_capabilities_tool_schema.py",
     }
     collect_ignore = sorted(
         f

@@ -162,12 +162,65 @@
 - **`deploy-test-contract.yml`**（手动）：部署 FeedlingAppAuth 到 Sepolia。
 - **`docker-publish.yml`**：镜像发布。
 
+### ⚠️ 新测试文件要登记**两份**名单，少一份就静默失效
+
+「测试没跑」和「测试通过」长得一模一样——这是本仓最容易自欺的一类失败，
+2026-08-10 一天之内以三种形态各栽了一次。两份名单管的是不同的事：
+
+| 名单 | 管什么 | 漏登记的后果 |
+|---|---|---|
+| `tests/conftest.py` 的 `_PURE_UNIT` | **本机没有测试 PG 时**能收集哪些文件 | 被静默 `collect_ignore`，`-q` 连提示都吞掉 |
+| `.github/workflows/ci.yml` 的显式文件清单 | **CI 真正执行**哪些文件 | CI 里根本不跑 |
+
+- 只登记前者 → CI 的 **Guard top-level pytest discovery coverage** 会把 PR 打红
+  （这道守卫干得对，别绕过它）。
+- **`.github/pytest-uncovered-baseline.txt` 是"已知不覆盖"的豁免名单，不是登记处。**
+  把新文件塞进去 = 它哪都不跑，**而且守卫也不会再报警**。本批就有一个 173 行的
+  新测试落在那儿、和一个 39 行的新增断言所在文件本来就在那儿——两个都从来没执行过。
+- 登记进 `_PURE_UNIT` 前先确认它**真的不碰 DB** 且自带
+  `sys.path.insert(backend)`，否则从"静默忽略"变成"收集期 ModuleNotFoundError"。
+- **验口径一秒钟**：`pytest tests/ -q --collect-only | tail -1`。
+  无 PG 约 1.7k，接上 PG 约 8.9k——报"全量通过"前先看这个数对不对得上。
+
 ---
 
 ## 5. 部署态 E2E 标准动作（L3 展开）
 
-0. **先对版本（铁律）**：`curl -sk <api>/healthz` 的 `release.git_commit`
-   必须 == 目标 SHA 才开跑——对不上 = 还没部署完，此刻任何"失败"都是假阴性。
+0. **先对版本（铁律）**：`healthz` 的 `release.git_commit` 必须**包含**目标提交
+   才开跑——对不上 = 还没部署完，此刻任何"失败"都是假阴性。
+
+   2026-08-10 在这条上烧了两小时、连跑三次 P0 全红。**规则早就写在这里，是没照做。**
+   三个具体坑，逐条写清楚免得下次再绕过去：
+
+   - **字段嵌在 `release` 里，不在顶层。** 读 `d["git_commit"]` 拿到空值，
+     我据此认定"healthz 不报版本"，转而用了两个更弱的判据（job 收工、`curl` 通），
+     两个都不足以判断部署到位。正确读法：
+     `json.load(...)["release"]["git_commit"]`。
+   - **判据是"包含"不是"=="。** 实际部署的往往是随后的 `deploy(test): pin …`
+     提交，严格相等**永远不成立**。用
+     `git merge-base --is-ancestor <你的提交> <线上SHA>`。
+   - **`curl` 不能用来判活。** 滚动期实测出现过 **`curl` 返回 000 而 `httpx`
+     返回 200 并存**。稳定性判据用同一个 HTTP 客户端连续探测（15 次零失败），
+     不要用单次 `curl`。
+
+0b. **跑之前先确认没有部署在跑。** P0 的**每个 cell 都要走 runner CVM**，
+   所以 runner 重部署期间 P0 必然全红，且失败形态高度一致
+   （7 个互不相关的 provider 报同一个 `ConnectError: EOF ... _ssl.c:997`）。
+   **这种整齐划一本身就是"环境层而非功能层"的信号**——真正的功能回归不会让
+   所有 provider 同时以同一种 TLS 错失败。
+
+   ```bash
+   # 等 test 上所有 job（含部署）收工
+   until [ "$(gh run list --limit 12 --json status,headBranch \
+       --jq '[.[]|select(.headBranch=="test" and .status!="completed")]|length')" = 0 ]; do
+     sleep 20
+   done
+   ```
+
+0c. **P0 只能验"已部署"的代码。** 合并前跑 P0 验不到本次改动（test 跑的是旧镜像），
+   那时它只是环境基线。**"e2e 绿了再合"这个门槛在 P0 上结构性不成立**，
+   顺序只能是：合 → 部署 → 跑 P0 做**同口径对比**（关注红的集合有没有变大，
+   而不是"是否全绿"——环境本身长期带着几条既有红）。
 1. **复用**（优先）或新建 test model_api 账号。
 2. 拿账号 X25519 keypair；`whoami` 拿 `public_key`。
 3. `backend/content_encryption.py::build_envelope(...)` 构造加密信封。
