@@ -76,6 +76,32 @@ def _log(user_id: str, outcome: str) -> None:
     print(f"[new-user-v2:{user_id}] outcome={outcome}")
 
 
+def restore_allowlist(user_id: str, previous: dict | None) -> None:
+    """Restore the allowlist state captured before a resident transition."""
+    if previous is None:
+        db.delete_runtime_allowlist(user_id)
+        return
+    db.upsert_runtime_allowlist(
+        user_id,
+        previous["desired"],
+        updated_by=previous["updated_by"],
+        note=previous["note"],
+    )
+
+
+def pin_resident(store) -> None:
+    """Persist explicit resident ownership, then converge the runtime fence."""
+    db.upsert_runtime_allowlist(
+        store.user_id,
+        "resident",
+        updated_by=ACCESS_MODE_UPDATED_BY,
+        note="user-selected-resident",
+    )
+    config_store.set_hosted_runtime_mode(
+        store, config_store.HOSTED_RUNTIME_MODE_RESIDENT
+    )
+
+
 def apply_default(store) -> str:
     """Apply the new-user default without overriding an explicit rollout pin."""
     if config_store.hosted_runtime_policy() != config_store.HOSTED_RUNTIME_POLICY_DUAL:
