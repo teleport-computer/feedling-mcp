@@ -219,6 +219,7 @@ if not _provisioned:
         "test_voice_context_regressions.py",
         "test_health_executor.py",
         "test_db_health_timeouts.py",
+        "test_health_route_isolation.py",
     }
     collect_ignore = sorted(
         f

@@ -29,8 +29,9 @@ from __future__ import annotations
 import os
 import time
 
+import db
+from asgi import health_executor
 from fastapi import APIRouter
-from starlette.concurrency import run_in_threadpool
 from starlette.responses import JSONResponse
 
 router = APIRouter()
@@ -64,9 +65,10 @@ def _worker() -> dict:
 def _db_checks() -> tuple[dict, dict]:
     """Return ``(db_check, db_pool_check)``. ``db`` is critical; pool saturation
     is a degraded signal. Runs synchronous DB I/O — call from the threadpool."""
-    import db
-
-    probe = db.health_probe(timeout=2.0)
+    probe = db.health_probe(
+        timeout=db.HEALTH_DB_ACQUIRE_TIMEOUT_SECONDS,
+        statement_timeout_ms=db.HEALTH_DB_STATEMENT_TIMEOUT_MS,
+    )
     db_check: dict = {
         "status": "ok" if probe["ok"] else "down",
         "latency_ms": probe["latency_ms"],
@@ -131,10 +133,30 @@ def _gather_checks() -> dict:
     }
 
 
+def _deadline_response() -> JSONResponse:
+    return JSONResponse(
+        {
+            "ok": False,
+            "mode": "multi_tenant",
+            "status": "unhealthy",
+            "release": _release(),
+            "uptime_s": round(time.time() - _STARTED_AT, 1),
+            "worker": _worker(),
+            "checks": {
+                "db": {"status": "down", "error": "health_check_timeout"},
+            },
+        },
+        status_code=503,
+    )
+
+
 @router.get("/healthz")
 async def healthz():
     """Liveness + readiness probe. Public, no auth — used by heartbeats/compose."""
-    checks = await run_in_threadpool(_gather_checks)
+    try:
+        checks = await health_executor.run(_gather_checks)
+    except health_executor.HealthCheckTimeout:
+        return _deadline_response()
 
     critical_ok = checks["db"]["status"] == "ok"
     degraded = (

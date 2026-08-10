@@ -57,7 +57,7 @@ _HEALTHY_STATS = {
 @pytest.fixture()
 def healthy(monkeypatch):
     """Patch every /healthz dependency into a healthy state (no live PG)."""
-    monkeypatch.setattr(db, "health_probe", lambda timeout=2.0: {
+    monkeypatch.setattr(db, "health_probe", lambda **_kwargs: {
         "ok": True, "latency_ms": 1.2, "error": None,
     })
     monkeypatch.setattr(db, "get_pool", lambda: _FakePool(dict(_HEALTHY_STATS)))
@@ -85,7 +85,7 @@ def test_healthz_healthy_shape(healthy):
 
 
 def test_healthz_db_down_is_503_unhealthy(healthy, monkeypatch):
-    monkeypatch.setattr(db, "health_probe", lambda timeout=2.0: {
+    monkeypatch.setattr(db, "health_probe", lambda **_kwargs: {
         "ok": False, "latency_ms": 2000.0, "error": "pool timeout",
     })
     status, body = _asgi_get("/healthz")
