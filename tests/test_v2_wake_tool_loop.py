@@ -196,7 +196,8 @@ def _bubbles(uid):
 def _turn_metric_row(job_id):
     with db.get_pool().connection() as c:
         row = c.execute(
-            "SELECT model_calls, failed, status FROM v2_turn_metrics WHERE job_id=%s",
+            "SELECT model_calls, failed, status, visible_reply_count "
+            "FROM v2_turn_metrics WHERE job_id=%s",
             (job_id,)).fetchone()
     return row
 
@@ -257,7 +258,36 @@ def test_wake_terminal_plain_text_writes_exactly_one_proactive_bubble(monkeypatc
     assert row[0] >= 1           # >=1 model call
     assert row[1] is False       # not failed
     assert row[2] == "ok"
+    assert row[3] == 1           # applied_unverified, not merely produced
     assert _job_status(job_id)[0] == "completed"
+
+
+def test_wake_enqueued_without_sink_is_not_counted_as_visible(monkeypatch):
+    uid = "u_wake_toolloop_enqueued_only"
+    conftest.seed_user(uid)
+    _reset(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, "screen_watch")
+    job = jobs_store.claim_next_job("w")
+
+    _script_provider(monkeypatch, [_text_round("produced but not applied")])
+    deps = _wake_deps(
+        tail=[{"id": "m1", "ts": 1.0, "role": "user", "content": "hi"}],
+    )
+    deps.apply_pending_effects = None
+
+    status = asyncio.run(worker.process_job(
+        job,
+        deps,
+        provider_config=_BYOK,
+        api_key=None,
+        runtime_token="rt",
+    ))
+
+    assert status == "completed"
+    row = _turn_metric_row(job_id)
+    assert row is not None
+    assert row[3] == 0
+    assert _bubbles(uid) == []
 
 
 # ------------------------------------------------------------------
@@ -311,7 +341,12 @@ def test_wake_empty_tail_still_completes_no_no_user_messages_guard(monkeypatch):
 
     async def _fake(config, messages, *, tools=None, **_kwargs):
         seen["messages"] = messages
-        return _text_round("")
+        # 必须返**非空**正文。本用例测的是空 tail 下的 prompt 形状（不触发
+        # `no_user_messages` 闸、不造用户角色消息），空回复只是早期图省事的载体；
+        # scheduled 道打开 require_reply 之后，空回复本身就会让这一轮判失败，
+        # 载体会把被测意图整个盖掉。给了正文，`status == "completed"` 才真正只
+        # 由那个闸决定——闸一旦误触发，这里立刻红。
+        return _text_round("a scheduled nudge")
 
     monkeypatch.setattr(provider_client, "chat_completion_async", _fake)
 
@@ -397,12 +432,16 @@ def test_wake_memory_write_is_authorized_applied_and_not_refused(monkeypatch):
     # memory-action shape (worker._memory_tool_actions) — no envelope, nested
     # plaintext memory dict — so the plaintext write path builds the E2E envelope.
     # NOT passed through raw (which memory_core.actions rejects with 400).
-    assert memory_sinks[0]["actions"] == [{
-        "type": "memory.add",
-        "memory": {"summary": "likes tea", "content": "likes tea", "bucket": "", "threads": []},
-        "reason": "Written by the agent via the memory_write tool.",
-        "capture_mode": "agent_tool",
-    }]
+    assert len(memory_sinks[0]["actions"]) == 1
+    action = memory_sinks[0]["actions"][0]
+    assert action["type"] == "memory.add"
+    assert action["reason"] == "Written by the agent via the memory_write tool."
+    assert action["capture_mode"] == "agent_tool"
+    assert action["memory"]["summary"] == "likes tea"
+    assert action["memory"]["content"] == "likes tea"
+    # The enqueue boundary now pins occurrence time; bucket/thread defaults
+    # are normalized later by the memory sink instead of being invented here.
+    assert action["memory"]["occurred_at"]
     serve_worker._validate_decrypted_tool_effect(
         "memory", {**memory_sinks[0], "effect_id": "wake-memory-effect"})
     # The durable outbox still contains only the encrypted wrapper; the model's

@@ -468,72 +468,184 @@ def _registered(stdout, *, lane="chat", enabled=("tavily",), cmd=None,
     return captured
 
 
-def test_registered_reports_what_the_cli_actually_registered():
-    kind, kw = _registered(
-        _init_line([{"name": "tavily", "status": "connected"}]))[0]
+def _stream(servers, calls=()):
+    """init 事件 + 若干真实 tool_use/tool_result 对。
+
+    calls 里每一项是 (服务器名, 成功?)。这是判据的第二个来源 —— 模型的散文
+    不能当证据,它会声称自己调用了从没碰过的工具(本机实测撞到过)。
+    """
+    lines = [json.dumps({
+        "type": "system", "subtype": "init",
+        "tools": ["Bash"], "mcp_servers": servers, "model": "m",
+    })]
+    for i, (srv, ok) in enumerate(calls):
+        tid = f"tu_{i}"
+        lines.append(json.dumps({"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "id": tid, "name": f"mcp__{srv}__do", "input": {}}]}}))
+        lines.append(json.dumps({"type": "user", "message": {"content": [
+            {"type": "tool_result", "tool_use_id": tid, "is_error": not ok,
+             "content": "pong" if ok else "boom"}]}}))
+    return "\n".join(lines) + "\n"
+
+
+def test_connected_at_init_and_never_called_is_ok():
+    kind, kw = _registered(_stream([{"name": "tavily", "status": "connected"}]))[0]
     assert kind == "mcp.surface.registered"
     assert kw["status"] == "ok"
-    assert kw["detail"]["registered"] == ["tavily"]
-    assert kw["detail"]["missing"] == []
+    assert kw["detail"]["verdict"] == {"tavily": "ok"}
 
 
-def test_empty_mcp_servers_on_a_chat_turn_is_the_headline_failure():
-    """`mcp_servers: []` + 有启用的服务器 = 模型一台都看不到。
+def test_pending_at_init_then_a_successful_call_is_recovered_not_a_failure():
+    """启动时没就绪、随后调通 —— 这是**实测出来的真实形态**,不是我想象的。
 
-    这是 usr_98947 那次的形态:App 里连接测试是绿的(控制面探针直连服务器,
-    另一条路),而 CLI 自报注册了零台。以前这条信息只存在于 stdout 里,没人看。
+    见 fixture claude_init_pending_tool_recovered.jsonl(本机真实录制)。
+    把这种轮次报成失败,正是这条埋点要防的假信号掉了个头:一个专门抓假绿的
+    埋点开始产假红,读的人很快就会学会忽略它。
     """
-    kind, kw = _registered(_init_line([]), enabled=("tavily", "gaodemap"))[0]
-    assert kind == "mcp.surface.registered"
-    assert kw["status"] == "error"
-    assert sorted(kw["detail"]["missing"]) == ["gaodemap", "tavily"]
+    raw = _stream([{"name": "slow", "status": "pending"}], [("slow", True)])
+    kind, kw = _registered(raw, enabled=("slow",))[0]
+    assert kw["status"] == "ok", "调通了就不是失败"
+    assert kw["detail"]["verdict"] == {"slow": "recovered"}
+    assert kw["detail"]["init_status"] == {"slow": "pending"}, (
+        "启动快照要原样留着 —— 它是唯一能解释「为什么需要恢复」的东西")
+    assert "已恢复" in kw["explain"]
 
 
-def test_only_connected_counts_as_working():
-    """判据就是 SDK 自己那条:`status !== "connected"` 即失败。
+def test_pending_and_never_called_is_inconclusive_not_an_error():
+    """「模型没调用」不等于「模型调不了」。
 
-    我第一版还把 `ok` / `ready` / **空 status** 也当成功 —— 那三个在 claude 的
-    init 协议里没有任何依据,是我编的。没有依据的状态一律不许判绿,否则一个
-    专门用来抓假绿的 postflight 自己开始产假绿(codex 审出)。
+    绝大多数轮次模型根本没有理由用某个工具。把这种判成失败,等于给每个装了
+    MCP 的用户每轮刷一条假告警。
     """
-    for status in ("failed", "pending", "ready", "ok", "needs-auth", ""):
-        kind, kw = _registered(_init_line([
-            {"name": "tavily", "status": status},
-        ]))[0]
-        assert kw["status"] == "error", f"status={status!r} 不该判绿"
-        assert kw["detail"]["failed"] == [f"tavily:{status or 'unknown'}"]
+    kind, kw = _registered(_stream([{"name": "slow", "status": "pending"}]),
+                           enabled=("slow",))[0]
+    assert kw["status"] == "ok"
+    assert kw["detail"]["verdict"] == {"slow": "inconclusive"}
+    assert "无法判定" in kw["explain"]
 
 
-def test_an_entry_without_a_status_field_is_not_assumed_working():
-    """dict 缺 status、以及裸字符串条目 —— 都是「我们没有观测」,不是「好的」。"""
-    _kind, kw = _registered(_init_line([{"name": "tavily"}]))[0]
-    assert kw["status"] == "error"
-    assert kw["detail"]["failed"] == ["tavily:unknown"]
-    _kind, kw = _registered(_init_line(["tavily"]))[0]
-    assert kw["status"] == "error"
-    assert kw["detail"]["failed"] == ["tavily:unknown"]
+def test_hard_init_states_without_a_successful_call_are_failures():
+    """failed / needs-auth / 压根没出现在名单里 —— 这三种是强证据。
 
-
-def test_attempt_is_labelled_so_the_final_one_is_identifiable():
-    """每次 attempt 各记一条,标明是哪一次。
-
-    重试会新起进程重做握手,并且**整个替换** result(不是追加),所以只记首次
-    等于记了一个输出已经被丢弃的进程;首次若在打出 init 之前就死了,真正回答的
-    那一轮还完全没有观测(codex 审出)。
+    `needs-auth` 是本机实测真实出现过的状态(claude.ai 系服务器),我原来那版
+    白名单会把它判绿。
     """
-    first = _registered(_init_line([{"name": "tavily", "status": "connected"}]))[0][1]
-    retry = _registered(_init_line([{"name": "tavily", "status": "connected"}]),
-                        attempt="stale_resume_retry")[0][1]
-    assert first["detail"]["attempt"] == "first"
-    assert retry["detail"]["attempt"] == "stale_resume_retry"
+    for servers, enabled, why in (
+        ([{"name": "s", "status": "failed"}], ("s",), "failed"),
+        ([{"name": "s", "status": "needs-auth"}], ("s",), "needs-auth"),
+        ([], ("s",), "整台没出现"),
+    ):
+        kind, kw = _registered(_stream(servers), enabled=enabled)[0]
+        assert kw["status"] == "error", why
+        assert kw["detail"]["verdict"] == {"s": "failed"}, why
+
+
+def test_a_successful_call_overrides_a_failed_init_state():
+    """同一轮里后来真的调通了,终态必须能覆盖启动时的失败。
+
+    否则 dashboard 的 any_error 会因为一个在用户看见之前就自愈了的状态,
+    把整轮永久染红(codex 审出)。
+    """
+    raw = _stream([{"name": "s", "status": "failed"}], [("s", True)])
+    _kind, kw = _registered(raw, enabled=("s",))[0]
+    assert kw["status"] == "ok"
+    assert kw["detail"]["verdict"] == {"s": "recovered"}
+
+
+def test_an_errored_tool_result_is_a_failure_even_if_init_looked_fine():
+    raw = _stream([{"name": "s", "status": "connected"}], [("s", False)])
+    _kind, kw = _registered(raw, enabled=("s",))[0]
+    assert kw["status"] == "error"
+    assert kw["detail"]["verdict"] == {"s": "failed"}
+    assert kw["detail"]["called_error"] == ["s"]
+
+
+def test_mixed_servers_are_judged_independently():
+    raw = _stream([{"name": "good", "status": "connected"},
+                   {"name": "slow", "status": "pending"},
+                   {"name": "dead", "status": "failed"}],
+                  [("slow", True)])
+    _kind, kw = _registered(raw, enabled=("good", "slow", "dead"))[0]
+    assert kw["detail"]["verdict"] == {
+        "dead": "failed", "good": "ok", "slow": "recovered"}
+    assert kw["status"] == "error", "有一台是硬失败,整条就该报 error"
+
+
+def test_the_real_recorded_transcript_is_classified_as_recovered():
+    """回归锁:真实录制的 stdout,不是手写 shape。
+
+    手写 fixture 比生产更规整,正是这条判据第一版栽跟头的原因 —— 它当时把
+    init 快照当终态,而真实那一轮 pending 之后是调通的。
+    """
+    raw = (Path(__file__).parent / "fixtures"
+           / "claude_init_pending_tool_recovered.jsonl").read_text()
+    _kind, kw = _registered(raw, enabled=("fast", "slow"))[0]
+    assert kw["detail"]["init_status"] == {"fast": "connected", "slow": "pending"}
+    assert kw["detail"]["verdict"] == {"fast": "ok", "slow": "recovered"}
+    assert kw["status"] == "ok"
 
 
 def test_last_init_wins_when_a_turn_was_retried():
     """重试会新起进程重做握手,前一次的结果不再描述这一轮。"""
-    raw = _init_line([]) + _init_line([{"name": "tavily", "status": "connected"}])
-    kind, kw = _registered(raw)[0]
+    raw = _stream([]) + _stream([{"name": "tavily", "status": "connected"}])
+    _kind, kw = _registered(raw)[0]
     assert kw["status"] == "ok"
-    assert kw["detail"]["registered"] == ["tavily"]
+    assert kw["detail"]["verdict"] == {"tavily": "ok"}
+
+
+def test_calls_from_a_superseded_attempt_do_not_leak_into_the_final_verdict():
+    """「最后一个 init 说了算」必须**连它的调用证据一起**换掉。
+
+    只换 init、留着上一次的 call_ok,会让第一次尝试的成功调用把第二次(真正
+    回答的那次)报的 failed 复活,产出自相矛盾的一对:
+    init_status=failed 而 verdict=recovered。我把注释写成了这样,代码却没做
+    (codex 审出)。
+    """
+    raw = (_stream([{"name": "s", "status": "pending"}], [("s", True)])
+           + _stream([{"name": "s", "status": "failed"}]))
+    _kind, kw = _registered(raw, enabled=("s",))[0]
+    assert kw["detail"]["init_status"] == {"s": "failed"}
+    assert kw["detail"]["called_ok"] == [], "被取代那次的调用不该留下"
+    assert kw["detail"]["verdict"] == {"s": "failed"}
+    assert kw["status"] == "error"
+
+
+def test_a_server_name_containing_a_double_underscore_is_attributed_correctly():
+    """服务器名允许含 `__`(mcp_core 的 _NAME_RE 是 [a-z0-9_-]{1,32})。
+
+    按 `split("__")[1]` 归属的话,`mcp__foo__bar__do` 会被算到「foo」头上,
+    于是真正那台 `foo__bar` 的成功调用全部丢失、被判成 inconclusive ——
+    恰好把这条埋点最该抓的「恢复了」漏掉。我原来在这里写了条**相反**的注释,
+    没去核对过命名规则(codex 审出)。
+    """
+    raw = _stream([{"name": "foo__bar", "status": "pending"}],
+                  [("foo__bar", True)])
+    _kind, kw = _registered(raw, enabled=("foo__bar",))[0]
+    assert kw["detail"]["called_ok"] == ["foo__bar"]
+    assert kw["detail"]["verdict"] == {"foo__bar": "recovered"}
+
+
+def test_a_prefix_named_server_does_not_steal_another_servers_calls():
+    """两台都启用、名字互为前缀时,归属必须取**最长匹配**。"""
+    raw = _stream([{"name": "foo", "status": "connected"},
+                   {"name": "foo__bar", "status": "pending"}],
+                  [("foo__bar", True)])
+    _kind, kw = _registered(raw, enabled=("foo", "foo__bar"))[0]
+    assert kw["detail"]["called_ok"] == ["foo__bar"], "不能被短名字截胡"
+    assert kw["detail"]["verdict"] == {"foo": "ok", "foo__bar": "recovered"}
+
+
+def test_an_unseen_future_init_status_is_inconclusive_not_a_failure():
+    """Claude 将来新增一个状态时,不能让全体用户一夜变红。
+
+    硬失败必须是**闭集**;没见过的值是「没有证据」,不是「失败」——
+    这条实现原本和本函数自己的 docstring 相反(codex 用 `connecting` 复现)。
+    """
+    for status in ("connecting", "restarting", "somethingnew"):
+        _kind, kw = _registered(_stream([{"name": "s", "status": status}]),
+                                enabled=("s",))[0]
+        assert kw["status"] == "ok", f"{status} 不该判失败"
+        assert kw["detail"]["verdict"] == {"s": "inconclusive"}, status
 
 
 def test_registered_trace_is_silent_where_an_empty_list_is_correct():

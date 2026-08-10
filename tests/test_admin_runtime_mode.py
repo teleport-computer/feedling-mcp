@@ -105,6 +105,7 @@ def test_post_valid_mode_sets_and_reflects_in_config_store(env):
     schedule = jobs_store.get_wake_schedule(uid)
     assert schedule is not None
     assert schedule["next_heartbeat_at"] is not None
+    assert schedule["next_screen_watch_at"] is not None
 
 
 def test_post_control_plane_write_failure_returns_503(env, monkeypatch):

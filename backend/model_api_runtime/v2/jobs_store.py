@@ -5026,6 +5026,12 @@ def recent_token_usage_by_lane(
                 "    AS usage_reported_calls,"
                 "  coalesce(sum(cache_reported_calls), 0)::bigint"
                 "    AS cache_reported_calls,"
+                "  coalesce(sum(screen_frames_pushed), 0)::bigint"
+                "    AS screen_frames_pushed,"
+                "  count(*) FILTER (WHERE visible_reply_count > 0)::bigint"
+                "    AS visible_reply_turns,"
+                "  coalesce(sum(visible_reply_count), 0)::bigint"
+                "    AS visible_reply_count,"
                 "  sum(prompt_tokens)::bigint AS prompt_tokens,"
                 "  sum(completion_tokens)::bigint AS completion_tokens,"
                 "  sum(cache_read_tokens)::bigint AS cache_read_tokens,"
@@ -5078,6 +5084,9 @@ def recent_token_usage_by_lane(
             # cache_hit_ratio 与 usage_coverage 挤在一列、标签写「缓存命中 · 上报」，
             # 读者会把那个"上报"当成 cache 上报（2026-07-30 审计指出）。
             "cache_reported_calls": cache_calls,
+            "screen_frames_pushed": int(row.get("screen_frames_pushed") or 0),
+            "visible_reply_turns": int(row.get("visible_reply_turns") or 0),
+            "visible_reply_count": int(row.get("visible_reply_count") or 0),
             "cache_coverage": (
                 float(cache_calls) / float(model_calls) if model_calls else None
             ),
@@ -5085,6 +5094,10 @@ def recent_token_usage_by_lane(
                 float(usage_calls) / float(model_calls) if model_calls else None
             ),
             "prompt_tokens": prompt_tokens,
+            # Admin calls this column "token input". Keep the normalized
+            # provider name too, but expose the explicit alias so downstream
+            # lane telemetry does not have to guess that prompt == input.
+            "input_tokens": prompt_tokens,
             "completion_tokens": completion_tokens,
             "total_tokens": (
                 prompt_tokens + completion_tokens
@@ -5103,6 +5116,11 @@ def recent_token_usage_by_lane(
             float(rendered["total_tokens"]) / float(rendered["active_user_days"])
             if rendered["total_tokens"] is not None
             and rendered["active_user_days"]
+            else None
+        )
+        rendered["visible_reply_rate"] = (
+            float(rendered["visible_reply_turns"]) / float(rendered["turns"])
+            if rendered["turns"]
             else None
         )
 
@@ -10462,6 +10480,42 @@ def upsert_wake_schedule(
                 else None,
             ),
         )
+
+
+def seed_missing_wake_clocks(
+    user_id: str,
+    *,
+    due_at: float | None = None,
+) -> bool:
+    """Atomically arm every NULL-backed wake lane for one V2 user.
+
+    ``due_heartbeat_users`` and ``due_screen_watch_users`` both deliberately
+    exclude NULL timestamps. Therefore row existence is not proof that either
+    lane is armed: self-wake, payment cooldown, or the other lane can create the
+    row while leaving one clock NULL. Fill only those two missing clocks and
+    preserve every already-advanced timestamp. ``next_capture_at`` is not
+    included because capture/dream eligibility does not use it as a due-list
+    predicate.
+
+    Returns True when a row was inserted or at least one NULL clock was repaired.
+    """
+    timestamp = time.time() if due_at is None else float(due_at)
+    with _pool().connection() as conn:
+        row = conn.execute(
+            "INSERT INTO v2_wake_schedule "
+            "(user_id,next_heartbeat_at,next_screen_watch_at,updated_at) "
+            "VALUES (%s,to_timestamp(%s),to_timestamp(%s),now()) "
+            "ON CONFLICT (user_id) DO UPDATE SET "
+            "next_heartbeat_at=COALESCE(v2_wake_schedule.next_heartbeat_at,"
+            "EXCLUDED.next_heartbeat_at),"
+            "next_screen_watch_at=COALESCE(v2_wake_schedule.next_screen_watch_at,"
+            "EXCLUDED.next_screen_watch_at),updated_at=now() "
+            "WHERE v2_wake_schedule.next_heartbeat_at IS NULL "
+            "OR v2_wake_schedule.next_screen_watch_at IS NULL "
+            "RETURNING user_id",
+            (str(user_id), timestamp, timestamp),
+        ).fetchone()
+    return row is not None
 
 
 _LATEST_GENUINE_USER_SEQ_SQL = (

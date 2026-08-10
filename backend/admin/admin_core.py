@@ -815,7 +815,7 @@ def set_runtime_mode(user_id: str, mode: str) -> tuple[dict, int]:
             # dormant because every producer is mode-filtered; the reverse order
             # creates a real window where the resident is reaped but no V2 wake
             # schedule exists.
-            jobs_store.upsert_wake_schedule(user_id, next_heartbeat_at=time.time())
+            jobs_store.seed_missing_wake_clocks(user_id, due_at=time.time())
         except Exception as e:  # noqa: BLE001 — do not report a half-ready flip
             return {"error": "v2_schedule_seed_failed", "detail": str(e)[:160]}, 503
     try:

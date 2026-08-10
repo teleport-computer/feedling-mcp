@@ -3698,7 +3698,9 @@ def _render_runtime_health_page(
         # 某 lane 有 job 但无 turn metric 行时（例如全部回合都还没终态），
         # tokens["lanes"] 里没有这个键——两列显 —，不得 KeyError、也不得显 0。
         lane_tokens = ((tokens or {}).get("lanes") or {}).get(name) or {}
-        prompt_tok = lane_tokens.get("prompt_tokens")
+        prompt_tok = lane_tokens.get("input_tokens")
+        if prompt_tok is None:
+            prompt_tok = lane_tokens.get("prompt_tokens")
         completion_tok = lane_tokens.get("completion_tokens")
         if prompt_tok is None and completion_tok is None:
             token_cell = "<td class='muted'>—</td>"
@@ -3722,6 +3724,21 @@ def _render_runtime_health_page(
         else:
             coverage_cell = (
                 f"<td>{_fmt_ratio(usage_cov)} / {_fmt_ratio(cache_cov)}</td>"
+            )
+        if name != "screen_watch" or not lane_tokens:
+            visible_reply_cell = "<td class='muted'>—</td>"
+        else:
+            visible_turns = int(lane_tokens.get("visible_reply_turns") or 0)
+            measured_turns = int(lane_tokens.get("turns") or 0)
+            visible_rate = lane_tokens.get("visible_reply_rate")
+            visible_reply_cell = (
+                f"<td>{visible_turns} / {measured_turns}"
+                + (
+                    f" ({_fmt_ratio(visible_rate)})"
+                    if visible_rate is not None
+                    else ""
+                )
+                + "</td>"
             )
         lane_label = html.escape(name)
         if name == "heartbeat":
@@ -3751,6 +3768,7 @@ def _render_runtime_health_page(
             + _ms_cell(lane.get("p50_ok_ms"))
             + _ms_cell(lane.get("p95_ok_ms"))
             + capture_cell
+            + visible_reply_cell
             + token_cell
             + cache_cell
             + coverage_cell
@@ -3879,8 +3897,8 @@ def _render_runtime_health_page(
   {delivery_section}
   <h2>各 lane 健康</h2>
   <div class="table-wrap"><table>
-    <thead><tr><th>Lane</th><th>样本</th><th>成功</th><th>原始失败</th><th>过期</th><th>系统故障<br><span class='muted'>含过期</span></th><th>控制切流</th><th>安全抑制</th><th>终态未成功率</th><th>系统故障率</th><th>p50(成功)</th><th>p95(成功)</th><th>捕获 见终态·无缺口/有缺口/漏写/在飞</th><th>token 入/出</th><th>缓存命中</th><th>上报 usage/cache</th></tr></thead>
-    <tbody>{''.join(lane_rows) if lane_rows else "<tr><td colspan='16' class='muted'>当前窗口无 job。</td></tr>"}</tbody>
+    <thead><tr><th>Lane</th><th>样本</th><th>成功</th><th>原始失败</th><th>过期</th><th>系统故障<br><span class='muted'>含过期</span></th><th>控制切流</th><th>安全抑制</th><th>终态未成功率</th><th>系统故障率</th><th>p50(成功)</th><th>p95(成功)</th><th>捕获 见终态·无缺口/有缺口/漏写/在飞</th><th>开口回合/回合<br><span class='muted'>仅 screen_watch</span></th><th>token 入/出</th><th>缓存命中</th><th>上报 usage/cache</th></tr></thead>
+    <tbody>{''.join(lane_rows) if lane_rows else "<tr><td colspan='17' class='muted'>当前窗口无 job。</td></tr>"}</tbody>
   </table></div>
   {_render_runtime_user_report(user_report)}
   <h2>未成功原因 Top</h2>
