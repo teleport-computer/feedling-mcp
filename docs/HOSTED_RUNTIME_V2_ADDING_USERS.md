@@ -88,11 +88,18 @@ curl -s https://api.feedling.app/v1/admin/runtime-allowlist \
 # 关注 .converged == true 且 .actual.state == "v2"
 ```
 
-### 回滚
+### 持久回滚到 resident
 ```bash
-# 切回 V1：
+# 用同一个 POST 写显式 resident pin；它优先于 automatic cohort admission：
 -d '{"user_id":"usr_xxx","desired":"resident"}'
-# 从 allowlist 移除（用户回到默认 resident，不再被 reconciler 管）：
+```
+
+如确需清理 allowlist 行，`remove` **不是**持久 resident 回滚。对
+`updated_by='new-user-cohort'` 的自动行，后续一次成功的 Model API setup 可能重新创建它；
+不要用删除来表达该用户长期留在 resident 的决定。
+
+```bash
+# 非持久清理；不能代替 resident pin：
 -d '{"user_id":"usr_xxx","desired":"remove"}'
 ```
 
@@ -123,11 +130,20 @@ for i in $(seq 1 15); do
 done
 ```
 
-### 回滚（DB）
+### 持久回滚（DB）
 ```sql
--- 切回 V1：
-UPDATE v2_user_allowlist SET desired='resident', updated_at=now() WHERE user_id='usr_xxx';
--- 移除：
+-- 显式 resident pin；不要直接更新 ownership fence：
+INSERT INTO v2_user_allowlist (user_id, desired, updated_by, note)
+VALUES ('usr_xxx', 'resident', 'ops-manual', 'durable resident rollback')
+ON CONFLICT (user_id) DO UPDATE SET
+  desired=EXCLUDED.desired, updated_by=EXCLUDED.updated_by,
+  note=EXCLUDED.note, updated_at=now();
+```
+
+如确需删除 allowlist 行，这只是非持久清理；自动 cohort 行会在后续成功的 Model API setup
+中重新创建，不能作为 resident pin：
+
+```sql
 DELETE FROM v2_user_allowlist WHERE user_id='usr_xxx';
 ```
 
