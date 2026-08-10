@@ -122,7 +122,6 @@ MEMORY_WRITE_RULES_V1 = ("""
 + _COMMON_BUCKETS_ZH + """); an English memory uses an English bucket (from: """
 + _COMMON_BUCKETS_EN + """). NEVER write a bilingual slash pair like 「健康/Health」or 「宠物/Pets」, and never let 工作 and Work coexist as two buckets.
 - importance means future usefulness for understanding the user. pulse means emotional activation when remembered.
-- content must use three Markdown sections: 记忆 / 上下文 / 使用提示.
 - Do not claim "saved" or "remembered" before the backend write actually succeeds.
 """).strip()
 
