@@ -1,7 +1,9 @@
 """serve_worker：生产 TurnDeps 装配的可测部分 + /healthz + 独立进程编排（reaper/wake 接线）。
 不起真 worker/真 enclave。"""
 import asyncio
+import json
 import sys
+import types
 from pathlib import Path
 
 import pytest
@@ -521,6 +523,162 @@ def test_build_production_deps_returns_turndeps(monkeypatch):
         lambda _user_id: 123.0,
     )
     assert deps.has_genuine_user_history("u-has-history") is True
+
+
+def test_v2_mcp_mixed_reachable_and_unreachable_servers_are_traced_and_recorded(
+    monkeypatch,
+):
+    """Drive the real loader failure taxonomy, not a hand-written summary.
+
+    One server resolves normally. The other enters mcp_client's actual SSRF
+    refusal path, which is the same stable ProbeError shape as an unreachable
+    configured endpoint. The turn stays usable, but its surface must be red and
+    name exactly which expected server disappeared without leaking connection
+    details.
+    """
+    from hosted import mcp_client
+
+    store = types.SimpleNamespace(user_id="usr_mcp_observed")
+    servers = {"servers": [
+        {"name": "up", "enabled": True, "config_envelope": {"id": "up"}},
+        {"name": "down", "enabled": True, "config_envelope": {"id": "down"}},
+    ]}
+    monkeypatch.setattr(
+        serve_worker.mcp_tools.mcp_core,
+        "envelopes_payload",
+        lambda _store: (servers, 200),
+    )
+    monkeypatch.setattr(
+        serve_worker.mcp_tools,
+        "_decrypt",
+        lambda envelope, _api_key, _runtime_token: {
+            "url": ("https://up.example.com/mcp" if envelope["id"] == "up"
+                    else "http://127.0.0.1/private-mcp"),
+            "headers": {"Authorization": "Bearer must-not-leak"},
+        },
+    )
+    real_list_tools = mcp_client.list_tools
+    if not hasattr(mcp_client.asyncio, "timeout"):
+        # Production runs Python 3.12. The local review interpreter is 3.10;
+        # provide only the missing wall-time context so the real SSRF refusal
+        # path below remains the code under test.
+        class _NoopTimeout:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return False
+
+        monkeypatch.setattr(
+            mcp_client.asyncio,
+            "timeout",
+            lambda _seconds: _NoopTimeout(),
+            raising=False,
+        )
+
+    async def mixed_list_tools(url, headers, **kwargs):
+        if url.startswith("http://127.0.0.1"):
+            return await real_list_tools(url, headers, **kwargs)
+        return [{"name": "search", "inputSchema": {"type": "object"}}]
+
+    monkeypatch.setattr(mcp_client, "list_tools", mixed_list_tools)
+    traces = []
+    recorded = []
+    monkeypatch.setattr(
+        serve_worker,
+        "_emit_v2_debug_trace",
+        lambda _store, event_type, **fields: traces.append(
+            {"type": event_type, **fields}),
+    )
+    monkeypatch.setattr(
+        serve_worker.mcp_status,
+        "record_runtime_results",
+        lambda _store, results: recorded.append(results) or True,
+    )
+
+    turn = asyncio.run(serve_worker._load_mcp_turn_observed(
+        store, api_key="k", runtime_token="rt"))
+
+    assert [spec.name for spec in turn.tool_specs] == ["mcp__up__search"]
+    assert len(traces) == 1
+    trace = traces[0]
+    assert trace["type"] == "mcp.surface.resolved"
+    assert trace["status"] == "error"
+    assert trace["detail"]["expected"] == 2
+    assert trace["detail"]["resolved"] == 1
+    assert trace["detail"]["skipped"] == [
+        {"name": "down", "kind": "unreachable_from_backend"},
+    ]
+    assert recorded == [[
+        {"name": "up", "kind": "available"},
+        {"name": "down", "kind": "unreachable_from_backend"},
+    ]]
+    dumped = json.dumps({"trace": trace, "recorded": recorded})
+    assert "127.0.0.1" not in dumped
+    assert "must-not-leak" not in dumped
+
+
+def test_v2_mcp_config_list_failure_is_traced_without_clearing_recent_status(
+    monkeypatch,
+):
+    store = types.SimpleNamespace(user_id="usr_mcp_config_fail")
+    blobs = {}
+
+    def get_blob(user_id, kind):
+        return blobs.get((user_id, kind))
+
+    def set_blob_if_unchanged(
+        user_id, kind, expected, new_doc, *, insert_if_missing=False,
+    ):
+        key = (user_id, kind)
+        if key not in blobs:
+            if not (insert_if_missing and expected == {}):
+                return False
+        elif blobs[key] != expected:
+            return False
+        blobs[key] = new_doc
+        return True
+
+    monkeypatch.setattr(serve_worker.mcp_status.db, "get_blob", get_blob)
+    monkeypatch.setattr(
+        serve_worker.mcp_status.db,
+        "set_blob_if_unchanged",
+        set_blob_if_unchanged,
+    )
+    assert serve_worker.mcp_status.record_runtime_results(
+        store,
+        [{"name": "existing", "kind": "available"}],
+        now=1000,
+    )
+
+    def fail_envelopes(_store):
+        raise RuntimeError("private database detail")
+
+    monkeypatch.setattr(
+        serve_worker.mcp_tools.mcp_core,
+        "envelopes_payload",
+        fail_envelopes,
+    )
+    traces = []
+    monkeypatch.setattr(
+        serve_worker,
+        "_emit_v2_debug_trace",
+        lambda _store, event_type, **fields: traces.append(
+            {"type": event_type, **fields}),
+    )
+
+    turn = asyncio.run(
+        serve_worker._load_mcp_turn_observed(
+            store, api_key="k", runtime_token="rt"))
+
+    assert turn.is_empty
+    assert len(traces) == 1
+    assert traces[0]["status"] == "error"
+    assert traces[0]["detail"]["surface_failure_kind"] == "envelopes_unavailable"
+    assert "private database detail" not in json.dumps(traces[0])
+    status = serve_worker.mcp_status.runtime_status_for_store(store)
+    assert set(status["servers"]) == {"existing"}
+    assert status["servers"]["existing"]["last_kind"] == "available"
 
 
 def test_wire_assembly_injects_envelope_pubkey_getter():
