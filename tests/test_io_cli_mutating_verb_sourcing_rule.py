@@ -37,6 +37,7 @@ MUTATING_VERBS = (
     "memory-patch",
     "memory-delete",
     "send-file",
+    "send-image",
 )
 
 

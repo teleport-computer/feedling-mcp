@@ -113,7 +113,7 @@
     "/healthz": {
       "get": {
         "summary": "Healthz",
-        "description": "Liveness + readiness probe. Public, no auth — used by heartbeats/compose.",
+        "description": "Process liveness probe. Public, no auth — used by heartbeats/compose.",
         "operationId": "healthz_healthz_get",
         "responses": {
           "200": {
@@ -132,16 +132,6 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
-          },
-          "503": {
-            "description": "A critical dependency is unavailable — PostgreSQL is unreachable or the connection pool cannot hand out a connection in time. The body has the same shape as the 200 response, with top-level \"status\": \"unhealthy\" and the failing entry under \"checks\".",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/GenericJsonResponse"
                 }
               }
             }
@@ -181,7 +171,7 @@
             }
           },
           "503": {
-            "description": "The runner fleet is unhealthy, unavailable, or misconfigured. The body has the same shape as the 200 response, with top-level \"status\": \"unhealthy\" and a down \"runner_fleet\" entry under \"checks\".",
+            "description": "The aggregate runner fleet is unhealthy, unavailable, or misconfigured, or its isolated probe exceeded its three-second health-check deadline. The body has the same shape as the 200 response, with top-level \"status\": \"unhealthy\" and a down \"runner_fleet\" entry under \"checks\".",
             "content": {
               "application/json": {
                 "schema": {
@@ -1372,12 +1362,12 @@
             "name": "X-Feedling-Consumer-Capabilities",
             "in": "header",
             "required": false,
-            "description": "Comma-separated capabilities advertised by the current official resident poll.",
+            "description": "Comma-separated capabilities advertised by the current official resident poll. agent_image_generation_v1 means the configured agent entry exposes a callable native image-generation tool; it is not inferred from VPS deployment alone.",
             "schema": {
               "type": "string",
               "maxLength": 500
             },
-            "example": "vision_observer_v1"
+            "example": "vision_observer_v1,agent_image_generation_v1"
           },
           {
             "name": "X-Feedling-Consumer-Compat-Commit",
@@ -1511,12 +1501,12 @@
             "name": "X-Feedling-Consumer-Capabilities",
             "in": "header",
             "required": false,
-            "description": "Comma-separated capabilities advertised by the current official resident poll.",
+            "description": "Comma-separated capabilities advertised by the current official resident poll. agent_image_generation_v1 means the configured agent entry exposes a callable native image-generation tool; it is not inferred from VPS deployment alone.",
             "schema": {
               "type": "string",
               "maxLength": 500
             },
-            "example": "vision_observer_v1"
+            "example": "vision_observer_v1,agent_image_generation_v1"
           }
         ],
         "requestBody": {
@@ -1530,7 +1520,7 @@
           }
         },
         "x-feedling-contract-level": "documented",
-        "description": "Store an agent reply as a v1 ciphertext envelope (plus optional thinking envelope and encrypted file_followups). A text primary and its file cards commit as one ordered transaction. Replies carrying reply_to_message_id are finalized atomically across backend workers: exactly one request inserts the reply and marks the parent answered, while a losing contender returns 409 already_answered without storing its reply. A hidden source=verify_ping reply is accepted only when reply_to_message_id identifies an outstanding verify ping exactly. role=system notices bypass reply exclusivity. Labeled envelopes sealed to a key that is no longer the user's registered content key are rejected with 409 content_pk_fpr_mismatch — the writer should re-fetch whoami, re-seal, and retry once."
+        "description": "Store an agent reply as a v1 ciphertext envelope plus optional thinking and encrypted file/image followups. A text primary and its attachment rows commit as one ordered transaction; generated images are returned as native content_type=image Chat messages. Replies carrying reply_to_message_id are finalized atomically across backend workers: exactly one request inserts the reply and marks the parent answered, while a losing contender returns 409 already_answered without storing its reply. A hidden source=verify_ping reply is accepted only when reply_to_message_id identifies an outstanding verify ping exactly. role=system notices bypass reply exclusivity. Labeled envelopes sealed to a key that is no longer the user's registered content key are rejected with 409 content_pk_fpr_mismatch — the writer should re-fetch whoami, re-seal, and retry once."
       }
     },
     "/v1/chat/turn-activity/{turn_id}": {
@@ -3387,6 +3377,250 @@
         "x-feedling-contract-level": "documented"
       }
     },
+    "/v1/image-generation/config": {
+      "get": {
+        "summary": "Image Generation Config Get",
+        "operationId": "image_generation_config_get_v1_image_generation_config_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GenericJsonResponse"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Error response.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "Other"
+        ],
+        "x-feedling-contract-level": "documented",
+        "description": "Return the effective image-generation route, candidate routes, and validation state. The response mirrors vision routing semantics: follow_main uses the active chat route and dedicated pins a separately validated route."
+      },
+      "put": {
+        "summary": "Image Generation Config Set",
+        "operationId": "image_generation_config_set_v1_image_generation_config_put",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GenericJsonResponse"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Error response.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "Other"
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ImageGenerationConfigUpdateRequest"
+              }
+            }
+          }
+        },
+        "x-feedling-contract-level": "documented",
+        "description": "Select follow_main or a dedicated image-generation route. The selected route is validated for real image output before the change is committed."
+      },
+      "post": {
+        "summary": "Image Generation Route Configure",
+        "operationId": "image_generation_route_configure_v1_image_generation_config_post",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GenericJsonResponse"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Error response.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "Other"
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ImageGenerationRouteCreateRequest"
+              }
+            }
+          }
+        },
+        "x-feedling-contract-level": "documented",
+        "description": "Create, validate, and select a dedicated image-generation route using an existing credential or a newly supplied provider key."
+      }
+    },
+    "/v1/image-generation/generate": {
+      "post": {
+        "summary": "Image Generation Generate",
+        "operationId": "image_generation_generate_v1_image_generation_generate_post",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GenericJsonResponse"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Error response.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "Other"
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ImageGenerationRequest"
+              }
+            }
+          }
+        },
+        "x-feedling-contract-level": "documented"
+      }
+    },
+    "/v1/image-generation/main/test": {
+      "post": {
+        "summary": "Image Generation Main Test",
+        "operationId": "image_generation_main_test_v1_image_generation_main_test_post",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GenericJsonResponse"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Error response.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "Other"
+        ],
+        "x-feedling-contract-level": "documented",
+        "description": "Validate the active main route for real image generation and return the refreshed effective configuration."
+      }
+    },
+    "/v1/image-generation/routes/{route_id}/test": {
+      "post": {
+        "summary": "Image Generation Route Test",
+        "operationId": "image_generation_route_test_v1_image_generation_routes__route_id__test_post",
+        "parameters": [
+          {
+            "name": "route_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Route Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GenericJsonResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid path or request parameter.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Error response.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "Other"
+        ],
+        "x-feedling-contract-level": "documented",
+        "description": "Validate one saved route for real image generation and persist its capability result."
+      }
+    },
     "/v1/mcp/envelopes": {
       "get": {
         "summary": "Mcp Envelopes",
@@ -3454,7 +3688,7 @@
           }
         ],
         "x-feedling-contract-level": "documented",
-        "description": "List the caller's user-configured MCP servers. Secrets (url, headers, ca_pem) are never returned; url_hint is the hostname only and header_names lists header keys only."
+        "description": "List the caller's user-configured MCP servers. Secrets (url, headers, ca_pem) are never returned; url_hint is the hostname only and header_names lists header keys only. When Hosted Runtime V2 has observed a server during recent chat turns, the record also carries a bounded, content-free runtime summary. The runtime field is omitted when no observation exists; absence is not evidence that the server is healthy. Runtime V1 does not currently write this status."
       },
       "post": {
         "summary": "Mcp Upsert",
@@ -7977,6 +8211,49 @@
         "x-feedling-contract-level": "documented"
       }
     },
+    "/v1/voice/cancel": {
+      "post": {
+        "summary": "Cancel Voice Call",
+        "description": "Idempotently end a voice call that will not be archived. The durable tombstone suppresses late resident and Hosted Runtime V2 replies before chat insertion, removes unarchived per-turn rows and encrypted voice handoff state, and makes repeated cancellation safe. If finalize already claimed the call, cancellation returns that lifecycle state without deleting rows or downgrading the archive.",
+        "operationId": "cancel_voice_call_v1_voice_cancel_post",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GenericJsonResponse"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Error response.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "Other"
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/VoiceCallCancelRequest"
+              }
+            }
+          }
+        },
+        "x-feedling-contract-level": "documented"
+      }
+    },
     "/v1/voice/chat/completions": {
       "post": {
         "summary": "Voice Chat Completions",
@@ -8489,6 +8766,27 @@
           }
         },
         "title": "ValidationError"
+      },
+      "VoiceCallCancelRequest": {
+        "type": "object",
+        "required": [
+          "call_id",
+          "reason"
+        ],
+        "properties": {
+          "call_id": {
+            "type": "string",
+            "pattern": "^vcall_",
+            "maxLength": 96
+          },
+          "reason": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 64,
+            "description": "Bounded client cancellation reason, for example user_hangup, connect_failed, transcript_empty, or app_terminated."
+          }
+        },
+        "additionalProperties": false
       },
       "ModelApiModelsRequest": {
         "type": "object",
@@ -9597,6 +9895,114 @@
         ],
         "additionalProperties": false
       },
+      "ImageGenerationConfigUpdateRequest": {
+        "type": "object",
+        "required": [
+          "mode"
+        ],
+        "properties": {
+          "mode": {
+            "type": "string",
+            "enum": [
+              "follow_main",
+              "dedicated"
+            ]
+          },
+          "route_id": {
+            "type": "string",
+            "format": "uuid",
+            "description": "Required when mode is dedicated."
+          }
+        },
+        "if": {
+          "properties": {
+            "mode": {
+              "const": "dedicated"
+            }
+          },
+          "required": [
+            "mode"
+          ]
+        },
+        "then": {
+          "required": [
+            "route_id"
+          ]
+        },
+        "additionalProperties": false
+      },
+      "ImageGenerationRouteCreateRequest": {
+        "type": "object",
+        "required": [
+          "model"
+        ],
+        "properties": {
+          "provider": {
+            "type": "string"
+          },
+          "model": {
+            "type": "string",
+            "minLength": 1
+          },
+          "api_key": {
+            "type": "string",
+            "minLength": 1,
+            "writeOnly": true
+          },
+          "credential_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "label": {
+            "type": "string"
+          },
+          "base_url": {
+            "type": "string",
+            "format": "uri"
+          },
+          "context_window_tokens": {
+            "type": "integer",
+            "minimum": 8192
+          }
+        },
+        "oneOf": [
+          {
+            "required": [
+              "api_key"
+            ],
+            "not": {
+              "required": [
+                "credential_id"
+              ]
+            }
+          },
+          {
+            "required": [
+              "credential_id"
+            ],
+            "not": {
+              "required": [
+                "api_key"
+              ]
+            }
+          }
+        ],
+        "additionalProperties": false
+      },
+      "ImageGenerationRequest": {
+        "type": "object",
+        "required": [
+          "prompt"
+        ],
+        "properties": {
+          "prompt": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 8000
+          }
+        },
+        "additionalProperties": false
+      },
       "VisionObserveRequest": {
         "type": "object",
         "required": [
@@ -9953,6 +10359,33 @@
         },
         "additionalProperties": false
       },
+      "ChatImageFollowup": {
+        "type": "object",
+        "required": [
+          "envelope",
+          "image_mime",
+          "image_byte_count"
+        ],
+        "properties": {
+          "envelope": {
+            "$ref": "#/components/schemas/EncryptedEnvelope"
+          },
+          "image_mime": {
+            "type": "string",
+            "enum": [
+              "image/jpeg",
+              "image/png",
+              "image/webp"
+            ]
+          },
+          "image_byte_count": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 2000000
+          }
+        },
+        "additionalProperties": false
+      },
       "ChatResponseRequest": {
         "type": "object",
         "required": [
@@ -9995,6 +10428,15 @@
               "$ref": "#/components/schemas/ChatFileFollowup"
             },
             "description": "Optional encrypted download cards committed atomically after a text primary. Chat source only; reply_to_message_id is required. The order in this array is the display order below the primary reply."
+          },
+          "image_followups": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 4,
+            "items": {
+              "$ref": "#/components/schemas/ChatImageFollowup"
+            },
+            "description": "Optional encrypted generated images committed atomically after a text primary. Each row is returned as content_type=image and renders directly in Chat. Chat source only; reply_to_message_id is required."
           },
           "turn_failure_error_class": {
             "type": "string",
@@ -10054,7 +10496,8 @@
           },
           "result_code": {
             "type": "string",
-            "maxLength": 64
+            "maxLength": 64,
+            "description": "Display-safe result token. Failed generate_image events preserve an allowlisted image_generation_* code; result bodies are never included."
           },
           "memory_count": {
             "type": "integer",
@@ -10924,6 +11367,46 @@
           }
         }
       },
+      "McpServerRuntimeStatus": {
+        "type": "object",
+        "required": [
+          "last_kind",
+          "last_at",
+          "recent_ok",
+          "recent_total"
+        ],
+        "properties": {
+          "last_kind": {
+            "type": "string",
+            "pattern": "^[a-z0-9_]{1,48}$",
+            "description": "Latest content-free Hosted Runtime V2 load outcome. available means the server catalog loaded successfully; other stable kinds describe why it was not ready. Clients must tolerate future kinds."
+          },
+          "last_at": {
+            "type": "number",
+            "exclusiveMinimum": 0,
+            "description": "Unix epoch seconds of the latest observation."
+          },
+          "recent_ok": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 10,
+            "description": "Number of recent observed chat turns whose kind was available."
+          },
+          "recent_total": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 10,
+            "description": "Number of recent observed chat turns in the bounded window."
+          }
+        },
+        "additionalProperties": false,
+        "example": {
+          "last_kind": "available",
+          "last_at": 1786370000.0,
+          "recent_ok": 9,
+          "recent_total": 10
+        }
+      },
       "McpServerRecord": {
         "type": "object",
         "properties": {
@@ -10964,6 +11447,10 @@
           },
           "updated_at": {
             "type": "string"
+          },
+          "runtime": {
+            "$ref": "#/components/schemas/McpServerRuntimeStatus",
+            "description": "Present on GET /v1/mcp/servers only when Hosted Runtime V2 has observed this server. Omitted when no observation exists; absence is not evidence of success."
           }
         },
         "additionalProperties": true,

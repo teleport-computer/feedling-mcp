@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import re
 import ssl
 import uuid
@@ -20,14 +21,29 @@ from core import envelope as core_envelope
 from core import util as core_util
 from core import wake_bus
 from core.store import UserStore
+from hosted import mcp_status
 from hosted.mcp_approvals import (
     MAX_READ_ONLY_TOOL_APPROVALS,
     valid_fingerprint,
     valid_tool_name,
 )
 
+log = logging.getLogger("feedling.hosted.mcp_core")
+
 USER_MCP_BLOB = "user_mcp"
-MAX_SERVERS = 10
+# ⚠️ 这是**防滥用的兜底**,不是产品限制 —— 别拿它当成本闸。
+#
+# 2026-07-10 首版随手定的 10,没有任何依据被记下来。而它挡的"服务器数量"和
+# 真实成本几乎无关:一台服务器可以出 100 个工具,十台也可能只有 15 个。
+# 真正决定死活的三样都在别处已经有闸:
+#   - 每轮到模型的工具数/字节数(mcp_tools 的 MAX_MCP_TOOLS_PER_TURN / 目录上限)
+#   - 握手延迟(并行 + 每个各自超时 + V2 的 MCP_TURN_WALL_BUDGET_SEC)
+#   - 单台的 header/CA 体积(下面几个常量)
+# 10 唯一的效果,是让想接第 11 台的用户撞一堵没道理的墙(2026-08-10 Seven 指出)。
+#
+# 留一道是因为「一个账号指 500 台」确实是真实滥用面:每轮就是 500 个并发出站
+# 连接。所以这个数只要**明显不碍正常使用**即可,不需要精确。
+MAX_SERVERS = 30
 MAX_HEADERS = 20
 MAX_HEADERS_BYTES = 8192
 MAX_CA_BYTES = 32768
@@ -245,7 +261,22 @@ def _public(srv: dict) -> dict:
 
 def list_servers(store: UserStore) -> tuple[dict, int]:
     servers = _load(store)["servers"]
-    return {"servers": [_public(s) for s in servers]}, 200
+    if not servers:
+        return {"servers": []}, 200
+    try:
+        runtime_by_name = mcp_status.runtime_summaries_for_store(store)
+    except Exception as exc:  # noqa: BLE001 — optional status never breaks config
+        log.warning("mcp runtime status read failed user=%s kind=%s",
+                    store.user_id, type(exc).__name__)
+        runtime_by_name = {}
+    public_servers = []
+    for server in servers:
+        public = _public(server)
+        runtime = runtime_by_name.get(str(server.get("name") or ""))
+        if runtime:
+            public["runtime"] = runtime
+        public_servers.append(public)
+    return {"servers": public_servers}, 200
 
 
 def upsert_server(store: UserStore, payload: dict) -> tuple[dict, int]:

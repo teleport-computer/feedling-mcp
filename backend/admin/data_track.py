@@ -651,6 +651,29 @@ def _data_track_app_usage_from_snapshot(snap: dict) -> dict:
     }
 
 
+def _data_track_user_mcp_from_snapshot(snap: dict) -> dict:
+    """Whether this user has MCP servers saved, and how many are switched ON.
+
+    Metadata only — the db aggregate counts in SQL so no encrypted envelope
+    (each server's url + auth headers) ever enters this process. ``configured``
+    answers a question the app cannot: its connection test is a control-plane
+    probe that dials the server directly and passes without saving anything, so
+    a user reporting "the test was green" is not evidence that anything was
+    stored. ``enabled_count`` separates the two failure shapes that look
+    identical from outside — a saved-but-switched-off server still advertises a
+    NON-empty fingerprint and materializes cleanly, yet reaches the agent as
+    zero servers, exactly like a broken apply chain would.
+    """
+    mcp = dict(snap.get("user_mcp") or {})
+    configured_count = int(mcp.get("configured_count") or 0)
+    return {
+        "configured": configured_count > 0,
+        "configured_count": configured_count,
+        "enabled_count": int(mcp.get("enabled_count") or 0),
+        "fingerprint": str(mcp.get("fingerprint") or ""),
+    }
+
+
 def _epoch_is_today_shanghai(epoch: float, now_epoch: float) -> bool:
     """True when ``epoch`` falls on the same Asia/Shanghai calendar day as
     ``now_epoch``. Explicit ZoneInfo — never the host's local TZ."""
@@ -1197,6 +1220,7 @@ def _build_data_track_user_fast(user_entry: dict, snap: dict) -> dict:
         "app_usage": _data_track_app_usage_from_snapshot(snap),
         "bootstrap_events": bootstrap_events,
         "history_import": history_import,
+        "user_mcp": _data_track_user_mcp_from_snapshot(snap),
     }
     row["responder"] = _effective_responder(
         route=route,
@@ -1231,6 +1255,14 @@ def _model_api_route_summaries(user_id: str) -> list[dict]:
             purposes.append("chat")
         if route.get("is_vision"):
             purposes.append("vision")
+        # image_generation was missing here while the column existed, so an
+        # image-gen route rendered as `purpose: []` — indistinguishable from a
+        # route with no job at all. Diagnosing usr_7001b1df80e2024d's "生图没引导
+        # 我加模型" (2026-08-10) from admin was impossible: the one fact that
+        # decides the whole branch (is there a dedicated image route?) was the
+        # one fact not projected. Read a projection as a projection.
+        if route.get("is_image_generation"):
+            purposes.append("image_generation")
         out.append({
             "purpose": purposes,
             "provider": str(route.get("provider") or "")[:80],
@@ -1238,6 +1270,12 @@ def _model_api_route_summaries(user_id: str) -> list[dict]:
             "vision_test_status": str(
                 route.get("vision_test_status") or "untested"
             )[:40],
+            "image_generation_test_status": str(
+                route.get("image_generation_test_status") or "untested"
+            )[:40],
+            "last_image_generation_test_error": str(
+                route.get("last_image_generation_test_error") or ""
+            )[:300],
             "last_vision_test_error": str(
                 route.get("last_vision_test_error") or ""
             )[:300],
@@ -1543,6 +1581,9 @@ def _build_data_track_user(user_entry: dict, *, include_detail: bool = False) ->
         )
         detail_snapshot = db.admin_data_track_snapshot([user_id]).get(user_id, {})
         row["app_usage"] = _data_track_app_usage_from_snapshot(detail_snapshot)
+        # Same key the list rows carry (_build_data_track_user_fast), so a
+        # client reading one shape can read the other.
+        row["user_mcp"] = _data_track_user_mcp_from_snapshot(detail_snapshot)
         detail_blobs = detail_snapshot.get("blobs") or {}
         row["responder"] = _effective_responder(
             route=route,
@@ -3693,7 +3734,9 @@ def _render_runtime_health_page(
         # 某 lane 有 job 但无 turn metric 行时（例如全部回合都还没终态），
         # tokens["lanes"] 里没有这个键——两列显 —，不得 KeyError、也不得显 0。
         lane_tokens = ((tokens or {}).get("lanes") or {}).get(name) or {}
-        prompt_tok = lane_tokens.get("prompt_tokens")
+        prompt_tok = lane_tokens.get("input_tokens")
+        if prompt_tok is None:
+            prompt_tok = lane_tokens.get("prompt_tokens")
         completion_tok = lane_tokens.get("completion_tokens")
         if prompt_tok is None and completion_tok is None:
             token_cell = "<td class='muted'>—</td>"
@@ -3717,6 +3760,21 @@ def _render_runtime_health_page(
         else:
             coverage_cell = (
                 f"<td>{_fmt_ratio(usage_cov)} / {_fmt_ratio(cache_cov)}</td>"
+            )
+        if name != "screen_watch" or not lane_tokens:
+            visible_reply_cell = "<td class='muted'>—</td>"
+        else:
+            visible_turns = int(lane_tokens.get("visible_reply_turns") or 0)
+            measured_turns = int(lane_tokens.get("turns") or 0)
+            visible_rate = lane_tokens.get("visible_reply_rate")
+            visible_reply_cell = (
+                f"<td>{visible_turns} / {measured_turns}"
+                + (
+                    f" ({_fmt_ratio(visible_rate)})"
+                    if visible_rate is not None
+                    else ""
+                )
+                + "</td>"
             )
         lane_label = html.escape(name)
         if name == "heartbeat":
@@ -3746,6 +3804,7 @@ def _render_runtime_health_page(
             + _ms_cell(lane.get("p50_ok_ms"))
             + _ms_cell(lane.get("p95_ok_ms"))
             + capture_cell
+            + visible_reply_cell
             + token_cell
             + cache_cell
             + coverage_cell
@@ -3874,8 +3933,8 @@ def _render_runtime_health_page(
   {delivery_section}
   <h2>各 lane 健康</h2>
   <div class="table-wrap"><table>
-    <thead><tr><th>Lane</th><th>样本</th><th>成功</th><th>原始失败</th><th>过期</th><th>系统故障<br><span class='muted'>含过期</span></th><th>控制切流</th><th>安全抑制</th><th>终态未成功率</th><th>系统故障率</th><th>p50(成功)</th><th>p95(成功)</th><th>捕获 见终态·无缺口/有缺口/漏写/在飞</th><th>token 入/出</th><th>缓存命中</th><th>上报 usage/cache</th></tr></thead>
-    <tbody>{''.join(lane_rows) if lane_rows else "<tr><td colspan='16' class='muted'>当前窗口无 job。</td></tr>"}</tbody>
+    <thead><tr><th>Lane</th><th>样本</th><th>成功</th><th>原始失败</th><th>过期</th><th>系统故障<br><span class='muted'>含过期</span></th><th>控制切流</th><th>安全抑制</th><th>终态未成功率</th><th>系统故障率</th><th>p50(成功)</th><th>p95(成功)</th><th>捕获 见终态·无缺口/有缺口/漏写/在飞</th><th>开口回合/回合<br><span class='muted'>仅 screen_watch</span></th><th>token 入/出</th><th>缓存命中</th><th>上报 usage/cache</th></tr></thead>
+    <tbody>{''.join(lane_rows) if lane_rows else "<tr><td colspan='17' class='muted'>当前窗口无 job。</td></tr>"}</tbody>
   </table></div>
   {_render_runtime_user_report(user_report)}
   <h2>未成功原因 Top</h2>
@@ -7640,6 +7699,9 @@ _DEBUG_STEP_LABELS = {
     "agent.model.call.start": ("🧠", "调用模型 · 开始"),
     "agent.model.call.done": ("🧠", "调用模型 · 完成"),
     "agent.tool.call": ("🔧", "调用工具"),
+    "mcp.surface.resolved": ("🧩", "MCP 工具面"),
+    "mcp.surface.missing": ("🧩", "MCP 工具面缺失"),
+    "mcp.surface.wired": ("🧩", "MCP 已接线"),
     "agent.reasoning": ("💭", "思考 / reasoning"),
     "agent.reply": ("💬", "AI 回复"),
     "chat.response": ("📤", "写入回复"),
@@ -7846,7 +7908,9 @@ def _render_data_track_debug_page(payload: dict) -> str:
         )
     limit_options = []
     current_limit = str(pagination.get("limit") or filters.get("limit") or 100)
-    for value in ("50", "100", "200", "500"):
+    # Ring depth is debug_trace._MAX_EVENTS (2500); stopping the picker at 500
+    # meant a full 48h trace could not be read out from the panel at all.
+    for value in ("50", "100", "200", "500", "1000", "2500"):
         selected = "selected" if current_limit == value else ""
         limit_options.append(f'<option value="{value}" {selected}>{value}</option>')
 

@@ -163,8 +163,20 @@ def test_reconciled_human_message_is_replied_and_advances_seq_cursor(monkeypatch
 
     provider_calls = []
 
-    async def _provider(config, messages, *, tools=None):
-        provider_calls.append({"messages": messages, "tools": tools})
+    async def _provider(
+        config,
+        messages,
+        *,
+        tools=None,
+        allow_image_output=False,
+        **kwargs,
+    ):
+        provider_calls.append({
+            "messages": messages,
+            "tools": tools,
+            "allow_image_output": allow_image_output,
+            **kwargs,
+        })
         return {
             "reply": "reply to human",
             "tool_calls": [],
@@ -231,6 +243,7 @@ def test_reconciled_human_message_is_replied_and_advances_seq_cursor(monkeypatch
 
     assert status == "completed"
     assert len(provider_calls) == 1
+    assert provider_calls[0]["allow_image_output"] is True
     # Prompt assembly may place coalesced input inside a structured context
     # block rather than retain it as a top-level provider ``user`` message.
     assert "hello from legacy human role" in str(provider_calls[0]["messages"])

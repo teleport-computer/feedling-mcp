@@ -241,3 +241,44 @@ def test_catalog_not_none_on_success():
     assert catalog is not None, "build_catalog should succeed and return string"
     assert isinstance(catalog, str), "build_catalog should return a string"
     assert len(catalog) > 0, "Catalog should not be empty"
+
+
+def test_catalog_survives_a_gbk_locale():
+    """The whole catalog must still build when the OS locale cannot encode the
+    help text — i.e. Chinese Windows (cp936/GBK).
+
+    Regression for a self-hosted user's 2026-08-08 report: one ⚠️ (U+26A0) in
+    `identity-redistill --help` is not encodable in GBK, so the `--help`
+    subprocess died with UnicodeEncodeError, `build_catalog` returned None, and
+    the agent silently lost its ENTIRE 4KB tool catalog on every single turn
+    (the failure path is deliberately not cached, so it re-failed forever).
+    The user only saw "the fallback block again"; nothing logged a cause.
+
+    This runs the real build in a child whose PYTHONIOENCODING is gbk, which is
+    what makes `text=True` pick GBK on both ends. It fails on ANY future
+    non-GBK-encodable character anywhere in any verb's help, not just that one
+    emoji — the point is the class of bug, not the single code point.
+    """
+    repo = os.path.join(os.path.dirname(__file__), "..")
+    io_cli_path = os.path.join(repo, "tools", "io_cli.py")
+    catalog_dir = os.path.join(repo, "tools")
+    env = {**os.environ, "PYTHONIOENCODING": "gbk"}
+    code = (
+        "import sys;"
+        f"sys.path.insert(0, {catalog_dir!r});"
+        "import io_cli_catalog;"
+        f"c = io_cli_catalog.build_catalog({io_cli_path!r}, python=sys.executable);"
+        "sys.stdout.buffer.write(b'OK' if c else b'NONE')"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", code], capture_output=True, timeout=180, env=env
+    )
+    assert result.returncode == 0, (
+        "catalog build crashed under a GBK locale: "
+        + result.stderr.decode("utf-8", "replace")[-400:]
+    )
+    assert result.stdout.strip() == b"OK", (
+        "build_catalog returned None under a GBK locale — a help string almost "
+        "certainly gained a character GBK cannot encode. Keep help text ASCII "
+        "for symbols (use [!] not ⚠️); Chinese prose is fine, GBK covers it."
+    )

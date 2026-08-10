@@ -121,6 +121,43 @@ def test_crud_roundtrip(client, monkeypatch):
     assert client.get("/v1/mcp/servers", headers=h).get_json() == {"servers": []}
 
 
+def test_list_serializes_optional_runtime_summary(client, monkeypatch):
+    _fake_envelope(monkeypatch)
+    user_id, key = _register(client)
+    h = {"X-API-Key": key}
+    created = client.post("/v1/mcp/servers", headers=h, json={
+        "name": "jira",
+        "url": "https://mcp.example.com/mcp",
+        "headers": {},
+    })
+    assert created.status_code == 200
+
+    from hosted import mcp_status
+
+    monkeypatch.setattr(
+        mcp_status,
+        "runtime_summaries_for_store",
+        lambda store: ({
+            "jira": {
+                "last_kind": "transport_failure",
+                "last_at": 1786370000.0,
+                "recent_ok": 0,
+                "recent_total": 10,
+            },
+        } if store.user_id == user_id else {}),
+    )
+
+    listed = client.get("/v1/mcp/servers", headers=h)
+
+    assert listed.status_code == 200
+    assert listed.get_json()["servers"][0]["runtime"] == {
+        "last_kind": "transport_failure",
+        "last_at": 1786370000.0,
+        "recent_ok": 0,
+        "recent_total": 10,
+    }
+
+
 @pytest.mark.parametrize(
     ("payload", "kind"),
     [

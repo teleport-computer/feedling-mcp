@@ -28,7 +28,7 @@ import dataclasses
 import json
 import math
 import os
-from collections.abc import Mapping, Sequence
+from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Literal
 from urllib.parse import urlsplit
@@ -756,6 +756,7 @@ def messages_component(
 def tool_schemas_component(
     tools: Sequence[Any],
     *,
+    name: str = "tool_schemas",
     required: bool = True,
     priority: int = 0,
     utf8_bytes_per_token: float = DEFAULT_ESTIMATOR_UTF8_BYTES_PER_TOKEN,
@@ -764,7 +765,7 @@ def tool_schemas_component(
 
     overhead = len(tools) * TOOL_SCHEMA_STRUCTURAL_OVERHEAD_TOKENS
     return structured_component(
-        "tool_schemas",
+        name,
         list(tools),
         required=required,
         priority=priority,
@@ -931,6 +932,7 @@ def plan_provider_round(
     model_limit: ModelPromptLimit,
     messages: Sequence[Any],
     tools: Sequence[Any] | None,
+    required_tool_names: Collection[str] = (),
     output_reserve_tokens: int = DEFAULT_OUTPUT_RESERVE_TOKENS,
     safety_margin_tokens: int | None = None,
     utf8_bytes_per_token: float = DEFAULT_ESTIMATOR_UTF8_BYTES_PER_TOKEN,
@@ -940,8 +942,10 @@ def plan_provider_round(
 
     Native exchanges are separated only for accounting/diagnostics; the caller
     still sends its original chronological ``messages`` list unchanged. Tool
-    schemas are the sole optional component because the unified loop can safely
-    degrade to one text-only terminal request. Conversation messages and native
+    schemas are normally optional because the unified loop can safely degrade to
+    one text-only terminal request. Schemas named in ``required_tool_names`` stay
+    required when their native call/result history is retained; the remaining
+    catalog may still be omitted atomically. Conversation messages and native
     call/result pairs are required and are never silently truncated.
     """
 
@@ -965,14 +969,35 @@ def plan_provider_round(
             )
         )
     if tools is not None:
-        components.append(
-            tool_schemas_component(
-                tools,
-                required=False,
-                priority=1,
-                utf8_bytes_per_token=utf8_bytes_per_token,
+        required_names = {str(name) for name in required_tool_names if str(name)}
+        required_tools = [
+            tool
+            for tool in tools
+            if str(getattr(tool, "name", "")) in required_names
+        ]
+        optional_tools = [
+            tool
+            for tool in tools
+            if str(getattr(tool, "name", "")) not in required_names
+        ]
+        if required_tools:
+            components.append(
+                tool_schemas_component(
+                    required_tools,
+                    name="required_tool_schemas",
+                    required=True,
+                    utf8_bytes_per_token=utf8_bytes_per_token,
+                )
             )
-        )
+        if optional_tools:
+            components.append(
+                tool_schemas_component(
+                    optional_tools,
+                    required=False,
+                    priority=1,
+                    utf8_bytes_per_token=utf8_bytes_per_token,
+                )
+            )
     return plan_prompt(
         model_limit=model_limit,
         components=components,

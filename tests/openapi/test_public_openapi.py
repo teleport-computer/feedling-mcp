@@ -39,6 +39,8 @@ EXPECTED_BODYLESS_POSTS = {
     ("post", "/v1/model_api/test"),
     ("post", "/v1/model_api/routes/{route_id}/activate"),
     ("post", "/v1/model_api/routes/{route_id}/test"),
+    ("post", "/v1/image-generation/main/test"),
+    ("post", "/v1/image-generation/routes/{route_id}/test"),
     ("post", "/v1/vision/main/test"),
     ("post", "/v1/vision/routes/{route_id}/test"),
     ("post", "/v1/proactive/scheduled/fire"),
@@ -70,6 +72,9 @@ EXPECTED_API_KEY_ONLY_OPERATIONS = {
 
 EXPECTED_CORE_BODY_REFS = {
     ("post", "/v1/model_api/chat/send"): "HostedChatSendRequest",
+    ("put", "/v1/image-generation/config"): "ImageGenerationConfigUpdateRequest",
+    ("post", "/v1/image-generation/config"): "ImageGenerationRouteCreateRequest",
+    ("post", "/v1/image-generation/generate"): "ImageGenerationRequest",
     ("put", "/v1/vision/config"): "VisionConfigUpdateRequest",
     ("post", "/v1/vision/config"): "VisionRouteCreateRequest",
     ("post", "/v1/vision/observe"): "VisionObserveRequest",
@@ -202,8 +207,14 @@ def test_public_operation_and_parameter_inventory(
     # /v1/voice/transcripts (list, metadata only) and GET
     # /v1/voice/transcripts/{call_id} (one sealed envelope, decrypted on the
     # client). Both bodyless, so the body count is unchanged.
-    assert len(operations) == 169
-    assert sum("requestBody" in operation for operation in operations.values()) == 80
+    # 170 since POST /v1/voice/cancel; its required JSON body installs the
+    # durable call tombstone used to suppress late resident/V2 replies.
+    # Image-generation routing adds GET/PUT/POST config plus two bodyless
+    # validators; only the two config mutations carry request bodies.
+    # The authenticated resident generation exchange adds one prompt-bearing
+    # operation.
+    assert len(operations) == 176
+    assert sum("requestBody" in operation for operation in operations.values()) == 84
 
     query_operations = {
         key for key, operation in operations.items() if _parameters(operation, "query")
@@ -568,18 +579,40 @@ def test_mcp_probe_and_approval_contract_matches_runtime_limits(
     public_schema: dict[str, Any],
     operations: dict[tuple[str, str], dict[str, Any]],
 ) -> None:
-    from hosted import mcp_approvals, mcp_core
+    from hosted import mcp_approvals, mcp_core, mcp_status
 
     schemas = public_schema["components"]["schemas"]
     upsert = schemas["McpServerUpsertRequest"]
     patch = schemas["McpServerPatchRequest"]
     probe = schemas["McpServerTestResponse"]
+    record = schemas["McpServerRecord"]
+    runtime = schemas["McpServerRuntimeStatus"]
 
     assert upsert["additionalProperties"] is False
     assert upsert["properties"]["enabled"]["type"] == "boolean"
     assert upsert["properties"]["headers"]["maxProperties"] == mcp_core.MAX_HEADERS
     assert patch["additionalProperties"] is False
     assert patch["properties"]["enabled"]["type"] == "boolean"
+    assert record["properties"]["runtime"]["$ref"] == (
+        "#/components/schemas/McpServerRuntimeStatus")
+    assert runtime["required"] == [
+        "last_kind", "last_at", "recent_ok", "recent_total",
+    ]
+    assert runtime["additionalProperties"] is False
+    assert runtime["properties"]["recent_ok"]["maximum"] == (
+        mcp_status.MAX_RECENT_TURNS)
+    assert runtime["properties"]["recent_total"] == {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": mcp_status.MAX_RECENT_TURNS,
+        "description": (
+            "Number of recent observed chat turns in the bounded window."
+        ),
+    }
+    kind_pattern = runtime["properties"]["last_kind"]["pattern"]
+    assert re.fullmatch(kind_pattern, "available")
+    assert re.fullmatch(kind_pattern, "transport_failure")
+    assert not re.fullmatch(kind_pattern, "https://secret.example")
 
     approval_schemas = [
         upsert["properties"]["read_only_tool_fingerprints"],
@@ -608,6 +641,11 @@ def test_mcp_probe_and_approval_contract_matches_runtime_limits(
         "too_many_read_only_tool_fingerprints",
     ):
         assert kind in post_description
+
+    list_description = operations[("get", "/v1/mcp/servers")]["description"]
+    assert "Hosted Runtime V2" in list_description
+    assert "runtime field is omitted" in list_description
+    assert "absence is not evidence" in list_description
 
     patch_operation = operations[("patch", "/v1/mcp/servers/{name}")]
     assert "invalid_enabled" in patch_operation["description"]
@@ -673,6 +711,15 @@ def test_runner_health_503_uses_the_aggregate_health_response_contract(
         "$ref": "#/components/schemas/GenericJsonResponse",
     }
     assert "same shape as the 200 response" in response["description"]
+
+
+def test_runner_health_503_description_covers_bounded_probe_deadline(
+    operations: dict[tuple[str, str], dict[str, Any]],
+) -> None:
+    runner_description = operations[("get", "/healthz/runner")]["responses"]["503"]["description"]
+
+    assert "503" not in operations[("get", "/healthz")]["responses"]
+    assert "three-second health-check deadline" in runner_description
 
 
 def test_sensitive_control_planes_enforce_api_key_in_backend(

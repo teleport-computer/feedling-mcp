@@ -56,6 +56,8 @@ log = logging.getLogger("feedling.db")
 
 _pool: ConnectionPool | None = None
 _pool_lock = threading.Lock()
+HEALTH_DB_ACQUIRE_TIMEOUT_SECONDS = 1.0
+HEALTH_DB_STATEMENT_TIMEOUT_MS = 1000
 
 
 def _database_url() -> str:
@@ -159,7 +161,24 @@ def healthcheck() -> bool:
         return False
 
 
-def health_probe(timeout: float = 2.0) -> dict:
+@contextmanager
+def _local_statement_timeout(conn, timeout_ms: int | None):
+    if timeout_ms is None:
+        yield
+        return
+    with conn.transaction():
+        conn.execute(
+            "SELECT set_config('statement_timeout', %s, true)",
+            (f"{int(timeout_ms)}ms",),
+        )
+        yield
+
+
+def health_probe(
+    timeout: float = 2.0,
+    *,
+    statement_timeout_ms: int | None = None,
+) -> dict:
     """Fast liveness probe for /healthz.
 
     Acquire a pooled connection within ``timeout`` seconds and run ``SELECT 1``.
@@ -172,8 +191,13 @@ def health_probe(timeout: float = 2.0) -> dict:
     t0 = time.perf_counter()
     try:
         with get_pool().connection(timeout=timeout) as conn:
-            conn.execute("SELECT 1")
-        return {"ok": True, "latency_ms": round((time.perf_counter() - t0) * 1000, 1), "error": None}
+            with _local_statement_timeout(conn, statement_timeout_ms):
+                conn.execute("SELECT 1")
+        return {
+            "ok": True,
+            "latency_ms": round((time.perf_counter() - t0) * 1000, 1),
+            "error": None,
+        }
     except Exception as e:  # noqa: BLE001 — health must never raise
         return {
             "ok": False,
@@ -362,18 +386,24 @@ def set_supervisor_instance_heartbeat(owner: str, payload: dict) -> None:
     mirror.execute(sql, params)
 
 
-def list_supervisor_instance_heartbeats() -> list[dict]:
+def list_supervisor_instance_heartbeats(
+    *,
+    timeout: float | None = None,
+    statement_timeout_ms: int | None = None,
+) -> list[dict]:
     """All runner heartbeat rows. Each dict carries the typed flags plus ``ts``
     (the row's ``updated_at`` as an epoch float) so the caller can age-filter in
     pure code. Freshness/aggregation is the guard's job, not this query's. Raises
     on a DB error so the caller can fall back to the legacy key."""
-    with get_pool().connection() as conn:
-        rows = conn.execute(
-            "SELECT owner, host, shard_index, shard_count, max_children, "
-            "       active_children, host_all, gateway, version, "
-            "       extract(epoch FROM updated_at) AS ts, payload "
-            "FROM agent_runtime_supervisor_heartbeats"
-        ).fetchall()
+    connection_kwargs = {"timeout": timeout} if timeout is not None else {}
+    with get_pool().connection(**connection_kwargs) as conn:
+        with _local_statement_timeout(conn, statement_timeout_ms):
+            rows = conn.execute(
+                "SELECT owner, host, shard_index, shard_count, max_children, "
+                "       active_children, host_all, gateway, version, "
+                "       extract(epoch FROM updated_at) AS ts, payload "
+                "FROM agent_runtime_supervisor_heartbeats"
+            ).fetchall()
     out = []
     for r in rows:
         # ``pi`` has no promoted column (unlike host_all/gateway) — the supervisor
@@ -477,6 +507,16 @@ def load_user(user_id: str) -> dict | None:
             "SELECT doc FROM users WHERE user_id = %s", (user_id,)
         ).fetchone()
     return row[0] if row else None
+
+
+def get_user_created_at_strict(user_id: str) -> str | None:
+    """Return the authoritative users.created_at text; DB errors propagate."""
+    with get_pool().connection() as conn:
+        row = conn.execute(
+            "SELECT created_at FROM users WHERE user_id=%s",
+            (str(user_id),),
+        ).fetchone()
+    return None if row is None else str(row[0] or "")
 
 
 def find_user_by_api_key_hash(h: str) -> dict | None:
@@ -612,6 +652,14 @@ def normalize_user_cas(
     return read_ok, authoritative
 
 
+def _delete_runtime_allowlist_on_cursor(cur, user_id: str) -> None:
+    """Delete RDS-only runtime routing control in the caller's transaction."""
+    cur.execute(
+        "DELETE FROM v2_user_allowlist WHERE user_id = %s",
+        (user_id,),
+    )
+
+
 def save_all_users(users: list[dict]) -> None:
     """Persist an explicit whole-registry snapshot for tests/offline tooling.
 
@@ -667,6 +715,7 @@ def save_all_users(users: list[dict]) -> None:
                         _mark_chat_r2_inventory_pending_on_cursor(
                             cur, removed_id, advance_generation=True,
                         )
+                        _delete_runtime_allowlist_on_cursor(cur, removed_id)
                         # Preserve the global lifecycle -> users/chat lock order.
                         # A bulk users FOR UPDATE before lifecycle would deadlock
                         # against append/clear, which take the lifecycle fence
@@ -717,6 +766,7 @@ def delete_user(user_id: str) -> bool:
                 _mark_chat_r2_inventory_pending_on_cursor(
                     cur, user_id, advance_generation=True,
                 )
+                _delete_runtime_allowlist_on_cursor(cur, user_id)
                 cur.execute(sql, (user_id,))
     from tee_shadow import mirror
     mirror.execute(sql, (user_id,))
@@ -1232,6 +1282,43 @@ def admin_data_track_snapshot(user_ids: list[str]) -> dict[str, dict]:
             ).fetchall()
             for uid, kind, doc in rows:
                 ensure(out, uid).setdefault("blobs", {})[kind] = doc
+
+            # User MCP: counts only, deliberately NOT added to the whitelist
+            # above. That query returns whole docs, and this blob carries one
+            # encrypted envelope per server (the url + auth headers live inside
+            # it) — counting in SQL keeps every envelope out of the admin
+            # process. The three fields are what triage actually needs:
+            #   - configured_count: did the user save a server at all? (the app's
+            #     connection test is a control-plane probe that succeeds without
+            #     saving anything, so "it tested fine" is not evidence of this);
+            #   - enabled_count: a saved-but-switched-off server still advertises
+            #     a NON-empty fingerprint and materializes cleanly, yet reaches
+            #     the agent as zero servers — indistinguishable from a broken
+            #     apply chain without this number;
+            #   - fingerprint: lines up against the one the consumer applied.
+            rows = conn.execute(
+                """
+                SELECT user_id,
+                       COALESCE(jsonb_array_length(
+                           CASE WHEN jsonb_typeof(doc->'servers') = 'array'
+                                THEN doc->'servers' END), 0) AS configured,
+                       COALESCE((
+                           SELECT COUNT(*) FROM jsonb_array_elements(
+                               CASE WHEN jsonb_typeof(doc->'servers') = 'array'
+                                    THEN doc->'servers' ELSE '[]'::jsonb END) s
+                           WHERE s->>'enabled' = 'true'), 0)::int AS enabled,
+                       COALESCE(doc->>'fingerprint', '') AS fingerprint
+                FROM user_blobs
+                WHERE user_id = ANY(%s) AND kind = 'user_mcp'
+                """,
+                (ids,),
+            ).fetchall()
+            for uid, configured, enabled, fingerprint in rows:
+                ensure(out, uid)["user_mcp"] = {
+                    "configured_count": int(configured),
+                    "enabled_count": int(enabled),
+                    "fingerprint": str(fingerprint or ""),
+                }
 
             rows = conn.execute(
                 """
@@ -4850,6 +4937,40 @@ def set_onboarding_route_strict(user_id: str, doc: dict) -> str | None:
     return active_route_id
 
 
+def delete_onboarding_route_strict(user_id: str) -> bool:
+    """Delete the route selector and enforce its missing-as-resident state.
+
+    This is the exact inverse persistence boundary needed when compensation
+    restores a previously absent ``onboarding_route`` document.  The document
+    deletion and Model API route deactivation share the same advisory lock and
+    transaction as :func:`set_onboarding_route_strict`.
+    """
+    sql = (
+        "DELETE FROM user_blobs "
+        "WHERE user_id = %s AND kind = 'onboarding_route'"
+    )
+    with get_pool().connection() as conn:
+        with conn.transaction():
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT pg_advisory_xact_lock("
+                    "hashtextextended('onboarding-route:' || %s, 0))",
+                    (str(user_id),),
+                )
+                cur.execute(sql, (user_id,))
+                deleted = cur.rowcount > 0
+                cur.execute(
+                    "UPDATE model_api_routes "
+                    "SET is_active = FALSE, updated_at = now() "
+                    "WHERE user_id = %s AND is_active",
+                    (user_id,),
+                )
+    from tee_shadow import mirror
+
+    mirror.execute(sql, (user_id,))
+    return deleted
+
+
 def patch_proactive_settings_strict(
     user_id: str,
     patch: dict,
@@ -5733,7 +5854,8 @@ def list_agent_runtime_enabled_users() -> list[dict]:
                   r.model AS model,
                   c.base_url AS base_url,
                   c.supports_responses AS supports_responses,
-                  COALESCE(r.reasoning_effort, '') AS reasoning_effort
+                  COALESCE(r.reasoning_effort, '') AS reasoning_effort,
+                  r.vision_test_status AS vision_test_status
                 FROM model_api_routes r
                 JOIN model_api_credentials c ON c.id = r.credential_id
                 WHERE r.is_active
@@ -5757,8 +5879,10 @@ def list_agent_runtime_enabled_users() -> list[dict]:
         return [{"user_id": uid, "driver": driver, "provider": provider,
                  "model": model, "base_url": base_url,
                  "supports_responses": bool(supports_responses),
-                 "reasoning_effort": reasoning_effort}
-                for uid, driver, provider, model, base_url, supports_responses, reasoning_effort in rows]
+                 "reasoning_effort": reasoning_effort,
+                 "vision_test_status": str(vision_test_status or "untested")}
+                for uid, driver, provider, model, base_url, supports_responses,
+                reasoning_effort, vision_test_status in rows]
     except Exception as e:
         log.error("[db] list_agent_runtime_enabled_users failed: %s", e)
         return []
@@ -8137,6 +8261,150 @@ def _lock_chat_user_fence_on_cursor(
     )
 
 
+def _lock_voice_call_on_cursor(cur, user_id: str, call_id: str) -> None:
+    cur.execute(
+        "SELECT pg_advisory_xact_lock(hashtextextended("
+        "'voice-call:' || %s || ':' || %s, 0))",
+        (str(user_id), str(call_id)),
+    )
+
+
+def voice_call_status_on_cursor(
+    cur, user_id: str, call_id: str, *, lock: bool = False
+) -> str:
+    """Read a call's durable lifecycle inside an existing transaction."""
+    if lock:
+        _lock_voice_call_on_cursor(cur, user_id, call_id)
+    cur.execute(
+        "SELECT status FROM voice_call_sessions "
+        "WHERE user_id=%s AND call_id=%s" + (" FOR UPDATE" if lock else ""),
+        (str(user_id), str(call_id)),
+    )
+    row = cur.fetchone()
+    if row is None:
+        return ""
+    return str(row["status"] if isinstance(row, dict) else row[0])
+
+
+def voice_call_status(user_id: str, call_id: str) -> str:
+    with get_pool().connection() as conn:
+        with conn.cursor() as cur:
+            return voice_call_status_on_cursor(cur, user_id, call_id)
+
+
+def voice_call_create_active(user_id: str, call_id: str) -> None:
+    """Persist session ownership before its signed gateway token is returned."""
+    with get_pool().connection() as conn:
+        conn.execute(
+            "INSERT INTO voice_call_sessions (user_id,call_id,status) "
+            "VALUES (%s,%s,'active') ON CONFLICT (user_id,call_id) DO NOTHING",
+            (str(user_id), str(call_id)),
+        )
+
+
+def voice_call_cancel(user_id: str, call_id: str, reason: str) -> dict:
+    """Install a cancellation tombstone under the shared chat write fence."""
+    with get_pool().connection() as conn:
+        with conn.transaction():
+            with conn.cursor() as cur:
+                _lock_chat_user_fence_on_cursor(cur, user_id)
+                _lock_voice_call_on_cursor(cur, user_id, call_id)
+                cur.execute(
+                    "SELECT status,cancel_reason FROM voice_call_sessions "
+                    "WHERE user_id=%s AND call_id=%s FOR UPDATE",
+                    (str(user_id), str(call_id)),
+                )
+                row = cur.fetchone()
+                if row is None:
+                    cur.execute(
+                        "INSERT INTO voice_call_sessions "
+                        "(user_id,call_id,status,cancel_reason,ended_at) "
+                        "VALUES (%s,%s,'cancelled',%s,now())",
+                        (str(user_id), str(call_id), str(reason)),
+                    )
+                    return {"status": "cancelled", "replayed": False}
+                status = str(row["status"] if isinstance(row, dict) else row[0])
+                if status in {"finalizing", "finalized"}:
+                    return {"status": status, "replayed": True}
+                if status == "cancelled":
+                    return {"status": "cancelled", "replayed": True}
+                cur.execute(
+                    "UPDATE voice_call_sessions SET status='cancelled',"
+                    "cancel_reason=%s,ended_at=now() "
+                    "WHERE user_id=%s AND call_id=%s",
+                    (str(reason), str(user_id), str(call_id)),
+                )
+                return {"status": "cancelled", "replayed": False}
+
+
+def voice_call_begin_finalize(user_id: str, call_id: str) -> dict:
+    """Claim finalize before any archive/card write can race with cancel."""
+    with get_pool().connection() as conn:
+        with conn.transaction():
+            with conn.cursor() as cur:
+                _lock_chat_user_fence_on_cursor(cur, user_id)
+                _lock_voice_call_on_cursor(cur, user_id, call_id)
+                cur.execute(
+                    "SELECT status FROM voice_call_sessions "
+                    "WHERE user_id=%s AND call_id=%s FOR UPDATE",
+                    (str(user_id), str(call_id)),
+                )
+                row = cur.fetchone()
+                if row is None:
+                    cur.execute(
+                        "INSERT INTO voice_call_sessions "
+                        "(user_id,call_id,status) VALUES (%s,%s,'finalizing')",
+                        (str(user_id), str(call_id)),
+                    )
+                    return {"status": "finalizing", "replayed": False}
+                status = str(row["status"] if isinstance(row, dict) else row[0])
+                if status == "cancelled":
+                    return {"status": "cancelled", "replayed": True}
+                if status in {"finalizing", "finalized"}:
+                    return {"status": status, "replayed": True}
+                cur.execute(
+                    "UPDATE voice_call_sessions SET status='finalizing' "
+                    "WHERE user_id=%s AND call_id=%s",
+                    (str(user_id), str(call_id)),
+                )
+                return {"status": "finalizing", "replayed": False}
+
+
+def voice_call_mark_finalized(user_id: str, call_id: str) -> dict:
+    """Finalize without ever reviving a call whose cancel tombstone won."""
+    with get_pool().connection() as conn:
+        with conn.transaction():
+            with conn.cursor() as cur:
+                _lock_chat_user_fence_on_cursor(cur, user_id)
+                _lock_voice_call_on_cursor(cur, user_id, call_id)
+                cur.execute(
+                    "SELECT status FROM voice_call_sessions "
+                    "WHERE user_id=%s AND call_id=%s FOR UPDATE",
+                    (str(user_id), str(call_id)),
+                )
+                row = cur.fetchone()
+                if row is None:
+                    cur.execute(
+                        "INSERT INTO voice_call_sessions "
+                        "(user_id,call_id,status,ended_at) "
+                        "VALUES (%s,%s,'finalized',now())",
+                        (str(user_id), str(call_id)),
+                    )
+                    return {"status": "finalized", "replayed": False}
+                status = str(row["status"] if isinstance(row, dict) else row[0])
+                if status == "cancelled":
+                    return {"status": "cancelled", "replayed": True}
+                if status == "finalized":
+                    return {"status": "finalized", "replayed": True}
+                cur.execute(
+                    "UPDATE voice_call_sessions SET status='finalized',"
+                    "cancel_reason='',ended_at=now() "
+                    "WHERE user_id=%s AND call_id=%s",
+                    (str(user_id), str(call_id)),
+                )
+                return {"status": "finalized", "replayed": False}
+
+
 def _lock_capture_consent_on_cursor(cur, user_id: str) -> None:
     """Serialize proactive Capture consent changes with the effect commit."""
     cur.execute(
@@ -8920,6 +9188,25 @@ class ResidentReplyRejected(RuntimeError):
         super().__init__(self.reason)
 
 
+class VoiceCallReplySuppressed(RuntimeError):
+    """A call ended before an asynchronous assistant reply could commit."""
+
+    def __init__(self, status: str):
+        self.status = str(status)
+        super().__init__(f"voice_call_{self.status}")
+
+
+def _voice_reply_context_on_cursor(cur, user_id: str, parent_doc: dict) -> dict:
+    call_id = str((parent_doc or {}).get("voice_call_id") or "").strip()
+    turn_id = str((parent_doc or {}).get("voice_turn_id") or "").strip()
+    if not call_id or not turn_id:
+        return {}
+    status = voice_call_status_on_cursor(cur, user_id, call_id, lock=True)
+    if status in {"finalizing", "cancelled", "finalized"}:
+        raise VoiceCallReplySuppressed(status)
+    return {"voice_call_id": call_id, "voice_turn_id": turn_id}
+
+
 def _same_reply_envelope(existing_doc, requested_doc) -> bool:
     existing_delivery_id = str(
         (existing_doc or {}).get("resident_delivery_id") or ""
@@ -8935,6 +9222,7 @@ def _same_reply_envelope(existing_doc, requested_doc) -> bool:
         stable_delivery_fields = (
             "id", "role", "source", "visibility", "owner_user_id",
             "content_type", "reply_to_message_id", "resident_delivery_id",
+            "voice_call_id", "voice_turn_id",
         )
         return (
             existing_delivery_id == requested_delivery_id
@@ -8947,6 +9235,7 @@ def _same_reply_envelope(existing_doc, requested_doc) -> bool:
         "id", "role", "source", "v", "body_ct", "nonce",
         "K_user", "K_enclave", "enclave_pk_fpr", "visibility",
         "owner_user_id", "content_type", "reply_to_message_id",
+        "voice_call_id", "voice_turn_id",
     )
     if not isinstance(existing_doc, dict) or not isinstance(requested_doc, dict):
         return False
@@ -9058,6 +9347,14 @@ def chat_append_resident_reply(
                 )
                 if not isinstance(parent_doc, dict) or parent_doc.get("role") != "user":
                     raise ResidentReplyRejected("reply_parent_not_user")
+
+                # The parent is the authoritative correlation source. Copy its
+                # call/turn ids onto the assistant row, and reject a late write
+                # after cancel/finalize while holding the same chat fence used
+                # by the lifecycle transition.
+                reply_doc.update(
+                    _voice_reply_context_on_cursor(cur, user_id, parent_doc)
+                )
 
                 prior_reply_id = str(parent_doc.get("reply_message_id") or "")
                 already_replied = (
@@ -9470,6 +9767,15 @@ def chat_append_effect_with_cursor(
         with conn.transaction():
             with conn.cursor() as cur:
                 _lock_chat_user_fence_on_cursor(cur, user_id)
+                voice_call_id = str(
+                    effect_doc.get("voice_call_id") or ""
+                ).strip()
+                if voice_call_id:
+                    voice_status = voice_call_status_on_cursor(
+                        cur, user_id, voice_call_id, lock=True
+                    )
+                    if voice_status in {"finalizing", "cancelled", "finalized"}:
+                        raise VoiceCallReplySuppressed(voice_status)
                 # Lock/materialize the cursor row before deciding whether a
                 # resident reply raced this V2 turn. If any newly-consumed user
                 # input was answered after V2 assembled its prompt, abort before
@@ -9790,6 +10096,83 @@ class RuntimeControlChangedError(RuntimeError):
     """The hosted-runtime ownership tuple changed before a fenced write."""
 
 
+def _voice_revision_identity(doc: dict) -> tuple[str, str] | None:
+    """Validated non-sensitive grouping key for a current voice revision."""
+    if not isinstance(doc, dict):
+        return None
+    if str(doc.get("role") or "") not in {"user", "human"}:
+        return None
+    if str(doc.get("voice_turn_status") or "") != "current":
+        return None
+    call_id = str(doc.get("voice_call_id") or "").strip()
+    logical_turn_id = str(doc.get("voice_logical_turn_id") or "").strip()
+    if (
+        not call_id
+        or not logical_turn_id
+        or len(call_id) > 96
+        or len(logical_turn_id) > 128
+    ):
+        return None
+    return call_id, logical_turn_id
+
+
+def _supersede_previous_voice_revisions_on_cursor(
+    cur,
+    *,
+    user_id: str,
+    new_msg_id: str,
+    doc: dict,
+) -> list[str]:
+    """Retire older ASR revisions while the chat lifecycle row is locked."""
+    identity = _voice_revision_identity(doc)
+    if identity is None:
+        return []
+    call_id, logical_turn_id = identity
+    fields = {
+        "voice_turn_status": "superseded",
+        "voice_superseded_by": str(new_msg_id),
+    }
+    cur.execute(
+        "UPDATE chat_messages SET doc=doc || %s "
+        "WHERE user_id=%s AND msg_id<>%s "
+        "AND doc->>'role' IN ('user','human') "
+        "AND doc->>'voice_call_id'=%s "
+        "AND COALESCE(NULLIF(doc->>'voice_logical_turn_id',''),"
+        "             doc->>'voice_turn_id','')=%s "
+        "AND COALESCE(doc->>'voice_turn_status','current')<>'superseded' "
+        "RETURNING msg_id",
+        (Jsonb(fields), user_id, new_msg_id, call_id, logical_turn_id),
+    )
+    return [
+        str(row["msg_id"] if isinstance(row, dict) else row[0])
+        for row in cur.fetchall()
+    ]
+
+
+def _mirror_superseded_voice_revisions(
+    user_id: str,
+    superseded_ids: list[str],
+    *,
+    new_msg_id: str,
+) -> None:
+    if not superseded_ids:
+        return
+    from tee_shadow import mirror
+
+    fields = Jsonb({
+        "voice_turn_status": "superseded",
+        "voice_superseded_by": str(new_msg_id),
+    })
+    mirror.execute_many([
+        (
+            "UPDATE chat_messages SET doc=doc || %s "
+            "WHERE user_id=%s AND msg_id=%s",
+            (fields, user_id, msg_id),
+        )
+        for msg_id in superseded_ids
+    ])
+
+
 def chat_append_and_enqueue(
     user_id: str, msg_id: str, ts: float, doc: dict, max_messages: int, lane: str,
     *, reason=None, trace_id=None, expected_generation: int | None = None,
@@ -9859,7 +10242,7 @@ def chat_append_and_enqueue(
             "runtime-control CAS requires expected state, mode, and generation")
     priority = jobs_store.LANE_PRIORITY.get(lane, 0)
 
-    def _attempt() -> tuple[int, int | None, int, bool]:
+    def _attempt() -> tuple[int, int | None, int, bool, list[str]]:
         with get_pool().connection() as conn:
             with conn.transaction():
                 with conn.cursor() as fence_cur:
@@ -9892,6 +10275,12 @@ def chat_append_and_enqueue(
                     ):
                         raise RuntimeControlChangedError(
                             "hosted runtime control changed before enqueue")
+                if _voice_revision_identity(doc) is not None:
+                    # Keep the established runtime-row -> profile-row -> chat
+                    # lifecycle lock order, then serialize distinct revision
+                    # client ids before retiring the prior one.
+                    with conn.cursor() as voice_cur:
+                        _lock_chat_r2_lifecycle_on_cursor(voice_cur, user_id)
                 if client_msg_id is not None:
                     # Length-prefix the user id so concatenation is unambiguous
                     # without a NUL byte (PostgreSQL text rejects U+0000). This
@@ -9911,8 +10300,14 @@ def chat_append_and_enqueue(
                         (user_id, client_msg_id, idempotency_window_sec),
                     ).fetchone()
                     if duplicate is not None:
-                        return int(duplicate[0]), None, 0, False
+                        return int(duplicate[0]), None, 0, False, []
                 with conn.cursor() as mc:
+                    superseded_ids = _supersede_previous_voice_revisions_on_cursor(
+                        mc,
+                        user_id=user_id,
+                        new_msg_id=msg_id,
+                        doc=doc,
+                    )
                     seq, storage_generation = _chat_insert_on_cursor(
                         mc, user_id, msg_id, ts, doc, max_messages,
                         coverage_gated=True,
@@ -9923,14 +10318,19 @@ def chat_append_and_enqueue(
                         priority=priority, deadline_at=None,
                         expected_generation=expected_generation,
                     )
-        return seq, job_id, storage_generation, True
+        return seq, job_id, storage_generation, True, superseded_ids
 
     def _finish(
-        result: tuple[int, int | None, int, bool],
+        result: tuple[int, int | None, int, bool, list[str]],
     ) -> tuple[int, int | None]:
-        seq, job_id, storage_generation, inserted = result
+        seq, job_id, storage_generation, inserted, superseded_ids = result
         if not inserted:
             return seq, None
+        _mirror_superseded_voice_revisions(
+            user_id,
+            superseded_ids,
+            new_msg_id=msg_id,
+        )
         # The primary message+job transaction is already committed. Offload the
         # new row's body without touching any older durable source row.
         _offload_chat_body_after_commit(
@@ -10191,6 +10591,7 @@ def chat_append_idempotent(
 
     row = None
     storage_generation: int | None = None
+    superseded_ids: list[str] = []
     with get_pool().connection() as conn:
         with conn.transaction():
             with conn.cursor() as cur:
@@ -10218,6 +10619,13 @@ def chat_append_idempotent(
                 if row is not None:
                     return row[0], False
 
+                superseded_ids = _supersede_previous_voice_revisions_on_cursor(
+                    cur,
+                    user_id=user_id,
+                    new_msg_id=msg_id,
+                    doc=doc,
+                )
+
                 # Preserve normal msg-id semantics: an envelope-id collision
                 # updates the same row, exactly like chat_append.  Reusing the
                 # shared primitive also pins storage_generation and applies the
@@ -10239,6 +10647,12 @@ def chat_append_idempotent(
 
     if row is None or storage_generation is None:
         raise RuntimeError("chat_idempotent_insert_returned_no_row")
+
+    _mirror_superseded_voice_revisions(
+        user_id,
+        superseded_ids,
+        new_msg_id=msg_id,
+    )
 
     # Only the transaction winner gets here. The shared offload primitive
     # commits an exact-key cleanup guard before PUT and pins every later CAS to
@@ -10395,6 +10809,7 @@ _CHAT_FINALIZE_REPLY_ONCE_SQL = (
     "  WHERE user_id = %s AND msg_id = %s "
     "    AND (doc->>'reply_status') IS DISTINCT FROM 'replied' "
     "    AND COALESCE(doc->>'reply_message_id','') = '' "
+    "    AND COALESCE(doc->>'voice_turn_status','') <> 'superseded' "
     "  RETURNING doc AS parent_doc"
     "), inserted AS ("
     "  INSERT INTO chat_messages (user_id, msg_id, ts, doc) "
@@ -10446,20 +10861,42 @@ def chat_finalize_reply_once(
     mirrors only the parent's plaintext metadata; the encrypted reply remains
     exclusively on the normal decrypting TEE-replicator path.
     """
+    persisted_reply = dict(reply_doc)
+    persisted_reply["reply_to_message_id"] = str(parent_msg_id)
     with get_pool().connection() as conn:
-        row = conn.execute(
-            _CHAT_FINALIZE_REPLY_ONCE_SQL,
-            (
-                Jsonb(replied_fields),
-                user_id,
-                parent_msg_id,
-                user_id,
-                reply_msg_id,
-                reply_ts,
-                Jsonb(reply_doc),
-                user_id,
-            ),
-        ).fetchone()
+        with conn.transaction():
+            with conn.cursor() as cur:
+                _lock_chat_user_fence_on_cursor(cur, user_id)
+                cur.execute(
+                    "SELECT doc FROM chat_messages "
+                    "WHERE user_id=%s AND msg_id=%s FOR UPDATE",
+                    (user_id, parent_msg_id),
+                )
+                parent_row = cur.fetchone()
+                if parent_row is None:
+                    return None
+                parent = (
+                    parent_row["doc"]
+                    if isinstance(parent_row, dict)
+                    else parent_row[0]
+                )
+                persisted_reply.update(
+                    _voice_reply_context_on_cursor(cur, user_id, parent)
+                )
+                cur.execute(
+                    _CHAT_FINALIZE_REPLY_ONCE_SQL,
+                    (
+                        Jsonb(replied_fields),
+                        user_id,
+                        parent_msg_id,
+                        user_id,
+                        reply_msg_id,
+                        reply_ts,
+                        Jsonb(persisted_reply),
+                        user_id,
+                    ),
+                )
+                row = cur.fetchone()
     if row is None:
         return None
     # The encrypted reply row is intentionally NOT mirrored here.  The normal
@@ -10496,12 +10933,30 @@ def chat_finalize_reply_sequence_once(
     with get_pool().connection() as conn:
         with conn.transaction():
             with conn.cursor() as cur:
+                _lock_chat_user_fence_on_cursor(cur, user_id)
                 _lock_chat_r2_lifecycle_on_cursor(cur, user_id)
+                cur.execute(
+                    "SELECT doc FROM chat_messages "
+                    "WHERE user_id=%s AND msg_id=%s FOR UPDATE",
+                    (user_id, parent_msg_id),
+                )
+                source_row = cur.fetchone()
+                if source_row is None:
+                    return None
+                source_doc = (
+                    source_row["doc"]
+                    if isinstance(source_row, dict)
+                    else source_row[0]
+                )
+                voice_context = _voice_reply_context_on_cursor(
+                    cur, user_id, source_doc
+                )
                 cur.execute(
                     "UPDATE chat_messages SET doc = doc || %s "
                     "WHERE user_id = %s AND msg_id = %s "
                     "AND (doc->>'reply_status') IS DISTINCT FROM 'replied' "
                     "AND COALESCE(doc->>'reply_message_id','') = '' "
+                    "AND COALESCE(doc->>'voice_turn_status','') <> 'superseded' "
                     "RETURNING doc",
                     (Jsonb(replied_fields), user_id, parent_msg_id),
                 )
@@ -10510,6 +10965,11 @@ def chat_finalize_reply_sequence_once(
                     return None
                 parent_doc = parent_row[0]
                 for reply_msg_id, reply_ts, reply_doc in replies:
+                    persisted_reply = {
+                        **reply_doc,
+                        "reply_to_message_id": str(parent_msg_id),
+                        **voice_context,
+                    }
                     cur.execute(
                         "INSERT INTO chat_messages (user_id, msg_id, ts, doc) "
                         "VALUES (%s, %s, %s, %s) RETURNING doc",
@@ -10517,7 +10977,7 @@ def chat_finalize_reply_sequence_once(
                             user_id,
                             reply_msg_id,
                             reply_ts,
-                            Jsonb(reply_doc),
+                            Jsonb(persisted_reply),
                         ),
                     )
                     inserted_docs.append(cur.fetchone()[0])
@@ -10645,6 +11105,7 @@ def chat_try_claim_reply(
         # this worker last refreshed. Mirrors _chat_message_claimable.
         "  AND (doc->>'reply_status') IS DISTINCT FROM 'replied' "
         "  AND COALESCE(doc->>'reply_message_id','') = '' "
+        "  AND COALESCE(doc->>'voice_turn_status','') <> 'superseded' "
         f"{unanswered_tail_sql}"
         "  AND ("
         "    COALESCE(doc->>'reply_claimed_by','') = '' "
@@ -11311,11 +11772,13 @@ _ROUTE_COLUMNS = """
     r.id::text, r.credential_id::text, c.provider, r.model, c.label,
     c.api_key_hint, c.base_url, c.supports_responses,
     COALESCE(r.reasoning_effort, ''), r.context_window_tokens,
-    r.is_active, r.is_vision, r.test_status,
+    r.is_active, r.is_vision, r.is_image_generation, r.test_status,
     COALESCE(to_char(r.last_test_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'), ''),
     r.last_test_error, r.vision_test_status,
     COALESCE(to_char(r.last_vision_test_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'), ''),
-    r.last_vision_test_error, r.last_runtime_error, r.last_runtime_error_class,
+    r.last_vision_test_error, r.image_generation_test_status,
+    COALESCE(to_char(r.last_image_generation_test_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'), ''),
+    r.last_image_generation_test_error, r.last_runtime_error, r.last_runtime_error_class,
     COALESCE(to_char(r.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'), ''),
     COALESCE(to_char(r.updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'), '')
 """
@@ -11328,11 +11791,15 @@ def _route_row_to_dict(row: tuple) -> dict:
         "supports_responses": bool(row[7]), "reasoning_effort": row[8],
         "context_window_tokens": int(row[9]) if row[9] is not None else None,
         "is_active": bool(row[10]), "is_vision": bool(row[11]),
-        "test_status": row[12], "last_test_at": row[13], "last_test_error": row[14],
-        "vision_test_status": row[15], "last_vision_test_at": row[16],
-        "last_vision_test_error": row[17], "last_runtime_error": row[18],
-        "last_runtime_error_class": row[19],
-        "created_at": row[20], "updated_at": row[21],
+        "is_image_generation": bool(row[12]),
+        "test_status": row[13], "last_test_at": row[14], "last_test_error": row[15],
+        "vision_test_status": row[16], "last_vision_test_at": row[17],
+        "last_vision_test_error": row[18],
+        "image_generation_test_status": row[19],
+        "last_image_generation_test_at": row[20],
+        "last_image_generation_test_error": row[21],
+        "last_runtime_error": row[22], "last_runtime_error_class": row[23],
+        "created_at": row[24], "updated_at": row[25],
     }
 
 
@@ -11485,6 +11952,9 @@ def model_api_credential_update(user_id: str, credential_id: str, *,
                         "UPDATE model_api_routes SET "
                         "vision_test_status = 'untested', "
                         "last_vision_test_error = '', last_vision_test_at = NULL, "
+                        "image_generation_test_status = 'untested', "
+                        "last_image_generation_test_error = '', "
+                        "last_image_generation_test_at = NULL, "
                         "updated_at = now() "
                         "WHERE user_id = %s AND credential_id = %s",
                         (user_id, credential_id),
@@ -11631,6 +12101,33 @@ def model_api_active_route_version(user_id: str) -> dict | None:
         return None
 
 
+def model_api_active_route_vision_verdict(user_id: str) -> dict | None:
+    """Return the active route's pixel-probe verdict without its key envelope."""
+    try:
+        with get_pool().connection() as conn:
+            row = conn.execute(
+                "SELECT id::text, vision_test_status, "
+                "to_char(updated_at AT TIME ZONE 'UTC',"
+                "  'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') "
+                "FROM model_api_routes WHERE user_id=%s AND is_active",
+                (user_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return {
+            "id": str(row[0]),
+            "vision_test_status": str(row[1] or "untested"),
+            "updated_at": str(row[2] or ""),
+        }
+    except Exception as e:
+        log.error(
+            "[db] model_api_active_route_vision_verdict(%s) failed: %s",
+            user_id,
+            e,
+        )
+        return None
+
+
 def model_api_vision_route(user_id: str) -> dict | None:
     """Return the dedicated vision route with its encrypted credential."""
     try:
@@ -11649,6 +12146,27 @@ def model_api_vision_route(user_id: str) -> dict | None:
         return out
     except Exception as e:
         log.error("[db] model_api_vision_route(%s) failed: %s", user_id, e)
+        return None
+
+
+def model_api_image_generation_route(user_id: str) -> dict | None:
+    """Return the dedicated image-generation route with its encrypted credential."""
+    try:
+        with get_pool().connection() as conn:
+            row = conn.execute(
+                f"SELECT {_ROUTE_COLUMNS}, c.api_key_envelope "
+                "FROM model_api_routes r "
+                "JOIN model_api_credentials c ON c.id = r.credential_id "
+                "WHERE r.user_id = %s AND r.is_image_generation",
+                (user_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        out = _route_row_to_dict(row)
+        out["api_key_envelope"] = row[-1]
+        return out
+    except Exception as e:
+        log.error("[db] model_api_image_generation_route(%s) failed: %s", user_id, e)
         return None
 
 
@@ -11845,6 +12363,81 @@ def model_api_route_clear_vision(user_id: str) -> bool:
         return True
     except Exception as e:
         log.error("[db] model_api_route_clear_vision(%s) failed: %s", user_id, e)
+        return False
+
+
+def model_api_route_set_image_generation(user_id: str, route_id: str) -> bool:
+    """Atomically assign one saved route as the user's image generator."""
+    try:
+        with get_pool().connection() as conn:
+            with conn.transaction():
+                target = conn.execute(
+                    "SELECT 1 FROM model_api_routes "
+                    "WHERE user_id = %s AND id = %s FOR UPDATE",
+                    (user_id, route_id),
+                ).fetchone()
+                if target is None:
+                    return False
+                conn.execute(
+                    "UPDATE model_api_routes SET is_image_generation = FALSE, "
+                    "updated_at = now() WHERE user_id = %s "
+                    "AND is_image_generation AND id != %s",
+                    (user_id, route_id),
+                )
+                cur = conn.execute(
+                    "UPDATE model_api_routes SET is_image_generation = TRUE, "
+                    "updated_at = now() WHERE user_id = %s AND id = %s",
+                    (user_id, route_id),
+                )
+        return cur.rowcount > 0
+    except Exception as e:
+        log.error(
+            "[db] model_api_route_set_image_generation(%s,%s) failed: %s",
+            user_id,
+            route_id,
+            e,
+        )
+        return False
+
+
+def model_api_route_clear_image_generation(user_id: str) -> bool:
+    try:
+        with get_pool().connection() as conn:
+            conn.execute(
+                "UPDATE model_api_routes SET is_image_generation = FALSE, "
+                "updated_at = now() WHERE user_id = %s AND is_image_generation",
+                (user_id,),
+            )
+        return True
+    except Exception as e:
+        log.error("[db] model_api_route_clear_image_generation(%s) failed: %s", user_id, e)
+        return False
+
+
+def model_api_route_mark_image_generation_test(
+    user_id: str,
+    route_id: str,
+    *,
+    status: str,
+    error: str = "",
+) -> bool:
+    try:
+        with get_pool().connection() as conn:
+            cur = conn.execute(
+                "UPDATE model_api_routes SET image_generation_test_status = %s, "
+                "last_image_generation_test_error = %s, "
+                "last_image_generation_test_at = now(), updated_at = now() "
+                "WHERE user_id = %s AND id = %s",
+                (str(status or "untested")[:32], str(error or "")[:240], user_id, route_id),
+            )
+        return cur.rowcount > 0
+    except Exception as e:
+        log.error(
+            "[db] model_api_route_mark_image_generation_test(%s,%s) failed: %s",
+            user_id,
+            route_id,
+            e,
+        )
         return False
 
 
@@ -12339,10 +12932,15 @@ def log_prune_older_than(user_id: str, stream: str, cutoff_epoch: float) -> None
 
 
 def delete_user_data(user_id: str) -> None:
-    """Redundant DB belt: per-user 行现由 delete_user 的 CASCADE 原子清净
-    (0011)。仍被 content/content_core.py 的销号(account/reset)兜底路径调用；
-    删账号主路径不再依赖它做 R2。"""
+    """Redundant DB belt for CASCADE-owned data and explicit RDS controls.
+
+    Most per-user rows are deleted atomically by ``delete_user`` through the
+    0011 foreign keys.  RDS-only control tables without a users FK are listed
+    explicitly here.  Account reset/admin deletion retain this as a best-effort
+    cleanup belt; the authoritative delete path does not rely on it for R2.
+    """
     tables = (
+        "v2_user_allowlist",
         "v2_usage_daily_dimensions",
         "v2_usage_daily_users",
         "v2_conversation_summary_segments",
@@ -12378,6 +12976,7 @@ def delete_user_data(user_id: str) -> None:
     # added upstream after the TEE 19-table baseline; not replicated).
     tee_table_for = {"frame_envelopes": "frames"}
     _no_tee_tables = {
+        "v2_user_allowlist",
         "v2_usage_daily_dimensions",
         "v2_usage_daily_users",
         "v2_conversation_summary_segments",
@@ -12848,6 +13447,44 @@ def upsert_runtime_allowlist(user_id: str, desired: str, *,
             """,
             (user_id, desired, updated_by, note),
         )
+
+
+def get_runtime_allowlist_entry(user_id: str) -> dict | None:
+    with get_pool().connection() as conn:
+        row = conn.execute(
+            "SELECT user_id,desired,updated_by,note "
+            "FROM v2_user_allowlist WHERE user_id=%s",
+            (str(user_id),),
+        ).fetchone()
+    if row is None:
+        return None
+    return {
+        "user_id": str(row[0]),
+        "desired": str(row[1]),
+        "updated_by": str(row[2] or ""),
+        "note": str(row[3] or ""),
+    }
+
+
+def insert_runtime_allowlist_if_absent(
+    user_id: str,
+    desired: str,
+    *,
+    updated_by: str,
+    note: str,
+) -> bool:
+    if desired not in _RUNTIME_ALLOWLIST_DESIRED:
+        raise ValueError(
+            f"desired must be one of {sorted(_RUNTIME_ALLOWLIST_DESIRED)}"
+        )
+    with get_pool().connection() as conn:
+        cur = conn.execute(
+            "INSERT INTO v2_user_allowlist "
+            "(user_id,desired,updated_at,updated_by,note) "
+            "VALUES (%s,%s,now(),%s,%s) ON CONFLICT (user_id) DO NOTHING",
+            (str(user_id), desired, updated_by, note),
+        )
+    return cur.rowcount > 0
 
 
 def delete_runtime_allowlist(user_id: str) -> bool:

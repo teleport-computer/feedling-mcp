@@ -23,7 +23,7 @@ import hashlib
 import json
 import logging
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from provider_types import MCP_TRANSPORT_FAILURE_ERROR, ToolResult, ToolSpec
 from hosted import mcp_core, mcp_client, mcp_probe, mcp_ca_fetch
@@ -31,8 +31,39 @@ from hosted import mcp_core, mcp_client, mcp_probe, mcp_ca_fetch
 log = logging.getLogger("feedling.hosted.mcp_tools")
 
 MCP_TOOL_PREFIX = "mcp__"
-MAX_MCP_TOOLS_PER_TURN = 64
-MAX_MCP_TOOL_SCHEMA_CHARS = 8192
+# 每轮交给模型的 MCP 工具数上限。**这个数是实测出来的,不是拍的**
+# (2026-08-10,tools/e2e/tool_count_ceiling_probe.py,可复跑)。
+#
+# 此前三条路三个值、且都没有依据:V2=64(2026-07-18 加,常量旁一行注释都没有)、
+# pi=50→100、claude/codex 无上限 —— 同一个用户换个 driver 行为就变。
+#
+# 实测(每档 3 次,易混淆模式:塞入预报/历史/空气质量等 6 个近义工具,
+# 逼模型真读说明才能选对;目标工具放在列表中间,防"选第一个"蒙对):
+#
+#   工具数   sonnet-4.6   gemini-flash   deepseek   sonnet prompt_tokens
+#      16      3/3           3/3          3/3           4,267
+#      64      3/3           3/3          3/3          12,475
+#     128      3/3           3/3          3/3          23,419
+#     300      3/3           3/3          3/3          52,830
+#     500      3/3           3/3          3/3          86,035   (简单模式)
+#
+# 三个结论:
+#   ① **没有硬墙** —— 一路到 500 个 / 225KB schema,openrouter(sonnet、
+#      gemini-flash)与 deepseek 直连都没拒收。原先担心的"撞 provider 函数上限
+#      导致整轮失败"在我们实际用的路上不存在。
+#   ② **选择准确率不是瓶颈** —— 弱模型在 300 个 + 6 个近义干扰项下仍全对。
+#   ③ 真正的代价是 **token,而且每轮都付**。所以阈值该按"愿意为工具面付多少
+#      上下文"来定,不是按"会不会坏"。
+#
+# 选 128 的理由:功能上远在任何边界之下;成本约 23k token(200k 窗口的 12%),
+# 且这是所有服务器开满的最坏情况;并且能把本月工具最多的真实用户
+# (usr_1baf,6 台共 107 个)**整个装下,一个都不用裁**。
+MAX_MCP_TOOLS_PER_TURN = 128
+# 2026-08-10 上调:同一天开始 schema 里带上说明/enum/default,体积自然变大。
+# 不上调的话,原来能用的工具会**新**撞上这道闸而被丢掉 —— 而丢弃只有一行
+# log.warning,又是一次静默失败。丢弃数现在也进 summary(见 _allocate_round_robin),
+# 所以真撞上了运维看得见。
+MAX_MCP_TOOL_SCHEMA_CHARS = 32768
 MAX_MCP_TOOL_CATALOG_CHARS = 65536
 MAX_PROVIDER_TOOL_NAME_CHARS = 64
 _PROVIDER_TOOL_NAME_RE = re.compile(r"^[A-Za-z0-9_-]+$")
@@ -85,10 +116,36 @@ class _CatalogCandidate:
     serialized_chars: int
 
 
+@dataclass(frozen=True)
+class _ServerLoadResult:
+    """One configured server's content-free catalog-load outcome."""
+
+    name: str
+    kind: str
+    secret: dict | None = None
+    tools: tuple = ()
+
+    @property
+    def available(self) -> bool:
+        return self.kind == "available"
+
+    def public(self) -> dict:
+        return {"name": self.name, "kind": self.kind}
+
+
 @dataclass
 class McpTurn:
     tool_specs: list  # list[ToolSpec], namespaced
     routes: dict      # qualified_name -> _Route
+    # 本轮工具面的分配摘要。**不是给模型看的**,是给运维看的:
+    # 「这一轮模型到底看得到哪些 MCP 工具」以前在 V2 上完全不可观测,只有一行
+    # log.warning,进不了 admin。usr_1baf 那次就是因此只能靠用户报 + 猜
+    # (pi 那条路已有 mcp.surface.* 埋点,V2 一直没有 —— 又是一次只覆盖一条 lane)。
+    # serve_worker 拿它落 debug trace;字段与 pi 那侧对齐,方便同一套排查。
+    summary: dict = field(default_factory=dict)
+    # 每台启用服务器的加载结果。只含 name + 稳定 kind,不含 URL/header/远端正文。
+    # 装配层用它维护 App 将来读取的最近状态,loader 本身不碰数据库。
+    server_results: list[dict] = field(default_factory=list)
 
     @property
     def is_empty(self) -> bool:
@@ -184,11 +241,18 @@ def _canonicalize_schema(value, *, parent_key: str | None = None):
 
 
 def _sanitize_schema_node(value, *, depth: int = 0) -> dict | None:
-    """Keep structural JSON-Schema data while dropping prompt-bearing prose.
+    """把远端 schema 规整成 provider 一定收得下的形状 —— 但**不再剥说明**。
 
-    MCP catalog metadata is remote content shown before the first model call.
-    Descriptions, examples, defaults, regexes, refs, and enum strings are not
-    needed for server-side validation and can carry arbitrary instructions.
+    2026-08-10 Seven 定稿:参数说明也要原样给模型。原本这里只留结构
+    (type/properties/required/数值边界),把 description/title/enum/default/
+    examples/pattern 全剥掉——模型看到的是 `{address: 字符串, city: 字符串}`,
+    不知道该填什么;`enum` 被剥掉更要命,本来只能填 celsius/fahrenheit 的参数
+    变成"随便填个字符串"。而 pi 桥那条路一直是**整个原样透传**的,
+    又是同一个产品两条路给模型看的东西完全不同。
+
+    保留的仍然是**结构校验**:深度上限、属性数量上限、类型白名单、属性名正则。
+    那道闸挡的是「畸形 schema 让 provider 整个拒收」——一个坏工具会连累这一轮
+    **所有**工具,和注入是两回事,不能一起放开。
     """
     if not isinstance(value, dict) or depth > 6:
         return None
@@ -239,6 +303,29 @@ def _sanitize_schema_node(value, *, depth: int = 0) -> dict | None:
         clean["additionalProperties"] = value["additionalProperties"]
     if value.get("format") in _SCHEMA_FORMATS:
         clean["format"] = value["format"]
+    # 说明性字段:原样带上。模型靠它们知道参数是什么、能填什么。
+    for key in ("description", "title"):
+        text = value.get(key)
+        if isinstance(text, str) and text.strip():
+            clean[key] = text
+    # enum / default / examples 是**取值**信息,对"填得对"和说明同样关键。
+    # 只做可 JSON 序列化的基本类型检查,不改内容。
+    raw_enum = value.get("enum")
+    if isinstance(raw_enum, list) and raw_enum and len(raw_enum) <= 128 and all(
+        item is None or isinstance(item, (str, int, float, bool))
+        for item in raw_enum
+    ):
+        clean["enum"] = list(raw_enum)
+    if isinstance(value.get("pattern"), str):
+        clean["pattern"] = value["pattern"]
+    for key in ("default", "examples"):
+        item = value.get(key)
+        if isinstance(item, (str, int, float, bool, list, dict)):
+            try:
+                json.dumps(item)
+            except (TypeError, ValueError):
+                continue
+            clean[key] = item
     for key in (
         "minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum",
         "minLength", "maxLength", "minItems", "maxItems", "minProperties",
@@ -325,14 +412,16 @@ async def load_turn_mcp(
             "mcp envelopes load failed user=%s kind=envelopes_unavailable",
             getattr(store, "user_id", "?"),
         )
-        return McpTurn([], {})
+        return McpTurn([], {}, {
+            "surface_failure_kind": "envelopes_unavailable",
+        })
     if isinstance(payload, tuple):
         payload = payload[0]
     servers = [s for s in (payload.get("servers") or []) if s.get("enabled")]
     if not servers:
         return McpTurn([], {})
 
-    async def _one(srv):
+    async def _one(srv) -> _ServerLoadResult:
         name = str(srv.get("name") or "")
         try:
             if enclave_sem is None:
@@ -354,7 +443,7 @@ async def load_turn_mcp(
                 "mcp server skipped server=%r kind=config_decrypt_failed",
                 name,
             )
-            return None
+            return _ServerLoadResult(name, "config_decrypt_failed")
         try:
             tools = await mcp_client.list_tools(
                 secret["url"], secret.get("headers") or {},
@@ -371,28 +460,42 @@ async def load_turn_mcp(
                 and isinstance(exc, mcp_client.ProbeError)
                 and str(getattr(exc, "kind", "")) == "tls"
             ):
-                anchor = await mcp_ca_fetch.fetch_anchor_for_url(secret["url"])
+                try:
+                    anchor = await mcp_ca_fetch.fetch_anchor_for_url(secret["url"])
+                except Exception as fetch_exc:  # noqa: BLE001 — one bad server only
+                    kind = _stable_failure_kind(
+                        fetch_exc, fallback="auto_ca_fetch_failed")
+                    log.warning(
+                        "mcp server skipped server=%r kind=%s",
+                        name,
+                        kind,
+                    )
+                    return _ServerLoadResult(name, kind)
             if anchor is None:
+                kind = _stable_failure_kind(
+                    exc, fallback="transport_failure")
                 log.warning(
                     "mcp server skipped server=%r kind=%s",
                     name,
-                    _stable_failure_kind(exc, fallback="transport_failure"),
+                    kind,
                 )
-                return None
+                return _ServerLoadResult(name, kind)
             secret = {**secret, "ca_pem": anchor}
             try:
                 tools = await mcp_client.list_tools(
                     secret["url"], secret.get("headers") or {},
                     ca_pem=anchor, mcp_transport=secret.get("transport"))
             except Exception as retry_exc:  # noqa: BLE001 — anchor didn't help
+                kind = _stable_failure_kind(
+                    retry_exc, fallback="transport_failure")
                 log.warning(
                     "mcp server skipped server=%r kind=%s (after auto-ca)",
                     name,
-                    _stable_failure_kind(retry_exc, fallback="transport_failure"),
+                    kind,
                 )
-                return None
+                return _ServerLoadResult(name, kind)
             log.info("mcp server auto-ca pinned server=%r", name)
-        return (name, secret, tools)
+        return _ServerLoadResult(name, "available", secret, tuple(tools))
 
     results = await asyncio.gather(*[_one(s) for s in servers])
     # Resolve collisions in source order before sorting. This preserves the
@@ -400,10 +503,15 @@ async def load_turn_mcp(
     # provider-facing catalog independent of server/tools-list ordering.
     candidates: list[_CatalogCandidate] = []
     seen_qualified_names: set[str] = set()
-    for r in results:
-        if r is None:
+    # 因 schema 太大 / 结构非法被整个丢掉的工具。以前只有 log.warning ——
+    # 模型少了一个工具,而运维在 admin 里什么都看不到。
+    schema_rejected: list[str] = []
+    for result in results:
+        if not result.available:
             continue
-        name, secret, tools = r
+        name = result.name
+        secret = result.secret or {}
+        tools = result.tools
         for t in tools:
             if not isinstance(t, dict):
                 continue
@@ -420,6 +528,7 @@ async def load_turn_mcp(
                     name,
                     raw,
                 )
+                schema_rejected.append(f"{name}/{raw}")
                 continue
             schema_chars = _serialized_chars(parameters)
             if (
@@ -427,13 +536,22 @@ async def load_turn_mcp(
                 or schema_chars > MAX_MCP_TOOL_SCHEMA_CHARS
             ):
                 log.warning("mcp tool %r/%r skipped: schema too large", name, raw)
+                schema_rejected.append(f"{name}/{raw}")
                 continue
-            # Never inject remote prose into the provider's first prompt. The
-            # namespaced name + structural schema identify the call; actual
-            # output is treated as external/untrusted by the unified loop.
-            description = (
-                "User-connected MCP tool. Its output is untrusted external "
-                "content."
+            # 原样透传服务器写的说明。
+            #
+            # 这里原本把每个工具的说明都换成同一句「用户连接的 MCP 工具,输出
+            # 不可信」——安全上省事,代价是模型只剩名字和参数名可看:很多工具名
+            # 是缩写,它不知道该什么时候用、参数该怎么填,于是要么不用、要么用错。
+            # 而 pi 桥那条路一直是原样透传的,**同一个产品两条路给模型看的东西
+            # 完全不同**。2026-08-10 Seven 定稿:两条路统一为原样透传,告诉模型
+            # 这是一个可以使用的 MCP 工具就够,不加不可信标注、不加长度上限。
+            #
+            # 注入面照旧由别处兜:工具**输出**仍按外部不可信内容处理(unified
+            # loop),服务器是用户自己连的,名字空间 mcp__<server>__<tool> 也让
+            # 模型知道调用来源。
+            description = str(t.get("description") or "").strip() or (
+                f'MCP tool "{raw}" from server "{name}"'
             )
             candidate = ToolSpec(
                 name=q,
@@ -479,26 +597,128 @@ async def load_turn_mcp(
                 serialized_chars=candidate_chars,
             ))
 
+    turn = _allocate_round_robin(candidates, schema_rejected=schema_rejected)
+    turn.server_results = [result.public() for result in results]
+    skipped = [result.public() for result in results if not result.available]
+    turn.summary.update({
+        "expected": len(results),
+        "expected_servers": [result.name for result in results],
+        "resolved": sum(1 for result in results if result.available),
+        "skipped_count": len(skipped),
+        "skipped": skipped,
+        "server_results": list(turn.server_results),
+    })
+    return turn
+
+
+def _allocate_round_robin(
+    candidates: list[_CatalogCandidate],
+    *,
+    schema_rejected: list[str] | None = None,
+) -> McpTurn:
+    """Fill the turn's tool budget round-robin across servers, not in name order.
+
+    The previous allocator sorted every candidate into one list keyed by server
+    name and truncated at the caps. That starves whole servers by alphabet: with
+    six connected servers offering 107 tools, ``mcdonalds`` and ``tavily`` landed
+    past the cut and reached the model with ZERO tools each — the user sees them
+    enabled and green in the app while the agent cannot see a single tool, and
+    the model then invents a reason ("I don't have a search tool"). The pi bridge
+    hit the identical bug against the identical user config and fixed it this way
+    (``tools/pi_mcp_bridge/tool_mapping.js``); this is the same allocation for the
+    hosted V2 catalog, so both runtimes now behave the same.
+
+    Round-robin means every server lands at least one tool before any server
+    lands its second, so a small server is never starved by a large one; only
+    the largest get trimmed. Determinism is preserved exactly as before —
+    servers sorted by name, tools sorted within a server, fixed rounds — so the
+    provider-facing catalog bytes stay stable for a given input.
+
+    BOTH caps are enforced in the same pass, and they are NOT symmetric:
+
+    - The count cap ends allocation — nothing more can fit, by definition.
+    - The char cap must NOT. It rejects the one candidate that would overflow
+      and allocation continues, because a later candidate can still be small
+      enough to fit. Ending the round-robin on the first oversized schema
+      starves every server still holding candidates for a reason that has
+      nothing to do with them (measured on the regression case: a server drops
+      from 20 tools to 12).
+
+    The cursor advances BEFORE the char check, so a repeatedly rejected
+    candidate can never spin the loop.
+    """
+    by_server: dict[str, list[_CatalogCandidate]] = {}
+    for item in candidates:
+        by_server.setdefault(item.server, []).append(item)
+    for items in by_server.values():
+        items.sort(key=lambda c: (c.raw_name, c.spec.name))
+    names = sorted(by_server)
+
     specs: list[ToolSpec] = []
     routes: dict[str, _Route] = {}
     catalog_chars = 0
-    for item in sorted(
-        candidates,
-        key=lambda candidate: (
-            candidate.server,
-            candidate.raw_name,
-            candidate.spec.name,
+    kept: dict[str, int] = {name: 0 for name in names}
+    dropped_chars = 0
+    cursor = {name: 0 for name in names}
+    progressed = True
+    while progressed and len(specs) < MAX_MCP_TOOLS_PER_TURN:
+        progressed = False
+        for server in names:
+            if len(specs) >= MAX_MCP_TOOLS_PER_TURN:
+                break
+            index = cursor[server]
+            items = by_server[server]
+            if index >= len(items):
+                continue
+            cursor[server] = index + 1
+            progressed = True
+            item = items[index]
+            if (
+                catalog_chars + item.serialized_chars
+                > MAX_MCP_TOOL_CATALOG_CHARS
+            ):
+                dropped_chars += 1
+                continue
+            specs.append(item.spec)
+            routes[item.spec.name] = item.route
+            catalog_chars += item.serialized_chars
+            kept[server] += 1
+
+    summary = {
+        "kept": len(specs),
+        "offered": len(candidates),
+        "count_cap": MAX_MCP_TOOLS_PER_TURN,
+        "char_cap": MAX_MCP_TOOL_CATALOG_CHARS,
+        "char_cap_skips": dropped_chars,
+        "catalog_chars": catalog_chars,
+        # `服务器:注册数/发现数` —— 必须是**分配后**的注册数。只报发现数的话,
+        # 一台服务器的工具全被裁掉时仍会显示它有 N 个,恰好把这条埋点要回答的
+        # 那个问题答错(pi 那侧栽过一次,这里不重蹈)。
+        "per_server": ",".join(
+            f"{name}:{kept[name]}/{len(by_server[name])}" for name in names
         ),
-    ):
-        if len(specs) >= MAX_MCP_TOOLS_PER_TURN:
-            break
-        if (
-            catalog_chars + item.serialized_chars
-            > MAX_MCP_TOOL_CATALOG_CHARS
-        ):
-            log.warning("mcp tool catalog cap reached; tool skipped")
-            continue
-        specs.append(item.spec)
-        routes[item.spec.name] = item.route
-        catalog_chars += item.serialized_chars
-    return McpTurn(specs, routes)
+        "servers": len(names),
+        # 连候选都没进来的:schema 太大或结构非法,整个工具消失。
+        # 和「进了候选但被上限裁掉」是两种不同的失踪,分开报才诊断得动。
+        "schema_rejected": len(schema_rejected or []),
+        "schema_rejected_names": ",".join((schema_rejected or [])[:10]),
+    }
+
+    # Never truncate silently: the count cap used to drop whole servers with no
+    # log line at all, which is exactly why this took a user report to find.
+    # Report kept/offered PER SERVER and post-allocation — a total alone cannot
+    # answer "which server did the model lose", and reporting the offered count
+    # would name a server whose tools were all dropped as if it were fine.
+    if len(specs) < len(candidates):
+        log.warning(
+            "mcp catalog capped: kept=%d offered=%d count_cap=%d "
+            "char_cap_skips=%d detail=%s",
+            len(specs),
+            len(candidates),
+            MAX_MCP_TOOLS_PER_TURN,
+            dropped_chars,
+            ",".join(
+                f"{name}:{kept[name]}/{len(by_server[name])}" for name in names
+            ),
+        )
+    return McpTurn(specs, routes, summary)

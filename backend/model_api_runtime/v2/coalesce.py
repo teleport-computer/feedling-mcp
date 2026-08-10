@@ -150,6 +150,16 @@ def coalesce_pending(
         ):
             if key in m:
                 item[key] = m[key]
+        call_id = str(m.get("voice_call_id") or "").strip()
+        turn_id = str(m.get("voice_turn_id") or "").strip()
+        if (
+            call_id
+            and turn_id
+            and len(call_id) <= 96
+            and len(turn_id) <= 128
+        ):
+            item["voice_call_id"] = call_id
+            item["voice_turn_id"] = turn_id
         if m.get("include_reasoning") is True:
             item["include_reasoning"] = True
         # Preserve the stable database identity whenever the reader supplied

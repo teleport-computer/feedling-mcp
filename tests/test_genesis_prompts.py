@@ -102,4 +102,7 @@ def test_genesis_prompts_use_neutral_rule_when_name_is_unknown():
     system = prompts.fact_write_messages([], user_name="用户")[0]["content"]
 
     assert "优先省略主语" in system
-    assert "确实需要主语时只用中性的「对方」" in system
+    # 2026-08-09:「对方」降为最后一档 —— 有依据就用 他/她(见 user_naming
+    # 的 UNKNOWN_PERSON_LABEL 注释)。
+    assert "判断性别" in system and "用「他」或「她」" in system
+    assert "线索不足以判断，才用中性的「对方」" in system

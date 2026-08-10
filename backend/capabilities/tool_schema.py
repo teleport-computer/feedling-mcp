@@ -19,9 +19,18 @@ from __future__ import annotations
 
 from provider_types import ToolSpec
 from capabilities import registry
+# Card-writing rules live with the memory package (single source of truth shared
+# with the V1 guidance block); only the op names above are V2-specific.
+from memory import prompts_v1
+from perception.agent_fields import (
+    AGENT_PERCEPTION_SIGNALS,
+    AGENT_SIGNAL_FIELDS,
+    FAST_AGENT_PERCEPTION_SIGNALS,
+)
 
 REPLY_TOOL = "reply"
 FILE_REPLY_TOOL = "send_file"
+IMAGE_REPLY_TOOL = "generate_image"
 TASK_TOOL = "task"
 PROVIDER_USAGE_TOOL = "provider_usage"
 MEMORY_ORGANIZE_TOOL = "memory_organize"
@@ -33,6 +42,22 @@ _INT = {"type": "integer"}
 _BOOL = {"type": "boolean"}
 _NO_ARGS: dict = {"type": "object", "properties": {}}
 
+# Keep the provider-visible vocabulary tied to the same projection catalog the
+# capability executor consumes.  A copied enum silently drifts and turns an
+# otherwise healthy perception read into ``unknown_signals`` at runtime.
+_PERCEPTION_SIGNAL_ENUM = list(AGENT_PERCEPTION_SIGNALS)
+_PERCEPTION_FIELD_ENUM = sorted({
+    field
+    for fields in AGENT_SIGNAL_FIELDS.values()
+    for field in fields
+})
+_PERCEPTION_DEFAULTS = ", ".join(FAST_AGENT_PERCEPTION_SIGNALS)
+_PERCEPTION_DOMAINS = (
+    "time/battery, location, weather, motion/focus/audio/app context, "
+    "calendar/reminders, and health/activity data (steps, sleep, workout, "
+    "vitals, activity, body, metabolic, cycle, mood)"
+)
+
 _MEMORY_TOOL_ACTION = {
     "type": "object",
     "properties": {
@@ -40,6 +65,14 @@ _MEMORY_TOOL_ACTION = {
         "summary": _STR,
         "content": _STR,
         "bucket": _STR,
+        # 线索标签。后端(worker 翻译层 + actions)一直在消费它,capture/dream 也产它,
+        # 共享的 MEMORY_WRITE_RULES_V1 还明确教模型「一张卡 1-4 个」——只有这道闸
+        # 拦着,于是 V2 手写的卡标签永远是空的(2026-08-10 真机)。
+        "threads": {"type": "array", "items": _STR},
+        # 这两个直接参与 ambient 排序(memory_readside_core)。schema 不开的话
+        # actions 一律落 0.5/0.3,V2 每张卡权重完全一样。
+        "importance": {"type": "number"},
+        "pulse": {"type": "number"},
         "target_id": _STR,
         "reason": _STR,
     },
@@ -99,10 +132,45 @@ PARAMS: dict[str, dict] = {
     },
     # memory.search(store, ...): params.get("query") (required, non-empty) + optional
     # limit (passed through like index).
+    # memory.search 和 memory.index 走同一个 memory_index_core，那个 core 一直在
+    # 消费 bucket / thread / include_sensitive；index 的 schema 开了这几个、search
+    # 漏了，于是搜索没法限定在某个桶或线索里。V1 的 `memory-index --query` 本来
+    # 能组合这些条件。ambient 刻意不开：search 强制带 query，走 exact-query 分支，
+    # ambient_top_n 不参与候选限制，开了也是哑参数。
     "memory_search": {
         "type": "object",
-        "properties": {"query": _STR, "limit": _INT},
+        "properties": {
+            "query": _STR,
+            "limit": _INT,
+            "bucket": _STR,
+            "thread": _STR,
+            "include_sensitive": _BOOL,
+        },
         "required": ["query"],
+    },
+    # -- history.py (backed by model_api_runtime/v2/history_readside.py) --
+    # history.search(store, ...): params query/start/end/cursor/limit, all
+    # optional at the schema level — "query 与 (start|end) 至少给一个 / 续页只传
+    # cursor" 是跨字段约束，由 facade 以稳定 slug（missing_query_or_time_range
+    # / cursor_mismatch）拒绝，模型可据以自我修正。
+    "history_search": {
+        "type": "object",
+        "properties": {
+            "query": _STR,
+            "start": _STR,
+            "end": _STR,
+            "cursor": _STR,
+            "limit": _INT,
+        },
+        "required": [],
+    },
+    # history.fetch(store, ...): params.get("message_id") (required) +
+    # before/after neighbor counts (each clamped to [0,15]; defaults are
+    # deliberately asymmetric — before 15, after 4, spec §3.2).
+    "history_fetch": {
+        "type": "object",
+        "properties": {"message_id": _STR, "before": _INT, "after": _INT},
+        "required": ["message_id"],
     },
     # memory.fetch(store, ...) -> memory_core.fetch: payload.get("ids") must be a
     # list of non-empty strings.
@@ -143,7 +211,12 @@ PARAMS: dict[str, dict] = {
     # perception.snapshot: params.get("signals") (list or csv string).
     "perception_snapshot": {
         "type": "object",
-        "properties": {"signals": {"type": "array", "items": _STR}},
+        "properties": {
+            "signals": {
+                "type": "array",
+                "items": {"type": "string", "enum": _PERCEPTION_SIGNAL_ENUM},
+            },
+        },
         "required": [],
     },
     # perception.recent_apps: params.get("limit"), params.get("hours").
@@ -155,13 +228,20 @@ PARAMS: dict[str, dict] = {
     # perception.trend: params.get("signal"), params.get("field"), params.get("days").
     "perception_trend": {
         "type": "object",
-        "properties": {"signal": _STR, "field": _STR, "days": _INT},
+        "properties": {
+            "signal": {"type": "string", "enum": _PERCEPTION_SIGNAL_ENUM},
+            "field": {"type": "string", "enum": _PERCEPTION_FIELD_ENUM},
+            "days": _INT,
+        },
         "required": [],
     },
     # perception.history: params.get("signal"), params.get("days").
     "perception_history": {
         "type": "object",
-        "properties": {"signal": _STR, "days": _INT},
+        "properties": {
+            "signal": {"type": "string", "enum": _PERCEPTION_SIGNAL_ENUM},
+            "days": _INT,
+        },
         "required": [],
     },
 
@@ -287,6 +367,11 @@ PARAMS: dict[str, dict] = {
         "properties": {"path": _STR, "revision": _INT},
         "required": ["path", "revision"],
     },
+    IMAGE_REPLY_TOOL: {
+        "type": "object",
+        "properties": {"prompt": _STR},
+        "required": ["prompt"],
+    },
 
     # -- runtime-native provider_usage tool (chat-lane only; see worker.py
     # _SUBAGENT_ALLOWED_TOOLS / _PRIVATE_READ_TOOLS / _run_wake disabled set) --
@@ -318,7 +403,9 @@ DESCRIPTIONS: dict[str, str] = {
                        "and list fields signature, boundaries, do_not_say, "
                        "stable_definitions. Edit a list field by whole-list replacement "
                        "or with op keys add_<field>/remove_<field>/replace_<field> "
-                       "(e.g. add_signature, remove_boundaries). For each list field, "
+                       "(e.g. add_signature, remove_boundaries). One exception: the "
+                       "whole-list replace key for signature is plural — write "
+                       "replace_signatures, NOT replace_signature. For each list field, "
                        "use only one method in a call: whole replacement, add, remove, "
                        "or replace. D4 rename rule: changing agent_name requires "
                        "self_introduction in the same call. To recalibrate how "
@@ -361,6 +448,33 @@ DESCRIPTIONS: dict[str, str] = {
         "trusting the card's summary of it. Paged: pass the returned "
         "next_offset to continue. You do NOT need this for the call that just "
         "ended — its memory was already written from the full transcript."),
+    "history_search": (
+        "Search the user's raw chat history (original message text from ANY "
+        "time period, beyond what is visible in context) by substring query "
+        "and/or RFC3339 time range. Use it when memory tools miss and the "
+        "user asks about the original wording of an earlier conversation. "
+        "First call: give 'query' and/or 'start'/'end' (start inclusive, end "
+        "exclusive, RFC3339 with explicit UTC offset; convert relative times "
+        "like 'last month' yourself). 'limit' 1-5, default 3. Results are in "
+        "scan-priority order, NOT time order. "
+        "三态语义：complete=true 扫完了；complete=false 且有 next_cursor → "
+        "还有可扫的，带 cursor 原样再调；complete=false 无 cursor 且 "
+        "coverage_gap=true → 有历史区间原文已不存在（legacy retention 清理），"
+        "结论不确定，不得回答\"历史里没有\"。"
+        "续页只传 cursor（其余参数必须省略）。unavailable_count counts rows "
+        "that could not be read (neither a hit nor proof of absence). Use "
+        "history_fetch with a returned message_id to read full context."),
+    "history_fetch": (
+        "Fetch ONE full history message by message_id (obtained from "
+        "history_search) together with its neighbors in conversation order: "
+        "'before'/'after' counts 0-15, defaulting to 15 before and 4 after "
+        "(the clue you are after is almost always earlier in the "
+        "conversation). Single window, no paging; anchor appears exactly "
+        "once, before/after are ordered old→new. Messages that did not fit "
+        "the size budget are reported as omitted_before/omitted_after — "
+        "raise nothing, just narrow the window if you need more of each. "
+        "not_found_or_not_visible means the id does not exist or cannot be "
+        "read — do not retry with the same id."),
     "memory_fetch": ("Fetch the most relevant ids chosen from the current index/search "
                      "step, usually 1–3 cards (guidance, not a hard cap). Related cards "
                      "may expand the returned set up to limit; use include_archived or "
@@ -370,8 +484,13 @@ DESCRIPTIONS: dict[str, str] = {
                      "optional 'bucket'), 'update' (supply 'target_id' plus new "
                      "'summary'/'content'), or 'delete' (supply 'target_id'). Each action "
                      "may include an audit 'reason'. Get "
-                     "target_ids from memory_search/memory_index first."),
-    "perception_snapshot": ("Read the latest perception snapshot for the given signals. "
+                     "target_ids from memory_search/memory_index first.\n"
+                     + prompts_v1.MEMORY_WRITE_RULES_V1),
+    "perception_snapshot": ("Read the latest perception snapshot for named signals across "
+                            + _PERCEPTION_DOMAINS + ". "
+                            "If signals is omitted, ONLY the fast defaults are returned: "
+                            + _PERCEPTION_DEFAULTS + ". Health and activity signals are "
+                            "never included by default; request them explicitly by name. "
                             "The app field is only the latest open/close event observed "
                             "within 15 minutes; never claim it is the app currently in use. "
                             "Use perception_recent_apps for an activity trajectory."),
@@ -380,10 +499,15 @@ DESCRIPTIONS: dict[str, str] = {
                                "the time window and check minutes_ago before saying 'just "
                                "now'. apps=[] means no data; disabled=true means access is "
                                "off, not that no apps were used."),
-    "perception_trend": ("Read a trend summary for a perception signal over recent days. "
+    "perception_trend": ("Read a numeric-field trend over recent days for one named signal "
+                         "from " + _PERCEPTION_DOMAINS + ". Snapshot defaults do not apply: "
+                         "always name the signal, and name the field when the signal has "
+                         "multiple numeric fields. "
                          "Interpret the rolling baseline as the usual level and delta as "
                          "the current change from that baseline; do not conflate them."),
-    "perception_history": "Read raw historical values for a perception signal over recent days.",
+    "perception_history": ("Read raw daily historical values over recent days for one named "
+                           "signal from " + _PERCEPTION_DOMAINS + ". Snapshot defaults do "
+                           "not apply: always request the signal explicitly."),
     "screen_recent": "List recent screen-share frame metadata.",
     "screen_read": ("Read a specific screen-share frame, or the latest one if no frame_id "
                     "is given. Start without include_image for caption/OCR. If pixels are "
@@ -436,6 +560,14 @@ DESCRIPTIONS: dict[str, str] = {
         "Do not call this merely because a conversational answer contains a list "
         "or structured text. Host filesystem paths and /artifacts, /skills, or "
         "/memory entries are not accepted."
+    ),
+    IMAGE_REPLY_TOOL: (
+        "Generate and deliver a real image in the chat. Call this whenever the user "
+        "asks you to draw, create, design, or generate an image, illustration, poster, "
+        "avatar, photo, or other visual. Put the complete visual instruction in prompt. "
+        "Never answer such a request with the word 'Image', a Markdown placeholder, a "
+        "fake URL, or a claim that an image was created. This tool either delivers "
+        "validated image bytes or returns a structured configuration failure."
     ),
     PROVIDER_USAGE_TOOL: (
         "查询当前 AI 服务商账户的余额与用量（只读）。仅在用户明确询问余额、用量、"
@@ -596,6 +728,8 @@ def validate_tool_args(name: str, args, *, live_model_call: bool = False) -> str
         type(args.get("revision")) is not int or args["revision"] <= 0
     ):
         return "send_file revision must be a positive integer"
+    if name == IMAGE_REPLY_TOOL and not str(args.get("prompt") or "").strip():
+        return "generate_image requires a non-empty prompt"
     return None
 
 
@@ -609,6 +743,7 @@ def build_tool_specs() -> list[ToolSpec]:
         TASK_TOOL,
         REPLY_TOOL,
         FILE_REPLY_TOOL,
+        IMAGE_REPLY_TOOL,
         PROVIDER_USAGE_TOOL,
         MEMORY_ORGANIZE_TOOL,
     ):

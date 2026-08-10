@@ -59,14 +59,24 @@ def _migration_0075_module():
     )
 
 
-def test_0077_perception_signal_state_is_the_single_installed_head():
+def test_screen_chat_frames_is_the_single_installed_head():
     """A deploy missing the durable baseline migration must fail before rollout."""
     backend = Path(__file__).parent.parent / "backend"
     cfg = Config(str(backend / "alembic.ini"))
     cfg.set_main_option("script_location", str(backend / "alembic"))
     script = ScriptDirectory.from_config(cfg)
 
-    assert script.get_heads() == ["0080_voice_transcripts"]
+    assert script.get_heads() == ["0083_screen_chat_frames"]
+    assert script.get_revision("0083_screen_chat_frames").down_revision == (
+        "0082_merge_image_voice"
+    )
+    assert script.get_revision("0082_merge_image_voice").down_revision == (
+        "0073_image_generation_route",
+        "0081_voice_call_sessions",
+    )
+    assert script.get_revision("0081_voice_call_sessions").down_revision == (
+        "0080_voice_transcripts"
+    )
     head_migration = script.get_revision("0080_voice_transcripts")
     assert head_migration.down_revision == "0079_home_hotpath_indexes"
     idx_migration = script.get_revision("0079_home_hotpath_indexes")
@@ -113,7 +123,7 @@ def test_0077_perception_signal_state_is_the_single_installed_head():
             "AND tc.table_name='perception_signal_state_v2'"
         ).fetchone()
 
-    assert installed_head == ("0080_voice_transcripts",)
+    assert installed_head == ("0083_screen_chat_frames",)
     assert columns == {
         "user_id": ("text", "NO"),
         "signal": ("text", "NO"),
@@ -175,7 +185,7 @@ def test_0075_usage_rollup_schema_is_installed_without_source_backfill():
             "AND tgrelid='v2_turn_metrics'::regclass"
         ).fetchone()[0]
 
-    assert head == ("0080_voice_transcripts",)
+    assert head == ("0083_screen_chat_frames",)
     assert tables == {
         "v2_usage_daily_users",
         "v2_usage_daily_dimensions",
@@ -406,18 +416,28 @@ def test_0075_downgrade_and_replay_is_repeatable():
     try:
         command.downgrade(cfg, "0074_runtime_user_delivery_idx")
         with db.get_pool().connection() as conn:
-            assert conn.execute(
-                "SELECT version_num FROM alembic_version"
-            ).fetchone() == ("0074_runtime_user_delivery_idx",)
+            assert set(
+                conn.execute(
+                    "SELECT version_num FROM alembic_version"
+                ).fetchall()
+            ) == {
+                ("0073_image_generation_route",),
+                ("0074_runtime_user_delivery_idx",),
+            }
             assert conn.execute(
                 "SELECT to_regclass('v2_usage_daily_users')"
             ).fetchone() == (None,)
 
         command.upgrade(cfg, "0075_v2_usage_rollup")
         with db.get_pool().connection() as conn:
-            assert conn.execute(
-                "SELECT version_num FROM alembic_version"
-            ).fetchone() == ("0075_v2_usage_rollup",)
+            assert set(
+                conn.execute(
+                    "SELECT version_num FROM alembic_version"
+                ).fetchall()
+            ) == {
+                ("0073_image_generation_route",),
+                ("0075_v2_usage_rollup",),
+            }
             assert conn.execute(
                 "SELECT to_regclass('v2_usage_daily_users')"
             ).fetchone()[0] is not None
@@ -425,9 +445,14 @@ def test_0075_downgrade_and_replay_is_repeatable():
         command.downgrade(cfg, "0074_runtime_user_delivery_idx")
         command.upgrade(cfg, "0075_v2_usage_rollup")
         with db.get_pool().connection() as conn:
-            assert conn.execute(
-                "SELECT version_num FROM alembic_version"
-            ).fetchone() == ("0075_v2_usage_rollup",)
+            assert set(
+                conn.execute(
+                    "SELECT version_num FROM alembic_version"
+                ).fetchall()
+            ) == {
+                ("0073_image_generation_route",),
+                ("0075_v2_usage_rollup",),
+            }
             assert conn.execute(
                 "SELECT to_regclass('v2_usage_daily_dimensions')"
             ).fetchone()[0] is not None

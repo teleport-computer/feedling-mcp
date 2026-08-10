@@ -181,6 +181,200 @@ def test_chat_tool_callback_emits_safe_result_metadata(monkeypatch):
     assert "secret" not in repr(captured)
 
 
+def test_perception_result_metadata_classifies_values_without_retaining_them():
+    assert activity_metadata.perception_result_metadata(
+        "perception_snapshot",
+        {
+            "ok": True,
+            "data": {"signals": {"steps": {"step_count": 0}}},
+        },
+    ) == {"perception_result_kind": "value"}
+    assert activity_metadata.perception_result_metadata(
+        "perception_snapshot",
+        {
+            "ok": True,
+            "data": {"signals": {
+                "steps": {"step_count": None},
+                "sleep": {"disabled": True, "reason": "private reason"},
+            }},
+        },
+    ) == {"perception_result_kind": "empty"}
+    assert activity_metadata.perception_result_metadata(
+        "perception_history",
+        {"ok": True, "data": {"daily": [{"date": "2026-08-10", "doc": {}}]}},
+    ) == {"perception_result_kind": "empty"}
+    assert activity_metadata.perception_result_metadata(
+        "perception_trend",
+        {"ok": True, "data": {"trend": {"current": 0, "daily": []}}},
+    ) == {"perception_result_kind": "value"}
+    assert activity_metadata.perception_result_metadata(
+        "perception_snapshot",
+        {
+            "ok": False,
+            "error": {"code": "capability_invalid_input", "message": "secret"},
+        },
+    ) == {
+        "perception_result_kind": "error",
+        "perception_error_code": "capability_invalid_input",
+    }
+    assert activity_metadata.perception_result_metadata(
+        "perception_snapshot",
+        {
+            "ok": False,
+            "error": {
+                "code": "capability_invalid_input",
+                "message": "unknown_signals",
+            },
+        },
+    )["perception_error_code"] == "unknown_signals"
+
+
+def test_chat_tool_callback_emits_content_free_v2_debug_trace(monkeypatch):
+    traces = []
+    monkeypatch.setattr(worker.jobs_store, "append_status_event", lambda *_a, **_kw: 1)
+
+    def emit(user_id, event_type, **kwargs):
+        traces.append((user_id, event_type, kwargs))
+
+    callback = worker._make_chat_tool_activity_callback(
+        user_id="usr_trace",
+        job_id=17,
+        attempt_identity=1,
+        recorder=None,
+        effect_evidence_by_call={},
+        emit_debug_trace=emit,
+    )
+    call = ToolCall(
+        id="call-perception",
+        name="perception_snapshot",
+        args={
+            "signals": ["steps", "sleep"],
+            "secret_prompt": "private calendar title",
+        },
+    )
+
+    async def run():
+        await callback(call, "tool_call_started", {})
+        await callback(call, "tool_call_result", {
+            "duration_ms": 12.3456,
+            "result": ToolResult(
+                call_id=call.id,
+                content='{"signals":{"steps":{"step_count":12345},"sleep":{"note":"private"}}}',
+                metadata={"perception_result_kind": "value"},
+            ),
+        })
+
+    asyncio.run(run())
+    assert len(traces) == 1
+    user_id, event_type, kwargs = traces[0]
+    assert user_id == "usr_trace"
+    assert event_type == "agent.tool.call"
+    assert kwargs["status"] == "ok"
+    assert kwargs["dur_ms"] == 12.346
+    assert kwargs["detail"] == {
+        "tool": "perception_snapshot",
+        "args": {"signals": ["steps", "sleep"]},
+        "result_status": "ok",
+        "result_kind": "value",
+        "dur_ms": 12.346,
+    }
+    assert "12345" not in repr(traces)
+    assert "private" not in repr(traces)
+
+
+def test_v2_debug_trace_defaults_snapshot_signals_and_keeps_safe_error_only(monkeypatch):
+    traces = []
+    monkeypatch.setattr(worker.jobs_store, "append_status_event", lambda *_a, **_kw: 1)
+    callback = worker._make_chat_tool_activity_callback(
+        user_id="usr_trace",
+        job_id=18,
+        attempt_identity=1,
+        recorder=None,
+        effect_evidence_by_call={},
+        emit_debug_trace=lambda user_id, event_type, **kwargs: traces.append(kwargs),
+    )
+    call = ToolCall(
+        id="call-default",
+        name="perception_snapshot",
+        args={"query": "very private text"},
+    )
+
+    asyncio.run(callback(call, "tool_call_result", {
+        "duration_ms": 3,
+        "result": ToolResult(
+            call_id=call.id,
+            content="error: capability_invalid_input private details",
+            metadata={
+                "perception_result_kind": "error",
+                "perception_error_code": "capability_invalid_input",
+            },
+        ),
+    }))
+
+    assert traces[0]["detail"] == {
+        "tool": "perception_snapshot",
+        "args": {
+            "signals": ["now", "location", "weather", "motion", "calendar"],
+            "defaulted": True,
+        },
+        "result_status": "err",
+        "result_kind": "error",
+        "dur_ms": 3.0,
+        "error_code": "capability_invalid_input",
+    }
+    assert "private" not in repr(traces)
+
+
+def test_v2_tool_trace_never_promotes_arbitrary_error_tokens_to_codes():
+    private_tokens = (
+        "my_private_notes.txt",
+        "girlfriend_name_liuyu",
+        "dns-failed-internal.corp.example.com",
+    )
+    call = ToolCall(id="call-private-error", name="workspace_read", args={})
+
+    for token in private_tokens:
+        detail = worker._v2_tool_trace_detail(
+            call,
+            event_kind="tool_call_result",
+            result=ToolResult(call_id=call.id, content=f"error: {token}"),
+            duration_ms=1.0,
+        )
+        assert detail["error_code"] == "tool_error"
+        assert token not in repr(detail)
+
+
+def test_chat_tool_callback_survives_trace_projection_failure(monkeypatch):
+    persisted = []
+    emitted = []
+    monkeypatch.setattr(
+        worker.jobs_store,
+        "append_status_event",
+        lambda _user_id, _kind, **kwargs: persisted.append(kwargs["detail"]),
+    )
+    monkeypatch.setattr(
+        worker,
+        "_v2_tool_trace_detail",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("trace bug")),
+    )
+    callback = worker._make_chat_tool_activity_callback(
+        user_id="usr_trace_failure",
+        job_id=19,
+        attempt_identity=1,
+        recorder=None,
+        effect_evidence_by_call={},
+        emit_debug_trace=lambda *_args, **_kwargs: emitted.append(1),
+    )
+    call = ToolCall(id="call-safe", name="perception_snapshot", args={})
+
+    asyncio.run(callback(call, "tool_call_result", {
+        "result": ToolResult(call_id=call.id, content="ok"),
+    }))
+
+    assert persisted[0]["state"] == "success"
+    assert emitted == []
+
+
 def test_chat_tool_callback_keeps_invocation_ids_unique_across_rounds(monkeypatch):
     captured = []
     monkeypatch.setattr(
@@ -330,6 +524,53 @@ def test_result_classifier_never_turns_error_body_into_metadata():
     assert chat_activity.result_code("private customer record") == "ok"
 
 
+def test_image_generation_result_code_is_allowlisted():
+    assert chat_activity.image_generation_result_code(
+        "image_generation_model_required"
+    ) == "image_generation_model_required"
+    assert chat_activity.image_generation_result_code("private_customer_record") == ""
+
+
+def test_chat_tool_callback_keeps_image_generation_failure_code(monkeypatch):
+    captured = []
+    monkeypatch.setattr(
+        worker.jobs_store,
+        "append_status_event",
+        lambda _user_id, _kind, **kwargs: captured.append(kwargs["detail"]),
+    )
+    callback = worker._make_chat_tool_activity_callback(
+        user_id="usr_image_failure",
+        job_id=17,
+        attempt_identity=1,
+        recorder=None,
+        effect_evidence_by_call={},
+    )
+    call = SimpleNamespace(id="call-image", name="generate_image")
+
+    async def run():
+        await callback(call, "tool_call_started", {})
+        await callback(
+            call,
+            "tool_call_result",
+            {
+                "result": ToolResult(
+                    call_id="call-image",
+                    content="error: private provider detail",
+                    metadata={
+                        "image_generation_result_code": (
+                            "image_generation_model_required"
+                        )
+                    },
+                )
+            },
+        )
+
+    asyncio.run(run())
+    assert captured[-1]["state"] == "failure"
+    assert captured[-1]["result_code"] == "image_generation_model_required"
+    assert "private provider detail" not in repr(captured)
+
+
 def _memory_result(*buckets):
     return {
         "ok": True,
@@ -474,6 +715,35 @@ def test_executor_keeps_memory_count_before_provider_result_truncation(monkeypat
         "memory_count": 2,
         "memory_categories": [{"key": "family", "count": 2}],
     }
+
+
+def test_executor_projects_perception_empty_metadata_at_trusted_boundary(monkeypatch):
+    monkeypatch.setattr(
+        executor.cap_registry,
+        "run_capability",
+        lambda *_args, **_kwargs: ok(data={
+            "signals": {"steps": {"step_count": None}},
+        }),
+    )
+
+    async def run():
+        return await executor.dispatch_tool_calls(
+            [ToolCall(
+                id="c-perception",
+                name="perception_snapshot",
+                args={"signals": ["steps"]},
+            )],
+            store=SimpleNamespace(),
+            api_key=None,
+            runtime_token="rt",
+            enclave_sem=asyncio.Semaphore(1),
+            turn_authorization=True,
+            enqueue_write_effect=lambda _tc: None,
+        )
+
+    result = asyncio.run(run())[0]
+    assert "step_count" in result.content
+    assert result.metadata == {"perception_result_kind": "empty"}
 
 
 def test_executor_memory_index_truncation_guides_partition_browsing(monkeypatch):

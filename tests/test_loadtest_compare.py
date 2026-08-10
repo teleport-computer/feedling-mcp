@@ -7,7 +7,7 @@ Two pieces under test:
   2. ``measure_v2_tokens_per_turn`` — drives the real
      ``model_api_runtime.v2.tool_loop.run_tool_loop`` path against a
      MockProvider (scripts/loadtest/mock_provider.py), including a native
-     tool-call round and the reserved tools-disabled final reply.
+  tool-call round and the reserved no-more-tools final reply.
 """
 from __future__ import annotations
 
@@ -126,14 +126,17 @@ def test_measure_v2_tokens_per_turn_matches_mock_usage():
         mean_tokens = measure_v2_tokens_per_turn(
             _FIXTURES, mock_base_url=provider.base_url
         )
-    # Each turn is one tools-enabled function call + one tools-disabled final.
+    # Each turn is one tools-enabled function call + one terminal text call.
     assert mean_tokens == 240.0
     assert provider.request_count == 2 * len(_FIXTURES)
     for tool_request, final_request in zip(
         provider.request_payloads[::2], provider.request_payloads[1::2]
     ):
         assert tool_request["tools"]
-        assert "tools" not in final_request
+        assert [tool["function"]["name"] for tool in final_request["tools"]] == [
+            "memory_search"
+        ]
+        assert final_request["tool_choice"] == "none"
         # The final request replays the provider-native assistant call and its
         # call-id-matched tool observation, not a flattened planner digest.
         assert any(message.get("tool_calls") for message in final_request["messages"])
@@ -214,7 +217,10 @@ def test_multi_round_turn_costs_more_llm_calls_than_single_round():
     assert multi["llm_calls_per_turn"] == 2.0  # native tool call + final text
     assert multi["tokens_per_turn"] > single["tokens_per_turn"]
     assert p.request_payloads[0]["tools"]
-    assert "tools" not in p.request_payloads[1]
+    assert [
+        tool["function"]["name"] for tool in p.request_payloads[1]["tools"]
+    ] == ["memory_search"]
+    assert p.request_payloads[1]["tool_choice"] == "none"
 
 
 def test_main_uses_whole_turn_measurement_and_reports_call_count(capsys):

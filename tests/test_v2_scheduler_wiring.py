@@ -105,28 +105,18 @@ def test_existing_v2_schedule_backfill_is_idempotent(monkeypatch):
         "list_runtime_modes",
         lambda: {"db_action_v2": ["new", "null-heartbeat", "existing"]},
     )
-    monkeypatch.setattr(
-        jobs_store,
-        "get_wake_schedule",
-        lambda uid: (
-            {"user_id": uid, "next_heartbeat_at": 456.0}
-            if uid == "existing"
-            else {"user_id": uid, "next_heartbeat_at": None}
-            if uid == "null-heartbeat"
-            else None
-        ),
-    )
     writes = []
     monkeypatch.setattr(
         jobs_store,
-        "upsert_wake_schedule",
-        lambda uid, **kwargs: writes.append((uid, kwargs)),
+        "seed_missing_wake_clocks",
+        lambda uid, **kwargs: writes.append((uid, kwargs)) or uid != "existing",
     )
 
     assert serve_worker._seed_existing_v2_wake_schedules(now=123.0) == 2
     assert writes == [
-        ("new", {"next_heartbeat_at": 123.0}),
-        ("null-heartbeat", {"next_heartbeat_at": 123.0}),
+        ("new", {"due_at": 123.0}),
+        ("null-heartbeat", {"due_at": 123.0}),
+        ("existing", {"due_at": 123.0}),
     ]
 
 

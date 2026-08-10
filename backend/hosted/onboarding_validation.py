@@ -249,7 +249,8 @@ def _model_api_steps_with_genesis(
             # burned five provider-timeout jobs while being told to update
             # the app.
             genesis_service.genesis_failure_required_text(
-                str(genesis_job.get("error") or "")
+                str(genesis_job.get("error") or ""),
+                ingest=str(metadata.get("ingest") or ""),
             )
             if failed else (
                 "Wait for Genesis to finish reading your onboarding materials."

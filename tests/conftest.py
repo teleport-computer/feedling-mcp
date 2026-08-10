@@ -164,6 +164,7 @@ if not _provisioned:
         "test_v2_status_stream.py",
         "test_v2_dependency_direction.py",
         "test_v2_provider_usage_tool.py",
+        "test_v2_history_tools.py",
         "test_user_mcp_ca_fetch.py",
         "test_user_mcp_ca_fetch_leaf.py",
         "test_identity_value_write_path.py",
@@ -200,6 +201,40 @@ if not _provisioned:
         "test_self_thinking_parse.py",
         # Voice hangup summary prompt builder. Pure — no DB.
         "test_voice_cleanup.py",
+        # History-search 纯逻辑内核（planner/cursor/归一化）。Pure — 只
+        # import model_api_runtime.v2.history_search（零 IO 模块），无 DB。
+        # DB 侧的 test_v2_history_search_store.py 不在此名单。
+        "test_v2_history_search_unit.py",
+        # 生图自主化(2026-08-08)。全部为纯单测:io_cli 的 HTTP 层被 monkeypatch,
+        # resident 回合用 fake call_agent/post_reply 驱动,tool_loop 用脚本化
+        # provider —— 三者都不碰 DB。
+        # ⚠️ 加进来是因为**漏加就等于没跑**:不在这份名单里的文件在无 PG 的机器上
+        # 被 collect_ignore 静默忽略,pytest 不报错、不提示,只是数字对不上。
+        # 我曾据此把「1342 passed」当成绿灯报出去两次,而那里面一条生图测试都没有。
+        "test_io_cli_generate_image.py",
+        "test_resident_image_autonomy.py",
+        "test_image_generation_autonomy.py",
+        # 这两个本来就自带 sys.path 引导、零 DB 引用,只是从来没登记过 ——
+        # 也就是说无 PG 的机器上它们一直没跑。superseded 那条新用例就在
+        # test_v2_tool_loop.py 里,不登记等于白写。
+        "test_v2_tool_loop.py",
+        "test_chat_resident_consumer_image.py",
+        # MCP 工具面可观测性(2026-08-09)。纯:只解析字符串 + 读两个 JS 源文件。
+        "test_user_mcp_surface_trace.py",
+        "test_voice_context_regressions.py",
+        "test_health_executor.py",
+        "test_db_health_timeouts.py",
+        "test_health_route_isolation.py",
+        # 记忆写入规则的 V1/V2 parity(2026-08-10)。纯:只读 memory.prompts_v1 与
+        # capabilities.tool_schema 的常量,不碰 DB。
+        "test_memory_write_guidance_parity.py",
+        # enclave 批量解密的 trace 折叠(2026-08-10)。纯:debug_trace.trace_event
+        # 被 monkeypatch 掉,不碰 DB。
+        "test_enclave_trace_coalescing.py",
+        # 感知工具面可发现性契约(2026-08-10)。纯:只读 schema 常量 + 一个假 store。
+        "test_perception_tool_surface_contract.py",
+        # agent.tool.call 的隐私断言(2026-08-10)。纯:直接调投影函数,不碰 DB。
+        "test_v2_tool_trace_privacy.py",
     }
     collect_ignore = sorted(
         f

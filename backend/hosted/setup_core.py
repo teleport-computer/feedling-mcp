@@ -39,6 +39,7 @@ from memory import service as memory_service
 import provider_client
 from hosted import agent_runtime_cutover
 from hosted import config_store as hosted_config_store
+from hosted import new_user_v2_cohort
 from hosted import turn as hosted_turn
 from hosted import vision_routing
 from hosted import vision_observer
@@ -616,11 +617,12 @@ def _kick_setup_main_vision_test(
 def _vision_config_payload(store) -> dict:
     capability = vision_routing.runtime_capability(store)
     onboarding_route = capability["onboarding_route"]
+    uses_model_api_main = capability["runtime"] in {"v2", "hosted_v1"}
     active = db.model_api_active_route(store.user_id)
     routing_available = bool(capability["available"])
     dedicated = db.model_api_vision_route(store.user_id)
 
-    if onboarding_route == "model_api":
+    if uses_model_api_main:
         main = {
             "source": "model_api",
             "route_id": (active or {}).get("id"),
@@ -658,7 +660,7 @@ def _vision_config_payload(store) -> dict:
         effective_status = dedicated.get("vision_test_status", "untested")
     elif dedicated:
         effective_status = "untested"
-    elif onboarding_route == "model_api":
+    elif uses_model_api_main:
         effective_status = (
             str(active.get("vision_test_status") or "untested")
             if active
@@ -676,9 +678,165 @@ def _vision_config_payload(store) -> dict:
         "dedicated_route": _public_saved_route(dedicated),
         "effective_status": effective_status,
         "test_pending": bool(
-            onboarding_route != "model_api" and resident_runtime.get("pending")
-        ) if onboarding_route != "model_api" else False,
+            not uses_model_api_main and resident_runtime.get("pending")
+        ) if not uses_model_api_main else False,
     }
+
+
+def _image_generation_config_payload(store) -> dict:
+    capability = vision_routing.runtime_capability(store)
+    onboarding_route = capability["onboarding_route"]
+    uses_model_api_main = capability["runtime"] in {"v2", "hosted_v1"}
+    active = db.model_api_active_route(store.user_id)
+    dedicated = db.model_api_image_generation_route(store.user_id)
+    if uses_model_api_main:
+        main = {
+            "source": "model_api",
+            "route_id": (active or {}).get("id"),
+            "provider": (active or {}).get("provider", ""),
+            "model": (active or {}).get("model", ""),
+            "image_generation_test_status": (
+                active.get("image_generation_test_status", "untested")
+                if active
+                else "not_configured"
+            ),
+            "last_image_generation_test_error": (active or {}).get(
+                "last_image_generation_test_error", ""
+            ),
+        }
+        routing_available = True
+        unavailable_reason = ""
+    else:
+        resident_runtime = vision_routing.chat_consumer.consumer_agent_runtime(store)
+        resident_main_supports_image_generation = (
+            vision_routing.chat_consumer.consumer_supports_capability(
+                store,
+                vision_routing.chat_consumer.AGENT_IMAGE_GENERATION_CAPABILITY,
+            )
+        )
+        routing_available = vision_routing.chat_consumer.consumer_supports_capability(
+            store,
+            vision_routing.chat_consumer.IMAGE_GENERATION_CAPABILITY,
+        )
+        unavailable_reason = "" if routing_available else "resident_update_required"
+        main = {
+            "source": "resident",
+            "route_id": None,
+            "provider": resident_runtime.get("provider", ""),
+            "model": resident_runtime.get("model", ""),
+            "image_generation_test_status": (
+                "ok" if resident_main_supports_image_generation else "unsupported"
+            ),
+            "last_image_generation_test_error": (
+                "" if resident_main_supports_image_generation
+                else "image_generation_model_required"
+            ),
+        }
+    mode = "dedicated" if dedicated else "follow_main"
+    if dedicated and routing_available:
+        effective_status = str(
+            dedicated.get("image_generation_test_status") or "untested"
+        )
+    elif dedicated:
+        effective_status = "untested"
+    elif uses_model_api_main:
+        effective_status = str(
+            (active or {}).get("image_generation_test_status") or "untested"
+        )
+    else:
+        effective_status = main["image_generation_test_status"]
+    return {
+        "available": routing_available,
+        "runtime": capability["runtime"],
+        "unavailable_reason": unavailable_reason,
+        "mode": mode,
+        "onboarding_route": onboarding_route,
+        "main_model": main,
+        "dedicated_route": _public_saved_route(dedicated),
+        "effective_status": effective_status,
+    }
+
+
+def _image_generation_error_code(exc: BaseException, *, dedicated: bool) -> str:
+    classified = provider_client.classify_provider_error(exc)
+    raw = str(exc).strip().lower()
+    if classified in {"provider_config", "provider_incompatible"} or raw in {
+        "image_generation_model_unsupported",
+        "image_generation_invalid_output",
+    }:
+        return (
+            "image_generation_model_incompatible"
+            if dedicated
+            else "image_generation_model_required"
+        )
+    return {
+        "auth_invalid": "image_generation_auth_invalid",
+        "quota_insufficient": "image_generation_quota_insufficient",
+        "model_not_found": "image_generation_model_not_found",
+        "rate_limited": "image_generation_rate_limited",
+        "upstream_unavailable": "image_generation_unavailable",
+        "turn_timeout": "image_generation_unavailable",
+    }.get(classified, "image_generation_test_failed")
+
+
+def _test_route_image_generation_or_error(
+    store,
+    route: dict,
+    caller_api_key: str | None,
+):
+    envelope = route.get("api_key_envelope")
+    if not isinstance(envelope, dict):
+        credential = db.model_api_credential_get(store.user_id, route["credential_id"])
+        envelope = (credential or {}).get("api_key_envelope")
+    if not isinstance(envelope, dict):
+        return {"error": "model_api_key_envelope_missing"}, 404
+    try:
+        provider_key = core_enclave._decrypt_envelope_via_enclave(
+            envelope,
+            caller_api_key,
+            purpose="model_api_provider_key",
+        ).decode("utf-8")
+    except Exception:
+        return {"error": "model_api_key_decrypt_failed"}, 400
+
+    config = provider_client.ProviderConfig(
+        str(route.get("provider") or ""),
+        str(route.get("model") or ""),
+        provider_key,
+        str(route.get("base_url") or ""),
+        context_window_tokens=route.get("context_window_tokens"),
+        reasoning_effort=str(route.get("reasoning_effort") or ""),
+    )
+    try:
+        result = provider_client.generate_image(
+            config,
+            "A simple blue circle centered on a plain white background.",
+        )
+        if not isinstance(result.get("media"), list) or not result["media"]:
+            raise provider_client.ProviderError("image_generation_invalid_output")
+    except Exception as exc:  # noqa: BLE001 - stable setup error contract
+        code = _image_generation_error_code(exc, dedicated=True)
+        status = (
+            "unsupported"
+            if code == "image_generation_model_incompatible"
+            else "failed"
+        )
+        if not db.model_api_route_mark_image_generation_test(
+            store.user_id,
+            str(route["id"]),
+            status=status,
+            error=code,
+        ):
+            return {"error": "model_api_route_write_failed"}, 500
+        return {"error": code, "retryable": status != "unsupported"}, 400
+
+    if not db.model_api_route_mark_image_generation_test(
+        store.user_id,
+        str(route["id"]),
+        status="ok",
+    ):
+        return {"error": "model_api_route_write_failed"}, 500
+    return None
 
 
 def _resolve_provider_key(store, raw_key: str, existing: dict | None,
@@ -722,6 +880,19 @@ def _apply_runtime_policy_or_error(store) -> tuple[dict, int] | None:
         print(
             f"[model_api:{store.user_id}] runtime policy apply FAILED "
             f"error={type(exc).__name__}:{str(exc)[:160]}"
+        )
+        return {"error": "runtime_policy_unavailable"}, 503
+    return None
+
+
+def _apply_new_user_v2_default_or_error(store) -> tuple[dict, int] | None:
+    """Converge eligible dual-policy Model API users before setup succeeds."""
+    try:
+        new_user_v2_cohort.apply_default(store)
+    except Exception as exc:  # noqa: BLE001 — control-plane failures fail closed
+        print(
+            f"[new-user-v2:{store.user_id}] outcome=convergence_failed "
+            f"error_type={type(exc).__name__}"
         )
         return {"error": "runtime_policy_unavailable"}, 503
     return None
@@ -904,8 +1075,7 @@ def model_api_setup(store, payload: dict, *, caller_api_key: str | None) -> tupl
             f"[model_api:{store.user_id}] setup FAILED provider={provider} "
             f"model={model} status_code={e.status_code} detail={str(e)[:160]}"
         )
-        return {"error": "provider_test_failed", "detail": str(e),
-                "status_code": e.status_code}, 400
+        return _provider_test_failed_body(e), 400
 
     # `supports_responses` is retired transport metadata: nothing in the backend
     # reads it (not even spawners.consumer_env), and /responses has exactly one
@@ -1015,6 +1185,9 @@ def model_api_setup(store, payload: dict, *, caller_api_key: str | None) -> tupl
     policy_error = _apply_runtime_policy_or_error(store)
     if policy_error is not None:
         return policy_error
+    cohort_error = _apply_new_user_v2_default_or_error(store)
+    if cohort_error is not None:
+        return cohort_error
     accounts_onboarding._save_onboarding_route(store, "model_api")
     print(f"[model_api:{store.user_id}] setup provider={provider} model={model}")
 
@@ -1089,8 +1262,8 @@ def vision_main_test(
     caller_api_key: str | None,
 ) -> tuple[dict, int]:
     """Test the effective main model through one runtime-neutral endpoint."""
-    onboarding_route = accounts_onboarding._load_onboarding_route(store)
-    if onboarding_route == "model_api":
+    capability = vision_routing.runtime_capability(store)
+    if capability["runtime"] in {"v2", "hosted_v1"}:
         route = db.model_api_active_route(store.user_id)
         if not route:
             return {
@@ -1195,7 +1368,10 @@ def vision_config_set(
         route = db.model_api_route_get(store.user_id, route_id) if route_id else None
         if not route:
             return {"error": "route_not_found"}, 404
-    elif accounts_onboarding._load_onboarding_route(store) == "model_api":
+    elif vision_routing.runtime_capability(store)["runtime"] in {
+        "v2",
+        "hosted_v1",
+    }:
         route = db.model_api_active_route(store.user_id)
         if not route:
             return {"error": "model_api_not_configured"}, 404
@@ -1291,6 +1467,192 @@ def vision_route_test(
     }, 200
 
 
+def image_generation_config_get(store) -> tuple[dict, int]:
+    return {"config": _image_generation_config_payload(store)}, 200
+
+
+@_serialized_model_api_mutation
+def image_generation_config_set(
+    store,
+    payload: dict,
+    *,
+    caller_api_key: str | None,
+) -> tuple[dict, int]:
+    mode = str(payload.get("mode") or "").strip().lower()
+    if mode not in {"follow_main", "dedicated"}:
+        return {"error": "invalid_image_generation_mode"}, 400
+
+    if mode == "dedicated":
+        route_id = str(payload.get("route_id") or "").strip()
+        route = db.model_api_route_get(store.user_id, route_id) if route_id else None
+        if not route:
+            return {"error": "route_not_found"}, 404
+    else:
+        route = db.model_api_active_route(store.user_id)
+        if not route:
+            return {"error": "model_api_not_configured"}, 404
+
+    test_error = _test_route_image_generation_or_error(
+        store,
+        route,
+        caller_api_key,
+    )
+    if test_error is not None:
+        return test_error
+
+    changed = (
+        db.model_api_route_set_image_generation(store.user_id, str(route["id"]))
+        if mode == "dedicated"
+        else db.model_api_route_clear_image_generation(store.user_id)
+    )
+    if not changed:
+        return {"error": "model_api_route_write_failed"}, 500
+    return {"config": _image_generation_config_payload(store)}, 200
+
+
+@_serialized_model_api_mutation
+def image_generation_route_configure(
+    store,
+    payload: dict,
+    *,
+    caller_api_key: str | None,
+) -> tuple[dict, int]:
+    route_ids_before = {
+        str(route.get("id") or "")
+        for route in db.model_api_routes_list(store.user_id)
+    }
+    created, status = model_api_route_create.__wrapped__(
+        store,
+        {**payload, "activate": False, "purpose": "image_generation"},
+        caller_api_key=caller_api_key,
+    )
+    if status != 200:
+        return created, status
+    route = created.get("route")
+    if not isinstance(route, dict):
+        return {"error": "model_api_route_write_failed"}, 500
+    selected, selected_status = image_generation_config_set.__wrapped__(
+        store,
+        {"mode": "dedicated", "route_id": route["id"]},
+        caller_api_key=caller_api_key,
+    )
+    route_id = str(route.get("id") or "")
+    if selected_status != 200 and route_id not in route_ids_before:
+        if str(payload.get("credential_id") or "").strip():
+            db.model_api_route_delete(store.user_id, route_id)
+        else:
+            credential_id = str(route.get("credential_id") or "")
+            if credential_id:
+                db.model_api_credential_delete(store.user_id, credential_id)
+    return selected, selected_status
+
+
+@_serialized_model_api_mutation
+def image_generation_route_test(
+    store,
+    route_id: str,
+    *,
+    caller_api_key: str | None,
+) -> tuple[dict, int]:
+    route = db.model_api_route_get(store.user_id, route_id)
+    if not route:
+        return {"error": "route_not_found"}, 404
+    error = _test_route_image_generation_or_error(store, route, caller_api_key)
+    if error is not None:
+        return error
+    return {
+        "status": "ok",
+        "route": _public_saved_route(
+            db.model_api_route_get(store.user_id, route_id)
+        ),
+    }, 200
+
+
+@_serialized_model_api_mutation
+def image_generation_main_test(
+    store,
+    *,
+    caller_api_key: str | None,
+) -> tuple[dict, int]:
+    capability = vision_routing.runtime_capability(store)
+    if capability["runtime"] == "vps":
+        if vision_routing.chat_consumer.consumer_supports_capability(
+            store,
+            vision_routing.chat_consumer.AGENT_IMAGE_GENERATION_CAPABILITY,
+        ):
+            return {"config": _image_generation_config_payload(store)}, 200
+        return {"error": "image_generation_model_required"}, 409
+    route = db.model_api_active_route(store.user_id)
+    if not route:
+        return {"error": "model_api_not_configured"}, 404
+    error = _test_route_image_generation_or_error(store, route, caller_api_key)
+    if error is not None:
+        return error
+    return {"config": _image_generation_config_payload(store)}, 200
+
+
+# provider 回的不是 API 响应而是网页 —— 几乎必然是 base_url 少了结尾的路径段
+# (绝大多数中转站要以 /v1 结尾),不是 key 的问题。
+#
+# 实测的两种形态(2026-08-09,用户报障的两个中转站,base_url 漏填 /v1):
+#   · HTTP 200 + 站点首页 HTML  → chat_completion 抛 "provider returned non-json response"
+#   · HTTP 404 + 错误页 HTML    → "provider_http_404: <!doctype html>..."
+#
+# ⚠️ HTML 本身**不能**单独作为判据(codex2 gatekeep 2026-08-09)。我原以为
+# 「真错误一律 JSON」,但 relay/WAF/计费层完全可能用 HTML 页面返回 401/402/429/5xx
+# —— 本仓 tests/test_catalog_consumer_parity.py:158-161 就存着这样的样本
+# (provider_http_504/402/401/429 + HTML)。把它们一并判成「地址错误」,
+# 会让额度不足、鉴权失败、限流全部指错方向,比原来的错更严重。
+# 所以 HTML 只在 **404** 时才算地址问题:其它状态码即使 body 是网页,
+# 也一定是真实的 provider 语义错误,原样透传。
+_NON_JSON_MARKER = "non-json response"
+_HTML_MARKERS = ("<!doctype", "<html")
+
+# 刻意只给通用方向、不替用户拼出具体地址:有的中转站要 /api/v1、/openai/v1,
+# 猜一个"看起来很确定其实是蒙的"地址,用户照抄仍然不通,反而更迷惑(Seven 2026-08-09 拍板)。
+_WRONG_API_ENDPOINT_HINT = (
+    "这个地址返回的是网页,不是 API 接口响应 —— 通常是接口地址结尾缺少 /v1。"
+    "请补上后重试(不是 API Key 的问题)。 / This address returned a web page, "
+    "not an API response — the endpoint usually needs to end with /v1. "
+    "Fix the address and retry; the API key is not the problem."
+)
+
+
+def _looks_like_wrong_api_endpoint(exc: BaseException) -> bool:
+    """这次失败是不是「地址根本不是 API 端点」而非「key 不对」。
+
+    两条判据都刻意收得很窄(宁可漏判,不可错判 —— 错判会把额度/鉴权/限流
+    说成地址问题):
+      · ``non-json response``:只在 HTTP 已经成功(2xx,过了
+        ``_raise_for_provider_status``)却解析不出 JSON 时抛出,正是
+        「200 + 站点首页」那种形状,与状态码无关;
+      · HTML 页面:**仅当 status_code == 404**。404 网页 = 这个路径不存在;
+        401/402/429/5xx 的 HTML 是 relay 的鉴权/支付/限流/故障页,是真错误。
+    """
+    text = str(exc or "").lower()
+    if _NON_JSON_MARKER in text:
+        return True
+    status = getattr(exc, "status_code", None)
+    return status == 404 and any(marker in text for marker in _HTML_MARKERS)
+
+
+def _provider_test_failed_body(exc: BaseException) -> dict:
+    """provider key 自测失败的统一响应体 —— 四个入口(保存配置 / 手动测试 /
+    加路由 / 改凭证)共用一份判据,否则同一个错误从不同入口进来说法会不一样。
+
+    ⚠️ 判成「地址不是 API 端点」时把 ``status_code`` 清成 ``None``:客户端
+    (FeedlingAPI.providerTestFailureMessage)会把 provider 的 404 映射成
+    「模型不存在」,而这里的 404 来自站点网页而不是模型缺失 —— 带着它回去
+    等于换一句话继续把用户往错方向支。原始错误照常写进 route.test_error,
+    排查不受影响。"""
+    if _looks_like_wrong_api_endpoint(exc):
+        return {"error": "provider_test_failed",
+                "detail": _WRONG_API_ENDPOINT_HINT,
+                "status_code": None}
+    return {"error": "provider_test_failed", "detail": str(exc),
+            "status_code": getattr(exc, "status_code", None)}
+
+
 def _test_active_route(store, route: dict, api_key: str | None) -> tuple[dict, int] | None:
     """Decrypt the active route's envelope via the enclave and test the provider key,
     writing the ok/failed result back to the route row. Returns ``None`` on success
@@ -1345,8 +1707,7 @@ def _test_active_route(store, route: dict, api_key: str | None) -> tuple[dict, i
         # 'failed' — a latent staleness, not a lie told to this caller.
         db.model_api_route_mark_test(store.user_id, route["id"], status="failed",
                                      error=str(e)[:240])
-        return {"error": "provider_test_failed", "detail": str(e),
-                "status_code": e.status_code}, 400
+        return _provider_test_failed_body(e), 400
     # Must check: returning None here tells model_api_test() "success" -> 200. If
     # this write silently fails, test_status never flips to 'ok', so the route can
     # stay excluded from the agent-runtime roster (which gates on test_status='ok')
@@ -1661,8 +2022,7 @@ def _test_route_or_error(store, route: dict, caller_api_key: str | None):
             f"[model_api:{store.user_id}] route test FAILED provider={route['provider']} "
             f"model={route['model']} status_code={e.status_code} detail={str(e)[:160]}"
         )
-        return {"error": "provider_test_failed", "detail": str(e),
-                "status_code": e.status_code}, 400
+        return _provider_test_failed_body(e), 400
     # Must check: model_api_route_activate() treats a None return here as "test
     # passed" and immediately flips is_active=True. If this write silently fails,
     # test_status never reaches 'ok', so the just-"activated" route is excluded from
@@ -1710,6 +2070,11 @@ def model_api_route_create(store, payload: dict, *, caller_api_key: str | None) 
     raw_key = str(payload.get("api_key") or "").strip()
     credential_id = str(payload.get("credential_id") or "").strip()
     activate = bool(payload.get("activate"))
+    purpose = str(payload.get("purpose") or "conversation").strip().lower()
+    if purpose not in {"conversation", "vision", "image_generation"}:
+        return {"error": "invalid_model_api_purpose"}, 400
+    if purpose == "image_generation" and activate:
+        return {"error": "image_generation_route_cannot_be_chat_active"}, 400
     try:
         reasoning_effort = _normalize_reasoning_effort(payload.get("reasoning_effort"))
     except ValueError as e:
@@ -1748,14 +2113,17 @@ def model_api_route_create(store, payload: dict, *, caller_api_key: str | None) 
         )
         if persisted_route is not None:
             supplied_context_window = persisted_route.get("context_window_tokens")
-    context_window_tokens, frontier_error = _resolve_route_context_window(
-        provider,
-        model,
-        base_url,
-        supplied_context_window,
-    )
-    if frontier_error is not None:
-        return frontier_error
+    if purpose == "image_generation":
+        context_window_tokens = None
+    else:
+        context_window_tokens, frontier_error = _resolve_route_context_window(
+            provider,
+            model,
+            base_url,
+            supplied_context_window,
+        )
+        if frontier_error is not None:
+            return frontier_error
 
     # Tracks whether THIS request minted a new credential row (vs. reusing one via
     # credential_id) — only what we created here gets cleaned up on a later failure;
@@ -1919,6 +2287,10 @@ def model_api_route_activate(store, route_id: str, *, caller_api_key: str | None
     policy_error = _apply_runtime_policy_or_error(store)
     if policy_error is not None:
         return policy_error
+    cohort_error = _apply_new_user_v2_default_or_error(store)
+    if cohort_error is not None:
+        return cohort_error
+    accounts_onboarding._save_onboarding_route(store, "model_api")
     # V2 provider config is pinned once per turn. The fence+restore above bumps
     # its generation around activation, so a turn on the old route can spend
     # provider quota but cannot commit a reply/tool effect after this endpoint
@@ -2079,8 +2451,7 @@ def model_api_credential_patch(store, credential_id: str, payload: dict, *,
             ))
         except provider_client.ProviderError as e:
             # 不落库：旧 key 与旧 test_status 都保持原样，用户不会掉出 roster。
-            return {"error": "provider_test_failed", "detail": str(e),
-                    "status_code": e.status_code}, 400
+            return _provider_test_failed_body(e), 400
 
     active_key_change = bool(
         active and active["credential_id"] == credential_id

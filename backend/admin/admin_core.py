@@ -822,7 +822,7 @@ def set_runtime_mode(user_id: str, mode: str) -> tuple[dict, int]:
             # dormant because every producer is mode-filtered; the reverse order
             # creates a real window where the resident is reaped but no V2 wake
             # schedule exists.
-            jobs_store.upsert_wake_schedule(user_id, next_heartbeat_at=time.time())
+            jobs_store.seed_missing_wake_clocks(user_id, due_at=time.time())
         except Exception as e:  # noqa: BLE001 — do not report a half-ready flip
             return {"error": "v2_schedule_seed_failed", "detail": str(e)[:160]}, 503
     try:
@@ -844,13 +844,18 @@ def get_runtime_mode(user_id: str) -> tuple[dict, int]:
 
 
 def set_runtime_allowlist(user_id: str, desired: str, *, note: str = "") -> tuple[dict, int]:
-    if desired == "remove":
-        removed = db.delete_runtime_allowlist(user_id)
-        return {"user_id": user_id, "removed": removed}, 200
     try:
-        db.upsert_runtime_allowlist(user_id, desired, updated_by="admin", note=note)
+        with db.hosted_runtime_config_mutation_lock(user_id):
+            if desired == "remove":
+                removed = db.delete_runtime_allowlist(user_id)
+                return {"user_id": user_id, "removed": removed}, 200
+            db.upsert_runtime_allowlist(
+                user_id, desired, updated_by="admin", note=note
+            )
     except ValueError as e:
         return {"error": str(e)}, 400
+    except Exception:
+        return {"error": "runtime_control_unavailable"}, 503
     return {"user_id": user_id, "desired": desired}, 200
 
 

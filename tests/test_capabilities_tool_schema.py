@@ -2,6 +2,11 @@ import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 from capabilities import tool_schema, registry
+from perception.agent_fields import (
+    AGENT_PERCEPTION_SIGNALS,
+    AGENT_SIGNAL_FIELDS,
+    FAST_AGENT_PERCEPTION_SIGNALS,
+)
 from provider_types import ToolSpec
 
 
@@ -83,6 +88,40 @@ def test_recent_apps_and_memory_fetch_parity_parameters_are_model_facing():
             "include_superseded": False,
         },
     ) is None
+
+
+def test_perception_tool_schema_exposes_catalog_and_default_boundary():
+    signal_enum = list(AGENT_PERCEPTION_SIGNALS)
+    assert (
+        tool_schema.PARAMS["perception_snapshot"]["properties"]["signals"]
+        ["items"]["enum"]
+        == signal_enum
+    )
+    for name in ("perception_history", "perception_trend"):
+        assert (
+            tool_schema.PARAMS[name]["properties"]["signal"]["enum"]
+            == signal_enum
+        )
+    assert tool_schema.PARAMS["perception_trend"]["properties"]["field"]["enum"] == sorted({
+        field for fields in AGENT_SIGNAL_FIELDS.values() for field in fields
+    })
+
+    snapshot_description = tool_schema.DESCRIPTIONS["perception_snapshot"]
+    assert ", ".join(FAST_AGENT_PERCEPTION_SIGNALS) in snapshot_description
+    assert "Health and activity signals are never included by default" in snapshot_description
+    assert all(
+        signal in snapshot_description
+        for signal in ("steps", "sleep", "vitals", "metabolic", "mood")
+    )
+
+
+def test_perception_enum_rejects_unknown_model_guesses_before_dispatch():
+    assert tool_schema.validate_tool_args(
+        "perception_snapshot", {"signals": ["health"]}
+    ) == "args.signals[0] has unsupported value"
+    assert tool_schema.validate_tool_args(
+        "perception_trend", {"signal": "vitals", "field": "heart_rate"}
+    ) == "args.field has unsupported value"
 
 
 def test_identity_patch_exposes_agent_name_so_a_rename_is_discoverable():
@@ -233,3 +272,48 @@ def test_memory_write_reason_and_relative_wake_are_described_and_valid():
         }]},
     ) is None
     assert "in 2 hours" in specs["schedule_wake"].description
+
+
+def test_memory_search_shares_the_index_filters_it_already_consumes():
+    """memory_search 和 memory_index 共用 memory_index_core,那个 core 一直在消费
+    bucket / thread / include_sensitive —— index 的 schema 开了,search 漏了。
+
+    后果:搜索不能限定在某个桶或某条线索里,只能拿回宽泛结果自己挑。
+    V1 的 `memory-index --query` 本来可以组合这些条件,V2 拆成 search 之后丢了。
+
+    ambient 刻意不开:search 强制带 query,走 exact-query 分支,ambient_top_n
+    不参与候选限制(Codex 2026-08-10 核实),开了也是个哑参数。
+    """
+    spec = next(
+        item for item in tool_schema.build_tool_specs() if item.name == "memory_search"
+    )
+
+    assert set(spec.parameters["properties"]) == {
+        "query", "limit", "bucket", "thread", "include_sensitive"
+    }
+    assert tool_schema.validate_tool_args(
+        "memory_search",
+        {"query": "骑行", "bucket": "爱好", "thread": "自行车", "include_sensitive": True},
+    ) is None
+
+
+def test_identity_patch_description_names_the_irregular_replace_key():
+    """描述教模型 `replace_<field>`,list 字段列的是 "signature"(单数),
+    模型自然推出 `replace_signature` —— 而实现唯一认的是 `replace_signatures`(复数)。
+
+    未知 key 不会报错,会走到 identity/actions.py 的 `changed` 为空分支,
+    返回 200 + noop:true。于是模型以为改成功了,回头告诉用户「签名改好了」,
+    实际什么都没动(Codex 2026-08-10 发现,我读代码确认)。
+
+    这里断言的是描述里**逐字**出现真实 key,而不是去扫描自然语言猜字段名 ——
+    后者会把示例和普通名词误当字段(Codex 明确反对做通用扫描)。
+    """
+    from identity.actions import _LIST_OP_FIELDS
+
+    desc = tool_schema.DESCRIPTIONS["identity_patch"]
+    real_keys = {keys[2] for keys in _LIST_OP_FIELDS.values()}
+    irregular = {k for k in real_keys if not k.startswith("replace_") or k[len("replace_"):] not in _LIST_OP_FIELDS}
+
+    assert "replace_signatures" in irregular, "前提变了:signature 不再是不规则例外"
+    for key in irregular:
+        assert key in desc, f"描述必须逐字点名不规则的 {key},否则模型会按规则推错"
