@@ -30,7 +30,11 @@ async def run(
 ) -> T:
     loop = asyncio.get_running_loop()
     future = loop.run_in_executor(_executor, partial(fn, *args, **kwargs))
-    done, pending = await asyncio.wait({future}, timeout=deadline_seconds)
+    try:
+        done, pending = await asyncio.wait({future}, timeout=deadline_seconds)
+    except asyncio.CancelledError:
+        future.cancel()
+        raise
     if pending:
         future.cancel()
         raise HealthCheckTimeout("health check deadline exceeded") from TimeoutError()

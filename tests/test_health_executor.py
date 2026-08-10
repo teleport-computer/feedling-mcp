@@ -32,26 +32,49 @@ def test_health_executor_limits_concurrency_to_two_workers():
     first_started = threading.Event()
     second_started = threading.Event()
     third_started = threading.Event()
-    release = threading.Event()
+    first_finished = threading.Event()
+    second_finished = threading.Event()
+    first_release = threading.Event()
+    second_release = threading.Event()
+    third_release = threading.Event()
     workers_ready = threading.Barrier(2)
 
-    def blocked(value: str, started: threading.Event) -> str:
+    def blocked(
+        value: str,
+        started: threading.Event,
+        finished: threading.Event,
+        release: threading.Event,
+    ) -> str:
         started.set()
         workers_ready.wait(timeout=1.0)
         release.wait(timeout=1.0)
+        finished.set()
         return value
 
     def third() -> str:
         third_started.set()
+        third_release.wait(timeout=1.0)
         return "third"
 
     async def go():
         tasks = [
             asyncio.create_task(
-                health_executor.run(blocked, "first", first_started)
+                health_executor.run(
+                    blocked,
+                    "first",
+                    first_started,
+                    first_finished,
+                    first_release,
+                )
             ),
             asyncio.create_task(
-                health_executor.run(blocked, "second", second_started)
+                health_executor.run(
+                    blocked,
+                    "second",
+                    second_started,
+                    second_finished,
+                    second_release,
+                )
             ),
             asyncio.create_task(health_executor.run(third)),
         ]
@@ -62,11 +85,62 @@ def test_health_executor_limits_concurrency_to_two_workers():
             )
             assert not third_started.is_set()
 
-            release.set()
+            first_release.set()
+            await asyncio.to_thread(third_started.wait)
+            assert first_finished.is_set()
+            assert not second_finished.is_set()
+
+            second_release.set()
+            third_release.set()
             assert await asyncio.gather(*tasks) == ["first", "second", "third"]
-            assert third_started.is_set()
         finally:
-            release.set()
+            first_release.set()
+            second_release.set()
+            third_release.set()
+
+    asyncio.run(go())
+
+
+def test_health_executor_cancels_queued_callable_when_run_is_cancelled():
+    first_started = threading.Event()
+    second_started = threading.Event()
+    third_started = threading.Event()
+    first_release = threading.Event()
+    second_release = threading.Event()
+
+    def blocked(started: threading.Event, release: threading.Event) -> None:
+        started.set()
+        release.wait(timeout=1.0)
+
+    def queued() -> None:
+        third_started.set()
+
+    async def go():
+        first_task = asyncio.create_task(
+            health_executor.run(blocked, first_started, first_release)
+        )
+        second_task = asyncio.create_task(
+            health_executor.run(blocked, second_started, second_release)
+        )
+        await asyncio.gather(
+            asyncio.to_thread(first_started.wait),
+            asyncio.to_thread(second_started.wait),
+        )
+
+        third_task = asyncio.create_task(health_executor.run(queued))
+        await asyncio.sleep(0)
+        third_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await third_task
+
+        try:
+            first_release.set()
+            second_release.set()
+            await asyncio.gather(first_task, second_task)
+            assert not third_started.is_set()
+        finally:
+            first_release.set()
+            second_release.set()
 
     asyncio.run(go())
 
