@@ -438,6 +438,14 @@ _GENESIS_TOKEN_SCOPE = ["envelope_decrypt", "genesis"]
 _V2_WAKE_OWNER_ID = "hosted_runtime_v2"
 
 _IMAGE_MARKER = "[image]"
+# Provider failures that say "try again later", not "your setup is wrong". Only
+# these keep their own error code when image generation was attempted WITHOUT a
+# configured image route — everything else becomes the actionable
+# `image_generation_model_required`, because in that branch we were generating
+# with the chat model on spec.
+_IMAGE_TRANSIENT_CLASSES = frozenset({
+    "rate_limited", "upstream_unavailable", "turn_timeout", "quota_insufficient",
+})
 _UNAVAILABLE_CHAT_MARKER = "[message unavailable]"
 _USER_ROLES = frozenset({"user", "human"})
 
@@ -2170,11 +2178,30 @@ async def _generate_image_for_chat(
                 provider=str(selected.get("provider") or ""),
             ) from exc
 
+    # Route metadata only — never the prompt, which is user content.
+    _image_route_detail = {
+        "dedicated_route": selected is not None,
+        "provider": str(getattr(config, "provider", "") or ""),
+        "model": str(getattr(config, "model", "") or ""),
+    }
+    _image_store = core_store.get_store(user_id)
+    _emit_v2_debug_trace(
+        _image_store, "agent.image.generate.start", status="ok",
+        summary="image generation started",
+        explain="开始生成图片（记录用的是哪条路由，不含提示词）。",
+        detail=dict(_image_route_detail),
+    )
     try:
         result = await provider_client.generate_image_async(config, prompt)
         media = ProviderResponse.from_result(result).media
         if not media:
             raise provider_client.ProviderError("image_generation_invalid_output")
+        _emit_v2_debug_trace(
+            _image_store, "agent.image.generate.done", status="ok",
+            summary="image generation done",
+            explain="图片生成成功。",
+            detail={**_image_route_detail, "media_count": len(media)},
+        )
     except Exception as exc:  # noqa: BLE001 - stable capability surface
         classified = provider_client.classify_provider_error(exc)
         incompatible = classified in {"provider_config", "provider_incompatible"} or (
@@ -2195,6 +2222,30 @@ async def _generate_image_for_chat(
                 if selected is not None
                 else "image_generation_model_required"
             )
+        elif selected is None and classified not in _IMAGE_TRANSIENT_CLASSES:
+            # No image route configured, so `config` above is the CHAT model and
+            # this attempt was a guess. Whatever the text model happened to answer
+            # with, the one action that helps is the same: add an image model. The
+            # copy for that already exists (notices `image_generation_model_required`
+            # -> "当前模型不能生成图片，请到设置里添加生图模型。") — it just never
+            # reached anyone whose provider did not classify as incompatible.
+            # usr_7001b1df80e2024d (2026-08-10, deepseek-v4-flash via openrouter)
+            # got the generic "模型那边暂时没接上" instead and had no idea what to do.
+            # Transient classes keep their own code: a user whose MAIN model really
+            # can generate images (Gemini-shaped) must not be told to add a model
+            # just because the provider rate-limited them.
+            code = "image_generation_model_required"
+        _emit_v2_debug_trace(
+            _image_store, "agent.image.generate.failed", status="error",
+            summary=f"image generation failed: {code}",
+            explain="图片生成失败，记录归因用的错误码与分类（不含提示词）。",
+            detail={
+                **_image_route_detail,
+                "error_code": code,
+                "classified": classified,
+                "incompatible": incompatible,
+            },
+        )
         if isinstance(route, dict) and route.get("id"):
             await asyncio.to_thread(
                 db.model_api_route_mark_image_generation_test,
@@ -4087,6 +4138,55 @@ def _record_extraction_status(
     )
 
 
+async def _load_mcp_turn_observed(store, **kwargs):
+    """`mcp_tools.load_turn_mcp` + 把本轮工具面写进 admin 可见的 debug trace。
+
+    为什么包在装配层而不是 loader 里:loader 在 `hosted`,worker 是依赖洁净的
+    (不能碰 db/hosted)—— serve_worker 才是既能拿到 loader、又能写诊断的那一层。
+
+    为什么必须有:在此之前 V2 这条路只有一行 `log.warning`,进不了 admin。
+    usr_1baf(2026-08-09)报「MCP 测试连接通过、AI 却说搜不到」时,pi 那条路已经
+    有 mcp.surface.* 埋点、一眼能看到每台注册了几个,**V2 这条什么都没有**,
+    只能靠读代码猜。事件名与 pi 侧刻意保持一致,同一套排查方法两条 lane 通用。
+    """
+    turn = await mcp_tools.load_turn_mcp(store, **kwargs)
+    try:
+        summary = dict(getattr(turn, "summary", None) or {})
+        if summary:
+            dropped = max(0, int(summary.get("offered") or 0)
+                          - int(summary.get("kept") or 0))
+            await asyncio.to_thread(
+                _emit_v2_debug_trace,
+                store,
+                "mcp.surface.resolved",
+                status="error" if dropped else "ok",
+                summary=(f"MCP 工具面 {summary.get('kept')} 个"
+                         + (f",裁掉 {dropped} 个" if dropped else "")),
+                explain=(
+                    f"模型这一轮能看到 {summary.get('kept')} 个 MCP 工具"
+                    + (f";另有 {dropped} 个因超过上限被裁掉 —— 分配是**轮转公平**"
+                       "的(每台各拿一个再拿第二个),裁掉的是工具最多那几台的尾部,"
+                       "每台仍有代表工具。detail.per_server 是「注册数/发现数」"
+                       if dropped else "")
+                ),
+                detail={"driver": "v2", "lane": "chat", **summary},
+            )
+    except Exception as exc:  # noqa: BLE001 — 诊断绝不能影响回合
+        log.warning("[v2.mcp] surface trace failed: %s", type(exc).__name__)
+    return turn
+
+
+def _emit_v2_debug_trace(store, event_type: str, *, status: str,
+                         summary: str, explain: str, detail: dict) -> None:
+    from diagnostics import diagnostics_core
+
+    diagnostics_core.emit_trace_event_payload(store, {"event": {
+        "subsystem": "agent", "type": event_type, "status": status,
+        "summary": summary, "explain": explain, "detail": detail,
+        "actor": "hosted_v2",
+    }})
+
+
 def build_production_deps() -> v2_worker.TurnDeps:
     return v2_worker.TurnDeps(
         read_messages=_read_messages,
@@ -4149,7 +4249,7 @@ def build_production_deps() -> v2_worker.TurnDeps:
         capture_enabled=_capture_enabled_for_user,
         dream_enabled=_dream_enabled_for_user,
         apply_pending_effects=_apply_pending_effects_for_user,
-        load_mcp_turn=mcp_tools.load_turn_mcp,
+        load_mcp_turn=_load_mcp_turn_observed,
         load_workspace_prompt=_load_workspace_prompt,
         load_workspace_file=_load_workspace_file,
         seal_trajectory_payload=_seal_trajectory_payload,

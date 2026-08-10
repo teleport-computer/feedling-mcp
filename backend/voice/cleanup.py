@@ -14,8 +14,13 @@ from __future__ import annotations
 
 import uuid
 
+import logging
+
 import db
+from core import enclave as core_enclave
 from core import envelope as core_envelope
+
+log = logging.getLogger("feedling.voice.cleanup")
 
 
 # Deterministic namespace: a retried finalize derives the SAME summary message
@@ -190,3 +195,49 @@ def delete_call_messages(user_id: str, call_id: str) -> dict:
         "retained_covered": retained_covered,
         "remaining": remaining,
     }
+
+
+def transcript_turns_from_rows(
+    user_id: str, call_id: str, *, runtime_token: str = "",
+) -> list[dict]:
+    """从服务器**自己的**聊天行重建这通电话的 ``{role, text}`` 轮次。
+
+    为什么需要它:归档一直只用客户端 POST 上来的 turns,而客户端那份列表来自
+    ElevenLabs SDK,**落定晚于服务器落库**。用户说完立刻挂断或切后台时,客户端
+    看到的是"空通话"、于是发 cancel,而服务器这边明明已经有真实的一问一答 ——
+    旧实现把那些行直接删掉,**整通电话永久消失**。
+
+    有了这个函数,cancel 不再需要相信客户端的判断:服务器读自己的行就够了。
+
+    解密失败的那一轮用占位符顶上而不是跳过 —— 一通电话里少一句话是静默的
+    信息丢失,而"这里有一轮读不出来"是可见的。
+    """
+    ids = [mid for mid, _seq in call_message_rows(user_id, call_id)]
+    if not ids:
+        return []
+    ordered = sorted(
+        ((mid, db.chat_get_strict(user_id, mid)) for mid in ids),
+        key=lambda pair: int((pair[1] or {}).get("seq") or 0),
+    )
+    turns: list[dict] = []
+    for mid, doc in ordered:
+        if not isinstance(doc, dict):
+            continue
+        raw_role = str(doc.get("role") or "").strip().lower()
+        role = "user" if raw_role in {"user", "human"} else "assistant"
+        text = ""
+        try:
+            text = core_enclave._decrypt_envelope_via_enclave(
+                doc, None, purpose="voice_transcript_capture",
+                runtime_token=runtime_token,
+            ).decode("utf-8").strip()
+        except Exception as exc:  # noqa: BLE001 — 一轮读不出不该丢掉整通
+            log.warning(
+                "[voice.reconstruct] row undecryptable user=%s call=%s msg=%s: %s",
+                str(user_id)[:12], str(call_id)[:24], str(mid)[:16],
+                type(exc).__name__,
+            )
+            text = "（这一轮的内容读不出来）"
+        if text:
+            turns.append({"role": role, "text": text})
+    return turns

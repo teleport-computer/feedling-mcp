@@ -1112,6 +1112,8 @@ def test_admin_route_and_notice_summary_helpers_are_explicit_allowlists(monkeypa
             "provider": "openrouter",
             "model": "vision/model-test",
             "vision_test_status": "unsupported",
+            "image_generation_test_status": "untested",
+            "last_image_generation_test_error": "",
             "last_vision_test_error": "v" * 350,
             "last_vision_test_at": "2026-07-31T19:59:00Z",
             "last_runtime_error_class": "provider_transient",
@@ -1146,10 +1148,17 @@ def test_admin_route_and_notice_summary_helpers_are_explicit_allowlists(monkeypa
     notices = _dt._notice_summaries("usr_test", limit=1)
 
     assert routes == [{
+        # image_generation 与 vision 同性质:状态是枚举、错误是我们自己的错误码
+        # (写入端 mark_image_generation_test(error=code)),都不含用户内容。
+        # 补上它们之前,生图路由在 admin 上渲染成 purpose: []，和"没有任何用途"
+        # 长得一模一样 —— 2026-08-10 查 usr_7001b1df80e2024d 的生图问题时,
+        # 决定整条分支的那个事实恰恰是唯一没被投影的那个。
         "purpose": ["chat", "vision"],
         "provider": "openrouter",
         "model": "vision/model-test",
         "vision_test_status": "unsupported",
+        "image_generation_test_status": "untested",
+        "last_image_generation_test_error": "",
         "last_vision_test_error": "v" * 300,
         "last_vision_test_at": "2026-07-31T19:59:00Z",
         "last_runtime_error_class": "provider_transient",
@@ -1225,6 +1234,8 @@ def test_detail_payload_exposes_content_free_route_errors_and_notice_summaries(c
         "provider": "openrouter",
         "model": "vision/model-test",
         "vision_test_status": "unsupported",
+        "image_generation_test_status": "untested",
+        "last_image_generation_test_error": "",
         "last_vision_test_error": "v" * 300,
         "last_vision_test_at": row["model_api_routes"][0]["last_vision_test_at"],
         "last_runtime_error_class": "provider_transient",
@@ -1236,6 +1247,8 @@ def test_detail_payload_exposes_content_free_route_errors_and_notice_summaries(c
         "provider",
         "model",
         "vision_test_status",
+        "image_generation_test_status",
+        "last_image_generation_test_error",
         "last_vision_test_error",
         "last_vision_test_at",
         "last_runtime_error_class",

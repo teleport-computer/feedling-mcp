@@ -285,6 +285,28 @@ def _voice_error_text(body: dict) -> str:
     return notices_catalog.user_text_for(code)
 
 
+def _empty_call_note(duration_sec: int, reason: str) -> str:
+    """一句内容都没有的通话,归档里留下的那行字。
+
+    Seven 2026-08-10 定稿:**所有通话一律归档**,没聊出内容的也要,写明大致
+    时长和情况就行。以前这种通话是被直接删掉的 —— 用户事后完全无从知道自己
+    那天打过电话,而"遗漏"是这条链上最不能接受的失败。
+    """
+    seconds = max(0, int(duration_sec or 0))
+    if seconds >= 60:
+        span = f"约 {max(1, round(seconds / 60))} 分钟"
+    elif seconds > 0:
+        span = f"{seconds} 秒"
+    else:
+        span = "很短"
+    tail = "（通话未能正常建立）" if reason in {
+        "connect_failed", "fail", "runtime_error",
+    } else ""
+    return (
+        f"（这通电话持续了{span},没有产生可记录的对话内容。{tail}）"
+    )
+
+
 def _streaming_text_response(request_id: str, text: str) -> StreamingResponse:
     # 空文本会退化成一个**零 content 块**的流,ElevenLabs 判协议错误并拆掉整通
     # 电话(见 _VOICE_SILENT_TURN_TEXT)。保证放在这里而不是各调用点:调用点是
@@ -359,6 +381,7 @@ async def cancel_voice_call(
     from core import store as core_store
     import db as _db
     from voice import cleanup as voice_cleanup
+    from voice import transcript_store
 
     payload = (await asgi_http.read_json_silent(request)) or {}
     if not isinstance(payload, dict):
@@ -373,32 +396,93 @@ async def cancel_voice_call(
         or any(not char.isprintable() for char in reason)
     ):
         return JSONResponse({"error": "cancel_reason_required"}, status_code=400)
+    # 归档也需要这两个:时长写进空通话的说明,mid 是那张卡的确定性 id
+    # (与 finalize 同一个命名空间,所以两条路写出来的卡是同一张)。
+    duration_sec = _positive_int(payload.get("duration_sec"))
+    mid = voice_cleanup.transcript_card_message_id(call_id)
 
     user_id = auth.user_id
 
     def _cancel() -> tuple[dict, int]:
-        lifecycle = _db.voice_call_cancel(user_id, call_id, reason)
-        if lifecycle["status"] in {"finalizing", "finalized"}:
-            return {
-                "status": lifecycle["status"],
-                "call_id": call_id,
-                "replayed": True,
-                "deleted": 0,
-                "retained_covered": 0,
-                "remaining": 0,
-            }, 200
-        # ⚠️ 已知风险(2026-08-09,**未修**,待 Seven 定产品语义):
+        # ⚠️ 2026-08-10 起 cancel **不再是「删掉」,而是「用服务器自己有的内容归档」**。
+        #
         # 客户端只按**它自己看到的** SDK 转写列表判空
         # (VoiceCallTerminationPolicy: turns.isEmpty ? .cancel : .finalize),
-        # 而那份列表落定晚于服务端落行。说完立刻挂断/切后台时,服务端可能已有真实
-        # 逐轮行和伴侣的回复,却仍收到 cancel → 这些行被删,整通电话消失。
+        # 而那份列表落定晚于服务端落行:说完立刻挂断/切后台时,服务端明明已经有
+        # 真实的一问一答。旧实现在这里把那些行直接删掉 —— **整通电话永久消失**,
+        # 而且墓碑之后一直 409 挡住任何补救。Seven 定稿:所有通话一律归档,
+        # 一句内容都没有的也归档一条说明,**绝不允许遗漏或删除**。
         #
-        # 我曾加过一道「有行且无归档就只写墓碑、不删行」的守卫,**已撤**:
-        # `voice_call_cancel` 在守卫之前就把状态写成 cancelled,而
-        # `voice_call_begin_finalize` 见到 cancelled 会永远返回 cancelled、
-        # 路由 409 —— 留下的行**永远等不到那个 finalize**,守卫承诺的事做不到
-        # (codex 审出)。正确修法需要一个可恢复的中间态或让客户端改判据,
-        # 属产品语义决定,不在本批。
+        # 所以这里走的是 finalize 的同一把生命周期锁:cancel 只是「finalize,
+        # 但转写由服务端自己重建」。这样也不再需要那个「留着行等后续 finalize」
+        # 的可恢复中间态 —— 归档当场就完成了。
+        lifecycle = _db.voice_call_begin_finalize(user_id, call_id)
+        if lifecycle.get("replayed") and lifecycle["status"] in {
+            "finalizing", "finalized",
+        }:
+            # 只在**别人正占着**时退让。判据是 replayed 而不是光看状态:
+            # begin_finalize 自己抢到时也返回 "finalizing"(replayed=False),
+            # 按状态判的话正在进行的 finalize 会被当成"还没人做",cancel 接着
+            # 归档同一通 —— 双重归档 + 和它抢行。既有用例
+            # test_cancel_route_does_not_clean_when_finalize_already_won 当场抓到。
+            #
+            # ⚠️ status == "cancelled" 故意**不**在这里退:那是旧版本(或一次中途
+            # 崩掉的取消)留下的状态,重放必须继续往下收敛 —— 缺归档就补归档、
+            # 该清的清干净。退让会让那种通话永远停在半成品状态。
+            return {
+                "status": lifecycle["status"], "call_id": call_id,
+                "replayed": True, "deleted": 0,
+                "retained_covered": 0, "remaining": 0,
+            }, 200
+        store = core_store.get_store(user_id)
+        if not transcript_store.exists(user_id, call_id):
+            runtime_token = results.mint_enclave_token(user_id)
+            turns = voice_cleanup.transcript_turns_from_rows(
+                user_id, call_id, runtime_token=runtime_token,
+            )
+            speaker_user, speaker_ai = transcript_store.resolve_speaker_names(
+                store, runtime_token=runtime_token,
+            )
+            text = transcript_store.render_transcript(
+                turns, user_name=speaker_user, ai_name=speaker_ai,
+            )
+            if not text:
+                # 一句话都没有的通话也要归档。留一条说明,而不是当它没发生过:
+                # 用户看到「这通电话没聊出什么」远好于电话凭空消失,而且以后
+                # 也能回答「我那天是不是打过一个电话」。
+                text = _empty_call_note(duration_sec, reason)
+            try:
+                stats = transcript_store.persist(
+                    store, call_id, text,
+                    turn_count=len(turns), duration_sec=duration_sec,
+                    chat_message_id=mid,
+                )
+            except Exception as exc:  # noqa: BLE001 — 归档不成就什么都别动
+                log.warning(
+                    "[voice.cancel] archive failed user=%s call=%s: %s",
+                    user_id[:12], call_id[:24], str(exc)[:160],
+                )
+                return {"error": "voice_transcript_not_archived"}, 502
+            # 卡也要写。只归档不写卡的话,逐轮行删掉之后用户在聊天里**什么都
+            # 看不到** —— 归档是存了,但对用户而言这通电话依然消失了,
+            # 而"遗漏"正是这条链上最不能接受的失败。
+            if _db.chat_get_strict(user_id, mid) is None and (
+                not voice_cleanup.persist_transcript_card(
+                    store, transcript_store.build_preview(text), mid, call_id,
+                    turn_count=stats["turn_count"],
+                    duration_sec=stats["duration_sec"],
+                )
+            ):
+                return {"error": "voice_transcript_card_not_persisted"}, 502
+            log.info(
+                "[voice.cancel] archived-instead-of-deleted user=%s call=%s "
+                "turns=%d reason=%s",
+                user_id[:12], call_id[:24], len(turns), reason[:32],
+            )
+        # 归档 + 卡都落好了,这通电话到此为止是**已归档**,不是"已取消"。
+        # 标成 finalized 而不是 cancelled:后者会让任何补救性 finalize 永远 409,
+        # 而现在已经没有什么需要补救了。
+        _db.voice_call_mark_finalized(user_id, call_id)
         handoff = results.delete_call_state(user_id, call_id)
         cleanup = voice_cleanup.delete_call_messages(user_id, call_id)
         store = core_store.get_store(user_id)

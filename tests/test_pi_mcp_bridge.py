@@ -744,11 +744,17 @@ def test_a_huge_server_cannot_starve_a_small_one():
 
 
 def test_the_reported_users_exact_configuration_keeps_every_server():
-    """她的真实配置(6 台 107 个工具):每台都要有代表工具。"""
+    """她的真实配置(6 台 107 个工具):现在**一台都不用裁**。
+
+    2026-08-10 上限统一到 128(实测得出)之后 107 < 128 —— 真实用户整套完整
+    到达模型。这条原本断言 `mapped == cap`(那时 cap=100,会裁掉 7 个);
+    保留这个用例是为了盯住"真实用户不该撞墙"这件事,所以断言改成全留。
+    """
     servers = [_big("game", 8), _big("gaodemap", 12), _big("gardenforum", 25),
                _big("luckin-coffee", 30), _big("mcdonalds", 28), _big("tavily", 4)]
     out = _harness("mapping", json.dumps(servers))
-    assert len(out["mapped"]) == out["cap"]
+    assert len(out["mapped"]) == 107, "真实用户的工具被裁了"
+    assert out["dropped"] == []
     for name in ("game", "gaodemap", "gardenforum", "luckin-coffee",
                  "mcdonalds", "tavily"):
         assert f"{name}:0/" not in out["per_server"], (

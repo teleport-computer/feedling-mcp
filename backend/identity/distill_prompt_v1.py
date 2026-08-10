@@ -15,6 +15,7 @@ import json
 
 from identity import card_policy
 from identity.user_naming import sanitize_user_name
+from memory.card_text import extract_json_block
 
 # consumer 侧"部分补全"读取现有卡时要保留的字段集(Task 3 使用)。
 #
@@ -167,12 +168,11 @@ def parse_identity_payload(raw: str) -> dict | None:
     Lenient(契约 B):结构问题能修就修 —— dimensions 走 card_policy.sanitize
     (clamp/去重/丢畸形),runtime-label 名字【置空】而不是拒卡,字符串截断、
     列表去空 + 截 12 条。清洗后一个有效字段都不剩才返 None。"""
-    raw = str(raw or "")
-    start, end = raw.find("{"), raw.rfind("}")
-    if start == -1 or end <= start:
+    block = extract_json_block(raw)
+    if not block:
         return None
     try:
-        obj = json.loads(raw[start:end + 1])
+        obj = json.loads(block)
     except Exception:
         return None
     if not isinstance(obj, dict):
