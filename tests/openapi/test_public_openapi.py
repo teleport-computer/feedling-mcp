@@ -686,13 +686,12 @@ def test_runner_health_503_uses_the_aggregate_health_response_contract(
     assert "same shape as the 200 response" in response["description"]
 
 
-def test_health_503_descriptions_cover_bounded_probe_deadlines(
+def test_runner_health_503_description_covers_bounded_probe_deadline(
     operations: dict[tuple[str, str], dict[str, Any]],
 ) -> None:
-    api_description = operations[("get", "/healthz")]["responses"]["503"]["description"]
     runner_description = operations[("get", "/healthz/runner")]["responses"]["503"]["description"]
 
-    assert "three-second health-check deadline" in api_description
+    assert "503" not in operations[("get", "/healthz")]["responses"]
     assert "three-second health-check deadline" in runner_description
 
 

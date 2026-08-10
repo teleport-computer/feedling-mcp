@@ -637,9 +637,16 @@ def test_round_frontier_stops_aggregate_native_transcript_before_provider_call(
             ],
             provider_config=provider_client.ProviderConfig(
                 "custom",
-                "test-150k",
+                "test-160k",
                 "key",
-                context_window_tokens=150_000,
+                # 160K, not a knife-edge window: round 3's prompt is two 65K
+                # exchanges PLUS the real tool catalog. At 150K the catalog had
+                # ~2.4K bytes of slack, so any capability addition flipped
+                # round 3 into "omit atomic tool_schemas" (tools=None => an
+                # early terminal round) instead of the round-4 transcript
+                # exhaustion this test is about. The headroom keeps the tested
+                # boundary the aggregate transcript, not the catalog's size.
+                context_window_tokens=160_000,
             ),
             fold_before_first=True,
             tool_result_char_cap=65_000,

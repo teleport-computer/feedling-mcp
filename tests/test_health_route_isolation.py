@@ -24,36 +24,14 @@ async def _get(path: str):
         return await client.get(path)
 
 
-class _PoolStats:
-    def get_stats(self):
-        return {
-            "pool_size": 6,
-            "pool_available": 5,
-            "requests_waiting": 0,
-            "pool_max": 16,
-        }
-
-
-def test_health_routes_map_dedicated_deadline_to_structured_503(monkeypatch):
+def test_runner_health_maps_dedicated_deadline_to_structured_503(monkeypatch):
     async def exceed_deadline(*_args, **_kwargs):
         raise health_executor.HealthCheckTimeout("test deadline")
 
     monkeypatch.setenv("FEEDLING_EXPECTED_RUNNER_COUNT", "1")
     monkeypatch.setattr(health_executor, "run", exceed_deadline)
 
-    async def go():
-        return await asyncio.gather(_get("/healthz"), _get("/healthz/runner"))
-
-    api, runner = asyncio.run(go())
-
-    assert api.status_code == 503
-    assert api.json()["ok"] is False
-    assert api.json()["status"] == "unhealthy"
-    assert api.json()["checks"] == {
-        "db": {"status": "down", "error": "health_check_timeout"},
-    }
-    assert set(api.json()) >= {"mode", "release", "uptime_s", "worker"}
-
+    runner = asyncio.run(_get("/healthz/runner"))
     assert runner.status_code == 503
     assert runner.json()["checks"]["runner_fleet"]["reason"] == (
         "runner_health_check_timeout"
@@ -63,16 +41,11 @@ def test_health_routes_map_dedicated_deadline_to_structured_503(monkeypatch):
 def test_health_routes_ignore_saturated_ordinary_threadpool(monkeypatch):
     monkeypatch.setenv("FEEDLING_EXPECTED_RUNNER_COUNT", "1")
 
-    def healthy_probe(**kwargs):
-        assert kwargs == {"timeout": 1.0, "statement_timeout_ms": 1000}
-        return {"ok": True, "latency_ms": 1.0, "error": None}
+    def fail_if_called(*_args, **_kwargs):
+        raise AssertionError("process liveness must not touch the database")
 
-    monkeypatch.setattr(
-        db,
-        "health_probe",
-        healthy_probe,
-    )
-    monkeypatch.setattr(db, "get_pool", lambda: _PoolStats())
+    monkeypatch.setattr(db, "health_probe", fail_if_called)
+    monkeypatch.setattr(db, "get_pool", fail_if_called)
 
     def healthy_runner_fleet(**kwargs):
         assert kwargs == {"timeout": 1.0, "statement_timeout_ms": 1000}

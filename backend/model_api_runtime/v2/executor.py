@@ -15,8 +15,10 @@ from typing import Any
 
 from capabilities import registry as cap_registry
 from capabilities import tool_schema
+from capabilities import history as cap_history
 from capabilities import identity as cap_identity
 from capabilities import activity_metadata
+from capabilities import result_budget
 from model_api_runtime.v2 import provenance as _prov
 from provider_types import ToolResult
 from workspace.backends import WorkspaceError, model_writable_path
@@ -86,7 +88,17 @@ def _summarize_capability_result(data: dict, *, tool_name: str = "") -> str:
     if not payload:
         return "ok"
     rendered = json.dumps(payload, ensure_ascii=False)
-    if len(rendered) > _RESULT_CHAR_CAP:
+    # 共享预算策略（capabilities/result_budget.py）优先于通用闸。没有策略的
+    # 工具（=绝大多数）拿到的仍是 _RESULT_CHAR_CAP，行为不变。
+    policy = result_budget.for_tool(tool_name)
+    result_cap = policy.result_cap if policy is not None else _RESULT_CHAR_CAP
+    # atomic_json 的生产者在序列化前就结构化缩到了同一个 result_cap（facade 自
+    # 己还会复核一遍），所以正常情况下到不了这里。真到了 = 生产者违约，此时
+    # **绝不能切串**：半截 JSON 比没有结果更糟（模型解析失败、还看不出发生了
+    # 什么）。整体换成一条短、稳定、合法的错误结果。
+    if policy is not None and policy.atomic_json and len(rendered) > result_cap:
+        return result_budget.OVERFLOW_RESULT_CONTENT
+    if len(rendered) > result_cap:
         marker = "...[truncated]"
         if str(tool_name) in {"memory_index", "memory_search"}:
             total = payload.get("total") if isinstance(payload, dict) else None
@@ -97,7 +109,7 @@ def _summarize_capability_result(data: dict, *, tool_name: str = "") -> str:
                     f"{returned} of {total} total cards. Use memory_index with "
                     "bucket or thread filters to browse partitions.]"
                 )
-        legacy_cap = _RESULT_CHAR_CAP + len("...[truncated]")
+        legacy_cap = result_cap + len("...[truncated]")
         prefix_cap = max(0, legacy_cap - len(marker))
         rendered = rendered[:prefix_cap] + marker
     return rendered
@@ -118,6 +130,15 @@ async def dispatch_tool_calls(
     observe_photo=None,
     read_parallelism: int = 4,
     identity_write_authorization: bool = True,
+    # History tools' dispatch gate (spec §6): catalog omission is the
+    # provider-facing control; this flag is the independent fail-closed
+    # boundary. Default False means every caller that does not explicitly
+    # opt in (wake lane, subagents, direct/broken-relay callers) rejects
+    # history calls even when the tool names are otherwise valid reads.
+    # Only the chat lane passes True, and only while the kill switch is ON —
+    # so with the switch OFF, or for any non-history tool, the gate branch
+    # below never changes behavior.
+    history_tools_allowed: bool = False,
 ) -> list[ToolResult]:
     """Dispatch provider tool_calls (spec C3). READ_ACTIONS run inline-parallel (their content
     feeds back to the model); WRITE_ACTIONS pass the provenance write_gate then are ENQUEUED as
@@ -143,6 +164,13 @@ async def dispatch_tool_calls(
             )
             results_by_id[tc.id] = ToolResult(
                 call_id=tc.id, content=content
+            )
+        elif tc.name in cap_history.HISTORY_TOOL_NAMES and not history_tools_allowed:
+            # Dispatch half of the history double gate. Same word as the
+            # facade's kill-switch rejection so the model sees one stable
+            # vocabulary regardless of which layer stopped the call.
+            results_by_id[tc.id] = ToolResult(
+                call_id=tc.id, content="error: tool_not_allowed"
             )
         elif tc.name in cap_registry.READ_ACTIONS:
             reads.append(tc)
@@ -206,7 +234,11 @@ async def dispatch_tool_calls(
                         },
                     }
             content = _summarize_capability_result(data, tool_name=tc.name)
-            metadata = activity_metadata.memory_result_metadata(tc.name, data) or None
+            metadata = (
+                activity_metadata.memory_result_metadata(tc.name, data)
+                or activity_metadata.history_result_metadata(tc.name, data)
+                or None
+            )
         except Exception:  # noqa: BLE001 — isolate one bad read; never expose its exception
             # Read calls are independent and side-effect-free.  A capability bug or
             # adapter failure must not discard successful sibling results or fail the

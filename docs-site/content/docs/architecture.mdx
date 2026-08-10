@@ -94,6 +94,18 @@ deletes them, and the 5,000-message constant bounds only a process-local hot
 window. Only explicit Chat clear or account deletion removes this conversation
 data.
 
+Runtime V2 chat turns may retrieve older ledger content on demand through two
+chat-only agent tools (`history_search`, `history_fetch`). Retrieval is
+search-first: summary leaves serve only as scan-priority hints, matching runs
+against decrypted original messages inside the enclave in bounded batches, and
+attachments contribute caption text only — object-storage bodies are never
+decrypted for search. Every call is bounded by row, byte, and deadline budgets
+with an authenticated resumable cursor, and an incomplete scan is reported as
+incomplete rather than as an empty result. These tools are never offered to
+proactive wake lanes or subagents; a turn that reads history drops outbound
+web/MCP/task tools for the following round, and a deployment kill switch
+removes the capability entirely without touching the normal chat path.
+
 Deployments may opt into deterministic Runtime V2 coverage accounting as an
 independent precursor to the bounded Memory/User profile rollout. In that mode,
 maintenance and synchronous prompt catch-up advance the same exact source
@@ -506,20 +518,21 @@ perform the direct certificate-fingerprint-to-`REPORT_DATA` check.
 
 ## Health and capability readiness
 
-`GET /healthz` returns a structured liveness and dependency snapshot. It carries
-a top-level `status` of `healthy`, `degraded`, or `unhealthy`, a `checks` object
-with per-component detail, and release/uptime metadata. The backend probe checks
-its own critical dependencies: it runs a short `SELECT 1` against PostgreSQL
-(failure, or a saturated connection pool that cannot hand out a connection in
-time, returns HTTP 503), and reports connection-pool utilization, the in-memory
-user registry size, and the cross-worker wake-bus listener. The enclave probe
-reports readiness, release, and TLS posture from cached boot state without doing
-any cryptography. A `degraded` result still returns HTTP 200.
+`GET /healthz` returns a structured process-liveness snapshot. It carries a
+top-level `status` of `healthy` or `degraded`, a `checks` object with
+process-local detail, and release/uptime metadata. The backend probe reports the
+in-memory user registry size and cross-worker wake-bus listener, but deliberately
+does not borrow a PostgreSQL connection or inspect the business connection pool;
+pool saturation therefore cannot delay the probe or turn it into an outage. The
+backend returns HTTP 200 whenever its worker can serve the request. The enclave
+probe reports readiness, release, and TLS posture from cached boot state without
+doing any cryptography. A `degraded` result still returns HTTP 200.
 
-Health database work runs on a two-slot executor reserved per backend worker,
-separate from ordinary ASGI blocking work. Connection acquisition and health
-SQL each have a one-second bound, and the complete route has a three-second
-deadline, so business-thread saturation cannot leave the public probe queued
+`GET /healthz/runner` runs its blocking heartbeat database query on a
+per-backend-worker executor with two worker threads and a four-call outstanding
+admission cap, separate from ordinary ASGI blocking work. Connection acquisition
+and health SQL each have a one-second bound, and the route has a three-second
+deadline, so business-thread saturation cannot leave the runner probe queued
 until an external monitor times out.
 
 `/healthz` still does not, by itself, complete an enclave decrypt, verify a live
@@ -538,8 +551,8 @@ enabled capability:
 
 There is no single public `/readyz` endpoint that proves all of these
 dependencies. Operators should compose synthetic, non-production probes for the
-capabilities they enable; `/healthz` covers the backend's own critical
-dependencies (process, PostgreSQL, pool, registry, wake bus) but not the
+capabilities they enable; `/healthz` covers process liveness plus the registry
+and wake bus, but not PostgreSQL, the business connection pool, or the
 capability-level checks above.
 
 The resident decrypt-health headers are an operational self-report used to

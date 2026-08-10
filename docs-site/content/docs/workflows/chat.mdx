@@ -302,7 +302,10 @@ provider-facing truncation. `memory_categories` is optional: it is present only 
 returned item has one of the canonical bilingual memory buckets and its counts
 sum to `memory_count`. If any bucket is custom or unknown, the category list is
 omitted and clients should show the total only. Raw bucket labels, summaries,
-memory content, and query text never enter activity metadata.
+memory content, and query text never enter activity metadata. Successful
+`history_search` and `history_fetch` calls likewise record only a content-free
+scanned-row count; matched snippets, message bodies, and query text never enter
+activity metadata.
 
 Every executed Runtime V2 platform, MCP, `reply`, and `send_file` call uses the
 same started/result/error activity boundary. Repeated memory-discovery calls

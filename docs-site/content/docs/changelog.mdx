@@ -10,12 +10,43 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
-- **Public health probes keep reserved capacity under backend load.**
-  `GET /healthz` and `GET /healthz/runner` now run their blocking database work
-  outside the ordinary ASGI thread pool, with bounded connection, SQL, and
-  three-second route deadlines. A real deadline failure returns a structured
-  HTTP 503 instead of leaving external monitors to time out after 15 seconds.
+- **Runner health probe keeps reserved capacity under backend load.**
+  `GET /healthz/runner` now runs its blocking heartbeat database query outside
+  the ordinary ASGI thread pool, with bounded connection and SQL timeouts plus
+  a three-second route deadline. A deadline failure returns a structured HTTP
+  503 instead of leaving external monitors to time out.
 
+- **Runtime V1 Fable 5 chat no longer requires visible chain-of-thought.**
+  Fable 5 routes running through pi, including OpenRouter and compatible relays,
+  now skip the mandatory `<think>` response format that the model refuses. Pi's
+  native reasoning setting is unchanged, and other models keep the existing
+  self-thinking behavior.
+- **Memory extraction no longer mistakes model thinking for its JSON result.**
+  Capture, Dream, legacy-card migration, and resident identity distillation now
+  remove well-formed thinking blocks before locating the result object while
+  retaining the previous raw-text fallback for malformed output. Hosted
+  Capture and Dream may re-ask once after a JSON decoding error; truncated or
+  prose-only responses remain non-retryable parse failures.
+
+- **A base URL that is not an API endpoint no longer reports as an API-key
+  failure.** When the configured relay base URL points at a web page rather than
+  the API (an HTTP 200 that returns the site's homepage, or a **404** HTML error
+  page), `provider_test_failed` now returns `"status_code": null` and a
+  bilingual `detail` telling the operator the endpoint usually needs to end with
+  `/v1` and that the API key is not the problem. Clients should display that
+  `detail` directly. HTML error pages carrying any other status
+  (401/402/429/5xx — relay auth, payment, throttle and gateway pages) keep their
+  original status code and detail unchanged.
+
+- **Runtime V2 Chat can search its own older conversation history on demand.**
+  Two chat-only agent tools let the agent keyword-search messages beyond its
+  visible context and read a small window around a match. Original messages
+  remain the retrieval source of truth (summaries only prioritize scanning);
+  decryption and matching stay inside the enclave under strict row/byte/time
+  budgets; attachment binaries are never read for search. A turn that reads
+  history loses outbound web/MCP/task tools for the next round, proactive wake
+  lanes never see these tools, and a deployment kill switch (default on) can
+  remove the capability without touching the normal chat path.
 - **Genesis plaintext retries reuse completed persona-voice mapping.** The
   estimate/commit flow now retains its opaque staged-upload pointer in trusted
   job metadata until completion, and both fact-map and voice-map window results
@@ -29,8 +60,20 @@ change must not be interpreted as an API guarantee.
   so every connected server keeps a share; only the largest ones are trimmed.
   Previously a single big server could consume the whole budget and a server
   later in the alphabet would contribute no tools at all — its connection test
-  passed while the companion genuinely could not see any of its tools. The
+  passed while the companion genuinely could not see any of its tools. This now
+  applies to both runtimes: the self-hosted bridge and Hosted Runtime V2, whose
+  catalog was still filled in server-name order. The self-hosted bridge's
   per-turn cap is also raised from 50 to 100.
+- **A self-hosted `claude` agent now receives the MCP servers you enabled in the
+  app.** A hand-written `AGENT_CLI_CMD` without the `{mcp}` placeholder — the
+  form the operator documentation previously showed — never passed
+  `--mcp-config`, so no app-configured server reached the agent even though its
+  connection test passed. Chat turns now get the server list and a matching
+  pre-approval for its tools. A command that already sets `--mcp-config` is left
+  untouched, and one that pins its own `--allowed-tools` keeps it and is told in
+  the log which `mcp__<name>__*` rules to add. Other self-hosted runtimes
+  (`codex`, hermes, OpenClaw) were unaffected: they read MCP from their own
+  config files.
 
 - **Voice calls no longer end with a protocol error when a turn produces no
   speech.** A turn that is deliberately silent — transport noise, a call that
@@ -1041,16 +1084,14 @@ change must not be interpreted as an API guarantee.
   Unlabeled envelopes are accepted unchanged, so existing clients are
   unaffected. This closes the failure mode where a writer with a stale key
   seals messages the owner's device can never decrypt.
-- Expand `GET /healthz` from a fixed liveness stub into a structured
-  liveness-and-dependency probe. Responses now carry a top-level `status`
-  (`healthy`, `degraded`, or `unhealthy`), a `checks` object with per-component
-  detail, and release/uptime metadata, while preserving the legacy `ok` /
-  `mode` / `ready` fields. The backend checks PostgreSQL (`SELECT 1`),
-  connection-pool saturation, the in-memory user registry, and the cross-worker
-  wake-bus listener, and returns HTTP 503 when PostgreSQL is unreachable. The
-  enclave reports readiness, release, and TLS posture from cached boot state
-  without performing any cryptography. The documented response schema is
-  unchanged (a generic JSON object).
+- `GET /healthz` is now a pool-independent process-liveness probe. It keeps the
+  structured status, release/uptime metadata, legacy fields, in-memory user
+  registry check, and cross-worker wake-bus check, but no longer executes
+  `SELECT 1`, inspects the business connection pool, returns DB-related 503s, or
+  includes `checks.db` / `checks.db_pool`. This prevents saturated user traffic
+  from delaying the health probe or creating a false outage. PostgreSQL
+  readiness now requires a separate authenticated synthetic read/write probe.
+  The documented response schema remains a generic JSON object.
 - `POST /v1/mcp/servers` now accepts `http://` URLs and loopback/private-network
   and raw-IP hosts — this backend never dials the URL itself, only your agent
   does when it calls a tool, so none of those forms were ever a new attack

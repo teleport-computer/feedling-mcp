@@ -113,6 +113,20 @@
 | route 不存在/不属于该用户 | 404 | `{"error": "route_not_found"}` |
 | 上游测活失败 | 400 | `{"error": "provider_test_failed", "detail": "…", "status_code": 401}` |
 
+> **`status_code` 为 `null` 的特例:地址不是 API 端点。** 当 base_url 指向的不是
+> 接口而是网页(实测两种形状:HTTP 200 返回站点首页导致响应非 JSON;或 **404** +
+> 错误页 HTML),`provider_test_failed` 会带 `"status_code": null`,`detail` 是一条
+> 可直接展示给用户的中英文提示(要点:地址结尾通常需要 `/v1`,**不是 API key 的问题**)。
+> 客户端此时应直接显示 `detail`。
+>
+> 清掉 `status_code` 是刻意的:客户端会把 provider 的 404 映射成「模型不存在」,
+> 带着它回去等于换一句话继续把用户往错方向支。原始错误仍完整写入 route 的
+> `test_error`,排查不受影响。
+>
+> ⚠️ **仅 404 的 HTML 算地址问题**。relay/WAF/计费层会用 HTML 页面返回
+> 401/402/429/5xx(鉴权页、支付页、限流页、故障页),这些一律保留原始
+> `status_code` 与 `detail`,不得改写成地址建议。
+
 > **为什么必须先测活**：agent-runner 的 roster 只收 `is_active AND test_status = 'ok'` 的用户。激活一条没测过的 route，用户会在下一个 15 秒 tick 从 roster 消失，supervisor 会杀掉他的 consumer 且不会自愈。所以测不过就不给切。
 >
 > 测活失败时该 route 会被标记 `test_status = "failed"`，UI 可以据此显示。

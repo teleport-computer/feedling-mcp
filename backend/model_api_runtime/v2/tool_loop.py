@@ -8,6 +8,7 @@ import posixpath
 import re
 from provider_types import ProviderResponse, ToolExchange, ToolResult
 from capabilities import registry as cap_registry
+from capabilities import result_budget
 from capabilities import tool_schema
 from model_api_runtime.v2 import prompt_frontier
 from model_api_runtime.v2 import provenance
@@ -272,13 +273,80 @@ def _result_quotas(lengths: list[int], batch_cap: int) -> list[int]:
     return quotas
 
 
+def _batch_quotas(contents: list[str], policies: list, batch_cap: int) -> list[int]:
+    """Water-fill the batch budget after reserving every atomic result in full.
+
+    With no atomic result in the batch this is exactly ``_result_quotas`` over
+    the unmodified ``batch_cap`` — the pre-existing behavior, unchanged.
+
+    With one present: the batch budget rises by its ``extra_batch_budget``
+    (otherwise a 4500-char fetch would leave seven siblings ~500 each), the
+    atomic result keeps its full length, and only the remainder is water-filled
+    among the siblings.  Reserving can exhaust the remainder in a pathological
+    batch; siblings then get 0, which is the same starvation the plain
+    water-fill already produces — never a sliced atomic result.
+    """
+    atomic = [
+        index
+        for index, policy in enumerate(policies)
+        if policy is not None and policy.atomic_json
+    ]
+    if not atomic:
+        return _result_quotas([len(content) for content in contents], batch_cap)
+    budget = batch_cap + sum(
+        policies[index].extra_batch_budget for index in atomic
+    )
+    reserved = sum(len(contents[index]) for index in atomic)
+    shared = [index for index in range(len(contents)) if index not in set(atomic)]
+    shared_quotas = _result_quotas(
+        [len(contents[index]) for index in shared], max(0, budget - reserved)
+    )
+    quotas = [0] * len(contents)
+    for index in atomic:
+        quotas[index] = len(contents[index])
+    for index, quota in zip(shared, shared_quotas):
+        quotas[index] = quota
+    return quotas
+
+
 def _normalize_tool_results(
     results: list[ToolResult],
     *,
     per_result_cap: int,
     batch_cap: int,
 ) -> list[ToolResult]:
-    """Apply provider-neutral per-call and aggregate prompt budgets in call order."""
+    """Apply provider-neutral per-call and aggregate prompt budgets in call order.
+
+    Results whose trusted metadata declares an ``atomic_json`` budget policy
+    (``capabilities/result_budget.py``) are reserved at full length before the
+    water-fill runs, and the batch budget rises by that policy's
+    ``extra_batch_budget``.  They are never string-truncated: their producer
+    already shrank them structurally, and cutting a JSON payload mid-string
+    makes the whole result unparseable for the model.  An atomic result that
+    arrives *over* its own cap is a producer contract violation, not something
+    to slice: it is replaced wholesale by one short, valid error result before
+    the water-fill sees it, so nothing downstream can reserve or cut a broken
+    payload.  (``worker`` rejects the configurations that would make this
+    reachable at start-up; this is the defence-in-depth half.)
+
+    A batch with no such result takes exactly the path it always took — same
+    per-result cap, same batch cap, same quotas, byte for byte.
+    """
+    policies = [result_budget.for_metadata(result.metadata) for result in results]
+    results = [
+        ToolResult(
+            call_id=result.call_id,
+            content=result_budget.OVERFLOW_RESULT_CONTENT,
+            metadata=result.metadata,
+        )
+        if (
+            policy is not None
+            and policy.atomic_json
+            and len(result.content) > policy.result_cap
+        )
+        else result
+        for result, policy in zip(results, policies)
+    ]
     markers = []
     for result in results:
         metadata = result.metadata or {}
@@ -294,12 +362,14 @@ def _normalize_tool_results(
         else:
             markers.append(_RESULT_TRUNCATION_MARKER)
     individually_capped = [
-        _truncate_result_content(result.content, per_result_cap, marker=marker)
-        for result, marker in zip(results, markers)
+        _truncate_result_content(
+            result.content,
+            policy.result_cap if policy is not None else per_result_cap,
+            marker=marker,
+        )
+        for result, policy, marker in zip(results, policies, markers)
     ]
-    quotas = _result_quotas(
-        [len(content) for content in individually_capped], batch_cap
-    )
+    quotas = _batch_quotas(individually_capped, policies, batch_cap)
     return [
         ToolResult(
             call_id=result.call_id,

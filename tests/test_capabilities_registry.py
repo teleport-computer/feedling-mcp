@@ -11,9 +11,11 @@ def test_all_action_types_registered():
     expected = {
         "identity_get", "identity_patch", "identity_nudge", "memory_index", "memory_fetch", "memory_write",
         "memory_search",
+        "history_search", "history_fetch",
+        "voice_transcript_list", "voice_transcript_read",
         "perception_snapshot", "perception_recent_apps", "perception_trend", "perception_history", "perception_glance",
         "screen_recent", "screen_read", "photo_recent", "photo_read", "chat_image_read",
-        "chat_file_read", "voice_transcript_list", "voice_transcript_read",
+        "chat_file_read",
         "web_search", "web_fetch",
         "schedule_wake", "cancel_wake",
         "workspace_list", "workspace_read", "workspace_write", "workspace_delete",
@@ -43,6 +45,7 @@ def test_capabilities_is_a_real_populated_dict():
     expected = {
         "identity_get", "identity_patch", "identity_nudge",
         "memory_index", "memory_fetch", "memory_write", "memory_search",
+        "history_search", "history_fetch",
         "perception_snapshot", "perception_recent_apps", "perception_trend",
         "perception_history", "perception_glance", "screen_recent",
         "screen_read", "photo_recent", "photo_read", "chat_image_read",
