@@ -1064,6 +1064,19 @@ def test_screen_question_attaches_decrypted_screen_context(monkeypatch):
     assert kwargs["image_paths"] == ["/tmp/feedling_chat_images/screen.jpg"]
 
 
+def test_screen_context_auto_mode_does_not_depend_on_message_words(monkeypatch):
+    monkeypatch.setattr(crc, "SCREEN_CONTEXT_MODE", "auto")
+
+    assert crc._should_attach_screen_context("嗨") is True
+    assert crc._should_attach_screen_context("这里没有屏幕关键词") is True
+
+
+def test_screen_context_explicit_disable_still_wins(monkeypatch):
+    monkeypatch.setattr(crc, "SCREEN_CONTEXT_MODE", "disabled")
+
+    assert crc._should_attach_screen_context("你能看到我的屏幕吗") is False
+
+
 def test_dedup_prevents_reprocessing_same_message():
     """The same message processed twice (e.g. on restart with stale checkpoint)
     must not trigger a second agent call."""

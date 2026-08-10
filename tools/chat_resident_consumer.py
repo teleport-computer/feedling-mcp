@@ -400,7 +400,6 @@ PROACTIVE_TICK_START_DELAY_SEC = int(os.environ.get("PROACTIVE_TICK_START_DELAY_
 # its own (broadcast-independent) cadence.
 SCREEN_WATCH_ENABLED = _env_bool("FEEDLING_SCREEN_WATCH_ENABLED", True)
 SCREEN_WATCH_INTERVAL_SEC = int(os.environ.get("FEEDLING_SCREEN_WATCH_INTERVAL_SEC", "120"))
-SCREEN_WATCH_CHAT_SUPPRESS_SEC = int(os.environ.get("FEEDLING_SCREEN_WATCH_CHAT_SUPPRESS_SEC", "180"))
 SCREEN_WATCH_FRAMES = int(os.environ.get("FEEDLING_SCREEN_WATCH_FRAMES", "5"))
 SCREEN_WATCH_START_DELAY_SEC = int(os.environ.get("FEEDLING_SCREEN_WATCH_START_DELAY_SEC", "20"))
 # A frame newer than this means sharing is genuinely live right now (iOS captures
@@ -3478,13 +3477,17 @@ def _message_for_agent(content: str, image_paths: list[str] | None = None) -> st
 # Screen-sharing context
 # ---------------------------------------------------------------------------
 
-def _should_attach_screen_context(content: str) -> bool:
+def _should_attach_screen_context(_content: str = "") -> bool:
+    """Whether live screen frames may be attached to a V1 chat turn.
+
+    ``auto`` used to inspect message wording.  A live share is now the only
+    content-independent trigger; freshness is checked immediately afterwards.
+    Explicitly disabled deployments remain disabled.
+    """
     mode = SCREEN_CONTEXT_MODE
     if mode in {"0", "false", "off", "none", "disabled"}:
         return False
-    if mode in {"1", "true", "always", "on"}:
-        return True
-    return bool(_SCREEN_CONTEXT_TRIGGER_RE.search(content or ""))
+    return True
 
 
 def _fetch_screen_json(path: str) -> dict | None:
@@ -3507,7 +3510,7 @@ def _fetch_screen_json(path: str) -> dict | None:
 
 
 def _screen_context_for_message(content: str) -> tuple[str, list[dict[str, str]], list[str]]:
-    """Attach recent screen-sharing context for screen/deictic questions.
+    """Attach recent context whenever screen sharing is currently active.
 
     The resident already has the Feedling API key, so it should decrypt the
     latest frame itself instead of making the agent run curl/MCP commands from a
@@ -17126,25 +17129,13 @@ def run() -> None:
                                 # Only act on genuinely new content; backlog stays
                                 # reachable via screen_recent in the light prompt.
                                 last_screen_watch_frame_id = latest_fid
-                                sw_chat = recent_chat_context_for_proactive()
-                                user_age = sw_chat.last_user_message_age_sec
-                                chatting = (
-                                    user_age is not None
-                                    and user_age < SCREEN_WATCH_CHAT_SUPPRESS_SEC
+                                sw = post_screen_watch_tick("on", watch_frames)
+                                log.info(
+                                    "screen-watch tick enqueued=%s frames=%d frame_id=%s",
+                                    bool(sw.get("enqueued")),
+                                    len(watch_frames),
+                                    latest_fid[:12],
                                 )
-                                if chatting:
-                                    log.info(
-                                        "screen-watch yielding to active chat (user_msg_age=%.0fs)",
-                                        user_age if user_age is not None else -1,
-                                    )
-                                else:
-                                    sw = post_screen_watch_tick("on", watch_frames)
-                                    log.info(
-                                        "screen-watch tick enqueued=%s frames=%d frame_id=%s",
-                                        bool(sw.get("enqueued")),
-                                        len(watch_frames),
-                                        latest_fid[:12],
-                                    )
                         except Exception as e:
                             log.warning("screen-watch tick failed: %s", e)
                         finally:
