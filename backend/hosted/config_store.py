@@ -230,10 +230,25 @@ def record_runtime_error(
     last_runtime_error（iOS 设置页，也已切到读 route）与 GET /v1/model_api/routes。
     legacy inline 路径经 action-trace 写同一字段；本函数是 pooled V2 路径的写侧
     （spec 2026-07-06-upstream-error-surfacing 腿②）。"""
+    result = str(provider_result or "").strip().lower()
+    if result == "vision_unsupported":
+        route = db.model_api_active_route_vision_verdict(store.user_id)
+        if route is None:
+            return {"error": "model_api_runtime_profile_missing"}, 404
+        landed = db.model_api_route_mark_vision_test(
+            store.user_id,
+            str(route["id"]),
+            status="unsupported",
+            error="vision_model_incompatible",
+            expected_updated_at=str(route.get("updated_at") or ""),
+        )
+        return ({"ok": True}, 200) if landed else (
+            {"error": "model_api_route_changed"},
+            409,
+        )
     if not db.model_api_route_mark_runtime_error(
             store.user_id, error=error, error_class=error_class):
         return {"error": "model_api_runtime_profile_missing"}, 404
-    result = str(provider_result or "").strip().lower()
     if result == "success":
         provider_health.record_success(store.user_id)
     elif result == "failure":

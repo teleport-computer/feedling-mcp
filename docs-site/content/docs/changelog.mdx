@@ -10,6 +10,29 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **Foreground Chat now stays grounded in an active screen share.** When the
+  newest encrypted screen frame is no more than 90 seconds old, each foreground
+  turn can attach up to six uniformly sampled frames that arrived after the
+  previous Chat attachment. Raw pixels are sent only when the active model route
+  passed the real image control probe; otherwise the model receives only an
+  availability marker and may use an authorized screen read. Screen frames are
+  explicitly untrusted application data, and any turn that receives pixels has
+  outbound web, MCP, and child-task access fenced from its first model call. If
+  the provider rejects those frames, Chat retries once without them and records
+  that route as image-unsupported instead of failing the user's text turn.
+
+- **New Model API users can enter Runtime V2 through a cutoff-based default.**
+  Only newly registered accounts with a successfully tested and active Model API
+  route are eligible; the default does not migrate older accounts or users on a
+  resident route. Invalid or absent rollout configuration keeps the account
+  resident.
+
+- **Runner health probe keeps reserved capacity under backend load.**
+  `GET /healthz/runner` now runs its blocking heartbeat database query outside
+  the ordinary ASGI thread pool, with bounded connection and SQL timeouts plus
+  a three-second route deadline. A deadline failure returns a structured HTTP
+  503 instead of leaving external monitors to time out.
+
 - **Runtime V1 Fable 5 chat no longer requires visible chain-of-thought.**
   Fable 5 routes running through pi, including OpenRouter and compatible relays,
   now skip the mandatory `<think>` response format that the model refuses. Pi's

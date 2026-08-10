@@ -686,6 +686,15 @@ def test_runner_health_503_uses_the_aggregate_health_response_contract(
     assert "same shape as the 200 response" in response["description"]
 
 
+def test_runner_health_503_description_covers_bounded_probe_deadline(
+    operations: dict[tuple[str, str], dict[str, Any]],
+) -> None:
+    runner_description = operations[("get", "/healthz/runner")]["responses"]["503"]["description"]
+
+    assert "503" not in operations[("get", "/healthz")]["responses"]
+    assert "three-second health-check deadline" in runner_description
+
+
 def test_sensitive_control_planes_enforce_api_key_in_backend(
     public_schema: dict[str, Any],
 ) -> None:

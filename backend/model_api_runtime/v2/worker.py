@@ -73,6 +73,7 @@ from capabilities import tool_schema as cap_tool_schema
 from core import chat_activity as core_chat_activity
 from core import envelope as core_envelope
 from core import protocol_leak
+from core import util as core_util
 from core import provider_usage
 from core import store as core_store
 from core import wake_bus as core_wake_bus
@@ -84,6 +85,7 @@ from perception.glance import (
 from model_api_runtime.v2 import coalesce as v2_coalesce
 from model_api_runtime.v2 import compaction as v2_compaction
 from model_api_runtime.v2 import context
+from model_api_runtime.v2 import screen_chat as v2_screen_chat
 from model_api_runtime.v2 import cursor as v2_cursor
 from model_api_runtime.v2 import document_render as v2_document_render
 from model_api_runtime.v2 import effect_outbox as v2_effect_outbox
@@ -767,6 +769,47 @@ def _safe_eager_screen_metadata(data: object) -> dict:
     return safe
 
 
+# 共享屏幕「此刻是否活着」的判据秒数。与 v2/screen_watch.FRESH_SEC 同源:iOS 约 30s
+# 一帧,>90s 没有新帧就当这次共享已经结束。
+_SCREEN_SHARE_LIVE_SEC = 90.0
+
+
+def _screen_share_grounding(user_id: str) -> dict:
+    """聊天回合的「用户此刻正在共享屏幕」提示 —— **只回可用性,不回内容**。
+
+    为什么需要它:`CHAT_SYSTEM_PROMPT` 早就写了「请求涉及 shared screen 就用 screen
+    工具」,但同一句后半段是「无关对话别调这些工具」。模型**无从知道此刻有没有共享
+    在进行**,于是保守地不调 —— 用户的体感就是「它看不见我的屏幕」,而后端其实一直
+    收着帧(usr_7001b1df80e2024d 2026-08-10:共享在推流、开关全开,两小时 123 个回合
+    没有一次读屏)。补上这个信号,模型才有依据决定要不要 screen_read。
+
+    两条硬约束:
+    ① **不碰 enclave**。走 `db.frame_list_meta`(服务端明文的 frame_id/ts 索引),
+       和 serve_worker 的屏幕监看生产者同一条路 —— 这个函数在**每个聊天回合**都跑,
+       一次 enclave 往返会锤死共享解密代理的容量。
+    ② **只回布尔与秒数**。frame_id / caption / 窗口标题一律不进这个可用性块。
+       视觉探针为 ok 时,调用方另走有界推帧路径,把像素标成不可信应用数据,并在
+       第一轮 provider 调用之前先建立出站执行栅栏。
+
+    共享没在进行(或读取失败)时返回 {},调用方据此整块省略 —— 不共享的用户
+    prompt 一个字都不变,provider 侧的前缀缓存不受影响。
+    """
+    try:
+        meta = db.frame_list_meta(user_id)
+    except Exception:
+        return {}
+    if not meta:
+        return {}
+    ts = meta[-1].get("ts")
+    try:
+        age = time.time() - float(ts)
+    except (TypeError, ValueError):
+        return {}
+    if age < 0 or age > _SCREEN_SHARE_LIVE_SEC:
+        return {}
+    return {"active": True, "latest_frame_age_sec": int(age)}
+
+
 def _read_blocks_later_outbound(tool_call) -> bool:
     """Argument-aware private/text read boundary for one completed tool call."""
     name = str(getattr(tool_call, "name", "") or "")
@@ -1254,6 +1297,9 @@ class TurnDeps:
     # read_tail，b64 会进摘要器 prompt，且该用户历史上每张图都会被解密一次。默认 None：
     # worker.py 自身不 import hosted/capabilities 的装配细节；生产装配见 serve_worker。
     read_images: Callable[[str, list[str]], dict[str, dict]] | None = None
+    # Foreground screen-share pixels. Production returns a bounded decrypted
+    # batch plus content-free cache counters; callers must hold enclave_sem.
+    read_screen_frames: Callable[[str, list[str]], dict[str, Any]] | None = None
     # (user_id, prompt, main config, auth) -> tuple[ProviderMedia, ...]. The
     # assembly tier resolves the optional dedicated route and decrypts only its
     # credential. The model-facing tool stays provider-neutral.
@@ -2259,6 +2305,10 @@ class TurnMetrics:
     effective_tail_turns: int | None = None
     tail_fallback: bool = False
     prompt_frontier_exhaustion_count: int = 0
+    screen_frames_pushed: int = 0
+    screen_frame_cache_hits: int = 0
+    screen_frame_cache_misses: int = 0
+    visible_reply_count: int = 0
     _flushed: bool = False
     _started: float = 0.0
 
@@ -2360,6 +2410,19 @@ class TurnMetrics:
             self.prompt_frontier_exhaustion_count + 1,
         )
 
+    def record_screen_frames(
+        self, *, pushed: int, cache_hits: int, cache_misses: int
+    ) -> None:
+        self.screen_frames_pushed = max(0, int(pushed))
+        self.screen_frame_cache_hits = max(0, int(cache_hits))
+        self.screen_frame_cache_misses = max(0, int(cache_misses))
+
+    def record_visible_reply(self) -> None:
+        self.visible_reply_count = min(
+            (1 << 31) - 1,
+            self.visible_reply_count + 1,
+        )
+
     def flush(self, *, failed: bool, status: str) -> None:
         """Idempotent per-job upsert; guarded so this SAME accumulator instance
         never double-writes even if a lane handler somehow reaches two terminal
@@ -2400,6 +2463,10 @@ class TurnMetrics:
             prompt_frontier_exhaustion_count=(
                 self.prompt_frontier_exhaustion_count
             ),
+            screen_frames_pushed=self.screen_frames_pushed,
+            screen_frame_cache_hits=self.screen_frame_cache_hits,
+            screen_frame_cache_misses=self.screen_frame_cache_misses,
+            visible_reply_count=self.visible_reply_count,
             latency_ms=latency_ms,
             model_calls=self.model_calls,
             retries=self.retries,
@@ -3345,6 +3412,7 @@ def _make_build_messages_fn(
     tail_anchor_seq: int | None = None,
     application_data_role: str = "user",
     manual_wake: bool = False,
+    screen_frame_message: dict[str, Any] | None = None,
 ) -> Callable[[list], list]:
     """Build the fixed base prompt plus the loop's chronological native transcript.
 
@@ -3421,6 +3489,7 @@ def _make_build_messages_fn(
             temporal_context=_temporal_for(rendered_tail),
             application_data_role=application_data_role,
             manual_wake=manual_wake,
+            screen_frame_message=screen_frame_message,
         )
 
     base_messages = _base(optional_turns)
@@ -4169,15 +4238,40 @@ def _memory_tool_actions(raw_actions) -> list[dict]:
         inner = {
             "summary": summary,
             "content": content or summary,
-            "bucket": str(a.get("bucket") or nested.get("bucket") or "").strip(),
-            "threads": (
-                list(a.get("threads") or [])
-                if isinstance(a.get("threads"), list)
-                else list(nested.get("threads") or [])
-                if isinstance(nested.get("threads"), list)
-                else []
-            ),
+            # 「发生时间」在 ENQUEUE 这一刻冻结,不留给 apply 时再取。V2 的 effect 是
+            # 排队异步落库的:队列一卡,几小时后才落库,时间就串了;同一条 effect 重放
+            # 两次还会拿到两个不同的时间。V1 是同步写(说话即落库)所以没这问题,
+            # 这里就是对齐它。同 `_frozen_relationship_anchor` 的惯例(也在 enqueue 冻结)。
+            #
+            # 刻意放在字典**前面**、且不读 a.get("occurred_at"):这是服务端的可信元数据,
+            # 不接受模型自报(schema 里也没有这个字段)。
+            "occurred_at": core_util._now_iso(),
         }
+        # ⚠️ 只在模型**真的传了**的时候才放这两个键。
+        #
+        # update 走的是 supersede(新写一张替换旧的),`actions._memory_supersede_action`
+        # 用 `{**inherited, **raw}` 从旧卡继承 bucket/threads —— 键一旦存在,空值
+        # 照样覆盖继承值。以前这里无条件写 bucket=""/threads=[],于是 V2 上**每一次**
+        # 改记忆卡,桶都掉回「未分类」、标签全清空(2026-08-10 实测)。threads 尤其致命:
+        # schema 至今不允许模型传,所以那条路必然清空。
+        #
+        # 「没传」和「显式传空」必须保持可区分:前者继承旧卡,后者才是用户要清空。
+        bucket = str(a.get("bucket") or nested.get("bucket") or "").strip()
+        if bucket:
+            inner["bucket"] = bucket
+        threads_raw = (
+            a.get("threads") if isinstance(a.get("threads"), list)
+            else nested.get("threads") if isinstance(nested.get("threads"), list)
+            else None
+        )
+        if threads_raw is not None:
+            inner["threads"] = list(threads_raw)
+        # 评分同理:同样要区分「没传」(继承旧卡)和「传了」。⚠️ 不能用 `or`——
+        # importance=0 / pulse=0 是合法取值,`or` 会把它们吞成没传。
+        for score in ("importance", "pulse"):
+            value = a.get(score, nested.get(score))
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                inner[score] = value
         base = {
             "reason": reason,
             "capture_mode": "agent_tool",
@@ -8462,6 +8556,8 @@ async def _run_wake(
                             "[v2.worker] wake reply push slot build failed user=%s: %s",
                             user_id, e)
                 if status == "applied":
+                    if tm is not None:
+                        tm.record_visible_reply()
                     if final:
                         source_status = await asyncio.to_thread(
                             jobs_store.get_job_status,
@@ -8525,6 +8621,8 @@ async def _run_wake(
                 },
                 best_effort=True,
             )
+            if tm is not None:
+                tm.record_visible_reply()
 
         # Snapshot the boundary at wake start. Production uses the same total-order
         # seq reader as chat; timestamp fallback remains only for narrow tests.
@@ -8657,7 +8755,23 @@ async def _run_wake(
                 # raising. Without this the lane failed 100% of the time on
                 # test with `wake_failed:providererror` while the provider
                 # answered 200 OK — the model simply had nothing to say.
-                require_reply=False,
+                #
+                # `scheduled` 是唯一的例外，它必须留在 require_reply=True 上。
+                # 这条道上的每个 timer 都带**到点交付义务**——无论是用户委托的
+                # （「20 秒后发消息给我」）还是 agent 自排的（`apply_turn_actions
+                # (..., self_wake=True)`，见 :7841）。沉默在这里不是「没什么可说」
+                # 而是提醒丢了：模型返空 → 落到下面的 `if not text: return` → job
+                # 记成 completed、无气泡、无失败、指标全绿，用户干等（usr_4ea3
+                # 2026-08-10，一晚上两次）。同一函数里「只给思考不给正文」那条
+                # 沉默路径早就为 scheduled 破了例（见 _THINKING_ONLY_NO_REPLY_REASON
+                # 处的 raise）——两条沉默路径必须同进同退，只堵一条等于没堵。
+                #
+                # 打开它拿到的是 tool_loop 已有的整条恢复链，而不是直接判死：
+                # 先追加 _EMPTY_RESPONSE_CORRECTION 重试一轮（多数抽风到此为止），
+                # 仍空才 ProviderEmptyReply → wake_failed:empty_reply。失败不会
+                # 重放定时器（mark_fired 在入队时就落，不等 job 成功），只会 arm
+                # 60s 起、1h 封顶的 proactive 退避，用户下次说话即清。
+                require_reply=(lane == "scheduled"),
                 on_provider_success=lambda: _record_provider_success(user_id),
                 on_provider_failure=lambda exc: _record_provider_failure(
                     user_id,
@@ -12295,6 +12409,95 @@ async def process_job(
         grounding_results: dict[str, Any] = {}
         if pending_schedule_results:
             grounding_results.update(pending_schedule_results)
+        # 共享屏幕的可用性提示(见 _screen_share_grounding)。只在共享真的活着时
+        # 出现;不共享的用户这一块整个不存在,prompt 与改动前逐字节相同。
+        screen_share_state = await asyncio.to_thread(
+            _screen_share_grounding, user_id
+        )
+        if screen_share_state:
+            grounding_results["screen_share"] = [
+                {"ok": True, "data": screen_share_state}
+            ]
+        screen_frame_message: dict[str, Any] | None = None
+        pushed_screen_frame_ids: list[str] = []
+        screen_vision_verdict = None
+        if screen_share_state:
+            screen_vision_verdict = await asyncio.to_thread(
+                db.model_api_active_route_vision_verdict, user_id
+            )
+        if (
+            screen_share_state
+            and isinstance(screen_vision_verdict, dict)
+            and screen_vision_verdict.get("vision_test_status") == "ok"
+            and deps.read_screen_frames is not None
+        ):
+            try:
+                schedule = await asyncio.to_thread(
+                    jobs_store.get_wake_schedule, user_id
+                )
+                last_pushed = str(
+                    (schedule or {}).get("last_screen_chat_frame_id") or ""
+                )
+                frame_meta = await asyncio.to_thread(db.frame_list_meta, user_id)
+                selected_meta = v2_screen_chat.uniformly_sample_new_frames(
+                    frame_meta,
+                    last_pushed_frame_id=last_pushed,
+                )
+                if selected_meta:
+                    selected_ids = [
+                        str(row.get("id") or row.get("frame_id") or "")
+                        for row in selected_meta
+                    ]
+                    async with enclave_sem:
+                        batch = await asyncio.to_thread(
+                            deps.read_screen_frames, user_id, selected_ids
+                        )
+                    decrypted = (
+                        batch.get("frames") if isinstance(batch, dict) else {}
+                    )
+                    decrypted = decrypted if isinstance(decrypted, dict) else {}
+                    merged_frames: list[dict[str, Any]] = []
+                    for meta in selected_meta:
+                        frame_id = str(
+                            meta.get("id") or meta.get("frame_id") or ""
+                        )
+                        pixels = decrypted.get(frame_id)
+                        if not isinstance(pixels, dict):
+                            continue
+                        merged_frames.append({**meta, **pixels, "id": frame_id})
+                    screen_frame_message = (
+                        v2_screen_chat.build_untrusted_frame_message(
+                            merged_frames, now=time.time()
+                        )
+                    )
+                    if screen_frame_message is not None:
+                        pushed_screen_frame_ids = [
+                            str(frame["id"]) for frame in merged_frames
+                        ]
+                    tm.record_screen_frames(
+                        pushed=len(pushed_screen_frame_ids),
+                        cache_hits=int((batch or {}).get("cache_hits") or 0),
+                        cache_misses=int((batch or {}).get("cache_misses") or 0),
+                    )
+            except Exception as exc:  # noqa: BLE001 - pixels are optional grounding
+                log.warning(
+                    "[v2.worker] screen frame grounding failed user=%s code=%s",
+                    user_id,
+                    type(exc).__name__,
+                )
+
+        async def _on_screen_images_rejected(_exc: BaseException) -> None:
+            verdict = screen_vision_verdict
+            if not isinstance(verdict, dict) or not verdict.get("id"):
+                return
+            await asyncio.to_thread(
+                db.model_api_route_mark_vision_test,
+                user_id,
+                str(verdict["id"]),
+                status="unsupported",
+                error="vision_model_incompatible",
+                expected_updated_at=str(verdict.get("updated_at") or ""),
+            )
         turn_extra_context = (
             context.action_context_str(grounding_results) if grounding_results else ""
         )
@@ -12324,6 +12527,7 @@ async def process_job(
                 tail_source_truncated=tail_source_truncated,
                 tail_lane=lane,
                 tail_anchor_seq=optional_anchor_seq,
+                screen_frame_message=screen_frame_message,
             )
 
         build_messages = _chat_builder()
@@ -12456,6 +12660,9 @@ async def process_job(
             disabled_tool_names=disabled_tool_names_for_turn,
             outbound_blocking_read_tool_names=_PRIVATE_READ_TOOLS,
             outbound_blocking_read_tool_predicate=_read_blocks_later_outbound,
+            initial_outbound_tools_blocked=(screen_frame_message is not None),
+            tagged_image_message_key=v2_screen_chat.MESSAGE_TAG,
+            on_tagged_images_rejected=_on_screen_images_rejected,
             max_tool_calls_per_round=MAX_TOOL_CALLS_PER_ROUND,
             max_tool_calls_per_turn=MAX_TOOL_CALLS_PER_TURN,
             tool_result_char_cap=TOOL_RESULT_CHAR_CAP,
@@ -12479,6 +12686,12 @@ async def process_job(
                 tm.record_prompt_frontier_exhaustion
             ),
         )
+        if pushed_screen_frame_ids:
+            await asyncio.to_thread(
+                jobs_store.upsert_wake_schedule,
+                user_id,
+                last_screen_chat_frame_id=pushed_screen_frame_ids[-1],
+            )
         if voice_call_ended_atomically:
             try:
                 await asyncio.to_thread(_emit_status, user_id, job_id, "done")

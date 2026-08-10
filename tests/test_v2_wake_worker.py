@@ -1737,9 +1737,145 @@ def test_wake_tells_the_provider_that_an_empty_reply_is_acceptable(monkeypatch):
     status = asyncio.run(worker._run_wake(
         job_id, uid, "heartbeat", deps, _BYOK, worker.ENCLAVE_SEMAPHORE, claimed_by))
 
-    # The lane must have told the provider that silence is a valid outcome…
+    # 这一条断言的**主体是 tool_loop**，不是 wake lane 的策略：a0ac5257（V2 空回复
+    # 恢复）之后 `run_tool_loop` 对 provider_client 恒传 `require_reply=False`
+    # （"V2 owns the lane-specific empty-response policy"），自己在 1156+ 判 lane。
+    # 所以它锁的是「V2 不让 provider 解析器替我们决定空回复算不算失败」，**不能**
+    # 用来推断 `_run_wake` 传了什么——那一跳由 `test_only_scheduled_wake_demands_
+    # a_reply` 的 `_seen_lane_policy` 绑住。两者别混。
     assert seen.get("require_reply") is False, seen
-    # …and therefore slept instead of failing.
+    # 沉默即成功：睡了，没失败，也没写气泡。
     assert status == "completed"
     assert _job_status(job_id)[0] == "completed"
     assert write_called["n"] == 0
+
+
+def _empty_round(*, stop_reason="end_turn"):
+    """A structurally valid provider success with no usable output.
+
+    `stop_reason` 必须非空：`tool_loop._empty_response_shape` 旁边的 `semantic_empty`
+    判据要求 reasoning/stop_reason 至少有一个有值，否则纠正重试根本不会 arm
+    （直接判死）。造样本时漏了它，测的就不是恢复链而是快速失败路径。
+    """
+    round_ = _text_round("")
+    round_["stop_reason"] = stop_reason
+    return round_
+
+
+def _seen_lane_policy(monkeypatch):
+    """记录 `_run_wake` 交给 `run_tool_loop` 的 require_reply —— 唯一还有意义的边界。"""
+    seen = {}
+    orig = worker.v2_tool_loop.run_tool_loop
+
+    async def _spy(*a, **kw):
+        seen["require_reply"] = kw.get("require_reply")
+        return await orig(*a, **kw)
+
+    monkeypatch.setattr(worker.v2_tool_loop, "run_tool_loop", _spy)
+    return seen
+
+
+@pytest.mark.parametrize(
+    "lane,expected_require_reply",
+    [
+        ("scheduled", True),
+        ("heartbeat", False),
+        ("manual_wake", False),
+        ("screen_watch", False),
+    ],
+)
+def test_only_scheduled_wake_demands_a_reply(monkeypatch, lane, expected_require_reply):
+    """心跳沉默=成功，定时提醒沉默=提醒丢了。两条道必须传不同的策略。
+
+    参数化而不是写两个用例：这个不对称本身就是被测对象，分开写的话有人只改
+    一个、另一个照绿。四条 wake lane 全列进来（不只被改的那条）——用例名说
+    "only"，就得真的把「其余 lane 零变化」也绑住，否则以后有人顺手把
+    manual_wake 也打开，没有任何测试会红（codex 复验 2026-08-10 提出）。
+    """
+    uid = f"u_wake_policy_{lane}"
+    conftest.seed_user(uid)
+    _reset(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, lane)
+    claimed_by = _claim(job_id)
+
+    seen = _seen_lane_policy(monkeypatch)
+    _script_provider(monkeypatch, [_text_round("something to say")])
+    monkeypatch.setattr(
+        worker, "_write_encrypted_reply", lambda store, text: {"id": "r"})
+
+    asyncio.run(worker._run_wake(
+        job_id, uid, lane, deps := _wake_deps(
+            tail=[{"id": "m1", "ts": 1.0, "role": "user", "content": "hi"}]),
+        _BYOK, worker.ENCLAVE_SEMAPHORE, claimed_by))
+    assert deps is not None
+
+    assert seen["require_reply"] is expected_require_reply, seen
+
+
+def test_scheduled_wake_empty_reply_fails_instead_of_completing_silently(monkeypatch):
+    """usr_4ea3de33c049a676，2026-08-10 prod，一晚上两次。
+
+    用户让 TA「20 秒后发个消息」，模型（deepseek）返空。旧行为：`require_reply=False`
+    ⇒ 空回复不被检测 ⇒ 落到 `_run_wake` 的 `if not text: return` ⇒ job 记
+    **completed**、无气泡、无失败、lane 指标全绿，用户干等着。同一模型的同一种
+    空回复走聊天道时是可见的 `turn_failed:empty_reply`——两条道对同一个事实
+    给出相反的结论，而只有静默的那条是用户在踩的。
+
+    这里锁的是「不许静默成功」。至于失败**该不该让用户看见**是另一个问题：
+    `_run_wake` 的 except 明写 "silent mark_failed, never surface/bubble"，
+    本用例不碰那个决定。
+    """
+    uid = "u_wake_sched_empty"
+    conftest.seed_user(uid)
+    _reset(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, "scheduled")
+    claimed_by = _claim(job_id)
+
+    calls = _script_provider(monkeypatch, [_empty_round(), _empty_round()])
+    write_called = {"n": 0}
+    monkeypatch.setattr(
+        worker, "_write_encrypted_reply",
+        lambda store, text: write_called.update(n=write_called["n"] + 1) or {"id": "r"})
+
+    status = asyncio.run(worker._run_wake(
+        job_id, uid, "scheduled",
+        _wake_deps(tail=[{"id": "m1", "ts": 1.0, "role": "user", "content": "hi"}]),
+        _BYOK, worker.ENCLAVE_SEMAPHORE, claimed_by))
+
+    assert status != "completed", "定时提醒返空竟然算成功了——正是本用例要挡的回归"
+    st, last_error = _job_status(job_id)
+    assert st == "failed", st
+    assert "empty_reply" in str(last_error), last_error
+    assert write_called["n"] == 0
+    # 先重试一轮再判死：判死前必须真的给过第二次机会，否则这就退化成
+    # 「把静默成功换成快速失败」，用户拿到的东西一样少。
+    assert len(calls) == 2, calls
+
+
+def test_scheduled_wake_empty_reply_recovers_on_the_correction_retry(monkeypatch):
+    """恢复链的正例：第一轮返空，纠正提示重试后拿到正文 —— 用户照常收到提醒。
+
+    这是本次改动真正的收益。只测失败那条会让人误以为代价是「更多失败」，
+    实际上多数抽风到这一步就结束了。
+    """
+    uid = "u_wake_sched_recover"
+    conftest.seed_user(uid)
+    _reset(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, "scheduled")
+    claimed_by = _claim(job_id)
+
+    calls = _script_provider(
+        monkeypatch, [_empty_round(), _text_round("该喝水啦")])
+    written = {}
+    monkeypatch.setattr(
+        worker, "_write_encrypted_reply",
+        lambda store, text: written.update(text=text) or {"id": "r"})
+
+    status = asyncio.run(worker._run_wake(
+        job_id, uid, "scheduled",
+        _wake_deps(tail=[{"id": "m1", "ts": 1.0, "role": "user", "content": "hi"}]),
+        _BYOK, worker.ENCLAVE_SEMAPHORE, claimed_by))
+
+    assert status == "completed", _job_status(job_id)
+    assert written.get("text") == "该喝水啦"
+    assert len(calls) == 2, calls

@@ -43,7 +43,7 @@ class ProviderError(Exception):
 # key / 4xx config) — those need the user to fix their provider, not us to hammer it.
 _RETRYABLE_HTTPX = (httpx.TimeoutException, httpx.TransportError)
 _RETRYABLE_STATUS = frozenset({408, 425, 429, 500, 502, 503, 504})
-_PROVIDER_CONFIG_STATUS = frozenset({400, 401, 402, 403, 404, 422})
+_PROVIDER_CONFIG_STATUS = frozenset({400, 401, 402, 403, 404, 415, 422})
 _MAX_PG_BIGINT = (1 << 63) - 1
 
 

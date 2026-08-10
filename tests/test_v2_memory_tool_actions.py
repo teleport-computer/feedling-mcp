@@ -22,8 +22,16 @@ def test_add_maps_to_memory_add_with_nested_plaintext_and_no_envelope():
     a = out[0]
     assert a["type"] == "memory.add"
     assert "envelope" not in a  # server builds the E2E envelope from plaintext
-    assert a["memory"] == {"summary": "编程偏好", "content": "用户最喜欢 Rust。",
-                           "bucket": "偏好", "threads": []}
+    # threads 不出现在翻译结果里 —— 模型没传就不替它写。add 没有可继承的旧卡,
+    # actions 落卡时照样补成 []（已验证与旧行为逐字段相同）;而 update 那条路
+    # 「缺席 vs 空数组」是旧卡标签保不保得住的分水岭,见
+    # test_update_without_bucket_or_threads_does_not_author_empty_ones。
+    memory = dict(a["memory"])
+    # occurred_at 是服务端在 enqueue 时冻结的可信时间,单独验(见
+    # test_occurred_at_is_frozen_at_enqueue_not_at_apply),这里只确认它在。
+    assert memory.pop("occurred_at")
+    assert memory == {"summary": "编程偏好", "content": "用户最喜欢 Rust。",
+                      "bucket": "偏好"}
     assert a["capture_mode"] == "agent_tool"
     assert a["reason"]
 
@@ -97,3 +105,125 @@ def test_memory_dot_prefixed_op_normalized():
 def test_none_and_non_dict_entries_are_skipped():
     assert worker._memory_tool_actions(None) == []
     assert worker._memory_tool_actions(["nope", 3, None]) == []
+
+
+def test_update_without_bucket_or_threads_does_not_author_empty_ones():
+    """模型没传 bucket/threads 时,翻译层不能替它写一个空值。
+
+    现场(2026-08-10):V2 上每次改记忆卡,桶都掉回「未分类」、标签全清空。
+    改卡走的是 supersede(新写一张替换旧的),actions 那边靠
+    `{**inherited, **raw}` 从旧卡继承 bucket/threads —— 但 raw 里带着
+    bucket=""/threads=[],空值照样覆盖继承值。
+
+    根因在翻译层丢了「没传」和「显式传空」的区别。threads 尤其致命:
+    schema 根本不允许模型传,所以每一次 update 都必然清空标签。
+    """
+    out = worker._memory_tool_actions([
+        {"op": "update", "target_id": "mem_1", "summary": "新", "content": "更新后的内容"}])
+    inner = out[0]["memory"]
+
+    assert "bucket" not in inner, "没传桶就不该出现这个键,否则会盖掉旧卡的桶"
+    assert "threads" not in inner, "没传线索就不该出现这个键,否则会清空旧卡的标签"
+
+
+def test_update_with_explicit_bucket_still_overrides():
+    """模型确实传了就照传 —— 别把修复做成「永远不能改桶」。"""
+    out = worker._memory_tool_actions([{
+        "op": "update", "target_id": "mem_1", "summary": "新", "content": "内容",
+        "bucket": "健康",
+    }])
+    assert out[0]["memory"]["bucket"] == "健康"
+
+
+def test_add_still_carries_whatever_the_model_gave():
+    """add 没有可继承的旧卡,行为不变。"""
+    out = worker._memory_tool_actions([{
+        "op": "add", "summary": "s", "content": "c", "bucket": "爱好",
+    }])
+    assert out[0]["memory"]["bucket"] == "爱好"
+
+
+def test_model_can_supply_threads_importance_and_pulse():
+    """这三个字段后端一直在消费,schema 却不允许模型传。
+
+    - threads:worker 早就在转发它,卡在 schema 那道闸 → 卡片标签永远是空的
+    - importance/pulse:actions 默认 0.5/0.3,于是 V2 每张卡权重完全一样,
+      而这两个值直接参与 ambient 排序(memory_readside_core)
+
+    共享的 MEMORY_WRITE_RULES_V1 里明确教了模型这三个字段的含义 ——
+    「prompt 要模型写、schema 禁止模型写」是当前最矛盾的一处。
+    """
+    from capabilities.tool_schema import validate_tool_args
+
+    err = validate_tool_args("memory_write", {"actions": [{
+        "op": "add", "summary": "s", "content": "c", "bucket": "爱好",
+        "threads": ["自行车", "瓜车"], "importance": 0.8, "pulse": 0.6,
+    }]})
+    assert err is None, f"schema 该放行这三个字段,却拒了:{err}"
+
+    out = worker._memory_tool_actions([{
+        "op": "add", "summary": "s", "content": "c",
+        "threads": ["自行车"], "importance": 0.8, "pulse": 0.6,
+    }])
+    inner = out[0]["memory"]
+    assert inner["threads"] == ["自行车"]
+    assert inner["importance"] == 0.8
+    assert inner["pulse"] == 0.6
+
+
+def test_zero_importance_is_not_swallowed_as_missing():
+    """importance=0 / pulse=0 是合法取值,不能被 `or default` 吞成「没传」。"""
+    out = worker._memory_tool_actions([{
+        "op": "add", "summary": "s", "content": "c", "importance": 0, "pulse": 0,
+    }])
+    inner = out[0]["memory"]
+    assert inner["importance"] == 0, "0 被当成没传了"
+    assert inner["pulse"] == 0, "0 被当成没传了"
+
+
+def test_update_still_inherits_when_scores_absent():
+    """没传评分时仍然不写这两个键 —— 和 bucket/threads 同一条规矩。"""
+    out = worker._memory_tool_actions([
+        {"op": "update", "target_id": "mem_1", "summary": "新", "content": "内容"}])
+    inner = out[0]["memory"]
+    assert "importance" not in inner
+    assert "pulse" not in inner
+
+
+def test_occurred_at_is_frozen_at_enqueue_not_at_apply(monkeypatch):
+    """记忆的「发生时间」在入队那一刻定死,不是等它落库时才取。
+
+    V2 的 effect 是排队异步落库的。以前 actions 在 apply 时才 `_now_iso()`,
+    于是队列一卡、几小时后才落库,时间就串了;同一条 effect 重放两次还会拿到
+    两个不同的时间。V1 没这个问题——它是同步写,说话即落库。
+
+    对齐 V1 的做法就是在入队时冻结,和 identity 的 relationship_anchor
+    (`_frozen_relationship_anchor`,同样在 ENQUEUE 冻结)是同一条惯例。
+    """
+    monkeypatch.setattr(worker.core_util, "_now_iso", lambda: "2026-08-10T23:00:00")
+
+    out = worker._memory_tool_actions([{"op": "add", "summary": "s", "content": "c"}])
+
+    assert out[0]["memory"]["occurred_at"] == "2026-08-10T23:00:00"
+
+
+def test_model_cannot_forge_occurred_at(monkeypatch):
+    """时间是服务端的可信元数据,不接受模型自报 —— schema 里也没这个字段。"""
+    monkeypatch.setattr(worker.core_util, "_now_iso", lambda: "2026-08-10T23:00:00")
+
+    out = worker._memory_tool_actions([{
+        "op": "add", "summary": "s", "content": "c",
+        "occurred_at": "1999-01-01T00:00:00",
+    }])
+
+    assert out[0]["memory"]["occurred_at"] == "2026-08-10T23:00:00"
+
+
+def test_update_also_carries_a_frozen_time(monkeypatch):
+    """supersede 走的是同一个 raw（action["memory"]），同样要带上。"""
+    monkeypatch.setattr(worker.core_util, "_now_iso", lambda: "2026-08-10T23:00:00")
+
+    out = worker._memory_tool_actions([
+        {"op": "update", "target_id": "mem_1", "summary": "新", "content": "内容"}])
+
+    assert out[0]["memory"]["occurred_at"] == "2026-08-10T23:00:00"
