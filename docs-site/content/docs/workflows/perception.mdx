@@ -188,15 +188,22 @@ added, so decoders should ignore unknown keys.
 
 ### How the agent receives perception
 
-In a foreground conversation, current perception readings are not inserted into the
-initial model prompt. The agent uses perception tools when your question depends on
-current device, environment, activity, health, calendar, reminder, photo, or shared-screen data.
+In a foreground conversation, ordinary current perception readings are not
+inserted into the initial model prompt. The agent uses perception tools when a
+question depends on current device, environment, activity, health, calendar,
+reminder, or photo data. Live screen sharing is the narrow exception: when its
+newest encrypted frame is at most 90 seconds old and the active model route has
+passed the randomized image-control probe, foreground Chat may attach up to six
+new frames. Without that `ok` verdict, Chat exposes only that sharing is active
+and leaves exact screen data behind the authorized screen-read path.
 
 During an ordinary proactive heartbeat, the runtime may provide a low-resolution
 glance made only of availability and change booleans. Exact readings and private text
 remain tool-only. A perception-triggered heartbeat adds only the triggering event type;
 it does not attach an unrelated device, weather, or health report. Scheduled reminders
-remain reminder-only, and screen watch remains isolated to safe screen metadata.
+remain reminder-only, and the proactive screen-watch lane remains isolated to
+safe screen metadata; foreground Chat's bounded pixel attachment does not change
+what screen watch receives.
 
 Proactive runtime and temporal context is labeled as application data rather
 than presented as a new user message. An ordinary heartbeat does not call the

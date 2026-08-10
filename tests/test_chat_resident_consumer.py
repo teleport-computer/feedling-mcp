@@ -73,6 +73,14 @@ def _reset_proactive_guard_state_between_tests():
     # test that monkeypatches call_agent bypasses that; without this a prior
     # test's suppressed-leak / parse failure leaks in and fails a later wake.
     crc._turn_reply_parse_failed = False
+    crc._SCREEN_DECRYPT_CACHE.clear()
+    crc._last_screen_chat_frame_id = ""
+    crc._screen_runtime_unsupported = False
+    crc._last_screen_context_metrics = {
+        "frame_count": 0,
+        "cache_hits": 0,
+        "cache_misses": 0,
+    }
     crc._reset_system_notice_state()
     yield
     crc._reset_system_notice_state()
@@ -1050,6 +1058,7 @@ def test_screen_question_attaches_decrypted_screen_context(monkeypatch):
             ["/tmp/feedling_chat_images/screen.jpg"],
         ),
     )
+    monkeypatch.setattr(crc, "_worldbook_context_for_foreground", lambda _text: "")
 
     with patch.object(crc, "call_agent", return_value="I can see it.") as mock_agent, \
          patch.object(crc, "post_reply") as mock_post:
@@ -1075,6 +1084,162 @@ def test_screen_context_explicit_disable_still_wins(monkeypatch):
     monkeypatch.setattr(crc, "SCREEN_CONTEXT_MODE", "disabled")
 
     assert crc._should_attach_screen_context("你能看到我的屏幕吗") is False
+
+
+def test_active_screen_share_pushes_up_to_six_new_frames_without_word_heuristic(
+    monkeypatch,
+):
+    now = 10_000.0
+    frames = [
+        {"id": f"f{i}", "ts": now - i, "app": "Feedling"}
+        for i in range(8)
+    ]
+    decrypt_calls = []
+
+    def _fetch(path):
+        if path.startswith("/v1/screen/frames?"):
+            return {"frames": frames}
+        frame_id = path.split("/frames/", 1)[1].split("/", 1)[0]
+        decrypt_calls.append(frame_id)
+        frame = next(row for row in frames if row["id"] == frame_id)
+        return {
+            **frame,
+            "image_b64": base64.b64encode(frame_id.encode()).decode(),
+            "image_mime": "image/jpeg",
+        }
+
+    monkeypatch.setattr(crc.time, "time", lambda: now)
+    monkeypatch.setattr(crc, "SCREEN_CONTEXT_MODE", "auto")
+    monkeypatch.setattr(crc, "SCREEN_VISION_TEST_STATUS", "ok")
+    monkeypatch.setattr(crc, "_fetch_screen_metadata_once", _fetch)
+    monkeypatch.setattr(crc, "_fetch_screen_json", _fetch)
+    monkeypatch.setattr(
+        crc,
+        "_image_file_paths_from_payloads",
+        lambda _name, payloads: [f"/tmp/screen-{i}.jpg" for i in range(len(payloads))],
+    )
+
+    text, payloads, paths = crc._screen_context_for_message("嗨")
+
+    assert len(payloads) == len(paths) == 6
+    assert len(decrypt_calls) == 6
+    assert "UNTRUSTED LIVE SCREEN-SHARE FRAMES" in text
+    assert "captured_at_utc:" in text
+    assert "relative_age_sec:" in text
+    assert crc._last_screen_context_metrics == {
+        "frame_count": 6,
+        "cache_hits": 0,
+        "cache_misses": 6,
+    }
+    assert crc._last_screen_chat_frame_id == decrypt_calls[-1]
+
+
+def test_active_screen_share_without_ok_pixel_verdict_exposes_only_availability(
+    monkeypatch,
+):
+    now = 20_000.0
+    calls = []
+
+    def _fetch(path):
+        calls.append(path)
+        return {"frames": [{"id": "f1", "ts": now - 3}]}
+
+    monkeypatch.setattr(crc.time, "time", lambda: now)
+    monkeypatch.setattr(crc, "SCREEN_VISION_TEST_STATUS", "unsupported")
+    monkeypatch.setattr(crc, "_fetch_screen_metadata_once", _fetch)
+
+    text, payloads, paths = crc._screen_context_for_message("随便聊聊")
+
+    assert "screen_share.active: true" in text
+    assert "latest_frame_age_sec: 3" in text
+    assert payloads == []
+    assert paths == []
+    assert calls == ["/v1/screen/frames?limit=100"]
+
+
+def test_screen_decrypt_cache_is_keyed_by_frame_id(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        crc,
+        "_fetch_screen_json",
+        lambda path: calls.append(path) or {"id": "f1", "image_b64": "YWJj"},
+    )
+
+    first, first_hit = crc._cached_screen_decrypt("f1")
+    second, second_hit = crc._cached_screen_decrypt("f1")
+
+    assert first == second
+    assert first_hit is False
+    assert second_hit is True
+    assert len(calls) == 1
+
+
+def test_foreground_screen_metadata_probe_is_single_attempt_and_short(monkeypatch):
+    get = MagicMock(side_effect=RuntimeError("backend unavailable"))
+    monkeypatch.setattr(crc._HTTP, "get", get)
+
+    assert crc._fetch_screen_metadata_once("/v1/screen/frames?limit=100") is None
+
+    get.assert_called_once()
+    assert get.call_args.kwargs["timeout"] == 2
+
+
+def test_screen_frame_provider_rejection_retries_once_without_screen_pixels(
+    monkeypatch,
+):
+    msg = _make_msg(role="user", content="继续说", ts=2250.0)
+    screen_image = {
+        "mime_type": "image/jpeg",
+        "data": "c2NyZWVu",
+        "data_url": "data:image/jpeg;base64,c2NyZWVu",
+    }
+    monkeypatch.setattr(
+        crc,
+        "_screen_context_for_message",
+        lambda _content: (
+            "UNTRUSTED LIVE SCREEN-SHARE FRAMES\nframe_id: f1",
+            [screen_image],
+            ["/tmp/screen-f1.jpg"],
+        ),
+    )
+    report = MagicMock(return_value=True)
+    monkeypatch.setattr(crc, "_report_runtime_error", report)
+    monkeypatch.setattr(crc, "_worldbook_context_for_foreground", lambda _text: "")
+
+    with patch.object(
+        crc,
+        "call_agent",
+        side_effect=[crc.VisionObserverFailure("vision_model_incompatible"), "ok"],
+    ) as mock_agent, patch.object(crc, "post_reply"):
+        result_ts = crc._process_messages([msg])
+
+    assert result_ts == pytest.approx(2250.0)
+    assert mock_agent.call_count == 2
+    first_call, second_call = mock_agent.call_args_list
+    assert first_call.kwargs["images"] == [screen_image]
+    assert first_call.kwargs["outbound_fence"] is True
+    assert "images" not in second_call.kwargs
+    assert second_call.kwargs["outbound_fence"] is True
+    assert "frame_id: f1" not in second_call.args[0]
+    report.assert_any_call(
+        "", "vision_model_incompatible", provider_result="vision_unsupported"
+    )
+    assert crc._screen_runtime_unsupported is True
+
+
+def test_runtime_error_report_preserves_vision_unsupported_signal(monkeypatch):
+    response = MagicMock(status_code=200)
+    monkeypatch.setattr(crc._HTTP, "post", MagicMock(return_value=response))
+
+    assert crc._report_runtime_error(
+        "",
+        "vision_model_incompatible",
+        provider_result="vision_unsupported",
+    )
+
+    assert crc._HTTP.post.call_args.kwargs["json"]["provider_result"] == (
+        "vision_unsupported"
+    )
 
 
 def test_dedup_prevents_reprocessing_same_message():
@@ -2260,6 +2425,24 @@ def test_prepare_hermes_cli_first_turn_removes_continue(monkeypatch):
 
     assert "--continue" not in cmd
     assert "--resume" not in cmd
+
+
+def test_prepare_cli_outbound_fence_strips_literal_mcp_config(
+    monkeypatch, tmp_path
+):
+    mcp_file = tmp_path / "mcp.json"
+    mcp_file.write_text("{}")
+    monkeypatch.setattr(
+        crc,
+        "AGENT_CLI_CMD",
+        f'claude -p --mcp-config "{mcp_file}" "{{message}}"',
+    )
+    monkeypatch.setattr(crc, "_resolve_cli_executable", lambda cmd: cmd)
+
+    cmd, _stdin = crc._prepare_cli_command("hello", outbound_fence=True)
+
+    assert "--mcp-config" not in cmd
+    assert str(mcp_file) not in cmd
 
 
 def _setup_hermes_session_cli(monkeypatch, tmp_path, *, session_id: str, session_doc: str | None):

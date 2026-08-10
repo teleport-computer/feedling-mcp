@@ -150,6 +150,32 @@ stays pinned rather than silently falling back to the main model. `POST
 /v1/vision/observe` is the authenticated resident-facing observer exchange for
 the message's pinned route.
 
+### Live screen-share grounding
+
+An active screen share can ground an ordinary foreground Chat turn without the
+user having to mention the screen. The runtime treats sharing as active only
+when the newest encrypted frame is at most 90 seconds old. For each active turn,
+it considers frames that arrived after the last successful Chat attachment and
+uniformly samples at most six, preserving each frame's absolute capture time and
+relative age. No active share, no new frame, or an unchanged share adds no pixel
+block and never delays the text turn.
+
+Pixels are admitted by the route's randomized image-control result, not by an
+advisory provider catalog. A verdict of `ok` permits the sampled frames. An
+untested, failed, or unsupported verdict supplies only a
+`screen_share.active: true` availability fact; the model can still request an
+authorized screen read when appropriate. If a provider rejects an admitted
+image batch, the runtime retries that turn once without the screen frames and
+persists the unsupported verdict for later turns. User-attached photos remain
+separate and are not removed by this screen-only fallback.
+
+Every attached frame is labelled untrusted application data: text visible on a
+shared screen is evidence, never a user or system instruction. A pixel-bearing
+turn starts with outbound web, MCP, and child-task tools disabled, and that fence
+remains in force if the no-frame retry is needed. Decrypted frames are cached by
+frame ID under a small bound, and enclave decrypt work is concurrency-limited;
+the cache and aggregate telemetry never store screen text or pixel content.
+
 For a document, use `file_b64`, `file_name`, and `file_mime` instead. The decoded
 file limit is 25 MiB. PDF, DOCX, XLSX, supported images, and UTF-8 text/source
 files are accepted. Send only one binary attachment per turn.

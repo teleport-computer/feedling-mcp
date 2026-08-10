@@ -85,6 +85,7 @@ from perception.glance import (
 from model_api_runtime.v2 import coalesce as v2_coalesce
 from model_api_runtime.v2 import compaction as v2_compaction
 from model_api_runtime.v2 import context
+from model_api_runtime.v2 import screen_chat as v2_screen_chat
 from model_api_runtime.v2 import cursor as v2_cursor
 from model_api_runtime.v2 import document_render as v2_document_render
 from model_api_runtime.v2 import effect_outbox as v2_effect_outbox
@@ -786,9 +787,9 @@ def _screen_share_grounding(user_id: str) -> dict:
     ① **不碰 enclave**。走 `db.frame_list_meta`(服务端明文的 frame_id/ts 索引),
        和 serve_worker 的屏幕监看生产者同一条路 —— 这个函数在**每个聊天回合**都跑,
        一次 enclave 往返会锤死共享解密代理的容量。
-    ② **只回布尔与秒数**。frame_id / caption / 窗口标题一律不进这里,与
-       `_safe_eager_screen_metadata` 同一条基线:屏幕内容是 pull-only,提前塞进第一
-       份 prompt 会让屏幕上的文字在执行栅栏生效前就选择一次对外调用。
+    ② **只回布尔与秒数**。frame_id / caption / 窗口标题一律不进这个可用性块。
+       视觉探针为 ok 时,调用方另走有界推帧路径,把像素标成不可信应用数据,并在
+       第一轮 provider 调用之前先建立出站执行栅栏。
 
     共享没在进行(或读取失败)时返回 {},调用方据此整块省略 —— 不共享的用户
     prompt 一个字都不变,provider 侧的前缀缓存不受影响。
@@ -1296,6 +1297,9 @@ class TurnDeps:
     # read_tail，b64 会进摘要器 prompt，且该用户历史上每张图都会被解密一次。默认 None：
     # worker.py 自身不 import hosted/capabilities 的装配细节；生产装配见 serve_worker。
     read_images: Callable[[str, list[str]], dict[str, dict]] | None = None
+    # Foreground screen-share pixels. Production returns a bounded decrypted
+    # batch plus content-free cache counters; callers must hold enclave_sem.
+    read_screen_frames: Callable[[str, list[str]], dict[str, Any]] | None = None
     # (user_id, prompt, main config, auth) -> tuple[ProviderMedia, ...]. The
     # assembly tier resolves the optional dedicated route and decrypts only its
     # credential. The model-facing tool stays provider-neutral.
@@ -2301,6 +2305,10 @@ class TurnMetrics:
     effective_tail_turns: int | None = None
     tail_fallback: bool = False
     prompt_frontier_exhaustion_count: int = 0
+    screen_frames_pushed: int = 0
+    screen_frame_cache_hits: int = 0
+    screen_frame_cache_misses: int = 0
+    visible_reply_count: int = 0
     _flushed: bool = False
     _started: float = 0.0
 
@@ -2402,6 +2410,19 @@ class TurnMetrics:
             self.prompt_frontier_exhaustion_count + 1,
         )
 
+    def record_screen_frames(
+        self, *, pushed: int, cache_hits: int, cache_misses: int
+    ) -> None:
+        self.screen_frames_pushed = max(0, int(pushed))
+        self.screen_frame_cache_hits = max(0, int(cache_hits))
+        self.screen_frame_cache_misses = max(0, int(cache_misses))
+
+    def record_visible_reply(self) -> None:
+        self.visible_reply_count = min(
+            (1 << 31) - 1,
+            self.visible_reply_count + 1,
+        )
+
     def flush(self, *, failed: bool, status: str) -> None:
         """Idempotent per-job upsert; guarded so this SAME accumulator instance
         never double-writes even if a lane handler somehow reaches two terminal
@@ -2442,6 +2463,10 @@ class TurnMetrics:
             prompt_frontier_exhaustion_count=(
                 self.prompt_frontier_exhaustion_count
             ),
+            screen_frames_pushed=self.screen_frames_pushed,
+            screen_frame_cache_hits=self.screen_frame_cache_hits,
+            screen_frame_cache_misses=self.screen_frame_cache_misses,
+            visible_reply_count=self.visible_reply_count,
             latency_ms=latency_ms,
             model_calls=self.model_calls,
             retries=self.retries,
@@ -3387,6 +3412,7 @@ def _make_build_messages_fn(
     tail_anchor_seq: int | None = None,
     application_data_role: str = "user",
     manual_wake: bool = False,
+    screen_frame_message: dict[str, Any] | None = None,
 ) -> Callable[[list], list]:
     """Build the fixed base prompt plus the loop's chronological native transcript.
 
@@ -3463,6 +3489,7 @@ def _make_build_messages_fn(
             temporal_context=_temporal_for(rendered_tail),
             application_data_role=application_data_role,
             manual_wake=manual_wake,
+            screen_frame_message=screen_frame_message,
         )
 
     base_messages = _base(optional_turns)
@@ -8529,6 +8556,8 @@ async def _run_wake(
                             "[v2.worker] wake reply push slot build failed user=%s: %s",
                             user_id, e)
                 if status == "applied":
+                    if tm is not None:
+                        tm.record_visible_reply()
                     if final:
                         source_status = await asyncio.to_thread(
                             jobs_store.get_job_status,
@@ -8592,6 +8621,8 @@ async def _run_wake(
                 },
                 best_effort=True,
             )
+            if tm is not None:
+                tm.record_visible_reply()
 
         # Snapshot the boundary at wake start. Production uses the same total-order
         # seq reader as chat; timestamp fallback remains only for narrow tests.
@@ -12371,6 +12402,86 @@ async def process_job(
             grounding_results["screen_share"] = [
                 {"ok": True, "data": screen_share_state}
             ]
+        screen_frame_message: dict[str, Any] | None = None
+        pushed_screen_frame_ids: list[str] = []
+        screen_vision_verdict = None
+        if screen_share_state:
+            screen_vision_verdict = await asyncio.to_thread(
+                db.model_api_active_route_vision_verdict, user_id
+            )
+        if (
+            screen_share_state
+            and isinstance(screen_vision_verdict, dict)
+            and screen_vision_verdict.get("vision_test_status") == "ok"
+            and deps.read_screen_frames is not None
+        ):
+            try:
+                schedule = await asyncio.to_thread(
+                    jobs_store.get_wake_schedule, user_id
+                )
+                last_pushed = str(
+                    (schedule or {}).get("last_screen_chat_frame_id") or ""
+                )
+                frame_meta = await asyncio.to_thread(db.frame_list_meta, user_id)
+                selected_meta = v2_screen_chat.uniformly_sample_new_frames(
+                    frame_meta,
+                    last_pushed_frame_id=last_pushed,
+                )
+                if selected_meta:
+                    selected_ids = [
+                        str(row.get("id") or row.get("frame_id") or "")
+                        for row in selected_meta
+                    ]
+                    async with enclave_sem:
+                        batch = await asyncio.to_thread(
+                            deps.read_screen_frames, user_id, selected_ids
+                        )
+                    decrypted = (
+                        batch.get("frames") if isinstance(batch, dict) else {}
+                    )
+                    decrypted = decrypted if isinstance(decrypted, dict) else {}
+                    merged_frames: list[dict[str, Any]] = []
+                    for meta in selected_meta:
+                        frame_id = str(
+                            meta.get("id") or meta.get("frame_id") or ""
+                        )
+                        pixels = decrypted.get(frame_id)
+                        if not isinstance(pixels, dict):
+                            continue
+                        merged_frames.append({**meta, **pixels, "id": frame_id})
+                    screen_frame_message = (
+                        v2_screen_chat.build_untrusted_frame_message(
+                            merged_frames, now=time.time()
+                        )
+                    )
+                    if screen_frame_message is not None:
+                        pushed_screen_frame_ids = [
+                            str(frame["id"]) for frame in merged_frames
+                        ]
+                    tm.record_screen_frames(
+                        pushed=len(pushed_screen_frame_ids),
+                        cache_hits=int((batch or {}).get("cache_hits") or 0),
+                        cache_misses=int((batch or {}).get("cache_misses") or 0),
+                    )
+            except Exception as exc:  # noqa: BLE001 - pixels are optional grounding
+                log.warning(
+                    "[v2.worker] screen frame grounding failed user=%s code=%s",
+                    user_id,
+                    type(exc).__name__,
+                )
+
+        async def _on_screen_images_rejected(_exc: BaseException) -> None:
+            verdict = screen_vision_verdict
+            if not isinstance(verdict, dict) or not verdict.get("id"):
+                return
+            await asyncio.to_thread(
+                db.model_api_route_mark_vision_test,
+                user_id,
+                str(verdict["id"]),
+                status="unsupported",
+                error="vision_model_incompatible",
+                expected_updated_at=str(verdict.get("updated_at") or ""),
+            )
         turn_extra_context = (
             context.action_context_str(grounding_results) if grounding_results else ""
         )
@@ -12400,6 +12511,7 @@ async def process_job(
                 tail_source_truncated=tail_source_truncated,
                 tail_lane=lane,
                 tail_anchor_seq=optional_anchor_seq,
+                screen_frame_message=screen_frame_message,
             )
 
         build_messages = _chat_builder()
@@ -12532,6 +12644,9 @@ async def process_job(
             disabled_tool_names=disabled_tool_names_for_turn,
             outbound_blocking_read_tool_names=_PRIVATE_READ_TOOLS,
             outbound_blocking_read_tool_predicate=_read_blocks_later_outbound,
+            initial_outbound_tools_blocked=(screen_frame_message is not None),
+            tagged_image_message_key=v2_screen_chat.MESSAGE_TAG,
+            on_tagged_images_rejected=_on_screen_images_rejected,
             max_tool_calls_per_round=MAX_TOOL_CALLS_PER_ROUND,
             max_tool_calls_per_turn=MAX_TOOL_CALLS_PER_TURN,
             tool_result_char_cap=TOOL_RESULT_CHAR_CAP,
@@ -12555,6 +12670,12 @@ async def process_job(
                 tm.record_prompt_frontier_exhaustion
             ),
         )
+        if pushed_screen_frame_ids:
+            await asyncio.to_thread(
+                jobs_store.upsert_wake_schedule,
+                user_id,
+                last_screen_chat_frame_id=pushed_screen_frame_ids[-1],
+            )
         if voice_call_ended_atomically:
             try:
                 await asyncio.to_thread(_emit_status, user_id, job_id, "done")

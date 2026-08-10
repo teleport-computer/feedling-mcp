@@ -3882,6 +3882,10 @@ def record_whole_turn_metric(
     effective_tail_turns=None,
     tail_fallback=False,
     prompt_frontier_exhaustion_count=0,
+    screen_frames_pushed=0,
+    screen_frame_cache_hits=0,
+    screen_frame_cache_misses=0,
+    visible_reply_count=0,
 ) -> None:
     """One idempotent whole-turn metric per job (spec B5): upsert on job_id so a
     re-drive (redelivery/retry of the same job) REPLACES rather than appends. Covers
@@ -3894,9 +3898,11 @@ def record_whole_turn_metric(
                 "cache_miss_tokens, usage_reported_calls, cache_reported_calls, "
                 "provider, model, cache_route_fingerprint, latency_ms, model_calls, "
                 "retries, failed, status, effective_tail_turns, tail_fallback, "
-                "prompt_frontier_exhaustion_count) "
+                "prompt_frontier_exhaustion_count, screen_frames_pushed, "
+                "screen_frame_cache_hits, screen_frame_cache_misses, "
+                "visible_reply_count) "
                 "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,"
-                "%s,%s,%s) "
+                "%s,%s,%s,%s,%s,%s,%s) "
                 "ON CONFLICT (job_id) DO UPDATE SET "
                 "user_id=EXCLUDED.user_id, lane=EXCLUDED.lane, "
                 "prompt_tokens=EXCLUDED.prompt_tokens, completion_tokens=EXCLUDED.completion_tokens, "
@@ -3913,6 +3919,10 @@ def record_whole_turn_metric(
                 "tail_fallback=EXCLUDED.tail_fallback, "
                 "prompt_frontier_exhaustion_count="
                 "EXCLUDED.prompt_frontier_exhaustion_count, "
+                "screen_frames_pushed=EXCLUDED.screen_frames_pushed, "
+                "screen_frame_cache_hits=EXCLUDED.screen_frame_cache_hits, "
+                "screen_frame_cache_misses=EXCLUDED.screen_frame_cache_misses, "
+                "visible_reply_count=EXCLUDED.visible_reply_count, "
                 "updated_at=now()",
                 (
                     job_id,
@@ -3936,6 +3946,10 @@ def record_whole_turn_metric(
                     effective_tail_turns,
                     bool(tail_fallback),
                     max(0, int(prompt_frontier_exhaustion_count)),
+                    max(0, int(screen_frames_pushed)),
+                    max(0, int(screen_frame_cache_hits)),
+                    max(0, int(screen_frame_cache_misses)),
+                    max(0, int(visible_reply_count)),
                 ),
             )
     except Exception as e:  # noqa: BLE001 — best-effort instrumentation, never fail the turn
@@ -10277,15 +10291,14 @@ def get_failure_review(source_job_id: int | str, user_id: str) -> dict | None:
 
 def get_wake_schedule(user_id) -> dict | None:
     """读取该用户的 v2_wake_schedule 行（proactive 唤醒调度：下次心跳/采集/屏幕监看到期
-    时间 + BYOK 支付冷却截止 + screen_watch 的跨-tick 状态 last_screen_watch_frame_id），
-    无行返回 None（该用户尚未被调度器接管过）。
+    时间 + BYOK 支付冷却截止 + screen_watch 与 foreground screen-chat 的跨回合
+    frame cursor），无行返回 None（该用户尚未被调度器接管过）。
 
     **四个时间列一律以 epoch 浮点数返回**（`EXTRACT(EPOCH FROM ...)`），与
     `upsert_wake_schedule` 收的 epoch float 对称，调用方可以直接做算术比较。
     曾经只有 `next_screen_watch_at` 是 float、其余三列是 `datetime` —— 同一个 dict 里四个
-    同类字段两种类型是个地雷（谁会记得只有第四个能做减法？）。本函数没有生产调用方，
-    只有测试，所以统一成 float 的代价是零。`updated_at` 保持 datetime：它是审计字段，
-    没人拿它做算术。"""
+    同类字段两种类型是个地雷（谁会记得只有第四个能做减法？）。`updated_at` 保持
+    datetime：它是审计字段，没人拿它做算术。"""
     with _pool().connection() as conn:
         with conn.cursor(row_factory=dict_row) as cur:
             cur.execute(
@@ -10296,7 +10309,7 @@ def get_wake_schedule(user_id) -> dict | None:
                 "EXTRACT(EPOCH FROM next_screen_watch_at) AS next_screen_watch_at, "
                 "EXTRACT(EPOCH FROM proactive_backoff_until) "
                 "AS proactive_backoff_until, "
-                "last_screen_watch_frame_id, self_wake_streak, "
+                "last_screen_watch_frame_id, last_screen_chat_frame_id, self_wake_streak, "
                 "self_wake_user_seq, self_wake_last_effect_id, "
                 "self_wake_last_effect_accepted, proactive_fail_streak, "
                 "proactive_fail_user_seq, updated_at "
@@ -10404,6 +10417,7 @@ def upsert_wake_schedule(
     payment_cooldown_until: float | None = None,
     next_screen_watch_at: float | None = None,
     last_screen_watch_frame_id: str | None = None,
+    last_screen_chat_frame_id: str | None = None,
 ) -> None:
     """UPSERT 该用户的唤醒调度行。时间列各自是可选的 epoch 浮点数；传 None 表示
     「本次不动这一列」（COALESCE(EXCLUDED.col, 现有值) 保留旧值），不会把已有到期时间
@@ -10418,15 +10432,17 @@ def upsert_wake_schedule(
         conn.execute(
             "INSERT INTO v2_wake_schedule "
             "(user_id, next_heartbeat_at, next_capture_at, payment_cooldown_until, "
-            "next_screen_watch_at, last_screen_watch_frame_id, updated_at) "
+            "next_screen_watch_at, last_screen_watch_frame_id, "
+            "last_screen_chat_frame_id, updated_at) "
             "VALUES (%s, to_timestamp(%s), to_timestamp(%s), to_timestamp(%s), "
-            "to_timestamp(%s), %s, now()) "
+            "to_timestamp(%s), %s, %s, now()) "
             "ON CONFLICT (user_id) DO UPDATE SET "
             "next_heartbeat_at = COALESCE(EXCLUDED.next_heartbeat_at, v2_wake_schedule.next_heartbeat_at), "
             "next_capture_at = COALESCE(EXCLUDED.next_capture_at, v2_wake_schedule.next_capture_at), "
             "payment_cooldown_until = COALESCE(EXCLUDED.payment_cooldown_until, v2_wake_schedule.payment_cooldown_until), "
             "next_screen_watch_at = COALESCE(EXCLUDED.next_screen_watch_at, v2_wake_schedule.next_screen_watch_at), "
             "last_screen_watch_frame_id = COALESCE(EXCLUDED.last_screen_watch_frame_id, v2_wake_schedule.last_screen_watch_frame_id), "
+            "last_screen_chat_frame_id = COALESCE(EXCLUDED.last_screen_chat_frame_id, v2_wake_schedule.last_screen_chat_frame_id), "
             "updated_at = now()",
             (
                 user_id,
@@ -10440,6 +10456,9 @@ def upsert_wake_schedule(
                 else None,
                 str(last_screen_watch_frame_id)
                 if last_screen_watch_frame_id is not None
+                else None,
+                str(last_screen_chat_frame_id)
+                if last_screen_chat_frame_id is not None
                 else None,
             ),
         )

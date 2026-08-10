@@ -169,6 +169,117 @@ def test_empty_tool_calls_is_final_reply_no_dispatch(monkeypatch):
     assert progress == ["round_boundary", "provider_start", "provider_complete"]
 
 
+def test_tagged_screen_images_retry_once_without_frames(monkeypatch):
+    provider = _ScriptedProvider([
+        # OpenRouter commonly reports an image rejection as 404 even when the
+        # configured text model itself is valid.
+        provider_client.ProviderError("images unsupported", status_code=404),
+        {"reply": "text fallback", "tool_calls": [], "usage": {}},
+    ])
+
+    async def scripted(config, messages, *, tools=None, **kwargs):
+        provider.calls.append({"config": config, "messages": messages, "tools": tools, **kwargs})
+        item = provider.responses.pop(0)
+        if isinstance(item, BaseException):
+            raise item
+        return item
+
+    monkeypatch.setattr(provider_client, "chat_completion_async", scripted)
+    rejected = []
+    usage = []
+    on_reply = _RecordingReply()
+    tagged = {
+        "role": "user",
+        "content": [
+            {"type": "text", "text": "untrusted frame"},
+            {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,AAAA"}},
+        ],
+        "_screen_test": True,
+    }
+
+    outcome = asyncio.run(tool_loop.run_tool_loop(
+        provider_config=_TEST_PROVIDER_CONFIG,
+        build_messages=lambda _transcript: [tagged, {"role": "user", "content": "hi"}],
+        dispatch_tools=_RecordingDispatch(),
+        on_reply=on_reply,
+        fold_new_messages=_RecordingFold([]),
+        add_usage=usage.append,
+        max_calls=3,
+        tagged_image_message_key="_screen_test",
+        on_tagged_images_rejected=lambda exc: rejected.append(type(exc).__name__),
+    ))
+
+    assert len(provider.calls) == 2
+    assert tagged in provider.calls[0]["messages"]
+    assert tagged not in provider.calls[1]["messages"]
+    assert rejected == ["ProviderError"]
+    assert usage == [None, {}]
+    assert outcome.final_text == "text fallback"
+
+
+def test_tagged_image_verdict_is_not_persisted_when_text_retry_also_fails(
+    monkeypatch,
+):
+    provider = _ScriptedProvider([
+        provider_client.ProviderError("images unsupported", status_code=404),
+        provider_client.ProviderError("route unavailable", status_code=503),
+    ])
+
+    async def scripted(config, messages, *, tools=None, **kwargs):
+        provider.calls.append({"config": config, "messages": messages, "tools": tools, **kwargs})
+        item = provider.responses.pop(0)
+        if isinstance(item, BaseException):
+            raise item
+        return item
+
+    monkeypatch.setattr(provider_client, "chat_completion_async", scripted)
+    rejected = []
+    tagged = {
+        "role": "user",
+        "content": [
+            {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,AAAA"}},
+        ],
+        "_screen_test": True,
+    }
+
+    with pytest.raises(provider_client.ProviderError):
+        asyncio.run(tool_loop.run_tool_loop(
+            provider_config=_TEST_PROVIDER_CONFIG,
+            build_messages=lambda _transcript: [tagged],
+            dispatch_tools=_RecordingDispatch(),
+            on_reply=_RecordingReply(),
+            fold_new_messages=_RecordingFold([]),
+            add_usage=_noop_add_usage,
+            max_calls=2,
+            tagged_image_message_key="_screen_test",
+            on_tagged_images_rejected=lambda exc: rejected.append(exc),
+        ))
+
+    assert len(provider.calls) == 2
+    assert rejected == []
+
+
+def test_initial_outbound_fence_is_armed_before_first_provider_call(monkeypatch):
+    provider = _ScriptedProvider([
+        {"reply": "offline answer", "tool_calls": [], "usage": {}},
+    ])
+    monkeypatch.setattr(provider_client, "chat_completion_async", provider)
+
+    asyncio.run(tool_loop.run_tool_loop(
+        provider_config=_TEST_PROVIDER_CONFIG,
+        build_messages=_RecordingBuildMessages(),
+        dispatch_tools=_RecordingDispatch(),
+        on_reply=_RecordingReply(),
+        fold_new_messages=_RecordingFold([]),
+        add_usage=_noop_add_usage,
+        max_calls=2,
+        initial_outbound_tools_blocked=True,
+    ))
+
+    offered = {spec.name for spec in (provider.calls[0]["tools"] or ())}
+    assert {"web_search", "web_fetch", "task"}.isdisjoint(offered)
+
+
 def test_provider_image_is_a_terminal_reply_without_synthetic_text(monkeypatch):
     provider = _ScriptedProvider(
         [

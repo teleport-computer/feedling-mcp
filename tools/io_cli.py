@@ -520,6 +520,8 @@ def _emit_web_result(status, body):
 
 def cmd_web_search(args):
     """联网搜索实时信息。POST /v1/agent/web/search."""
+    if os.environ.get("FEEDLING_OUTBOUND_FENCE") == "1":
+        _emit({"ok": False, "error": "outbound_blocked_after_private_screen_read"}, 1)
     api_url, auth = _require_backend()
     payload = {"query": args.query}
     if args.limit is not None:
@@ -530,6 +532,8 @@ def cmd_web_search(args):
 
 def cmd_web_fetch(args):
     """抓取指定网页正文。POST /v1/agent/web/fetch."""
+    if os.environ.get("FEEDLING_OUTBOUND_FENCE") == "1":
+        _emit({"ok": False, "error": "outbound_blocked_after_private_screen_read"}, 1)
     api_url, auth = _require_backend()
     status, body = _http_json("POST", f"{api_url}/v1/agent/web/fetch", auth, payload={"url": args.url})
     _emit_web_result(status, body)

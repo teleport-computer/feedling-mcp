@@ -95,6 +95,37 @@ def test_cache_telemetry_and_provider_identity_are_persisted(pg_clean_metrics):
     )
 
 
+def test_screen_frame_and_visible_reply_metrics_are_content_free(pg_clean_metrics):
+    uid = "u_wtm_screen"
+    jid = _seed_job(uid)
+    jobs_store.record_whole_turn_metric(
+        jid,
+        uid,
+        "screen_watch",
+        screen_frames_pushed=6,
+        screen_frame_cache_hits=4,
+        screen_frame_cache_misses=2,
+        visible_reply_count=1,
+        prompt_tokens=10,
+        completion_tokens=0,
+        latency_ms=20,
+        model_calls=1,
+        retries=0,
+        failed=False,
+        status="ok",
+    )
+
+    with db.get_pool().connection() as conn:
+        row = conn.execute(
+            "SELECT screen_frames_pushed, screen_frame_cache_hits, "
+            "screen_frame_cache_misses, visible_reply_count "
+            "FROM v2_turn_metrics WHERE job_id=%s",
+            (jid,),
+        ).fetchone()
+
+    assert row == (6, 4, 2, 1)
+
+
 def test_token_metrics_accept_values_above_legacy_integer_range(pg_clean_metrics):
     uid = "u_wtm_bigint"
     jid = _seed_job(uid)

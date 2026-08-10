@@ -46,6 +46,7 @@ import threading
 import time
 import types
 import uuid
+from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -79,6 +80,7 @@ from hosted import mcp_tools
 from hosted import vision_observer
 from identity import identity_core
 from memory import memory_core
+from screen import screen_read_core
 from model_api_runtime.v2 import context as v2_context
 from model_api_runtime.v2 import compaction as v2_compaction
 from model_api_runtime.v2 import cursor as v2_cursor
@@ -2037,6 +2039,120 @@ def _read_images(user_id: str, message_ids: list[str]) -> dict[str, dict]:
                 "image_b64": data["image_b64"],
             }
     return out
+
+
+_SCREEN_FRAME_CACHE_TTL_SEC = 300.0
+_SCREEN_FRAME_NEGATIVE_CACHE_TTL_SEC = 10.0
+_SCREEN_FRAME_CACHE_MAX_ENTRIES = 48
+_SCREEN_FRAME_CACHE_LOCK = threading.Lock()
+_SCREEN_FRAME_CACHE: OrderedDict[
+    tuple[str, str], tuple[float, dict | None]
+] = OrderedDict()
+_SCREEN_FRAME_INFLIGHT: dict[tuple[str, str], threading.Event] = {}
+
+
+def _decode_screen_frame_result(result) -> dict | None:
+    if result.status != 200:
+        return None
+    body = result.json_body
+    if body is None and result.raw_body is not None:
+        try:
+            raw = result.raw_body
+            if isinstance(raw, bytes):
+                raw = raw.decode("utf-8")
+            body = json.loads(raw)
+        except (TypeError, ValueError, UnicodeDecodeError):
+            return None
+    if not isinstance(body, dict):
+        return None
+    image_b64 = str(body.get("image_b64") or "").strip()
+    if image_b64.startswith("data:") and "," in image_b64:
+        image_b64 = image_b64.split(",", 1)[1]
+    if not image_b64:
+        return None
+    return {
+        "image_b64": image_b64,
+        "image_mime": str(body.get("image_mime") or "image/jpeg"),
+        "ts": body.get("ts"),
+    }
+
+
+def _read_screen_frame_cached(user_id: str, frame_id: str) -> tuple[dict | None, bool]:
+    """Single-flight one shared-proxy decrypt. Returns (pixels, cache_hit)."""
+    key = (str(user_id), str(frame_id))
+    while True:
+        now = time.monotonic()
+        with _SCREEN_FRAME_CACHE_LOCK:
+            stale = [
+                cached_key
+                for cached_key, (stored_at, cached_value) in _SCREEN_FRAME_CACHE.items()
+                if now - stored_at
+                > (
+                    _SCREEN_FRAME_CACHE_TTL_SEC
+                    if cached_value is not None
+                    else _SCREEN_FRAME_NEGATIVE_CACHE_TTL_SEC
+                )
+            ]
+            for cached_key in stale:
+                _SCREEN_FRAME_CACHE.pop(cached_key, None)
+            if key in _SCREEN_FRAME_CACHE:
+                cached = _SCREEN_FRAME_CACHE[key]
+                _SCREEN_FRAME_CACHE.move_to_end(key)
+                return (
+                    dict(cached[1]) if cached[1] is not None else None,
+                    True,
+                )
+            waiter = _SCREEN_FRAME_INFLIGHT.get(key)
+            if waiter is None:
+                waiter = threading.Event()
+                _SCREEN_FRAME_INFLIGHT[key] = waiter
+                owner = True
+            else:
+                owner = False
+        if owner:
+            break
+        waiter.wait(timeout=35.0)
+
+    value: dict | None = None
+    try:
+        store = core_store.get_store(user_id)
+        value = _decode_screen_frame_result(
+            screen_read_core.frame_decrypt(
+                store,
+                frame_id,
+                include_image="true",
+                api_key=None,
+                runtime_token=_mint_runtime_token(user_id),
+            )
+        )
+        return (dict(value) if value is not None else None), False
+    finally:
+        with _SCREEN_FRAME_CACHE_LOCK:
+            _SCREEN_FRAME_CACHE[key] = (
+                time.monotonic(),
+                dict(value) if value is not None else None,
+            )
+            _SCREEN_FRAME_CACHE.move_to_end(key)
+            while len(_SCREEN_FRAME_CACHE) > _SCREEN_FRAME_CACHE_MAX_ENTRIES:
+                _SCREEN_FRAME_CACHE.popitem(last=False)
+            completed = _SCREEN_FRAME_INFLIGHT.pop(key, None)
+            if completed is not None:
+                completed.set()
+
+
+def _read_screen_frames(user_id: str, frame_ids: list[str]) -> dict[str, Any]:
+    frames: dict[str, dict] = {}
+    hits = 0
+    misses = 0
+    # Sequential by design: all users share the same enclave decrypt proxy. The
+    # worker's outer enclave_sem bounds cross-turn concurrency as well.
+    for frame_id in frame_ids[:6]:
+        value, hit = _read_screen_frame_cached(user_id, str(frame_id))
+        hits += int(hit)
+        misses += int(not hit)
+        if value is not None:
+            frames[str(frame_id)] = value
+    return {"frames": frames, "cache_hits": hits, "cache_misses": misses}
 
 
 def _observe_photo(
@@ -4385,6 +4501,7 @@ def build_production_deps() -> v2_worker.TurnDeps:
         append_summary_segment=_append_summary_segment,
         append_summary_checkpoint=_append_summary_checkpoint,
         read_images=_read_images,
+        read_screen_frames=_read_screen_frames,
         generate_image=_generate_image_for_chat,
         read_vision_observations=_read_vision_observations,
         observe_photo=_observe_photo,

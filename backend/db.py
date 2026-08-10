@@ -5727,7 +5727,8 @@ def list_agent_runtime_enabled_users() -> list[dict]:
                   r.model AS model,
                   c.base_url AS base_url,
                   c.supports_responses AS supports_responses,
-                  COALESCE(r.reasoning_effort, '') AS reasoning_effort
+                  COALESCE(r.reasoning_effort, '') AS reasoning_effort,
+                  r.vision_test_status AS vision_test_status
                 FROM model_api_routes r
                 JOIN model_api_credentials c ON c.id = r.credential_id
                 WHERE r.is_active
@@ -5751,8 +5752,10 @@ def list_agent_runtime_enabled_users() -> list[dict]:
         return [{"user_id": uid, "driver": driver, "provider": provider,
                  "model": model, "base_url": base_url,
                  "supports_responses": bool(supports_responses),
-                 "reasoning_effort": reasoning_effort}
-                for uid, driver, provider, model, base_url, supports_responses, reasoning_effort in rows]
+                 "reasoning_effort": reasoning_effort,
+                 "vision_test_status": str(vision_test_status or "untested")}
+                for uid, driver, provider, model, base_url, supports_responses,
+                reasoning_effort, vision_test_status in rows]
     except Exception as e:
         log.error("[db] list_agent_runtime_enabled_users failed: %s", e)
         return []
@@ -11968,6 +11971,33 @@ def model_api_active_route_version(user_id: str) -> dict | None:
         }
     except Exception as e:
         log.error("[db] model_api_active_route_version(%s) failed: %s", user_id, e)
+        return None
+
+
+def model_api_active_route_vision_verdict(user_id: str) -> dict | None:
+    """Return the active route's pixel-probe verdict without its key envelope."""
+    try:
+        with get_pool().connection() as conn:
+            row = conn.execute(
+                "SELECT id::text, vision_test_status, "
+                "to_char(updated_at AT TIME ZONE 'UTC',"
+                "  'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') "
+                "FROM model_api_routes WHERE user_id=%s AND is_active",
+                (user_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return {
+            "id": str(row[0]),
+            "vision_test_status": str(row[1] or "untested"),
+            "updated_at": str(row[2] or ""),
+        }
+    except Exception as e:
+        log.error(
+            "[db] model_api_active_route_vision_verdict(%s) failed: %s",
+            user_id,
+            e,
+        )
         return None
 
 
