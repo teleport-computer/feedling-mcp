@@ -142,6 +142,9 @@ import generated_image
 # Shared torn-protocol-JSON leak detector (backend/core, pure). backend/ is on
 # sys.path via the insert above, so it imports as a top-level `core.*` name.
 from core import protocol_leak as _protocol_leak
+# 世界书注入侧的标头/上限/截断标记与 V2 共用同一份定义(纯模块,无 enclave 依赖)。
+# 各写一份就会漂——本文件前台原本就漂成了没有 UNTRUSTED 标注的弱版本。
+import worldbook_match as _worldbook_match
 
 from memory.capture_prompt_v1 import (
     build_capture_prompt,
@@ -3702,6 +3705,64 @@ def _worldbook_context_for_foreground(content: str) -> str:
         return block
     except Exception as exc:
         log.warning("worldbook context fetch failed: %s", exc)
+        return ""
+
+
+def _worldbook_context_for_wake(job: dict) -> str:
+    """主动开口时的世界书（Seven 2026-08-10）。
+
+    之前只有前台聊天注入，于是同一个伴侣在聊天里说「影月初三」、心跳主动发消息时
+    说「8 月 11 号」——用户看到的是人格分裂，而世界书恰恰是为「设定一致」买的。
+
+    **匹配信号按道分**，因为世界书有两半、语义不同：
+      · alwaysOn 条目 = 世界常数（历法/地名/「这世界没有手机」），语义就是「聊什么
+        都成立」，所有唤醒道都给；
+      · 关键词触发条目 = 对话范围内的资料，要有**新鲜的文本信号**才有意义。
+        定时唤醒有（提醒正文，且它本来就已逐字进 prompt，拿它匹配零新增暴露面）；
+        心跳没有（手里只有可能几小时前的旧消息）；屏幕监看有新输入但**是不可信
+        输入**，用屏幕文本去选世界书条目等于让屏幕内容影响 prompt 内容，绕开了
+        既有的「屏幕文本 pull-only」防注入姿态。
+
+    不需要动匹配器：空 messages 下 `worldbook_match._triggered` 天然只留 alwaysOn。
+    ⚠️ 不要复用 `_worldbook_context_for_foreground`——它 `if not text: return ""`
+    早退，会让所有无信号的唤醒道一条 alwaysOn 都拿不到，正好抹掉本函数的目的。
+
+    ⚠️ **成本已知并接受(codex 复验 2026-08-10)**:本函数在每次主动唤醒都会打一次
+    `/v1/worldbook/match`。用户一条世界书都没有时 backend 200 早返,但只要存有任意
+    条目(哪怕全是 keyword-only),空 messages 仍会把全部条目送进 enclave 解密匹配;
+    resident 侧固定 `timeout=20`。更要紧的是**调用点在资格闸之前**——
+    `_process_proactive_jobs` 先构建整条消息,之后才判 proactive backoff / payment
+    cooldown,所以一个最终必然 skipped 的 job 也会白付这次往返。
+    这不是本函数引入的排序:同一段里的屏幕抓取、感知摘要早就在闸之前。把闸整体提到
+    昂贵构建之前是**独立的可靠性改进**,不在世界书这批里夹带(改动主动 job 生命周期
+    顺序,需要自己的回归面)。
+    """
+    messages: list[dict] = []
+    if _is_scheduled_wake_job(job):
+        note = _scheduled_note(job)
+        if note:
+            messages = [{"role": "user", "content": note}]
+    try:
+        resp = _HTTP.post(
+            f"{FEEDLING_API_URL}/v1/worldbook/match",
+            headers=_HEADERS,
+            json={"messages": messages},
+            timeout=20,
+        )
+        if resp.status_code == 404:
+            return ""
+        resp.raise_for_status()
+        body = resp.json()
+        block = str((body or {}).get("block") or "").strip()
+        if block:
+            log.info(
+                "worldbook wake context injected names=%s signal=%s",
+                (body or {}).get("matched_names") or [],
+                "reminder_note" if messages else "always_on_only",
+            )
+        return block
+    except Exception as exc:  # 与前台同款 best effort:取不到不该打掉一次主动开口
+        log.warning("worldbook wake context fetch failed: %s", exc)
         return ""
 
 
@@ -12367,13 +12428,18 @@ def _wake_trigger_line(job: dict) -> str:
     return ", ".join(seen) if seen else "wake"
 
 
-def _scheduled_wake_message(job: dict) -> str:
+def _scheduled_note(job: dict) -> str:
+    """提醒正文。抽成函数是因为世界书匹配也要读它——两处各抄一遍就会漂。"""
     note = ""
     for key in ("scheduled_note", "context_hint", "change_digest"):
         note = str((job or {}).get(key) or "").strip()
         if note:
             break
-    note = note[:2000] or "The reminder time the user requested has arrived."
+    return note[:2000]
+
+
+def _scheduled_wake_message(job: dict) -> str:
+    note = _scheduled_note(job) or "The reminder time the user requested has arrived."
     timezone_name = str((job or {}).get("timezone") or "").strip() or _user_timezone()
     return "\n\n".join([
         "[Feedling scheduled reminder]",
@@ -12402,10 +12468,20 @@ def _message_for_proactive_job(
     perception_digest: tuple[dict, list, dict] | None = None,
 ) -> str:
     chat_context = _coerce_proactive_chat_context(recent_chat_context)
+
+    # 世界书挂在**这个唯一入口**上,而不是各分支各写一遍:三条唤醒道(屏幕/定时/
+    # 通用)都从这里出去,加在这里才叫「加全」,以后新增一条道也自动带上。
+    def _with_worldbook(message: str) -> str:
+        block = _worldbook_match.format_context_block(_worldbook_context_for_wake(job))
+        if not block:
+            return message
+        return f"{block}\n\n{message}"
+
     if _is_screen_watch_job(job):
-        return _screen_watch_message(job, screen_text=screen_text, chat_context=chat_context)
+        return _with_worldbook(
+            _screen_watch_message(job, screen_text=screen_text, chat_context=chat_context))
     if _is_scheduled_wake_job(job):
-        return _scheduled_wake_message(job)
+        return _with_worldbook(_scheduled_wake_message(job))
     wake_kind = _proactive_wake_kind(job, screen_text=screen_text)
     screen_available = bool(screen_text)
     presence = perception_digest[0] if (perception_digest and isinstance(perception_digest[0], dict)) else {}
@@ -12453,7 +12529,7 @@ def _message_for_proactive_job(
         )
     if screen_text:
         parts.append(screen_text)
-    return "\n\n".join(parts)
+    return _with_worldbook("\n\n".join(parts))
 
 
 def _reply_protocol_block() -> str:
@@ -15230,9 +15306,14 @@ def _process_messages(messages: list) -> float:
                 ts,
                 len(screen_payloads),
             )
-        worldbook_text = _worldbook_context_for_foreground(content)
+        # 走与唤醒道、与 V2 同一个 formatter:带 UNTRUSTED 标注 + 24k 总量上限 +
+        # 显式截断标记。原先这里是裸的 `World book context:` 且**没有总量上限**
+        # ——enclave 只 cap 单条(20k),多条 alwaysOn 合并后可以远超一轮该占的份额,
+        # V2 的 builder 会截断而 resident 直接全塞(codex 复验 2026-08-10 指出)。
+        worldbook_text = _worldbook_match.format_context_block(
+            _worldbook_context_for_foreground(content))
         if worldbook_text:
-            content = f"World book context:\n{worldbook_text}\n\n{content}"
+            content = f"{worldbook_text}\n\n{content}"
 
         # Inject any memory the user explicitly referenced for this turn
         # (Garden「talk in chat」). The enclave already expanded the id into the

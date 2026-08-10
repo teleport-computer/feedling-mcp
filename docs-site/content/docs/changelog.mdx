@@ -189,8 +189,21 @@ change must not be interpreted as an API guarantee.
 - **Runtime V2 Chat now applies matching World Book entries.** Matches use the
   current user turn and enter the prompt as a standalone, untrusted setting-data
   block rather than changing the user's message. Oversized matched context is
-  deterministically truncated with a visible marker; proactive wake lanes remain
-  unchanged for Runtime V1 parity.
+  deterministically truncated with a visible marker.
+
+- **World Book now also reaches the turns your companion starts.** Previously
+  only foreground chat saw it, so the companion could describe the world one way
+  in conversation and another way when it reached out on its own. Entries marked
+  *always on* — the world's constants — now enter every lane where the companion
+  speaks in its own voice: heartbeat, scheduled reminders, manual wakes and
+  screen-watch, on Runtime V2 and on your own server alike. Keyword entries
+  still need a fresh text signal to trigger, so only scheduled reminders match
+  them, and only against the reminder's own text; heartbeat and screen-watch do
+  not trigger keyword entries from stale conversation or from on-screen text.
+  Memory distillation, profile and maintenance turns receive no World Book
+  context. On your own server the block now carries the same untrusted-data
+  header, total-size cap and visible truncation marker that Runtime V2 already
+  used.
 
 - **Dream more clearly keeps merely related memories separate.** Its shared V1
   and Runtime V2 consolidation guidance now gives a concrete example that a

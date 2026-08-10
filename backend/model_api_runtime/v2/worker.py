@@ -1383,9 +1383,15 @@ class TurnDeps:
     read_perception_wake_context: Callable[[str, int], list[dict]] | None = None
     # Pending timer identity lets follow-ups use a backend-confirmed wake_id.
     read_pending_scheduled_wake_context: Callable[[str], dict] | None = None
-    # Chat-only World Book match. The assembly callback decrypts and matches the
-    # user's entries against this turn's current user text, returning
-    # {"block": str, "matched_names": [...]}. Wake lanes never call it.
+    # World Book match. The assembly callback decrypts the user's entries and
+    # matches them against whatever messages it is handed, returning
+    # {"block": str, "matched_names": [...]}.
+    #
+    # **Every lane where the companion speaks in its own voice calls it.** chat
+    # passes this turn's user text; wake lanes pass the reminder note (scheduled)
+    # or an empty list (heartbeat / manual_wake / screen_watch) — an empty list
+    # is precisely what selects alwaysOn-only. See `_run_wake` for why the
+    # signal differs per lane.
     read_worldbook_context: Callable[..., dict] | None = None
     # (user_id, actions) -> result dict：把抽取产出的 memory.add/memory.supersede action 落库
     # （走既有 /v1/memory/actions 同路径的服务端实现）。None 时跳过持久化、仍干净 mark_completed
@@ -7886,6 +7892,10 @@ async def _run_wake(
         wake_system_prompt = _WAKE_SYSTEM_PROMPT
         scheduled_activity_events: list[dict] = []
         scheduled_runtime_data: list[dict[str, Any]] = []
+        # 与上面两个同级预初始化：下面的世界书匹配要读它，而它原本只在
+        # `if lane == "scheduled"` 分支里才诞生。靠调用处的条件表达式惰性求值
+        # 也能躲过 NameError，但那是隐式契约，重构一动就炸。
+        scheduled_notes: list[str] = []
         perception_wake_context: list[dict] = []
         wake_observed_generation = observed_generation
         consumed_perception_context_seq = 0
@@ -7904,7 +7914,6 @@ async def _run_wake(
                 if scheduled_context or attempt == 2:
                     break
                 await asyncio.sleep(0.05)
-            scheduled_notes: list[str] = []
             for index, item in enumerate(scheduled_context[:10]):
                 if not isinstance(item, dict):
                     continue
@@ -8821,6 +8830,57 @@ async def _run_wake(
         fold_new_messages = _make_fold_new_messages(
             user_id, deps, cursor_box, enclave_sem=enclave_sem
         )
+
+        # ── 世界书:主动开口的四条道也要认得这个世界（Seven 2026-08-10）
+        #
+        # 之前只有 chat 道注入，于是同一个伴侣在聊天里说「影月初三」、心跳主动
+        # 发消息时却说「8 月 11 号」——用户看到的是人格分裂，而世界书恰恰是为
+        # 「设定一致」买的。
+        #
+        # **匹配信号按道分，不是一刀切开**（世界书有两半，语义不同）：
+        #
+        #   alwaysOn 条目 = 世界常数（历法/地名/「这世界没有手机」）。语义就是
+        #   「聊什么都成立」，四条唤醒道全给。
+        #
+        #   关键词触发条目 = 对话范围内的资料，要有**新鲜的文本信号**才有意义：
+        #     · scheduled —— 有。提醒正文（`scheduled_notes`）是用户/agent 刚写下
+        #       的意图，且**本来就已逐字进 prompt**，拿它匹配零新增暴露面。
+        #     · heartbeat / manual_wake —— 无。手里只有可能几小时前的旧消息，
+        #       拿陈旧关键词灌 24k 字设定是噪音，不是接地。
+        #     · screen_watch —— 有新输入，但**是不可信输入**。屏幕文本被刻意设成
+        #       pull-only 正是为了不让屏幕内容影响首轮 prompt（见 :7734 注释）；
+        #       用它选世界书条目等于把那道闸从侧面绕开。
+        #
+        # 实现上不需要动匹配器:`worldbook_match._triggered` 对空扫描面天然只留
+        # alwaysOn（keyword in "" 恒 False），所以「不给匹配信号」= 传空 messages。
+        # ⚠️ 别照抄 chat 道那句 `if worldbook_match_messages:` 短路——那会让三条
+        # 无信号的道**一条都拿不到 alwaysOn**，正好把本次改动的主要目的抹掉。
+        worldbook_context = ""
+        if deps.read_worldbook_context is not None:
+            wake_match_messages = [
+                {"role": "user", "content": note}
+                for note in (scheduled_notes if lane == "scheduled" else [])
+                if str(note or "").strip()
+            ]
+            try:
+                async with enclave_sem:
+                    wb = await asyncio.to_thread(
+                        deps.read_worldbook_context,
+                        user_id,
+                        wake_match_messages,
+                        runtime_token=token,
+                    )
+                if isinstance(wb, dict):
+                    worldbook_context = str(wb.get("block") or "").strip()
+            except Exception as exc:  # noqa: BLE001 — 与 chat 道同款 best effort:
+                # 世界书取不到不该把一次主动开口整个打掉。
+                log.warning(
+                    "[v2.worldbook] wake match unavailable user=%s lane=%s code=%s",
+                    user_id,
+                    lane,
+                    type(exc).__name__.lower(),
+                )
+
         def _wake_builder():
             from core import self_thinking as _st_wake_sys
 
@@ -8847,6 +8907,7 @@ async def _run_wake(
                 working_memory=working_memory,
                 agent_memory=agent_memory,
                 user_profile=user_profile,
+                worldbook_context=worldbook_context,
                 coverage_hole_notice=coverage_hole_notice,
                 provider_config=provider_config,
                 temporal_snapshot=temporal_snapshot,
