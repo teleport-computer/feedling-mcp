@@ -238,6 +238,21 @@ jobs:
             exit 1
           fi
 
+      - name: Run admin usage snapshot suite (needs its own database)
+        env:
+          FEEDLING_TEST_PG: "postgresql://postgres:postgres@127.0.0.1:5432/postgres"
+        run: |
+          # ⚠️ 必须单独一次 pytest 调用,别并进上面的合并步骤。
+          # 这个文件里有几条断言的是**全局**用户口径
+          # (`..._keeps_global_current_population`、
+          #  `..._current_v2_population_excludes_resident_and_draining_states`),
+          # 而 conftest 是**每个 pytest 进程**建一个测试库、进程内所有文件共享它。
+          # 一旦和别的文件同进程,那些文件建的用户会被算进总数
+          # (实测 current_app_users 4 -> 5,coverage 0.5 -> 0.4)。
+          # 这不是测试写错了 —— 全局指标本来就该按全局断言;它只是需要独占的库。
+          python -m pytest \
+            tests/test_admin_usage.py
+
       - name: Run Hosted Runtime V2 safety and prompt-cache suites
         env:
           FEEDLING_TEST_PG: "postgresql://postgres:postgres@127.0.0.1:5432/postgres"
@@ -267,7 +282,6 @@ jobs:
             tests/test_capabilities_tool_schema.py \
             tests/test_debug_trace.py \
             tests/test_access_mode_runtime_sync_unit.py \
-            tests/test_admin_usage.py \
             tests/test_pytest_coverage_ratchet.py \
             tests/test_mcp_client.py \
             tests/test_mcp_status.py \

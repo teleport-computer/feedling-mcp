@@ -1,4 +1,17 @@
-"""Admin Usage query normalization and canonical link behavior."""
+"""Admin Usage query normalization and canonical link behavior.
+
+⚠️ 这个文件在 CI 里是**单独一次 pytest 调用**(`.github/workflows/ci.yml` 的
+"Run admin usage snapshot suite"),别并进那个 79 文件的合并步骤。
+
+原因:下面有几条断言的是**全局**用户口径 ——
+`test_usage_snapshot_user_drilldown_keeps_global_current_population`、
+`test_usage_current_v2_population_excludes_resident_and_draining_states` 等。
+而 `tests/conftest.py` 是**每个 pytest 进程**建一个测试库、进程内所有文件共享它,
+于是同进程其他文件建的用户会被算进总数(实测 current_app_users 4→5、
+coverage 0.5→0.4)。
+
+这不是测试写错了:全局指标本来就该按全局断言,它只是需要一个独占的库。
+"""
 
 from __future__ import annotations
 
