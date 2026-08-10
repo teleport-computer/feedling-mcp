@@ -10482,6 +10482,42 @@ def upsert_wake_schedule(
         )
 
 
+def seed_missing_wake_clocks(
+    user_id: str,
+    *,
+    due_at: float | None = None,
+) -> bool:
+    """Atomically arm every NULL-backed wake lane for one V2 user.
+
+    ``due_heartbeat_users`` and ``due_screen_watch_users`` both deliberately
+    exclude NULL timestamps. Therefore row existence is not proof that either
+    lane is armed: self-wake, payment cooldown, or the other lane can create the
+    row while leaving one clock NULL. Fill only those two missing clocks and
+    preserve every already-advanced timestamp. ``next_capture_at`` is not
+    included because capture/dream eligibility does not use it as a due-list
+    predicate.
+
+    Returns True when a row was inserted or at least one NULL clock was repaired.
+    """
+    timestamp = time.time() if due_at is None else float(due_at)
+    with _pool().connection() as conn:
+        row = conn.execute(
+            "INSERT INTO v2_wake_schedule "
+            "(user_id,next_heartbeat_at,next_screen_watch_at,updated_at) "
+            "VALUES (%s,to_timestamp(%s),to_timestamp(%s),now()) "
+            "ON CONFLICT (user_id) DO UPDATE SET "
+            "next_heartbeat_at=COALESCE(v2_wake_schedule.next_heartbeat_at,"
+            "EXCLUDED.next_heartbeat_at),"
+            "next_screen_watch_at=COALESCE(v2_wake_schedule.next_screen_watch_at,"
+            "EXCLUDED.next_screen_watch_at),updated_at=now() "
+            "WHERE v2_wake_schedule.next_heartbeat_at IS NULL "
+            "OR v2_wake_schedule.next_screen_watch_at IS NULL "
+            "RETURNING user_id",
+            (str(user_id), timestamp, timestamp),
+        ).fetchone()
+    return row is not None
+
+
 _LATEST_GENUINE_USER_SEQ_SQL = (
     "(SELECT COALESCE(MAX(message.seq),0) FROM chat_messages AS message "
     "WHERE message.user_id=schedule.user_id "

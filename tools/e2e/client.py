@@ -275,6 +275,11 @@ class E2EClient:
     def post(self, path: str, **kw) -> httpx.Response:
         return self._request("POST", path, **kw)
 
+    def delete(self, path: str, **kw) -> httpx.Response:
+        # 有真实的 DELETE 路由（`/v1/worldbook/delete?id=…`），探针不该为此去戳
+        # 私有的 `_request`。重试语义与 GET/POST 同源：按 id 删除是幂等的。
+        return self._request("DELETE", path, **kw)
+
     def _request(self, method: str, path: str, *, _retries: int = 3, **kw) -> httpx.Response:
         """Transport-retry wrapper. This dev/test environment demonstrably flaps
         (proxy resets, single-CVM deploy windows — the 2026-07-18 shakedown died

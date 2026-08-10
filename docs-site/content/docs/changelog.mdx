@@ -10,11 +10,27 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **Hosted Runtime V2 now starts proactive screen watching for every eligible
+  account.** New Runtime V2 transitions arm the screen-watch schedule alongside
+  heartbeat, and worker startup repairs existing schedule rows whose
+  screen-watch clock was left empty. Existing non-empty wake clocks are
+  preserved, so the repair cannot pull a future heartbeat or screen check
+  forward.
+
 - **Account deletion now removes Runtime V2 rollout controls.** Account reset,
   administrator deletion, and application-managed registry removals clear the
   deleted user's Runtime V2 allowlist record regardless of whether it came from
   automatic new-user routing or an administrator pin. Other users and resident
   routing behavior are unchanged.
+
+- **MCP server lists can include recent Hosted Runtime V2 readiness.**
+  `GET /v1/mcp/servers` now adds an optional, content-free `runtime` object to
+  each server that Runtime V2 has observed. It reports the latest stable outcome
+  and successful/total observations across a bounded window of at most 10 Chat
+  turns. The field is omitted when no observation exists, including current
+  Runtime V1 users, and omission is not evidence that the server is healthy.
+  URLs, headers, exception text, tool arguments, remote responses, and individual
+  turn history are never exposed.
 
 - **Foreground Chat now stays grounded in an active screen share.** When the
   newest encrypted screen frame is no more than 90 seconds old, each foreground

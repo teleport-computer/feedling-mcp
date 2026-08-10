@@ -8,7 +8,6 @@ tests/test_admin_home_view.py
 tests/test_admin_kpi_windows.py
 tests/test_admin_product_health_view.py
 tests/test_admin_runtime_allowlist.py
-tests/test_admin_runtime_mode.py
 tests/test_admin_tee_replication.py
 tests/test_admin_usage.py
 tests/test_agent_perception_route.py
@@ -426,16 +425,12 @@ tests/test_v2_reaper.py
 tests/test_v2_reply_cursor_seq.py
 tests/test_v2_runtime_generation.py
 tests/test_v2_scheduler.py
-tests/test_v2_scheduler_wiring.py
-tests/test_v2_screen_watch_gate.py
-tests/test_v2_screen_watch_store.py
 tests/test_v2_send_enqueue_atomic.py
 tests/test_v2_seq_cursor_migration.py
 tests/test_v2_serve_worker_consent.py
 tests/test_v2_serve_worker_extraction.py
 tests/test_v2_serve_worker_genesis.py
 tests/test_v2_serve_worker_images.py
-tests/test_v2_serve_worker_screen_watch.py
 tests/test_v2_sink_retryable.py
 tests/test_v2_status_poll.py
 tests/test_v2_status_stream.py

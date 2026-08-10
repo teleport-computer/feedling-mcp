@@ -4651,13 +4651,14 @@ def _build_scheduler_deps():
 
 
 def _seed_existing_v2_wake_schedules(*, now: float | None = None) -> int:
-    """Idempotent startup repair for V2 users without an armed heartbeat.
+    """Idempotent startup repair for V2 users with any unarmed wake lane.
 
     A row can already exist because another producer (self-wake, screen watch,
     payment cooldown, etc.) touched ``v2_wake_schedule`` while leaving
-    ``next_heartbeat_at`` NULL.  Treating any existing row as "seeded" makes
-    that user permanently invisible to ``due_heartbeat_users``.  Only a
-    non-NULL heartbeat timestamp proves that the heartbeat lane is armed.
+    ``next_heartbeat_at`` or ``next_screen_watch_at`` NULL. Treating any
+    existing row as "seeded" makes that user permanently invisible to the
+    corresponding due-list. The store primitive uses the two columns, not row
+    existence, as its atomic predicate and preserves already-advanced clocks.
     """
     due_at = time.time() if now is None else float(now)
     users = admin_core.list_runtime_modes().get(
@@ -4665,11 +4666,8 @@ def _seed_existing_v2_wake_schedules(*, now: float | None = None) -> int:
     )
     seeded = 0
     for user_id in users:
-        schedule = jobs_store.get_wake_schedule(user_id)
-        if schedule is not None and schedule.get("next_heartbeat_at") is not None:
-            continue
-        jobs_store.upsert_wake_schedule(user_id, next_heartbeat_at=due_at)
-        seeded += 1
+        if jobs_store.seed_missing_wake_clocks(user_id, due_at=due_at):
+            seeded += 1
     return seeded
 
 

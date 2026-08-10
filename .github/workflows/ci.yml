@@ -242,6 +242,7 @@ jobs:
           python -m pytest \
             tests/test_ci_image_tag_width.py \
             tests/test_deploy_yaml_strict.py \
+            tests/test_admin_runtime_mode.py \
             tests/test_hosted_runtime_policy.py \
             tests/test_dual_runtime_coexistence.py \
             tests/test_dual_runtime_send_routing.py \
@@ -260,6 +261,7 @@ jobs:
             tests/test_mcp_client.py \
             tests/test_mcp_status.py \
             tests/test_user_mcp_core.py \
+            tests/test_user_mcp_handshake_probe.py \
             tests/test_user_mcp_probe.py \
             tests/test_user_mcp_routes.py \
             tests/test_v2_prompt_cache_key.py \
@@ -276,7 +278,11 @@ jobs:
             tests/test_data_track_ops_views.py \
             tests/test_ops_dashboard_queries.py \
             tests/test_v2_runtime_health.py \
+            tests/test_v2_scheduler_wiring.py \
+            tests/test_v2_screen_watch_gate.py \
+            tests/test_v2_screen_watch_store.py \
             tests/test_v2_serve_worker.py \
+            tests/test_v2_serve_worker_screen_watch.py \
             tests/test_v2_worker_unit_telemetry.py \
             tests/test_v2_p0_unified_loop.py \
             tests/test_v2_p0_history_safety.py \
