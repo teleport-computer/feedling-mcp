@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import sys
+from contextlib import contextmanager
 from pathlib import Path
 
 import psycopg
@@ -518,6 +519,39 @@ def test_production_turn_adapter_uses_strict_read_and_observable_summary_fallbac
     assert selection.used_profile is False
     assert selection.fallback_reason == reason
     assert profile_store.profile_turn_fallback_counts()[reason] == before + 1
+
+
+def test_production_profile_decrypts_declare_both_trace_scopes(monkeypatch):
+    doc = _ok_doc("u-profile-scopes", 1)
+    plaintext = iter((b"memory-1", b"user-1"))
+    scopes = []
+
+    @contextmanager
+    def record_scope(purpose):
+        scopes.append(purpose)
+        yield
+
+    monkeypatch.setattr(serve_worker.db, "get_blob_strict", lambda *_args: doc)
+    monkeypatch.setattr(serve_worker, "_mint_runtime_token", lambda _uid: "rt")
+    monkeypatch.setattr(
+        serve_worker.core_enclave,
+        "_decrypt_envelope_via_enclave",
+        lambda *_args, **_kwargs: next(plaintext),
+    )
+    monkeypatch.setattr(
+        serve_worker.core_enclave,
+        "coalesced_success_trace",
+        record_scope,
+    )
+
+    selection = serve_worker._select_agent_profile_for_turn(
+        "u-profile-scopes",
+        "old summary",
+        enabled=True,
+    )
+
+    assert selection.used_profile is True
+    assert scopes == ["v2_profile_memory_read", "v2_profile_user_read"]
 
 
 def test_ok_profile_suppresses_summary_only_after_both_fields_decrypt():

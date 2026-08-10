@@ -35,7 +35,7 @@ from typing import Any, Optional
 import httpx
 
 import db
-import debug_trace
+from core import enclave as core_enclave
 from screen import frames
 from screen import summary as summary_mod
 from semantic_analysis import analyze as _semantic_analysis
@@ -107,24 +107,20 @@ def _trace_enclave_proxy(
     detail: dict | None = None,
     dur_ms: float | None = None,
 ) -> None:
-    try:
-        debug_trace.trace_event(
-            store,
-            subsystem="enclave",
-            type=event_type,
-            actor="backend",
-            status=status,
-            summary=summary,
-            explain="Screen route proxied a request to the enclave; only metadata is recorded.",
-            detail={
-                "path": path,
-                "purpose": purpose,
-                **(detail or {}),
-            },
-            dur_ms=dur_ms,
-        )
-    except Exception:
-        pass
+    core_enclave._trace_enclave(
+        store,
+        event_type,
+        path=path,
+        purpose=purpose,
+        status=status,
+        summary=summary,
+        explain=(
+            "Screen route proxied a request to the enclave; only metadata is "
+            "recorded."
+        ),
+        detail=detail,
+        dur_ms=dur_ms,
+    )
 
 
 # --------------------------------------------------------------------------- #
