@@ -333,6 +333,12 @@ no resident process, per-user home, CLI checkpoint, or lease to keep alive. A
 turn can run in a watchdog-controlled child process, but that is a failure and
 resource boundary rather than a strong sandbox for mutually hostile code.
 
+Newly registered Model API accounts can be admitted directly to this pooled V2
+runtime after a provider route has been successfully tested and activated. The
+cutoff-based admission is fail-closed: accounts outside the configured cohort,
+without an eligible route, or on an invalid rollout configuration remain on the
+separate resident execution path.
+
 Feedling does not represent this as per-user microVM or per-user hardware-enclave
 isolation. Keep hosted execution restricted to supported agent entry points, and
 use a separately reviewed container or microVM boundary before offering

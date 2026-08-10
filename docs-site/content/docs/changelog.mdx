@@ -10,6 +10,11 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **New Model API users can enter Runtime V2 through a cutoff-based default.**
+  Only newly registered accounts with a successfully tested and active Model API
+  route are eligible; the default does not migrate older accounts or users on a
+  resident route. Invalid or absent rollout configuration keeps the account
+  resident.
 - **Runtime V2 Chat can search its own older conversation history on demand.**
   Two chat-only agent tools let the agent keyword-search messages beyond its
   visible context and read a small window around a match. Original messages
