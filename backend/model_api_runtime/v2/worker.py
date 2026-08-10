@@ -4169,15 +4169,26 @@ def _memory_tool_actions(raw_actions) -> list[dict]:
         inner = {
             "summary": summary,
             "content": content or summary,
-            "bucket": str(a.get("bucket") or nested.get("bucket") or "").strip(),
-            "threads": (
-                list(a.get("threads") or [])
-                if isinstance(a.get("threads"), list)
-                else list(nested.get("threads") or [])
-                if isinstance(nested.get("threads"), list)
-                else []
-            ),
         }
+        # ⚠️ 只在模型**真的传了**的时候才放这两个键。
+        #
+        # update 走的是 supersede(新写一张替换旧的),`actions._memory_supersede_action`
+        # 用 `{**inherited, **raw}` 从旧卡继承 bucket/threads —— 键一旦存在,空值
+        # 照样覆盖继承值。以前这里无条件写 bucket=""/threads=[],于是 V2 上**每一次**
+        # 改记忆卡,桶都掉回「未分类」、标签全清空(2026-08-10 实测)。threads 尤其致命:
+        # schema 至今不允许模型传,所以那条路必然清空。
+        #
+        # 「没传」和「显式传空」必须保持可区分:前者继承旧卡,后者才是用户要清空。
+        bucket = str(a.get("bucket") or nested.get("bucket") or "").strip()
+        if bucket:
+            inner["bucket"] = bucket
+        threads_raw = (
+            a.get("threads") if isinstance(a.get("threads"), list)
+            else nested.get("threads") if isinstance(nested.get("threads"), list)
+            else None
+        )
+        if threads_raw is not None:
+            inner["threads"] = list(threads_raw)
         base = {
             "reason": reason,
             "capture_mode": "agent_tool",
