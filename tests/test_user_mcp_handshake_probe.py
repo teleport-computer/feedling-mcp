@@ -134,11 +134,19 @@ def test_v2_zero_expected_is_not_a_pass():
 def test_v2_config_list_failure_is_no_observation_not_a_pass():
     """配置列表本轮读不出来 = 对服务器零观测。
 
-    拿它当「每台都好」是凭空造证据 —— 而且是这条探针最该防的那种造。
+    ⚠️ 这里**不能**用 `_v2()`:那个辅助函数会自动补上 expected/resolved/skipped,
+    而生产里真正的配置失败事件**只有** surface_failure_kind 一个键(loader 连
+    列表都没读到,不可能知道 expected)。用补全过的形状测,恰好绕过了这条判据
+    的真实入口 —— 我第一版就是这么写的,于是把真实失败误报成「后端太旧,先发版」,
+    把人指向完全不相干的问题(codex 审出)。
     """
-    code, _ = classify(_v2(surface_failure_kind="envelopes_unavailable"),
-                       runtime="v2", expect="ok", server_count=1)
+    events = [{"type": "agent.model.call.done", "detail": {"driver": "v2"}},
+              {"type": "mcp.surface.resolved",
+               "detail": {"surface_failure_kind": "envelopes_unavailable"}}]
+    code, lines = classify(events, runtime="v2", expect="ok", server_count=1)
     assert code == 3
+    assert any("读不出来" in x for x in lines)
+    assert not any("先发版" in x for x in lines), "别把真实失败说成部署问题"
 
 
 def test_v2_inconsistent_counts_are_rejected():
@@ -154,11 +162,33 @@ def test_v2_expect_failed_rejects_a_healthy_surface():
     assert code == 1
 
 
-def test_v2_expect_failed_passes_on_a_real_skip():
+def test_v2_expect_failed_requires_every_server_to_fail():
+    """`--expect` 是对**每一台**的要求 —— V1 就是这么判的,--help 也这么写。
+
+    一台成功一台失败却算通过,等于同一个参数在两个运行时里含义不同。
+    混合结果属于 --expect any。
+    """
     code, _ = classify(
         _v2(expected=2, resolved=1,
             skipped=[{"name": "dead", "kind": "transport_failure"}]),
         runtime="v2", expect="failed", server_count=2)
+    assert code == 1
+
+
+def test_v2_expect_failed_passes_when_every_server_failed():
+    code, _ = classify(
+        _v2(expected=2, resolved=0,
+            skipped=[{"name": "a", "kind": "transport_failure"},
+                     {"name": "b", "kind": "tls"}]),
+        runtime="v2", expect="failed", server_count=2)
+    assert code == 0
+
+
+def test_v2_mixed_result_passes_only_under_expect_any():
+    code, _ = classify(
+        _v2(expected=2, resolved=1,
+            skipped=[{"name": "dead", "kind": "transport_failure"}]),
+        runtime="v2", expect="any", server_count=2)
     assert code == 0
 
 

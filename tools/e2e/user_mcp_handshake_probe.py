@@ -182,12 +182,13 @@ def classify(events: list[dict], *, runtime: str, expect: str,
             return 3, out
         detail = seen["mcp.surface.resolved"].get("detail") or {}
         out.append(f"resolved: {json.dumps(detail, ensure_ascii=False)}")
-        if "expected" not in detail:
-            # Pre-97511545 shape: the event exists but carries no baseline.
-            # Same distinction as the V1 side — "ship it first", not "MCP broke".
-            out.append("FAIL resolved 里没有 expected 字段 —— 部署的 backend 早于"
-                       "整台失败可观测那批,先发版再测")
-            return 3, out
+        # Order matters. A real config-list failure emits ONLY
+        # {"surface_failure_kind": ...} — the loader cannot know `expected`
+        # when it never read the list. Checking the expected-shape gate first
+        # reported production's actual failure as "your backend is old, deploy
+        # first", sending whoever read it to the wrong problem entirely. My
+        # test missed it because its helper always supplied expected, so it
+        # could not produce the shape production actually emits (codex 审出).
         failure_kind = str(detail.get("surface_failure_kind") or "")
         if failure_kind:
             # The config list itself could not be read, so this turn observed
@@ -195,6 +196,12 @@ def classify(events: list[dict], *, runtime: str, expect: str,
             # would be inventing evidence.
             out.append(f"FAIL 配置列表本轮读不出来({failure_kind}) —— "
                        f"这一轮对服务器没有任何观测")
+            return 3, out
+        if "expected" not in detail:
+            # Pre-97511545 shape: the event exists but carries no baseline.
+            # Same distinction as the V1 side — "ship it first", not "MCP broke".
+            out.append("FAIL resolved 里没有 expected 字段 —— 部署的 backend 早于"
+                       "整台失败可观测那批,先发版再测")
             return 3, out
         expected = int(detail.get("expected") or 0)
         resolved = int(detail.get("resolved") or 0)
@@ -213,8 +220,12 @@ def classify(events: list[dict], *, runtime: str, expect: str,
         if expect == "ok" and skipped:
             out.append(f"FAIL 有整台服务器没进工具面:{names}")
             return 1, out
-        if expect == "failed" and not skipped:
-            out.append("FAIL 期望有整台失败,但每台都进了工具面")
+        if expect == "failed" and resolved:
+            # `--expect` is the required verdict for EVERY configured server —
+            # that is how the V1 path reads it and what --help says. Passing a
+            # mixed result here would quietly mean something different on the
+            # two runtimes; a partial skip belongs under --expect any.
+            out.append(f"FAIL 期望每台都失败,但有 {resolved} 台进了工具面")
             return 1, out
         out.append(f"PASS resolved={resolved}/{expected}"
                    + (f",未就绪:{names}" if skipped else ""))
