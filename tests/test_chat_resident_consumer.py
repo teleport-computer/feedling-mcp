@@ -1086,7 +1086,7 @@ def test_screen_context_explicit_disable_still_wins(monkeypatch):
     assert crc._should_attach_screen_context("你能看到我的屏幕吗") is False
 
 
-def test_active_screen_share_pushes_up_to_six_new_frames_without_word_heuristic(
+def test_active_screen_share_uses_recent_session_selector_without_word_heuristic(
     monkeypatch,
 ):
     now = 10_000.0
@@ -1121,15 +1121,15 @@ def test_active_screen_share_pushes_up_to_six_new_frames_without_word_heuristic(
 
     text, payloads, paths = crc._screen_context_for_message("嗨")
 
-    assert len(payloads) == len(paths) == 6
-    assert len(decrypt_calls) == 6
+    assert decrypt_calls == ["f3", "f2", "f1", "f0"]
+    assert len(payloads) == len(paths) == 4
     assert "UNTRUSTED LIVE SCREEN-SHARE FRAMES" in text
     assert "captured_at_utc:" in text
     assert "relative_age_sec:" in text
     assert crc._last_screen_context_metrics == {
-        "frame_count": 6,
+        "frame_count": 4,
         "cache_hits": 0,
-        "cache_misses": 6,
+        "cache_misses": 4,
     }
     assert crc._last_screen_chat_frame_id == decrypt_calls[-1]
 

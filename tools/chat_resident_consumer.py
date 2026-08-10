@@ -3609,8 +3609,8 @@ def _screen_context_for_message(content: str) -> tuple[str, list[dict[str, str]]
     if _screen_runtime_unsupported or SCREEN_VISION_TEST_STATUS != "ok":
         return active_signal, [], []
 
-    selected = v2_screen_chat.uniformly_sample_new_frames(
-        list(reversed(frames)),
+    selected = v2_screen_chat.select_recent_session_frames(
+        frames,
         last_pushed_frame_id=_last_screen_chat_frame_id,
     )
     if not selected:
