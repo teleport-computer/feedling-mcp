@@ -73,6 +73,7 @@ from capabilities import tool_schema as cap_tool_schema
 from core import chat_activity as core_chat_activity
 from core import envelope as core_envelope
 from core import protocol_leak
+from core import util as core_util
 from core import provider_usage
 from core import store as core_store
 from core import wake_bus as core_wake_bus
@@ -4169,6 +4170,14 @@ def _memory_tool_actions(raw_actions) -> list[dict]:
         inner = {
             "summary": summary,
             "content": content or summary,
+            # 「发生时间」在 ENQUEUE 这一刻冻结,不留给 apply 时再取。V2 的 effect 是
+            # 排队异步落库的:队列一卡,几小时后才落库,时间就串了;同一条 effect 重放
+            # 两次还会拿到两个不同的时间。V1 是同步写(说话即落库)所以没这问题,
+            # 这里就是对齐它。同 `_frozen_relationship_anchor` 的惯例(也在 enqueue 冻结)。
+            #
+            # 刻意放在字典**前面**、且不读 a.get("occurred_at"):这是服务端的可信元数据,
+            # 不接受模型自报(schema 里也没有这个字段)。
+            "occurred_at": core_util._now_iso(),
         }
         # ⚠️ 只在模型**真的传了**的时候才放这两个键。
         #

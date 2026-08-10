@@ -1313,7 +1313,12 @@ def _expand_quoted_memories(user_id: str, rows: list[dict]) -> list[dict]:
         fetched, status = memory_core.fetch(
             store,
             None,
-            {"ids": wanted[:_QUOTED_MEMORY_MAX], "limit": 0, "include_sensitive": True},
+            # 刻意不带 include_sensitive:enclave 的 fetch 一律挡住敏感卡正文,
+            # 而这正是产品设计 —— V1 的 io_cli 同样只有 memory-index 有
+            # --include-sensitive,memory-fetch 没有。标成敏感 = 自己能看、
+            # 不给 agent 读正文。带上这个字段既无效(readside 发给 enclave 时就丢了)
+            # 又会误导后来人以为这条路能读敏感卡。
+            {"ids": wanted[:_QUOTED_MEMORY_MAX], "limit": 0},
             post_enclave=_post,
         )
         items = fetched.get("items") if isinstance(fetched, dict) else None

@@ -26,8 +26,12 @@ def test_add_maps_to_memory_add_with_nested_plaintext_and_no_envelope():
     # actions 落卡时照样补成 []（已验证与旧行为逐字段相同）;而 update 那条路
     # 「缺席 vs 空数组」是旧卡标签保不保得住的分水岭,见
     # test_update_without_bucket_or_threads_does_not_author_empty_ones。
-    assert a["memory"] == {"summary": "编程偏好", "content": "用户最喜欢 Rust。",
-                           "bucket": "偏好"}
+    memory = dict(a["memory"])
+    # occurred_at 是服务端在 enqueue 时冻结的可信时间,单独验(见
+    # test_occurred_at_is_frozen_at_enqueue_not_at_apply),这里只确认它在。
+    assert memory.pop("occurred_at")
+    assert memory == {"summary": "编程偏好", "content": "用户最喜欢 Rust。",
+                      "bucket": "偏好"}
     assert a["capture_mode"] == "agent_tool"
     assert a["reason"]
 
@@ -184,3 +188,42 @@ def test_update_still_inherits_when_scores_absent():
     inner = out[0]["memory"]
     assert "importance" not in inner
     assert "pulse" not in inner
+
+
+def test_occurred_at_is_frozen_at_enqueue_not_at_apply(monkeypatch):
+    """记忆的「发生时间」在入队那一刻定死,不是等它落库时才取。
+
+    V2 的 effect 是排队异步落库的。以前 actions 在 apply 时才 `_now_iso()`,
+    于是队列一卡、几小时后才落库,时间就串了;同一条 effect 重放两次还会拿到
+    两个不同的时间。V1 没这个问题——它是同步写,说话即落库。
+
+    对齐 V1 的做法就是在入队时冻结,和 identity 的 relationship_anchor
+    (`_frozen_relationship_anchor`,同样在 ENQUEUE 冻结)是同一条惯例。
+    """
+    monkeypatch.setattr(worker.core_util, "_now_iso", lambda: "2026-08-10T23:00:00")
+
+    out = worker._memory_tool_actions([{"op": "add", "summary": "s", "content": "c"}])
+
+    assert out[0]["memory"]["occurred_at"] == "2026-08-10T23:00:00"
+
+
+def test_model_cannot_forge_occurred_at(monkeypatch):
+    """时间是服务端的可信元数据,不接受模型自报 —— schema 里也没这个字段。"""
+    monkeypatch.setattr(worker.core_util, "_now_iso", lambda: "2026-08-10T23:00:00")
+
+    out = worker._memory_tool_actions([{
+        "op": "add", "summary": "s", "content": "c",
+        "occurred_at": "1999-01-01T00:00:00",
+    }])
+
+    assert out[0]["memory"]["occurred_at"] == "2026-08-10T23:00:00"
+
+
+def test_update_also_carries_a_frozen_time(monkeypatch):
+    """supersede 走的是同一个 raw（action["memory"]），同样要带上。"""
+    monkeypatch.setattr(worker.core_util, "_now_iso", lambda: "2026-08-10T23:00:00")
+
+    out = worker._memory_tool_actions([
+        {"op": "update", "target_id": "mem_1", "summary": "新", "content": "内容"}])
+
+    assert out[0]["memory"]["occurred_at"] == "2026-08-10T23:00:00"
