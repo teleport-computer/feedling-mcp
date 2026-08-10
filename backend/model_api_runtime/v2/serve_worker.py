@@ -797,6 +797,31 @@ def _decrypt_chat_rows(
     preserve_unreadable: bool = False,
     include_capture_metadata: bool = False,
 ) -> list[dict]:
+    """Decrypt the prompt window, emitting ONE trace rollup for the whole batch.
+
+    The row loop below issues an enclave call per row (up to
+    FEEDLING_V2_TAIL_HARD_CAP), which at two success trace events each used to
+    emit ~120 events per turn into a 500-event ring — one chat turn evicted the
+    entire debug trace. Failures inside the batch still trace individually.
+    """
+    with core_enclave.coalesced_success_trace("v2_chat_read"):
+        return _decrypt_chat_rows_inner(
+            user_id,
+            rows,
+            user_only=user_only,
+            preserve_unreadable=preserve_unreadable,
+            include_capture_metadata=include_capture_metadata,
+        )
+
+
+def _decrypt_chat_rows_inner(
+    user_id: str,
+    rows: list[dict],
+    *,
+    user_only: bool,
+    preserve_unreadable: bool = False,
+    include_capture_metadata: bool = False,
+) -> list[dict]:
     """Decrypt already-selected chat rows and preserve their exact seq IDs.
 
     Selection/bounding happens before this helper so enclave work stays
