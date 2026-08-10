@@ -175,12 +175,30 @@ def _funnel() -> dict:
     }
 
 
+def _story() -> dict:
+    return {
+        "curve": {
+            "d1": {"pct": 34.2, "n": 313},
+            "d7": {"pct": 20.0, "n": 260},
+            "d14": {"pct": 18.3, "n": 169},
+            "d30": None,
+            "flat_pp": 1.7,
+        },
+        "depth": {"day": "2026-08-06", "pct": 66.3, "avg7_pct": 71.0},
+        "mix": {
+            "day": "2026-08-06", "active": 97, "retained": 66,
+            "resurrected": 28, "new": 3, "new_blood_pct": 64.9,
+        },
+    }
+
+
 _HOME_BUILDER_STUBS = {
     "queue": (db, "admin_home_queue", _queue),
     "pulse": (db, "admin_home_pulse", _pulse),
     "feed": (db, "admin_home_feed", _feed),
     "cost": (db, "admin_home_cost", _cost),
     "soft_verdicts": (db, "admin_home_soft_verdicts", _soft_verdicts),
+    "pulse_story": (db, "admin_home_pulse_story", _story),
     "funnel": (db, "admin_funnel_snapshot", _funnel),
     "imports": (db, "recent_genesis_import_health", _imports),
     "chat": (jobs_store, "recent_chat_reliability", _chat),
@@ -212,7 +230,8 @@ class _HomeRenderCapture:
     def __init__(self):
         self.calls: list[dict] = []
 
-    def __call__(self, system_verdict, soft_verdicts, queue, pulse, feed, cost, funnel):
+    def __call__(self, system_verdict, soft_verdicts, queue, pulse, feed, cost, funnel,
+                 *, story=None):
         self.calls.append(
             {
                 "system_verdict": system_verdict,
@@ -222,6 +241,7 @@ class _HomeRenderCapture:
                 "feed": feed,
                 "cost": cost,
                 "funnel": funnel,
+                "story": story,
             }
         )
         return self.MARKER
@@ -1142,3 +1162,71 @@ def test_funnel_w1_conversion_uses_eligible_denominator():
     funnel["stages"][-1].update({"count": 0, "eligible": 0})
     out0 = dt._render_funnel(funnel, compact=True)
     assert "暂不可判（无人走完 W1 窗）" in out0
+
+
+def test_story_row_renders_curve_depth_mix_and_reg():
+    """脉搏第二排：留存曲线加权值、发消息深度、DAU 构成、注册环比。"""
+    if not hasattr(dt, "_home_story_section"):
+        pytest.skip("story renderer not present")
+    out = dt._home_story_section(_story(), _funnel())
+    assert "D1 34% · D7 20% · D14 18%" in out
+    assert "D7→D14 趋平" in out          # |1.7pp| <= 3 阈值
+    assert "66%" in out                   # depth
+    assert "65% 新人" in out              # mix new-blood
+    assert "留任 66 · 回流 28 · 新增 3" in out
+    assert "近 28 天注册" in out and "20" in out  # funnel cur registered
+    # D30 未成熟：spark label 说明而不是 0。
+    assert "D30 · 未成熟" in out
+    # None → 整排暂不可用，绝不显 0。
+    out_none = dt._home_story_section(None, _funnel())
+    assert "暂不可用" in out_none and "0%" not in out_none
+
+
+def test_story_flat_pill_needs_threshold():
+    if not hasattr(dt, "_home_story_section"):
+        pytest.skip("story renderer not present")
+    story = _story()
+    story["curve"]["flat_pp"] = 6.4       # 还在掉，不许贴「趋平」
+    out = dt._home_story_section(story, _funnel())
+    assert "趋平" not in out
+    assert "−6.4pp" in out
+
+
+def test_spark_labels_render_native_titles():
+    if not hasattr(dt, "_spark"):
+        pytest.skip("spark not present")
+    out = dt._spark([1, None, 3], labels=["a · 1", "b · 缺", "c · 3"], width=120, height=30)
+    assert out.count("<title>") == 3
+    assert "a · 1" in out and "c · 3" in out
+    assert "viewBox='0 0 120 30'" in out
+    # 无 labels 的旧调用完全兼容：无 title、保持 aria-hidden。
+    legacy = dt._spark([1, 2, 3])
+    assert "<title>" not in legacy and "aria-hidden" in legacy
+
+
+def test_growth_accounting_in_progress_day_not_settled():
+    """进行中的当天不渲染流失/QR 定数（半天数据的 QR 0.1 是垃圾值）。"""
+    from datetime import datetime as _dt
+    from zoneinfo import ZoneInfo as _zi
+    today = _dt.now(_zi("Asia/Shanghai")).date().isoformat()
+    payload = {
+        "summary": {"generated_at": "", "timezone": "Asia/Shanghai",
+                     "days_returned": 0, "total_users": 0, "latest_day": "",
+                     "latest_new": 0, "snapshot_first_day": "", "snapshot_days": 0,
+                     "freeze_day": "2026-07-01", "cohort_count": 0},
+        "filters": {"days": 60, "view": "growth"},
+        "growth": [],
+        "retention": {"cohorts": [], "days": []},
+        "retention_week": {"cohorts": [], "days": []},
+        "accounting": {"rows": [
+            {"day": "2026-08-06", "active": 97, "new": 3, "resurrected": 28,
+             "retained": 66, "churned": 27, "quick_ratio": 1.15},
+            {"day": today, "active": 53, "new": 1, "resurrected": 4,
+             "retained": 48, "churned": 49, "quick_ratio": 0.1},
+        ], "since_day": "2026-07-01"},
+    }
+    page = dt._render_data_track_growth_page(payload)
+    assert "进行中" in page
+    assert "0.10" not in page             # 当天 QR 不渲染
+    assert "1.15" in page                 # 已冻结日照常
+    assert "增长 QR" in page              # 更名防与财务速动比混淆

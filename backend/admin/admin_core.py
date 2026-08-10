@@ -206,7 +206,8 @@ def compose_system_verdict(imports: dict | None, chat: dict | None) -> dict:
 
 
 _HOME_PAGE_BUILDERS = (
-    "queue", "pulse", "feed", "cost", "soft_verdicts", "funnel", "imports", "chat",
+    "queue", "pulse", "feed", "cost", "soft_verdicts", "pulse_story", "funnel",
+    "imports", "chat",
 )
 _VERDICTS_BUILDERS = ("queue", "pulse", "soft_verdicts", "imports", "chat")
 
@@ -224,6 +225,11 @@ def _run_home_builders(names: tuple[str, ...]) -> dict[str, dict | None]:
         "soft_verdicts": (
             "admin home soft verdicts query failed",
             db.admin_home_soft_verdicts,
+            {},
+        ),
+        "pulse_story": (
+            "admin home pulse story query failed",
+            db.admin_home_pulse_story,
             {},
         ),
         "funnel": (
@@ -262,6 +268,7 @@ def _build_home_page() -> str:
         results["feed"],
         results["cost"],
         results["funnel"],
+        story=results["pulse_story"],
     )
 
 
