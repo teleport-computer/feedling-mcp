@@ -137,3 +137,50 @@ def test_add_still_carries_whatever_the_model_gave():
         "op": "add", "summary": "s", "content": "c", "bucket": "爱好",
     }])
     assert out[0]["memory"]["bucket"] == "爱好"
+
+
+def test_model_can_supply_threads_importance_and_pulse():
+    """这三个字段后端一直在消费,schema 却不允许模型传。
+
+    - threads:worker 早就在转发它,卡在 schema 那道闸 → 卡片标签永远是空的
+    - importance/pulse:actions 默认 0.5/0.3,于是 V2 每张卡权重完全一样,
+      而这两个值直接参与 ambient 排序(memory_readside_core)
+
+    共享的 MEMORY_WRITE_RULES_V1 里明确教了模型这三个字段的含义 ——
+    「prompt 要模型写、schema 禁止模型写」是当前最矛盾的一处。
+    """
+    from capabilities.tool_schema import validate_tool_args
+
+    err = validate_tool_args("memory_write", {"actions": [{
+        "op": "add", "summary": "s", "content": "c", "bucket": "爱好",
+        "threads": ["自行车", "瓜车"], "importance": 0.8, "pulse": 0.6,
+    }]})
+    assert err is None, f"schema 该放行这三个字段,却拒了:{err}"
+
+    out = worker._memory_tool_actions([{
+        "op": "add", "summary": "s", "content": "c",
+        "threads": ["自行车"], "importance": 0.8, "pulse": 0.6,
+    }])
+    inner = out[0]["memory"]
+    assert inner["threads"] == ["自行车"]
+    assert inner["importance"] == 0.8
+    assert inner["pulse"] == 0.6
+
+
+def test_zero_importance_is_not_swallowed_as_missing():
+    """importance=0 / pulse=0 是合法取值,不能被 `or default` 吞成「没传」。"""
+    out = worker._memory_tool_actions([{
+        "op": "add", "summary": "s", "content": "c", "importance": 0, "pulse": 0,
+    }])
+    inner = out[0]["memory"]
+    assert inner["importance"] == 0, "0 被当成没传了"
+    assert inner["pulse"] == 0, "0 被当成没传了"
+
+
+def test_update_still_inherits_when_scores_absent():
+    """没传评分时仍然不写这两个键 —— 和 bucket/threads 同一条规矩。"""
+    out = worker._memory_tool_actions([
+        {"op": "update", "target_id": "mem_1", "summary": "新", "content": "内容"}])
+    inner = out[0]["memory"]
+    assert "importance" not in inner
+    assert "pulse" not in inner

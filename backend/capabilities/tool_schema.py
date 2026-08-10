@@ -44,6 +44,14 @@ _MEMORY_TOOL_ACTION = {
         "summary": _STR,
         "content": _STR,
         "bucket": _STR,
+        # 线索标签。后端(worker 翻译层 + actions)一直在消费它,capture/dream 也产它,
+        # 共享的 MEMORY_WRITE_RULES_V1 还明确教模型「一张卡 1-4 个」——只有这道闸
+        # 拦着,于是 V2 手写的卡标签永远是空的(2026-08-10 真机)。
+        "threads": {"type": "array", "items": _STR},
+        # 这两个直接参与 ambient 排序(memory_readside_core)。schema 不开的话
+        # actions 一律落 0.5/0.3,V2 每张卡权重完全一样。
+        "importance": {"type": "number"},
+        "pulse": {"type": "number"},
         "target_id": _STR,
         "reason": _STR,
     },

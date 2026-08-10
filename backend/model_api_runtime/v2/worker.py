@@ -4189,6 +4189,12 @@ def _memory_tool_actions(raw_actions) -> list[dict]:
         )
         if threads_raw is not None:
             inner["threads"] = list(threads_raw)
+        # 评分同理:同样要区分「没传」(继承旧卡)和「传了」。⚠️ 不能用 `or`——
+        # importance=0 / pulse=0 是合法取值,`or` 会把它们吞成没传。
+        for score in ("importance", "pulse"):
+            value = a.get(score, nested.get(score))
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                inner[score] = value
         base = {
             "reason": reason,
             "capture_mode": "agent_tool",
