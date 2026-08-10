@@ -460,6 +460,66 @@ def test_verify_covers_every_synced_table():
     assert not missing, f"这些表进了 TEE 但 verify 不核对它们：{missing}"
 
 
+def _insert_rds_voice_transcript(uid: str, call_id: str) -> None:
+    envelope = {
+        "v": 1,
+        "id": call_id,
+        "owner_user_id": uid,
+        "visibility": "shared",
+        "body_ct": "ciphertext",
+        "nonce": "nonce",
+        "K_user": "wrapped-user-key",
+        "K_enclave": "wrapped-enclave-key",
+    }
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            "INSERT INTO voice_transcripts "
+            "(user_id, call_id, transcript_envelope) VALUES (%s,%s,%s)",
+            (uid, call_id, Jsonb(envelope)),
+        )
+
+
+def _insert_tee_voice_transcript(uid: str, call_id: str) -> None:
+    with psycopg.connect(os.environ["TEE_DATABASE_URL"], autocommit=True) as conn:
+        conn.execute(
+            "INSERT INTO voice_transcripts (user_id, call_id, doc) VALUES (%s,%s,%s)",
+            (uid, call_id, Jsonb({"transcript": "hello"})),
+        )
+
+
+def test_voice_transcripts_equal_rows_are_strictly_verified():
+    uid = f"usr_{uuid.uuid4().hex[:8]}"
+    _seed(uid)
+    _insert_rds_voice_transcript(uid, "vcall_equal")
+    _insert_tee_voice_transcript(uid, "vcall_equal")
+
+    report = verify.run(sample_rate=1.0)
+
+    voice = report["tables"]["voice_transcripts"]
+    assert voice["rds_rows"] == 1
+    assert voice["tee_rows"] == 1
+    assert voice["pending_rows"] == 0
+    assert voice["rows_ok"] is True
+    assert report["strict_ok"] is True
+    assert report["ok"] is True
+
+
+def test_voice_transcripts_rds_only_row_fails_strict_verification():
+    uid = f"usr_{uuid.uuid4().hex[:8]}"
+    _seed(uid)
+    _insert_rds_voice_transcript(uid, "vcall_missing")
+
+    report = verify.run(sample_rate=1.0)
+
+    voice = report["tables"]["voice_transcripts"]
+    assert voice["rds_rows"] == 1
+    assert voice["tee_rows"] == 0
+    assert voice["pending_rows"] == 0
+    assert voice["rows_ok"] is False
+    assert report["strict_ok"] is False
+    assert report["ok"] is False
+
+
 # --------------------------------------------------------------------------- #
 # Fix round 1 review: SNAPSHOT lane / kind=None ciphertext lane / C1 regression
 # had zero coverage — the autouse _clean fixture truncates every newly-covered
