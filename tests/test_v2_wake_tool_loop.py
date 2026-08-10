@@ -196,7 +196,8 @@ def _bubbles(uid):
 def _turn_metric_row(job_id):
     with db.get_pool().connection() as c:
         row = c.execute(
-            "SELECT model_calls, failed, status FROM v2_turn_metrics WHERE job_id=%s",
+            "SELECT model_calls, failed, status, visible_reply_count "
+            "FROM v2_turn_metrics WHERE job_id=%s",
             (job_id,)).fetchone()
     return row
 
@@ -257,7 +258,36 @@ def test_wake_terminal_plain_text_writes_exactly_one_proactive_bubble(monkeypatc
     assert row[0] >= 1           # >=1 model call
     assert row[1] is False       # not failed
     assert row[2] == "ok"
+    assert row[3] == 1           # applied_unverified, not merely produced
     assert _job_status(job_id)[0] == "completed"
+
+
+def test_wake_enqueued_without_sink_is_not_counted_as_visible(monkeypatch):
+    uid = "u_wake_toolloop_enqueued_only"
+    conftest.seed_user(uid)
+    _reset(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, "screen_watch")
+    job = jobs_store.claim_next_job("w")
+
+    _script_provider(monkeypatch, [_text_round("produced but not applied")])
+    deps = _wake_deps(
+        tail=[{"id": "m1", "ts": 1.0, "role": "user", "content": "hi"}],
+    )
+    deps.apply_pending_effects = None
+
+    status = asyncio.run(worker.process_job(
+        job,
+        deps,
+        provider_config=_BYOK,
+        api_key=None,
+        runtime_token="rt",
+    ))
+
+    assert status == "completed"
+    row = _turn_metric_row(job_id)
+    assert row is not None
+    assert row[3] == 0
+    assert _bubbles(uid) == []
 
 
 # ------------------------------------------------------------------

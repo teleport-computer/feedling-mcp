@@ -20,6 +20,8 @@ change must not be interpreted as an API guarantee.
   outbound web, MCP, and child-task access fenced from its first model call. If
   the provider rejects those frames, Chat retries once without them and records
   that route as image-unsupported instead of failing the user's text turn.
+  Runtime operations now also report screen-watch turns, turns that produced a
+  visible reply, their speaking rate, frames pushed, and input tokens by lane.
 
 - **New Model API users can enter Runtime V2 through a cutoff-based default.**
   Only newly registered accounts with a successfully tested and active Model API

@@ -8621,7 +8621,11 @@ async def _run_wake(
                 },
                 best_effort=True,
             )
-            if tm is not None:
+            # Legacy/non-seq assembly can enqueue without a sink. That proves
+            # the model produced text, not that a user-visible bubble was
+            # applied. Count only the applied-but-unverified path here; the
+            # seq-native path above records only an explicit applied status.
+            if tm is not None and deps.apply_pending_effects is not None:
                 tm.record_visible_reply()
 
         # Snapshot the boundary at wake start. Production uses the same total-order
