@@ -4743,6 +4743,40 @@ def set_onboarding_route_strict(user_id: str, doc: dict) -> str | None:
     return active_route_id
 
 
+def delete_onboarding_route_strict(user_id: str) -> bool:
+    """Delete the route selector and enforce its missing-as-resident state.
+
+    This is the exact inverse persistence boundary needed when compensation
+    restores a previously absent ``onboarding_route`` document.  The document
+    deletion and Model API route deactivation share the same advisory lock and
+    transaction as :func:`set_onboarding_route_strict`.
+    """
+    sql = (
+        "DELETE FROM user_blobs "
+        "WHERE user_id = %s AND kind = 'onboarding_route'"
+    )
+    with get_pool().connection() as conn:
+        with conn.transaction():
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT pg_advisory_xact_lock("
+                    "hashtextextended('onboarding-route:' || %s, 0))",
+                    (str(user_id),),
+                )
+                cur.execute(sql, (user_id,))
+                deleted = cur.rowcount > 0
+                cur.execute(
+                    "UPDATE model_api_routes "
+                    "SET is_active = FALSE, updated_at = now() "
+                    "WHERE user_id = %s AND is_active",
+                    (user_id,),
+                )
+    from tee_shadow import mirror
+
+    mirror.execute(sql, (user_id,))
+    return deleted
+
+
 def patch_proactive_settings_strict(
     user_id: str,
     patch: dict,

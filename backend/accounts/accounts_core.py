@@ -69,39 +69,49 @@ def _select_access_mode(store: UserStore, mode: str) -> dict:
         # particular, selecting Model API is not rollout authority.
         return onboarding._save_onboarding_route(store, mode)
 
-    previous_mode = onboarding._load_onboarding_route(store)
     try:
-        previous_runtime_mode = (
-            config_store.get_hosted_runtime_control_strict(store)[0]
-        )
-        previous_allowlist = db.get_runtime_allowlist_entry(store.user_id)
+        with db.hosted_runtime_config_mutation_lock(store.user_id):
+            previous_route_doc = db.get_blob_strict(
+                store.user_id, "onboarding_route"
+            )
+            previous_runtime_mode = (
+                config_store.get_hosted_runtime_control_strict(store)[0]
+            )
+            previous_allowlist = db.get_runtime_allowlist_entry(store.user_id)
+            try:
+                data = onboarding._save_onboarding_route(store, mode)
+                new_user_v2_cohort.pin_resident(store)
+            except Exception as transition_error:
+                compensation_error = None
+                try:
+                    new_user_v2_cohort.restore_allowlist(
+                        store.user_id, previous_allowlist
+                    )
+                except Exception as exc:
+                    compensation_error = exc
+                try:
+                    if previous_route_doc is None:
+                        db.delete_onboarding_route_strict(store.user_id)
+                    else:
+                        db.set_onboarding_route_strict(
+                            store.user_id, previous_route_doc
+                        )
+                except Exception as exc:
+                    compensation_error = compensation_error or exc
+                try:
+                    config_store.set_hosted_runtime_mode(
+                        store, previous_runtime_mode
+                    )
+                except Exception as exc:
+                    compensation_error = compensation_error or exc
+                raise _RuntimeControlUnavailable from (
+                    compensation_error or transition_error
+                )
+            return data
+    except _RuntimeControlUnavailable:
+        raise
     except Exception as exc:
         raise _RuntimeControlUnavailable from exc
-    data = onboarding._save_onboarding_route(store, mode)
-    try:
-        new_user_v2_cohort.pin_resident(store)
-    except Exception as transition_error:
-        compensation_error = None
-        try:
-            new_user_v2_cohort.restore_allowlist(
-                store.user_id, previous_allowlist
-            )
-        except Exception as exc:
-            compensation_error = exc
-        try:
-            config_store.set_hosted_runtime_mode(
-                store, previous_runtime_mode
-            )
-        except Exception as exc:
-            compensation_error = compensation_error or exc
-        try:
-            onboarding._save_onboarding_route(store, previous_mode)
-        except Exception as exc:
-            compensation_error = compensation_error or exc
-        raise _RuntimeControlUnavailable from (
-            compensation_error or transition_error
-        )
-    return data
 
 
 def access_link_token_create(store: UserStore, payload: dict):
