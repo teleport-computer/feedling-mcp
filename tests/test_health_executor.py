@@ -101,6 +101,69 @@ def test_health_executor_limits_concurrency_to_two_workers():
     asyncio.run(go())
 
 
+def test_health_executor_rejects_work_beyond_outstanding_limit():
+    worker_started = [threading.Event(), threading.Event()]
+    worker_release = threading.Event()
+    queued_started = [threading.Event(), threading.Event()]
+    excess_started = threading.Event()
+
+    def blocked(started: threading.Event) -> None:
+        started.set()
+        assert worker_release.wait(timeout=2.0)
+
+    def queued(started: threading.Event) -> None:
+        started.set()
+
+    async def go():
+        running_tasks = [
+            asyncio.create_task(health_executor.run(blocked, started))
+            for started in worker_started
+        ]
+        queued_tasks = []
+        excess_task = None
+        try:
+            entered = await asyncio.gather(
+                *(asyncio.to_thread(started.wait, 1.0) for started in worker_started)
+            )
+            assert entered == [True, True]
+
+            queued_tasks = [
+                asyncio.create_task(health_executor.run(queued, started))
+                for started in queued_started
+            ]
+            await asyncio.sleep(0)
+
+            excess_task = asyncio.create_task(
+                health_executor.run(queued, excess_started, deadline_seconds=10.0)
+            )
+            await asyncio.sleep(0)
+
+            assert excess_task.done()
+            with pytest.raises(health_executor.HealthCheckTimeout):
+                await excess_task
+
+            for task in queued_tasks:
+                task.cancel()
+            cancelled = await asyncio.gather(*queued_tasks, return_exceptions=True)
+            assert all(isinstance(item, asyncio.CancelledError) for item in cancelled)
+
+            worker_release.set()
+            await asyncio.gather(*running_tasks)
+            assert not any(started.is_set() for started in queued_started)
+            assert not excess_started.is_set()
+        finally:
+            worker_release.set()
+            pending_tasks = [*running_tasks, *queued_tasks]
+            if excess_task is not None:
+                pending_tasks.append(excess_task)
+            for task in pending_tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*pending_tasks, return_exceptions=True)
+
+    asyncio.run(go())
+
+
 def test_health_executor_cancels_queued_callable_when_run_is_cancelled():
     first_started = threading.Event()
     second_started = threading.Event()
