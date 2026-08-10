@@ -7438,6 +7438,7 @@ _DEBUG_STEP_LABELS = {
     "agent.tool.call": ("🔧", "调用工具"),
     "mcp.surface.resolved": ("🧩", "MCP 工具面"),
     "mcp.surface.missing": ("🧩", "MCP 工具面缺失"),
+    "mcp.surface.wired": ("🧩", "MCP 已接线"),
     "agent.reasoning": ("💭", "思考 / reasoning"),
     "agent.reply": ("💬", "AI 回复"),
     "chat.response": ("📤", "写入回复"),

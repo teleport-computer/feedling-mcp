@@ -155,13 +155,22 @@ def test_bridge_log_format_matches_what_the_parser_expects():
 def test_tool_cap_is_high_enough_for_a_realistic_multi_server_setup():
     """上限要能装下真实用户的配置。
 
-    usr_1baf 装了 6 个服务器,仅 gardenforum 一个就 25 个工具;旧上限 50
-    在这种配置下会把字母序靠后的 tavily 整个丢掉(2026-08-09 提到 100)。
+    usr_1baf 装了 6 个服务器共 107 个工具。50 那版会把字母序靠后的 tavily
+    整个丢掉;2026-08-10 统一到 **128**(实测得出,见
+    tools/e2e/tool_count_ceiling_probe.py),这套配置一个都不用裁。
+
+    这里读的是**当前**常量而不是写死数字 —— 写死的话调上限时测试会静默失配。
     """
     mapping = (
         Path(__file__).parent.parent / "tools" / "pi_mcp_bridge" / "tool_mapping.js"
     ).read_text(encoding="utf-8")
-    assert "export const MAX_TOOLS = 100;" in mapping
+    import re as _re
+
+    match = _re.search(r"export const MAX_TOOLS = (\d+);", mapping)
+    assert match, "找不到 MAX_TOOLS"
+    assert int(match.group(1)) >= 107, (
+        f"上限 {match.group(1)} 装不下本月工具最多的真实用户(107 个)"
+    )
 
 
 def test_multiple_surface_lines_do_not_cross_wire_the_dropped_list():
@@ -230,3 +239,98 @@ def test_a_clean_turn_never_carries_someone_elses_dropped_names():
     _kind, kw = events[0]
     assert kw["detail"]["dropped"] == 0
     assert kw["detail"]["dropped_names"] == ""
+
+
+# ── 全路径覆盖(2026-08-10)────────────────────────────────────────────
+#
+# PR#174 暴露的最大缺漏:pi 那条修了、V2 整条被漏掉,而公开 changelog 却按通用
+# 措辞宣称修好了。所以这里按**路径矩阵**逐条锁,而不是只锁自己最熟的那条。
+#
+#   路径                     截断             可观测
+#   Hosted V2                轮转 64/65536    mcp.surface.resolved(serve_worker)
+#   V1/自托管 + pi           轮转 100         mcp.surface.resolved(桥 → consumer)
+#   V1/自托管 + claude       无(全量下发)   mcp.surface.wired / .missing
+#   V1/自托管 + codex        无(config.toml) mcp.surface.wired / .missing
+
+
+def _wiring(cmd, *, lane="chat", enabled=("tavily", "gaodemap"), env=None):
+    import os
+
+    captured = []
+    applied = {"servers": [{"name": n, "enabled": True} for n in enabled]}
+    with patch.object(crc, "_emit_debug_trace",
+                      side_effect=lambda ss, t, **kw: captured.append((t, kw))), \
+         patch.object(crc, "_user_mcp_applied", applied), \
+         patch.dict(os.environ, env or {}, clear=False):
+        crc._trace_user_mcp_wiring(list(cmd), trace_id="t1", lane=lane)
+    return captured
+
+
+def test_self_hosted_claude_without_mcp_config_is_reported_as_not_wired():
+    """PR#174 修的那个洞必须留声。
+
+    自托管 operator 照旧版文档写的 `AGENT_CLI_CMD` 没有 `{mcp}` 占位符,
+    `--mcp-config` 一次都没下发 —— App 里配的服务器**一台都到不了 agent**,
+    而 App 的连接测试是绿的(那是控制面探针直连服务器,两条路)。
+    这种情况以前完全不可观测,只能靠用户报。
+    """
+    events = _wiring(["claude", "--print", "--output-format", "json"],
+                     env={"CLAUDE_CONFIG_DIR": ""})
+    assert len(events) == 1
+    kind, kw = events[0]
+    assert kind == "mcp.surface.missing"
+    assert kw["status"] == "error"
+    assert kw["detail"]["wired"] is False
+    assert kw["detail"]["driver"] == "claude"
+
+
+def test_claude_wired_but_unauthorized_is_still_an_error():
+    """只接线不授权 = 调用进 permission_denials,模型回「这个工具需要授权」。
+
+    和用户原话一致(PR#174 实测)。这两个条件必须分开报,否则「已接线」会被
+    当成「能用」。
+    """
+    kind, kw = _wiring(["claude", "--mcp-config=/tmp/x.json", "--print"],
+                       env={"CLAUDE_CONFIG_DIR": ""})[0]
+    assert kind == "mcp.surface.wired"
+    assert kw["status"] == "error"
+    assert kw["detail"]["authorized"] is False
+    assert "需要授权" in kw["explain"]
+
+
+def test_claude_fully_wired_is_ok():
+    kind, kw = _wiring([
+        "claude", "--mcp-config=/tmp/x.json",
+        "--allowed-tools=mcp__tavily__*", "--print",
+    ])[0]
+    assert kind == "mcp.surface.wired"
+    assert kw["status"] == "ok"
+    assert kw["detail"]["authorized"] is True
+
+
+def test_hosted_claude_is_authorized_by_settings_json_not_by_a_flag():
+    """托管路线没有 allowlist 参数也算授权 —— 规则在我们生成的 settings.json 里。
+
+    PR#174 的四格矩阵证明 settings.json 单独就够。不认这条的话,托管用户每轮
+    都会被误报成「未授权」,把真问题淹掉。
+    """
+    kind, kw = _wiring(["claude", "--mcp-config=/tmp/x.json", "--print"],
+                       env={"CLAUDE_CONFIG_DIR": "/tmp"})[0]
+    assert kind == "mcp.surface.wired"
+    assert kw["status"] == "ok"
+
+
+def test_codex_without_config_home_is_reported_as_not_wired():
+    kind, kw = _wiring(["codex", "exec"], env={"CODEX_HOME": ""})[0]
+    assert kind == "mcp.surface.missing"
+    assert kw["detail"]["driver"] == "codex"
+
+
+def test_wiring_trace_is_silent_when_there_is_nothing_to_report():
+    """后台轮次、没有启用的服务器、非 claude/codex driver —— 都不该出声。
+
+    每轮刷一条假告警会把 200 条的 trace 环冲掉,真问题反而看不见。
+    """
+    assert _wiring(["claude", "--print"], lane="proactive") == []
+    assert _wiring(["claude", "--print"], enabled=()) == []
+    assert _wiring(["pi", "--mode", "json"]) == []

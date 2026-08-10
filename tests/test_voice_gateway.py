@@ -409,9 +409,11 @@ def test_cancel_route_does_not_clean_when_finalize_already_won(monkeypatch):
         return {"call_id": "vcall_race", "reason": "user_hangup"}
 
     monkeypatch.setattr(routes_asgi.asgi_http, "read_json_silent", read_payload)
+    # cancel 现在走**和 finalize 同一把生命周期锁**:2026-08-10 起它不再是
+    # 「删掉」,而是「用服务端自己有的内容归档」,所以裁决入口也统一了。
     monkeypatch.setattr(
         db,
-        "voice_call_cancel",
+        "voice_call_begin_finalize",
         lambda *_args: {"status": "finalizing", "replayed": True},
     )
     monkeypatch.setattr(
@@ -449,6 +451,13 @@ def test_cancel_route_does_not_clean_when_finalize_already_won(monkeypatch):
 
 
 def test_replayed_cancel_route_remains_idempotent_and_cleans(monkeypatch):
+    """旧版本留下的 `cancelled` 状态,重放要**继续收敛**,不是退让。
+
+    2026-08-10 起 cancel 不再删东西,而是「用服务端自己有的内容归档」。
+    但线上存量里还有旧版本写下的 cancelled 通话(有的行已经被删了、归档从没写过)。
+    重放打到那种通话时必须往下走:缺归档就补一条,该清的清干净 ——
+    退让会让它们永远停在半成品状态。
+    """
     async def read_payload(_request):
         return {"call_id": "vcall_repeat", "reason": "connect_failed"}
 
@@ -464,24 +473,45 @@ def test_replayed_cancel_route_remains_idempotent_and_cleans(monkeypatch):
             self.notified = True
 
     store = Store()
+    archived = {}
     monkeypatch.setattr(routes_asgi.asgi_http, "read_json_silent", read_payload)
     monkeypatch.setattr(
-        db,
-        "voice_call_cancel",
+        db, "voice_call_begin_finalize",
         lambda *_args: {"status": "cancelled", "replayed": True},
     )
+    monkeypatch.setattr(db, "voice_call_mark_finalized",
+                        lambda *_args: {"status": "finalized"})
+    monkeypatch.setattr(db, "chat_get_strict", lambda *_args: None)
+    monkeypatch.setattr(routes_asgi.results, "mint_enclave_token",
+                        lambda *_args: "rt")
     monkeypatch.setattr(
-        results,
-        "delete_call_state",
+        results, "delete_call_state",
         lambda *_args: {"results_deleted": 0, "streams_deleted": 0},
     )
     monkeypatch.setattr(
-        voice_cleanup,
-        "delete_call_messages",
+        voice_cleanup, "delete_call_messages",
         lambda *_args: {"deleted": 0, "retained_covered": 0, "remaining": 0},
     )
+    # 行已经被旧版本删光了 —— 归档仍然要写,否则这通电话对用户彻底消失
+    monkeypatch.setattr(voice_cleanup, "transcript_turns_from_rows",
+                        lambda *a, **k: [])
+    monkeypatch.setattr(voice_cleanup, "persist_transcript_card",
+                        lambda *a, **k: True)
     monkeypatch.setattr(core_store, "get_store", lambda *_args: store)
     monkeypatch.setattr(routes_asgi.wake_bus, "notify", lambda *_args: None)
+
+    from voice import transcript_store as _ts
+
+    monkeypatch.setattr(_ts, "exists", lambda *_args: False)
+    monkeypatch.setattr(_ts, "resolve_speaker_names", lambda *a, **k: ("我", "TA"))
+    monkeypatch.setattr(_ts, "render_transcript", lambda *a, **k: "")
+    monkeypatch.setattr(_ts, "build_preview", lambda text: text)
+
+    def _persist(_store, call_id, text, **kw):
+        archived["text"] = text
+        return {"turn_count": 0, "duration_sec": 0}
+
+    monkeypatch.setattr(_ts, "persist", _persist)
 
     response = asyncio.run(
         routes_asgi.cancel_voice_call(
@@ -492,10 +522,11 @@ def test_replayed_cancel_route_remains_idempotent_and_cleans(monkeypatch):
 
     body = json.loads(response.body)
     assert response.status_code == 200
-    assert body["status"] == "cancelled"
-    assert body["replayed"] is True
     assert store.reloaded is True
     assert store.notified is True
+    # 一句内容都没有的通话也要留下痕迹 —— Seven 2026-08-10 定稿:绝不允许遗漏
+    assert archived.get("text"), "空通话没有被归档,这通电话对用户就消失了"
+    assert "没有产生可记录的对话内容" in archived["text"]
 
 
 def test_gateway_does_not_persist_or_run_non_speech_turn(monkeypatch):
@@ -752,3 +783,85 @@ def test_voice_stream_handoff_is_encrypted_monotonic_and_segmented(monkeypatch):
     assert results.load_stream_texts(
         "another-user", call_id="call-1", turn_id="turn-1"
     ) == []
+
+
+def test_cancel_archives_the_content_the_server_has_instead_of_deleting_it(
+    monkeypatch,
+):
+    """客户端说「这通是空的」,但服务端明明有真实对话 —— 必须归档,不能删。
+
+    客户端只按**它自己看到的** ElevenLabs SDK 列表判空,而那份列表落定晚于
+    服务端落库:说完立刻挂断或切后台时,服务端已经有真实的一问一答了。
+    旧实现在这里把那些行直接删掉 —— **整通电话永久消失**,墓碑还会让之后
+    任何补救都 409。Seven 2026-08-10 定稿:所有通话一律归档,绝不允许遗漏。
+
+    所以 cancel 不再相信客户端的判断:它读服务端自己的行来重建转写。
+    """
+    async def read_payload(_request):
+        return {"call_id": "vcall_lagging_client", "reason": "user_hangup",
+                "duration_sec": 42}
+
+    class Store:
+        def reload(self):
+            pass
+
+        def notify_chat_waiters(self):
+            pass
+
+    archived = {}
+    deleted_after_archive = {"ok": False}
+    monkeypatch.setattr(routes_asgi.asgi_http, "read_json_silent", read_payload)
+    monkeypatch.setattr(db, "voice_call_begin_finalize",
+                        lambda *_args: {"status": "finalizing", "replayed": False})
+    monkeypatch.setattr(db, "voice_call_mark_finalized",
+                        lambda *_args: {"status": "finalized"})
+    monkeypatch.setattr(db, "chat_get_strict", lambda *_args: None)
+    monkeypatch.setattr(routes_asgi.results, "mint_enclave_token",
+                        lambda *_args: "rt")
+    monkeypatch.setattr(results, "delete_call_state",
+                        lambda *_args: {"results_deleted": 0, "streams_deleted": 0})
+    monkeypatch.setattr(core_store, "get_store", lambda *_args: Store())
+    monkeypatch.setattr(routes_asgi.wake_bus, "notify", lambda *_args: None)
+    # 服务端**有**真实内容,尽管客户端以为这通是空的
+    monkeypatch.setattr(
+        voice_cleanup, "transcript_turns_from_rows",
+        lambda *a, **k: [
+            {"role": "user", "text": "我明天要去看那个展"},
+            {"role": "assistant", "text": "记下了,几点的?"},
+        ],
+    )
+    monkeypatch.setattr(voice_cleanup, "persist_transcript_card",
+                        lambda *a, **k: True)
+
+    def _delete(*_args):
+        # 删行只能发生在归档之后 —— 顺序反了就等于没修
+        deleted_after_archive["ok"] = bool(archived)
+        return {"deleted": 2, "retained_covered": 0, "remaining": 0}
+
+    monkeypatch.setattr(voice_cleanup, "delete_call_messages", _delete)
+
+    from voice import transcript_store as _ts
+
+    monkeypatch.setattr(_ts, "exists", lambda *_args: False)
+    monkeypatch.setattr(_ts, "resolve_speaker_names", lambda *a, **k: ("我", "年年"))
+    monkeypatch.setattr(_ts, "build_preview", lambda text: text)
+
+    def _persist(_store, call_id, text, **kw):
+        archived["text"] = text
+        return {"turn_count": kw.get("turn_count", 0),
+                "duration_sec": kw.get("duration_sec", 0)}
+
+    monkeypatch.setattr(_ts, "persist", _persist)
+
+    response = asyncio.run(
+        routes_asgi.cancel_voice_call(
+            SimpleNamespace(), auth=SimpleNamespace(user_id="user-1"),
+        )
+    )
+
+    assert response.status_code == 200
+    assert "我明天要去看那个展" in archived.get("text", ""), (
+        "服务端有真实对话却没被归档 —— 这通电话就永久消失了"
+    )
+    assert "记下了" in archived["text"]
+    assert deleted_after_archive["ok"], "逐轮行在归档之前就被删了,顺序反了"

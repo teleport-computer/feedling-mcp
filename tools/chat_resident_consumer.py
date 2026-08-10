@@ -156,7 +156,7 @@ from memory import dream_gates as memory_dream_gates
 from memory.prompts_v1 import normalize_bucket_language
 from memory.card_text import (
     count_user_token_residuals,
-    is_card_format_error,
+    is_retryable_parse_error,
 )
 from memory.dream_prompt_v1 import (
     build_dream_prompt,
@@ -525,6 +525,66 @@ FOREGROUND_CHAT_CONTEXT_HEADER = os.environ.get(
 )
 FALLBACK_REPLY = os.environ.get(
     "FALLBACK_REPLY", "我这会儿有点慢，刚刚没接上。你稍后再发一次，我会继续接。"
+)
+# 同一句的英文。此前只有中文,自建的英文用户失败一次就收到一句中文
+# (2026-08-10 顺手修)。所有兜底文案都走 _fallback_reply_for,别再直接引用
+# FALLBACK_REPLY —— 直接引用就是漏掉英文分支的那条路。
+FALLBACK_REPLY_EN = os.environ.get(
+    "FALLBACK_REPLY_EN",
+    "I'm running slow and didn't catch that one. Send it again in a bit — "
+    "I'll pick it up.",
+)
+
+
+def _looks_chinese(text: Any) -> bool:
+    return bool(re.search(r"[一-鿿]", str(text or "")))
+
+
+def _fallback_reply_for(lang_anchor: Any = "") -> str:
+    """通用兜底(超时/5xx/限流/流断)。锚点是**用户原话**,不是拼装后的 prompt。"""
+    return FALLBACK_REPLY if _looks_chinese(lang_anchor) else FALLBACK_REPLY_EN
+
+
+def _empty_reply_fallback(lang_anchor: Any = "") -> str:
+    """「只思考没说出来」专用兜底(见 FOREGROUND_EMPTY_REPLY_RETRIES)。
+
+    刻意**不复用**通用那句:通用句覆盖 401/429/403/超时等一大票失败,那些情况
+    模型往往压根没跑起来,说「我开始想了」就是编。这一类我们确知模型收到了、
+    也确实产出了 reasoning,只是正文没出来 —— 所以可以照实说,而且照实说比
+    「我这会儿有点慢」对用户有用得多(Seven 2026-08-10:用户根本不知道发生了
+    什么)。技术归因不挤进这句话:失败横幅 turn_failure_* 是独立通道。
+    不提「系统」「网络」——我们并不知道是哪一段断的,也不该把用户自己的中转
+    问题说成我们的系统不稳。
+    """
+    if _looks_chinese(lang_anchor):
+        return (
+            "我收到你的消息了，也开始想怎么回你，可是话到一半断了，没能发出来。"
+            "让你等了。再跟我说一次，我在。"
+        )
+    return (
+        "I got your message and started writing back, but it got cut off "
+        "before anything reached you. Sorry for the wait — say it again? "
+        "I'm here."
+    )
+# 前台聊天的硬不变量:用户在等,这一轮**必须**产出可见文字。thinking 不算,
+# tool_call 也不算。空了就原地重调模型,重调用完还空才发 FALLBACK_REPLY。
+#
+# 为什么必须在前台单独立一条:唤醒/心跳/屏幕/感知车道「只思考不说话」是**合法
+# 结果**(V2 的 2f187175 `accept thinking-only wake silence` 就是这个语义),所以
+# 抽取层(_call_agent_http_* / CLI 分支)刻意把 thinking_summary/tool_calls 当作
+# "这轮有效"而放行。前台继承了那条放行,于是:
+#   usr_0724 2026-08-08~09,MiniMax-M3 连着几轮只吐 reasoning 不吐正文
+#   → turn.messages == [] → replies == [] → 下面 posted_any 那段
+#     `if replies and not posted_any` 因为 replies 为空整段跳过
+#   → 不重试、不兜底、checkpoint 照常前进,消息被判"已回答"永久丢失。
+# 用户连发十几条五个多小时收不到任何回复、也看不到任何报错(她的解读是"你不理
+# 我了")。前台唯一正确的语义是:出不来字就重试,重试不出来就说人话,绝不沉默。
+#
+# 原地重试是安全的:走到这里我们**确知一个字都没发出去**(posted_any=False),
+# 不存在重复发送 —— 这和已有的 lease 过期重试不是一回事,那条是给"可能已经发出
+# 去了"的写失败用的。
+FOREGROUND_EMPTY_REPLY_RETRIES = max(
+    0, int(os.environ.get("FOREGROUND_EMPTY_REPLY_RETRIES", "2"))
 )
 # Canned reply for /v1/chat/verify_loop liveness pings — see the short-circuit
 # in _process_messages. The server GCs both the ping and this reply once the
@@ -1202,7 +1262,9 @@ def _notify_agent_turn_failure(exc: BaseException, *, foreground: bool) -> None:
         log.exception("system notice emit failed (non-fatal)")
 
 
-def _turn_failure_reply_text(notice: "AgentErrorNotice") -> str:
+def _turn_failure_reply_text(
+    notice: "AgentErrorNotice", lang_anchor: Any = "",
+) -> str:
     """前台失败时那条用户可见气泡该说什么。
 
     `blame=user_provider` 的错误（余额耗尽 / key 失效 / 模型名被上游下线 / 上下文超限）
@@ -1215,7 +1277,7 @@ def _turn_failure_reply_text(notice: "AgentErrorNotice") -> str:
     因为对它们来说「稍后再发一次」是真话。"""
     if notice is not None and notice.blame == "user_provider":
         return notice.user_text
-    return FALLBACK_REPLY
+    return _fallback_reply_for(lang_anchor)
 
 
 def _suppress_duplicate_upstream_banner(notice: "AgentErrorNotice") -> None:
@@ -5403,6 +5465,8 @@ def _trace_user_mcp_surface(
         # 而不是只在 missing 分支判 —— 否则 claude 的 stderr 里若恰好出现
         # 一行同形文本,就会伪造出一条 resolved 事件(codex 审出)。
         return
+
+
     text = str(stderr or "")
     # 取**最后**一条,不是第一条:一轮正常只有一行,但桥若被重跑(或将来多次
     # 握手)会有多行,而第一条配上后面那条的丢弃名单就是张冠李戴。
@@ -5462,6 +5526,69 @@ def _trace_user_mcp_surface(
             # `服务器:注册数/发现数` —— 注册数才回答「它到底进没进去」。
             "per_server": per_server[:400], "dropped_names": dropped_names,
             "lane": lane, "attempt": attempt,
+        },
+    )
+
+
+def _trace_user_mcp_wiring(cmd: list[str], *, trace_id: str, lane: str) -> None:
+    """claude / codex 这两条路的 MCP **接线**是否到位。
+
+    它们不经过我们的桥,所以拿不到「注册了几个工具」——那是 CLI 内部的事。
+    但**能**回答一个同样致命的问题:这一轮我们到底有没有把服务器交给它。
+    PR#174 修的正是这个洞:自托管 claude 的模板没有 `{mcp}` 占位符,
+    `--mcp-config` 一次都没下发,用户在 App 里配的服务器**一台都到不了 agent**,
+    而 App 的连接测试是绿的(那是控制面探针直连服务器测的,两条路)。
+
+    这条埋点让那种情况不用再靠用户报:trace 里直接写着 wired=false。
+    """
+    if lane != "chat":
+        return
+    is_claude = _is_claude_code_cmd(cmd)
+    is_codex = _is_codex_cmd(cmd)
+    if not (is_claude or is_codex):
+        return
+    enabled = [
+        s for s in (_user_mcp_applied.get("servers") or []) if s.get("enabled")
+    ]
+    if not enabled:
+        return
+    names = [str(s.get("name") or "") for s in enabled]
+    if is_claude:
+        wired = any(
+            t == "--mcp-config" or t.startswith("--mcp-config=") for t in cmd
+        )
+        mechanism = "--mcp-config"
+        # 授权是第二个必要条件:只接线不授权时调用会进 permission_denials,
+        # 模型回「这个工具需要授权」——和用户原话一致(PR#174 实测)。
+        authorized = _cmd_has_allowed_tools(cmd) or bool(
+            os.environ.get("CLAUDE_CONFIG_DIR", "")
+        )
+    else:
+        codex_home = os.environ.get("CODEX_HOME", "")
+        wired = bool(codex_home) and (Path(codex_home) / "config.toml").exists()
+        mechanism = "config.toml"
+        authorized = wired  # codex 的 MCP 授权就在同一份 config 里
+    _emit_debug_trace(
+        "agent",
+        "mcp.surface.wired" if wired else "mcp.surface.missing",
+        status="ok" if (wired and authorized) else "error",
+        trace_id=trace_id,
+        summary=(f"{len(names)} 台 MCP 服务器"
+                 + ("已接线" + ("" if authorized else ",但未授权")
+                    if wired else "**未接线**")),
+        explain=(
+            f"这一轮通过 {mechanism} 把 {len(names)} 台服务器交给 CLI"
+            if wired else
+            f"有 {len(names)} 台启用的 MCP 服务器,但这一轮**一台都没交给 CLI** —— "
+            f"{mechanism} 没有出现在命令里,模型看不到任何 MCP 工具"
+        ) + ("" if authorized or not wired else
+             ";但没有授权来源(既无 allowlist 参数也无 settings.json),"
+             "调用会被拒,模型通常会说「需要授权」"),
+        detail={
+            "driver": "claude" if is_claude else "codex",
+            "lane": lane, "mechanism": mechanism,
+            "wired": wired, "authorized": authorized,
+            "servers": names[:20],
         },
     )
 
@@ -6590,6 +6717,141 @@ def _inject_codex_images(cmd: list[str], image_paths: list[str]) -> list[str]:
     return [*cmd[:insert_at], *flags, *cmd[insert_at:]]
 
 
+def _cmd_has_allowed_tools(cmd: list[str]) -> bool:
+    """True when the argv already pins a claude tool allowlist.
+
+    Both spellings are accepted by the CLI and both appear in the wild: the
+    official docs write ``--allowedTools`` while this repo's own templates use
+    ``--allowed-tools``. Matching only one of them means an operator using the
+    other gets a SECOND allowlist flag injected, which is exactly the
+    "how do duplicate flags merge" question we refuse to guess at — and a wrong
+    guess there can revoke a tool they depend on. Both bare and ``=``-bound
+    forms count.
+    """
+    return any(
+        t in ("--allowed-tools", "--allowedTools")
+        or t.startswith(("--allowed-tools=", "--allowedTools="))
+        for t in cmd
+    )
+
+
+def _inject_claude_user_mcp(cmd: list[str], lane: str) -> list[str]:
+    """Wire the app-configured MCP servers into a self-hosted ``claude`` command
+    whose template has no ``{mcp}`` placeholder.
+
+    Hosted commands are generated by ``agent_runtime.spawners`` and always carry
+    ``{mcp}``, so they never reach this path. A self-hosted operator writes
+    ``AGENT_CLI_CMD`` by hand from ``tools/README.md``, whose Claude example is
+    just ``claude --print --output-format json "{message}"`` — no ``{mcp}``. With
+    no placeholder ``_user_mcp_cli_value`` returns "" and ``--mcp-config`` is
+    never passed, so every server the user enabled in the app is simply absent
+    from the agent. The app shows them connected (the control-plane probe dials
+    the server directly and succeeds) while the agent has never heard of them,
+    and the model then reports the gap in whatever words it invents. Adding the
+    placeholder to the docs only helps operators who rewrite their command;
+    this injection also fixes the ones already deployed.
+
+    Two flags are needed, verified against claude-code 2.1.217 with a real MCP
+    server and the filesystem as ground truth (``--mcp-config`` alone → the call
+    comes back in ``permission_denials`` and the model says the tool "needs
+    permission granted"):
+      - ``--mcp-config`` so the servers exist at all;
+      - ``--allowed-tools`` so the calls are pre-approved, because a self-hosted
+        operator has no ``CLAUDE_CONFIG_DIR`` settings.json from us to carry the
+        ``mcp__<name>__*`` rules. Measured on the same version: adding this flag
+        does NOT turn into an exclusive allowlist — a Bash call still ran with
+        only ``mcp__ombre__*`` granted — so injecting it cannot cost the agent a
+        tool it had before.
+
+    ⚠️ BOTH are emitted in the ``=``-bound form. Both flags are variadic, so a
+    bare ``--mcp-config <path>`` swallows a following positional prompt —
+    reproduced by hand, though not reachable through this function today since
+    ``_driver_reads_stdin`` pipes the prompt for claude. Binding the value
+    removes the hazard for any template shape rather than relying on that.
+    Same trap, same fix as ``_inject_codex_images``.
+
+    Pure bypass: with no enabled server, no materialized file, a non-chat lane,
+    a non-claude driver, or an operator who already wired ``--mcp-config``, the
+    argv is returned unchanged.
+    """
+    if lane != "chat" or not _is_claude_code_cmd(cmd):
+        return cmd
+    if any(t == "--mcp-config" or t.startswith("--mcp-config=") for t in cmd):
+        return cmd  # operator wired MCP themselves — they own it
+    # Sorted by name so the emitted argv is identical for a given server set
+    # regardless of the order the backend happened to return them in — same
+    # rule ``user_mcp_materialize._enabled`` applies to the settings.json rules.
+    enabled = sorted(
+        (s for s in _user_mcp_applied.get("servers") or [] if s.get("enabled")),
+        key=lambda s: s.get("name") or "",
+    )
+    if not enabled:
+        return cmd
+    if not Path(USER_MCP_FILE).exists():
+        # Same degrade-don't-kill rule the pi bridge uses: a missing config
+        # makes claude exit 1 before any model call, which would take chat
+        # replies down entirely rather than merely losing MCP tools.
+        return cmd
+    flags = [f"--mcp-config={USER_MCP_FILE}"]
+    if _cmd_has_allowed_tools(cmd):
+        # The operator pinned their own allowlist. A second flag's merge
+        # semantics are not something to guess at, and silently replacing their
+        # allowlist could revoke a tool they rely on. Give them the servers and
+        # tell them the one line to add.
+        log.warning(
+            "[user_mcp] claude command has its own --allowed-tools; user MCP "
+            "servers are wired but NOT pre-approved. Add %s to that flag or to "
+            "settings.json, or the agent's calls to them will be denied.",
+            ",".join(f"mcp__{s['name']}__*" for s in enabled),
+        )
+    else:
+        _warn_if_claude_allowlist_semantics_unverified()
+        flags.append(
+            "--allowed-tools="
+            + ",".join(f"mcp__{s['name']}__*" for s in enabled)
+        )
+    return [cmd[0], *flags, *cmd[1:]]
+
+
+# 注入 --allowed-tools 的前提是它**不是排他白名单**(加了它,别的工具照样能用)。
+# 这一点是在 claude-code 2.1.217 上实测的:只授权 mcp__ombre__* 之后 Bash 仍然跑通。
+# 但自托管 operator 装的是什么版本我们不知道 —— 如果某个版本里它是排他的,
+# 注入就会**夺走 agent 原本有的工具**,把「少一个功能」变成「多一个故障」。
+# 所以在这里留声:实测版本写死在代码里,低于它就打一行 warning,
+# 而不是把这个假设只写在 PR 描述和「合入后建议」里(那样没人看得到)。
+_CLAUDE_ALLOWLIST_VERIFIED_VERSION = (2, 1, 217)
+_claude_allowlist_warned = False
+
+
+def _warn_if_claude_allowlist_semantics_unverified() -> None:
+    global _claude_allowlist_warned
+    if _claude_allowlist_warned:
+        return
+    raw = ""
+    try:
+        raw = subprocess.run(
+            ["claude", "--version"], capture_output=True, text=True, timeout=10
+        ).stdout
+    except Exception:  # noqa: BLE001 — 探不到版本不该影响回合
+        raw = ""
+    match = re.search(r"(\d+)\.(\d+)\.(\d+)", raw or "")
+    if not match:
+        return
+    version = tuple(int(g) for g in match.groups())
+    if version >= _CLAUDE_ALLOWLIST_VERIFIED_VERSION:
+        return
+    _claude_allowlist_warned = True
+    log.warning(
+        "[user_mcp] injecting --allowed-tools into claude %s, but the "
+        "'not an exclusive allowlist' behaviour was only measured on %s. "
+        "If this version treats it as exclusive, the agent loses every tool "
+        "outside mcp__*__*. Set your own --allowed-tools (it is left "
+        "untouched) or upgrade claude-code.",
+        ".".join(str(v) for v in version),
+        ".".join(str(v) for v in _CLAUDE_ALLOWLIST_VERIFIED_VERSION),
+    )
+
+
 def _cli_template_is_pi() -> bool:
     """True when AGENT_CLI_CMD drives ``pi`` (so we attach images as @refs)."""
     return _is_pi_cmd(_cli_cmd_tokens())
@@ -7043,6 +7305,9 @@ def _prepare_cli_command(
         cmd = _inject_codex_images(cmd, image_paths or [])
     if pi_native_images:
         cmd = _inject_pi_images(cmd, image_paths or [])
+    if "{mcp}" not in AGENT_CLI_CMD:
+        # Self-hosted claude templates written before the placeholder existed.
+        cmd = _inject_claude_user_mcp(cmd, lane)
 
     return _resolve_cli_executable(cmd), stdin_msg
 
@@ -7583,6 +7848,9 @@ def call_agent_cli(
         result.stderr or "", trace_id=trace_id, lane=lane,
         is_pi=_is_pi_cmd(cmd), attempt="first",
     )
+    # claude / codex 拿不到「注册了几个工具」(那是 CLI 内部的事),但能回答
+    # 同样致命的「这一轮到底有没有把服务器交给它」—— PR#174 修的正是这个洞。
+    _trace_user_mcp_wiring(cmd, trace_id=trace_id, lane=lane)
     if result.returncode == 0 and _is_claude_code_cmd(cmd):
         # Claude Code can silently choose its own default despite ANTHROPIC_MODEL.
         # Validate the CLI's structured receipt before persisting the session, so
@@ -8360,6 +8628,27 @@ def _image_claim_retry_prompt() -> str:
         f"(1) 你确实想给出这张图 —— 运行 `python {_IO_CLI_PATH} generate-image "
         "--prompt \"<完整的画面描述>\"`,再用 send-image 交付;"
         "(2) 你并不打算画 —— 照实说,不要用文字假装图已经存在。"
+    )
+
+
+def _empty_reply_retry_prompt(text: str) -> str:
+    """前台空回合的纠偏指令(见 FOREGROUND_EMPTY_REPLY_RETRIES)。
+
+    与 `_image_claim_retry_prompt` 同款:给一次明确的纠正机会,只点明缺什么,
+    **不替它决定说什么** —— 这是伴侣的话,不是我们的。裸重调一遍很可能撞同一个
+    坑(重推理模型把整轮都花在 reasoning 里),所以必须带上这句。
+    """
+    if re.search(r"[一-鿿]", str(text or "")):
+        return (
+            "上一轮你只在心里想了,没有输出任何给对方看到的文字 —— 对方那边是"
+            "一片空白,还在等你。这一轮请直接把要说的话说出来:正文不能为空,"
+            "也不要只调工具或只写思考。"
+        )
+    return (
+        "Last turn you only thought — nothing visible was sent, so the other "
+        "person is staring at silence and still waiting. This turn, say it out "
+        "loud: the visible reply must not be empty, and must not be only a tool "
+        "call or reasoning."
     )
 
 
@@ -10003,8 +10292,11 @@ def _user_mcp_cli_value(template: str, lane: str) -> str:
     """Resolve the ``{mcp}`` placeholder for one CLI turn.
 
     - No ``{mcp}`` slot in the template, or no enabled server → empty.
-    - claude → ``--mcp-config <file>`` ONLY on the chat lane (foreground turns
-      may call user MCP tools; background/proactive turns must not).
+    - claude → ``--mcp-config=<file>`` ONLY on the chat lane (foreground turns
+      may call user MCP tools; background/proactive turns must not), plus
+      ``--allowed-tools=mcp__<name>__*`` when the template pins no allowlist of
+      its own. Both ``=``-bound — the flags are variadic and would otherwise
+      swallow a trailing positional prompt.
     - codex  → per-server ``-c mcp_servers.<name>.enabled=false`` overrides ONLY
       on non-chat lanes. codex has no way to enable a subset per-turn, so its
       user MCP servers are configured in config.toml (available on chat turns)
@@ -10059,7 +10351,32 @@ def _user_mcp_cli_value(template: str, lane: str) -> str:
         return " ".join(
             f"-c mcp_servers.{name}.enabled=false" for name in names if name
         )
-    return f"--mcp-config {USER_MCP_FILE}" if lane == "chat" else ""
+    if lane != "chat":
+        return ""
+    # =-bound, NOT the bare ``--mcp-config <path>`` form this used to emit.
+    # The flag is variadic, so a template whose prompt is a trailing positional
+    # would have it swallowed — claude then opens the message text as a config
+    # file and exits 1 with "Invalid MCP configuration" (reproduced by running
+    # the documented line by hand). The consumer itself pipes the prompt via
+    # stdin for claude/codex/pi (``_driver_reads_stdin``), so no rendered
+    # command hits this today; the bound form is correct by construction for
+    # every template shape instead of only the ones that happen to pipe.
+    value = f"--mcp-config={USER_MCP_FILE}"
+    if _cmd_has_allowed_tools(shlex.split(template)):
+        # Hosted templates (agent_runtime.spawners) always pin their own
+        # allowlist, and so may an operator; theirs wins untouched. Hosted
+        # additionally carries the ``mcp__<name>__*`` rules in the settings.json
+        # we materialize, so it is already authorized.
+        return value
+    # Self-hosted with no allowlist of its own has no settings.json from us
+    # either, so wiring the servers without a grant just moves the failure from
+    # "tool doesn't exist" to "tool call denied" (verified: the call lands in
+    # permission_denials and the model reports it as missing permission).
+    grant = ",".join(
+        f"mcp__{s['name']}__*"
+        for s in sorted(enabled_servers, key=lambda s: s.get("name") or "")
+    )
+    return f"{value} --allowed-tools={grant}"
 
 
 def poll_proactive_jobs(since: float) -> dict:
@@ -12220,7 +12537,11 @@ def _memory_agent_parse_with_bounce(
     _note_agent_turn_success()
     parsed = parse(reply_text, strict=True)
     err = parsed[-1]
-    if not is_card_format_error(err):
+    # 谓词与 V2 的 ParseRetry.should_retry 是同一个(memory.card_text)。两条 lane
+    # 必须共用一份判据,否则同一个模型在托管和自建上会得到不同的重问行为 ——
+    # json_decode_error 以前不在重问范围,注释说它「各有自己的退避路径」,实测那条
+    # 路是空的:usr_450ee421e16a3b5a 连续 6 次失败,reask_count 全是 0。
+    if not is_retryable_parse_error(err):
         return parsed, ""
     log.warning(
         "%s content gate bounced id=%s reason=%s — re-asking once", lane, job_id, err
@@ -14564,7 +14885,7 @@ def _process_messages(messages: list) -> float:
                 # 否则用户被引导去重试一个永远不会成功的调用（见
                 # _turn_failure_reply_text）。
                 failure_notice = classify_agent_error(e)
-                agent_result = [_turn_failure_reply_text(failure_notice)]
+                agent_result = [_turn_failure_reply_text(failure_notice, raw_user_content_for_lang)]
                 if failure_notice.blame == "user_provider":
                     _suppress_duplicate_upstream_banner(failure_notice)
                 pending_failure_notice = e
@@ -14596,6 +14917,13 @@ def _process_messages(messages: list) -> float:
                     parse_failure_class
                 )
                 pending_failure_is_parse_only = True
+                # call_agent 那条兜底(清洗后为空)只拿得到**拼装后的 prompt**,
+                # 用它判语言正是 I5 明令禁止的(catalog/转写头里全是中文)。所以
+                # 它固定返回中文,由这里 —— 唯一握着用户原话的地方 —— 归一。
+                if agent_result == [FALLBACK_REPLY]:
+                    agent_result = [
+                        _fallback_reply_for(raw_user_content_for_lang)
+                    ]
             elif not vision_observer_failed:
                 _note_agent_turn_success()
 
@@ -14708,36 +15036,132 @@ def _process_messages(messages: list) -> float:
                 pending_failure_is_parse_only = False
                 _note_agent_turn_success()
 
-        turn = _split_agent_turn(agent_result)
-        sanitized_messages: list[str] = []
-        stripped_file_citation = False
-        for message in turn.messages:
-            if not isinstance(message, str):
-                continue
-            sanitized, removed = _sanitize_outbound_file_reply(
-                message,
-                attachment_staged=bool(
-                    staged_outbound_files or staged_outbound_images
-                ),
-            )
-            stripped_file_citation = stripped_file_citation or removed
-            if sanitized.strip():
-                sanitized_messages.append(sanitized)
-        if stripped_file_citation:
-            log.warning("removed internal file reference from visible reply")
-            turn.messages = sanitized_messages
-            if not staged_outbound_files:
-                turn.messages = [
-                    _outbound_file_failure_reply(raw_user_content_for_lang)
+        def _finalize_turn(result):
+            """agent_result → 清洗后的 turn。抽成函数是为了让空回合重试走**同一
+            条**清洗链:重试出来的回复若换一条更宽松的路进库,就等于给重试开了后
+            门,线上会冒出"只有重试那次才漏内部文件引用"这种查不出来的差异。"""
+            finalized = _split_agent_turn(result)
+            sanitized_messages: list[str] = []
+            stripped_file_citation = False
+            for message in finalized.messages:
+                if not isinstance(message, str):
+                    continue
+                sanitized, removed = _sanitize_outbound_file_reply(
+                    message,
+                    attachment_staged=bool(
+                        staged_outbound_files or staged_outbound_images
+                    ),
+                )
+                stripped_file_citation = stripped_file_citation or removed
+                if sanitized.strip():
+                    sanitized_messages.append(sanitized)
+            if stripped_file_citation:
+                log.warning("removed internal file reference from visible reply")
+                finalized.messages = sanitized_messages
+                if not staged_outbound_files:
+                    finalized.messages = [
+                        _outbound_file_failure_reply(raw_user_content_for_lang)
+                    ]
+            if staged_outbound_files and not finalized.messages:
+                finalized.messages = [
+                    "文件已经准备好了。"
+                    if re.search(r"[\u4e00-\u9fff]", raw_user_content_for_lang)
+                    else "The file is ready."
                 ]
-        if staged_outbound_files and not turn.messages:
-            turn.messages = [
-                "文件已经准备好了。"
-                if re.search(r"[\u4e00-\u9fff]", raw_user_content_for_lang)
-                else "The file is ready."
-            ]
-        if staged_outbound_images and not turn.messages:
-            turn.messages = [_image_ready_reply(raw_user_content_for_lang)]
+            if staged_outbound_images and not finalized.messages:
+                finalized.messages = [_image_ready_reply(raw_user_content_for_lang)]
+            return finalized
+
+        turn = _finalize_turn(agent_result)
+
+        # ---- 前台不变量:出不来字就重试,重试不出来就说人话,绝不沉默 ---------
+        # 判据是「可见文字」。actions 也算数(动作会经 rewrite_reply_for_outcomes
+        # 变成一句诚实的回复),但 thinking_summary / tool_calls **不算** —— 那正
+        # 是 usr_0724 那三轮的形状:模型想完了、工具也调了,就是一个字没说。
+        # 已带失败通知的回合不进这里:那条路自己会发兜底,再重试等于把一次上游
+        # 故障放大成三次。维护车道也不进:那是内部回合,没有人在等,给它糊一句
+        # 「我这会儿有点慢」等于往用户聊天流里塞一条不属于对话的气泡。
+        if (
+            not turn.messages
+            and not turn.actions
+            and pending_failure_notice is None
+            and source != RESIDENT_MAINTENANCE_SOURCE
+        ):
+            for attempt in range(1, FOREGROUND_EMPTY_REPLY_RETRIES + 1):
+                log.warning(
+                    "foreground turn produced no visible reply "
+                    "(thinking=%s tool_calls=%s); retrying %d/%d",
+                    bool(turn.thinking_summary), bool(turn.tool_calls),
+                    attempt, FOREGROUND_EMPTY_REPLY_RETRIES,
+                )
+                _emit_debug_trace(
+                    "agent", "agent.reply.empty_retry", status="error",
+                    trace_id=trace_id,
+                    summary=(f"empty visible reply; retry {attempt}/"
+                             f"{FOREGROUND_EMPTY_REPLY_RETRIES}"),
+                    explain="模型这一轮只思考没说话，用户还在等；正在重试。",
+                    detail={
+                        "attempt": attempt,
+                        "max_attempts": FOREGROUND_EMPTY_REPLY_RETRIES,
+                        "had_thinking": bool(turn.thinking_summary),
+                        "had_tool_calls": bool(turn.tool_calls),
+                        "thinking_kind": turn.thinking_kind or "",
+                    },
+                    content_excerpt={
+                        "thinking": (turn.thinking_summary or "")[:2000]
+                    },
+                )
+                try:
+                    retry_result = _dispatch_foreground_agent(
+                        content
+                        + "\n\n"
+                        + _empty_reply_retry_prompt(raw_user_content_for_lang)
+                    )
+                except Exception as exc:
+                    # 重试自己炸了:别把它记成新的一类失败,按空回复收口走下面的
+                    # 兜底 —— 用户要的是一句话,不是一份更精确的验尸报告。
+                    log.error("empty-reply retry raised: %s", exc)
+                    _consume_reply_parse_failed()
+                    break
+                retry_failure_class = _consume_reply_parse_failed()
+                turn = _finalize_turn(retry_result)
+                if turn.messages or turn.actions:
+                    log.info(
+                        "empty-reply retry %d recovered a visible reply", attempt
+                    )
+                    _note_agent_turn_success()
+                    break
+                if retry_failure_class:
+                    break
+            if not turn.messages and not turn.actions:
+                # 重试用尽仍然一个字都没有。用户发了一条,就必须收到一条 ——
+                # 归 provider_empty_reply(模型压根没给正文),横幅才不会赖我们。
+                log.error(
+                    "foreground turn still empty after %d retries; sending fallback",
+                    FOREGROUND_EMPTY_REPLY_RETRIES,
+                )
+                # 这条是这类失败在看板上**唯一**的信号:agent.reply 那条记的是
+                # status=ok(它确实解析成功了,只是解析出 0 条),stalled_turns 也
+                # 数不到 —— usr_0724 的三轮在 admin 面上长得跟正常回合一模一样,
+                # 所以这个 bug 过去有多少次我们根本查不出来。
+                _emit_debug_trace(
+                    "agent", "agent.reply.empty_exhausted", status="error",
+                    trace_id=trace_id,
+                    summary="empty visible reply after "
+                            f"{FOREGROUND_EMPTY_REPLY_RETRIES} retries",
+                    explain="重试后模型仍然只思考不说话，已发兜底回复。",
+                    detail={
+                        "max_attempts": FOREGROUND_EMPTY_REPLY_RETRIES,
+                        "had_thinking": bool(turn.thinking_summary),
+                        "thinking_kind": turn.thinking_kind or "",
+                    },
+                )
+                turn.messages = [_empty_reply_fallback(raw_user_content_for_lang)]
+                pending_failure_notice = _reply_parse_failure_exc(
+                    "provider_empty_reply"
+                )
+                pending_failure_is_parse_only = True
+
         _reply_text = "\n\n".join(m for m in turn.messages if isinstance(m, str) and m.strip())
         _emit_debug_trace(
             "agent", "agent.reply", trace_id=trace_id,
@@ -14821,7 +15245,7 @@ def _process_messages(messages: list) -> float:
                     "(degenerate punctuation fragment only)"
                 )
                 if SEND_FALLBACK_ON_AGENT_ERROR:
-                    replies = [FALLBACK_REPLY]
+                    replies = [_fallback_reply_for(raw_user_content_for_lang)]
                     pending_failure_notice = stream_cut
                 else:
                     _notify_agent_turn_failure(stream_cut, foreground=True)

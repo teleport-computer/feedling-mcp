@@ -17,7 +17,12 @@
 // —— 于是「测试连接通过、AI 却说搜不到」。上限本身是防御性的(挡住工具面爆炸),
 // 不是产品意图,所以放宽而不是取消;真正的修复是让它**可见**(见 index.js 里
 // 无条件输出的 surface 行),别再静默丢弃。
-export const MAX_TOOLS = 100;
+// 与 hosted/mcp_tools.py 的 MAX_MCP_TOOLS_PER_TURN **保持同一个数**。
+// 两条路不同 = 同一个用户换个 driver 行为就变,这一整周修的就是这类不一致。
+// 128 是实测出来的(见 tools/e2e/tool_count_ceiling_probe.py 与那边的注释):
+// 500 个工具都没撞硬墙、弱模型 300 个仍全对,真正的代价是每轮的 token;
+// 128 ≈ 23k token,而且能把本月工具最多的真实用户(6 台共 107 个)全装下。
+export const MAX_TOOLS = 128;
 const MAX_NAME_LEN = 64;
 
 function sanitizeSegment(s) {

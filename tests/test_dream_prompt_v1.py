@@ -95,6 +95,15 @@ def test_parse_normal_consolidation():
     assert qs == ["要不要问 TA X"]
 
 
+def test_parse_ignores_fake_json_inside_thinking():
+    raw = (
+        '<think>草稿 {"consolidations": [not valid]}</think>'
+        '{"consolidations": [], "questions_to_ask": []}'
+    )
+    cons, questions, err = parse_dream_consolidations(raw)
+    assert cons == [] and questions == [] and err is None
+
+
 def test_parse_empty_is_clean():
     cons, qs, err = parse_dream_consolidations('{"consolidations": [], "questions_to_ask": []}')
     assert cons == [] and qs == [] and err is None

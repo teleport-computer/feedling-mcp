@@ -1165,7 +1165,8 @@ def test_agent_failure_posts_visible_fallback_by_default(monkeypatch):
 
     # Original contract, unweakened: the user-visible fallback must still go out.
     assert len(fallback_calls) == 1
-    assert fallback_calls[0].args[0] == crc.FALLBACK_REPLY
+    # 兜底语言跟用户走(2026-08-10):"msg1" 是英文,所以拿到英文那句。
+    assert fallback_calls[0].args[0] == crc._fallback_reply_for("msg1")
     assert fallback_calls[0].kwargs["reply_to_message_id"] == "agent-failure-1"
 
     # New contract: a suppressed-push system notice with the technical reason.
@@ -1333,7 +1334,8 @@ def test_agent_failure_fallback_posts_every_turn_banner_windowed(monkeypatch):
     fallback_calls = [c for c in mock_post.call_args_list if c.kwargs.get("role") != "system"]
     notice_calls = [c for c in mock_post.call_args_list if c.kwargs.get("role") == "system"]
 
-    assert [c.args[0] for c in fallback_calls] == [crc.FALLBACK_REPLY, crc.FALLBACK_REPLY]
+    en = crc._fallback_reply_for("msg1")
+    assert [c.args[0] for c in fallback_calls] == [en, en]
 
     assert len(notice_calls) == 1
     c = notice_calls[0]
@@ -4297,6 +4299,188 @@ def test_foreground_degenerate_with_fallback_disabled_posts_nothing(monkeypatch)
     assert _visible_replies(captured) == []
     assert captured["failures"] and captured["failures"][0][1] is True  # foreground
     assert result_ts == pytest.approx(5555.0)
+
+
+# ---------------------------------------------------------------------------
+# Foreground "thinking-only" guard (2026-08-10).
+#
+# Sibling of the degenerate-fragment guard above, and the SAME product rule: a
+# user is waiting, so silence is not an outcome. The hole this closes sits one
+# notch earlier — not "the reply was a bare 。" but "there was no reply at all".
+# A heavy-reasoning model (usr_0724, MiniMax-M3 over an openai_compatible relay)
+# burned whole turns inside the reasoning channel and emitted no assistant text.
+# The extractors deliberately let that through — thinking_summary / tool_calls
+# mark a turn "valid" because the WAKE lanes are allowed to think and stay quiet
+# (runtime-v2 2f187175 made that explicit) — and the foreground lane inherited
+# the pass. Downstream, `replies == []` meant the degenerate guard never fired
+# (it is nested under `if degenerate:`) and `if replies and not posted_any`
+# skipped the keep-checkpoint retry, so the message was marked answered and lost
+# FOREVER. 2026-08-08: she sent 15+ messages over five hours and got nothing —
+# no reply, no error, no banner. Foreground now retries with an explicit nudge,
+# then falls back out loud.
+# ---------------------------------------------------------------------------
+
+def _thinking_only(text="她说她想我了，我得回应一下"):
+    """Production shape of the bug: reasoning present, zero visible messages."""
+    return {"messages": [], "provider_reasoning": text}
+
+
+def test_thinking_only_turn_is_actually_empty():
+    """Guard the fixture itself: if this ever parsed to a message, every test
+    below would pass for the wrong reason."""
+    turn = crc._split_agent_turn(_thinking_only())
+    assert turn.messages == [] and turn.actions == []
+    assert turn.thinking_summary  # …but the model DID think
+
+
+def test_foreground_thinking_only_retries_and_recovers(monkeypatch):
+    """THE regression: think-only must not end the turn. Retry, and the user
+    gets the real reply — never the fallback line."""
+    crc._seen_ids.clear()
+    crc._seen_ids_order.clear()
+    calls = []
+
+    def fake_call_agent(message, **kwargs):
+        calls.append(message)
+        if len(calls) == 1:
+            return _thinking_only()
+        return {"messages": ["在呢在呢，刚走神了"]}
+
+    monkeypatch.setattr(crc, "call_agent", fake_call_agent)
+    with patch.object(crc, "post_reply", return_value={"id": "r1"}) as mock_post:
+        crc._process_messages(
+            [{"id": "u-think1", "role": "user", "content": "怎么还不回我", "ts": 100.0}]
+        )
+
+    posted = [c.args[0] for c in mock_post.call_args_list]
+    assert "在呢在呢，刚走神了" in posted
+    assert crc._empty_reply_fallback("怎么还不回我") not in posted, (
+        "a recovered turn must not also look like a failure"
+    )
+    assert len(calls) == 2, "exactly one retry was needed"
+    # The retry carries an explicit nudge — a bare re-call usually re-hits the
+    # same reasoning-only shape.
+    assert "没有输出任何给对方看到的文字" in calls[1]
+    assert "怎么还不回我" in calls[1], "retry must re-send the user's actual message"
+
+
+def test_empty_reply_retry_prompt_follows_the_user_language():
+    """The nudge rides along on a companion turn — an English-speaking user must
+    not get a Chinese instruction bleeding into their reply."""
+    assert "说出来" in crc._empty_reply_retry_prompt("在吗")
+    assert "say it out loud" in crc._empty_reply_retry_prompt("you there?")
+
+
+def test_foreground_thinking_only_exhausts_retries_then_falls_back(monkeypatch):
+    """Model never speaks → user still gets a bubble, blamed on the provider."""
+    crc._seen_ids.clear()
+    crc._seen_ids_order.clear()
+    calls = []
+
+    def fake_call_agent(message, **kwargs):
+        calls.append(message)
+        return _thinking_only()
+
+    monkeypatch.setattr(crc, "call_agent", fake_call_agent)
+    with (
+        patch.object(crc, "post_reply", return_value={"id": "r1"}) as mock_post,
+        patch.object(crc, "_emit_debug_trace") as mock_trace,
+    ):
+        result_ts = crc._process_messages(
+            [{"id": "u-think2", "role": "user", "content": "怎么还不回消息?", "ts": 200.0}]
+        )
+
+    posted = [c.args[0] for c in mock_post.call_args_list]
+    assert posted, "SILENCE — the exact bug this guard exists to prevent"
+    assert crc._empty_reply_fallback("怎么还不回消息?") in posted
+    assert len(calls) == 1 + crc.FOREGROUND_EMPTY_REPLY_RETRIES
+    # 归因:模型压根没给正文 = provider 的空回复,不是我们解析坏了。
+    kwargs = mock_post.call_args_list[0].kwargs
+    assert kwargs["turn_failure_error_class"] == "provider_empty_reply"
+    # Turn is resolved (a fallback went out), so the checkpoint may advance.
+    assert result_ts == pytest.approx(200.0)
+    # …and it must be VISIBLE on the dashboard. The agent.reply row for this
+    # turn is status=ok (it parsed fine — into zero messages) and stalled_turns
+    # misses it entirely, so without this trace the class stays invisible and
+    # we cannot tell how often it has been happening. (codex4 的恢复分支补的
+    # 这条断言,合过来。)
+    exhausted = [
+        call for call in mock_trace.call_args_list
+        if len(call.args) > 1 and call.args[1] == "agent.reply.empty_exhausted"
+    ]
+    assert len(exhausted) == 1
+    assert exhausted[0].kwargs["status"] == "error"
+    assert exhausted[0].kwargs["detail"]["max_attempts"] == (
+        crc.FOREGROUND_EMPTY_REPLY_RETRIES
+    )
+
+
+def test_empty_reply_fallback_says_what_actually_happened():
+    """Seven 2026-08-10: 「我这会儿有点慢」leaves the user with no idea what
+    happened. This class is the one case where we DO know — the model received
+    it and produced reasoning, the visible text just never came — so say that.
+    Deliberately NOT the generic line, which also covers 401/429/403 where the
+    model never ran and "I started thinking" would be a lie."""
+    zh = crc._empty_reply_fallback("在吗")
+    assert zh != crc.FALLBACK_REPLY, "must not reuse the generic failure line"
+    assert "收到你的消息" in zh and "断了" in zh
+    for blame_word in ("系统", "网络", "服务"):
+        assert blame_word not in zh, (
+            f"{blame_word!r} reads as 'our platform is broken' — we do not "
+            "actually know which hop cut out"
+        )
+    en = crc._empty_reply_fallback("you there?")
+    assert "got your message" in en and "cut off" in en
+
+
+def test_foreground_normal_reply_never_triggers_a_retry(monkeypatch):
+    """The guard must be invisible on the happy path — one call, one reply."""
+    crc._seen_ids.clear()
+    crc._seen_ids_order.clear()
+    calls = []
+
+    def fake_call_agent(message, **kwargs):
+        calls.append(message)
+        return {"messages": ["晚安，睡吧"]}
+
+    monkeypatch.setattr(crc, "call_agent", fake_call_agent)
+    with patch.object(crc, "post_reply", return_value={"id": "r1"}) as mock_post:
+        crc._process_messages(
+            [{"id": "u-ok", "role": "user", "content": "晚安", "ts": 300.0}]
+        )
+
+    assert len(calls) == 1
+    assert [c.args[0] for c in mock_post.call_args_list] == ["晚安，睡吧"]
+
+
+def test_foreground_retry_that_raises_still_falls_back_not_silent(monkeypatch):
+    """If the retry call itself explodes, the user still gets a line. A more
+    precise post-mortem is worth nothing to someone staring at silence."""
+    crc._seen_ids.clear()
+    crc._seen_ids_order.clear()
+    calls = []
+
+    def fake_call_agent(message, **kwargs):
+        calls.append(message)
+        if len(calls) == 1:
+            return _thinking_only()
+        raise RuntimeError("relay died mid-retry")
+
+    monkeypatch.setattr(crc, "call_agent", fake_call_agent)
+    with patch.object(crc, "post_reply", return_value={"id": "r1"}) as mock_post:
+        crc._process_messages(
+            [{"id": "u-think3", "role": "user", "content": "在吗", "ts": 400.0}]
+        )
+
+    posted = [c.args[0] for c in mock_post.call_args_list]
+    assert posted, "retry blowing up must not turn into silence"
+
+
+def test_generic_fallback_follows_the_user_language():
+    """英文自建用户此前失败一次就收到一句中文(2026-08-10 顺手修)。"""
+    assert crc._fallback_reply_for("晚安") == crc.FALLBACK_REPLY
+    assert crc._fallback_reply_for("good night") == crc.FALLBACK_REPLY_EN
+    assert crc._fallback_reply_for("") == crc.FALLBACK_REPLY_EN
 
 
 def _degenerate_test_harness(monkeypatch, agent_result):
