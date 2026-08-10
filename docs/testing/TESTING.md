@@ -174,6 +174,26 @@
   扫一遍**，尤其看提交信息里有没有出现同一个 user_id——一次 grep 省掉整轮重复劳动，
   也避免两个人各修一半在同一个文件里撞车。
 - **`runtime.test_status=ok` 骗人**：它只证明轻量 ping 通了，真实生成仍可能全部 timeout（廉价中转限流/欠费/过载）。判"中转是否真活着"要看 `provider_attempt_ledger` 尾部的 `outcome`。
+- **"埋点没出现"不是证据，是四种可能**：2026-08-10 查 MCP 时我差点拿"这个用户的
+  trace 里一条 `mcp.surface.*` 都没有"直接结论成"consumer 侧一台服务器都没有"。
+  缺失至少有四个来源，**必须四个全排除才能当发现**：① 条件确实没发生；
+  ② **发埋点的代码还没跑在那个进程上**（埋点提交今天才进镜像，而 consumer 是长跑
+  进程，部署不一定重启它）；③ **埋点自己有前置早退**（`_trace_user_mcp_wiring` 在
+  "零台启用"时 return，而那恰好就是要查的状态——洞照不出自己）；④ **环被冲掉了**
+  （trace 是每用户 200 条的环，一轮记忆蒸馏就刷 ~198 条 `enclave.call`，把同期的
+  chat 轮整个挤没）。排 ③ 的办法是读那个函数的早退条件，排 ④ 的办法是按 subsystem
+  过滤重查、看 `events_total` 是不是正好顶格。
+- **判据不能问"容器在不在"，要问"内容对不对"**：同一天发现 `authorized` 的判据是
+  `有 --allowed-tools` OR `CLAUDE_CONFIG_DIR 非空`——而托管模板**恒带**前一个
+  （里面只有 io_cli 动词、没有任何 mcp 规则）、托管环境**恒设**后一个。于是它对
+  全部托管用户永远返回 true：**它唯一该报的那个状态，恰恰是它永远报不出来的**。
+  自查手法：拿主力环境的真实形状代进去，问"这个判据在生产上**存在**返回 false 的
+  输入吗"——答不上来就是恒真。同族：`if 文件存在` / `if 环境变量非空` /
+  `if 列表非 None` 这类，都要追一步"那里面装的是不是我要的东西"。
+- **控制面探通 ≠ 数据面能用**：App 的 MCP"测试连接"是**后端直连**那台服务器的探针，
+  和 agent 那条路完全不相干（agent 走 `--mcp-config`/桥/config.toml）。用户说
+  "测试是绿的"对"agent 拿没拿到工具"零信息量。凡是"配置页显示正常、实际功能用不了"
+  的投诉，先把两条路画出来，确认绿灯到底亮在哪条上。
 - **openai_compatible 中转验证，`test_status:ok` 之外还有两个独立坑**（2026-07-27 Kimi/Moonshot 验证）：
   ① **key 有区域锁**——同一家中转多个区域 endpoint，key 只在签发区有效：Moonshot 的 key 在 `api.moonshot.cn` 返 200，同 key 打 `api.moonshot.ai` 直接 `401 Invalid Authentication`。用户报 `provider_test_failed` / 401，**先核 `base_url` 区域是否配对 key 的签发区，再谈 key 废没废**（先 `curl {base_url}/models -H "Authorization: Bearer <key>"` 隔离 provider 侧）。
   ② **「能回话」≠「记忆/工具能用」，必须单独验一轮带记忆写入 + 工具调用的回合**——但**没有任何配置字段能替你预测这件事**。曾经的 `responses_unsupported` warning + `supports_responses` 探测（setup 打中转 `/responses`）是错的，2026-07-27 已删除：它的前提「LiteLLM 强制 responses→chat-completions 桥接 mangle codex 工具循环」三条全失效（网关已退役；`openai_compatible` 派生 `pi` 而非 `codex`；V2 全程 `chat_completion_async`，`/responses` 在 `provider_client` 唯一入口是 `provider == "openai"`）。实测：Kimi/Moonshot 在 V1(pi) 与 V2 两条路径上记忆写入、下一轮回读、工具调用全部正常（V2 trajectory 记到 `tool_call_started`/`tool_call_result` 各 3 次）。**验法只有跑真回合**：写一条事实 → 下一轮问回来 → 查 `/v1/memory/index` 有卡；要白盒就查 `v2_trajectory_events.event_kind`（明文列，`user_id` 过滤，删号会 CASCADE 掉，必须在 teardown 前查）。
