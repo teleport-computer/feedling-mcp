@@ -7659,7 +7659,9 @@ def _render_data_track_debug_page(payload: dict) -> str:
         )
     limit_options = []
     current_limit = str(pagination.get("limit") or filters.get("limit") or 100)
-    for value in ("50", "100", "200", "500"):
+    # Ring depth is debug_trace._MAX_EVENTS (2500); stopping the picker at 500
+    # meant a full 48h trace could not be read out from the panel at all.
+    for value in ("50", "100", "200", "500", "1000", "2500"):
         selected = "selected" if current_limit == value else ""
         limit_options.append(f'<option value="{value}" {selected}>{value}</option>')
 
