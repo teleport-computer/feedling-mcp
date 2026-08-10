@@ -25,6 +25,47 @@
 
 ---
 
+## 新注册 Model API 用户的自动 V2 admission
+
+`FEEDLING_V2_NEW_USER_CUTOFF` 是主 CVM **backend** 的环境变量。只接受带时区的 UTC
+ISO-8601 时间戳（推荐以 `Z` 结尾，例如 `2026-08-10T00:00:00Z`）；未配置、空值、格式
+非法，或用户注册时间不能可靠解析时都 **fail-safe 为 resident**。`FEEDLING_RUNTIME_DEFAULT_DESIRED`
+始终保持 `resident`，因此没有 cutoff 的代码部署是零行为变化阶段。
+
+自动判定只在成功测试且已激活的 Model API route 已持久化后执行，且只覆盖
+`users.created_at >= cutoff` 的账号。命中后会创建：
+
+```text
+desired=v2
+updated_by=new-user-cohort
+note=registered-at-or-after:<normalized-cutoff>
+```
+
+任何 `updated_by != 'new-user-cohort'` 的人工或用户路线记录都是更高优先级的显式 pin，
+不会被自动 admission 覆盖。尤其是 `desired=resident` 会持久阻止自动切回 V2；只删除
+自动记录不是可靠的 resident pin，因为用户以后再次完成 setup 时仍可能重新满足 cohort
+条件并创建该记录。
+
+### 启用、观察与停止 admission
+
+按环境分阶段执行：先以空 cutoff 部署代码并验证健康；再设置一个明确的 UTC cutoff，重部署
+measured Compose，随后用 runtime allowlist reconciliation view 观察
+`updated_by='new-user-cohort'` 的 `desired`、实际 mode/state/generation 与 `converged`。
+同时观察 V2 首轮回复成功率、worker capacity、pending/oldest-job age 和延迟；不得把
+provider key、聊天明文或用户内容写入运维记录。
+
+停止新增自动 admission：清空 cutoff，或把它移动到未来。这不会改变已经进入 V2 的账号。
+单个账号的持久回滚应写 `desired=resident`；批量回滚只操作自动 cohort，避免影响人工
+canary 或其他来源的记录：
+
+```sql
+UPDATE v2_user_allowlist
+SET desired='resident', updated_at=now()
+WHERE updated_by='new-user-cohort' AND desired='v2';
+```
+
+---
+
 ## 方式 A：Admin API（推荐，单个/少量）
 
 **端点**：`POST /v1/admin/runtime-allowlist`（prod = `https://api.feedling.app`）
@@ -47,11 +88,18 @@ curl -s https://api.feedling.app/v1/admin/runtime-allowlist \
 # 关注 .converged == true 且 .actual.state == "v2"
 ```
 
-### 回滚
+### 持久回滚到 resident
 ```bash
-# 切回 V1：
+# 用同一个 POST 写显式 resident pin；它优先于 automatic cohort admission：
 -d '{"user_id":"usr_xxx","desired":"resident"}'
-# 从 allowlist 移除（用户回到默认 resident，不再被 reconciler 管）：
+```
+
+如确需清理 allowlist 行，`remove` **不是**持久 resident 回滚。对
+`updated_by='new-user-cohort'` 的自动行，后续一次成功的 Model API setup 可能重新创建它；
+不要用删除来表达该用户长期留在 resident 的决定。
+
+```bash
+# 非持久清理；不能代替 resident pin：
 -d '{"user_id":"usr_xxx","desired":"remove"}'
 ```
 
@@ -82,11 +130,20 @@ for i in $(seq 1 15); do
 done
 ```
 
-### 回滚（DB）
+### 持久回滚（DB）
 ```sql
--- 切回 V1：
-UPDATE v2_user_allowlist SET desired='resident', updated_at=now() WHERE user_id='usr_xxx';
--- 移除：
+-- 显式 resident pin；不要直接更新 ownership fence：
+INSERT INTO v2_user_allowlist (user_id, desired, updated_by, note)
+VALUES ('usr_xxx', 'resident', 'ops-manual', 'durable resident rollback')
+ON CONFLICT (user_id) DO UPDATE SET
+  desired=EXCLUDED.desired, updated_by=EXCLUDED.updated_by,
+  note=EXCLUDED.note, updated_at=now();
+```
+
+如确需删除 allowlist 行，这只是非持久清理；自动 cohort 行会在后续成功的 Model API setup
+中重新创建，不能作为 resident pin：
+
+```sql
 DELETE FROM v2_user_allowlist WHERE user_id='usr_xxx';
 ```
 

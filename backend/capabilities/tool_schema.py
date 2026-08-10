@@ -44,6 +44,14 @@ _MEMORY_TOOL_ACTION = {
         "summary": _STR,
         "content": _STR,
         "bucket": _STR,
+        # 线索标签。后端(worker 翻译层 + actions)一直在消费它,capture/dream 也产它,
+        # 共享的 MEMORY_WRITE_RULES_V1 还明确教模型「一张卡 1-4 个」——只有这道闸
+        # 拦着,于是 V2 手写的卡标签永远是空的(2026-08-10 真机)。
+        "threads": {"type": "array", "items": _STR},
+        # 这两个直接参与 ambient 排序(memory_readside_core)。schema 不开的话
+        # actions 一律落 0.5/0.3,V2 每张卡权重完全一样。
+        "importance": {"type": "number"},
+        "pulse": {"type": "number"},
         "target_id": _STR,
         "reason": _STR,
     },
@@ -103,9 +111,20 @@ PARAMS: dict[str, dict] = {
     },
     # memory.search(store, ...): params.get("query") (required, non-empty) + optional
     # limit (passed through like index).
+    # memory.search 和 memory.index 走同一个 memory_index_core，那个 core 一直在
+    # 消费 bucket / thread / include_sensitive；index 的 schema 开了这几个、search
+    # 漏了，于是搜索没法限定在某个桶或线索里。V1 的 `memory-index --query` 本来
+    # 能组合这些条件。ambient 刻意不开：search 强制带 query，走 exact-query 分支，
+    # ambient_top_n 不参与候选限制，开了也是哑参数。
     "memory_search": {
         "type": "object",
-        "properties": {"query": _STR, "limit": _INT},
+        "properties": {
+            "query": _STR,
+            "limit": _INT,
+            "bucket": _STR,
+            "thread": _STR,
+            "include_sensitive": _BOOL,
+        },
         "required": ["query"],
     },
     # -- history.py (backed by model_api_runtime/v2/history_readside.py) --
@@ -351,7 +370,9 @@ DESCRIPTIONS: dict[str, str] = {
                        "and list fields signature, boundaries, do_not_say, "
                        "stable_definitions. Edit a list field by whole-list replacement "
                        "or with op keys add_<field>/remove_<field>/replace_<field> "
-                       "(e.g. add_signature, remove_boundaries). For each list field, "
+                       "(e.g. add_signature, remove_boundaries). One exception: the "
+                       "whole-list replace key for signature is plural — write "
+                       "replace_signatures, NOT replace_signature. For each list field, "
                        "use only one method in a call: whole replacement, add, remove, "
                        "or replace. D4 rename rule: changing agent_name requires "
                        "self_introduction in the same call. To recalibrate how "

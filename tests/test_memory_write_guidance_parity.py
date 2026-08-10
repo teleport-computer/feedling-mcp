@@ -100,13 +100,36 @@ def test_both_runtimes_share_one_rules_constant():
 @pytest.mark.parametrize("rule", [
     "durable user/relationship facts",
     "bilingual slash pair",
-    "记忆 / 上下文 / 使用提示",
     "pulse means",
     "Do not claim",
 ])
 def test_v1_guidance_lost_nothing_in_the_extraction(rule):
-    """抽共享常量是纯重构,V1 收到的文字不许少一条。"""
+    """抽共享常量是纯重构,V1 收到的文字不许少一条。
+
+    唯一的例外是三段结构那条,2026-08-10 由 Seven 本人确认取消(见
+    test_card_body_format_is_not_prescribed)——它不在本清单里,是刻意删的,
+    不是抽取时漏的。
+    """
     assert rule in prompts_v1.MEMORY_WRITE_GUIDANCE_V1
+
+
+def test_card_body_format_is_not_prescribed():
+    """卡片正文不规定格式 —— 一段话就行。
+
+    三段结构(记忆/上下文/使用提示)原本写在 V1 的 guidance 里,1c8293cd 抽共享
+    常量时一起带进了 V2,于是 V2 手写的卡开始长成三段。2026-08-10 Seven 确认
+    那是改错了:不需要三段,和之前一样一段话即可。
+
+    删的是**共享**常量里那条,所以 V1 和 V2 同时恢复成不规定格式 —— 两条 runtime
+    仍然一致。capture/dream/genesis 本来就从没要求过。
+    """
+    for text in (
+        prompts_v1.MEMORY_WRITE_RULES_V1,
+        prompts_v1.MEMORY_WRITE_GUIDANCE_V1,
+        tool_schema.DESCRIPTIONS["memory_write"],
+    ):
+        assert "使用提示" not in text
+        assert "three Markdown sections" not in text
 
 
 # --------------------------------------------------------------------------- #

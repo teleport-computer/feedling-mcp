@@ -127,3 +127,34 @@ def test_web_search_non_200_surfaces_status_and_exits_nonzero(monkeypatch):
     assert obj["http_status"] == 403
     assert "missing_scope" in str(obj["error"])
     assert code != 0
+
+
+def test_screen_pixel_outbound_fence_blocks_web_without_http(monkeypatch):
+    monkeypatch.setenv("FEEDLING_OUTBOUND_FENCE", "1")
+    monkeypatch.setattr(
+        io_cli,
+        "_http_json",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("outbound fence must block before HTTP")
+        ),
+    )
+    monkeypatch.setattr(
+        io_cli,
+        "_emit",
+        lambda obj, code=0: (_ for _ in ()).throw(_Emitted(obj, code)),
+    )
+
+    for cmd, ns in (
+        (io_cli.cmd_web_search, _types.SimpleNamespace(query="secret", limit=None)),
+        (io_cli.cmd_web_fetch, _types.SimpleNamespace(url="https://example.com")),
+    ):
+        try:
+            cmd(ns)
+        except _Emitted as emitted:
+            assert emitted.code != 0
+            assert emitted.obj == {
+                "ok": False,
+                "error": "outbound_blocked_after_private_screen_read",
+            }
+        else:
+            raise AssertionError("fenced web command did not emit")

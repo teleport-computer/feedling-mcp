@@ -837,13 +837,18 @@ def get_runtime_mode(user_id: str) -> tuple[dict, int]:
 
 
 def set_runtime_allowlist(user_id: str, desired: str, *, note: str = "") -> tuple[dict, int]:
-    if desired == "remove":
-        removed = db.delete_runtime_allowlist(user_id)
-        return {"user_id": user_id, "removed": removed}, 200
     try:
-        db.upsert_runtime_allowlist(user_id, desired, updated_by="admin", note=note)
+        with db.hosted_runtime_config_mutation_lock(user_id):
+            if desired == "remove":
+                removed = db.delete_runtime_allowlist(user_id)
+                return {"user_id": user_id, "removed": removed}, 200
+            db.upsert_runtime_allowlist(
+                user_id, desired, updated_by="admin", note=note
+            )
     except ValueError as e:
         return {"error": str(e)}, 400
+    except Exception:
+        return {"error": "runtime_control_unavailable"}, 503
     return {"user_id": user_id, "desired": desired}, 200
 
 

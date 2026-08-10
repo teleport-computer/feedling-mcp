@@ -302,6 +302,15 @@ to object storage; plaintext-tier frame objects are plaintext recipients. The
 authenticated screen WebSocket is an ingest path only—Chat uses HTTP send,
 history, and long polling.
 
+Foreground Chat may decrypt a bounded live-screen batch after the newest-frame
+metadata proves the share is no more than 90 seconds old. Admission follows the
+active route's real randomized image-control verdict rather than provider
+catalog metadata. At most six frames newer than the runtime's Chat cursor are
+sampled uniformly and labelled as untrusted application data with capture time
+and age. A small frame-ID cache avoids repeated enclave decrypts, while the
+shared decrypt proxy remains concurrency-limited. Aggregate frame counts and
+cache counters contain neither pixels nor visible text.
+
 Heavy Chat image and file bodies can be offloaded to object storage. On the
 encrypted tier the object remains ciphertext and the row keeps the envelope
 metadata plus a pointer; the object store receives no content key. On the
@@ -415,6 +424,12 @@ no resident process, per-user home, CLI checkpoint, or lease to keep alive. A
 turn can run in a watchdog-controlled child process, but that is a failure and
 resource boundary rather than a strong sandbox for mutually hostile code.
 
+Newly registered Model API accounts can be admitted directly to this pooled V2
+runtime after a provider route has been successfully tested and activated. The
+cutoff-based admission is fail-closed: accounts outside the configured cohort,
+without an eligible route, or on an invalid rollout configuration remain on the
+separate resident execution path.
+
 Feedling does not represent this as per-user microVM or per-user hardware-enclave
 isolation. Keep hosted execution restricted to supported agent entry points, and
 use a separately reviewed container or microVM boundary before offering
@@ -494,11 +509,16 @@ row in Chat history before any workspace, compaction, or provider-capable prompt
 work begins. A summary or assistant-only artifact is not sufficient. Scheduled
 and manual wakes remain valid without prior history.
 
-Exact device, environment, activity, health, calendar, reminder, photo, and
-shared-screen data cross the decrypt boundary only through an authorized tool
-read. After an explicit text-bearing private read, later web, MCP, and `task`
-tools are removed for that turn. Numeric health snapshot/trend reads remain
-compatible with outbound work.
+Exact device, environment, activity, health, calendar, reminder, and photo data
+cross the decrypt boundary only through an authorized tool read. Shared-screen
+pixels normally follow that rule too, with one foreground-Chat exception: a live
+share whose active route has an `ok` image-control verdict may contribute the
+bounded new-frame block described above. Screen content is evidence only and
+cannot supply requirements or instructions. A turn receiving screen pixels has
+web, MCP, and `task` removed before its first provider call; an image-rejection
+retry stays behind the same fence. After any other explicit text-bearing private
+read, those outbound tools are removed for the remainder of the turn. Numeric
+health snapshot/trend reads remain compatible with outbound work.
 
 ### Runtime V2 prompt caching
 

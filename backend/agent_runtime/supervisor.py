@@ -926,7 +926,8 @@ def _discover_enabled() -> dict[str, dict]:
     return {u["user_id"]: {"driver": u["driver"], "provider": u.get("provider", ""),
                            "model": u.get("model", ""), "base_url": u.get("base_url", ""),
                            "supports_responses": bool(u.get("supports_responses", False)),
-                           "reasoning_effort": u.get("reasoning_effort", "")}
+                           "reasoning_effort": u.get("reasoning_effort", ""),
+                           "vision_test_status": u.get("vision_test_status", "untested")}
             for u in db.list_agent_runtime_enabled_users()}
 
 
@@ -946,7 +947,8 @@ def _apply_discovery(roster: list[dict], enabled: dict[str, dict]) -> list[dict]
                         "model": info.get("model", ""),
                         "base_url": info.get("base_url", ""),
                         "supports_responses": bool(info.get("supports_responses", False)),
-                        "reasoning_effort": info.get("reasoning_effort", "")})
+                        "reasoning_effort": info.get("reasoning_effort", ""),
+                        "vision_test_status": info.get("vision_test_status", "untested")})
     return out
 
 
@@ -1275,6 +1277,7 @@ def _spawn_identity(entry: dict) -> tuple:
         entry.get("model") or "",
         entry.get("base_url") or "",
         entry.get("reasoning_effort") or "",
+        entry.get("vision_test_status") or "untested",
         # LiteLLM gateway 已退役：``model`` 现在原生透传，不再有 gw-<uid> 别名/网关
         # 间接层。``identity_model`` 目前恒为空，但保留字段/签名位以防未来复用。
         entry.get("identity_model") or "",

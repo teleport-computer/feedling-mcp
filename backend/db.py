@@ -589,6 +589,16 @@ def load_user(user_id: str) -> dict | None:
     return row[0] if row else None
 
 
+def get_user_created_at_strict(user_id: str) -> str | None:
+    """Return the authoritative users.created_at text; DB errors propagate."""
+    with get_pool().connection() as conn:
+        row = conn.execute(
+            "SELECT created_at FROM users WHERE user_id=%s",
+            (str(user_id),),
+        ).fetchone()
+    return None if row is None else str(row[0] or "")
+
+
 def find_user_by_api_key_hash(h: str) -> dict | None:
     """Return the user document whose api key hashes to ``h``, or None.
 
@@ -4880,6 +4890,40 @@ def set_onboarding_route_strict(user_id: str, doc: dict) -> str | None:
     return active_route_id
 
 
+def delete_onboarding_route_strict(user_id: str) -> bool:
+    """Delete the route selector and enforce its missing-as-resident state.
+
+    This is the exact inverse persistence boundary needed when compensation
+    restores a previously absent ``onboarding_route`` document.  The document
+    deletion and Model API route deactivation share the same advisory lock and
+    transaction as :func:`set_onboarding_route_strict`.
+    """
+    sql = (
+        "DELETE FROM user_blobs "
+        "WHERE user_id = %s AND kind = 'onboarding_route'"
+    )
+    with get_pool().connection() as conn:
+        with conn.transaction():
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT pg_advisory_xact_lock("
+                    "hashtextextended('onboarding-route:' || %s, 0))",
+                    (str(user_id),),
+                )
+                cur.execute(sql, (user_id,))
+                deleted = cur.rowcount > 0
+                cur.execute(
+                    "UPDATE model_api_routes "
+                    "SET is_active = FALSE, updated_at = now() "
+                    "WHERE user_id = %s AND is_active",
+                    (user_id,),
+                )
+    from tee_shadow import mirror
+
+    mirror.execute(sql, (user_id,))
+    return deleted
+
+
 def patch_proactive_settings_strict(
     user_id: str,
     patch: dict,
@@ -5763,7 +5807,8 @@ def list_agent_runtime_enabled_users() -> list[dict]:
                   r.model AS model,
                   c.base_url AS base_url,
                   c.supports_responses AS supports_responses,
-                  COALESCE(r.reasoning_effort, '') AS reasoning_effort
+                  COALESCE(r.reasoning_effort, '') AS reasoning_effort,
+                  r.vision_test_status AS vision_test_status
                 FROM model_api_routes r
                 JOIN model_api_credentials c ON c.id = r.credential_id
                 WHERE r.is_active
@@ -5787,8 +5832,10 @@ def list_agent_runtime_enabled_users() -> list[dict]:
         return [{"user_id": uid, "driver": driver, "provider": provider,
                  "model": model, "base_url": base_url,
                  "supports_responses": bool(supports_responses),
-                 "reasoning_effort": reasoning_effort}
-                for uid, driver, provider, model, base_url, supports_responses, reasoning_effort in rows]
+                 "reasoning_effort": reasoning_effort,
+                 "vision_test_status": str(vision_test_status or "untested")}
+                for uid, driver, provider, model, base_url, supports_responses,
+                reasoning_effort, vision_test_status in rows]
     except Exception as e:
         log.error("[db] list_agent_runtime_enabled_users failed: %s", e)
         return []
@@ -12395,6 +12442,33 @@ def model_api_active_route_version(user_id: str) -> dict | None:
         return None
 
 
+def model_api_active_route_vision_verdict(user_id: str) -> dict | None:
+    """Return the active route's pixel-probe verdict without its key envelope."""
+    try:
+        with get_pool().connection() as conn:
+            row = conn.execute(
+                "SELECT id::text, vision_test_status, "
+                "to_char(updated_at AT TIME ZONE 'UTC',"
+                "  'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') "
+                "FROM model_api_routes WHERE user_id=%s AND is_active",
+                (user_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return {
+            "id": str(row[0]),
+            "vision_test_status": str(row[1] or "untested"),
+            "updated_at": str(row[2] or ""),
+        }
+    except Exception as e:
+        log.error(
+            "[db] model_api_active_route_vision_verdict(%s) failed: %s",
+            user_id,
+            e,
+        )
+        return None
+
+
 def model_api_vision_route(user_id: str) -> dict | None:
     """Return the dedicated vision route with its encrypted credential."""
     try:
@@ -13736,6 +13810,44 @@ def upsert_runtime_allowlist(user_id: str, desired: str, *,
             """,
             (user_id, desired, updated_by, note),
         )
+
+
+def get_runtime_allowlist_entry(user_id: str) -> dict | None:
+    with get_pool().connection() as conn:
+        row = conn.execute(
+            "SELECT user_id,desired,updated_by,note "
+            "FROM v2_user_allowlist WHERE user_id=%s",
+            (str(user_id),),
+        ).fetchone()
+    if row is None:
+        return None
+    return {
+        "user_id": str(row[0]),
+        "desired": str(row[1]),
+        "updated_by": str(row[2] or ""),
+        "note": str(row[3] or ""),
+    }
+
+
+def insert_runtime_allowlist_if_absent(
+    user_id: str,
+    desired: str,
+    *,
+    updated_by: str,
+    note: str,
+) -> bool:
+    if desired not in _RUNTIME_ALLOWLIST_DESIRED:
+        raise ValueError(
+            f"desired must be one of {sorted(_RUNTIME_ALLOWLIST_DESIRED)}"
+        )
+    with get_pool().connection() as conn:
+        cur = conn.execute(
+            "INSERT INTO v2_user_allowlist "
+            "(user_id,desired,updated_at,updated_by,note) "
+            "VALUES (%s,%s,now(),%s,%s) ON CONFLICT (user_id) DO NOTHING",
+            (str(user_id), desired, updated_by, note),
+        )
+    return cur.rowcount > 0
 
 
 def delete_runtime_allowlist(user_id: str) -> bool:

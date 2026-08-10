@@ -255,6 +255,9 @@ services:
       # "resident" keeps day-1 behavior identical to pre-dual-runtime pre; the
       # allowlisted P1 dual-fleet test accounts override this default.
       FEEDLING_RUNTIME_DEFAULT_DESIRED: "resident"
+      # UTC registration cutoff for automatic new Model API -> Runtime V2
+      # admission. Empty preserves resident-default behavior for every account.
+      FEEDLING_V2_NEW_USER_CUTOFF: "${FEEDLING_V2_NEW_USER_CUTOFF:-}"
       # Backend owns capture admission/triggers; serve-worker executes the lane.
       # Keep both deployment gates aligned. User consent remains independent.
       FEEDLING_V2_CAPTURE_ENABLED: "${FEEDLING_V2_CAPTURE_ENABLED:-1}"

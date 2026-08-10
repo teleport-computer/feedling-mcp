@@ -114,3 +114,68 @@ def test_quote_block_does_not_teach_v2_an_op_its_schema_rejects(monkeypatch):
 
     assert "memory_patch" not in content
     assert "memory_delete" not in content
+
+
+# --- 生产接线 ---------------------------------------------------------------
+# 上面那批测的是 helper 组合。helper 对了但没接进生产 reader 的话,功能照样是哑的
+# —— 而测试会绿(Codex 2026-08-10 指出:「即使把两处生产 wiring 删掉,测试仍会绿」)。
+# 下面三条直接调生产 reader,把接线本身钉住。
+
+def _wire_raw_rows(monkeypatch, rows: list[dict]):
+    class _Store:
+        def reload_chat_strict(self):
+            return list(rows)
+
+    monkeypatch.setattr(serve_worker.core_store, "get_store", lambda _uid: _Store())
+
+
+def test_ts_based_tail_reader_expands_quotes(monkeypatch):
+    """_read_tail —— chat/wake 的 ts-based 入口。"""
+    _stub_decrypt(monkeypatch)
+    rows = [_row("m1", quoted="mem_1")]
+    _wire_raw_rows(monkeypatch, rows)
+    monkeypatch.setattr(serve_worker.memory_core, "fetch", lambda *_a, **_k: (
+        {"items": [{"id": "mem_1", "type": "fact", "summary": "卡片标题", "content": "卡片正文"}]}, 200
+    ))
+
+    out = serve_worker._read_tail("u1", 0.0, 10)
+
+    assert "卡片标题" in out[0]["content"], "_read_tail 没接引用展开"
+
+
+def test_seq_based_tail_reader_expands_quotes(monkeypatch):
+    """_read_tail_after_seq —— chat/wake 的 seq-based 入口。只接一条的话,
+    实际走另一条时功能照样是哑的。"""
+    _stub_decrypt(monkeypatch)
+    rows = [_row("m1", quoted="mem_1")]
+    monkeypatch.setattr(
+        serve_worker, "_read_tail_window_after_seq",
+        lambda *_a, **_k: serve_worker._decrypt_chat_rows("u1", rows, user_only=False),
+    )
+    monkeypatch.setattr(serve_worker.core_store, "get_store", lambda _uid: object())
+    monkeypatch.setattr(serve_worker.memory_core, "fetch", lambda *_a, **_k: (
+        {"items": [{"id": "mem_1", "type": "fact", "summary": "卡片标题", "content": "卡片正文"}]}, 200
+    ))
+
+    out = serve_worker._read_tail_after_seq("u1", 0, 10)
+
+    assert "卡片标题" in out[0]["content"], "_read_tail_after_seq 没接引用展开"
+
+
+def test_recent_turns_replay_expands_quotes(monkeypatch):
+    """_read_recent_turns —— 会作为 optional replay 回到 prompt。不展开的话,
+    引用轮老化到 summary 水位之前再被回放,模型又看不到引用的是什么。"""
+    _stub_decrypt(monkeypatch)
+    rows = [_row("m1", quoted="mem_1")]
+    monkeypatch.setattr(
+        serve_worker.db, "chat_recent_turn_rows", lambda *_a, **_k: {"rows": rows}
+    )
+    monkeypatch.setattr(serve_worker, "_scrub_leaked_thinking_rows", lambda r: r)
+    monkeypatch.setattr(serve_worker.core_store, "get_store", lambda _uid: object())
+    monkeypatch.setattr(serve_worker.memory_core, "fetch", lambda *_a, **_k: (
+        {"items": [{"id": "mem_1", "type": "fact", "summary": "卡片标题", "content": "卡片正文"}]}, 200
+    ))
+
+    out = serve_worker._read_recent_turns("u1", 4, 40)
+
+    assert "卡片标题" in out["rows"][0]["content"], "_read_recent_turns 没接引用展开"
