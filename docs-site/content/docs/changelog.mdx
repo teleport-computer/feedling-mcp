@@ -10,6 +10,12 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **Account deletion now removes Runtime V2 rollout controls.** Account reset,
+  administrator deletion, and application-managed registry removals clear the
+  deleted user's Runtime V2 allowlist record regardless of whether it came from
+  automatic new-user routing or an administrator pin. Other users and resident
+  routing behavior are unchanged.
+
 - **Foreground Chat now stays grounded in an active screen share.** When the
   newest encrypted screen frame is no more than 90 seconds old, each foreground
   turn can attach up to six uniformly sampled frames that arrived after the
