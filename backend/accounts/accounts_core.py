@@ -19,6 +19,7 @@ from __future__ import annotations
 import hmac
 import secrets
 import time
+from contextlib import nullcontext
 from datetime import datetime
 
 import db
@@ -202,31 +203,41 @@ def access_link_token_claim(payload: dict):
         mode = registry._normalize_access_mode(str(match.get("access_mode") or ""))
         if mode not in registry.ACCESS_MODES:
             return {"error": "token_access_mode_invalid"}, 400
-        with registry._users_lock:
-            user_entry = registry._find_user_entry_locked(user_id)
-            if not user_entry:
-                return {"error": "user not found"}, 404
-            if public_key and not str(user_entry.get("public_key") or "").strip():
-                _, err = core_envelope._decode_content_public_key(public_key)
-                if err:
-                    return {"error": err}, 400
-                user_entry["public_key"] = public_key
-            if archive_language and not user_entry.get("archive_language"):
-                user_entry["archive_language"] = archive_language
-            issued = registry._issue_api_key_for_user_locked(
-                user_entry,
-                access_mode=mode,
-                label=client_label or str(match.get("label") or registry.ACCESS_MODE_LABELS.get(mode, mode)),
-            )
-            registry.persist_user(user_entry)
-            principal_id = user_entry.get("principal_id", "")
-        if make_active:
-            store = core_store.get_store(user_id)
-            with db.hosted_runtime_config_mutation_lock(user_id):
-                onboarding._save_onboarding_route(store, mode)
-        match["used_at"] = datetime.now().isoformat()
-        match["claimed_label"] = client_label
-        accounts_access._save_access_link_tokens(accounts_access._trim_access_link_tokens(rows))
+        runtime_lock = (
+            db.hosted_runtime_config_mutation_lock(user_id)
+            if make_active
+            else nullcontext()
+        )
+        try:
+            with runtime_lock:
+                with registry._users_lock:
+                    user_entry = registry._find_user_entry_locked(user_id)
+                    if not user_entry:
+                        return {"error": "user not found"}, 404
+                    if public_key and not str(user_entry.get("public_key") or "").strip():
+                        _, err = core_envelope._decode_content_public_key(public_key)
+                        if err:
+                            return {"error": err}, 400
+                        user_entry["public_key"] = public_key
+                    if archive_language and not user_entry.get("archive_language"):
+                        user_entry["archive_language"] = archive_language
+                    issued = registry._issue_api_key_for_user_locked(
+                        user_entry,
+                        access_mode=mode,
+                        label=client_label or str(match.get("label") or registry.ACCESS_MODE_LABELS.get(mode, mode)),
+                    )
+                    registry.persist_user(user_entry)
+                    principal_id = user_entry.get("principal_id", "")
+                if make_active:
+                    store = core_store.get_store(user_id)
+                    onboarding._save_onboarding_route(store, mode)
+                match["used_at"] = datetime.now().isoformat()
+                match["claimed_label"] = client_label
+                accounts_access._save_access_link_tokens(
+                    accounts_access._trim_access_link_tokens(rows)
+                )
+        except db.HostedRuntimeConfigBusyError:
+            return {"error": "runtime_control_unavailable"}, 503
     print(f"[access:{user_id}] claimed mode={mode} key={issued['key_entry']['key_id']}")
     return {
         "status": "connected",
