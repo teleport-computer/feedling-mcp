@@ -8534,7 +8534,8 @@ def test_mcp_postflight_follows_the_retry_not_the_discarded_first_attempt(
     assert len(registered) == 1, (
         "首次没有 init 事件时不该发,重试有了才发 —— 得到 "
         f"{[kw['detail'] for kw in registered]}")
-    assert registered[0]["detail"]["registered"] == ["tavily"]
+    assert registered[0]["detail"]["init_status"] == {"tavily": "connected"}
+    assert registered[0]["detail"]["verdict"] == {"tavily": "ok"}
     assert registered[0]["detail"]["attempt"] == "stale_resume_retry"
     assert registered[0]["status"] == "ok"
 

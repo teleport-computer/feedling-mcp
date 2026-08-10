@@ -5635,16 +5635,39 @@ def _trace_user_mcp_registered(raw: str, cmd: list[str], *,
 
         {"type":"system","subtype":"init","tools":[...],"mcp_servers":[...]}
 
-    which settles in one field what preflight can only imply. It is also what
-    exposed the shape of this whole class of bug: a prod turn showing
+    which is what exposed this whole class of bug: a prod turn showing
     ``mcp_servers: []`` while the app listed the server as connected.
+
+    ⚠️ But that event is a SNAPSHOT of the moment the run opened, not a verdict.
+    Measured on a real turn: a server reported ``pending`` at init, contributed
+    zero tools to the opening surface, and was then discovered and called
+    successfully later in the same turn (fixture:
+    ``tests/fixtures/claude_init_pending_tool_recovered.jsonl``). Reporting that
+    turn as a failure is exactly the false green this trace exists to prevent,
+    pointed the other way. So the verdict comes from two observations:
+
+      1. the init snapshot — strictly ``status == "connected"``, never inventing
+         a second passing value;
+      2. the real ``mcp__<server>__*`` tool_use / tool_result pairs in the same
+         stream — structured blocks only, never the model's prose, which will
+         happily claim it called a tool it never touched.
+
+    Per server that resolves to:
+      ok           — connected at init, or called successfully
+      recovered    — not connected at init, but a later call succeeded
+      failed       — hard init state (failed / needs-auth / absent) or an errored
+                     call, with no successful call to overturn it
+      inconclusive — pending at init and never called. "The model did not call
+                     it" is NOT "the model could not call it"; there is no
+                     evidence either way, so this must not be reported as error.
+
+    A later success always overrides an init failure — the dashboard's
+    ``any_error`` would otherwise dye the whole turn red over a state that
+    resolved before the user saw anything.
 
     Only judged on the chat lane with servers enabled — MCP is deliberately
     chat-only, so an empty list anywhere else is correct, and reporting it
     would bury the real signal under one false error per distillation.
-
-    Registration is not approval: a registered tool can still be denied at call
-    time (that lands in ``permission_denials``). Preflight covers the grant.
 
     ⚠️ Emitted once per CLI **attempt**, same rule the pi surface trace follows:
     a retry starts a NEW process that redoes the MCP handshake, and it replaces
@@ -5664,56 +5687,107 @@ def _trace_user_mcp_registered(raw: str, cmd: list[str], *,
     if not expected:
         return
     init = None
+    call_ok: set[str] = set()      # servers with at least one successful call
+    call_err: set[str] = set()     # servers whose call came back is_error
+    pending_use: dict[str, str] = {}   # tool_use_id -> server, awaiting its result
     for obj in _json_objects_from_cli_output(raw):
-        # Last init wins: a retried attempt re-runs the handshake in a new
-        # process, and the earlier one's result no longer describes this turn.
-        if (isinstance(obj, dict)
-                and str(obj.get("type") or "").strip() == "system"
-                and str(obj.get("subtype") or "").strip() == "init"):
+        if not isinstance(obj, dict):
+            continue
+        etype = str(obj.get("type") or "").strip()
+        if etype == "system" and str(obj.get("subtype") or "").strip() == "init":
+            # Last init wins: a retried attempt re-runs the handshake in a new
+            # process, and the earlier one no longer describes this turn.
             init = obj
+            continue
+        content = (obj.get("message") or {}).get("content")
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            btype = str(block.get("type") or "").strip()
+            if btype == "tool_use":
+                # mcp__<server>__<tool>. Server names can't contain "__" (the
+                # backend's _NAME_RE is [a-z0-9_-] and the CLI joins on "__"),
+                # so splitting on it is safe.
+                name = str(block.get("name") or "")
+                if name.startswith("mcp__") and name.count("__") >= 2:
+                    pending_use[str(block.get("id") or "")] = name.split("__")[1]
+            elif btype == "tool_result":
+                server = pending_use.pop(str(block.get("tool_use_id") or ""), "")
+                if not server:
+                    continue
+                (call_err if block.get("is_error") else call_ok).add(server)
+
     if init is None or not isinstance(init.get("mcp_servers"), list):
         # Non-JSON output shape (or a CLI that stopped reporting it). Silence is
         # right here: we have no observation, and inventing one from a regex
         # over stdout is how a tool-output echo becomes a fake event.
         return
-    registered, failed = [], []
+
+    init_status: dict[str, str] = {}
     for entry in init["mcp_servers"]:
         if isinstance(entry, dict):
             name = str(entry.get("name") or "")
-            status = str(entry.get("status") or "").strip().lower()
+            status = str(entry.get("status") or "").strip().lower() or "unknown"
         else:
-            name, status = str(entry), ""
-        if not name:
-            continue
-        registered.append(name)
-        # Exactly the SDK's own predicate — `s.status !== "connected"` is a
-        # failed server. Nothing else counts as working: an entry with no
-        # status, a bare string entry, and any status we don't recognise are
-        # all states we have no evidence about, and guessing them green is how
-        # a postflight built to catch false greens starts producing them.
-        # `ready`/`ok` were my invention, with no protocol basis (codex 审出)。
-        if status != "connected":
-            failed.append(f"{name}:{status or 'unknown'}")
-    missing = [n for n in expected if n not in registered]
-    ok = not missing and not failed
+            name, status = str(entry), "unknown"
+        if name:
+            # Exactly the SDK's own predicate — anything that is not literally
+            # "connected" is not connected. An entry with no status, a bare
+            # string entry and an unrecognised status are all states we have no
+            # evidence about; `ready`/`ok` were my invention with no protocol
+            # basis (codex 审出).
+            init_status[name] = status
+
+    verdict: dict[str, str] = {}
+    for name in expected:
+        started = init_status.get(name, "absent")
+        if name in call_ok:
+            # A successful call outranks every init state: whatever was wrong at
+            # startup had resolved by the time it mattered.
+            verdict[name] = "ok" if started == "connected" else "recovered"
+        elif name in call_err:
+            verdict[name] = "failed"
+        elif started == "connected":
+            verdict[name] = "ok"
+        elif started in ("pending", "unknown"):
+            # Never called, and startup was merely unfinished — we cannot tell
+            # whether the model chose not to use it or could not see it.
+            verdict[name] = "inconclusive"
+        else:
+            verdict[name] = "failed"   # failed / needs-auth / absent
+
+    by = lambda v: [n for n in expected if verdict[n] == v]  # noqa: E731
+    failed, recovered, inconclusive = by("failed"), by("recovered"), by("inconclusive")
     _emit_debug_trace(
         "agent",
         "mcp.surface.registered",
-        status="ok" if ok else "error",
+        # Only hard evidence turns a turn red. `inconclusive` must not, or every
+        # ordinary turn where the model simply had no reason to use a tool would
+        # report a failure.
+        status="error" if failed else "ok",
         trace_id=trace_id,
-        summary=(f"CLI 实际注册 {len(registered)}/{len(expected)} 台 MCP 服务器"
-                 + ("" if ok else ",有缺失")),
+        summary=(f"MCP 可用 {len(by('ok')) + len(recovered)}/{len(expected)} 台"
+                 + (f",{len(failed)} 台不可用" if failed else "")
+                 + (f",{len(inconclusive)} 台无法判定" if inconclusive else "")),
         explain=(
-            "claude 自己报告的注册结果 —— 这是模型这一轮真正看得到的服务器。"
-            if ok else
-            "claude 自报的注册结果和我们交过去的对不上:"
-            + (f"没注册上 {','.join(missing[:10])};" if missing else "")
-            + (f"握手异常 {','.join(failed[:10])};" if failed else "")
-            + "模型看不到这些服务器的工具,通常会答「用不了」。"
+            (f"这几台这一轮确实不可用:{','.join(failed[:10])}。"
+             "模型看不到它们的工具,通常会答「用不了」。"
+             if failed else "这一轮 MCP 工具面正常。")
+            + (f" 启动时未就绪、但随后调用成功(已恢复):{','.join(recovered[:10])}。"
+               if recovered else "")
+            + (f" 启动时未就绪且本轮没被调用,无法判定能不能用:"
+               f"{','.join(inconclusive[:10])} —— 「模型没调用」不等于「模型调不了」。"
+               if inconclusive else "")
         ),
         detail={
-            "expected": expected[:20], "registered": registered[:20],
-            "missing": missing[:20], "failed": failed[:20],
+            "expected": expected[:20],
+            # The startup snapshot, kept verbatim: it is the only thing that
+            # explains WHY a server needed recovering.
+            "init_status": {k: v for k, v in list(init_status.items())[:20]},
+            "verdict": {k: verdict[k] for k in expected[:20]},
+            "called_ok": sorted(call_ok)[:20], "called_error": sorted(call_err)[:20],
             # Which CLI attempt this describes. A turn can emit several; the
             # last one is the process that produced the reply.
             "attempt": attempt,
