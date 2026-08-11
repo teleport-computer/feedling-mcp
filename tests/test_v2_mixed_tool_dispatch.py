@@ -16,6 +16,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
 from provider_types import ToolCall, ToolResult, ToolSpec
+from capabilities import result_budget as cap_result_budget
 from model_api_runtime.v2 import worker
 
 
@@ -806,8 +807,20 @@ def test_mcp_wall_budget_is_shared_and_rejects_without_starting_next_call():
         assert dispatched == ["first"]
         assert fenced == ["fence", "fence"]
         assert budget.used_sec == 3.0
+        # 成功的那次带上结果预算标记(2026-08-12):MCP 返回不再被通用的 2000
+        # 字符切碎,靠的就是这个可信 metadata 通道。这条断言同时是**生产接线**的
+        # 回归锁 —— worker 是否真的挂了标记,只有走完整链路的用例能证明,
+        # 手造 metadata 的单测证明不了(codex 审出)。
+        # 被墙钟预算拒掉的那次不带:它返回的是我们自己造的短字符串,不需要额度。
         assert results == [
-            ToolResult(call_id="first", content="ok"),
+            ToolResult(
+                call_id="first",
+                content="ok",
+                metadata={
+                    cap_result_budget.RESULT_KIND_METADATA_KEY:
+                        cap_result_budget.USER_MCP_RESULT_KIND,
+                },
+            ),
             ToolResult(
                 call_id="second",
                 content=worker.MCP_TURN_WALL_BUDGET_EXHAUSTED_ERROR,
