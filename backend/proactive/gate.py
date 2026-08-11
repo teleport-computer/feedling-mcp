@@ -69,10 +69,10 @@ def _proactive_v2_auto_wake_block_reason(trigger: str, *, broadcast_state: str, 
     from screen broadcasting. Runtime V2's pooled scheduler emits that trigger;
     treating persisted ``broadcast_state=off`` as a global heartbeat block
     silently disables proactive presence for every user who is not sharing
-    their screen. Screen-dependent ticks use explicit no-frame/opened triggers.
+    their screen. Explicit missing-frame heartbeat triggers remain mechanically
+    suppressible, while broadcast edges below are state facts.
     """
     normalized_trigger = str(trigger or "").strip().lower()
-    has_frames = bool(frame_ids)
 
     if normalized_trigger in {"heartbeat_unknown", "heartbeat_no_frame"}:
         return "no_recent_frames"
