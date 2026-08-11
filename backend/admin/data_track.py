@@ -396,6 +396,36 @@ def _proactive_stats(store: UserStore) -> dict:
     }
 
 
+def _worldbook_stats(store: UserStore) -> dict:
+    """世界书**只出数量与时间,绝不出条目 id**。
+
+    id 是用户自己起的名字(「月光咖啡馆」这种),那就是内容;正文更是端到端加密的,
+    服务端本来也读不到。这里只回答一个支持问题:**东西到底存进去了没有。**
+
+    为什么需要:2026-08-11 usr_99c3eca0 报「世界书无法保存」,随后又报「问它世界书
+    内容命中不了」。管理端当时**连有几条都看不到**,我只能去下客户端诊断日志、
+    数一数 attestation 与封装失败的比例(1 : 247)才反推出「他一条都没存进去」。
+    有这个字段,一眼就能分清是**没存进去**还是**存了没匹配上**——这是两条完全
+    不同的排查路径。
+    """
+    try:
+        with store.world_books_lock:
+            records = [r for r in store.world_books if isinstance(r, dict)]
+    except Exception as e:  # noqa: BLE001 — observability must never 500 the page
+        return {"error": f"{type(e).__name__}:{str(e)[:120]}"}
+
+    updated = [str(r.get("updated_at") or "") for r in records]
+    updated = [u for u in updated if u]
+    return {
+        "entries": len(records),
+        "last_updated_at": max(updated) if updated else "",
+        # 匹配只在**前台聊天**发生(V2 `worker.py: if lane == "chat"`,V1
+        # `_worldbook_context_for_foreground`);唤醒道另给 alwaysOn,见
+        # v2_wake_activity。写在这里省得下次又去翻代码确认覆盖面。
+        "note": "条目数与最后更新时间;id 与正文不出(id 是用户自定名 = 内容)",
+    }
+
+
 def _push_stats(store: UserStore) -> dict:
     tokens = [t for t in (store.tokens or []) if isinstance(t, dict)]
     statuses = _count_rows(tokens, "status")
@@ -1646,6 +1676,7 @@ def _build_data_track_user(user_entry: dict, *, include_detail: bool = False) ->
     memory = _memory_stats(store)
     proactive = _with_proactive_lens(_proactive_stats(store))
     push = _push_stats(store)
+    worldbook = _worldbook_stats(store)
     events_limit = _data_track_query_int(
         "events_limit",
         default=50,
@@ -1710,6 +1741,7 @@ def _build_data_track_user(user_entry: dict, *, include_detail: bool = False) ->
         "memory": memory,
         "proactive": proactive,
         "connection": _connection_health(route, access_modes, chat),
+        "worldbook": worldbook,
         "push": push,
         "tracking": tracking,
         "bootstrap_events": bootstrap_events,
