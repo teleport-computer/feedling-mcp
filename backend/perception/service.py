@@ -24,7 +24,6 @@ import time
 from datetime import datetime
 from typing import Any, Callable, Mapping
 
-import db
 from content_encryption import random_item_id
 from core import enclave as core_enclave
 
@@ -684,19 +683,6 @@ def _proactive_activation_ready(user_id: str) -> bool:
     return core_store.get_store(user_id).proactive_activation_ready()
 
 
-def _broadcast_open_has_recent_frame(user_id: str, *, now: float) -> bool:
-    """Fail closed unless an opened edge has a frame on the shared live clock."""
-    try:
-        from screen import screen_read_core  # lazy: shared live-frame clock
-
-        frame_meta = db.frame_list_meta(user_id)
-        latest_frame_ts = frame_meta[-1].get("ts") if frame_meta else None
-        latest_frame_age = now - float(latest_frame_ts)
-        return 0 <= latest_frame_age <= screen_read_core.SCREEN_SHARE_LIVE_SEC
-    except Exception:  # noqa: BLE001 - missing metadata suppresses auto wake
-        return False
-
-
 _LEGACY_WAKE_TRIGGER_BY_CAPABILITY = {
     "photos": "photo_added",
     "location": "arrived_at_anchor",
@@ -778,19 +764,6 @@ def _submit_wake_event_v2_compat(event) -> None:
             "ts": now,
         }, now)
         return
-    if str(event.trigger or "").strip().lower() == "broadcast_opened":
-        if not _broadcast_open_has_recent_frame(event.user_id, now=now):
-            store.append_event(event.user_id, {
-                "cap": "runtime_v2",
-                "type": "suppressed",
-                "reason": "no_recent_frames",
-                "source": event.source,
-                "trigger": event.trigger,
-                "change_digest": event.change_digest,
-                "origin_refs": list(event.origin_refs or ()),
-                "ts": now,
-            }, now)
-            return
     wake_capability = _RUNTIME_V2_WAKE_CAPABILITY_BY_TRIGGER.get(
         str(event.trigger or "").strip().lower(), ""
     )
@@ -927,15 +900,6 @@ def _maybe_wake(user_id, cap_key, debounce, field, old, new_v, now) -> None:
             "trigger": trigger, "field": field, "old": old, "new": new_v, "ts": now,
         }, now)
         return
-    if trigger == "broadcast_opened" and not _broadcast_open_has_recent_frame(
-        user_id, now=now
-    ):
-        store.append_event(user_id, {
-            "cap": cap_key, "type": "suppressed", "reason": "no_recent_frames",
-            "trigger": trigger, "field": field, "old": old, "new": new_v,
-            "ts": now,
-        }, now)
-        return
     if debounce and (now - _last_wake_ts(user_id, cap_key)) < debounce:
         store.append_event(user_id, {
             "cap": cap_key, "type": "debounced", "trigger": trigger, "field": field,
@@ -960,8 +924,8 @@ def _wake_hint(cap_key: str, field: str, old, new_v) -> str:
         trigger = _broadcast_edge_trigger(new_v)
         if trigger == "broadcast_opened":
             return (
-                "用户刚主动开始屏幕共享。请简短主动打招呼，"
-                "表示你已准备好查看；不要声称看到了尚未读取的内容。"
+                "用户刚主动开始屏幕共享。这是一条状态事实；由你结合当前"
+                "对话决定是否开口。若需内容就读取屏幕，不要声称看到了尚未读取的内容。"
             )
         if trigger == "broadcast_closed":
             return (

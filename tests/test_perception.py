@@ -377,16 +377,8 @@ def test_always_on_signals_stored(env):
     assert snap["broadcast_state"] == "inactive"
 
 
-def test_legacy_broadcast_edges_require_baseline_and_share_debounce(
-    env, monkeypatch
-):
+def test_legacy_broadcast_edges_require_baseline_and_share_debounce(env):
     fake, wakes = env
-    latest = {"ts": 1_005.0}
-    monkeypatch.setattr(
-        service.db,
-        "frame_list_meta",
-        lambda _uid: [{"id": "f1", "ts": latest["ts"]}],
-    )
 
     service.ingest_snapshot(
         UID,
@@ -405,7 +397,6 @@ def test_legacy_broadcast_edges_require_baseline_and_share_debounce(
         [_item("broadcast", {"state": "inactive", "active": False})],
         client_ts=1_071.0,
     )
-    latest["ts"] = 1_079.0
     service.ingest_snapshot(
         UID,
         [_item("broadcast", {"state": "broadcasting", "active": True})],

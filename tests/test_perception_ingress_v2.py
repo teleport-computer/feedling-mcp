@@ -130,11 +130,6 @@ def test_broadcast_edges_share_one_capability_debounce(monkeypatch):
     monkeypatch.setattr(service, "_settings_v2_for_user", lambda _uid: None)
     monkeypatch.setattr(service, "_proactive_activation_ready", lambda _uid: True)
     monkeypatch.setattr(
-        service.db,
-        "frame_list_meta",
-        lambda _uid: [{"id": "f1", "ts": 1_000.0}],
-    )
-    monkeypatch.setattr(
         service, "_fire_wake_event_v2", lambda event: fired.append(event.trigger)
     )
 
@@ -156,13 +151,12 @@ def test_broadcast_edges_share_one_capability_debounce(monkeypatch):
     assert fake.events["u_broadcast_flap"][1]["reason"] == "capability_debounce"
 
 
-def test_broadcast_open_requires_frame_but_close_does_not(monkeypatch):
+def test_broadcast_edges_wake_without_frames(monkeypatch):
     fake = _Store()
     fired = []
     monkeypatch.setattr(service, "store", fake)
     monkeypatch.setattr(service, "_settings_v2_for_user", lambda _uid: None)
     monkeypatch.setattr(service, "_proactive_activation_ready", lambda _uid: True)
-    monkeypatch.setattr(service.db, "frame_list_meta", lambda _uid: [])
     monkeypatch.setattr(
         service, "_fire_wake_event_v2", lambda event: fired.append(event.trigger)
     )
@@ -174,16 +168,15 @@ def test_broadcast_open_requires_frame_but_close_does_not(monkeypatch):
         _broadcast_wake("u_close_no_frame", "broadcast_closed", 1_000.0)
     )
 
-    assert fake.events["u_open_no_frame"][0]["reason"] == "no_recent_frames"
+    assert fake.events["u_open_no_frame"][0]["type"] == "wake"
     assert fake.events["u_close_no_frame"][0]["type"] == "wake"
-    assert fired == ["broadcast_closed"]
+    assert fired == ["broadcast_opened", "broadcast_closed"]
 
 
 def test_broadcast_wake_respects_activation_and_screen_watch_switch(monkeypatch):
     fake = _Store()
     fired = []
     monkeypatch.setattr(service, "store", fake)
-    monkeypatch.setattr(service.db, "frame_list_meta", lambda _uid: [])
     monkeypatch.setattr(
         service, "_fire_wake_event_v2", lambda event: fired.append(event.trigger)
     )

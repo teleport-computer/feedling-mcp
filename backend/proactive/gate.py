@@ -78,11 +78,10 @@ def _proactive_v2_auto_wake_block_reason(trigger: str, *, broadcast_state: str, 
         return "no_recent_frames"
     if normalized_trigger.startswith("heartbeat_broadcast_"):
         return ""
-    if normalized_trigger == "broadcast_opened" and not has_frames:
-        return "no_recent_frames"
-    # A close edge is meaningful precisely when no new frame will arrive. It
-    # must never inherit broadcast_opened's frame prerequisite.
-    if normalized_trigger == "broadcast_closed":
+    # Broadcast edges are facts, not claims that current pixels are available.
+    # Both remain eligible without a frame; the model can stay silent or use
+    # screen_read, whose result explains the actual share state without guessing.
+    if normalized_trigger in {"broadcast_opened", "broadcast_closed"}:
         return ""
     return ""
 

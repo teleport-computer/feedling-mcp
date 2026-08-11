@@ -147,12 +147,14 @@ Screen broadcast state is also a durable, significant Runtime V2 signal. After
 the first report establishes a baseline, recognized off-to-on and on-to-off
 transitions produce `broadcast_opened` and `broadcast_closed` wake events. Both
 use the screen-watch switch and one shared 60-second capability debounce, so a
-rapid open/close/open flap admits at most one wake. An opened edge additionally
-requires a recent encrypted frame; a closed edge does not, because frame
-production has ended. The user action of starting sharing is the consent signal
-for this always-available source, but it does not bypass proactive activation,
-the screen-watch switch, or delivery controls. DND may allow the runtime to
-consider the edge while still blocking a visible proactive message.
+rapid open/close/open flap admits at most one wake. Neither edge requires a new
+frame: each is a state-transition fact, not a claim that current pixels are
+available. The standard proactive wake policy then lets the model speak or stay
+silent from conversation and attention context. The user action of starting
+sharing is the consent signal for this always-available source, but it does not
+bypass proactive activation, the screen-watch switch, or delivery controls.
+DND may allow the runtime to consider the edge while still blocking a visible
+proactive message.
 
 ## 3. Read the current snapshot
 

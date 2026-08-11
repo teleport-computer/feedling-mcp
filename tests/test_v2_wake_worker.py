@@ -906,7 +906,7 @@ def test_run_perception_wake_injects_trigger_as_untrusted_runtime_data(monkeypat
 @pytest.mark.parametrize(
     ("trigger", "expected_require_reply", "prompt_fragment"),
     [
-        ("broadcast_opened", True, "just started sharing their screen"),
+        ("broadcast_opened", False, "Speaking and staying silent are equally valid"),
         ("broadcast_closed", False, "Speaking and staying silent are equally valid"),
     ],
 )

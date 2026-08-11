@@ -1051,8 +1051,12 @@ def test_auto_proactive_v2_schedule_heartbeats_split_presence_and_screen_wakes(t
     )
     assert opened_without_frame.status_code == 200
     opened_body = opened_without_frame.get_json()
-    assert opened_body["enqueued"] is False
-    assert opened_body["decision"]["reason"] == "no_recent_frames"
+    assert opened_body["enqueued"] is True
+    assert opened_body["decision"]["reason"] == "wake_created"
+    assert opened_body["decision"]["wake_kind"] == "screen"
+    assert opened_body["decision"]["screen_context_available"] is False
+    assert opened_body["job"]["wake_kind"] == "screen"
+    assert opened_body["job"]["frame_ids"] == []
 
     closed_without_frame = client.post(
         "/v1/proactive/tick",
