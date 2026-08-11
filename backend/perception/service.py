@@ -24,6 +24,7 @@ import time
 from datetime import datetime
 from typing import Any, Callable, Mapping
 
+import db
 from content_encryption import random_item_id
 from core import enclave as core_enclave
 
@@ -511,7 +512,19 @@ def _apply(user_id: str, pairs: list, client_ts=None, *, emit_legacy_wakes: bool
                 patch[fname] = _cell(new_v, now, msg)
                 fields.append(fname)
                 old = (prev_state.get(fname) or {}).get("v")
-                if cap.wake_source and sig.significant and new_v != old:
+                broadcast_edge_field = (
+                    sig.capability != "broadcast" or fname == "broadcast_state"
+                )
+                broadcast_has_baseline = (
+                    sig.capability != "broadcast" or old is not None
+                )
+                if (
+                    cap.wake_source
+                    and sig.significant
+                    and broadcast_edge_field
+                    and broadcast_has_baseline
+                    and new_v != old
+                ):
                     wake_pending.append((sig.capability, cap.debounce_sec, fname, old, new_v))
             if key == "time" and isinstance(resolved, dict):
                 tz_seen = resolved.get("timezone") or tz_seen
@@ -643,6 +656,24 @@ def _last_v2_wake_ts(user_id: str, trigger: str) -> float:
     return 0.0
 
 
+_RUNTIME_V2_WAKE_CAPABILITY_BY_TRIGGER = {
+    "broadcast_opened": "broadcast",
+    "broadcast_closed": "broadcast",
+}
+
+
+def _last_v2_capability_wake_ts(user_id: str, capability: str) -> float:
+    """Newest accepted V2 wake for one capability, across edge triggers."""
+    for ev in reversed(store.read_events(user_id, limit=200)):
+        if (
+            ev.get("cap") == "runtime_v2"
+            and ev.get("type") == "wake"
+            and ev.get("wake_capability") == capability
+        ):
+            return float(ev.get("ts") or 0)
+    return 0.0
+
+
 def _settings_v2_for_user(user_id: str):
     from proactive.store_v2 import DBProactiveSettingsStoreV2  # lazy
     return DBProactiveSettingsStoreV2().load(user_id)
@@ -651,6 +682,19 @@ def _settings_v2_for_user(user_id: str):
 def _proactive_activation_ready(user_id: str) -> bool:
     from core import store as core_store  # lazy
     return core_store.get_store(user_id).proactive_activation_ready()
+
+
+def _broadcast_open_has_recent_frame(user_id: str, *, now: float) -> bool:
+    """Fail closed unless an opened edge has a frame on the shared live clock."""
+    try:
+        from screen import screen_read_core  # lazy: shared live-frame clock
+
+        frame_meta = db.frame_list_meta(user_id)
+        latest_frame_ts = frame_meta[-1].get("ts") if frame_meta else None
+        latest_frame_age = now - float(latest_frame_ts)
+        return 0 <= latest_frame_age <= screen_read_core.SCREEN_SHARE_LIVE_SEC
+    except Exception:  # noqa: BLE001 - missing metadata suppresses auto wake
+        return False
 
 
 _LEGACY_WAKE_TRIGGER_BY_CAPABILITY = {
@@ -663,15 +707,26 @@ _LEGACY_WAKE_TRIGGER_BY_CAPABILITY = {
 }
 
 
-def _legacy_wake_trigger(cap_key: str) -> str:
+def _broadcast_edge_trigger(value) -> str:
+    normalized = str(value if value is not None else "").strip().lower()
+    if normalized in {"on", "active", "broadcasting", "true", "1"}:
+        return "broadcast_opened"
+    if normalized in {"off", "inactive", "stopped", "false", "0"}:
+        return "broadcast_closed"
+    return ""
+
+
+def _legacy_wake_trigger(cap_key: str, new_value=None) -> str:
     """Map every supported legacy wake source onto its V2 consent trigger."""
+    if str(cap_key or "").strip() == "broadcast":
+        return _broadcast_edge_trigger(new_value)
     return _LEGACY_WAKE_TRIGGER_BY_CAPABILITY.get(str(cap_key or "").strip(), "")
 
 
-def _legacy_wake_control_decision(user_id: str, cap_key: str):
+def _legacy_wake_control_decision(user_id: str, cap_key: str, new_value=None):
     from proactive.controls_v2 import evaluate_wake_control_v2  # lazy
 
-    trigger = _legacy_wake_trigger(cap_key)
+    trigger = _legacy_wake_trigger(cap_key, new_value)
     if not trigger:
         return trigger, None
     return trigger, evaluate_wake_control_v2(
@@ -723,9 +778,51 @@ def _submit_wake_event_v2_compat(event) -> None:
             "ts": now,
         }, now)
         return
+    if str(event.trigger or "").strip().lower() == "broadcast_opened":
+        if not _broadcast_open_has_recent_frame(event.user_id, now=now):
+            store.append_event(event.user_id, {
+                "cap": "runtime_v2",
+                "type": "suppressed",
+                "reason": "no_recent_frames",
+                "source": event.source,
+                "trigger": event.trigger,
+                "change_digest": event.change_digest,
+                "origin_refs": list(event.origin_refs or ()),
+                "ts": now,
+            }, now)
+            return
+    wake_capability = _RUNTIME_V2_WAKE_CAPABILITY_BY_TRIGGER.get(
+        str(event.trigger or "").strip().lower(), ""
+    )
+    debounce_sec = (
+        float(catalog.CAPABILITIES[wake_capability].debounce_sec)
+        if wake_capability in catalog.CAPABILITIES
+        else 0.0
+    )
+    last_capability_wake = _last_v2_capability_wake_ts(
+        event.user_id, wake_capability
+    ) if wake_capability else 0.0
+    if (
+        debounce_sec
+        and last_capability_wake > 0
+        and (now - last_capability_wake) < debounce_sec
+    ):
+        store.append_event(event.user_id, {
+            "cap": "runtime_v2",
+            "type": "debounced",
+            "reason": "capability_debounce",
+            "wake_capability": wake_capability,
+            "source": event.source,
+            "trigger": event.trigger,
+            "change_digest": event.change_digest,
+            "origin_refs": list(event.origin_refs or ()),
+            "ts": now,
+        }, now)
+        return
     store.append_event(event.user_id, {
         "cap": "runtime_v2",
         "type": "wake",
+        "wake_capability": wake_capability,
         "wake_id": str(event.wake_id or ""),
         "source": event.source,
         "trigger": event.trigger,
@@ -820,7 +917,7 @@ def _maybe_wake(user_id, cap_key, debounce, field, old, new_v, now) -> None:
             "field": field, "old": old, "new": new_v, "ts": now,
         }, now)
         return
-    trigger, decision = _legacy_wake_control_decision(user_id, cap_key)
+    trigger, decision = _legacy_wake_control_decision(user_id, cap_key, new_v)
     if decision is None:
         log.warning("drop unmapped legacy perception wake: cap=%s field=%s", cap_key, field)
         return
@@ -828,6 +925,15 @@ def _maybe_wake(user_id, cap_key, debounce, field, old, new_v, now) -> None:
         store.append_event(user_id, {
             "cap": cap_key, "type": "suppressed", "reason": decision.reason,
             "trigger": trigger, "field": field, "old": old, "new": new_v, "ts": now,
+        }, now)
+        return
+    if trigger == "broadcast_opened" and not _broadcast_open_has_recent_frame(
+        user_id, now=now
+    ):
+        store.append_event(user_id, {
+            "cap": cap_key, "type": "suppressed", "reason": "no_recent_frames",
+            "trigger": trigger, "field": field, "old": old, "new": new_v,
+            "ts": now,
         }, now)
         return
     if debounce and (now - _last_wake_ts(user_id, cap_key)) < debounce:
@@ -840,10 +946,28 @@ def _maybe_wake(user_id, cap_key, debounce, field, old, new_v, now) -> None:
         "cap": cap_key, "type": "wake", "trigger": trigger, "field": field,
         "old": old, "new": new_v, "ts": now,
     }, now)
-    _fire_wake(user_id, cap_key, _wake_hint(cap_key, field, old, new_v), now)
+    _fire_wake(
+        user_id,
+        cap_key,
+        _wake_hint(cap_key, field, old, new_v),
+        now,
+        trigger=trigger,
+    )
 
 
 def _wake_hint(cap_key: str, field: str, old, new_v) -> str:
+    if cap_key == "broadcast":
+        trigger = _broadcast_edge_trigger(new_v)
+        if trigger == "broadcast_opened":
+            return (
+                "用户刚主动开始屏幕共享。请简短主动打招呼，"
+                "表示你已准备好查看；不要声称看到了尚未读取的内容。"
+            )
+        if trigger == "broadcast_closed":
+            return (
+                "用户刚结束屏幕共享。之前已共享的画面仍可在对话中讨论，"
+                "但不再是当前屏幕；由你判断是否需要开口。"
+            )
     if cap_key == "location":
         return f"她到了一个新地方：place_label = {new_v}（之前 {old or '未知'}）。"
     if cap_key == "wifi":
@@ -859,10 +983,17 @@ def _wake_hint(cap_key: str, field: str, old, new_v) -> str:
     return f"{cap_key} 发生了变化：{field} = {new_v}。"
 
 
-def _fire_wake(user_id: str, cap_key: str, hint: str, now: float) -> None:
+def _fire_wake(
+    user_id: str,
+    cap_key: str,
+    hint: str,
+    now: float,
+    *,
+    trigger: str | None = None,
+) -> None:
     """Enqueue a proactive job so the resident agent wakes. Lazy-imports app to
     avoid an import cycle (app registers this module at the bottom of startup)."""
-    trigger = _legacy_wake_trigger(cap_key)
+    trigger = trigger or _legacy_wake_trigger(cap_key)
     if not trigger:
         log.warning("drop unmapped legacy perception enqueue: cap=%s", cap_key)
         return

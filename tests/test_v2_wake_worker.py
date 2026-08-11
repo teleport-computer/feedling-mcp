@@ -903,6 +903,68 @@ def test_run_perception_wake_injects_trigger_as_untrusted_runtime_data(monkeypat
     )
 
 
+@pytest.mark.parametrize(
+    ("trigger", "expected_require_reply", "prompt_fragment"),
+    [
+        ("broadcast_opened", True, "just started sharing their screen"),
+        ("broadcast_closed", False, "Speaking and staying silent are equally valid"),
+    ],
+)
+def test_broadcast_edge_wake_reply_policy(
+    monkeypatch, trigger, expected_require_reply, prompt_fragment
+):
+    uid = f"u_wake_{trigger}"
+    conftest.seed_user(uid)
+    _reset(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, "heartbeat")
+    claimed_by = _claim(job_id)
+    policy = _seen_lane_policy(monkeypatch)
+    calls = _script_provider(monkeypatch, [_text_round("我在，可以开始了。")])
+
+    async def _empty_glance(*_args, **_kwargs):
+        return None, None
+
+    monkeypatch.setattr(
+        worker, "_perception_glance_grounding_results", _empty_glance
+    )
+    monkeypatch.setattr(worker, "_screen_share_grounding", lambda _uid: {})
+    monkeypatch.setattr(
+        worker, "_write_encrypted_reply", lambda store, text: {"id": "r"}
+    )
+    deps = _wake_deps(
+        tail=[{"id": "m1", "ts": 1.0, "role": "user", "content": "hi"}]
+    )
+    deps.read_perception_wake_context = lambda user_id, wake_job_id: [{
+        "wake_id": f"wake-{trigger}",
+        "source": "scene_change",
+        "trigger": trigger,
+        "change_digest": "broadcast state changed",
+        "origin_refs": ["ios_report:broadcast"],
+        "created_at": 100.0,
+    }]
+
+    status = asyncio.run(
+        worker._run_wake(
+            job_id,
+            uid,
+            "heartbeat",
+            deps,
+            _BYOK,
+            worker.ENCLAVE_SEMAPHORE,
+            claimed_by,
+        )
+    )
+
+    assert status == "completed"
+    assert policy["require_reply"] is expected_require_reply
+    system_text = "\n".join(
+        str(message.get("content") or "")
+        for message in calls[0]["messages"]
+        if message.get("role") == "system"
+    )
+    assert prompt_fragment in system_text
+
+
 def test_lost_heartbeat_lease_does_not_persist_glance_fingerprint(monkeypatch):
     """Catches a candidate write that happens before terminalization wins."""
     uid = "u_glance_lost_lease"

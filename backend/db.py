@@ -3252,7 +3252,7 @@ def admin_product_health_power_users(
                     AND COALESCE(NULLIF(doc->>'job_kind',''), NULLIF(doc->>'wake_kind',''),
                                  NULLIF(doc->>'trigger',''), 'unknown')
                         NOT IN ('screen_watch','scene_change','screen_tick',
-                                'broadcast_opened','heartbeat_broadcast_on')
+                                'broadcast_opened','broadcast_closed','heartbeat_broadcast_on')
                   )
 
                 UNION ALL
@@ -4174,7 +4174,7 @@ def admin_data_track_proactive_daily(*, since_epoch: float = 0.0, days: int = 30
     （(delivered+completed) / (delivered+completed+failed)）。"""
     day_limit = max(1, min(int(days or 30), 1000))
     since = float(since_epoch or 0.0)
-    screen_kinds = "('screen_watch','scene_change','screen_tick','broadcast_opened','heartbeat_broadcast_on')"
+    screen_kinds = "('screen_watch','scene_change','screen_tick','broadcast_opened','broadcast_closed','heartbeat_broadcast_on')"
     maintenance_kinds = "('memory_capture','memory_dream','memory_migrate')"
     try:
         with get_pool().connection() as conn:
@@ -4311,7 +4311,7 @@ def admin_proactive_heartbeat_overspeed(*, since_epoch: float = 0.0, days: int =
                       AND COALESCE(NULLIF(doc->>'job_kind',''), NULLIF(doc->>'wake_kind',''),
                                    NULLIF(doc->>'trigger',''), 'unknown')
                           NOT IN ('screen_watch','scene_change','screen_tick',
-                                  'broadcast_opened','heartbeat_broadcast_on')
+                                  'broadcast_opened','broadcast_closed','heartbeat_broadcast_on')
                       -- 哨兵只数「放行(admitted)」的心跳:①闸拦下的 throttled
                       -- skipped 是闸在正常工作,不能算——否则闸守得越好标得越红,
                       -- 与「出现即闸失效」的页面语义正好相反(codex review ④)。
@@ -4492,7 +4492,7 @@ def admin_events_overview(*, day: str = "", tz: str = "Asia/Shanghai") -> dict:
         FROM (
           SELECT l.user_id, COALESCE(l.doc->>'status','') AS status, {_JOB_DUR_SEC.replace('doc','l.doc')} AS dur,
             CASE
-              WHEN k.kind IN ('screen_watch','screen_tick','broadcast_opened','heartbeat_broadcast_on') THEN 'screen'
+              WHEN k.kind IN ('screen_watch','screen_tick','broadcast_opened','broadcast_closed','heartbeat_broadcast_on') THEN 'screen'
               WHEN k.kind IN ('perception_event','scene_change','photo_added','arrived_at_anchor','location','unlock_after_absence','scheduled_wake') THEN 'trigger'
               WHEN k.kind = 'presence' OR left(k.kind, 9) = 'heartbeat' THEN 'heartbeat'
               ELSE 'other'
@@ -4629,7 +4629,7 @@ def admin_events_by_user(category: str, *, limit: int = 400) -> list[dict]:
             FROM (
               SELECT l.user_id, l.ts, COALESCE(l.doc->>'status','') AS status, {dur_l} AS dur,
                 CASE
-                  WHEN k.kind IN ('screen_watch','screen_tick','broadcast_opened','heartbeat_broadcast_on') THEN 'screen'
+                  WHEN k.kind IN ('screen_watch','screen_tick','broadcast_opened','broadcast_closed','heartbeat_broadcast_on') THEN 'screen'
                   WHEN k.kind IN ('perception_event','scene_change','photo_added','arrived_at_anchor','location','unlock_after_absence','scheduled_wake') THEN 'trigger'
                   WHEN k.kind = 'presence' OR left(k.kind,9) = 'heartbeat' THEN 'heartbeat'
                   ELSE 'other'

@@ -80,6 +80,10 @@ def _proactive_v2_auto_wake_block_reason(trigger: str, *, broadcast_state: str, 
         return ""
     if normalized_trigger == "broadcast_opened" and not has_frames:
         return "no_recent_frames"
+    # A close edge is meaningful precisely when no new frame will arrive. It
+    # must never inherit broadcast_opened's frame prerequisite.
+    if normalized_trigger == "broadcast_closed":
+        return ""
     return ""
 
 
@@ -91,7 +95,7 @@ def _proactive_v2_wake_kind(trigger: str, *, frame_ids: list[str], job_kind: str
         return "presence"
     if frame_ids:
         return "screen"
-    if normalized_trigger in {"broadcast_opened", "screen_tick"}:
+    if normalized_trigger in {"broadcast_opened", "broadcast_closed", "screen_tick"}:
         return "screen"
     return "presence"
 

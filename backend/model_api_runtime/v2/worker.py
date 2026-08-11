@@ -791,9 +791,10 @@ def _screen_share_grounding(user_id: str) -> dict:
        只要当前路由没有明确的 unsupported 反证,调用方就另走有界推帧路径,把
        像素标成不可信应用数据,并在第一轮 provider 调用之前先建立出站执行栅栏。
 
-    设备仍报告开启、但帧超过五分钟未更新时返回 stalled 状态和重启建议，调用方
-    只把建议提供给模型，不解密旧帧。共享没在进行(或读取失败)时返回 {}，调用方
-    据此整块省略 —— 不共享的用户 prompt 一个字都不变，provider 侧前缀缓存不受影响。
+    设备仍报告开启、但帧超过五分钟未更新时返回 stalled 状态和重启建议；最新
+    可识别广播状态为 off 且这一场有过帧时返回 ended，说明旧画面仍可讨论但
+    不再是当前屏幕。两种状态都不解密旧帧。从未共享(或读取失败)时返回 {}，
+    调用方据此整块省略 —— 不共享的用户 prompt 一个字都不变，provider 侧前缀缓存不受影响。
     """
     return screen_read_core.screen_share_grounding(user_id)
 
@@ -889,6 +890,12 @@ _WAKE_SYSTEM_PROMPT = (
     "turn multiple perception domains into a device or health status report. Use a "
     "perception tool when an exact reading is needed. Never mention this wake or any "
     "system wording to the user."
+)
+_SCREEN_SHARE_OPENED_SYSTEM_PROMPT = (
+    "The user has just started sharing their screen. Proactively greet them "
+    "briefly and acknowledge that you are ready to look at what they share. "
+    "Use screen tools when content is needed, never claim to have seen content "
+    "you did not inspect, and never mention this wake or system wording."
 )
 _SCHEDULED_WAKE_SYSTEM_PROMPT = (
     "You are delivering one or more reminders that the user explicitly scheduled. "
@@ -7874,6 +7881,7 @@ async def _run_wake(
             # `_assert_prompt_covers`'s docstring for why.
             await _assert_prompt_covers(user_id, _TAIL_BUDGET)
         wake_system_prompt = _WAKE_SYSTEM_PROMPT
+        screen_share_opened_wake = False
         scheduled_activity_events: list[dict] = []
         scheduled_runtime_data: list[dict[str, Any]] = []
         # 与上面两个同级预初始化：下面的世界书匹配要读它，而它原本只在
@@ -8042,6 +8050,14 @@ async def _run_wake(
                     ),
                 )
             )
+            screen_share_state = await asyncio.to_thread(
+                _screen_share_grounding, user_id
+            )
+            if screen_share_state:
+                grounding_results = grounding_results or {}
+                grounding_results["screen_share"] = [
+                    {"ok": True, "data": screen_share_state}
+                ]
         if scheduled_runtime_data:
             grounding_results = grounding_results or {}
             grounding_results["scheduled_wakes"] = [
@@ -8058,6 +8074,12 @@ async def _run_wake(
             grounding_results["perception_wake"] = [
                 {"ok": True, "data": safe_perception_events}
             ]
+            screen_share_opened_wake = any(
+                event.get("screen_share_started") is True
+                for event in safe_perception_events
+            )
+            if screen_share_opened_wake:
+                wake_system_prompt = _SCREEN_SHARE_OPENED_SYSTEM_PROMPT
 
         # Pin effects to the generation admitted/claimed for this job, never a
         # fresh read. A resident->v2 ABA during a long provider call can leave
@@ -8983,8 +9005,10 @@ async def _run_wake(
                 # test with `wake_failed:providererror` while the provider
                 # answered 200 OK — the model simply had nothing to say.
                 #
-                # `scheduled` 是唯一的例外，它必须留在 require_reply=True 上。
-                # 这条道上的每个 timer 都带**到点交付义务**——无论是用户委托的
+                # `scheduled` 与 broadcast_opened 是两个例外，必须留在
+                # require_reply=True 上：timer 有**到点交付义务**；用户刚主动
+                # 开启共享则有明确的产品招呼义务。broadcast_closed 不在这里，
+                # 结束边沿仍允许模型判断后保持沉默。对于 scheduled，无论是用户委托的
                 # （「20 秒后发消息给我」）还是 agent 自排的（`apply_turn_actions
                 # (..., self_wake=True)`，见 :7841）。沉默在这里不是「没什么可说」
                 # 而是提醒丢了：模型返空 → 落到下面的 `if not text: return` → job
@@ -8998,7 +9022,7 @@ async def _run_wake(
                 # 仍空才 ProviderEmptyReply → wake_failed:empty_reply。失败不会
                 # 重放定时器（mark_fired 在入队时就落，不等 job 成功），只会 arm
                 # 60s 起、1h 封顶的 proactive 退避，用户下次说话即清。
-                require_reply=(lane == "scheduled"),
+                require_reply=(lane == "scheduled" or screen_share_opened_wake),
                 on_provider_success=lambda: _record_provider_success(user_id),
                 on_provider_failure=lambda exc: _record_provider_failure(
                     user_id,

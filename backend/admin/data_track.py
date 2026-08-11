@@ -820,7 +820,7 @@ def _data_track_screen_frames_from_snapshot(snap: dict) -> dict:
 
 
 _SCREEN_PROACTIVE_KINDS = frozenset({
-    "screen_watch", "scene_change", "screen_tick", "broadcast_opened",
+    "screen_watch", "scene_change", "screen_tick", "broadcast_opened", "broadcast_closed",
     "heartbeat_broadcast_on",
 })
 

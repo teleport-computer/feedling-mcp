@@ -66,6 +66,38 @@ def test_shared_screen_grounding_reports_fresh_broadcast_without_recent_frames(
     }
 
 
+def test_shared_screen_grounding_reports_just_ended_share(monkeypatch):
+    monkeypatch.setattr(screen_read_core.time, "time", lambda: 1_000.0)
+    monkeypatch.setattr(
+        screen_read_core.db,
+        "frame_list_meta",
+        lambda _user_id: [{"id": "f1", "ts": 950.0}],
+    )
+    monkeypatch.setattr(
+        screen_read_core.db,
+        "perception_broadcast_meta",
+        lambda _user_id: {
+            "broadcast_state": "off",
+            "broadcast_state_ts": 999.0,
+            "broadcast_active": False,
+            "broadcast_active_ts": 999.0,
+        },
+    )
+
+    assert screen_read_core.screen_share_grounding("u1") == {
+        "active": False,
+        "ended": True,
+        "status": "screen_share_ended",
+        "latest_frame_age_sec": 50,
+        "previous_frames_remain_in_conversation": True,
+        "suggested_action": (
+            "The screen share has ended. Previously shared frames remain "
+            "available in the conversation. To see the screen again, ask "
+            "the user to restart screen sharing or send a screenshot."
+        ),
+    }
+
+
 def test_shared_screen_grounding_ignores_old_or_inactive_broadcast(monkeypatch):
     monkeypatch.setattr(screen_read_core.time, "time", lambda: 1_000.0)
     monkeypatch.setattr(
@@ -187,7 +219,10 @@ def test_read_resolves_latest_then_decrypts(monkeypatch):
     r = cap_screen.read("STORE", params={})  # no frame_id → resolve latest
     assert r.ok is True and r.data == {
         "caption": "a cat",
-        "image_omitted_reason": "not_requested",
+        "image_omitted_reason": "screen_share_not_active",
+        "suggested_action": (
+            "Ask the user to restart screen sharing or send a screenshot."
+        ),
     }
     assert seen == {"frame_id": "f1", "include_image": "false"}
 
@@ -226,7 +261,7 @@ def test_active_share_defaults_to_pixels_when_include_image_is_omitted(monkeypat
     assert result.data["has_image"] is True
 
 
-def test_inactive_share_default_explains_that_pixels_were_not_requested(monkeypatch):
+def test_inactive_share_default_explains_that_share_is_not_active(monkeypatch):
     store = types.SimpleNamespace(user_id="u_idle")
     monkeypatch.setattr(
         screen_read_core, "screen_share_grounding", lambda _user_id: {}
@@ -252,7 +287,8 @@ def test_inactive_share_default_explains_that_pixels_were_not_requested(monkeypa
     result = cap_screen.read(store, params={"frame_id": "f-idle"})
 
     assert seen["include_image"] == "false"
-    assert result.data["image_omitted_reason"] == "not_requested"
+    assert result.data["image_omitted_reason"] == "screen_share_not_active"
+    assert "restart screen sharing" in result.data["suggested_action"]
 
 
 def test_stalled_share_does_not_default_to_old_pixels(monkeypatch):
@@ -277,7 +313,37 @@ def test_stalled_share_does_not_default_to_old_pixels(monkeypatch):
     result = cap_screen.read(store, params={"frame_id": "f-old"})
 
     assert seen["include_image"] == "false"
-    assert result.data["image_omitted_reason"] == "not_requested"
+    assert result.data["image_omitted_reason"] == "screen_share_stalled"
+    assert "restart screen sharing" in result.data["suggested_action"]
+
+
+def test_ended_share_does_not_default_to_old_pixels(monkeypatch):
+    store = types.SimpleNamespace(user_id="u_ended")
+    monkeypatch.setattr(
+        screen_read_core,
+        "screen_share_grounding",
+        lambda _user_id: {
+            "active": False,
+            "ended": True,
+            "latest_frame_age_sec": 20,
+            "suggested_action": (
+                "Ask the user to restart screen sharing or send a screenshot."
+            ),
+        },
+    )
+    seen = {}
+
+    def fake_decrypt(store, frame_id, *, include_image, api_key, runtime_token):
+        seen["include_image"] = include_image
+        return ScreenResult(status=200, json_body={"ocr_text": "prior text"})
+
+    monkeypatch.setattr(screen_read_core, "frame_decrypt", fake_decrypt)
+
+    result = cap_screen.read(store, params={"frame_id": "f-prior"})
+
+    assert seen["include_image"] == "false"
+    assert result.data["image_omitted_reason"] == "screen_share_ended"
+    assert "send a screenshot" in result.data["suggested_action"]
 
 
 def test_active_share_without_plaintext_image_explains_absence(monkeypatch):

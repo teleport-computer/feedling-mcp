@@ -183,7 +183,7 @@ def env(monkeypatch):
     monkeypatch.setattr(service, "store", fake)
     wakes = []
     monkeypatch.setattr(service, "_fire_wake",
-                        lambda uid, cap, hint, now: wakes.append((cap, hint)))
+                        lambda uid, cap, hint, now, **_kw: wakes.append((cap, hint)))
     monkeypatch.setattr(service, "_app_proactive_settings", lambda uid: {})
     monkeypatch.setattr(service, "_settings_v2_for_user", lambda uid: None)
     monkeypatch.setattr(service, "_fire_wake_event_v2",
@@ -375,6 +375,49 @@ def test_always_on_signals_stored(env):
     assert snap["local_time"] == "2026-06-08T15:30:45Z"
     assert snap["battery_level"] == "0.85"
     assert snap["broadcast_state"] == "inactive"
+
+
+def test_legacy_broadcast_edges_require_baseline_and_share_debounce(
+    env, monkeypatch
+):
+    fake, wakes = env
+    latest = {"ts": 1_005.0}
+    monkeypatch.setattr(
+        service.db,
+        "frame_list_meta",
+        lambda _uid: [{"id": "f1", "ts": latest["ts"]}],
+    )
+
+    service.ingest_snapshot(
+        UID,
+        [_item("broadcast", {"state": "inactive", "active": False})],
+        client_ts=1_000.0,
+    )
+    assert wakes == []
+
+    service.ingest_snapshot(
+        UID,
+        [_item("broadcast", {"state": "broadcasting", "active": True})],
+        client_ts=1_010.0,
+    )
+    service.ingest_snapshot(
+        UID,
+        [_item("broadcast", {"state": "inactive", "active": False})],
+        client_ts=1_071.0,
+    )
+    latest["ts"] = 1_079.0
+    service.ingest_snapshot(
+        UID,
+        [_item("broadcast", {"state": "broadcasting", "active": True})],
+        client_ts=1_080.0,
+    )
+
+    assert [cap for cap, _hint in wakes] == ["broadcast", "broadcast"]
+    assert [event["type"] for event in fake.events[UID]] == [
+        "wake",
+        "wake",
+        "debounced",
+    ]
 
 
 def test_report_no_setup_accepted_and_stored(env):

@@ -6,6 +6,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
+from perception import catalog as perception_catalog
 from perception.differ_v2 import PerceptionDifferV2
 from perception.signal_state_v2 import SignalObservationDecision
 from proactive.adapters_v2 import wake_event_v2_from_legacy_job
@@ -171,6 +172,8 @@ def test_event_wake_switches_gate_only_matching_trigger_and_manual_bypasses():
         ("unlock_wake_enabled", "perception_event", "unlock_after_absence", "unlock_wake_disabled"),
         ("screen_watch_enabled", "scene_change", "screen_watch", "screen_watch_disabled"),
         ("screen_watch_enabled", "scene_change", "scene_change", "screen_watch_disabled"),
+        ("screen_watch_enabled", "scene_change", "broadcast_opened", "screen_watch_disabled"),
+        ("screen_watch_enabled", "scene_change", "broadcast_closed", "screen_watch_disabled"),
     ]
     for switch, source, trigger, reason in cases:
         settings = resolve_settings_v2({"switches": {switch: False}})
@@ -260,6 +263,19 @@ def test_delivery_off_blocks_visible_delivery_not_chat_write_and_is_visible_to_a
     assert delivery.reason == "reminders_delivery_disabled"
     assert ctx is not None
     assert ctx.as_turn_context()["switches"]["reminders_delivery"] is False
+
+
+def test_dnd_keeps_broadcast_edge_thinkable_but_blocks_visible_delivery():
+    settings = resolve_settings_v2({"dnd": True})
+    wake = evaluate_wake_control_v2(
+        "scene_change", trigger="broadcast_closed", settings=settings
+    )
+    delivery = evaluate_delivery_v2(settings, source="scene_change")
+
+    assert wake.accepted is True
+    assert delivery.allow_chat_write is True
+    assert delivery.allow_visible_delivery is False
+    assert delivery.reason == "reminders_delivery_disabled"
 
 
 def test_manual_wake_bypasses_user_silencing_gates():
@@ -404,6 +420,15 @@ def test_tool_catalog_cost_classes_and_pull_only_motion():
     assert catalog.get("perception.motion").wake_source is False
 
 
+def test_broadcast_catalog_is_significant_wake_source_with_location_debounce():
+    broadcast = perception_catalog.CAPABILITIES["broadcast"]
+    location = perception_catalog.CAPABILITIES["location"]
+
+    assert broadcast.wake_source is True
+    assert broadcast.debounce_sec == location.debounce_sec == 60.0
+    assert perception_catalog.SIGNALS["broadcast"].significant is True
+
+
 def test_perception_differ_only_discrete_anchor_wakes_location():
     differ = PerceptionDifferV2(observe_state=_scripted_state(
         ("baseline_created", 3.0), ("changed", 4.0)
@@ -442,6 +467,28 @@ def test_perception_differ_tracks_seen_separately_from_changed():
     assert second.events == ()
 
 
+def test_perception_differ_emits_first_class_broadcast_edges():
+    differ = PerceptionDifferV2(observe_state=_scripted_state(
+        ("baseline_created", 10.0),
+        ("changed", 20.0),
+        ("changed", 30.0),
+    ))
+
+    baseline = differ.observe("u1", "broadcast_state", "off", ts=10.0)
+    opened = differ.observe("u1", "broadcast_state", "broadcasting", ts=20.0)
+    closed = differ.observe("u1", "broadcast_state", "off", ts=30.0)
+
+    assert baseline.events == ()
+    assert [(event.source, event.trigger) for event in opened.events] == [
+        ("scene_change", "broadcast_opened")
+    ]
+    assert [(event.source, event.trigger) for event in closed.events] == [
+        ("scene_change", "broadcast_closed")
+    ]
+    assert opened.events[0].change_digest
+    assert closed.events[0].change_digest
+
+
 def test_legacy_job_adapter_keeps_old_shape_at_boundary():
     event = wake_event_v2_from_legacy_job(
         "u1",
@@ -459,3 +506,18 @@ def test_legacy_job_adapter_keeps_old_shape_at_boundary():
     assert event.trigger == "perception_location"
     assert event.change_digest == "legacy hint"
     assert event.payload["legacy_proactive_job"]["job_id"] == "pj_1"
+
+
+def test_legacy_broadcast_closed_adapter_uses_scene_change_source():
+    event = wake_event_v2_from_legacy_job(
+        "u1",
+        {
+            "job_id": "pj_closed",
+            "trigger": "broadcast_closed",
+            "ts": 123.0,
+            "context_hint": "screen share ended",
+        },
+    )
+
+    assert event.source == "scene_change"
+    assert event.trigger == "broadcast_closed"

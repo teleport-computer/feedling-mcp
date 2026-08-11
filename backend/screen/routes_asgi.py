@@ -78,10 +78,11 @@ async def get_sources(auth: AuthResult = Depends(require_auth)):
 async def list_frames(request: Request, auth: AuthResult = Depends(require_auth)):
     """List encrypted frame metadata and content-free screen-share health.
 
-    ``screen_share`` is live when the latest frame is recent, stalled when a
-    fresh device broadcast-on report has no frame update for over five minutes,
-    and otherwise an empty object. A stalled result includes restart guidance
-    and never treats the old frame as current screen content.
+    ``screen_share`` is live when the latest frame is recent, ended when a fresh
+    device broadcast-off report follows a recent frame, stalled when a fresh
+    broadcast-on report has no frame update for over five minutes, and otherwise
+    an empty object. Ended/stalled results include restart guidance and never
+    treat an old frame as current screen content.
     """
     result = await threadpool.run_db(
         screen_read_core.list_frames, auth.store, request.query_params.get("limit"))

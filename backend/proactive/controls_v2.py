@@ -260,7 +260,10 @@ def evaluate_wake_control_v2(
         return WakeControlDecisionV2(False, "unlock_wake_disabled", resolved)
     if (
         normalized == "scene_change"
-        or normalized_trigger in {"scene_change", "screen_watch", "screen_tick", "broadcast_opened"}
+        or normalized_trigger in {
+            "scene_change", "screen_watch", "screen_tick",
+            "broadcast_opened", "broadcast_closed",
+        }
     ) and not resolved.screen_watch_enabled:
         return WakeControlDecisionV2(False, "screen_watch_disabled", resolved)
     if normalized == SCHEDULED_WAKE_SOURCE_V2 and not resolved.scheduled:

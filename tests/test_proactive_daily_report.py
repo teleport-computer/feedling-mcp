@@ -112,6 +112,8 @@ def test_classify_proactive_kind_presence_is_heartbeat():
     assert data_track._classify_proactive_kind("presence") == "heartbeat"
     # 历史 kind 仍然归 heartbeat lane
     assert data_track._classify_proactive_kind("heartbeat_broadcast_off") == "heartbeat"
+    assert data_track._classify_proactive_kind("broadcast_opened") == "screen"
+    assert data_track._classify_proactive_kind("broadcast_closed") == "screen"
 
 
 # ---------------------------------------------------------------------------
