@@ -8,6 +8,16 @@ from memory.prompts_v1 import COMMON_BUCKETS_V1
 
 
 _HISTORY_TOOL_NAMES = frozenset({"history_search", "history_fetch"})
+_PERCEPTION_TOOL_NAMES = frozenset({
+    "perception_snapshot",
+    "perception_history",
+    "perception_trend",
+})
+_PERCEPTION_DOMAIN_ERROR_CODES = frozenset({
+    "invalid_days",
+    "unknown_or_unhistorized_signal",
+    "unknown_signals",
+})
 
 _MEMORY_CATEGORY_KEYS = (
     "work",
@@ -124,6 +134,97 @@ def history_result_metadata(tool_name: str, result: Mapping[str, Any]) -> dict:
         # 通道，provider 文本永远进不来。
         result_budget.RESULT_KIND_METADATA_KEY: str(tool_name),
     }
+
+
+def perception_result_metadata(tool_name: str, result: Mapping[str, Any]) -> dict:
+    """Classify a perception result without retaining any perceived value.
+
+    This runs at the trusted capability boundary, before the result is rendered
+    into provider text.  The worker may persist only this tiny classification;
+    location labels, health values, calendar titles, and error messages never
+    cross the observability boundary.
+    """
+    name = str(tool_name or "")
+    if name not in _PERCEPTION_TOOL_NAMES or not isinstance(result, Mapping):
+        return {}
+    if result.get("ok") is not True:
+        error = result.get("error")
+        code = error.get("code") if isinstance(error, Mapping) else None
+        message_code = (
+            _safe_error_code(error.get("message"))
+            if isinstance(error, Mapping)
+            else ""
+        )
+        # Capability error codes are intentionally coarse. Preserve the
+        # perception builder's stable domain slug only through an exact
+        # allowlist; an arbitrary one-word message must never become telemetry.
+        safe_code = (
+            message_code
+            if message_code in _PERCEPTION_DOMAIN_ERROR_CODES
+            else _safe_error_code(code)
+        )
+        metadata = {"perception_result_kind": "error"}
+        if safe_code:
+            metadata["perception_error_code"] = safe_code
+        return metadata
+
+    data = result.get("data")
+    if not isinstance(data, Mapping):
+        return {"perception_result_kind": "empty"}
+    if name == "perception_snapshot":
+        signals = data.get("signals")
+        has_value = (
+            isinstance(signals, Mapping)
+            and any(_signal_doc_has_value(doc) for doc in signals.values())
+        )
+    elif name == "perception_history":
+        rows = data.get("daily")
+        has_value = (
+            isinstance(rows, list)
+            and any(
+                isinstance(row, Mapping)
+                and _signal_doc_has_value(row.get("doc"))
+                for row in rows
+            )
+        )
+    else:
+        trend = data.get("trend")
+        has_value = isinstance(trend, Mapping) and (
+            trend.get("current") is not None
+            or bool(trend.get("daily"))
+        )
+    return {"perception_result_kind": "value" if has_value else "empty"}
+
+
+def _signal_doc_has_value(value: Any) -> bool:
+    if not isinstance(value, Mapping) or value.get("disabled") is True:
+        return False
+    for key, item in value.items():
+        if key in {"disabled", "reason"} or item is None:
+            continue
+        if isinstance(item, Mapping):
+            if _signal_doc_has_value(item):
+                return True
+        elif isinstance(item, (list, tuple, set)):
+            if any(_collection_item_has_value(child) for child in item):
+                return True
+        elif item != "":
+            # Zero and False are real sensor values, not missing data.
+            return True
+    return False
+
+
+def _collection_item_has_value(value: Any) -> bool:
+    if isinstance(value, Mapping):
+        return _signal_doc_has_value(value)
+    return value is not None and value != ""
+
+
+def _safe_error_code(value: Any) -> str:
+    text = str(value or "").strip().lower()
+    if not text or len(text) > 64:
+        return ""
+    return text if all(ch.isalnum() or ch in {"_", "-", "."} for ch in text) else ""
 
 
 def _omitted(data: Mapping[str, Any]) -> int:

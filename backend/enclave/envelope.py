@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import logging
 
 import nacl.bindings
 import nacl.exceptions
@@ -24,6 +25,8 @@ from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
 from cryptography.hazmat.primitives.hashes import SHA256
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from cryptography.hazmat.primitives import serialization
+
+log = logging.getLogger("feedling.enclave.envelope")
 
 
 class DecryptFailure(Exception):
@@ -133,6 +136,14 @@ def decrypt_envelope(env: dict, authorized_user_id: str, content_sk: nacl.public
         )
     except nacl.exceptions.CryptoError as e:
         # AEAD failure — either tampering, wrong aad, or wrong K
+        log.warning(
+            "envelope_aead_verify_failed authorized_user_id=%s "
+            "owner_user_id=%s item_id=%s version=%s",
+            authorized_user_id,
+            env.get("owner_user_id", ""),
+            item_id,
+            v,
+        )
         raise DecryptFailure(f"AEAD verify: {e}")
 
     return plaintext

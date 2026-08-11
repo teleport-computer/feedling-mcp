@@ -3688,7 +3688,7 @@
           }
         ],
         "x-feedling-contract-level": "documented",
-        "description": "List the caller's user-configured MCP servers. Secrets (url, headers, ca_pem) are never returned; url_hint is the hostname only and header_names lists header keys only."
+        "description": "List the caller's user-configured MCP servers. Secrets (url, headers, ca_pem) are never returned; url_hint is the hostname only and header_names lists header keys only. When Hosted Runtime V2 has observed a server during recent chat turns, the record also carries a bounded, content-free runtime summary. The runtime field is omitted when no observation exists; absence is not evidence that the server is healthy. Runtime V1 does not currently write this status."
       },
       "post": {
         "summary": "Mcp Upsert",
@@ -7183,6 +7183,7 @@
     "/v1/screen/frames": {
       "get": {
         "summary": "List Frames",
+        "description": "List encrypted frame metadata and content-free screen-share health.\n\n``screen_share`` is live when the latest frame is recent, stalled when a\nfresh device broadcast-on report has no frame update for over five minutes,\nand otherwise an empty object. A stalled result includes restart guidance\nand never treats the old frame as current screen content.",
         "operationId": "list_frames_v1_screen_frames_get",
         "responses": {
           "200": {
@@ -11457,6 +11458,46 @@
           }
         }
       },
+      "McpServerRuntimeStatus": {
+        "type": "object",
+        "required": [
+          "last_kind",
+          "last_at",
+          "recent_ok",
+          "recent_total"
+        ],
+        "properties": {
+          "last_kind": {
+            "type": "string",
+            "pattern": "^[a-z0-9_]{1,48}$",
+            "description": "Latest content-free Hosted Runtime V2 load outcome. available means the server catalog loaded successfully; other stable kinds describe why it was not ready. Clients must tolerate future kinds."
+          },
+          "last_at": {
+            "type": "number",
+            "exclusiveMinimum": 0,
+            "description": "Unix epoch seconds of the latest observation."
+          },
+          "recent_ok": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 10,
+            "description": "Number of recent observed chat turns whose kind was available."
+          },
+          "recent_total": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 10,
+            "description": "Number of recent observed chat turns in the bounded window."
+          }
+        },
+        "additionalProperties": false,
+        "example": {
+          "last_kind": "available",
+          "last_at": 1786370000.0,
+          "recent_ok": 9,
+          "recent_total": 10
+        }
+      },
       "McpServerRecord": {
         "type": "object",
         "properties": {
@@ -11497,6 +11538,10 @@
           },
           "updated_at": {
             "type": "string"
+          },
+          "runtime": {
+            "$ref": "#/components/schemas/McpServerRuntimeStatus",
+            "description": "Present on GET /v1/mcp/servers only when Hosted Runtime V2 has observed this server. Omitted when no observation exists; absence is not evidence of success."
           }
         },
         "additionalProperties": true,

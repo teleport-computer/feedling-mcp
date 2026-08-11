@@ -17,7 +17,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 from accounts import registry  # noqa: E402
 from core import store as core_store  # noqa: E402
-from hosted import mcp_core  # noqa: E402
+from hosted import mcp_core, mcp_status  # noqa: E402
 
 from _ca_helpers import self_signed_ca_pem  # noqa: E402
 
@@ -63,8 +63,74 @@ def test_upsert_and_list_masks_secrets(store, monkeypatch):
     assert srv["url_hint"] == "mcp.example.com"
     assert srv["header_names"] == ["Authorization"]
     assert srv["enabled"] is True
+    assert "runtime" not in srv
     assert "secret-token" not in str(body)
     assert "config_envelope" not in srv
+
+
+def test_list_projects_bounded_runtime_summary_for_each_observed_server(
+    store,
+    monkeypatch,
+):
+    _fake_envelope(monkeypatch)
+    for name, enabled in (("healthy", True), ("flaky", False)):
+        body, status = mcp_core.upsert_server(store, {
+            "name": name,
+            "url": f"https://{name}.example.com/mcp",
+            "headers": {},
+            "enabled": enabled,
+        })
+        assert status == 200, body
+
+    for at, flaky_kind in ((1000, "available"), (1001, "timeout"), (1002, "timeout")):
+        assert mcp_status.record_runtime_results(store, [
+            {"name": "healthy", "kind": "available"},
+            {"name": "flaky", "kind": flaky_kind},
+        ], now=at)
+
+    body, status = mcp_core.list_servers(store)
+
+    assert status == 200
+    by_name = {server["name"]: server for server in body["servers"]}
+    assert by_name["healthy"]["runtime"] == {
+        "last_kind": "available",
+        "last_at": 1002.0,
+        "recent_ok": 3,
+        "recent_total": 3,
+    }
+    assert by_name["flaky"]["enabled"] is False
+    assert by_name["flaky"]["runtime"] == {
+        "last_kind": "timeout",
+        "last_at": 1002.0,
+        "recent_ok": 1,
+        "recent_total": 3,
+    }
+    assert set(by_name["flaky"]["runtime"]) == {
+        "last_kind", "last_at", "recent_ok", "recent_total",
+    }
+
+
+def test_list_omits_optional_runtime_when_status_read_fails(
+    store,
+    monkeypatch,
+):
+    _fake_envelope(monkeypatch)
+    body, status = mcp_core.upsert_server(store, {
+        "name": "safe",
+        "url": "https://safe.example.com/mcp",
+        "headers": {},
+    })
+    assert status == 200, body
+    monkeypatch.setattr(
+        mcp_core.mcp_status,
+        "runtime_summaries_for_store",
+        lambda _store: (_ for _ in ()).throw(RuntimeError("private detail")),
+    )
+
+    body, status = mcp_core.list_servers(store)
+
+    assert status == 200
+    assert "runtime" not in body["servers"][0]
 
 
 def test_malformed_url_returns_400_not_500(store, monkeypatch):

@@ -193,8 +193,11 @@ inserted into the initial model prompt. The agent uses perception tools when a
 question depends on current device, environment, activity, health, calendar,
 reminder, or photo data. Live screen sharing is the narrow exception: when its
 newest encrypted frame is at most 90 seconds old, foreground Chat may attach up
-to six new frames. Hosted Runtime V2 admits an untested or missing route verdict
-optimistically and blocks only an explicit image-unsupported verdict; a
+to the latest four frames from the current continuous sharing session, and
+explicitly marks the newest as the current screen. A follow-up turn with no new
+frame still receives that latest frame. Hosted Runtime V2 admits an untested or
+missing route verdict optimistically and blocks only an explicit
+image-unsupported verdict; a
 confirmed provider rejection is learned after a successful text-only retry and
 prevents pixel attachment on later turns. The official resident path admits
 pixels only after its propagated setup probe reports `ok`.

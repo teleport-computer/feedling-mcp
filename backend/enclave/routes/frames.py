@@ -13,6 +13,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import logging
 import os
 import re
 
@@ -28,6 +29,7 @@ from enclave.routes._errors import backend_call_or_error, content_sk_or_503
 from enclave.routes._json import json_response_offthread
 
 router = APIRouter()
+log = logging.getLogger("feedling.enclave.screen_frames")
 
 _FRAME_ID_RE = re.compile(r"^[a-f0-9]{16,64}$")
 
@@ -155,6 +157,12 @@ async def v1_frame_decrypt(frame_id: str, request: Request):
     if include_image:
         result["image_b64"] = inner.get("image", "")
         result["image_mime"] = inner.get("image_mime") or "image/jpeg"
+        if not result["image_b64"]:
+            log.warning(
+                "screen_frame_image_absent route=decrypt user_id=%s frame_id=%s",
+                user_id,
+                frame_id,
+            )
     else:
         result["image_b64"] = None
         result["image_bytes_omitted"] = True
@@ -303,6 +311,11 @@ async def v1_frame_image(frame_id: str, request: Request):
     image_b64 = inner.get("image", "")
     image_mime = inner.get("image_mime") or "image/jpeg"
     if not image_b64:
+        log.warning(
+            "screen_frame_image_absent route=image user_id=%s frame_id=%s",
+            user_id,
+            frame_id,
+        )
         return JSONResponse({"error": "no image in plaintext"}, status_code=404)
     try:
         image_bytes = base64.b64decode(image_b64)

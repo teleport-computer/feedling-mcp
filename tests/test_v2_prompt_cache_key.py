@@ -6,6 +6,7 @@ import hashlib
 import hmac
 import json
 import sys
+from contextlib import contextmanager
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -151,6 +152,29 @@ def test_prompt_cache_key_is_deterministic_opaque_and_non_mutating(monkeypatch):
     assert store == {"sentinel": "unchanged"}
     assert user_id not in repr(original_config)
     assert first is not original_config
+
+
+def test_provider_key_resolution_declares_a_coalesced_trace_scope(monkeypatch):
+    _install_provider_config(monkeypatch)
+    monkeypatch.setenv("FEEDLING_RUNTIME_TOKEN_SECRET", "runtime-secret")
+    scopes = []
+
+    @contextmanager
+    def record_scope(purpose):
+        scopes.append(purpose)
+        yield
+
+    monkeypatch.setattr(
+        serve_worker.core_enclave,
+        "coalesced_success_trace",
+        record_scope,
+    )
+
+    resolved, metadata = serve_worker._resolve_provider("user-one")
+
+    assert resolved is not None
+    assert metadata == {}
+    assert scopes == ["model_api_provider_key"]
 
 
 def test_prompt_cache_key_is_distinct_for_different_users(monkeypatch):

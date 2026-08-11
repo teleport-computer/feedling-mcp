@@ -597,14 +597,12 @@ def _set_hosted_runtime_mode_for_user_id_locked(
     if mode == HOSTED_RUNTIME_MODE_DB_ACTION_V2:
         # Seed first. Flipping ownership before a wake schedule exists creates a
         # window where the resident has been reaped but V2 proactive work has no
-        # durable clock. Preserve an existing schedule rather than resetting its
-        # next heartbeat every time startup reconciliation runs.
+        # durable clock. Row existence is insufficient: another producer can
+        # leave either heartbeat or screen-watch NULL forever. The atomic seed
+        # preserves every non-NULL clock during startup reconciliation.
         from model_api_runtime.v2 import jobs_store
 
-        if jobs_store.get_wake_schedule(store_ref.user_id) is None:
-            jobs_store.upsert_wake_schedule(
-                store_ref.user_id, next_heartbeat_at=time.time()
-            )
+        jobs_store.seed_missing_wake_clocks(store_ref.user_id, due_at=time.time())
     # Read control state fail-loud. A missing profile is a real state (seed it
     # for configured users); a DB failure must never be mistaken for that state.
     existing = db.get_blob_strict(store_ref.user_id, MODEL_API_RUNTIME_BLOB)

@@ -155,10 +155,22 @@ the message's pinned route.
 An active screen share can ground an ordinary foreground Chat turn without the
 user having to mention the screen. The runtime treats sharing as active only
 when the newest encrypted frame is at most 90 seconds old. For each active turn,
-it considers frames that arrived after the last successful Chat attachment and
-uniformly samples at most six, preserving each frame's absolute capture time and
-relative age. No active share, no new frame, or an unchanged share adds no pixel
-block and never delays the text turn.
+it walks backward through the current continuous sharing session (stopping at a
+gap over 90 seconds or ten minutes), then attaches the latest four frames. The
+Chat cursor avoids repeating a whole batch, but a follow-up with no newer frame
+still receives the latest frame. Every frame preserves absolute capture time and
+relative age; the newest is explicitly marked as the current screen and the
+others as earlier in the same session. When no share is active, no pixel block
+is added and the text turn is never delayed.
+
+If the device still reports that its broadcast is active but the newest frame
+is more than five minutes old, Chat treats the connection as stalled rather
+than live. Runtime V1 and Hosted Runtime V2 both tell the model that the sharing
+connection may have disconnected and ask the user to stop and restart screen
+sharing. They do not decrypt, attach, or describe the old frame as the current
+screen. `GET /v1/screen/frames` exposes the same content-free decision in its
+`screen_share` object, including `stalled`, `latest_frame_age_sec`, and
+`suggested_action`; a stale broadcast report does not trigger this state.
 
 Hosted Runtime V2 withholds pixels only when the exact route has an explicit
 `unsupported` verdict. An `ok`, untested, failed, or absent verdict admits the
@@ -177,6 +189,13 @@ turn starts with outbound web, MCP, and child-task tools disabled, and that fenc
 remains in force if the no-frame retry is needed. Decrypted frames are cached by
 frame ID under a small bound, and enclave decrypt work is concurrency-limited;
 the cache and aggregate telemetry never store screen text or pixel content.
+
+The model-facing `screen_read` tool uses the same 90-second active-share clock.
+While sharing is active, omitting `include_image` includes the real frame pixels;
+callers may explicitly set it to `false` only when text or OCR is sufficient.
+Outside an active share, omission remains metadata/text-only. A successful read
+without pixels reports whether they were not requested or were absent from the
+decrypted plaintext, so the model can retry or explain the limitation accurately.
 
 For a document, use `file_b64`, `file_name`, and `file_mime` instead. The decoded
 file limit is 25 MiB. PDF, DOCX, XLSX, supported images, and UTF-8 text/source

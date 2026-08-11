@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
 import sys
 from pathlib import Path
 
@@ -74,6 +75,31 @@ def test_decrypt_include_image_toggle(client, _wired):
     r = client.get(f"/v1/screen/frames/{FRAME_ID}/decrypt",
                    headers={"X-API-Key": "k"})
     assert base64.b64decode(r.get_json()["image_b64"]) == JPEG
+
+
+def test_missing_plaintext_image_is_traced_for_both_routes(
+    client, _wired, monkeypatch, caplog
+):
+    inner = {"image": "", "image_mime": "image/jpeg", "ocr_text": ""}
+    monkeypatch.setattr(
+        envmod, "decrypt_envelope", lambda *_args: json.dumps(inner).encode()
+    )
+    caplog.set_level(logging.WARNING)
+
+    decrypt = client.get(
+        f"/v1/screen/frames/{FRAME_ID}/decrypt", headers={"X-API-Key": "k"}
+    )
+    image = client.get(
+        f"/v1/screen/frames/{FRAME_ID}/image", headers={"X-API-Key": "k"}
+    )
+
+    assert decrypt.status_code == 200
+    assert decrypt.get_json()["image_b64"] == ""
+    assert image.status_code == 404
+    messages = [record.getMessage() for record in caplog.records]
+    assert any("screen_frame_image_absent route=decrypt" in msg for msg in messages)
+    assert any("screen_frame_image_absent route=image" in msg for msg in messages)
+    assert all(FRAME_ID in msg and "usr_a" in msg for msg in messages)
 
 
 def test_caption_unconfigured_503(client, _wired, monkeypatch):

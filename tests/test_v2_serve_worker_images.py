@@ -143,6 +143,67 @@ def test_decrypted_user_row_preserves_only_strict_reasoning_boolean(
         assert "include_reasoning" not in rows[0]
 
 
+def test_chat_window_folds_body_and_caption_decrypts_independently(monkeypatch):
+    import debug_trace
+
+    events = []
+    monkeypatch.setattr(
+        debug_trace,
+        "trace_event",
+        lambda _store, **kwargs: events.append(kwargs),
+    )
+    monkeypatch.setattr(serve_worker, "_mint_runtime_token", lambda _uid: "rt")
+
+    def decrypt(envelope, _api_key, *, purpose, **_kwargs):
+        store = type("Store", (), {"user_id": "u1"})()
+        serve_worker.core_enclave._trace_enclave(
+            store,
+            "enclave.call.start",
+            purpose=purpose,
+            path="/v1/envelope/decrypt",
+        )
+        serve_worker.core_enclave._trace_enclave(
+            store,
+            "enclave.call.done",
+            purpose=purpose,
+            path="/v1/envelope/decrypt",
+        )
+        return b"caption" if purpose == "v2_caption_read" else b"body"
+
+    monkeypatch.setattr(
+        serve_worker.core_enclave,
+        "_decrypt_envelope_via_enclave",
+        decrypt,
+    )
+    rows = [
+        {
+            "id": "body",
+            "ts": 1.0,
+            "role": "user",
+            "body_ct": "ct",
+            "K_enclave": "key",
+        },
+        {
+            "id": "image",
+            "ts": 2.0,
+            "role": "user",
+            "content_type": "image",
+            "caption_body_ct": "caption-ct",
+            "caption_K_enclave": "key",
+        },
+    ]
+
+    decrypted = serve_worker._decrypt_chat_rows("u1", rows, user_only=True)
+
+    assert [row["content"] for row in decrypted] == ["body", "caption"]
+    batches = {
+        event["detail"]["purpose"]: event["detail"]["calls"]
+        for event in events
+        if event["type"] == "enclave.call.batch"
+    }
+    assert batches == {"v2_chat_read": 1, "v2_caption_read": 1}
+
+
 def test_dedicated_observer_uses_exact_pinned_route_and_returns_text(monkeypatch):
     route = {
         "id": "route-123",

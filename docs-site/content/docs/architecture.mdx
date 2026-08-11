@@ -305,11 +305,16 @@ history, and long polling.
 Foreground Chat may decrypt a bounded live-screen batch after the newest-frame
 metadata proves the share is no more than 90 seconds old. Admission follows the
 active route's real randomized image-control verdict rather than provider
-catalog metadata. At most six frames newer than the runtime's Chat cursor are
-sampled uniformly and labelled as untrusted application data with capture time
-and age. A small frame-ID cache avoids repeated enclave decrypts, while the
-shared decrypt proxy remains concurrency-limited. Aggregate frame counts and
-cache counters contain neither pixels nor visible text.
+catalog metadata. Starting at the newest frame, the runtime keeps only the
+continuous sharing session (adjacent gaps no greater than 90 seconds and an
+absolute ten-minute cap), then attaches its latest four frames. The Chat cursor
+suppresses an already-seen batch, but if no newer frame exists the latest frame
+is repeated so a follow-up question remains grounded. Frames are labelled as
+untrusted application data with capture time and age, and the newest is
+explicitly identified as the current screen. A small frame-ID cache avoids
+repeated enclave decrypts, while the shared decrypt proxy remains
+concurrency-limited. Aggregate frame counts and cache counters contain neither
+pixels nor visible text.
 
 Heavy Chat image and file bodies can be offloaded to object storage. On the
 encrypted tier the object remains ciphertext and the row keeps the envelope

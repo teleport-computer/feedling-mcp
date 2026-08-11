@@ -141,6 +141,9 @@ import generated_image
 # Shared torn-protocol-JSON leak detector (backend/core, pure). backend/ is on
 # sys.path via the insert above, so it imports as a top-level `core.*` name.
 from core import protocol_leak as _protocol_leak
+# 世界书注入侧的标头/上限/截断标记与 V2 共用同一份定义(纯模块,无 enclave 依赖)。
+# 各写一份就会漂——本文件前台原本就漂成了没有 UNTRUSTED 标注的弱版本。
+import worldbook_match as _worldbook_match
 
 from memory.capture_prompt_v1 import (
     build_capture_prompt,
@@ -3575,6 +3578,25 @@ def _screen_context_for_message(content: str) -> tuple[str, list[dict[str, str]]
         "cache_misses": 0,
     }
     body = _fetch_screen_metadata_once("/v1/screen/frames?limit=100")
+    if not isinstance(body, dict):
+        return "", [], []
+    share_state_present = "screen_share" in body
+    share_state = body.get("screen_share")
+    share_state = share_state if isinstance(share_state, dict) else {}
+    if share_state.get("stalled") is True:
+        latest_age = share_state.get("latest_frame_age_sec")
+        return (
+            "[Feedling screen-sharing connection status]\n"
+            "screen_share.active: false\n"
+            "screen_share.stalled: true\n"
+            f"latest_frame_age_sec: {latest_age if latest_age is not None else 'unknown'}\n"
+            "The screen-sharing connection may have disconnected. Ask the user "
+            "to stop and restart screen sharing.",
+            [],
+            [],
+        )
+    if share_state_present and share_state.get("active") is not True:
+        return "", [], []
     frames = (body or {}).get("frames") if isinstance(body, dict) else None
     if not isinstance(frames, list) or not frames:
         return "", [], []
@@ -3586,10 +3608,8 @@ def _screen_context_for_message(content: str) -> tuple[str, list[dict[str, str]]
     if not str(latest.get("id") or latest.get("frame_id") or "").strip():
         return "", [], []
     latest_age = time.time() - latest_ts
-    if (
-        not latest_ts
-        or latest_age < 0
-        or latest_age > SCREEN_CONTEXT_MAX_AGE_SEC
+    if not share_state_present and (
+        not latest_ts or latest_age < 0 or latest_age > SCREEN_CONTEXT_MAX_AGE_SEC
     ):
         log.info(
             "screen context skipped — latest frame is stale age=%.1fs id=%s",
@@ -3597,6 +3617,11 @@ def _screen_context_for_message(content: str) -> tuple[str, list[dict[str, str]]
             str(latest.get("id") or latest.get("frame_id") or ""),
         )
         return "", [], []
+    if share_state_present:
+        try:
+            latest_age = float(share_state.get("latest_frame_age_sec"))
+        except (TypeError, ValueError):
+            return "", [], []
     active_signal = (
         "[Live Feedling screen-sharing availability]\n"
         "screen_share.active: true\n"
@@ -3605,8 +3630,8 @@ def _screen_context_for_message(content: str) -> tuple[str, list[dict[str, str]]
     if _screen_runtime_unsupported or SCREEN_VISION_TEST_STATUS != "ok":
         return active_signal, [], []
 
-    selected = v2_screen_chat.uniformly_sample_new_frames(
-        list(reversed(frames)),
+    selected = v2_screen_chat.select_recent_session_frames(
+        frames,
         last_pushed_frame_id=_last_screen_chat_frame_id,
     )
     if not selected:
@@ -3701,6 +3726,63 @@ def _worldbook_context_for_foreground(content: str) -> str:
         return block
     except Exception as exc:
         log.warning("worldbook context fetch failed: %s", exc)
+        return ""
+
+
+def _worldbook_context_for_wake(job: dict) -> str:
+    """主动开口时的世界书（Seven 2026-08-10）。
+
+    之前只有前台聊天注入，于是同一个伴侣在聊天里说「影月初三」、心跳主动发消息时
+    说「8 月 11 号」——用户看到的是人格分裂，而世界书恰恰是为「设定一致」买的。
+
+    **匹配信号按道分**，因为世界书有两半、语义不同：
+      · alwaysOn 条目 = 世界常数（历法/地名/「这世界没有手机」），语义就是「聊什么
+        都成立」，所有唤醒道都给；
+      · 关键词触发条目 = 对话范围内的资料，要有**新鲜的文本信号**才有意义。
+        定时唤醒有（提醒正文，且它本来就已逐字进 prompt，拿它匹配零新增暴露面）；
+        心跳没有（手里只有可能几小时前的旧消息）；屏幕监看有新输入但**是不可信
+        输入**，用屏幕文本去选世界书条目等于让屏幕内容影响 prompt 内容，绕开了
+        既有的「屏幕文本 pull-only」防注入姿态。
+
+    不需要动匹配器：空 messages 下 `worldbook_match._triggered` 天然只留 alwaysOn。
+    ⚠️ 不要复用 `_worldbook_context_for_foreground`——它 `if not text: return ""`
+    早退，会让所有无信号的唤醒道一条 alwaysOn 都拿不到，正好抹掉本函数的目的。
+
+    成本说明:本函数在每次主动唤醒都会打一次 `/v1/worldbook/match`。用户一条世界书
+    都没有时 backend 200 早返,但只要存有任意条目(哪怕全是 keyword-only),空
+    messages 仍会把全部条目送进 enclave 解密匹配;resident 侧固定 `timeout=20`。
+
+    ✅ **调用点已在资格闸之后**(2026-08-10 后一批):`_process_proactive_jobs` 现在
+    先判 proactive backoff / payment cooldown,放行了才构建整条消息。所以必然被
+    skipped 的 job 不再白付这次往返。锁在
+    `tests/test_chat_resident_consumer.py::test_skipped_proactive_job_pays_no_context_fetches`。
+    """
+    messages: list[dict] = []
+    if _is_scheduled_wake_job(job):
+        note = _scheduled_note(job)
+        if note:
+            messages = [{"role": "user", "content": note}]
+    try:
+        resp = _HTTP.post(
+            f"{FEEDLING_API_URL}/v1/worldbook/match",
+            headers=_HEADERS,
+            json={"messages": messages},
+            timeout=20,
+        )
+        if resp.status_code == 404:
+            return ""
+        resp.raise_for_status()
+        body = resp.json()
+        block = str((body or {}).get("block") or "").strip()
+        if block:
+            log.info(
+                "worldbook wake context injected names=%s signal=%s",
+                (body or {}).get("matched_names") or [],
+                "reminder_note" if messages else "always_on_only",
+            )
+        return block
+    except Exception as exc:  # 与前台同款 best effort:取不到不该打掉一次主动开口
+        log.warning("worldbook wake context fetch failed: %s", exc)
         return ""
 
 
@@ -5728,6 +5810,15 @@ def _trace_user_mcp_wiring(cmd: list[str], *, trace_id: str, lane: str) -> None:
     )
 
 
+# init states that are POSITIVE evidence of failure, as opposed to "we don't
+# know yet". Only these turn a server red without a failed tool call.
+# `absent` is ours, not Claude's: the server we handed over never appeared in
+# its list at all. Deliberately a closed set — a status we have never seen
+# (Claude adds one, a relay rewrites one) must fall through to inconclusive,
+# or the day the CLI ships a new state every user with MCP goes red at once.
+_MCP_INIT_HARD_FAILURES = frozenset({"failed", "needs-auth", "absent", "error"})
+
+
 def _trace_user_mcp_registered(raw: str, cmd: list[str], *,
                                trace_id: str, lane: str,
                                attempt: str = "first") -> None:
@@ -5740,16 +5831,39 @@ def _trace_user_mcp_registered(raw: str, cmd: list[str], *,
 
         {"type":"system","subtype":"init","tools":[...],"mcp_servers":[...]}
 
-    which settles in one field what preflight can only imply. It is also what
-    exposed the shape of this whole class of bug: a prod turn showing
+    which is what exposed this whole class of bug: a prod turn showing
     ``mcp_servers: []`` while the app listed the server as connected.
+
+    ⚠️ But that event is a SNAPSHOT of the moment the run opened, not a verdict.
+    Measured on a real turn: a server reported ``pending`` at init, contributed
+    zero tools to the opening surface, and was then discovered and called
+    successfully later in the same turn (fixture:
+    ``tests/fixtures/claude_init_pending_tool_recovered.jsonl``). Reporting that
+    turn as a failure is exactly the false green this trace exists to prevent,
+    pointed the other way. So the verdict comes from two observations:
+
+      1. the init snapshot — strictly ``status == "connected"``, never inventing
+         a second passing value;
+      2. the real ``mcp__<server>__*`` tool_use / tool_result pairs in the same
+         stream — structured blocks only, never the model's prose, which will
+         happily claim it called a tool it never touched.
+
+    Per server that resolves to:
+      ok           — connected at init, or called successfully
+      recovered    — not connected at init, but a later call succeeded
+      failed       — hard init state (failed / needs-auth / absent) or an errored
+                     call, with no successful call to overturn it
+      inconclusive — pending at init and never called. "The model did not call
+                     it" is NOT "the model could not call it"; there is no
+                     evidence either way, so this must not be reported as error.
+
+    A later success always overrides an init failure — the dashboard's
+    ``any_error`` would otherwise dye the whole turn red over a state that
+    resolved before the user saw anything.
 
     Only judged on the chat lane with servers enabled — MCP is deliberately
     chat-only, so an empty list anywhere else is correct, and reporting it
     would bury the real signal under one false error per distillation.
-
-    Registration is not approval: a registered tool can still be denied at call
-    time (that lands in ``permission_denials``). Preflight covers the grant.
 
     ⚠️ Emitted once per CLI **attempt**, same rule the pi surface trace follows:
     a retry starts a NEW process that redoes the MCP handshake, and it replaces
@@ -5768,57 +5882,131 @@ def _trace_user_mcp_registered(raw: str, cmd: list[str], *,
     expected = [n for n in expected if n]
     if not expected:
         return
+    # Longest first: attribution below matches a tool name against the servers
+    # we actually enabled, and "foo" is a prefix of "foo__bar".
+    expected_by_length = sorted(expected, key=len, reverse=True)
     init = None
+    call_ok: set[str] = set()      # servers with at least one successful call
+    call_err: set[str] = set()     # servers whose call came back is_error
+    pending_use: dict[str, str] = {}   # tool_use_id -> server, awaiting its result
     for obj in _json_objects_from_cli_output(raw):
-        # Last init wins: a retried attempt re-runs the handshake in a new
-        # process, and the earlier one's result no longer describes this turn.
-        if (isinstance(obj, dict)
-                and str(obj.get("type") or "").strip() == "system"
-                and str(obj.get("subtype") or "").strip() == "init"):
+        if not isinstance(obj, dict):
+            continue
+        etype = str(obj.get("type") or "").strip()
+        if etype == "system" and str(obj.get("subtype") or "").strip() == "init":
+            # Last init wins: a retried attempt re-runs the handshake in a NEW
+            # process, and the earlier one no longer describes this turn — so
+            # its tool calls must go with it. Keeping them let a first attempt's
+            # successful call resurrect a server that the attempt which actually
+            # answered had reported `failed`, producing the impossible pair
+            # "init_status: failed" + "verdict: recovered" (codex 审出). The
+            # comment above used to claim this while the code did the opposite.
             init = obj
+            call_ok.clear()
+            call_err.clear()
+            pending_use.clear()
+            continue
+        content = (obj.get("message") or {}).get("content")
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            btype = str(block.get("type") or "").strip()
+            if btype == "tool_use":
+                # mcp__<server>__<tool>. Attribute by matching against the
+                # servers we actually enabled, LONGEST first — never by
+                # splitting on "__". The backend's name rule is
+                # ``[a-z0-9_-]{1,32}`` (mcp_core), which ALLOWS a double
+                # underscore, so ``mcp__foo__bar__do`` is ambiguous on its own:
+                # split() reads it as server "foo" and loses every call made to
+                # a server literally named "foo__bar". The comment that used to
+                # sit here claimed the opposite — asserted, never checked
+                # against the rule (codex 审出).
+                name = str(block.get("name") or "")
+                for srv in expected_by_length:
+                    if name.startswith(f"mcp__{srv}__"):
+                        pending_use[str(block.get("id") or "")] = srv
+                        break
+            elif btype == "tool_result":
+                server = pending_use.pop(str(block.get("tool_use_id") or ""), "")
+                if not server:
+                    continue
+                (call_err if block.get("is_error") else call_ok).add(server)
+
     if init is None or not isinstance(init.get("mcp_servers"), list):
         # Non-JSON output shape (or a CLI that stopped reporting it). Silence is
         # right here: we have no observation, and inventing one from a regex
         # over stdout is how a tool-output echo becomes a fake event.
         return
-    registered, failed = [], []
+
+    init_status: dict[str, str] = {}
     for entry in init["mcp_servers"]:
         if isinstance(entry, dict):
             name = str(entry.get("name") or "")
-            status = str(entry.get("status") or "").strip().lower()
+            status = str(entry.get("status") or "").strip().lower() or "unknown"
         else:
-            name, status = str(entry), ""
-        if not name:
-            continue
-        registered.append(name)
-        # Exactly the SDK's own predicate — `s.status !== "connected"` is a
-        # failed server. Nothing else counts as working: an entry with no
-        # status, a bare string entry, and any status we don't recognise are
-        # all states we have no evidence about, and guessing them green is how
-        # a postflight built to catch false greens starts producing them.
-        # `ready`/`ok` were my invention, with no protocol basis (codex 审出)。
-        if status != "connected":
-            failed.append(f"{name}:{status or 'unknown'}")
-    missing = [n for n in expected if n not in registered]
-    ok = not missing and not failed
+            name, status = str(entry), "unknown"
+        if name:
+            # Exactly the SDK's own predicate — anything that is not literally
+            # "connected" is not connected. An entry with no status, a bare
+            # string entry and an unrecognised status are all states we have no
+            # evidence about; `ready`/`ok` were my invention with no protocol
+            # basis (codex 审出).
+            init_status[name] = status
+
+    verdict: dict[str, str] = {}
+    for name in expected:
+        started = init_status.get(name, "absent")
+        if name in call_ok:
+            # A successful call outranks every init state: whatever was wrong at
+            # startup had resolved by the time it mattered.
+            verdict[name] = "ok" if started == "connected" else "recovered"
+        elif name in call_err:
+            verdict[name] = "failed"
+        elif started == "connected":
+            verdict[name] = "ok"
+        elif started in _MCP_INIT_HARD_FAILURES:
+            verdict[name] = "failed"
+        else:
+            # Everything else — pending, a status we have never seen, one Claude
+            # adds next month — is "no evidence", not failure. The previous
+            # version sent every unrecognised value to `failed`, which
+            # contradicted this function's own docstring and would turn the
+            # whole fleet red the day the CLI introduces a new state
+            # (`connecting` reproduced it — codex 审出).
+            verdict[name] = "inconclusive"
+
+    by = lambda v: [n for n in expected if verdict[n] == v]  # noqa: E731
+    failed, recovered, inconclusive = by("failed"), by("recovered"), by("inconclusive")
     _emit_debug_trace(
         "agent",
         "mcp.surface.registered",
-        status="ok" if ok else "error",
+        # Only hard evidence turns a turn red. `inconclusive` must not, or every
+        # ordinary turn where the model simply had no reason to use a tool would
+        # report a failure.
+        status="error" if failed else "ok",
         trace_id=trace_id,
-        summary=(f"CLI 实际注册 {len(registered)}/{len(expected)} 台 MCP 服务器"
-                 + ("" if ok else ",有缺失")),
+        summary=(f"MCP 可用 {len(by('ok')) + len(recovered)}/{len(expected)} 台"
+                 + (f",{len(failed)} 台不可用" if failed else "")
+                 + (f",{len(inconclusive)} 台无法判定" if inconclusive else "")),
         explain=(
-            "claude 自己报告的注册结果 —— 这是模型这一轮真正看得到的服务器。"
-            if ok else
-            "claude 自报的注册结果和我们交过去的对不上:"
-            + (f"没注册上 {','.join(missing[:10])};" if missing else "")
-            + (f"握手异常 {','.join(failed[:10])};" if failed else "")
-            + "模型看不到这些服务器的工具,通常会答「用不了」。"
+            (f"这几台这一轮确实不可用:{','.join(failed[:10])}。"
+             "模型看不到它们的工具,通常会答「用不了」。"
+             if failed else "这一轮 MCP 工具面正常。")
+            + (f" 启动时未就绪、但随后调用成功(已恢复):{','.join(recovered[:10])}。"
+               if recovered else "")
+            + (f" 启动时未就绪且本轮没被调用,无法判定能不能用:"
+               f"{','.join(inconclusive[:10])} —— 「模型没调用」不等于「模型调不了」。"
+               if inconclusive else "")
         ),
         detail={
-            "expected": expected[:20], "registered": registered[:20],
-            "missing": missing[:20], "failed": failed[:20],
+            "expected": expected[:20],
+            # The startup snapshot, kept verbatim: it is the only thing that
+            # explains WHY a server needed recovering.
+            "init_status": {k: v for k, v in list(init_status.items())[:20]},
+            "verdict": {k: verdict[k] for k in expected[:20]},
+            "called_ok": sorted(call_ok)[:20], "called_error": sorted(call_err)[:20],
             # Which CLI attempt this describes. A turn can emit several; the
             # last one is the process that produced the reply.
             "attempt": attempt,
@@ -12296,13 +12484,18 @@ def _wake_trigger_line(job: dict) -> str:
     return ", ".join(seen) if seen else "wake"
 
 
-def _scheduled_wake_message(job: dict) -> str:
+def _scheduled_note(job: dict) -> str:
+    """提醒正文。抽成函数是因为世界书匹配也要读它——两处各抄一遍就会漂。"""
     note = ""
     for key in ("scheduled_note", "context_hint", "change_digest"):
         note = str((job or {}).get(key) or "").strip()
         if note:
             break
-    note = note[:2000] or "The reminder time the user requested has arrived."
+    return note[:2000]
+
+
+def _scheduled_wake_message(job: dict) -> str:
+    note = _scheduled_note(job) or "The reminder time the user requested has arrived."
     timezone_name = str((job or {}).get("timezone") or "").strip() or _user_timezone()
     return "\n\n".join([
         "[Feedling scheduled reminder]",
@@ -12331,10 +12524,20 @@ def _message_for_proactive_job(
     perception_digest: tuple[dict, list, dict] | None = None,
 ) -> str:
     chat_context = _coerce_proactive_chat_context(recent_chat_context)
+
+    # 世界书挂在**这个唯一入口**上,而不是各分支各写一遍:三条唤醒道(屏幕/定时/
+    # 通用)都从这里出去,加在这里才叫「加全」,以后新增一条道也自动带上。
+    def _with_worldbook(message: str) -> str:
+        block = _worldbook_match.format_context_block(_worldbook_context_for_wake(job))
+        if not block:
+            return message
+        return f"{block}\n\n{message}"
+
     if _is_screen_watch_job(job):
-        return _screen_watch_message(job, screen_text=screen_text, chat_context=chat_context)
+        return _with_worldbook(
+            _screen_watch_message(job, screen_text=screen_text, chat_context=chat_context))
     if _is_scheduled_wake_job(job):
-        return _scheduled_wake_message(job)
+        return _with_worldbook(_scheduled_wake_message(job))
     wake_kind = _proactive_wake_kind(job, screen_text=screen_text)
     screen_available = bool(screen_text)
     presence = perception_digest[0] if (perception_digest and isinstance(perception_digest[0], dict)) else {}
@@ -12382,7 +12585,7 @@ def _message_for_proactive_job(
         )
     if screen_text:
         parts.append(screen_text)
-    return "\n\n".join(parts)
+    return _with_worldbook("\n\n".join(parts))
 
 
 def _reply_protocol_block() -> str:
@@ -14072,26 +14275,11 @@ def _process_proactive_jobs(jobs: list) -> float:
             continue
 
         is_introduction = _is_introduction_job(job)
-        if is_introduction:
+        # 只做**便宜**的取值(读 job 自己的字段),好让日志和下面的资格闸都能用。
+        # 真正昂贵的那三样——屏幕取帧、感知摘要、世界书匹配——一律留到闸之后。
+        frame_ids = job.get("frame_ids")
+        if is_introduction or not isinstance(frame_ids, list):
             frame_ids = []
-            screen_payloads = []
-            screen_paths = []
-            message = _message_for_introduction_job(job)
-        else:
-            frame_ids = job.get("frame_ids")
-            if not isinstance(frame_ids, list):
-                frame_ids = []
-            screen_text, screen_payloads, screen_paths = _screen_context_for_frame_ids(frame_ids)
-            recent_context = recent_chat_context_for_proactive()
-            # Screen-watch is a light lane: skip the heavy cross-domain digest fetch
-            # (its prompt deliberately omits the board).
-            perception_digest = None if _is_screen_watch_job(job) else _proactive_perception_digest()
-            message = _message_for_proactive_job(
-                job,
-                screen_text=screen_text,
-                recent_chat_context=recent_context,
-                perception_digest=perception_digest,
-            )
         log.info(
             "proactive job [ts=%.3f] id=%s kind=%s intent=%s frames=%d",
             ts,
@@ -14101,6 +14289,22 @@ def _process_proactive_jobs(jobs: list) -> float:
             len(frame_ids),
         )
 
+        # ── 资格闸必须跑在昂贵的上下文构建**之前** ──────────────────────
+        # 这两道闸都是纯本地判断,而它们下面那段每次要打 3–4 个 HTTP(屏幕帧 /
+        # 感知摘要 / 世界书匹配,后者 timeout=20)。闸在后面时,一个**必然会被
+        # 跳过**的 job 也会把这些往返全付一遍。resident consumer 跑在用户自己的
+        # VPS 上,而这两道闸恰恰在「用户配置已经坏了」时最常命中。
+        # 闸的输入(is_introduction / job / job_id)在此都已就绪,所以能上提。
+        #
+        # 被推后的取用**不推进任何业务状态**——不消费帧游标、不动 health/cursor、
+        # 不写服务端状态(`_fetch_screen_json`、enclave history、感知快照与 board、
+        # worldbook match 全是读)。但**不能说成"纯只读/无副作用"**:
+        # `_screen_context_for_frame_ids` 会经 `_image_file_paths_from_payloads`
+        # **mkdir + 把解密后的屏幕截图写到本地临时文件**(:3141)。
+        # 也就是说旧顺序下,一个必然被跳过的 job 也会把用户的解密屏幕内容落盘一次。
+        # 前移因此不只是省往返,更是**不为不会发生的工作物化解密内容**——这比
+        # 省流量更值得。(codex 复验 2026-08-10 指出我原注释"纯位移"说过头了。)
+        #
         # Failure backoff applies only to genuine idle proactive turns — never to
         # the first-greeting introduction or the screen-watch lane. The self-wake
         # LOOP guard is NOT here: it fires at the schedule point (where the agent
@@ -14125,6 +14329,24 @@ def _process_proactive_jobs(jobs: list) -> float:
                 job_id, "failed", "provider_payment_required: cooling down"
             )
             continue
+
+        # ── 闸已放行,现在才付昂贵的上下文构建 ────────────────────────
+        if is_introduction:
+            screen_payloads = []
+            screen_paths = []
+            message = _message_for_introduction_job(job)
+        else:
+            screen_text, screen_payloads, screen_paths = _screen_context_for_frame_ids(frame_ids)
+            recent_context = recent_chat_context_for_proactive()
+            # Screen-watch is a light lane: skip the heavy cross-domain digest fetch
+            # (its prompt deliberately omits the board).
+            perception_digest = None if _is_screen_watch_job(job) else _proactive_perception_digest()
+            message = _message_for_proactive_job(
+                job,
+                screen_text=screen_text,
+                recent_chat_context=recent_context,
+                perception_digest=perception_digest,
+            )
         update_proactive_job_status(job_id, "realizing")
         try:
             agent_result = call_agent(
@@ -15159,9 +15381,14 @@ def _process_messages(messages: list) -> float:
                 ts,
                 len(screen_payloads),
             )
-        worldbook_text = _worldbook_context_for_foreground(content)
+        # 走与唤醒道、与 V2 同一个 formatter:带 UNTRUSTED 标注 + 24k 总量上限 +
+        # 显式截断标记。原先这里是裸的 `World book context:` 且**没有总量上限**
+        # ——enclave 只 cap 单条(20k),多条 alwaysOn 合并后可以远超一轮该占的份额,
+        # V2 的 builder 会截断而 resident 直接全塞(codex 复验 2026-08-10 指出)。
+        worldbook_text = _worldbook_match.format_context_block(
+            _worldbook_context_for_foreground(content))
         if worldbook_text:
-            content = f"World book context:\n{worldbook_text}\n\n{content}"
+            content = f"{worldbook_text}\n\n{content}"
 
         # Inject any memory the user explicitly referenced for this turn
         # (Garden「talk in chat」). The enclave already expanded the id into the

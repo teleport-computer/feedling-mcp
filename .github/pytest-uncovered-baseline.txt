@@ -1,4 +1,3 @@
-tests/test_access_mode_runtime_sync_unit.py
 tests/test_access_modes.py
 tests/test_account_recover.py
 tests/test_account_reset_purges_all_tables.py
@@ -8,9 +7,7 @@ tests/test_admin_home_view.py
 tests/test_admin_kpi_windows.py
 tests/test_admin_product_health_view.py
 tests/test_admin_runtime_allowlist.py
-tests/test_admin_runtime_mode.py
 tests/test_admin_tee_replication.py
-tests/test_admin_usage.py
 tests/test_agent_perception_route.py
 tests/test_agent_runtime_discovery.py
 tests/test_agent_runtime_genesis_gate.py
@@ -71,7 +68,6 @@ tests/test_capabilities_perception.py
 tests/test_capabilities_photo.py
 tests/test_capabilities_registry.py
 tests/test_capabilities_screen.py
-tests/test_capabilities_tool_schema.py
 tests/test_capabilities_types.py
 tests/test_capability_html_extract.py
 tests/test_capability_wake.py
@@ -81,7 +77,6 @@ tests/test_capture_dream_submit_seam.py
 tests/test_capture_failure_backoff.py
 tests/test_capture_source_whitelists_agree.py
 tests/test_card_guard.py
-tests/test_chat_activity_projection.py
 tests/test_chat_core_file_ingest.py
 tests/test_chat_core_introduction_trigger.py
 tests/test_chat_envelope_fpr_guard.py
@@ -118,7 +113,6 @@ tests/test_data_track.py
 tests/test_data_track_debug.py
 tests/test_dau_snapshot_scheduler.py
 tests/test_db_health_timeouts.py
-tests/test_debug_trace.py
 tests/test_debug_trace_atomic.py
 tests/test_debug_trace_event_route.py
 tests/test_delete_user_cascades_all_tables.py
@@ -426,16 +420,12 @@ tests/test_v2_reaper.py
 tests/test_v2_reply_cursor_seq.py
 tests/test_v2_runtime_generation.py
 tests/test_v2_scheduler.py
-tests/test_v2_scheduler_wiring.py
-tests/test_v2_screen_watch_gate.py
-tests/test_v2_screen_watch_store.py
 tests/test_v2_send_enqueue_atomic.py
 tests/test_v2_seq_cursor_migration.py
 tests/test_v2_serve_worker_consent.py
 tests/test_v2_serve_worker_extraction.py
 tests/test_v2_serve_worker_genesis.py
 tests/test_v2_serve_worker_images.py
-tests/test_v2_serve_worker_screen_watch.py
 tests/test_v2_sink_retryable.py
 tests/test_v2_status_poll.py
 tests/test_v2_status_stream.py

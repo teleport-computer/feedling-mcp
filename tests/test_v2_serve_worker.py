@@ -4,6 +4,7 @@ import asyncio
 import json
 import sys
 import types
+from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -512,6 +513,7 @@ def test_build_production_deps_returns_turndeps(monkeypatch):
     assert callable(deps.read_temporal_snapshot)
     assert callable(deps.read_summary_with_seq)
     assert callable(deps.has_genuine_user_history)
+    assert callable(deps.emit_debug_trace)
     monkeypatch.setattr(
         serve_worker.db,
         "chat_latest_genuine_user_ts",
@@ -525,6 +527,47 @@ def test_build_production_deps_returns_turndeps(monkeypatch):
     )
     assert deps.has_genuine_user_history("u-has-history") is True
 
+
+def test_v2_debug_trace_user_seam_resolves_store_and_preserves_duration(monkeypatch):
+    calls = []
+    store = object()
+    monkeypatch.setattr(
+        serve_worker.core_store,
+        "get_store",
+        lambda uid: (calls.append(uid), store)[1],
+    )
+    monkeypatch.setattr(
+        serve_worker,
+        "_emit_v2_debug_trace",
+        lambda resolved_store, event_type, **kwargs: calls.append(
+            (resolved_store, event_type, kwargs)
+        ),
+    )
+
+    serve_worker._emit_v2_debug_trace_for_user(
+        "usr_trace",
+        "agent.tool.call",
+        status="ok",
+        summary="V2 perception_snapshot ok",
+        explain="safe",
+        detail={"tool": "perception_snapshot"},
+        dur_ms=7.5,
+    )
+
+    assert calls == [
+        "usr_trace",
+        (
+            store,
+            "agent.tool.call",
+            {
+                "status": "ok",
+                "summary": "V2 perception_snapshot ok",
+                "explain": "safe",
+                "detail": {"tool": "perception_snapshot"},
+                "dur_ms": 7.5,
+            },
+        ),
+    ]
 
 def test_v2_mcp_mixed_reachable_and_unreachable_servers_are_traced_and_recorded(
     monkeypatch,
@@ -1587,6 +1630,54 @@ def test_read_summary_decrypts_present_row(monkeypatch):
     assert serve_worker._read_summary_with_seq("u_summary_test") == (
         "- prior chat", 7.0, 3, 19,
     )
+
+
+def test_persona_and_summary_decrypts_declare_trace_scopes(monkeypatch):
+    from model_api_runtime.v2 import jobs_store as v2_jobs_store
+
+    scopes = []
+
+    @contextmanager
+    def record_scope(purpose):
+        scopes.append(purpose)
+        yield
+
+    monkeypatch.setattr(
+        serve_worker.core_enclave,
+        "coalesced_success_trace",
+        record_scope,
+    )
+    monkeypatch.setattr(
+        serve_worker.db,
+        "get_blob",
+        lambda *_args: {"content_envelope": {"body_ct": "persona"}},
+    )
+    monkeypatch.setattr(
+        v2_jobs_store,
+        "get_summary_frontier_state",
+        lambda _uid: {
+            "summary_envelope": {"body_ct": "summary"},
+            "watermark_ts": 0.0,
+            "watermark_seq": 0,
+            "version": 1,
+        },
+    )
+    monkeypatch.setattr(serve_worker, "_mint_runtime_token", lambda _uid: "rt")
+    monkeypatch.setattr(
+        serve_worker.core_enclave,
+        "_decrypt_envelope_via_enclave",
+        lambda envelope, *_args, **_kwargs: str(envelope["body_ct"]).encode(),
+    )
+
+    persona = serve_worker._load_genesis_persona(
+        types.SimpleNamespace(user_id="u-scopes"),
+        runtime_token="rt",
+    )
+    summary = serve_worker._read_summary_with_seq("u-scopes")
+
+    assert persona == "persona"
+    assert summary == ("summary", 0.0, 1, 0)
+    assert scopes == ["genesis_persona", "v2_summary_read"]
 
 
 @pytest.mark.parametrize(

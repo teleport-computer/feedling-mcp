@@ -94,6 +94,7 @@ from model_api_runtime.v2 import profile_store as v2_profile_store
 from model_api_runtime.v2 import reaper as v2_reaper
 from model_api_runtime.v2 import runner_identity
 from model_api_runtime.v2 import scheduler
+from model_api_runtime.v2 import screen_chat as v2_screen_chat
 from model_api_runtime.v2 import screen_watch
 from model_api_runtime.v2 import summary_frontier as v2_summary_frontier
 from model_api_runtime.v2 import usage_rollup
@@ -159,12 +160,13 @@ def _load_genesis_persona(store, *, runtime_token: str) -> str:
     if not isinstance(envelope, dict):
         return ""
     try:
-        raw = core_envelope.read_envelope_body(
-            envelope,
-            None,
-            purpose="genesis_persona",
-            runtime_token=str(runtime_token or ""),
-        )
+        with core_enclave.coalesced_success_trace("genesis_persona"):
+            raw = core_envelope.read_envelope_body(
+                envelope,
+                None,
+                purpose="genesis_persona",
+                runtime_token=str(runtime_token or ""),
+            )
         return raw.decode("utf-8")
     except Exception as exc:  # noqa: BLE001 — mirror Runtime V1 fallback
         log.warning(
@@ -812,9 +814,10 @@ def _resolve_provider(user_id: str):
         return None, {"error": "runtime_token_mint_failed", "detail": str(e)[:160]}
     # api_key=None: Runtime V2 turns never hold the user's long-term
     # Feedling API key — only the runtime token authenticates to the enclave.
-    runtime = hosted_config_store._load_runtime_provider_config(
-        store, None, runtime_token=token
-    )
+    with core_enclave.coalesced_success_trace("model_api_provider_key"):
+        runtime = hosted_config_store._load_runtime_provider_config(
+            store, None, runtime_token=token
+        )
     if isinstance(runtime, tuple):
         return None, runtime[1]
     # Per-user opaque affinity: provider caches must never receive the raw user
@@ -861,13 +864,14 @@ def _decrypt_chat_rows(
     entire debug trace. Failures inside the batch still trace individually.
     """
     with core_enclave.coalesced_success_trace("v2_chat_read"):
-        return _decrypt_chat_rows_inner(
-            user_id,
-            rows,
-            user_only=user_only,
-            preserve_unreadable=preserve_unreadable,
-            include_capture_metadata=include_capture_metadata,
-        )
+        with core_enclave.coalesced_success_trace("v2_caption_read"):
+            return _decrypt_chat_rows_inner(
+                user_id,
+                rows,
+                user_only=user_only,
+                preserve_unreadable=preserve_unreadable,
+                include_capture_metadata=include_capture_metadata,
+            )
 
 
 def _decrypt_chat_rows_inner(
@@ -1705,11 +1709,12 @@ def _read_summary_with_seq(user_id: str) -> tuple[str, float, int, int]:
             )
         return "", watermark_ts, version, watermark_seq
     token = _mint_runtime_token(user_id)
-    plaintext = _decrypt_summary_text(
-        env,
-        purpose="v2_summary_read",
-        runtime_token=token,
-    )
+    with core_enclave.coalesced_success_trace("v2_summary_read"):
+        plaintext = _decrypt_summary_text(
+            env,
+            purpose="v2_summary_read",
+            runtime_token=token,
+        )
     if has_durable_coverage and not plaintext.strip():
         raise v2_summary_frontier.SummaryFrontierIntegrityError(
             "covered_summary_empty_plaintext"
@@ -1754,13 +1759,15 @@ def _select_agent_profile_for_turn(
             runtime_token=token,
         )
 
-    return v2_profile_store.select_profile_for_turn(
-        user_id,
-        summary,
-        enabled=enabled,
-        decrypt_envelope=_decrypt,
-        read_blob=db.get_blob_strict,
-    )
+    with core_enclave.coalesced_success_trace("v2_profile_memory_read"):
+        with core_enclave.coalesced_success_trace("v2_profile_user_read"):
+            return v2_profile_store.select_profile_for_turn(
+                user_id,
+                summary,
+                enabled=enabled,
+                decrypt_envelope=_decrypt,
+                read_blob=db.get_blob_strict,
+            )
 
 
 def _write_summary(
@@ -2218,12 +2225,13 @@ def _read_screen_frames(user_id: str, frame_ids: list[str]) -> dict[str, Any]:
     misses = 0
     # Sequential by design: all users share the same enclave decrypt proxy. The
     # worker's outer enclave_sem bounds cross-turn concurrency as well.
-    for frame_id in frame_ids[:6]:
-        value, hit = _read_screen_frame_cached(user_id, str(frame_id))
-        hits += int(hit)
-        misses += int(not hit)
-        if value is not None:
-            frames[str(frame_id)] = value
+    with core_enclave.coalesced_success_trace("screen_frame_decrypt"):
+        for frame_id in frame_ids[: v2_screen_chat.MAX_PUSH_FRAMES]:
+            value, hit = _read_screen_frame_cached(user_id, str(frame_id))
+            hits += int(hit)
+            misses += int(not hit)
+            if value is not None:
+                frames[str(frame_id)] = value
     return {"frames": frames, "cache_hits": hits, "cache_misses": misses}
 
 
@@ -4606,14 +4614,23 @@ async def _load_mcp_turn_observed(store, **kwargs):
 
 
 def _emit_v2_debug_trace(store, event_type: str, *, status: str,
-                         summary: str, explain: str, detail: dict) -> None:
+                         summary: str, explain: str, detail: dict,
+                         dur_ms: float | None = None) -> None:
     from diagnostics import diagnostics_core
 
-    diagnostics_core.emit_trace_event_payload(store, {"event": {
+    event = {
         "subsystem": "agent", "type": event_type, "status": status,
         "summary": summary, "explain": explain, "detail": detail,
         "actor": "hosted_v2",
-    }})
+    }
+    if dur_ms is not None:
+        event["dur_ms"] = dur_ms
+    diagnostics_core.emit_trace_event_payload(store, {"event": event})
+
+
+def _emit_v2_debug_trace_for_user(user_id: str, event_type: str, **kwargs) -> None:
+    """Assembly seam for the dependency-clean V2 worker."""
+    _emit_v2_debug_trace(core_store.get_store(user_id), event_type, **kwargs)
 
 
 def build_production_deps() -> v2_worker.TurnDeps:
@@ -4684,6 +4701,7 @@ def build_production_deps() -> v2_worker.TurnDeps:
         load_workspace_file=_load_workspace_file,
         seal_trajectory_payload=_seal_trajectory_payload,
         open_trajectory_payload=_open_trajectory_payload,
+        emit_debug_trace=_emit_v2_debug_trace_for_user,
         send_reply_push=(
             _send_reply_push
             if os.environ.get("FEEDLING_V2_PUSH_ENABLED", "1").strip() != "0"
@@ -4749,13 +4767,14 @@ def _build_scheduler_deps():
 
 
 def _seed_existing_v2_wake_schedules(*, now: float | None = None) -> int:
-    """Idempotent startup repair for V2 users without an armed heartbeat.
+    """Idempotent startup repair for V2 users with any unarmed wake lane.
 
     A row can already exist because another producer (self-wake, screen watch,
     payment cooldown, etc.) touched ``v2_wake_schedule`` while leaving
-    ``next_heartbeat_at`` NULL.  Treating any existing row as "seeded" makes
-    that user permanently invisible to ``due_heartbeat_users``.  Only a
-    non-NULL heartbeat timestamp proves that the heartbeat lane is armed.
+    ``next_heartbeat_at`` or ``next_screen_watch_at`` NULL. Treating any
+    existing row as "seeded" makes that user permanently invisible to the
+    corresponding due-list. The store primitive uses the two columns, not row
+    existence, as its atomic predicate and preserves already-advanced clocks.
     """
     due_at = time.time() if now is None else float(now)
     users = admin_core.list_runtime_modes().get(
@@ -4763,11 +4782,8 @@ def _seed_existing_v2_wake_schedules(*, now: float | None = None) -> int:
     )
     seeded = 0
     for user_id in users:
-        schedule = jobs_store.get_wake_schedule(user_id)
-        if schedule is not None and schedule.get("next_heartbeat_at") is not None:
-            continue
-        jobs_store.upsert_wake_schedule(user_id, next_heartbeat_at=due_at)
-        seeded += 1
+        if jobs_store.seed_missing_wake_clocks(user_id, due_at=due_at):
+            seeded += 1
     return seeded
 
 

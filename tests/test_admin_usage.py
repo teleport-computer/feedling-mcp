@@ -1,4 +1,17 @@
-"""Admin Usage query normalization and canonical link behavior."""
+"""Admin Usage query normalization and canonical link behavior.
+
+⚠️ 这个文件在 CI 里是**单独一次 pytest 调用**(`.github/workflows/ci.yml` 的
+"Run admin usage snapshot suite"),别并进那个 79 文件的合并步骤。
+
+原因:下面有几条断言的是**全局**用户口径 ——
+`test_usage_snapshot_user_drilldown_keeps_global_current_population`、
+`test_usage_current_v2_population_excludes_resident_and_draining_states` 等。
+而 `tests/conftest.py` 是**每个 pytest 进程**建一个测试库、进程内所有文件共享它,
+于是同进程其他文件建的用户会被算进总数(实测 current_app_users 4→5、
+coverage 0.5→0.4)。
+
+这不是测试写错了:全局指标本来就该按全局断言,它只是需要一个独占的库。
+"""
 
 from __future__ import annotations
 
@@ -2736,11 +2749,42 @@ def test_usage_query_failure_is_local_and_runtime_remains_available(monkeypatch)
     assert "各 lane 健康" in runtime_body
 
 
+def _mounted_paths(routes, *, depth: int = 0) -> set[str]:
+    """Collect the real URL paths behind FastAPI's included routers.
+
+    ⚠️ 不要改回直读 `app.routes` 里的 `route.path`。这个应用的顶层 routes
+    **全部**是 `_IncludedRouter`(fastapi 0.139,`requirements.lock` 钉死的版本),
+    而 `_IncludedRouter` 没有 `.path` —— 实测 29 个顶层 route,零个带 path。
+
+    原断言 `route.path == "/admin/data-track"` 因此抛 AttributeError。
+    也别用 `getattr(route, "path", None)` 打发:那样断言会**永远为 False**,
+    只是把崩溃换成一句 `assert False`,更难查。真正的路径挂在
+    `original_router.routes` 上,要递归下去取。
+    """
+    found: set[str] = set()
+    if depth > 6:
+        return found
+    for route in routes:
+        path = getattr(route, "path", None)
+        if isinstance(path, str):
+            found.add(path)
+        nested = getattr(route, "routes", None)
+        if nested is None:
+            inner = getattr(route, "original_router", None)
+            nested = getattr(inner, "routes", None)
+        if nested:
+            found |= _mounted_paths(nested, depth=depth + 1)
+    return found
+
+
 def test_asgi_assembly_wires_usage_report_to_jobs_store():
     """ASGI assembly registers the admin page and installs the real snapshot."""
     import asgi_app
 
-    assert any(route.path == "/admin/data-track" for route in asgi_app.app.routes)
+    paths = _mounted_paths(asgi_app.app.routes)
+
+    assert paths, "一条路径都没收集到 —— 递归走错了,断言会变成空转"
+    assert "/admin/data-track" in paths
     assert _data_track._usage_report is jobs_store.usage_report_snapshot
 
 

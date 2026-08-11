@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
 import os
 import time
 from dataclasses import dataclass, field
@@ -35,10 +36,12 @@ from typing import Any, Optional
 import httpx
 
 import db
-import debug_trace
+from core import enclave as core_enclave
 from screen import frames
 from screen import summary as summary_mod
 from semantic_analysis import analyze as _semantic_analysis
+
+log = logging.getLogger(__name__)
 
 
 @dataclass
@@ -70,6 +73,92 @@ def enclave_forward_headers(*, api_key: str | None, runtime_token: str | None) -
     return {"X-API-Key": api_key} if api_key else {}
 
 
+SCREEN_SHARE_LIVE_SEC = 90.0
+SCREEN_SHARE_STALLED_SEC = 5 * 60.0
+SCREEN_BROADCAST_FUTURE_SKEW_SEC = 2 * 60.0
+_BROADCAST_ACTIVE_STATES = frozenset({"on", "active", "broadcasting", "true", "1"})
+_BROADCAST_INACTIVE_STATES = frozenset({"off", "inactive", "stopped", "false", "0"})
+
+
+def broadcast_report_is_recently_active(
+    report: dict, *, now: float
+) -> bool:
+    cells: list[tuple[float, bool]] = []
+    for value, timestamp_key in (
+        (report.get("broadcast_state"), "broadcast_state_ts"),
+        (report.get("broadcast_active"), "broadcast_active_ts"),
+    ):
+        normalized = str(value if value is not None else "").strip().lower()
+        if normalized not in _BROADCAST_ACTIVE_STATES | _BROADCAST_INACTIVE_STATES:
+            continue
+        try:
+            timestamp = float(report.get(timestamp_key))
+        except (TypeError, ValueError):
+            continue
+        cells.append((timestamp, normalized in _BROADCAST_ACTIVE_STATES))
+    if not cells:
+        return False
+    newest_ts = max(timestamp for timestamp, _is_active in cells)
+    report_age = now - newest_ts
+    if report_age < -SCREEN_BROADCAST_FUTURE_SKEW_SEC:
+        log.debug(
+            "broadcast report ignored because device timestamp is %.1fs ahead",
+            -report_age,
+        )
+        return False
+    if report_age > SCREEN_SHARE_STALLED_SEC:
+        return False
+    newest_values = [is_active for ts, is_active in cells if ts == newest_ts]
+    return any(newest_values) and all(newest_values)
+
+
+def screen_share_grounding(
+    user_id: str, *, latest_frame_ts: float | None = None
+) -> dict:
+    """Return live, stalled, or absent state from content-free metadata.
+
+    Foreground grounding and the ``screen_read`` default must never disagree
+    about whether sharing is active. Both therefore use this one metadata-only
+    predicate. A frame no more than 90 seconds old is live. A fresh device
+    broadcast-on report paired with a frame older than five minutes is stalled
+    and carries a restart action. Frame ids and content never leave this helper.
+    """
+    if latest_frame_ts is None:
+        try:
+            meta = db.frame_list_meta(user_id)
+        except Exception:
+            return {}
+        if not meta:
+            return {}
+        latest_frame_ts = meta[-1].get("ts")
+    now = time.time()
+    try:
+        age = now - float(latest_frame_ts)
+    except (TypeError, ValueError):
+        return {}
+    if age < 0:
+        return {}
+    if age <= SCREEN_SHARE_LIVE_SEC:
+        return {"active": True, "latest_frame_age_sec": int(age)}
+    # Give a transient disconnect time to self-heal before telling the user to
+    # restart sharing. The iOS reconnect backoff is capped well below 5 minutes.
+    if age <= SCREEN_SHARE_STALLED_SEC:
+        return {}
+    try:
+        broadcast = db.perception_broadcast_meta(user_id)
+    except Exception:
+        return {}
+    if not broadcast_report_is_recently_active(broadcast, now=now):
+        return {}
+    return {
+        "active": False,
+        "stalled": True,
+        "status": "broadcast_on_without_recent_frames",
+        "latest_frame_age_sec": int(age),
+        "suggested_action": "Ask the user to stop and restart screen sharing.",
+    }
+
+
 def _trace_enclave_proxy(
     store,
     event_type: str,
@@ -81,24 +170,20 @@ def _trace_enclave_proxy(
     detail: dict | None = None,
     dur_ms: float | None = None,
 ) -> None:
-    try:
-        debug_trace.trace_event(
-            store,
-            subsystem="enclave",
-            type=event_type,
-            actor="backend",
-            status=status,
-            summary=summary,
-            explain="Screen route proxied a request to the enclave; only metadata is recorded.",
-            detail={
-                "path": path,
-                "purpose": purpose,
-                **(detail or {}),
-            },
-            dur_ms=dur_ms,
-        )
-    except Exception:
-        pass
+    core_enclave._trace_enclave(
+        store,
+        event_type,
+        path=path,
+        purpose=purpose,
+        status=status,
+        summary=summary,
+        explain=(
+            "Screen route proxied a request to the enclave; only metadata is "
+            "recorded."
+        ),
+        detail=detail,
+        dur_ms=dur_ms,
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -160,9 +245,23 @@ def list_frames(store, limit_raw) -> ScreenResult:
     limit = min(int(limit_raw if limit_raw is not None else 20), 100)
     with store.frames_lock:
         recent = [f.copy() for f in reversed(store.frames_meta)][:limit]
+        latest_ts = store.frames_meta[-1].get("ts") if store.frames_meta else None
+        total = len(store.frames_meta)
     for f in recent:
         f["url"] = frames._frame_url(store, f["filename"])
-    return ScreenResult(200, json_body={"frames": recent, "total": len(store.frames_meta)})
+    share_state = (
+        screen_share_grounding(store.user_id, latest_frame_ts=latest_ts)
+        if latest_ts is not None
+        else {}
+    )
+    return ScreenResult(
+        200,
+        json_body={
+            "frames": recent,
+            "total": total,
+            "screen_share": share_state,
+        },
+    )
 
 
 def latest_frame(store) -> ScreenResult:

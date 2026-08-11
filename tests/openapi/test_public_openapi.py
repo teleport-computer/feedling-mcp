@@ -606,18 +606,40 @@ def test_mcp_probe_and_approval_contract_matches_runtime_limits(
     public_schema: dict[str, Any],
     operations: dict[tuple[str, str], dict[str, Any]],
 ) -> None:
-    from hosted import mcp_approvals, mcp_core
+    from hosted import mcp_approvals, mcp_core, mcp_status
 
     schemas = public_schema["components"]["schemas"]
     upsert = schemas["McpServerUpsertRequest"]
     patch = schemas["McpServerPatchRequest"]
     probe = schemas["McpServerTestResponse"]
+    record = schemas["McpServerRecord"]
+    runtime = schemas["McpServerRuntimeStatus"]
 
     assert upsert["additionalProperties"] is False
     assert upsert["properties"]["enabled"]["type"] == "boolean"
     assert upsert["properties"]["headers"]["maxProperties"] == mcp_core.MAX_HEADERS
     assert patch["additionalProperties"] is False
     assert patch["properties"]["enabled"]["type"] == "boolean"
+    assert record["properties"]["runtime"]["$ref"] == (
+        "#/components/schemas/McpServerRuntimeStatus")
+    assert runtime["required"] == [
+        "last_kind", "last_at", "recent_ok", "recent_total",
+    ]
+    assert runtime["additionalProperties"] is False
+    assert runtime["properties"]["recent_ok"]["maximum"] == (
+        mcp_status.MAX_RECENT_TURNS)
+    assert runtime["properties"]["recent_total"] == {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": mcp_status.MAX_RECENT_TURNS,
+        "description": (
+            "Number of recent observed chat turns in the bounded window."
+        ),
+    }
+    kind_pattern = runtime["properties"]["last_kind"]["pattern"]
+    assert re.fullmatch(kind_pattern, "available")
+    assert re.fullmatch(kind_pattern, "transport_failure")
+    assert not re.fullmatch(kind_pattern, "https://secret.example")
 
     approval_schemas = [
         upsert["properties"]["read_only_tool_fingerprints"],
@@ -646,6 +668,11 @@ def test_mcp_probe_and_approval_contract_matches_runtime_limits(
         "too_many_read_only_tool_fingerprints",
     ):
         assert kind in post_description
+
+    list_description = operations[("get", "/v1/mcp/servers")]["description"]
+    assert "Hosted Runtime V2" in list_description
+    assert "runtime field is omitted" in list_description
+    assert "absence is not evidence" in list_description
 
     patch_operation = operations[("patch", "/v1/mcp/servers/{name}")]
     assert "invalid_enabled" in patch_operation["description"]

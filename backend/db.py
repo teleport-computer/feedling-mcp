@@ -1123,6 +1123,51 @@ def admin_data_track_snapshot(user_ids: list[str]) -> dict[str, dict]:
                 """
                 SELECT user_id,
                        COUNT(*)::int AS total,
+                       MAX(ts) AS latest_ts,
+                       COUNT(*) FILTER (
+                         WHERE body_key IS NULL
+                       )::int AS inline_count,
+                       COUNT(*) FILTER (
+                         WHERE body_key IS NOT NULL
+                       )::int AS r2_count
+                FROM frame_envelopes
+                WHERE user_id = ANY(%s)
+                GROUP BY user_id
+                """,
+                (ids,),
+            ).fetchall()
+            for uid, total, latest_ts, inline_count, r2_count in rows:
+                ensure(out, uid)["screen_frames"] = {
+                    "total": total,
+                    "latest_ts": latest_ts,
+                    "inline_count": inline_count,
+                    "r2_count": r2_count,
+                }
+
+            rows = conn.execute(
+                """
+                SELECT user_id,
+                       doc->'broadcast_state'->>'v' AS broadcast_state,
+                       doc->'broadcast_state'->>'ts' AS broadcast_state_ts,
+                       doc->'broadcast_active'->>'v' AS broadcast_active,
+                       doc->'broadcast_active'->>'ts' AS broadcast_active_ts
+                FROM user_blobs
+                WHERE user_id = ANY(%s) AND kind = 'perception_state'
+                """,
+                (ids,),
+            ).fetchall()
+            for uid, state, state_ts, active, active_ts in rows:
+                ensure(out, uid)["screen_broadcast"] = {
+                    "broadcast_state": state,
+                    "broadcast_state_ts": state_ts,
+                    "broadcast_active": active,
+                    "broadcast_active_ts": active_ts,
+                }
+
+            rows = conn.execute(
+                """
+                SELECT user_id,
+                       COUNT(*)::int AS total,
                        MIN(NULLIF(doc->>'created_at', '')) AS first_created_at,
                        MAX(NULLIF(doc->>'created_at', '')) AS last_created_at,
                        MIN(NULLIF(doc->>'occurred_at', '')) AS earliest_occurred_at,
@@ -2545,8 +2590,9 @@ def admin_data_track_retention_daily(
 
     Cohort = signup Beijing day (``granularity="day"``) or Beijing ISO week
     (``"week"``, labeled by the Monday). D_N = share of the cohort active exactly
-    N days after EACH member's own signup day (activity = a user chat message or
-    a tracking event — identical to the DAU definition). Only signups on/after
+    N days after EACH member's own signup day (activity = an app_session_end
+    foreground session — the 使用 DAU/打开App ruler; the SQL below is the truth,
+    an older draft of this docstring claimed the broad chat∪tracking ruler). Only signups on/after
     ``since_day`` (the freeze boundary) count; pre-freeze days drift as accounts
     delete and are excluded entirely per the product decision.
 
@@ -2647,7 +2693,8 @@ def admin_data_track_growth_accounting(
     the active set into new / resurrected / retained, plus churned (users active
     the prior day but not today) and Quick Ratio = (new+resurrected)/churned.
 
-    active = a user chat message or tracking event that day (DAU definition).
+    active = an app_session_end foreground session that day (使用 DAU/打开App
+    ruler — matches the SQL below; an older docstring claimed chat∪tracking).
     new = signed up that day; resurrected = active today, existed before, but was
     not active yesterday; retained = active both days. Iterates every calendar
     day from ``since_day`` to today so a zero-activity gap correctly shows as
@@ -3813,6 +3860,121 @@ def admin_home_cost(*, tz: str = "Asia/Shanghai") -> dict:
         "runaway": runaway,
         "coverage": coverage,
     }
+
+
+def admin_home_pulse_story(*, tz: str = "Asia/Shanghai") -> dict:
+    """首页脉搏第二排「故事数字」：留存曲线加权值 / 发消息深度 / DAU 构成。
+
+    三块的尺子都已对齐到既有页面（上板前一致性审查 2026-08-07）：
+    - curve：对增长页的逐日 cohort 留存网格加权平均 D1/D7/D14/D30——
+      活跃口径 = app_session_end（使用 DAU，与 dau/growth 同一把尺，实为
+      SQL 现状），live 重算、随删号回缩、只算冻结边界后注册的 cohort。
+      cell 为 None（cohort 未活到那一天）不进分母；某列所有 cohort 都
+      未成熟 → 该列 None（未成熟 ≠ 0）。flat_pp = D7−D14 百分点差，
+      两列都有值才给（正=还在掉，越接近 0 越平）。
+    - depth：最近一个已冻结北京日的 chat_dau ÷ session_dau（发消息的人
+      ÷ 打开 App 的人，同日同一张冻结快照，绝不跨源拼比值），外加近 7
+      个冻结日的加权均值。分母 0 → None。
+    - mix：最近一个已完整北京日（昨天）的 DAU 构成，与增长核算同源同尺
+      （app_session_end），live 重算；new_blood_pct = 当日活跃者中注册
+      不满 28 天者占比（created_at 严格 CASE 解析，坏值静默出局）。
+
+    全部有界（快照表 LIMIT 7 / 网格自冻结边界 / 单日活跃集），失败一律
+    RAISE——admin_core 兜成 None，页面显「暂不可用」不显 0。
+    """
+    zone = _ph_zone(tz)
+    today = datetime.now(zone).date()
+
+    bounds = admin_dau_snapshot_bounds()
+    freeze_day = str(bounds.get("first_day") or "")
+    curve: dict = {"d1": None, "d7": None, "d14": None, "d30": None, "flat_pp": None}
+    if freeze_day:
+        grid = admin_data_track_retention_daily(
+            tz=tz, since_day=freeze_day, granularity="day"
+        )
+        acc = {k: [0.0, 0] for k in ("1", "7", "14", "30")}
+        for c in grid.get("cohorts") or []:
+            n = int(c.get("size") or 0)
+            cells = c.get("cells") or {}
+            for k in acc:
+                v = cells.get(k)
+                if v is not None and n > 0:
+                    acc[k][0] += n * float(v) / 100.0
+                    acc[k][1] += n
+        for k, out_key in (("1", "d1"), ("7", "d7"), ("14", "d14"), ("30", "d30")):
+            kept, n = acc[k]
+            if n > 0:
+                curve[out_key] = {"pct": kept / n * 100.0, "n": n}
+        if curve["d7"] is not None and curve["d14"] is not None:
+            curve["flat_pp"] = curve["d7"]["pct"] - curve["d14"]["pct"]
+
+    with get_pool().connection() as conn:
+        depth_rows = conn.execute(
+            """
+            SELECT day, chat_dau, session_dau FROM dau_daily_snapshot
+            ORDER BY day DESC LIMIT 7
+            """,
+        ).fetchall()
+    depth: dict | None = None
+    if depth_rows:
+        latest_day, latest_chat, latest_sess = (
+            str(depth_rows[0][0]), int(depth_rows[0][1] or 0), int(depth_rows[0][2] or 0),
+        )
+        chat_sum = sum(int(r[1] or 0) for r in depth_rows)
+        sess_sum = sum(int(r[2] or 0) for r in depth_rows)
+        depth = {
+            "day": latest_day,
+            "pct": (latest_chat / latest_sess * 100.0) if latest_sess else None,
+            "avg7_pct": (chat_sum / sess_sum * 100.0) if sess_sum else None,
+        }
+
+    mix: dict | None = None
+    if freeze_day:
+        acct = admin_data_track_growth_accounting(tz=tz, since_day=freeze_day)
+        complete = [
+            r for r in (acct.get("rows") or [])
+            if str(r.get("day") or "") < today.isoformat()
+        ]
+        if complete:
+            last = complete[-1]
+            day_text = str(last.get("day") or "")
+            day_start = _ph_day_epoch(date.fromisoformat(day_text), zone)
+            day_end = _ph_day_epoch(date.fromisoformat(day_text) + timedelta(days=1), zone)
+            # timestamptz 字面量自带时区偏移，比较时 PG 自行换算——不用
+            # 手工转 UTC。
+            cutoff = datetime.combine(
+                date.fromisoformat(day_text) - timedelta(days=28),
+                datetime.min.time(), tzinfo=zone,
+            ).isoformat()
+            with get_pool().connection() as conn:
+                ca = _ph_created_at_sql(conn)
+                row = conn.execute(
+                    f"""
+                    WITH act AS (
+                        SELECT DISTINCT user_id FROM user_logs
+                        WHERE stream = 'tracking_events'
+                          AND doc->>'type' = 'app_session_end'
+                          AND ts >= %s AND ts < %s
+                    )
+                    SELECT count(*)::int,
+                           count(*) FILTER (
+                               WHERE ({ca}) >= %s::timestamptz
+                           )::int
+                    FROM act JOIN users USING (user_id)
+                    """,
+                    (day_start, day_end, cutoff),
+                ).fetchone()
+            active_n, fresh_n = int(row[0] or 0), int(row[1] or 0)
+            mix = {
+                "day": day_text,
+                "active": int(last.get("active") or 0),
+                "retained": last.get("retained"),
+                "resurrected": last.get("resurrected"),
+                "new": last.get("new"),
+                "new_blood_pct": (fresh_n / active_n * 100.0) if active_n else None,
+            }
+
+    return {"curve": curve, "depth": depth, "mix": mix}
 
 
 def admin_home_soft_verdicts(*, tz: str = "Asia/Shanghai") -> dict:
@@ -5548,7 +5710,14 @@ _hosted_runtime_config_lock_users: ContextVar[frozenset[str]] = ContextVar(
     "hosted_runtime_config_lock_users",
     default=frozenset(),
 )
-_hosted_runtime_config_connection_slots = threading.BoundedSemaphore(1)
+# Bound the number of long-lived, pool-external advisory-lock sessions without
+# serializing unrelated users behind one process-wide slot. Eight supports the
+# hosted-provider validation fan-out while remaining a small fixed addition to
+# each backend worker's ordinary connection pool budget.
+_HOSTED_RUNTIME_CONFIG_CONNECTION_SLOT_COUNT = 8
+_hosted_runtime_config_connection_slots = threading.BoundedSemaphore(
+    _HOSTED_RUNTIME_CONFIG_CONNECTION_SLOT_COUNT
+)
 _HOSTED_RUNTIME_CONFIG_LOCK_WAIT_SEC = 5.0
 
 
@@ -5561,10 +5730,12 @@ def hosted_runtime_config_mutation_lock(user_id: str):
     """Serialize one user's config mutation and runtime-generation rotation.
 
     The lock is session-level and pool-external because provider validation can
-    span a network call. A one-slot process-local semaphore is acquired *before*
+    span a network call. A bounded process-local semaphore is acquired *before*
     opening that connection, so a burst of settings requests waits in Python
-    rather than consuming one PostgreSQL session per waiter. Both the local and
-    cross-process waits are deadline-bounded. ContextVar reentrancy lets route
+    rather than consuming an unbounded PostgreSQL session per waiter. Different
+    users may use separate slots concurrently; the advisory lock remains the
+    authoritative per-user serializer. Both the local and cross-process waits
+    are deadline-bounded. ContextVar reentrancy lets route
     creation call route activation and lets setup call the runtime transition
     without trying to acquire the same advisory lock on a second connection.
     """
@@ -12950,6 +13121,37 @@ def frame_exists(user_id: str, frame_id: str) -> bool:
     except Exception as e:
         log.error("[db] frame_exists(%s,%s) failed: %s", user_id, frame_id, e)
         return False
+
+
+def perception_broadcast_meta(user_id: str) -> dict:
+    """Return only the broadcast state/value cells needed for screen health.
+
+    The perception_state blob contains many unrelated user readings. Screen
+    liveness must not load or expose that document just to compare two
+    metadata timestamps, so this SQL projects only the four scalar fields.
+    """
+    try:
+        with get_pool().connection() as conn:
+            row = conn.execute(
+                "SELECT doc->'broadcast_state'->>'v', "
+                "       doc->'broadcast_state'->>'ts', "
+                "       doc->'broadcast_active'->>'v', "
+                "       doc->'broadcast_active'->>'ts' "
+                "FROM user_blobs "
+                "WHERE user_id = %s AND kind = 'perception_state'",
+                (user_id,),
+            ).fetchone()
+    except Exception as e:
+        log.error("[db] perception_broadcast_meta(%s) failed: %s", user_id, e)
+        return {}
+    if row is None:
+        return {}
+    return {
+        "broadcast_state": row[0],
+        "broadcast_state_ts": row[1],
+        "broadcast_active": row[2],
+        "broadcast_active_ts": row[3],
+    }
 
 
 def frame_get(user_id: str, frame_id: str) -> dict | None:

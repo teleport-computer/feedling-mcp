@@ -26,6 +26,7 @@ from chat import consumer as chat_consumer
 from memory import service as memory_service
 from notices import core as notices_core
 from proactive import service as proactive_service
+from screen import screen_read_core
 from bootstrap import gates as boot_gates
 from core import store as core_store
 from core import util as core_util
@@ -318,6 +319,19 @@ def _memory_capture_validation_detail(store: UserStore, *, limit: int = 50) -> d
 
 
 def _proactive_stats(store: UserStore) -> dict:
+    """⚠️ 这个块读的是 **V1 口径**:`proactive_jobs` 日志 + `source ==
+    agent_initiated_proactive` 的聊天行。
+
+    Runtime V2 两样都不用:唤醒 job 在 `agent_jobs`(lane =
+    heartbeat/scheduled/manual_wake/screen_watch),回复行一律
+    `append_chat("openclaw", "model_api", …)`,靠行上的 `wake_kind` 标记才认得出是
+    主动开口。所以对 V2 用户,这里的 `heartbeat_jobs` / `proactive_messages` 会是
+    **结构性的 0**,而那堆 `pending` 是 V2 下无人排空的旧流死行
+    (`v2/serve_worker.py:_fire_scheduled_for_user` 注释里的 BUG-3)。
+
+    2026-08-10 我就是拿这块去判一个 V2 用户,差点报「你心跳十天没跑了」。调用方
+    `_build_data_track_user` 现在按运行时分流并显式标注口径,见 `_v2_proactive_stats`。
+    """
     decisions = store.list_gate_decisions(limit=0)
     jobs = store.list_proactive_jobs(limit=0)
     device_events = store.list_device_events(limit=0)
@@ -745,6 +759,33 @@ def _data_track_chat_from_snapshot(snap: dict) -> dict:
         "last_user_at": _data_track_iso(chat.get("last_user_ts")),
         "last_agent_at": _data_track_iso(chat.get("last_agent_ts")),
         "proactive_last_at": _data_track_iso(chat.get("proactive_last_ts")),
+    }
+
+
+def _data_track_screen_frames_from_snapshot(snap: dict) -> dict:
+    frames = dict(snap.get("screen_frames") or {})
+    broadcast = dict(snap.get("screen_broadcast") or {})
+    latest_ts = frames.get("latest_ts")
+    latest_epoch = core_util._to_epoch(latest_ts)
+    latest_age_sec = (
+        int(max(0, time.time() - latest_epoch)) if latest_epoch else None
+    )
+    broadcast_active = screen_read_core.broadcast_report_is_recently_active(
+        broadcast, now=time.time()
+    )
+    broadcast_stalled = bool(
+        broadcast_active
+        and latest_age_sec is not None
+        and latest_age_sec > screen_read_core.SCREEN_SHARE_STALLED_SEC
+    )
+    return {
+        "total": int(frames.get("total") or 0),
+        "latest_at": _data_track_iso(latest_ts),
+        "latest_age_sec": latest_age_sec,
+        "inline_count": int(frames.get("inline_count") or 0),
+        "r2_count": int(frames.get("r2_count") or 0),
+        "broadcast_report_active": broadcast_active,
+        "broadcast_stalled": broadcast_stalled,
     }
 
 
@@ -1212,6 +1253,7 @@ def _build_data_track_user_fast(user_entry: dict, snap: dict) -> dict:
         },
         "last_activity_at": core_util._epoch_to_iso(latest_epoch),
         "chat": chat,
+        "screen_frames": _data_track_screen_frames_from_snapshot(snap),
         "memory": memory,
         "proactive": proactive,
         "connection": _connection_health(route, access_modes, chat),
@@ -1405,6 +1447,108 @@ def _v2_chat_failures_detail(user_id: str) -> dict:
         return {"error": f"{type(e).__name__}:{str(e)[:120]}"}
 
 
+PROACTIVE_V1_LENS = "v1_proactive_jobs_log"
+PROACTIVE_V1_LENS_NOTE = (
+    "V1 口径:proactive_jobs 日志 + source=agent_initiated_proactive 的聊天行。"
+    "Runtime V2 的唤醒 job 在 agent_jobs、回复行 source 恒为 model_api,"
+    "因此 V2 用户在本块里的计数结构性为 0,pending 多为 V2 下无人排空的旧流死行。"
+    "V2 请看 v2_wake_activity / v2_wake_schedule。"
+)
+
+
+def _with_proactive_lens(block: dict) -> dict:
+    """给 V1 口径的 proactive 块贴上口径标注。
+
+    抽成函数而不是在调用点直接赋值,是为了让测试能真的绑住它——直接赋值的话,
+    测试只能自己造个 dict 再断言,production 删掉标注也照样绿(我第一版就是这么
+    写的,自己撞上了 TESTING.md 里那条「守卫本身在撒谎」)。
+
+    为什么必须标:V2 用户在这个块里看到的 0 是「没测量」而不是「没发生」,
+    不打标就会被读成故障——2026-08-10 我本人据此差点误报「心跳十天没跑」。
+    """
+    out = dict(block or {})
+    out["lens"] = PROACTIVE_V1_LENS
+    out["lens_note"] = PROACTIVE_V1_LENS_NOTE
+    return out
+
+
+def _v2_wake_activity_detail(user_id: str) -> dict:
+    """V2 主动唤醒的真实活动(按 lane)。
+
+    与 `proactive` 块互补且**不可互相替代**:那个块是 V1 口径,对 V2 用户结构性显示
+    0;这个块读的是 `agent_jobs`。两处的 lane 词汇也不同(见 `core/store.py` 的
+    `wake_kind` 注释:只有 screen_watch 重叠),不要跨着 join。
+    """
+    try:
+        from model_api_runtime.v2 import jobs_store as _v2_jobs_store
+        return _v2_jobs_store.wake_lane_activity_for_user(user_id)
+    except Exception as e:  # noqa: BLE001 — observability must never 500 the page
+        return {"error": f"{type(e).__name__}:{str(e)[:120]}"}
+
+
+def _v2_wake_schedule_detail(user_id: str, settings: dict | None) -> dict:
+    """`v2_wake_schedule` 那一行 + **「现在为什么不到期」的确定结论**。
+
+    这张表决定主动消息发不发,而 2026-08-10 之前它在管理端一个字段都看不到——
+    我只能靠读源码反推「是 NULL 还是支付冷却还是退避」。
+
+    `blocked_by` 交给 `jobs_store.heartbeat_due_diagnosis` 求值,**它跑的是
+    `due_heartbeat_users` 的同一份判据**(含 backoff 的真人发言逃生口)。
+    绝不在这里用 Python 重写一遍规则:support 面板给出的结论与调度器实际规则不一致,
+    就是又造了一个「看起来在测量、其实没有」的信号——正是本批要消灭的东西。
+
+    只出时间与计数,不出任何用户内容。
+    """
+    try:
+        from model_api_runtime.v2 import jobs_store as _v2_jobs_store
+
+        row = _v2_jobs_store.get_wake_schedule(str(user_id))
+        diagnosis = _v2_jobs_store.heartbeat_due_diagnosis(str(user_id))
+    except Exception as e:  # noqa: BLE001 — observability must never 500 the page
+        return {"error": f"{type(e).__name__}:{str(e)[:120]}"}
+
+    if row is None:
+        # 不要显示成空:「没有行」本身就是一个结论——调度器从没接管过这个用户,
+        # 心跳因此永远不会到期(`due_heartbeat_users` 要求 next_heartbeat_at 非空)。
+        return {
+            "present": False,
+            "blocked_by": ["no_schedule_row"],
+            "note": "该用户尚未被 V2 调度器接管过（无 v2_wake_schedule 行）",
+        }
+
+    def _epoch(key: str) -> float:
+        try:
+            return float(row.get(key) or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    def _iso(key: str) -> str:
+        value = _epoch(key)
+        return _data_track_iso(value) if value else ""
+
+    return {
+        "present": True,
+        "now": _data_track_iso(time.time()),
+        # ⚠️ 只列 `v2_wake_schedule` **真实存在**的列。我第一版凭印象写了
+        # `next_scheduled_at`,那一列根本不存在,于是永远是空字符串——一个空值会被
+        # 读成「这个用户没有定时任务」,和本批要修的病一模一样(codex 复验抓出)。
+        # 定时任务的真源是 `user_logs` 的 SCHEDULED_WAKE_STREAM（`due_scheduled_users`），
+        # 不在这张表里;本块不假装知道,见下面的 scheduled_timers_source。
+        "next_heartbeat_at": _iso("next_heartbeat_at"),
+        "next_capture_at": _iso("next_capture_at"),
+        "next_screen_watch_at": _iso("next_screen_watch_at"),
+        "payment_cooldown_until": _iso("payment_cooldown_until"),
+        "proactive_backoff_until": _iso("proactive_backoff_until"),
+        "proactive_fail_streak": int(row.get("proactive_fail_streak") or 0),
+        "proactive_fail_user_seq": int(row.get("proactive_fail_user_seq") or 0),
+        "self_wake_streak": int(row.get("self_wake_streak") or 0),
+        "dnd": bool((settings or {}).get("dnd", False)),
+        "scheduled_timers_source": "user_logs/scheduled_wake（不在 v2_wake_schedule 内）",
+        # 空列表 = 现在就该到期。非空 = 这些条件挡着,判据与调度器同源。
+        "blocked_by": list(diagnosis.get("blocked_by") or []),
+    }
+
+
 def _v2_profile_detail(user_id: str) -> dict:
     """Return the Runtime V2 profile's content-free support metadata only.
 
@@ -1500,7 +1644,7 @@ def _build_data_track_user(user_entry: dict, *, include_detail: bool = False) ->
     steps_done = sum(1 for s in steps if bool(s.get("passing")))
     chat = _chat_stats(store)
     memory = _memory_stats(store)
-    proactive = _proactive_stats(store)
+    proactive = _with_proactive_lens(_proactive_stats(store))
     push = _push_stats(store)
     events_limit = _data_track_query_int(
         "events_limit",
@@ -1581,6 +1725,9 @@ def _build_data_track_user(user_entry: dict, *, include_detail: bool = False) ->
         )
         detail_snapshot = db.admin_data_track_snapshot([user_id]).get(user_id, {})
         row["app_usage"] = _data_track_app_usage_from_snapshot(detail_snapshot)
+        row["screen_frames"] = _data_track_screen_frames_from_snapshot(
+            detail_snapshot
+        )
         # Same key the list rows carry (_build_data_track_user_fast), so a
         # client reading one shape can read the other.
         row["user_mcp"] = _data_track_user_mcp_from_snapshot(detail_snapshot)
@@ -1608,6 +1755,12 @@ def _build_data_track_user(user_entry: dict, *, include_detail: bool = False) ->
         row["v2_profile"] = _v2_profile_detail(user_id)
         row["memory_capture_validation"] = _memory_capture_validation_detail(store)
         _ps = store.load_proactive_settings()
+        # 主动侧的 V2 真相:上面的 `proactive` 块是 V1 口径,对 V2 用户结构性显示 0
+        # (唤醒 job 在 agent_jobs、回复行 source 恒为 model_api)。这两个块补上
+        # 「真跑了多少」与「现在为什么不到期」——2026-08-10 少了它们,我拿 V1 口径
+        # 的 0 差点判成「心跳十天没跑」。
+        row["v2_wake_activity"] = _v2_wake_activity_detail(user_id)
+        row["v2_wake_schedule"] = _v2_wake_schedule_detail(user_id, _ps)
         row["perception_permissions"] = {
             # what the device reports it granted (free-form; keys are app-defined,
             # e.g. photos / screen / location / health / motion / calendar / audio)
@@ -2647,8 +2800,19 @@ def _fmt_tokens_compact(value) -> str:
     return str(n)
 
 
-def _spark(values: list, *, good_when: str = "neutral") -> str:
-    """64×20 内联 SVG 折线 sparkline，纯静态无 JS。
+def _spark(
+    values: list,
+    *,
+    good_when: str = "neutral",
+    labels: list | None = None,
+    width: float = 64.0,
+    height: float = 20.0,
+) -> str:
+    """内联 SVG 折线 sparkline，纯静态无 JS（默认 64×20）。
+
+    labels 给出每个点的悬浮说明（如「08-06 · 98」）时，每个点上叠一条
+    全高透明命中列 + SVG <title>——浏览器原生 hover 提示，零 JS，缓存
+    出来的静态页也能用。点本身画成小圆点，缺 label 时保持旧的纯折线。
 
     None 是「缺数据」不是 0：缺的点断成缺口，绝不画成落零——和
     _fmt_count 的未知≠0 语义一致。全缺时渲染灰 — 占位。描边一律
@@ -2656,7 +2820,9 @@ def _spark(values: list, *, good_when: str = "neutral") -> str:
     嵌进什么底色的页面都不用改 SVG 本身。good_when 只决定首尾趋势的
     好坏着色：'up' 涨绿跌红、'down' 反之、'neutral' 一律灰（如 token
     总量，烧多烧少不预设立场）。"""
-    width, height, pad = 64.0, 20.0, 2.5
+    width = float(width); height = float(height)
+    pad = 2.5 if height <= 20 else 3.5
+    labels = list(labels) if labels else []
     pts: list[float | None] = []
     for v in values or []:
         if v is None:
@@ -2708,6 +2874,27 @@ def _spark(values: list, *, good_when: str = "neutral") -> str:
                 f"<polyline points='{attr}' fill='none' stroke='currentColor'"
                 " stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'/>"
             )
+    if labels:
+        # 数据点画成可见小圆点 + 全高命中列（透明），列里挂 <title>：
+        # hover 任意横向位置都能读到「哪天 · 多少」。命中列在折线之后
+        # 渲染，天然盖在上层接管 hover。
+        col_w = (width - 2 * pad) / max(1, n - 1) if n > 1 else width
+        for i, p in enumerate(pts):
+            if p is None:
+                continue
+            parts.append(
+                f"<circle cx='{px(i):.1f}' cy='{py(p):.1f}' r='1.8'"
+                " fill='currentColor'/>"
+            )
+        for i in range(n):
+            if i >= len(labels) or not labels[i]:
+                continue
+            x0 = px(i) - col_w / 2
+            parts.append(
+                f"<rect x='{x0:.1f}' y='0' width='{col_w:.1f}' height='{height:.1f}'"
+                " fill='transparent' pointer-events='all'>"
+                f"<title>{html.escape(str(labels[i]))}</title></rect>"
+            )
     cls = ""
     if good_when in ("up", "down"):
         first = next(p for p in pts if p is not None)
@@ -2716,9 +2903,11 @@ def _spark(values: list, *, good_when: str = "neutral") -> str:
             rising = last > first
             good = rising if good_when == "up" else not rising
             cls = " good" if good else " bad"
+    aria = "" if labels else " aria-hidden='true'"
     return (
-        f"<span class='spark{cls}' aria-hidden='true'>"
-        f"<svg viewBox='0 0 64 20' width='64' height='20'>{''.join(parts)}</svg>"
+        f"<span class='spark{cls}'{aria}>"
+        f"<svg viewBox='0 0 {width:.0f} {height:.0f}' width='{width:.0f}' height='{height:.0f}'>"
+        f"{''.join(parts)}</svg>"
         "</span>"
     )
 
@@ -3409,6 +3598,8 @@ _RUNTIME_PAGE_CSS = _NAV_GROUP_CSS + """
     .dimension-scope { margin-top:8px; color:var(--muted); font-size:11px; line-height:1.4; }
     .overall-summary { margin:12px 0 3px; color:var(--muted); font-size:13px; font-weight:650; }
     .table-wrap { max-width:100%; overflow-x:auto; }
+    .human-summary { font-size:17px; line-height:1.6; margin:14px 0 4px; padding:12px 16px; background:var(--card); border:1px solid var(--line); border-radius:8px; }
+    .human-summary b { font-size:19px; }
     .ops-kicker { color:var(--accent); font-size:11px; font-weight:800; letter-spacing:.11em; text-transform:uppercase; }
     .ops-window { display:flex; flex-wrap:wrap; align-items:center; gap:8px; margin:18px 0; }
     .ops-window-label { margin-right:3px; color:var(--muted); font-size:12px; }
@@ -5585,6 +5776,56 @@ def _home_status_card(
     )
 
 
+def _home_human_summary(
+    pulse: dict | None, story: dict | None, queue: dict | None
+) -> str:
+    """首页顶部的人话总结：一句话说完水位/留存/工单。
+
+    诚实规则同全站：某块数据缺失就整句丢掉对应从句，绝不编数；三块全缺
+    就不渲染这一行。数字全部与下方板块同源（脉搏 WAU、故事数字 D14、
+    队列行数），不另起口径。"""
+    clauses: list[str] = []
+    wau = (pulse or {}).get("wau")
+    prev_wau = (pulse or {}).get("prev_wau")
+    if wau is not None:
+        head = f"近 7 天 <b>{int(wau)}</b> 人在用"
+        try:
+            diff = int(wau) - int(prev_wau)
+        except (TypeError, ValueError):
+            diff = None
+        if diff is not None and diff != 0:
+            head += f"（比上一周{'多' if diff > 0 else '少'} {abs(diff)} 个）"
+        elif diff == 0:
+            head += "（和上一周持平）"
+        clauses.append(head)
+    d14 = ((story or {}).get("curve") or {}).get("d14")
+    if isinstance(d14, dict) and d14.get("pct") is not None:
+        try:
+            kept = int(round(float(d14["pct"])))
+            clauses.append(f"新来 100 个能留住 <b>{kept}</b> 个")
+        except (TypeError, ValueError):
+            pass
+    if queue is not None:
+        rows = [r for r in (queue.get("rows") or []) if isinstance(r, dict)]
+        if rows:
+            plus = "+" if queue.get("truncated") else ""
+            clauses.append(f"<b>{len(rows)}{plus}</b> 个人卡住等你")
+        else:
+            clauses.append("没有人卡住")
+    if not clauses:
+        return ""
+    hint = (
+        "在用=近 7 完整北京日打开过 App；留住=注册日 cohort 加权 D14；"
+        "卡住=下方「需要你的用户」名单。都和下方板块同源，缺数的从句直接省略。"
+    )
+    return (
+        "<div class='human-summary'>"
+        + "；".join(clauses)
+        + f"。<span class='hint' title='{html.escape(hint, quote=True)}'>?</span>"
+        "</div>"
+    )
+
+
 def _home_queue_section(queue: dict | None) -> str:
     # 用户详情链接沿用 users 页的 qs 透传模式（admin_key 等跟着走）；view
     # 参数属于当前页，不带进详情页。
@@ -5683,6 +5924,10 @@ def _home_pulse_section(pulse: dict | None) -> str:
     health_href = html.escape(_data_track_page_href(view="health"), quote=True)
     daily = [d for d in (pulse.get("daily_actives") or []) if isinstance(d, dict)]
     dau_values = [d.get("dau") for d in daily]
+    dau_labels = [
+        f"{str(d.get('day') or '')[5:]} · {d.get('dau') if d.get('dau') is not None else '—'}"
+        for d in daily
+    ]
     wau = pulse.get("wau")
     prev_wau = pulse.get("prev_wau")
     latest_day = daily[-1] if daily else {}
@@ -5732,6 +5977,16 @@ def _home_pulse_section(pulse: dict | None) -> str:
         None if str(c.get("cohort_week")) == this_monday else c.get("t3_rate")
         for c in reversed(activation)
     ]
+    act_spark_labels = [
+        (f"{str(c.get('cohort_week') or '')[5:]} 周 · 进行中不计"
+         if str(c.get("cohort_week")) == this_monday
+         else (
+             f"{str(c.get('cohort_week') or '')[5:]} 周 · "
+             + (f"{float(c.get('t3_rate')) * 100:.1f}%" if c.get("t3_rate") is not None else "未知")
+             + f"（n={c.get('n')}）"
+         ))
+        for c in reversed(activation)
+    ]
 
     def card(value_html: str, spark_html: str, delta_html: str, label: str, hint: str, sub: str) -> str:
         hint_html = f"<span class='hint' title='{html.escape(hint, quote=True)}'>?</span>"
@@ -5746,7 +6001,7 @@ def _home_pulse_section(pulse: dict | None) -> str:
     cards = "".join([
         card(
             _fmt_count(wau),
-            _spark(dau_values, good_when="up"),
+            _spark(dau_values, good_when="up", labels=dau_labels, width=150, height=34),
             _render_delta(wau, prev_wau),
             "7日活跃真人",
             "近 7 个已完整北京自然日的去重活跃账号（与 DAU 页同源）；环比对上一个 7 完整日窗口；折线是逐日 DAU",
@@ -5762,7 +6017,7 @@ def _home_pulse_section(pulse: dict | None) -> str:
         ),
         card(
             act_value,
-            _spark(act_spark_values, good_when="up"),
+            _spark(act_spark_values, good_when="up", labels=act_spark_labels, width=150, height=34),
             "",
             "激活率（t3）",
             "最新已完整注册周 cohort 中注册后产生首条非 fallback 真回复（t3，不限天数）的比例；进行中的周右删失不当定局；覆盖不完整的周是缺口不是 0；折线为近 4 个 cohort（进行中的周留空）",
@@ -5807,6 +6062,11 @@ def _home_cost_section(cost: dict | None) -> str:
         )
     daily = [d for d in (cost.get("daily_tokens") or []) if isinstance(d, dict)]
     token_values = [d.get("tokens") for d in daily]
+    token_labels = [
+        f"{str(d.get('day') or '')[5:]} · "
+        + (_fmt_tokens_compact(d.get("tokens")) if d.get("tokens") is not None else "缺报")
+        for d in daily
+    ]
     runaway = cost.get("runaway")
     if runaway is True:
         runaway_html = "<span class='pill bad'>放量异常</span>"
@@ -5841,7 +6101,7 @@ def _home_cost_section(cost: dict | None) -> str:
     )
     return (
         "<div class='cost-line'>"
-        f"<div class='cost-item'>近 7 日 token 走势{hint}{_spark(token_values, good_when='neutral')}</div>"
+        f"<div class='cost-item'>近 7 日 token 走势{hint}{_spark(token_values, good_when='neutral', labels=token_labels, width=150, height=30)}</div>"
         f"<div class='cost-item'>今日已用（进行中）<b>{_fmt_tokens_compact(cost.get('today_so_far'))}</b></div>"
         f"<div class='cost-item'>每活跃用户日<b>{per_active_value}</b></div>"
         f"<div class='cost-item'>放量判定<b>{runaway_html}</b></div>"
@@ -5849,6 +6109,139 @@ def _home_cost_section(cost: dict | None) -> str:
         f"<div class='cost-item'><a href='{usage_href}'>去 Token 与模型 →</a></div>"
         "</div>"
         + coverage_note
+    )
+
+
+def _home_story_section(story: dict | None, funnel: dict | None) -> str:
+    """脉搏第二排「故事数字」：留存曲线 / 发消息深度 / DAU 构成 / 注册环比。
+
+    与第一排同一套诚实规则：builder 失败整排显「暂不可用」；单块缺数显
+    —；进行中周期不进任何分母。注册环比直接读漏斗快照的 cur/prev（同一
+    份数据不再另查）,_render_delta 的小样本中性规则自动生效。"""
+    if story is None:
+        return (
+            "<div class='note-box'><b>故事数字暂不可用。</b>"
+            "留存曲线/深度/构成的查询失败按未知处理，不会渲染成 0。</div>"
+        )
+    tiles: list[str] = []
+
+    curve = story.get("curve") or {}
+
+    def _pt(key: str):
+        cell = curve.get(key)
+        if not isinstance(cell, dict):
+            return None
+        try:
+            return float(cell.get("pct"))
+        except (TypeError, ValueError):
+            return None
+
+    d1, d7, d14, d30 = _pt("d1"), _pt("d7"), _pt("d14"), _pt("d30")
+    if d1 is not None or d7 is not None:
+        parts = []
+        for lbl, v in (("D1", d1), ("D7", d7), ("D14", d14), ("D30", d30)):
+            parts.append(f"{lbl} {v:.0f}%" if v is not None else f"{lbl} —")
+        flat_pp = curve.get("flat_pp")
+        if flat_pp is not None and abs(float(flat_pp)) <= 3.0:
+            flat_html = (
+                f"<span class='pill ok' title='D7→D14 差 {float(flat_pp):.1f}pp（阈值 ≤3pp）；"
+                "D30 长出来之前只是一周的平'>D7→D14 趋平</span>"
+            )
+        elif flat_pp is not None:
+            flat_html = f"<span class='muted'>D7→D14 −{float(flat_pp):.1f}pp</span>"
+        else:
+            flat_html = "<span class='muted'>D14 未成熟</span>"
+        n7 = (curve.get("d7") or {}).get("n")
+        spark = _spark(
+            [d1, d7, d14, d30],
+            labels=[
+                f"D1 · {d1:.1f}%" if d1 is not None else "D1 · 未成熟",
+                f"D7 · {d7:.1f}%" if d7 is not None else "D7 · 未成熟",
+                f"D14 · {d14:.1f}%" if d14 is not None else "D14 · 未成熟",
+                f"D30 · {d30:.1f}%" if d30 is not None else "D30 · 未成熟（8 月中旬起自动出数）",
+            ],
+            width=100, height=30,
+        )
+        tiles.append(_render_metric(
+            "留存曲线（注册日 cohort 加权）",
+            " · ".join(parts[:3]),
+            hint=(
+                "对增长页逐日 cohort 网格按规模加权：D_N=注册后第 N 天仍打开"
+                " App 的比例（app_session_end 口径，live 重算、随删号回缩、"
+                "冻结边界后 cohort）。未成熟列显 —，不当 0"
+            ),
+            delta=f"{spark}{flat_html}",
+        ) + (f"<div class='muted' style='font-size:11px'>n={int(n7)}（D7 列分母）</div>" if n7 else ""))
+
+    depth = story.get("depth")
+    if isinstance(depth, dict):
+        pct = depth.get("pct")
+        avg7 = depth.get("avg7_pct")
+        tiles.append(_render_metric(
+            "发消息深度（昨冻结日）",
+            f"{float(pct):.0f}%" if pct is not None else "—",
+            hint=(
+                "chat_dau ÷ session_dau：当天打开 App 的人里有多少真的发了"
+                "消息。同一张冻结快照内的比值，绝不跨源拼分子分母"
+            ),
+            delta=(
+                f"<span class='muted'>近7日均 {float(avg7):.0f}%</span>"
+                if avg7 is not None else ""
+            ),
+        ))
+
+    mix = story.get("mix")
+    if isinstance(mix, dict):
+        nb = mix.get("new_blood_pct")
+        comp_bits = []
+        for lbl, key in (("留任", "retained"), ("回流", "resurrected"), ("新增", "new")):
+            v = mix.get(key)
+            comp_bits.append(f"{lbl} {int(v)}" if v is not None else f"{lbl} —")
+        tiles.append(_render_metric(
+            "DAU 构成（昨完整日）",
+            f"{float(nb):.0f}% 新人" if nb is not None else "—",
+            hint=(
+                "新人=当日活跃者中注册不满 28 天的占比（打开 App 口径，live"
+                " 重算）。占比高=DAU 靠新注册供血，注册一停 DAU 会回落——"
+                "增长期正常，但要知道"
+            ),
+            delta=f"<span class='muted'>{' · '.join(comp_bits)}</span>",
+        ))
+
+    reg_delta_html = ""
+    reg_value = "—"
+    reg_sub = ""
+    stages = [s_ for s_ in ((funnel or {}).get("stages") or []) if isinstance(s_, dict)]
+    reg_cur = next((s_.get("count") for s_ in stages if s_.get("id") == "registered"), None)
+    prev_stages = [
+        s_ for s_ in (((funnel or {}).get("prev") or {}).get("stages") or [])
+        if isinstance(s_, dict)
+    ]
+    reg_prev = next(
+        (s_.get("count") for s_ in prev_stages if s_.get("id") == "registered"), None
+    )
+    if reg_cur is not None:
+        reg_value = f"{int(reg_cur):,}"
+        reg_delta_html = _render_delta(reg_cur, reg_prev)
+        if reg_prev is not None:
+            reg_sub = f"<span class='muted'>上一个 28 天窗 {int(reg_prev):,}</span>"
+    if reg_cur is not None or tiles:
+        tiles.append(_render_metric(
+            "近 28 天注册",
+            reg_value,
+            hint="漏斗快照同源（含重装孤儿行·非人数）；环比上一个 28 天窗",
+            delta=f"{reg_delta_html}{reg_sub}",
+        ))
+
+    if not tiles:
+        return (
+            "<div class='note-box'><b>故事数字暂无样本。</b>快照/网格长出"
+            "数据后自动出现。</div>"
+        )
+    return (
+        "<section class='metrics' aria-label='故事数字'>"
+        + "".join(tiles)
+        + "</section>"
     )
 
 
@@ -5860,6 +6253,8 @@ def _render_home_page(
     feed: dict | None,
     cost: dict | None,
     funnel: dict | None,
+    *,
+    story: dict | None = None,
 ) -> str:
     """值班首页（新的默认视图）。七个入参各自独立失败：None → 对应板块
     渲染「暂不可用」，绝不 or 0、绝不装健康。system_verdict 由 admin_core
@@ -5929,12 +6324,14 @@ def _render_home_page(
   <span class="ops-kicker">Operations / metadata only</span>
   <h1>Feedling 值班首页</h1>
   <div class="muted">先看四个灯，再看谁卡住；每块都能点进对应诊断页。生成于 {html.escape(_bj_iso(time.time()))}（北京时间）。</div>
+  {_home_human_summary(pulse, story, queue)}
   {_render_data_track_view_nav("home")}
   <section class="ops-questions">{status_cards}</section>
   <h2>需要你的用户</h2>
   {_home_queue_section(queue)}
   <h2>产品脉搏 <span class="h2-sub">点卡片进「产品健康」</span></h2>
   {_home_pulse_section(pulse)}
+  {_home_story_section(story, funnel)}
   <h2>激活漏斗 <span class="h2-sub"><a href='{users_href}'>去「用户」页看上一窗口对照 →</a></span></h2>
   {_render_funnel(funnel, compact=True)}
   <h2>今天发生了什么 <span class="h2-sub">近 48 小时</span></h2>
@@ -6745,19 +7142,32 @@ def _render_data_track_growth_page(payload: dict) -> str:
         return "—" if v is None else str(int(v))
 
     acct_rows = []
+    bj_today = datetime.now(ZoneInfo("Asia/Shanghai")).date().isoformat()
     for r in accounting.get("rows", []):
+        day = str(r.get("day") or "")
+        # 进行中的当天不渲染流失/QR 定数：半天数据算出来的「流失 49 /
+        # QR 0.1」是垃圾值（今天还没结束，没来的人不等于流失了）——与
+        # 首页/漏斗「进行中周期不当定局」同一把尺。
+        in_progress = day == bj_today
         qr = r.get("quick_ratio")
         churn = r.get("churned")
-        churn_txt = "—" if churn is None else (f"-{int(churn)}" if churn else "0")
+        if in_progress:
+            churn_txt = "<span class='muted'>进行中</span>"
+            qr_txt = "<span class='muted'>进行中</span>"
+            day_html = f"{html.escape(day)} <span class='muted'>(今天)</span>"
+        else:
+            churn_txt = "—" if churn is None else (f"-{int(churn)}" if churn else "0")
+            qr_txt = "—" if qr is None else f"{qr:.2f}"
+            day_html = html.escape(day)
         acct_rows.append(
             "<tr>"
-            f"<td>{html.escape(str(r.get('day') or ''))}</td>"
+            f"<td>{day_html}</td>"
             f"<td>{int(r.get('active') or 0)}</td>"
             f"<td><b>{int(r.get('new') or 0)}</b></td>"
             f"<td>{_opt(r.get('resurrected'))}</td>"
             f"<td>{_opt(r.get('retained'))}</td>"
             f"<td style='color:#a05a00'>{churn_txt}</td>"
-            f"<td>{'—' if qr is None else f'{qr:.2f}'}</td>"
+            f"<td>{qr_txt}</td>"
             "</tr>"
         )
     acct_rows.reverse()  # newest first
@@ -6801,9 +7211,9 @@ def _render_data_track_growth_page(payload: dict) -> str:
   <div class="muted" style="margin-bottom:8px">Y 轴为对数刻度:<b>直线=指数增长</b>,<b>上弯=加速</b>,<b>下弯=放缓</b>。全量累计(注册即计,不受冻结边界限制)。</div>
   {growth_curve}
   <h2>Growth Accounting · 每日(新增/回流/留存/流失 + Quick Ratio)</h2>
-  <div class="muted" style="margin-bottom:8px">活跃=使用 DAU=当天真打开过 App(app_session_end)。<b>新增</b>=当天注册;<b>回流</b>=今天活跃、之前注册过、但昨天没活跃;<b>留存</b>=今昨都活跃;<b>流失</b>=昨天活跃今天没(负);<b>Quick Ratio</b>=(新增+回流)/流失,&gt;1 才是净增长。首日为基线无环比。仅冻结边界 {_freeze} 起。</div>
+  <div class="muted" style="margin-bottom:8px">活跃=使用 DAU=当天真打开过 App(app_session_end)。<b>新增</b>=当天注册;<b>回流</b>=今天活跃、之前注册过、但昨天没活跃;<b>留存</b>=今昨都活跃;<b>流失</b>=昨天活跃今天没(负);<b>增长 QR</b>=增长会计的 Quick Ratio=(新增+回流)/流失,&gt;1 才是净增长（与财务「速动比率」无关;日粒度在小样本下波动大,看多日趋势）。进行中的当天不算流失/QR。首日为基线无环比。仅冻结边界 {_freeze} 起。</div>
   <table>
-    <thead><tr><th>Beijing day</th><th>活跃</th><th>新增</th><th>回流</th><th>留存</th><th>流失</th><th>Quick Ratio</th></tr></thead>
+    <thead><tr><th>Beijing day</th><th>活跃</th><th>新增</th><th>回流</th><th>留存</th><th>流失</th><th title='增长会计 Quick Ratio=(新增+回流)÷流失，与财务速动比率无关；日粒度小样本波动大，看趋势别看单日'>增长 QR</th></tr></thead>
     <tbody>{''.join(acct_rows) if acct_rows else "<tr><td colspan='7' class='muted'>暂无足够天数做增长核算</td></tr>"}</tbody>
   </table>
   <div class="muted" style="margin:6px 0">堆叠柱:<b style="color:#b7352b">■ 新增</b> + <b style="color:#1d7a4d">■ 回流</b> 向上,<b style="color:#c79a63">■ 流失</b> 向下;零线以上净增、以下净减。</div>
@@ -8451,6 +8861,43 @@ def _render_perception_freshness(user: dict) -> str:
     )
 
 
+def _render_screen_frames(user: dict) -> str:
+    frames = user.get("screen_frames")
+    if not isinstance(frames, dict):
+        return ""
+    latest_at = str(frames.get("latest_at") or "")
+    latest_age = frames.get("latest_age_sec")
+    latest_value = html.escape(_bj_iso(latest_at)) if latest_at else "从未收到"
+    age_value = (
+        html.escape(_fmt_duration_sec(latest_age)) if latest_age is not None else "—"
+    )
+    stalled_alert = (
+        "<div class='responder-alert'><strong>屏幕共享连接可能已断开</strong>："
+        "设备仍报告 broadcast=on，但屏幕帧已超过 5 分钟没有更新。"
+        "建议让用户停止后重新开启一次屏幕共享。</div>"
+        if frames.get("broadcast_stalled") is True
+        else ""
+    )
+    return (
+        "<h2 style='font-size:15px;margin:22px 0 6px'>屏幕帧</h2>"
+        "<div class='ppmuted' style='font-size:12px;margin-bottom:6px'>"
+        "仅展示密文帧元数据与存储分布，不读取或渲染屏幕内容。</div>"
+        + stalled_alert
+        + "<section class='grid'>"
+        f"<div class='card'><div class='value'>{int(frames.get('total') or 0)}</div>"
+        "<div class='label'>frame count</div></div>"
+        f"<div class='card'><div class='value'>{latest_value}</div>"
+        "<div class='label'>latest frame</div></div>"
+        f"<div class='card'><div class='value'>{age_value}</div>"
+        "<div class='label'>latest age</div></div>"
+        f"<div class='card'><div class='value'>{int(frames.get('inline_count') or 0)}</div>"
+        "<div class='label'>inline frames</div></div>"
+        f"<div class='card'><div class='value'>{int(frames.get('r2_count') or 0)}</div>"
+        "<div class='label'>R2 frames</div></div>"
+        "</section>"
+    )
+
+
 def _render_user_daily_usage(user: dict) -> str:
     rows = list(user.get("daily_usage") or [])
     days = int(user.get("daily_usage_days") or len(rows) or 14)
@@ -8606,6 +9053,7 @@ def _render_user_detail_page(user: dict) -> str:
   </section>
   {responder_notice}
   <div class="muted">Responder 判据：{html.escape(str(responder.get('criteria') or 'unavailable'))}</div>
+  {_render_screen_frames(user)}
   {_render_user_daily_usage(user)}
   {_render_perception_permissions(user)}
   {_render_perception_freshness(user)}

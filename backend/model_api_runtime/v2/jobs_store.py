@@ -4198,6 +4198,94 @@ def recent_chat_failures_for_user(
     }
 
 
+WAKE_LANES_FOR_SUPPORT = ("heartbeat", "scheduled", "manual_wake", "screen_watch")
+
+
+def wake_lane_activity_for_user(user_id: str, *, within_hours: int = 72) -> dict:
+    """这一个用户的 V2 **主动唤醒**活动:按 lane 分的 job 计数 + 最近失败原因。
+
+    存在的理由:admin 数据面原本只有 V1 口径的 `proactive_jobs` 日志,而 V2 的唤醒
+    job 在 `agent_jobs`。于是一个 V2 用户在数据面上永远显示「心跳 0 次」,看起来
+    像故障——2026-08-10 我据此差点误报「心跳十天没跑」。
+
+    出的是计数 + **有界的原始失败原因**(`_truncated_failure_reason`,与
+    `recent_chat_failures_for_user` 同一姿态),不出任何 prompt/回复内容。
+    ⚠️ 措辞上别说成「只出错误码」:`mark_failed` 收的是任意异常文本,这里给的是它的
+    前若干字符,不是受控枚举(codex 复验 2026-08-10 指出)。admin-only,可接受,
+    但契约要写准。
+    """
+    safe_hours = max(1, min(int(within_hours), 24 * 30))
+    uid = str(user_id or "").strip()
+    empty = {
+        "window_hours": safe_hours,
+        "by_lane": {},
+        "totals": {"jobs": 0, "completed": 0, "failed": 0, "pending": 0},
+        "recent_failures": [],
+        "last_terminal_at": "",
+    }
+    if not uid:
+        return empty
+
+    with _pool().connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "SELECT lane, status, count(*) AS n, max(finished_at) AS last_at "
+                "FROM agent_jobs "
+                "WHERE user_id=%s AND lane = ANY(%s) "
+                "  AND created_at >= now() - make_interval(hours => %s) "
+                "GROUP BY lane, status",
+                (uid, list(WAKE_LANES_FOR_SUPPORT), safe_hours),
+            )
+            grouped = cur.fetchall()
+            cur.execute(
+                "SELECT id, lane, status, last_error, created_at, finished_at "
+                "FROM agent_jobs "
+                "WHERE user_id=%s AND lane = ANY(%s) "
+                "  AND status IN ('failed','expired') "
+                "  AND finished_at >= now() - make_interval(hours => %s) "
+                "ORDER BY finished_at DESC, id DESC LIMIT 20",
+                (uid, list(WAKE_LANES_FOR_SUPPORT), safe_hours),
+            )
+            failures = cur.fetchall()
+
+    by_lane: dict[str, dict] = {}
+    totals = {"jobs": 0, "completed": 0, "failed": 0, "pending": 0}
+    last_terminal = None
+    for row in grouped:
+        lane = str(row["lane"] or "")
+        status = str(row["status"] or "")
+        n = int(row["n"] or 0)
+        slot = by_lane.setdefault(lane, {})
+        slot[status] = slot.get(status, 0) + n
+        totals["jobs"] += n
+        if status == "completed":
+            totals["completed"] += n
+        elif status in ("failed", "expired"):
+            totals["failed"] += n
+        elif status == "pending":
+            totals["pending"] += n
+        if row["last_at"] is not None and (last_terminal is None or row["last_at"] > last_terminal):
+            last_terminal = row["last_at"]
+
+    return {
+        "window_hours": safe_hours,
+        "by_lane": by_lane,
+        "totals": totals,
+        "recent_failures": [
+            {
+                "job_id": int(r["id"]),
+                "lane": str(r["lane"] or ""),
+                "status": str(r["status"] or ""),
+                "reason": _truncated_failure_reason(r["last_error"]),
+                "created_at": _iso_or_empty(r["created_at"]),
+                "finished_at": _iso_or_empty(r["finished_at"]),
+            }
+            for r in failures
+        ],
+        "last_terminal_at": _iso_or_empty(last_terminal),
+    }
+
+
 def recent_chat_operational_health(
     *,
     within_hours: int = 24,
@@ -10509,6 +10597,42 @@ def upsert_wake_schedule(
         )
 
 
+def seed_missing_wake_clocks(
+    user_id: str,
+    *,
+    due_at: float | None = None,
+) -> bool:
+    """Atomically arm every NULL-backed wake lane for one V2 user.
+
+    ``due_heartbeat_users`` and ``due_screen_watch_users`` both deliberately
+    exclude NULL timestamps. Therefore row existence is not proof that either
+    lane is armed: self-wake, payment cooldown, or the other lane can create the
+    row while leaving one clock NULL. Fill only those two missing clocks and
+    preserve every already-advanced timestamp. ``next_capture_at`` is not
+    included because capture/dream eligibility does not use it as a due-list
+    predicate.
+
+    Returns True when a row was inserted or at least one NULL clock was repaired.
+    """
+    timestamp = time.time() if due_at is None else float(due_at)
+    with _pool().connection() as conn:
+        row = conn.execute(
+            "INSERT INTO v2_wake_schedule "
+            "(user_id,next_heartbeat_at,next_screen_watch_at,updated_at) "
+            "VALUES (%s,to_timestamp(%s),to_timestamp(%s),now()) "
+            "ON CONFLICT (user_id) DO UPDATE SET "
+            "next_heartbeat_at=COALESCE(v2_wake_schedule.next_heartbeat_at,"
+            "EXCLUDED.next_heartbeat_at),"
+            "next_screen_watch_at=COALESCE(v2_wake_schedule.next_screen_watch_at,"
+            "EXCLUDED.next_screen_watch_at),updated_at=now() "
+            "WHERE v2_wake_schedule.next_heartbeat_at IS NULL "
+            "OR v2_wake_schedule.next_screen_watch_at IS NULL "
+            "RETURNING user_id",
+            (str(user_id), timestamp, timestamp),
+        ).fetchone()
+    return row is not None
+
+
 _LATEST_GENUINE_USER_SEQ_SQL = (
     "(SELECT COALESCE(MAX(message.seq),0) FROM chat_messages AS message "
     "WHERE message.user_id=schedule.user_id "
@@ -10516,6 +10640,54 @@ _LATEST_GENUINE_USER_SEQ_SQL = (
     "AND COALESCE(message.doc->>'source','') "
     "NOT IN ('verify_ping','resident_maintenance'))"
 )
+
+
+def heartbeat_due_diagnosis(user_id: str, *, now: float | None = None) -> dict:
+    """单用户版的「心跳现在到期了吗?不到期是因为哪一条?」
+
+    **判据必须与 `due_heartbeat_users` 逐条同源**——support 面板给出的结论如果和
+    调度器实际用的规则不一致,那就是又一个「看起来在测量、其实没有」的信号
+    (2026-08-10 我正是被这类信号骗过)。所以这里复用同一个
+    `_LATEST_GENUINE_USER_SEQ_SQL`、同一套 DND EXISTS 子句,而不是在 Python 侧
+    重写一遍。
+
+    尤其是 **proactive_backoff**:那条不是「退避窗没过就挡」,还有一条逃生口——
+    用户在失败之后又真人发过言(`proactive_fail_user_seq < 最新真人 seq`)就照样
+    到期。少算这一条就只能给出模棱两可的 maybe,support 依旧判断不了。
+
+    无行返回 `{"present": False}`。
+    """
+    ts = float(now) if now is not None else None
+    uid = str(user_id or "").strip()
+    if not uid:
+        return {"present": False}
+    sql = (
+        "SELECT "
+        "  (schedule.next_heartbeat_at IS NULL) AS unarmed, "
+        "  (schedule.next_heartbeat_at IS NOT NULL AND schedule.next_heartbeat_at "
+        "     > COALESCE(to_timestamp(%s), now())) AS not_due_yet, "
+        "  (schedule.payment_cooldown_until IS NOT NULL AND schedule.payment_cooldown_until "
+        "     > COALESCE(to_timestamp(%s), now())) AS payment_cooldown, "
+        "  EXISTS (SELECT 1 FROM user_blobs AS settings "
+        "     WHERE settings.user_id=schedule.user_id AND settings.kind='proactive_settings' "
+        "     AND settings.doc @> '{\"dnd\": true}'::jsonb) AS dnd, "
+        "  (schedule.proactive_backoff_until IS NOT NULL "
+        "     AND schedule.proactive_backoff_until > COALESCE(to_timestamp(%s), now()) "
+        "     AND schedule.proactive_fail_user_seq >= "
+        + _LATEST_GENUINE_USER_SEQ_SQL
+        + ") AS proactive_backoff "
+        "FROM v2_wake_schedule AS schedule WHERE schedule.user_id=%s"
+    )
+    with _pool().connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(sql, (ts, ts, ts, uid))
+            row = cur.fetchone()
+    if row is None:
+        return {"present": False}
+    blockers = [name for name in
+                ("unarmed", "not_due_yet", "payment_cooldown", "dnd", "proactive_backoff")
+                if bool(row.get(name))]
+    return {"present": True, "blocked_by": blockers}
 
 
 def due_heartbeat_users(*, now: float | None = None, limit: int = 500) -> list[str]:
