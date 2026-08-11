@@ -150,7 +150,10 @@ def test_v2_only_reconciles_every_runnable_shape_idempotently(monkeypatch):
     for user_id in (missing, resident, already_v2, split):
         mode, state, _generation = db.get_hosted_runtime_control_strict(user_id)
         assert (mode, state) == ("db_action_v2", "v2")
-        assert jobs_store.get_wake_schedule(user_id) is not None
+        schedule = jobs_store.get_wake_schedule(user_id)
+        assert schedule is not None
+        assert schedule["next_heartbeat_at"] is not None
+        assert schedule["next_screen_watch_at"] is not None
     assert db.get_hosted_runtime_control_strict(split)[2] == 13
     assert db.get_hosted_runtime_control_strict(failed)[:2] == (
         "resident_cli",
@@ -177,10 +180,9 @@ def test_v2_schedule_seed_failure_never_flips_ownership(monkeypatch):
     user_id = _seed_runnable("policy_seed_failure")
     _clear_control(user_id)
     monkeypatch.setenv(config_store.HOSTED_RUNTIME_POLICY_ENV, "v2_only")
-    monkeypatch.setattr(jobs_store, "get_wake_schedule", lambda _uid: None)
     monkeypatch.setattr(
         jobs_store,
-        "upsert_wake_schedule",
+        "seed_missing_wake_clocks",
         lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("schedule down")),
     )
 

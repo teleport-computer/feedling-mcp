@@ -48,31 +48,9 @@ def test_first_ever_tick_treats_any_frame_as_changed():
     assert should is True
 
 
-def test_active_chat_suppresses_the_watch():
-    should, reason = _call(last_user_msg_ts=_NOW - (sw.CHAT_SUPPRESS_SEC - 1))
-    assert should is False and reason == "chatting"
-
-
-def test_chat_exactly_at_the_suppress_boundary_does_not_suppress():
-    should, _ = _call(last_user_msg_ts=_NOW - sw.CHAT_SUPPRESS_SEC)
-    assert should is True
-
-
-def test_old_chat_does_not_suppress():
-    should, _ = _call(last_user_msg_ts=_NOW - (sw.CHAT_SUPPRESS_SEC + 1))
-    assert should is True
-
-
-def test_never_chatted_does_not_suppress():
-    should, _ = _call(last_user_msg_ts=None)
-    assert should is True
-
-
-def test_freshness_is_checked_before_chatting():
-    """A stale frame reports `not_fresh`, not `chatting`, even while the user is typing.
-    The reason string is an observability contract — keep the resident's precedence."""
-    should, reason = _call(latest_ts=_NOW - 10_000, last_user_msg_ts=_NOW - 1)
-    assert should is False and reason == "not_fresh"
+def test_active_chat_no_longer_suppresses_the_watch():
+    should, reason = _call(last_user_msg_ts=_NOW - 1)
+    assert should is True and reason == "ok"
 
 
 def test_screen_watch_gate_is_pure():

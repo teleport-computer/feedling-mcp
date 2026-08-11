@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import re
 import ssl
 import uuid
@@ -20,11 +21,14 @@ from core import envelope as core_envelope
 from core import util as core_util
 from core import wake_bus
 from core.store import UserStore
+from hosted import mcp_status
 from hosted.mcp_approvals import (
     MAX_READ_ONLY_TOOL_APPROVALS,
     valid_fingerprint,
     valid_tool_name,
 )
+
+log = logging.getLogger("feedling.hosted.mcp_core")
 
 USER_MCP_BLOB = "user_mcp"
 # ⚠️ 这是**防滥用的兜底**,不是产品限制 —— 别拿它当成本闸。
@@ -257,7 +261,22 @@ def _public(srv: dict) -> dict:
 
 def list_servers(store: UserStore) -> tuple[dict, int]:
     servers = _load(store)["servers"]
-    return {"servers": [_public(s) for s in servers]}, 200
+    if not servers:
+        return {"servers": []}, 200
+    try:
+        runtime_by_name = mcp_status.runtime_summaries_for_store(store)
+    except Exception as exc:  # noqa: BLE001 — optional status never breaks config
+        log.warning("mcp runtime status read failed user=%s kind=%s",
+                    store.user_id, type(exc).__name__)
+        runtime_by_name = {}
+    public_servers = []
+    for server in servers:
+        public = _public(server)
+        runtime = runtime_by_name.get(str(server.get("name") or ""))
+        if runtime:
+            public["runtime"] = runtime
+        public_servers.append(public)
+    return {"servers": public_servers}, 200
 
 
 def upsert_server(store: UserStore, payload: dict) -> tuple[dict, int]:

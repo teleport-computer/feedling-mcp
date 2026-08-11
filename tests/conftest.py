@@ -222,6 +222,24 @@ if not _provisioned:
         # MCP 工具面可观测性(2026-08-09)。纯:只解析字符串 + 读两个 JS 源文件。
         "test_user_mcp_surface_trace.py",
         "test_voice_context_regressions.py",
+        "test_health_executor.py",
+        "test_db_health_timeouts.py",
+        "test_health_route_isolation.py",
+        # 记忆写入规则的 V1/V2 parity(2026-08-10)。纯:只读 memory.prompts_v1 与
+        # capabilities.tool_schema 的常量,不碰 DB。
+        "test_memory_write_guidance_parity.py",
+        # enclave 批量解密的 trace 折叠(2026-08-10)。纯:debug_trace.trace_event
+        # 被 monkeypatch 掉,不碰 DB。
+        "test_enclave_trace_coalescing.py",
+        # 感知工具面可发现性契约(2026-08-10)。纯:只读 schema 常量 + 一个假 store。
+        "test_perception_tool_surface_contract.py",
+        # agent.tool.call 的隐私断言(2026-08-10)。纯:直接调投影函数,不碰 DB。
+        "test_v2_tool_trace_privacy.py",
+        # 工具面目录契约(自带 sys.path 引导,只 import tool_schema/registry/
+        # agent_fields/provider_types,零 DB 引用 —— 实测确认)。
+        "test_capabilities_tool_schema.py",
+        # 豁免名单棘轮(2026-08-10)。纯:只读两个文本文件,自带 sys.path 引导。
+        "test_pytest_coverage_ratchet.py",
     }
     collect_ignore = sorted(
         f

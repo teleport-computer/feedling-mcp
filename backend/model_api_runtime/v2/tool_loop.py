@@ -3,6 +3,7 @@ all side effects injected. One loop for every model — no is_official branch.""
 
 from __future__ import annotations
 from dataclasses import dataclass
+import inspect
 import json
 import posixpath
 import re
@@ -13,6 +14,23 @@ from capabilities import tool_schema
 from model_api_runtime.v2 import prompt_frontier
 from model_api_runtime.v2 import provenance
 import provider_client
+
+
+def _has_tagged_image_message(messages, tag_key: str) -> bool:
+    return bool(tag_key) and any(
+        isinstance(message, dict) and message.get(tag_key) is True
+        for message in messages
+    )
+
+
+def _without_tagged_image_messages(messages, tag_key: str) -> list:
+    if not tag_key:
+        return list(messages)
+    return [
+        message
+        for message in messages
+        if not (isinstance(message, dict) and message.get(tag_key) is True)
+    ]
 
 _CATALOG = None  # built lazily/once
 _SEARCH_RESULT_URL_RE = re.compile(r'"url"\s*:\s*("(?:\\.|[^"\\])*")')
@@ -491,6 +509,9 @@ async def run_tool_loop(
     on_file_requirement_changed=None,
     outbound_blocking_read_tool_names=None,
     outbound_blocking_read_tool_predicate=None,
+    initial_outbound_tools_blocked: bool = False,
+    tagged_image_message_key: str = "",
+    on_tagged_images_rejected=None,
     max_tool_calls_per_round: int = DEFAULT_MAX_TOOL_CALLS_PER_ROUND,
     max_tool_calls_per_turn: int = DEFAULT_MAX_TOOL_CALLS_PER_TURN,
     tool_result_char_cap: int = DEFAULT_TOOL_RESULT_CHAR_CAP,
@@ -610,7 +631,8 @@ async def run_tool_loop(
     empty_response_retry_instruction = ""
     external_content_seen = False
     mutation_outcome_unknown = False
-    outbound_tools_blocked = False
+    outbound_tools_blocked = bool(initial_outbound_tools_blocked)
+    tagged_image_fallback_active = False
     file_requirement_message_state = [
         dict(message)
         for message in file_requirement_messages
@@ -961,6 +983,10 @@ async def run_tool_loop(
             ] or None
         if before_provider_call is not None:
             before_provider_call()
+        if tagged_image_fallback_active:
+            messages = _without_tagged_image_messages(
+                messages, tagged_image_message_key
+            )
         await _trajectory(
             "provider_request",
             {
@@ -974,6 +1000,7 @@ async def run_tool_loop(
         )
         attempts += 1
         _progress("provider_start")
+        provider_error: BaseException | None = None
         try:
             # V2 owns the lane-specific empty-response policy. Let the provider
             # parser return any structurally valid success so an abnormal HTTP
@@ -1032,6 +1059,58 @@ async def run_tool_loop(
                 **provider_kwargs,
             )
         except Exception as exc:
+            tagged_image_rejected = (
+                not tagged_image_fallback_active
+                and _has_tagged_image_message(messages, tagged_image_message_key)
+                and getattr(exc, "status_code", None) in {400, 404, 415, 422}
+            )
+            if tagged_image_rejected:
+                await _trajectory(
+                    "provider_error",
+                    {
+                        "round": attempts,
+                        "error_class": type(exc).__name__,
+                        "tools_enabled": tools is not None,
+                        "tagged_images_rejected": True,
+                    },
+                )
+                add_usage(None)
+                tagged_image_fallback_active = True
+                messages = _without_tagged_image_messages(
+                    messages, tagged_image_message_key
+                )
+                await _trajectory(
+                    "provider_request",
+                    {
+                        "round": attempts,
+                        "messages": messages,
+                        "tools": tools,
+                        "forced_tool": forced_delivery_tool,
+                        "retry_without_tagged_images": True,
+                    },
+                )
+                try:
+                    result = await provider_client.reliable_chat_completion_async(
+                        provider_config,
+                        messages,
+                        max_attempts=1,
+                        base_delay_sec=0.2,
+                        max_delay_sec=1.0,
+                        **provider_kwargs,
+                    )
+                    # A successful text-only retry confirms that the rejected
+                    # part was our tagged image block (important for ambiguous
+                    # provider statuses such as OpenRouter's HTTP 404).
+                    if on_tagged_images_rejected is not None:
+                        callback_result = on_tagged_images_rejected(exc)
+                        if inspect.isawaitable(callback_result):
+                            await callback_result
+                except Exception as retry_exc:
+                    provider_error = retry_exc
+            else:
+                provider_error = exc
+        if provider_error is not None:
+            exc = provider_error
             attempt_trace = provider_client.runtime_provider_attempt_trace(exc)
             await _trajectory(
                 "provider_error",
@@ -1113,7 +1192,7 @@ async def run_tool_loop(
                 )
                 _progress("provider_retry_boundary")
                 continue
-            raise
+            raise provider_error
         _progress("provider_complete")
         add_usage(result.get("usage"))
         raw_has_usable_output = bool(

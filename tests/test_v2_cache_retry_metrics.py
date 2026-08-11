@@ -53,6 +53,22 @@ def test_turn_metrics_keep_worst_adaptive_tail_outcome(monkeypatch) -> None:
     assert captured["kwargs"]["prompt_frontier_exhaustion_count"] == 2
 
 
+def test_turn_metrics_record_content_free_visible_reply_count(monkeypatch) -> None:
+    captured: dict = {}
+    monkeypatch.setattr(
+        jobs_store,
+        "record_whole_turn_metric",
+        lambda *args, **kwargs: captured.update(args=args, kwargs=kwargs),
+    )
+    tm = worker.TurnMetrics(job_id=125, user_id="u", lane="screen_watch")
+
+    tm.record_visible_reply()
+    tm.record_visible_reply()
+    tm.flush(failed=False, status="ok")
+
+    assert captured["kwargs"]["visible_reply_count"] == 2
+
+
 def test_cache_turn_details_select_persisted_retry_count(monkeypatch) -> None:
     captured: dict = {}
 

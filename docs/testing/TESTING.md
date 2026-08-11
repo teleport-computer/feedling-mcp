@@ -10,7 +10,7 @@
 
 ---
 
-## 0. 五条总原则
+## 0. 七条总原则
 
 1. **改了什么就测什么** —— 见 §2 决策矩阵，按你**动过的文件类别**对号入座，做齐"必做"项。
 2. **要证据，不要感觉** —— "跑通了"不算完成；本地要有 pytest 绿、碰链路要有 E2E `OK`、上了线要有 admin trace 字段。
@@ -54,6 +54,36 @@
    在那之后我们做的每一步清洗都是自己的行为。
    同族：参数化要覆盖**每一种真实入参形状**（本例 `str` / `dict{messages}` / `dict{actions}` /
    `dict{choices}` 是四条不同的腿），只测最顺手那条 = 只测了自己想得到的那种坏法。
+   **(d) 夹具比生产更规整，就等于绕开了被测入口。** 2026-08-10 的 MCP 批一天栽三次：
+   ① 手写的 init 事件永远字段齐全，而生产里配置读取失败时那个事件**只有一个键**，
+   于是真实故障被误报成"后端版本太旧，先发版"，把人指向完全不相干的问题；
+   ② V2 的夹具里手工塞了一个 `agent.model.call.done`——那个事件在 V2 这条路上
+   **根本不存在**，于是单测全绿而每一次真实运行都等满超时报"没有观测"；
+   ③ 同一个探针**第三次**在同一位置要求 V1 专属信号。
+   判据：**写夹具前先去生产 trace 里捞一条真的**，至少问一句"这个字段在这条路上一定有吗"。
+   最好把真实输出脱敏存成 fixture（本批的
+   `tests/fixtures/claude_init_pending_tool_recovered.jsonl` 就是这么来的，
+   它当场推翻了我"init 快照即终态"的判据）。
+
+6. **说出口的每一句"因为"，都要有一次查证垫底** —— 2026-08-10 一天犯三次：
+   把 `--allowed-tools` 说成排他白名单（仓库里早有实测记录说不是）；在代码注释里写
+   "服务器名不能含 `__`"（命名规则明明允许，一次 grep 可查）；写"真错误总是 JSON"
+   （反例就躺在本仓测试文件里，四条）。共同点：**下结论的速度快过查证的速度，
+   而三次的查证成本都低于五分钟**。同族两条：
+   - **n=1 不下因果结论**：改一个变量、各跑一次就断言因果——本批"5 台服务器让埋点失明"
+     复跑两次全绿，真因是单次事件丢失。跨环境比较更要命：拿 prod key 从本机去"复现"
+     test 环境 + 另一把 key + 有历史的账号，**三个变量同时不同**。
+   - **注释不能替代码作证**：本批两次写下意图后实现没做到（"最后一个 init 说了算"却没清空
+     上一轮的调用证据），而注释留在那里让读的人以为已经成立。改完回头读自己的注释，
+     问一句"代码真做到了吗"。
+
+7. **修完必须锁** —— 修了代码没补测试，下一轮就退回去。本批被 gatekeep 原话点名：
+   "四条 P1 修复里两条仍是回归状态"。判据很硬：**修复提交里必须有一条会因为这次修复
+   而由红转绿的用例**；拿不出来，等于这次修复没有发生过。
+   配套：**判据逻辑要能被调用**——本批的探针把所有检查内联在 `main()` 里，于是没有任何
+   东西能测它，四条修复里两条静默回归；抽成纯函数之后才锁得住。
+   反向提醒：**变异存活先问"这条分支在生产里到达得了吗"**再定性——本批我差点拿一段
+   不可达代码去要求别人补测试。
 
 ---
 
@@ -88,6 +118,8 @@
 | **F6. 喂给模型的文本是子进程产物(io_cli 目录等)** | `tools/io_cli.py` 任何 `help=`/`epilog=`、`tools/io_cli_catalog.py` | ✅（`test_io_cli_catalog.py`，含 GBK locale 用例） | — | ⚠️ 自建用户环境 | **帮助文本里的一个字符能让整份工具目录静默消失**：`build_catalog` 是逐 verb 跑 `--help` 的子进程，`text=True` 两侧都用**系统 locale** 编码。中文 Windows 是 cp936(GBK)，help 里出现一个 GBK 装不下的字符（2026-08-08 自建用户报的 `identity-redistill` 里的 ⚠️ U+26A0）→ 子进程 UnicodeEncodeError → `build_catalog` 返回 None → consumer 回退到只剩 D3 一行的 fallback，**agent 每一轮都丢掉整个 4KB 工具目录**（失败路径**故意不缓存**，所以每轮重试、每轮再失败），全程无日志、无报错，用户只看到「AI 好像不会用工具了」。三条纪律：①**符号一律用 ASCII**（`[!]` 不要 `⚠️`）——中文散文没问题，GBK 覆盖得了，坏的是 emoji/特殊符号；②**跨进程读文本必须钉死编码**（子进程 `PYTHONIOENCODING=utf-8` + 父进程 `encoding='utf-8', errors='replace'`），别依赖 locale；③**回归用例要模拟目标 locale 真跑一遍构建**，并做负向对照证明它在修复前会红（`test_catalog_survives_a_gbk_locale`）。同族问句：**这段文本最终会被谁、在什么编码下读一遍？** |
 | **F7. 会话级指令 / 后台 lane 共用聊天会话** | 前台 dispatch 里任何**常驻**指令注入（`core/self_thinking.INSTRUCTION` 这类）、以及所有不带 `isolated_session` 的 `call_agent` 后台调用（capture / dream / migrate / identity 蒸馏 / 探针） | ✅ | — | ✅ **必跑** | **「我只注入在前台」不等于「后台不受影响」——真正决定作用域的是会话,不是 prompt。** 前台注入的常驻指令(自研思维链那条写着「⛔ 绝对输出规则:最终回复第一个字符必须是 `<think>`」)会留在**续接会话**里,而后台 lane 用的是**同一个会话**,于是模型在 capture 轮照样照办。**两次事故同一形状**:①2026-08-05 identity-redistill 在聊天会话里蒸馏 → schema 漂移 + 第二次被模型当「重复请求」拒答;②2026-08-09 capture/dream → 回复带 `<think>`,而记忆解析器从第一个 `{` 扫平衡括号,**capture 的 prompt 恰恰要求输出 JSON,模型思维链里天然全是大括号** → 抓到「平衡但非法」的片段 → `json_decode_error`,全 prod 56 次/11 用户,capture 失败头号原因。**纪律**:①加任何**常驻**指令时,列出「哪些 lane 共用这个会话」,别只看注入点——注释写「background lanes are never asked to emit X」而实际会被要求,正是第二次事故的原文;②修好一个 lane 后**必须横向扫一遍**同族(`grep -n "isolated_session" tools/chat_resident_consumer.py` 看谁**没有**带),第一次只修 identity 没横扫,capture 就是漏网的;③**解析层要自己扛得住**,不能只靠「我们不注入」——受影响用户里有 `-thinking` 中转,我们一个字不注入它照样内联推理,所以剥离必须做在解析入口(`card_text.extract_json_block`),且 strip 失败时**回退原文**(否则把今天能解析的搞挂)。验收:全栈探针 `tools/e2e/memory_thinking_leak_probe.py`,断言**用户能看见的东西**(花园里到底多没多出那张卡),不是只断言字符串解析成功 |
 | **F8. 「沉默」也是一种输出（各车道的合法结果不同）** | 任何决定「这一轮要不要发东西」的判据：抽取层把 `thinking_summary`/`tool_calls` 当「本轮有效」的放行（`_call_agent_http_*` / CLI 分支）、`_split_agent_turn` 之后的空判、以及 `if replies` / `if messages` 这类**以非空为前提**的兜底分支 | ✅ | — | ✅ **必跑** | **对唤醒车道正确的放行，前台继承过来就是数据丢失。** 2026-08-08 usr_0724（MiniMax-M3 经中转）连着几轮只吐 reasoning 不吐正文：抽取层按「有 thinking 就算有效」放行——这**对心跳是对的**（runtime-v2 `2f187175` 专门定过「唤醒可以想完不说话」）——前台于是拿到 `turn.messages == []`；下游 `replies == []` 让退化碎片守卫（它嵌在 `if degenerate:` 里）根本不触发，`if replies and not posted_any` 的保-checkpoint 重试也整段跳过 → **消息被判「已回答」并永久丢失**。她五个多小时发了十几条，没有回复、没有报错、没有横幅。三条纪律：①**任何「这轮可以不发」的放行都必须带车道**，落笔时问一句「前台走到这里会怎样」；②**空集合会让 `if x and …` 的整条兜底静默跳过**——兜底要按「什么都没有」写，不能只按「内容不对」写（本仓两个守卫都只覆盖了后者）；③**失败形态是「什么都没有」的 bug 在看板上不可见**：`agent.reply` 记 `status=ok`（它确实解析成功了，只是解析出 0 条），`stalled_turns` 也数不到——全 prod 扫一个月才在采样里看见 3 次，真实次数无从得知。所以这类修复**必须同时加一条 error 级埋点**（这里是 `agent.reply.empty_retry` / `agent.reply.empty_exhausted`），否则连「以前发生过多少次」都答不了。验收：断言**用户真的收到了东西**，不要只断言「没崩」；前台车道的口径是埋点里有 `route.decided`。 |
+| **F9. 跨 V1/V2 共享的符号(改名 / 改签名)** | `backend/model_api_runtime/v2/*` 里被 `tools/chat_resident_consumer.py` import 的任何东西(反之亦然):选择器、判据函数、常量、payload 形状 | ✅ | — | ✅ **必跑** | **只验自己那一侧 = 把另一条运行时打断,而 prod 跑的往往是另一侧。** 2026-08-11:把 `uniformly_sample_new_frames` 改名成 `select_recent_session_frames`,V2 侧改齐、测试全绿、gatekeep 也过了(我用独立脚本打了 8 条边界),**但 `chat_resident_consumer.py:3612` 那个调用点没改** —— V1 在共享活跃的聊天回合直接 `AttributeError`。而 prod 事实上全是 V1(埋点扫一个月:V2 迹象 0、resident 258),这条一旦随 test→main 合过去,**每个开着屏幕共享的 prod 用户聊天当场崩**。没被拦住的原因:V2 的测试只测 V2 模块本身,consumer 那套虽然会跑,但**没有一条用例真的执行到那一行**。三条纪律:①**改名/改签名的当下就 `git grep -n "<旧符号>" -- tools/ backend/ tests/`**,不要等 review;gatekeep 方也把这条列为固定第一步(这次是我漏了)。②修完要加一条**真的会执行到那一行**的回归 —— 判据是「它调的是真函数,只 mock I/O 边界」,而不是「测试文件名里有那个模块」。③**共享符号最好别改名**;非改不可时,同一个 commit 里把两侧和测试一起改,别拆成两个提交(中间那一刻 test 分支是坏的)。同族:§O(共享判据 + 各自视图 → 判据在字段缺失的那条 lane 上静默失效)。 |
+| **F10. 「哪条车道拿到什么上下文」（注入面的覆盖）** | 任何往 prompt 里加/减一块上下文的地方：`v2/worker.py::_run_wake` 与 `process_job`、`v2/context.py::build_turn_messages`、consumer 的 `_message_for_proactive_job` 与前台 dispatch | ✅（**四条 wake lane 全参数化**，不是只测被改的那条） | — | ⚠️ 能强制触发的车道必跑 | **加上下文时必须逐车道显式决定，并写下依据**——不是"先给聊天，别的以后再说"。世界书接进来一年只接了前台聊天，于是同一个伴侣在聊天里说「影月初三」、心跳主动开口时说「8 月 11 日」，而世界书恰恰是为「设定一致」买的（2026-08-10 修）。三条纪律：①**先问这块上下文有没有两半语义**——世界书的 `alwaysOn`（世界常数，聊什么都成立）与关键词触发（需要**新鲜文本信号**）答案不同，一刀切开或一刀切关都是错的；②**没有新鲜信号的车道不要硬凑**：心跳手里只有几小时前的旧消息，拿陈旧关键词灌 24k 字设定是噪音不是接地；③**有新鲜输入但输入不可信的车道，宁可不用**——屏幕文本被刻意设成 pull-only 正是为了不让屏幕内容影响首轮 prompt，拿它去**选**注入哪条用户数据，就是绕过那道闸的 retrieval-selection 注入通道（codex 复验定性为「必要，不是过度谨慎」）。测试要**参数化全部车道**（含没改的那些），否则以后有人顺手把某条也打开，没有任何测试会红；断言要打在「传给匹配/检索层的输入」上，那正是各车道语义的分界。跨运行时(V2 / resident)有各自实现时，**标注与上限必须共用同一份定义**——两边各写一份必漂（本次发现 resident 前台早已漂成没有 UNTRUSTED 标注、且完全没有总量上限） |
 | **G. DB schema / migration** | 建表 / 改列 / reset 路径 | ✅（`test_*_migration.py` `test_account_reset_purges_all_tables.py`） | — | ⚠️ | prod 用户极少，clean reinstall 迁移可接受（**须任务明确授权**）；reset 必须 CASCADE 清干净 |
 | **H. compose / enclave / 链上不变量** | `deploy/docker-compose*.yaml` `enclave_app.py` compose 段 | ✅ | ✅（envelope roundtrip） | — | **compose 任何字面量变更 → `compose_hash` 变 → 重新上链**（`deploy/DEPLOYMENTS.md`） |
 | **I. CVM runner 镜像 / 部署** | `deploy/Dockerfile.agent-runner` bump | — | — | ✅ **必跑** | `phala inspect` 确认 image tag == 目标 hash；`deploy/verify-remote.sh`；litellm 版本没变=桥行为没变 |
@@ -132,12 +164,65 @@
 - **`deploy-test-contract.yml`**（手动）：部署 FeedlingAppAuth 到 Sepolia。
 - **`docker-publish.yml`**：镜像发布。
 
+### ⚠️ 新测试文件要登记**两份**名单，少一份就静默失效
+
+「测试没跑」和「测试通过」长得一模一样——这是本仓最容易自欺的一类失败，
+2026-08-10 一天之内以三种形态各栽了一次。两份名单管的是不同的事：
+
+| 名单 | 管什么 | 漏登记的后果 |
+|---|---|---|
+| `tests/conftest.py` 的 `_PURE_UNIT` | **本机没有测试 PG 时**能收集哪些文件 | 被静默 `collect_ignore`，`-q` 连提示都吞掉 |
+| `.github/workflows/ci.yml` 的显式文件清单 | **CI 真正执行**哪些文件 | CI 里根本不跑 |
+
+- 只登记前者 → CI 的 **Guard top-level pytest discovery coverage** 会把 PR 打红
+  （这道守卫干得对，别绕过它）。
+- **`.github/pytest-uncovered-baseline.txt` 是"已知不覆盖"的豁免名单，不是登记处。**
+  把新文件塞进去 = 它哪都不跑，**而且守卫也不会再报警**。本批就有一个 173 行的
+  新测试落在那儿、和一个 39 行的新增断言所在文件本来就在那儿——两个都从来没执行过。
+- 登记进 `_PURE_UNIT` 前先确认它**真的不碰 DB** 且自带
+  `sys.path.insert(backend)`，否则从"静默忽略"变成"收集期 ModuleNotFoundError"。
+- **验口径一秒钟**：`pytest tests/ -q --collect-only | tail -1`。
+  无 PG 约 1.7k，接上 PG 约 8.9k——报"全量通过"前先看这个数对不对得上。
+
 ---
 
 ## 5. 部署态 E2E 标准动作（L3 展开）
 
-0. **先对版本（铁律）**：`curl -sk <api>/healthz` 的 `release.git_commit`
-   必须 == 目标 SHA 才开跑——对不上 = 还没部署完，此刻任何"失败"都是假阴性。
+0. **先对版本（铁律）**：`healthz` 的 `release.git_commit` 必须**包含**目标提交
+   才开跑——对不上 = 还没部署完，此刻任何"失败"都是假阴性。
+
+   2026-08-10 在这条上烧了两小时、连跑三次 P0 全红。**规则早就写在这里，是没照做。**
+   三个具体坑，逐条写清楚免得下次再绕过去：
+
+   - **字段嵌在 `release` 里，不在顶层。** 读 `d["git_commit"]` 拿到空值，
+     我据此认定"healthz 不报版本"，转而用了两个更弱的判据（job 收工、`curl` 通），
+     两个都不足以判断部署到位。正确读法：
+     `json.load(...)["release"]["git_commit"]`。
+   - **判据是"包含"不是"=="。** 实际部署的往往是随后的 `deploy(test): pin …`
+     提交，严格相等**永远不成立**。用
+     `git merge-base --is-ancestor <你的提交> <线上SHA>`。
+   - **`curl` 不能用来判活。** 滚动期实测出现过 **`curl` 返回 000 而 `httpx`
+     返回 200 并存**。稳定性判据用同一个 HTTP 客户端连续探测（15 次零失败），
+     不要用单次 `curl`。
+
+0b. **跑之前先确认没有部署在跑。** P0 的**每个 cell 都要走 runner CVM**，
+   所以 runner 重部署期间 P0 必然全红，且失败形态高度一致
+   （7 个互不相关的 provider 报同一个 `ConnectError: EOF ... _ssl.c:997`）。
+   **这种整齐划一本身就是"环境层而非功能层"的信号**——真正的功能回归不会让
+   所有 provider 同时以同一种 TLS 错失败。
+
+   ```bash
+   # 等 test 上所有 job（含部署）收工
+   until [ "$(gh run list --limit 12 --json status,headBranch \
+       --jq '[.[]|select(.headBranch=="test" and .status!="completed")]|length')" = 0 ]; do
+     sleep 20
+   done
+   ```
+
+0c. **P0 只能验"已部署"的代码。** 合并前跑 P0 验不到本次改动（test 跑的是旧镜像），
+   那时它只是环境基线。**"e2e 绿了再合"这个门槛在 P0 上结构性不成立**，
+   顺序只能是：合 → 部署 → 跑 P0 做**同口径对比**（关注红的集合有没有变大，
+   而不是"是否全绿"——环境本身长期带着几条既有红）。
 1. **复用**（优先）或新建 test model_api 账号。
 2. 拿账号 X25519 keypair；`whoami` 拿 `public_key`。
 3. `backend/content_encryption.py::build_envelope(...)` 构造加密信封。
@@ -174,12 +259,37 @@
   扫一遍**，尤其看提交信息里有没有出现同一个 user_id——一次 grep 省掉整轮重复劳动，
   也避免两个人各修一半在同一个文件里撞车。
 - **`runtime.test_status=ok` 骗人**：它只证明轻量 ping 通了，真实生成仍可能全部 timeout（廉价中转限流/欠费/过载）。判"中转是否真活着"要看 `provider_attempt_ledger` 尾部的 `outcome`。
+- **"埋点没出现"不是证据，是四种可能**：2026-08-10 查 MCP 时我差点拿"这个用户的
+  trace 里一条 `mcp.surface.*` 都没有"直接结论成"consumer 侧一台服务器都没有"。
+  缺失至少有四个来源，**必须四个全排除才能当发现**：① 条件确实没发生；
+  ② **发埋点的代码还没跑在那个进程上**（埋点提交今天才进镜像，而 consumer 是长跑
+  进程，部署不一定重启它）；③ **埋点自己有前置早退**（`_trace_user_mcp_wiring` 在
+  "零台启用"时 return，而那恰好就是要查的状态——洞照不出自己）；④ **环被冲掉了**
+  （trace 是每用户 200 条的环，一轮记忆蒸馏就刷 ~198 条 `enclave.call`，把同期的
+  chat 轮整个挤没）。排 ③ 的办法是读那个函数的早退条件，排 ④ 的办法是按 subsystem
+  过滤重查、看 `events_total` 是不是正好顶格。
+- **判据不能问"容器在不在"，要问"内容对不对"**：同一天发现 `authorized` 的判据是
+  `有 --allowed-tools` OR `CLAUDE_CONFIG_DIR 非空`——而托管模板**恒带**前一个
+  （里面只有 io_cli 动词、没有任何 mcp 规则）、托管环境**恒设**后一个。于是它对
+  全部托管用户永远返回 true：**它唯一该报的那个状态，恰恰是它永远报不出来的**。
+  自查手法：拿主力环境的真实形状代进去，问"这个判据在生产上**存在**返回 false 的
+  输入吗"——答不上来就是恒真。同族：`if 文件存在` / `if 环境变量非空` /
+  `if 列表非 None` 这类，都要追一步"那里面装的是不是我要的东西"。
+- **控制面探通 ≠ 数据面能用**：App 的 MCP"测试连接"是**后端直连**那台服务器的探针，
+  和 agent 那条路完全不相干（agent 走 `--mcp-config`/桥/config.toml）。用户说
+  "测试是绿的"对"agent 拿没拿到工具"零信息量。凡是"配置页显示正常、实际功能用不了"
+  的投诉，先把两条路画出来，确认绿灯到底亮在哪条上。
 - **openai_compatible 中转验证，`test_status:ok` 之外还有两个独立坑**（2026-07-27 Kimi/Moonshot 验证）：
   ① **key 有区域锁**——同一家中转多个区域 endpoint，key 只在签发区有效：Moonshot 的 key 在 `api.moonshot.cn` 返 200，同 key 打 `api.moonshot.ai` 直接 `401 Invalid Authentication`。用户报 `provider_test_failed` / 401，**先核 `base_url` 区域是否配对 key 的签发区，再谈 key 废没废**（先 `curl {base_url}/models -H "Authorization: Bearer <key>"` 隔离 provider 侧）。
   ② **「能回话」≠「记忆/工具能用」，必须单独验一轮带记忆写入 + 工具调用的回合**——但**没有任何配置字段能替你预测这件事**。曾经的 `responses_unsupported` warning + `supports_responses` 探测（setup 打中转 `/responses`）是错的，2026-07-27 已删除：它的前提「LiteLLM 强制 responses→chat-completions 桥接 mangle codex 工具循环」三条全失效（网关已退役；`openai_compatible` 派生 `pi` 而非 `codex`；V2 全程 `chat_completion_async`，`/responses` 在 `provider_client` 唯一入口是 `provider == "openai"`）。实测：Kimi/Moonshot 在 V1(pi) 与 V2 两条路径上记忆写入、下一轮回读、工具调用全部正常（V2 trajectory 记到 `tool_call_started`/`tool_call_result` 各 3 次）。**验法只有跑真回合**：写一条事实 → 下一轮问回来 → 查 `/v1/memory/index` 有卡；要白盒就查 `v2_trajectory_events.event_kind`（明文列，`user_id` 过滤，删号会 CASCADE 掉，必须在 teardown 前查）。
   旁证（可复用基线）：enclave 能连 `api.moonshot.cn`；Kimi `kimi-k2.5` 经 openai_compatible 端到端可用、原生 thinking 正常。验证走 L2/L3 真链路（`tests/e2e_model_api_test.py` / `tools/e2e/`，register→setup→send→客户端解密）——openai_compatible 只需 setup 传 `provider=openai_compatible` + `base_url` + `context_window_tokens`。
 - **改用户可见文案前，先从屏幕反向追到抛点**：确认这条 error code 在**目标运行时**真会走到用户面前。V2 抛的是 `prompt_frontier_exhausted`（裸协议码），不是 provider 的 `context_overflow`——改后者的话术对 V2 用户一个字都不会生效（07-26 险些上线一条死分支，撤回）。**而且"能走到"之后还有一层：客户端会按自己的规则二次翻译。** 2026-08-09 中转站地址填错那次，后端已经准确判成"地址不是 API 端点"、detail 也写对了，但返回体里带着 provider 的 `404`——iOS `providerTestFailureMessage` 会**优先按状态码映射**，`404 → "模型不存在"`，用户屏幕上仍然是一句指错方向的话。修法是后端把 `status_code` 清成 `null`，让它落到 detail 分支。**判据：改完之后去客户端把那段映射读一遍**（slug 分支 / 状态码分支 / 兜底分支，哪条先命中），别只看返回体对不对。
 - **跨环境复现之前，先把变量表列出来逐项对齐**：2026-08-07 查一个 prod 用户的空回复，我用**prod 的 key、从本机**发了十几轮请求（参数矩阵、35916 token 大 prompt、六个 endpoint 逐个锁定）**全部成功**，据此一路推翻自己的假设——而用户失败的是 **test 环境 + 另一把 key + 有 187 条历史的账号**，**三个变量都不一样**，这个对照从第一分钟起就不成立。折腾了一下午，最后是用户自己观察到"一调工具就失败"才定位。**动手复现前先写下这张表并逐项打勾**：运行时（V1 resident / V2）、driver（pi / claude / codex）、凭证（哪一把 key、哪个账号）、账号状态（历史规模、记忆条数、是否新号）、出口（本机 / CVM，`phala cvms list` 能看到 prod 不在同一个账号下）、客户端版本。**任何一项对不上，"我这边全通"就不构成证据。** 同族手法：链路里的**外部 CLI（pi 等）不是黑盒**——它装在本机 npm 缓存里，`dist/` 下就有源码。那次的真因（工具历史存在时 pi 发 `tools: []`，模型只输出思考块不说话）是**读它的 `openai-completions.js` 三分钟看出来的**，而我在那之前猜了一整天。
+- **想在本地复现 CI 的某一步,必须连 job 级 env 一起抄,不能只抄那一步的 `env:`。**2026-08-10:我照着 ci.yml 里 `Run resident consumer regression suite` 那一步的 `env:` 只设了 `FEEDLING_TEST_PG`,50 个文件里 3 个当场红(`test_v2_screen_watch_lane` / `test_v1_downloadable_files` / `test_redistill_job_exclusivity`),报错第一行是 `DATABASE_URL is not set` —— 那个变量来自 job 级 env + service container,不在步骤里。差点把它们当成真回归去追。**判据**:本地红而 CI 同一 commit 绿 = 先查环境差异,别先查代码;确认方式是看报错的**第一行**(往往直说缺哪个变量),不是看最后的 assert。反过来也成立:本地绿不等于 CI 绿 —— 同一天我只跑了自己改的那一个文件就宣布通过,结果打红了另一个文件里三条我从没打开过的断言。**改动共享函数后,要跑的是 CI 那一整套,不是你改的那一个文件**(命令就在 ci.yml 里,照抄那段 `grep -l` 的文件发现逻辑)。
+- **排查「功能不生效」之前,先证明客户端到服务端的基础连通是健康的。** 2026-08-11 屏幕共享联调:我连着给出四个「根因」,前三个都错,而真正让当晚三次实测全废的是两件与功能无关的事 —— ①用户手机挂着 VPN 做 TLS 中间人:**短连接**(聊天/token 上传)能在断续间隙里挤过去、看起来一切正常,而**长连 `wss://`**(屏幕帧)挂不住,于是「聊天好好的,就是看不见屏幕」;②同一时段 test 在部署,ingress 重启导致 `test-api`/`test-enclave` 自定义域名全挂,而直连 CVM 网关(`<app_id>-5003s`)仍 200。**判据**:先跑一遍「中性站点 / prod / test / 直连网关」四点对照 —— 只有 test 挂 = 环境或部署,全挂 = 客户端网络。别在这层没确认前去读业务代码。
+- **验证了机制的内部逻辑 ≠ 验证它被执行到。** 同一晚我算出「94% 的轮询撞在 180 秒聊天压制窗口里」,统计没错,结论全错 —— 那条 lane 因为 `next_screen_watch_at` 从来没有播种器,**根本没有轮询发生过**,压制那一关连碰都没碰到。**每次给出根因前多问一句:这个机制这次真的被执行到了吗?** 有埋点就看埋点(enclave 的 `path` + `status_code` 就是这次的决定性证据),没埋点就先加埋点,别拿「它能解释现象」当证据。
+- **测试数据的形状必须贴近生产,否则你会给一个错的算法盖章。** 我用一个跨 10 分钟的假帧集验证「均匀采样跨越全窗口」并判它 PASS;生产里「全窗口」是**这个账号有史以来所有的帧**,于是首次推帧把用户几天前看过的页面当成「现在」交给了模型 —— 是 Seven 一句「我刚才没在看这个页面」抓出来的,不是测试。**写夹具时先问:这个维度在生产里的真实跨度是多少?**(时间跨度、条数、体积、并发)
+- **拿数据下结论前先看数据的时间窗。** 我差点用一份 20:15→01:50 的埋点去论证 02:49 发生的事,重拉之后结论整个反过来(从「一次帧解密都没有」变成「14 次全部 200」)。admin data-track 每用户只留 200 条事件,**窗口经常盖不住你要查的那一刻**。
 - **下判据之前，先在仓库里找反例**：写"凡是 X 就一定是 Y"这种判据时，**先 grep 现有测试和样本**，别拿"我没见过"当"不存在"。2026-08-09 我给中转站地址错误写判据，断言"真正的 provider 错误一律是 JSON，所以见到 HTML 就是地址错"——而本仓 `tests/test_catalog_consumer_parity.py:158-161` 就存着四个反例（relay 的 401 鉴权页 / 402 支付页 / 429 限流页 / 504 故障页**都是 HTML**）。判据一旦上线，额度不足和鉴权失败会被一并说成"地址填错了"，**比原来的错更严重**。收窄后 HTML 只在 `404` 时才算地址问题。**判据越"显然"，越要去搜它的否定面**；仓库里的既有样本是最便宜的反例来源。
 - **判"某个缺陷修没修好"，先确认你的用例真能让它复现**：称谓泄漏只在**账号没名字**时发生，拿有名字的账号怎么测都是 0——不是修好了，是根本没触发。概率性缺陷的验收用例必须先证明"改之前它会挂"。
 - **上下文注入了新成分，就要证明模型真读到了**：问一个**答案只存在于新注入段**的问题，判分（`tools/e2e/temporal_probe.py` 的做法：问"距上一条多久"，答"刚刚"判 FAIL）。"prompt 里有这段字符串"≠"模型用上了"。
@@ -212,6 +322,37 @@
   教训：`test_memory_capture_trace` 被当 fixture 问题挂了几天，实为 trace 异步化
   引入的真实读写竞态（生产 admin 同样读旧数据，修复 e4b38e39）。排查起手式：
   单跑 vs 全量差异、`git archive` 导出的干净树（别 stash 共享区）、进程内全局状态清单。
+
+### 6.1 先证明测量工具是好的，再谈被测对象坏没坏
+
+2026-08-10 一晚踩了八次，**全部**是"测量工具坏了"而不是"被测对象坏了"。这类事故
+一律长成同一副样子：**你看到一个结论，而那个结论其实来自一个根本没测量该事实的信号。**
+它比普通 bug 危险，因为它同时污染"改坏了"和"改好了"两个方向——当晚它三次让我
+差点把好东西报成坏的，也让两轮全量白跑却以为是绿的。
+
+| 陷阱 | 当晚实例 | 判据 |
+|---|---|---|
+| shell 退出码不是被测命令的 | 后台任务回报 `exit code 0`，那是命令串里最后一个 `tail` 的；pytest 其实被 3 个收集错误中断，**零测试执行** | **只认 pytest 自己那行 `N passed`**；没有那行就是没跑，不管退出码 |
+| zsh 不对未加引号的变量做词分割 | `IGN="--ignore=a --ignore=b"` 再 `$IGN` 展开 → 整串当**一个**参数，`--ignore` 静默失效，两轮全量都白跑 | 参数写字面量；或反查被忽略的文件是否真的没被收集 |
+| `git diff origin/test HEAD` ≠「我改了什么」 | 分支落后时它的语义是「把 origin 变成我」：报 19 files / **-998**，含删掉别人两个测试文件。**同一坑当晚踩两次**，第二次是在 codex 已明确指出之后 | 唯一口径 **`git show --stat <commit>`**；`origin/*` 是活动靶子，"我改了什么"不许以它为参照 |
+| baseline 与被测不在同一 commit | ①拿**还没跑完**的 baseline 比 → 50 条假新增；②两个 worktree 差 4 个提交（其中一个刚好改了那条测试的名字）→ 1 条假回归 | 比之前先 `git rev-parse` 核对两边**完全一致**，并确认 baseline 已跑完 |
+| 断言打在序列化后的文本上 | `json.dumps(messages)` 把 header 里的真实换行转义成 `\n` 两个字符，断言永远匹配不上 → 红三条，差点判「功能没接上」；dump 出真实消息一看，功能好端端的 | 在**消息正文/结构**里断言，别在 dump 出来的字符串里 |
+| 量错了对象 | `split(header)[1]` 当成"世界书正文"量长度，实际把后面整条 prompt 也算了进去（27010 vs 24000）——截断本身是好的 | 明确框定量的**起止两端**，不要只框起点 |
+| 单个 node id / `-k` 静默不收集 | `pytest x.py::test_y` → `2 warnings in 0.21s`，零收集（conftest 白名单）；`-k` 拼错同样静默 | 同第一条；**跑整个文件**能否收集是最快的判别法 |
+| 探针写死仓库路径 | 探针里 `REPO = "/Users/.../feedling-mcp-test"`，于是在任何 worktree 里跑它，import 的都是**主树**的代码；我在 worktree 加了个方法，跑起来照报 `no attribute` | 路径从 `__file__` 推；"在 worktree 改代码→跑探针→绿"这条链默认不成立 |
+
+**通用起手式**：任何"这里坏了"的结论落地之前，先回答一句 ——
+**我用来看见它的那个信号，真的测量它吗？** 当晚三次产品级误判（拿 V1 口径的数据面
+判 V2 用户、断言判"功能没接上"、量法判"截断没生效"）全栽在这一问上。
+
+### 6.2 定根因前，必须往上追一层调用
+
+`if not text: return` 只是**症状落点**；让它可达的是上一层 `require_reply=False`。
+只读症状那一行，会得出"这个洞没被修过"——而实际上恢复机制早就建好、也早就在 prod，
+只是**没接到那条道上**。2026-08-10 定时提醒静默丢失事故，就是这么被多绕了一圈。
+
+同族判据：同一个函数里若已有一条为某 lane / 某场景**破了例**的路径，而另一条同语义
+路径没破例，基本就是漏改，不是设计。
 
 ## 7. "完成"的定义（Definition of Done）
 

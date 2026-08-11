@@ -19,6 +19,14 @@ from __future__ import annotations
 
 from provider_types import ToolSpec
 from capabilities import registry
+# Card-writing rules live with the memory package (single source of truth shared
+# with the V1 guidance block); only the op names above are V2-specific.
+from memory import prompts_v1
+from perception.agent_fields import (
+    AGENT_PERCEPTION_SIGNALS,
+    AGENT_SIGNAL_FIELDS,
+    FAST_AGENT_PERCEPTION_SIGNALS,
+)
 
 REPLY_TOOL = "reply"
 FILE_REPLY_TOOL = "send_file"
@@ -34,6 +42,22 @@ _INT = {"type": "integer"}
 _BOOL = {"type": "boolean"}
 _NO_ARGS: dict = {"type": "object", "properties": {}}
 
+# Keep the provider-visible vocabulary tied to the same projection catalog the
+# capability executor consumes.  A copied enum silently drifts and turns an
+# otherwise healthy perception read into ``unknown_signals`` at runtime.
+_PERCEPTION_SIGNAL_ENUM = list(AGENT_PERCEPTION_SIGNALS)
+_PERCEPTION_FIELD_ENUM = sorted({
+    field
+    for fields in AGENT_SIGNAL_FIELDS.values()
+    for field in fields
+})
+_PERCEPTION_DEFAULTS = ", ".join(FAST_AGENT_PERCEPTION_SIGNALS)
+_PERCEPTION_DOMAINS = (
+    "time/battery, location, weather, motion/focus/audio/app context, "
+    "calendar/reminders, and health/activity data (steps, sleep, workout, "
+    "vitals, activity, body, metabolic, cycle, mood)"
+)
+
 _MEMORY_TOOL_ACTION = {
     "type": "object",
     "properties": {
@@ -41,6 +65,14 @@ _MEMORY_TOOL_ACTION = {
         "summary": _STR,
         "content": _STR,
         "bucket": _STR,
+        # 线索标签。后端(worker 翻译层 + actions)一直在消费它,capture/dream 也产它,
+        # 共享的 MEMORY_WRITE_RULES_V1 还明确教模型「一张卡 1-4 个」——只有这道闸
+        # 拦着,于是 V2 手写的卡标签永远是空的(2026-08-10 真机)。
+        "threads": {"type": "array", "items": _STR},
+        # 这两个直接参与 ambient 排序(memory_readside_core)。schema 不开的话
+        # actions 一律落 0.5/0.3,V2 每张卡权重完全一样。
+        "importance": {"type": "number"},
+        "pulse": {"type": "number"},
         "target_id": _STR,
         "reason": _STR,
     },
@@ -100,9 +132,20 @@ PARAMS: dict[str, dict] = {
     },
     # memory.search(store, ...): params.get("query") (required, non-empty) + optional
     # limit (passed through like index).
+    # memory.search 和 memory.index 走同一个 memory_index_core，那个 core 一直在
+    # 消费 bucket / thread / include_sensitive；index 的 schema 开了这几个、search
+    # 漏了，于是搜索没法限定在某个桶或线索里。V1 的 `memory-index --query` 本来
+    # 能组合这些条件。ambient 刻意不开：search 强制带 query，走 exact-query 分支，
+    # ambient_top_n 不参与候选限制，开了也是哑参数。
     "memory_search": {
         "type": "object",
-        "properties": {"query": _STR, "limit": _INT},
+        "properties": {
+            "query": _STR,
+            "limit": _INT,
+            "bucket": _STR,
+            "thread": _STR,
+            "include_sensitive": _BOOL,
+        },
         "required": ["query"],
     },
     # -- history.py (backed by model_api_runtime/v2/history_readside.py) --
@@ -168,7 +211,12 @@ PARAMS: dict[str, dict] = {
     # perception.snapshot: params.get("signals") (list or csv string).
     "perception_snapshot": {
         "type": "object",
-        "properties": {"signals": {"type": "array", "items": _STR}},
+        "properties": {
+            "signals": {
+                "type": "array",
+                "items": {"type": "string", "enum": _PERCEPTION_SIGNAL_ENUM},
+            },
+        },
         "required": [],
     },
     # perception.recent_apps: params.get("limit"), params.get("hours").
@@ -180,13 +228,20 @@ PARAMS: dict[str, dict] = {
     # perception.trend: params.get("signal"), params.get("field"), params.get("days").
     "perception_trend": {
         "type": "object",
-        "properties": {"signal": _STR, "field": _STR, "days": _INT},
+        "properties": {
+            "signal": {"type": "string", "enum": _PERCEPTION_SIGNAL_ENUM},
+            "field": {"type": "string", "enum": _PERCEPTION_FIELD_ENUM},
+            "days": _INT,
+        },
         "required": [],
     },
     # perception.history: params.get("signal"), params.get("days").
     "perception_history": {
         "type": "object",
-        "properties": {"signal": _STR, "days": _INT},
+        "properties": {
+            "signal": {"type": "string", "enum": _PERCEPTION_SIGNAL_ENUM},
+            "days": _INT,
+        },
         "required": [],
     },
 
@@ -348,7 +403,9 @@ DESCRIPTIONS: dict[str, str] = {
                        "and list fields signature, boundaries, do_not_say, "
                        "stable_definitions. Edit a list field by whole-list replacement "
                        "or with op keys add_<field>/remove_<field>/replace_<field> "
-                       "(e.g. add_signature, remove_boundaries). For each list field, "
+                       "(e.g. add_signature, remove_boundaries). One exception: the "
+                       "whole-list replace key for signature is plural — write "
+                       "replace_signatures, NOT replace_signature. For each list field, "
                        "use only one method in a call: whole replacement, add, remove, "
                        "or replace. D4 rename rule: changing agent_name requires "
                        "self_introduction in the same call. To recalibrate how "
@@ -427,8 +484,13 @@ DESCRIPTIONS: dict[str, str] = {
                      "optional 'bucket'), 'update' (supply 'target_id' plus new "
                      "'summary'/'content'), or 'delete' (supply 'target_id'). Each action "
                      "may include an audit 'reason'. Get "
-                     "target_ids from memory_search/memory_index first."),
-    "perception_snapshot": ("Read the latest perception snapshot for the given signals. "
+                     "target_ids from memory_search/memory_index first.\n"
+                     + prompts_v1.MEMORY_WRITE_RULES_V1),
+    "perception_snapshot": ("Read the latest perception snapshot for named signals across "
+                            + _PERCEPTION_DOMAINS + ". "
+                            "If signals is omitted, ONLY the fast defaults are returned: "
+                            + _PERCEPTION_DEFAULTS + ". Health and activity signals are "
+                            "never included by default; request them explicitly by name. "
                             "The app field is only the latest open/close event observed "
                             "within 15 minutes; never claim it is the app currently in use. "
                             "Use perception_recent_apps for an activity trajectory."),
@@ -437,16 +499,23 @@ DESCRIPTIONS: dict[str, str] = {
                                "the time window and check minutes_ago before saying 'just "
                                "now'. apps=[] means no data; disabled=true means access is "
                                "off, not that no apps were used."),
-    "perception_trend": ("Read a trend summary for a perception signal over recent days. "
+    "perception_trend": ("Read a numeric-field trend over recent days for one named signal "
+                         "from " + _PERCEPTION_DOMAINS + ". Snapshot defaults do not apply: "
+                         "always name the signal, and name the field when the signal has "
+                         "multiple numeric fields. "
                          "Interpret the rolling baseline as the usual level and delta as "
                          "the current change from that baseline; do not conflate them."),
-    "perception_history": "Read raw historical values for a perception signal over recent days.",
+    "perception_history": ("Read raw daily historical values over recent days for one named "
+                           "signal from " + _PERCEPTION_DOMAINS + ". Snapshot defaults do "
+                           "not apply: always request the signal explicitly."),
     "screen_recent": "List recent screen-share frame metadata.",
     "screen_read": ("Read a specific screen-share frame, or the latest one if no frame_id "
-                    "is given. Start without include_image for caption/OCR. If pixels are "
-                    "needed, set include_image=true; Runtime V2 inspects them through its "
-                    "native vision observer and returns an untrusted visual_observation "
-                    "instead of a local image_file path."),
+                    "is given. During an active screen share, omitting include_image shows "
+                    "the pixels by default; set include_image=false only when text/OCR is "
+                    "explicitly sufficient. Outside an active share, pixels remain opt-in. "
+                    "Runtime V2 inspects pixels through its native vision observer and "
+                    "returns an untrusted visual_observation instead of a local image_file "
+                    "path."),
     "photo_recent": "List recent photos, optionally capped by limit.",
     "photo_read": ("Read a specific photo by id. Set include_image=true only when metadata "
                    "is insufficient; Runtime V2 inspects the decrypted pixels through its "

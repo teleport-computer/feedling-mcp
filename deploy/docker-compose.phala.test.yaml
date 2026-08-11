@@ -98,7 +98,7 @@ services:
   # baked into REPORT_DATA. Moving this behind ingress would break the
   # Phase 3 pinning guarantee.
   enclave:
-    image: &enclave-image ghcr.io/teleport-computer/feedling:b20a6d6
+    image: &enclave-image ghcr.io/teleport-computer/feedling:db04786
     command: &enclave-command ["python", "-u", "backend/enclave_app.py"]
     restart: unless-stopped
     environment:
@@ -178,7 +178,7 @@ services:
   # a safe no-op unless invoked with --force.
 
   backend:
-    image: ghcr.io/teleport-computer/feedling:b20a6d6
+    image: ghcr.io/teleport-computer/feedling:db04786
     # gunicorn (uvicorn ASGI worker) = production server (the Werkzeug dev server stalls on large
     # responses under TDX). Worker count now comes from FEEDLING_BACKEND_WORKERS
     # (backend/gunicorn_conf.py, default 1) — NOT a `-w` flag — so the default is
@@ -309,6 +309,9 @@ services:
       # "resident" keeps day-1 behavior identical to pre-dual-runtime test;
       # allowlisted users' desired state overrides this default.
       FEEDLING_RUNTIME_DEFAULT_DESIRED: "resident"
+      # UTC registration cutoff for automatic new Model API -> Runtime V2
+      # admission. Empty preserves resident-default behavior for every account.
+      FEEDLING_V2_NEW_USER_CUTOFF: "${FEEDLING_V2_NEW_USER_CUTOFF:-}"
       # Backend owns capture admission/triggers; serve-worker executes the lane.
       # Keep both deployment gates aligned. User consent remains independent.
       # Normal-on in test (V1-parity program 2026-08-05): product lanes are
@@ -357,7 +360,7 @@ services:
   # (deploy/docker-compose.phala.runner.yaml) is unrelated extra V2 capacity
   # and is untouched by this change.
   serve-worker:
-    image: ghcr.io/teleport-computer/feedling:b20a6d6
+    image: ghcr.io/teleport-computer/feedling:db04786
     container_name: serve-worker
     command: ["python", "-u", "backend/model_api_runtime/v2/serve_worker.py"]
     restart: unless-stopped

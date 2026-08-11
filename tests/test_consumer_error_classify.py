@@ -822,7 +822,17 @@ def test_system_failure_reply_keeps_fallback():
 
 
 def test_none_notice_falls_back():
-    assert crc._turn_failure_reply_text(None) == crc.FALLBACK_REPLY_EN
+    """不带语言锚点 = 没有语言信号 → 保持中文(这条链路的历史默认)。
+
+    2026-08-10:双语兜底刚落地时判据写反了(「没有中文就发英文」),空串于是走
+    英文分支、打红本文件三条;zhihao 的 f7205c0b 先按当时的行为把这行对齐成
+    EN 让 CI 转绿(上面两条显式双语断言是那次加的,是改进,保留)。但真正该修的
+    是**默认值本身**:零信息时翻转 incumbent,等于给下一个忘记传锚点的调用方
+    埋一个「全体用户静默切英文」的坑。判据已改成「要有正面证据才发英文」
+    (`_prefers_english`),这行随之回到中文。生产里 4 个调用点当前都传了锚点,
+    两种写法今天都不影响线上 —— 正因如此更该按「失败时退回 incumbent」来定。
+    """
+    assert crc._turn_failure_reply_text(None) == crc.FALLBACK_REPLY
 
 
 def test_actionable_reply_suppresses_duplicate_banner():

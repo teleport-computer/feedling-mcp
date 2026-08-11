@@ -1,5 +1,10 @@
 # 健康探针隔离实施计划
 
+> **上游协调说明（2026-08-10）：** `test` 分支已将 `/healthz` 改为完全不访问
+> PostgreSQL 的进程存活探针，因此下文涉及 `/healthz` 数据库查询、专用执行器和 503
+> 的步骤已被该上游契约取代。最终实现仅隔离 `/healthz/runner` 的 heartbeat 查询；
+> `/healthz` 保持进程内检查并在 worker 可响应时返回 200。
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** 让 `/healthz` 和 `/healthz/runner` 使用独立双线程执行池，并通过数据库连接、SQL 和路由三级硬超时，确保业务 ASGI 阻塞线程池饱和时仍在三秒内返回结构化响应。

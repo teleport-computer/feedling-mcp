@@ -4,6 +4,7 @@ round-trip through upsert_wake_schedule/get_wake_schedule, and
 due_screen_watch_users mirrors due_heartbeat_users (payment-cooldown
 exclusion, NULL-is-not-due)."""
 import sys
+import types
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
@@ -12,11 +13,14 @@ import pytest
 import conftest
 import db
 from model_api_runtime.v2 import jobs_store
+from model_api_runtime.v2 import scheduler
+from model_api_runtime.v2 import serve_worker
 
 
 @pytest.fixture(autouse=True)
 def _clean():
     with db.get_pool().connection() as conn:
+        conn.execute("DELETE FROM agent_jobs WHERE user_id LIKE 'u_sw_%'")
         conn.execute("DELETE FROM v2_wake_schedule")
     yield
 
@@ -77,3 +81,92 @@ def test_null_next_screen_watch_at_is_not_due():
     conftest.seed_user("u_sw_null")
     jobs_store.upsert_wake_schedule("u_sw_null", next_heartbeat_at=1.0)
     assert jobs_store.due_screen_watch_users(now=500.0) == []
+
+
+def test_startup_seed_repairs_null_clocks_and_reaches_a_real_enqueued_job(
+    monkeypatch,
+):
+    """New and pre-existing V2 users must cross the real due query and enqueue.
+
+    The old-user row models production: heartbeat already armed the shared row
+    while screen-watch stayed NULL. The new user starts with no row at all.
+    """
+    now = 500.0
+    users = ["u_sw_seed_existing", "u_sw_seed_new"]
+    for user_id in users:
+        conftest.seed_user(user_id)
+        conftest.set_v2_runtime_owner(user_id)
+    jobs_store.upsert_wake_schedule(
+        "u_sw_seed_existing", next_heartbeat_at=9_000.0
+    )
+    assert jobs_store.get_wake_schedule("u_sw_seed_new") is None
+    assert (
+        jobs_store.get_wake_schedule("u_sw_seed_existing")[
+            "next_screen_watch_at"
+        ]
+        is None
+    )
+
+    monkeypatch.setattr(
+        serve_worker.admin_core,
+        "list_runtime_modes",
+        lambda: {"db_action_v2": list(users)},
+    )
+    assert serve_worker._seed_existing_v2_wake_schedules(now=now) == 2
+    assert set(jobs_store.due_screen_watch_users(now=now)) == set(users)
+    assert (
+        jobs_store.get_wake_schedule("u_sw_seed_existing")["next_heartbeat_at"]
+        == 9_000.0
+    )
+    assert serve_worker._seed_existing_v2_wake_schedules(now=now) == 0
+
+    monkeypatch.setattr(serve_worker.time, "time", lambda: now)
+    monkeypatch.setattr(jobs_store, "due_heartbeat_users", lambda: [])
+    monkeypatch.setattr(
+        serve_worker.hosted_config_store,
+        "hosted_runtime_v2_enabled_strict",
+        lambda _store: True,
+    )
+    monkeypatch.setattr(
+        serve_worker.core_store,
+        "get_store",
+        lambda _user_id: types.SimpleNamespace(chat_messages=[]),
+    )
+    monkeypatch.setattr(
+        serve_worker.db,
+        "frame_list_meta",
+        lambda user_id: [
+            {"filename": f"{user_id}-fresh.env.json", "ts": now, "app": None}
+        ],
+    )
+    monkeypatch.setattr(
+        serve_worker,
+        "_wake_decision_for_user",
+        lambda _user_id, **_kwargs: {
+            "should_wake": True,
+            "wake_interval_sec": 7_200,
+            "block_reason": "",
+        },
+    )
+    notifications = []
+    monkeypatch.setattr(
+        serve_worker.core_wake_bus,
+        "notify",
+        lambda channel, user_id: notifications.append((channel, user_id)),
+    )
+
+    result = scheduler.run_scheduler_tick(
+        serve_worker._build_scheduler_deps(), now=now
+    )
+    assert result["screen_watch_enqueued"] == 2
+    with db.get_pool().connection() as conn:
+        rows = conn.execute(
+            "SELECT user_id,lane,status,reason FROM agent_jobs "
+            "WHERE user_id IN (%s,%s) ORDER BY user_id",
+            tuple(users),
+        ).fetchall()
+    assert [(row[0], row[1], row[2], row[3]) for row in rows] == [
+        ("u_sw_seed_existing", "screen_watch", "pending", "screen_watch"),
+        ("u_sw_seed_new", "screen_watch", "pending", "screen_watch"),
+    ]
+    assert set(notifications) == {("v2_jobs", user_id) for user_id in users}

@@ -3,7 +3,7 @@ title: MCP servers
 description: Connect your agent to remote MCP tool servers, including plain HTTP, private-network, and self-signed endpoints.
 ---
 
-Feedling lets each account register up to 10 remote [MCP](https://modelcontextprotocol.io)
+Feedling lets each account register up to 30 remote [MCP](https://modelcontextprotocol.io)
 servers. Both MCP transports are supported: modern **streamable HTTP** and the
 older **HTTP+SSE** transport that some providers still ship as their `…/sse`
 URL. The transport is detected automatically from the URL and the server's
@@ -75,11 +75,44 @@ The response never echoes back the URL, header values, or CA certificate.
 from the URL path (`…/sse` ⇒ `"sse"`) and is corrected to whatever the server
 actually speaks the first time a connectivity test succeeds.
 
-`GET /v1/mcp/servers` returns `{"servers": [...]}` with the same shape.
+`GET /v1/mcp/servers` returns `{"servers": [...]}` with the same configuration
+shape and may add the optional Hosted Runtime V2 observation described below.
 `PATCH /v1/mcp/servers/{name}` with `{"enabled": false}` toggles a server
 without resending the URL, headers, or CA. The same PATCH also updates encrypted
 read-only approvals as described below. `DELETE /v1/mcp/servers/{name}` removes
 the server.
+
+### Recent runtime observation
+
+When Hosted Runtime V2 has tried to load an enabled server during recent Chat
+turns, `GET /v1/mcp/servers` adds a content-free `runtime` summary to that
+server's record:
+
+```json
+{
+  "runtime": {
+    "last_kind": "transport_failure",
+    "last_at": 1786370000.0,
+    "recent_ok": 0,
+    "recent_total": 10
+  }
+}
+```
+
+`last_at` is a Unix timestamp. `last_kind` is `"available"` when the server's
+catalog loaded successfully; other stable kinds describe why it was not ready.
+Clients must tolerate new kinds and use a generic not-ready presentation for
+unknown values. `recent_ok` counts observations whose kind was `"available"`,
+and `recent_total` is the number of observed Chat turns in the bounded window
+(at most 10). These counts are turns for this server, not server counts.
+
+The `runtime` key is omitted when there is no observation. In particular,
+Runtime V1 does not currently write this status, and omission must not be shown
+as a successful connection. Individual turn rows, URLs, headers, exceptions,
+tool arguments, and remote response bodies are never included. Disabling a
+server may prune its old observation after the next successful V2 configuration
+read; re-enabling it then starts with no status until a new Chat turn observes
+it.
 
 ## Network requirements
 

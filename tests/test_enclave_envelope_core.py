@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import logging
 import os
 import sys
 from pathlib import Path
@@ -65,14 +66,21 @@ def test_owner_mismatch_rejected(sk):
     assert "owner mismatch" in ei.value.reason
 
 
-def test_tampered_ciphertext_rejected(sk):
+def test_tampered_ciphertext_rejected_and_traced(sk, caplog):
     env = _make_envelope("usr_a", "itm_1", b"x", bytes(sk.public_key))
     raw = bytearray(base64.b64decode(env["body_ct"]))
     raw[0] ^= 0xFF
     env["body_ct"] = base64.b64encode(bytes(raw)).decode()
+    caplog.set_level(logging.WARNING)
     with pytest.raises(envmod.DecryptFailure) as ei:
         envmod.decrypt_envelope(env, "usr_a", sk)
     assert "AEAD verify" in ei.value.reason
+    assert any(
+        "envelope_aead_verify_failed" in record.getMessage()
+        and "usr_a" in record.getMessage()
+        and "itm_1" in record.getMessage()
+        for record in caplog.records
+    )
 
 
 def test_aad_binds_item_id(sk):

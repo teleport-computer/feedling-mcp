@@ -59,6 +59,24 @@ def test_partial_upsert_leaves_other_columns_unchanged():
     assert second["next_heartbeat_at"] == first["next_heartbeat_at"]
 
 
+def test_screen_chat_cursor_round_trips_without_clobbering_watch_cursor():
+    uid = "u_ws_screen_chat_cursor"
+    seed_user(uid)
+    jobs_store.upsert_wake_schedule(
+        uid,
+        last_screen_watch_frame_id="watch-f1",
+    )
+
+    jobs_store.upsert_wake_schedule(
+        uid,
+        last_screen_chat_frame_id="chat-f2",
+    )
+
+    row = jobs_store.get_wake_schedule(uid)
+    assert row["last_screen_watch_frame_id"] == "watch-f1"
+    assert row["last_screen_chat_frame_id"] == "chat-f2"
+
+
 def test_due_heartbeat_users_excludes_future_and_includes_due():
     seed_user("u_ws_due")
     seed_user("u_ws_future")
@@ -195,10 +213,21 @@ def test_due_heartbeat_backoff_is_bypassed_only_by_genuine_user_input():
     )
 
     assert uid not in jobs_store.due_heartbeat_users(now=now + 1)
+    assert jobs_store.heartbeat_due_diagnosis(uid, now=now + 1) == {
+        "present": True,
+        "blocked_by": ["proactive_backoff"],
+    }
     _append_user_row(uid, "maintenance-reset-no", source="resident_maintenance")
     assert uid not in jobs_store.due_heartbeat_users(now=now + 1)
+    assert jobs_store.heartbeat_due_diagnosis(uid, now=now + 1)[
+        "blocked_by"
+    ] == ["proactive_backoff"]
     _append_user_row(uid, "genuine-reset")
     assert uid in jobs_store.due_heartbeat_users(now=now + 1)
+    assert jobs_store.heartbeat_due_diagnosis(uid, now=now + 1) == {
+        "present": True,
+        "blocked_by": [],
+    }
 
 
 @pytest.mark.parametrize("lane", ["manual_wake", "screen_watch"])

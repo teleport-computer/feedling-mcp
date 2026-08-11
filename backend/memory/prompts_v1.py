@@ -50,6 +50,38 @@ _COMMON_BUCKETS_ZH = "、".join(zh for zh, _en in COMMON_BUCKETS_V1)
 _BUCKET_EN_TO_ZH = {en: zh for zh, en in COMMON_BUCKETS_V1}
 _BUCKET_ZH_TO_EN = {zh: en for zh, en in COMMON_BUCKETS_V1}
 
+# Short forms the model actually emits instead of the canonical multi-word bucket.
+# Observed 2026-08-10 (usr_7001b1df80e2024d, V2): a Chinese card came back with the
+# bucket "preferences" — not a key in the pair map above, so the backstop passed it
+# straight through and an English bucket landed in a Chinese garden. The exact-match
+# map only ever caught models that wrote "Preferences & boundaries" in full.
+#
+# Keys are casefolded; the lookup below casefolds too, so a lowercase "work" is
+# also caught. Only unambiguous short forms of the common buckets belong here — a
+# genuinely custom bucket must still pass through untouched.
+_BUCKET_ALIASES = {
+    "preferences": "偏好与边界",
+    "boundaries": "偏好与边界",
+    "goals": "目标与成长",
+    "growth": "目标与成长",
+    "relationship": "我们的关系",
+    "feelings": "情绪与安抚",
+    "emotions": "情绪与安抚",
+    "comfort": "情绪与安抚",
+    "personality": "个性与价值观",
+    "values": "个性与价值观",
+    "places": "地点与旅行",
+    "travel": "地点与旅行",
+}
+# Canonical-name lookup keyed by casefolded form, so case-only drift converges too.
+_BUCKET_EN_FOLDED = {en.casefold(): zh for zh, en in COMMON_BUCKETS_V1}
+_BUCKET_ALIAS_TO_ZH = {**_BUCKET_EN_FOLDED, **_BUCKET_ALIASES}
+_BUCKET_ALIAS_TO_EN = {
+    folded: _BUCKET_ZH_TO_EN[zh]
+    for folded, zh in _BUCKET_ALIAS_TO_ZH.items()
+    if zh in _BUCKET_ZH_TO_EN
+}
+
 
 def _text_is_chinese(text: str) -> bool:
     """A card counts as Chinese if its text carries any CJK ideograph."""
@@ -64,24 +96,42 @@ def normalize_bucket_language(bucket: str, text: str) -> str:
     if not b:
         return b
     if _text_is_chinese(text):
-        return _BUCKET_EN_TO_ZH.get(b, b)
-    return _BUCKET_ZH_TO_EN.get(b, b)
+        # Exact pair map first, then the casefolded short-form table; a bucket in
+        # neither is genuinely custom (妈妈 / the house) and must survive as written.
+        mapped = _BUCKET_EN_TO_ZH.get(b)
+        return mapped if mapped else _BUCKET_ALIAS_TO_ZH.get(b.casefold(), b)
+    mapped = _BUCKET_ZH_TO_EN.get(b)
+    return mapped if mapped else _BUCKET_ALIAS_TO_EN.get(b.casefold(), b)
 
 
-MEMORY_WRITE_GUIDANCE_V1 = ("""
-Memory write guidance:
+# Runtime-agnostic card-writing rules — shared verbatim by the V1 hosted-runtime
+# guidance block below and by the Runtime V2 `memory_write` tool description
+# (capabilities/tool_schema.py).
+#
+# ⚠️ Op names are deliberately NOT in here. V1 says `memory.add` / `memory.supersede`;
+# V2's schema takes op='add'/'update'/'delete'. V2 ran without ANY of these rules
+# until 2026-08-10, and the obvious "just inject MEMORY_WRITE_GUIDANCE_V1 into V2"
+# fix would have taught the V2 model two op names its own schema rejects — worse
+# than no guidance. Each runtime states its own ops and shares the rules below.
+MEMORY_WRITE_RULES_V1 = ("""
 - Write only durable user/relationship facts, preferences, boundaries, repeated patterns, or meaningful events.
 - Do not write greetings, jokes, one-off task instructions, unconfirmed guesses, roleplay hypotheticals, or the assistant's own inference.
-- Use memory.add for new durable events/facts.
-- Use memory.supersede when the user corrects or replaces an older memory; do not patch old cards in place.
+- Refer to the person by the name on their identity card. NEVER call them 「用户」/"the user" in card text, and do not use the placeholder 「TA」 or the second person 「你」 for them. When you do not know a name, prefer dropping the subject entirely (「常在深夜写代码」) over inventing a label.
 - Pick one bucket and 1-4 reusable threads. Prefer existing bucket/thread names when provided; converge on the common buckets and only mint a specific new bucket (Mom / 妈妈 / the house) when none fit.
 - The bucket name MUST be ONE word in the memory's OWN language: a Chinese memory uses a Chinese bucket (from: """
 + _COMMON_BUCKETS_ZH + """); an English memory uses an English bucket (from: """
 + _COMMON_BUCKETS_EN + """). NEVER write a bilingual slash pair like 「健康/Health」or 「宠物/Pets」, and never let 工作 and Work coexist as two buckets.
 - importance means future usefulness for understanding the user. pulse means emotional activation when remembered.
-- content must use three Markdown sections: 记忆 / 上下文 / 使用提示.
 - Do not claim "saved" or "remembered" before the backend write actually succeeds.
 """).strip()
+
+
+MEMORY_WRITE_GUIDANCE_V1 = ("""
+Memory write guidance:
+- Use memory.add for new durable events/facts.
+- Use memory.supersede when the user corrects or replaces an older memory; do not patch old cards in place.
+"""
++ MEMORY_WRITE_RULES_V1).strip()
 
 
 # Full bucket-convergence guidance injected into every card-creating prompt

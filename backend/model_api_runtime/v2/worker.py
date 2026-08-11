@@ -73,6 +73,7 @@ from capabilities import tool_schema as cap_tool_schema
 from core import chat_activity as core_chat_activity
 from core import envelope as core_envelope
 from core import protocol_leak
+from core import util as core_util
 from core import provider_usage
 from core import store as core_store
 from core import wake_bus as core_wake_bus
@@ -81,9 +82,15 @@ from perception.glance import (
     perception_glance_fingerprint,
     project_perception_wake_events,
 )
+from perception.agent_fields import (
+    AGENT_PERCEPTION_SIGNALS,
+    FAST_AGENT_PERCEPTION_SIGNALS,
+)
+from screen import screen_read_core
 from model_api_runtime.v2 import coalesce as v2_coalesce
 from model_api_runtime.v2 import compaction as v2_compaction
 from model_api_runtime.v2 import context
+from model_api_runtime.v2 import screen_chat as v2_screen_chat
 from model_api_runtime.v2 import cursor as v2_cursor
 from model_api_runtime.v2 import document_render as v2_document_render
 from model_api_runtime.v2 import effect_outbox as v2_effect_outbox
@@ -767,6 +774,60 @@ def _safe_eager_screen_metadata(data: object) -> dict:
     return safe
 
 
+def _screen_share_grounding(user_id: str) -> dict:
+    """聊天回合的屏幕共享健康提示 —— **只回状态,不回内容**。
+
+    为什么需要它:`CHAT_SYSTEM_PROMPT` 早就写了「请求涉及 shared screen 就用 screen
+    工具」,但同一句后半段是「无关对话别调这些工具」。模型**无从知道此刻有没有共享
+    在进行**,于是保守地不调 —— 用户的体感就是「它看不见我的屏幕」,而后端其实一直
+    收着帧(usr_7001b1df80e2024d 2026-08-10:共享在推流、开关全开,两小时 123 个回合
+    没有一次读屏)。补上这个信号,模型才有依据决定要不要 screen_read。
+
+    两条硬约束:
+    ① **不碰 enclave**。走 `db.frame_list_meta`(服务端明文的 frame_id/ts 索引),
+       和 serve_worker 的屏幕监看生产者同一条路 —— 这个函数在**每个聊天回合**都跑,
+       一次 enclave 往返会锤死共享解密代理的容量。
+    ② **只回状态与秒数**。frame_id / caption / 窗口标题一律不进这个可用性块。
+       只要当前路由没有明确的 unsupported 反证,调用方就另走有界推帧路径,把
+       像素标成不可信应用数据,并在第一轮 provider 调用之前先建立出站执行栅栏。
+
+    设备仍报告开启、但帧超过五分钟未更新时返回 stalled 状态和重启建议，调用方
+    只把建议提供给模型，不解密旧帧。共享没在进行(或读取失败)时返回 {}，调用方
+    据此整块省略 —— 不共享的用户 prompt 一个字都不变，provider 侧前缀缓存不受影响。
+    """
+    return screen_read_core.screen_share_grounding(user_id)
+
+
+def _screen_vision_allows_pixels(verdict: Any) -> bool:
+    """Optimistically admit pixels unless this route is known unsupported.
+
+    ``untested`` and a missing verdict are the normal first-turn state. The
+    provider fallback strips only our tagged screen block, retries the user's
+    text once, and persists ``unsupported`` after that retry succeeds, so lack
+    of a probe is not evidence that pixels must be silently withheld.
+    """
+    if not isinstance(verdict, dict):
+        return True
+    return str(verdict.get("vision_test_status") or "").strip().lower() != (
+        "unsupported"
+    )
+
+
+def _mark_screen_route_vision_unsupported(user_id: str, verdict: Any) -> bool:
+    """Persist a learned rejection behind the exact route-version fence."""
+    if not isinstance(verdict, dict) or not verdict.get("id"):
+        return False
+    return bool(
+        db.model_api_route_mark_vision_test(
+            user_id,
+            str(verdict["id"]),
+            status="unsupported",
+            error="vision_model_incompatible",
+            expected_updated_at=str(verdict.get("updated_at") or ""),
+        )
+    )
+
+
 def _read_blocks_later_outbound(tool_call) -> bool:
     """Argument-aware private/text read boundary for one completed tool call."""
     name = str(getattr(tool_call, "name", "") or "")
@@ -1254,6 +1315,9 @@ class TurnDeps:
     # read_tail，b64 会进摘要器 prompt，且该用户历史上每张图都会被解密一次。默认 None：
     # worker.py 自身不 import hosted/capabilities 的装配细节；生产装配见 serve_worker。
     read_images: Callable[[str, list[str]], dict[str, dict]] | None = None
+    # Foreground screen-share pixels. Production returns a bounded decrypted
+    # batch plus content-free cache counters; callers must hold enclave_sem.
+    read_screen_frames: Callable[[str, list[str]], dict[str, Any]] | None = None
     # (user_id, prompt, main config, auth) -> tuple[ProviderMedia, ...]. The
     # assembly tier resolves the optional dedicated route and decrypts only its
     # credential. The model-facing tool stays provider-neutral.
@@ -1303,9 +1367,15 @@ class TurnDeps:
     read_perception_wake_context: Callable[[str, int], list[dict]] | None = None
     # Pending timer identity lets follow-ups use a backend-confirmed wake_id.
     read_pending_scheduled_wake_context: Callable[[str], dict] | None = None
-    # Chat-only World Book match. The assembly callback decrypts and matches the
-    # user's entries against this turn's current user text, returning
-    # {"block": str, "matched_names": [...]}. Wake lanes never call it.
+    # World Book match. The assembly callback decrypts the user's entries and
+    # matches them against whatever messages it is handed, returning
+    # {"block": str, "matched_names": [...]}.
+    #
+    # **Every lane where the companion speaks in its own voice calls it.** chat
+    # passes this turn's user text; wake lanes pass the reminder note (scheduled)
+    # or an empty list (heartbeat / manual_wake / screen_watch) — an empty list
+    # is precisely what selects alwaysOn-only. See `_run_wake` for why the
+    # signal differs per lane.
     read_worldbook_context: Callable[..., dict] | None = None
     # (user_id, actions) -> result dict：把抽取产出的 memory.add/memory.supersede action 落库
     # （走既有 /v1/memory/actions 同路径的服务端实现）。None 时跳过持久化、仍干净 mark_completed
@@ -1390,6 +1460,11 @@ class TurnDeps:
     seal_trajectory_payload: Callable[[str, bytes, str], dict] | None = None
     # (user_id, envelope, runtime_token) -> plaintext bytes
     open_trajectory_payload: Callable[[str, dict, str], bytes] | None = None
+    # Content-free admin/debug trace boundary. Production resolves the user's
+    # store and delegates to serve_worker._emit_v2_debug_trace; worker stays
+    # dependency-clean and tests may inject a collector. Observability is always
+    # best-effort and must never affect tool execution.
+    emit_debug_trace: Callable[..., None] | None = None
 
 
 class _EmptyMcpTurn:
@@ -2259,6 +2334,10 @@ class TurnMetrics:
     effective_tail_turns: int | None = None
     tail_fallback: bool = False
     prompt_frontier_exhaustion_count: int = 0
+    screen_frames_pushed: int = 0
+    screen_frame_cache_hits: int = 0
+    screen_frame_cache_misses: int = 0
+    visible_reply_count: int = 0
     _flushed: bool = False
     _started: float = 0.0
 
@@ -2360,6 +2439,19 @@ class TurnMetrics:
             self.prompt_frontier_exhaustion_count + 1,
         )
 
+    def record_screen_frames(
+        self, *, pushed: int, cache_hits: int, cache_misses: int
+    ) -> None:
+        self.screen_frames_pushed = max(0, int(pushed))
+        self.screen_frame_cache_hits = max(0, int(cache_hits))
+        self.screen_frame_cache_misses = max(0, int(cache_misses))
+
+    def record_visible_reply(self) -> None:
+        self.visible_reply_count = min(
+            (1 << 31) - 1,
+            self.visible_reply_count + 1,
+        )
+
     def flush(self, *, failed: bool, status: str) -> None:
         """Idempotent per-job upsert; guarded so this SAME accumulator instance
         never double-writes even if a lane handler somehow reaches two terminal
@@ -2400,6 +2492,10 @@ class TurnMetrics:
             prompt_frontier_exhaustion_count=(
                 self.prompt_frontier_exhaustion_count
             ),
+            screen_frames_pushed=self.screen_frames_pushed,
+            screen_frame_cache_hits=self.screen_frame_cache_hits,
+            screen_frame_cache_misses=self.screen_frame_cache_misses,
+            visible_reply_count=self.visible_reply_count,
             latency_ms=latency_ms,
             model_calls=self.model_calls,
             retries=self.retries,
@@ -2613,6 +2709,94 @@ def _make_tool_trajectory_callback(
     return _record
 
 
+_PERCEPTION_TRACE_TOOLS = frozenset({
+    "perception_snapshot",
+    "perception_history",
+    "perception_trend",
+})
+_PERCEPTION_TRACE_SIGNALS = frozenset(AGENT_PERCEPTION_SIGNALS)
+
+
+def _v2_tool_trace_detail(
+    tc,
+    *,
+    event_kind: str,
+    result: ToolResult | None,
+    duration_ms: float | None,
+) -> dict[str, Any]:
+    """Project one terminal tool boundary to content-free debug metadata."""
+    tool = core_chat_activity.safe_token(getattr(tc, "name", ""), max_len=120)
+    content = result.content if isinstance(result, ToolResult) else ""
+    metadata = result.metadata if isinstance(result, ToolResult) else {}
+    failed = (
+        event_kind == "tool_call_error"
+        or str(content or "").strip().lower().startswith("error:")
+    )
+    result_kind = "error" if failed else _generic_tool_result_kind(content)
+    error_code = "tool_error" if failed else ""
+    if tool in _PERCEPTION_TRACE_TOOLS and isinstance(metadata, dict):
+        projected_kind = str(metadata.get("perception_result_kind") or "")
+        if projected_kind in {"empty", "value", "error"}:
+            result_kind = projected_kind
+            failed = projected_kind == "error"
+        projected_code = core_chat_activity.safe_token(
+            metadata.get("perception_error_code"), max_len=64
+        ).lower()
+        if projected_code:
+            error_code = projected_code
+    detail: dict[str, Any] = {
+        "tool": tool,
+        "args": _v2_tool_trace_args(tc),
+        "result_status": "err" if failed else "ok",
+        "result_kind": result_kind,
+    }
+    if duration_ms is not None:
+        detail["dur_ms"] = duration_ms
+    if failed:
+        detail["error_code"] = error_code or "tool_error"
+    return detail
+
+
+def _v2_tool_trace_args(tc) -> dict[str, Any]:
+    """Keep only catalog-backed perception signal names, never user content."""
+    tool = str(getattr(tc, "name", "") or "")
+    if tool not in _PERCEPTION_TRACE_TOOLS:
+        return {}
+    raw_args = getattr(tc, "args", None)
+    args = raw_args if isinstance(raw_args, dict) else {}
+    if tool == "perception_snapshot":
+        raw_signals = args.get("signals")
+        if not isinstance(raw_signals, list) or not raw_signals:
+            return {
+                "signals": list(FAST_AGENT_PERCEPTION_SIGNALS),
+                "defaulted": True,
+            }
+        signals = [
+            value
+            for value in raw_signals
+            if isinstance(value, str) and value in _PERCEPTION_TRACE_SIGNALS
+        ]
+    else:
+        value = args.get("signal")
+        signals = (
+            [value]
+            if isinstance(value, str) and value in _PERCEPTION_TRACE_SIGNALS
+            else []
+        )
+    return {"signals": signals}
+
+
+def _generic_tool_result_kind(content: Any) -> str:
+    text = str(content or "").strip()
+    if not text or text.lower() == "ok":
+        return "empty"
+    try:
+        value = json.loads(text)
+    except (TypeError, ValueError):
+        return "value"
+    return "empty" if value in (None, "", [], {}) else "value"
+
+
 def _make_chat_tool_activity_callback(
     *,
     user_id: str,
@@ -2620,12 +2804,14 @@ def _make_chat_tool_activity_callback(
     attempt_identity: int,
     recorder: v2_trajectory.TrajectoryRecorder | None,
     effect_evidence_by_call: dict[str, dict],
+    emit_debug_trace: Callable[..., None] | None = None,
 ):
     """Write a display-safe status row at each confirmed V2 tool boundary."""
     trajectory_callback = _make_tool_trajectory_callback(
         recorder, effect_evidence_by_call
     )
     invocation_ids: dict[int, str] = {}
+    started_monotonic: dict[int, float] = {}
     ordinal = itertools.count(1)
 
     async def _record(tc, event_kind: str, payload: dict) -> None:
@@ -2637,6 +2823,8 @@ def _make_chat_tool_activity_callback(
             invocation_ids[object_key] = (
                 f"{job_id}:{int(attempt_identity)}:{next(ordinal)}"
             )
+        if event_kind == "tool_call_started":
+            started_monotonic[object_key] = time.monotonic()
         result = payload.get("result")
         result_content = result.content if isinstance(result, ToolResult) else ""
         result_metadata = result.metadata if isinstance(result, ToolResult) else {}
@@ -2648,6 +2836,16 @@ def _make_chat_tool_activity_callback(
             "state": core_chat_activity.event_state(event_kind, result_content),
         }
         duration = core_chat_activity.safe_duration_ms(payload.get("duration_ms"))
+        if (
+            duration is None
+            and event_kind in {"tool_call_result", "tool_call_error"}
+        ):
+            started_at = started_monotonic.get(object_key)
+            duration = core_chat_activity.safe_duration_ms(
+                (time.monotonic() - started_at) * 1000.0
+                if started_at is not None
+                else 0.0
+            )
         if duration is not None:
             detail["duration_ms"] = duration
         if event_kind == "tool_call_error":
@@ -2699,8 +2897,45 @@ def _make_chat_tool_activity_callback(
                 job_id,
                 type(exc).__name__.lower(),
             )
+        if (
+            emit_debug_trace is not None
+            and event_kind in {"tool_call_result", "tool_call_error"}
+        ):
+            try:
+                trace_detail = _v2_tool_trace_detail(
+                    tc,
+                    event_kind=event_kind,
+                    result=result,
+                    duration_ms=duration,
+                )
+                await asyncio.to_thread(
+                    emit_debug_trace,
+                    user_id,
+                    "agent.tool.call",
+                    status=(
+                        "ok" if trace_detail["result_status"] == "ok" else "error"
+                    ),
+                    summary=(
+                        f"V2 {trace_detail['tool']} {trace_detail['result_status']}"
+                    ),
+                    explain=(
+                        f"V2 tool {trace_detail['tool']} finished "
+                        f"{trace_detail['result_status']} in "
+                        f"{int(trace_detail.get('dur_ms') or 0)}ms"
+                    ),
+                    detail=trace_detail,
+                    dur_ms=duration,
+                )
+            except Exception as exc:  # noqa: BLE001 — diagnostics are best-effort
+                log.warning(
+                    "[v2.tool_trace] emit failed user=%s job=%s code=%s",
+                    user_id,
+                    job_id,
+                    type(exc).__name__.lower(),
+                )
         if event_kind in {"tool_call_result", "tool_call_error"}:
             invocation_ids.pop(object_key, None)
+            started_monotonic.pop(object_key, None)
 
     return _record
 
@@ -3345,6 +3580,7 @@ def _make_build_messages_fn(
     tail_anchor_seq: int | None = None,
     application_data_role: str = "user",
     manual_wake: bool = False,
+    screen_frame_message: dict[str, Any] | None = None,
 ) -> Callable[[list], list]:
     """Build the fixed base prompt plus the loop's chronological native transcript.
 
@@ -3421,6 +3657,7 @@ def _make_build_messages_fn(
             temporal_context=_temporal_for(rendered_tail),
             application_data_role=application_data_role,
             manual_wake=manual_wake,
+            screen_frame_message=screen_frame_message,
         )
 
     base_messages = _base(optional_turns)
@@ -4169,15 +4406,40 @@ def _memory_tool_actions(raw_actions) -> list[dict]:
         inner = {
             "summary": summary,
             "content": content or summary,
-            "bucket": str(a.get("bucket") or nested.get("bucket") or "").strip(),
-            "threads": (
-                list(a.get("threads") or [])
-                if isinstance(a.get("threads"), list)
-                else list(nested.get("threads") or [])
-                if isinstance(nested.get("threads"), list)
-                else []
-            ),
+            # 「发生时间」在 ENQUEUE 这一刻冻结,不留给 apply 时再取。V2 的 effect 是
+            # 排队异步落库的:队列一卡,几小时后才落库,时间就串了;同一条 effect 重放
+            # 两次还会拿到两个不同的时间。V1 是同步写(说话即落库)所以没这问题,
+            # 这里就是对齐它。同 `_frozen_relationship_anchor` 的惯例(也在 enqueue 冻结)。
+            #
+            # 刻意放在字典**前面**、且不读 a.get("occurred_at"):这是服务端的可信元数据,
+            # 不接受模型自报(schema 里也没有这个字段)。
+            "occurred_at": core_util._now_iso(),
         }
+        # ⚠️ 只在模型**真的传了**的时候才放这两个键。
+        #
+        # update 走的是 supersede(新写一张替换旧的),`actions._memory_supersede_action`
+        # 用 `{**inherited, **raw}` 从旧卡继承 bucket/threads —— 键一旦存在,空值
+        # 照样覆盖继承值。以前这里无条件写 bucket=""/threads=[],于是 V2 上**每一次**
+        # 改记忆卡,桶都掉回「未分类」、标签全清空(2026-08-10 实测)。threads 尤其致命:
+        # schema 至今不允许模型传,所以那条路必然清空。
+        #
+        # 「没传」和「显式传空」必须保持可区分:前者继承旧卡,后者才是用户要清空。
+        bucket = str(a.get("bucket") or nested.get("bucket") or "").strip()
+        if bucket:
+            inner["bucket"] = bucket
+        threads_raw = (
+            a.get("threads") if isinstance(a.get("threads"), list)
+            else nested.get("threads") if isinstance(nested.get("threads"), list)
+            else None
+        )
+        if threads_raw is not None:
+            inner["threads"] = list(threads_raw)
+        # 评分同理:同样要区分「没传」(继承旧卡)和「传了」。⚠️ 不能用 `or`——
+        # importance=0 / pulse=0 是合法取值,`or` 会把它们吞成没传。
+        for score in ("importance", "pulse"):
+            value = a.get(score, nested.get(score))
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                inner[score] = value
         base = {
             "reason": reason,
             "capture_mode": "agent_tool",
@@ -7614,6 +7876,10 @@ async def _run_wake(
         wake_system_prompt = _WAKE_SYSTEM_PROMPT
         scheduled_activity_events: list[dict] = []
         scheduled_runtime_data: list[dict[str, Any]] = []
+        # 与上面两个同级预初始化：下面的世界书匹配要读它，而它原本只在
+        # `if lane == "scheduled"` 分支里才诞生。靠调用处的条件表达式惰性求值
+        # 也能躲过 NameError，但那是隐式契约，重构一动就炸。
+        scheduled_notes: list[str] = []
         perception_wake_context: list[dict] = []
         wake_observed_generation = observed_generation
         consumed_perception_context_seq = 0
@@ -7632,7 +7898,6 @@ async def _run_wake(
                 if scheduled_context or attempt == 2:
                     break
                 await asyncio.sleep(0.05)
-            scheduled_notes: list[str] = []
             for index, item in enumerate(scheduled_context[:10]):
                 if not isinstance(item, dict):
                     continue
@@ -8462,6 +8727,8 @@ async def _run_wake(
                             "[v2.worker] wake reply push slot build failed user=%s: %s",
                             user_id, e)
                 if status == "applied":
+                    if tm is not None:
+                        tm.record_visible_reply()
                     if final:
                         source_status = await asyncio.to_thread(
                             jobs_store.get_job_status,
@@ -8525,6 +8792,12 @@ async def _run_wake(
                 },
                 best_effort=True,
             )
+            # Legacy/non-seq assembly can enqueue without a sink. That proves
+            # the model produced text, not that a user-visible bubble was
+            # applied. Count only the applied-but-unverified path here; the
+            # seq-native path above records only an explicit applied status.
+            if tm is not None and deps.apply_pending_effects is not None:
+                tm.record_visible_reply()
 
         # Snapshot the boundary at wake start. Production uses the same total-order
         # seq reader as chat; timestamp fallback remains only for narrow tests.
@@ -8541,6 +8814,57 @@ async def _run_wake(
         fold_new_messages = _make_fold_new_messages(
             user_id, deps, cursor_box, enclave_sem=enclave_sem
         )
+
+        # ── 世界书:主动开口的四条道也要认得这个世界（Seven 2026-08-10）
+        #
+        # 之前只有 chat 道注入，于是同一个伴侣在聊天里说「影月初三」、心跳主动
+        # 发消息时却说「8 月 11 号」——用户看到的是人格分裂，而世界书恰恰是为
+        # 「设定一致」买的。
+        #
+        # **匹配信号按道分，不是一刀切开**（世界书有两半，语义不同）：
+        #
+        #   alwaysOn 条目 = 世界常数（历法/地名/「这世界没有手机」）。语义就是
+        #   「聊什么都成立」，四条唤醒道全给。
+        #
+        #   关键词触发条目 = 对话范围内的资料，要有**新鲜的文本信号**才有意义：
+        #     · scheduled —— 有。提醒正文（`scheduled_notes`）是用户/agent 刚写下
+        #       的意图，且**本来就已逐字进 prompt**，拿它匹配零新增暴露面。
+        #     · heartbeat / manual_wake —— 无。手里只有可能几小时前的旧消息，
+        #       拿陈旧关键词灌 24k 字设定是噪音，不是接地。
+        #     · screen_watch —— 有新输入，但**是不可信输入**。屏幕文本被刻意设成
+        #       pull-only 正是为了不让屏幕内容影响首轮 prompt（见 :7734 注释）；
+        #       用它选世界书条目等于把那道闸从侧面绕开。
+        #
+        # 实现上不需要动匹配器:`worldbook_match._triggered` 对空扫描面天然只留
+        # alwaysOn（keyword in "" 恒 False），所以「不给匹配信号」= 传空 messages。
+        # ⚠️ 别照抄 chat 道那句 `if worldbook_match_messages:` 短路——那会让三条
+        # 无信号的道**一条都拿不到 alwaysOn**，正好把本次改动的主要目的抹掉。
+        worldbook_context = ""
+        if deps.read_worldbook_context is not None:
+            wake_match_messages = [
+                {"role": "user", "content": note}
+                for note in (scheduled_notes if lane == "scheduled" else [])
+                if str(note or "").strip()
+            ]
+            try:
+                async with enclave_sem:
+                    wb = await asyncio.to_thread(
+                        deps.read_worldbook_context,
+                        user_id,
+                        wake_match_messages,
+                        runtime_token=token,
+                    )
+                if isinstance(wb, dict):
+                    worldbook_context = str(wb.get("block") or "").strip()
+            except Exception as exc:  # noqa: BLE001 — 与 chat 道同款 best effort:
+                # 世界书取不到不该把一次主动开口整个打掉。
+                log.warning(
+                    "[v2.worldbook] wake match unavailable user=%s lane=%s code=%s",
+                    user_id,
+                    lane,
+                    type(exc).__name__.lower(),
+                )
+
         def _wake_builder():
             from core import self_thinking as _st_wake_sys
 
@@ -8567,6 +8891,7 @@ async def _run_wake(
                 working_memory=working_memory,
                 agent_memory=agent_memory,
                 user_profile=user_profile,
+                worldbook_context=worldbook_context,
                 coverage_hole_notice=coverage_hole_notice,
                 provider_config=provider_config,
                 temporal_snapshot=temporal_snapshot,
@@ -8657,7 +8982,23 @@ async def _run_wake(
                 # raising. Without this the lane failed 100% of the time on
                 # test with `wake_failed:providererror` while the provider
                 # answered 200 OK — the model simply had nothing to say.
-                require_reply=False,
+                #
+                # `scheduled` 是唯一的例外，它必须留在 require_reply=True 上。
+                # 这条道上的每个 timer 都带**到点交付义务**——无论是用户委托的
+                # （「20 秒后发消息给我」）还是 agent 自排的（`apply_turn_actions
+                # (..., self_wake=True)`，见 :7841）。沉默在这里不是「没什么可说」
+                # 而是提醒丢了：模型返空 → 落到下面的 `if not text: return` → job
+                # 记成 completed、无气泡、无失败、指标全绿，用户干等（usr_4ea3
+                # 2026-08-10，一晚上两次）。同一函数里「只给思考不给正文」那条
+                # 沉默路径早就为 scheduled 破了例（见 _THINKING_ONLY_NO_REPLY_REASON
+                # 处的 raise）——两条沉默路径必须同进同退，只堵一条等于没堵。
+                #
+                # 打开它拿到的是 tool_loop 已有的整条恢复链，而不是直接判死：
+                # 先追加 _EMPTY_RESPONSE_CORRECTION 重试一轮（多数抽风到此为止），
+                # 仍空才 ProviderEmptyReply → wake_failed:empty_reply。失败不会
+                # 重放定时器（mark_fired 在入队时就落，不等 job 成功），只会 arm
+                # 60s 起、1h 封顶的 proactive 退避，用户下次说话即清。
+                require_reply=(lane == "scheduled"),
                 on_provider_success=lambda: _record_provider_success(user_id),
                 on_provider_failure=lambda exc: _record_provider_failure(
                     user_id,
@@ -11303,6 +11644,7 @@ async def process_job(
             attempt_identity=int(job.get("attempt_count") or 0),
             recorder=trajectory_recorder,
             effect_evidence_by_call=effect_evidence_by_call,
+            emit_debug_trace=deps.emit_debug_trace,
         )
 
         async def _dispatch_tools(tool_calls):
@@ -12295,6 +12637,89 @@ async def process_job(
         grounding_results: dict[str, Any] = {}
         if pending_schedule_results:
             grounding_results.update(pending_schedule_results)
+        # 共享屏幕的健康提示(见 _screen_share_grounding)。live 时可推当前帧；
+        # stalled 时只给模型重启建议、不碰旧帧。不共享时整块不存在。
+        screen_share_state = await asyncio.to_thread(
+            _screen_share_grounding, user_id
+        )
+        if screen_share_state:
+            grounding_results["screen_share"] = [
+                {"ok": True, "data": screen_share_state}
+            ]
+        screen_share_live = screen_share_state.get("active") is True
+        screen_frame_message: dict[str, Any] | None = None
+        pushed_screen_frame_ids: list[str] = []
+        screen_vision_verdict = None
+        if screen_share_live:
+            screen_vision_verdict = await asyncio.to_thread(
+                db.model_api_active_route_vision_verdict, user_id
+            )
+        if (
+            screen_share_live
+            and _screen_vision_allows_pixels(screen_vision_verdict)
+            and deps.read_screen_frames is not None
+        ):
+            try:
+                schedule = await asyncio.to_thread(
+                    jobs_store.get_wake_schedule, user_id
+                )
+                last_pushed = str(
+                    (schedule or {}).get("last_screen_chat_frame_id") or ""
+                )
+                frame_meta = await asyncio.to_thread(db.frame_list_meta, user_id)
+                selected_meta = v2_screen_chat.select_recent_session_frames(
+                    frame_meta,
+                    last_pushed_frame_id=last_pushed,
+                )
+                if selected_meta:
+                    selected_ids = [
+                        str(row.get("id") or row.get("frame_id") or "")
+                        for row in selected_meta
+                    ]
+                    async with enclave_sem:
+                        batch = await asyncio.to_thread(
+                            deps.read_screen_frames, user_id, selected_ids
+                        )
+                    decrypted = (
+                        batch.get("frames") if isinstance(batch, dict) else {}
+                    )
+                    decrypted = decrypted if isinstance(decrypted, dict) else {}
+                    merged_frames: list[dict[str, Any]] = []
+                    for meta in selected_meta:
+                        frame_id = str(
+                            meta.get("id") or meta.get("frame_id") or ""
+                        )
+                        pixels = decrypted.get(frame_id)
+                        if not isinstance(pixels, dict):
+                            continue
+                        merged_frames.append({**meta, **pixels, "id": frame_id})
+                    screen_frame_message = (
+                        v2_screen_chat.build_untrusted_frame_message(
+                            merged_frames, now=time.time()
+                        )
+                    )
+                    if screen_frame_message is not None:
+                        pushed_screen_frame_ids = [
+                            str(frame["id"]) for frame in merged_frames
+                        ]
+                    tm.record_screen_frames(
+                        pushed=len(pushed_screen_frame_ids),
+                        cache_hits=int((batch or {}).get("cache_hits") or 0),
+                        cache_misses=int((batch or {}).get("cache_misses") or 0),
+                    )
+            except Exception as exc:  # noqa: BLE001 - pixels are optional grounding
+                log.warning(
+                    "[v2.worker] screen frame grounding failed user=%s code=%s",
+                    user_id,
+                    type(exc).__name__,
+                )
+
+        async def _on_screen_images_rejected(_exc: BaseException) -> None:
+            await asyncio.to_thread(
+                _mark_screen_route_vision_unsupported,
+                user_id,
+                screen_vision_verdict,
+            )
         turn_extra_context = (
             context.action_context_str(grounding_results) if grounding_results else ""
         )
@@ -12324,6 +12749,7 @@ async def process_job(
                 tail_source_truncated=tail_source_truncated,
                 tail_lane=lane,
                 tail_anchor_seq=optional_anchor_seq,
+                screen_frame_message=screen_frame_message,
             )
 
         build_messages = _chat_builder()
@@ -12456,6 +12882,9 @@ async def process_job(
             disabled_tool_names=disabled_tool_names_for_turn,
             outbound_blocking_read_tool_names=_PRIVATE_READ_TOOLS,
             outbound_blocking_read_tool_predicate=_read_blocks_later_outbound,
+            initial_outbound_tools_blocked=(screen_frame_message is not None),
+            tagged_image_message_key=v2_screen_chat.MESSAGE_TAG,
+            on_tagged_images_rejected=_on_screen_images_rejected,
             max_tool_calls_per_round=MAX_TOOL_CALLS_PER_ROUND,
             max_tool_calls_per_turn=MAX_TOOL_CALLS_PER_TURN,
             tool_result_char_cap=TOOL_RESULT_CHAR_CAP,
@@ -12479,6 +12908,12 @@ async def process_job(
                 tm.record_prompt_frontier_exhaustion
             ),
         )
+        if pushed_screen_frame_ids:
+            await asyncio.to_thread(
+                jobs_store.upsert_wake_schedule,
+                user_id,
+                last_screen_chat_frame_id=pushed_screen_frame_ids[-1],
+            )
         if voice_call_ended_atomically:
             try:
                 await asyncio.to_thread(_emit_status, user_id, job_id, "done")

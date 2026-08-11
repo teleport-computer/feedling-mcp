@@ -185,6 +185,70 @@ def test_chat_turn_does_not_prefetch_or_inject_perception(monkeypatch):
     }
 
 
+def test_chat_turn_explains_stalled_screen_share_without_old_pixels(monkeypatch):
+    uid = "u_screen_share_stalled"
+    conftest.seed_user(uid)
+    _reset(uid)
+    monkeypatch.setattr(
+        worker, "_write_encrypted_reply", lambda store, text: {"id": "r"}
+    )
+    monkeypatch.setattr(
+        worker,
+        "_screen_share_grounding",
+        lambda _user_id: {
+            "active": False,
+            "stalled": True,
+            "status": "broadcast_on_without_recent_frames",
+            "latest_frame_age_sec": 600,
+            "suggested_action": (
+                "Ask the user to stop and restart screen sharing."
+            ),
+        },
+    )
+    monkeypatch.setattr(
+        worker.db,
+        "model_api_active_route_vision_verdict",
+        lambda _user_id: (_ for _ in ()).throw(
+            AssertionError("stalled share must not query the vision route")
+        ),
+    )
+    seen = {}
+    _spy_provider(monkeypatch, seen)
+    deps = _chat_deps(
+        [{"id": "m1", "ts": 1.0, "role": "user", "content": "你能看到吗？"}]
+    )
+    deps.read_screen_frames = lambda *_args: (_ for _ in ()).throw(
+        AssertionError("stalled share must not decrypt old frames")
+    )
+
+    jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("w")
+    status = asyncio.run(
+        worker.process_job(
+            job,
+            deps,
+            provider_config=_BYOK,
+            api_key=None,
+            runtime_token="rt",
+        )
+    )
+
+    share = _runtime_payload(seen)["runtime_data"]["screen_share"]
+    assert status == "completed"
+    assert share["active"] is False
+    assert share["stalled"] is True
+    assert share["latest_frame_age_sec"] == 600
+    assert "stop and restart screen sharing" in share["suggested_action"]
+    system = next(
+        message["content"]
+        for message in seen["messages"]
+        if message.get("role") == "system"
+    )
+    assert "screen_share.stalled" in system
+    assert "may have disconnected" in system
+    assert "Do not describe an old frame as current" in system
+
+
 def test_chat_can_pull_exact_perception_after_first_round(monkeypatch):
     """Catches missing perception schemas or a broken chat tool-result round."""
     uid = "u_pg_chat_tool_pull"

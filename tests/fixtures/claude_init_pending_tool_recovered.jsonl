@@ -1,0 +1,8 @@
+{"type": "system", "subtype": "init", "tools": ["Bash", "Read", "ToolSearch", "mcp__fast__ping"], "mcp_servers": [{"name": "fast", "status": "connected"}, {"name": "slow", "status": "pending"}], "model": "test-model"}
+{"type": "assistant", "message": {"content": [{"type": "tool_use", "id": "toolu_01ADzM4GCgAVFTnrcdqFwAcb", "name": "ToolSearch", "input": {}}]}}
+{"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": "toolu_01ADzM4GCgAVFTnrcdqFwAcb", "is_error": null, "content": "No matching deferred tools found. Some MCP servers are still connecting: slow. Their tools will become available shortly — try searching again. If you're looking for a capability rather than a specific tool name, try keywords that might match the server's purpose (e.g., 'slack message', 'calendar event'). Once you find a matching tool, call it directly — do not stop after searching."}]}}
+{"type": "assistant", "message": {"content": [{"type": "tool_use", "id": "toolu_0194oEysBHG3JL6kHSsM1GRN", "name": "ToolSearch", "input": {}}]}}
+{"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": "toolu_0194oEysBHG3JL6kHSsM1GRN", "is_error": null, "content": [{"type": "tool_reference", "tool_name": "mcp__slow__ping"}]}]}}
+{"type": "assistant", "message": {"content": [{"type": "tool_use", "id": "toolu_01Vqdn967TQaUNzd8FZgmV7M", "name": "mcp__slow__ping", "input": {}}]}}
+{"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": "toolu_01Vqdn967TQaUNzd8FZgmV7M", "is_error": null, "content": [{"type": "text", "text": "pong"}]}]}}
+{"type": "result", "subtype": "success", "result": "done"}
