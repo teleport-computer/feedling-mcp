@@ -36,6 +36,7 @@ def _run(
     responses, dispatch, *, extra_tool_specs, provider_tools,
     extra_mutating_tool_names=None,
     outbound_blocking_read_tool_predicate=None,
+    refresh_extra_tool_specs=None,
 ):
     if extra_mutating_tool_names is None:
         extra_mutating_tool_names = {
@@ -66,6 +67,7 @@ def _run(
             add_usage=lambda _u: None,
             max_calls=4,
             extra_tool_specs=extra_tool_specs,
+            refresh_extra_tool_specs=refresh_extra_tool_specs,
             extra_mutating_tool_names=extra_mutating_tool_names,
             outbound_blocking_read_tool_predicate=(
                 outbound_blocking_read_tool_predicate
@@ -74,6 +76,50 @@ def _run(
     finally:
         provider_client.chat_completion_async = orig
     return outcome, replies
+
+
+def test_dynamic_refresh_replaces_schema_without_adding_tool_names():
+    folded = ToolSpec(
+        name=MCP_SPEC.name,
+        description=MCP_SPEC.description,
+        parameters={"type": "object", "properties": {}},
+    )
+    current = [folded]
+    responses = iter([
+        {"reply": "", "usage": {}, "tool_calls": [
+            {"id": "search", "name": "mcp_tool_search",
+             "args": {"names": [MCP_SPEC.name]}},
+        ]},
+        {"reply": "done", "tool_calls": [], "usage": {}},
+    ])
+
+    async def _dispatch(calls):
+        current[:] = [
+            MCP_SPEC,
+            ToolSpec(
+                name="mcp__not_admitted__hidden",
+                description="must never appear",
+                parameters={"type": "object", "properties": {}},
+            ),
+        ]
+        return [ToolResult(call_id=calls[0].id, content="resolved")]
+
+    provider_tools = []
+    _run(
+        responses,
+        _dispatch,
+        extra_tool_specs=[folded],
+        refresh_extra_tool_specs=lambda: current,
+        provider_tools=provider_tools,
+    )
+
+    first = {spec.name: spec for spec in provider_tools[0]}
+    second = {spec.name: spec for spec in provider_tools[1]}
+    assert first[MCP_SPEC.name].parameters["properties"] == {}
+    assert second[MCP_SPEC.name].parameters["properties"]["q"] == {
+        "type": "string",
+    }
+    assert "mcp__not_admitted__hidden" not in second
 
 
 def test_mcp_tool_is_offered_and_dispatched():

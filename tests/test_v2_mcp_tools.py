@@ -18,8 +18,9 @@ from provider_types import ToolCall  # noqa: E402
 STORE = types.SimpleNamespace(user_id="usr_test")
 
 
-def _servers(*names):
+def _servers(*names, resident=True):
     return {"servers": [{"name": n, "enabled": True,
+                         "resident": resident,
                          "config_envelope": {"id": f"env_{n}"}} for n in names]}
 
 
@@ -47,6 +48,191 @@ def test_builds_namespaced_specs_with_schemas(monkeypatch):
     spec = turn.tool_specs[0]
     assert spec.parameters["properties"]["q"]["type"] == "string"
     assert turn.handles("mcp__weather__search")
+
+
+def test_missing_resident_defaults_to_folded_schema(monkeypatch):
+    servers = _servers("weather", resident=False)
+    servers["servers"][0].pop("resident")
+
+    async def fake_list(url, headers, *, ca_pem=None, transport=None,
+                        mcp_transport=None):
+        return [{
+            "name": "search",
+            "description": "Find\nweather by city",
+            "inputSchema": {
+                "type": "object",
+                "properties": {"q": {"type": "string"}},
+                "required": ["q"],
+            },
+        }]
+
+    _patch(
+        monkeypatch,
+        servers=servers,
+        decrypt=lambda env, api_key, runtime_token: {
+            "url": "https://w.example.com", "headers": {}},
+        list_tools=fake_list,
+    )
+
+    turn = asyncio.run(
+        mcp_tools.load_turn_mcp(STORE, api_key="k", runtime_token="rt"))
+    (spec,) = turn.tool_specs
+
+    assert spec.name == "mcp__weather__search"
+    assert spec.description == "Find weather by city"
+    assert spec.parameters == {
+        "type": "object",
+        "properties": {},
+        "additionalProperties": False,
+    }
+    assert turn.requires_resolution(spec.name)
+    assert turn.full_specs[spec.name].parameters["required"] == ["q"]
+
+
+def test_tool_search_resolves_exact_name_before_remote_dispatch(monkeypatch):
+    seen = []
+
+    async def fake_list(url, headers, *, ca_pem=None, transport=None,
+                        mcp_transport=None):
+        return [{
+            "name": "search",
+            "description": "Find weather by city",
+            "inputSchema": {
+                "type": "object",
+                "properties": {"q": {"type": "string"}},
+                "required": ["q"],
+            },
+        }]
+
+    async def fake_call(url, headers, name, arguments, *, ca_pem=None,
+                        transport=None, mcp_transport=None):
+        seen.append((name, arguments))
+        return {"is_error": False, "text": "sunny"}
+
+    _patch(
+        monkeypatch,
+        servers=_servers("weather", resident=False),
+        decrypt=lambda env, api_key, runtime_token: {
+            "url": "https://w.example.com", "headers": {}},
+        list_tools=fake_list,
+        call_tool=fake_call,
+    )
+    turn = asyncio.run(
+        mcp_tools.load_turn_mcp(STORE, api_key="k", runtime_token="rt"))
+    name = "mcp__weather__search"
+
+    blocked = asyncio.run(
+        turn.dispatch(ToolCall(id="before", name=name, args={"q": "SF"})))
+    assert "mcp_tool_search" in blocked.content
+    assert seen == []
+
+    result = turn.resolve_tool_schemas({"names": [name]})
+    assert result["resolved"] == [name]
+    assert result["tools"][0]["parameters"]["required"] == ["q"]
+    assert turn.current_tool_specs()[0].parameters["required"] == ["q"]
+    assert not turn.requires_resolution(name)
+
+    dispatched = asyncio.run(
+        turn.dispatch(ToolCall(id="after", name=name, args={"q": "SF"})))
+    assert dispatched.content == "sunny"
+    assert seen == [("search", {"q": "SF"})]
+
+
+def test_tool_search_query_only_matches_folded_tools(monkeypatch):
+    servers = {
+        "servers": [
+            {"name": "folded", "enabled": True, "resident": False,
+             "config_envelope": {"id": "env_folded"}},
+            {"name": "resident", "enabled": True, "resident": True,
+             "config_envelope": {"id": "env_resident"}},
+        ]
+    }
+
+    async def fake_list(url, headers, *, ca_pem=None, transport=None,
+                        mcp_transport=None):
+        return [{
+            "name": "lookup",
+            "description": "Look up calendar events",
+            "inputSchema": {"type": "object", "properties": {}},
+        }]
+
+    _patch(
+        monkeypatch,
+        servers=servers,
+        decrypt=lambda env, api_key, runtime_token: {
+            "url": f"https://{env['id']}.example.com", "headers": {}},
+        list_tools=fake_list,
+    )
+    turn = asyncio.run(
+        mcp_tools.load_turn_mcp(STORE, api_key="k", runtime_token="rt"))
+
+    result = turn.resolve_tool_schemas({"query": "calendar"})
+
+    assert result["resolved"] == ["mcp__folded__lookup"]
+    assert "mcp__resident__lookup" not in turn.collapsed_names
+
+
+def test_tool_search_keeps_resolved_catalog_within_char_budget(monkeypatch):
+    async def fake_list(url, headers, *, ca_pem=None, transport=None,
+                        mcp_transport=None):
+        return [
+            {
+                "name": name,
+                "description": "d",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        f"field_{name}_{i}": {"type": "string"}
+                        for i in range(12)
+                    },
+                },
+            }
+            for name in ("alpha", "beta")
+        ]
+
+    _patch(
+        monkeypatch,
+        servers=_servers("tools", resident=False),
+        decrypt=lambda env, api_key, runtime_token: {
+            "url": "https://tools.example.com", "headers": {}},
+        list_tools=fake_list,
+    )
+    turn = asyncio.run(
+        mcp_tools.load_turn_mcp(STORE, api_key="k", runtime_token="rt"))
+    names = [spec.name for spec in turn.tool_specs]
+    collapsed_total = sum(
+        mcp_tools._serialized_chars({
+            "name": spec.name,
+            "description": spec.description,
+            "parameters": spec.parameters,
+        })
+        for spec in turn.tool_specs
+    )
+    first = turn.full_specs[names[0]]
+    folded_first = turn.tool_specs[0]
+    first_delta = (
+        mcp_tools._serialized_chars({
+            "name": first.name,
+            "description": first.description,
+            "parameters": first.parameters,
+        })
+        - mcp_tools._serialized_chars({
+            "name": folded_first.name,
+            "description": folded_first.description,
+            "parameters": folded_first.parameters,
+        })
+    )
+    monkeypatch.setattr(
+        mcp_tools,
+        "MAX_MCP_TOOL_CATALOG_CHARS",
+        collapsed_total + first_delta,
+    )
+
+    result = turn.resolve_tool_schemas({"names": names})
+
+    assert result["resolved"] == [names[0]]
+    assert result["schema_budget_exceeded"] == [names[1]]
+    assert turn.requires_resolution(names[1])
 
 
 def test_catalog_permutations_produce_identical_provider_tool_bytes(monkeypatch):
@@ -216,9 +402,12 @@ def test_duplicate_resolution_precedes_sort_and_dispatches_first_route(
 ):
     servers = {
         "servers": [
-            {"name": "dup", "enabled": True, "config_envelope": {"id": "first"}},
-            {"name": "dup", "enabled": True, "config_envelope": {"id": "second"}},
-            {"name": "alpha", "enabled": True, "config_envelope": {"id": "alpha"}},
+            {"name": "dup", "enabled": True, "resident": True,
+             "config_envelope": {"id": "first"}},
+            {"name": "dup", "enabled": True, "resident": True,
+             "config_envelope": {"id": "second"}},
+            {"name": "alpha", "enabled": True, "resident": True,
+             "config_envelope": {"id": "alpha"}},
         ],
     }
     seen = []
@@ -1115,8 +1304,12 @@ def test_allocation_summary_reports_post_allocation_counts_per_server():
         return [
             _CatalogCandidate(
                 server=server, raw_name=f"t{i:03d}",
-                spec=ToolSpec(name=f"mcp__{server}__t{i:03d}", description="d",
-                              parameters={"type": "object"}),
+                    full_spec=ToolSpec(
+                        name=f"mcp__{server}__t{i:03d}", description="d",
+                        parameters={"type": "object"}),
+                    offered_spec=ToolSpec(
+                        name=f"mcp__{server}__t{i:03d}", description="d",
+                        parameters={"type": "object"}),
                 route=None, serialized_chars=120,
             )
             for i in range(count)

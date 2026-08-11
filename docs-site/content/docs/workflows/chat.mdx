@@ -680,9 +680,10 @@ interval.
 The resident-job fallback scan is throttled by
 `FEEDLING_RESIDENT_FALLBACK_CHECK_SEC` (default 300 seconds).
 
-`user_mcp.fingerprint` changes whenever the account's MCP server list changes;
-see the [MCP servers workflow](/docs/workflows/mcp) for how to manage that list
-and re-materialize local config when the fingerprint moves.
+`user_mcp.fingerprint` changes whenever the account's MCP server list, enabled
+state, schema-residency setting, or encrypted connection envelope changes; see
+the [MCP servers workflow](/docs/workflows/mcp) for how to manage that list and
+re-materialize local config when the fingerprint moves.
 
 ### 3. The consumer posts the encrypted reply
 

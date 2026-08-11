@@ -10,6 +10,15 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **MCP tool schemas now load on demand by default.** MCP server records expose
+  a `resident` boolean on `GET /v1/mcp/servers`; `POST` and `PATCH` accept the
+  same field, defaulting to `false`. Hosted Runtime V2 keeps folded tool names
+  and short descriptions available, then uses the new `mcp_tool_search`
+  platform tool to inject complete schemas for matching tools on the next model
+  round. `resident=true` retains the previous full-catalog behavior. Changing
+  the setting updates `user_mcp.fingerprint`, and search cannot add names beyond
+  the bounded catalog already admitted for that turn.
+
 - **Screen-share start and end are now first-class proactive events.** Runtime
   V2 recognizes durable `broadcast_opened` and `broadcast_closed` edges behind
   proactive activation and the screen-watch switch, with one shared 60-second

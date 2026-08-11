@@ -66,6 +66,8 @@ MAX_MCP_TOOLS_PER_TURN = 128
 MAX_MCP_TOOL_SCHEMA_CHARS = 32768
 MAX_MCP_TOOL_CATALOG_CHARS = 65536
 MAX_PROVIDER_TOOL_NAME_CHARS = 64
+MAX_MCP_TOOL_SEARCH_RESULTS = 8
+MAX_COLLAPSED_DESCRIPTION_CHARS = 240
 _PROVIDER_TOOL_NAME_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 
 
@@ -111,7 +113,8 @@ class _Route:
 class _CatalogCandidate:
     server: str
     raw_name: str
-    spec: ToolSpec
+    full_spec: ToolSpec
+    offered_spec: ToolSpec
     route: _Route
     serialized_chars: int
 
@@ -124,6 +127,7 @@ class _ServerLoadResult:
     kind: str
     secret: dict | None = None
     tools: tuple = ()
+    resident: bool = False
 
     @property
     def available(self) -> bool:
@@ -146,6 +150,11 @@ class McpTurn:
     # 每台启用服务器的加载结果。只含 name + 稳定 kind,不含 URL/header/远端正文。
     # 装配层用它维护 App 将来读取的最近状态,loader 本身不碰数据库。
     server_results: list[dict] = field(default_factory=list)
+    # Complete schemas stay process-local until mcp_tool_search resolves one of
+    # the names that was already admitted by this turn's count/character caps.
+    full_specs: dict[str, ToolSpec] = field(default_factory=dict)
+    collapsed_names: set[str] = field(default_factory=set)
+    resolved_names: set[str] = field(default_factory=set)
 
     @property
     def is_empty(self) -> bool:
@@ -153,6 +162,125 @@ class McpTurn:
 
     def handles(self, name: str) -> bool:
         return name in self.routes
+
+    def requires_resolution(self, name: str) -> bool:
+        return name in self.collapsed_names and name not in self.resolved_names
+
+    def current_tool_specs(self) -> list[ToolSpec]:
+        """Return the provider surface after any in-turn schema resolutions."""
+        return list(self.tool_specs)
+
+    def resolve_tool_schemas(self, args: dict | None) -> dict:
+        """Resolve folded schemas without expanding this turn's admitted names."""
+        args = args if isinstance(args, dict) else {}
+        raw_names = args.get("names")
+        query = str(args.get("query") or "").strip()
+        folded_specs = {
+            name: spec
+            for name, spec in self.full_specs.items()
+            if name in self.collapsed_names
+        }
+
+        requested: list[str] = []
+        not_found: list[str] = []
+        if isinstance(raw_names, list) and raw_names:
+            seen: set[str] = set()
+            for value in raw_names:
+                name = str(value or "").strip()
+                if not name or name in seen:
+                    continue
+                seen.add(name)
+                if name in folded_specs:
+                    requested.append(name)
+                else:
+                    not_found.append(name)
+                if len(requested) >= MAX_MCP_TOOL_SEARCH_RESULTS:
+                    break
+        elif query:
+            needle = query.casefold()
+            terms = needle.split()
+            ranked: list[tuple[int, str]] = []
+            for name, spec in folded_specs.items():
+                folded_name = name.casefold()
+                description = str(spec.description or "").casefold()
+                haystack = f"{folded_name} {description}"
+                if not all(term in haystack for term in terms):
+                    continue
+                if folded_name == needle:
+                    rank = 0
+                elif folded_name.startswith(needle):
+                    rank = 1
+                elif needle in folded_name:
+                    rank = 2
+                else:
+                    rank = 3
+                ranked.append((rank, name))
+            requested = [
+                name for _rank, name in sorted(ranked)
+            ][:MAX_MCP_TOOL_SEARCH_RESULTS]
+        else:
+            return {
+                "error": "provide exactly one of query or names",
+                "tools": [],
+            }
+
+        current_by_name = {spec.name: spec for spec in self.tool_specs}
+        catalog_chars = sum(
+            _serialized_chars({
+                "name": spec.name,
+                "description": spec.description,
+                "parameters": spec.parameters,
+            }) or MAX_MCP_TOOL_CATALOG_CHARS + 1
+            for spec in self.tool_specs
+        )
+        resolved: list[str] = []
+        schema_budget_exceeded: list[str] = []
+        for name in requested:
+            if name in self.resolved_names:
+                resolved.append(name)
+                continue
+            current = current_by_name[name]
+            full = self.full_specs[name]
+            current_chars = _serialized_chars({
+                "name": current.name,
+                "description": current.description,
+                "parameters": current.parameters,
+            })
+            full_chars = _serialized_chars({
+                "name": full.name,
+                "description": full.description,
+                "parameters": full.parameters,
+            })
+            if current_chars is None or full_chars is None or (
+                catalog_chars - current_chars + full_chars
+                > MAX_MCP_TOOL_CATALOG_CHARS
+            ):
+                schema_budget_exceeded.append(name)
+                continue
+            catalog_chars = catalog_chars - current_chars + full_chars
+            self.resolved_names.add(name)
+            resolved.append(name)
+
+        if resolved:
+            self.tool_specs[:] = [
+                self.full_specs[spec.name]
+                if spec.name in self.resolved_names
+                else spec
+                for spec in self.tool_specs
+            ]
+        return {
+            "resolved": resolved,
+            "not_found": not_found,
+            "schema_budget_exceeded": schema_budget_exceeded,
+            "tools": [
+                {
+                    "name": self.full_specs[name].name,
+                    "description": self.full_specs[name].description,
+                    "parameters": self.full_specs[name].parameters,
+                }
+                for name in resolved
+            ],
+        }
 
     def is_read_only(self, name: str) -> bool:
         """Return whether ``name`` has approved read-only execution semantics.
@@ -181,6 +309,14 @@ class McpTurn:
         route = self.routes.get(call.name)
         if route is None:
             return ToolResult(call_id=call.id, content="error: unknown mcp tool")
+        if self.requires_resolution(call.name):
+            return ToolResult(
+                call_id=call.id,
+                content=(
+                    "error: mcp tool schema is not loaded; call mcp_tool_search "
+                    f'with names=["{call.name}"] first'
+                ),
+            )
         try:
             out = await mcp_client.call_tool(
                 route.url, route.headers, route.tool, call.args or {},
@@ -362,6 +498,24 @@ def _serialized_chars(value) -> int | None:
         return None
 
 
+def _collapsed_spec(spec: ToolSpec) -> ToolSpec:
+    """Keep discovery text resident while withholding the remote arg schema."""
+    description = " ".join(str(spec.description or "").split())
+    if len(description) > MAX_COLLAPSED_DESCRIPTION_CHARS:
+        description = description[: MAX_COLLAPSED_DESCRIPTION_CHARS - 3].rstrip() + "..."
+    return ToolSpec(
+        name=spec.name,
+        description=description,
+        # Provider tool protocols require a schema object even for a no-arg
+        # tool. This empty closed object carries no remote parameter details.
+        parameters={
+            "type": "object",
+            "properties": {},
+            "additionalProperties": False,
+        },
+    )
+
+
 def _read_only_hint(tool: dict) -> bool:
     """Interpret MCP ``annotations.readOnlyHint`` conservatively.
 
@@ -495,7 +649,13 @@ async def load_turn_mcp(
                 )
                 return _ServerLoadResult(name, kind)
             log.info("mcp server auto-ca pinned server=%r", name)
-        return _ServerLoadResult(name, "available", secret, tuple(tools))
+        return _ServerLoadResult(
+            name,
+            "available",
+            secret,
+            tuple(tools),
+            resident=bool(srv.get("resident")),
+        )
 
     results = await asyncio.gather(*[_one(s) for s in servers])
     # Resolve collisions in source order before sorting. This preserves the
@@ -558,10 +718,11 @@ async def load_turn_mcp(
                 description=description,
                 parameters=parameters,
             )
+            offered_spec = candidate if result.resident else _collapsed_spec(candidate)
             candidate_chars = _serialized_chars({
-                "name": candidate.name,
-                "description": candidate.description,
-                "parameters": candidate.parameters,
+                "name": offered_spec.name,
+                "description": offered_spec.description,
+                "parameters": offered_spec.parameters,
             })
             if candidate_chars is None:
                 continue
@@ -592,7 +753,8 @@ async def load_turn_mcp(
             candidates.append(_CatalogCandidate(
                 server=name,
                 raw_name=raw,
-                spec=candidate,
+                full_spec=candidate,
+                offered_spec=offered_spec,
                 route=route,
                 serialized_chars=candidate_chars,
             ))
@@ -651,11 +813,13 @@ def _allocate_round_robin(
     for item in candidates:
         by_server.setdefault(item.server, []).append(item)
     for items in by_server.values():
-        items.sort(key=lambda c: (c.raw_name, c.spec.name))
+        items.sort(key=lambda c: (c.raw_name, c.full_spec.name))
     names = sorted(by_server)
 
     specs: list[ToolSpec] = []
     routes: dict[str, _Route] = {}
+    full_specs: dict[str, ToolSpec] = {}
+    collapsed_names: set[str] = set()
     catalog_chars = 0
     kept: dict[str, int] = {name: 0 for name in names}
     dropped_chars = 0
@@ -679,8 +843,11 @@ def _allocate_round_robin(
             ):
                 dropped_chars += 1
                 continue
-            specs.append(item.spec)
-            routes[item.spec.name] = item.route
+            specs.append(item.offered_spec)
+            routes[item.full_spec.name] = item.route
+            full_specs[item.full_spec.name] = item.full_spec
+            if item.offered_spec is not item.full_spec:
+                collapsed_names.add(item.full_spec.name)
             catalog_chars += item.serialized_chars
             kept[server] += 1
 
@@ -721,4 +888,10 @@ def _allocate_round_robin(
                 f"{name}:{kept[name]}/{len(by_server[name])}" for name in names
             ),
         )
-    return McpTurn(specs, routes, summary)
+    return McpTurn(
+        specs,
+        routes,
+        summary,
+        full_specs=full_specs,
+        collapsed_names=collapsed_names,
+    )

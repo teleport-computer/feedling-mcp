@@ -1480,6 +1480,12 @@ class _EmptyMcpTurn:
     def is_read_only(self, name: str) -> bool:
         return False
 
+    def current_tool_specs(self) -> tuple:
+        return ()
+
+    def requires_resolution(self, name: str) -> bool:
+        return False
+
     @property
     def mutating_tool_names(self) -> frozenset[str]:
         return frozenset()
@@ -8206,6 +8212,7 @@ async def _run_wake(
         wake_disabled_tool_names = wake_disabled_web_tool_names | {
             cap_tool_schema.PROVIDER_USAGE_TOOL,
             cap_tool_schema.MEMORY_ORGANIZE_TOOL,
+            cap_tool_schema.MCP_TOOL_SEARCH_TOOL,
             # History tools are chat-lane only (spec §6 offer gate): the
             # proactive companion must never browse raw history on its own.
             # Withheld unconditionally — not tied to the kill switch — and the
@@ -11521,7 +11528,17 @@ async def process_job(
             )
         mcp_mutating_names = _mcp_mutating_names_for_turn(mcp_turn)
         disabled_mutation_tool_names = frozenset()
-        offered_mcp_tool_specs = tuple(mcp_turn.tool_specs)
+
+        def _current_offered_mcp_tool_specs() -> tuple:
+            refresh = getattr(mcp_turn, "current_tool_specs", None)
+            specs = refresh() if callable(refresh) else mcp_turn.tool_specs
+            if mutation_recovery_barrier is None:
+                return tuple(specs)
+            return tuple(
+                spec for spec in specs if spec.name not in mcp_mutating_names
+            )
+
+        offered_mcp_tool_specs = _current_offered_mcp_tool_specs()
         if mutation_recovery_barrier is not None:
             disabled_mutation_tool_names = frozenset(
                 set(cap_registry.WRITE_ACTIONS)
@@ -11530,11 +11547,6 @@ async def process_job(
                     cap_tool_schema.FILE_REPLY_TOOL,
                     cap_tool_schema.MEMORY_ORGANIZE_TOOL,
                 }
-            )
-            offered_mcp_tool_specs = tuple(
-                spec
-                for spec in mcp_turn.tool_specs
-                if spec.name not in mcp_mutating_names
             )
         # Web gate. UNION with the mutation set, never assignment — overwriting
         # would re-expose the writes that mutation recovery just withheld.
@@ -11582,11 +11594,18 @@ async def process_job(
             if history_tools_offered
             else frozenset(cap_history.HISTORY_TOOL_NAMES)
         )
+        disabled_mcp_search_tool_names = (
+            frozenset()
+            if set(getattr(mcp_turn, "collapsed_names", ()) or ())
+            & {spec.name for spec in offered_mcp_tool_specs}
+            else frozenset({cap_tool_schema.MCP_TOOL_SEARCH_TOOL})
+        )
         disabled_tool_names_for_turn = (
             frozenset(disabled_mutation_tool_names)
             | disabled_web_tool_names
             | disabled_provider_usage_tool_names
             | disabled_history_tool_names
+            | disabled_mcp_search_tool_names
         )
         # Shared across every provider round in this chat turn. A per-dispatch
         # budget would reset whenever the model asks for another tool batch and
@@ -11727,6 +11746,22 @@ async def process_job(
                 # One call per coroutine lets platform reads share the exact same
                 # worker-level gate as MCP reads. Executor still owns validation,
                 # provenance, encrypted outbox writes, and terminal write failures.
+                if tc.name == cap_tool_schema.MCP_TOOL_SEARCH_TOOL:
+                    resolve = getattr(mcp_turn, "resolve_tool_schemas", None)
+                    if not callable(resolve):
+                        return ToolResult(
+                            call_id=tc.id,
+                            content="error: no folded MCP tools are available",
+                        )
+                    return ToolResult(
+                        call_id=tc.id,
+                        content=json.dumps(
+                            resolve(tc.args),
+                            ensure_ascii=False,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ),
+                    )
                 if tc.name == cap_tool_schema.MEMORY_ORGANIZE_TOOL:
                     return await _dispatch_memory_organize_tool(user_id, tc)
                 if tc.name in cap_history.HISTORY_TOOL_NAMES:
@@ -11904,28 +11939,62 @@ async def process_job(
                     for tc, result in zip(calls, results)
                 ]
 
-            # Schema omission is the provider-facing control; this runtime
-            # gate is the independent fail-closed boundary. A broken relay or
-            # direct caller that invents an omitted mutating MCP call must not
-            # reach the durable-attempt marker or the remote network.
+            # Schema omission is the provider-facing control; this runtime gate
+            # independently refuses unresolved MCP calls before any durable
+            # mutation marker or remote request.
             blocked_by_id: dict[str, ToolResult] = {}
             dispatchable_calls = list(tool_calls)
+            unresolved_by_id = {
+                str(tc.id): ToolResult(
+                    call_id=tc.id,
+                    content=(
+                        "error: mcp tool schema is not loaded; call "
+                        f'{cap_tool_schema.MCP_TOOL_SEARCH_TOOL} with '
+                        f'names=["{tc.name}"] first'
+                    ),
+                )
+                for tc in dispatchable_calls
+                if callable(getattr(mcp_turn, "requires_resolution", None))
+                and mcp_turn.requires_resolution(tc.name)
+            }
+            if unresolved_by_id:
+                blocked_by_id.update(unresolved_by_id)
+                dispatchable_calls = [
+                    tc
+                    for tc in dispatchable_calls
+                    if str(tc.id) not in unresolved_by_id
+                ]
+                for tc in tool_calls:
+                    result = unresolved_by_id.get(str(tc.id))
+                    if result is None:
+                        continue
+                    await chat_tool_activity_callback(
+                        tc,
+                        "tool_call_started",
+                        {"phase": "mcp_schema_required"},
+                    )
+                    await chat_tool_activity_callback(
+                        tc,
+                        "tool_call_result",
+                        {"phase": "mcp_schema_required", "result": result},
+                    )
             if mutation_recovery_barrier is not None:
-                blocked_by_id = {
+                recovery_blocked = {
                     str(tc.id): ToolResult(
                         call_id=tc.id,
                         content=_MUTATION_RECOVERY_BLOCKED_ERROR,
                     )
-                    for tc in tool_calls
+                    for tc in dispatchable_calls
                     if tc.name in mcp_mutating_names
                     or tc.name in cap_registry.WRITE_ACTIONS
                     or tc.name == cap_tool_schema.MEMORY_ORGANIZE_TOOL
                 }
+                blocked_by_id.update(recovery_blocked)
                 dispatchable_calls = [
                     tc for tc in tool_calls if str(tc.id) not in blocked_by_id
                 ]
                 for tc in tool_calls:
-                    result = blocked_by_id.get(str(tc.id))
+                    result = recovery_blocked.get(str(tc.id))
                     if result is None:
                         continue
                     await chat_tool_activity_callback(
@@ -12888,6 +12957,7 @@ async def process_job(
             on_progress=_report_turn_progress,
             on_trajectory_event=_ledger_tapped_sink(trajectory_recorder),
             extra_tool_specs=offered_mcp_tool_specs,
+            refresh_extra_tool_specs=_current_offered_mcp_tool_specs,
             extra_mutating_tool_names=mcp_mutating_names,
             disabled_tool_names=disabled_tool_names_for_turn,
             outbound_blocking_read_tool_names=_PRIVATE_READ_TOOLS,

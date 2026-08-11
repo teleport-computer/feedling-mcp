@@ -138,6 +138,42 @@ class _FakeMcpTurn:
         return ToolResult(call_id=call.id, content="pong from test server")
 
 
+class _FoldedFakeMcpTurn(_FakeMcpTurn):
+    def __init__(self, recorder):
+        folded = ToolSpec(
+            name=_MCP_SPEC.name,
+            description=_MCP_SPEC.description,
+            parameters={"type": "object", "properties": {}},
+        )
+        super().__init__([folded], recorder)
+        self.collapsed_names = {_MCP_SPEC.name}
+        self._resolved = False
+
+    def current_tool_specs(self):
+        return list(self.tool_specs)
+
+    def requires_resolution(self, name):
+        return name in self.collapsed_names and not self._resolved
+
+    def resolve_tool_schemas(self, args):
+        names = list(args.get("names") or [])
+        resolved = [_MCP_SPEC.name] if _MCP_SPEC.name in names else []
+        if resolved:
+            self._resolved = True
+            self.tool_specs[:] = [_MCP_SPEC]
+        return {
+            "resolved": resolved,
+            "not_found": [name for name in names if name not in resolved],
+            "tools": [
+                {
+                    "name": _MCP_SPEC.name,
+                    "description": _MCP_SPEC.description,
+                    "parameters": _MCP_SPEC.parameters,
+                }
+            ] if resolved else [],
+        }
+
+
 def _make_load_turn_mcp(turn, seen=None):
     async def _fake_load(
         store,
@@ -195,6 +231,54 @@ def test_chat_turn_offers_and_dispatches_configured_mcp_tool(monkeypatch):
     # the turn produced the model's final reply
     bubbles = _bubbles(uid)
     assert len(bubbles) == 1 and bubbles[0]["body_ct"] == "the server said pong"
+
+
+def test_chat_tool_search_injects_full_schema_before_mcp_dispatch(monkeypatch):
+    uid = "u_mcp_tool_search"
+    conftest.seed_user(uid)
+    _reset(uid)
+    jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("w")
+    _patch_real_write(monkeypatch)
+
+    dispatched = []
+    turn = _FoldedFakeMcpTurn(dispatched)
+    calls = _script_provider(monkeypatch, [
+        {
+            "reply": "",
+            "tool_calls": [{
+                "id": "find",
+                "name": "mcp_tool_search",
+                "args": {"names": [_MCP_SPEC.name]},
+            }],
+            "usage": {},
+        },
+        {
+            "reply": "",
+            "tool_calls": [{
+                "id": "ping",
+                "name": _MCP_SPEC.name,
+                "args": {},
+            }],
+            "usage": {},
+        },
+        {"reply": "pong", "tool_calls": [], "usage": {}},
+    ])
+    deps = _deps(
+        [{"id": "m1", "ts": 10.0, "role": "user", "content": "ping it"}],
+        load_mcp_turn=_make_load_turn_mcp(turn),
+    )
+
+    status = asyncio.run(worker.process_job(
+        job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt-turn"))
+
+    assert status == "completed"
+    first = {spec.name: spec for spec in calls[0]["tools"]}
+    second = {spec.name: spec for spec in calls[1]["tools"]}
+    assert "mcp_tool_search" in first
+    assert first[_MCP_SPEC.name].parameters["properties"] == {}
+    assert second[_MCP_SPEC.name] == _MCP_SPEC
+    assert dispatched == [(_MCP_SPEC.name, {})]
 
 
 def test_chat_turn_blocks_approved_read_only_mcp_after_its_remote_result(

@@ -478,6 +478,7 @@ async def run_tool_loop(
     on_progress=None,
     on_trajectory_event=None,
     extra_tool_specs=None,
+    refresh_extra_tool_specs=None,
     extra_mutating_tool_names=None,
     disabled_tool_names=None,
     allow_reply_tool: bool = True,
@@ -693,9 +694,10 @@ async def run_tool_loop(
             return True
     allowed_fetch_urls: set[str] = set()
     # Per-turn tool surface = the static platform catalog plus any user-MCP tools
-    # injected for this turn (chat lane only). New list, never mutates the memoized
-    # `_catalog()`. `mcp_names` marks the injected tools so their args skip the
-    # platform PARAMS validation (the MCP server validates its own schema). MCP
+    # injected for this turn (chat lane only). `mcp_names` is frozen from the
+    # entry snapshot so a dynamic schema refresh can replace definitions but can
+    # never grant a new tool name mid-turn. The MCP server validates tool args.
+    # MCP
     # result content is nevertheless untrusted external input: after the model
     # observes it, every later outbound MCP call is stripped, including a tool
     # whose exact catalog fingerprint the user approved as read-only.  Read-only
@@ -714,12 +716,24 @@ async def run_tool_loop(
         disabled_names.add(tool_schema.FILE_REPLY_TOOL)
     if on_image_reply is None:
         disabled_names.add(tool_schema.IMAGE_REPLY_TOOL)
-    turn_catalog = [
-        spec
-        for spec in (_catalog() + list(extra_tool_specs or []))
-        if spec.name not in disabled_names
-    ]
-    mcp_names = {spec.name for spec in (extra_tool_specs or [])}
+    initial_extra_specs = list(extra_tool_specs or [])
+    mcp_names = {spec.name for spec in initial_extra_specs}
+
+    def _turn_catalog() -> list:
+        current_extra_specs = initial_extra_specs
+        if refresh_extra_tool_specs is not None:
+            try:
+                refreshed = list(refresh_extra_tool_specs() or [])
+            except Exception:  # noqa: BLE001 - optional refresh fails stable
+                refreshed = initial_extra_specs
+            current_extra_specs = [
+                spec for spec in refreshed if spec.name in mcp_names
+            ]
+        return [
+            spec
+            for spec in (_catalog() + current_extra_specs)
+            if spec.name not in disabled_names
+        ]
     # Only offered MCP tools can gain mutating semantics through this injected
     # set. Intersecting avoids a stale/buggy loader accidentally reclassifying a
     # platform read or a tool that was never shown to the provider.
@@ -823,6 +837,7 @@ async def run_tool_loop(
                             await on_file_requirement_changed()
 
         messages = build_messages(list(transcript))
+        turn_catalog = _turn_catalog()
         # 三道有界纠正共用同一条临时 system suffix 注入通道：文件投递缺失、
         # 生图谎报，以及语义空回复。各自最多打回一次，不写入 transcript。
         retry_instructions = "\n\n".join(
