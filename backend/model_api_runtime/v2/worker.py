@@ -1967,7 +1967,22 @@ async def _dispatch_mixed_tool_calls(
                 call_id=tc.id,
                 content=v2_tool_loop.MCP_MUTATION_OUTCOME_UNKNOWN_ERROR,
             )
-        return result
+        # 打上结果预算标记,让截断层给 MCP 一档更宽的逐条上限(见
+        # capabilities/result_budget.py 的 user_mcp 档)。通用的 2000 字符对记忆型
+        # 服务器会把一次取回的多条记忆切成碎片 —— 用户报的「AI 不认得自己的
+        # 记忆」,有一部分就是它拿到的本来就不完整。
+        # 只在**成功**路径打:上面每条错误路径返回的都是我们自己造的短字符串,
+        # 不需要额度。metadata 是可信通道,provider 的文本进不来
+        # (见 result_budget 模块开头)。
+        return ToolResult(
+            call_id=result.call_id,
+            content=result.content,
+            metadata={
+                **(result.metadata or {}),
+                cap_result_budget.RESULT_KIND_METADATA_KEY:
+                    cap_result_budget.USER_MCP_RESULT_KIND,
+            },
+        )
 
     async def _read(kind: str, tc) -> ToolResult:
         await _event(tc, "tool_call_started", {"phase": f"{kind}_read"})

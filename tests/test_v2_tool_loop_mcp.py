@@ -549,3 +549,55 @@ def test_no_extra_specs_is_unchanged_behavior():
     names = {s.name for s in provider_tools[0]}
     assert not any(n.startswith("mcp__") for n in names)
     assert outcome.final_text == "just text"
+
+
+def test_user_mcp_results_get_a_wider_per_result_budget():
+    """MCP 返回不该被通用的 2000 字符切成碎片。
+
+    记忆型 MCP 一次 breath 可能带回好几条记忆;按 2000 截断,模型看到的是残缺
+    内容 —— usr_dd0b 报的「AI 不认得我的记忆」有一部分就是这么来的。
+
+    ⚠️ 这一档刻意**不是** atomic_json:那面旗只给「序列化前已结构收缩」的生产者,
+    而 MCP 服务器没有这个契约,声明成原子的话超限返回会被整份换成一条 error,
+    比截断更糟。
+    """
+    from capabilities import result_budget
+
+    long_text = "记" * 5000
+    marked = ToolResult(
+        call_id="m1",
+        content=long_text,
+        metadata={result_budget.RESULT_KIND_METADATA_KEY:
+                  result_budget.USER_MCP_RESULT_KIND},
+    )
+    plain = ToolResult(call_id="p1", content=long_text)
+
+    kept_mcp = tool_loop._normalize_tool_results(
+        [marked], per_result_cap=2000, batch_cap=8000)[0]
+    kept_plain = tool_loop._normalize_tool_results(
+        [plain], per_result_cap=2000, batch_cap=8000)[0]
+
+    assert len(kept_plain.content) <= 2100, "普通工具维持原有的窄上限"
+    assert len(kept_mcp.content) > 4000, (
+        f"MCP 结果应拿到更宽的额度,实际只有 {len(kept_mcp.content)}")
+    # 标记必须原样带下去 —— 丢了的话下一层截断又会退回 2000
+    assert (kept_mcp.metadata or {}).get(result_budget.RESULT_KIND_METADATA_KEY) \
+        == result_budget.USER_MCP_RESULT_KIND
+
+
+def test_user_mcp_budget_is_not_atomic():
+    """超限的 MCP 返回要被截断,而不是整份换成一条 error。"""
+    from capabilities import result_budget
+
+    policy = result_budget.for_tool(result_budget.USER_MCP_RESULT_KIND)
+    assert policy is not None and policy.atomic_json is False
+    over = ToolResult(
+        call_id="m1",
+        content="x" * 50000,
+        metadata={result_budget.RESULT_KIND_METADATA_KEY:
+                  result_budget.USER_MCP_RESULT_KIND},
+    )
+    kept = tool_loop._normalize_tool_results(
+        [over], per_result_cap=2000, batch_cap=8000)[0]
+    assert kept.content != result_budget.OVERFLOW_RESULT_CONTENT
+    assert kept.content.startswith("x")
