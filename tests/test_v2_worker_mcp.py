@@ -281,13 +281,15 @@ def test_chat_tool_search_injects_full_schema_before_mcp_dispatch(monkeypatch):
     assert dispatched == [(_MCP_SPEC.name, {})]
 
 
-def test_chat_turn_blocks_approved_read_only_mcp_after_its_remote_result(
+def test_chat_turn_keeps_mcp_usable_after_its_own_remote_result(
     monkeypatch,
 ):
     """Exercise the production worker -> loader -> tool-loop provenance wire.
 
-    An exact catalog approval makes the MCP tool a parallel read, but its remote
-    result is still external input and must remove every MCP schema next round.
+    2026-08-12 Seven 拍板放宽:MCP 的返回内容不再把 MCP 自己下架。原规则下
+    一轮只能调一次,而记忆型服务器要「先取后存」——那正是用户报的
+    「MCP 只能读不能写」。这条用例走的是**生产链路**(worker → loader →
+    tool_loop),比 tool_loop 单测更接近真实。
     """
     uid = "u_mcp_read_only_provenance_fence"
     conftest.seed_user(uid)
@@ -332,7 +334,8 @@ def test_chat_turn_blocks_approved_read_only_mcp_after_its_remote_result(
     assert status == "completed"
     assert dispatched == [(_MCP_SPEC.name, {})]
     assert _MCP_SPEC.name in {spec.name for spec in calls[0]["tools"]}
-    assert _MCP_SPEC.name not in {spec.name for spec in calls[1]["tools"]}
+    assert _MCP_SPEC.name in {spec.name for spec in calls[1]["tools"]}, (
+        "第二轮必须还能调 MCP —— 「只能读不能写」的生产链路复现点")
     assert _bubbles(uid)[0]["body_ct"] == "kept the remote result local"
 
 
@@ -417,9 +420,13 @@ def test_chat_identity_get_result_fences_outbound_but_keeps_local_edits(
     assert {"identity_get", "web_search", "web_fetch", "task", _MCP_SPEC.name} <= (
         first_names
     )
-    assert {"web_search", "web_fetch", "task", _MCP_SPEC.name}.isdisjoint(
+    assert {"web_search", "web_fetch", "task"}.isdisjoint(
         second_names
     )
+    # 2026-08-12:读过人格之后 web/task 仍然掐掉,但用户自己配的 MCP 不再被牵连。
+    # 这条以前是最致命的一环 —— _PRIVATE_READ_TOOLS 里有 memory_index/search/fetch,
+    # 模型几乎每轮都读记忆,于是 MCP 常在第一次调用之前就没了。
+    assert _MCP_SPEC.name in second_names
     assert cap_registry.WRITE_ACTIONS <= second_names
     assert _bubbles(uid)[0]["body_ct"] == "kept the persona private"
 

@@ -145,8 +145,14 @@ def test_mcp_tool_is_offered_and_dispatched():
     assert replies == [("it's sunny", True)]
 
 
-def test_mcp_result_is_external_content_and_removes_later_mutations():
-    """Remote MCP text cannot prompt-inject a later platform or MCP write."""
+def test_mcp_result_still_fences_platform_writes_but_keeps_mcp_usable():
+    """MCP 返回内容仍拦得住**平台**写,但不再把 MCP 自己下架。
+
+    2026-08-12 Seven 拍板放宽。原规则是「任何一次 MCP 调用之后本轮所有 MCP 工具
+    消失」,代价是**一轮只能调一次** —— 记忆型服务器天生要「先取后存」,
+    两位用户报的「MCP 只能读不能写」就是这条。平台写仍拦(那是我们自己的副作用面),
+    MCP 放行(服务器是用户自己挑的,和模型自己搜到的网页不是一个威胁模型)。
+    """
     responses = iter([
         {"reply": "", "usage": {}, "tool_calls": [
             {"id": "m1", "name": "mcp__weather__search", "args": {"q": "SF"}}]},
@@ -160,9 +166,10 @@ def test_mcp_result_is_external_content_and_removes_later_mutations():
     provider_tools = []
     _run(responses, _dispatch, extra_tool_specs=[MCP_SPEC], provider_tools=provider_tools)
     second_names = {s.name for s in provider_tools[1]}
-    assert cap_registry.WRITE_ACTIONS.isdisjoint(second_names)
-    assert "mcp__weather__search" not in second_names
-    assert tool_loop.provenance.EXTERNAL_READS.isdisjoint(second_names)
+    assert cap_registry.WRITE_ACTIONS.isdisjoint(second_names), "平台写仍要拦"
+    assert tool_loop.provenance.EXTERNAL_READS.isdisjoint(second_names), "web/task 仍要拦"
+    assert "mcp__weather__search" in second_names, (
+        "第二次 MCP 调用必须还在 —— 这正是「只能读不能写」的复现点")
 
 
 def test_reply_plus_mutating_mcp_is_rejected_before_any_side_effect():
@@ -217,7 +224,7 @@ def test_reply_plus_server_claimed_read_only_mcp_is_still_rejected():
     assert outcome.final_text == "safe fallback"
 
 
-def test_external_web_content_removes_every_user_mcp_tool():
+def test_external_web_content_no_longer_removes_user_mcp_tools():
     responses = iter([
         {"reply": "", "usage": {}, "tool_calls": [
             {"id": "web", "name": "web_search", "args": {"query": "weather"}},
@@ -239,11 +246,12 @@ def test_external_web_content_removes_every_user_mcp_tool():
         provider_tools=provider_tools,
     )
     second_names = {spec.name for spec in provider_tools[1]}
-    assert MCP_SPEC.name not in second_names
-    assert MCP_WRITE_SPEC.name not in second_names
+    # 2026-08-12 放宽:网页内容不再牵连用户自己配的 MCP 服务器。
+    assert MCP_SPEC.name in second_names
+    assert MCP_WRITE_SPEC.name in second_names
 
 
-def test_external_web_content_removes_approved_read_only_mcp_tool():
+def test_external_web_content_keeps_approved_read_only_mcp_tool():
     """Read-only approval does not make a later outbound request non-exfiltrating."""
     responses = iter([
         {"reply": "", "usage": {}, "tool_calls": [
@@ -272,11 +280,16 @@ def test_external_web_content_removes_approved_read_only_mcp_tool():
     first_names = {spec.name for spec in provider_tools[0]}
     second_names = {spec.name for spec in provider_tools[1]}
     assert MCP_SPEC.name in first_names
-    assert MCP_SPEC.name not in second_names
+    assert MCP_SPEC.name in second_names
 
 
-def test_approved_read_only_mcp_result_blocks_every_later_mcp_tool():
-    """Remote read results cannot select another outbound MCP request."""
+def test_reading_from_an_mcp_server_still_allows_writing_to_it():
+    """「先取后存」必须能在同一轮跑完 —— 这条就是用户报的「只能读不能写」。
+
+    记忆型 MCP(Ombre Brain 之类)的标准用法是开场取记忆、聊完存回去。旧规则在
+    第一次调用之后就把整个 MCP 工具面下架,第二步必然失败,而用户只看到
+    「AI 说它存不了」。
+    """
     responses = iter([
         {"reply": "", "usage": {}, "tool_calls": [
             {"id": "m1", "name": MCP_SPEC.name, "args": {"q": "SF"}},
@@ -302,11 +315,11 @@ def test_approved_read_only_mcp_result_blocks_every_later_mcp_tool():
     first_names = {spec.name for spec in provider_tools[0]}
     second_names = {spec.name for spec in provider_tools[1]}
     assert {MCP_SPEC.name, MCP_WRITE_SPEC.name} <= first_names
-    assert {MCP_SPEC.name, MCP_WRITE_SPEC.name}.isdisjoint(second_names)
+    assert {MCP_SPEC.name, MCP_WRITE_SPEC.name} <= second_names
 
 
-def test_task_result_conservatively_blocks_approved_read_only_mcp_tool():
-    """Parent treats every child summary as transitively external provenance."""
+def test_task_result_no_longer_blocks_user_mcp_tools():
+    """子任务摘要仍算外部来源(web/平台写照拦),但不再牵连用户自己配的 MCP。"""
     responses = iter([
         {"reply": "", "usage": {}, "tool_calls": [
             {
@@ -340,11 +353,17 @@ def test_task_result_conservatively_blocks_approved_read_only_mcp_tool():
     first_names = {spec.name for spec in provider_tools[0]}
     second_names = {spec.name for spec in provider_tools[1]}
     assert {"task", MCP_SPEC.name} <= first_names
-    assert {"task", MCP_SPEC.name}.isdisjoint(second_names)
+    assert "task" not in second_names, "子任务摘要仍算外部来源"
+    assert MCP_SPEC.name in second_names, "但不再牵连用户自己配的 MCP"
 
 
-def test_text_bearing_perception_read_removes_later_web_mcp_and_task():
-    """Calendar/app/etc. strings are private input, not outbound instructions."""
+def test_text_bearing_perception_read_removes_later_web_and_task_not_mcp():
+    """日历/应用文本仍然掐掉 web/task,但不再掐用户自己的 MCP。
+
+    这条以前是最致命的一环:_PRIVATE_READ_TOOLS 里有 memory_index/search/fetch,
+    而模型几乎每轮都读记忆 —— 于是 MCP 常在第一次调用之前就没了,用户看到的是
+    「工具明明连着,AI 却说用不了」(usr_dd0b)。
+    """
     from model_api_runtime.v2 import worker
 
     responses = iter([
@@ -376,9 +395,8 @@ def test_text_bearing_perception_read_removes_later_web_mcp_and_task():
     first_names = {spec.name for spec in provider_tools[0]}
     second_names = {spec.name for spec in provider_tools[1]}
     assert {"web_search", "web_fetch", "task", MCP_SPEC.name} <= first_names
-    assert {"web_search", "web_fetch", "task", MCP_SPEC.name}.isdisjoint(
-        second_names
-    )
+    assert {"web_search", "web_fetch", "task"}.isdisjoint(second_names)
+    assert MCP_SPEC.name in second_names, "读过私密内容不该牵连用户自己的 MCP"
 
 
 def test_numeric_perception_read_preserves_later_web_mcp_and_task():
@@ -415,8 +433,8 @@ def test_numeric_perception_read_preserves_later_web_mcp_and_task():
     assert {"web_search", "web_fetch", "task", MCP_SPEC.name} <= second_names
 
 
-def test_identity_get_removes_later_outbound_but_keeps_local_edits():
-    """Persona text stays local without breaking read-then-edit workflows."""
+def test_identity_get_removes_later_web_but_keeps_mcp_and_local_edits():
+    """人格文本仍不外流到 web/task,但用户自己的 MCP 不再被牵连。"""
     from model_api_runtime.v2 import worker
 
     responses = iter([
@@ -461,7 +479,7 @@ def test_identity_get_removes_later_outbound_but_keeps_local_edits():
         MCP_WRITE_SPEC.name,
     } <= first_names
     assert {"web_search", "web_fetch", "task"}.isdisjoint(second_names)
-    assert {MCP_SPEC.name, MCP_WRITE_SPEC.name}.isdisjoint(second_names)
+    assert {MCP_SPEC.name, MCP_WRITE_SPEC.name} <= second_names
     assert cap_registry.WRITE_ACTIONS <= second_names
 
 
@@ -489,9 +507,14 @@ def test_unknown_mcp_mutation_outcome_disables_all_later_mutations():
     )
 
     second_names = {spec.name for spec in provider_tools[1]}
-    assert MCP_SPEC.name not in second_names
-    assert MCP_WRITE_SPEC.name not in second_names
-    assert not (cap_registry.WRITE_ACTIONS & second_names)
+    # 这条闸**保留**:远端超时时可能已经提交,再写一次会重复或叠加未知状态。
+    # 它防的是幂等性,不是信任 —— 所以 2026-08-12 那次放宽没有动它。
+    # 这个夹具没传 extra_mutating_tool_names,于是两台都按「未批准只读 = 视为
+    # 变更工具」处理,所以两台都该消失。想验「只读的那台不受影响」要另起一条、
+    # 显式传批准集合(见 test_reading_from_an_mcp_server_still_allows_writing_to_it)。
+    assert {MCP_SPEC.name, MCP_WRITE_SPEC.name}.isdisjoint(second_names), (
+        "结果未知时,所有未批准只读的 MCP 变更工具都必须消失")
+    assert not (cap_registry.WRITE_ACTIONS & second_names), "平台写同样要拦"
 
 
 def test_unknown_non_mcp_tool_still_rejected():

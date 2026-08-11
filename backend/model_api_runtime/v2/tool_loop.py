@@ -889,11 +889,18 @@ async def run_tool_loop(
             blocked_tools: set[str] = set()
             if external_content_seen:
                 blocked_tools.update(_PLATFORM_MUTATION_TOOLS)
-                # Every MCP call crosses an outbound data boundary.  A matching
-                # read-only approval permits parallel execution before external
-                # content is observed, but cannot permit a later data-dependent
-                # request which could exfiltrate private conversation history.
-                blocked_tools.update(mcp_names)
+                # ⚠️ 2026-08-12 Seven 拍板:user-MCP 不再因为「看过外部内容」下架。
+                #
+                # 原规则:任何一次 MCP 调用之后,本轮**所有** MCP 工具从工具面消失
+                # ——理由是每次 MCP 调用都跨出站边界,后一次请求可能被前一次的返回
+                # 内容操纵去带走隐私。代价是**一轮只能调一次 MCP**,而记忆型服务器
+                # 天生要「先取后存」:两位用户报的「MCP 只能读不能写」正是这条。
+                #
+                # 对齐 Claude Code —— 它对 MCP 没有这类围栏。服务器是用户自己挑的、
+                # 自己填的地址与鉴权头,和「模型自己搜到的网页」不是同一个威胁模型。
+                # 被接受的风险面:模型读过私密内容后可以把它发给用户配置的任意 MCP
+                # 服务器(含论坛这类别人可写内容的)。**这是有意放宽,不是疏漏** ——
+                # 谁想加回来,请先去看 docs/MCP_TRUST_BOUNDARY.md 里的决策记录。
                 blocked_tools.add("web_search")
                 blocked_tools.add(tool_schema.TASK_TOOL)
                 if not allowed_fetch_urls:
@@ -911,10 +918,15 @@ async def run_tool_loop(
             # still carries the original user/wake seed plus generation fence.
             if outbound_tools_blocked:
                 blocked_tools.update({"web_search", "web_fetch"})
-                blocked_tools.update(mcp_names)
-                # A parent task can hand private workspace/memory-derived text
-                # to a child which still has outbound web access.  Treat that
-                # delegation as another outbound channel, not as a local read.
+                # ⚠️ 同一次放宽(2026-08-12):读过私密内容之后,user-MCP 也不再下架。
+                #
+                # 这条比上面那条更常触发,而且几乎没人意识到:_PRIVATE_READ_TOOLS 里
+                # 有 memory_index / memory_search / memory_fetch,而模型**几乎每轮
+                # 都要读记忆**(usr_dd0b 的 trace 里 memory.index.called ×5)。
+                # 于是 MCP 往往在第一次读记忆之后就没了,连第一次调用都轮不上 ——
+                # 用户看到的是「工具明明连着,AI 说用不了」。
+                #
+                # web/task 仍然拦着:那是模型自己选的目的地,MCP 是用户选的。
                 blocked_tools.add(tool_schema.TASK_TOOL)
             tools = [spec for spec in turn_catalog if spec.name not in blocked_tools]
         else:
