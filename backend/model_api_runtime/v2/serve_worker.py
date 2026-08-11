@@ -159,12 +159,13 @@ def _load_genesis_persona(store, *, runtime_token: str) -> str:
     if not (isinstance(envelope, dict) and envelope.get("body_ct")):
         return ""
     try:
-        raw = core_enclave._decrypt_envelope_via_enclave(
-            envelope,
-            None,
-            purpose="genesis_persona",
-            runtime_token=str(runtime_token or ""),
-        )
+        with core_enclave.coalesced_success_trace("genesis_persona"):
+            raw = core_enclave._decrypt_envelope_via_enclave(
+                envelope,
+                None,
+                purpose="genesis_persona",
+                runtime_token=str(runtime_token or ""),
+            )
         return raw.decode("utf-8")
     except Exception as exc:  # noqa: BLE001 — mirror Runtime V1 fallback
         log.warning(
@@ -760,9 +761,10 @@ def _resolve_provider(user_id: str):
         return None, {"error": "runtime_token_mint_failed", "detail": str(e)[:160]}
     # api_key=None: Runtime V2 turns never hold the user's long-term
     # Feedling API key — only the runtime token authenticates to the enclave.
-    runtime = hosted_config_store._load_runtime_provider_config(
-        store, None, runtime_token=token
-    )
+    with core_enclave.coalesced_success_trace("model_api_provider_key"):
+        runtime = hosted_config_store._load_runtime_provider_config(
+            store, None, runtime_token=token
+        )
     if isinstance(runtime, tuple):
         return None, runtime[1]
     # Per-user opaque affinity: provider caches must never receive the raw user
@@ -809,13 +811,14 @@ def _decrypt_chat_rows(
     entire debug trace. Failures inside the batch still trace individually.
     """
     with core_enclave.coalesced_success_trace("v2_chat_read"):
-        return _decrypt_chat_rows_inner(
-            user_id,
-            rows,
-            user_only=user_only,
-            preserve_unreadable=preserve_unreadable,
-            include_capture_metadata=include_capture_metadata,
-        )
+        with core_enclave.coalesced_success_trace("v2_caption_read"):
+            return _decrypt_chat_rows_inner(
+                user_id,
+                rows,
+                user_only=user_only,
+                preserve_unreadable=preserve_unreadable,
+                include_capture_metadata=include_capture_metadata,
+            )
 
 
 def _decrypt_chat_rows_inner(
@@ -1634,11 +1637,12 @@ def _read_summary_with_seq(user_id: str) -> tuple[str, float, int, int]:
             )
         return "", watermark_ts, version, watermark_seq
     token = _mint_runtime_token(user_id)
-    plaintext = _decrypt_summary_text(
-        env,
-        purpose="v2_summary_read",
-        runtime_token=token,
-    )
+    with core_enclave.coalesced_success_trace("v2_summary_read"):
+        plaintext = _decrypt_summary_text(
+            env,
+            purpose="v2_summary_read",
+            runtime_token=token,
+        )
     if has_durable_coverage and not plaintext.strip():
         raise v2_summary_frontier.SummaryFrontierIntegrityError(
             "covered_summary_empty_plaintext"
@@ -1683,13 +1687,15 @@ def _select_agent_profile_for_turn(
             runtime_token=token,
         )
 
-    return v2_profile_store.select_profile_for_turn(
-        user_id,
-        summary,
-        enabled=enabled,
-        decrypt_envelope=_decrypt,
-        read_blob=db.get_blob_strict,
-    )
+    with core_enclave.coalesced_success_trace("v2_profile_memory_read"):
+        with core_enclave.coalesced_success_trace("v2_profile_user_read"):
+            return v2_profile_store.select_profile_for_turn(
+                user_id,
+                summary,
+                enabled=enabled,
+                decrypt_envelope=_decrypt,
+                read_blob=db.get_blob_strict,
+            )
 
 
 def _write_summary(
@@ -2148,12 +2154,13 @@ def _read_screen_frames(user_id: str, frame_ids: list[str]) -> dict[str, Any]:
     misses = 0
     # Sequential by design: all users share the same enclave decrypt proxy. The
     # worker's outer enclave_sem bounds cross-turn concurrency as well.
-    for frame_id in frame_ids[: v2_screen_chat.MAX_PUSH_FRAMES]:
-        value, hit = _read_screen_frame_cached(user_id, str(frame_id))
-        hits += int(hit)
-        misses += int(not hit)
-        if value is not None:
-            frames[str(frame_id)] = value
+    with core_enclave.coalesced_success_trace("screen_frame_decrypt"):
+        for frame_id in frame_ids[: v2_screen_chat.MAX_PUSH_FRAMES]:
+            value, hit = _read_screen_frame_cached(user_id, str(frame_id))
+            hits += int(hit)
+            misses += int(not hit)
+            if value is not None:
+                frames[str(frame_id)] = value
     return {"frames": frames, "cache_hits": hits, "cache_misses": misses}
 
 

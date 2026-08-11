@@ -38,13 +38,22 @@ _bulk_scope = threading.local()
 
 
 class _BulkTrace:
-    __slots__ = ("purpose", "store", "count", "started_at")
+    __slots__ = (
+        "purpose",
+        "store",
+        "count",
+        "started_at",
+        "path",
+        "explain",
+    )
 
     def __init__(self, purpose: str) -> None:
         self.purpose = purpose
         self.store = None
         self.count = 0
         self.started_at = time.time()
+        self.path: str | None = None
+        self.explain: str | None = None
 
 
 @contextlib.contextmanager
@@ -52,27 +61,39 @@ def coalesced_success_trace(purpose: str):
     """Collapse a bulk decrypt loop's per-call success events into one event.
 
     Errors and timeouts still emit individually — a failure inside a batch is
-    exactly what someone reading the trace is looking for. Nested scopes are
-    left to the outermost one so a helper cannot silently split the rollup.
+    exactly what someone reading the trace is looking for. Nested scopes of the
+    same purpose join the outer batch; different purposes are tracked
+    independently so a chat-row loop can fold both body and caption decrypts.
     """
-    if getattr(_bulk_scope, "active", None) is not None:
+    scopes = getattr(_bulk_scope, "active_by_purpose", None)
+    if scopes is None:
+        scopes = {}
+        _bulk_scope.active_by_purpose = scopes
+    if purpose in scopes:
         yield
         return
     scope = _BulkTrace(purpose)
-    _bulk_scope.active = scope
+    scopes[purpose] = scope
     try:
         yield
     finally:
-        _bulk_scope.active = None
+        scopes.pop(purpose, None)
+        if not scopes:
+            try:
+                del _bulk_scope.active_by_purpose
+            except AttributeError:
+                pass
         if scope.store is not None and scope.count:
             _trace_enclave(
                 scope.store,
                 "enclave.call.batch",
                 purpose=purpose,
-                path="/v1/envelope/decrypt",
+                path=scope.path or "",
                 summary=f"enclave decrypt x{scope.count}",
                 detail={"calls": scope.count},
                 dur_ms=(time.time() - scope.started_at) * 1000,
+                explain=scope.explain
+                or ("Backend called the enclave over HTTP; only metadata is recorded."),
             )
 
 
@@ -142,6 +163,7 @@ def _trace_enclave(
     summary: str = "",
     detail: dict | None = None,
     dur_ms: float | None = None,
+    explain: str = "Backend called the enclave over HTTP; only metadata is recorded.",
 ) -> None:
     if store is None:
         return
@@ -151,7 +173,8 @@ def _trace_enclave(
         and purpose.startswith(_QUIET_SUCCESS_PURPOSE_PREFIXES)
     ):
         return
-    scope = getattr(_bulk_scope, "active", None)
+    scopes = getattr(_bulk_scope, "active_by_purpose", None) or {}
+    scope = scopes.get(purpose)
     if (
         scope is not None
         and status == "ok"
@@ -163,6 +186,15 @@ def _trace_enclave(
             scope.count += 1
         if scope.store is None:
             scope.store = store
+        if scope.path is None:
+            scope.path = path
+        elif scope.path != path:
+            # A multi-resource proxy batch (screen frames) has no single exact
+            # route. Omit it instead of reporting the first frame's path as if
+            # every call used that resource.
+            scope.path = ""
+        if scope.explain is None:
+            scope.explain = explain
         return
     try:
         debug_trace.trace_event(
@@ -172,7 +204,7 @@ def _trace_enclave(
             actor="backend",
             status=status,
             summary=summary,
-            explain="Backend called the enclave over HTTP; only metadata is recorded.",
+            explain=explain,
             detail={
                 "purpose": purpose,
                 "path": path,

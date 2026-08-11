@@ -4,6 +4,7 @@ import asyncio
 import json
 import sys
 import types
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -1470,6 +1471,54 @@ def test_read_summary_decrypts_present_row(monkeypatch):
     assert serve_worker._read_summary_with_seq("u_summary_test") == (
         "- prior chat", 7.0, 3, 19,
     )
+
+
+def test_persona_and_summary_decrypts_declare_trace_scopes(monkeypatch):
+    from model_api_runtime.v2 import jobs_store as v2_jobs_store
+
+    scopes = []
+
+    @contextmanager
+    def record_scope(purpose):
+        scopes.append(purpose)
+        yield
+
+    monkeypatch.setattr(
+        serve_worker.core_enclave,
+        "coalesced_success_trace",
+        record_scope,
+    )
+    monkeypatch.setattr(
+        serve_worker.db,
+        "get_blob",
+        lambda *_args: {"content_envelope": {"body_ct": "persona"}},
+    )
+    monkeypatch.setattr(
+        v2_jobs_store,
+        "get_summary_frontier_state",
+        lambda _uid: {
+            "summary_envelope": {"body_ct": "summary"},
+            "watermark_ts": 0.0,
+            "watermark_seq": 0,
+            "version": 1,
+        },
+    )
+    monkeypatch.setattr(serve_worker, "_mint_runtime_token", lambda _uid: "rt")
+    monkeypatch.setattr(
+        serve_worker.core_enclave,
+        "_decrypt_envelope_via_enclave",
+        lambda envelope, *_args, **_kwargs: str(envelope["body_ct"]).encode(),
+    )
+
+    persona = serve_worker._load_genesis_persona(
+        types.SimpleNamespace(user_id="u-scopes"),
+        runtime_token="rt",
+    )
+    summary = serve_worker._read_summary_with_seq("u-scopes")
+
+    assert persona == "persona"
+    assert summary == ("summary", 0.0, 1, 0)
+    assert scopes == ["genesis_persona", "v2_summary_read"]
 
 
 @pytest.mark.parametrize(
