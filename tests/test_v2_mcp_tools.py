@@ -56,7 +56,7 @@ def test_missing_resident_defaults_to_folded_schema(monkeypatch):
     servers["servers"][0].pop("resident")
 
     async def fake_list(url, headers, *, ca_pem=None, transport=None,
-                        mcp_transport=None):
+                        mcp_transport=None, instructions_out=None):
         return [{
             "name": "search",
             "description": "Find\nweather by city",
@@ -94,7 +94,7 @@ def test_tool_search_resolves_exact_name_before_remote_dispatch(monkeypatch):
     seen = []
 
     async def fake_list(url, headers, *, ca_pem=None, transport=None,
-                        mcp_transport=None):
+                        mcp_transport=None, instructions_out=None):
         return [{
             "name": "search",
             "description": "Find weather by city",
@@ -150,7 +150,7 @@ def test_tool_search_query_only_matches_folded_tools(monkeypatch):
     }
 
     async def fake_list(url, headers, *, ca_pem=None, transport=None,
-                        mcp_transport=None):
+                        mcp_transport=None, instructions_out=None):
         return [{
             "name": "lookup",
             "description": "Look up calendar events",
@@ -175,7 +175,7 @@ def test_tool_search_query_only_matches_folded_tools(monkeypatch):
 
 def test_tool_search_keeps_resolved_catalog_within_char_budget(monkeypatch):
     async def fake_list(url, headers, *, ca_pem=None, transport=None,
-                        mcp_transport=None):
+                        mcp_transport=None, instructions_out=None):
         return [
             {
                 "name": name,
