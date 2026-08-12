@@ -752,3 +752,44 @@ def test_missing_blank_or_non_string_instructions_yield_nothing():
         "garbage",
     ):
         assert mcp_client._instructions_from_init_doc(doc) == [], doc
+
+
+def test_streamable_handshake_collects_initialize_instructions(monkeypatch):
+    """Lock the production wire between handshake parsing and the output box."""
+    seen_methods = []
+
+    async def fake_post(_client, _target, _headers, payload, _extra):
+        method = payload["method"]
+        seen_methods.append(method)
+        if method == "initialize":
+            return httpx.Response(
+                200,
+                headers={"content-type": "application/json"},
+                json={
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "result": {
+                        "protocolVersion": "2025-03-26",
+                        "capabilities": {"tools": {}},
+                        "serverInfo": {"name": "fake", "version": "0"},
+                        "instructions": "Call breath first.",
+                    },
+                },
+            )
+        assert method == "notifications/initialized"
+        return httpx.Response(202)
+
+    monkeypatch.setattr(mcp_client, "_post_bounded", fake_post)
+    target = mcp_probe._PinnedTarget(
+        request_url=httpx.URL("https://93.184.216.34/mcp"),
+        host_header="mcp.example.com",
+        sni_hostname="mcp.example.com",
+    )
+    collected = []
+
+    session = asyncio.run(mcp_client._handshake(
+        object(), target, {}, instructions_out=collected))
+
+    assert session == {}
+    assert collected == ["Call breath first."]
+    assert seen_methods == ["initialize", "notifications/initialized"]
