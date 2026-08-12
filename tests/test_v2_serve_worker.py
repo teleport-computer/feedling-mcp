@@ -82,9 +82,19 @@ def test_temporal_snapshot_prefers_registry_timezone_and_freezes_timestamp(
         lambda _user_id: "Asia/Shanghai",
     )
     monkeypatch.setattr(
+        serve_worker.accounts_registry,
+        "_get_user_archive_language",
+        lambda _user_id: "zh-Hans",
+    )
+    monkeypatch.setattr(
         serve_worker.perception_service,
         "stable_context_timezone",
         lambda _user_id: calls.append("perception") or "Europe/Berlin",
+    )
+    monkeypatch.setattr(
+        serve_worker.perception_service,
+        "stable_context_locale",
+        lambda _user_id: "en-US",
     )
     monkeypatch.setattr(
         serve_worker.db,
@@ -101,6 +111,8 @@ def test_temporal_snapshot_prefers_registry_timezone_and_freezes_timestamp(
 
     assert snapshot == {
         "timezone": "Asia/Shanghai",
+        "locale": "en-US",
+        "archive_language": "zh-Hans",
         "last_user_message_ts": 123.0,
     }
     assert calls == [("u-time", 42)]
@@ -113,6 +125,11 @@ def test_temporal_snapshot_uses_perception_then_china_default(monkeypatch):
         lambda _user_id: None,
     )
     monkeypatch.setattr(
+        serve_worker.accounts_registry,
+        "_get_user_archive_language",
+        lambda _user_id: "",
+    )
+    monkeypatch.setattr(
         serve_worker.db,
         "chat_latest_genuine_user_ts",
         lambda _user_id, *, through_seq=None: None,
@@ -121,6 +138,11 @@ def test_temporal_snapshot_uses_perception_then_china_default(monkeypatch):
         serve_worker.perception_service,
         "stable_context_timezone",
         lambda _user_id: "Europe/Berlin",
+    )
+    monkeypatch.setattr(
+        serve_worker.perception_service,
+        "stable_context_locale",
+        lambda _user_id: "",
     )
     assert serve_worker._read_temporal_snapshot("u-time")["timezone"] == (
         "Europe/Berlin"

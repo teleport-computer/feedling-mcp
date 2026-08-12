@@ -1388,6 +1388,10 @@ def _read_temporal_snapshot(
         timezone_name = perception_service.stable_context_timezone(user_id)
     return {
         "timezone": str(timezone_name or v2_context.DEFAULT_TIMEZONE),
+        "locale": str(perception_service.stable_context_locale(user_id) or ""),
+        "archive_language": str(
+            accounts_registry._get_user_archive_language(user_id) or ""
+        ),
         "last_user_message_ts": db.chat_latest_genuine_user_ts(
             user_id,
             through_seq=through_seq,

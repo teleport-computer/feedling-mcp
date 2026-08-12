@@ -3,7 +3,7 @@
 No I/O, no DB, no LLM calls — just deterministic message-list construction
 from a system prompt, an optional **untrusted** conversation summary, a
 verbatim message tail, and an optional untrusted runtime-data block. It depends
-only on stdlib and the pure shared voice-row classifier.
+only on stdlib and pure shared chat helpers.
 """
 from __future__ import annotations
 
@@ -15,6 +15,7 @@ from datetime import datetime, timezone
 from typing import Any, Sequence
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from chat.reply_language import infer_reply_language_policy, local_time_labels
 import worldbook_match
 from voice.message_filter import VOICE_CALL_RECORD_ROLE, conversation_rows
 
@@ -680,6 +681,8 @@ def build_temporal_context(
     timezone_name: str,
     last_user_message_ts: float | None,
     tail: list[dict],
+    locale: str = "",
+    archive_language: str = "",
     visible_proactive_count_24h: int | None = None,
     last_visible_proactive_message_ts: float | None = None,
     tail_fresh_window_sec: int = 21_600,
@@ -701,6 +704,13 @@ def build_temporal_context(
     now_value = float(now_ts)
     now_utc = datetime.fromtimestamp(now_value, tz=timezone.utc)
     now_local = now_utc.astimezone(zone)
+    language_policy = infer_reply_language_policy(
+        {},
+        [],
+        locale=str(locale or ""),
+        archive_language=str(archive_language or ""),
+    )
+    labels = local_time_labels(now_local, language_policy)
 
     last_ts = _finite_timestamp(last_user_message_ts)
     last_sent_at = (
@@ -743,6 +753,8 @@ def build_temporal_context(
         # current_utc_time sibling was a foot-gun: the model misread the
         # evening-UTC value as the user's local wall clock. Omitted on purpose.
         "current_local_time": now_local.isoformat(timespec="seconds"),
+        "current_weekday": labels.weekday,
+        "current_day_period": labels.day_period,
         "last_genuine_user_message_sent_at": last_sent_at,
         "seconds_since_last_genuine_user_message": seconds_since_last,
         "tail_timestamps": tail_timestamps,

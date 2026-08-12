@@ -22,6 +22,14 @@ class ReplyLanguagePolicy:
     evidence_chars: int = 0
 
 
+@dataclass(frozen=True)
+class LocalTimeLabels:
+    """Localized calendar labels for one already-localized wall clock."""
+
+    weekday: str
+    day_period: str
+
+
 IDENTITY_LANGUAGE_FIELDS = (
     "custom_persona_prompt",
     "self_introduction",
@@ -172,6 +180,37 @@ def _age_text(seconds: float, language: str) -> str:
     return f"{days} 天前" if language != "en" else f"{days} day{'s' if days != 1 else ''} ago"
 
 
+def local_time_labels(
+    local: datetime,
+    policy: ReplyLanguagePolicy,
+) -> LocalTimeLabels:
+    """Return the shared V1/V2 weekday and day-period labels.
+
+    ``local`` must already be expressed in the user's timezone. Keeping timezone
+    conversion outside this helper lets each runtime preserve its existing
+    fallback semantics while sharing the language and boundary rules exactly.
+    """
+    hour = local.hour
+    if policy.language == "en":
+        day_period = (
+            "late night" if hour < 6
+            else "morning" if hour < 12
+            else "midday" if hour < 14
+            else "afternoon" if hour < 18
+            else "evening"
+        )
+        return LocalTimeLabels(_WEEKDAYS_EN[local.weekday()], day_period)
+
+    day_period = (
+        "凌晨" if hour < 6
+        else "上午" if hour < 12
+        else "中午" if hour < 14
+        else "下午" if hour < 18
+        else "晚上"
+    )
+    return LocalTimeLabels(_WEEKDAYS_ZH[local.weekday()], day_period)
+
+
 def format_time_anchor(
     dt,
     tz_name,
@@ -190,19 +229,16 @@ def format_time_anchor(
     if current.tzinfo is None:
         current = current.replace(tzinfo=timezone.utc)
     local = current.astimezone(zone)
+    labels = local_time_labels(local, policy)
     if policy.language == "en":
-        h = local.hour
-        segment = "late night" if h < 6 else "morning" if h < 12 else "midday" if h < 14 else "afternoon" if h < 18 else "evening"
-        body = f"{local.strftime('%Y-%m-%d')} {_WEEKDAYS_EN[local.weekday()]} {local.strftime('%H:%M')} {segment}"
+        body = f"{local.strftime('%Y-%m-%d')} {labels.weekday} {local.strftime('%H:%M')} {labels.day_period}"
         body += f" {zone_name}" + (" (default; device timezone unavailable)" if timezone_default else "")
         line = f"current_time: {body}"
         if since_sec is not None and since_sec >= 1800:
             line += f" (last interaction {_age_text(float(since_sec), policy.language)})"
         return line
 
-    h = local.hour
-    segment = "凌晨" if h < 6 else "上午" if h < 12 else "中午" if h < 14 else "下午" if h < 18 else "晚上"
-    body = f"{local.strftime('%Y-%m-%d')} {_WEEKDAYS_ZH[local.weekday()]} {local.strftime('%H:%M')} {segment}"
+    body = f"{local.strftime('%Y-%m-%d')} {labels.weekday} {local.strftime('%H:%M')} {labels.day_period}"
     body += f" {zone_name}" + ("（默认·未获取到设备时区）" if timezone_default else "")
     line = f"current_time: {body}"
     if since_sec is not None and since_sec >= 1800:

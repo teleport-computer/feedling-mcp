@@ -10,6 +10,13 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **Runtime V1 and V2 now share localized weekday and day-period labels.**
+  Hosted Runtime V2's trailing temporal context now includes the user's local
+  weekday and day period beside its existing ISO timestamp and timezone. Both
+  runtimes use one boundary table and the same locale/account-language fallback,
+  including local-midnight rollover and non-China timezones; no duplicate UTC
+  clock is added.
+
 - **Screen-share start and end are now first-class proactive events.** Runtime
   V2 recognizes durable `broadcast_opened` and `broadcast_closed` edges behind
   proactive activation and the screen-watch switch, with one shared 60-second
