@@ -1754,6 +1754,34 @@ def _history_round_blocked_results(tool_calls, *, budget) -> dict[str, ToolResul
     return blocked
 
 
+def _render_mcp_instructions(mcp_turn) -> str:
+    """服务器自己写的使用说明 → 一段系统提示文本(没有就返回 "")。
+
+    渲染放在 V2 这边而不是 hosted:``mcp_turn.instructions`` 是纯数据
+    ([(server_name, text), ...],已按服务器名排序、已受逐台与总量上限约束),
+    在这里成型就不必让 V2 核心 import hosted(依赖方向)。
+
+    这是 MCP 协议里「服务器告诉模型该怎么用我」的官方通道
+    (initialize 的 result.instructions),Claude Code 就是这么用的。我们以前把
+    整个 initialize 响应体丢掉、只留 session id,于是自带使用说明的服务器
+    (Ombre Brain 专门配了一份 CLAUDE_PROMPT.md 就是干这个的)什么都送不到模型
+    面前 —— 模型只能自己猜怎么对待那些数据,而它猜成了「别人的东西」。
+    """
+    entries = list(getattr(mcp_turn, "instructions", None) or [])
+    if not entries:
+        return ""
+    parts = [
+        "# MCP 服务器说明",
+        "",
+        "以下是你连接的各 MCP 服务器自己提供的使用说明。",
+    ]
+    for name, text in entries:
+        if not isinstance(name, str) or not isinstance(text, str) or not text.strip():
+            continue
+        parts.extend(["", f"## {name}", text.strip()])
+    return "\n".join(parts) if len(parts) > 3 else ""
+
+
 def _mcp_mutating_names_for_turn(mcp_turn) -> frozenset[str]:
     """Use only the loader's independently approved read classification.
 
@@ -11541,6 +11569,13 @@ async def process_job(
                 runtime_token=runtime_token,
                 enclave_sem=enclave_sem,
             )
+        # 服务器自己写的使用说明进系统提示(MCP spec 的 initialize.result.
+        # instructions)。走 trusted_system_blocks 这条现成通道,和 skills 同一个
+        # 位置 —— 它排在工具目录之后,正好是「这些工具怎么用」该出现的地方。
+        # 一轮只注入一次;渲染层保证确定性顺序;长度上限在采集处已经加过。
+        mcp_instructions_block = _render_mcp_instructions(mcp_turn)
+        if mcp_instructions_block:
+            trusted_system_blocks = (*trusted_system_blocks, mcp_instructions_block)
         mcp_mutating_names = _mcp_mutating_names_for_turn(mcp_turn)
         disabled_mutation_tool_names = frozenset()
 

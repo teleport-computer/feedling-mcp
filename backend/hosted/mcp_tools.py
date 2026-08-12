@@ -65,6 +65,11 @@ MAX_MCP_TOOLS_PER_TURN = 128
 # 所以真撞上了运维看得见。
 MAX_MCP_TOOL_SCHEMA_CHARS = 32768
 MAX_MCP_TOOL_CATALOG_CHARS = 65536
+# 服务器自己写的使用说明进系统提示的预算。**这是远端可控文本**,所以必须有硬上限:
+# 逐台一份、总量一份。没有上限的话,一台服务器可以用一份超长 instructions 把
+# 人格、记忆、对话全挤出上下文 —— 那是比提示注入更钝但更有效的一种攻击。
+MAX_MCP_INSTRUCTIONS_CHARS_PER_SERVER = 4096
+MAX_MCP_INSTRUCTIONS_CHARS_TOTAL = 16384
 MAX_PROVIDER_TOOL_NAME_CHARS = 64
 MAX_MCP_TOOL_SEARCH_RESULTS = 8
 MAX_COLLAPSED_DESCRIPTION_CHARS = 240
@@ -128,6 +133,8 @@ class _ServerLoadResult:
     secret: dict | None = None
     tools: tuple = ()
     resident: bool = False
+    # 服务器自己写的使用说明(spec 的 initialize.result.instructions),没有就是 ""。
+    instructions: str = ""
 
     @property
     def available(self) -> bool:
@@ -155,6 +162,12 @@ class McpTurn:
     full_specs: dict[str, ToolSpec] = field(default_factory=dict)
     collapsed_names: set[str] = field(default_factory=set)
     resolved_names: set[str] = field(default_factory=set)
+    # 服务器自己写的使用说明(MCP spec 的 initialize.result.instructions)。
+    # [(server_name, text), ...],按服务器名排序,提示词组装层原样注入。
+    # 这是协议里「服务器告诉模型该怎么用我」的官方通道 —— 我们以前把整个
+    # initialize 响应体丢掉、只留 session id,于是像 Ombre Brain 这种自带使用说明
+    # 的服务器,说明完全到不了模型,模型只能自己猜怎么对待那些数据。
+    instructions: list = field(default_factory=list)
 
     @property
     def is_empty(self) -> bool:
@@ -598,10 +611,13 @@ async def load_turn_mcp(
                 name,
             )
             return _ServerLoadResult(name, "config_decrypt_failed")
+        # try 之外:auto-CA 重试也走 list_tools,说明得跟着那次拿回来。
+        instructions_box: list[str] = []
         try:
             tools = await mcp_client.list_tools(
                 secret["url"], secret.get("headers") or {},
-                ca_pem=secret.get("ca_pem"), mcp_transport=secret.get("transport"))
+                ca_pem=secret.get("ca_pem"), mcp_transport=secret.get("transport"),
+                instructions_out=instructions_box)
         except Exception as exc:  # noqa: BLE001 — one bad server never sinks turn
             # Auto-CA fallback: a self-signed server with no configured ca_pem
             # fails the handshake with a TLS error. Fetch its own chain's anchor
@@ -638,7 +654,8 @@ async def load_turn_mcp(
             try:
                 tools = await mcp_client.list_tools(
                     secret["url"], secret.get("headers") or {},
-                    ca_pem=anchor, mcp_transport=secret.get("transport"))
+                    ca_pem=anchor, mcp_transport=secret.get("transport"),
+                    instructions_out=instructions_box)
             except Exception as retry_exc:  # noqa: BLE001 — anchor didn't help
                 kind = _stable_failure_kind(
                     retry_exc, fallback="transport_failure")
@@ -655,6 +672,7 @@ async def load_turn_mcp(
             secret,
             tuple(tools),
             resident=bool(srv.get("resident")),
+            instructions=(instructions_box[0] if instructions_box else ""),
         )
 
     results = await asyncio.gather(*[_one(s) for s in servers])
@@ -761,6 +779,25 @@ async def load_turn_mcp(
 
     turn = _allocate_round_robin(candidates, schema_rejected=schema_rejected)
     turn.server_results = [result.public() for result in results]
+    # 服务器说明:按服务器名排序(确定性,便于提示缓存),逐台截断后再受总量约束。
+    # 空白/非字符串直接丢弃 —— 没有说明和「有一份空说明」对模型是两回事。
+    collected: list[tuple[str, str]] = []
+    spent = 0
+    for result in sorted(results, key=lambda r: r.name):
+        text = result.instructions
+        if not isinstance(text, str) or not text.strip():
+            continue
+        text = text.strip()[:MAX_MCP_INSTRUCTIONS_CHARS_PER_SERVER]
+        if spent + len(text) > MAX_MCP_INSTRUCTIONS_CHARS_TOTAL:
+            # 超总量就整台丢掉,不切一半:半截使用说明比没有更容易误导模型。
+            log.warning(
+                "mcp instructions dropped server=%r kind=instructions_budget_exceeded",
+                result.name,
+            )
+            continue
+        collected.append((result.name, text))
+        spent += len(text)
+    turn.instructions = collected
     skipped = [result.public() for result in results if not result.available]
     turn.summary.update({
         "expected": len(results),

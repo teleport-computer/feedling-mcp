@@ -79,6 +79,9 @@ def _script_provider(monkeypatch, responses):
     ):
         calls.append({
             "tools": tools,
+            # 系统提示的内容以前没被记下来 —— 于是「某段有没有真的进提示词」
+            # 这类断言只能靠间接证据。注入类改动必须能直接看到 messages。
+            "messages": messages,
             "allow_image_output": allow_image_output,
             **kwargs,
         })
@@ -110,10 +113,12 @@ def _bubbles(uid):
 
 class _FakeMcpTurn:
     """Stands in for a loaded McpTurn without enclave/network. Records dispatches."""
-    def __init__(self, specs, recorder, *, read_only_names=()):
+    def __init__(self, specs, recorder, *, read_only_names=(), instructions=()):
         self.tool_specs = specs
         self._rec = recorder
         self._read_only_names = frozenset(read_only_names)
+        # [(server_name, text), ...] —— 真 McpTurn 的同名字段,由 loader 排好序
+        self.instructions = list(instructions)
 
     @property
     def is_empty(self):
@@ -567,3 +572,81 @@ def test_platform_write_is_exactly_applied_before_later_round_mcp_mutation(
 
     assert status == "completed"
     assert events == ["platform_applied", "mcp_committed"]
+
+
+def test_server_instructions_reach_the_system_prompt_once(monkeypatch):
+    """服务器自己写的使用说明必须真的进到系统提示里。
+
+    这是 MCP 协议里「服务器告诉模型该怎么用我」的官方通道
+    (initialize 的 result.instructions),Claude Code 就是这么用的。我们以前把
+    整个 initialize 响应体丢掉、只留 session id —— 自带使用说明的服务器
+    (Ombre Brain 专门配了 CLAUDE_PROMPT.md 干这个)什么都送不到模型面前,
+    模型只能自己猜怎么对待那些数据,而 usr_dd0b 那次它猜成了「别人的东西」。
+
+    ⚠️ 这条走的是**生产链路**(process_job → load_mcp_turn → 提示词组装)。
+    只测渲染函数是不够的:接线断了照样全绿(codex 审出同一形状两次)。
+    """
+    uid = "u_mcp_instr"
+    conftest.seed_user(uid)
+    _reset(uid)
+    jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("w")
+    _patch_real_write(monkeypatch)
+    monkeypatch.setattr(worker, "_report_turn_progress", lambda *_a, **_k: None)
+
+    turn = _FakeMcpTurn(
+        [_MCP_SPEC], [],
+        instructions=[("alpha", "Always call breath first."),
+                      ("zeta", "Store with hold when the topic closes.")],
+    )
+    calls = _script_provider(monkeypatch, [
+        {"reply": "ok", "tool_calls": [],
+         "usage": {"prompt_tokens": 1, "completion_tokens": 1}},
+    ])
+    deps = _deps([{"id": "m1", "ts": 10.0, "role": "user", "content": "hi"}],
+                 load_mcp_turn=_make_load_turn_mcp(turn))
+
+    assert asyncio.run(worker.process_job(
+        job, deps, provider_config=_BYOK, api_key=None,
+        runtime_token="rt")) == "completed"
+
+    system_text = "\n".join(
+        str(m.get("content") or "")
+        for m in calls[0]["messages"] if m.get("role") == "system"
+    )
+    assert "Always call breath first." in system_text
+    assert "Store with hold when the topic closes." in system_text
+    # 逐台分隔,不然多台的说明会黏成一坨看不出边界
+    assert "## alpha" in system_text and "## zeta" in system_text
+    # 确定性顺序(loader 已按服务器名排好),对提示缓存友好
+    assert system_text.index("## alpha") < system_text.index("## zeta")
+    # 一轮只注入一次
+    assert system_text.count("# MCP 服务器说明") == 1
+
+
+def test_no_instructions_means_no_section_at_all(monkeypatch):
+    """没有说明的服务器不该在系统提示里留下一个空章节。"""
+    uid = "u_mcp_no_instr"
+    conftest.seed_user(uid)
+    _reset(uid)
+    jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("w")
+    _patch_real_write(monkeypatch)
+    monkeypatch.setattr(worker, "_report_turn_progress", lambda *_a, **_k: None)
+
+    calls = _script_provider(monkeypatch, [
+        {"reply": "ok", "tool_calls": [],
+         "usage": {"prompt_tokens": 1, "completion_tokens": 1}},
+    ])
+    deps = _deps([{"id": "m1", "ts": 10.0, "role": "user", "content": "hi"}],
+                 load_mcp_turn=_make_load_turn_mcp(_FakeMcpTurn([_MCP_SPEC], [])))
+
+    assert asyncio.run(worker.process_job(
+        job, deps, provider_config=_BYOK, api_key=None,
+        runtime_token="rt")) == "completed"
+
+    system_text = "\n".join(
+        str(m.get("content") or "")
+        for m in calls[0]["messages"] if m.get("role") == "system"
+    )
+    assert "MCP 服务器说明" not in system_text

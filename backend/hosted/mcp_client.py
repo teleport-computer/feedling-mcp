@@ -69,8 +69,40 @@ async def _once_aiter(data: bytes):
     yield data
 
 
-async def _handshake(client, target, send_headers) -> dict:
+def _instructions_from_init_doc(init_doc) -> list[str]:
+    """Pull the spec's optional ``result.instructions`` out of an initialize doc.
+
+    A separate pure function on purpose: the whole handshake path runs through
+    ``asyncio.timeout`` (3.11+), so on a 3.10 box the network-level tests cannot
+    execute at all — and an untestable extraction is one nobody notices breaking.
+    Here the parsing rules are unit-testable on any interpreter.
+
+    Returns a list so the caller can ``extend`` unconditionally: no instructions,
+    a blank one, and a non-string all mean "this server said nothing", which is
+    genuinely different from "this server sent an empty guide" — the latter would
+    render an empty section in the system prompt.
+    """
+    if not isinstance(init_doc, dict):
+        return []
+    result = init_doc.get("result")
+    text = result.get("instructions") if isinstance(result, dict) else None
+    if isinstance(text, str) and text.strip():
+        return [text]
+    return []
+
+
+async def _handshake(client, target, send_headers, *,
+                     instructions_out=None) -> dict:
     """Streamable initialize → capture session-id → notifications/initialized.
+
+    ``instructions_out`` (a list used as a box) collects the spec's optional
+    ``result.instructions`` — "Instructions describing how to use the server and
+    its features", which the MCP spec exists for clients to feed the model.
+    Claude Code puts it in the system prompt; we used to drop the whole response
+    body on the floor and keep only the session id. Ombre Brain ships a separate
+    `CLAUDE_PROMPT.md` for exactly this purpose, and its user had nowhere to put
+    it — the model then had to guess how to treat those memories, and guessed
+    "someone else's".
 
     Raises the transport-detection signals ``_NotStreamableServer`` (a 4xx
     initialize — the MCP backwards-compat cue to try the SSE GET) and
@@ -99,6 +131,8 @@ async def _handshake(client, target, send_headers) -> dict:
         init_doc = _parse_rpc_response(resp)  # validates the JSON-RPC envelope
     if "error" in init_doc:
         raise ProbeError("protocol", "JSON-RPC error")
+    if instructions_out is not None:
+        instructions_out.extend(_instructions_from_init_doc(init_doc))
     session = {}
     sid = resp.headers.get("mcp-session-id")
     if sid:
@@ -191,8 +225,10 @@ def _map_sse_connect_error(exc: Exception) -> ProbeError:
     return ProbeError("transport", "connection failed")
 
 
-async def _streamable_list(client, target, send_headers) -> list[dict]:
-    session = await _handshake(client, target, send_headers)
+async def _streamable_list(client, target, send_headers,
+                           *, instructions_out=None) -> list[dict]:
+    session = await _handshake(
+        client, target, send_headers, instructions_out=instructions_out)
     resp = await _post_bounded(
         client, target, send_headers,
         {"jsonrpc": "2.0", "id": 2, "method": "tools/list"}, session)
@@ -282,12 +318,19 @@ async def _with_transport_fallback(mcp_transport, sse_attempt, streamable_attemp
 
 
 async def list_tools(url, headers, *, ca_pem=None, transport=None,
-                     mcp_transport=None) -> list[dict]:
+                     mcp_transport=None, instructions_out=None) -> list[dict]:
     """Return the server's full tool objects ``[{name, description, inputSchema}]``.
 
     ``transport`` is the httpx transport injection (tests). ``mcp_transport`` is
     the persisted MCP transport ("sse"/"http"/None) that picks which handshake
     to try first, with a narrow fallback to the other.
+
+    ``instructions_out`` (optional list, used as a box) collects the server's
+    spec-defined ``instructions`` string when there is one.
+    ⚠️ Only the streamable transport fills it. The legacy SSE path keeps its own
+    session helper and is not threaded — a server on that transport simply gets
+    no instructions rather than a wrong one. Left explicit here instead of
+    silently: if an SSE-only server ever needs it, this is the line to change.
 
     Raises ``ProbeError`` on SSRF refusal, transport error, HTTP error, or a
     JSON-RPC error response.
@@ -302,7 +345,9 @@ async def list_tools(url, headers, *, ca_pem=None, transport=None,
                 return await _with_transport_fallback(
                     mcp_transport,
                     lambda: _sse_list(client, url, target, send_headers),
-                    lambda: _streamable_list(client, target, send_headers),
+                    lambda: _streamable_list(
+                        client, target, send_headers,
+                        instructions_out=instructions_out),
                 )
     except ProbeError:
         raise
