@@ -5559,7 +5559,6 @@ async def _rebalance_summary_frontier(
             fanout=_SUMMARY_ROLLUP_FANOUT,
             max_frontier_segments=_SUMMARY_FRONTIER_MAX_SEGMENTS,
             max_frontier_chars=_SUMMARY_FRONTIER_MAX_CHARS,
-            max_rollup_input_chars=_COMPACTION_BATCH_CHARS,
         )
         if candidate is None:
             return frontier

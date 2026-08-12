@@ -72,13 +72,44 @@ def test_zero_raw_legacy_opaque_frontier_is_valid_and_can_roll_up_unary():
     assert frontier.validate_canonical_frontier(
         (legacy,), watermark_seq=0, first_source_seq=0, covered_source_count=0
     ) == (legacy,)
-    candidate = frontier.choose_rollup_candidate(
-        (legacy,), max_frontier_chars=40, max_rollup_input_chars=200
-    )
+    candidate = frontier.choose_rollup_candidate((legacy,), max_frontier_chars=40)
     assert candidate is not None
     assert candidate.child_segment_ids == (9,)
     assert candidate.coverage_kind == "legacy_opaque"
     assert candidate.legacy_opaque_through_seq == 0
+
+
+def test_rollup_candidate_ignores_historical_child_text_size():
+    legacy = frontier.SummarySegment(
+        segment_id=1,
+        coverage_kind="legacy_opaque",
+        level=0,
+        start_seq=0,
+        end_seq=0,
+        source_message_count=0,
+        legacy_opaque_through_seq=0,
+        child_segment_ids=(),
+        text="- " + "legacy context " * 12_000,
+    )
+    candidate = frontier.choose_rollup_candidate(
+        (legacy,),
+        max_frontier_chars=40,
+    )
+    assert candidate is not None
+    assert candidate.child_segment_ids == (1,)
+    assert candidate.source_message_count == 0
+
+
+def test_fanout_rollup_ignores_provider_input_size_of_exact_children():
+    items = tuple(
+        _segment(index, text="- " + "historical prose " * 1_500)
+        for index in range(1, 9)
+    )
+
+    candidate = frontier.choose_rollup_candidate(items, fanout=8)
+
+    assert candidate is not None
+    assert candidate.child_segment_ids == tuple(range(1, 9))
 
 
 def test_rollup_prefers_closed_same_level_fanout_and_replaces_exact_run():

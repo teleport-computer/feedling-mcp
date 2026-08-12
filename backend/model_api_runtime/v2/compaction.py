@@ -248,27 +248,21 @@ def _verbatim_fold(
     return validated
 
 
-def deterministic_fold(*, source_message_count: int) -> str:
-    """Render one content-free exact-coverage leaf without a provider call.
-
-    The text is intentionally a normal validated summary bullet: storage and
-    prompt readers do not need a second payload type, while the immutable
-    segment metadata remains the authoritative exact seq/count witness.  A
-    malformed local sentinel must fail before it can advance a watermark, so
-    this uses the same all-or-nothing validator as provider output.
-    """
+def deterministic_fold(
+    *,
+    source_message_count: int,
+    includes_legacy_opaque: bool = False,
+) -> str:
+    """Render a content-free coverage witness from persisted metadata only."""
 
     count = int(source_message_count)
-    if count <= 0:
-        raise ValueError("source_message_count must be positive")
-    rendered = f"- [{count} 条更早的消息已由长期记忆覆盖]"
-    validated, reject = _validate_new_bullets(
-        rendered,
-        current_summary="",
-    )
-    if validated is None:
-        raise ValueError(f"deterministic_fold_rejected:{reject}")
-    return validated
+    if count < 0 or (count == 0 and not includes_legacy_opaque):
+        raise ValueError("source_message_count must prove coverage")
+    if includes_legacy_opaque and count == 0:
+        return "- [更早的历史摘要已由长期记忆覆盖]"
+    if includes_legacy_opaque:
+        return f"- [更早的历史摘要及 {count} 条消息已由长期记忆覆盖]"
+    return f"- [{count} 条更早的消息已由长期记忆覆盖]"
 
 
 def deterministic_checkpoint(child_texts: list[str]) -> str | None:

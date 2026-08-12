@@ -71,20 +71,24 @@ def test_compact_reports_unknown_usage_when_provider_raises():
     assert seen == [None]
 
 
-def test_deterministic_fold_uses_the_normal_bullet_validator(monkeypatch):
-    seen = []
-    real_validate = compaction._validate_new_bullets
+def test_deterministic_fold_renders_exact_count_without_source_text():
+    assert compaction.deterministic_fold(source_message_count=7) == (
+        "- [7 条更早的消息已由长期记忆覆盖]"
+    )
 
-    def _spy(reply, *, current_summary):
-        seen.append((reply, current_summary))
-        return real_validate(reply, current_summary=current_summary)
 
-    monkeypatch.setattr(compaction, "_validate_new_bullets", _spy)
+def test_deterministic_fold_renders_zero_count_legacy_opaque_coverage():
+    assert compaction.deterministic_fold(
+        source_message_count=0,
+        includes_legacy_opaque=True,
+    ) == "- [更早的历史摘要已由长期记忆覆盖]"
 
-    rendered = compaction.deterministic_fold(source_message_count=37)
 
-    assert rendered == "- [37 条更早的消息已由长期记忆覆盖]"
-    assert seen == [(rendered, "")]
+def test_deterministic_fold_renders_mixed_legacy_and_exact_coverage():
+    assert compaction.deterministic_fold(
+        source_message_count=9,
+        includes_legacy_opaque=True,
+    ) == "- [更早的历史摘要及 9 条消息已由长期记忆覆盖]"
 
 
 @pytest.mark.parametrize("count", [0, -1])
