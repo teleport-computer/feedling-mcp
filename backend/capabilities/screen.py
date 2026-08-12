@@ -42,6 +42,8 @@ def _norm(
     *,
     default_msg: str,
     image_requested: bool | None = None,
+    image_omitted_reason: str | None = None,
+    suggested_action: str | None = None,
 ) -> CapabilityResult:
     if res.status == 200:
         if res.json_body is not None:
@@ -55,9 +57,13 @@ def _norm(
                 data = {
                     **data,
                     "image_omitted_reason": (
-                        "absent_in_plaintext" if image_requested else "not_requested"
+                        "absent_in_plaintext"
+                        if image_requested
+                        else (image_omitted_reason or "not_requested")
                     ),
                 }
+                if suggested_action:
+                    data["suggested_action"] = suggested_action
         return ok(data=errors.cap_data(data))
     return err(errors.code_for_status(res.status),
                errors.message_for_body(res.json_body, default_msg),
@@ -80,7 +86,9 @@ def read(store, *, api_key=None, runtime_token=None, params=None) -> CapabilityR
         frame_id = latest.json_body.get("id") or latest.json_body.get("frame_id")
         if not frame_id:
             return err(errors.NOT_FOUND, "no recent screen frame", retryable=False)
-    if "include_image" in params:
+    share_state: dict = {}
+    explicit_image_choice = "include_image" in params
+    if explicit_image_choice:
         include_pixels = bool(params.get("include_image"))
     else:
         user_id = str(getattr(store, "user_id", "") or "")
@@ -88,6 +96,19 @@ def read(store, *, api_key=None, runtime_token=None, params=None) -> CapabilityR
             screen_read_core.screen_share_grounding(user_id) if user_id else {}
         )
         include_pixels = share_state.get("active") is True
+    omitted_reason = None
+    suggested_action = None
+    if not explicit_image_choice and not include_pixels:
+        if share_state.get("ended") is True:
+            omitted_reason = "screen_share_ended"
+        elif share_state.get("stalled") is True:
+            omitted_reason = "screen_share_stalled"
+        else:
+            omitted_reason = "screen_share_not_active"
+        suggested_action = str(
+            share_state.get("suggested_action")
+            or "Ask the user to restart screen sharing or send a screenshot."
+        )
     include_image = "true" if include_pixels else "false"
     res = screen_read_core.frame_decrypt(store, frame_id, include_image=include_image,
                                          api_key=api_key, runtime_token=runtime_token)
@@ -109,4 +130,6 @@ def read(store, *, api_key=None, runtime_token=None, params=None) -> CapabilityR
         res,
         default_msg="screen read unavailable",
         image_requested=include_pixels,
+        image_omitted_reason=omitted_reason,
+        suggested_action=suggested_action,
     )

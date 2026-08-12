@@ -513,6 +513,9 @@ DESCRIPTIONS: dict[str, str] = {
                     "is given. During an active screen share, omitting include_image shows "
                     "the pixels by default; set include_image=false only when text/OCR is "
                     "explicitly sufficient. Outside an active share, pixels remain opt-in. "
+                    "When include_image is omitted and sharing is inactive, ended, or "
+                    "stalled, image_omitted_reason and suggested_action explain how to "
+                    "restore current screen access. "
                     "Runtime V2 inspects pixels through its native vision observer and "
                     "returns an untrusted visual_observation instead of a local image_file "
                     "path."),

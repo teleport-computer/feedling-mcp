@@ -54,7 +54,11 @@ CAPABILITIES: dict[str, Capability] = {c.key: c for c in [
     # --- always-on (no iOS permission) ---
     Capability("time", "本地时间", 1, context_field=True),
     Capability("device", "电量", 1, context_field=True),
-    Capability("broadcast", "屏幕采集状态", 1, context_field=True),
+    # Starting/stopping a user-initiated share is a discrete presence edge. A
+    # shared cooldown prevents rapid iOS on/off flapping from producing a burst
+    # of proactive turns.
+    Capability("broadcast", "屏幕采集状态", 1,
+               wake_source=True, debounce_sec=60.0, context_field=True),
 
     # --- permissioned ---
     Capability("location", "你大概在哪里（只看地点标签，不看具体地址）", 1,
@@ -100,7 +104,7 @@ SIGNALS: dict[str, Signal] = {s.input: s for s in [
     Signal("battery", "device", ("battery_level", "charging"),
            resolver="battery", ttl_sec=600.0, significant=False),
     Signal("broadcast", "broadcast", ("broadcast_state", "broadcast_active"),
-           resolver="broadcast", ttl_sec=300.0, significant=False),
+           resolver="broadcast", ttl_sec=300.0, significant=True),
     Signal("focus", "focus", ("focus_authorization_status", "in_focus"),
            resolver="focus_presence", ttl_sec=300.0, significant=False),
 

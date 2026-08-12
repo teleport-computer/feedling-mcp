@@ -1300,6 +1300,41 @@ def test_stalled_screen_share_returns_restart_guidance_without_old_pixels(
     assert paths == []
 
 
+def test_ended_screen_share_keeps_prior_frames_conversational_without_decrypt(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        crc,
+        "_fetch_screen_metadata_once",
+        lambda _path: {
+            "frames": [{"id": "f-prior", "ts": 1.0}],
+            "screen_share": {
+                "active": False,
+                "ended": True,
+                "status": "screen_share_ended",
+                "latest_frame_age_sec": 20,
+                "previous_frames_remain_in_conversation": True,
+            },
+        },
+    )
+    monkeypatch.setattr(
+        crc,
+        "_fetch_screen_json",
+        lambda _path: (_ for _ in ()).throw(
+            AssertionError("ended share must not decrypt an old frame")
+        ),
+    )
+
+    text, payloads, paths = crc._screen_context_for_message("你还记得刚才吗")
+
+    assert "screen_share.active: false" in text
+    assert "screen_share.ended: true" in text
+    assert "already shared in this conversation remain available" in text
+    assert "restart screen sharing or send a screenshot" in text
+    assert payloads == []
+    assert paths == []
+
+
 def test_screen_decrypt_cache_is_keyed_by_frame_id(monkeypatch):
     calls = []
     monkeypatch.setattr(

@@ -10,6 +10,19 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **Screen-share start and end are now first-class proactive events.** Runtime
+  V2 recognizes durable `broadcast_opened` and `broadcast_closed` edges behind
+  proactive activation and the screen-watch switch, with one shared 60-second
+  debounce for rapid toggles. Both edges are ordinary proactive wake facts,
+  remain actionable without a new frame, and let the model decide whether to
+  speak from the current conversation and attention state. DND continues to
+  block visible delivery. Foreground Chat, heartbeat, manual wake, Runtime V1,
+  and the `screen_read` tool now share an explicit `screen_share_ended` state:
+  earlier conversation frames remain discussable, but current-screen access requires
+  restarting sharing or sending a screenshot. Pixel-free default reads report
+  `screen_share_not_active`, `screen_share_ended`, or `screen_share_stalled`
+  with a suggested action instead of the misleading `not_requested` reason.
+
 - **Model API settings no longer serialize unrelated accounts.** Concurrent
   provider validation for different users can now proceed through separate,
   bounded database advisory-lock sessions. Mutations for the same account

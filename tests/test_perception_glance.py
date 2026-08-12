@@ -96,10 +96,14 @@ def test_event_projection_is_allowlist_only():
     assert project_perception_wake_events([
         {"trigger": "photo_added", "change_digest": "battery 17", "origin_refs": ["photo:secret"]},
         {"trigger": "arrived_at_anchor", "presence_hints": {"place": "private"}},
+        {"trigger": "broadcast_opened", "change_digest": "private screen state"},
+        {"trigger": "broadcast_closed", "origin_refs": ["private-ref"]},
         {"trigger": "unknown_trigger", "payload": "private"},
     ]) == [
         {"trigger": "photo_added", "new_photo": True},
         {"trigger": "arrived_at_anchor", "anchor_changed": True},
+        {"trigger": "broadcast_opened", "screen_share_started": True},
+        {"trigger": "broadcast_closed", "screen_share_ended": True},
     ]
 
 

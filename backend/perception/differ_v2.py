@@ -47,6 +47,7 @@ _DURABLE_WAKE_SIGNALS = frozenset({
     "unlock_after_absence",
     "screen_phash",
     "photo_added",
+    "broadcast_state",
 })
 
 _ANCHOR_SIGNALS = frozenset({
@@ -190,6 +191,21 @@ class PerceptionDifferV2:
                 DifferEventV2(
                     source="perception_event",
                     trigger="unlock_after_absence",
+                    change_digest=digest,
+                ),
+            )
+        if signal == "broadcast_state":
+            normalized = str(value or "").strip().lower()
+            if normalized in {"on", "active", "broadcasting", "true", "1"}:
+                trigger = "broadcast_opened"
+            elif normalized in {"off", "inactive", "stopped", "false", "0"}:
+                trigger = "broadcast_closed"
+            else:
+                return ()
+            return (
+                DifferEventV2(
+                    source="scene_change",
+                    trigger=trigger,
                     change_digest=digest,
                 ),
             )
