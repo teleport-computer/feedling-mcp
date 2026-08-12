@@ -132,6 +132,62 @@ def test_a_different_purpose_is_not_swallowed_by_the_scope(recorded):
     )
 
 
+def test_nested_different_purpose_batches_fold_independently(recorded):
+    """Chat rows and attachment captions share one loop but keep their purposes."""
+    with enclave.coalesced_success_trace("v2_chat_read"):
+        with enclave.coalesced_success_trace("v2_caption_read"):
+            for _ in range(3):
+                _ok("v2_chat_read")
+            for _ in range(2):
+                _ok("v2_caption_read")
+
+    assert [event["type"] for event in recorded] == [
+        "enclave.call.batch",
+        "enclave.call.batch",
+    ]
+    assert {
+        event["detail"]["purpose"]: event["detail"]["calls"]
+        for event in recorded
+    } == {"v2_chat_read": 3, "v2_caption_read": 2}
+
+
+def test_nested_same_purpose_joins_the_outer_batch(recorded):
+    with enclave.coalesced_success_trace("v2_chat_read"):
+        _ok()
+        with enclave.coalesced_success_trace("v2_chat_read"):
+            _ok()
+
+    assert len(recorded) == 1
+    assert recorded[0]["type"] == "enclave.call.batch"
+    assert recorded[0]["detail"]["calls"] == 2
+
+
+def test_screen_proxy_successes_use_the_same_batch_mechanism(recorded):
+    from screen import screen_read_core
+
+    with enclave.coalesced_success_trace("screen_frame_decrypt"):
+        for frame_id in ("frame-a", "frame-b"):
+            path = f"/v1/screen/frames/{frame_id}/decrypt"
+            screen_read_core._trace_enclave_proxy(
+                _store(),
+                "enclave.call.start",
+                path=path,
+                purpose="screen_frame_decrypt",
+            )
+            screen_read_core._trace_enclave_proxy(
+                _store(),
+                "enclave.call.done",
+                path=path,
+                purpose="screen_frame_decrypt",
+            )
+
+    assert len(recorded) == 1
+    assert recorded[0]["type"] == "enclave.call.batch"
+    assert recorded[0]["detail"]["calls"] == 2
+    assert recorded[0]["detail"]["path"] == ""
+    assert recorded[0]["explain"].startswith("Screen route proxied")
+
+
 def test_outside_any_scope_behaviour_is_unchanged(recorded):
     """单次解密的事件形状一个字不变。"""
     _ok()

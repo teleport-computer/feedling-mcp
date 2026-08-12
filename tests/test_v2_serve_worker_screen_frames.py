@@ -7,6 +7,7 @@ import json
 import sys
 import threading
 import time
+from contextlib import contextmanager
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
@@ -110,6 +111,18 @@ def test_failed_screen_decrypt_is_briefly_negative_cached(monkeypatch):
 
 def test_screen_frame_batch_is_bounded_to_latest_four_contract(monkeypatch):
     seen = []
+    scopes = []
+
+    @contextmanager
+    def record_scope(purpose):
+        scopes.append(purpose)
+        yield
+
+    monkeypatch.setattr(
+        serve_worker.core_enclave,
+        "coalesced_success_trace",
+        record_scope,
+    )
     monkeypatch.setattr(
         serve_worker,
         "_read_screen_frame_cached",
@@ -124,6 +137,7 @@ def test_screen_frame_batch_is_bounded_to_latest_four_contract(monkeypatch):
     assert set(batch["frames"]) == set(seen)
     assert batch["cache_hits"] == 0
     assert batch["cache_misses"] == 4
+    assert scopes == ["screen_frame_decrypt"]
 
 
 def test_screen_pixel_gate_blocks_only_explicit_unsupported():

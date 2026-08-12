@@ -14,6 +14,7 @@ from perception.ingress_v2 import (  # noqa: E402
     observe_signal_v2,
 )
 from proactive.adapters_v2 import wake_event_v2_from_legacy_job  # noqa: E402
+from proactive.runtime_v2 import WakeEventV2  # noqa: E402
 
 
 FIXTURES = Path(__file__).parent / "fixtures" / "perception_ios_v2"
@@ -109,6 +110,96 @@ class _Store:
             doc for (row_uid, row_kind, _), doc in self.items.items()
             if row_uid == uid and row_kind == kind
         ][:limit]
+
+
+def _broadcast_wake(user_id: str, trigger: str, ts: float) -> WakeEventV2:
+    return WakeEventV2(
+        user_id=user_id,
+        source="scene_change",
+        trigger=trigger,
+        created_at=ts,
+        change_digest=f"broadcast_state changed at {ts}",
+        origin_refs=("ios_report:broadcast",),
+    )
+
+
+def test_broadcast_edges_share_one_capability_debounce(monkeypatch):
+    fake = _Store()
+    fired = []
+    monkeypatch.setattr(service, "store", fake)
+    monkeypatch.setattr(service, "_settings_v2_for_user", lambda _uid: None)
+    monkeypatch.setattr(service, "_proactive_activation_ready", lambda _uid: True)
+    monkeypatch.setattr(
+        service, "_fire_wake_event_v2", lambda event: fired.append(event.trigger)
+    )
+
+    for trigger, ts in (
+        ("broadcast_opened", 1_000.0),
+        ("broadcast_closed", 1_010.0),
+        ("broadcast_opened", 1_020.0),
+    ):
+        service._submit_wake_event_v2_compat(
+            _broadcast_wake("u_broadcast_flap", trigger, ts)
+        )
+
+    assert fired == ["broadcast_opened"]
+    assert [event["type"] for event in fake.events["u_broadcast_flap"]] == [
+        "wake",
+        "debounced",
+        "debounced",
+    ]
+    assert fake.events["u_broadcast_flap"][1]["reason"] == "capability_debounce"
+
+
+def test_broadcast_edges_wake_without_frames(monkeypatch):
+    fake = _Store()
+    fired = []
+    monkeypatch.setattr(service, "store", fake)
+    monkeypatch.setattr(service, "_settings_v2_for_user", lambda _uid: None)
+    monkeypatch.setattr(service, "_proactive_activation_ready", lambda _uid: True)
+    monkeypatch.setattr(
+        service, "_fire_wake_event_v2", lambda event: fired.append(event.trigger)
+    )
+
+    service._submit_wake_event_v2_compat(
+        _broadcast_wake("u_open_no_frame", "broadcast_opened", 1_000.0)
+    )
+    service._submit_wake_event_v2_compat(
+        _broadcast_wake("u_close_no_frame", "broadcast_closed", 1_000.0)
+    )
+
+    assert fake.events["u_open_no_frame"][0]["type"] == "wake"
+    assert fake.events["u_close_no_frame"][0]["type"] == "wake"
+    assert fired == ["broadcast_opened", "broadcast_closed"]
+
+
+def test_broadcast_wake_respects_activation_and_screen_watch_switch(monkeypatch):
+    fake = _Store()
+    fired = []
+    monkeypatch.setattr(service, "store", fake)
+    monkeypatch.setattr(
+        service, "_fire_wake_event_v2", lambda event: fired.append(event.trigger)
+    )
+
+    monkeypatch.setattr(service, "_proactive_activation_ready", lambda _uid: False)
+    monkeypatch.setattr(service, "_settings_v2_for_user", lambda _uid: None)
+    service._submit_wake_event_v2_compat(
+        _broadcast_wake("u_not_activated", "broadcast_closed", 1_000.0)
+    )
+
+    monkeypatch.setattr(service, "_proactive_activation_ready", lambda _uid: True)
+    monkeypatch.setattr(
+        service,
+        "_settings_v2_for_user",
+        lambda _uid: {"switches": {"screen_watch_enabled": False}},
+    )
+    service._submit_wake_event_v2_compat(
+        _broadcast_wake("u_screen_off", "broadcast_closed", 1_000.0)
+    )
+
+    assert fake.events["u_not_activated"][0]["reason"] == "activation_pending"
+    assert fake.events["u_screen_off"][0]["reason"] == "screen_watch_disabled"
+    assert fired == []
 
 
 def test_anchor_transition_wakes_once_and_repeat_only_updates_seen():

@@ -69,17 +69,20 @@ def _proactive_v2_auto_wake_block_reason(trigger: str, *, broadcast_state: str, 
     from screen broadcasting. Runtime V2's pooled scheduler emits that trigger;
     treating persisted ``broadcast_state=off`` as a global heartbeat block
     silently disables proactive presence for every user who is not sharing
-    their screen. Screen-dependent ticks use explicit no-frame/opened triggers.
+    their screen. Explicit missing-frame heartbeat triggers remain mechanically
+    suppressible, while broadcast edges below are state facts.
     """
     normalized_trigger = str(trigger or "").strip().lower()
-    has_frames = bool(frame_ids)
 
     if normalized_trigger in {"heartbeat_unknown", "heartbeat_no_frame"}:
         return "no_recent_frames"
     if normalized_trigger.startswith("heartbeat_broadcast_"):
         return ""
-    if normalized_trigger == "broadcast_opened" and not has_frames:
-        return "no_recent_frames"
+    # Broadcast edges are facts, not claims that current pixels are available.
+    # Both remain eligible without a frame; the model can stay silent or use
+    # screen_read, whose result explains the actual share state without guessing.
+    if normalized_trigger in {"broadcast_opened", "broadcast_closed"}:
+        return ""
     return ""
 
 
@@ -91,7 +94,7 @@ def _proactive_v2_wake_kind(trigger: str, *, frame_ids: list[str], job_kind: str
         return "presence"
     if frame_ids:
         return "screen"
-    if normalized_trigger in {"broadcast_opened", "screen_tick"}:
+    if normalized_trigger in {"broadcast_opened", "broadcast_closed", "screen_tick"}:
         return "screen"
     return "presence"
 

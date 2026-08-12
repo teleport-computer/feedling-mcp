@@ -791,9 +791,10 @@ def _screen_share_grounding(user_id: str) -> dict:
        只要当前路由没有明确的 unsupported 反证,调用方就另走有界推帧路径,把
        像素标成不可信应用数据,并在第一轮 provider 调用之前先建立出站执行栅栏。
 
-    设备仍报告开启、但帧超过五分钟未更新时返回 stalled 状态和重启建议，调用方
-    只把建议提供给模型，不解密旧帧。共享没在进行(或读取失败)时返回 {}，调用方
-    据此整块省略 —— 不共享的用户 prompt 一个字都不变，provider 侧前缀缓存不受影响。
+    设备仍报告开启、但帧超过五分钟未更新时返回 stalled 状态和重启建议；最新
+    可识别广播状态为 off 且这一场有过帧时返回 ended，说明旧画面仍可讨论但
+    不再是当前屏幕。两种状态都不解密旧帧。从未共享(或读取失败)时返回 {}，
+    调用方据此整块省略 —— 不共享的用户 prompt 一个字都不变，provider 侧前缀缓存不受影响。
     """
     return screen_read_core.screen_share_grounding(user_id)
 
@@ -8042,6 +8043,14 @@ async def _run_wake(
                     ),
                 )
             )
+            screen_share_state = await asyncio.to_thread(
+                _screen_share_grounding, user_id
+            )
+            if screen_share_state:
+                grounding_results = grounding_results or {}
+                grounding_results["screen_share"] = [
+                    {"ok": True, "data": screen_share_state}
+                ]
         if scheduled_runtime_data:
             grounding_results = grounding_results or {}
             grounding_results["scheduled_wakes"] = [
@@ -8983,8 +8992,9 @@ async def _run_wake(
                 # test with `wake_failed:providererror` while the provider
                 # answered 200 OK — the model simply had nothing to say.
                 #
-                # `scheduled` 是唯一的例外，它必须留在 require_reply=True 上。
-                # 这条道上的每个 timer 都带**到点交付义务**——无论是用户委托的
+                # `scheduled` 是唯一的例外，必须留在 require_reply=True 上。
+                # opened/closed 屏幕共享边沿都只是普通 wake 事实，由模型结合
+                # attention_facts 决定说话或沉默。对于 scheduled，无论是用户委托的
                 # （「20 秒后发消息给我」）还是 agent 自排的（`apply_turn_actions
                 # (..., self_wake=True)`，见 :7841）。沉默在这里不是「没什么可说」
                 # 而是提醒丢了：模型返空 → 落到下面的 `if not text: return` → job

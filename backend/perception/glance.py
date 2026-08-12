@@ -19,6 +19,8 @@ _EVENT_FIELDS = {
     "arrived_at_anchor": {"trigger": "arrived_at_anchor", "anchor_changed": True},
     "photo_added": {"trigger": "photo_added", "new_photo": True},
     "scene_change": {"trigger": "scene_change"},
+    "broadcast_opened": {"trigger": "broadcast_opened", "screen_share_started": True},
+    "broadcast_closed": {"trigger": "broadcast_closed", "screen_share_ended": True},
 }
 
 

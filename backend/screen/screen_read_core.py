@@ -36,7 +36,7 @@ from typing import Any, Optional
 import httpx
 
 import db
-import debug_trace
+from core import enclave as core_enclave
 from screen import frames
 from screen import summary as summary_mod
 from semantic_analysis import analyze as _semantic_analysis
@@ -80,9 +80,8 @@ _BROADCAST_ACTIVE_STATES = frozenset({"on", "active", "broadcasting", "true", "1
 _BROADCAST_INACTIVE_STATES = frozenset({"off", "inactive", "stopped", "false", "0"})
 
 
-def broadcast_report_is_recently_active(
-    report: dict, *, now: float
-) -> bool:
+def recent_broadcast_report_state(report: dict, *, now: float) -> str:
+    """Return ``active``/``inactive`` for a fresh recognizable device report."""
     cells: list[tuple[float, bool]] = []
     for value, timestamp_key in (
         (report.get("broadcast_state"), "broadcast_state_ts"),
@@ -97,7 +96,7 @@ def broadcast_report_is_recently_active(
             continue
         cells.append((timestamp, normalized in _BROADCAST_ACTIVE_STATES))
     if not cells:
-        return False
+        return ""
     newest_ts = max(timestamp for timestamp, _is_active in cells)
     report_age = now - newest_ts
     if report_age < -SCREEN_BROADCAST_FUTURE_SKEW_SEC:
@@ -105,23 +104,32 @@ def broadcast_report_is_recently_active(
             "broadcast report ignored because device timestamp is %.1fs ahead",
             -report_age,
         )
-        return False
+        return ""
     if report_age > SCREEN_SHARE_STALLED_SEC:
-        return False
+        return ""
     newest_values = [is_active for ts, is_active in cells if ts == newest_ts]
-    return any(newest_values) and all(newest_values)
+    if all(newest_values):
+        return "active"
+    if not any(newest_values):
+        return "inactive"
+    return ""
+
+
+def broadcast_report_is_recently_active(report: dict, *, now: float) -> bool:
+    return recent_broadcast_report_state(report, now=now) == "active"
 
 
 def screen_share_grounding(
     user_id: str, *, latest_frame_ts: float | None = None
 ) -> dict:
-    """Return live, stalled, or absent state from content-free metadata.
+    """Return live, stalled, ended, or absent state from content-free metadata.
 
     Foreground grounding and the ``screen_read`` default must never disagree
     about whether sharing is active. Both therefore use this one metadata-only
     predicate. A frame no more than 90 seconds old is live. A fresh device
-    broadcast-on report paired with a frame older than five minutes is stalled
-    and carries a restart action. Frame ids and content never leave this helper.
+    broadcast-on report paired with a frame older than five minutes is stalled.
+    A fresh broadcast-off report paired with a frame from the last five minutes
+    means the just-ended share. Frame ids and content never leave this helper.
     """
     if latest_frame_ts is None:
         try:
@@ -138,17 +146,34 @@ def screen_share_grounding(
         return {}
     if age < 0:
         return {}
+    try:
+        broadcast = db.perception_broadcast_meta(user_id)
+    except Exception:
+        broadcast = {}
+    broadcast_state = recent_broadcast_report_state(broadcast, now=now)
+    if (
+        broadcast_state == "inactive"
+        and age <= SCREEN_SHARE_STALLED_SEC
+    ):
+        return {
+            "active": False,
+            "ended": True,
+            "status": "screen_share_ended",
+            "latest_frame_age_sec": int(age),
+            "previous_frames_remain_in_conversation": True,
+            "suggested_action": (
+                "The screen share has ended. Previously shared frames remain "
+                "available in the conversation. To see the screen again, ask "
+                "the user to restart screen sharing or send a screenshot."
+            ),
+        }
     if age <= SCREEN_SHARE_LIVE_SEC:
         return {"active": True, "latest_frame_age_sec": int(age)}
     # Give a transient disconnect time to self-heal before telling the user to
     # restart sharing. The iOS reconnect backoff is capped well below 5 minutes.
     if age <= SCREEN_SHARE_STALLED_SEC:
         return {}
-    try:
-        broadcast = db.perception_broadcast_meta(user_id)
-    except Exception:
-        return {}
-    if not broadcast_report_is_recently_active(broadcast, now=now):
+    if broadcast_state != "active":
         return {}
     return {
         "active": False,
@@ -170,24 +195,20 @@ def _trace_enclave_proxy(
     detail: dict | None = None,
     dur_ms: float | None = None,
 ) -> None:
-    try:
-        debug_trace.trace_event(
-            store,
-            subsystem="enclave",
-            type=event_type,
-            actor="backend",
-            status=status,
-            summary=summary,
-            explain="Screen route proxied a request to the enclave; only metadata is recorded.",
-            detail={
-                "path": path,
-                "purpose": purpose,
-                **(detail or {}),
-            },
-            dur_ms=dur_ms,
-        )
-    except Exception:
-        pass
+    core_enclave._trace_enclave(
+        store,
+        event_type,
+        path=path,
+        purpose=purpose,
+        status=status,
+        summary=summary,
+        explain=(
+            "Screen route proxied a request to the enclave; only metadata is "
+            "recorded."
+        ),
+        detail=detail,
+        dur_ms=dur_ms,
+    )
 
 
 # --------------------------------------------------------------------------- #

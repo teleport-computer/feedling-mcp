@@ -169,3 +169,49 @@ def test_heartbeat_due_diagnosis_sql_actually_runs_against_the_real_schema():
     jobs_store.upsert_wake_schedule(uid, next_heartbeat_at=4e12)
     later = jobs_store.heartbeat_due_diagnosis(uid)
     assert later["blocked_by"] == ["not_due_yet"], later
+
+
+def test_worldbook_stats_counts_without_leaking_entry_names():
+    """世界书只出数量与时间,**绝不出条目 id**。
+
+    id 是用户自己起的名字(「月光咖啡馆」这种)—— 那是内容,不该出现在支持面板里。
+    正文本身端到端加密,服务端读不到,不用额外防。
+
+    为什么要有这个字段:2026-08-11 usr_99c3eca0 先报「世界书保存失败」、再报
+    「问它世界书内容命中不了」。管理端当时连**有几条**都看不到,只能去下客户端
+    诊断日志、数 attestation 与封装失败的比例(1 : 247)才反推出「他一条都没存进去」。
+    有了它,「没存进去」和「存了没匹配上」一眼可分——那是两条完全不同的排查路径。
+    """
+    class _FakeStore:
+        world_books_lock = __import__("threading").Lock()
+        world_books = [
+            {"id": "月光咖啡馆", "updated_at": "2026-08-11T10:00:00", "body_ct": "..."},
+            {"id": "青岚学院", "updated_at": "2026-08-11T12:00:00", "body_ct": "..."},
+        ]
+
+    out = dt._worldbook_stats(_FakeStore())
+
+    assert out["entries"] == 2
+    assert out["last_updated_at"] == "2026-08-11T12:00:00"
+    blob = __import__("json").dumps(out, ensure_ascii=False)
+    assert "月光咖啡馆" not in blob and "青岚学院" not in blob, "条目名泄漏了"
+    assert "body_ct" not in blob
+
+
+def test_worldbook_stats_distinguishes_empty_from_broken():
+    """零条目要显式是 0,不是缺字段——「没存进去」本身就是结论。"""
+    class _EmptyStore:
+        world_books_lock = __import__("threading").Lock()
+        world_books = []
+
+    out = dt._worldbook_stats(_EmptyStore())
+    assert out["entries"] == 0
+    assert out["last_updated_at"] == ""
+
+    class _BoomStore:
+        @property
+        def world_books_lock(self):
+            raise RuntimeError("db down")
+
+    boom = dt._worldbook_stats(_BoomStore())
+    assert "error" in boom, "读不到时要显式报错,不能装成 0 条"

@@ -3596,6 +3596,19 @@ def _screen_context_for_message(content: str) -> tuple[str, list[dict[str, str]]
             [],
             [],
         )
+    if share_state.get("ended") is True:
+        latest_age = share_state.get("latest_frame_age_sec")
+        return (
+            "[Feedling screen-sharing connection status]\n"
+            "screen_share.active: false\n"
+            "screen_share.ended: true\n"
+            f"latest_frame_age_sec: {latest_age if latest_age is not None else 'unknown'}\n"
+            "The screen share has ended. Screen images already shared in this "
+            "conversation remain available for discussion. To see the screen "
+            "again, ask the user to restart screen sharing or send a screenshot.",
+            [],
+            [],
+        )
     if share_state_present and share_state.get("active") is not True:
         return "", [], []
     frames = (body or {}).get("frames") if isinstance(body, dict) else None

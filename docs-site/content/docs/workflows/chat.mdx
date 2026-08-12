@@ -172,6 +172,15 @@ screen. `GET /v1/screen/frames` exposes the same content-free decision in its
 `screen_share` object, including `stalled`, `latest_frame_age_sec`, and
 `suggested_action`; a stale broadcast report does not trigger this state.
 
+When a fresh broadcast-off report follows frames from the last five minutes,
+the same object reports `active: false`, `ended: true`, and
+`status: "screen_share_ended"`. The runtime tells the model that sharing has
+ended and does not attach or decrypt those earlier frames as a current screen.
+Images already present in the conversation remain available for discussion;
+to see the screen again, the user must restart sharing or send a screenshot.
+Heartbeat and manual-wake turns receive this same content-free `screen_share`
+grounding alongside their boolean-only perception glance.
+
 Hosted Runtime V2 withholds pixels only when the exact route has an explicit
 `unsupported` verdict. An `ok`, untested, failed, or absent verdict admits the
 sampled frames: not having run the optional control probe is not evidence that
@@ -194,8 +203,11 @@ The model-facing `screen_read` tool uses the same 90-second active-share clock.
 While sharing is active, omitting `include_image` includes the real frame pixels;
 callers may explicitly set it to `false` only when text or OCR is sufficient.
 Outside an active share, omission remains metadata/text-only. A successful read
-without pixels reports whether they were not requested or were absent from the
-decrypted plaintext, so the model can retry or explain the limitation accurately.
+without pixels reports whether the share is not active, ended, or stalled; an
+explicit `include_image: false` still reports that pixels were not requested,
+and requested pixels absent from plaintext are reported separately. Each
+inactive-state result includes a suggested restart-or-screenshot action so the
+model can explain the limitation accurately.
 
 For a document, use `file_b64`, `file_name`, and `file_mime` instead. The decoded
 file limit is 25 MiB. PDF, DOCX, XLSX, supported images, and UTF-8 text/source
