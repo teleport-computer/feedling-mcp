@@ -51,7 +51,7 @@ from concurrent.futures import CancelledError as FutureCancelledError
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
-from typing import Any, Awaitable, Callable
+from typing import Any, Awaitable, Callable, Iterable
 
 import db
 import generated_image
@@ -1803,6 +1803,19 @@ def _mcp_mutating_names_for_turn(mcp_turn) -> frozenset[str]:
     return offered & mutating
 
 
+def _mcp_turn_usage_detail(
+    offered_names: Iterable[str], called_names: Iterable[str]
+) -> dict[str, int]:
+    """Content-free MCP usage counts for one chat turn."""
+    offered = {str(name) for name in offered_names if str(name)}
+    calls = [str(name) for name in called_names if str(name)]
+    return {
+        "offered_tool_count": len(offered),
+        "called_tool_count": len(set(calls)),
+        "call_count": len(calls),
+    }
+
+
 async def _dispatch_mixed_tool_calls(
     tool_calls,
     *,
@@ -1822,6 +1835,7 @@ async def _dispatch_mixed_tool_calls(
     mcp_wall_budget: _McpTurnWallBudget | None = None,
     on_progress: Callable[[str], None] | None = None,
     on_tool_event: Callable[[Any, str, dict], Awaitable[None]] | None = None,
+    mcp_called_names: list[str] | None = None,
 ) -> list[ToolResult]:
     """Run one provider batch with mixed-read overlap and ordered mutations.
 
@@ -1945,7 +1959,11 @@ async def _dispatch_mixed_tool_calls(
         async def _invoke():
             if use_read_gate:
                 async with read_gate:
+                    if mcp_called_names is not None:
+                        mcp_called_names.append(str(tc.name))
                     return await mcp_turn.dispatch(tc)
+            if mcp_called_names is not None:
+                mcp_called_names.append(str(tc.name))
             return await mcp_turn.dispatch(tc)
 
         call_timeout = (
@@ -10782,6 +10800,9 @@ async def process_job(
     voice_call_ended_atomically = False
     lease_keepalive_stop = asyncio.Event()
     lease_keepalive_task: asyncio.Task | None = None
+    mcp_offered_names: tuple[str, ...] = ()
+    mcp_called_names: list[str] = []
+    mcp_turn_outcome = "failed"
 
     try:
         if not claimed_by or not await asyncio.to_thread(
@@ -11589,6 +11610,9 @@ async def process_job(
             )
 
         offered_mcp_tool_specs = _current_offered_mcp_tool_specs()
+        mcp_offered_names = tuple(
+            str(spec.name) for spec in offered_mcp_tool_specs if str(spec.name)
+        )
         if mutation_recovery_barrier is not None:
             disabled_mutation_tool_names = frozenset(
                 set(cap_registry.WRITE_ACTIONS)
@@ -12109,6 +12133,7 @@ async def process_job(
                 mcp_wall_budget=mcp_wall_budget,
                 on_progress=_report_turn_progress,
                 on_tool_event=chat_tool_activity_callback,
+                mcp_called_names=mcp_called_names,
             )
             dispatched_by_id = {str(result.call_id): result for result in dispatched}
             results = [
@@ -13056,6 +13081,7 @@ async def process_job(
                     type(exc).__name__.lower(),
                 )
             tm.flush(failed=False, status="voice_call_ended")
+            mcp_turn_outcome = "completed"
             return "completed"
         if outcome.stop_reason == "input_advanced":
             # The hard provider-call budget remains authoritative. The stale
@@ -13074,6 +13100,7 @@ async def process_job(
                 raise LostJobLease("job ownership lost during late-input handoff")
             await asyncio.to_thread(core_wake_bus.notify, "v2_jobs", user_id)
             tm.flush(failed=False, status="input_advanced_handoff")
+            mcp_turn_outcome = "completed"
             return "completed"
         if outcome.stop_reason == "required_file_missing":
             # File completion is best-effort after one bounded recovery. Keep a
@@ -13305,6 +13332,7 @@ async def process_job(
                 job_id,
                 type(exc).__name__,
             )
+        mcp_turn_outcome = "completed"
         return "completed"
     except LostJobLease as e:
         # The winning lifecycle transition (normally the reaper) owns terminal
@@ -13408,6 +13436,29 @@ async def process_job(
         if lease_keepalive_task is not None:
             lease_keepalive_task.cancel()
             await asyncio.gather(lease_keepalive_task, return_exceptions=True)
+        if mcp_offered_names and deps.emit_debug_trace is not None:
+            detail = _mcp_turn_usage_detail(mcp_offered_names, mcp_called_names)
+            try:
+                await asyncio.to_thread(
+                    deps.emit_debug_trace,
+                    user_id,
+                    "mcp.turn.usage",
+                    status="ok" if mcp_turn_outcome == "completed" else "error",
+                    summary=(
+                        f"MCP 本轮提供 {detail['offered_tool_count']} 个工具,"
+                        f"调用 {detail['call_count']} 次"
+                    ),
+                    explain=(
+                        "仅记录工具数量和调用次数;不记录参数、返回值或用户内容。"
+                    ),
+                    detail={"lane": "chat", "outcome": mcp_turn_outcome, **detail},
+                )
+            except Exception as exc:  # noqa: BLE001 -- telemetry is best-effort
+                log.warning(
+                    "[v2.mcp] turn usage trace failed user=%s code=%s",
+                    user_id,
+                    type(exc).__name__.lower(),
+                )
         if push_slot is not None and deps.send_reply_push is not None:
             try:
                 await asyncio.to_thread(

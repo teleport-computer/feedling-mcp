@@ -4451,8 +4451,18 @@ def _record_extraction_status(
 # admin/排查流程才找得到(codex 审出 —— 我原本发的是新事件 mcp.catalog.described,
 # 那等于给同一件事造了第二个入口)。
 _LAST_MCP_CATALOG_FINGERPRINT: dict[str, str] = {}
+_MCP_CATALOG_FINGERPRINT_MAX_USERS = 4096
 _MCP_CATALOG_DESC_CHARS = 160
 _MCP_CATALOG_MAX_TOOLS = 60
+
+
+def _remember_mcp_catalog_fingerprint(user_id: str, fingerprint: str) -> None:
+    """Bound the process-local dedupe cache for long-lived workers."""
+    _LAST_MCP_CATALOG_FINGERPRINT.pop(user_id, None)
+    _LAST_MCP_CATALOG_FINGERPRINT[user_id] = fingerprint
+    while len(_LAST_MCP_CATALOG_FINGERPRINT) > _MCP_CATALOG_FINGERPRINT_MAX_USERS:
+        oldest = next(iter(_LAST_MCP_CATALOG_FINGERPRINT))
+        _LAST_MCP_CATALOG_FINGERPRINT.pop(oldest, None)
 
 
 def _mcp_catalog_detail(store, turn) -> dict:
@@ -4572,9 +4582,10 @@ async def _load_mcp_turn_observed(store, **kwargs):
             # 或 trace 写失败就会把这个指纹永久吃掉,后面恢复了也不再记明细
             # (codex 审出)。并发下重复记一条无所谓,漏掉第一份工具面才要命。
             if catalog_fingerprint:
-                _LAST_MCP_CATALOG_FINGERPRINT[
-                    str(getattr(store, "user_id", "") or "")
-                ] = catalog_fingerprint
+                _remember_mcp_catalog_fingerprint(
+                    str(getattr(store, "user_id", "") or ""),
+                    catalog_fingerprint,
+                )
     except Exception as exc:  # noqa: BLE001 — 诊断绝不能影响回合
         log.warning("[v2.mcp] surface trace failed: %s", type(exc).__name__)
     # A config-list failure is not an observation of the enabled-server set;

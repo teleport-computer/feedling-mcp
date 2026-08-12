@@ -2056,6 +2056,21 @@ def test_mcp_catalog_records_descriptions_but_never_results(monkeypatch):
     assert not any(k in tool for k in ("result", "content", "output"))
 
 
+def test_mcp_catalog_fingerprint_cache_is_bounded(monkeypatch):
+    serve_worker._LAST_MCP_CATALOG_FINGERPRINT.clear()
+    monkeypatch.setattr(serve_worker, "_MCP_CATALOG_FINGERPRINT_MAX_USERS", 2)
+
+    serve_worker._remember_mcp_catalog_fingerprint("u1", "f1")
+    serve_worker._remember_mcp_catalog_fingerprint("u2", "f2")
+    serve_worker._remember_mcp_catalog_fingerprint("u1", "f1-new")
+    serve_worker._remember_mcp_catalog_fingerprint("u3", "f3")
+
+    assert serve_worker._LAST_MCP_CATALOG_FINGERPRINT == {
+        "u1": "f1-new",
+        "u3": "f3",
+    }
+
+
 def test_no_catalog_detail_without_a_fingerprint(monkeypatch):
     """没有配置指纹(用户压根没配 MCP)就不该带明细。"""
     serve_worker._LAST_MCP_CATALOG_FINGERPRINT.clear()

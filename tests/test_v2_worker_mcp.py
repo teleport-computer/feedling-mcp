@@ -30,6 +30,11 @@ _BYOK = provider_client.ProviderConfig(
 
 _MCP_SPEC = ToolSpec(name="mcp__test__ping", description="ping the test server",
                      parameters={"type": "object", "properties": {}})
+_MCP_SPEC_TWO = ToolSpec(
+    name="mcp__test__status",
+    description="read test server status",
+    parameters={"type": "object", "properties": {}},
+)
 
 
 def _reset(uid):
@@ -91,7 +96,7 @@ def _script_provider(monkeypatch, responses):
     return calls
 
 
-def _deps(messages, *, load_mcp_turn=None):
+def _deps(messages, *, load_mcp_turn=None, emit_debug_trace=None):
     return worker.TurnDeps(
         # web_search/web_fetch are gated per user now (default OFF); these
         # tests use them as a generic outbound read, so opt in explicitly.
@@ -101,6 +106,7 @@ def _deps(messages, *, load_mcp_turn=None):
         mint_enclave_token=lambda uid: "rt-enclave",
         apply_pending_effects=_apply_effects,
         load_mcp_turn=load_mcp_turn,
+        emit_debug_trace=emit_debug_trace,
     )
 
 
@@ -342,6 +348,116 @@ def test_chat_turn_keeps_mcp_usable_after_its_own_remote_result(
     assert _MCP_SPEC.name in {spec.name for spec in calls[1]["tools"]}, (
         "第二轮必须还能调 MCP —— 「只能读不能写」的生产链路复现点")
     assert _bubbles(uid)[0]["body_ct"] == "kept the remote result local"
+
+
+def test_mcp_turn_usage_records_two_offered_and_two_consecutive_calls(monkeypatch):
+    uid = "u_mcp_usage_two_calls"
+    conftest.seed_user(uid)
+    _reset(uid)
+    jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("w")
+    _patch_real_write(monkeypatch)
+
+    dispatched = []
+    turn = _FakeMcpTurn(
+        [_MCP_SPEC, _MCP_SPEC_TWO],
+        dispatched,
+        read_only_names={_MCP_SPEC.name, _MCP_SPEC_TWO.name},
+    )
+    _script_provider(monkeypatch, [
+        {"reply": "", "tool_calls": [
+            {"id": "m1", "name": _MCP_SPEC.name, "args": {}}], "usage": {}},
+        {"reply": "", "tool_calls": [
+            {"id": "m2", "name": _MCP_SPEC.name, "args": {}}], "usage": {}},
+        {"reply": "done", "tool_calls": [], "usage": {}},
+    ])
+    traces = []
+    deps = _deps(
+        [{"id": "m1", "ts": 10.0, "role": "user", "content": "ping twice"}],
+        load_mcp_turn=_make_load_turn_mcp(turn),
+        emit_debug_trace=lambda user_id, event_type, **fields: traces.append(
+            {"user_id": user_id, "type": event_type, **fields}
+        ),
+    )
+
+    assert asyncio.run(worker.process_job(
+        job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"
+    )) == "completed"
+
+    usage = [trace for trace in traces if trace["type"] == "mcp.turn.usage"]
+    assert len(usage) == 1
+    assert usage[0]["status"] == "ok"
+    assert usage[0]["detail"] == {
+        "lane": "chat",
+        "outcome": "completed",
+        "offered_tool_count": 2,
+        "called_tool_count": 1,
+        "call_count": 2,
+    }
+    assert dispatched == [(_MCP_SPEC.name, {}), (_MCP_SPEC.name, {})]
+    assert not any(key in usage[0]["detail"] for key in ("args", "result", "content"))
+
+
+def test_mcp_turn_usage_records_offered_but_zero_calls(monkeypatch):
+    uid = "u_mcp_usage_zero_calls"
+    conftest.seed_user(uid)
+    _reset(uid)
+    jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("w")
+    _patch_real_write(monkeypatch)
+
+    traces = []
+    deps = _deps(
+        [{"id": "m1", "ts": 10.0, "role": "user", "content": "say hi"}],
+        load_mcp_turn=_make_load_turn_mcp(
+            _FakeMcpTurn([_MCP_SPEC, _MCP_SPEC_TWO], [])
+        ),
+        emit_debug_trace=lambda user_id, event_type, **fields: traces.append(
+            {"user_id": user_id, "type": event_type, **fields}
+        ),
+    )
+    _script_provider(monkeypatch, [
+        {"reply": "hi", "tool_calls": [], "usage": {}},
+    ])
+
+    assert asyncio.run(worker.process_job(
+        job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"
+    )) == "completed"
+    usage = next(trace for trace in traces if trace["type"] == "mcp.turn.usage")
+    assert usage["detail"]["offered_tool_count"] == 2
+    assert usage["detail"]["called_tool_count"] == 0
+    assert usage["detail"]["call_count"] == 0
+
+
+def test_mcp_turn_usage_marks_failed_turns(monkeypatch):
+    uid = "u_mcp_usage_failed_turn"
+    conftest.seed_user(uid)
+    _reset(uid)
+    jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("w")
+    _patch_real_write(monkeypatch)
+
+    async def _provider_failure(*_args, **_kwargs):
+        raise RuntimeError("provider unavailable")
+
+    monkeypatch.setattr(provider_client, "chat_completion_async", _provider_failure)
+    traces = []
+    deps = _deps(
+        [{"id": "m1", "ts": 10.0, "role": "user", "content": "ping"}],
+        load_mcp_turn=_make_load_turn_mcp(_FakeMcpTurn([_MCP_SPEC], [])),
+        emit_debug_trace=lambda user_id, event_type, **fields: traces.append(
+            {"user_id": user_id, "type": event_type, **fields}
+        ),
+    )
+
+    assert asyncio.run(worker.process_job(
+        job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"
+    )) == "failed"
+    usage = next(trace for trace in traces if trace["type"] == "mcp.turn.usage")
+    assert usage["status"] == "error"
+    assert usage["detail"]["outcome"] == "failed"
+    assert usage["detail"]["offered_tool_count"] == 1
+    assert usage["detail"]["call_count"] == 0
 
 
 def test_chat_identity_get_result_fences_outbound_but_keeps_local_edits(

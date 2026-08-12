@@ -46,6 +46,49 @@ class _DispatchingMcpTurn:
         return await self._dispatch(call)
 
 
+def test_mcp_call_attempt_is_counted_even_when_dispatch_fails():
+    async def _scenario():
+        async def _fail(_call):
+            raise RuntimeError("transport down")
+
+        async def _before_mutation():
+            return None
+
+        called_names = []
+        results = await worker._dispatch_mixed_tool_calls(
+            [_call("mcp", "mcp__files__search")],
+            mcp_turn=_DispatchingMcpTurn(["mcp__files__search"], _fail),
+            mutating_mcp_names={"mcp__files__search"},
+            dispatch_platform_one=lambda _call: None,
+            before_mcp_mutation=_before_mutation,
+            read_parallelism=1,
+            mcp_timeout_sec=1,
+            mcp_called_names=called_names,
+        )
+
+        assert called_names == ["mcp__files__search"]
+        assert results[0].content == worker.v2_tool_loop.MCP_MUTATION_OUTCOME_UNKNOWN_ERROR
+        assert worker._mcp_turn_usage_detail(
+            ["mcp__files__search", "mcp__files__status"], called_names
+        ) == {
+            "offered_tool_count": 2,
+            "called_tool_count": 1,
+            "call_count": 1,
+        }
+
+    asyncio.run(_scenario())
+
+
+def test_mcp_turn_usage_detail_keeps_zero_call_turns_visible():
+    assert worker._mcp_turn_usage_detail(
+        ["mcp__files__search", "mcp__files__status"], []
+    ) == {
+        "offered_tool_count": 2,
+        "called_tool_count": 0,
+        "call_count": 0,
+    }
+
+
 def test_partial_parallel_results_and_sibling_error_are_observable():
     async def _scenario():
         good_recorded = asyncio.Event()
