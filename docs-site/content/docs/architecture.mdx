@@ -410,6 +410,15 @@ call to an unresolved MCP name is rejected before any remote request or durable
 mutation-attempt marker. `resident=true` supplies complete schemas from the
 first provider round instead.
 
+Enabled user MCP servers are treated as user-selected infrastructure. Their
+bounded streamable-HTTP `instructions` may enter the Chat system context, and
+MCP tools are not removed merely because a turn has read private application
+data or observed an earlier MCP result. This permits multi-step remote memory
+flows, but also means model-selected arguments can carry private context to any
+enabled MCP server. Platform web/task outbound fences remain separate, and an
+MCP mutation whose outcome is unknown still disables later mutating MCP calls
+for that turn to prevent duplicate effects.
+
 Runtime V2 layers perception by lane. Foreground Chat starts with perception
 tools but no current readings. Ordinary heartbeat and manual-wake prompts may
 receive only a fixed boolean glance describing domain availability and whether

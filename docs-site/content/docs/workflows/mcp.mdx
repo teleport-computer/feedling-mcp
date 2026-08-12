@@ -29,10 +29,21 @@ server-authored descriptions enter the model-facing tool catalog, where they
 can influence tool selection. Complete input schemas also enter the catalog
 when resident or resolved on demand. Only connect servers operated by people or
 organizations you trust. Feedling preserves catalog descriptions and parameter
-guidance so the agent can use the tools correctly. A server's `readOnlyHint`
-grants no parallel-read privilege unless the exact current catalog fingerprint
-has been explicitly approved. Tool return values are never written to the
-content-free MCP status/debug surface.
+guidance so the agent can use the tools correctly. For streamable HTTP servers,
+the optional MCP `initialize.result.instructions` text is also inserted into the
+Chat system context, bounded to 4,096 characters per server and 16,384 characters
+in total. A server's `readOnlyHint` grants no parallel-read privilege unless the
+exact current catalog fingerprint has been explicitly approved. Tool return
+values are never written to the content-free MCP status/debug surface.
+
+User-configured MCP servers remain available after the agent reads private
+workspace or memory data and after it receives MCP output. This intentionally
+treats a server selected and authenticated by the user as user infrastructure,
+not as a destination discovered by the model. Consequently, model-selected
+arguments may send private context to any enabled MCP server. Web and task
+destinations retain their separate outbound fences, and a timed-out MCP mutation
+with an unknown outcome still blocks later mutating MCP calls in that turn to
+avoid duplicate remote effects.
 
 ## Add or update a server
 

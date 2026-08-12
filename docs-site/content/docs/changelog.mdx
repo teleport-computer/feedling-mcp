@@ -10,6 +10,16 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **User-configured MCP servers now follow the selected-server trust model.**
+  MCP tools remain available after private reads and earlier MCP results, which
+  enables multi-step flows such as reading and then storing remote memory in one
+  turn. Streamable HTTP servers can supply bounded
+  `initialize.result.instructions` that enter Chat's system context. This means
+  an enabled server can influence tool use and receive model-selected private
+  context; web/task outbound fences and the unknown-mutation retry fence remain
+  in place. MCP tool results now use a separate 8,000-character default result
+  budget.
+
 - **MCP tool schemas now load on demand by default.** MCP server records expose
   a `resident` boolean on `GET /v1/mcp/servers`; `POST` and `PATCH` accept the
   same field, defaulting to `false`. Hosted Runtime V2 keeps folded tool names
