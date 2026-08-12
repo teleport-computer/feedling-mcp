@@ -697,12 +697,10 @@ async def run_tool_loop(
     # injected for this turn (chat lane only). `mcp_names` is frozen from the
     # entry snapshot so a dynamic schema refresh can replace definitions but can
     # never grant a new tool name mid-turn. The MCP server validates tool args.
-    # MCP
-    # result content is nevertheless untrusted external input: after the model
-    # observes it, every later outbound MCP call is stripped, including a tool
-    # whose exact catalog fingerprint the user approved as read-only.  Read-only
-    # controls remote mutation semantics; it does not make sending model-chosen
-    # arguments to that remote server safe after prompt-injected external text.
+    # MCP result content remains external model input, but the user explicitly
+    # chose each MCP endpoint. Under the accepted trust boundary, observing that
+    # content does not remove later user-MCP calls; platform web/task fences and
+    # the unknown-mutation idempotency gate still apply below.
     disabled_names = {str(name) for name in (disabled_tool_names or ()) if str(name)}
     # ``reply`` is part of the parent loop protocol rather than a side-effect
     # capability. Recovery callers may remove every mutation schema, but must
@@ -912,8 +910,9 @@ async def run_tool_loop(
                 blocked_tools.update(_PLATFORM_MUTATION_TOOLS)
                 blocked_tools.update(mutating_mcp_names)
             # A private read may expose persona, workspace/artifact, or memory
-            # content. That observation cannot influence a later outbound
-            # query/URL/MCP/task call. Local durable edits remain available:
+            # content. That observation cannot influence a later platform-owned
+            # query/URL/task call. User-selected MCP endpoints remain available.
+            # Local durable edits remain available:
             # read-then-edit is a core workspace/working-memory workflow and
             # still carries the original user/wake seed plus generation fence.
             if outbound_tools_blocked:
