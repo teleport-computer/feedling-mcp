@@ -71,7 +71,6 @@ def _install_metadata_store(monkeypatch, *, source_count: int):
         state["watermark_ts"] = float(kwargs["watermark_ts"])
         return True
 
-    monkeypatch.setattr(worker, "_PROFILE_COVERAGE_DETERMINISTIC", True)
     monkeypatch.setattr(jobs_store, "get_summary_row", _summary_row)
     monkeypatch.setattr(worker.db, "count_messages_after_seq", _count)
     monkeypatch.setattr(worker.db, "chat_coverage_bounds_after_seq", _bounds)
@@ -80,7 +79,6 @@ def _install_metadata_store(monkeypatch, *, source_count: int):
         "chat_max_seq",
         lambda _user_id: seqs[-1] if seqs else 0,
     )
-    monkeypatch.setattr(worker.db, "v2_effective_batch_cap", lambda _user_id: None)
     return state, writes, _append
 
 
@@ -117,9 +115,7 @@ def test_maintenance_deterministic_path_never_reads_or_calls_model(monkeypatch):
         resolve_provider=lambda _user_id: (object(), {}),
         mint_enclave_token=lambda _user_id: "runtime-token",
         append_summary_segment=append,
-        read_summary=_must_not_run,
         read_summary_with_seq=_must_not_run,
-        read_compaction_tail=_must_not_run,
         read_compaction_tail_after_seq=_must_not_run,
         read_summary_frontier_metadata=lambda _user_id: None,
         runtime_mode_enabled=lambda _user_id: True,
@@ -130,7 +126,6 @@ def test_maintenance_deterministic_path_never_reads_or_calls_model(monkeypatch):
             41,
             "u-deterministic-maintenance",
             deps,
-            object(),
             asyncio.Semaphore(1),
             claimed_by="worker-a",
         )
@@ -194,7 +189,6 @@ def test_deterministic_maintenance_cas_loss_requeues_fresh_metadata(monkeypatch)
             42,
             "u-deterministic-cas",
             deps,
-            object(),
             asyncio.Semaphore(1),
             claimed_by="worker-b",
         )
@@ -228,9 +222,7 @@ def test_inline_wake_catchup_drains_large_gap_without_model_or_decrypt(
         resolve_provider=lambda _user_id: (object(), {}),
         mint_enclave_token=lambda _user_id: "runtime-token",
         append_summary_segment=append,
-        read_summary=_must_not_run,
         read_summary_with_seq=_must_not_run,
-        read_compaction_tail=_must_not_run,
         read_compaction_tail_after_seq=_must_not_run,
         read_summary_frontier_metadata=lambda _user_id: None,
     )
@@ -240,10 +232,8 @@ def test_inline_wake_catchup_drains_large_gap_without_model_or_decrypt(
         worker._ensure_prompt_coverage(
             "u-deterministic-wake",
             deps,
-            provider_config=object(),
             enclave_sem=asyncio.Semaphore(1),
             tail_limit=worker._TAIL_BUDGET,
-            add_usage=usage.append,
         )
     )
 
@@ -255,6 +245,41 @@ def test_inline_wake_catchup_drains_large_gap_without_model_or_decrypt(
         total - worker._TAIL_BUDGET - worker._COMPACTION_BATCH,
     ]
     assert usage == []
+
+
+def test_inline_catchup_ignores_legacy_semantic_callbacks(monkeypatch):
+    monkeypatch.setattr(worker, "_COMPACTION_BATCH", 50)
+    total = 50 + worker._TAIL_BUDGET + 3
+    _state, writes, append = _install_metadata_store(
+        monkeypatch,
+        source_count=total,
+    )
+
+    def _must_not_run(*_args, **_kwargs):
+        raise AssertionError("legacy semantic callback reached")
+
+    deps = worker.TurnDeps(
+        read_messages=lambda _uid: [],
+        resolve_provider=lambda _uid: (object(), {}),
+        mint_enclave_token=lambda _uid: "unused",
+        append_summary_segment=append,
+        read_compaction_tail_after_seq=_must_not_run,
+        read_summary_frontier_metadata=lambda _uid: None,
+    )
+
+    watermark, _ = asyncio.run(
+        worker._ensure_prompt_coverage(
+            "u-fixed-inline",
+            deps,
+            enclave_sem=asyncio.Semaphore(1),
+            tail_limit=worker._TAIL_BUDGET,
+        )
+    )
+
+    assert watermark == total - worker._TAIL_BUDGET
+    assert writes[0]["segment_text"] == (
+        "- [50 条更早的消息已由长期记忆覆盖]"
+    )
 
 
 def test_metadata_frontier_reconstructs_exact_text_without_decrypt(monkeypatch):
@@ -299,9 +324,9 @@ def test_metadata_frontier_reconstructs_exact_text_without_decrypt(monkeypatch):
     )
     monkeypatch.setattr(
         serve_worker,
-        "_read_summary_frontier",
-        lambda _user_id: (_ for _ in ()).throw(
-            AssertionError("exact metadata frontier must not decrypt")
+        "_decrypt_summary_text",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("metadata frontier must not decrypt")
         ),
     )
 
@@ -315,16 +340,43 @@ def test_metadata_frontier_reconstructs_exact_text_without_decrypt(monkeypatch):
     ]
 
 
-def test_deterministic_coverage_flag_is_strictly_allowlisted(monkeypatch):
-    name = "FEEDLING_V2_PROFILE_COVERAGE_DETERMINISTIC"
-    monkeypatch.delenv(name, raising=False)
-    assert worker._allowlisted_bool_env(name) is False
-    for value in ("", "0", "false", "no", "off", "garbage", "2"):
-        monkeypatch.setenv(name, value)
-        assert worker._allowlisted_bool_env(name) is False
-    for value in ("1", "true", "TRUE", "yes", "on", " On "):
-        monkeypatch.setenv(name, value)
-        assert worker._allowlisted_bool_env(name) is True
+def test_metadata_frontier_renders_legacy_opaque_without_decrypt(monkeypatch):
+    state = {
+        "version": 1,
+        "watermark_seq": 0,
+        "watermark_ts": 0.0,
+        "summary_envelope": {"ciphertext": "head"},
+        "has_segment_rows": True,
+        "materialized_segment_ids": (1,),
+        "first_source_seq": 0,
+        "covered_source_count": 0,
+        "segments": [
+            {
+                "segment_id": 1,
+                "coverage_kind": "legacy_opaque",
+                "level": 0,
+                "start_seq": 0,
+                "end_seq": 0,
+                "source_message_count": 0,
+                "legacy_opaque_through_seq": 0,
+                "child_segment_ids": (),
+                "summary_envelope": {"ciphertext": "legacy"},
+            }
+        ],
+    }
+    monkeypatch.setattr(jobs_store, "get_summary_frontier_state", lambda _uid: state)
+    monkeypatch.setattr(
+        serve_worker,
+        "_decrypt_summary_text",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("legacy metadata frontier must not decrypt")
+        ),
+    )
+
+    snapshot = serve_worker._read_summary_frontier_metadata("u-legacy")
+
+    assert snapshot is not None
+    assert snapshot.segments[0].text == "- [更早的历史摘要已由长期记忆覆盖]"
 
 
 def test_coverage_queries_share_one_synthetic_source_predicate():
@@ -334,30 +386,3 @@ def test_coverage_queries_share_one_synthetic_source_predicate():
         worker.db.count_messages_after_seq,
     ):
         assert "_CHAT_COVERAGE_SOURCE_PREDICATE" in inspect.getsource(query)
-
-
-def test_phala_worker_composes_wire_deterministic_flag_default_off():
-    # Test is the "normal-on" environment since 2026-08-05 (V1-parity
-    # program): deterministic coverage is hardcoded on there.  Prod/pre stay
-    # env-parameterized default-off (with the M5 deployment guard comment)
-    # until Seven schedules the prod rollout.
-    parameterized_off = (
-        'FEEDLING_V2_PROFILE_COVERAGE_DETERMINISTIC: '
-        '"${FEEDLING_V2_PROFILE_COVERAGE_DETERMINISTIC:-0}"'
-    )
-    hardcoded_on = 'FEEDLING_V2_PROFILE_COVERAGE_DETERMINISTIC: "1"'
-    deployment_guard = (
-        "# DO NOT set to 1 before M5 MEMORY/USER prompt injection is deployed."
-    )
-    for name in (
-        "docker-compose.phala.yaml",
-        "docker-compose.phala.test.yaml",
-        "docker-compose.phala.pre.yaml",
-    ):
-        text = (ROOT / "deploy" / name).read_text()
-        if name == "docker-compose.phala.test.yaml":
-            assert text.count(hardcoded_on) == 1, name
-            assert parameterized_off not in text, name
-        else:
-            assert text.count(parameterized_off) == 1, name
-            assert text.count(deployment_guard) == 1, name

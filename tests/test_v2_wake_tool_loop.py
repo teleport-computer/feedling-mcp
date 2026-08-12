@@ -159,7 +159,7 @@ def _wake_deps(
         mint_enclave_token=lambda uid: token,
         observe_photo=observe_photo,
         read_tail=lambda uid, after_ts, limit: list(tail if tail is not None else []),
-        read_summary=lambda uid: (summary, 0.0, 0),
+        has_genuine_user_history=lambda _uid: True,
         apply_pending_effects=_apply_effects_factory(sink_calls if sink_calls is not None else []),
 )
 

@@ -432,27 +432,12 @@ services:
       # the duration of an incident and back to "0" afterwards — the ${VAR:-}
       # form means neither flip needs a new compose_hash / on-chain publish.
       FEEDLING_V2_TRAJECTORY_INSPECT_ENABLED: "${FEEDLING_V2_TRAJECTORY_INSPECT_ENABLED:-0}"
-      # Prompt catch-up compaction budgets. Declared here (rather than left to
-      # the code defaults) so a stuck summary frontier can be unwedged by
-      # shrinking the batch from an encrypted env instead of shipping a build:
-      # a batch is folded all-or-nothing, so a batch whose summary the model
-      # cannot render as valid bullets never advances the watermark and blocks
-      # every later message for that user (usr_7f30…, 2026-07-24 → 07-27).
-      # Values below are the code defaults — this is wiring, not a change.
-      # 200 -> 50 (2026-07-28). Both prod stalls were the SAME oversized
-      # batch in different clothes: usr_7f30 could not render 200 rows as
-      # valid bullets under the 500-token output budget (folds refused,
-      # then a deadlock), and usr_90184 could not get 200 rows answered
-      # inside compaction's 60s provider timeout (transient every turn).
-      # A quarter-size request is both easier to summarize and faster to
-      # return; the cost is more fold calls per backlog, which is bounded.
+      # Maximum source rows advanced by one metadata-only coverage batch.
       FEEDLING_V2_COMPACTION_BATCH_MSGS: "${FEEDLING_V2_COMPACTION_BATCH_MSGS:-50}"
-      FEEDLING_V2_COMPACTION_BATCH_CHARS: "${FEEDLING_V2_COMPACTION_BATCH_CHARS:-120000}"
       # Generation may be enabled for M4 validation; prompt replacement stays
       # locked until M5 has deployed and been verified.
       FEEDLING_V2_PROFILE_ENABLED: "${FEEDLING_V2_PROFILE_ENABLED:-0}"
       # DO NOT set to 1 before M5 MEMORY/USER prompt injection is deployed.
-      FEEDLING_V2_PROFILE_COVERAGE_DETERMINISTIC: "${FEEDLING_V2_PROFILE_COVERAGE_DETERMINISTIC:-0}"
       FEEDLING_V2_PROMPT_CATCHUP_DEADLINE_SEC: "${FEEDLING_V2_PROMPT_CATCHUP_DEADLINE_SEC:-600}"
       # 20 -> 50 (2026-07-28). This threshold decides whether a turn enters
       # the catch-up fold path AT ALL: a backlog at or under it fits in the
@@ -462,13 +447,6 @@ services:
       # history never reached it. A few dozen more verbatim rows is cheap
       # against a >=128k input budget.
       FEEDLING_V2_TAIL_BUDGET_MSGS: "${FEEDLING_V2_TAIL_BUDGET_MSGS:-50}"
-      # Head-of-line escape hatch: after shrinking the batch all the way to a
-      # single message the catch-up still cannot fold it, cover that ONE row
-      # with a deterministic stand-in segment and advance past it. Losing
-      # summary coverage of one row beats blocking every later message for
-      # that user indefinitely; `chat_messages` still holds the transcript.
-      # "0" restores the strict fail-closed behaviour (turn fails instead).
-      FEEDLING_V2_COMPACTION_QUARANTINE_ENABLED: "${FEEDLING_V2_COMPACTION_QUARANTINE_ENABLED:-1}"
       FEEDLING_HOSTED_RUNTIME_POLICY: "dual"
       FEEDLING_RUNTIME_DEFAULT_DESIRED: "resident"
     depends_on:

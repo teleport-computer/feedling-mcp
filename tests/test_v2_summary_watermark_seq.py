@@ -7,7 +7,6 @@ now also move the reply/turn boundary from ``last_replied_ts`` to the durable
 
 from __future__ import annotations
 
-import asyncio
 import sys
 from pathlib import Path
 
@@ -15,28 +14,15 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
 import conftest
 import db
-import provider_client
 import pytest
 from alembic.config import Config
 from alembic.script import ScriptDirectory
-from model_api_runtime.v2 import compaction as v2_compaction
 from model_api_runtime.v2 import jobs_store
-from model_api_runtime.v2 import worker
-
-_BYOK = provider_client.ProviderConfig(
-    provider="anthropic",
-    model="claude-sonnet-4-test",
-    api_key="sk-user-byok",
-    base_url="",
-)
 
 
 @pytest.fixture(autouse=True)
 def _clean_agent_jobs_table(monkeypatch):
-    # This module specifies the legacy plaintext fold's seq-watermark plumbing.
-    monkeypatch.setattr(worker, "_PROFILE_COVERAGE_DETERMINISTIC", False)
-    # claim_next_job() is a GLOBAL claim (no user_id filter, by design) — see
-    # the identical fixture in test_v2_worker.py / test_v2_compaction_integration.py.
+    # claim_next_job() is a GLOBAL claim (no user_id filter, by design).
     with db.get_pool().connection() as conn:
         conn.execute("DELETE FROM agent_jobs")
     yield
@@ -325,154 +311,3 @@ def test_chat_seq_for_msg_id_exact_lookup_and_missing():
 # worker._run_compaction: advances watermark_seq to the last-compacted row's
 # real (DB-assigned) seq, atomically alongside watermark_ts
 # ---------------------------------------------------------------------------
-
-
-def test_run_compaction_advances_watermark_seq_to_last_compacted_row(monkeypatch):
-    """Seeds REAL chat_messages rows (so each has a real, distinct DB-assigned
-    seq) over the compaction budget, drives a real maintenance-lane compaction
-    job through `worker.process_job`, and asserts the summary row's
-    watermark_seq lands on the EXACT seq of the last-folded row — mirrors
-    `test_v2_worker.py::test_run_compaction_folds_oldest_batch_and_advances_watermark`
-    but for the new seq watermark."""
-    uid = "u_wmseq_compaction"
-    conftest.seed_user(uid)
-    _reset(uid)
-
-    n = worker._TAIL_KEEP + 6
-    tail_rows = []
-    for i in range(n):
-        mid = f"m{i}"
-        db.chat_append(
-            uid, mid, float(i), {"id": mid, "role": "user", "content": f"msg {i}"}, 1000
-        )
-        tail_rows.append(
-            {"id": mid, "ts": float(i), "role": "user", "content": f"msg {i}"}
-        )
-
-    old_count = n - worker._TAIL_KEEP
-    assert old_count > 0
-    expected_last_seq = db.chat_seq_for_msg_id(uid, f"m{old_count - 1}")
-    assert expected_last_seq is not None
-    # Distinct, monotonic seqs (sanity: the fixture actually produced what the
-    # test claims to be exercising, not an accidental tie).
-    all_seqs = [db.chat_seq_for_msg_id(uid, f"m{i}") for i in range(n)]
-    assert all_seqs == sorted(all_seqs)
-    assert len(set(all_seqs)) == n
-
-    job_id, _ = jobs_store.enqueue_job(uid, "maintenance")
-    job = jobs_store.claim_next_job("w")
-
-    async def _fake_compact(
-        *,
-        provider_config,
-        current_summary,
-        old_messages,
-        llm,
-        usage_out=None,
-    ):
-        return current_summary + "\n- new"
-
-    monkeypatch.setattr(v2_compaction, "compact", _fake_compact)
-
-    def _write_summary(
-        uid_, summary, watermark_ts, expected_version, watermark_seq=None
-    ):
-        return jobs_store.upsert_summary_row_cas(
-            uid_,
-            summary_envelope={"plaintext": summary},
-            watermark_ts=watermark_ts,
-            expected_version=expected_version,
-            watermark_seq=watermark_seq,
-        )
-
-    deps = worker.TurnDeps(
-        read_messages=lambda uid_: [],
-        resolve_provider=lambda uid_: (_BYOK, {}),
-        mint_enclave_token=lambda uid_: "rt",
-        read_tail=lambda uid_, after_ts, limit: tail_rows,
-        read_summary=lambda uid_: ("- old", 0.0, 0),
-        write_summary=_write_summary,
-    )
-
-    status = asyncio.run(
-        worker.process_job(
-            job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"
-        )
-    )
-
-    assert status == "completed"
-    summary_row = jobs_store.get_summary_row(uid)
-    assert summary_row["watermark_ts"] == float(old_count - 1)
-    assert summary_row["watermark_seq"] == expected_last_seq
-    assert _job_status(job_id)[0] == "completed"
-
-
-def test_run_compaction_without_id_in_tail_row_leaves_seq_watermark_unadvanced(
-    monkeypatch,
-):
-    """Degenerate fallback: a tail row dict with neither "seq" nor "id" (only
-    ever a synthetic test double — every real row carries "id") must not crash
-    the CAS write; the ts watermark still advances, watermark_seq is left at
-    its prior value (0 on first build) rather than a guessed value."""
-    uid = "u_wmseq_no_id"
-    conftest.seed_user(uid)
-    _reset(uid)
-
-    tail = [
-        {"ts": float(i), "role": "user", "content": f"msg {i}"}
-        for i in range(worker._TAIL_KEEP + 6)
-    ]
-
-    async def _fake_compact(
-        *,
-        provider_config,
-        current_summary,
-        old_messages,
-        llm,
-        usage_out=None,
-    ):
-        return current_summary + "\n- new"
-
-    monkeypatch.setattr(v2_compaction, "compact", _fake_compact)
-
-    def _write_summary(
-        uid_, summary, watermark_ts, expected_version, watermark_seq=None
-    ):
-        return jobs_store.upsert_summary_row_cas(
-            uid_,
-            summary_envelope={"plaintext": summary},
-            watermark_ts=watermark_ts,
-            expected_version=expected_version,
-            watermark_seq=watermark_seq,
-        )
-
-    job_id, _ = jobs_store.enqueue_job(uid, "maintenance")
-    job = jobs_store.claim_next_job("w")
-    deps = worker.TurnDeps(
-        read_messages=lambda uid_: [],
-        resolve_provider=lambda uid_: (_BYOK, {}),
-        mint_enclave_token=lambda uid_: "rt",
-        read_tail=lambda uid_, after_ts, limit: tail,
-        read_summary=lambda uid_: ("- old", 0.0, 0),
-        write_summary=_write_summary,
-    )
-
-    status = asyncio.run(
-        worker.process_job(
-            job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"
-        )
-    )
-
-    assert status == "completed"
-    old_count = len(tail) - worker._TAIL_KEEP
-    summary_row = jobs_store.get_summary_row(uid)
-    assert summary_row["watermark_ts"] == tail[old_count - 1]["ts"]
-    assert summary_row["watermark_seq"] == 0
-
-
-def _job_status(job_id):
-    with db.get_pool().connection() as conn:
-        row = conn.execute(
-            "SELECT status, last_error FROM agent_jobs WHERE id=%s", (job_id,)
-        ).fetchone()
-    return row

@@ -20,13 +20,6 @@ from model_api_runtime.v2 import (
 )
 
 
-@pytest.fixture(autouse=True)
-def _provider_backed_compaction_mode(monkeypatch):
-    # This suite's compaction case specifies media-decrypt failure behavior in
-    # the provider-backed fallback path.
-    monkeypatch.setattr(worker, "_PROFILE_COVERAGE_DETERMINISTIC", False)
-
-
 def _fake_serve_from_script(script, calls):
     """Return an async _serve fake that raises/returns each scripted item."""
     it = iter(script)
@@ -816,26 +809,6 @@ def test_read_messages_propagates_strict_database_read_failure(monkeypatch):
         serve_worker._read_messages("u", after_seq=0)
 
 
-def test_compaction_reader_is_oldest_first_while_context_reader_is_newest(monkeypatch):
-    class _Store:
-        chat_messages = [
-            {"id": f"m{i}", "ts": float(i), "role": "user", "body_ct": "x", "K_enclave": "k"}
-            for i in range(1, 6)
-        ]
-
-    monkeypatch.setattr(serve_worker.core_store, "get_store", lambda uid: _Store())
-    monkeypatch.setattr(serve_worker, "_mint_runtime_token", lambda uid: "rt")
-    monkeypatch.setattr(
-        serve_worker.core_enclave,
-        "_decrypt_envelope_via_enclave",
-        lambda row, *args, **kwargs: row["id"].encode(),
-    )
-
-    newest = serve_worker._read_tail("u", 0.0, 2)
-    oldest = serve_worker._read_compaction_tail("u", 0.0, 2)
-    assert [row["id"] for row in newest] == ["m4", "m5"]
-    assert [row["id"] for row in oldest] == ["m1", "m2"]
-
 
 def test_tail_reader_selects_window_before_enclave_decrypt(monkeypatch):
     class _Store:
@@ -886,206 +859,6 @@ def test_seq_catchup_reader_uses_strict_db_order_and_preserves_seq(monkeypatch):
     assert [(row["id"], row["seq"]) for row in out] == [("m1", 11), ("m2", 13)]
     assert [row["role"] for row in out] == ["user", "user"]
 
-
-def test_compaction_reader_decrypts_every_selected_media_caption_past_eight(
-    monkeypatch,
-):
-    rows = [
-        {
-            "id": f"m{i}",
-            "seq": i,
-            "ts": float(i),
-            "role": "user",
-            "content_type": "image" if i % 2 else "file",
-            "file_name": f"f{i}.pdf",
-            "caption_id": f"cap{i}",
-            "caption_body_ct": f"cipher-caption-{i}",
-            "caption_K_enclave": "k",
-            "caption_owner_user_id": "u",
-        }
-        for i in range(1, 13)
-    ]
-    selected = []
-    decrypted = []
-
-    def _read(uid, after_seq, *, limit, oldest_first=True, through_seq=None,
-              exclude_synthetic_sources=False):
-        selected.append((uid, after_seq, limit, oldest_first, through_seq))
-        return rows
-
-    def _decrypt(envelope, *args, **kwargs):
-        decrypted.append(envelope["id"])
-        return f"caption-{envelope['id']}".encode()
-
-    monkeypatch.setattr(serve_worker.db, "chat_messages_after_seq", _read)
-    monkeypatch.setattr(serve_worker, "_mint_runtime_token", lambda uid: "rt")
-    monkeypatch.setattr(
-        serve_worker.core_enclave,
-        "_decrypt_envelope_via_enclave",
-        _decrypt,
-    )
-
-    out = serve_worker._read_compaction_tail_after_seq(
-        "u", 0, 12, through_seq=12,
-    )
-
-    assert selected == [("u", 0, 12, True, 12)]
-    assert decrypted == [f"cap{i}" for i in range(1, 13)]
-    assert [row["content"] for row in out] == [
-        f"caption-cap{i}" for i in range(1, 13)
-    ]
-
-
-def test_compaction_caption_failure_aborts_the_whole_read(monkeypatch):
-    rows = [
-        {
-            "id": f"m{i}",
-            "seq": i,
-            "ts": float(i),
-            "role": "user",
-            "content_type": "image",
-            "caption_id": f"cap{i}",
-            "caption_body_ct": f"cipher-caption-{i}",
-            "caption_K_enclave": "k",
-            "caption_owner_user_id": "u",
-        }
-        for i in range(1, 10)
-    ]
-
-    monkeypatch.setattr(
-        serve_worker.db,
-        "chat_messages_after_seq",
-        lambda *args, **kwargs: rows,
-    )
-    monkeypatch.setattr(serve_worker, "_mint_runtime_token", lambda uid: "rt")
-
-    def _decrypt(envelope, *args, **kwargs):
-        if envelope["id"] == "cap9":
-            raise RuntimeError("caption unavailable")
-        return f"caption-{envelope['id']}".encode()
-
-    monkeypatch.setattr(
-        serve_worker.core_enclave,
-        "_decrypt_envelope_via_enclave",
-        _decrypt,
-    )
-
-    # No partial list reaches compaction, so its summary watermark cannot move
-    # past cap9 while that selected row's original text is unavailable.
-    with pytest.raises(RuntimeError, match="caption unavailable"):
-        serve_worker._read_compaction_tail_after_seq(
-            "u", 0, 9, through_seq=9,
-        )
-
-
-def test_media_caption_failure_does_not_advance_compaction_watermark(monkeypatch):
-    """The real maintenance path must fail before summary CAS on caption loss."""
-    import conftest
-    import db
-    import provider_client
-    from core import store as core_store
-    from model_api_runtime.v2 import compaction as v2_compaction
-
-    uid = "u_media_caption_compaction_fail_closed"
-    conftest.seed_user(uid)
-    with db.get_pool().connection() as conn:
-        conn.execute("DELETE FROM agent_jobs")
-        conn.execute("DELETE FROM v2_conversation_summary WHERE user_id=%s", (uid,))
-        conn.execute("DELETE FROM chat_messages WHERE user_id=%s", (uid,))
-    conftest.set_v2_runtime_owner(uid)
-
-    row_count = max(12, worker._TAIL_KEEP + 2)
-    for i in range(1, row_count + 1):
-        db.chat_append_strict(
-            uid,
-            f"m{i}",
-            float(i),
-            {
-                "id": f"m{i}",
-                "ts": float(i),
-                "role": "user",
-                "content_type": "image",
-                "body_ct": f"cipher-image-{i}",
-                "nonce": f"image-nonce-{i}",
-                "K_user": "wrapped-user-key",
-                "K_enclave": "wrapped-enclave-key",
-                "owner_user_id": uid,
-                "caption_id": f"cap{i}",
-                "caption_body_ct": f"cipher-caption-{i}",
-                "caption_nonce": f"caption-nonce-{i}",
-                "caption_K_enclave": "wrapped-caption-key",
-                "caption_owner_user_id": uid,
-            },
-            core_store.MAX_CHAT_MESSAGES,
-        )
-
-    monkeypatch.setattr(serve_worker, "_mint_runtime_token", lambda _uid: "rt")
-    decrypted = []
-
-    def _decrypt(envelope, *args, **kwargs):
-        decrypted.append(envelope["id"])
-        if envelope["id"] == "cap9":
-            raise RuntimeError("caption unavailable")
-        return f"caption-{envelope['id']}".encode()
-
-    monkeypatch.setattr(
-        serve_worker.core_enclave,
-        "_decrypt_envelope_via_enclave",
-        _decrypt,
-    )
-    monkeypatch.setattr(
-        v2_compaction,
-        "compact",
-        lambda **kwargs: (_ for _ in ()).throw(
-            AssertionError("provider compaction must not run after caption read failure")
-        ),
-    )
-    writes = []
-
-    def _write_summary(*args, **kwargs):
-        writes.append((args, kwargs))
-        return True
-
-    config = provider_client.ProviderConfig(
-        provider="anthropic",
-        model="claude-sonnet-4-test",
-        api_key="sk-test",
-        context_window_tokens=200_000,
-    )
-    job_id, _ = jobs_store.enqueue_job(uid, "maintenance")
-    job = jobs_store.claim_next_job("media-caption-worker")
-    deps = worker.TurnDeps(
-        read_messages=lambda _uid: [],
-        resolve_provider=lambda _uid: (config, {}),
-        mint_enclave_token=lambda _uid: "rt",
-        read_summary_with_seq=serve_worker._read_summary_with_seq,
-        read_compaction_tail_after_seq=(
-            serve_worker._read_compaction_tail_after_seq
-        ),
-        write_summary=_write_summary,
-    )
-
-    status = asyncio.run(
-        worker.process_job(
-            job,
-            deps,
-            provider_config=config,
-            api_key=None,
-            runtime_token="rt",
-        )
-    )
-
-    assert status == "failed"
-    assert decrypted == [f"cap{i}" for i in range(1, 10)]
-    assert writes == []
-    assert jobs_store.get_summary_row(uid) is None
-    with db.get_pool().connection() as conn:
-        job_row = conn.execute(
-            "SELECT status,last_error FROM agent_jobs WHERE id=%s",
-            (job_id,),
-        ).fetchone()
-    assert job_row[0] == "failed"
-    assert job_row[1] == "compaction_failed:runtimeerror"
 
 
 def test_seq_tail_readers_request_exact_oldest_and_newest_windows(monkeypatch):
@@ -1437,8 +1210,7 @@ def test_read_tail_caps_to_limit(monkeypatch):
 
 
 # ------------------------------------------------------------------
-# Task 4: _read_summary / _write_summary — decrypt-on-read (enclave) +
-# encrypt-on-write (local) + CAS against v2_conversation_summary.
+# Summary compatibility rendering from the segmented metadata frontier.
 # ------------------------------------------------------------------
 
 def test_read_summary_missing_returns_empty(monkeypatch):
@@ -1447,9 +1219,6 @@ def test_read_summary_missing_returns_empty(monkeypatch):
     from model_api_runtime.v2 import jobs_store as v2_jobs_store
 
     monkeypatch.setattr(v2_jobs_store, "get_summary_frontier_state", lambda uid: None)
-
-    out = serve_worker._read_summary("u_summary_test")
-    assert out == ("", 0.0, 0)
 
     assert serve_worker._read_summary_with_seq("u_summary_test") == ("", 0.0, 0, 0)
 
@@ -1466,8 +1235,6 @@ def test_read_summary_decrypts_present_row(monkeypatch):
         core_enclave, "_decrypt_envelope_via_enclave",
         lambda envelope, key, *, purpose, runtime_token="": b"- prior chat")
 
-    out = serve_worker._read_summary("u_summary_test")
-    assert out == ("- prior chat", 7.0, 3)
     assert serve_worker._read_summary_with_seq("u_summary_test") == (
         "- prior chat", 7.0, 3, 19,
     )
@@ -1570,7 +1337,7 @@ def test_read_summary_nonzero_watermark_with_empty_plaintext_fails_closed(monkey
     )
 
     with pytest.raises(v2_summary_frontier.SummaryFrontierIntegrityError):
-        serve_worker._read_summary("u_summary_test")
+        serve_worker._read_summary_with_seq("u_summary_test")
 
 
 def test_canonical_summary_decrypt_rejection_is_integrity_failure(monkeypatch):
@@ -1702,47 +1469,6 @@ def test_read_segmented_summary_rejects_bound_ids_without_canonical_rows(monkeyp
     ):
         serve_worker._read_summary_with_seq("u_summary_test")
 
-
-def test_write_summary_builds_envelope_and_cas(monkeypatch):
-    from core import envelope as core_envelope
-    from core import store as core_store
-    from model_api_runtime.v2 import jobs_store as v2_jobs_store
-
-    monkeypatch.setattr(core_store, "get_store", lambda uid: object())
-    monkeypatch.setattr(
-        core_envelope, "_build_shared_envelope_for_store",
-        lambda store, plaintext: ({"body_ct": "e"}, ""))
-
-    calls = {}
-
-    def _fake_cas(uid, *, summary_envelope, watermark_ts, expected_version):
-        calls["args"] = (uid, summary_envelope, watermark_ts, expected_version)
-        return True
-
-    monkeypatch.setattr(v2_jobs_store, "upsert_summary_row_cas", _fake_cas)
-
-    ok = serve_worker._write_summary("u", "- s", 9.0, 2)
-    assert ok is True
-    assert calls["args"] == ("u", {"body_ct": "e"}, 9.0, 2)
-
-
-def test_write_summary_envelope_build_failure_returns_false(monkeypatch):
-    from core import envelope as core_envelope
-    from core import store as core_store
-    from model_api_runtime.v2 import jobs_store as v2_jobs_store
-
-    monkeypatch.setattr(core_store, "get_store", lambda uid: object())
-    monkeypatch.setattr(
-        core_envelope, "_build_shared_envelope_for_store",
-        lambda store, plaintext: (None, "boom"))
-
-    def _must_not_call(*a, **k):
-        raise AssertionError("CAS must not be called when envelope build fails")
-
-    monkeypatch.setattr(v2_jobs_store, "upsert_summary_row_cas", _must_not_call)
-
-    ok = serve_worker._write_summary("u", "- s", 9.0, 2)
-    assert ok is False
 
 
 def test_fire_scheduled_for_user_enqueues_a_scheduled_agent_job(monkeypatch, backend_env):

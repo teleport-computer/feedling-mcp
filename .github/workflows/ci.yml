@@ -335,15 +335,12 @@ jobs:
             tests/test_v2_extraction_memory_integration.py \
             -v
 
-  # Both rollout switches are default-off, so ordinary CI cannot exercise
-  # their combined contract. Keep every state pair live until M6 removes them.
-  runtime-v2-compaction-matrix:
-    name: Runtime V2 rollout (det=${{ matrix.deterministic }}, profile=${{ matrix.profile_enabled }})
+  runtime-v2-coverage:
+    name: Runtime V2 coverage (profile=${{ matrix.profile_enabled }})
     runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
-        deterministic: ["0", "1"]
         profile_enabled: ["0", "1"]
     services:
       postgres:
@@ -372,10 +369,9 @@ jobs:
           pip install --require-hashes -r backend/requirements.lock
           pip install pytest-asyncio
 
-      - name: Run deterministic coverage matrix
+      - name: Run Runtime V2 coverage
         env:
           FEEDLING_TEST_PG: "postgresql://postgres:postgres@127.0.0.1:5432/postgres"
-          FEEDLING_V2_PROFILE_COVERAGE_DETERMINISTIC: "${{ matrix.deterministic }}"
           FEEDLING_V2_PROFILE_ENABLED: "${{ matrix.profile_enabled }}"
         run: |
           python -m pytest \
@@ -1210,10 +1206,8 @@ jobs:
           # with a redeploy and no new compose_hash — which is the whole
           # point, since the two prod stalls were both batch-size problems.
           FEEDLING_V2_COMPACTION_BATCH_MSGS: ${{ vars.PROD_FEEDLING_V2_COMPACTION_BATCH_MSGS }}
-          FEEDLING_V2_COMPACTION_BATCH_CHARS: ${{ vars.PROD_FEEDLING_V2_COMPACTION_BATCH_CHARS }}
           FEEDLING_V2_PROMPT_CATCHUP_DEADLINE_SEC: ${{ vars.PROD_FEEDLING_V2_PROMPT_CATCHUP_DEADLINE_SEC }}
           FEEDLING_V2_TAIL_BUDGET_MSGS: ${{ vars.PROD_FEEDLING_V2_TAIL_BUDGET_MSGS }}
-          FEEDLING_V2_COMPACTION_QUARANTINE_ENABLED: ${{ vars.PROD_FEEDLING_V2_COMPACTION_QUARANTINE_ENABLED }}
           # gunicorn worker counts (compose reads them; empty → compose default
           # 4/backend, 2/enclave). Encrypted env, NOT baked into compose_hash —
           # flip via repo var without on-chain re-auth. Gate: the deployed image
@@ -1266,10 +1260,8 @@ jobs:
             -e "FEEDLING_V2_PROFILE_ENABLED=$FEEDLING_V2_PROFILE_ENABLED" \
             -e "FEEDLING_V2_TRAJECTORY_INSPECT_ENABLED=$FEEDLING_V2_TRAJECTORY_INSPECT_ENABLED" \
             -e "FEEDLING_V2_COMPACTION_BATCH_MSGS=$FEEDLING_V2_COMPACTION_BATCH_MSGS" \
-            -e "FEEDLING_V2_COMPACTION_BATCH_CHARS=$FEEDLING_V2_COMPACTION_BATCH_CHARS" \
             -e "FEEDLING_V2_PROMPT_CATCHUP_DEADLINE_SEC=$FEEDLING_V2_PROMPT_CATCHUP_DEADLINE_SEC" \
             -e "FEEDLING_V2_TAIL_BUDGET_MSGS=$FEEDLING_V2_TAIL_BUDGET_MSGS" \
-            -e "FEEDLING_V2_COMPACTION_QUARANTINE_ENABLED=$FEEDLING_V2_COMPACTION_QUARANTINE_ENABLED" \
             -e "FEEDLING_BACKEND_WORKERS=$FEEDLING_BACKEND_WORKERS" \
             -e "FEEDLING_ENCLAVE_WORKERS=$FEEDLING_ENCLAVE_WORKERS" \
             -e "FEEDLING_V2_RUNNER_CVM_ID=$CVM_ID" \
@@ -1477,10 +1469,8 @@ jobs:
           # with a redeploy and no new compose_hash — which is the whole
           # point, since the two prod stalls were both batch-size problems.
           FEEDLING_V2_COMPACTION_BATCH_MSGS: ${{ vars.TEST_FEEDLING_V2_COMPACTION_BATCH_MSGS }}
-          FEEDLING_V2_COMPACTION_BATCH_CHARS: ${{ vars.TEST_FEEDLING_V2_COMPACTION_BATCH_CHARS }}
           FEEDLING_V2_PROMPT_CATCHUP_DEADLINE_SEC: ${{ vars.TEST_FEEDLING_V2_PROMPT_CATCHUP_DEADLINE_SEC }}
           FEEDLING_V2_TAIL_BUDGET_MSGS: ${{ vars.TEST_FEEDLING_V2_TAIL_BUDGET_MSGS }}
-          FEEDLING_V2_COMPACTION_QUARANTINE_ENABLED: ${{ vars.TEST_FEEDLING_V2_COMPACTION_QUARANTINE_ENABLED }}
           # gunicorn worker count (backend/gunicorn_conf.py reads it; empty → 1).
           # Encrypted env channel, NOT baked into compose_hash — flip without
           # on-chain re-auth. Gate: the deployed image must contain the leader-
@@ -1526,10 +1516,8 @@ jobs:
             -e "FEEDLING_V2_DREAM_ENABLED=$FEEDLING_V2_DREAM_ENABLED" \
             -e "FEEDLING_V2_TRAJECTORY_INSPECT_ENABLED=$FEEDLING_V2_TRAJECTORY_INSPECT_ENABLED" \
             -e "FEEDLING_V2_COMPACTION_BATCH_MSGS=$FEEDLING_V2_COMPACTION_BATCH_MSGS" \
-            -e "FEEDLING_V2_COMPACTION_BATCH_CHARS=$FEEDLING_V2_COMPACTION_BATCH_CHARS" \
             -e "FEEDLING_V2_PROMPT_CATCHUP_DEADLINE_SEC=$FEEDLING_V2_PROMPT_CATCHUP_DEADLINE_SEC" \
             -e "FEEDLING_V2_TAIL_BUDGET_MSGS=$FEEDLING_V2_TAIL_BUDGET_MSGS" \
-            -e "FEEDLING_V2_COMPACTION_QUARANTINE_ENABLED=$FEEDLING_V2_COMPACTION_QUARANTINE_ENABLED" \
             -e "FEEDLING_BACKEND_WORKERS=$FEEDLING_BACKEND_WORKERS" \
             -e "FEEDLING_V2_RUNNER_CVM_ID=$CVM_ID" \
             -e "FEEDLING_V2_DEPLOYED_BUILD=${GITHUB_SHA:0:7}"
@@ -1861,10 +1849,8 @@ jobs:
           # with a redeploy and no new compose_hash — which is the whole
           # point, since the two prod stalls were both batch-size problems.
           FEEDLING_V2_COMPACTION_BATCH_MSGS: ${{ vars.PRE_FEEDLING_V2_COMPACTION_BATCH_MSGS }}
-          FEEDLING_V2_COMPACTION_BATCH_CHARS: ${{ vars.PRE_FEEDLING_V2_COMPACTION_BATCH_CHARS }}
           FEEDLING_V2_PROMPT_CATCHUP_DEADLINE_SEC: ${{ vars.PRE_FEEDLING_V2_PROMPT_CATCHUP_DEADLINE_SEC }}
           FEEDLING_V2_TAIL_BUDGET_MSGS: ${{ vars.PRE_FEEDLING_V2_TAIL_BUDGET_MSGS }}
-          FEEDLING_V2_COMPACTION_QUARANTINE_ENABLED: ${{ vars.PRE_FEEDLING_V2_COMPACTION_QUARANTINE_ENABLED }}
           # gunicorn worker count (backend/gunicorn_conf.py reads it; empty → 1).
           # Encrypted env channel, NOT baked into compose_hash — flip without
           # on-chain re-auth. Gate: the deployed image must contain the leader-
@@ -1906,10 +1892,8 @@ jobs:
             -e "FEEDLING_V2_PROFILE_ENABLED=$FEEDLING_V2_PROFILE_ENABLED" \
             -e "FEEDLING_V2_TRAJECTORY_INSPECT_ENABLED=$FEEDLING_V2_TRAJECTORY_INSPECT_ENABLED" \
             -e "FEEDLING_V2_COMPACTION_BATCH_MSGS=$FEEDLING_V2_COMPACTION_BATCH_MSGS" \
-            -e "FEEDLING_V2_COMPACTION_BATCH_CHARS=$FEEDLING_V2_COMPACTION_BATCH_CHARS" \
             -e "FEEDLING_V2_PROMPT_CATCHUP_DEADLINE_SEC=$FEEDLING_V2_PROMPT_CATCHUP_DEADLINE_SEC" \
             -e "FEEDLING_V2_TAIL_BUDGET_MSGS=$FEEDLING_V2_TAIL_BUDGET_MSGS" \
-            -e "FEEDLING_V2_COMPACTION_QUARANTINE_ENABLED=$FEEDLING_V2_COMPACTION_QUARANTINE_ENABLED" \
             -e "FEEDLING_BACKEND_WORKERS=$FEEDLING_BACKEND_WORKERS" \
             -e "FEEDLING_V2_RUNNER_CVM_ID=$CVM_ID" \
             -e "FEEDLING_V2_DEPLOYED_BUILD=${GITHUB_SHA:0:7}" \

@@ -27,7 +27,6 @@ import conftest
 import db
 import provider_client
 from core import store as core_store
-from model_api_runtime.v2 import compaction as v2_compaction
 from model_api_runtime.v2 import effect_id
 from model_api_runtime.v2 import effect_outbox
 from model_api_runtime.v2 import jobs_store
@@ -58,9 +57,6 @@ def _reset(uid: str) -> None:
 
 @pytest.fixture(autouse=True)
 def _clean_agent_jobs_table(monkeypatch):
-    # The compaction acceptance case in this legacy safety suite specifies the
-    # provider-fold CAS/requeue path.
-    monkeypatch.setattr(worker, "_PROFILE_COVERAGE_DETERMINISTIC", False)
     # claim_next_job claims globally (no user_id filter) — a leftover pending
     # job from another test module could get claimed by this file's tests.
     with db.get_pool().connection() as conn:
@@ -191,147 +187,6 @@ def _seed_messages(uid: str, n: int) -> list[dict]:
     return out
 
 
-def _seed_summary(uid: str, *, covers: int, messages: list[dict]) -> int:
-    watermark_seq = messages[covers - 1]["seq"] if covers > 0 else 0
-    watermark_ts = messages[covers - 1]["ts"] if covers > 0 else 0.0
-    ok = jobs_store.upsert_summary_row_cas(
-        uid, summary_envelope={"plaintext": "- old"}, watermark_ts=watermark_ts,
-        expected_version=0, watermark_seq=watermark_seq)
-    assert ok, "seed CAS insert must land on a clean row"
-    return watermark_seq
-
-
-def _make_deps(messages: list[dict]):
-    ordered = sorted(messages, key=lambda m: m["ts"])
-
-    def _read_summary(uid):
-        row = jobs_store.get_summary_row(uid)
-        if row is None:
-            return "", 0.0, 0
-        env = row["summary_envelope"]
-        if not env:
-            return "", row["watermark_ts"], row["version"]
-        return str(env.get("plaintext") or ""), row["watermark_ts"], row["version"]
-
-    def _read_compaction_tail(uid, after_ts, limit):
-        out = [m for m in ordered if m["ts"] > after_ts]
-        return out[:limit] if limit > 0 else []
-
-    def _read_tail(uid, after_ts, limit):
-        out = [m for m in ordered if m["ts"] > after_ts]
-        return out[-limit:] if limit > 0 else []
-
-    def _write_summary(uid, summary, watermark_ts, expected_version, watermark_seq=None):
-        return jobs_store.upsert_summary_row_cas(
-            uid, summary_envelope={"plaintext": summary}, watermark_ts=watermark_ts,
-            expected_version=expected_version, watermark_seq=watermark_seq)
-
-    return _read_summary, _read_compaction_tail, _read_tail, _write_summary
-
-
-def test_prompt_coverage_after_catchup_no_message_falls_in_gap(monkeypatch):
-    """A gap: watermark far behind (covers only the first 5 of 80 messages)
-    and a bounded tail window (tail_limit=10, so >tail_cap=75 messages sit
-    after the watermark) — before catch-up, messages with seq strictly
-    between the watermark and the tail's start would be SILENTLY DROPPED
-    (not summarized, not in the bounded tail; this is the exact D6 hole).
-
-    Strong property: after running `_ensure_prompt_coverage`, EVERY message
-    with seq > (the now-advanced) watermark_seq is verified present, by id,
-    in the freshly-read tail — a single set-membership check across all 80
-    messages, not a spot check. To prove this isn't vacuous, the test first
-    positively demonstrates the pre-catch-up gap exists (some messages are
-    provably in neither the old covered range nor the old tail) — so the
-    post-catch-up all-covered assertion is closing a hole shown to be real,
-    not asserting a property that held trivially from the start.
-    """
-    uid = "u_p0hs_prompt_gap"
-    conftest.seed_user(uid)
-    _reset(uid)
-
-    n, tail_limit = 80, 10
-    messages = _seed_messages(uid, n)
-    seeded_watermark_seq = _seed_summary(uid, covers=5, messages=messages)
-
-    read_summary, read_compaction_tail, read_tail, write_summary = _make_deps(messages)
-
-    # --- Demonstrate the gap is REAL before catch-up (non-vacuity check) ---
-    max_seq = messages[-1]["seq"]
-    old_tail = read_tail(uid, messages[4]["ts"], tail_limit)  # watermark_ts of the seeded row
-    old_tail_ids = {m["id"] for m in old_tail}
-    gap_messages = [
-        m for m in messages
-        if m["seq"] > seeded_watermark_seq and m["id"] not in old_tail_ids
-    ]
-    assert len(gap_messages) > 0, "test setup must produce a real pre-catch-up gap"
-    assert asyncio.run(worker._prompt_coverage_gap(
-        uid, watermark_seq=seeded_watermark_seq, tail_limit=tail_limit))
-
-    # --- Fold via a fake LLM (append a marker per call, no real provider) ---
-    compact_calls = []
-
-    async def _fake_compact(
-        *, provider_config, current_summary, old_messages, llm, usage_out=None,
-        reject_out=None,
-    ):
-        compact_calls.append(list(old_messages))
-        return (current_summary + "\n- folded").strip()
-
-    monkeypatch.setattr(v2_compaction, "compact", _fake_compact)
-
-    deps = worker.TurnDeps(
-        read_messages=lambda uid_: [],
-        resolve_provider=lambda uid_: (_BYOK, {}),
-        mint_enclave_token=lambda uid_: "rt",
-        read_summary=read_summary,
-        read_compaction_tail=read_compaction_tail,
-        read_tail=read_tail,
-        write_summary=write_summary,
-    )
-
-    watermark_seq, returned_max_seq = asyncio.run(worker._ensure_prompt_coverage(
-        uid, deps, provider_config=_BYOK, enclave_sem=None, tail_limit=tail_limit))
-
-    assert len(compact_calls) >= 1  # catch-up actually ran, not a no-op
-    assert returned_max_seq == max_seq
-    assert not asyncio.run(worker._prompt_coverage_gap(
-        uid, watermark_seq=watermark_seq, tail_limit=tail_limit))
-
-    # Independent re-derivation from the DB agrees (Task 9's watermark_seq
-    # column, not merely the in-process return value).
-    row = jobs_store.get_summary_row(uid)
-    assert row["watermark_seq"] == watermark_seq
-    assert row["watermark_seq"] > seeded_watermark_seq
-
-    # THE strong property: EVERY one of the 80 messages ends up either
-    # summarized (seq <= the now-advanced watermark_seq) or present, by id,
-    # in the re-read tail — never neither (that "neither" state is exactly
-    # the D6 silent-drop hole this task closes). Checked across the whole
-    # set, not sampled. (In this scenario `_ensure_prompt_coverage` folds the
-    # entire gap in one inline pass — see its docstring, "covering the ENTIRE
-    # gap" — so every one of the `gap_messages` proven missing from the OLD
-    # tail above lands on the "summarized" side; the membership check still
-    # covers the "or in the tail" branch generally, since it is evaluated for
-    # every message, not assumed.)
-    new_tail = read_tail(uid, row["watermark_ts"], tail_limit)
-    covered_ids = {m["id"] for m in new_tail}
-    for m in messages:
-        summarized = m["seq"] <= watermark_seq
-        in_tail = m["id"] in covered_ids
-        assert summarized or in_tail, (
-            f"message seq={m['seq']} id={m['id']} fell in the gap: neither "
-            f"summarized (seq<=watermark_seq={watermark_seq}) nor in the tail"
-        )
-    # The messages proven to be in the pre-catch-up gap are, in particular,
-    # now on the "summarized" side (folded, not silently lost).
-    for m in gap_messages:
-        assert m["seq"] <= watermark_seq
-
-    # And nothing with seq <= watermark_seq is left dangling outside the
-    # summary either — the post-assembly hard assertion independently agrees.
-    asyncio.run(worker._assert_prompt_covers(uid, tail_limit))
-
-
 def test_prompt_coverage_no_false_gap_under_multiuser_seq_interleaving(monkeypatch):
     """THE critical-bug regression test (P0, real Postgres): ``chat_messages.
     seq`` is a TABLE-WIDE ``BIGINT GENERATED ALWAYS AS IDENTITY`` counter
@@ -430,56 +285,24 @@ def test_prompt_coverage_no_false_gap_under_multiuser_seq_interleaving(monkeypat
     assert not asyncio.run(worker._prompt_coverage_gap(
         uid_a, watermark_seq=watermark_seq, tail_limit=tail_limit))
 
-    def _boom_compact(*a, **k):
-        raise AssertionError(
-            "compaction.compact must NOT run on this false-gap scenario -- "
-            "the old seq-arithmetic code would have run it on every "
-            "multi-user turn")
-
-    monkeypatch.setattr(v2_compaction, "compact", _boom_compact)
-
-    # User-scoped reader (mirrors production `serve_worker._read_tail_window`,
-    # which always reads from `core_store.get_store(user_id)` -- B's
-    # interleaved rows are never visible to A's reader at all).
-    a_ordered = sorted(a_messages, key=lambda m: m["ts"])
-
-    def _read_tail_a(uid_, after_ts, limit):
-        out = [m for m in a_ordered if m["ts"] > after_ts]
-        return out[-limit:] if limit > 0 else []
-
-    def _read_compaction_tail_a(uid_, after_ts, limit):
-        out = [m for m in a_ordered if m["ts"] > after_ts]
-        return out[:limit] if limit > 0 else []
-
-    def _read_summary_a(uid_):
-        row = jobs_store.get_summary_row(uid_)
-        if row is None:
-            return "", 0.0, 0
-        env = row["summary_envelope"]
-        if not env:
-            return "", row["watermark_ts"], row["version"]
-        return str(env.get("plaintext") or ""), row["watermark_ts"], row["version"]
-
-    def _write_summary_a(uid_, summary, watermark_ts_, expected_version, watermark_seq=None):
-        return jobs_store.upsert_summary_row_cas(
-            uid_, summary_envelope={"plaintext": summary}, watermark_ts=watermark_ts_,
-            expected_version=expected_version, watermark_seq=watermark_seq)
-
     deps = worker.TurnDeps(
-        read_messages=lambda uid_: [],
-        resolve_provider=lambda uid_: (_BYOK, {}),
-        mint_enclave_token=lambda uid_: "rt",
-        read_summary=_read_summary_a,
-        read_compaction_tail=_read_compaction_tail_a,
-        read_tail=_read_tail_a,
-        write_summary=_write_summary_a,
+        read_messages=lambda _uid: [],
+        resolve_provider=lambda _uid: (_BYOK, {}),
+        mint_enclave_token=lambda _uid: "rt",
+        append_summary_segment=lambda *_a, **_k: (_ for _ in ()).throw(
+            AssertionError("no-gap path must not append coverage")
+        ),
     )
 
-    returned_watermark_seq, returned_max_seq = asyncio.run(worker._ensure_prompt_coverage(
-        uid_a, deps, provider_config=_BYOK, enclave_sem=None, tail_limit=tail_limit))
+    returned_watermark_seq, returned_max_seq = asyncio.run(
+        worker._ensure_prompt_coverage(
+            uid_a,
+            deps,
+            enclave_sem=None,
+            tail_limit=tail_limit,
+        )
+    )
 
-    # No catch-up ran (the boom guard would have raised) and the watermark
-    # is unchanged.
     assert returned_watermark_seq == watermark_seq
     assert returned_max_seq == a_own_max_seq
 
@@ -489,7 +312,7 @@ def test_prompt_coverage_no_false_gap_under_multiuser_seq_interleaving(monkeypat
     # the prompt (or, in the general case, spinning through `max_retries`
     # no-op-fold attempts and raising ResponderError
     # ("prompt_coverage_incomplete") on a turn that never had a real gap).
-    tail = _read_tail_a(uid_a, watermark_ts, tail_limit)
+    tail = [m for m in a_messages if m["seq"] > watermark_seq]
     assert len(tail) == tail_limit
     assert tail  # non-empty -- the exact D6-regression failure mode
     tail_ids = {m["id"] for m in tail}
@@ -505,102 +328,6 @@ def test_prompt_coverage_no_false_gap_under_multiuser_seq_interleaving(monkeypat
 # still-over-budget tail (Task 6).
 # ---------------------------------------------------------------------------
 
-
-def _make_tail_deps(n: int):
-    messages = [{"id": f"m{i}", "ts": float(i), "content": f"turn {i}"} for i in range(1, n + 1)]
-
-    def _read_tail(uid, after_ts, limit):
-        out = [m for m in messages if m["ts"] > after_ts]
-        return out[-limit:] if limit > 0 else []
-
-    def _read_summary(uid):
-        row = jobs_store.get_summary_row(uid)
-        if row is None:
-            return "", 0.0, 0
-        env = row["summary_envelope"]
-        if not env:
-            return "", row["watermark_ts"], row["version"]
-        return str(env.get("plaintext") or ""), row["watermark_ts"], row["version"]
-
-    def _write_summary(uid, summary, watermark_ts, expected_version):
-        return jobs_store.upsert_summary_row_cas(
-            uid, summary_envelope={"plaintext": summary},
-            watermark_ts=watermark_ts, expected_version=expected_version)
-
-    return _read_tail, _read_summary, _write_summary
-
-
-def test_compaction_cas_loss_requeues_never_permanently_abandons_tail(monkeypatch):
-    """`worker._run_compaction` with `jobs_store.upsert_summary_row_cas`
-    monkeypatched to unconditionally return False (every attempt loses the
-    race) must still leave a fresh 'maintenance' job PENDING afterward — the
-    over-budget tail is never silently abandoned, it is guaranteed another
-    shot at coverage.
-
-    Strong property: not just "a job got enqueued" (which could trivially be
-    satisfied by enqueuing unconditionally on every failure, masking a bug
-    where non-CAS failures also wrongly retry forever) — this test also
-    drives the requeued job through a SECOND `_run_compaction` attempt (this
-    time with a real, unpatched CAS) and asserts it actually SUCCEEDS and
-    advances the watermark, proving the retry loop terminates in real
-    coverage rather than spinning as an infinite-requeue mirage.
-    """
-    uid = "u_p0hs_cas_requeue"
-    conftest.seed_user(uid)
-    _reset(uid)
-
-    read_tail, read_summary, write_summary = _make_tail_deps(worker._TAIL_KEEP + 5)
-
-    async def _fake_llm(cfg, msgs, **kw):
-        return {"reply": "- folded bullet"}
-
-    monkeypatch.setattr(provider_client, "reliable_chat_completion_async", _fake_llm)
-    monkeypatch.setattr(jobs_store, "upsert_summary_row_cas", lambda *a, **k: False)
-
-    deps = worker.TurnDeps(
-        read_messages=lambda uid_: [],
-        resolve_provider=lambda uid_: (_BYOK, {}),
-        mint_enclave_token=lambda uid_: "rt",
-        read_tail=read_tail,
-        read_summary=read_summary,
-        write_summary=write_summary,
-    )
-
-    jobs_store.enqueue_job(uid, "maintenance")
-    job1 = jobs_store.claim_next_job("w-p0-maint")
-    assert job1 is not None and job1["lane"] == "maintenance"
-    sem = asyncio.Semaphore(1)
-    status = asyncio.run(worker._run_compaction(
-        job1["id"], uid, deps, _BYOK, sem, claimed_by=job1["claimed_by"]))
-    assert status == "failed"
-
-    with db.get_pool().connection() as conn:
-        pending = conn.execute(
-            "SELECT id, status, reason FROM agent_jobs "
-            "WHERE user_id=%s AND lane='maintenance' AND status='pending'",
-            (uid,),
-        ).fetchall()
-    assert len(pending) == 1, f"expected exactly one fresh pending maintenance job, got {pending}"
-    assert pending[0][2] == "cas_lost_retry"
-    assert jobs_store.get_summary_row(uid) is None  # the lost CAS write never landed
-
-    # Un-patch the CAS and drive the requeued job to a real completion — the
-    # requeue must eventually terminate in actual coverage, not just exist.
-    monkeypatch.undo()
-    monkeypatch.setattr(worker, "_PROFILE_COVERAGE_DETERMINISTIC", False)
-    monkeypatch.setattr(provider_client, "reliable_chat_completion_async", _fake_llm)
-    job2 = jobs_store.claim_next_job("w-p0-maint-2")
-    assert job2 is not None and job2["id"] == pending[0][0]
-    status2 = asyncio.run(worker._run_compaction(
-        job2["id"], uid, deps, _BYOK, sem, claimed_by=job2["claimed_by"]))
-    assert status2 == "completed"
-    summary_row = jobs_store.get_summary_row(uid)
-    assert summary_row is not None and summary_row["version"] == 1
-
-
-# ---------------------------------------------------------------------------
-# P0 #4 — kill at a durable-effect boundary -> exactly one reply/effect.
-# ---------------------------------------------------------------------------
 
 
 def test_kill_between_sink_write_and_status_flip_yields_exactly_one_reply():

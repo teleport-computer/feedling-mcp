@@ -8,7 +8,6 @@ import pytest
 
 sys.path.insert(0, str(pathlib.Path(__file__).parent.parent / "backend"))
 
-from model_api_runtime.v2 import compaction
 from model_api_runtime.v2 import summary_frontier as frontier
 from model_api_runtime.v2 import worker
 import provider_client
@@ -131,51 +130,11 @@ def test_bounded_frontier_is_not_rewritten_without_a_closed_run():
     assert frontier.choose_rollup_candidate(items, fanout=8) is None
 
 
-def test_compact_segment_never_resends_an_existing_aggregate_summary():
-    seen = []
 
-    async def _llm(_config, messages, **_kwargs):
-        seen.extend(messages)
-        return {"reply": "- covered new batch"}
-
-    # Above the verbatim-fold threshold, so this exercises the provider path
-    # whose prompt shape is what this test is about.
-    result = asyncio.run(
-        compaction.compact_segment(
-            provider_config=object(),
-            old_messages=[
-                {"role": "user", "content": "NEW_BATCH_ONLY " + "x" * 500}
-                for _ in range(compaction._VERBATIM_FOLD_MAX_CHARS // 500 + 2)
-            ],
-            llm=_llm,
-        )
-    )
-    assert result == "- covered new batch"
-    assert "NEW_BATCH_ONLY" in str(seen)
-    assert "现有摘要" not in str(seen)
-
-
-def test_compact_checkpoint_rejects_malformed_output_as_full_noop():
-    async def _llm(_config, _messages, **_kwargs):
-        return {"reply": "prose before bullet\n- child"}
-
-    result = asyncio.run(
-        compaction.compact_checkpoint(
-            provider_config=object(),
-            child_summaries=["- child one", "- child two"],
-            llm=_llm,
-        )
-    )
-    assert result is None
-
-
-def test_oversized_legacy_summary_rolls_up_without_new_messages(monkeypatch):
-    """Lazy-seeded legacy heads must not need a new chat row to become bounded."""
-
-    # Strictly beyond one 120K checkpoint request: this must map/reduce rather
-    # than require a new message or fail at the old aggregate's size.
-    oversized = "- " + ("legacy context " * 12_000)
-    bounded = "- bounded legacy checkpoint"
+def test_mixed_historical_frontier_rolls_up_from_metadata_without_provider(
+    monkeypatch,
+):
+    monkeypatch.setattr(worker, "_SUMMARY_FRONTIER_MAX_SEGMENTS", 1)
     state = {
         "snapshot": frontier.SummaryFrontierSnapshot(
             segments=(
@@ -184,47 +143,62 @@ def test_oversized_legacy_summary_rolls_up_without_new_messages(monkeypatch):
                     coverage_kind="legacy_opaque",
                     level=0,
                     start_seq=0,
-                    end_seq=0,
+                    end_seq=10,
                     source_message_count=0,
+                    legacy_opaque_through_seq=10,
+                    child_segment_ids=(),
+                    text="- historical model-authored prose",
+                ),
+                frontier.SummarySegment(
+                    segment_id=2,
+                    coverage_kind="exact",
+                    level=0,
+                    start_seq=20,
+                    end_seq=22,
+                    source_message_count=3,
                     legacy_opaque_through_seq=0,
                     child_segment_ids=(),
-                    text=oversized,
+                    text="- [3 条更早的消息已由长期记忆覆盖]",
                 ),
             ),
             head_version=1,
-            watermark_seq=0,
+            watermark_seq=22,
         ),
     }
     checkpoint_calls = []
-    provider_calls = []
 
-    async def _llm(_config, messages, **_kwargs):
-        provider_calls.append(messages)
-        return {"reply": bounded, "usage": {"prompt_tokens": 10}}
+    async def _must_not_call_provider(*_args, **_kwargs):
+        raise AssertionError("conversation coverage must not use a provider")
 
-    monkeypatch.setattr(provider_client, "reliable_chat_completion_async", _llm)
+    monkeypatch.setattr(
+        provider_client,
+        "reliable_chat_completion_async",
+        _must_not_call_provider,
+    )
 
     def _append_checkpoint(_user_id, summary, **kwargs):
         checkpoint_calls.append((summary, kwargs))
-        assert kwargs["child_segment_ids"] == (1,)
+        assert summary == "- [更早的历史摘要及 3 条消息已由长期记忆覆盖]"
+        assert kwargs["source_message_count"] == 3
+        assert kwargs["child_segment_ids"] == (1, 2)
         assert kwargs["expected_version"] == 1
-        assert kwargs["expected_watermark_seq"] == 0
+        assert kwargs["expected_watermark_seq"] == 22
         state["snapshot"] = frontier.SummaryFrontierSnapshot(
             segments=(
                 frontier.SummarySegment(
-                    segment_id=2,
+                    segment_id=3,
                     coverage_kind="legacy_opaque",
                     level=1,
                     start_seq=0,
-                    end_seq=0,
-                    source_message_count=0,
-                    legacy_opaque_through_seq=0,
-                    child_segment_ids=(1,),
+                    end_seq=22,
+                    source_message_count=3,
+                    legacy_opaque_through_seq=10,
+                    child_segment_ids=(1, 2),
                     text=summary,
                 ),
             ),
             head_version=2,
-            watermark_seq=0,
+            watermark_seq=22,
         )
         return True
 
@@ -232,29 +206,17 @@ def test_oversized_legacy_summary_rolls_up_without_new_messages(monkeypatch):
         read_messages=lambda _user_id: [],
         resolve_provider=lambda _user_id: (object(), {}),
         mint_enclave_token=lambda _user_id: "token",
-        read_summary_frontier=lambda _user_id: state["snapshot"],
+        read_summary_frontier_metadata=lambda _user_id: state["snapshot"],
         append_summary_checkpoint=_append_checkpoint,
-        read_summary_with_seq=lambda _user_id: (bounded, 0.0, 2, 0),
     )
 
     result = asyncio.run(
-        worker._bound_materialized_summary(
+        worker._rebalance_summary_frontier(
             "user-1",
-            oversized,
             deps,
-            provider_config=object(),
             enclave_sem=asyncio.Semaphore(1),
-            claimed_by=None,
-            job_id=None,
-            add_usage=None,
-            trajectory_recorder=None,
         )
     )
 
-    assert result == bounded
+    assert result == list(state["snapshot"].segments)
     assert len(checkpoint_calls) == 1
-    assert len(provider_calls) >= 3
-    assert all(
-        len(str(call[1]["content"])) < len(oversized)
-        for call in provider_calls
-    )

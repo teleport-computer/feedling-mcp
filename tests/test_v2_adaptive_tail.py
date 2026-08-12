@@ -9,16 +9,8 @@ import pytest
 sys.path.insert(0, str(pathlib.Path(__file__).parent.parent / "backend"))
 
 from model_api_runtime.v2 import prompt_frontier  # noqa: E402
-from model_api_runtime.v2 import compaction  # noqa: E402
 from model_api_runtime.v2 import jobs_store  # noqa: E402
 from model_api_runtime.v2 import worker  # noqa: E402
-
-
-@pytest.fixture(autouse=True)
-def _provider_backed_targeted_catchup(monkeypatch):
-    # Targeted catch-up in this suite specifies the provider-backed fold path;
-    # deterministic metadata catch-up has its own rollout-mode suite.
-    monkeypatch.setattr(worker, "_PROFILE_COVERAGE_DETERMINISTIC", False)
 
 
 def _row(seq: int, role: str, content: str, *, genuine: bool | None = None) -> dict:
@@ -240,7 +232,11 @@ def test_targeted_catchup_compacts_exactly_through_safe_boundary(monkeypatch):
     monkeypatch.setattr(
         jobs_store,
         "get_summary_row",
-        lambda _uid: {"watermark_seq": state["watermark_seq"]},
+        lambda _uid: {
+            "watermark_seq": state["watermark_seq"],
+            "watermark_ts": 0.0,
+            "version": state["version"],
+        },
     )
 
     def count(_uid, after_seq, *, through_seq=None, exclude_synthetic_sources=False):
@@ -257,30 +253,20 @@ def test_targeted_catchup_compacts_exactly_through_safe_boundary(monkeypatch):
     monkeypatch.setattr(worker.db, "count_messages_after_seq", count)
     monkeypatch.setattr(worker.db, "chat_max_seq", lambda _uid: rows[-1]["seq"])
 
-    def read_summary(_uid):
-        return (
-            state["summary"],
-            float(state["watermark_seq"]),
-            state["version"],
-            state["watermark_seq"],
-        )
-
-    def read_oldest(_uid, after_seq, limit, *, through_seq=None):
-        return [
-            row
+    def bounds(_uid, after_seq, *, limit, through_seq=None):
+        selected = [
+            row["seq"]
             for row in rows
             if row["seq"] > after_seq
             and (through_seq is None or row["seq"] <= through_seq)
         ][:limit]
+        return (selected[0], selected[-1], len(selected)) if selected else (0, 0, 0)
 
-    async def compact_segment(*, old_messages, **_kwargs):
-        folded.extend(row["seq"] for row in old_messages)
-        return "- folded " + ",".join(str(row["seq"]) for row in old_messages)
-
-    monkeypatch.setattr(compaction, "compact_segment", compact_segment)
+    monkeypatch.setattr(worker.db, "chat_coverage_bounds_after_seq", bounds)
 
     def append_segment(_uid, text, **kwargs):
         assert kwargs["previous_watermark_seq"] == state["watermark_seq"]
+        folded.extend(range(kwargs["start_seq"], kwargs["end_seq"] + 1))
         state["summary"] = (state["summary"] + "\n" + text).strip()
         state["watermark_seq"] = kwargs["end_seq"]
         state["version"] += 1
@@ -290,9 +276,6 @@ def test_targeted_catchup_compacts_exactly_through_safe_boundary(monkeypatch):
         read_messages=lambda _uid: [],
         resolve_provider=lambda _uid: (None, {}),
         mint_enclave_token=lambda _uid: "token",
-        read_summary_with_seq=read_summary,
-        read_compaction_tail_after_seq=read_oldest,
-        read_tail_after_seq=read_oldest,
         append_summary_segment=append_segment,
     )
 
@@ -300,7 +283,6 @@ def test_targeted_catchup_compacts_exactly_through_safe_boundary(monkeypatch):
         worker._ensure_prompt_coverage(
             "u",
             deps,
-            provider_config=None,
             enclave_sem=None,
             tail_limit=0,
             compact_through_seq=5,
