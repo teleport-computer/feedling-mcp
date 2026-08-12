@@ -14,7 +14,11 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from tools.e2e.user_mcp_handshake_probe import classify  # noqa: E402
+from tools.e2e.user_mcp_handshake_probe import (  # noqa: E402
+    build_probe_prompt,
+    classify,
+    observation_complete,
+)
 
 
 def _ev(type_, **detail):
@@ -294,3 +298,79 @@ def test_v2_still_rejects_a_surface_event_from_the_wrong_runtime():
     code, lines = classify(events, runtime="v2", expect="ok", server_count=1)
     assert code == 1
     assert any("driver=pi" in x for x in lines)
+
+
+def test_v2_minimum_call_count_proves_two_real_dispatches():
+    events = _v2()
+    events.append(_ev(
+        "mcp.turn.usage",
+        outcome="completed",
+        offered_tool_count=2,
+        called_tool_count=1,
+        call_count=2,
+    ))
+    code, lines = classify(
+        events,
+        runtime="v2",
+        expect="ok",
+        server_count=1,
+        min_mcp_calls=2,
+    )
+    assert code == 0
+    assert any("call_count" in line for line in lines)
+
+
+def test_v2_minimum_call_count_rejects_one_call_and_missing_usage():
+    events = _v2()
+    code, _ = classify(
+        events,
+        runtime="v2",
+        expect="ok",
+        server_count=1,
+        min_mcp_calls=2,
+    )
+    assert code == 3
+    assert not observation_complete(events, "v2", min_mcp_calls=2)
+
+    events.append(_ev(
+        "mcp.turn.usage",
+        outcome="completed",
+        offered_tool_count=1,
+        called_tool_count=1,
+        call_count=1,
+    ))
+    code, _ = classify(
+        events,
+        runtime="v2",
+        expect="ok",
+        server_count=1,
+        min_mcp_calls=2,
+    )
+    assert code == 1
+    assert observation_complete(events, "v2", min_mcp_calls=2)
+
+
+def test_v2_minimum_call_count_rejects_failed_turn_usage():
+    events = _v2()
+    events.append(_ev(
+        "mcp.turn.usage",
+        outcome="failed",
+        offered_tool_count=1,
+        called_tool_count=1,
+        call_count=2,
+    ))
+    code, _ = classify(
+        events,
+        runtime="v2",
+        expect="ok",
+        server_count=1,
+        min_mcp_calls=2,
+    )
+    assert code == 1
+
+
+def test_probe_prompt_requests_the_same_number_of_real_calls_it_will_require():
+    prompt = build_probe_prompt("deepwiki", 2)
+    assert "deepwiki" in prompt
+    assert "至少 2 次" in prompt
+    assert "每次" in prompt
