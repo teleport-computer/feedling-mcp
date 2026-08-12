@@ -76,6 +76,7 @@ from core import store as core_store
 from core import wake_bus as core_wake_bus
 from genesis import daemon as genesis_daemon
 from hosted import config_store as hosted_config_store
+from hosted import mcp_core
 from hosted import mcp_status
 from hosted import mcp_tools
 from hosted import vision_observer
@@ -4441,6 +4442,65 @@ def _record_extraction_status(
     )
 
 
+# 上一次为某用户记过工具明细的 MCP 指纹。**只在指纹变化的那一轮附带明细**,
+# 不是每轮:每用户 200 条的 trace 环,一轮塞几十个工具的话几轮就冲光,而我们
+# 真正要读的那些轮次会先被挤掉(2026-08-10 实测:一轮蒸馏刷 ~198 条
+# enclave.call 就能把当天的 chat 轮全冲没)。进程重启后重记一次,代价只是多一条。
+#
+# 明细挂在既有的 `mcp.surface.resolved` 上、不另起事件名:按约定事件名查询的
+# admin/排查流程才找得到(codex 审出 —— 我原本发的是新事件 mcp.catalog.described,
+# 那等于给同一件事造了第二个入口)。
+_LAST_MCP_CATALOG_FINGERPRINT: dict[str, str] = {}
+_MCP_CATALOG_DESC_CHARS = 160
+_MCP_CATALOG_MAX_TOOLS = 60
+
+
+def _mcp_catalog_detail(store, turn) -> dict:
+    """指纹变了就返回 {"catalog": [...]},否则返回 {}(合进 surface.resolved)。
+
+    为什么需要:2026-08-12 查 usr_dd0b 时,我在服务端**看不到她那 41 个工具是
+    什么** —— 只有每台的计数(`xiaozhen:24/24`),连工具名都没有,只能跑去
+    GitHub 翻那个 MCP 项目的 README 猜。而「模型自称我是 Claude Code」这个问题的
+    嫌疑正落在某台服务器的工具描述上,没有明细就查不下去。
+
+    ⚠️ 边界:记**描述**(服务器作者写的),绝不记**返回值**(用户的记忆正文)。
+    ⚠️ 指纹在这里**不写**。调用方要等 trace 真的发出去之后再记,否则某轮加载
+    失败或 trace 写失败时会把这个指纹永久吃掉,后面恢复了也不再记(codex 审出)。
+    """
+    specs = list(getattr(turn, "tool_specs", None) or [])
+    if not specs:
+        return {}
+    tools = []
+    for spec in specs[:_MCP_CATALOG_MAX_TOOLS]:
+        try:
+            schema_chars = len(json.dumps(spec.parameters, ensure_ascii=False))
+        except Exception:  # noqa: BLE001
+            schema_chars = -1
+        tools.append({
+            "name": spec.name,
+            "desc": str(spec.description or "")[:_MCP_CATALOG_DESC_CHARS],
+            "schema_chars": schema_chars,
+        })
+    return {
+        "catalog": tools,
+        "catalog_truncated": len(specs) > _MCP_CATALOG_MAX_TOOLS,
+    }
+
+
+def _mcp_catalog_fingerprint_if_new(store) -> str:
+    """本轮该不该附带工具明细 —— 返回新指纹,或 ""(不附带)。"""
+    user_id = str(getattr(store, "user_id", "") or "")
+    if not user_id:
+        return ""
+    try:
+        fingerprint = mcp_core.fingerprint_for_store(store)
+    except Exception:  # noqa: BLE001 — 诊断绝不能影响回合
+        return ""
+    if not fingerprint or _LAST_MCP_CATALOG_FINGERPRINT.get(user_id) == fingerprint:
+        return ""
+    return fingerprint
+
+
 async def _load_mcp_turn_observed(store, **kwargs):
     """`mcp_tools.load_turn_mcp` + 把本轮工具面写进 admin 可见的 debug trace。
 
@@ -4453,6 +4513,17 @@ async def _load_mcp_turn_observed(store, **kwargs):
     只能靠读代码猜。事件名与 pi 侧刻意保持一致,同一套排查方法两条 lane 通用。
     """
     turn = await mcp_tools.load_turn_mcp(store, **kwargs)
+    catalog_fingerprint = ""
+    catalog_detail: dict = {}
+    try:
+        catalog_fingerprint = _mcp_catalog_fingerprint_if_new(store)
+        if catalog_fingerprint:
+            catalog_detail = _mcp_catalog_detail(store, turn)
+            if not catalog_detail:
+                # 工具面是空的:没什么可记,也别把指纹吃掉 —— 下次真有工具时还要记。
+                catalog_fingerprint = ""
+    except Exception as exc:  # noqa: BLE001 — 诊断绝不能影响回合
+        log.warning("[v2.mcp] catalog detail failed: %s", type(exc).__name__)
     try:
         summary = dict(getattr(turn, "summary", None) or {})
         if summary:
@@ -4494,8 +4565,16 @@ async def _load_mcp_turn_observed(store, **kwargs):
                        "每台仍有代表工具。detail.per_server 是「注册数/发现数」"
                        if dropped else "")
                 ),
-                detail={"driver": "v2", "lane": "chat", **summary},
+                detail={"driver": "v2", "lane": "chat", **summary,
+                        **catalog_detail},
             )
+            # 指纹只在 trace **确实发出去之后**才记。写在前面的话,某轮加载失败
+            # 或 trace 写失败就会把这个指纹永久吃掉,后面恢复了也不再记明细
+            # (codex 审出)。并发下重复记一条无所谓,漏掉第一份工具面才要命。
+            if catalog_fingerprint:
+                _LAST_MCP_CATALOG_FINGERPRINT[
+                    str(getattr(store, "user_id", "") or "")
+                ] = catalog_fingerprint
     except Exception as exc:  # noqa: BLE001 — 诊断绝不能影响回合
         log.warning("[v2.mcp] surface trace failed: %s", type(exc).__name__)
     # A config-list failure is not an observation of the enabled-server set;
