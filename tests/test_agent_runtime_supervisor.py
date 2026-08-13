@@ -294,6 +294,47 @@ def test_enqueue_introduction_job_when_profile_fields_empty(monkeypatch):
     assert len(store.jobs) == 1
 
 
+def test_fetch_intro_identity_plaintext_uses_backend_not_enclave(monkeypatch):
+    class Response:
+        status_code = 200
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {
+                "identity": {
+                    "v": 1,
+                    "body": '{"agent_name":"Mira","self_introduction":"hello"}',
+                    "owner_user_id": "u_1",
+                    "visibility": "shared",
+                    "days_with_user": 2,
+                }
+            }
+
+    monkeypatch.setattr(supervisor_mod.httpx, "get", lambda *_args, **_kwargs: Response())
+    monkeypatch.setattr(
+        supervisor_mod._ENCLAVE_HTTP,
+        "get",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("plaintext identity must not call enclave")
+        ),
+    )
+
+    identity, reason = supervisor_mod._fetch_identity_plain_for_intro(
+        {
+            "user_id": "u_1",
+            "api_key": "k",
+            "content_encryption": "off",
+        },
+        api_url="http://backend",
+        enclave_url="https://enclave",
+    )
+
+    assert reason == ""
+    assert identity["agent_name"] == "Mira"
+
+
 def test_enqueue_introduction_no_card_still_introduces_once(monkeypatch):
     # The core new behavior: a user with NO identity card (identity_not_found)
     # still gets exactly one introduction — the card is no longer a precondition.

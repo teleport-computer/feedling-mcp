@@ -770,14 +770,46 @@ def _needs_introduction_identity(identity: dict | None) -> bool:
 
 
 def _fetch_identity_plain_for_intro(entry: dict, *, api_url: str, enclave_url: str) -> tuple[dict | None, str]:
-    if not str(enclave_url or "").strip():
-        return None, "enclave_url_missing"
     headers = _auth_headers(
         api_key=str(entry.get("api_key") or ""),
         runtime_token=str(entry.get("runtime_token") or ""),
     )
     if not headers:
         return None, "auth_missing"
+    if str(entry.get("content_encryption") or "").strip().lower() == "off":
+        try:
+            from core import envelope as core_envelope
+            from identity import card_view
+
+            resp = httpx.get(
+                f"{api_url.rstrip('/')}/v1/identity/get",
+                headers=headers,
+                timeout=10,
+            )
+            if resp.status_code == 404:
+                return None, "identity_not_found"
+            resp.raise_for_status()
+            body = resp.json()
+            stored = body.get("identity") if isinstance(body, dict) else None
+            if not isinstance(stored, dict):
+                return None, "identity_not_initialized"
+            raw = core_envelope.read_plaintext_envelope_body(
+                stored,
+                owner_user_id=str(entry.get("user_id") or ""),
+            )
+            inner = json.loads(raw.decode("utf-8"))
+            if not isinstance(inner, dict):
+                raise ValueError("identity plaintext is not an object")
+            return card_view.plaintext_view(
+                card_view.envelope_base(stored),
+                inner,
+                stored,
+                days_with_user=int(stored.get("days_with_user") or 0),
+            ), ""
+        except Exception as e:  # noqa: BLE001
+            return None, f"identity_fetch_failed:{type(e).__name__}"
+    if not str(enclave_url or "").strip():
+        return None, "enclave_url_missing"
     try:
         resp = _ENCLAVE_HTTP.get(
             f"{enclave_url.rstrip('/')}/v1/identity/get",
@@ -831,7 +863,10 @@ def _enqueue_introduction_job_if_needed(
     # introduced do we record the marker and skip — a transient decrypt failure
     # must not be mistaken for "already introduced" (it would suppress a real
     # intro forever).
-    identity, reason = _fetch_identity_plain_for_intro(entry, api_url=api_url, enclave_url=enclave_url)
+    identity_entry = dict(entry)
+    identity_entry.setdefault("user_id", user_id)
+    identity, reason = _fetch_identity_plain_for_intro(
+        identity_entry, api_url=api_url, enclave_url=enclave_url)
     if isinstance(identity, dict):
         status = str(identity.get("decrypt_status") or "").strip()
         decrypt_ok = (not status) or status == "ok"

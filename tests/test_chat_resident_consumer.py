@@ -1131,6 +1131,35 @@ def test_fetch_from_enclave_gives_up_after_max_attempts(monkeypatch):
     assert mock_client.get.call_count == crc.ENCLAVE_FETCH_MAX_ATTEMPTS
 
 
+def test_plaintext_history_uses_backend_without_bulk_enclave(monkeypatch):
+    class Response:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"messages": [{
+                "id": "m-plain",
+                "ts": 2.0,
+                "role": "user",
+                "content_type": "text",
+                "body": "hello local",
+                "owner_user_id": "usr_plain",
+            }]}
+
+    monkeypatch.setattr(crc._HTTP, "get", lambda *_args, **_kwargs: Response())
+    monkeypatch.setattr(
+        crc,
+        "_fetch_from_enclave",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("plaintext history must not use bulk enclave")
+        ),
+    )
+
+    result = crc.get_decrypted_history(since=1.0, limit=20)
+
+    assert result[0]["content"] == "hello local"
+
+
 def test_image_message_passes_image_context_to_agent(monkeypatch, tmp_path):
     monkeypatch.setattr(crc, "IMAGE_TEMP_DIR", tmp_path)
     msg = _make_image_msg(ts=2100.0)

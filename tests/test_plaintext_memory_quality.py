@@ -1,6 +1,7 @@
 """Regression coverage for v1 plaintext Memory Garden quality scanning."""
 
 import sys
+import types
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
@@ -34,3 +35,33 @@ def test_typed_memory_quality_fields_remain_supported():
     )
 
     assert issues == []
+
+
+def test_recent_recap_reads_plaintext_history_without_enclave(monkeypatch):
+    store = types.SimpleNamespace(user_id="usr_plain")
+    monkeypatch.setattr(
+        turn.db,
+        "chat_history_page_strict",
+        lambda *_args, **_kwargs: [{
+            "id": "m1",
+            "role": "user",
+            "source": "model_api",
+            "content_type": "text",
+            "body": "hello recap",
+            "owner_user_id": "usr_plain",
+        }],
+    )
+    monkeypatch.setattr(
+        turn.core_envelope.enclave,
+        "_decrypt_envelope_via_enclave",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("plaintext recap must not call enclave")
+        ),
+    )
+
+    messages, warnings = turn._model_api_recent_recap_chat(store, None)
+
+    assert len(messages) == 1
+    assert messages[0]["role"] == "user"
+    assert messages[0]["content"] == "hello recap"
+    assert warnings == []

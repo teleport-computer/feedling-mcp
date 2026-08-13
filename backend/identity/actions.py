@@ -15,6 +15,7 @@ from bootstrap import gates as boot_gates
 from core import util as core_util
 from core import enclave as core_enclave
 from core import envelope as core_envelope
+from identity import card_view
 from identity import service as identity_service
 
 def _identity_action_text(value, max_chars: int) -> str:
@@ -223,6 +224,24 @@ def apply_list_ops(existing: dict, patch: dict) -> dict:
 
 def _identity_plain_for_action(store: UserStore, api_key: str | None,
                                runtime_token: str = "") -> tuple[dict | None, str]:
+    stored = identity_service._load_identity(store)
+    shape = core_envelope.classify_envelope_shape(stored)
+    if shape in ("plaintext_text", "plaintext_binary"):
+        try:
+            raw = core_envelope.read_plaintext_envelope_body(
+                stored, owner_user_id=store.user_id)
+            inner = json.loads(raw.decode("utf-8"))
+            if not isinstance(inner, dict):
+                raise ValueError("identity plaintext is not an object")
+            return card_view.plaintext_view(
+                card_view.envelope_base(stored),
+                inner,
+                stored,
+                days_with_user=identity_service._live_days_with_user(
+                    stored, store=store),
+            ), ""
+        except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+            return None, f"identity_plaintext_invalid:{type(exc).__name__}"
     # Only pass runtime_token when present, so the api_key path keeps the original
     # 2-arg call shape (mocks/monkeypatches that predate the runtime_token param).
     if runtime_token:

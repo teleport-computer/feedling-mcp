@@ -2955,6 +2955,11 @@ def get_decrypted_history(
               (may be empty if no new messages).
       None  — no source configured, or all configured sources failed.
     """
+    handled, local_result = _fetch_plaintext_or_mixed_history(
+        since, limit, include_image_body=include_image_body)
+    if handled:
+        return local_result
+
     if FEEDLING_ENCLAVE_URL:
         result = _fetch_from_enclave(since, limit, include_image_body=include_image_body)
         if result is not None:
@@ -2962,6 +2967,98 @@ def get_decrypted_history(
         log.warning("enclave source failed")
 
     return None  # no configured source succeeded
+
+
+def _fetch_plaintext_or_mixed_history(
+    since: float,
+    limit: int,
+    *,
+    include_image_body: bool,
+) -> tuple[bool, list[dict] | None]:
+    """Use backend rows when a page contains plaintext; decrypt sealed rows one-by-one.
+
+    ``handled=False`` means the page is entirely sealed and the existing bulk
+    enclave path remains the efficient path. Once plaintext is present, the
+    bulk endpoint is forbidden because it would forward that plaintext page to
+    enclave along with the sealed rows.
+    """
+    params: dict = {"limit": limit, "since": since}
+    if not include_image_body:
+        params["include_image_body"] = "false"
+    try:
+        resp = _HTTP.get(
+            f"{FEEDLING_API_URL}/v1/chat/history",
+            params=params,
+            headers=_HEADERS,
+            timeout=20,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        rows = data.get("messages") or data.get("history") or []
+    except Exception as exc:
+        log.warning("backend history shape probe failed: %s", exc)
+        return False, None
+    if not isinstance(rows, list):
+        return False, None
+
+    def _shape(row: dict) -> str:
+        if row.get("body_ct"):
+            return "sealed"
+        if row.get("body_b64") is not None:
+            return "plaintext_binary"
+        if isinstance(row.get("body"), str):
+            return "plaintext_text"
+        return "invalid"
+
+    if not any(isinstance(row, dict) and _shape(row).startswith("plaintext") for row in rows):
+        return False, None
+
+    out: list[dict] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        shape = _shape(row)
+        if shape == "sealed":
+            message_id = str(row.get("id") or row.get("message_id") or "")
+            decrypted = _fetch_message_body_from_enclave(message_id)
+            if decrypted is None:
+                out.append({**row, "body_unavailable": True})
+            else:
+                out.append({**row, **decrypted})
+            continue
+        if shape == "plaintext_text":
+            out.append({**row, "content": str(row.get("body") or "")})
+            continue
+        if shape == "plaintext_binary":
+            ctype = str(row.get("content_type") or "")
+            key = "file_b64" if ctype == "file" else "image_b64"
+            out.append({**row, key: str(row.get("body_b64") or "")})
+            continue
+        if row.get("body_omitted") and row.get("body_size_bytes") is not None:
+            message_id = str(row.get("id") or row.get("message_id") or "")
+            try:
+                body_resp = _HTTP.get(
+                    f"{FEEDLING_API_URL}/v1/chat/messages/"
+                    f"{urllib.parse.quote(message_id, safe='')}/body",
+                    headers=_HEADERS,
+                    timeout=20,
+                )
+                body_resp.raise_for_status()
+                full = (body_resp.json() or {}).get("message")
+            except Exception:
+                full = None
+            if isinstance(full, dict):
+                merged = {**row, **full}
+                ctype = str(merged.get("content_type") or "")
+                if merged.get("body_b64") is not None:
+                    merged["file_b64" if ctype == "file" else "image_b64"] = str(
+                        merged.get("body_b64") or "")
+                elif isinstance(merged.get("body"), str):
+                    merged["content"] = merged["body"]
+                out.append(merged)
+                continue
+        out.append({**row, "body_unavailable": True})
+    return True, _filter_since(out, since)
 
 
 def _fetch_message_body_from_enclave(message_id: str) -> dict | None:
