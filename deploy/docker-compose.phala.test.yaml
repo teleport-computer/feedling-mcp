@@ -486,7 +486,7 @@ services:
       retries: 3
 
   cpu-recorder:
-    image: ghcr.io/teleport-computer/feedling:0294e5b
+    image: ghcr.io/teleport-computer/feedling:43a6a98
     container_name: cpu-recorder
     command: ["python", "-u", "ops/cpu_recorder.py"]
     restart: unless-stopped
