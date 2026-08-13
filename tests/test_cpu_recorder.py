@@ -181,14 +181,18 @@ def test_docker_client_uses_only_allowlisted_unversioned_gets():
     ]
 
 
-def test_docker_client_falls_back_to_percpu_count():
+@pytest.mark.parametrize("online_cpus", [None, 0])
+def test_docker_client_falls_back_to_positive_percpu_count(online_cpus):
+    cpu_stats = {
+        "cpu_usage": {"total_usage": 40, "percpu_usage": [1, 2, 3, 4]},
+        "system_cpu_usage": 200,
+    }
+    if online_cpus is not None:
+        cpu_stats["online_cpus"] = online_cpus
     fake_urlopen = _FakeUrlOpen(
         [
             {
-                "cpu_stats": {
-                    "cpu_usage": {"total_usage": 40, "percpu_usage": [1, 2, 3, 4]},
-                    "system_cpu_usage": 200,
-                }
+                "cpu_stats": cpu_stats
             }
         ]
     )
@@ -359,7 +363,7 @@ class _SequenceDockerClient:
         }
         self.list_results = iter(list_results) if list_results is not None else None
 
-    def list_running_containers(self):
+    def list_running_containers(self, timeout_sec=None):
         if self.list_results is None:
             return list(self.refs)
         result = next(self.list_results)
@@ -367,7 +371,7 @@ class _SequenceDockerClient:
             raise result
         return list(result)
 
-    def read_cpu_snapshot(self, container_id):
+    def read_cpu_snapshot(self, container_id, timeout_sec=None):
         result = next(self.snapshots[container_id])
         if isinstance(result, BaseException):
             raise result
@@ -540,6 +544,54 @@ def test_recorder_timeout_does_not_replace_baseline_and_next_samples_recover(
     assert "url-secret" not in captured.err
 
 
+def test_recorder_bounds_all_docker_reads_to_one_cycle_timeout(tmp_path, capsys):
+    class _Clock:
+        now = 0.0
+
+        def monotonic(self):
+            return self.now
+
+    class _BudgetClient:
+        def __init__(self, clock):
+            self.clock = clock
+            self.timeouts = []
+            self.refs = [
+                ContainerRef("a" * 64, "first"),
+                ContainerRef("b" * 64, "second"),
+            ]
+
+        def list_running_containers(self, timeout_sec=None):
+            self.timeouts.append(timeout_sec)
+            self.clock.now += 3.0
+            return self.refs
+
+        def read_cpu_snapshot(self, container_id, timeout_sec=None):
+            self.timeouts.append(timeout_sec)
+            self.clock.now += timeout_sec
+            raise TimeoutError("bounded")
+
+    proc_root = tmp_path / "proc"
+    data_dir = tmp_path / "history"
+    data_dir.mkdir()
+    _write_proc(proc_root, 350)
+    clock = _Clock()
+    client = _BudgetClient(clock)
+    recorder = CpuRecorder(
+        client,
+        proc_root,
+        DailyCsvStore(data_dir, "test"),
+        docker_cycle_timeout_sec=10.0,
+        docker_monotonic_fn=clock.monotonic,
+    )
+
+    assert recorder.sample_once(datetime(2026, 8, 13, tzinfo=timezone.utc)) is False
+    assert client.timeouts == [10.0, 7.0]
+    assert clock.now == 10.0
+    assert capsys.readouterr().err == (
+        "cpu_recorder_container_sample_failed error=TimeoutError\n"
+    )
+
+
 def test_invalid_proc_sample_keeps_last_good_host_baseline(tmp_path, capsys):
     proc_root = tmp_path / "proc"
     data_dir = tmp_path / "history"
@@ -632,10 +684,22 @@ def test_main_rejects_unmeasured_numeric_override(monkeypatch, tmp_path, capsys)
     assert capsys.readouterr().err == "cpu_recorder_startup_failed error=ValueError\n"
 
 
-def test_main_accepts_measured_defaults_and_runs_recorder(monkeypatch, tmp_path):
-    calls = []
+def test_main_rejects_missing_host_proc_files(monkeypatch, tmp_path, capsys):
     monkeypatch.setenv("CPU_RECORDER_CVM_NAME", "feedling-io-test")
     monkeypatch.setenv("CPU_RECORDER_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("CPU_RECORDER_PROC_ROOT", str(tmp_path / "missing-proc"))
+
+    assert main() == 2
+    assert capsys.readouterr().err == "cpu_recorder_startup_failed error=ValueError\n"
+
+
+def test_main_accepts_measured_defaults_and_runs_recorder(monkeypatch, tmp_path):
+    calls = []
+    proc_root = tmp_path / "proc"
+    _write_proc(proc_root, 350)
+    monkeypatch.setenv("CPU_RECORDER_CVM_NAME", "feedling-io-test")
+    monkeypatch.setenv("CPU_RECORDER_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("CPU_RECORDER_PROC_ROOT", str(proc_root))
     monkeypatch.setattr(CpuRecorder, "run_forever", lambda self: calls.append(self))
 
     assert main() == 0
@@ -643,3 +707,4 @@ def test_main_accepts_measured_defaults_and_runs_recorder(monkeypatch, tmp_path)
     assert calls[0].interval_sec == 60.0
     assert calls[0].store.retention_days == 30
     assert calls[0].client._timeout_sec == 10.0
+    assert calls[0].docker_cycle_timeout_sec == 10.0

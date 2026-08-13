@@ -182,16 +182,21 @@ class DockerStatsClient:
         self._timeout_sec = timeout_sec
         self._urlopen = urlopen_fn
 
-    def _get_json(self, path: str) -> Any:
+    def _get_json(self, path: str, timeout_sec: float | None = None) -> Any:
+        timeout = self._timeout_sec if timeout_sec is None else timeout_sec
+        if timeout <= 0:
+            raise TimeoutError("docker_cycle_timeout")
         request = Request(f"{self._base_url}{path}", method="GET")
         try:
-            with self._urlopen(request, timeout=self._timeout_sec) as response:
+            with self._urlopen(request, timeout=timeout) as response:
                 return json.load(response)
         except (json.JSONDecodeError, UnicodeDecodeError) as exc:
             raise ValueError("invalid_docker_response") from exc
 
-    def list_running_containers(self) -> list[ContainerRef]:
-        payload = self._get_json("/containers/json?all=0")
+    def list_running_containers(
+        self, timeout_sec: float | None = None
+    ) -> list[ContainerRef]:
+        payload = self._get_json("/containers/json?all=0", timeout_sec)
         if not isinstance(payload, list):
             raise ValueError("invalid_docker_response")
         refs: list[ContainerRef] = []
@@ -214,11 +219,13 @@ class DockerStatsClient:
             refs.append(ContainerRef(container_id=container_id, name=name))
         return refs
 
-    def read_cpu_snapshot(self, container_id: str) -> ContainerCpuSnapshot:
+    def read_cpu_snapshot(
+        self, container_id: str, timeout_sec: float | None = None
+    ) -> ContainerCpuSnapshot:
         if not _CONTAINER_ID_RE.fullmatch(container_id):
             raise ValueError("invalid_container_id")
         payload = self._get_json(
-            f"/containers/{container_id}/stats?stream=false"
+            f"/containers/{container_id}/stats?stream=false", timeout_sec
         )
         try:
             cpu_stats = payload["cpu_stats"]
@@ -226,8 +233,23 @@ class DockerStatsClient:
             total_ns = cpu_usage["total_usage"]
             system_ns = cpu_stats["system_cpu_usage"]
             online_cpus = cpu_stats.get("online_cpus")
-            if online_cpus is None:
+            if online_cpus is None or (
+                isinstance(online_cpus, int)
+                and not isinstance(online_cpus, bool)
+                and online_cpus <= 0
+            ):
                 percpu_usage = cpu_usage["percpu_usage"]
+                if (
+                    not isinstance(percpu_usage, list)
+                    or not percpu_usage
+                    or any(
+                        isinstance(value, bool)
+                        or not isinstance(value, int)
+                        or value < 0
+                        for value in percpu_usage
+                    )
+                ):
+                    raise ValueError("invalid_docker_response")
                 online_cpus = len(percpu_usage)
         except (KeyError, TypeError) as exc:
             raise ValueError("invalid_docker_response") from exc
@@ -351,8 +373,10 @@ class CpuRecorder:
         proc_root: Path,
         store: DailyCsvStore,
         interval_sec: float = 60.0,
+        docker_cycle_timeout_sec: float = 10.0,
         *,
         monotonic_fn: Callable[[], float] = time.monotonic,
+        docker_monotonic_fn: Callable[[], float] = time.monotonic,
         sleep_fn: Callable[[float], None] = time.sleep,
         now_fn: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
     ) -> None:
@@ -360,7 +384,9 @@ class CpuRecorder:
         self.proc_root = Path(proc_root)
         self.store = store
         self.interval_sec = interval_sec
+        self.docker_cycle_timeout_sec = docker_cycle_timeout_sec
         self._monotonic = monotonic_fn
+        self._docker_monotonic = docker_monotonic_fn
         self._sleep = sleep_fn
         self._now = now_fn
         self._previous_host: HostCounters | None = None
@@ -393,14 +419,24 @@ class CpuRecorder:
     def sample_once(self, now_utc: datetime) -> bool:
         try:
             current_host, logical_cpus, loads = self._read_host()
-            refs = self.client.list_running_containers()
+            docker_deadline = (
+                self._docker_monotonic() + self.docker_cycle_timeout_sec
+            )
+            refs = self.client.list_running_containers(
+                timeout_sec=self._docker_remaining(docker_deadline)
+            )
             current_containers: dict[str, ContainerCpuSnapshot] = {}
             usages: list[ContainerCpuUsage] = []
             for ref in refs:
                 try:
-                    snapshot = self.client.read_cpu_snapshot(ref.container_id)
+                    snapshot = self.client.read_cpu_snapshot(
+                        ref.container_id,
+                        timeout_sec=self._docker_remaining(docker_deadline),
+                    )
                 except Exception as exc:
                     self._error("cpu_recorder_container_sample_failed", exc)
+                    if self._docker_monotonic() >= docker_deadline:
+                        break
                     continue
                 current_containers[ref.container_id] = snapshot
                 previous = self._previous_containers.get(ref.container_id)
@@ -439,6 +475,12 @@ class CpuRecorder:
             self._error("cpu_recorder_sample_failed", exc)
             return False
 
+    def _docker_remaining(self, deadline: float) -> float:
+        remaining = deadline - self._docker_monotonic()
+        if remaining <= 0:
+            raise TimeoutError("docker_cycle_timeout")
+        return min(self.docker_cycle_timeout_sec, remaining)
+
     def run_forever(self) -> None:
         deadline = self._monotonic()
         while True:
@@ -472,12 +514,20 @@ def main() -> int:
         interval = _fixed_numeric_env("CPU_RECORDER_INTERVAL_SEC", "60")
         retention = int(_fixed_numeric_env("CPU_RECORDER_RETENTION_DAYS", "30"))
         timeout = _fixed_numeric_env("CPU_RECORDER_DOCKER_TIMEOUT_SEC", "10")
+        if (
+            not proc_root.is_absolute()
+            or not proc_root.is_dir()
+            or not (proc_root / "stat").is_file()
+            or not (proc_root / "loadavg").is_file()
+        ):
+            raise ValueError("invalid_cpu_recorder_config")
         store = DailyCsvStore(data_dir, cvm_name, retention_days=retention)
         recorder = CpuRecorder(
             DockerStatsClient(docker_url, timeout_sec=timeout),
             proc_root,
             store,
             interval_sec=interval,
+            docker_cycle_timeout_sec=timeout,
         )
     except (KeyError, TypeError, ValueError, OSError) as exc:
         CpuRecorder._error("cpu_recorder_startup_failed", exc)

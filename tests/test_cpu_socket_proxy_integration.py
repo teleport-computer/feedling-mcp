@@ -135,6 +135,10 @@ def test_socket_proxy_allows_only_cpu_recorder_reads():
             == 200
         )
         assert (
+            _container_status(target, "GET", f"{base_url}/containers/json?all=0")
+            == 403
+        )
+        assert (
             _container_status(
                 client,
                 "GET",
