@@ -5832,6 +5832,40 @@ def _trace_user_mcp_wiring(cmd: list[str], *, trace_id: str, lane: str) -> None:
 # or the day the CLI ships a new state every user with MCP goes red at once.
 _MCP_INIT_HARD_FAILURES = frozenset({"failed", "needs-auth", "absent", "error"})
 
+# claude's own built-in for blocking on a still-connecting MCP server. Present
+# in the runner's pinned 2.1.195 and in 2.1.217 (read off the init event's
+# `tools` list; `sdk-tools.d.ts` lists it in neither, so that file cannot be
+# used to decide this). The chat prompt points the model at it —
+# see _prepend_user_mcp_wait_hint.
+_CLAUDE_WAIT_TOOL = "WaitForMcpServers"
+
+
+def _wait_outcome(block: dict) -> str:
+    """Classify one WaitForMcpServers tool_result: ready / not_ready / error.
+
+    Measured result shapes (claude 2.1.217, deepseek):
+      success → ``ready: true\\nConnected (their tools are now available …): x``
+      failure → is_error, ``ready: false\\nUnknown (no MCP server with this
+                name is configured): x`` (model guessed a name we never wired)
+
+    Deliberately coarse. This exists to answer three questions in aggregate —
+    did the model try, did trying work, is it looping — not to reproduce
+    claude's wording, which is upstream text we do not control. Anything
+    unrecognised is ``not_ready`` rather than a new bucket: an unknown shape is
+    "we have no evidence it worked", the same fail-closed rule the verdict
+    ladder above uses for unrecognised init states."""
+    if block.get("is_error"):
+        return "error"
+    content = block.get("content")
+    if isinstance(content, list):
+        text = " ".join(
+            str(part.get("text") or "")
+            for part in content if isinstance(part, dict)
+        )
+    else:
+        text = str(content or "")
+    return "ready" if "ready: true" in text.lower() else "not_ready"
+
 
 def _trace_user_mcp_registered(raw: str, cmd: list[str], *,
                                trace_id: str, lane: str,
@@ -5903,6 +5937,14 @@ def _trace_user_mcp_registered(raw: str, cmd: list[str], *,
     call_ok: set[str] = set()      # servers with at least one successful call
     call_err: set[str] = set()     # servers whose call came back is_error
     pending_use: dict[str, str] = {}   # tool_use_id -> server, awaiting its result
+    # claude's own WaitForMcpServers, which the chat prompt now points the model
+    # at (_prepend_user_mcp_wait_hint). Counted here because "did the hint work"
+    # is otherwise unanswerable in prod: a turn with no MCP call looks identical
+    # whether the model never tried, waited and timed out, or waited in a loop.
+    # This is the single input that decides whether the prompt is enough or the
+    # local proxy (spec §6 plan B) has to be built.
+    wait_uses: set[str] = set()        # tool_use_ids of WaitForMcpServers calls
+    wait_outcomes: list[str] = []      # ready | not_ready | error, in order
     for obj in _json_objects_from_cli_output(raw):
         if not isinstance(obj, dict):
             continue
@@ -5919,6 +5961,10 @@ def _trace_user_mcp_registered(raw: str, cmd: list[str], *,
             call_ok.clear()
             call_err.clear()
             pending_use.clear()
+            # Same last-init-wins rule: a retried attempt's waits belong to the
+            # process that no longer describes this turn.
+            wait_uses.clear()
+            wait_outcomes.clear()
             continue
         content = (obj.get("message") or {}).get("content")
         if not isinstance(content, list):
@@ -5938,12 +5984,20 @@ def _trace_user_mcp_registered(raw: str, cmd: list[str], *,
                 # sit here claimed the opposite — asserted, never checked
                 # against the rule (codex 审出).
                 name = str(block.get("name") or "")
+                if name == _CLAUDE_WAIT_TOOL:
+                    wait_uses.add(str(block.get("id") or ""))
+                    continue
                 for srv in expected_by_length:
                     if name.startswith(f"mcp__{srv}__"):
                         pending_use[str(block.get("id") or "")] = srv
                         break
             elif btype == "tool_result":
-                server = pending_use.pop(str(block.get("tool_use_id") or ""), "")
+                use_id = str(block.get("tool_use_id") or "")
+                if use_id in wait_uses:
+                    wait_uses.discard(use_id)
+                    wait_outcomes.append(_wait_outcome(block))
+                    continue
+                server = pending_use.pop(use_id, "")
                 if not server:
                     continue
                 (call_err if block.get("is_error") else call_ok).add(server)
@@ -6021,6 +6075,14 @@ def _trace_user_mcp_registered(raw: str, cmd: list[str], *,
             "init_status": {k: v for k, v in list(init_status.items())[:20]},
             "verdict": {k: verdict[k] for k in expected[:20]},
             "called_ok": sorted(call_ok)[:20], "called_error": sorted(call_err)[:20],
+            # Did the wait hint actually change behaviour this turn? Content-free
+            # counts only. `wait_count` is what catches the failure mode Codex
+            # flagged — a weak model re-waiting in a loop — and a high
+            # attempted-rate on turns whose verdicts were all `ok` is what would
+            # catch the other one: waiting on turns that never needed MCP.
+            "wait_attempted": bool(wait_outcomes),
+            "wait_count": len(wait_outcomes),
+            "wait_outcomes": wait_outcomes[:10],
             # Which CLI attempt this describes. A turn can emit several; the
             # last one is the process that produced the reply.
             "attempt": attempt,
