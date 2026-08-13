@@ -50,6 +50,7 @@ COPY backend/requirements-v2-worker.lock ./requirements-v2-worker.lock
 RUN pip install --require-hashes -r requirements.lock -r requirements-v2-worker.lock
 
 COPY backend/ ./backend/
+COPY ops/ ./ops/
 
 # Release metadata — baked at build time, read at runtime by
 # backend/enclave_app.py and served inside /attestation.enclave_release
@@ -67,8 +68,8 @@ ENV FEEDLING_GIT_COMMIT=${FEEDLING_GIT_COMMIT} \
 # Run as a fixed non-root UID so bind-mounted volumes on the host can be
 # chowned predictably.
 RUN useradd --system --uid 1000 --home-dir /home/feedling --create-home feedling \
- && mkdir -p /data /tls \
- && chown -R feedling:feedling /data /tls /app
+ && mkdir -p /data /tls /var/lib/feedling-cpu \
+ && chown -R feedling:feedling /data /tls /var/lib/feedling-cpu /app
 USER feedling
 
 EXPOSE 5001 9998

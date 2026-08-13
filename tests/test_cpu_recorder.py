@@ -2,18 +2,28 @@ from __future__ import annotations
 
 import io
 import json
+import csv
+from datetime import date, datetime, timezone
+from pathlib import Path
 
 import pytest
 
 from ops.cpu_recorder import (
     ContainerCpuSnapshot,
+    ContainerCpuUsage,
     ContainerRef,
+    CpuRecorder,
+    CSV_FIELDS,
+    DailyCsvStore,
     DockerStatsClient,
     HostCounters,
+    HostCpuUsage,
+    SampleBatch,
     calculate_container_usage,
     calculate_host_usage,
     parse_logical_cpu_count,
     parse_proc_stat,
+    main,
 )
 
 
@@ -230,3 +240,406 @@ def test_docker_client_rejects_malformed_stats_without_leaking_payload():
 
     assert str(caught.value) == "invalid_docker_response"
     assert secret_marker not in str(caught.value)
+
+
+def _sample_batch(*containers):
+    return SampleBatch(
+        timestamp_utc=datetime(2026, 8, 13, 6, 7, 8, tzinfo=timezone.utc),
+        host=HostCpuUsage(busy_pct=40.0, idle_pct=55.0, iowait_pct=5.0),
+        host_logical_cpus=8,
+        loads=(4.1, 3.9, 3.5),
+        containers=tuple(containers),
+    )
+
+
+def test_daily_csv_store_writes_stable_schema_and_one_row_per_container(tmp_path):
+    store = DailyCsvStore(tmp_path, "feedling-io-test")
+    batch = _sample_batch(
+        ContainerCpuUsage("a" * 64, "backend", 2.5, 31.25),
+        ContainerCpuUsage("b" * 64, "serve-worker", 0.25, 3.125),
+    )
+
+    path = store.append(batch)
+    store.append(batch)
+
+    assert path == tmp_path / "cpu-2026-08-13.csv"
+    with path.open(newline="", encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle))
+        assert tuple(handle.seek(0) or next(csv.reader(handle))) == CSV_FIELDS
+    assert len(rows) == 4
+    assert rows[0] == {
+        "timestamp_utc": "2026-08-13T06:07:08Z",
+        "cvm_name": "feedling-io-test",
+        "host_logical_cpus": "8",
+        "host_cpu_busy_pct": "40.000000",
+        "host_cpu_idle_pct": "55.000000",
+        "host_cpu_iowait_pct": "5.000000",
+        "load1": "4.100000",
+        "load5": "3.900000",
+        "load15": "3.500000",
+        "container_id": "a" * 64,
+        "container_name": "backend",
+        "container_cpu_cores": "2.500000",
+        "container_cpu_capacity_pct": "31.250000",
+    }
+
+
+def test_daily_csv_store_writes_host_only_row_when_no_container_delta(tmp_path):
+    path = DailyCsvStore(tmp_path, "feedling-enclave-v2").append(_sample_batch())
+
+    with path.open(newline="", encoding="utf-8") as handle:
+        row = next(csv.DictReader(handle))
+
+    assert row["cvm_name"] == "feedling-enclave-v2"
+    assert row["container_id"] == ""
+    assert row["container_name"] == ""
+    assert row["container_cpu_cores"] == ""
+    assert row["container_cpu_capacity_pct"] == ""
+
+
+def test_daily_csv_store_escapes_container_names(tmp_path):
+    path = DailyCsvStore(tmp_path, "feedling-io-test").append(
+        _sample_batch(ContainerCpuUsage("c" * 64, 'worker,"quoted"', 1.0, 12.5))
+    )
+
+    with path.open(newline="", encoding="utf-8") as handle:
+        row = next(csv.DictReader(handle))
+
+    assert row["container_name"] == 'worker,"quoted"'
+
+
+def test_daily_csv_store_prunes_only_exact_files_before_oldest_kept_day(tmp_path):
+    old = tmp_path / "cpu-2026-07-14.csv"
+    oldest_kept = tmp_path / "cpu-2026-07-15.csv"
+    today = tmp_path / "cpu-2026-08-13.csv"
+    ignored = [
+        tmp_path / "notes.txt",
+        tmp_path / "cpu-bad.csv",
+        tmp_path / "cpu-2026-07-13.csv.gz",
+    ]
+    for path in [old, oldest_kept, today, *ignored]:
+        path.write_text("sample\n")
+    directory = tmp_path / "cpu-2026-07-01.csv"
+    directory.mkdir()
+    symlink = tmp_path / "cpu-2026-07-02.csv"
+    symlink.symlink_to(oldest_kept)
+    store = DailyCsvStore(tmp_path, "feedling-io-test")
+
+    deleted = store.prune(date(2026, 8, 13))
+
+    assert deleted == [old]
+    assert not old.exists()
+    assert oldest_kept.exists()
+    assert today.exists()
+    assert all(path.exists() for path in ignored)
+    assert directory.is_dir()
+    assert symlink.is_symlink()
+
+
+@pytest.mark.parametrize(
+    ("path_factory", "cvm_name"),
+    [
+        (lambda tmp: Path("relative"), "feedling-io-test"),
+        (lambda tmp: Path("/"), "feedling-io-test"),
+        (lambda tmp: tmp / "missing", "feedling-io-test"),
+        (lambda tmp: tmp, "bad/name"),
+        (lambda tmp: tmp, ""),
+    ],
+)
+def test_daily_csv_store_rejects_unsafe_paths_and_names(tmp_path, path_factory, cvm_name):
+    with pytest.raises(ValueError, match="invalid_cpu_history_config"):
+        DailyCsvStore(path_factory(tmp_path), cvm_name)
+
+
+class _SequenceDockerClient:
+    def __init__(self, refs, snapshots, list_results=None):
+        self.refs = refs
+        self.snapshots = {
+            container_id: iter(values) for container_id, values in snapshots.items()
+        }
+        self.list_results = iter(list_results) if list_results is not None else None
+
+    def list_running_containers(self):
+        if self.list_results is None:
+            return list(self.refs)
+        result = next(self.list_results)
+        if isinstance(result, BaseException):
+            raise result
+        return list(result)
+
+    def read_cpu_snapshot(self, container_id):
+        result = next(self.snapshots[container_id])
+        if isinstance(result, BaseException):
+            raise result
+        return result
+
+
+def _write_proc(proc_root, total_user, idle=600, iowait=50):
+    proc_root.mkdir(exist_ok=True)
+    (proc_root / "stat").write_text(
+        f"cpu {total_user} 0 0 {idle} {iowait} 0 0 0\n"
+        "cpu0 1 0 0 1 0 0 0 0\n"
+        "cpu1 1 0 0 1 0 0 0 0\n"
+    )
+    (proc_root / "loadavg").write_text("1.25 2.50 3.75 1/100 42\n")
+
+
+def _read_csv_rows(data_dir):
+    paths = sorted(data_dir.glob("cpu-*.csv"))
+    if not paths:
+        return []
+    with paths[-1].open(newline="", encoding="utf-8") as handle:
+        return list(csv.DictReader(handle))
+
+
+def test_recorder_first_sample_baselines_and_second_writes_stable_containers(tmp_path):
+    proc_root = tmp_path / "proc"
+    data_dir = tmp_path / "history"
+    data_dir.mkdir()
+    _write_proc(proc_root, 350)
+    ref = ContainerRef("a" * 64, "backend")
+    client = _SequenceDockerClient(
+        [ref],
+        {
+            ref.container_id: [
+                ContainerCpuSnapshot(1000, 10_000, 2),
+                ContainerCpuSnapshot(1100, 10_400, 2),
+            ]
+        },
+    )
+    recorder = CpuRecorder(
+        client,
+        proc_root,
+        DailyCsvStore(data_dir, "feedling-io-test"),
+    )
+
+    assert recorder.sample_once(datetime(2026, 8, 13, tzinfo=timezone.utc)) is False
+    assert _read_csv_rows(data_dir) == []
+    _write_proc(proc_root, 430, idle=700, iowait=70)
+    assert recorder.sample_once(
+        datetime(2026, 8, 13, 0, 1, tzinfo=timezone.utc)
+    ) is True
+
+    rows = _read_csv_rows(data_dir)
+    assert len(rows) == 1
+    assert rows[0]["host_logical_cpus"] == "2"
+    assert rows[0]["container_name"] == "backend"
+    assert rows[0]["container_cpu_cores"] == "0.500000"
+    assert rows[0]["container_cpu_capacity_pct"] == "25.000000"
+
+
+def test_recorder_new_container_waits_for_its_second_snapshot(tmp_path):
+    proc_root = tmp_path / "proc"
+    data_dir = tmp_path / "history"
+    data_dir.mkdir()
+    first_ref = ContainerRef("a" * 64, "backend")
+    new_ref = ContainerRef("b" * 64, "serve-worker")
+    client = _SequenceDockerClient(
+        [],
+        {
+            first_ref.container_id: [
+                ContainerCpuSnapshot(100, 1000, 2),
+                ContainerCpuSnapshot(200, 1400, 2),
+                ContainerCpuSnapshot(300, 1800, 2),
+            ],
+            new_ref.container_id: [
+                ContainerCpuSnapshot(50, 1400, 2),
+                ContainerCpuSnapshot(100, 1800, 2),
+            ],
+        },
+        list_results=[[first_ref], [first_ref, new_ref], [first_ref, new_ref]],
+    )
+    recorder = CpuRecorder(client, proc_root, DailyCsvStore(data_dir, "test"))
+
+    _write_proc(proc_root, 350)
+    recorder.sample_once(datetime(2026, 8, 13, tzinfo=timezone.utc))
+    _write_proc(proc_root, 430, idle=700, iowait=70)
+    recorder.sample_once(datetime(2026, 8, 13, 0, 1, tzinfo=timezone.utc))
+    assert [row["container_name"] for row in _read_csv_rows(data_dir)] == ["backend"]
+    _write_proc(proc_root, 510, idle=800, iowait=90)
+    recorder.sample_once(datetime(2026, 8, 13, 0, 2, tzinfo=timezone.utc))
+
+    assert [row["container_name"] for row in _read_csv_rows(data_dir)] == [
+        "backend",
+        "backend",
+        "serve-worker",
+    ]
+
+
+def test_recorder_container_failure_keeps_valid_peers_and_hides_error_detail(
+    tmp_path, capsys
+):
+    proc_root = tmp_path / "proc"
+    data_dir = tmp_path / "history"
+    data_dir.mkdir()
+    good = ContainerRef("a" * 64, "backend")
+    bad = ContainerRef("b" * 64, "secret-container")
+    client = _SequenceDockerClient(
+        [good, bad],
+        {
+            good.container_id: [
+                ContainerCpuSnapshot(100, 1000, 2),
+                ContainerCpuSnapshot(200, 1400, 2),
+            ],
+            bad.container_id: [
+                ContainerCpuSnapshot(50, 1000, 2),
+                RuntimeError("payload-must-not-leak"),
+            ],
+        },
+    )
+    recorder = CpuRecorder(client, proc_root, DailyCsvStore(data_dir, "test"))
+
+    _write_proc(proc_root, 350)
+    recorder.sample_once(datetime(2026, 8, 13, tzinfo=timezone.utc))
+    _write_proc(proc_root, 430, idle=700, iowait=70)
+    assert recorder.sample_once(
+        datetime(2026, 8, 13, 0, 1, tzinfo=timezone.utc)
+    ) is True
+
+    assert [row["container_name"] for row in _read_csv_rows(data_dir)] == ["backend"]
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == "cpu_recorder_container_sample_failed error=RuntimeError\n"
+    assert "payload-must-not-leak" not in captured.err
+    assert "secret-container" not in captured.err
+
+
+def test_recorder_timeout_does_not_replace_baseline_and_next_samples_recover(
+    tmp_path, capsys
+):
+    proc_root = tmp_path / "proc"
+    data_dir = tmp_path / "history"
+    data_dir.mkdir()
+    ref = ContainerRef("a" * 64, "backend")
+    client = _SequenceDockerClient(
+        [],
+        {
+            ref.container_id: [
+                ContainerCpuSnapshot(100, 1000, 2),
+                ContainerCpuSnapshot(200, 1400, 2),
+            ]
+        },
+        list_results=[TimeoutError("url-secret"), [ref], [ref]],
+    )
+    recorder = CpuRecorder(client, proc_root, DailyCsvStore(data_dir, "test"))
+
+    _write_proc(proc_root, 350)
+    assert recorder.sample_once(datetime(2026, 8, 13, tzinfo=timezone.utc)) is False
+    _write_proc(proc_root, 430, idle=700, iowait=70)
+    assert recorder.sample_once(
+        datetime(2026, 8, 13, 0, 1, tzinfo=timezone.utc)
+    ) is False
+    _write_proc(proc_root, 510, idle=800, iowait=90)
+    assert recorder.sample_once(
+        datetime(2026, 8, 13, 0, 2, tzinfo=timezone.utc)
+    ) is True
+
+    assert len(_read_csv_rows(data_dir)) == 1
+    captured = capsys.readouterr()
+    assert captured.err == "cpu_recorder_sample_failed error=TimeoutError\n"
+    assert "url-secret" not in captured.err
+
+
+def test_invalid_proc_sample_keeps_last_good_host_baseline(tmp_path, capsys):
+    proc_root = tmp_path / "proc"
+    data_dir = tmp_path / "history"
+    data_dir.mkdir()
+    client = _SequenceDockerClient([], {})
+    recorder = CpuRecorder(client, proc_root, DailyCsvStore(data_dir, "test"))
+
+    _write_proc(proc_root, 350)
+    recorder.sample_once(datetime(2026, 8, 13, tzinfo=timezone.utc))
+    (proc_root / "stat").write_text("broken\n")
+    assert recorder.sample_once(
+        datetime(2026, 8, 13, 0, 1, tzinfo=timezone.utc)
+    ) is False
+    _write_proc(proc_root, 510, idle=800, iowait=90)
+    assert recorder.sample_once(
+        datetime(2026, 8, 13, 0, 2, tzinfo=timezone.utc)
+    ) is True
+
+    assert len(_read_csv_rows(data_dir)) == 1
+    assert capsys.readouterr().err == "cpu_recorder_sample_failed error=ValueError\n"
+
+
+def test_recorder_prunes_once_on_startup_and_each_utc_day_change(tmp_path):
+    class _SpyStore(DailyCsvStore):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.prune_calls = []
+
+        def prune(self, today_utc):
+            self.prune_calls.append(today_utc)
+            return super().prune(today_utc)
+
+    proc_root = tmp_path / "proc"
+    data_dir = tmp_path / "history"
+    data_dir.mkdir()
+    _write_proc(proc_root, 350)
+    store = _SpyStore(data_dir, "test")
+    recorder = CpuRecorder(_SequenceDockerClient([], {}), proc_root, store)
+
+    recorder.sample_once(datetime(2026, 8, 13, tzinfo=timezone.utc))
+    _write_proc(proc_root, 430, idle=700, iowait=70)
+    recorder.sample_once(datetime(2026, 8, 13, 23, 59, tzinfo=timezone.utc))
+    _write_proc(proc_root, 510, idle=800, iowait=90)
+    recorder.sample_once(datetime(2026, 8, 14, tzinfo=timezone.utc))
+
+    assert store.prune_calls == [date(2026, 8, 13), date(2026, 8, 14)]
+
+
+def test_run_forever_uses_monotonic_deadlines_and_skips_missed_intervals(tmp_path):
+    proc_root = tmp_path / "proc"
+    data_dir = tmp_path / "history"
+    data_dir.mkdir()
+    _write_proc(proc_root, 350)
+    monotonic_values = iter([0.0, 5.0, 130.0])
+    sleep_calls = []
+
+    def fake_sleep(seconds):
+        sleep_calls.append(seconds)
+        if len(sleep_calls) == 2:
+            raise StopIteration
+
+    recorder = CpuRecorder(
+        _SequenceDockerClient([], {}),
+        proc_root,
+        DailyCsvStore(data_dir, "test"),
+        monotonic_fn=lambda: next(monotonic_values),
+        sleep_fn=fake_sleep,
+        now_fn=lambda: datetime(2026, 8, 13, tzinfo=timezone.utc),
+    )
+
+    with pytest.raises(StopIteration):
+        recorder.run_forever()
+
+    assert sleep_calls == [55.0, 50.0]
+
+
+def test_main_rejects_missing_cvm_name(monkeypatch, capsys):
+    monkeypatch.delenv("CPU_RECORDER_CVM_NAME", raising=False)
+
+    assert main() == 2
+    assert capsys.readouterr().err == "cpu_recorder_startup_failed error=KeyError\n"
+
+
+def test_main_rejects_unmeasured_numeric_override(monkeypatch, tmp_path, capsys):
+    monkeypatch.setenv("CPU_RECORDER_CVM_NAME", "feedling-io-test")
+    monkeypatch.setenv("CPU_RECORDER_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("CPU_RECORDER_INTERVAL_SEC", "61")
+
+    assert main() == 2
+    assert capsys.readouterr().err == "cpu_recorder_startup_failed error=ValueError\n"
+
+
+def test_main_accepts_measured_defaults_and_runs_recorder(monkeypatch, tmp_path):
+    calls = []
+    monkeypatch.setenv("CPU_RECORDER_CVM_NAME", "feedling-io-test")
+    monkeypatch.setenv("CPU_RECORDER_DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(CpuRecorder, "run_forever", lambda self: calls.append(self))
+
+    assert main() == 0
+    assert len(calls) == 1
+    assert calls[0].interval_sec == 60.0
+    assert calls[0].store.retention_days == 30
+    assert calls[0].client._timeout_sec == 10.0
