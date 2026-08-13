@@ -11,6 +11,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).parent.parent / "backend"))
 from model_api_runtime.v2 import prompt_frontier as frontier
 from model_api_runtime.v2 import tool_loop
 import provider_client
+from capabilities import tool_schema
 from provider_types import ToolCall, ToolExchange, ToolResult, ToolSpec
 
 
@@ -22,6 +23,52 @@ def _model_limit(context_window_tokens: int = 2_048) -> frontier.ModelPromptLimi
         source="deployment_override",
         override_key="test:test-model",
     )
+
+
+_REAL_TOOL_COUNT = 69
+_REAL_TOOL_CATALOG_BYTES = 32_684
+
+
+def _real_sized_mixed_tool_catalog() -> tuple[list[ToolSpec], list[ToolSpec]]:
+    """34-ish platform tools + user MCP, matching the captured production size.
+
+    The fixture is derived from the real platform catalog rather than copying a
+    toy schema list. ASCII description padding makes the combined canonical
+    payload exactly 32,684 bytes while keeping 69 independently named tools.
+    """
+    platform = list(tool_schema.build_tool_specs())
+    mcp_count = _REAL_TOOL_COUNT - len(platform)
+    assert mcp_count > 0, "platform catalog outgrew the captured 69-tool surface"
+
+    def mcp_specs(description_lengths: list[int]) -> list[ToolSpec]:
+        return [
+            ToolSpec(
+                name=f"mcp__boundary__search_{index:02d}",
+                description="d" * description_length,
+                parameters={
+                    "type": "object",
+                    "properties": {"query": {"type": "string"}},
+                },
+            )
+            for index, description_length in enumerate(description_lengths)
+        ]
+
+    empty_mcp = mcp_specs([0] * mcp_count)
+    base_bytes = len(frontier.canonical_json(platform + empty_mcp).encode("utf-8"))
+    padding = _REAL_TOOL_CATALOG_BYTES - base_bytes
+    assert padding >= 0, "real platform schemas alone exceed captured fixture size"
+    each, remainder = divmod(padding, mcp_count)
+    mcp = mcp_specs([
+        each + (1 if index < remainder else 0)
+        for index in range(mcp_count)
+    ])
+    combined = platform + mcp
+    assert len(combined) == _REAL_TOOL_COUNT
+    assert (
+        len(frontier.canonical_json(combined).encode("utf-8"))
+        == _REAL_TOOL_CATALOG_BYTES
+    )
+    return platform, mcp
 
 
 def test_known_model_uses_audited_family_lower_bound():
@@ -321,6 +368,51 @@ def test_non_ascii_schema_bytes_never_inherit_ascii_calibration():
     )
 
 
+def test_large_cjk_tool_catalog_keeps_every_non_ascii_byte_conservative():
+    tools = [
+        ToolSpec(
+            f"mcp__calendar__lookup_{index}",
+            "查询日历安排和提醒" * 40,
+            {
+                "type": "object",
+                "properties": {"查询": {"type": "string"}},
+            },
+        )
+        for index in range(69)
+    ]
+    rendered = frontier.canonical_json(tools).encode("utf-8")
+    non_ascii_bytes = sum(byte >= 0x80 for byte in rendered)
+    estimate = frontier.tool_schemas_component(tools).estimated_tokens
+    wrapper_reserve = (
+        len(tools) * frontier.TOOL_SCHEMA_STRUCTURAL_OVERHEAD_TOKENS
+    )
+
+    assert non_ascii_bytes > 0
+    assert estimate - wrapper_reserve >= non_ascii_bytes
+
+
+def test_schema_wrapper_reserve_covers_every_current_provider_wire_shape():
+    platform, mcp = _real_sized_mixed_tool_catalog()
+    tools = platform + mcp
+    canonical_bytes = len(frontier.canonical_json(tools).encode("utf-8"))
+    reserved_wrapper_bytes = math.floor(
+        len(tools)
+        * frontier.TOOL_SCHEMA_STRUCTURAL_OVERHEAD_TOKENS
+        * frontier.TOOL_SCHEMA_UTF8_BYTES_PER_TOKEN
+    )
+    provider_shapes = {
+        "openai_chat": provider_client._encode_tools_openai_chat(tools),
+        "openai_responses": provider_client._encode_tools_openai_responses(tools),
+        "anthropic": provider_client._encode_tools_anthropic(tools),
+        "bedrock": provider_client._encode_tools_bedrock(tools),
+        "gemini": provider_client._encode_tools_gemini(tools),
+    }
+
+    for provider, shape in provider_shapes.items():
+        wire_bytes = len(frontier.canonical_json(shape).encode("utf-8"))
+        assert wire_bytes <= canonical_bytes + reserved_wrapper_bytes, provider
+
+
 def test_schema_calibration_keeps_ascii_catalog_inside_real_small_window():
     """The text estimator must not be reused for ASCII-heavy tool schemas.
 
@@ -512,10 +604,21 @@ def test_tool_transcript_is_indivisible_instead_of_partially_admitted():
 
 
 def test_optional_tool_catalog_is_omitted_whole_and_reported():
+    budget = frontier.build_prompt_budget(
+        _model_limit().context_window_tokens,
+        output_reserve_tokens=128,
+        safety_margin_tokens=128,
+    )
+    overflow_bytes = int(
+        budget.input_budget_tokens * frontier.TOOL_SCHEMA_UTF8_BYTES_PER_TOKEN
+    ) + 1_024
     tools = [
         {
             "type": "function",
-            "function": {"name": "large_tool", "description": "z" * 6_000},
+            "function": {
+                "name": "large_tool",
+                "description": "z" * overflow_bytes,
+            },
         }
     ]
     plan = frontier.plan_prompt(
@@ -942,6 +1045,71 @@ def test_fourteen_mcp_catalog_pressure_reaches_provider_with_memory_floor(
     assert surface["mcp_dropped_tool_count"] == 1
     assert surface["reason"] == "frontier_omitted"
     assert calls[0][0] == [{"role": "system", "content": "stable prefix"}]
+
+
+@pytest.mark.parametrize(
+    "context_window_tokens",
+    [16_384, 32_768, 40_000, 128_000],
+)
+def test_real_sized_mixed_catalog_reaches_provider_at_common_window_boundaries(
+    monkeypatch,
+    context_window_tokens,
+):
+    """A production-sized catalog must not turn into a text-only request.
+
+    The captured failure had 69 tools / 32,684 canonical UTF-8 bytes. Previous
+    fixtures used a handful of tiny schemas, so the atomic omission branch was
+    never reached. This assertion is at the final provider exit: accounting a
+    catalog upstream does not count if ``tool_loop`` later sends ``tools=None``.
+    """
+    platform, mcp = _real_sized_mixed_tool_catalog()
+    calls = []
+
+    async def provider(_config, _messages, *, tools=None, **_kwargs):
+        calls.append(tools)
+        return {"reply": "ok", "tool_calls": [], "usage": {}}
+
+    async def fold():
+        return []
+
+    async def on_file_reply(_path, _revision):
+        return None
+
+    async def on_image_reply(_args):
+        return ()
+
+    outcome = _run_loop(
+        monkeypatch=monkeypatch,
+        provider=provider,
+        fold=fold,
+        build_messages=lambda transcript: [
+            {"role": "system", "content": "stable prefix"},
+            {"role": "user", "content": "use my connected tools"},
+            *transcript,
+        ],
+        provider_config=provider_client.ProviderConfig(
+            "custom",
+            f"boundary-{context_window_tokens}",
+            "key",
+            "https://relay.example/v1",
+            context_window_tokens=context_window_tokens,
+        ),
+        extra_tool_specs=mcp,
+        on_file_reply=on_file_reply,
+        on_image_reply=on_image_reply,
+    )
+
+    assert outcome.final_text == "ok"
+    assert len(calls) == 1
+    offered = calls[0]
+    assert offered is not None, (
+        f"{context_window_tokens}-token route silently dropped the complete "
+        f"{_REAL_TOOL_COUNT}-tool surface"
+    )
+    offered_names = {spec.name for spec in offered}
+    assert len(offered) == _REAL_TOOL_COUNT
+    assert {spec.name for spec in platform} <= offered_names
+    assert {spec.name for spec in mcp} <= offered_names
 
 
 def test_adaptive_round_reports_tail_window_to_metrics_and_trajectory(monkeypatch):
