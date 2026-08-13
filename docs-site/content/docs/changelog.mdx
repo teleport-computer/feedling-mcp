@@ -10,6 +10,13 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **Hosted Runtime V2 removes leaked tool-call markup from visible replies.**
+  A closed set of XML-like function-call markers, including singular/plural
+  forms and optional namespace prefixes, is stripped before foreground or
+  proactive text is delivered. Normal angle-bracket text, HTML examples, and
+  fenced code remain unchanged. Useful text beside a leaked block is preserved,
+  and a reply wrapped entirely inside tool markup keeps its payload.
+
 - **Runtime V2 no longer falls back to raw provider chain-of-thought while
   self-authored thinking is enabled.** Chat and proactive replies show io's
   bounded `<think>` summary when present; otherwise the reply has no thinking
@@ -18,7 +25,6 @@ change must not be interpreted as an API guarantee.
   self-hosted operators. A content-free per-turn diagnostic records only the
   selected branch, character count, model name, and lane; it never includes the
   thinking text or a fragment of it.
-
 - **Runtime V2 can search multiple memory subjects in one Chat turn.** Distinct
   `memory_search` queries are now dispatched independently, including when the
   model requests them in one batch; an exact repeated query still reuses its

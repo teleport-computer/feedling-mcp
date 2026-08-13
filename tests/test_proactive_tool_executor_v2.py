@@ -266,6 +266,45 @@ def test_send_message_drops_internal_protocol_fragments_before_adapter():
     assert sent == []
 
 
+def test_send_message_strips_tool_markup_before_adapter():
+    sent = []
+    executor = ToolExecutorV2(
+        adapters=_adapters(
+            send_message=lambda user_id, text, args: sent.append(
+                (user_id, text, dict(args))
+            )
+            or {"message_id": "m1"}
+        )
+    )
+
+    result = executor.execute(
+        ToolCallV2(
+            "send_message",
+            user_id="u1",
+            args={
+                "text": (
+                    '<parameter name="tool_name">send_message</parameter>\n'
+                    "宝宝，中午了。"
+                )
+            },
+        )
+    )
+
+    assert result.ok is True
+    assert sent == [
+        (
+            "u1",
+            "宝宝，中午了。",
+            {
+                "text": (
+                    '<parameter name="tool_name">send_message</parameter>\n'
+                    "宝宝，中午了。"
+                )
+            },
+        )
+    ]
+
+
 def test_unavailable_tools_are_not_masked_by_budget_handoff():
     executor = ToolExecutorV2(adapters=_adapters(), budget=ToolBudgetV2(slow_inline_limit=0))
 

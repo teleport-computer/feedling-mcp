@@ -676,6 +676,104 @@ def test_foreground_keeps_user_json_talk_without_reasoning(monkeypatch):
     assert [b["body_ct"] for b in _bubbles(uid)] == [user_json_talk]
 
 
+def test_foreground_real_chain_strips_tool_markup_and_emits_content_free_trace(
+    monkeypatch,
+):
+    """Production chain: provider text -> worker._on_reply -> durable bubble."""
+    uid = "u_toolloop_tool_markup_leak"
+    conftest.seed_user(uid)
+    _reset(uid)
+    jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("w-tool-markup")
+    _patch_real_write(monkeypatch)
+    leaked = (
+        '<parameter name="tool_name">reply</parameter>\n'
+        "好，棋先停着\n你要干嘛去了"
+    )
+    _script_provider(monkeypatch, [_text_round(leaked)])
+    traces = []
+    deps = _deps(
+        messages=[{"id": "m1", "ts": 10.0, "role": "user", "content": "先停一下"}]
+    )
+    deps.emit_debug_trace = lambda *args, **kwargs: traces.append((args, kwargs))
+
+    status = asyncio.run(
+        worker.process_job(
+            job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"
+        )
+    )
+
+    assert status == "completed"
+    assert [bubble["body_ct"] for bubble in _bubbles(uid)] == [
+        "好，棋先停着\n你要干嘛去了"
+    ]
+    sanitized = [item for item in traces if item[0][1] == "agent.reply.sanitized"]
+    assert len(sanitized) == 1
+    assert sanitized[0][1]["detail"] == {
+        "lane": "chat",
+        "final": True,
+        "error_class": "upstream_unavailable",
+        "reason": "tool_markup_leak_sanitized",
+    }
+
+
+def test_foreground_markup_only_reply_uses_existing_fallback(monkeypatch):
+    uid = "u_toolloop_tool_markup_only"
+    conftest.seed_user(uid)
+    _reset(uid)
+    jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("w-tool-markup-only")
+    _patch_real_write(monkeypatch)
+    _script_provider(monkeypatch, [_text_round("<tool_call></tool_call>")])
+
+    status = asyncio.run(
+        worker.process_job(
+            job,
+            _deps(messages=[{"id": "m1", "ts": 10.0, "role": "user", "content": "在吗"}]),
+            provider_config=_BYOK,
+            api_key=None,
+            runtime_token="rt",
+        )
+    )
+
+    assert status == "completed"
+    bubble = _bubbles(uid)[0]
+    assert bubble["body_ct"] == worker._DEGENERATE_REPLY_FALLBACK
+    assert bubble["turn_failure_error_class"] == "upstream_unavailable"
+
+
+def test_foreground_wrapped_reply_payload_is_not_lost(monkeypatch):
+    uid = "u_toolloop_wrapped_reply_payload"
+    conftest.seed_user(uid)
+    _reset(uid)
+    jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("w-wrapped-reply")
+    _patch_real_write(monkeypatch)
+    _script_provider(
+        monkeypatch,
+        [
+            _text_round(
+                '<antml:invoke name="reply"><antml:parameter name="text">'
+                "真正的回复内容"
+                "</antml:parameter></antml:invoke>"
+            )
+        ],
+    )
+
+    status = asyncio.run(
+        worker.process_job(
+            job,
+            _deps(messages=[{"id": "m1", "ts": 10.0, "role": "user", "content": "继续"}]),
+            provider_config=_BYOK,
+            api_key=None,
+            runtime_token="rt",
+        )
+    )
+
+    assert status == "completed"
+    assert [bubble["body_ct"] for bubble in _bubbles(uid)] == ["真正的回复内容"]
+
+
 def test_chat_intermediate_reply_tool_tail_with_reasoning_suppressed(monkeypatch):
     """Codex code-review #1: an intermediate `reply` tool call carrying a torn
     tail, with the head in the round's reasoning, must not produce a leaked
