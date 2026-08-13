@@ -11,6 +11,7 @@ from provider_types import ProviderResponse, ToolExchange, ToolResult
 from capabilities import registry as cap_registry
 from capabilities import result_budget
 from capabilities import tool_schema
+from core import protocol_leak
 from model_api_runtime.v2 import prompt_frontier
 from model_api_runtime.v2 import provenance
 import provider_client
@@ -1311,8 +1312,14 @@ async def run_tool_loop(
             raise provider_error
         _progress("provider_complete")
         add_usage(result.get("usage"))
+        upstream_response_envelope = protocol_leak.is_upstream_response_envelope(
+            result.get("reply")
+        )
         raw_has_usable_output = bool(
-            str(result.get("reply") or "").strip()
+            (
+                str(result.get("reply") or "").strip()
+                and not upstream_response_envelope
+            )
             or result.get("tool_calls")
             or result.get("media")
         )
@@ -1350,12 +1357,13 @@ async def run_tool_loop(
 
         if (
             require_reply
-            and not pr.text.strip()
+            and (not pr.text.strip() or upstream_response_envelope)
             and not pr.tool_calls
             and not pr.media
         ):
             semantic_empty = bool(
-                str(pr.raw.get("reasoning") or "").strip()
+                upstream_response_envelope
+                or str(pr.raw.get("reasoning") or "").strip()
                 or str(pr.raw.get("stop_reason") or "").strip()
             )
             can_correct = (
@@ -1367,7 +1375,11 @@ async def run_tool_loop(
                 "empty_provider_response",
                 {
                     "round": attempts,
-                    "reason": "empty_provider_success",
+                    "reason": (
+                        "upstream_response_envelope"
+                        if upstream_response_envelope
+                        else "empty_provider_success"
+                    ),
                     "response_shape": _empty_response_shape(pr),
                     "action": (
                         "semantic_correction"

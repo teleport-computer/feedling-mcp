@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import json
 import sys
 from pathlib import Path
 
@@ -617,6 +618,18 @@ def test_degenerate_intermediate_is_dropped_before_real_final_reply(monkeypatch)
 # One envelope torn at the channel boundary.
 _TORN_HEAD = '{"messages":[],"actions":[{"type":"pro'
 _TORN_TAIL = 'active.sleep","reason":"7点了 还在睡 不打扰了 醒了会找我"}]}'
+_UPSTREAM_RESPONSE_ENVELOPE = json.dumps(
+    {
+        "response": {
+            "candidates": [{"content": {}}],
+            "usageMetadata": {"totalTokenCount": 24515},
+            "modelVersion": "gemini-3-flash",
+            "responseId": "response-id",
+        },
+        "traceId": "trace-id",
+        "metadata": {},
+    }
+)
 
 
 def test_torn_protocol_tail_with_reasoning_head_becomes_fallback(monkeypatch):
@@ -824,6 +837,45 @@ def test_chat_intermediate_reply_tool_tail_with_reasoning_suppressed(monkeypatch
     assert bubbles == ["在的，怎么了"]
 
 
+def test_chat_intermediate_reply_tool_upstream_envelope_is_suppressed(monkeypatch):
+    """The final-effect guard also covers a relay wrapper inside reply(text=...)."""
+    uid = "u_toolloop_upstream_envelope_intermediate"
+    conftest.seed_user(uid)
+    _reset(uid)
+    jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("w-upstream-envelope-mid")
+    monkeypatch.setattr(
+        cap_registry,
+        "run_capability",
+        lambda action_type, store, **kwargs: _FakeCapResult({"snippet": "r"}),
+    )
+    _patch_real_write(monkeypatch)
+    _script_provider(
+        monkeypatch,
+        [
+            _tool_round(
+                _tc("r1", "reply", text=_UPSTREAM_RESPONSE_ENVELOPE),
+                _tc("s1", "web_search", query="x"),
+            ),
+            _text_round("在的，怎么了"),
+        ],
+    )
+    deps = _deps(
+        messages=[{"id": "m1", "ts": 10.0, "role": "user", "content": "在吗"}]
+    )
+
+    status = asyncio.run(
+        worker.process_job(
+            job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"
+        )
+    )
+
+    assert status == "completed"
+    bubbles = [bubble["body_ct"] for bubble in _bubbles(uid)]
+    assert _UPSTREAM_RESPONSE_ENVELOPE not in bubbles
+    assert bubbles == ["在的，怎么了"]
+
+
 def test_torn_protocol_evidence_lane_policy():
     """Pure-unit: the worker's lane-policy helper. Proactive suppresses any leak;
     foreground only strong cross-channel evidence."""
@@ -833,6 +885,13 @@ def test_torn_protocol_evidence_lane_policy():
     # Strong: head in reasoning rejoins to a complete envelope.
     assert worker._torn_protocol_evidence(_TORN_TAIL, _TORN_HEAD, lane="proactive")
     assert worker._torn_protocol_evidence(_TORN_TAIL, _TORN_HEAD, lane="foreground")
+    # A complete provider transport wrapper is strong without reasoning evidence.
+    assert worker._torn_protocol_evidence(
+        _UPSTREAM_RESPONSE_ENVELOPE, "", lane="proactive"
+    )
+    assert worker._torn_protocol_evidence(
+        _UPSTREAM_RESPONSE_ENVELOPE, "", lane="foreground"
+    )
     # Normal reply: never suppressed.
     assert not worker._torn_protocol_evidence("晚安，做个好梦", "在想她累不累", lane="proactive")
     assert not worker._torn_protocol_evidence("晚安，做个好梦", "", lane="foreground")

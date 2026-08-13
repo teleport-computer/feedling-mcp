@@ -10,6 +10,13 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **Hosted Runtime V2 no longer exposes serialized provider response wrappers
+  as assistant text.** A complete relay envelope containing Gemini response
+  metadata and a transport trace ID is treated as content-free provider output,
+  retried once with a bounded correction, and never delivered to foreground or
+  proactive reply surfaces. Ordinary JSON answers and code examples remain
+  unchanged.
+
 - **Hosted Runtime V2 removes leaked tool-call markup from visible replies.**
   A closed set of XML-like function-call markers, including singular/plural
   forms and optional namespace prefixes, is stripped before foreground or

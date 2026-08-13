@@ -48,6 +48,7 @@ E2E_KEY_DEEPSEEK=sk-…
 | `temporal_probe.py` | 模型真的读到了注入的时间锚点 | 动 V2 上下文组装时 |
 | `turn_failure_smoke.py` | 回合失败的字段/归责能下发到客户端 | 动错误分类或 consumer 兜底时 |
 | `resident_maintenance_smoke.py` | resident 识别/poll/notice/genesis claim | 动 consumer 这几条时 |
+| `provider_response_envelope_probe.py` | 上游完整响应包装器不会进入 V2 气泡，且只触发一次有界纠正 | 动 provider 回复解析、V2 tool loop 或最终回复闸时 |
 
 `repeat_wake_probe` 的两个坑（写新探针时同样适用）：
 - `/v1/proactive/scheduled/fire` **只触发已到期的**（`due_at <= now`），
@@ -88,6 +89,16 @@ materials 抖动。共同点:只在「真 provider + 多帧观察」下暴露。
 **合并前也能跑**:client 放行 `127.0.0.1`,配合本机 `serve_dev` + dev-seed
 enclave 可以在分支上先真跑一遍(见 docs/testing/TESTING.md 的本地全栈配方),
 再合 test。
+
+完整 provider 响应包专项探针还需要同一数据库上的 V2 worker；三项服务启动后运行：
+
+```bash
+python3 tools/e2e/provider_response_envelope_probe.py
+```
+
+它在本机临时启动 OpenAI-compatible provider stub：setup 测活返回正常文本，
+首个真实聊天回合返回现场截图的 Gemini relay 包，第二回合只返回恢复标记。真实
+HTTP、队列、worker、信封加解密与账号清理均不替换。
 
 **中转站要测两家**:不同中转站 `/models` 的目录格式差异很大(带日期后缀 /
 带方括号标签 / 裸名),推荐链路只测一家不够 —— `relay-openai-compatible`
