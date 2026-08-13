@@ -261,7 +261,11 @@ def model_api_chat_send_core(
         user_plaintext = file_parse["bytes"]
     else:
         user_plaintext = message.encode("utf-8")
-    user_env, env_err = core_envelope._build_shared_envelope_for_store(store, user_plaintext)
+    user_env, env_err = core_envelope._build_shared_envelope_for_store(
+        store,
+        user_plaintext,
+        content_kind="binary" if (has_image or has_file) else "text",
+    )
     if user_env is None:
         return {"error": "user_message_envelope_failed", "detail": env_err}, 409
     # A supported provider enters the unified V2 loop; reject before persistence
@@ -468,7 +472,11 @@ def _send_resident(
         user_plaintext = file_parse["bytes"]
     else:
         user_plaintext = message.encode("utf-8")
-    user_env, env_err = core_envelope._build_shared_envelope_for_store(store, user_plaintext)
+    user_env, env_err = core_envelope._build_shared_envelope_for_store(
+        store,
+        user_plaintext,
+        content_kind="binary" if (has_image or has_file) else "text",
+    )
     if user_env is None:
         return {"error": "user_message_envelope_failed", "detail": env_err}, 409
     # 收口：配了 fit provider 即托管到 agent-runner，否则 409。

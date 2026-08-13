@@ -21,6 +21,7 @@ B 类（凭证）的特殊处理经用户 2026-07-29 拍板取消，40 处统一
 from __future__ import annotations
 
 import os
+import base64
 import sys
 import uuid
 
@@ -103,6 +104,29 @@ def test_plaintext_tier_rejects_non_utf8_body(store, monkeypatch):
     out, err = core_envelope._build_shared_envelope_for_store(store, b"\xff\xfe")
 
     assert out is None and err == "plaintext_body_not_utf8"
+
+
+def test_plaintext_tier_binary_body_uses_base64_shape(store, monkeypatch):
+    """Callers that own binary content can request the existing binary shape."""
+    _prefer(monkeypatch, "off")
+    raw = b"\xff\x00%PDF"
+
+    out, err = core_envelope._build_shared_envelope_for_store(
+        store,
+        raw,
+        content_kind="binary",
+    )
+
+    assert err == "", err
+    assert out is not None
+    assert set(out) == {
+        "body_b64", "body_size_bytes", "id", "owner_user_id", "visibility",
+    }
+    assert base64.b64decode(out["body_b64"], validate=True) == raw
+    assert out["body_size_bytes"] == len(raw)
+    assert out["owner_user_id"] == store.user_id
+    assert out["visibility"] == "shared"
+    assert "body" not in out and "body_ct" not in out
 
 
 def _wire_assembly(monkeypatch):

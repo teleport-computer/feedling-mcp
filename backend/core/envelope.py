@@ -348,9 +348,20 @@ def _build_shared_envelope_for_store(
     plaintext: bytes,
     *,
     item_id: str | None = None,
+    content_kind: str = "text",
 ) -> tuple[dict | None, str]:
+    if content_kind not in {"text", "binary"}:
+        return None, "content_kind_invalid"
     if resolve_content_encryption(store.user_id) == "off":
         # 明文档：不取 enclave 公钥，因此 enclave 故障不连坐明文档用户的写入。
+        if content_kind == "binary":
+            return {
+                "body_b64": base64.b64encode(plaintext).decode("ascii"),
+                "body_size_bytes": len(plaintext),
+                "id": item_id or content_encryption.random_item_id(),
+                "owner_user_id": store.user_id,
+                "visibility": "shared",
+            }, ""
         try:
             body = plaintext.decode("utf-8")
         except UnicodeDecodeError:
