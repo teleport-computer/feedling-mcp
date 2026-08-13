@@ -1408,6 +1408,151 @@ def test_same_batch_duplicate_memory_discovery_dispatches_only_once(monkeypatch)
     assert outcome.final_text == "direct answer"
 
 
+def test_memory_search_dispatches_different_queries_across_rounds(monkeypatch):
+    provider = _ScriptedProvider([
+        {
+            "reply": "",
+            "tool_calls": [
+                {"id": "m1", "name": "memory_search", "args": {"query": "生日"}}
+            ],
+            "usage": {},
+        },
+        {
+            "reply": "",
+            "tool_calls": [
+                {"id": "m2", "name": "memory_search", "args": {"query": "工作"}}
+            ],
+            "usage": {},
+        },
+        {"reply": "direct answer", "tool_calls": [], "usage": {}},
+    ])
+    monkeypatch.setattr(provider_client, "chat_completion_async", provider)
+    dispatch = _RecordingDispatch("matching memory")
+
+    outcome = asyncio.run(tool_loop.run_tool_loop(
+        provider_config=_TEST_PROVIDER_CONFIG,
+        build_messages=_RecordingBuildMessages(),
+        dispatch_tools=dispatch,
+        on_reply=_RecordingReply(),
+        fold_new_messages=_RecordingFold([[], []]),
+        add_usage=_noop_add_usage,
+        max_calls=4,
+    ))
+
+    assert [[tc.id for tc in batch] for batch in dispatch.calls] == [["m1"], ["m2"]]
+    assert outcome.final_text == "direct answer"
+
+
+def test_same_batch_memory_search_dispatches_different_queries(monkeypatch):
+    provider = _ScriptedProvider([
+        {
+            "reply": "",
+            "tool_calls": [
+                {"id": "m1", "name": "memory_search", "args": {"query": "生日"}},
+                {"id": "m2", "name": "memory_search", "args": {"query": "工作"}},
+            ],
+            "usage": {},
+        },
+        {"reply": "direct answer", "tool_calls": [], "usage": {}},
+    ])
+    monkeypatch.setattr(provider_client, "chat_completion_async", provider)
+    dispatch = _RecordingDispatch("matching memory")
+
+    outcome = asyncio.run(tool_loop.run_tool_loop(
+        provider_config=_TEST_PROVIDER_CONFIG,
+        build_messages=_RecordingBuildMessages(),
+        dispatch_tools=dispatch,
+        on_reply=_RecordingReply(),
+        fold_new_messages=_RecordingFold([[]]),
+        add_usage=_noop_add_usage,
+        max_calls=3,
+    ))
+
+    assert [[tc.id for tc in batch] for batch in dispatch.calls] == [["m1", "m2"]]
+    assert outcome.final_text == "direct answer"
+
+
+def test_memory_search_reuses_same_query_across_rounds(monkeypatch):
+    provider = _ScriptedProvider([
+        {
+            "reply": "",
+            "tool_calls": [
+                {
+                    "id": "m1",
+                    "name": "memory_search",
+                    "args": {"query": "生日", "limit": 5},
+                }
+            ],
+            "usage": {},
+        },
+        {
+            "reply": "",
+            "tool_calls": [
+                {
+                    "id": "m2",
+                    "name": "memory_search",
+                    "args": {"limit": 5, "query": "生日"},
+                }
+            ],
+            "usage": {},
+        },
+        {"reply": "direct answer", "tool_calls": [], "usage": {}},
+    ])
+    monkeypatch.setattr(provider_client, "chat_completion_async", provider)
+    dispatch = _RecordingDispatch("matching memory")
+    build_messages = _RecordingBuildMessages()
+
+    outcome = asyncio.run(tool_loop.run_tool_loop(
+        provider_config=_TEST_PROVIDER_CONFIG,
+        build_messages=build_messages,
+        dispatch_tools=dispatch,
+        on_reply=_RecordingReply(),
+        fold_new_messages=_RecordingFold([[], []]),
+        add_usage=_noop_add_usage,
+        max_calls=4,
+    ))
+
+    assert [[tc.id for tc in batch] for batch in dispatch.calls] == [["m1"]]
+    repeated_exchange = build_messages.calls[2][-1]
+    assert isinstance(repeated_exchange, ToolExchange)
+    assert repeated_exchange.results[0].call_id == "m2"
+    assert "already completed" in repeated_exchange.results[0].content
+    assert outcome.final_text == "direct answer"
+
+
+def test_same_batch_memory_search_reuses_same_query(monkeypatch):
+    provider = _ScriptedProvider([
+        {
+            "reply": "",
+            "tool_calls": [
+                {"id": "m1", "name": "memory_search", "args": {"query": "生日"}},
+                {"id": "m2", "name": "memory_search", "args": {"query": "生日"}},
+            ],
+            "usage": {},
+        },
+        {"reply": "direct answer", "tool_calls": [], "usage": {}},
+    ])
+    monkeypatch.setattr(provider_client, "chat_completion_async", provider)
+    dispatch = _RecordingDispatch("matching memory")
+    build_messages = _RecordingBuildMessages()
+
+    outcome = asyncio.run(tool_loop.run_tool_loop(
+        provider_config=_TEST_PROVIDER_CONFIG,
+        build_messages=build_messages,
+        dispatch_tools=dispatch,
+        on_reply=_RecordingReply(),
+        fold_new_messages=_RecordingFold([[]]),
+        add_usage=_noop_add_usage,
+        max_calls=3,
+    ))
+
+    assert [[tc.id for tc in batch] for batch in dispatch.calls] == [["m1"]]
+    exchange = build_messages.calls[1][-1]
+    assert [result.call_id for result in exchange.results] == ["m1", "m2"]
+    assert "already completed" in exchange.results[1].content
+    assert outcome.final_text == "direct answer"
+
+
 def test_openrouter_file_recovery_forces_write_then_send_file(monkeypatch):
     provider = _ScriptedProvider([
         {"reply": "# draft", "tool_calls": [], "usage": {}},

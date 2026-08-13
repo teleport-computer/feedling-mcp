@@ -19,6 +19,11 @@ change must not be interpreted as an API guarantee.
   selected branch, character count, model name, and lane; it never includes the
   thinking text or a fragment of it.
 
+- **Runtime V2 can search multiple memory subjects in one Chat turn.** Distinct
+  `memory_search` queries are now dispatched independently, including when the
+  model requests them in one batch; an exact repeated query still reuses its
+  prior result, and the once-per-turn `memory_index` overview is unchanged.
+
 - **Managed Phala deployments can retain bounded CPU history.** The measured
   test and production CVM topology records one-minute host and container CPU
   samples in a private persistent volume for 30 UTC calendar days. A narrowly

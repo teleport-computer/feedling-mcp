@@ -107,6 +107,29 @@ def _catalog():
     return _CATALOG
 
 
+def _memory_discovery_call_key(tool_call) -> tuple[str, str] | None:
+    """Return the per-turn deduplication key for a memory discovery call.
+
+    ``memory_index`` remains a once-per-turn overview regardless of filters.
+    ``memory_search`` may legitimately run more than once for different subjects,
+    so only an exact canonical-JSON argument match is repeated. Query whitespace
+    and case stay significant; normalizing either could merge distinct searches.
+    """
+    if tool_call.name == "memory_index":
+        return (tool_call.name, "")
+    if tool_call.name == "memory_search":
+        return (
+            tool_call.name,
+            json.dumps(
+                tool_call.args,
+                sort_keys=True,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ),
+        )
+    return None
+
+
 def _is_probably_tool_schema_rejection(exc: provider_client.ProviderError) -> bool:
     """Should a tools-enabled 400/422 be retried once WITHOUT tools?
 
@@ -669,7 +692,11 @@ async def run_tool_loop(
     file_delivery_fallback_reasoning = ""
     file_delivery_recovery_needed = False
     workspace_write_applied = False
+    # Names keep required schemas visible and completed discovery calls valid in
+    # native history. Exact call keys independently decide whether dispatch would
+    # repeat work; do not collapse these sets back into one name-only concept.
     completed_memory_discovery_tools: set[str] = set()
+    completed_memory_discovery_calls: set[tuple[str, str]] = set()
     outbound_blocking_reads = {
         str(name) for name in (outbound_blocking_read_tool_names or ()) if str(name)
     }
@@ -1596,18 +1623,19 @@ async def run_tool_loop(
         reply_results: dict[str, ToolResult] = {}
         repeated_memory_calls = []
         dispatch_calls = []
-        discovery_names_in_batch: set[str] = set()
+        discovery_calls_in_batch: set[tuple[str, str]] = set()
         for tc in other_calls:
-            repeated_discovery = (
-                tc.name in completed_memory_discovery_tools
-                or tc.name in discovery_names_in_batch
+            discovery_call_key = _memory_discovery_call_key(tc)
+            repeated_discovery = discovery_call_key is not None and (
+                discovery_call_key in completed_memory_discovery_calls
+                or discovery_call_key in discovery_calls_in_batch
             )
             if repeated_discovery:
                 repeated_memory_calls.append(tc)
                 continue
             dispatch_calls.append(tc)
-            if tc.name in _MEMORY_DISCOVERY_TOOLS:
-                discovery_names_in_batch.add(tc.name)
+            if discovery_call_key is not None:
+                discovery_calls_in_batch.add(discovery_call_key)
         for tc in repeated_memory_calls:
             await _tool_event(tc, "tool_call_started", {})
             repeated_result = ToolResult(
@@ -1845,9 +1873,11 @@ async def run_tool_loop(
                 allowed_fetch_urls.update(_search_result_urls(result.content))
             elif tc.name == "web_fetch":
                 allowed_fetch_urls.discard(str(tc.args.get("url") or "").strip())
-        completed_memory_discovery_tools.update(
-            tc.name for tc in dispatch_calls if tc.name in _MEMORY_DISCOVERY_TOOLS
-        )
+        for tc in dispatch_calls:
+            discovery_call_key = _memory_discovery_call_key(tc)
+            if discovery_call_key is not None:
+                completed_memory_discovery_tools.add(tc.name)
+                completed_memory_discovery_calls.add(discovery_call_key)
         if any(
             tc.name == "workspace_write"
             and str(ordered_results_by_id[tc.id].content).strip().lower().startswith("ok")
