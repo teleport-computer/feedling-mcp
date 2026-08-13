@@ -11,6 +11,7 @@ not the pytest-asyncio marker, to avoid a plugin-config dependency.
 from __future__ import annotations
 
 import asyncio
+import json
 import sys
 from pathlib import Path
 
@@ -475,6 +476,124 @@ def test_foreground_semantic_empty_response_gets_one_correction(monkeypatch):
     correction = provider.calls[1]["messages"][0]
     assert correction["role"] == "system"
     assert "Do not return a thinking-only response" in correction["content"]
+
+
+def test_serialized_upstream_response_envelope_gets_one_correction(monkeypatch):
+    """usr_90184: a relay serialized Gemini's whole body as visible text."""
+    leaked = json.dumps(
+        {
+            "response": {
+                "candidates": [{"content": {}}],
+                "usageMetadata": {
+                    "promptTokenCount": 23894,
+                    "totalTokenCount": 24515,
+                    "thoughtsTokenCount": 621,
+                },
+                "modelVersion": "gemini-3-flash",
+                "responseId": "OTV9aoyAI9ronsEPuOK1kAM",
+            },
+            "traceId": "491379ee31653ba7",
+            "metadata": {},
+        },
+        ensure_ascii=False,
+    )
+    provider = _ScriptedProvider(
+        [
+            {
+                "reply": leaked,
+                "reasoning": "",
+                "stop_reason": "",
+                "tool_calls": [],
+                "usage": {"prompt_tokens": 23894, "completion_tokens": 621},
+            },
+            {
+                "reply": "正常回复",
+                "reasoning": "",
+                "stop_reason": "end_turn",
+                "tool_calls": [],
+                "usage": {"completion_tokens": 8},
+            },
+        ]
+    )
+    monkeypatch.setattr(provider_client, "chat_completion_async", provider)
+    published = []
+    provider_successes = []
+    events = []
+
+    async def publish(text, *, final, reasoning=""):
+        published.append((text, final, reasoning))
+
+    async def on_provider_success():
+        provider_successes.append(True)
+
+    async def record(kind, payload):
+        events.append((kind, payload))
+
+    outcome = asyncio.run(
+        tool_loop.run_tool_loop(
+            provider_config=_TEST_PROVIDER_CONFIG,
+            build_messages=_AdaptiveBuildMessages(),
+            dispatch_tools=_RecordingDispatch(),
+            on_reply=publish,
+            fold_new_messages=_RecordingFold([]),
+            add_usage=_noop_add_usage,
+            max_calls=5,
+            on_provider_success=on_provider_success,
+            on_trajectory_event=record,
+        )
+    )
+
+    assert outcome.final_text == "正常回复"
+    assert published == [("正常回复", True, "")]
+    assert provider_successes == [True]
+    assert len(provider.calls) == 2
+    correction = provider.calls[1]["messages"][0]
+    assert "without visible text" in correction["content"]
+    empty_event = next(
+        payload for kind, payload in events if kind == "empty_provider_response"
+    )
+    assert empty_event["reason"] == "upstream_response_envelope"
+    assert empty_event["response_shape"]["has_visible_text"] is True
+    assert leaked not in str(empty_event)
+
+
+def test_repeated_upstream_response_envelope_fails_without_publishing(monkeypatch):
+    leaked = json.dumps(
+        {
+            "response": {
+                "candidates": [{"content": {}}],
+                "usageMetadata": {"totalTokenCount": 24515},
+                "modelVersion": "gemini-3-flash",
+                "responseId": "response-id",
+            },
+            "traceId": "trace-id",
+            "metadata": {},
+        }
+    )
+    provider = _ScriptedProvider(
+        [
+            {"reply": leaked, "tool_calls": [], "usage": {}},
+            {"reply": leaked, "tool_calls": [], "usage": {}},
+        ]
+    )
+    monkeypatch.setattr(provider_client, "chat_completion_async", provider)
+    published = _RecordingReply()
+
+    with pytest.raises(tool_loop.ProviderEmptyReply, match="empty_reply"):
+        asyncio.run(
+            tool_loop.run_tool_loop(
+                provider_config=_TEST_PROVIDER_CONFIG,
+                build_messages=_AdaptiveBuildMessages(),
+                dispatch_tools=_RecordingDispatch(),
+                on_reply=published,
+                fold_new_messages=_RecordingFold([[]]),
+                add_usage=_noop_add_usage,
+                max_calls=5,
+            )
+        )
+
+    assert len(provider.calls) == 2
+    assert published.calls == []
 
 
 def test_semantic_empty_correction_retains_real_tool_flow(monkeypatch):
