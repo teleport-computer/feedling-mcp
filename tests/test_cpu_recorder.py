@@ -592,6 +592,58 @@ def test_recorder_bounds_all_docker_reads_to_one_cycle_timeout(tmp_path, capsys)
     )
 
 
+def test_recorder_default_cycle_budget_handles_seven_delayed_containers(tmp_path):
+    class _Clock:
+        now = 0.0
+
+        def monotonic(self):
+            return self.now
+
+    class _DelayedClient:
+        timeout_sec = 10.0
+
+        def __init__(self, clock):
+            self.clock = clock
+            self.refs = [
+                ContainerRef(f"{index:064x}", f"container-{index}")
+                for index in range(1, 8)
+            ]
+            self.samples = 0
+
+        def list_running_containers(self, timeout_sec=None):
+            self.clock.now += 0.5
+            return self.refs
+
+        def read_cpu_snapshot(self, container_id, timeout_sec=None):
+            self.clock.now += 2.0
+            self.samples += 1
+            round_number = (self.samples - 1) // len(self.refs) + 1
+            total = round_number * 100
+            return ContainerCpuSnapshot(total, round_number * 400, 2)
+
+    proc_root = tmp_path / "proc"
+    data_dir = tmp_path / "history"
+    data_dir.mkdir()
+    _write_proc(proc_root, 350)
+    clock = _Clock()
+    recorder = CpuRecorder(
+        _DelayedClient(clock),
+        proc_root,
+        DailyCsvStore(data_dir, "test"),
+        docker_monotonic_fn=clock.monotonic,
+    )
+
+    assert recorder.sample_once(datetime(2026, 8, 13, tzinfo=timezone.utc)) is False
+    _write_proc(proc_root, 430, idle=700, iowait=70)
+    assert recorder.sample_once(
+        datetime(2026, 8, 13, 0, 1, tzinfo=timezone.utc)
+    ) is True
+
+    assert [row["container_name"] for row in _read_csv_rows(data_dir)] == [
+        f"container-{index}" for index in range(1, 8)
+    ]
+
+
 def test_recorder_deadline_failure_preserves_all_container_baselines(tmp_path):
     class _Clock:
         now = 0.0
@@ -654,7 +706,7 @@ def test_recorder_deadline_failure_preserves_all_container_baselines(tmp_path):
     ]
 
 
-def test_recorder_uses_client_timeout_as_cycle_budget(tmp_path):
+def test_recorder_keeps_request_timeout_separate_from_cycle_budget(tmp_path):
     proc_root = tmp_path / "proc"
     data_dir = tmp_path / "history"
     data_dir.mkdir()
@@ -663,7 +715,8 @@ def test_recorder_uses_client_timeout_as_cycle_budget(tmp_path):
 
     recorder = CpuRecorder(client, proc_root, DailyCsvStore(data_dir, "test"))
 
-    assert recorder.docker_cycle_timeout_sec == 5.0
+    assert client.timeout_sec == 5.0
+    assert recorder.docker_cycle_timeout_sec == 30.0
 
 
 def test_invalid_proc_sample_keeps_last_good_host_baseline(tmp_path, capsys):
@@ -781,4 +834,4 @@ def test_main_accepts_measured_defaults_and_runs_recorder(monkeypatch, tmp_path)
     assert calls[0].interval_sec == 60.0
     assert calls[0].store.retention_days == 30
     assert calls[0].client._timeout_sec == 10.0
-    assert calls[0].docker_cycle_timeout_sec == 10.0
+    assert calls[0].docker_cycle_timeout_sec == 30.0

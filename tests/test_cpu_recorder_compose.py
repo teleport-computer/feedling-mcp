@@ -31,6 +31,7 @@ ENVIRONMENT_KEYS = {
     "CPU_RECORDER_INTERVAL_SEC",
     "CPU_RECORDER_RETENTION_DAYS",
     "CPU_RECORDER_DOCKER_TIMEOUT_SEC",
+    "CPU_RECORDER_DOCKER_CYCLE_TIMEOUT_SEC",
 }
 CASES = [
     (
@@ -108,6 +109,7 @@ def test_cpu_recorder_compose_is_private_bounded_and_dependency_isolated(
         "CPU_RECORDER_INTERVAL_SEC": "60",
         "CPU_RECORDER_RETENTION_DAYS": "30",
         "CPU_RECORDER_DOCKER_TIMEOUT_SEC": "10",
+        "CPU_RECORDER_DOCKER_CYCLE_TIMEOUT_SEC": "30",
     }
     assert not any(
         re.search(r"TOKEN|PASSWORD|SECRET|DATABASE|R2|KEY", key)

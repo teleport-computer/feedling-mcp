@@ -386,7 +386,7 @@ class CpuRecorder:
         self.store = store
         self.interval_sec = interval_sec
         resolved_timeout = (
-            getattr(client, "timeout_sec", 10.0)
+            30.0
             if docker_cycle_timeout_sec is None
             else docker_cycle_timeout_sec
         )
@@ -522,6 +522,9 @@ def main() -> int:
         interval = _fixed_numeric_env("CPU_RECORDER_INTERVAL_SEC", "60")
         retention = int(_fixed_numeric_env("CPU_RECORDER_RETENTION_DAYS", "30"))
         timeout = _fixed_numeric_env("CPU_RECORDER_DOCKER_TIMEOUT_SEC", "10")
+        cycle_timeout = _fixed_numeric_env(
+            "CPU_RECORDER_DOCKER_CYCLE_TIMEOUT_SEC", "30"
+        )
         if (
             not proc_root.is_absolute()
             or not proc_root.is_dir()
@@ -535,6 +538,7 @@ def main() -> int:
             proc_root,
             store,
             interval_sec=interval,
+            docker_cycle_timeout_sec=cycle_timeout,
         )
     except (KeyError, TypeError, ValueError, OSError) as exc:
         CpuRecorder._error("cpu_recorder_startup_failed", exc)
