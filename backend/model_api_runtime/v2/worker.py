@@ -1805,15 +1805,59 @@ def _mcp_mutating_names_for_turn(mcp_turn) -> frozenset[str]:
 
 def _mcp_turn_usage_detail(
     offered_names: Iterable[str], called_names: Iterable[str]
-) -> dict[str, int]:
-    """Content-free MCP usage counts for one chat turn."""
+) -> dict[str, Any]:
+    """Content-free MCP usage counts for one chat turn.
+
+    ``offered_tool_count`` is retained for trace compatibility, but its lens is
+    explicit: this is the turn-start resolved surface before prompt-frontier or
+    terminal-round filtering. ``mcp.surface.provider`` records what each actual
+    provider request received.
+    """
     offered = {str(name) for name in offered_names if str(name)}
     calls = [str(name) for name in called_names if str(name)]
     return {
         "offered_tool_count": len(offered),
+        "offered_tool_count_lens": "turn_resolved_before_provider_budget",
         "called_tool_count": len(set(calls)),
         "call_count": len(calls),
     }
+
+
+def _provider_tool_surface_callback(
+    deps: TurnDeps,
+    user_id: str,
+    lane: str,
+):
+    """Build a best-effort plaintext-count trace sink for one runtime lane."""
+
+    if deps.emit_debug_trace is None:
+        return None
+
+    async def _emit(detail: dict[str, Any]) -> None:
+        trace_detail = {"lane": lane, **dict(detail)}
+        if lane != "chat":
+            trace_detail["wake_kind"] = lane
+        await asyncio.to_thread(
+            deps.emit_debug_trace,
+            user_id,
+            "mcp.surface.provider",
+            status=(
+                "warning"
+                if trace_detail["dropped_tool_count"]
+                else "ok"
+            ),
+            summary=(
+                f"Provider 实收 {trace_detail['sent_tool_count']} 个工具,"
+                f"裁剪 {trace_detail['dropped_tool_count']} 个"
+            ),
+            explain=(
+                "记录每次 provider 请求真正携带的工具数量;不记录工具参数、"
+                "返回值或用户内容。"
+            ),
+            detail=trace_detail,
+        )
+
+    return _emit
 
 
 async def _dispatch_mixed_tool_calls(
@@ -9217,6 +9261,11 @@ async def _run_wake(
                     user_id,
                     exc,
                 ),
+                on_provider_tool_surface=_provider_tool_surface_callback(
+                    deps,
+                    user_id,
+                    lane,
+                ),
                 fold_before_first=deps.read_messages_after_seq is not None,
                 on_progress=_report_turn_progress,
                 on_trajectory_event=_ledger_tapped_sink(trajectory_recorder),
@@ -13231,6 +13280,11 @@ async def process_job(
                 user_id,
                 exc,
             ),
+            on_provider_tool_surface=_provider_tool_surface_callback(
+                deps,
+                user_id,
+                lane,
+            ),
             fold_before_first=seq_native and not ordered_chat_replies,
             on_progress=_report_turn_progress,
             on_trajectory_event=_ledger_tapped_sink(trajectory_recorder),
@@ -13648,11 +13702,13 @@ async def process_job(
                     "mcp.turn.usage",
                     status="ok" if mcp_turn_outcome == "completed" else "error",
                     summary=(
-                        f"MCP 本轮提供 {detail['offered_tool_count']} 个工具,"
+                        f"MCP 本轮解析 {detail['offered_tool_count']} 个工具,"
                         f"调用 {detail['call_count']} 次"
                     ),
                     explain=(
-                        "仅记录工具数量和调用次数;不记录参数、返回值或用户内容。"
+                        "解析数是 prompt 预算前的回合工具面,不证明 provider 实收;"
+                        "实际下发见 mcp.surface.provider。仅记录数量和调用次数,"
+                        "不记录参数、返回值或用户内容。"
                     ),
                     detail={"lane": "chat", "outcome": mcp_turn_outcome, **detail},
                 )

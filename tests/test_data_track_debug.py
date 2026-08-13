@@ -49,6 +49,14 @@ def _patch_blob_reads(monkeypatch, blobs: dict) -> None:
     )
 
 
+def test_provider_tool_surface_has_explicit_admin_step_label():
+    assert data_track._debug_friendly_step({
+        "type": "mcp.surface.provider",
+        "subsystem": "mcp",
+        "detail": {},
+    }) == ("🧩", "MCP Provider 实收工具面")
+
+
 def test_genesis_stats_surfaces_state_and_recent_jobs(monkeypatch):
     state = {
         "status": "processing",

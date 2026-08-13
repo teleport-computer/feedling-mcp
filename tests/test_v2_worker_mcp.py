@@ -391,6 +391,7 @@ def test_mcp_turn_usage_records_two_offered_and_two_consecutive_calls(monkeypatc
         "lane": "chat",
         "outcome": "completed",
         "offered_tool_count": 2,
+        "offered_tool_count_lens": "turn_resolved_before_provider_budget",
         "called_tool_count": 1,
         "call_count": 2,
     }
@@ -425,8 +426,18 @@ def test_mcp_turn_usage_records_offered_but_zero_calls(monkeypatch):
     )) == "completed"
     usage = next(trace for trace in traces if trace["type"] == "mcp.turn.usage")
     assert usage["detail"]["offered_tool_count"] == 2
+    assert usage["detail"]["offered_tool_count_lens"] == (
+        "turn_resolved_before_provider_budget"
+    )
     assert usage["detail"]["called_tool_count"] == 0
     assert usage["detail"]["call_count"] == 0
+    provider_surface = next(
+        trace for trace in traces if trace["type"] == "mcp.surface.provider"
+    )
+    assert provider_surface["detail"]["mcp_candidate_tool_count"] == 2
+    assert provider_surface["detail"]["mcp_sent_tool_count"] == 2
+    assert provider_surface["detail"]["mcp_dropped_tool_count"] == 0
+    assert provider_surface["detail"]["reason"] == "none"
 
 
 def test_mcp_turn_usage_marks_failed_turns(monkeypatch):

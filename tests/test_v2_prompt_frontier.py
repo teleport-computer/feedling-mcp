@@ -515,7 +515,7 @@ def test_optional_tool_catalog_is_omitted_whole_and_reported():
     tools = [
         {
             "type": "function",
-                "function": {"name": "large_tool", "description": "z" * 6_000},
+            "function": {"name": "large_tool", "description": "z" * 6_000},
         }
     ]
     plan = frontier.plan_prompt(
@@ -863,6 +863,7 @@ def test_tool_catalog_pressure_reaches_provider_with_core_floor_not_huge_tail(
     monkeypatch,
 ):
     calls = []
+    surfaces = []
 
     async def provider(_config, messages, *, tools=None, **kwargs):
         calls.append((list(messages), tools))
@@ -870,6 +871,9 @@ def test_tool_catalog_pressure_reaches_provider_with_core_floor_not_huge_tail(
 
     async def fold():
         return []
+
+    async def record_surface(detail):
+        surfaces.append(detail)
 
     outcome = _run_loop(
         monkeypatch=monkeypatch,
@@ -894,6 +898,7 @@ def test_tool_catalog_pressure_reaches_provider_with_core_floor_not_huge_tail(
         ],
         prompt_output_reserve_tokens=2_000,
         prompt_safety_margin_tokens=0,
+        on_provider_tool_surface=record_surface,
     )
 
     assert outcome.final_text == "text-only"
@@ -902,6 +907,18 @@ def test_tool_catalog_pressure_reaches_provider_with_core_floor_not_huge_tail(
     assert {"memory_index", "memory_write", "reply"}.issubset(sent_names)
     assert "large_read" not in sent_names
     assert len(sent_names) < len(tool_loop._catalog()) + 1
+    assert len(surfaces) == 1
+    surface = surfaces[0]
+    assert surface["round"] == 1
+    assert surface["sent_tool_count"] == len(sent_names)
+    assert surface["candidate_tool_count"] > surface["sent_tool_count"]
+    assert surface["dropped_tool_count"] == (
+        surface["candidate_tool_count"] - surface["sent_tool_count"]
+    )
+    assert surface["mcp_candidate_tool_count"] == 1
+    assert surface["mcp_sent_tool_count"] == 0
+    assert surface["mcp_dropped_tool_count"] == 1
+    assert surface["reason"] == "frontier_omitted"
     assert calls[0][0] == [{"role": "system", "content": "stable prefix"}]
 
 

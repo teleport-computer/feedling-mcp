@@ -13,11 +13,12 @@ defaults to one byte per token, intentionally overestimating multilingual text.
 ASCII-heavy tool schemas use a separate conservative three-byte ratio instead
 of inheriting that text estimate; applying one byte per token to schemas can
 inflate their cost by roughly four times and silently erase the whole tool
-surface. Image payload bytes are replaced by a separately configurable
-per-image reserve so base64 transport encoding does not masquerade as text
-tokens. Deployments may calibrate the natural-language byte ratio or provide
-route context metadata, but must not weaken the all-required-or-error contract
-implemented here.
+surface. Non-ASCII schema bytes still count one-for-one, so multilingual tool
+descriptions cannot become underestimates through the ASCII calibration. Image
+payload bytes are replaced by a separately configurable per-image reserve so
+base64 transport encoding does not masquerade as text tokens. Deployments may
+calibrate the natural-language byte ratio or provide route context metadata,
+but must not weaken the all-required-or-error contract implemented here.
 
 Conversation text never enters :class:`PromptFrontierPlan`; components retain
 only a name and a bounded integer estimate.  This makes the result safe to
