@@ -14,6 +14,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
 from model_api_runtime.v2 import serve_worker
 from model_api_runtime.v2 import worker
+from core import tool_markup_leak
 from enclave import envelope as enclave_envelope
 from incident_guard_reference import legacy_reply_is_degenerate
 
@@ -43,6 +44,10 @@ from incident_guard_reference import legacy_reply_is_degenerate
 def test_degenerate_reply_decision_matches_runtime_v1(text, expected):
     assert legacy_reply_is_degenerate(text) is expected
     assert worker._is_degenerate_reply(text) is expected
+
+
+def test_worker_and_markup_sanitizer_share_one_degenerate_predicate():
+    assert worker._is_degenerate_reply is tool_markup_leak.is_degenerate_visible_text
 
 
 @pytest.mark.parametrize(
