@@ -28,6 +28,9 @@ MARKER_END = "# --- end feedling user_mcp ---"
 # dropped by `_enabled` rather than allowed to corrupt/escape the config.
 _SAFE_NAME = re.compile(r"^[a-z0-9_-]{1,32}$")
 
+# See hermes_config_merged for the full reasoning and the cost of this number.
+HERMES_MCP_DISCOVERY_TIMEOUT_SEC = 10.0
+
 
 def _enabled(servers: list[dict]) -> list[dict]:
     return sorted(
@@ -198,6 +201,29 @@ def hermes_config_merged(existing_text: str | None, servers: list[dict],
         mcp[s["name"]] = entry
     if mcp:
         doc["mcp_servers"] = mcp
+        # hermes's own default is 1.5s (hermes_cli/config.py DEFAULT_CONFIG,
+        # read 2026-08-13 against 0.18.2) — TIGHTER than the ~2.5s claude
+        # allows, and measured real public MCP servers need 1.3~2.5s for the
+        # full 3-round-trip handshake from a cold process. So a server that the
+        # app's own connection test passes routinely contributes zero tools to
+        # the turn, and the user is told the capability does not exist.
+        #
+        # Unlike claude's MCP_TIMEOUT (measured: does nothing), this value is a
+        # real bound: ``wait_for_mcp_discovery`` is a ``thread.join(timeout)``
+        # that returns THE INSTANT discovery completes, so healthy servers pay
+        # ~0s and only a still-connecting one costs anything.
+        #
+        # 10.0 matches mcp_probe._CONNECT_TIMEOUT — the same servers, the same
+        # patience the control-plane probe already grants them. The cost of that
+        # choice, stated plainly: a server that is genuinely unreachable makes
+        # every turn wait the full 10s before starting. That is the price of a
+        # hard guarantee here; the claude path deliberately refuses to pay it
+        # (see the spec's §6) because it has no equivalent knob to bound.
+        #
+        # Written ONLY alongside enabled servers, and only when the user has not
+        # chosen a value: a hand-set number is the operator's call, and a user
+        # with no MCP configured must not have their startup touched at all.
+        doc.setdefault("mcp_discovery_timeout", HERMES_MCP_DISCOVERY_TIMEOUT_SEC)
     elif "mcp_servers" in doc:
         del doc["mcp_servers"]
     return yaml.safe_dump(
