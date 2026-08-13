@@ -50,6 +50,17 @@ RESULT_KIND_METADATA_KEY = "result_budget_kind"
 OVERFLOW_ERROR_CODE = "result_budget_exceeded"
 OVERFLOW_RESULT_CONTENT = f"error: {OVERFLOW_ERROR_CODE}"
 
+# 用户自建 MCP 的返回。2026-08-12 加:通用逐条上限是 2000 字符,对记忆型 MCP
+# (Ombre Brain 之类,一次 breath 可能带回好几条记忆)来说模型看到的是碎片 ——
+# 「AI 不认可我的记忆」里有一部分就是这么来的:它拿到的本来就不完整。
+#
+# ⚠️ 刻意 **不** 声明 atomic_json:那面旗只该给「序列化前已按结构收缩」的生产者
+# (见本文件开头)。MCP 服务器返回什么就是什么,没有这个契约;声明成原子的话,
+# 超限的返回会被整份换成一条 error,比截断更糟。
+USER_MCP_RESULT_MAX_CHARS_ENV = "FEEDLING_V2_USER_MCP_RESULT_MAX_CHARS"
+DEFAULT_USER_MCP_RESULT_MAX_CHARS = 8000
+USER_MCP_RESULT_KIND = "user_mcp"
+
 HISTORY_SEARCH_RESULT_MAX_CHARS_ENV = "FEEDLING_V2_HISTORY_SEARCH_RESULT_MAX_CHARS"
 HISTORY_FETCH_RESULT_MAX_CHARS_ENV = "FEEDLING_V2_HISTORY_FETCH_RESULT_MAX_CHARS"
 DEFAULT_HISTORY_SEARCH_RESULT_MAX_CHARS = 1800
@@ -133,6 +144,14 @@ def for_tool(tool_name) -> ResultBudget | None:
                 DEFAULT_HISTORY_SEARCH_RESULT_MAX_CHARS,
             ),
             atomic_json=True,
+        )
+    if name == USER_MCP_RESULT_KIND:
+        return ResultBudget(
+            result_cap=_int_env(
+                USER_MCP_RESULT_MAX_CHARS_ENV,
+                DEFAULT_USER_MCP_RESULT_MAX_CHARS,
+            ),
+            atomic_json=False,
         )
     if name == "history_fetch":
         return ResultBudget(

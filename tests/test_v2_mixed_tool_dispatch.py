@@ -16,6 +16,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
 from provider_types import ToolCall, ToolResult, ToolSpec
+from capabilities import result_budget as cap_result_budget
 from model_api_runtime.v2 import worker
 
 
@@ -43,6 +44,49 @@ class _DispatchingMcpTurn:
 
     async def dispatch(self, call: ToolCall) -> ToolResult:
         return await self._dispatch(call)
+
+
+def test_mcp_call_attempt_is_counted_even_when_dispatch_fails():
+    async def _scenario():
+        async def _fail(_call):
+            raise RuntimeError("transport down")
+
+        async def _before_mutation():
+            return None
+
+        called_names = []
+        results = await worker._dispatch_mixed_tool_calls(
+            [_call("mcp", "mcp__files__search")],
+            mcp_turn=_DispatchingMcpTurn(["mcp__files__search"], _fail),
+            mutating_mcp_names={"mcp__files__search"},
+            dispatch_platform_one=lambda _call: None,
+            before_mcp_mutation=_before_mutation,
+            read_parallelism=1,
+            mcp_timeout_sec=1,
+            mcp_called_names=called_names,
+        )
+
+        assert called_names == ["mcp__files__search"]
+        assert results[0].content == worker.v2_tool_loop.MCP_MUTATION_OUTCOME_UNKNOWN_ERROR
+        assert worker._mcp_turn_usage_detail(
+            ["mcp__files__search", "mcp__files__status"], called_names
+        ) == {
+            "offered_tool_count": 2,
+            "called_tool_count": 1,
+            "call_count": 1,
+        }
+
+    asyncio.run(_scenario())
+
+
+def test_mcp_turn_usage_detail_keeps_zero_call_turns_visible():
+    assert worker._mcp_turn_usage_detail(
+        ["mcp__files__search", "mcp__files__status"], []
+    ) == {
+        "offered_tool_count": 2,
+        "called_tool_count": 0,
+        "call_count": 0,
+    }
 
 
 def test_partial_parallel_results_and_sibling_error_are_observable():
@@ -806,8 +850,20 @@ def test_mcp_wall_budget_is_shared_and_rejects_without_starting_next_call():
         assert dispatched == ["first"]
         assert fenced == ["fence", "fence"]
         assert budget.used_sec == 3.0
+        # 成功的那次带上结果预算标记(2026-08-12):MCP 返回不再被通用的 2000
+        # 字符切碎,靠的就是这个可信 metadata 通道。这条断言同时是**生产接线**的
+        # 回归锁 —— worker 是否真的挂了标记,只有走完整链路的用例能证明,
+        # 手造 metadata 的单测证明不了(codex 审出)。
+        # 被墙钟预算拒掉的那次不带:它返回的是我们自己造的短字符串,不需要额度。
         assert results == [
-            ToolResult(call_id="first", content="ok"),
+            ToolResult(
+                call_id="first",
+                content="ok",
+                metadata={
+                    cap_result_budget.RESULT_KIND_METADATA_KEY:
+                        cap_result_budget.USER_MCP_RESULT_KIND,
+                },
+            ),
             ToolResult(
                 call_id="second",
                 content=worker.MCP_TURN_WALL_BUDGET_EXHAUSTED_ERROR,

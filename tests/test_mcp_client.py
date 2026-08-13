@@ -14,8 +14,11 @@ from hosted import mcp_client, mcp_probe  # noqa: E402
 from _ca_helpers import self_signed_ca_pem  # noqa: E402
 
 
+_UNSET = object()
+
+
 def _fake_mcp_app(*, require_auth=None, tools=None, call_result=None, call_is_error=False,
-                  fail_status=None):
+                  fail_status=None, instructions=_UNSET):
     """In-process streamable-HTTP MCP server supporting initialize /
     notifications/initialized / tools/list / tools/call."""
     tool_defs = tools if tools is not None else [
@@ -44,6 +47,10 @@ def _fake_mcp_app(*, require_auth=None, tools=None, call_result=None, call_is_er
         if method == "initialize":
             result = {"protocolVersion": "2025-03-26", "capabilities": {"tools": {}},
                       "serverInfo": {"name": "fake", "version": "0"}}
+            # spec 的可选字段:服务器自己写的使用说明。_UNSET = 整个字段不出现
+            # (绝大多数服务器就是这样),None/""/非字符串各自是独立的一种坏形状。
+            if instructions is not _UNSET:
+                result["instructions"] = instructions
         elif method == "notifications/initialized":
             await _respond(send, 202, None)
             return
@@ -711,3 +718,78 @@ def test_sse_get_connect_failure_surfaces_probeerror_transport(monkeypatch):
         asyncio.run(mcp_client.list_tools(
             SSE_URL, {}, transport=httpx.MockTransport(handler), mcp_transport="sse"))
     assert e.value.kind == "transport"
+
+
+# --- 服务器自己写的使用说明:协议解析 -----------------------------------------
+# ⚠️ 这几条锁的是**协议提取本身**。tests/test_v2_mcp_tools 那侧的用例是用 fake
+# list_tools 主动往 box 里塞的 —— 把采集整段删掉,那 42 条照样全绿(我跑变异时
+# 验证过它存活,codex 也独立指出)。夹具替生产代码把活干了,就等于没测那段代码。
+#
+# 走的是纯函数而不是整条握手:握手路径全程在 asyncio.timeout 里(3.11+),
+# 本机 3.10 上这个文件里 34 条既有用例都跑不了。把解析规则抽出来,任何解释器
+# 都能锁住它 —— 与其跟环境较劲,不如让逻辑可测。
+# ⚠️ 仍未被本地锁住的一环:`_handshake` 到底有没有调这个函数。那条需要 3.11+,
+# 已在双签信里点名交给 codex2 补。
+
+def test_instructions_are_pulled_from_the_initialize_result():
+    assert mcp_client._instructions_from_init_doc(
+        {"result": {"instructions": "Call breath first."}}
+    ) == ["Call breath first."]
+
+
+def test_missing_blank_or_non_string_instructions_yield_nothing():
+    """「没有说明」和「有一份空说明」对模型是两回事:后者会渲染出一个空章节。"""
+    for doc in (
+        {},
+        {"result": {}},
+        {"result": {"instructions": ""}},
+        {"result": {"instructions": "   "}},
+        {"result": {"instructions": None}},
+        {"result": {"instructions": {"a": 1}}},
+        {"result": {"instructions": 42}},
+        {"result": "not-a-dict"},
+        None,
+        "garbage",
+    ):
+        assert mcp_client._instructions_from_init_doc(doc) == [], doc
+
+
+def test_streamable_handshake_collects_initialize_instructions(monkeypatch):
+    """Lock the production wire between handshake parsing and the output box."""
+    seen_methods = []
+
+    async def fake_post(_client, _target, _headers, payload, _extra):
+        method = payload["method"]
+        seen_methods.append(method)
+        if method == "initialize":
+            return httpx.Response(
+                200,
+                headers={"content-type": "application/json"},
+                json={
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "result": {
+                        "protocolVersion": "2025-03-26",
+                        "capabilities": {"tools": {}},
+                        "serverInfo": {"name": "fake", "version": "0"},
+                        "instructions": "Call breath first.",
+                    },
+                },
+            )
+        assert method == "notifications/initialized"
+        return httpx.Response(202)
+
+    monkeypatch.setattr(mcp_client, "_post_bounded", fake_post)
+    target = mcp_probe._PinnedTarget(
+        request_url=httpx.URL("https://93.184.216.34/mcp"),
+        host_header="mcp.example.com",
+        sni_hostname="mcp.example.com",
+    )
+    collected = []
+
+    session = asyncio.run(mcp_client._handshake(
+        object(), target, {}, instructions_out=collected))
+
+    assert session == {}
+    assert collected == ["Call breath first."]
+    assert seen_methods == ["initialize", "notifications/initialized"]

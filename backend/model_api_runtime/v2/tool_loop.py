@@ -478,6 +478,7 @@ async def run_tool_loop(
     on_progress=None,
     on_trajectory_event=None,
     extra_tool_specs=None,
+    refresh_extra_tool_specs=None,
     extra_mutating_tool_names=None,
     disabled_tool_names=None,
     allow_reply_tool: bool = True,
@@ -693,14 +694,13 @@ async def run_tool_loop(
             return True
     allowed_fetch_urls: set[str] = set()
     # Per-turn tool surface = the static platform catalog plus any user-MCP tools
-    # injected for this turn (chat lane only). New list, never mutates the memoized
-    # `_catalog()`. `mcp_names` marks the injected tools so their args skip the
-    # platform PARAMS validation (the MCP server validates its own schema). MCP
-    # result content is nevertheless untrusted external input: after the model
-    # observes it, every later outbound MCP call is stripped, including a tool
-    # whose exact catalog fingerprint the user approved as read-only.  Read-only
-    # controls remote mutation semantics; it does not make sending model-chosen
-    # arguments to that remote server safe after prompt-injected external text.
+    # injected for this turn (chat lane only). `mcp_names` is frozen from the
+    # entry snapshot so a dynamic schema refresh can replace definitions but can
+    # never grant a new tool name mid-turn. The MCP server validates tool args.
+    # MCP result content remains external model input, but the user explicitly
+    # chose each MCP endpoint. Under the accepted trust boundary, observing that
+    # content does not remove later user-MCP calls; platform web/task fences and
+    # the unknown-mutation idempotency gate still apply below.
     disabled_names = {str(name) for name in (disabled_tool_names or ()) if str(name)}
     # ``reply`` is part of the parent loop protocol rather than a side-effect
     # capability. Recovery callers may remove every mutation schema, but must
@@ -714,12 +714,24 @@ async def run_tool_loop(
         disabled_names.add(tool_schema.FILE_REPLY_TOOL)
     if on_image_reply is None:
         disabled_names.add(tool_schema.IMAGE_REPLY_TOOL)
-    turn_catalog = [
-        spec
-        for spec in (_catalog() + list(extra_tool_specs or []))
-        if spec.name not in disabled_names
-    ]
-    mcp_names = {spec.name for spec in (extra_tool_specs or [])}
+    initial_extra_specs = list(extra_tool_specs or [])
+    mcp_names = {spec.name for spec in initial_extra_specs}
+
+    def _turn_catalog() -> list:
+        current_extra_specs = initial_extra_specs
+        if refresh_extra_tool_specs is not None:
+            try:
+                refreshed = list(refresh_extra_tool_specs() or [])
+            except Exception:  # noqa: BLE001 - optional refresh fails stable
+                refreshed = initial_extra_specs
+            current_extra_specs = [
+                spec for spec in refreshed if spec.name in mcp_names
+            ]
+        return [
+            spec
+            for spec in (_catalog() + current_extra_specs)
+            if spec.name not in disabled_names
+        ]
     # Only offered MCP tools can gain mutating semantics through this injected
     # set. Intersecting avoids a stale/buggy loader accidentally reclassifying a
     # platform read or a tool that was never shown to the provider.
@@ -823,6 +835,7 @@ async def run_tool_loop(
                             await on_file_requirement_changed()
 
         messages = build_messages(list(transcript))
+        turn_catalog = _turn_catalog()
         # 三道有界纠正共用同一条临时 system suffix 注入通道：文件投递缺失、
         # 生图谎报，以及语义空回复。各自最多打回一次，不写入 transcript。
         retry_instructions = "\n\n".join(
@@ -874,11 +887,18 @@ async def run_tool_loop(
             blocked_tools: set[str] = set()
             if external_content_seen:
                 blocked_tools.update(_PLATFORM_MUTATION_TOOLS)
-                # Every MCP call crosses an outbound data boundary.  A matching
-                # read-only approval permits parallel execution before external
-                # content is observed, but cannot permit a later data-dependent
-                # request which could exfiltrate private conversation history.
-                blocked_tools.update(mcp_names)
+                # ⚠️ 2026-08-12 Seven 拍板:user-MCP 不再因为「看过外部内容」下架。
+                #
+                # 原规则:任何一次 MCP 调用之后,本轮**所有** MCP 工具从工具面消失
+                # ——理由是每次 MCP 调用都跨出站边界,后一次请求可能被前一次的返回
+                # 内容操纵去带走隐私。代价是**一轮只能调一次 MCP**,而记忆型服务器
+                # 天生要「先取后存」:两位用户报的「MCP 只能读不能写」正是这条。
+                #
+                # 对齐 Claude Code —— 它对 MCP 没有这类围栏。服务器是用户自己挑的、
+                # 自己填的地址与鉴权头,和「模型自己搜到的网页」不是同一个威胁模型。
+                # 被接受的风险面:模型读过私密内容后可以把它发给用户配置的任意 MCP
+                # 服务器(含论坛这类别人可写内容的)。**这是有意放宽,不是疏漏** ——
+                # 谁想加回来,请先去看 docs/MCP_TRUST_BOUNDARY.md 里的决策记录。
                 blocked_tools.add("web_search")
                 blocked_tools.add(tool_schema.TASK_TOOL)
                 if not allowed_fetch_urls:
@@ -890,16 +910,22 @@ async def run_tool_loop(
                 blocked_tools.update(_PLATFORM_MUTATION_TOOLS)
                 blocked_tools.update(mutating_mcp_names)
             # A private read may expose persona, workspace/artifact, or memory
-            # content. That observation cannot influence a later outbound
-            # query/URL/MCP/task call. Local durable edits remain available:
+            # content. That observation cannot influence a later platform-owned
+            # query/URL/task call. User-selected MCP endpoints remain available.
+            # Local durable edits remain available:
             # read-then-edit is a core workspace/working-memory workflow and
             # still carries the original user/wake seed plus generation fence.
             if outbound_tools_blocked:
                 blocked_tools.update({"web_search", "web_fetch"})
-                blocked_tools.update(mcp_names)
-                # A parent task can hand private workspace/memory-derived text
-                # to a child which still has outbound web access.  Treat that
-                # delegation as another outbound channel, not as a local read.
+                # ⚠️ 同一次放宽(2026-08-12):读过私密内容之后,user-MCP 也不再下架。
+                #
+                # 这条比上面那条更常触发,而且几乎没人意识到:_PRIVATE_READ_TOOLS 里
+                # 有 memory_index / memory_search / memory_fetch,而模型**几乎每轮
+                # 都要读记忆**(usr_dd0b 的 trace 里 memory.index.called ×5)。
+                # 于是 MCP 往往在第一次读记忆之后就没了,连第一次调用都轮不上 ——
+                # 用户看到的是「工具明明连着,AI 说用不了」。
+                #
+                # web/task 仍然拦着:那是模型自己选的目的地,MCP 是用户选的。
                 blocked_tools.add(tool_schema.TASK_TOOL)
             tools = [spec for spec in turn_catalog if spec.name not in blocked_tools]
         else:

@@ -877,10 +877,16 @@ class _ScriptedProvider:
         return self.responses.pop(0)
 
 
-def test_history_read_fences_later_outbound_tools(monkeypatch):
-    """history 读之后的下一轮：web/MCP/task 出站工具从目录移除（含注入的
-    MCP extra spec），本地工具保留——由 `_PRIVATE_READ_TOOLS` 成员资格自动
-    生效，不另造闸。"""
+def test_history_read_fences_web_and_task_but_not_user_mcp(monkeypatch):
+    """history 读之后的下一轮:web/task 出站工具从目录移除,本地工具保留 ——
+    由 `_PRIVATE_READ_TOOLS` 成员资格自动生效,不另造闸。
+
+    ⚠️ 2026-08-12 Seven 拍板:**用户自己配的 MCP 不再被牵连**。
+    这条以前是最致命的一环 —— 模型几乎每轮都读记忆/历史,于是 MCP 常在第一次
+    调用之前就没了,用户看到的是「工具明明连着,AI 却说用不了」。
+    web/task 仍拦:那是模型自己选的目的地;MCP 是用户自己挑的。
+    决策记录见 docs/MCP_TRUST_BOUNDARY.md。
+    """
     provider = _ScriptedProvider([
         {
             "reply": "",
@@ -936,8 +942,9 @@ def test_history_read_fences_later_outbound_tools(monkeypatch):
     round2_names = {spec.name for spec in provider.calls[1]["tools"]}
     assert "web_search" not in round2_names
     assert "web_fetch" not in round2_names
-    assert "mcp_notion_read" not in round2_names
     assert tool_schema.TASK_TOOL not in round2_names
+    assert "mcp_notion_read" in round2_names, (
+        "读过历史不该牵连用户自己配的 MCP —— 见 docs/MCP_TRUST_BOUNDARY.md")
     # 本地读写不受出站 fence 影响（read-then-edit 仍是核心工作流）。
     assert "memory_search" in round2_names
     assert "workspace_read" in round2_names

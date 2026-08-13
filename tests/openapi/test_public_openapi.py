@@ -617,9 +617,21 @@ def test_mcp_probe_and_approval_contract_matches_runtime_limits(
 
     assert upsert["additionalProperties"] is False
     assert upsert["properties"]["enabled"]["type"] == "boolean"
+    assert upsert["properties"]["resident"] == {
+        "type": "boolean",
+        "default": False,
+        "description": (
+            "When true, send this server's complete tool argument schemas "
+            "to the model at turn start. When false, keep only tool names "
+            "and short descriptions resident and load complete schemas on "
+            "demand with mcp_tool_search."
+        ),
+    }
     assert upsert["properties"]["headers"]["maxProperties"] == mcp_core.MAX_HEADERS
     assert patch["additionalProperties"] is False
     assert patch["properties"]["enabled"]["type"] == "boolean"
+    assert patch["properties"]["resident"]["type"] == "boolean"
+    assert record["properties"]["resident"]["type"] == "boolean"
     assert record["properties"]["runtime"]["$ref"] == (
         "#/components/schemas/McpServerRuntimeStatus")
     assert runtime["required"] == [
@@ -664,6 +676,7 @@ def test_mcp_probe_and_approval_contract_matches_runtime_limits(
     for kind in (
         "invalid_request",
         "invalid_enabled",
+        "invalid_resident",
         "invalid_read_only_tool_fingerprints",
         "too_many_read_only_tool_fingerprints",
     ):
@@ -673,9 +686,11 @@ def test_mcp_probe_and_approval_contract_matches_runtime_limits(
     assert "Hosted Runtime V2" in list_description
     assert "runtime field is omitted" in list_description
     assert "absence is not evidence" in list_description
+    assert "mcp_tool_search" in list_description
 
     patch_operation = operations[("patch", "/v1/mcp/servers/{name}")]
     assert "invalid_enabled" in patch_operation["description"]
+    assert "invalid_resident" in patch_operation["description"]
     assert "409" in patch_operation["responses"]
     assert "cannot_encrypt" in patch_operation["responses"]["409"]["description"]
 

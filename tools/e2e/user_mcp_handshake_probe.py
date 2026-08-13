@@ -129,7 +129,9 @@ def terminal_event_type(runtime: str) -> str:
     return "mcp.surface.registered" if runtime == "resident" else "mcp.surface.resolved"
 
 
-def observation_complete(events: list[dict], runtime: str) -> bool:
+def observation_complete(
+    events: list[dict], runtime: str, *, min_mcp_calls: int = 0
+) -> bool:
     """True once BOTH receipts are in.
 
     The driver receipt matters as much as the MCP event: trace posts are
@@ -139,6 +141,8 @@ def observation_complete(events: list[dict], runtime: str) -> bool:
     types = {str(e.get("type") or "") for e in events}
     if terminal_event_type(runtime) not in types:
         return False
+    if min_mcp_calls > 0 and "mcp.turn.usage" not in types:
+        return False
     # V2 emits no `agent.model.call.done` at all — its runtime receipt rides on
     # the surface event's own `driver` field. Requiring the V1 receipt here made
     # every V2 run wait out the timeout and then report "no observation", which
@@ -146,8 +150,23 @@ def observation_complete(events: list[dict], runtime: str) -> bool:
     return runtime != "resident" or "agent.model.call.done" in types
 
 
+def build_probe_prompt(server_name: str, min_mcp_calls: int = 0) -> str:
+    if min_mcp_calls > 1:
+        return (
+            f"请在这一条回复里连续调用你的 {server_name} MCP 工具至少"
+            f" {min_mcp_calls} 次,每次做一个独立的最简单查询,然后分别告诉我"
+            "每次工具返回的第一句。如果你根本看不到这个工具,就直接说"
+            "「工具不在我的工具面里」。"
+        )
+    return (
+        f"请调用你的 {server_name} MCP 工具做一次最简单的查询,"
+        f"然后把工具返回的第一句原样告诉我。"
+        f"如果你根本看不到这个工具,就直接说「工具不在我的工具面里」。"
+    )
+
+
 def classify(events: list[dict], *, runtime: str, expect: str,
-             server_count: int) -> tuple[int, list[str]]:
+             server_count: int, min_mcp_calls: int = 0) -> tuple[int, list[str]]:
     """Turn the trace into an exit code. Pure, so it can be tested without a CVM.
 
     Kept out of ``main`` on purpose: the previous version inlined every check,
@@ -182,6 +201,23 @@ def classify(events: list[dict], *, runtime: str, expect: str,
     if driver != want_driver:
         out.append(f"FAIL 实际跑在 driver={driver},要测的是 {want_driver} —— 结果不能用")
         return 1, out
+
+    if min_mcp_calls > 0:
+        usage = seen.get("mcp.turn.usage")
+        if usage is None:
+            out.append("FAIL 没有 mcp.turn.usage —— 无法证明这一轮实际调用过 MCP")
+            return 3, out
+        usage_detail = usage.get("detail") or {}
+        call_count = int(usage_detail.get("call_count") or 0)
+        out.append(f"usage: {json.dumps(usage_detail, ensure_ascii=False)}")
+        if str(usage_detail.get("outcome") or "") != "completed":
+            out.append("FAIL MCP 用量事件不是 completed 回合")
+            return 1, out
+        if call_count < min_mcp_calls:
+            out.append(
+                f"FAIL 本轮只实际派发 {call_count} 次 MCP,要求至少 {min_mcp_calls} 次"
+            )
+            return 1, out
 
     if runtime != "resident":
         if expect not in _V2_EXPECTATIONS:
@@ -313,18 +349,27 @@ def main() -> int:
                          "does NOT depend on this")
     ap.add_argument("--timeout", type=float, default=240.0)
     ap.add_argument("--trace-timeout", type=float, default=90.0)
+    ap.add_argument(
+        "--min-mcp-calls",
+        type=int,
+        default=0,
+        help="require at least N actual MCP dispatches in this completed V2 turn",
+    )
     args = ap.parse_args()
     if args.copies < 1:
         print("[probe] --copies 至少为 1", file=sys.stderr)
+        return 2
+    if args.min_mcp_calls < 0:
+        print("[probe] --min-mcp-calls 不能小于 0", file=sys.stderr)
+        return 2
+    if args.min_mcp_calls and args.runtime != "v2":
+        print("[probe] --min-mcp-calls 目前只支持带 mcp.turn.usage 的 V2", file=sys.stderr)
         return 2
 
     # Built from --name: the old hardcoded deepwiki question meant passing a
     # different --server produced a turn about a repo that server knows nothing
     # about, and a guaranteed-meaningless result.
-    ask = args.ask or (
-        f"请调用你的 {args.name} MCP 工具做一次最简单的查询,"
-        f"然后把工具返回的第一句原样告诉我。"
-        f"如果你根本看不到这个工具,就直接说「工具不在我的工具面里」。")
+    ask = args.ask or build_probe_prompt(args.name, args.min_mcp_calls)
 
     pool = load_keys()
     admin = _admin(args.api, args.admin_token)
@@ -403,12 +448,15 @@ def main() -> int:
             # `registered`, so waiting on it burned the whole timeout on every
             # healthy V2 run; and stopping at the MCP event alone can leave the
             # driver receipt still in flight (codex 审出).
-            if observation_complete(events, args.runtime):
+            if observation_complete(
+                events, args.runtime, min_mcp_calls=args.min_mcp_calls
+            ):
                 break
             time.sleep(5)
 
         code, lines = classify(events, runtime=args.runtime,
-                               expect=args.expect, server_count=len(names))
+                               expect=args.expect, server_count=len(names),
+                               min_mcp_calls=args.min_mcp_calls)
         for line in lines:
             print(f"[probe] {line}")
         return code

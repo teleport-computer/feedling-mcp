@@ -238,6 +238,23 @@ def test_all_model_facing_tools_reject_unknown_top_level_fields():
         assert spec.parameters["additionalProperties"] is False, spec.name
 
 
+def test_mcp_tool_search_accepts_query_or_bounded_exact_names():
+    name = tool_schema.MCP_TOOL_SEARCH_TOOL
+    specs = {spec.name: spec for spec in tool_schema.build_tool_specs()}
+
+    assert name in specs
+    assert set(specs[name].parameters["properties"]) == {"query", "names"}
+    assert tool_schema.validate_tool_args(name, {"query": "calendar"}) is None
+    assert tool_schema.validate_tool_args(
+        name, {"names": ["mcp__calendar__events"]}) is None
+    assert "exactly one" in tool_schema.validate_tool_args(name, {})
+    assert "exactly one" in tool_schema.validate_tool_args(
+        name, {"query": "calendar", "names": ["mcp__calendar__events"]})
+    assert "1-8" in tool_schema.validate_tool_args(name, {"names": [""]})
+    assert "1-8" in tool_schema.validate_tool_args(
+        name, {"names": [f"mcp__s__t{i}" for i in range(9)]})
+
+
 def test_server_validation_covers_required_types_unknowns_and_array_items():
     assert tool_schema.validate_tool_args("web_search", {}) == "missing required field: query"
     assert tool_schema.validate_tool_args("web_search", {"query": 42}) == "args.query must be string"

@@ -336,28 +336,37 @@ def test_coverage_queries_share_one_synthetic_source_predicate():
         assert "_CHAT_COVERAGE_SOURCE_PREDICATE" in inspect.getsource(query)
 
 
-def test_phala_worker_composes_wire_deterministic_flag_default_off():
-    # Test is the "normal-on" environment since 2026-08-05 (V1-parity
-    # program): deterministic coverage is hardcoded on there.  Prod/pre stay
-    # env-parameterized default-off (with the M5 deployment guard comment)
-    # until Seven schedules the prod rollout.
-    parameterized_off = (
-        'FEEDLING_V2_PROFILE_COVERAGE_DETERMINISTIC: '
-        '"${FEEDLING_V2_PROFILE_COVERAGE_DETERMINISTIC:-0}"'
-    )
+def test_phala_worker_composes_pin_deterministic_coverage_on_everywhere():
+    """三个环境都必须**硬编码** "1",不许退回 env 参数化。
+
+    2026-08-05 起 test 常态开,prod/pre 一直留在 env 参数化的默认关,注释写着
+    「等 Seven 安排 rollout」。**那一等就是七天,代价是真金白银**:prod 上开关
+    实际为 0,`_run_compaction` 因此走老的 LLM 路径 —— 24 小时内 331/395 个
+    maintenance job 以 `compaction_failed:providererror` 失败,历史压不下去,
+    每轮 prompt 越滚越大(均值 26.6k token/轮,chat 已出现
+    `prompt_frontier_exhausted`)。同一份代码在 test 上 maintenance lane 一个 job
+    都没有、chat 零失败 —— 因为确定性路径**根本不调 provider**。
+
+    Seven 2026-08-12 拍板三环境对齐硬编码。用字面量而不是 env 参数化,是为了让
+    「线上真实状态」在文件里一眼可读:prod 之前 PROFILE 写着默认 0、实际注入的是 1,
+    正是这种「配置写的和跑的不是一回事」把排查引偏过。
+    """
     hardcoded_on = 'FEEDLING_V2_PROFILE_COVERAGE_DETERMINISTIC: "1"'
-    deployment_guard = (
-        "# DO NOT set to 1 before M5 MEMORY/USER prompt injection is deployed."
-    )
+    parameterized = 'FEEDLING_V2_PROFILE_COVERAGE_DETERMINISTIC: "${'
+    rollback_rule = "turn THIS off first, then PROFILE"
     for name in (
         "docker-compose.phala.yaml",
         "docker-compose.phala.test.yaml",
         "docker-compose.phala.pre.yaml",
     ):
         text = (ROOT / "deploy" / name).read_text()
-        if name == "docker-compose.phala.test.yaml":
-            assert text.count(hardcoded_on) == 1, name
-            assert parameterized_off not in text, name
-        else:
-            assert text.count(parameterized_off) == 1, name
-            assert text.count(deployment_guard) == 1, name
+        assert text.count(hardcoded_on) == 1, name
+        assert parameterized not in text, name
+    # 回滚铁律(先关这个、再关 PROFILE)必须留在注释里,别在某次清理注释时丢掉
+    # —— 它是这两个开关之间唯一的顺序约束。
+    # ⚠️ 比之前先把 YAML 注释规范化:那句话在 prod 里是跨行折写的
+    # (`turn THIS off` + 换行 + `# first, then PROFILE`),逐字 in 匹配不到。
+    for name in ("docker-compose.phala.yaml", "docker-compose.phala.test.yaml"):
+        raw = (ROOT / "deploy" / name).read_text()
+        flat = " ".join(raw.replace("#", " ").split())
+        assert rollback_rule in flat, name

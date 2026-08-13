@@ -1809,6 +1809,16 @@ COMPONENT_SCHEMAS: dict[str, dict[str, Any]] = {
                 "description": "Extra HTTP headers (e.g. Authorization) sent with every MCP request. Max 20 entries, 8192 bytes combined across names and values. The Host header is forbidden.",
             },
             "enabled": {"type": "boolean", "default": True},
+            "resident": {
+                "type": "boolean",
+                "default": False,
+                "description": (
+                    "When true, send this server's complete tool argument schemas "
+                    "to the model at turn start. When false, keep only tool names "
+                    "and short descriptions resident and load complete schemas on "
+                    "demand with mcp_tool_search."
+                ),
+            },
             "ca_pem": {
                 "type": "string",
                 "maxLength": 32768,
@@ -1848,6 +1858,7 @@ COMPONENT_SCHEMAS: dict[str, dict[str, Any]] = {
             "url": "https://mcp.example.com/mcp",
             "headers": {"Authorization": "Bearer sk-..."},
             "enabled": True,
+            "resident": False,
         },
     },
     "McpServerPatchRequest": {
@@ -1855,6 +1866,14 @@ COMPONENT_SCHEMAS: dict[str, dict[str, Any]] = {
         "minProperties": 1,
         "properties": {
             "enabled": {"type": "boolean"},
+            "resident": {
+                "type": "boolean",
+                "description": (
+                    "Toggle whether complete tool schemas remain resident. Changing "
+                    "this field updates the MCP fingerprint and rematerializes the "
+                    "runtime tool surface."
+                ),
+            },
             "read_only_tool_fingerprints": {
                 "type": "object",
                 "maxProperties": 64,
@@ -1931,6 +1950,13 @@ COMPONENT_SCHEMAS: dict[str, dict[str, Any]] = {
             "id": {"type": "string"},
             "name": {"type": "string"},
             "enabled": {"type": "boolean"},
+            "resident": {
+                "type": "boolean",
+                "description": (
+                    "Whether complete remote tool schemas are resident at turn start. "
+                    "False uses name/description discovery plus mcp_tool_search."
+                ),
+            },
             "url_hint": {"type": "string", "description": "Hostname only (no scheme, path, or credentials), for display."},
             "header_names": {"type": "array", "items": {"type": "string"}, "description": "Header names only; values are never returned."},
             "has_ca": {"type": "boolean", "description": "Whether a CA certificate is currently stored for this server."},
@@ -1951,6 +1977,7 @@ COMPONENT_SCHEMAS: dict[str, dict[str, Any]] = {
             "id": "srv_1a2b3c4d",
             "name": "search",
             "enabled": True,
+            "resident": False,
             "url_hint": "mcp.example.com",
             "header_names": ["Authorization"],
             "has_ca": False,
@@ -2326,7 +2353,9 @@ OPERATION_DESCRIPTIONS: dict[Operation, str] = {
     ("get", "/v1/mcp/servers"): (
         "List the caller's user-configured MCP servers. Secrets (url, headers, "
         "ca_pem) are never returned; url_hint is the hostname only and "
-        "header_names lists header keys only. When Hosted Runtime V2 has "
+        "header_names lists header keys only. resident reports whether complete "
+        "tool schemas are sent at turn start; false uses mcp_tool_search on demand. "
+        "When Hosted Runtime V2 has "
         "observed a server during recent chat turns, the record also carries a "
         "bounded, content-free runtime summary. The runtime field is omitted "
         "when no observation exists; absence is not evidence that the server is "
@@ -2337,7 +2366,9 @@ OPERATION_DESCRIPTIONS: dict[Operation, str] = {
         "are both accepted, including loopback and private-network hosts and IP literals — this "
         "backend does not dial the URL at save time. POST .../test dials public endpoints from the "
         "API backend on request. Hosted Runtime V2 contacts each enabled server at the start of "
-        "every turn for tools/list, before any later tool calls. "
+        "every turn for tools/list, before any later tool calls. resident defaults to false: tool "
+        "names and short descriptions stay visible while full argument schemas load on demand via "
+        "mcp_tool_search. Set resident=true only when every schema should be sent at turn start. "
         "Hosted (cloud-run) agents cannot reach machines on your home or office network; expose a "
         "local MCP server through a tunnel (e.g. Cloudflare Tunnel, Tailscale Funnel, ngrok) to a "
         "public address first. To use a self-signed or private-CA server, paste the issuing CA "
@@ -2346,6 +2377,7 @@ OPERATION_DESCRIPTIONS: dict[Operation, str] = {
         "present a certificate chaining to that CA. http:// sends all configured headers, including "
         "API keys, in plaintext over the network; this is an explicit, informed choice. Possible 400 "
         "error kinds: invalid_request, invalid_name, invalid_url, invalid_headers, invalid_enabled, "
+        "invalid_resident, "
         "too_many_headers, headers_too_large, forbidden_header, invalid_ca, ca_too_large, "
         "invalid_read_only_tool_fingerprints, invalid_read_only_tool_name, "
         "invalid_read_only_tool_fingerprint, too_many_read_only_tool_fingerprints, and "
@@ -2353,10 +2385,12 @@ OPERATION_DESCRIPTIONS: dict[Operation, str] = {
         "cannot_encrypt means the server-side envelope could not be built."
     ),
     ("patch", "/v1/mcp/servers/{name}"): (
-        "Toggle a user-configured MCP server and/or replace its encrypted read-only tool "
+        "Toggle a user-configured MCP server, change whether its full schemas are resident, "
+        "and/or replace its encrypted read-only tool "
         "fingerprint approvals without resending URL, headers, or CA. Send an empty approval "
-        "object to revoke all read-only approvals. Unknown fields are rejected and enabled must "
-        "be a JSON boolean. Possible 400 errors include invalid_patch, invalid_enabled, "
+        "object to revoke all read-only approvals. Unknown fields are rejected; enabled and "
+        "resident must be JSON booleans. Possible 400 errors include invalid_patch, "
+        "invalid_enabled, invalid_resident, "
         "invalid_read_only_tool_fingerprints, invalid_read_only_tool_name, "
         "invalid_read_only_tool_fingerprint, too_many_read_only_tool_fingerprints, and "
         "decrypt_failed. A 409 cannot_encrypt leaves the old config unchanged. 404 not_found "

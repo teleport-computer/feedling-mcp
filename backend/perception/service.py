@@ -1030,6 +1030,15 @@ def stable_context_timezone(user_id: str) -> str | None:
     return None
 
 
+def stable_context_locale(user_id: str) -> str | None:
+    """Device locale from the same TTL-exempt context state as timezone."""
+    cell = store.get_state(user_id).get("locale")
+    if isinstance(cell, dict):
+        value = str(cell.get("v") or "").strip()
+        return value or None
+    return None
+
+
 def _catalog_snapshot_fields(user_id: str, now: float | None = None, *, include_query_tools: bool = False) -> dict:
     now = now or _now()
     state = store.get_state(user_id)

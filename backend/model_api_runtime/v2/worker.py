@@ -51,7 +51,7 @@ from concurrent.futures import CancelledError as FutureCancelledError
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
-from typing import Any, Awaitable, Callable
+from typing import Any, Awaitable, Callable, Iterable
 
 import db
 import generated_image
@@ -1273,9 +1273,11 @@ class TurnDeps:
     # metadata plus decrypted rows. A turn starts at a genuine user row and
     # includes every following row before the next genuine user seed.
     read_recent_turns: Callable[..., dict] | None = None
-    # (user_id, through_seq|None) -> {"timezone","last_user_message_ts"}.
-    # Production resolves registry timezone -> perception fallback -> UTC and
-    # bounds the genuine-user timestamp to the turn's frozen prompt frontier.
+    # (user_id, through_seq|None) -> timezone, locale/archive-language hints,
+    # and last_user_message_ts. Production resolves registry timezone ->
+    # perception fallback -> China default and bounds the genuine-user timestamp
+    # to the turn's frozen prompt frontier. Language hints localize only the
+    # derived calendar labels; they do not add user content to this snapshot.
     read_temporal_snapshot: Callable[..., dict] | None = None
     # Wake-only content-free social-attention metadata. Kept separate from the
     # ordinary temporal reader so foreground Chat does not pay an extra count
@@ -1478,6 +1480,12 @@ class _EmptyMcpTurn:
         return False
 
     def is_read_only(self, name: str) -> bool:
+        return False
+
+    def current_tool_specs(self) -> tuple:
+        return ()
+
+    def requires_resolution(self, name: str) -> bool:
         return False
 
     @property
@@ -1748,6 +1756,34 @@ def _history_round_blocked_results(tool_calls, *, budget) -> dict[str, ToolResul
     return blocked
 
 
+def _render_mcp_instructions(mcp_turn) -> str:
+    """服务器自己写的使用说明 → 一段系统提示文本(没有就返回 "")。
+
+    渲染放在 V2 这边而不是 hosted:``mcp_turn.instructions`` 是纯数据
+    ([(server_name, text), ...],已按服务器名排序、已受逐台与总量上限约束),
+    在这里成型就不必让 V2 核心 import hosted(依赖方向)。
+
+    这是 MCP 协议里「服务器告诉模型该怎么用我」的官方通道
+    (initialize 的 result.instructions),Claude Code 就是这么用的。我们以前把
+    整个 initialize 响应体丢掉、只留 session id,于是自带使用说明的服务器
+    (Ombre Brain 专门配了一份 CLAUDE_PROMPT.md 就是干这个的)什么都送不到模型
+    面前 —— 模型只能自己猜怎么对待那些数据,而它猜成了「别人的东西」。
+    """
+    entries = list(getattr(mcp_turn, "instructions", None) or [])
+    if not entries:
+        return ""
+    parts = [
+        "# MCP 服务器说明",
+        "",
+        "以下是你连接的各 MCP 服务器自己提供的使用说明。",
+    ]
+    for name, text in entries:
+        if not isinstance(name, str) or not isinstance(text, str) or not text.strip():
+            continue
+        parts.extend(["", f"## {name}", text.strip()])
+    return "\n".join(parts) if len(parts) > 3 else ""
+
+
 def _mcp_mutating_names_for_turn(mcp_turn) -> frozenset[str]:
     """Use only the loader's independently approved read classification.
 
@@ -1769,6 +1805,19 @@ def _mcp_mutating_names_for_turn(mcp_turn) -> frozenset[str]:
     return offered & mutating
 
 
+def _mcp_turn_usage_detail(
+    offered_names: Iterable[str], called_names: Iterable[str]
+) -> dict[str, int]:
+    """Content-free MCP usage counts for one chat turn."""
+    offered = {str(name) for name in offered_names if str(name)}
+    calls = [str(name) for name in called_names if str(name)]
+    return {
+        "offered_tool_count": len(offered),
+        "called_tool_count": len(set(calls)),
+        "call_count": len(calls),
+    }
+
+
 async def _dispatch_mixed_tool_calls(
     tool_calls,
     *,
@@ -1788,6 +1837,7 @@ async def _dispatch_mixed_tool_calls(
     mcp_wall_budget: _McpTurnWallBudget | None = None,
     on_progress: Callable[[str], None] | None = None,
     on_tool_event: Callable[[Any, str, dict], Awaitable[None]] | None = None,
+    mcp_called_names: list[str] | None = None,
 ) -> list[ToolResult]:
     """Run one provider batch with mixed-read overlap and ordered mutations.
 
@@ -1911,7 +1961,11 @@ async def _dispatch_mixed_tool_calls(
         async def _invoke():
             if use_read_gate:
                 async with read_gate:
+                    if mcp_called_names is not None:
+                        mcp_called_names.append(str(tc.name))
                     return await mcp_turn.dispatch(tc)
+            if mcp_called_names is not None:
+                mcp_called_names.append(str(tc.name))
             return await mcp_turn.dispatch(tc)
 
         call_timeout = (
@@ -1961,7 +2015,22 @@ async def _dispatch_mixed_tool_calls(
                 call_id=tc.id,
                 content=v2_tool_loop.MCP_MUTATION_OUTCOME_UNKNOWN_ERROR,
             )
-        return result
+        # 打上结果预算标记,让截断层给 MCP 一档更宽的逐条上限(见
+        # capabilities/result_budget.py 的 user_mcp 档)。通用的 2000 字符对记忆型
+        # 服务器会把一次取回的多条记忆切成碎片 —— 用户报的「AI 不认得自己的
+        # 记忆」,有一部分就是它拿到的本来就不完整。
+        # 只在**成功**路径打:上面每条错误路径返回的都是我们自己造的短字符串,
+        # 不需要额度。metadata 是可信通道,provider 的文本进不来
+        # (见 result_budget 模块开头)。
+        return ToolResult(
+            call_id=result.call_id,
+            content=result.content,
+            metadata={
+                **(result.metadata or {}),
+                cap_result_budget.RESULT_KIND_METADATA_KEY:
+                    cap_result_budget.USER_MCP_RESULT_KIND,
+            },
+        )
 
     async def _read(kind: str, tc) -> ToolResult:
         await _event(tc, "tool_call_started", {"phase": f"{kind}_read"})
@@ -3628,6 +3697,10 @@ def _make_build_messages_fn(
                 "last_user_message_ts"
             ),
             tail=rendered_tail,
+            locale=str(temporal_snapshot.get("locale") or ""),
+            archive_language=str(
+                temporal_snapshot.get("archive_language") or ""
+            ),
             visible_proactive_count_24h=temporal_snapshot.get(
                 "visible_proactive_count_24h"
             ),
@@ -3884,6 +3957,8 @@ async def _capture_turn_temporal_snapshot(
         # Never a silent UTC clock: align with the resident anchor's China
         # default so the two time sources in one prompt cannot disagree.
         "timezone": str(snapshot.get("timezone") or context.DEFAULT_TIMEZONE),
+        "locale": str(snapshot.get("locale") or ""),
+        "archive_language": str(snapshot.get("archive_language") or ""),
         "last_user_message_ts": last_user_ts,
     }
 
@@ -3907,6 +3982,8 @@ async def _resolve_turn_temporal_context(
         timezone_name=str(snapshot["timezone"]),
         last_user_message_ts=snapshot.get("last_user_message_ts"),
         tail=tail,
+        locale=str(snapshot.get("locale") or ""),
+        archive_language=str(snapshot.get("archive_language") or ""),
     )
 
 
@@ -8206,6 +8283,7 @@ async def _run_wake(
         wake_disabled_tool_names = wake_disabled_web_tool_names | {
             cap_tool_schema.PROVIDER_USAGE_TOOL,
             cap_tool_schema.MEMORY_ORGANIZE_TOOL,
+            cap_tool_schema.MCP_TOOL_SEARCH_TOOL,
             # History tools are chat-lane only (spec §6 offer gate): the
             # proactive companion must never browse raw history on its own.
             # Withheld unconditionally — not tied to the kill switch — and the
@@ -10732,6 +10810,9 @@ async def process_job(
     voice_call_ended_atomically = False
     lease_keepalive_stop = asyncio.Event()
     lease_keepalive_task: asyncio.Task | None = None
+    mcp_offered_names: tuple[str, ...] = ()
+    mcp_called_names: list[str] = []
+    mcp_turn_outcome = "failed"
 
     try:
         if not claimed_by or not await asyncio.to_thread(
@@ -11519,9 +11600,29 @@ async def process_job(
                 runtime_token=runtime_token,
                 enclave_sem=enclave_sem,
             )
+        # 服务器自己写的使用说明进系统提示(MCP spec 的 initialize.result.
+        # instructions)。走 trusted_system_blocks 这条现成通道,和 skills 同一个
+        # 位置 —— 它排在工具目录之后,正好是「这些工具怎么用」该出现的地方。
+        # 一轮只注入一次;渲染层保证确定性顺序;长度上限在采集处已经加过。
+        mcp_instructions_block = _render_mcp_instructions(mcp_turn)
+        if mcp_instructions_block:
+            trusted_system_blocks = (*trusted_system_blocks, mcp_instructions_block)
         mcp_mutating_names = _mcp_mutating_names_for_turn(mcp_turn)
         disabled_mutation_tool_names = frozenset()
-        offered_mcp_tool_specs = tuple(mcp_turn.tool_specs)
+
+        def _current_offered_mcp_tool_specs() -> tuple:
+            refresh = getattr(mcp_turn, "current_tool_specs", None)
+            specs = refresh() if callable(refresh) else mcp_turn.tool_specs
+            if mutation_recovery_barrier is None:
+                return tuple(specs)
+            return tuple(
+                spec for spec in specs if spec.name not in mcp_mutating_names
+            )
+
+        offered_mcp_tool_specs = _current_offered_mcp_tool_specs()
+        mcp_offered_names = tuple(
+            str(spec.name) for spec in offered_mcp_tool_specs if str(spec.name)
+        )
         if mutation_recovery_barrier is not None:
             disabled_mutation_tool_names = frozenset(
                 set(cap_registry.WRITE_ACTIONS)
@@ -11530,11 +11631,6 @@ async def process_job(
                     cap_tool_schema.FILE_REPLY_TOOL,
                     cap_tool_schema.MEMORY_ORGANIZE_TOOL,
                 }
-            )
-            offered_mcp_tool_specs = tuple(
-                spec
-                for spec in mcp_turn.tool_specs
-                if spec.name not in mcp_mutating_names
             )
         # Web gate. UNION with the mutation set, never assignment — overwriting
         # would re-expose the writes that mutation recovery just withheld.
@@ -11582,11 +11678,18 @@ async def process_job(
             if history_tools_offered
             else frozenset(cap_history.HISTORY_TOOL_NAMES)
         )
+        disabled_mcp_search_tool_names = (
+            frozenset()
+            if set(getattr(mcp_turn, "collapsed_names", ()) or ())
+            & {spec.name for spec in offered_mcp_tool_specs}
+            else frozenset({cap_tool_schema.MCP_TOOL_SEARCH_TOOL})
+        )
         disabled_tool_names_for_turn = (
             frozenset(disabled_mutation_tool_names)
             | disabled_web_tool_names
             | disabled_provider_usage_tool_names
             | disabled_history_tool_names
+            | disabled_mcp_search_tool_names
         )
         # Shared across every provider round in this chat turn. A per-dispatch
         # budget would reset whenever the model asks for another tool batch and
@@ -11727,6 +11830,22 @@ async def process_job(
                 # One call per coroutine lets platform reads share the exact same
                 # worker-level gate as MCP reads. Executor still owns validation,
                 # provenance, encrypted outbox writes, and terminal write failures.
+                if tc.name == cap_tool_schema.MCP_TOOL_SEARCH_TOOL:
+                    resolve = getattr(mcp_turn, "resolve_tool_schemas", None)
+                    if not callable(resolve):
+                        return ToolResult(
+                            call_id=tc.id,
+                            content="error: no folded MCP tools are available",
+                        )
+                    return ToolResult(
+                        call_id=tc.id,
+                        content=json.dumps(
+                            resolve(tc.args),
+                            ensure_ascii=False,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ),
+                    )
                 if tc.name == cap_tool_schema.MEMORY_ORGANIZE_TOOL:
                     return await _dispatch_memory_organize_tool(user_id, tc)
                 if tc.name in cap_history.HISTORY_TOOL_NAMES:
@@ -11904,28 +12023,62 @@ async def process_job(
                     for tc, result in zip(calls, results)
                 ]
 
-            # Schema omission is the provider-facing control; this runtime
-            # gate is the independent fail-closed boundary. A broken relay or
-            # direct caller that invents an omitted mutating MCP call must not
-            # reach the durable-attempt marker or the remote network.
+            # Schema omission is the provider-facing control; this runtime gate
+            # independently refuses unresolved MCP calls before any durable
+            # mutation marker or remote request.
             blocked_by_id: dict[str, ToolResult] = {}
             dispatchable_calls = list(tool_calls)
+            unresolved_by_id = {
+                str(tc.id): ToolResult(
+                    call_id=tc.id,
+                    content=(
+                        "error: mcp tool schema is not loaded; call "
+                        f'{cap_tool_schema.MCP_TOOL_SEARCH_TOOL} with '
+                        f'names=["{tc.name}"] first'
+                    ),
+                )
+                for tc in dispatchable_calls
+                if callable(getattr(mcp_turn, "requires_resolution", None))
+                and mcp_turn.requires_resolution(tc.name)
+            }
+            if unresolved_by_id:
+                blocked_by_id.update(unresolved_by_id)
+                dispatchable_calls = [
+                    tc
+                    for tc in dispatchable_calls
+                    if str(tc.id) not in unresolved_by_id
+                ]
+                for tc in tool_calls:
+                    result = unresolved_by_id.get(str(tc.id))
+                    if result is None:
+                        continue
+                    await chat_tool_activity_callback(
+                        tc,
+                        "tool_call_started",
+                        {"phase": "mcp_schema_required"},
+                    )
+                    await chat_tool_activity_callback(
+                        tc,
+                        "tool_call_result",
+                        {"phase": "mcp_schema_required", "result": result},
+                    )
             if mutation_recovery_barrier is not None:
-                blocked_by_id = {
+                recovery_blocked = {
                     str(tc.id): ToolResult(
                         call_id=tc.id,
                         content=_MUTATION_RECOVERY_BLOCKED_ERROR,
                     )
-                    for tc in tool_calls
+                    for tc in dispatchable_calls
                     if tc.name in mcp_mutating_names
                     or tc.name in cap_registry.WRITE_ACTIONS
                     or tc.name == cap_tool_schema.MEMORY_ORGANIZE_TOOL
                 }
+                blocked_by_id.update(recovery_blocked)
                 dispatchable_calls = [
                     tc for tc in tool_calls if str(tc.id) not in blocked_by_id
                 ]
                 for tc in tool_calls:
-                    result = blocked_by_id.get(str(tc.id))
+                    result = recovery_blocked.get(str(tc.id))
                     if result is None:
                         continue
                     await chat_tool_activity_callback(
@@ -11990,6 +12143,7 @@ async def process_job(
                 mcp_wall_budget=mcp_wall_budget,
                 on_progress=_report_turn_progress,
                 on_tool_event=chat_tool_activity_callback,
+                mcp_called_names=mcp_called_names,
             )
             dispatched_by_id = {str(result.call_id): result for result in dispatched}
             results = [
@@ -12888,6 +13042,7 @@ async def process_job(
             on_progress=_report_turn_progress,
             on_trajectory_event=_ledger_tapped_sink(trajectory_recorder),
             extra_tool_specs=offered_mcp_tool_specs,
+            refresh_extra_tool_specs=_current_offered_mcp_tool_specs,
             extra_mutating_tool_names=mcp_mutating_names,
             disabled_tool_names=disabled_tool_names_for_turn,
             outbound_blocking_read_tool_names=_PRIVATE_READ_TOOLS,
@@ -12936,6 +13091,7 @@ async def process_job(
                     type(exc).__name__.lower(),
                 )
             tm.flush(failed=False, status="voice_call_ended")
+            mcp_turn_outcome = "completed"
             return "completed"
         if outcome.stop_reason == "input_advanced":
             # The hard provider-call budget remains authoritative. The stale
@@ -12954,6 +13110,7 @@ async def process_job(
                 raise LostJobLease("job ownership lost during late-input handoff")
             await asyncio.to_thread(core_wake_bus.notify, "v2_jobs", user_id)
             tm.flush(failed=False, status="input_advanced_handoff")
+            mcp_turn_outcome = "completed"
             return "completed"
         if outcome.stop_reason == "required_file_missing":
             # File completion is best-effort after one bounded recovery. Keep a
@@ -13185,6 +13342,7 @@ async def process_job(
                 job_id,
                 type(exc).__name__,
             )
+        mcp_turn_outcome = "completed"
         return "completed"
     except LostJobLease as e:
         # The winning lifecycle transition (normally the reaper) owns terminal
@@ -13288,6 +13446,29 @@ async def process_job(
         if lease_keepalive_task is not None:
             lease_keepalive_task.cancel()
             await asyncio.gather(lease_keepalive_task, return_exceptions=True)
+        if mcp_offered_names and deps.emit_debug_trace is not None:
+            detail = _mcp_turn_usage_detail(mcp_offered_names, mcp_called_names)
+            try:
+                await asyncio.to_thread(
+                    deps.emit_debug_trace,
+                    user_id,
+                    "mcp.turn.usage",
+                    status="ok" if mcp_turn_outcome == "completed" else "error",
+                    summary=(
+                        f"MCP 本轮提供 {detail['offered_tool_count']} 个工具,"
+                        f"调用 {detail['call_count']} 次"
+                    ),
+                    explain=(
+                        "仅记录工具数量和调用次数;不记录参数、返回值或用户内容。"
+                    ),
+                    detail={"lane": "chat", "outcome": mcp_turn_outcome, **detail},
+                )
+            except Exception as exc:  # noqa: BLE001 -- telemetry is best-effort
+                log.warning(
+                    "[v2.mcp] turn usage trace failed user=%s code=%s",
+                    user_id,
+                    type(exc).__name__.lower(),
+                )
         if push_slot is not None and deps.send_reply_push is not None:
             try:
                 await asyncio.to_thread(

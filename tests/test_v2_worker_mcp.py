@@ -30,6 +30,11 @@ _BYOK = provider_client.ProviderConfig(
 
 _MCP_SPEC = ToolSpec(name="mcp__test__ping", description="ping the test server",
                      parameters={"type": "object", "properties": {}})
+_MCP_SPEC_TWO = ToolSpec(
+    name="mcp__test__status",
+    description="read test server status",
+    parameters={"type": "object", "properties": {}},
+)
 
 
 def _reset(uid):
@@ -79,6 +84,9 @@ def _script_provider(monkeypatch, responses):
     ):
         calls.append({
             "tools": tools,
+            # 系统提示的内容以前没被记下来 —— 于是「某段有没有真的进提示词」
+            # 这类断言只能靠间接证据。注入类改动必须能直接看到 messages。
+            "messages": messages,
             "allow_image_output": allow_image_output,
             **kwargs,
         })
@@ -88,7 +96,7 @@ def _script_provider(monkeypatch, responses):
     return calls
 
 
-def _deps(messages, *, load_mcp_turn=None):
+def _deps(messages, *, load_mcp_turn=None, emit_debug_trace=None):
     return worker.TurnDeps(
         # web_search/web_fetch are gated per user now (default OFF); these
         # tests use them as a generic outbound read, so opt in explicitly.
@@ -98,6 +106,7 @@ def _deps(messages, *, load_mcp_turn=None):
         mint_enclave_token=lambda uid: "rt-enclave",
         apply_pending_effects=_apply_effects,
         load_mcp_turn=load_mcp_turn,
+        emit_debug_trace=emit_debug_trace,
     )
 
 
@@ -110,10 +119,12 @@ def _bubbles(uid):
 
 class _FakeMcpTurn:
     """Stands in for a loaded McpTurn without enclave/network. Records dispatches."""
-    def __init__(self, specs, recorder, *, read_only_names=()):
+    def __init__(self, specs, recorder, *, read_only_names=(), instructions=()):
         self.tool_specs = specs
         self._rec = recorder
         self._read_only_names = frozenset(read_only_names)
+        # [(server_name, text), ...] —— 真 McpTurn 的同名字段,由 loader 排好序
+        self.instructions = list(instructions)
 
     @property
     def is_empty(self):
@@ -136,6 +147,42 @@ class _FakeMcpTurn:
     async def dispatch(self, call):
         self._rec.append((call.name, dict(call.args or {})))
         return ToolResult(call_id=call.id, content="pong from test server")
+
+
+class _FoldedFakeMcpTurn(_FakeMcpTurn):
+    def __init__(self, recorder):
+        folded = ToolSpec(
+            name=_MCP_SPEC.name,
+            description=_MCP_SPEC.description,
+            parameters={"type": "object", "properties": {}},
+        )
+        super().__init__([folded], recorder)
+        self.collapsed_names = {_MCP_SPEC.name}
+        self._resolved = False
+
+    def current_tool_specs(self):
+        return list(self.tool_specs)
+
+    def requires_resolution(self, name):
+        return name in self.collapsed_names and not self._resolved
+
+    def resolve_tool_schemas(self, args):
+        names = list(args.get("names") or [])
+        resolved = [_MCP_SPEC.name] if _MCP_SPEC.name in names else []
+        if resolved:
+            self._resolved = True
+            self.tool_specs[:] = [_MCP_SPEC]
+        return {
+            "resolved": resolved,
+            "not_found": [name for name in names if name not in resolved],
+            "tools": [
+                {
+                    "name": _MCP_SPEC.name,
+                    "description": _MCP_SPEC.description,
+                    "parameters": _MCP_SPEC.parameters,
+                }
+            ] if resolved else [],
+        }
 
 
 def _make_load_turn_mcp(turn, seen=None):
@@ -197,13 +244,63 @@ def test_chat_turn_offers_and_dispatches_configured_mcp_tool(monkeypatch):
     assert len(bubbles) == 1 and bubbles[0]["body_ct"] == "the server said pong"
 
 
-def test_chat_turn_blocks_approved_read_only_mcp_after_its_remote_result(
+def test_chat_tool_search_injects_full_schema_before_mcp_dispatch(monkeypatch):
+    uid = "u_mcp_tool_search"
+    conftest.seed_user(uid)
+    _reset(uid)
+    jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("w")
+    _patch_real_write(monkeypatch)
+
+    dispatched = []
+    turn = _FoldedFakeMcpTurn(dispatched)
+    calls = _script_provider(monkeypatch, [
+        {
+            "reply": "",
+            "tool_calls": [{
+                "id": "find",
+                "name": "mcp_tool_search",
+                "args": {"names": [_MCP_SPEC.name]},
+            }],
+            "usage": {},
+        },
+        {
+            "reply": "",
+            "tool_calls": [{
+                "id": "ping",
+                "name": _MCP_SPEC.name,
+                "args": {},
+            }],
+            "usage": {},
+        },
+        {"reply": "pong", "tool_calls": [], "usage": {}},
+    ])
+    deps = _deps(
+        [{"id": "m1", "ts": 10.0, "role": "user", "content": "ping it"}],
+        load_mcp_turn=_make_load_turn_mcp(turn),
+    )
+
+    status = asyncio.run(worker.process_job(
+        job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt-turn"))
+
+    assert status == "completed"
+    first = {spec.name: spec for spec in calls[0]["tools"]}
+    second = {spec.name: spec for spec in calls[1]["tools"]}
+    assert "mcp_tool_search" in first
+    assert first[_MCP_SPEC.name].parameters["properties"] == {}
+    assert second[_MCP_SPEC.name] == _MCP_SPEC
+    assert dispatched == [(_MCP_SPEC.name, {})]
+
+
+def test_chat_turn_keeps_mcp_usable_after_its_own_remote_result(
     monkeypatch,
 ):
     """Exercise the production worker -> loader -> tool-loop provenance wire.
 
-    An exact catalog approval makes the MCP tool a parallel read, but its remote
-    result is still external input and must remove every MCP schema next round.
+    2026-08-12 Seven 拍板放宽:MCP 的返回内容不再把 MCP 自己下架。原规则下
+    一轮只能调一次,而记忆型服务器要「先取后存」——那正是用户报的
+    「MCP 只能读不能写」。这条用例走的是**生产链路**(worker → loader →
+    tool_loop),比 tool_loop 单测更接近真实。
     """
     uid = "u_mcp_read_only_provenance_fence"
     conftest.seed_user(uid)
@@ -248,8 +345,119 @@ def test_chat_turn_blocks_approved_read_only_mcp_after_its_remote_result(
     assert status == "completed"
     assert dispatched == [(_MCP_SPEC.name, {})]
     assert _MCP_SPEC.name in {spec.name for spec in calls[0]["tools"]}
-    assert _MCP_SPEC.name not in {spec.name for spec in calls[1]["tools"]}
+    assert _MCP_SPEC.name in {spec.name for spec in calls[1]["tools"]}, (
+        "第二轮必须还能调 MCP —— 「只能读不能写」的生产链路复现点")
     assert _bubbles(uid)[0]["body_ct"] == "kept the remote result local"
+
+
+def test_mcp_turn_usage_records_two_offered_and_two_consecutive_calls(monkeypatch):
+    uid = "u_mcp_usage_two_calls"
+    conftest.seed_user(uid)
+    _reset(uid)
+    jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("w")
+    _patch_real_write(monkeypatch)
+
+    dispatched = []
+    turn = _FakeMcpTurn(
+        [_MCP_SPEC, _MCP_SPEC_TWO],
+        dispatched,
+        read_only_names={_MCP_SPEC.name, _MCP_SPEC_TWO.name},
+    )
+    _script_provider(monkeypatch, [
+        {"reply": "", "tool_calls": [
+            {"id": "m1", "name": _MCP_SPEC.name, "args": {}}], "usage": {}},
+        {"reply": "", "tool_calls": [
+            {"id": "m2", "name": _MCP_SPEC.name, "args": {}}], "usage": {}},
+        {"reply": "done", "tool_calls": [], "usage": {}},
+    ])
+    traces = []
+    deps = _deps(
+        [{"id": "m1", "ts": 10.0, "role": "user", "content": "ping twice"}],
+        load_mcp_turn=_make_load_turn_mcp(turn),
+        emit_debug_trace=lambda user_id, event_type, **fields: traces.append(
+            {"user_id": user_id, "type": event_type, **fields}
+        ),
+    )
+
+    assert asyncio.run(worker.process_job(
+        job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"
+    )) == "completed"
+
+    usage = [trace for trace in traces if trace["type"] == "mcp.turn.usage"]
+    assert len(usage) == 1
+    assert usage[0]["status"] == "ok"
+    assert usage[0]["detail"] == {
+        "lane": "chat",
+        "outcome": "completed",
+        "offered_tool_count": 2,
+        "called_tool_count": 1,
+        "call_count": 2,
+    }
+    assert dispatched == [(_MCP_SPEC.name, {}), (_MCP_SPEC.name, {})]
+    assert not any(key in usage[0]["detail"] for key in ("args", "result", "content"))
+
+
+def test_mcp_turn_usage_records_offered_but_zero_calls(monkeypatch):
+    uid = "u_mcp_usage_zero_calls"
+    conftest.seed_user(uid)
+    _reset(uid)
+    jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("w")
+    _patch_real_write(monkeypatch)
+
+    traces = []
+    deps = _deps(
+        [{"id": "m1", "ts": 10.0, "role": "user", "content": "say hi"}],
+        load_mcp_turn=_make_load_turn_mcp(
+            _FakeMcpTurn([_MCP_SPEC, _MCP_SPEC_TWO], [])
+        ),
+        emit_debug_trace=lambda user_id, event_type, **fields: traces.append(
+            {"user_id": user_id, "type": event_type, **fields}
+        ),
+    )
+    _script_provider(monkeypatch, [
+        {"reply": "hi", "tool_calls": [], "usage": {}},
+    ])
+
+    assert asyncio.run(worker.process_job(
+        job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"
+    )) == "completed"
+    usage = next(trace for trace in traces if trace["type"] == "mcp.turn.usage")
+    assert usage["detail"]["offered_tool_count"] == 2
+    assert usage["detail"]["called_tool_count"] == 0
+    assert usage["detail"]["call_count"] == 0
+
+
+def test_mcp_turn_usage_marks_failed_turns(monkeypatch):
+    uid = "u_mcp_usage_failed_turn"
+    conftest.seed_user(uid)
+    _reset(uid)
+    jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("w")
+    _patch_real_write(monkeypatch)
+
+    async def _provider_failure(*_args, **_kwargs):
+        raise RuntimeError("provider unavailable")
+
+    monkeypatch.setattr(provider_client, "chat_completion_async", _provider_failure)
+    traces = []
+    deps = _deps(
+        [{"id": "m1", "ts": 10.0, "role": "user", "content": "ping"}],
+        load_mcp_turn=_make_load_turn_mcp(_FakeMcpTurn([_MCP_SPEC], [])),
+        emit_debug_trace=lambda user_id, event_type, **fields: traces.append(
+            {"user_id": user_id, "type": event_type, **fields}
+        ),
+    )
+
+    assert asyncio.run(worker.process_job(
+        job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"
+    )) == "failed"
+    usage = next(trace for trace in traces if trace["type"] == "mcp.turn.usage")
+    assert usage["status"] == "error"
+    assert usage["detail"]["outcome"] == "failed"
+    assert usage["detail"]["offered_tool_count"] == 1
+    assert usage["detail"]["call_count"] == 0
 
 
 def test_chat_identity_get_result_fences_outbound_but_keeps_local_edits(
@@ -333,9 +541,13 @@ def test_chat_identity_get_result_fences_outbound_but_keeps_local_edits(
     assert {"identity_get", "web_search", "web_fetch", "task", _MCP_SPEC.name} <= (
         first_names
     )
-    assert {"web_search", "web_fetch", "task", _MCP_SPEC.name}.isdisjoint(
+    assert {"web_search", "web_fetch", "task"}.isdisjoint(
         second_names
     )
+    # 2026-08-12:读过人格之后 web/task 仍然掐掉,但用户自己配的 MCP 不再被牵连。
+    # 这条以前是最致命的一环 —— _PRIVATE_READ_TOOLS 里有 memory_index/search/fetch,
+    # 模型几乎每轮都读记忆,于是 MCP 常在第一次调用之前就没了。
+    assert _MCP_SPEC.name in second_names
     assert cap_registry.WRITE_ACTIONS <= second_names
     assert _bubbles(uid)[0]["body_ct"] == "kept the persona private"
 
@@ -476,3 +688,81 @@ def test_platform_write_is_exactly_applied_before_later_round_mcp_mutation(
 
     assert status == "completed"
     assert events == ["platform_applied", "mcp_committed"]
+
+
+def test_server_instructions_reach_the_system_prompt_once(monkeypatch):
+    """服务器自己写的使用说明必须真的进到系统提示里。
+
+    这是 MCP 协议里「服务器告诉模型该怎么用我」的官方通道
+    (initialize 的 result.instructions),Claude Code 就是这么用的。我们以前把
+    整个 initialize 响应体丢掉、只留 session id —— 自带使用说明的服务器
+    (Ombre Brain 专门配了 CLAUDE_PROMPT.md 干这个)什么都送不到模型面前,
+    模型只能自己猜怎么对待那些数据,而 usr_dd0b 那次它猜成了「别人的东西」。
+
+    ⚠️ 这条走的是**生产链路**(process_job → load_mcp_turn → 提示词组装)。
+    只测渲染函数是不够的:接线断了照样全绿(codex 审出同一形状两次)。
+    """
+    uid = "u_mcp_instr"
+    conftest.seed_user(uid)
+    _reset(uid)
+    jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("w")
+    _patch_real_write(monkeypatch)
+    monkeypatch.setattr(worker, "_report_turn_progress", lambda *_a, **_k: None)
+
+    turn = _FakeMcpTurn(
+        [_MCP_SPEC], [],
+        instructions=[("alpha", "Always call breath first."),
+                      ("zeta", "Store with hold when the topic closes.")],
+    )
+    calls = _script_provider(monkeypatch, [
+        {"reply": "ok", "tool_calls": [],
+         "usage": {"prompt_tokens": 1, "completion_tokens": 1}},
+    ])
+    deps = _deps([{"id": "m1", "ts": 10.0, "role": "user", "content": "hi"}],
+                 load_mcp_turn=_make_load_turn_mcp(turn))
+
+    assert asyncio.run(worker.process_job(
+        job, deps, provider_config=_BYOK, api_key=None,
+        runtime_token="rt")) == "completed"
+
+    system_text = "\n".join(
+        str(m.get("content") or "")
+        for m in calls[0]["messages"] if m.get("role") == "system"
+    )
+    assert "Always call breath first." in system_text
+    assert "Store with hold when the topic closes." in system_text
+    # 逐台分隔,不然多台的说明会黏成一坨看不出边界
+    assert "## alpha" in system_text and "## zeta" in system_text
+    # 确定性顺序(loader 已按服务器名排好),对提示缓存友好
+    assert system_text.index("## alpha") < system_text.index("## zeta")
+    # 一轮只注入一次
+    assert system_text.count("# MCP 服务器说明") == 1
+
+
+def test_no_instructions_means_no_section_at_all(monkeypatch):
+    """没有说明的服务器不该在系统提示里留下一个空章节。"""
+    uid = "u_mcp_no_instr"
+    conftest.seed_user(uid)
+    _reset(uid)
+    jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("w")
+    _patch_real_write(monkeypatch)
+    monkeypatch.setattr(worker, "_report_turn_progress", lambda *_a, **_k: None)
+
+    calls = _script_provider(monkeypatch, [
+        {"reply": "ok", "tool_calls": [],
+         "usage": {"prompt_tokens": 1, "completion_tokens": 1}},
+    ])
+    deps = _deps([{"id": "m1", "ts": 10.0, "role": "user", "content": "hi"}],
+                 load_mcp_turn=_make_load_turn_mcp(_FakeMcpTurn([_MCP_SPEC], [])))
+
+    assert asyncio.run(worker.process_job(
+        job, deps, provider_config=_BYOK, api_key=None,
+        runtime_token="rt")) == "completed"
+
+    system_text = "\n".join(
+        str(m.get("content") or "")
+        for m in calls[0]["messages"] if m.get("role") == "system"
+    )
+    assert "MCP 服务器说明" not in system_text

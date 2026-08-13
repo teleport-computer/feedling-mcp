@@ -83,9 +83,19 @@ def test_temporal_snapshot_prefers_registry_timezone_and_freezes_timestamp(
         lambda _user_id: "Asia/Shanghai",
     )
     monkeypatch.setattr(
+        serve_worker.accounts_registry,
+        "_get_user_archive_language",
+        lambda _user_id: "zh-Hans",
+    )
+    monkeypatch.setattr(
         serve_worker.perception_service,
         "stable_context_timezone",
         lambda _user_id: calls.append("perception") or "Europe/Berlin",
+    )
+    monkeypatch.setattr(
+        serve_worker.perception_service,
+        "stable_context_locale",
+        lambda _user_id: "en-US",
     )
     monkeypatch.setattr(
         serve_worker.db,
@@ -102,6 +112,8 @@ def test_temporal_snapshot_prefers_registry_timezone_and_freezes_timestamp(
 
     assert snapshot == {
         "timezone": "Asia/Shanghai",
+        "locale": "en-US",
+        "archive_language": "zh-Hans",
         "last_user_message_ts": 123.0,
     }
     assert calls == [("u-time", 42)]
@@ -114,6 +126,11 @@ def test_temporal_snapshot_uses_perception_then_china_default(monkeypatch):
         lambda _user_id: None,
     )
     monkeypatch.setattr(
+        serve_worker.accounts_registry,
+        "_get_user_archive_language",
+        lambda _user_id: "",
+    )
+    monkeypatch.setattr(
         serve_worker.db,
         "chat_latest_genuine_user_ts",
         lambda _user_id, *, through_seq=None: None,
@@ -122,6 +139,11 @@ def test_temporal_snapshot_uses_perception_then_china_default(monkeypatch):
         serve_worker.perception_service,
         "stable_context_timezone",
         lambda _user_id: "Europe/Berlin",
+    )
+    monkeypatch.setattr(
+        serve_worker.perception_service,
+        "stable_context_locale",
+        lambda _user_id: "",
     )
     assert serve_worker._read_temporal_snapshot("u-time")["timezone"] == (
         "Europe/Berlin"
@@ -2124,3 +2146,142 @@ def test_worldbook_reader_forwards_current_turn_and_runtime_token(monkeypatch):
         serve_worker.build_production_deps().read_worldbook_context
         is serve_worker._read_worldbook_context
     )
+
+
+def _catalog_traces(monkeypatch, store, *, fingerprint, specs, emit_fails=False):
+    """驱动 _load_mcp_turn_observed,收集它发出的 trace。"""
+    traces = []
+
+    def _emit(_store, event_type, **fields):
+        if emit_fails:
+            raise RuntimeError("trace backend down")
+        traces.append({"type": event_type, **fields})
+
+    monkeypatch.setattr(serve_worker, "_emit_v2_debug_trace", _emit)
+    monkeypatch.setattr(
+        serve_worker.mcp_status, "record_runtime_results",
+        lambda _store, results: True)
+    monkeypatch.setattr(
+        serve_worker.mcp_core, "fingerprint_for_store", lambda _s: fingerprint)
+
+    class _Turn:
+        tool_specs = specs
+        summary = {"kept": len(specs), "offered": len(specs), "expected": 1,
+                   "resolved": 1, "skipped": []}
+
+    async def _fake_load(_store, **_kw):
+        return _Turn()
+
+    monkeypatch.setattr(serve_worker.mcp_tools, "load_turn_mcp", _fake_load)
+    asyncio.run(serve_worker._load_mcp_turn_observed(
+        store, api_key="k", runtime_token="rt"))
+    return traces
+
+
+def _catalog_of(traces):
+    for tr in traces:
+        if tr["type"] == "mcp.surface.resolved" and "catalog" in (tr.get("detail") or {}):
+            return tr["detail"]["catalog"]
+    return None
+
+
+class _CatStore:
+    def __init__(self, uid):
+        self.user_id = uid
+
+
+def _spec(name="mcp__ob__breath", desc="Surface or search memories"):
+    from provider_types import ToolSpec
+    return ToolSpec(name=name, description=desc,
+                    parameters={"type": "object", "properties": {}})
+
+
+def test_mcp_catalog_detail_rides_the_contract_event_once_per_fingerprint(monkeypatch):
+    """工具明细挂在既有的 mcp.surface.resolved 上,且**只在指纹变化那一轮**附带。
+
+    2026-08-12 查 usr_dd0b 时,服务端看不到她那 41 个工具是什么 —— 只有每台的
+    计数(`xiaozhen:24/24`),连工具名都没有,只能跑去 GitHub 翻项目 README 猜。
+    但每轮都塞几十个工具的话,每用户 200 条的 trace 环几轮就冲光,真正要读的
+    轮次先被挤掉。
+    ⚠️ 不另起事件名:按约定事件名查询的排查流程才找得到(codex 审出)。
+    """
+    serve_worker._LAST_MCP_CATALOG_FINGERPRINT.clear()
+    store = _CatStore("u_catalog")
+
+    first = _catalog_traces(monkeypatch, store, fingerprint="sha256:abc",
+                            specs=[_spec()])
+    assert _catalog_of(first) is not None
+
+    second = _catalog_traces(monkeypatch, store, fingerprint="sha256:abc",
+                             specs=[_spec()])
+    assert _catalog_of(second) is None, "同一份配置不该每轮都带明细"
+    assert any(t["type"] == "mcp.surface.resolved" for t in second), (
+        "但常规的工具面埋点仍要照发")
+
+    third = _catalog_traces(monkeypatch, store, fingerprint="sha256:changed",
+                            specs=[_spec()])
+    assert _catalog_of(third) is not None, "配置变了要重新带一次"
+
+
+def test_mcp_catalog_records_descriptions_but_never_results(monkeypatch):
+    """记描述(服务器作者写的),绝不记返回值(用户的记忆正文)。"""
+    serve_worker._LAST_MCP_CATALOG_FINGERPRINT.clear()
+    traces = _catalog_traces(
+        monkeypatch, _CatStore("u_catalog2"), fingerprint="sha256:d",
+        specs=[_spec(desc="Surface or search memories" + "x" * 500)])
+    tool = _catalog_of(traces)[0]
+    assert tool["name"] == "mcp__ob__breath"
+    assert tool["desc"].startswith("Surface or search memories")
+    assert len(tool["desc"]) <= serve_worker._MCP_CATALOG_DESC_CHARS
+    assert tool["schema_chars"] > 0
+    assert not any(k in tool for k in ("result", "content", "output"))
+
+
+def test_mcp_catalog_fingerprint_cache_is_bounded(monkeypatch):
+    serve_worker._LAST_MCP_CATALOG_FINGERPRINT.clear()
+    monkeypatch.setattr(serve_worker, "_MCP_CATALOG_FINGERPRINT_MAX_USERS", 2)
+
+    serve_worker._remember_mcp_catalog_fingerprint("u1", "f1")
+    serve_worker._remember_mcp_catalog_fingerprint("u2", "f2")
+    serve_worker._remember_mcp_catalog_fingerprint("u1", "f1-new")
+    serve_worker._remember_mcp_catalog_fingerprint("u3", "f3")
+
+    assert serve_worker._LAST_MCP_CATALOG_FINGERPRINT == {
+        "u1": "f1-new",
+        "u3": "f3",
+    }
+
+
+def test_no_catalog_detail_without_a_fingerprint(monkeypatch):
+    """没有配置指纹(用户压根没配 MCP)就不该带明细。"""
+    serve_worker._LAST_MCP_CATALOG_FINGERPRINT.clear()
+    traces = _catalog_traces(monkeypatch, _CatStore("u_catalog3"),
+                             fingerprint="", specs=[_spec()])
+    assert _catalog_of(traces) is None
+
+
+def test_a_failed_trace_does_not_swallow_the_fingerprint_forever(monkeypatch):
+    """trace 写失败时不能把指纹记掉 —— 否则恢复之后**永远**不再记这份工具面。
+
+    指纹原本写在 emit 之前,那一轮 trace 后端挂掉就等于这份配置的明细永久丢失
+    (codex 审出)。并发下重复记一条无所谓,漏掉第一份工具面才要命。
+    """
+    serve_worker._LAST_MCP_CATALOG_FINGERPRINT.clear()
+    store = _CatStore("u_catalog4")
+    _catalog_traces(monkeypatch, store, fingerprint="sha256:e",
+                    specs=[_spec()], emit_fails=True)
+    assert serve_worker._LAST_MCP_CATALOG_FINGERPRINT.get("u_catalog4") is None
+
+    recovered = _catalog_traces(monkeypatch, store, fingerprint="sha256:e",
+                                specs=[_spec()])
+    assert _catalog_of(recovered) is not None, "恢复后必须补记"
+
+
+def test_an_empty_tool_surface_does_not_consume_the_fingerprint(monkeypatch):
+    """工具面为空时没什么可记,也别把指纹吃掉 —— 下次真有工具时还要记。"""
+    serve_worker._LAST_MCP_CATALOG_FINGERPRINT.clear()
+    store = _CatStore("u_catalog5")
+    _catalog_traces(monkeypatch, store, fingerprint="sha256:f", specs=[])
+    later = _catalog_traces(monkeypatch, store, fingerprint="sha256:f",
+                            specs=[_spec()])
+    assert _catalog_of(later) is not None

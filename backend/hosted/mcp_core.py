@@ -55,10 +55,15 @@ _UPSERT_FIELDS = frozenset({
     "url",
     "headers",
     "enabled",
+    "resident",
     "ca_pem",
     "read_only_tool_fingerprints",
 })
-_PATCH_FIELDS = frozenset({"enabled", "read_only_tool_fingerprints"})
+_PATCH_FIELDS = frozenset({
+    "enabled",
+    "resident",
+    "read_only_tool_fingerprints",
+})
 
 
 def _err(kind: str, detail: str = "") -> dict:
@@ -79,6 +84,7 @@ def compute_fingerprint(servers: list[dict]) -> str:
         return ""
     basis = [
         {"name": s["name"], "enabled": bool(s.get("enabled")),
+         "resident": bool(s.get("resident")),
          "envelope_id": (s.get("config_envelope") or {}).get("id", "")}
         for s in sorted(servers, key=lambda s: s["name"])
     ]
@@ -173,6 +179,8 @@ def _validate_upsert_request(payload) -> dict | None:
                 "invalid_headers", "header names and values must be strings")
     if "enabled" in payload and not isinstance(payload["enabled"], bool):
         return _err("invalid_enabled", "enabled must be a boolean")
+    if "resident" in payload and not isinstance(payload["resident"], bool):
+        return _err("invalid_resident", "resident must be a boolean")
     if "ca_pem" in payload and not isinstance(payload["ca_pem"], str):
         return _err("invalid_ca", "ca_pem must be a string")
     return None
@@ -187,10 +195,12 @@ def _validate_patch_request(payload) -> dict | None:
     if not payload:
         return _err(
             "invalid_patch",
-            "provide enabled and/or read_only_tool_fingerprints",
+            "provide enabled, resident, and/or read_only_tool_fingerprints",
         )
     if "enabled" in payload and not isinstance(payload["enabled"], bool):
         return _err("invalid_enabled", "enabled must be a boolean")
+    if "resident" in payload and not isinstance(payload["resident"], bool):
+        return _err("invalid_resident", "resident must be a boolean")
     return None
 
 
@@ -245,13 +255,14 @@ def _validate_payload(
 
 def _public(srv: dict) -> dict:
     out = {k: srv.get(k) for k in
-           ("id", "name", "enabled", "url_hint", "header_names", "has_ca",
-            "transport", "created_at", "updated_at")}
+           ("id", "name", "enabled", "resident", "url_hint", "header_names",
+            "has_ca", "transport", "created_at", "updated_at")}
     # v2 (2026-07-08) records predate the "has_ca" field entirely — .get()
     # returns None for them, which violates the boolean type this endpoint
     # declares in the OpenAPI contract. Coerce, don't KeyError: missing means
     # "no CA was ever set", i.e. False.
     out["has_ca"] = bool(out["has_ca"])
+    out["resident"] = bool(out["resident"])
     # Pre-transport records: the URL lives only inside the envelope, so the
     # list endpoint can't run the path heuristic — report the default. The
     # probe stamps the real value on the record at first successful test.
@@ -323,6 +334,7 @@ def upsert_server(store: UserStore, payload: dict) -> tuple[dict, int]:
         "id": existing["id"] if existing else f"srv_{uuid.uuid4().hex[:8]}",
         "name": name,
         "enabled": payload.get("enabled", True),
+        "resident": payload.get("resident", False),
         "config_envelope": envelope,
         "url_hint": urlparse(url).hostname or "",
         "header_names": sorted(str(k) for k in headers),
@@ -360,6 +372,7 @@ def set_enabled(
     if request_error:
         return request_error, 400
     patch_enabled = "enabled" in payload
+    patch_resident = "resident" in payload
     patch_approvals = "read_only_tool_fingerprints" in payload
 
     replacement_envelope = None
@@ -404,6 +417,8 @@ def set_enabled(
     # succeeded, so a failed approval patch cannot incidentally toggle enabled.
     if patch_enabled:
         srv["enabled"] = payload["enabled"]
+    if patch_resident:
+        srv["resident"] = payload["resident"]
     if replacement_envelope is not None:
         srv["config_envelope"] = replacement_envelope
     srv["updated_at"] = core_util._now_iso()
@@ -524,6 +539,7 @@ def envelopes_payload(store: UserStore) -> tuple[dict, int]:
         "fingerprint": data["fingerprint"],
         "servers": [
             {"name": s["name"], "enabled": bool(s.get("enabled")),
+             "resident": bool(s.get("resident")),
              # convenience mirror of the encrypted secret's transport; ""
              # for pre-transport records (consumer falls back to the URL
              # heuristic after decrypting)

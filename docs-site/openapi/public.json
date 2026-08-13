@@ -3688,7 +3688,7 @@
           }
         ],
         "x-feedling-contract-level": "documented",
-        "description": "List the caller's user-configured MCP servers. Secrets (url, headers, ca_pem) are never returned; url_hint is the hostname only and header_names lists header keys only. When Hosted Runtime V2 has observed a server during recent chat turns, the record also carries a bounded, content-free runtime summary. The runtime field is omitted when no observation exists; absence is not evidence that the server is healthy. Runtime V1 does not currently write this status."
+        "description": "List the caller's user-configured MCP servers. Secrets (url, headers, ca_pem) are never returned; url_hint is the hostname only and header_names lists header keys only. resident reports whether complete tool schemas are sent at turn start; false uses mcp_tool_search on demand. When Hosted Runtime V2 has observed a server during recent chat turns, the record also carries a bounded, content-free runtime summary. The runtime field is omitted when no observation exists; absence is not evidence that the server is healthy. Runtime V1 does not currently write this status."
       },
       "post": {
         "summary": "Mcp Upsert",
@@ -3744,7 +3744,7 @@
           }
         },
         "x-feedling-contract-level": "documented",
-        "description": "Create or update a user-configured MCP server (matched by name). http:// and https:// URLs are both accepted, including loopback and private-network hosts and IP literals — this backend does not dial the URL at save time. POST .../test dials public endpoints from the API backend on request. Hosted Runtime V2 contacts each enabled server at the start of every turn for tools/list, before any later tool calls. Hosted (cloud-run) agents cannot reach machines on your home or office network; expose a local MCP server through a tunnel (e.g. Cloudflare Tunnel, Tailscale Funnel, ngrok) to a public address first. To use a self-signed or private-CA server, paste the issuing CA certificate (PEM, max 32768 bytes) into ca_pem — this adds the CA to the trust store used for this server; it does not disable certificate verification, and the server still has to present a certificate chaining to that CA. http:// sends all configured headers, including API keys, in plaintext over the network; this is an explicit, informed choice. Possible 400 error kinds: invalid_request, invalid_name, invalid_url, invalid_headers, invalid_enabled, too_many_headers, headers_too_large, forbidden_header, invalid_ca, ca_too_large, invalid_read_only_tool_fingerprints, invalid_read_only_tool_name, invalid_read_only_tool_fingerprint, too_many_read_only_tool_fingerprints, and too_many_servers. A 409 cannot_encrypt means the server-side envelope could not be built."
+        "description": "Create or update a user-configured MCP server (matched by name). http:// and https:// URLs are both accepted, including loopback and private-network hosts and IP literals — this backend does not dial the URL at save time. POST .../test dials public endpoints from the API backend on request. Hosted Runtime V2 contacts each enabled server at the start of every turn for tools/list, before any later tool calls. resident defaults to false: tool names and short descriptions stay visible while full argument schemas load on demand via mcp_tool_search. Set resident=true only when every schema should be sent at turn start. Hosted (cloud-run) agents cannot reach machines on your home or office network; expose a local MCP server through a tunnel (e.g. Cloudflare Tunnel, Tailscale Funnel, ngrok) to a public address first. To use a self-signed or private-CA server, paste the issuing CA certificate (PEM, max 32768 bytes) into ca_pem — this adds the CA to the trust store used for this server; it does not disable certificate verification, and the server still has to present a certificate chaining to that CA. http:// sends all configured headers, including API keys, in plaintext over the network; this is an explicit, informed choice. Possible 400 error kinds: invalid_request, invalid_name, invalid_url, invalid_headers, invalid_enabled, invalid_resident, too_many_headers, headers_too_large, forbidden_header, invalid_ca, ca_too_large, invalid_read_only_tool_fingerprints, invalid_read_only_tool_name, invalid_read_only_tool_fingerprint, too_many_read_only_tool_fingerprints, and too_many_servers. A 409 cannot_encrypt means the server-side envelope could not be built."
       }
     },
     "/v1/mcp/servers/{name}": {
@@ -3833,7 +3833,7 @@
           }
         },
         "x-feedling-contract-level": "documented",
-        "description": "Toggle a user-configured MCP server and/or replace its encrypted read-only tool fingerprint approvals without resending URL, headers, or CA. Send an empty approval object to revoke all read-only approvals. Unknown fields are rejected and enabled must be a JSON boolean. Possible 400 errors include invalid_patch, invalid_enabled, invalid_read_only_tool_fingerprints, invalid_read_only_tool_name, invalid_read_only_tool_fingerprint, too_many_read_only_tool_fingerprints, and decrypt_failed. A 409 cannot_encrypt leaves the old config unchanged. 404 not_found when no server with that name exists."
+        "description": "Toggle a user-configured MCP server, change whether its full schemas are resident, and/or replace its encrypted read-only tool fingerprint approvals without resending URL, headers, or CA. Send an empty approval object to revoke all read-only approvals. Unknown fields are rejected; enabled and resident must be JSON booleans. Possible 400 errors include invalid_patch, invalid_enabled, invalid_resident, invalid_read_only_tool_fingerprints, invalid_read_only_tool_name, invalid_read_only_tool_fingerprint, too_many_read_only_tool_fingerprints, and decrypt_failed. A 409 cannot_encrypt leaves the old config unchanged. 404 not_found when no server with that name exists."
       },
       "delete": {
         "summary": "Mcp Delete",
@@ -11397,6 +11397,11 @@
             "type": "boolean",
             "default": true
           },
+          "resident": {
+            "type": "boolean",
+            "default": false,
+            "description": "When true, send this server's complete tool argument schemas to the model at turn start. When false, keep only tool names and short descriptions resident and load complete schemas on demand with mcp_tool_search."
+          },
           "ca_pem": {
             "type": "string",
             "maxLength": 32768,
@@ -11425,7 +11430,8 @@
           "headers": {
             "Authorization": "Bearer sk-..."
           },
-          "enabled": true
+          "enabled": true,
+          "resident": false
         }
       },
       "McpServerPatchRequest": {
@@ -11434,6 +11440,10 @@
         "properties": {
           "enabled": {
             "type": "boolean"
+          },
+          "resident": {
+            "type": "boolean",
+            "description": "Toggle whether complete tool schemas remain resident. Changing this field updates the MCP fingerprint and rematerializes the runtime tool surface."
           },
           "read_only_tool_fingerprints": {
             "type": "object",
@@ -11510,6 +11520,10 @@
           "enabled": {
             "type": "boolean"
           },
+          "resident": {
+            "type": "boolean",
+            "description": "Whether complete remote tool schemas are resident at turn start. False uses name/description discovery plus mcp_tool_search."
+          },
           "url_hint": {
             "type": "string",
             "description": "Hostname only (no scheme, path, or credentials), for display."
@@ -11549,6 +11563,7 @@
           "id": "srv_1a2b3c4d",
           "name": "search",
           "enabled": true,
+          "resident": false,
           "url_hint": "mcp.example.com",
           "header_names": [
             "Authorization"

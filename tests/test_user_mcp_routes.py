@@ -95,6 +95,7 @@ def test_crud_roundtrip(client, monkeypatch):
         "headers": {"Authorization": "Bearer tok"}})
     assert r.status_code == 200, r.get_data(as_text=True)
     assert r.get_json()["name"] == "jira"
+    assert r.get_json()["resident"] is False
 
     r = client.get("/v1/mcp/servers", headers=h)
     assert r.status_code == 200
@@ -102,10 +103,13 @@ def test_crud_roundtrip(client, monkeypatch):
     assert len(servers) == 1
     assert servers[0]["url_hint"] == "mcp.example.com"
     assert "config_envelope" not in servers[0]
+    assert servers[0]["resident"] is False
 
     r = client.open("/v1/mcp/servers/jira", method="PATCH", headers=h,
-                     json={"enabled": False})
-    assert r.status_code == 200 and r.get_json()["enabled"] is False
+                     json={"enabled": False, "resident": True})
+    assert r.status_code == 200
+    assert r.get_json()["enabled"] is False
+    assert r.get_json()["resident"] is True
 
     r = client.get("/v1/mcp/envelopes", headers=h)
     assert r.status_code == 200
@@ -114,6 +118,7 @@ def test_crud_roundtrip(client, monkeypatch):
     assert len(body["servers"]) == 1
     assert body["servers"][0]["config_envelope"]
     assert body["servers"][0]["enabled"] is False
+    assert body["servers"][0]["resident"] is True
 
     r = client.delete("/v1/mcp/servers/jira", headers=h)
     assert r.status_code == 200
@@ -163,6 +168,8 @@ def test_list_serializes_optional_runtime_summary(client, monkeypatch):
     [
         ({"name": "jira", "url": "https://mcp.example.com", "enabled": "false"},
          "invalid_enabled"),
+        ({"name": "jira", "url": "https://mcp.example.com", "resident": "yes"},
+         "invalid_resident"),
         ({"name": "jira", "url": "https://mcp.example.com", "unknown": True},
          "invalid_request"),
         ({"name": 123, "url": "https://mcp.example.com"}, "invalid_name"),
@@ -201,6 +208,8 @@ def test_upsert_rejects_bodies_outside_openapi_schema(
     [
         ({"enabled": "false"}, "invalid_enabled"),
         ({"enabled": 1}, "invalid_enabled"),
+        ({"resident": "yes"}, "invalid_resident"),
+        ({"resident": 1}, "invalid_resident"),
         ({"enabled": False, "unknown": True}, "invalid_patch"),
         (["enabled"], "invalid_patch"),
         ([], "invalid_patch"),

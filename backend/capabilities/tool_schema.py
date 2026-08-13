@@ -34,6 +34,7 @@ IMAGE_REPLY_TOOL = "generate_image"
 TASK_TOOL = "task"
 PROVIDER_USAGE_TOOL = "provider_usage"
 MEMORY_ORGANIZE_TOOL = "memory_organize"
+MCP_TOOL_SEARCH_TOOL = "mcp_tool_search"
 
 _EXCLUDED = frozenset({"chat_image_read", "chat_file_read", "perception_glance"})
 
@@ -377,6 +378,19 @@ PARAMS: dict[str, dict] = {
     # _SUBAGENT_ALLOWED_TOOLS / _PRIVATE_READ_TOOLS / _run_wake disabled set) --
     PROVIDER_USAGE_TOOL: {"type": "object", "properties": {}, "additionalProperties": False},
     MEMORY_ORGANIZE_TOOL: {"type": "object", "properties": {}, "additionalProperties": False},
+    MCP_TOOL_SEARCH_TOOL: {
+        "type": "object",
+        "properties": {
+            "query": {"type": "string", "minLength": 1, "maxLength": 200},
+            "names": {
+                "type": "array",
+                "items": _STR,
+                "minItems": 1,
+                "maxItems": 8,
+            },
+        },
+        "required": [],
+    },
 }
 
 # Tool arguments cross an untrusted model boundary.  Close every model-facing
@@ -586,6 +600,12 @@ DESCRIPTIONS: dict[str, str] = {
         "for those). This queues safe background organization; it does not let the chat "
         "turn merge cards directly."
     ),
+    MCP_TOOL_SEARCH_TOOL: (
+        "Load complete argument schemas for user-connected MCP tools whose names "
+        "and short descriptions are already visible. Provide either a search query "
+        "or exact qualified tool names. After this returns, call a resolved tool in "
+        "a later round using its newly available parameters."
+    ),
 }
 
 
@@ -735,6 +755,20 @@ def validate_tool_args(name: str, args, *, live_model_call: bool = False) -> str
         return "send_file revision must be a positive integer"
     if name == IMAGE_REPLY_TOOL and not str(args.get("prompt") or "").strip():
         return "generate_image requires a non-empty prompt"
+    if name == MCP_TOOL_SEARCH_TOOL:
+        query = str(args.get("query") or "").strip()
+        names = args.get("names") or []
+        has_query = bool(query)
+        has_names = bool(names)
+        if has_query == has_names:
+            return "mcp_tool_search requires exactly one of query or names"
+        if len(query) > 200:
+            return "mcp_tool_search query must be at most 200 characters"
+        if has_names and (
+            len(names) > 8
+            or any(not str(value or "").strip() for value in names)
+        ):
+            return "mcp_tool_search names must contain 1-8 non-empty names"
     return None
 
 
@@ -751,6 +785,7 @@ def build_tool_specs() -> list[ToolSpec]:
         IMAGE_REPLY_TOOL,
         PROVIDER_USAGE_TOOL,
         MEMORY_ORGANIZE_TOOL,
+        MCP_TOOL_SEARCH_TOOL,
     ):
         specs.append(ToolSpec(
             name=name,

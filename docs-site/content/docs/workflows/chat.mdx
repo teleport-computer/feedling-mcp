@@ -52,6 +52,19 @@ ownership are recorded. If that ownership transition cannot complete, setup
 fails closed with a retryable error rather than silently falling back to the
 resident path.
 
+### Time grounding
+
+Hosted Runtime V2 freezes one user-local temporal snapshot for the whole turn
+and keeps it in the trailing application-data context. Alongside the local ISO
+timestamp and IANA timezone, the snapshot includes the local weekday and
+day-period label so models do not have to infer them from a numeric offset. The
+weekday is computed after timezone conversion, including across local midnight.
+
+Runtime V1's time anchor and Runtime V2 use the same weekday and day-period
+boundaries. Labels follow the same device-locale, account-language, then default
+language policy used by the resident reply guardrail. The snapshot deliberately
+does not add a second UTC clock representation.
+
 ### 1. Send the turn
 
 At least one of `message`, `image_b64`, or `file_b64` is required. `message` is
@@ -709,9 +722,10 @@ interval.
 The resident-job fallback scan is throttled by
 `FEEDLING_RESIDENT_FALLBACK_CHECK_SEC` (default 300 seconds).
 
-`user_mcp.fingerprint` changes whenever the account's MCP server list changes;
-see the [MCP servers workflow](/docs/workflows/mcp) for how to manage that list
-and re-materialize local config when the fingerprint moves.
+`user_mcp.fingerprint` changes whenever the account's MCP server list, enabled
+state, schema-residency setting, or encrypted connection envelope changes; see
+the [MCP servers workflow](/docs/workflows/mcp) for how to manage that list and
+re-materialize local config when the fingerprint moves.
 
 ### 3. The consumer posts the encrypted reply
 

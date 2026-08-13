@@ -63,6 +63,7 @@ def test_upsert_and_list_masks_secrets(store, monkeypatch):
     assert srv["url_hint"] == "mcp.example.com"
     assert srv["header_names"] == ["Authorization"]
     assert srv["enabled"] is True
+    assert srv["resident"] is False
     assert "runtime" not in srv
     assert "secret-token" not in str(body)
     assert "config_envelope" not in srv
@@ -230,6 +231,25 @@ def test_patch_enabled_keeps_envelope(store, monkeypatch):
     assert mcp_core.fingerprint_for_store(store) != fp_before
 
 
+def test_patch_resident_keeps_envelope_and_changes_fingerprint(store, monkeypatch):
+    _fake_envelope(monkeypatch)
+    created, status = mcp_core.upsert_server(store, {
+        "name": "jira", "url": "https://a.example.com", "headers": {},
+        "resident": False,
+    })
+    assert status == 200 and created["resident"] is False
+    before = mcp_core.envelopes_payload(store)[0]["servers"][0]
+    fp_before = mcp_core.fingerprint_for_store(store)
+
+    body, status = mcp_core.set_enabled(store, "jira", {"resident": True})
+
+    assert status == 200 and body["resident"] is True
+    after = mcp_core.envelopes_payload(store)[0]["servers"][0]
+    assert after["config_envelope"] == before["config_envelope"]
+    assert after["resident"] is True
+    assert mcp_core.fingerprint_for_store(store) != fp_before
+
+
 def test_patch_read_only_approvals_preserves_encrypted_connection_config(
     store, monkeypatch,
 ):
@@ -368,7 +388,10 @@ def test_envelopes_payload_shape(store, monkeypatch):
     assert status == 200
     assert body["fingerprint"] == mcp_core.fingerprint_for_store(store)
     (srv,) = body["servers"]
-    assert set(srv) == {"name", "enabled", "transport", "config_envelope"}
+    assert set(srv) == {
+        "name", "enabled", "resident", "transport", "config_envelope",
+    }
+    assert srv["resident"] is False
     # /mcp URL → http; the consumer reads this mirror without decrypting.
     assert srv["transport"] == "http"
 
@@ -600,9 +623,11 @@ def test_legacy_record_without_has_ca_key_defaults_false(store):
     (srv,) = listed["servers"]
     assert srv["has_ca"] is False
     assert srv["has_ca"] is not None
+    assert srv["resident"] is False
 
     public = mcp_core._public(legacy_record)
     assert public["has_ca"] is False
+    assert public["resident"] is False
 
 
 def test_garbage_ca_rejected(store, monkeypatch):
