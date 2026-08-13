@@ -137,6 +137,8 @@ for _mod_name in _ASGI_PACKAGES:
 # stats were silently empty in production.
 from admin import data_track as _admin_data_track  # noqa: E402
 from chat import chat_core as _chat_core  # noqa: E402
+from diagnostics import diagnostics_core as _diagnostics_core  # noqa: E402
+from hosted import mcp_status as _hosted_mcp_status  # noqa: E402
 from hosted import onboarding_validation as _hosted_onboarding_validation  # noqa: E402
 from identity import service as _identity_service  # noqa: E402
 from model_api_runtime.v2 import jobs_store as _v2_jobs_store  # noqa: E402
@@ -153,3 +155,7 @@ _admin_data_track._runtime_delivery_health = _v2_jobs_store.recent_delivery_heal
 _admin_data_track._runtime_user_report = _v2_jobs_store.recent_runtime_user_delivery_report
 _admin_data_track._usage_report = _v2_jobs_store.usage_report_snapshot
 _chat_core.publish_voice_reply = _voice_results.store_reply_for_parent
+# V1's only per-turn evidence about a user's MCP servers is the consumer's
+# `mcp.surface.registered` trace. Wired (not imported) because diagnostics sits
+# below hosted — see diagnostics_core.on_mcp_surface_registered.
+_diagnostics_core.on_mcp_surface_registered = _hosted_mcp_status.record_from_registered_trace
