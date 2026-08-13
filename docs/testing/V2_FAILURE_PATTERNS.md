@@ -170,7 +170,7 @@ claude2 自认根因:上一轮审计时"只点了 `function_call(s)` / `tool_cal
 |---|---|---|---|---|
 | 1 | 配好的 MCP(日历/邮箱)AI 说用不了,只看得到 image_gen | `prompt_frontier.py:971-1000` + `tool_loop.py:1000-1009`;估算器 1 字节=1token 把 32k 字节算成 32k token | 共用·上下文组装 | 查清 |
 | 2 | MCP 只能读不能写;第二步必失败 | `tool_loop.py` 三条出站围栏在后续轮次摘掉工具 | 共用·工具面裁剪 | ✅ 已修 57b4aedb |
-| 3 | 气泡第一行出现 `<parameter name="tool_name">` | `worker.py _on_reply` 与 `agent_protocol_v2.py` 清洗词表无 XML 工具标记 | 共用·回复清洗出口 | 修复待审(T016) |
+| 3 | 气泡第一行出现 `<parameter name="tool_name">` | `worker.py _on_reply` 与 `agent_protocol_v2.py` 清洗词表无 XML 工具标记 | 共用·回复清洗出口 | ✅ PR#193 结构性修复,独立矩阵 25 passed 验收通过 |
 | 4 | 推理过程时有时无/整段英文/反复自我推翻 | `worker.py:12422-12434`(chat) `:8669-8673`(wake) 兜底展示原生 CoT | 共用·回复封装出口 | 查清 |
 | 5 | 旧气泡里显示 `<think></think>` 裸标签 | 剥离全在封装前,存量密文擦不掉;V1 入口仍在产新的 | 共用·跨加密边界 | 查清 |
 | 6 | 今天星期几/早上晚上答错,与 V1 不一致 | `context.py` 尾部时间块缺本地化 weekday/day_period | 共用·上下文组装 | 已收敛到 `reply_language.local_time_labels` |
