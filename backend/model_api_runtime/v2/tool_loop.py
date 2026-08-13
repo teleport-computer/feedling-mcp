@@ -111,23 +111,24 @@ def _memory_discovery_call_key(tool_call) -> tuple[str, str] | None:
     """Return the per-turn deduplication key for a memory discovery call.
 
     ``memory_index`` remains a once-per-turn overview regardless of filters.
-    ``memory_search`` may legitimately run more than once for different subjects,
-    so only an exact canonical-JSON argument match is repeated. Query whitespace
-    and case stay significant; normalizing either could merge distinct searches.
+    Other discovery tools (currently ``memory_search``) may legitimately run more
+    than once for different subjects, so only an exact canonical-JSON argument
+    match is repeated. Query whitespace and case stay significant; normalizing
+    either could merge distinct searches.
     """
+    if tool_call.name not in _MEMORY_DISCOVERY_TOOLS:
+        return None
     if tool_call.name == "memory_index":
         return (tool_call.name, "")
-    if tool_call.name == "memory_search":
-        return (
-            tool_call.name,
-            json.dumps(
-                tool_call.args,
-                sort_keys=True,
-                ensure_ascii=False,
-                separators=(",", ":"),
-            ),
-        )
-    return None
+    return (
+        tool_call.name,
+        json.dumps(
+            tool_call.args,
+            sort_keys=True,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ),
+    )
 
 
 def _is_probably_tool_schema_rejection(exc: provider_client.ProviderError) -> bool:
