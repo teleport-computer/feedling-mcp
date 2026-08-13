@@ -24,6 +24,7 @@ from capabilities import registry
 # Card-writing rules live with the memory package (single source of truth shared
 # with the V1 guidance block); only the op names above are V2-specific.
 from memory import prompts_v1
+from memory.source_policy import MAX_MEMORY_SUPERSEDE_TARGETS
 from perception.agent_fields import (
     AGENT_PERCEPTION_SIGNALS,
     AGENT_SIGNAL_FIELDS,
@@ -77,6 +78,15 @@ _MEMORY_TOOL_ACTION = {
         "importance": {"type": "number"},
         "pulse": {"type": "number"},
         "target_id": _STR,
+        # Consolidating several existing cards creates one successor and must
+        # retire every source card atomically.  The downstream
+        # memory.supersede action already supports a list; expose that ability
+        # at the model-facing boundary instead of forcing a one-target update.
+        "target_ids": {
+            "type": "array",
+            "items": _STR,
+            "maxItems": MAX_MEMORY_SUPERSEDE_TARGETS,
+        },
         "reason": _STR,
     },
     "required": ["op"],
@@ -508,7 +518,13 @@ DESCRIPTIONS: dict[str, str] = {
     "memory_write": ("Write, update, or delete memory cards. Each action needs an "
                      "'op': 'add' (supply a one-line 'summary' AND full 'content', "
                      "optional 'bucket'), 'update' (supply 'target_id' plus new "
-                     "'summary'/'content'), or 'delete' (supply 'target_id'). Each action "
+                     "'summary'/'content'), or 'delete' (supply 'target_id'). To merge "
+                     "multiple existing cards into one successor, use one 'update' with "
+                     "'target_ids' containing every old card id (at most 20 per update); "
+                     "all of them are retired only if the successor is written successfully. "
+                     "For a larger merge, continue in another tool round and include the "
+                     "returned successor id among that round's at most 20 ids. 'delete' "
+                     "accepts one 'target_id' only. Each action "
                      "may include an audit 'reason'. Get "
                      "target_ids from memory_search/memory_index first.\n"
                      + prompts_v1.MEMORY_WRITE_RULES_V1),
@@ -778,10 +794,29 @@ def validate_tool_args(name: str, args, *, live_model_call: bool = False) -> str
             summary = str(action.get("summary") or "").strip()
             content = str(action.get("content") or "").strip()
             target_id = str(action.get("target_id") or "").strip()
+            target_ids = [
+                str(value or "").strip()
+                for value in (action.get("target_ids") or [])
+                if str(value or "").strip()
+            ]
+            combined_targets = set(target_ids)
+            if target_id:
+                combined_targets.add(target_id)
+            if (
+                len(action.get("target_ids") or []) > MAX_MEMORY_SUPERSEDE_TARGETS
+                or len(combined_targets) > MAX_MEMORY_SUPERSEDE_TARGETS
+            ):
+                return (
+                    f"args.actions[{index}] target_ids exceeds maximum "
+                    f"{MAX_MEMORY_SUPERSEDE_TARGETS}"
+                )
             if op == "add" and (not summary or not content):
                 return f"args.actions[{index}] add requires summary and content"
-            if op == "update" and (not target_id or not summary or not content):
-                return f"args.actions[{index}] update requires target_id, summary, and content"
+            if op == "update" and (not (target_id or target_ids) or not summary or not content):
+                return (
+                    f"args.actions[{index}] update requires target_id or target_ids, "
+                    "summary, and content"
+                )
             if op == "delete" and not target_id:
                 return f"args.actions[{index}] delete requires target_id"
     if name in {"workspace_write", "workspace_delete"}:

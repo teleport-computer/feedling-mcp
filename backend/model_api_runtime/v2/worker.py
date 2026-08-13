@@ -4613,25 +4613,36 @@ def _memory_tool_actions(raw_actions) -> list[dict]:
         ).strip()
         if not summary:
             summary = content[:80]
-        target = str(
+        raw_targets = a.get("target_ids")
+        if not isinstance(raw_targets, list):
+            raw_supersedes = a.get("supersedes")
+            raw_targets = raw_supersedes if isinstance(raw_supersedes, list) else []
+        targets: list[str] = []
+        for value in raw_targets:
+            target_id = str(value or "").strip()
+            if target_id and target_id not in targets:
+                targets.append(target_id)
+        legacy_target = str(
             a.get("target_id")
             or a.get("id")
-            or a.get("supersedes")
+            or (a.get("supersedes") if not isinstance(a.get("supersedes"), list) else "")
             or a.get("memory_id")
             or ""
         ).strip()
+        if legacy_target and legacy_target not in targets:
+            targets.append(legacy_target)
         reason = str(a.get("reason") or "").strip()[:1000]
         if not reason:
             reason = "Written by the agent via the memory_write tool."
         if op in ("delete", "remove"):
-            if target:
+            if legacy_target:
                 out.append({
                     "type": "memory.delete",
-                    "memory_id": target,
+                    "memory_id": legacy_target,
                     "reason": reason,
                 })
             continue
-        if op in ("update", "supersede", "merge", "patch") and not target:
+        if op in ("update", "supersede", "merge", "patch") and not targets:
             # Never turn an invalid targeted mutation into a new memory.add.
             continue
         if op not in ("add", "create", "update", "supersede", "merge", "patch"):
@@ -4681,7 +4692,7 @@ def _memory_tool_actions(raw_actions) -> list[dict]:
             out.append(
                 {
                     "type": "memory.supersede",
-                    "supersedes": target,
+                    "supersedes": targets[0] if len(targets) == 1 else targets,
                     "memory": inner,
                     **base,
                 }

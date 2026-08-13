@@ -59,6 +59,12 @@ change must not be interpreted as an API guarantee.
   user message, and does not advance that message's reply cursor. Heartbeat,
   manual-wake, and screen-watch silence remains unchanged.
 
+- **Multi-card memory consolidation no longer leaves a silently unretired
+  suffix.** Hosted Runtime V2 can supply up to 20 source IDs when writing one
+  consolidated successor. Oversized `memory.supersede` requests now fail with
+  `too_many_supersedes` before changing any card instead of silently applying
+  only the first 20, and successful receipts list only IDs actually retired.
+
 - **`memory_search` guidance documents literal matching and allows a reworded
   retry.** Matching is a case-insensitive literal substring with no synonyms,
   translation, or stemming, so an empty result means that wording is absent
