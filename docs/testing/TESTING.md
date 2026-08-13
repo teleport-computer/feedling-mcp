@@ -319,6 +319,15 @@ python3 -m pytest -q <你要跑的文件>
 
 ## 6. 通用坑（文档里查不到、只有做过才知道）
 
+- **判断「某修复在不在某分支」不能用 `git merge-base --is-ancestor`**(2026-08-14,
+  claude4 栽过一次并据此误报给 Seven)。rebase / squash 之后 hash 变了,
+  **内容明明在,它照样答「不在」**。正确判据是**查内容**:
+  `git show <branch>:<file> | grep <符号>` 或 `git log -S <符号> <branch>`。
+- **没有埋点的动作,它在 trace 里缺席什么都不能证明**(同日,Supervisor 自己踩)。
+  排查前先确认这个动作**有没有埋点**;`memory_search` / `memory_write` 至今 0 埋点,
+  而 `memory_index` / `memory_fetch` 各有 3 处 —— 只看 trace 会得出完全错误的结论。
+
+
 - **git pull ≠ 生效**：拉代码只更新文件，跑着的 Python 进程仍是旧内存态 → 改 consumer 必 `systemctl --user restart feedling-chat-resident`。
 - **复用账号 config 可能是旧的**：改了网关行为要 `phala inspect` 确认 CVM 真部署了新镜像；litellm 版本没变 = 桥行为没变。
 - **别一个诊断套所有模型**：必做「模型家族失败分层」（Anthropic 家族 / OpenAI·o 系 / Gemini / 中转，wire 形状与行为各异）——web_search 400 和思维链上都栽过这个。
