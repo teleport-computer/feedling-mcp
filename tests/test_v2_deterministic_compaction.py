@@ -386,3 +386,19 @@ def test_coverage_queries_share_one_synthetic_source_predicate():
         worker.db.count_messages_after_seq,
     ):
         assert "_CHAT_COVERAGE_SOURCE_PREDICATE" in inspect.getsource(query)
+
+
+def test_phala_worker_composes_expose_only_metadata_coverage():
+    forbidden = (
+        "FEEDLING_V2_" + "PROFILE_COVERAGE_DETERMINISTIC",
+        "FEEDLING_V2_" + "COMPACTION_BATCH_CHARS",
+        "FEEDLING_V2_" + "COMPACTION_QUARANTINE_ENABLED",
+    )
+    for name in (
+        "docker-compose.phala.yaml",
+        "docker-compose.phala.test.yaml",
+        "docker-compose.phala.pre.yaml",
+    ):
+        text = (ROOT / "deploy" / name).read_text()
+        assert 'FEEDLING_V2_PROFILE_ENABLED: "1"' in text, name
+        assert all(symbol not in text for symbol in forbidden), name

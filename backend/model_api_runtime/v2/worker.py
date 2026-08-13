@@ -1257,9 +1257,11 @@ class TurnDeps:
     # metadata plus decrypted rows. A turn starts at a genuine user row and
     # includes every following row before the next genuine user seed.
     read_recent_turns: Callable[..., dict] | None = None
-    # (user_id, through_seq|None) -> {"timezone","last_user_message_ts"}.
-    # Production resolves registry timezone -> perception fallback -> UTC and
-    # bounds the genuine-user timestamp to the turn's frozen prompt frontier.
+    # (user_id, through_seq|None) -> timezone, locale/archive-language hints,
+    # and last_user_message_ts. Production resolves registry timezone ->
+    # perception fallback -> China default and bounds the genuine-user timestamp
+    # to the turn's frozen prompt frontier. Language hints localize only the
+    # derived calendar labels; they do not add user content to this snapshot.
     read_temporal_snapshot: Callable[..., dict] | None = None
     # Wake-only content-free social-attention metadata. Kept separate from the
     # ordinary temporal reader so foreground Chat does not pay an extra count
@@ -3671,6 +3673,10 @@ def _make_build_messages_fn(
                 "last_user_message_ts"
             ),
             tail=rendered_tail,
+            locale=str(temporal_snapshot.get("locale") or ""),
+            archive_language=str(
+                temporal_snapshot.get("archive_language") or ""
+            ),
             visible_proactive_count_24h=temporal_snapshot.get(
                 "visible_proactive_count_24h"
             ),
@@ -3927,6 +3933,8 @@ async def _capture_turn_temporal_snapshot(
         # Never a silent UTC clock: align with the resident anchor's China
         # default so the two time sources in one prompt cannot disagree.
         "timezone": str(snapshot.get("timezone") or context.DEFAULT_TIMEZONE),
+        "locale": str(snapshot.get("locale") or ""),
+        "archive_language": str(snapshot.get("archive_language") or ""),
         "last_user_message_ts": last_user_ts,
     }
 
@@ -3950,6 +3958,8 @@ async def _resolve_turn_temporal_context(
         timezone_name=str(snapshot["timezone"]),
         last_user_message_ts=snapshot.get("last_user_message_ts"),
         tail=tail,
+        locale=str(snapshot.get("locale") or ""),
+        archive_language=str(snapshot.get("archive_language") or ""),
     )
 
 
