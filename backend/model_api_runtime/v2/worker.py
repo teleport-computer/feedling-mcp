@@ -1416,7 +1416,7 @@ class TurnDeps:
     # of an empty pending set; the field exists so the call site is already wired
     # ahead of the producer landing.
     apply_pending_effects: Callable[[str], dict] | None = None
-    # (user_id, *, msg_id, body, is_wake, lane) -> None：把本回合最后一条已落库回复的
+    # (user_id, *, msg_id, body, is_wake, lane) -> bool：把本回合最后一条已落库回复的
     # 明文正文交给 backend 发 APNs（serve-worker 容器没有 APNs 私钥，只有 backend
     # 有）。best-effort：实现方吞掉自身异常，调用点也再兜一层 —— 推送失败绝不能
     # 把一个已经成功发布回复的回合打成 failed。None（所有不接线的测试/legacy
@@ -1425,7 +1425,14 @@ class TurnDeps:
     # 真实 wake source，对齐 V1 `_proactive_delivery_decision_v2` 从 job 推 manual
     # 的做法 —— 之前这里硬编码 source="heartbeat"/manual=False，导致关了
     # reminders_delivery 的用户在 V2 手动唤醒收不到推送（V1 会走 manual_bypass）。
-    send_reply_push: Callable[..., None] | None = None
+    # 返回 True 只表示 APNs 接受了 alert（设备专注/静音/通知设置不可见，是实际响铃的
+    # 上界）；任何关闭、前台压制、无 token、出网失败都返回 False。chat lane 忽略该
+    # 返回值；wake lane 只把它写入决策后的影子观测，绝不回灌判据。
+    send_reply_push: Callable[..., bool] | None = None
+    # (user_id, *, job_id, lane, decision_allowed, apns_alert_sent, decided_at) -> bool。
+    # A′ 只写后验、content-free 观测；生产装配把用户时区转换成本地日/时/分再持久化。
+    # 回调缺失或失败都不得改变回合结果。
+    record_wake_shadow_decision: Callable[..., bool] | None = None
     # Final voice replies cross from the worker to the public Custom LLM gateway
     # through a narrow internal endpoint. The callback receives routing ids plus
     # plaintext only in memory; the backend encrypts it before temporary storage.
@@ -7802,6 +7809,7 @@ async def _run_wake(
     观测）是两回事。
     """
     push_slot: dict | None = None
+    shadow_decision_allowed: bool | None = None
     try:
         store = core_store.get_store(user_id)
         seq_native = deps.read_messages_after_seq is not None
@@ -7827,6 +7835,7 @@ async def _run_wake(
             )
 
         async def _sleep_heartbeat_without_history() -> str:
+            nonlocal shadow_decision_allowed
             wake_generation = observed_generation
             consumed_context_seq = 0
             if deps.read_perception_wake_context is not None:
@@ -7877,6 +7886,7 @@ async def _run_wake(
                 )
             if successor_id is not None:
                 await asyncio.to_thread(core_wake_bus.notify, "v2_jobs", user_id)
+            shadow_decision_allowed = False
             if tm is not None:
                 tm.flush(failed=False, status="slept_no_history")
             return "completed"
@@ -8662,7 +8672,7 @@ async def _run_wake(
         thinking_trace_emitted = False
 
         async def _on_reply(text: str, *, final: bool, reasoning: str = "") -> None:
-            nonlocal thinking_trace_emitted
+            nonlocal thinking_trace_emitted, shadow_decision_allowed
             text = str(text or "").strip()
             # Self-authored thinking (same mechanism as the chat lane): peel a leading
             # <think> off the wake reply BEFORE the degenerate/torn checks so they see
@@ -9002,6 +9012,7 @@ async def _run_wake(
                     best_effort=True,
                 )
                 if status == "applied":
+                    shadow_decision_allowed = True
                     # 覆盖式：一个回合可能吐多条气泡，只有最后一条会成为推送。构建槽位
                     # 本身也是 best-effort：payload 缺 "envelope"（例如未来出现的非
                     # seq_native / 测试注入变体）不该把一个已经成功落库的回合打成
@@ -9359,6 +9370,11 @@ async def _run_wake(
                     else None
                 ),
             )
+            if shadow_decision_allowed is None:
+                # A successful weak-wake turn with no applied reply is the
+                # model's suppress/sleep outcome.  This assignment is after the
+                # tool loop and cannot influence any provider input or branch.
+                shadow_decision_allowed = False
         except Exception as e:  # noqa: BLE001 — classify below, then let it fall to the outer silent mark_failed
             if provider_client.classify_provider_error(e) == "provider_config":
                 # Dead/broke BYOK key (402 out-of-credits, 401/403 bad key) — back off
@@ -9480,9 +9496,11 @@ async def _run_wake(
             tm.flush(failed=True, status=code)
         return "failed"
     finally:
+        decided_at = time.time()
+        apns_alert_sent = False
         if push_slot is not None and deps.send_reply_push is not None:
             try:
-                await asyncio.to_thread(
+                push_result = await asyncio.to_thread(
                     deps.send_reply_push,
                     user_id,
                     msg_id=push_slot["msg_id"],
@@ -9490,9 +9508,33 @@ async def _run_wake(
                     is_wake=push_slot["is_wake"],
                     lane=push_slot["lane"],
                 )
+                apns_alert_sent = push_result is True
             except Exception as e:  # noqa: BLE001 — 推送绝不能影响回合结果
                 log.warning(
                     "[v2.worker] wake reply push failed user=%s: %s", user_id, e)
+        if (
+            shadow_decision_allowed is not None
+            and deps.record_wake_shadow_decision is not None
+        ):
+            try:
+                await asyncio.to_thread(
+                    deps.record_wake_shadow_decision,
+                    user_id,
+                    job_id=int(job_id),
+                    lane=lane,
+                    decision_allowed=shadow_decision_allowed,
+                    apns_alert_sent=(
+                        apns_alert_sent if shadow_decision_allowed else False
+                    ),
+                    decided_at=decided_at,
+                )
+            except Exception as e:  # noqa: BLE001 — 影子观测绝不能改变决策/回合
+                log.warning(
+                    "[v2.worker] wake shadow record failed user=%s job=%s: %s",
+                    user_id,
+                    job_id,
+                    e,
+                )
 
 
 def _memory_write_result_counts(

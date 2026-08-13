@@ -1890,7 +1890,7 @@ def test_send_reply_push_posts_to_backend(monkeypatch):
         status_code = 200
 
         def json(self):
-            return {"status": "delivered"}
+            return {"status": "delivered", "apns_alert_sent": True}
 
     def _fake_post(url, json=None, headers=None, timeout=None):
         posted.update(url=url, json=json, headers=headers, timeout=timeout)
@@ -1899,8 +1899,16 @@ def test_send_reply_push_posts_to_backend(monkeypatch):
     monkeypatch.setenv("FEEDLING_API_URL", "http://backend:5001")
     monkeypatch.setattr(serve_worker.httpx, "post", _fake_post)
 
-    serve_worker._send_reply_push(
-        "u_push_send", msg_id="m1", body="hi", is_wake=True, lane="manual_wake")
+    assert (
+        serve_worker._send_reply_push(
+            "u_push_send",
+            msg_id="m1",
+            body="hi",
+            is_wake=True,
+            lane="manual_wake",
+        )
+        is True
+    )
 
     assert posted["url"] == "http://backend:5001/v1/internal/push/ai_reply"
     assert posted["json"] == {
@@ -1944,13 +1952,51 @@ def test_send_reply_push_swallows_transport_errors(monkeypatch):
     monkeypatch.setattr(serve_worker.httpx, "post", _boom)
 
     # 不抛：推送失败绝不能冒到回合上去。
-    serve_worker._send_reply_push("u_push_err", msg_id="m1", body="hi", is_wake=False)
+    assert serve_worker._send_reply_push(
+        "u_push_err", msg_id="m1", body="hi", is_wake=False) is False
+
+
+def test_record_wake_shadow_converts_decision_time_to_user_local_clock(monkeypatch):
+    from datetime import datetime, timezone
+
+    decided_at = datetime(2026, 8, 13, 16, 5, tzinfo=timezone.utc).timestamp()
+    monkeypatch.setattr(
+        serve_worker.accounts_registry,
+        "_get_user_timezone",
+        lambda _uid: "Asia/Shanghai",
+    )
+    observed = {}
+    monkeypatch.setattr(
+        serve_worker.jobs_store,
+        "record_wake_shadow_decision",
+        lambda **kwargs: observed.update(kwargs) or True,
+    )
+
+    assert serve_worker._record_wake_shadow_decision(
+        "u_shadow_local",
+        job_id=42,
+        lane="heartbeat",
+        decision_allowed=True,
+        apns_alert_sent=False,
+        decided_at=decided_at,
+    ) is True
+    assert observed == {
+        "job_id": 42,
+        "local_day": datetime(2026, 8, 14).date(),
+        "local_hour": 0,
+        "local_minute": 5,
+        "lane": "heartbeat",
+        "decision_allowed": True,
+        "apns_alert_sent": False,
+        "decided_at": decided_at,
+    }
 
 
 def test_kill_switch_unwires_the_push_dep(monkeypatch):
     monkeypatch.setenv("FEEDLING_V2_PUSH_ENABLED", "0")
     deps = serve_worker.build_production_deps()
     assert deps.send_reply_push is None
+    assert deps.record_wake_shadow_decision is serve_worker._record_wake_shadow_decision
 
 
 def test_worldbook_reader_forwards_current_turn_and_runtime_token(monkeypatch):

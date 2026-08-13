@@ -49,9 +49,11 @@ import uuid
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import urlsplit
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import httpx
 
@@ -656,7 +658,7 @@ def _publish_voice_reply(
 
 def _send_reply_push(
     user_id: str, *, msg_id: str, body: str, is_wake: bool, lane: str = ""
-) -> None:
+) -> bool:
     """`TurnDeps.send_reply_push` 的生产接线。
 
     APNs 私钥只注入 backend 容器，所以推送由 backend 发；这里只把明文正文经
@@ -672,7 +674,7 @@ def _send_reply_push(
     api_url = os.environ.get("FEEDLING_API_URL", "").strip()
     if not api_url:
         log.warning("[v2.push] FEEDLING_API_URL not set — reply push skipped")
-        return
+        return False
     try:
         resp = httpx.post(
             f"{api_url}/v1/internal/push/ai_reply",
@@ -690,8 +692,49 @@ def _send_reply_push(
             log.warning(
                 "[v2.push] reply push rejected user=%s status=%s",
                 user_id, resp.status_code)
+            return False
+        try:
+            result = resp.json()
+        except Exception:
+            return False
+        return isinstance(result, dict) and result.get("apns_alert_sent") is True
     except Exception as e:  # noqa: BLE001 — best-effort by contract
         log.warning("[v2.push] reply push failed user=%s: %s", user_id, e)
+        return False
+
+
+def _record_wake_shadow_decision(
+    user_id: str,
+    *,
+    job_id: int,
+    lane: str,
+    decision_allowed: bool,
+    apns_alert_sent: bool,
+    decided_at: float,
+) -> bool:
+    """Persist post-decision A′ telemetry without feeding it back into policy."""
+    zone_name = accounts_registry._get_user_timezone(user_id)
+    if not zone_name:
+        zone_name = perception_service.stable_context_timezone(user_id)
+    zone_name = str(zone_name or v2_context.DEFAULT_TIMEZONE)
+    try:
+        zone = ZoneInfo(zone_name)
+    except (ValueError, ZoneInfoNotFoundError):
+        try:
+            zone = ZoneInfo(v2_context.DEFAULT_TIMEZONE)
+        except (ValueError, ZoneInfoNotFoundError):
+            zone = ZoneInfo("UTC")
+    local = datetime.fromtimestamp(float(decided_at), tz=timezone.utc).astimezone(zone)
+    return jobs_store.record_wake_shadow_decision(
+        job_id=int(job_id),
+        local_day=local.date(),
+        local_hour=local.hour,
+        local_minute=local.minute,
+        lane=str(lane),
+        decision_allowed=decision_allowed,
+        apns_alert_sent=apns_alert_sent,
+        decided_at=float(decided_at),
+    )
 
 
 def _prompt_cache_route_scope(runtime, *, secret: bytes) -> str:
@@ -4703,6 +4746,7 @@ def build_production_deps() -> v2_worker.TurnDeps:
             if os.environ.get("FEEDLING_V2_PUSH_ENABLED", "1").strip() != "0"
             else None
         ),
+        record_wake_shadow_decision=_record_wake_shadow_decision,
         publish_voice_reply=_publish_voice_reply,
     )
 

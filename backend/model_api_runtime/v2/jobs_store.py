@@ -21,7 +21,7 @@ from concurrent.futures import (
     TimeoutError as FutureTimeoutError,
 )
 from contextlib import contextmanager, nullcontext
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Callable
 
 import psycopg
@@ -8630,6 +8630,183 @@ def recent_prompt_cache_stats(
 
 
 WAKE_LANES = ("heartbeat", "scheduled", "manual_wake")
+
+
+_WAKE_SHADOW_LANES = frozenset(
+    {"heartbeat", "scheduled", "manual_wake", "screen_watch"}
+)
+_WAKE_SHADOW_RETENTION_DAYS = 90
+
+
+def record_wake_shadow_decision(
+    *,
+    job_id: int,
+    local_day: date | str,
+    local_hour: int,
+    local_minute: int,
+    lane: str,
+    decision_allowed: bool,
+    apns_alert_sent: bool,
+    decided_at: datetime | float,
+) -> bool:
+    """Persist one immutable, content-free A′ wake observation.
+
+    The source job id is the idempotency key, so replays cannot inflate Seven's
+    counts. The row deliberately survives source-job cleanup and owns a bounded
+    90-day retention window. This write happens only after the wake decision;
+    no return value is allowed to feed back into runtime policy.
+    """
+    normalized_lane = str(lane or "").strip()
+    if normalized_lane not in _WAKE_SHADOW_LANES:
+        raise ValueError("invalid wake shadow lane")
+    if not isinstance(decision_allowed, bool) or not isinstance(
+        apns_alert_sent, bool
+    ):
+        raise ValueError("wake shadow outcomes must be booleans")
+    if apns_alert_sent and not decision_allowed:
+        raise ValueError("a suppressed wake cannot send an APNs alert")
+    hour = int(local_hour)
+    minute = int(local_minute)
+    if not 0 <= hour <= 23 or not 0 <= minute <= 59:
+        raise ValueError("invalid wake shadow local time")
+    day = (
+        local_day.date()
+        if isinstance(local_day, datetime)
+        else (
+            local_day
+            if isinstance(local_day, date)
+            else date.fromisoformat(str(local_day))
+        )
+    )
+    observed_at = (
+        decided_at
+        if isinstance(decided_at, datetime)
+        else datetime.fromtimestamp(float(decided_at), tz=timezone.utc)
+    )
+    if observed_at.tzinfo is None:
+        observed_at = observed_at.replace(tzinfo=timezone.utc)
+    with db.get_pool().connection() as conn:
+        # This observation owns its retention. It deliberately does not depend
+        # on agent_jobs lifetime, so a 90-day report remains meaningful even if
+        # queue rows gain a shorter GC policy later.
+        conn.execute(
+            "DELETE FROM v2_wake_shadow_decisions "
+            "WHERE recorded_at < now() - (%s * interval '1 day')",
+            (_WAKE_SHADOW_RETENTION_DAYS,),
+        )
+        row = conn.execute(
+            "INSERT INTO v2_wake_shadow_decisions "
+            "(job_id,local_day,local_hour,local_minute,lane,"
+            "decision_allowed,apns_alert_sent,decided_at) "
+            "VALUES (%s,%s,%s,%s,%s,%s,%s,%s) "
+            "ON CONFLICT (job_id) DO NOTHING RETURNING job_id",
+            (
+                int(job_id),
+                day,
+                hour,
+                minute,
+                normalized_lane,
+                decision_allowed,
+                apns_alert_sent,
+                observed_at.astimezone(timezone.utc),
+            ),
+        ).fetchone()
+    return row is not None
+
+
+def wake_shadow_report(
+    *,
+    days: int,
+    bucket_start_hour: int,
+    bucket_end_hour: int,
+    through_day: date | str | None = None,
+) -> dict:
+    """Count A′ observations in a caller-defined local-hour bucket.
+
+    The bucket is report input, not a runtime sleep-window constant.  A range
+    with start > end crosses midnight (for example 23→7); equal endpoints are
+    rejected instead of silently defining either zero or twenty-four hours.
+    """
+    bounded_days = int(days)
+    start_hour = int(bucket_start_hour)
+    end_hour = int(bucket_end_hour)
+    if not 1 <= bounded_days <= 90:
+        raise ValueError("days must be between 1 and 90")
+    if not 0 <= start_hour <= 23 or not 0 <= end_hour <= 23:
+        raise ValueError("bucket hours must be between 0 and 23")
+    if start_hour == end_hour:
+        raise ValueError("bucket hours must differ")
+    end_day = (
+        date.today()
+        if through_day is None
+        else (
+            through_day
+            if isinstance(through_day, date)
+            else date.fromisoformat(str(through_day))
+        )
+    )
+    start_day = end_day - timedelta(days=bounded_days - 1)
+    if start_hour < end_hour:
+        bucket_sql = "(local_hour >= %s AND local_hour < %s)"
+    else:
+        bucket_sql = "(local_hour >= %s OR local_hour < %s)"
+    base_sql = (
+        "WITH selected AS ("
+        " SELECT lane,decision_allowed,apns_alert_sent," + bucket_sql + " AS in_bucket"
+        " FROM v2_wake_shadow_decisions WHERE local_day BETWEEN %s AND %s"
+        ") "
+    )
+    count_sql = (
+        "count(*)::bigint AS total_decisions,"
+        "count(*) FILTER (WHERE decision_allowed)::bigint AS allowed,"
+        "count(*) FILTER (WHERE NOT decision_allowed)::bigint AS suppressed,"
+        "count(*) FILTER (WHERE apns_alert_sent)::bigint AS apns_alert_sent,"
+        "count(*) FILTER (WHERE decision_allowed AND in_bucket)::bigint "
+        "AS bucket_allowed,"
+        "count(*) FILTER "
+        "(WHERE decision_allowed AND in_bucket AND apns_alert_sent)::bigint "
+        "AS bucket_allowed_apns_alert_sent"
+    )
+    params = (start_hour, end_hour, start_day, end_day)
+    with db.get_pool().connection() as conn:
+        total = conn.execute(
+            base_sql + "SELECT " + count_sql + " FROM selected",
+            params,
+        ).fetchone()
+        lane_rows = conn.execute(
+            base_sql
+            + "SELECT lane,"
+            + count_sql
+            + " FROM selected GROUP BY lane ORDER BY lane",
+            params,
+        ).fetchall()
+
+    def render(row, *, offset: int = 0) -> dict:
+        return {
+            "total_decisions": int(row[offset] or 0),
+            "allowed": int(row[offset + 1] or 0),
+            "suppressed": int(row[offset + 2] or 0),
+            "apns_alert_sent": int(row[offset + 3] or 0),
+            "bucket_allowed": int(row[offset + 4] or 0),
+            "bucket_allowed_apns_alert_sent": int(row[offset + 5] or 0),
+        }
+
+    return {
+        "days": bounded_days,
+        "start_day": start_day.isoformat(),
+        "end_day": end_day.isoformat(),
+        "bucket": {
+            "start_hour_inclusive": start_hour,
+            "end_hour_exclusive": end_hour,
+            "crosses_midnight": start_hour > end_hour,
+            "purpose": "observation_only_not_product_policy",
+        },
+        **render(total),
+        "by_lane": {
+            str(row[0]): render(row, offset=1)
+            for row in lane_rows
+        },
+    }
 
 
 def wake_success_stats(*, within_hours: int = 24) -> dict:

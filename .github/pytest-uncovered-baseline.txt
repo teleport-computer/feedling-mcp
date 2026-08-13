@@ -412,7 +412,6 @@ tests/test_v2_prompt_invariant.py
 tests/test_v2_provenance.py
 tests/test_v2_provider_usage_tool.py
 tests/test_v2_push_delivery.py
-tests/test_v2_push_endpoint.py
 tests/test_v2_quoted_memory.py
 tests/test_v2_reaper.py
 tests/test_v2_reply_cursor_seq.py
