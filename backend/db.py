@@ -10405,6 +10405,21 @@ def chat_append_and_enqueue(
         ) = result
         if not inserted:
             return seq, None
+        # The authoritative owner invalidation has committed before _finish is
+        # entered.  NOTIFY is intentionally best-effort acceleration; a lost
+        # event is repaired by the parent reconciliation loop.
+        from core import wake_bus as core_wake_bus
+
+        for preempted in _preempted_jobs:
+            if preempted.claimed_by is None:
+                continue
+            core_wake_bus.notify_job_cancel(
+                core_wake_bus.JobCancellation(
+                    job_id=preempted.job_id,
+                    claimed_by=preempted.claimed_by,
+                    reason="foreground_chat_preempted",
+                )
+            )
         _mirror_superseded_voice_revisions(
             user_id,
             superseded_ids,

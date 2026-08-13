@@ -21,6 +21,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
 import db
+from core import wake_bus
 from model_api_runtime.v2 import jobs_store
 
 from conftest import seed_user
@@ -71,12 +72,22 @@ def _running_job(user_id: str, lane: str, worker_id: str) -> int:
     return job_id
 
 
-def test_chat_atomically_preempts_same_user_profile_and_keeps_return_tuple():
+def test_chat_atomically_preempts_same_user_profile_and_keeps_return_tuple(monkeypatch):
     uid = "u_atomic_preempt_profile"
     seed_user(uid)
     profile_id = _running_job(uid, "profile", "heavy-0:g1")
     msg_id = uuid.uuid4().hex
 
+    notifications = []
+
+    def _notify_after_commit(event):
+        with db.get_pool().connection() as conn:
+            status = conn.execute(
+                "SELECT status FROM agent_jobs WHERE id=%s", (event.job_id,)
+            ).fetchone()[0]
+        notifications.append((event, status))
+
+    monkeypatch.setattr(wake_bus, "notify_job_cancel", _notify_after_commit)
     result = db.chat_append_and_enqueue(
         uid,
         msg_id,
@@ -103,6 +114,14 @@ def test_chat_atomically_preempts_same_user_profile_and_keeps_return_tuple():
         ).fetchone()
     assert profile == ("superseded", "foreground_chat_preempted", None, None, None, None)
     assert chat == ("pending", "chat")
+    assert notifications == [
+        (
+            wake_bus.JobCancellation(
+                profile_id, "heavy-0:g1", "foreground_chat_preempted"
+            ),
+            "superseded",
+        )
+    ]
 
 
 @pytest.mark.parametrize("lane", ["scheduled", "capture"])
@@ -173,7 +192,9 @@ def test_chat_insert_failure_rolls_back_background_preemption(monkeypatch):
     def _boom(*args, **kwargs):
         raise RuntimeError("simulated chat insert failure")
 
+    notifications = []
     monkeypatch.setattr(jobs_store, "coalesce_or_insert_on_cursor", _boom)
+    monkeypatch.setattr(wake_bus, "notify_job_cancel", notifications.append)
     with pytest.raises(RuntimeError, match="simulated chat insert failure"):
         db.chat_append_and_enqueue(
             uid,
@@ -195,6 +216,7 @@ def test_chat_insert_failure_rolls_back_background_preemption(monkeypatch):
         ).fetchone()
     assert profile == ("running", "heavy-0:g1")
     assert message is None
+    assert notifications == []
 
 
 def test_rollback_on_job_failure_leaves_no_orphan_message(monkeypatch):

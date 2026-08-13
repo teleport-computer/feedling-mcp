@@ -4851,6 +4851,33 @@ def _reload_accounts_registry(user_id: str) -> None:
     accounts_registry.reload_users_after_notify(user_id)
 
 
+class _JobCancelRouter:
+    """Route a committed cancellation only to its exact current owner."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._by_claimed_by: dict[str, Callable[[], None]] = {}
+
+    def bind(self, claimed_by: str, cancel: Callable[[], None]) -> None:
+        with self._lock:
+            self._by_claimed_by[str(claimed_by)] = cancel
+
+    def unbind(self, claimed_by: str) -> None:
+        with self._lock:
+            self._by_claimed_by.pop(str(claimed_by), None)
+
+    def handle(self, event: core_wake_bus.JobCancellation) -> bool:
+        with self._lock:
+            cancel = self._by_claimed_by.get(event.claimed_by)
+        if cancel is None:
+            return False
+        cancel()
+        return True
+
+
+_JOB_CANCEL_ROUTER = _JobCancelRouter()
+
+
 def wire_assembly() -> None:
     """复刻 asgi/lifespan.py 的关键接线（本进程无 lifespan）：注入 envelope pubkey getter、
     载入内存 registry、起 wake-bus listener、接上 "v2_jobs" 即时唤醒（FIX 3）。幂等
@@ -4863,6 +4890,7 @@ def wire_assembly() -> None:
     accounts_registry.load_users()
     core_wake_bus.register_handler("users", _reload_accounts_registry)
     core_wake_bus.register_handler("v2_jobs", v2_worker.on_v2_job_notify)
+    core_wake_bus.register_job_cancel_handler(_JOB_CANCEL_ROUTER.handle)
     core_wake_bus.start_listener()
 
 

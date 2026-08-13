@@ -95,6 +95,24 @@ def test_heartbeat_records_full_capacity_when_progress_just_under_threshold(monk
     assert kwargs == {"capacity": 4, "kind": "turn", "pool": "foreground"}
 
 
+def test_job_cancel_router_ignores_stale_owner_and_targets_exact_claim():
+    router = serve_worker._JobCancelRouter()
+    cancelled = []
+    router.bind("worker:heavy:0:g8", lambda: cancelled.append("heavy-0:g8"))
+
+    stale = serve_worker.core_wake_bus.JobCancellation(
+        3694, "worker:heavy:0:g7", "foreground_chat_preempted"
+    )
+    current = serve_worker.core_wake_bus.JobCancellation(
+        3694, "worker:heavy:0:g8", "foreground_chat_preempted"
+    )
+
+    assert router.handle(stale) is False
+    assert cancelled == []
+    assert router.handle(current) is True
+    assert cancelled == ["heavy-0:g8"]
+
+
 def test_heartbeat_survives_missing_last_progress_age_sec(monkeypatch):
     """`poll_liveness()` contract always includes `last_progress_age_sec`, but the
     heartbeat loop must not crash if a supervisor implementation omits it — treat
