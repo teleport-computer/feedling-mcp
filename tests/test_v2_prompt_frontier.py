@@ -859,11 +859,24 @@ def test_late_input_is_in_required_frontier_before_first_provider_call(monkeypat
     assert caught.value.required_components == ("message_context",)
 
 
-def test_tool_catalog_pressure_reaches_provider_with_core_floor_not_huge_tail(
+def test_fourteen_mcp_catalog_pressure_reaches_provider_with_memory_floor(
     monkeypatch,
 ):
+    """The reported MCP cardinality must retain real provider memory tools.
+
+    This intentionally crosses the planner/tool-loop seam: assertions inspect
+    the ``tools`` array received by the fake provider, not the frontier plan.
+    """
     calls = []
     surfaces = []
+    mcp_tools = [
+        ToolSpec(
+            f"mcp__connected__tool_{index}",
+            "user-selected connected capability",
+            {"type": "object", "properties": {}},
+        )
+        for index in range(14)
+    ]
 
     async def provider(_config, messages, *, tools=None, **kwargs):
         calls.append((list(messages), tools))
@@ -890,6 +903,7 @@ def test_tool_catalog_pressure_reaches_provider_with_core_floor_not_huge_tail(
             context_window_tokens=20_000,
         ),
         extra_tool_specs=[
+            *mcp_tools,
             ToolSpec(
                 "large_read",
                 "z" * 60_000,
@@ -904,9 +918,17 @@ def test_tool_catalog_pressure_reaches_provider_with_core_floor_not_huge_tail(
     assert outcome.final_text == "text-only"
     assert len(calls) == 1
     sent_names = {spec.name for spec in calls[0][1]}
-    assert {"memory_index", "memory_write", "reply"}.issubset(sent_names)
+    assert {
+        "memory_index",
+        "memory_search",
+        "memory_fetch",
+        "memory_write",
+        "memory_organize",
+        "reply",
+    }.issubset(sent_names)
+    assert {tool.name for tool in mcp_tools}.issubset(sent_names)
     assert "large_read" not in sent_names
-    assert len(sent_names) < len(tool_loop._catalog()) + 1
+    assert len(sent_names) < len(tool_loop._catalog()) + len(mcp_tools) + 1
     assert len(surfaces) == 1
     surface = surfaces[0]
     assert surface["round"] == 1
@@ -915,8 +937,8 @@ def test_tool_catalog_pressure_reaches_provider_with_core_floor_not_huge_tail(
     assert surface["dropped_tool_count"] == (
         surface["candidate_tool_count"] - surface["sent_tool_count"]
     )
-    assert surface["mcp_candidate_tool_count"] == 1
-    assert surface["mcp_sent_tool_count"] == 0
+    assert surface["mcp_candidate_tool_count"] == 15
+    assert surface["mcp_sent_tool_count"] == 14
     assert surface["mcp_dropped_tool_count"] == 1
     assert surface["reason"] == "frontier_omitted"
     assert calls[0][0] == [{"role": "system", "content": "stable prefix"}]
