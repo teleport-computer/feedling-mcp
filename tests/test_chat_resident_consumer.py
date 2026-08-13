@@ -1160,6 +1160,17 @@ def test_plaintext_history_uses_backend_without_bulk_enclave(monkeypatch):
     assert result[0]["content"] == "hello local"
 
 
+def test_resident_plaintext_envelope_helpers_never_call_enclave(monkeypatch):
+    monkeypatch.setattr(
+        crc,
+        "_ENCLAVE_CLIENT",
+        object(),
+    )
+
+    assert crc._decrypt_envelope({"body": "mcp local"}) == b"mcp local"
+    assert crc._decrypt_sealed_material({"body": "genesis local"}) == b"genesis local"
+
+
 def test_image_message_passes_image_context_to_agent(monkeypatch, tmp_path):
     monkeypatch.setattr(crc, "IMAGE_TEMP_DIR", tmp_path)
     msg = _make_image_msg(ts=2100.0)
@@ -3986,34 +3997,37 @@ def test_migrate_job_fails_when_legacy_batch_response_missing(monkeypatch):
     assert all(row[2] != "migrate_no_legacy" for row in statuses)
 
 
-def test_capture_identity_context_prefers_enclave_plaintext_and_filters_ciphertext(monkeypatch):
+def test_capture_identity_context_decodes_plaintext_without_enclave(monkeypatch):
     calls = []
 
     def _get_json(path, **kwargs):
         calls.append((path, kwargs.get("base_url")))
+        if kwargs.get("base_url"):
+            raise AssertionError("plaintext identity must not call enclave")
         return {
             "identity": {
-                "agent_name": "IO",
-                "user_preferred_name": "Seven",
-                "self_introduction": "陪 Seven 一起生活。",
-                "dimensions": [{"key": "tone", "value": "direct"}],
-                "body_ct": "ciphertext-must-not-enter-prompt",
-                "K_user": "wrapped-key-must-not-enter-prompt",
+                "body": json.dumps({
+                    "agent_name": "IO",
+                    "user_preferred_name": "Seven",
+                    "self_introduction": "陪 Seven 一起生活。",
+                    "dimensions": [{"key": "tone", "value": "direct"}],
+                }),
+                "owner_user_id": "usr_plain",
+                "visibility": "shared",
             }
         }
 
     monkeypatch.setattr(crc, "FEEDLING_ENCLAVE_URL", "http://enclave.local")
     monkeypatch.setattr(crc, "_capture_get_json", _get_json)
+    monkeypatch.setitem(crc._whoami_cache, "user_id", "usr_plain")
 
     identity, ai_name, user_name, identity_text = crc._capture_identity_context()
 
-    assert calls == [("/v1/identity/get", "http://enclave.local")]
+    assert calls == [("/v1/identity/get", None)]
     assert ai_name == "IO"
     assert user_name == "Seven"
     assert identity["self_introduction"] == "陪 Seven 一起生活。"
-    assert "body_ct" not in identity_text
-    assert "K_user" not in identity_text
-    assert "ciphertext-must-not-enter-prompt" not in identity_text
+    assert "body" not in identity_text
 
 
 def test_capture_job_add_card_writes_envelope_without_chat_or_delivery(monkeypatch):

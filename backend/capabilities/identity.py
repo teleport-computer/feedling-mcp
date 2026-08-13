@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 
 from core import enclave as core_enclave
+from core import envelope as core_envelope
 from identity import card_view, identity_core
 
 from capabilities import errors
@@ -41,16 +42,22 @@ def get(store, *, api_key=None, runtime_token=None, params=None) -> CapabilityRe
     identity = body.get("identity") if isinstance(body, dict) else None
     if not isinstance(identity, dict):
         return ok(data=errors.cap_data(body))  # no card written yet
-    if not identity.get("body_ct"):
-        return ok(data=errors.cap_data(body))  # already plaintext; nothing to open
-
+    if not any(key in identity for key in ("body", "body_b64", "body_ct")):
+        # Compatibility with injected/older identity adapters that already
+        # return a materialized plaintext view rather than a stored envelope.
+        return ok(data=errors.cap_data(body))
     base = card_view.envelope_base(identity)
     if identity.get("visibility") == "local_only":
         return ok(data=errors.cap_data({"identity": card_view.local_only_view(base)}))
 
     try:
-        raw = core_enclave._decrypt_envelope_via_enclave(
-            identity, api_key, purpose="identity_get", runtime_token=runtime_token or "")
+        shape = core_envelope.classify_envelope_shape(identity)
+        if shape in ("plaintext_text", "plaintext_binary"):
+            raw = core_envelope.read_plaintext_envelope_body(
+                identity, owner_user_id=str(getattr(store, "user_id", "") or ""))
+        else:
+            raw = core_enclave._decrypt_envelope_via_enclave(
+                identity, api_key, purpose="identity_get", runtime_token=runtime_token or "")
         inner = json.loads(raw.decode("utf-8"))
         if not isinstance(inner, dict):
             raise ValueError("identity_plaintext_not_object")

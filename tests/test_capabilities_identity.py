@@ -12,6 +12,36 @@ def test_get_wraps(monkeypatch):
     assert r.ok is True and r.data["identity"]["days_with_user"] == 3
 
 
+def test_get_decodes_plaintext_identity_without_enclave(monkeypatch):
+    import types
+
+    store = types.SimpleNamespace(user_id="usr_plain")
+    monkeypatch.setattr(
+        identity_core,
+        "get_identity",
+        lambda _store: ({"identity": {
+            "v": 1,
+            "body": '{"agent_name":"Mira","self_introduction":"hello"}',
+            "owner_user_id": "usr_plain",
+            "visibility": "shared",
+            "days_with_user": 4,
+        }}, 200),
+    )
+    monkeypatch.setattr(
+        cap_identity.core_enclave,
+        "_decrypt_envelope_via_enclave",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("plaintext identity must not call enclave")
+        ),
+    )
+
+    result = cap_identity.get(store)
+
+    assert result.ok is True
+    assert result.data["identity"]["agent_name"] == "Mira"
+    assert result.data["identity"]["days_with_user"] == 4
+
+
 def test_patch_builds_profile_patch_action(monkeypatch):
     seen = {}
     def fake_run_actions(store, payload, *, api_key, runtime_token, trusted_relationship_anchor=None):

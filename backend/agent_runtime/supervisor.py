@@ -776,23 +776,24 @@ def _fetch_identity_plain_for_intro(entry: dict, *, api_url: str, enclave_url: s
     )
     if not headers:
         return None, "auth_missing"
-    if str(entry.get("content_encryption") or "").strip().lower() == "off":
-        try:
-            from core import envelope as core_envelope
-            from identity import card_view
+    try:
+        from core import envelope as core_envelope
+        from identity import card_view
 
-            resp = httpx.get(
-                f"{api_url.rstrip('/')}/v1/identity/get",
-                headers=headers,
-                timeout=10,
-            )
-            if resp.status_code == 404:
-                return None, "identity_not_found"
-            resp.raise_for_status()
-            body = resp.json()
-            stored = body.get("identity") if isinstance(body, dict) else None
-            if not isinstance(stored, dict):
-                return None, "identity_not_initialized"
+        resp = httpx.get(
+            f"{api_url.rstrip('/')}/v1/identity/get",
+            headers=headers,
+            timeout=10,
+        )
+        if resp.status_code == 404:
+            return None, "identity_not_found"
+        resp.raise_for_status()
+        body = resp.json()
+        stored = body.get("identity") if isinstance(body, dict) else None
+        if not isinstance(stored, dict):
+            return None, "identity_not_initialized"
+        shape = core_envelope.classify_envelope_shape(stored)
+        if shape in ("plaintext_text", "plaintext_binary"):
             raw = core_envelope.read_plaintext_envelope_body(
                 stored,
                 owner_user_id=str(entry.get("user_id") or ""),
@@ -806,8 +807,8 @@ def _fetch_identity_plain_for_intro(entry: dict, *, api_url: str, enclave_url: s
                 stored,
                 days_with_user=int(stored.get("days_with_user") or 0),
             ), ""
-        except Exception as e:  # noqa: BLE001
-            return None, f"identity_fetch_failed:{type(e).__name__}"
+    except Exception as e:  # noqa: BLE001
+        return None, f"identity_fetch_failed:{type(e).__name__}"
     if not str(enclave_url or "").strip():
         return None, "enclave_url_missing"
     try:

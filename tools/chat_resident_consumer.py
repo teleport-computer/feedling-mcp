@@ -141,6 +141,8 @@ import generated_image
 # Shared torn-protocol-JSON leak detector (backend/core, pure). backend/ is on
 # sys.path via the insert above, so it imports as a top-level `core.*` name.
 from core import protocol_leak as _protocol_leak
+from core import envelope as _core_envelope
+from identity import card_view as _identity_card_view
 # 世界书注入侧的标头/上限/截断标记与 V2 共用同一份定义(纯模块,无 enclave 依赖)。
 # 各写一份就会漂——本文件前台原本就漂成了没有 UNTRUSTED 标注的弱版本。
 import worldbook_match as _worldbook_match
@@ -10641,6 +10643,12 @@ def _decrypt_envelope(envelope: dict) -> bytes:
     the consumer already uses for chat/memory — no new trust surface. Auth rides
     the shared ``_HEADERS`` (runtime-token or api-key, kept fresh by
     ``_refresh_auth_header``)."""
+    if not envelope.get("body_ct"):
+        if envelope.get("body_b64") is not None:
+            return base64.b64decode(envelope["body_b64"], validate=True)
+        if isinstance(envelope.get("body"), str):
+            return envelope["body"].encode("utf-8")
+        raise ValueError("envelope_shape_unrecognized")
     if not FEEDLING_ENCLAVE_URL or _ENCLAVE_CLIENT is None:
         raise RuntimeError("enclave_unavailable")
     resp = _ENCLAVE_CLIENT.post(
@@ -13045,15 +13053,48 @@ def _capture_context_text(value: Any, *, empty: str = "（暂无）") -> str:
         return str(value)[:CAPTURE_CONTEXT_MAX_CHARS]
 
 
+def _resident_identity_view() -> dict:
+    """Read plaintext cards locally; ask the enclave only for sealed cards."""
+    body = _capture_get_json("/v1/identity/get")
+    stored = body.get("identity") if isinstance(body.get("identity"), dict) else None
+    if not isinstance(stored, dict):
+        return {}
+
+    shape = _core_envelope.classify_envelope_shape(stored)
+    if shape in ("plaintext_text", "plaintext_binary"):
+        if stored.get("visibility") == "local_only":
+            return _identity_card_view.local_only_view(
+                _identity_card_view.envelope_base(stored))
+        try:
+            raw = _core_envelope.read_plaintext_envelope_body(
+                stored,
+                owner_user_id=str(_whoami_cache.get("user_id") or ""),
+            )
+            inner = json.loads(raw.decode("utf-8"))
+            if not isinstance(inner, dict):
+                return {}
+            return _identity_card_view.plaintext_view(
+                _identity_card_view.envelope_base(stored),
+                inner,
+                stored,
+                days_with_user=int(stored.get("days_with_user") or 0),
+            )
+        except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
+            return {}
+
+    if shape != "sealed" or not FEEDLING_ENCLAVE_URL:
+        # Compatibility: some injected/older backends already return a materialized
+        # card view rather than an envelope. It is plaintext and stays local.
+        return stored if not stored.get("body_ct") else {}
+
+    decrypted = _capture_get_json(
+        "/v1/identity/get", base_url=FEEDLING_ENCLAVE_URL)
+    identity = decrypted.get("identity")
+    return identity if isinstance(identity, dict) else {}
+
+
 def _capture_identity_context() -> tuple[dict, str, str, str]:
-    body = (
-        _capture_get_json("/v1/identity/get", base_url=FEEDLING_ENCLAVE_URL)
-        if FEEDLING_ENCLAVE_URL
-        else {}
-    )
-    if not isinstance(body.get("identity"), dict):
-        body = _capture_get_json("/v1/identity/get")
-    identity = body.get("identity") if isinstance(body.get("identity"), dict) else {}
+    identity = _resident_identity_view()
     identity = {
         key: value
         for key, value in identity.items()
@@ -16297,6 +16338,12 @@ def _decrypt_sealed_material(env: dict) -> bytes:
 
     Same decrypt the consumer already uses for chat/memory — the envelope is the
     identical v1 shape, so no new crypto path is introduced."""
+    if not env.get("body_ct"):
+        if env.get("body_b64") is not None:
+            return base64.b64decode(env["body_b64"], validate=True)
+        if isinstance(env.get("body"), str):
+            return env["body"].encode("utf-8")
+        raise ValueError("envelope_shape_unrecognized")
     if not FEEDLING_ENCLAVE_URL or _ENCLAVE_CLIENT is None:
         raise RuntimeError("enclave_not_configured")
     resp = _ENCLAVE_CLIENT.post(
@@ -17210,13 +17257,7 @@ def _resident_existing_identity() -> dict:
     keeps fields the upload doesn't mention (parallel to the cloud card merge).
     {} => fresh derive (old behavior). VPS has no genesis persona, so this is card-only."""
     try:
-        body = (
-            _capture_get_json("/v1/identity/get", base_url=FEEDLING_ENCLAVE_URL)
-            if FEEDLING_ENCLAVE_URL else {}
-        )
-        if not isinstance(body.get("identity"), dict):
-            body = _capture_get_json("/v1/identity/get")
-        identity = body.get("identity") if isinstance(body.get("identity"), dict) else {}
+        identity = _resident_identity_view()
         from identity import distill_prompt_v1 as _dp
         return {
             k: identity[k]
@@ -17234,13 +17275,7 @@ def _resident_current_replaced_at() -> str:
     ``_resident_existing_identity``; "" on any failure or missing field (never raises,
     never invents a value)."""
     try:
-        body = (
-            _capture_get_json("/v1/identity/get", base_url=FEEDLING_ENCLAVE_URL)
-            if FEEDLING_ENCLAVE_URL else {}
-        )
-        if not isinstance(body.get("identity"), dict):
-            body = _capture_get_json("/v1/identity/get")
-        identity = body.get("identity") if isinstance(body.get("identity"), dict) else {}
+        identity = _resident_identity_view()
         return str(identity.get("replaced_at") or "")
     except Exception:
         return ""

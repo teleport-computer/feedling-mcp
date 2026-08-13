@@ -43,6 +43,31 @@ def test_plaintext_chunk_round_trips_without_crypto_fields(monkeypatch):
     assert service.chunk_envelope_from_row(row) == meta
 
 
+def test_existing_plaintext_identity_for_update_never_calls_enclave(monkeypatch):
+    store = _store("usr_plain")
+    monkeypatch.setattr(
+        service.identity_service,
+        "_load_identity",
+        lambda _store: {
+            "body": '{"agent_name":"Mira"}',
+            "owner_user_id": "usr_plain",
+            "visibility": "shared",
+        },
+    )
+    monkeypatch.setattr(
+        service.core_enclave,
+        "_enclave_get_json_for_gate",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("plaintext identity must not call enclave")
+        ),
+    )
+
+    identity, error = service._existing_identity_plain_for_update(store, None)
+
+    assert identity == {"agent_name": "Mira"}
+    assert error == ""
+
+
 def test_genesis_state_maps_active_job_to_processing_gate_status(monkeypatch):
     captured = {}
     monkeypatch.setattr(

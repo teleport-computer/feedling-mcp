@@ -325,7 +325,6 @@ def test_fetch_intro_identity_plaintext_uses_backend_not_enclave(monkeypatch):
         {
             "user_id": "u_1",
             "api_key": "k",
-            "content_encryption": "off",
         },
         api_url="http://backend",
         enclave_url="https://enclave",

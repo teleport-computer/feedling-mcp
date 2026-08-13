@@ -1410,7 +1410,23 @@ def _identity_payload_from_existing_plain(identity: dict | None) -> dict:
     return payload
 
 
-def _existing_identity_plain_for_update(api_key: str | None, runtime_token: str = "") -> tuple[dict | None, str]:
+def _existing_identity_plain_for_update(
+    store: UserStore,
+    api_key: str | None,
+    runtime_token: str = "",
+) -> tuple[dict | None, str]:
+    stored = identity_service._load_identity(store)
+    shape = core_envelope.classify_envelope_shape(stored)
+    if shape in ("plaintext_text", "plaintext_binary"):
+        try:
+            raw = core_envelope.read_plaintext_envelope_body(
+                stored, owner_user_id=store.user_id)
+            inner = json.loads(raw.decode("utf-8"))
+            if not isinstance(inner, dict):
+                raise ValueError("identity plaintext is not an object")
+            return inner, ""
+        except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+            return None, f"identity_plain_invalid:{type(exc).__name__}"
     if not api_key and not runtime_token:
         return None, "api_key_unavailable"
     data, err = core_enclave._enclave_get_json_for_gate(
@@ -1451,7 +1467,8 @@ def init_identity_if_absent(
 
     base_payload = {"agent_name": "", "self_introduction": "", "dimensions": []}
     if existing:
-        existing_plain, err = _existing_identity_plain_for_update(api_key, runtime_token)
+        existing_plain, err = _existing_identity_plain_for_update(
+            store, api_key, runtime_token)
         if existing_plain is not None:
             base_payload = _identity_payload_from_existing_plain(existing_plain)
         elif str(existing.get("relationship_anchor_source") or "") != GENESIS_SOURCE:
@@ -1675,7 +1692,8 @@ def replace_identity_preserving_anchor(
             snapshot = identity_service._load_identity(store)
             if not snapshot:
                 return "identity_not_initialized"
-            existing_plain, _plain_err = _existing_identity_plain_for_update(api_key, runtime_token)
+            existing_plain, _plain_err = _existing_identity_plain_for_update(
+                store, api_key, runtime_token)
             if existing_plain is None:
                 return "identity_plain_unavailable"
 
