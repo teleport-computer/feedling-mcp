@@ -19,6 +19,14 @@ change must not be interpreted as an API guarantee.
   envelope and verification chain, and plaintext photos keep derived place labels
   on-device rather than adding them to the plaintext request.
 
+- **Plaintext content now stays outside the enclave across normal read and
+  processing workflows.** Memory, History Search/Fetch, World Book, Hosted and
+  resident Chat, Identity, attachments, voice reconstruction, Genesis persona
+  paths, and reasoning metadata route per stored record. `body` and `body_b64`
+  are processed locally, while only `body_ct` projections enter enclave
+  decrypt/readside endpoints. Mixed encrypted/plaintext history preserves its
+  existing ordering, cursor, authorization, and resource-limit behavior.
+
 - **Plaintext-account Genesis imports now commit and resume without entering the
   enclave decrypt path.** Estimate/commit staged uploads and resumable
   checkpoints read plaintext envelopes locally, while encrypted accounts keep

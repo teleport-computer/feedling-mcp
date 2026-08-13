@@ -406,6 +406,16 @@ preference, and precedence is `body_ct`, then `body_b64`, then `body`. The
 [`/v1/content/swap`](/docs/workflows/memory) endpoint converts existing inline
 records between encrypted and plaintext shapes.
 
+This routing rule is also a service boundary, not only a decoding convenience.
+Normal backend and hosted-runtime workflows do not submit `body` or `body_b64`
+to enclave decrypt or readside endpoints. Batch features such as Memory,
+History Search/Fetch, and World Book partition mixed inputs by record, process
+plaintext partitions locally, and send only sealed projections to the enclave.
+Consequently, an enclave outage does not make plaintext-tier Chat, Genesis,
+Identity, attachments, or readside operations unavailable. Defensive plaintext
+handling may remain inside compatibility endpoints, but it is not the normal
+application path.
+
 Changing the preference does not re-encrypt or decrypt history on its own; it
 governs new writes, and existing records convert only through the swap endpoint.
 Encrypted old-client uploads remain accepted for a plaintext-tier account so a
