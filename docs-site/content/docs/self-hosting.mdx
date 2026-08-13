@@ -76,6 +76,14 @@ A functional deployment can include:
 | WebSocket ingest | Screen/broadcast ingestion | The ASGI background service binds the configured ingest port, normally 9998. |
 | APNs credentials | Apple push and Live Activity | Optional; Chat storage works without push delivery. |
 | Object storage configuration | Large frames, chat files, and onboarding archives where enabled | Inventory and back up this data separately from PostgreSQL. |
+| CPU history recorder | Optional private operational history | Provide a protected, path-allowlisted Docker socket proxy and a dedicated persistent volume; expose neither service publicly. |
+
+The managed Phala CPU-history topology is optional operational infrastructure,
+not an application API. A self-hosted operator who adopts it must provide and
+secure their own Docker socket proxy and persistent volume, keep the recorder
+off public networks, and define retention appropriate to that deployment.
+Copying this topology does not create tenant isolation or make a generic host a
+confidential-computing boundary.
 
 The resident consumer requires an `openssl` binary on `PATH` if any
 user-configured [MCP server](/docs/workflows/mcp) is registered over HTTPS with a

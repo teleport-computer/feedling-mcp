@@ -115,9 +115,11 @@ block, or mark any business service unhealthy. Both services may use
 
 Mounting the Docker socket, even read-only, grants a caller broad effective
 control through the Docker API. The recorder therefore receives no socket
-mount. Only the proxy holds the mount, and its allowlist is limited to the
-minimum endpoints required for container enumeration, daemon information if
-needed for CPU normalization, and container stats.
+mount. Only the proxy holds the mount, and its allowlist is limited to GETs on
+the two paths required for running-container enumeration and container stats.
+The proxy matches URL paths rather than query strings, so the recorder itself
+fixes the requests to `all=0` and `stream=false`. Container inspect, logs,
+images, daemon information, version, and all mutation methods remain denied.
 
 The proxy is reachable only on an internal Compose network shared with the
 recorder. It has no published port and no credentials or Feedling application

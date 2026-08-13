@@ -198,6 +198,16 @@ jobs:
           printf 'Running %d resident consumer test files\n' "${#consumer_tests[@]}"
           python -m pytest "${consumer_tests[@]}" -v
 
+      - name: Run Phala CPU recorder regression suite
+        env:
+          PYTHONPATH: backend
+        run: |
+          python -m pytest \
+            tests/test_cpu_recorder.py \
+            tests/test_cpu_recorder_compose.py \
+            tests/test_cpu_socket_proxy_integration.py \
+            -v
+
       - name: Guard top-level pytest discovery coverage
         run: |
           export LC_ALL=C
