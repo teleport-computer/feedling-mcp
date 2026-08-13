@@ -199,6 +199,8 @@ jobs:
           python -m pytest "${consumer_tests[@]}" -v
 
       - name: Run Phala CPU recorder regression suite
+        env:
+          PYTHONPATH: backend
         run: |
           python -m pytest \
             tests/test_cpu_recorder.py \
