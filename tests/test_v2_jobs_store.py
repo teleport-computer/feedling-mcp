@@ -1614,8 +1614,8 @@ def test_completed_wake_retry_cannot_overwrite_newer_glance_source():
 
 
 def test_live_worker_count_counts_only_recent():
-    jobs_store.record_worker_heartbeat("w-fresh-1")
-    jobs_store.record_worker_heartbeat("w-fresh-2")
+    jobs_store.record_worker_heartbeat("w-fresh-1", pool="foreground")
+    jobs_store.record_worker_heartbeat("w-fresh-2", pool="foreground")
     # 塞一个陈旧心跳（beat_at 在窗口外）
     with db.get_pool().connection() as conn:
         conn.execute(
@@ -1679,8 +1679,10 @@ def test_genesis_heartbeat_does_not_inflate_turn_worker_liveness():
     single-process pool and over-admit onto turn slots that do not exist.
     """
     _clear_heartbeats()
-    jobs_store.record_worker_heartbeat("w1")  # default kind='turn'
-    jobs_store.record_worker_heartbeat("w1:genesis", kind="genesis")
+    jobs_store.record_worker_heartbeat("w1", pool="foreground")
+    jobs_store.record_worker_heartbeat(
+        "w1:genesis", pool="control", kind="genesis"
+    )
 
     assert jobs_store.live_worker_count() == 1
     assert jobs_store.workers_alive() is True
@@ -1690,7 +1692,9 @@ def test_genesis_heartbeat_does_not_inflate_turn_worker_liveness():
 def test_genesis_heartbeat_alone_does_not_open_the_send_gate():
     """Genesis alive but every turn worker dead => send must still 503."""
     _clear_heartbeats()
-    jobs_store.record_worker_heartbeat("only:genesis", kind="genesis")
+    jobs_store.record_worker_heartbeat(
+        "only:genesis", pool="control", kind="genesis"
+    )
 
     assert jobs_store.workers_alive() is False
     assert jobs_store.live_worker_count() == 0
@@ -1704,9 +1708,17 @@ def test_genesis_worker_alive_false_when_nothing_beats():
 
 def test_recent_worker_heartbeats_returns_identity_kind_capacity_and_db_age():
     _clear_heartbeats()
-    jobs_store.record_worker_heartbeat("v2-worker-new-deadbeef1234", capacity=4)
     jobs_store.record_worker_heartbeat(
-        "v2-worker-new-deadbeef1234:genesis", kind="genesis", capacity=0
+        "v2-worker-new-deadbeef1234",
+        pool="foreground",
+        capacity=4,
+        runtime_state={"slot": "foreground-0", "job_id": "job-123"},
+    )
+    jobs_store.record_worker_heartbeat(
+        "v2-worker-new-deadbeef1234:genesis",
+        pool="control",
+        kind="genesis",
+        capacity=0,
     )
     with db.get_pool().connection() as conn:
         conn.execute(
@@ -1724,7 +1736,14 @@ def test_recent_worker_heartbeats_returns_identity_kind_capacity_and_db_age():
     turn = next(row for row in rows if row["kind"] == "turn")
     genesis = next(row for row in rows if row["kind"] == "genesis")
     assert turn["capacity"] == 4
+    assert turn["pool"] == "foreground"
+    assert turn["runtime_state"] == {
+        "slot": "foreground-0",
+        "job_id": "job-123",
+    }
     assert genesis["capacity"] == 0
+    assert genesis["pool"] == "control"
+    assert genesis["runtime_state"] == {}
     assert turn["age_sec"] >= 0
     assert isinstance(turn["beat_at_epoch"], float)
 

@@ -200,7 +200,7 @@ def model_api_chat_send_core(
     # v2_worker_heartbeats table each live serve_worker UPSERTs every ~10s.
     # ``workers_unavailable`` is the sole managed-host liveness error; no
     # resident supervisor is consulted or offered as a fallback.
-    if not jobs_store.workers_alive():
+    if not jobs_store.workers_alive(pool="foreground"):
         debug_trace.trace_event(
             store, subsystem="route", type="route.decided", actor="host_agent_runtime",
             status="gated", summary="workers_unavailable",
@@ -227,7 +227,9 @@ def model_api_chat_send_core(
     # fail-open（放行）——此闸绝不能自身变成故障源。
     _inflight = _workers = 0
     try:
-        _workers = jobs_store.live_worker_capacity(within_sec=30)
+        _workers = jobs_store.live_worker_capacity(
+            within_sec=30, pool="foreground"
+        )
         _inflight = jobs_store.inflight_job_count()
         _mean = jobs_store.recent_mean_service_sec(lane="chat", limit=admission.SERVICE_SAMPLE_N)
         _est = admission.estimate_wait_sec(

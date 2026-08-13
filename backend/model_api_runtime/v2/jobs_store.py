@@ -3786,7 +3786,12 @@ def get_runtime_state(user_id) -> dict:
 
 
 def record_worker_heartbeat(
-    worker_id: str, *, kind: str = "turn", capacity: int = 1
+    worker_id: str,
+    *,
+    pool: str,
+    kind: str = "turn",
+    capacity: int = 1,
+    runtime_state: dict[str, object] | None = None,
 ) -> None:
     """UPSERT this process's liveness row (turn loops every ~10s via
     serve_worker._heartbeat_loop; the genesis thread every tick with
@@ -3798,41 +3803,57 @@ def record_worker_heartbeat(
     """
     with _pool().connection() as conn:
         conn.execute(
-            "INSERT INTO v2_worker_heartbeats (worker_id, beat_at, kind, capacity) "
-            "VALUES (%s, now(), %s, %s) "
+            "INSERT INTO v2_worker_heartbeats "
+            "(worker_id, beat_at, kind, capacity, pool, runtime_state) "
+            "VALUES (%s, now(), %s, %s, %s, %s) "
             "ON CONFLICT (worker_id) DO UPDATE SET beat_at = now(), "
-            "kind = EXCLUDED.kind, capacity = EXCLUDED.capacity",
-            (str(worker_id), str(kind), max(0, int(capacity))),
+            "kind = EXCLUDED.kind, capacity = EXCLUDED.capacity, "
+            "pool = EXCLUDED.pool, runtime_state = EXCLUDED.runtime_state",
+            (
+                str(worker_id),
+                str(kind),
+                max(0, int(capacity)),
+                str(pool),
+                Jsonb(dict(runtime_state or {})),
+            ),
         )
 
 
-def workers_alive(*, within_sec: int = 30) -> bool:
+def workers_alive(*, within_sec: int = 30, pool: str | None = None) -> bool:
     """True iff at least one serve_worker TURN process has recorded a heartbeat
     within the last ``within_sec`` seconds. Used by the chat/send v2 liveness
     guard. Genesis heartbeats are deliberately invisible here — a live genesis
     thread says nothing about whether any turn slot exists to drain the job."""
     with _pool().connection() as conn:
         with conn.cursor() as cur:
-            cur.execute(
+            query = (
                 "SELECT EXISTS(SELECT 1 FROM v2_worker_heartbeats "
                 "WHERE kind = 'turn' AND capacity > 0 "
-                "AND beat_at > now() - make_interval(secs => %s))",
-                (int(within_sec),),
+                "AND beat_at > now() - make_interval(secs => %s)"
             )
+            params: list[object] = [int(within_sec)]
+            if pool is not None:
+                query += " AND pool = %s"
+                params.append(str(pool))
+            cur.execute(query + ")", params)
             return bool(cur.fetchone()[0])
 
 
-def live_worker_count(*, within_sec: int = 30) -> int:
+def live_worker_count(*, within_sec: int = 30, pool: str | None = None) -> int:
     """窗口内有心跳的 serve_worker TURN 进程数（workers_alive 的计数版，喂 admission
     ceiling）。genesis 心跳不计入——它不占 turn 槽位。"""
     with _pool().connection() as conn:
         with conn.cursor() as cur:
-            cur.execute(
+            query = (
                 "SELECT count(*) FROM v2_worker_heartbeats "
                 "WHERE kind = 'turn' AND capacity > 0 "
-                "AND beat_at > now() - make_interval(secs => %s)",
-                (int(within_sec),),
+                "AND beat_at > now() - make_interval(secs => %s)"
             )
+            params: list[object] = [int(within_sec)]
+            if pool is not None:
+                query += " AND pool = %s"
+                params.append(str(pool))
+            cur.execute(query, params)
             return int(cur.fetchone()[0])
 
 
@@ -3853,15 +3874,20 @@ def live_genesis_worker_ids(*, within_sec: int = 30) -> list[str]:
             return [str(r[0]) for r in cur.fetchall()]
 
 
-def live_worker_capacity(*, within_sec: int = 30) -> int:
+def live_worker_capacity(*, within_sec: int = 30, pool: str | None = None) -> int:
     """Sum executable turn slots, not heartbeat processes."""
     with _pool().connection() as conn:
         with conn.cursor() as cur:
-            cur.execute(
+            query = (
                 "SELECT COALESCE(sum(capacity),0) FROM v2_worker_heartbeats "
-                "WHERE kind='turn' AND beat_at > now() - make_interval(secs => %s)",
-                (int(within_sec),),
+                "WHERE kind='turn' "
+                "AND beat_at > now() - make_interval(secs => %s)"
             )
+            params: list[object] = [int(within_sec)]
+            if pool is not None:
+                query += " AND pool = %s"
+                params.append(str(pool))
+            cur.execute(query, params)
             return int(cur.fetchone()[0])
 
 
@@ -3895,7 +3921,7 @@ def recent_worker_heartbeats(*, within_sec: int = 300, limit: int = 50) -> list[
     with _pool().connection() as conn:
         with conn.cursor(row_factory=dict_row) as cur:
             cur.execute(
-                "SELECT worker_id, kind, capacity, "
+                "SELECT worker_id, kind, capacity, pool, runtime_state, "
                 "EXTRACT(EPOCH FROM beat_at) AS beat_at_epoch, "
                 "GREATEST(0, EXTRACT(EPOCH FROM (now() - beat_at))) AS age_sec "
                 "FROM v2_worker_heartbeats "
@@ -3910,6 +3936,8 @@ def recent_worker_heartbeats(*, within_sec: int = 300, limit: int = 50) -> list[
             "worker_id": str(row["worker_id"]),
             "kind": str(row["kind"]),
             "capacity": int(row["capacity"] or 0),
+            "pool": str(row["pool"]),
+            "runtime_state": dict(row["runtime_state"] or {}),
             "beat_at_epoch": float(row["beat_at_epoch"]),
             "age_sec": float(row["age_sec"]),
         }

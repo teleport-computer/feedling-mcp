@@ -4936,6 +4936,7 @@ async def _heartbeat_loop(
     stop_event: asyncio.Event,
     *,
     supervisor: v2_child_supervisor.ChildSupervisor,
+    pool: str,
     interval: float = _HEARTBEAT_INTERVAL_SEC,
     capacity_stale_sec: float = _CAPACITY_STALE_SEC,
 ) -> None:
@@ -4976,6 +4977,7 @@ async def _heartbeat_loop(
                     worker_id,
                     capacity=capacity,
                     kind="turn",
+                    pool=pool,
                 )
             except Exception as e:  # noqa: BLE001 — a heartbeat write failure must not kill the worker
                 log.warning("[v2.serve_worker] record_worker_heartbeat failed: %s", e)
@@ -4992,6 +4994,7 @@ async def _heartbeat_loop(
                 worker_id,
                 capacity=0,
                 kind="turn",
+                pool=pool,
             )
         except Exception as e:  # noqa: BLE001 — shutdown must remain bounded
             log.warning("[v2.serve_worker] clear worker capacity failed: %s", e)
@@ -5492,7 +5495,7 @@ def _start_genesis_thread(worker_id: str):
 
     def _beat() -> None:
         jobs_store.record_worker_heartbeat(
-            genesis_worker_id, kind="genesis", capacity=0
+            genesis_worker_id, pool="control", kind="genesis", capacity=0
         )
 
     thread = threading.Thread(
@@ -5597,7 +5600,12 @@ async def _serve(worker_id: str, *, poll_interval: float) -> None:
         asyncio.create_task(_reaper_loop(stop_event)),
         asyncio.create_task(_r2_cleanup_loop(stop_event)),
         asyncio.create_task(
-            _heartbeat_loop(worker_id, stop_event, supervisor=supervisor)
+            _heartbeat_loop(
+                worker_id,
+                stop_event,
+                supervisor=supervisor,
+                pool="foreground",
+            )
         ),
         asyncio.create_task(_scheduler_loop(stop_event)),
         asyncio.create_task(_watchdog_loop(supervisor, worker_id, stop_event)),

@@ -181,7 +181,7 @@ async def _watchdog_loop(
             await asyncio.wait_for(
                 asyncio.to_thread(
                     jobs_store.record_worker_heartbeat,
-                    worker_id, capacity=0, kind="turn"),
+                    worker_id, capacity=0, kind="turn", pool="foreground"),
                 timeout=capacity_write_timeout_sec,
             )
         except asyncio.TimeoutError:

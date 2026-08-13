@@ -26,6 +26,7 @@ class _FakeSupervisor:
 
 
 def _drive_one_beat(monkeypatch, liveness: dict, *, max_workers: int = 4,
+                     pool: str = "foreground",
                      capacity_stale_sec: float = 45.0):
     """Run `_heartbeat_loop` until it records exactly one heartbeat, then stop it.
     Returns the captured `(worker_id, kwargs)` of the FIRST recorded call."""
@@ -41,7 +42,7 @@ def _drive_one_beat(monkeypatch, liveness: dict, *, max_workers: int = 4,
 
     async def _driver():
         task = asyncio.create_task(serve_worker._heartbeat_loop(
-            "worker-a", stop_event, supervisor=supervisor, interval=0.02,
+            "worker-a", stop_event, supervisor=supervisor, pool=pool, interval=0.02,
             capacity_stale_sec=capacity_stale_sec))
         for _ in range(50):
             if calls:
@@ -59,14 +60,14 @@ def test_heartbeat_records_full_capacity_when_child_alive_and_fresh(monkeypatch)
     worker_id, kwargs = _drive_one_beat(
         monkeypatch, {"alive": True, "last_progress_age_sec": 1.0}, max_workers=4)
     assert worker_id == "worker-a"
-    assert kwargs == {"capacity": 4, "kind": "turn"}
+    assert kwargs == {"capacity": 4, "kind": "turn", "pool": "foreground"}
 
 
 def test_heartbeat_records_zero_capacity_when_child_dead(monkeypatch):
     worker_id, kwargs = _drive_one_beat(
         monkeypatch, {"alive": False, "last_progress_age_sec": 1.0}, max_workers=4)
     assert worker_id == "worker-a"
-    assert kwargs == {"capacity": 0, "kind": "turn"}
+    assert kwargs == {"capacity": 0, "kind": "turn", "pool": "foreground"}
 
 
 def test_heartbeat_records_zero_capacity_when_progress_stale(monkeypatch):
@@ -80,7 +81,7 @@ def test_heartbeat_records_zero_capacity_when_progress_stale(monkeypatch):
         capacity_stale_sec=45.0,
     )
     assert worker_id == "worker-a"
-    assert kwargs == {"capacity": 0, "kind": "turn"}
+    assert kwargs == {"capacity": 0, "kind": "turn", "pool": "foreground"}
 
 
 def test_heartbeat_records_full_capacity_when_progress_just_under_threshold(monkeypatch):
@@ -91,7 +92,7 @@ def test_heartbeat_records_full_capacity_when_progress_just_under_threshold(monk
         capacity_stale_sec=45.0,
     )
     assert worker_id == "worker-a"
-    assert kwargs == {"capacity": 4, "kind": "turn"}
+    assert kwargs == {"capacity": 4, "kind": "turn", "pool": "foreground"}
 
 
 def test_heartbeat_survives_missing_last_progress_age_sec(monkeypatch):
@@ -102,4 +103,16 @@ def test_heartbeat_survives_missing_last_progress_age_sec(monkeypatch):
     worker_id, kwargs = _drive_one_beat(
         monkeypatch, {"alive": True}, max_workers=4, capacity_stale_sec=45.0)
     assert worker_id == "worker-a"
-    assert kwargs == {"capacity": 0, "kind": "turn"}
+    assert kwargs == {"capacity": 0, "kind": "turn", "pool": "foreground"}
+
+
+def test_heartbeat_writes_the_explicit_pool_identity(monkeypatch):
+    worker_id, kwargs = _drive_one_beat(
+        monkeypatch,
+        {"alive": True, "last_progress_age_sec": 1.0},
+        max_workers=2,
+        pool="wake",
+    )
+
+    assert worker_id == "worker-a"
+    assert kwargs == {"capacity": 2, "kind": "turn", "pool": "wake"}

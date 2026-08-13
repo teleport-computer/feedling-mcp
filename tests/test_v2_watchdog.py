@@ -159,9 +159,10 @@ def test_watchdog_loop_kills_and_writes_capacity_zero_before_kill_and_respawn(mo
 
     from model_api_runtime.v2 import jobs_store
 
-    def _fake_heartbeat(worker_id, *, capacity, kind="turn"):
+    def _fake_heartbeat(worker_id, *, capacity, kind="turn", pool):
         assert capacity == 0
         assert kind == "turn"
+        assert pool == "foreground"
         order.append("capacity_zero")
 
     monkeypatch.setattr(jobs_store, "record_worker_heartbeat", _fake_heartbeat)
