@@ -178,3 +178,49 @@ def test_orphan_json_tail_still_caught(tail):
 def test_orphan_tail_detector_has_no_false_positives(text):
     """断头检测器不许把正常聊天判成协议残片。"""
     assert not pl.is_orphan_json_tail(text), f"正常内容被误判为协议尾巴: {text!r}"
+
+
+# ---------------------------------------------------------------------------
+# 五、从词表派生的数形遍历(失效模式 9:手工枚举字面量)
+#
+# 由来:08-14 的 T016 审计里,用户报的是单数 <parameter>,修好后 CI 12 绿、
+# 已判 APPROVED;但复数 <parameters> 原样漏过,继续扫又发现 tool_results /
+# tool_uses / invokes 同样漏 —— 因为词表是手工枚举字面量的,每多一个数形
+# 就是一次新的漏网。
+#
+# 关键:本组用例**从模块的词表变量派生**,不手写清单 ——
+# 手写测试清单会复制手写词表的同一个盲点,那正是这次漏掉的原因。
+# 词表以后加词,这里自动覆盖。
+# ---------------------------------------------------------------------------
+try:  # PR#193 引入;未合入时跳过整组,不拖累当前分支
+    from core import tool_markup_leak as _tml  # noqa: E402
+
+    _HAS_TML = True
+except Exception:  # pragma: no cover - 合入前的正常状态
+    _HAS_TML = False
+
+
+def _derived_tag_forms():
+    """从 _TAG_NAMES 派生单数 + 复数两种数形。"""
+    if not _HAS_TML:
+        return []
+    out = []
+    for name in getattr(_tml, "_TAG_NAMES", ()):
+        out.append(name)
+        out.append(name + "s" if not name.endswith("s") else name[:-1])
+    return sorted(set(out))
+
+
+@pytest.mark.skipif(not _HAS_TML, reason="core.tool_markup_leak 尚未合入(PR#193)")
+@pytest.mark.parametrize("tag", _derived_tag_forms())
+def test_every_tag_form_in_vocabulary_is_stripped(tag):
+    """词表里每个标记的**两种数形**都必须被清掉,正文必须活下来。
+
+    这条测试的价值不在它今天抓到什么,而在于:
+    以后有人往 _TAG_NAMES 加一个词,这里立刻多两条用例把两种数形都钉住。
+    """
+    body = "这是用户真正要看的话"
+    raw = f'<{tag} name="x">y</{tag}>{body}'
+    out = ap2.sanitize_visible_message_text_v2(raw)
+    assert f"<{tag}" not in out, f"标记 <{tag}> 漏进用户可见文本: {out!r}"
+    assert body in out, f"清标记时把正文吃掉了: {out!r}"
