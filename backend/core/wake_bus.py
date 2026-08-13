@@ -37,8 +37,8 @@ log = logging.getLogger("feedling.wake_bus")
 # Single Postgres NOTIFY channel; the JSON payload carries the logical channel.
 PG_CHANNEL = "feedling_wake"
 
-# This worker's identity. A genuine write tags its NOTIFY with this so the same
-# worker's listener can skip it (the local fast path already handled it).
+# Gunicorn can import this before forking, so children would inherit one id and
+# discard cross-worker notifications as self-origin. Rotate it after each fork.
 WORKER_ID = uuid.uuid4().hex
 
 # Logical channels whose target is a per-user cached store: a cross-worker
@@ -53,6 +53,18 @@ _extra_handlers: dict[str, list[Callable[[str], None]]] = {}
 _RECONNECT_DELAY_SEC = 5.0
 _listener_started = False
 _listener_lock = threading.Lock()
+
+
+def _after_fork_child() -> None:
+    """Give a forked process its own wake identity and listener state."""
+    global WORKER_ID, _listener_started, _listener_lock
+    WORKER_ID = uuid.uuid4().hex
+    _listener_started = False
+    _listener_lock = threading.Lock()
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_after_fork_child)
 
 
 def _enabled() -> bool:
