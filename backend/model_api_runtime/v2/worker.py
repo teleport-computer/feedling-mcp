@@ -99,6 +99,7 @@ from model_api_runtime.v2 import effect_id as v2_effect_id
 from model_api_runtime.v2 import executor as v2_executor
 from model_api_runtime.v2 import extraction as v2_extraction
 from model_api_runtime.v2 import jobs_store
+from model_api_runtime.v2 import slot_protocol
 from model_api_runtime.v2 import kill_switch
 from model_api_runtime.v2 import model_identity as v2_model_identity
 from model_api_runtime.v2 import web_gate as v2_web_gate
@@ -14380,8 +14381,9 @@ async def _slot_loop(
     deps: TurnDeps,
     wake_event: "asyncio.Event | None" = None,
     lanes: "set | None" = None,
-    slot_id: int = 0,
-    progress_cb: "Callable[[int, float | None], None] | None" = None,
+    slot_id: str = "slot-0",
+    slot_generation: str = "g0",
+    progress_cb: "Callable[[slot_protocol.SlotProgress], None] | None" = None,
 ) -> None:
     """一个 job-slot：抢一个 job 就跑一回合，抢不到就等待（poll_interval 兜底，
     wake_event 命中时立刻醒——见 `_wait_for_job_or_stop`）。stop_event 置位后不再抢新活，
@@ -14413,11 +14415,25 @@ async def _slot_loop(
     mark_running 撞到一次性 DB 错误）绝不允许冒出这个协程、拖垮 run_worker_loop 里其他
     仍然健康的 slot——记日志后 continue，下一轮再抢。"""
 
-    def _signal_progress(turn_start: float | None = None) -> None:
+    active_job: slot_protocol.ActiveJobIdentity | None = None
+
+    def _signal_progress(
+        stage: str,
+        turn_start: float | None = None,
+    ) -> None:
         if progress_cb is None:
             return
         try:
-            progress_cb(slot_id, turn_start)
+            progress_cb(
+                slot_protocol.SlotProgress(
+                    slot_id=slot_id,
+                    slot_generation=slot_generation,
+                    monotonic_at=time.monotonic(),
+                    turn_start=turn_start,
+                    stage=stage,
+                    active_job=active_job if turn_start is not None else None,
+                )
+            )
         except Exception as e:  # noqa: BLE001 — 心跳信号故障绝不能拖垮 slot 主循环
             log.debug("[v2.worker] slot %s progress_cb failed: %s", worker_id, e)
 
@@ -14431,38 +14447,47 @@ async def _slot_loop(
             # THIS read as a reason to stop draining jobs it may already own).
             if await asyncio.to_thread(kill_switch.turns_halted):
                 await _wait_for_job_or_stop(stop_event, wake_event, poll_interval)
-                _signal_progress()
+                _signal_progress("idle")
                 continue
             job = await asyncio.to_thread(
                 jobs_store.claim_next_job, worker_id, lanes=lanes
             )
             if job is None:
                 await _wait_for_job_or_stop(stop_event, wake_event, poll_interval)
-                _signal_progress()
+                _signal_progress("idle")
                 continue
             # (a) claimed a job, about to enter _run_turn — record the turn's start
             # time and report it so a wedge INSIDE _run_turn (the slot never reaches
             # (b) below) still shows up as a climbing current_turn_age_sec even
             # though this slot never sends another message.
             turn_start = time.monotonic()
-            _signal_progress(turn_start)
+            active_job = slot_protocol.ActiveJobIdentity(
+                job_id=int(job["id"]),
+                lane=str(job.get("lane") or "chat"),
+                claimed_by=str(job.get("claimed_by") or worker_id),
+            )
+            _signal_progress("claimed", turn_start)
 
             # Keep the public `_run_turn(job, deps)` seam unchanged (many tests
             # and assembly callers replace it directly).  A task-local callback
             # lets provider/tool/compaction helpers refresh this exact slot's
             # stall clock without leaking progress across concurrent slots.
-            def _active_turn_progress(_stage: str) -> None:
-                _signal_progress(turn_start)
+            def _active_turn_progress(stage: str) -> None:
+                _signal_progress(stage, turn_start)
 
             progress_token = _TURN_PROGRESS_CB.set(_active_turn_progress)
             try:
                 await _run_turn(job, deps)
             finally:
                 _TURN_PROGRESS_CB.reset(progress_token)
-            _signal_progress(None)  # (b) turn completed — back to idle
+            _signal_progress("durable_completion", turn_start)
+            active_job = None
+            _signal_progress("idle")  # (b) turn completed — back to idle
         except Exception as e:  # noqa: BLE001 — 单 slot 故障绝不冒出去拖垮其他 slot
             log.warning("[v2.worker] slot %s iteration failed: %s", worker_id, e)
             if job is not None:
+                if active_job is not None:
+                    _signal_progress("failure_cleanup", turn_start)
                 try:
                     user_id = str(job.get("user_id") or "")
                     message = f"slot_failure:{type(e).__name__.lower()}"
@@ -14515,7 +14540,8 @@ async def _slot_loop(
                         _safe_failure_code("slot_recovery_failed", recovery_error),
                     )
             await _wait_for_job_or_stop(stop_event, wake_event, poll_interval)
-            _signal_progress()  # (c) idle/error poll wake — slot is alive, just cycling
+            active_job = None
+            _signal_progress("idle")  # (c) idle/error poll wake
             continue
 
 
@@ -14527,7 +14553,9 @@ async def run_worker_loop(
     stop_event: asyncio.Event,
     deps: TurnDeps,
     wake_event: "asyncio.Event | None" = None,
-    progress_cb: "Callable[[int, float | None], None] | None" = None,
+    progress_cb: "Callable[[slot_protocol.SlotProgress], None] | None" = None,
+    slot_generation: str = "g0",
+    slot_ids: "list[str] | None" = None,
 ) -> None:
     """起 max_workers 个 job-slot 协程共抢同一张 agent_jobs（SKIP LOCKED 无争用）。
     stop_event 置位 → 所有 slot 跑完手上 job 后退出（SIGTERM 优雅 drain 的落点）。
@@ -14551,6 +14579,9 @@ async def run_worker_loop(
     _reserved_env = os.environ.get("FEEDLING_V2_CHAT_RESERVED_SLOTS", "").strip()
     reserved = int(_reserved_env) if _reserved_env else None
     assignments = _reserved_lane_slots(max_workers, reserved)
+    resolved_slot_ids = slot_ids or [f"slot-{i}" for i in range(len(assignments))]
+    if len(resolved_slot_ids) != len(assignments):
+        raise ValueError("slot_ids must match max_workers")
     slots = [
         asyncio.create_task(
             _slot_loop(
@@ -14560,7 +14591,8 @@ async def run_worker_loop(
                 deps=deps,
                 wake_event=wake_event,
                 lanes=assignments[i],
-                slot_id=i,
+                slot_id=resolved_slot_ids[i],
+                slot_generation=slot_generation,
                 progress_cb=progress_cb,
             )
         )

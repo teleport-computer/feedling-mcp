@@ -4857,6 +4857,7 @@ class _JobCancelRouter:
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._by_claimed_by: dict[str, Callable[[], None]] = {}
+        self._supervisors: list[v2_child_supervisor.ChildSupervisor] = []
 
     def bind(self, claimed_by: str, cancel: Callable[[], None]) -> None:
         with self._lock:
@@ -4866,9 +4867,31 @@ class _JobCancelRouter:
         with self._lock:
             self._by_claimed_by.pop(str(claimed_by), None)
 
+    def watch(self, supervisor: v2_child_supervisor.ChildSupervisor) -> None:
+        with self._lock:
+            if supervisor not in self._supervisors:
+                self._supervisors.append(supervisor)
+
+    def unwatch(self, supervisor: v2_child_supervisor.ChildSupervisor) -> None:
+        with self._lock:
+            if supervisor in self._supervisors:
+                self._supervisors.remove(supervisor)
+
     def handle(self, event: core_wake_bus.JobCancellation) -> bool:
         with self._lock:
             cancel = self._by_claimed_by.get(event.claimed_by)
+            supervisors = tuple(self._supervisors)
+        if cancel is None:
+            for supervisor in supervisors:
+                snapshot = supervisor.snapshot()
+                if (
+                    snapshot is not None
+                    and snapshot.active_job is not None
+                    and snapshot.active_job.job_id == event.job_id
+                    and snapshot.active_job.claimed_by == event.claimed_by
+                ):
+                    cancel = supervisor.kill_and_respawn
+                    break
         if cancel is None:
             return False
         cancel()
@@ -4959,6 +4982,19 @@ _HEARTBEAT_INTERVAL_SEC = _positive_float_env(
 _CAPACITY_STALE_SEC = _positive_float_env("FEEDLING_V2_CAPACITY_STALE_SEC", "45")
 
 
+def _heartbeat_slot_state(
+    supervisor: v2_child_supervisor.ChildSupervisor,
+) -> dict[str, object]:
+    snapshot_fn = getattr(supervisor, "snapshot", None)
+    snapshot = snapshot_fn() if callable(snapshot_fn) else None
+    return {
+        "slot": {
+            "stage": "starting" if snapshot is None else snapshot.stage,
+            "busy": bool(snapshot is not None and snapshot.active_job is not None),
+        }
+    }
+
+
 async def _heartbeat_loop(
     worker_id: str,
     stop_event: asyncio.Event,
@@ -4998,7 +5034,7 @@ async def _heartbeat_loop(
                 capacity = (
                     0
                     if (not liveness.get("alive", False) or age > capacity_stale_sec)
-                    else v2_worker.MAX_WORKERS
+                    else 1
                 )
                 await asyncio.to_thread(
                     jobs_store.record_worker_heartbeat,
@@ -5006,6 +5042,7 @@ async def _heartbeat_loop(
                     capacity=capacity,
                     kind="turn",
                     pool=pool,
+                    runtime_state=_heartbeat_slot_state(supervisor),
                 )
             except Exception as e:  # noqa: BLE001 — a heartbeat write failure must not kill the worker
                 log.warning("[v2.serve_worker] record_worker_heartbeat failed: %s", e)
@@ -5023,6 +5060,7 @@ async def _heartbeat_loop(
                 capacity=0,
                 kind="turn",
                 pool=pool,
+                runtime_state={"slot": {"stage": "stopping", "busy": False}},
             )
         except Exception as e:  # noqa: BLE001 — shutdown must remain bounded
             log.warning("[v2.serve_worker] clear worker capacity failed: %s", e)
@@ -5623,6 +5661,7 @@ async def _serve(worker_id: str, *, poll_interval: float) -> None:
     # there is nothing here for `asyncio.gather` to await; its liveness is polled
     # (Task 3) rather than joined.
     await asyncio.to_thread(supervisor.start)
+    _JOB_CANCEL_ROUTER.watch(supervisor)
 
     tasks = [
         asyncio.create_task(_reaper_loop(stop_event)),
@@ -5648,6 +5687,7 @@ async def _serve(worker_id: str, *, poll_interval: float) -> None:
         # a live heartbeat with dead work.
         await asyncio.gather(*tasks)
     finally:
+        _JOB_CANCEL_ROUTER.unwatch(supervisor)
         stop_event.set()
         for task in tasks:
             if not task.done():

@@ -19,6 +19,7 @@ import time
 import pytest
 
 from model_api_runtime.v2 import child_supervisor as child_supervisor_module
+from model_api_runtime.v2 import slot_protocol
 from model_api_runtime.v2.child_supervisor import ChildSupervisor
 
 # ---------------------------------------------------------------------------
@@ -26,11 +27,29 @@ from model_api_runtime.v2.child_supervisor import ChildSupervisor
 # ---------------------------------------------------------------------------
 
 
+def _progress(slot_generation, *, turn_start=None, stage="idle"):
+    active_job = (
+        None
+        if turn_start is None
+        else slot_protocol.ActiveJobIdentity(3694, "profile", "worker:heavy:0:g7")
+    )
+    return slot_protocol.encode_message(
+        slot_protocol.SlotProgress(
+            slot_id="heavy-0",
+            slot_generation=slot_generation,
+            monotonic_at=time.monotonic(),
+            turn_start=turn_start,
+            stage=stage,
+            active_job=active_job,
+        )
+    )
+
+
 def _fake_target_periodic_progress(conn, *_args) -> None:
     """Sends a progress heartbeat every ~50ms forever (until killed/pipe breaks)."""
     while True:
         try:
-            conn.send(("progress", 0, time.monotonic()))
+            conn.send(_progress(_args[-1]))
         except Exception:
             return
         time.sleep(0.05)
@@ -41,7 +60,7 @@ def _fake_target_wedge_after_one(conn, *_args) -> None:
     slot / deadlocked event loop): the process stays alive but never makes
     progress again."""
     try:
-        conn.send(("progress", 0, time.monotonic()))
+        conn.send(_progress(_args[-1]))
     except Exception:
         pass
     time.sleep(3600)
@@ -56,7 +75,7 @@ def _fake_target_wedged_mid_turn(conn, *_args) -> None:
     though this target never sends a second message (hard-timeout fix)."""
     try:
         now = time.monotonic()
-        conn.send(("progress", 0, now, now))
+        conn.send(_progress(_args[-1], turn_start=now, stage="profile.cards.batch"))
     except Exception:
         pass
     time.sleep(3600)
@@ -68,20 +87,20 @@ def _fake_target_idle_only(conn, *_args) -> None:
     inside a turn. `current_turn_age_sec` must read 0.0 the whole time."""
     while True:
         try:
-            conn.send(("progress", 0, time.monotonic(), None))
+            conn.send(_progress(_args[-1]))
         except Exception:
             return
         time.sleep(0.05)
 
 
-def _fake_target_pid_then_wedge(conn, pid_holder) -> None:
+def _fake_target_pid_then_wedge(conn, pid_holder, slot_generation) -> None:
     """Publishes its own PID into a shared `multiprocessing.Value`, sends one
     progress heartbeat, then wedges — lets a test assert `kill_and_respawn()`
     actually produces a fresh process (new PID), not the same one still limping
     along."""
     pid_holder.value = os.getpid()
     try:
-        conn.send(("progress", 0, time.monotonic()))
+        conn.send(_progress(slot_generation))
     except Exception:
         pass
     time.sleep(3600)
@@ -110,6 +129,54 @@ def _pid_is_dead(pid: int) -> bool:
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
+
+
+def test_slot_progress_codec_round_trip_and_strict_decode():
+    progress = slot_protocol.SlotProgress(
+        slot_id="heavy-0",
+        slot_generation="g7",
+        monotonic_at=123.4,
+        turn_start=120.0,
+        stage="profile.cards.batch",
+        active_job=slot_protocol.ActiveJobIdentity(
+            job_id=3694,
+            lane="profile",
+            claimed_by="worker:heavy:0:g7",
+        ),
+    )
+    assert slot_protocol.decode_message(slot_protocol.encode_message(progress)) == progress
+    with pytest.raises(ValueError):
+        slot_protocol.decode_message(("progress", "heavy-0", 123.4, 120.0))
+    with pytest.raises(ValueError):
+        slot_protocol.decode_message(
+            {**slot_protocol.encode_message(progress), "unexpected": True}
+        )
+
+
+def test_supervisor_snapshot_preserves_identity_and_discards_late_generation():
+    sup = ChildSupervisor(_fake_target_idle_only, liveness_timeout_sec=5.0)
+    sup._slot_generation = "g8"
+    current = slot_protocol.SlotProgress(
+        "heavy-0",
+        "g8",
+        123.4,
+        120.0,
+        "profile.cards.batch",
+        slot_protocol.ActiveJobIdentity(3694, "profile", "worker:heavy:0:g8"),
+    )
+    late = slot_protocol.SlotProgress(
+        "heavy-0",
+        "g7",
+        124.0,
+        120.0,
+        "profile.write",
+        slot_protocol.ActiveJobIdentity(3694, "profile", "worker:heavy:0:g7"),
+    )
+
+    sup._handle_message(slot_protocol.encode_message(current))
+    sup._handle_message(slot_protocol.encode_message(late))
+
+    assert sup.snapshot() == current
 
 
 def test_healthy_child_reports_alive_with_fresh_progress():
@@ -226,11 +293,34 @@ def test_round_and_catchup_boundaries_refresh_stall_not_absolute_age(monkeypatch
         child_supervisor_module.time, "monotonic", lambda: clock["now"])
     sup = ChildSupervisor(_fake_target_idle_only, liveness_timeout_sec=45.0)
     turn_start = clock["now"]
-    sup._handle_message(("progress", 3, turn_start, turn_start))
+    sup._slot_generation = "g-test"
+    sup._handle_message(
+        slot_protocol.encode_message(
+            slot_protocol.SlotProgress(
+                "heavy-0",
+                "g-test",
+                turn_start,
+                turn_start,
+                "claimed",
+                slot_protocol.ActiveJobIdentity(3694, "profile", "worker"),
+            )
+        )
+    )
 
     for elapsed in range(60, 601, 60):
         clock["now"] = turn_start + elapsed
-        sup._handle_message(("progress", 3, clock["now"], turn_start))
+        sup._handle_message(
+            slot_protocol.encode_message(
+                slot_protocol.SlotProgress(
+                    "heavy-0",
+                    "g-test",
+                    clock["now"],
+                    turn_start,
+                    "profile.cards.batch",
+                    slot_protocol.ActiveJobIdentity(3694, "profile", "worker"),
+                )
+            )
+        )
 
     clock["now"] = turn_start + 601.0
     progressing = sup.poll_liveness()
@@ -240,7 +330,11 @@ def test_round_and_catchup_boundaries_refresh_stall_not_absolute_age(monkeypatch
     # Event-loop liveness is a separate signal and cannot keep a wedged turn
     # alive.  It refreshes the coarse process clock, not this slot's stall age.
     clock["now"] = turn_start + 850.0
-    sup._handle_message(("loop_heartbeat", clock["now"]))
+    sup._handle_message(
+        slot_protocol.encode_message(
+            slot_protocol.LoopHeartbeat("g-test", clock["now"])
+        )
+    )
     wedged = sup.poll_liveness()
     assert wedged["last_progress_age_sec"] == pytest.approx(0.0)
     assert wedged["event_loop_heartbeat_age_sec"] == pytest.approx(0.0)

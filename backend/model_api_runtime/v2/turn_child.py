@@ -52,6 +52,7 @@ if str(_BACKEND_DIR) not in sys.path:
 
 import db  # noqa: E402
 from model_api_runtime.v2 import serve_worker  # noqa: E402 — 见模块 docstring：复用装配层
+from model_api_runtime.v2 import slot_protocol  # noqa: E402
 from model_api_runtime.v2 import worker as v2_worker  # noqa: E402
 
 if TYPE_CHECKING:  # pragma: no cover — 类型检查专用，运行期不需要真的 import
@@ -79,9 +80,9 @@ def _make_progress_cb(conn: "Connection") -> "callable":
     try/except 包了这次调用（双保险），这里再兜一层是因为 `conn.send` 在 BrokenPipe 之外
     还可能抛 `OSError`/`ValueError`（管道已 close 后再 send）。"""
 
-    def _progress_cb(slot_id: int, turn_start: float | None = None) -> None:
+    def _progress_cb(progress: slot_protocol.SlotProgress) -> None:
         try:
-            conn.send(("progress", slot_id, time.monotonic(), turn_start))
+            conn.send(slot_protocol.encode_message(progress))
         except (BrokenPipeError, OSError, ValueError) as e:
             log.info("[v2.turn_child] progress pipe closed, dropping progress signal: %s", e)
 
@@ -92,6 +93,7 @@ async def _event_loop_heartbeat(
     conn: "Connection",
     stop_event: asyncio.Event,
     *,
+    slot_generation: str,
     interval: float = 5.0,
 ) -> None:
     """Prove that the child event loop itself can still schedule callbacks.
@@ -112,7 +114,14 @@ async def _event_loop_heartbeat(
     """
     while not stop_event.is_set():
         try:
-            conn.send(("loop_heartbeat", time.monotonic()))
+            conn.send(
+                slot_protocol.encode_message(
+                    slot_protocol.LoopHeartbeat(
+                        slot_generation=slot_generation,
+                        monotonic_at=time.monotonic(),
+                    )
+                )
+            )
         except (BrokenPipeError, OSError, ValueError) as e:
             log.info("[v2.turn_child] heartbeat pipe closed: %s", e)
             return
@@ -122,7 +131,12 @@ async def _event_loop_heartbeat(
             pass
 
 
-async def _run(conn: "Connection", worker_id: str, poll_interval: float) -> None:
+async def _run(
+    conn: "Connection",
+    worker_id: str,
+    poll_interval: float,
+    slot_generation: str,
+) -> None:
     stop_event = asyncio.Event()
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGTERM, signal.SIGINT):
@@ -148,14 +162,20 @@ async def _run(conn: "Connection", worker_id: str, poll_interval: float) -> None
     tasks = [
         asyncio.create_task(v2_worker.run_worker_loop(
             worker_id,
-            max_workers=v2_worker.MAX_WORKERS,
+            max_workers=1,
             poll_interval=poll_interval,
             stop_event=stop_event,
             deps=deps,
             wake_event=wake_event,
             progress_cb=_make_progress_cb(conn),
+            slot_generation=slot_generation,
+            slot_ids=["foreground-0"],
         )),
-        asyncio.create_task(_event_loop_heartbeat(conn, stop_event)),
+        asyncio.create_task(
+            _event_loop_heartbeat(
+                conn, stop_event, slot_generation=slot_generation
+            )
+        ),
     ]
     try:
         # run_worker_loop 已经把所有可恢复的 per-slot 故障吞在内部；能逃出来的异常代表
@@ -173,7 +193,12 @@ async def _run(conn: "Connection", worker_id: str, poll_interval: float) -> None
     log.info("[v2.turn_child] drained; exiting worker=%s pid=%s", worker_id, os.getpid())
 
 
-def main(conn: "Connection", worker_id: str, poll_interval: float | None = None) -> None:
+def main(
+    conn: "Connection",
+    worker_id: str,
+    poll_interval: float | None = None,
+    slot_generation: str = "g0",
+) -> None:
     """`child_supervisor.ChildSupervisor` 的 spawn target——签名约定
     `spawn_target(conn_write_end, *spawn_args)`，这里的 `spawn_args` 就是
     `(worker_id, poll_interval)`（由 `serve_worker._serve` 传入，沿用跟父进程心跳/
@@ -208,7 +233,7 @@ def main(conn: "Connection", worker_id: str, poll_interval: float | None = None)
             poll_interval if poll_interval is not None
             else serve_worker._positive_float_env("FEEDLING_V2_POLL_INTERVAL_SEC", "1.0")
         )
-        asyncio.run(_run(conn, worker_id, interval))
+        asyncio.run(_run(conn, worker_id, interval, slot_generation))
     finally:
         try:
             conn.close()

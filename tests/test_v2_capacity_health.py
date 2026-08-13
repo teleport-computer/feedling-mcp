@@ -14,15 +14,19 @@ pytest-asyncio plugin in this repo, tests drive coroutines via `asyncio.run`.
 """
 import asyncio
 
-from model_api_runtime.v2 import jobs_store, serve_worker, worker
+from model_api_runtime.v2 import jobs_store, serve_worker, slot_protocol, worker
 
 
 class _FakeSupervisor:
-    def __init__(self, liveness: dict):
+    def __init__(self, liveness: dict, snapshot=None):
         self._liveness = liveness
+        self._snapshot = snapshot
 
     def poll_liveness(self) -> dict:
         return dict(self._liveness)
+
+    def snapshot(self):
+        return self._snapshot
 
 
 def _drive_one_beat(monkeypatch, liveness: dict, *, max_workers: int = 4,
@@ -60,14 +64,24 @@ def test_heartbeat_records_full_capacity_when_child_alive_and_fresh(monkeypatch)
     worker_id, kwargs = _drive_one_beat(
         monkeypatch, {"alive": True, "last_progress_age_sec": 1.0}, max_workers=4)
     assert worker_id == "worker-a"
-    assert kwargs == {"capacity": 4, "kind": "turn", "pool": "foreground"}
+    assert kwargs == {
+        "capacity": 1,
+        "kind": "turn",
+        "pool": "foreground",
+        "runtime_state": {"slot": {"stage": "starting", "busy": False}},
+    }
 
 
 def test_heartbeat_records_zero_capacity_when_child_dead(monkeypatch):
     worker_id, kwargs = _drive_one_beat(
         monkeypatch, {"alive": False, "last_progress_age_sec": 1.0}, max_workers=4)
     assert worker_id == "worker-a"
-    assert kwargs == {"capacity": 0, "kind": "turn", "pool": "foreground"}
+    assert kwargs == {
+        "capacity": 0,
+        "kind": "turn",
+        "pool": "foreground",
+        "runtime_state": {"slot": {"stage": "starting", "busy": False}},
+    }
 
 
 def test_heartbeat_records_zero_capacity_when_progress_stale(monkeypatch):
@@ -81,7 +95,12 @@ def test_heartbeat_records_zero_capacity_when_progress_stale(monkeypatch):
         capacity_stale_sec=45.0,
     )
     assert worker_id == "worker-a"
-    assert kwargs == {"capacity": 0, "kind": "turn", "pool": "foreground"}
+    assert kwargs == {
+        "capacity": 0,
+        "kind": "turn",
+        "pool": "foreground",
+        "runtime_state": {"slot": {"stage": "starting", "busy": False}},
+    }
 
 
 def test_heartbeat_records_full_capacity_when_progress_just_under_threshold(monkeypatch):
@@ -92,7 +111,12 @@ def test_heartbeat_records_full_capacity_when_progress_just_under_threshold(monk
         capacity_stale_sec=45.0,
     )
     assert worker_id == "worker-a"
-    assert kwargs == {"capacity": 4, "kind": "turn", "pool": "foreground"}
+    assert kwargs == {
+        "capacity": 1,
+        "kind": "turn",
+        "pool": "foreground",
+        "runtime_state": {"slot": {"stage": "starting", "busy": False}},
+    }
 
 
 def test_job_cancel_router_ignores_stale_owner_and_targets_exact_claim():
@@ -113,6 +137,41 @@ def test_job_cancel_router_ignores_stale_owner_and_targets_exact_claim():
     assert cancelled == ["heavy-0:g8"]
 
 
+def test_job_cancel_router_matches_supervisor_snapshot_job_and_owner():
+    active = slot_protocol.ActiveJobIdentity(
+        3694, "profile", "worker:heavy:0:g8"
+    )
+    snapshot = slot_protocol.SlotProgress(
+        "heavy-0", "g8", 123.4, 120.0, "profile.cards.batch", active
+    )
+
+    class _SnapshotSupervisor:
+        def __init__(self):
+            self.kills = 0
+
+        def snapshot(self):
+            return snapshot
+
+        def kill_and_respawn(self):
+            self.kills += 1
+
+    supervisor = _SnapshotSupervisor()
+    router = serve_worker._JobCancelRouter()
+    router.watch(supervisor)
+
+    wrong_job = serve_worker.core_wake_bus.JobCancellation(
+        3695, active.claimed_by, "foreground_chat_preempted"
+    )
+    exact = serve_worker.core_wake_bus.JobCancellation(
+        active.job_id, active.claimed_by, "foreground_chat_preempted"
+    )
+
+    assert router.handle(wrong_job) is False
+    assert supervisor.kills == 0
+    assert router.handle(exact) is True
+    assert supervisor.kills == 1
+
+
 def test_heartbeat_survives_missing_last_progress_age_sec(monkeypatch):
     """`poll_liveness()` contract always includes `last_progress_age_sec`, but the
     heartbeat loop must not crash if a supervisor implementation omits it — treat
@@ -121,7 +180,12 @@ def test_heartbeat_survives_missing_last_progress_age_sec(monkeypatch):
     worker_id, kwargs = _drive_one_beat(
         monkeypatch, {"alive": True}, max_workers=4, capacity_stale_sec=45.0)
     assert worker_id == "worker-a"
-    assert kwargs == {"capacity": 0, "kind": "turn", "pool": "foreground"}
+    assert kwargs == {
+        "capacity": 0,
+        "kind": "turn",
+        "pool": "foreground",
+        "runtime_state": {"slot": {"stage": "starting", "busy": False}},
+    }
 
 
 def test_heartbeat_writes_the_explicit_pool_identity(monkeypatch):
@@ -133,4 +197,29 @@ def test_heartbeat_writes_the_explicit_pool_identity(monkeypatch):
     )
 
     assert worker_id == "worker-a"
-    assert kwargs == {"capacity": 2, "kind": "turn", "pool": "wake"}
+    assert kwargs == {
+        "capacity": 1,
+        "kind": "turn",
+        "pool": "wake",
+        "runtime_state": {"slot": {"stage": "starting", "busy": False}},
+    }
+
+
+def test_heartbeat_runtime_state_exposes_stage_without_job_identity():
+    snapshot = slot_protocol.SlotProgress(
+        "heavy-0",
+        "g7",
+        123.4,
+        120.0,
+        "profile.cards.batch",
+        slot_protocol.ActiveJobIdentity(3694, "profile", "worker:heavy:0:g7"),
+    )
+    state = serve_worker._heartbeat_slot_state(
+        _FakeSupervisor({"alive": True}, snapshot=snapshot)
+    )
+
+    assert state == {"slot": {"stage": "profile.cards.batch", "busy": True}}
+    serialized = repr(state)
+    assert "3694" not in serialized
+    assert "worker:heavy" not in serialized
+    assert "g7" not in serialized

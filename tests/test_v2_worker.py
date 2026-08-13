@@ -1298,7 +1298,7 @@ def test_slot_recovery_failure_does_not_kill_slot(monkeypatch):
     def _claim(worker_id, lanes=None):
         claim_calls["n"] += 1
         if claim_calls["n"] == 1:
-            return {"id": "job-1", "user_id": "u", "lane": "chat",
+            return {"id": 1, "user_id": "u", "lane": "chat",
                     "claimed_by": worker_id}
         stop.set()
         return None
@@ -2149,7 +2149,7 @@ def test_slot_loop_progress_cb_called_on_claim_and_turn_completion(monkeypatch):
     def _claim(worker_id, lanes=None):
         claim_calls["n"] += 1
         if claim_calls["n"] == 1:
-            return {"id": "job-1", "user_id": "u", "lane": "chat", "claimed_by": worker_id}
+            return {"id": 1, "user_id": "u", "lane": "chat", "claimed_by": worker_id}
         stop.set()
         return None
 
@@ -2163,19 +2163,23 @@ def test_slot_loop_progress_cb_called_on_claim_and_turn_completion(monkeypatch):
 
     asyncio.run(worker._slot_loop(
         "w-progress", poll_interval=0.001, stop_event=stop, deps=_ok_deps({}),
-        slot_id=7, progress_cb=lambda slot_id, turn_start=None: events.append((slot_id, turn_start))))
+        slot_id="foreground-7", slot_generation="g7", progress_cb=events.append))
 
     assert claim_calls["n"] >= 2
     assert turn_calls["n"] == 1
     # (a) claim + (b) turn-completion signals, both tagged with this slot's id —
     # plus (c) an idle-poll signal once claim_next_job starts returning None.
     assert len(events) >= 2
-    assert all(slot_id == 7 for slot_id, _turn_start in events)
+    assert all(event.slot_id == "foreground-7" for event in events)
+    assert all(event.slot_generation == "g7" for event in events)
+    assert events[0].active_job == worker.slot_protocol.ActiveJobIdentity(
+        1, "chat", "w-progress"
+    )
     # (a) the claim signal must carry a non-None turn_start (hard-timeout fix);
     # (b)/(c) idle signals must carry None.
-    claim_events = [ts for sid, ts in events if ts is not None]
-    idle_events = [ts for sid, ts in events if ts is None]
-    assert len(claim_events) == 1, "exactly one turn was claimed and started"
+    claim_events = [event.turn_start for event in events if event.turn_start is not None]
+    idle_events = [event.turn_start for event in events if event.turn_start is None]
+    assert len(claim_events) == 2, "claimed and durable-completion share one turn"
     assert isinstance(claim_events[0], float) and claim_events[0] > 0
     assert len(idle_events) >= 1, "turn-completion and/or idle-poll signals report turn_start=None"
 
@@ -2194,13 +2198,13 @@ def test_slot_loop_progress_cb_exception_does_not_crash_loop(monkeypatch):
 
     monkeypatch.setattr(jobs_store, "claim_next_job", _claim)
 
-    def _boom(slot_id, turn_start=None):
+    def _boom(_progress):
         raise RuntimeError("boom")
 
     # Must not raise despite progress_cb always raising.
     asyncio.run(worker._slot_loop(
         "w-progress-boom", poll_interval=0.001, stop_event=stop, deps=_ok_deps({}),
-        slot_id=0, progress_cb=_boom))
+        slot_id="foreground-0", slot_generation="g0", progress_cb=_boom))
 
     assert calls["n"] >= 3
 
@@ -2213,17 +2217,19 @@ def test_run_worker_loop_threads_progress_cb_with_slot_index(monkeypatch):
     stop = asyncio.Event()
 
     async def _fake_slot_loop(worker_id, *, poll_interval, stop_event, deps,
-                               wake_event=None, lanes=None, slot_id=0, progress_cb=None):
+                               wake_event=None, lanes=None, slot_id="slot-0",
+                               slot_generation="g0", progress_cb=None):
         if progress_cb is not None:
-            progress_cb(slot_id, None)
+            progress_cb(worker.slot_protocol.SlotProgress(
+                slot_id, slot_generation, 1.0, None, "idle", None))
         stop_event.set()
 
     monkeypatch.setattr(worker, "_slot_loop", _fake_slot_loop)
     events = []
     asyncio.run(worker.run_worker_loop(
         "w-thread", max_workers=2, poll_interval=0.01, stop_event=stop, deps=_ok_deps({}),
-        progress_cb=lambda slot_id, turn_start=None: events.append(slot_id)))
-    assert sorted(events) == [0, 1]
+        progress_cb=events.append))
+    assert sorted(event.slot_id for event in events) == ["slot-0", "slot-1"]
 
 
 def test_slot_loop_progress_cb_reports_turn_start_at_claim_and_none_after_completion(monkeypatch):
@@ -2239,7 +2245,7 @@ def test_slot_loop_progress_cb_reports_turn_start_at_claim_and_none_after_comple
     def _claim(worker_id, lanes=None):
         claim_calls["n"] += 1
         if claim_calls["n"] == 1:
-            return {"id": "job-1", "user_id": "u", "lane": "chat", "claimed_by": worker_id}
+            return {"id": 1, "user_id": "u", "lane": "chat", "claimed_by": worker_id}
         stop.set()
         return None
 
@@ -2253,18 +2259,22 @@ def test_slot_loop_progress_cb_reports_turn_start_at_claim_and_none_after_comple
 
     asyncio.run(worker._slot_loop(
         "w-turnstart", poll_interval=0.001, stop_event=stop, deps=_ok_deps({}),
-        slot_id=3, progress_cb=lambda slot_id, turn_start=None: calls.append((slot_id, turn_start))))
+        slot_id="foreground-3", slot_generation="g3", progress_cb=calls.append))
 
     # First call: claim just happened, about to run the turn -> non-None turn_start.
-    first_slot_id, first_turn_start = calls[0]
-    assert first_slot_id == 3
+    first_slot_id, first_turn_start = calls[0].slot_id, calls[0].turn_start
+    assert first_slot_id == "foreground-3"
+    assert calls[0].stage == "claimed"
     assert first_turn_start is not None
     assert isinstance(first_turn_start, float) and first_turn_start > 0
 
     # Second call: the turn just completed -> back to idle (turn_start=None).
-    second_slot_id, second_turn_start = calls[1]
-    assert second_slot_id == 3
-    assert second_turn_start is None
+    second_slot_id, second_turn_start = calls[1].slot_id, calls[1].turn_start
+    assert second_slot_id == "foreground-3"
+    assert calls[1].stage == "durable_completion"
+    assert second_turn_start == first_turn_start
+    assert calls[2].stage == "idle"
+    assert calls[2].active_job is None
 
 
 def test_slot_loop_in_turn_boundaries_refresh_same_turn_stall_clock(monkeypatch):
@@ -2279,7 +2289,7 @@ def test_slot_loop_in_turn_boundaries_refresh_same_turn_stall_clock(monkeypatch)
     def _claim(worker_id, lanes=None):
         claims["n"] += 1
         if claims["n"] == 1:
-            return {"id": "job-progress", "user_id": "u", "lane": "chat",
+            return {"id": 2, "user_id": "u", "lane": "chat",
                     "claimed_by": worker_id}
         stop.set()
         return None
@@ -2294,15 +2304,23 @@ def test_slot_loop_in_turn_boundaries_refresh_same_turn_stall_clock(monkeypatch)
 
     asyncio.run(worker._slot_loop(
         "w-in-turn-progress", poll_interval=0.001, stop_event=stop,
-        deps=_ok_deps({}), slot_id=4,
-        progress_cb=lambda slot_id, turn_start=None: events.append(
-            (slot_id, turn_start))))
+        deps=_ok_deps({}), slot_id="foreground-4", slot_generation="g4",
+        progress_cb=events.append))
 
-    active = [event for event in events if event[1] is not None]
-    assert len(active) == 3  # claim plus two real in-turn boundaries
-    assert {event[0] for event in active} == {4}
-    assert len({event[1] for event in active}) == 1  # absolute start never resets
-    assert any(turn_start is None for _slot, turn_start in events)
+    active = [event for event in events if event.turn_start is not None]
+    assert len(active) == 4  # claim, two boundaries, durable completion
+    assert {event.slot_id for event in active} == {"foreground-4"}
+    assert len({event.turn_start for event in active}) == 1
+    assert {event.active_job for event in active} == {
+        worker.slot_protocol.ActiveJobIdentity(2, "chat", "w-in-turn-progress")
+    }
+    assert [event.stage for event in active] == [
+        "claimed",
+        "provider_complete",
+        "prompt_catchup_batch_complete",
+        "durable_completion",
+    ]
+    assert any(event.turn_start is None for event in events)
 
 
 def test_active_job_lease_keeper_renews_until_stopped(monkeypatch):

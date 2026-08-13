@@ -60,7 +60,10 @@ import math
 import multiprocessing as mp
 import threading
 import time
+import uuid
 from typing import Any, Callable
+
+from model_api_runtime.v2 import slot_protocol
 
 log = logging.getLogger("feedling.runtime_v2.child_supervisor")
 
@@ -102,13 +105,9 @@ class ChildSupervisor:
         # by _handle_message on every ("progress", slot_id, ts, turn_start) message;
         # read by poll_liveness() to compute current_turn_age_sec. See module
         # docstring's "progress pipe 协议" / split-budget sections.
-        self._turn_starts: dict[Any, float] = {}
-        # Parent-local receive time for the newest *in-turn* progress boundary
-        # from each active slot.  Unlike ``_turn_starts`` this intentionally
-        # moves forward at provider-round/tool/compaction boundaries.  The
-        # watchdog uses its age to distinguish a long but progressing turn from
-        # one stuck forever inside a single await.
-        self._turn_progress_at: dict[Any, float] = {}
+        self._slot_generation = ""
+        self._snapshot: slot_protocol.SlotProgress | None = None
+        self._turn_progress_at: float | None = None
 
         self._reader_thread: threading.Thread | None = None
         self._reader_stop = threading.Event()
@@ -122,9 +121,10 @@ class ChildSupervisor:
         的 Pipe + 全新的 Process，不复用上一代子进程的任何状态。
         """
         read_conn, write_conn = mp.Pipe(duplex=False)
+        slot_generation = uuid.uuid4().hex
         proc = self._ctx.Process(
             target=self._spawn_target,
-            args=(write_conn, *self._spawn_args),
+            args=(write_conn, *self._spawn_args, slot_generation),
             daemon=True,
         )
         proc.start()
@@ -145,8 +145,9 @@ class ChildSupervisor:
             # Fresh generation of child == fresh turn-tracking state. A prior
             # generation's slot_ids/turn_starts must never leak into this one
             # (kill_and_respawn() calls start() again after killing the old proc).
-            self._turn_starts = {}
-            self._turn_progress_at = {}
+            self._slot_generation = slot_generation
+            self._snapshot = None
+            self._turn_progress_at = None
 
         self._reader_stop = threading.Event()
         self._reader_thread = threading.Thread(
@@ -180,12 +181,8 @@ class ChildSupervisor:
             proc = self._proc
             last = self._last_progress_at
             last_slot = self._last_slot_progress_at
-            turn_starts = list(self._turn_starts.values())
-            turn_progress_at = [
-                self._turn_progress_at[slot_id]
-                for slot_id in self._turn_starts
-                if slot_id in self._turn_progress_at
-            ]
+            snapshot = self._snapshot
+            turn_progress_at = self._turn_progress_at
         alive = bool(proc is not None and proc.is_alive())
         age = math.inf if last is None else max(0.0, time.monotonic() - last)
         slot_age = (
@@ -193,10 +190,15 @@ class ChildSupervisor:
             else max(0.0, time.monotonic() - last_slot)
         )
         now = time.monotonic()
-        current_turn_age_sec = max((now - ts for ts in turn_starts), default=0.0)
+        current_turn_age_sec = (
+            0.0
+            if snapshot is None or snapshot.turn_start is None
+            else now - snapshot.turn_start
+        )
         current_turn_age_sec = max(0.0, current_turn_age_sec)
-        current_turn_stall_age_sec = max(
-            (now - ts for ts in turn_progress_at), default=0.0)
+        current_turn_stall_age_sec = (
+            0.0 if turn_progress_at is None else now - turn_progress_at
+        )
         current_turn_stall_age_sec = max(0.0, current_turn_stall_age_sec)
         return {
             "alive": alive,
@@ -205,10 +207,17 @@ class ChildSupervisor:
             "last_progress_age_sec": age,
             "event_loop_heartbeat_age_sec": age,
             "last_slot_progress_age_sec": slot_age,
-            "active_turn_count": len(turn_starts),
+            "active_turn_count": int(
+                snapshot is not None and snapshot.active_job is not None
+            ),
             "current_turn_age_sec": current_turn_age_sec,
             "current_turn_stall_age_sec": current_turn_stall_age_sec,
         }
+
+    def snapshot(self) -> slot_protocol.SlotProgress | None:
+        """Return the immutable latest snapshot for this one-slot child."""
+        with self._lock:
+            return self._snapshot
 
     def kill_and_respawn(self, *, join_timeout: float = 5.0) -> None:
         """SIGKILL 当前子进程（不可catch，就是要硬杀掉卡死的那个），join，然后重新
@@ -282,10 +291,13 @@ class ChildSupervisor:
 
     def _handle_message(self, msg: Any) -> None:
         try:
-            kind = msg[0]
-        except (TypeError, IndexError):
+            decoded = slot_protocol.decode_message(msg)
+        except (TypeError, ValueError):
             return
-        if kind == "loop_heartbeat":
+        with self._lock:
+            if decoded.slot_generation != self._slot_generation:
+                return
+        if isinstance(decoded, slot_protocol.LoopHeartbeat):
             # Event-loop heartbeat is deliberately process-level only.  It
             # proves the child's loop can still schedule work, but must never
             # refresh a particular turn's stall clock: an await that never
@@ -294,27 +306,14 @@ class ChildSupervisor:
             with self._lock:
                 self._last_progress_at = time.monotonic()
             return
-        if kind != "progress":
-            return
-        # msg shape: ("progress", slot_id, monotonic_ts, turn_start). The 4th
-        # element is optional at the parse level (defensive against an older/
-        # narrower fake target in a test that only sends a 3-tuple, e.g.
-        # tests/test_v2_child_supervisor.py's pre-existing fakes) — absent, this
-        # message carries no turn-start information and only refreshes the
-        # coarse last_progress_at clock below.
-        slot_id = msg[1] if len(msg) > 1 else None
-        turn_start = msg[3] if len(msg) > 3 else None
         received_at = time.monotonic()
         with self._lock:
             self._last_progress_at = received_at
             self._last_slot_progress_at = received_at
-            if len(msg) > 3:
-                if turn_start is None:
-                    self._turn_starts.pop(slot_id, None)
-                    self._turn_progress_at.pop(slot_id, None)
-                else:
-                    self._turn_starts[slot_id] = turn_start
-                    self._turn_progress_at[slot_id] = received_at
+            self._snapshot = decoded
+            self._turn_progress_at = (
+                None if decoded.active_job is None else received_at
+            )
 
     def _stop_reader(self) -> None:
         self._reader_stop.set()
