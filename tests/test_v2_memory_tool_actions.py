@@ -52,6 +52,79 @@ def test_update_maps_to_supersede_with_target():
     assert "envelope" not in a
 
 
+def test_merge_update_can_supersede_every_source_card():
+    """A consolidated successor must retire every card it replaced.
+
+    The server-side memory.supersede action has always accepted a list, but the
+    model-facing tool exposed only one target_id.  That made a real multi-card
+    merge impossible: one old card could be retired while the others remained
+    active beside the merged successor.
+    """
+    from capabilities.tool_schema import validate_tool_args
+
+    raw = {
+        "actions": [{
+            "op": "update",
+            "target_ids": ["mem_old_1", "mem_old_2", "mem_old_1"],
+            "summary": "合并后的记忆",
+            "content": "两张旧卡整理成的一张新卡。",
+        }]
+    }
+
+    assert validate_tool_args("memory_write", raw) is None
+    out = worker._memory_tool_actions(raw["actions"])
+    assert len(out) == 1
+    assert out[0]["type"] == "memory.supersede"
+    assert out[0]["supersedes"] == ["mem_old_1", "mem_old_2"]
+
+
+def test_merge_update_rejects_empty_target_ids():
+    from capabilities.tool_schema import validate_tool_args
+
+    err = validate_tool_args("memory_write", {"actions": [{
+        "op": "update", "target_ids": [], "summary": "s", "content": "c",
+    }]})
+
+    assert err == "args.actions[0] update requires target_id or target_ids, summary, and content"
+
+
+def test_merge_update_over_limit_is_rejected_without_silent_truncation():
+    from capabilities.tool_schema import validate_tool_args
+
+    actions = [{
+        "op": "update",
+        "target_ids": [f"mem_{index}" for index in range(25)],
+        "summary": "s",
+        "content": "c",
+    }]
+
+    assert validate_tool_args("memory_write", {"actions": actions}) == (
+        "args.actions[0] target_ids exceeds maximum 20"
+    )
+    # Translation is deliberately lossless as a second guard.  Live model
+    # calls stop at validation; any trusted/internal caller that bypasses it is
+    # rejected explicitly by memory.actions instead of receiving a partial 20.
+    assert worker._memory_tool_actions(actions)[0]["supersedes"] == [
+        f"mem_{index}" for index in range(25)
+    ]
+
+
+def test_merge_limit_counts_target_id_together_with_target_ids():
+    from capabilities.tool_schema import validate_tool_args
+
+    action = {
+        "op": "update",
+        "target_id": "mem_20",
+        "target_ids": [f"mem_{index}" for index in range(20)],
+        "summary": "s",
+        "content": "c",
+    }
+
+    assert validate_tool_args("memory_write", {"actions": [action]}) == (
+        "args.actions[0] target_ids exceeds maximum 20"
+    )
+
+
 def test_delete_maps_to_memory_delete():
     out = worker._memory_tool_actions([{"op": "delete", "target_id": "mem_9"}])
     assert out == [{

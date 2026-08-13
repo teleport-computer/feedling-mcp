@@ -299,6 +299,14 @@ server, never written into visible text. Ordinary prose about something being
 replaced is unaffected: the rejection requires an internal-id-like hex string
 next to the phrase.
 
+A `memory.supersede` action accepts one source ID or an array of at most 20
+source IDs. An oversized array fails that action with
+`too_many_supersedes` before any card is changed; it is never truncated to a
+successful prefix. On success, `superseded_ids` lists the cards the mutation
+actually retired rather than echoing the requested IDs. Clients consolidating
+more than 20 cards should continue in a later request, including the returned
+successor ID among that request's at most 20 source IDs.
+
 This example adds one encrypted card, retypes an existing card, supersedes an
 outdated card with a new encrypted card, and deletes a fourth card:
 

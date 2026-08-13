@@ -215,6 +215,85 @@ def test_memory_supersede_prebuilt_envelope_accepts_multiple_old_cards(monkeypat
     assert body["results"][0]["superseded_ids"] == ["mem_old_a", "mem_old_b"]
 
 
+def test_memory_supersede_rejects_over_limit_instead_of_retiring_a_prefix():
+    store = types.SimpleNamespace(user_id="usr_m2")
+
+    result, effects, status = memory_actions._memory_supersede_envelope_action(
+        store,
+        {
+            "type": "memory.supersede",
+            "supersedes": [f"mem_{index}" for index in range(25)],
+            "envelope": {},
+        },
+    )
+
+    assert status == 400
+    assert result["error"] == "too_many_supersedes"
+    assert result["max_supersedes"] == 20
+    assert effects == []
+
+
+def test_memory_supersede_receipt_reports_only_cards_actually_retired(monkeypatch):
+    """A target removed between validation and the locked re-read is not claimed.
+
+    This race is rare, but the old receipt echoed requested ids rather than the
+    rows the mutation loop actually changed.  That let an agent tell the user
+    every old card was retired even when the persisted effect said otherwise.
+    """
+    store = types.SimpleNamespace(user_id="usr_m2")
+
+    def old_card(mid: str) -> dict:
+        return {
+            "v": 1,
+            "id": mid,
+            "type": "fact",
+            "owner_user_id": "usr_m2",
+            "visibility": "shared",
+            "body_ct": json.dumps({"summary": mid, "description": mid}),
+            "nonce": f"nonce_{mid}",
+            "K_user": f"ku_{mid}",
+            "K_enclave": f"ke_{mid}",
+            "enclave_pk_fpr": "fpr_test",
+            "occurred_at": "2026-06-20",
+            "created_at": "2026-06-20",
+            "updated_at": "2026-06-20",
+            "source": "memory_capture",
+            "status": "active",
+        }
+
+    old_a = old_card("mem_old_a")
+    old_b = old_card("mem_old_b")
+    moments = [old_a, old_b]
+    _install_memory_action_fakes(monkeypatch, moments)
+    monkeypatch.setattr(
+        memory_actions,
+        "_memory_plain_from_envelope",
+        lambda moment, _api_key, runtime_token="": (_inner(moment), ""),
+    )
+    loads = {"count": 0}
+
+    def load_with_concurrent_removal(_store):
+        loads["count"] += 1
+        return [old_a, old_b] if loads["count"] == 1 else [old_a]
+
+    monkeypatch.setattr(
+        memory_actions.memory_service,
+        "_load_moments",
+        load_with_concurrent_removal,
+    )
+
+    body, status = memory_actions._execute_memory_actions(store, "api_key", [{
+        "type": "memory.supersede",
+        "supersedes": ["mem_old_a", "mem_old_b"],
+        "memory": {"summary": "merged", "content": "merged content"},
+        "capture_mode": "agent_tool",
+    }])
+
+    assert status == 200
+    assert body["results"][0]["superseded_ids"] == ["mem_old_a"]
+    assert body["effects"][0]["superseded_ids"] == ["mem_old_a"]
+
+
 def test_coerce_runtime_action_maps_memory_supersede_to_executor_action():
     action = {
         "type": "memory.supersede",

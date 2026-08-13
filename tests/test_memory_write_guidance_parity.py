@@ -77,6 +77,13 @@ def test_v2_tool_description_still_states_its_own_ops():
     assert "target_id" in desc
 
 
+def test_v2_tool_description_states_merge_limit_and_single_delete_target():
+    desc = tool_schema.DESCRIPTIONS["memory_write"]
+
+    assert "at most 20 per update" in desc
+    assert "'delete' accepts one 'target_id' only" in desc
+
+
 def test_v1_guidance_keeps_its_own_op_names():
     """V1 那条路的 op 名不许被这次重构顺走。"""
     guidance = prompts_v1.MEMORY_WRITE_GUIDANCE_V1

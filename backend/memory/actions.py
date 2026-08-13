@@ -20,6 +20,7 @@ from memory import card_text
 from memory import service as memory_service
 from memory.prompts_v1 import normalize_bucket_language
 from memory.source_policy import (
+    MAX_MEMORY_SUPERSEDE_TARGETS,
     MEMORY_CAPTURE_MODE_VALUES,
     MEMORY_SOURCE_VALUES,
 )
@@ -154,7 +155,11 @@ def _memory_action_list(value, max_items: int = 8, max_chars: int = 80) -> list[
     return out
 
 
-def _memory_supersedes_list(action: dict, *, max_items: int = 20) -> list[str]:
+def _memory_supersedes_list(
+    action: dict,
+    *,
+    max_items: int = MAX_MEMORY_SUPERSEDE_TARGETS + 1,
+) -> list[str]:
     for key in ("supersedes", "old_id", "target_id", "memory_id"):
         if key not in action:
             continue
@@ -775,6 +780,13 @@ def _memory_supersede_action(
     old_ids = _memory_supersedes_list(action)
     if not old_ids:
         return {"status": "error", "error": "supersedes_required", "action": "memory.supersede"}, [], 400
+    if len(old_ids) > MAX_MEMORY_SUPERSEDE_TARGETS:
+        return {
+            "status": "error",
+            "error": "too_many_supersedes",
+            "max_supersedes": MAX_MEMORY_SUPERSEDE_TARGETS,
+            "action": "memory.supersede",
+        }, [], 400
 
     mem_type = str(raw.get("type") or "fact").strip().lower()
     summary = str(raw.get("summary") or raw.get("description") or raw.get("title") or "").strip()[:2000]
@@ -894,12 +906,13 @@ def _memory_supersede_action(
         "source_chat_message_ids": action.get("source_chat_message_ids") or [],
         "anchor_memory_ids": anchor_ids,
     })
+    retired_ids = [str(doc.get("id") or "") for doc in retired_docs if str(doc.get("id") or "")]
     effect = {
         "type": "memory_superseded",
         "action": "memory.supersede",
         "memory_id": new_moment["id"],
-        "supersedes": old_ids[0] if len(old_ids) == 1 else list(old_ids),
-        "superseded_ids": list(old_ids),
+        "supersedes": retired_ids[0] if len(retired_ids) == 1 else retired_ids,
+        "superseded_ids": retired_ids,
         "fields": ["created", "status", "supersedes", "superseded_by"],
     }
     return {
@@ -907,7 +920,7 @@ def _memory_supersede_action(
         "action": "memory.supersede",
         "memory": {"id": new_moment["id"], "type": mem_type, "occurred_at": new_moment["occurred_at"], "status": "active"},
         "superseded": retired_docs[0] if len(retired_docs) == 1 else retired_docs,
-        "superseded_ids": list(old_ids),
+        "superseded_ids": retired_ids,
         "change": change,
     }, [effect], 201
 
@@ -916,6 +929,13 @@ def _memory_supersede_envelope_action(store: UserStore, action: dict) -> tuple[d
     old_ids = _memory_supersedes_list(action)
     if not old_ids:
         return {"status": "error", "error": "supersedes_required", "action": "memory.supersede"}, [], 400
+    if len(old_ids) > MAX_MEMORY_SUPERSEDE_TARGETS:
+        return {
+            "status": "error",
+            "error": "too_many_supersedes",
+            "max_supersedes": MAX_MEMORY_SUPERSEDE_TARGETS,
+            "action": "memory.supersede",
+        }, [], 400
     envelope = dict(action.get("envelope") or {})
     moments = memory_service._load_moments(store)
     old_indices: list[int] = []
@@ -979,12 +999,13 @@ def _memory_supersede_envelope_action(store: UserStore, action: dict) -> tuple[d
         "source_chat_message_ids": action.get("source_chat_message_ids") or [],
         "anchor_memory_ids": anchor_ids,
     })
+    retired_ids = [str(doc.get("id") or "") for doc in retired_docs if str(doc.get("id") or "")]
     effect = {
         "type": "memory_superseded",
         "action": "memory.supersede",
         "memory_id": new_moment["id"],
-        "supersedes": old_ids[0] if len(old_ids) == 1 else list(old_ids),
-        "superseded_ids": list(old_ids),
+        "supersedes": retired_ids[0] if len(retired_ids) == 1 else retired_ids,
+        "superseded_ids": retired_ids,
         "fields": ["created", "status", "supersedes", "superseded_by"],
     }
     return {
@@ -997,7 +1018,7 @@ def _memory_supersede_envelope_action(store: UserStore, action: dict) -> tuple[d
             "status": new_moment.get("status", "active"),
         },
         "superseded": retired_docs[0] if len(retired_docs) == 1 else retired_docs,
-        "superseded_ids": list(old_ids),
+        "superseded_ids": retired_ids,
         "change": change,
     }, [effect], 201
 
