@@ -15,8 +15,10 @@
 - Record host busy/idle/I/O-wait/load plus per-container CPU cores and total-CVM capacity percentage.
 - Record no environment values, labels, command lines, logs, credentials, user IDs, requests, or business content.
 - Limit cpu-socket-proxy to 0.05 CPU/64 MB and cpu-recorder to 0.10 CPU/128 MB.
-- Permit only GET /containers/json?all=0 and GET requests matching
-  /containers/[0-9a-f]{64}/stats?stream=false.
+- Permit only GET paths /containers/json and
+  /containers/[0-9a-f]{64}/stats through the socket proxy. The proxy matches
+  paths rather than query strings; the recorder fixes its requests to all=0
+  and stream=false.
 - Publish no proxy/recorder ports. Only the recorder and proxy join their internal network.
 - No business service depends on either observability service.
 - Pin the proxy to ghcr.io/wollomatic/socket-proxy:1.13.0@sha256:be7a61fc50baf0add95d94442c3d40cddc4594925a564f22ba870eb017ceae9f.
@@ -241,8 +243,8 @@ For both Compose files, assert:
   - -loglevel=INFO
   - -listenip=0.0.0.0
   - -allowfrom=cpu-recorder
-  - -allowGET=/containers/json\?all=0
-  - -allowGET=/containers/[0-9a-f]{64}/stats\?stream=false
+  - -allowGET=/containers/json
+  - -allowGET=/containers/[0-9a-f]{64}/stats
   - -allowhealthcheck
   - -watchdoginterval=60
   - -stoponwatchdog

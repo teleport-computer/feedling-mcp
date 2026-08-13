@@ -57,6 +57,10 @@ def _make_release_repo(tmp_path: Path) -> ReleaseRepo:
         "services:\n"
         "  backend:\n"
         "    image: ghcr.io/old-owner/feedling:deadbee\n"
+        "  cpu-recorder:\n"
+        "    image: ghcr.io/old-owner/feedling:deadbee\n"
+        "  cpu-socket-proxy:\n"
+        "    image: ghcr.io/wollomatic/socket-proxy:1.13.0@sha256:proxy-pin\n"
     )
     (checkout / RUNNER_COMPOSE).write_text(
         "services:\n"
@@ -115,6 +119,12 @@ def test_release_pin_commits_and_pushes_both_images_as_one_unit(tmp_path: Path):
         f"ghcr.io/teleport-computer/feedling:{release.trigger_sha[:7]}"
         in (release.checkout / MAIN_COMPOSE).read_text()
     )
+    main_source = (release.checkout / MAIN_COMPOSE).read_text()
+    expected_feedling = (
+        f"ghcr.io/teleport-computer/feedling:{release.trigger_sha[:7]}"
+    )
+    assert main_source.count(expected_feedling) == 2
+    assert "ghcr.io/wollomatic/socket-proxy:1.13.0@sha256:proxy-pin" in main_source
     assert (
         "ghcr.io/teleport-computer/feedling-agent-runner:"
         f"{release.trigger_sha[:7]}"
