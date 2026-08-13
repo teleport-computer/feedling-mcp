@@ -8,13 +8,16 @@ workers, providers, or the tool loop.  It answers two small questions:
    and safety headroom?
 
 The estimator uses canonical UTF-8 JSON bytes as conservative *admission
-units*.  They are not billing-token estimates.  The default treats every byte
-as one token, intentionally overestimating ordinary tokenizers while keeping
-the implementation provider-independent and monotonic. Image payload bytes are
-replaced by a separately configurable per-image reserve so base64 transport
-encoding does not masquerade as text tokens. Deployments may calibrate the byte
-ratio or provide route context metadata, but must not weaken the
-all-required-or-error contract implemented here.
+units*.  They are not billing-token estimates. Natural-language prompt content
+defaults to one byte per token, intentionally overestimating multilingual text.
+ASCII-heavy tool schemas use a separate conservative three-byte ratio instead
+of inheriting that text estimate; applying one byte per token to schemas can
+inflate their cost by roughly four times and silently erase the whole tool
+surface. Image payload bytes are replaced by a separately configurable
+per-image reserve so base64 transport encoding does not masquerade as text
+tokens. Deployments may calibrate the natural-language byte ratio or provide
+route context metadata, but must not weaken the all-required-or-error contract
+implemented here.
 
 Conversation text never enters :class:`PromptFrontierPlan`; components retain
 only a name and a bounded integer estimate.  This makes the result safe to
@@ -40,6 +43,11 @@ MIN_SAFETY_MARGIN_TOKENS = 512
 MIN_CONTEXT_WINDOW_TOKENS = 2_048
 MAX_CONTEXT_WINDOW_TOKENS = 2_000_000
 DEFAULT_ESTIMATOR_UTF8_BYTES_PER_TOKEN = 1.0
+# Tool/function schemas are overwhelmingly ASCII JSON. Keep this calibration
+# inside the frontier so every caller accounts for the same provider-visible
+# structure; the deployment knob above remains scoped to natural-language and
+# transcript content, where increasing it would undercount CJK text.
+TOOL_SCHEMA_UTF8_BYTES_PER_TOKEN = 3.0
 DEFAULT_IMAGE_RESERVE_TOKENS = 8_192
 
 # Provider message framing is not present in a content string itself.  The
@@ -759,18 +767,26 @@ def tool_schemas_component(
     name: str = "tool_schemas",
     required: bool = True,
     priority: int = 0,
-    utf8_bytes_per_token: float = DEFAULT_ESTIMATOR_UTF8_BYTES_PER_TOKEN,
 ) -> PromptComponent:
     """Account for the complete offered tool catalog as one atomic component."""
 
     overhead = len(tools) * TOOL_SCHEMA_STRUCTURAL_OVERHEAD_TOKENS
-    return structured_component(
-        name,
-        list(tools),
+    rendered = canonical_json(list(tools)).encode("utf-8")
+    ascii_bytes = sum(byte < 0x80 for byte in rendered)
+    non_ascii_bytes = len(rendered) - ascii_bytes
+    # JSON syntax, field names, and most schemas are ASCII-heavy and use the
+    # calibrated ratio. Server-authored descriptions/enums may be CJK or any
+    # other UTF-8 text; count every non-ASCII byte as a full admission token so
+    # the ASCII calibration can never turn multilingual schemas into an
+    # under-estimate (for example, one Chinese character contributes 3 bytes).
+    estimated_tokens = int(
+        math.ceil(ascii_bytes / TOOL_SCHEMA_UTF8_BYTES_PER_TOKEN)
+    ) + non_ascii_bytes + overhead
+    return PromptComponent(
         required=required,
+        name=name,
         priority=priority,
-        structural_overhead_tokens=overhead,
-        utf8_bytes_per_token=utf8_bytes_per_token,
+        estimated_tokens=estimated_tokens,
     )
 
 
@@ -986,7 +1002,6 @@ def plan_provider_round(
                     required_tools,
                     name="required_tool_schemas",
                     required=True,
-                    utf8_bytes_per_token=utf8_bytes_per_token,
                 )
             )
         if optional_tools:
@@ -995,7 +1010,6 @@ def plan_provider_round(
                     optional_tools,
                     required=False,
                     priority=1,
-                    utf8_bytes_per_token=utf8_bytes_per_token,
                 )
             )
     return plan_prompt(

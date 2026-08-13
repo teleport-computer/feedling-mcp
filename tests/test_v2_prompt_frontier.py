@@ -1,6 +1,7 @@
 import pathlib
 import sys
 import asyncio
+import math
 
 import pytest
 
@@ -262,16 +263,117 @@ def test_complete_tool_schema_catalog_is_one_atomic_component():
     ]
 
     component = frontier.tool_schemas_component(tools)
+    rendered = frontier.canonical_json(tools).encode("utf-8")
+    ascii_bytes = sum(byte < 0x80 for byte in rendered)
+    non_ascii_bytes = len(rendered) - ascii_bytes
 
     assert component == frontier.PromptComponent(
         name="tool_schemas",
         estimated_tokens=(
-            len(frontier.canonical_json(tools).encode("utf-8"))
+            int(
+                math.ceil(
+                    ascii_bytes / frontier.TOOL_SCHEMA_UTF8_BYTES_PER_TOKEN
+                )
+            )
+            + non_ascii_bytes
             + len(tools) * frontier.TOOL_SCHEMA_STRUCTURAL_OVERHEAD_TOKENS
         ),
         required=True,
         priority=0,
     )
+
+
+def test_non_ascii_schema_bytes_never_inherit_ascii_calibration():
+    ascii_tool = ToolSpec(
+        "lookup",
+        "calendar lookup",
+        {"type": "object", "properties": {}},
+    )
+    multilingual_tool = ToolSpec(
+        "lookup",
+        "查询日历安排",
+        {"type": "object", "properties": {}},
+    )
+    ascii_json = frontier.canonical_json([ascii_tool]).encode("utf-8")
+    multilingual_json = frontier.canonical_json([multilingual_tool]).encode("utf-8")
+    ascii_non_ascii_bytes = sum(byte >= 0x80 for byte in ascii_json)
+    multilingual_non_ascii_bytes = sum(
+        byte >= 0x80 for byte in multilingual_json
+    )
+    assert ascii_non_ascii_bytes == 0
+    assert multilingual_non_ascii_bytes > 0
+
+    ascii_cost = frontier.tool_schemas_component([ascii_tool]).estimated_tokens
+    multilingual_cost = frontier.tool_schemas_component(
+        [multilingual_tool]
+    ).estimated_tokens
+    assert multilingual_cost > ascii_cost
+    multilingual_ascii_bytes = (
+        len(multilingual_json) - multilingual_non_ascii_bytes
+    )
+    assert multilingual_cost == (
+        math.ceil(
+            multilingual_ascii_bytes
+            / frontier.TOOL_SCHEMA_UTF8_BYTES_PER_TOKEN
+        )
+        + multilingual_non_ascii_bytes
+        + frontier.TOOL_SCHEMA_STRUCTURAL_OVERHEAD_TOKENS
+    )
+
+
+def test_schema_calibration_keeps_ascii_catalog_inside_real_small_window():
+    """The text estimator must not be reused for ASCII-heavy tool schemas.
+
+    Grow the fixture from the frontier's own budget rather than copying a
+    schema-size threshold into the test. The sample must straddle the old
+    one-byte estimate and the calibrated estimate; changing the production
+    ratio back to one therefore makes this guard fail before planning.
+    """
+
+    model_limit = _model_limit(16_384)
+    budget = frontier.build_prompt_budget(model_limit.context_window_tokens)
+    messages = [{"role": "user", "content": "hello"}]
+    message_cost = frontier.messages_component(
+        messages, name="message_context"
+    ).estimated_tokens
+    available_for_tools = budget.input_budget_tokens - message_cost
+    tools = []
+    calibrated = None
+    legacy = None
+    for index in range(1, 1_000):
+        tools.append(ToolSpec(
+            name=f"catalog_tool_{index}",
+            description="lookup structured records " * 8,
+            parameters={
+                "type": "object",
+                "properties": {"query": {"type": "string"}},
+            },
+        ))
+        calibrated = frontier.tool_schemas_component(
+            tools, required=False
+        ).estimated_tokens
+        legacy = frontier.estimate_structured_tokens(
+            tools,
+            structural_overhead_tokens=(
+                len(tools) * frontier.TOOL_SCHEMA_STRUCTURAL_OVERHEAD_TOKENS
+            ),
+            utf8_bytes_per_token=(
+                frontier.DEFAULT_ESTIMATOR_UTF8_BYTES_PER_TOKEN
+            ),
+        )
+        if calibrated <= available_for_tools < legacy:
+            break
+
+    assert calibrated is not None and legacy is not None
+    assert calibrated <= available_for_tools < legacy, (
+        "fixture did not cross the legacy schema-estimator gate"
+    )
+    plan = frontier.plan_provider_round(
+        model_limit=model_limit,
+        messages=messages,
+        tools=tools,
+    )
+    assert "tool_schemas" not in plan.omitted_optional_components
 
 
 def test_output_and_safety_reserves_are_explicit():
@@ -413,7 +515,7 @@ def test_optional_tool_catalog_is_omitted_whole_and_reported():
     tools = [
         {
             "type": "function",
-            "function": {"name": "large_tool", "description": "z" * 2_000},
+                "function": {"name": "large_tool", "description": "z" * 6_000},
         }
     ]
     plan = frontier.plan_prompt(
@@ -441,7 +543,7 @@ def test_historical_tool_schema_is_required_when_optional_catalog_does_not_fit()
     ]
     tools = [
         ToolSpec("memory_index", "list memories", {"type": "object"}),
-        ToolSpec("large_optional", "z" * 5_000, {"type": "object"}),
+        ToolSpec("large_optional", "z" * 15_000, {"type": "object"}),
     ]
 
     plan = frontier.plan_provider_round(
@@ -466,7 +568,7 @@ def test_historical_tool_schema_fails_closed_when_required_frontier_is_exhausted
         ),
     ]
     tools = [
-        ToolSpec("memory_index", "z" * 5_000, {"type": "object"}),
+        ToolSpec("memory_index", "z" * 15_000, {"type": "object"}),
     ]
 
     with pytest.raises(frontier.PromptFrontierExhausted) as caught:
@@ -734,7 +836,7 @@ def test_tool_catalog_is_counted_and_omitted_whole_when_only_it_does_not_fit(
         extra_tool_specs=[
             ToolSpec(
                 "large_read",
-                "z" * 20_000,
+                "z" * 60_000,
                 {"type": "object", "properties": {}},
             )
         ],
