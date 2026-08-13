@@ -945,13 +945,18 @@ def _existing_import_user_name(store: UserStore, api_key: str | None) -> str:
     """
     try:
         identity = identity_service._load_identity(store)
-        if not isinstance(identity, dict) or not identity.get("body_ct"):
+        if not isinstance(identity, dict):
             return "TA"
-        raw = core_envelope.read_envelope_body(
-            identity,
-            api_key,
-            purpose="identity_update_merge",
-        )
+        shape = core_envelope.classify_envelope_shape(identity)
+        if shape in ("plaintext_text", "plaintext_binary"):
+            raw = core_envelope.read_plaintext_envelope_body(
+                identity, owner_user_id=store.user_id)
+        else:
+            raw = core_envelope.read_envelope_body(
+                identity,
+                api_key,
+                purpose="identity_update_merge",
+            )
         payload = json.loads(raw.decode("utf-8"))
         if not isinstance(payload, dict):
             return "TA"

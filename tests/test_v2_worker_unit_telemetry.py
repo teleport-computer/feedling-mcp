@@ -13,6 +13,21 @@ from model_api_runtime.v2 import worker  # noqa: E402
 from model_api_runtime.v2 import summary_frontier  # noqa: E402
 
 
+def test_thinking_extra_preserves_plaintext_body():
+    extra = worker._thinking_extra({
+        "envelope": {
+            "id": "thinking-plain",
+            "body": "private reasoning",
+            "owner_user_id": "usr_plain",
+            "visibility": "shared",
+        },
+        "metadata": {"thinking_kind": "reasoning"},
+    })
+
+    assert extra["thinking_body"] == "private reasoning"
+    assert "thinking_body_ct" not in extra
+
+
 @pytest.mark.parametrize(
     "reason",
     [

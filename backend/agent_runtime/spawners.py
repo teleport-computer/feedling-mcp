@@ -1011,7 +1011,10 @@ def _persona_from_blob(blob, decrypt_fn) -> str:
     if not isinstance(blob, dict):
         return ""
     env = blob.get("content_envelope")
-    if not (isinstance(env, dict) and env.get("body_ct")):
+    if not isinstance(env, dict):
+        return ""
+    from core import envelope as core_envelope
+    if core_envelope.classify_envelope_shape(env) == "invalid":
         return ""
     try:
         return str(decrypt_fn(env) or "")

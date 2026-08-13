@@ -10,7 +10,7 @@ import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "backend"))
 
-from memory import migration  # noqa: E402
+from memory import actions, migration  # noqa: E402
 from memory import migrate_prompt_v1 as mp  # noqa: E402
 from proactive import capture_jobs  # noqa: E402
 from proactive import capture_scheduler  # noqa: E402
@@ -62,6 +62,11 @@ def test_select_legacy_batch_filters_and_caps():
     # cap respected
     assert len(migration.select_legacy_batch(moments, batch_size=1)) == 1
     assert migration.count_legacy(moments) == 3
+
+
+def test_plaintext_memory_cas_token_changes_with_body():
+    assert migration.body_hash({"body": "a"}) != migration.body_hash({"body": "b"})
+    assert actions._memory_body_hash({"body": "a"}) != actions._memory_body_hash({"body": "b"})
 
 
 # --- migration state machine ---------------------------------------------

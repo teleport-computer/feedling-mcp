@@ -685,6 +685,15 @@ def test_persona_from_blob_decrypts_envelope():
     assert spawners._persona_from_blob(blob, lambda env: "You are Kai.") == "You are Kai."
 
 
+def test_persona_from_plaintext_blob_delegates_to_shape_aware_reader():
+    blob = {"content_envelope": {"body": "You are Kai."}}
+
+    assert spawners._persona_from_blob(
+        blob,
+        lambda env: env["body"],
+    ) == "You are Kai."
+
+
 def test_persona_from_blob_empty_on_absent_or_undecryptable():
     assert spawners._persona_from_blob(None, lambda env: "x") == ""
     assert spawners._persona_from_blob({}, lambda env: "x") == ""                        # no envelope

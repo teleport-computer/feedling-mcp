@@ -1162,9 +1162,15 @@ def _plaintext_existing_identity_for_update(store, api_key: str | None) -> dict:
     return {} so the job falls back to the old fresh-derive behavior."""
     try:
         blob = identity_service._load_identity(store)
-        if not isinstance(blob, dict) or not blob.get("body_ct"):
+        if not isinstance(blob, dict):
             return {}
-        raw = core_envelope.read_envelope_body(blob, api_key, purpose="identity_update_merge")
+        shape = core_envelope.classify_envelope_shape(blob)
+        if shape in ("plaintext_text", "plaintext_binary"):
+            raw = core_envelope.read_plaintext_envelope_body(
+                blob, owner_user_id=store.user_id)
+        else:
+            raw = core_envelope.read_envelope_body(
+                blob, api_key, purpose="identity_update_merge")
         parsed = json.loads(raw.decode("utf-8"))
         return parsed if isinstance(parsed, dict) else {}
     except Exception:

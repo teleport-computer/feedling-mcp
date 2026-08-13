@@ -585,6 +585,15 @@ def _decrypt_blob_text(
     envelope = blob.get("content_envelope") if isinstance(blob.get("content_envelope"), dict) else {}
     if not envelope:
         return ""
+    from core import envelope as core_envelope
+
+    shape = core_envelope.classify_envelope_shape(envelope)
+    if shape in ("plaintext_text", "plaintext_binary"):
+        raw = core_envelope.read_plaintext_envelope_body(
+            envelope,
+            owner_user_id=str(getattr(store, "user_id", "") or ""),
+        )
+        return raw.decode("utf-8")
     return _decrypt_envelope(enclave_url, runtime_token, envelope, purpose=purpose, store=store, job_id=job_id).decode("utf-8")
 
 

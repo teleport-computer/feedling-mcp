@@ -1,6 +1,5 @@
 """Memory write actions (add / patch / retype / delete) + executor."""
 
-import hashlib
 import json
 import re
 import unicodedata
@@ -570,10 +569,8 @@ def _memory_add_envelope_action(
 
 
 def _memory_body_hash(moment: dict | None) -> str:
-    """Stable CAS token = sha256 of the stored ciphertext. `to_v1_card` never
-    looks inside `body_ct`, so this is invariant across reads until a genuine
-    re-encrypt — exactly what a read-modify-write needs to detect concurrent edits."""
-    return hashlib.sha256(str((moment or {}).get("body_ct") or "").encode("utf-8")).hexdigest()
+    """Stable CAS token over the authoritative persisted content shape."""
+    return core_envelope.envelope_content_token(moment or {})
 
 
 def _memory_upgrade_apply(
