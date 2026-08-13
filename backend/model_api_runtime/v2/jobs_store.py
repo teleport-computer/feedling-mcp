@@ -15,6 +15,7 @@ import re
 import threading
 import time
 import uuid
+from dataclasses import dataclass
 from concurrent.futures import (
     Future,
     ThreadPoolExecutor,
@@ -22,7 +23,7 @@ from concurrent.futures import (
 )
 from contextlib import contextmanager, nullcontext
 from datetime import date, datetime, timedelta, timezone
-from typing import Any, Callable
+from typing import Any, Callable, Literal
 
 import psycopg
 from psycopg import sql
@@ -128,6 +129,15 @@ LANE_PRIORITY = {
     # maintenance. One generic job drains one encrypted failed-turn review.
     "trajectory_review": 1,
 }
+
+
+@dataclass(frozen=True)
+class PreemptedJob:
+    job_id: int
+    user_id: str
+    lane: str
+    claimed_by: str | None
+    recovery: Literal["terminal", "requeued"]
 # Chat admission and execution use separate columns and clocks. Pending rows
 # have a short queue deadline so an admitted turn cannot wait forever when the
 # fleet dies. Claim starts a distinct owner-fenced execution lease. Workers
@@ -607,6 +617,72 @@ def coalesce_or_insert_on_cursor(
         ),
     )
     return int(cur.fetchone()["id"]), False
+
+
+def preempt_active_for_chat_on_cursor(
+    cur: psycopg.Cursor,
+    *,
+    user_id: str,
+) -> list[PreemptedJob]:
+    """Invalidate same-user non-Chat owners before inserting/coalescing Chat.
+
+    The caller owns the surrounding transaction and has already taken the
+    runtime-state/user fence.  Recoverable scheduled and capture executions
+    retain their durable Job identity and return to ``pending``; other lanes
+    become terminal ``superseded`` rows and may be recreated by their normal
+    due/backoff policy.  Each write rechecks the locked row's exact status and
+    owner so a stale snapshot can never revoke a newer claim.
+    """
+    cur.execute(
+        "SELECT id,user_id,lane,status,claimed_by FROM agent_jobs "
+        "WHERE user_id=%s AND lane<>'chat' "
+        "AND status IN ('pending','claimed','running') "
+        "ORDER BY id FOR UPDATE",
+        (str(user_id),),
+    )
+    rows = [dict(row) for row in cur.fetchall()]
+    results: list[PreemptedJob] = []
+    for row in rows:
+        lane = str(row["lane"])
+        recovery: Literal["terminal", "requeued"]
+        if lane in {"scheduled", "capture"}:
+            recovery = "requeued"
+            cur.execute(
+                "UPDATE agent_jobs SET status='pending', "
+                "last_error='foreground_chat_preempted', claimed_by=NULL, "
+                "claimed_at=NULL, started_at=NULL, finished_at=NULL, "
+                "lease_expires_at=NULL, deadline_at=NULL, created_at=now() "
+                "WHERE id=%s AND status=%s "
+                "AND claimed_by IS NOT DISTINCT FROM %s",
+                (row["id"], row["status"], row["claimed_by"]),
+            )
+        else:
+            recovery = "terminal"
+            cur.execute(
+                "UPDATE agent_jobs SET status='superseded', finished_at=now(), "
+                "last_error='foreground_chat_preempted', claimed_by=NULL, "
+                "claimed_at=NULL, started_at=NULL, lease_expires_at=NULL, "
+                "deadline_at=NULL "
+                "WHERE id=%s AND status=%s "
+                "AND claimed_by IS NOT DISTINCT FROM %s",
+                (row["id"], row["status"], row["claimed_by"]),
+            )
+        if cur.rowcount != 1:
+            raise RuntimeError(
+                f"active job ownership changed while preempting job {row['id']}"
+            )
+        results.append(
+            PreemptedJob(
+                job_id=int(row["id"]),
+                user_id=str(row["user_id"]),
+                lane=lane,
+                claimed_by=(
+                    None if row["claimed_by"] is None else str(row["claimed_by"])
+                ),
+                recovery=recovery,
+            )
+        )
+    return results
 
 
 def enqueue_job(

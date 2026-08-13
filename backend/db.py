@@ -10296,7 +10296,9 @@ def chat_append_and_enqueue(
             "runtime-control CAS requires expected state, mode, and generation")
     priority = jobs_store.LANE_PRIORITY.get(lane, 0)
 
-    def _attempt() -> tuple[int, int | None, int, bool, list[str]]:
+    def _attempt() -> tuple[
+        int, int | None, int, bool, list[str], list[jobs_store.PreemptedJob]
+    ]:
         with get_pool().connection() as conn:
             with conn.transaction():
                 with conn.cursor() as fence_cur:
@@ -10354,7 +10356,14 @@ def chat_append_and_enqueue(
                         (user_id, client_msg_id, idempotency_window_sec),
                     ).fetchone()
                     if duplicate is not None:
-                        return int(duplicate[0]), None, 0, False, []
+                        return int(duplicate[0]), None, 0, False, [], []
+                preempted_jobs: list[jobs_store.PreemptedJob] = []
+                if lane == "chat":
+                    with conn.cursor(row_factory=dict_row) as preempt_cur:
+                        preempted_jobs = jobs_store.preempt_active_for_chat_on_cursor(
+                            preempt_cur,
+                            user_id=user_id,
+                        )
                 with conn.cursor() as mc:
                     superseded_ids = _supersede_previous_voice_revisions_on_cursor(
                         mc,
@@ -10372,12 +10381,28 @@ def chat_append_and_enqueue(
                         priority=priority, deadline_at=None,
                         expected_generation=expected_generation,
                     )
-        return seq, job_id, storage_generation, True, superseded_ids
+        return (
+            seq,
+            job_id,
+            storage_generation,
+            True,
+            superseded_ids,
+            preempted_jobs,
+        )
 
     def _finish(
-        result: tuple[int, int | None, int, bool, list[str]],
+        result: tuple[
+            int, int | None, int, bool, list[str], list[jobs_store.PreemptedJob]
+        ],
     ) -> tuple[int, int | None]:
-        seq, job_id, storage_generation, inserted, superseded_ids = result
+        (
+            seq,
+            job_id,
+            storage_generation,
+            inserted,
+            superseded_ids,
+            _preempted_jobs,
+        ) = result
         if not inserted:
             return seq, None
         _mirror_superseded_voice_revisions(
