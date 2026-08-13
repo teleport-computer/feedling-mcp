@@ -116,6 +116,8 @@ def photo_evaluate(store, payload: dict) -> tuple[dict, int]:
             content_envelope, user_id=store.user_id, content_type="image")
         if error is not None:
             return error, 400
+        if content_envelope.get("owner_user_id") != store.user_id:
+            return {"error": "envelope.owner_user_id does not match caller"}, 403
     meta_envelope = p.get("meta_envelope")
     if isinstance(meta_envelope, dict) and meta_envelope.get("body") is not None:
         error = core_envelope.validate_uploaded_envelope(
