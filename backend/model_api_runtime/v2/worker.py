@@ -1161,7 +1161,7 @@ def _turn_failure_error_class(exc: BaseException) -> str:
             return "unknown"
         return "context_overflow"
     if isinstance(exc, (asyncio.TimeoutError, TimeoutError)):
-        return "turn_timeout"
+        return "provider_timeout"
     if (
         isinstance(exc, v2_tool_loop.ProviderEmptyReply)
         or (isinstance(exc, TurnError) and str(exc) == "empty_reply")
@@ -1199,7 +1199,7 @@ def _turn_failure_error_class(exc: BaseException) -> str:
     if status_code in {400, 422}:
         return "provider_incompatible"
     if status_code == 408:
-        return "turn_timeout"
+        return "provider_timeout"
     if status_code == 429:
         return "rate_limited"
     if isinstance(status_code, int) and 500 <= status_code <= 599:

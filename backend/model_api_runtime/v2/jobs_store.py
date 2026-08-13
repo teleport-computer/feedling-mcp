@@ -180,8 +180,12 @@ def _terminal_error_class(error: object, error_class: object = "") -> str:
     if candidate in notices_catalog.ERROR_CLASSES:
         return candidate
     code = _terminal_error_code(error)
-    if code in {"queue_timeout", "lease_timeout", "runtime_expired"}:
-        return "turn_timeout"
+    if code == "queue_timeout":
+        return "platform_queue_timeout"
+    if code in {"slot_watchdog_timeout", "lease_timeout", "runtime_expired"}:
+        return "platform_execution_timeout"
+    if code in {"provider_timeout", "provider_transport_timeout"}:
+        return "provider_timeout"
     if "prompt_frontier_exhausted" in code:
         return "context_overflow"
     if code.endswith(":empty_reply"):
@@ -3191,13 +3195,25 @@ def _deliver_terminal_failure_reply(row: dict) -> bool:
         if lane == "scheduled"
         else []
     )
-    reply_text = _scheduled_failure_reply_text(
-        error_class,
-        language=language,
-        user_text=user_text,
-        notes=scheduled_notes,
-    ) if lane == "scheduled" else (
-        user_text if blame == "user_provider" else _TERMINAL_FAILURE_FALLBACK_REPLY
+    reply_text = (
+        _scheduled_failure_reply_text(
+            error_class,
+            language=language,
+            user_text=user_text,
+            notes=scheduled_notes,
+        )
+        if lane == "scheduled"
+        else (
+            user_text
+            if error_class
+            in {
+                "platform_queue_timeout",
+                "platform_execution_timeout",
+                "provider_timeout",
+            }
+            or blame == "user_provider"
+            else _TERMINAL_FAILURE_FALLBACK_REPLY
+        )
     )
     store = core_store.get_store(user_id)
     envelope, error = core_envelope._build_shared_envelope_for_store(
