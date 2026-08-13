@@ -70,6 +70,22 @@ fi
 
 root="$(repo_root)"
 mailbox="${AGENT_MAILBOX_DIR:-$root/.agents/mailbox}"
+
+# 投递地址硬闸(2026-08-14):有 agent 的 cwd 落在生产 checkout 或 feature
+# worktree 里,post.sh 就把信投进那棵树自己的 .agents/mailbox —— 写入成功、
+# 无人读取、**静默丢件**。当晚在 feedling-mcp-main 里发现 29 封被吞的信,
+# 其中 2 封是发给 Supervisor 的,它一直不知道。
+# 这是最坏的一种失败:没有报错、没有信号。所以宁可拒发,不许静默。
+_MAIN_TREE="/Users/xiaotingtan/Desktop/feedling-mcp-test"
+case "$(cd "$root" && pwd -P)" in
+  "$_MAIN_TREE") ;;
+  *)
+    echo "REFUSED: 你当前在 $root,不是主树。" >&2
+    echo "  mailbox 是每棵树独立的目录,在这里发信会投进本树的信箱,收件人永远读不到。" >&2
+    echo "  正确做法:cd $_MAIN_TREE 再发。" >&2
+    echo "  (确实要投到别处?设 AGENT_MAILBOX_DIR 显式指定。)" >&2
+    exit 1 ;;
+esac
 messages_dir="$mailbox/messages"
 inbox_dir="$mailbox/inbox/$to"
 outbox_dir="$mailbox/outbox/$from"
