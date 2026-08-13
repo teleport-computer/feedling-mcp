@@ -90,6 +90,58 @@ def _model_api_key_encryption_material(store) -> tuple[bytes, bytes] | tuple[Non
     return user_pk, enclave_pk
 
 
+def classify_envelope_shape(envelope: object) -> str:
+    """Return the authoritative persisted content shape for one row."""
+    if not isinstance(envelope, dict):
+        return "invalid"
+    if envelope.get("body_ct"):
+        return "sealed"
+    if envelope.get("body_b64") is not None:
+        return "plaintext_binary"
+    if isinstance(envelope.get("body"), str):
+        return "plaintext_text"
+    return "invalid"
+
+
+def read_plaintext_envelope_body(
+    envelope: dict,
+    *,
+    owner_user_id: str = "",
+) -> bytes:
+    """Read a plaintext row locally, rejecting sealed, invalid, or foreign rows."""
+    shape = classify_envelope_shape(envelope)
+    if shape not in ("plaintext_text", "plaintext_binary"):
+        if shape == "sealed":
+            raise ValueError("plaintext_envelope_required")
+        raise ValueError("envelope_shape_unrecognized")
+
+    if owner_user_id and str(envelope.get("owner_user_id") or "") != owner_user_id:
+        raise ValueError("envelope_owner_mismatch")
+
+    if shape == "plaintext_binary":
+        try:
+            return base64.b64decode(envelope["body_b64"], validate=True)
+        except Exception as exc:
+            raise ValueError("envelope_body_b64_invalid") from exc
+    return envelope["body"].encode("utf-8")
+
+
+def envelope_content_token(envelope: dict) -> str:
+    """Hash the authoritative stored shape and body for CAS/idempotency checks."""
+    shape = classify_envelope_shape(envelope)
+    if shape == "invalid":
+        raise ValueError("envelope_shape_unrecognized")
+    field = {
+        "sealed": "body_ct",
+        "plaintext_binary": "body_b64",
+        "plaintext_text": "body",
+    }[shape]
+    value = envelope[field]
+    if not isinstance(value, str):
+        raise ValueError("envelope_shape_unrecognized")
+    return hashlib.sha256(f"{shape}\0{value}".encode("utf-8")).hexdigest()
+
+
 def read_envelope_body(envelope: dict, api_key: str | None, *,
                        purpose: str, runtime_token: str = "") -> bytes:
     """读出内容行的正文，按行形状路由。
@@ -106,24 +158,15 @@ def read_envelope_body(envelope: dict, api_key: str | None, *,
     ``body_ct`` 优先于 ``body``：两者并存只可能出现在迁移中间态，此时密文是真源，
     反过来会读到过期的明文残留。
     """
-    if not isinstance(envelope, dict):
-        raise ValueError("envelope_shape_unrecognized")
-    if envelope.get("body_ct"):
+    shape = classify_envelope_shape(envelope)
+    if shape == "sealed":
         # 只在 runtime_token 非空时透传：api-key 调用方的下游入参必须与改造前
         # 逐字一致（原调用点用 `**decrypt_kwargs` 达到同样效果）。无脑传空串会
         # 让 tests/test_model_api_profiles_config_store.py 的断言失败。
         kwargs = {"runtime_token": runtime_token} if runtime_token else {}
         return enclave._decrypt_envelope_via_enclave(
             envelope, api_key, purpose=purpose, **kwargs)
-    if envelope.get("body_b64") is not None:
-        try:
-            return base64.b64decode(envelope["body_b64"], validate=True)
-        except Exception as exc:
-            raise ValueError("envelope_body_b64_invalid") from exc
-    body = envelope.get("body")
-    if isinstance(body, str):
-        return body.encode("utf-8")
-    raise ValueError("envelope_shape_unrecognized")
+    return read_plaintext_envelope_body(envelope)
 
 
 def decrypt_provider_key_envelope(envelope: dict, api_key: str | None, *,

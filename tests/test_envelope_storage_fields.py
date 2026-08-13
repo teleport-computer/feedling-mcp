@@ -227,3 +227,30 @@ def test_reply_idempotency_compares_plaintext_body():
     src = inspect.getsource(db._same_reply_envelope)
     head = src[:src.index("if not isinstance")]
     assert '"body"' in head, "immutable_reply_fields 漏了 body"
+
+
+def test_content_token_uses_authoritative_shape_and_value():
+    from core.envelope import envelope_content_token
+
+    text_a = envelope_content_token({"body": "a"})
+    text_b = envelope_content_token({"body": "b"})
+    binary_a = envelope_content_token({"body_b64": "a"})
+    sealed_a = envelope_content_token({"body_ct": "a"})
+
+    assert len(text_a) == 64
+    assert len({text_a, text_b, binary_a, sealed_a}) == 4
+
+
+def test_content_token_ciphertext_wins_over_stale_plaintext():
+    from core.envelope import envelope_content_token
+
+    assert envelope_content_token({"body_ct": "fresh", "body": "stale"}) == (
+        envelope_content_token({"body_ct": "fresh"})
+    )
+
+
+def test_content_token_rejects_invalid_shape():
+    from core.envelope import envelope_content_token
+
+    with pytest.raises(ValueError, match="envelope_shape_unrecognized"):
+        envelope_content_token({"id": "no-content"})

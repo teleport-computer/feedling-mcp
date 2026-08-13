@@ -115,3 +115,46 @@ def test_provider_key_wrapper_pins_its_purpose(spy):
     """Task 1.1 的 wrapper 保留，purpose 钉死——它的调用点不该因泛化而改动。"""
     core_envelope.decrypt_provider_key_envelope({"body_ct": "x"}, "ak")
     assert spy[0]["purpose"] == "model_api_provider_key"
+
+
+def test_plaintext_local_reader_never_calls_enclave(spy):
+    env = {
+        "body": "hello",
+        "owner_user_id": "u1",
+        "visibility": "shared",
+    }
+
+    assert core_envelope.classify_envelope_shape(env) == "plaintext_text"
+    assert core_envelope.read_plaintext_envelope_body(
+        env, owner_user_id="u1") == b"hello"
+    assert spy == []
+
+
+def test_plaintext_local_reader_rejects_wrong_owner(spy):
+    env = {"body": "hello", "owner_user_id": "u1"}
+
+    with pytest.raises(ValueError, match="envelope_owner_mismatch"):
+        core_envelope.read_plaintext_envelope_body(env, owner_user_id="u2")
+    assert spy == []
+
+
+def test_ciphertext_wins_over_stale_plaintext():
+    env = {"body_ct": "Y3Q=", "body": "stale"}
+
+    assert core_envelope.classify_envelope_shape(env) == "sealed"
+    with pytest.raises(ValueError, match="plaintext_envelope_required"):
+        core_envelope.read_plaintext_envelope_body(env)
+
+
+@pytest.mark.parametrize(
+    ("envelope", "shape"),
+    [
+        ({"body_ct": "Y3Q="}, "sealed"),
+        ({"body": ""}, "plaintext_text"),
+        ({"body_b64": ""}, "plaintext_binary"),
+        ({"body": 3}, "invalid"),
+        (None, "invalid"),
+    ],
+)
+def test_classify_envelope_shape(envelope, shape):
+    assert core_envelope.classify_envelope_shape(envelope) == shape
