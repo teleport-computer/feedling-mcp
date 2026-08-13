@@ -10,7 +10,7 @@ workers, providers, or the tool loop.  It answers two small questions:
 The estimator uses canonical UTF-8 JSON bytes as conservative *admission
 units*.  They are not billing-token estimates. Natural-language prompt content
 defaults to one byte per token, intentionally overestimating multilingual text.
-ASCII-heavy tool schemas use a separate conservative three-byte ratio instead
+ASCII-heavy tool schemas use a separate conservative 3.5-byte ratio instead
 of inheriting that text estimate; applying one byte per token to schemas can
 inflate their cost by roughly four times and silently erase the whole tool
 surface. Non-ASCII schema bytes still count one-for-one, so multilingual tool
@@ -48,14 +48,20 @@ DEFAULT_ESTIMATOR_UTF8_BYTES_PER_TOKEN = 1.0
 # inside the frontier so every caller accounts for the same provider-visible
 # structure; the deployment knob above remains scoped to natural-language and
 # transcript content, where increasing it would undercount CJK text.
-TOOL_SCHEMA_UTF8_BYTES_PER_TOKEN = 3.0
+TOOL_SCHEMA_UTF8_BYTES_PER_TOKEN = 3.5
 DEFAULT_IMAGE_RESERVE_TOKENS = 8_192
 
 # Provider message framing is not present in a content string itself.  The
 # canonical JSON estimate already counts roles/keys/delimiters; this small
 # fixed allowance covers wire-specific framing that adapters add around it.
 MESSAGE_STRUCTURAL_OVERHEAD_TOKENS = 8
-TOOL_SCHEMA_STRUCTURAL_OVERHEAD_TOKENS = 64
+# The canonical ToolSpec JSON does not contain each provider's outer wrapper.
+# The widest current wrapper adds about 31 ASCII bytes per tool (OpenAI chat;
+# the captured 69-tool catalog is 32,684 canonical bytes and 34,823 wire bytes).
+# Sixteen tokens/tool therefore reserves well above that framing at the
+# calibrated 3.5-byte ratio without reintroducing the multi-thousand-token
+# overcount that previously erased the complete tool surface on 16K/32K/40K.
+TOOL_SCHEMA_STRUCTURAL_OVERHEAD_TOKENS = 16
 TOOL_EXCHANGE_STRUCTURAL_OVERHEAD_TOKENS = 12
 
 LimitSource = Literal[
@@ -795,7 +801,10 @@ def tool_schemas_component(
     ascii_bytes = sum(byte < 0x80 for byte in rendered)
     non_ascii_bytes = len(rendered) - ascii_bytes
     # JSON syntax, field names, and most schemas are ASCII-heavy and use the
-    # calibrated ratio. Server-authored descriptions/enums may be CJK or any
+    # calibrated ratio. The captured 32,684-byte production catalog encodes to
+    # 7,355-7,851 tokens across cl100k/o200k and all current provider wrappers;
+    # 3.5 bytes/token plus the explicit wrapper reserve estimates 10,443.
+    # Server-authored descriptions/enums may be CJK or any
     # other UTF-8 text; count every non-ASCII byte as a full admission token so
     # the ASCII calibration can never turn multilingual schemas into an
     # under-estimate (for example, one Chinese character contributes 3 bytes).
