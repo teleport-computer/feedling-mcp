@@ -283,6 +283,9 @@ jobs:
             tests/test_debug_trace.py \
             tests/test_access_mode_runtime_sync_unit.py \
             tests/test_pytest_coverage_ratchet.py \
+            tests/test_cpu_recorder.py \
+            tests/test_cpu_recorder_compose.py \
+            tests/test_cpu_socket_proxy_integration.py \
             tests/test_mcp_client.py \
             tests/test_mcp_status.py \
             tests/test_user_mcp_core.py \
