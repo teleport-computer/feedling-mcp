@@ -10,6 +10,14 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **`memory_search` guidance documents literal matching and allows a reworded
+  retry.** Matching is a case-insensitive literal substring with no synonyms,
+  translation, or stemming, so an empty result means that wording is absent
+  rather than that the memory is missing. The tool guidance no longer tells the
+  model to stop after one discovery result; it directs a retry with different
+  wording and refuses only an identical repeat of the same arguments. Request
+  and response shapes are unchanged.
+
 - **Hosted Runtime V2 no longer exposes serialized provider response wrappers
   as assistant text.** A complete relay envelope containing Gemini response
   metadata and a transport trace ID is treated as content-free provider output,
