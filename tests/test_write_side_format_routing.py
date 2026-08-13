@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import base64
 import os
+import base64
 import sys
 import uuid
 
@@ -132,6 +133,7 @@ def test_plaintext_tier_binary_body_uses_body_b64(store, monkeypatch):
     assert out["id"] == "generated-image-id"
     assert out["owner_user_id"] == store.user_id
     assert out["visibility"] == "shared"
+    assert "body" not in out and "body_ct" not in out
 
 
 def test_shared_envelope_rejects_unknown_content_kind(store, monkeypatch):

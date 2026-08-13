@@ -10,6 +10,15 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **Plaintext accounts can send hosted Chat images and files and upload capture
+  media without an enclave dependency.** Hosted image and PDF/file bodies now
+  use the strict binary `body_b64` envelope instead of being decoded as UTF-8,
+  preventing the previous `plaintext_body_not_utf8` 409 (and PostgreSQL null-byte
+  failure). Screen frames and perception photos use the same authenticated,
+  owner-bound binary shape. Encrypted accounts retain the existing dual-recipient
+  envelope and verification chain, and plaintext photos keep derived place labels
+  on-device rather than adding them to the plaintext request.
+
 - **Plaintext-account Genesis imports now commit and resume without entering the
   enclave decrypt path.** Estimate/commit staged uploads and resumable
   checkpoints read plaintext envelopes locally, while encrypted accounts keep

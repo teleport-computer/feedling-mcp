@@ -31,6 +31,9 @@ from hosted import config_store as hosted_config_store  # noqa: E402
 from model_api_runtime.v2 import jobs_store  # noqa: E402
 
 
+_REAL_SHARED_ENVELOPE_BUILDER = core_envelope._build_shared_envelope_for_store
+
+
 def _app_has_route(app, path: str) -> bool:
     def walk(routes) -> bool:
         for route in routes:
@@ -55,7 +58,13 @@ def _b64(raw: bytes) -> str:
 def _fake_envelope_builder():
     counter = {"n": 0}
 
-    def build(store, plaintext: bytes, *, item_id: str | None = None):
+    def build(
+        store,
+        plaintext: bytes,
+        *,
+        item_id: str | None = None,
+        content_kind: str = "text",
+    ):
         counter["n"] += 1
         n = counter["n"]
         return {
@@ -245,6 +254,60 @@ def test_asgi_file_turns_enter_v2(env, payload, content_type):
     store = core_store.get_store(user_id)
     user_rows = [row for row in store.chat_messages if row.get("role") == "user"]
     assert user_rows[-1]["content_type"] == content_type
+
+
+@pytest.mark.parametrize(
+    ("payload", "expected_type", "expected_bytes"),
+    [
+        (
+            {
+                "image_b64": _b64(b"\xff\xd8\xff\x00image"),
+                "image_mime": "image/jpeg",
+            },
+            "image",
+            b"\xff\xd8\xff\x00image",
+        ),
+        (
+            {
+                "content_type": "file",
+                "file_name": "report.pdf",
+                "file_mime": "application/pdf",
+                "file_b64": _b64(b"%PDF-1.7\x00binary"),
+            },
+            "file",
+            b"%PDF-1.7\x00binary",
+        ),
+    ],
+)
+def test_effective_off_binary_turns_persist_plaintext_binary_envelope(
+    env, payload, expected_type, expected_bytes,
+):
+    monkeypatch = env
+    user_id, api_key = _register()
+    _setup(api_key, monkeypatch)
+    monkeypatch.setattr(
+        core_envelope,
+        "_build_shared_envelope_for_store",
+        _REAL_SHARED_ENVELOPE_BUILDER,
+    )
+    monkeypatch.setattr(
+        core_envelope,
+        "resolve_content_encryption",
+        lambda _user_id: "off",
+    )
+
+    status, body = _asgi_post(payload, api_key)
+
+    assert status == 202, body
+    rows = [
+        row for row in core_store.get_store(user_id).chat_messages
+        if row.get("role") == "user"
+    ]
+    row = rows[-1]
+    assert row["content_type"] == expected_type
+    assert base64.b64decode(row["body_b64"], validate=True) == expected_bytes
+    assert row["body_size_bytes"] == len(expected_bytes)
+    assert "body_ct" not in row and "K_enclave" not in row
 
 
 def test_auth_and_validation_parity(env):
