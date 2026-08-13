@@ -1659,6 +1659,73 @@ def test_inflight_job_count_filters_foreground_and_background_lanes():
     assert jobs_store.inflight_job_count() == before_all + 8
 
 
+def test_recover_killed_chat_is_exact_and_queues_terminal_failure():
+    uid = "u_js_exact_watchdog_chat"
+    seed_user(uid)
+    _reset(uid)
+    chat_id, _ = jobs_store.enqueue_job(uid, "chat")
+    other_id, _ = jobs_store.enqueue_job(uid, "profile")
+    claimed = jobs_store.claim_next_job("foreground-0:g7", lanes={"chat"})
+    assert claimed is not None and int(claimed["id"]) == chat_id
+    assert jobs_store.mark_running(chat_id, claimed_by="foreground-0:g7")
+
+    recovered = jobs_store.recover_killed_job(
+        job_id=chat_id, claimed_by="foreground-0:g7"
+    )
+
+    assert recovered == {
+        "job_id": chat_id,
+        "user_id": uid,
+        "lane": "chat",
+        "recovery": "terminal",
+    }
+    with db.get_pool().connection() as conn:
+        chat = conn.execute(
+            "SELECT status,last_error,claimed_by FROM agent_jobs WHERE id=%s",
+            (chat_id,),
+        ).fetchone()
+        other = conn.execute(
+            "SELECT status FROM agent_jobs WHERE id=%s", (other_id,)
+        ).fetchone()
+        outbox = conn.execute(
+            "SELECT error_code FROM v2_terminal_failure_outbox WHERE job_id=%s",
+            (chat_id,),
+        ).fetchone()
+    assert chat == ("expired", "slot_watchdog_timeout", None)
+    assert other == ("pending",)
+    assert outbox == ("slot_watchdog_timeout",)
+    assert jobs_store.recover_killed_job(
+        job_id=chat_id, claimed_by="foreground-0:g7"
+    ) is None
+
+
+@pytest.mark.parametrize("lane", ["profile", "scheduled", "capture"])
+def test_recover_killed_background_requeues_exact_claim(lane):
+    uid = f"u_js_exact_watchdog_{lane}"
+    seed_user(uid)
+    _reset(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, lane)
+    claimed = jobs_store.claim_next_job(f"{lane}-owner", lanes={lane})
+    assert claimed is not None and int(claimed["id"]) == job_id
+    assert jobs_store.mark_running(job_id, claimed_by=f"{lane}-owner")
+
+    assert jobs_store.recover_killed_job(
+        job_id=job_id, claimed_by="wrong-owner"
+    ) is None
+    recovered = jobs_store.recover_killed_job(
+        job_id=job_id, claimed_by=f"{lane}-owner"
+    )
+
+    assert recovered["recovery"] == "requeued"
+    with db.get_pool().connection() as conn:
+        row = conn.execute(
+            "SELECT status,last_error,claimed_by,lease_expires_at "
+            "FROM agent_jobs WHERE id=%s",
+            (job_id,),
+        ).fetchone()
+    assert row == ("pending", "slot_watchdog_timeout", None, None)
+
+
 def test_recent_mean_service_sec_none_without_history():
     # 全新 lane，无 completed job
     assert jobs_store.recent_mean_service_sec(lane="no-such-lane") is None

@@ -1551,6 +1551,77 @@ def mark_expired(job_id, error: str = "runtime_expired") -> None:
                 user_id, "v2_trajectory_reviews", source_job_id, "requeue")
 
 
+def recover_killed_job(
+    *,
+    job_id: int,
+    claimed_by: str,
+    reason: str = "slot_watchdog_timeout",
+) -> dict[str, object] | None:
+    """Recover exactly one claim still owned by a killed slot generation."""
+    recovered_reviews: list[tuple[str, str]] = []
+    result: dict[str, object] | None = None
+    with _pool().connection() as conn:
+        with conn.transaction():
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(
+                    "SELECT id,user_id,lane,status,claimed_by FROM agent_jobs "
+                    "WHERE id=%s AND claimed_by=%s "
+                    "AND status IN ('claimed','running') FOR UPDATE",
+                    (int(job_id), str(claimed_by)),
+                )
+                row = cur.fetchone()
+                if row is None:
+                    return None
+                lane = str(row["lane"])
+                if lane == "chat":
+                    recovery = "terminal"
+                    cur.execute(
+                        "UPDATE agent_jobs SET status='expired',finished_at=now(), "
+                        "last_error=%s,attempt_count=attempt_count+1,"
+                        "claimed_by=NULL,claimed_at=NULL,started_at=NULL,"
+                        "lease_expires_at=NULL,deadline_at=NULL "
+                        "WHERE id=%s AND claimed_by=%s "
+                        "AND status IN ('claimed','running')",
+                        (str(reason)[:500], int(job_id), str(claimed_by)),
+                    )
+                    if cur.rowcount != 1:
+                        return None
+                    _queue_terminal_failure_on_cursor(
+                        cur, int(job_id), str(row["user_id"]), str(reason)
+                    )
+                    recovered_reviews = _recover_review_runner_on_cursor(
+                        cur, int(job_id)
+                    )
+                    _queue_failure_review_on_cursor(cur, int(job_id))
+                else:
+                    recovery = "requeued"
+                    cur.execute(
+                        "UPDATE agent_jobs SET status='pending',created_at=now(), "
+                        "last_error=%s,attempt_count=attempt_count+1,"
+                        "claimed_by=NULL,claimed_at=NULL,started_at=NULL,"
+                        "finished_at=NULL,lease_expires_at=NULL,deadline_at=NULL "
+                        "WHERE id=%s AND claimed_by=%s "
+                        "AND status IN ('claimed','running')",
+                        (str(reason)[:500], int(job_id), str(claimed_by)),
+                    )
+                    if cur.rowcount != 1:
+                        return None
+                result = {
+                    "job_id": int(job_id),
+                    "user_id": str(row["user_id"]),
+                    "lane": lane,
+                    "recovery": recovery,
+                }
+    if recovered_reviews:
+        from tee_shadow import mirror
+
+        for user_id, source_job_id in recovered_reviews:
+            mirror.mark_pending(
+                user_id, "v2_trajectory_reviews", source_job_id, "requeue"
+            )
+    return result
+
+
 def reap_stuck_job_rows(now=None) -> list[dict]:
     """Expire overdue pending admissions and claimed/running execution leases.
 

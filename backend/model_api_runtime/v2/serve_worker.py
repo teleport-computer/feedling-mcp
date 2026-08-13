@@ -89,6 +89,7 @@ from model_api_runtime.v2 import context as v2_context
 from model_api_runtime.v2 import compaction as v2_compaction
 from model_api_runtime.v2 import cursor as v2_cursor
 from model_api_runtime.v2 import child_supervisor as v2_child_supervisor
+from model_api_runtime.v2 import claim_recovery as v2_claim_recovery
 from model_api_runtime.v2 import effect_id as v2_effect_id
 from model_api_runtime.v2 import effect_outbox as v2_effect_outbox
 from model_api_runtime.v2 import jobs_store
@@ -4890,7 +4891,11 @@ class _JobCancelRouter:
                     and snapshot.active_job.job_id == event.job_id
                     and snapshot.active_job.claimed_by == event.claimed_by
                 ):
-                    cancel = supervisor.kill_and_respawn
+                    def _restart(supervisor=supervisor) -> None:
+                        supervisor.kill()
+                        supervisor.start()
+
+                    cancel = _restart
                     break
         if cancel is None:
             return False
@@ -5200,6 +5205,8 @@ async def _watchdog_loop(
     stop_event: asyncio.Event,
     *,
     interval: float = _WATCHDOG_INTERVAL_SEC,
+    recovery_queue: v2_claim_recovery.ClaimRecoveryQueue | None = None,
+    pool: str = "foreground",
 ) -> None:
     """Thin wrapper around `watchdog._watchdog_loop` (mirrors `_reaper_loop`'s
     delegation to `v2_reaper.run_loop`) — supplies the production
@@ -5217,6 +5224,9 @@ async def _watchdog_loop(
         child_liveness_timeout_sec=_CHILD_LIVENESS_TIMEOUT_SEC,
         jobs_claimable_timeout_sec=_WATCHDOG_DB_TIMEOUT_SEC,
         capacity_write_timeout_sec=_WATCHDOG_DB_TIMEOUT_SEC,
+        recovery_timeout_sec=_WATCHDOG_DB_TIMEOUT_SEC,
+        recovery_queue=recovery_queue,
+        pool=pool,
     )
 
 
@@ -5662,6 +5672,7 @@ async def _serve(worker_id: str, *, poll_interval: float) -> None:
     # (Task 3) rather than joined.
     await asyncio.to_thread(supervisor.start)
     _JOB_CANCEL_ROUTER.watch(supervisor)
+    recovery_queue = v2_claim_recovery.ClaimRecoveryQueue()
 
     tasks = [
         asyncio.create_task(_reaper_loop(stop_event)),
@@ -5675,7 +5686,15 @@ async def _serve(worker_id: str, *, poll_interval: float) -> None:
             )
         ),
         asyncio.create_task(_scheduler_loop(stop_event)),
-        asyncio.create_task(_watchdog_loop(supervisor, worker_id, stop_event)),
+        asyncio.create_task(
+            _watchdog_loop(
+                supervisor,
+                worker_id,
+                stop_event,
+                recovery_queue=recovery_queue,
+            )
+        ),
+        asyncio.create_task(recovery_queue.run(stop_event)),
         asyncio.create_task(_reconcile_loop(stop_event)),
         asyncio.create_task(_backlog_scan_loop(stop_event)),
         asyncio.create_task(_usage_rollup_loop(stop_event)),

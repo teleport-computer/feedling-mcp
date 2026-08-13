@@ -219,10 +219,13 @@ class ChildSupervisor:
         with self._lock:
             return self._snapshot
 
-    def kill_and_respawn(self, *, join_timeout: float = 5.0) -> None:
-        """SIGKILL 当前子进程（不可catch，就是要硬杀掉卡死的那个），join，然后重新
-        `start()` 一个全新子进程。是否 SIGKILL 由调用方（D2 watchdog）的
-        `should_kill` 判定驱动——本方法本身不判断，只执行。"""
+    def kill(
+        self, *, join_timeout: float = 5.0
+    ) -> slot_protocol.ActiveJobIdentity | None:
+        """Snapshot the exact owner, kill this slot generation, and stop."""
+        with self._lock:
+            snapshot = self._snapshot
+            active_job = None if snapshot is None else snapshot.active_job
         self._stop_reader()
         proc = self._proc
         if proc is not None:
@@ -237,8 +240,18 @@ class ChildSupervisor:
                         "SIGKILL+join — orphaned; proceeding to respawn anyway",
                         proc.pid, join_timeout)
             except Exception as e:  # noqa: BLE001 — 杀不掉也不能拖垮父进程的 watchdog 循环
-                log.warning("[v2.child_supervisor] kill_and_respawn cleanup failed: %s", e)
+                log.warning("[v2.child_supervisor] kill cleanup failed: %s", e)
         self._close_read_conn()
+        with self._lock:
+            self._proc = None
+            self._slot_generation = uuid.uuid4().hex
+            self._snapshot = None
+            self._turn_progress_at = None
+        return active_job
+
+    def kill_and_respawn(self, *, join_timeout: float = 5.0) -> None:
+        """Compatibility wrapper; new recovery paths call kill/recover/start."""
+        self.kill(join_timeout=join_timeout)
         self.start()
 
     def stop(self, *, drain_timeout: float = 10.0, kill_timeout: float = 2.0) -> None:

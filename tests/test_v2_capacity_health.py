@@ -152,8 +152,11 @@ def test_job_cancel_router_matches_supervisor_snapshot_job_and_owner():
         def snapshot(self):
             return snapshot
 
-        def kill_and_respawn(self):
+        def kill(self):
             self.kills += 1
+
+        def start(self):
+            return None
 
     supervisor = _SnapshotSupervisor()
     router = serve_worker._JobCancelRouter()

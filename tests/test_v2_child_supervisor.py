@@ -344,7 +344,7 @@ def test_round_and_catchup_boundaries_refresh_stall_not_absolute_age(monkeypatch
     assert wedged["current_turn_stall_age_sec"] == pytest.approx(250.0)
 
 
-def test_kill_and_respawn_replaces_wedged_child_with_a_fresh_pid():
+def test_split_kill_then_start_replaces_wedged_child_with_a_fresh_pid():
     pid_holder = multiprocessing.Value("i", 0)
     sup = ChildSupervisor(
         _fake_target_pid_then_wedge, liveness_timeout_sec=0.3, spawn_args=(pid_holder,))
@@ -354,11 +354,12 @@ def test_kill_and_respawn_replaces_wedged_child_with_a_fresh_pid():
         old_pid = pid_holder.value
         pid_holder.value = 0  # so we can unambiguously detect the respawned child's PID below
 
-        sup.kill_and_respawn()
+        assert sup.kill() is None
 
         assert _wait_until(lambda: _pid_is_dead(old_pid), timeout=5.0), (
-            "old (wedged) child should be SIGKILLed and reaped by kill_and_respawn()"
+            "old (wedged) child should be SIGKILLed and reaped by kill()"
         )
+        sup.start()
         assert _wait_until(lambda: pid_holder.value != 0), "respawned child never published its PID"
         new_pid = pid_holder.value
         assert new_pid != old_pid

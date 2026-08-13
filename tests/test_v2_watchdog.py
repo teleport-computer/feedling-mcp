@@ -16,7 +16,7 @@ import asyncio
 import math
 import threading
 
-from model_api_runtime.v2 import watchdog
+from model_api_runtime.v2 import claim_recovery, slot_protocol, watchdog
 
 
 # ---------------------------------------------------------------------------
@@ -29,6 +29,17 @@ def _kw(**overrides):
           "jobs_claimable": True}
     kw.update(overrides)
     return kw
+
+
+def test_claim_recovery_queue_is_bounded_and_coalesces_exact_owner_key():
+    queue = claim_recovery.ClaimRecoveryQueue(limit=2, recover=lambda **kw: None)
+
+    assert queue.enqueue(job_id=1, claimed_by="w1") is True
+    assert queue.enqueue(job_id=1, claimed_by="w1") is True
+    assert queue.pending_count == 1
+    assert queue.enqueue(job_id=1, claimed_by="w2") is True
+    assert queue.pending_count == 2
+    assert queue.enqueue(job_id=2, claimed_by="w3") is False
 
 
 def test_should_kill_false_when_healthy_and_fresh():
@@ -151,7 +162,7 @@ class _FakeSupervisor:
         self.kill_calls += 1
 
 
-def test_watchdog_loop_kills_and_writes_capacity_zero_before_kill_and_respawn(monkeypatch):
+def test_watchdog_orders_capacity_snapshot_kill_recover_start(monkeypatch):
     """On a kill decision: capacity=0 must be recorded strictly before
     kill_and_respawn() runs (admission must see the drop before the SIGKILL races
     a fresh claim in) — assert via a shared ordering log both fakes append to."""
@@ -167,10 +178,34 @@ def test_watchdog_loop_kills_and_writes_capacity_zero_before_kill_and_respawn(mo
 
     monkeypatch.setattr(jobs_store, "record_worker_heartbeat", _fake_heartbeat)
 
+    active = slot_protocol.ActiveJobIdentity(3694, "profile", "heavy-0:g7")
+    snapshot = slot_protocol.SlotProgress(
+        "heavy-0", "g7", 123.4, 120.0, "profile.cards.batch", active
+    )
+
     class _KillOrderSupervisor(_FakeSupervisor):
-        def kill_and_respawn(self) -> None:
-            order.append("kill_and_respawn")
-            super().kill_and_respawn()
+        def snapshot(self):
+            order.append("snapshot")
+            return snapshot
+
+        def kill(self):
+            order.append("kill")
+            self.kill_calls += 1
+            return active
+
+        def start(self):
+            order.append("start")
+
+    def _recover(**kwargs):
+        assert kwargs == {
+            "job_id": 3694,
+            "claimed_by": "heavy-0:g7",
+            "reason": "slot_watchdog_timeout",
+        }
+        order.append("recover")
+        return {"recovery": "requeued"}
+
+    monkeypatch.setattr(watchdog.jobs_store, "recover_killed_job", _recover)
 
     supervisor = _KillOrderSupervisor({"alive": True, "last_progress_age_sec": 999.0})
     stop_event = asyncio.Event()
@@ -193,7 +228,7 @@ def test_watchdog_loop_kills_and_writes_capacity_zero_before_kill_and_respawn(mo
 
     asyncio.run(_driver())
     assert supervisor.kill_calls >= 1
-    assert order[:2] == ["capacity_zero", "kill_and_respawn"]
+    assert order[:5] == ["capacity_zero", "snapshot", "kill", "recover", "start"]
 
 
 def test_watchdog_loop_does_not_kill_when_healthy(monkeypatch):
@@ -229,6 +264,81 @@ def test_watchdog_loop_does_not_kill_when_healthy(monkeypatch):
     assert supervisor.kill_calls == 0
     assert heartbeat_calls == []
     assert claimable_calls["n"] == 0  # fresh liveness makes queue state irrelevant
+
+
+def test_watchdog_restarts_and_queues_exact_retry_when_recovery_raises(monkeypatch):
+    monkeypatch.setattr(
+        watchdog.jobs_store, "record_worker_heartbeat", lambda *a, **k: None
+    )
+    monkeypatch.setattr(
+        watchdog.jobs_store,
+        "recover_killed_job",
+        lambda **kwargs: (_ for _ in ()).throw(RuntimeError("db unavailable")),
+    )
+    active = slot_protocol.ActiveJobIdentity(77, "profile", "heavy-0:g9")
+    snapshot = slot_protocol.SlotProgress(
+        "heavy-0", "g9", 10.0, 9.0, "profile.provider", active
+    )
+
+    class _Supervisor:
+        def __init__(self):
+            self.kill_calls = 0
+            self.start_calls = 0
+
+        def poll_liveness(self):
+            return {"alive": False, "last_progress_age_sec": math.inf}
+
+        def snapshot(self):
+            return snapshot
+
+        def kill(self):
+            self.kill_calls += 1
+            return active
+
+        def start(self):
+            self.start_calls += 1
+
+    class _Queue:
+        def __init__(self):
+            self.requests = []
+
+        def enqueue(self, **kwargs):
+            self.requests.append(kwargs)
+            return True
+
+    supervisor = _Supervisor()
+    queue = _Queue()
+    stop_event = asyncio.Event()
+
+    async def _driver():
+        task = asyncio.create_task(
+            watchdog._watchdog_loop(
+                supervisor,
+                "worker-a",
+                stop_event,
+                jobs_claimable_fn=lambda: False,
+                interval=0.02,
+                turn_stall_timeout_sec=240.0,
+                turn_absolute_timeout_sec=1500.0,
+                child_liveness_timeout_sec=45.0,
+                recovery_queue=queue,
+            )
+        )
+        for _ in range(50):
+            if supervisor.start_calls:
+                break
+            await asyncio.sleep(0.01)
+        stop_event.set()
+        await asyncio.wait_for(task, timeout=1.0)
+
+    asyncio.run(_driver())
+    assert supervisor.kill_calls >= 1
+    assert supervisor.start_calls >= 1
+    assert queue.requests[0] == {
+        "job_id": 77,
+        "claimed_by": "heavy-0:g9",
+        "reason": "slot_watchdog_timeout",
+    }
 
 
 def test_watchdog_loop_swallows_per_iteration_errors(monkeypatch):
