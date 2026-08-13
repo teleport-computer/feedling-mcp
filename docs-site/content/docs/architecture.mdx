@@ -367,7 +367,7 @@ choice with two storage tiers:
 | Tier | Stored shape | Who can read the body |
 | --- | --- | --- |
 | Encrypted | Dual-recipient envelope (`body_ct`, `K_user`, `K_enclave`) | The user's device, and the measured decrypt service for `shared` records |
-| Plaintext | `body` alongside `id`, `owner_user_id`, and `visibility` | The service, within the same tenant-isolation boundary as every other row |
+| Plaintext | UTF-8 `body`, or strict-base64 `body_b64` for binary media, alongside `id`, `owner_user_id`, and `visibility` | The service, within the same tenant-isolation boundary as every other row |
 
 Two `whoami` fields describe this. `content_encryption` is the user's stated
 preference. `content_encryption_effective` is the shape a client must actually
@@ -390,6 +390,14 @@ Two boundaries hold in both tiers:
 - `local_only` requires encryption. That visibility means only the user's device
   holds a usable key, which a plaintext body cannot express, so the combination is
   rejected on both the upload and swap paths.
+
+Hosted Chat explicitly declares image and file bodies as binary when it builds a
+server-owned envelope. Effective-plaintext accounts therefore store those bytes
+as `body_b64`; the route never guesses from whether arbitrary bytes happen to be
+valid UTF-8. Screen frames and perception photos use the same binary shape. A
+plaintext perception photo does not promote the locally derived place label into
+a plaintext metadata envelope; that sensitive context is sent only with the
+encrypted photo shape.
 
 Reads route per record rather than per user: a row carrying `body_ct` is opened
 through the decrypt service, `body_b64` is strictly base64-decoded locally, and
