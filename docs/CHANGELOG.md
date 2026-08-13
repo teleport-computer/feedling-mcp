@@ -47,6 +47,18 @@
 
 ## 记录正文（最新的在上面）
 
+## 2026-08-14 — V2 wake 最终出口补齐工具标记清洗
+
+**[DONE] 四条 Runtime V2 wake lane 的模型正文在加密下发前统一剥离工具协议标记。**
+
+- T016 只接到了 chat 的 `_on_reply` 与结构化 proactive `send_message`，而
+  heartbeat / scheduled / manual-wake / screen-watch 共用的 wake `_on_reply`
+  没经过两者；现在它在封装前调用同一封闭词表清洗器。
+- 回归断言钉在用户私钥解密之后，并新增空历史本地全栈 manual-wake 探针，覆盖真实
+  HTTP、入队、worker、信封封装与用户解密；清洗事件只记录 lane/原因，不记录正文。
+- 同族扫描确认 torn-protocol、thinking surface 与 reasoning 清洗两侧都已有；
+  chat/wake 的空正文策略不同，暂不做会改变 lane 语义的共享出口重构。
+
 ## 2026-08-14 — memory_search 一次搜不到不再宣告「记忆不存在」
 
 **[DONE] 工具描述不再禁止换关键词重搜；并明说匹配是字面子串，空结果 ≠ 记忆不存在。**

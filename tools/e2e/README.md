@@ -49,6 +49,7 @@ E2E_KEY_DEEPSEEK=sk-…
 | `turn_failure_smoke.py` | 回合失败的字段/归责能下发到客户端 | 动错误分类或 consumer 兜底时 |
 | `resident_maintenance_smoke.py` | resident 识别/poll/notice/genesis claim | 动 consumer 这几条时 |
 | `provider_response_envelope_probe.py` | 上游完整响应包装器不会进入 V2 气泡，且只触发一次有界纠正 | 动 provider 回复解析、V2 tool loop 或最终回复闸时 |
+| `wake_tool_markup_probe.py` | V2 manual wake 的工具标记在封装前剥离，用户私钥解密后只见正文 | 动 V2 wake 最终回复闸时 |
 
 `repeat_wake_probe` 的两个坑（写新探针时同样适用）：
 - `/v1/proactive/scheduled/fire` **只触发已到期的**（`due_at <= now`），
@@ -99,6 +100,17 @@ python3 tools/e2e/provider_response_envelope_probe.py
 它在本机临时启动 OpenAI-compatible provider stub：setup 测活返回正常文本，
 首个真实聊天回合返回现场截图的 Gemini relay 包，第二回合只返回恢复标记。真实
 HTTP、队列、worker、信封加解密与账号清理均不替换。
+
+V2 wake 工具标记专项探针使用同一套本地服务：
+
+```bash
+python3 tools/e2e/wake_tool_markup_probe.py
+```
+
+它用空历史强制触发 `manual_wake`（避免撞 active-conversation 延迟）；本地
+provider stub 只在 wake 回复里混入现场同形的 `<parameter>` 标记，最终断言
+钉在用户私钥解密后的正文。真实 HTTP、调度入队、worker、信封加解密与账号
+清理均不替换。
 
 **中转站要测两家**:不同中转站 `/models` 的目录格式差异很大(带日期后缀 /
 带方括号标签 / 裸名),推荐链路只测一家不够 —— `relay-openai-compatible`

@@ -8731,6 +8731,54 @@ async def _run_wake(
                 if final:
                     raise TurnError(_PROTOCOL_FRAGMENT_REASON)
                 return
+            # Keep this paired with the foreground guard in process_job._on_reply.
+            # The two lanes deliberately differ after sanitization (chat falls back;
+            # wake fails silently), but every user-visible text outlet must call the
+            # same closed-set parser before sealing an envelope.
+            if text:
+                text, removed_tool_markup = tool_markup_leak.strip_tool_markup(text)
+                if removed_tool_markup:
+                    log.warning(
+                        "[v2.worker] wake tool markup stripped user=%s job=%s "
+                        "lane=%s final=%s error_class=%s",
+                        user_id,
+                        job_id,
+                        lane,
+                        final,
+                        tool_markup_leak.ERROR_CLASS,
+                    )
+                    if deps.emit_debug_trace is not None:
+                        try:
+                            await asyncio.to_thread(
+                                deps.emit_debug_trace,
+                                user_id,
+                                "agent.reply.sanitized",
+                                status="error",
+                                summary="V2 主动回复已剥离工具调用标记",
+                                explain=(
+                                    "中转返回的可见文本混入工具协议标记；正文已保留，"
+                                    "标记已在下发前移除。"
+                                ),
+                                detail={
+                                    "lane": lane,
+                                    "final": bool(final),
+                                    "error_class": tool_markup_leak.ERROR_CLASS,
+                                    "reason": tool_markup_leak.REASON,
+                                },
+                            )
+                        except Exception as exc:  # noqa: BLE001 — best-effort trace
+                            log.warning(
+                                "[v2.worker] wake tool markup trace failed user=%s "
+                                "job=%s lane=%s code=%s",
+                                user_id,
+                                job_id,
+                                lane,
+                                type(exc).__name__.lower(),
+                            )
+                    if _is_degenerate_reply(text):
+                        if final:
+                            raise TurnError("degenerate_reply_suppressed")
+                        return
             if not text:
                 # Silence is a legitimate wake outcome — both mid-loop (an empty
                 # `reply{}` call) and terminal ("weak wake sleeps"): unlike the chat
@@ -12457,7 +12505,8 @@ async def process_job(
                 text = _DEGENERATE_REPLY_FALLBACK
                 turn_failure_error_class = _PROTOCOL_FRAGMENT_ERROR_CLASS
                 reasoning = ""
-            # Some OpenAI-compatible relays turn native tool calls into XML-like
+            # Keep this paired with the wake guard in _run_wake._on_reply. Some
+            # OpenAI-compatible relays turn native tool calls into XML-like
             # text and then incompletely parse that text back into structured
             # calls.  Keep any useful reply body, but never render the closed set
             # of known tool markers.  This intentionally runs after the JSON
