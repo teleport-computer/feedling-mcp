@@ -28,7 +28,8 @@ change must not be interpreted as an API guarantee.
 - **Hosted Runtime V2 removes leaked tool-call markup from visible replies.**
   A closed set of XML-like function-call markers, including singular/plural
   forms and optional namespace prefixes, is stripped before foreground or
-  proactive text is delivered. Normal angle-bracket text, HTML examples, and
+  proactive text is delivered, including heartbeat, scheduled, manual-wake,
+  and screen-watch replies. Normal angle-bracket text, HTML examples, and
   fenced code remain unchanged. Useful text beside a leaked block is preserved,
   and a reply wrapped entirely inside tool markup keeps its payload.
 

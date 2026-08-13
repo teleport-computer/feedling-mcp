@@ -35,10 +35,12 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
 import pytest
+from nacl.public import PrivateKey
 
 import conftest
 import db
 import provider_client
+from content_encryption import build_envelope
 from capabilities import registry as cap_registry
 from core import store as core_store
 from model_api_runtime.v2 import context as v2_context
@@ -47,6 +49,7 @@ from model_api_runtime.v2 import jobs_store
 from model_api_runtime.v2 import coalesce as v2_coalesce
 from model_api_runtime.v2 import serve_worker
 from model_api_runtime.v2 import worker
+from tools.e2e.client import E2EClient, TEST_API
 
 
 @pytest.fixture(autouse=True)
@@ -65,6 +68,7 @@ def _reset(uid):
         conn.execute("DELETE FROM agent_jobs WHERE user_id=%s", (uid,))
         conn.execute("DELETE FROM runtime_state WHERE user_id=%s", (uid,))
         conn.execute("DELETE FROM v2_effect_outbox WHERE user_id=%s", (uid,))
+        conn.execute("DELETE FROM chat_messages WHERE user_id=%s", (uid,))
     conftest.set_v2_runtime_owner(uid)
 
 
@@ -134,6 +138,40 @@ def _script_provider(monkeypatch, responses):
 def _text_round(text, *, prompt_tokens=1, completion_tokens=1):
     return {"reply": text, "tool_calls": [],
             "usage": {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens}}
+
+
+def _patch_user_decryptable_envelopes(monkeypatch, user_id: str) -> E2EClient:
+    """Use real reply-envelope crypto and return the user-side decryptor."""
+    user_sk = PrivateKey.generate()
+    enclave_pk = bytes(PrivateKey.generate().public_key)
+    client = E2EClient(
+        TEST_API,
+        user_id,
+        "test-api-key",
+        user_sk,
+        enclave_pk,
+    )
+
+    def _build(store, plaintext, *, item_id=None):
+        assert store.user_id == user_id
+        return (
+            build_envelope(
+                plaintext=bytes(plaintext),
+                owner_user_id=user_id,
+                user_pk_bytes=bytes(user_sk.public_key),
+                enclave_pk_bytes=enclave_pk,
+                visibility="shared",
+                item_id=item_id,
+            ),
+            "",
+        )
+
+    monkeypatch.setattr(
+        worker.core_envelope,
+        "_build_shared_envelope_for_store",
+        _build,
+    )
+    return client
 
 
 # ------------------------------------------------------------------
@@ -237,6 +275,107 @@ def test_wake_self_thinking_on_drops_native_reasoning_fallback(monkeypatch):
         "model": _BYOK.model,
         "lane": "wake",
     }]
+
+
+@pytest.mark.parametrize(
+    "lane", ["heartbeat", "scheduled", "manual_wake", "screen_watch"]
+)
+def test_wake_full_chain_strips_tool_markup_after_user_decrypt(monkeypatch, lane):
+    """The wake outlet must apply the same visible-text guard as chat before
+    sealing; the assertion is intentionally after strict user-key decrypt."""
+    uid = f"u_wake_tool_markup_user_view_{lane}"
+    conftest.seed_user(uid)
+    _reset(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, lane)
+    claimed_by = _claim(job_id)
+    leaked = (
+        '<parameter name="tool_name">reply</parameter>\n'
+        "好，棋先停着\n你要干嘛去了"
+    )
+    _script_provider(monkeypatch, [_text_round(leaked)])
+    decryptor = _patch_user_decryptable_envelopes(monkeypatch, uid)
+    deps = _wake_deps(
+        tail=[{"id": "m1", "ts": 1.0, "role": "user", "content": "先停一下"}]
+    )
+    deps.apply_pending_effects = serve_worker._apply_pending_effects_for_user
+    traces = []
+    deps.emit_debug_trace = lambda user_id, event_type, **fields: traces.append(
+        {"user_id": user_id, "event_type": event_type, **fields}
+    )
+
+    try:
+        status = asyncio.run(
+            worker._run_wake(
+                job_id,
+                uid,
+                lane,
+                deps,
+                _BYOK,
+                worker.ENCLAVE_SEMAPHORE,
+                claimed_by,
+            )
+        )
+        store = core_store.get_store(uid)
+        store.reload()
+        bubble = next(
+            row for row in store.chat_messages
+            if row.get("role") == "openclaw" and row.get("source") == "model_api"
+        )
+        plaintext = decryptor.decrypt_reply(bubble)
+    finally:
+        decryptor._http.close()
+
+    assert status == "completed"
+    assert plaintext == "好，棋先停着\n你要干嘛去了"
+    sanitized = [
+        trace for trace in traces if trace["event_type"] == "agent.reply.sanitized"
+    ]
+    assert [trace["detail"] for trace in sanitized] == [
+        {
+            "lane": lane,
+            "final": True,
+            "error_class": "upstream_unavailable",
+            "reason": "tool_markup_leak_sanitized",
+        }
+    ]
+
+
+def test_wake_markup_only_reply_fails_silently_without_bubble(monkeypatch):
+    """Wake keeps its existing degenerate lifecycle after sanitization."""
+    uid = "u_wake_tool_markup_only"
+    conftest.seed_user(uid)
+    _reset(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, "heartbeat")
+    claimed_by = _claim(job_id)
+    _script_provider(monkeypatch, [_text_round("<tool_call></tool_call>")])
+    writes = []
+    monkeypatch.setattr(
+        worker,
+        "_write_encrypted_reply",
+        lambda *_args, **_kwargs: writes.append(True),
+    )
+    deps = _wake_deps(
+        tail=[{"id": "m1", "ts": 1.0, "role": "user", "content": "在吗"}]
+    )
+
+    status = asyncio.run(
+        worker._run_wake(
+            job_id,
+            uid,
+            "heartbeat",
+            deps,
+            _BYOK,
+            worker.ENCLAVE_SEMAPHORE,
+            claimed_by,
+        )
+    )
+
+    assert status == "failed"
+    assert writes == []
+    assert _job_status(job_id) == (
+        "failed",
+        "wake_failed:degenerate_reply_suppressed",
+    )
 
 
 def test_run_wake_reply_push_carries_is_wake_true_and_manual_wake_lane(monkeypatch):
