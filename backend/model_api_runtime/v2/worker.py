@@ -4927,7 +4927,7 @@ class WorkspaceFileReply:
 
 @dataclass(frozen=True)
 class GeneratedImageReply:
-    """One validated provider image ready for encrypted chat publication."""
+    """One validated provider image ready for native Chat publication."""
 
     name: str
     mime_type: str
@@ -5259,12 +5259,13 @@ def _build_encrypted_image_reply_effect_payload(
     *,
     effect_id: str,
 ) -> dict:
-    """Seal one normalized image into a deterministic Chat image message."""
+    """Wrap one normalized image into a deterministic Chat image message."""
     item_id = hashlib.sha256(effect_id.encode("utf-8")).hexdigest()[:32]
     envelope, error = core_envelope._build_shared_envelope_for_store(
         store,
         bytes(image_reply.data),
         item_id=item_id,
+        content_kind="binary",
     )
     if envelope is None:
         raise RuntimeError(error or "image reply envelope build failed")

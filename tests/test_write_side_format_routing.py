@@ -20,6 +20,7 @@ B 类（凭证）的特殊处理经用户 2026-07-29 拍板取消，40 处统一
 """
 from __future__ import annotations
 
+import base64
 import os
 import sys
 import uuid
@@ -105,6 +106,46 @@ def test_plaintext_tier_rejects_non_utf8_body(store, monkeypatch):
     assert out is None and err == "plaintext_body_not_utf8"
 
 
+def test_plaintext_tier_binary_body_uses_body_b64(store, monkeypatch):
+    """显式二进制意图必须走既有 body_b64 形状，不能尝试 UTF-8 解码。"""
+    _prefer(monkeypatch, "off")
+    raw = b"\xff\x00generated-image"
+
+    out, err = core_envelope._build_shared_envelope_for_store(
+        store,
+        raw,
+        item_id="generated-image-id",
+        content_kind="binary",
+    )
+
+    assert err == "", err
+    assert out is not None
+    assert set(out) == {
+        "body_b64",
+        "body_size_bytes",
+        "id",
+        "owner_user_id",
+        "visibility",
+    }
+    assert base64.b64decode(out["body_b64"], validate=True) == raw
+    assert out["body_size_bytes"] == len(raw)
+    assert out["id"] == "generated-image-id"
+    assert out["owner_user_id"] == store.user_id
+    assert out["visibility"] == "shared"
+
+
+def test_shared_envelope_rejects_unknown_content_kind(store, monkeypatch):
+    """内容类型必须由调用方明确声明，不能按字节是否可解码来猜。"""
+    _prefer(monkeypatch, "off")
+
+    with pytest.raises(ValueError, match="invalid content_kind"):
+        core_envelope._build_shared_envelope_for_store(
+            store,
+            b"payload",
+            content_kind="guess",
+        )
+
+
 def _wire_assembly(monkeypatch):
     """补上 assembly 层（asgi/lifespan.py）在生产里注入的两样东西。
 
@@ -134,6 +175,23 @@ def test_encrypted_tier_still_gets_dual_recipient_envelope(store, monkeypatch):
     assert out is not None
     assert "body_ct" in out and "K_enclave" in out and "K_user" in out
     assert "body" not in out, "加密档不得同时留明文 body"
+
+
+def test_encrypted_tier_binary_intent_keeps_ciphertext_shape(store, monkeypatch):
+    """binary 只影响明文形状；加密档必须继续产生原有双收件人信封。"""
+    _prefer(monkeypatch, "on")
+    _wire_assembly(monkeypatch)
+
+    out, err = core_envelope._build_shared_envelope_for_store(
+        store,
+        b"\xff\x00generated-image",
+        content_kind="binary",
+    )
+
+    assert err == "", err
+    assert out is not None
+    assert "body_ct" in out and "K_user" in out and "K_enclave" in out
+    assert "body" not in out and "body_b64" not in out
 
 
 def test_encrypted_tier_never_silently_falls_back_to_plaintext(store, monkeypatch):
