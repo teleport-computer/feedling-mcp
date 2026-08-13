@@ -75,6 +75,7 @@ from core import envelope as core_envelope
 from core import protocol_leak
 from core import util as core_util
 from core import provider_usage
+from core import self_thinking
 from core import store as core_store
 from core import wake_bus as core_wake_bus
 from core.downloadable_reply import sanitize_downloadable_reply
@@ -5043,6 +5044,99 @@ def _sanitize_reasoning(text: str) -> str:
     return cleaned
 
 
+def _select_thinking_surface(
+    provider_reasoning: str,
+    *,
+    self_thinking_on: bool,
+    self_thinking_text: str = "",
+    self_thinking_failed: bool = False,
+) -> tuple[str, str, str | None, bool, str]:
+    """Choose the only thinking text a final V2 reply may surface.
+
+    While self-thinking is enabled, provider-native chain-of-thought is never a
+    fallback: the model-authored ``<think>`` summary (or the existing failure
+    marker) is the complete display contract.  Disabling the feature preserves
+    the legacy native-reasoning behavior byte-for-byte.
+
+    The final item is a content-free observability branch name.  Keep this
+    decision shared by chat and wake so the two duplicated reply sinks cannot
+    drift again. Wake does not pass ``self_thinking_failed`` because malformed
+    wake output fails before sealing; the marker branch is reachable only from
+    foreground Chat.
+    """
+    if self_thinking_on:
+        if self_thinking_failed:
+            return (
+                self_thinking.THINKING_FAILED_MARKER,
+                "agent_summary",
+                "self_thinking",
+                False,
+                "marker",
+            )
+        if self_thinking_text:
+            return (
+                self_thinking_text,
+                "agent_summary",
+                "self_thinking",
+                False,
+                "self",
+            )
+        return "", "agent_summary", "self_thinking", False, "none"
+    if provider_reasoning:
+        return provider_reasoning, "provider_reasoning", None, True, "native_legacy"
+    return "", "provider_reasoning", None, True, "none"
+
+
+async def _emit_thinking_surfaced_trace(
+    emit_debug_trace: Callable[..., None] | None,
+    user_id: str,
+    provider_config,
+    *,
+    lane: str,
+    branch: str,
+    chars: int,
+) -> None:
+    """Emit one content-free terminal thinking decision, best-effort."""
+    if emit_debug_trace is None:
+        return
+    safe_branch = (
+        branch
+        if branch in {"self", "marker", "none", "native_legacy"}
+        else "none"
+    )
+    safe_lane = "wake" if lane == "wake" else "chat"
+    safe_chars = max(0, int(chars))
+    # ``model`` is user-configurable for compatible relays.  Match the existing
+    # plaintext thinking metadata bound instead of letting an arbitrary string
+    # expand the server-visible trace ring.
+    model = str(getattr(provider_config, "model", "") or "").strip()[:96]
+    try:
+        await asyncio.to_thread(
+            emit_debug_trace,
+            user_id,
+            "thinking.surfaced",
+            status="ok",
+            summary=f"V2 thinking {safe_branch} ({safe_chars} chars)",
+            explain=(
+                "Records only the selected branch, character count, model, and "
+                "lane; no thinking text or fragment is included."
+            ),
+            detail={
+                "branch": safe_branch,
+                "chars": safe_chars,
+                "model": model,
+                "lane": safe_lane,
+            },
+        )
+    except Exception as exc:  # noqa: BLE001 — diagnostics cannot fail a reply
+        log.warning(
+            "[v2.thinking] surface trace failed user=%s lane=%s code=%s",
+            user_id,
+            safe_lane,
+            type(exc).__name__.lower(),
+        )
+
+
 def _build_thinking_payload(
     store,
     reasoning: str,
@@ -8515,7 +8609,10 @@ async def _run_wake(
                 ),
             )
 
+        thinking_trace_emitted = False
+
         async def _on_reply(text: str, *, final: bool, reasoning: str = "") -> None:
+            nonlocal thinking_trace_emitted
             text = str(text or "").strip()
             # Self-authored thinking (same mechanism as the chat lane): peel a leading
             # <think> off the wake reply BEFORE the degenerate/torn checks so they see
@@ -8662,15 +8759,21 @@ async def _run_wake(
                         job_id=int(job_id),
                     )
                 )
-            # Surface thinking on the same effect (sealed into a separate envelope),
-            # matching the chat lane: PREFER the self-authored <think> when present,
-            # else the provider's native reasoning. Never mislabel one as the other.
-            # Only a final reply carries it; intermediate reply{} bubbles are agent-authored.
-            _wake_display_reasoning = reasoning
-            _wk_kind, _wk_source, _wk_native = "provider_reasoning", None, True
-            if _wake_self_thinking_on and _wake_self_thinking_text:
-                _wake_display_reasoning = _wake_self_thinking_text
-                _wk_kind, _wk_source, _wk_native = "agent_summary", "self_thinking", False
+            # Surface only the agent-authored summary while self-thinking is on.
+            # Native provider reasoning remains available solely behind the
+            # feature-off compatibility contract.
+            (
+                _wake_display_reasoning,
+                _wk_kind,
+                _wk_source,
+                _wk_native,
+                _wake_thinking_branch,
+            ) = _select_thinking_surface(
+                reasoning,
+                self_thinking_on=_wake_self_thinking_on,
+                self_thinking_text=_wake_self_thinking_text,
+            )
+            _wake_thinking_chars = 0
             if final and _wake_display_reasoning:
                 thinking_effect_id = v2_effect_id.derive(
                     job_id=job_id,
@@ -8689,6 +8792,11 @@ async def _run_wake(
                 )
                 if thinking_payload:
                     payload["thinking"] = thinking_payload
+                    _wake_thinking_chars = len(
+                        _sanitize_reasoning(_wake_display_reasoning)
+                    )
+                else:
+                    _wake_thinking_branch = "none"
             enqueued_id = await asyncio.to_thread(
                 v2_effect_outbox.enqueue_effect,
                 job_id=job_id,
@@ -8827,6 +8935,16 @@ async def _run_wake(
                             raise RuntimeError(
                                 "wake final applied without completing source job"
                             )
+                        if not thinking_trace_emitted:
+                            thinking_trace_emitted = True
+                            await _emit_thinking_surfaced_trace(
+                                deps.emit_debug_trace,
+                                user_id,
+                                provider_config,
+                                lane="wake",
+                                branch=_wake_thinking_branch,
+                                chars=_wake_thinking_chars,
+                            )
                     return
                 if (
                     status == "discarded"
@@ -8879,6 +8997,16 @@ async def _run_wake(
                 },
                 best_effort=True,
             )
+            if final and not thinking_trace_emitted:
+                thinking_trace_emitted = True
+                await _emit_thinking_surfaced_trace(
+                    deps.emit_debug_trace,
+                    user_id,
+                    provider_config,
+                    lane="wake",
+                    branch=_wake_thinking_branch,
+                    chars=_wake_thinking_chars,
+                )
             # Legacy/non-seq assembly can enqueue without a sink. That proves
             # the model produced text, not that a user-visible bubble was
             # applied. Count only the applied-but-unverified path here; the
@@ -12165,6 +12293,8 @@ async def process_job(
             pending_file_replies.clear()
             pending_file_keys.clear()
 
+        thinking_trace_emitted = False
+
         async def _on_reply(
             text: str | WorkspaceFileReply,
             *,
@@ -12174,6 +12304,7 @@ async def process_job(
         ) -> None:
             nonlocal final_job_completed_atomically, voice_reply_slot
             nonlocal voice_call_ended_atomically
+            nonlocal thinking_trace_emitted
             file_reply = text if isinstance(text, WorkspaceFileReply) else None
             text = "" if file_reply is not None else str(text or "").strip()
             image_replies: list[GeneratedImageReply] = []
@@ -12410,28 +12541,21 @@ async def process_job(
                         job_id,
                         type(exc).__name__.lower(),
                     )
-            # Provider chain-of-thought rides the same effect as its final reply,
-            # sealed into a separate thinking envelope so the durable outbox holds
-            # only ciphertext and a retry re-addresses the same thinking row. Only
-            # final replies carry it — intermediate reply{} bubbles are
-            # agent-authored text, not provider reasoning.
-            # Decide which thinking to seal and its provenance. Self-authored
-            # <think> (or a "thinking failed" marker) is an agent summary, NOT
-            # provider-native chain-of-thought; the provider's native reasoning
-            # keeps its native metadata. Never mislabel one as the other.
-            _display_reasoning = reasoning
-            _thinking_kind, _thinking_source, _thinking_native = (
-                "provider_reasoning", None, True,
+            # Self-thinking ON has no native CoT fallback.  The feature-off path
+            # intentionally keeps the pre-existing native display behavior.
+            (
+                _display_reasoning,
+                _thinking_kind,
+                _thinking_source,
+                _thinking_native,
+                _thinking_branch,
+            ) = _select_thinking_surface(
+                reasoning,
+                self_thinking_on=self_thinking_on,
+                self_thinking_text=self_thinking_text,
+                self_thinking_failed=self_thinking_failed,
             )
-            if self_thinking_on and (self_thinking_text or self_thinking_failed):
-                _display_reasoning = (
-                    self_thinking.THINKING_FAILED_MARKER
-                    if self_thinking_failed
-                    else self_thinking_text
-                )
-                _thinking_kind, _thinking_source, _thinking_native = (
-                    "agent_summary", "self_thinking", False,
-                )
+            _thinking_chars = 0
             if final and _display_reasoning and file_reply is None:
                 thinking_payload = await asyncio.to_thread(
                     _build_thinking_payload,
@@ -12445,6 +12569,9 @@ async def process_job(
                 )
                 if thinking_payload:
                     payload["thinking"] = thinking_payload
+                    _thinking_chars = len(_sanitize_reasoning(_display_reasoning))
+                else:
+                    _thinking_branch = "none"
             enqueued_id = await asyncio.to_thread(
                 v2_effect_outbox.enqueue_effect,
                 job_id=job_id,
@@ -12622,6 +12749,16 @@ async def process_job(
                         raise RuntimeError(
                             "final reply applied without completing source job"
                         )
+                    if final and not thinking_trace_emitted:
+                        thinking_trace_emitted = True
+                        await _emit_thinking_surfaced_trace(
+                            deps.emit_debug_trace,
+                            user_id,
+                            provider_config,
+                            lane="chat",
+                            branch=_thinking_branch,
+                            chars=_thinking_chars,
+                        )
                     final_job_completed_atomically = True
                     return
                 if (
@@ -12688,6 +12825,16 @@ async def process_job(
                 },
                 best_effort=True,
             )
+            if final and not thinking_trace_emitted:
+                thinking_trace_emitted = True
+                await _emit_thinking_surfaced_trace(
+                    deps.emit_debug_trace,
+                    user_id,
+                    provider_config,
+                    lane="chat",
+                    branch=_thinking_branch,
+                    chars=_thinking_chars,
+                )
 
         # `seq` is exclusively the consumed user|human frontier. The base prompt's
         # all-role snapshot bound is passed separately to the fold closure so an

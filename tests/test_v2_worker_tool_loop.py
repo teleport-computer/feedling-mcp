@@ -760,11 +760,14 @@ def _stub_envelope_build(monkeypatch):
     monkeypatch.setattr(core_envelope, "_build_shared_envelope_for_store", _fake)
 
 
-def test_provider_reasoning_surfaces_as_thinking_bubble(monkeypatch):
-    """A final reply whose provider result carried chain-of-thought
+def test_self_thinking_off_preserves_native_reasoning_bubble(monkeypatch):
+    """Feature OFF preserves the legacy provider chain-of-thought contract.
+
+    A final reply whose provider result carried chain-of-thought
     (``result["reasoning"]``) must publish it as the row's separately-sealed
-    thinking envelope (``thinking_body_ct`` + ``thinking_kind``), not silently
-    drop it. Regression guard for the V2 reasoning-surfacing gap."""
+    thinking envelope (``thinking_body_ct`` + ``thinking_kind``).
+    """
+    monkeypatch.setenv("FEEDLING_V2_SELF_THINKING", "off")
     uid = "u_toolloop_reasoning"
     conftest.seed_user(uid)
     _reset(uid)
@@ -783,7 +786,11 @@ def test_provider_reasoning_surfaces_as_thinking_bubble(monkeypatch):
             }
         ],
     )
+    traces = []
     deps = _deps(messages=[{"id": "m1", "ts": 10.0, "role": "user", "content": "hi"}])
+    deps.emit_debug_trace = lambda user_id, event_type, **fields: traces.append(
+        {"user_id": user_id, "event_type": event_type, **fields}
+    )
 
     status = asyncio.run(
         worker.process_job(
@@ -799,6 +806,110 @@ def test_provider_reasoning_surfaces_as_thinking_bubble(monkeypatch):
     assert bubble["body_ct"] == "the answer"
     assert bubble.get("thinking_kind") == "provider_reasoning"
     assert bubble.get("thinking_body_ct") == "step one\nstep two"
+    thinking_traces = [
+        trace for trace in traces if trace["event_type"] == "thinking.surfaced"
+    ]
+    assert [trace["detail"] for trace in thinking_traces] == [{
+        "branch": "native_legacy",
+        "chars": len("step one\nstep two"),
+        "model": _BYOK.model,
+        "lane": "chat",
+    }]
+
+
+def test_self_thinking_on_drops_native_reasoning_without_authored_block(
+    monkeypatch,
+):
+    """Provider-native CoT is never a fallback while self-thinking is ON."""
+    monkeypatch.delenv("FEEDLING_V2_SELF_THINKING", raising=False)
+    uid = "u_toolloop_selfthink_no_fallback"
+    conftest.seed_user(uid)
+    _reset(uid)
+    jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("w-selfthink-no-fallback")
+
+    _stub_envelope_build(monkeypatch)
+    _script_provider(
+        monkeypatch,
+        [{
+            "reply": "the answer",
+            "reasoning": "private native cot",
+            "tool_calls": [],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+        }],
+    )
+    traces = []
+    deps = _deps(messages=[{"id": "m1", "ts": 10.0, "role": "user", "content": "hi"}])
+    deps.emit_debug_trace = lambda user_id, event_type, **fields: traces.append(
+        {"user_id": user_id, "event_type": event_type, **fields}
+    )
+
+    status = asyncio.run(
+        worker.process_job(
+            job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"
+        )
+    )
+
+    assert status == "completed"
+    bubble = _bubbles(uid)[0]
+    assert bubble["body_ct"] == "the answer"
+    assert "thinking_kind" not in bubble
+    assert "thinking_body_ct" not in bubble
+    thinking_traces = [
+        trace for trace in traces if trace["event_type"] == "thinking.surfaced"
+    ]
+    assert [trace["detail"] for trace in thinking_traces] == [{
+        "branch": "none",
+        "chars": 0,
+        "model": _BYOK.model,
+        "lane": "chat",
+    }]
+
+
+def test_self_thinking_on_prefers_authored_block_over_native_reasoning(monkeypatch):
+    monkeypatch.delenv("FEEDLING_V2_SELF_THINKING", raising=False)
+    uid = "u_toolloop_selfthink_authored"
+    conftest.seed_user(uid)
+    _reset(uid)
+    jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("w-selfthink-authored")
+
+    _stub_envelope_build(monkeypatch)
+    _script_provider(
+        monkeypatch,
+        [{
+            "reply": "<think>我先自己归纳</think>the answer",
+            "reasoning": "private native cot",
+            "tool_calls": [],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+        }],
+    )
+    traces = []
+    deps = _deps(messages=[{"id": "m1", "ts": 10.0, "role": "user", "content": "hi"}])
+    deps.emit_debug_trace = lambda user_id, event_type, **fields: traces.append(
+        {"user_id": user_id, "event_type": event_type, **fields}
+    )
+
+    status = asyncio.run(
+        worker.process_job(
+            job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"
+        )
+    )
+
+    assert status == "completed"
+    bubble = _bubbles(uid)[0]
+    assert bubble["body_ct"] == "the answer"
+    assert bubble["thinking_kind"] == "agent_summary"
+    assert bubble["thinking_body_ct"] == "我先自己归纳"
+    thinking_traces = [
+        trace for trace in traces if trace["event_type"] == "thinking.surfaced"
+    ]
+    assert [trace["detail"] for trace in thinking_traces] == [{
+        "branch": "self",
+        "chars": len("我先自己归纳"),
+        "model": _BYOK.model,
+        "lane": "chat",
+    }]
 
 
 def test_reasoning_absent_leaves_no_thinking_fields(monkeypatch):

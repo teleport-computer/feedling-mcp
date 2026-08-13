@@ -175,6 +175,70 @@ def test_run_wake_reply_written_and_job_completed(monkeypatch):
     ] == ["hi"]
 
 
+def test_wake_self_thinking_on_drops_native_reasoning_fallback(monkeypatch):
+    """Wake follows Chat: native CoT is not displayed while self-thinking is ON."""
+    monkeypatch.delenv("FEEDLING_V2_SELF_THINKING", raising=False)
+    uid = "u_wake_selfthink_no_fallback"
+    conftest.seed_user(uid)
+    _reset(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, "heartbeat")
+    claimed_by = _claim(job_id)
+    _script_provider(
+        monkeypatch,
+        [{
+            "reply": "hey, how did that go?",
+            "reasoning": "private native cot",
+            "tool_calls": [],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+        }],
+    )
+    monkeypatch.setattr(
+        worker,
+        "_build_thinking_payload",
+        lambda *_args, **_kwargs: pytest.fail(
+            "native reasoning must not be sealed while self-thinking is on"
+        ),
+    )
+    written = {}
+    monkeypatch.setattr(
+        worker,
+        "_write_encrypted_reply",
+        lambda store, text: written.update(text=text, user_id=store.user_id)
+        or {"id": "wake-no-fallback"},
+    )
+    traces = []
+    deps = _wake_deps(
+        tail=[{"id": "m1", "ts": 1.0, "role": "user", "content": "hi"}]
+    )
+    deps.emit_debug_trace = lambda user_id, event_type, **fields: traces.append(
+        {"user_id": user_id, "event_type": event_type, **fields}
+    )
+
+    status = asyncio.run(
+        worker._run_wake(
+            job_id,
+            uid,
+            "heartbeat",
+            deps,
+            _BYOK,
+            worker.ENCLAVE_SEMAPHORE,
+            claimed_by,
+        )
+    )
+
+    assert status == "completed"
+    assert written == {"text": "hey, how did that go?", "user_id": uid}
+    thinking_traces = [
+        trace for trace in traces if trace["event_type"] == "thinking.surfaced"
+    ]
+    assert [trace["detail"] for trace in thinking_traces] == [{
+        "branch": "none",
+        "chars": 0,
+        "model": _BYOK.model,
+        "lane": "wake",
+    }]
+
+
 def test_run_wake_reply_push_carries_is_wake_true_and_manual_wake_lane(monkeypatch):
     """Review Minor #2: before this test, the wake lane's entire push wiring
     (push_slot build + the `finally` `deps.send_reply_push` call in `_run_wake`)

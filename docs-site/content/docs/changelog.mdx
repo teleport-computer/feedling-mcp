@@ -10,6 +10,15 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **Runtime V2 no longer falls back to raw provider chain-of-thought while
+  self-authored thinking is enabled.** Chat and proactive replies show io's
+  bounded `<think>` summary when present; otherwise the reply has no thinking
+  attachment. The existing incomplete-summary marker is unchanged. Setting
+  `FEEDLING_V2_SELF_THINKING=0` retains the legacy native-reasoning display for
+  self-hosted operators. A content-free per-turn diagnostic records only the
+  selected branch, character count, model name, and lane; it never includes the
+  thinking text or a fragment of it.
+
 - **Managed Phala deployments can retain bounded CPU history.** The measured
   test and production CVM topology records one-minute host and container CPU
   samples in a private persistent volume for 30 UTC calendar days. A narrowly

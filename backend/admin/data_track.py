@@ -7937,6 +7937,7 @@ _DEBUG_STEP_LABELS = {
     "agent.model.call.start": ("🧠", "调用模型 · 开始"),
     "agent.model.call.done": ("🧠", "调用模型 · 完成"),
     "agent.tool.call": ("🔧", "调用工具"),
+    "thinking.surfaced": ("💭", "思考展示 · 分支"),
     "mcp.surface.resolved": ("🧩", "MCP 工具面"),
     "mcp.surface.missing": ("🧩", "MCP 工具面缺失"),
     "mcp.surface.wired": ("🧩", "MCP 已接线"),

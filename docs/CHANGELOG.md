@@ -47,6 +47,18 @@
 
 ## 记录正文（最新的在上面）
 
+## 2026-08-14 — Runtime V2 推理展示只认自撰摘要
+
+**[FEEDBACK] 推理过程不再在缺少 `<think>` 时退回 provider 原生 CoT。**
+
+- Runtime V2 的 chat 与 wake 两条最终回复统一走同一个选择器：
+  `FEEDLING_V2_SELF_THINKING` 开启时只展示 Agent 自撰的 `<think>` 摘要；
+  模型没写就不带 thinking 信封，解析失败仍保留既有失败标记。
+- 开关关闭时维持兼容契约，继续逐字展示 provider 原生 reasoning；不改 provider
+  请求、长度上限、prompt 或安全剥离闸。
+- 每条成功发布的终局回复最多记录一条 `thinking.surfaced`，仅含
+  `branch/chars/model/lane`，不含思考正文或片段，便于部署后核对四种分支分布。
+
 ## 2026-08-07 — 首页顶部人话总结
 
 **[FEEDBACK] Xyn：指标太复杂看不懂——首页第一行改成一句人话。**
