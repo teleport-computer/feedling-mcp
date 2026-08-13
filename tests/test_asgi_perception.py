@@ -328,6 +328,27 @@ def test_photo_evaluate_rejects_plaintext_binary_owned_by_another_user(
     assert fake.get_photo_envelope(UID, "p_wrong_owner") is None
 
 
+def test_photo_evaluate_rejects_utf8_plaintext_photo_shape(env, monkeypatch):
+    fake, _ = env
+    wire = {
+        "id": "p_utf8",
+        "body": "not a binary photo envelope",
+        "visibility": "shared",
+        "owner_user_id": UID,
+    }
+    monkeypatch.setattr(core_envelope, "PLAINTEXT_WRITES_ACCEPTED", True)
+    monkeypatch.setattr(core_envelope, "resolve_content_encryption", lambda uid: "off")
+
+    status, out, _ct = _both(
+        "POST", "/v1/perception/photo/evaluate",
+        json={"metadata": {"scene_hint": "landscape"}, "content_envelope": wire},
+    )
+
+    assert status == 400
+    assert out == {"error": "photo_content_envelope_requires_binary_body"}
+    assert fake.get_photo_envelope(UID, "p_utf8") is None
+
+
 def test_photo_evaluate_missing_envelope_400_parity(env):
     body = {"metadata": {"scene_hint": "food"}}
     status, out, _ct = _both("POST", "/v1/perception/photo/evaluate", json=body)

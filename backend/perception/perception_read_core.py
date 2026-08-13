@@ -111,6 +111,8 @@ def photo_evaluate(store, payload: dict) -> tuple[dict, int]:
     content_envelope = p.get("content_envelope")
     if content_envelope is None:
         return {"error": "content_envelope_required"}, 400
+    if isinstance(content_envelope, dict) and content_envelope.get("body") is not None:
+        return {"error": "photo_content_envelope_requires_binary_body"}, 400
     if isinstance(content_envelope, dict) and content_envelope.get("body_b64") is not None:
         error = core_envelope.validate_uploaded_chat_envelope(
             content_envelope, user_id=store.user_id, content_type="image")
