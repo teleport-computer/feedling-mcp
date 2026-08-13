@@ -70,6 +70,24 @@
   请求、长度上限、prompt 或安全剥离闸。
 - 每条成功发布的终局回复最多记录一条 `thinking.surfaced`，仅含
   `branch/chars/model/lane`，不含思考正文或片段，便于部署后核对四种分支分布。
+
+## 2026-08-14 — Runtime V2 工具面不再因保守预算静默清空
+
+**[DONE] 灰测用户已连接 35 个 MCP 工具，模型却只看得到生图能力。**
+
+- 根因是 prompt frontier 把 ASCII 工具 schema 沿用自然语言的 1 UTF-8
+  字节/token 估算，约放大四倍；而可选工具目录又是原子组件，预算不足时
+  `tool_loop` 会把 MCP、记忆、回复、主动能力一起清空。
+- 工具 schema 改为按实际 UTF-8 构成估算：ASCII 字节按保守 3 字节/token，
+  非 ASCII 字节仍按 1 字节/token；自然语言、工具结果和中文正文也维持
+  1 字节/token，避免中文 MCP 描述被 ASCII 校准反向低估、撑爆 provider。
+- 完整目录放不下时改为逐项择入，优先保留用户 MCP 与核心记忆/回复工具，
+  再按原目录顺序填入其余能力，不再 all-or-nothing。
+- 新增 `mcp.surface.provider`：每次 provider 请求记录候选/实收/裁剪工具数，
+  并区分 `frontier_omitted`、`tool_schema_rejected`、
+  `terminal_text_round`；`mcp.turn.usage.offered_tool_count` 同时标明它只是
+  prompt 预算前的解析口径，避免再次把“解析出来”误判成“模型实际拿到”。
+
 ## 2026-08-07 — 首页顶部人话总结
 
 **[FEEDBACK] Xyn：指标太复杂看不懂——首页第一行改成一句人话。**

@@ -496,6 +496,7 @@ async def run_tool_loop(
     add_usage,
     max_calls: int,
     before_provider_call=None,
+    on_provider_tool_surface=None,
     on_provider_success=None,
     on_provider_failure=None,
     fold_before_first: bool = False,
@@ -652,6 +653,7 @@ async def run_tool_loop(
     reasoning_fragments: list[str] = []
     seen_reasoning_fragments: set[str] = set()
     force_text_fallback = False
+    force_text_fallback_reason = ""
     empty_response_recovery_used = False
     empty_response_retry_instruction = ""
     external_content_seen = False
@@ -898,12 +900,20 @@ async def run_tool_loop(
             and provider_name
             in {"anthropic", "openrouter", "openai_compatible", "deepseek"}
         )
+        surface_candidate_tools = list(turn_catalog)
+        surface_reason = ""
         if terminal_schema_guard:
             tools = [
                 spec for spec in turn_catalog if spec.name in historical_tool_names
             ] or None
+            surface_reason = (
+                force_text_fallback_reason or "terminal_text_round"
+            )
         elif terminal_text_round:
             tools = None
+            surface_reason = (
+                force_text_fallback_reason or "terminal_text_round"
+            )
         elif (
             external_content_seen or mutation_outcome_unknown or outbound_tools_blocked
         ):
@@ -956,8 +966,10 @@ async def run_tool_loop(
                 # web/task 仍然拦着:那是模型自己选的目的地,MCP 是用户选的。
                 blocked_tools.add(tool_schema.TASK_TOOL)
             tools = [spec for spec in turn_catalog if spec.name not in blocked_tools]
+            surface_candidate_tools = list(tools)
         else:
             tools = turn_catalog
+            surface_candidate_tools = list(tools)
         requirement_already_met = (
             not file_delivery_required
             or (
@@ -975,6 +987,7 @@ async def run_tool_loop(
         ):
             # Keep the recovery path narrow enough for weaker tool-using models.
             tools = [spec for spec in tools if spec.name in _FILE_DELIVERY_TOOLS]
+            surface_reason = "file_delivery_forced"
             if file_delivery_recovery_needed:
                 forced_delivery_tool = (
                     tool_schema.FILE_REPLY_TOOL
@@ -1025,16 +1038,40 @@ async def run_tool_loop(
                 on_tail_window(dict(tail_window))
             except Exception:
                 pass
-        if "tool_schemas" in frontier_plan.omitted_optional_components:
+        planned_tool_names = tuple(
+            getattr(frontier_plan, "included_tool_names", ()) or ()
+        )
+        planned_offered_tool_names = tuple(
+            getattr(frontier_plan, "offered_tool_names", ()) or ()
+        )
+        if planned_offered_tool_names:
+            included_tool_names = set(planned_tool_names)
+            tools = [
+                spec
+                for spec in (tools or [])
+                if spec.name in included_tool_names
+            ] or None
+            if (
+                not surface_reason
+                and len(tools or []) < len(surface_candidate_tools)
+            ):
+                surface_reason = "frontier_omitted"
+        elif "tool_schemas" in frontier_plan.omitted_optional_components:
             # Once a memory discovery result is present in the required native
             # transcript, keep that matching schema even when the remaining
-            # optional catalog no longer fits. This avoids a provider-visible
-            # call/result history whose tool definition has disappeared.
+            # optional catalog no longer fits. This compatibility branch also
+            # supports injected/legacy planners that predate per-tool frontier
+            # decisions.
             tools = [
                 spec
                 for spec in (tools or [])
                 if spec.name in required_schema_names
             ] or None
+            if (
+                not surface_reason
+                and len(tools or []) < len(surface_candidate_tools)
+            ):
+                surface_reason = "frontier_omitted"
         if before_provider_call is not None:
             before_provider_call()
         if tagged_image_fallback_active:
@@ -1104,6 +1141,30 @@ async def run_tool_loop(
                 # frontier; wake/child/screen lanes omit on_file_reply and keep
                 # their existing limits unchanged.
                 provider_kwargs["max_tokens"] = prompt_output_reserve_tokens
+            if on_provider_tool_surface is not None:
+                candidate_names = {
+                    str(spec.name) for spec in surface_candidate_tools
+                }
+                sent_names = {str(spec.name) for spec in (tools or [])}
+                mcp_candidate_names = candidate_names & mcp_names
+                mcp_sent_names = sent_names & mcp_names
+                try:
+                    await on_provider_tool_surface(
+                        {
+                            "round": attempts,
+                            "candidate_tool_count": len(candidate_names),
+                            "sent_tool_count": len(sent_names),
+                            "dropped_tool_count": len(candidate_names - sent_names),
+                            "mcp_candidate_tool_count": len(mcp_candidate_names),
+                            "mcp_sent_tool_count": len(mcp_sent_names),
+                            "mcp_dropped_tool_count": len(
+                                mcp_candidate_names - mcp_sent_names
+                            ),
+                            "reason": surface_reason or "none",
+                        }
+                    )
+                except Exception:
+                    pass
             result = await provider_client.reliable_chat_completion_async(
                 provider_config,
                 messages,
@@ -1240,6 +1301,7 @@ async def run_tool_loop(
                 and _is_probably_tool_schema_rejection(exc)
             ):
                 force_text_fallback = True
+                force_text_fallback_reason = "tool_schema_rejected"
                 await _trajectory(
                     "protocol_fallback",
                     {"round": attempts, "reason": "tool_schema_rejected"},
@@ -1413,6 +1475,7 @@ async def run_tool_loop(
                         "terminal reply."
                     )
                 force_text_fallback = False
+                force_text_fallback_reason = ""
                 # One guard-triggered recovery is enough. Tool calls emitted by
                 # that recovery may still take later rounds to write, deliver,
                 # and finish; the guard itself must not keep re-arming or consume
@@ -1606,6 +1669,7 @@ async def run_tool_loop(
                 },
             )
             force_text_fallback = True
+            force_text_fallback_reason = ""
             continue
 
         tool_calls_used += len(pr.tool_calls)

@@ -1583,6 +1583,7 @@ def test_openrouter_file_recovery_forces_write_then_send_file(monkeypatch):
     monkeypatch.setattr(provider_client, "chat_completion_async", provider)
     dispatched = []
     files = []
+    surfaces = []
 
     async def dispatch(tool_calls):
         dispatched.extend(tool_calls)
@@ -1600,6 +1601,9 @@ def test_openrouter_file_recovery_forces_write_then_send_file(monkeypatch):
     async def on_file(path, revision):
         files.append((path, revision))
 
+    async def record_surface(detail):
+        surfaces.append(detail)
+
     config = provider_client.ProviderConfig(
         provider="openrouter",
         model="deepseek/deepseek-v4-flash",
@@ -1615,6 +1619,7 @@ def test_openrouter_file_recovery_forces_write_then_send_file(monkeypatch):
         fold_new_messages=_RecordingFold([[], [], []]),
         add_usage=_noop_add_usage,
         max_calls=5,
+        on_provider_tool_surface=record_surface,
     ))
 
     assert [tc.name for tc in dispatched] == ["workspace_write"]
@@ -1630,6 +1635,12 @@ def test_openrouter_file_recovery_forces_write_then_send_file(monkeypatch):
     assert [spec.name for spec in provider.calls[2]["tools"]] == ["send_file"]
     assert files == [("/workspace/summary.md", 1)]
     assert outcome.final_text == "文档已生成。"
+    assert [item["reason"] for item in surfaces[:3]] == [
+        "file_delivery_forced",
+        "file_delivery_forced",
+        "file_delivery_forced",
+    ]
+    assert all(item["dropped_tool_count"] > 0 for item in surfaces[:3])
 
 
 def test_invalid_artifact_write_is_model_visible_and_retries_in_workspace(
@@ -2142,7 +2153,11 @@ def test_tool_schema_rejection_gets_exactly_one_tools_disabled_fallback(monkeypa
     provider = _RejectThenReply()
     monkeypatch.setattr(provider_client, "chat_completion_async", provider)
     usage = []
+    surfaces = []
     reply = _RecordingReply()
+
+    async def record_surface(detail):
+        surfaces.append(detail)
 
     outcome = asyncio.run(tool_loop.run_tool_loop(
         provider_config=_TEST_PROVIDER_CONFIG, build_messages=_RecordingBuildMessages(),
@@ -2150,6 +2165,7 @@ def test_tool_schema_rejection_gets_exactly_one_tools_disabled_fallback(monkeypa
         fold_new_messages=_RecordingFold([[]]), add_usage=usage.append,
         max_calls=5,
         allow_image_output=True,
+        on_provider_tool_surface=record_surface,
     ))
 
     assert provider.calls[0]["tools"] is not None
@@ -2160,6 +2176,40 @@ def test_tool_schema_rejection_gets_exactly_one_tools_disabled_fallback(monkeypa
     assert usage == [None, {}]
     assert reply.calls == [("fallback answer", True)]
     assert outcome.rounds == 2
+    assert [item["reason"] for item in surfaces] == [
+        "none",
+        "tool_schema_rejected",
+    ]
+    assert surfaces[0]["sent_tool_count"] > 0
+    assert surfaces[1]["sent_tool_count"] == 0
+    assert surfaces[1]["dropped_tool_count"] == surfaces[1]["candidate_tool_count"]
+
+
+def test_provider_surface_marks_reserved_terminal_text_round(monkeypatch):
+    provider = _ScriptedProvider([
+        {"reply": "terminal", "tool_calls": [], "usage": {}},
+    ])
+    monkeypatch.setattr(provider_client, "chat_completion_async", provider)
+    surfaces = []
+
+    async def record_surface(detail):
+        surfaces.append(detail)
+
+    outcome = asyncio.run(tool_loop.run_tool_loop(
+        provider_config=_TEST_PROVIDER_CONFIG,
+        build_messages=_RecordingBuildMessages(),
+        dispatch_tools=_RecordingDispatch(),
+        on_reply=_RecordingReply(),
+        fold_new_messages=_RecordingFold([]),
+        add_usage=_noop_add_usage,
+        max_calls=1,
+        on_provider_tool_surface=record_surface,
+    ))
+
+    assert outcome.final_text == "terminal"
+    assert surfaces[0]["reason"] == "terminal_text_round"
+    assert surfaces[0]["sent_tool_count"] == 0
+    assert surfaces[0]["dropped_tool_count"] == surfaces[0]["candidate_tool_count"]
 
 
 def test_provider_call_exception_still_counts_a_model_call(monkeypatch):

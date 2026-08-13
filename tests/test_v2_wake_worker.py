@@ -1889,12 +1889,13 @@ def _empty_round(*, stop_reason="end_turn"):
 
 
 def _seen_lane_policy(monkeypatch):
-    """记录 `_run_wake` 交给 `run_tool_loop` 的 require_reply —— 唯一还有意义的边界。"""
+    """记录 `_run_wake` 交给 `run_tool_loop` 的 lane-specific seams。"""
     seen = {}
     orig = worker.v2_tool_loop.run_tool_loop
 
     async def _spy(*a, **kw):
         seen["require_reply"] = kw.get("require_reply")
+        seen["on_provider_tool_surface"] = kw.get("on_provider_tool_surface")
         return await orig(*a, **kw)
 
     monkeypatch.setattr(worker.v2_tool_loop, "run_tool_loop", _spy)
@@ -1928,14 +1929,55 @@ def test_only_scheduled_wake_demands_a_reply(monkeypatch, lane, expected_require
     _script_provider(monkeypatch, [_text_round("something to say")])
     monkeypatch.setattr(
         worker, "_write_encrypted_reply", lambda store, text: {"id": "r"})
+    deps = _wake_deps(
+        tail=[{"id": "m1", "ts": 1.0, "role": "user", "content": "hi"}]
+    )
+    deps.emit_debug_trace = lambda *_args, **_kwargs: None
 
     asyncio.run(worker._run_wake(
-        job_id, uid, lane, deps := _wake_deps(
-            tail=[{"id": "m1", "ts": 1.0, "role": "user", "content": "hi"}]),
+        job_id, uid, lane, deps,
         _BYOK, worker.ENCLAVE_SEMAPHORE, claimed_by))
     assert deps is not None
 
     assert seen["require_reply"] is expected_require_reply, seen
+    assert seen["on_provider_tool_surface"] is not None, seen
+
+
+def test_wake_provider_tool_surface_trace_carries_wake_kind(monkeypatch):
+    uid = "u_wake_provider_surface_trace"
+    conftest.seed_user(uid)
+    _reset(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, "scheduled")
+    claimed_by = _claim(job_id)
+    traces = []
+    _script_provider(monkeypatch, [_text_round("scheduled reply")])
+    monkeypatch.setattr(
+        worker, "_write_encrypted_reply", lambda store, text: {"id": "r"}
+    )
+    deps = _wake_deps(
+        tail=[{"id": "m1", "ts": 1.0, "role": "user", "content": "hi"}]
+    )
+    deps.emit_debug_trace = lambda user_id, event_type, **fields: traces.append(
+        {"user_id": user_id, "type": event_type, **fields}
+    )
+
+    status = asyncio.run(worker._run_wake(
+        job_id,
+        uid,
+        "scheduled",
+        deps,
+        _BYOK,
+        worker.ENCLAVE_SEMAPHORE,
+        claimed_by,
+    ))
+
+    assert status == "completed"
+    surface = next(
+        trace for trace in traces if trace["type"] == "mcp.surface.provider"
+    )
+    assert surface["detail"]["lane"] == "scheduled"
+    assert surface["detail"]["wake_kind"] == "scheduled"
+    assert surface["detail"]["sent_tool_count"] > 0
 
 
 def test_scheduled_wake_empty_reply_fails_instead_of_completing_silently(monkeypatch):
