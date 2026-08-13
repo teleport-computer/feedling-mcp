@@ -57,6 +57,40 @@ def test_provider_tool_surface_has_explicit_admin_step_label():
     }) == ("🧩", "MCP Provider 实收工具面")
 
 
+def test_memory_search_and_index_have_distinct_admin_labels():
+    search = data_track._debug_friendly_step({
+        "type": "memory.search.called",
+        "subsystem": "memory",
+        "detail": {},
+    })
+    index = data_track._debug_friendly_step({
+        "type": "memory.index.called",
+        "subsystem": "memory",
+        "detail": {},
+    })
+
+    assert search == ("🔍", "搜索记忆")
+    assert index == ("🧩", "浏览记忆总览")
+    assert search != index
+
+
+def test_query_fingerprint_is_visible_but_plaintext_query_stays_redacted():
+    fingerprint = "0123456789ab"
+
+    redacted = data_track._debug_redact_value({
+        "query_fingerprint": fingerprint,
+        "query": "她的生日",
+    })
+
+    assert redacted["query_fingerprint"] == fingerprint
+    assert redacted["query"] == "<redacted string len=4>"
+
+    spoofed = data_track._debug_redact_value({
+        "query_fingerprint": "她的生日",
+    })
+    assert spoofed["query_fingerprint"] == "<redacted string len=4>"
+
+
 def test_genesis_stats_surfaces_state_and_recent_jobs(monkeypatch):
     state = {
         "status": "processing",

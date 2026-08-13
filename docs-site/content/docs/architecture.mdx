@@ -267,6 +267,15 @@ encrypted and expires automatically.
 4. A `local_only` body remains client-readable but is unavailable to agent-side
    index and fetch operations.
 
+The bounded, operator-only debug trace distinguishes an executed memory search
+from an index overview. It records the returned-card count, requested limit, and
+a 12-hex SHA-256 prefix of the trimmed search query; it never records the query
+text. Repeated Runtime V2 discovery calls that reuse an earlier result carry a
+separate content-free reuse flag. The fingerprint is operational metadata: it
+lets an authorized administrator compare whether two searches used the same
+trimmed query during the trace-retention window, but it is not ciphertext and
+must not be exposed through a public debug route.
+
 See the [Memory workflow](/docs/workflows/memory) for the complete envelope,
 selection, fetch, and action contracts.
 

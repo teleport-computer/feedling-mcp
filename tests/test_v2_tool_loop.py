@@ -1535,6 +1535,10 @@ def test_same_batch_memory_search_reuses_same_query(monkeypatch):
     monkeypatch.setattr(provider_client, "chat_completion_async", provider)
     dispatch = _RecordingDispatch("matching memory")
     build_messages = _RecordingBuildMessages()
+    tool_events = []
+
+    async def record_tool_event(tc, event_kind, payload):
+        tool_events.append((tc, event_kind, payload))
 
     outcome = asyncio.run(tool_loop.run_tool_loop(
         provider_config=_TEST_PROVIDER_CONFIG,
@@ -1543,6 +1547,7 @@ def test_same_batch_memory_search_reuses_same_query(monkeypatch):
         on_reply=_RecordingReply(),
         fold_new_messages=_RecordingFold([[]]),
         add_usage=_noop_add_usage,
+        on_tool_event=record_tool_event,
         max_calls=3,
     ))
 
@@ -1550,6 +1555,13 @@ def test_same_batch_memory_search_reuses_same_query(monkeypatch):
     exchange = build_messages.calls[1][-1]
     assert [result.call_id for result in exchange.results] == ["m1", "m2"]
     assert "already completed" in exchange.results[1].content
+    reused = [
+        payload["result"]
+        for tc, event_kind, payload in tool_events
+        if tc.id == "m2" and event_kind == "tool_call_result"
+    ]
+    assert len(reused) == 1
+    assert reused[0].metadata == {"memory_discovery_reused": True}
     assert outcome.final_text == "direct answer"
 
 

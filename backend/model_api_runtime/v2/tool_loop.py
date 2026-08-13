@@ -1709,6 +1709,7 @@ async def run_tool_loop(
                     "ok: this memory discovery was already completed; use its "
                     "prior result and continue without calling it again"
                 ),
+                metadata={"memory_discovery_reused": True},
             )
             reply_results[tc.id] = repeated_result
             await _tool_event(

@@ -2862,6 +2862,15 @@ def _v2_tool_trace_detail(
         "result_status": "err" if failed else "ok",
         "result_kind": result_kind,
     }
+    if (
+        tool in {"memory_index", "memory_search"}
+        and isinstance(metadata, dict)
+        and metadata.get("memory_discovery_reused") is True
+    ):
+        # This result never reached the capability dispatcher: the turn-level
+        # discovery deduper reused an earlier result. Preserve that edge as a
+        # content-free boolean so admin can distinguish it from a real search.
+        detail["memory_discovery_reused"] = True
     if duration_ms is not None:
         detail["dur_ms"] = duration_ms
     if failed:
