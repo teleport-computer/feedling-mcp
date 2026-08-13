@@ -513,6 +513,8 @@ def test_record_context_timezone_writes_locale_to_snapshot(env):
     snap = service.snapshot(UID)
     assert snap["timezone"] == "Asia/Shanghai"
     assert snap["locale"] == "zh"
+    assert service.stable_context_timezone(UID) == "Asia/Shanghai"
+    assert service.stable_context_locale(UID) == "zh"
 
 
 def test_record_context_timezone_rejects_junk(env):

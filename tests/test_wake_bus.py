@@ -8,6 +8,8 @@ Step-5 integration concern.
 Run:  python -m pytest tests/test_wake_bus.py -q
 """
 import json
+import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -33,6 +35,46 @@ def test_notify_payload_shape(monkeypatch):
 
     assert captured["channel"] == wake_bus.PG_CHANNEL
     assert captured["payload"] == {"u": "user-42", "c": "chat", "o": wake_bus.WORKER_ID}
+
+
+def test_forked_workers_get_distinct_identities():
+    if not hasattr(os, "fork"):
+        return
+
+    backend_path = Path(__file__).parent.parent / "backend"
+    script = f"""
+import json, os, sys
+sys.path.insert(0, {str(backend_path)!r})
+from core import wake_bus
+
+worker_ids = [wake_bus.WORKER_ID]
+children = []
+for _ in range(2):
+    read_fd, write_fd = os.pipe()
+    pid = os.fork()
+    if pid == 0:
+        os.close(read_fd)
+        os.write(write_fd, wake_bus.WORKER_ID.encode())
+        os.close(write_fd)
+        os._exit(0)
+    os.close(write_fd)
+    children.append((pid, read_fd))
+for pid, read_fd in children:
+    worker_ids.append(os.read(read_fd, 128).decode())
+    os.close(read_fd)
+    os.waitpid(pid, 0)
+print(json.dumps(worker_ids))
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    worker_ids = json.loads(result.stdout)
+
+    assert len(set(worker_ids)) == 3
 
 
 def test_notify_disabled_is_noop(monkeypatch):

@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import pytest
 sys.path.insert(0, str(pathlib.Path(__file__).parent.parent / "backend"))
 from core import self_thinking
+from chat.reply_language import format_time_anchor, infer_reply_language_policy
 from model_api_runtime.v2 import context, worker
 import worldbook_readside_core
 
@@ -517,6 +518,8 @@ def test_temporal_context_maps_visible_tail_without_mutating_messages():
     payload = json.loads(messages[-1]["content"].split("\n", 1)[1])
     data = payload["temporal_context"]
     assert data["current_local_time"] == "2026-07-26T20:00:00+08:00"
+    assert data["current_weekday"] == "周日"
+    assert data["current_day_period"] == "晚上"
     # A raw UTC wall-clock sibling field is a foot-gun: the model misreads the
     # evening-UTC value as the user's local time ("晚上9点你那边" at 凌晨4:55).
     # current_local_time + timezone fully specify the instant.
@@ -542,6 +545,108 @@ def test_temporal_context_maps_visible_tail_without_mutating_messages():
     ]
     assert "USER_TAIL_MARKER" not in messages[0]["content"]
     assert context.TEMPORAL_CONTEXT_HEADER in messages[0]["content"]
+
+
+@pytest.mark.parametrize(
+    ("locale", "archive_language", "weekday", "day_period"),
+    [
+        ("zh-Hans-CN", "", "周三", "晚上"),
+        ("en-US", "zh-Hans", "Wednesday", "evening"),
+        ("", "en-US", "Wednesday", "evening"),
+    ],
+)
+def test_v1_anchor_and_v2_temporal_context_share_local_labels(
+    locale,
+    archive_language,
+    weekday,
+    day_period,
+):
+    now_dt = datetime(2026, 8, 12, 13, 45, tzinfo=timezone.utc)
+    policy = infer_reply_language_policy(
+        {},
+        [],
+        locale=locale,
+        archive_language=archive_language,
+    )
+    v1_line = format_time_anchor(now_dt, "Asia/Shanghai", policy)
+    v2 = context.build_temporal_context(
+        now_ts=now_dt.timestamp(),
+        timezone_name="Asia/Shanghai",
+        last_user_message_ts=None,
+        tail=[],
+        locale=locale,
+        archive_language=archive_language,
+    )
+
+    assert v2["current_weekday"] == weekday
+    assert v2["current_day_period"] == day_period
+    assert weekday in v1_line
+    assert day_period in v1_line
+
+
+@pytest.mark.parametrize(
+    ("local_iso", "weekday"),
+    [
+        ("2026-07-26T23:59:00+08:00", "周日"),
+        ("2026-07-27T00:01:00+08:00", "周一"),
+    ],
+)
+def test_temporal_context_weekday_rolls_over_at_local_midnight(
+    local_iso,
+    weekday,
+):
+    local_dt = datetime.fromisoformat(local_iso)
+    temporal = context.build_temporal_context(
+        now_ts=local_dt.timestamp(),
+        timezone_name="Asia/Shanghai",
+        last_user_message_ts=None,
+        tail=[],
+        locale="zh-CN",
+    )
+
+    assert temporal["current_weekday"] == weekday
+
+
+@pytest.mark.parametrize(
+    ("local_iso", "day_period"),
+    [
+        ("2026-08-12T05:59:00+08:00", "凌晨"),
+        ("2026-08-12T06:00:00+08:00", "上午"),
+        ("2026-08-12T11:59:00+08:00", "上午"),
+        ("2026-08-12T12:00:00+08:00", "中午"),
+        ("2026-08-12T13:59:00+08:00", "中午"),
+        ("2026-08-12T14:00:00+08:00", "下午"),
+        ("2026-08-12T17:59:00+08:00", "下午"),
+        ("2026-08-12T18:00:00+08:00", "晚上"),
+    ],
+)
+def test_temporal_context_day_period_boundaries(local_iso, day_period):
+    local_dt = datetime.fromisoformat(local_iso)
+    temporal = context.build_temporal_context(
+        now_ts=local_dt.timestamp(),
+        timezone_name="Asia/Shanghai",
+        last_user_message_ts=None,
+        tail=[],
+        locale="zh-CN",
+    )
+
+    assert temporal["current_day_period"] == day_period
+
+
+def test_temporal_context_weekday_uses_non_shanghai_local_date():
+    # This instant is already Tuesday in UTC/Shanghai, but still Monday in LA.
+    now = datetime(2026, 7, 28, 6, 30, tzinfo=timezone.utc).timestamp()
+    temporal = context.build_temporal_context(
+        now_ts=now,
+        timezone_name="America/Los_Angeles",
+        last_user_message_ts=None,
+        tail=[],
+        locale="en-US",
+    )
+
+    assert temporal["current_local_time"].startswith("2026-07-27T23:30:00")
+    assert temporal["current_weekday"] == "Monday"
+    assert temporal["current_day_period"] == "evening"
 
 
 def test_temporal_context_invalid_timezone_falls_back_to_china_default():

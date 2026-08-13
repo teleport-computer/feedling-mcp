@@ -475,11 +475,9 @@ def test_compose_memory_lane_defaults_match_environment_policy():
             if is_test
             else 'FEEDLING_V2_CAPTURE_ENABLED: "${FEEDLING_V2_CAPTURE_ENABLED:-1}"'
         )
-        expected_profile = (
-            'FEEDLING_V2_PROFILE_ENABLED: "1"'
-            if is_test
-            else 'FEEDLING_V2_PROFILE_ENABLED: "${FEEDLING_V2_PROFILE_ENABLED:-0}"'
-        )
+        # PROFILE 三环境一律硬编码 "1"(Seven 2026-08-12 拍板对齐)。prod 此前写着
+        # 默认 0 而实际注入的是 1 —— 配置文件与线上状态不一致,排查时会把人引偏。
+        expected_profile = 'FEEDLING_V2_PROFILE_ENABLED: "1"'
         assert expected_capture in backend_block
         assert expected_profile in backend_block
         assert expected_capture in worker_block
@@ -490,11 +488,13 @@ def test_compose_memory_lane_defaults_match_environment_policy():
         )
         assert expected_dream in worker_block
         assert expected_profile in worker_block
-        if not is_test:
-            assert (
-                "# DO NOT set to 1 before M5 MEMORY/USER prompt injection"
-                in worker_block
-            )
+        # 旧断言要求 prod/pre 保留 "# DO NOT set to 1 before M5 …" 那句部署守卫。
+        # M5(3086025c,2026-07-31)早已部署,那句话已成假话,随本批删除 ——
+        # 留着一条不再成立的警告,比没有警告更糟:它会让下一个人以为前置条件
+        # 还没满足,从而继续不敢开(prod 就这么关了七天)。
+        # 改为断言 capture/dream/profile 三个 lane 开关在两个服务上都可读为字面量,
+        # 「配置写的」与「线上跑的」必须一致。
+        assert "${FEEDLING_V2_PROFILE_ENABLED" not in text, relative
 
 
 @pytest.mark.parametrize(
