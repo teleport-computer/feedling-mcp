@@ -611,6 +611,74 @@ def test_budget_pressure_keeps_mcp_memory_and_reply_floor_before_tail():
     assert len(plan.included_tool_names) < len(plan.offered_tool_names)
 
 
+def test_fourteen_mcp_user_shape_keeps_every_core_memory_tool_under_pressure():
+    """Regression for usr_7f30…: external tools must not erase Memory Garden.
+
+    The incident user had fourteen resolved MCP tools.  The old atomic catalog
+    omission removed the platform memory surface before the provider request,
+    so the model claimed it had searched while no ``memory_search`` execution
+    existed.  Exercise that cardinality and derive the platform floor from the
+    production vocabulary so a newly-added core memory tool cannot escape this
+    guard.
+    """
+
+    messages = [{"role": "user", "content": "找出记忆花园里提到 ElevenLabs 的卡片"}]
+    core_floor_tools = [
+        ToolSpec(name, f"core capability {name}", {"type": "object"})
+        for name in sorted(frontier._CORE_TOOL_FLOOR_NAMES)
+    ]
+    mcp_tools = [
+        ToolSpec(
+            f"mcp__connected__tool_{index}",
+            "user-selected connected capability",
+            {"type": "object", "properties": {}},
+        )
+        for index in range(14)
+    ]
+    tail_tools = [
+        ToolSpec(
+            f"optional_tail_{index}",
+            "non-core platform capability " * 30,
+            {"type": "object", "properties": {}},
+        )
+        for index in range(40)
+    ]
+    retained_tools = [*core_floor_tools, *mcp_tools]
+    tools = [*tail_tools, *retained_tools]
+    message_cost = frontier.messages_component(
+        messages, name="message_context"
+    ).estimated_tokens
+    retained_cost = frontier.tool_schemas_component(retained_tools).estimated_tokens
+    full_cost = frontier.tool_schemas_component(tools).estimated_tokens
+    output_reserve = 128
+    safety_margin = 128
+    context_window = max(
+        frontier.MIN_CONTEXT_WINDOW_TOKENS,
+        message_cost + retained_cost + output_reserve + safety_margin + 128,
+    )
+    budget = frontier.build_prompt_budget(
+        context_window,
+        output_reserve_tokens=output_reserve,
+        safety_margin_tokens=safety_margin,
+    )
+    assert message_cost + retained_cost <= budget.input_budget_tokens
+    assert message_cost + full_cost > budget.input_budget_tokens
+
+    plan = frontier.plan_provider_round(
+        model_limit=_model_limit(context_window),
+        messages=messages,
+        tools=tools,
+        output_reserve_tokens=output_reserve,
+        safety_margin_tokens=safety_margin,
+    )
+
+    included = set(plan.included_tool_names)
+    assert frontier._CORE_TOOL_FLOOR_NAMES.issubset(included)
+    assert {tool.name for tool in mcp_tools}.issubset(included)
+    assert "memory_search" in included
+    assert len(included) < len(plan.offered_tool_names)
+
+
 def test_historical_tool_schema_fails_closed_when_required_frontier_is_exhausted():
     messages = [
         {"role": "user", "content": "find my memories"},
