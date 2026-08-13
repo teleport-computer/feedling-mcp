@@ -321,7 +321,9 @@ def test_kill_switch_halts_admission_then_resumes(monkeypatch):
     monkeypatch.setattr(chat_send_core.agent_runtime_cutover, "resolve_driver", lambda cfg: "claude")
     monkeypatch.setattr(chat_send_core.jobs_store, "workers_alive", lambda **kw: True)
     monkeypatch.setattr(chat_send_core.jobs_store, "live_worker_capacity", lambda **kw: 1)
-    monkeypatch.setattr(chat_send_core.jobs_store, "inflight_job_count", lambda: 0)
+    monkeypatch.setattr(
+        chat_send_core.jobs_store, "inflight_job_count", lambda **kw: 0
+    )
     monkeypatch.setattr(chat_send_core.jobs_store, "recent_mean_service_sec", lambda **kw: None)
 
     append_chat_calls = {"n": 0}

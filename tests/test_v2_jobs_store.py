@@ -1639,6 +1639,26 @@ def test_inflight_job_count_counts_active_states():
     assert jobs_store.inflight_job_count() == before + 1
 
 
+def test_inflight_job_count_filters_foreground_and_background_lanes():
+    foreground = {"chat", "manual_wake"}
+    background = {"profile", "dream"}
+    before_all = jobs_store.inflight_job_count()
+    before_foreground = jobs_store.inflight_job_count(lanes=foreground)
+    before_background = jobs_store.inflight_job_count(lanes=background)
+
+    seed_user("u_js_inflight_foreground")
+    jobs_store.enqueue_job("u_js_inflight_foreground", "chat", reason="t")
+    for index in range(7):
+        user_id = f"u_js_inflight_background_{index}"
+        lane = "profile" if index % 2 == 0 else "dream"
+        seed_user(user_id)
+        jobs_store.enqueue_job(user_id, lane, reason="t")
+
+    assert jobs_store.inflight_job_count(lanes=foreground) == before_foreground + 1
+    assert jobs_store.inflight_job_count(lanes=background) == before_background + 7
+    assert jobs_store.inflight_job_count() == before_all + 8
+
+
 def test_recent_mean_service_sec_none_without_history():
     # 全新 lane，无 completed job
     assert jobs_store.recent_mean_service_sec(lane="no-such-lane") is None

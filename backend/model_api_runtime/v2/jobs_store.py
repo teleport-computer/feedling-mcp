@@ -3964,14 +3964,23 @@ def recent_worker_heartbeat_count(*, within_sec: int = 300) -> int:
             return int(cur.fetchone()[0])
 
 
-def inflight_job_count() -> int:
-    """在飞 job 数（pending/claimed/running）。单飞唯一索引 → 约等活跃用户数。"""
+def inflight_job_count(*, lanes: set[str] | None = None) -> int:
+    """Count pending/claimed/running Jobs, optionally within selected lanes.
+
+    Runtime admission must pass its pool's lane set.  The unfiltered form is
+    retained for aggregate Admin observability only.
+    """
     with _pool().connection() as conn:
         with conn.cursor() as cur:
-            cur.execute(
+            query = (
                 "SELECT count(*) FROM agent_jobs "
                 "WHERE status IN ('pending','claimed','running')"
             )
+            params: list[object] = []
+            if lanes:
+                query += " AND lane = ANY(%s)"
+                params.append(sorted(str(lane) for lane in lanes))
+            cur.execute(query, params)
             return int(cur.fetchone()[0])
 
 

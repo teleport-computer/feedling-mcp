@@ -230,7 +230,9 @@ def model_api_chat_send_core(
         _workers = jobs_store.live_worker_capacity(
             within_sec=30, pool="foreground"
         )
-        _inflight = jobs_store.inflight_job_count()
+        _inflight = jobs_store.inflight_job_count(
+            lanes={"chat", "manual_wake"}
+        )
         _mean = jobs_store.recent_mean_service_sec(lane="chat", limit=admission.SERVICE_SAMPLE_N)
         _est = admission.estimate_wait_sec(
             inflight=_inflight, workers=_workers,
