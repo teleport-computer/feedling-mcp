@@ -9253,6 +9253,84 @@ def _sanitize_outbound_file_reply(
     )
 
 
+# The tested wording. Changing it invalidates the cross-model evidence in
+# docs/superpowers/specs/2026-08-13-mcp-handshake-wait-hint-design.md §5.3 —
+# re-run that matrix before touching it.
+#
+# It deliberately does NOT ask the model to narrate connection failures to the
+# user: which server is down is configuration state, and the app already has a
+# channel for it (`/v1/mcp/servers` → per-server ``runtime``). Making the model
+# the messenger would be both unreliable and the wrong layer (spec §2.3).
+_USER_MCP_WAIT_HINT = (
+    "【你连接的 MCP 服务器】{names}\n"
+    "其中一些可能还在后台连接、工具暂时没出现在你的工具表里。如果某台服务器"
+    "可能有你需要的能力而看不到它的工具，先调用 WaitForMcpServers"
+    "（参数用上面列表里的准确名字，只等你真正需要的那一台，最多等一次）"
+    "等它就绪，再调用工具。不要因为「看不到工具」就告诉用户用不了。\n\n"
+)
+
+
+def _cli_template_is_claude() -> bool:
+    """True when AGENT_CLI_CMD drives ``claude`` (the only driver that does not
+    wait for the MCP handshake — see _prepend_user_mcp_wait_hint)."""
+    return _is_claude_code_cmd(_cli_cmd_tokens())
+
+
+def _prepend_user_mcp_wait_hint(content: str, *, lane: str) -> str:
+    """Tell a claude-driven chat turn that ``WaitForMcpServers`` exists.
+
+    claude CLI emits its ``init`` snapshot ~2.5s after start and begins the turn
+    with whatever connected in time; a server that missed that window
+    contributes ZERO tools, so the model does not know the capability exists and
+    truthfully answers "I can't". Because the consumer spawns a fresh
+    ``claude --print`` per turn, claude's own "it'll be there next turn" recovery
+    never gets a next turn.
+
+    ``WaitForMcpServers`` is a claude built-in (verified present in BOTH the
+    runner's pinned 2.1.195 and 2.1.217 by reading the init event's ``tools``
+    list — NOT via ``sdk-tools.d.ts``, which lists it in neither). It is already
+    callable: ``--allowed-tools`` is not an exclusive allowlist (see
+    ``_warn_if_claude_allowlist_semantics_unverified``). The model simply had no
+    way to know it was an option.
+
+    No pre-turn wait is added anywhere: the cost is paid only on the turn that
+    actually needs a server, so turns that need no MCP stay byte-for-byte as fast
+    as today. That is the one advantage this has over "spawn early, send the
+    message late", which buys a hard guarantee with a wait on EVERY turn.
+
+    Three gates, all required — any miss returns ``content`` unchanged (the same
+    object, so a caller can assert identity):
+
+    1. chat lane only. Background/proactive turns are never wired with MCP at
+       all (``_user_mcp_cli_value``), so the hint would name servers the model
+       cannot reach and invite a call to a tool it does not have.
+    2. claude driver only. **This gate is load-bearing.** codex blocks for
+       ``startup_timeout_sec`` and pi's bridge is awaited, so neither has the
+       race — and neither has ``WaitForMcpServers``. Injecting there would send
+       the model after a nonexistent tool: a new failure in place of no failure.
+    3. at least one enabled server in ``_user_mcp_applied`` — the same in-memory
+       source of truth ``_user_mcp_cli_value`` gates on, not on-disk file
+       existence (a stale /tmp file can outlive the servers it was written for).
+
+    Every turn, not once per session: unlike the io_cli catalog, "which servers
+    missed the window" is re-rolled by a brand-new process on every single turn,
+    so a once-per-session injection would describe a race that has since been
+    re-run. Three lines is cheap enough that no pending→commit dance is needed.
+    """
+    if lane != "chat" or AGENT_MODE != "cli":
+        return content
+    if not _cli_template_is_claude():
+        return content
+    names = sorted(
+        str(s.get("name") or "")
+        for s in _user_mcp_applied.get("servers") or []
+        if s.get("enabled") and s.get("name")
+    )
+    if not names:
+        return content
+    return _USER_MCP_WAIT_HINT.format(names=", ".join(names)) + content
+
+
 def _prepend_io_cli_capability_catalog(content: str) -> str:
     """Prepend the live io_cli command catalog (io_cli_catalog.build_catalog,
     T6) to a foreground CLI turn, so a self-hosted resident's model always
@@ -15422,6 +15500,13 @@ def _process_messages(messages: list) -> float:
         # transcript header it prepends stays topmost (see that function's
         # docstring and _message_has_injected_history).
         content = _prepend_io_cli_capability_catalog(content)
+        # claude does NOT wait for the user-MCP handshake, and we spawn a fresh
+        # process per turn — so tell the model about WaitForMcpServers rather
+        # than let it truthfully report a capability it cannot see. No-op for
+        # every other driver and for users with no MCP configured. Placed here,
+        # after the catalog and before _foreground_agent_message, for the same
+        # reason the catalog is: the transcript header must stay topmost.
+        content = _prepend_user_mcp_wait_hint(content, lane="chat")
         # Then inject cross-turn continuity for drivers with no reliable session of
         # their own (codex / hosted claude). No-op for pi / when disabled / when
         # there is no prior turn. Done once here so every dispatch branch below

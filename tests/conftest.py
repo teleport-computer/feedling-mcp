@@ -108,6 +108,8 @@ if not _provisioned:
     # no-Postgres dev machine still runs something useful.
     _PURE_UNIT = {
         "test_card_guard.py",
+        # Fully monkeypatched consumer prompt-gate unit — no DB, no network.
+        "test_user_mcp_wait_hint.py",
         "test_bucket_lang_normalize.py",
         "test_branch_flow_guard.py",
         "test_memory_actions_guard.py",
