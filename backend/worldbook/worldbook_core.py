@@ -17,6 +17,7 @@ is ever introduced here.
 from __future__ import annotations
 
 from datetime import datetime
+import json
 import os
 
 from content.content_core import _apply_envelope_fields, _swap_envelope_missing
@@ -69,6 +70,23 @@ def _validate_content_cap_with_enclave(
     length locally. The enclave decrypt path owns that check; this call makes the
     write path reject over-cap world book content before it is persisted.
     """
+    shape = core_envelope.classify_envelope_shape(record)
+    if shape in ("plaintext_text", "plaintext_binary"):
+        try:
+            raw = core_envelope.read_plaintext_envelope_body(
+                record, owner_user_id=str(record.get("owner_user_id") or ""))
+            inner = json.loads(raw.decode("utf-8"))
+            if not isinstance(inner, dict):
+                raise ValueError("world book plaintext is not an object")
+        except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
+            return {"error": "worldbook_validate_failed", "id": record.get("id")}, 400
+        if len(str(inner.get("content") or "")) > worldbook_readside_core.WORLD_BOOK_CONTENT_CAP:
+            return {
+                "error": "content_too_long",
+                "id": str(record.get("id") or ""),
+                "max_chars": worldbook_readside_core.WORLD_BOOK_CONTENT_CAP,
+            }, 400
+        return None
     if not os.environ.get("FEEDLING_ENCLAVE_URL", "").strip():
         return None
     try:
@@ -128,15 +146,70 @@ def match(
         world_books = [dict(item) for item in store.world_books]
     if not world_books:
         return {"block": "", "matched_names": [], "rejected_over_cap": [], "unavailable_ids": []}, 200
-    try:
-        result = worldbook_readside_core.post_enclave_worldbook_match(
-            api_key,
-            world_books,
-            messages,
-            runtime_token=runtime_token,
-        )
-    except RuntimeError as e:
-        return {"error": "worldbook_match_unavailable", "detail": str(e)}, 503
+    parts: list[dict] = []
+    index = 0
+    while index < len(world_books):
+        row = world_books[index]
+        shape = core_envelope.classify_envelope_shape(row)
+        plaintext = shape in ("plaintext_text", "plaintext_binary")
+        end = index + 1
+        while end < len(world_books):
+            next_shape = core_envelope.classify_envelope_shape(world_books[end])
+            if (next_shape in ("plaintext_text", "plaintext_binary")) != plaintext:
+                break
+            end += 1
+        group = world_books[index:end]
+        if plaintext:
+            entries: list[dict] = []
+            unavailable_ids: list[str] = []
+            for entry in group:
+                try:
+                    raw = core_envelope.read_plaintext_envelope_body(
+                        entry, owner_user_id=store.user_id)
+                    inner = json.loads(raw.decode("utf-8"))
+                    if not isinstance(inner, dict):
+                        raise ValueError("world book plaintext is not an object")
+                    entries.append(inner)
+                except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
+                    entry_id = str(entry.get("id") or "")
+                    if entry_id:
+                        unavailable_ids.append(entry_id)
+            result = worldbook_readside_core.build_block(entries, messages)
+            result["unavailable_ids"] = unavailable_ids
+        else:
+            sealed_group = []
+            unavailable_ids = []
+            for entry in group:
+                if core_envelope.classify_envelope_shape(entry) != "sealed":
+                    entry_id = str(entry.get("id") or "")
+                    if entry_id:
+                        unavailable_ids.append(entry_id)
+                    continue
+                projection = dict(entry)
+                projection.pop("body", None)
+                projection.pop("body_b64", None)
+                sealed_group.append(projection)
+            try:
+                result = (
+                    worldbook_readside_core.post_enclave_worldbook_match(
+                        api_key,
+                        sealed_group,
+                        messages,
+                        runtime_token=runtime_token,
+                    )
+                    if sealed_group
+                    else {"block": "", "matched_names": [],
+                          "rejected_over_cap": [], "unavailable_ids": []}
+                )
+            except RuntimeError as e:
+                return {"error": "worldbook_match_unavailable", "detail": str(e)}, 503
+            result["unavailable_ids"] = [
+                *unavailable_ids,
+                *(result.get("unavailable_ids") or []),
+            ]
+        parts.append(result)
+        index = end
+    result = worldbook_readside_core.merge_match_results(parts)
     block = str(result.get("block") or "")
     matched_names = result.get("matched_names") if isinstance(result.get("matched_names"), list) else []
     if block:

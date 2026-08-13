@@ -46,6 +46,28 @@ def build_block(
     }
 
 
+def merge_match_results(parts: list[dict]) -> dict:
+    lines: list[str] = []
+    matched_names: list[str] = []
+    rejected_over_cap: list[str] = []
+    unavailable_ids: list[str] = []
+    for part in parts:
+        block = str(part.get("block") or "").strip()
+        if block.startswith("<world_book>\n") and block.endswith("\n</world_book>"):
+            block = block[len("<world_book>\n"):-len("\n</world_book>")]
+        if block:
+            lines.append(block)
+        matched_names.extend(str(item) for item in part.get("matched_names") or [])
+        rejected_over_cap.extend(str(item) for item in part.get("rejected_over_cap") or [])
+        unavailable_ids.extend(str(item) for item in part.get("unavailable_ids") or [])
+    return {
+        "block": "<world_book>\n" + "\n".join(lines) + "\n</world_book>" if lines else "",
+        "matched_names": matched_names,
+        "rejected_over_cap": rejected_over_cap,
+        "unavailable_ids": unavailable_ids,
+    }
+
+
 def post_enclave_worldbook_match(
     api_key: str | None,
     world_books: list[dict],
