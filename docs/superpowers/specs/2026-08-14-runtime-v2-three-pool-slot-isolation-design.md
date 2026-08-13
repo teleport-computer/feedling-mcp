@@ -405,24 +405,46 @@ admission。
 
 ## 11. 配置与回滚
 
-新增配置采用以下确定名称：
+这些参数都是非敏感的容量、调度和功能开关，不放入 GitHub Secret、GitHub Variable 或 Phala
+encrypted env。它们直接写在各环境主 CVM compose 的 `serve-worker.environment` 中：
 
-```text
-FEEDLING_V2_POOL_MODE=three_pool
-FEEDLING_V2_FOREGROUND_SLOTS=4
-FEEDLING_V2_WAKE_SLOTS=2
-FEEDLING_V2_HEAVY_SLOTS=2
-FEEDLING_V2_PROFILE_INSTANCE_CONCURRENCY=1
-FEEDLING_V2_ENCLAVE_INSTANCE_CONCURRENCY=4
-FEEDLING_V2_CHAT_PREEMPTION_ENABLED=1
-FEEDLING_V2_SLOT_PROCESS_ISOLATION=1
+- prod：`deploy/docker-compose.phala.yaml`；
+- pre：`deploy/docker-compose.phala.pre.yaml`；
+- test：`deploy/docker-compose.phala.test.yaml`。
+
+prod 的目标 YAML 为：
+
+```yaml
+FEEDLING_V2_POOL_MODE: "three_pool"
+FEEDLING_V2_FOREGROUND_SLOTS: "4"
+FEEDLING_V2_WAKE_SLOTS: "2"
+FEEDLING_V2_HEAVY_SLOTS: "2"
+FEEDLING_V2_PROFILE_INSTANCE_CONCURRENCY: "1"
+FEEDLING_V2_ENCLAVE_INSTANCE_CONCURRENCY: "4"
+FEEDLING_V2_CHAT_PREEMPTION_ENABLED: "1"
+FEEDLING_V2_SLOT_PROCESS_ISOLATION: "1"
 ```
 
-`FEEDLING_V2_POOL_MODE=legacy` 时继续读取现有 `FEEDLING_V2_MAX_WORKERS` 和
-`FEEDLING_V2_CHAT_RESERVED_SLOTS`，作为一键回滚路径。`three_pool` 模式不得同时把旧
-`MAX_WORKERS` 当作额外 slot 加到三个新配置上；Admin 应明确展示最终解析后的三个容量值。
+pre 在生产推广前必须写成相同的 `4/2/2` 做拓扑等价验证。test 可先在 Phase 2 使用
+`2/1/1 = 4` 验证进程模型，验证后再显式改成 `4/2/2 = 8`；所有值都在 YAML 中可审计，不能被
+未展示的 CI repo variable 覆盖。
 
-上线必须支持独立开关：
+`FEEDLING_V2_POOL_MODE: "legacy"` 时继续读取现有 `FEEDLING_V2_MAX_WORKERS` 和
+`FEEDLING_V2_CHAT_RESERVED_SLOTS`。切到 `three_pool` 后，从对应 compose 删除旧
+`FEEDLING_V2_MAX_WORKERS`，避免操作者误以为它会额外增加容量；代码在 three-pool 模式也必须
+明确忽略旧值。Admin 展示最终解析后的三个容量值。
+
+以下内容仍属于 Secret，继续通过现有加密环境注入，绝不能内联到 YAML：
+
+- `DATABASE_URL`；
+- `FEEDLING_RUNTIME_TOKEN_SECRET` 及 previous secret；
+- provider/API key；
+- 其他密码、token 和私钥。
+
+直接修改 YAML 会改变 compose hash，需要按现有发布流程重新授权/部署。这是有意选择：容量和
+故障域变更应进入代码审查和部署记录，不允许在 GitHub Secret 页面静默漂移。
+
+上线仍保留以下独立代码开关，但开关值均由 YAML 显式声明：
 
 1. lane-aware admission；
 2. Chat preemption；
@@ -430,9 +452,9 @@ FEEDLING_V2_SLOT_PROCESS_ISOLATION=1
 4. per-slot process；
 5. Profile batching/global cap。
 
-回滚顺序与上线相反。关闭三池/per-slot 后恢复当前单 `turn_child` 模式；关闭抢占后恢复现有同用户
-单飞。数据库迁移必须向后兼容旧 worker：新 heartbeat `pool` 字段有兼容默认值，新取消字段/状态
-不能使旧 claim SQL 误领终局 Job。
+回滚顺序与上线相反。通过提交 YAML 把 `POOL_MODE` 改成 `legacy` 并重新部署，恢复当前单
+`turn_child` 模式；关闭抢占后恢复现有同用户单飞。数据库迁移必须向后兼容旧 worker：新
+heartbeat `pool` 字段有兼容默认值，新取消字段/状态不能使旧 claim SQL 误领终局 Job。
 
 ## 12. 可观测性
 
