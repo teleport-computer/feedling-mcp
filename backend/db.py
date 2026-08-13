@@ -58,6 +58,8 @@ log = logging.getLogger("feedling.db")
 
 _pool: ConnectionPool | None = None
 _pool_lock = threading.Lock()
+HEALTH_DB_ACQUIRE_TIMEOUT_SECONDS = 1.0
+HEALTH_DB_STATEMENT_TIMEOUT_MS = 1000
 
 
 def _database_url() -> str:
@@ -239,7 +241,24 @@ def healthcheck() -> bool:
         return False
 
 
-def health_probe(timeout: float = 2.0) -> dict:
+@contextmanager
+def _local_statement_timeout(conn, timeout_ms: int | None):
+    if timeout_ms is None:
+        yield
+        return
+    with conn.transaction():
+        conn.execute(
+            "SELECT set_config('statement_timeout', %s, true)",
+            (f"{int(timeout_ms)}ms",),
+        )
+        yield
+
+
+def health_probe(
+    timeout: float = 2.0,
+    *,
+    statement_timeout_ms: int | None = None,
+) -> dict:
     """Fast liveness probe for /healthz.
 
     Acquire a pooled connection within ``timeout`` seconds and run ``SELECT 1``.
@@ -252,8 +271,13 @@ def health_probe(timeout: float = 2.0) -> dict:
     t0 = time.perf_counter()
     try:
         with get_pool().connection(timeout=timeout) as conn:
-            conn.execute("SELECT 1")
-        return {"ok": True, "latency_ms": round((time.perf_counter() - t0) * 1000, 1), "error": None}
+            with _local_statement_timeout(conn, statement_timeout_ms):
+                conn.execute("SELECT 1")
+        return {
+            "ok": True,
+            "latency_ms": round((time.perf_counter() - t0) * 1000, 1),
+            "error": None,
+        }
     except Exception as e:  # noqa: BLE001 — health must never raise
         return {
             "ok": False,
@@ -442,18 +466,24 @@ def set_supervisor_instance_heartbeat(owner: str, payload: dict) -> None:
     mirror.execute(sql, params)
 
 
-def list_supervisor_instance_heartbeats() -> list[dict]:
+def list_supervisor_instance_heartbeats(
+    *,
+    timeout: float | None = None,
+    statement_timeout_ms: int | None = None,
+) -> list[dict]:
     """All runner heartbeat rows. Each dict carries the typed flags plus ``ts``
     (the row's ``updated_at`` as an epoch float) so the caller can age-filter in
     pure code. Freshness/aggregation is the guard's job, not this query's. Raises
     on a DB error so the caller can fall back to the legacy key."""
-    with get_pool().connection() as conn:
-        rows = conn.execute(
-            "SELECT owner, host, shard_index, shard_count, max_children, "
-            "       active_children, host_all, gateway, version, "
-            "       extract(epoch FROM updated_at) AS ts, payload "
-            "FROM agent_runtime_supervisor_heartbeats"
-        ).fetchall()
+    connection_kwargs = {"timeout": timeout} if timeout is not None else {}
+    with get_pool().connection(**connection_kwargs) as conn:
+        with _local_statement_timeout(conn, statement_timeout_ms):
+            rows = conn.execute(
+                "SELECT owner, host, shard_index, shard_count, max_children, "
+                "       active_children, host_all, gateway, version, "
+                "       extract(epoch FROM updated_at) AS ts, payload "
+                "FROM agent_runtime_supervisor_heartbeats"
+            ).fetchall()
     out = []
     for r in rows:
         # ``pi`` has no promoted column (unlike host_all/gateway) — the supervisor
@@ -557,6 +587,16 @@ def load_user(user_id: str) -> dict | None:
             "SELECT doc FROM users WHERE user_id = %s", (user_id,)
         ).fetchone()
     return row[0] if row else None
+
+
+def get_user_created_at_strict(user_id: str) -> str | None:
+    """Return the authoritative users.created_at text; DB errors propagate."""
+    with get_pool().connection() as conn:
+        row = conn.execute(
+            "SELECT created_at FROM users WHERE user_id=%s",
+            (str(user_id),),
+        ).fetchone()
+    return None if row is None else str(row[0] or "")
 
 
 def find_user_by_api_key_hash(h: str) -> dict | None:
@@ -692,6 +732,14 @@ def normalize_user_cas(
     return read_ok, authoritative
 
 
+def _delete_runtime_allowlist_on_cursor(cur, user_id: str) -> None:
+    """Delete RDS-only runtime routing control in the caller's transaction."""
+    cur.execute(
+        "DELETE FROM v2_user_allowlist WHERE user_id = %s",
+        (user_id,),
+    )
+
+
 def save_all_users(users: list[dict]) -> None:
     """Persist an explicit whole-registry snapshot for tests/offline tooling.
 
@@ -747,6 +795,7 @@ def save_all_users(users: list[dict]) -> None:
                         _mark_chat_r2_inventory_pending_on_cursor(
                             cur, removed_id, advance_generation=True,
                         )
+                        _delete_runtime_allowlist_on_cursor(cur, removed_id)
                         # Preserve the global lifecycle -> users/chat lock order.
                         # A bulk users FOR UPDATE before lifecycle would deadlock
                         # against append/clear, which take the lifecycle fence
@@ -797,6 +846,7 @@ def delete_user(user_id: str) -> bool:
                 _mark_chat_r2_inventory_pending_on_cursor(
                     cur, user_id, advance_generation=True,
                 )
+                _delete_runtime_allowlist_on_cursor(cur, user_id)
                 cur.execute(sql, (user_id,))
     from tee_shadow import mirror
     mirror.execute(sql, (user_id,))
@@ -1073,6 +1123,51 @@ def admin_data_track_snapshot(user_ids: list[str]) -> dict[str, dict]:
                 """
                 SELECT user_id,
                        COUNT(*)::int AS total,
+                       MAX(ts) AS latest_ts,
+                       COUNT(*) FILTER (
+                         WHERE body_key IS NULL
+                       )::int AS inline_count,
+                       COUNT(*) FILTER (
+                         WHERE body_key IS NOT NULL
+                       )::int AS r2_count
+                FROM frame_envelopes
+                WHERE user_id = ANY(%s)
+                GROUP BY user_id
+                """,
+                (ids,),
+            ).fetchall()
+            for uid, total, latest_ts, inline_count, r2_count in rows:
+                ensure(out, uid)["screen_frames"] = {
+                    "total": total,
+                    "latest_ts": latest_ts,
+                    "inline_count": inline_count,
+                    "r2_count": r2_count,
+                }
+
+            rows = conn.execute(
+                """
+                SELECT user_id,
+                       doc->'broadcast_state'->>'v' AS broadcast_state,
+                       doc->'broadcast_state'->>'ts' AS broadcast_state_ts,
+                       doc->'broadcast_active'->>'v' AS broadcast_active,
+                       doc->'broadcast_active'->>'ts' AS broadcast_active_ts
+                FROM user_blobs
+                WHERE user_id = ANY(%s) AND kind = 'perception_state'
+                """,
+                (ids,),
+            ).fetchall()
+            for uid, state, state_ts, active, active_ts in rows:
+                ensure(out, uid)["screen_broadcast"] = {
+                    "broadcast_state": state,
+                    "broadcast_state_ts": state_ts,
+                    "broadcast_active": active,
+                    "broadcast_active_ts": active_ts,
+                }
+
+            rows = conn.execute(
+                """
+                SELECT user_id,
+                       COUNT(*)::int AS total,
                        MIN(NULLIF(doc->>'created_at', '')) AS first_created_at,
                        MAX(NULLIF(doc->>'created_at', '')) AS last_created_at,
                        MIN(NULLIF(doc->>'occurred_at', '')) AS earliest_occurred_at,
@@ -1312,6 +1407,43 @@ def admin_data_track_snapshot(user_ids: list[str]) -> dict[str, dict]:
             ).fetchall()
             for uid, kind, doc in rows:
                 ensure(out, uid).setdefault("blobs", {})[kind] = doc
+
+            # User MCP: counts only, deliberately NOT added to the whitelist
+            # above. That query returns whole docs, and this blob carries one
+            # encrypted envelope per server (the url + auth headers live inside
+            # it) — counting in SQL keeps every envelope out of the admin
+            # process. The three fields are what triage actually needs:
+            #   - configured_count: did the user save a server at all? (the app's
+            #     connection test is a control-plane probe that succeeds without
+            #     saving anything, so "it tested fine" is not evidence of this);
+            #   - enabled_count: a saved-but-switched-off server still advertises
+            #     a NON-empty fingerprint and materializes cleanly, yet reaches
+            #     the agent as zero servers — indistinguishable from a broken
+            #     apply chain without this number;
+            #   - fingerprint: lines up against the one the consumer applied.
+            rows = conn.execute(
+                """
+                SELECT user_id,
+                       COALESCE(jsonb_array_length(
+                           CASE WHEN jsonb_typeof(doc->'servers') = 'array'
+                                THEN doc->'servers' END), 0) AS configured,
+                       COALESCE((
+                           SELECT COUNT(*) FROM jsonb_array_elements(
+                               CASE WHEN jsonb_typeof(doc->'servers') = 'array'
+                                    THEN doc->'servers' ELSE '[]'::jsonb END) s
+                           WHERE s->>'enabled' = 'true'), 0)::int AS enabled,
+                       COALESCE(doc->>'fingerprint', '') AS fingerprint
+                FROM user_blobs
+                WHERE user_id = ANY(%s) AND kind = 'user_mcp'
+                """,
+                (ids,),
+            ).fetchall()
+            for uid, configured, enabled, fingerprint in rows:
+                ensure(out, uid)["user_mcp"] = {
+                    "configured_count": int(configured),
+                    "enabled_count": int(enabled),
+                    "fingerprint": str(fingerprint or ""),
+                }
 
             rows = conn.execute(
                 """
@@ -2458,8 +2590,9 @@ def admin_data_track_retention_daily(
 
     Cohort = signup Beijing day (``granularity="day"``) or Beijing ISO week
     (``"week"``, labeled by the Monday). D_N = share of the cohort active exactly
-    N days after EACH member's own signup day (activity = a user chat message or
-    a tracking event — identical to the DAU definition). Only signups on/after
+    N days after EACH member's own signup day (activity = an app_session_end
+    foreground session — the 使用 DAU/打开App ruler; the SQL below is the truth,
+    an older draft of this docstring claimed the broad chat∪tracking ruler). Only signups on/after
     ``since_day`` (the freeze boundary) count; pre-freeze days drift as accounts
     delete and are excluded entirely per the product decision.
 
@@ -2560,7 +2693,8 @@ def admin_data_track_growth_accounting(
     the active set into new / resurrected / retained, plus churned (users active
     the prior day but not today) and Quick Ratio = (new+resurrected)/churned.
 
-    active = a user chat message or tracking event that day (DAU definition).
+    active = an app_session_end foreground session that day (使用 DAU/打开App
+    ruler — matches the SQL below; an older docstring claimed chat∪tracking).
     new = signed up that day; resurrected = active today, existed before, but was
     not active yesterday; retained = active both days. Iterates every calendar
     day from ``since_day`` to today so a zero-activity gap correctly shows as
@@ -3198,7 +3332,7 @@ def admin_product_health_power_users(
                     AND COALESCE(NULLIF(doc->>'job_kind',''), NULLIF(doc->>'wake_kind',''),
                                  NULLIF(doc->>'trigger',''), 'unknown')
                         NOT IN ('screen_watch','scene_change','screen_tick',
-                                'broadcast_opened','heartbeat_broadcast_on')
+                                'broadcast_opened','broadcast_closed','heartbeat_broadcast_on')
                   )
 
                 UNION ALL
@@ -3728,6 +3862,121 @@ def admin_home_cost(*, tz: str = "Asia/Shanghai") -> dict:
     }
 
 
+def admin_home_pulse_story(*, tz: str = "Asia/Shanghai") -> dict:
+    """首页脉搏第二排「故事数字」：留存曲线加权值 / 发消息深度 / DAU 构成。
+
+    三块的尺子都已对齐到既有页面（上板前一致性审查 2026-08-07）：
+    - curve：对增长页的逐日 cohort 留存网格加权平均 D1/D7/D14/D30——
+      活跃口径 = app_session_end（使用 DAU，与 dau/growth 同一把尺，实为
+      SQL 现状），live 重算、随删号回缩、只算冻结边界后注册的 cohort。
+      cell 为 None（cohort 未活到那一天）不进分母；某列所有 cohort 都
+      未成熟 → 该列 None（未成熟 ≠ 0）。flat_pp = D7−D14 百分点差，
+      两列都有值才给（正=还在掉，越接近 0 越平）。
+    - depth：最近一个已冻结北京日的 chat_dau ÷ session_dau（发消息的人
+      ÷ 打开 App 的人，同日同一张冻结快照，绝不跨源拼比值），外加近 7
+      个冻结日的加权均值。分母 0 → None。
+    - mix：最近一个已完整北京日（昨天）的 DAU 构成，与增长核算同源同尺
+      （app_session_end），live 重算；new_blood_pct = 当日活跃者中注册
+      不满 28 天者占比（created_at 严格 CASE 解析，坏值静默出局）。
+
+    全部有界（快照表 LIMIT 7 / 网格自冻结边界 / 单日活跃集），失败一律
+    RAISE——admin_core 兜成 None，页面显「暂不可用」不显 0。
+    """
+    zone = _ph_zone(tz)
+    today = datetime.now(zone).date()
+
+    bounds = admin_dau_snapshot_bounds()
+    freeze_day = str(bounds.get("first_day") or "")
+    curve: dict = {"d1": None, "d7": None, "d14": None, "d30": None, "flat_pp": None}
+    if freeze_day:
+        grid = admin_data_track_retention_daily(
+            tz=tz, since_day=freeze_day, granularity="day"
+        )
+        acc = {k: [0.0, 0] for k in ("1", "7", "14", "30")}
+        for c in grid.get("cohorts") or []:
+            n = int(c.get("size") or 0)
+            cells = c.get("cells") or {}
+            for k in acc:
+                v = cells.get(k)
+                if v is not None and n > 0:
+                    acc[k][0] += n * float(v) / 100.0
+                    acc[k][1] += n
+        for k, out_key in (("1", "d1"), ("7", "d7"), ("14", "d14"), ("30", "d30")):
+            kept, n = acc[k]
+            if n > 0:
+                curve[out_key] = {"pct": kept / n * 100.0, "n": n}
+        if curve["d7"] is not None and curve["d14"] is not None:
+            curve["flat_pp"] = curve["d7"]["pct"] - curve["d14"]["pct"]
+
+    with get_pool().connection() as conn:
+        depth_rows = conn.execute(
+            """
+            SELECT day, chat_dau, session_dau FROM dau_daily_snapshot
+            ORDER BY day DESC LIMIT 7
+            """,
+        ).fetchall()
+    depth: dict | None = None
+    if depth_rows:
+        latest_day, latest_chat, latest_sess = (
+            str(depth_rows[0][0]), int(depth_rows[0][1] or 0), int(depth_rows[0][2] or 0),
+        )
+        chat_sum = sum(int(r[1] or 0) for r in depth_rows)
+        sess_sum = sum(int(r[2] or 0) for r in depth_rows)
+        depth = {
+            "day": latest_day,
+            "pct": (latest_chat / latest_sess * 100.0) if latest_sess else None,
+            "avg7_pct": (chat_sum / sess_sum * 100.0) if sess_sum else None,
+        }
+
+    mix: dict | None = None
+    if freeze_day:
+        acct = admin_data_track_growth_accounting(tz=tz, since_day=freeze_day)
+        complete = [
+            r for r in (acct.get("rows") or [])
+            if str(r.get("day") or "") < today.isoformat()
+        ]
+        if complete:
+            last = complete[-1]
+            day_text = str(last.get("day") or "")
+            day_start = _ph_day_epoch(date.fromisoformat(day_text), zone)
+            day_end = _ph_day_epoch(date.fromisoformat(day_text) + timedelta(days=1), zone)
+            # timestamptz 字面量自带时区偏移，比较时 PG 自行换算——不用
+            # 手工转 UTC。
+            cutoff = datetime.combine(
+                date.fromisoformat(day_text) - timedelta(days=28),
+                datetime.min.time(), tzinfo=zone,
+            ).isoformat()
+            with get_pool().connection() as conn:
+                ca = _ph_created_at_sql(conn)
+                row = conn.execute(
+                    f"""
+                    WITH act AS (
+                        SELECT DISTINCT user_id FROM user_logs
+                        WHERE stream = 'tracking_events'
+                          AND doc->>'type' = 'app_session_end'
+                          AND ts >= %s AND ts < %s
+                    )
+                    SELECT count(*)::int,
+                           count(*) FILTER (
+                               WHERE ({ca}) >= %s::timestamptz
+                           )::int
+                    FROM act JOIN users USING (user_id)
+                    """,
+                    (day_start, day_end, cutoff),
+                ).fetchone()
+            active_n, fresh_n = int(row[0] or 0), int(row[1] or 0)
+            mix = {
+                "day": day_text,
+                "active": int(last.get("active") or 0),
+                "retained": last.get("retained"),
+                "resurrected": last.get("resurrected"),
+                "new": last.get("new"),
+                "new_blood_pct": (fresh_n / active_n * 100.0) if active_n else None,
+            }
+
+    return {"curve": curve, "depth": depth, "mix": mix}
+
+
 def admin_home_soft_verdicts(*, tz: str = "Asia/Shanghai") -> dict:
     """首页状态条的 growth/cost/evidence 三枚软判定（system 由 admin_core
     用它自己够得着的 _ops_*_level 组合——db 层不许向上 import 渲染包）。
@@ -4005,7 +4254,7 @@ def admin_data_track_proactive_daily(*, since_epoch: float = 0.0, days: int = 30
     （(delivered+completed) / (delivered+completed+failed)）。"""
     day_limit = max(1, min(int(days or 30), 1000))
     since = float(since_epoch or 0.0)
-    screen_kinds = "('screen_watch','scene_change','screen_tick','broadcast_opened','heartbeat_broadcast_on')"
+    screen_kinds = "('screen_watch','scene_change','screen_tick','broadcast_opened','broadcast_closed','heartbeat_broadcast_on')"
     maintenance_kinds = "('memory_capture','memory_dream','memory_migrate')"
     try:
         with get_pool().connection() as conn:
@@ -4142,7 +4391,7 @@ def admin_proactive_heartbeat_overspeed(*, since_epoch: float = 0.0, days: int =
                       AND COALESCE(NULLIF(doc->>'job_kind',''), NULLIF(doc->>'wake_kind',''),
                                    NULLIF(doc->>'trigger',''), 'unknown')
                           NOT IN ('screen_watch','scene_change','screen_tick',
-                                  'broadcast_opened','heartbeat_broadcast_on')
+                                  'broadcast_opened','broadcast_closed','heartbeat_broadcast_on')
                       -- 哨兵只数「放行(admitted)」的心跳:①闸拦下的 throttled
                       -- skipped 是闸在正常工作,不能算——否则闸守得越好标得越红,
                       -- 与「出现即闸失效」的页面语义正好相反(codex review ④)。
@@ -4323,7 +4572,7 @@ def admin_events_overview(*, day: str = "", tz: str = "Asia/Shanghai") -> dict:
         FROM (
           SELECT l.user_id, COALESCE(l.doc->>'status','') AS status, {_JOB_DUR_SEC.replace('doc','l.doc')} AS dur,
             CASE
-              WHEN k.kind IN ('screen_watch','screen_tick','broadcast_opened','heartbeat_broadcast_on') THEN 'screen'
+              WHEN k.kind IN ('screen_watch','screen_tick','broadcast_opened','broadcast_closed','heartbeat_broadcast_on') THEN 'screen'
               WHEN k.kind IN ('perception_event','scene_change','photo_added','arrived_at_anchor','location','unlock_after_absence','scheduled_wake') THEN 'trigger'
               WHEN k.kind = 'presence' OR left(k.kind, 9) = 'heartbeat' THEN 'heartbeat'
               ELSE 'other'
@@ -4460,7 +4709,7 @@ def admin_events_by_user(category: str, *, limit: int = 400) -> list[dict]:
             FROM (
               SELECT l.user_id, l.ts, COALESCE(l.doc->>'status','') AS status, {dur_l} AS dur,
                 CASE
-                  WHEN k.kind IN ('screen_watch','screen_tick','broadcast_opened','heartbeat_broadcast_on') THEN 'screen'
+                  WHEN k.kind IN ('screen_watch','screen_tick','broadcast_opened','broadcast_closed','heartbeat_broadcast_on') THEN 'screen'
                   WHEN k.kind IN ('perception_event','scene_change','photo_added','arrived_at_anchor','location','unlock_after_absence','scheduled_wake') THEN 'trigger'
                   WHEN k.kind = 'presence' OR left(k.kind,9) = 'heartbeat' THEN 'heartbeat'
                   ELSE 'other'
@@ -4811,6 +5060,40 @@ def set_onboarding_route_strict(user_id: str, doc: dict) -> str | None:
                     )
     _mirror_persisted_blob(user_id, "onboarding_route", doc)
     return active_route_id
+
+
+def delete_onboarding_route_strict(user_id: str) -> bool:
+    """Delete the route selector and enforce its missing-as-resident state.
+
+    This is the exact inverse persistence boundary needed when compensation
+    restores a previously absent ``onboarding_route`` document.  The document
+    deletion and Model API route deactivation share the same advisory lock and
+    transaction as :func:`set_onboarding_route_strict`.
+    """
+    sql = (
+        "DELETE FROM user_blobs "
+        "WHERE user_id = %s AND kind = 'onboarding_route'"
+    )
+    with get_pool().connection() as conn:
+        with conn.transaction():
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT pg_advisory_xact_lock("
+                    "hashtextextended('onboarding-route:' || %s, 0))",
+                    (str(user_id),),
+                )
+                cur.execute(sql, (user_id,))
+                deleted = cur.rowcount > 0
+                cur.execute(
+                    "UPDATE model_api_routes "
+                    "SET is_active = FALSE, updated_at = now() "
+                    "WHERE user_id = %s AND is_active",
+                    (user_id,),
+                )
+    from tee_shadow import mirror
+
+    mirror.execute(sql, (user_id,))
+    return deleted
 
 
 def patch_proactive_settings_strict(
@@ -5427,7 +5710,14 @@ _hosted_runtime_config_lock_users: ContextVar[frozenset[str]] = ContextVar(
     "hosted_runtime_config_lock_users",
     default=frozenset(),
 )
-_hosted_runtime_config_connection_slots = threading.BoundedSemaphore(1)
+# Bound the number of long-lived, pool-external advisory-lock sessions without
+# serializing unrelated users behind one process-wide slot. Eight supports the
+# hosted-provider validation fan-out while remaining a small fixed addition to
+# each backend worker's ordinary connection pool budget.
+_HOSTED_RUNTIME_CONFIG_CONNECTION_SLOT_COUNT = 8
+_hosted_runtime_config_connection_slots = threading.BoundedSemaphore(
+    _HOSTED_RUNTIME_CONFIG_CONNECTION_SLOT_COUNT
+)
 _HOSTED_RUNTIME_CONFIG_LOCK_WAIT_SEC = 5.0
 
 
@@ -5440,10 +5730,12 @@ def hosted_runtime_config_mutation_lock(user_id: str):
     """Serialize one user's config mutation and runtime-generation rotation.
 
     The lock is session-level and pool-external because provider validation can
-    span a network call. A one-slot process-local semaphore is acquired *before*
+    span a network call. A bounded process-local semaphore is acquired *before*
     opening that connection, so a burst of settings requests waits in Python
-    rather than consuming one PostgreSQL session per waiter. Both the local and
-    cross-process waits are deadline-bounded. ContextVar reentrancy lets route
+    rather than consuming an unbounded PostgreSQL session per waiter. Different
+    users may use separate slots concurrently; the advisory lock remains the
+    authoritative per-user serializer. Both the local and cross-process waits
+    are deadline-bounded. ContextVar reentrancy lets route
     creation call route activation and lets setup call the runtime transition
     without trying to acquire the same advisory lock on a second connection.
     """
@@ -5696,7 +5988,8 @@ def list_agent_runtime_enabled_users() -> list[dict]:
                   r.model AS model,
                   c.base_url AS base_url,
                   c.supports_responses AS supports_responses,
-                  COALESCE(r.reasoning_effort, '') AS reasoning_effort
+                  COALESCE(r.reasoning_effort, '') AS reasoning_effort,
+                  r.vision_test_status AS vision_test_status
                 FROM model_api_routes r
                 JOIN model_api_credentials c ON c.id = r.credential_id
                 WHERE r.is_active
@@ -5720,8 +6013,10 @@ def list_agent_runtime_enabled_users() -> list[dict]:
         return [{"user_id": uid, "driver": driver, "provider": provider,
                  "model": model, "base_url": base_url,
                  "supports_responses": bool(supports_responses),
-                 "reasoning_effort": reasoning_effort}
-                for uid, driver, provider, model, base_url, supports_responses, reasoning_effort in rows]
+                 "reasoning_effort": reasoning_effort,
+                 "vision_test_status": str(vision_test_status or "untested")}
+                for uid, driver, provider, model, base_url, supports_responses,
+                reasoning_effort, vision_test_status in rows]
     except Exception as e:
         log.error("[db] list_agent_runtime_enabled_users failed: %s", e)
         return []
@@ -12328,6 +12623,33 @@ def model_api_active_route_version(user_id: str) -> dict | None:
         return None
 
 
+def model_api_active_route_vision_verdict(user_id: str) -> dict | None:
+    """Return the active route's pixel-probe verdict without its key envelope."""
+    try:
+        with get_pool().connection() as conn:
+            row = conn.execute(
+                "SELECT id::text, vision_test_status, "
+                "to_char(updated_at AT TIME ZONE 'UTC',"
+                "  'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') "
+                "FROM model_api_routes WHERE user_id=%s AND is_active",
+                (user_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return {
+            "id": str(row[0]),
+            "vision_test_status": str(row[1] or "untested"),
+            "updated_at": str(row[2] or ""),
+        }
+    except Exception as e:
+        log.error(
+            "[db] model_api_active_route_vision_verdict(%s) failed: %s",
+            user_id,
+            e,
+        )
+        return None
+
+
 def model_api_vision_route(user_id: str) -> dict | None:
     """Return the dedicated vision route with its encrypted credential."""
     try:
@@ -12801,6 +13123,37 @@ def frame_exists(user_id: str, frame_id: str) -> bool:
         return False
 
 
+def perception_broadcast_meta(user_id: str) -> dict:
+    """Return only the broadcast state/value cells needed for screen health.
+
+    The perception_state blob contains many unrelated user readings. Screen
+    liveness must not load or expose that document just to compare two
+    metadata timestamps, so this SQL projects only the four scalar fields.
+    """
+    try:
+        with get_pool().connection() as conn:
+            row = conn.execute(
+                "SELECT doc->'broadcast_state'->>'v', "
+                "       doc->'broadcast_state'->>'ts', "
+                "       doc->'broadcast_active'->>'v', "
+                "       doc->'broadcast_active'->>'ts' "
+                "FROM user_blobs "
+                "WHERE user_id = %s AND kind = 'perception_state'",
+                (user_id,),
+            ).fetchone()
+    except Exception as e:
+        log.error("[db] perception_broadcast_meta(%s) failed: %s", user_id, e)
+        return {}
+    if row is None:
+        return {}
+    return {
+        "broadcast_state": row[0],
+        "broadcast_state_ts": row[1],
+        "broadcast_active": row[2],
+        "broadcast_active_ts": row[3],
+    }
+
+
 def frame_get(user_id: str, frame_id: str) -> dict | None:
     """Return the full v1 envelope, reconstructing ``body_ct`` from R2 for
     offloaded rows (``body_key`` set) and returning the inline ``doc`` for
@@ -13160,10 +13513,15 @@ def log_prune_older_than(user_id: str, stream: str, cutoff_epoch: float) -> None
 
 
 def delete_user_data(user_id: str) -> None:
-    """Redundant DB belt: per-user 行现由 delete_user 的 CASCADE 原子清净
-    (0011)。仍被 content/content_core.py 的销号(account/reset)兜底路径调用；
-    删账号主路径不再依赖它做 R2。"""
+    """Redundant DB belt for CASCADE-owned data and explicit RDS controls.
+
+    Most per-user rows are deleted atomically by ``delete_user`` through the
+    0011 foreign keys.  RDS-only control tables without a users FK are listed
+    explicitly here.  Account reset/admin deletion retain this as a best-effort
+    cleanup belt; the authoritative delete path does not rely on it for R2.
+    """
     tables = (
+        "v2_user_allowlist",
         "v2_usage_daily_dimensions",
         "v2_usage_daily_users",
         "v2_conversation_summary_segments",
@@ -13199,6 +13557,7 @@ def delete_user_data(user_id: str) -> None:
     # added upstream after the TEE 19-table baseline; not replicated).
     tee_table_for = {"frame_envelopes": "frames"}
     _no_tee_tables = {
+        "v2_user_allowlist",
         "v2_usage_daily_dimensions",
         "v2_usage_daily_users",
         "v2_conversation_summary_segments",
@@ -13669,6 +14028,44 @@ def upsert_runtime_allowlist(user_id: str, desired: str, *,
             """,
             (user_id, desired, updated_by, note),
         )
+
+
+def get_runtime_allowlist_entry(user_id: str) -> dict | None:
+    with get_pool().connection() as conn:
+        row = conn.execute(
+            "SELECT user_id,desired,updated_by,note "
+            "FROM v2_user_allowlist WHERE user_id=%s",
+            (str(user_id),),
+        ).fetchone()
+    if row is None:
+        return None
+    return {
+        "user_id": str(row[0]),
+        "desired": str(row[1]),
+        "updated_by": str(row[2] or ""),
+        "note": str(row[3] or ""),
+    }
+
+
+def insert_runtime_allowlist_if_absent(
+    user_id: str,
+    desired: str,
+    *,
+    updated_by: str,
+    note: str,
+) -> bool:
+    if desired not in _RUNTIME_ALLOWLIST_DESIRED:
+        raise ValueError(
+            f"desired must be one of {sorted(_RUNTIME_ALLOWLIST_DESIRED)}"
+        )
+    with get_pool().connection() as conn:
+        cur = conn.execute(
+            "INSERT INTO v2_user_allowlist "
+            "(user_id,desired,updated_at,updated_by,note) "
+            "VALUES (%s,%s,now(),%s,%s) ON CONFLICT (user_id) DO NOTHING",
+            (str(user_id), desired, updated_by, note),
+        )
+    return cur.rowcount > 0
 
 
 def delete_runtime_allowlist(user_id: str) -> bool:

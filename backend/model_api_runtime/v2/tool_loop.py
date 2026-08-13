@@ -3,15 +3,34 @@ all side effects injected. One loop for every model — no is_official branch.""
 
 from __future__ import annotations
 from dataclasses import dataclass
+import inspect
 import json
 import posixpath
 import re
 from provider_types import ProviderResponse, ToolExchange, ToolResult
 from capabilities import registry as cap_registry
+from capabilities import result_budget
 from capabilities import tool_schema
 from model_api_runtime.v2 import prompt_frontier
 from model_api_runtime.v2 import provenance
 import provider_client
+
+
+def _has_tagged_image_message(messages, tag_key: str) -> bool:
+    return bool(tag_key) and any(
+        isinstance(message, dict) and message.get(tag_key) is True
+        for message in messages
+    )
+
+
+def _without_tagged_image_messages(messages, tag_key: str) -> list:
+    if not tag_key:
+        return list(messages)
+    return [
+        message
+        for message in messages
+        if not (isinstance(message, dict) and message.get(tag_key) is True)
+    ]
 
 _CATALOG = None  # built lazily/once
 _SEARCH_RESULT_URL_RE = re.compile(r'"url"\s*:\s*("(?:\\.|[^"\\])*")')
@@ -272,13 +291,80 @@ def _result_quotas(lengths: list[int], batch_cap: int) -> list[int]:
     return quotas
 
 
+def _batch_quotas(contents: list[str], policies: list, batch_cap: int) -> list[int]:
+    """Water-fill the batch budget after reserving every atomic result in full.
+
+    With no atomic result in the batch this is exactly ``_result_quotas`` over
+    the unmodified ``batch_cap`` — the pre-existing behavior, unchanged.
+
+    With one present: the batch budget rises by its ``extra_batch_budget``
+    (otherwise a 4500-char fetch would leave seven siblings ~500 each), the
+    atomic result keeps its full length, and only the remainder is water-filled
+    among the siblings.  Reserving can exhaust the remainder in a pathological
+    batch; siblings then get 0, which is the same starvation the plain
+    water-fill already produces — never a sliced atomic result.
+    """
+    atomic = [
+        index
+        for index, policy in enumerate(policies)
+        if policy is not None and policy.atomic_json
+    ]
+    if not atomic:
+        return _result_quotas([len(content) for content in contents], batch_cap)
+    budget = batch_cap + sum(
+        policies[index].extra_batch_budget for index in atomic
+    )
+    reserved = sum(len(contents[index]) for index in atomic)
+    shared = [index for index in range(len(contents)) if index not in set(atomic)]
+    shared_quotas = _result_quotas(
+        [len(contents[index]) for index in shared], max(0, budget - reserved)
+    )
+    quotas = [0] * len(contents)
+    for index in atomic:
+        quotas[index] = len(contents[index])
+    for index, quota in zip(shared, shared_quotas):
+        quotas[index] = quota
+    return quotas
+
+
 def _normalize_tool_results(
     results: list[ToolResult],
     *,
     per_result_cap: int,
     batch_cap: int,
 ) -> list[ToolResult]:
-    """Apply provider-neutral per-call and aggregate prompt budgets in call order."""
+    """Apply provider-neutral per-call and aggregate prompt budgets in call order.
+
+    Results whose trusted metadata declares an ``atomic_json`` budget policy
+    (``capabilities/result_budget.py``) are reserved at full length before the
+    water-fill runs, and the batch budget rises by that policy's
+    ``extra_batch_budget``.  They are never string-truncated: their producer
+    already shrank them structurally, and cutting a JSON payload mid-string
+    makes the whole result unparseable for the model.  An atomic result that
+    arrives *over* its own cap is a producer contract violation, not something
+    to slice: it is replaced wholesale by one short, valid error result before
+    the water-fill sees it, so nothing downstream can reserve or cut a broken
+    payload.  (``worker`` rejects the configurations that would make this
+    reachable at start-up; this is the defence-in-depth half.)
+
+    A batch with no such result takes exactly the path it always took — same
+    per-result cap, same batch cap, same quotas, byte for byte.
+    """
+    policies = [result_budget.for_metadata(result.metadata) for result in results]
+    results = [
+        ToolResult(
+            call_id=result.call_id,
+            content=result_budget.OVERFLOW_RESULT_CONTENT,
+            metadata=result.metadata,
+        )
+        if (
+            policy is not None
+            and policy.atomic_json
+            and len(result.content) > policy.result_cap
+        )
+        else result
+        for result, policy in zip(results, policies)
+    ]
     markers = []
     for result in results:
         metadata = result.metadata or {}
@@ -294,12 +380,14 @@ def _normalize_tool_results(
         else:
             markers.append(_RESULT_TRUNCATION_MARKER)
     individually_capped = [
-        _truncate_result_content(result.content, per_result_cap, marker=marker)
-        for result, marker in zip(results, markers)
+        _truncate_result_content(
+            result.content,
+            policy.result_cap if policy is not None else per_result_cap,
+            marker=marker,
+        )
+        for result, policy, marker in zip(results, policies, markers)
     ]
-    quotas = _result_quotas(
-        [len(content) for content in individually_capped], batch_cap
-    )
+    quotas = _batch_quotas(individually_capped, policies, batch_cap)
     return [
         ToolResult(
             call_id=result.call_id,
@@ -421,6 +509,9 @@ async def run_tool_loop(
     on_file_requirement_changed=None,
     outbound_blocking_read_tool_names=None,
     outbound_blocking_read_tool_predicate=None,
+    initial_outbound_tools_blocked: bool = False,
+    tagged_image_message_key: str = "",
+    on_tagged_images_rejected=None,
     max_tool_calls_per_round: int = DEFAULT_MAX_TOOL_CALLS_PER_ROUND,
     max_tool_calls_per_turn: int = DEFAULT_MAX_TOOL_CALLS_PER_TURN,
     tool_result_char_cap: int = DEFAULT_TOOL_RESULT_CHAR_CAP,
@@ -540,7 +631,8 @@ async def run_tool_loop(
     empty_response_retry_instruction = ""
     external_content_seen = False
     mutation_outcome_unknown = False
-    outbound_tools_blocked = False
+    outbound_tools_blocked = bool(initial_outbound_tools_blocked)
+    tagged_image_fallback_active = False
     file_requirement_message_state = [
         dict(message)
         for message in file_requirement_messages
@@ -744,11 +836,32 @@ async def run_tool_loop(
         )
         if retry_instructions:
             messages = _with_system_suffix(messages, retry_instructions)
-        # Reserve the final provider attempt for a tools-disabled terminal reply.
-        # A 400/422 tool-schema rejection or repeated malformed call also forces
-        # this same one-shot fallback; the fallback itself is never retried.
+        # Reserve the final provider attempt for a terminal reply. Providers with
+        # a real tool_choice=none keep schemas referenced by their native history;
+        # other wires omit tools as before. A 400/422 schema rejection or repeated
+        # malformed call also forces this bounded fallback.
         terminal_text_round = force_text_fallback or attempts == max_calls - 1
-        if terminal_text_round:
+        historical_tool_names = {
+            call.name
+            for item in transcript
+            if isinstance(item, ToolExchange)
+            for call in item.calls
+            if call.name
+        }
+        provider_name = str(
+            getattr(provider_config, "provider", "") or ""
+        ).strip().lower()
+        terminal_schema_guard = (
+            terminal_text_round
+            and bool(historical_tool_names)
+            and provider_name
+            in {"anthropic", "openrouter", "openai_compatible", "deepseek"}
+        )
+        if terminal_schema_guard:
+            tools = [
+                spec for spec in turn_catalog if spec.name in historical_tool_names
+            ] or None
+        elif terminal_text_round:
             tools = None
         elif (
             external_content_seen or mutation_outcome_unknown or outbound_tools_blocked
@@ -791,15 +904,6 @@ async def run_tool_loop(
             tools = [spec for spec in turn_catalog if spec.name not in blocked_tools]
         else:
             tools = turn_catalog
-        if tools is not None and completed_memory_discovery_tools:
-            # Each discovery mode may run once. A keyword search can legitimately
-            # miss while memory_index still finds the user's saved cards, so do
-            # not suppress both after only one observation.
-            tools = [
-                spec
-                for spec in tools
-                if spec.name not in completed_memory_discovery_tools
-            ]
         requirement_already_met = (
             not file_delivery_required
             or (
@@ -809,7 +913,12 @@ async def run_tool_loop(
             )
         )
         forced_delivery_tool = ""
-        if tools is not None and file_delivery_required and not requirement_already_met:
+        if (
+            not terminal_text_round
+            and tools is not None
+            and file_delivery_required
+            and not requirement_already_met
+        ):
             # Keep the recovery path narrow enough for weaker tool-using models.
             tools = [spec for spec in tools if spec.name in _FILE_DELIVERY_TOOLS]
             if file_delivery_recovery_needed:
@@ -820,12 +929,18 @@ async def run_tool_loop(
                 )
                 tools = [spec for spec in tools if spec.name == forced_delivery_tool]
         tail_window = None
+        required_schema_names = (
+            historical_tool_names
+            if terminal_schema_guard
+            else completed_memory_discovery_tools
+        )
         adaptive_planner = getattr(build_messages, "plan_provider_round", None)
         try:
             if callable(adaptive_planner):
                 messages, frontier_plan, tail_window = adaptive_planner(
                     transcript=list(transcript),
                     tools=tools,
+                    required_tool_names=required_schema_names,
                     model_limit=model_prompt_limit,
                     output_reserve_tokens=prompt_output_reserve_tokens,
                     safety_margin_tokens=prompt_safety_margin_tokens,
@@ -838,6 +953,7 @@ async def run_tool_loop(
                     model_limit=model_prompt_limit,
                     messages=messages,
                     tools=tools,
+                    required_tool_names=required_schema_names,
                     output_reserve_tokens=prompt_output_reserve_tokens,
                     safety_margin_tokens=prompt_safety_margin_tokens,
                     utf8_bytes_per_token=prompt_estimator_utf8_bytes_per_token,
@@ -856,12 +972,21 @@ async def run_tool_loop(
             except Exception:
                 pass
         if "tool_schemas" in frontier_plan.omitted_optional_components:
-            # Schemas are atomic and optional: omitting the whole catalog is a
-            # valid weak-model/text-only degradation. Required conversation and
-            # native tool exchanges are never clipped to make room.
-            tools = None
+            # Once a memory discovery result is present in the required native
+            # transcript, keep that matching schema even when the remaining
+            # optional catalog no longer fits. This avoids a provider-visible
+            # call/result history whose tool definition has disappeared.
+            tools = [
+                spec
+                for spec in (tools or [])
+                if spec.name in required_schema_names
+            ] or None
         if before_provider_call is not None:
             before_provider_call()
+        if tagged_image_fallback_active:
+            messages = _without_tagged_image_messages(
+                messages, tagged_image_message_key
+            )
         await _trajectory(
             "provider_request",
             {
@@ -875,15 +1000,19 @@ async def run_tool_loop(
         )
         attempts += 1
         _progress("provider_start")
+        provider_error: BaseException | None = None
         try:
             # V2 owns the lane-specific empty-response policy. Let the provider
             # parser return any structurally valid success so an abnormal HTTP
             # 200 is not retried as though it were a transient network failure.
             provider_kwargs = {"tools": tools, "require_reply": False}
+            if terminal_schema_guard and tools is not None:
+                provider_kwargs["tool_choice"] = "none"
             if allow_image_output and not terminal_text_round:
                 provider_kwargs["allow_image_output"] = True
             if (
                 forced_delivery_tool
+                and not terminal_text_round
                 and tools is not None
                 and str(getattr(provider_config, "provider", "")).strip().lower()
                 == "openrouter"
@@ -930,6 +1059,58 @@ async def run_tool_loop(
                 **provider_kwargs,
             )
         except Exception as exc:
+            tagged_image_rejected = (
+                not tagged_image_fallback_active
+                and _has_tagged_image_message(messages, tagged_image_message_key)
+                and getattr(exc, "status_code", None) in {400, 404, 415, 422}
+            )
+            if tagged_image_rejected:
+                await _trajectory(
+                    "provider_error",
+                    {
+                        "round": attempts,
+                        "error_class": type(exc).__name__,
+                        "tools_enabled": tools is not None,
+                        "tagged_images_rejected": True,
+                    },
+                )
+                add_usage(None)
+                tagged_image_fallback_active = True
+                messages = _without_tagged_image_messages(
+                    messages, tagged_image_message_key
+                )
+                await _trajectory(
+                    "provider_request",
+                    {
+                        "round": attempts,
+                        "messages": messages,
+                        "tools": tools,
+                        "forced_tool": forced_delivery_tool,
+                        "retry_without_tagged_images": True,
+                    },
+                )
+                try:
+                    result = await provider_client.reliable_chat_completion_async(
+                        provider_config,
+                        messages,
+                        max_attempts=1,
+                        base_delay_sec=0.2,
+                        max_delay_sec=1.0,
+                        **provider_kwargs,
+                    )
+                    # A successful text-only retry confirms that the rejected
+                    # part was our tagged image block (important for ambiguous
+                    # provider statuses such as OpenRouter's HTTP 404).
+                    if on_tagged_images_rejected is not None:
+                        callback_result = on_tagged_images_rejected(exc)
+                        if inspect.isawaitable(callback_result):
+                            await callback_result
+                except Exception as retry_exc:
+                    provider_error = retry_exc
+            else:
+                provider_error = exc
+        if provider_error is not None:
+            exc = provider_error
             attempt_trace = provider_client.runtime_provider_attempt_trace(exc)
             await _trajectory(
                 "provider_error",
@@ -1011,7 +1192,7 @@ async def run_tool_loop(
                 )
                 _progress("provider_retry_boundary")
                 continue
-            raise
+            raise provider_error
         _progress("provider_complete")
         add_usage(result.get("usage"))
         raw_has_usable_output = bool(
@@ -1299,24 +1480,29 @@ async def run_tool_loop(
         # Provider media is terminal output. Do not silently discard or retain
         # its large inline payload when a broken relay also invents function
         # calls in the same turn; fall back once with every tool disabled.
-        malformed = bool(pr.media) or any(
-            not tc.id
-            or not tc.name
-            or not tc.args_ok
-            or (
-                tc.name not in offered_names
-                and tc.name not in completed_memory_discovery_tools
+        malformed = (
+            (terminal_text_round and bool(pr.tool_calls))
+            or bool(pr.media)
+            or any(
+                not tc.id
+                or not tc.name
+                or not tc.args_ok
+                or (
+                    tc.name not in offered_names
+                    and tc.name not in completed_memory_discovery_tools
+                )
+                or (
+                    external_content_seen
+                    and tc.name == "web_fetch"
+                    and str(tc.args.get("url") or "").strip()
+                    not in allowed_fetch_urls
+                )
+                or (
+                    tc.name not in mcp_names
+                    and tool_schema.validate_tool_args(tc.name, tc.args) is not None
+                )
+                for tc in pr.tool_calls
             )
-            or (
-                external_content_seen
-                and tc.name == "web_fetch"
-                and str(tc.args.get("url") or "").strip() not in allowed_fetch_urls
-            )
-            or (
-                tc.name not in mcp_names
-                and tool_schema.validate_tool_args(tc.name, tc.args) is not None
-            )
-            for tc in pr.tool_calls
         )
         image_reply_calls = [
             tc for tc in pr.tool_calls if tc.name == tool_schema.IMAGE_REPLY_TOOL
@@ -1513,14 +1699,14 @@ async def run_tool_loop(
                 if not media:
                     raise RuntimeError("generate_image returned no media")
             except Exception as exc:
-                await _tool_event(
-                    tc, "tool_call_error", {"error": type(exc).__name__}
-                )
                 # 生图失败**不打断这一轮** —— 把结构化失败交回给伴侣,让它自己
                 # 决定怎么跟用户说(换个描述再试、或者老实讲这次没画成)。
                 # 原来这里直接 raise,整轮炸掉:用户既没有图、也没有一句解释,
                 # 而伴侣根本不知道发生过什么。工具失败是它该知道的事实,不是
                 # runtime 替它隐藏的意外。
+                image_error_code = str(
+                    getattr(exc, "error_code", "") or "image_generation_failed"
+                )[:64]
                 image_result = ToolResult(
                     call_id=tc.id,
                     content=(
@@ -1529,6 +1715,7 @@ async def run_tool_loop(
                         + "). 图没有生成。请如实告诉用户,或换一个更清楚的画面"
                         "描述再调一次;不要声称图已经生成。"
                     ),
+                    metadata={"image_generation_result_code": image_error_code},
                 )
                 reply_results[tc.id] = image_result
                 await _tool_event(

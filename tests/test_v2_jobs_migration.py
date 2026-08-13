@@ -59,20 +59,36 @@ def _migration_0075_module():
     )
 
 
-def test_image_voice_and_plaintext_are_merged_into_the_single_installed_head():
+def test_voice_shape_and_wake_indexes_are_merged_into_single_installed_head():
     """A deploy missing the durable baseline migration must fail before rollout."""
     backend = Path(__file__).parent.parent / "backend"
     cfg = Config(str(backend / "alembic.ini"))
     cfg.set_main_option("script_location", str(backend / "alembic"))
     script = ScriptDirectory.from_config(cfg)
 
-    assert script.get_heads() == ["0083_merge_image_voice_plaintext"]
+    assert script.get_heads() == ["0086_merge_voice_wake"]
+    merge = script.get_revision("0086_merge_voice_wake")
+    assert set(merge.down_revision) == {
+        "0085_voice_transcript_shapes",
+        "0084_wake_support_indexes",
+    }
+    voice_shape = script.get_revision("0085_voice_transcript_shapes")
+    assert len(voice_shape.revision) <= 32
+    assert voice_shape.down_revision == "0084_merge_screen_plaintext"
+    assert "transcript_envelope ? 'body'" in voice_shape.module._shape_check(
+        "transcript_envelope"
+    )
     assert set(
-        script.get_revision("0083_merge_image_voice_plaintext").down_revision
+        script.get_revision("0084_merge_screen_plaintext").down_revision
     ) == {
-        "0082_merge_image_voice",
+        "0083_screen_chat_frames",
         "0079_merge_admin_plaintext",
     }
+    migration = script.get_revision("0084_wake_support_indexes")
+    assert migration.down_revision == "0083_screen_chat_frames"
+    assert script.get_revision("0083_screen_chat_frames").down_revision == (
+        "0082_merge_image_voice"
+    )
     assert set(script.get_revision("0079_merge_admin_plaintext").down_revision) == {
         "0078_admin_dashboard_indexes",
         "0078_merge_plaintext_perception",
@@ -93,6 +109,8 @@ def test_image_voice_and_plaintext_are_merged_into_the_single_installed_head():
     migration = script.get_revision("0077_perception_signal_state_v2")
     assert migration.down_revision == "0076_plaintext_job_exclusivity"
 
+
+def test_perception_signal_schema_is_installed_at_the_merged_head():
     with db.get_pool().connection() as conn:
         installed_head = conn.execute(
             "SELECT version_num FROM alembic_version"
@@ -130,7 +148,7 @@ def test_image_voice_and_plaintext_are_merged_into_the_single_installed_head():
             "AND tc.table_name='perception_signal_state_v2'"
         ).fetchone()
 
-    assert installed_head == ("0083_merge_image_voice_plaintext",)
+    assert installed_head == ("0086_merge_voice_wake",)
     assert columns == {
         "user_id": ("text", "NO"),
         "signal": ("text", "NO"),
@@ -195,7 +213,7 @@ def test_0075_usage_rollup_schema_is_installed_without_source_backfill():
             "AND tgrelid='v2_turn_metrics'::regclass"
         ).fetchone()[0]
 
-    assert heads == {"0083_merge_image_voice_plaintext"}
+    assert heads == {"0086_merge_voice_wake"}
     assert tables == {
         "v2_usage_daily_users",
         "v2_usage_daily_dimensions",

@@ -2,9 +2,34 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from alembic.config import Config
+from alembic.script import ScriptDirectory
+
 
 ROOT = Path(__file__).parent.parent
 WORKFLOW = ROOT / ".github" / "workflows" / "ci.yml"
+
+
+def test_tee_migrate_has_one_head_after_voice_primary_alignment():
+    cfg = Config(str(ROOT / "backend" / "alembic_tee" / "alembic.ini"))
+    cfg.set_main_option("script_location", str(ROOT / "backend" / "alembic_tee"))
+    script = ScriptDirectory.from_config(cfg)
+
+    assert script.get_heads() == ["0017_voice_primary_alignment"]
+    assert (
+        script.get_revision("0017_voice_primary_alignment").down_revision
+        == "0016_merge_screen_pre_perception"
+    )
+    assert set(
+        script.get_revision("0016_merge_screen_pre_perception").down_revision
+    ) == {
+        "0014_screen_chat_frames",
+        "0015_merge_pre_perception",
+    }
+    migration = script.get_revision("0017_voice_primary_alignment").module
+    assert "'[\"0017_voice_primary_alignment\"]'::jsonb" in (
+        migration._UPDATE_PREPARED_HEAD
+    )
 
 
 def _job(source: str, name: str, next_name: str) -> str:

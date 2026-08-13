@@ -150,7 +150,10 @@ def test_v2_only_reconciles_every_runnable_shape_idempotently(monkeypatch):
     for user_id in (missing, resident, already_v2, split):
         mode, state, _generation = db.get_hosted_runtime_control_strict(user_id)
         assert (mode, state) == ("db_action_v2", "v2")
-        assert jobs_store.get_wake_schedule(user_id) is not None
+        schedule = jobs_store.get_wake_schedule(user_id)
+        assert schedule is not None
+        assert schedule["next_heartbeat_at"] is not None
+        assert schedule["next_screen_watch_at"] is not None
     assert db.get_hosted_runtime_control_strict(split)[2] == 13
     assert db.get_hosted_runtime_control_strict(failed)[:2] == (
         "resident_cli",
@@ -177,10 +180,9 @@ def test_v2_schedule_seed_failure_never_flips_ownership(monkeypatch):
     user_id = _seed_runnable("policy_seed_failure")
     _clear_control(user_id)
     monkeypatch.setenv(config_store.HOSTED_RUNTIME_POLICY_ENV, "v2_only")
-    monkeypatch.setattr(jobs_store, "get_wake_schedule", lambda _uid: None)
     monkeypatch.setattr(
         jobs_store,
-        "upsert_wake_schedule",
+        "seed_missing_wake_clocks",
         lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("schedule down")),
     )
 
@@ -302,6 +304,61 @@ def test_config_lock_waiters_do_not_open_one_db_session_each(monkeypatch):
     assert not holder_thread.is_alive()
     assert all(not thread.is_alive() for thread in waiters)
     assert waiter_errors == []
+
+
+def test_config_mutations_for_two_users_validate_concurrently(monkeypatch):
+    """Unrelated users must not share a process-wide single config slot."""
+    from hosted import setup_core
+
+    assert db._HOSTED_RUNTIME_CONFIG_CONNECTION_SLOT_COUNT >= 2
+    monkeypatch.setattr(db, "_HOSTED_RUNTIME_CONFIG_LOCK_WAIT_SEC", 1.0)
+    validation_barrier = threading.Barrier(2)
+    results: list[tuple[dict, int]] = []
+    errors: list[BaseException] = []
+
+    class FakeResult:
+        def fetchone(self):
+            return (True,)
+
+    class FakeConnection:
+        def execute(self, *_args, **_kwargs):
+            return FakeResult()
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr(db, "listen_connection", FakeConnection)
+
+    @setup_core._serialized_model_api_mutation
+    def configure(store):
+        # This represents the provider network validation inside every config
+        # endpoint. With the old global one-slot semaphore, the first request
+        # blocks here until the barrier breaks and neither request succeeds.
+        validation_barrier.wait(timeout=0.5)
+        return {"status": "configured", "user_id": store.user_id}, 200
+
+    def run(user_id: str) -> None:
+        try:
+            results.append(configure(type("Store", (), {"user_id": user_id})()))
+        except BaseException as exc:
+            errors.append(exc)
+
+    threads = [
+        threading.Thread(target=run, args=(f"u_config_{index}",), daemon=True)
+        for index in range(2)
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=2)
+
+    assert errors == []
+    assert all(not thread.is_alive() for thread in threads)
+    assert sorted(status for _body, status in results) == [200, 200]
+    assert {body["user_id"] for body, _status in results} == {
+        "u_config_0",
+        "u_config_1",
+    }
 
 
 def test_config_lock_timeout_is_visible_503(monkeypatch):

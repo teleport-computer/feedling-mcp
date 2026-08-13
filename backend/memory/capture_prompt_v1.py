@@ -23,6 +23,7 @@ from identity.user_naming import _naming_rule, sanitize_user_name
 from memory.card_text import (
     build_format_retry_prompt,
     card_text_rejection,
+    extract_json_block,
     format_error,
     sanitize_card_labels,
 )
@@ -74,8 +75,9 @@ _CAPTURE_PROMPT_TEMPLATE = """你是 {ai_name}——{user_name} 的伴侣。你�
      只有专有名词/品牌名/TA 的原话才保留原文。
    · 称呼：{naming_rule}这些卡是 TA 会亲眼看到的、你写下的记忆——
      写进卡里的字段（bucket/threads/summary/content）永远不要用"用户"/"user"
-     这类系统称谓，也不要用「TA」指代对方——「TA」只是这份指令里的标记，
-     不是你对 TA 本人的称呼（上面的对话转写用的是真名，名字未知时是「对方」）。
+     这类系统称谓，也不要用「TA」指代本人——「TA」只是这份指令里的标记，
+     不是你对 TA 本人的称呼。转写里的说话人标签同理：有名字时是真名，
+     没名字时是「对方」，那只是标签——卡里怎么称呼，按上面那条规则判断。
      卡里的字段最好整个不出现「用户」/"user"这两个词：如果你要写的确实是产品术语，
      就去掉这个前缀（写「界面」「留存」「满意度」，而不是「用户界面」「用户留存」）——
      这样就不会有人分不清那个「用户」说的是 TA 还是 TA 的客户。
@@ -120,32 +122,6 @@ CAPTURE_TYPES = ("event", "fact", "quote", "moment")
 _DEFAULT_CAPTURE_TYPE = "event"
 
 
-def _extract_json_block(raw: str) -> str:
-    """Pull the first balanced {...} JSON object out of an agent reply.
-
-    Agents sometimes wrap JSON in prose or a ```json fence despite the
-    instruction. Be forgiving: find the outermost balanced braces.
-    """
-    text = (raw or "").strip()
-    if text.startswith("```"):
-        # strip a leading ```json / ``` fence and its closing fence
-        text = text.split("```", 2)[1] if text.count("```") >= 2 else text.strip("`")
-        if text.lstrip().lower().startswith("json"):
-            text = text.lstrip()[4:]
-    start = text.find("{")
-    if start < 0:
-        return ""
-    depth = 0
-    for i in range(start, len(text)):
-        if text[i] == "{":
-            depth += 1
-        elif text[i] == "}":
-            depth -= 1
-            if depth == 0:
-                return text[start : i + 1]
-    return ""
-
-
 def _clamp01(value) -> float:
     try:
         f = float(value)
@@ -175,7 +151,7 @@ def parse_capture_cards(
     """
     import json
 
-    block = _extract_json_block(raw)
+    block = extract_json_block(raw)
     if not block:
         return [], "no_json_object"
     try:

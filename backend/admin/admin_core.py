@@ -206,7 +206,8 @@ def compose_system_verdict(imports: dict | None, chat: dict | None) -> dict:
 
 
 _HOME_PAGE_BUILDERS = (
-    "queue", "pulse", "feed", "cost", "soft_verdicts", "funnel", "imports", "chat",
+    "queue", "pulse", "feed", "cost", "soft_verdicts", "pulse_story", "funnel",
+    "imports", "chat",
 )
 _VERDICTS_BUILDERS = ("queue", "pulse", "soft_verdicts", "imports", "chat")
 
@@ -224,6 +225,11 @@ def _run_home_builders(names: tuple[str, ...]) -> dict[str, dict | None]:
         "soft_verdicts": (
             "admin home soft verdicts query failed",
             db.admin_home_soft_verdicts,
+            {},
+        ),
+        "pulse_story": (
+            "admin home pulse story query failed",
+            db.admin_home_pulse_story,
             {},
         ),
         "funnel": (
@@ -262,6 +268,7 @@ def _build_home_page() -> str:
         results["feed"],
         results["cost"],
         results["funnel"],
+        story=results["pulse_story"],
     )
 
 
@@ -815,7 +822,7 @@ def set_runtime_mode(user_id: str, mode: str) -> tuple[dict, int]:
             # dormant because every producer is mode-filtered; the reverse order
             # creates a real window where the resident is reaped but no V2 wake
             # schedule exists.
-            jobs_store.upsert_wake_schedule(user_id, next_heartbeat_at=time.time())
+            jobs_store.seed_missing_wake_clocks(user_id, due_at=time.time())
         except Exception as e:  # noqa: BLE001 — do not report a half-ready flip
             return {"error": "v2_schedule_seed_failed", "detail": str(e)[:160]}, 503
     try:
@@ -837,13 +844,18 @@ def get_runtime_mode(user_id: str) -> tuple[dict, int]:
 
 
 def set_runtime_allowlist(user_id: str, desired: str, *, note: str = "") -> tuple[dict, int]:
-    if desired == "remove":
-        removed = db.delete_runtime_allowlist(user_id)
-        return {"user_id": user_id, "removed": removed}, 200
     try:
-        db.upsert_runtime_allowlist(user_id, desired, updated_by="admin", note=note)
+        with db.hosted_runtime_config_mutation_lock(user_id):
+            if desired == "remove":
+                removed = db.delete_runtime_allowlist(user_id)
+                return {"user_id": user_id, "removed": removed}, 200
+            db.upsert_runtime_allowlist(
+                user_id, desired, updated_by="admin", note=note
+            )
     except ValueError as e:
         return {"error": str(e)}, 400
+    except Exception:
+        return {"error": "runtime_control_unavailable"}, 503
     return {"user_id": user_id, "desired": desired}, 200
 
 

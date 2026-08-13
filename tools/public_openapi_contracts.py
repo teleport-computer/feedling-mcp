@@ -1448,7 +1448,15 @@ COMPONENT_SCHEMAS: dict[str, dict[str, Any]] = {
             "tool_name": {"type": "string", "maxLength": 120},
             "state": {"type": "string", "enum": ["running", "success", "failure"]},
             "duration_ms": {"type": "number", "minimum": 0},
-            "result_code": {"type": "string", "maxLength": 64},
+            "result_code": {
+                "type": "string",
+                "maxLength": 64,
+                "description": (
+                    "Display-safe result token. Failed generate_image events "
+                    "preserve an allowlisted image_generation_* code; result "
+                    "bodies are never included."
+                ),
+            },
             "memory_count": {"type": "integer", "minimum": 0, "maximum": 1000},
             "memory_categories": {
                 "type": "array",
@@ -1873,6 +1881,50 @@ COMPONENT_SCHEMAS: dict[str, dict[str, Any]] = {
             }
         },
     },
+    "McpServerRuntimeStatus": {
+        "type": "object",
+        "required": ["last_kind", "last_at", "recent_ok", "recent_total"],
+        "properties": {
+            "last_kind": {
+                "type": "string",
+                "pattern": "^[a-z0-9_]{1,48}$",
+                "description": (
+                    "Latest content-free Hosted Runtime V2 load outcome. "
+                    "available means the server catalog loaded successfully; "
+                    "other stable kinds describe why it was not ready. Clients "
+                    "must tolerate future kinds."
+                ),
+            },
+            "last_at": {
+                "type": "number",
+                "exclusiveMinimum": 0,
+                "description": "Unix epoch seconds of the latest observation.",
+            },
+            "recent_ok": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 10,
+                "description": (
+                    "Number of recent observed chat turns whose kind was available."
+                ),
+            },
+            "recent_total": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 10,
+                "description": (
+                    "Number of recent observed chat turns in the bounded window."
+                ),
+            },
+        },
+        "additionalProperties": False,
+        "example": {
+            "last_kind": "available",
+            "last_at": 1786370000.0,
+            "recent_ok": 9,
+            "recent_total": 10,
+        },
+    },
     "McpServerRecord": {
         "type": "object",
         "properties": {
@@ -1885,6 +1937,14 @@ COMPONENT_SCHEMAS: dict[str, dict[str, Any]] = {
             "transport": {"type": "string", "enum": ["http", "sse"], "description": "MCP transport: 'http' (streamable HTTP) or 'sse' (legacy HTTP+SSE). Guessed from the URL path at save time ('.../sse' => 'sse') and corrected to the server's actual transport the first time a connectivity test succeeds."},
             "created_at": {"type": "string"},
             "updated_at": {"type": "string"},
+            "runtime": {
+                "$ref": "#/components/schemas/McpServerRuntimeStatus",
+                "description": (
+                    "Present on GET /v1/mcp/servers only when Hosted Runtime V2 "
+                    "has observed this server. Omitted when no observation exists; "
+                    "absence is not evidence of success."
+                ),
+            },
         },
         "additionalProperties": True,
         "example": {
@@ -2263,7 +2323,15 @@ OPERATION_DESCRIPTIONS: dict[Operation, str] = {
     ("post", "/v1/genesis/imports/plaintext"): "Queue an asynchronous plaintext import and immediately publish every material as queued with its total window count. Every processing frame preserves the complete material list while item progress advances. Identity may become ready while processing continues; done is published only after every material window completes. A non-empty keep-all memory import that produces zero cards fails as distill_empty_output; its job output may include up to six discarded-map diagnostics, each with a reason and a model-output excerpt capped at 500 characters. Only one plaintext import can process per account; a concurrent submission returns 409 import_job_active with active_job_id. A same-host abandoned worker is detected by its exited process and failed immediately as worker_restarted; remote or legacy owners use a bounded heartbeat lease so a live rolling-deploy worker is not killed. A failed matching client_job_id or input is resumed from its encrypted per-window checkpoint, while a completed match returns the existing job. In update_identity mode, the uploaded role card creates an identity when absent or updates the existing card while preserving its relationship anchor by default.",
     ("post", "/v1/genesis/imports/plaintext/estimate"): "Parse and encrypt-stage plaintext onboarding material without calling an LLM. Returns per-material window and conservative token estimates plus an optional fast-model recommendation for Anthropic, DeepSeek, Gemini, OpenAI, OpenRouter, or compatible relay configurations. Compatible-relay recommendations exclude Gemini Flash model IDs while leaving Gemini Pro and non-Gemini Flash names eligible. The staged payload expires and must be committed by staged_id.",
     ("post", "/v1/genesis/imports/plaintext/commit"): "Commit one encrypted staged plaintext import and start asynchronous processing. An optional distill_model overrides only this job's model; provider, base URL, credential, and the account chat model remain unchanged.",
-    ("get", "/v1/mcp/servers"): "List the caller's user-configured MCP servers. Secrets (url, headers, ca_pem) are never returned; url_hint is the hostname only and header_names lists header keys only.",
+    ("get", "/v1/mcp/servers"): (
+        "List the caller's user-configured MCP servers. Secrets (url, headers, "
+        "ca_pem) are never returned; url_hint is the hostname only and "
+        "header_names lists header keys only. When Hosted Runtime V2 has "
+        "observed a server during recent chat turns, the record also carries a "
+        "bounded, content-free runtime summary. The runtime field is omitted "
+        "when no observation exists; absence is not evidence that the server is "
+        "healthy. Runtime V1 does not currently write this status."
+    ),
     ("post", "/v1/mcp/servers"): (
         "Create or update a user-configured MCP server (matched by name). http:// and https:// URLs "
         "are both accepted, including loopback and private-network hosts and IP literals — this "
@@ -2436,22 +2504,12 @@ RESPONSE_OVERRIDES: dict[Operation, dict[str, Any]] = {
             },
         },
     },
-    ("get", "/healthz"): {
-        "503": {
-            "description": (
-                "A critical dependency is unavailable — PostgreSQL is "
-                "unreachable or the connection pool cannot hand out a "
-                "connection in time. The body has the same shape as the 200 "
-                "response, with top-level \"status\": \"unhealthy\" and the "
-                "failing entry under \"checks\"."
-            ),
-            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/GenericJsonResponse"}}},
-        },
-    },
     ("get", "/healthz/runner"): {
         "503": {
             "description": (
-                "The runner fleet is unhealthy, unavailable, or misconfigured. "
+                "The aggregate runner fleet is unhealthy, unavailable, or "
+                "misconfigured, or its isolated probe exceeded its three-second "
+                "health-check deadline. "
                 "The body has the same shape as the 200 response, with top-level "
                 "\"status\": \"unhealthy\" and a down \"runner_fleet\" entry "
                 "under \"checks\"."

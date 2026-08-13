@@ -11,19 +11,22 @@ def test_all_action_types_registered():
     expected = {
         "identity_get", "identity_patch", "identity_nudge", "memory_index", "memory_fetch", "memory_write",
         "memory_search",
+        "history_search", "history_fetch",
+        "voice_transcript_list", "voice_transcript_read",
         "perception_snapshot", "perception_recent_apps", "perception_trend", "perception_history", "perception_glance",
         "screen_recent", "screen_read", "photo_recent", "photo_read", "chat_image_read",
         "chat_file_read",
         "web_search", "web_fetch",
         "schedule_wake", "cancel_wake",
         "workspace_list", "workspace_read", "workspace_write", "workspace_delete",
-        "voice_transcript_list", "voice_transcript_read",
     }
     assert set(registry.CAPABILITIES) == expected
     assert registry.WRITE_ACTIONS == frozenset({
         "memory_write", "identity_patch", "identity_nudge", "schedule_wake", "cancel_wake",
         "workspace_write", "workspace_delete"})
     assert "memory_index" in registry.READ_ACTIONS
+    assert {"voice_transcript_list", "voice_transcript_read"} <= registry.READ_ACTIONS
+    assert not ({"voice_transcript_list", "voice_transcript_read"} & registry.WRITE_ACTIONS)
 
 
 def test_run_capability_dispatches(monkeypatch):
@@ -39,17 +42,18 @@ def test_run_capability_unknown():
 
 
 def test_capabilities_is_a_real_populated_dict():
-    assert len(registry.CAPABILITIES) == 28
-    assert set(registry.CAPABILITIES.keys()) == {
-        "identity_get", "identity_patch", "identity_nudge", "memory_index", "memory_fetch", "memory_write",
-        "memory_search",
-        "perception_snapshot", "perception_recent_apps", "perception_trend", "perception_history", "perception_glance",
-        "screen_recent", "screen_read", "photo_recent", "photo_read", "chat_image_read",
-        "chat_file_read",
-        "web_search", "web_fetch",
-        "schedule_wake", "cancel_wake",
+    expected = {
+        "identity_get", "identity_patch", "identity_nudge",
+        "memory_index", "memory_fetch", "memory_write", "memory_search",
+        "history_search", "history_fetch",
+        "perception_snapshot", "perception_recent_apps", "perception_trend",
+        "perception_history", "perception_glance", "screen_recent",
+        "screen_read", "photo_recent", "photo_read", "chat_image_read",
+        "chat_file_read", "voice_transcript_list", "voice_transcript_read",
+        "web_search", "web_fetch", "schedule_wake", "cancel_wake",
         "workspace_list", "workspace_read", "workspace_write", "workspace_delete",
-        "voice_transcript_list", "voice_transcript_read",
     }
-    assert len(list(registry.CAPABILITIES.items())) == 28
+    assert len(registry.CAPABILITIES) == len(expected)
+    assert set(registry.CAPABILITIES) == expected
+    assert len(list(registry.CAPABILITIES.items())) == len(expected)
     assert bool(registry.CAPABILITIES) is True

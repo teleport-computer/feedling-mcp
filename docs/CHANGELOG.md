@@ -47,6 +47,157 @@
 
 ## 记录正文（最新的在上面）
 
+## 2026-08-05 — Pre 明文用户 Runtime V2 Chat 启动失败修复
+
+### [DONE] Flight recorder 的二进制明文 wire 补齐
+
+- 根因：开启 `FEEDLING_PLAINTEXT_WRITES_ACCEPTED=1` 后，V2 trajectory 的 zlib
+  二进制载荷误走只接受 UTF-8 的普通明文信封构造器，第一条 `turn_started` 轨迹
+  即抛 `trajectory_encryption_failed:plaintext_body_not_utf8`，模型调用数始终为 0。
+- 修复：明文档 trajectory 用带版本前缀的 Base64 文本承载压缩字节，review 时
+  严格校验并还原；密文档继续使用原 `body_ct` 信封。新增二进制 round-trip 和
+  非法编码拒绝测试。
+
+## 2026-08-05 — Pre 明文/密文双线身份与记忆兼容修复
+
+### [DONE] 客户端展示、Runtime V2 上下文与回复写入形状重新对齐
+
+- Runtime V2 每轮同时读取 genesis persona 与当前 identity card，兼容 `body`
+  明文和 `body_ct` 密文，避免 agent 忘记自己的名称和身份。
+- iOS identity / memory 解码补齐结构化明文 `body`，旧密文解密路径保持不变，
+  修复身份缺失和记忆卡片全部显示「未分类」。
+- Pre backend、V2 serve-worker 与独立 V1 runner 统一开启明文写入 gate；runner
+  健康检查显式声明 1 个预期实例，避免 API 宣告 `effective=off` 时 worker 仍
+  fail-safe 回写密文，或健康接口因缺少期望数量配置而固定报错。
+- 记忆质量扫描同时识别 V1 `summary/content` 与 V2 `title/description` 字段，
+  不再把可用的存量明文记忆误报成 noisy。
+
+## 2026-07-31 — Pre 专用 TEE Postgres 开通并纳入发布链
+
+### [DONE] Pre 不再复用 test 影子库
+
+- 新建 `feedling-io-db-pre`（prod9 node 18、2 vCPU / 4GB、30GB），使用独立角色密码、
+  TLS CA/server 证书、WAL-G libsodium key 与 `pre/wal-g` 备份前缀。
+- schema 升至 `0009_provider_latency`（55 张表），app/replicator 的 CRUD + TRUNCATE
+  权限全量验证，monitoring 业务表负向权限验证通过。
+- 首次 base backup、direct-TLS、强制 WAL switch 与归档零失败均已验证。
+- pre compose/CI 接入独立 TEE DSN；PG deploy、TEE migrate、备份监控新增 pre lane。
+  双写默认关闭，等 pre 应用部署与连通验证后再开启回填。
+## 2026-08-07 — 首页顶部人话总结
+
+**[FEEDBACK] Xyn：指标太复杂看不懂——首页第一行改成一句人话。**
+
+- `_home_human_summary`：「近 7 天 N 人在用（比上一周多 X 个）；新来
+  100 个能留住 Y 个；Z 个人卡住等你。」数字与下方板块严格同源（脉搏
+  WAU / 故事数字 D14 加权 / 队列行数），缺哪块丢哪个从句、全缺整行不
+  渲染——人话也不许编数。'?' 悬浮给口径。
+- 配套测试（从句组合、降级、整页渲染）。
+
+
+## 2026-08-07 — 首页脉搏「故事数字」+ sparkline 可读性 + QR 语义
+
+**[FEEDBACK] Xyn：折线看不清没 hover；quick ratio 名字存疑；新指标上板前先做遥测一致性审查。**
+
+- sparkline 全面可读化：`_spark` 支持 labels/尺寸参数——每个数据点叠
+  全高透明命中列 + SVG `<title>`，浏览器原生 hover 显「哪天 · 多少」，
+  零 JS、缓存页照样用；脉搏 DAU/激活/成本三条折线放大到 150px 并带
+  逐点标签。旧调用完全兼容。
+- 脉搏第二排「故事数字」（builder `admin_home_pulse_story`，上板前做了
+  口径一致性审查——两处 docstring 还写着旧宽口径、实际 SQL 是
+  app_session_end，已顺手修正）：①留存曲线 D1/D7/D14/D30 注册日
+  cohort 加权 + 「D7→D14 趋平」判定（|Δ|≤3pp 才贴,D30 未成熟显 —）
+  ②发消息深度 = chat_dau ÷ session_dau（同一张冻结快照内的比值）
+  ③DAU 构成 = 留任/回流/新增 + 28 天新人占比（供血依赖显性化）
+  ④近 28 天注册环比（漏斗快照同源）。
+- 增长核算表：进行中的当天不再渲染 流失/QR 定数（半天数据的 QR 0.1
+  是垃圾值）；「Quick Ratio」更名「增长 QR」并注明=增长会计口径
+  （(新增+回流)÷流失）、与财务速动比率无关、日粒度看趋势别看单日。
+- 测试 300 通过（PG17 本地集群;顺带解锁 pg_input_is_valid 系）。存量
+  发现另立任务：events_overview↔admin_usage 跨文件种子污染（基线即挂,
+  与本轮无关）。
+
+
+## 2026-08-09 — 地址不是 API 端点时,别把它说成「API key 未通过测试」
+
+**[DONE] 用户报障:两个中转站都提示 key 未通过测试;实测两站完全健康,真因是 base_url 漏了结尾的 `/v1`。**
+
+- 我们把 **URL 问题的报错说成了 key 问题**,用户一直在换 key。判据落在
+  `setup_core._looks_like_wrong_api_endpoint`,四个入口(保存配置 / 手动测试 /
+  加路由 / 改凭证)统一走 `_provider_test_failed_body`,避免同一错误从不同入口
+  说法不一。
+- 判定为地址问题时把 `status_code` 清成 `null`:客户端会把 provider 的 404
+  映射成「模型不存在」,不清就是换一句话继续指错方向。原始错误仍写进
+  `route.test_error`。
+- **⚠️ 判据必须按状态码收窄(codex2 gatekeep 抓到的 blocker)**:我原先断言
+  「真错误一律是 JSON」,但 relay/WAF/计费层会用 **HTML 页面**返回
+  401/402/429/5xx —— 本仓 `tests/test_catalog_consumer_parity.py:158-161`
+  就存着这样的样本。HTML 只在 **404** 时才算地址问题,其余状态码原样透传,
+  否则额度不足/鉴权失败/限流会被一并说成地址错误,比原来的错更严重。
+- 刻意**不**自动补 `/v1`:6 个 provider 里 gemini(`/v1beta`)、bedrock、
+  deepseek 本就不是 `/v1` 结尾;且 `base_url` 属敏感字段、admin 不下发,
+  改一个看不见影响面的东西等于拿存量用户赌。也不替用户拼具体地址(有的站
+  要 `/api/v1`、`/openai/v1`,猜错让用户照抄后更迷惑)。
+- 不需要 iOS 改动:复用 `provider_test_failed` 老 slug,现有 App 直接显示 detail。
+
+## 2026-08-08 — 思维链泄漏统一闸
+
+**问题**：模型自己写的 `<think>` 心里话漏进用户聊天气泡。**三个出口各漏各的**，
+且三条路此前用的是**两套不同判据 + 一处没有**：
+
+| 出口 | 漏的形状 | 原因 |
+|---|---|---|
+| V2 聊天 | 模型一轮写了两个块 | 剥离器只处理开头第一块，第二块原样进气泡 |
+| V1 聊天 | 孤立的 `</think>`（开标签被上游吃掉） | 正则要求开闭成对，配不上对 → 整段原样放行 |
+| 主动消息 | 任何 think | **一处剥离都没有** |
+
+共同毛病是 **fail-open**：遇到不认识的形状就把原文端给用户。
+
+**自我繁殖**：漏出去的内容原样存进 `chat_messages` 正文（正常情况下思考封在
+**另一个**信封里、模型永远看不到），下一轮当历史喂回去 → 模型看到「我上一条就
+这么写的」→ 照抄 → 漏得更多。这解释了为什么主动消息那条 lane 我们**根本没在
+提示词里要求**它写 think，它却照写不误。
+
+**改动**
+
+- 新增 `core.self_thinking.strip_all_thinking()`：扫全文剥所有完整块 + 孤立闭
+  标签前缀，剥完仍有标签残留则 **fail-CLOSED**（返回 `FAILED`，调用方不发）。
+  `split_thinking()` 一行未动，只增不改。
+- 四个对外出口（V2 聊天 / V2 唤醒 / V1 聊天 / 主动消息）+ 一个历史入口全部改调
+  同一个函数，判据统一。
+- 指令换版：从「每一次输出都写、工具轮也写」改成「**只在不再调工具的那次输出
+  写一个块，内容覆盖整轮**」。13 模型 × 2 遍实测：能写的 6 个模型 12/12 全对
+  （1 块 / 在开头 / 正文零残留 / 工具轮 0 个）；`gpt-5` 在旧指令下会拒绝
+  （"抱歉，我不能分享我的内部推理" + 整段转英文），新指令下两遍都正常。
+
+**开关**：`FEEDLING_THINK_GATE`，**默认开**。关掉后五个调用点对同样的输入逐字回到
+改动前的**解析 / 出口 / 历史处理**行为，用于线上出问题时立刻止血 —— 是 kill switch，
+不是灰度门。**注意它不回滚提示词**：`INSTRUCTION` 归 `FEEDLING_V2_SELF_THINKING` 管，
+所以关掉本开关不等于系统整体回到基点（Codex review 2026-08-08 指出，原文案说成
+「逐字节回到改动前」是不成立的）。
+
+**与 `FEEDLING_V2_SELF_THINKING` 解耦**：安全剥离不再挂在 self-thinking 开关下。
+那是公开支持的自托管配置，关掉它时模型仍可能自己写 `<think>`（主动消息那条 lane
+就是实证：我们从没要求它写，它照写），此前的写法会在那种配置下完全跳过剥离，等于
+把心里话原样发给用户。现在的判定是「闸开 → 一律剥离；闸关但 self-thinking 开 →
+旧行为；两者都关 → 不处理」，而**展示与否**仍然只看 `FEEDLING_V2_SELF_THINKING`。
+
+**放弃的替代方案**：给模型一个专门的 think 工具走结构化交付（`tool_calls`）。
+实测 gpt-5.4 **不会**把正文和 think 工具调用放进同一次输出，会多一次 API 往返；
+2026-08-08 定为「先不做」。
+
+**已知取舍**
+
+1. **误剥**：用户或 io 正常聊天里提到 `</think>` 这几个字会被当协议残留剥掉。
+   低频，而泄漏每天都在发生 —— 优先堵漏（hx 2026-08-08 明确「误杀先不考虑」）。
+2. **4 个模型完全不写 think**（openrouter-deepseek-r1 / glm / 中转·哈吉米 /
+   中转·空悲切）→ 这些用户看不到「推理过程」。是"没有"不是"漏"，之后单独处理。
+3. V1 的展示格式**不变**（保留换行、上限 700）：内核提供 `sanitize=False`，本次
+   统一的是剥离**判据**，不顺带改展示。
+
+**上线状态**：⬜ 未上线。backend 部分随 test 分支 CI 自动出镜像 + 部署 CVM；
+`tools/chat_resident_consumer.py` **CI 不管**，必须手动上 VPS
+`systemctl restart feedling-chat-resident` 才生效。
+
 ## 2026-08-07 — 语音挂断取消与迟到回复隔离
 
 **[DONE] 失败通话不再把迟到 AI 回复写进普通聊天。**
@@ -183,43 +334,6 @@
 - 待办：usr_a40e 花园复原（recover CLI 走 Actions，时间窗定位墓碑批次，dry-run
   清单过目后 apply）——修复部署 prod 之后做，防止下一晚 dream 再产墓碑。
 
-## 2026-08-05 — Pre 明文用户 Runtime V2 Chat 启动失败修复
-
-### [DONE] Flight recorder 的二进制明文 wire 补齐
-
-- 根因：开启 `FEEDLING_PLAINTEXT_WRITES_ACCEPTED=1` 后，V2 trajectory 的 zlib
-  二进制载荷误走只接受 UTF-8 的普通明文信封构造器，第一条 `turn_started` 轨迹
-  即抛 `trajectory_encryption_failed:plaintext_body_not_utf8`，模型调用数始终为 0。
-- 修复：明文档 trajectory 用带版本前缀的 Base64 文本承载压缩字节，review 时
-  严格校验并还原；密文档继续使用原 `body_ct` 信封。新增二进制 round-trip 和
-  非法编码拒绝测试。
-
-## 2026-08-05 — Pre 明文/密文双线身份与记忆兼容修复
-
-### [DONE] 客户端展示、Runtime V2 上下文与回复写入形状重新对齐
-
-- Runtime V2 每轮同时读取 genesis persona 与当前 identity card，兼容 `body`
-  明文和 `body_ct` 密文，避免 agent 忘记自己的名称和身份。
-- iOS identity / memory 解码补齐结构化明文 `body`，旧密文解密路径保持不变，
-  修复身份缺失和记忆卡片全部显示「未分类」。
-- Pre backend、V2 serve-worker 与独立 V1 runner 统一开启明文写入 gate；runner
-  健康检查显式声明 1 个预期实例，避免 API 宣告 `effective=off` 时 worker 仍
-  fail-safe 回写密文，或健康接口因缺少期望数量配置而固定报错。
-- 记忆质量扫描同时识别 V1 `summary/content` 与 V2 `title/description` 字段，
-  不再把可用的存量明文记忆误报成 noisy。
-
-## 2026-07-31 — Pre 专用 TEE Postgres 开通并纳入发布链
-
-### [DONE] Pre 不再复用 test 影子库
-
-- 新建 `feedling-io-db-pre`（prod9 node 18、2 vCPU / 4GB、30GB），使用独立角色密码、
-  TLS CA/server 证书、WAL-G libsodium key 与 `pre/wal-g` 备份前缀。
-- schema 升至 `0009_provider_latency`（55 张表），app/replicator 的 CRUD + TRUNCATE
-  权限全量验证，monitoring 业务表负向权限验证通过。
-- 首次 base backup、direct-TLS、强制 WAL switch 与归档零失败均已验证。
-- pre compose/CI 接入独立 TEE DSN；PG deploy、TEE migrate、备份监控新增 pre lane。
-  双写默认关闭，等 pre 应用部署与连通验证后再开启回填。
-
 ## 2026-08-04 — 新增 Admin「产品健康」view（留存/激活/强度/证据缺口）
 
 **[DONE] /admin/data-track?view=health：投资人级产品指标常态化进 dashboard，全部只用现库可证实的数。**
@@ -320,6 +434,59 @@
 - 优先使用用户配置的专用视觉路由；未配置时复用当前回合的主模型路由。专用路由失败时不会静默回退，避免意外跨越用户选择的信任边界。
 - chat、wake 和只读子任务共用同一按需观察链路；模型未调用 `photo_read` 时不会读取或观察照片。
 - 变更仅限 V2 后端，V1 路径与 iOS 授权/UI 行为不变。
+
+## 2026-07-31 — Task 1.3 backend 协议完成，生产迁移仍锁住
+
+### [DONE] R2 plaintext pointer、原子迁移与三形状读写已落地
+
+- 新增 raw object helper 与 `plaintext_v1` pointer：
+  `body_object_format + body_size_bytes + body_sha256`。成功水合只向公共读取出口交付
+  `body_b64`，并在交付前核 raw byte length 与 SHA-256；未知 marker、坏 base64 与
+  完整性不符全部 fail closed。
+- 新写只允许 effective `off` 用户的 image/file 使用 `body_b64`；text、加密档、
+  `local_only`、混合 crypto 字段与超限 decoded bytes 均拒绝。重体 offload 复用
+  versioned key、upload guard、per-key advisory lock 与 CAS，encrypted `body_ct`
+  路径保持兼容。
+- backfill 支持 live JSONB CAS 与 archive 事务内 delete+insert，不放宽 archive
+  immutable UPDATE trigger。CAS 输家/进程崩溃留下的新对象由 durable cleanup 回收，
+  旧权威对象不会被覆盖；CLI 缺省 inventory-only，apply 需双参数确认和部署环境 gate。
+- TEE replicator 对 plaintext pointer 原样保留、仅解密独立 thinking/caption；
+  live/archive 替换都进入 requeue。verify 改用 archive `source_seq` 对账，并抽样 GET
+  plaintext R2 对象核 size/hash，避免两库同指坏对象时假绿。
+- 公共 OpenAPI、Chat workflow、architecture、self-host trust model 与 Unreleased
+  changelog 同步更新。生产 apply 仍等待 iOS `body_b64` 支持和强更窗口。
+
+## 2026-07-31 — Task 1.3 回退为只读盘点；补明文行复制终态
+
+### [BLOCKER] R2 聊天重体不能靠原地覆盖完成明文化
+
+- 接手审计发现 `backfill_chat_bodies_to_plaintext.py` 首版不能安全真跑：
+  `get_chat_body()` 返回重新 base64 的密文，`put_chat_body()` 又会 base64 解码并生成
+  另一个 key，既可能改坏普通文本，也覆盖不到数据库里持久化的 versioned
+  `body_key`。更关键的是，数据库行仍是密文 pointer 形状，读侧会继续把对象装回
+  `body_ct`；原地覆盖还有「对象已改、行未改」时不可恢复的崩溃窗口。
+- 工具改成 inventory-only，`--apply` 在任何数据库/R2 访问前硬拒绝。Task 1.3 重新
+  标为 blocker：先定义明文 pointer（含二进制策略），再实现
+  「新 key 写明文 → CAS 切 pointer/形状 → 旧 key durable cleanup」，并同时覆盖
+  `chat_messages` / `chat_message_archive`、app 读侧、replicator 与 verify。
+- **设计草案已形成**：推荐持久化
+  `body_object_format="plaintext_v1" + body_size_bytes + body_sha256`，读取线形新增
+  `body_b64` 承载 file/image 明文字节；迁移逐 key 复用现有 upload guard、advisory
+  lock、CAS 与 cleanup。archive 保持 UPDATE 不可变，迁移用事务内 delete+insert。
+  由此修正阶段顺序：代码可先落，生产 apply 必须等 iOS 支持 `body_b64` 并完成强更。
+- **[DECISION] 2026-07-31 四项推荐方案全部拍板**：允许明文档 image/file raw
+  bytes 明文存在 R2；采用 `body_b64` public wire shape；archive 用事务内
+  delete+insert；plaintext pointer 强制 size + SHA-256 校验。批准设计不等于批准
+  生产数据操作，apply gate 不变。
+- 同轮补上 Phase 2 终态漏测：显式明文档的新 `body` 行进入 TEE replicator 时直搬，
+  不铸 token、不触碰 enclave；chat 的 plaintext thinking/caption 会规范化成嵌套
+  形状，混合的加密子信封仍会解密。R2 瞬时水合失败继续按既有语义冻结游标重试，
+  不会被误分成 `PendingDeviceMigration` 后跳过。
+- 合并 `origin/test` 时加密面守卫抓到新 `v2_agent_profile`。通用 builder 本身已按
+  effective preference 路由，旧守卫把它当强制 primitive 属误报，已收窄为只抓直接
+  `build_envelope()`；profile validator/read 的确仍写死 `body_ct`，已改为每字段
+  `body_ct|body` 路由，明文 profile 读取不铸 token、不触碰 enclave。
+- 定向回归 80 passed；相关文件 pyflakes 干净。
 
 ## 2026-07-30 — Runtime 值班台补审计的三条实质缺口：capture 语义、完整窗口、端到端交付
 

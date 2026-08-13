@@ -5,7 +5,8 @@
 //   node pi_mcp_bridge_harness.mjs client <url>
 //     → {"tools": [...]} | {"error": "..."}
 //   node pi_mcp_bridge_harness.mjs mapping <json-of-servers>
-//     → {"mapped": [...], "dropped": [...]}
+//     → {"mapped": [...], "dropped": [...], "cap": N,
+//        "per_server": "srv:kept/found,...", "schema_bytes": N}
 //   node pi_mcp_bridge_harness.mjs extension
 //     → {"tools": [{name, description, parameters}], "threw": false}
 //
@@ -51,8 +52,17 @@ async function main() {
     return JSON.parse(arg).map((cfg) => effectiveTransport(cfg));
   }
   if (mode === "mapping") {
-    const { buildToolTable } = await import(path.join(BRIDGE, "tool_mapping.js"));
-    return buildToolTable(JSON.parse(arg));
+    const { buildToolTable, MAX_TOOLS, surfaceCounts, schemaBytes } =
+      await import(path.join(BRIDGE, "tool_mapping.js"));
+    const servers = JSON.parse(arg);
+    const table = buildToolTable(servers);
+    // 把 MAX_TOOLS 一并交出来:测试不该再抄一份魔数,否则改常量时测试静默失配。
+    return {
+      ...table,
+      cap: MAX_TOOLS,
+      per_server: surfaceCounts(servers, table.mapped),
+      schema_bytes: schemaBytes(table.mapped),
+    };
   }
   if (mode === "extension") {
     const mod = await import(path.join(BRIDGE, "index.js"));

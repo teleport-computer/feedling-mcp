@@ -44,46 +44,33 @@ CREATE TABLE IF NOT EXISTS voice_transcripts (
   CONSTRAINT ck_voice_transcript_envelope
     CHECK (
       jsonb_typeof(transcript_envelope) = 'object'
+      AND transcript_envelope ? 'body_ct'
+      AND transcript_envelope ? 'nonce'
+      AND transcript_envelope ? 'K_user'
+      AND transcript_envelope ? 'K_enclave'
       AND transcript_envelope ? 'owner_user_id'
       AND transcript_envelope ? 'id'
+      AND transcript_envelope ? 'v'
       AND transcript_envelope ? 'visibility'
+      AND jsonb_typeof(transcript_envelope->'v') = 'number'
       AND jsonb_typeof(transcript_envelope->'id') = 'string'
       AND jsonb_typeof(transcript_envelope->'owner_user_id') = 'string'
       AND jsonb_typeof(transcript_envelope->'visibility') = 'string'
+      AND jsonb_typeof(transcript_envelope->'body_ct') = 'string'
+      AND jsonb_typeof(transcript_envelope->'nonce') = 'string'
+      AND jsonb_typeof(transcript_envelope->'K_user') = 'string'
+      AND jsonb_typeof(transcript_envelope->'K_enclave') = 'string'
       AND transcript_envelope->>'owner_user_id' = user_id
       AND transcript_envelope->>'visibility' = 'shared'
       AND length(transcript_envelope->>'id') > 0
-      AND (
-        (
-          transcript_envelope ? 'body_ct'
-          AND transcript_envelope ? 'nonce'
-          AND transcript_envelope ? 'K_user'
-          AND transcript_envelope ? 'K_enclave'
-          AND transcript_envelope ? 'v'
-          AND jsonb_typeof(transcript_envelope->'v') = 'number'
-          AND jsonb_typeof(transcript_envelope->'body_ct') = 'string'
-          AND jsonb_typeof(transcript_envelope->'nonce') = 'string'
-          AND jsonb_typeof(transcript_envelope->'K_user') = 'string'
-          AND jsonb_typeof(transcript_envelope->'K_enclave') = 'string'
-          AND length(transcript_envelope->>'body_ct') > 0
-          AND length(transcript_envelope->>'nonce') > 0
-          AND length(transcript_envelope->>'K_user') > 0
-          AND length(transcript_envelope->>'K_enclave') > 0
-          AND transcript_envelope - ARRAY[
-            'v','id','owner_user_id','visibility','body_ct','nonce','K_user',
-            'K_enclave','enclave_pk_fpr','content_pk_fpr'
-          ]::text[] = '{}'::jsonb
-        )
-        OR
-        (
-          transcript_envelope ? 'body'
-          AND jsonb_typeof(transcript_envelope->'body') = 'string'
-          AND NOT (transcript_envelope ? 'body_ct')
-          AND transcript_envelope - ARRAY[
-            'id','owner_user_id','visibility','body'
-          ]::text[] = '{}'::jsonb
-        )
-      )
+      AND length(transcript_envelope->>'body_ct') > 0
+      AND length(transcript_envelope->>'nonce') > 0
+      AND length(transcript_envelope->>'K_user') > 0
+      AND length(transcript_envelope->>'K_enclave') > 0
+      AND transcript_envelope - ARRAY[
+        'v','id','owner_user_id','visibility','body_ct','nonce','K_user',
+        'K_enclave','enclave_pk_fpr','content_pk_fpr'
+      ]::text[] = '{}'::jsonb
     )
 );
 

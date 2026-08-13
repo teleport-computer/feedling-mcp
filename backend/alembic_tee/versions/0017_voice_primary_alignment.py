@@ -1,17 +1,14 @@
-"""Merge image/voice and PRE plaintext TEE migration heads.
+"""Align voice transcripts and runtime indexes after the merged PRE TEE head.
 
-Revision ID: 0016_merge_image_voice_pre
-Revises: 0013_merge_image_voice, 0015_merge_pre_perception
+Revision ID: 0017_voice_primary_alignment
+Revises: 0016_merge_screen_pre_perception
 """
 
 from alembic import op
 
 
-revision = "0016_merge_image_voice_pre"
-down_revision = (
-    "0013_merge_image_voice",
-    "0015_merge_pre_perception",
-)
+revision = "0017_voice_primary_alignment"
+down_revision = "0016_merge_screen_pre_perception"
 branch_labels = None
 depends_on = None
 
@@ -20,7 +17,7 @@ _UPDATE_PREPARED_HEAD = """
 UPDATE server_config
 SET value = convert_to(
   jsonb_set(convert_from(value, 'UTF8')::jsonb, '{tee_heads}',
-            '["0016_merge_image_voice_pre"]'::jsonb)::text,
+            '["0017_voice_primary_alignment"]'::jsonb)::text,
   'UTF8'
 )
 WHERE key = 'phase4_primary_prepared'
@@ -37,6 +34,13 @@ CREATE INDEX IF NOT EXISTS ix_user_logs_proactive_jobs_ts
 CREATE INDEX IF NOT EXISTS ix_user_logs_app_session_end_ts
   ON user_logs (ts)
   WHERE stream='tracking_events' AND doc->>'type'='app_session_end';
+CREATE INDEX IF NOT EXISTS ix_agent_jobs_user_wake_created
+  ON agent_jobs (user_id, created_at DESC)
+  WHERE lane IN ('heartbeat','scheduled','manual_wake','screen_watch');
+CREATE INDEX IF NOT EXISTS ix_agent_jobs_user_wake_failure
+  ON agent_jobs (user_id, finished_at DESC, id DESC)
+  WHERE lane IN ('heartbeat','scheduled','manual_wake','screen_watch')
+    AND status IN ('failed','expired');
 
 ALTER TABLE voice_transcripts
   ADD COLUMN IF NOT EXISTS transcript_envelope JSONB;
@@ -71,8 +75,8 @@ ALTER TABLE voice_transcripts
       AND transcript_envelope ? 'owner_user_id'
       AND transcript_envelope ? 'id'
       AND transcript_envelope ? 'visibility'
-      AND jsonb_typeof(transcript_envelope->'id') = 'string'
       AND jsonb_typeof(transcript_envelope->'owner_user_id') = 'string'
+      AND jsonb_typeof(transcript_envelope->'id') = 'string'
       AND jsonb_typeof(transcript_envelope->'visibility') = 'string'
       AND transcript_envelope->>'owner_user_id' = user_id
       AND transcript_envelope->>'visibility' = 'shared'
@@ -84,11 +88,11 @@ ALTER TABLE voice_transcripts
           AND transcript_envelope ? 'K_user'
           AND transcript_envelope ? 'K_enclave'
           AND transcript_envelope ? 'v'
-          AND jsonb_typeof(transcript_envelope->'v') = 'number'
           AND jsonb_typeof(transcript_envelope->'body_ct') = 'string'
           AND jsonb_typeof(transcript_envelope->'nonce') = 'string'
           AND jsonb_typeof(transcript_envelope->'K_user') = 'string'
           AND jsonb_typeof(transcript_envelope->'K_enclave') = 'string'
+          AND jsonb_typeof(transcript_envelope->'v') = 'number'
           AND length(transcript_envelope->>'body_ct') > 0
           AND length(transcript_envelope->>'nonce') > 0
           AND length(transcript_envelope->>'K_user') > 0

@@ -903,6 +903,68 @@ def test_run_perception_wake_injects_trigger_as_untrusted_runtime_data(monkeypat
     )
 
 
+@pytest.mark.parametrize(
+    ("trigger", "expected_require_reply", "prompt_fragment"),
+    [
+        ("broadcast_opened", False, "Speaking and staying silent are equally valid"),
+        ("broadcast_closed", False, "Speaking and staying silent are equally valid"),
+    ],
+)
+def test_broadcast_edge_wake_reply_policy(
+    monkeypatch, trigger, expected_require_reply, prompt_fragment
+):
+    uid = f"u_wake_{trigger}"
+    conftest.seed_user(uid)
+    _reset(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, "heartbeat")
+    claimed_by = _claim(job_id)
+    policy = _seen_lane_policy(monkeypatch)
+    calls = _script_provider(monkeypatch, [_text_round("我在，可以开始了。")])
+
+    async def _empty_glance(*_args, **_kwargs):
+        return None, None
+
+    monkeypatch.setattr(
+        worker, "_perception_glance_grounding_results", _empty_glance
+    )
+    monkeypatch.setattr(worker, "_screen_share_grounding", lambda _uid: {})
+    monkeypatch.setattr(
+        worker, "_write_encrypted_reply", lambda store, text: {"id": "r"}
+    )
+    deps = _wake_deps(
+        tail=[{"id": "m1", "ts": 1.0, "role": "user", "content": "hi"}]
+    )
+    deps.read_perception_wake_context = lambda user_id, wake_job_id: [{
+        "wake_id": f"wake-{trigger}",
+        "source": "scene_change",
+        "trigger": trigger,
+        "change_digest": "broadcast state changed",
+        "origin_refs": ["ios_report:broadcast"],
+        "created_at": 100.0,
+    }]
+
+    status = asyncio.run(
+        worker._run_wake(
+            job_id,
+            uid,
+            "heartbeat",
+            deps,
+            _BYOK,
+            worker.ENCLAVE_SEMAPHORE,
+            claimed_by,
+        )
+    )
+
+    assert status == "completed"
+    assert policy["require_reply"] is expected_require_reply
+    system_text = "\n".join(
+        str(message.get("content") or "")
+        for message in calls[0]["messages"]
+        if message.get("role") == "system"
+    )
+    assert prompt_fragment in system_text
+
+
 def test_lost_heartbeat_lease_does_not_persist_glance_fingerprint(monkeypatch):
     """Catches a candidate write that happens before terminalization wins."""
     uid = "u_glance_lost_lease"
@@ -1737,9 +1799,260 @@ def test_wake_tells_the_provider_that_an_empty_reply_is_acceptable(monkeypatch):
     status = asyncio.run(worker._run_wake(
         job_id, uid, "heartbeat", deps, _BYOK, worker.ENCLAVE_SEMAPHORE, claimed_by))
 
-    # The lane must have told the provider that silence is a valid outcome…
+    # 这一条断言的**主体是 tool_loop**，不是 wake lane 的策略：a0ac5257（V2 空回复
+    # 恢复）之后 `run_tool_loop` 对 provider_client 恒传 `require_reply=False`
+    # （"V2 owns the lane-specific empty-response policy"），自己在 1156+ 判 lane。
+    # 所以它锁的是「V2 不让 provider 解析器替我们决定空回复算不算失败」，**不能**
+    # 用来推断 `_run_wake` 传了什么——那一跳由 `test_only_scheduled_wake_demands_
+    # a_reply` 的 `_seen_lane_policy` 绑住。两者别混。
     assert seen.get("require_reply") is False, seen
-    # …and therefore slept instead of failing.
+    # 沉默即成功：睡了，没失败，也没写气泡。
     assert status == "completed"
     assert _job_status(job_id)[0] == "completed"
     assert write_called["n"] == 0
+
+
+def _empty_round(*, stop_reason="end_turn"):
+    """A structurally valid provider success with no usable output.
+
+    `stop_reason` 必须非空：`tool_loop._empty_response_shape` 旁边的 `semantic_empty`
+    判据要求 reasoning/stop_reason 至少有一个有值，否则纠正重试根本不会 arm
+    （直接判死）。造样本时漏了它，测的就不是恢复链而是快速失败路径。
+    """
+    round_ = _text_round("")
+    round_["stop_reason"] = stop_reason
+    return round_
+
+
+def _seen_lane_policy(monkeypatch):
+    """记录 `_run_wake` 交给 `run_tool_loop` 的 require_reply —— 唯一还有意义的边界。"""
+    seen = {}
+    orig = worker.v2_tool_loop.run_tool_loop
+
+    async def _spy(*a, **kw):
+        seen["require_reply"] = kw.get("require_reply")
+        return await orig(*a, **kw)
+
+    monkeypatch.setattr(worker.v2_tool_loop, "run_tool_loop", _spy)
+    return seen
+
+
+@pytest.mark.parametrize(
+    "lane,expected_require_reply",
+    [
+        ("scheduled", True),
+        ("heartbeat", False),
+        ("manual_wake", False),
+        ("screen_watch", False),
+    ],
+)
+def test_only_scheduled_wake_demands_a_reply(monkeypatch, lane, expected_require_reply):
+    """心跳沉默=成功，定时提醒沉默=提醒丢了。两条道必须传不同的策略。
+
+    参数化而不是写两个用例：这个不对称本身就是被测对象，分开写的话有人只改
+    一个、另一个照绿。四条 wake lane 全列进来（不只被改的那条）——用例名说
+    "only"，就得真的把「其余 lane 零变化」也绑住，否则以后有人顺手把
+    manual_wake 也打开，没有任何测试会红（codex 复验 2026-08-10 提出）。
+    """
+    uid = f"u_wake_policy_{lane}"
+    conftest.seed_user(uid)
+    _reset(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, lane)
+    claimed_by = _claim(job_id)
+
+    seen = _seen_lane_policy(monkeypatch)
+    _script_provider(monkeypatch, [_text_round("something to say")])
+    monkeypatch.setattr(
+        worker, "_write_encrypted_reply", lambda store, text: {"id": "r"})
+
+    asyncio.run(worker._run_wake(
+        job_id, uid, lane, deps := _wake_deps(
+            tail=[{"id": "m1", "ts": 1.0, "role": "user", "content": "hi"}]),
+        _BYOK, worker.ENCLAVE_SEMAPHORE, claimed_by))
+    assert deps is not None
+
+    assert seen["require_reply"] is expected_require_reply, seen
+
+
+def test_scheduled_wake_empty_reply_fails_instead_of_completing_silently(monkeypatch):
+    """usr_4ea3de33c049a676，2026-08-10 prod，一晚上两次。
+
+    用户让 TA「20 秒后发个消息」，模型（deepseek）返空。旧行为：`require_reply=False`
+    ⇒ 空回复不被检测 ⇒ 落到 `_run_wake` 的 `if not text: return` ⇒ job 记
+    **completed**、无气泡、无失败、lane 指标全绿，用户干等着。同一模型的同一种
+    空回复走聊天道时是可见的 `turn_failed:empty_reply`——两条道对同一个事实
+    给出相反的结论，而只有静默的那条是用户在踩的。
+
+    这里锁的是「不许静默成功」。至于失败**该不该让用户看见**是另一个问题：
+    `_run_wake` 的 except 明写 "silent mark_failed, never surface/bubble"，
+    本用例不碰那个决定。
+    """
+    uid = "u_wake_sched_empty"
+    conftest.seed_user(uid)
+    _reset(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, "scheduled")
+    claimed_by = _claim(job_id)
+
+    calls = _script_provider(monkeypatch, [_empty_round(), _empty_round()])
+    write_called = {"n": 0}
+    monkeypatch.setattr(
+        worker, "_write_encrypted_reply",
+        lambda store, text: write_called.update(n=write_called["n"] + 1) or {"id": "r"})
+
+    status = asyncio.run(worker._run_wake(
+        job_id, uid, "scheduled",
+        _wake_deps(tail=[{"id": "m1", "ts": 1.0, "role": "user", "content": "hi"}]),
+        _BYOK, worker.ENCLAVE_SEMAPHORE, claimed_by))
+
+    assert status != "completed", "定时提醒返空竟然算成功了——正是本用例要挡的回归"
+    st, last_error = _job_status(job_id)
+    assert st == "failed", st
+    assert "empty_reply" in str(last_error), last_error
+    assert write_called["n"] == 0
+    # 先重试一轮再判死：判死前必须真的给过第二次机会，否则这就退化成
+    # 「把静默成功换成快速失败」，用户拿到的东西一样少。
+    assert len(calls) == 2, calls
+
+
+def test_scheduled_wake_empty_reply_recovers_on_the_correction_retry(monkeypatch):
+    """恢复链的正例：第一轮返空，纠正提示重试后拿到正文 —— 用户照常收到提醒。
+
+    这是本次改动真正的收益。只测失败那条会让人误以为代价是「更多失败」，
+    实际上多数抽风到这一步就结束了。
+    """
+    uid = "u_wake_sched_recover"
+    conftest.seed_user(uid)
+    _reset(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, "scheduled")
+    claimed_by = _claim(job_id)
+
+    calls = _script_provider(
+        monkeypatch, [_empty_round(), _text_round("该喝水啦")])
+    written = {}
+    monkeypatch.setattr(
+        worker, "_write_encrypted_reply",
+        lambda store, text: written.update(text=text) or {"id": "r"})
+
+    status = asyncio.run(worker._run_wake(
+        job_id, uid, "scheduled",
+        _wake_deps(tail=[{"id": "m1", "ts": 1.0, "role": "user", "content": "hi"}]),
+        _BYOK, worker.ENCLAVE_SEMAPHORE, claimed_by))
+
+    assert status == "completed", _job_status(job_id)
+    assert written.get("text") == "该喝水啦"
+    assert len(calls) == 2, calls
+
+
+# ------------------------------------------------------------------
+# 世界书:主动开口的四条道也要认得这个世界（Seven 2026-08-10）
+#
+# 匹配信号按道分。锁死的是「传给匹配器的 messages」——那正是两半语义的分界：
+# 空 messages ⇒ `worldbook_match._triggered` 只留 alwaysOn；非空 ⇒ 额外按关键词命中。
+# ------------------------------------------------------------------
+
+def _wake_deps_with_worldbook(seen, *, block="〈世界书〉墨白历,一年十四个月。", boom=False,
+                              tail=None, **kw):
+    def _read(user_id, messages, *, runtime_token):
+        seen["messages"] = list(messages or [])
+        seen["n"] = seen.get("n", 0) + 1
+        if boom:
+            raise RuntimeError("worldbook_match_failed")
+        return {"block": block, "matched_names": ["历法常识"]}
+
+    deps = _wake_deps(tail=tail if tail is not None else
+                      [{"id": "m1", "ts": 1.0, "role": "user", "content": "hi"}], **kw)
+    return deps.__class__(**{**deps.__dict__, "read_worldbook_context": _read})
+
+
+@pytest.mark.parametrize("lane", ["heartbeat", "manual_wake", "screen_watch"])
+def test_wake_lanes_without_fresh_text_ask_for_alwayson_only(monkeypatch, lane):
+    """无新鲜文本的三条道:必须**照样去取**世界书,但不给匹配信号。
+
+    两件事一起锁:
+    1. 去取了(n==1)——chat 道那句 `if worldbook_match_messages:` 短路若被照抄过来,
+       这三条道会一条 alwaysOn 都拿不到,正好抹掉本次改动的主要目的;
+    2. messages 为空——空扫描面下 `_triggered` 只放行 alwaysOn。拿几小时前的旧消息
+       去撞关键词是噪音,不是接地;screen_watch 更是刻意不用屏幕文本(不可信输入
+       不许决定 prompt 内容,见 worker.py 的 screen_recent pull-only 注释)。
+    """
+    uid = f"u_wb_wake_{lane}"
+    conftest.seed_user(uid)
+    _reset(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, lane)
+    claimed_by = _claim(job_id)
+
+    seen = {}
+    calls = _script_provider(monkeypatch, [_text_round("在想你呢")])
+    monkeypatch.setattr(worker, "_write_encrypted_reply", lambda store, text: {"id": "r"})
+
+    status = asyncio.run(worker._run_wake(
+        job_id, uid, lane, _wake_deps_with_worldbook(seen),
+        _BYOK, worker.ENCLAVE_SEMAPHORE, claimed_by))
+
+    assert status == "completed", _job_status(job_id)
+    assert seen.get("n") == 1, f"{lane} 没有去取世界书: {seen}"
+    assert seen["messages"] == [], f"{lane} 不该给匹配信号: {seen['messages']}"
+    # 取回来的块要真的进 prompt,而不是取了就扔。
+    # ⚠️ 断言必须在**消息正文**里找,不能 json.dumps 之后再找:header 自带真实
+    # 换行,dumps 会把它转义成 "\\n" 两个字符,于是永远匹配不上——2026-08-10
+    # 我第一版就这么写,红了三条,差点误判成「功能没接上」。
+    blocks = [str(m.get("content") or "") for m in calls[0]["messages"]]
+    assert any(v2_context.WORLD_BOOK_CONTEXT_HEADER in b for b in blocks), blocks[:3]
+    assert any("墨白历" in b for b in blocks), blocks[:3]
+
+
+def test_scheduled_wake_matches_the_reminder_note(monkeypatch):
+    """定时道**有**新鲜文本:提醒正文。它本来就已逐字进 prompt,拿它匹配零新增暴露面。
+
+    用户说「提醒我去青岚学院上课」,到点那一刻理应认得青岚学院——这正是关键词
+    触发条目该发挥作用的场景,也是本改动里唯一给匹配信号的道。
+    """
+    uid = "u_wb_wake_sched"
+    conftest.seed_user(uid)
+    _reset(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, "scheduled")
+    claimed_by = _claim(job_id)
+
+    seen = {}
+    _script_provider(monkeypatch, [_text_round("该去上课啦")])
+    monkeypatch.setattr(worker, "_write_encrypted_reply", lambda store, text: {"id": "r"})
+
+    deps = _wake_deps_with_worldbook(seen)
+    deps = deps.__class__(**{
+        **deps.__dict__,
+        "read_scheduled_wake_context": lambda uid_, job_: [
+            {"note": "提醒他去青岚学院上课", "timer_id": "t1"}
+        ],
+    })
+
+    status = asyncio.run(worker._run_wake(
+        job_id, uid, "scheduled", deps, _BYOK, worker.ENCLAVE_SEMAPHORE, claimed_by))
+
+    assert status == "completed", _job_status(job_id)
+    contents = [m.get("content") for m in seen.get("messages") or []]
+    assert any("青岚学院" in str(c) for c in contents), seen.get("messages")
+
+
+def test_worldbook_failure_does_not_kill_the_wake(monkeypatch):
+    """世界书取不到是 best effort(与 chat 道同款):一次主动开口不该因此整个打掉。"""
+    uid = "u_wb_wake_boom"
+    conftest.seed_user(uid)
+    _reset(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, "heartbeat")
+    claimed_by = _claim(job_id)
+
+    seen = {}
+    calls = _script_provider(monkeypatch, [_text_round("在想你呢")])
+    written = {}
+    monkeypatch.setattr(
+        worker, "_write_encrypted_reply",
+        lambda store, text: written.update(text=text) or {"id": "r"})
+
+    status = asyncio.run(worker._run_wake(
+        job_id, uid, "heartbeat", _wake_deps_with_worldbook(seen, boom=True),
+        _BYOK, worker.ENCLAVE_SEMAPHORE, claimed_by))
+
+    assert status == "completed", _job_status(job_id)
+    assert written.get("text") == "在想你呢"
+    blocks = [str(m.get("content") or "") for m in calls[0]["messages"]]
+    assert not any(v2_context.WORLD_BOOK_CONTEXT_HEADER in b for b in blocks), blocks[:3]

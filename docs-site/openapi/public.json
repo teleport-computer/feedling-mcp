@@ -113,7 +113,7 @@
     "/healthz": {
       "get": {
         "summary": "Healthz",
-        "description": "Liveness + readiness probe. Public, no auth — used by heartbeats/compose.",
+        "description": "Process liveness probe. Public, no auth — used by heartbeats/compose.",
         "operationId": "healthz_healthz_get",
         "responses": {
           "200": {
@@ -132,16 +132,6 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
-          },
-          "503": {
-            "description": "A critical dependency is unavailable — PostgreSQL is unreachable or the connection pool cannot hand out a connection in time. The body has the same shape as the 200 response, with top-level \"status\": \"unhealthy\" and the failing entry under \"checks\".",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/GenericJsonResponse"
                 }
               }
             }
@@ -181,7 +171,7 @@
             }
           },
           "503": {
-            "description": "The runner fleet is unhealthy, unavailable, or misconfigured. The body has the same shape as the 200 response, with top-level \"status\": \"unhealthy\" and a down \"runner_fleet\" entry under \"checks\".",
+            "description": "The aggregate runner fleet is unhealthy, unavailable, or misconfigured, or its isolated probe exceeded its three-second health-check deadline. The body has the same shape as the 200 response, with top-level \"status\": \"unhealthy\" and a down \"runner_fleet\" entry under \"checks\".",
             "content": {
               "application/json": {
                 "schema": {
@@ -3698,7 +3688,7 @@
           }
         ],
         "x-feedling-contract-level": "documented",
-        "description": "List the caller's user-configured MCP servers. Secrets (url, headers, ca_pem) are never returned; url_hint is the hostname only and header_names lists header keys only."
+        "description": "List the caller's user-configured MCP servers. Secrets (url, headers, ca_pem) are never returned; url_hint is the hostname only and header_names lists header keys only. When Hosted Runtime V2 has observed a server during recent chat turns, the record also carries a bounded, content-free runtime summary. The runtime field is omitted when no observation exists; absence is not evidence that the server is healthy. Runtime V1 does not currently write this status."
       },
       "post": {
         "summary": "Mcp Upsert",
@@ -7193,6 +7183,7 @@
     "/v1/screen/frames": {
       "get": {
         "summary": "List Frames",
+        "description": "List encrypted frame metadata and content-free screen-share health.\n\n``screen_share`` is live when the latest frame is recent, ended when a fresh\ndevice broadcast-off report follows a recent frame, stalled when a fresh\nbroadcast-on report has no frame update for over five minutes, and otherwise\nan empty object. Ended/stalled results include restart guidance and never\ntreat an old frame as current screen content.",
         "operationId": "list_frames_v1_screen_frames_get",
         "responses": {
           "200": {
@@ -10586,7 +10577,8 @@
           },
           "result_code": {
             "type": "string",
-            "maxLength": 64
+            "maxLength": 64,
+            "description": "Display-safe result token. Failed generate_image events preserve an allowlisted image_generation_* code; result bodies are never included."
           },
           "memory_count": {
             "type": "integer",
@@ -11466,6 +11458,46 @@
           }
         }
       },
+      "McpServerRuntimeStatus": {
+        "type": "object",
+        "required": [
+          "last_kind",
+          "last_at",
+          "recent_ok",
+          "recent_total"
+        ],
+        "properties": {
+          "last_kind": {
+            "type": "string",
+            "pattern": "^[a-z0-9_]{1,48}$",
+            "description": "Latest content-free Hosted Runtime V2 load outcome. available means the server catalog loaded successfully; other stable kinds describe why it was not ready. Clients must tolerate future kinds."
+          },
+          "last_at": {
+            "type": "number",
+            "exclusiveMinimum": 0,
+            "description": "Unix epoch seconds of the latest observation."
+          },
+          "recent_ok": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 10,
+            "description": "Number of recent observed chat turns whose kind was available."
+          },
+          "recent_total": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 10,
+            "description": "Number of recent observed chat turns in the bounded window."
+          }
+        },
+        "additionalProperties": false,
+        "example": {
+          "last_kind": "available",
+          "last_at": 1786370000.0,
+          "recent_ok": 9,
+          "recent_total": 10
+        }
+      },
       "McpServerRecord": {
         "type": "object",
         "properties": {
@@ -11506,6 +11538,10 @@
           },
           "updated_at": {
             "type": "string"
+          },
+          "runtime": {
+            "$ref": "#/components/schemas/McpServerRuntimeStatus",
+            "description": "Present on GET /v1/mcp/servers only when Hosted Runtime V2 has observed this server. Omitted when no observation exists; absence is not evidence of success."
           }
         },
         "additionalProperties": true,

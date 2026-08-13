@@ -43,7 +43,7 @@ class ProviderError(Exception):
 # key / 4xx config) — those need the user to fix their provider, not us to hammer it.
 _RETRYABLE_HTTPX = (httpx.TimeoutException, httpx.TransportError)
 _RETRYABLE_STATUS = frozenset({408, 425, 429, 500, 502, 503, 504})
-_PROVIDER_CONFIG_STATUS = frozenset({400, 401, 402, 403, 404, 422})
+_PROVIDER_CONFIG_STATUS = frozenset({400, 401, 402, 403, 404, 415, 422})
 _MAX_PG_BIGINT = (1 << 63) - 1
 
 
@@ -2964,8 +2964,8 @@ def _build_anthropic_payload(
     response_format: dict[str, Any] | None,
     include_reasoning: bool = False,
     tools: "list[ToolSpec] | None" = None,
-    tool_choice: str | dict[str, Any] | None = None,
     prompt_cache_key: str = "",
+    tool_choice: str | dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], str, dict[str, str]]:
     cacheable_system_parts = [
         _content_text(message.get("content"))
@@ -3006,7 +3006,9 @@ def _build_anthropic_payload(
         payload["system"] = system
     if tools:
         payload["tools"] = _encode_tools_anthropic(tools)
-        if isinstance(tool_choice, dict):
+        if tool_choice == "none" or tool_choice == {"type": "none"}:
+            payload["tool_choice"] = {"type": "none"}
+        elif isinstance(tool_choice, dict):
             function = tool_choice.get("function")
             name = (
                 str(function.get("name") or "")
@@ -4257,8 +4259,8 @@ async def _chat_completion_async_impl(
             response_format=response_format,
             include_reasoning=include_reasoning,
             tools=tools,
-            tool_choice=tool_choice,
             prompt_cache_key=config.prompt_cache_key,
+            tool_choice=tool_choice,
         )
 
         async def post_anthropic(request_payload: dict[str, Any]) -> httpx.Response:

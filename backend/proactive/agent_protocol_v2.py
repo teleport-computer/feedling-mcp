@@ -88,6 +88,17 @@ def sanitize_visible_message_text_v2(value: Any) -> str:
     """
     if not isinstance(value, str):
         return ""
+    # 主动消息此前完全没有 <think> 剥离（2026-08-08 线上：模型把整段思考塞进
+    # send_message.text 原样发了出去）。这条 lane 我们甚至没在提示词里要求它写
+    # think——它是从聊天历史里学来的，所以出口必须一律过闸，不能只在「要求它写
+    # 的地方」设防。proactive 本来就是 fail-closed，剥不干净直接不发。
+    from core import self_thinking as _st
+
+    if _st.gate_enabled():
+        _status, _thinking, _stripped = _st.strip_all_thinking(value)
+        if _status == _st.FAILED:
+            return ""
+        value = _stripped
     text = _clean_text(value, MAX_MESSAGE_CHARS_V2)
     if not text or _looks_like_protocol_fragment(text):
         return ""

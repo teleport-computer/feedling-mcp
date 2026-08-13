@@ -119,8 +119,8 @@ _CIPHERTEXT_TABLES: dict[str, dict] = {
         kind=None, strict=False),
     "voice_transcripts": dict(
         rds_table="voice_transcripts", tee_table="voice_transcripts",
-        item_col="call_id", pending_table="voice_transcripts",
-        kind=None),
+        item_col="call_id", pending_table="voice_transcripts", kind=None,
+    ),
 }
 
 

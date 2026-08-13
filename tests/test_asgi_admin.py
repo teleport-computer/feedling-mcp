@@ -129,6 +129,9 @@ def _admin(token=ADMIN_TOKEN):
 # --------------------------------------------------------------------------- #
 
 _TS_RE = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?")
+_CACHE_NOTE_RE = re.compile(
+    r"<div class='cache-note'[^>]*>页面缓存 · 数据生成于 [^<]*</div>"
+)
 
 
 def _norm_json(obj):
@@ -144,7 +147,8 @@ def _norm_json(obj):
 
 
 def _norm_html(text: str) -> str:
-    return _TS_RE.sub("TS", text)
+    without_cache_note = _CACHE_NOTE_RE.sub("", text)
+    return _TS_RE.sub("TS", without_cache_note)
 
 
 # --------------------------------------------------------------------------- #
@@ -295,7 +299,7 @@ def test_data_track_page_parity(env):
     assert f_status == a_status == 200
     assert f_ct == a_ct == "text/html; charset=utf-8"
     assert _norm_html(f_body) == _norm_html(a_body)
-    assert "Feedling Beta Data Track" in f_body
+    assert "Feedling 值班首页" in f_body
 
 
 def test_data_track_dau_page_parity(env):
@@ -384,6 +388,7 @@ _DELETE_TABLES = (
     "user_blobs",
     "agent_runtime_instances",
     "provider_health",
+    "v2_user_allowlist",
 )
 
 
@@ -413,6 +418,14 @@ def _seed_delete_rows(user_id: str) -> None:
         conn.execute(
             "INSERT INTO provider_health (user_id, provider_state) "
             "VALUES (%s, 'ok')",
+            (user_id,),
+        )
+        conn.execute(
+            "INSERT INTO v2_user_allowlist "
+            "(user_id, desired, updated_by, note) "
+            "VALUES (%s, 'resident', 'admin', 'admin-delete') "
+            "ON CONFLICT (user_id) DO UPDATE SET desired='resident', "
+            "updated_by='admin', note='admin-delete'",
             (user_id,),
         )
 

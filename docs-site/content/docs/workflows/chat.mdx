@@ -46,6 +46,12 @@ restores the most recently updated tested-ok route when one exists. Missing or
 legacy selector state fails closed for V1, so it cannot silently run beside an
 independent resident.
 
+For a newly registered Model API account admitted to Runtime V2, setup does not
+report success until both the tested active provider route and durable V2
+ownership are recorded. If that ownership transition cannot complete, setup
+fails closed with a retryable error rather than silently falling back to the
+resident path.
+
 ### 1. Send the turn
 
 At least one of `message`, `image_b64`, or `file_b64` is required. `message` is
@@ -143,6 +149,65 @@ Follow-main keeps the existing image path unchanged; a selected dedicated route
 stays pinned rather than silently falling back to the main model. `POST
 /v1/vision/observe` is the authenticated resident-facing observer exchange for
 the message's pinned route.
+
+### Live screen-share grounding
+
+An active screen share can ground an ordinary foreground Chat turn without the
+user having to mention the screen. The runtime treats sharing as active only
+when the newest encrypted frame is at most 90 seconds old. For each active turn,
+it walks backward through the current continuous sharing session (stopping at a
+gap over 90 seconds or ten minutes), then attaches the latest four frames. The
+Chat cursor avoids repeating a whole batch, but a follow-up with no newer frame
+still receives the latest frame. Every frame preserves absolute capture time and
+relative age; the newest is explicitly marked as the current screen and the
+others as earlier in the same session. When no share is active, no pixel block
+is added and the text turn is never delayed.
+
+If the device still reports that its broadcast is active but the newest frame
+is more than five minutes old, Chat treats the connection as stalled rather
+than live. Runtime V1 and Hosted Runtime V2 both tell the model that the sharing
+connection may have disconnected and ask the user to stop and restart screen
+sharing. They do not decrypt, attach, or describe the old frame as the current
+screen. `GET /v1/screen/frames` exposes the same content-free decision in its
+`screen_share` object, including `stalled`, `latest_frame_age_sec`, and
+`suggested_action`; a stale broadcast report does not trigger this state.
+
+When a fresh broadcast-off report follows frames from the last five minutes,
+the same object reports `active: false`, `ended: true`, and
+`status: "screen_share_ended"`. The runtime tells the model that sharing has
+ended and does not attach or decrypt those earlier frames as a current screen.
+Images already present in the conversation remain available for discussion;
+to see the screen again, the user must restart sharing or send a screenshot.
+Heartbeat and manual-wake turns receive this same content-free `screen_share`
+grounding alongside their boolean-only perception glance.
+
+Hosted Runtime V2 withholds pixels only when the exact route has an explicit
+`unsupported` verdict. An `ok`, untested, failed, or absent verdict admits the
+sampled frames: not having run the optional control probe is not evidence that
+a model is text-only. If a provider rejects an admitted image batch, the runtime
+retries that turn once without the screen frames. Only a successful text-only
+retry confirms and persists the unsupported verdict, so later turns stop
+attaching pixels without misclassifying a generally unavailable route. The
+official resident path continues to require its propagated setup-probe `ok`
+signal. User-attached photos remain separate and are not removed by this
+screen-only fallback.
+
+Every attached frame is labelled untrusted application data: text visible on a
+shared screen is evidence, never a user or system instruction. A pixel-bearing
+turn starts with outbound web, MCP, and child-task tools disabled, and that fence
+remains in force if the no-frame retry is needed. Decrypted frames are cached by
+frame ID under a small bound, and enclave decrypt work is concurrency-limited;
+the cache and aggregate telemetry never store screen text or pixel content.
+
+The model-facing `screen_read` tool uses the same 90-second active-share clock.
+While sharing is active, omitting `include_image` includes the real frame pixels;
+callers may explicitly set it to `false` only when text or OCR is sufficient.
+Outside an active share, omission remains metadata/text-only. A successful read
+without pixels reports whether the share is not active, ended, or stalled; an
+explicit `include_image: false` still reports that pixels were not requested,
+and requested pixels absent from plaintext are reported separately. Each
+inactive-state result includes a suggested restart-or-screenshot action so the
+model can explain the limitation accurately.
 
 For a document, use `file_b64`, `file_name`, and `file_mime` instead. The decoded
 file limit is 25 MiB. PDF, DOCX, XLSX, supported images, and UTF-8 text/source
@@ -304,13 +369,23 @@ provider-facing truncation. `memory_categories` is optional: it is present only 
 returned item has one of the canonical bilingual memory buckets and its counts
 sum to `memory_count`. If any bucket is custom or unknown, the category list is
 omitted and clients should show the total only. Raw bucket labels, summaries,
-memory content, and query text never enter activity metadata.
+memory content, and query text never enter activity metadata. Successful
+`history_search` and `history_fetch` calls likewise record only a content-free
+scanned-row count; matched snippets, message bodies, and query text never enter
+activity metadata.
 
 Every executed Runtime V2 platform, MCP, `reply`, and `send_file` call uses the
 same started/result/error activity boundary. Repeated memory-discovery calls
 that are deterministically rejected by the loop are recorded as confirmed
 results too. Zero-result discovery is retained, and each turn returns at most
 100 projected events.
+
+For `generate_image`, an allowlisted configuration or provider failure keeps its
+specific `image_generation_*` value in `result_code`; the tool result body is
+still excluded. A client that offers image-model setup should inspect only the
+final `generate_image` attempt in a completed turn. A later successful attempt,
+or a temporary error such as rate limiting or upstream unavailability, must not
+be presented as missing configuration.
 
 Completed tool events are also attached to the assistant history item's
 `activity_events` metadata, so clients can render the execution record below

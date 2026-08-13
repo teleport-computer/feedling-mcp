@@ -167,13 +167,19 @@ jobs:
             tests/test_screen_caption_flag.py \
             tests/test_enclave_frame_caption.py \
             tests/test_enclave_visual_plaintext.py \
+            tests/test_io_cli_web.py \
             tests/test_proactive_agent_protocol_v2.py \
             tests/test_runtime_v2_default_flag.py \
+            tests/test_screen_vision_verdict_runtime.py \
             tests/test_capture_prompt_v1.py \
             tests/test_dream_prompt_v1.py \
             tests/test_card_text_gate.py \
             tests/test_card_user_referent.py \
             tests/test_pi_mcp_bridge.py \
+            tests/test_v2_cache_retry_metrics.py \
+            tests/test_v2_screen_chat.py \
+            tests/test_v2_serve_worker_screen_frames.py \
+            tests/test_v2_wake_tool_loop.py \
             -v
 
       - name: Run resident consumer regression suite
@@ -192,6 +198,61 @@ jobs:
           printf 'Running %d resident consumer test files\n' "${#consumer_tests[@]}"
           python -m pytest "${consumer_tests[@]}" -v
 
+      - name: Guard top-level pytest discovery coverage
+        run: |
+          export LC_ALL=C
+          find tests -maxdepth 1 -type f -name 'test_*.py' -print | sort \
+            > /tmp/feedling-all-tests.txt
+          grep -oE 'tests/test_[A-Za-z0-9_]+\.py' .github/workflows/ci.yml | sort -u \
+            > /tmp/feedling-named-tests.txt
+          grep -l -E \
+            'tools\.chat_resident_consumer|chat_resident_consumer as|import chat_resident_consumer|from tools import chat_resident_consumer|chat_resident_consumer\.py' \
+            tests/test_*.py | sort \
+            > /tmp/feedling-consumer-tests.txt
+          sort -u /tmp/feedling-named-tests.txt /tmp/feedling-consumer-tests.txt \
+            > /tmp/feedling-covered-tests.txt
+          comm -12 /tmp/feedling-all-tests.txt /tmp/feedling-covered-tests.txt \
+            > /tmp/feedling-covered-top-level-tests.txt
+          comm -23 /tmp/feedling-all-tests.txt /tmp/feedling-covered-tests.txt \
+            > /tmp/feedling-uncovered-tests.txt
+          comm -23 /tmp/feedling-uncovered-tests.txt \
+            .github/pytest-uncovered-baseline.txt \
+            > /tmp/feedling-new-uncovered-tests.txt
+          comm -13 /tmp/feedling-uncovered-tests.txt \
+            .github/pytest-uncovered-baseline.txt \
+            > /tmp/feedling-now-covered-tests.txt
+          echo "Top-level pytest discovery: $(wc -l < /tmp/feedling-all-tests.txt) total, $(wc -l < /tmp/feedling-covered-top-level-tests.txt) covered, $(wc -l < /tmp/feedling-uncovered-tests.txt) baseline-uncovered"
+          echo "::group::Top-level pytest files outside explicit/consumer discovery"
+          sed -n '1,9999p' /tmp/feedling-uncovered-tests.txt
+          echo "::endgroup::"
+          if [[ -s /tmp/feedling-now-covered-tests.txt ]]; then
+            # 曾经只是 ::warning::,于是「名单可以缩了」永远没人处理,名单只增不减。
+            # 硬失败逼着删掉已覆盖/已删除的条目,棘轮才咬得住。
+            echo "These baseline entries are now covered or no longer exist; remove them from .github/pytest-uncovered-baseline.txt:"
+            sed -n '1,9999p' /tmp/feedling-now-covered-tests.txt
+            exit 1
+          fi
+          if [[ -s /tmp/feedling-new-uncovered-tests.txt ]]; then
+            echo "New top-level pytest files are not exercised by an explicit CI list or resident-consumer discovery:"
+            sed -n '1,9999p' /tmp/feedling-new-uncovered-tests.txt
+            exit 1
+          fi
+
+      - name: Run admin usage snapshot suite (needs its own database)
+        env:
+          FEEDLING_TEST_PG: "postgresql://postgres:postgres@127.0.0.1:5432/postgres"
+        run: |
+          # ⚠️ 必须单独一次 pytest 调用,别并进上面的合并步骤。
+          # 这个文件里有几条断言的是**全局**用户口径
+          # (`..._keeps_global_current_population`、
+          #  `..._current_v2_population_excludes_resident_and_draining_states`),
+          # 而 conftest 是**每个 pytest 进程**建一个测试库、进程内所有文件共享它。
+          # 一旦和别的文件同进程,那些文件建的用户会被算进总数
+          # (实测 current_app_users 4 -> 5,coverage 0.5 -> 0.4)。
+          # 这不是测试写错了 —— 全局指标本来就该按全局断言;它只是需要独占的库。
+          python -m pytest \
+            tests/test_admin_usage.py
+
       - name: Run Hosted Runtime V2 safety and prompt-cache suites
         env:
           FEEDLING_TEST_PG: "postgresql://postgres:postgres@127.0.0.1:5432/postgres"
@@ -199,6 +260,7 @@ jobs:
           python -m pytest \
             tests/test_ci_image_tag_width.py \
             tests/test_deploy_yaml_strict.py \
+            tests/test_admin_runtime_mode.py \
             tests/test_hosted_runtime_policy.py \
             tests/test_dual_runtime_coexistence.py \
             tests/test_dual_runtime_send_routing.py \
@@ -208,13 +270,23 @@ jobs:
             tests/test_hosted_runtime_mode.py \
             tests/test_chat_send_v2_enqueue.py \
             tests/test_model_api_chat_send_routing.py \
+            tests/test_model_api_profiles_db.py \
             tests/test_model_api_profiles_endpoints.py \
             tests/test_provider_prompt_cache.py \
             tests/test_prompt_cache_canary.py \
             tests/test_provider_usage_normalize.py \
             tests/test_provider_malformed_tool_fallback.py \
+            tests/test_perception_tool_surface_contract.py \
+            tests/test_v2_tool_trace_privacy.py \
+            tests/test_chat_activity_projection.py \
+            tests/test_capabilities_tool_schema.py \
+            tests/test_debug_trace.py \
+            tests/test_access_mode_runtime_sync_unit.py \
+            tests/test_pytest_coverage_ratchet.py \
             tests/test_mcp_client.py \
+            tests/test_mcp_status.py \
             tests/test_user_mcp_core.py \
+            tests/test_user_mcp_handshake_probe.py \
             tests/test_user_mcp_probe.py \
             tests/test_user_mcp_routes.py \
             tests/test_v2_prompt_cache_key.py \
@@ -224,6 +296,8 @@ jobs:
             tests/test_prod_runner_fleet_gate.py \
             tests/test_v2_turn_metrics.py \
             tests/test_v2_whole_turn_metric.py \
+            tests/test_admin_proactive_observability.py \
+            tests/test_wake_support_indexes_migration.py \
             tests/test_v2_jobs_migration.py \
             tests/test_v2_jobs_store.py \
             tests/test_capture_prompt_v1.py \
@@ -231,7 +305,11 @@ jobs:
             tests/test_data_track_ops_views.py \
             tests/test_ops_dashboard_queries.py \
             tests/test_v2_runtime_health.py \
+            tests/test_v2_scheduler_wiring.py \
+            tests/test_v2_screen_watch_gate.py \
+            tests/test_v2_screen_watch_store.py \
             tests/test_v2_serve_worker.py \
+            tests/test_v2_serve_worker_screen_watch.py \
             tests/test_v2_worker_unit_telemetry.py \
             tests/test_v2_p0_unified_loop.py \
             tests/test_v2_p0_history_safety.py \
@@ -255,6 +333,19 @@ jobs:
             tests/test_v2_extraction.py \
             tests/test_v2_extraction_lanes.py \
             tests/test_v2_extraction_memory_integration.py \
+            tests/test_backfill_chat_bodies_to_plaintext.py \
+            tests/test_byok_plaintext_read_routing.py \
+            tests/test_content_encryption_preference.py \
+            tests/test_encryption_surface_frozen.py \
+            tests/test_envelope_storage_fields.py \
+            tests/test_no_fake_envelope_shapes.py \
+            tests/test_phase4_cutover.py \
+            tests/test_plaintext_memory_quality.py \
+            tests/test_read_side_shape_routing.py \
+            tests/test_swap_shape_transition.py \
+            tests/test_tee_carry_verbatim.py \
+            tests/test_uploaded_envelope_gate.py \
+            tests/test_write_side_format_routing.py \
             -v
 
   # Both rollout switches are default-off, so ordinary CI cannot exercise
@@ -1176,6 +1267,8 @@ jobs:
           FEEDLING_TEE_DUAL_WRITE: ${{ secrets.PROD_FEEDLING_TEE_DUAL_WRITE }}
           CVM_ID:              ${{ steps.cvmid.outputs.cvm_id }}
           FEEDLING_RUNTIME_TOKEN_SECRET: ${{ secrets.FEEDLING_RUNTIME_TOKEN_SECRET }}
+          # Empty until the environment-specific admission rollout is activated.
+          FEEDLING_V2_NEW_USER_CUTOFF:   ${{ vars.PROD_FEEDLING_V2_NEW_USER_CUTOFF }}
           FEEDLING_MIGRATE_ENABLE:      ${{ vars.FEEDLING_MIGRATE_ENABLE }}
           FEEDLING_V2_CAPTURE_ENABLED:  ${{ vars.PROD_FEEDLING_V2_CAPTURE_ENABLED || '0' }}
           # M4/M5 profile generation + MEMORY/USER prompt injection. Encrypted
@@ -1241,6 +1334,7 @@ jobs:
             -e "TEE_DATABASE_URL=$TEE_DATABASE_URL" \
             -e "FEEDLING_TEE_DUAL_WRITE=$FEEDLING_TEE_DUAL_WRITE" \
             -e "FEEDLING_RUNTIME_TOKEN_SECRET=$FEEDLING_RUNTIME_TOKEN_SECRET" \
+            -e "FEEDLING_V2_NEW_USER_CUTOFF=$FEEDLING_V2_NEW_USER_CUTOFF" \
             -e "FEEDLING_EXPECTED_RUNNER_COUNT=$FEEDLING_EXPECTED_RUNNER_COUNT" \
             -e "FEEDLING_MIGRATE_ENABLE=$FEEDLING_MIGRATE_ENABLE" \
             -e "FEEDLING_V2_CAPTURE_ENABLED=$FEEDLING_V2_CAPTURE_ENABLED" \
@@ -1435,6 +1529,8 @@ jobs:
           FEEDLING_TEE_DUAL_WRITE: ${{ secrets.TEST_FEEDLING_TEE_DUAL_WRITE }}
           CVM_ID:              ${{ steps.cvmid.outputs.cvm_id }}
           FEEDLING_RUNTIME_TOKEN_SECRET: ${{ secrets.TEST_FEEDLING_RUNTIME_TOKEN_SECRET }}
+          # Empty until the environment-specific admission rollout is activated.
+          FEEDLING_V2_NEW_USER_CUTOFF:   ${{ vars.TEST_FEEDLING_V2_NEW_USER_CUTOFF }}
           FEEDLING_MIGRATE_ENABLE:      ${{ vars.TEST_FEEDLING_MIGRATE_ENABLE }}
           FEEDLING_V2_CAPTURE_ENABLED:  ${{ vars.TEST_FEEDLING_V2_CAPTURE_ENABLED || '0' }}
           # M4/M5 profile generation + MEMORY/USER prompt injection. Encrypted
@@ -1498,6 +1594,7 @@ jobs:
             -e "TEE_DATABASE_URL=$TEE_DATABASE_URL" \
             -e "FEEDLING_TEE_DUAL_WRITE=$FEEDLING_TEE_DUAL_WRITE" \
             -e "FEEDLING_RUNTIME_TOKEN_SECRET=$FEEDLING_RUNTIME_TOKEN_SECRET" \
+            -e "FEEDLING_V2_NEW_USER_CUTOFF=$FEEDLING_V2_NEW_USER_CUTOFF" \
             -e "FEEDLING_MIGRATE_ENABLE=$FEEDLING_MIGRATE_ENABLE" \
             -e "FEEDLING_V2_CAPTURE_ENABLED=$FEEDLING_V2_CAPTURE_ENABLED" \
             -e "FEEDLING_V2_PROFILE_ENABLED=$FEEDLING_V2_PROFILE_ENABLED" \
@@ -1828,6 +1925,8 @@ jobs:
           FEEDLING_TEE_DUAL_WRITE: ${{ secrets.PRE_FEEDLING_TEE_DUAL_WRITE }}
           CVM_ID:              ${{ steps.cvmid.outputs.cvm_id }}
           FEEDLING_RUNTIME_TOKEN_SECRET: ${{ secrets.TEST_FEEDLING_RUNTIME_TOKEN_SECRET }}
+          # Empty until the environment-specific admission rollout is activated.
+          FEEDLING_V2_NEW_USER_CUTOFF:   ${{ vars.PRE_FEEDLING_V2_NEW_USER_CUTOFF }}
           FEEDLING_MIGRATE_ENABLE:      ${{ vars.TEST_FEEDLING_MIGRATE_ENABLE }}
           FEEDLING_V2_CAPTURE_ENABLED:  ${{ vars.PRE_FEEDLING_V2_CAPTURE_ENABLED || '0' }}
           # M4/M5 profile generation + MEMORY/USER prompt injection. Encrypted
@@ -1886,6 +1985,7 @@ jobs:
             -e "TEE_DATABASE_URL=$TEE_DATABASE_URL" \
             -e "FEEDLING_TEE_DUAL_WRITE=$FEEDLING_TEE_DUAL_WRITE" \
             -e "FEEDLING_RUNTIME_TOKEN_SECRET=$FEEDLING_RUNTIME_TOKEN_SECRET" \
+            -e "FEEDLING_V2_NEW_USER_CUTOFF=$FEEDLING_V2_NEW_USER_CUTOFF" \
             -e "FEEDLING_MIGRATE_ENABLE=$FEEDLING_MIGRATE_ENABLE" \
             -e "FEEDLING_V2_CAPTURE_ENABLED=$FEEDLING_V2_CAPTURE_ENABLED" \
             -e "FEEDLING_V2_PROFILE_ENABLED=$FEEDLING_V2_PROFILE_ENABLED" \

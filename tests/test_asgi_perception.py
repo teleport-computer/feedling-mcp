@@ -82,7 +82,7 @@ def env(monkeypatch):
     monkeypatch.setattr(service, "_now", lambda: 2_000_000_000.0)
     wakes: list = []
     monkeypatch.setattr(service, "_fire_wake",
-                        lambda uid, cap, hint, now: wakes.append((cap, hint)))
+                        lambda uid, cap, hint, now, **_kw: wakes.append((cap, hint)))
     monkeypatch.setattr(service, "_app_proactive_settings", lambda uid: {})
     monkeypatch.setattr(service, "_settings_v2_for_user", lambda uid: None)
     monkeypatch.setattr(service, "_fire_wake_event_v2",

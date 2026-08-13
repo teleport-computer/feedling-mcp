@@ -208,6 +208,103 @@ def test_admin_data_track_aggregates_counts_without_content(client):
     assert "private evidence" not in dumped
 
 
+def test_admin_data_track_reports_screen_frame_storage_and_freshness(client):
+    user_id, _ = _register(client)
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO frame_envelopes
+                (user_id, frame_id, ts, doc, env_meta, body_key)
+            VALUES
+                (%s, 'frame_inline', extract(epoch FROM now()) - 5,
+                 %s::jsonb, NULL, NULL),
+                (%s, 'frame_r2', extract(epoch FROM now()),
+                 NULL, %s::jsonb, 'frames/test/body')
+            """,
+            (
+                user_id,
+                json.dumps({"v": 1, "body_ct": "must-not-leak"}),
+                user_id,
+                json.dumps({"v": 1, "owner_user_id": user_id}),
+            ),
+        )
+
+    body = client.get(
+        "/v1/admin/data-track/users", headers=_admin_headers()
+    ).get_json()
+    frames = body["users"][0]["screen_frames"]
+
+    assert frames["total"] == 2
+    assert frames["inline_count"] == 1
+    assert frames["r2_count"] == 1
+    assert frames["latest_at"]
+    assert 0 <= frames["latest_age_sec"] < 30
+    assert "must-not-leak" not in json.dumps(body)
+
+    page = client.get(
+        f"/admin/data-track/users/{user_id}", headers=_admin_headers()
+    )
+    html_body = page.get_data(as_text=True)
+    assert page.status_code == 200
+    assert "屏幕帧" in html_body
+    assert "frame count" in html_body
+    assert "latest age" in html_body
+    assert "inline frames" in html_body
+    assert "R2 frames" in html_body
+
+
+def test_admin_data_track_warns_when_broadcast_is_on_but_frames_are_stale(client):
+    user_id, _ = _register(client)
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO frame_envelopes
+                (user_id, frame_id, ts, doc, env_meta, body_key)
+            VALUES
+                (%s, 'frame_stale', extract(epoch FROM now()) - 600,
+                 %s::jsonb, NULL, NULL)
+            """,
+            (user_id, json.dumps({"v": 1, "body_ct": "must-not-leak"})),
+        )
+        conn.execute(
+            """
+            INSERT INTO user_blobs (user_id, kind, doc)
+            VALUES (
+                %s,
+                'perception_state',
+                jsonb_build_object(
+                    'broadcast_state', jsonb_build_object(
+                        'v', 'on', 'ts', extract(epoch FROM now())
+                    ),
+                    'broadcast_active', jsonb_build_object(
+                        'v', true, 'ts', extract(epoch FROM now())
+                    )
+                )
+            )
+            ON CONFLICT (user_id, kind) DO UPDATE SET doc = EXCLUDED.doc
+            """,
+            (user_id,),
+        )
+
+    body = client.get(
+        "/v1/admin/data-track/users", headers=_admin_headers()
+    ).get_json()
+    frames = body["users"][0]["screen_frames"]
+
+    assert frames["broadcast_report_active"] is True
+    assert frames["broadcast_stalled"] is True
+    assert frames["latest_age_sec"] >= 599
+    assert "must-not-leak" not in json.dumps(body)
+
+    page = client.get(
+        f"/admin/data-track/users/{user_id}", headers=_admin_headers()
+    )
+    html_body = page.get_data(as_text=True)
+    assert page.status_code == 200
+    assert "屏幕共享连接可能已断开" in html_body
+    assert "停止后重新开启" in html_body
+
+
 def test_admin_data_track_surfaces_provider_health(client):
     user_id, _ = _register(client)
     with db.get_pool().connection() as conn:
@@ -1112,6 +1209,8 @@ def test_admin_route_and_notice_summary_helpers_are_explicit_allowlists(monkeypa
             "provider": "openrouter",
             "model": "vision/model-test",
             "vision_test_status": "unsupported",
+            "image_generation_test_status": "untested",
+            "last_image_generation_test_error": "",
             "last_vision_test_error": "v" * 350,
             "last_vision_test_at": "2026-07-31T19:59:00Z",
             "last_runtime_error_class": "provider_transient",
@@ -1146,10 +1245,17 @@ def test_admin_route_and_notice_summary_helpers_are_explicit_allowlists(monkeypa
     notices = _dt._notice_summaries("usr_test", limit=1)
 
     assert routes == [{
+        # image_generation 与 vision 同性质:状态是枚举、错误是我们自己的错误码
+        # (写入端 mark_image_generation_test(error=code)),都不含用户内容。
+        # 补上它们之前,生图路由在 admin 上渲染成 purpose: []，和"没有任何用途"
+        # 长得一模一样 —— 2026-08-10 查 usr_7001b1df80e2024d 的生图问题时,
+        # 决定整条分支的那个事实恰恰是唯一没被投影的那个。
         "purpose": ["chat", "vision"],
         "provider": "openrouter",
         "model": "vision/model-test",
         "vision_test_status": "unsupported",
+        "image_generation_test_status": "untested",
+        "last_image_generation_test_error": "",
         "last_vision_test_error": "v" * 300,
         "last_vision_test_at": "2026-07-31T19:59:00Z",
         "last_runtime_error_class": "provider_transient",
@@ -1225,6 +1331,8 @@ def test_detail_payload_exposes_content_free_route_errors_and_notice_summaries(c
         "provider": "openrouter",
         "model": "vision/model-test",
         "vision_test_status": "unsupported",
+        "image_generation_test_status": "untested",
+        "last_image_generation_test_error": "",
         "last_vision_test_error": "v" * 300,
         "last_vision_test_at": row["model_api_routes"][0]["last_vision_test_at"],
         "last_runtime_error_class": "provider_transient",
@@ -1236,6 +1344,8 @@ def test_detail_payload_exposes_content_free_route_errors_and_notice_summaries(c
         "provider",
         "model",
         "vision_test_status",
+        "image_generation_test_status",
+        "last_image_generation_test_error",
         "last_vision_test_error",
         "last_vision_test_at",
         "last_runtime_error_class",
@@ -1574,3 +1684,68 @@ def test_connection_health_separates_never_connected_from_went_offline():
     # A live sighting outranks a missing/false binding flag: liveness is the
     # heartbeat, and the flag is the thing we stopped trusting.
     assert health(datetime.now().isoformat(), connected=False)["status"] == "ok"
+
+
+def test_admin_data_track_reports_user_mcp_counts_without_secrets(client):
+    """A saved-but-switched-off MCP server must be distinguishable from none.
+
+    Support cannot answer "did this user actually configure a server?" today:
+    the app's connection test is a control-plane probe that dials the server
+    directly and passes without storing anything, so "the test was green" is
+    not evidence. Worse, a server that is saved but toggled OFF still produces
+    a NON-empty fingerprint and materializes cleanly on the consumer, then
+    reaches the agent as zero servers — outwardly identical to a broken apply
+    chain. ``enabled_count`` is what separates those two.
+    """
+    from hosted import mcp_core
+
+    user_id, _ = _register(client)
+    servers = [
+        {"name": "alpha", "enabled": True,
+         "config_envelope": {"id": "env_alpha",
+                             "ciphertext": "ciphertext-that-must-not-leak"},
+         "url_hint": "alpha.example.com", "header_names": ["authorization"]},
+        {"name": "beta", "enabled": False,
+         "config_envelope": {"id": "env_beta",
+                             "ciphertext": "ciphertext-that-must-not-leak"},
+         "url_hint": "beta.example.com", "header_names": ["x-api-key"]},
+    ]
+    db.set_blob(user_id, mcp_core.USER_MCP_BLOB, {
+        "fingerprint": mcp_core.compute_fingerprint(servers),
+        "servers": servers,
+    })
+
+    res = client.get("/v1/admin/data-track/users", headers=_admin_headers())
+    assert res.status_code == 200, res.get_data(as_text=True)
+    body = res.get_json()
+    row = body["users"][0]
+
+    assert row["user_mcp"]["configured"] is True
+    assert row["user_mcp"]["configured_count"] == 2
+    assert row["user_mcp"]["enabled_count"] == 1, (
+        "the disabled server must not be counted as reaching the agent")
+    # Derived, never hardcoded: this is the exact string the consumer compares
+    # its applied fingerprint against, so a change to the basis must show up
+    # here rather than silently passing against a stale literal.
+    assert row["user_mcp"]["fingerprint"] == mcp_core.compute_fingerprint(servers)
+    assert row["user_mcp"]["fingerprint"], (
+        "servers exist, so the fingerprint is non-empty even with one disabled")
+
+    # The envelope holds the url + auth headers. Counting happens in SQL
+    # precisely so none of it enters the admin process.
+    dumped = json.dumps(body)
+    assert "ciphertext-that-must-not-leak" not in dumped
+    assert "alpha.example.com" not in dumped
+    assert "x-api-key" not in dumped
+
+
+def test_admin_data_track_user_mcp_absent_reads_as_not_configured(client):
+    """No blob at all is the third state, and must not look like a failure."""
+    _register(client)
+    res = client.get("/v1/admin/data-track/users", headers=_admin_headers())
+    assert res.status_code == 200, res.get_data(as_text=True)
+    row = res.get_json()["users"][0]
+    assert row["user_mcp"] == {
+        "configured": False, "configured_count": 0,
+        "enabled_count": 0, "fingerprint": "",
+    }

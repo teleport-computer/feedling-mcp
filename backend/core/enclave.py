@@ -6,6 +6,7 @@ on THIS module — callers must invoke them as ``enclave.func()``.
 """
 
 import base64
+import contextlib
 import os
 import threading
 import time
@@ -17,6 +18,83 @@ import debug_trace
 
 _QUIET_SUCCESS_PURPOSE_PREFIXES = ("tee_replicate:",)
 _SUCCESS_TRACE_EVENT_TYPES = frozenset({"enclave.call.start", "enclave.call.done"})
+
+# —— Bulk-decrypt trace coalescing ——
+# `_decrypt_chat_rows` decrypts the prompt window one row at a time, up to
+# FEEDLING_V2_TAIL_HARD_CAP (60) rows per turn. At two success events per row
+# that is ~120 trace events for a single chat turn, against a ring that holds
+# 500 — so ONE turn evicts everything else and the debug panel shows a window
+# measured in seconds. Measured on usr_7001b1df80e2024d 2026-08-10: 182 of 200
+# retained events were purpose=v2_chat_read, and the whole trace spanned 1s.
+#
+# Per-row success events carry no diagnostic signal that the batch total does
+# not (the interesting per-row cases — error/timeout — are separate event types
+# and are NEVER coalesced). So a bulk scope collapses the successes into one
+# `enclave.call.batch` event carrying the count and the elapsed total.
+#
+# Thread-local: the scope must not leak across concurrently served users, and
+# the decrypt loop is synchronous within one thread.
+_bulk_scope = threading.local()
+
+
+class _BulkTrace:
+    __slots__ = (
+        "purpose",
+        "store",
+        "count",
+        "started_at",
+        "path",
+        "explain",
+    )
+
+    def __init__(self, purpose: str) -> None:
+        self.purpose = purpose
+        self.store = None
+        self.count = 0
+        self.started_at = time.time()
+        self.path: str | None = None
+        self.explain: str | None = None
+
+
+@contextlib.contextmanager
+def coalesced_success_trace(purpose: str):
+    """Collapse a bulk decrypt loop's per-call success events into one event.
+
+    Errors and timeouts still emit individually — a failure inside a batch is
+    exactly what someone reading the trace is looking for. Nested scopes of the
+    same purpose join the outer batch; different purposes are tracked
+    independently so a chat-row loop can fold both body and caption decrypts.
+    """
+    scopes = getattr(_bulk_scope, "active_by_purpose", None)
+    if scopes is None:
+        scopes = {}
+        _bulk_scope.active_by_purpose = scopes
+    if purpose in scopes:
+        yield
+        return
+    scope = _BulkTrace(purpose)
+    scopes[purpose] = scope
+    try:
+        yield
+    finally:
+        scopes.pop(purpose, None)
+        if not scopes:
+            try:
+                del _bulk_scope.active_by_purpose
+            except AttributeError:
+                pass
+        if scope.store is not None and scope.count:
+            _trace_enclave(
+                scope.store,
+                "enclave.call.batch",
+                purpose=purpose,
+                path=scope.path or "",
+                summary=f"enclave decrypt x{scope.count}",
+                detail={"calls": scope.count},
+                dur_ms=(time.time() - scope.started_at) * 1000,
+                explain=scope.explain
+                or ("Backend called the enclave over HTTP; only metadata is recorded."),
+            )
 
 
 # —— Pooled HTTP client ——
@@ -85,6 +163,7 @@ def _trace_enclave(
     summary: str = "",
     detail: dict | None = None,
     dur_ms: float | None = None,
+    explain: str = "Backend called the enclave over HTTP; only metadata is recorded.",
 ) -> None:
     if store is None:
         return
@@ -94,6 +173,29 @@ def _trace_enclave(
         and purpose.startswith(_QUIET_SUCCESS_PURPOSE_PREFIXES)
     ):
         return
+    scopes = getattr(_bulk_scope, "active_by_purpose", None) or {}
+    scope = scopes.get(purpose)
+    if (
+        scope is not None
+        and status == "ok"
+        and event_type in _SUCCESS_TRACE_EVENT_TYPES
+        and purpose == scope.purpose
+    ):
+        # Count the pair once, on `.done`, so the rollup reports calls not events.
+        if event_type == "enclave.call.done":
+            scope.count += 1
+        if scope.store is None:
+            scope.store = store
+        if scope.path is None:
+            scope.path = path
+        elif scope.path != path:
+            # A multi-resource proxy batch (screen frames) has no single exact
+            # route. Omit it instead of reporting the first frame's path as if
+            # every call used that resource.
+            scope.path = ""
+        if scope.explain is None:
+            scope.explain = explain
+        return
     try:
         debug_trace.trace_event(
             store,
@@ -102,7 +204,7 @@ def _trace_enclave(
             actor="backend",
             status=status,
             summary=summary,
-            explain="Backend called the enclave over HTTP; only metadata is recorded.",
+            explain=explain,
             detail={
                 "purpose": purpose,
                 "path": path,

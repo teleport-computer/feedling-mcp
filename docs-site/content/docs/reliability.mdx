@@ -218,6 +218,13 @@ validation retain the durable `processed_chunks` count and per-material
 `windows_done` / `windows_total` values after failure; only a completed job
 reports 100 percent.
 
+Estimate/commit jobs retain their opaque staged-upload identifier in trusted
+job metadata until successful completion releases the staged upload. Completed
+persona-voice map windows are checkpointed in the same encrypted envelope as
+fact-map candidates, under separate task identifiers. A manual retry can reuse
+both result sets without repeating their model calls; disabling
+`FEEDLING_GENESIS_VOICE_CHECKPOINT_ENABLED` restores full voice-map reruns.
+
 Job status also exposes `identity_ready` and material entries ordered as AI
 persona, user profile, memory summary, then chat history. Material status uses
 `queued`, `processing`, `failed`, or `done`; `cards` reports the durable mapped

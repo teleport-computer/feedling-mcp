@@ -371,5 +371,18 @@ def test_enclave_fetch_item_returns_v1_full_card_without_sensitive_scope():
         "last_referenced_at": "",
         "voice_call_id": "",
         "is_sensitive": True,
+        "voice_call_id": "",
     }
     assert "sensitive_scope" not in item
+
+    voice_inner = {
+        "summary": "Voice memory",
+        "content": "Transcript-derived memory",
+        "bucket": "comfort",
+        "threads": ["voice"],
+        "voice_call_id": "vcall_123",
+    }
+    fetch_item = readside.build_memory_fetch_item({"id": "mem_voice"}, voice_inner)
+    index_item = readside.build_memory_index_item({"id": "mem_voice"}, voice_inner)
+    assert fetch_item["voice_call_id"] == "vcall_123"
+    assert "voice_call_id" not in index_item

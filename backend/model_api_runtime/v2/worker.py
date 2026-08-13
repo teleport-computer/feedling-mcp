@@ -66,11 +66,14 @@ from provider_types import (
     ToolExchange,
     ToolResult,
 )
+from capabilities import history as cap_history
 from capabilities import registry as cap_registry
+from capabilities import result_budget as cap_result_budget
 from capabilities import tool_schema as cap_tool_schema
 from core import chat_activity as core_chat_activity
 from core import envelope as core_envelope
 from core import protocol_leak
+from core import util as core_util
 from core import provider_usage
 from core import store as core_store
 from core import wake_bus as core_wake_bus
@@ -79,9 +82,15 @@ from perception.glance import (
     perception_glance_fingerprint,
     project_perception_wake_events,
 )
+from perception.agent_fields import (
+    AGENT_PERCEPTION_SIGNALS,
+    FAST_AGENT_PERCEPTION_SIGNALS,
+)
+from screen import screen_read_core
 from model_api_runtime.v2 import coalesce as v2_coalesce
 from model_api_runtime.v2 import compaction as v2_compaction
 from model_api_runtime.v2 import context
+from model_api_runtime.v2 import screen_chat as v2_screen_chat
 from model_api_runtime.v2 import cursor as v2_cursor
 from model_api_runtime.v2 import document_render as v2_document_render
 from model_api_runtime.v2 import effect_outbox as v2_effect_outbox
@@ -114,7 +123,7 @@ from memory.capture_prompt_v1 import (
 from identity.user_naming import transcript_speaker_label
 from memory.card_text import (
     count_user_token_residuals,
-    is_card_format_error,
+    is_retryable_parse_error,
 )
 from memory import dream_gates as memory_dream_gates
 from memory.dream_prompt_v1 import (
@@ -478,6 +487,25 @@ if (
     raise RuntimeError(
         "FEEDLING_V2_TOOL_BATCH_RESULT_CHAR_CAP is too small for stable errors"
     )
+# Atomic-JSON producers (history tools) are reserved in full by the batch
+# water-fill and are never string-sliced, so their per-tool caps and this
+# batch cap have to be consistent with each other. Checked here, once, against
+# the deployment's real numbers — see capabilities/result_budget.py.
+#
+# Only while history is actually on. The kill switch has to restore the exact
+# pre-history startup contract, and a batch cap that was legal before the
+# history tools existed (it only had to clear MAX_TOOL_CALLS_PER_ROUND ×
+# MIN_TOOL_RESULT_ERROR_QUOTA) must not keep the worker from booting once the
+# feature is switched off — otherwise the valve cannot roll anything back.
+# The switch is read at call time, so a process that boots with history off and
+# is turned on later re-runs this check there; see
+# ``_history_tools_enabled_for_turn``.
+cap_result_budget.validate_result_caps(
+    batch_cap=TOOL_BATCH_RESULT_CHAR_CAP,
+    tool_names=(
+        cap_result_budget.ATOMIC_TOOL_NAMES if cap_history.enabled() else ()
+    ),
+)
 # This is a true wall deadline around the whole async MCP call, including time
 # waiting for the per-round read gate. Unlike synchronous platform capabilities,
 # MCP's httpx coroutine is cancellable and therefore safe to wrap in wait_for.
@@ -501,6 +529,14 @@ if not math.isfinite(MCP_TURN_WALL_BUDGET_SEC) or MCP_TURN_WALL_BUDGET_SEC <= 0:
     raise RuntimeError(
         "FEEDLING_V2_MCP_TURN_WALL_BUDGET_SEC must be positive and finite"
     )
+# History tools' cumulative per-chat-turn budget (spec §5): raw rows OR wall
+# seconds, whichever exhausts first,累计跨 provider round（两工具合计）。
+# Exhaustion is not a turn failure — later history calls get a short error
+# while every other tool keeps working.
+HISTORY_TURN_MAX_ROWS = _positive_int_env("FEEDLING_V2_HISTORY_TURN_MAX_ROWS", "1500")
+HISTORY_TURN_MAX_WALL_SEC = _positive_float_env(
+    "FEEDLING_V2_HISTORY_TURN_MAX_WALL_SEC", "8"
+)
 # 跨所有 job 共享的 enclave 并发闸（provider-key 解密 + chat 解密 + capability 调用都过它）。治 R3。
 ENCLAVE_CONCURRENCY = _positive_int_env("FEEDLING_V2_ENCLAVE_CONCURRENCY", "2")
 ENCLAVE_SEMAPHORE = asyncio.Semaphore(ENCLAVE_CONCURRENCY)
@@ -693,6 +729,11 @@ _PRIVATE_READ_TOOLS = frozenset(
         # 该再有出站通道(web/MCP),否则原话可以被原样带出去。
         # list 只返回元信息(时间/时长/轮数),不含内容,故不入此集合。
         "voice_transcript_read",
+        # Raw chat history is the most private read of all (spec §6): once the
+        # model has observed it, later outbound web/MCP/task calls are fenced
+        # for the rest of the turn via tool_loop's shared private-read boundary.
+        cap_history.HISTORY_SEARCH_TOOL,
+        cap_history.HISTORY_FETCH_TOOL,
         cap_tool_schema.PROVIDER_USAGE_TOOL,
     }
 )
@@ -731,6 +772,61 @@ def _safe_eager_screen_metadata(data: object) -> dict:
     ):
         safe["total"] = total
     return safe
+
+
+def _screen_share_grounding(user_id: str) -> dict:
+    """聊天回合的屏幕共享健康提示 —— **只回状态,不回内容**。
+
+    为什么需要它:`CHAT_SYSTEM_PROMPT` 早就写了「请求涉及 shared screen 就用 screen
+    工具」,但同一句后半段是「无关对话别调这些工具」。模型**无从知道此刻有没有共享
+    在进行**,于是保守地不调 —— 用户的体感就是「它看不见我的屏幕」,而后端其实一直
+    收着帧(usr_7001b1df80e2024d 2026-08-10:共享在推流、开关全开,两小时 123 个回合
+    没有一次读屏)。补上这个信号,模型才有依据决定要不要 screen_read。
+
+    两条硬约束:
+    ① **不碰 enclave**。走 `db.frame_list_meta`(服务端明文的 frame_id/ts 索引),
+       和 serve_worker 的屏幕监看生产者同一条路 —— 这个函数在**每个聊天回合**都跑,
+       一次 enclave 往返会锤死共享解密代理的容量。
+    ② **只回状态与秒数**。frame_id / caption / 窗口标题一律不进这个可用性块。
+       只要当前路由没有明确的 unsupported 反证,调用方就另走有界推帧路径,把
+       像素标成不可信应用数据,并在第一轮 provider 调用之前先建立出站执行栅栏。
+
+    设备仍报告开启、但帧超过五分钟未更新时返回 stalled 状态和重启建议；最新
+    可识别广播状态为 off 且这一场有过帧时返回 ended，说明旧画面仍可讨论但
+    不再是当前屏幕。两种状态都不解密旧帧。从未共享(或读取失败)时返回 {}，
+    调用方据此整块省略 —— 不共享的用户 prompt 一个字都不变，provider 侧前缀缓存不受影响。
+    """
+    return screen_read_core.screen_share_grounding(user_id)
+
+
+def _screen_vision_allows_pixels(verdict: Any) -> bool:
+    """Optimistically admit pixels unless this route is known unsupported.
+
+    ``untested`` and a missing verdict are the normal first-turn state. The
+    provider fallback strips only our tagged screen block, retries the user's
+    text once, and persists ``unsupported`` after that retry succeeds, so lack
+    of a probe is not evidence that pixels must be silently withheld.
+    """
+    if not isinstance(verdict, dict):
+        return True
+    return str(verdict.get("vision_test_status") or "").strip().lower() != (
+        "unsupported"
+    )
+
+
+def _mark_screen_route_vision_unsupported(user_id: str, verdict: Any) -> bool:
+    """Persist a learned rejection behind the exact route-version fence."""
+    if not isinstance(verdict, dict) or not verdict.get("id"):
+        return False
+    return bool(
+        db.model_api_route_mark_vision_test(
+            user_id,
+            str(verdict["id"]),
+            status="unsupported",
+            error="vision_model_incompatible",
+            expected_updated_at=str(verdict.get("updated_at") or ""),
+        )
+    )
 
 
 def _read_blocks_later_outbound(tool_call) -> bool:
@@ -1220,6 +1316,9 @@ class TurnDeps:
     # read_tail，b64 会进摘要器 prompt，且该用户历史上每张图都会被解密一次。默认 None：
     # worker.py 自身不 import hosted/capabilities 的装配细节；生产装配见 serve_worker。
     read_images: Callable[[str, list[str]], dict[str, dict]] | None = None
+    # Foreground screen-share pixels. Production returns a bounded decrypted
+    # batch plus content-free cache counters; callers must hold enclave_sem.
+    read_screen_frames: Callable[[str, list[str]], dict[str, Any]] | None = None
     # (user_id, prompt, main config, auth) -> tuple[ProviderMedia, ...]. The
     # assembly tier resolves the optional dedicated route and decrypts only its
     # credential. The model-facing tool stays provider-neutral.
@@ -1269,9 +1368,15 @@ class TurnDeps:
     read_perception_wake_context: Callable[[str, int], list[dict]] | None = None
     # Pending timer identity lets follow-ups use a backend-confirmed wake_id.
     read_pending_scheduled_wake_context: Callable[[str], dict] | None = None
-    # Chat-only World Book match. The assembly callback decrypts and matches the
-    # user's entries against this turn's current user text, returning
-    # {"block": str, "matched_names": [...]}. Wake lanes never call it.
+    # World Book match. The assembly callback decrypts the user's entries and
+    # matches them against whatever messages it is handed, returning
+    # {"block": str, "matched_names": [...]}.
+    #
+    # **Every lane where the companion speaks in its own voice calls it.** chat
+    # passes this turn's user text; wake lanes pass the reminder note (scheduled)
+    # or an empty list (heartbeat / manual_wake / screen_watch) — an empty list
+    # is precisely what selects alwaysOn-only. See `_run_wake` for why the
+    # signal differs per lane.
     read_worldbook_context: Callable[..., dict] | None = None
     # (user_id, actions) -> result dict：把抽取产出的 memory.add/memory.supersede action 落库
     # （走既有 /v1/memory/actions 同路径的服务端实现）。None 时跳过持久化、仍干净 mark_completed
@@ -1356,6 +1461,11 @@ class TurnDeps:
     seal_trajectory_payload: Callable[[str, bytes, str], dict] | None = None
     # (user_id, envelope, runtime_token) -> plaintext bytes
     open_trajectory_payload: Callable[[str, dict, str], bytes] | None = None
+    # Content-free admin/debug trace boundary. Production resolves the user's
+    # store and delegates to serve_worker._emit_v2_debug_trace; worker stays
+    # dependency-clean and tests may inject a collector. Observability is always
+    # best-effort and must never affect tool execution.
+    emit_debug_trace: Callable[..., None] | None = None
 
 
 class _EmptyMcpTurn:
@@ -1451,6 +1561,191 @@ class _McpTurnWallBudget:
     def finish_call(self, started_at: float) -> None:
         elapsed = max(0.0, float(self.clock()) - float(started_at))
         self.used_sec = min(self.limit_sec, self.used_sec + elapsed)
+
+
+@dataclass(frozen=True)
+class _HistoryCallLease:
+    """What one history call is allowed to spend, decided before it starts."""
+
+    max_rows: int
+    deadline_ms: int
+    started_at: float
+
+
+@dataclass
+class _HistoryTurnBudget:
+    """Cumulative history-tool budget shared by one chat turn (spec §5).
+
+    Raw rows and wall seconds accumulate across provider rounds for BOTH
+    history tools combined; whichever limit is reached first stops later
+    history calls (short error, never a turn failure). ``lock`` keeps history
+    calls serial through the executor even if a future dispatcher overlaps
+    platform reads — today the per-round single-call gate plus strictly
+    sequential provider rounds already imply serial execution, so the lock is
+    a cheap invariant, not the mechanism. Rows are charged from the trusted
+    capability metadata (``history_scanned_rows``); wall time is charged
+    around the whole executor dispatch, which deliberately over-counts DB and
+    transport time — conservative in the same direction as
+    ``_McpTurnWallBudget``.
+
+    Reserve BEFORE the call, settle after (``reserve_call``/``settle_call``).
+    Only checking "is it exhausted?" up front turns the turn budget into a
+    limit on the call *after* the offending one: at 1499/1500 used rows the
+    next call would still be handed the full per-call 512, and at 7.9s/8s the
+    full 2.5s — so a turn could really scan 2011 rows in 10.4s. The lease
+    carries the remainder, and the facade clamps this call's per-call budget
+    down to it.
+    """
+
+    max_rows: int
+    max_wall_sec: float
+    clock: Callable[[], float] = time.monotonic
+    used_rows: int = 0
+    used_sec: float = 0.0
+
+    def __post_init__(self) -> None:
+        self.max_rows = int(self.max_rows)
+        self.max_wall_sec = float(self.max_wall_sec)
+        if self.max_rows <= 0:
+            raise ValueError("history turn row budget must be positive")
+        if not math.isfinite(self.max_wall_sec) or self.max_wall_sec <= 0:
+            raise ValueError("history turn wall budget must be positive and finite")
+        self.lock = asyncio.Lock()
+
+    def exhausted(self) -> bool:
+        return self.used_rows >= self.max_rows or self.used_sec >= self.max_wall_sec
+
+    def remaining_rows(self) -> int:
+        return max(0, self.max_rows - self.used_rows)
+
+    def remaining_ms(self) -> int:
+        return max(0, round((self.max_wall_sec - self.used_sec) * 1000))
+
+    def reserve_call(self) -> _HistoryCallLease | None:
+        """Lease this turn's remaining budget to one call; None = exhausted."""
+        if self.exhausted():
+            return None
+        return _HistoryCallLease(
+            max_rows=self.remaining_rows(),
+            deadline_ms=self.remaining_ms(),
+            started_at=float(self.clock()),
+        )
+
+    def settle_call(self, lease: _HistoryCallLease, *, scanned_rows: int = 0) -> None:
+        """Charge what the call actually spent (rows come from trusted metadata)."""
+        elapsed = max(0.0, float(self.clock()) - float(lease.started_at))
+        self.used_sec += elapsed
+        self.used_rows += max(0, int(scanned_rows))
+
+
+def _history_tools_enabled_for_turn() -> bool:
+    """History 这一轮到底开不开：kill switch + atomic cap 配置的联合判定。
+
+    两件事必须放在一起，因为**开关是调用时读 env 的**：一个「关着启动」的进程
+    里，import 期那道 atomic cap 校验被跳过了（关掉的功能不该拦住启动，见那里
+    的注释）；如果之后有人把开关打开，就会绕过校验，模型收到的 history 结果会
+    在下游被切成半截 JSON。所以开启这一侧自己再验一次。
+
+    验不过就**当作没开**（fail-closed），而不是抛异常：坏配置只该让这两个工具
+    消失，不该打断整个聊天回合。
+    """
+    if not cap_history.enabled():
+        return False
+    try:
+        cap_result_budget.validate_result_caps(
+            batch_cap=TOOL_BATCH_RESULT_CHAR_CAP,
+            tool_names=cap_result_budget.ATOMIC_TOOL_NAMES,
+        )
+    except RuntimeError as exc:
+        log.error("[v2.history] tools withheld — result cap config: %s", exc)
+        return False
+    return True
+
+
+# executor 自己产生的、带自由文本尾巴的三种拒绝（全部在 capability 之前）。
+_HISTORY_PRE_SCAN_ERROR_PREFIXES = (
+    "error: unparseable args for ",
+    "error: unknown tool ",
+    "error: invalid args for ",
+)
+
+
+def _history_never_reached_the_scan(content: str) -> bool:
+    """这条 ToolResult 是否证明「一行原文都没读过」。
+
+    只认 executor / capability 自己写的稳定错误词面——provider 文本永远进不了
+    ``ToolResult.content`` 的这几种形态（失败结果只回显错误码，见
+    ``executor._summarize_capability_result``）。
+    """
+    text = str(content or "")
+    if any(text.startswith(prefix) for prefix in _HISTORY_PRE_SCAN_ERROR_PREFIXES):
+        return True
+    if not text.startswith("error: "):
+        return False
+    return text[len("error: "):].strip() in cap_history.PRE_SCAN_ERROR_CODES
+
+
+def _history_rows_charged(result, lease: _HistoryCallLease) -> int:
+    """这次 history 调用要向回合预算扣多少 raw 行（spec §5）。
+
+    三态，不是两态：
+
+    * 可信 metadata 有计数 → 按实际值（含**可信的实际 0**）。
+    * 明确未触达扫描的错误 → 0（``PRE_SCAN_ERROR_CODES`` 与 executor 的三种
+      参数拒绝，全部发生在第一次 enclave POST 之前）。
+    * 其余「已经开跑但用量未知」→ **按 lease 上限保守结算**。
+
+    第三档是这个函数存在的理由。以前拿不到 metadata 就记 0：capability 抛异常
+    被 executor 吞成 ``error: capability_failed``（executor 刻意隔离单个坏读，
+    不让它拖垮整轮）时，enclave 可能已经解了 1500 行，账上却是 0，下一次照样
+    租出满额——多轮快速失败即可突破回合累计闸。宁可多扣，不许白嫖。
+    """
+    metadata = getattr(result, "metadata", None) or {}
+    rows = metadata.get("history_scanned_rows")
+    if isinstance(rows, int) and not isinstance(rows, bool):
+        return max(0, rows)
+    if _history_never_reached_the_scan(getattr(result, "content", "")):
+        return 0
+    return max(0, int(lease.max_rows))
+
+
+_HISTORY_ROUND_LIMIT_ERROR = (
+    "error: history_round_limit; only one history call is allowed per round — "
+    "re-issue this call in the next round"
+)
+_HISTORY_TURN_BUDGET_ERROR = (
+    "error: history_turn_budget_exhausted; continue with next_cursor in a "
+    "later turn"
+)
+
+
+def _history_round_blocked_results(tool_calls, *, budget) -> dict[str, ToolResult]:
+    """Round half of the spec §5 history gate, decided in provider order.
+
+    Returns ``{call_id: ToolResult}`` for history calls that must NOT dispatch
+    this round: every history call once the turn budget is exhausted, otherwise
+    every history call after the first. Deciding on the whole batch here (not
+    per-coroutine) keeps "which call was first" deterministic under the mixed
+    dispatcher's read overlap. Non-history calls are never touched, so with the
+    feature disabled this function returns an empty mapping and the round
+    behaves exactly as before.
+    """
+    blocked: dict[str, ToolResult] = {}
+    seen_allowed = False
+    for tc in tool_calls:
+        if str(getattr(tc, "name", "")) not in cap_history.HISTORY_TOOL_NAMES:
+            continue
+        if budget is not None and budget.exhausted():
+            blocked[str(tc.id)] = ToolResult(
+                call_id=tc.id, content=_HISTORY_TURN_BUDGET_ERROR
+            )
+        elif seen_allowed:
+            blocked[str(tc.id)] = ToolResult(
+                call_id=tc.id, content=_HISTORY_ROUND_LIMIT_ERROR
+            )
+        else:
+            seen_allowed = True
+    return blocked
 
 
 def _mcp_mutating_names_for_turn(mcp_turn) -> frozenset[str]:
@@ -2040,6 +2335,10 @@ class TurnMetrics:
     effective_tail_turns: int | None = None
     tail_fallback: bool = False
     prompt_frontier_exhaustion_count: int = 0
+    screen_frames_pushed: int = 0
+    screen_frame_cache_hits: int = 0
+    screen_frame_cache_misses: int = 0
+    visible_reply_count: int = 0
     _flushed: bool = False
     _started: float = 0.0
 
@@ -2141,6 +2440,19 @@ class TurnMetrics:
             self.prompt_frontier_exhaustion_count + 1,
         )
 
+    def record_screen_frames(
+        self, *, pushed: int, cache_hits: int, cache_misses: int
+    ) -> None:
+        self.screen_frames_pushed = max(0, int(pushed))
+        self.screen_frame_cache_hits = max(0, int(cache_hits))
+        self.screen_frame_cache_misses = max(0, int(cache_misses))
+
+    def record_visible_reply(self) -> None:
+        self.visible_reply_count = min(
+            (1 << 31) - 1,
+            self.visible_reply_count + 1,
+        )
+
     def flush(self, *, failed: bool, status: str) -> None:
         """Idempotent per-job upsert; guarded so this SAME accumulator instance
         never double-writes even if a lane handler somehow reaches two terminal
@@ -2181,6 +2493,10 @@ class TurnMetrics:
             prompt_frontier_exhaustion_count=(
                 self.prompt_frontier_exhaustion_count
             ),
+            screen_frames_pushed=self.screen_frames_pushed,
+            screen_frame_cache_hits=self.screen_frame_cache_hits,
+            screen_frame_cache_misses=self.screen_frame_cache_misses,
+            visible_reply_count=self.visible_reply_count,
             latency_ms=latency_ms,
             model_calls=self.model_calls,
             retries=self.retries,
@@ -2394,6 +2710,94 @@ def _make_tool_trajectory_callback(
     return _record
 
 
+_PERCEPTION_TRACE_TOOLS = frozenset({
+    "perception_snapshot",
+    "perception_history",
+    "perception_trend",
+})
+_PERCEPTION_TRACE_SIGNALS = frozenset(AGENT_PERCEPTION_SIGNALS)
+
+
+def _v2_tool_trace_detail(
+    tc,
+    *,
+    event_kind: str,
+    result: ToolResult | None,
+    duration_ms: float | None,
+) -> dict[str, Any]:
+    """Project one terminal tool boundary to content-free debug metadata."""
+    tool = core_chat_activity.safe_token(getattr(tc, "name", ""), max_len=120)
+    content = result.content if isinstance(result, ToolResult) else ""
+    metadata = result.metadata if isinstance(result, ToolResult) else {}
+    failed = (
+        event_kind == "tool_call_error"
+        or str(content or "").strip().lower().startswith("error:")
+    )
+    result_kind = "error" if failed else _generic_tool_result_kind(content)
+    error_code = "tool_error" if failed else ""
+    if tool in _PERCEPTION_TRACE_TOOLS and isinstance(metadata, dict):
+        projected_kind = str(metadata.get("perception_result_kind") or "")
+        if projected_kind in {"empty", "value", "error"}:
+            result_kind = projected_kind
+            failed = projected_kind == "error"
+        projected_code = core_chat_activity.safe_token(
+            metadata.get("perception_error_code"), max_len=64
+        ).lower()
+        if projected_code:
+            error_code = projected_code
+    detail: dict[str, Any] = {
+        "tool": tool,
+        "args": _v2_tool_trace_args(tc),
+        "result_status": "err" if failed else "ok",
+        "result_kind": result_kind,
+    }
+    if duration_ms is not None:
+        detail["dur_ms"] = duration_ms
+    if failed:
+        detail["error_code"] = error_code or "tool_error"
+    return detail
+
+
+def _v2_tool_trace_args(tc) -> dict[str, Any]:
+    """Keep only catalog-backed perception signal names, never user content."""
+    tool = str(getattr(tc, "name", "") or "")
+    if tool not in _PERCEPTION_TRACE_TOOLS:
+        return {}
+    raw_args = getattr(tc, "args", None)
+    args = raw_args if isinstance(raw_args, dict) else {}
+    if tool == "perception_snapshot":
+        raw_signals = args.get("signals")
+        if not isinstance(raw_signals, list) or not raw_signals:
+            return {
+                "signals": list(FAST_AGENT_PERCEPTION_SIGNALS),
+                "defaulted": True,
+            }
+        signals = [
+            value
+            for value in raw_signals
+            if isinstance(value, str) and value in _PERCEPTION_TRACE_SIGNALS
+        ]
+    else:
+        value = args.get("signal")
+        signals = (
+            [value]
+            if isinstance(value, str) and value in _PERCEPTION_TRACE_SIGNALS
+            else []
+        )
+    return {"signals": signals}
+
+
+def _generic_tool_result_kind(content: Any) -> str:
+    text = str(content or "").strip()
+    if not text or text.lower() == "ok":
+        return "empty"
+    try:
+        value = json.loads(text)
+    except (TypeError, ValueError):
+        return "value"
+    return "empty" if value in (None, "", [], {}) else "value"
+
+
 def _make_chat_tool_activity_callback(
     *,
     user_id: str,
@@ -2401,12 +2805,14 @@ def _make_chat_tool_activity_callback(
     attempt_identity: int,
     recorder: v2_trajectory.TrajectoryRecorder | None,
     effect_evidence_by_call: dict[str, dict],
+    emit_debug_trace: Callable[..., None] | None = None,
 ):
     """Write a display-safe status row at each confirmed V2 tool boundary."""
     trajectory_callback = _make_tool_trajectory_callback(
         recorder, effect_evidence_by_call
     )
     invocation_ids: dict[int, str] = {}
+    started_monotonic: dict[int, float] = {}
     ordinal = itertools.count(1)
 
     async def _record(tc, event_kind: str, payload: dict) -> None:
@@ -2418,8 +2824,11 @@ def _make_chat_tool_activity_callback(
             invocation_ids[object_key] = (
                 f"{job_id}:{int(attempt_identity)}:{next(ordinal)}"
             )
+        if event_kind == "tool_call_started":
+            started_monotonic[object_key] = time.monotonic()
         result = payload.get("result")
         result_content = result.content if isinstance(result, ToolResult) else ""
+        result_metadata = result.metadata if isinstance(result, ToolResult) else {}
         effect = effect_evidence_by_call.get(str(tc.id)) or {}
         detail: dict[str, Any] = {
             "activity_id": invocation_ids[object_key],
@@ -2428,6 +2837,16 @@ def _make_chat_tool_activity_callback(
             "state": core_chat_activity.event_state(event_kind, result_content),
         }
         duration = core_chat_activity.safe_duration_ms(payload.get("duration_ms"))
+        if (
+            duration is None
+            and event_kind in {"tool_call_result", "tool_call_error"}
+        ):
+            started_at = started_monotonic.get(object_key)
+            duration = core_chat_activity.safe_duration_ms(
+                (time.monotonic() - started_at) * 1000.0
+                if started_at is not None
+                else 0.0
+            )
         if duration is not None:
             detail["duration_ms"] = duration
         if event_kind == "tool_call_error":
@@ -2436,6 +2855,12 @@ def _make_chat_tool_activity_callback(
             detail["result_code"] = core_chat_activity.result_code(
                 result_content, effect
             )
+            if str(tc.name or "") == cap_tool_schema.IMAGE_REPLY_TOOL:
+                image_code = core_chat_activity.image_generation_result_code(
+                    (result_metadata or {}).get("image_generation_result_code")
+                )
+                if image_code:
+                    detail["result_code"] = image_code
         for key, target, limit in (
             ("effect_id", "effect_id", 160),
             ("effect_type", "effect_type", 80),
@@ -2473,8 +2898,45 @@ def _make_chat_tool_activity_callback(
                 job_id,
                 type(exc).__name__.lower(),
             )
+        if (
+            emit_debug_trace is not None
+            and event_kind in {"tool_call_result", "tool_call_error"}
+        ):
+            try:
+                trace_detail = _v2_tool_trace_detail(
+                    tc,
+                    event_kind=event_kind,
+                    result=result,
+                    duration_ms=duration,
+                )
+                await asyncio.to_thread(
+                    emit_debug_trace,
+                    user_id,
+                    "agent.tool.call",
+                    status=(
+                        "ok" if trace_detail["result_status"] == "ok" else "error"
+                    ),
+                    summary=(
+                        f"V2 {trace_detail['tool']} {trace_detail['result_status']}"
+                    ),
+                    explain=(
+                        f"V2 tool {trace_detail['tool']} finished "
+                        f"{trace_detail['result_status']} in "
+                        f"{int(trace_detail.get('dur_ms') or 0)}ms"
+                    ),
+                    detail=trace_detail,
+                    dur_ms=duration,
+                )
+            except Exception as exc:  # noqa: BLE001 — diagnostics are best-effort
+                log.warning(
+                    "[v2.tool_trace] emit failed user=%s job=%s code=%s",
+                    user_id,
+                    job_id,
+                    type(exc).__name__.lower(),
+                )
         if event_kind in {"tool_call_result", "tool_call_error"}:
             invocation_ids.pop(object_key, None)
+            started_monotonic.pop(object_key, None)
 
     return _record
 
@@ -3119,6 +3581,7 @@ def _make_build_messages_fn(
     tail_anchor_seq: int | None = None,
     application_data_role: str = "user",
     manual_wake: bool = False,
+    screen_frame_message: dict[str, Any] | None = None,
 ) -> Callable[[list], list]:
     """Build the fixed base prompt plus the loop's chronological native transcript.
 
@@ -3195,6 +3658,7 @@ def _make_build_messages_fn(
             temporal_context=_temporal_for(rendered_tail),
             application_data_role=application_data_role,
             manual_wake=manual_wake,
+            screen_frame_message=screen_frame_message,
         )
 
     base_messages = _base(optional_turns)
@@ -3255,6 +3719,7 @@ def _make_build_messages_fn(
             safety_margin_tokens: int | None,
             utf8_bytes_per_token: float,
             image_reserve_tokens: int,
+            required_tool_names=(),
             system_suffix: str = "",
         ) -> tuple[list, Any, dict]:
             rendered_transcript: list = []
@@ -3287,6 +3752,7 @@ def _make_build_messages_fn(
                     model_limit=model_limit,
                     messages=messages,
                     tools=tools,
+                    required_tool_names=required_tool_names,
                     output_reserve_tokens=output_reserve_tokens,
                     safety_margin_tokens=safety_margin_tokens,
                     utf8_bytes_per_token=utf8_bytes_per_token,
@@ -3941,15 +4407,40 @@ def _memory_tool_actions(raw_actions) -> list[dict]:
         inner = {
             "summary": summary,
             "content": content or summary,
-            "bucket": str(a.get("bucket") or nested.get("bucket") or "").strip(),
-            "threads": (
-                list(a.get("threads") or [])
-                if isinstance(a.get("threads"), list)
-                else list(nested.get("threads") or [])
-                if isinstance(nested.get("threads"), list)
-                else []
-            ),
+            # 「发生时间」在 ENQUEUE 这一刻冻结,不留给 apply 时再取。V2 的 effect 是
+            # 排队异步落库的:队列一卡,几小时后才落库,时间就串了;同一条 effect 重放
+            # 两次还会拿到两个不同的时间。V1 是同步写(说话即落库)所以没这问题,
+            # 这里就是对齐它。同 `_frozen_relationship_anchor` 的惯例(也在 enqueue 冻结)。
+            #
+            # 刻意放在字典**前面**、且不读 a.get("occurred_at"):这是服务端的可信元数据,
+            # 不接受模型自报(schema 里也没有这个字段)。
+            "occurred_at": core_util._now_iso(),
         }
+        # ⚠️ 只在模型**真的传了**的时候才放这两个键。
+        #
+        # update 走的是 supersede(新写一张替换旧的),`actions._memory_supersede_action`
+        # 用 `{**inherited, **raw}` 从旧卡继承 bucket/threads —— 键一旦存在,空值
+        # 照样覆盖继承值。以前这里无条件写 bucket=""/threads=[],于是 V2 上**每一次**
+        # 改记忆卡,桶都掉回「未分类」、标签全清空(2026-08-10 实测)。threads 尤其致命:
+        # schema 至今不允许模型传,所以那条路必然清空。
+        #
+        # 「没传」和「显式传空」必须保持可区分:前者继承旧卡,后者才是用户要清空。
+        bucket = str(a.get("bucket") or nested.get("bucket") or "").strip()
+        if bucket:
+            inner["bucket"] = bucket
+        threads_raw = (
+            a.get("threads") if isinstance(a.get("threads"), list)
+            else nested.get("threads") if isinstance(nested.get("threads"), list)
+            else None
+        )
+        if threads_raw is not None:
+            inner["threads"] = list(threads_raw)
+        # 评分同理:同样要区分「没传」(继承旧卡)和「传了」。⚠️ 不能用 `or`——
+        # importance=0 / pulse=0 是合法取值,`or` 会把它们吞成没传。
+        for score in ("importance", "pulse"):
+            value = a.get(score, nested.get(score))
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                inner[score] = value
         base = {
             "reason": reason,
             "capture_mode": "agent_tool",
@@ -5522,6 +6013,7 @@ def _preflight_adaptive_builder(
     planner(
         transcript=[],
         tools=None,
+        required_tool_names=(),
         model_limit=model_limit,
         output_reserve_tokens=PROMPT_OUTPUT_RESERVE_TOKENS,
         safety_margin_tokens=PROMPT_SAFETY_MARGIN_TOKENS,
@@ -7385,6 +7877,10 @@ async def _run_wake(
         wake_system_prompt = _WAKE_SYSTEM_PROMPT
         scheduled_activity_events: list[dict] = []
         scheduled_runtime_data: list[dict[str, Any]] = []
+        # 与上面两个同级预初始化：下面的世界书匹配要读它，而它原本只在
+        # `if lane == "scheduled"` 分支里才诞生。靠调用处的条件表达式惰性求值
+        # 也能躲过 NameError，但那是隐式契约，重构一动就炸。
+        scheduled_notes: list[str] = []
         perception_wake_context: list[dict] = []
         wake_observed_generation = observed_generation
         consumed_perception_context_seq = 0
@@ -7403,7 +7899,6 @@ async def _run_wake(
                 if scheduled_context or attempt == 2:
                     break
                 await asyncio.sleep(0.05)
-            scheduled_notes: list[str] = []
             for index, item in enumerate(scheduled_context[:10]):
                 if not isinstance(item, dict):
                     continue
@@ -7548,6 +8043,14 @@ async def _run_wake(
                     ),
                 )
             )
+            screen_share_state = await asyncio.to_thread(
+                _screen_share_grounding, user_id
+            )
+            if screen_share_state:
+                grounding_results = grounding_results or {}
+                grounding_results["screen_share"] = [
+                    {"ok": True, "data": screen_share_state}
+                ]
         if scheduled_runtime_data:
             grounding_results = grounding_results or {}
             grounding_results["scheduled_wakes"] = [
@@ -7703,6 +8206,13 @@ async def _run_wake(
         wake_disabled_tool_names = wake_disabled_web_tool_names | {
             cap_tool_schema.PROVIDER_USAGE_TOOL,
             cap_tool_schema.MEMORY_ORGANIZE_TOOL,
+            # History tools are chat-lane only (spec §6 offer gate): the
+            # proactive companion must never browse raw history on its own.
+            # Withheld unconditionally — not tied to the kill switch — and the
+            # executor's dispatch gate (history_tools_allowed defaults False)
+            # backstops any direct call that skips this catalog.
+            cap_history.HISTORY_SEARCH_TOOL,
+            cap_history.HISTORY_FETCH_TOOL,
         }
 
         dispatch_task_batch = _make_task_batch_dispatcher(
@@ -7937,9 +8447,17 @@ async def _run_wake(
             from core import self_thinking as _st_wake
 
             _wake_self_thinking_on = _st_wake.enabled()
+            # 与聊天出口同样解耦：关掉 self-thinking 不能顺带关掉安全剥离
+            # （Codex review 2026-08-08 Critical）。SILENT 语义不变。
+            _wake_gate_on = _st_wake.gate_enabled()
             _wake_self_thinking_text = ""
-            if _wake_self_thinking_on and text:
-                _wst_status, _wst_thinking, _wst_reply = _st_wake.split_thinking(text)
+            if (_wake_gate_on or _wake_self_thinking_on) and text:
+                _wake_split = (
+                    _st_wake.strip_all_thinking
+                    if _wake_gate_on
+                    else _st_wake.split_thinking
+                )
+                _wst_status, _wst_thinking, _wst_reply = _wake_split(text)
                 if _wst_status == _st_wake.COMPLETE:
                     text = _wst_reply
                     _wake_self_thinking_text = _wst_thinking
@@ -8218,6 +8736,8 @@ async def _run_wake(
                             "[v2.worker] wake reply push slot build failed user=%s: %s",
                             user_id, e)
                 if status == "applied":
+                    if tm is not None:
+                        tm.record_visible_reply()
                     if final:
                         source_status = await asyncio.to_thread(
                             jobs_store.get_job_status,
@@ -8281,6 +8801,12 @@ async def _run_wake(
                 },
                 best_effort=True,
             )
+            # Legacy/non-seq assembly can enqueue without a sink. That proves
+            # the model produced text, not that a user-visible bubble was
+            # applied. Count only the applied-but-unverified path here; the
+            # seq-native path above records only an explicit applied status.
+            if tm is not None and deps.apply_pending_effects is not None:
+                tm.record_visible_reply()
 
         # Snapshot the boundary at wake start. Production uses the same total-order
         # seq reader as chat; timestamp fallback remains only for narrow tests.
@@ -8297,6 +8823,57 @@ async def _run_wake(
         fold_new_messages = _make_fold_new_messages(
             user_id, deps, cursor_box, enclave_sem=enclave_sem
         )
+
+        # ── 世界书:主动开口的四条道也要认得这个世界（Seven 2026-08-10）
+        #
+        # 之前只有 chat 道注入，于是同一个伴侣在聊天里说「影月初三」、心跳主动
+        # 发消息时却说「8 月 11 号」——用户看到的是人格分裂，而世界书恰恰是为
+        # 「设定一致」买的。
+        #
+        # **匹配信号按道分，不是一刀切开**（世界书有两半，语义不同）：
+        #
+        #   alwaysOn 条目 = 世界常数（历法/地名/「这世界没有手机」）。语义就是
+        #   「聊什么都成立」，四条唤醒道全给。
+        #
+        #   关键词触发条目 = 对话范围内的资料，要有**新鲜的文本信号**才有意义：
+        #     · scheduled —— 有。提醒正文（`scheduled_notes`）是用户/agent 刚写下
+        #       的意图，且**本来就已逐字进 prompt**，拿它匹配零新增暴露面。
+        #     · heartbeat / manual_wake —— 无。手里只有可能几小时前的旧消息，
+        #       拿陈旧关键词灌 24k 字设定是噪音，不是接地。
+        #     · screen_watch —— 有新输入，但**是不可信输入**。屏幕文本被刻意设成
+        #       pull-only 正是为了不让屏幕内容影响首轮 prompt（见 :7734 注释）；
+        #       用它选世界书条目等于把那道闸从侧面绕开。
+        #
+        # 实现上不需要动匹配器:`worldbook_match._triggered` 对空扫描面天然只留
+        # alwaysOn（keyword in "" 恒 False），所以「不给匹配信号」= 传空 messages。
+        # ⚠️ 别照抄 chat 道那句 `if worldbook_match_messages:` 短路——那会让三条
+        # 无信号的道**一条都拿不到 alwaysOn**，正好把本次改动的主要目的抹掉。
+        worldbook_context = ""
+        if deps.read_worldbook_context is not None:
+            wake_match_messages = [
+                {"role": "user", "content": note}
+                for note in (scheduled_notes if lane == "scheduled" else [])
+                if str(note or "").strip()
+            ]
+            try:
+                async with enclave_sem:
+                    wb = await asyncio.to_thread(
+                        deps.read_worldbook_context,
+                        user_id,
+                        wake_match_messages,
+                        runtime_token=token,
+                    )
+                if isinstance(wb, dict):
+                    worldbook_context = str(wb.get("block") or "").strip()
+            except Exception as exc:  # noqa: BLE001 — 与 chat 道同款 best effort:
+                # 世界书取不到不该把一次主动开口整个打掉。
+                log.warning(
+                    "[v2.worldbook] wake match unavailable user=%s lane=%s code=%s",
+                    user_id,
+                    lane,
+                    type(exc).__name__.lower(),
+                )
+
         def _wake_builder():
             from core import self_thinking as _st_wake_sys
 
@@ -8323,6 +8900,7 @@ async def _run_wake(
                 working_memory=working_memory,
                 agent_memory=agent_memory,
                 user_profile=user_profile,
+                worldbook_context=worldbook_context,
                 coverage_hole_notice=coverage_hole_notice,
                 provider_config=provider_config,
                 temporal_snapshot=temporal_snapshot,
@@ -8413,7 +8991,24 @@ async def _run_wake(
                 # raising. Without this the lane failed 100% of the time on
                 # test with `wake_failed:providererror` while the provider
                 # answered 200 OK — the model simply had nothing to say.
-                require_reply=False,
+                #
+                # `scheduled` 是唯一的例外，必须留在 require_reply=True 上。
+                # opened/closed 屏幕共享边沿都只是普通 wake 事实，由模型结合
+                # attention_facts 决定说话或沉默。对于 scheduled，无论是用户委托的
+                # （「20 秒后发消息给我」）还是 agent 自排的（`apply_turn_actions
+                # (..., self_wake=True)`，见 :7841）。沉默在这里不是「没什么可说」
+                # 而是提醒丢了：模型返空 → 落到下面的 `if not text: return` → job
+                # 记成 completed、无气泡、无失败、指标全绿，用户干等（usr_4ea3
+                # 2026-08-10，一晚上两次）。同一函数里「只给思考不给正文」那条
+                # 沉默路径早就为 scheduled 破了例（见 _THINKING_ONLY_NO_REPLY_REASON
+                # 处的 raise）——两条沉默路径必须同进同退，只堵一条等于没堵。
+                #
+                # 打开它拿到的是 tool_loop 已有的整条恢复链，而不是直接判死：
+                # 先追加 _EMPTY_RESPONSE_CORRECTION 重试一轮（多数抽风到此为止），
+                # 仍空才 ProviderEmptyReply → wake_failed:empty_reply。失败不会
+                # 重放定时器（mark_fired 在入队时就落，不等 job 成功），只会 arm
+                # 60s 起、1h 封顶的 proactive 退避，用户下次说话即清。
+                require_reply=(lane == "scheduled"),
                 on_provider_success=lambda: _record_provider_success(user_id),
                 on_provider_failure=lambda exc: _record_provider_failure(
                     user_id,
@@ -9301,7 +9896,7 @@ async def _run_extraction(
             # 内容闸打回后的第二问：放宽成「只丢占位符那几张、干净的照收」，
             # 不让一张脏卡把整个窗口的落卡清零。
             parse_retry = v2_extraction.ParseRetry(
-                should_retry=is_card_format_error,
+                should_retry=is_retryable_parse_error,
                 build_prompt=build_capture_retry_prompt,
                 parse=lambda reply: parse_capture_cards(reply, strict=False),
                 semantic_reasons=capture_semantic_retry_reasons,
@@ -9330,7 +9925,7 @@ async def _run_extraction(
                 v2_extraction.consolidations_to_actions,
             )
             parse_retry = v2_extraction.ParseRetry(
-                should_retry=is_card_format_error,
+                should_retry=is_retryable_parse_error,
                 build_prompt=build_dream_retry_prompt,
                 parse=lambda reply: parse_dream_consolidations(
                     reply, strict=False, known_ids=dream_known_ids
@@ -10976,15 +11571,34 @@ async def process_job(
             if provider_usage_halted
             else frozenset()
         )
+        # History kill switch, offer-time half (spec §6). Resolved ONCE per
+        # turn so the offer gate and the dispatch gate below cannot disagree
+        # mid-turn; default ON — this is a rollback valve, not a feature gate.
+        # Includes the atomic-cap re-check for the "booted off, switched on
+        # later" path that import-time validation cannot cover.
+        history_tools_offered = _history_tools_enabled_for_turn()
+        disabled_history_tool_names = (
+            frozenset()
+            if history_tools_offered
+            else frozenset(cap_history.HISTORY_TOOL_NAMES)
+        )
         disabled_tool_names_for_turn = (
             frozenset(disabled_mutation_tool_names)
             | disabled_web_tool_names
             | disabled_provider_usage_tool_names
+            | disabled_history_tool_names
         )
         # Shared across every provider round in this chat turn. A per-dispatch
         # budget would reset whenever the model asks for another tool batch and
         # would therefore fail to bound the whole-turn MCP contribution.
         mcp_wall_budget = _McpTurnWallBudget(MCP_TURN_WALL_BUDGET_SEC)
+        # Same lifetime for the history row/wall budget (spec §5): one object
+        # spans every provider round, so paging with next_cursor inside a turn
+        # keeps accumulating instead of resetting per round.
+        history_turn_budget = _HistoryTurnBudget(
+            max_rows=HISTORY_TURN_MAX_ROWS,
+            max_wall_sec=HISTORY_TURN_MAX_WALL_SEC,
+        )
 
         pending_schedule_results = None
         if deps.read_pending_scheduled_wake_context is not None:
@@ -11040,6 +11654,7 @@ async def process_job(
             attempt_identity=int(job.get("attempt_count") or 0),
             recorder=trajectory_recorder,
             effect_evidence_by_call=effect_evidence_by_call,
+            emit_debug_trace=deps.emit_debug_trace,
         )
 
         async def _dispatch_tools(tool_calls):
@@ -11056,12 +11671,66 @@ async def process_job(
             for tc in tool_calls:
                 action_digest.setdefault(tc.name, {"ok": 0, "count": 0})["count"] += 1
 
+            async def _dispatch_history_one(tc) -> ToolResult:
+                # History reads only (never a write): serial lock + cumulative
+                # turn accounting (spec §5). The batch-level round gate below
+                # admits at most one history call per provider round; the lock
+                # keeps the serial invariant explicit anyway. Rows come back
+                # via the trusted capability metadata channel; wall time is
+                # charged around the whole dispatch. The re-check under the
+                # lock covers a budget exhausted by an earlier round after the
+                # round gate already ran.
+                async with history_turn_budget.lock:
+                    lease = history_turn_budget.reserve_call()
+                    if lease is None:
+                        return ToolResult(
+                            call_id=tc.id, content=_HISTORY_TURN_BUDGET_ERROR
+                        )
+                    # Conservative default, replaced only once the call
+                    # returns and its usage is actually known: an exception on
+                    # the way out (cancellation) must not settle as free.
+                    scanned_rows = int(lease.max_rows)
+                    try:
+                        # The lease is what is left of the TURN, pushed down as
+                        # this call's ceiling: 1 remaining row must not buy
+                        # another full 512-row scan. cap_history reads it at the
+                        # capability boundary (trusted context, never args).
+                        with cap_history.call_limits(
+                            max_rows=lease.max_rows, deadline_ms=lease.deadline_ms
+                        ):
+                            (result,) = await v2_executor.dispatch_tool_calls(
+                                [tc],
+                                store=store,
+                                api_key=api_key,
+                                runtime_token=runtime_token,
+                                enclave_sem=enclave_sem,
+                                turn_authorization=(
+                                    mutation_recovery_barrier is None),
+                                enqueue_write_effect=_enqueue_write_effect,
+                                before_write=_before_write,
+                                observe_photo=observe_photo,
+                                read_parallelism=1,
+                                # Dispatch half of the double gate: chat lane,
+                                # and only while the switch resolved ON for
+                                # this turn.
+                                history_tools_allowed=history_tools_offered,
+                            )
+                        scanned_rows = _history_rows_charged(result, lease)
+                    finally:
+                        effect_reservations.mark_ready(tc)
+                        history_turn_budget.settle_call(
+                            lease, scanned_rows=scanned_rows
+                        )
+                return result
+
             async def _dispatch_platform_one(tc) -> ToolResult:
                 # One call per coroutine lets platform reads share the exact same
                 # worker-level gate as MCP reads. Executor still owns validation,
                 # provenance, encrypted outbox writes, and terminal write failures.
                 if tc.name == cap_tool_schema.MEMORY_ORGANIZE_TOOL:
                     return await _dispatch_memory_organize_tool(user_id, tc)
+                if tc.name in cap_history.HISTORY_TOOL_NAMES:
+                    return await _dispatch_history_one(tc)
                 try:
                     (result,) = await v2_executor.dispatch_tool_calls(
                         [tc],
@@ -11273,6 +11942,36 @@ async def process_job(
                         },
                     )
 
+            # Round half of the history gate (spec §5): at most one history
+            # call per provider round, and none once the turn budget is spent.
+            # Decided on the batch in provider order (deterministic under read
+            # overlap); blocked calls never reach the executor. Same
+            # blocked_by_id merge as mutation recovery above.
+            history_blocked = _history_round_blocked_results(
+                dispatchable_calls, budget=history_turn_budget
+            )
+            if history_blocked:
+                blocked_by_id.update(history_blocked)
+                dispatchable_calls = [
+                    tc
+                    for tc in dispatchable_calls
+                    if str(tc.id) not in history_blocked
+                ]
+                for tc in tool_calls:
+                    result = history_blocked.get(str(tc.id))
+                    if result is None:
+                        continue
+                    await chat_tool_activity_callback(
+                        tc,
+                        "tool_call_started",
+                        {"phase": "history_budget_blocked"},
+                    )
+                    await chat_tool_activity_callback(
+                        tc,
+                        "tool_call_result",
+                        {"phase": "history_budget_blocked", "result": result},
+                    )
+
             dispatched = await _dispatch_mixed_tool_calls(
                 dispatchable_calls,
                 mcp_turn=mcp_turn,
@@ -11354,10 +12053,22 @@ async def process_job(
             from core import self_thinking
 
             self_thinking_on = self_thinking.enabled()
+            # 安全剥离与「要不要写/展示自写 thinking」必须解耦：FEEDLING_V2_SELF_THINKING
+            # 是公开支持的自托管配置，关掉它时模型仍然可能自己写 <think>（主动消息那条
+            # lane 就是实证：我们从没要求它写，它照写），此时若跳过剥离就等于把心里话
+            # 原样发给用户（Codex review 2026-08-08 Critical）。
+            # 因此：闸开 → 一律全文剥离；闸关但 self-thinking 开 → 旧行为；两者都关
+            # → 完全不处理。展示与否仍然只看 self_thinking_on。
+            _st_gate_on = self_thinking.gate_enabled()
             self_thinking_text = ""
             self_thinking_failed = False
-            if self_thinking_on and file_reply is None and text:
-                _st_status, _st_thinking, _st_reply = self_thinking.split_thinking(text)
+            if (_st_gate_on or self_thinking_on) and file_reply is None and text:
+                _st_split = (
+                    self_thinking.strip_all_thinking
+                    if _st_gate_on
+                    else self_thinking.split_thinking
+                )
+                _st_status, _st_thinking, _st_reply = _st_split(text)
                 if _st_status == self_thinking.COMPLETE:
                     text = _st_reply
                     self_thinking_text = _st_thinking
@@ -11936,6 +12647,89 @@ async def process_job(
         grounding_results: dict[str, Any] = {}
         if pending_schedule_results:
             grounding_results.update(pending_schedule_results)
+        # 共享屏幕的健康提示(见 _screen_share_grounding)。live 时可推当前帧；
+        # stalled 时只给模型重启建议、不碰旧帧。不共享时整块不存在。
+        screen_share_state = await asyncio.to_thread(
+            _screen_share_grounding, user_id
+        )
+        if screen_share_state:
+            grounding_results["screen_share"] = [
+                {"ok": True, "data": screen_share_state}
+            ]
+        screen_share_live = screen_share_state.get("active") is True
+        screen_frame_message: dict[str, Any] | None = None
+        pushed_screen_frame_ids: list[str] = []
+        screen_vision_verdict = None
+        if screen_share_live:
+            screen_vision_verdict = await asyncio.to_thread(
+                db.model_api_active_route_vision_verdict, user_id
+            )
+        if (
+            screen_share_live
+            and _screen_vision_allows_pixels(screen_vision_verdict)
+            and deps.read_screen_frames is not None
+        ):
+            try:
+                schedule = await asyncio.to_thread(
+                    jobs_store.get_wake_schedule, user_id
+                )
+                last_pushed = str(
+                    (schedule or {}).get("last_screen_chat_frame_id") or ""
+                )
+                frame_meta = await asyncio.to_thread(db.frame_list_meta, user_id)
+                selected_meta = v2_screen_chat.select_recent_session_frames(
+                    frame_meta,
+                    last_pushed_frame_id=last_pushed,
+                )
+                if selected_meta:
+                    selected_ids = [
+                        str(row.get("id") or row.get("frame_id") or "")
+                        for row in selected_meta
+                    ]
+                    async with enclave_sem:
+                        batch = await asyncio.to_thread(
+                            deps.read_screen_frames, user_id, selected_ids
+                        )
+                    decrypted = (
+                        batch.get("frames") if isinstance(batch, dict) else {}
+                    )
+                    decrypted = decrypted if isinstance(decrypted, dict) else {}
+                    merged_frames: list[dict[str, Any]] = []
+                    for meta in selected_meta:
+                        frame_id = str(
+                            meta.get("id") or meta.get("frame_id") or ""
+                        )
+                        pixels = decrypted.get(frame_id)
+                        if not isinstance(pixels, dict):
+                            continue
+                        merged_frames.append({**meta, **pixels, "id": frame_id})
+                    screen_frame_message = (
+                        v2_screen_chat.build_untrusted_frame_message(
+                            merged_frames, now=time.time()
+                        )
+                    )
+                    if screen_frame_message is not None:
+                        pushed_screen_frame_ids = [
+                            str(frame["id"]) for frame in merged_frames
+                        ]
+                    tm.record_screen_frames(
+                        pushed=len(pushed_screen_frame_ids),
+                        cache_hits=int((batch or {}).get("cache_hits") or 0),
+                        cache_misses=int((batch or {}).get("cache_misses") or 0),
+                    )
+            except Exception as exc:  # noqa: BLE001 - pixels are optional grounding
+                log.warning(
+                    "[v2.worker] screen frame grounding failed user=%s code=%s",
+                    user_id,
+                    type(exc).__name__,
+                )
+
+        async def _on_screen_images_rejected(_exc: BaseException) -> None:
+            await asyncio.to_thread(
+                _mark_screen_route_vision_unsupported,
+                user_id,
+                screen_vision_verdict,
+            )
         turn_extra_context = (
             context.action_context_str(grounding_results) if grounding_results else ""
         )
@@ -11945,7 +12739,7 @@ async def process_job(
 
         def _chat_builder():
             return _make_build_messages_fn(
-                system_prompt=context.chat_system_prompt(),
+                system_prompt=context.chat_system_prompt(provider_config),
                 summary=summary,
                 tail=tail,
                 extra_context=turn_extra_context,
@@ -11965,6 +12759,7 @@ async def process_job(
                 tail_source_truncated=tail_source_truncated,
                 tail_lane=lane,
                 tail_anchor_seq=optional_anchor_seq,
+                screen_frame_message=screen_frame_message,
             )
 
         build_messages = _chat_builder()
@@ -12097,6 +12892,9 @@ async def process_job(
             disabled_tool_names=disabled_tool_names_for_turn,
             outbound_blocking_read_tool_names=_PRIVATE_READ_TOOLS,
             outbound_blocking_read_tool_predicate=_read_blocks_later_outbound,
+            initial_outbound_tools_blocked=(screen_frame_message is not None),
+            tagged_image_message_key=v2_screen_chat.MESSAGE_TAG,
+            on_tagged_images_rejected=_on_screen_images_rejected,
             max_tool_calls_per_round=MAX_TOOL_CALLS_PER_ROUND,
             max_tool_calls_per_turn=MAX_TOOL_CALLS_PER_TURN,
             tool_result_char_cap=TOOL_RESULT_CHAR_CAP,
@@ -12120,6 +12918,12 @@ async def process_job(
                 tm.record_prompt_frontier_exhaustion
             ),
         )
+        if pushed_screen_frame_ids:
+            await asyncio.to_thread(
+                jobs_store.upsert_wake_schedule,
+                user_id,
+                last_screen_chat_frame_id=pushed_screen_frame_ids[-1],
+            )
         if voice_call_ended_atomically:
             try:
                 await asyncio.to_thread(_emit_status, user_id, job_id, "done")

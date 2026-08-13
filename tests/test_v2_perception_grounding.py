@@ -185,6 +185,131 @@ def test_chat_turn_does_not_prefetch_or_inject_perception(monkeypatch):
     }
 
 
+def test_chat_turn_explains_stalled_screen_share_without_old_pixels(monkeypatch):
+    uid = "u_screen_share_stalled"
+    conftest.seed_user(uid)
+    _reset(uid)
+    monkeypatch.setattr(
+        worker, "_write_encrypted_reply", lambda store, text: {"id": "r"}
+    )
+    monkeypatch.setattr(
+        worker,
+        "_screen_share_grounding",
+        lambda _user_id: {
+            "active": False,
+            "stalled": True,
+            "status": "broadcast_on_without_recent_frames",
+            "latest_frame_age_sec": 600,
+            "suggested_action": (
+                "Ask the user to stop and restart screen sharing."
+            ),
+        },
+    )
+    monkeypatch.setattr(
+        worker.db,
+        "model_api_active_route_vision_verdict",
+        lambda _user_id: (_ for _ in ()).throw(
+            AssertionError("stalled share must not query the vision route")
+        ),
+    )
+    seen = {}
+    _spy_provider(monkeypatch, seen)
+    deps = _chat_deps(
+        [{"id": "m1", "ts": 1.0, "role": "user", "content": "你能看到吗？"}]
+    )
+    deps.read_screen_frames = lambda *_args: (_ for _ in ()).throw(
+        AssertionError("stalled share must not decrypt old frames")
+    )
+
+    jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("w")
+    status = asyncio.run(
+        worker.process_job(
+            job,
+            deps,
+            provider_config=_BYOK,
+            api_key=None,
+            runtime_token="rt",
+        )
+    )
+
+    share = _runtime_payload(seen)["runtime_data"]["screen_share"]
+    assert status == "completed"
+    assert share["active"] is False
+    assert share["stalled"] is True
+    assert share["latest_frame_age_sec"] == 600
+    assert "stop and restart screen sharing" in share["suggested_action"]
+    system = next(
+        message["content"]
+        for message in seen["messages"]
+        if message.get("role") == "system"
+    )
+    assert "screen_share.stalled" in system
+    assert "may have disconnected" in system
+    assert "Do not describe an old frame as current" in system
+
+
+def test_chat_turn_explains_ended_screen_share_without_old_pixels(monkeypatch):
+    uid = "u_screen_share_ended"
+    conftest.seed_user(uid)
+    _reset(uid)
+    monkeypatch.setattr(
+        worker, "_write_encrypted_reply", lambda store, text: {"id": "r"}
+    )
+    ended = {
+        "active": False,
+        "ended": True,
+        "status": "screen_share_ended",
+        "latest_frame_age_sec": 20,
+        "previous_frames_remain_in_conversation": True,
+        "suggested_action": (
+            "Ask the user to restart screen sharing or send a screenshot."
+        ),
+    }
+    monkeypatch.setattr(
+        worker, "_screen_share_grounding", lambda _user_id: ended
+    )
+    monkeypatch.setattr(
+        worker.db,
+        "model_api_active_route_vision_verdict",
+        lambda _user_id: (_ for _ in ()).throw(
+            AssertionError("ended share must not query the vision route")
+        ),
+    )
+    seen = {}
+    _spy_provider(monkeypatch, seen)
+    deps = _chat_deps(
+        [{"id": "m1", "ts": 1.0, "role": "user", "content": "你还能看到吗？"}]
+    )
+    deps.read_screen_frames = lambda *_args: (_ for _ in ()).throw(
+        AssertionError("ended share must not decrypt old frames")
+    )
+
+    jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("w")
+    status = asyncio.run(
+        worker.process_job(
+            job,
+            deps,
+            provider_config=_BYOK,
+            api_key=None,
+            runtime_token="rt",
+        )
+    )
+
+    share = _runtime_payload(seen)["runtime_data"]["screen_share"]
+    assert status == "completed"
+    assert share == ended
+    system = next(
+        message["content"]
+        for message in seen["messages"]
+        if message.get("role") == "system"
+    )
+    assert "screen_share.ended" in system
+    assert "remain available for discussion" in system
+    assert "restart sharing or send a screenshot" in system
+
+
 def test_chat_can_pull_exact_perception_after_first_round(monkeypatch):
     """Catches missing perception schemas or a broken chat tool-result round."""
     uid = "u_pg_chat_tool_pull"
@@ -377,6 +502,49 @@ def test_wake_lane_grounding_matrix(monkeypatch, lane, expected_actions):
 
     assert status == "completed"
     assert [call["action"] for call in calls] == expected_actions
+
+
+@pytest.mark.parametrize("lane", ["heartbeat", "manual_wake"])
+def test_ambient_wake_injects_screen_share_grounding(monkeypatch, lane):
+    uid = f"u_pg_screen_share_{lane}"
+    conftest.seed_user(uid)
+    _reset(uid)
+    monkeypatch.setattr(
+        worker, "_write_encrypted_reply", lambda store, text: {"id": "r"}
+    )
+    ended = {
+        "active": False,
+        "ended": True,
+        "status": "screen_share_ended",
+        "latest_frame_age_sec": 12,
+    }
+    monkeypatch.setattr(
+        worker, "_screen_share_grounding", lambda _user_id: ended
+    )
+    seen = {}
+    _spy_provider(monkeypatch, seen)
+
+    async def fake_cap_data(store, action_type, **kwargs):
+        assert action_type == "perception_glance"
+        return {"glance": {}}
+
+    monkeypatch.setattr(worker, "_cap_data", fake_cap_data)
+    jobs_store.enqueue_job(uid, lane)
+    job = jobs_store.claim_next_job("w")
+    status = asyncio.run(
+        worker.process_job(
+            job,
+            _wake_deps(
+                [{"id": "m1", "ts": 1.0, "role": "user", "content": "hi"}]
+            ),
+            provider_config=_BYOK,
+            api_key=None,
+            runtime_token="rt",
+        )
+    )
+
+    assert status == "completed"
+    assert _runtime_payload(seen)["runtime_data"]["screen_share"] == ended
 
 
 def test_heartbeat_injects_boolean_glance_without_snapshot_values(monkeypatch):

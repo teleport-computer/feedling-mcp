@@ -9,8 +9,8 @@ E2E / enclave boundary (unchanged): ``/v1/model_api/key_envelope`` returns the
 caller's OWN ``api_key_envelope`` ciphertext — the server never decrypts it; only
 the enclave can. ``model_api_setup`` seals a freshly-supplied provider key into a
 shared envelope via ``core.envelope._build_shared_envelope_for_store`` and, when
-reusing a saved key, decrypts the existing envelope ONLY through the enclave
-(``core.enclave._decrypt_envelope_via_enclave``). These functions take
+reusing a saved key, reads the existing row through the shared shape router.
+Encrypted rows still cross the enclave boundary; plaintext rows are read locally. These functions take
 already-parsed params + the store and the caller's credential as explicit
 arguments — they never read ``flask.request`` — so no new server-side plaintext
 is ever introduced here. Module-level references (``provider_client``,
@@ -39,6 +39,7 @@ from memory import service as memory_service
 import provider_client
 from hosted import agent_runtime_cutover
 from hosted import config_store as hosted_config_store
+from hosted import new_user_v2_cohort
 from hosted import turn as hosted_turn
 from hosted import vision_routing
 from hosted import vision_observer
@@ -883,6 +884,19 @@ def _apply_runtime_policy_or_error(store) -> tuple[dict, int] | None:
     return None
 
 
+def _apply_new_user_v2_default_or_error(store) -> tuple[dict, int] | None:
+    """Converge eligible dual-policy Model API users before setup succeeds."""
+    try:
+        new_user_v2_cohort.apply_default(store)
+    except Exception as exc:  # noqa: BLE001 — control-plane failures fail closed
+        print(
+            f"[new-user-v2:{store.user_id}] outcome=convergence_failed "
+            f"error_type={type(exc).__name__}"
+        )
+        return {"error": "runtime_policy_unavailable"}, 503
+    return None
+
+
 def _runtime_should_restore_v2(store) -> bool:
     """Whether an active-config replacement should resume V2 after fencing."""
     forced_mode = hosted_config_store.forced_hosted_runtime_mode()
@@ -1060,8 +1074,7 @@ def model_api_setup(store, payload: dict, *, caller_api_key: str | None) -> tupl
             f"[model_api:{store.user_id}] setup FAILED provider={provider} "
             f"model={model} status_code={e.status_code} detail={str(e)[:160]}"
         )
-        return {"error": "provider_test_failed", "detail": str(e),
-                "status_code": e.status_code}, 400
+        return _provider_test_failed_body(e), 400
 
     # `supports_responses` is retired transport metadata: nothing in the backend
     # reads it (not even spawners.consumer_env), and /responses has exactly one
@@ -1171,6 +1184,9 @@ def model_api_setup(store, payload: dict, *, caller_api_key: str | None) -> tupl
     policy_error = _apply_runtime_policy_or_error(store)
     if policy_error is not None:
         return policy_error
+    cohort_error = _apply_new_user_v2_default_or_error(store)
+    if cohort_error is not None:
+        return cohort_error
     accounts_onboarding._save_onboarding_route(store, "model_api")
     print(f"[model_api:{store.user_id}] setup provider={provider} model={model}")
 
@@ -1574,6 +1590,68 @@ def image_generation_main_test(
     return {"config": _image_generation_config_payload(store)}, 200
 
 
+# provider 回的不是 API 响应而是网页 —— 几乎必然是 base_url 少了结尾的路径段
+# (绝大多数中转站要以 /v1 结尾),不是 key 的问题。
+#
+# 实测的两种形态(2026-08-09,用户报障的两个中转站,base_url 漏填 /v1):
+#   · HTTP 200 + 站点首页 HTML  → chat_completion 抛 "provider returned non-json response"
+#   · HTTP 404 + 错误页 HTML    → "provider_http_404: <!doctype html>..."
+#
+# ⚠️ HTML 本身**不能**单独作为判据(codex2 gatekeep 2026-08-09)。我原以为
+# 「真错误一律 JSON」,但 relay/WAF/计费层完全可能用 HTML 页面返回 401/402/429/5xx
+# —— 本仓 tests/test_catalog_consumer_parity.py:158-161 就存着这样的样本
+# (provider_http_504/402/401/429 + HTML)。把它们一并判成「地址错误」,
+# 会让额度不足、鉴权失败、限流全部指错方向,比原来的错更严重。
+# 所以 HTML 只在 **404** 时才算地址问题:其它状态码即使 body 是网页,
+# 也一定是真实的 provider 语义错误,原样透传。
+_NON_JSON_MARKER = "non-json response"
+_HTML_MARKERS = ("<!doctype", "<html")
+
+# 刻意只给通用方向、不替用户拼出具体地址:有的中转站要 /api/v1、/openai/v1,
+# 猜一个"看起来很确定其实是蒙的"地址,用户照抄仍然不通,反而更迷惑(Seven 2026-08-09 拍板)。
+_WRONG_API_ENDPOINT_HINT = (
+    "这个地址返回的是网页,不是 API 接口响应 —— 通常是接口地址结尾缺少 /v1。"
+    "请补上后重试(不是 API Key 的问题)。 / This address returned a web page, "
+    "not an API response — the endpoint usually needs to end with /v1. "
+    "Fix the address and retry; the API key is not the problem."
+)
+
+
+def _looks_like_wrong_api_endpoint(exc: BaseException) -> bool:
+    """这次失败是不是「地址根本不是 API 端点」而非「key 不对」。
+
+    两条判据都刻意收得很窄(宁可漏判,不可错判 —— 错判会把额度/鉴权/限流
+    说成地址问题):
+      · ``non-json response``:只在 HTTP 已经成功(2xx,过了
+        ``_raise_for_provider_status``)却解析不出 JSON 时抛出,正是
+        「200 + 站点首页」那种形状,与状态码无关;
+      · HTML 页面:**仅当 status_code == 404**。404 网页 = 这个路径不存在;
+        401/402/429/5xx 的 HTML 是 relay 的鉴权/支付/限流/故障页,是真错误。
+    """
+    text = str(exc or "").lower()
+    if _NON_JSON_MARKER in text:
+        return True
+    status = getattr(exc, "status_code", None)
+    return status == 404 and any(marker in text for marker in _HTML_MARKERS)
+
+
+def _provider_test_failed_body(exc: BaseException) -> dict:
+    """provider key 自测失败的统一响应体 —— 四个入口(保存配置 / 手动测试 /
+    加路由 / 改凭证)共用一份判据,否则同一个错误从不同入口进来说法会不一样。
+
+    ⚠️ 判成「地址不是 API 端点」时把 ``status_code`` 清成 ``None``:客户端
+    (FeedlingAPI.providerTestFailureMessage)会把 provider 的 404 映射成
+    「模型不存在」,而这里的 404 来自站点网页而不是模型缺失 —— 带着它回去
+    等于换一句话继续把用户往错方向支。原始错误照常写进 route.test_error,
+    排查不受影响。"""
+    if _looks_like_wrong_api_endpoint(exc):
+        return {"error": "provider_test_failed",
+                "detail": _WRONG_API_ENDPOINT_HINT,
+                "status_code": None}
+    return {"error": "provider_test_failed", "detail": str(exc),
+            "status_code": getattr(exc, "status_code", None)}
+
+
 def _test_active_route(store, route: dict, api_key: str | None) -> tuple[dict, int] | None:
     """Decrypt the active route's envelope via the enclave and test the provider key,
     writing the ok/failed result back to the route row. Returns ``None`` on success
@@ -1628,8 +1706,7 @@ def _test_active_route(store, route: dict, api_key: str | None) -> tuple[dict, i
         # 'failed' — a latent staleness, not a lie told to this caller.
         db.model_api_route_mark_test(store.user_id, route["id"], status="failed",
                                      error=str(e)[:240])
-        return {"error": "provider_test_failed", "detail": str(e),
-                "status_code": e.status_code}, 400
+        return _provider_test_failed_body(e), 400
     # Must check: returning None here tells model_api_test() "success" -> 200. If
     # this write silently fails, test_status never flips to 'ok', so the route can
     # stay excluded from the agent-runtime roster (which gates on test_status='ok')
@@ -1944,8 +2021,7 @@ def _test_route_or_error(store, route: dict, caller_api_key: str | None):
             f"[model_api:{store.user_id}] route test FAILED provider={route['provider']} "
             f"model={route['model']} status_code={e.status_code} detail={str(e)[:160]}"
         )
-        return {"error": "provider_test_failed", "detail": str(e),
-                "status_code": e.status_code}, 400
+        return _provider_test_failed_body(e), 400
     # Must check: model_api_route_activate() treats a None return here as "test
     # passed" and immediately flips is_active=True. If this write silently fails,
     # test_status never reaches 'ok', so the just-"activated" route is excluded from
@@ -2210,6 +2286,9 @@ def model_api_route_activate(store, route_id: str, *, caller_api_key: str | None
     policy_error = _apply_runtime_policy_or_error(store)
     if policy_error is not None:
         return policy_error
+    cohort_error = _apply_new_user_v2_default_or_error(store)
+    if cohort_error is not None:
+        return cohort_error
     accounts_onboarding._save_onboarding_route(store, "model_api")
     # V2 provider config is pinned once per turn. The fence+restore above bumps
     # its generation around activation, so a turn on the old route can spend
@@ -2371,8 +2450,7 @@ def model_api_credential_patch(store, credential_id: str, payload: dict, *,
             ))
         except provider_client.ProviderError as e:
             # 不落库：旧 key 与旧 test_status 都保持原样，用户不会掉出 roster。
-            return {"error": "provider_test_failed", "detail": str(e),
-                    "status_code": e.status_code}, 400
+            return _provider_test_failed_body(e), 400
 
     active_key_change = bool(
         active and active["credential_id"] == credential_id

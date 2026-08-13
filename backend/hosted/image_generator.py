@@ -7,11 +7,9 @@ import base64
 import db
 import generated_image
 import provider_client
+from core import enclave as core_enclave
 from core import envelope as core_envelope
 from provider_types import ProviderResponse
-
-# Compatibility alias: existing tests and callers patch this shared module.
-core_enclave = core_envelope.enclave
 
 
 _MAX_PROMPT_CHARS = 8_000
@@ -94,15 +92,10 @@ def generate_with_pinned_route(
         return {"error": code, "error_class": code}, _status_for_error(code)
 
     try:
-        decrypt_kwargs = (
-            {"runtime_token": caller_runtime_token}
-            if caller_runtime_token
-            else {}
-        )
         provider_key = core_envelope.decrypt_provider_key_envelope(
             envelope,
             caller_api_key,
-            **decrypt_kwargs,
+            runtime_token=caller_runtime_token,
         ).decode("utf-8")
         config = provider_client.ProviderConfig(
             provider,

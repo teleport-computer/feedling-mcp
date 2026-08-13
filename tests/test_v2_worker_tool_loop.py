@@ -26,6 +26,7 @@ import provider_client
 from provider_types import ToolCall, ToolExchange
 from capabilities import registry as cap_registry
 from core import envelope as core_envelope
+from core import self_thinking
 from core import store as core_store
 from model_api_runtime.v2 import cursor as v2_cursor
 from model_api_runtime.v2 import context as v2_context
@@ -43,6 +44,13 @@ pytestmark = pytest.mark.skipif(
 _BYOK = provider_client.ProviderConfig(
     provider="anthropic",
     model="claude-sonnet-4-test",
+    api_key="sk-user-byok",
+    base_url="",
+)
+
+_FABLE_BYOK = provider_client.ProviderConfig(
+    provider="anthropic",
+    model="claude-fable-5",
     api_key="sk-user-byok",
     base_url="",
 )
@@ -451,6 +459,48 @@ def test_self_thinking_on_suppresses_native_reasoning(monkeypatch):
     assert len(calls) == 1
     # The point: native reasoning was NOT requested despite include_reasoning=True.
     assert calls[0].get("include_reasoning") is not True
+    system_text = "\n".join(
+        str(message.get("content") or "")
+        for message in calls[0]["messages"]
+        if isinstance(message, dict) and message.get("role") == "system"
+    )
+    assert self_thinking.INSTRUCTION in system_text
+
+
+def test_fable_chat_omits_mandatory_self_thinking_prompt(monkeypatch):
+    monkeypatch.delenv("FEEDLING_V2_SELF_THINKING", raising=False)
+    uid = "u_toolloop_fable_plain_reply"
+    conftest.seed_user(uid)
+    _reset(uid)
+    jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("w-fable-plain")
+    _patch_real_write(monkeypatch)
+    calls = _script_provider(monkeypatch, [_text_round("Fable plain reply")])
+    deps = _deps(messages=[{
+        "id": "m1",
+        "ts": 10.0,
+        "role": "user",
+        "content": "hi",
+    }])
+
+    status = asyncio.run(
+        worker.process_job(
+            job,
+            deps,
+            provider_config=_FABLE_BYOK,
+            api_key=None,
+            runtime_token="rt",
+        )
+    )
+
+    assert status == "completed"
+    system_text = "\n".join(
+        str(message.get("content") or "")
+        for message in calls[0]["messages"]
+        if isinstance(message, dict) and message.get("role") == "system"
+    )
+    assert self_thinking.INSTRUCTION not in system_text
+    assert _bubbles(uid)[-1]["body_ct"] == "Fable plain reply"
 
 
 def test_chat_thinking_only_keeps_existing_required_reply_fallback(monkeypatch):

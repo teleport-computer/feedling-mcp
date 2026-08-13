@@ -3909,6 +3909,10 @@ def record_whole_turn_metric(
     effective_tail_turns=None,
     tail_fallback=False,
     prompt_frontier_exhaustion_count=0,
+    screen_frames_pushed=0,
+    screen_frame_cache_hits=0,
+    screen_frame_cache_misses=0,
+    visible_reply_count=0,
 ) -> None:
     """One idempotent whole-turn metric per job (spec B5): upsert on job_id so a
     re-drive (redelivery/retry of the same job) REPLACES rather than appends. Covers
@@ -3921,9 +3925,11 @@ def record_whole_turn_metric(
                 "cache_miss_tokens, usage_reported_calls, cache_reported_calls, "
                 "provider, model, cache_route_fingerprint, latency_ms, model_calls, "
                 "retries, failed, status, effective_tail_turns, tail_fallback, "
-                "prompt_frontier_exhaustion_count) "
+                "prompt_frontier_exhaustion_count, screen_frames_pushed, "
+                "screen_frame_cache_hits, screen_frame_cache_misses, "
+                "visible_reply_count) "
                 "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,"
-                "%s,%s,%s) "
+                "%s,%s,%s,%s,%s,%s,%s) "
                 "ON CONFLICT (job_id) DO UPDATE SET "
                 "user_id=EXCLUDED.user_id, lane=EXCLUDED.lane, "
                 "prompt_tokens=EXCLUDED.prompt_tokens, completion_tokens=EXCLUDED.completion_tokens, "
@@ -3940,6 +3946,10 @@ def record_whole_turn_metric(
                 "tail_fallback=EXCLUDED.tail_fallback, "
                 "prompt_frontier_exhaustion_count="
                 "EXCLUDED.prompt_frontier_exhaustion_count, "
+                "screen_frames_pushed=EXCLUDED.screen_frames_pushed, "
+                "screen_frame_cache_hits=EXCLUDED.screen_frame_cache_hits, "
+                "screen_frame_cache_misses=EXCLUDED.screen_frame_cache_misses, "
+                "visible_reply_count=EXCLUDED.visible_reply_count, "
                 "updated_at=now()",
                 (
                     job_id,
@@ -3963,6 +3973,10 @@ def record_whole_turn_metric(
                     effective_tail_turns,
                     bool(tail_fallback),
                     max(0, int(prompt_frontier_exhaustion_count)),
+                    max(0, int(screen_frames_pushed)),
+                    max(0, int(screen_frame_cache_hits)),
+                    max(0, int(screen_frame_cache_misses)),
+                    max(0, int(visible_reply_count)),
                 ),
             )
     except Exception as e:  # noqa: BLE001 — best-effort instrumentation, never fail the turn
@@ -4181,6 +4195,94 @@ def recent_chat_failures_for_user(
             }
             for row in rows[:safe_limit]
         ],
+    }
+
+
+WAKE_LANES_FOR_SUPPORT = ("heartbeat", "scheduled", "manual_wake", "screen_watch")
+
+
+def wake_lane_activity_for_user(user_id: str, *, within_hours: int = 72) -> dict:
+    """这一个用户的 V2 **主动唤醒**活动:按 lane 分的 job 计数 + 最近失败原因。
+
+    存在的理由:admin 数据面原本只有 V1 口径的 `proactive_jobs` 日志,而 V2 的唤醒
+    job 在 `agent_jobs`。于是一个 V2 用户在数据面上永远显示「心跳 0 次」,看起来
+    像故障——2026-08-10 我据此差点误报「心跳十天没跑」。
+
+    出的是计数 + **有界的原始失败原因**(`_truncated_failure_reason`,与
+    `recent_chat_failures_for_user` 同一姿态),不出任何 prompt/回复内容。
+    ⚠️ 措辞上别说成「只出错误码」:`mark_failed` 收的是任意异常文本,这里给的是它的
+    前若干字符,不是受控枚举(codex 复验 2026-08-10 指出)。admin-only,可接受,
+    但契约要写准。
+    """
+    safe_hours = max(1, min(int(within_hours), 24 * 30))
+    uid = str(user_id or "").strip()
+    empty = {
+        "window_hours": safe_hours,
+        "by_lane": {},
+        "totals": {"jobs": 0, "completed": 0, "failed": 0, "pending": 0},
+        "recent_failures": [],
+        "last_terminal_at": "",
+    }
+    if not uid:
+        return empty
+
+    with _pool().connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "SELECT lane, status, count(*) AS n, max(finished_at) AS last_at "
+                "FROM agent_jobs "
+                "WHERE user_id=%s AND lane = ANY(%s) "
+                "  AND created_at >= now() - make_interval(hours => %s) "
+                "GROUP BY lane, status",
+                (uid, list(WAKE_LANES_FOR_SUPPORT), safe_hours),
+            )
+            grouped = cur.fetchall()
+            cur.execute(
+                "SELECT id, lane, status, last_error, created_at, finished_at "
+                "FROM agent_jobs "
+                "WHERE user_id=%s AND lane = ANY(%s) "
+                "  AND status IN ('failed','expired') "
+                "  AND finished_at >= now() - make_interval(hours => %s) "
+                "ORDER BY finished_at DESC, id DESC LIMIT 20",
+                (uid, list(WAKE_LANES_FOR_SUPPORT), safe_hours),
+            )
+            failures = cur.fetchall()
+
+    by_lane: dict[str, dict] = {}
+    totals = {"jobs": 0, "completed": 0, "failed": 0, "pending": 0}
+    last_terminal = None
+    for row in grouped:
+        lane = str(row["lane"] or "")
+        status = str(row["status"] or "")
+        n = int(row["n"] or 0)
+        slot = by_lane.setdefault(lane, {})
+        slot[status] = slot.get(status, 0) + n
+        totals["jobs"] += n
+        if status == "completed":
+            totals["completed"] += n
+        elif status in ("failed", "expired"):
+            totals["failed"] += n
+        elif status == "pending":
+            totals["pending"] += n
+        if row["last_at"] is not None and (last_terminal is None or row["last_at"] > last_terminal):
+            last_terminal = row["last_at"]
+
+    return {
+        "window_hours": safe_hours,
+        "by_lane": by_lane,
+        "totals": totals,
+        "recent_failures": [
+            {
+                "job_id": int(r["id"]),
+                "lane": str(r["lane"] or ""),
+                "status": str(r["status"] or ""),
+                "reason": _truncated_failure_reason(r["last_error"]),
+                "created_at": _iso_or_empty(r["created_at"]),
+                "finished_at": _iso_or_empty(r["finished_at"]),
+            }
+            for r in failures
+        ],
+        "last_terminal_at": _iso_or_empty(last_terminal),
     }
 
 
@@ -5039,6 +5141,12 @@ def recent_token_usage_by_lane(
                 "    AS usage_reported_calls,"
                 "  coalesce(sum(cache_reported_calls), 0)::bigint"
                 "    AS cache_reported_calls,"
+                "  coalesce(sum(screen_frames_pushed), 0)::bigint"
+                "    AS screen_frames_pushed,"
+                "  count(*) FILTER (WHERE visible_reply_count > 0)::bigint"
+                "    AS visible_reply_turns,"
+                "  coalesce(sum(visible_reply_count), 0)::bigint"
+                "    AS visible_reply_count,"
                 "  sum(prompt_tokens)::bigint AS prompt_tokens,"
                 "  sum(completion_tokens)::bigint AS completion_tokens,"
                 "  sum(cache_read_tokens)::bigint AS cache_read_tokens,"
@@ -5091,6 +5199,9 @@ def recent_token_usage_by_lane(
             # cache_hit_ratio 与 usage_coverage 挤在一列、标签写「缓存命中 · 上报」，
             # 读者会把那个"上报"当成 cache 上报（2026-07-30 审计指出）。
             "cache_reported_calls": cache_calls,
+            "screen_frames_pushed": int(row.get("screen_frames_pushed") or 0),
+            "visible_reply_turns": int(row.get("visible_reply_turns") or 0),
+            "visible_reply_count": int(row.get("visible_reply_count") or 0),
             "cache_coverage": (
                 float(cache_calls) / float(model_calls) if model_calls else None
             ),
@@ -5098,6 +5209,10 @@ def recent_token_usage_by_lane(
                 float(usage_calls) / float(model_calls) if model_calls else None
             ),
             "prompt_tokens": prompt_tokens,
+            # Admin calls this column "token input". Keep the normalized
+            # provider name too, but expose the explicit alias so downstream
+            # lane telemetry does not have to guess that prompt == input.
+            "input_tokens": prompt_tokens,
             "completion_tokens": completion_tokens,
             "total_tokens": (
                 prompt_tokens + completion_tokens
@@ -5116,6 +5231,11 @@ def recent_token_usage_by_lane(
             float(rendered["total_tokens"]) / float(rendered["active_user_days"])
             if rendered["total_tokens"] is not None
             and rendered["active_user_days"]
+            else None
+        )
+        rendered["visible_reply_rate"] = (
+            float(rendered["visible_reply_turns"]) / float(rendered["turns"])
+            if rendered["turns"]
             else None
         )
 
@@ -10304,15 +10424,14 @@ def get_failure_review(source_job_id: int | str, user_id: str) -> dict | None:
 
 def get_wake_schedule(user_id) -> dict | None:
     """读取该用户的 v2_wake_schedule 行（proactive 唤醒调度：下次心跳/采集/屏幕监看到期
-    时间 + BYOK 支付冷却截止 + screen_watch 的跨-tick 状态 last_screen_watch_frame_id），
-    无行返回 None（该用户尚未被调度器接管过）。
+    时间 + BYOK 支付冷却截止 + screen_watch 与 foreground screen-chat 的跨回合
+    frame cursor），无行返回 None（该用户尚未被调度器接管过）。
 
     **四个时间列一律以 epoch 浮点数返回**（`EXTRACT(EPOCH FROM ...)`），与
     `upsert_wake_schedule` 收的 epoch float 对称，调用方可以直接做算术比较。
     曾经只有 `next_screen_watch_at` 是 float、其余三列是 `datetime` —— 同一个 dict 里四个
-    同类字段两种类型是个地雷（谁会记得只有第四个能做减法？）。本函数没有生产调用方，
-    只有测试，所以统一成 float 的代价是零。`updated_at` 保持 datetime：它是审计字段，
-    没人拿它做算术。"""
+    同类字段两种类型是个地雷（谁会记得只有第四个能做减法？）。`updated_at` 保持
+    datetime：它是审计字段，没人拿它做算术。"""
     with _pool().connection() as conn:
         with conn.cursor(row_factory=dict_row) as cur:
             cur.execute(
@@ -10323,7 +10442,7 @@ def get_wake_schedule(user_id) -> dict | None:
                 "EXTRACT(EPOCH FROM next_screen_watch_at) AS next_screen_watch_at, "
                 "EXTRACT(EPOCH FROM proactive_backoff_until) "
                 "AS proactive_backoff_until, "
-                "last_screen_watch_frame_id, self_wake_streak, "
+                "last_screen_watch_frame_id, last_screen_chat_frame_id, self_wake_streak, "
                 "self_wake_user_seq, self_wake_last_effect_id, "
                 "self_wake_last_effect_accepted, proactive_fail_streak, "
                 "proactive_fail_user_seq, updated_at "
@@ -10431,6 +10550,7 @@ def upsert_wake_schedule(
     payment_cooldown_until: float | None = None,
     next_screen_watch_at: float | None = None,
     last_screen_watch_frame_id: str | None = None,
+    last_screen_chat_frame_id: str | None = None,
 ) -> None:
     """UPSERT 该用户的唤醒调度行。时间列各自是可选的 epoch 浮点数；传 None 表示
     「本次不动这一列」（COALESCE(EXCLUDED.col, 现有值) 保留旧值），不会把已有到期时间
@@ -10445,15 +10565,17 @@ def upsert_wake_schedule(
         conn.execute(
             "INSERT INTO v2_wake_schedule "
             "(user_id, next_heartbeat_at, next_capture_at, payment_cooldown_until, "
-            "next_screen_watch_at, last_screen_watch_frame_id, updated_at) "
+            "next_screen_watch_at, last_screen_watch_frame_id, "
+            "last_screen_chat_frame_id, updated_at) "
             "VALUES (%s, to_timestamp(%s), to_timestamp(%s), to_timestamp(%s), "
-            "to_timestamp(%s), %s, now()) "
+            "to_timestamp(%s), %s, %s, now()) "
             "ON CONFLICT (user_id) DO UPDATE SET "
             "next_heartbeat_at = COALESCE(EXCLUDED.next_heartbeat_at, v2_wake_schedule.next_heartbeat_at), "
             "next_capture_at = COALESCE(EXCLUDED.next_capture_at, v2_wake_schedule.next_capture_at), "
             "payment_cooldown_until = COALESCE(EXCLUDED.payment_cooldown_until, v2_wake_schedule.payment_cooldown_until), "
             "next_screen_watch_at = COALESCE(EXCLUDED.next_screen_watch_at, v2_wake_schedule.next_screen_watch_at), "
             "last_screen_watch_frame_id = COALESCE(EXCLUDED.last_screen_watch_frame_id, v2_wake_schedule.last_screen_watch_frame_id), "
+            "last_screen_chat_frame_id = COALESCE(EXCLUDED.last_screen_chat_frame_id, v2_wake_schedule.last_screen_chat_frame_id), "
             "updated_at = now()",
             (
                 user_id,
@@ -10468,8 +10590,47 @@ def upsert_wake_schedule(
                 str(last_screen_watch_frame_id)
                 if last_screen_watch_frame_id is not None
                 else None,
+                str(last_screen_chat_frame_id)
+                if last_screen_chat_frame_id is not None
+                else None,
             ),
         )
+
+
+def seed_missing_wake_clocks(
+    user_id: str,
+    *,
+    due_at: float | None = None,
+) -> bool:
+    """Atomically arm every NULL-backed wake lane for one V2 user.
+
+    ``due_heartbeat_users`` and ``due_screen_watch_users`` both deliberately
+    exclude NULL timestamps. Therefore row existence is not proof that either
+    lane is armed: self-wake, payment cooldown, or the other lane can create the
+    row while leaving one clock NULL. Fill only those two missing clocks and
+    preserve every already-advanced timestamp. ``next_capture_at`` is not
+    included because capture/dream eligibility does not use it as a due-list
+    predicate.
+
+    Returns True when a row was inserted or at least one NULL clock was repaired.
+    """
+    timestamp = time.time() if due_at is None else float(due_at)
+    with _pool().connection() as conn:
+        row = conn.execute(
+            "INSERT INTO v2_wake_schedule "
+            "(user_id,next_heartbeat_at,next_screen_watch_at,updated_at) "
+            "VALUES (%s,to_timestamp(%s),to_timestamp(%s),now()) "
+            "ON CONFLICT (user_id) DO UPDATE SET "
+            "next_heartbeat_at=COALESCE(v2_wake_schedule.next_heartbeat_at,"
+            "EXCLUDED.next_heartbeat_at),"
+            "next_screen_watch_at=COALESCE(v2_wake_schedule.next_screen_watch_at,"
+            "EXCLUDED.next_screen_watch_at),updated_at=now() "
+            "WHERE v2_wake_schedule.next_heartbeat_at IS NULL "
+            "OR v2_wake_schedule.next_screen_watch_at IS NULL "
+            "RETURNING user_id",
+            (str(user_id), timestamp, timestamp),
+        ).fetchone()
+    return row is not None
 
 
 _LATEST_GENUINE_USER_SEQ_SQL = (
@@ -10479,6 +10640,54 @@ _LATEST_GENUINE_USER_SEQ_SQL = (
     "AND COALESCE(message.doc->>'source','') "
     "NOT IN ('verify_ping','resident_maintenance'))"
 )
+
+
+def heartbeat_due_diagnosis(user_id: str, *, now: float | None = None) -> dict:
+    """单用户版的「心跳现在到期了吗?不到期是因为哪一条?」
+
+    **判据必须与 `due_heartbeat_users` 逐条同源**——support 面板给出的结论如果和
+    调度器实际用的规则不一致,那就是又一个「看起来在测量、其实没有」的信号
+    (2026-08-10 我正是被这类信号骗过)。所以这里复用同一个
+    `_LATEST_GENUINE_USER_SEQ_SQL`、同一套 DND EXISTS 子句,而不是在 Python 侧
+    重写一遍。
+
+    尤其是 **proactive_backoff**:那条不是「退避窗没过就挡」,还有一条逃生口——
+    用户在失败之后又真人发过言(`proactive_fail_user_seq < 最新真人 seq`)就照样
+    到期。少算这一条就只能给出模棱两可的 maybe,support 依旧判断不了。
+
+    无行返回 `{"present": False}`。
+    """
+    ts = float(now) if now is not None else None
+    uid = str(user_id or "").strip()
+    if not uid:
+        return {"present": False}
+    sql = (
+        "SELECT "
+        "  (schedule.next_heartbeat_at IS NULL) AS unarmed, "
+        "  (schedule.next_heartbeat_at IS NOT NULL AND schedule.next_heartbeat_at "
+        "     > COALESCE(to_timestamp(%s), now())) AS not_due_yet, "
+        "  (schedule.payment_cooldown_until IS NOT NULL AND schedule.payment_cooldown_until "
+        "     > COALESCE(to_timestamp(%s), now())) AS payment_cooldown, "
+        "  EXISTS (SELECT 1 FROM user_blobs AS settings "
+        "     WHERE settings.user_id=schedule.user_id AND settings.kind='proactive_settings' "
+        "     AND settings.doc @> '{\"dnd\": true}'::jsonb) AS dnd, "
+        "  (schedule.proactive_backoff_until IS NOT NULL "
+        "     AND schedule.proactive_backoff_until > COALESCE(to_timestamp(%s), now()) "
+        "     AND schedule.proactive_fail_user_seq >= "
+        + _LATEST_GENUINE_USER_SEQ_SQL
+        + ") AS proactive_backoff "
+        "FROM v2_wake_schedule AS schedule WHERE schedule.user_id=%s"
+    )
+    with _pool().connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(sql, (ts, ts, ts, uid))
+            row = cur.fetchone()
+    if row is None:
+        return {"present": False}
+    blockers = [name for name in
+                ("unarmed", "not_due_yet", "payment_cooldown", "dnd", "proactive_backoff")
+                if bool(row.get(name))]
+    return {"present": True, "blocked_by": blockers}
 
 
 def due_heartbeat_users(*, now: float | None = None, limit: int = 500) -> list[str]:
@@ -10709,3 +10918,273 @@ def set_chat_tail_anchor(user_id: str, anchor_seq: int) -> None:
             "updated_at=now()",
             (str(user_id), value),
         )
+
+
+# ---------------------------------------------------------------------------
+# History search（只读；见 model_api_runtime/v2/history_search.py 的纯逻辑内核）
+# ---------------------------------------------------------------------------
+
+# History-search 可见性 contract（spec §7）：只回用户可见的双方消息。角色白名
+# 单 user/human/openclaw；合成流量（verify_ping / resident_maintenance，写法同
+# db._CHAT_COVERAGE_SOURCE_PREDICATE）在 SQL LIMIT 之前排除，Python 侧后过滤会
+# 让一段长合成行序列把真实候选挤出窗口（同 chat_capture_messages_after_seq 的
+# 教训）。
+_HISTORY_VISIBLE_PREDICATE = (
+    # assistant 侧三个历史 role 都要含（serve_worker._ASSISTANT_ROLES：V1 时代
+    # 写 'agent'，部分路径写 'assistant'，现行 'openclaw'）——漏掉前两个会让老
+    # 用户的历史回复整段搜不到。
+    "doc->>'role' IN ('user','human','openclaw','assistant','agent') "
+    "AND COALESCE(doc->>'source','') "
+    "NOT IN ('verify_ping','resident_maintenance')"
+)
+
+
+def list_level0_summary_leaves(user_id, *, through_seq: int) -> list[dict]:
+    """History-search 扫描提示专用：end_seq<=through_seq 的全部 level-0 叶子。
+
+    刻意不复用 get_summary_frontier_state 的 canonical cover——那个查询会把被
+    更高层 checkpoint 覆盖的子节点排除掉，而扫描提示恰恰需要每片叶子的精确
+    start/end 范围（spec §4）。返回的 summary_envelope 仍是密文，由调用方送
+    enclave 解密后做归一化子串匹配；legacy_opaque 叶子（start_seq=0，无精确
+    source witness）也一并返回，但绝不参与命中段的范围推断——其覆盖的原文可能
+    已被旧 retention 清理，raw 兜底扫不到时置 coverage_gap。
+
+    按 end_seq 降序返回（recent-first 的提示扫描顺序）。只读、无锁；叶子段
+    append-only，end_seq<=snapshot 过滤即天然自洽。
+    """
+    upper = int(through_seq)
+    if upper < 0:
+        raise ValueError("through_seq must be >= 0")
+    with _pool().connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "SELECT segment_id,format_version,coverage_kind,level,"
+                "start_seq,end_seq,source_message_count,"
+                "legacy_opaque_through_seq,summary_envelope "
+                "FROM v2_conversation_summary_segments "
+                "WHERE user_id=%s AND level=0 AND end_seq<=%s "
+                "ORDER BY end_seq DESC,start_seq DESC",
+                (str(user_id), upper),
+            )
+            return [dict(row) for row in cur.fetchall()]
+
+
+def chat_history_candidate_rows(
+    user_id,
+    *,
+    min_seq: int,
+    max_seq: int,
+    start_ts: float | None = None,
+    end_ts: float | None = None,
+    limit: int,
+) -> list[dict]:
+    """一个降序候选窗口的**元数据**（绝不返回、也不解密正文）。
+
+    planner（history_search.next_batch）给出 seq ∈ [min_seq, max_seq]，这里取
+    其中最新的 ``limit`` 条可见候选，按 seq 降序（=扫描优先级顺序）返回。
+    可见性过滤全部发生在 SQL LIMIT 之前（见 _HISTORY_VISIBLE_PREDICATE）；
+    时间范围 start inclusive / end exclusive（spec §3.1）。
+
+    每行只带：seq / msg_id / ts / role / content_type / has_ciphertext。
+    ``has_ciphertext`` 镜像 serve_worker._decrypt_chat_rows 的可读性判据
+    （body_ct 非空且 K_enclave 非空）：False 的行（本地-only、R2 指针化的
+    图片/文件正文等）不可在本路径解密，调用方计入 unavailable_count 或按
+    content_type 走 caption 分支——图片/文件二进制正文（R2）绝不读。
+    """
+    lower = int(min_seq)
+    upper = int(max_seq)
+    if lower < 0 or upper < 0:
+        raise ValueError("history candidate seq bounds must be >= 0")
+    bounded = max(1, min(int(limit), 1000))
+    if upper < lower:
+        return []
+    predicate = (
+        "WHERE user_id=%s AND seq>=%s AND seq<=%s "
+        f"AND {_HISTORY_VISIBLE_PREDICATE} "
+    )
+    params: list = [str(user_id), lower, upper]
+    if start_ts is not None:
+        predicate += "AND ts>=%s "
+        params.append(float(start_ts))
+    if end_ts is not None:
+        predicate += "AND ts<%s "
+        params.append(float(end_ts))
+    with _pool().connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "SELECT seq,msg_id,ts,doc->>'role' AS role,"
+                "COALESCE(doc->>'content_type','') AS content_type,"
+                "(COALESCE(doc->>'body_ct','')<>'' "
+                " AND doc->>'K_enclave' IS NOT NULL) AS has_ciphertext "
+                "FROM chat_messages "
+                + predicate
+                + "ORDER BY seq DESC LIMIT %s",
+                (*params, bounded),
+            )
+            return [
+                {
+                    "seq": int(row["seq"]),
+                    "msg_id": str(row["msg_id"]),
+                    "ts": float(row["ts"]),
+                    "role": str(row["role"] or ""),
+                    "content_type": str(row["content_type"] or ""),
+                    "has_ciphertext": bool(row["has_ciphertext"]),
+                }
+                for row in cur.fetchall()
+            ]
+
+
+def _history_full_row(seq, msg_id, ts, doc) -> dict:
+    """doc 与权威关系列合并（同 db.chat_messages_after_seq 的契约）：
+    ``msg_id``/``ts``/``seq`` 覆盖 doc 里可能过期的副本。"""
+    return {**dict(doc or {}), "id": str(msg_id), "ts": float(ts), "seq": int(seq)}
+
+
+def chat_history_rows_by_seqs(user_id, seqs) -> list[dict]:
+    """给定 seq 集合的**完整密文行**（含 body_ct/K_enclave/caption_*），seq 降序。
+
+    候选选择走 chat_history_candidate_rows（元数据）在前，这里只按 seq 精确
+    取回密文供 enclave 批量解密；可见性谓词再套一遍属防御（两次查询之间行
+    不可变，谓词幂等）。附件行 body 密文的剥离（caption-only 契约，spec §7）
+    由 readside 协调层在投影时做——本函数保持"取回原行"的单一职责。
+    """
+    wanted = sorted({int(s) for s in seqs}, reverse=True)
+    if not wanted:
+        return []
+    if wanted[-1] < 0:
+        raise ValueError("history row seqs must be >= 0")
+    with _pool().connection() as conn:
+        rows = conn.execute(
+            "SELECT seq,msg_id,ts,doc FROM chat_messages "
+            "WHERE user_id=%s AND seq=ANY(%s) "
+            f"AND {_HISTORY_VISIBLE_PREDICATE} "
+            "ORDER BY seq DESC",
+            (str(user_id), wanted),
+        ).fetchall()
+    return [_history_full_row(r[0], r[1], r[2], r[3]) for r in rows]
+
+
+def chat_history_anchor_row(user_id, message_id) -> dict | None:
+    """history_fetch 的锚点行（完整密文行）。
+
+    不存在与不可见（角色/合成流量排除）统一返回 None——调用方按
+    ``not_found_or_not_visible`` 报，不区分（spec §3.2：不靠 message_id
+    难猜当权限控制）。
+    """
+    with _pool().connection() as conn:
+        row = conn.execute(
+            "SELECT seq,msg_id,ts,doc FROM chat_messages "
+            "WHERE user_id=%s AND msg_id=%s "
+            f"AND {_HISTORY_VISIBLE_PREDICATE} "
+            "LIMIT 1",
+            (str(user_id), str(message_id)),
+        ).fetchone()
+    if row is None:
+        return None
+    return _history_full_row(row[0], row[1], row[2], row[3])
+
+
+def _neighbor_window_sql() -> str:
+    """One statement: both neighbour windows and both existence counts.
+
+    取行与计数**必须在同一个 statement snapshot 内**。分成多条 SQL 是不够的：
+    连接池是 ``autocommit=True``（``db._pool``），READ COMMITTED 下每条语句各
+    取一次快照；而 ``chat_messages`` 也**不是** append-only（存在单条删除路径，
+    见 ``db.py`` 的 chat 删除）。并发删除落在两条语句之间时，取行看到的那批已
+    消失、计数却数到后面补位的行，``available - len(rows)`` 就会算出一个凭空的
+    ``omitted_*``——正是这个字段要根除的谎报。一条 CTE 里的所有分支共享同一个
+    快照，这种错位在原理上就不存在（顺带把 fetch 的往返从三次降到一次）。
+
+    每个 CTE 分支都自带 ``LIMIT``，在请求窗口处提前终止；计数结果因此是
+    ``min(请求条数, 实际条数)``，永不全表扫。四个分支共用同一份可见性谓词。
+    """
+    pred = _HISTORY_VISIBLE_PREDICATE
+    return (
+        "WITH before_rows AS ("
+        f" SELECT seq,msg_id,ts,doc FROM chat_messages"
+        f" WHERE user_id=%(uid)s AND seq<%(anchor)s AND {pred}"
+        "  ORDER BY seq DESC LIMIT %(n_before)s"
+        "), after_rows AS ("
+        f" SELECT seq,msg_id,ts,doc FROM chat_messages"
+        f" WHERE user_id=%(uid)s AND seq>%(anchor)s AND {pred}"
+        "  ORDER BY seq ASC LIMIT %(n_after)s"
+        "), before_probe AS ("
+        f" SELECT 1 FROM chat_messages"
+        f" WHERE user_id=%(uid)s AND seq<%(anchor)s AND {pred}"
+        "  ORDER BY seq DESC LIMIT %(want_before)s"
+        "), after_probe AS ("
+        f" SELECT 1 FROM chat_messages"
+        f" WHERE user_id=%(uid)s AND seq>%(anchor)s AND {pred}"
+        "  ORDER BY seq ASC LIMIT %(want_after)s"
+        ")"
+        " SELECT 'before' AS side, seq, msg_id, ts, doc FROM before_rows"
+        " UNION ALL"
+        " SELECT 'after', seq, msg_id, ts, doc FROM after_rows"
+        " UNION ALL"
+        " SELECT 'count_before', (SELECT count(*) FROM before_probe),"
+        "        NULL, NULL, NULL"
+        " UNION ALL"
+        " SELECT 'count_after', (SELECT count(*) FROM after_probe),"
+        "        NULL, NULL, NULL"
+    )
+
+
+def chat_history_neighbor_rows(
+    user_id,
+    anchor_seq: int,
+    *,
+    before: int,
+    after: int,
+    before_requested: int | None = None,
+    after_requested: int | None = None,
+) -> tuple[list[dict], list[dict], dict]:
+    """锚点邻居（该用户 seq 序取，客户端时间戳不可靠——spec §3.2）。
+
+    ``before``/``after`` = 这次真正取回密文的条数（已被回合预算钳过）；
+    ``before_requested``/``after_requested`` = 模型请求的窗口大小（省略则同上）。
+
+    返回 ``(before_rows, after_rows, available)``：前两项按**旧→新**排列（返回
+    结构的展示序），``available`` 是 ``{"before": n, "after": n}``——请求窗口内
+    实际存在多少条可见邻居。调用方据此算 ``omitted_*``，**不许**从"取回条数"
+    反推。取行与计数在**同一条语句**里完成，共享一个快照（见
+    ``_neighbor_window_sql``）；可见性谓词与候选查询完全同一套。
+    """
+    anchor = int(anchor_seq)
+    if anchor < 0:
+        raise ValueError("anchor_seq must be >= 0")
+    n_before = max(0, int(before))
+    n_after = max(0, int(after))
+    # 请求窗口至少要覆盖真的取回的条数，否则 available 会小于返回行数。
+    want_before = max(n_before, 0 if before_requested is None
+                      else int(before_requested))
+    want_after = max(n_after, 0 if after_requested is None
+                     else int(after_requested))
+    older: list[dict] = []
+    newer: list[dict] = []
+    available = {"before": 0, "after": 0}
+    if not (n_before or n_after or want_before or want_after):
+        return older, newer, available
+    with _pool().connection() as conn:
+        rows = conn.execute(
+            _neighbor_window_sql(),
+            {
+                "uid": str(user_id),
+                "anchor": anchor,
+                "n_before": n_before,
+                "n_after": n_after,
+                "want_before": want_before,
+                "want_after": want_after,
+            },
+        ).fetchall()
+    for side, seq, msg_id, ts, doc in rows:
+        if side == "before":
+            older.append(_history_full_row(seq, msg_id, ts, doc))
+        elif side == "after":
+            newer.append(_history_full_row(seq, msg_id, ts, doc))
+        elif side == "count_before":
+            available["before"] = int(seq or 0)
+        elif side == "count_after":
+            available["after"] = int(seq or 0)
+    # before 分支按 seq DESC 取（要最靠近锚点的 N 条），展示序是旧→新。
+    older.reverse()
+    return older, newer, available

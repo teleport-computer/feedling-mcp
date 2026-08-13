@@ -133,7 +133,7 @@ enclave:5003` / `http://backend:5001`）——这是全部改动里唯一的地�
 其余环境变量（`DATABASE_URL`、`FEEDLING_RUNTIME_TOKEN_SECRET` 等）与此前
 runner 侧的 serve-worker 完全一致。
 
-**环境变量表**（主 CVM 新增的 `serve-worker` 服务）：
+**环境变量表**（主 CVM 的 backend 与 `serve-worker` 服务）：
 
 | 变量 | 值 | 说明 |
 |---|---|---|
@@ -147,6 +147,7 @@ runner 侧的 serve-worker 完全一致。
 | `FEEDLING_V2_SANDBOX_PROVIDER` | `"disabled"`（字面量） | 灰度期不接 E2B 沙箱；照抄即可，不要用 `${VAR}` |
 | `FEEDLING_HOSTED_RUNTIME_POLICY` | `"dual"` | backend 与 serve-worker 都设，取代旧的 `"v2_only"` 字面量 |
 | `FEEDLING_RUNTIME_DEFAULT_DESIRED` | `"resident"` | 无 allowlist 记录的账号默认 fence；保证部署瞬间行为与部署前一致 |
+| `FEEDLING_V2_NEW_USER_CUTOFF` | `${FEEDLING_V2_NEW_USER_CUTOFF:-}`（仅 backend） | 带时区的 UTC ISO-8601 注册 cutoff；空值是零行为变化阶段，缺失/空值/非法值都 fail-safe 为 resident |
 
 **Voice 公网回调**：主 CVM 的 `backend` 还必须设置
 `FEEDLING_VOICE_GATEWAY_PUBLIC_URL`，并与同一 compose 的 ingress 域名一致：
@@ -170,6 +171,20 @@ fail closed 为 `503 voice_gateway_not_configured`。
    （除非未来任务显式改它）。
 4. 部署完成瞬间：全员 fence 应为 `resident` → 行为与部署前完全一致
    （P3 验收点）；之后由 allowlist 逐步把个别账号切到 `v2`。
+
+### 新注册 Model API 用户自动 V2 admission
+
+按环境逐步启用：先部署包含该功能的代码并保持
+`FEEDLING_V2_NEW_USER_CUTOFF` 为空，验证 backend、serve-worker 和现有 resident 路径健康；
+再设置一个明确、带时区的 UTC cutoff，重新部署 measured Compose，最后观察 cohort 收敛。
+cutoff 只适用于成功测试并激活了 Model API route、且注册时间不早于 cutoff 的新账号；
+不迁移存量账号或 resident 路线。缺失、空值或非法 cutoff 会保持 resident。
+
+通过现有 runtime allowlist reconciliation view 按 `updated_by='new-user-cohort'` 筛选，记录
+`desired=v2`、实际 state、generation 和 `converged`，并同时观察 V2 worker capacity、队列年龄、
+首轮回复成功率及延迟。停止新增 admission 时清空 cutoff 或移至未来；如需回滚已自动纳入的
+账号，只将 `updated_by='new-user-cohort' AND desired='v2'` 的记录改为 `desired='resident'`，
+不要影响人工 pin。
 
 ### Production CVM (prod9, current)
 
@@ -713,7 +728,7 @@ WAL-G 备份；test/prod 已接双写 + in-process 同步调度器，pre 在首�
 | Placement | prod9 node 18，`tdx.medium`（2 vCPU / 4GB），30GB ZFS |
 | Public PG | `ade3cabf133ec3e9ee6220265843c4ac993e1e63-5432s.dstack-pha-prod9.phala.network:443`（direct TLS） |
 | Backup | `s3://io-in-enclave-db/pre/wal-g`，pre 独立 libsodium key |
-| Schema baseline | Phase 4 target is the current `alembic_tee` release head (`0015_merge_pre_perception` at this revision); the owner-only workflow must reach the release's head before any app DSN switch. |
+| Schema baseline | Phase 4 target is the current `alembic_tee` release head (`0017_voice_primary_alignment` at this revision); the owner-only workflow must reach the release's head before any app DSN switch. |
 | Deploy path | `Deploy Postgres CVM` workflow 的 `pre` lane，目标 ID 在 `deploy/pre-pg-cvm-id.txt` |
 | Migration | `TEE migrate` workflow 的 `pre` lane，owner DSN + verify-full CA |
 | App wiring | Shadow stage: `PRE_TEE_DATABASE_URL` + `PRE_FEEDLING_TEE_DUAL_WRITE`. Primary stage: `PRE_DATABASE_URL` points to the TEE app DSN, `FEEDLING_DATABASE_SCHEMA=tee`, and both shadow variables are empty. |

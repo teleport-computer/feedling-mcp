@@ -553,14 +553,60 @@ def test_plaintext_reuses_done_job_200_parity(user, monkeypatch):
 
 def test_plaintext_update_identity_without_identity_enqueues_202_parity(user, monkeypatch):
     uid, api_key = user
-    payload = {"mode": "update_identity", "ai_persona_content": "Name: Joy", "client_job_id": "identity-x"}
-    monkeypatch.setattr(genesis_routes, "_start_plaintext_genesis_job", lambda *_args, **_kwargs: True)
-    f = _flask("POST", "/v1/genesis/imports/plaintext", headers=_headers(api_key), json_body=payload)
+    payload = {
+        "mode": "update_identity",
+        "ai_persona_content": "Name: Joy",
+        "client_job_id": "identity-x",
+    }
+    monkeypatch.setattr(
+        genesis_routes,
+        "_start_plaintext_genesis_job",
+        lambda *_args, **_kwargs: True,
+    )
+
+    f = _flask(
+        "POST",
+        "/v1/genesis/imports/plaintext",
+        headers=_headers(api_key),
+        json_body=payload,
+    )
     # Flask and ASGI are alternate adapters, not two concurrent requests in
     # this parity test. Clear the first adapter's active job before exercising
     # the second; a real duplicate while processing correctly returns 409.
     _reset_genesis(uid)
     a = _asgi("POST", "/v1/genesis/imports/plaintext", headers=_headers(api_key), json_body=payload)
+
     assert f[0] == a[0] == 202
     assert _norm(f, drop={"job_id"}) == _norm(a, drop={"job_id"})
     assert f[1]["status"] == "processing"
+
+
+def test_plaintext_update_identity_rejects_a_second_active_job(user, monkeypatch):
+    _uid, api_key = user
+    payload = {
+        "mode": "update_identity",
+        "ai_persona_content": "Name: Joy",
+        "client_job_id": "identity-active",
+    }
+    monkeypatch.setattr(
+        genesis_routes,
+        "_start_plaintext_genesis_job",
+        lambda *_args, **_kwargs: True,
+    )
+
+    first = _asgi(
+        "POST",
+        "/v1/genesis/imports/plaintext",
+        headers=_headers(api_key),
+        json_body=payload,
+    )
+    second = _asgi(
+        "POST",
+        "/v1/genesis/imports/plaintext",
+        headers=_headers(api_key),
+        json_body=payload,
+    )
+
+    assert first[0] == 202
+    assert second[0] == 409
+    assert second[1]["error"] == "import_job_active"

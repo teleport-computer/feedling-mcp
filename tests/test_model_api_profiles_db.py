@@ -103,6 +103,22 @@ def test_vision_verdict_write_is_fenced_to_exact_route_version(backend_env):
     assert db.model_api_route_get(uid, route_id)["vision_test_status"] == "unsupported"
 
 
+def test_active_route_vision_verdict_is_content_and_credential_free(backend_env):
+    uid = _uid()
+    seed_user(uid)
+    cid = _cred(uid)
+    route_id = db.model_api_route_upsert(uid, cid, "vision-model", None)
+    assert db.model_api_route_activate(uid, route_id)
+    assert db.model_api_route_mark_vision_test(uid, route_id, status="ok")
+
+    verdict = db.model_api_active_route_vision_verdict(uid)
+
+    assert verdict["id"] == route_id
+    assert verdict["vision_test_status"] == "ok"
+    assert verdict["updated_at"].endswith("Z")
+    assert set(verdict) == {"id", "vision_test_status", "updated_at"}
+
+
 def test_changing_model_creates_fresh_untested_vision_verdict(backend_env):
     uid = _uid()
     seed_user(uid)
@@ -566,11 +582,13 @@ def test_route_columns_timestamps_are_utc_invariant_under_session_timezone(backe
 
         conn.execute("RESET TIME ZONE")
 
-    # _ROUTE_COLUMNS' 0-indexed order after image-generation fields landed:
-    # 14=last_test_at, 17=last_vision_test_at, 24=created_at, 25=updated_at.
+    # _ROUTE_COLUMNS' 0-indexed order after the V2 vision fields:
+    # 14=last_test_at, 17=last_vision_test_at, 20=last_image_generation_test_at,
+    # 24=created_at, 25=updated_at.
     for idx, name in (
         (14, "last_test_at"),
         (17, "last_vision_test_at"),
+        (20, "last_image_generation_test_at"),
         (24, "created_at"),
         (25, "updated_at"),
     ):

@@ -40,12 +40,30 @@ def test_build_response_defaults_are_empty_and_backward_compatible():
     # vision_probe (67078873, resident auto-probe) is additive and defaults to
     # None when the poll context carries no probe payload.
     assert resp["vision_probe"] is None
+    assert resp["web_policy"] is None
     # exact legacy field set + the additive fields, nothing else snuck in.
     assert set(resp.keys()) == {
         "messages", "runtime_v2", "client_release", "user_mcp", "timed_out",
         "consumer_id", "claimed", "agent_status_events", "status_cursor",
         "vision_probe", "web_policy",
     }
+
+
+def test_build_response_projects_explicit_web_policy():
+    policy = {"effective": True, "search": True, "fetch": False}
+    resp = chat_poll_core.build_response(
+        messages=[],
+        context={
+            "runtime_v2": {},
+            "client_release": {},
+            "user_mcp": {},
+            "web_policy": policy,
+        },
+        consumer_id="c1",
+        claim=False,
+        timed_out=False,
+    )
+    assert resp["web_policy"] == policy
 
 
 def test_db_list_agent_status_events_increments_by_after_id(client, backend_env):

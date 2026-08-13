@@ -21,9 +21,6 @@ def upgrade() -> None:
             ADD COLUMN IF NOT EXISTS image_generation_test_status TEXT NOT NULL DEFAULT 'untested',
             ADD COLUMN IF NOT EXISTS last_image_generation_test_at TIMESTAMPTZ,
             ADD COLUMN IF NOT EXISTS last_image_generation_test_error TEXT NOT NULL DEFAULT '';
-
-        CREATE UNIQUE INDEX IF NOT EXISTS model_api_routes_one_image_generation
-            ON model_api_routes (user_id) WHERE is_image_generation;
         """
     )
 
@@ -31,7 +28,6 @@ def upgrade() -> None:
 def downgrade() -> None:
     op.execute(
         """
-        DROP INDEX IF EXISTS model_api_routes_one_image_generation;
         ALTER TABLE model_api_routes
             DROP COLUMN IF EXISTS last_image_generation_test_error,
             DROP COLUMN IF EXISTS last_image_generation_test_at,

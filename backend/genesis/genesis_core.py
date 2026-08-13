@@ -551,7 +551,9 @@ def get_import_status(store, job_id: str, *, include_missing_raw) -> tuple[dict,
         error_class = service.classify_genesis_error(str(job.get("error") or ""))
         status_projection["error_class"] = error_class
         status_projection["friendly_copy"] = service.genesis_failure_required_text(
-            str(job.get("error") or ""))
+            str(job.get("error") or ""),
+            ingest=str((job.get("metadata") or {}).get("ingest") or ""),
+        )
     extra.update(status_projection)
     return _job_response(job, extra=extra), 200
 
@@ -855,6 +857,9 @@ def plaintext_import(
         metadata["distill_model"] = normalized_distill_model
     total_bytes = sum(len(text.encode("utf-8")) for text in prepared["chunk_texts"])
     try:
+        trusted_metadata = plaintext_helpers._plaintext_worker_metadata()
+        if trusted_staged_id:
+            trusted_metadata["staged_id"] = trusted_staged_id
         job, _status = service.create_import_job(
             store,
             {
@@ -865,7 +870,7 @@ def plaintext_import(
                 "metadata": metadata,
             },
             initial_status="processing",
-            trusted_metadata=plaintext_helpers._plaintext_worker_metadata(),
+            trusted_metadata=trusted_metadata,
         )
     except db.GenesisPlaintextJobActive as e:
         return _bad("import_job_active", 409, active_job_id=e.active_job_id)
