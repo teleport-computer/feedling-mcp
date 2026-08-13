@@ -65,6 +65,23 @@ LimitSource = Literal[
 ]
 PlanStatus = Literal["fits", "fits_optional_omitted"]
 
+# When the complete catalog does not fit, retain the user-selected MCP surface
+# and the smallest useful memory/reply loop before admitting less essential
+# platform capabilities. The priority decision belongs here, beside the budget
+# that applies it, rather than being copied into each worker/tool-loop caller.
+_MCP_TOOL_PREFIX = "mcp__"
+_CORE_TOOL_FLOOR_NAMES = frozenset(
+    {
+        "memory_index",
+        "memory_search",
+        "memory_fetch",
+        "memory_write",
+        "memory_organize",
+        "reply",
+        "send_file",
+    }
+)
+
 
 @dataclass(frozen=True)
 class ModelPromptLimit:
@@ -140,6 +157,8 @@ class PromptFrontierPlan:
     estimated_input_tokens: int
     remaining_input_tokens: int
     status: PlanStatus
+    offered_tool_names: tuple[str, ...] = ()
+    included_tool_names: tuple[str, ...] = ()
 
     @property
     def included_components(self) -> tuple[str, ...]:
@@ -984,6 +1003,9 @@ def plan_provider_round(
                 utf8_bytes_per_token=utf8_bytes_per_token,
             )
         )
+    offered_tools = list(tools or [])
+    required_tools: list[Any] = []
+    optional_tools: list[Any] = []
     if tools is not None:
         required_names = {str(name) for name in required_tool_names if str(name)}
         required_tools = [
@@ -1012,11 +1034,71 @@ def plan_provider_round(
                     priority=1,
                 )
             )
-    return plan_prompt(
+    plan = plan_prompt(
         model_limit=model_limit,
         components=components,
         output_reserve_tokens=output_reserve_tokens,
         safety_margin_tokens=safety_margin_tokens,
+    )
+    offered_names = tuple(str(getattr(tool, "name", "")) for tool in offered_tools)
+    required_name_set = {
+        str(getattr(tool, "name", "")) for tool in required_tools
+    }
+    if not optional_tools or "tool_schemas" not in plan.omitted_optional_components:
+        return dataclasses.replace(
+            plan,
+            offered_tool_names=offered_names,
+            included_tool_names=offered_names,
+        )
+
+    # The complete optional catalog is too large. Re-plan the same exact prompt
+    # with one atomic component per remaining schema so pressure trims a
+    # deterministic tail instead of turning every tool off. User MCP and the
+    # core memory/reply loop are admitted first; schemas referenced by retained
+    # native history remain required exactly as above.
+    granular_components = [
+        component for component in components if component.name != "tool_schemas"
+    ]
+    optional_component_names: list[tuple[str, str]] = []
+    for index, tool in enumerate(optional_tools):
+        tool_name = str(getattr(tool, "name", ""))
+        component_name = f"tool_schema_{index}"
+        priority = (
+            2
+            if tool_name.startswith(_MCP_TOOL_PREFIX)
+            or tool_name in _CORE_TOOL_FLOOR_NAMES
+            else 1
+        )
+        granular_components.append(
+            tool_schemas_component(
+                [tool],
+                name=component_name,
+                required=False,
+                priority=priority,
+            )
+        )
+        optional_component_names.append((component_name, tool_name))
+    plan = plan_prompt(
+        model_limit=model_limit,
+        components=granular_components,
+        output_reserve_tokens=output_reserve_tokens,
+        safety_margin_tokens=safety_margin_tokens,
+    )
+    included_components = set(plan.included_components)
+    included_optional_names = {
+        tool_name
+        for component_name, tool_name in optional_component_names
+        if component_name in included_components
+    }
+    included_names = tuple(
+        name
+        for name in offered_names
+        if name in required_name_set or name in included_optional_names
+    )
+    return dataclasses.replace(
+        plan,
+        offered_tool_names=offered_names,
+        included_tool_names=included_names,
     )
 
 

@@ -556,7 +556,59 @@ def test_historical_tool_schema_is_required_when_optional_catalog_does_not_fit()
     )
 
     assert "required_tool_schemas" in plan.included_components
-    assert "tool_schemas" in plan.omitted_optional_components
+    assert plan.included_tool_names == ("memory_index",)
+    assert plan.offered_tool_names == ("memory_index", "large_optional")
+
+
+def test_budget_pressure_keeps_mcp_memory_and_reply_floor_before_tail():
+    messages = [{"role": "user", "content": "use my connected service"}]
+    floor_tools = [
+        ToolSpec("memory_index", "browse memory", {"type": "object"}),
+        ToolSpec("memory_write", "write memory", {"type": "object"}),
+        ToolSpec("reply", "reply now", {"type": "object"}),
+        ToolSpec("mcp__calendar__events", "calendar", {"type": "object"}),
+    ]
+    tail_tools = [
+        ToolSpec(
+            f"optional_tail_{index}",
+            "non-core capability " * 20,
+            {"type": "object", "properties": {}},
+        )
+        for index in range(40)
+    ]
+    tools = [*tail_tools, *floor_tools]
+    message_cost = frontier.messages_component(
+        messages, name="message_context"
+    ).estimated_tokens
+    floor_cost = frontier.tool_schemas_component(floor_tools).estimated_tokens
+    full_cost = frontier.tool_schemas_component(tools).estimated_tokens
+    output_reserve = 128
+    safety_margin = 128
+    context_window = max(
+        frontier.MIN_CONTEXT_WINDOW_TOKENS,
+        message_cost + floor_cost + output_reserve + safety_margin + 128,
+    )
+    budget = frontier.build_prompt_budget(
+        context_window,
+        output_reserve_tokens=output_reserve,
+        safety_margin_tokens=safety_margin,
+    )
+    assert message_cost + floor_cost <= budget.input_budget_tokens
+    assert message_cost + full_cost > budget.input_budget_tokens, (
+        "fixture did not cross the complete-catalog budget gate"
+    )
+
+    plan = frontier.plan_provider_round(
+        model_limit=_model_limit(context_window),
+        messages=messages,
+        tools=tools,
+        output_reserve_tokens=output_reserve,
+        safety_margin_tokens=safety_margin,
+    )
+
+    included = set(plan.included_tool_names)
+    assert {tool.name for tool in floor_tools}.issubset(included)
+    assert len(plan.included_tool_names) < len(plan.offered_tool_names)
 
 
 def test_historical_tool_schema_fails_closed_when_required_frontier_is_exhausted():
@@ -807,7 +859,7 @@ def test_late_input_is_in_required_frontier_before_first_provider_call(monkeypat
     assert caught.value.required_components == ("message_context",)
 
 
-def test_tool_catalog_is_counted_and_omitted_whole_when_only_it_does_not_fit(
+def test_tool_catalog_pressure_reaches_provider_with_core_floor_not_huge_tail(
     monkeypatch,
 ):
     calls = []
@@ -846,7 +898,10 @@ def test_tool_catalog_is_counted_and_omitted_whole_when_only_it_does_not_fit(
 
     assert outcome.final_text == "text-only"
     assert len(calls) == 1
-    assert calls[0][1] is None
+    sent_names = {spec.name for spec in calls[0][1]}
+    assert {"memory_index", "memory_write", "reply"}.issubset(sent_names)
+    assert "large_read" not in sent_names
+    assert len(sent_names) < len(tool_loop._catalog()) + 1
     assert calls[0][0] == [{"role": "system", "content": "stable prefix"}]
 
 

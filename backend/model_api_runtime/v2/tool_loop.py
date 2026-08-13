@@ -1025,11 +1025,25 @@ async def run_tool_loop(
                 on_tail_window(dict(tail_window))
             except Exception:
                 pass
-        if "tool_schemas" in frontier_plan.omitted_optional_components:
+        planned_tool_names = tuple(
+            getattr(frontier_plan, "included_tool_names", ()) or ()
+        )
+        planned_offered_tool_names = tuple(
+            getattr(frontier_plan, "offered_tool_names", ()) or ()
+        )
+        if planned_offered_tool_names:
+            included_tool_names = set(planned_tool_names)
+            tools = [
+                spec
+                for spec in (tools or [])
+                if spec.name in included_tool_names
+            ] or None
+        elif "tool_schemas" in frontier_plan.omitted_optional_components:
             # Once a memory discovery result is present in the required native
             # transcript, keep that matching schema even when the remaining
-            # optional catalog no longer fits. This avoids a provider-visible
-            # call/result history whose tool definition has disappeared.
+            # optional catalog no longer fits. This compatibility branch also
+            # supports injected/legacy planners that predate per-tool frontier
+            # decisions.
             tools = [
                 spec
                 for spec in (tools or [])
