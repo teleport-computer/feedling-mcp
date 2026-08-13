@@ -589,8 +589,11 @@ def load_genesis_staged_payload(
     envelope = blob.get("content_envelope")
     if not isinstance(envelope, dict):
         raise RuntimeError("staged_import_payload_missing")
-    raw = core_enclave._decrypt_envelope_via_enclave(
-        envelope, api_key, purpose="genesis_staged_payload")
+    try:
+        raw = core_envelope.read_envelope_body(
+            envelope, api_key, purpose="genesis_staged_payload")
+    except ValueError as exc:
+        raise RuntimeError(f"staged_import_envelope_invalid:{exc}") from exc
     if _sha256_hex(raw) != str(blob.get("sha256") or ""):
         raise RuntimeError("staged_import_sha256_mismatch")
     try:
@@ -698,12 +701,15 @@ def load_genesis_checkpoint(
     envelope = blob.get("content_envelope") if isinstance(blob, dict) else None
     if not isinstance(envelope, dict):
         raise RuntimeError("genesis_checkpoint_envelope_missing")
-    raw = core_enclave._decrypt_envelope_via_enclave(
-        envelope,
-        api_key,
-        purpose="genesis_checkpoint",
-        runtime_token=runtime_token,
-    )
+    try:
+        raw = core_envelope.read_envelope_body(
+            envelope,
+            api_key,
+            purpose="genesis_checkpoint",
+            runtime_token=runtime_token,
+        )
+    except ValueError as exc:
+        raise RuntimeError(f"genesis_checkpoint_envelope_invalid:{exc}") from exc
     digest = _sha256_hex(raw)
     if digest != str(blob.get("sha256") or ""):
         raise RuntimeError("genesis_checkpoint_sha256_mismatch")

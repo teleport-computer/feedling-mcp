@@ -10,6 +10,12 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **Plaintext-account Genesis imports now commit and resume without entering the
+  enclave decrypt path.** Estimate/commit staged uploads and resumable
+  checkpoints read plaintext envelopes locally, while encrypted accounts keep
+  the existing authenticated enclave decryption. This restores both long-term
+  memory and chat-history file imports when content encryption is off.
+
 - **User-configured MCP servers now follow the selected-server trust model.**
   MCP tools remain available after private reads and earlier MCP results, which
   enables multi-step flows such as reading and then storing remote memory in one

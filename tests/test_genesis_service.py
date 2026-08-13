@@ -1348,6 +1348,7 @@ def test_genesis_checkpoint_persists_only_encrypted_content(monkeypatch):
 
 def test_genesis_checkpoint_load_verifies_and_decrypts(monkeypatch):
     checkpoint_doc = {"v": 1, "tasks": {}, "map_outputs": {}}
+    decrypt_call = {}
     raw = json.dumps(
         checkpoint_doc, ensure_ascii=False, sort_keys=True, separators=(",", ":")
     ).encode()
@@ -1359,10 +1360,52 @@ def test_genesis_checkpoint_load_verifies_and_decrypts(monkeypatch):
     monkeypatch.setattr(
         service.core_enclave,
         "_decrypt_envelope_via_enclave",
-        lambda envelope, api_key, **kwargs: raw,
+        lambda envelope, api_key, **kwargs: (
+            decrypt_call.update(
+                envelope=envelope, api_key=api_key, kwargs=kwargs
+            ) or raw
+        ),
     )
 
-    assert service.load_genesis_checkpoint(_store(), "api-key", "job_1") == checkpoint_doc
+    assert service.load_genesis_checkpoint(
+        _store(), "api-key", "job_1", runtime_token="runtime-token"
+    ) == checkpoint_doc
+    assert decrypt_call == {
+        "envelope": {"body_ct": "ciphertext"},
+        "api_key": "api-key",
+        "kwargs": {
+            "purpose": "genesis_checkpoint",
+            "runtime_token": "runtime-token",
+        },
+    }
+
+
+def test_plaintext_genesis_checkpoint_loads_locally_without_enclave(monkeypatch):
+    checkpoint_doc = {"v": 1, "tasks": {}, "map_outputs": {}}
+    raw = json.dumps(
+        checkpoint_doc, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode()
+    blob = {
+        "content_envelope": {
+            "body": raw.decode(),
+            "id": "genesis_checkpoint_job_plain",
+            "owner_user_id": "usr_plain",
+            "visibility": "shared",
+        },
+        "sha256": service._sha256_hex(raw),
+    }
+    monkeypatch.setattr(service.db, "get_blob_strict", lambda *_args: blob)
+    monkeypatch.setattr(
+        service.core_enclave,
+        "_decrypt_envelope_via_enclave",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("plaintext checkpoint must not enter enclave")
+        ),
+    )
+
+    assert service.load_genesis_checkpoint(
+        _store("usr_plain"), "api-key", "job_plain"
+    ) == checkpoint_doc
 
 
 def test_genesis_staged_payload_is_encrypted_and_consumed_as_tombstone(monkeypatch):
@@ -1407,6 +1450,56 @@ def test_genesis_staged_payload_is_encrypted_and_consumed_as_tombstone(monkeypat
     service.mark_genesis_staged_consumed(_store(), staged_id, "job_1")
     assert stored["doc"]["consumed"] is True
     assert "content_envelope" not in stored["doc"]
+
+
+def test_plaintext_genesis_staged_payload_loads_locally_without_enclave(monkeypatch):
+    payload = {"format": "plaintext", "content": "User: hello"}
+    raw = json.dumps(
+        payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode()
+    blob = {
+        "staged_id": "staged_plain",
+        "expires_at": int(service.time.time()) + 600,
+        "consumed": False,
+        "content_envelope": {
+            "body": raw.decode(),
+            "id": "genesis_staged_staged_plain",
+            "owner_user_id": "usr_plain",
+            "visibility": "shared",
+        },
+        "sha256": service._sha256_hex(raw),
+    }
+    monkeypatch.setattr(service.db, "get_blob_strict", lambda *_args: blob)
+    monkeypatch.setattr(
+        service.core_enclave,
+        "_decrypt_envelope_via_enclave",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("plaintext staged payload must not enter enclave")
+        ),
+    )
+
+    assert service.load_genesis_staged_payload(
+        _store("usr_plain"), "api-key", "staged_plain"
+    ) == payload
+
+
+def test_invalid_plaintext_genesis_staged_shape_remains_server_error(monkeypatch):
+    blob = {
+        "staged_id": "staged_invalid",
+        "expires_at": int(service.time.time()) + 600,
+        "consumed": False,
+        "content_envelope": {"body_b64": "not-valid-base64"},
+        "sha256": "0" * 64,
+    }
+    monkeypatch.setattr(service.db, "get_blob_strict", lambda *_args: blob)
+
+    with pytest.raises(
+        RuntimeError,
+        match="staged_import_envelope_invalid:envelope_body_b64_invalid",
+    ):
+        service.load_genesis_staged_payload(
+            _store("usr_plain"), "api-key", "staged_invalid"
+        )
 
 
 def test_expired_genesis_stage_is_deleted_before_410(monkeypatch):
