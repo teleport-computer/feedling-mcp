@@ -112,6 +112,7 @@ if not _provisioned:
         "test_branch_flow_guard.py",
         "test_memory_actions_guard.py",
         "test_protocol_leak.py",
+        "test_memory_search_retry_guidance.py",
         "test_tool_markup_leak.py",
         "test_v2_provider_output_edges.py",
         "test_memory_lane_torn_protocol_no_write.py",

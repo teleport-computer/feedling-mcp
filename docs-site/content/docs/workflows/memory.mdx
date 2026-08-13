@@ -27,6 +27,14 @@ unchanged. Specific questions should use `memory_search` followed by
 `total`, without indiscriminately loading every card. Bulk cleanup requests
 belong to `memory_organize`, not a chat-loop sequence of single-card edits.
 
+`memory_search` matches a literal, case-insensitive substring of the card text;
+it applies no synonyms, translation, or stemming. An empty result therefore means
+that exact wording does not appear on any card, not that the memory is missing —
+a card written in one language is not found by searching for the other. The tool
+guidance directs the model to retry with different wording before concluding that
+a memory does not exist; only an identical repeat of the same arguments is
+refused within a turn.
+
 `GET /v1/dream/status` also returns `capture_cards_added` and
 `capture_completed_at`. The count is a monotonic total of cards actually added
 across Capture runs. Clients subtract the total saved when the user last

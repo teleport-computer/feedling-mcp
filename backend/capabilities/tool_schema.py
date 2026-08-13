@@ -448,9 +448,19 @@ DESCRIPTIONS: dict[str, str] = {
                       "memory_fetch for the selected ids. This is the normal path for a "
                       "specific remembered subject, person, phrase, or event. Never use "
                       "it for ordinary conversation, model/runtime identity, or an "
-                      "all-memory overview, and do not repeat it after one discovery "
-                      "result. For a user-requested bulk rewrite or cleanup, call "
-                      "memory_organize."),
+                      "all-memory overview. Matching is a literal case-insensitive "
+                      "substring over the card text, with no synonyms, translation, or "
+                      "stemming: zero results mean that exact wording is absent, NOT "
+                      "that the memory is absent. So when a search comes back empty, do "
+                      "not tell the user the memory does not exist and do not ask them "
+                      "to paste the content back to you — search again with different "
+                      "wording (the user's own words, the other language, a shorter "
+                      "distinctive fragment). Case and surrounding whitespace are "
+                      "normalized away, so a query differing only in those returns the "
+                      "same rows and is wasted; only an identical repeat of the same "
+                      "arguments is refused, while the same query narrowed by a "
+                      "different limit/bucket/thread is a legitimate re-search. For a "
+                      "user-requested bulk rewrite or cleanup, call memory_organize."),
     "voice_transcript_list": (
         "List this user's archived voice calls, newest first: call_id, when it "
         "happened, how long it ran, how many turns. Metadata only — no words "
