@@ -1,27 +1,28 @@
 # Runtime V2 Three-Pool Slot Isolation Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use `superpowers:executing-plans` to implement this plan task by task. Use `superpowers:test-driven-development` for every behavior change and `superpowers:verification-before-completion` before claiming a task or phase complete.
+> **For agentic workers:** REQUIRED SUB-SKILL: Use `superpowers:subagent-driven-development` (recommended) or `superpowers:executing-plans` to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking. Use `superpowers:test-driven-development` for every behavior change and `superpowers:verification-before-completion` before claiming a task complete.
 
-**Goal:** Prevent Runtime V2 background work from blocking Chat, contain a hung Job to one slot, and run an initial production layout of 4 foreground, 2 wake, and 2 heavy slots on the 8C16G enclave.
+**Goal:** From the current `test` branch, replace Runtime V2's shared multi-slot worker with the complete 4-foreground/2-wake/2-heavy runtime, then validate it in the test environment.
 
-**Architecture:** A single `serve-worker` parent owns eight one-slot child processes grouped into three logical pools. PostgreSQL remains the source of truth for Job ownership and recovery; Chat atomically terminalizes/requeues conflicting same-user background work, while a typed notification asks the owning child to stop promptly. The parent watchdog kills only the affected slot, recovers only that slot's active claim, and then respawns it. Enclave concurrency is enforced by a parent IPC broker, not by process-local semaphores.
+**Architecture:** Runtime V2 has one topology only: a `serve-worker` parent owns eight one-slot child processes grouped into three logical pools. PostgreSQL remains the source of truth for Job ownership and recovery; Chat atomically terminalizes/requeues conflicting same-user background work, while a typed notification asks the owning child to stop promptly. The parent watchdog kills only the affected slot, recovers only that slot's active claim, and then respawns it. Enclave concurrency is enforced by a parent IPC broker, not by process-local semaphores.
 
-**Tech Stack:** Python 3.11, `asyncio`, `multiprocessing` with spawn, psycopg 3 and `psycopg_pool`, PostgreSQL/Alembic, pytest, Docker Compose, Prometheus metrics.
+**Tech Stack:** Python 3.11, `asyncio`, `multiprocessing` with spawn, psycopg 3 and `psycopg_pool`, PostgreSQL/Alembic, pytest, Docker Compose, and the existing admin JSON metrics endpoint.
 
 ## Global Constraints
 
-- Preserve the default legacy worker path until the three-pool mode has passed test and pre-environment validation. `FEEDLING_V2_POOL_MODE=legacy` is the rollback switch.
+- Start implementation from the current local `test` tip. The single implementation PR targets `test`; this plan ends after test-environment validation and does not promote to pre or prod.
+- Three pools and one-process-per-slot are unconditional Runtime V2 behavior. Do not add `FEEDLING_V2_POOL_MODE`, a legacy supervisor branch, or feature switches for Chat preemption or slot isolation.
 - Do not change the public return contract of `backend.db.chat_append_and_enqueue`: it remains `tuple[int, int | None]`.
 - PostgreSQL is authoritative. IPC messages accelerate cancellation and admission but must never be required for durable correctness.
-- A child process owns exactly one execution slot in three-pool mode. Do not recreate several `asyncio` slot tasks inside one child.
+- A child process owns exactly one execution slot. Do not recreate several `asyncio` slot tasks inside one child.
 - Chat preemption and Chat enqueue happen in the same database transaction. Publish cancellation notifications only after that transaction commits.
 - A watchdog must use this order: advertise slot unavailable, snapshot active claim, kill child, recover exactly that claim conditionally, then start the replacement child.
 - All claim recovery updates must compare `job_id`, `claimed_by`, and active status so a stale watchdog cannot overwrite a newer owner.
 - Preserve terminal-failure outbox/reconciler semantics. A failed Chat still gets at most one durable user-visible reply.
-- In three-pool mode, parent DB pool maximum is 8 and each child DB pool maximum is 2. Do not apply the old all-slots-in-one-process sizing formula to every child.
+- Parent DB pool maximum is 8 and each child DB pool maximum is 2. Do not apply the old all-slots-in-one-process sizing formula to every child.
 - Enclave admission is instance-wide: total 4 permits, with initial reservations of foreground 2, wake 1, heavy 1. Unused reservations may be borrowed without violating a waiting pool's reservation.
 - Only one Heavy slot may claim `profile`; the other Heavy slot handles the remaining heavy lanes.
-- Non-secret pool and capacity settings belong directly in the Phala Compose YAML files. Credentials and provider keys remain in encrypted environment configuration.
+- Non-secret pool and capacity settings belong directly in `deploy/docker-compose.phala.test.yaml`. Credentials and provider keys remain in encrypted environment configuration.
 - Any architecture, trust-boundary, deployment-topology, or user-visible behavior change must update the affected public docs and `Unreleased` changelog in the same phase.
 - Use one behavior change per commit where practical. Do not mix formatting or unrelated cleanup into these commits.
 - All PostgreSQL tests must run against the test DSN and must not silently skip:
@@ -43,11 +44,29 @@ The logical pool name stored in worker heartbeat rows is `heavy` for both Heavy 
 
 ## Delivery Phases
 
-- **Phase 1 / PR 1 — correctness primitives:** pool-aware queries, atomic Chat preemption, typed cancellation, exact recovery APIs, and owner fences. Keep all new kill/preemption behavior disabled on legacy production topology; these paths become active only with per-slot isolation.
-- **Phase 2 / PR 2 — failure-domain isolation:** one process per slot, three pool lane allowlists, pool-aware capacity and admission.
-- **Phase 3 / PR 3 — bounded resources and rollout:** Enclave broker, DB limits, Profile batching/progress, metrics, YAML, public docs, and test/pre/prod rollout evidence.
+- **Checkpoint 1 — correctness primitives:** pool-aware queries, atomic Chat preemption, typed cancellation, exact recovery APIs, and owner fences.
+- **Checkpoint 2 — failure-domain isolation:** one process per slot, three pool lane allowlists, pool-aware capacity and admission.
+- **Checkpoint 3 — bounded resources and test readiness:** Enclave broker, DB limits, Profile batching/progress, metrics, test YAML, and public docs.
 
-PRs from the implementation branch target `test`, per repository policy. Promotion to `main` must originate from `test` or `pre` after recording environment evidence.
+Keep all checkpoints on one feature branch and open one implementation PR targeting `test` only after Tasks 1–16 pass. Merging that PR is the first test deployment, so `test` never receives an incomplete hybrid topology. Pre/prod promotion is a separate decision after this plan's test evidence is reviewed.
+
+## Approved Requirement Overrides
+
+This plan incorporates the user's post-spec decision and overrides the design document wherever it describes a legacy mode, independent rollout switches, phased deployment of partial topology, or pre/prod rollout:
+
+- Runtime V2 always starts all three pools and one process per slot.
+- `FEEDLING_V2_POOL_MODE`, `FEEDLING_V2_MAX_WORKERS`, `FEEDLING_V2_CHAT_PREEMPTION_ENABLED`, and `FEEDLING_V2_SLOT_PROCESS_ISOLATION` are retired from the test service.
+- Tasks 1–16 land together in one PR to `test`; Task 17 validates only the test environment.
+- Operational recovery redeploys the previous known-good image/commit. There is no configuration switch back to the shared child topology.
+
+Before Task 1, verify the branch is based on the local `test` tip:
+
+```bash
+git merge-base --is-ancestor test HEAD
+git rev-list --left-right --count test...HEAD
+```
+
+Expected: the first command exits 0 and the second prints `0 N`, where `N` is the number of feature-branch commits. If the left count is non-zero, rebase before changing implementation files.
 
 ---
 
@@ -58,11 +77,10 @@ PRs from the implementation branch target `test`, per repository policy. Promoti
 - Create: `backend/model_api_runtime/v2/pool_config.py`
 - Test: `tests/test_v2_pool_config.py`
 
-- [ ] **Step 1: Write failing tests for legacy defaults, the 4/2/2 layout, lane allowlists, and invalid values**
+- [ ] **Step 1: Write failing tests for the unconditional 4/2/2 layout, lane allowlists, and invalid values**
 
   ```python
   def test_three_pool_defaults_build_eight_one_slot_specs(monkeypatch):
-      monkeypatch.setenv("FEEDLING_V2_POOL_MODE", "three_pool")
       config = RuntimePoolConfig.from_env()
 
       assert [slot.pool for slot in config.slots].count("foreground") == 4
@@ -73,7 +91,6 @@ PRs from the implementation branch target `test`, per repository policy. Promoti
 
 
   def test_three_pool_rejects_zero_foreground_slots(monkeypatch):
-      monkeypatch.setenv("FEEDLING_V2_POOL_MODE", "three_pool")
       monkeypatch.setenv("FEEDLING_V2_FOREGROUND_SLOTS", "0")
       with pytest.raises(ValueError, match="foreground"):
           RuntimePoolConfig.from_env()
@@ -111,15 +128,12 @@ PRs from the implementation branch target `test`, per repository policy. Promoti
 
   @dataclass(frozen=True)
   class RuntimePoolConfig:
-      mode: Literal["legacy", "three_pool"]
       slots: tuple[SlotSpec, ...]
       profile_instance_concurrency: int
       enclave_instance_concurrency: int
-      chat_preemption_enabled: bool
-      slot_process_isolation: bool
   ```
 
-  Implement `RuntimePoolConfig.from_env() -> RuntimePoolConfig`. Set initial budgets to Foreground `240/1500` seconds, Wake `240/900`, and Heavy `240/1200`; tighten Heavy stall to 120 only in the later Profile task after batched progress tests pass. Parse booleans strictly as `0/1`; reject unknown modes, negative counts, no foreground slots, profile concurrency other than `1` in the initial implementation, or an Enclave total lower than the three reserved pool minima.
+  Implement `RuntimePoolConfig.from_env() -> RuntimePoolConfig`. It always constructs all three pools; there is no mode field or legacy fallback. Set initial budgets to Foreground `240/1500` seconds, Wake `240/900`, and Heavy `240/1200`; tighten Heavy stall to 120 only in the later Profile task after batched progress tests pass. Reject negative counts, no foreground slots, profile concurrency other than `1` in the initial implementation, or an Enclave total lower than the three reserved pool minima. Add a test proving `FEEDLING_V2_POOL_MODE`, `FEEDLING_V2_MAX_WORKERS`, `FEEDLING_V2_CHAT_PREEMPTION_ENABLED`, and `FEEDLING_V2_SLOT_PROCESS_ISOLATION` do not affect the parsed topology when present in an operator shell.
 
 - [ ] **Step 4: Run the tests and confirm they pass**
 
@@ -151,7 +165,7 @@ PRs from the implementation branch target `test`, per repository policy. Promoti
 
 - [ ] **Step 1: Write failing migration and store tests**
 
-  Add assertions that migration `0085_v2_worker_pool_heartbeats` has `down_revision = "0084_wake_support_indexes"`, adds `pool TEXT NOT NULL DEFAULT 'legacy'`, adds `runtime_state JSONB NOT NULL DEFAULT '{}'::jsonb`, and creates an index beginning with `(pool, kind, beat_at DESC)`.
+  Add assertions that migration `0085_v2_worker_pool_heartbeats` has `down_revision = "0084_wake_support_indexes"`, adds `pool TEXT NOT NULL DEFAULT 'unassigned'`, adds `runtime_state JSONB NOT NULL DEFAULT '{}'::jsonb`, and creates an index beginning with `(pool, kind, beat_at DESC)`.
 
   Add behavior tests:
 
@@ -176,17 +190,17 @@ PRs from the implementation branch target `test`, per repository policy. Promoti
 
 - [ ] **Step 3: Add migration `0085`**
 
-  Use Alembic operations to add the non-null column with a temporary server default of `legacy`; retain the default so legacy writers remain compatible during a rolling deployment. Create the pool/kind/freshness index and remove both in downgrade.
+  Use Alembic operations to add the non-null column with server default `unassigned`. Existing/stale pre-deploy heartbeat rows remain distinguishable and never count as foreground capacity; all new turn and Genesis heartbeat call sites must write an explicit pool. Create the pool/kind/freshness index and remove both columns/indexes in downgrade.
 
-- [ ] **Step 4: Extend heartbeat APIs without breaking legacy callers**
+- [ ] **Step 4: Require explicit pool identity from every new heartbeat caller**
 
   ```python
   def record_worker_heartbeat(
       worker_id: str,
       *,
+      pool: str,
       kind: str = "turn",
       capacity: int = 1,
-      pool: str = "legacy",
       runtime_state: dict[str, object] | None = None,
   ) -> None:
       """Upsert the liveness, capacity, pool, and bounded runtime snapshot."""
@@ -201,11 +215,11 @@ PRs from the implementation branch target `test`, per repository policy. Promoti
       """Return fresh executable capacity, optionally restricted to one pool."""
   ```
 
-  Apply the optional pool predicate consistently to count/alive/capacity queries. Use distinct heartbeat identities such as `f"{worker_id}:{pool}"` when the parent publishes multiple pool rows.
+  Apply the optional pool predicate consistently to count/alive/capacity queries. Use distinct heartbeat identities such as `f"{worker_id}:{pool}"` when the parent publishes multiple pool rows. Turn callers use `foreground`, `wake`, or `heavy`; the Genesis parent thread uses `control`. Queries that gate Chat explicitly ignore `unassigned` and `control`.
 
-- [ ] **Step 5: Make three-pool health require foreground capacity while legacy health stays unchanged**
+- [ ] **Step 5: Make Runtime V2 health require foreground capacity**
 
-  In `serve_worker.py`, return healthy for Chat admission only when fresh `foreground` capacity is positive in three-pool mode. Expose wake/heavy capacity separately for diagnostics; do not let a healthy Heavy pool make Chat appear healthy.
+  In `serve_worker.py`, return healthy for Chat admission only when fresh `foreground` capacity is positive. Expose wake/heavy capacity separately for diagnostics; do not let a healthy Heavy pool make Chat appear healthy.
 
 - [ ] **Step 6: Run focused tests**
 
@@ -263,7 +277,7 @@ PRs from the implementation branch target `test`, per repository policy. Promoti
           params.append(sorted(lanes))
   ```
 
-  Do not interpolate lane names into SQL. In three-pool mode, pass `{"chat", "manual_wake"}` and query `pool="foreground"`; retain the old unfiltered path in legacy mode.
+  Do not interpolate lane names into SQL. Chat admission always passes `{"chat", "manual_wake"}` and queries `pool="foreground"`. Keep the unfiltered store method only for Admin's all-lane observability, not as a runtime fallback.
 
 - [ ] **Step 4: Run focused tests**
 
@@ -352,7 +366,7 @@ PRs from the implementation branch target `test`, per repository policy. Promoti
   FEEDLING_TEST_PG='postgresql://postgres:test@127.0.0.1:55432/postgres' /Users/zhengzhihao/Projects/teleport/feedling-mcp/.venv-test/bin/python -m pytest tests/test_v2_send_enqueue_atomic.py tests/test_chat_send_v2_enqueue.py tests/test_v2_jobs_store.py -q
   ```
 
-  Expected: PASS, including rollback behavior.
+  Expected: PASS, including transaction rollback behavior.
 
 - [ ] **Step 6: Commit**
 
@@ -411,7 +425,7 @@ PRs from the implementation branch target `test`, per repository policy. Promoti
 
 - [ ] **Step 4: Publish only after Chat transaction commit and route only to the matching slot**
 
-  The Chat DB function collects preemptions in the successful attempt and calls `notify_job_cancel` after the transaction exits. The parent listener looks up `claimed_by -> SlotKey` in its current registry and terminates/restarts only that child after the database commit. Durable preemption already invalidates the lease; the child kill prevents uninstrumented in-flight work from continuing. Ignore the event in legacy multi-slot mode, where killing one child would still kill unrelated slots; this is why the preemption flag is not enabled until the per-slot topology task is complete.
+  The Chat DB function collects preemptions in the successful attempt and calls `notify_job_cancel` after the transaction exits. The parent listener looks up `claimed_by -> SlotKey` in its current registry and terminates/restarts only that child after the database commit. Durable preemption already invalidates the lease; the child kill prevents uninstrumented in-flight work from continuing. This behavior is unconditional and may be merged before the slot-fleet task, but the combined PR set must not deploy to test until one-process-per-slot is present.
 
 - [ ] **Step 5: Run focused tests**
 
@@ -494,7 +508,7 @@ PRs from the implementation branch target `test`, per repository policy. Promoti
 
 - [ ] **Step 5: Make `ChildSupervisor` expose an immutable current snapshot**
 
-  Add `snapshots() -> dict[str, SlotProgress]` because legacy mode may still report several logical slots from one child. Do not yet change topology. Keep backward compatibility only inside legacy startup, not inside the new protocol parser.
+  Add `snapshot() -> SlotProgress | None` because every child owns exactly one slot. Delete parsing/state branches for the old tuple protocol; there is no multi-slot child compatibility path.
 
 - [ ] **Step 6: Run focused tests**
 
@@ -684,7 +698,7 @@ PRs from the implementation branch target `test`, per repository policy. Promoti
   - Killing one child does not change the PIDs/generations of the other seven.
   - Pool heartbeat capacity equals the number of healthy children in that pool.
   - If a cancellation NOTIFY is dropped, parent reconciliation detects the no-longer-owned active snapshot and restarts only that slot within 5 seconds.
-  - Legacy mode still starts the old single multi-slot child.
+  - No startup path reads `FEEDLING_V2_MAX_WORKERS` or starts the old multi-slot child.
 
 - [ ] **Step 2: Run focused tests and confirm failure**
 
@@ -738,7 +752,7 @@ PRs from the implementation branch target `test`, per repository policy. Promoti
       """Initialize one child process and run exactly one configured slot."""
   ```
 
-  In three-pool mode call one `_slot_loop` directly with `lanes=set(lanes)`. Do not read `FEEDLING_V2_MAX_WORKERS` or create `_reserved_lane_slots`. Preserve the old signature/path only for `POOL_MODE=legacy`.
+  Call one `_slot_loop` directly with `lanes=set(lanes)`. Delete the old child-level `MAX_WORKERS` fan-out and `_reserved_lane_slots`; no Runtime V2 path reads `FEEDLING_V2_MAX_WORKERS`.
 
 - [ ] **Step 5: Replace the single supervisor/watchdog in `_serve` with one pair per slot**
 
@@ -822,9 +836,9 @@ PRs from the implementation branch target `test`, per repository policy. Promoti
 
   The child sends `acquire`, waits for a matching `granted`, performs the Enclave operation, and sends `release` in `finally`. Add cancellation handling so a preempted/killed Job does not leave a waiter. The parent calls `drop_generation` immediately after child death.
 
-- [ ] **Step 5: Replace process-local `ENCLAVE_CONCURRENCY` in three-pool mode**
+- [ ] **Step 5: Replace process-local `ENCLAVE_CONCURRENCY`**
 
-  Keep the local semaphore only on the legacy path. Route every existing Enclave read/write call through one helper that chooses broker IPC in three-pool mode, so Profile, Chat, wake, and heavy calls are all counted.
+  Delete the Runtime V2 process-local semaphore. Route every existing Enclave read/write call through one broker-IPC helper so Profile, Chat, wake, and heavy calls are all counted.
 
 - [ ] **Step 6: Run focused tests**
 
@@ -855,7 +869,7 @@ PRs from the implementation branch target `test`, per repository policy. Promoti
 
 - [ ] **Step 1: Write failing sizing tests**
 
-  Assert that three-pool startup configures the parent with `FEEDLING_DB_POOL_MAX_SIZE=8`, passes `db_pool_max=2` to every child, and never invokes `_configure_db_pool_capacity(max_workers=8)` inside a child. Assert the legacy formula remains unchanged in legacy mode.
+  Assert startup configures the parent with `FEEDLING_DB_POOL_MAX_SIZE=8`, passes `db_pool_max=2` to every child, and never invokes `_configure_db_pool_capacity(max_workers=8)` inside a child. Delete the old `MAX_WORKERS`-derived Runtime V2 sizing formula.
 
 - [ ] **Step 2: Run focused tests and confirm failure**
 
@@ -1049,31 +1063,26 @@ PRs from the implementation branch target `test`, per repository policy. Promoti
 
 ---
 
-## Task 14: Configure Test, Pre, and Prod with Inline Non-Secret Values
+## Task 14: Configure the Test Environment with Inline Non-Secret Values
 
 **Files:**
 
 - Modify: `deploy/docker-compose.phala.test.yaml`
-- Modify: `deploy/docker-compose.phala.pre.yaml`
-- Modify: `deploy/docker-compose.phala.yaml`
 - Modify: `tests/test_deploy_yaml_strict.py`
 
 - [ ] **Step 1: Write failing strict-YAML assertions**
 
-  Parse all three Phala Compose files and assert the Runtime V2 `serve-worker` service contains literal string values:
+  Parse the test Phala Compose file and assert the Runtime V2 `serve-worker` service contains these literal string values:
 
   ```yaml
-  FEEDLING_V2_POOL_MODE: "three_pool"
   FEEDLING_V2_FOREGROUND_SLOTS: "4"
   FEEDLING_V2_WAKE_SLOTS: "2"
   FEEDLING_V2_HEAVY_SLOTS: "2"
   FEEDLING_V2_PROFILE_INSTANCE_CONCURRENCY: "1"
   FEEDLING_V2_ENCLAVE_INSTANCE_CONCURRENCY: "4"
-  FEEDLING_V2_CHAT_PREEMPTION_ENABLED: "1"
-  FEEDLING_V2_SLOT_PROCESS_ISOLATION: "1"
   ```
 
-  Assert these values do not use `${...}` substitution and the service does not set `FEEDLING_V2_MAX_WORKERS` in three-pool mode. Keep assertions limited to the V2 service; the separate V1 resident runner is out of scope.
+  Assert these values do not use `${...}` substitution. Assert the service contains none of `FEEDLING_V2_POOL_MODE`, `FEEDLING_V2_MAX_WORKERS`, `FEEDLING_V2_CHAT_PREEMPTION_ENABLED`, or `FEEDLING_V2_SLOT_PROCESS_ISOLATION`. Keep assertions limited to the V2 service; the separate V1 resident runner is out of scope. Do not modify pre or prod Compose files in this plan.
 
 - [ ] **Step 2: Run the strict test and confirm failure**
 
@@ -1081,35 +1090,33 @@ PRs from the implementation branch target `test`, per repository policy. Promoti
   /Users/zhengzhihao/Projects/teleport/feedling-mcp/.venv-test/bin/python -m pytest tests/test_deploy_yaml_strict.py -q
   ```
 
-  Expected: FAIL because Compose currently configures only `FEEDLING_V2_MAX_WORKERS: "4"`.
+  Expected: FAIL because the test service still carries the former max-worker setting with value 4 and lacks the five pool-capacity settings.
 
 - [ ] **Step 3: Write the non-secret settings directly into YAML**
 
-  Apply the exact block above to test, pre, and prod. Remove the old V2 max-worker setting from those services. Do not add GitHub Secrets or GitHub Variables. Do not alter `DATABASE_URL`, runtime token secret, provider keys, or other credentials.
+  Apply the exact five-variable block above to test and remove its old V2 max-worker setting. Do not add GitHub Secrets or GitHub Variables. Do not alter `DATABASE_URL`, runtime token secret, provider keys, or other credentials.
 
-  Leave `deploy/docker-compose.agent-runner.yaml` on its existing explicit legacy/local max-worker configuration; it is a developer overlay, not one of the 8C16G Phala targets in this rollout.
+  Leave `deploy/docker-compose.agent-runner.yaml`, pre, and prod unchanged; they are outside this test-environment validation plan.
 
 - [ ] **Step 4: Run strict tests and render Compose configs**
 
   ```bash
   /Users/zhengzhihao/Projects/teleport/feedling-mcp/.venv-test/bin/python -m pytest tests/test_deploy_yaml_strict.py -q
   docker compose -f deploy/docker-compose.phala.test.yaml config --quiet
-  docker compose -f deploy/docker-compose.phala.pre.yaml config --quiet
-  docker compose -f deploy/docker-compose.phala.yaml config --quiet
   ```
 
-  Expected: all commands exit 0 and no variable-substitution warning mentions the eight new settings.
+  Expected: both commands exit 0 and no variable-substitution warning mentions the five new settings.
 
 - [ ] **Step 5: Commit**
 
   ```bash
-  git add deploy/docker-compose.phala.test.yaml deploy/docker-compose.phala.pre.yaml deploy/docker-compose.phala.yaml tests/test_deploy_yaml_strict.py
-  git commit -m "ops(v2): configure three runtime pools for 8c16g"
+  git add deploy/docker-compose.phala.test.yaml tests/test_deploy_yaml_strict.py
+  git commit -m "ops(v2): configure test runtime with three pools"
   ```
 
 ---
 
-## Task 15: Document Architecture, Chat Preemption, Resource Limits, and Rollback
+## Task 15: Document Architecture, Chat Preemption, Resource Limits, and Deployment Recovery
 
 **Files:**
 
@@ -1118,21 +1125,25 @@ PRs from the implementation branch target `test`, per repository policy. Promoti
 - Modify: `docs-site/content/docs/workflows/memory.mdx`
 - Modify: `docs-site/content/docs/self-hosting.mdx`
 - Modify: `docs-site/content/docs/changelog.mdx`
-- Modify: `docs/superpowers/specs/2026-08-14-runtime-v2-three-pool-slot-isolation-design.md` only if implementation decisions differ from the approved design
+- Modify: `docs/superpowers/specs/2026-08-14-runtime-v2-three-pool-slot-isolation-design.md`
 
-- [ ] **Step 1: Update the architecture page and diagram**
+- [ ] **Step 1: Bring the design record forward to the approved no-legacy decision**
+
+  Remove `FEEDLING_V2_POOL_MODE`, the independent partial-rollout switches, shared-child configuration rollback, and pre/prod rollout instructions from the design record. State that the full implementation lands in one PR to `test`, and that recovery uses the previous known-good image/commit while leaving additive migration `0085` installed.
+
+- [ ] **Step 2: Update the architecture page and diagram**
 
   Show one parent, three logical pools, eight single-slot children, PostgreSQL Job authority, the cancellation bus, and the parent Enclave broker. State that OS-process isolation is per slot, while all pools remain inside one CVM/service instance.
 
-- [ ] **Step 2: Update workflow and trust-boundary text**
+- [ ] **Step 3: Update workflow and trust-boundary text**
 
-  In Chat docs, explain that a newly accepted Chat can preempt same-user non-Chat work atomically. In memory/Profile docs, document batching and instance concurrency 1. In self-hosting, document 4/2/2 slots, Enclave total 4, parent/child DB maxima, resource monitoring, and `FEEDLING_V2_POOL_MODE=legacy` rollback.
+  In Chat docs, explain that a newly accepted Chat can preempt same-user non-Chat work atomically. In memory/Profile docs, document batching and instance concurrency 1. In self-hosting, document 4/2/2 slots, Enclave total 4, parent/child DB maxima, resource monitoring, and that Runtime V2 no longer supports the shared multi-slot topology. Document recovery as redeploying the previously known-good image/commit; do not document a mode switch.
 
-- [ ] **Step 3: Add an `Unreleased` changelog entry**
+- [ ] **Step 4: Add an `Unreleased` changelog entry**
 
   Describe the user-visible outcome: background maintenance no longer consumes all Chat execution capacity, and a hung Job is isolated to one worker slot. Avoid claiming absolute latency guarantees.
 
-- [ ] **Step 4: Run documentation checks**
+- [ ] **Step 5: Run documentation checks**
 
   ```bash
   npm run types:check
@@ -1144,7 +1155,7 @@ PRs from the implementation branch target `test`, per repository policy. Promoti
 
   Expected: all commands exit 0.
 
-- [ ] **Step 5: Run OpenAPI contract tests because deployment behavior changed but public API shape did not**
+- [ ] **Step 6: Run OpenAPI contract tests because deployment behavior changed but public API shape did not**
 
   ```bash
   FEEDLING_TEST_PG='postgresql://postgres:test@127.0.0.1:55432/postgres' /Users/zhengzhihao/Projects/teleport/feedling-mcp/.venv-test/bin/python -m pytest tests/openapi/test_public_openapi.py -q
@@ -1152,10 +1163,10 @@ PRs from the implementation branch target `test`, per repository policy. Promoti
 
   Do not regenerate `docs-site/openapi/public.json` unless this contract test or the implementation diff shows the public API schema changed.
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 7: Commit**
 
   ```bash
-  git add docs-site/content/docs/architecture.mdx docs-site/content/docs/workflows/chat.mdx docs-site/content/docs/workflows/memory.mdx docs-site/content/docs/self-hosting.mdx docs-site/content/docs/changelog.mdx
+  git add docs/superpowers/specs/2026-08-14-runtime-v2-three-pool-slot-isolation-design.md docs-site/content/docs/architecture.mdx docs-site/content/docs/workflows/chat.mdx docs-site/content/docs/workflows/memory.mdx docs-site/content/docs/self-hosting.mdx docs-site/content/docs/changelog.mdx
   git commit -m "docs(v2): explain three-pool runtime isolation"
   ```
 
@@ -1216,21 +1227,21 @@ PRs from the implementation branch target `test`, per repository policy. Promoti
 
 ---
 
-## Task 17: Roll Out Through Test, Pre, and Prod with Explicit Gates
+## Task 17: Deploy and Validate the Complete Runtime in Test
 
 **Files:**
 
-- Create: `docs/ops/2026-08-14-v2-three-pool-rollout.md`
+- Create: `docs/ops/2026-08-14-v2-three-pool-test-validation.md`
 
 - [ ] **Step 1: Prepare the rollout evidence template before deployment**
 
-  Include timestamp, commit SHA, CVM profile, effective environment, migration revision, slot PIDs/generations, pool heartbeat capacity, DB connections, Enclave grant/wait counts, queue depth/service time by lane, watchdog/preemption counts, Chat probe IDs, and rollback outcome if exercised. Do not include credentials, message bodies, memory content, or provider payloads.
+  Include timestamp, commit SHA, CVM profile, effective environment, migration revision, slot PIDs/generations, pool heartbeat capacity, DB connections, Enclave grant/wait counts, queue depth/service time by lane, watchdog/preemption counts, Chat probe IDs, and previous-image recovery outcome. Do not include credentials, message bodies, memory content, or provider payloads.
 
-  Before enabling three-pool mode, record a 4-slot test/pre baseline for Chat claim P95, Enclave P95, provider 429/timeout rate, DB wait/timeout rate, CPU, and memory. Use those measurements to write explicit allowed-regression numbers for Enclave/provider/DB into this evidence document before production promotion; do not invent percentages without a baseline.
+  Before deploying the new image, record the current test environment's 4-slot baseline for Chat claim P95, Enclave P95, provider 429/timeout rate, DB wait/timeout rate, CPU, and memory. Use those measurements to write explicit allowed-regression numbers for Enclave/provider/DB into this evidence document before evaluating the new runtime; do not invent percentages without a baseline.
 
 - [ ] **Step 2: Merge the implementation PR into `test` and deploy test**
 
-  Follow the repository's normal test deployment workflow. Confirm migration `0085` applies, the effective Runtime V2 environment is exactly 4/2/2 and Enclave 4, and eight distinct slot child PIDs are visible.
+  Follow the repository's normal test deployment workflow. Confirm migration `0085` applies, the effective Runtime V2 environment is exactly 4/2/2 and Enclave 4, and eight distinct slot child PIDs are visible. Assert logs and process arguments contain no `POOL_MODE`, `MAX_WORKERS`, legacy supervisor startup, or disabled-isolation path: the first deployment must already be the complete topology.
 
 - [ ] **Step 3: Execute test-environment acceptance scenarios**
 
@@ -1259,23 +1270,23 @@ PRs from the implementation branch target `test`, per repository policy. Promoti
   - Enclave P95 and provider/DB error or wait rates remain inside the baseline-derived limits recorded in Step 1;
   - watchdog/preemption rates are explainable by injected tests or known failures.
 
-- [ ] **Step 5: Promote to pre and repeat the acceptance scenarios**
+- [ ] **Step 5: Exercise image/commit recovery in test**
 
-  Use a PR/merge direction allowed by repository policy. Record pre-environment evidence separately. Do not promote if pool heartbeat, cancellation targeting, exact recovery, or DB/Enclave ceilings cannot be observed.
+  Record the previous known-good test image digest before deployment. Redeploy that image once and confirm the service returns healthy using its own default 4-worker behavior even though the new test YAML no longer defines `FEEDLING_V2_MAX_WORKERS`. Migration `0085` remains installed because its additive `pool='unassigned'` and `runtime_state={}` defaults are backward-compatible. Do not downgrade the database during operational recovery.
 
-- [ ] **Step 6: Promote from `test` or `pre` to `main` and monitor production**
+- [ ] **Step 6: Redeploy the new image and repeat smoke tests**
 
-  Confirm the production CVM is the expected 8C16G profile before enabling 4/2/2. During the first production window, watch foreground queue/service time, per-pool healthy slots, DB connections, Enclave waits, Profile duration, watchdog kills, and preemptions.
+  Confirm all eight slot processes return, pool heartbeats report 4/2/2, Chat succeeds, and the controlled Heavy-Job isolation scenario still passes after recovery. This proves recovery does not leave test on the old image.
 
-- [ ] **Step 7: Exercise and document rollback readiness**
+- [ ] **Step 7: Record the test decision**
 
-  Rollback is a configuration/deployment change to `FEEDLING_V2_POOL_MODE=legacy` using the previous `FEEDLING_V2_MAX_WORKERS=4` behavior. Migration `0085` remains installed because the additive column/default is backward-compatible. Do not downgrade the database during an operational rollback.
+  Mark the test result `pass` only if pool heartbeat, cancellation targeting, exact recovery, Enclave/DB ceilings, latency thresholds, and image recovery are all evidenced. Otherwise record `fail`, restore the previous known-good test image, and open follow-up defects. Pre/prod promotion is explicitly outside this plan and requires a separate approval after this evidence is reviewed.
 
 - [ ] **Step 8: Commit the completed evidence document**
 
   ```bash
-  git add docs/ops/2026-08-14-v2-three-pool-rollout.md
-  git commit -m "docs(ops): record v2 three-pool rollout evidence"
+  git add docs/ops/2026-08-14-v2-three-pool-test-validation.md
+  git commit -m "docs(ops): record v2 three-pool test evidence"
   ```
 
 ## Completion Criteria
@@ -1284,9 +1295,10 @@ PRs from the implementation branch target `test`, per repository policy. Promoti
 - A same-user Chat is durably admitted without waiting for a background Job's lease expiry.
 - A hung Job can cause at most one slot process to be killed.
 - Only the killed slot's still-owned active claim is recovered immediately.
-- Eight-slot production defaults are 4 foreground, 2 wake, and 2 heavy; Profile instance concurrency is 1.
+- Runtime V2 has no legacy topology, pool-mode switch, max-worker fan-out, or isolation/preemption feature flags.
+- The test deployment runs 4 foreground, 2 wake, and 2 heavy slots; Profile instance concurrency is 1.
 - Instance-wide Enclave concurrency never exceeds 4 and recovers permits after child death.
 - Default maximum pooled DB connections are approximately 24 across the parent and eight children.
-- Test, pre, and prod Compose YAML contains the non-secret settings directly.
+- Test Compose YAML contains the five non-secret capacity settings directly and does not contain the four retired variables.
 - Focused, full Runtime V2, full backend, Compose, OpenAPI contract, and public-doc checks pass.
-- Test and pre rollout evidence is attached before production promotion.
+- Test validation and previous-image recovery evidence is recorded; pre/prod promotion remains a separate decision.
