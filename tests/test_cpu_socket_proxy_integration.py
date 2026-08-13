@@ -2,11 +2,9 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-import socket
 import subprocess
 import time
-from urllib.error import HTTPError
-from urllib.request import Request, urlopen
+import re
 import uuid
 
 import pytest
@@ -24,15 +22,13 @@ def _docker(*args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
     )
 
 
-def _status(method: str, url: str) -> int:
-    request = Request(url, data=b"" if method == "POST" else None, method=method)
-    try:
-        with urlopen(request, timeout=10) as response:
-            response.read(1)
-            return response.status
-    except HTTPError as exc:
-        exc.read()
-        return exc.code
+def _container_status(container: str, method: str, url: str) -> int | None:
+    args = ["exec", container, "wget", "-S", "-O", "/dev/null"]
+    if method == "POST":
+        args.append("--post-data=")
+    result = _docker(*args, url, check=False)
+    statuses = re.findall(r"HTTP/\S+\s+(\d{3})", result.stderr)
+    return int(statuses[-1]) if statuses else None
 
 
 def _docker_socket_path() -> Path | None:
@@ -49,12 +45,6 @@ def _docker_socket_path() -> Path | None:
     return path if path.exists() else None
 
 
-def _unused_loopback_port() -> int:
-    with socket.socket() as listener:
-        listener.bind(("127.0.0.1", 0))
-        return listener.getsockname()[1]
-
-
 @pytest.mark.skipif(
     os.environ.get("FEEDLING_RUN_DOCKER_SOCKET_TESTS") != "1",
     reason="set FEEDLING_RUN_DOCKER_SOCKET_TESTS=1 for the live Docker contract",
@@ -69,10 +59,10 @@ def test_socket_proxy_allows_only_cpu_recorder_reads():
     suffix = uuid.uuid4().hex[:12]
     network = f"cpu-recorder-test-{suffix}"
     target = f"cpu-recorder-target-{suffix}"
+    client = f"cpu-recorder-client-{suffix}"
     proxy = f"cpu-recorder-proxy-{suffix}"
     created_containers: list[str] = []
     created_network = False
-    port = _unused_loopback_port()
     try:
         _docker("network", "create", "--label", "feedling.cpu-recorder-test=1", network)
         created_network = True
@@ -90,6 +80,20 @@ def test_socket_proxy_allows_only_cpu_recorder_reads():
             "300",
         ).stdout.strip()
         created_containers.append(target_id)
+        client_id = _docker(
+            "run",
+            "-d",
+            "--name",
+            client,
+            "--network",
+            network,
+            "--label",
+            "feedling.cpu-recorder-test=1",
+            "alpine:3.21",
+            "sleep",
+            "300",
+        ).stdout.strip()
+        created_containers.append(client_id)
         proxy_id = _docker(
             "run",
             "-d",
@@ -103,32 +107,39 @@ def test_socket_proxy_allows_only_cpu_recorder_reads():
             f"{docker_socket}:/var/run/docker.sock:ro",
             "--group-add",
             "0",
-            "-p",
-            f"127.0.0.1:{port}:2375",
             PROXY_IMAGE,
             "-loglevel=INFO",
             "-listenip=0.0.0.0",
-            "-allowfrom=0.0.0.0/0",
+            f"-allowfrom={client}",
             "-allowGET=/containers/json",
             r"-allowGET=/containers/[0-9a-f]{64}/stats",
         ).stdout.strip()
         created_containers.append(proxy_id)
 
-        base_url = f"http://127.0.0.1:{port}"
+        base_url = f"http://{proxy}:2375"
         deadline = time.monotonic() + 20
         while True:
-            try:
-                if _status("GET", f"{base_url}/containers/json?all=0") == 200:
-                    break
-            except OSError:
-                pass
+            if (
+                _container_status(
+                    client, "GET", f"{base_url}/containers/json?all=0"
+                )
+                == 200
+            ):
+                break
             if time.monotonic() >= deadline:
                 pytest.fail("socket proxy did not become ready")
             time.sleep(0.2)
 
-        assert _status("GET", f"{base_url}/containers/json?all=0") == 200
         assert (
-            _status("GET", f"{base_url}/containers/{target_id}/stats?stream=false")
+            _container_status(client, "GET", f"{base_url}/containers/json?all=0")
+            == 200
+        )
+        assert (
+            _container_status(
+                client,
+                "GET",
+                f"{base_url}/containers/{target_id}/stats?stream=false",
+            )
             == 200
         )
         denied_reads = [
@@ -138,11 +149,14 @@ def test_socket_proxy_allows_only_cpu_recorder_reads():
             ("GET", f"{base_url}/info"),
             ("GET", f"{base_url}/version"),
         ]
-        assert [_status(method, url) for method, url in denied_reads] == [403] * len(
-            denied_reads
-        )
+        assert [
+            _container_status(client, method, url) for method, url in denied_reads
+        ] == [403] * len(denied_reads)
         assert (
-            _status("POST", f"{base_url}/containers/{target_id}/restart") == 405
+            _container_status(
+                client, "POST", f"{base_url}/containers/{target_id}/restart"
+            )
+            == 405
         )
         assert _docker("inspect", "-f", "{{.State.Running}}", target_id).stdout.strip() == "true"
     finally:
