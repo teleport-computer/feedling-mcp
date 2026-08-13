@@ -14,10 +14,8 @@ import unicodedata
 ERROR_CLASS = "upstream_unavailable"
 REASON = "tool_markup_leak_sanitized"
 
-_TAG_NAMES = (
-    "function_calls",
+TOOL_TAG_STEMS = (
     "function_call",
-    "tool_calls",
     "tool_result",
     "tool_call",
     "tool_use",
@@ -27,7 +25,7 @@ _TAG_NAMES = (
 _TAG_TOKEN_RE = re.compile(
     r"<\s*(?P<closing>/\s*)?"
     r"(?:[A-Za-z][A-Za-z0-9_.-]*:)?"
-    r"(?P<name>" + "|".join(_TAG_NAMES) + r")"
+    r"(?P<stem>" + "|".join(TOOL_TAG_STEMS) + r")s?"
     r"(?=[\s/>])(?P<tail>[^>]*)>",
     flags=re.IGNORECASE,
 )
@@ -71,7 +69,9 @@ def _strip_unfenced_segment(text: str) -> tuple[str, str, bool]:
     block_intervals = list(marker_intervals)
     stack: list[tuple[str, int]] = []
     for match in tokens:
-        name = match.group("name").lower()
+        # Pair by the allowlisted stem so namespace prefixes and singular/plural
+        # drift cannot stop an otherwise recognizable block from closing.
+        name = match.group("stem").lower()
         closing = bool(match.group("closing"))
         self_closing = not closing and match.group("tail").rstrip().endswith("/")
         if self_closing:

@@ -90,27 +90,21 @@ def test_markup_only_reply_becomes_empty():
 @pytest.mark.parametrize(
     "tag",
     [
-        "function_calls",
-        "invoke",
-        "parameter",
-        "tool_use",
-        "tool_call",
-        "tool_result",
+        form
+        for stem in tool_markup_leak.TOOL_TAG_STEMS
+        for form in (stem, f"{stem}s")
     ],
 )
-def test_every_allowlisted_paired_tag_is_removed(tag):
+def test_every_allowlisted_stem_accepts_singular_and_plural(tag):
     assert tool_markup_leak.strip_tool_markup(
         f"<{tag}>internal</{tag}>正文"
     ) == ("正文", True)
 
 
-@pytest.mark.parametrize(
-    "tag",
-    ["function_call", "function_calls", "tool_call", "tool_calls"],
-)
-def test_singular_and_plural_wrapper_names_are_recognized(tag):
+@pytest.mark.parametrize("stem", tool_markup_leak.TOOL_TAG_STEMS)
+def test_singular_plural_pairing_is_canonicalized_to_the_stem(stem):
     assert tool_markup_leak.strip_tool_markup(
-        f"<{tag}>internal</{tag}>正文"
+        f"<{stem}s>internal</{stem}>正文"
     ) == ("正文", True)
 
 

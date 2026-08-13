@@ -170,6 +170,7 @@ jobs:
             tests/test_io_cli_web.py \
             tests/test_proactive_agent_protocol_v2.py \
             tests/test_tool_markup_leak.py \
+            tests/test_v2_provider_output_edges.py \
             tests/test_runtime_v2_default_flag.py \
             tests/test_screen_vision_verdict_runtime.py \
             tests/test_capture_prompt_v1.py \
