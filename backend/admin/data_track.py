@@ -2309,7 +2309,16 @@ def _debug_redact_value(value, *, key: str = ""):
     if value is None or isinstance(value, (bool, int, float)):
         return value
     if isinstance(value, str):
-        safe_string_keys = {"model", "provider", "subsystem", "type", "status", "route", "stage", "actor"}
+        if key == "query_fingerprint":
+            return (
+                value
+                if re.fullmatch(r"[0-9a-f]{12}", value)
+                else f"<redacted string len={len(value)}>"
+            )
+        safe_string_keys = {
+            "model", "provider", "subsystem", "type", "status", "route",
+            "stage", "actor",
+        }
         if key in safe_string_keys:
             return value
         return f"<redacted string len={len(value)}>"
@@ -7950,6 +7959,8 @@ _DEBUG_STEP_LABELS = {
     "enclave.call.done": ("🔐", "飞地调用 · 完成"),
     "memory.capture.queued": ("🧩", "记忆抓取 · 入队"),
     "memory.capture.done": ("🧩", "记忆抓取 · 完成"),
+    "memory.index.called": ("🧩", "浏览记忆总览"),
+    "memory.search.called": ("🔍", "搜索记忆"),
 }
 _DEBUG_SUBSYSTEM_FALLBACK = {
     "route": ("🧭", "路由"), "context": ("📎", "上下文"), "agent": ("🤖", "Agent"),
