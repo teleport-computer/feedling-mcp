@@ -179,11 +179,12 @@ class DockerStatsClient:
         urlopen_fn: Callable[..., Any] = urlopen,
     ) -> None:
         self._base_url = base_url.rstrip("/")
+        self.timeout_sec = timeout_sec
         self._timeout_sec = timeout_sec
         self._urlopen = urlopen_fn
 
     def _get_json(self, path: str, timeout_sec: float | None = None) -> Any:
-        timeout = self._timeout_sec if timeout_sec is None else timeout_sec
+        timeout = self.timeout_sec if timeout_sec is None else timeout_sec
         if timeout <= 0:
             raise TimeoutError("docker_cycle_timeout")
         request = Request(f"{self._base_url}{path}", method="GET")
@@ -373,7 +374,7 @@ class CpuRecorder:
         proc_root: Path,
         store: DailyCsvStore,
         interval_sec: float = 60.0,
-        docker_cycle_timeout_sec: float = 10.0,
+        docker_cycle_timeout_sec: float | None = None,
         *,
         monotonic_fn: Callable[[], float] = time.monotonic,
         docker_monotonic_fn: Callable[[], float] = time.monotonic,
@@ -384,7 +385,14 @@ class CpuRecorder:
         self.proc_root = Path(proc_root)
         self.store = store
         self.interval_sec = interval_sec
-        self.docker_cycle_timeout_sec = docker_cycle_timeout_sec
+        resolved_timeout = (
+            getattr(client, "timeout_sec", 10.0)
+            if docker_cycle_timeout_sec is None
+            else docker_cycle_timeout_sec
+        )
+        if resolved_timeout <= 0:
+            raise ValueError("invalid_docker_cycle_timeout")
+        self.docker_cycle_timeout_sec = resolved_timeout
         self._monotonic = monotonic_fn
         self._docker_monotonic = docker_monotonic_fn
         self._sleep = sleep_fn
@@ -434,9 +442,9 @@ class CpuRecorder:
                         timeout_sec=self._docker_remaining(docker_deadline),
                     )
                 except Exception as exc:
-                    self._error("cpu_recorder_container_sample_failed", exc)
                     if self._docker_monotonic() >= docker_deadline:
-                        break
+                        raise TimeoutError("docker_cycle_timeout") from exc
+                    self._error("cpu_recorder_container_sample_failed", exc)
                     continue
                 current_containers[ref.container_id] = snapshot
                 previous = self._previous_containers.get(ref.container_id)
@@ -527,7 +535,6 @@ def main() -> int:
             proc_root,
             store,
             interval_sec=interval,
-            docker_cycle_timeout_sec=timeout,
         )
     except (KeyError, TypeError, ValueError, OSError) as exc:
         CpuRecorder._error("cpu_recorder_startup_failed", exc)

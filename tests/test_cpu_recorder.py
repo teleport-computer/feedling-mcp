@@ -588,8 +588,82 @@ def test_recorder_bounds_all_docker_reads_to_one_cycle_timeout(tmp_path, capsys)
     assert client.timeouts == [10.0, 7.0]
     assert clock.now == 10.0
     assert capsys.readouterr().err == (
-        "cpu_recorder_container_sample_failed error=TimeoutError\n"
+        "cpu_recorder_sample_failed error=TimeoutError\n"
     )
+
+
+def test_recorder_deadline_failure_preserves_all_container_baselines(tmp_path):
+    class _Clock:
+        now = 0.0
+
+        def monotonic(self):
+            return self.now
+
+    class _DeadlineClient:
+        timeout_sec = 10.0
+
+        def __init__(self, clock):
+            self.clock = clock
+            self.round = 0
+            self.refs = [
+                ContainerRef("a" * 64, "first"),
+                ContainerRef("b" * 64, "second"),
+            ]
+            self.totals = {
+                self.refs[0].container_id: [100, 200, 300],
+                self.refs[1].container_id: [100, 300],
+            }
+
+        def list_running_containers(self, timeout_sec=None):
+            self.round += 1
+            return self.refs
+
+        def read_cpu_snapshot(self, container_id, timeout_sec=None):
+            if self.round == 2 and container_id == self.refs[1].container_id:
+                self.clock.now += timeout_sec
+                raise TimeoutError("cycle exhausted")
+            total = self.totals[container_id].pop(0)
+            return ContainerCpuSnapshot(total, total * 4, 2)
+
+    proc_root = tmp_path / "proc"
+    data_dir = tmp_path / "history"
+    data_dir.mkdir()
+    _write_proc(proc_root, 350)
+    clock = _Clock()
+    client = _DeadlineClient(clock)
+    recorder = CpuRecorder(
+        client,
+        proc_root,
+        DailyCsvStore(data_dir, "test"),
+        docker_monotonic_fn=clock.monotonic,
+    )
+
+    assert recorder.sample_once(datetime(2026, 8, 13, tzinfo=timezone.utc)) is False
+    _write_proc(proc_root, 430, idle=700, iowait=70)
+    assert recorder.sample_once(
+        datetime(2026, 8, 13, 0, 1, tzinfo=timezone.utc)
+    ) is False
+    _write_proc(proc_root, 510, idle=800, iowait=90)
+    assert recorder.sample_once(
+        datetime(2026, 8, 13, 0, 2, tzinfo=timezone.utc)
+    ) is True
+
+    assert [row["container_name"] for row in _read_csv_rows(data_dir)] == [
+        "first",
+        "second",
+    ]
+
+
+def test_recorder_uses_client_timeout_as_cycle_budget(tmp_path):
+    proc_root = tmp_path / "proc"
+    data_dir = tmp_path / "history"
+    data_dir.mkdir()
+    _write_proc(proc_root, 350)
+    client = DockerStatsClient("http://proxy", timeout_sec=5)
+
+    recorder = CpuRecorder(client, proc_root, DailyCsvStore(data_dir, "test"))
+
+    assert recorder.docker_cycle_timeout_sec == 5.0
 
 
 def test_invalid_proc_sample_keeps_last_good_host_baseline(tmp_path, capsys):
