@@ -10,6 +10,13 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **Managed Phala deployments can retain bounded CPU history.** The measured
+  test and production CVM topology records one-minute host and container CPU
+  samples in a private persistent volume for 30 UTC calendar days. A narrowly
+  allowlisted internal socket proxy exposes only the Docker reads required by
+  the recorder; no public metrics endpoint, application content collection, or
+  alerting is introduced.
+
 - **User-configured MCP servers now follow the selected-server trust model.**
   MCP tools remain available after private reads and earlier MCP results, which
   enables multi-step flows such as reading and then storing remote memory in one

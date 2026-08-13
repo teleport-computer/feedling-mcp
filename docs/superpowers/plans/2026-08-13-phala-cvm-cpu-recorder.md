@@ -287,7 +287,7 @@ Skip unless FEEDLING_RUN_DOCKER_SOCKET_TESTS=1, Docker is reachable, and the soc
 
 - intended container list/stats GETs return 200;
 - container inspect, logs, images, info, and version GETs return 403;
-- restart POST returns 403 and the target remains running.
+- restart POST returns 405 (method denied) and the target remains running.
 
 Use explicit subprocess argument arrays and try/finally cleanup of only IDs created by the test. Never issue an allowed mutation.
 
