@@ -76,10 +76,11 @@ volume. Files use a stable schema and include a header. A temporary file must
 not be used as the authoritative daily record; each completed sample is flushed
 so a recorder restart loses at most the in-progress sample.
 
-At startup and after each successful daily rollover, the recorder deletes only
-its own daily CPU files older than 30 days. Cleanup must use an exact filename
-pattern and a validated recorder-owned directory. It must never recursively
-delete an unresolved or broad path.
+At startup and after each successful daily rollover, the recorder retains the
+current UTC date plus the previous 29 UTC dates and deletes only its own older
+daily CPU files. Cleanup must use an exact filename pattern and a validated
+recorder-owned directory. It must never recursively delete an unresolved or
+broad path.
 
 At the expected scale of roughly five containers, one-minute sampling produces
 about 216,000 container rows over 30 days. The expected storage footprint is
@@ -123,10 +124,12 @@ recorder. It has no published port and no credentials or Feedling application
 secrets. The recorder likewise receives no database, R2, API, runtime-token, or
 Cloudflare secrets.
 
-All container images must be pinned to immutable digests. The implementation
-must verify the selected proxy's actual allowlist semantics against its pinned
-version; environment-variable names alone are not sufficient evidence that
-mutation endpoints are denied.
+The third-party proxy image must be pinned to an immutable OCI digest. The
+recorder must use the exact same release-pinned Feedling commit tag as the
+backend and remain covered by `deploy/pin-runtime-release.sh`'s compare-and-swap
+release flow. The implementation must verify the selected proxy's actual
+allowlist semantics against its pinned version; configuration text alone is
+not sufficient evidence that mutation or unintended read endpoints are denied.
 
 Because adding services changes the measured Compose configuration, production
 promotion requires the repository's normal test-to-production branch flow and
