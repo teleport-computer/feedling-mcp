@@ -291,6 +291,8 @@ jobs:
             tests/test_provider_malformed_tool_fallback.py \
             tests/test_perception_tool_surface_contract.py \
             tests/test_v2_tool_trace_privacy.py \
+            tests/test_capabilities_memory.py \
+            tests/test_data_track_debug.py \
             tests/test_chat_activity_projection.py \
             tests/test_capabilities_tool_schema.py \
             tests/test_debug_trace.py \
