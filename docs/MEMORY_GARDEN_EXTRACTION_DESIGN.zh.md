@@ -377,6 +377,35 @@ memory/source_policy.py   33 行   来源枚举
 
 ## 五、形态与分层
 
+### 提取出来的是什么:一个包,三种壳,N 个适配器
+
+```
+memory-garden 包
+│
+├── 谁来调(壳)                       └── 数据存哪(适配器)
+│   ├── 直接 import ← IO 用这个           ├── postgres(+ 加密中间件)← IO 用这个
+│   ├── CLI 子命令                        ├── sqlite
+│   └── MCP server                        └── 自定义(Notion / NAS / …)
+```
+
+**壳和适配器是正交的,任意组合:**
+
+```
+memory-garden serve --storage sqlite://~/.memory-garden/db    MCP 壳 + SQLite
+memory-garden serve --storage postgres://...                  MCP 壳 + Postgres
+memory-garden dream  --storage sqlite://...                   CLI 壳 + SQLite
+from memory_garden import ...                                 无壳,直接调函数
+```
+
+壳只负责「把外面的调用翻译成内核函数调用」,不参与存储决策;适配器只负责「数据落到哪、
+要不要加解密」,不关心是谁在调。
+
+**IO 走的是「直接 import + Postgres 加密适配器」这一组**——同进程调函数,
+因为每轮选卡一天要跑几百次且在关键路径上,走跨进程等于每轮把整个记忆库的索引序列化两趟。
+
+> CLI 与 MCP 两层壳本批不做(见第九节),但**内核的接口从一开始就要按「能被壳包住」来设计**
+> ——壳是几十行转接代码,前提是内核本身不假设调用者是谁。
+
 ### 五层各管什么
 
 ```
