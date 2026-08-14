@@ -113,6 +113,9 @@ def normalize_bucket_language(bucket: str, text: str) -> str:
 # until 2026-08-10, and the obvious "just inject MEMORY_WRITE_GUIDANCE_V1 into V2"
 # fix would have taught the V2 model two op names its own schema rejects — worse
 # than no guidance. Each runtime states its own ops and shares the rules below.
+# Keep this block operation-agnostic: Runtime V2 wake turns reuse it in a narrowed
+# add/update-only tool description where mentioning delete would reopen a hidden
+# destructive affordance in the prompt even though the executor still refuses it.
 MEMORY_WRITE_RULES_V1 = ("""
 - Write only durable user/relationship facts, preferences, boundaries, repeated patterns, or meaningful events.
 - Do not write greetings, jokes, one-off task instructions, unconfirmed guesses, roleplay hypotheticals, or the assistant's own inference.

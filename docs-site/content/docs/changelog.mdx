@@ -10,6 +10,11 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **Runtime V2 background wake turns cannot delete memory cards.** Heartbeat,
+  scheduled, manual-wake, and screen-watch turns retain memory add and update
+  tools, but deletion is absent from their provider tool schema and rejected at
+  the execution boundary. Foreground Chat memory deletion remains available.
+
 - **Hosted Runtime V2 isolates foreground Chat from background maintenance.**
   Chat/manual-wake, ambient-wake, and Heavy maintenance work now use separate
   capacity pools with one OS process per worker slot. Background work therefore

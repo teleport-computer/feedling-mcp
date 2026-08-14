@@ -298,6 +298,21 @@ def test_memory_write_reason_and_relative_wake_are_described_and_valid():
     assert "in 2 hours" in specs["schedule_wake"].description
 
 
+def test_wake_memory_write_surface_removes_only_delete_without_mutating_chat():
+    chat_spec = next(
+        item for item in tool_schema.build_tool_specs()
+        if item.name == "memory_write"
+    )
+    wake_spec = tool_schema.without_memory_delete(chat_spec)
+
+    chat_ops = chat_spec.parameters["properties"]["actions"]["items"]["properties"]["op"]["enum"]
+    wake_ops = wake_spec.parameters["properties"]["actions"]["items"]["properties"]["op"]["enum"]
+    assert chat_ops == ["add", "update", "delete"]
+    assert wake_ops == ["add", "update"]
+    assert "delete" not in wake_spec.description.lower()
+    assert "add" in wake_spec.description and "update" in wake_spec.description
+
+
 def test_memory_search_shares_the_index_filters_it_already_consumes():
     """memory_search 和 memory_index 共用 memory_index_core,那个 core 一直在消费
     bucket / thread / include_sensitive —— index 的 schema 开了,search 漏了。

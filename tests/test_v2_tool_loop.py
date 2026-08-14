@@ -170,6 +170,31 @@ def test_empty_tool_calls_is_final_reply_no_dispatch(monkeypatch):
     assert progress == ["round_boundary", "provider_start", "provider_complete"]
 
 
+def test_memory_delete_surface_defaults_fail_closed(monkeypatch):
+    provider = _ScriptedProvider([
+        {"reply": "done", "tool_calls": [], "usage": {}},
+    ])
+    monkeypatch.setattr(provider_client, "chat_completion_async", provider)
+
+    asyncio.run(tool_loop.run_tool_loop(
+        provider_config=_TEST_PROVIDER_CONFIG,
+        build_messages=_RecordingBuildMessages(),
+        dispatch_tools=_RecordingDispatch(),
+        on_reply=_RecordingReply(),
+        fold_new_messages=_RecordingFold([]),
+        add_usage=_noop_add_usage,
+        max_calls=2,
+    ))
+
+    memory_spec = next(
+        spec for spec in provider.calls[0]["tools"] if spec.name == "memory_write"
+    )
+    ops = memory_spec.parameters["properties"]["actions"]["items"][
+        "properties"
+    ]["op"]["enum"]
+    assert ops == ["add", "update"]
+
+
 def test_tagged_screen_images_retry_once_without_frames(monkeypatch):
     provider = _ScriptedProvider([
         # OpenRouter commonly reports an image rejection as 404 even when the
