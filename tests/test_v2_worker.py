@@ -1045,21 +1045,7 @@ def test_run_turn_maintenance_bypasses_provider_and_runtime_token(monkeypatch):
 
     assert status == "completed"
     assert _job_status(job_id)[0] == "completed"
-    assert writes == [
-        (
-            "- [1 条更早的消息已由长期记忆覆盖]",
-            {
-                "current_summary": "",
-                "head_summary": "- [1 条更早的消息已由长期记忆覆盖]",
-                "start_seq": 1,
-                "end_seq": 1,
-                "source_message_count": 1,
-                "watermark_ts": 0.0,
-                "expected_version": 0,
-                "previous_watermark_seq": 0,
-            },
-        )
-    ]
+    assert writes == []
 
 
 def test_run_turn_heartbeat_resolve_failure_is_silent_no_user_error(monkeypatch):
@@ -1623,113 +1609,6 @@ def test_semantic_compaction_api_is_removed():
     assert not hasattr(v2_compaction, "compact")
 
 
-def test_run_compaction_failure_marks_failed_without_surfacing_user_error(monkeypatch):
-    """A metadata coverage write failure must be a
-    silent `mark_failed` — NEVER a chat bubble, NEVER an "error"-kind status
-    event, NEVER a `_surface_terminal_error` call. That machinery is for
-    user-initiated chat turns; maintenance is a background job."""
-    uid = "u_w_maintenance_fail"
-    conftest.seed_user(uid)
-    _reset(uid)
-    job_id, _ = jobs_store.enqueue_job(uid, "maintenance")
-    job = jobs_store.claim_next_job("w")
-
-    monkeypatch.setattr(jobs_store, "get_summary_row", lambda _uid: None)
-
-    async def _unsummarized(_uid, _watermark_seq):
-        return worker._TAIL_KEEP + 1
-
-    monkeypatch.setattr(worker, "_unsummarized_count", _unsummarized)
-    monkeypatch.setattr(
-        worker.db,
-        "chat_coverage_bounds_after_seq",
-        lambda *_args, **_kwargs: (1, 1, 1),
-    )
-    monkeypatch.setattr(
-        worker.db,
-        "count_messages_after_seq",
-        lambda *_args, **_kwargs: 1,
-    )
-
-    def _boom_append(*_args, **_kwargs):
-        raise RuntimeError("metadata write exploded")
-
-    write_bubble_called = {"n": 0}
-    monkeypatch.setattr(
-        worker, "_write_encrypted_reply",
-        lambda store, text: write_bubble_called.update(n=write_bubble_called["n"] + 1) or {"id": "r"})
-
-    surface_called = {"n": 0}
-    monkeypatch.setattr(
-        worker, "_surface_terminal_error",
-        lambda *a, **k: surface_called.update(n=surface_called["n"] + 1))
-
-    deps = worker.TurnDeps(
-        read_messages=lambda uid_: [],
-        resolve_provider=lambda uid_: (_BYOK, {}),
-        mint_enclave_token=lambda uid_: "rt",
-        append_summary_segment=_boom_append,
-        runtime_mode_enabled=lambda _uid: True,
-    )
-
-    status = asyncio.run(worker.process_job(
-        job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"))
-
-    assert status == "failed"
-    assert write_bubble_called["n"] == 0
-    assert surface_called["n"] == 0
-    row = _job_status(job_id)
-    assert row[0] == "failed"
-    assert "compaction_failed" in (row[1] or "")
-    events = _status_events(uid)
-    assert not any(e["kind"] == "error" for e in events)
-
-
-def test_compaction_rollback_during_llm_blocks_summary_write(monkeypatch):
-    uid = "u_w_maintenance_rollback"
-    conftest.seed_user(uid)
-    _reset(uid)
-    job_id, _ = jobs_store.enqueue_job(uid, "maintenance")
-    job = jobs_store.claim_next_job("w")
-    monkeypatch.setattr(jobs_store, "get_summary_row", lambda _uid: None)
-
-    async def _unsummarized(_uid, _watermark_seq):
-        return worker._TAIL_KEEP + 1
-
-    monkeypatch.setattr(worker, "_unsummarized_count", _unsummarized)
-    monkeypatch.setattr(
-        worker.db,
-        "chat_coverage_bounds_after_seq",
-        lambda *_args, **_kwargs: (1, 1, 1),
-    )
-    monkeypatch.setattr(
-        worker.db,
-        "count_messages_after_seq",
-        lambda *_args, **_kwargs: 1,
-    )
-    writes = {"n": 0}
-
-    def _append(*_args, **_kwargs):
-        writes["n"] += 1
-        return True
-
-    deps = worker.TurnDeps(
-        read_messages=lambda uid_: [],
-        resolve_provider=lambda uid_: (_BYOK, {}),
-        mint_enclave_token=lambda uid_: "rt",
-        runtime_mode_enabled=lambda _uid: False,
-        append_summary_segment=_append,
-    )
-
-    status = asyncio.run(worker.process_job(
-        job, deps, provider_config=_BYOK,
-        api_key=None, runtime_token="rt"))
-
-    assert status == "failed"
-    assert writes["n"] == 0
-    assert _job_status(job_id)[0] == "failed"
-
-
 # ------------------------------------------------------------------
 # spec B5 (Hosted Runtime V2 PR B, Task 8): the old per-call metric callback is
 # superseded by a per-job `TurnMetrics` whole-turn accumulator that upserts
@@ -1905,8 +1784,8 @@ def test_run_wake_weak_wake_still_records_whole_turn_metric_with_call_counted(mo
     assert row[3] == "ok"
 
 
-def test_run_compaction_records_whole_turn_metric_on_success(monkeypatch):
-    """Metadata-only maintenance records success without any model usage."""
+def test_retired_maintenance_records_whole_turn_metric(monkeypatch):
+    """The content-free tombstone records success without any model usage."""
     uid = "u_w_compaction_turnmetric"
     conftest.seed_user(uid)
     _reset(uid)
@@ -1951,7 +1830,7 @@ def test_run_compaction_records_whole_turn_metric_on_success(monkeypatch):
     status = asyncio.run(worker._run_turn(job, deps))
 
     assert status == "completed"
-    assert writes["n"] == 1
+    assert writes["n"] == 0
     with db.get_pool().connection() as c:
         row = c.execute(
             "SELECT lane, prompt_tokens, completion_tokens, model_calls, failed, status, "
@@ -1964,7 +1843,7 @@ def test_run_compaction_records_whole_turn_metric_on_success(monkeypatch):
     assert row[1] is None and row[2] is None
     assert row[3] == 0
     assert row[4] is False
-    assert row[5] == "ok"
+    assert row[5] == "maintenance_retired"
     assert row[6:11] == (None, None, None, 0, 0)
     assert row[11:] == (None, None, None)
 
@@ -2025,41 +1904,6 @@ def test_turn_metrics_ignore_malformed_or_bigint_overflow_usage():
     assert tm.prompt_tokens == 10
     assert tm.completion_tokens == 2
     assert tm.cache_read_tokens == 4
-
-
-def test_run_compaction_under_keep_threshold_completes_as_noop(monkeypatch):
-    """A metadata count at `_TAIL_KEEP` completes without appending coverage."""
-    uid = "u_w_maintenance_noop"
-    conftest.seed_user(uid)
-    _reset(uid)
-    job_id, _ = jobs_store.enqueue_job(uid, "maintenance")
-    job = jobs_store.claim_next_job("w")
-
-    monkeypatch.setattr(jobs_store, "get_summary_row", lambda _uid: None)
-
-    async def _unsummarized(_uid, _watermark_seq):
-        return worker._TAIL_KEEP
-
-    monkeypatch.setattr(worker, "_unsummarized_count", _unsummarized)
-    write_calls = {"n": 0}
-
-    def _append(*_args, **_kwargs):
-        write_calls["n"] += 1
-        return True
-
-    deps = worker.TurnDeps(
-        read_messages=lambda uid_: [],
-        resolve_provider=lambda uid_: (_BYOK, {}),
-        mint_enclave_token=lambda uid_: "rt",
-        append_summary_segment=_append,
-    )
-
-    status = asyncio.run(worker.process_job(
-        job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"))
-
-    assert status == "completed"
-    assert write_calls["n"] == 0
-    assert _job_status(job_id)[0] == "completed"
 
 
 # ------------------------------------------------------------------

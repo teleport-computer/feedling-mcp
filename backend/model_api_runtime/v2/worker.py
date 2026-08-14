@@ -6353,36 +6353,19 @@ async def _run_compaction(
                 job_id=job_id,
                 trajectory_recorder=trajectory_recorder,
             )
-            remaining_count = await _unsummarized_count(user_id, last_seq)
-            completed = await asyncio.to_thread(
+            await asyncio.to_thread(
                 jobs_store.mark_completed, job_id, claimed_by=claimed_by
             )
-            if completed and remaining_count > _TAIL_KEEP:
-                await asyncio.to_thread(
-                    jobs_store.enqueue_job,
-                    user_id,
-                    "maintenance",
-                    reason="compaction_catchup",
-                )
-                await asyncio.to_thread(core_wake_bus.notify, "v2_jobs", user_id)
             if tm is not None:
                 tm.flush(failed=False, status="ok")
             return "completed"
 
-        failed_owned = await asyncio.to_thread(
+        await asyncio.to_thread(
             jobs_store.mark_failed,
             job_id,
             "summary_cas_lost",
             claimed_by=claimed_by,
         )
-        if failed_owned:
-            await asyncio.to_thread(
-                jobs_store.enqueue_job,
-                user_id,
-                "maintenance",
-                reason="cas_lost_retry",
-            )
-            await asyncio.to_thread(core_wake_bus.notify, "v2_jobs", user_id)
         if tm is not None:
             tm.flush(failed=True, status="summary_cas_lost")
         return "failed"
@@ -9859,68 +9842,6 @@ def _inject_tail_files(tail: list[dict], *, user_id: str, read_files) -> list[di
     return out
 
 
-async def _ensure_prompt_coverage_or_degrade(
-    user_id: str,
-    deps: TurnDeps,
-    *,
-    provider_config: Any,
-    enclave_sem: "asyncio.Semaphore",
-    tail_limit: int,
-    job_id,
-    claimed_by: str | None,
-    add_usage: Callable[[dict | None], None] | None,
-    trajectory_recorder: "v2_trajectory.TrajectoryRecorder | None",
-    compact_through_seq: int | None,
-) -> None:
-    """Option A: run the inline catch-up, but NEVER fail a user reply because
-    compaction is behind.
-
-    On any non-control-flow failure (coverage exhaustion, a summary-frontier
-    exhaustion, a transient provider error during a fold), kick the
-    self-sustaining background maintenance-compaction chain and return, so the
-    turn serves the bounded recency tail (+ coverage-hole notice) that
-    ``_read_seq_adaptive_prompt_context`` produces. Control-flow signals
-    (``LostJobLease``/``RuntimeModeChanged``/cancellation) still propagate.
-
-    This breaks the deadlock where a user whose gap exceeds what one turn's
-    bounded catch-up can close fails EVERY turn, which also starves the
-    post-reply enqueue that would have drained the backlog (usr_7f30 / usr_81a0
-    / usr_90184 on prod, stuck for days).
-    """
-    try:
-        await _ensure_prompt_coverage(
-            user_id,
-            deps,
-            enclave_sem=enclave_sem,
-            tail_limit=tail_limit,
-            job_id=job_id,
-            claimed_by=claimed_by,
-            trajectory_recorder=trajectory_recorder,
-            compact_through_seq=compact_through_seq,
-        )
-    except (LostJobLease, RuntimeModeChanged, asyncio.CancelledError):
-        raise
-    except Exception as coverage_exc:  # noqa: BLE001 — degrade, never fail the reply
-        _report_turn_progress("prompt_catchup_degraded")
-        try:
-            await asyncio.to_thread(
-                jobs_store.enqueue_job, user_id, "maintenance", reason="compaction"
-            )
-            await asyncio.to_thread(core_wake_bus.notify, "v2_jobs", user_id)
-        except Exception as enqueue_exc:  # noqa: BLE001
-            log.warning(
-                "[v2.worker] degraded-coverage compaction enqueue failed for %s: %s",
-                user_id,
-                enqueue_exc,
-            )
-        await _record_trajectory(
-            trajectory_recorder,
-            "prompt_catchup_degraded",
-            {"lane": "chat", "error_class": type(coverage_exc).__name__},
-            best_effort=True,
-        )
-
-
 async def process_job(
     job: dict,
     deps: TurnDeps,
@@ -10065,19 +9986,6 @@ async def process_job(
 
         await _ensure_runtime_mode()
 
-        if lane == "maintenance":
-            # 自成一体的压缩路径：自己的 try/except（见 `_run_compaction`），绝不落到本
-            # 函数下面那个 chat-turn 的 `except`——那个分支会 emit 用户可见的 error status
-            # + record_terminal_error（iOS 错误 chip），压缩失败是后台维护事，不该弹给用户。
-            return await _run_compaction(
-                job_id,
-                user_id,
-                deps,
-                enclave_sem,
-                claimed_by,
-                tm,
-                trajectory_recorder,
-            )
         if lane == "profile":
             return await _run_profile(
                 job_id,
@@ -12515,6 +12423,22 @@ async def _run_turn(job: dict, deps: TurnDeps, *, enclave_sem=None) -> str:
     lane = str(job.get("lane") or "chat")
     tm = TurnMetrics(job_id=job_id, user_id=user_id, lane=lane)
 
+    # Rolling-deploy tombstone: an older worker may already have enqueued or
+    # claimed a conversation-compaction job. Retire it using only the owned-job
+    # completion fence, before trajectory setup, provider resolution, content
+    # reads, decryptors, summary writers, or successor producers can run.
+    if lane == "maintenance":
+        completed = await asyncio.to_thread(
+            jobs_store.mark_completed,
+            job_id,
+            claimed_by=claimed_by,
+        )
+        tm.flush(
+            failed=not completed,
+            status="maintenance_retired" if completed else "lease_lost",
+        )
+        return "completed" if completed else "failed"
+
     async def _settle_legacy_traced_chat_failure(code: str) -> None:
         trace_id = str(job.get("trace_id") or "")
         if (
@@ -12729,23 +12653,6 @@ async def _run_turn(job: dict, deps: TurnDeps, *, enclave_sem=None) -> str:
                 "attempt_count": job.get("attempt_count", 0),
             },
         )
-        if lane == "maintenance":
-            outcome = await process_job(
-                job,
-                deps,
-                provider_config=None,
-                api_key=None,
-                runtime_token="",
-                tm=tm,
-                trajectory_recorder=recorder,
-            )
-            await _record_trajectory(
-                recorder,
-                "turn_terminal",
-                {"outcome": outcome},
-                best_effort=True,
-            )
-            return outcome
         try:
             async with enclave_sem:
                 provider_config, _meta = await asyncio.to_thread(

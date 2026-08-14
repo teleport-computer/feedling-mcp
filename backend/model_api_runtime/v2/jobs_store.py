@@ -11359,62 +11359,6 @@ def due_screen_watch_users(*, now: float | None = None, limit: int = 500) -> lis
             return [row[0] for row in cur.fetchall()]
 
 
-def due_compaction_users(
-    *, min_backlog: int, limit: int = 200
-) -> list[tuple[str, int]]:
-    """V2 用户里积压过大、且当前没人在折的 ``[(user_id, backlog)]``，积压降序。
-
-    这是唯一不需要用户开口的 maintenance 入队来源。其余四个入队点都挂在 turn
-    上（回复成功后、coverage 降级、自链 catchup、CAS 重试），所以一个不再说话的
-    用户就此停止折叠，而刚切到 V2 的大积压用户根本没人踢第一脚。
-
-    三条口径必须和折叠本身一致，否则扫出来的用户会空转：
-
-    * **从 ``v2_runtime_state`` 出发**（不是从 summary），因为刚切过来的用户还
-      没有 summary 行，``COALESCE(watermark_seq, 0)`` 让他们的积压等于全部消息
-      ——正是最需要扫的那批。同时天然排除已回滚到 resident 的用户：给 V1 用户
-      入队 maintenance 会把已经停掉的 V2 工作重新拉起来。
-    * **排除 GC-able 合成行**，与 ``db.count_messages_after_seq`` /
-      ``chat_messages_after_seq`` 和两个 frontier 见证同一集合。把 verify_ping
-      当积压会安排一次针对「马上要被 verify_loop 删掉的行」的折叠，那是永久性的
-      frontier 损坏。
-    * **跳过已有在途 maintenance job 的用户**。``enqueue_job`` 自己有 per-user
-      单飞会 coalesce，所以重复入队本身无害；这一条只是不让扫描器每个 tick 都
-      对同一批用户做无用功。
-
-    每个用户的计数走 LATERAL 子查询并 ``LIMIT min_backlog``：只需要判定「够不够
-    阈值」，不需要精确总数，所以一个积压 5 万条的用户也只扫 ``min_backlog`` 行。
-    返回的 backlog 因此是**下界**（等于阈值即「至少这么多」），够排序用。
-    """
-    threshold = max(1, int(min_backlog))
-    with _pool().connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                "SELECT rs.user_id, backlog.n FROM v2_runtime_state AS rs "
-                "LEFT JOIN v2_conversation_summary AS s ON s.user_id = rs.user_id "
-                "JOIN LATERAL ("
-                "  SELECT count(*) AS n FROM ("
-                "    SELECT 1 FROM chat_messages AS m "
-                "    WHERE m.user_id = rs.user_id "
-                "      AND m.seq > COALESCE(s.watermark_seq, 0) "
-                "      AND COALESCE(m.doc->>'source','') "
-                "          NOT IN ('verify_ping','resident_maintenance') "
-                "    LIMIT %s"
-                "  ) AS capped"
-                ") AS backlog ON TRUE "
-                "WHERE rs.hosted_runtime_state = 'v2' "
-                "  AND backlog.n >= %s "
-                "  AND NOT EXISTS ("
-                "    SELECT 1 FROM agent_jobs AS j "
-                "    WHERE j.user_id = rs.user_id AND j.lane = 'maintenance' "
-                "      AND j.status IN ('pending','claimed','running')"
-                "  ) "
-                "ORDER BY backlog.n DESC, rs.user_id LIMIT %s",
-                (threshold, threshold, int(limit)),
-            )
-            return [(row[0], int(row[1])) for row in cur.fetchall()]
-
-
 def due_scheduled_users(*, now: float | None = None, limit: int = 500) -> list[str]:
     """有到期 self-wake timer 的用户（跨用户）。
 
