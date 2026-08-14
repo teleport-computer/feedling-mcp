@@ -108,19 +108,33 @@ LANGUAGE_RULE_TEMPLATE = """语言：所有字段（bucket/threads/summary/conte
 中文就用中文（用「宠物」不是「pets」、「旅行」不是「travel」），英文就用英文；
 别归成英文桶/线索；只有专有名词、品牌名、原话才保留原文。"""
 
-#: 各来源的「语言依据」。这是三档之间**必要**的差异，不是措辞不一致。
+#: 各来源的「语言依据」。这是三档之间**必要**的差异，不是措辞不一致：
+#: 导入一批英文历史记录、而用户当前说中文时，两者会分叉 —— 那时卡应该跟素材走。
+#:
+#: ⚠️ 「TA 跟你对话」带前导空格是有意的：模板里是「用{basis}的语言」，
+#: 而中英混排时「用」和字母之间要留空格（原文就是「用 TA 跟你对话的语言」）。
+#: 纯中文的「素材原文」不需要。
 LANGUAGE_BASIS = {
-    "conversation_capture": "TA 跟你对话",
+    "conversation_capture": " TA 跟你对话",
     "history_import": "素材原文",
     "curated_archive": "素材原文",
 }
 
 
-def language_rule(policy_name: str) -> str:
-    """按档位渲染语言规则。"""
-    return LANGUAGE_RULE_TEMPLATE.format(
+def language_rule(policy_name: str, *, indent: str = "", first_prefix: str = "") -> str:
+    """按档位渲染语言规则。
+
+    ``first_prefix`` / ``indent`` 让调用方套进自己的排版
+    （capture 的模板是「   · 」开头的列表项，续行缩进 5 空格；
+    genesis 是顶格的一段）。规则文字本身共用，排版各随宿主。
+    """
+    text = LANGUAGE_RULE_TEMPLATE.format(
         basis=LANGUAGE_BASIS.get(policy_name, LANGUAGE_BASIS["conversation_capture"])
     )
+    lines = text.splitlines()
+    out = [f"{first_prefix}{lines[0]}"]
+    out.extend(f"{indent}{line}" for line in lines[1:])
+    return "\n".join(out)
 
 
 # ⏸ **本模块的 language_rule 目前没有任何调用方** —— 这是有意的。

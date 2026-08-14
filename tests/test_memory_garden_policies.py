@@ -111,8 +111,9 @@ def test_language_rule_is_shared_text_with_only_the_basis_swapped():
     assert chat != imported
     assert "TA 跟你对话" in chat
     assert "素材原文" in imported
-    # 除了依据那几个字，其余逐字相同
-    assert chat.replace("TA 跟你对话", "素材原文") == imported
+    # 除了依据那几个字，其余逐字相同。
+    # 注意「 TA 跟你对话」带前导空格（中英混排），换算时要连空格一起换。
+    assert chat.replace(" TA 跟你对话", "素材原文") == imported
 
 
 def test_language_rule_keeps_both_sides_original_points():
@@ -131,23 +132,36 @@ def test_language_rule_falls_back_for_unknown_policy():
     assert "TA 跟你对话" in language_rule("nonexistent")
 
 
-def test_language_rule_is_not_wired_yet():
-    """守住「写好但未接线」这个状态。
+def test_language_rule_is_wired_into_both_sides():
+    """语言规则已接线：capture 与 genesis 都从本模块取，不再各写一份。
 
-    接线会同时改动 capture 与 genesis 两处的 prompt 文本，必须先过真模型 e2e。
-    这条测试在接线时会失败 —— **那是提醒，不是回归**：改的时候要连同各档位的
-    golden fixture 一起重生成。
+    这是本批真正消除的第二处重复（第一处是 curated_archive 的两段）。
     """
     import pathlib
 
-    capture_src = (
-        pathlib.Path(__file__).resolve().parents[1]
-        / "backend" / "memory_garden" / "prompts" / "capture.py"
-    ).read_text(encoding="utf-8")
-    assert "{language_rule}" not in capture_src, (
-        "capture 模板已接入共用语言规则 —— 请确认已跑过真模型 e2e，"
-        "并重新生成各档位的 golden fixture，然后删掉这条测试。"
-    )
+    root = pathlib.Path(__file__).resolve().parents[1] / "backend"
+    capture_src = (root / "memory_garden" / "prompts" / "capture.py").read_text(encoding="utf-8")
+    genesis_src = (root / "genesis" / "prompts.py").read_text(encoding="utf-8")
+
+    assert "{language_rule}" in capture_src, "capture 模板没有语言占位符"
+    assert "policies_language_rule" in capture_src, "capture 没调 language_rule"
+    assert "mg_policies.language_rule" in genesis_src, "genesis 没调 language_rule"
+
+    # 两边都不许再出现内联的旧文本
+    for name, src in (("capture", capture_src), ("genesis", genesis_src)):
+        assert "用 TA 跟你对话的语言记" not in src, f"{name} 里还留着旧的内联文本"
+        assert "用素材原文的语言——中文素材" not in src, f"{name} 里还留着旧的内联文本"
+
+
+def test_language_basis_keeps_the_cjk_latin_spacing():
+    """「TA 跟你对话」带前导空格 —— 中英混排时「用」和字母之间要留空格。
+
+    丢了空格会产出「用TA 跟你对话的语言」，是排版退化。
+    """
+    from memory_garden.policies import language_rule
+
+    assert "用 TA 跟你对话的语言" in language_rule("conversation_capture")
+    assert "用素材原文的语言" in language_rule("history_import")
 
 
 # --------------------------------------------------------------------------- #

@@ -82,17 +82,39 @@ def test_fixture_covers_every_case():
     assert set(_baseline()) == set(CASES), "fixture 与用例集合不同步"
 
 
+#: 语言规则统一（2026-08-14）之后，产出与基线的差异**只允许出现在语言那一段**。
+#: 基线快照仍是改造前的原文，不更新 —— 它的价值就在于持续证明「只改了那一段」。
+_LANG_BLOCK_MARKERS = ("   · 语言：", "   · 称呼：")
+
+
+def _strip_language_block(text: str) -> str:
+    start = text.index(_LANG_BLOCK_MARKERS[0])
+    end = text.index(_LANG_BLOCK_MARKERS[1])
+    return text[:start] + text[end:]
+
+
 @pytest.mark.parametrize("case_name", sorted(CASES))
-def test_shell_output_is_byte_identical_to_baseline(case_name):
-    expected = _baseline()[case_name]
+def test_everything_except_the_language_block_is_byte_identical_to_baseline(case_name):
+    """除语言段外逐字节不变 —— 守住「这次只动了语言那一段」。"""
+    expected = _baseline()[case_name]["text"]
     actual = build_via_shell(**CASES[case_name])
-    assert hashlib.sha256(actual.encode("utf-8")).hexdigest() == expected["sha256"]
-    assert actual == expected["text"]
+    assert _strip_language_block(actual) == _strip_language_block(expected)
+
+
+@pytest.mark.parametrize("case_name", sorted(CASES))
+def test_language_block_now_comes_from_the_shared_rule(case_name):
+    """语言段本身换成了共用规则（capture 与 genesis 同源）。"""
+    from memory_garden.policies import language_rule
+
+    actual = build_via_shell(**CASES[case_name])
+    assert language_rule("conversation_capture", indent="     ", first_prefix="   · ") in actual
+    # 旧的内联文本不许再出现
+    assert "用 TA 跟你对话的语言记" not in actual
 
 
 @pytest.mark.parametrize("policy_name", [None, "", "conversation_capture"])
 def test_kernel_default_and_fallbacks_match_baseline_typical(policy_name):
-    """内核层：默认档与「没传」的回落都产出基线文本（称呼参数由本测试自行装配）。
+    """内核层：默认档与「没传」的回落产出同一份文本（除语言段外与基线一致）。
 
     注意未知名不在这里 —— 它现在会抛 UnknownPolicyError，见
     test_memory_garden_policies.py::test_unknown_policy_name_raises。
@@ -107,7 +129,11 @@ def test_kernel_default_and_fallbacks_match_baseline_typical(policy_name):
         policy=policy_name,
         **args,
     )
-    assert text == _baseline()["typical"]["text"]
+    assert _strip_language_block(text) == _strip_language_block(
+        _baseline()["typical"]["text"]
+    )
+    # 三种传法（没传 / 空串 / 显式默认档）必须产出完全同一份
+    assert text == build_via_shell(**CASES["typical"])
 
 
 def _kernel_args() -> dict:

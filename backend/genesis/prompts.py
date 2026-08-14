@@ -129,9 +129,11 @@ grounding:只用这块真实出现的原话。这块太薄/全寒暄 -> 两边�
 FACT_WRITE_PROMPT = """你收到从整段历史抽出的事实候选 digest(+ 可能有 AI persona / memory summary / known_memories)。把该长期留存的写进 IO。
 只写候选真实支持的,绝不编。
 去重:known_memories 里是【已经保存过】的记忆。这些事实别再写一遍——哪怕你换了说法、合并了措辞、或拆/并了句子,只要说的是同一件事,就算重复,【跳过】。只写 known_memories 里【没有】的新事实。注意区分:同一件事换个说法=重复(别写);同一类但具体值不同=不同事实(要写,例:「喜欢美式咖啡」和「喜欢拿铁」是两条、「狗叫蛋子」和「养了金毛」是两条)。
-语言:bucket/threads/summary/content 用素材原文的语言——中文素材就用中文(用「宠物」不是「pets」),别归成英文桶/线索;专有名词/原话保留原文。
+{__LANG__}
 
-桶名收敛(onboarding 一次产很多卡,别让桶太分散):""" + COMMON_BUCKETS_GUIDANCE_V1 + """
+桶名收敛(onboarding 一次产很多卡,别让桶太分散):""".replace(
+    "{__LANG__}", mg_policies.language_rule("history_import")
+) + COMMON_BUCKETS_GUIDANCE_V1 + """
 
 防火墙:
 - 用户档案/关于用户的事实 -> 只能进 memory,绝不成为 agent 的性格/维度/身份(agent_name/dimensions/category)。

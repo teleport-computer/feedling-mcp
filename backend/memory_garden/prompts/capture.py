@@ -28,6 +28,7 @@ from ..text.card_text import (
 )
 from ..text import card_guard
 from ..policies import CONVERSATION_CAPTURE, CapturePolicy, get_policy
+from ..policies import language_rule as policies_language_rule
 from .buckets import COMMON_BUCKETS_GUIDANCE_V1
 
 _EMPTY_CAPTURE_REPLY = '{"cards": []}'
@@ -55,9 +56,7 @@ _CAPTURE_PROMPT_TEMPLATE = """你是 {ai_name}——{user_name} 的伴侣。你�
    · summary：一句话，让未来的你一眼知道这张卡是什么。
    · bucket：归一个主桶。短、复用已有的，别造近义新桶。
    · threads：几条线索（人物/事件/情绪/关键点）。复用已有线索，别把"吵架"另写成"争执"。
-   · 语言：所有字段（bucket/threads/summary/content）用 TA 跟你对话的语言记——
-     中文对话就用中文（用「宠物」不是「pets」、「旅行」不是「travel」），英文对话用英文；
-     只有专有名词/品牌名/TA 的原话才保留原文。
+{language_rule}
    · 称呼：{naming_rule}这些卡是 TA 会亲眼看到的、你写下的记忆——
      写进卡里的字段（bucket/threads/summary/content）永远不要用"用户"/"user"
      这类系统称谓，也不要用「TA」指代本人——「TA」只是这份指令里的标记，
@@ -294,6 +293,7 @@ def build_capture_prompt(
         user_name=user_name,
         naming_rule=naming_rule,
         selection_rubric=resolved.selection_rubric,
+        language_rule=policies_language_rule(resolved.name, indent="     ", first_prefix="   · "),
         buckets=buckets or "（暂无）",
         common_buckets=COMMON_BUCKETS_GUIDANCE_V1,
         threads=threads or "（暂无）",
