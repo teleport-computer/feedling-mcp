@@ -87,6 +87,79 @@ def test_degraded_respects_retry_not_before(monkeypatch):
     assert worker._profile_refresh_due("u", now=now + 61) is True
 
 
+def _failed_profile(
+    *,
+    disposition: str,
+    family: str,
+    retry_not_before: float = 0,
+    count: int = 5,
+    updated: str = "u5",
+):
+    return profile_store.build_profile_document(
+        "u",
+        state="pending",
+        source={"card_count": count, "max_updated_at": updated, "generated_at": ""},
+        last_attempt={
+            "at": _iso(1),
+            "reject_code": "reply_not_json",
+            "attempts": 1,
+            "retry_disposition": disposition,
+            "retry_family": family,
+            "retry_attempts": 1,
+            "retry_not_before": retry_not_before,
+        },
+        seal_text=_seal,
+    )
+
+
+def test_scheduled_profile_refresh_respects_persisted_retry_time(monkeypatch):
+    document = _failed_profile(
+        disposition="scheduled",
+        family="shape",
+        retry_not_before=1060,
+    )
+    monkeypatch.setattr(worker.db, "get_blob_strict", lambda *_args: document)
+
+    assert worker._profile_refresh_due("u", now=1000) is False
+    assert worker._profile_refresh_due("u", now=1061) is True
+
+
+@pytest.mark.parametrize("disposition", ["provider_config", "terminal"])
+def test_non_timed_profile_failure_waits_for_explicit_repair(
+    monkeypatch, disposition
+):
+    document = _failed_profile(
+        disposition=disposition,
+        family="provider_config" if disposition == "provider_config" else "terminal",
+    )
+    monkeypatch.setattr(worker.db, "get_blob_strict", lambda *_args: document)
+    monkeypatch.setattr(
+        worker.db,
+        "memory_profile_source_stats",
+        lambda _uid: pytest.fail("non-timed retry must not query Garden"),
+    )
+
+    assert worker._profile_refresh_due("u", now=2_000_000_000) is False
+
+
+def test_source_change_retry_only_requeues_after_garden_witness_changes(monkeypatch):
+    document = _failed_profile(disposition="source_change", family="source")
+    monkeypatch.setattr(worker.db, "get_blob_strict", lambda *_args: document)
+    monkeypatch.setattr(
+        worker.db,
+        "memory_profile_source_stats",
+        lambda _uid: (5, "u5"),
+    )
+    assert worker._profile_refresh_due("u", now=2_000_000_000) is False
+
+    monkeypatch.setattr(
+        worker.db,
+        "memory_profile_source_stats",
+        lambda _uid: (6, "u6"),
+    )
+    assert worker._profile_refresh_due("u", now=2_000_000_000) is True
+
+
 def test_stale_floor_is_independent_of_dream_setting(monkeypatch):
     now = 2_000_000_000.0
     document = _ok(generated_at=_iso(now - 8 * 86400))

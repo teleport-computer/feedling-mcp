@@ -105,6 +105,7 @@ from model_api_runtime.v2 import model_identity as v2_model_identity
 from model_api_runtime.v2 import web_gate as v2_web_gate
 from model_api_runtime.v2 import prompt_frontier as v2_prompt_frontier
 from model_api_runtime.v2 import profile as v2_profile
+from model_api_runtime.v2 import profile_retry as v2_profile_retry
 from model_api_runtime.v2 import profile_store as v2_profile_store
 from model_api_runtime.v2 import status_stream
 from model_api_runtime.v2 import subagents as v2_subagents
@@ -8483,9 +8484,17 @@ def _profile_refresh_due(user_id: str, *, now: float | None = None) -> bool:
             or str(source.get("max_updated_at") or "") != max_updated_at
         )
     if state != "ok":
-        retry_not_before = float(
-            (document.get("last_attempt") or {}).get("retry_not_before") or 0
-        )
+        attempt = document.get("last_attempt") or {}
+        disposition = str(attempt.get("retry_disposition") or "")
+        if disposition in {"provider_config", "terminal"}:
+            return False
+        if disposition == "source_change":
+            card_count, max_updated_at = db.memory_profile_source_stats(user_id)
+            return (
+                int(source.get("card_count") or 0) != card_count
+                or str(source.get("max_updated_at") or "") != max_updated_at
+            )
+        retry_not_before = float(attempt.get("retry_not_before") or 0)
         return current_time >= retry_not_before
     generated_at = _profile_generated_timestamp(source.get("generated_at"))
     if generated_at <= 0 or current_time - generated_at < _PROFILE_MAX_AGE_SEC:
@@ -8536,6 +8545,8 @@ def _profile_retry_not_before(attempts: int, *, now: float) -> float:
 
 class _ProfileProviderSetupFailure(RuntimeError):
     """Content-free provider-resolution failure routed into profile handling."""
+
+    feedling_error_class = "provider_config"
 
 
 def _profile_failure_code(exc: BaseException) -> str:
@@ -8621,13 +8632,30 @@ async def _run_profile(
         ):
             raise RuntimeModeChanged(f"user rolled back before {effect}")
 
-    async def _metadata_failure(previous: dict, code: str) -> dict:
+    async def _metadata_failure(
+        previous: dict,
+        code: str,
+        *,
+        error_class: str = "",
+    ) -> dict:
         card_count, max_updated_at = await asyncio.to_thread(
             db.memory_profile_source_stats,
             user_id,
         )
         attempts = _profile_attempt_count(previous)
         now_ts = time.time()
+        previous_attempt = previous.get("last_attempt") or {}
+        decision = v2_profile_retry.decide_profile_retry(
+            error_class=str(error_class or ""),
+            reject_code=code,
+            previous_retry_family=str(
+                previous_attempt.get("retry_family") or ""
+            ),
+            previous_retry_attempts=int(
+                previous_attempt.get("retry_attempts") or 0
+            ),
+            now=now_ts,
+        )
         await _fence_profile_write("failure metadata write")
         _report_turn_progress("profile_write_started")
         return v2_profile_store.build_profile_document(
@@ -8642,13 +8670,53 @@ async def _run_profile(
                 "at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
                 "reject_code": code,
                 "attempts": attempts,
-                "retry_not_before": _profile_retry_not_before(
-                    attempts,
-                    now=now_ts,
-                ),
+                "retry_disposition": decision.disposition,
+                "retry_family": decision.retry_family,
+                "retry_attempts": decision.retry_attempts,
+                "retry_not_before": decision.retry_not_before,
             },
             previous=previous,
         )
+
+    async def _settle_failure(document: dict, code: str) -> str:
+        attempt = document.get("last_attempt") or {}
+        disposition = str(attempt.get("retry_disposition") or "")
+        if disposition == "scheduled":
+            retry_not_before = float(attempt.get("retry_not_before") or 0.0)
+            moved = await asyncio.to_thread(
+                jobs_store.reschedule_owned_job,
+                job_id,
+                claimed_by=claimed_by,
+                error=code,
+                available_at=retry_not_before,
+            )
+            if not moved:
+                raise LostJobLease("profile retry ownership lost")
+            await _record_trajectory(
+                trajectory_recorder,
+                "profile_retry",
+                {
+                    "lane": "profile",
+                    "disposition": disposition,
+                    "retry_family": str(attempt.get("retry_family") or ""),
+                    "retry_attempts": int(attempt.get("retry_attempts") or 0),
+                    "retry_not_before": retry_not_before,
+                    "error_code": code,
+                },
+                best_effort=True,
+            )
+            if tm is not None:
+                tm.flush(failed=True, status="profile_retry_scheduled")
+            return "rescheduled"
+        await asyncio.to_thread(
+            jobs_store.mark_failed,
+            job_id,
+            code,
+            claimed_by=claimed_by,
+        )
+        if tm is not None:
+            tm.flush(failed=True, status=code)
+        return "failed"
 
     async def _recompute(previous: dict) -> dict:
         nonlocal terminal_reject
@@ -8695,6 +8763,9 @@ async def _run_profile(
                     "at": now_iso,
                     "reject_code": "",
                     "attempts": attempts,
+                    "retry_disposition": "",
+                    "retry_family": "",
+                    "retry_attempts": 0,
                     "retry_not_before": 0,
                 },
             )
@@ -8739,6 +8810,9 @@ async def _run_profile(
                 "at": now_iso,
                 "reject_code": "",
                 "attempts": attempts,
+                "retry_disposition": "",
+                "retry_family": "",
+                "retry_attempts": 0,
                 "retry_not_before": 0,
             },
             memory_text=generated.fields["memory"],
@@ -8783,15 +8857,7 @@ async def _run_profile(
         if result.status == "cas_failed":
             terminal_reject = "profile_cas_failed"
         if terminal_reject:
-            await asyncio.to_thread(
-                jobs_store.mark_failed,
-                job_id,
-                terminal_reject,
-                claimed_by=claimed_by,
-            )
-            if tm is not None:
-                tm.flush(failed=True, status=terminal_reject)
-            return "failed"
+            return await _settle_failure(result.document, terminal_reject)
         await asyncio.to_thread(
             jobs_store.mark_completed,
             job_id,
@@ -8804,11 +8870,21 @@ async def _run_profile(
         raise
     except Exception as exc:  # noqa: BLE001 — background-only, never surface UI
         code = _profile_failure_code(exc)
+        provider_error_class = str(
+            getattr(exc, "feedling_error_class", "") or ""
+        )
+        exception_type = type(exc).__name__
+        failure_document: dict = {}
         try:
-            await v2_profile_store.update_profile_cas_async(
+            metadata_result = await v2_profile_store.update_profile_cas_async(
                 user_id,
-                lambda previous: _metadata_failure(previous, code),
+                lambda previous: _metadata_failure(
+                    previous,
+                    code,
+                    error_class=provider_error_class,
+                ),
             )
+            failure_document = metadata_result.document
             _report_turn_progress("profile_write_completed")
         except Exception as metadata_exc:  # noqa: BLE001
             log.warning(
@@ -8821,16 +8897,21 @@ async def _run_profile(
             "turn_exception",
             {
                 "lane": "profile",
-                "error_class": type(exc).__name__,
+                "error_class": exception_type,
                 "error_code": code,
+                "retry_disposition": str(
+                    (failure_document.get("last_attempt") or {}).get(
+                        "retry_disposition"
+                    )
+                    or "terminal"
+                ),
             },
             best_effort=True,
         )
+        if failure_document:
+            return await _settle_failure(failure_document, code)
         await asyncio.to_thread(
-            jobs_store.mark_failed,
-            job_id,
-            code,
-            claimed_by=claimed_by,
+            jobs_store.mark_failed, job_id, code, claimed_by=claimed_by
         )
         if tm is not None:
             tm.flush(failed=True, status=code)
@@ -12926,6 +13007,74 @@ async def _run_turn(job: dict, deps: TurnDeps, *, enclave_sem=None) -> str:
                 "attempt_count": job.get("attempt_count", 0),
             },
         )
+        if lane == "profile":
+            raw_profile = await asyncio.to_thread(
+                db.get_blob_strict,
+                user_id,
+                v2_profile_store.PROFILE_BLOB_KIND,
+            )
+            if raw_profile is not None:
+                profile_document = v2_profile_store.validate_profile_document(
+                    raw_profile
+                )
+                attempt = profile_document.get("last_attempt") or {}
+                retry_not_before = float(
+                    attempt.get("retry_not_before") or 0.0
+                )
+                if (
+                    str(attempt.get("retry_disposition") or "") == "scheduled"
+                    and retry_not_before > time.time()
+                ):
+                    renewed = await asyncio.to_thread(
+                        jobs_store.renew_job_lease,
+                        job_id,
+                        claimed_by,
+                        ttl_sec=jobs_store.RUNNING_TTL_SEC,
+                    )
+                    if not renewed:
+                        raise LostJobLease(
+                            "profile retry ownership lost before preflight"
+                        )
+                    retry_code = str(
+                        attempt.get("reject_code") or "profile_retry_scheduled"
+                    )
+                    moved = await asyncio.to_thread(
+                        jobs_store.reschedule_owned_job,
+                        job_id,
+                        claimed_by=claimed_by,
+                        error=retry_code,
+                        available_at=retry_not_before,
+                    )
+                    if not moved:
+                        raise LostJobLease(
+                            "profile retry ownership lost during preflight"
+                        )
+                    await _record_trajectory(
+                        recorder,
+                        "profile_retry",
+                        {
+                            "lane": "profile",
+                            "disposition": "scheduled",
+                            "retry_family": str(
+                                attempt.get("retry_family") or ""
+                            ),
+                            "retry_attempts": int(
+                                attempt.get("retry_attempts") or 0
+                            ),
+                            "retry_not_before": retry_not_before,
+                            "error_code": retry_code,
+                            "preflight": True,
+                        },
+                        best_effort=True,
+                    )
+                    tm.flush(failed=True, status="profile_retry_scheduled")
+                    await _record_trajectory(
+                        recorder,
+                        "turn_terminal",
+                        {"outcome": "rescheduled"},
+                        best_effort=True,
+                    )
+                    return "rescheduled"
         if lane == "maintenance":
             outcome = await process_job(
                 job,

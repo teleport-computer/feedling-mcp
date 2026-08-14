@@ -48,7 +48,7 @@ def test_profile_is_registered_at_background_priority():
     assert jobs_store.LANE_PRIORITY["profile"] == jobs_store.LANE_PRIORITY["dream"]
 
 
-def test_profile_shape_reject_writes_pending_metadata_and_fails_silently(
+def test_profile_shape_reject_writes_pending_metadata_and_reschedules_silently(
     monkeypatch,
 ):
     captured = {}
@@ -66,14 +66,23 @@ def test_profile_shape_reject_writes_pending_metadata_and_fails_silently(
         captured["document"] = document
         return _cas_result(document)
 
-    failed = []
+    rescheduled = []
     monkeypatch.setattr(profile, "generate_profile", _generate)
     monkeypatch.setattr(profile_store, "update_profile_cas_async", _cas)
     monkeypatch.setattr(worker.db, "memory_profile_source_stats", lambda _uid: (1, "u1"))
     monkeypatch.setattr(
         worker.jobs_store,
         "mark_failed",
-        lambda job_id, code, **_kw: failed.append((job_id, code)) or True,
+        lambda *_args, **_kwargs: pytest.fail("retryable profile cannot fail"),
+    )
+    monkeypatch.setattr(worker.jobs_store, "renew_job_lease", lambda *_a, **_kw: True)
+    monkeypatch.setattr(
+        worker.jobs_store,
+        "reschedule_owned_job",
+        lambda job_id, **kwargs: rescheduled.append(
+            (job_id, kwargs["claimed_by"], kwargs["available_at"])
+        )
+        or True,
     )
     monkeypatch.setattr(
         worker.jobs_store,
@@ -98,13 +107,140 @@ def test_profile_shape_reject_writes_pending_metadata_and_fails_silently(
             _deps(),
             object(),
             asyncio.Semaphore(1),
+            claimed_by="heavy-0:g1",
+        )
+    )
+
+    assert status == "rescheduled"
+    assert len(rescheduled) == 1
+    assert rescheduled[0][0:2] == (7, "heavy-0:g1")
+    assert captured["document"]["state"] == "pending"
+    assert captured["document"]["last_attempt"]["reject_code"] == "reply_not_json"
+    assert captured["document"]["last_attempt"]["retry_disposition"] == "scheduled"
+    assert captured["document"]["last_attempt"]["retry_family"] == "shape"
+    assert captured["document"]["last_attempt"]["retry_attempts"] == 1
+    assert rescheduled[0][2] == captured["document"]["last_attempt"][
+        "retry_not_before"
+    ]
+
+
+def test_profile_fourth_consecutive_shape_failure_is_terminal(monkeypatch):
+    previous = profile_store.build_profile_document(
+        "u",
+        state="pending",
+        source={"card_count": 1, "max_updated_at": "u1", "generated_at": ""},
+        last_attempt={
+            "at": "2026-08-14T00:00:00Z",
+            "reject_code": "reply_not_json",
+            "attempts": 3,
+            "retry_disposition": "scheduled",
+            "retry_family": "shape",
+            "retry_attempts": 3,
+            "retry_not_before": 1,
+        },
+        seal_text=lambda _uid, _text: {"body_ct": "ct", "nonce": "n"},
+    )
+    captured = {}
+
+    async def _generate(**_kwargs):
+        return profile.ProfileGenerationResult(
+            fields=None,
+            reject_code="reply_not_json",
+            overlap=None,
+            provider_calls=1,
+        )
+
+    async def _cas(_uid, recompute):
+        document = await recompute(previous)
+        captured["document"] = document
+        return _cas_result(document)
+
+    failed = []
+    monkeypatch.setattr(profile, "generate_profile", _generate)
+    monkeypatch.setattr(profile_store, "update_profile_cas_async", _cas)
+    monkeypatch.setattr(worker.db, "memory_profile_source_stats", lambda _uid: (1, "u1"))
+    monkeypatch.setattr(worker.jobs_store, "renew_job_lease", lambda *_a, **_kw: True)
+    monkeypatch.setattr(
+        worker.jobs_store,
+        "reschedule_owned_job",
+        lambda *_args, **_kwargs: pytest.fail("fourth shape failure is terminal"),
+    )
+    monkeypatch.setattr(
+        worker.jobs_store,
+        "mark_failed",
+        lambda job_id, code, **_kw: failed.append((job_id, code)) or True,
+    )
+
+    status = asyncio.run(
+        worker._run_profile(
+            70,
+            "u",
+            _deps(),
+            object(),
+            asyncio.Semaphore(1),
+            claimed_by="heavy-0:g4",
         )
     )
 
     assert status == "failed"
-    assert failed == [(7, "reply_not_json")]
-    assert captured["document"]["state"] == "pending"
-    assert captured["document"]["last_attempt"]["reject_code"] == "reply_not_json"
+    assert failed == [(70, "reply_not_json")]
+    assert captured["document"]["last_attempt"]["retry_disposition"] == "terminal"
+    assert captured["document"]["last_attempt"]["retry_attempts"] == 4
+
+
+def test_profile_transient_provider_failure_reschedules_exact_job(monkeypatch):
+    captured = {}
+    calls = 0
+    provider_error = worker.provider_client.ProviderError("secret upstream detail")
+    provider_error.feedling_error_class = "transient_exhausted"
+
+    async def _generate(**_kwargs):
+        raise provider_error
+
+    async def _cas(_uid, recompute):
+        nonlocal calls
+        calls += 1
+        document = await recompute({})
+        captured["document"] = document
+        return _cas_result(document)
+
+    rescheduled = []
+    monkeypatch.setattr(profile, "generate_profile", _generate)
+    monkeypatch.setattr(profile_store, "update_profile_cas_async", _cas)
+    monkeypatch.setattr(worker.db, "memory_profile_source_stats", lambda _uid: (1, "u1"))
+    monkeypatch.setattr(worker.jobs_store, "renew_job_lease", lambda *_a, **_kw: True)
+    monkeypatch.setattr(
+        worker.jobs_store,
+        "reschedule_owned_job",
+        lambda job_id, **kwargs: rescheduled.append(
+            (job_id, kwargs["claimed_by"], kwargs["available_at"], kwargs["error"])
+        )
+        or True,
+    )
+    monkeypatch.setattr(
+        worker.jobs_store,
+        "mark_failed",
+        lambda *_args, **_kwargs: pytest.fail("transient profile cannot fail"),
+    )
+
+    status = asyncio.run(
+        worker._run_profile(
+            71,
+            "u",
+            _deps(),
+            object(),
+            asyncio.Semaphore(1),
+            claimed_by="heavy-0:g5",
+        )
+    )
+
+    assert status == "rescheduled"
+    assert calls == 2
+    assert len(rescheduled) == 1
+    assert rescheduled[0][0:2] == (71, "heavy-0:g5")
+    assert rescheduled[0][3] == "profile_generation_failed:providererror"
+    assert captured["document"]["last_attempt"]["retry_disposition"] == "scheduled"
+    assert captured["document"]["last_attempt"]["retry_family"] == "transient"
 
 
 def test_profile_budget_exception_message_is_persisted_as_reject_code(monkeypatch):
@@ -151,7 +287,7 @@ def test_profile_budget_exception_message_is_persisted_as_reject_code(monkeypatc
     )
 
 
-def test_profile_provider_setup_failure_persists_degraded_backoff(monkeypatch):
+def test_profile_provider_setup_failure_waits_for_explicit_repair(monkeypatch):
     previous = profile_store.build_profile_document(
         "u",
         state="ok",
@@ -208,7 +344,13 @@ def test_profile_provider_setup_failure_persists_degraded_backoff(monkeypatch):
     assert captured["document"]["last_attempt"]["reject_code"] == (
         "profile_provider_unavailable:runtimeerror"
     )
-    assert captured["document"]["last_attempt"]["retry_not_before"] > 0
+    assert captured["document"]["last_attempt"]["retry_disposition"] == (
+        "provider_config"
+    )
+    assert captured["document"]["last_attempt"]["retry_family"] == (
+        "provider_config"
+    )
+    assert captured["document"]["last_attempt"]["retry_not_before"] == 0
 
 
 def test_run_turn_routes_profile_provider_resolution_failure_to_handler(monkeypatch):
@@ -249,6 +391,86 @@ def test_run_turn_routes_profile_provider_resolution_failure_to_handler(monkeypa
         "profile_provider_unavailable:runtimeerror"
     )
     assert captured["runtime_token"] == ""
+
+
+def test_recovered_profile_job_honors_persisted_future_retry_before_provider(
+    monkeypatch,
+):
+    retry_at = 2_000_000_000.0
+    document = profile_store.build_profile_document(
+        "u",
+        state="pending",
+        source={"card_count": 1, "max_updated_at": "u1", "generated_at": ""},
+        last_attempt={
+            "at": "2026-08-14T00:00:00Z",
+            "reject_code": "profile_generation_failed:providererror",
+            "attempts": 1,
+            "retry_disposition": "scheduled",
+            "retry_family": "transient",
+            "retry_attempts": 1,
+            "retry_not_before": retry_at,
+        },
+        seal_text=lambda _uid, _text: {"body_ct": "ct", "nonce": "n"},
+    )
+    deps = _deps()
+    deps.resolve_provider = lambda _uid: pytest.fail(
+        "future retry must not resolve/decrypt provider config"
+    )
+    deps.read_profile_cards = lambda *_args: pytest.fail(
+        "future retry must not read Garden cards"
+    )
+    rescheduled = []
+    flushed = []
+
+    class _Metrics:
+        def __init__(self, **_kwargs):
+            pass
+
+        def flush(self, **kwargs):
+            flushed.append(kwargs)
+
+    monkeypatch.setattr(worker, "TurnMetrics", _Metrics)
+    monkeypatch.setattr(worker.time, "time", lambda: retry_at - 60)
+    monkeypatch.setattr(worker.db, "get_blob_strict", lambda *_args: document)
+    monkeypatch.setattr(worker.jobs_store, "renew_job_lease", lambda *_a, **_kw: True)
+    monkeypatch.setattr(
+        worker.jobs_store,
+        "reschedule_owned_job",
+        lambda job_id, **kwargs: rescheduled.append(
+            (job_id, kwargs["claimed_by"], kwargs["available_at"], kwargs["error"])
+        )
+        or True,
+    )
+    monkeypatch.setattr(
+        worker,
+        "process_job",
+        lambda *_args, **_kwargs: pytest.fail(
+            "future retry must not enter process_job"
+        ),
+    )
+
+    status = asyncio.run(
+        worker._run_turn(
+            {
+                "id": 72,
+                "user_id": "u",
+                "lane": "profile",
+                "claimed_by": "heavy-0:g6",
+            },
+            deps,
+        )
+    )
+
+    assert status == "rescheduled"
+    assert rescheduled == [
+        (
+            72,
+            "heavy-0:g6",
+            retry_at,
+            "profile_generation_failed:providererror",
+        )
+    ]
+    assert flushed == [{"failed": True, "status": "profile_retry_scheduled"}]
 
 
 def test_empty_garden_completes_with_zero_provider_calls(monkeypatch):
