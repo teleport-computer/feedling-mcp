@@ -1,33 +1,12 @@
-"""Closed provenance enums shared by memory writers and the public API."""
+"""已搬至 ``memory_garden.types`` —— 此处保留 re-export 以兼容现有 import 路径。
 
-MEMORY_SOURCE_VALUES = frozenset({
-    "bootstrap",
-    "chat",
-    "genesis_import",
-    "genesis_resident_distill",
-    "history_import",
-    "hosted_runtime_state",
-    "live_conversation",
-    "memory_capture",
-    "memory_dream",
-    "memory_migrate",
-    "model_api_capture",
-    "model_api_correction",
-    "model_api_repair",
-    "ombre_brain_sync",
-    "resident_absorb",
-    "resident_patch",
-})
-
-MEMORY_CAPTURE_MODE_VALUES = frozenset({
-    "agent_tool",
-    "genesis_import",
-    "genesis_resident_distill",
-    "memory_capture",
-    "memory_dream",
-    "repair",
-    "state",
-})
-
-RESIDENT_ABSORB_SOURCE = "resident_absorb"
-RESIDENT_PATCH_SOURCE = "resident_patch"
+搬迁背景见 ``docs/MEMORY_GARDEN_EXTRACTION_DESIGN.zh.md``：
+来源枚举属于「卡长什么样」这一层，是内核的一部分。
+"""
+from memory_garden.types import *  # noqa: F401,F403
+from memory_garden.types import (  # noqa: F401
+    MEMORY_CAPTURE_MODE_VALUES,
+    MEMORY_SOURCE_VALUES,
+    RESIDENT_ABSORB_SOURCE,
+    RESIDENT_PATCH_SOURCE,
+)
