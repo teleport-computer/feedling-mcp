@@ -142,7 +142,15 @@ asgi_app.py（装配，最高）
   ↑ db / content_encryption / provider_client / dstack_tls / hosted_runtime /
      semantic_analysis / memory_readside_core / memory_index_selector /
      context_memory_selection（最低；均为无业务依赖的共享/底层模块）
+  ↑ memory_garden（最低；记忆判断力内核，**不 import 任何 io 模块**，
+     由 tests/test_memory_garden_purity.py 的 AST 守卫钉死）
 ```
+
+> `memory_garden` 是被抽出来的纯函数内核（什么值得记 / 怎么归桶 / 打分排序 /
+> 要不要整理 / 解析并算 mutation）。它只依赖标准库，所以天然处在最低层，
+> 被 `memory` / `genesis` / `model_api_runtime` 等上层 import。
+> 加解密、身份装配、锁、审计、调模型一律不在其中 —— 那些由调用方提供。
+> 设计见 `docs/MEMORY_GARDEN_EXTRACTION_DESIGN.zh.md`。
 
 - `routes.py` 可以 import 平级或更低的任何 service；`service.py` 只准向下。
 - **需要「向上」调用时，用注入，不用 import。** 现有范例：
@@ -200,6 +208,20 @@ result = chat_completion(runtime, messages)
 
 - ❌ 不准再造任何全局符号 re-export 门面；新代码直接 import 真正的模块。
 - ❌ 不准新建 `backend/app.py`。
+
+**一个有边界的例外：模块搬家时的路径兼容壳。**
+`memory_garden` 内核提取期间，被搬走的模块在原路径保留了一层 re-export
+（例：`memory/card_text.py` → `memory_garden/text/card_text.py`）。它与被禁的
+`app.py` 门面**不是一回事**：
+
+- 被禁的是**全局符号门面** —— 一个模块 re-export 整个后端的符号，谁都从它拿东西，
+  依赖关系彻底看不见。
+- 这里是**一对一的路径别名** —— 一个壳只转发一个模块，依赖关系不变，
+  只是文件搬了家。目的是让搬迁批次的正常路径逐字节不变，不必一次性改动
+  V1 consumer / V2 worker / genesis / enclave 等分散的调用点。
+
+**它是过渡态，有退出条件**：调用方逐批改成直接 import `memory_garden.*` 之后，
+对应的壳即删除。新代码一律直接 import 内核，不要通过壳。
 
 ---
 
