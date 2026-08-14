@@ -51,6 +51,7 @@ if str(_BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(_BACKEND_DIR))
 
 import db  # noqa: E402
+from model_api_runtime.v2 import enclave_broker  # noqa: E402
 from model_api_runtime.v2 import serve_worker  # noqa: E402 — 见模块 docstring：复用装配层
 from model_api_runtime.v2 import slot_protocol  # noqa: E402
 from model_api_runtime.v2 import worker as v2_worker  # noqa: E402
@@ -152,6 +153,12 @@ async def _run(
             log.warning("[v2.turn_child] add_signal_handler unsupported for %s", sig)
 
     deps = serve_worker.build_production_deps()
+    enclave_sem = enclave_broker.BrokerSemaphore(
+        conn,
+        pool=pool,
+        slot_id=slot_id,
+        slot_generation=slot_generation,
+    )
     # "v2_jobs" 即时唤醒：跟父进程原来的 _serve 一样，wake_event 必须在 running loop 里
     # 创建/绑定。`wire_assembly()`（在 `main()` 里、进入这个协程之前）只负责注册
     # handler，不依赖 running loop——镜像 serve_worker._serve 里同一段注释的说明。
@@ -174,6 +181,7 @@ async def _run(
             progress_cb=_make_progress_cb(conn),
             slot_generation=slot_generation,
             slot_id=slot_id,
+            enclave_sem=enclave_sem,
         )),
         asyncio.create_task(
             _event_loop_heartbeat(
@@ -194,6 +202,7 @@ async def _run(
             if not task.done():
                 task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
+        await enclave_sem.close()
     log.info("[v2.turn_child] drained; exiting worker=%s pid=%s", worker_id, os.getpid())
 
 

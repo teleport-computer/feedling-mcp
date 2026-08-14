@@ -13,7 +13,7 @@ tool-call 行为自然降级。
 
 生产 turn 依赖：
 - resolve_provider：mint 一个 user-scoped runtime token → hosted.config_store 用它 JIT
-  解密 provider key（单次；只留内存，不落库）。enclave-bound（受 worker.ENCLAVE_SEMAPHORE 框住）。
+  解密 provider key（单次；只留内存，不落库）。enclave-bound（受父进程实例级 broker 框住）。
   BYOK-only：`_load_runtime_provider_config` 只从该用户自己的 `model_api_config` 信封解出
   provider key，从不读取/回退任何平台系统 key。
 - mint_enclave_token：签发 enclave-auth runtime_token（scope=envelope_decrypt）。只是 HMAC
@@ -92,6 +92,7 @@ from model_api_runtime.v2 import child_supervisor as v2_child_supervisor
 from model_api_runtime.v2 import claim_recovery as v2_claim_recovery
 from model_api_runtime.v2 import effect_id as v2_effect_id
 from model_api_runtime.v2 import effect_outbox as v2_effect_outbox
+from model_api_runtime.v2 import enclave_broker as v2_enclave_broker
 from model_api_runtime.v2 import jobs_store
 from model_api_runtime.v2 import pool_config as v2_pool_config
 from model_api_runtime.v2 import pool_supervisor as v2_pool_supervisor
@@ -5780,12 +5781,18 @@ async def _serve(worker_id: str, *, poll_interval: float) -> None:
     # the turn-child split: it never lived in the turn slots' event loop.
     genesis = _start_genesis_thread(worker_id)
 
+    enclave_broker = v2_enclave_broker.EnclaveBroker(
+        limit=config.enclave_instance_concurrency,
+        reservations={"foreground": 2, "wake": 1, "heavy": 1},
+        on_grant=lambda _request: None,
+    )
     fleet = v2_pool_supervisor.SlotFleet(
         config,
         spawn_target=turn_child.main,
         worker_id=worker_id,
         poll_interval=poll_interval,
         db_pool_max=2,
+        broker=enclave_broker,
     )
     # Synchronous: spawns the child process + starts the parent-side progress-pipe
     # reader thread. Not an asyncio task — the child runs in its own OS process, so

@@ -233,7 +233,7 @@ def test_run_wake_reply_written_and_job_completed(monkeypatch):
 
     deps = _wake_deps(tail=[{"id": "m1", "ts": 1.0, "role": "user", "content": "hi"}])
     status = asyncio.run(worker._run_wake(
-        job_id, uid, "heartbeat", deps, _BYOK, worker.ENCLAVE_SEMAPHORE, claimed_by))
+        job_id, uid, "heartbeat", deps, _BYOK, asyncio.Semaphore(4), claimed_by))
 
     assert status == "completed"
     assert written == {"text": "hey, how did that go?", "user_id": uid}
@@ -491,7 +491,7 @@ def test_run_wake_reply_push_carries_is_wake_true_and_manual_wake_lane(monkeypat
     )
 
     status = asyncio.run(worker._run_wake(
-        job_id, uid, "manual_wake", deps, _BYOK, worker.ENCLAVE_SEMAPHORE, claimed_by))
+        job_id, uid, "manual_wake", deps, _BYOK, asyncio.Semaphore(4), claimed_by))
 
     assert status == "completed"
     store = core_store.get_store(uid)
@@ -605,7 +605,7 @@ def test_wake_workspace_prompt_snapshot_is_loaded_once_across_rounds(
         "heartbeat",
         deps,
         _BYOK,
-        worker.ENCLAVE_SEMAPHORE,
+        asyncio.Semaphore(4),
         claimed_by,
     ))
 
@@ -662,7 +662,7 @@ def test_wake_workspace_prompt_failure_is_silent_before_provider(
         "heartbeat",
         deps,
         _BYOK,
-        worker.ENCLAVE_SEMAPHORE,
+        asyncio.Semaphore(4),
         claimed_by,
     ))
 
@@ -703,7 +703,7 @@ def test_run_wake_weak_wake_sleeps_no_bubble_no_error(monkeypatch):
         lambda uid, **kw: shadow.append((uid, kw)) or True
     )
     status = asyncio.run(worker._run_wake(
-        job_id, uid, "heartbeat", deps, _BYOK, worker.ENCLAVE_SEMAPHORE, claimed_by))
+        job_id, uid, "heartbeat", deps, _BYOK, asyncio.Semaphore(4), claimed_by))
 
     assert status == "completed"
     assert write_called["n"] == 0
@@ -773,7 +773,7 @@ def test_automatic_heartbeat_with_empty_history_skips_the_provider(monkeypatch):
         lambda uid, **kw: shadow.append((uid, kw)) or True
     )
     status = asyncio.run(worker._run_wake(
-        job_id, uid, "heartbeat", deps, _BYOK, worker.ENCLAVE_SEMAPHORE, claimed_by))
+        job_id, uid, "heartbeat", deps, _BYOK, asyncio.Semaphore(4), claimed_by))
 
     assert status == "completed"
     assert provider_calls == []
@@ -821,7 +821,7 @@ def test_automatic_heartbeat_authoritative_no_user_history_skips_all_prompt_work
     ) or {"trusted_system_blocks": [], "working_memory": ""}
 
     status = asyncio.run(worker._run_wake(
-        job_id, uid, "heartbeat", deps, _BYOK, worker.ENCLAVE_SEMAPHORE, claimed_by))
+        job_id, uid, "heartbeat", deps, _BYOK, asyncio.Semaphore(4), claimed_by))
 
     assert status == "completed"
     assert provider_calls == []
@@ -883,7 +883,7 @@ def test_wake_injects_attention_facts_as_non_user_application_data(monkeypatch):
             "heartbeat",
             deps,
             _BYOK,
-            worker.ENCLAVE_SEMAPHORE,
+            asyncio.Semaphore(4),
             claimed_by,
         )
     )
@@ -940,7 +940,7 @@ def test_run_wake_degenerate_reply_fails_silently(monkeypatch):
             "heartbeat",
             deps,
             _BYOK,
-            worker.ENCLAVE_SEMAPHORE,
+            asyncio.Semaphore(4),
             claimed_by,
         )
     )
@@ -982,7 +982,7 @@ def test_heartbeat_thinking_only_is_successful_silence_without_backoff(
             "heartbeat",
             deps,
             _BYOK,
-            worker.ENCLAVE_SEMAPHORE,
+            asyncio.Semaphore(4),
             claimed_by,
         )
     )
@@ -1016,7 +1016,7 @@ def test_scheduled_thinking_only_remains_a_must_deliver_failure(monkeypatch):
             "scheduled",
             _wake_deps(tail=[]),
             _BYOK,
-            worker.ENCLAVE_SEMAPHORE,
+            asyncio.Semaphore(4),
             claimed_by,
         )
     )
@@ -1075,7 +1075,7 @@ def test_run_scheduled_wake_prompts_with_the_exact_due_reminders(monkeypatch):
         "scheduled",
         deps,
         _BYOK,
-        worker.ENCLAVE_SEMAPHORE,
+        asyncio.Semaphore(4),
         claimed_by,
     ))
 
@@ -1249,7 +1249,7 @@ def test_run_perception_wake_injects_trigger_as_untrusted_runtime_data(monkeypat
         "heartbeat",
         deps,
         _BYOK,
-        worker.ENCLAVE_SEMAPHORE,
+        asyncio.Semaphore(4),
         claimed_by,
     ))
 
@@ -1332,7 +1332,7 @@ def test_broadcast_edge_wake_reply_policy(
             "heartbeat",
             deps,
             _BYOK,
-            worker.ENCLAVE_SEMAPHORE,
+            asyncio.Semaphore(4),
             claimed_by,
         )
     )
@@ -1531,7 +1531,7 @@ def test_ordinary_heartbeat_final_reply_persists_glance_before_finish(
             "heartbeat",
             deps,
             _BYOK,
-            worker.ENCLAVE_SEMAPHORE,
+            asyncio.Semaphore(4),
             claimed_by,
         )
     )
@@ -1747,7 +1747,7 @@ def test_run_perception_wake_hands_late_context_to_successor(monkeypatch):
         "heartbeat",
         deps,
         _BYOK,
-        worker.ENCLAVE_SEMAPHORE,
+        asyncio.Semaphore(4),
         claimed_by,
     ))
 
@@ -1836,7 +1836,7 @@ def test_run_wake_provider_error_silent_mark_failed(monkeypatch):
         lambda uid, **kw: shadow.append((uid, kw)) or True
     )
     status = asyncio.run(worker._run_wake(
-        job_id, uid, "manual_wake", deps, _BYOK, worker.ENCLAVE_SEMAPHORE, claimed_by))
+        job_id, uid, "manual_wake", deps, _BYOK, asyncio.Semaphore(4), claimed_by))
 
     assert status == "failed"
     assert write_called["n"] == 0
@@ -1875,7 +1875,7 @@ def test_run_wake_unexpected_exception_also_silent_mark_failed(monkeypatch):
         lambda *a, **k: surface_called.update(n=surface_called["n"] + 1))
 
     status = asyncio.run(worker._run_wake(
-        job_id, uid, "heartbeat", deps, _BYOK, worker.ENCLAVE_SEMAPHORE, claimed_by))
+        job_id, uid, "heartbeat", deps, _BYOK, asyncio.Semaphore(4), claimed_by))
 
     assert status == "failed"
     assert surface_called["n"] == 0
@@ -1920,7 +1920,7 @@ def test_run_wake_tolerates_missing_read_summary_read_tail(monkeypatch):
     )
 
     status = asyncio.run(worker._run_wake(
-        job_id, uid, "heartbeat", deps, _BYOK, worker.ENCLAVE_SEMAPHORE, claimed_by))
+        job_id, uid, "heartbeat", deps, _BYOK, asyncio.Semaphore(4), claimed_by))
 
     assert status == "completed"
     assert provider_calls == []
@@ -1971,7 +1971,7 @@ def test_run_wake_provider_config_error_sets_payment_cooldown(monkeypatch):
     deps = _wake_deps(tail=[{"id": "m1", "ts": 1.0, "role": "user", "content": "hi"}])
     before = time.time()
     status = asyncio.run(worker._run_wake(
-        job_id, uid, "heartbeat", deps, _BYOK, worker.ENCLAVE_SEMAPHORE, claimed_by))
+        job_id, uid, "heartbeat", deps, _BYOK, asyncio.Semaphore(4), claimed_by))
     after = time.time()
 
     assert status == "failed"
@@ -2019,7 +2019,7 @@ def test_run_wake_rollback_blocks_provider_cooldown_write(monkeypatch):
     deps.runtime_mode_enabled = lambda _uid: next(mode_checks)
 
     status = asyncio.run(worker._run_wake(
-        job_id, uid, "heartbeat", deps, _BYOK, worker.ENCLAVE_SEMAPHORE, claimed_by))
+        job_id, uid, "heartbeat", deps, _BYOK, asyncio.Semaphore(4), claimed_by))
 
     assert status == "failed"
     assert cooldown_calls == []
@@ -2050,7 +2050,7 @@ def test_run_wake_lost_lease_blocks_provider_cooldown_write(monkeypatch):
     )
     status = asyncio.run(worker._run_wake(
         job_id, uid, "heartbeat", deps, _BYOK,
-        worker.ENCLAVE_SEMAPHORE, claimed_by))
+        asyncio.Semaphore(4), claimed_by))
 
     assert status == "failed"
     assert cooldown_calls == []
@@ -2080,7 +2080,7 @@ def test_run_wake_transient_error_does_not_set_payment_cooldown(monkeypatch):
 
     deps = _wake_deps(tail=[{"id": "m1", "ts": 1.0, "role": "user", "content": "hi"}])
     status = asyncio.run(worker._run_wake(
-        job_id, uid, "heartbeat", deps, _BYOK, worker.ENCLAVE_SEMAPHORE, claimed_by))
+        job_id, uid, "heartbeat", deps, _BYOK, asyncio.Semaphore(4), claimed_by))
 
     assert status == "failed"
     assert _job_status(job_id)[0] == "failed"
@@ -2184,7 +2184,7 @@ def test_wake_tells_the_provider_that_an_empty_reply_is_acceptable(monkeypatch):
 
     deps = _wake_deps(tail=[{"id": "m1", "ts": 1.0, "role": "user", "content": "hi"}])
     status = asyncio.run(worker._run_wake(
-        job_id, uid, "heartbeat", deps, _BYOK, worker.ENCLAVE_SEMAPHORE, claimed_by))
+        job_id, uid, "heartbeat", deps, _BYOK, asyncio.Semaphore(4), claimed_by))
 
     # 这一条断言的**主体是 tool_loop**，不是 wake lane 的策略：a0ac5257（V2 空回复
     # 恢复）之后 `run_tool_loop` 对 provider_client 恒传 `require_reply=False`
@@ -2259,7 +2259,7 @@ def test_only_scheduled_wake_demands_a_reply(monkeypatch, lane, expected_require
 
     asyncio.run(worker._run_wake(
         job_id, uid, lane, deps,
-        _BYOK, worker.ENCLAVE_SEMAPHORE, claimed_by))
+        _BYOK, asyncio.Semaphore(4), claimed_by))
     assert deps is not None
 
     assert seen["require_reply"] is expected_require_reply, seen
@@ -2338,7 +2338,7 @@ def test_scheduled_wake_empty_reply_fails_instead_of_completing_silently(monkeyp
     status = asyncio.run(worker._run_wake(
         job_id, uid, "scheduled",
         _wake_deps(tail=[{"id": "m1", "ts": 1.0, "role": "user", "content": "hi"}]),
-        _BYOK, worker.ENCLAVE_SEMAPHORE, claimed_by))
+        _BYOK, asyncio.Semaphore(4), claimed_by))
 
     assert status != "completed", "定时提醒返空竟然算成功了——正是本用例要挡的回归"
     st, last_error = _job_status(job_id)
@@ -2392,7 +2392,7 @@ def test_scheduled_wake_empty_reply_recovers_on_the_correction_retry(monkeypatch
     status = asyncio.run(worker._run_wake(
         job_id, uid, "scheduled",
         _wake_deps(tail=[{"id": "m1", "ts": 1.0, "role": "user", "content": "hi"}]),
-        _BYOK, worker.ENCLAVE_SEMAPHORE, claimed_by))
+        _BYOK, asyncio.Semaphore(4), claimed_by))
 
     assert status == "completed", _job_status(job_id)
     assert written.get("text") == "该喝水啦"
@@ -2443,7 +2443,7 @@ def test_wake_lanes_without_fresh_text_ask_for_alwayson_only(monkeypatch, lane):
 
     status = asyncio.run(worker._run_wake(
         job_id, uid, lane, _wake_deps_with_worldbook(seen),
-        _BYOK, worker.ENCLAVE_SEMAPHORE, claimed_by))
+        _BYOK, asyncio.Semaphore(4), claimed_by))
 
     assert status == "completed", _job_status(job_id)
     assert seen.get("n") == 1, f"{lane} 没有去取世界书: {seen}"
@@ -2482,7 +2482,7 @@ def test_scheduled_wake_matches_the_reminder_note(monkeypatch):
     })
 
     status = asyncio.run(worker._run_wake(
-        job_id, uid, "scheduled", deps, _BYOK, worker.ENCLAVE_SEMAPHORE, claimed_by))
+        job_id, uid, "scheduled", deps, _BYOK, asyncio.Semaphore(4), claimed_by))
 
     assert status == "completed", _job_status(job_id)
     contents = [m.get("content") for m in seen.get("messages") or []]
@@ -2506,7 +2506,7 @@ def test_worldbook_failure_does_not_kill_the_wake(monkeypatch):
 
     status = asyncio.run(worker._run_wake(
         job_id, uid, "heartbeat", _wake_deps_with_worldbook(seen, boom=True),
-        _BYOK, worker.ENCLAVE_SEMAPHORE, claimed_by))
+        _BYOK, asyncio.Semaphore(4), claimed_by))
 
     assert status == "completed", _job_status(job_id)
     assert written.get("text") == "在想你呢"

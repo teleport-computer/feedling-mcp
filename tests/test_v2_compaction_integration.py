@@ -313,7 +313,7 @@ def test_checkpoint_failure_must_not_block_the_fold(monkeypatch):
     assert job is not None and job["id"] == job_id
 
     status = asyncio.run(worker._run_compaction(
-        job_id, uid, deps, _BYOK, worker.ENCLAVE_SEMAPHORE,
+        job_id, uid, deps, _BYOK, asyncio.Semaphore(4),
         claimed_by=str(job["claimed_by"])))
 
     # The fold ran despite the checkpoint failing, and the watermark moved.
@@ -480,7 +480,7 @@ def test_refused_fold_shrinks_instead_of_reporting_success(monkeypatch):
     assert job is not None and job["id"] == job_id
 
     status = asyncio.run(worker._run_compaction(
-        job_id, uid, deps, _BYOK, worker.ENCLAVE_SEMAPHORE,
+        job_id, uid, deps, _BYOK, asyncio.Semaphore(4),
         claimed_by=str(job["claimed_by"])))
 
     row = jobs_store.get_summary_row(uid)
@@ -744,7 +744,7 @@ def test_a_shrunk_fold_is_remembered_by_the_next_job(monkeypatch):
         job = jobs_store.claim_next_job("compaction-test")
         assert job is not None
         return asyncio.run(worker._run_compaction(
-            job_id, uid, deps, _BYOK, worker.ENCLAVE_SEMAPHORE,
+            job_id, uid, deps, _BYOK, asyncio.Semaphore(4),
             claimed_by=str(job["claimed_by"])))
 
     _run_one_job()

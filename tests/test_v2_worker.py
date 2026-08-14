@@ -521,7 +521,7 @@ def test_process_job_acquires_enclave_semaphore_for_read_messages_and_prefetch(m
 def test_coalesce_inputs_and_cap_data_tolerate_enclave_sem_none(monkeypatch):
     """Direct unit coverage of the `enclave_sem is None` guard added to the two
     newly-wrapped helpers (mirrors executor._run_one's tolerance): calling them
-    with no semaphore at all — not even process_job's ENCLAVE_SEMAPHORE default
+    with no semaphore at all — not even process_job's private direct-call default
     substitution — must not raise."""
     uid = "u_w_semaphore_none"
     conftest.seed_user(uid)
@@ -1335,7 +1335,8 @@ def test_run_worker_loop_propagates_unexpected_slot_exit(monkeypatch):
 def test_bounded_gates_exist():
     assert isinstance(worker.MAX_WORKERS, int) and worker.MAX_WORKERS >= 1
     assert isinstance(worker.MAX_READ_ACTION_PARALLELISM, int)
-    assert isinstance(worker.ENCLAVE_SEMAPHORE, asyncio.Semaphore)
+    assert not hasattr(worker, "ENCLAVE_SEMAPHORE")
+    assert isinstance(worker._new_direct_enclave_gate(), asyncio.Semaphore)
 
 
 @pytest.mark.parametrize("raw", ["0", "-1", "nan", "nope"])

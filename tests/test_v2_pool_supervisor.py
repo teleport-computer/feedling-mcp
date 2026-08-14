@@ -11,7 +11,16 @@ from model_api_runtime.v2 import (
 class _FakeSupervisor:
     next_pid = 1000
 
-    def __init__(self, target, *, liveness_timeout_sec, spawn_args):
+    def __init__(
+        self,
+        target,
+        *,
+        liveness_timeout_sec,
+        spawn_args,
+        broker=None,
+        pool="",
+        slot_id="",
+    ):
         self.target = target
         self.liveness_timeout_sec = liveness_timeout_sec
         self.spawn_args = spawn_args

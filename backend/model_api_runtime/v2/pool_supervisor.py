@@ -7,7 +7,12 @@ import threading
 from dataclasses import dataclass
 from typing import Callable
 
-from model_api_runtime.v2 import child_supervisor, pool_config, slot_protocol
+from model_api_runtime.v2 import (
+    child_supervisor,
+    enclave_broker,
+    pool_config,
+    slot_protocol,
+)
 
 
 @dataclass(frozen=True, order=True)
@@ -25,6 +30,7 @@ class SlotFleet:
         worker_id: str,
         poll_interval: float,
         db_pool_max: int = 2,
+        broker: enclave_broker.EnclaveBroker | None = None,
         supervisor_factory=child_supervisor.ChildSupervisor,
     ) -> None:
         self.config = config
@@ -45,7 +51,12 @@ class SlotFleet:
                     tuple(sorted(spec.lanes)),
                     int(db_pool_max),
                 ),
+                broker=broker,
+                pool=spec.pool,
+                slot_id=spec.slot_id,
             )
+        if broker is not None:
+            broker.set_on_grant(self._grant_enclave)
 
     def keys(self) -> tuple[SlotKey, ...]:
         return tuple(self._supervisors)
@@ -110,3 +121,7 @@ class SlotFleet:
             if bool(liveness.get("alive")) and age <= float(stale_sec):
                 healthy += 1
         return healthy
+
+    def _grant_enclave(self, request: enclave_broker.EnclaveRequest) -> None:
+        for supervisor in self._supervisors.values():
+            supervisor.grant_enclave(request)

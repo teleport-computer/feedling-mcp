@@ -19,6 +19,7 @@ import time
 import pytest
 
 from model_api_runtime.v2 import child_supervisor as child_supervisor_module
+from model_api_runtime.v2 import enclave_broker
 from model_api_runtime.v2 import slot_protocol
 from model_api_runtime.v2.child_supervisor import ChildSupervisor
 
@@ -177,6 +178,47 @@ def test_supervisor_snapshot_preserves_identity_and_discards_late_generation():
     sup._handle_message(slot_protocol.encode_message(late))
 
     assert sup.snapshot() == current
+
+
+def test_supervisor_routes_duplex_enclave_grant_and_release_by_generation():
+    parent, child = multiprocessing.Pipe(duplex=True)
+    broker = enclave_broker.EnclaveBroker(
+        limit=4,
+        reservations={"foreground": 2, "wake": 1, "heavy": 1},
+        on_grant=lambda _request: None,
+    )
+    sup = ChildSupervisor(
+        _fake_target_idle_only,
+        liveness_timeout_sec=5.0,
+        broker=broker,
+        pool="foreground",
+        slot_id="foreground-0",
+    )
+    sup._slot_generation = "g7"
+    sup._read_conn = parent
+    broker.set_on_grant(sup.grant_enclave)
+    request = enclave_broker.EnclaveRequest(
+        "r1", "foreground", "foreground-0", "g7"
+    )
+    try:
+        sup._handle_message(enclave_broker.acquire_message(request))
+        assert enclave_broker.decode_grant_message(child.recv()) == ("r1", "g7")
+        assert broker.snapshot()["total_granted"] == 1
+
+        sup._handle_message(enclave_broker.release_message("r1", "g7"))
+        assert broker.snapshot()["total_granted"] == 0
+
+        sup._handle_message(
+            enclave_broker.acquire_message(
+                enclave_broker.EnclaveRequest(
+                    "late", "foreground", "foreground-0", "g6"
+                )
+            )
+        )
+        assert broker.snapshot()["total_granted"] == 0
+    finally:
+        parent.close()
+        child.close()
 
 
 def test_healthy_child_reports_alive_with_fresh_progress():

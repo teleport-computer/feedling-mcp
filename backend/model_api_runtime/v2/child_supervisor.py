@@ -63,7 +63,7 @@ import time
 import uuid
 from typing import Any, Callable
 
-from model_api_runtime.v2 import slot_protocol
+from model_api_runtime.v2 import enclave_broker, slot_protocol
 
 log = logging.getLogger("feedling.runtime_v2.child_supervisor")
 
@@ -86,11 +86,17 @@ class ChildSupervisor:
         *,
         liveness_timeout_sec: float,
         spawn_args: tuple[Any, ...] = (),
+        broker: enclave_broker.EnclaveBroker | None = None,
+        pool: str = "",
+        slot_id: str = "",
     ) -> None:
         self._spawn_target = spawn_target
         self.liveness_timeout_sec = float(liveness_timeout_sec)
         self._spawn_args = tuple(spawn_args)
         self._ctx = mp.get_context("spawn")
+        self._broker = broker
+        self._pool = str(pool)
+        self._slot_id = str(slot_id)
 
         self._lock = threading.Lock()
         self._proc: mp.process.BaseProcess | None = None
@@ -120,7 +126,7 @@ class ChildSupervisor:
         可重复调用（`kill_and_respawn` 内部就是 kill 完再调一次这个）——每次都是全新
         的 Pipe + 全新的 Process，不复用上一代子进程的任何状态。
         """
-        read_conn, write_conn = mp.Pipe(duplex=False)
+        read_conn, write_conn = mp.Pipe(duplex=True)
         slot_generation = uuid.uuid4().hex
         proc = self._ctx.Process(
             target=self._spawn_target,
@@ -226,6 +232,7 @@ class ChildSupervisor:
         with self._lock:
             snapshot = self._snapshot
             active_job = None if snapshot is None else snapshot.active_job
+            dead_generation = self._slot_generation
         self._stop_reader()
         proc = self._proc
         if proc is not None:
@@ -247,6 +254,8 @@ class ChildSupervisor:
             self._slot_generation = uuid.uuid4().hex
             self._snapshot = None
             self._turn_progress_at = None
+        if self._broker is not None and dead_generation:
+            self._broker.drop_generation(dead_generation)
         return active_job
 
     def kill_and_respawn(self, *, join_timeout: float = 5.0) -> None:
@@ -271,6 +280,7 @@ class ChildSupervisor:
             if self._snapshot != expected:
                 return False
             proc = self._proc
+            dead_generation = self._slot_generation
             try:
                 if proc is not None and proc.is_alive():
                     log.warning(
@@ -285,6 +295,8 @@ class ChildSupervisor:
             self._slot_generation = uuid.uuid4().hex
             self._snapshot = None
             self._turn_progress_at = None
+        if self._broker is not None and dead_generation:
+            self._broker.drop_generation(dead_generation)
         self._stop_reader()
         if proc is not None:
             try:
@@ -299,6 +311,8 @@ class ChildSupervisor:
         join；超时仍活着才升级成 SIGKILL。父进程 `_serve` 的 finally/stop_event 路径调
         这个，不是 `kill_and_respawn`——那个是 watchdog 专用的"不管三七二十一先杀死"。
         """
+        with self._lock:
+            dead_generation = self._slot_generation
         self._stop_reader()
         proc = self._proc
         if proc is not None:
@@ -317,32 +331,91 @@ class ChildSupervisor:
         self._close_read_conn()
         with self._lock:
             self._proc = None
+        if self._broker is not None and dead_generation:
+            self._broker.drop_generation(dead_generation)
         log.info("[v2.child_supervisor] stopped")
+
+    def grant_enclave(self, request: enclave_broker.EnclaveRequest) -> None:
+        """Deliver a broker grant only to the matching live slot generation."""
+        with self._lock:
+            if (
+                request.slot_generation != self._slot_generation
+                or request.pool != self._pool
+                or request.slot_id != self._slot_id
+                or self._read_conn is None
+            ):
+                return
+            try:
+                self._read_conn.send(
+                    enclave_broker.grant_message(
+                        request.request_id, request.slot_generation
+                    )
+                )
+            except (BrokenPipeError, EOFError, OSError, ValueError):
+                return
 
     # -- progress pipe reader -------------------------------------------------
 
     def _drain_loop(self) -> None:
         conn = self._read_conn
-        while not self._reader_stop.is_set():
-            try:
-                ready = conn.poll(_POLL_TIMEOUT_SEC)
-            except (OSError, EOFError, ValueError, BrokenPipeError):
-                return
-            if not ready:
-                continue
-            try:
-                msg = conn.recv()
-            except (EOFError, OSError, BrokenPipeError):
-                # 子进程退出/写端关闭——没有更多消息可读了，安静退出这个线程；
-                # poll_liveness() 的 alive 字段会随 proc.is_alive() 自然翻false，
-                # age 字段则从这一刻起只会单调增长，两者共同反映出"子进程没了"。
-                return
-            except Exception as e:  # noqa: BLE001 — 单条畸形消息不能打死整个 reader 线程
-                log.warning("[v2.child_supervisor] malformed progress message: %s", e)
-                continue
-            self._handle_message(msg)
+        try:
+            while not self._reader_stop.is_set():
+                try:
+                    ready = conn.poll(_POLL_TIMEOUT_SEC)
+                except (OSError, EOFError, ValueError, BrokenPipeError):
+                    return
+                if not ready:
+                    continue
+                try:
+                    msg = conn.recv()
+                except (EOFError, OSError, BrokenPipeError):
+                    # 子进程退出/写端关闭——没有更多消息可读了，安静退出这个线程；
+                    # poll_liveness() 的 alive 字段会随 proc.is_alive() 自然翻false，
+                    # age 字段则从这一刻起只会单调增长，两者共同反映出"子进程没了"。
+                    return
+                except Exception as e:  # noqa: BLE001 — 单条畸形消息不能打死整个 reader 线程
+                    log.warning("[v2.child_supervisor] malformed progress message: %s", e)
+                    continue
+                self._handle_message(msg)
+        finally:
+            with self._lock:
+                proc = self._proc
+                generation = self._slot_generation
+            if (
+                self._broker is not None
+                and generation
+                and proc is not None
+                and not proc.is_alive()
+            ):
+                self._broker.drop_generation(generation)
 
     def _handle_message(self, msg: Any) -> None:
+        broker_message = enclave_broker.decode_child_message(msg)
+        if broker_message is not None:
+            if self._broker is None:
+                return
+            action, payload = broker_message
+            if action == "acquire":
+                request = payload
+                with self._lock:
+                    valid = (
+                        request.slot_generation == self._slot_generation
+                        and request.pool == self._pool
+                        and request.slot_id == self._slot_id
+                    )
+                if valid:
+                    self._broker.request(request)
+                return
+            request_id, generation = payload
+            with self._lock:
+                valid = generation == self._slot_generation
+            if not valid:
+                return
+            if action == "release":
+                self._broker.release(request_id, generation)
+            else:
+                self._broker.cancel(request_id, generation)
+            return
         try:
             decoded = slot_protocol.decode_message(msg)
         except (TypeError, ValueError):

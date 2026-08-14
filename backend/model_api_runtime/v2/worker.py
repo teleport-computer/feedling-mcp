@@ -24,7 +24,7 @@ this module so the worker never imports the hosted layer.
 并发：asyncio 事件循环 + asyncio.to_thread 把同步 jobs_store/enclave 调用移出 loop。
 四种 provider wire 全部 await 原生 async HTTP transport；provider 并发不再受默认线程池
 大小限制。
-ENCLAVE_SEMAPHORE 框住 turn 里所有 enclave-bound 调用（provider-key 解密 + 逐条 chat 解密
+父进程实例级 Enclave broker 框住 turn 里所有 enclave-bound 调用（provider-key 解密 + 逐条 chat 解密
 + capability 调用），治 spec R3。enclave 不是单线程（prod = 4 个 gunicorn worker，每个
 32 线程解密池），但它是全系统共享、容量有限、且解密 GIL-bound 的代理——多 worker 齐打
 照样会放大 502，闸门因此仍然必要。
@@ -539,9 +539,15 @@ HISTORY_TURN_MAX_ROWS = _positive_int_env("FEEDLING_V2_HISTORY_TURN_MAX_ROWS", "
 HISTORY_TURN_MAX_WALL_SEC = _positive_float_env(
     "FEEDLING_V2_HISTORY_TURN_MAX_WALL_SEC", "8"
 )
-# 跨所有 job 共享的 enclave 并发闸（provider-key 解密 + chat 解密 + capability 调用都过它）。治 R3。
-ENCLAVE_CONCURRENCY = _positive_int_env("FEEDLING_V2_ENCLAVE_CONCURRENCY", "2")
-ENCLAVE_SEMAPHORE = asyncio.Semaphore(ENCLAVE_CONCURRENCY)
+# Production children receive one instance-wide broker-backed gate from
+# ``turn_child``. Direct helper tests that omit a gate get a private one below;
+# no process-global permit count is multiplied across isolated slot processes.
+_DEFAULT_ENCLAVE_GATE = object()
+
+
+def _new_direct_enclave_gate():
+    """Compatibility gate for direct helper calls outside the slot runtime."""
+    return asyncio.Semaphore(1)
 
 
 def _reserved_lane_slots(max_workers: int, reserved: int | None = None) -> list:
@@ -3222,6 +3228,7 @@ async def _run_trajectory_review_turn(
     job: dict,
     deps: TurnDeps,
     tm: TurnMetrics,
+    enclave_sem=None,
 ) -> str:
     """Offline failure review with a deliberately absent side-effect surface.
 
@@ -3230,6 +3237,8 @@ async def _run_trajectory_review_turn(
     workspace writer to accidentally invoke. The provider receives tools=None
     exactly once; its encrypted analysis is stored only on the review row.
     """
+    if enclave_sem is None:
+        enclave_sem = _new_direct_enclave_gate()
     job_id = job["id"]
     user_id = str(job["user_id"])
     claimed_by = str(job.get("claimed_by") or "")
@@ -3306,7 +3315,7 @@ async def _run_trajectory_review_turn(
             raise RuntimeError("trajectory_codec_unavailable")
 
         _report_turn_progress("trajectory_review_provider_resolve_start")
-        async with ENCLAVE_SEMAPHORE:
+        async with enclave_sem:
             provider_config, _meta = await asyncio.to_thread(
                 deps.resolve_provider,
                 user_id,
@@ -3337,7 +3346,7 @@ async def _run_trajectory_review_turn(
         decoded_events: list[dict] = []
         for row in rows:
             await _review_fence("trajectory_review_decrypt_start")
-            async with ENCLAVE_SEMAPHORE:
+            async with enclave_sem:
                 plaintext = await asyncio.to_thread(
                     deps.open_trajectory_payload,
                     user_id,
@@ -3656,7 +3665,7 @@ def _make_fold_new_messages(
     user_id: str,
     deps: TurnDeps,
     cursor_box: dict,
-    enclave_sem: "asyncio.Semaphore | None" = ENCLAVE_SEMAPHORE,
+    enclave_sem=_DEFAULT_ENCLAVE_GATE,
     *,
     prompt_through_seq: int | None = None,
 ) -> Callable[[], Awaitable[list[dict]]]:
@@ -3681,9 +3690,9 @@ def _make_fold_new_messages(
     R3). This closure must do the same: it is called once per round by
     `tool_loop.run_tool_loop`, which `await`s it, so calling the sync reader directly here
     (no thread offload, no semaphore) would block the loop thread for the enclave round-trip
-    AND let concurrent workers hit the shared, capacity-bounded enclave ungated. `enclave_sem` defaults
-    to the module-level `ENCLAVE_SEMAPHORE` (the same shared gate `process_job` uses); tests
-    that want to exercise the closure with no gating pass `enclave_sem=None` (mirrors
+    AND let concurrent workers hit the shared, capacity-bounded enclave ungated. Production
+    passes the broker-backed turn gate explicitly; direct tests get a private gate unless they
+    pass `enclave_sem=None` to exercise the no-gate compatibility path (mirrors
     `_coalesce_inputs`/`_cap_data`'s own `enclave_sem is None` no-gate tolerance).
 
     `cursor_box` is a mutable `{"seq": int, "ts": float}` dict the caller owns and shares with
@@ -3708,6 +3717,9 @@ def _make_fold_new_messages(
     tie or a late-arriving earlier-ts message could strand a message below the boundary
     forever; that ts fragility is exactly the D5 no-reply bug this seq wiring fixes).
     """
+
+    if enclave_sem is _DEFAULT_ENCLAVE_GATE:
+        enclave_sem = _new_direct_enclave_gate()
 
     async def fold_new_messages() -> list[dict]:
         seq_native = "seq" in cursor_box
@@ -8342,7 +8354,7 @@ async def _run_wake(
         # block above: `_cap_data` acquires enclave_sem ITSELF (see its body), and
         # asyncio.Semaphore is NOT reentrant. Nesting it inside another
         # `async with enclave_sem` deadlocks whenever the semaphore value is 1
-        # (FEEDLING_V2_ENCLAVE_CONCURRENCY defaults to 2, so a naive test would pass
+        # (a gate wider than one would hide this, so a naive test would pass
         # while production wedges wherever the value is 1). The gate still bounds the
         # call — _cap_data holds the semaphore for its own turn.
         grounding_results = None
@@ -11188,7 +11200,7 @@ async def process_job(
     的终态 flush 点仍然生效。
     """
     if enclave_sem is None:
-        enclave_sem = ENCLAVE_SEMAPHORE
+        enclave_sem = _new_direct_enclave_gate()
     if read_parallelism is None:
         read_parallelism = MAX_READ_ACTION_PARALLELISM
 
@@ -13977,7 +13989,7 @@ async def process_job(
                 )
 
 
-async def _run_turn(job: dict, deps: TurnDeps) -> str:
+async def _run_turn(job: dict, deps: TurnDeps, *, enclave_sem=None) -> str:
     """把一个已 claim 的 job 交给 `process_job` 之前，先做一次性的 enclave-bound 解析：
     单次解密 BYOK provider key（single-decrypt-per-turn）+ 铸一个
     enclave-auth runtime_token。resolve_provider 失败（未配置/解密失败等）直接 mark_failed，
@@ -13987,6 +13999,8 @@ async def _run_turn(job: dict, deps: TurnDeps) -> str:
     whole-turn 累加器在这里创建（早于 `process_job`——provider 解析失败时根本不会进
     `process_job`，那次失败仍需要一行 v2_turn_metrics），再原样传给 `process_job`
     复用（同一个 job 只有一行，不会因为累加器实例不同而分裂成两次 upsert）。"""
+    if enclave_sem is None:
+        enclave_sem = _new_direct_enclave_gate()
     job_id = job["id"]
     user_id = str(job["user_id"])
     claimed_by = str(job.get("claimed_by") or "")
@@ -14018,7 +14032,7 @@ async def _run_turn(job: dict, deps: TurnDeps) -> str:
             )
 
     if lane == _TRAJECTORY_REVIEW_LANE:
-        return await _run_trajectory_review_turn(job, deps, tm)
+        return await _run_trajectory_review_turn(job, deps, tm, enclave_sem)
     if lane in _EXTRACTION_LANES:
         try:
             if await asyncio.to_thread(kill_switch.turns_halted):
@@ -14208,7 +14222,7 @@ async def _run_turn(job: dict, deps: TurnDeps) -> str:
             },
         )
         try:
-            async with ENCLAVE_SEMAPHORE:
+            async with enclave_sem:
                 provider_config, _meta = await asyncio.to_thread(
                     deps.resolve_provider, user_id
                 )
@@ -14268,6 +14282,7 @@ async def _run_turn(job: dict, deps: TurnDeps) -> str:
             provider_config=provider_config,
             api_key=None,
             runtime_token=runtime_token,
+            enclave_sem=enclave_sem,
             tm=tm,
             trajectory_recorder=recorder,
         )
@@ -14384,6 +14399,7 @@ async def _slot_loop(
     slot_id: str = "slot-0",
     slot_generation: str = "g0",
     progress_cb: "Callable[[slot_protocol.SlotProgress], None] | None" = None,
+    enclave_sem=None,
 ) -> None:
     """一个 job-slot：抢一个 job 就跑一回合，抢不到就等待（poll_interval 兜底，
     wake_event 命中时立刻醒——见 `_wait_for_job_or_stop`）。stop_event 置位后不再抢新活，
@@ -14477,7 +14493,10 @@ async def _slot_loop(
 
             progress_token = _TURN_PROGRESS_CB.set(_active_turn_progress)
             try:
-                await _run_turn(job, deps)
+                if enclave_sem is None:
+                    await _run_turn(job, deps)
+                else:
+                    await _run_turn(job, deps, enclave_sem=enclave_sem)
             finally:
                 _TURN_PROGRESS_CB.reset(progress_token)
             _signal_progress("durable_completion", turn_start)
