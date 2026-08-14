@@ -122,9 +122,7 @@ def test_db_action_v2_voice_revision_supersedes_partial_without_reenqueuing_retr
         "live_worker_capacity",
         lambda **_kw: 1,
     )
-    monkeypatch.setattr(
-        chat_send_core.jobs_store, "inflight_job_count", lambda **kw: 0
-    )
+    monkeypatch.setattr(chat_send_core.jobs_store, "inflight_job_count", lambda: 0)
     monkeypatch.setattr(
         chat_send_core.jobs_store,
         "recent_mean_service_sec",
@@ -304,9 +302,7 @@ def test_db_action_v2_input_write_failure_never_enqueues(monkeypatch):
     monkeypatch.setattr(chat_send_core.agent_runtime_cutover, "resolve_driver", lambda cfg: "claude")
     monkeypatch.setattr(chat_send_core.jobs_store, "workers_alive", lambda **kw: True)
     monkeypatch.setattr(chat_send_core.jobs_store, "live_worker_capacity", lambda **kw: 1)
-    monkeypatch.setattr(
-        chat_send_core.jobs_store, "inflight_job_count", lambda **kw: 0
-    )
+    monkeypatch.setattr(chat_send_core.jobs_store, "inflight_job_count", lambda: 0)
     monkeypatch.setattr(chat_send_core.jobs_store, "recent_mean_service_sec", lambda **kw: None)
 
     def _fail_append(*args, **kwargs):
@@ -404,13 +400,7 @@ def test_db_action_v2_over_sla_admission_rejects_before_persist(monkeypatch):
     # 1 worker, 999 in-flight, no history (falls back to the 20s default
     # service time) → est_wait = ceil(999/1)*20 = 19980s, far over the 60s SLA.
     monkeypatch.setattr(chat_send_core.jobs_store, "live_worker_capacity", lambda **kw: 1)
-    def _foreground_inflight(*, lanes):
-        assert lanes == {"chat", "manual_wake"}
-        return 999
-
-    monkeypatch.setattr(
-        chat_send_core.jobs_store, "inflight_job_count", _foreground_inflight
-    )
+    monkeypatch.setattr(chat_send_core.jobs_store, "inflight_job_count", lambda: 999)
     monkeypatch.setattr(chat_send_core.jobs_store, "recent_mean_service_sec", lambda **kw: None)
 
     enqueue_called = {"n": 0}
@@ -458,8 +448,7 @@ def test_db_action_v2_admission_check_fails_open_on_exception(monkeypatch):
     monkeypatch.setattr(chat_send_core.jobs_store, "workers_alive", lambda **kw: True)
     monkeypatch.setattr(chat_send_core.jobs_store, "live_worker_capacity", lambda **kw: 1)
 
-    def _boom(*, lanes):
-        assert lanes == {"chat", "manual_wake"}
+    def _boom():
         raise RuntimeError("db hiccup")
 
     monkeypatch.setattr(chat_send_core.jobs_store, "inflight_job_count", _boom)
@@ -505,13 +494,7 @@ def test_db_action_v2_admission_admits_under_sla(monkeypatch):
     monkeypatch.setattr(chat_send_core.agent_runtime_cutover, "resolve_driver", lambda cfg: "claude")
     monkeypatch.setattr(chat_send_core.jobs_store, "workers_alive", lambda **kw: True)
     monkeypatch.setattr(chat_send_core.jobs_store, "live_worker_capacity", lambda **kw: 1)
-    def _foreground_inflight(*, lanes):
-        assert lanes == {"chat", "manual_wake"}
-        return 0
-
-    monkeypatch.setattr(
-        chat_send_core.jobs_store, "inflight_job_count", _foreground_inflight
-    )
+    monkeypatch.setattr(chat_send_core.jobs_store, "inflight_job_count", lambda: 0)
     monkeypatch.setattr(chat_send_core.jobs_store, "recent_mean_service_sec", lambda **kw: None)
 
     notified = {}

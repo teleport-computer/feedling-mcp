@@ -315,11 +315,6 @@ jobs:
             tests/test_wake_support_indexes_migration.py \
             tests/test_v2_jobs_migration.py \
             tests/test_v2_jobs_store.py \
-            tests/test_v2_enclave_broker.py \
-            tests/test_v2_job_lease_fencing.py \
-            tests/test_v2_pool_config.py \
-            tests/test_v2_pool_fault_injection.py \
-            tests/test_v2_pool_supervisor.py \
             tests/test_capture_prompt_v1.py \
             tests/test_data_track_runtime_view.py \
             tests/test_data_track_ops_views.py \

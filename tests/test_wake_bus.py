@@ -13,8 +13,6 @@ import subprocess
 import sys
 from pathlib import Path
 
-import pytest
-
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
 from core import wake_bus
@@ -22,83 +20,6 @@ from core import wake_bus
 
 def _reset_handlers():
     wake_bus._extra_handlers.clear()
-    wake_bus._job_cancel_handlers.clear()
-
-
-def test_job_cancellation_codec_round_trip():
-    event = wake_bus.JobCancellation(
-        job_id=3694,
-        claimed_by="worker:heavy:0:g7",
-        reason="preempted_by_chat",
-    )
-
-    assert wake_bus.JobCancellation.from_payload(event.to_payload()) == event
-
-
-@pytest.mark.parametrize(
-    "payload",
-    [
-        {},
-        {"j": 0, "b": "worker", "r": "preempted_by_chat"},
-        {"j": "3694", "b": "worker", "r": "preempted_by_chat"},
-        {"j": 3694, "b": "", "r": "preempted_by_chat"},
-        {"j": 3694, "b": "worker", "r": ""},
-        {"j": 3694, "b": "worker", "r": "preempted_by_chat", "x": 1},
-        {"j": 3694, "b": "w" * 201, "r": "preempted_by_chat"},
-        {"j": 3694, "b": "worker", "r": "r" * 121},
-    ],
-)
-def test_job_cancellation_rejects_invalid_or_oversized_payload(payload):
-    with pytest.raises(ValueError):
-        wake_bus.JobCancellation.from_payload(payload)
-
-
-def test_notify_job_cancel_uses_existing_wake_channel(monkeypatch):
-    captured = {}
-    event = wake_bus.JobCancellation(3694, "worker:heavy:0:g7", "preempted_by_chat")
-    monkeypatch.setenv("FEEDLING_WAKE_BUS_ENABLED", "1")
-    monkeypatch.setattr(
-        wake_bus.db,
-        "pg_notify",
-        lambda channel, payload: captured.update(
-            channel=channel, payload=json.loads(payload)
-        ),
-    )
-
-    wake_bus.notify_job_cancel(event)
-
-    assert captured == {
-        "channel": wake_bus.PG_CHANNEL,
-        "payload": {
-            "c": "job_cancel",
-            "o": wake_bus.WORKER_ID,
-            "j": 3694,
-            "b": "worker:heavy:0:g7",
-            "r": "preempted_by_chat",
-        },
-    }
-
-
-def test_dispatch_job_cancel_is_typed_and_rejects_extra_keys():
-    _reset_handlers()
-    fired = []
-    wake_bus.register_job_cancel_handler(fired.append)
-    payload = {
-        "c": "job_cancel",
-        "o": "OTHER",
-        "j": 3694,
-        "b": "worker:heavy:0:g7",
-        "r": "preempted_by_chat",
-    }
-
-    wake_bus._dispatch(json.dumps(payload))
-    wake_bus._dispatch(json.dumps({**payload, "unexpected": True}))
-    wake_bus._dispatch(json.dumps({**payload, "o": 123}))
-
-    assert fired == [
-        wake_bus.JobCancellation(3694, "worker:heavy:0:g7", "preempted_by_chat")
-    ]
-    _reset_handlers()
 
 
 def test_notify_payload_shape(monkeypatch):
@@ -194,7 +115,6 @@ def test_dispatch_store_channel_evicts(monkeypatch):
 
 def test_dispatch_ignores_malformed_payload():
     wake_bus._dispatch("not json")  # must not raise
-    wake_bus._dispatch("[]")
 
 
 def test_reconnect_catch_up_refreshes_stores_and_handlers(monkeypatch):

@@ -1,5 +1,4 @@
 from datetime import datetime, timezone
-import asyncio
 import sys
 from pathlib import Path
 
@@ -159,58 +158,3 @@ def test_missing_profile_requeues_without_garden_read(monkeypatch):
         lambda _uid: pytest.fail("missing profile needs no freshness query"),
     )
     assert worker._profile_refresh_due("u", now=2) is True
-
-
-def test_retry_backoff_starts_at_five_minutes_and_caps_at_six_hours(monkeypatch):
-    monkeypatch.setattr(worker, "_PROFILE_RETRY_BASE_SEC", 300.0)
-    monkeypatch.setattr(worker, "_PROFILE_RETRY_CAP_SEC", 21600.0)
-
-    assert worker._profile_retry_not_before(1, now=1000.0) == 1300.0
-    assert worker._profile_retry_not_before(2, now=1000.0) == 1600.0
-    assert worker._profile_retry_not_before(99, now=1000.0) == 22600.0
-
-
-def test_post_chat_missing_profile_enqueues_but_healthy_unchanged_does_not(monkeypatch):
-    calls = []
-    monkeypatch.setattr(worker, "_PROFILE_ENABLED", True)
-    monkeypatch.setattr(worker, "_profile_refresh_due", lambda _uid: True)
-    monkeypatch.setattr(
-        worker.jobs_store,
-        "enqueue_job",
-        lambda uid, lane, **kwargs: calls.append((uid, lane, kwargs["reason"]))
-        or (9, False),
-    )
-    monkeypatch.setattr(worker.core_wake_bus, "notify", lambda *_args: None)
-
-    assert asyncio.run(
-        worker._enqueue_profile_if_due("u", reason="post_turn_refresh")
-    ) is True
-    assert calls == [("u", "profile", "post_turn_refresh")]
-
-    monkeypatch.setattr(worker, "_profile_refresh_due", lambda _uid: False)
-    assert asyncio.run(
-        worker._enqueue_profile_if_due("u", reason="post_turn_refresh")
-    ) is False
-    assert calls == [("u", "profile", "post_turn_refresh")]
-
-
-def test_dream_force_refresh_bypasses_healthy_profile_due_check(monkeypatch):
-    calls = []
-    monkeypatch.setattr(worker, "_PROFILE_ENABLED", True)
-    monkeypatch.setattr(
-        worker,
-        "_profile_refresh_due",
-        lambda _uid: pytest.fail("force refresh must bypass due check"),
-    )
-    monkeypatch.setattr(
-        worker.jobs_store,
-        "enqueue_job",
-        lambda uid, lane, **kwargs: calls.append((uid, lane, kwargs["reason"]))
-        or (10, False),
-    )
-    monkeypatch.setattr(worker.core_wake_bus, "notify", lambda *_args: None)
-
-    assert asyncio.run(
-        worker._enqueue_profile_if_due("u", reason="dream_refresh", force=True)
-    ) is True
-    assert calls == [("u", "profile", "dream_refresh")]

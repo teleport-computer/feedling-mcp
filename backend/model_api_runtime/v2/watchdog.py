@@ -32,7 +32,7 @@ import logging
 import math
 from typing import Callable, Protocol
 
-from model_api_runtime.v2 import claim_recovery, jobs_store, slot_protocol
+from model_api_runtime.v2 import jobs_store
 
 log = logging.getLogger("feedling.runtime_v2.watchdog")
 
@@ -43,11 +43,7 @@ class _SupervisorLike(Protocol):
 
     def poll_liveness(self) -> dict: ...
 
-    def snapshot(self): ...
-
-    def kill(self) -> slot_protocol.ActiveJobIdentity | None: ...
-
-    def start(self) -> None: ...
+    def kill_and_respawn(self) -> None: ...
 
 
 def should_kill(
@@ -139,9 +135,6 @@ async def _watchdog_loop(
     turn_hard_timeout_sec: float | None = None,
     jobs_claimable_timeout_sec: float = 5.0,
     capacity_write_timeout_sec: float = 5.0,
-    recovery_timeout_sec: float = 5.0,
-    recovery_queue: claim_recovery.ClaimRecoveryQueue | None = None,
-    pool: str = "foreground",
 ) -> None:
     """PARENT loop — mirrors `serve_worker._reaper_loop`/`_heartbeat_loop`'s
     interruptible `wait_for(stop_event.wait(), timeout=interval)` shape so
@@ -188,7 +181,7 @@ async def _watchdog_loop(
             await asyncio.wait_for(
                 asyncio.to_thread(
                     jobs_store.record_worker_heartbeat,
-                    worker_id, capacity=0, kind="turn", pool=pool),
+                    worker_id, capacity=0, kind="turn"),
                 timeout=capacity_write_timeout_sec,
             )
         except asyncio.TimeoutError:
@@ -199,52 +192,7 @@ async def _watchdog_loop(
             log.exception(
                 "[v2.watchdog] capacity=0 heartbeat write failed worker=%s "
                 "(proceeding to kill_and_respawn anyway)", worker_id)
-        if not all(hasattr(supervisor, name) for name in ("snapshot", "kill", "start")):
-            # Test-double compatibility while production has fully moved to
-            # the split lifecycle. No exact identity exists on this path.
-            await asyncio.to_thread(supervisor.kill_and_respawn)
-            return
-        snapshot = supervisor.snapshot()
-        killed_identity = await asyncio.to_thread(supervisor.kill)
-        active_job = killed_identity or (
-            None if snapshot is None else snapshot.active_job
-        )
-        try:
-            if active_job is not None:
-                try:
-                    result = await asyncio.wait_for(
-                        asyncio.to_thread(
-                            jobs_store.recover_killed_job,
-                            job_id=active_job.job_id,
-                            claimed_by=active_job.claimed_by,
-                            reason="slot_watchdog_timeout",
-                        ),
-                        timeout=recovery_timeout_sec,
-                    )
-                    log.warning(
-                        "[v2.watchdog] exact recovery pool=%s slot=%s job=%s "
-                        "lane=%s owner=%s result=%s",
-                        pool,
-                        None if snapshot is None else snapshot.slot_id,
-                        active_job.job_id,
-                        active_job.lane,
-                        active_job.claimed_by,
-                        result,
-                    )
-                except Exception:
-                    if recovery_queue is not None:
-                        recovery_queue.enqueue(
-                            job_id=active_job.job_id,
-                            claimed_by=active_job.claimed_by,
-                            reason="slot_watchdog_timeout",
-                        )
-                    log.exception(
-                        "[v2.watchdog] immediate exact recovery failed job=%s owner=%s",
-                        active_job.job_id,
-                        active_job.claimed_by,
-                    )
-        finally:
-            await asyncio.to_thread(supervisor.start)
+        await asyncio.to_thread(supervisor.kill_and_respawn)
 
     while not stop_event.is_set():
         try:

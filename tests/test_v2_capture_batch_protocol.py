@@ -935,15 +935,19 @@ def test_capture_keepalive_failure_cancels_and_drains_before_opt_out(
     assert opt_out_observed_provider_done == [True]
 
 
-def test_capture_guard_pool_is_one_thread_per_slot_process(monkeypatch):
+def test_capture_guard_pool_size_tracks_worker_admission(monkeypatch):
     worker._shutdown_capture_provider_guard_executor(wait=True)
-    monkeypatch.setenv("FEEDLING_V2_MAX_WORKERS", "99")
+    monkeypatch.setattr(worker, "MAX_WORKERS", 3)
     executor = worker._capture_provider_guard_thread_pool()
     try:
-        assert executor._max_workers == 1
+        assert executor._max_workers == 3
         assert executor is worker._capture_provider_guard_thread_pool()
     finally:
         worker._shutdown_capture_provider_guard_executor(wait=True)
+
+    monkeypatch.setattr(worker, "MAX_WORKERS", 0)
+    with pytest.raises(RuntimeError, match="must be a positive integer"):
+        worker._capture_provider_guard_thread_pool()
 
 
 def test_capture_commit_linearizes_before_halt_update(monkeypatch):

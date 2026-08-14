@@ -111,28 +111,23 @@ def test_p0_all_slots_stuck_zeroes_capacity_before_kill_and_genesis_unaffected(m
     # An independently-written genesis heartbeat row — separate PK (worker_id),
     # separate `kind`. If the watchdog kill path ever touched it, its beat_at
     # would move; it must not.
-    jobs_store.record_worker_heartbeat(
-        genesis_worker_id, pool="control", kind="genesis", capacity=0
-    )
+    jobs_store.record_worker_heartbeat(genesis_worker_id, kind="genesis", capacity=0)
     beat_before = _genesis_beat_at(genesis_worker_id)
     assert jobs_store.genesis_worker_alive(within_sec=60) is True
 
     order: list[str] = []
     real_heartbeat = jobs_store.record_worker_heartbeat
 
-    def _spy_heartbeat(worker_id, *, pool, kind="turn", capacity=1):
+    def _spy_heartbeat(worker_id, *, kind="turn", capacity=1):
         # The watchdog's own contract (watchdog.py's `_watchdog_loop` docstring
         # and Task 3's kill branch) is to write ONLY the turn worker's row with
         # capacity=0 — assert that's exactly what happens, nothing genesis-kind
         # and nothing but capacity=0.
         assert kind == "turn", f"watchdog must never write a non-turn heartbeat, got kind={kind!r}"
-        assert pool == "foreground"
         assert worker_id == turn_worker_id
         assert capacity == 0
         order.append("capacity_zero")
-        return real_heartbeat(
-            worker_id, pool=pool, kind=kind, capacity=capacity
-        )
+        return real_heartbeat(worker_id, kind=kind, capacity=capacity)
 
     monkeypatch.setattr(jobs_store, "record_worker_heartbeat", _spy_heartbeat)
 
@@ -224,15 +219,12 @@ def test_p0_single_wedged_turn_hard_timeout_zeroes_capacity_before_kill(monkeypa
     order: list[str] = []
     real_heartbeat = jobs_store.record_worker_heartbeat
 
-    def _spy_heartbeat(worker_id, *, pool, kind="turn", capacity=1):
+    def _spy_heartbeat(worker_id, *, kind="turn", capacity=1):
         assert kind == "turn"
-        assert pool == "foreground"
         assert worker_id == turn_worker_id
         assert capacity == 0
         order.append("capacity_zero")
-        return real_heartbeat(
-            worker_id, pool=pool, kind=kind, capacity=capacity
-        )
+        return real_heartbeat(worker_id, kind=kind, capacity=capacity)
 
     monkeypatch.setattr(jobs_store, "record_worker_heartbeat", _spy_heartbeat)
 
@@ -321,9 +313,7 @@ def test_kill_switch_halts_admission_then_resumes(monkeypatch):
     monkeypatch.setattr(chat_send_core.agent_runtime_cutover, "resolve_driver", lambda cfg: "claude")
     monkeypatch.setattr(chat_send_core.jobs_store, "workers_alive", lambda **kw: True)
     monkeypatch.setattr(chat_send_core.jobs_store, "live_worker_capacity", lambda **kw: 1)
-    monkeypatch.setattr(
-        chat_send_core.jobs_store, "inflight_job_count", lambda **kw: 0
-    )
+    monkeypatch.setattr(chat_send_core.jobs_store, "inflight_job_count", lambda: 0)
     monkeypatch.setattr(chat_send_core.jobs_store, "recent_mean_service_sec", lambda **kw: None)
 
     append_chat_calls = {"n": 0}

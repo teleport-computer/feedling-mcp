@@ -95,28 +95,3 @@ def test_lane_derived_default_priority_and_explicit_override():
     assert rows[chat_id] == 100
     assert rows[capture_id] == 10
     assert rows[hb_id] == 7  # explicit priority honored, not lane-derived
-
-
-def test_valid_active_claims_matches_job_and_owner_as_one_fence():
-    _seed_v2("u_claim_snapshot")
-    job_id, _ = jobs_store.enqueue_job("u_claim_snapshot", "chat")
-    claimed = jobs_store.claim_next_job("worker:foreground:0:g7")
-    assert claimed is not None
-
-    assert jobs_store.valid_active_claims(
-        [
-            (job_id, "worker:foreground:0:g7"),
-            (job_id, "worker:foreground:0:g8"),
-            (job_id + 1, "worker:foreground:0:g7"),
-        ]
-    ) == {(job_id, "worker:foreground:0:g7")}
-
-    with db.get_pool().connection() as conn:
-        conn.execute(
-            "UPDATE agent_jobs SET status='cancelled', finished_at=now() WHERE id=%s",
-            (job_id,),
-        )
-
-    assert jobs_store.valid_active_claims(
-        [(job_id, "worker:foreground:0:g7")]
-    ) == set()

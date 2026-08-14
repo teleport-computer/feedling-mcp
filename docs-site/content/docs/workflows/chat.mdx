@@ -37,14 +37,6 @@ and a live Hosted Runtime V2 worker pool. Runtime-control, worker-liveness,
 kill-switch, and admission failures are returned before the user message is
 stored.
 
-Accepted Chat work has dedicated Foreground execution capacity. During the same
-database transaction that enqueues a new Chat Job, Runtime V2 can supersede or
-requeue that user's active non-Chat background Job and publish an exact-owner
-cancellation. Ownership fences prevent the old process from committing after
-the transaction, even if delivery of the cancellation notification is delayed;
-periodic claim reconciliation is the notification-loss backstop. Other users'
-Jobs and other slot processes are not cancelled.
-
 The account's selected onboarding route is the execution-ownership switch.
 Hosted Runtime V1 is eligible only when that selector is positively
 `model_api`; Runtime V2's `v2`/`draining` ownership fence excludes V1

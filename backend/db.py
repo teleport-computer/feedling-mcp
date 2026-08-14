@@ -89,21 +89,6 @@ def _pool_max_size() -> int:
     return value
 
 
-def configure_pool_max_size(max_size: int | str) -> int:
-    """Set this process's explicit pool ceiling before the lazy pool opens."""
-    try:
-        value = int(str(max_size).strip())
-    except (TypeError, ValueError) as exc:
-        raise RuntimeError("database pool max size must be an integer >= 2") from exc
-    if value < 2:
-        raise RuntimeError("database pool max size must be an integer >= 2")
-    with _pool_lock:
-        if _pool is not None:
-            raise RuntimeError("database pool max size cannot change after pool startup")
-        os.environ["FEEDLING_DB_POOL_MAX_SIZE"] = str(value)
-    return value
-
-
 def get_pool() -> ConnectionPool:
     global _pool
     if _pool is not None:
@@ -10311,9 +10296,7 @@ def chat_append_and_enqueue(
             "runtime-control CAS requires expected state, mode, and generation")
     priority = jobs_store.LANE_PRIORITY.get(lane, 0)
 
-    def _attempt() -> tuple[
-        int, int | None, int, bool, list[str], list[jobs_store.PreemptedJob]
-    ]:
+    def _attempt() -> tuple[int, int | None, int, bool, list[str]]:
         with get_pool().connection() as conn:
             with conn.transaction():
                 with conn.cursor() as fence_cur:
@@ -10371,14 +10354,7 @@ def chat_append_and_enqueue(
                         (user_id, client_msg_id, idempotency_window_sec),
                     ).fetchone()
                     if duplicate is not None:
-                        return int(duplicate[0]), None, 0, False, [], []
-                preempted_jobs: list[jobs_store.PreemptedJob] = []
-                if lane == "chat":
-                    with conn.cursor(row_factory=dict_row) as preempt_cur:
-                        preempted_jobs = jobs_store.preempt_active_for_chat_on_cursor(
-                            preempt_cur,
-                            user_id=user_id,
-                        )
+                        return int(duplicate[0]), None, 0, False, []
                 with conn.cursor() as mc:
                     superseded_ids = _supersede_previous_voice_revisions_on_cursor(
                         mc,
@@ -10396,45 +10372,14 @@ def chat_append_and_enqueue(
                         priority=priority, deadline_at=None,
                         expected_generation=expected_generation,
                     )
-        return (
-            seq,
-            job_id,
-            storage_generation,
-            True,
-            superseded_ids,
-            preempted_jobs,
-        )
+        return seq, job_id, storage_generation, True, superseded_ids
 
     def _finish(
-        result: tuple[
-            int, int | None, int, bool, list[str], list[jobs_store.PreemptedJob]
-        ],
+        result: tuple[int, int | None, int, bool, list[str]],
     ) -> tuple[int, int | None]:
-        (
-            seq,
-            job_id,
-            storage_generation,
-            inserted,
-            superseded_ids,
-            _preempted_jobs,
-        ) = result
+        seq, job_id, storage_generation, inserted, superseded_ids = result
         if not inserted:
             return seq, None
-        # The authoritative owner invalidation has committed before _finish is
-        # entered.  NOTIFY is intentionally best-effort acceleration; a lost
-        # event is repaired by the parent reconciliation loop.
-        from core import wake_bus as core_wake_bus
-
-        for preempted in _preempted_jobs:
-            if preempted.claimed_by is None:
-                continue
-            core_wake_bus.notify_job_cancel(
-                core_wake_bus.JobCancellation(
-                    job_id=preempted.job_id,
-                    claimed_by=preempted.claimed_by,
-                    reason="foreground_chat_preempted",
-                )
-            )
         _mirror_superseded_voice_revisions(
             user_id,
             superseded_ids,

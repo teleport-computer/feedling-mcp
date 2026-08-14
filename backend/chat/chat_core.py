@@ -1406,7 +1406,7 @@ def verify_loop(store: UserStore, payload: dict) -> tuple[dict, int]:
         if v2_mode:
             from model_api_runtime.v2 import jobs_store
 
-            alive = jobs_store.workers_alive(pool="foreground")
+            alive = jobs_store.workers_alive()
             if alive:
                 boot_gates._log_bootstrap_event(
                     store, "chat_loop_verified", success=True

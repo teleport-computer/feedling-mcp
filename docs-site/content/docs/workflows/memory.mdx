@@ -5,16 +5,6 @@ description: Store encrypted memory cards, inspect the index, and fetch selected
 
 Memory separates ciphertext storage from enclave-authorized read projections.
 
-## Hosted profile refresh execution
-
-Runtime V2 generates its bounded Memory/User profile as low-priority Heavy-pool
-work, separate from foreground Chat. It first verifies the complete lightweight
-Garden index, then fetches card bodies in stable batches of 64 and fails closed
-if any batch is incomplete. At most one Profile Job runs in a serve-worker
-instance; the second Heavy slot remains available for Dream, Capture, and other
-maintenance. Provider and write stages report progress so a slow but advancing
-profile is not mistaken for a hung Job.
-
 | Operation | Returns |
 | --- | --- |
 | `POST /v1/memory/add` | The stored v1 encrypted record. |

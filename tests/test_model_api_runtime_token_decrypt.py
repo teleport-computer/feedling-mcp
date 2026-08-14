@@ -52,7 +52,7 @@ def client(tmp_path, monkeypatch):
     )
     monkeypatch.setattr(jobs_store, "workers_alive", lambda **kw: True)
     monkeypatch.setattr(jobs_store, "live_worker_capacity", lambda **kw: 4)
-    monkeypatch.setattr(jobs_store, "inflight_job_count", lambda **kw: 0)
+    monkeypatch.setattr(jobs_store, "inflight_job_count", lambda: 0)
     monkeypatch.setattr(jobs_store, "recent_mean_service_sec", lambda **kw: None)
     monkeypatch.setattr(chat_send_core.kill_switch, "turns_halted", lambda **kw: False)
     monkeypatch.setenv("FEEDLING_RUNTIME_TOKEN_SECRET", _SECRET)

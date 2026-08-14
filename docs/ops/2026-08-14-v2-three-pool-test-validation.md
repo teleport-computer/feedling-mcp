@@ -1,5 +1,13 @@
 # Runtime V2 三池 test 环境验证记录（2026-08-14）
 
+> [!WARNING]
+> **本记录已被回退发布方案取代，不是当前运维指引。** PR #207 仅部署到 test，未推广到
+> pre/prod；`revert/v2-three-pool-for-release` 已恢复 legacy Runtime V2 与
+> `FEEDLING_V2_MAX_WORKERS=4`，但回退提交尚未推送或部署，test 验证仍待完成。
+> 数据库 revision `0086_v2_worker_pool_heartbeats` 为兼容已迁移的 test 数据库而保留，
+> 不执行数据库降级。下文完整保留的是镜像 `9253789` 的历史部署证据，其中三池配置与
+> 验收结论均不代表回退后的目标状态。
+
 ## 决策状态
 
 - 当前结果：`pending`（部署与基础运行态通过；受控负载、峰值窗口和 previous-image

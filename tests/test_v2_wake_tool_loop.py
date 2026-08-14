@@ -314,7 +314,7 @@ def test_wake_empty_terminal_text_completes_with_zero_bubbles(monkeypatch):
         sink_calls=sink_calls,
     )
     status = asyncio.run(worker._run_wake(
-        job_id, uid, "heartbeat", deps, _BYOK, asyncio.Semaphore(4), str(job["claimed_by"])))
+        job_id, uid, "heartbeat", deps, _BYOK, worker.ENCLAVE_SEMAPHORE, str(job["claimed_by"])))
 
     assert status == "completed"
     assert _bubbles(uid) == []
@@ -352,7 +352,7 @@ def test_wake_empty_tail_still_completes_no_no_user_messages_guard(monkeypatch):
 
     deps = _wake_deps(tail=[])
     status = asyncio.run(worker._run_wake(
-        job_id, uid, "scheduled", deps, _BYOK, asyncio.Semaphore(4), str(job["claimed_by"])))
+        job_id, uid, "scheduled", deps, _BYOK, worker.ENCLAVE_SEMAPHORE, str(job["claimed_by"])))
 
     assert status == "completed"
     conversation_messages = [
@@ -411,7 +411,7 @@ def test_wake_memory_write_is_authorized_applied_and_not_refused(monkeypatch):
         "manual_wake",
         deps,
         _BYOK,
-        asyncio.Semaphore(4),
+        worker.ENCLAVE_SEMAPHORE,
         str(job["claimed_by"]),
         trajectory_recorder=trajectory,
     ))
@@ -489,7 +489,7 @@ def test_wake_identity_write_is_visibly_refused_and_not_enqueued(
         "manual_wake",
         deps,
         _BYOK,
-        asyncio.Semaphore(4),
+        worker.ENCLAVE_SEMAPHORE,
         str(job["claimed_by"]),
     ))
 
@@ -555,7 +555,7 @@ def test_wake_mixed_valid_invalid_workspace_batch_applies_valid_call(
             "manual_wake",
             deps,
             _BYOK,
-            asyncio.Semaphore(4),
+            worker.ENCLAVE_SEMAPHORE,
             str(job["claimed_by"]),
         )
     )
@@ -613,7 +613,7 @@ def test_wake_photo_read_observation_is_pull_on_demand(monkeypatch):
         "manual_wake",
         deps,
         _BYOK,
-        asyncio.Semaphore(4),
+        worker.ENCLAVE_SEMAPHORE,
         str(job["claimed_by"]),
     ))
 
@@ -646,7 +646,7 @@ def test_wake_without_photo_read_never_observes_photo(monkeypatch):
         "manual_wake",
         deps,
         _BYOK,
-        asyncio.Semaphore(4),
+        worker.ENCLAVE_SEMAPHORE,
         str(job["claimed_by"]),
     ))
 
@@ -691,7 +691,7 @@ def test_wake_provider_error_silent_mark_failed(monkeypatch):
 
     deps = _wake_deps(tail=[{"id": "m1", "ts": 1.0, "role": "user", "content": "hi"}])
     status = asyncio.run(worker._run_wake(
-        job_id, uid, "manual_wake", deps, _BYOK, asyncio.Semaphore(4), str(job["claimed_by"])))
+        job_id, uid, "manual_wake", deps, _BYOK, worker.ENCLAVE_SEMAPHORE, str(job["claimed_by"])))
 
     assert status == "failed"
     assert _bubbles(uid) == []
@@ -733,7 +733,7 @@ def test_wake_provider_config_error_still_sets_payment_cooldown(monkeypatch):
     deps = _wake_deps(tail=[{"id": "m1", "ts": 1.0, "role": "user", "content": "hi"}])
     before = _time.time()
     status = asyncio.run(worker._run_wake(
-        job_id, uid, "heartbeat", deps, _BYOK, asyncio.Semaphore(4), str(job["claimed_by"])))
+        job_id, uid, "heartbeat", deps, _BYOK, worker.ENCLAVE_SEMAPHORE, str(job["claimed_by"])))
     after = _time.time()
 
     assert status == "failed"
@@ -771,7 +771,7 @@ def test_wake_transient_error_does_not_set_payment_cooldown(monkeypatch):
 
     deps = _wake_deps(tail=[{"id": "m1", "ts": 1.0, "role": "user", "content": "hi"}])
     status = asyncio.run(worker._run_wake(
-        job_id, uid, "heartbeat", deps, _BYOK, asyncio.Semaphore(4), str(job["claimed_by"])))
+        job_id, uid, "heartbeat", deps, _BYOK, worker.ENCLAVE_SEMAPHORE, str(job["claimed_by"])))
 
     assert status == "failed"
     assert cooldown_calls == []
@@ -809,7 +809,7 @@ def test_screen_watch_lane_uses_its_own_prompt_and_screen_context(monkeypatch):
 
     deps = _wake_deps(tail=[{"id": "m1", "ts": 1.0, "role": "user", "content": "hi"}])
     status = asyncio.run(worker._run_wake(
-        job_id, uid, "screen_watch", deps, _BYOK, asyncio.Semaphore(4), str(job["claimed_by"])))
+        job_id, uid, "screen_watch", deps, _BYOK, worker.ENCLAVE_SEMAPHORE, str(job["claimed_by"])))
 
     assert status == "completed"
     system_msg = next(m for m in seen["messages"] if m["role"] == "system")

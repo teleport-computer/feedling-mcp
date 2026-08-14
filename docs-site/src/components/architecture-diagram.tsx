@@ -169,16 +169,16 @@ export function ArchitectureDiagram() {
               Hosted Runtime V2 worker pool
             </h3>
             <div className="grid gap-2">
-              <Node title="Runtime V2 parent">
-                Runs alongside the backend inside the measured main CVM; coordinates PostgreSQL claims,
-                exact cancellation, per-slot watchdogs, capacity heartbeats, and one four-permit Enclave broker.
+              <Node title="Pooled serve-worker">
+                Runs alongside the backend inside the measured main CVM; claims durable jobs, publishes
+                capacity heartbeats, and mints scoped runtime tokens per turn. During the dual-runtime
+                window a separate CVM still runs the V1 resident runner.
               </Node>
               <div aria-hidden="true" className="text-center text-lg leading-none text-fd-primary">
                 ↓
               </div>
-              <Node title="Eight single-slot child processes">
-                Four Foreground, two Wake, and two Heavy slots each run at most one Job. Durable ownership
-                remains in PostgreSQL, and one stalled child can be restarted without killing its siblings.
+              <Node title="Bounded turn slot">
+                Runs the native tool loop under deadlines and a watchdog; durable state remains in PostgreSQL.
               </Node>
             </div>
           </section>

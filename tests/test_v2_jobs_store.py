@@ -1614,8 +1614,8 @@ def test_completed_wake_retry_cannot_overwrite_newer_glance_source():
 
 
 def test_live_worker_count_counts_only_recent():
-    jobs_store.record_worker_heartbeat("w-fresh-1", pool="foreground")
-    jobs_store.record_worker_heartbeat("w-fresh-2", pool="foreground")
+    jobs_store.record_worker_heartbeat("w-fresh-1")
+    jobs_store.record_worker_heartbeat("w-fresh-2")
     # 塞一个陈旧心跳（beat_at 在窗口外）
     with db.get_pool().connection() as conn:
         conn.execute(
@@ -1637,93 +1637,6 @@ def test_inflight_job_count_counts_active_states():
     before = jobs_store.inflight_job_count()
     jobs_store.enqueue_job("u_js_11", "chat", reason="t")
     assert jobs_store.inflight_job_count() == before + 1
-
-
-def test_inflight_job_count_filters_foreground_and_background_lanes():
-    foreground = {"chat", "manual_wake"}
-    background = {"profile", "dream"}
-    before_all = jobs_store.inflight_job_count()
-    before_foreground = jobs_store.inflight_job_count(lanes=foreground)
-    before_background = jobs_store.inflight_job_count(lanes=background)
-
-    seed_user("u_js_inflight_foreground")
-    jobs_store.enqueue_job("u_js_inflight_foreground", "chat", reason="t")
-    for index in range(7):
-        user_id = f"u_js_inflight_background_{index}"
-        lane = "profile" if index % 2 == 0 else "dream"
-        seed_user(user_id)
-        jobs_store.enqueue_job(user_id, lane, reason="t")
-
-    assert jobs_store.inflight_job_count(lanes=foreground) == before_foreground + 1
-    assert jobs_store.inflight_job_count(lanes=background) == before_background + 7
-    assert jobs_store.inflight_job_count() == before_all + 8
-
-
-def test_recover_killed_chat_is_exact_and_queues_terminal_failure():
-    uid = "u_js_exact_watchdog_chat"
-    seed_user(uid)
-    _reset(uid)
-    chat_id, _ = jobs_store.enqueue_job(uid, "chat")
-    other_id, _ = jobs_store.enqueue_job(uid, "profile")
-    claimed = jobs_store.claim_next_job("foreground-0:g7", lanes={"chat"})
-    assert claimed is not None and int(claimed["id"]) == chat_id
-    assert jobs_store.mark_running(chat_id, claimed_by="foreground-0:g7")
-
-    recovered = jobs_store.recover_killed_job(
-        job_id=chat_id, claimed_by="foreground-0:g7"
-    )
-
-    assert recovered == {
-        "job_id": chat_id,
-        "user_id": uid,
-        "lane": "chat",
-        "recovery": "terminal",
-    }
-    with db.get_pool().connection() as conn:
-        chat = conn.execute(
-            "SELECT status,last_error,claimed_by FROM agent_jobs WHERE id=%s",
-            (chat_id,),
-        ).fetchone()
-        other = conn.execute(
-            "SELECT status FROM agent_jobs WHERE id=%s", (other_id,)
-        ).fetchone()
-        outbox = conn.execute(
-            "SELECT error_code FROM v2_terminal_failure_outbox WHERE job_id=%s",
-            (chat_id,),
-        ).fetchone()
-    assert chat == ("expired", "slot_watchdog_timeout", None)
-    assert other == ("pending",)
-    assert outbox == ("slot_watchdog_timeout",)
-    assert jobs_store.recover_killed_job(
-        job_id=chat_id, claimed_by="foreground-0:g7"
-    ) is None
-
-
-@pytest.mark.parametrize("lane", ["profile", "scheduled", "capture"])
-def test_recover_killed_background_requeues_exact_claim(lane):
-    uid = f"u_js_exact_watchdog_{lane}"
-    seed_user(uid)
-    _reset(uid)
-    job_id, _ = jobs_store.enqueue_job(uid, lane)
-    claimed = jobs_store.claim_next_job(f"{lane}-owner", lanes={lane})
-    assert claimed is not None and int(claimed["id"]) == job_id
-    assert jobs_store.mark_running(job_id, claimed_by=f"{lane}-owner")
-
-    assert jobs_store.recover_killed_job(
-        job_id=job_id, claimed_by="wrong-owner"
-    ) is None
-    recovered = jobs_store.recover_killed_job(
-        job_id=job_id, claimed_by=f"{lane}-owner"
-    )
-
-    assert recovered["recovery"] == "requeued"
-    with db.get_pool().connection() as conn:
-        row = conn.execute(
-            "SELECT status,last_error,claimed_by,lease_expires_at "
-            "FROM agent_jobs WHERE id=%s",
-            (job_id,),
-        ).fetchone()
-    assert row == ("pending", "slot_watchdog_timeout", None, None)
 
 
 def test_recent_mean_service_sec_none_without_history():
@@ -1766,10 +1679,8 @@ def test_genesis_heartbeat_does_not_inflate_turn_worker_liveness():
     single-process pool and over-admit onto turn slots that do not exist.
     """
     _clear_heartbeats()
-    jobs_store.record_worker_heartbeat("w1", pool="foreground")
-    jobs_store.record_worker_heartbeat(
-        "w1:genesis", pool="control", kind="genesis"
-    )
+    jobs_store.record_worker_heartbeat("w1")  # default kind='turn'
+    jobs_store.record_worker_heartbeat("w1:genesis", kind="genesis")
 
     assert jobs_store.live_worker_count() == 1
     assert jobs_store.workers_alive() is True
@@ -1779,9 +1690,7 @@ def test_genesis_heartbeat_does_not_inflate_turn_worker_liveness():
 def test_genesis_heartbeat_alone_does_not_open_the_send_gate():
     """Genesis alive but every turn worker dead => send must still 503."""
     _clear_heartbeats()
-    jobs_store.record_worker_heartbeat(
-        "only:genesis", pool="control", kind="genesis"
-    )
+    jobs_store.record_worker_heartbeat("only:genesis", kind="genesis")
 
     assert jobs_store.workers_alive() is False
     assert jobs_store.live_worker_count() == 0
@@ -1795,17 +1704,9 @@ def test_genesis_worker_alive_false_when_nothing_beats():
 
 def test_recent_worker_heartbeats_returns_identity_kind_capacity_and_db_age():
     _clear_heartbeats()
+    jobs_store.record_worker_heartbeat("v2-worker-new-deadbeef1234", capacity=4)
     jobs_store.record_worker_heartbeat(
-        "v2-worker-new-deadbeef1234",
-        pool="foreground",
-        capacity=4,
-        runtime_state={"slot": "foreground-0", "job_id": "job-123"},
-    )
-    jobs_store.record_worker_heartbeat(
-        "v2-worker-new-deadbeef1234:genesis",
-        pool="control",
-        kind="genesis",
-        capacity=0,
+        "v2-worker-new-deadbeef1234:genesis", kind="genesis", capacity=0
     )
     with db.get_pool().connection() as conn:
         conn.execute(
@@ -1823,14 +1724,7 @@ def test_recent_worker_heartbeats_returns_identity_kind_capacity_and_db_age():
     turn = next(row for row in rows if row["kind"] == "turn")
     genesis = next(row for row in rows if row["kind"] == "genesis")
     assert turn["capacity"] == 4
-    assert turn["pool"] == "foreground"
-    assert turn["runtime_state"] == {
-        "slot": "foreground-0",
-        "job_id": "job-123",
-    }
     assert genesis["capacity"] == 0
-    assert genesis["pool"] == "control"
-    assert genesis["runtime_state"] == {}
     assert turn["age_sec"] >= 0
     assert isinstance(turn["beat_at_epoch"], float)
 

@@ -70,7 +70,7 @@ def _migration_0085_module():
     )
 
 
-def test_worker_pool_heartbeats_is_the_single_installed_head():
+def test_worker_pool_heartbeat_compatibility_is_the_single_installed_head():
     """A deploy missing the durable baseline migration must fail before rollout."""
     backend = Path(__file__).parent.parent / "backend"
     cfg = Config(str(backend / "alembic.ini"))
@@ -82,9 +82,8 @@ def test_worker_pool_heartbeats_is_the_single_installed_head():
     assert migration.down_revision == "0085_v2_wake_shadow_decisions"
     migration = script.get_revision("0085_v2_wake_shadow_decisions")
     assert migration.down_revision == "0084_wake_support_indexes"
-    assert script.get_revision("0084_wake_support_indexes").down_revision == (
-        "0083_screen_chat_frames"
-    )
+    migration = script.get_revision("0084_wake_support_indexes")
+    assert migration.down_revision == "0083_screen_chat_frames"
     assert script.get_revision("0083_screen_chat_frames").down_revision == (
         "0082_merge_image_voice"
     )

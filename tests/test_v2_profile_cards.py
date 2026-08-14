@@ -10,7 +10,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 from model_api_runtime.v2 import profile, serve_worker
 
 
-def _wire(monkeypatch, *, index_body, fetched_items=(), fetch_calls=None):
+def _wire(monkeypatch, *, index_body, fetched_items=()):
     monkeypatch.setattr(serve_worker.core_store, "get_store", lambda _uid: object())
     monkeypatch.setattr(serve_worker, "_mint_runtime_token", lambda _uid: "rt-profile")
     auth = []
@@ -33,13 +33,8 @@ def _wire(monkeypatch, *, index_body, fetched_items=(), fetch_calls=None):
 
     def _fetch(_store, api_key, payload, *, post_enclave):
         assert api_key is None
-        if fetch_calls is not None:
-            fetch_calls.append(tuple(payload["ids"]))
         post_enclave(None, [], operation="fetch", payload={})
-        by_id = {str(item.get("id") or ""): item for item in fetched_items}
-        return {
-            "items": [by_id[memory_id] for memory_id in payload["ids"] if memory_id in by_id]
-        }, 200
+        return {"items": list(fetched_items)}, 200
 
     monkeypatch.setattr(serve_worker.memory_core, "index", _index)
     monkeypatch.setattr(serve_worker.memory_core, "fetch", _fetch)
@@ -115,46 +110,6 @@ def test_profile_cards_content_only_fallback_and_1000_cards(monkeypatch):
     assert tail_window["profile_cards_truncated"] is False
 
 
-def test_profile_cards_554_are_read_in_nine_stable_batches(monkeypatch):
-    items = [{"id": f"m{i}"} for i in range(554)]
-    fetched = [
-        {"id": f"m{i}", "content": f"正文{i}"}
-        for i in reversed(range(554))
-    ]
-    fetch_calls = []
-    progress = []
-    _wire(
-        monkeypatch,
-        index_body={
-            "items": items,
-            "user_card_count": 554,
-            "truncated": False,
-        },
-        fetched_items=fetched,
-        fetch_calls=fetch_calls,
-    )
-
-    rendered, count, tail_window = serve_worker._read_profile_cards(
-        "u", progress.append
-    )
-
-    assert count == 554
-    assert [len(batch) for batch in fetch_calls] == [64] * 8 + [42]
-    assert rendered.splitlines()[0].startswith("- id=m0 ")
-    assert rendered.splitlines()[-1].startswith("- id=m553 ")
-    assert tail_window == {
-        "lane": "profile",
-        "profile_cards_truncated": False,
-    }
-    assert progress == [
-        "profile_index_completed",
-        *[
-            f"profile_fetch_batch_completed:{index}:9:{min(index * 64, 554)}:554"
-            for index in range(1, 10)
-        ],
-    ]
-
-
 @pytest.mark.parametrize(
     "body",
     [
@@ -174,6 +129,8 @@ def test_profile_card_content_has_explicit_per_card_bound():
         {"id": "m", "content": "中" * 3000}
     )
     assert rendered.count("中") == serve_worker._PROFILE_CARD_CONTENT_MAX_CHARS
+
+
 def test_profile_card_truncation_reaches_provider_request_trace(monkeypatch):
     cap = serve_worker._PROFILE_CARD_CONTENT_MAX_CHARS
     clipped_body = "Q" * (cap + 1)

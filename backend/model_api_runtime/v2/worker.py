@@ -24,7 +24,7 @@ this module so the worker never imports the hosted layer.
 并发：asyncio 事件循环 + asyncio.to_thread 把同步 jobs_store/enclave 调用移出 loop。
 四种 provider wire 全部 await 原生 async HTTP transport；provider 并发不再受默认线程池
 大小限制。
-父进程实例级 Enclave broker 框住 turn 里所有 enclave-bound 调用（provider-key 解密 + 逐条 chat 解密
+ENCLAVE_SEMAPHORE 框住 turn 里所有 enclave-bound 调用（provider-key 解密 + 逐条 chat 解密
 + capability 调用），治 spec R3。enclave 不是单线程（prod = 4 个 gunicorn worker，每个
 32 线程解密池），但它是全系统共享、容量有限、且解密 GIL-bound 的代理——多 worker 齐打
 照样会放大 502，闸门因此仍然必要。
@@ -99,7 +99,6 @@ from model_api_runtime.v2 import effect_id as v2_effect_id
 from model_api_runtime.v2 import executor as v2_executor
 from model_api_runtime.v2 import extraction as v2_extraction
 from model_api_runtime.v2 import jobs_store
-from model_api_runtime.v2 import slot_protocol
 from model_api_runtime.v2 import kill_switch
 from model_api_runtime.v2 import model_identity as v2_model_identity
 from model_api_runtime.v2 import web_gate as v2_web_gate
@@ -286,6 +285,11 @@ def _positive_float_env(name: str, default: str) -> float:
     return value
 
 
+# —— 三个有界闸 ——（spec §6）
+# 每进程并发 job 数（= 并发回合数）。线上多进程 × CVM 共抢同一张 agent_jobs → 线性扩容。
+MAX_WORKERS = _positive_int_env("FEEDLING_V2_MAX_WORKERS", "4")
+
+
 # Capture is the one provider path whose disclosure lifetime is deliberately
 # coupled to a synchronous PostgreSQL transaction: D4, consent, Chat Clear, and
 # runtime-generation locks must stay held until the async provider attempt (and
@@ -300,9 +304,13 @@ _capture_provider_guard_executor_size = 0
 
 
 def _capture_provider_guard_pool_size() -> int:
-    """Return the dedicated Capture guard size for this one-slot process."""
-
-    return 1
+    try:
+        size = int(MAX_WORKERS)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("FEEDLING_V2_MAX_WORKERS must be a positive integer") from exc
+    if size <= 0:
+        raise RuntimeError("FEEDLING_V2_MAX_WORKERS must be a positive integer")
+    return size
 
 
 def _reset_capture_provider_guard_executor_after_fork() -> None:
@@ -530,15 +538,9 @@ HISTORY_TURN_MAX_ROWS = _positive_int_env("FEEDLING_V2_HISTORY_TURN_MAX_ROWS", "
 HISTORY_TURN_MAX_WALL_SEC = _positive_float_env(
     "FEEDLING_V2_HISTORY_TURN_MAX_WALL_SEC", "8"
 )
-# Production children receive one instance-wide broker-backed gate from
-# ``turn_child``. Direct helper tests that omit a gate get a private one below;
-# no process-global permit count is multiplied across isolated slot processes.
-_DEFAULT_ENCLAVE_GATE = object()
-
-
-def _new_direct_enclave_gate():
-    """Compatibility gate for direct helper calls outside the slot runtime."""
-    return asyncio.Semaphore(1)
+# 跨所有 job 共享的 enclave 并发闸（provider-key 解密 + chat 解密 + capability 调用都过它）。治 R3。
+ENCLAVE_CONCURRENCY = _positive_int_env("FEEDLING_V2_ENCLAVE_CONCURRENCY", "2")
+ENCLAVE_SEMAPHORE = asyncio.Semaphore(ENCLAVE_CONCURRENCY)
 
 
 def _reserved_lane_slots(max_workers: int, reserved: int | None = None) -> list:
@@ -1158,7 +1160,7 @@ def _turn_failure_error_class(exc: BaseException) -> str:
             return "unknown"
         return "context_overflow"
     if isinstance(exc, (asyncio.TimeoutError, TimeoutError)):
-        return "provider_timeout"
+        return "turn_timeout"
     if (
         isinstance(exc, v2_tool_loop.ProviderEmptyReply)
         or (isinstance(exc, TurnError) and str(exc) == "empty_reply")
@@ -1196,7 +1198,7 @@ def _turn_failure_error_class(exc: BaseException) -> str:
     if status_code in {400, 422}:
         return "provider_incompatible"
     if status_code == 408:
-        return "provider_timeout"
+        return "turn_timeout"
     if status_code == 429:
         return "rate_limited"
     if isinstance(status_code, int) and 500 <= status_code <= 599:
@@ -1360,7 +1362,7 @@ class TurnDeps:
     # tail-window metadata). Unlike read_memory_context this is fail-loud and
     # rejects any truncated cardinality read; bounded per-card content remains
     # observable through the metadata.
-    read_profile_cards: Callable[..., tuple[str, int, dict]] | None = None
+    read_profile_cards: Callable[[str], tuple[str, int, dict]] | None = None
     # (user_id, summary, enabled=...) -> ProfilePromptSelection. Production
     # performs a strict blob read and scoped enclave decrypt; any failure keeps
     # the rollback-compatible summary and returns a content-free reason.
@@ -3219,7 +3221,6 @@ async def _run_trajectory_review_turn(
     job: dict,
     deps: TurnDeps,
     tm: TurnMetrics,
-    enclave_sem=None,
 ) -> str:
     """Offline failure review with a deliberately absent side-effect surface.
 
@@ -3228,8 +3229,6 @@ async def _run_trajectory_review_turn(
     workspace writer to accidentally invoke. The provider receives tools=None
     exactly once; its encrypted analysis is stored only on the review row.
     """
-    if enclave_sem is None:
-        enclave_sem = _new_direct_enclave_gate()
     job_id = job["id"]
     user_id = str(job["user_id"])
     claimed_by = str(job.get("claimed_by") or "")
@@ -3306,7 +3305,7 @@ async def _run_trajectory_review_turn(
             raise RuntimeError("trajectory_codec_unavailable")
 
         _report_turn_progress("trajectory_review_provider_resolve_start")
-        async with enclave_sem:
+        async with ENCLAVE_SEMAPHORE:
             provider_config, _meta = await asyncio.to_thread(
                 deps.resolve_provider,
                 user_id,
@@ -3337,7 +3336,7 @@ async def _run_trajectory_review_turn(
         decoded_events: list[dict] = []
         for row in rows:
             await _review_fence("trajectory_review_decrypt_start")
-            async with enclave_sem:
+            async with ENCLAVE_SEMAPHORE:
                 plaintext = await asyncio.to_thread(
                     deps.open_trajectory_payload,
                     user_id,
@@ -3656,7 +3655,7 @@ def _make_fold_new_messages(
     user_id: str,
     deps: TurnDeps,
     cursor_box: dict,
-    enclave_sem=_DEFAULT_ENCLAVE_GATE,
+    enclave_sem: "asyncio.Semaphore | None" = ENCLAVE_SEMAPHORE,
     *,
     prompt_through_seq: int | None = None,
 ) -> Callable[[], Awaitable[list[dict]]]:
@@ -3681,9 +3680,9 @@ def _make_fold_new_messages(
     R3). This closure must do the same: it is called once per round by
     `tool_loop.run_tool_loop`, which `await`s it, so calling the sync reader directly here
     (no thread offload, no semaphore) would block the loop thread for the enclave round-trip
-    AND let concurrent workers hit the shared, capacity-bounded enclave ungated. Production
-    passes the broker-backed turn gate explicitly; direct tests get a private gate unless they
-    pass `enclave_sem=None` to exercise the no-gate compatibility path (mirrors
+    AND let concurrent workers hit the shared, capacity-bounded enclave ungated. `enclave_sem` defaults
+    to the module-level `ENCLAVE_SEMAPHORE` (the same shared gate `process_job` uses); tests
+    that want to exercise the closure with no gating pass `enclave_sem=None` (mirrors
     `_coalesce_inputs`/`_cap_data`'s own `enclave_sem is None` no-gate tolerance).
 
     `cursor_box` is a mutable `{"seq": int, "ts": float}` dict the caller owns and shares with
@@ -3708,9 +3707,6 @@ def _make_fold_new_messages(
     tie or a late-arriving earlier-ts message could strand a message below the boundary
     forever; that ts fragility is exactly the D5 no-reply bug this seq wiring fixes).
     """
-
-    if enclave_sem is _DEFAULT_ENCLAVE_GATE:
-        enclave_sem = _new_direct_enclave_gate()
 
     async def fold_new_messages() -> list[dict]:
         seq_native = "seq" in cursor_box
@@ -8345,7 +8341,7 @@ async def _run_wake(
         # block above: `_cap_data` acquires enclave_sem ITSELF (see its body), and
         # asyncio.Semaphore is NOT reentrant. Nesting it inside another
         # `async with enclave_sem` deadlocks whenever the semaphore value is 1
-        # (a gate wider than one would hide this, so a naive test would pass
+        # (FEEDLING_V2_ENCLAVE_CONCURRENCY defaults to 2, so a naive test would pass
         # while production wedges wherever the value is 1). The gate still bounds the
         # call — _cap_data holds the semaphore for its own turn.
         grounding_results = None
@@ -9888,7 +9884,6 @@ async def _run_profile(
         attempts = _profile_attempt_count(previous)
         now_ts = time.time()
         await _fence_profile_write("failure metadata write")
-        _report_turn_progress("profile_write_started")
         return v2_profile_store.build_profile_document(
             user_id,
             state=("degraded" if previous.get("memory") is not None else "pending"),
@@ -9913,20 +9908,11 @@ async def _run_profile(
         nonlocal terminal_reject
         if deps.read_profile_cards is None:
             raise RuntimeError("profile_cards_reader_unavailable")
-        _report_turn_progress("profile_index_started")
-        loop = asyncio.get_running_loop()
-
-        def _thread_progress(stage: str) -> None:
-            loop.call_soon_threadsafe(_report_turn_progress, stage)
-
         async with enclave_sem:
             rendered, card_count, tail_window = await asyncio.to_thread(
                 deps.read_profile_cards,
                 user_id,
-                _thread_progress,
             )
-        await asyncio.sleep(0)
-        _report_turn_progress("profile_cards_completed")
         raw_count, max_updated_at = await asyncio.to_thread(
             db.memory_profile_source_stats,
             user_id,
@@ -9945,7 +9931,6 @@ async def _run_profile(
         if card_count == 0:
             terminal_reject = ""
             await _fence_profile_write("empty profile write")
-            _report_turn_progress("profile_write_started")
             return v2_profile_store.build_profile_document(
                 user_id,
                 state="empty",
@@ -9957,29 +9942,10 @@ async def _run_profile(
                     "retry_not_before": 0,
                 },
             )
-        provider_call_ordinal = 0
-
-        async def _profile_llm(*args, **kwargs):
-            nonlocal provider_call_ordinal
-            provider_call_ordinal += 1
-            ordinal = provider_call_ordinal
-            _report_turn_progress(f"profile_provider_request:{ordinal}")
-            kwargs.setdefault(
-                "progress_cb",
-                lambda stage, attempt: _report_turn_progress(
-                    f"profile_provider_{stage}:{ordinal}:{int(attempt)}"
-                ),
-            )
-            result = await provider_client.reliable_chat_completion_async(
-                *args, **kwargs
-            )
-            _report_turn_progress(f"profile_provider_response:{ordinal}")
-            return result
-
         generated = await v2_profile.generate_profile(
             provider_config=provider_config,
             rendered_cards=rendered,
-            llm=_profile_llm,
+            llm=provider_client.reliable_chat_completion_async,
             usage_out=(tm.add_call if tm is not None else None),
             trajectory_out=_trajectory,
             tail_window=tail_window,
@@ -9989,7 +9955,6 @@ async def _run_profile(
             return await _metadata_failure(previous, terminal_reject)
         terminal_reject = ""
         await _fence_profile_write("profile write")
-        _report_turn_progress("profile_write_started")
         return v2_profile_store.build_profile_document(
             user_id,
             state="ok",
@@ -10027,7 +9992,6 @@ async def _run_profile(
             user_id,
             _recompute,
         )
-        _report_turn_progress("profile_write_completed")
         if result.status == "superseded":
             winner_state = str(result.document.get("state") or "")
             if winner_state in {"ok", "empty"}:
@@ -10068,7 +10032,6 @@ async def _run_profile(
                 user_id,
                 lambda previous: _metadata_failure(previous, code),
             )
-            _report_turn_progress("profile_write_completed")
         except Exception as metadata_exc:  # noqa: BLE001
             log.warning(
                 "[v2.worker] profile failure metadata write failed user=%s code=%s",
@@ -11224,7 +11187,7 @@ async def process_job(
     的终态 flush 点仍然生效。
     """
     if enclave_sem is None:
-        enclave_sem = _new_direct_enclave_gate()
+        enclave_sem = ENCLAVE_SEMAPHORE
     if read_parallelism is None:
         read_parallelism = MAX_READ_ACTION_PARALLELISM
 
@@ -14013,7 +13976,7 @@ async def process_job(
                 )
 
 
-async def _run_turn(job: dict, deps: TurnDeps, *, enclave_sem=None) -> str:
+async def _run_turn(job: dict, deps: TurnDeps) -> str:
     """把一个已 claim 的 job 交给 `process_job` 之前，先做一次性的 enclave-bound 解析：
     单次解密 BYOK provider key（single-decrypt-per-turn）+ 铸一个
     enclave-auth runtime_token。resolve_provider 失败（未配置/解密失败等）直接 mark_failed，
@@ -14023,8 +13986,6 @@ async def _run_turn(job: dict, deps: TurnDeps, *, enclave_sem=None) -> str:
     whole-turn 累加器在这里创建（早于 `process_job`——provider 解析失败时根本不会进
     `process_job`，那次失败仍需要一行 v2_turn_metrics），再原样传给 `process_job`
     复用（同一个 job 只有一行，不会因为累加器实例不同而分裂成两次 upsert）。"""
-    if enclave_sem is None:
-        enclave_sem = _new_direct_enclave_gate()
     job_id = job["id"]
     user_id = str(job["user_id"])
     claimed_by = str(job.get("claimed_by") or "")
@@ -14056,7 +14017,7 @@ async def _run_turn(job: dict, deps: TurnDeps, *, enclave_sem=None) -> str:
             )
 
     if lane == _TRAJECTORY_REVIEW_LANE:
-        return await _run_trajectory_review_turn(job, deps, tm, enclave_sem)
+        return await _run_trajectory_review_turn(job, deps, tm)
     if lane in _EXTRACTION_LANES:
         try:
             if await asyncio.to_thread(kill_switch.turns_halted):
@@ -14246,7 +14207,7 @@ async def _run_turn(job: dict, deps: TurnDeps, *, enclave_sem=None) -> str:
             },
         )
         try:
-            async with enclave_sem:
+            async with ENCLAVE_SEMAPHORE:
                 provider_config, _meta = await asyncio.to_thread(
                     deps.resolve_provider, user_id
                 )
@@ -14306,7 +14267,6 @@ async def _run_turn(job: dict, deps: TurnDeps, *, enclave_sem=None) -> str:
             provider_config=provider_config,
             api_key=None,
             runtime_token=runtime_token,
-            enclave_sem=enclave_sem,
             tm=tm,
             trajectory_recorder=recorder,
         )
@@ -14420,10 +14380,8 @@ async def _slot_loop(
     deps: TurnDeps,
     wake_event: "asyncio.Event | None" = None,
     lanes: "set | None" = None,
-    slot_id: str = "slot-0",
-    slot_generation: str = "g0",
-    progress_cb: "Callable[[slot_protocol.SlotProgress], None] | None" = None,
-    enclave_sem=None,
+    slot_id: int = 0,
+    progress_cb: "Callable[[int, float | None], None] | None" = None,
 ) -> None:
     """一个 job-slot：抢一个 job 就跑一回合，抢不到就等待（poll_interval 兜底，
     wake_event 命中时立刻醒——见 `_wait_for_job_or_stop`）。stop_event 置位后不再抢新活，
@@ -14455,25 +14413,11 @@ async def _slot_loop(
     mark_running 撞到一次性 DB 错误）绝不允许冒出这个协程、拖垮 run_worker_loop 里其他
     仍然健康的 slot——记日志后 continue，下一轮再抢。"""
 
-    active_job: slot_protocol.ActiveJobIdentity | None = None
-
-    def _signal_progress(
-        stage: str,
-        turn_start: float | None = None,
-    ) -> None:
+    def _signal_progress(turn_start: float | None = None) -> None:
         if progress_cb is None:
             return
         try:
-            progress_cb(
-                slot_protocol.SlotProgress(
-                    slot_id=slot_id,
-                    slot_generation=slot_generation,
-                    monotonic_at=time.monotonic(),
-                    turn_start=turn_start,
-                    stage=stage,
-                    active_job=active_job if turn_start is not None else None,
-                )
-            )
+            progress_cb(slot_id, turn_start)
         except Exception as e:  # noqa: BLE001 — 心跳信号故障绝不能拖垮 slot 主循环
             log.debug("[v2.worker] slot %s progress_cb failed: %s", worker_id, e)
 
@@ -14487,50 +14431,38 @@ async def _slot_loop(
             # THIS read as a reason to stop draining jobs it may already own).
             if await asyncio.to_thread(kill_switch.turns_halted):
                 await _wait_for_job_or_stop(stop_event, wake_event, poll_interval)
-                _signal_progress("idle")
+                _signal_progress()
                 continue
             job = await asyncio.to_thread(
                 jobs_store.claim_next_job, worker_id, lanes=lanes
             )
             if job is None:
                 await _wait_for_job_or_stop(stop_event, wake_event, poll_interval)
-                _signal_progress("idle")
+                _signal_progress()
                 continue
             # (a) claimed a job, about to enter _run_turn — record the turn's start
             # time and report it so a wedge INSIDE _run_turn (the slot never reaches
             # (b) below) still shows up as a climbing current_turn_age_sec even
             # though this slot never sends another message.
             turn_start = time.monotonic()
-            active_job = slot_protocol.ActiveJobIdentity(
-                job_id=int(job["id"]),
-                lane=str(job.get("lane") or "chat"),
-                claimed_by=str(job.get("claimed_by") or worker_id),
-            )
-            _signal_progress("claimed", turn_start)
+            _signal_progress(turn_start)
 
             # Keep the public `_run_turn(job, deps)` seam unchanged (many tests
             # and assembly callers replace it directly).  A task-local callback
             # lets provider/tool/compaction helpers refresh this exact slot's
             # stall clock without leaking progress across concurrent slots.
-            def _active_turn_progress(stage: str) -> None:
-                _signal_progress(stage, turn_start)
+            def _active_turn_progress(_stage: str) -> None:
+                _signal_progress(turn_start)
 
             progress_token = _TURN_PROGRESS_CB.set(_active_turn_progress)
             try:
-                if enclave_sem is None:
-                    await _run_turn(job, deps)
-                else:
-                    await _run_turn(job, deps, enclave_sem=enclave_sem)
+                await _run_turn(job, deps)
             finally:
                 _TURN_PROGRESS_CB.reset(progress_token)
-            _signal_progress("durable_completion", turn_start)
-            active_job = None
-            _signal_progress("idle")  # (b) turn completed — back to idle
+            _signal_progress(None)  # (b) turn completed — back to idle
         except Exception as e:  # noqa: BLE001 — 单 slot 故障绝不冒出去拖垮其他 slot
             log.warning("[v2.worker] slot %s iteration failed: %s", worker_id, e)
             if job is not None:
-                if active_job is not None:
-                    _signal_progress("failure_cleanup", turn_start)
                 try:
                     user_id = str(job.get("user_id") or "")
                     message = f"slot_failure:{type(e).__name__.lower()}"
@@ -14583,8 +14515,7 @@ async def _slot_loop(
                         _safe_failure_code("slot_recovery_failed", recovery_error),
                     )
             await _wait_for_job_or_stop(stop_event, wake_event, poll_interval)
-            active_job = None
-            _signal_progress("idle")  # (c) idle/error poll wake
+            _signal_progress()  # (c) idle/error poll wake — slot is alive, just cycling
             continue
 
 
@@ -14596,9 +14527,7 @@ async def run_worker_loop(
     stop_event: asyncio.Event,
     deps: TurnDeps,
     wake_event: "asyncio.Event | None" = None,
-    progress_cb: "Callable[[slot_protocol.SlotProgress], None] | None" = None,
-    slot_generation: str = "g0",
-    slot_ids: "list[str] | None" = None,
+    progress_cb: "Callable[[int, float | None], None] | None" = None,
 ) -> None:
     """起 max_workers 个 job-slot 协程共抢同一张 agent_jobs（SKIP LOCKED 无争用）。
     stop_event 置位 → 所有 slot 跑完手上 job 后退出（SIGTERM 优雅 drain 的落点）。
@@ -14622,9 +14551,6 @@ async def run_worker_loop(
     _reserved_env = os.environ.get("FEEDLING_V2_CHAT_RESERVED_SLOTS", "").strip()
     reserved = int(_reserved_env) if _reserved_env else None
     assignments = _reserved_lane_slots(max_workers, reserved)
-    resolved_slot_ids = slot_ids or [f"slot-{i}" for i in range(len(assignments))]
-    if len(resolved_slot_ids) != len(assignments):
-        raise ValueError("slot_ids must match max_workers")
     slots = [
         asyncio.create_task(
             _slot_loop(
@@ -14634,8 +14560,7 @@ async def run_worker_loop(
                 deps=deps,
                 wake_event=wake_event,
                 lanes=assignments[i],
-                slot_id=resolved_slot_ids[i],
-                slot_generation=slot_generation,
+                slot_id=i,
                 progress_cb=progress_cb,
             )
         )

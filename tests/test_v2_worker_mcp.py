@@ -225,17 +225,15 @@ def test_chat_turn_offers_and_dispatches_configured_mcp_tool(monkeypatch):
     ])
     deps = _deps([{"id": "m1", "ts": 10.0, "role": "user", "content": "ping it"}],
                  load_mcp_turn=load_fn)
-    enclave_sem = asyncio.Semaphore(1)
 
     status = asyncio.run(worker.process_job(
-        job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt-turn",
-        enclave_sem=enclave_sem))
+        job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt-turn"))
 
     assert status == "completed"
     # load_turn_mcp was called with this turn's user + runtime token
     assert seen_load and seen_load[0]["user_id"] == uid
     assert seen_load[0]["runtime_token"] == "rt-turn"
-    assert seen_load[0]["enclave_sem"] is enclave_sem
+    assert seen_load[0]["enclave_sem"] is worker.ENCLAVE_SEMAPHORE
     # the MCP tool was offered to the provider in round 1
     assert any(s.name == "mcp__test__ping" for s in calls[0]["tools"])
     # the mcp__ call was routed to the MCP dispatcher (not the platform executor)

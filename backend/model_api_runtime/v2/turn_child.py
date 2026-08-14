@@ -51,9 +51,7 @@ if str(_BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(_BACKEND_DIR))
 
 import db  # noqa: E402
-from model_api_runtime.v2 import enclave_broker  # noqa: E402
 from model_api_runtime.v2 import serve_worker  # noqa: E402 — 见模块 docstring：复用装配层
-from model_api_runtime.v2 import slot_protocol  # noqa: E402
 from model_api_runtime.v2 import worker as v2_worker  # noqa: E402
 
 if TYPE_CHECKING:  # pragma: no cover — 类型检查专用，运行期不需要真的 import
@@ -81,9 +79,9 @@ def _make_progress_cb(conn: "Connection") -> "callable":
     try/except 包了这次调用（双保险），这里再兜一层是因为 `conn.send` 在 BrokenPipe 之外
     还可能抛 `OSError`/`ValueError`（管道已 close 后再 send）。"""
 
-    def _progress_cb(progress: slot_protocol.SlotProgress) -> None:
+    def _progress_cb(slot_id: int, turn_start: float | None = None) -> None:
         try:
-            conn.send(slot_protocol.encode_message(progress))
+            conn.send(("progress", slot_id, time.monotonic(), turn_start))
         except (BrokenPipeError, OSError, ValueError) as e:
             log.info("[v2.turn_child] progress pipe closed, dropping progress signal: %s", e)
 
@@ -94,7 +92,6 @@ async def _event_loop_heartbeat(
     conn: "Connection",
     stop_event: asyncio.Event,
     *,
-    slot_generation: str,
     interval: float = 5.0,
 ) -> None:
     """Prove that the child event loop itself can still schedule callbacks.
@@ -115,14 +112,7 @@ async def _event_loop_heartbeat(
     """
     while not stop_event.is_set():
         try:
-            conn.send(
-                slot_protocol.encode_message(
-                    slot_protocol.LoopHeartbeat(
-                        slot_generation=slot_generation,
-                        monotonic_at=time.monotonic(),
-                    )
-                )
-            )
+            conn.send(("loop_heartbeat", time.monotonic()))
         except (BrokenPipeError, OSError, ValueError) as e:
             log.info("[v2.turn_child] heartbeat pipe closed: %s", e)
             return
@@ -132,15 +122,7 @@ async def _event_loop_heartbeat(
             pass
 
 
-async def _run(
-    conn: "Connection",
-    worker_id: str,
-    poll_interval: float,
-    pool: str,
-    slot_id: str,
-    lanes: tuple[str, ...],
-    slot_generation: str,
-) -> None:
+async def _run(conn: "Connection", worker_id: str, poll_interval: float) -> None:
     stop_event = asyncio.Event()
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGTERM, signal.SIGINT):
@@ -153,41 +135,27 @@ async def _run(
             log.warning("[v2.turn_child] add_signal_handler unsupported for %s", sig)
 
     deps = serve_worker.build_production_deps()
-    enclave_sem = enclave_broker.BrokerSemaphore(
-        conn,
-        pool=pool,
-        slot_id=slot_id,
-        slot_generation=slot_generation,
-    )
     # "v2_jobs" 即时唤醒：跟父进程原来的 _serve 一样，wake_event 必须在 running loop 里
     # 创建/绑定。`wire_assembly()`（在 `main()` 里、进入这个协程之前）只负责注册
     # handler，不依赖 running loop——镜像 serve_worker._serve 里同一段注释的说明。
     wake_event = asyncio.Event()
     v2_worker.set_job_wake_context(loop, wake_event)
-    claimed_by = f"{worker_id}:{slot_id}:{slot_generation}"
     log.info(
-        "[v2.turn_child] starting owner=%s pool=%s lanes=%s pid=%s",
-        claimed_by, pool, lanes, os.getpid(),
+        "[v2.turn_child] starting worker=%s max_workers=%s pid=%s",
+        worker_id, v2_worker.MAX_WORKERS, os.getpid(),
     )
 
     tasks = [
-        asyncio.create_task(v2_worker._slot_loop(
-            claimed_by,
+        asyncio.create_task(v2_worker.run_worker_loop(
+            worker_id,
+            max_workers=v2_worker.MAX_WORKERS,
             poll_interval=poll_interval,
             stop_event=stop_event,
             deps=deps,
             wake_event=wake_event,
-            lanes=set(lanes),
             progress_cb=_make_progress_cb(conn),
-            slot_generation=slot_generation,
-            slot_id=slot_id,
-            enclave_sem=enclave_sem,
         )),
-        asyncio.create_task(
-            _event_loop_heartbeat(
-                conn, stop_event, slot_generation=slot_generation
-            )
-        ),
+        asyncio.create_task(_event_loop_heartbeat(conn, stop_event)),
     ]
     try:
         # run_worker_loop 已经把所有可恢复的 per-slot 故障吞在内部；能逃出来的异常代表
@@ -202,20 +170,10 @@ async def _run(
             if not task.done():
                 task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
-        await enclave_sem.close()
     log.info("[v2.turn_child] drained; exiting worker=%s pid=%s", worker_id, os.getpid())
 
 
-def main(
-    conn: "Connection",
-    worker_id: str,
-    poll_interval: float | None = None,
-    pool: str = "foreground",
-    slot_id: str = "foreground-0",
-    lanes: tuple[str, ...] = ("chat", "manual_wake"),
-    db_pool_max: int = 2,
-    slot_generation: str = "g0",
-) -> None:
+def main(conn: "Connection", worker_id: str, poll_interval: float | None = None) -> None:
     """`child_supervisor.ChildSupervisor` 的 spawn target——签名约定
     `spawn_target(conn_write_end, *spawn_args)`，这里的 `spawn_args` 就是
     `(worker_id, poll_interval)`（由 `serve_worker._serve` 传入，沿用跟父进程心跳/
@@ -234,9 +192,10 @@ def main(
     logging.basicConfig(level=logging.INFO)
     log.info("[v2.turn_child] child process starting pid=%s worker_id=%s", os.getpid(), worker_id)
     try:
-        # Override the inherited parent value before this fresh process opens
-        # its own lazy pool. Every child owns exactly one turn slot.
-        db.configure_pool_max_size(int(db_pool_max))
+        # Validate before db.init_schema() creates this fresh process's lazy
+        # pool.  The parent normally exports the computed ceiling before spawn;
+        # the child repeats the check so direct invocation cannot bypass it.
+        serve_worker._configure_db_pool_capacity(v2_worker.MAX_WORKERS)
         db.init_schema()
         serve_worker.wire_assembly()
         # 周期性全量自愈——和 serve_worker.main / backend lifespan 对称。turn_child
@@ -249,17 +208,7 @@ def main(
             poll_interval if poll_interval is not None
             else serve_worker._positive_float_env("FEEDLING_V2_POLL_INTERVAL_SEC", "1.0")
         )
-        asyncio.run(
-            _run(
-                conn,
-                worker_id,
-                interval,
-                pool,
-                slot_id,
-                tuple(lanes),
-                slot_generation,
-            )
-        )
+        asyncio.run(_run(conn, worker_id, interval))
     finally:
         try:
             conn.close()

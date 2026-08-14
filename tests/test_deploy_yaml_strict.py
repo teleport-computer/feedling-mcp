@@ -51,35 +51,3 @@ def test_ci_runs_the_strict_deploy_yaml_gate():
         "tests/test_deploy_yaml_strict.py" in step.get("run", "")
         for step in steps
     )
-
-
-def test_test_environment_uses_literal_three_pool_runtime_values():
-    path = ROOT / "deploy" / "docker-compose.phala.test.yaml"
-    compose = load_yaml_strict(
-        path.read_text(),
-        source_name=str(path.relative_to(ROOT)),
-    )
-    environment = compose["services"]["serve-worker"]["environment"]
-
-    assert environment | {
-        "FEEDLING_V2_FOREGROUND_SLOTS": "2",
-        "FEEDLING_V2_WAKE_SLOTS": "1",
-        "FEEDLING_V2_HEAVY_SLOTS": "1",
-        "FEEDLING_V2_PROFILE_INSTANCE_CONCURRENCY": "1",
-        "FEEDLING_V2_ENCLAVE_INSTANCE_CONCURRENCY": "4",
-    } == environment
-    for key in (
-        "FEEDLING_V2_FOREGROUND_SLOTS",
-        "FEEDLING_V2_WAKE_SLOTS",
-        "FEEDLING_V2_HEAVY_SLOTS",
-        "FEEDLING_V2_PROFILE_INSTANCE_CONCURRENCY",
-        "FEEDLING_V2_ENCLAVE_INSTANCE_CONCURRENCY",
-    ):
-        assert "${" not in environment[key]
-    for retired in (
-        "FEEDLING_V2_POOL_MODE",
-        "FEEDLING_V2_MAX_WORKERS",
-        "FEEDLING_V2_CHAT_PREEMPTION_ENABLED",
-        "FEEDLING_V2_SLOT_PROCESS_ISOLATION",
-    ):
-        assert retired not in environment

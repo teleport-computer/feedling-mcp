@@ -967,8 +967,7 @@ _ERROR_CLASS_RULES = (
 CONSUMER_ERROR_CLASSES = frozenset(
     {klass for klass, _blame, _text, _pat in _ERROR_CLASS_RULES}
     | {
-        "turn_timeout", "platform_queue_timeout", "platform_execution_timeout",
-        "provider_timeout", "provider_empty_reply", "reply_parse_failed",
+        "turn_timeout", "provider_empty_reply", "reply_parse_failed",
         "model_not_found", "unknown",
         "image_generation_model_required", "image_generation_model_incompatible",
         "image_generation_auth_invalid", "image_generation_quota_insufficient",
