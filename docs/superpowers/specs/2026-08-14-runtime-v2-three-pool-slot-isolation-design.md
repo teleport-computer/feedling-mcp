@@ -403,36 +403,22 @@ admission。
 只有存在 durable、幂等的服务端自动重试时，文案才能承诺“无需重发”。不能用话术掩盖一个已
 终局失败且不会自动恢复的 Job。
 
-## 11. 配置与回滚
+## 11. 配置与恢复
 
-这些参数都是非敏感的容量、调度和功能开关，不放入 GitHub Secret、GitHub Variable 或 Phala
-encrypted env。它们直接写在各环境主 CVM compose 的 `serve-worker.environment` 中：
-
-- prod：`deploy/docker-compose.phala.yaml`；
-- pre：`deploy/docker-compose.phala.pre.yaml`；
-- test：`deploy/docker-compose.phala.test.yaml`。
-
-prod 的目标 YAML 为：
+三池和单 Slot 进程隔离是 Runtime V2 的唯一拓扑，不保留 legacy 模式、共享多 Slot child，
+也不保留可拼成部分上线状态的独立开关。完整实现以一个 PR 合入 `test`，先在 test 环境验证。
+以下容量参数不是 Secret，直接写入 test 主 CVM compose 的 `serve-worker.environment`，不放入
+GitHub Secret、GitHub Variable 或 Phala encrypted env：
 
 ```yaml
-FEEDLING_V2_POOL_MODE: "three_pool"
 FEEDLING_V2_FOREGROUND_SLOTS: "4"
 FEEDLING_V2_WAKE_SLOTS: "2"
 FEEDLING_V2_HEAVY_SLOTS: "2"
 FEEDLING_V2_PROFILE_INSTANCE_CONCURRENCY: "1"
 FEEDLING_V2_ENCLAVE_INSTANCE_CONCURRENCY: "4"
-FEEDLING_V2_CHAT_PREEMPTION_ENABLED: "1"
-FEEDLING_V2_SLOT_PROCESS_ISOLATION: "1"
 ```
 
-pre 在生产推广前必须写成相同的 `4/2/2` 做拓扑等价验证。test 可先在 Phase 2 使用
-`2/1/1 = 4` 验证进程模型，验证后再显式改成 `4/2/2 = 8`；所有值都在 YAML 中可审计，不能被
-未展示的 CI repo variable 覆盖。
-
-`FEEDLING_V2_POOL_MODE: "legacy"` 时继续读取现有 `FEEDLING_V2_MAX_WORKERS` 和
-`FEEDLING_V2_CHAT_RESERVED_SLOTS`。切到 `three_pool` 后，从对应 compose 删除旧
-`FEEDLING_V2_MAX_WORKERS`，避免操作者误以为它会额外增加容量；代码在 three-pool 模式也必须
-明确忽略旧值。Admin 展示最终解析后的三个容量值。
+旧 `FEEDLING_V2_MAX_WORKERS` 不再参与容量计算。Admin 展示最终解析后的三个容量值。
 
 以下内容仍属于 Secret，继续通过现有加密环境注入，绝不能内联到 YAML：
 
@@ -441,20 +427,12 @@ pre 在生产推广前必须写成相同的 `4/2/2` 做拓扑等价验证。test
 - provider/API key；
 - 其他密码、token 和私钥。
 
-直接修改 YAML 会改变 compose hash，需要按现有发布流程重新授权/部署。这是有意选择：容量和
-故障域变更应进入代码审查和部署记录，不允许在 GitHub Secret 页面静默漂移。
+直接修改 YAML 会改变 compose hash，需要按现有发布流程重新授权/部署。容量和故障域变更因此
+进入代码审查和部署记录，不能在 GitHub Secret 页面静默漂移。
 
-上线仍保留以下独立代码开关，但开关值均由 YAML 显式声明：
-
-1. lane-aware admission；
-2. Chat preemption；
-3. 三池 dispatcher；
-4. per-slot process；
-5. Profile batching/global cap。
-
-回滚顺序与上线相反。通过提交 YAML 把 `POOL_MODE` 改成 `legacy` 并重新部署，恢复当前单
-`turn_child` 模式；关闭抢占后恢复现有同用户单飞。数据库迁移必须向后兼容旧 worker：新
-heartbeat `pool` 字段有兼容默认值，新取消字段/状态不能使旧 claim SQL 误领终局 Job。
+恢复不切换运行模式：重新部署此前已验证的 known-good image/commit。加法迁移 `0085` 保留
+安装，不做降级；它与旧 image 向后兼容。恢复后重新核对 worker heartbeat、Foreground capacity、
+队列年龄和 exact-claim 回收，再决定是否继续测试。
 
 ## 12. 可观测性
 
@@ -518,39 +496,18 @@ Admin 和指标至少新增：
 - Provider 429/timeout 率无显著增长；
 - DB connection wait/timeout 不增长到影响 Chat。
 
-“不可接受回退”和“显著增长”的数值阈值必须在实施计划的基线采集任务中，用 test/pre 当前数据
-固定后再进入 prod，不在没有基线的设计阶段伪造百分比。
+“不可接受回退”和“显著增长”的数值阈值必须用 test 当前数据固定，不在没有基线的设计阶段
+伪造百分比。
 
-## 14. 上线与扩容顺序
+## 14. test 实施与扩容顺序
 
-### Phase 0：基线与低风险修正
+完整三池实现以一个 PR 合入 `test`，不拆成可独立启停的部分拓扑。顺序是：
 
-1. 采集 test/pre/prod 的 pool、DB、Enclave、provider 与 claim latency 基线；
-2. 增加 lane-aware admission 查询和指标，但先 shadow 对比；
-3. 补 Profile 阶段轨迹；
-4. 修正 provider timeout/hang blame 与文案。
-
-### Phase 1：P0 止血
-
-1. 上线 Chat 原子抢占和 stale-owner write fence 测试；
-2. 上线 watchdog 精确 claim 回收；
-3. 在 test 完成 P0 故障注入；
-4. 在 pre 验证真实 provider、Enclave、DB 链路。
-
-### Phase 2：三池与单 Slot 进程
-
-1. 先以总容量 4 验证进程模型，不同时引入扩容变量；
-2. 开启 Foreground/Wake/Heavy 三池和 per-slot watchdog；
-3. 验证 pool capacity、取消通知和 respawn；
-4. 扩到 `4/2/2 = 8`；
-5. 观察完整流量窗口后决定是否扩到 `6/2/2 = 10`。
-
-### Phase 3：Profile 与资源优化
-
-1. Profile batching + global concurrency 1；
-2. Enclave 实例级 broker 初始总并发 4；
-3. DB child pool 上限与连接指标；
-4. 根据生产基线决定是否扩到 `8/2/2 = 12` 或横向增加 CVM。
+1. 采集 test 的 pool、DB、Enclave、provider 与 claim latency 基线；
+2. 部署 `4/2/2 = 8`、Chat 原子抢占、per-slot watchdog、精确 claim 回收；
+3. 同时启用 Profile batching/concurrency 1、Enclave broker 4 和 child DB pool 2；
+4. 完成 P0 故障注入、554-card 等价负载和资源检查；
+5. 观察完整 test 流量窗口后，另行评审是否增加 Foreground slot。
 
 任何普通开发分支 PR 目标为 `test`。进入 `main` 的生产推广必须来自 `test` 或 `pre`，并记录
 test/pre 的故障注入、资源和用户链路证据。该改动改变部署拓扑、故障域和隔离假设，实施时必须
@@ -561,15 +518,15 @@ test/pre 的故障注入、资源和用户链路证据。该改动改变部署�
 
 | 风险 | 缓解 |
 | --- | --- |
-| 进程数增加导致内存膨胀 | 先总容量 4 验证；8-slot 要求 <70% 内存；child DB pool 固定小上限 |
+| 进程数增加导致内存膨胀 | test 的 8-slot 要求 <70% 内存；child DB pool 固定小上限 |
 | Enclave semaphore 随进程倍增 | Parent 实例级 broker + Enclave 服务硬上限 |
 | 抢占时外部工具已发出 | lease/write fence + effect/call idempotency + 故障注入 |
 | Scheduled/Capture 被抢占后丢工作 | lane-specific durable successor/recovery，不做通用 `superseded` |
 | kill 后误回收新 owner | 所有回收带 `job_id + claimed_by + generation` |
 | cancel 通知丢失 | DB 先终结 + Parent reconciliation + lease fence |
 | 三池容量被错误汇总 | heartbeat 显式 `pool` 字段；Chat 只读 Foreground |
-| 8-slot Provider 并发放大 | 先 4-slot 验证，再 8-slot；监控 route 429/timeout |
-| 方案过大难以回滚 | 五个独立 feature flag，按 Phase 分 PR/部署 |
+| 8-slot Provider 并发放大 | Enclave broker 保持实例上限 4；监控 route 429/timeout |
+| 新拓扑部署异常 | 重部署 previous known-good image/commit；保留兼容的加法迁移 `0085` |
 
 ## 16. 完成定义
 
@@ -577,8 +534,8 @@ test/pre 的故障注入、资源和用户链路证据。该改动改变部署�
 
 1. 第 13 节 P0、调度、Profile 测试全部通过；
 2. test 环境数据库测试未因缺少 Postgres 而静默跳过；
-3. pre 环境完成真实 kill/respawn、Chat 抢占、554-card 等价负载验证；
+3. test 环境完成真实 kill/respawn、Chat 抢占、554-card 等价负载验证；
 4. 8-slot 资源指标满足性能门槛；
 5. 公共架构/部署/错误契约文档同步完成；
-6. 回滚开关在 pre 实测可恢复旧单 child 模式；
-7. 生产推广 PR 遵守仓库 `test/pre → main` 分支规则。
+6. previous known-good image/commit 恢复流程在 test 验证；
+7. 本设计不包含 pre/prod 推广；后续推广另行记录验证证据并遵守仓库分支规则。

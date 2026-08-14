@@ -10,6 +10,13 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **Hosted Runtime V2 isolates foreground Chat from background maintenance.**
+  Chat/manual-wake, ambient-wake, and Heavy maintenance work now use separate
+  capacity pools with one OS process per worker slot. Background work therefore
+  cannot consume every Chat execution slot, and a hung Job can be recovered by
+  restarting its one slot without restarting healthy sibling Jobs. Profile
+  reads are batched and limited to one concurrent run per service instance.
+
 - **Hosted Runtime V2 proactive turns remain compatible with Claude 4.6 and
   later.** Scheduled reminders, heartbeat, manual wake, and screen-watch turns
   retain dynamic runtime context as non-user application data, then end the
