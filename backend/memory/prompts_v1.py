@@ -116,9 +116,17 @@ def normalize_bucket_language(bucket: str, text: str) -> str:
 # Keep this block operation-agnostic: Runtime V2 wake turns reuse it in a narrowed
 # add/update-only tool description where mentioning delete would reopen a hidden
 # destructive affordance in the prompt even though the executor still refuses it.
+MEMORY_CARD_LENGTH_RULE_V1 = (
+    "- Keep each card to ONE thing and its content under ~1000 characters. "
+    "Split a longer story into several cards instead of writing one long card."
+)
+
 MEMORY_WRITE_RULES_V1 = ("""
 - Write only durable user/relationship facts, preferences, boundaries, repeated patterns, or meaningful events.
 - Do not write greetings, jokes, one-off task instructions, unconfirmed guesses, roleplay hypotheticals, or the assistant's own inference.
+"""
++ MEMORY_CARD_LENGTH_RULE_V1
++ """
 - Refer to the person by the name on their identity card. NEVER call them 「用户」/"the user" in card text, and do not use the placeholder 「TA」 or the second person 「你」 for them. When you do not know a name, prefer dropping the subject entirely (「常在深夜写代码」) over inventing a label.
 - Pick one bucket and 1-4 reusable threads. Prefer existing bucket/thread names when provided; converge on the common buckets and only mint a specific new bucket (Mom / 妈妈 / the house) when none fit.
 - The bucket name MUST be ONE word in the memory's OWN language: a Chinese memory uses a Chinese bucket (from: """
@@ -146,4 +154,5 @@ COMMON_BUCKETS_GUIDANCE_V1 = (
     "桶名【只写一个词】、且只用这条记忆本身的语言那一份:中文记忆写「健康」,英文记忆写「Health」。"
     "⚠️ 绝不要把两种语言拼在一起当桶名——别写成「健康/Health」「宠物/Pets」这种带斜杠的双语串。"
     "这些都不贴合,再起一个简短的具体桶(如 妈妈、房子);别造「工作/职业/事业」这种近义重复桶。"
+    "\n" + MEMORY_CARD_LENGTH_RULE_V1
 ).strip()
