@@ -2,10 +2,16 @@
 
 ## 决策状态
 
-- 当前结果：`pending`
+- 当前结果：`pending`（部署与基础运行态通过；受控负载、峰值窗口和 previous-image
+  恢复演练尚未闭环，不能标记为 `pass`）
 - 目标环境：`test`
 - CVM：`feedling-io-test`（profile `amiller-users-projects`）
-- 待部署提交：pending（feature 分支验证完成后填写）
+- 已部署提交：`925378905fe2af464298adfed32e3cecb077b2f9`
+- 镜像：`ghcr.io/teleport-computer/feedling:9253789`
+- 实施 PR：[PR #207](https://github.com/teleport-computer/feedling-mcp/pull/207)
+- test CI：[run 31775875835](https://github.com/teleport-computer/feedling-mcp/actions/runs/31775875835)
+  全部成功，包括 test 主 CVM、test runner、远程证明和部署后 canary；pre/prod deploy
+  jobs 均跳过。
 - previous known-good commit/image：
   `afc7e4a915eb0fd34b9031203191e76b3b22c7fd` /
   `ghcr.io/teleport-computer/feedling:afc7e4a`
@@ -70,26 +76,41 @@ FEEDLING_V2_ENCLAVE_INSTANCE_CONCURRENCY=4
 
 ## 部署后验收记录
 
+部署时间：2026-08-14 14:23--14:28 CST；基础运行态复核至约 14:53 CST。
+
+public `/healthz` 返回 HTTP 200，release commit 为
+`925378905fe2af464298adfed32e3cecb077b2f9`。有效环境只包含以下五个三池变量；
+`FEEDLING_V2_POOL_MODE` 和 `FEEDLING_V2_MAX_WORKERS` 均不存在。
+
 ### 拓扑与资源
 
-- [ ] migration `0086` 已应用；不执行数据库降级。
-- [ ] 观察到 4 个不同 child PID/generation，pool 数量为 `2/1/1`。
-- [ ] Foreground/Wake/Heavy heartbeat capacity 为 `2/1/1`。
-- [ ] Enclave active grants 始终不超过 4；第 5 个 caller 等待。
-- [ ] Profile 实例并发始终不超过 1。
-- [ ] Parent DB pool max 8；每个 child max 2；约 16 个 pooled connections 在安全包络内。
-- [ ] test 主机无 OOM、无非预期容器重启，稳态 available memory ≥ 128 MiB。
-- [ ] test 主机稳态总 CPU < 85% of 1 core（排除短时启动峰值）。
+- [x] migration `0086_v2_worker_pool_heartbeats` 已应用；未执行数据库降级。
+- [x] 观察到 parent、resource tracker 和 4 个不同 child；启动 owner 分别为
+  `foreground-0`、`foreground-1`、`wake-0`、`heavy-0`，pool 数量为 `2/1/1`。
+- [x] Foreground/Wake/Heavy heartbeat capacity 为 `2/1/1`，configured/healthy
+  分别为 `2/2`、`1/1`、`1/1`，restarting 均为 0。
+- [ ] Enclave broker 配置 limit=4，当前 wait P95 最高 1.289 ms、无 active/waiting；
+  尚未执行 5 caller live contention，因此“第 5 个等待”只有自动化测试证据。
+- [ ] Profile 配置并发 1；部署观察窗内没有 Profile batch，尚无 live contention 样本。
+- [x] heartbeat 报告 Parent DB pool max 8、4 个 child 各 max 2、waiting=0、
+  timeouts=0；采样时 RDS 为 46 idle + 1 active，仍有连接余量。
+- [x] serve-worker 容器 RestartCount=0、OOMKilled=false。部署后约 6 分钟 available
+  191 MiB，约 25 分钟 available 186 MiB，均高于 128 MiB 门槛。
+- [x] 资源采样中 serve-worker 4.06% CPU、backend 12.77% CPU，其余主要容器均低于
+  1%；总量低于 85% of 1 core（排除启动峰值）。
+
+serve-worker 部署后采样为 441.5 MiB / 67 PIDs；backend 为 321.6 MiB / 46 PIDs。
+相较旧共享 child，新增的单-slot 子进程没有降低 host available memory。
 
 ### 故障注入与用户链路
 
 | 场景 | 时间/Job 或 probe ID | 结果与证据 |
 | --- | --- | --- |
-| 长 Heavy Job + 同用户 Chat | pending | pending |
-| 单 Heavy slot watchdog | pending | pending |
-| 5 个并发 Enclave caller | pending | pending |
-| Profile concurrency | pending | pending |
-| Chat smoke | pending | pending |
+| 长 Heavy Job + 同用户 Chat | pending | 部署观察窗内无合适的合成账号/受控 Job，不直接写 RDS 注入 |
+| 单 Heavy slot watchdog | pending | 尚未受控触发 watchdog；观察到 wake Job 5067 完成后，exact-claim reconcile 只 SIGKILL/拉起 wake-0，foreground/heavy PID 与容器均未重启。这是单槽 fencing 旁证，不冒充 watchdog 注入 |
+| 5 个并发 Enclave caller | CI 31775875835 | 自动化并发/故障测试通过；live heartbeat limit=4，但无 5 caller live 样本 |
+| Profile concurrency | CI 31775875835 | 自动化并发测试通过；live 配置为 1，但观察窗内 batch_count=0 |
+| Chat smoke | pending | 部署 canary round-trip 通过，但它不是 Chat；部署后窗口 Chat 样本数为 0 |
 
 必须证明：Chat claim P95 ≤ 2 秒；watchdog kill 到 exact claim release P95 ≤ 5 秒；
 单 slot watchdog 只改变一个 PID；没有重复 terminal Chat reply。
@@ -104,12 +125,19 @@ FEEDLING_V2_ENCLAVE_INSTANCE_CONCURRENCY=4
 
 | 步骤 | 时间 | 证据 |
 | --- | --- | --- |
-| previous image restored | pending | pending |
+| previous image restored | blocked-safe | 尝试重跑旧 test deploy job（run 31768281532 attempt 2）；`pin-runtime-release.sh` 发现 test 已从 `afc7e4a` 前进到新提交，在调用 `phala deploy` 前拒绝，CVM 未变更 |
 | new image redeployed | pending | pending |
 | repeated smoke/isolation | pending | pending |
 
+不能把该结果记为恢复成功。仓库的“较新 workflow 拥有部署权”保护阻止旧 workflow 覆盖
+test，这是正确的并发安全行为。后续恢复演练应增加一个受审计的 test-only workflow 输入，
+允许选择 previous known-good image，同时复用当前 test secrets、目标检查、远程证明和新版本恢复
+步骤；不应通过本地拼接不完整 secrets 或绕过 branch-head guard 完成。
+
 ## 最终判定
 
-只有 pool heartbeat、取消定向、exact recovery、Enclave/DB 上限、延迟阈值、资源阈值和
-previous-image 恢复全部具备证据时，才把结果改为 `pass`。任一关键项失败则标记 `fail`，恢复
-previous known-good image，并记录 follow-up defect。pre/prod 推广不在本记录范围内。
+本次可以判定“test 配置与基础运行态上线成功”，但完整结果继续保持 `pending`：Chat/Heavy、
+live Enclave/Profile contention、峰值窗口和 previous-image 恢复尚缺证据。只有 pool heartbeat、
+取消定向、exact recovery、Enclave/DB 上限、延迟阈值、资源阈值和 previous-image 恢复全部
+具备证据时，才把结果改为 `pass`。任一关键项失败则标记 `fail`，恢复 previous known-good
+image，并记录 follow-up defect。pre/prod 推广不在本记录范围内。
