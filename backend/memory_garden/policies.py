@@ -82,9 +82,16 @@ _RUBRIC_CONVERSATION_CAPTURE = """你找的是「值得记住的事」，不是�
 · 一次「开会 + 心率高 + 吵架」是一张厚卡（一件事），不是三张薄卡。
 · 没有值得记的，就什么都不写。大多数闲聊不必落卡，这很正常。"""
 
-_RUBRIC_HISTORY_IMPORT = """你在看一段「用户 ↔ TA」真实历史的【其中一块】。抽出值得长期留存的【事实】候选:
-关于「用户」和「他们的关系」的 durable 事实。候选阶段,落卡/去重后面做。
-闲聊/临时情绪/玩笑/未确认猜测/一次性事件不抽。"""
+#: history_import 的尺子在 genesis 的 FACT_MAP_PROMPT 里**不连续** ——
+#: 开头讲「抽什么」，中间隔着防火墙段，之后才是「不抽什么」。
+#: 拆成两个片段、由 genesis 在**原位置原顺序**分别拼回，就既消除了副本、
+#: 又不移动任何文本（codex review 2026-08-14 给的解法；此前误判为「抽不出来」）。
+HISTORY_IMPORT_OPENING_RUBRIC = """你在看一段「用户 ↔ TA」真实历史的【其中一块】。抽出值得长期留存的【事实】候选:
+关于「用户」和「他们的关系」的 durable 事实。候选阶段,落卡/去重后面做。"""
+
+HISTORY_IMPORT_FILTER_RUBRIC = """闲聊/临时情绪/玩笑/未确认猜测/一次性事件不抽。"""
+
+_RUBRIC_HISTORY_IMPORT = HISTORY_IMPORT_OPENING_RUBRIC + "\n" + HISTORY_IMPORT_FILTER_RUBRIC
 
 #: curated_archive 由两段组成 —— genesis 的 map 阶段与 write 阶段各挂一段。
 #: **本模块是这两段的唯一来源**，genesis/prompts.py 直接引用它们，不再各写一份。
@@ -104,9 +111,16 @@ _RUBRIC_CURATED_ARCHIVE = KEEP_ALL_MAP_SUFFIX + "\n\n" + KEEP_ALL_WRITE_SUFFIX
 # 共用的结构性规则（⏸ 已写好，尚未接线 —— 见下方说明）
 # --------------------------------------------------------------------------- #
 
+#: ⚠️ 这段是**条件化**的，别改回无条件句。
+#:
+#: 第一版写成「…英文就用英文；别归成英文桶/线索」，两句直接矛盾 ——
+#: 后半句无条件生效，对纯英文素材同样要求「别用英文桶」，会加剧
+#: 「英文用户拿到中文卡」这个已存在的问题（codex review 2026-08-14 指出）。
+#: 现在改成按材料语言分支，并给混合材料一条明确规则。
 LANGUAGE_RULE_TEMPLATE = """语言：所有字段（bucket/threads/summary/content）用{basis}的语言——
-中文就用中文（用「宠物」不是「pets」、「旅行」不是「travel」），英文就用英文；
-别归成英文桶/线索；只有专有名词、品牌名、原话才保留原文。"""
+中文材料就用中文（用「宠物」不是「pets」、「旅行」不是「travel」），
+英文材料就用英文（用 "pets" 不是「宠物」）；混合材料按每条事实自身的主语言。
+只有专有名词、品牌名、原话才保留原文。"""
 
 #: 各来源的「语言依据」。这是三档之间**必要**的差异，不是措辞不一致：
 #: 导入一批英文历史记录、而用户当前说中文时，两者会分叉 —— 那时卡应该跟素材走。
@@ -127,9 +141,15 @@ def language_rule(policy_name: str, *, indent: str = "", first_prefix: str = "")
     ``first_prefix`` / ``indent`` 让调用方套进自己的排版
     （capture 的模板是「   · 」开头的列表项，续行缩进 5 空格；
     genesis 是顶格的一段）。规则文字本身共用，排版各随宿主。
+
+    档位名走 ``get_policy`` 严格解析 —— 与它保持同一口径：
+    ``None``/空串回落到默认档，非空未知名抛 ``UnknownPolicyError``。
+    原实现在这里用 ``dict.get`` 静默回落，等于把上一轮修掉的 fail-open
+    又从侧门放了进来（codex review 2026-08-14 指出）。
     """
+    resolved = get_policy(policy_name)
     text = LANGUAGE_RULE_TEMPLATE.format(
-        basis=LANGUAGE_BASIS.get(policy_name, LANGUAGE_BASIS["conversation_capture"])
+        basis=LANGUAGE_BASIS.get(resolved.name, LANGUAGE_BASIS["conversation_capture"])
     )
     lines = text.splitlines()
     out = [f"{first_prefix}{lines[0]}"]

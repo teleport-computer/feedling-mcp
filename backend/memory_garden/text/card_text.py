@@ -20,7 +20,7 @@ import re
 import unicodedata
 
 from . import card_guard
-from . import self_thinking
+from agent_protocol_core import self_thinking
 from ..prompts.buckets import normalize_bucket_language
 
 # 卡上会被用户亲眼看到的文字字段(bucket/threads 也显示在花园里)。

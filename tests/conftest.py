@@ -108,6 +108,14 @@ if not _provisioned:
     # no-Postgres dev machine still runs something useful.
     _PURE_UNIT = {
         "test_card_guard.py",
+        # Memory Garden 内核（2026-08-14）：纯函数包，零 DB / 零网络。
+        # 六个文件都在「DATABASE_URL 指向不可达地址」的环境下实测通过。
+        "test_memory_garden_purity.py",
+        "test_memory_garden_policies.py",
+        "test_memory_garden_capture_golden.py",
+        "test_memory_garden_prompt_params.py",
+        "test_memory_garden_storage_port.py",
+        "test_memory_garden_dreaming.py",
         # Fully monkeypatched consumer prompt-gate unit — no DB, no network.
         "test_user_mcp_wait_hint.py",
         "test_bucket_lang_normalize.py",

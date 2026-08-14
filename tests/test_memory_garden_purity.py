@@ -18,9 +18,13 @@ _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 _BACKEND_ROOT = _REPO_ROOT / "backend"
 _KERNEL_ROOT = _BACKEND_ROOT / "memory_garden"
 
-# 第三方依赖白名单。内核目前一个都不用（只依赖标准库），留空集合即可；
-# 将来真要引入（例如某个纯算法库），在这里显式登记，让引入动作被看见。
-_ALLOWED_THIRD_PARTY: frozenset[str] = frozenset()
+# 允许的非标准库依赖。
+#
+# ``agent_protocol_core`` 是模型协议层的纯共享判据（思维链剥离、协议残片识别），
+# 与「记忆」无关 —— 聊天主链路、工具循环、主动唤醒都在用。把它单独成包是因为
+# 第一版把它塞进了 memory_garden，导致**普通聊天反向依赖记忆包**
+# （codex review 2026-08-14 指出）。它自己同样不 import 任何 io 模块。
+_ALLOWED_THIRD_PARTY: frozenset[str] = frozenset({"agent_protocol_core"})
 
 
 def _backend_top_level_names() -> frozenset[str]:
@@ -32,8 +36,10 @@ def _backend_top_level_names() -> frozenset[str]:
     那正是最容易出现的倒挂（codex code_review 2026-08-14 指出）。
     """
     names: set[str] = set()
+    # 这两个包本身就是「非 io」的纯包，不算在禁止集合里。
+    _NOT_IO = {"memory_garden", "agent_protocol_core"}
     for entry in _BACKEND_ROOT.iterdir():
-        if entry.name.startswith((".", "_")) or entry.name == "memory_garden":
+        if entry.name.startswith((".", "_")) or entry.name in _NOT_IO:
             continue
         if entry.is_dir() and (entry / "__init__.py").exists():
             names.add(entry.name)
@@ -120,3 +126,40 @@ def test_kernel_modules_import_without_side_effects():
         except Exception as exc:  # noqa: BLE001 — 要的就是「任何异常」
             failures.append(f"{module_name}: {type(exc).__name__}: {exc}")
     assert not failures, "内核模块导入失败:\n  " + "\n  ".join(failures)
+
+
+# --------------------------------------------------------------------------- #
+# agent_protocol_core 同样必须是纯的
+# --------------------------------------------------------------------------- #
+
+_PROTOCOL_ROOT = _BACKEND_ROOT / "agent_protocol_core"
+
+
+def _protocol_files() -> list[pathlib.Path]:
+    return sorted(p for p in _PROTOCOL_ROOT.rglob("*.py") if "__pycache__" not in p.parts)
+
+
+def test_protocol_core_is_not_empty():
+    assert _protocol_files(), f"agent_protocol_core 为空：{_PROTOCOL_ROOT}"
+
+
+def test_protocol_core_imports_only_stdlib():
+    """中立包只许依赖标准库 —— 它被聊天和记忆两边共用，不能反向依赖任何一边。"""
+    stdlib = set(sys.stdlib_module_names)
+    offenders: list[str] = []
+    for path in _protocol_files():
+        for root in sorted(_imported_roots(path)):
+            if root in stdlib:
+                continue
+            offenders.append(f"{path.name}: import {root}")
+    assert not offenders, (
+        "agent_protocol_core 出现了非标准库依赖：\n  " + "\n  ".join(offenders)
+    )
+
+
+def test_protocol_core_does_not_depend_on_memory_garden():
+    """方向必须是单向的：memory_garden → agent_protocol_core，不能反过来。"""
+    for path in _protocol_files():
+        assert "memory_garden" not in _imported_roots(path), (
+            f"{path.name} 反向依赖了 memory_garden"
+        )

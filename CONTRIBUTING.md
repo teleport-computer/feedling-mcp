@@ -144,12 +144,21 @@ asgi_app.py（装配，最高）
      context_memory_selection（最低；均为无业务依赖的共享/底层模块）
   ↑ memory_garden（最低；记忆判断力内核，**不 import 任何 io 模块**，
      由 tests/test_memory_garden_purity.py 的 AST 守卫钉死）
+  ↑ agent_protocol_core（最低；模型协议层的纯共享判据：思维链剥离、
+     协议残片识别。**与记忆无关** —— 聊天主链路、工具循环、主动唤醒、
+     记忆落卡都在用，所以它不属于任何一个领域。只依赖标准库）
 ```
 
 > `memory_garden` 是被抽出来的纯函数内核（什么值得记 / 怎么归桶 / 打分排序 /
 > 要不要整理 / 解析并算 mutation）。它只依赖标准库，所以天然处在最低层，
 > 被 `memory` / `genesis` / `model_api_runtime` 等上层 import。
 > 加解密、身份装配、锁、审计、调模型一律不在其中 —— 那些由调用方提供。
+>
+> `agent_protocol_core` 与它平级、互不依赖。方向是单向的：
+> `memory_garden` → `agent_protocol_core`，聊天链路也 → `agent_protocol_core`。
+> 第一版曾把这两个模块塞进 `memory_garden`，导致普通聊天反向依赖记忆包，
+> 已在 2026-08-14 拆开。
+>
 > 设计见 `docs/MEMORY_GARDEN_EXTRACTION_DESIGN.zh.md`。
 
 - `routes.py` 可以 import 平级或更低的任何 service；`service.py` 只准向下。

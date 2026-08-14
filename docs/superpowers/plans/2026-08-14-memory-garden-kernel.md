@@ -34,9 +34,9 @@ accounts / bootstrap / core.store）。所有外部输入由调用方传参。�
 | 2 | prompt 三件套进包，identity 依赖改传参 | 低 | ✅ |
 | 3 | 策略档位：genesis 与 capture 共用判断规则（消半拟合） | 中 | ✅ |
 | 4 | 存储 port + 适配器能力声明 | 中 | ✅ 只加接口，不切流 |
-| 5 | 切 V2 read/tool → capture → dream | 高 | ⛔ 等拍板 |
-| 6 | 切 V1 resident（hosted/VPS 共用文件） | 高 | ⛔ 等拍板 |
-| 7 | 切 genesis（onboarding / add_memory / keep_all / recheck） | 高 | ⛔ 等拍板 |
+| 5 | 切换全部调用方到内核（39 个文件），删掉 10 个纯转发壳 | 高 | ✅ 已完成 |
+| 6 | dream 判据搬进内核（含与旧算法对拍） | 中 | ✅ 已完成 |
+| 7 | genesis 的三处 prompt 片段改为引用 policies（唯一来源） | 中 | ✅ 已完成 |
 
 > **批 7 的一条具体待办（本轮实施中查出来的）**：
 > 除了「什么值得记」那把尺子，**结构性规则也重复了一份**。最硬的证据是语言规则——
@@ -56,10 +56,12 @@ accounts / bootstrap / core.store）。所有外部输入由调用方传参。�
 > ⚠️ **本轮不动**：统一措辞等于改 prompt，而 prompt 行为的 bug 单测抓不到，
 > 只有真模型 e2e 能暴露（capture/migrate 的单测都 stub 了 agent）。
 > 合并这类规则必须配一次真模型 e2e，放在批 7 一起做。
-| 8 | dream_scheduler 拆两半 | 中 | ⛔ 等拍板 |
+| 8 | 语言规则统一并接线（capture + genesis 同源） | 中 | ✅ 已完成 |
 | 9 | CLI / MCP 壳 | 低 | ⛔ 摸开源时再做 |
 
-批 5-8 会真正切换调用路径，动到写入与 hosted/VPS 共用文件，留待 hx 回来拍板。
+批 5-8 已完成（切调用路径、删壳、拆 dream 判据、语言规则接线）。
+真正未做的是：存储适配器切流、CLI/MCP 壳、以及测试方案里那三个阻塞缺口
+（V1 真跑、genesis 真跑、加密链路真验）。
 批 1-4 全部是「新增结构 + 保持旧路径可用」，正常流程逐字节不变。
 
 ---

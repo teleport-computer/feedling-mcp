@@ -34,8 +34,8 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "backend"))
 
-from memory_garden.text import protocol_leak as pl  # noqa: E402
-from memory_garden.text import self_thinking as st  # noqa: E402
+from agent_protocol_core import protocol_leak as pl  # noqa: E402
+from agent_protocol_core import self_thinking as st  # noqa: E402
 from proactive import agent_protocol_v2 as ap2  # noqa: E402
 
 

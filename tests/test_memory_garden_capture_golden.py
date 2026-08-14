@@ -12,7 +12,6 @@ fixture 里的五组文本是在 **origin/test 基线的 checkout 上**跑出来
 """
 from __future__ import annotations
 
-import hashlib
 import json
 import pathlib
 

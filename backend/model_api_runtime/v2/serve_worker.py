@@ -1100,7 +1100,7 @@ def _scrub_leaked_thinking_rows(rows: list[dict]) -> list[dict]:
     保留文字，格式没了、内容还在。行的 id/ts/seq 一律原样保留，compaction /
     capture 的水位连续性不受影响。
     """
-    from memory_garden.text import self_thinking as _st
+    from agent_protocol_core import self_thinking as _st
 
     if not _st.gate_enabled():
         return rows

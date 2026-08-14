@@ -71,11 +71,11 @@ from capabilities import result_budget as cap_result_budget
 from capabilities import tool_schema as cap_tool_schema
 from core import chat_activity as core_chat_activity
 from core import envelope as core_envelope
-from memory_garden.text import protocol_leak
+from agent_protocol_core import protocol_leak
 from core import tool_markup_leak
 from core import util as core_util
 from core import provider_usage
-from memory_garden.text import self_thinking
+from agent_protocol_core import self_thinking
 from core import store as core_store
 from core import wake_bus as core_wake_bus
 from core.downloadable_reply import sanitize_downloadable_reply
@@ -7526,7 +7526,7 @@ async def _run_wake(
             # the real reply, and surface the block in the thinking channel instead of
             # native reasoning. Same kill switch. Fail-closed: a malformed block →
             # silence (a legitimate wake outcome), never a leaked tag.
-            from memory_garden.text import self_thinking as _st_wake
+            from agent_protocol_core import self_thinking as _st_wake
 
             _wake_self_thinking_on = _st_wake.enabled()
             # 与聊天出口同样解耦：关掉 self-thinking 不能顺带关掉安全剥离
@@ -8037,7 +8037,7 @@ async def _run_wake(
                 )
 
         def _wake_builder():
-            from memory_garden.text import self_thinking as _st_wake_sys
+            from agent_protocol_core import self_thinking as _st_wake_sys
 
             _wake_sys = (
                 _SCREEN_WATCH_SYSTEM_PROMPT
@@ -8133,7 +8133,7 @@ async def _run_wake(
                     raise
 
         await _fence_wake_effect("wake turn")
-        from memory_garden.text import self_thinking as _st_wake_loop
+        from agent_protocol_core import self_thinking as _st_wake_loop
 
         try:
             await v2_tool_loop.run_tool_loop(
@@ -11320,7 +11320,7 @@ async def process_job(
             # text; which thinking to surface (self-authored vs native) and its
             # provenance are decided at seal time. Fail-closed on malformed <think>:
             # never leak a raw tag, never promote private thinking to the reply.
-            from memory_garden.text import self_thinking
+            from agent_protocol_core import self_thinking
 
             self_thinking_on = self_thinking.enabled()
             # 安全剥离与「要不要写/展示自写 thinking」必须解耦：FEEDLING_V2_SELF_THINKING
@@ -12181,7 +12181,7 @@ async def process_job(
         # which the seal surfaces cleanly (same as V1). Gated on the same kill switch;
         # when self-thinking is OFF this is False and the old include_reasoning path is
         # unchanged.
-        from memory_garden.text import self_thinking as _self_thinking_v2
+        from agent_protocol_core import self_thinking as _self_thinking_v2
 
         outcome = await v2_tool_loop.run_tool_loop(
             provider_config=provider_config,

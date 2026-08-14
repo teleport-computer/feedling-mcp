@@ -36,6 +36,19 @@ IO 自己的适配器用 ``FULL_CAPABILITIES``。
 
 本模块只定义接口与降级规划，不接任何真实存储。把 IO 现有的
 锁 / 信封 / 全量替换包成适配器，是后续批次的事（会动写入路径，需拍板）。
+
+## ⚠️ 这个接口还没定完（codex review 2026-08-14）
+
+已知的四处不足，**接第一个真实适配器之前必须先定**，否则所有适配器都要返工：
+
+1. ``mutations`` 现在是 ``list[dict]``，无法从类型判断这批操作需要哪些能力。
+   应该改成 ``Add`` / ``Merge`` / ``Supersede`` 之类的类型。
+2. ``ensure_supported`` 依赖每个调用方**记得**手工调用。应该在统一的
+   executor / wrapper 里按 mutation 类型自动校验，而不是靠自觉。
+3. 读侧只定义了 ``load``，没定义「挑完候选之后怎么取内容」（index → fetch →
+   decrypt 那一段现在还在 IO 侧的 ``memory_readside_core``，没进 port）。
+4. 冲突与部分失败没有标准表达：``RevisionConflict`` / ``IdempotencyConflict`` /
+   ``UnsupportedMutation`` 都还没定义，调用方只能靠约定。
 """
 from __future__ import annotations
 
@@ -249,14 +262,20 @@ def describe_for_user(caps: Capabilities) -> list[str]:
 
 @dataclass(frozen=True)
 class Snapshot:
-    """一次读取的结果：卡信封 + 这批数据的版本号。
+    """一次读取的结果：未解密的卡视图 + 这批数据的版本号。
 
     ``revision`` 是调用方做 CAS 的凭据 —— 基于这份快照算出来的 mutation
     必须带着它回来，否则并发写会基于过期快照覆盖别人刚写的卡。
     原实现只返回卡列表，调用方无从获得合法 token（codex code_review 2026-08-14）。
     """
 
-    envelopes: list[dict]
+    cards: list[dict]
+    """未解密的卡。**「信封」是 IO 适配器的内部概念，不是领域模型** ——
+    对 mem0 / SQLite 这类后端不成立。内核只要求：每张卡带得动打分需要的明文
+    元数据（重要度 / 情绪强度 / 最近被想起 / 状态），内容部分不透明即可。
+    （codex review 2026-08-14 指出原字段名 ``envelopes`` 把 IO 假设写进了 port。）
+    """
+
     revision: Any
 
 
@@ -293,7 +312,7 @@ class StoragePort(Protocol):
         ...
 
     def load(self, tenant: str, **filters: Any) -> Snapshot:
-        """取出该租户的卡信封 + 版本号。不解密。"""
+        """取出该租户的卡 + 版本号。不解密（若该后端有加密的话）。"""
         ...
 
     def apply(

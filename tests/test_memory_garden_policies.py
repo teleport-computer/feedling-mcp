@@ -8,6 +8,8 @@
 """
 from __future__ import annotations
 
+import pathlib
+
 import pytest
 
 from memory_garden.policies import (
@@ -116,20 +118,39 @@ def test_language_rule_is_shared_text_with_only_the_basis_swapped():
     assert chat.replace(" TA 跟你对话", "素材原文") == imported
 
 
-def test_language_rule_keeps_both_sides_original_points():
-    """合并后必须同时保留两边各自独有的要点，不能丢。"""
+def test_language_rule_is_conditional_not_unconditional():
+    """规则必须按材料语言分支，不能有无条件的「别用英文桶」。
+
+    第一版写成「英文就用英文；别归成英文桶/线索」，两句直接矛盾 ——
+    后半句无条件生效会加剧「英文用户拿到中文卡」。
+    （codex review 2026-08-14 指出。）
+    """
     from memory_garden.policies import language_rule
 
     text = language_rule("conversation_capture")
-    assert "旅行" in text, "capture 原有的第二个例子丢了"
-    assert "别归成英文桶/线索" in text, "genesis 原有的要点丢了"
+    assert "中文材料就用中文" in text
+    assert "英文材料就用英文" in text
+    assert "混合材料按每条事实自身的主语言" in text, "混合材料要有明确规则"
+    assert "别归成英文桶" not in text, "无条件句又回来了 —— 它与「英文材料就用英文」矛盾"
+    assert "旅行" in text, "capture 原有的例子丢了"
     assert "专有名词" in text
 
 
-def test_language_rule_falls_back_for_unknown_policy():
-    from memory_garden.policies import language_rule
+def test_language_rule_rejects_unknown_policy_like_get_policy_does():
+    """与 get_policy 同一口径 —— 不许从侧门放回 fail-open。
 
-    assert "TA 跟你对话" in language_rule("nonexistent")
+    上一轮把 get_policy 的静默回落改成抛错，但 language_rule 当时仍用
+    dict.get 静默回落（codex review 2026-08-14 指出）。
+    """
+    import pytest as _pytest
+
+    from memory_garden.policies import UnknownPolicyError, language_rule
+
+    with _pytest.raises(UnknownPolicyError):
+        language_rule("nonexistent")
+    # None / 空串仍回落，代表「旧调用方没传」
+    assert "TA 跟你对话" in language_rule(None)
+    assert "TA 跟你对话" in language_rule("")
 
 
 def test_language_rule_is_wired_into_both_sides():
@@ -181,17 +202,53 @@ def test_genesis_keep_all_comes_from_policies_not_its_own_copy():
     assert gp.FACT_WRITE_KEEP_ALL_SUFFIX == "\n\n" + KEEP_ALL_WRITE_SUFFIX
 
 
-def test_history_import_rubric_still_matches_genesis_verbatim():
-    """history_import 仍是副本（原文在 genesis 里不连续，抽出来会改行为）。
+def test_history_import_is_also_single_source_now():
+    """history_import 的副本**已消除** —— genesis 引用两个片段，不再自己写。
 
-    既然是副本，就必须逐字相同 —— 这条钉住两边不许漂移。
-    真正消除这份重复需要改动 FACT_MAP_PROMPT 的文本顺序，得先过真模型 e2e。
+    原文在 FACT_MAP_PROMPT 里不连续（中间隔着防火墙段），所以拆成
+    OPENING + FILTER 两段，由 genesis 在原位置原顺序拼回：既去重复，
+    又不移动任何文本。
     """
     from genesis import prompts as gp
-    from memory_garden.policies import HISTORY_IMPORT
+    from memory_garden.policies import (
+        HISTORY_IMPORT_FILTER_RUBRIC,
+        HISTORY_IMPORT_OPENING_RUBRIC,
+    )
 
-    for line in HISTORY_IMPORT.selection_rubric.splitlines():
-        assert line in gp.FACT_MAP_PROMPT, f"与 genesis 原文漂移了: {line!r}"
+    assert HISTORY_IMPORT_OPENING_RUBRIC in gp.FACT_MAP_PROMPT
+    assert HISTORY_IMPORT_FILTER_RUBRIC in gp.FACT_MAP_PROMPT
+    # 顺序不许颠倒：开头讲抽什么，之后才是不抽什么
+    assert gp.FACT_MAP_PROMPT.index(HISTORY_IMPORT_OPENING_RUBRIC) < gp.FACT_MAP_PROMPT.index(
+        HISTORY_IMPORT_FILTER_RUBRIC
+    )
+    # genesis 里不许再出现字面量副本
+    src = pathlib.Path(__file__).resolve().parents[1] / "backend" / "genesis" / "prompts.py"
+    text = src.read_text(encoding="utf-8")
+    assert "闲聊/临时情绪/玩笑/未确认猜测/一次性事件不抽。" not in text, "字面量副本又写回来了"
+
+
+#: genesis 三个 prompt 的字节 golden。逐行 `in` 判断抓不住重排 / 重复 / 插入，
+#: 所以这里用完整哈希（codex review 2026-08-14 指出原守卫不够）。
+#: **有意改 prompt 时更新这些值，并在提交说明里写清改了什么、为什么。**
+_GENESIS_PROMPT_GOLDEN = {
+    "FACT_MAP_PROMPT": "26dd13bcc54e83ac",
+    "COMBINED_MAP_PROMPT": "1f0721abc7aa00e6",
+}
+
+
+@pytest.mark.parametrize("name", sorted(_GENESIS_PROMPT_GOLDEN))
+def test_genesis_prompt_is_byte_identical_to_golden(name):
+    """完整 prompt 的字节 golden —— 引用重构不许改动任何一个字符。"""
+    import hashlib
+
+    from genesis import prompts as gp
+
+    text = getattr(gp, name)
+    digest = hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+    assert digest == _GENESIS_PROMPT_GOLDEN[name], (
+        f"{name} 变了。若是有意改动，更新 _GENESIS_PROMPT_GOLDEN 并说明原因；"
+        f"若不是，说明引用重构改动了文本。"
+    )
 
 
 def test_keep_all_text_keeps_genesis_original_punctuation():
@@ -200,3 +257,76 @@ def test_keep_all_text_keeps_genesis_original_punctuation():
 
     assert "不是聊天记录:" in KEEP_ALL_MAP_SUFFIX, "半角冒号被改掉了"
     assert "宁多勿漏。" in KEEP_ALL_MAP_SUFFIX
+
+
+# --------------------------------------------------------------------------- #
+# 档位必须真的进入执行路径，不能只是「描述数据」
+# --------------------------------------------------------------------------- #
+
+
+def _cards_json(n: int) -> str:
+    import json
+
+    return json.dumps(
+        {
+            "cards": [
+                {
+                    "action": "add", "type": "fact", "bucket": f"桶{i}",
+                    "threads": ["x"], "summary": f"第{i}张卡的摘要内容",
+                    "content": f"第{i}张卡的正文内容，足够长以通过内容闸。",
+                    "importance": 0.5, "pulse": 0.3,
+                }
+                for i in range(n)
+            ]
+        },
+        ensure_ascii=False,
+    )
+
+
+def test_max_cards_is_actually_enforced_not_just_declared():
+    """「少而厚 ≤2 张」必须在代码上生效，不能只写在 prompt 里。
+
+    codex review 2026-08-14 实测：此前传 3 张卡返回 3 张，max_cards 声明了
+    却没有任何调用方消费 —— 三个档位只是「描述数据」，不是可执行策略。
+    """
+    from memory_garden.prompts.capture import parse_capture_cards
+
+    cards, err = parse_capture_cards(_cards_json(3))
+    assert cards == []
+    assert err is not None and err.startswith("too_many_cards"), err
+
+
+def test_over_limit_is_a_full_batch_retry_not_a_silent_truncation():
+    """超限要打回重做整批，而不是静默截掉第三张 —— 截断会丢内容且无人知晓。"""
+    from memory_garden.prompts.capture import parse_capture_cards
+
+    _, err = parse_capture_cards(_cards_json(3), strict=True)
+    assert "too_many_cards" in err
+
+
+def test_after_retry_keeps_the_first_n_instead_of_failing_the_whole_job():
+    """重问后仍超：保留前 N 张。**不能**整批失败 ——
+    那会推进 capture frontier 把这段对话永久丢掉（与内容闸同一教训）。
+    """
+    from memory_garden.prompts.capture import parse_capture_cards
+
+    cards, err = parse_capture_cards(_cards_json(3), strict=False)
+    assert len(cards) == 2 and err is None
+
+
+def test_unlimited_policies_do_not_truncate():
+    """用户整理的档案不限张数 —— 传 3 张就该留 3 张。"""
+    from memory_garden.prompts.capture import parse_capture_cards
+
+    for name in ("curated_archive", "history_import"):
+        cards, err = parse_capture_cards(_cards_json(3), policy=name)
+        assert len(cards) == 3 and err is None, name
+
+
+def test_within_limit_is_untouched():
+    """没超限的批次行为完全不变（守住绝大多数正常路径）。"""
+    from memory_garden.prompts.capture import parse_capture_cards
+
+    for n in (0, 1, 2):
+        cards, err = parse_capture_cards(_cards_json(n))
+        assert len(cards) == n and err is None

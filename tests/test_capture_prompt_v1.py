@@ -16,7 +16,7 @@ from memory.capture_prompt_v1 import (  # noqa: E402
     parse_capture_cards,
 )
 from memory_garden.text.card_text import extract_json_block  # noqa: E402
-from memory_garden.text import self_thinking  # noqa: E402
+from agent_protocol_core import self_thinking  # noqa: E402
 
 _FENCE = "`" * 3
 

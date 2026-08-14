@@ -14,7 +14,7 @@ import re
 from typing import Any, Mapping, Sequence
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from memory_garden.text import protocol_leak
+from agent_protocol_core import protocol_leak
 from core import tool_markup_leak
 
 
@@ -99,7 +99,7 @@ def sanitize_visible_message_text_v2(
     # send_message.text 原样发了出去）。这条 lane 我们甚至没在提示词里要求它写
     # think——它是从聊天历史里学来的，所以出口必须一律过闸，不能只在「要求它写
     # 的地方」设防。proactive 本来就是 fail-closed，剥不干净直接不发。
-    from memory_garden.text import self_thinking as _st
+    from agent_protocol_core import self_thinking as _st
 
     if _st.gate_enabled():
         _status, _thinking, _stripped = _st.strip_all_thinking(value)

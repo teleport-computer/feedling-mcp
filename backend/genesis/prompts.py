@@ -94,15 +94,18 @@ PERSONA_UPDATE_MERGE_SUFFIX = """
 - 保持【连贯】:输出是【一个】一致的 persona,不是旧+新拼接。"""
 
 
-FACT_MAP_PROMPT = """你在看一段「用户 ↔ TA」真实历史的【其中一块】。抽出值得长期留存的【事实】候选:
-关于「用户」和「他们的关系」的 durable 事实。候选阶段,落卡/去重后面做。
+FACT_MAP_PROMPT = """{__OPENING__}
 
 防火墙:用户档案/用户关于自己说的话 = 关于【用户】的事实;绝不当成 TA 的性格。
 如果输入标注 source_kind=user_profile,整段都按用户档案处理:只能抽关于用户的 facts,不能推断 TA 的身份/维度/语气。
-闲聊/临时情绪/玩笑/未确认猜测/一次性事件不抽。
+{__FILTER__}
 
 输出 JSON:{"fact_candidates":[{"about":"user|relationship","summary":"一句话事实","evidence":"出处原话(短)"}]}
-没有就 {"fact_candidates":[]}。"""
+没有就 {"fact_candidates":[]}。""".replace(
+    "{__OPENING__}", mg_policies.HISTORY_IMPORT_OPENING_RUBRIC
+).replace(
+    "{__FILTER__}", mg_policies.HISTORY_IMPORT_FILTER_RUBRIC
+)
 
 
 COMBINED_MAP_PROMPT = """你在看一段「用户 ↔ TA(AI 伴侣)」真实历史的【其中一块】。
@@ -112,7 +115,7 @@ COMBINED_MAP_PROMPT = """你在看一段「用户 ↔ TA(AI 伴侣)」真实历�
 
 事实规则:
 - 用户档案/用户关于自己说的话 = 关于【用户】的事实;绝不当成 TA 的性格。
-- 闲聊/临时情绪/玩笑/未确认猜测/一次性事件不抽。
+- {__FILTER__}
 
 声音规则:
 - 声音 = 不管聊什么都成立的形式:怎么开口/怎么接情绪/句长/标点语气词/惯用动作/绝不做的事。
@@ -123,7 +126,9 @@ grounding:只用这块真实出现的原话。这块太薄/全寒暄 -> 两边�
 输出 JSON:
 {"fact_candidates":[{"about":"user|relationship","summary":"一句话事实","evidence":"出处原话(短)"}],
  "voice_candidates":{"behavior_notes_candidates":["..."],"exemplar_candidates":[{"turns":[{"role":"user","text":"..."},{"role":"ta","text":"..."}],"axis":["opening"],"why":"..."}]}}
-没有就 {"fact_candidates":[],"voice_candidates":{"behavior_notes_candidates":[],"exemplar_candidates":[]}}。"""
+没有就 {"fact_candidates":[],"voice_candidates":{"behavior_notes_candidates":[],"exemplar_candidates":[]}}。""".replace(
+    "{__FILTER__}", mg_policies.HISTORY_IMPORT_FILTER_RUBRIC
+)
 
 
 FACT_WRITE_PROMPT = """你收到从整段历史抽出的事实候选 digest(+ 可能有 AI persona / memory summary / known_memories)。把该长期留存的写进 IO。

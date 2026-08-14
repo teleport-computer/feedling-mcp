@@ -184,8 +184,8 @@ def test_user_facing_text_says_what_is_lost_not_just_what_is_missing():
 
 def test_snapshot_carries_a_revision():
     """load 必须给出 CAS 凭据，否则调用方无从合法地传 expected_revision。"""
-    snap = Snapshot(envelopes=[{"id": "m_1"}], revision="rev-7")
-    assert snap.envelopes and snap.revision == "rev-7"
+    snap = Snapshot(cards=[{"id": "m_1"}], revision="rev-7")
+    assert snap.cards and snap.revision == "rev-7"
 
 
 def test_apply_result_returns_the_new_revision():
@@ -209,7 +209,7 @@ class _FakeAdapter:
         return FULL_CAPABILITIES
 
     def load(self, tenant: str, **filters) -> Snapshot:
-        return Snapshot(envelopes=[], revision="rev-0")
+        return Snapshot(cards=[], revision="rev-0")
 
     def apply(self, tenant, mutations, *, idempotency_key, expected_revision) -> ApplyResult:
         return ApplyResult(results=[], revision="rev-1")
@@ -225,6 +225,6 @@ def test_adapter_missing_apply_is_not_a_port():
             return FULL_CAPABILITIES
 
         def load(self, tenant: str, **filters) -> Snapshot:
-            return Snapshot(envelopes=[], revision=None)
+            return Snapshot(cards=[], revision=None)
 
     assert not isinstance(MissingApply(), StoragePort)

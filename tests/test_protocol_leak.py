@@ -14,7 +14,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "backend"))
 
-from memory_garden.text import protocol_leak as pl  # noqa: E402
+from agent_protocol_core import protocol_leak as pl  # noqa: E402
 
 
 # The three real leaked tails from the live report (usr_ed9d6c05d1accb94), each a

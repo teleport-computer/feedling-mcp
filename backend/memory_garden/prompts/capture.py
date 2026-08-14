@@ -115,7 +115,10 @@ def _clamp01(value) -> float:
 
 
 def parse_capture_cards(
-    raw: str, *, strict: bool = True
+    raw: str,
+    *,
+    strict: bool = True,
+    policy: CapturePolicy | str | None = None,
 ) -> tuple[list[dict], str | None]:
     """Parse the 落卡 agent reply into normalized capture cards.
 
@@ -195,6 +198,19 @@ def parse_capture_cards(
             # nothing_worth_keeping 完成并推进 frontier,这段对话就再也没人落卡了
             # (codex review P1-3)。
             return [], format_error(hard_rejections, after_retry=True)
+
+    # 张数约束 —— 由档位决定（codex review 2026-08-14:此前 max_cards 声明了
+    # 却没有任何调用方消费,「少而厚」只写在 prompt 里、代码上不设防)。
+    resolved = policy if isinstance(policy, CapturePolicy) else get_policy(policy)
+    limit = resolved.max_cards
+    if limit is not None and len(out) > limit:
+        if strict:
+            # 打回让模型重做**整批**,而不是静默截掉多出来的那张 ——
+            # 截断会丢掉模型认为值得记的内容,且用户永远不知道。
+            return [], f"too_many_cards:{len(out)}>{limit}"
+        # 重问后仍超:保留前 limit 张。**不能**整批失败 —— 那会推进 frontier
+        # 把这段对话永久丢掉(同上面 hard_rejections 的教训)。
+        out = out[:limit]
     return out, None
 
 
