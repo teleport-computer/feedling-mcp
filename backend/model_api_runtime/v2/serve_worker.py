@@ -2677,12 +2677,14 @@ def _render_profile_card(item: dict) -> str:
     return "- " + " | ".join(parts)
 
 
-def _read_profile_cards(user_id: str) -> tuple[str, int]:
+def _read_profile_cards(user_id: str) -> tuple[str, int, dict]:
     """Read every eligible Garden card or fail loudly on any truncation.
 
     The lightweight index proves the complete cardinality, then fetch obtains
     each card's bounded content. Both use the scoped runtime token; no API key
-    or server-side envelope decryption is involved.
+    or server-side envelope decryption is involved. Per-card bodies keep their
+    separate ``_PROFILE_CARD_CONTENT_MAX_CHARS`` bound; the returned tail-window
+    metadata makes any such clipping observable without changing prompt text.
     """
 
     store = core_store.get_store(user_id)
@@ -2717,7 +2719,10 @@ def _read_profile_cards(user_id: str) -> tuple[str, int]:
             f"profile_cards_truncated:{user_card_count}/{len(items)}"
         )
     if not items:
-        return "", 0
+        return "", 0, {
+            "lane": "profile",
+            "profile_cards_truncated": False,
+        }
     ids = [str(item.get("id") or "").strip() for item in items]
     if any(not memory_id for memory_id in ids):
         raise RuntimeError("profile_cards_id_missing")
@@ -2744,7 +2749,19 @@ def _read_profile_cards(user_id: str) -> tuple[str, int]:
     rendered = [_render_profile_card(by_id[memory_id]) for memory_id in ids]
     if any(not line for line in rendered):
         raise RuntimeError("profile_cards_render_incomplete")
-    return "\n".join(rendered), user_card_count
+    # Derive the signal at the reader's final outlet from the source lengths
+    # and the cap that actually produced ``rendered``. Do not set a side flag
+    # next to the slice: a future rendering refactor must not silently detach
+    # the telemetry from the effective output.
+    profile_cards_truncated = any(
+        len(str(by_id[memory_id].get("content") or "").strip())
+        > _PROFILE_CARD_CONTENT_MAX_CHARS
+        for memory_id in ids
+    )
+    return "\n".join(rendered), user_card_count, {
+        "lane": "profile",
+        "profile_cards_truncated": profile_cards_truncated,
+    }
 
 
 def _read_memory_context(user_id: str, *, full_cards: bool = False) -> dict:

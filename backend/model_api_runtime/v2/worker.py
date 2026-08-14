@@ -1352,9 +1352,11 @@ class TurnDeps:
     # (user_id, call_id) -> 归档的通话全文明文。缺省 None = 不展开通话卡
     # （老部署/测试注入）。生产实现在 serve_worker,走 enclave 解密。
     read_voice_transcript: Callable[[str, str], str] | None = None
-    # user_id -> (all rendered Garden cards, exact card count). Unlike
-    # read_memory_context this is fail-loud and rejects any truncated read.
-    read_profile_cards: Callable[[str], tuple[str, int]] | None = None
+    # user_id -> (all rendered Garden cards, exact card count, content-free
+    # tail-window metadata). Unlike read_memory_context this is fail-loud and
+    # rejects any truncated cardinality read; bounded per-card content remains
+    # observable through the metadata.
+    read_profile_cards: Callable[[str], tuple[str, int, dict]] | None = None
     # (user_id, summary, enabled=...) -> ProfilePromptSelection. Production
     # performs a strict blob read and scoped enclave decrypt; any failure keeps
     # the rollback-compatible summary and returns a content-free reason.
@@ -9784,7 +9786,7 @@ async def _run_profile(
         if deps.read_profile_cards is None:
             raise RuntimeError("profile_cards_reader_unavailable")
         async with enclave_sem:
-            rendered, card_count = await asyncio.to_thread(
+            rendered, card_count, tail_window = await asyncio.to_thread(
                 deps.read_profile_cards,
                 user_id,
             )
@@ -9823,6 +9825,7 @@ async def _run_profile(
             llm=provider_client.reliable_chat_completion_async,
             usage_out=(tm.add_call if tm is not None else None),
             trajectory_out=_trajectory,
+            tail_window=tail_window,
         )
         if generated.fields is None:
             terminal_reject = generated.reject_code
