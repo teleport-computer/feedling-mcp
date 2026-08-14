@@ -94,3 +94,57 @@ def test_policies_are_immutable():
     """档位是冻结的 dataclass —— 防止运行时被某条路径就地改掉。"""
     with pytest.raises(Exception):
         CURATED_ARCHIVE.max_cards = 2  # type: ignore[misc]
+
+
+# --------------------------------------------------------------------------- #
+# 共用的语言规则（已写好、尚未接线）
+# --------------------------------------------------------------------------- #
+
+
+def test_language_rule_is_shared_text_with_only_the_basis_swapped():
+    """措辞/举例/标点全共用，只有「依据」不同 —— 那是必要差异，不是不一致。"""
+    from memory_garden.policies import language_rule
+
+    chat = language_rule("conversation_capture")
+    imported = language_rule("history_import")
+
+    assert chat != imported
+    assert "TA 跟你对话" in chat
+    assert "素材原文" in imported
+    # 除了依据那几个字，其余逐字相同
+    assert chat.replace("TA 跟你对话", "素材原文") == imported
+
+
+def test_language_rule_keeps_both_sides_original_points():
+    """合并后必须同时保留两边各自独有的要点，不能丢。"""
+    from memory_garden.policies import language_rule
+
+    text = language_rule("conversation_capture")
+    assert "旅行" in text, "capture 原有的第二个例子丢了"
+    assert "别归成英文桶/线索" in text, "genesis 原有的要点丢了"
+    assert "专有名词" in text
+
+
+def test_language_rule_falls_back_for_unknown_policy():
+    from memory_garden.policies import language_rule
+
+    assert "TA 跟你对话" in language_rule("nonexistent")
+
+
+def test_language_rule_is_not_wired_yet():
+    """守住「写好但未接线」这个状态。
+
+    接线会同时改动 capture 与 genesis 两处的 prompt 文本，必须先过真模型 e2e。
+    这条测试在接线时会失败 —— **那是提醒，不是回归**：改的时候要连同各档位的
+    golden fixture 一起重生成。
+    """
+    import pathlib
+
+    capture_src = (
+        pathlib.Path(__file__).resolve().parents[1]
+        / "backend" / "memory_garden" / "prompts" / "capture.py"
+    ).read_text(encoding="utf-8")
+    assert "{language_rule}" not in capture_src, (
+        "capture 模板已接入共用语言规则 —— 请确认已跑过真模型 e2e，"
+        "并重新生成各档位的 golden fixture，然后删掉这条测试。"
+    )

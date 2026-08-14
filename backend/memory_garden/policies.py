@@ -92,6 +92,60 @@ _RUBRIC_CURATED_ARCHIVE = """本块是用户【手动整理好的长期记忆档
 
 
 # --------------------------------------------------------------------------- #
+# 共用的结构性规则（⏸ 已写好，尚未接线 —— 见下方说明）
+# --------------------------------------------------------------------------- #
+
+LANGUAGE_RULE_TEMPLATE = """语言：所有字段（bucket/threads/summary/content）用{basis}的语言——
+中文就用中文（用「宠物」不是「pets」、「旅行」不是「travel」），英文就用英文；
+别归成英文桶/线索；只有专有名词、品牌名、原话才保留原文。"""
+
+#: 各来源的「语言依据」。这是三档之间**必要**的差异，不是措辞不一致。
+LANGUAGE_BASIS = {
+    "conversation_capture": "TA 跟你对话",
+    "history_import": "素材原文",
+    "curated_archive": "素材原文",
+}
+
+
+def language_rule(policy_name: str) -> str:
+    """按档位渲染语言规则。"""
+    return LANGUAGE_RULE_TEMPLATE.format(
+        basis=LANGUAGE_BASIS.get(policy_name, LANGUAGE_BASIS["conversation_capture"])
+    )
+
+
+# ⏸ **本模块的 language_rule 目前没有任何调用方** —— 这是有意的。
+#
+# 现状：同一条语言规则在两处各写一遍，措辞和标点都不同：
+#
+#   capture   语言：所有字段（bucket/threads/summary/content）用 TA 跟你对话的语言记——
+#             中文对话就用中文（用「宠物」不是「pets」、「旅行」不是「travel」），
+#             英文对话用英文；只有专有名词/品牌名/TA 的原话才保留原文。
+#
+#   genesis   语言:bucket/threads/summary/content 用素材原文的语言——中文素材就用中文
+#             (用「宠物」不是「pets」),别归成英文桶/线索;专有名词/原话保留原文。
+#
+# 查过之后发现**差别不只是措辞**：capture 的依据是「当前对话说什么语言」，
+# genesis 的依据是「导入的材料是什么语言」。日常聊天时两者一致，但导入一批英文
+# 历史记录、而用户现在说中文时会分叉 —— 那时 genesis 那条更合理（卡应该跟素材走）。
+#
+# 所以统一的正确形态是：**措辞、举例、标点全部共用，只把「依据」参数化**，
+# 正是上面这个模板。
+#
+# 为什么还没接线：接上去会同时改动 capture 与 genesis 两处的 prompt 文本
+# （上面的模板合并了两边各自独有的要点 —— capture 的「旅行不是 travel」
+# 与 genesis 的「别归成英文桶/线索」）。**prompt 行为的 bug 单测抓不到**
+# （capture/migrate 的单测都 stub 掉了 agent），必须配一次真模型 e2e：
+# 本地起服务，分别跑一轮 capture 与 genesis 导入，比对改前改后的落卡语言分布。
+#
+# 接线方式（e2e 通过后）：
+#   1. capture 模板里那段语言规则换成 {language_rule} 占位符
+#   2. build_capture_prompt 里传 language_rule(resolved.name)
+#   3. genesis/prompts.py 的对应段同样替换
+#   4. 各档位重新生成 golden fixture
+
+
+# --------------------------------------------------------------------------- #
 # 档位
 # --------------------------------------------------------------------------- #
 
