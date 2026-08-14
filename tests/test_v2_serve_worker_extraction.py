@@ -98,7 +98,7 @@ def test_dream_context_budget_keeps_only_whole_cards(monkeypatch):
 
 
 def test_dream_context_budget_rejects_oversized_first_card_from_final_prompt(
-    monkeypatch,
+    monkeypatch, caplog,
 ):
     serve_worker.wire_assembly()
     monkeypatch.setattr(serve_worker, "_mint_runtime_token", lambda _uid: "token")
@@ -128,7 +128,8 @@ def test_dream_context_budget_rejects_oversized_first_card_from_final_prompt(
         ),
     )
 
-    ctx = serve_worker._read_dream_memory_context("u_ctx_oversized_first")
+    with caplog.at_level("WARNING", logger="feedling.runtime_v2.serve_worker"):
+        ctx = serve_worker._read_dream_memory_context("u_ctx_oversized_first")
     prompt = build_dream_prompt(
         ai_name=ctx["ai_name"],
         user_name=ctx["user_name"],
@@ -145,6 +146,15 @@ def test_dream_context_budget_rejects_oversized_first_card_from_final_prompt(
     assert ctx["card_items"] == []
     assert len(prompt) == len(empty_prompt)
     assert "oversized-first" not in prompt
+    budget_logs = [
+        record.getMessage()
+        for record in caplog.records
+        if "dream cards truncated" in record.getMessage()
+    ]
+    assert len(budget_logs) == 1
+    assert "kept=0/1" in budget_logs[0]
+    assert "empty_context=True" in budget_logs[0]
+    assert "oversized-first" not in budget_logs[0]
 
 
 def test_capture_submit_enqueues_a_capture_agent_job(monkeypatch):
