@@ -313,6 +313,7 @@ jobs:
             tests/test_v2_whole_turn_metric.py \
             tests/test_admin_proactive_observability.py \
             tests/test_wake_support_indexes_migration.py \
+            tests/test_v2_first_chat_activation_backfill.py \
             tests/test_v2_jobs_migration.py \
             tests/test_v2_jobs_store.py \
             tests/test_v2_enclave_broker.py \
