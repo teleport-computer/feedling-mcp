@@ -5236,7 +5236,8 @@ _WATCHDOG_DB_TIMEOUT_SEC = _positive_float_env(
 def _jobs_claimable() -> bool:
     """Watchdog's "is there work waiting" predicate (`watchdog.should_kill`'s
     `jobs_claimable` guard) — `pending_job_count()` counts only rows still
-    `status='pending'` (queued, not yet claimed by ANY worker slot), which is
+    `status='pending'` whose durable `available_at` fence is due (queued and
+    ready, not yet claimed by ANY worker slot), which is
     exactly "all slots stuck while work waits": a wedged child claims nothing, so
     genuinely queued work sits at `pending` instead of draining into `claimed`/
     `running`. Deliberately NOT `inflight_job_count()` (pending+claimed+running) —
