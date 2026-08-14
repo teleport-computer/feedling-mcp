@@ -1199,6 +1199,113 @@ def test_detail_payload_runtime_includes_reasoning_effort(client):
     assert row["runtime"]["reasoning_effort"] == "medium"
 
 
+def test_detail_runtime_reports_the_prompt_budget_turns_are_planned_against(client):
+    """Support's first screen must show the window V2 actually budgets against.
+
+    The budget decides how much of the tool catalog survives prompt assembly
+    (``prompt_frontier`` admits optional tool schemas one at a time, keeping a
+    floor of user MCP plus the core memory/reply tools), so a window that is too
+    small silently trims the surface the user is counting on.
+    usr_90184ac4cc0896e5 (2026-08-14) reported that with a healthy 3/3 MCP
+    surface, and this page held no field that could confirm or refute it.
+    (Before T019 the component was atomic and a tight budget dropped every tool;
+    support must not explain a new report with that older mechanism.)
+
+    ``configured`` and the resolved value are asserted separately so an
+    inherited default can never read as something the user chose.
+    """
+    from admin import data_track as data_track
+    from conftest import configure_model_api_route
+
+    supplied = 24576
+    user_id, _api_key = _register(client)
+    configure_model_api_route(
+        user_id, provider="openai_compatible", model="gpt-5.5",
+        base_url="https://relay.example.com/v1",
+        context_window_tokens=supplied, test_status="ok")
+    user_entry = next(u for u in registry._users if u["user_id"] == user_id)
+
+    runtime = data_track._build_data_track_user(
+        user_entry, include_detail=True)["runtime"]
+
+    assert runtime["context_window_configured"] == supplied
+    assert runtime["context_window_tokens"] == supplied
+    assert runtime["context_window_source"] == "provider_metadata"
+
+
+def test_detail_runtime_marks_an_inherited_window_as_not_user_chosen(client):
+    """A relay user who never supplied a window inherits the deployment default.
+
+    The expectation is read from the module, not written as a literal: a
+    hardcoded number would keep passing while quietly no longer describing the
+    deployment.
+    """
+    from admin import data_track as data_track
+    from model_api_runtime.v2 import prompt_frontier
+    from conftest import configure_model_api_route
+
+    inherited = prompt_frontier.unaudited_default_context_window()
+    assert inherited > 0, "deployment is in fail-closed mode; this case cannot arise"
+    user_id, _api_key = _register(client)
+    configure_model_api_route(
+        user_id, provider="openai_compatible", model="relay-only-model",
+        base_url="https://relay.example.com/v1",
+        context_window_tokens=None, test_status="ok")
+    user_entry = next(u for u in registry._users if u["user_id"] == user_id)
+
+    runtime = data_track._build_data_track_user(
+        user_entry, include_detail=True)["runtime"]
+
+    assert runtime["context_window_configured"] == 0
+    assert runtime["context_window_tokens"] == inherited
+    assert runtime["context_window_source"] == "unaudited_default"
+
+
+def test_detail_runtime_reports_no_window_when_there_is_no_model_route(client):
+    """A user with no model_api route must not be given a window at all.
+
+    Resolution with an empty provider/model still falls through to the
+    deployment default, so an unconditional call printed a concrete number for
+    users who have no route — support reads that as fact. The local admin E2E
+    caught this; every unit case above configures a route, so none could.
+    """
+    from admin import data_track as data_track
+
+    user_id, _api_key = _register(client)  # deliberately no route configured
+    user_entry = next(u for u in registry._users if u["user_id"] == user_id)
+
+    runtime = data_track._build_data_track_user(
+        user_entry, include_detail=True)["runtime"]
+
+    assert runtime["provider"] == ""
+    assert runtime["context_window_configured"] == 0
+    assert runtime["context_window_tokens"] == 0
+    assert runtime["context_window_source"] == ""
+
+
+def test_detail_runtime_driver_carries_its_v1_lens(client):
+    """``driver`` is a provider-derived V1 label and selects no V2 path.
+
+    Support — and I, on 2026-08-14 — read a V2 user's ``driver: pi`` as "this
+    user runs on pi". The lens has to travel with the value, the way the
+    proactive block's already does, or the next reader repeats it.
+    """
+    from admin import data_track as data_track
+    from conftest import configure_model_api_route
+
+    user_id, _api_key = _register(client)
+    configure_model_api_route(
+        user_id, provider="openai_compatible", model="gpt-5.5",
+        base_url="https://relay.example.com/v1", test_status="ok")
+    user_entry = next(u for u in registry._users if u["user_id"] == user_id)
+
+    runtime = data_track._build_data_track_user(
+        user_entry, include_detail=True)["runtime"]
+
+    assert runtime["driver"] == "pi"  # the historical label itself is unchanged
+    assert "selects no V2 execution path" in runtime["driver_lens"]
+
+
 def test_admin_route_and_notice_summary_helpers_are_explicit_allowlists(monkeypatch):
     monkeypatch.setattr(
         _dt.db,

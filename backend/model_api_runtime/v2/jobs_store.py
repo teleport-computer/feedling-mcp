@@ -15,6 +15,7 @@ import re
 import threading
 import time
 import uuid
+from dataclasses import dataclass
 from concurrent.futures import (
     Future,
     ThreadPoolExecutor,
@@ -22,7 +23,7 @@ from concurrent.futures import (
 )
 from contextlib import contextmanager, nullcontext
 from datetime import date, datetime, timedelta, timezone
-from typing import Any, Callable
+from typing import Any, Callable, Literal
 
 import psycopg
 from psycopg import sql
@@ -128,6 +129,15 @@ LANE_PRIORITY = {
     # maintenance. One generic job drains one encrypted failed-turn review.
     "trajectory_review": 1,
 }
+
+
+@dataclass(frozen=True)
+class PreemptedJob:
+    job_id: int
+    user_id: str
+    lane: str
+    claimed_by: str | None
+    recovery: Literal["terminal", "requeued"]
 # Chat admission and execution use separate columns and clocks. Pending rows
 # have a short queue deadline so an admitted turn cannot wait forever when the
 # fleet dies. Claim starts a distinct owner-fenced execution lease. Workers
@@ -170,8 +180,12 @@ def _terminal_error_class(error: object, error_class: object = "") -> str:
     if candidate in notices_catalog.ERROR_CLASSES:
         return candidate
     code = _terminal_error_code(error)
-    if code in {"queue_timeout", "lease_timeout", "runtime_expired"}:
-        return "turn_timeout"
+    if code == "queue_timeout":
+        return "platform_queue_timeout"
+    if code in {"slot_watchdog_timeout", "lease_timeout", "runtime_expired"}:
+        return "platform_execution_timeout"
+    if code in {"provider_timeout", "provider_transport_timeout"}:
+        return "provider_timeout"
     if "prompt_frontier_exhausted" in code:
         return "context_overflow"
     if code.endswith(":empty_reply"):
@@ -609,6 +623,72 @@ def coalesce_or_insert_on_cursor(
     return int(cur.fetchone()["id"]), False
 
 
+def preempt_active_for_chat_on_cursor(
+    cur: psycopg.Cursor,
+    *,
+    user_id: str,
+) -> list[PreemptedJob]:
+    """Invalidate same-user non-Chat owners before inserting/coalescing Chat.
+
+    The caller owns the surrounding transaction and has already taken the
+    runtime-state/user fence.  Recoverable scheduled and capture executions
+    retain their durable Job identity and return to ``pending``; other lanes
+    become terminal ``superseded`` rows and may be recreated by their normal
+    due/backoff policy.  Each write rechecks the locked row's exact status and
+    owner so a stale snapshot can never revoke a newer claim.
+    """
+    cur.execute(
+        "SELECT id,user_id,lane,status,claimed_by FROM agent_jobs "
+        "WHERE user_id=%s AND lane<>'chat' "
+        "AND status IN ('pending','claimed','running') "
+        "ORDER BY id FOR UPDATE",
+        (str(user_id),),
+    )
+    rows = [dict(row) for row in cur.fetchall()]
+    results: list[PreemptedJob] = []
+    for row in rows:
+        lane = str(row["lane"])
+        recovery: Literal["terminal", "requeued"]
+        if lane in {"scheduled", "capture"}:
+            recovery = "requeued"
+            cur.execute(
+                "UPDATE agent_jobs SET status='pending', "
+                "last_error='foreground_chat_preempted', claimed_by=NULL, "
+                "claimed_at=NULL, started_at=NULL, finished_at=NULL, "
+                "lease_expires_at=NULL, deadline_at=NULL, created_at=now() "
+                "WHERE id=%s AND status=%s "
+                "AND claimed_by IS NOT DISTINCT FROM %s",
+                (row["id"], row["status"], row["claimed_by"]),
+            )
+        else:
+            recovery = "terminal"
+            cur.execute(
+                "UPDATE agent_jobs SET status='superseded', finished_at=now(), "
+                "last_error='foreground_chat_preempted', claimed_by=NULL, "
+                "claimed_at=NULL, started_at=NULL, lease_expires_at=NULL, "
+                "deadline_at=NULL "
+                "WHERE id=%s AND status=%s "
+                "AND claimed_by IS NOT DISTINCT FROM %s",
+                (row["id"], row["status"], row["claimed_by"]),
+            )
+        if cur.rowcount != 1:
+            raise RuntimeError(
+                f"active job ownership changed while preempting job {row['id']}"
+            )
+        results.append(
+            PreemptedJob(
+                job_id=int(row["id"]),
+                user_id=str(row["user_id"]),
+                lane=lane,
+                claimed_by=(
+                    None if row["claimed_by"] is None else str(row["claimed_by"])
+                ),
+                recovery=recovery,
+            )
+        )
+    return results
+
+
 def enqueue_job(
     user_id,
     lane,
@@ -997,6 +1077,33 @@ def claim_next_job(worker_id: str, *, lanes: set[str] | None = None) -> dict | N
                         )
                         return None
                     return outcome
+
+
+def valid_active_claims(
+    claims: list[tuple[int, str]],
+) -> set[tuple[int, str]]:
+    """Return the exact still-live ``(job_id, claimed_by)`` snapshot pairs.
+
+    The parent supervisor uses this as a periodic backstop for a dropped
+    cancellation NOTIFY.  Job id and owner are joined as one composite fence:
+    neither a recycled slot generation nor a reassigned job can validate the
+    other half of a stale snapshot.
+    """
+    if not claims:
+        return set()
+    job_ids = [int(job_id) for job_id, _claimed_by in claims]
+    owners = [str(claimed_by) for _job_id, claimed_by in claims]
+    with _pool().connection() as conn:
+        rows = conn.execute(
+            "WITH wanted(job_id, claimed_by) AS ("
+            "SELECT * FROM unnest(%s::bigint[], %s::text[])"
+            ") SELECT j.id, j.claimed_by FROM wanted w "
+            "JOIN agent_jobs j ON j.id=w.job_id AND j.claimed_by=w.claimed_by "
+            "WHERE j.status IN ('claimed','running') "
+            "AND j.lease_expires_at > clock_timestamp()",
+            (job_ids, owners),
+        ).fetchall()
+    return {(int(row[0]), str(row[1])) for row in rows}
 
 
 def mark_running(job_id, *, claimed_by: str) -> bool:
@@ -1473,6 +1580,77 @@ def mark_expired(job_id, error: str = "runtime_expired") -> None:
         for user_id, source_job_id in recovered_reviews:
             mirror.mark_pending(
                 user_id, "v2_trajectory_reviews", source_job_id, "requeue")
+
+
+def recover_killed_job(
+    *,
+    job_id: int,
+    claimed_by: str,
+    reason: str = "slot_watchdog_timeout",
+) -> dict[str, object] | None:
+    """Recover exactly one claim still owned by a killed slot generation."""
+    recovered_reviews: list[tuple[str, str]] = []
+    result: dict[str, object] | None = None
+    with _pool().connection() as conn:
+        with conn.transaction():
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(
+                    "SELECT id,user_id,lane,status,claimed_by FROM agent_jobs "
+                    "WHERE id=%s AND claimed_by=%s "
+                    "AND status IN ('claimed','running') FOR UPDATE",
+                    (int(job_id), str(claimed_by)),
+                )
+                row = cur.fetchone()
+                if row is None:
+                    return None
+                lane = str(row["lane"])
+                if lane == "chat":
+                    recovery = "terminal"
+                    cur.execute(
+                        "UPDATE agent_jobs SET status='expired',finished_at=now(), "
+                        "last_error=%s,attempt_count=attempt_count+1,"
+                        "claimed_by=NULL,claimed_at=NULL,started_at=NULL,"
+                        "lease_expires_at=NULL,deadline_at=NULL "
+                        "WHERE id=%s AND claimed_by=%s "
+                        "AND status IN ('claimed','running')",
+                        (str(reason)[:500], int(job_id), str(claimed_by)),
+                    )
+                    if cur.rowcount != 1:
+                        return None
+                    _queue_terminal_failure_on_cursor(
+                        cur, int(job_id), str(row["user_id"]), str(reason)
+                    )
+                    recovered_reviews = _recover_review_runner_on_cursor(
+                        cur, int(job_id)
+                    )
+                    _queue_failure_review_on_cursor(cur, int(job_id))
+                else:
+                    recovery = "requeued"
+                    cur.execute(
+                        "UPDATE agent_jobs SET status='pending',created_at=now(), "
+                        "last_error=%s,attempt_count=attempt_count+1,"
+                        "claimed_by=NULL,claimed_at=NULL,started_at=NULL,"
+                        "finished_at=NULL,lease_expires_at=NULL,deadline_at=NULL "
+                        "WHERE id=%s AND claimed_by=%s "
+                        "AND status IN ('claimed','running')",
+                        (str(reason)[:500], int(job_id), str(claimed_by)),
+                    )
+                    if cur.rowcount != 1:
+                        return None
+                result = {
+                    "job_id": int(job_id),
+                    "user_id": str(row["user_id"]),
+                    "lane": lane,
+                    "recovery": recovery,
+                }
+    if recovered_reviews:
+        from tee_shadow import mirror
+
+        for user_id, source_job_id in recovered_reviews:
+            mirror.mark_pending(
+                user_id, "v2_trajectory_reviews", source_job_id, "requeue"
+            )
+    return result
 
 
 def reap_stuck_job_rows(now=None) -> list[dict]:
@@ -3044,13 +3222,25 @@ def _deliver_terminal_failure_reply(row: dict) -> bool:
         if lane == "scheduled"
         else []
     )
-    reply_text = _scheduled_failure_reply_text(
-        error_class,
-        language=language,
-        user_text=user_text,
-        notes=scheduled_notes,
-    ) if lane == "scheduled" else (
-        user_text if blame == "user_provider" else _TERMINAL_FAILURE_FALLBACK_REPLY
+    reply_text = (
+        _scheduled_failure_reply_text(
+            error_class,
+            language=language,
+            user_text=user_text,
+            notes=scheduled_notes,
+        )
+        if lane == "scheduled"
+        else (
+            user_text
+            if error_class
+            in {
+                "platform_queue_timeout",
+                "platform_execution_timeout",
+                "provider_timeout",
+            }
+            or blame == "user_provider"
+            else _TERMINAL_FAILURE_FALLBACK_REPLY
+        )
     )
     store = core_store.get_store(user_id)
     envelope, error = core_envelope._build_shared_envelope_for_store(
@@ -3786,7 +3976,12 @@ def get_runtime_state(user_id) -> dict:
 
 
 def record_worker_heartbeat(
-    worker_id: str, *, kind: str = "turn", capacity: int = 1
+    worker_id: str,
+    *,
+    pool: str,
+    kind: str = "turn",
+    capacity: int = 1,
+    runtime_state: dict[str, object] | None = None,
 ) -> None:
     """UPSERT this process's liveness row (turn loops every ~10s via
     serve_worker._heartbeat_loop; the genesis thread every tick with
@@ -3798,41 +3993,57 @@ def record_worker_heartbeat(
     """
     with _pool().connection() as conn:
         conn.execute(
-            "INSERT INTO v2_worker_heartbeats (worker_id, beat_at, kind, capacity) "
-            "VALUES (%s, now(), %s, %s) "
+            "INSERT INTO v2_worker_heartbeats "
+            "(worker_id, beat_at, kind, capacity, pool, runtime_state) "
+            "VALUES (%s, now(), %s, %s, %s, %s) "
             "ON CONFLICT (worker_id) DO UPDATE SET beat_at = now(), "
-            "kind = EXCLUDED.kind, capacity = EXCLUDED.capacity",
-            (str(worker_id), str(kind), max(0, int(capacity))),
+            "kind = EXCLUDED.kind, capacity = EXCLUDED.capacity, "
+            "pool = EXCLUDED.pool, runtime_state = EXCLUDED.runtime_state",
+            (
+                str(worker_id),
+                str(kind),
+                max(0, int(capacity)),
+                str(pool),
+                Jsonb(dict(runtime_state or {})),
+            ),
         )
 
 
-def workers_alive(*, within_sec: int = 30) -> bool:
+def workers_alive(*, within_sec: int = 30, pool: str | None = None) -> bool:
     """True iff at least one serve_worker TURN process has recorded a heartbeat
     within the last ``within_sec`` seconds. Used by the chat/send v2 liveness
     guard. Genesis heartbeats are deliberately invisible here — a live genesis
     thread says nothing about whether any turn slot exists to drain the job."""
     with _pool().connection() as conn:
         with conn.cursor() as cur:
-            cur.execute(
+            query = (
                 "SELECT EXISTS(SELECT 1 FROM v2_worker_heartbeats "
                 "WHERE kind = 'turn' AND capacity > 0 "
-                "AND beat_at > now() - make_interval(secs => %s))",
-                (int(within_sec),),
+                "AND beat_at > now() - make_interval(secs => %s)"
             )
+            params: list[object] = [int(within_sec)]
+            if pool is not None:
+                query += " AND pool = %s"
+                params.append(str(pool))
+            cur.execute(query + ")", params)
             return bool(cur.fetchone()[0])
 
 
-def live_worker_count(*, within_sec: int = 30) -> int:
+def live_worker_count(*, within_sec: int = 30, pool: str | None = None) -> int:
     """窗口内有心跳的 serve_worker TURN 进程数（workers_alive 的计数版，喂 admission
     ceiling）。genesis 心跳不计入——它不占 turn 槽位。"""
     with _pool().connection() as conn:
         with conn.cursor() as cur:
-            cur.execute(
+            query = (
                 "SELECT count(*) FROM v2_worker_heartbeats "
                 "WHERE kind = 'turn' AND capacity > 0 "
-                "AND beat_at > now() - make_interval(secs => %s)",
-                (int(within_sec),),
+                "AND beat_at > now() - make_interval(secs => %s)"
             )
+            params: list[object] = [int(within_sec)]
+            if pool is not None:
+                query += " AND pool = %s"
+                params.append(str(pool))
+            cur.execute(query, params)
             return int(cur.fetchone()[0])
 
 
@@ -3853,15 +4064,20 @@ def live_genesis_worker_ids(*, within_sec: int = 30) -> list[str]:
             return [str(r[0]) for r in cur.fetchall()]
 
 
-def live_worker_capacity(*, within_sec: int = 30) -> int:
+def live_worker_capacity(*, within_sec: int = 30, pool: str | None = None) -> int:
     """Sum executable turn slots, not heartbeat processes."""
     with _pool().connection() as conn:
         with conn.cursor() as cur:
-            cur.execute(
+            query = (
                 "SELECT COALESCE(sum(capacity),0) FROM v2_worker_heartbeats "
-                "WHERE kind='turn' AND beat_at > now() - make_interval(secs => %s)",
-                (int(within_sec),),
+                "WHERE kind='turn' "
+                "AND beat_at > now() - make_interval(secs => %s)"
             )
+            params: list[object] = [int(within_sec)]
+            if pool is not None:
+                query += " AND pool = %s"
+                params.append(str(pool))
+            cur.execute(query, params)
             return int(cur.fetchone()[0])
 
 
@@ -3895,7 +4111,7 @@ def recent_worker_heartbeats(*, within_sec: int = 300, limit: int = 50) -> list[
     with _pool().connection() as conn:
         with conn.cursor(row_factory=dict_row) as cur:
             cur.execute(
-                "SELECT worker_id, kind, capacity, "
+                "SELECT worker_id, kind, capacity, pool, runtime_state, "
                 "EXTRACT(EPOCH FROM beat_at) AS beat_at_epoch, "
                 "GREATEST(0, EXTRACT(EPOCH FROM (now() - beat_at))) AS age_sec "
                 "FROM v2_worker_heartbeats "
@@ -3910,6 +4126,8 @@ def recent_worker_heartbeats(*, within_sec: int = 300, limit: int = 50) -> list[
             "worker_id": str(row["worker_id"]),
             "kind": str(row["kind"]),
             "capacity": int(row["capacity"] or 0),
+            "pool": str(row["pool"]),
+            "runtime_state": dict(row["runtime_state"] or {}),
             "beat_at_epoch": float(row["beat_at_epoch"]),
             "age_sec": float(row["age_sec"]),
         }
@@ -3936,14 +4154,122 @@ def recent_worker_heartbeat_count(*, within_sec: int = 300) -> int:
             return int(cur.fetchone()[0])
 
 
-def inflight_job_count() -> int:
-    """在飞 job 数（pending/claimed/running）。单飞唯一索引 → 约等活跃用户数。"""
+def _job_pool_case_sql() -> str:
+    return (
+        "CASE WHEN lane IN ('chat','manual_wake') THEN 'foreground' "
+        "WHEN lane IN ('heartbeat','scheduled','screen_watch') THEN 'wake' "
+        "ELSE 'heavy' END"
+    )
+
+
+def pool_queue_metrics() -> dict[str, dict[str, int | float | None]]:
+    """Bounded queue/claim aggregates for the three fixed runtime pools."""
+    query = (
+        "WITH tagged AS (SELECT " + _job_pool_case_sql() + " AS pool, "
+        "status,created_at,claimed_at FROM agent_jobs "
+        "WHERE created_at > now() - interval '24 hours' "
+        "OR status IN ('pending','claimed','running')) "
+        "SELECT pool, count(*) FILTER (WHERE status='pending') AS pending, "
+        "MAX(EXTRACT(EPOCH FROM (now()-created_at))) "
+        "FILTER (WHERE status='pending') AS oldest_pending_sec, "
+        "percentile_cont(0.95) WITHIN GROUP (ORDER BY "
+        "EXTRACT(EPOCH FROM (claimed_at-created_at))*1000) "
+        "FILTER (WHERE claimed_at IS NOT NULL) AS claim_p95_ms "
+        "FROM tagged GROUP BY pool"
+    )
+    result = {
+        pool: {"pending": 0, "oldest_pending_sec": None, "claim_p95_ms": None}
+        for pool in ("foreground", "wake", "heavy")
+    }
+    with _pool().connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(query)
+            for row in cur.fetchall():
+                result[str(row["pool"])] = {
+                    "pending": int(row["pending"] or 0),
+                    "oldest_pending_sec": (
+                        None
+                        if row["oldest_pending_sec"] is None
+                        else float(row["oldest_pending_sec"])
+                    ),
+                    "claim_p95_ms": (
+                        None
+                        if row["claim_p95_ms"] is None
+                        else float(row["claim_p95_ms"])
+                    ),
+                }
+    return result
+
+
+def job_counts_by_lane() -> dict[str, dict[str, int]]:
+    """Current pending and owner-held counts, omitting all-zero lanes."""
+    with _pool().connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "SELECT lane, count(*) FILTER (WHERE status='pending') AS pending, "
+                "count(*) FILTER (WHERE status IN ('claimed','running')) AS active "
+                "FROM agent_jobs WHERE status IN ('pending','claimed','running') "
+                "GROUP BY lane ORDER BY lane"
+            )
+            rows = cur.fetchall()
+    return {
+        str(row["lane"]): {
+            "pending": int(row["pending"] or 0),
+            "active": int(row["active"] or 0),
+        }
+        for row in rows
+    }
+
+
+def recent_preemption_counts(*, within_hours: int = 24) -> dict[str, int]:
+    safe_hours = max(1, min(int(within_hours), 24 * 30))
+    with _pool().connection() as conn:
+        rows = conn.execute(
+            "SELECT lane, count(*) FROM agent_jobs "
+            "WHERE last_error='foreground_chat_preempted' "
+            "AND COALESCE(finished_at,created_at) > "
+            "now()-make_interval(hours => %s) GROUP BY lane ORDER BY lane",
+            (safe_hours,),
+        ).fetchall()
+    return {
+        f"{str(lane)}:{'requeued' if str(lane) in {'scheduled', 'capture'} else 'terminal'}": int(count)
+        for lane, count in rows
+    }
+
+
+def recent_watchdog_recovery_counts(*, within_hours: int = 24) -> dict[str, int]:
+    safe_hours = max(1, min(int(within_hours), 24 * 30))
+    with _pool().connection() as conn:
+        rows = conn.execute(
+            "SELECT lane, count(*) FROM agent_jobs "
+            "WHERE last_error='slot_watchdog_timeout' "
+            "AND COALESCE(finished_at,created_at) > "
+            "now()-make_interval(hours => %s) GROUP BY lane ORDER BY lane",
+            (safe_hours,),
+        ).fetchall()
+    return {
+        f"{str(lane)}:{'terminal' if str(lane) == 'chat' else 'requeued'}": int(count)
+        for lane, count in rows
+    }
+
+
+def inflight_job_count(*, lanes: set[str] | None = None) -> int:
+    """Count pending/claimed/running Jobs, optionally within selected lanes.
+
+    Runtime admission must pass its pool's lane set.  The unfiltered form is
+    retained for aggregate Admin observability only.
+    """
     with _pool().connection() as conn:
         with conn.cursor() as cur:
-            cur.execute(
+            query = (
                 "SELECT count(*) FROM agent_jobs "
                 "WHERE status IN ('pending','claimed','running')"
             )
+            params: list[object] = []
+            if lanes:
+                query += " AND lane = ANY(%s)"
+                params.append(sorted(str(lane) for lane in lanes))
+            cur.execute(query, params)
             return int(cur.fetchone()[0])
 
 

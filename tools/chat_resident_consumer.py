@@ -967,7 +967,8 @@ _ERROR_CLASS_RULES = (
 CONSUMER_ERROR_CLASSES = frozenset(
     {klass for klass, _blame, _text, _pat in _ERROR_CLASS_RULES}
     | {
-        "turn_timeout", "provider_empty_reply", "reply_parse_failed",
+        "turn_timeout", "platform_queue_timeout", "platform_execution_timeout",
+        "provider_timeout", "provider_empty_reply", "reply_parse_failed",
         "model_not_found", "unknown",
         "image_generation_model_required", "image_generation_model_incompatible",
         "image_generation_auth_invalid", "image_generation_quota_insufficient",
@@ -5832,6 +5833,40 @@ def _trace_user_mcp_wiring(cmd: list[str], *, trace_id: str, lane: str) -> None:
 # or the day the CLI ships a new state every user with MCP goes red at once.
 _MCP_INIT_HARD_FAILURES = frozenset({"failed", "needs-auth", "absent", "error"})
 
+# claude's own built-in for blocking on a still-connecting MCP server. Present
+# in the runner's pinned 2.1.195 and in 2.1.217 (read off the init event's
+# `tools` list; `sdk-tools.d.ts` lists it in neither, so that file cannot be
+# used to decide this). The chat prompt points the model at it —
+# see _prepend_user_mcp_wait_hint.
+_CLAUDE_WAIT_TOOL = "WaitForMcpServers"
+
+
+def _wait_outcome(block: dict) -> str:
+    """Classify one WaitForMcpServers tool_result: ready / not_ready / error.
+
+    Measured result shapes (claude 2.1.217, deepseek):
+      success → ``ready: true\\nConnected (their tools are now available …): x``
+      failure → is_error, ``ready: false\\nUnknown (no MCP server with this
+                name is configured): x`` (model guessed a name we never wired)
+
+    Deliberately coarse. This exists to answer three questions in aggregate —
+    did the model try, did trying work, is it looping — not to reproduce
+    claude's wording, which is upstream text we do not control. Anything
+    unrecognised is ``not_ready`` rather than a new bucket: an unknown shape is
+    "we have no evidence it worked", the same fail-closed rule the verdict
+    ladder above uses for unrecognised init states."""
+    if block.get("is_error"):
+        return "error"
+    content = block.get("content")
+    if isinstance(content, list):
+        text = " ".join(
+            str(part.get("text") or "")
+            for part in content if isinstance(part, dict)
+        )
+    else:
+        text = str(content or "")
+    return "ready" if "ready: true" in text.lower() else "not_ready"
+
 
 def _trace_user_mcp_registered(raw: str, cmd: list[str], *,
                                trace_id: str, lane: str,
@@ -5903,6 +5938,14 @@ def _trace_user_mcp_registered(raw: str, cmd: list[str], *,
     call_ok: set[str] = set()      # servers with at least one successful call
     call_err: set[str] = set()     # servers whose call came back is_error
     pending_use: dict[str, str] = {}   # tool_use_id -> server, awaiting its result
+    # claude's own WaitForMcpServers, which the chat prompt now points the model
+    # at (_prepend_user_mcp_wait_hint). Counted here because "did the hint work"
+    # is otherwise unanswerable in prod: a turn with no MCP call looks identical
+    # whether the model never tried, waited and timed out, or waited in a loop.
+    # This is the single input that decides whether the prompt is enough or the
+    # local proxy (spec §6 plan B) has to be built.
+    wait_uses: set[str] = set()        # tool_use_ids of WaitForMcpServers calls
+    wait_outcomes: list[str] = []      # ready | not_ready | error, in order
     for obj in _json_objects_from_cli_output(raw):
         if not isinstance(obj, dict):
             continue
@@ -5919,6 +5962,10 @@ def _trace_user_mcp_registered(raw: str, cmd: list[str], *,
             call_ok.clear()
             call_err.clear()
             pending_use.clear()
+            # Same last-init-wins rule: a retried attempt's waits belong to the
+            # process that no longer describes this turn.
+            wait_uses.clear()
+            wait_outcomes.clear()
             continue
         content = (obj.get("message") or {}).get("content")
         if not isinstance(content, list):
@@ -5938,12 +5985,20 @@ def _trace_user_mcp_registered(raw: str, cmd: list[str], *,
                 # sit here claimed the opposite — asserted, never checked
                 # against the rule (codex 审出).
                 name = str(block.get("name") or "")
+                if name == _CLAUDE_WAIT_TOOL:
+                    wait_uses.add(str(block.get("id") or ""))
+                    continue
                 for srv in expected_by_length:
                     if name.startswith(f"mcp__{srv}__"):
                         pending_use[str(block.get("id") or "")] = srv
                         break
             elif btype == "tool_result":
-                server = pending_use.pop(str(block.get("tool_use_id") or ""), "")
+                use_id = str(block.get("tool_use_id") or "")
+                if use_id in wait_uses:
+                    wait_uses.discard(use_id)
+                    wait_outcomes.append(_wait_outcome(block))
+                    continue
+                server = pending_use.pop(use_id, "")
                 if not server:
                     continue
                 (call_err if block.get("is_error") else call_ok).add(server)
@@ -6021,6 +6076,14 @@ def _trace_user_mcp_registered(raw: str, cmd: list[str], *,
             "init_status": {k: v for k, v in list(init_status.items())[:20]},
             "verdict": {k: verdict[k] for k in expected[:20]},
             "called_ok": sorted(call_ok)[:20], "called_error": sorted(call_err)[:20],
+            # Did the wait hint actually change behaviour this turn? Content-free
+            # counts only. `wait_count` is what catches the failure mode Codex
+            # flagged — a weak model re-waiting in a loop — and a high
+            # attempted-rate on turns whose verdicts were all `ok` is what would
+            # catch the other one: waiting on turns that never needed MCP.
+            "wait_attempted": bool(wait_outcomes),
+            "wait_count": len(wait_outcomes),
+            "wait_outcomes": wait_outcomes[:10],
             # Which CLI attempt this describes. A turn can emit several; the
             # last one is the process that produced the reply.
             "attempt": attempt,
@@ -9251,6 +9314,84 @@ def _sanitize_outbound_file_reply(
         text,
         attachment_staged=attachment_staged,
     )
+
+
+# The tested wording. Changing it invalidates the cross-model evidence in
+# docs/superpowers/specs/2026-08-13-mcp-handshake-wait-hint-design.md §5.3 —
+# re-run that matrix before touching it.
+#
+# It deliberately does NOT ask the model to narrate connection failures to the
+# user: which server is down is configuration state, and the app already has a
+# channel for it (`/v1/mcp/servers` → per-server ``runtime``). Making the model
+# the messenger would be both unreliable and the wrong layer (spec §2.3).
+_USER_MCP_WAIT_HINT = (
+    "【你连接的 MCP 服务器】{names}\n"
+    "其中一些可能还在后台连接、工具暂时没出现在你的工具表里。如果某台服务器"
+    "可能有你需要的能力而看不到它的工具，先调用 WaitForMcpServers"
+    "（参数用上面列表里的准确名字，只等你真正需要的那一台，最多等一次）"
+    "等它就绪，再调用工具。不要因为「看不到工具」就告诉用户用不了。\n\n"
+)
+
+
+def _cli_template_is_claude() -> bool:
+    """True when AGENT_CLI_CMD drives ``claude`` (the only driver that does not
+    wait for the MCP handshake — see _prepend_user_mcp_wait_hint)."""
+    return _is_claude_code_cmd(_cli_cmd_tokens())
+
+
+def _prepend_user_mcp_wait_hint(content: str, *, lane: str) -> str:
+    """Tell a claude-driven chat turn that ``WaitForMcpServers`` exists.
+
+    claude CLI emits its ``init`` snapshot ~2.5s after start and begins the turn
+    with whatever connected in time; a server that missed that window
+    contributes ZERO tools, so the model does not know the capability exists and
+    truthfully answers "I can't". Because the consumer spawns a fresh
+    ``claude --print`` per turn, claude's own "it'll be there next turn" recovery
+    never gets a next turn.
+
+    ``WaitForMcpServers`` is a claude built-in (verified present in BOTH the
+    runner's pinned 2.1.195 and 2.1.217 by reading the init event's ``tools``
+    list — NOT via ``sdk-tools.d.ts``, which lists it in neither). It is already
+    callable: ``--allowed-tools`` is not an exclusive allowlist (see
+    ``_warn_if_claude_allowlist_semantics_unverified``). The model simply had no
+    way to know it was an option.
+
+    No pre-turn wait is added anywhere: the cost is paid only on the turn that
+    actually needs a server, so turns that need no MCP stay byte-for-byte as fast
+    as today. That is the one advantage this has over "spawn early, send the
+    message late", which buys a hard guarantee with a wait on EVERY turn.
+
+    Three gates, all required — any miss returns ``content`` unchanged (the same
+    object, so a caller can assert identity):
+
+    1. chat lane only. Background/proactive turns are never wired with MCP at
+       all (``_user_mcp_cli_value``), so the hint would name servers the model
+       cannot reach and invite a call to a tool it does not have.
+    2. claude driver only. **This gate is load-bearing.** codex blocks for
+       ``startup_timeout_sec`` and pi's bridge is awaited, so neither has the
+       race — and neither has ``WaitForMcpServers``. Injecting there would send
+       the model after a nonexistent tool: a new failure in place of no failure.
+    3. at least one enabled server in ``_user_mcp_applied`` — the same in-memory
+       source of truth ``_user_mcp_cli_value`` gates on, not on-disk file
+       existence (a stale /tmp file can outlive the servers it was written for).
+
+    Every turn, not once per session: unlike the io_cli catalog, "which servers
+    missed the window" is re-rolled by a brand-new process on every single turn,
+    so a once-per-session injection would describe a race that has since been
+    re-run. Three lines is cheap enough that no pending→commit dance is needed.
+    """
+    if lane != "chat" or AGENT_MODE != "cli":
+        return content
+    if not _cli_template_is_claude():
+        return content
+    names = sorted(
+        str(s.get("name") or "")
+        for s in _user_mcp_applied.get("servers") or []
+        if s.get("enabled") and s.get("name")
+    )
+    if not names:
+        return content
+    return _USER_MCP_WAIT_HINT.format(names=", ".join(names)) + content
 
 
 def _prepend_io_cli_capability_catalog(content: str) -> str:
@@ -15422,6 +15563,13 @@ def _process_messages(messages: list) -> float:
         # transcript header it prepends stays topmost (see that function's
         # docstring and _message_has_injected_history).
         content = _prepend_io_cli_capability_catalog(content)
+        # claude does NOT wait for the user-MCP handshake, and we spawn a fresh
+        # process per turn — so tell the model about WaitForMcpServers rather
+        # than let it truthfully report a capability it cannot see. No-op for
+        # every other driver and for users with no MCP configured. Placed here,
+        # after the catalog and before _foreground_agent_message, for the same
+        # reason the catalog is: the transcript header must stay topmost.
+        content = _prepend_user_mcp_wait_hint(content, lane="chat")
         # Then inject cross-turn continuity for drivers with no reliable session of
         # their own (codex / hosted claude). No-op for pi / when disabled / when
         # there is no prior turn. Done once here so every dispatch branch below

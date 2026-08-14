@@ -7,6 +7,8 @@ why this module is collectable even without a reachable Postgres.
 import json
 import sys
 import tomllib
+
+import yaml
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -233,3 +235,41 @@ def test_ca_bundle_pem_skips_unsafe_names():
     servers = [{"name": "BAD NAME", "enabled": True, "url": "https://a/",
                 "ca_pem": "PEM-X"}]
     assert m.ca_bundle_pem(servers) is None
+
+
+# ---------------------------------------------------------------------------
+# hermes 的 MCP 发现上限
+#
+# hermes 默认只等 1.5s(hermes_cli/config.py DEFAULT_CONFIG,2026-08-13 对
+# 0.18.2 实读),比 claude 的 ~2.5s 还紧,而实测真实公网 MCP 服务器整套握手要
+# 1.3~2.5s —— 于是「测试连接通过、聊天里说用不了」在 hermes 上同样成立。
+# 和 claude 不同的是,这个值是真的能配的(wait_for_mcp_discovery 是一个
+# thread.join(timeout),发现完成就立刻返回)。
+# ---------------------------------------------------------------------------
+
+
+def test_hermes_gets_a_discovery_timeout_that_real_servers_can_meet():
+    out = yaml.safe_load(m.hermes_config_merged(
+        None, [{"name": "ombre", "enabled": True, "url": "https://o/mcp"}], set()))
+    assert out["mcp_discovery_timeout"] == m.HERMES_MCP_DISCOVERY_TIMEOUT_SEC
+    # 实测的真实公网服务器最慢一台(deepwiki)全程 2.53s;这个值必须留出余量,
+    # 否则从更慢的出网看过去,那台又回到「时好时坏」——正是本次要修的病。
+    assert out["mcp_discovery_timeout"] >= 2.53 * 1.5, (
+        "必须显著高过实测最慢的健康服务器(2.53s),否则等于没修")
+
+
+def test_a_user_with_no_mcp_never_has_their_startup_touched():
+    """没配 MCP 的用户不该因为这个功能多出任何一行配置 —— 更不该多等。"""
+    out = yaml.safe_load(m.hermes_config_merged(
+        "model: x\n", [{"name": "off", "enabled": False, "url": "https://o/mcp"}],
+        set())) or {}
+    assert "mcp_discovery_timeout" not in out
+    assert out == {"model": "x"}
+
+
+def test_an_operator_chosen_timeout_is_never_overwritten():
+    """手工设过的值是 operator 的决定。我们只在他没表态时给个能用的默认。"""
+    out = yaml.safe_load(m.hermes_config_merged(
+        "mcp_discovery_timeout: 30\n",
+        [{"name": "ombre", "enabled": True, "url": "https://o/mcp"}], set()))
+    assert out["mcp_discovery_timeout"] == 30

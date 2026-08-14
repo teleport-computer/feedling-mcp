@@ -10,6 +10,21 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **Hosted Runtime V2 isolates foreground Chat from background maintenance.**
+  Chat/manual-wake, ambient-wake, and Heavy maintenance work now use separate
+  capacity pools with one OS process per worker slot. Background work therefore
+  cannot consume every Chat execution slot, and a hung Job can be recovered by
+  restarting its one slot without restarting healthy sibling Jobs. Profile
+  reads are batched and limited to one concurrent run per service instance.
+
+- **Hosted Runtime V2 proactive turns remain compatible with Claude 4.6 and
+  later.** Scheduled reminders, heartbeat, manual wake, and screen-watch turns
+  retain dynamic runtime context as non-user application data, then end the
+  provider request with one fixed, content-free transport marker. This avoids
+  the unsupported assistant-prefill request shape without attributing reminder
+  text, sensor context, or a new request to the user. The model still decides
+  whether weak wakes speak; scheduled reminders still require delivery.
+
 - **Hosted Runtime V2 scheduled reminders no longer disappear after a model or
   provider failure.** A content-free reminder response gets one bounded retry
   with a reminder-specific correction. If delivery still fails, the runtime
@@ -658,19 +673,12 @@ change must not be interpreted as an API guarantee.
   receive the same ciphertext document; only state, character counts, source
   counts, and generation/retry timestamps remain plaintext metadata.
 
-- **Runtime V2 can advance conversation coverage without steady-state
-  background model calls.** The default-off
-  `FEEDLING_V2_PROFILE_COVERAGE_DETERMINISTIC` worker switch replaces
-  provider-backed maintenance and inline catch-up folds with exact,
-  content-free count leaves. Deterministic fan-out checkpoints keep the
-  canonical frontier and encrypted materialized head bounded. Synthetic
-  `verify_ping` and `resident_maintenance` rows remain excluded from both the
-  source bounds and immutable coverage witnesses; encrypted Chat rows remain
-  the durable source ledger. Disabling the switch restores the existing
-  provider-backed summary path. Enable it only after the bounded Memory/User
-  prompt path is deployed and verified. Existing legacy model-written frontier
-  nodes can still require a provider-backed rollup during migration, so zero
-  background calls is the steady state.
+- **Runtime V2 removed provider-backed conversation summarization.** MEMORY/USER
+  is now the sole long-term semantic layer. Conversation maintenance advances
+  exact history coverage with local count sentinels, while encrypted Chat rows
+  remain the durable source ledger. Existing model-authored segments remain
+  readable until metadata-only checkpoints replace them in the canonical
+  frontier.
 
 - **Memory action batches now isolate item failures.** A structurally valid
   `POST /v1/memory/actions` batch processes every item and returns per-item

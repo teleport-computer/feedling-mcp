@@ -3,9 +3,12 @@
 import json
 import hashlib
 import math
+import os
 import re
 import time
+from collections.abc import Mapping
 from datetime import date, datetime, timedelta, timezone
+from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from urllib.parse import parse_qs, quote
@@ -1421,8 +1424,10 @@ def _runtime_summary(store: UserStore) -> dict:
     unless the default sandbox-bypass command is used, or a gateway-routed
     provider. Metadata only — no api_key / base_url is read."""
     out = {"provider": "", "model": "", "test_status": "",
-           "driver": "", "codex_transport": "", "cli_cmd_custom": False,
-           "reasoning_effort": ""}
+           "driver": "", "driver_lens": _DRIVER_LENS, "codex_transport": "",
+           "cli_cmd_custom": False, "reasoning_effort": "",
+           "context_window_configured": 0, "context_window_tokens": 0,
+           "context_window_source": ""}
     try:
         from hosted import config_store as _cfg_store
         cfg = _cfg_store._load_model_api_config(store) or {}
@@ -1445,6 +1450,74 @@ def _runtime_summary(store: UserStore) -> dict:
             out["codex_transport"] = _cutover.codex_transport(provider)
         except Exception:
             pass
+        # Only a configured route has a budget. Resolving one for an empty
+        # provider/model still returns the deployment default, which would
+        # print a concrete window for a user who has no model route at all —
+        # a number support would read as fact. Caught by the local admin E2E,
+        # which the unit cases (all of which configure a route) could not see.
+        out.update(_context_window_summary(cfg))
+    return out
+
+
+# ``driver`` is derived from the provider alone (anthropic/deepseek → claude,
+# OpenAI-compatible → pi, openai → codex) and selects NO execution path on V2 —
+# see agent_runtime_cutover.driver_for_provider. Support read it as "which
+# runtime serves this user" and reported a V2 user as running on pi
+# (2026-08-14). The lens travels with the value so the next reader can't.
+_DRIVER_LENS = "v1_label_from_provider_only; selects no V2 execution path"
+
+
+def _context_window_summary(cfg: Mapping[str, Any]) -> dict:
+    """Which prompt budget V2 actually plans this user's turns against.
+
+    Why this belongs in support's first screen: the budget decides how much of
+    the tool catalog survives assembly. ``prompt_frontier`` admits optional tool
+    schemas one at a time, so a window that is too small trims the surface — user
+    MCP and the core memory/reply tools are admitted first and keep a floor, the
+    tail is what goes. usr_90184ac4cc0896e5 (2026-08-14) reported "the AI says it
+    can't call my calendar MCP" with a fully healthy 3/3 server surface; the
+    configured window was the one fact that could confirm it and the only one
+    this page did not show.
+
+    ⚠️ Before T019 this component was atomic and a tight budget dropped **every**
+    tool. Support must not explain a new report with that older mechanism: today
+    a trimmed surface is partial, not empty, and ``mcp.surface.provider`` records
+    what each provider request actually carried.
+
+    ``configured`` is what the user typed (0 = never supplied); ``tokens`` and
+    ``source`` are what ``resolve_model_limit`` actually returns, so a value
+    inherited from an audited family or the deployment default is not
+    misread as something the user chose.
+
+    ⚠️ Resolution reads this process's env. It is faithful only because backend
+    and serve-worker carry the same context-window vars
+    (deploy/docker-compose.phala.yaml:325 and :427). If those ever diverge,
+    this number becomes a claim about the wrong process.
+    """
+    configured = cfg.get("context_window_tokens")
+    out = {
+        "context_window_configured": int(configured or 0),
+        "context_window_tokens": 0,
+        "context_window_source": "",
+    }
+    try:
+        from model_api_runtime.v2 import prompt_frontier as _frontier
+        limit = _frontier.resolve_model_limit(
+            str(cfg.get("provider") or ""),
+            str(cfg.get("model") or ""),
+            base_url=str(cfg.get("base_url") or ""),
+            provider_context_window_tokens=configured,
+            deployment_overrides=_frontier.parse_deployment_overrides(
+                os.environ.get("FEEDLING_V2_PROMPT_CONTEXT_WINDOWS_JSON")
+            ),
+        )
+    except Exception:  # noqa: BLE001 — an unresolvable route is a real state
+        # PromptContextLimitUnconfigured is not an error to hide: that route
+        # fails before every provider request, which is worth seeing here.
+        out["context_window_source"] = "unresolved"
+        return out
+    out["context_window_tokens"] = int(limit.context_window_tokens)
+    out["context_window_source"] = str(limit.source or "")
     return out
 
 

@@ -56,9 +56,10 @@ or diagnostic upload is encrypted.
    `POST /v1/model_api/chat/send`.
 2. Inside the managed main VM, the API validates the request, creates a shared
    encrypted envelope, appends the user turn, and wakes the hosted queue.
-3. A bounded Runtime V2 worker pool claims the durable job and mints a scoped
-   runtime token for that turn. It requests only the Chat, Memory, and Perception
-   context authorized for that user.
+3. A Runtime V2 parent assigns the durable job to one of four foreground
+   single-slot child processes and mints a scoped runtime token for that turn.
+   PostgreSQL remains authoritative for the claim, and a cancellation bus can
+   target the exact child owner.
 4. The decrypt service opens the required shared envelopes. The runner sends the
    plaintext prompt and selected context to the configured model provider.
 5. The runner encrypts the assistant result into a new user-owned envelope before
@@ -118,13 +119,13 @@ proactive wake lanes or subagents; a turn that reads history drops outbound
 web/MCP/task tools for the following round, and a deployment kill switch
 removes the capability entirely without touching the normal chat path.
 
-Deployments may opt into deterministic Runtime V2 coverage accounting as an
-independent precursor to the bounded Memory/User profile rollout. In that mode,
-maintenance and synchronous prompt catch-up advance the same exact source
-witnesses using content-free count sentinels, and deterministic fan-out
-checkpoints keep the frontier bounded without sending historical Chat plaintext
-to a model provider. The source ledger and rollback-compatible summary storage
-remain unchanged.
+Runtime V2 coverage accounting is permanently metadata-only. Maintenance and
+synchronous prompt catch-up advance exact source witnesses using content-free
+count sentinels, and deterministic fan-out checkpoints keep the frontier bounded
+without sending historical Chat plaintext to a model provider. MEMORY/USER is
+the sole long-term semantic layer; encrypted Chat rows remain the durable source
+ledger. Restoring provider-backed conversation summaries requires rolling back
+the worker image rather than changing a runtime flag.
 
 The bounded Memory/User profile storage contract uses one
 `v2_agent_profile` document so both fields advance under one compare-and-swap.
@@ -362,11 +363,20 @@ The public API resolves each credential to one user, scopes storage queries by
 that user, and checks envelope ownership before protected reads and writes. This
 is the primary multi-tenant boundary for API and persistence access.
 
-Managed Hosted Runtime V2 uses a bounded worker pool. Durable jobs, conversation
-state, reply cursors, deadlines, and terminal errors live in PostgreSQL; there is
-no resident process, per-user home, CLI checkpoint, or lease to keep alive. A
-turn can run in a watchdog-controlled child process, but that is a failure and
-resource boundary rather than a strong sandbox for mutually hostile code.
+Managed Hosted Runtime V2 uses one parent with three logical pools: four
+Foreground slots for Chat and manual wakes, two Wake slots for ambient work,
+and two Heavy slots for Profile, Dream, Capture, and maintenance. Each of the
+eight slots is a separate one-Job OS process. The parent owns scheduling,
+per-slot watchdogs, the cancellation bus connection, and a four-permit Enclave
+broker shared across all children. All three pools still run inside one
+confidential VM and one service instance; process isolation limits a hung Job's
+failure domain but is not a sandbox for mutually hostile code.
+
+Durable jobs, conversation state, reply cursors, ownership fences, deadlines,
+and terminal errors live in PostgreSQL. A watchdog restarts only the exact
+stalled slot, and PostgreSQL recovery settles that slot's exact claim before
+replacement work proceeds. There is no resident process, per-user home, CLI
+checkpoint, or in-memory lease that becomes the source of truth.
 
 Newly registered Model API accounts can be admitted directly to this pooled V2
 runtime after a provider route has been successfully tested and activated. The

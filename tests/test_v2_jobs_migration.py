@@ -70,18 +70,23 @@ def _migration_0085_module():
     )
 
 
-def test_wake_shadow_decisions_is_the_single_installed_head():
+def test_first_chat_activation_is_the_single_installed_head():
     """A deploy missing the durable baseline migration must fail before rollout."""
     backend = Path(__file__).parent.parent / "backend"
     cfg = Config(str(backend / "alembic.ini"))
     cfg.set_main_option("script_location", str(backend / "alembic"))
     script = ScriptDirectory.from_config(cfg)
 
-    assert script.get_heads() == ["0085_v2_wake_shadow_decisions"]
+    assert script.get_heads() == ["0087_v2_first_chat_activation"]
+    migration = script.get_revision("0087_v2_first_chat_activation")
+    assert migration.down_revision == "0086_v2_worker_pool_heartbeats"
+    migration = script.get_revision("0086_v2_worker_pool_heartbeats")
+    assert migration.down_revision == "0085_v2_wake_shadow_decisions"
     migration = script.get_revision("0085_v2_wake_shadow_decisions")
     assert migration.down_revision == "0084_wake_support_indexes"
-    migration = script.get_revision("0084_wake_support_indexes")
-    assert migration.down_revision == "0083_screen_chat_frames"
+    assert script.get_revision("0084_wake_support_indexes").down_revision == (
+        "0083_screen_chat_frames"
+    )
     assert script.get_revision("0083_screen_chat_frames").down_revision == (
         "0082_merge_image_voice"
     )
@@ -138,7 +143,7 @@ def test_wake_shadow_decisions_is_the_single_installed_head():
             "AND tc.table_name='perception_signal_state_v2'"
         ).fetchone()
 
-    assert installed_head == ("0085_v2_wake_shadow_decisions",)
+    assert installed_head == ("0087_v2_first_chat_activation",)
     assert columns == {
         "user_id": ("text", "NO"),
         "signal": ("text", "NO"),
@@ -200,7 +205,7 @@ def test_0075_usage_rollup_schema_is_installed_without_source_backfill():
             "AND tgrelid='v2_turn_metrics'::regclass"
         ).fetchone()[0]
 
-    assert head == ("0085_v2_wake_shadow_decisions",)
+    assert head == ("0087_v2_first_chat_activation",)
     assert tables == {
         "v2_usage_daily_users",
         "v2_usage_daily_dimensions",
@@ -265,6 +270,30 @@ def test_0085_wake_shadow_schema_is_content_free_and_idempotent():
     # The observation owns its 90-day retention and must survive any future
     # agent_jobs GC; job_id is an idempotency key, not a lifecycle dependency.
     assert foreign_keys == 0
+
+
+def test_worker_pool_heartbeat_columns_and_index_are_installed():
+    with db.get_pool().connection() as conn:
+        columns = {
+            row[0]: (row[1], row[2], row[3])
+            for row in conn.execute(
+                "SELECT column_name,data_type,is_nullable,column_default "
+                "FROM information_schema.columns "
+                "WHERE table_schema='public' AND table_name='v2_worker_heartbeats' "
+                "AND column_name IN ('pool','runtime_state')"
+            ).fetchall()
+        }
+        index = conn.execute(
+            "SELECT indexdef FROM pg_indexes "
+            "WHERE indexname='ix_v2_worker_heartbeats_pool_kind_beat'"
+        ).fetchone()
+
+    assert columns["pool"][:2] == ("text", "NO")
+    assert "'unassigned'::text" in columns["pool"][2]
+    assert columns["runtime_state"][:2] == ("jsonb", "NO")
+    assert "'{}'::jsonb" in columns["runtime_state"][2]
+    assert index is not None
+    assert "(pool, kind, beat_at DESC)" in index[0]
 
 
 def test_0075_schema_phase_is_restartable_after_concurrent_index_failure():

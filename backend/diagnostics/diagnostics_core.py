@@ -15,6 +15,7 @@ backends emit the identical JSON body + status code.
 from __future__ import annotations
 
 import json
+import logging
 import time
 from datetime import datetime, timezone
 
@@ -138,6 +139,22 @@ def clear_trace_payload(store):
     return {"status": "ok"}, 200
 
 
+# Injected by asgi_app at assembly time (CONTRIBUTING §2: diagnostics must not
+# import hosted, so an upward call is wired, not imported — same pattern as
+# core/store.py's on_proactive_job_appended). Left None in tests that do not
+# care; a missing hook silently skips the projection.
+#
+# Why here: V1's only per-turn evidence about a user's MCP servers arrives as
+# this trace. Without this the `runtime` field of GET /v1/mcp/servers is
+# permanently empty for every resident_cli user, so the app cannot tell them
+# which of their servers is actually broken.
+on_mcp_surface_registered = None
+
+_MCP_REGISTERED_EVENT = "mcp.surface.registered"
+
+log = logging.getLogger("feedling.diagnostics")
+
+
 def emit_trace_event_payload(store, payload):
     """Body of ``POST /v1/debug/trace/event`` for the HTTP-only resident.
 
@@ -168,4 +185,18 @@ def emit_trace_event_payload(store, payload):
         turn_id=str(ev.get("turn_id") or ""),
         dur_ms=dur,
     )
+    if (str(ev.get("type") or "") == _MCP_REGISTERED_EVENT
+            and on_mcp_surface_registered is not None):
+        try:
+            on_mcp_surface_registered(
+                store,
+                ev.get("detail") if isinstance(ev.get("detail"), dict) else None,
+            )
+        except Exception as exc:  # noqa: BLE001
+            # The trace itself already landed above. A status-projection failure
+            # must never turn a successful diagnostics POST into an error — the
+            # consumer retries the whole event, which would duplicate the trace
+            # ring entry to fix a field nobody is blocked on.
+            log.warning("mcp runtime status projection failed user=%s kind=%s",
+                        getattr(store, "user_id", ""), type(exc).__name__)
     return {"status": "ok"}, 200
