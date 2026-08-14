@@ -124,6 +124,35 @@ def test_chat_atomically_preempts_same_user_profile_and_keeps_return_tuple(monke
     ]
 
 
+def test_dropped_preemption_notify_leaves_durable_chat_and_terminal_profile(monkeypatch):
+    uid = "u_atomic_preempt_dropped_notify"
+    seed_user(uid)
+    profile_id = _running_job(uid, "profile", "heavy-0:g1")
+    msg_id = uuid.uuid4().hex
+    monkeypatch.setattr(wake_bus, "notify_job_cancel", lambda _event: None)
+
+    _seq, chat_id = db.chat_append_and_enqueue(
+        uid,
+        msg_id,
+        time.time(),
+        _msg_doc(msg_id),
+        5000,
+        "chat",
+        expected_generation=db.get_runtime_generation(uid),
+    )
+
+    with db.get_pool().connection() as conn:
+        rows = conn.execute(
+            "SELECT id,status,last_error,claimed_by FROM agent_jobs "
+            "WHERE id IN (%s,%s) ORDER BY id",
+            (profile_id, chat_id),
+        ).fetchall()
+    assert rows == [
+        (profile_id, "superseded", "foreground_chat_preempted", None),
+        (chat_id, "pending", None, None),
+    ]
+
+
 @pytest.mark.parametrize("lane", ["scheduled", "capture"])
 def test_chat_requeues_recoverable_same_user_background_without_duplication(lane):
     uid = f"u_atomic_preempt_{lane}"
