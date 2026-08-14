@@ -1202,7 +1202,6 @@ def test_wake_yields_snapshot_race_input_to_chat_without_duplicate_reply(
         read_summary_with_seq=_summary_with_send_race,
         resolve_provider=lambda _uid: (None, {}),
         mint_enclave_token=lambda _uid: "rt",
-        write_summary=lambda *_args: True,
         apply_pending_effects=serve_worker._apply_pending_effects_for_user,
     )
 
@@ -1354,7 +1353,6 @@ def test_same_timestamp_initial_midturn_and_successor_inputs_are_consumed_once(m
         read_summary_with_seq=_summary_with_snapshot_race,
         resolve_provider=lambda _uid: (None, {}),
         mint_enclave_token=lambda _uid: "rt",
-        write_summary=lambda *_args: True,
         apply_pending_effects=_apply,
     )
 

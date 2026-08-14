@@ -220,15 +220,13 @@ round2 收敛 0 动作),最弱真实模型过全绿才算数。
 冲突以 tail 原文为准”)。
 **准入闸**(志豪):自动切 V2 要求 profile state=ok 且 memory/user 非空,
 否则留 resident,不半切换。
-**回滚铁律**:先关 DETERMINISTIC 再关 PROFILE(compose 注释已写明)。
+**回滚铁律**:PROFILE 可独立关闭；历史 coverage 始终走 metadata-only 确定性路径。
 
 ## 10. compaction(摘要压缩,maintenance lane)
 
-积压超 `_TAIL_BUDGET`(50)触发;每批 ≤50 条/12 万字符全或无折叠,折叠失败
-不推进水位(曾致 prod 两次卡死,故批量从 200 缩到 50);
-`QUARANTINE_ENABLED=1`:单条毒丸消息用确定性替身盖过,不永久堵死该用户;
-`PROFILE_COVERAGE_DETERMINISTIC=1`(test 现开):不可折叠行发确定性计数
-哨兵(watermark_seq:count)而非整 turn 失败。
+积压超 `_TAIL_BUDGET` 触发；coverage 只读取 seq/count 边界并写入确定性计数哨兵，
+不解密历史消息、不调用 provider。该行为没有运行时开关，也不存在语义摘要、字符批次
+或毒丸 quarantine 分支。
 
 ## 11. 记忆注入全景(模型什么时候看到什么)
 
@@ -250,13 +248,13 @@ V2 把"必须在场的"改为确定性注入,"按需的"留给工具——弱模
 | FEEDLING_V2_CAPTURE_ENABLED | "1" 硬编码(backend+worker) | 两侧 |
 | FEEDLING_V2_DREAM_ENABLED | "1" 硬编码 | serve-worker |
 | FEEDLING_V2_PROFILE_ENABLED | "1" 硬编码(backend+worker) | 两侧 |
-| FEEDLING_V2_PROFILE_COVERAGE_DETERMINISTIC | "1" 硬编码 | serve-worker |
 | FEEDLING_V2_PUSH_ENABLED / SELF_THINKING | "1" 显式声明 | serve-worker |
-| COMPACTION_QUARANTINE | 默认 1 | serve-worker |
 | TRAJECTORY_INSPECT / REVIEW | 0(break-glass/调试,保留 env 形态) | serve-worker |
 | 每用户 proactive_settings | 全字段默认 true(dnd=false),新用户无死 lane | — |
 
-prod/pre compose 一字未动(PROFILE 等仍默认 0,rollout 归 Seven)。
+Runtime V2 对话 coverage 固定使用本地 seq/count sentinel；maintenance、inline
+catch-up 和 checkpoint 都不读取对话明文或调用 provider。需要回退时回滚 worker
+镜像版本，不再提供运行时双轨开关。
 
 ## 13. V1 差异判定汇总
 
