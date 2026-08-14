@@ -233,13 +233,8 @@ def test_memory_supersede_rejects_over_limit_instead_of_retiring_a_prefix():
     assert effects == []
 
 
-def test_memory_supersede_receipt_reports_only_cards_actually_retired(monkeypatch):
-    """A target removed between validation and the locked re-read is not claimed.
-
-    This race is rare, but the old receipt echoed requested ids rather than the
-    rows the mutation loop actually changed.  That let an agent tell the user
-    every old card was retired even when the persisted effect said otherwise.
-    """
+def test_memory_supersede_aborts_if_any_target_changes_before_locked_commit(monkeypatch):
+    """A stale merge must not append a successor after one source disappears."""
     store = types.SimpleNamespace(user_id="usr_m2")
 
     def old_card(mid: str) -> dict:
@@ -264,7 +259,7 @@ def test_memory_supersede_receipt_reports_only_cards_actually_retired(monkeypatc
     old_a = old_card("mem_old_a")
     old_b = old_card("mem_old_b")
     moments = [old_a, old_b]
-    _install_memory_action_fakes(monkeypatch, moments)
+    saved = _install_memory_action_fakes(monkeypatch, moments)
     monkeypatch.setattr(
         memory_actions,
         "_memory_plain_from_envelope",
@@ -289,9 +284,86 @@ def test_memory_supersede_receipt_reports_only_cards_actually_retired(monkeypatc
         "capture_mode": "agent_tool",
     }])
 
-    assert status == 200
-    assert body["results"][0]["superseded_ids"] == ["mem_old_a"]
-    assert body["effects"][0]["superseded_ids"] == ["mem_old_a"]
+    assert status == 400
+    assert body["status"] == "failed"
+    assert body["results"][0]["http_status"] == 409
+    assert body["results"][0]["error"] == "supersede_targets_changed"
+    assert body["results"][0]["target_ids"] == ["mem_old_b"]
+    assert body["effects"] == []
+    assert saved == []
+    assert old_a["status"] == "active"
+
+
+def test_memory_supersede_rejects_an_already_archived_target_without_new_card(monkeypatch):
+    store = types.SimpleNamespace(user_id="usr_m2")
+    old = {
+        "id": "mem_old",
+        "type": "fact",
+        "owner_user_id": "usr_m2",
+        "body_ct": json.dumps({"summary": "old", "description": "old"}),
+        "status": "superseded",
+        "is_archived": True,
+        "superseded_by": "mem_existing_successor",
+    }
+    moments = [old]
+    saved = _install_memory_action_fakes(monkeypatch, moments)
+
+    body, status = memory_actions._execute_memory_actions(store, "api_key", [{
+        "type": "memory.supersede",
+        "supersedes": ["mem_old"],
+        "memory": {"summary": "duplicate successor", "content": "duplicate successor"},
+    }])
+
+    assert status == 400
+    assert body["results"][0]["http_status"] == 409
+    assert body["results"][0]["error"] == "supersede_targets_unavailable"
+    assert body["results"][0]["target_ids"] == ["mem_old"]
+    assert saved == []
+
+
+def test_prebuilt_memory_supersede_aborts_if_all_targets_disappear_before_commit(monkeypatch):
+    store = types.SimpleNamespace(user_id="usr_m2")
+    old = {
+        "id": "mem_old",
+        "type": "fact",
+        "owner_user_id": "usr_m2",
+        "body_ct": json.dumps({"summary": "old", "description": "old"}),
+        "status": "active",
+    }
+    moments = [old]
+    saved = _install_memory_action_fakes(monkeypatch, moments)
+    loads = {"count": 0}
+
+    def load_with_concurrent_removal(_store):
+        loads["count"] += 1
+        return [old] if loads["count"] == 1 else []
+
+    monkeypatch.setattr(memory_actions.memory_service, "_load_moments", load_with_concurrent_removal)
+
+    result, effects, status = memory_actions._memory_supersede_envelope_action(store, {
+        "type": "memory.supersede",
+        "supersedes": ["mem_old"],
+        "envelope": {
+            "id": "mem_duplicate",
+            "type": "fact",
+            "owner_user_id": "usr_m2",
+            "body_ct": "ciphertext",
+            "nonce": "nonce_duplicate",
+            "K_user": "ku_duplicate",
+            "K_enclave": "ke_duplicate",
+            "enclave_pk_fpr": "fpr_test",
+            "visibility": "shared",
+            "occurred_at": "2026-08-14",
+            "source": "memory_dream",
+            "status": "active",
+        },
+    })
+
+    assert status == 409
+    assert result["error"] == "supersede_targets_changed"
+    assert result["target_ids"] == ["mem_old"]
+    assert effects == []
+    assert saved == []
 
 
 def test_coerce_runtime_action_maps_memory_supersede_to_executor_action():

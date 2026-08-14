@@ -169,6 +169,21 @@ def _memory_supersedes_list(
     return []
 
 
+def _memory_supersede_target_is_active(moment: dict | None) -> bool:
+    """Only a currently visible source card may be replaced.
+
+    Supersede builds its successor before taking the mutation lock.  Rechecking
+    both the row and its active state under that lock is the compare-and-swap
+    fence: a concurrent delete/supersede must make this action fail instead of
+    allowing a second active successor to be appended.
+    """
+    return bool(
+        isinstance(moment, dict)
+        and str(moment.get("status") or "active").strip().lower() == "active"
+        and not memory_service._memory_is_archived(moment)
+    )
+
+
 def _memory_default_bucket(value) -> str:
     mem_type = str(value or "").strip().lower()
     if mem_type in {"moment", "quote"}:
@@ -838,6 +853,14 @@ def _memory_supersede_action(
     old_cards = [moments[idx] for idx in old_indices]
     if any(old.get("owner_user_id") != store.user_id for old in old_cards):
         return {"status": "error", "error": "not_owned", "action": "memory.supersede"}, [], 403
+    inactive = [str(old.get("id") or "") for old in old_cards if not _memory_supersede_target_is_active(old)]
+    if inactive:
+        return {
+            "status": "error",
+            "error": "supersede_targets_unavailable",
+            "target_ids": inactive,
+            "action": "memory.supersede",
+        }, [], 409
 
     ok, err = _memory_validate_write(store, moments, mem_type=mem_type, anchor_ids=anchor_ids)
     if not ok:
@@ -879,10 +902,19 @@ def _memory_supersede_action(
     with memory_service.mutation_lock(store):
         moments = memory_service._load_moments(store)
         by_id = {m.get("id"): m for m in moments if isinstance(m, dict)}
+        unavailable = [
+            old_id for old_id in old_ids
+            if not _memory_supersede_target_is_active(by_id.get(old_id))
+        ]
+        if unavailable:
+            return {
+                "status": "error",
+                "error": "supersede_targets_changed",
+                "target_ids": unavailable,
+                "action": "memory.supersede",
+            }, [], 409
         for old_id in old_ids:
             retired = by_id.get(old_id)
-            if retired is None:
-                continue
             retired["status"] = "superseded"
             retired["superseded_by"] = new_moment["id"]
             retired["updated_at"] = now
@@ -951,6 +983,14 @@ def _memory_supersede_envelope_action(store: UserStore, action: dict) -> tuple[d
     old_cards = [moments[idx] for idx in old_indices]
     if any(old.get("owner_user_id") != store.user_id for old in old_cards):
         return {"status": "error", "error": "not_owned", "action": "memory.supersede"}, [], 403
+    inactive = [str(old.get("id") or "") for old in old_cards if not _memory_supersede_target_is_active(old)]
+    if inactive:
+        return {
+            "status": "error",
+            "error": "supersede_targets_unavailable",
+            "target_ids": inactive,
+            "action": "memory.supersede",
+        }, [], 409
 
     envelope["supersedes"] = list(old_ids)
     ok, err = _memory_validate_prebuilt_envelope(
@@ -971,10 +1011,19 @@ def _memory_supersede_envelope_action(store: UserStore, action: dict) -> tuple[d
     with memory_service.mutation_lock(store):
         moments = memory_service._load_moments(store)
         by_id = {m.get("id"): m for m in moments if isinstance(m, dict)}
+        unavailable = [
+            old_id for old_id in old_ids
+            if not _memory_supersede_target_is_active(by_id.get(old_id))
+        ]
+        if unavailable:
+            return {
+                "status": "error",
+                "error": "supersede_targets_changed",
+                "target_ids": unavailable,
+                "action": "memory.supersede",
+            }, [], 409
         for old_id in old_ids:
             retired = by_id.get(old_id)
-            if retired is None:
-                continue
             retired["status"] = "superseded"
             retired["superseded_by"] = new_moment["id"]
             retired["updated_at"] = now
