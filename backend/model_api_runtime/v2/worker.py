@@ -5919,35 +5919,29 @@ def _coverage_hole_notice(hole_count: int) -> str:
 async def _select_profile_prompt_for_turn(
     *,
     user_id: str,
-    summary: str,
     deps: TurnDeps,
     trajectory_recorder: "v2_trajectory.TrajectoryRecorder | None",
 ) -> "v2_profile_store.ProfilePromptSelection":
     if deps.select_profile_for_turn is None:
-        return v2_profile_store.ProfilePromptSelection(summary=str(summary))
+        return v2_profile_store.ProfilePromptSelection(state="empty")
     try:
         selection = await asyncio.to_thread(
             deps.select_profile_for_turn,
             user_id,
-            summary,
             enabled=_PROFILE_ENABLED,
         )
         if not isinstance(selection, v2_profile_store.ProfilePromptSelection):
             raise TypeError("invalid profile prompt selection")
-    except Exception as exc:  # noqa: BLE001 — turn must retain summary fallback
-        selection = v2_profile_store.ProfilePromptSelection(
-            summary=str(summary),
-            fallback_reason=(
-                "selection_failed:" + type(exc).__name__.lower()
-            ),
-        )
-    if selection.fallback_reason:
-        await _record_trajectory(
-            trajectory_recorder,
-            "profile_prompt_fallback",
-            {"reason": selection.fallback_reason},
-            best_effort=True,
-        )
+        if selection.state not in {"ok", "last_good", "empty", "unavailable"}:
+            raise TypeError("invalid profile prompt state")
+    except Exception:  # noqa: BLE001 — profile lag/failure must not block a turn
+        selection = v2_profile_store.ProfilePromptSelection(state="unavailable")
+    await _record_trajectory(
+        trajectory_recorder,
+        "profile_prompt_state",
+        {"state": selection.state},
+        best_effort=True,
+    )
     return selection
 
 
@@ -6070,12 +6064,12 @@ async def _read_seq_adaptive_prompt_context(
             optional_tail_turns = _group_complete_turns(optional_rows)
     profile_selection = await _select_profile_prompt_for_turn(
         user_id=user_id,
-        summary=summary,
         deps=deps,
         trajectory_recorder=trajectory_recorder,
     )
-    summary = profile_selection.summary
-    if not profile_selection.used_profile:
+    if profile_selection.state in {"ok", "last_good"}:
+        summary = ""
+    else:
         summary = await _bound_materialized_summary(
             user_id,
             summary,
@@ -6885,14 +6879,14 @@ async def _run_wake(
                 )
             profile_selection = await _select_profile_prompt_for_turn(
                 user_id=user_id,
-                summary=summary,
                 deps=deps,
                 trajectory_recorder=trajectory_recorder,
             )
-            summary = profile_selection.summary
             agent_memory = profile_selection.memory
             user_profile = profile_selection.user
-            if not profile_selection.used_profile:
+            if profile_selection.state in {"ok", "last_good"}:
+                summary = ""
+            else:
                 summary = await _bound_materialized_summary(
                     user_id,
                     summary,

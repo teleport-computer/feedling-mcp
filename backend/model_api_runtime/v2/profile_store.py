@@ -16,6 +16,7 @@ import logging
 import math
 import re
 import threading
+import time
 from typing import Any, Awaitable, Callable
 
 import db
@@ -37,11 +38,12 @@ class ProfileStorageError(RuntimeError):
 
 @dataclass(frozen=True)
 class ProfilePromptSelection:
-    summary: str
     memory: str = ""
     user: str = ""
-    used_profile: bool = False
-    fallback_reason: str = ""
+    state: str = "empty"
+    memory_chars: int = 0
+    user_chars: int = 0
+    age_seconds: float | None = None
 
 
 @dataclass(frozen=True)
@@ -377,41 +379,32 @@ async def update_profile_cas_async(
 
 def select_profile_for_turn(
     user_id: str,
-    summary: str,
     *,
     enabled: bool,
     decrypt_envelope: Callable[[dict, str], bytes],
     read_blob: Callable[[str, str], Any] = db.get_blob_strict,
 ) -> ProfilePromptSelection:
-    """Strictly read/decrypt an enabled profile or visibly fall back to summary."""
+    """Select decryptable profile fields without consulting Chat summary state."""
     if not enabled:
-        return ProfilePromptSelection(summary=str(summary))
+        return ProfilePromptSelection(state="empty")
     try:
         raw = read_blob(str(user_id), PROFILE_BLOB_KIND)
     except Exception as exc:  # DB outage must not masquerade as a missing profile.
         reason = f"strict_read_failed:{type(exc).__name__.lower()}"
         _record_turn_fallback(reason)
-        return ProfilePromptSelection(
-            summary=str(summary), fallback_reason=reason
-        )
+        return ProfilePromptSelection(state="unavailable")
     if raw is None:
-        return ProfilePromptSelection(summary=str(summary), fallback_reason="missing")
+        return ProfilePromptSelection(state="empty")
     try:
         document = validate_profile_document(raw)
     except ProfileStorageError:
         reason = "invalid_profile_document"
         _record_turn_fallback(reason)
-        return ProfilePromptSelection(
-            summary=str(summary), fallback_reason=reason
-        )
+        return ProfilePromptSelection(state="unavailable")
     if document["disabled"]:
-        return ProfilePromptSelection(
-            summary=str(summary), fallback_reason="disabled"
-        )
-    if document["state"] != "ok":
-        return ProfilePromptSelection(
-            summary=str(summary), fallback_reason=f"state:{document['state']}"
-        )
+        return ProfilePromptSelection(state="empty")
+    if document.get("memory") is None:
+        return ProfilePromptSelection(state="empty")
     try:
         memory = decrypt_envelope(document["memory"]["envelope"], "memory").decode(
             "utf-8"
@@ -424,12 +417,18 @@ def select_profile_for_turn(
     except Exception as exc:
         reason = f"decrypt_failed:{type(exc).__name__.lower()}"
         _record_turn_fallback(reason)
-        return ProfilePromptSelection(
-            summary=str(summary), fallback_reason=reason
-        )
+        return ProfilePromptSelection(state="unavailable")
+    generated_at = _timestamp_rank(document["source"].get("generated_at"))
+    age_seconds = (
+        None
+        if not math.isfinite(generated_at)
+        else max(0.0, time.time() - generated_at)
+    )
     return ProfilePromptSelection(
-        summary="",
         memory=memory,
         user=user,
-        used_profile=True,
+        state="ok" if document["state"] == "ok" else "last_good",
+        memory_chars=len(memory),
+        user_chars=len(user),
+        age_seconds=age_seconds,
     )

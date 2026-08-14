@@ -1623,16 +1623,14 @@ def _read_summary_with_seq(user_id: str) -> tuple[str, float, int, int]:
 
 def _select_agent_profile_for_turn(
     user_id: str,
-    summary: str,
     *,
     enabled: bool,
 ) -> v2_profile_store.ProfilePromptSelection:
     """Production strict-read/decrypt adapter for M5 prompt selection.
 
     M2 lands and tests this trust/storage boundary before prompt wiring.  M5
-    consumes the returned selection; a DB/decrypt failure already has the final
-    safe behavior here: keep the summary and emit a content-free observable
-    fallback event/counter.
+    consumes the returned selection; a DB/decrypt failure yields an empty,
+    content-free unavailable selection and never blocks Chat or wake.
     """
     token: str | None = None
 
@@ -1651,7 +1649,6 @@ def _select_agent_profile_for_turn(
         with core_enclave.coalesced_success_trace("v2_profile_user_read"):
             return v2_profile_store.select_profile_for_turn(
                 user_id,
-                summary,
                 enabled=enabled,
                 decrypt_envelope=_decrypt,
                 read_blob=db.get_blob_strict,

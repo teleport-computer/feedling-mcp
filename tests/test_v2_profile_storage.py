@@ -466,7 +466,7 @@ def test_second_cas_loss_fails_without_a_third_write_or_field_merge(monkeypatch)
     assert cas_candidates[0] is not cas_candidates[1]
 
 
-def test_strict_read_failure_falls_back_to_summary_and_emits_event_and_count(
+def test_strict_read_failure_returns_unavailable_and_emits_event_and_count(
     caplog,
 ):
     reason = "strict_read_failed:runtimeerror"
@@ -475,7 +475,6 @@ def test_strict_read_failure_falls_back_to_summary_and_emits_event_and_count(
     with caplog.at_level(logging.WARNING, logger="feedling.runtime_v2.profile_store"):
         selection = profile_store.select_profile_for_turn(
             "u-profile-read-failure",
-            "- durable summary",
             enabled=True,
             decrypt_envelope=lambda *_args: b"must-not-run",
             read_blob=lambda *_args: (_ for _ in ()).throw(
@@ -483,15 +482,15 @@ def test_strict_read_failure_falls_back_to_summary_and_emits_event_and_count(
             ),
         )
 
-    assert selection.summary == "- durable summary"
-    assert selection.used_profile is False
-    assert selection.fallback_reason == reason
+    assert selection.memory == ""
+    assert selection.user == ""
+    assert selection.state == "unavailable"
     assert profile_store.profile_turn_fallback_counts()[reason] == before + 1
     assert "turn profile fallback" in caplog.text
     assert "database unavailable" not in caplog.text
 
 
-def test_production_turn_adapter_uses_strict_read_and_observable_summary_fallback(
+def test_production_turn_adapter_uses_strict_read_and_observable_unavailable_state(
     monkeypatch,
 ):
     reason = "strict_read_failed:runtimeerror"
@@ -511,13 +510,12 @@ def test_production_turn_adapter_uses_strict_read_and_observable_summary_fallbac
 
     selection = serve_worker._select_agent_profile_for_turn(
         "u-profile-production-read",
-        "- existing encrypted summary",
         enabled=True,
     )
 
-    assert selection.summary == "- existing encrypted summary"
-    assert selection.used_profile is False
-    assert selection.fallback_reason == reason
+    assert selection.memory == ""
+    assert selection.user == ""
+    assert selection.state == "unavailable"
     assert profile_store.profile_turn_fallback_counts()[reason] == before + 1
 
 
@@ -546,15 +544,14 @@ def test_production_profile_decrypts_declare_both_trace_scopes(monkeypatch):
 
     selection = serve_worker._select_agent_profile_for_turn(
         "u-profile-scopes",
-        "old summary",
         enabled=True,
     )
 
-    assert selection.used_profile is True
+    assert selection.state == "ok"
     assert scopes == ["v2_profile_memory_read", "v2_profile_user_read"]
 
 
-def test_ok_profile_suppresses_summary_only_after_both_fields_decrypt():
+def test_ok_profile_returns_both_decrypted_fields():
     doc = _ok_doc("u-profile-turn", 1)
     plaintext = {
         doc["memory"]["envelope"]["body_ct"]: b"memory-1",
@@ -562,19 +559,17 @@ def test_ok_profile_suppresses_summary_only_after_both_fields_decrypt():
     }
     selection = profile_store.select_profile_for_turn(
         "u-profile-turn",
-        "- old summary",
         enabled=True,
         read_blob=lambda *_args: doc,
         decrypt_envelope=lambda envelope, _field: plaintext[envelope["body_ct"]],
     )
 
-    assert selection.used_profile is True
-    assert selection.summary == ""
+    assert selection.state == "ok"
     assert selection.memory == "memory-1"
     assert selection.user == "user-1"
 
 
-def test_disabled_ok_profile_keeps_summary_without_decrypting_fields():
+def test_disabled_ok_profile_returns_empty_without_decrypting_fields():
     doc = profile_store.build_profile_document(
         "u-profile-disabled",
         state="ok",
@@ -588,7 +583,6 @@ def test_disabled_ok_profile_keeps_summary_without_decrypting_fields():
 
     selection = profile_store.select_profile_for_turn(
         "u-profile-disabled",
-        "- old summary",
         enabled=True,
         read_blob=lambda *_args: doc,
         decrypt_envelope=lambda *_args: (_ for _ in ()).throw(
@@ -597,9 +591,35 @@ def test_disabled_ok_profile_keeps_summary_without_decrypting_fields():
     )
 
     assert selection == profile_store.ProfilePromptSelection(
-        summary="- old summary",
-        fallback_reason="disabled",
+        state="empty",
     )
+
+
+def test_degraded_profile_uses_retained_fields_as_last_known_good():
+    ok = _ok_doc("u-profile-last-good", 1)
+    degraded = profile_store.build_profile_document(
+        "u-profile-last-good",
+        state="degraded",
+        source=_source(1),
+        last_attempt={**_attempt(), "reject_code": "provider_unavailable"},
+        previous=ok,
+        seal_text=_seal,
+    )
+    plaintext = {
+        degraded["memory"]["envelope"]["body_ct"]: b"memory-1",
+        degraded["user"]["envelope"]["body_ct"]: b"user-1",
+    }
+
+    selection = profile_store.select_profile_for_turn(
+        "u-profile-last-good",
+        enabled=True,
+        read_blob=lambda *_args: degraded,
+        decrypt_envelope=lambda envelope, _field: plaintext[envelope["body_ct"]],
+    )
+
+    assert selection.memory == "memory-1"
+    assert selection.user == "user-1"
+    assert selection.state == "last_good"
 
 
 def test_winning_cas_mirrors_only_ciphertext_to_real_tee_shadow(monkeypatch):

@@ -19,7 +19,7 @@ def _deps(selection):
         read_tail_after_seq=lambda _uid, _after, _limit, **_kwargs: [
             {"id": "m6", "seq": 6, "role": "user", "content": "latest"}
         ],
-        select_profile_for_turn=lambda _uid, _summary, **_kwargs: selection,
+        select_profile_for_turn=lambda _uid, **_kwargs: selection,
     )
 
 
@@ -47,10 +47,9 @@ def _read(monkeypatch, selection):
 
 def test_ok_profile_suppresses_summary_and_skips_summary_bounding(monkeypatch):
     selection = profile_store.ProfilePromptSelection(
-        summary="",
         memory="relationship facts",
         user="interaction style",
-        used_profile=True,
+        state="ok",
     )
     monkeypatch.setattr(
         worker,
@@ -78,11 +77,12 @@ def test_ok_profile_suppresses_summary_and_skips_summary_bounding(monkeypatch):
     assert coverage_notice == ""
 
 
-@pytest.mark.parametrize("reason", ["state:degraded", "state:pending", "disabled"])
-def test_nonusable_or_disabled_profile_keeps_summary_path(monkeypatch, reason):
+@pytest.mark.parametrize("state", ["empty", "unavailable"])
+def test_nonusable_or_disabled_profile_keeps_summary_path_temporarily(
+    monkeypatch, state
+):
     selection = profile_store.ProfilePromptSelection(
-        summary="- legacy summary",
-        fallback_reason=reason,
+        state=state,
     )
     calls = []
 
@@ -101,11 +101,11 @@ def test_nonusable_or_disabled_profile_keeps_summary_path(monkeypatch, reason):
 def test_profile_flag_off_is_forwarded_without_suppressing_summary(monkeypatch):
     seen = {}
 
-    def _select(_uid, summary, *, enabled):
+    def _select(_uid, *, enabled):
         seen["enabled"] = enabled
-        return profile_store.ProfilePromptSelection(summary=summary)
+        return profile_store.ProfilePromptSelection(state="empty")
 
-    deps = _deps(profile_store.ProfilePromptSelection(summary="- unused"))
+    deps = _deps(profile_store.ProfilePromptSelection(state="empty"))
     deps.select_profile_for_turn = _select
 
     async def _exact(*_args, **_kwargs):
@@ -133,7 +133,7 @@ def test_profile_flag_off_is_forwarded_without_suppressing_summary(monkeypatch):
     assert result[5:7] == ("", "")
 
 
-def test_selection_failure_records_only_content_free_fallback_reason(monkeypatch):
+def test_selection_failure_records_only_content_free_unavailable_state(monkeypatch):
     events = []
 
     class Recorder:
@@ -141,7 +141,7 @@ def test_selection_failure_records_only_content_free_fallback_reason(monkeypatch
             events.append((kind, payload))
             return True
 
-    deps = _deps(profile_store.ProfilePromptSelection(summary="- unused"))
+    deps = _deps(profile_store.ProfilePromptSelection(state="empty"))
     deps.select_profile_for_turn = lambda *_args, **_kwargs: (_ for _ in ()).throw(
         RuntimeError("PRIVATE provider or storage detail")
     )
@@ -150,18 +150,18 @@ def test_selection_failure_records_only_content_free_fallback_reason(monkeypatch
     selection = asyncio.run(
         worker._select_profile_prompt_for_turn(
             user_id="u",
-            summary="- durable summary",
             deps=deps,
             trajectory_recorder=Recorder(),
         )
     )
 
-    assert selection.summary == "- durable summary"
-    assert selection.fallback_reason == "selection_failed:runtimeerror"
+    assert selection.state == "unavailable"
+    assert selection.memory == ""
+    assert selection.user == ""
     assert events == [
         (
-            "profile_prompt_fallback",
-            {"reason": "selection_failed:runtimeerror"},
+            "profile_prompt_state",
+            {"state": "unavailable"},
         )
     ]
     assert "PRIVATE" not in json.dumps(events)
