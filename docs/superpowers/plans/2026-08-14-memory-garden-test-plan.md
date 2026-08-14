@@ -191,6 +191,14 @@ conftest 自己从维护库里开一个一次性数据库并导出 `DATABASE_URL
 两个错叠加的效果特别像真回归：一批看着相关的测试（access_mode、perception）
 集体变红。**先查跑法，再查代码。**
 
+按正确跑法（`cd backend` + 维护库 + `--ignore=../tests/test_api.py`）复跑后：
+
+    本分支   5 failed / 9545 passed
+    基线     9 failed / 9378 passed
+    新增失败 0 条
+    基线独有 4 条（e2b 模板 / PDF 提取 / 可下载文件）—— 装齐依赖后反而过了
+    共同失败 5 条
+
 并发下有几个测试是 flaky（`test_v2_optional_anchor` 与
 `test_ops_dashboard_queries` 都出现过），判定方法：单独跑 + 在基线上跑同一组合。
 **不能因为「看着无关」就跳过验证。**
