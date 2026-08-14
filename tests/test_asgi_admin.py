@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import itertools
+import json
 import re
 import sys
 import uuid
@@ -31,6 +32,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 import db  # noqa: E402
 from accounts import registry  # noqa: E402
 from admin import routes_asgi as admin_asgi  # noqa: E402
+from admin import memory_metadata  # noqa: E402
 from asgi import middleware  # noqa: E402
 from asgi_test_client import make_client  # noqa: E402
 from content import content_core  # noqa: E402
@@ -287,6 +289,232 @@ def test_user_detail_invalid_uid_parity(env):
     f = _flask_get_json(path, headers=_admin())
     a = _asgi_json("GET", path, headers=_admin())
     assert f == a == (400, {"error": "invalid_user_id"})
+
+
+# --------------------------------------------------------------------------- #
+# content-free memory metadata diagnostics
+# --------------------------------------------------------------------------- #
+
+def _seed_memory_metadata_rows(user_id: str) -> None:
+    rows = [
+        (
+            "memory-new",
+            "2026-08-13T12:00:00Z",
+            {
+                "created_at": "2026-08-13T12:00:01Z",
+                "supersedes": ["memory-old"],
+                "source": "memory_dream",
+                "summary": "NEVER_RETURN_CARD_SUMMARY",
+                "content": "NEVER_RETURN_CARD_CONTENT",
+                "body_ct": "NEVER_RETURN_CARD_BODY_CT",
+                "prompt": "NEVER_RETURN_CARD_PROMPT",
+                "reply": "NEVER_RETURN_CARD_REPLY",
+            },
+        ),
+        (
+            "memory-old",
+            "2026-08-12",
+            {
+                "created_at": "2026-08-12T08:30:00Z",
+                "superseded_by": "memory-new",
+                "capture_mode": "memory_capture",
+                "is_archived": True,
+                "archive_reason": "superseded_by:memory-new",
+                "summary": "NEVER_RETURN_OLD_SUMMARY",
+            },
+        ),
+    ]
+    with db.get_pool().connection() as conn:
+        for memory_id, occurred_at, doc in rows:
+            conn.execute(
+                "INSERT INTO memory_moments (user_id,moment_id,occurred_at,doc) "
+                "VALUES (%s,%s,%s,%s)",
+                (user_id, memory_id, occurred_at, json.dumps(doc)),
+            )
+
+
+def _seed_dream_job_rows(user_id: str) -> None:
+    with db.get_pool().connection() as conn:
+        first = conn.execute(
+            "INSERT INTO agent_jobs "
+            "(user_id,lane,status,last_error,created_at,claimed_at,started_at,finished_at) "
+            "VALUES (%s,'dream','failed','upstream_unavailable',"
+            "'2026-08-13T10:00:00Z','2026-08-13T10:00:05Z',"
+            "'2026-08-13T10:00:10Z','2026-08-13T10:04:59Z') RETURNING id",
+            (user_id,),
+        ).fetchone()[0]
+        second = conn.execute(
+            "INSERT INTO agent_jobs "
+            "(user_id,lane,status,last_error,created_at,started_at,finished_at) "
+            "VALUES (%s,'dream','failed','NEVER RETURN RAW PROVIDER BODY',"
+            "'2026-08-13T09:00:00Z','2026-08-13T09:00:02Z',"
+            "'2026-08-13T09:00:27Z') RETURNING id",
+            (user_id,),
+        ).fetchone()[0]
+        conn.execute(
+            "INSERT INTO agent_jobs (user_id,lane,status,created_at,finished_at) "
+            "VALUES (%s,'chat','completed','2026-08-13T08:00:00Z',"
+            "'2026-08-13T08:00:01Z')",
+            (user_id,),
+        )
+        for job_id, provider, model, latency in (
+            (first, "openai", "gpt-5.5", 289000),
+            (second, "anthropic", "claude-sonnet-4-5", 25000),
+        ):
+            conn.execute(
+                "INSERT INTO v2_turn_metrics "
+                "(job_id,user_id,lane,provider,model,latency_ms,failed,status) "
+                "VALUES (%s,%s,'dream',%s,%s,%s,true,'failed')",
+                (job_id, user_id, provider, model, latency),
+            )
+
+
+def test_memory_card_metadata_is_paginated_and_content_free(env):
+    uid, _key = _register()
+    _seed_memory_metadata_rows(uid)
+
+    status, first = _asgi_json(
+        "GET",
+        f"/v1/admin/users/{uid}/memory-card-metadata?limit=1&offset=0",
+        headers=_admin(),
+    )
+    assert status == 200
+    assert first["user_id"] == uid
+    assert first["pagination"] == {
+        "limit": 1,
+        "offset": 0,
+        "total": 2,
+        "has_more": True,
+    }
+    assert first["cards"] == [
+        {
+            "id": "memory-new",
+            "occurred_at": "2026-08-13T12:00:00Z",
+            "created_at": "2026-08-13T12:00:01Z",
+            "supersedes": ["memory-old"],
+            "superseded_by": "",
+            "source": "memory_dream",
+            "archived": False,
+        }
+    ]
+
+    status, second = _asgi_json(
+        "GET",
+        f"/v1/admin/users/{uid}/memory-card-metadata?limit=1&offset=1"
+        f"&admin_key={ADMIN_TOKEN}",
+    )
+    assert status == 200
+    assert second["pagination"]["has_more"] is False
+    assert second["cards"][0]["id"] == "memory-old"
+    assert second["cards"][0]["source"] == "memory_capture"
+    assert second["cards"][0]["archived"] is True
+
+    rendered = json.dumps([first, second])
+    for forbidden in (
+        "summary",
+        "content",
+        "body_ct",
+        "prompt",
+        "reply",
+        "NEVER_RETURN",
+    ):
+        assert forbidden not in rendered
+    assert set(first["cards"][0]) == memory_metadata.CARD_FIELDS
+
+
+def test_dream_job_metadata_supports_filters_pagination_and_no_bodies(env):
+    uid, _key = _register()
+    _seed_memory_metadata_rows(uid)
+    _seed_dream_job_rows(uid)
+
+    path = (
+        f"/v1/admin/memory-dream-jobs?user_id={uid}"
+        "&status=failed&limit=1&offset=0"
+    )
+    status, first = _asgi_json("GET", path, headers=_admin())
+    assert status == 200
+    assert first["filters"] == {"user_id": uid, "status": "failed"}
+    assert first["pagination"] == {
+        "limit": 1,
+        "offset": 0,
+        "total": 2,
+        "has_more": True,
+    }
+    assert first["jobs"][0] == {
+        "job_id": first["jobs"][0]["job_id"],
+        "user_id": uid,
+        "lane": "dream",
+        "status": "failed",
+        "failure_code": "upstream_unavailable",
+        "duration_ms": 289000,
+        "provider": "openai",
+        "model": "gpt-5.5",
+        "memory_card_count": 2,
+        "created_at": "2026-08-13T10:00:00Z",
+        "finished_at": "2026-08-13T10:04:59Z",
+    }
+    assert set(first["jobs"][0]) == memory_metadata.DREAM_JOB_FIELDS
+
+    status, second = _asgi_json(
+        "GET", path.replace("offset=0", "offset=1"), headers=_admin()
+    )
+    assert status == 200
+    assert second["pagination"]["has_more"] is False
+    assert second["jobs"][0]["failure_code"] == "runtime_failed"
+    assert second["jobs"][0]["duration_ms"] == 25000
+    rendered = json.dumps([first, second])
+    for forbidden in ("prompt", "reply", "content", "body", "NEVER RETURN"):
+        assert forbidden not in rendered
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/v1/admin/users/usr_example/memory-card-metadata",
+        "/v1/admin/memory-dream-jobs",
+    ],
+)
+def test_memory_metadata_routes_use_existing_admin_auth(env, path):
+    assert _asgi_json("GET", path) == (401, {"error": "unauthorized"})
+    assert _asgi_json("GET", path, headers=_admin("wrong")) == (
+        401,
+        {"error": "unauthorized"},
+    )
+
+
+def test_metadata_projection_rejects_unexpected_content_fields():
+    hostile = {
+        "id": "safe-id",
+        "occurred_at": "2026-08-13",
+        "created_at": "2026-08-13T00:00:00Z",
+        "supersedes": [],
+        "superseded_by": "",
+        "source": "memory_dream",
+        "archived": False,
+        "summary": "SECRET SUMMARY",
+        "content": "SECRET CONTENT",
+        "body_ct": "SECRET CIPHERTEXT",
+        "prompt": "SECRET PROMPT",
+        "reply": "SECRET REPLY",
+    }
+    card = memory_metadata.card_metadata_from_row(hostile)
+    job = memory_metadata.dream_job_metadata_from_row(
+        {
+            **hostile,
+            "job_id": 7,
+            "user_id": "usr_safe",
+            "status": "failed",
+            "failure_code": "no_json_object",
+            "duration_ms": 42,
+            "provider": "openai",
+            "model": "gpt-5.5",
+            "memory_card_count": 3,
+            "finished_at": "2026-08-13T00:00:01Z",
+        }
+    )
+    assert set(card) == memory_metadata.CARD_FIELDS
+    assert set(job) == memory_metadata.DREAM_JOB_FIELDS
+    assert "SECRET" not in json.dumps([card, job])
 
 
 # --------------------------------------------------------------------------- #

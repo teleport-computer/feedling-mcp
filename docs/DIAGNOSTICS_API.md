@@ -143,6 +143,8 @@ X-Admin-Token: <FEEDLING_ADMIN_TOKEN>
 ```
 （也接受 `Authorization: Bearer <token>` 或 `?admin_key=<token>`。）
 
+记忆诊断可用 `GET /v1/admin/users/{user_id}/memory-card-metadata` 分页读取逐卡时间与替代关系元数据，并用 `GET /v1/admin/memory-dream-jobs` 分页读取 dream job 的耗时、失败码和 provider/model 标签；两者均不返回 prompt、回复或记忆正文。
+
 ### 响应 `200`
 
 返回该用户**最近最多 10 条**上报(按时间正序):
