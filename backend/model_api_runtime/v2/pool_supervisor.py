@@ -97,20 +97,17 @@ class SlotFleet:
     ) -> bool:
         """Restart one child only if its full generation/job snapshot matches."""
         supervisor = self._supervisors[key]
-        kill_if_snapshot = getattr(supervisor, "kill_if_snapshot", None)
-        if callable(kill_if_snapshot):
-            killed = bool(kill_if_snapshot(expected))
+        restart_if_snapshot = getattr(supervisor, "restart_if_snapshot", None)
+        if callable(restart_if_snapshot):
+            return bool(restart_if_snapshot(expected))
         else:
-            # Test-double compatibility; production supervisors always expose
-            # the atomic compare-and-kill method above.
+            # Narrow compatibility for simple unit-test doubles. Production
+            # supervisors always own the atomic lifecycle operation above.
             if supervisor.snapshot() != expected:
                 return False
             supervisor.kill()
-            killed = True
-        if not killed:
-            return False
-        supervisor.start()
-        return True
+            supervisor.start()
+            return True
 
     def healthy_capacity(self, pool: pool_config.PoolName, *, stale_sec: float) -> int:
         healthy = 0

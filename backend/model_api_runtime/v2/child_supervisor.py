@@ -61,6 +61,7 @@ import multiprocessing as mp
 import threading
 import time
 import uuid
+from dataclasses import dataclass
 from typing import Any, Callable
 
 from model_api_runtime.v2 import enclave_broker, slot_protocol
@@ -70,6 +71,14 @@ log = logging.getLogger("feedling.runtime_v2.child_supervisor")
 # `multiprocessing.connection.Connection.poll()` 的轮询粒度：够短以便 stop()/reader 线程
 # 能及时响应，又不至于空转烧 CPU。
 _POLL_TIMEOUT_SEC = 0.5
+
+
+@dataclass(frozen=True)
+class KillOutcome:
+    """Result of a physical kill attempt used before DB claim recovery."""
+
+    active_job: slot_protocol.ActiveJobIdentity | None
+    terminated: bool
 
 
 class ChildSupervisor:
@@ -98,6 +107,13 @@ class ChildSupervisor:
         self._pool = str(pool)
         self._slot_id = str(slot_id)
 
+        # Serialize the whole per-slot process lifecycle.  `_lock` protects
+        # snapshots and pipe state for short reads/writes; it cannot protect a
+        # compare -> kill -> cleanup -> start transaction because reader
+        # shutdown may itself need `_lock`.  A separate re-entrant lock keeps
+        # cancellation, reconciliation, watchdog recovery, and shutdown from
+        # spawning overlapping generations.
+        self._lifecycle_lock = threading.RLock()
         self._lock = threading.Lock()
         self._proc: mp.process.BaseProcess | None = None
         self._read_conn = None
@@ -112,6 +128,10 @@ class ChildSupervisor:
         # read by poll_liveness() to compute current_turn_age_sec. See module
         # docstring's "progress pipe 协议" / split-budget sections.
         self._slot_generation = ""
+        # Generations invalidated while their OS child could not yet be
+        # confirmed dead.  Keep their broker permits reserved until a later
+        # kill/join proves the tracked process is gone.
+        self._retired_generations: set[str] = set()
         self._snapshot: slot_protocol.SlotProgress | None = None
         self._turn_progress_at: float | None = None
 
@@ -123,9 +143,27 @@ class ChildSupervisor:
     def start(self) -> None:
         """spawn 一个新子进程 + 起后台 reader 线程drain progress pipe。
 
-        可重复调用（`kill_and_respawn` 内部就是 kill 完再调一次这个）——每次都是全新
-        的 Pipe + 全新的 Process，不复用上一代子进程的任何状态。
+        在上一代已 kill/stop 后可重复调用，每次都是全新的 Pipe + Process。若上一代仍
+        存活则幂等返回，防止任何误用覆盖 `_proc` 并制造无法追踪的孤儿子进程。
         """
+        with self._lifecycle_lock:
+            self._start_locked()
+
+    def _start_locked(self) -> None:
+        """Start one generation while `_lifecycle_lock` is held."""
+        with self._lock:
+            existing = self._proc
+        if existing is not None and existing.is_alive():
+            log.warning(
+                "[v2.child_supervisor] ignored duplicate start for live child pid=%s",
+                existing.pid,
+            )
+            return
+        if existing is not None:
+            # Reap a process that exited between liveness polling and start;
+            # do not overwrite its pipe/reader handles.
+            self._kill_locked(join_timeout=0.0)
+
         read_conn, write_conn = mp.Pipe(duplex=True)
         slot_generation = uuid.uuid4().hex
         proc = self._ctx.Process(
@@ -229,39 +267,62 @@ class ChildSupervisor:
         self, *, join_timeout: float = 5.0
     ) -> slot_protocol.ActiveJobIdentity | None:
         """Snapshot the exact owner, kill this slot generation, and stop."""
+        with self._lifecycle_lock:
+            outcome = self._kill_locked(join_timeout=join_timeout)
+            return outcome.active_job if outcome.terminated else None
+
+    def kill_for_recovery(self, *, join_timeout: float = 5.0) -> KillOutcome:
+        """Kill and explicitly report whether DB claim recovery is now safe."""
+        with self._lifecycle_lock:
+            return self._kill_locked(join_timeout=join_timeout)
+
+    def _kill_locked(
+        self, *, join_timeout: float = 5.0
+    ) -> KillOutcome:
+        """Kill the current generation while `_lifecycle_lock` is held."""
         with self._lock:
             snapshot = self._snapshot
             active_job = None if snapshot is None else snapshot.active_job
             dead_generation = self._slot_generation
         self._stop_reader()
         proc = self._proc
+        terminated = proc is None
         if proc is not None:
             try:
                 if proc.is_alive():
                     log.warning("[v2.child_supervisor] SIGKILL wedged child pid=%s", proc.pid)
                     proc.kill()
                 proc.join(join_timeout)
-                if proc.is_alive():
+                terminated = not proc.is_alive()
+                if not terminated:
                     log.error(
                         "[v2.child_supervisor] child pid=%s still alive %.1fs after "
-                        "SIGKILL+join — orphaned; proceeding to respawn anyway",
+                        "SIGKILL+join — keeping it tracked and refusing respawn",
                         proc.pid, join_timeout)
             except Exception as e:  # noqa: BLE001 — 杀不掉也不能拖垮父进程的 watchdog 循环
                 log.warning("[v2.child_supervisor] kill cleanup failed: %s", e)
+                terminated = False
         self._close_read_conn()
-        with self._lock:
-            self._proc = None
-            self._slot_generation = uuid.uuid4().hex
-            self._snapshot = None
-            self._turn_progress_at = None
-        if self._broker is not None and dead_generation:
-            self._broker.drop_generation(dead_generation)
-        return active_job
+        if terminated:
+            with self._lock:
+                if self._proc is proc:
+                    self._proc = None
+                generations_to_drop = set(self._retired_generations)
+                self._retired_generations.clear()
+                if dead_generation:
+                    generations_to_drop.add(dead_generation)
+                self._slot_generation = uuid.uuid4().hex
+                self._snapshot = None
+                self._turn_progress_at = None
+            self._drop_broker_generations(generations_to_drop)
+        return KillOutcome(active_job=active_job, terminated=terminated)
 
     def kill_and_respawn(self, *, join_timeout: float = 5.0) -> None:
         """Compatibility wrapper; new recovery paths call kill/recover/start."""
-        self.kill(join_timeout=join_timeout)
-        self.start()
+        with self._lifecycle_lock:
+            outcome = self._kill_locked(join_timeout=join_timeout)
+            if outcome.terminated:
+                self._start_locked()
 
     def kill_if_snapshot(
         self,
@@ -276,6 +337,18 @@ class ChildSupervisor:
         lock, so a late pipe message from the killed process cannot repopulate
         state after the decision.
         """
+        with self._lifecycle_lock:
+            return self._kill_if_snapshot_locked(
+                expected, join_timeout=join_timeout
+            )
+
+    def _kill_if_snapshot_locked(
+        self,
+        expected: slot_protocol.SlotProgress,
+        *,
+        join_timeout: float = 5.0,
+    ) -> bool:
+        """Fenced kill while `_lifecycle_lock` is held."""
         with self._lock:
             if self._snapshot != expected:
                 return False
@@ -291,30 +364,78 @@ class ChildSupervisor:
             except Exception as exc:  # noqa: BLE001
                 log.warning("[v2.child_supervisor] fenced kill failed: %s", exc)
                 return False
-            self._proc = None
             self._slot_generation = uuid.uuid4().hex
             self._snapshot = None
             self._turn_progress_at = None
-        if self._broker is not None and dead_generation:
-            self._broker.drop_generation(dead_generation)
         self._stop_reader()
+        terminated = proc is None
         if proc is not None:
             try:
                 proc.join(join_timeout)
+                terminated = not proc.is_alive()
             except Exception as exc:  # noqa: BLE001
                 log.warning("[v2.child_supervisor] fenced join failed: %s", exc)
+                terminated = False
         self._close_read_conn()
+        if not terminated:
+            with self._lock:
+                if dead_generation:
+                    self._retired_generations.add(dead_generation)
+            log.error(
+                "[v2.child_supervisor] fenced child pid=%s still alive after "
+                "SIGKILL+join — keeping it tracked and refusing replacement",
+                None if proc is None else proc.pid,
+            )
+            return False
+        with self._lock:
+            if self._proc is proc:
+                self._proc = None
+            generations_to_drop = set(self._retired_generations)
+            self._retired_generations.clear()
+            if dead_generation:
+                generations_to_drop.add(dead_generation)
+        self._drop_broker_generations(generations_to_drop)
         return True
+
+    def restart_if_snapshot(
+        self,
+        expected: slot_protocol.SlotProgress,
+        *,
+        join_timeout: float = 5.0,
+    ) -> bool:
+        """Atomically replace only the exact slot generation in `expected`.
+
+        Snapshot comparison, SIGKILL, pipe cleanup, and replacement spawn are
+        one lifecycle transaction.  Concurrent owners of the same stale
+        snapshot therefore cannot each create a replacement child.
+        """
+        with self._lifecycle_lock:
+            if not self._kill_if_snapshot_locked(
+                expected, join_timeout=join_timeout
+            ):
+                return False
+            self._start_locked()
+            return True
 
     def stop(self, *, drain_timeout: float = 10.0, kill_timeout: float = 2.0) -> None:
         """优雅停止：SIGTERM（子进程的信号处理器据此 drain 手上的回合再退出）+ 限时
         join；超时仍活着才升级成 SIGKILL。父进程 `_serve` 的 finally/stop_event 路径调
         这个，不是 `kill_and_respawn`——那个是 watchdog 专用的"不管三七二十一先杀死"。
         """
+        with self._lifecycle_lock:
+            self._stop_locked(
+                drain_timeout=drain_timeout, kill_timeout=kill_timeout
+            )
+
+    def _stop_locked(
+        self, *, drain_timeout: float = 10.0, kill_timeout: float = 2.0
+    ) -> None:
+        """Gracefully stop the current generation with lifecycle ownership."""
         with self._lock:
             dead_generation = self._slot_generation
         self._stop_reader()
         proc = self._proc
+        terminated = proc is None
         if proc is not None:
             try:
                 if proc.is_alive():
@@ -326,14 +447,38 @@ class ChildSupervisor:
                         "after SIGTERM — SIGKILL", proc.pid, drain_timeout)
                     proc.kill()
                     proc.join(kill_timeout)
+                terminated = not proc.is_alive()
             except Exception as e:  # noqa: BLE001 — shutdown 必须有界，不能被这里的异常卡住
                 log.warning("[v2.child_supervisor] stop() cleanup failed: %s", e)
+                terminated = False
         self._close_read_conn()
         with self._lock:
-            self._proc = None
-        if self._broker is not None and dead_generation:
-            self._broker.drop_generation(dead_generation)
+            if terminated and self._proc is proc:
+                self._proc = None
+            if terminated:
+                generations_to_drop = set(self._retired_generations)
+                self._retired_generations.clear()
+                if dead_generation:
+                    generations_to_drop.add(dead_generation)
+            else:
+                generations_to_drop = set()
+                if dead_generation:
+                    self._retired_generations.add(dead_generation)
+            # Shutdown is a lifecycle fence even when OS termination fails.
+            # Invalidate the old snapshot/generation so a cancellation queued
+            # before unwatch cannot resurrect this slot after stop returns.
+            self._slot_generation = uuid.uuid4().hex
+            self._snapshot = None
+            self._turn_progress_at = None
+        self._drop_broker_generations(generations_to_drop)
         log.info("[v2.child_supervisor] stopped")
+
+    def _drop_broker_generations(self, generations: set[str]) -> None:
+        if self._broker is None:
+            return
+        for generation in generations:
+            if generation:
+                self._broker.drop_generation(generation)
 
     def grant_enclave(self, request: enclave_broker.EnclaveRequest) -> None:
         """Deliver a broker grant only to the matching live slot generation."""

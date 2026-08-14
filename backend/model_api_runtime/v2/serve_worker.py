@@ -4863,25 +4863,19 @@ class _JobCancelRouter:
         with self._lock:
             cancel = self._by_claimed_by.get(event.claimed_by)
             supervisors = tuple(self._supervisors)
-        if cancel is None:
-            for supervisor in supervisors:
-                snapshot = supervisor.snapshot()
-                if (
-                    snapshot is not None
-                    and snapshot.active_job is not None
-                    and snapshot.active_job.job_id == event.job_id
-                    and snapshot.active_job.claimed_by == event.claimed_by
-                ):
-                    def _restart(supervisor=supervisor) -> None:
-                        supervisor.kill()
-                        supervisor.start()
-
-                    cancel = _restart
-                    break
-        if cancel is None:
-            return False
-        cancel()
-        return True
+        if cancel is not None:
+            cancel()
+            return True
+        for supervisor in supervisors:
+            snapshot = supervisor.snapshot()
+            if (
+                snapshot is not None
+                and snapshot.active_job is not None
+                and snapshot.active_job.job_id == event.job_id
+                and snapshot.active_job.claimed_by == event.claimed_by
+            ):
+                return bool(supervisor.restart_if_snapshot(snapshot))
+        return False
 
 
 _JOB_CANCEL_ROUTER = _JobCancelRouter()

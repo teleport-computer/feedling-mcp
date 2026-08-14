@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import multiprocessing
 import os
+import threading
 import time
 
 import pytest
@@ -105,6 +106,22 @@ def _fake_target_pid_then_wedge(conn, pid_holder, slot_generation) -> None:
     except Exception:
         pass
     time.sleep(3600)
+
+
+def _fake_target_record_each_spawn(
+    conn, spawn_count, spawned_pids, slot_generation
+) -> None:
+    """Record every actual OS child so a lost supervisor handle is observable."""
+    with spawn_count.get_lock():
+        index = spawn_count.value
+        spawned_pids[index] = os.getpid()
+        spawn_count.value += 1
+    while True:
+        try:
+            conn.send(_progress(slot_generation))
+        except Exception:
+            return
+        time.sleep(0.05)
 
 
 def _wait_until(predicate, *, timeout: float = 5.0, interval: float = 0.02) -> bool:
@@ -411,6 +428,180 @@ def test_split_kill_then_start_replaces_wedged_child_with_a_fresh_pid():
         assert liveness["last_progress_age_sec"] < 1.0
     finally:
         sup.stop()
+
+
+def test_concurrent_fenced_restarts_spawn_exactly_one_replacement():
+    """Two owners of one stale snapshot must not create an untracked child."""
+    spawn_count = multiprocessing.Value("i", 0)
+    spawned_pids = multiprocessing.Array("i", 4)
+    sup = ChildSupervisor(
+        _fake_target_record_each_spawn,
+        liveness_timeout_sec=5.0,
+        spawn_args=(spawn_count, spawned_pids),
+    )
+    sup.start()
+    gate = threading.Barrier(3)
+    results: list[bool] = []
+
+    def _restart() -> None:
+        gate.wait()
+        results.append(sup.restart_if_snapshot(expected))
+
+    try:
+        assert _wait_until(lambda: sup.snapshot() is not None)
+        expected = sup.snapshot()
+        assert expected is not None
+        old_pid = spawned_pids[0]
+        threads = [threading.Thread(target=_restart) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        gate.wait()
+        for thread in threads:
+            thread.join(10.0)
+            assert not thread.is_alive()
+
+        assert sorted(results) == [False, True]
+        assert _wait_until(lambda: spawn_count.value == 2)
+        assert _pid_is_dead(old_pid)
+        assert sup.poll_liveness()["alive"] is True
+    finally:
+        sup.stop()
+        for pid in spawned_pids[: spawn_count.value]:
+            assert _wait_until(lambda pid=pid: _pid_is_dead(pid))
+
+
+def test_duplicate_start_does_not_overwrite_a_live_child():
+    """A stray start call must not make the existing child untrackable."""
+    spawn_count = multiprocessing.Value("i", 0)
+    spawned_pids = multiprocessing.Array("i", 2)
+    sup = ChildSupervisor(
+        _fake_target_record_each_spawn,
+        liveness_timeout_sec=5.0,
+        spawn_args=(spawn_count, spawned_pids),
+    )
+    sup.start()
+    try:
+        assert _wait_until(lambda: spawn_count.value == 1)
+        first_pid = spawned_pids[0]
+
+        sup.start()
+        time.sleep(0.1)
+
+        assert spawn_count.value == 1
+        assert spawned_pids[0] == first_pid
+        assert sup.poll_liveness()["alive"] is True
+    finally:
+        sup.stop()
+        assert _wait_until(lambda: _pid_is_dead(spawned_pids[0]))
+
+
+def test_stop_invalidates_snapshot_so_queued_restart_cannot_resurrect_slot():
+    spawn_count = multiprocessing.Value("i", 0)
+    spawned_pids = multiprocessing.Array("i", 2)
+    sup = ChildSupervisor(
+        _fake_target_record_each_spawn,
+        liveness_timeout_sec=5.0,
+        spawn_args=(spawn_count, spawned_pids),
+    )
+    sup.start()
+    assert _wait_until(lambda: sup.snapshot() is not None)
+    expected = sup.snapshot()
+    assert expected is not None
+
+    sup.stop()
+
+    assert sup.snapshot() is None
+    assert sup.restart_if_snapshot(expected) is False
+    time.sleep(0.1)
+    assert spawn_count.value == 1
+    assert _wait_until(lambda: _pid_is_dead(spawned_pids[0]))
+
+
+class _UnkillableProcess:
+    pid = 424242
+
+    def __init__(self) -> None:
+        self.kill_calls = 0
+        self.join_calls = 0
+        self.alive = True
+
+    def is_alive(self) -> bool:
+        return self.alive
+
+    def kill(self) -> None:
+        self.kill_calls += 1
+
+    def join(self, _timeout: float) -> None:
+        self.join_calls += 1
+
+
+def _supervisor_with_unkillable_process(*, broker=None):
+    sup = ChildSupervisor(
+        _fake_target_periodic_progress,
+        liveness_timeout_sec=5.0,
+        broker=broker,
+    )
+    active = slot_protocol.ActiveJobIdentity(3694, "profile", "worker:heavy:0:g7")
+    expected = slot_protocol.SlotProgress(
+        "heavy-0", "g7", 10.0, 9.0, "profile.provider", active
+    )
+    proc = _UnkillableProcess()
+    sup._proc = proc
+    sup._slot_generation = "g7"
+    sup._snapshot = expected
+    return sup, proc, expected
+
+
+def test_fenced_restart_does_not_spawn_until_old_process_is_confirmed_dead():
+    sup, proc, expected = _supervisor_with_unkillable_process()
+    starts = []
+    sup._start_locked = lambda: starts.append("start")
+
+    assert sup.restart_if_snapshot(expected, join_timeout=0.0) is False
+    assert starts == []
+    assert sup._proc is proc
+    assert proc.kill_calls == 1
+
+
+def test_watchdog_respawn_does_not_spawn_while_old_process_survives_sigkill():
+    sup, proc, _expected = _supervisor_with_unkillable_process()
+    starts = []
+    sup._start_locked = lambda: starts.append("start")
+
+    sup.kill_and_respawn(join_timeout=0.0)
+
+    assert starts == []
+    assert sup._proc is proc
+    assert proc.kill_calls == 1
+
+
+def test_kill_for_recovery_reports_unconfirmed_termination():
+    sup, proc, expected = _supervisor_with_unkillable_process()
+
+    outcome = sup.kill_for_recovery(join_timeout=0.0)
+
+    assert outcome.terminated is False
+    assert outcome.active_job == expected.active_job
+    assert sup._proc is proc
+
+
+def test_failed_fenced_kill_retains_broker_generation_until_process_dies():
+    class _Broker:
+        def __init__(self):
+            self.dropped = []
+
+        def drop_generation(self, generation):
+            self.dropped.append(generation)
+
+    broker = _Broker()
+    sup, proc, expected = _supervisor_with_unkillable_process(broker=broker)
+
+    assert sup.restart_if_snapshot(expected, join_timeout=0.0) is False
+    assert broker.dropped == []
+
+    proc.alive = False
+    sup.kill(join_timeout=0.0)
+    assert "g7" in broker.dropped
 
 
 def test_stop_cleanly_joins_and_reports_not_alive():
