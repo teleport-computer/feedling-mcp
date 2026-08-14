@@ -372,7 +372,13 @@ services:
       FEEDLING_ENCLAVE_URL: "https://enclave:5003"
       DATABASE_URL: "${DATABASE_URL:-}"
       FEEDLING_RUNTIME_TOKEN_SECRET: "${FEEDLING_RUNTIME_TOKEN_SECRET:-}"
-      FEEDLING_V2_MAX_WORKERS: "4"
+      # 8c/16g test CVM: fixed three-pool topology. These are deployment
+      # topology values, not secrets, so keep them literal and reviewable.
+      FEEDLING_V2_FOREGROUND_SLOTS: "4"
+      FEEDLING_V2_WAKE_SLOTS: "2"
+      FEEDLING_V2_HEAVY_SLOTS: "2"
+      FEEDLING_V2_PROFILE_INSTANCE_CONCURRENCY: "1"
+      FEEDLING_V2_ENCLAVE_INSTANCE_CONCURRENCY: "4"
       FEEDLING_V2_FLEET_IDENTITY_REQUIRED: "1"
       FEEDLING_V2_RUNNER_CVM_ID: "${FEEDLING_V2_RUNNER_CVM_ID:-main-cvm}"
       FEEDLING_V2_DEPLOYED_BUILD: "${FEEDLING_V2_DEPLOYED_BUILD:-}"
