@@ -1,9 +1,4 @@
-"""DB-backed tests for the history-search read-only queries in jobs_store.
-
-覆盖 spec §8.2/§8.3 的存储侧：level-0 全叶子快照查询（不走 canonical
-cover）、候选元数据查询的 SQL 侧可见性过滤 / 时间范围 / LIMIT / 元数据-only
-契约。纯逻辑（planner/cursor）见 test_v2_history_search_unit.py。
-"""
+"""DB-backed tests for raw history-search queries in jobs_store."""
 
 from __future__ import annotations
 
@@ -34,93 +29,6 @@ def _append(uid: str, index: int, *, ts: float, role: str = "user", **doc_extra)
     doc.update(doc_extra)
     db.chat_append_strict(uid, message_id, ts, doc, core_store.MAX_CHAT_MESSAGES)
     return int(db.chat_seq_for_msg_id(uid, message_id))
-
-
-# ---------------------------------------------------------------------------
-# level-0 全叶子快照查询
-# ---------------------------------------------------------------------------
-
-
-def test_level0_leaves_include_checkpoint_covered_children():
-    uid = "u_hist_leaves"
-    _reset(uid)
-    seqs = [_append(uid, i, ts=float(i + 1)) for i in range(5)]
-
-    assert jobs_store.append_summary_leaf_cas(
-        uid,
-        summary_envelope={"plaintext": "- leaf one"},
-        head_summary_envelope={"plaintext": "- leaf one"},
-        start_seq=seqs[0],
-        end_seq=seqs[1],
-        source_message_count=2,
-        watermark_ts=2.0,
-        expected_version=0,
-        previous_watermark_seq=0,
-    )
-    assert jobs_store.append_summary_leaf_cas(
-        uid,
-        summary_envelope={"plaintext": "- leaf two"},
-        head_summary_envelope={"plaintext": "- leaf one\n- leaf two"},
-        start_seq=seqs[2],
-        end_seq=seqs[3],
-        source_message_count=2,
-        watermark_ts=4.0,
-        expected_version=1,
-        previous_watermark_seq=seqs[1],
-    )
-    state = jobs_store.get_summary_frontier_state(uid)
-    child_ids = tuple(row["segment_id"] for row in state["segments"])
-    assert jobs_store.insert_summary_checkpoint(
-        uid,
-        summary_envelope={"plaintext": "- parent"},
-        head_summary_envelope={"plaintext": "- parent"},
-        level=1,
-        start_seq=seqs[0],
-        end_seq=seqs[3],
-        source_message_count=4,
-        child_segment_ids=child_ids,
-        expected_version=2,
-        expected_watermark_seq=seqs[3],
-    )
-
-    # canonical cover 只剩 checkpoint 一个节点……
-    assert len(jobs_store.get_summary_frontier_state(uid)["segments"]) == 1
-    # ……但 history 扫描提示必须拿到全部 level-0 叶子（被覆盖的也要），
-    # 且不包含 level-1 checkpoint 本身。end_seq 降序（recent-first）。
-    leaves = jobs_store.list_level0_summary_leaves(uid, through_seq=seqs[4])
-    assert [row["level"] for row in leaves] == [0, 0]
-    assert [(row["start_seq"], row["end_seq"]) for row in leaves] == [
-        (seqs[2], seqs[3]),
-        (seqs[0], seqs[1]),
-    ]
-    assert leaves[0]["summary_envelope"] == {"plaintext": "- leaf two"}
-    assert leaves[0]["coverage_kind"] == "exact"
-
-    # 快照上界过滤：through_seq 落在第一片叶子内 → 只有第一片
-    early = jobs_store.list_level0_summary_leaves(uid, through_seq=seqs[1])
-    assert [(row["start_seq"], row["end_seq"]) for row in early] == [(seqs[0], seqs[1])]
-    assert jobs_store.list_level0_summary_leaves(uid, through_seq=0) == []
-
-
-def test_level0_leaves_include_legacy_opaque_seed():
-    uid = "u_hist_leaves_legacy"
-    _reset(uid)
-    assert jobs_store.upsert_summary_row_cas(
-        uid,
-        summary_envelope={"plaintext": "- legacy blob"},
-        watermark_ts=1.0,
-        expected_version=0,
-        watermark_seq=900,
-    )
-    assert jobs_store.seed_legacy_summary_segment(
-        uid, expected_version=1, translated_watermark_seq=900
-    )
-    leaves = jobs_store.list_level0_summary_leaves(uid, through_seq=1_000)
-    assert len(leaves) == 1
-    assert leaves[0]["coverage_kind"] == "legacy_opaque"
-    assert leaves[0]["start_seq"] == 0
-    assert leaves[0]["end_seq"] == 900
-    assert leaves[0]["legacy_opaque_through_seq"] == 900
 
 
 # ---------------------------------------------------------------------------

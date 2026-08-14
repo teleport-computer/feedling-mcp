@@ -83,8 +83,8 @@ def _skeleton_chars(payload: Any) -> int:
 # below this is unsatisfiable: the facade shrinks as far as it can, is still
 # over, and hands a too-large object to a string-slicing layer downstream.
 #
-# ``next_cursor`` is the reason search's floor is large: the three-state
-# semantics hang off it (spec §3.1), so the shrink may never drop it, and it is
+# ``next_cursor`` is the reason search's floor is large: incomplete-scan
+# semantics hang off it, so the shrink may never drop it, and it is
 # variable-length up to the cursor ceiling.  Truncation must never be able to
 # masquerade as "the scan finished".
 MIN_RESULT_CAPS: Mapping[str, int] = {
@@ -93,7 +93,6 @@ MIN_RESULT_CAPS: Mapping[str, int] = {
         "complete": False,
         "scanned_count": 0,
         "unavailable_count": 0,
-        "coverage_gap": False,
         "next_cursor": "x" * _CURSOR_MAX_CHARS,
     }),
     # anchor is never dropped (spec §3.2), and its excerpt shrinks to "" at

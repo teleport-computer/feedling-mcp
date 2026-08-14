@@ -506,12 +506,15 @@ def _patch_store(monkeypatch, *, max_seq=100, generation=7, watermark=60,
     monkeypatch.setattr(history_readside.db, "chat_max_seq", lambda uid: max_seq)
     monkeypatch.setattr(
         history_readside.db, "get_runtime_generation", lambda uid: generation)
+    def forbidden_summary_read(*args, **kwargs):
+        raise AssertionError("raw history search must not read compact summaries")
+
     monkeypatch.setattr(
         history_readside.jobs_store, "get_summary_frontier_state",
-        lambda uid: {"watermark_seq": watermark})
+        forbidden_summary_read)
     monkeypatch.setattr(
         history_readside.jobs_store, "list_level0_summary_leaves",
-        lambda uid, *, through_seq: list(leaves or []))
+        forbidden_summary_read)
     calls: list[tuple] = []
 
     def default_candidates(uid, *, min_seq, max_seq, start_ts=None, end_ts=None, limit):
@@ -533,17 +536,13 @@ def _patch_store(monkeypatch, *, max_seq=100, generation=7, watermark=60,
     return calls
 
 
-def test_run_history_search_pages_with_cursor_and_leaf_priority(monkeypatch):
-    leaves = [_leaf(1, 30, 40)]
-    calls = _patch_store(monkeypatch, leaves=leaves)
+def test_run_history_search_pages_raw_snapshot_newest_to_oldest(monkeypatch):
+    calls = _patch_store(monkeypatch)
     posts: list[tuple] = []
 
     def fake_post(op, payload):
         posts.append((op, payload))
-        if op == "leaf-hints":
-            return {"hits": [{"segment_id": 1, "start_seq": 30, "end_seq": 40}],
-                    "legacy_opaque_hits": [], "checked_count": 1,
-                    "unavailable_count": 0, "truncated": False}
+        assert op == "scan"
         rows = payload["rows"]
         if rows and rows[0]["seq"] == 100:
             # 未压缩区间第一行即命中，密集停：只检查了 1 行
@@ -566,10 +565,9 @@ def test_run_history_search_pages_with_cursor_and_leaf_priority(monkeypatch):
     assert page1["complete"] is False
     token = page1["next_cursor"]
     cur = history_search.decode_cursor(token, key=_KEY, now=1000.0)
-    # ①只跑一批后让位给摘要命中段；resume 从快照顶开始，floor 记在 100
-    assert cur.phase == history_search.PHASE_LEAF_HITS
-    assert cur.uncompressed_floor == 100
-    assert calls == [(61, 100, 128)]
+    assert cur.snapshot_through_seq == 100
+    assert cur.resume_seq == 99
+    assert calls == [(1, 100, 128)]
 
     calls.clear()
     page2 = history_readside.run_history_search(
@@ -578,12 +576,10 @@ def test_run_history_search_pages_with_cursor_and_leaf_priority(monkeypatch):
     assert page2["matches"] == []
     assert page2["complete"] is True
     assert "next_cursor" not in page2
-    assert page2["coverage_gap"] is False
-    # 命中段 (30,40) 先扫，然后 recent 兜底跳过已覆盖的 (30,40)+(100,100)
-    assert calls == [(30, 40, 128), (41, 99, 128), (1, 29, 128)]
+    assert calls == [(1, 99, 128)]
 
 
-def test_run_history_search_time_only_skips_leaf_hints(monkeypatch):
+def test_run_history_search_time_only_uses_raw_scan(monkeypatch):
     _patch_store(
         monkeypatch, leaves=[_leaf(1, 30, 40)],
         candidate_fn=lambda uid, **kw: [])
@@ -599,8 +595,7 @@ def test_run_history_search_time_only_skips_leaf_hints(monkeypatch):
         "usr_a", cursor_hmac_key=_KEY,
         start="2026-01-01T00:00:00Z", end="2026-02-01T00:00:00Z",
         post_enclave=fake_post)
-    # 纯时间模式跳过摘要提示（spec §4）：没有任何 leaf-hints 投递
-    assert all(op != "leaf-hints" for op, _ in posts)
+    assert all(op == "scan" for op, _ in posts)
     assert out["matches"] == []
     assert out["complete"] is True
 
@@ -629,8 +624,8 @@ def test_cursor_overflow_is_raised_only_after_the_scan_already_ran(monkeypatch):
             "hits": [{"message_id": rows[0]["id"], "seq": rows[0]["seq"],
                       "ts": 1.0, "role": "user", "snippet": "x",
                       "content_truncated": False}],
-            "checked_count": len(rows), "unavailable_count": 0,
-            "last_checked_seq": rows[-1]["seq"], "stopped": "hits",
+            "checked_count": 1, "unavailable_count": 0,
+            "last_checked_seq": rows[0]["seq"], "stopped": "hits",
             "truncated": False,
         }
 
@@ -654,7 +649,7 @@ def test_route_missing_after_a_successful_scan_is_no_longer_pre_scan(monkeypatch
     0 行）。第一次投递就 404（真正的版本错位）保持原样；跑过之后再 404 必须
     降级成普通 upstream 错误，才能按 lease 满额扣。
     """
-    _patch_store(monkeypatch)
+    _patch_store(monkeypatch, max_seq=200)
     posts: list[str] = []
 
     def fake_post(op, payload):
@@ -695,87 +690,14 @@ def test_run_history_search_cross_user_cursor_rejected(monkeypatch):
     cursor = history_search.encode_cursor(
         history_search.HistoryCursor(
             user_id="usr_other", snapshot_through_seq=100,
-            summary_watermark_seq=60, runtime_generation=7, query="target",
+            runtime_generation=7, query="target",
             start_ts=None, end_ts=None,
-            phase=history_search.PHASE_RECENT, resume_seq=50,
-            uncompressed_floor=0, expires_at=2000.0),
+            resume_seq=50, expires_at=2000.0),
         key=_KEY)
     with pytest.raises(history_search.CursorInvalid):
         history_readside.run_history_search(
             "usr_a", cursor_hmac_key=_KEY, cursor=cursor,
             post_enclave=fake_post, now=1000.0)
-
-
-def test_leaf_hints_ignore_leaves_appended_after_the_pinned_watermark(monkeypatch):
-    """翻页期间并发 compaction 追加新叶，不许改变本次搜索的叶子命中集合。
-
-    快照钉住 (snapshot, watermark)；叶子查询上界必须钳到 watermark，否则
-    (watermark, snapshot] 里新长出来的叶子会挤占叶预算、把原命中段顶出去 →
-    ``_covered_intervals`` 在两页之间变形 → recent 兜底既漏扫真正没扫过的区
-    间，又回头重扫上一页已经返回过的区间。
-    """
-    old_leaf = _leaf(1, 30, 40)
-    # 并发 compaction 在 (60, 100] 追加的新叶：end_seq 更大，排在最前面。
-    new_leaf = _leaf(5, 61, 70)
-    store_leaves = [old_leaf]
-
-    def _leaves(uid, *, through_seq):
-        return sorted(
-            (l for l in store_leaves if int(l["end_seq"]) <= int(through_seq)),
-            key=lambda l: int(l["end_seq"]), reverse=True)
-
-    calls = _patch_store(monkeypatch, max_seq=100, watermark=60)
-    monkeypatch.setattr(
-        history_readside.jobs_store, "list_level0_summary_leaves", _leaves)
-    # 叶预算只装得下 1 片：新叶一旦入选，老叶就被顶掉。raw 单批 10 行让
-    # phase ① 只啃掉 (91,100]，新叶所在的 61..70 留在真正没扫过的空隙里。
-    budget = history_readside.HistorySearchBudget(
-        leaf_call_max_leaves=1, raw_batch_rows=10)
-
-    checked: list[int] = []
-
-    def fake_post(op, payload):
-        if op == "leaf-hints":
-            return {
-                "hits": [{"segment_id": l["segment_id"],
-                          "start_seq": l["start_seq"], "end_seq": l["end_seq"]}
-                         for l in payload["leaves"]],
-                "legacy_opaque_hits": [], "checked_count": len(payload["leaves"]),
-                "unavailable_count": 0, "truncated": False}
-        rows = payload["rows"]
-        if rows and rows[0]["seq"] == 40:   # 叶子命中段的顶格行命中，密集停
-            checked.append(40)
-            return {"hits": [{"message_id": rows[0]["id"], "seq": 40,
-                              "ts": 1.0, "role": "user", "snippet": "x",
-                              "content_truncated": False}],
-                    "checked_count": 1, "unavailable_count": 0,
-                    "last_checked_seq": 40, "stopped": "hits",
-                    "truncated": False}
-        checked.extend(int(r["seq"]) for r in rows)
-        return {"hits": [], "checked_count": len(rows), "unavailable_count": 0,
-                "last_checked_seq": rows[-1]["seq"] if rows else None,
-                "stopped": "exhausted", "truncated": False}
-
-    page1 = history_readside.run_history_search(
-        "usr_a", cursor_hmac_key=_KEY, query="target", limit=1,
-        budget=budget, post_enclave=fake_post, now=1000.0)
-    assert [m["message_id"] for m in page1["matches"]] == ["m40"]
-    token = page1["next_cursor"]
-    assert [(lo, hi) for lo, hi, _lim in calls] == [(61, 100), (30, 40)]
-    # 第一页真正检查过的行：phase ① 的 (91,100] + 叶子段里提前停住的那一条。
-    page1_checked = set(checked)
-    assert page1_checked == set(range(91, 101)) | {40}
-
-    store_leaves.append(new_leaf)  # 并发 compaction 落地
-    checked.clear()
-    history_readside.run_history_search(
-        "usr_a", cursor_hmac_key=_KEY, cursor=token,
-        budget=budget, post_enclave=fake_post, now=1001.0)
-    page2_checked = set(checked)
-    # 不漏：61..70 第一页没检查过（phase ① 只到 91），本页必须扫到。
-    assert set(range(61, 71)) <= page2_checked, sorted(page2_checked)
-    # 不重：第一页已经检查过的行一条都不许重扫。
-    assert not (page1_checked & page2_checked), sorted(page1_checked & page2_checked)
 
 
 def test_run_history_search_cursor_with_explicit_limit_rejected(monkeypatch):
@@ -787,10 +709,9 @@ def test_run_history_search_cursor_with_explicit_limit_rejected(monkeypatch):
     cursor = history_search.encode_cursor(
         history_search.HistoryCursor(
             user_id="usr_a", snapshot_through_seq=100,
-            summary_watermark_seq=60, runtime_generation=7, query="target",
+            runtime_generation=7, query="target",
             start_ts=None, end_ts=None,
-            phase=history_search.PHASE_RECENT, resume_seq=50,
-            uncompressed_floor=0, expires_at=2000.0),
+            resume_seq=50, expires_at=2000.0),
         key=_KEY)
     with pytest.raises(history_search.CursorMismatch):
         history_readside.run_history_search(
@@ -801,22 +722,6 @@ def test_run_history_search_cursor_with_explicit_limit_rejected(monkeypatch):
         "usr_a", cursor_hmac_key=_KEY, cursor=cursor,
         post_enclave=fake_post, now=1000.0)
     assert out["complete"] is True
-
-
-def test_run_history_search_coverage_gap_demotes_complete(monkeypatch):
-    legacy = _leaf(9, 0, 900, kind="legacy_opaque")
-    _patch_store(
-        monkeypatch, max_seq=50, watermark=50, leaves=[legacy],
-        candidate_fn=lambda uid, **kw: [])  # raw 一条都不剩（retention 清理过）
-    out = history_readside.run_history_search(
-        "usr_a", cursor_hmac_key=_KEY, start="2026-01-01T00:00:00Z",
-        post_enclave=lambda op, p: {
-            "hits": [], "checked_count": 0, "unavailable_count": 0,
-            "last_checked_seq": None, "stopped": "exhausted", "truncated": False})
-    # spec §3.1 三态之三：扫完但 legacy 覆盖区原文已不存在 → 不许声称 complete
-    assert out["coverage_gap"] is True
-    assert out["complete"] is False
-    assert "next_cursor" not in out
 
 
 def test_readside_row_byte_budget_checked_before_the_row_joins_the_batch(monkeypatch):
@@ -875,86 +780,11 @@ def test_readside_single_row_over_byte_budget_sent_as_placeholder(monkeypatch):
     assert first[0]["oversize"] is True
 
 
-def test_readside_leaf_budget_checked_before_the_leaf_joins_the_batch(monkeypatch):
-    _patch_store(monkeypatch, max_seq=50, watermark=50,
-                 candidate_fn=lambda uid, **kw: [])
-    small, big = _leaf(1, 30, 40), _leaf(2, 10, 20)
-    small["summary_envelope"]["body_ct"] = "a" * 600
-    big["summary_envelope"]["body_ct"] = "b" * 600
-    monkeypatch.setattr(
-        history_readside.jobs_store, "list_level0_summary_leaves",
-        lambda uid, *, through_seq: [small, big])
-    sent: list[list[dict]] = []
-
-    def fake_post(op, payload):
-        if op == "leaf-hints":
-            sent.append(payload["leaves"])
-            return {"hits": [], "legacy_opaque_hits": [], "checked_count": 0,
-                    "unavailable_count": 0, "truncated": True}
-        return _exhausted_post(op, payload)
-
-    history_readside.run_history_search(
-        "usr_a", cursor_hmac_key=_KEY, query="target",
-        budget=history_readside.HistorySearchBudget(leaf_call_max_bytes=1000),
-        post_enclave=fake_post)
-    assert [l["segment_id"] for l in sent[0]] == [1]
-
-
-def _partial_legacy_retention_candidates(kept: range):
-    """legacy 覆盖区里只剩 ``kept`` 这段原文的候选源（其余被旧 retention 清掉）。"""
-
-    def _fn(uid, *, min_seq, max_seq, start_ts=None, end_ts=None, limit):
-        seqs = [s for s in range(max_seq, min_seq - 1, -1) if s in kept][:limit]
-        return [
-            {"seq": s, "msg_id": f"m{s}", "ts": float(s), "role": "user",
-             "content_type": "text", "has_ciphertext": True}
-            for s in seqs
-        ]
-
-    return _fn
-
-
 def _exhausted_post(op, payload):
     rows = payload.get("rows") or []
     return {"hits": [], "checked_count": len(rows), "unavailable_count": 0,
             "last_checked_seq": rows[-1]["seq"] if rows else None,
             "stopped": "exhausted", "truncated": False}
-
-
-@pytest.mark.parametrize("kept", [range(700, 901), range(1, 201)])
-def test_coverage_gap_is_conservative_on_partial_legacy_retention(monkeypatch, kept):
-    """legacy 覆盖区被**部分**清理时也必须报 coverage_gap。
-
-    旧实现用一条 LIMIT 1 探针"整段还剩没剩行"，只能发现整段全清；覆盖
-    1–900 而实际只剩一个前缀/后缀时探针照样命中 → 错误地 complete=true →
-    模型据此回答"历史里没有"。保守语义：本次扫描只要触及 legacy_opaque 的
-    覆盖区间（该区间按定义没有精确 source witness），一律置 coverage_gap。
-    """
-    legacy = _leaf(9, 0, 900, kind="legacy_opaque")
-    _patch_store(
-        monkeypatch, max_seq=900, watermark=900, leaves=[legacy],
-        candidate_fn=_partial_legacy_retention_candidates(kept))
-    out = history_readside.run_history_search(
-        "usr_a", cursor_hmac_key=_KEY, start="2026-01-01T00:00:00Z",
-        post_enclave=_exhausted_post)
-    assert out["complete"] is False
-    assert out["coverage_gap"] is True
-    assert "next_cursor" not in out
-
-
-def test_coverage_gap_false_until_the_scan_reaches_the_legacy_range(monkeypatch):
-    """还没扫到 legacy 覆盖区就停（预算用尽）→ 不是缺口，是"还能翻页"。"""
-    legacy = _leaf(9, 0, 200, kind="legacy_opaque")
-    _patch_store(monkeypatch, max_seq=900, watermark=900, leaves=[legacy])
-    out = history_readside.run_history_search(
-        "usr_a", cursor_hmac_key=_KEY, start="2026-01-01T00:00:00Z",
-        budget=history_readside.HistorySearchBudget(
-            raw_batch_rows=10, call_max_rows=10),
-        post_enclave=_exhausted_post)
-    # 只啃到 (891,900]，legacy 的 1..200 一行都没触及
-    assert out["coverage_gap"] is False
-    assert out["complete"] is False
-    assert out["next_cursor"]
 
 
 def test_run_history_search_attachment_rows_project_caption_only(monkeypatch):

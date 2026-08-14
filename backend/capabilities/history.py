@@ -83,9 +83,9 @@ TOOL_NOT_ALLOWED = "tool_not_allowed"
 #                                ``enclave_history_capability_unavailable``
 #                                （HTTP 404 = 镜像没带 history 路由）翻成它。
 #                                ②的产生点是 _post_enclave_history，而它在
-#                                leaf-hints / scan / fetch 三处都会被调到——
-#                                单看这里**推不出**"一定在扫描前"。所以 readside
-#                                在第一次 scan 投递成功之后就不再让这个码逃出来
+#                                scan / fetch 两处都会被调到——单看这里**推不出**
+#                                "一定在扫描前"。所以 readside 在第一次 scan
+#                                投递成功之后就不再让这个码逃出来
 #                                （run_history_search 里改抛 enclave_error_after_scan
 #                                → 走 UPSTREAM → 按 lease 满额扣）。**那段代码是
 #                                本行豁免成立的前提，别删。**
@@ -166,15 +166,8 @@ def _float_env(name: str, default: float) -> float:
 
 
 def _budget_from_env() -> history_readside.HistorySearchBudget:
-    """spec §5 预算表 → env 可调（默认即 spec 默认值）。
-
-    cursor 确定性要求（history_readside._leaf_hint_ranges 的注释）：同一部署内
-    这些值保持稳定，翻页期间重算的叶子命中段才一致；env 只该在部署级设置。
-    """
+    """spec §5 预算表 → env 可调（默认即 spec 默认值）。"""
     budget = history_readside.HistorySearchBudget(
-        leaf_call_max_leaves=_int_env("FEEDLING_V2_HISTORY_LEAF_CALL_MAX_LEAVES", 64),
-        leaf_call_max_bytes=_int_env(
-            "FEEDLING_V2_HISTORY_LEAF_CALL_MAX_BYTES", 256 * 1024),
         raw_batch_rows=_int_env("FEEDLING_V2_HISTORY_RAW_BATCH_ROWS", 128),
         raw_batch_bytes=_int_env("FEEDLING_V2_HISTORY_RAW_BATCH_BYTES", 512 * 1024),
         call_max_rows=_int_env("FEEDLING_V2_HISTORY_CALL_MAX_ROWS", 512),

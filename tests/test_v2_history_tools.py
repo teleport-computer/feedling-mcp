@@ -52,7 +52,6 @@ def _search_result(
         "complete": complete,
         "scanned_count": scanned,
         "unavailable_count": 0,
-        "coverage_gap": False,
     }
     if next_cursor is not None:
         result["next_cursor"] = next_cursor
@@ -99,15 +98,12 @@ def test_history_tool_args_validate():
     ) is None
 
 
-def test_history_search_description_carries_three_state_semantics():
-    """Spec §3.1 三态语义原文 + 「续页只传 cursor」必须进工具描述。"""
+def test_history_search_description_carries_raw_paging_semantics():
     desc = tool_schema.DESCRIPTIONS["history_search"]
-    assert "complete=true 扫完了" in desc
-    assert "带 cursor 原样再调" in desc
-    assert "coverage_gap=true" in desc
-    assert "历史区间原文已不存在" in desc
+    assert "frozen raw snapshot was fully scanned" in desc
+    assert "pass unchanged to continue" in desc
     assert "续页只传 cursor" in desc
-    assert "NOT time order" in desc  # 结果顺序 = 扫描优先级（spec §3.1）
+    assert "newest-to-oldest scan order" in desc
     fetch_desc = tool_schema.DESCRIPTIONS["history_fetch"]
     assert "not_found_or_not_visible" in fetch_desc
 
