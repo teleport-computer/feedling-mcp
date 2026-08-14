@@ -34,6 +34,11 @@ future model prompt. Information that is no longer in the recent-turn window is
 available to future turns only if Capture retained it in the Memory Garden and
 Profile distilled it into `MEMORY` or `USER`.
 
+The explicit `history_search` / `history_fetch` tools remain a separate,
+user-authorized archive access path. They may scan bounded raw encrypted Chat
+through the enclave when the model deliberately calls them; they do not inject
+history automatically into a turn.
+
 ## Data flow
 
 The only long-term semantic path is:
@@ -111,6 +116,8 @@ conversation-compaction path.
 - count-sentinel rendering and coverage-hole prompt text;
 - summary/frontier callbacks from `TurnDeps` and production dependency wiring;
 - compaction/frontier modules with no remaining non-compatibility callers;
+- summary-leaf hinting, summary watermark cursor state, and legacy coverage-gap
+  inference from `history_search`;
 - compaction, watermark, checkpoint, frontier-level, coverage-hole, catch-up,
   and summary-CAS runtime metrics.
 
@@ -129,6 +136,23 @@ created by the new release.
 This compatibility path exists because old workers can enqueue maintenance jobs
 during a mixed-version rollout after a one-time database cleanup. New workers
 must harmlessly drain those jobs until all old workers have exited.
+
+### Raw-only history search
+
+`history_search` keeps its existing explicit tool contract, authentication,
+runtime generation binding, cursor HMAC, row/byte/deadline budgets, enclave
+decryption, pagination, and attachment-caption rules. Its scan shape becomes a
+single recent-to-old raw Chat scan bounded by the frozen `snapshot_through_seq`.
+
+It no longer reads summary/frontier state, decrypts summary leaves, prioritizes
+leaf-hit ranges, stores a summary watermark in new cursors, or reports a
+summary-derived `coverage_gap`. Exhausting the raw scan budget remains an
+ordinary incomplete page with a continuation cursor; an empty complete raw scan
+means no matching retained Chat row was found.
+
+Existing cursors minted by the summary-aware implementation may be rejected as
+`cursor_invalid` after deployment. They are short-lived and callers already
+restart from the first page on that stable error.
 
 ## Phase two: schema and compatibility deletion
 
@@ -171,7 +195,10 @@ The change reduces historical plaintext movement:
 - Profile continues to send rendered Memory Garden cards to the user's
   configured provider under its existing disclosure contract; and
 - recent Chat plaintext is still decrypted and sent for the active Chat or wake
-  turn according to the existing bounded replay policy.
+  turn according to the existing bounded replay policy; and
+- explicit `history_search` / `history_fetch` calls continue to decrypt bounded
+  raw Chat candidates inside the enclave under their existing authorization and
+  budget contract.
 
 The raw encrypted Chat archive and Capture authorization/fencing behavior are
 unchanged.
@@ -206,6 +233,16 @@ unchanged.
 - Static CI guards reject reintroduction of compaction, summary/frontier prompt
   reads, coverage catch-up, and their deployment switches.
 
+### History tools
+
+- `history_search` scans raw Chat newest-to-oldest without summary/frontier
+  reads or leaf-hint enclave calls.
+- Pagination remains deterministic against one frozen raw-Chat snapshot.
+- Row, byte, deadline, result, and per-turn lease budgets remain enforced.
+- `history_fetch` behavior and neighbor ordering remain unchanged.
+- A pre-deployment summary-aware cursor fails with the existing stable
+  `cursor_invalid` contract and can be restarted from page one.
+
 ### Regression scope
 
 Run focused Chat, wake, Profile, recent-turn, prompt-frontier, job lifecycle,
@@ -232,6 +269,7 @@ semantics explicit.
 - Making Profile synchronous with Chat or wake.
 - Changing the 40-turn Chat or 16-turn wake defaults.
 - Deleting raw encrypted Chat history.
+- Removing `history_search` or `history_fetch`; they become raw-archive-only.
 - Dropping summary/frontier schema in phase one.
 - Changing Dream, memory search, attachment replay, tool admission, or provider
   routing behavior beyond removing conversation-summary dependencies.
