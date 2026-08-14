@@ -473,3 +473,64 @@ def test_v2_metrics_wrong_token_is_401(env):
 
     assert status == 401
     assert body == {"error": "unauthorized"}
+
+
+def test_v2_wake_shadow_uses_explicit_report_bucket(env, monkeypatch):
+    seen = {}
+
+    def _report(**kwargs):
+        seen.update(kwargs)
+        return {
+            "days": kwargs["days"],
+            "bucket": {
+                "start_hour_inclusive": kwargs["bucket_start_hour"],
+                "end_hour_exclusive": kwargs["bucket_end_hour"],
+                "purpose": "observation_only_not_product_policy",
+            },
+            "allowed": 20,
+            "bucket_allowed": 7,
+            "bucket_allowed_apns_alert_sent": 3,
+        }
+
+    monkeypatch.setattr(jobs_store, "wake_shadow_report", _report)
+    status, body = _asgi_json(
+        "GET",
+        "/v1/admin/v2-wake-shadow?days=14&start_hour=23&end_hour=7",
+        headers=_admin(),
+    )
+
+    assert status == 200
+    assert seen == {
+        "days": 14,
+        "bucket_start_hour": 23,
+        "bucket_end_hour": 7,
+    }
+    assert body["allowed"] == 20
+    assert body["bucket_allowed"] == 7
+    assert body["bucket_allowed_apns_alert_sent"] == 3
+    assert body["bucket"]["purpose"] == "observation_only_not_product_policy"
+
+
+@pytest.mark.parametrize(
+    ("query", "error"),
+    [
+        ("start_hour=23&end_hour=7", "invalid_days"),
+        ("days=0&start_hour=23&end_hour=7", "invalid_days"),
+        ("days=7&start_hour=24&end_hour=7", "invalid_start_hour"),
+        ("days=7&start_hour=23&end_hour=23", "invalid_hour_bucket"),
+    ],
+)
+def test_v2_wake_shadow_rejects_implicit_or_invalid_bucket(env, query, error):
+    status, body = _asgi_json(
+        "GET", f"/v1/admin/v2-wake-shadow?{query}", headers=_admin())
+
+    assert status == 400
+    assert body == {"error": error}
+
+
+def test_v2_wake_shadow_requires_admin(env):
+    status, body = _asgi_json(
+        "GET", "/v1/admin/v2-wake-shadow?days=7&start_hour=23&end_hour=7")
+
+    assert status == 401
+    assert body == {"error": "unauthorized"}

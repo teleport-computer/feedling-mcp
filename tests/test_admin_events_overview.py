@@ -26,6 +26,44 @@ from conftest import seed_user  # noqa: E402
 
 db.init_schema()
 
+_SEED_CREATED_AT = "2026-08-14T00:00:00+00:00"
+_SEEDED_USER_IDS: set[str] = set()
+
+
+@pytest.fixture(autouse=True)
+def _cleanup_seeded_users():
+    _SEEDED_USER_IDS.clear()
+    try:
+        yield
+    finally:
+        user_ids = tuple(_SEEDED_USER_IDS)
+        if user_ids:
+            try:
+                with db.get_pool().connection() as conn:
+                    conn.execute(
+                        "DELETE FROM v2_wake_schedule WHERE user_id = ANY(%s)",
+                        (list(user_ids),),
+                    )
+                    conn.execute(
+                        "DELETE FROM users WHERE user_id = ANY(%s)",
+                        (list(user_ids),),
+                    )
+            finally:
+                from accounts import registry
+
+                with registry._users_lock:
+                    registry._users[:] = [
+                        row
+                        for row in registry._users
+                        if row.get("user_id") not in user_ids
+                    ]
+        _SEEDED_USER_IDS.clear()
+
+
+def _seed_test_user(user_id: str) -> None:
+    _SEEDED_USER_IDS.add(user_id)
+    seed_user(user_id, created_at=_SEED_CREATED_AT)
+
 
 def _uid(prefix: str) -> str:
     return f"{prefix}_{uuid.uuid4().hex[:12]}"
@@ -41,7 +79,7 @@ def test_admin_events_overview_aggregates_routes_events_and_durations():
     u_api = _uid("events_api")
     u_import = _uid("events_import")
     for uid in (u_res, u_api, u_import):
-        seed_user(uid)
+        _seed_test_user(uid)
     db.set_blob(u_res, "onboarding_route", {"route": "resident"})
     db.set_blob(u_api, "onboarding_route", {"route": "model_api"})
     db.set_blob(u_import, "onboarding_route", {"route": "official_import"})
@@ -163,7 +201,7 @@ def _bj_epoch(day: str, hour: int = 12) -> float:
 
 def test_events_overview_scopes_counts_to_one_beijing_day():
     u = _uid("events_day")
-    seed_user(u)
+    _seed_test_user(u)
     db.set_blob(u, "onboarding_route", {"route": "model_api"})
 
     # 昨天成功、今天失败：按天看应该是两幅完全不同的画面
@@ -194,7 +232,7 @@ def test_events_overview_does_not_leak_across_the_beijing_midnight():
     "今天"就少了一整个上午。
     """
     u = _uid("events_mid")
-    seed_user(u)
+    _seed_test_user(u)
     db.set_blob(u, "onboarding_route", {"route": "model_api"})
 
     db.log_append(u, "proactive_jobs", {

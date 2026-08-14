@@ -49,6 +49,73 @@ def _patch_blob_reads(monkeypatch, blobs: dict) -> None:
     )
 
 
+def test_provider_tool_surface_has_explicit_admin_step_label():
+    assert data_track._debug_friendly_step({
+        "type": "mcp.surface.provider",
+        "subsystem": "mcp",
+        "detail": {},
+    }) == ("🧩", "MCP Provider 实收工具面")
+
+
+def test_memory_search_and_index_have_distinct_admin_labels():
+    search = data_track._debug_friendly_step({
+        "type": "memory.search.called",
+        "subsystem": "memory",
+        "detail": {},
+    })
+    index = data_track._debug_friendly_step({
+        "type": "memory.index.called",
+        "subsystem": "memory",
+        "detail": {},
+    })
+
+    assert search == ("🔍", "搜索记忆")
+    assert index == ("🧩", "浏览记忆总览")
+    assert search != index
+
+
+def test_context_truncation_has_explicit_admin_label_and_visible_counts():
+    event = _event(
+        1,
+        "user_t047",
+        "context.truncation",
+        trace_id="t047",
+        status="warning",
+        detail={
+            "counts": {
+                "profile_cards_truncated": 1,
+                "worldbook_truncated": 0,
+            }
+        },
+    )
+
+    assert data_track._debug_friendly_step(event) == ("✂️", "上下文裁剪")
+    public = data_track._debug_event_public_json(event)
+    assert public["detail"] == {
+        "counts": {
+            "profile_cards_truncated": 1,
+            "worldbook_truncated": 0,
+        }
+    }
+
+
+def test_query_fingerprint_is_visible_but_plaintext_query_stays_redacted():
+    fingerprint = "0123456789ab"
+
+    redacted = data_track._debug_redact_value({
+        "query_fingerprint": fingerprint,
+        "query": "她的生日",
+    })
+
+    assert redacted["query_fingerprint"] == fingerprint
+    assert redacted["query"] == "<redacted string len=4>"
+
+    spoofed = data_track._debug_redact_value({
+        "query_fingerprint": "她的生日",
+    })
+    assert spoofed["query_fingerprint"] == "<redacted string len=4>"
+
+
 def test_genesis_stats_surfaces_state_and_recent_jobs(monkeypatch):
     state = {
         "status": "processing",

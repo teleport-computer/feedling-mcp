@@ -115,6 +115,26 @@ def test_non_perception_tool_args_are_dropped_entirely(tool, args):
         assert str(value) not in flat
 
 
+def test_memory_discovery_reuse_is_visible_without_exposing_the_query():
+    query = "她的生日"
+    tc = SimpleNamespace(name="memory_search", args={"query": query})
+    result = worker.ToolResult(
+        call_id="call_1",
+        content="ok: this memory discovery was already completed",
+        metadata={"memory_discovery_reused": True},
+    )
+
+    detail = worker._v2_tool_trace_detail(
+        tc,
+        event_kind="tool_call_result",
+        result=result,
+        duration_ms=1.0,
+    )
+
+    assert detail["memory_discovery_reused"] is True
+    assert query not in _flat(detail)
+
+
 def test_perception_keeps_only_catalog_signal_names():
     """信号名是封闭词表、非用户内容,留着才有诊断价值;夹带的自由串必须掉。"""
     detail = _detail(

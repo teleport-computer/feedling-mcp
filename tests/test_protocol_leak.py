@@ -9,6 +9,7 @@ visible reply using multiple independent signals (see the module docstring), and
 returns an evidence enum — lane policy lives in each runtime, not here.
 """
 import sys
+import json
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "backend"))
@@ -42,6 +43,25 @@ NORMAL_CHAT = [
     "删掉多余的 }，把 \"port\": 8080 改成 8081",
     "把 config 里的 \"retries\": 3 删掉，然后 } 收尾",
 ]
+
+RAW_GEMINI_RESPONSE_ENVELOPE = json.dumps(
+    {
+        "response": {
+            "candidates": [{"content": {}}],
+            "usageMetadata": {
+                "promptTokenCount": 23894,
+                "totalTokenCount": 24515,
+                "thoughtsTokenCount": 621,
+            },
+            "modelVersion": "gemini-3-flash",
+            "responseId": "OTV9aoyAI9ronsEPuOK1kAM",
+        },
+        "traceId": "491379ee31653ba7",
+        "metadata": {},
+    },
+    ensure_ascii=False,
+    indent=2,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -142,6 +162,31 @@ def test_strong_evidence_classification():
 def test_plain_prose_is_none():
     for text in ["好的，晚安~", "收到！", "晚安，做个好梦 🌙", "(๑•̀ㅂ•́)و✧ 加油！"]:
         assert pl.classify(text) == pl.NONE, text
+
+
+def test_complete_upstream_gemini_response_envelope_is_strong_leak():
+    """The usr_90184 screenshot is a complete object, not an orphan tail."""
+    evidence = pl.classify(RAW_GEMINI_RESPONSE_ENVELOPE)
+
+    assert evidence == pl.UPSTREAM_RESPONSE_ENVELOPE
+    assert pl.is_strong(evidence)
+    assert pl.should_suppress(evidence, lane="foreground")
+    assert pl.should_suppress(evidence, lane="proactive")
+
+
+def test_similar_user_json_without_transport_wrapper_is_not_upgraded():
+    """Foreground JSON/code must survive unless the transport signature is exact."""
+    ordinary = json.dumps(
+        {
+            "response": {"candidates": [{"content": {}}]},
+            "metadata": {"example": True},
+        },
+        ensure_ascii=False,
+    )
+
+    evidence = pl.classify(ordinary)
+    assert evidence != pl.UPSTREAM_RESPONSE_ENVELOPE
+    assert not pl.should_suppress(evidence, lane="foreground")
 
 
 def test_reassembled_envelope_is_never_returned_for_execution():

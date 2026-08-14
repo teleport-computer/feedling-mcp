@@ -49,9 +49,11 @@ import uuid
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import urlsplit
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import httpx
 
@@ -656,7 +658,7 @@ def _publish_voice_reply(
 
 def _send_reply_push(
     user_id: str, *, msg_id: str, body: str, is_wake: bool, lane: str = ""
-) -> None:
+) -> bool:
     """`TurnDeps.send_reply_push` 的生产接线。
 
     APNs 私钥只注入 backend 容器，所以推送由 backend 发；这里只把明文正文经
@@ -672,7 +674,7 @@ def _send_reply_push(
     api_url = os.environ.get("FEEDLING_API_URL", "").strip()
     if not api_url:
         log.warning("[v2.push] FEEDLING_API_URL not set — reply push skipped")
-        return
+        return False
     try:
         resp = httpx.post(
             f"{api_url}/v1/internal/push/ai_reply",
@@ -690,8 +692,49 @@ def _send_reply_push(
             log.warning(
                 "[v2.push] reply push rejected user=%s status=%s",
                 user_id, resp.status_code)
+            return False
+        try:
+            result = resp.json()
+        except Exception:
+            return False
+        return isinstance(result, dict) and result.get("apns_alert_sent") is True
     except Exception as e:  # noqa: BLE001 — best-effort by contract
         log.warning("[v2.push] reply push failed user=%s: %s", user_id, e)
+        return False
+
+
+def _record_wake_shadow_decision(
+    user_id: str,
+    *,
+    job_id: int,
+    lane: str,
+    decision_allowed: bool,
+    apns_alert_sent: bool,
+    decided_at: float,
+) -> bool:
+    """Persist post-decision A′ telemetry without feeding it back into policy."""
+    zone_name = accounts_registry._get_user_timezone(user_id)
+    if not zone_name:
+        zone_name = perception_service.stable_context_timezone(user_id)
+    zone_name = str(zone_name or v2_context.DEFAULT_TIMEZONE)
+    try:
+        zone = ZoneInfo(zone_name)
+    except (ValueError, ZoneInfoNotFoundError):
+        try:
+            zone = ZoneInfo(v2_context.DEFAULT_TIMEZONE)
+        except (ValueError, ZoneInfoNotFoundError):
+            zone = ZoneInfo("UTC")
+    local = datetime.fromtimestamp(float(decided_at), tz=timezone.utc).astimezone(zone)
+    return jobs_store.record_wake_shadow_decision(
+        job_id=int(job_id),
+        local_day=local.date(),
+        local_hour=local.hour,
+        local_minute=local.minute,
+        lane=str(lane),
+        decision_allowed=decision_allowed,
+        apns_alert_sent=apns_alert_sent,
+        decided_at=float(decided_at),
+    )
 
 
 def _prompt_cache_route_scope(runtime, *, secret: bytes) -> str:
@@ -2634,12 +2677,14 @@ def _render_profile_card(item: dict) -> str:
     return "- " + " | ".join(parts)
 
 
-def _read_profile_cards(user_id: str) -> tuple[str, int]:
+def _read_profile_cards(user_id: str) -> tuple[str, int, dict]:
     """Read every eligible Garden card or fail loudly on any truncation.
 
     The lightweight index proves the complete cardinality, then fetch obtains
     each card's bounded content. Both use the scoped runtime token; no API key
-    or server-side envelope decryption is involved.
+    or server-side envelope decryption is involved. Per-card bodies keep their
+    separate ``_PROFILE_CARD_CONTENT_MAX_CHARS`` bound; the returned tail-window
+    metadata makes any such clipping observable without changing prompt text.
     """
 
     store = core_store.get_store(user_id)
@@ -2674,7 +2719,10 @@ def _read_profile_cards(user_id: str) -> tuple[str, int]:
             f"profile_cards_truncated:{user_card_count}/{len(items)}"
         )
     if not items:
-        return "", 0
+        return "", 0, {
+            "lane": "profile",
+            "profile_cards_truncated": False,
+        }
     ids = [str(item.get("id") or "").strip() for item in items]
     if any(not memory_id for memory_id in ids):
         raise RuntimeError("profile_cards_id_missing")
@@ -2701,7 +2749,19 @@ def _read_profile_cards(user_id: str) -> tuple[str, int]:
     rendered = [_render_profile_card(by_id[memory_id]) for memory_id in ids]
     if any(not line for line in rendered):
         raise RuntimeError("profile_cards_render_incomplete")
-    return "\n".join(rendered), user_card_count
+    # Derive the signal at the reader's final outlet from the source lengths
+    # and the cap that actually produced ``rendered``. Do not set a side flag
+    # next to the slice: a future rendering refactor must not silently detach
+    # the telemetry from the effective output.
+    profile_cards_truncated = any(
+        len(str(by_id[memory_id].get("content") or "").strip())
+        > _PROFILE_CARD_CONTENT_MAX_CHARS
+        for memory_id in ids
+    )
+    return "\n".join(rendered), user_card_count, {
+        "lane": "profile",
+        "profile_cards_truncated": profile_cards_truncated,
+    }
 
 
 def _read_memory_context(user_id: str, *, full_cards: bool = False) -> dict:
@@ -4703,6 +4763,7 @@ def build_production_deps() -> v2_worker.TurnDeps:
             if os.environ.get("FEEDLING_V2_PUSH_ENABLED", "1").strip() != "0"
             else None
         ),
+        record_wake_shadow_decision=_record_wake_shadow_decision,
         publish_voice_reply=_publish_voice_reply,
     )
 

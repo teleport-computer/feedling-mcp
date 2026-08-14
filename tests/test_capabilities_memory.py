@@ -1,4 +1,7 @@
+import hashlib
+import json
 import sys, pathlib
+from types import SimpleNamespace
 sys.path.insert(0, str(pathlib.Path(__file__).parent.parent / "backend"))  # noqa: E402
 
 from memory import memory_core  # noqa: E402
@@ -109,3 +112,93 @@ def test_search_requires_nonempty_query(monkeypatch):
     assert r2.ok is False
     assert r2.error["code"] == "capability_invalid_input"
     assert called["n"] == 0
+
+
+def _record_memory_trace(monkeypatch, *, response=None, failure: str = ""):
+    events = []
+
+    def fake_index_core(store, api_key, payload, *, post_enclave):
+        if failure:
+            raise RuntimeError(failure)
+        return response or {"items": []}
+
+    monkeypatch.setattr(
+        memory_core.memory_readside_core, "memory_index_core", fake_index_core,
+    )
+    monkeypatch.setattr(
+        memory_core.debug_trace,
+        "trace_event",
+        lambda _store, **event: events.append(event),
+    )
+    return events
+
+
+def test_search_trace_is_distinct_from_index_and_uses_confirmed_hit_count(monkeypatch):
+    events = _record_memory_trace(
+        monkeypatch,
+        response={"items": [{"id": "1"}, {"id": "2"}]},
+    )
+    store = SimpleNamespace(user_id="usr_trace")
+
+    search = cap_memory.search(
+        store,
+        params={"query": "她的生日", "limit": 7},
+    )
+    index = cap_memory.index(store, params={"limit": 11})
+
+    assert search.ok is True and index.ok is True
+    assert [event["type"] for event in events] == [
+        "memory.search.called",
+        "memory.index.called",
+    ]
+    search_event = events[0]
+    assert search_event["subsystem"] == "memory"
+    assert search_event["actor"] == "agent"
+    assert search_event["detail"]["counts"] == {"items": 2, "limit": 7}
+    assert search_event["detail"]["query_fingerprint"] == hashlib.sha256(
+        "她的生日".encode("utf-8")
+    ).hexdigest()[:12]
+    assert "她的生日" not in json.dumps(search_event, ensure_ascii=False)
+
+
+def test_search_trace_fingerprint_is_stable_and_query_sensitive(monkeypatch):
+    events = _record_memory_trace(monkeypatch, response={"items": []})
+    store = SimpleNamespace(user_id="usr_trace")
+
+    for query in ("同一个问题", "同一个问题", "另一个问题"):
+        result = cap_memory.search(store, params={"query": query})
+        assert result.ok is True
+
+    fingerprints = [
+        event["detail"]["query_fingerprint"] for event in events
+    ]
+    assert fingerprints[0] == fingerprints[1]
+    assert fingerprints[0] != fingerprints[2]
+    rendered = json.dumps(events, ensure_ascii=False)
+    assert "同一个问题" not in rendered
+    assert "另一个问题" not in rendered
+
+
+def test_search_failure_still_emits_content_free_search_event(monkeypatch):
+    secret_query = "不能进入埋点的私密问题"
+    events = _record_memory_trace(
+        monkeypatch,
+        failure=f"enclave failed while searching {secret_query}",
+    )
+
+    result = cap_memory.search(
+        SimpleNamespace(user_id="usr_trace"),
+        params={"query": secret_query, "limit": 3},
+    )
+
+    assert result.ok is False
+    assert result.error["code"] == "capability_upstream_error"
+    assert len(events) == 1
+    event = events[0]
+    assert event["type"] == "memory.search.called"
+    assert event["status"] == "failed"
+    assert event["detail"]["counts"] == {"limit": 3}
+    assert event["detail"]["query_fingerprint"] == hashlib.sha256(
+        secret_query.encode("utf-8")
+    ).hexdigest()[:12]
+    assert secret_query not in json.dumps(event, ensure_ascii=False)
