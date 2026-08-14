@@ -388,6 +388,33 @@ def test_single_round_plain_text_writes_exactly_one_bubble(monkeypatch):
     assert _job_status_row(job_id)[0] == "completed"
 
 
+def test_chat_tool_surface_keeps_memory_delete(monkeypatch):
+    """Foreground Chat retains the destructive operation Seven left enabled."""
+    uid = "u_chat_keeps_memory_delete"
+    conftest.seed_user(uid)
+    _reset(uid)
+    jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("w")
+    _patch_real_write(monkeypatch)
+    calls = _script_provider(monkeypatch, [_text_round("done")])
+    deps = _deps(messages=[{
+        "id": "m1", "ts": 10.0, "role": "user", "content": "delete that memory",
+    }])
+
+    status = asyncio.run(worker.process_job(
+        job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"
+    ))
+
+    assert status == "completed"
+    memory_spec = next(
+        spec for spec in calls[0]["tools"] if spec.name == "memory_write"
+    )
+    chat_ops = memory_spec.parameters["properties"]["actions"]["items"][
+        "properties"
+    ]["op"]["enum"]
+    assert chat_ops == ["add", "update", "delete"]
+
+
 def test_chat_worldbook_matches_current_turn_without_rewriting_user_text(
     monkeypatch,
 ):

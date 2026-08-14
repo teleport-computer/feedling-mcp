@@ -5,6 +5,12 @@ description: Store encrypted memory cards, inspect the index, and fetch selected
 
 Memory separates ciphertext storage from enclave-authorized read projections.
 
+Runtime V2 permits memory-card deletion only during foreground Chat, when the
+user is present in the turn. Background heartbeat, scheduled, manual-wake, and
+screen-watch turns can add or update cards but cannot delete them; the delete
+operation is omitted from their tool schema and independently refused by the
+execution gate.
+
 ## Hosted profile refresh execution
 
 Runtime V2 generates its bounded Memory/User profile as low-priority Heavy-pool

@@ -681,6 +681,18 @@ def _init_payload() -> dict:
 def _tools_from_rpc(doc: dict) -> dict:
     if "error" in doc:
         raise ProbeError("protocol", json.dumps(doc["error"])[:160])
+    # A 200 whose body is not JSON-RPC at all. Measured 2026-08-14 against
+    # mcp.amap.com with no ``?key=``: it answers 200 with its own vendor shape
+    # ``{"status":"0","info":"INVALID_USER_KEY","infocode":"10001"}`` — no
+    # ``jsonrpc``, no ``result``, no ``error``. Without this check the reads
+    # below degrade that to result={} → tools=[] → "connected, 0 tools", and
+    # the user is told their misconfigured server is fine.
+    if "result" not in doc:
+        raise ProbeError(
+            "protocol",
+            "响应不是 MCP 协议(没有 result/error)。常见原因:URL 少了 API key，"
+            "服务器用自己的格式回了一条错误。",
+        )
     result = doc.get("result") or {}
     if not isinstance(result, dict):
         raise ProbeError("protocol", "tools/list result must be an object")
@@ -715,6 +727,18 @@ def _tools_from_rpc(doc: dict) -> dict:
         if len(read_only_fingerprints) >= MAX_READ_ONLY_TOOL_APPROVALS:
             continue
         read_only_fingerprints[name] = catalog_tool_fingerprint(tool)
+    # A server that offers zero tools cannot do anything for the user, and
+    # reporting it as connected is the same lie in a different costume: the app
+    # says OK, the agent says "I don't have that tool", and the user has no way
+    # to tell this apart from the handshake race (see the 2026-08-13 spec).
+    # Auth-gated servers land here routinely — most popular MCP endpoints carry
+    # their key in the URL, so one typo degrades the catalogue to empty.
+    if not names:
+        raise ProbeError(
+            "no_tools",
+            "服务器响应了，但没有提供任何工具。常见原因:URL 少了 API key，"
+            "或该服务器要求鉴权。",
+        )
     return {
         "ok": True,
         "tool_count": len(names),

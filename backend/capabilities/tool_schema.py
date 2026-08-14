@@ -17,6 +17,8 @@ exist misleads the model into fabricating structured junk.
 """
 from __future__ import annotations
 
+from copy import deepcopy
+
 from provider_types import ToolSpec
 from capabilities import registry
 # Card-writing rules live with the memory package (single source of truth shared
@@ -615,6 +617,37 @@ DESCRIPTIONS: dict[str, str] = {
         "a later round using its newly available parameters."
     ),
 }
+
+
+_MEMORY_WRITE_UPSERT_DESCRIPTION = (
+    "Write or update memory cards. Each action needs an 'op': 'add' "
+    "(supply a one-line 'summary' AND full 'content', optional 'bucket') or "
+    "'update' (supply 'target_id' plus new 'summary'/'content'). Each action "
+    "may include an audit 'reason'. Get target_ids from "
+    "memory_search/memory_index first.\n"
+    + prompts_v1.MEMORY_WRITE_RULES_V1
+)
+
+
+def without_memory_delete(spec: ToolSpec) -> ToolSpec:
+    """Return the wake-safe ``memory_write`` surface without mutating the catalog.
+
+    Chat keeps the canonical add/update/delete schema. Proactive wake turns use
+    this narrowed copy so the model is not invited to attempt a destructive
+    operation that the execution gate will reject anyway.
+    """
+    if spec.name != "memory_write":
+        return spec
+    parameters = deepcopy(spec.parameters)
+    op_schema = parameters["properties"]["actions"]["items"]["properties"]["op"]
+    op_schema["enum"] = [
+        op for op in op_schema.get("enum", []) if op != "delete"
+    ]
+    return ToolSpec(
+        name=spec.name,
+        description=_MEMORY_WRITE_UPSERT_DESCRIPTION,
+        parameters=parameters,
+    )
 
 
 def _matches_json_type(value, expected: str) -> bool:
