@@ -526,7 +526,11 @@ DESCRIPTIONS: dict[str, str] = {
                      "returned successor id among that round's at most 20 ids. 'delete' "
                      "accepts one 'target_id' only. Each action "
                      "may include an audit 'reason'. Get "
-                     "target_ids from memory_search/memory_index first.\n"
+                     "target_ids from memory_search/memory_index first. If an update "
+                     "returns supersede_targets_unavailable or "
+                     "supersede_targets_changed, do not retry the stale ids: run "
+                     "memory_search/memory_index again for current active ids, then "
+                     "retry the merge.\n"
                      + prompts_v1.MEMORY_WRITE_RULES_V1),
     "perception_snapshot": ("Read the latest perception snapshot for named signals across "
                             + _PERCEPTION_DOMAINS + ". "

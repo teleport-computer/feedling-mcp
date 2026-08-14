@@ -87,6 +87,15 @@ def test_v2_tool_description_states_merge_limit_and_single_delete_target():
     assert "'delete' accepts one 'target_id' only" in desc
 
 
+def test_v2_tool_description_explains_how_to_recover_from_stale_merge_ids():
+    desc = tool_schema.DESCRIPTIONS["memory_write"]
+
+    assert "supersede_targets_unavailable" in desc
+    assert "supersede_targets_changed" in desc
+    assert "do not retry the stale ids" in desc
+    assert "memory_search/memory_index again" in desc
+
+
 def test_v1_guidance_keeps_its_own_op_names():
     """V1 那条路的 op 名不许被这次重构顺走。"""
     guidance = prompts_v1.MEMORY_WRITE_GUIDANCE_V1
