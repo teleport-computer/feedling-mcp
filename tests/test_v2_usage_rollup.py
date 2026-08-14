@@ -1115,7 +1115,7 @@ def test_statement_timeout_rolls_back_the_day_and_remains_fail_open():
     with db.get_pool().connection() as conn:
         conn.execute(
             "CREATE OR REPLACE FUNCTION slow_usage_insert() RETURNS trigger "
-            "LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_sleep(0.2); RETURN NEW; END $$"
+            "LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_sleep(1); RETURN NEW; END $$"
         )
         conn.execute(
             "CREATE TRIGGER slow_usage_insert BEFORE INSERT "
@@ -1130,7 +1130,7 @@ def test_statement_timeout_rolls_back_the_day_and_remains_fail_open():
                 "DROP TRIGGER IF EXISTS slow_usage_insert ON v2_usage_daily_users"
             )
             conn.execute("DROP FUNCTION IF EXISTS slow_usage_insert()")
-    assert result["status"] == "error"
+    assert result["status"] == "error", result
     assert result["error"] == "QueryCanceled"
     with db.get_pool().connection() as conn:
         assert (

@@ -16,9 +16,12 @@ If no Postgres is reachable, the whole suite is skipped with a clear message
 rather than failing with confusing connection errors.
 """
 
+import copy
 import os
 import sys
+import threading
 import uuid
+from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
@@ -42,6 +45,157 @@ _provisioned = False
 _PROVISION_ERROR = None
 _created_test_db = False
 _created_tee_db = False
+
+
+@dataclass(frozen=True)
+class _SeedUserBeforeImage:
+    """State observed immediately before a test first seeds one user ID."""
+
+    db_user: tuple[object, dict] | None
+    wake_schedule: dict | None
+    registry_user: tuple[int, dict] | None
+
+
+class _SeedUserTracker:
+    def __init__(self, nodeid: str) -> None:
+        import db
+
+        self.nodeid = nodeid
+        self.calls = 0
+        self.before: dict[str, _SeedUserBeforeImage] = {}
+        self.lock = threading.RLock()
+        # Fault-injection tests monkeypatch db.get_pool inside the test body.
+        # Isolation cleanup must retain the real pool entrypoint captured before
+        # those patches, otherwise an intentional "db down" stub breaks teardown.
+        self._get_pool = db.get_pool
+
+    def capture_before(self, user_id: str) -> None:
+        """Capture once per user/test; repeated seed calls share one baseline."""
+        with self.lock:
+            self.calls += 1
+            if user_id in self.before:
+                return
+
+            from accounts import registry
+
+            with self._get_pool().connection() as conn:
+                db_row = conn.execute(
+                    "SELECT created_at, doc FROM users WHERE user_id=%s",
+                    (user_id,),
+                ).fetchone()
+                wake_row = conn.execute(
+                    "SELECT to_jsonb(schedule) FROM v2_wake_schedule AS schedule "
+                    "WHERE user_id=%s",
+                    (user_id,),
+                ).fetchone()
+
+            with registry._users_lock:
+                registry_row = next(
+                    (
+                        (index, copy.deepcopy(row))
+                        for index, row in enumerate(registry._users)
+                        if row.get("user_id") == user_id
+                    ),
+                    None,
+                )
+
+            self.before[user_id] = _SeedUserBeforeImage(
+                db_user=(copy.deepcopy(db_row[0]), copy.deepcopy(db_row[1]))
+                if db_row is not None
+                else None,
+                wake_schedule=copy.deepcopy(wake_row[0])
+                if wake_row is not None
+                else None,
+                registry_user=registry_row,
+            )
+
+    def restore_before_images(self) -> None:
+        """Undo state written after each tracked user's first seed in a test."""
+        from accounts import registry
+        from psycopg.types.json import Jsonb
+
+        with self.lock:
+            before = tuple(self.before.items())
+        if not before:
+            return
+
+        user_ids = [user_id for user_id, _image in before]
+        try:
+            with self._get_pool().connection() as conn:
+                conn.execute(
+                    "DELETE FROM v2_wake_schedule WHERE user_id = ANY(%s)",
+                    (user_ids,),
+                )
+                for user_id, image in before:
+                    if image.db_user is None:
+                        conn.execute(
+                            "DELETE FROM users WHERE user_id=%s",
+                            (user_id,),
+                        )
+                        continue
+                    created_at, doc = image.db_user
+                    conn.execute(
+                        "INSERT INTO users (user_id, created_at, doc) "
+                        "VALUES (%s, %s, %s) "
+                        "ON CONFLICT (user_id) DO UPDATE SET "
+                        "created_at=EXCLUDED.created_at, doc=EXCLUDED.doc",
+                        (user_id, created_at, Jsonb(doc)),
+                    )
+                for _user_id, image in before:
+                    if image.wake_schedule is not None:
+                        conn.execute(
+                            "INSERT INTO v2_wake_schedule "
+                            "SELECT * FROM jsonb_populate_record("
+                            "NULL::v2_wake_schedule, %s)",
+                            (Jsonb(image.wake_schedule),),
+                        )
+        finally:
+            with registry._users_lock:
+                tracked_ids = set(user_ids)
+                registry._users[:] = [
+                    row
+                    for row in registry._users
+                    if row.get("user_id") not in tracked_ids
+                ]
+                restored = sorted(
+                    (
+                        image.registry_user
+                        for _user_id, image in before
+                        if image.registry_user is not None
+                    ),
+                    key=lambda item: item[0],
+                )
+                for index, row in restored:
+                    registry._users.insert(
+                        min(index, len(registry._users)),
+                        copy.deepcopy(row),
+                    )
+
+
+_seed_user_tracker_lock = threading.RLock()
+_active_seed_user_tracker: _SeedUserTracker | None = None
+_seed_user_observation = {
+    "tests_with_calls": 0,
+    "tests_with_new": 0,
+    "tests_with_existing": 0,
+    "calls": 0,
+    "unique_touches": 0,
+    "new_touches": 0,
+    "existing_touches": 0,
+    "repeated_calls": 0,
+    "outside_test_calls": 0,
+}
+
+
+def _observe_seed_user(user_id: str) -> None:
+    with _seed_user_tracker_lock:
+        tracker = _active_seed_user_tracker
+        if tracker is None:
+            _seed_user_observation["outside_test_calls"] += 1
+            return
+    tracker.capture_before(user_id)
+
+
 try:
     import psycopg
 
@@ -271,6 +425,7 @@ def seed_user(user_id: str, **doc) -> None:
     import db
     from accounts import registry
 
+    _observe_seed_user(user_id)
     entry = {"user_id": user_id, **doc}
     db.upsert_user(entry)
     with registry._users_lock:
@@ -395,6 +550,54 @@ def pytest_unconfigure(config):
         admin.close()
     except Exception:
         pass
+
+
+def pytest_terminal_summary(terminalreporter):
+    """Print how often central seed-user isolation exercised each branch."""
+    stats = _seed_user_observation
+    terminalreporter.write_sep("=", "seed_user tracker")
+    terminalreporter.write_line(
+        "tests_with_calls={tests_with_calls} tests_with_new={tests_with_new} "
+        "tests_with_existing={tests_with_existing} calls={calls} "
+        "unique_touches={unique_touches} new_touches={new_touches} "
+        "existing_touches={existing_touches} repeated_calls={repeated_calls} "
+        "outside_test_calls={outside_test_calls}".format(**stats)
+    )
+
+
+@pytest.fixture(autouse=True)
+def _track_seed_user_before_images(request):
+    """Restore DB and registry state changed after a test first seeds a UID."""
+    global _active_seed_user_tracker
+
+    tracker = _SeedUserTracker(request.node.nodeid)
+    with _seed_user_tracker_lock:
+        if _active_seed_user_tracker is not None:
+            raise AssertionError("overlapping function-scope seed_user trackers")
+        _active_seed_user_tracker = tracker
+    try:
+        yield
+    finally:
+        with _seed_user_tracker_lock:
+            if _active_seed_user_tracker is tracker:
+                _active_seed_user_tracker = None
+        with tracker.lock:
+            touches = tuple(tracker.before.values())
+            calls = tracker.calls
+        if calls:
+            new_touches = sum(item.db_user is None for item in touches)
+            existing_touches = len(touches) - new_touches
+            with _seed_user_tracker_lock:
+                stats = _seed_user_observation
+                stats["tests_with_calls"] += 1
+                stats["tests_with_new"] += int(new_touches > 0)
+                stats["tests_with_existing"] += int(existing_touches > 0)
+                stats["calls"] += calls
+                stats["unique_touches"] += len(touches)
+                stats["new_touches"] += new_touches
+                stats["existing_touches"] += existing_touches
+                stats["repeated_calls"] += calls - len(touches)
+        tracker.restore_before_images()
 
 
 @pytest.fixture(autouse=True)

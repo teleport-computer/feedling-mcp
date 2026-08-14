@@ -435,7 +435,6 @@ tests/test_v2_trajectory_db.py
 tests/test_v2_trajectory_inspect_unit.py
 tests/test_v2_trajectory_unit.py
 tests/test_v2_turn_failure_supersede.py
-tests/test_v2_usage_rollup.py
 tests/test_v2_wake_decision_adapter.py
 tests/test_v2_wake_success.py
 tests/test_v2_web_gate.py
