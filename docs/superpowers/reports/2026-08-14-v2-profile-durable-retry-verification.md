@@ -1,8 +1,8 @@
 # Runtime V2 Profile Durable Retry Verification
 
-Date: 2026-08-14  
-Branch: `fix/v2-profile-durable-retry`  
-Base: `origin/test` at `6cad3ed2` (includes merged PR #187 at `e752dc6c`)
+Date: 2026-08-14
+Branch: `fix/v2-profile-durable-retry`
+Base: `origin/test` at `6a7bf491` (includes merged PR #187 at `e752dc6c`)
 
 ## Scope verified locally
 

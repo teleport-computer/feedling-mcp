@@ -1,8 +1,8 @@
 # Runtime V2 Profile Job 持久化重试设计
 
-**日期：** 2026-08-14  
-**状态：** 已获方向确认，待实施计划  
-**目标分支：** `test`  
+**日期：** 2026-08-14
+**状态：** 已获方向确认，待实施计划
+**目标分支：** `test`
 **前置依赖：** [PR #187](https://github.com/teleport-computer/feedling-mcp/pull/187) 先合入 `test`
 
 ## 背景
