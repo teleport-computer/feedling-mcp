@@ -40,7 +40,7 @@ DREAM_JOB_FIELDS = frozenset(
         "duration_ms",
         "provider",
         "model",
-        "memory_card_count",
+        "memory_card_count_now",
         "created_at",
         "finished_at",
     }
@@ -135,7 +135,12 @@ def card_metadata_from_row(row: Mapping[str, Any]) -> dict:
 
 
 def dream_job_metadata_from_row(row: Mapping[str, Any]) -> dict:
-    """Fixed job projection; last_error is reduced to a stable short code."""
+    """Fixed job projection; last_error is reduced to a stable short code.
+
+    ``duration_ms`` is processing wall time: ``finished_at`` minus ``started_at``;
+    old/incomplete rows fall back to ``claimed_at`` and finally ``created_at``.
+    ``memory_card_count_now`` is a query-time snapshot, never the job's input size.
+    """
     duration = row.get("duration_ms")
     try:
         safe_duration = max(0, int(duration)) if duration is not None else None
@@ -154,7 +159,9 @@ def dream_job_metadata_from_row(row: Mapping[str, Any]) -> dict:
         "duration_ms": safe_duration,
         "provider": _safe_label(row.get("provider")),
         "model": _safe_label(row.get("model")),
-        "memory_card_count": max(0, int(row.get("memory_card_count") or 0)),
+        "memory_card_count_now": max(
+            0, int(row.get("memory_card_count_now") or 0)
+        ),
         "created_at": _safe_timestamp(row.get("created_at")),
         "finished_at": _safe_timestamp(row.get("finished_at")),
     }
@@ -266,7 +273,7 @@ def list_dream_job_metadata(
                    COALESCE(metric.provider, 'unknown') AS provider,
                    COALESCE(metric.model, 'unknown') AS model,
                    (SELECT count(*) FROM memory_moments mm
-                    WHERE mm.user_id=j.user_id)::bigint AS memory_card_count,
+                    WHERE mm.user_id=j.user_id)::bigint AS memory_card_count_now,
                    j.created_at,
                    j.finished_at
             FROM agent_jobs j
@@ -293,7 +300,7 @@ def list_dream_job_metadata(
                 "duration_ms": row[4],
                 "provider": row[5],
                 "model": row[6],
-                "memory_card_count": row[7],
+                "memory_card_count_now": row[7],
                 "created_at": row[8],
                 "finished_at": row[9],
             }

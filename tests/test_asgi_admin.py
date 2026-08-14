@@ -449,7 +449,7 @@ def test_dream_job_metadata_supports_filters_pagination_and_no_bodies(env):
         "duration_ms": 289000,
         "provider": "openai",
         "model": "gpt-5.5",
-        "memory_card_count": 2,
+        "memory_card_count_now": 2,
         "created_at": "2026-08-13T10:00:00Z",
         "finished_at": "2026-08-13T10:04:59Z",
     }
@@ -508,7 +508,7 @@ def test_metadata_projection_rejects_unexpected_content_fields():
             "duration_ms": 42,
             "provider": "openai",
             "model": "gpt-5.5",
-            "memory_card_count": 3,
+            "memory_card_count_now": 3,
             "finished_at": "2026-08-13T00:00:01Z",
         }
     )
