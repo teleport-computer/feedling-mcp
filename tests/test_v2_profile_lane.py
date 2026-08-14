@@ -8,7 +8,6 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
-from admin import data_track as admin_data_track
 from hosted import config_store
 from model_api_runtime.v2 import jobs_store, profile, profile_store, serve_worker, worker
 
@@ -340,14 +339,14 @@ def test_empty_eligible_garden_persists_raw_source_witness(monkeypatch):
     }
 
 
-def test_profile_card_truncation_reaches_recorded_provider_request(monkeypatch):
+def test_profile_full_card_reaches_recorded_provider_request(monkeypatch):
     provider_messages = []
     events = []
     traces = []
-    rare_secret = "T047_PROFILE_SECRET_MUST_NOT_REACH_ADMIN"
+    tail_sentinel = "T062_PROFILE_CARD_TAIL_REACHES_PROVIDER_ONLY"
     content = (
-        "P" * serve_worker._PROFILE_CARD_CONTENT_MAX_CHARS
-        + rare_secret
+        "P" * (profile.PROFILE_MEMORY_MAX_CHARS + profile.PROFILE_USER_MAX_CHARS)
+        + tail_sentinel
     )
     rendered_cards = serve_worker._render_profile_card({
         "id": "m1",
@@ -389,7 +388,7 @@ def test_profile_card_truncation_reaches_recorded_provider_request(monkeypatch):
         cards=(
             rendered_cards,
             1,
-            {"lane": "profile", "profile_cards_truncated": True},
+            {"lane": "profile", "profile_cards_truncated": False},
         )
     )
     deps.emit_debug_trace = lambda user_id, event_type, **fields: traces.append(
@@ -414,34 +413,14 @@ def test_profile_card_truncation_reaches_recorded_provider_request(monkeypatch):
         "lane": "profile",
         "tail_window": {
             "lane": "profile",
-            "profile_cards_truncated": True,
+            "profile_cards_truncated": False,
         },
     }
-    truncation = next(
-        trace for trace in traces if trace["type"] == "context.truncation"
-    )
-    assert truncation == {
-        "user_id": "u",
-        "type": "context.truncation",
-        "status": "warning",
-        "summary": "",
-        "explain": "",
-        "detail": {
-            "counts": {
-                "profile_cards_truncated": 1,
-                "worldbook_truncated": 0,
-            }
-        },
-    }
-    raw_outputs = json.dumps(
-        {
-            "provider_messages": provider_messages,
-            "trajectory": events,
-            "data_track": admin_data_track._debug_event_public_json(truncation),
-        },
-        ensure_ascii=False,
-    )
-    assert rare_secret not in raw_outputs
+    provider_payload = json.dumps(provider_messages, ensure_ascii=False)
+    assert content in provider_payload
+    assert tail_sentinel in provider_payload
+    assert traces == []
+    assert tail_sentinel not in json.dumps(events, ensure_ascii=False)
 
 
 def test_profile_reports_read_provider_and_durable_write_boundaries(monkeypatch):
