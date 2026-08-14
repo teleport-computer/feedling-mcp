@@ -110,7 +110,7 @@ def _system_of(**kwargs) -> str:
     from model_api_runtime.v2 import worker
 
     build_messages = worker._make_build_messages_fn(
-        system_prompt="SYS", summary="", tail=[{"role": "user", "content": "hi"}], **kwargs
+        system_prompt="SYS", tail=[{"role": "user", "content": "hi"}], **kwargs
     )
     messages = build_messages([])
     assert messages[0]["role"] == "system"

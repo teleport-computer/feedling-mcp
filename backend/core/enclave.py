@@ -20,8 +20,8 @@ _QUIET_SUCCESS_PURPOSE_PREFIXES = ("tee_replicate:",)
 _SUCCESS_TRACE_EVENT_TYPES = frozenset({"enclave.call.start", "enclave.call.done"})
 
 # —— Bulk-decrypt trace coalescing ——
-# `_decrypt_chat_rows` decrypts the prompt window one row at a time, up to
-# FEEDLING_V2_TAIL_HARD_CAP (60) rows per turn. At two success events per row
+# `_decrypt_chat_rows` decrypts the prompt window one row at a time. Even the
+# former 60-row window produced two success events per row;
 # that is ~120 trace events for a single chat turn, against a ring that holds
 # 500 — so ONE turn evicts everything else and the debug panel shows a window
 # measured in seconds. Measured on usr_7001b1df80e2024d 2026-08-10: 182 of 200
@@ -124,7 +124,7 @@ def coalesced_success_trace(purpose: str, *, prefix: bool = False):
 # Every enclave call used to build its own ``httpx.Client``, which meant a fresh
 # TCP connect + TLS handshake per request. That is invisible for one-shot calls
 # but brutal on the V2 prompt path: `_decrypt_chat_rows` decrypts the tail one
-# row at a time, so a full `FEEDLING_V2_TAIL_HARD_CAP` (60) window paid 60
+# row at a time, so the former 60-row window paid 60
 # handshakes — measured at ~82ms each on test, ~4.9s of every chat turn.
 #
 # One pooled client per process instead. It is lazily built, guarded by a lock,

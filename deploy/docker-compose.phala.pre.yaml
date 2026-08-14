@@ -320,19 +320,8 @@ services:
       # the duration of an incident and back to "0" afterwards — the ${VAR:-}
       # form means neither flip needs a new compose_hash / on-chain publish.
       FEEDLING_V2_TRAJECTORY_INSPECT_ENABLED: "${FEEDLING_V2_TRAJECTORY_INSPECT_ENABLED:-0}"
-      # Maximum source rows advanced by one metadata-only coverage batch.
-      FEEDLING_V2_COMPACTION_BATCH_MSGS: "${FEEDLING_V2_COMPACTION_BATCH_MSGS:-50}"
       # MEMORY/USER prompt replacement is normal-on and aligned with prod/test.
       FEEDLING_V2_PROFILE_ENABLED: "1"
-      FEEDLING_V2_PROMPT_CATCHUP_DEADLINE_SEC: "${FEEDLING_V2_PROMPT_CATCHUP_DEADLINE_SEC:-600}"
-      # 20 -> 50 (2026-07-28). This threshold decides whether a turn enters
-      # the catch-up fold path AT ALL: a backlog at or under it fits in the
-      # verbatim tail and nothing is folded. At 20 nearly every active user
-      # folds every turn; the two prod users who stayed healthy through all
-      # of this (21/21 and 13/15) were healthy precisely because their
-      # history never reached it. A few dozen more verbatim rows is cheap
-      # against a >=128k input budget.
-      FEEDLING_V2_TAIL_BUDGET_MSGS: "${FEEDLING_V2_TAIL_BUDGET_MSGS:-50}"
       FEEDLING_HOSTED_RUNTIME_POLICY: "dual"
       FEEDLING_RUNTIME_DEFAULT_DESIRED: "resident"
     depends_on:

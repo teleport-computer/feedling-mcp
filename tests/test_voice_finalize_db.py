@@ -284,10 +284,9 @@ def test_delete_never_touches_the_transcript_card_and_is_idempotent():
     assert db.chat_get_strict(uid, smid) is not None
 
 
-def test_rows_folded_by_compaction_are_retained_not_deleted():
-    # C1 guard: a voice row already covered by the V2 summary watermark is part
-    # of compaction's frozen ledger — deleting it would corrupt the frontier.
-    # It must be RETAINED (and not counted as a cleanup failure).
+def test_rows_covered_by_legacy_summary_watermark_are_retained_not_deleted():
+    # Phase-1 compatibility: rows covered by a legacy summary watermark remain
+    # protected until the legacy schema and cleanup contract are removed.
     uid = _seed_user()
     call_id = "vcall_" + uuid.uuid4().hex[:10]
     early = _append(uid, {
@@ -312,8 +311,8 @@ def test_rows_folded_by_compaction_are_retained_not_deleted():
 
     result = summary.delete_call_messages(uid, call_id)
     assert result == {"deleted": 1, "retained_covered": 1, "remaining": 0}
-    assert db.chat_get_strict(uid, early) is not None   # folded row kept
-    assert db.chat_get_strict(uid, late) is None        # unfolded row deleted
+    assert db.chat_get_strict(uid, early) is not None
+    assert db.chat_get_strict(uid, late) is None
 
 
 # --------------------------------------------------------------------------- #

@@ -1,4 +1,4 @@
-"""Durable chat retention: append limits and summary watermarks never delete.
+"""Durable chat retention: append limits never delete source rows.
 
 The historical filename is retained so downstream test selectors keep working,
 but the old "coverage gate" is intentionally gone. A summary is a derived
@@ -16,7 +16,6 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
 import db  # noqa: E402
-from model_api_runtime.v2 import jobs_store  # noqa: E402
 
 from conftest import seed_user  # noqa: E402
 
@@ -62,21 +61,12 @@ def test_legacy_append_limit_only_bounds_hot_cache_not_durable_rows():
     ]
 
 
-def test_v2_summary_watermark_and_compaction_coverage_never_authorize_delete():
-    uid = "retention-v2-summary"
+def test_v2_strict_append_limit_never_authorizes_delete():
+    uid = "retention-v2-strict"
     seed_user(uid)
     for index in range(6):
         msg_id = f"message-{index}"
         db.chat_append_strict(uid, msg_id, float(index), _doc(msg_id), 0)
-
-    watermark_seq = db.chat_seq_for_msg_id(uid, "message-5")
-    assert jobs_store.upsert_summary_row_cas(
-        uid,
-        summary_envelope={"body_ct": "encrypted-summary"},
-        watermark_ts=5.0,
-        watermark_seq=watermark_seq,
-        expected_version=0,
-    )
 
     for index in range(6, 12):
         msg_id = f"message-{index}"

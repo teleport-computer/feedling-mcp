@@ -13,7 +13,7 @@ _V2 = pathlib.Path(__file__).parent.parent / "backend" / "model_api_runtime" / "
 _EXEMPT = {"serve_worker.py", "__init__.py"}
 
 # Derived, not hand-listed. A hardcoded roster silently exempts every module added after it
-# was written: admission.py, scheduler.py, context.py, and compaction.py had
+# was written: admission.py, scheduler.py, context.py, and another runtime module had
 # all escaped this guard that way. Deriving from the directory means a new v2 module is
 # guarded the moment it exists, which is the only version of this rule that stays true.
 _CORE_MODULES = sorted(p.name for p in _V2.glob("*.py") if p.name not in _EXEMPT)

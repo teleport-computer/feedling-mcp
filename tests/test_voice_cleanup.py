@@ -5,9 +5,8 @@ Replaces test_voice_summary.py — the model-written summary was removed on
 it. What is still worth locking here is the card that stands in for the call in
 the chat stream, because two of its properties are load-bearing:
 
-- it is **bounded** (an oversized chat row makes V2 compaction raise
-  ``compaction_message_exceeds_char_budget``, taking the user's ordinary text
-  chat down with it), and
+- it is **bounded** so Capture and recent-turn replay do not spend an
+  unbounded prompt budget on a transport card, and
 - it carries ``voice_call_id`` (without it Capture cannot find the archive, and
   would silently distil the preview instead of the whole call).
 """

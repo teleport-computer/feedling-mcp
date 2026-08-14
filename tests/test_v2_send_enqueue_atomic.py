@@ -411,16 +411,6 @@ def test_atomic_send_retains_every_source_row_without_tee_eviction(monkeypatch):
             _msg_doc(f"old-{index}"),
             0,
         )
-    old_two_seq = db.chat_seq_for_msg_id(uid, "old-2")
-    assert old_two_seq is not None
-    assert jobs_store.upsert_summary_row_cas(
-        uid,
-        summary_envelope={"body_ct": "summary"},
-        watermark_ts=2.0,
-        watermark_seq=old_two_seq,
-        expected_version=0,
-    )
-
     from tee_shadow import mirror
 
     mirrored: list[list[tuple[str, tuple]]] = []

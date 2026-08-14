@@ -404,9 +404,6 @@ jobs:
             tests/test_model_api_chat_send_routing.py \
             tests/test_provider_prompt_cache.py \
             tests/test_v2_adaptive_tail.py \
-            tests/test_v2_compaction.py \
-            tests/test_v2_compaction_integration.py \
-            tests/test_v2_compaction_cas_requeue.py \
             tests/test_v2_context.py \
             tests/test_v2_p0_history_safety.py \
             tests/test_v2_profile_lane.py \
@@ -416,12 +413,10 @@ jobs:
             tests/test_v2_reconcile.py \
             tests/test_v2_reconcile_sweeper.py \
             tests/test_v2_serve_worker.py \
-            tests/test_v2_summary_frontier_store.py \
             tests/test_v2_summary_watermark_seq.py \
             tests/test_v2_wake_worker.py \
             tests/test_v2_worker.py \
             tests/test_v2_worker_tool_loop.py \
-            tests/test_v2_deterministic_compaction.py \
             -v
 
   # -------------------------------------------------------------------------
@@ -1227,9 +1222,6 @@ jobs:
           # supplies the value. Setting one of these overrides that default
           # with a redeploy and no new compose_hash — which is the whole
           # point, since the two prod stalls were both batch-size problems.
-          FEEDLING_V2_COMPACTION_BATCH_MSGS: ${{ vars.PROD_FEEDLING_V2_COMPACTION_BATCH_MSGS }}
-          FEEDLING_V2_PROMPT_CATCHUP_DEADLINE_SEC: ${{ vars.PROD_FEEDLING_V2_PROMPT_CATCHUP_DEADLINE_SEC }}
-          FEEDLING_V2_TAIL_BUDGET_MSGS: ${{ vars.PROD_FEEDLING_V2_TAIL_BUDGET_MSGS }}
           # gunicorn worker counts (compose reads them; empty → compose default
           # 4/backend, 2/enclave). Encrypted env, NOT baked into compose_hash —
           # flip via repo var without on-chain re-auth. Gate: the deployed image
@@ -1281,9 +1273,6 @@ jobs:
             -e "FEEDLING_V2_CAPTURE_ENABLED=$FEEDLING_V2_CAPTURE_ENABLED" \
             -e "FEEDLING_V2_PROFILE_ENABLED=$FEEDLING_V2_PROFILE_ENABLED" \
             -e "FEEDLING_V2_TRAJECTORY_INSPECT_ENABLED=$FEEDLING_V2_TRAJECTORY_INSPECT_ENABLED" \
-            -e "FEEDLING_V2_COMPACTION_BATCH_MSGS=$FEEDLING_V2_COMPACTION_BATCH_MSGS" \
-            -e "FEEDLING_V2_PROMPT_CATCHUP_DEADLINE_SEC=$FEEDLING_V2_PROMPT_CATCHUP_DEADLINE_SEC" \
-            -e "FEEDLING_V2_TAIL_BUDGET_MSGS=$FEEDLING_V2_TAIL_BUDGET_MSGS" \
             -e "FEEDLING_BACKEND_WORKERS=$FEEDLING_BACKEND_WORKERS" \
             -e "FEEDLING_ENCLAVE_WORKERS=$FEEDLING_ENCLAVE_WORKERS" \
             -e "FEEDLING_V2_RUNNER_CVM_ID=$CVM_ID" \
@@ -1490,9 +1479,6 @@ jobs:
           # supplies the value. Setting one of these overrides that default
           # with a redeploy and no new compose_hash — which is the whole
           # point, since the two prod stalls were both batch-size problems.
-          FEEDLING_V2_COMPACTION_BATCH_MSGS: ${{ vars.TEST_FEEDLING_V2_COMPACTION_BATCH_MSGS }}
-          FEEDLING_V2_PROMPT_CATCHUP_DEADLINE_SEC: ${{ vars.TEST_FEEDLING_V2_PROMPT_CATCHUP_DEADLINE_SEC }}
-          FEEDLING_V2_TAIL_BUDGET_MSGS: ${{ vars.TEST_FEEDLING_V2_TAIL_BUDGET_MSGS }}
           # gunicorn worker count (backend/gunicorn_conf.py reads it; empty → 1).
           # Encrypted env channel, NOT baked into compose_hash — flip without
           # on-chain re-auth. Gate: the deployed image must contain the leader-
@@ -1537,9 +1523,6 @@ jobs:
             -e "FEEDLING_V2_PROFILE_ENABLED=$FEEDLING_V2_PROFILE_ENABLED" \
             -e "FEEDLING_V2_DREAM_ENABLED=$FEEDLING_V2_DREAM_ENABLED" \
             -e "FEEDLING_V2_TRAJECTORY_INSPECT_ENABLED=$FEEDLING_V2_TRAJECTORY_INSPECT_ENABLED" \
-            -e "FEEDLING_V2_COMPACTION_BATCH_MSGS=$FEEDLING_V2_COMPACTION_BATCH_MSGS" \
-            -e "FEEDLING_V2_PROMPT_CATCHUP_DEADLINE_SEC=$FEEDLING_V2_PROMPT_CATCHUP_DEADLINE_SEC" \
-            -e "FEEDLING_V2_TAIL_BUDGET_MSGS=$FEEDLING_V2_TAIL_BUDGET_MSGS" \
             -e "FEEDLING_BACKEND_WORKERS=$FEEDLING_BACKEND_WORKERS" \
             -e "FEEDLING_V2_RUNNER_CVM_ID=$CVM_ID" \
             -e "FEEDLING_V2_DEPLOYED_BUILD=${GITHUB_SHA:0:7}"
@@ -1870,9 +1853,6 @@ jobs:
           # supplies the value. Setting one of these overrides that default
           # with a redeploy and no new compose_hash — which is the whole
           # point, since the two prod stalls were both batch-size problems.
-          FEEDLING_V2_COMPACTION_BATCH_MSGS: ${{ vars.PRE_FEEDLING_V2_COMPACTION_BATCH_MSGS }}
-          FEEDLING_V2_PROMPT_CATCHUP_DEADLINE_SEC: ${{ vars.PRE_FEEDLING_V2_PROMPT_CATCHUP_DEADLINE_SEC }}
-          FEEDLING_V2_TAIL_BUDGET_MSGS: ${{ vars.PRE_FEEDLING_V2_TAIL_BUDGET_MSGS }}
           # gunicorn worker count (backend/gunicorn_conf.py reads it; empty → 1).
           # Encrypted env channel, NOT baked into compose_hash — flip without
           # on-chain re-auth. Gate: the deployed image must contain the leader-
@@ -1913,9 +1893,6 @@ jobs:
             -e "FEEDLING_V2_CAPTURE_ENABLED=$FEEDLING_V2_CAPTURE_ENABLED" \
             -e "FEEDLING_V2_PROFILE_ENABLED=$FEEDLING_V2_PROFILE_ENABLED" \
             -e "FEEDLING_V2_TRAJECTORY_INSPECT_ENABLED=$FEEDLING_V2_TRAJECTORY_INSPECT_ENABLED" \
-            -e "FEEDLING_V2_COMPACTION_BATCH_MSGS=$FEEDLING_V2_COMPACTION_BATCH_MSGS" \
-            -e "FEEDLING_V2_PROMPT_CATCHUP_DEADLINE_SEC=$FEEDLING_V2_PROMPT_CATCHUP_DEADLINE_SEC" \
-            -e "FEEDLING_V2_TAIL_BUDGET_MSGS=$FEEDLING_V2_TAIL_BUDGET_MSGS" \
             -e "FEEDLING_BACKEND_WORKERS=$FEEDLING_BACKEND_WORKERS" \
             -e "FEEDLING_V2_RUNNER_CVM_ID=$CVM_ID" \
             -e "FEEDLING_V2_DEPLOYED_BUILD=${GITHUB_SHA:0:7}" \

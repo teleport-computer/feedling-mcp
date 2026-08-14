@@ -150,7 +150,7 @@ def _tc(call_id, name, **args):
 
 
 def _wake_deps(
-    *, tail=None, summary="", sink_calls=None, token="rt-enclave",
+    *, tail=None, sink_calls=None, token="rt-enclave",
     observe_photo=None,
 ):
     return worker.TurnDeps(

@@ -342,7 +342,7 @@ def test_idle_slot_reports_zero_current_turn_age():
 def test_round_and_catchup_boundaries_refresh_stall_not_absolute_age(monkeypatch):
     """Deterministic fake-clock proof for the production budget mismatch.
 
-    Simulate ten successful 60-second provider/compaction boundaries.  The
+    Simulate ten successful 60-second provider/Capture boundaries. The
     turn is now 601s old (well past the former 180s hard kill) but only 1s
     stalled, so the supervisor must expose those as different clocks.  Once
     no further boundary arrives, the stall clock grows and becomes killable.

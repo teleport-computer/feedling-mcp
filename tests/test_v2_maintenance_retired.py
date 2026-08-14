@@ -40,8 +40,7 @@ def test_claimed_maintenance_is_content_free_tombstone(monkeypatch):
         resolve_provider=prohibited,
         mint_enclave_token=prohibited,
         read_recent_turns=prohibited,
-        read_compaction_tail_after_seq=prohibited,
-        append_summary_segment=prohibited,
+        read_capture_tail_after_seq=prohibited,
         seal_trajectory_payload=prohibited,
         runtime_mode_enabled=prohibited,
     )
@@ -84,7 +83,6 @@ def test_maintenance_tombstone_respects_lease_loss(monkeypatch):
         read_messages=prohibited,
         resolve_provider=prohibited,
         mint_enclave_token=prohibited,
-        append_summary_segment=prohibited,
     )
     assert asyncio.run(worker._run_turn(job, deps)) == "failed"
     assert flushed == [(True, "lease_lost")]

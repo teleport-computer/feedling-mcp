@@ -2,7 +2,7 @@
 
 Why this exists: `_decrypt_chat_rows` decrypts a V2 prompt tail one row at a
 time, so a `httpx.Client` built per call meant one TCP connect + TLS handshake
-per chat message — 60 handshakes for a full `FEEDLING_V2_TAIL_HARD_CAP` window,
+per chat message — 60 handshakes for the former 60-row prompt window,
 measured at ~82ms each on test. These tests pin the pooling contract: one client
 per process, rebuilt after fork, with each call still choosing its own timeout.
 """

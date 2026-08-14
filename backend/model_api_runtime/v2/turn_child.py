@@ -25,7 +25,7 @@ Python 循环 import。函数体内 import 在 `_serve()` 真正被调用时才�
 `serve_worker` 模块早已加载完毕，没有这个风险。
 
 **progress pipe 有两类信号**：`loop_heartbeat` 每 5s 证明 event loop 还能调度；slot
-`progress` 则只在 claim/idle/turn 内真实 provider、tool、compaction 边界发送，并携带固定
+`progress` 则只在 claim/idle/turn 内真实 provider、tool、Capture 边界发送，并携带固定
 `turn_start`。父进程分别维护 loop age、slot age、active-turn stall age 与 absolute age。
 所以同步阻塞会让 loop heartbeat 变旧；卡在一个永不返回的 async await 会让该 slot 的 stall
 age 变旧（即使 loop heartbeat 仍新鲜）；合法的 60/90s provider 调用、多轮工具循环和 600s
@@ -106,7 +106,7 @@ async def _event_loop_heartbeat(
     * a synchronous event-loop block stops this heartbeat and trips the short
       pool-wide liveness watchdog;
     * an ``await`` that never returns leaves the loop heartbeat healthy, but
-      its slot stops crossing provider/tool/compaction boundaries and trips
+      its slot stops crossing provider/tool/Capture boundaries and trips
       the per-turn stall watchdog.
 
     Keeping them separate also prevents a normal 60-second async provider wait

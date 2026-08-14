@@ -7319,7 +7319,7 @@ def chat_load_strict(user_id: str) -> list[dict]:
 def chat_load_recent_strict(user_id: str, limit: int) -> list[dict]:
     """Load only the newest ``limit`` durable rows, returned oldest-to-newest.
 
-    The durable table is intentionally unbounded by prompt compaction. This
+    The durable table is intentionally unbounded by prompt replay. This
     bounded API is the process-cache boundary; it replaces the old design where
     the same limit was enforced by physically deleting source messages.
     """
@@ -7717,10 +7717,9 @@ def chat_max_user_seq_between(
 ) -> int:
     """Highest user-input seq in one closed prompt frontier, or ``0``.
 
-    This is the metadata-only companion to the decrypted prompt readers.  It
-    lets wake/chat cursor arbitration detect unanswered input even when that
-    row has already moved behind the encrypted-summary watermark and therefore
-    is no longer present in the verbatim tail.
+    This is the metadata-only companion to the bounded prompt readers. It lets
+    wake/chat cursor arbitration detect unanswered input without decrypting
+    rows merely to locate the newest user sequence.
     """
     lower = int(after_seq)
     upper = int(through_seq)
@@ -7738,7 +7737,7 @@ def chat_max_user_seq_between(
     return int(row[0]) if row and row[0] is not None else 0
 
 
-_CHAT_COVERAGE_SOURCE_PREDICATE = (
+_CHAT_CAPTURE_SOURCE_PREDICATE = (
     "COALESCE(doc->>'source','') "
     "NOT IN ('verify_ping','resident_maintenance')"
 )
@@ -7783,15 +7782,9 @@ def chat_messages_after_seq(
         predicate += " AND seq <= %s"
         params.append(upper_seq)
     if exclude_synthetic_sources:
-        # Summary-coverage callers only. `verify_ping`/`resident_maintenance`
-        # rows are GC-able (a verify_ping is deleted once verify_loop completes,
-        # see core/store.py), so folding one into an immutable leaf leaves a
-        # coverage claim over a seq that later vanishes — the permanent
-        # `v2_summary_frontier_integrity_error` brick. The gap counter
-        # (count_messages_after_seq) and both frontier witnesses
-        # (jobs_store.get_summary_frontier_state / append_summary_leaf_cas)
-        # exclude the SAME set, so coverage stays consistent under GC.
-        predicate += f" AND {_CHAT_COVERAGE_SOURCE_PREDICATE}"
+        # Capture must not disclose synthetic verify/maintenance rows to the
+        # user's configured model provider.
+        predicate += f" AND {_CHAT_CAPTURE_SOURCE_PREDICATE}"
     with get_pool().connection() as conn:
         if limit is None:
             rows = conn.execute(
@@ -7825,56 +7818,6 @@ def chat_messages_after_seq(
         for r in rows
     ]
 
-
-def chat_coverage_bounds_after_seq(
-    user_id: str,
-    after_seq: int,
-    *,
-    limit: int,
-    through_seq: int | None = None,
-) -> tuple[int, int, int]:
-    """Return exact bounds/count for one oldest metadata-only coverage batch.
-
-    This is the plaintext-free sibling of ``chat_messages_after_seq`` used by
-    deterministic V2 coverage accounting.  Its eligible-row predicate is
-    deliberately identical to ``_read_compaction_tail_after_seq``: GC-able
-    ``verify_ping`` and ``resident_maintenance`` rows can never enter an
-    immutable coverage claim.
-    """
-
-    cursor_seq = int(after_seq)
-    bounded = int(limit)
-    upper_seq = int(through_seq) if through_seq is not None else None
-    if cursor_seq < 0:
-        raise ValueError("after_seq must be >= 0")
-    if bounded <= 0:
-        return 0, 0, 0
-    if upper_seq is not None and upper_seq < 0:
-        raise ValueError("through_seq must be >= 0")
-    if upper_seq is not None and upper_seq <= cursor_seq:
-        return 0, 0, 0
-
-    predicate = (
-        "WHERE user_id=%s AND seq>%s "
-        f"AND {_CHAT_COVERAGE_SOURCE_PREDICATE} "
-    )
-    params: list = [str(user_id), cursor_seq]
-    if upper_seq is not None:
-        predicate += "AND seq<=%s "
-        params.append(upper_seq)
-    with get_pool().connection() as conn:
-        row = conn.execute(
-            "WITH selected AS ("
-            " SELECT seq FROM chat_messages "
-            + predicate
-            + "ORDER BY seq ASC LIMIT %s"
-            ") SELECT COALESCE(MIN(seq),0),COALESCE(MAX(seq),0),COUNT(*) "
-            "FROM selected",
-            (*params, bounded),
-        ).fetchone()
-    if not row:
-        return 0, 0, 0
-    return int(row[0] or 0), int(row[1] or 0), int(row[2] or 0)
 
 
 def chat_recent_turn_rows(
@@ -8050,11 +7993,9 @@ def count_messages_after_seq(
     (``max_seq - after_seq``) has no fixed relationship to how many of this
     user's OWN rows actually fall in that span — it can vastly overcount
     (mostly other users' rows) while the true per-user count stays small.
-    Used by V2 worker's D6 prompt-coverage gap detection
-    (``worker._prompt_coverage_gap``), which must compare against
-    ``tail_limit`` using a real per-user count, not a global-seq guess — a
-    one-shot ``COUNT(*)`` on the existing ``(user_id, seq)`` index, exactly
-    as cheap as :func:`chat_max_seq`."""
+    Used by metadata-only callers that need an exact per-user count rather
+    than a global-sequence span — a one-shot ``COUNT(*)`` on the existing
+    ``(user_id, seq)`` index, exactly as cheap as :func:`chat_max_seq`."""
     upper = int(through_seq) if through_seq is not None else None
     if upper is not None and upper <= int(after_seq):
         return 0
@@ -8064,10 +8005,8 @@ def count_messages_after_seq(
         predicate += " AND seq <= %s"
         params.append(upper)
     if exclude_synthetic_sources:
-        # See chat_messages_after_seq: coverage gap detection must not count
-        # GC-able synthetic rows, or it would demand folding a row that
-        # verify_loop is about to delete (permanent frontier corruption).
-        predicate += f" AND {_CHAT_COVERAGE_SOURCE_PREDICATE}"
+        # Keep this predicate identical to the Capture reader.
+        predicate += f" AND {_CHAT_CAPTURE_SOURCE_PREDICATE}"
     with get_pool().connection() as conn:
         row = conn.execute(
             f"SELECT COUNT(*) FROM chat_messages {predicate}",
@@ -8133,11 +8072,8 @@ def chat_genuine_turn_count_after_seq(
 
 def chat_seq_for_msg_id(user_id: str, msg_id: str) -> int | None:
     """Exact ``seq`` for one message (its real primary-key identity), or
-    ``None`` if the user has no such row. Used by V2 compaction (worker.py
-    ``_run_compaction``) to attach the precise seq of the last-folded tail
-    row to the summary's new watermark — a direct-by-id lookup rather than a
-    ts-range query so it is exact even under same-``ts`` ties (see
-    :func:`chat_max_seq`)."""
+    ``None`` if the user has no such row. This direct-by-id lookup stays exact
+    under same-``ts`` ties (see :func:`chat_max_seq`)."""
     with get_pool().connection() as conn:
         row = conn.execute(
             "SELECT seq FROM chat_messages WHERE user_id = %s AND msg_id = %s",
@@ -8145,26 +8081,6 @@ def chat_seq_for_msg_id(user_id: str, msg_id: str) -> int | None:
         ).fetchone()
     return int(row[0]) if row is not None else None
 
-
-def seq_for_watermark_ts(user_id: str, watermark_ts: float) -> int:
-    """Conservative one-time ts->seq translation for a LEGACY summary
-    watermark that only carries ``watermark_ts`` (``v2_conversation_summary
-    .watermark_seq`` still at its migration default of 0 — see migration
-    0031). Strictly-less (``ts < watermark_ts``), never ``<=``: a summary's
-    ``watermark_ts`` marks how far compaction has folded, but with only a
-    ts we cannot tell whether a row exactly AT that ts was itself folded in
-    (same-ts ties — see :func:`chat_max_seq`), so this under-approximates
-    the covered seq range on purpose. That is the same conservative
-    direction the GC coverage gate/retention boundary already takes (never
-    treat a possibly-uncovered row as covered). Returns 0 (covers nothing)
-    when there is no row strictly before ``watermark_ts``."""
-    with get_pool().connection() as conn:
-        row = conn.execute(
-            "SELECT COALESCE(MAX(seq), 0) FROM chat_messages "
-            "WHERE user_id = %s AND ts < %s",
-            (user_id, watermark_ts),
-        ).fetchone()
-    return int(row[0]) if row and row[0] is not None else 0
 
 
 def _is_chat_file_pointer(doc) -> bool:
@@ -9085,7 +9001,7 @@ def _chat_insert_on_cursor(
     ``max_messages`` and ``coverage_gated`` remain in the
     signature only for source compatibility with legacy callers. They never
     authorize deletion. Conversation summaries and their watermarks are derived
-    prompt indexes, not retention proofs; compaction must not destroy the raw
+    prompt indexes, not retention proofs; derived state must not destroy the raw
     encrypted transcript or an attached R2 body. Hot process memory is bounded
     independently by :func:`chat_load_recent_strict` and ``UserStore``.
 

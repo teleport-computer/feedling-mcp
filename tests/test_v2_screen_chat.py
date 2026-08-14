@@ -124,7 +124,7 @@ def test_frame_message_is_tagged_untrusted_and_has_absolute_and_relative_time():
 
 
 def test_empty_screen_message_keeps_prompt_byte_identical():
-    kwargs = dict(system_prompt="system", summary="", tail=[{"role": "user", "content": "hi"}])
+    kwargs = dict(system_prompt="system", tail=[{"role": "user", "content": "hi"}])
 
     before = context.build_turn_messages(**kwargs)
     after = context.build_turn_messages(**kwargs, screen_frame_message=None)

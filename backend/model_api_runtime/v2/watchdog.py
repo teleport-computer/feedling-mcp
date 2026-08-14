@@ -74,7 +74,7 @@ def should_kill(
         queue guard stops an idle pool from being killed;
     (d) `current_turn_stall_age_sec` exceeds `turn_stall_timeout_sec`.  The
         child refreshes this clock at real in-turn boundaries (provider round,
-        tool batch, prompt-compaction batch), so this catches one permanently
+        tool batch, Capture batch), so this catches one permanently
         wedged slot even while sibling slots and the child event loop remain
         healthy.  Critically, it does *not* kill a long turn merely because its
         absolute age crossed the old 180-second ceiling.

@@ -13,7 +13,6 @@ BACKEND = Path(__file__).parent.parent / "backend"
 sys.path.insert(0, str(BACKEND))
 
 import db  # noqa: E402
-from model_api_runtime.v2 import jobs_store  # noqa: E402
 
 from conftest import seed_user  # noqa: E402
 
@@ -251,14 +250,13 @@ def test_backfill_is_conservative_at_same_timestamp_and_monotonic():
     seq_after = db.chat_seq_for_msg_id(uid, "after")
     assert seq_before is not None and seq_tie_b is not None and seq_after is not None
 
-    assert jobs_store.upsert_summary_row_cas(
-        uid,
-        summary_envelope={"plaintext": "legacy"},
-        watermark_ts=3.0,
-        watermark_seq=0,
-        expected_version=0,
-    )
     with db.get_pool().connection() as conn:
+        conn.execute(
+            "INSERT INTO v2_conversation_summary "
+            "(user_id,summary_envelope,watermark_ts,watermark_seq,version) "
+            "VALUES (%s,%s::jsonb,3.0,0,1)",
+            (uid, '{"plaintext":"legacy"}'),
+        )
         conn.execute(
             "INSERT INTO runtime_state (user_id, state_json) VALUES (%s, %s::jsonb) "
             "ON CONFLICT (user_id) DO UPDATE SET state_json=EXCLUDED.state_json",
@@ -266,8 +264,12 @@ def test_backfill_is_conservative_at_same_timestamp_and_monotonic():
         )
         conn.execute(_migration_module()._UP)
 
-    summary = jobs_store.get_summary_row(uid)
-    assert summary["watermark_seq"] == seq_tie_b
+    with db.get_pool().connection() as conn:
+        watermark_seq = conn.execute(
+            "SELECT watermark_seq FROM v2_conversation_summary WHERE user_id=%s",
+            (uid,),
+        ).fetchone()[0]
+    assert watermark_seq == seq_tie_b
     assert db.get_blob(uid, "model_api_runtime")["v2_reply_cursor_seq"] == seq_before
 
     # Re-running the migration cannot regress a cursor already advanced by a

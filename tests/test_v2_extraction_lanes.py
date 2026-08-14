@@ -64,7 +64,7 @@ def _deps(**over):
                 "content": "我换工作了",
             }
         ],
-        read_compaction_tail_after_seq=lambda uid, after, limit, **kw: [
+        read_capture_tail_after_seq=lambda uid, after, limit, **kw: [
             {
                 "id": "m1",
                 "seq": 1,
@@ -546,7 +546,7 @@ def test_extraction_reads_go_through_the_enclave_semaphore(monkeypatch):
     monkeypatch.setattr(extraction, "extract", _empty)
     deps = _deps(
         read_memory_context=_ctx,
-        read_compaction_tail_after_seq=_tail,
+        read_capture_tail_after_seq=_tail,
     )
 
     status = asyncio.run(worker.process_job(
@@ -572,7 +572,7 @@ def test_capture_all_non_live_batch_advances_without_provider(monkeypatch):
 
     monkeypatch.setattr(extraction, "extract", _provider_forbidden)
     deps = _deps(
-        read_compaction_tail_after_seq=lambda *_args, **_kwargs: [
+        read_capture_tail_after_seq=lambda *_args, **_kwargs: [
             {
                 "id": "verify-1",
                 "seq": 1,
@@ -627,7 +627,7 @@ def test_capture_mixed_batch_discloses_only_live_rows(monkeypatch):
 
     monkeypatch.setattr(extraction, "extract", _capture)
     deps = _deps(
-        read_compaction_tail_after_seq=lambda *_args, **_kwargs: [
+        read_capture_tail_after_seq=lambda *_args, **_kwargs: [
             {
                 "id": "import-1",
                 "seq": 1,
@@ -680,7 +680,7 @@ def test_empty_capture_successor_completes_without_backoff_or_provider(monkeypat
     assert asyncio.run(
         worker.process_job(
             job,
-            _deps(read_compaction_tail_after_seq=lambda *_a, **_k: []),
+            _deps(read_capture_tail_after_seq=lambda *_a, **_k: []),
             provider_config=_BYOK,
             api_key=None,
             runtime_token="rt",

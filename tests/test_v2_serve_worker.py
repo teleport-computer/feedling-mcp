@@ -15,7 +15,6 @@ from model_api_runtime.v2 import (
     jobs_store,
     reaper as v2_reaper,
     serve_worker,
-    summary_frontier as v2_summary_frontier,
     worker,
 )
 
@@ -426,8 +425,7 @@ def test_mcp_call_timeout_must_leave_watchdog_stall_margin():
 
 def test_chat_absolute_budget_includes_bounded_mcp_turn_allowance():
     expected = (
-        worker._PROMPT_CATCHUP_DEADLINE_SEC
-        + worker._TURN_MAX_LLM_CALLS * (2.0 * 60.0)
+        worker._TURN_MAX_LLM_CALLS * (2.0 * 60.0)
         + worker.MCP_TURN_WALL_BUDGET_SEC
         + 120.0
     )
@@ -543,9 +541,8 @@ def test_build_production_deps_returns_turndeps(monkeypatch):
     assert not hasattr(deps, "record_turn_metric")
     assert callable(deps.mint_enclave_token)
     assert callable(deps.read_tail_after_seq)
-    assert callable(deps.read_compaction_tail_after_seq)
+    assert callable(deps.read_capture_tail_after_seq)
     assert callable(deps.read_temporal_snapshot)
-    assert callable(deps.read_summary_with_seq)
     assert callable(deps.has_genuine_user_history)
     assert callable(deps.emit_debug_trace)
     monkeypatch.setattr(
@@ -974,7 +971,7 @@ def test_seq_tail_readers_request_exact_oldest_and_newest_windows(monkeypatch):
     assert serve_worker._read_tail_after_seq(
         "u", 20, 2, through_seq=25,
     )[0]["seq"] == 21
-    assert serve_worker._read_compaction_tail_after_seq(
+    assert serve_worker._read_capture_tail_after_seq(
         "u", 20, 3, through_seq=26,
     )[0]["seq"] == 21
     assert calls == [
@@ -1053,7 +1050,7 @@ def test_read_messages_carries_id_and_ts_and_seq_for_coalesce(client, backend_en
     # Multimodal round: image rows additionally carry non-sensitive `has_image`/`image_mime`
     # markers so worker._inject_tail_images can find them. `content` stays TEXT here (no
     # caption envelope on this synthetic row -> the "[image]" placeholder); bytes never
-    # enter this read path, because compaction shares it.
+    # enter this read path; Capture uses a separate oldest-first reader.
     assert messages == [{
         "id": "m_synthetic_1", "ts": 12345.0, "seq": seq, "role": "user", "content": "[image]",
         "has_image": True, "image_mime": "image/jpeg",
@@ -1392,263 +1389,6 @@ def test_read_tail_caps_to_limit(monkeypatch):
 # ------------------------------------------------------------------
 # Summary compatibility rendering from the segmented metadata frontier.
 # ------------------------------------------------------------------
-
-def test_read_summary_missing_returns_empty(monkeypatch):
-    """No row yet for this user (never compressed) -> ("", 0.0, 0), no enclave
-    round trip attempted."""
-    from model_api_runtime.v2 import jobs_store as v2_jobs_store
-
-    monkeypatch.setattr(v2_jobs_store, "get_summary_frontier_state", lambda uid: None)
-
-    assert serve_worker._read_summary_with_seq("u_summary_test") == ("", 0.0, 0, 0)
-
-
-def test_read_summary_decrypts_present_row(monkeypatch):
-    from core import enclave as core_enclave
-    from model_api_runtime.v2 import jobs_store as v2_jobs_store
-
-    monkeypatch.setattr(
-        v2_jobs_store, "get_summary_frontier_state",
-        lambda uid: {"summary_envelope": {"body_ct": "x"}, "watermark_ts": 7.0,
-                     "watermark_seq": 19, "version": 3})
-    monkeypatch.setattr(
-        core_enclave, "_decrypt_envelope_via_enclave",
-        lambda envelope, key, *, purpose, runtime_token="": b"- prior chat")
-
-    assert serve_worker._read_summary_with_seq("u_summary_test") == (
-        "- prior chat", 7.0, 3, 19,
-    )
-
-
-def test_persona_and_summary_decrypts_declare_trace_scopes(monkeypatch):
-    from model_api_runtime.v2 import jobs_store as v2_jobs_store
-
-    scopes = []
-
-    @contextmanager
-    def record_scope(purpose):
-        scopes.append(purpose)
-        yield
-
-    monkeypatch.setattr(
-        serve_worker.core_enclave,
-        "coalesced_success_trace",
-        record_scope,
-    )
-    monkeypatch.setattr(
-        serve_worker.db,
-        "get_blob",
-        lambda *_args: {"content_envelope": {"body_ct": "persona"}},
-    )
-    monkeypatch.setattr(
-        v2_jobs_store,
-        "get_summary_frontier_state",
-        lambda _uid: {
-            "summary_envelope": {"body_ct": "summary"},
-            "watermark_ts": 0.0,
-            "watermark_seq": 0,
-            "version": 1,
-        },
-    )
-    monkeypatch.setattr(serve_worker, "_mint_runtime_token", lambda _uid: "rt")
-    monkeypatch.setattr(
-        serve_worker.core_enclave,
-        "_decrypt_envelope_via_enclave",
-        lambda envelope, *_args, **_kwargs: str(envelope["body_ct"]).encode(),
-    )
-
-    persona = serve_worker._load_genesis_persona(
-        types.SimpleNamespace(user_id="u-scopes"),
-        runtime_token="rt",
-    )
-    summary = serve_worker._read_summary_with_seq("u-scopes")
-
-    assert persona == "persona"
-    assert summary == ("summary", 0.0, 1, 0)
-    assert scopes == ["genesis_persona", "v2_summary_read"]
-
-
-@pytest.mark.parametrize(
-    "watermark_ts,watermark_seq",
-    [(4.0, 0), (0.0, 19)],
-)
-def test_read_summary_nonzero_watermark_without_envelope_fails_closed(
-    monkeypatch, watermark_ts, watermark_seq,
-):
-    """Coverage must never advance unless its encrypted summary is readable."""
-    from core import enclave as core_enclave
-    from model_api_runtime.v2 import jobs_store as v2_jobs_store
-
-    monkeypatch.setattr(
-        v2_jobs_store, "get_summary_frontier_state",
-        lambda uid: {
-            "summary_envelope": None,
-            "watermark_ts": watermark_ts,
-            "watermark_seq": watermark_seq,
-            "version": 1,
-        },
-    )
-
-    def _boom(*a, **k):
-        raise AssertionError("must not decrypt when summary_envelope is empty")
-
-    monkeypatch.setattr(core_enclave, "_decrypt_envelope_via_enclave", _boom)
-
-    with pytest.raises(v2_summary_frontier.SummaryFrontierIntegrityError):
-        serve_worker._read_summary_with_seq("u_summary_test")
-
-
-def test_read_summary_nonzero_watermark_with_empty_plaintext_fails_closed(monkeypatch):
-    from core import enclave as core_enclave
-    from model_api_runtime.v2 import jobs_store as v2_jobs_store
-
-    monkeypatch.setattr(
-        v2_jobs_store, "get_summary_frontier_state",
-        lambda uid: {
-            "summary_envelope": {"body_ct": "x"},
-            "watermark_ts": 7.0,
-            "watermark_seq": 19,
-            "version": 3,
-        },
-    )
-    monkeypatch.setattr(
-        core_enclave, "_decrypt_envelope_via_enclave",
-        lambda envelope, key, *, purpose, runtime_token="": b" \n\t",
-    )
-
-    with pytest.raises(v2_summary_frontier.SummaryFrontierIntegrityError):
-        serve_worker._read_summary_with_seq("u_summary_test")
-
-
-def test_canonical_summary_decrypt_rejection_is_integrity_failure(monkeypatch):
-    from core import enclave as core_enclave
-
-    def _rejected(*_args, **_kwargs):
-        raise RuntimeError(
-            'enclave_http_403:{"error":"decrypt_failed: ciphertext invalid"}'
-        )
-
-    monkeypatch.setattr(core_enclave, "_decrypt_envelope_via_enclave", _rejected)
-    with pytest.raises(
-        v2_summary_frontier.SummaryFrontierIntegrityError
-    ) as caught:
-        serve_worker._decrypt_summary_text(
-            {"body_ct": "broken"},
-            runtime_token="rt",
-            purpose="v2_summary_read",
-        )
-    assert caught.value.detail == "canonical_summary_decrypt_failed"
-
-
-def test_canonical_summary_transient_enclave_failure_remains_retryable(monkeypatch):
-    from core import enclave as core_enclave
-
-    def _unavailable(*_args, **_kwargs):
-        raise RuntimeError('enclave_http_503:{"error":"not_ready"}')
-
-    monkeypatch.setattr(core_enclave, "_decrypt_envelope_via_enclave", _unavailable)
-    with pytest.raises(RuntimeError, match="^enclave_http_503") as caught:
-        serve_worker._decrypt_summary_text(
-            {"body_ct": "valid"},
-            runtime_token="rt",
-            purpose="v2_summary_read",
-        )
-    assert not isinstance(
-        caught.value, v2_summary_frontier.SummaryFrontierIntegrityError
-    )
-
-
-def test_read_summary_zero_watermark_without_envelope_is_valid(monkeypatch):
-    from core import enclave as core_enclave
-    from model_api_runtime.v2 import jobs_store as v2_jobs_store
-
-    monkeypatch.setattr(
-        v2_jobs_store, "get_summary_frontier_state",
-        lambda uid: {
-            "summary_envelope": None,
-            "watermark_ts": 0.0,
-            "watermark_seq": 0,
-            "version": 1,
-        },
-    )
-
-    def _boom(*a, **k):
-        raise AssertionError("zero-coverage state must not call the enclave")
-
-    monkeypatch.setattr(core_enclave, "_decrypt_envelope_via_enclave", _boom)
-
-    assert serve_worker._read_summary_with_seq("u_summary_test") == ("", 0.0, 1, 0)
-
-
-def test_read_segmented_summary_requires_exact_materialized_id_binding(monkeypatch):
-    from core import enclave as core_enclave
-    from model_api_runtime.v2 import jobs_store as v2_jobs_store
-
-    monkeypatch.setattr(
-        v2_jobs_store,
-        "get_summary_frontier_state",
-        lambda uid: {
-            "summary_envelope": {"body_ct": "authentic-but-stale"},
-            "watermark_ts": 1.0,
-            "watermark_seq": 10,
-            "version": 2,
-            "materialized_segment_ids": (999,),
-            "has_segment_rows": True,
-            "first_source_seq": 10,
-            "covered_source_count": 1,
-            "segments": [{
-                "segment_id": 1,
-                "coverage_kind": "exact",
-                "level": 0,
-                "start_seq": 10,
-                "end_seq": 10,
-                "source_message_count": 1,
-                "legacy_opaque_through_seq": 0,
-                "child_segment_ids": [],
-                "summary_envelope": {"body_ct": "leaf"},
-            }],
-        },
-    )
-
-    def _boom(*args, **kwargs):
-        raise AssertionError("mismatched head must fail before decrypt")
-
-    monkeypatch.setattr(core_enclave, "_decrypt_envelope_via_enclave", _boom)
-    with pytest.raises(
-        RuntimeError, match="^v2_summary_frontier_integrity_error$"
-    ):
-        serve_worker._read_summary_with_seq("u_summary_test")
-
-
-def test_read_segmented_summary_rejects_bound_ids_without_canonical_rows(monkeypatch):
-    from core import enclave as core_enclave
-    from model_api_runtime.v2 import jobs_store as v2_jobs_store
-
-    monkeypatch.setattr(
-        v2_jobs_store,
-        "get_summary_frontier_state",
-        lambda uid: {
-            "summary_envelope": {"body_ct": "orphaned-head"},
-            "watermark_ts": 1.0,
-            "watermark_seq": 10,
-            "version": 2,
-            "materialized_segment_ids": (),
-            "has_segment_rows": True,
-            "first_source_seq": 10,
-            "covered_source_count": 1,
-            "segments": [],
-        },
-    )
-
-    def _boom(*args, **kwargs):
-        raise AssertionError("orphaned head must fail before decrypt")
-
-    monkeypatch.setattr(core_enclave, "_decrypt_envelope_via_enclave", _boom)
-    with pytest.raises(
-        RuntimeError, match="^v2_summary_frontier_integrity_error$"
-    ):
-        serve_worker._read_summary_with_seq("u_summary_test")
-
 
 
 def test_fire_scheduled_for_user_enqueues_a_scheduled_agent_job(monkeypatch, backend_env):

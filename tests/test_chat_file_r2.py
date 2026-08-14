@@ -23,7 +23,6 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 import db  # noqa: E402
 import object_storage  # noqa: E402
 from chat import service as chat_service  # noqa: E402
-from model_api_runtime.v2 import jobs_store  # noqa: E402
 
 from conftest import seed_user  # noqa: E402
 from test_frame_r2 import _FakeS3  # noqa: E402  reuse the fake S3
@@ -1134,7 +1133,7 @@ def test_resident_unlinked_message_offloads_and_preserves_prior_body(
     assert set(client.store) == {(_BUCKET, evicted_key), (_BUCKET, message_key)}
 
 
-def test_v2_atomic_reply_preserves_covered_r2_body(backend_env, monkeypatch):
+def test_v2_atomic_reply_preserves_prior_r2_body(backend_env, monkeypatch):
     client = _FakeS3()
     _enable_r2(monkeypatch, client)
     uid = _uid()
@@ -1149,16 +1148,8 @@ def test_v2_atomic_reply_preserves_covered_r2_body(backend_env, monkeypatch):
         {"id": parent, "role": "user", "body_ct": "question"},
         100,
     )
-    evicted_seq = db.chat_seq_for_msg_id(uid, evicted)
     parent_seq = db.chat_seq_for_msg_id(uid, parent)
-    assert evicted_seq is not None and parent_seq is not None
-    assert jobs_store.upsert_summary_row_cas(
-        uid,
-        summary_envelope={"body_ct": "summary"},
-        watermark_ts=1.0,
-        watermark_seq=evicted_seq,
-        expected_version=0,
-    )
+    assert parent_seq is not None
 
     db.chat_append_effect_with_cursor(
         uid,
@@ -1184,15 +1175,6 @@ def test_v2_atomic_send_offloads_and_preserves_prior_body(
     evicted, message = uuid.uuid4().hex, uuid.uuid4().hex
     db.chat_append(uid, evicted, 1.0, _image_doc(uid, evicted), 100)
     evicted_key = _body_key(uid, evicted)
-    evicted_seq = db.chat_seq_for_msg_id(uid, evicted)
-    assert evicted_seq is not None
-    assert jobs_store.upsert_summary_row_cas(
-        uid,
-        summary_envelope={"body_ct": "summary"},
-        watermark_ts=1.0,
-        watermark_seq=evicted_seq,
-        expected_version=0,
-    )
     message_doc = _file_doc(uid, message, b"v2-atomic-send-file")
 
     _seq, job_id = db.chat_append_and_enqueue(

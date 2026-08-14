@@ -42,7 +42,7 @@ async def _run_native_turn(provider_config, content):
     return await tool_loop.run_tool_loop(
         provider_config=provider_config,
         build_messages=lambda _transcript: context.build_turn_messages(
-            system_prompt="test", summary="", tail=[{"role": "user", "content": content}]),
+            system_prompt="test", tail=[{"role": "user", "content": content}]),
         dispatch_tools=_dispatch,
         on_reply=_reply,
         fold_new_messages=_fold,

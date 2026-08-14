@@ -366,7 +366,6 @@ def test_p0_mid_turn_fold_no_restart_no_debounce(monkeypatch):
         mint_enclave_token=lambda uid: "rt-enclave",
         apply_pending_effects=_apply_effects,
         read_messages_since=lambda uid, since_ts: list(live_rows["rows"]),
-        read_summary_with_seq=lambda _uid: ("", 0.0, 0, 0),
         read_tail_after_seq=lambda *_args, **_kwargs: [msg_a],
     )
 

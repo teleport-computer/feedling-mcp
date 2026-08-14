@@ -96,7 +96,7 @@ def _apply_effects(user_id):
     return v2_effect_outbox.apply_pending_effects(user_id, dispatch=_reply_effect_dispatch(user_id))
 
 
-def _wake_deps(*, summary="", tail=None):
+def _wake_deps(*, tail=None):
     return worker.TurnDeps(
         read_messages=lambda uid: [],
         resolve_provider=lambda uid: (_BYOK, {}),

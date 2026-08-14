@@ -628,7 +628,7 @@ def test_worker_keeps_opt_out_fenced_for_complete_async_provider_call(monkeypatc
             "last_captured_until_seq": 0,
             "capture_seq_initialized": True,
         },
-        read_compaction_tail_after_seq=lambda *_args, **_kwargs: [
+        read_capture_tail_after_seq=lambda *_args, **_kwargs: [
             {
                 "id": "m1",
                 "seq": 1,
@@ -760,7 +760,7 @@ def test_capture_guard_does_not_occupy_saturated_default_executor(monkeypatch):
             "last_captured_until_seq": 0,
             "capture_seq_initialized": True,
         },
-        read_compaction_tail_after_seq=lambda *_args, **_kwargs: [
+        read_capture_tail_after_seq=lambda *_args, **_kwargs: [
             {
                 "id": "m1",
                 "seq": 1,
@@ -876,7 +876,7 @@ def test_capture_keepalive_failure_cancels_and_drains_before_opt_out(
             "last_captured_until_seq": 0,
             "capture_seq_initialized": True,
         },
-        read_compaction_tail_after_seq=lambda *_args, **_kwargs: [
+        read_capture_tail_after_seq=lambda *_args, **_kwargs: [
             {
                 "id": "m1",
                 "seq": 1,
@@ -1395,7 +1395,7 @@ def test_prepared_retry_commits_before_provider_or_enclave(monkeypatch):
             AssertionError("token mint ran before prepared recovery")
         ),
         read_capture_state=lambda _uid: db.get_blob_strict(_uid, "capture_state") or {},
-        read_compaction_tail_after_seq=lambda *_a, **_k: (_ for _ in ()).throw(
+        read_capture_tail_after_seq=lambda *_a, **_k: (_ for _ in ()).throw(
             AssertionError("enclave reader ran before prepared recovery")
         ),
         build_memory_envelope=lambda *_a: (_ for _ in ()).throw(

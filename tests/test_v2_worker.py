@@ -21,7 +21,6 @@ import provider_client
 from provider_types import ToolExchange
 from capabilities import registry as cap_registry
 from core import store as core_store
-from model_api_runtime.v2 import compaction as v2_compaction
 from model_api_runtime.v2 import cursor as v2_cursor
 from model_api_runtime.v2 import effect_outbox as v2_effect_outbox
 from model_api_runtime.v2 import jobs_store
@@ -88,9 +87,6 @@ def test_prompt_frontier_failures_use_stable_content_free_status_codes():
     assert worker._turn_failure_error_class(unconfigured) == "unknown"
     assert worker._turn_failure_error_class(exhausted) == "context_overflow"
     assert worker._turn_failure_error_class(unaudited_exhausted) == "unknown"
-    assert worker._turn_failure_error_class(
-        worker.TurnError("prompt_coverage_incomplete:reply_empty")
-    ) == "unknown"
     assert worker._safe_failure_code(
         "turn_failed", worker.v2_tool_loop.ProviderEmptyReply("empty_reply")
     ) == "turn_failed:empty_reply"
@@ -996,57 +992,6 @@ def test_run_turn_provider_resolve_failure_emits_error_status_and_callback(monke
     assert settled == [(uid, "m-provider", "provider_unavailable")]
 
 
-def test_run_turn_maintenance_bypasses_provider_and_runtime_token(monkeypatch):
-    uid = "u_w_maint_metadata_only"
-    conftest.seed_user(uid)
-    _reset(uid)
-    job_id, _ = jobs_store.enqueue_job(uid, "maintenance", reason="compaction")
-    job = jobs_store.claim_next_job("w")
-
-    monkeypatch.setattr(jobs_store, "get_summary_row", lambda _uid: None)
-
-    async def _unsummarized(_uid, watermark_seq, **_kwargs):
-        return worker._TAIL_KEEP + 1 if watermark_seq == 0 else 0
-
-    monkeypatch.setattr(worker, "_unsummarized_count", _unsummarized)
-    monkeypatch.setattr(
-        worker.db,
-        "chat_coverage_bounds_after_seq",
-        lambda *_args, **_kwargs: (1, 1, 1),
-    )
-    monkeypatch.setattr(
-        worker.db,
-        "count_messages_after_seq",
-        lambda *_args, **_kwargs: 1,
-    )
-
-    writes = []
-
-    def _append(_uid, segment_text, **kwargs):
-        writes.append((segment_text, kwargs))
-        return True
-
-    def _provider_boom(_uid):
-        raise AssertionError("maintenance resolved provider")
-
-    def _token_boom(_uid):
-        raise AssertionError("maintenance minted runtime token")
-
-    deps = worker.TurnDeps(
-        read_messages=lambda _uid: [],
-        resolve_provider=_provider_boom,
-        mint_enclave_token=_token_boom,
-        append_summary_segment=_append,
-        read_summary_frontier_metadata=lambda _uid: None,
-        runtime_mode_enabled=lambda _uid: True,
-    )
-
-    status = asyncio.run(worker._run_turn(job, deps))
-
-    assert status == "completed"
-    assert _job_status(job_id)[0] == "completed"
-    assert writes == []
-
 
 def test_run_turn_heartbeat_resolve_failure_is_silent_no_user_error(monkeypatch):
     """Weak wake lanes remain silent when provider resolution fails.
@@ -1422,11 +1367,10 @@ def test_reserved_lane_slots_reserved_zero_means_all_unrestricted():
 
 # ------------------------------------------------------------------
 # Worker dispatch by lane — legacy plaintext tail callbacks must not revive
-# semantic prompt construction or semantic compaction scheduling.
+# prompt construction or background maintenance production.
 # ------------------------------------------------------------------
 
-def test_process_job_legacy_tail_cannot_drive_prompt_or_compaction(monkeypatch):
-    """A legacy plaintext tail cannot revive semantic prompt/compaction logic."""
+def test_process_job_legacy_tail_is_ignored_and_produces_no_maintenance(monkeypatch):
     uid = "u_w_compact_enqueue"
     conftest.seed_user(uid)
     _reset(uid)
@@ -1438,7 +1382,7 @@ def test_process_job_legacy_tail_cannot_drive_prompt_or_compaction(monkeypatch):
 
     big_tail = [
         {"id": f"m{i}", "ts": float(i), "role": "user" if i % 2 == 0 else "openclaw", "content": f"msg {i}"}
-        for i in range(worker._TAIL_BUDGET + 5)
+        for i in range(45)
     ]
     calls = _script_provider(monkeypatch, [_text_round("REPLY")])
 
@@ -1469,42 +1413,6 @@ def test_process_job_legacy_tail_cannot_drive_prompt_or_compaction(monkeypatch):
     assert "msg 0" not in joined
     assert (uid, "maintenance", "compaction") not in enqueue_calls
 
-
-def test_process_job_reply_skips_compaction_enqueue_when_under_budget(monkeypatch):
-    """Symmetric negative case: a short tail (under `_TAIL_BUDGET`) must NOT
-    trigger a maintenance enqueue."""
-    uid = "u_w_compact_skip"
-    conftest.seed_user(uid)
-    _reset(uid)
-    job_id, _ = jobs_store.enqueue_job(uid, "chat")
-    job = jobs_store.claim_next_job("w")
-
-    monkeypatch.setattr(cap_registry, "run_capability", lambda *a, **k: _FakeCapResult({}))
-    monkeypatch.setattr(worker, "_write_encrypted_reply", lambda store, text: {"id": "r"})
-    _script_provider(monkeypatch, [_text_round("REPLY")])
-
-    enqueue_calls = []
-    orig_enqueue = jobs_store.enqueue_job
-
-    def _spy_enqueue(user_id_, lane, *, reason=None, **k):
-        enqueue_calls.append((user_id_, lane, reason))
-        return orig_enqueue(user_id_, lane, reason=reason, **k)
-
-    monkeypatch.setattr(jobs_store, "enqueue_job", _spy_enqueue)
-
-    deps = worker.TurnDeps(
-        read_messages=lambda uid_: [{"id": "m1", "ts": 1.0, "role": "user", "content": "hi"}],
-        resolve_provider=lambda uid_: (_BYOK, {}),
-        mint_enclave_token=lambda uid_: "rt",
-        read_tail=lambda uid_, after_ts, limit: [{"id": "m1", "ts": 1.0, "role": "user", "content": "hi"}],
-        apply_pending_effects=_apply_effects,
-    )
-
-    status = asyncio.run(worker.process_job(
-        job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"))
-
-    assert status == "completed"
-    assert enqueue_calls == []
 
 
 def test_chat_uses_recent_profile_context_without_compact_dependencies(monkeypatch):
@@ -1560,7 +1468,6 @@ def test_chat_uses_recent_profile_context_without_compact_dependencies(monkeypat
         read_messages=lambda _uid: [recent_rows[-1]],
         resolve_provider=lambda _uid: (_BYOK, {}),
         mint_enclave_token=lambda _uid: "rt",
-        read_summary_with_seq=forbidden,
         read_tail_after_seq=forbidden,
         read_recent_turns=lambda user_id, max_turns, row_cap, **kwargs: (
             recent_calls.append((user_id, max_turns, row_cap, kwargs))
@@ -1603,10 +1510,6 @@ def test_chat_uses_recent_profile_context_without_compact_dependencies(monkeypat
     assert "older user turn" in rendered
     assert "older assistant reply" in rendered
     assert "active user turn" in rendered
-
-
-def test_semantic_compaction_api_is_removed():
-    assert not hasattr(v2_compaction, "compact")
 
 
 # ------------------------------------------------------------------
@@ -1718,7 +1621,6 @@ def test_run_wake_records_whole_turn_metric_on_success(monkeypatch):
         resolve_provider=lambda uid_: (_BYOK, {}),
         mint_enclave_token=lambda uid_: "rt",
         has_genuine_user_history=lambda _uid: True,
-        read_summary_with_seq=lambda _uid: ("", 0.0, 0, 0),
         read_tail_after_seq=lambda *_a, **_k: [
             {"id": "m1", "seq": 1, "ts": 1.0, "role": "user", "content": "hi"}
         ],
@@ -1762,7 +1664,6 @@ def test_run_wake_weak_wake_still_records_whole_turn_metric_with_call_counted(mo
         resolve_provider=lambda uid_: (_BYOK, {}),
         mint_enclave_token=lambda uid_: "rt",
         has_genuine_user_history=lambda _uid: True,
-        read_summary_with_seq=lambda _uid: ("", 0.0, 0, 0),
         read_tail_after_seq=lambda *_a, **_k: [
             {"id": "m1", "seq": 1, "ts": 1.0, "role": "user", "content": "hi"}
         ],
@@ -1783,69 +1684,6 @@ def test_run_wake_weak_wake_still_records_whole_turn_metric_with_call_counted(mo
     assert row[2] is False
     assert row[3] == "ok"
 
-
-def test_retired_maintenance_records_whole_turn_metric(monkeypatch):
-    """The content-free tombstone records success without any model usage."""
-    uid = "u_w_compaction_turnmetric"
-    conftest.seed_user(uid)
-    _reset(uid)
-    job_id, _ = jobs_store.enqueue_job(uid, "maintenance")
-    job = jobs_store.claim_next_job("w")
-
-    monkeypatch.setattr(jobs_store, "get_summary_row", lambda _uid: None)
-
-    async def _unsummarized(_uid, _watermark_seq):
-        return worker._TAIL_KEEP + 1
-
-    monkeypatch.setattr(worker, "_unsummarized_count", _unsummarized)
-    monkeypatch.setattr(
-        worker.db,
-        "chat_coverage_bounds_after_seq",
-        lambda *_args, **_kwargs: (1, 1, 1),
-    )
-    monkeypatch.setattr(
-        worker.db,
-        "count_messages_after_seq",
-        lambda *_args, **_kwargs: 1,
-    )
-    writes = {"n": 0}
-
-    def _append(*_args, **_kwargs):
-        writes["n"] += 1
-        return True
-
-    def _provider_boom(_uid):
-        raise AssertionError("maintenance resolved provider")
-
-    deps = worker.TurnDeps(
-        read_messages=lambda uid_: [],
-        resolve_provider=_provider_boom,
-        mint_enclave_token=lambda _uid: (_ for _ in ()).throw(
-            AssertionError("maintenance minted runtime token")
-        ),
-        append_summary_segment=_append,
-        runtime_mode_enabled=lambda _uid: True,
-    )
-
-    status = asyncio.run(worker._run_turn(job, deps))
-
-    assert status == "completed"
-    assert writes["n"] == 0
-    with db.get_pool().connection() as c:
-        row = c.execute(
-            "SELECT lane, prompt_tokens, completion_tokens, model_calls, failed, status, "
-            "cache_read_tokens, cache_write_tokens, cache_miss_tokens, "
-            "usage_reported_calls, cache_reported_calls, provider, model, "
-            "cache_route_fingerprint "
-            "FROM v2_turn_metrics WHERE job_id=%s", (job_id,)).fetchone()
-    assert row is not None
-    assert row[0] == "maintenance"
-    assert row[1] is None and row[2] is None
-    assert row[3] == 0
-    assert row[4] is False
-    assert row[5] == "maintenance_retired"
-    assert row[6:11] == (None, None, None, 0, 0)
-    assert row[11:] == (None, None, None)
 
 
 def test_turn_metrics_keep_unknown_usage_nullable_and_count_coverage(monkeypatch):
@@ -2306,53 +2144,6 @@ def test_active_job_lease_keeper_renews_until_stopped(monkeypatch):
                for call in calls)
 
 
-def test_metadata_compaction_refreshes_turn_progress(monkeypatch):
-    progress = []
-    monkeypatch.setattr(worker, "_report_turn_progress", progress.append)
-    uid = "u_metadata_progress"
-    conftest.seed_user(uid)
-    _reset(uid)
-    job_id, _ = jobs_store.enqueue_job(uid, "maintenance")
-    job = jobs_store.claim_next_job("worker-progress")
-    monkeypatch.setattr(jobs_store, "get_summary_row", lambda _uid: None)
-
-    async def _unsummarized(_uid, _watermark_seq):
-        return worker._TAIL_KEEP + 1
-
-    monkeypatch.setattr(worker, "_unsummarized_count", _unsummarized)
-    monkeypatch.setattr(
-        worker.db,
-        "chat_coverage_bounds_after_seq",
-        lambda *_args, **_kwargs: (1, 1, 1),
-    )
-    monkeypatch.setattr(
-        worker.db,
-        "count_messages_after_seq",
-        lambda *_args, **_kwargs: 1,
-    )
-    deps = worker.TurnDeps(
-        read_messages=lambda _uid: [],
-        resolve_provider=lambda _uid: (_BYOK, {}),
-        mint_enclave_token=lambda _uid: "rt",
-        append_summary_segment=lambda *_args, **_kwargs: True,
-    )
-
-    result = asyncio.run(
-        worker._run_compaction(
-            job_id,
-            uid,
-            deps,
-            None,
-            claimed_by=job["claimed_by"],
-        )
-    )
-
-    assert result == "completed"
-    assert progress == [
-        "deterministic_compaction_batch_start",
-        "deterministic_compaction_batch_complete",
-    ]
-
 
 def test_chat_lane_still_takes_the_chat_path(monkeypatch):
     """Regression guard for the BUG-2 dispatch fix: the `lane != "chat"` bail-out must not
@@ -2425,7 +2216,6 @@ def test_wake_turn_system_prompt_states_the_live_third_party_model(monkeypatch):
         resolve_provider=lambda uid_: (_THIRD_PARTY, {}),
         mint_enclave_token=lambda uid_: "rt",
         has_genuine_user_history=lambda _uid: True,
-        read_summary_with_seq=lambda _uid: ("", 0.0, 0, 0),
         read_tail_after_seq=lambda *_a, **_k: [
             {"id": "m1", "seq": 1, "ts": 1.0, "role": "user", "content": "hi"}
         ],

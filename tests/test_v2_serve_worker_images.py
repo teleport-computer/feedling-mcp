@@ -42,7 +42,7 @@ def test_caption_envelope_falls_back_to_message_owner_and_id():
 
 def test_file_row_renders_a_marker_and_never_decrypts_the_body():
     """A file message's plaintext is RAW FILE BYTES. Decoding it as utf-8 raises and takes
-    the whole _read_tail down with it (chat + wake + extraction + compaction). The file row
+    the whole _read_tail down with it (chat + wake + extraction). The file row
     must be rendered from plaintext `file_name` alone — no enclave round-trip."""
     from core import enclave as core_enclave
 

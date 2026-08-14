@@ -82,60 +82,11 @@ def test_group_complete_turns_drops_partial_prefix_and_keeps_internal_rows():
     ]
 
 
-def test_adaptive_replay_union_preserves_every_seq_through_snapshot():
-    recent = [*_turn(1), *_turn(2), *_turn(3)]
-    required = [_row(30, "user", "u3"), _row(31, "assistant", "a3")]
-    window = {
-        "rows": recent,
-        "source_truncated": False,
-    }
-
-    optional, enriched_required, truncated = worker._adaptive_replay_parts(
-        window,
-        watermark_seq=21,
-        required_tail=required,
-    )
-
-    summary_covered = {row["seq"] for row in recent if row["seq"] <= 21}
-    optional_seqs = {
-        row["seq"] for row in worker._flatten_turns(optional)
-    }
-    required_seqs = {row["seq"] for row in enriched_required}
-    stored_through_snapshot = {row["seq"] for row in recent}
-    assert optional_seqs <= summary_covered
-    assert summary_covered | required_seqs == stored_through_snapshot
-    assert truncated is False
-
-
-def test_adaptive_replay_marks_row_cap_partial_prefix_as_fallback():
-    partial_window = {
-        "rows": [
-            _row(11, "assistant", "cut oldest turn", genuine=False),
-            *_turn(2),
-            *_turn(3),
-        ],
-        "source_truncated": True,
-    }
-
-    optional, _required, truncated = worker._adaptive_replay_parts(
-        partial_window,
-        watermark_seq=31,
-        required_tail=[],
-    )
-
-    assert [[row["seq"] for row in group] for group in optional] == [
-        [20, 21],
-        [30, 31],
-    ]
-    assert truncated is True
-
-
 def test_synthetic_64k_keeps_40_turns_while_32k_shrinks_whole_turns():
     optional = [_turn(i, chars=1400) for i in range(1, 40)]
     required = _turn(40, chars=64)
     builder = worker._make_build_messages_fn(
         system_prompt="system",
-        summary="summary covers turns 1 through 39",
         tail=required,
         optional_tail_turns=optional,
         tail_target_turns=40,
@@ -168,7 +119,6 @@ def test_native_transcript_growth_can_only_reduce_optional_replay():
     optional = [_turn(i, chars=1000) for i in range(1, 40)]
     builder = worker._make_build_messages_fn(
         system_prompt="system",
-        summary="covered",
         tail=_turn(40, chars=64),
         optional_tail_turns=optional,
         tail_target_turns=40,
@@ -189,7 +139,6 @@ def test_native_transcript_growth_can_only_reduce_optional_replay():
 def test_required_only_overflow_is_not_hidden_by_optional_eviction():
     builder = worker._make_build_messages_fn(
         system_prompt="system",
-        summary="covered",
         tail=_turn(40, chars=60_000),
         optional_tail_turns=[_turn(1, chars=8)],
         tail_target_turns=40,
@@ -204,7 +153,6 @@ def test_adaptive_frontier_truncates_worldbook_with_explicit_marker():
     worldbook = "<world_book>\n" + ("world detail " * 3_000) + "\n</world_book>"
     builder = worker._make_build_messages_fn(
         system_prompt="system",
-        summary="covered",
         tail=_turn(40, chars=64),
         optional_tail_turns=[_turn(1, chars=400)],
         tail_target_turns=2,
@@ -219,77 +167,3 @@ def test_adaptive_frontier_truncates_worldbook_with_explicit_marker():
     assert "WORLD BOOK CONTEXT TRUNCATED TO FIT THE PROMPT BUDGET" in rendered
     assert "turn-40-user" in rendered
     assert "turn-40-assistant" in rendered
-
-
-def test_targeted_catchup_compacts_exactly_through_safe_boundary(monkeypatch):
-    rows = [
-        _row(seq, "user" if seq % 2 else "assistant", f"row-{seq}")
-        for seq in range(1, 9)
-    ]
-    state = {"summary": "", "version": 0, "watermark_seq": 0}
-    folded: list[int] = []
-    monkeypatch.setattr(worker, "_COMPACTION_BATCH", 2)
-    monkeypatch.setattr(
-        jobs_store,
-        "get_summary_row",
-        lambda _uid: {
-            "watermark_seq": state["watermark_seq"],
-            "watermark_ts": 0.0,
-            "version": state["version"],
-        },
-    )
-
-    def count(_uid, after_seq, *, through_seq=None, exclude_synthetic_sources=False):
-        # These fixture rows carry no synthetic sources, so the coverage-path
-        # exclusion is a no-op here; accept the kwarg to mirror the production
-        # signature (worker._unsummarized_count now always passes it).
-        return len([
-            row
-            for row in rows
-            if row["seq"] > after_seq
-            and (through_seq is None or row["seq"] <= through_seq)
-        ])
-
-    monkeypatch.setattr(worker.db, "count_messages_after_seq", count)
-    monkeypatch.setattr(worker.db, "chat_max_seq", lambda _uid: rows[-1]["seq"])
-
-    def bounds(_uid, after_seq, *, limit, through_seq=None):
-        selected = [
-            row["seq"]
-            for row in rows
-            if row["seq"] > after_seq
-            and (through_seq is None or row["seq"] <= through_seq)
-        ][:limit]
-        return (selected[0], selected[-1], len(selected)) if selected else (0, 0, 0)
-
-    monkeypatch.setattr(worker.db, "chat_coverage_bounds_after_seq", bounds)
-
-    def append_segment(_uid, text, **kwargs):
-        assert kwargs["previous_watermark_seq"] == state["watermark_seq"]
-        folded.extend(range(kwargs["start_seq"], kwargs["end_seq"] + 1))
-        state["summary"] = (state["summary"] + "\n" + text).strip()
-        state["watermark_seq"] = kwargs["end_seq"]
-        state["version"] += 1
-        return True
-
-    deps = worker.TurnDeps(
-        read_messages=lambda _uid: [],
-        resolve_provider=lambda _uid: (None, {}),
-        mint_enclave_token=lambda _uid: "token",
-        append_summary_segment=append_segment,
-    )
-
-    watermark, snapshot = asyncio.run(
-        worker._ensure_prompt_coverage(
-            "u",
-            deps,
-            enclave_sem=None,
-            tail_limit=0,
-            compact_through_seq=5,
-        )
-    )
-
-    assert folded == [1, 2, 3, 4, 5]
-    assert watermark == 5
-    assert snapshot == 8
-    assert [row["seq"] for row in rows if row["seq"] > watermark] == [6, 7, 8]

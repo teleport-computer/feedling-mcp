@@ -83,7 +83,6 @@ def _runtime_turn_messages() -> tuple[list[dict], list[dict], list[dict]]:
     ]
     first = v2_context.build_turn_messages(
         system_prompt=v2_context.CHAT_SYSTEM_PROMPT,
-        summary="",
         tail=first_tail,
         action_context=v2_context.action_context_str({
             "perception_snapshot": [{
@@ -94,7 +93,6 @@ def _runtime_turn_messages() -> tuple[list[dict], list[dict], list[dict]]:
     )
     second = v2_context.build_turn_messages(
         system_prompt=v2_context.CHAT_SYSTEM_PROMPT,
-        summary="",
         tail=[
             *first_tail,
             {"role": "assistant", "content": "first stable response"},
@@ -109,7 +107,6 @@ def _runtime_turn_messages() -> tuple[list[dict], list[dict], list[dict]]:
     )
     without_runtime_data = v2_context.build_turn_messages(
         system_prompt=v2_context.CHAT_SYSTEM_PROMPT,
-        summary="",
         tail=first_tail,
     )
     return first, second, without_runtime_data
@@ -118,7 +115,6 @@ def _runtime_turn_messages() -> tuple[list[dict], list[dict], list[dict]]:
 def _multimodal_runtime_messages() -> list[dict]:
     return v2_context.build_turn_messages(
         system_prompt=v2_context.CHAT_SYSTEM_PROMPT,
-        summary="- user asked for visual debugging help",
         tail=[{
             "role": "user",
             "content": [
@@ -142,7 +138,6 @@ def test_temporal_context_stays_after_the_reusable_conversation_prefix() -> None
     stable_tail = [{"role": "user", "content": "first stable request", "ts": 100.0}]
     first = v2_context.build_turn_messages(
         system_prompt=v2_context.CHAT_SYSTEM_PROMPT,
-        summary="",
         tail=stable_tail,
         temporal_context=v2_context.build_temporal_context(
             now_ts=200.0,
@@ -158,7 +153,6 @@ def test_temporal_context_stays_after_the_reusable_conversation_prefix() -> None
     ]
     second = v2_context.build_turn_messages(
         system_prompt=v2_context.CHAT_SYSTEM_PROMPT,
-        summary="",
         tail=second_tail,
         temporal_context=v2_context.build_temporal_context(
             now_ts=230.0,
@@ -279,7 +273,6 @@ def test_openrouter_sends_sticky_cache_fields_and_anthropic_cache_control() -> N
 def test_v2_cache_breakpoints_exclude_dynamic_perception_grounding() -> None:
     messages = v2_context.build_turn_messages(
         system_prompt=v2_context.CHAT_SYSTEM_PROMPT,
-        summary="- user likes tea",
         tail=[{"role": "user", "content": "What should I drink?"}],
         action_context="live perception: now=2026-07-18T10:00:00Z",
     )
@@ -328,7 +321,6 @@ def test_stable_skills_and_working_memory_precede_dynamic_cache_frontier() -> No
         system_prompt=v2_context.CHAT_SYSTEM_PROMPT,
         trusted_system_blocks=("<skill>stable skill</skill>",),
         working_memory="- project alpha is active",
-        summary="- prior discussion",
         tail=[{"role": "user", "content": "continue"}],
         action_context="now=dynamic",
     )
@@ -404,13 +396,11 @@ def test_profile_header_contract_and_cache_priority_on_openai_and_anthropic():
         working_memory="- editable state",
         agent_memory="stable relationship facts",
         user_profile="stable interaction style",
-        summary="",
         tail=[
             {"role": "user", "content": "older request"},
             {"role": "assistant", "content": "older response"},
             {"role": "user", "content": "newest request"},
         ],
-        coverage_hole_notice="7 earlier messages omitted",
         action_context="live=dynamic",
     )
 
@@ -438,10 +428,7 @@ def test_profile_header_contract_and_cache_priority_on_openai_and_anthropic():
         _nested_cache_controls(message)
         for message in marked_openai
         if str(message.get("role") or "").lower() == "user"
-        and (
-            pc._is_coverage_hole_message(message)
-            or pc._is_runtime_context_message(message)
-        )
+        and pc._is_runtime_context_message(message)
     )
 
     system = str(messages[0]["content"])
@@ -471,8 +458,7 @@ def test_profile_header_contract_and_cache_priority_on_openai_and_anthropic():
     assert not any(
         _nested_cache_controls(message)
         for message in marked_anthropic
-        if pc._is_coverage_hole_message(message)
-        or pc._is_runtime_context_message(message)
+        if pc._is_runtime_context_message(message)
     )
 
 
@@ -497,7 +483,6 @@ def test_working_memory_revision_preserves_skill_prefix_on_all_cache_wires():
                 block.content for block in blocks
                 if block.name == "working-memory"
             ),
-            summary="- stable summary",
             tail=[{"role": "user", "content": "continue"}],
             action_context="dynamic-now",
         )
@@ -756,7 +741,6 @@ def test_openrouter_openai_production_prompt_has_large_stable_cache_prefix() -> 
     tools = tool_schema.build_tool_specs()
     first_messages = v2_worker._make_build_messages_fn(
         system_prompt=v2_context.CHAT_SYSTEM_PROMPT,
-        summary="",
         tail=[{"role": "user", "content": long_user}],
         extra_context=v2_context.action_context_str({
             "perception_snapshot": [{
@@ -767,7 +751,6 @@ def test_openrouter_openai_production_prompt_has_large_stable_cache_prefix() -> 
     )([])
     second_messages = v2_worker._make_build_messages_fn(
         system_prompt=v2_context.CHAT_SYSTEM_PROMPT,
-        summary="",
         tail=[
             {"role": "user", "content": long_user},
             {"role": "assistant", "content": "CACHE_CANARY_ONE"},
@@ -912,9 +895,10 @@ def test_direct_anthropic_native_tool_round_keeps_canonical_cached_prefix() -> N
     second = build([*base_messages, exchange])
 
     assert native == native_original
-    # The advancing marker set deliberately displaces the old summary marker.
+    # With no synthetic conversation summary, the earliest replay boundary
+    # remains part of the reusable prefix while the tool transcript advances.
     assert _nested_cache_controls(first["messages"][0])
-    assert not _nested_cache_controls(second["messages"][0])
+    assert _nested_cache_controls(second["messages"][0])
     # Cache metadata may move; the serialized semantic prefix must not.
     assert _without_cache_metadata(first["system"]) == _without_cache_metadata(
         second["system"]
@@ -994,10 +978,10 @@ def test_openrouter_native_tool_round_keeps_canonical_cached_prefix() -> None:
     ])
 
     assert native == native_original
-    # A folded user boundary plus the native tool transcript advances all four
-    # OpenRouter markers and deliberately displaces the old summary marker.
+    # A folded user boundary plus the native tool transcript preserves the
+    # earliest reusable raw-chat boundary now that no summary marker competes.
     assert _nested_cache_controls(first["messages"][1])
-    assert not _nested_cache_controls(second["messages"][1])
+    assert _nested_cache_controls(second["messages"][1])
     assert _without_cache_metadata(first["messages"]) == _without_cache_metadata(
         second["messages"][:len(first["messages"])]
     )

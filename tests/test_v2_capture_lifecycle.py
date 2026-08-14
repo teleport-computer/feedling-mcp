@@ -647,7 +647,7 @@ def test_capture_extraction_pages_oldest_contiguous_batches_of_60(monkeypatch):
         read_messages=lambda _uid: [],
         resolve_provider=lambda _uid: (object(), {}),
         mint_enclave_token=lambda _uid: "rt",
-        read_compaction_tail_after_seq=_read_oldest,
+        read_capture_tail_after_seq=_read_oldest,
         read_memory_context=lambda _uid: {},
         read_capture_state=lambda _uid: dict(state),
         build_memory_envelope=lambda *_args: {},
@@ -686,11 +686,6 @@ def test_capture_legacy_missing_boundary_restarts_from_zero(monkeypatch):
     monkeypatch.setattr(extraction, "extract", _empty)
     monkeypatch.setattr(jobs_store, "renew_job_lease", lambda *_a, **_k: True)
     monkeypatch.setattr(worker.db, "chat_seq_for_msg_id", lambda *_args: None)
-    monkeypatch.setattr(
-        worker.db,
-        "seq_for_watermark_ts",
-        lambda *_args: (_ for _ in ()).throw(AssertionError("timestamp fallback used")),
-    )
     monkeypatch.setattr(worker.db, "chat_max_seq", lambda _uid: 5)
     state = {
         "last_captured_until_message_id": "pruned",
@@ -718,7 +713,7 @@ def test_capture_legacy_missing_boundary_restarts_from_zero(monkeypatch):
         read_messages=lambda _uid: [],
         resolve_provider=lambda _uid: (object(), {}),
         mint_enclave_token=lambda _uid: "rt",
-        read_compaction_tail_after_seq=_read,
+        read_capture_tail_after_seq=_read,
         read_capture_state=lambda _uid: dict(state),
         build_memory_envelope=lambda *_args: {},
         **protocol,
@@ -763,7 +758,7 @@ def test_capture_legacy_existing_boundary_translates_exact_seq(monkeypatch):
         read_messages=lambda _uid: [],
         resolve_provider=lambda _uid: (object(), {}),
         mint_enclave_token=lambda _uid: "rt",
-        read_compaction_tail_after_seq=lambda _uid, after, limit, **kw: (
+        read_capture_tail_after_seq=lambda _uid, after, limit, **kw: (
             seen.append(after)
             or [
                 {
@@ -803,7 +798,7 @@ def test_lost_lease_never_advances_capture_frontier(monkeypatch):
         read_messages=lambda _uid: [],
         resolve_provider=lambda _uid: (object(), {}),
         mint_enclave_token=lambda _uid: "rt",
-        read_compaction_tail_after_seq=lambda *_args, **_kwargs: [
+        read_capture_tail_after_seq=lambda *_args, **_kwargs: [
             {
                 "id": "m1",
                 "seq": 1,

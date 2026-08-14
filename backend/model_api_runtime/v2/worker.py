@@ -89,7 +89,6 @@ from perception.agent_fields import (
 )
 from screen import screen_read_core
 from model_api_runtime.v2 import coalesce as v2_coalesce
-from model_api_runtime.v2 import compaction as v2_compaction
 from model_api_runtime.v2 import context
 from model_api_runtime.v2 import screen_chat as v2_screen_chat
 from model_api_runtime.v2 import cursor as v2_cursor
@@ -108,8 +107,6 @@ from model_api_runtime.v2 import profile as v2_profile
 from model_api_runtime.v2 import profile_store as v2_profile_store
 from model_api_runtime.v2 import status_stream
 from model_api_runtime.v2 import subagents as v2_subagents
-from model_api_runtime.v2 import summary_frontier as v2_summary_frontier
-from model_api_runtime.v2 import tail_anchor as v2_tail_anchor
 from model_api_runtime.v2 import tool_loop as v2_tool_loop
 from model_api_runtime.v2 import trajectory as v2_trajectory
 
@@ -556,35 +553,18 @@ def _reserved_lane_slots(max_workers: int, reserved: int | None = None) -> list:
     return [{"chat", "manual_wake"} if i < r else None for i in range(n)]
 
 
-# Legacy message-count controls remain compaction compatibility knobs only.
-# They are deliberately not reinterpreted as turns: doing so would silently
-# double effective history for the common user+assistant shape.
-_TAIL_BUDGET = int(os.environ.get("FEEDLING_V2_TAIL_BUDGET_MSGS", "20"))
-_TAIL_KEEP = int(os.environ.get("FEEDLING_V2_TAIL_KEEP_MSGS", "10"))
-_TAIL_HARD_CAP = int(os.environ.get("FEEDLING_V2_TAIL_HARD_CAP", "60"))
 _CHAT_TAIL_MAX_TURNS = _positive_int_env(
     "FEEDLING_V2_CHAT_TAIL_MAX_TURNS", "40"
 )
 _WAKE_TAIL_MAX_TURNS = _positive_int_env(
     "FEEDLING_V2_WAKE_TAIL_MAX_TURNS", "16"
 )
-# optional 重放窗口的滞后上限：eligible_optional 的轮数在 _CHAT_TAIL_MAX_TURNS
-# 与本值之间浮动。必须严格大于 _CHAT_TAIL_MAX_TURNS，否则没有滞后区、退化回
-# 逐轮滑动窗口（即本次要修的 bug 本身）。
-_CHAT_TAIL_ANCHOR_MAX_TURNS = _positive_int_env(
-    "FEEDLING_V2_CHAT_TAIL_ANCHOR_MAX_TURNS", "60"
-)
-if _CHAT_TAIL_ANCHOR_MAX_TURNS <= _CHAT_TAIL_MAX_TURNS:
-    _CHAT_TAIL_ANCHOR_MAX_TURNS = _CHAT_TAIL_MAX_TURNS + 20
 _RECENT_TURN_ROW_CAP = _positive_int_env(
     "FEEDLING_V2_RECENT_TURN_ROW_CAP", "512"
 )
-if "FEEDLING_V2_TAIL_BUDGET_MSGS" in os.environ:
-    log.warning(
-        "[v2.worker] FEEDLING_V2_TAIL_BUDGET_MSGS remains a legacy "
-        "compaction message threshold; use FEEDLING_V2_CHAT_TAIL_MAX_TURNS "
-        "and FEEDLING_V2_WAKE_TAIL_MAX_TURNS for prompt replay depth"
-    )
+_EXTRACTION_TAIL_MAX_ROWS = _positive_int_env(
+    "FEEDLING_V2_EXTRACTION_TAIL_MAX_ROWS", "60"
+)
 _CAPTURE_BATCH_LIMIT = 60
 _CAPTURE_PROMPT_RAW_ROLES = frozenset({"user", "openclaw"})
 # MUST stay a superset-compatible mirror of
@@ -607,7 +587,6 @@ _VOICE_TRANSCRIPT_SOURCE = "voice_call_transcript"
 _VOICE_TRANSCRIPT_PROMPT_CHARS = _positive_int_env(
     "FEEDLING_V2_VOICE_TRANSCRIPT_PROMPT_CHARS", "30000"
 )
-_COMPACTION_BATCH = _positive_int_env("FEEDLING_V2_COMPACTION_BATCH_MSGS", "200")
 _PROFILE_ENABLED = _allowlisted_bool_env("FEEDLING_V2_PROFILE_ENABLED")
 _PROFILE_MAX_AGE_SEC = float(
     os.environ.get("FEEDLING_V2_PROFILE_MAX_AGE_SEC", str(7 * 24 * 60 * 60))
@@ -627,29 +606,6 @@ if (
     or _PROFILE_RETRY_CAP_SEC < _PROFILE_RETRY_BASE_SEC
 ):
     raise RuntimeError("invalid Runtime V2 profile timing configuration")
-_SUMMARY_ROLLUP_FANOUT = _positive_int_env(
-    "FEEDLING_V2_SUMMARY_ROLLUP_FANOUT", "8"
-)
-_SUMMARY_FRONTIER_MAX_SEGMENTS = _positive_int_env(
-    "FEEDLING_V2_SUMMARY_FRONTIER_MAX_SEGMENTS", "24"
-)
-_SUMMARY_FRONTIER_MAX_CHARS = _positive_int_env(
-    "FEEDLING_V2_SUMMARY_FRONTIER_MAX_CHARS", "48000"
-)
-_SUMMARY_ROLLUP_MAX_PASSES = _positive_int_env(
-    "FEEDLING_V2_SUMMARY_ROLLUP_MAX_PASSES", "32"
-)
-if _SUMMARY_ROLLUP_FANOUT < 2:
-    raise RuntimeError("FEEDLING_V2_SUMMARY_ROLLUP_FANOUT must be at least 2")
-# Catch-up may legitimately need many successful batches (for example after a
-# long worker outage), but it must not monopolise a turn forever.  This is an
-# overall wall-clock bound for metadata/CAS progress.
-_PROMPT_CATCHUP_DEADLINE_SEC = float(
-    os.environ.get("FEEDLING_V2_PROMPT_CATCHUP_DEADLINE_SEC", "600")
-)
-if not math.isfinite(_PROMPT_CATCHUP_DEADLINE_SEC) or _PROMPT_CATCHUP_DEADLINE_SEC <= 0:
-    raise RuntimeError("FEEDLING_V2_PROMPT_CATCHUP_DEADLINE_SEC must be positive")
-
 # 每回合最多注入最近 N 张图。enclave 容量有限（每张图一次往返），且无 prompt caching ——
 # tail 里的图片每个回合都要重发，token 成本随图片数线性上升。
 _TAIL_IMAGE_LIMIT = int(os.environ.get("FEEDLING_V2_TAIL_IMAGE_LIMIT", "2"))
@@ -975,26 +931,6 @@ class WorkspacePromptUnavailable(RuntimeError):
     """The encrypted workspace prefix could not be loaded safely."""
 
 
-# The prompt-coverage invariant's stable error string.  Kept as a constant
-# because it is matched (not just raised) in `_safe_failure_code`, which turns
-# it into the persisted terminal status operators read.
-_COVERAGE_INCOMPLETE = "prompt_coverage_incomplete"
-
-
-def _coverage_incomplete_reason(reject_code: str = "") -> str:
-    """Attach a content-free compaction reject code to the coverage error.
-
-    A catch-up that keeps rejecting the same fold stalls the watermark
-    silently and re-reads the identical batch forever.  Carrying the reject
-    code out to the terminal status is what makes that loop diagnosable from
-    `agent_jobs.last_error` alone — no trajectory decrypt, no code reading.
-    """
-    code = str(reject_code or "").strip()
-    if not code:
-        return _COVERAGE_INCOMPLETE
-    return f"{_COVERAGE_INCOMPLETE}:{code}"[:110]
-
-
 # Compatibility name retained for existing parity tests/callers; the predicate
 # itself lives in core so the markup fallback and the worker delivery gate can
 # never drift apart.
@@ -1055,17 +991,6 @@ def _safe_failure_code(scope: str, exc: BaseException) -> str:
             _THINKING_ONLY_NO_REPLY_REASON,
         }:
             kind = raw
-        elif raw == _COVERAGE_INCOMPLETE or raw.startswith(
-            f"{_COVERAGE_INCOMPLETE}:"
-        ):
-            # Promoted out of the `responder_error` bucket deliberately. A
-            # coverage stall is invisible to the user (the turn never reaches
-            # the model that answers them) and self-perpetuating (the identical
-            # batch is re-read next turn), so it must be distinguishable from
-            # the other eleven TurnError sites without decrypting a trajectory.
-            # The suffix, when present, is the content-free compaction reject
-            # code that stalled the watermark.
-            kind = raw
         else:
             # Keep the established persisted code stable across the internal
             # responder-module removal; dashboards and clients may group by it.
@@ -1075,8 +1000,6 @@ def _safe_failure_code(scope: str, exc: BaseException) -> str:
         (
             v2_prompt_frontier.PromptContextLimitUnconfigured,
             v2_prompt_frontier.PromptFrontierExhausted,
-            v2_summary_frontier.SummaryFrontierIntegrityError,
-            v2_summary_frontier.SummaryFrontierExhausted,
         ),
     ):
         # Frontier errors expose explicit, content-free protocol codes. Preserve
@@ -1162,14 +1085,6 @@ def _turn_failure_error_class(exc: BaseException) -> str:
         # 这几个都是我们自己造成的(主动剥掉/压制,或跑光我们设定的工具预算)
         # —— 归 system 不变。
         return "reply_parse_failed"
-    if isinstance(exc, TurnError) and (
-        str(exc) == _COVERAGE_INCOMPLETE
-        or str(exc).startswith(f"{_COVERAGE_INCOMPLETE}:")
-    ):
-        # Compaction validation is our own coverage invariant. Its content-free
-        # reject suffix is diagnostic, never evidence of a provider/user fault.
-        return "unknown"
-
     classified = notices_catalog.classify_upstream(str(exc))
     if classified:
         return classified
@@ -1254,7 +1169,7 @@ class TurnDeps:
     # 测试/其他调用方不必提供；生产装配见 serve_worker.build_production_deps。
     read_tail: Callable[[str, float, int], list[dict]] | None = None
     read_tail_after_seq: Callable[..., list[dict]] | None = None
-    read_compaction_tail_after_seq: Callable[..., list[dict]] | None = None
+    read_capture_tail_after_seq: Callable[..., list[dict]] | None = None
     # (user_id, max_turns, row_cap, through_seq=...) -> content-free window
     # metadata plus decrypted rows. A turn starts at a genuine user row and
     # includes every following row before the next genuine user seed.
@@ -1269,30 +1184,6 @@ class TurnDeps:
     # ordinary temporal reader so foreground Chat does not pay an extra count
     # query. Production returns recent visible proactive count + latest ts.
     read_wake_attention_snapshot: Callable[..., dict] | None = None
-    # user_id -> (summary_plaintext, watermark_ts, version)：读取该用户当前会话摘要（enclave
-    # 解密明文）；从未压缩过时 ("", 0.0, 0)（D1：turn 看 摘要+尾巴 而不是全量重放）。默认
-    # None：worker.py 自身不 import hosted，测试/其他调用方不必提供；生产装配见
-    # serve_worker.build_production_deps。
-    # user_id -> (summary, watermark_ts, version, watermark_seq)
-    read_summary_with_seq: Callable[[str], tuple[str, float, int, int]] | None = None
-    # (user_id, summary, watermark_ts, expected_version[, watermark_seq]) -> True if CAS
-    # landed：本地加密（core_envelope，非 enclave 往返）+ CAS 写回 v2_conversation_summary
-    # （Task 2 storage）。expected_version 不匹配（别的回合已推进过摘要）时返回 False，
-    # 调用方按丢弃本次压缩处理，不重试、不报错——下一回合会用新版本重新压缩。默认 None：同上。
-    # watermark_seq（D5/Task 9）是可选的第 5 个位置参数——_run_compaction 只有在能拿到折叠
-    # 批次最后一行的精确 seq 时才会传它（生产路径总是能拿到；某些窄签名的测试 fake 只接 4
-    # 个参数，_run_compaction 会退化成旧的 4 参调用，两边都不破）。
-    # Segmented production path. Leaf summaries and higher-level checkpoints
-    # are immutable encrypted rows; ``read_summary_with_seq`` renders only the
-    # validated canonical cover.
-    # Content-free equivalent used by deterministic coverage mode. Exact
-    # segment payloads are reconstructed from their persisted row counts, so
-    # normal roll-up never needs to decrypt historical summaries.
-    read_summary_frontier_metadata: Callable[
-        [str], "v2_summary_frontier.SummaryFrontierSnapshot | None"
-    ] | None = None
-    append_summary_segment: Callable[..., bool] | None = None
-    append_summary_checkpoint: Callable[..., bool] | None = None
     # (user_id, message_ids) -> {message_id: {"image_mime": str, "image_b64": str}}：只对
     # 指定的图片消息做 enclave 解密。不能并进通用历史读取，否则会让非视觉路径解密 b64。
     # 默认 None：
@@ -2461,20 +2352,20 @@ class TurnMetrics:
     earliest point `job_id`/`user_id`/`lane` are known — before that, chat-turn
     setup failures like an unresolvable BYOK provider have nowhere else to
     attribute a metric row to) and threaded down through `process_job` and
-    each self-contained lane handler (`_run_compaction`/`_run_profile`/
-    `_run_wake`/`_run_extraction`). `flush()` upserts ONE
+    each self-contained lane handler (`_run_profile`/`_run_wake`/
+    `_run_extraction`). `flush()` upserts ONE
     `v2_turn_metrics` row per job_id
     (idempotent replace, never append — see `jobs_store.record_whole_turn_metric`),
     called at exactly the terminal points spec'd by B5: EVERY lane's success
-    return AND every `mark_failed` call site — chat, `maintenance` (compaction),
+    return AND every `mark_failed` call site — chat, retired `maintenance`,
     wake (`heartbeat`/`scheduled`/`manual_wake`/`screen_watch`) and extraction
     (`capture`/`dream`/`profile`) alike. The background lanes are not
     metric-free: provider-backed paths record each real BYOK call
     (`_run_wake` and chat's
     `process_job` both drive `tool_loop.run_tool_loop`, which calls `add_call`
     itself via its `add_usage` callback for every provider round; `_run_extraction`
-    → `v2_extraction.extract`. Metadata-only `_run_compaction` always records
-    `model_calls=0`; an empty Garden profile does the same. Provider-backed
+    → `v2_extraction.extract`. An empty Garden profile records
+    `model_calls=0`. Provider-backed
     success elsewhere carries real
     token/usage data worth a row — this is precisely the lane that burns
     idle-user BYOK tokens on heartbeat/scheduled wakes, so it is the metric
@@ -3551,7 +3442,7 @@ def _split_recent_turn_window(
     *,
     required_from_seq: int | None,
 ) -> tuple[list[list[dict[str, Any]]], list[dict[str, Any]], bool]:
-    """Partition one frozen recent window without a summary coverage frontier."""
+    """Partition one frozen recent raw-chat window at the required boundary."""
     rows = [dict(row) for row in list(window.get("rows") or [])]
     groups = _group_complete_turns(rows)
     optional: list[list[dict[str, Any]]] = []
@@ -3566,52 +3457,6 @@ def _split_recent_turn_window(
     leading_partial = bool(rows) and not _is_genuine_user_seed(rows[0])
     truncated = bool(window.get("source_truncated")) or leading_partial
     return optional, _flatten_turns(required), truncated
-
-
-def _adaptive_replay_parts(
-    window: dict,
-    *,
-    watermark_seq: int,
-    required_tail: list[dict],
-) -> tuple[list[list[dict]], list[dict], bool]:
-    """Split a recent window into summary-covered replay and exact core.
-
-    Optional groups must be wholly at or below the summary watermark. Exact
-    core rows are returned in full, annotated with seed metadata when the
-    recent reader observed the same seq. The union therefore never relies on
-    optional replay for coverage above the durable summary frontier.
-    """
-    rows = [dict(row) for row in list(window.get("rows") or [])]
-    groups = _group_complete_turns(rows)
-    optional: list[list[dict]] = []
-    for group in groups:
-        seqs = [
-            int(row["seq"])
-            for row in group
-            if row.get("seq") is not None
-        ]
-        if len(seqs) == len(group) and seqs and max(seqs) <= int(watermark_seq):
-            optional.append(group)
-
-    seed_by_seq = {
-        int(row["seq"]): row.get("_genuine_user") is True
-        for row in rows
-        if row.get("seq") is not None
-    }
-    enriched_required: list[dict] = []
-    for row in required_tail:
-        copied = dict(row)
-        seq = copied.get("seq")
-        if seq is not None and int(seq) in seed_by_seq:
-            copied["_genuine_user"] = seed_by_seq[int(seq)]
-        enriched_required.append(copied)
-
-    leading_partial = bool(rows) and not _is_genuine_user_seed(rows[0])
-    return (
-        optional,
-        enriched_required,
-        bool(window.get("source_truncated")) or leading_partial,
-    )
 
 
 async def _coalesce_inputs(
@@ -3802,7 +3647,6 @@ def _make_fold_new_messages(
 def _make_build_messages_fn(
     *,
     system_prompt: str,
-    summary: str,
     tail: list[dict],
     extra_context: str = "",
     mutation_recovery_active: bool = False,
@@ -3811,7 +3655,6 @@ def _make_build_messages_fn(
     agent_memory: str = "",
     user_profile: str = "",
     worldbook_context: str = "",
-    coverage_hole_notice: str = "",
     provider_config: Any = None,
     temporal_context: dict[str, Any] | None = None,
     temporal_snapshot: dict[str, Any] | None = None,
@@ -3819,7 +3662,6 @@ def _make_build_messages_fn(
     tail_target_turns: int | None = None,
     tail_source_truncated: bool = False,
     tail_lane: str = "",
-    tail_anchor_seq: int | None = None,
     application_data_role: str = "user",
     proactive_turn_boundary: bool = False,
     manual_wake: bool = False,
@@ -3827,7 +3669,7 @@ def _make_build_messages_fn(
 ) -> Callable[[list], list]:
     """Build the fixed base prompt plus the loop's chronological native transcript.
 
-    `system_prompt`/`summary`/`tail` are the turn's base context — captured once at loop
+    `system_prompt`/`tail` are the turn's base context — captured once at loop
     entry (D1: the caller already resolved these once via the seq-native readers
     before starting the loop).  The transcript then contains, in arrival order:
 
@@ -3892,7 +3734,6 @@ def _make_build_messages_fn(
         rendered_tail = _flatten_turns(selected_turns) + required_tail
         return context.build_turn_messages(
             system_prompt=system_prompt,
-            summary=summary,
             tail=rendered_tail,
             action_context=extra_context,
             mutation_recovery_active=mutation_recovery_active,
@@ -3902,7 +3743,6 @@ def _make_build_messages_fn(
             user_profile=user_profile,
             worldbook_context=worldbook_context,
             worldbook_context_char_cap=worldbook_char_cap,
-            coverage_hole_notice=coverage_hole_notice,
             temporal_context=_temporal_for(rendered_tail),
             application_data_role=application_data_role,
             proactive_turn_boundary=proactive_turn_boundary,
@@ -3927,37 +3767,10 @@ def _make_build_messages_fn(
         required_turn_count = sum(
             1 for row in required_tail if _is_genuine_user_seed(row)
         )
-        if tail_anchor_seq is not None and int(tail_anchor_seq) > 0:
-            # 锚点决定起点：滞后区内它逐轮不变，前缀因此逐字节稳定。
-            anchor = int(tail_anchor_seq)
-
-            def _group_start_seq(group: list[dict]) -> int | None:
-                seqs = [
-                    int(row["seq"])
-                    for row in group
-                    if row.get("seq") is not None
-                ]
-                return min(seqs) if seqs else None
-
-            eligible_optional = [
-                group
-                for group in optional_turns
-                if (_group_start_seq(group) or 0) >= anchor
-            ]
-            # 锚点裁掉滞后区之外的历史是设计内行为，不是预算降级；单独记录，
-            # 不要计入下面 plan_provider_round 的 `fallback` 信号。
-            anchor_trimmed = len(optional_turns) > len(eligible_optional)
-        else:
-            # wake lane 的常态路径：`_wake_builder` 只传 `tail_target_turns`，
-            # 从不传 `tail_anchor_seq`，所以每次都会走到这里，而不是仅在零历史
-            # 时才会走到——这里保持原有的逐轮滑动行为（公式②），与改动前逐字
-            # 等价。chat lane 只有在 `decide_anchor` 尚未 bootstrap 出锚点时
-            # （即 boundary_seq_for_target 为 None）才会短暂落到这条分支。
-            optional_limit = max(0, target_turns - required_turn_count)
-            eligible_optional = (
-                optional_turns[-optional_limit:] if optional_limit else []
-            )
-            anchor_trimmed = False
+        optional_limit = max(0, target_turns - required_turn_count)
+        eligible_optional = (
+            optional_turns[-optional_limit:] if optional_limit else []
+        )
 
         def plan_provider_round(
             *,
@@ -4046,7 +3859,7 @@ def _make_build_messages_fn(
                 effective_worldbook_cap, best_messages, best_plan = best_worldbook
 
             # Required-only must fit. It is the structural failure boundary:
-            # summary, exact core, native transcript, and at least the explicit
+            # exact core, native transcript, and at least the explicit
             # World Book truncation marker are never silently clipped.
             low, high, best = 1, len(eligible_optional), 0
             while low <= high:
@@ -4066,10 +3879,7 @@ def _make_build_messages_fn(
             available_turns = required_turn_count + len(eligible_optional)
             fallback = (
                 bool(tail_source_truncated)
-                or (
-                    not anchor_trimmed
-                    and len(optional_turns) > len(eligible_optional)
-                )
+                or len(optional_turns) > len(eligible_optional)
                 or best < len(eligible_optional)
             )
             return best_messages, best_plan, {
@@ -4078,7 +3888,6 @@ def _make_build_messages_fn(
                 "available_turns": available_turns,
                 "effective_turns": effective_turns,
                 "fallback": fallback,
-                "anchor_trimmed": anchor_trimmed,
                 "source_truncated": bool(tail_source_truncated),
                 "worldbook_truncated": bool(worldbook_context) and (
                     effective_worldbook_cap
@@ -4377,7 +4186,6 @@ def _make_task_batch_dispatcher(
 
             build_messages = _make_build_messages_fn(
                 system_prompt=_SUBAGENT_SYSTEM_PROMPT,
-                summary="",
                 tail=[{"role": "user", "content": task.prompt}],
                 trusted_system_blocks=trusted_system_blocks,
                 # WORKING.md is encrypted private state. Injecting it before the
@@ -5690,266 +5498,6 @@ def _render_capture_line(message: dict, voice_transcripts: dict,
 
 
 
-async def _rebalance_summary_frontier(
-    user_id: str,
-    deps: TurnDeps,
-    *,
-    enclave_sem: "asyncio.Semaphore | None",
-    claimed_by: str | None = None,
-    job_id=None,
-    trajectory_recorder: "v2_trajectory.TrajectoryRecorder | None" = None,
-) -> list:
-    """Roll immutable canonical nodes up from authenticated metadata only."""
-    frontier_reader = deps.read_summary_frontier_metadata
-    if frontier_reader is None or deps.append_summary_checkpoint is None:
-        return []
-
-    async def _read_frontier():
-        if enclave_sem is None:
-            return await asyncio.to_thread(frontier_reader, user_id)
-        async with enclave_sem:
-            return await asyncio.to_thread(frontier_reader, user_id)
-
-    no_progress = 0
-    for _pass in range(_SUMMARY_ROLLUP_MAX_PASSES):
-        snapshot = await _read_frontier()
-        if snapshot is None:
-            return []
-        if not isinstance(snapshot, v2_summary_frontier.SummaryFrontierSnapshot):
-            raise v2_summary_frontier.SummaryFrontierIntegrityError(
-                "unversioned_frontier_snapshot"
-            )
-        frontier = list(snapshot.segments)
-        candidate = v2_summary_frontier.choose_rollup_candidate(
-            frontier,
-            fanout=_SUMMARY_ROLLUP_FANOUT,
-            max_frontier_segments=_SUMMARY_FRONTIER_MAX_SEGMENTS,
-            max_frontier_chars=_SUMMARY_FRONTIER_MAX_CHARS,
-        )
-        if candidate is None:
-            return frontier
-
-        _report_turn_progress("summary_checkpoint_start")
-        includes_legacy = any(
-            item.coverage_kind == "legacy_opaque"
-            for item in candidate.children
-        )
-        checkpoint = v2_compaction.deterministic_fold(
-            source_message_count=candidate.source_message_count,
-            includes_legacy_opaque=includes_legacy,
-        )
-        materialized_head = v2_compaction.deterministic_fold(
-            source_message_count=sum(item.source_message_count for item in frontier),
-            includes_legacy_opaque=any(
-                item.coverage_kind == "legacy_opaque" for item in frontier
-            ),
-        )
-        if claimed_by and job_id is not None:
-            renewed = await asyncio.to_thread(
-                jobs_store.renew_job_lease,
-                job_id,
-                claimed_by,
-                ttl_sec=jobs_store.RUNNING_TTL_SEC,
-            )
-            if not renewed:
-                raise LostJobLease("summary checkpoint lease lost")
-        if deps.runtime_mode_enabled is not None and not await asyncio.to_thread(
-            deps.runtime_mode_enabled, user_id
-        ):
-            raise RuntimeModeChanged("user rolled back before summary checkpoint")
-        await _record_trajectory(
-            trajectory_recorder,
-            "summary_checkpoint",
-            {
-                "child_segment_ids": list(candidate.child_segment_ids),
-                "source_message_count": candidate.source_message_count,
-                "coverage_kind": candidate.coverage_kind,
-            },
-            best_effort=True,
-        )
-        inserted = await asyncio.to_thread(
-            deps.append_summary_checkpoint,
-            user_id,
-            checkpoint,
-            head_summary=materialized_head,
-            level=candidate.parent_level,
-            start_seq=candidate.start_seq,
-            end_seq=candidate.end_seq,
-            source_message_count=candidate.source_message_count,
-            child_segment_ids=candidate.child_segment_ids,
-            coverage_kind=candidate.coverage_kind,
-            legacy_opaque_through_seq=candidate.legacy_opaque_through_seq,
-            expected_version=snapshot.head_version,
-            expected_watermark_seq=snapshot.watermark_seq,
-        )
-        _report_turn_progress("summary_checkpoint_complete")
-        if inserted:
-            no_progress = 0
-            continue
-        no_progress += 1
-        if no_progress >= 3:
-            raise v2_summary_frontier.SummaryFrontierExhausted(
-                "checkpoint_cas_no_progress"
-            )
-    raise v2_summary_frontier.SummaryFrontierExhausted(
-        "checkpoint_pass_budget_exhausted"
-    )
-
-
-_CHECKPOINT_EXHAUSTION_DETAILS = frozenset(
-    {
-        "empty_rollup_candidate",
-        "no_reducing_rollup_candidate",
-        "checkpoint_cas_no_progress",
-        "checkpoint_pass_budget_exhausted",
-        "materialized_prompt_view_over_target",
-    }
-)
-
-
-def _checkpoint_degradation_detail(exc: BaseException) -> str:
-    """Return an allowlisted, content-free checkpoint reason.
-
-    Arbitrary ``.detail`` / ``.code`` attributes are untrusted just like an
-    exception message: a provider SDK or adapter can put credentials or user
-    content there.  Only details minted by our own frontier exception are
-    eligible for plaintext telemetry; everything else is reduced to its class.
-    """
-    if isinstance(exc, v2_summary_frontier.SummaryFrontierExhausted):
-        detail = str(exc.detail or "")
-        if detail in _CHECKPOINT_EXHAUSTION_DETAILS:
-            return detail
-        return "summary_frontier_exhausted"
-    if isinstance(exc, (asyncio.TimeoutError, TimeoutError)):
-        return "checkpoint_timeout"
-    type_name = re.sub(r"[^a-z0-9_]", "", type(exc).__name__.lower())[:64]
-    return f"checkpoint_{type_name}" if type_name else "checkpoint_error"
-
-
-async def _rebalance_summary_frontier_best_effort(
-    user_id: str,
-    deps: TurnDeps,
-    *,
-    lane: str,
-    phase: str,
-    enclave_sem: "asyncio.Semaphore | None",
-    claimed_by: str | None = None,
-    job_id=None,
-    trajectory_recorder: "v2_trajectory.TrajectoryRecorder | None" = None,
-    timeout_sec: float = 30.0,
-) -> bool:
-    """Run an optional checkpoint without undoing an already-durable leaf.
-
-    Lease/control cancellation and a corrupt frontier remain fatal.  Every
-    other checkpoint-local failure is a bounded degradation: the exact leaf
-    coverage is already durable and a later maintenance turn can retry the
-    roll-up.  This distinction prevents post-fold optimization failures from
-    being counted as if the fold itself failed.
-    """
-    try:
-        if not math.isfinite(float(timeout_sec)) or float(timeout_sec) <= 0:
-            raise asyncio.TimeoutError
-        await asyncio.wait_for(
-            _rebalance_summary_frontier(
-                user_id,
-                deps,
-                enclave_sem=enclave_sem,
-                claimed_by=claimed_by,
-                job_id=job_id,
-                trajectory_recorder=trajectory_recorder,
-            ),
-            timeout=float(timeout_sec),
-        )
-        return True
-    except (LostJobLease, RuntimeModeChanged, asyncio.CancelledError):
-        raise
-    except v2_summary_frontier.SummaryFrontierIntegrityError:
-        raise
-    except Exception as exc:  # noqa: BLE001 — checkpoint is optional here
-        detail = _checkpoint_degradation_detail(exc)
-        _report_turn_progress("compaction_checkpoint_degraded")
-        await _record_trajectory(
-            trajectory_recorder,
-            "compaction_checkpoint_degraded",
-            {
-                "lane": str(lane or "unknown")[:40],
-                "phase": str(phase or "unknown")[:40],
-                "error_class": type(exc).__name__,
-                "detail": detail,
-            },
-            best_effort=True,
-        )
-        log.warning(
-            "[v2.worker] checkpoint degraded user=%s lane=%s phase=%s code=%s",
-            user_id,
-            lane,
-            phase,
-            detail,
-        )
-        return False
-
-
-async def _bound_materialized_summary(
-    user_id: str,
-    summary: str,
-    deps: TurnDeps,
-    *,
-    enclave_sem: "asyncio.Semaphore",
-    claimed_by: str | None,
-    job_id,
-    trajectory_recorder: "v2_trajectory.TrajectoryRecorder | None",
-) -> str:
-    """Repair an over-target summary view before final per-route admission.
-
-    The 48K character target keeps ordinary audited large-context routes well
-    away from their edge; it is not a substitute for the model-specific total
-    prompt frontier. Custom/small routes still pass through the exact fail-closed
-    provider-round budget after messages and tools are assembled.
-    """
-    if (
-        len(str(summary)) <= _SUMMARY_FRONTIER_MAX_CHARS
-        or deps.read_summary_frontier_metadata is None
-        or deps.append_summary_checkpoint is None
-        or deps.read_summary_with_seq is None
-    ):
-        return summary
-    await _rebalance_summary_frontier(
-        user_id,
-        deps,
-        enclave_sem=enclave_sem,
-        claimed_by=claimed_by,
-        job_id=job_id,
-        trajectory_recorder=trajectory_recorder,
-    )
-    async with enclave_sem:
-        bounded, _watermark_ts, _version, _watermark_seq = await asyncio.to_thread(
-            deps.read_summary_with_seq, user_id
-        )
-    if len(str(bounded)) > _SUMMARY_FRONTIER_MAX_CHARS:
-        raise v2_summary_frontier.SummaryFrontierExhausted(
-            "materialized_prompt_view_over_target"
-        )
-    return bounded
-
-
-def _coverage_hole_notice(hole_count: int) -> str:
-    """Disclose that older messages were dropped from the bounded prompt window.
-
-    Option A serves a bounded recency tail when compaction is behind, leaving a
-    gap between the summary and the recent messages. Stating it plainly stops the
-    model from assuming the omitted span never happened; the durable facts remain
-    in long-term memory, and the background maintenance compaction chain shrinks
-    the gap over time. It is rendered as a separate untrusted data block after
-    replay, so it never mutates the stable profile/summary prefix or seq-exact
-    tail.
-    """
-    return (
-        f"{hole_count} earlier message(s) between the historical profile/summary "
-        "above and the recent messages below are omitted here to fit the context "
-        "window. Their durable facts are retained in long-term memory — ask the "
-        "user if you need older details."
-    )
-
 
 async def _select_profile_prompt_for_turn(
     *,
@@ -6063,161 +5611,6 @@ async def _read_recent_prompt_context(
     )
 
 
-async def _read_seq_adaptive_prompt_context(
-    *,
-    user_id: str,
-    deps: TurnDeps,
-    through_seq: int,
-    target_turns: int,
-    provider_config: Any,
-    enclave_sem: "asyncio.Semaphore",
-    claimed_by: str | None,
-    job_id,
-    add_usage: Callable[[dict | None], None] | None,
-    trajectory_recorder: "v2_trajectory.TrajectoryRecorder | None",
-    active_image_ids: set[str] | None = None,
-    tail_cap: int | None = None,
-) -> tuple[str, list[dict], list[list[dict]], bool, int, str, str, str]:
-    """Read one exact core plus summary-covered complete-turn replay.
-
-    ``tail_cap`` (Option A / graceful degradation): when set, the verbatim tail
-    is bounded to the newest ``tail_cap`` rows after the summary watermark
-    instead of REQUIRING every post-watermark row. If compaction has fallen
-    behind, the oldest uncompacted rows are dropped from the prompt (a "coverage
-    hole", disclosed in the summary text) and the turn still answers from recent
-    context rather than failing. ``None`` keeps the historical exact-coverage
-    contract (used by paths that must never drop a row, e.g. wake replay).
-    """
-    async with enclave_sem:
-        (
-            summary,
-            _watermark_ts,
-            _version,
-            watermark_seq,
-        ) = await asyncio.to_thread(deps.read_summary_with_seq, user_id)
-        tail = await asyncio.to_thread(
-            deps.read_tail_after_seq,
-            user_id,
-            watermark_seq,
-            tail_cap,
-            through_seq=through_seq,
-        )
-        # The lower seq boundary the prompt actually covers verbatim. Equal to the
-        # watermark on the exact-coverage path; raised to just below the oldest
-        # bounded-tail row when a hole is dropped, so `_assert_prompt_tail_exact`
-        # checks membership over the WINDOW the prompt claims, not the whole gap.
-        prompt_floor_seq = int(watermark_seq)
-        coverage_hole_count = 0
-        if tail_cap is not None and tail:
-            candidate_floor = int(tail[0]["seq"]) - 1
-            if candidate_floor > int(watermark_seq):
-                prompt_floor_seq = candidate_floor
-                # Count only real (non-synthetic) rows so the disclosed number
-                # matches messages a user would recognize as missing.
-                coverage_hole_count = max(
-                    0,
-                    await asyncio.to_thread(
-                        db.count_messages_after_seq,
-                        user_id,
-                        int(watermark_seq),
-                        through_seq=int(through_seq),
-                        exclude_synthetic_sources=True,
-                    )
-                    - await asyncio.to_thread(
-                        db.count_messages_after_seq,
-                        user_id,
-                        prompt_floor_seq,
-                        through_seq=int(through_seq),
-                        exclude_synthetic_sources=True,
-                    ),
-                )
-        optional_tail_turns: list[list[dict]] = []
-        tail_source_truncated = False
-        if deps.read_recent_turns is not None:
-            recent_window = await asyncio.to_thread(
-                deps.read_recent_turns,
-                user_id,
-                target_turns,
-                _RECENT_TURN_ROW_CAP,
-                through_seq=through_seq,
-            )
-            (
-                optional_tail_turns,
-                tail,
-                tail_source_truncated,
-            ) = _adaptive_replay_parts(
-                recent_window,
-                watermark_seq=watermark_seq,
-                required_tail=tail,
-            )
-        tail = await asyncio.to_thread(
-            _inject_tail_images,
-            tail,
-            user_id=user_id,
-            read_images=deps.read_images,
-            active_image_ids=active_image_ids,
-            read_vision_observations=deps.read_vision_observations,
-        )
-        tail = await asyncio.to_thread(
-            _inject_tail_files,
-            tail,
-            user_id=user_id,
-            read_files=deps.read_files,
-        )
-        if optional_tail_turns:
-            optional_rows = await asyncio.to_thread(
-                _inject_tail_images,
-                _flatten_turns(optional_tail_turns),
-                user_id=user_id,
-                read_images=deps.read_images,
-                active_image_ids=active_image_ids,
-                read_vision_observations=deps.read_vision_observations,
-            )
-            optional_rows = await asyncio.to_thread(
-                _inject_tail_files,
-                optional_rows,
-                user_id=user_id,
-                read_files=deps.read_files,
-            )
-            optional_tail_turns = _group_complete_turns(optional_rows)
-    profile_selection = await _select_profile_prompt_for_turn(
-        user_id=user_id,
-        deps=deps,
-        trajectory_recorder=trajectory_recorder,
-    )
-    if profile_selection.state in {"ok", "last_good"}:
-        summary = ""
-    else:
-        summary = await _bound_materialized_summary(
-            user_id,
-            summary,
-            deps,
-            enclave_sem=enclave_sem,
-            claimed_by=claimed_by,
-            job_id=job_id,
-            trajectory_recorder=trajectory_recorder,
-        )
-    await _assert_prompt_tail_exact(
-        user_id,
-        watermark_seq=prompt_floor_seq,
-        through_seq=through_seq,
-        tail=tail,
-    )
-    return (
-        summary,
-        tail,
-        optional_tail_turns,
-        tail_source_truncated,
-        int(watermark_seq),
-        profile_selection.memory,
-        profile_selection.user,
-        (
-            _coverage_hole_notice(coverage_hole_count)
-            if coverage_hole_count > 0
-            else ""
-        ),
-    )
-
 
 def _preflight_adaptive_builder(
     build_messages: Callable[[list], list],
@@ -6244,488 +5637,6 @@ def _preflight_adaptive_builder(
     )
 
 
-async def _run_compaction(
-    job_id,
-    user_id: str,
-    deps: TurnDeps,
-    enclave_sem: "asyncio.Semaphore | None",
-    claimed_by: str | None = None,
-    tm: "TurnMetrics | None" = None,
-    trajectory_recorder: "v2_trajectory.TrajectoryRecorder | None" = None,
-) -> str:
-    """Advance maintenance coverage with one exact metadata-only leaf."""
-
-    del enclave_sem  # No coverage operation decrypts chat or calls a provider.
-    try:
-        if deps.append_summary_segment is None:
-            raise RuntimeError("deterministic_compaction_unwired")
-        summary_row = await asyncio.to_thread(jobs_store.get_summary_row, user_id)
-        watermark_seq = int(summary_row["watermark_seq"]) if summary_row else 0
-        watermark_ts = float(summary_row["watermark_ts"]) if summary_row else 0.0
-        version = int(summary_row["version"]) if summary_row else 0
-        unsummarized_count = await _unsummarized_count(user_id, watermark_seq)
-        if unsummarized_count <= _TAIL_KEEP:
-            await asyncio.to_thread(
-                jobs_store.mark_completed, job_id, claimed_by=claimed_by
-            )
-            if tm is not None:
-                tm.flush(failed=False, status="ok")
-            return "completed"
-
-        fold_count = min(_COMPACTION_BATCH, unsummarized_count - _TAIL_KEEP)
-        first_seq, last_seq, source_count = await asyncio.to_thread(
-            db.chat_coverage_bounds_after_seq,
-            user_id,
-            watermark_seq,
-            limit=fold_count,
-            through_seq=None,
-        )
-        if (
-            source_count != fold_count
-            or first_seq <= watermark_seq
-            or last_seq < first_seq
-        ):
-            raise RuntimeError("deterministic_coverage_bounds_incomplete")
-
-        segment_text = v2_compaction.deterministic_fold(
-            source_message_count=source_count
-        )
-        covered_count = await asyncio.to_thread(
-            db.count_messages_after_seq,
-            user_id,
-            0,
-            through_seq=last_seq,
-            exclude_synthetic_sources=True,
-        )
-        head_text = v2_compaction.deterministic_fold(
-            source_message_count=covered_count
-        )
-        _report_turn_progress("deterministic_compaction_batch_start")
-        await _record_trajectory(
-            trajectory_recorder,
-            "deterministic_compaction_batch",
-            {
-                "lane": "maintenance",
-                "start_seq": first_seq,
-                "end_seq": last_seq,
-                "source_message_count": source_count,
-            },
-            best_effort=True,
-        )
-        if claimed_by and not await asyncio.to_thread(
-            jobs_store.renew_job_lease,
-            job_id,
-            claimed_by,
-            ttl_sec=jobs_store.RUNNING_TTL_SEC,
-        ):
-            raise LostJobLease(
-                "compaction lease lost before deterministic summary write"
-            )
-        if deps.runtime_mode_enabled is not None and not await asyncio.to_thread(
-            deps.runtime_mode_enabled, user_id
-        ):
-            raise RuntimeModeChanged(
-                "user rolled back before deterministic summary write"
-            )
-
-        inserted = await asyncio.to_thread(
-            deps.append_summary_segment,
-            user_id,
-            segment_text,
-            current_summary="",
-            head_summary=head_text,
-            start_seq=first_seq,
-            end_seq=last_seq,
-            source_message_count=source_count,
-            watermark_ts=watermark_ts,
-            expected_version=version,
-            previous_watermark_seq=watermark_seq,
-        )
-        _report_turn_progress("deterministic_compaction_batch_complete")
-        if inserted:
-            await _rebalance_summary_frontier_best_effort(
-                user_id,
-                deps,
-                lane="maintenance",
-                phase="post_fold_deterministic",
-                enclave_sem=None,
-                claimed_by=claimed_by,
-                job_id=job_id,
-                trajectory_recorder=trajectory_recorder,
-            )
-            await asyncio.to_thread(
-                jobs_store.mark_completed, job_id, claimed_by=claimed_by
-            )
-            if tm is not None:
-                tm.flush(failed=False, status="ok")
-            return "completed"
-
-        await asyncio.to_thread(
-            jobs_store.mark_failed,
-            job_id,
-            "summary_cas_lost",
-            claimed_by=claimed_by,
-        )
-        if tm is not None:
-            tm.flush(failed=True, status="summary_cas_lost")
-        return "failed"
-    except Exception as exc:  # noqa: BLE001 — maintenance stays user-invisible
-        code = _safe_failure_code("compaction_failed", exc)
-        await _record_trajectory(
-            trajectory_recorder,
-            "turn_exception",
-            {
-                "stage": "compaction",
-                "error_class": type(exc).__name__,
-                "error_code": code,
-            },
-            best_effort=True,
-        )
-        log.warning("[v2.worker] compaction job %s failed code=%s", job_id, code)
-        await asyncio.to_thread(
-            jobs_store.mark_failed, job_id, code, claimed_by=claimed_by
-        )
-        if tm is not None:
-            tm.flush(failed=True, status=code)
-        return "failed"
-
-def _gap_from_count(unsummarized_count: int, tail_limit: int) -> bool:
-    """Pure/no-I/O core of D6 gap detection: True when THIS USER has more
-    unsummarized messages (``seq > watermark_seq``) than the bounded tail
-    window can hold. The tail keeps only the newest ``tail_limit`` of them
-    (``serve_worker._read_tail_window``'s ``candidates[-limit:]`` slice) —
-    anything beyond that count is neither folded into the summary nor inside
-    the tail: D6's silent-drop hole.
-
-    COUNT-based, NOT seq-arithmetic. ``chat_messages.seq`` is a TABLE-WIDE
-    ``BIGINT GENERATED ALWAYS AS IDENTITY`` counter shared by every user (see
-    migration 0001_baseline.py) — in production, other users' concurrent
-    inserts interleave with this user's, so the raw seq SPAN since the
-    watermark (``max_seq - watermark_seq``, the OLD buggy test — ``max_seq``
-    being the GLOBAL max across all users) has no fixed relationship to how
-    many of THIS user's own messages actually sit in that span: it can be
-    huge (mostly other users' rows) even when this user has only a handful
-    unsummarized. That produced a FALSE gap on ~every multi-user turn — every
-    turn ran a needless synchronous BYOK catch-up compaction, collapsing the
-    verbatim tail to empty and occasionally failing the turn outright
-    (``prompt_coverage_incomplete`` after 3 no-op-fold retries). The fix:
-    compare THIS USER's own row count (``db.count_messages_after_seq``,
-    scoped by ``user_id``) against ``tail_limit`` directly — ``max_seq <= 0``
-    no longer needs a special case, since a user with zero rows past the
-    watermark has ``unsummarized_count == 0 <= tail_limit`` naturally."""
-    return unsummarized_count > tail_limit
-
-
-async def _unsummarized_count(
-    user_id: str,
-    watermark_seq: int,
-    *,
-    through_seq: int | None = None,
-) -> int:
-    """THIS USER's own ``chat_messages`` row count with ``seq > watermark_seq``
-    — one cheap indexed ``COUNT(*)`` (see ``db.count_messages_after_seq``),
-    scoped by ``user_id``. Replaces the old ``max_seq - watermark_seq``
-    global-seq-span estimate — see ``_gap_from_count``'s docstring for why
-    that was wrong."""
-    # Exclude GC-able synthetic rows (verify_ping/resident_maintenance) from the
-    # gap: both metadata coverage witnesses exclude them, so the gap/coverage
-    # math must too —
-    # otherwise a lone synthetic row after the watermark reports a phantom gap
-    # that no fold can close (its row is never returned to be folded), and the
-    # post-assembly _assert_prompt_covers would raise on a row that is not a
-    # real coverage hole.
-    if through_seq is None:
-        return await asyncio.to_thread(
-            db.count_messages_after_seq,
-            user_id,
-            watermark_seq,
-            exclude_synthetic_sources=True,
-        )
-    return await asyncio.to_thread(
-        db.count_messages_after_seq,
-        user_id,
-        watermark_seq,
-        through_seq=through_seq,
-        exclude_synthetic_sources=True,
-    )
-
-
-async def _prompt_coverage_gap(
-    user_id: str, *, watermark_seq: int, tail_limit: int
-) -> bool:
-    """D6 gap check: fetch THIS USER's own unsummarized row count and run it
-    through the pure ``_gap_from_count`` core. One indexed COUNT query on the
-    fast (overwhelmingly common) no-gap path — no enclave/decrypt work, no
-    LLM call, no compaction."""
-    count = await _unsummarized_count(user_id, watermark_seq)
-    return _gap_from_count(count, tail_limit)
-
-
-async def _assert_prompt_covers_seq(
-    user_id: str, *, watermark_seq: int, tail_limit: int
-) -> None:
-    """D6 hard invariant, count-based (see ``_prompt_coverage_gap``): raises
-    ``TurnError`` if a coverage hole would remain — see
-    ``_assert_prompt_covers`` (the wrapper actually wired into the two call
-    sites, which additionally re-derives ``watermark_seq`` fresh) for why
-    raising, not truncating/ignoring, is the deliberate choice here."""
-    if await _prompt_coverage_gap(
-        user_id, watermark_seq=watermark_seq, tail_limit=tail_limit
-    ):
-        raise TurnError("prompt_coverage_incomplete")
-
-
-async def _assert_prompt_covers(user_id: str, tail_limit: int) -> None:
-    """Post-assembly hard assertion (D6/Task 10): every message with
-    ``seq > watermark_seq`` must be inside the tail window this turn is about
-    to hand the model. Re-derives ``watermark_seq`` fresh from the DB
-    (``jobs_store.get_summary_row``) rather than reusing
-    ``_ensure_prompt_coverage``'s return value — this is deliberately an
-    INDEPENDENT re-check, not a cache read, so it still catches a future
-    wiring bug (e.g. the tail read moved ahead of the coverage call, or the
-    coverage call got dropped from a call site entirely) instead of silently
-    trusting whatever the earlier call computed. One extra cheap indexed
-    COUNT read per turn (see ``_prompt_coverage_gap``) — negligible next to
-    the LLM/enclave work already in the same turn.
-
-    Raising here (rather than truncating the tail or proceeding) is
-    deliberate: reaching a real gap at THIS point means
-    ``_ensure_prompt_coverage`` either wasn't called before this, or its
-    catch-up didn't actually land — a bug, not a recoverable runtime
-    condition — so the turn must fail loudly (``mark_failed``, requeue-able)
-    instead of silently shipping a prompt with a known coverage hole, which
-    is exactly the silent-drop bug this task exists to close."""
-    summary_row = await asyncio.to_thread(jobs_store.get_summary_row, user_id)
-    watermark_seq = int(summary_row["watermark_seq"]) if summary_row else 0
-    await _assert_prompt_covers_seq(
-        user_id, watermark_seq=watermark_seq, tail_limit=tail_limit
-    )
-
-
-async def _assert_prompt_tail_exact(
-    user_id: str,
-    *,
-    watermark_seq: int,
-    through_seq: int,
-    tail: list[dict],
-    ordered_user_through_seq: int | None = None,
-) -> None:
-    """Assert exact prompt membership against one race-bounded DB snapshot.
-
-    Count-only checks can pass with the wrong rows.  This compares the ordered
-    seq identities the prompt actually contains with every stored row in
-    ``watermark_seq < seq <= through_seq``.  Messages committed after the
-    snapshot belong to the next round-boundary fold and cannot displace an older
-    row or create a false failure.
-    """
-    try:
-        actual = [int(row["seq"]) for row in tail]
-    except (KeyError, TypeError, ValueError) as exc:
-        raise TurnError("prompt_coverage_incomplete") from exc
-    if ordered_user_through_seq is None:
-        expected = await asyncio.to_thread(
-            db.chat_seqs_after_seq,
-            user_id,
-            int(watermark_seq),
-            through_seq=int(through_seq),
-        )
-    else:
-        expected_rows = await asyncio.to_thread(
-            db.chat_messages_after_seq,
-            user_id,
-            int(watermark_seq),
-            limit=None,
-            through_seq=int(through_seq),
-        )
-        expected = [
-            int(row["seq"])
-            for row in context.ordered_reply_tail(
-                expected_rows,
-                user_through_seq=int(ordered_user_through_seq),
-            )
-        ]
-    if actual != expected:
-        raise TurnError("prompt_coverage_incomplete")
-
-
-
-async def _ensure_prompt_coverage(
-    user_id: str,
-    deps: TurnDeps,
-    *,
-    enclave_sem: "asyncio.Semaphore | None",
-    tail_limit: int,
-    max_retries: int = 3,
-    job_id: Any | None = None,
-    claimed_by: str | None = None,
-    catchup_deadline_sec: float | None = None,
-    trajectory_recorder: "v2_trajectory.TrajectoryRecorder | None" = None,
-    compact_through_seq: int | None = None,
-) -> tuple[int, int]:
-    """Close a prompt-coverage gap with exact metadata-only segment writes."""
-
-    del enclave_sem  # Coverage reads are metadata-only and need no enclave slot.
-    deadline_sec = (
-        _PROMPT_CATCHUP_DEADLINE_SEC
-        if catchup_deadline_sec is None
-        else float(catchup_deadline_sec)
-    )
-    if not math.isfinite(deadline_sec) or deadline_sec <= 0:
-        raise TurnError("prompt_coverage_incomplete")
-    deadline_at = time.monotonic() + deadline_sec
-
-    def _remaining() -> float:
-        remaining = deadline_at - time.monotonic()
-        if remaining <= 0:
-            raise TurnError("prompt_coverage_incomplete")
-        return remaining
-
-    async def _within_deadline(start: Callable[[], Awaitable[Any]]) -> Any:
-        try:
-            return await asyncio.wait_for(start(), timeout=_remaining())
-        except asyncio.TimeoutError as exc:
-            raise TurnError("prompt_coverage_incomplete") from exc
-
-    async def _renew_catchup_lease() -> None:
-        if job_id is None or not claimed_by:
-            return
-        renewed = await _within_deadline(
-            lambda: asyncio.to_thread(
-                jobs_store.renew_job_lease,
-                job_id,
-                claimed_by,
-                ttl_sec=jobs_store.RUNNING_TTL_SEC,
-            )
-        )
-        if not renewed:
-            raise LostJobLease("job lease lost during prompt catch-up")
-
-    no_progress_attempts = 0
-    last_observed_watermark: int | None = None
-    attempted_since_observation = False
-
-    while True:
-        summary_row = await _within_deadline(
-            lambda: asyncio.to_thread(jobs_store.get_summary_row, user_id)
-        )
-        watermark_seq = int(summary_row["watermark_seq"]) if summary_row else 0
-        if last_observed_watermark is not None:
-            if watermark_seq > last_observed_watermark:
-                no_progress_attempts = 0
-            elif attempted_since_observation:
-                no_progress_attempts += 1
-        if no_progress_attempts >= max(1, int(max_retries)):
-            raise TurnError("prompt_coverage_incomplete")
-        last_observed_watermark = watermark_seq
-        attempted_since_observation = False
-
-        unsummarized_count = await _within_deadline(
-            lambda: _unsummarized_count(
-                user_id,
-                watermark_seq,
-                through_seq=compact_through_seq,
-            )
-        )
-        target_mode = compact_through_seq is not None
-        required_gap_count = (
-            unsummarized_count
-            if target_mode
-            else max(0, unsummarized_count - int(tail_limit))
-        )
-        if required_gap_count <= 0:
-            max_seq = await _within_deadline(
-                lambda: asyncio.to_thread(db.chat_max_seq, user_id)
-            )
-            return watermark_seq, max_seq
-        if deps.append_summary_segment is None:
-            raise TurnError(_coverage_incomplete_reason("catchup_unwired"))
-
-        fold_count = min(required_gap_count, _COMPACTION_BATCH)
-        first_seq, last_seq, source_count = await _within_deadline(
-            lambda: asyncio.to_thread(
-                db.chat_coverage_bounds_after_seq,
-                user_id,
-                watermark_seq,
-                limit=fold_count,
-                through_seq=compact_through_seq,
-            )
-        )
-        if (
-            source_count != fold_count
-            or first_seq <= watermark_seq
-            or last_seq < first_seq
-        ):
-            raise TurnError("prompt_coverage_incomplete")
-
-        segment_text = v2_compaction.deterministic_fold(
-            source_message_count=source_count
-        )
-        covered_count = await _within_deadline(
-            lambda: asyncio.to_thread(
-                db.count_messages_after_seq,
-                user_id,
-                0,
-                through_seq=last_seq,
-                exclude_synthetic_sources=True,
-            )
-        )
-        head_text = v2_compaction.deterministic_fold(
-            source_message_count=covered_count
-        )
-        await _renew_catchup_lease()
-        if deps.runtime_mode_enabled is not None and not await _within_deadline(
-            lambda: asyncio.to_thread(deps.runtime_mode_enabled, user_id)
-        ):
-            raise RuntimeModeChanged("user rolled back during prompt catch-up")
-
-        attempted_since_observation = True
-        _report_turn_progress("prompt_deterministic_catchup_batch_start")
-        wrote = await _within_deadline(
-            lambda: asyncio.to_thread(
-                deps.append_summary_segment,
-                user_id,
-                segment_text,
-                current_summary="",
-                head_summary=head_text,
-                start_seq=first_seq,
-                end_seq=last_seq,
-                source_message_count=source_count,
-                watermark_ts=(
-                    float(summary_row["watermark_ts"]) if summary_row else 0.0
-                ),
-                expected_version=(
-                    int(summary_row["version"]) if summary_row else 0
-                ),
-                previous_watermark_seq=watermark_seq,
-            )
-        )
-        if wrote:
-            checkpoint_budget = deadline_at - time.monotonic() - 2.0
-            if checkpoint_budget > 0:
-                await _rebalance_summary_frontier_best_effort(
-                    user_id,
-                    deps,
-                    lane="prompt_catchup",
-                    phase="post_fold_deterministic",
-                    enclave_sem=None,
-                    claimed_by=claimed_by,
-                    job_id=job_id,
-                    trajectory_recorder=trajectory_recorder,
-                    timeout_sec=min(30.0, checkpoint_budget),
-                )
-        _report_turn_progress("prompt_deterministic_catchup_batch_complete")
-        await _record_trajectory(
-            trajectory_recorder,
-            "deterministic_compaction_batch",
-            {
-                "lane": "prompt_catchup",
-                "start_seq": first_seq,
-                "end_seq": last_seq,
-                "source_message_count": source_count,
-                "written": bool(wrote),
-            },
-            best_effort=True,
-        )
 
 async def _run_wake(
     job_id,
@@ -6739,8 +5650,8 @@ async def _run_wake(
     trajectory_recorder: "v2_trajectory.TrajectoryRecorder | None" = None,
 ) -> str:
     """wake-lane（heartbeat/scheduled/manual_wake/screen_watch）turn：让伴侣主动开口，而不是
-    回答用户刚发的消息（用户根本没发消息——这就是唤醒的定义）。同 `_run_compaction` 一样自成
-    一体、自己的 try/except。heartbeat/manual_wake/screen_watch 是弱唤醒，失败继续静默；
+    回答用户刚发的消息（用户根本没发消息——这就是唤醒的定义）。它自成一体、拥有自己的
+    try/except。heartbeat/manual_wake/screen_watch 是弱唤醒，失败继续静默；
     scheduled 是到点交付，最终失败通过 durable terminal outbox 写明确失败结果，不能无声消失。
 
     D3 Task 8 (PR C spec C8)：跟 chat 分支（`process_job`，Task 7）一样跑同一个
@@ -6852,9 +5763,8 @@ async def _run_wake(
                 tm.flush(failed=False, status="slept_no_history")
             return "completed"
 
-        # This content-free gate runs before workspace loading, compaction, or
-        # any other provider-capable prompt preparation. A summary can outlive
-        # its source rows and assistant/system artifacts can exist on their own;
+        # This content-free gate runs before workspace loading or any other
+        # provider-capable prompt preparation. Assistant/system artifacts can exist on their own;
         # neither is authority for an automatic outbound message.
         if lane == "heartbeat" and deps.has_genuine_user_history is not None:
             has_history = await asyncio.to_thread(
@@ -6865,7 +5775,7 @@ async def _run_wake(
                 return await _sleep_heartbeat_without_history()
 
         # One HMAC token and one encrypted workspace snapshot per authorized
-        # wake turn. Load before any prompt-coverage provider call so a broken
+        # wake turn. Load before any provider call so a broken
         # workspace never produces an under-authorized proactive response.
         token = deps.mint_enclave_token(user_id)
         observe_photo = _make_photo_observer(
@@ -6914,13 +5824,11 @@ async def _run_wake(
             enclave_sem=enclave_sem,
             trajectory_recorder=trajectory_recorder,
         )
-        summary = ""
         tail = recent_context.required_tail
         optional_tail_turns = recent_context.optional_turns
         tail_source_truncated = recent_context.tail_source_truncated
         agent_memory = recent_context.agent_memory
         user_profile = recent_context.user_profile
-        coverage_hole_notice = ""
         if seq_native:
             # A wake is proactive work only while there is no unanswered user
             # input.  Keep the frozen prompt snapshot boundary separate from
@@ -8069,7 +6977,6 @@ async def _run_wake(
                 _wake_sys = _wake_sys + _st_wake_sys.INSTRUCTION
             return _make_build_messages_fn(
                 system_prompt=_wake_sys,
-                summary=summary,
                 tail=wake_tail,
                 extra_context=(
                     context.action_context_str(grounding_results)
@@ -8081,7 +6988,6 @@ async def _run_wake(
                 agent_memory=agent_memory,
                 user_profile=user_profile,
                 worldbook_context=worldbook_context,
-                coverage_hole_notice=coverage_hole_notice,
                 provider_config=provider_config,
                 temporal_snapshot=temporal_snapshot,
                 optional_tail_turns=optional_tail_turns,
@@ -8985,10 +7891,10 @@ async def _run_extraction(
                         "[v2.worker] memory context unavailable for %s: %s", user_id, e
                     )
             if lane == "capture" and deps.read_capture_state is not None:
-                if deps.read_compaction_tail_after_seq is None:
+                if deps.read_capture_tail_after_seq is None:
                     raise RuntimeError("capture_oldest_reader_unavailable")
                 tail = await asyncio.to_thread(
-                    deps.read_compaction_tail_after_seq,
+                    deps.read_capture_tail_after_seq,
                     user_id,
                     capture_after_seq,
                     _CAPTURE_BATCH_LIMIT,
@@ -9000,12 +7906,12 @@ async def _run_extraction(
                     deps.read_tail_after_seq,
                     user_id,
                     0,
-                    _TAIL_HARD_CAP,
+                    _EXTRACTION_TAIL_MAX_ROWS,
                     through_seq=through_seq,
                 )
             elif deps.read_tail is not None:
                 tail = await asyncio.to_thread(
-                    deps.read_tail, user_id, 0.0, _TAIL_HARD_CAP
+                    deps.read_tail, user_id, 0.0, _EXTRACTION_TAIL_MAX_ROWS
                 )
             else:
                 tail = []
@@ -10015,7 +8921,7 @@ async def process_job(
             )
         if lane in _EXTRACTION_LANES:
             # 自成一体的记忆抽取路径（capture/dream，Task 3）：build prompt → BYOK 抽取 →
-            # parse → memory actions。同 _run_compaction/_run_wake 一样有自己的 try/except，
+            # parse → memory actions。同 _run_wake 一样有自己的 try/except，
             # 绝不落进下面 chat-turn 的 except（那条会 emit 用户可见 error status +
             # record_terminal_error）——后台 job 永不写气泡、永不弹 error chip。
             try:
@@ -10249,7 +9155,7 @@ async def process_job(
 
         # Load after recovery and empty-input finalization so a workspace outage
         # cannot block a reply that was already committed by a previous worker.
-        # It still precedes every provider/prompt-coverage call, preventing an
+        # It still precedes every provider call, preventing an
         # under-authorized response when the workspace snapshot is unavailable.
         trusted_system_blocks, working_memory = await _load_workspace_prompt_context(
             deps,
@@ -10306,13 +9212,11 @@ async def process_job(
                 if row.get("has_image") and row.get("id")
             },
         )
-        summary = ""
         tail = recent_context.required_tail
         optional_tail_turns = recent_context.optional_turns
         tail_source_truncated = recent_context.tail_source_truncated
         agent_memory = recent_context.agent_memory
         user_profile = recent_context.user_profile
-        coverage_hole_notice = ""
         if ordered_chat_replies:
             tail = context.ordered_reply_tail(
                 tail,
@@ -11869,7 +10773,6 @@ async def process_job(
         def _chat_builder():
             return _make_build_messages_fn(
                 system_prompt=context.chat_system_prompt(provider_config),
-                summary=summary,
                 tail=tail,
                 extra_context=turn_extra_context,
                 mutation_recovery_active=(mutation_recovery_barrier is not None),
@@ -11878,7 +10781,6 @@ async def process_job(
                 agent_memory=agent_memory,
                 user_profile=user_profile,
                 worldbook_context=worldbook_context,
-                coverage_hole_notice=coverage_hole_notice,
                 provider_config=provider_config,
                 temporal_snapshot=temporal_snapshot,
                 optional_tail_turns=optional_tail_turns,
@@ -12844,7 +11746,7 @@ async def _slot_loop(
     progress_cb（可选，PR D Task 2 + hard-timeout fix）：`progress_cb(slot_id, turn_start)`
     在真实 slot 活动的天然边界调用——claim 到一个 job 之后（即将进入 `_run_turn`）、
     `_run_turn` 跑完、每次空转 poll 醒来，以及 task-local `_report_turn_progress` 转发的
-    provider round / reliable retry / tool batch / compaction batch 边界。这样一个合法长回合会
+    provider round / reliable retry / tool batch / Capture batch 边界。这样一个合法长回合会
     刷新 stall clock，但所有消息始终携带同一个 `turn_start`，绝不重置 absolute clock。
     `slot_id` 是 `run_worker_loop` 里的下标（不是 `"{worker_id}#{i}"` 复合标签）。
 
@@ -12918,7 +11820,7 @@ async def _slot_loop(
 
             # Keep the public `_run_turn(job, deps)` seam unchanged (many tests
             # and assembly callers replace it directly).  A task-local callback
-            # lets provider/tool/compaction helpers refresh this exact slot's
+            # lets provider/tool/Capture helpers refresh this exact slot's
             # stall clock without leaking progress across concurrent slots.
             def _active_turn_progress(stage: str) -> None:
                 _signal_progress(stage, turn_start)

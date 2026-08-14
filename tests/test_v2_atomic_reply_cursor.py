@@ -738,7 +738,7 @@ def test_colliding_user_row_cannot_advance_reply_cursor():
 
 
 def test_atomic_reply_retains_source_history_without_tee_eviction(monkeypatch):
-    """Reply+cursor commit must never turn prompt coverage into history GC."""
+    """Reply+cursor commit must never turn a replay limit into history GC."""
     uid = "u_atomic_reply_tee_trim"
     conftest.seed_user(uid)
     _reset(uid)
@@ -751,16 +751,8 @@ def test_atomic_reply_retains_source_history_without_tee_eviction(monkeypatch):
             {"id": f"old-{index}", "role": "user", "content": str(index)},
             0,
         )
-    old_two_seq = db.chat_seq_for_msg_id(uid, "old-2")
     newest_input_seq = db.chat_seq_for_msg_id(uid, "old-3")
-    assert old_two_seq is not None and newest_input_seq is not None
-    assert jobs_store.upsert_summary_row_cas(
-        uid,
-        summary_envelope={"body_ct": "summary"},
-        watermark_ts=2.0,
-        watermark_seq=old_two_seq,
-        expected_version=0,
-    )
+    assert newest_input_seq is not None
 
     from tee_shadow import mirror
 
@@ -1043,22 +1035,16 @@ def test_final_reply_effect_surfaces_sealed_thinking(monkeypatch):
     assert reply.get("thinking_native") is True
 
 
-@pytest.mark.parametrize("advance_cursor_after_snapshot", [False, True])
 def test_wake_yields_snapshot_race_input_to_chat_without_duplicate_reply(
     monkeypatch,
-    advance_cursor_after_snapshot,
 ):
     """A send that lands after wake claim but before its tail snapshot is chat work.
 
-    A concurrent compaction watermark can put the row only in the encrypted
-    summary, so tail membership is not enough.  The durable reply cursor still
-    proves it was unanswered: wake retires without calling the model and the
-    pending chat lane consumes the row exactly once.
+    Tail membership alone is not enough because the bounded replay snapshot may
+    race a send. The durable reply cursor proves it was unanswered: wake retires
+    without calling the model and the pending chat lane consumes it exactly once.
     """
-    uid = (
-        "u_atomic_wake_presnapshot_yield_"
-        f"{int(bool(advance_cursor_after_snapshot))}"
-    )
+    uid = "u_atomic_wake_presnapshot_yield"
     conftest.seed_user(uid)
     _reset(uid)
 
@@ -1094,14 +1080,9 @@ def test_wake_yields_snapshot_race_input_to_chat_without_duplicate_reply(
         # test hook performs both synchronously at the same race boundary.
         jobs_store.enqueue_job(uid, "chat")
 
-    def _summary_with_send_race(_uid: str):
+    def _load_workspace_with_send_race(*_args, **_kwargs):
         _append_racing_send()
-        return (
-            "- user: answer this in the chat lane",
-            100.0,
-            1,
-            input_seq_box["value"],
-        )
+        return {"trusted_system_blocks": [], "working_memory": ""}
 
     def _plain_rows(after_seq: int, *, limit=None, oldest_first=True, through_seq=None):
         rows = db.chat_messages_after_seq(
@@ -1137,6 +1118,17 @@ def test_wake_yields_snapshot_race_input_to_chat_without_duplicate_reply(
             through_seq=through_seq,
         )
 
+    def _recent_turns(_uid: str, _max_turns: int, row_cap: int, *, through_seq):
+        rows = _plain_rows(
+            0,
+            limit=row_cap,
+            oldest_first=False,
+            through_seq=through_seq,
+        )
+        for row in rows:
+            row["_genuine_user"] = row.get("role") in {"user", "human"}
+        return {"rows": rows, "source_truncated": False}
+
     provider_calls: list[list[dict]] = []
 
     async def _provider(_config, messages, *, tools=None, **_kwargs):
@@ -1154,54 +1146,15 @@ def test_wake_yields_snapshot_race_input_to_chat_without_duplicate_reply(
         "_build_shared_envelope_for_store",
         lambda _store, _text, *, item_id=None: (_envelope(str(item_id)), ""),
     )
-    if advance_cursor_after_snapshot:
-        original_assert = worker._assert_prompt_tail_exact
-        advanced = {"done": False}
-
-        async def _assert_then_finish_concurrent_chat(*args, **kwargs):
-            await original_assert(*args, **kwargs)
-            if advanced["done"]:
-                return
-            advanced["done"] = True
-            # Model a final-effect recovery that commits immediately after the
-            # wake froze its prompt.  Wake must retain its earlier cursor read;
-            # reloading the advanced cursor here would let it reply from a
-            # snapshot that omitted this assistant row.
-            db.chat_append_strict(
-                uid,
-                "concurrent-chat-reply",
-                101.0,
-                {
-                    "id": "concurrent-chat-reply",
-                    "role": "openclaw",
-                    "ts": 101.0,
-                    "body_ct": "cipher-reply",
-                    "nonce": "n",
-                    "K_user": "k",
-                    "K_enclave": "e",
-                },
-                5000,
-            )
-            db.patch_blob(
-                uid,
-                "model_api_runtime",
-                {"v2_reply_cursor_seq": input_seq_box["value"]},
-            )
-
-        monkeypatch.setattr(
-            worker,
-            "_assert_prompt_tail_exact",
-            _assert_then_finish_concurrent_chat,
-        )
-
     deps = worker.TurnDeps(
         read_messages=lambda _uid: [],
         read_messages_after_seq=_messages_after,
         read_tail_after_seq=_tail_after,
-        read_compaction_tail_after_seq=_tail_after,
-        read_summary_with_seq=_summary_with_send_race,
+        read_capture_tail_after_seq=_tail_after,
+        read_recent_turns=_recent_turns,
         resolve_provider=lambda _uid: (None, {}),
         mint_enclave_token=lambda _uid: "rt",
+        load_workspace_prompt=_load_workspace_with_send_race,
         apply_pending_effects=serve_worker._apply_pending_effects_for_user,
     )
 
@@ -1215,9 +1168,7 @@ def test_wake_yields_snapshot_race_input_to_chat_without_duplicate_reply(
         )
     ) == "completed"
     assert provider_calls == []
-    assert cursor.load_seq(core_store.get_store(uid)) == (
-        input_seq_box["value"] if advance_cursor_after_snapshot else 0
-    )
+    assert cursor.load_seq(core_store.get_store(uid)) == 0
     assert jobs_store.get_job_status(
         wake_id,
         user_id=uid,
@@ -1239,15 +1190,12 @@ def test_wake_yields_snapshot_race_input_to_chat_without_duplicate_reply(
     input_seq = input_seq_box["value"]
     assert input_seq > 0
     assert cursor.load_seq(core_store.get_store(uid)) == input_seq
-    if advance_cursor_after_snapshot:
-        assert provider_calls == []
-    else:
-        assert len(provider_calls) == 1
-        assert sum(
-            "answer this in the chat lane" in str(message.get("content") or "")
-            for message in provider_calls[0]
-            if isinstance(message, dict)
-        ) == 1
+    assert len(provider_calls) == 1
+    assert sum(
+        "answer this in the chat lane" in str(message.get("content") or "")
+        for message in provider_calls[0]
+        if isinstance(message, dict)
+    ) == 1
     with db.get_pool().connection() as conn:
         reply_count = conn.execute(
             "SELECT COUNT(*) FROM chat_messages "
@@ -1296,7 +1244,7 @@ def test_same_timestamp_initial_midturn_and_successor_inputs_are_consumed_once(m
         return _plain_rows(
             after_seq, limit=limit, oldest_first=False, through_seq=through_seq)
 
-    def _compact_after(_uid: str, after_seq: int, limit: int, *, through_seq=None):
+    def _capture_after(_uid: str, after_seq: int, limit: int, *, through_seq=None):
         return _plain_rows(
             after_seq, limit=limit, oldest_first=True, through_seq=through_seq)
 
@@ -1314,13 +1262,22 @@ def test_same_timestamp_initial_midturn_and_successor_inputs_are_consumed_once(m
     seq3_box = {"value": 0}
     seq4_box = {"value": 0}
 
-    def _summary_with_snapshot_race(_uid: str):
-        # Arrives after the initial coalesce but before chat_max_seq/tail are
-        # snapped. It belongs in the base tail and must not be folded a second
-        # time at the first provider boundary.
+    def _load_workspace(*_args, **_kwargs):
+        # Arrives after initial coalescing but before the raw-chat snapshot.
         if not seq3_box["value"]:
             seq3_box["value"] = _append_user("m3", "third-snapshot-race")
-        return "", 0.0, 0, 0
+        return {"trusted_system_blocks": [], "working_memory": ""}
+
+    def _recent_turns(_uid: str, _max_turns: int, row_cap: int, *, through_seq):
+        rows = _plain_rows(
+            0,
+            limit=row_cap,
+            oldest_first=False,
+            through_seq=through_seq,
+        )
+        for row in rows:
+            row["_genuine_user"] = row.get("role") == "user"
+        return {"rows": rows, "source_truncated": False}
 
     def _capability(*args, **kwargs):
         if not seq4_box["value"]:
@@ -1349,8 +1306,9 @@ def test_same_timestamp_initial_midturn_and_successor_inputs_are_consumed_once(m
         read_messages=lambda _uid: [],
         read_messages_after_seq=_messages_after,
         read_tail_after_seq=_tail_after,
-        read_compaction_tail_after_seq=_compact_after,
-        read_summary_with_seq=_summary_with_snapshot_race,
+        read_capture_tail_after_seq=_capture_after,
+        read_recent_turns=_recent_turns,
+        load_workspace_prompt=_load_workspace,
         resolve_provider=lambda _uid: (None, {}),
         mint_enclave_token=lambda _uid: "rt",
         apply_pending_effects=_apply,

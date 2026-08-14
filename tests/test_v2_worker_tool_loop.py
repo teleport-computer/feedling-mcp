@@ -383,7 +383,6 @@ def test_chat_worldbook_matches_current_turn_without_rewriting_user_text(
     deps = _deps(messages=turn_messages)
     monkeypatch.setattr(worker.db, "chat_max_seq", lambda _uid: 1)
     monkeypatch.setattr(worker.db, "chat_seqs_after_seq", lambda *_a, **_k: [1])
-    deps.read_summary_with_seq = lambda _uid: ("", 0.0, 0, 0)
     deps.read_tail_after_seq = lambda *_a, **_k: list(turn_messages)
     deps.read_worldbook_context = read_worldbook
 
@@ -1532,7 +1531,6 @@ def test_explicit_openrouter_image_rejection_writes_terminal_history_guidance(
             }
             for message_id in message_ids
         },
-        read_summary_with_seq=lambda _user_id: ("", 0.0, 0, 0),
         resolve_provider=lambda _user_id: (_BYOK, {}),
         mint_enclave_token=lambda _user_id: "rt",
     )
@@ -1767,7 +1765,6 @@ def test_ordered_chat_replies_settle_each_user_message_separately(monkeypatch):
     written: list[str] = []
     deps = _late_input_deps(uid, written)
     deps.ordered_chat_replies = True
-    deps.read_summary_with_seq = lambda _uid: ("", 0.0, 0, 0)
     deps.read_tail_after_seq = lambda *_a, **_k: [
         {"id": "A", "seq": seq_a, "ts": 10.0, "role": "user", "content": "first A"}
     ]
@@ -1944,7 +1941,6 @@ def test_new_turn_after_intermediate_failure_starts_after_failure_cursor(
         resolve_provider=lambda _user_id: (_BYOK, {}),
         mint_enclave_token=lambda _user_id: "rt",
         apply_pending_effects=serve_worker._apply_pending_effects_for_user,
-        read_summary_with_seq=lambda _user_id: ("", 0.0, 0, 0),
         read_tail_after_seq=_read_tail_after_seq,
     )
 

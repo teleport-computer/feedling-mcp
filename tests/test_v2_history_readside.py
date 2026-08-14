@@ -506,15 +506,6 @@ def _patch_store(monkeypatch, *, max_seq=100, generation=7, watermark=60,
     monkeypatch.setattr(history_readside.db, "chat_max_seq", lambda uid: max_seq)
     monkeypatch.setattr(
         history_readside.db, "get_runtime_generation", lambda uid: generation)
-    def forbidden_summary_read(*args, **kwargs):
-        raise AssertionError("raw history search must not read compact summaries")
-
-    monkeypatch.setattr(
-        history_readside.jobs_store, "get_summary_frontier_state",
-        forbidden_summary_read)
-    monkeypatch.setattr(
-        history_readside.jobs_store, "list_level0_summary_leaves",
-        forbidden_summary_read)
     calls: list[tuple] = []
 
     def default_candidates(uid, *, min_seq, max_seq, start_ts=None, end_ts=None, limit):

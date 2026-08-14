@@ -228,7 +228,7 @@ def test_fold_uses_read_messages_when_read_messages_since_absent():
 
 def test_build_messages_appends_folded_inputs_and_tool_results():
     build_messages = worker._make_build_messages_fn(
-        system_prompt="sys", summary="", tail=[{"role": "user", "content": "earlier"}]
+        system_prompt="sys", tail=[{"role": "user", "content": "earlier"}]
     )
     from provider_types import ToolCall, ToolExchange, ToolResult
 
@@ -253,7 +253,7 @@ def test_build_messages_appends_folded_inputs_and_tool_results():
 
 def test_build_messages_with_no_folded_inputs_or_results_is_stable():
     build_messages = worker._make_build_messages_fn(
-        system_prompt="sys", summary="", tail=[{"role": "user", "content": "hello"}]
+        system_prompt="sys", tail=[{"role": "user", "content": "hello"}]
     )
     messages = build_messages([])
     assert messages[0]["role"] == "system"

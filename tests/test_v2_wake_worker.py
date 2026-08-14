@@ -1,6 +1,6 @@
 """Wake-lane processing on the unified `tool_loop.run_tool_loop`.
 
-`_run_wake` mirrors `_run_compaction`'s self-contained shape (own try/except).
+`_run_wake` has its own self-contained try/except.
 Weak wake failures remain silent; a scheduled reminder failure is durably
 surfaced because that lane has an explicit delivery obligation. On a
 SUCCESSFUL model-authored reply it writes an encrypted
@@ -109,7 +109,7 @@ def _apply_effects(user_id):
     return v2_effect_outbox.apply_pending_effects(user_id, dispatch=_reply_effect_dispatch(user_id))
 
 
-def _wake_deps(*, summary="", tail=None, has_genuine_user_history=None):
+def _wake_deps(*, tail=None, has_genuine_user_history=None):
     return worker.TurnDeps(
         read_messages=lambda uid: [],
         resolve_provider=lambda uid: (_BYOK, {}),
@@ -787,18 +787,17 @@ def test_automatic_heartbeat_with_empty_history_skips_the_provider(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    ("summary", "tail"),
+    "tail",
     [
-        ("A summary exists without any real user message.", []),
-        ("", [{"id": "m1", "ts": 1.0, "role": "assistant", "content": "hello"}]),
+        [],
+        [{"id": "m1", "ts": 1.0, "role": "assistant", "content": "hello"}],
     ],
 )
 def test_automatic_heartbeat_authoritative_no_user_history_skips_all_prompt_work(
     monkeypatch,
-    summary,
     tail,
 ):
-    """Summary/assistant artifacts cannot authorize a proactive provider call."""
+    """Assistant artifacts cannot authorize a proactive provider call."""
     uid = f"u_wake_no_authority_{len(tail)}"
     conftest.seed_user(uid)
     _reset(uid)
@@ -814,7 +813,6 @@ def test_automatic_heartbeat_authoritative_no_user_history_skips_all_prompt_work
 
     monkeypatch.setattr(provider_client, "chat_completion_async", _fake)
     deps = _wake_deps(
-        summary=summary,
         tail=tail,
         has_genuine_user_history=lambda user_id: False,
     )
@@ -1853,8 +1851,8 @@ def test_run_wake_provider_error_silent_mark_failed(monkeypatch):
 
 def test_run_wake_unexpected_exception_also_silent_mark_failed(monkeypatch):
     """Any other unexpected exception during the wake turn (e.g. recent history
-    blowing up) must be caught by _run_wake's own try/except, same as
-    _run_compaction — never propagate, never surface a user error chip."""
+    blowing up) must be caught by _run_wake's own try/except — never
+    propagate and never surface a user error chip."""
     uid = "u_wake_boom"
     conftest.seed_user(uid)
     _reset(uid)
@@ -1886,7 +1884,7 @@ def test_run_wake_unexpected_exception_also_silent_mark_failed(monkeypatch):
     assert "wake_failed" in (row[1] or "")
 
 
-def test_wake_uses_recent_context_without_compact_dependencies(monkeypatch):
+def test_wake_uses_recent_context_without_legacy_tail_dependencies(monkeypatch):
     uid = "u_wake_recent_context"
     conftest.seed_user(uid)
     _reset(uid)
@@ -1894,7 +1892,7 @@ def test_wake_uses_recent_context_without_compact_dependencies(monkeypatch):
     claimed_by = _claim(job_id)
 
     def forbidden(*_args, **_kwargs):
-        raise AssertionError("conversation compact dependency was touched")
+        raise AssertionError("legacy tail dependency was touched")
 
     monkeypatch.setattr(worker.db, "chat_max_seq", lambda _uid: 20)
     calls = _script_provider(monkeypatch, [_text_round("")])
@@ -1921,7 +1919,6 @@ def test_wake_uses_recent_context_without_compact_dependencies(monkeypatch):
         read_messages=lambda _uid: [],
         resolve_provider=lambda _uid: (_BYOK, {}),
         mint_enclave_token=lambda _uid: "rt",
-        read_summary_with_seq=forbidden,
         read_tail_after_seq=forbidden,
         read_recent_turns=lambda user_id, max_turns, row_cap, **kwargs: (
             recent_calls.append((user_id, max_turns, row_cap, kwargs))
@@ -1961,10 +1958,8 @@ def test_wake_uses_recent_context_without_compact_dependencies(monkeypatch):
     assert "wake history assistant" in rendered
 
 
-def test_run_wake_tolerates_missing_read_summary_read_tail(monkeypatch):
-    """Mirrors _run_compaction's degrade-gracefully contract for deps without
-    read_summary/read_tail wired (defaults None): falls back to empty summary/
-    tail rather than crashing on a None call."""
+def test_run_wake_without_recent_reader_retires_silently(monkeypatch):
+    """Missing recent-history wiring must not turn a weak wake into a failure."""
     uid = "u_wake_nodeps"
     conftest.seed_user(uid)
     _reset(uid)
@@ -1993,7 +1988,7 @@ def test_run_wake_tolerates_missing_read_summary_read_tail(monkeypatch):
         read_messages=lambda uid_: [],
         resolve_provider=lambda uid_: (_BYOK, {}),
         mint_enclave_token=lambda uid_: "rt",
-        # read_tail/read_summary left at their TurnDeps default of None.
+        # read_recent_turns remains at its TurnDeps default of None.
     )
 
     status = asyncio.run(worker._run_wake(

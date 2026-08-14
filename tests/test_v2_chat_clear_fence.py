@@ -140,19 +140,23 @@ def test_clear_atomically_removes_live_chat_context_but_retains_independent_stat
     job_id, old_generation = _running_job(uid)
     assert old_generation == 7
 
-    assert jobs_store.upsert_summary_row_cas(
-        uid,
-        summary_envelope={"body_ct": "encrypted-summary"},
-        watermark_ts=10.0,
-        expected_version=0,
-        watermark_seq=seq,
-        require_source_row=True,
-    )
-    assert jobs_store.seed_legacy_summary_segment(
-        uid,
-        expected_version=1,
-        translated_watermark_seq=seq,
-    )
+    # Phase 1 keeps the legacy tables only so clear/account-reset can remove
+    # rows written by older deployments; seed those rows directly because the
+    # runtime summary writer no longer exists.
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            "INSERT INTO v2_conversation_summary "
+            "(user_id,summary_envelope,watermark_ts,watermark_seq,version) "
+            "VALUES (%s,%s,10.0,%s,1)",
+            (uid, Jsonb({"body_ct": "encrypted-summary"}), seq),
+        )
+        conn.execute(
+            "INSERT INTO v2_conversation_summary_segments "
+            "(user_id,coverage_kind,level,start_seq,end_seq,source_message_count,"
+            "legacy_opaque_through_seq,summary_envelope) "
+            "VALUES (%s,'legacy_opaque',0,0,%s,0,%s,%s)",
+            (uid, seq, seq, Jsonb({"body_ct": "encrypted-summary"})),
+        )
     artifact = jobs_store.put_workspace_entry_cas(
         uid,
         "/artifacts/pre-clear.txt",
@@ -483,15 +487,6 @@ def test_clear_first_rejects_paused_summary_artifact_trajectory_and_status_write
     with ThreadPoolExecutor(max_workers=7) as pool:
         clear_future = pool.submit(db.chat_clear, uid)
         assert clear_has_exclusive.wait(timeout=3)
-        summary_future = pool.submit(
-            jobs_store.upsert_summary_row_cas,
-            uid,
-            summary_envelope={"body_ct": "stale-summary"},
-            watermark_ts=10.0,
-            expected_version=0,
-            watermark_seq=seq,
-            require_source_row=True,
-        )
         artifact_future = pool.submit(
             jobs_store.put_workspace_entry_cas,
             uid,
@@ -530,7 +525,6 @@ def test_clear_first_rejects_paused_summary_artifact_trajectory_and_status_write
             "turn_failed:providererror",
         )
         for future in (
-            summary_future,
             artifact_future,
             trajectory_future,
             status_future,
@@ -541,7 +535,6 @@ def test_clear_first_rejects_paused_summary_artifact_trajectory_and_status_write
                 future.result(timeout=0.1)
         release_clear.set()
         assert clear_future.result(timeout=5) == 1
-        assert summary_future.result(timeout=5) is False
         assert artifact_future.result(timeout=5) is None
         with pytest.raises(ValueError, match="trajectory source job generation is stale"):
             trajectory_future.result(timeout=5)
@@ -551,9 +544,6 @@ def test_clear_first_rejects_paused_summary_artifact_trajectory_and_status_write
         assert failure_future.result(timeout=5) is False
 
     with db.get_pool().connection() as conn:
-        assert conn.execute(
-            "SELECT COUNT(*) FROM v2_conversation_summary WHERE user_id=%s", (uid,)
-        ).fetchone()[0] == 0
         assert conn.execute(
             "SELECT COUNT(*) FROM v2_workspace_entries WHERE user_id=%s", (uid,)
         ).fetchone()[0] == 0

@@ -86,7 +86,6 @@ from identity import identity_core
 from memory import memory_core
 from screen import screen_read_core
 from model_api_runtime.v2 import context as v2_context
-from model_api_runtime.v2 import compaction as v2_compaction
 from model_api_runtime.v2 import cursor as v2_cursor
 from model_api_runtime.v2 import child_supervisor as v2_child_supervisor
 from model_api_runtime.v2 import claim_recovery as v2_claim_recovery
@@ -102,7 +101,6 @@ from model_api_runtime.v2 import runner_identity
 from model_api_runtime.v2 import scheduler
 from model_api_runtime.v2 import screen_chat as v2_screen_chat
 from model_api_runtime.v2 import screen_watch
-from model_api_runtime.v2 import summary_frontier as v2_summary_frontier
 from model_api_runtime.v2 import usage_rollup
 from model_api_runtime.v2 import watchdog as v2_watchdog
 from model_api_runtime.v2 import worker as v2_worker
@@ -448,10 +446,10 @@ def _caption_envelope(m: dict) -> dict | None:
 def _caption_text(m, *, mid, token, fallback: str) -> str:
     """附件行（image / file）的可见文本：随附件发的那句话。
 
-    选中行在进入这里之前已由 tail/compaction window 做了有界筛选。因此每个
+    选中行在进入这里之前已由有界 replay/capture window 筛选。因此每个
     真实存在的 caption 都必须完整解密；解密或 UTF-8 校验失败要让整个读取
-    显式失败，这样 turn/caption compaction 就不会越过这条文本推进 cursor /
-    summary watermark。只有原本就没有 caption，或 caption 明文确实为空，才使用
+    显式失败，这样 Chat/Capture 就不会越过不可读文本推进各自 cursor。只有原本
+    就没有 caption，或 caption 明文确实为空，才使用
     无内容附件标记 `fallback`。
     """
     cap_env = _caption_envelope(m)
@@ -468,7 +466,7 @@ def _caption_text(m, *, mid, token, fallback: str) -> str:
 
 
 def _image_row(m, *, mid, ts, role, token) -> dict:
-    """图片行 -> **纯文本** tail 行 + 两个非敏感标记。绝不放 b64——compaction 共用这条读路径。"""
+    """图片行 -> **纯文本** tail 行 + 两个非敏感标记。绝不放 b64。"""
     text = _caption_text(m, mid=mid, token=token, fallback=_IMAGE_MARKER)
     row = {
         "id": mid,
@@ -489,8 +487,8 @@ def _file_row(m, *, mid, ts, role, token) -> dict:
     文件消息的明文是**原始文件字节**（`chat_send_core`: `user_plaintext = file_parse["bytes"]`，
     `content_type="file"`）。没有这个分支，这一行会掉进下面通用的
     `_decrypt_envelope_via_enclave(...).decode("utf-8")`，一个 PDF 立刻 `UnicodeDecodeError`
-    —— 而它会**抛出整个 `_read_tail`**，连带打死该用户的 chat / wake / extraction /
-    compaction 四条路径（compaction 用 limit=10_000 调同一个函数）。
+    —— 而它会**抛出整个 `_read_tail`**，连带打死该用户的 chat / wake / extraction
+    三条路径。
 
     这个洞是两个各自正确的特性撞出来的：上游加文件上传时 V2 还不存在，V2 写这条读路径时
     `content_type == "file"` 还不存在。两边的测试都覆盖不到。
@@ -816,8 +814,8 @@ def _decrypt_chat_rows(
 ) -> list[dict]:
     """Decrypt the prompt window, emitting ONE trace rollup for the whole batch.
 
-    The row loop below issues an enclave call per row (up to
-    FEEDLING_V2_TAIL_HARD_CAP), which at two success trace events each used to
+    The row loop below issues an enclave call per row in the bounded prompt or
+    extraction window, which at two success trace events each used to
     emit ~120 events per turn into a 500-event ring — one chat turn evicted the
     entire debug trace. Failures inside the batch still trace individually.
     """
@@ -1097,8 +1095,8 @@ def _scrub_leaked_thinking_rows(rows: list[dict]) -> list[dict]:
     剥离失败（FAILED）时**不能原样保留**——那等于把可抄的格式继续摆在模型面前
     （Codex review 2026-08-08 Important #2）。但也不整行换占位符：那些文字本来
     就已经发到用户眼前过了，抹掉整行只会平白打断对话连贯性。折中是只删标签壳、
-    保留文字，格式没了、内容还在。行的 id/ts/seq 一律原样保留，compaction /
-    capture 的水位连续性不受影响。
+    保留文字，格式没了、内容还在。行的 id/ts/seq 一律原样保留，capture
+    的 cursor 连续性不受影响。
     """
     from core import self_thinking as _st
 
@@ -1158,10 +1156,10 @@ def _read_tail_after_seq(
     *,
     through_seq: int | None = None,
 ) -> list[dict]:
-    """Newest bounded verbatim window after a summary seq watermark."""
+    """Newest bounded verbatim window after an exact sequence cursor."""
     # chat/wake 的两个 tail 入口(ts-based 的 `_read_tail` 和这条 seq-based)都要
     # 展开引用记忆 —— 只接一条的话,实际走另一条时花园「在 CHAT 里聊聊」照样是哑的。
-    # compaction 那两个入口刻意不接:摘要不需要引用块,那是给用户看的对话资料。
+    # Capture 入口刻意不接:引用块是给对话 replay 使用的。
     return _expand_quoted_memories(
         user_id,
         _read_tail_window_after_seq(
@@ -1174,31 +1172,26 @@ def _read_tail_after_seq(
     )
 
 
-def _read_compaction_tail_after_seq(
+def _read_capture_tail_after_seq(
     user_id: str,
     after_seq: int,
     limit: int,
     *,
     through_seq: int | None = None,
 ) -> list[dict]:
-    """Oldest contiguous compaction batch after a summary seq watermark."""
+    """Oldest contiguous Capture batch after an exact sequence cursor."""
     return _read_tail_window_after_seq(
         user_id,
         after_seq,
         limit,
         oldest_first=True,
         through_seq=through_seq,
-        # Capture shares this oldest-contiguous reader with compaction. The
-        # extra plaintext routing metadata is needed only to exclude synthetic
+        # Extra plaintext routing metadata is needed only to exclude synthetic
         # and internal rows from provider disclosure; ordinary chat readers
         # retain their existing exact output contract.
         include_capture_metadata=True,
-        # The compaction fold turns these rows into an IMMUTABLE coverage
-        # claim, so a GC-able synthetic row (verify_ping/resident_maintenance)
-        # must never be folded — deleting it later permanently corrupts the
-        # frontier. The gap counter and both witnesses exclude the same set.
-        # (The verbatim tail reader, _read_tail_after_seq, does NOT exclude
-        # them: it only displays recent rows and never freezes coverage.)
+        # Capture must not disclose synthetic verify/maintenance rows to the
+        # provider. The verbatim Chat reader may still display recent rows.
         exclude_synthetic_sources=True,
     )
 
@@ -1411,215 +1404,6 @@ def _read_wake_attention_snapshot(
     )
 
 
-def _summary_metadata_frontier(state: dict) -> list:
-    """Validate canonical provenance without decrypting every retained node."""
-    opened = [
-        v2_summary_frontier.SummarySegment(
-            segment_id=int(row["segment_id"]),
-            coverage_kind=str(row["coverage_kind"]),
-            level=int(row["level"]),
-            start_seq=int(row["start_seq"]),
-            end_seq=int(row["end_seq"]),
-            source_message_count=int(row["source_message_count"]),
-            legacy_opaque_through_seq=int(
-                row.get("legacy_opaque_through_seq") or 0
-            ),
-            child_segment_ids=tuple(
-                int(value) for value in (row.get("child_segment_ids") or [])
-            ),
-            # The authenticated materialized head is the prompt payload. This
-            # sentinel lets the pure validator check content-free provenance
-            # without N enclave round-trips on every ordinary turn.
-            text="<encrypted-summary-segment>",
-        )
-        for row in list(state.get("segments") or [])
-    ]
-    validated = list(
-        v2_summary_frontier.validate_canonical_frontier(
-            opened,
-            watermark_seq=int(state.get("watermark_seq") or 0),
-            first_source_seq=int(state.get("first_source_seq") or 0),
-            covered_source_count=int(state.get("covered_source_count") or 0),
-        )
-    )
-    canonical_ids = tuple(item.segment_id for item in validated)
-    materialized_ids = tuple(
-        int(value) for value in (state.get("materialized_segment_ids") or [])
-    )
-    if canonical_ids != materialized_ids:
-        raise v2_summary_frontier.SummaryFrontierIntegrityError(
-            "materialized_head_provenance_mismatch"
-        )
-    return validated
-
-
-def _decrypt_summary_text(
-    envelope: dict,
-    *,
-    runtime_token: str,
-    purpose: str,
-) -> str:
-    """Open one canonical summary envelope and preserve integrity failures.
-
-    Enclave availability/auth failures remain ordinary runtime failures so an
-    optional checkpoint may retry later.  An authenticated decrypt rejection,
-    invalid plaintext framing, or non-UTF-8 summary means the canonical node
-    itself cannot be opened and must never be downgraded to best effort.
-    """
-    try:
-        raw = core_enclave._decrypt_envelope_via_enclave(
-            envelope,
-            None,
-            purpose=purpose,
-            runtime_token=runtime_token,
-        )
-    except RuntimeError as exc:
-        reason = str(exc or "")
-        if (
-            reason.startswith("enclave_http_403:")
-            and "decrypt_failed" in reason
-        ) or reason.startswith("enclave_plaintext_decode:"):
-            raise v2_summary_frontier.SummaryFrontierIntegrityError(
-                "canonical_summary_decrypt_failed"
-            ) from exc
-        raise
-    try:
-        return raw.decode("utf-8")
-    except UnicodeDecodeError as exc:
-        raise v2_summary_frontier.SummaryFrontierIntegrityError(
-            "canonical_summary_not_utf8"
-        ) from exc
-
-
-def _open_summary_frontier_state(user_id: str) -> tuple[dict | None, list]:
-    """Open canonical nodes only for checkpoint generation."""
-    state = jobs_store.get_summary_frontier_state(user_id)
-    if state is None:
-        return None, []
-    segment_rows = list(state.get("segments") or [])
-    if not segment_rows:
-        return state, []
-    token = _mint_runtime_token(user_id)
-    metadata = _summary_metadata_frontier(state)
-    metadata_by_id = {item.segment_id: item for item in metadata}
-    opened: list[v2_summary_frontier.SummarySegment] = []
-    for row in segment_rows:
-        env = row.get("summary_envelope")
-        if not env:
-            raise v2_summary_frontier.SummaryFrontierIntegrityError(
-                "canonical_segment_missing_envelope"
-            )
-        plaintext = _decrypt_summary_text(
-            env,
-            purpose="v2_summary_segment_read",
-            runtime_token=token,
-        )
-        meta = metadata_by_id[int(row["segment_id"])]
-        opened.append(
-            v2_summary_frontier.SummarySegment(
-                segment_id=meta.segment_id,
-                coverage_kind=meta.coverage_kind,
-                level=meta.level,
-                start_seq=meta.start_seq,
-                end_seq=meta.end_seq,
-                source_message_count=meta.source_message_count,
-                legacy_opaque_through_seq=meta.legacy_opaque_through_seq,
-                child_segment_ids=meta.child_segment_ids,
-                text=plaintext,
-            )
-        )
-    return state, opened
-
-
-
-def _read_summary_frontier_metadata(user_id: str):
-    """Read a deterministic canonical cover without opening segment prose."""
-
-    state = jobs_store.get_summary_frontier_state(user_id)
-    if state is None:
-        return None
-    if not state.get("segments") and state.get("summary_envelope"):
-        seeded = jobs_store.seed_legacy_summary_segment(
-            user_id,
-            expected_version=int(state.get("version") or 0),
-            translated_watermark_seq=int(state.get("watermark_seq") or 0),
-        )
-        if not seeded:
-            raise v2_summary_frontier.SummaryFrontierIntegrityError(
-                "legacy_summary_seed_race"
-            )
-        state = jobs_store.get_summary_frontier_state(user_id)
-    if state is None or not state.get("segments"):
-        return None
-    metadata = _summary_metadata_frontier(state)
-    deterministic = tuple(
-        v2_summary_frontier.SummarySegment(
-            segment_id=item.segment_id,
-            coverage_kind=item.coverage_kind,
-            level=item.level,
-            start_seq=item.start_seq,
-            end_seq=item.end_seq,
-            source_message_count=item.source_message_count,
-            legacy_opaque_through_seq=item.legacy_opaque_through_seq,
-            child_segment_ids=item.child_segment_ids,
-            text=v2_compaction.deterministic_fold(
-                source_message_count=item.source_message_count,
-                includes_legacy_opaque=(
-                    item.coverage_kind == "legacy_opaque"
-                ),
-            ),
-        )
-        for item in metadata
-    )
-    return v2_summary_frontier.SummaryFrontierSnapshot(
-        segments=deterministic,
-        head_version=int(state.get("version") or 0),
-        watermark_seq=int(state.get("watermark_seq") or 0),
-    )
-
-
-def _read_summary_with_seq(user_id: str) -> tuple[str, float, int, int]:
-    """Read/decrypt summary plus its exact seq coverage watermark.
-
-    Returns ``(summary, watermark_ts, version, watermark_seq)``. The timestamp
-    remains during migration/observability, but prompt selection and retention
-    use only ``watermark_seq``. A missing row returns all-zero metadata.
-    """
-    row = jobs_store.get_summary_frontier_state(user_id)
-    if row is None:
-        return "", 0.0, 0, 0
-    watermark_ts = float(row.get("watermark_ts") or 0.0)
-    watermark_seq = int(row.get("watermark_seq") or 0)
-    version = int(row.get("version") or 0)
-    has_durable_coverage = watermark_seq > 0 or watermark_ts > 0
-    if row.get("has_segment_rows") and not row.get("segments"):
-        raise v2_summary_frontier.SummaryFrontierIntegrityError(
-            "missing_canonical_segment_rows"
-        )
-    if row.get("segments") or row.get("materialized_segment_ids"):
-        _summary_metadata_frontier(row)
-
-    env = row.get("summary_envelope")
-    if not env:
-        if has_durable_coverage:
-            raise v2_summary_frontier.SummaryFrontierIntegrityError(
-                "covered_summary_missing_envelope"
-            )
-        return "", watermark_ts, version, watermark_seq
-    token = _mint_runtime_token(user_id)
-    with core_enclave.coalesced_success_trace("v2_summary_read"):
-        plaintext = _decrypt_summary_text(
-            env,
-            purpose="v2_summary_read",
-            runtime_token=token,
-        )
-    if has_durable_coverage and not plaintext.strip():
-        raise v2_summary_frontier.SummaryFrontierIntegrityError(
-            "covered_summary_empty_plaintext"
-        )
-    return plaintext, watermark_ts, version, watermark_seq
-
-
 
 def _select_agent_profile_for_turn(
     user_id: str,
@@ -1655,115 +1439,6 @@ def _select_agent_profile_for_turn(
             )
 
 
-
-def _append_summary_segment(
-    user_id: str,
-    segment_text: str,
-    *,
-    current_summary: str,
-    head_summary: str | None = None,
-    start_seq: int,
-    end_seq: int,
-    source_message_count: int,
-    watermark_ts: float,
-    expected_version: int,
-    previous_watermark_seq: int,
-) -> bool:
-    """Seal one leaf and atomically append it with the summary head CAS."""
-    store = core_store.get_store(user_id)
-    env, err = core_envelope._build_shared_envelope_for_store(
-        store, str(segment_text).encode("utf-8")
-    )
-    if env is None:
-        log.warning(
-            "[v2.serve_worker] summary segment envelope failed for %s: %s",
-            user_id,
-            err,
-        )
-        return False
-    if head_summary is None:
-        compatibility_text = str(current_summary or "").rstrip()
-        if compatibility_text:
-            compatibility_text += "\n"
-        compatibility_text += str(segment_text).strip()
-    else:
-        compatibility_text = str(head_summary).strip()
-        if not compatibility_text:
-            return False
-    head_env, head_err = core_envelope._build_shared_envelope_for_store(
-        store, compatibility_text.encode("utf-8")
-    )
-    if head_env is None:
-        log.warning(
-            "[v2.serve_worker] summary compatibility envelope failed for %s: %s",
-            user_id,
-            head_err,
-        )
-        return False
-    return jobs_store.append_summary_leaf_cas(
-        user_id,
-        summary_envelope=env,
-        head_summary_envelope=head_env,
-        start_seq=int(start_seq),
-        end_seq=int(end_seq),
-        source_message_count=int(source_message_count),
-        watermark_ts=float(watermark_ts),
-        expected_version=int(expected_version),
-        previous_watermark_seq=int(previous_watermark_seq),
-    )
-
-
-def _append_summary_checkpoint(
-    user_id: str,
-    checkpoint_text: str,
-    *,
-    head_summary: str,
-    level: int,
-    start_seq: int,
-    end_seq: int,
-    source_message_count: int,
-    child_segment_ids: tuple[int, ...],
-    expected_version: int,
-    expected_watermark_seq: int,
-    coverage_kind: str = "exact",
-    legacy_opaque_through_seq: int = 0,
-) -> bool:
-    """Seal one derived parent; all encrypted children remain immutable."""
-    store = core_store.get_store(user_id)
-    env, err = core_envelope._build_shared_envelope_for_store(
-        store, str(checkpoint_text).encode("utf-8")
-    )
-    if env is None:
-        log.warning(
-            "[v2.serve_worker] summary checkpoint envelope failed for %s: %s",
-            user_id,
-            err,
-        )
-        return False
-    head_env, head_err = core_envelope._build_shared_envelope_for_store(
-        store, str(head_summary).encode("utf-8")
-    )
-    if head_env is None:
-        log.warning(
-            "[v2.serve_worker] checkpoint prompt-view envelope failed for %s: %s",
-            user_id,
-            head_err,
-        )
-        return False
-    return jobs_store.insert_summary_checkpoint(
-        user_id,
-        summary_envelope=env,
-        head_summary_envelope=head_env,
-        level=int(level),
-        start_seq=int(start_seq),
-        end_seq=int(end_seq),
-        source_message_count=int(source_message_count),
-        child_segment_ids=tuple(int(value) for value in child_segment_ids),
-        coverage_kind=str(coverage_kind),
-        legacy_opaque_through_seq=int(legacy_opaque_through_seq),
-        expected_version=int(expected_version),
-        expected_watermark_seq=int(expected_watermark_seq),
-    )
 
 
 def _wake_decision_for_user(user_id: str, trigger: str = "heartbeat") -> dict:
@@ -4592,15 +4267,11 @@ def build_production_deps() -> v2_worker.TurnDeps:
         mint_enclave_token=_mint_runtime_token,
         read_tail=_read_tail,
         read_tail_after_seq=_read_tail_after_seq,
-        read_compaction_tail_after_seq=_read_compaction_tail_after_seq,
+        read_capture_tail_after_seq=_read_capture_tail_after_seq,
         read_voice_transcript=_read_voice_transcript,
         read_recent_turns=_read_recent_turns,
         read_temporal_snapshot=_read_temporal_snapshot,
         read_wake_attention_snapshot=_read_wake_attention_snapshot,
-        read_summary_with_seq=_read_summary_with_seq,
-        read_summary_frontier_metadata=_read_summary_frontier_metadata,
-        append_summary_segment=_append_summary_segment,
-        append_summary_checkpoint=_append_summary_checkpoint,
         read_images=_read_images,
         read_screen_frames=_read_screen_frames,
         generate_image=_generate_image_for_chat,
@@ -5196,10 +4867,9 @@ _TURN_ABSOLUTE_TIMEOUT_SEC = _positive_float_env(
     "FEEDLING_V2_TURN_ABSOLUTE_TIMEOUT_SEC", "1800"
 )
 _CHAT_TURN_BUDGET_SEC = (
-    float(v2_worker._PROMPT_CATCHUP_DEADLINE_SEC)
     # One OpenAI-compatible provider attempt may make a second full-timeout
     # wire request for a bounded reasoning/temperature compatibility fallback.
-    + float(v2_worker._TURN_MAX_LLM_CALLS) * (2.0 * 60.0)
+    float(v2_worker._TURN_MAX_LLM_CALLS) * (2.0 * 60.0)
     # One cumulative allowance shared by every serial user-MCP call across all
     # provider rounds. The worker enforces this budget, so this is a real upper
     # bound rather than MAX_TOOL_CALLS_PER_TURN * the per-call timeout.
@@ -5213,8 +4883,8 @@ _EXTRACTION_TURN_BUDGET_SEC = 3.0 * (2.0 * 90.0) + 6.0 + 120.0
 _MIN_TURN_ABSOLUTE_TIMEOUT_SEC = max(_CHAT_TURN_BUDGET_SEC, _EXTRACTION_TURN_BUDGET_SEC)
 if _TURN_ABSOLUTE_TIMEOUT_SEC < _MIN_TURN_ABSOLUTE_TIMEOUT_SEC:
     raise RuntimeError(
-        "FEEDLING_V2_TURN_ABSOLUTE_TIMEOUT_SEC must cover prompt catch-up, "
-        "all provider rounds, the MCP turn wall budget, and 120s "
+        "FEEDLING_V2_TURN_ABSOLUTE_TIMEOUT_SEC must cover all provider "
+        "rounds, the MCP turn wall budget, and 120s "
         "setup/write margin "
         f"(minimum {_MIN_TURN_ABSOLUTE_TIMEOUT_SEC:.0f}s)"
     )

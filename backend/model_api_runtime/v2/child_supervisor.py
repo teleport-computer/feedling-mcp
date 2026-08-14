@@ -36,7 +36,7 @@ per-slot 的 `_turn_starts` 字典——``turn_start is None``（slot 空闲）�
 
 **四只独立时钟**：`last_progress_age_sec`/`event_loop_heartbeat_age_sec` 只看 child event
 loop 是否还能调度；`last_slot_progress_age_sec` 看有没有 slot 穿过 claim/idle/turn 边界；
-active slot 另外有 `current_turn_stall_age_sec`（距本 turn 最近真实 provider/tool/compaction
+active slot 另外有 `current_turn_stall_age_sec`（距本 turn 最近真实 provider/tool/Capture
 边界）和 `current_turn_age_sec`（距 turn 开始）。watchdog 用 stall age 抓永久卡住的 await，
 用更大的 absolute age 防止一个不断制造进度却永不终止的回合。这样合法的多轮/600s 历史
 catch-up 不会再因为绝对年龄超过旧 180s 就被误杀，而 event-loop heartbeat 也不会替某个

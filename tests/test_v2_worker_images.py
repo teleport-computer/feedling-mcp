@@ -87,7 +87,7 @@ def test_inject_is_a_noop_without_a_reader_or_without_images():
 
 
 def test_inject_does_not_mutate_the_input_tail():
-    """compaction shares read_tail's rows; mutating them would poison the summarizer."""
+    """Prompt assembly must not mutate the shared decrypted tail rows."""
     tail = [_img_row("m1", caption="c")]
     original = dict(tail[0])
     worker._inject_tail_images(
