@@ -119,13 +119,17 @@ Dream 的现有 `force=True` 和 provider 配置成功变更属于显式强制�
 
 ## Profile 重试决策
 
-新增纯决策对象和 helper，输入只能是 content-free error class/reject code、累计 attempts 和当前时间，输出如下三类之一：
+新增纯决策对象和 helper，输入只能是 content-free error class/reject code、前一次 retry family/attempts 和当前时间，输出如下四类之一：
 
 ```python
 ProfileRetryDecision(
     disposition: Literal[
         "scheduled", "provider_config", "source_change", "terminal"
     ],
+    retry_family: Literal[
+        "transient", "shape", "provider_config", "source", "terminal"
+    ],
+    retry_attempts: int,
     retry_not_before: float,
     reason: str,
 )
@@ -165,9 +169,13 @@ provider 配置成功变更后显式 ready/enqueue 一次 profile，确保修复
   "attempts": 2,
   "reject_code": "profile_generation_failed:providererror",
   "retry_disposition": "scheduled",
+  "retry_family": "transient",
+  "retry_attempts": 2,
   "retry_not_before": 1785000000.0
 }
 ```
+
+既有 `attempts` 保留累计生成次数语义，不参与有界重试判断。`retry_attempts` 只统计当前连续失败家族；`retry_family` 取 `transient`、`shape`、`provider_config`、`source`、`terminal` 或空字符串。成功/empty 时两者清空归零；失败家族改变时从 1 重新计数。这样一个历史上成功刷新过很多次的用户，不会因为累计 `attempts` 很大而在第一次 shape 失败时直接熔断。
 
 - `scheduled`：数据库中应存在一个延迟 profile Job。
 - `provider_config`：等待 provider 配置成功变更。
@@ -207,7 +215,7 @@ provider 配置成功写入后增加 best-effort profile ready/enqueue。失败�
 ## Watchdog、准入和可观测性
 
 - `pending_job_count()` 的 watchdog/claimable 口径只统计 `available_at <= now()` 的 pending Job。
-- aggregate Admin 仍可统计所有活动行，但 pool queue metrics 必须拆成 `pending_ready` 和 `pending_delayed`。
+- aggregate Admin 仍可统计所有活动行，但 pool queue metrics 必须拆成 `pending_ready` 和 `pending_delayed`；为兼容现有消费者，旧 `pending` 字段保留为 `pending_ready` 的别名。
 - `oldest_pending_sec` 只针对 ready Job，不能让一个等待 6 小时的 profile 显示成 heavy pool 排队 6 小时。
 - delayed profile 不进入 foreground admission；现有 foreground lane filter 保持不变。
 - trajectory 和日志记录 retry disposition、attempt、delay 与 content-free error code；不得记录 Memory Garden 文本、provider 原始响应、key 或用户标识以外的内容。
