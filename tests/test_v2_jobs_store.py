@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+from datetime import date, datetime, timezone
 import os
 import sys
 import threading
@@ -115,6 +116,7 @@ def _clean_agent_jobs_table(monkeypatch):
     monkeypatch.setenv("FEEDLING_V2_TRAJECTORY_REVIEW_ENABLED", "1")
     monkeypatch.setenv("FEEDLING_V2_TRAJECTORY_REVIEW_MAX_ACTIVE", "64")
     with db.get_pool().connection() as conn:
+        conn.execute("DELETE FROM v2_wake_shadow_decisions")
         conn.execute("DELETE FROM agent_jobs")
         conn.execute("DELETE FROM v2_runtime_state")
     yield
@@ -126,6 +128,158 @@ def test_enqueue_returns_job_id_and_not_coalesced_first_time():
     job_id, coalesced = jobs_store.enqueue_job("u_js_1", "chat", reason="hi")
     assert isinstance(job_id, int) and job_id > 0
     assert coalesced is False
+
+
+def test_wake_shadow_observations_are_idempotent_and_reportable():
+    uid = "u_wake_shadow_report"
+    seed_user(uid)
+    _reset(uid)
+    heartbeat_id, _ = jobs_store.enqueue_job(uid, "heartbeat")
+    scheduled_id, _ = jobs_store.enqueue_job(uid, "scheduled")
+    screen_id, _ = jobs_store.enqueue_job(uid, "screen_watch")
+    day = date(2026, 8, 14)
+    decided_at = datetime(2026, 8, 14, 15, 0, tzinfo=timezone.utc)
+
+    assert jobs_store.record_wake_shadow_decision(
+        job_id=heartbeat_id,
+        local_day=day,
+        local_hour=23,
+        local_minute=8,
+        lane="heartbeat",
+        decision_allowed=True,
+        apns_alert_sent=True,
+        decided_at=decided_at,
+    ) is True
+    assert jobs_store.record_wake_shadow_decision(
+        job_id=scheduled_id,
+        local_day=day,
+        local_hour=2,
+        local_minute=40,
+        lane="scheduled",
+        decision_allowed=True,
+        apns_alert_sent=False,
+        decided_at=decided_at,
+    ) is True
+    assert jobs_store.record_wake_shadow_decision(
+        job_id=screen_id,
+        local_day=day,
+        local_hour=12,
+        local_minute=0,
+        lane="screen_watch",
+        decision_allowed=False,
+        apns_alert_sent=False,
+        decided_at=decided_at,
+    ) is True
+    # Same source job cannot inflate the report if the best-effort observer is
+    # replayed after a worker retry.
+    assert jobs_store.record_wake_shadow_decision(
+        job_id=heartbeat_id,
+        local_day=day,
+        local_hour=9,
+        local_minute=9,
+        lane="heartbeat",
+        decision_allowed=False,
+        apns_alert_sent=False,
+        decided_at=decided_at,
+    ) is False
+
+    # Queue cleanup must not erase the observation window. job_id is only the
+    # stable idempotency key in this table, not a foreign-key lifecycle tie.
+    with db.get_pool().connection() as conn:
+        conn.execute("DELETE FROM agent_jobs WHERE id=%s", (heartbeat_id,))
+
+    report = jobs_store.wake_shadow_report(
+        days=2,
+        bucket_start_hour=23,
+        bucket_end_hour=7,
+        through_day=day,
+    )
+
+    assert report["bucket"] == {
+        "start_hour_inclusive": 23,
+        "end_hour_exclusive": 7,
+        "crosses_midnight": True,
+        "purpose": "observation_only_not_product_policy",
+    }
+    assert {
+        key: report[key]
+        for key in (
+            "total_decisions",
+            "allowed",
+            "suppressed",
+            "apns_alert_sent",
+            "bucket_allowed",
+            "bucket_allowed_apns_alert_sent",
+        )
+    } == {
+        "total_decisions": 3,
+        "allowed": 2,
+        "suppressed": 1,
+        "apns_alert_sent": 1,
+        "bucket_allowed": 2,
+        "bucket_allowed_apns_alert_sent": 1,
+    }
+    assert report["by_lane"]["heartbeat"]["total_decisions"] == 1
+    assert report["by_lane"]["scheduled"]["bucket_allowed"] == 1
+    assert report["by_lane"]["screen_watch"]["suppressed"] == 1
+
+
+def test_wake_shadow_prunes_its_own_90_day_retention_window():
+    uid = "u_wake_shadow_retention"
+    seed_user(uid)
+    _reset(uid)
+    old_id, _ = jobs_store.enqueue_job(uid, "heartbeat")
+    fresh_id, _ = jobs_store.enqueue_job(uid, "scheduled")
+
+    assert jobs_store.record_wake_shadow_decision(
+        job_id=old_id,
+        local_day=date.today(),
+        local_hour=1,
+        local_minute=0,
+        lane="heartbeat",
+        decision_allowed=False,
+        apns_alert_sent=False,
+        decided_at=time.time(),
+    ) is True
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            "UPDATE v2_wake_shadow_decisions "
+            "SET recorded_at=now() - interval '91 days' WHERE job_id=%s",
+            (old_id,),
+        )
+
+    assert jobs_store.record_wake_shadow_decision(
+        job_id=fresh_id,
+        local_day=date.today(),
+        local_hour=2,
+        local_minute=0,
+        lane="scheduled",
+        decision_allowed=True,
+        apns_alert_sent=False,
+        decided_at=time.time(),
+    ) is True
+    with db.get_pool().connection() as conn:
+        ids = {
+            int(row[0])
+            for row in conn.execute(
+                "SELECT job_id FROM v2_wake_shadow_decisions"
+            ).fetchall()
+        }
+    assert ids == {fresh_id}
+
+
+def test_wake_shadow_rejects_impossible_apns_alert_observation():
+    with pytest.raises(ValueError, match="suppressed wake cannot send an APNs alert"):
+        jobs_store.record_wake_shadow_decision(
+            job_id=1,
+            local_day="2026-08-14",
+            local_hour=1,
+            local_minute=2,
+            lane="heartbeat",
+            decision_allowed=False,
+            apns_alert_sent=True,
+            decided_at=0.0,
+        )
 
 
 @pytest.mark.parametrize("raw", ["0", "-1", "nan", "inf", "nope"])

@@ -178,6 +178,39 @@ def _patch_user_decryptable_envelopes(monkeypatch, user_id: str) -> E2EClient:
 # _run_wake direct unit coverage
 # ------------------------------------------------------------------
 
+def test_shadow_signals_never_reach_the_wake_provider_prompt(monkeypatch):
+    """A′ signals are post-decision observations, never provider inputs.
+
+    This invariant is what permits shadow telemetry to ship without changing
+    wake product policy. Exercise the real `_run_wake` prompt assembly so both
+    its wake system prompt and runtime application data are covered.
+    """
+    uid = "u_wake_shadow_prompt_purity"
+    conftest.seed_user(uid)
+    _reset(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, "manual_wake")
+    claimed_by = _claim(job_id)
+    calls = _script_provider(monkeypatch, [_text_round("")])
+
+    status = asyncio.run(
+        worker._run_wake(
+            job_id,
+            uid,
+            "manual_wake",
+            _wake_deps(tail=[]),
+            _BYOK,
+            worker.ENCLAVE_SEMAPHORE,
+            claimed_by,
+        )
+    )
+
+    assert status == "completed"
+    assert len(calls) == 1
+    provider_wire = json.dumps(calls[0]["messages"], ensure_ascii=False)
+    assert "apns_alert_sent" not in provider_wire
+    assert "local_hour" not in provider_wire
+
+
 def test_run_wake_reply_written_and_job_completed(monkeypatch):
     uid = "u_wake_reply"
     conftest.seed_user(uid)
@@ -436,6 +469,12 @@ def test_run_wake_reply_push_carries_is_wake_true_and_manual_wake_lane(monkeypat
     monkeypatch.setattr(provider_client, "chat_completion_async", _fake)
 
     pushes = []
+    shadow = []
+
+    def _send_push(uid, **kwargs):
+        pushes.append((uid, kwargs))
+        return True
+
     deps = worker.TurnDeps(
         read_messages=lambda uid: [],
         resolve_provider=lambda uid: (_BYOK, {}),
@@ -444,7 +483,10 @@ def test_run_wake_reply_push_carries_is_wake_true_and_manual_wake_lane(monkeypat
         read_summary=lambda uid: ("", 0.0, 0),
         read_messages_after_seq=lambda uid, after_seq: [],
         apply_pending_effects=serve_worker._apply_pending_effects_for_user,
-        send_reply_push=lambda uid, **kw: pushes.append((uid, kw)),
+        send_reply_push=_send_push,
+        record_wake_shadow_decision=(
+            lambda uid, **kw: shadow.append((uid, kw)) or True
+        ),
     )
 
     status = asyncio.run(worker._run_wake(
@@ -479,6 +521,14 @@ def test_run_wake_reply_push_carries_is_wake_true_and_manual_wake_lane(monkeypat
     runtime_payload = json.loads(runtime_message["content"].split("\n", 1)[1])
     assert runtime_payload["runtime_control"]["manual_wake"] is True
     assert not any(message.get("role") == "user" for message in provider_messages[0])
+    assert len(shadow) == 1
+    shadow_uid, observed = shadow[0]
+    assert shadow_uid == uid
+    assert observed["job_id"] == job_id
+    assert observed["lane"] == "manual_wake"
+    assert observed["decision_allowed"] is True
+    assert observed["apns_alert_sent"] is True
+    assert isinstance(observed["decided_at"], float)
 
 
 def test_wake_workspace_prompt_snapshot_is_loaded_once_across_rounds(
@@ -571,7 +621,11 @@ def test_wake_workspace_prompt_failure_is_silent_before_provider(
     _reset(uid)
     job_id, _ = jobs_store.enqueue_job(uid, "heartbeat")
     claimed_by = _claim(job_id)
+    shadow = []
     deps = _wake_deps(tail=[])
+    deps.record_wake_shadow_decision = (
+        lambda uid, **kw: shadow.append((uid, kw)) or True
+    )
     deps.load_workspace_prompt = lambda *_args, **_kwargs: (
         (_ for _ in ()).throw(RuntimeError("private workspace plaintext"))
     )
@@ -610,6 +664,7 @@ def test_wake_workspace_prompt_failure_is_silent_before_provider(
         "failed",
         "wake_failed:workspace_prompt_unavailable",
     )
+    assert shadow == []
 
 
 def test_run_wake_weak_wake_sleeps_no_bubble_no_error(monkeypatch):
@@ -633,7 +688,11 @@ def test_run_wake_weak_wake_sleeps_no_bubble_no_error(monkeypatch):
         worker, "_surface_terminal_error",
         lambda *a, **k: surface_called.update(n=surface_called["n"] + 1))
 
+    shadow = []
     deps = _wake_deps(tail=[{"id": "m1", "ts": 1.0, "role": "user", "content": "hi"}])
+    deps.record_wake_shadow_decision = (
+        lambda uid, **kw: shadow.append((uid, kw)) or True
+    )
     status = asyncio.run(worker._run_wake(
         job_id, uid, "heartbeat", deps, _BYOK, worker.ENCLAVE_SEMAPHORE, claimed_by))
 
@@ -642,6 +701,41 @@ def test_run_wake_weak_wake_sleeps_no_bubble_no_error(monkeypatch):
     assert surface_called["n"] == 0
     assert _job_status(job_id)[0] == "completed"
     assert not any(e["kind"] == "error" for e in _status_events(uid))
+    assert len(shadow) == 1
+    assert shadow[0][1]["decision_allowed"] is False
+    assert shadow[0][1]["apns_alert_sent"] is False
+
+
+def test_wake_shadow_write_failure_cannot_change_the_decision(monkeypatch):
+    uid = "u_wake_shadow_fail_open"
+    conftest.seed_user(uid)
+    _reset(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, "heartbeat")
+    claimed_by = _claim(job_id)
+    _script_provider(monkeypatch, [_text_round("")])
+    deps = _wake_deps(
+        tail=[{"id": "m1", "ts": 1.0, "role": "user", "content": "hi"}]
+    )
+
+    def _observer_failure(*_args, **_kwargs):
+        raise RuntimeError("shadow database unavailable")
+
+    deps.record_wake_shadow_decision = _observer_failure
+
+    status = asyncio.run(
+        worker._run_wake(
+            job_id,
+            uid,
+            "heartbeat",
+            deps,
+            _BYOK,
+            worker.ENCLAVE_SEMAPHORE,
+            claimed_by,
+        )
+    )
+
+    assert status == "completed"
+    assert _job_status(job_id)[0] == "completed"
 
 
 def test_automatic_heartbeat_with_empty_history_skips_the_provider(monkeypatch):
@@ -664,7 +758,11 @@ def test_automatic_heartbeat_with_empty_history_skips_the_provider(monkeypatch):
         worker, "_write_encrypted_reply",
         lambda store, text: write_called.update(n=write_called["n"] + 1) or {"id": "r"})
 
+    shadow = []
     deps = _wake_deps(tail=[])
+    deps.record_wake_shadow_decision = (
+        lambda uid, **kw: shadow.append((uid, kw)) or True
+    )
     status = asyncio.run(worker._run_wake(
         job_id, uid, "heartbeat", deps, _BYOK, worker.ENCLAVE_SEMAPHORE, claimed_by))
 
@@ -672,6 +770,9 @@ def test_automatic_heartbeat_with_empty_history_skips_the_provider(monkeypatch):
     assert provider_calls == []
     assert write_called["n"] == 0
     assert _job_status(job_id)[0] == "completed"
+    assert len(shadow) == 1
+    assert shadow[0][1]["decision_allowed"] is False
+    assert shadow[0][1]["apns_alert_sent"] is False
 
 
 @pytest.mark.parametrize(
@@ -1651,7 +1752,11 @@ def test_run_wake_provider_error_silent_mark_failed(monkeypatch):
         worker, "_surface_terminal_error",
         lambda *a, **k: surface_called.update(n=surface_called["n"] + 1))
 
+    shadow = []
     deps = _wake_deps(tail=[{"id": "m1", "ts": 1.0, "role": "user", "content": "hi"}])
+    deps.record_wake_shadow_decision = (
+        lambda uid, **kw: shadow.append((uid, kw)) or True
+    )
     status = asyncio.run(worker._run_wake(
         job_id, uid, "manual_wake", deps, _BYOK, worker.ENCLAVE_SEMAPHORE, claimed_by))
 
@@ -1663,6 +1768,7 @@ def test_run_wake_provider_error_silent_mark_failed(monkeypatch):
     assert row[1] == "wake_failed:runtimeerror"
     assert not any(e["kind"] == "error" for e in _status_events(uid))
     assert jobs_store.get_wake_schedule(uid) is None
+    assert shadow == [], "provider failures are not model allow/suppress decisions"
 
 
 def test_run_wake_unexpected_exception_also_silent_mark_failed(monkeypatch):

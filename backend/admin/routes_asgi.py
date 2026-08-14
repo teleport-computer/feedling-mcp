@@ -37,6 +37,7 @@ from admin import admin_core
 from admin import tee_replication as admin_tee_replication
 from asgi import threadpool
 from asgi.http import read_json_silent
+from model_api_runtime.v2 import jobs_store
 
 router = APIRouter()
 
@@ -442,6 +443,49 @@ async def v2_metrics(request: Request):
         cache_user_id=cache_user_id,
         cache_since_ts=cache_since_ts,
         cache_until_ts=cache_until_ts,
+    )
+    return JSONResponse(payload)
+
+
+@router.get("/v1/admin/v2-wake-shadow")
+async def v2_wake_shadow(request: Request):
+    """Content-free A′ report; the local-hour bucket is caller supplied.
+
+    ``start_hour``/``end_hour`` are observation parameters, not a product
+    sleep-window definition and never enter wake policy.
+    """
+    _require_admin(request)
+
+    def _int_arg(
+        name: str,
+        minimum: int,
+        maximum: int,
+    ) -> tuple[int | None, JSONResponse | None]:
+        raw = (request.query_params.get(name) or "").strip()
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            return None, JSONResponse({"error": f"invalid_{name}"}, status_code=400)
+        if value < minimum or value > maximum:
+            return None, JSONResponse({"error": f"invalid_{name}"}, status_code=400)
+        return value, None
+
+    days, invalid = _int_arg("days", 1, 90)
+    if invalid is not None:
+        return invalid
+    start_hour, invalid = _int_arg("start_hour", 0, 23)
+    if invalid is not None:
+        return invalid
+    end_hour, invalid = _int_arg("end_hour", 0, 23)
+    if invalid is not None:
+        return invalid
+    if start_hour == end_hour:
+        return JSONResponse({"error": "invalid_hour_bucket"}, status_code=400)
+    payload = await threadpool.run_db(
+        jobs_store.wake_shadow_report,
+        days=days,
+        bucket_start_hour=start_hour,
+        bucket_end_hour=end_hour,
     )
     return JSONResponse(payload)
 
