@@ -47,6 +47,13 @@
 
 ## 记录正文（最新的在上面）
 
+## 2026-08-15
+
+### [DECISION] Runtime V2 取消 conversation compact，统一为 Profile + raw recent turns
+- Chat 自动上下文固定为最新可用 MEMORY/USER + 最多 40 个完整最近回合；wake 为同一 Profile + 最多 16 个完整最近回合。Profile 延迟或失败不阻塞，保留可解密的 last-known-good 字段。
+- 长期语义链路统一为 Chat → Capture → Memory Garden → Profile；`history_search` / `history_fetch` 只按界限读取加密 raw Chat，不再使用 summary/frontier hint。
+- 当前 worker 删除 compact/frontier/catch-up 生产者、开关和死代码。第一阶段暂留旧 schema/migration 供滚动发布与回滚，旧 `maintenance` job 只走不读内容、不调 provider 的 tombstone 完成路径。
+
 ## 2026-08-14 — V2 wake 最终出口补齐工具标记清洗
 
 **[DONE] 四条 Runtime V2 wake lane 的模型正文在加密下发前统一剥离工具协议标记。**

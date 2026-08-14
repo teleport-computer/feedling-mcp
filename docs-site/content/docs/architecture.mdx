@@ -81,37 +81,33 @@ application content, and exposes no public metrics endpoint. Because the proxy
 can reach the Docker socket, it remains a privileged component of the measured
 CVM trust boundary even with this narrow allowlist.
 
-Runtime V2 builds each turn from an encrypted hierarchical summary frontier plus
-every uncovered source message verbatim. The trusted runner decrypts that
-selected view in memory before sending ordinary plaintext messages to the
-configured model. It can additionally replay a newest suffix of complete,
-user-seeded turns that the summary already covers: Chat targets 40 turns and
-proactive wake lanes target 16. Before each provider round, the runner admits
-the largest newest complete-turn suffix that fits the resolved model window
-after the fixed prompt, summary, uncovered exact core, and provider-native tool
-transcript. Only summary-covered replay is optional; uncovered rows are never
-clipped. If the required core is too large, the runner first compacts only a
-safe answered prefix and rebuilds the prompt from the new durable watermark.
+Runtime V2 builds each automatic prompt from the latest usable encrypted
+MEMORY/USER Profile and a bounded suffix of complete, user-seeded raw Chat
+turns. Foreground Chat targets up to 40 complete recent turns; proactive wake
+lanes target up to 16 complete recent turns. The trusted runner decrypts the selected rows in memory
+before sending ordinary plaintext messages to the configured model. Before
+each provider round, the model-aware prompt frontier may reduce only the older
+optional turn suffix; the current unanswered input or labeled wake control,
+trusted policy, and provider-native tool transcript remain required. If those
+required components do not fit, the turn fails explicitly instead of silently
+dropping source messages.
 
 Proactive wake turns may read the agent identity card but cannot mutate it:
 Runtime V2 visibly refuses `identity_patch` and `identity_nudge` in background
 turns. Foreground Chat identity changes and wake-time Memory writes retain their
 existing authorization.
 
-Exact immutable leaf segments carry source-range/count
-witnesses; immutable higher-level checkpoints retain and name their ordered
-children, while one encrypted materialized view keeps ordinary turns to a
-single summary decrypt. The durable encrypted `chat_messages` rows and
-referenced object-storage bodies remain the source ledger: compaction never
-deletes them, and the 5,000-message constant bounds only a process-local hot
-window. Only explicit Chat clear or account deletion removes this conversation
-data.
+The durable encrypted `chat_messages` rows and referenced object-storage bodies
+remain the conversation source ledger. The 5,000-message constant bounds only
+a process-local hot window; automatic Runtime V2 processing does not delete raw
+Chat. Only explicit Chat clear, voice-finalization cleanup, or account deletion
+removes conversation rows under their documented fences.
 
 Runtime V2 chat turns may retrieve older ledger content on demand through two
 chat-only agent tools (`history_search`, `history_fetch`). Retrieval is
-search-first: summary leaves serve only as scan-priority hints, matching runs
-against decrypted original messages inside the enclave in bounded batches, and
-attachments contribute caption text only — object-storage bodies are never
+search-first: `history_search` scans raw encrypted Chat in bounded batches, and
+matching runs against decrypted original messages inside the enclave. Attachments
+contribute caption text only — object-storage bodies are never
 decrypted for search. Every call is bounded by row, byte, and deadline budgets
 with an authenticated resumable cursor, and an incomplete scan is reported as
 incomplete rather than as an empty result. These tools are never offered to
@@ -119,13 +115,13 @@ proactive wake lanes or subagents; a turn that reads history drops outbound
 web/MCP/task tools for the following round, and a deployment kill switch
 removes the capability entirely without touching the normal chat path.
 
-Runtime V2 coverage accounting is permanently metadata-only. Maintenance and
-synchronous prompt catch-up advance exact source witnesses using content-free
-count sentinels, and deterministic fan-out checkpoints keep the frontier bounded
-without sending historical Chat plaintext to a model provider. MEMORY/USER is
-the sole long-term semantic layer; encrypted Chat rows remain the durable source
-ledger. Restoring provider-backed conversation summaries requires rolling back
-the worker image rather than changing a runtime flag.
+The long-term semantic path is asynchronous: Chat feeds Capture, Capture writes
+the Memory Garden, and Profile refresh produces the bounded MEMORY/USER fields.
+Explicit archive lookup remains separate and raw-Chat-only. Runtime V2 no longer
+runs conversation compaction, prompt catch-up, summary frontiers, or summary
+checkpoints. Phase one retains the legacy summary/frontier tables and accepts a
+legacy `maintenance` Job only to complete it immediately during a rolling
+deploy; no current producer enqueues that work.
 
 The bounded Memory/User profile storage contract uses one
 `v2_agent_profile` document so both fields advance under one compare-and-swap.
@@ -135,18 +131,16 @@ state, disabled status, source-card counts, and generation/retry timestamps
 remain plaintext routing and observability metadata. A stale CAS loser must
 re-read and recompute rather than replaying its earlier result.
 
-When the default-off profile switch is enabled, a turn strictly reads that
-document and decrypts both fields together. Only an `ok`, non-disabled document
-whose two fields both validate replaces the rollback-compatible summary. The
-Memory and User fields are serialized into one early user-role block, labeled
-as model-derived untrusted data; they are never system instructions, and later
-verbatim conversation replay wins on conflict. Missing, pending, degraded,
-disabled, invalid, or undecryptable profiles retain the existing summary path.
-Any bounded-tail coverage-hole count is a separate late user-role data block,
-so it cannot perturb the stable profile prefix.
+Managed deployments enable Profile generation. A turn reads the latest usable
+field values and serializes Memory and User into one early user-role block,
+labeled as model-derived untrusted data; they are never system instructions,
+and later verbatim conversation replay wins on conflict. Profile refresh is
+last-known-good and non-blocking: missing, pending, degraded, disabled, invalid,
+or undecryptable refresh state does not block Chat or wake. Usable retained
+fields are kept; otherwise the turn continues with bounded recent raw Chat.
 
 Profile generation is a separate low-priority Runtime V2 job, alongside
-maintenance, capture, and dream rather than foreground Chat or wake work. The
+Capture and Dream rather than foreground Chat or wake work. The
 worker reads the complete eligible Memory Garden through a user-bound runtime
 token and fails loudly if the read-side response is truncated or incomplete.
 It sends that plaintext Garden view to the user's configured model provider,
@@ -158,9 +152,8 @@ The staged worker refreshes after a successful dream write, after Runtime V2
 cutover, and best-effort after Chat when a profile is missing, eligible for
 retry, or at least seven days old and the Garden's content-free source witness
 has changed. The seven-day floor is independent of the user's dream setting.
-The profile switch remains off by default and gates both generation and prompt
-selection. Managed Compose now explicitly enables capture and dream in the
-pooled `serve-worker`; their user-level consent gates remain independent.
+Managed Compose explicitly enables Profile, Capture, and Dream in the pooled
+`serve-worker`; their user-level consent gates remain independent.
 
 An [independent resident consumer](/docs/workflows/chat#independent-resident-loop)
 uses the same encrypted queue-and-reply protocol but runs in infrastructure the
@@ -214,9 +207,9 @@ account's chat route, provider URL, or credential.
    context. Memory then runs the ordinary capture pipeline, which renders the
    ARCHIVED FULL transcript into its window in place of that card — a call is
    distilled from everything that was said, not from a précis of it. Rows
-   already folded into the Runtime V2 conversation summary are retained
-   (deleting them would desync compaction's frozen ledger); they no longer
-   feed future context reads. If the archive or the card cannot be persisted,
+   protected by a legacy summary watermark are retained during the phase-one
+   compatibility window; they no longer feed future bounded context reads. If
+   the archive or the card cannot be persisted,
    nothing is deleted and the client may retry. In ordinary conversation
    context the card is replayed as a labelled call-record block, not as
    assistant speech: its preview holds both speakers' lines, so presenting it
@@ -365,7 +358,7 @@ is the primary multi-tenant boundary for API and persistence access.
 
 Managed Hosted Runtime V2 uses one parent with three logical pools: four
 Foreground slots for Chat and manual wakes, two Wake slots for ambient work,
-and two Heavy slots for Profile, Dream, Capture, and maintenance. Each of the
+and two Heavy slots for Profile, Dream, Capture, and legacy-job retirement. Each of the
 eight slots is a separate one-Job OS process. The parent owns scheduling,
 per-slot watchdogs, the cancellation bus connection, and a four-permit Enclave
 broker shared across all children. All three pools still run inside one
@@ -479,8 +472,8 @@ Foreground Chat serializes application-data blocks with a user role. Proactive
 turns use an assistant role for the same explicitly untrusted blocks, preventing
 platform wake control or scheduled reminder payloads from masquerading as a
 new user request. An ordinary heartbeat requires an authoritative genuine-user
-row in Chat history before any workspace, compaction, or provider-capable prompt
-work begins. A summary or assistant-only artifact is not sufficient. Scheduled
+row in Chat history before any workspace or provider-capable prompt work begins.
+An assistant-only artifact is not sufficient. Scheduled
 and manual wakes remain valid without prior history.
 
 Exact device, environment, activity, health, calendar, reminder, and photo data
@@ -500,16 +493,15 @@ health snapshot/trend reads remain compatible with outbound work.
 ### Runtime V2 prompt caching
 
 Tool schemas, runtime policy, and canonical-path-sorted trusted `/skills` are
-serialized deterministically before dynamic summary, tail, runtime context, and
-tool results. Provider adapters use route-bound cache affinity or provider-native
+serialized deterministically before dynamic Profile, recent raw turns, runtime
+context, and tool results. Provider adapters use route-bound cache affinity or provider-native
 cache controls/checkpoints where supported and normalize cache read/write/miss
 usage into whole-turn telemetry.
 
 An enabled, usable Memory/User profile forms a deterministic early prompt
 prefix after editable working memory. OpenAI Chat and Anthropic cache
-breakpoints prioritize that profile ahead of an older recent-user boundary;
-dynamic runtime context and coverage-hole notices are excluded from the stable
-profile checkpoint.
+breakpoints prioritize that profile ahead of an older recent-user boundary.
+Dynamic runtime context is excluded from the stable profile checkpoint.
 
 Editable `/memory/WORKING.md` is encrypted persistent state, but it is pull-only
 through `workspace_read`, not silently injected into future prompts or cache

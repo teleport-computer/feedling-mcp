@@ -10,6 +10,17 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **Hosted Runtime V2 now uses Profile plus bounded raw turns instead of
+  conversation compaction.** Foreground Chat receives the latest usable
+  MEMORY/USER fields and up to 40 complete recent turns; proactive wakes receive
+  the same Profile and up to 16 turns. Profile refresh lag or failure is
+  non-blocking and preserves usable last-known-good fields. Explicit
+  `history_search`/`history_fetch` reads bounded raw encrypted Chat without
+  summary hints. Legacy summary/frontier storage remains temporarily for
+  rollback and rolling-deploy compatibility, but current workers do not produce
+  or consume it and retire old `maintenance` Jobs without reading content or
+  calling a model provider.
+
 - **Hosted Runtime V2 isolates foreground Chat from background maintenance.**
   Chat/manual-wake, ambient-wake, and Heavy maintenance work now use separate
   capacity pools with one OS process per worker slot. Background work therefore

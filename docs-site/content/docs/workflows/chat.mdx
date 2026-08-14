@@ -60,6 +60,21 @@ ownership are recorded. If that ownership transition cannot complete, setup
 fails closed with a retryable error rather than silently falling back to the
 resident path.
 
+### Automatic context and archive lookup
+
+Hosted Runtime V2 automatically supplies the latest usable MEMORY/USER Profile
+plus bounded raw Chat: up to 40 complete recent turns for foreground Chat and
+up to 16 for proactive wakes. Profile refresh is asynchronous and
+last-known-good, so a missing, delayed, failed, or undecryptable refresh never
+blocks the turn; usable retained fields are preferred, and raw recent turns
+remain available independently.
+
+Long-term semantics follow Chat → Capture → Memory Garden → Profile. Older
+conversation text is not summarized into the automatic prompt. When the model
+needs the archive, Chat-only `history_search` scans bounded batches of raw
+encrypted Chat and `history_fetch` retrieves selected raw messages. These tools
+do not use summary leaves or summary watermarks as hints.
+
 ### Time grounding
 
 Hosted Runtime V2 freezes one user-local temporal snapshot for the whole turn
@@ -801,9 +816,9 @@ X-API-Key: YOUR_FEEDLING_API_KEY
 }
 ```
 
-This atomically clears the authenticated user's raw transcript plus its live
-Runtime V2 summary, chat-derived artifact views, pending effects/status, and
-reply cursor. It advances the runtime generation so an in-flight pre-clear turn
+This atomically clears the authenticated user's raw transcript plus any retained
+legacy Runtime V2 summary rows, chat-derived artifact views, pending
+effects/status, and reply cursor. It advances the runtime generation so an in-flight pre-clear turn
 cannot recreate a reply or derived context after the endpoint returns.
 
 It does not delete Memory Garden, Identity, API keys, user-authored

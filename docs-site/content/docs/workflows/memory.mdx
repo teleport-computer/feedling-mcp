@@ -15,6 +15,14 @@ instance; the second Heavy slot remains available for Dream, Capture, and other
 maintenance. Provider and write stages report progress so a slow but advancing
 profile is not mistaken for a hung Job.
 
+This Profile is Runtime V2's automatic long-term semantic context. Chat first
+feeds asynchronous Capture, Capture updates the Memory Garden, and Profile
+refresh condenses that Garden into bounded MEMORY/USER fields. Chat and wake
+then combine the latest usable fields with up to 40 and 16 complete recent raw
+turns respectively. Refresh lag or failure is non-blocking and preserves usable
+last-known-good fields; older raw conversation remains available only through
+explicit bounded `history_search`/`history_fetch` calls from foreground Chat.
+
 | Operation | Returns |
 | --- | --- |
 | `POST /v1/memory/add` | The stored v1 encrypted record. |

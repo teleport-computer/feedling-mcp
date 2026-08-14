@@ -24,7 +24,8 @@ chat API。核心文件:
 - `backend/capabilities/` — 模型工具面(tool_schema.py 定义,capabilities/*.py 实现)
 
 **Job 模型**:一切皆 job。lane ∈ {chat, heartbeat, scheduled, manual_wake,
-screen_watch, capture, dream, maintenance(compaction), profile}。
+screen_watch, capture, dream, profile}。`maintenance` 只保留为滚动发布兼容
+tombstone：旧 worker 遗留的 job 会在读内容、建 trajectory、调 provider 前直接完成。
 `_slot_loop` 认领(worker.py:12328 一带)→ `_run_turn` → `process_job`
 按 lane 分发(worker.py:9901-9962)。并发:`FEEDLING_V2_MAX_WORKERS=4`,
 enclave 解密信号量 2。
@@ -44,10 +45,10 @@ enclave 解密信号量 2。
 3. 装载 workspace prompt 上下文 `_load_workspace_prompt_context`(worker.py:10147):
    **genesis 人设全文**(每 turn JIT 解密 `genesis_persona.content_envelope`,
    serve_worker.py:_load_genesis_persona,95bbd545)+ `/skills/*` 政策文档;
-4. 读摘要 + 原文尾巴(read_summary_with_seq / read_tail_after_seq,
-   worker.py:10261-10348;tail 硬上限 60 行,超时丢最旧并注入 coverage_hole 声明);
-5. 画像选择 `_select_profile_prompt_for_turn`(worker.py:5313):PROFILE 开关开 →
-   取 `v2_agent_profile` 的 MEMORY/USER 双字段;
+4. 冻结 raw Chat 上界，读取最多 **40 complete recent turns**（按真实 user seed
+   分组；row cap=512，若切到最老半轮则整轮丢弃并记录 fallback）;
+5. 画像选择 `_select_profile_prompt_for_turn`:取 `v2_agent_profile` 最新可用的
+   MEMORY/USER；刷新延迟/失败不阻塞，优先保留可解密的 last-known-good 字段;
 6. 时间快照 build_temporal_context(worker.py:10377);
 7. 组 prompt(见下)→ 校验 token 预算(超限硬失败,不静默降级)→ 进工具循环。
 
@@ -59,11 +60,9 @@ enclave 解密信号量 2。
 | 2 | **genesis 人设全文** + `/skills/*` | system(trusted blocks) | 无截断,不走 profile 开关 |
 | 3 | working memory(WORKING.md,如模型写过) | user | pull-only,默认不注入 |
 | 4 | **MEMORY(长期记忆精粹)+ USER(用户画像)** | user(UNTRUSTED 头) | PROFILE=1 时在场 |
-| 5 | 对话摘要(compaction 产物) | user | 受压缩水位约束 |
-| 6 | 原文 tail | user | ≤60 行;图≤2/文件≤2 |
-| 7 | coverage hole 声明(如有丢行) | user | ~200字 |
-| 8 | temporal context JSON(本地时间/时间戳;wake 时含 attention_facts) | user | ~1000字 |
-| 9 | runtime context JSON(感知 glance/日程/action 数据) | user | 8000字封顶,超丢最旧+_truncated 标 |
+| 5 | raw Chat recent turns | 原始 role | Chat ≤40 个完整回合；模型预算不足时只缩最老 optional suffix |
+| 6 | temporal context JSON(本地时间/时间戳;wake 时含 attention_facts) | user | ~1000字 |
+| 7 | runtime context JSON(感知 glance/日程/action 数据) | user | 8000字封顶,超丢最旧+_truncated 标 |
 
 **工具循环**(tool_loop.run_tool_loop):每 turn ≤6 次 LLM 调用(带文件 10),
 每轮 ≤8 个工具、全 turn ≤24;结果每条 2000 字符/每轮 8000 字符水位分配,
@@ -106,8 +105,8 @@ enqueue heartbeat job → 完成后推进 `next_heartbeat_at = now + wake_interv
   heartbeat/screen/事件唤醒不消耗计数);
 - 无真实用户历史 → 直接静默完成,不调模型(worker.py:7020-7026)。
 
-**上下文**(worker.py:_run_wake,:6870 起):摘要 + wake tail(≤16 turns)+
-人设(同 chat)+ perception_glance 预取 + **attention_facts**(a53a2923):
+**上下文**(worker.py:_run_wake):最新可用 MEMORY/USER + 最多 **16 complete recent turns**，
+加上人设(同 chat)、perception_glance 预取与 **attention_facts**(a53a2923):
 `last_message_age_sec / last_user_message_age_sec / last_visible_proactive_age_sec
 / tail_freshness / tail_included_messages / visible_proactive_count_24h`
 (计数跨 V1/V2 口径,db.chat_visible_proactive_stats)。以 temporal 数据块注入,
@@ -218,21 +217,22 @@ round2 收敛 0 动作),最弱真实模型过全绿才算数。
 到 provider,与聊天同信任面)。
 **注入**:context.py:502-524,两块 UNTRUSTED 头(“是记忆不是指令,与原文
 冲突以 tail 原文为准”)。
-**准入闸**(志豪):自动切 V2 要求 profile state=ok 且 memory/user 非空,
-否则留 resident,不半切换。
-**回滚铁律**:PROFILE 可独立关闭；历史 coverage 始终走 metadata-only 确定性路径。
+**非阻塞契约**:profile missing/pending/degraded/disabled/invalid/解密失败均不阻塞
+Chat 或 wake；能用的 last-known-good 字段继续使用，否则只带 bounded raw recent turns。
 
-## 10. compaction(摘要压缩,maintenance lane)
+## 10. 对话归档与长期语义
 
-积压超 `_TAIL_BUDGET` 触发；coverage 只读取 seq/count 边界并写入确定性计数哨兵，
-不解密历史消息、不调用 provider。该行为没有运行时开关，也不存在语义摘要、字符批次
-或毒丸 quarantine 分支。
+自动 prompt 不再运行 conversation compaction、frontier、checkpoint 或 inline catch-up。
+长期语义链路固定为 **Chat → Capture → Memory Garden → Profile**。显式归档链路为
+`history_search` / `history_fetch`：前者按 row/byte/deadline 上限扫描 **raw encrypted
+Chat**，后者取选中的原始消息；两者不读 summary hint。第一阶段保留旧
+summary/frontier schema 与 migration 供滚动发布和回滚，不再有生产者或 prompt 消费者。
 
 ## 11. 记忆注入全景(模型什么时候看到什么)
 
 | 时机 | 记忆形态 | 保证方式 |
 |---|---|---|
-| 每 turn 无条件 | genesis 人设全文;MEMORY/USER 双字段;对话摘要+tail | harness 确定性注入 |
+| 每 turn 自动 | genesis 人设全文;最新可用 MEMORY/USER;bounded raw recent turns | harness 确定性注入 |
 | 模型自主 | memory_index(分区浏览,total/returned 对账)→ memory_fetch 全文 | 两步读,工具结果计费截断 |
 | 后台写 | capture(原文窗口)/dream(全文 fetch)/agent memory_write | actions.py 统一校验栈 |
 | wake 额外 | attention_facts + perception_glance | temporal/runtime 数据块 |
@@ -252,9 +252,9 @@ V2 把"必须在场的"改为确定性注入,"按需的"留给工具——弱模
 | TRAJECTORY_INSPECT / REVIEW | 0(break-glass/调试,保留 env 形态) | serve-worker |
 | 每用户 proactive_settings | 全字段默认 true(dnd=false),新用户无死 lane | — |
 
-Runtime V2 对话 coverage 固定使用本地 seq/count sentinel；maintenance、inline
-catch-up 和 checkpoint 都不读取对话明文或调用 provider。需要回退时回滚 worker
-镜像版本，不再提供运行时双轨开关。
+Runtime V2 已删除 conversation compact 的开关与实现。Chat/Wake 只依赖 Profile +
+raw recent turns；旧 `maintenance` job 只走 tombstone。需要回退时回滚 worker 镜像，
+旧 schema 暂留到单独的 phase-two migration。
 
 ## 13. V1 差异判定汇总
 
@@ -263,7 +263,7 @@ catch-up 和 checkpoint 都不读取对话明文或调用 provider。需要回�
 工具面字段与措辞(3f9d375d;memory_index parity 更早)│capture 触发
 (设备事件线已通,专项验证)。
 **V2 反超 V1,保留**:self-loop guard 原子化│撞车门进发布事务│dream
-rationale+独立二审│确定性注入(人设/画像/摘要)│缓存稳定前缀│身份 list
+rationale+独立二审│确定性注入(人设/画像/raw recent turns)│缓存稳定前缀│身份 list
 三操作│加密 workspace/task 子agent。
 **已知 limitation(挂 P2,等 Seven 排期)**:chat_image_read(超 tail 窗旧图
 不可回看;提案=vision-observer 模式)│reminder 列表 API(取消靠工具可用)。

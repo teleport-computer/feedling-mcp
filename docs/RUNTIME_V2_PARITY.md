@@ -5,6 +5,13 @@
 > 的每一处改成 **harness 确定性保证**。每项走 spec → 实现 → gatekeep →
 > 真实模型 live E2E(本地 rig,用最弱模型验收,seeded 测试绿 ≠ 过)。
 
+> **2026-08-15 架构更新**：Runtime V2 已取消 conversation compact。当前自动
+> 上下文为 Chat = 最新可用 MEMORY/USER + 最多 40 个完整最近回合，wake = 同一
+> Profile + 最多 16 个完整最近回合；Profile 延迟/失败不阻塞并保留可用的
+> last-known-good 字段。长期语义走 Chat → Capture → Memory Garden → Profile，
+> 显式历史工具只读 bounded raw encrypted Chat。下文 2026-08-05 的诊断与任务项
+> 保留为历史审计记录，不再代表 compact/frontier 的现行架构。
+
 ## 背景诊断(已核实,file:line 见各项)
 
 体感差距 = 三个正交旋钮同时变差:
@@ -28,8 +35,8 @@
 
 - ✅ P0-1 persona 注入(95bbd545)、P0-2 wake attention_facts+禁令(a53a2923,
   叠加志豪 PR #158 的 nudge 移除/语义恢复/感知 baseline/画像闸)。
-- ✅ test 开关归一「常态全开」:CAPTURE/PROFILE 硬编码 1；conversation coverage
-  固定为 metadata-only 单路径,
+- ✅ test 开关归一「常态全开」:CAPTURE/PROFILE 硬编码 1；conversation compact
+  已在 2026-08-15 删除，自动上下文固定为 Profile + raw recent turns，
   PUSH/SELF_THINKING 显式声明(86f0763c/ecb5c055/b49d8b2c;守门测试改为
   按环境分派,prod/pre 原样)。
 - ✅ 四路全环节审计结论:**wake/感知链 ~95% 对齐**(self-loop guard V2 反超
@@ -99,9 +106,9 @@
 ### P2-7 撞车门与频控 parity(并入 P0-2 ④评估结果)
 
 ### GATED(需 Seven 拍板,不阻塞上述)
-- **PROFILE 双字段 rollout**(agent_memory+user_profile):隐私代价 = 花园
-  明文进 provider。conversation coverage 不再有运行时开关；需要恢复旧语义
-  compaction 时只能回滚 worker 镜像。
+- **PROFILE 双字段 rollout**(agent_memory+user_profile)已成为现行自动长期语义层；
+  隐私代价仍是花园明文进入用户配置的 provider。要恢复旧 compact 只能回滚
+  worker 镜像，旧 schema 仅为 phase-one 滚动发布/回滚兼容保留。
 
 ## 度量
 - 每项各自的 live E2E 探针(本地 rig:serve_dev + dev enclave + 本地 PG,

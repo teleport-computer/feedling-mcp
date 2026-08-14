@@ -154,11 +154,11 @@ these settings:
 | `FEEDLING_V2_CHAT_TAIL_MAX_TURNS` | Optional maximum complete-turn replay target for foreground Chat (default 40). The model-aware prompt frontier may choose a smaller newest suffix. |
 | `FEEDLING_V2_WAKE_TAIL_MAX_TURNS` | Optional maximum complete-turn replay target for proactive wake lanes (default 16). Larger values increase user-BYOK prompt cost. |
 | `FEEDLING_V2_RECENT_TURN_ROW_CAP` | Defensive encrypted-row read cap used while locating complete recent turns (default 512). If the cap cuts the oldest selected turn, Runtime V2 drops that partial turn and records a tail fallback instead of rendering an incomplete group. |
-| `FEEDLING_V2_TAIL_BUDGET_MSGS` | Legacy compaction message threshold only. It is not interpreted as turns; use the two `*_TAIL_MAX_TURNS` settings for replay depth. |
+| `FEEDLING_V2_EXTRACTION_TAIL_MAX_ROWS` | Defensive raw-row cap for legacy Capture fallback readers (default 60). It does not control Chat or wake replay depth. |
 | `FEEDLING_V2_CAPTURE_ENABLED` / `FEEDLING_V2_DREAM_ENABLED` | Deployment gates for the pooled Runtime V2 worker's Memory Garden extraction lanes. Production and pre-production default both worker gates to `1`; test temporarily defaults V2 dream to `0` as an incident-recovery kill switch. User-level capture and dream settings remain separate and independent. Set either worker gate to `0` for an operational kill switch. When Dream is off, an explicit chat `memory_organize` request returns an explainable disabled state and does not enqueue work. |
 | `FEEDLING_V2_DREAM_CARDS_MAX_CHARS` | Maximum rendered characters of complete fetched Memory Garden cards disclosed to one hosted Dream provider call (default `60000`). Runtime V2 stops before the next whole card rather than truncating a card body. |
 | `FEEDLING_DREAM_FUSE_RATIO` / `FEEDLING_DREAM_FUSE_MIN_CARDS` | Dream blast-radius fuse, shared by resident V1 and Runtime V2. A single Dream run that would retire more than `RATIO` (default `0.8`) of the active garden **and** at least `MIN_CARDS` (default `10`) cards fails as a whole without applying anything, instead of partially rewriting the garden. With the default 10-card floor, gardens with fewer than 10 retiring cards cannot trip the fuse; lowering `MIN_CARDS` removes that exemption accordingly. Invalid values fall back to the defaults. |
-| `FEEDLING_V2_PROFILE_ENABLED` | Defaults to `0`. Enables the low-priority Memory/User profile-generation lane, its post-Chat/dream freshness triggers, and prompt selection for Chat and wake turns. Keep it off until you are ready to send the complete eligible Memory Garden plaintext to each user's configured model provider and to replace the legacy summary only when both generated fields are usable. Missing, pending, degraded, disabled, invalid, or undecryptable profiles keep the existing summary path. Generation failures are background-only and use bounded retry metadata. |
+| `FEEDLING_V2_PROFILE_ENABLED` | Enables the low-priority Memory/User profile-generation lane, its post-Chat/dream freshness triggers, and prompt selection for Chat and wake turns. Managed deployments pin it to `1`. The generated Profile is last-known-good: a missing, pending, degraded, invalid, or undecryptable refresh does not block Chat or wake, which continue with the latest usable MEMORY/USER fields plus bounded recent raw turns. |
 | `FEEDLING_V2_PROFILE_MAX_AGE_SEC` | Optional stale-profile floor, default seven days. A stale profile is refreshed only after the Garden's content-free row-count or maximum-`updated_at` witness changes; this check is independent of the user's dream setting. |
 | `FEEDLING_V2_SANDBOX_PROVIDER` | Defaults to `disabled`. Set to `e2b` only on worker deployments that are allowed to send decrypted artifact bytes to E2B. Text-only turns and virtual text edits do not need it. |
 | `E2B_API_KEY` + `FEEDLING_V2_E2B_TEMPLATE` | Required together when the sandbox provider is `e2b`. The template must implement Feedling's fixed extractor contract; inject the API key through the deployment secret channel. |
@@ -195,12 +195,13 @@ worker owns a pool plus listener/election connections; increasing workers withou
 raising the database limit can turn an apparent capacity improvement into an
 outage.
 
-Runtime V2 conversation maintenance is always metadata-only: it advances exact
-sequence/count coverage with local sentinels and never sends conversation
-history to a model provider. MEMORY/USER is the long-term semantic layer, while
-encrypted Chat rows remain the durable source ledger. Existing model-authored
-summary segments remain readable until a metadata-only checkpoint replaces
-them in the canonical frontier.
+Runtime V2 no longer runs conversation compaction or prompt catch-up.
+MEMORY/USER is the long-term semantic layer, produced asynchronously through
+Chat → Capture → Memory Garden → Profile, while encrypted Chat rows remain the
+durable source ledger and explicit history tools scan that raw ledger in bounded
+batches. Phase one retains legacy summary/frontier tables for rollback and
+rolling-deploy compatibility; a legacy `maintenance` Job is completed without
+reading content or calling a provider, and current workers do not enqueue one.
 
 Runtime V2's parent PostgreSQL pool is capped at 8 connections and every
 single-slot child at 2, for an approximate 24-connection budget with eight
@@ -331,9 +332,9 @@ otherwise healthy ciphertext permanently unreadable, while leaking it changes
 the privacy impact of a database backup.
 
 PostgreSQL also holds encrypted Runtime V2 workspace bodies and
-trajectory/review payloads. Conversation compaction does not authorize deletion
-of raw Chat rows, and the 5,000-message constant is only a process hot-window
-limit. Trajectory rows currently have no automatic time-based retention job, so
+trajectory/review payloads. Automatic prompt assembly does not delete raw Chat
+rows, and the 5,000-message constant is only a process hot-window limit.
+Trajectory rows currently have no automatic time-based retention job, so
 operators must choose and document an explicit retention/export/deletion policy
 before enabling provider-backed failure review broadly.
 
