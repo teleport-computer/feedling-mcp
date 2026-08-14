@@ -114,8 +114,9 @@ def test_language_rule_is_shared_text_with_only_the_basis_swapped():
     assert "TA 跟你对话" in chat
     assert "素材原文" in imported
     # 除了依据那几个字，其余逐字相同。
-    # 注意「 TA 跟你对话」带前导空格（中英混排），换算时要连空格一起换。
-    assert chat.replace(" TA 跟你对话", "素材原文") == imported
+    # 注意「 TA 跟你对话」带前导空格（中英混排），换算时要连空格一起换；
+    # 指代输入的那个词也跟着依据走（对话 / 素材），两边基线原文就是这么写的。
+    assert chat.replace(" TA 跟你对话", "素材原文").replace("对话", "素材") == imported
 
 
 def test_language_rule_is_conditional_not_unconditional():
@@ -128,11 +129,34 @@ def test_language_rule_is_conditional_not_unconditional():
     from memory_garden.policies import language_rule
 
     text = language_rule("conversation_capture")
-    assert "中文材料就用中文" in text
-    assert "英文材料就用英文" in text
-    assert "混合材料按每条事实自身的主语言" in text, "混合材料要有明确规则"
-    assert "别归成英文桶" not in text, "无条件句又回来了 —— 它与「英文材料就用英文」矛盾"
+    assert "中文对话就用中文" in text
+    assert "英文对话就用英文" in text
+    assert "别归成英文桶" not in text, "无条件句又回来了 —— 它与「英文对话就用英文」矛盾"
     assert "旅行" in text, "capture 原有的例子丢了"
+
+
+def test_mixed_language_material_unifies_the_taxonomy_language():
+    """混合语料必须按**整体主语言**统一，不许按每条事实各自判。
+
+    真实回归（2026-08-14 本地 genesis 导入实测）：规则一度写成
+    「混合材料按每条事实自身的主语言」——两边基线都没有这条 —— 结果一份
+    中文为主、夹一句英文的档案导进去后，同一个桶裂成
+    ``目标与成长`` 与 ``Goals & growth``。
+
+    桶/线索是分类键，裂开等于同一类记忆被拆成两堆；而
+    ``normalize_bucket_language`` 按每张卡自己的文字归一化，兜不住跨卡分裂。
+    """
+    from memory_garden.policies import language_rule
+
+    for policy in ("conversation_capture", "history_import", "curated_archive"):
+        text = language_rule(policy)
+        assert "按整体主语言统一" in text, f"{policy} 缺混合语料的统一口径"
+        assert "每条事实自身的主语言" not in text, (
+            f"{policy} 又回到按条判语言 —— 这会让同一个桶裂成两种语言"
+        )
+        assert "工作" in text and "Work" in text, (
+            f"{policy} 丢了「不能『工作』和 Work 并存」这个具体反例"
+        )
     assert "专有名词" in text
 
 

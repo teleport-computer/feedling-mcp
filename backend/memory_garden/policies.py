@@ -111,15 +111,27 @@ _RUBRIC_CURATED_ARCHIVE = KEEP_ALL_MAP_SUFFIX + "\n\n" + KEEP_ALL_WRITE_SUFFIX
 # 共用的结构性规则（⏸ 已写好，尚未接线 —— 见下方说明）
 # --------------------------------------------------------------------------- #
 
-#: ⚠️ 这段是**条件化**的，别改回无条件句。
+#: ⚠️ 这段有两条来之不易的约束，改之前先读完。
 #:
+#: **① 必须条件化，别改回无条件句。**
 #: 第一版写成「…英文就用英文；别归成英文桶/线索」，两句直接矛盾 ——
 #: 后半句无条件生效，对纯英文素材同样要求「别用英文桶」，会加剧
 #: 「英文用户拿到中文卡」这个已存在的问题（codex review 2026-08-14 指出）。
-#: 现在改成按材料语言分支，并给混合材料一条明确规则。
+#:
+#: **② 混合语料必须按整体主语言统一，不许按每条事实各自判。**
+#: 第二版改成「混合材料按每条事实自身的主语言」——这是两边基线都**没有**的
+#: 新规则，而且真跑出了问题：一份中文为主、夹一句英文的档案，导进去后同一个
+#: 桶裂成 ``目标与成长`` 和 ``Goals & growth`` 两个（本地真实 genesis 导入实测，
+#: 2026-08-14）。这直接违反 ``prompts/buckets.py`` 的硬约束「never let 工作 and
+#: Work coexist as two buckets」。
+#:
+#: 桶和线索是**分类键**，裂开等于同一类记忆被拆成两堆、检索时互相看不见；
+#: 而 ``normalize_bucket_language`` 是按**每张卡自己的文字**归一化的，兜不住
+#: 这种跨卡分裂 —— 所以只能在 prompt 这层约束「整份材料用一种分类语言」。
 LANGUAGE_RULE_TEMPLATE = """语言：所有字段（bucket/threads/summary/content）用{basis}的语言——
-中文材料就用中文（用「宠物」不是「pets」、「旅行」不是「travel」），
-英文材料就用英文（用 "pets" 不是「宠物」）；混合材料按每条事实自身的主语言。
+中文{noun}就用中文（用「宠物」不是「pets」、「旅行」不是「travel」），
+英文{noun}就用英文（用 "pets" 不是「宠物」）；
+{noun}里夹杂另一种语言时，按整体主语言统一，别让同一个桶裂成两种语言（不能「工作」和 Work 并存）。
 只有专有名词、品牌名、原话才保留原文。"""
 
 #: 各来源的「语言依据」。这是三档之间**必要**的差异，不是措辞不一致：
@@ -132,6 +144,15 @@ LANGUAGE_BASIS = {
     "conversation_capture": " TA 跟你对话",
     "history_import": "素材原文",
     "curated_archive": "素材原文",
+}
+
+#: 规则正文里指代「输入」的那个词，跟着依据走：聊天说「对话」，导入说「素材」。
+#: 两边基线原文用的就是各自这个词（capture:「中文对话就用中文」，
+#: genesis:「中文素材就用中文」），统一时保留下来，读起来才不别扭。
+LANGUAGE_MATERIAL_NOUN = {
+    "conversation_capture": "对话",
+    "history_import": "素材",
+    "curated_archive": "素材",
 }
 
 
@@ -149,7 +170,10 @@ def language_rule(policy_name: str, *, indent: str = "", first_prefix: str = "")
     """
     resolved = get_policy(policy_name)
     text = LANGUAGE_RULE_TEMPLATE.format(
-        basis=LANGUAGE_BASIS.get(resolved.name, LANGUAGE_BASIS["conversation_capture"])
+        basis=LANGUAGE_BASIS.get(resolved.name, LANGUAGE_BASIS["conversation_capture"]),
+        noun=LANGUAGE_MATERIAL_NOUN.get(
+            resolved.name, LANGUAGE_MATERIAL_NOUN["conversation_capture"]
+        ),
     )
     lines = text.splitlines()
     out = [f"{first_prefix}{lines[0]}"]
