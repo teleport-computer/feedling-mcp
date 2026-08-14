@@ -14,6 +14,7 @@ from memory_garden.policies import (
     CURATED_ARCHIVE,
     DEFAULT_POLICY,
     POLICIES,
+    UnknownPolicyError,
     get_policy,
 )
 
@@ -62,11 +63,31 @@ def test_conversation_and_archive_are_opposites():
     assert "宁多勿漏" in archive.selection_rubric
 
 
-@pytest.mark.parametrize("bad", [None, "", "   ", "nonexistent_policy"])
-def test_unknown_policy_falls_back_to_default(bad):
-    """回落而不是抛错：接线过程中漏传 policy 应退回现行为，不炸生产路径。"""
-    assert get_policy(bad) is DEFAULT_POLICY
+@pytest.mark.parametrize("empty", [None, "", "   "])
+def test_missing_policy_falls_back_to_default(empty):
+    """没传 = 旧调用方，退回现行为是安全的。"""
+    assert get_policy(empty) is DEFAULT_POLICY
     assert DEFAULT_POLICY.name == "conversation_capture"
+
+
+@pytest.mark.parametrize(
+    "typo", ["nonexistent_policy", "curated_archiv", "CONVERSATION_CAPTURE", "history import"]
+)
+def test_unknown_policy_name_raises(typo):
+    """显式传错必须炸出来 —— 静默回落的后果不对称。
+
+    ``curated_archive`` 拼错一个字母就会悄悄切成「宁少勿多」，把用户手工整理的
+    上百条事实压成一两张卡，而且没有任何信号。
+    """
+    with pytest.raises(UnknownPolicyError) as excinfo:
+        get_policy(typo)
+    # 报错要指出可用值，否则调用方还得翻源码
+    assert "conversation_capture" in str(excinfo.value)
+
+
+def test_unknown_policy_error_is_a_valueerror():
+    """沿用 ValueError 语义，调用方原有的 except ValueError 仍能兜住。"""
+    assert issubclass(UnknownPolicyError, ValueError)
 
 
 def test_policies_are_immutable():

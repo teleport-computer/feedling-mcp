@@ -10,28 +10,36 @@ IO 自己的实现是 Postgres + enclave 信封，但同一个内核将来可能
     Postgres 适配器：好，改个状态字段
     某个外部记忆库：我没有「被取代」这个概念，只能删掉或覆盖内容
 
-所以接口留一个口子：**适配器声明自己支持哪些能力，内核遇到不支持的就降级**，
-而不是假设所有后端都支持全部能力。这条现在定成本几乎为零；等适配器都写完再改，
-全部要返工。
+所以接口留一个口子：**适配器声明自己支持哪些能力**。这条现在定成本几乎为零；
+等适配器都写完再改，全部要返工。
 
-## 降级必须显式
+## 能力分两类，不能一视同仁
 
-⚠️ 静默降级会让用户以为功能都在，实际记忆库在悄悄变乱 —— 本项目在别处踩过
-静默失败的坑（工具被三层静默丢弃，模型把它说成「没权限」）。所以
-``plan_degradations`` 对每一项缺失能力都产出一条**带后果说明**的记录，
-由调用方决定报到哪（日志 / 指标 / 用户可见）。
+这是 codex code_review（2026-08-14）纠正的一处：原实现把所有缺失能力都当成
+「可降级」，写条日志继续跑。但其中两项缺了**没有正确的降级路径**：
 
-IO 的 Postgres 适配器声明支持全部能力，**所以 IO 侧行为不受这个机制影响**；
-降级只发生在外部适配器上。
+    缺 supersede    → 降级成「覆盖旧卡」会破坏「永远不硬删」这条红线，
+                      前后链条丢了就不可追溯，写日志救不回来
+    缺 atomic_batch → 降级成「逐条写」会留下半完成状态（两张 active 卡，
+                      或旧卡已退休而新卡没写成），这是数据损坏不是体验下降
+
+所以它们是**正确性前置条件**：缺了就拒绝对应操作，而不是降级。
+另外两项（custom_fields / metadata_sort）缺了只是能力退化，可以降级但必须上报。
+
+## 声明必须显式
+
+``Capabilities`` 没有默认值：外部适配器要逐项写清楚。原实现默认全 True 是
+fail-open —— 适配器漏声明会被当成「全支持」，正好错在最危险的方向。
+IO 自己的适配器用 ``FULL_CAPABILITIES``。
 
 ## 现状
 
 本模块只定义接口与降级规划，不接任何真实存储。把 IO 现有的
-锁 / 信封 / 全量替换包成适配器，是后续批次的事（会动写入路径，需 hx 拍板）。
+锁 / 信封 / 全量替换包成适配器，是后续批次的事（会动写入路径，需拍板）。
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Protocol, runtime_checkable
 
 
@@ -42,97 +50,180 @@ from typing import Any, Protocol, runtime_checkable
 
 @dataclass(frozen=True)
 class Capabilities:
-    """一个存储后端能做什么。适配器在注入时声明。
+    """一个存储后端能做什么。**每一项都必须显式声明** —— 没有默认值。
 
-    默认全 True 是有意的：**IO 自己的后端支持全部能力**，
-    只有外部适配器才需要显式关掉某几项。
+    不给默认值是有意的：适配器漏写一项时，我们宁可它报错，
+    也不要被静默当成「支持」。
     """
 
-    supports_supersede: bool = True
+    supports_supersede: bool
     """能不能「标记为被取代」而不是删掉。
 
-    做梦消矛盾、capture 的 supersede 都依赖它。不支持时旧卡只能被覆盖，
-    前后链条会丢 —— 这是 IO 记忆的一条红线（永远不硬删）。
+    ⚠️ **正确性前置条件，不可降级。** 做梦消矛盾、capture 的 supersede 都依赖它。
+    缺了只能拒绝该操作 —— 降级成覆盖会破坏「永远不硬删」，链条丢了不可追溯。
     """
 
-    supports_atomic_batch: bool = True
+    supports_atomic_batch: bool
     """能不能把一批 mutation 当作一个原子单位。
 
-    「写新卡 + 标记旧卡」必须一起成或一起败。不支持时会出现两张 active 卡，
-    或者旧卡退休了新卡没写成。
+    ⚠️ **正确性前置条件，不可降级。**「写新卡 + 标记旧卡」必须一起成或一起败。
+    缺了只能拒绝复合 mutation —— 逐条写会留下半完成状态。
     """
 
-    supports_custom_fields: bool = True
+    supports_custom_fields: bool
     """能不能原样保留 bucket / threads 这些自定义字段。
 
-    不支持时只能塞进对方的 metadata 或正文，检索与展示都会退化。
+    可降级：塞进对方的 metadata 或正文，检索与展示会退化但数据不损坏。
     """
 
-    supports_metadata_sort: bool = True
+    supports_metadata_sort: bool
     """能不能按元数据（重要度 / 时间 / 状态）排序并分页。
 
-    不支持时每轮选卡要把全部卡拉回本地再排，量大了扛不住。
+    可降级：把候选拉回本地再排，量大时延迟和内存变差但结果正确。
     """
+
+
+#: IO 自己的 Postgres + enclave 适配器：全部支持。
+FULL_CAPABILITIES = Capabilities(
+    supports_supersede=True,
+    supports_atomic_batch=True,
+    supports_custom_fields=True,
+    supports_metadata_sort=True,
+)
+
+#: 缺了就必须拒绝对应操作的能力（不是「降级后继续」）。
+CORRECTNESS_CRITICAL = frozenset({"supports_supersede", "supports_atomic_batch"})
 
 
 @dataclass(frozen=True)
 class Degradation:
-    """一条降级记录：少了什么能力、退化成什么、后果是什么。
+    """一条能力退化：少了什么、退化成什么、代价是什么。
 
-    三个字段都必填 —— ``risk`` 存在的意义就是让降级没法被静默吞掉。
+    只用于**可降级**的能力。正确性前置条件不产出 Degradation，
+    而是让相应操作直接被 ``ensure_supported`` 拒绝。
     """
 
     capability: str
     fallback: str
-    risk: str
+    cost: str
 
 
-# 能力 → (退化成什么, 后果)。文案写死在这里，保证任何调用方报出来的口径一致。
-_DEGRADATION_RULES: tuple[tuple[str, str, str], ...] = (
-    (
-        "supports_supersede",
-        "退化成直接覆盖旧卡内容",
-        "前后矛盾的链条会丢失，「这张卡被哪张取代」不可追溯；违反「永远不硬删」这条红线",
-    ),
-    (
-        "supports_atomic_batch",
-        "退化成逐条写入",
-        "中途失败会留下半完成状态：两张 active 卡，或旧卡已退休而新卡没写成",
-    ),
+@dataclass(frozen=True)
+class UnsupportedOperation(RuntimeError):
+    """缺少正确性前置条件时，对应操作被拒绝。"""
+
+    capability: str
+    operation: str
+    why: str
+
+    def __str__(self) -> str:  # pragma: no cover - 纯展示
+        return f"{self.operation} 需要 {self.capability}：{self.why}"
+
+
+_DEGRADABLE_RULES: tuple[tuple[str, str, str], ...] = (
     (
         "supports_custom_fields",
-        "退化成把 bucket/threads 塞进对方的 metadata 或正文",
-        "按桶/线索的检索与展示失效，做梦的归并判断也拿不到结构信息",
+        "把 bucket/threads 塞进对方的 metadata 或正文",
+        "按桶/线索的检索与展示失效，做梦的归并判断拿不到结构信息",
     ),
     (
         "supports_metadata_sort",
-        "退化成把全部卡拉回本地再排序",
-        "记忆量大时每轮选卡的延迟和内存都会失控",
+        "把候选拉回本地再排序",
+        "记忆量大时每轮选卡的延迟和内存变差",
     ),
 )
 
+_CRITICAL_REASONS: dict[str, str] = {
+    "supports_supersede": (
+        "降级成覆盖会破坏「永远不硬删」——旧卡的前后链条丢失且不可追溯，"
+        "写日志救不回来"
+    ),
+    "supports_atomic_batch": (
+        "降级成逐条写会留下半完成状态：两张 active 卡，或旧卡已退休而新卡没写成"
+    ),
+}
+
 
 def plan_degradations(caps: Capabilities) -> list[Degradation]:
-    """按能力声明算出这个后端要承受哪些降级。
+    """算出这个后端要承受哪些**可接受的**能力退化。
 
-    全支持返回空列表。**调用方必须把非空结果上报**（日志/指标/用户可见），
-    不允许丢弃 —— 静默降级正是这套机制要防的东西。
+    只覆盖 custom_fields / metadata_sort。正确性前置条件不在这里 ——
+    那两项缺失时不是「降级运行」，而是相应操作必须被拒绝，见 ``ensure_supported``。
+
+    **调用方必须把非空结果上报**（日志/指标/用户可见），不允许丢弃。
     """
     return [
-        Degradation(capability=name, fallback=fallback, risk=risk)
-        for name, fallback, risk in _DEGRADATION_RULES
+        Degradation(capability=name, fallback=fallback, cost=cost)
+        for name, fallback, cost in _DEGRADABLE_RULES
         if not getattr(caps, name)
     ]
 
 
-def describe_degradations(degradations: list[Degradation]) -> str:
-    """把降级列表渲染成一段人能读的说明，供日志或界面直接用。"""
-    if not degradations:
-        return "无降级：该存储后端支持全部能力。"
-    lines = ["该存储后端缺少以下能力，已降级运行："]
-    for d in degradations:
-        lines.append(f"  · {d.capability}：{d.fallback} —— 风险：{d.risk}")
+def missing_critical(caps: Capabilities) -> list[str]:
+    """列出缺失的正确性前置条件。非空即代表这个后端只能跑受限的操作集。"""
+    return sorted(name for name in CORRECTNESS_CRITICAL if not getattr(caps, name))
+
+
+def ensure_supported(caps: Capabilities, *, operation: str, requires: str) -> None:
+    """在执行需要前置条件的操作前调用；不满足直接抛。
+
+    例：做梦要 supersede 一批旧卡之前
+    ``ensure_supported(caps, operation="dream.supersede", requires="supports_supersede")``
+    """
+    if getattr(caps, requires):
+        return
+    raise UnsupportedOperation(
+        capability=requires,
+        operation=operation,
+        why=_CRITICAL_REASONS.get(requires, "该后端不支持这项能力"),
+    )
+
+
+def describe_capabilities(caps: Capabilities) -> str:
+    """渲染成一段人能读的说明，供日志或界面直接用。"""
+    lines: list[str] = []
+    critical = missing_critical(caps)
+    if critical:
+        lines.append("⚠️ 该后端缺少正确性前置条件，相关操作会被拒绝：")
+        for name in critical:
+            lines.append(f"  · {name}：{_CRITICAL_REASONS[name]}")
+    degradations = plan_degradations(caps)
+    if degradations:
+        lines.append("该后端缺少以下能力，已降级运行：")
+        for d in degradations:
+            lines.append(f"  · {d.capability}：{d.fallback} —— 代价：{d.cost}")
+    if not lines:
+        return "该存储后端支持全部能力，无降级、无受限操作。"
     return "\n".join(lines)
+
+
+# --------------------------------------------------------------------------- #
+# 快照与写入结果（CAS 协议）
+# --------------------------------------------------------------------------- #
+
+
+@dataclass(frozen=True)
+class Snapshot:
+    """一次读取的结果：卡信封 + 这批数据的版本号。
+
+    ``revision`` 是调用方做 CAS 的凭据 —— 基于这份快照算出来的 mutation
+    必须带着它回来，否则并发写会基于过期快照覆盖别人刚写的卡。
+    原实现只返回卡列表，调用方无从获得合法 token（codex code_review 2026-08-14）。
+    """
+
+    envelopes: list[dict]
+    revision: Any
+
+
+@dataclass(frozen=True)
+class ApplyResult:
+    """一次写入的结果：每个动作的结局 + 写完之后的新版本号。
+
+    ``revision`` 让调用方可以接着做下一次 CAS，不必重新 load。
+    """
+
+    results: list[dict] = field(default_factory=list)
+    revision: Any = None
 
 
 # --------------------------------------------------------------------------- #
@@ -147,17 +238,17 @@ class StoragePort(Protocol):
     读侧返回的是**信封**（明文元数据 + 密文正文原样），内核只在明文元数据上
     打分排序；解密由适配器在内核挑完候选之后另做一步。
 
-    写侧只有一个入口 ``apply``，因为「写新卡 + 标记旧卡」必须原子。
+    写侧只有 ``apply`` 一个入口，因为「写新卡 + 标记旧卡」必须原子。
     不提供 save/update/delete 三个独立方法 —— 那样在并发下会丢卡
     （IO 现有实现用跨进程 advisory fence 包住整个 load→mutate→save）。
     """
 
     def capabilities(self) -> Capabilities:
-        """声明这个后端支持哪些能力。"""
+        """声明这个后端支持哪些能力。每一项都要显式给。"""
         ...
 
-    def load(self, tenant: str, **filters: Any) -> list[dict]:
-        """取出该租户的卡信封。不解密。"""
+    def load(self, tenant: str, **filters: Any) -> Snapshot:
+        """取出该租户的卡信封 + 版本号。不解密。"""
         ...
 
     def apply(
@@ -166,11 +257,14 @@ class StoragePort(Protocol):
         mutations: list[dict],
         *,
         idempotency_key: str,
-        expected_revision: Any | None = None,
-    ) -> list[dict]:
-        """把一批 mutation 作为一个原子单位写入，返回每个动作的结果。
+        expected_revision: Any,
+    ) -> ApplyResult:
+        """把一批 mutation 作为一个原子单位写入。
 
-        ``idempotency_key`` 保证重放不产生第二份；``expected_revision``
-        做 CAS，防止基于过期快照覆盖别人刚写的卡。
+        ``expected_revision`` 来自先前 ``load`` 的 ``Snapshot.revision``；
+        与当前不符时适配器应拒绝写入（CAS 失败），由调用方重读后重算。
+        纯新增（不依赖旧快照）可以传 ``None``。
+
+        ``idempotency_key`` 保证同一批重放不产生第二份。
         """
         ...

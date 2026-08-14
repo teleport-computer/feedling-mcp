@@ -27,7 +27,7 @@ from ..text.card_text import (
     sanitize_card_labels,
 )
 from ..text import card_guard
-from ..policies import CapturePolicy, get_policy
+from ..policies import CONVERSATION_CAPTURE, CapturePolicy, get_policy
 from .buckets import COMMON_BUCKETS_GUIDANCE_V1
 
 _EMPTY_CAPTURE_REPLY = '{"cards": []}'
@@ -271,8 +271,24 @@ def build_capture_prompt(
     ``policy`` 决定用哪把「什么值得记」的尺子（见 ``memory_garden.policies``）。
     留空 = 日常聊天档，其 rubric 与本模板原先内联的那段逐字相同，
     所以默认调用的产出与重构前**字节一致**（golden fixture 守着这一点）。
+
+    ⚠️ **本模板目前只支持 conversation_capture 档**。其余两档（history_import /
+    curated_archive）的 rubric 已经收在 ``policies`` 里，但这个模板的其余部分
+    还没有随档位变化——它写死了「并入（优先）」、输出 schema 里没有
+    ``occurred_at``、也没有 tags→threads 的指令。若此时允许传 curated_archive，
+    prompt 会自相矛盾：一边说「宁多勿漏」，一边说「并入优先」且无处放日期。
+    （codex code_review 2026-08-14 指出。）
+
+    完整的策略化 —— 动作偏好、张数、日期、tags 与输出 schema 全部随档位变 ——
+    要和 genesis 接线一起做（批 7），并为每个档位建立与旧 prompt 对照的 golden。
     """
     resolved = policy if isinstance(policy, CapturePolicy) else get_policy(policy)
+    if resolved is not CONVERSATION_CAPTURE:
+        raise NotImplementedError(
+            f"本模板暂只支持 conversation_capture 档，收到 {resolved.name!r}。"
+            "其余档位的模板结构（动作偏好/日期/tags/输出 schema）尚未策略化，"
+            "见批 7。"
+        )
     return _CAPTURE_PROMPT_TEMPLATE.format(
         ai_name=(ai_name or "我").strip(),
         user_name=user_name,

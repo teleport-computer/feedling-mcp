@@ -14,19 +14,27 @@
 所以收进一处的是**结构**（卡长什么样、怎么归桶、怎么去重、怎么写入），
 分档保留的是**尺子**。见 ``docs/MEMORY_GARDEN_EXTRACTION_DESIGN.zh.md`` 第二节。
 
-## 尺子文字的来源
+## 尺子文字的来源（三段的成色不一样，别混）
 
-三段 rubric 全部**逐字摘自现有实现**，本模块不重写措辞 —— 本批的验收是
-「行为逐字节不变」，改措辞等于改行为：
+  - ``conversation_capture`` —— **逐字**取自 ``prompts/capture.py`` 原先内联的
+    「你在找什么」段（用脚本抽出来的，不是手抄）。它是唯一已接线的档位，
+    默认调用的产出与重构前字节一致，由基线快照测试守着。
 
-  - ``conversation_capture`` ← ``memory_garden/prompts/capture.py`` 的「你在找什么」段
-  - ``history_import``       ← ``genesis/prompts.py`` 的 ``FACT_MAP_PROMPT`` 过滤句
-  - ``curated_archive``      ← ``genesis/prompts.py`` 的 ``FACT_*_KEEP_ALL_SUFFIX``
+  - ``history_import`` / ``curated_archive`` —— ⚠️ **是摘录改写，不是逐字子串**。
+    原文散在 ``genesis/prompts.py`` 的 ``FACT_MAP_PROMPT`` 与
+    ``FACT_*_KEEP_ALL_SUFFIX`` 里，与 genesis 自己的输出 schema、防火墙段、
+    身份卡指令缠在一起，没法整段照搬。
+    （codex code_review 2026-08-14 指出原 docstring 把三段都说成「逐字」。）
+
+    **这两档目前不影响任何行为** —— ``build_capture_prompt`` 收到它们会直接抛
+    ``NotImplementedError``，因为那个模板的其余部分（动作偏好/日期/tags/输出
+    schema）还没随档位变。批 7 接 genesis 时，必须回到 ``genesis/prompts.py``
+    逐条核对原文，并为每个档位建立与旧 prompt 对照的 golden，才能放开。
 
 ## 现状
 
-本模块只把三把尺子收拢到一处并用测试钉死差异。真正让 genesis 改调内核，
-是批 7 的事（会动 onboarding 流程，需 hx 拍板）。
+本模块把三把尺子收拢到一处、用测试钉死它们不能被抹平。真正让 genesis 改调内核，
+是批 7 的事（会动 onboarding 流程，需拍板）。
 """
 from __future__ import annotations
 
@@ -121,12 +129,29 @@ POLICIES: dict[str, CapturePolicy] = {
 DEFAULT_POLICY = CONVERSATION_CAPTURE
 
 
-def get_policy(name: str | None) -> CapturePolicy:
-    """按名字取档位；``None`` 或未知名回落到日常聊天档。
+class UnknownPolicyError(ValueError):
+    """显式传了一个不认识的档位名。"""
 
-    回落而不是抛错，是为了让接线过程中任何一处漏传 policy 都退回现行为，
-    不至于在生产上炸掉一条落卡路径。
+
+def get_policy(name: str | None) -> CapturePolicy:
+    """按名字取档位。
+
+    ``None`` / 空串 → 回落到日常聊天档：代表「旧调用方没传」，
+    退回现行为是安全的，接线过程中漏传不会炸掉落卡路径。
+
+    **非空的未知名 → 抛 ``UnknownPolicyError``**：那基本只会是拼写或配置错误，
+    而静默回落的后果不对称 —— ``curated_archive`` 拼错一个字母就会悄悄切成
+    「宁少勿多」，把用户手工整理的上百条事实压成一两张卡，而且没有任何信号。
+    （codex code_review 2026-08-14 指出，原实现对两种情况一视同仁地回落。）
     """
-    if not name:
+    if name is None:
         return DEFAULT_POLICY
-    return POLICIES.get(str(name).strip(), DEFAULT_POLICY)
+    key = str(name).strip()
+    if not key:
+        return DEFAULT_POLICY
+    try:
+        return POLICIES[key]
+    except KeyError:
+        raise UnknownPolicyError(
+            f"未知的落卡档位 {key!r}；可用的是：{', '.join(sorted(POLICIES))}"
+        ) from None

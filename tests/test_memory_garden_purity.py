@@ -12,22 +12,34 @@ from __future__ import annotations
 import ast
 import importlib
 import pathlib
+import sys
 
-# io 侧的顶层模块名。内核出现任何一个都是硬伤。
-_FORBIDDEN_ROOTS = frozenset({
-    "db",
-    "identity",
-    "accounts",
-    "bootstrap",
-    "enclave",
-    "debug_trace",
-    "hosted_runtime",
-    "provider_client",
-    "core",     # core.store / core.enclave 等；被搬进包的纯模块应改相对引用
-    "memory",   # 老的 memory 包；包内引用一律走相对 import
-})
+_REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
+_BACKEND_ROOT = _REPO_ROOT / "backend"
+_KERNEL_ROOT = _BACKEND_ROOT / "memory_garden"
 
-_KERNEL_ROOT = pathlib.Path(__file__).resolve().parents[1] / "backend" / "memory_garden"
+# 第三方依赖白名单。内核目前一个都不用（只依赖标准库），留空集合即可；
+# 将来真要引入（例如某个纯算法库），在这里显式登记，让引入动作被看见。
+_ALLOWED_THIRD_PARTY: frozenset[str] = frozenset()
+
+
+def _backend_top_level_names() -> frozenset[str]:
+    """动态枚举 backend/ 下的所有顶层模块与包 —— 这些都是 io 侧代码。
+
+    用枚举而不是黑名单：黑名单只挡得住写它的时候想到的那几个，
+    ``from genesis import ...`` / ``from proactive import ...`` /
+    ``from model_api_runtime import ...`` 全会漏过去 —— 而批 7 接 genesis 时，
+    那正是最容易出现的倒挂（codex code_review 2026-08-14 指出）。
+    """
+    names: set[str] = set()
+    for entry in _BACKEND_ROOT.iterdir():
+        if entry.name.startswith((".", "_")) or entry.name == "memory_garden":
+            continue
+        if entry.is_dir() and (entry / "__init__.py").exists():
+            names.add(entry.name)
+        elif entry.is_file() and entry.suffix == ".py":
+            names.add(entry.stem)
+    return frozenset(names)
 
 
 def _kernel_files() -> list[pathlib.Path]:
@@ -56,14 +68,41 @@ def test_kernel_package_is_not_empty():
 
 
 def test_kernel_imports_no_io():
+    """内核不得绝对 import backend/ 下的任何模块 —— 包内引用一律相对 import。"""
+    io_names = _backend_top_level_names()
+    assert "genesis" in io_names and "db" in io_names, (
+        "backend/ 枚举结果不对，守卫会失效：" + ", ".join(sorted(io_names))[:200]
+    )
+
     offenders: list[str] = []
     for path in _kernel_files():
         rel = path.relative_to(_KERNEL_ROOT)
         for root in sorted(_imported_roots(path)):
-            if root in _FORBIDDEN_ROOTS:
-                offenders.append(f"{rel}: import {root}")
+            if root in io_names:
+                offenders.append(f"{rel}: import {root}（io 模块）")
+            elif root == "memory_garden":
+                offenders.append(f"{rel}: import memory_garden（包内请用相对 import）")
     assert not offenders, (
         "内核里出现了 io 依赖（包内引用请改成相对 import）:\n  "
+        + "\n  ".join(offenders)
+    )
+
+
+def test_kernel_imports_only_stdlib_and_allowlisted_third_party():
+    """白名单口径：除标准库与显式登记的第三方外，不许有别的绝对 import。
+
+    比「黑名单 io 模块」更严 —— 悄悄引入一个新依赖也会被这条挡下来。
+    """
+    stdlib = set(sys.stdlib_module_names)
+    offenders: list[str] = []
+    for path in _kernel_files():
+        rel = path.relative_to(_KERNEL_ROOT)
+        for root in sorted(_imported_roots(path)):
+            if root in stdlib or root in _ALLOWED_THIRD_PARTY:
+                continue
+            offenders.append(f"{rel}: import {root}")
+    assert not offenders, (
+        "内核出现了非标准库依赖。若确实需要，请登记进 _ALLOWED_THIRD_PARTY:\n  "
         + "\n  ".join(offenders)
     )
 
