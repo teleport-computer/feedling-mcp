@@ -152,23 +152,60 @@ def test_heartbeat_due_diagnosis_sql_actually_runs_against_the_real_schema():
     这里不追求断言语义,只要求:真实 schema 上能跑通,且未接管用户返回 present=False。
     """
     import conftest
+    import db
+    from accounts import registry
 
     uid = "u_wake_due_sql"
-    conftest.seed_user(uid)
+    conftest.seed_user(uid, created_at="2026-08-14T00:00:00+00:00")
 
-    # 未被调度器接管过 → 无行 → present False(顺带证明 SQL 能执行)。
-    assert jobs_store.heartbeat_due_diagnosis(uid) == {"present": False}
+    try:
+        with db.get_pool().connection() as conn:
+            created_at = conn.execute(
+                "SELECT created_at FROM users WHERE user_id=%s",
+                (uid,),
+            ).fetchone()[0]
+        assert created_at == "2026-08-14T00:00:00+00:00"
 
-    # 接管之后:武装一个已到期的心跳,应当没有任何 blocker。
-    jobs_store.upsert_wake_schedule(uid, next_heartbeat_at=1.0)
-    armed = jobs_store.heartbeat_due_diagnosis(uid)
-    assert armed["present"] is True
-    assert armed["blocked_by"] == [], armed
+        # 未被调度器接管过 → 无行 → present False(顺带证明 SQL 能执行)。
+        assert jobs_store.heartbeat_due_diagnosis(uid) == {"present": False}
 
-    # 未到期 → 唯一 blocker 是 not_due_yet(4e12 epoch ≈ 公元 128000 年)。
-    jobs_store.upsert_wake_schedule(uid, next_heartbeat_at=4e12)
-    later = jobs_store.heartbeat_due_diagnosis(uid)
-    assert later["blocked_by"] == ["not_due_yet"], later
+        # 接管之后:武装一个已到期的心跳,应当没有任何 blocker。
+        jobs_store.upsert_wake_schedule(uid, next_heartbeat_at=1.0)
+        armed = jobs_store.heartbeat_due_diagnosis(uid)
+        assert armed["present"] is True
+        assert armed["blocked_by"] == [], armed
+
+        # 未到期 → 唯一 blocker 是 not_due_yet(4e12 epoch ≈ 公元 128000 年)。
+        jobs_store.upsert_wake_schedule(uid, next_heartbeat_at=4e12)
+        later = jobs_store.heartbeat_due_diagnosis(uid)
+        assert later["blocked_by"] == ["not_due_yet"], later
+    finally:
+        try:
+            with db.get_pool().connection() as conn:
+                conn.execute(
+                    "DELETE FROM v2_wake_schedule WHERE user_id=%s",
+                    (uid,),
+                )
+                conn.execute("DELETE FROM users WHERE user_id=%s", (uid,))
+        finally:
+            with registry._users_lock:
+                registry._users[:] = [
+                    row
+                    for row in registry._users
+                    if row.get("user_id") != uid
+                ]
+
+    with db.get_pool().connection() as conn:
+        assert conn.execute(
+            "SELECT count(*) FROM v2_wake_schedule WHERE user_id=%s",
+            (uid,),
+        ).fetchone()[0] == 0
+        assert conn.execute(
+            "SELECT count(*) FROM users WHERE user_id=%s",
+            (uid,),
+        ).fetchone()[0] == 0
+    with registry._users_lock:
+        assert not any(row.get("user_id") == uid for row in registry._users)
 
 
 def test_worldbook_stats_counts_without_leaking_entry_names():
