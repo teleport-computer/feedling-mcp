@@ -244,7 +244,71 @@ e2e 查出：纯英文对话时模型把卡正文写成中文，导致归一化�
     normalize_bucket_language 修不了正文语言
     混合语种保留到什么程度，由 hx 拍板
 
-### 仍然成立的三个阻塞缺口
+---
 
-V1 真跑、genesis 真跑、加密链路真验 —— 这三项一项都没做，
-**所以现在不能合进 test**。
+## 七、三个阻塞缺口的真实验证（2026-08-15）
+
+本地 docker 环境（独立库 + **真实 enclave** + DeepSeek 真模型）逐项跑通。
+下面每条都写清「怎么证明它真的跑了」，因为「服务起来了」不等于「新代码被执行了」。
+
+### 缺口 3：加密链路 ✅
+
+    工具   tools/memory_readside_docker_e2e.py --no-up
+    链路   客户端封信封（K sealed to enclave content pk，AEAD AAD=owner|v|id）
+           → 写库 → /v1/memory/index → **内核 selector** → /v1/memory/fetch
+           → enclave 真解密
+    结果   index_count=5  fetch_count=1  index_no_raw_quote=PASS
+           missing_ids=[]  unavailable_ids=[]   ← 全部解密成功
+
+**怎么证明走的是内核**：产出的 selector trace 里 `reason=phrase_match`，
+而 `phrase_match` 这个字符串在 `backend/` 下**只存在于**
+`memory_garden/scoring/relevance.py`。服务端跑的确实是内核代码，不是残留副本。
+
+### 缺口 2：genesis 完整导入 ✅（并因此抓到一个真回归）
+
+两个档位各跑一次真实导入（supervisor 里的 genesis worker + DeepSeek）：
+
+    history 档      10 轮对话 → 落 5 张卡
+                    留下：过敏 / 工作 / 家庭 / 偏好边界 / Rust 副项目
+                    滤掉：午饭、取快递、车按喇叭、三杯咖啡 ← 一次性事件确实被过滤
+                    state=done  privacy_leak=[]  persona encrypted=true
+
+    curated 档      12 条整理好的档案 → 落 12 张卡，**零丢失**
+                    state=done  memory_action_count=12
+
+**抓到的回归**：curated 那轮出现同一个桶裂成 `目标与成长` 与 `Goals & growth`。
+根因是统一语言规则时写进了一条**两边基线都没有**的新规则「混合材料按每条事实
+自身的主语言」，同时丢掉了 genesis 原有的「别归成英文桶/线索」。
+桶/线索是分类键，裂开等于同一类记忆被拆成两堆，且直接违反
+`prompts/buckets.py` 的硬约束「never let 工作 and Work coexist as two buckets」。
+
+已改成「夹杂另一种语言时按整体主语言统一」，同一份语料复跑：12 条零丢失、
+**全部中文桶**、英文那条正确落成中文卡且保留 `Ripple` / `Rust` 专名。
+
+**改后与 origin/test 的 genesis prompt 全矩阵对比**（11 个常量 + 21 组渲染 = 32 项）：
+差异**只**落在 `FACT_WRITE_PROMPT` 的那一行语言规则上，其余 19 项逐字节一致。
+这是 hx 授权的那次统一，不是意外漂移。
+
+> ⚠️ 这里踩过一次假绿：第一版对比脚本函数名写错，两边都抛异常、
+> 各产出一个**空文件**，`diff` 自然「无差异」，差点当成通过。
+> **对比类脚本必须先断言两边输出非空**，再比内容。
+
+### 缺口 1：V1 consumer（VPS 自托管）✅
+
+真起了一个 resident consumer（`AGENT_MODE=http` → DeepSeek），连本地后端 + 真实
+enclave，发一条**真实加密**的用户消息：
+
+    用户消息 → consumer 从 enclave 解密拿到明文
+             → 调 DeepSeek → POST /v1/chat/response
+    回复     「好嘞阿哲，记住了：杭州后端、Go 选手、芒果过敏。」
+
+这条路径经过本批改动的全部 7 处 import（`agent_protocol_core.protocol_leak` /
+`self_thinking`、`memory_garden.text.card_guard` / `card_text`、
+`memory_garden.guards.dream_gates`、`memory_garden.prompts.buckets` /
+`migrate`）—— 任何一处解析失败，进程根本起不来。
+
+> 踩的坑：`tools/v1_envelope_roundtrip_test.py` 里的 `box_seal` 用的是
+> `salt=ek_pub||recipient` + 全零 nonce，与当前 enclave 的
+> `salt=None` + `nonce=sha256(ek_pub||recipient)` **不兼容**。照它写会静默失败 ——
+> consumer 只报一句「user message has no plaintext content … skipping」，
+> 看不出是封装错了。要抄就抄 `tools/memory_readside_docker_e2e.py` 那份。
