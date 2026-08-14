@@ -1659,6 +1659,52 @@ def test_inflight_job_count_filters_foreground_and_background_lanes():
     assert jobs_store.inflight_job_count() == before_all + 8
 
 
+def test_claim_skips_profile_job_until_available_at():
+    uid = "u_delayed_claim"
+    seed_user(uid)
+    _reset(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, "profile", reason="retry")
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            "UPDATE agent_jobs "
+            "SET available_at=clock_timestamp()+interval '1 hour' WHERE id=%s",
+            (job_id,),
+        )
+
+    assert jobs_store.claim_next_job("heavy-delayed", lanes={"profile"}) is None
+
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            "UPDATE agent_jobs "
+            "SET available_at=clock_timestamp()-interval '1 second' WHERE id=%s",
+            (job_id,),
+        )
+    claimed = jobs_store.claim_next_job("heavy-ready", lanes={"profile"})
+    assert claimed is not None
+    assert int(claimed["id"]) == job_id
+
+
+def test_future_job_with_missing_runtime_state_is_not_orphan_retired():
+    uid = "u_delayed_orphan_probe"
+    seed_user(uid)
+    _reset(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, "profile", reason="retry")
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            "UPDATE agent_jobs "
+            "SET available_at=clock_timestamp()+interval '1 hour' WHERE id=%s",
+            (job_id,),
+        )
+        conn.execute("DELETE FROM v2_runtime_state WHERE user_id=%s", (uid,))
+
+    assert jobs_store.claim_next_job("heavy-orphan", lanes={"profile"}) is None
+    with db.get_pool().connection() as conn:
+        row = conn.execute(
+            "SELECT status FROM agent_jobs WHERE id=%s", (job_id,)
+        ).fetchone()
+    assert row == ("pending",)
+
+
 def test_recover_killed_chat_is_exact_and_queues_terminal_failure():
     uid = "u_js_exact_watchdog_chat"
     seed_user(uid)

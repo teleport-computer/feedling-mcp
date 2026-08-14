@@ -70,14 +70,16 @@ def _migration_0085_module():
     )
 
 
-def test_first_chat_activation_is_the_single_installed_head():
+def test_agent_jobs_available_at_is_the_single_installed_head():
     """A deploy missing the durable baseline migration must fail before rollout."""
     backend = Path(__file__).parent.parent / "backend"
     cfg = Config(str(backend / "alembic.ini"))
     cfg.set_main_option("script_location", str(backend / "alembic"))
     script = ScriptDirectory.from_config(cfg)
 
-    assert script.get_heads() == ["0087_v2_first_chat_activation"]
+    assert script.get_heads() == ["0088_agent_jobs_available_at"]
+    migration = script.get_revision("0088_agent_jobs_available_at")
+    assert migration.down_revision == "0087_v2_first_chat_activation"
     migration = script.get_revision("0087_v2_first_chat_activation")
     assert migration.down_revision == "0086_v2_worker_pool_heartbeats"
     migration = script.get_revision("0086_v2_worker_pool_heartbeats")
@@ -142,8 +144,22 @@ def test_first_chat_activation_is_the_single_installed_head():
             "WHERE tc.table_schema='public' "
             "AND tc.table_name='perception_signal_state_v2'"
         ).fetchone()
+        available_at = conn.execute(
+            "SELECT data_type,is_nullable,column_default "
+            "FROM information_schema.columns "
+            "WHERE table_schema='public' AND table_name='agent_jobs' "
+            "AND column_name='available_at'"
+        ).fetchone()
+        pending_index = conn.execute(
+            "SELECT indexdef FROM pg_indexes "
+            "WHERE schemaname='public' AND tablename='agent_jobs' "
+            "AND indexname='ix_agent_jobs_pending_available_at'"
+        ).fetchone()
 
-    assert installed_head == ("0087_v2_first_chat_activation",)
+    assert installed_head == ("0088_agent_jobs_available_at",)
+    assert available_at[:2] == ("timestamp with time zone", "NO")
+    assert "now()" in str(available_at[2])
+    assert pending_index is not None
     assert columns == {
         "user_id": ("text", "NO"),
         "signal": ("text", "NO"),
@@ -205,7 +221,7 @@ def test_0075_usage_rollup_schema_is_installed_without_source_backfill():
             "AND tgrelid='v2_turn_metrics'::regclass"
         ).fetchone()[0]
 
-    assert head == ("0087_v2_first_chat_activation",)
+    assert head == ("0088_agent_jobs_available_at",)
     assert tables == {
         "v2_usage_daily_users",
         "v2_usage_daily_dimensions",
