@@ -121,11 +121,11 @@ V2 走 provider 原生 tool-calling;resident 侧靠"在提示词里告诉模型�
 | 出口 | Runtime V2 | Resident consumer |
 |---|---|---|
 | 前台聊天 | ✅ `backend/model_api_runtime/v2/worker.py` chat lane `_on_reply` 内调 `self_thinking.strip_all_thinking` | ✅ `tools/chat_resident_consumer.py::_split_tagged_thinking` 内调 `_st.strip_all_thinking(raw, sanitize=False)` |
-| 主动/唤醒 | ✅ `backend/model_api_runtime/v2/worker.py` wake lane `_on_reply` 内调 `_st_wake.strip_all_thinking` | ✅ 复用同一条链:`_process_proactive_jobs` → `_split_agent_turn` → `_agent_turn_from_obj` → `_split_tagged_thinking` → `core/self_thinking.py::strip_all_thinking`(codex3 实测:喂 `<think>private</think>visible`,messages 只剩 `['visible']`) |
+| 主动/唤醒 | ✅ `backend/model_api_runtime/v2/worker.py` wake lane `_on_reply` 内调 `_st_wake.strip_all_thinking` | ✅ 复用同一条链:`_process_proactive_jobs` → `_split_agent_turn` → `_agent_turn_from_obj` → `_split_tagged_thinking` → `backend/core/self_thinking.py::strip_all_thinking`(codex3 实测:喂 `<think>private</think>visible`,messages 只剩 `['visible']`) |
 | 喂回模型的历史 | ✅ `backend/model_api_runtime/v2/serve_worker.py::_scrub_leaked_thinking_rows` | ⛔ **没有 replay 期的二次剥离**。`_clean_messages_for_proactive_context` → `_message_text_for_context` 只压空白 + 截 500 字;codex3 实测直接喂历史行,原样得到 `<think>old private</think>old visible` |
 | 协议残片抑制 | ✅ chat/wake 两个 lane 各有 `_torn_protocol_evidence` 判定 | ✅ `tools/chat_resident_consumer.py::_suppress_torn_protocol_leaks` |
 
-⚠️ **共享内核**:两侧的 `<think>` 剥离都调 `core/self_thinking.py` 的同一个
+⚠️ **共享内核**:两侧的 `<think>` 剥离都调 `backend/core/self_thinking.py` 的同一个
 `strip_all_thinking`,**判据共享、调用点各自独立**。所以「闸有没有生效」要分两问:
 ① 内核逻辑对不对(共享,一处改两侧受益)② **这条出口有没有接上它**(各自独立,一处漏就漏)。
 
@@ -175,8 +175,14 @@ s = msgs[0]["content"]; print(len(s), s.find("<<<PERSONA-SENTINEL>>>"))
 | **① 要不要启动这一轮** | 后端(创建/下发一个 wake job) | 上游的调度与闸,不在本表这两个入口里 |
 | **② 这一轮最终有没有可见气泡** | **本地** —— 模型可能选择沉默/空回复,还要过本地闸 | ✅ V2:`backend/model_api_runtime/v2/worker.py` wake lane `_on_reply`(SILENT/FAILED 分支)<br>✅ resident:`tools/chat_resident_consumer.py::_proactive_chat_collision` 等本地闸 |
 
-所以「不该说话时说了」要查 ①,「该说话时没说」多半在 ② ——
-**把两层混成一句"决策在上游",会让人把 ② 的问题全赶去上游白找。**
+**不要从症状猜层 —— 两层都能产生「多说」和「不说」**
+(① 错误创建 job 会多说,② 本地闸失效同样会多说;「该说没说」可能是 ① 没建 job,
+也可能是 ② 有 job 但模型沉默/被闸拦)。**按证据顺序分流**:
+
+1. 先查**这一轮 job 到底有没有被创建/下发**。没有,或创建条件本身就不对 → **①**
+2. job 合法存在之后,再查模型这一轮的结果和本地 delivery gate。
+   有 job 却没气泡、或本该抑制却发出去了 → **②**
+
 (这一条是 codex3 审计时纠正的,原文写成了"两侧都不是自己决定",太绝对。)
 
 ---
@@ -185,7 +191,7 @@ s = msgs[0]["content"]; print(len(s), s.find("<<<PERSONA-SENTINEL>>>"))
 
 1. **只 grep `backend/` 会得到假的「resident 侧没有」。**
    resident 侧的实现大量在 **`tools/`** 下(`tools/chat_resident_consumer.py`、`tools/io_cli.py`、
-   `io_cli_catalog.py`)。2026-08-14 我据此错判「V1 整条没有剥离闸」,
+   `tools/io_cli_catalog.py`)。2026-08-14 我据此错判「V1 整条没有剥离闸」,
    实际闸就在 `tools/chat_resident_consumer.py`。
    **做对照时 grep 范围必须含 `tools/`。**
 
@@ -201,3 +207,22 @@ s = msgs[0]["content"]; print(len(s), s.find("<<<PERSONA-SENTINEL>>>"))
 
 发现某一格过期(符号改名/文件搬家/机制变了),**直接改这里**,并更新顶部的快照提交。
 新增概念时照第 1–8 节的格式:**每格必须带证据等级标记,不许写「应该在 xxx」。**
+
+### 改完跑这个自检(它检查的是「本表的定位命令还跑不跑得通」)
+
+```sh
+python3 - <<'PY'
+import re, pathlib
+s = pathlib.Path("docs/testing/RUNTIME_MAP.md").read_text()
+paths = {m.split("::")[0] for m in re.findall(r'`([^`]+?/[^`]*?\.py)(?:::[^`]*)?`', s)}
+bad = [p for p in sorted(paths) if not pathlib.Path(p).exists()]
+print("不可复跑:", bad or "无")
+PY
+```
+
+⚠️ **两个要点**:(a) 抽反引号里**所有带 `/` 的 python 路径**,别按 `backend/`/`tools/` 这种
+目录前缀筛;(b) 正则要求含 `/`,所以它同时把「必须写 repo-relative 路径」这条规矩也强制了。
+本表初版的自检写成了只匹配 `backend/` 和 `tools/` 开头的路径,于是
+`backend/core/self_thinking.py`(共享内核,两侧都调它)被自己的量具静默漏掉 ——
+自检报「全部通过」,而文档里那条命令实际 exit 128。
+**量具和被查对象有同一个盲区时,绿色是假的。**
