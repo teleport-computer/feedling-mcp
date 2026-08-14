@@ -93,6 +93,8 @@ from model_api_runtime.v2 import claim_recovery as v2_claim_recovery
 from model_api_runtime.v2 import effect_id as v2_effect_id
 from model_api_runtime.v2 import effect_outbox as v2_effect_outbox
 from model_api_runtime.v2 import jobs_store
+from model_api_runtime.v2 import pool_config as v2_pool_config
+from model_api_runtime.v2 import pool_supervisor as v2_pool_supervisor
 from model_api_runtime.v2 import profile_store as v2_profile_store
 from model_api_runtime.v2 import reaper as v2_reaper
 from model_api_runtime.v2 import runner_identity
@@ -393,9 +395,9 @@ def _configure_db_pool_capacity(max_workers: int) -> int:
     try:
         slots = int(max_workers)
     except (TypeError, ValueError) as exc:
-        raise RuntimeError("FEEDLING_V2_MAX_WORKERS must be an integer > 0") from exc
+        raise RuntimeError("runtime slot count must be an integer > 0") from exc
     if slots <= 0:
-        raise RuntimeError("FEEDLING_V2_MAX_WORKERS must be an integer > 0")
+        raise RuntimeError("runtime slot count must be an integer > 0")
 
     workspace_parallelism = _workspace_write_parallelism()
     required = max(16, (2 * slots) + workspace_parallelism + 4)
@@ -411,7 +413,7 @@ def _configure_db_pool_capacity(max_workers: int) -> int:
             raise RuntimeError(
                 "FEEDLING_DB_POOL_MAX_SIZE="
                 + str(configured)
-                + " is too small for FEEDLING_V2_MAX_WORKERS="
+                + " is too small for runtime_slots="
                 + str(slots)
                 + "; require >= "
                 + str(required)
@@ -685,7 +687,7 @@ def _send_reply_push(
             headers={"X-Feedling-Runtime-Token": _mint_push_token(user_id)},
             # Best-effort notification, sent synchronously from the turn's
             # `finally` while the job is already completed but the worker slot
-            # (FEEDLING_V2_MAX_WORKERS) is still held. Keep this short — 10s
+            # slot-level concurrency is still held. Keep this short — 10s
             # would let a slow/wedged backend eat a scarce worker slot per turn;
             # 3s is enough for an intra-compose-network call and still cheap to
             # lose if backend is stuck (review Minor #4).
@@ -4976,7 +4978,7 @@ _HEARTBEAT_INTERVAL_SEC = _positive_float_env(
 )
 
 # D3 (Task 4, PR-D plan): capacity must reflect the turn-child's ACTUAL health, not
-# the constant `v2_worker.MAX_WORKERS` — otherwise a heartbeat tick ~10s after the
+# a configured aggregate — otherwise a heartbeat tick ~10s after the
 # watchdog (Task 3) writes capacity=0 on a kill would silently re-advertise full
 # capacity for a child that is mid-SIGKILL/respawn, letting admission race new turns
 # onto a pool slot that is not there yet. Independently env-configured (own var, own
@@ -5005,7 +5007,7 @@ async def _heartbeat_loop(
     stop_event: asyncio.Event,
     *,
     supervisor: v2_child_supervisor.ChildSupervisor,
-    pool: str,
+    pool: str = "foreground",
     interval: float = _HEARTBEAT_INTERVAL_SEC,
     capacity_stale_sec: float = _CAPACITY_STALE_SEC,
 ) -> None:
@@ -5016,8 +5018,8 @@ async def _heartbeat_loop(
     ``claim_next_job``/``run_worker_loop`` — one row per live process.
 
     D3 (Task 4): ``capacity`` is DERIVED from ``supervisor.poll_liveness()`` each
-    tick, not the constant ``v2_worker.MAX_WORKERS`` — 0 if the turn-child is dead
-    OR its progress is older than ``capacity_stale_sec``, else ``MAX_WORKERS``. This
+    tick — 0 if the turn-child is dead or its progress is older than
+    ``capacity_stale_sec``, else one. This
     is deliberately the same shape as (and agrees with) the watchdog's own kill
     threshold: whichever of the two loops ticks next while the child is down keeps
     writing capacity=0, so they reinforce rather than race each other back to a
@@ -5069,6 +5071,124 @@ async def _heartbeat_loop(
             )
         except Exception as e:  # noqa: BLE001 — shutdown must remain bounded
             log.warning("[v2.serve_worker] clear worker capacity failed: %s", e)
+
+
+async def _fleet_heartbeat_loop(
+    worker_id: str,
+    pool: v2_pool_config.PoolName,
+    fleet: v2_pool_supervisor.SlotFleet,
+    stop_event: asyncio.Event,
+    *,
+    interval: float = _HEARTBEAT_INTERVAL_SEC,
+    capacity_stale_sec: float = _CAPACITY_STALE_SEC,
+) -> None:
+    heartbeat_id = f"{worker_id}:{pool}"
+    configured = sum(key.pool == pool for key in fleet.keys())
+    try:
+        while not stop_event.is_set():
+            try:
+                capacity = fleet.healthy_capacity(pool, stale_sec=capacity_stale_sec)
+                snapshots = fleet.snapshots()
+                busy = sum(
+                    key.pool == pool
+                    and snapshot is not None
+                    and snapshot.active_job is not None
+                    for key, snapshot in snapshots.items()
+                )
+                await asyncio.to_thread(
+                    jobs_store.record_worker_heartbeat,
+                    heartbeat_id,
+                    pool=pool,
+                    kind="turn",
+                    capacity=capacity,
+                    runtime_state={
+                        "slots": {
+                            "configured": configured,
+                            "healthy": capacity,
+                            "busy": busy,
+                            "restarting": max(0, configured - capacity),
+                        }
+                    },
+                )
+            except Exception as exc:  # noqa: BLE001
+                log.warning("[v2.serve_worker] fleet heartbeat failed pool=%s: %s", pool, exc)
+            try:
+                await asyncio.wait_for(stop_event.wait(), timeout=interval)
+            except asyncio.TimeoutError:
+                pass
+    finally:
+        try:
+            await asyncio.to_thread(
+                jobs_store.record_worker_heartbeat,
+                heartbeat_id,
+                pool=pool,
+                kind="turn",
+                capacity=0,
+                runtime_state={
+                    "slots": {
+                        "configured": configured,
+                        "healthy": 0,
+                        "busy": 0,
+                        "restarting": configured,
+                    }
+                },
+            )
+        except Exception:  # noqa: BLE001
+            log.exception("[v2.serve_worker] fleet heartbeat clear failed pool=%s", pool)
+
+
+_CLAIM_RECONCILE_INTERVAL_SEC = _positive_float_env(
+    "FEEDLING_V2_CLAIM_RECONCILE_INTERVAL_SEC", "2"
+)
+
+
+async def _reconcile_fleet_claims_once(
+    fleet: v2_pool_supervisor.SlotFleet,
+) -> int:
+    snapshots = {
+        key: snapshot
+        for key, snapshot in fleet.snapshots().items()
+        if snapshot is not None and snapshot.active_job is not None
+    }
+    pairs = [
+        (snapshot.active_job.job_id, snapshot.active_job.claimed_by)
+        for snapshot in snapshots.values()
+    ]
+    valid = await asyncio.to_thread(jobs_store.valid_active_claims, pairs)
+    restarted = 0
+    for key, snapshot in snapshots.items():
+        active = snapshot.active_job
+        if (active.job_id, active.claimed_by) in valid:
+            continue
+        if await asyncio.to_thread(fleet.restart_if_snapshot, key, snapshot):
+            restarted += 1
+            log.warning(
+                "[v2.serve_worker] restarted invalid exact claim pool=%s slot=%s "
+                "job=%s owner=%s",
+                key.pool,
+                snapshot.slot_id,
+                active.job_id,
+                active.claimed_by,
+            )
+    return restarted
+
+
+async def _fleet_claim_reconcile_loop(
+    fleet: v2_pool_supervisor.SlotFleet,
+    stop_event: asyncio.Event,
+    *,
+    interval: float = _CLAIM_RECONCILE_INTERVAL_SEC,
+) -> None:
+    """Backstop dropped cancellation NOTIFY without broad user/job killing."""
+    while not stop_event.is_set():
+        try:
+            await _reconcile_fleet_claims_once(fleet)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("[v2.serve_worker] exact claim reconciliation failed: %s", exc)
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=interval)
+        except asyncio.TimeoutError:
+            pass
 
 
 _SCHEDULER_INTERVAL_SEC = _positive_float_env(
@@ -5207,6 +5327,8 @@ async def _watchdog_loop(
     interval: float = _WATCHDOG_INTERVAL_SEC,
     recovery_queue: v2_claim_recovery.ClaimRecoveryQueue | None = None,
     pool: str = "foreground",
+    turn_stall_timeout_sec: float = _TURN_STALL_TIMEOUT_SEC,
+    turn_absolute_timeout_sec: float = _TURN_ABSOLUTE_TIMEOUT_SEC,
 ) -> None:
     """Thin wrapper around `watchdog._watchdog_loop` (mirrors `_reaper_loop`'s
     delegation to `v2_reaper.run_loop`) — supplies the production
@@ -5219,8 +5341,8 @@ async def _watchdog_loop(
         stop_event,
         jobs_claimable_fn=_jobs_claimable,
         interval=interval,
-        turn_stall_timeout_sec=_TURN_STALL_TIMEOUT_SEC,
-        turn_absolute_timeout_sec=_TURN_ABSOLUTE_TIMEOUT_SEC,
+        turn_stall_timeout_sec=turn_stall_timeout_sec,
+        turn_absolute_timeout_sec=turn_absolute_timeout_sec,
         child_liveness_timeout_sec=_CHILD_LIVENESS_TIMEOUT_SEC,
         jobs_claimable_timeout_sec=_WATCHDOG_DB_TIMEOUT_SEC,
         capacity_write_timeout_sec=_WATCHDOG_DB_TIMEOUT_SEC,
@@ -5643,11 +5765,8 @@ async def _serve(worker_id: str, *, poll_interval: float) -> None:
     seeded = await asyncio.to_thread(_seed_existing_v2_wake_schedules)
     if seeded:
         log.info("[v2.serve_worker] seeded %d existing V2 wake schedule(s)", seeded)
-    log.info(
-        "[v2.serve_worker] starting worker=%s max_workers=%s",
-        worker_id,
-        v2_worker.MAX_WORKERS,
-    )
+    config = v2_pool_config.RuntimePoolConfig.from_env()
+    log.info("[v2.serve_worker] starting worker=%s slots=%s", worker_id, len(config.slots))
 
     # Local import — see the comment beside the module-level import block for why
     # `turn_child` cannot be imported at this module's top level (circular import:
@@ -5661,40 +5780,48 @@ async def _serve(worker_id: str, *, poll_interval: float) -> None:
     # the turn-child split: it never lived in the turn slots' event loop.
     genesis = _start_genesis_thread(worker_id)
 
-    supervisor = v2_child_supervisor.ChildSupervisor(
-        turn_child.main,
-        liveness_timeout_sec=_CHILD_LIVENESS_TIMEOUT_SEC,
-        spawn_args=(worker_id, poll_interval),
+    fleet = v2_pool_supervisor.SlotFleet(
+        config,
+        spawn_target=turn_child.main,
+        worker_id=worker_id,
+        poll_interval=poll_interval,
+        db_pool_max=2,
     )
     # Synchronous: spawns the child process + starts the parent-side progress-pipe
     # reader thread. Not an asyncio task — the child runs in its own OS process, so
     # there is nothing here for `asyncio.gather` to await; its liveness is polled
     # (Task 3) rather than joined.
-    await asyncio.to_thread(supervisor.start)
-    _JOB_CANCEL_ROUTER.watch(supervisor)
+    await asyncio.to_thread(fleet.start_all)
+    for key in fleet.keys():
+        _JOB_CANCEL_ROUTER.watch(fleet.supervisor(key))
     recovery_queue = v2_claim_recovery.ClaimRecoveryQueue()
 
     tasks = [
         asyncio.create_task(_reaper_loop(stop_event)),
         asyncio.create_task(_r2_cleanup_loop(stop_event)),
-        asyncio.create_task(
-            _heartbeat_loop(
-                worker_id,
-                stop_event,
-                supervisor=supervisor,
-                pool="foreground",
+        *[
+            asyncio.create_task(
+                _fleet_heartbeat_loop(worker_id, pool, fleet, stop_event)
             )
-        ),
+            for pool in ("foreground", "wake", "heavy")
+        ],
         asyncio.create_task(_scheduler_loop(stop_event)),
-        asyncio.create_task(
-            _watchdog_loop(
-                supervisor,
-                worker_id,
-                stop_event,
-                recovery_queue=recovery_queue,
+        *[
+            asyncio.create_task(
+                _watchdog_loop(
+                    fleet.supervisor(key),
+                    f"{worker_id}:{fleet.spec(key).slot_id}",
+                    stop_event,
+                    recovery_queue=recovery_queue,
+                    pool=key.pool,
+                    turn_stall_timeout_sec=fleet.spec(key).stall_budget_sec,
+                    turn_absolute_timeout_sec=fleet.spec(key).absolute_budget_sec,
+                )
             )
-        ),
+            for key in fleet.keys()
+        ],
         asyncio.create_task(recovery_queue.run(stop_event)),
+        asyncio.create_task(_fleet_claim_reconcile_loop(fleet, stop_event)),
         asyncio.create_task(_reconcile_loop(stop_event)),
         asyncio.create_task(_backlog_scan_loop(stop_event)),
         asyncio.create_task(_usage_rollup_loop(stop_event)),
@@ -5706,7 +5833,8 @@ async def _serve(worker_id: str, *, poll_interval: float) -> None:
         # a live heartbeat with dead work.
         await asyncio.gather(*tasks)
     finally:
-        _JOB_CANCEL_ROUTER.unwatch(supervisor)
+        for key in fleet.keys():
+            _JOB_CANCEL_ROUTER.unwatch(fleet.supervisor(key))
         stop_event.set()
         for task in tasks:
             if not task.done():
@@ -5714,7 +5842,7 @@ async def _serve(worker_id: str, *, poll_interval: float) -> None:
         await asyncio.gather(*tasks, return_exceptions=True)
         # SIGTERM the child + join (falls back to SIGKILL past the drain timeout);
         # mirrors the graceful-drain contract the parent's own loops follow above.
-        await asyncio.to_thread(supervisor.stop)
+        await asyncio.to_thread(fleet.stop_all)
         if genesis is not None:
             genesis_thread, genesis_stop = genesis
             genesis_stop.set()
@@ -5761,7 +5889,8 @@ def main() -> None:
     # other durable side effect. A mis-targeted production container must fail
     # without first applying an irreversible schema upgrade.
     worker_id = runner_identity.resolve_worker_id(_default_worker_id)
-    db_pool_max = _configure_db_pool_capacity(v2_worker.MAX_WORKERS)
+    config = v2_pool_config.RuntimePoolConfig.from_env()
+    db_pool_max = _configure_db_pool_capacity(len(config.slots))
     # Schema single-point for this standalone process (idempotent — see
     # db.init_schema docstring). The ASGI backend's gunicorn on_starting also
     # runs this once per deploy; this worker is its own entrypoint in the runner
@@ -5775,9 +5904,9 @@ def main() -> None:
     accounts_registry.start_periodic_full_reload()
     poll_interval = _positive_float_env("FEEDLING_V2_POLL_INTERVAL_SEC", "1.0")
     log.info(
-        "[v2.serve_worker] configured db_pool_max=%s for max_workers=%s",
+        "[v2.serve_worker] configured db_pool_max=%s for runtime_slots=%s",
         db_pool_max,
-        v2_worker.MAX_WORKERS,
+        len(config.slots),
     )
     _run_forever(worker_id, poll_interval)
 

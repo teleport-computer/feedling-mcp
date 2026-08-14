@@ -135,6 +135,9 @@ async def _run(
     conn: "Connection",
     worker_id: str,
     poll_interval: float,
+    pool: str,
+    slot_id: str,
+    lanes: tuple[str, ...],
     slot_generation: str,
 ) -> None:
     stop_event = asyncio.Event()
@@ -154,22 +157,23 @@ async def _run(
     # handler，不依赖 running loop——镜像 serve_worker._serve 里同一段注释的说明。
     wake_event = asyncio.Event()
     v2_worker.set_job_wake_context(loop, wake_event)
+    claimed_by = f"{worker_id}:{slot_id}:{slot_generation}"
     log.info(
-        "[v2.turn_child] starting worker=%s max_workers=%s pid=%s",
-        worker_id, v2_worker.MAX_WORKERS, os.getpid(),
+        "[v2.turn_child] starting owner=%s pool=%s lanes=%s pid=%s",
+        claimed_by, pool, lanes, os.getpid(),
     )
 
     tasks = [
-        asyncio.create_task(v2_worker.run_worker_loop(
-            worker_id,
-            max_workers=1,
+        asyncio.create_task(v2_worker._slot_loop(
+            claimed_by,
             poll_interval=poll_interval,
             stop_event=stop_event,
             deps=deps,
             wake_event=wake_event,
+            lanes=set(lanes),
             progress_cb=_make_progress_cb(conn),
             slot_generation=slot_generation,
-            slot_ids=["foreground-0"],
+            slot_id=slot_id,
         )),
         asyncio.create_task(
             _event_loop_heartbeat(
@@ -197,6 +201,10 @@ def main(
     conn: "Connection",
     worker_id: str,
     poll_interval: float | None = None,
+    pool: str = "foreground",
+    slot_id: str = "foreground-0",
+    lanes: tuple[str, ...] = ("chat", "manual_wake"),
+    db_pool_max: int = 2,
     slot_generation: str = "g0",
 ) -> None:
     """`child_supervisor.ChildSupervisor` 的 spawn target——签名约定
@@ -220,7 +228,7 @@ def main(
         # Validate before db.init_schema() creates this fresh process's lazy
         # pool.  The parent normally exports the computed ceiling before spawn;
         # the child repeats the check so direct invocation cannot bypass it.
-        serve_worker._configure_db_pool_capacity(v2_worker.MAX_WORKERS)
+        serve_worker._configure_db_pool_capacity(int(db_pool_max))
         db.init_schema()
         serve_worker.wire_assembly()
         # 周期性全量自愈——和 serve_worker.main / backend lifespan 对称。turn_child
@@ -233,7 +241,17 @@ def main(
             poll_interval if poll_interval is not None
             else serve_worker._positive_float_env("FEEDLING_V2_POLL_INTERVAL_SEC", "1.0")
         )
-        asyncio.run(_run(conn, worker_id, interval, slot_generation))
+        asyncio.run(
+            _run(
+                conn,
+                worker_id,
+                interval,
+                pool,
+                slot_id,
+                tuple(lanes),
+                slot_generation,
+            )
+        )
     finally:
         try:
             conn.close()

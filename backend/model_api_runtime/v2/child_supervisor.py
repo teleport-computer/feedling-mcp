@@ -254,6 +254,46 @@ class ChildSupervisor:
         self.kill(join_timeout=join_timeout)
         self.start()
 
+    def kill_if_snapshot(
+        self,
+        expected: slot_protocol.SlotProgress,
+        *,
+        join_timeout: float = 5.0,
+    ) -> bool:
+        """SIGKILL only while the exact generation/job snapshot still matches.
+
+        This is the parent-side compare-and-kill fence used by periodic claim
+        reconciliation.  Invalidate the generation while holding the snapshot
+        lock, so a late pipe message from the killed process cannot repopulate
+        state after the decision.
+        """
+        with self._lock:
+            if self._snapshot != expected:
+                return False
+            proc = self._proc
+            try:
+                if proc is not None and proc.is_alive():
+                    log.warning(
+                        "[v2.child_supervisor] SIGKILL invalid exact claim pid=%s",
+                        proc.pid,
+                    )
+                    proc.kill()
+            except Exception as exc:  # noqa: BLE001
+                log.warning("[v2.child_supervisor] fenced kill failed: %s", exc)
+                return False
+            self._proc = None
+            self._slot_generation = uuid.uuid4().hex
+            self._snapshot = None
+            self._turn_progress_at = None
+        self._stop_reader()
+        if proc is not None:
+            try:
+                proc.join(join_timeout)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("[v2.child_supervisor] fenced join failed: %s", exc)
+        self._close_read_conn()
+        return True
+
     def stop(self, *, drain_timeout: float = 10.0, kill_timeout: float = 2.0) -> None:
         """优雅停止：SIGTERM（子进程的信号处理器据此 drain 手上的回合再退出）+ 限时
         join；超时仍活着才升级成 SIGKILL。父进程 `_serve` 的 finally/stop_event 路径调
@@ -310,17 +350,15 @@ class ChildSupervisor:
         with self._lock:
             if decoded.slot_generation != self._slot_generation:
                 return
-        if isinstance(decoded, slot_protocol.LoopHeartbeat):
-            # Event-loop heartbeat is deliberately process-level only.  It
-            # proves the child's loop can still schedule work, but must never
-            # refresh a particular turn's stall clock: an await that never
-            # returns leaves that slot's ``_turn_progress_at`` untouched and
-            # is still killed by the per-turn stall watchdog.
-            with self._lock:
+            if isinstance(decoded, slot_protocol.LoopHeartbeat):
+                # Event-loop heartbeat is deliberately process-level only.  It
+                # proves the child's loop can still schedule work, but must never
+                # refresh a particular turn's stall clock: an await that never
+                # returns leaves that slot's ``_turn_progress_at`` untouched and
+                # is still killed by the per-turn stall watchdog.
                 self._last_progress_at = time.monotonic()
-            return
-        received_at = time.monotonic()
-        with self._lock:
+                return
+            received_at = time.monotonic()
             self._last_progress_at = received_at
             self._last_slot_progress_at = received_at
             self._snapshot = decoded

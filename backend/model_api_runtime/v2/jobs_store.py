@@ -1079,6 +1079,33 @@ def claim_next_job(worker_id: str, *, lanes: set[str] | None = None) -> dict | N
                     return outcome
 
 
+def valid_active_claims(
+    claims: list[tuple[int, str]],
+) -> set[tuple[int, str]]:
+    """Return the exact still-live ``(job_id, claimed_by)`` snapshot pairs.
+
+    The parent supervisor uses this as a periodic backstop for a dropped
+    cancellation NOTIFY.  Job id and owner are joined as one composite fence:
+    neither a recycled slot generation nor a reassigned job can validate the
+    other half of a stale snapshot.
+    """
+    if not claims:
+        return set()
+    job_ids = [int(job_id) for job_id, _claimed_by in claims]
+    owners = [str(claimed_by) for _job_id, claimed_by in claims]
+    with _pool().connection() as conn:
+        rows = conn.execute(
+            "WITH wanted(job_id, claimed_by) AS ("
+            "SELECT * FROM unnest(%s::bigint[], %s::text[])"
+            ") SELECT j.id, j.claimed_by FROM wanted w "
+            "JOIN agent_jobs j ON j.id=w.job_id AND j.claimed_by=w.claimed_by "
+            "WHERE j.status IN ('claimed','running') "
+            "AND j.lease_expires_at > clock_timestamp()",
+            (job_ids, owners),
+        ).fetchall()
+    return {(int(row[0]), str(row[1])) for row in rows}
+
+
 def mark_running(job_id, *, claimed_by: str) -> bool:
     with _pool().connection() as conn:
         with conn.transaction():

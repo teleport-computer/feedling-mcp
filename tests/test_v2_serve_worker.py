@@ -1363,7 +1363,6 @@ class _HealthySupervisor:
 
 def test_turn_heartbeat_advertises_slot_capacity(monkeypatch):
     calls = []
-    monkeypatch.setattr(worker, "MAX_WORKERS", 12)
     monkeypatch.setattr(
         jobs_store,
         "record_worker_heartbeat",
@@ -1383,8 +1382,28 @@ def test_turn_heartbeat_advertises_slot_capacity(monkeypatch):
         await asyncio.wait_for(task, timeout=1.0)
 
     asyncio.run(_driver())
-    assert calls[0] == ("worker-a", {"capacity": 12, "kind": "turn"})
-    assert calls[-1] == ("worker-a", {"capacity": 0, "kind": "turn"})
+    assert calls[0] == (
+        "worker-a",
+        {
+            "capacity": 1,
+            "kind": "turn",
+            "pool": "foreground",
+            "runtime_state": {
+                "slot": {"stage": "starting", "busy": False}
+            },
+        },
+    )
+    assert calls[-1] == (
+        "worker-a",
+        {
+            "capacity": 0,
+            "kind": "turn",
+            "pool": "foreground",
+            "runtime_state": {
+                "slot": {"stage": "stopping", "busy": False}
+            },
+        },
+    )
 
 
 # ------------------------------------------------------------------
