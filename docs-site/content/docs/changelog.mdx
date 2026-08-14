@@ -63,7 +63,9 @@ change must not be interpreted as an API guarantee.
   suffix.** Hosted Runtime V2 can supply up to 20 source IDs when writing one
   consolidated successor. Oversized `memory.supersede` requests now fail with
   `too_many_supersedes` before changing any card instead of silently applying
-  only the first 20, and successful receipts list only IDs actually retired.
+  only the first 20. A merge also fails atomically if any source card is already
+  unavailable or changes before commit, so a stale request cannot append a
+  second active successor. Successful receipts list only IDs actually retired.
 
 - **`memory_search` guidance documents literal matching and allows a reworded
   retry.** Matching is a case-insensitive literal substring with no synonyms,
