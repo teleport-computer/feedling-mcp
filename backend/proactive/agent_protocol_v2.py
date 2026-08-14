@@ -9,11 +9,16 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import json
+import logging
 import re
 from typing import Any, Mapping, Sequence
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from core import protocol_leak
+from core import tool_markup_leak
+
+
+log = logging.getLogger(__name__)
 
 MAX_MESSAGE_CHARS_V2 = 4000
 MAX_ACTION_NOTE_CHARS_V2 = 1000
@@ -71,7 +76,9 @@ def _looks_like_protocol_fragment(text: str) -> bool:
     return False
 
 
-def sanitize_visible_message_text_v2(value: Any) -> str:
+def sanitize_visible_message_text_v2(
+    value: Any, *, log_tool_markup: bool = True
+) -> str:
     """Return safe proactive visible text, or "" for protocol/internal debris.
 
     Weak models sometimes leak malformed protocol fragments like a lone ``}`` or
@@ -99,6 +106,13 @@ def sanitize_visible_message_text_v2(value: Any) -> str:
         if _status == _st.FAILED:
             return ""
         value = _stripped
+    value, removed_tool_markup = tool_markup_leak.strip_tool_markup(value)
+    if removed_tool_markup and log_tool_markup:
+        log.warning(
+            "[proactive.v2] visible tool markup stripped error_class=%s reason=%s",
+            tool_markup_leak.ERROR_CLASS,
+            tool_markup_leak.REASON,
+        )
     text = _clean_text(value, MAX_MESSAGE_CHARS_V2)
     if not text or _looks_like_protocol_fragment(text):
         return ""

@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import json
 import sys
 from pathlib import Path
 
@@ -23,6 +24,8 @@ import pytest
 import conftest
 import db
 import provider_client
+import worldbook_match
+from admin import data_track as admin_data_track
 from provider_types import ToolCall, ToolExchange
 from capabilities import registry as cap_registry
 from core import envelope as core_envelope
@@ -425,6 +428,80 @@ def test_chat_worldbook_matches_current_turn_without_rewriting_user_text(
     )
 
 
+def test_worldbook_truncation_reaches_provider_and_data_track_without_content(
+    monkeypatch,
+):
+    monkeypatch.setenv("FEEDLING_V2_SELF_THINKING", "off")
+    uid = "u_toolloop_worldbook_truncation"
+    conftest.seed_user(uid)
+    _reset(uid)
+    jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("w-worldbook-truncation")
+    _patch_real_write(monkeypatch)
+
+    rare_secret = "T047_WORLDBOOK_SECRET_MUST_NOT_REACH_ADMIN"
+    raw_worldbook = (
+        "<world_book>\n"
+        + ("W" * worldbook_match.CONTEXT_CHAR_CAP)
+        + rare_secret
+        + "\n</world_book>"
+    )
+    calls = _script_provider(monkeypatch, [_text_round("bounded")])
+    traces = []
+    turn_messages = [{
+        "id": "m-worldbook-truncated",
+        "ts": 10.0,
+        "role": "user",
+        "content": "Tell me about this setting",
+    }]
+    deps = _deps(messages=turn_messages)
+    deps.read_summary = lambda _uid: ("", 0.0, 0)
+    deps.read_tail = lambda _uid, _after_ts, _limit: list(turn_messages)
+    deps.read_worldbook_context = lambda *_args, **_kwargs: {
+        "block": raw_worldbook,
+        "matched_names": [],
+    }
+    deps.emit_debug_trace = lambda user_id, event_type, **fields: traces.append(
+        {"user_id": user_id, "type": event_type, **fields}
+    )
+
+    status = asyncio.run(
+        worker.process_job(
+            job,
+            deps,
+            provider_config=_BYOK,
+            api_key=None,
+            runtime_token="rt",
+        )
+    )
+
+    assert status == "completed"
+    provider_payload = json.dumps(calls[0]["messages"], ensure_ascii=False)
+    assert worldbook_match.TRUNCATION_MARKER.strip() in provider_payload
+    truncation = next(
+        trace for trace in traces if trace["type"] == "context.truncation"
+    )
+    assert truncation == {
+        "user_id": uid,
+        "type": "context.truncation",
+        "status": "warning",
+        "summary": "",
+        "explain": "",
+        "detail": {
+            "counts": {
+                "profile_cards_truncated": 0,
+                "worldbook_truncated": 1,
+            }
+        },
+    }
+    raw_admin_material = json.dumps(
+        admin_data_track._debug_event_public_json(truncation),
+        ensure_ascii=False,
+    )
+    assert rare_secret not in provider_payload
+    assert rare_secret not in raw_admin_material
+
+
 def test_self_thinking_on_suppresses_native_reasoning(monkeypatch):
     """Self-authored thinking ON (shipped default): even an explicit
     include_reasoning request is suppressed at the provider, so a reasoning-capable
@@ -616,6 +693,18 @@ def test_degenerate_intermediate_is_dropped_before_real_final_reply(monkeypatch)
 # One envelope torn at the channel boundary.
 _TORN_HEAD = '{"messages":[],"actions":[{"type":"pro'
 _TORN_TAIL = 'active.sleep","reason":"7点了 还在睡 不打扰了 醒了会找我"}]}'
+_UPSTREAM_RESPONSE_ENVELOPE = json.dumps(
+    {
+        "response": {
+            "candidates": [{"content": {}}],
+            "usageMetadata": {"totalTokenCount": 24515},
+            "modelVersion": "gemini-3-flash",
+            "responseId": "response-id",
+        },
+        "traceId": "trace-id",
+        "metadata": {},
+    }
+)
 
 
 def test_torn_protocol_tail_with_reasoning_head_becomes_fallback(monkeypatch):
@@ -675,6 +764,104 @@ def test_foreground_keeps_user_json_talk_without_reasoning(monkeypatch):
     assert [b["body_ct"] for b in _bubbles(uid)] == [user_json_talk]
 
 
+def test_foreground_real_chain_strips_tool_markup_and_emits_content_free_trace(
+    monkeypatch,
+):
+    """Production chain: provider text -> worker._on_reply -> durable bubble."""
+    uid = "u_toolloop_tool_markup_leak"
+    conftest.seed_user(uid)
+    _reset(uid)
+    jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("w-tool-markup")
+    _patch_real_write(monkeypatch)
+    leaked = (
+        '<parameter name="tool_name">reply</parameter>\n'
+        "好，棋先停着\n你要干嘛去了"
+    )
+    _script_provider(monkeypatch, [_text_round(leaked)])
+    traces = []
+    deps = _deps(
+        messages=[{"id": "m1", "ts": 10.0, "role": "user", "content": "先停一下"}]
+    )
+    deps.emit_debug_trace = lambda *args, **kwargs: traces.append((args, kwargs))
+
+    status = asyncio.run(
+        worker.process_job(
+            job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"
+        )
+    )
+
+    assert status == "completed"
+    assert [bubble["body_ct"] for bubble in _bubbles(uid)] == [
+        "好，棋先停着\n你要干嘛去了"
+    ]
+    sanitized = [item for item in traces if item[0][1] == "agent.reply.sanitized"]
+    assert len(sanitized) == 1
+    assert sanitized[0][1]["detail"] == {
+        "lane": "chat",
+        "final": True,
+        "error_class": "upstream_unavailable",
+        "reason": "tool_markup_leak_sanitized",
+    }
+
+
+def test_foreground_markup_only_reply_uses_existing_fallback(monkeypatch):
+    uid = "u_toolloop_tool_markup_only"
+    conftest.seed_user(uid)
+    _reset(uid)
+    jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("w-tool-markup-only")
+    _patch_real_write(monkeypatch)
+    _script_provider(monkeypatch, [_text_round("<tool_call></tool_call>")])
+
+    status = asyncio.run(
+        worker.process_job(
+            job,
+            _deps(messages=[{"id": "m1", "ts": 10.0, "role": "user", "content": "在吗"}]),
+            provider_config=_BYOK,
+            api_key=None,
+            runtime_token="rt",
+        )
+    )
+
+    assert status == "completed"
+    bubble = _bubbles(uid)[0]
+    assert bubble["body_ct"] == worker._DEGENERATE_REPLY_FALLBACK
+    assert bubble["turn_failure_error_class"] == "upstream_unavailable"
+
+
+def test_foreground_wrapped_reply_payload_is_not_lost(monkeypatch):
+    uid = "u_toolloop_wrapped_reply_payload"
+    conftest.seed_user(uid)
+    _reset(uid)
+    jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("w-wrapped-reply")
+    _patch_real_write(monkeypatch)
+    _script_provider(
+        monkeypatch,
+        [
+            _text_round(
+                '<antml:invoke name="reply"><antml:parameter name="text">'
+                "真正的回复内容"
+                "</antml:parameter></antml:invoke>"
+            )
+        ],
+    )
+
+    status = asyncio.run(
+        worker.process_job(
+            job,
+            _deps(messages=[{"id": "m1", "ts": 10.0, "role": "user", "content": "继续"}]),
+            provider_config=_BYOK,
+            api_key=None,
+            runtime_token="rt",
+        )
+    )
+
+    assert status == "completed"
+    assert [bubble["body_ct"] for bubble in _bubbles(uid)] == ["真正的回复内容"]
+
+
 def test_chat_intermediate_reply_tool_tail_with_reasoning_suppressed(monkeypatch):
     """Codex code-review #1: an intermediate `reply` tool call carrying a torn
     tail, with the head in the round's reasoning, must not produce a leaked
@@ -725,6 +912,45 @@ def test_chat_intermediate_reply_tool_tail_with_reasoning_suppressed(monkeypatch
     assert bubbles == ["在的，怎么了"]
 
 
+def test_chat_intermediate_reply_tool_upstream_envelope_is_suppressed(monkeypatch):
+    """The final-effect guard also covers a relay wrapper inside reply(text=...)."""
+    uid = "u_toolloop_upstream_envelope_intermediate"
+    conftest.seed_user(uid)
+    _reset(uid)
+    jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("w-upstream-envelope-mid")
+    monkeypatch.setattr(
+        cap_registry,
+        "run_capability",
+        lambda action_type, store, **kwargs: _FakeCapResult({"snippet": "r"}),
+    )
+    _patch_real_write(monkeypatch)
+    _script_provider(
+        monkeypatch,
+        [
+            _tool_round(
+                _tc("r1", "reply", text=_UPSTREAM_RESPONSE_ENVELOPE),
+                _tc("s1", "web_search", query="x"),
+            ),
+            _text_round("在的，怎么了"),
+        ],
+    )
+    deps = _deps(
+        messages=[{"id": "m1", "ts": 10.0, "role": "user", "content": "在吗"}]
+    )
+
+    status = asyncio.run(
+        worker.process_job(
+            job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"
+        )
+    )
+
+    assert status == "completed"
+    bubbles = [bubble["body_ct"] for bubble in _bubbles(uid)]
+    assert _UPSTREAM_RESPONSE_ENVELOPE not in bubbles
+    assert bubbles == ["在的，怎么了"]
+
+
 def test_torn_protocol_evidence_lane_policy():
     """Pure-unit: the worker's lane-policy helper. Proactive suppresses any leak;
     foreground only strong cross-channel evidence."""
@@ -734,6 +960,13 @@ def test_torn_protocol_evidence_lane_policy():
     # Strong: head in reasoning rejoins to a complete envelope.
     assert worker._torn_protocol_evidence(_TORN_TAIL, _TORN_HEAD, lane="proactive")
     assert worker._torn_protocol_evidence(_TORN_TAIL, _TORN_HEAD, lane="foreground")
+    # A complete provider transport wrapper is strong without reasoning evidence.
+    assert worker._torn_protocol_evidence(
+        _UPSTREAM_RESPONSE_ENVELOPE, "", lane="proactive"
+    )
+    assert worker._torn_protocol_evidence(
+        _UPSTREAM_RESPONSE_ENVELOPE, "", lane="foreground"
+    )
     # Normal reply: never suppressed.
     assert not worker._torn_protocol_evidence("晚安，做个好梦", "在想她累不累", lane="proactive")
     assert not worker._torn_protocol_evidence("晚安，做个好梦", "", lane="foreground")
@@ -759,11 +992,14 @@ def _stub_envelope_build(monkeypatch):
     monkeypatch.setattr(core_envelope, "_build_shared_envelope_for_store", _fake)
 
 
-def test_provider_reasoning_surfaces_as_thinking_bubble(monkeypatch):
-    """A final reply whose provider result carried chain-of-thought
+def test_self_thinking_off_preserves_native_reasoning_bubble(monkeypatch):
+    """Feature OFF preserves the legacy provider chain-of-thought contract.
+
+    A final reply whose provider result carried chain-of-thought
     (``result["reasoning"]``) must publish it as the row's separately-sealed
-    thinking envelope (``thinking_body_ct`` + ``thinking_kind``), not silently
-    drop it. Regression guard for the V2 reasoning-surfacing gap."""
+    thinking envelope (``thinking_body_ct`` + ``thinking_kind``).
+    """
+    monkeypatch.setenv("FEEDLING_V2_SELF_THINKING", "off")
     uid = "u_toolloop_reasoning"
     conftest.seed_user(uid)
     _reset(uid)
@@ -782,7 +1018,11 @@ def test_provider_reasoning_surfaces_as_thinking_bubble(monkeypatch):
             }
         ],
     )
+    traces = []
     deps = _deps(messages=[{"id": "m1", "ts": 10.0, "role": "user", "content": "hi"}])
+    deps.emit_debug_trace = lambda user_id, event_type, **fields: traces.append(
+        {"user_id": user_id, "event_type": event_type, **fields}
+    )
 
     status = asyncio.run(
         worker.process_job(
@@ -798,6 +1038,110 @@ def test_provider_reasoning_surfaces_as_thinking_bubble(monkeypatch):
     assert bubble["body_ct"] == "the answer"
     assert bubble.get("thinking_kind") == "provider_reasoning"
     assert bubble.get("thinking_body_ct") == "step one\nstep two"
+    thinking_traces = [
+        trace for trace in traces if trace["event_type"] == "thinking.surfaced"
+    ]
+    assert [trace["detail"] for trace in thinking_traces] == [{
+        "branch": "native_legacy",
+        "chars": len("step one\nstep two"),
+        "model": _BYOK.model,
+        "lane": "chat",
+    }]
+
+
+def test_self_thinking_on_drops_native_reasoning_without_authored_block(
+    monkeypatch,
+):
+    """Provider-native CoT is never a fallback while self-thinking is ON."""
+    monkeypatch.delenv("FEEDLING_V2_SELF_THINKING", raising=False)
+    uid = "u_toolloop_selfthink_no_fallback"
+    conftest.seed_user(uid)
+    _reset(uid)
+    jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("w-selfthink-no-fallback")
+
+    _stub_envelope_build(monkeypatch)
+    _script_provider(
+        monkeypatch,
+        [{
+            "reply": "the answer",
+            "reasoning": "private native cot",
+            "tool_calls": [],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+        }],
+    )
+    traces = []
+    deps = _deps(messages=[{"id": "m1", "ts": 10.0, "role": "user", "content": "hi"}])
+    deps.emit_debug_trace = lambda user_id, event_type, **fields: traces.append(
+        {"user_id": user_id, "event_type": event_type, **fields}
+    )
+
+    status = asyncio.run(
+        worker.process_job(
+            job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"
+        )
+    )
+
+    assert status == "completed"
+    bubble = _bubbles(uid)[0]
+    assert bubble["body_ct"] == "the answer"
+    assert "thinking_kind" not in bubble
+    assert "thinking_body_ct" not in bubble
+    thinking_traces = [
+        trace for trace in traces if trace["event_type"] == "thinking.surfaced"
+    ]
+    assert [trace["detail"] for trace in thinking_traces] == [{
+        "branch": "none",
+        "chars": 0,
+        "model": _BYOK.model,
+        "lane": "chat",
+    }]
+
+
+def test_self_thinking_on_prefers_authored_block_over_native_reasoning(monkeypatch):
+    monkeypatch.delenv("FEEDLING_V2_SELF_THINKING", raising=False)
+    uid = "u_toolloop_selfthink_authored"
+    conftest.seed_user(uid)
+    _reset(uid)
+    jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("w-selfthink-authored")
+
+    _stub_envelope_build(monkeypatch)
+    _script_provider(
+        monkeypatch,
+        [{
+            "reply": "<think>我先自己归纳</think>the answer",
+            "reasoning": "private native cot",
+            "tool_calls": [],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+        }],
+    )
+    traces = []
+    deps = _deps(messages=[{"id": "m1", "ts": 10.0, "role": "user", "content": "hi"}])
+    deps.emit_debug_trace = lambda user_id, event_type, **fields: traces.append(
+        {"user_id": user_id, "event_type": event_type, **fields}
+    )
+
+    status = asyncio.run(
+        worker.process_job(
+            job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"
+        )
+    )
+
+    assert status == "completed"
+    bubble = _bubbles(uid)[0]
+    assert bubble["body_ct"] == "the answer"
+    assert bubble["thinking_kind"] == "agent_summary"
+    assert bubble["thinking_body_ct"] == "我先自己归纳"
+    thinking_traces = [
+        trace for trace in traces if trace["event_type"] == "thinking.surfaced"
+    ]
+    assert [trace["detail"] for trace in thinking_traces] == [{
+        "branch": "self",
+        "chars": len("我先自己归纳"),
+        "model": _BYOK.model,
+        "lane": "chat",
+    }]
 
 
 def test_reasoning_absent_leaves_no_thinking_fields(monkeypatch):

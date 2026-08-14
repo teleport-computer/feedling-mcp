@@ -41,7 +41,7 @@ CI_WORKFLOW = ROOT / ".github" / "workflows" / "ci.yml"
 # ⚠️ 这个数**只许往下改**。调大它意味着又有一个测试文件退出了 CI ——
 # 那需要在 PR 里说明理由,而不是顺手 +1。缩小名单时请一并把这个数改小,
 # 否则棘轮会松掉。
-MAX_EXEMPTED = 472
+MAX_EXEMPTED = 469
 
 
 def _baseline_entries() -> list[str]:

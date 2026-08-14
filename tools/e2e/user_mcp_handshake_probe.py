@@ -103,6 +103,52 @@ def _admin(api: str, token_path: str):
     return client
 
 
+_RUNTIME_MODE_FOR_DESIRED = {"resident": "resident_cli", "v2": "db_action_v2"}
+
+
+def _await_runtime_convergence(
+    admin: httpx.Client, api: str, user_id: str, desired: str,
+    *, budget_s: float = 180.0, every_s: float = 5.0,
+) -> bool:
+    """Block until the pinned runtime is the one actually serving this user.
+
+    Returns True once the user's allowlist row reports ``converged`` AND its
+    ``actual`` mode matches ``desired``; False if the budget runs out (the
+    caller must treat that as a SETUP failure, never as a verdict).
+
+    Why a poll and not a sleep: the flip is a control-plane request that a
+    supervisor acts on asynchronously, so its latency is a property of the
+    environment, not a constant we can hardcode. A fixed sleep is wrong in both
+    directions — too short silently measures the wrong runtime (observed on
+    test 2026-08-14), too long burns minutes on every run.
+    """
+    want_mode = _RUNTIME_MODE_FOR_DESIRED.get(desired, desired)
+    deadline = time.monotonic() + budget_s
+    last = ""
+    while time.monotonic() < deadline:
+        try:
+            r = admin.get(f"{api}/v1/admin/runtime-allowlist")
+            rows = (r.json() or {}).get("allowlist") or []
+        except Exception as e:  # noqa: BLE001 — a blip must not end the probe
+            last = f"{type(e).__name__}"
+            time.sleep(every_s)
+            continue
+        row = next((x for x in rows if x.get("user_id") == user_id), None)
+        if row:
+            actual = (row.get("actual") or {}).get("mode") or ""
+            last = f"converged={row.get('converged')} actual={actual or '-'}"
+            if row.get("converged") and actual == want_mode:
+                print(f"[probe] runtime converged -> {actual}")
+                return True
+        else:
+            last = "该用户不在 allowlist 里"
+        time.sleep(every_s)
+    print(f"[probe] FAIL runtime 在 {budget_s:.0f}s 内没有收敛到 {want_mode} "
+          f"（最后一次看到：{last}）—— 这是环境没准备好,不是 MCP 的判据。"
+          f"在没收敛的 runtime 上测 MCP,绿了红了都不说明问题")
+    return False
+
+
 def _agent_events(admin: httpx.Client, api: str, user_id: str) -> list[dict]:
     r = admin.get(f"{api}/v1/admin/data-track/debug",
                   params={"user_id": user_id, "subsystem": "agent"})
@@ -416,9 +462,21 @@ def main() -> int:
         if ar.status_code != 200:
             return 2
 
-        # Let the consumer pick up the moved fingerprint and the runtime flip
-        # converge before the turn is claimed.
-        time.sleep(30)
+        # Wait for the runtime flip to CONVERGE, not for a fixed number of
+        # seconds. The previous version slept 30s and sent the turn regardless;
+        # measured 2026-08-14 on test, that is not always enough — the turn was
+        # claimed by V2 while the pin was still converging, the trace carried
+        # V2's `mcp.surface.resolved` instead of V1's `mcp.surface.wired`, and
+        # the probe reported "FAIL 没有 mcp.surface.wired". That reads as "the
+        # fix is broken" when the truth is "we measured the wrong runtime" —
+        # the exact class of false signal this probe exists to prevent.
+        #
+        # The allowlist row already carries the answer (`converged` plus an
+        # `actual` mode), so poll it instead of guessing. A pin that never
+        # converges is a SETUP failure (exit 2), not a verdict: judging MCP on
+        # a runtime we did not ask for tells us nothing either way.
+        if not _await_runtime_convergence(admin, args.api, c.user_id, args.runtime):
+            return 2
 
         sent = c.send_chat(ask)
         reply = c.wait_reply(sent, timeout=args.timeout)

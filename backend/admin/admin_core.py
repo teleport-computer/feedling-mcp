@@ -927,6 +927,39 @@ def v2_metrics(
     cache_since_ts: float | None = None,
     cache_until_ts: float | None = None,
 ) -> dict:
+    heartbeats = jobs_store.recent_worker_heartbeats(limit=200)
+    fresh_turns = [
+        row
+        for row in heartbeats
+        if row.get("kind") == "turn" and float(row.get("age_sec") or 0) <= 30.0
+    ]
+    queue_by_pool = jobs_store.pool_queue_metrics()
+    pools = {}
+    for pool in ("foreground", "wake", "heavy"):
+        heartbeat = next(
+            (row for row in fresh_turns if row.get("pool") == pool),
+            None,
+        )
+        slots = (
+            ((heartbeat or {}).get("runtime_state") or {}).get("slots") or {}
+        )
+        queue = queue_by_pool.get(pool) or {}
+        pools[pool] = {
+            "configured": int(slots.get("configured") or 0),
+            "healthy": int(slots.get("healthy") or 0),
+            "busy": int(slots.get("busy") or 0),
+            "restarting": int(slots.get("restarting") or 0),
+            "pending": int(queue.get("pending") or 0),
+            "oldest_pending_sec": queue.get("oldest_pending_sec"),
+            "claim_p95_ms": queue.get("claim_p95_ms"),
+        }
+    foreground_state = {}
+    foreground = next(
+        (row for row in fresh_turns if row.get("pool") == "foreground"),
+        None,
+    )
+    if foreground is not None:
+        foreground_state = dict(foreground.get("runtime_state") or {})
     return {
         "inflight": jobs_store.inflight_job_count(),
         "pending": jobs_store.pending_job_count(),
@@ -935,7 +968,7 @@ def v2_metrics(
         # Two rows (turn + Genesis) per runner. Use the store's bounded maximum
         # so the production per-CVM gate can prove fleets larger than 25 CVMs
         # instead of silently truncating at the helper's observational default.
-        "worker_heartbeats": jobs_store.recent_worker_heartbeats(limit=200),
+        "worker_heartbeats": heartbeats,
         "worker_heartbeat_count": jobs_store.recent_worker_heartbeat_count(),
         "runtime_policy": config_store.hosted_runtime_policy_status(),
         "mean_service_sec": jobs_store.recent_mean_service_sec(lane="chat"),
@@ -975,6 +1008,41 @@ def v2_metrics(
         # like a falling wake success rate. See jobs_store.memory_lane_health().
         "memory_lanes": jobs_store.memory_lane_health(),
         "effects": db.effect_outbox_health(),
+        "pools": pools,
+        "jobs_by_lane": jobs_store.job_counts_by_lane(),
+        "preemptions_24h": jobs_store.recent_preemption_counts(within_hours=24),
+        "watchdog_recoveries_24h": jobs_store.recent_watchdog_recovery_counts(
+            within_hours=24
+        ),
+        "enclave": foreground_state.get("enclave") or {
+            "limit": 0,
+            "granted": {},
+            "waiting": {},
+            "wait_p95_ms": {},
+        },
+        "db_pools": foreground_state.get("db_pools") or {
+            "parent": {"max": 0, "used": 0, "waiting": 0, "timeouts": 0},
+            "slot": {
+                "processes": 0,
+                "max_each": 0,
+                "used": 0,
+                "waiting": 0,
+                "timeouts": 0,
+            },
+        },
+        "isolation_events": foreground_state.get("isolation_events") or {
+            "watchdog_kills": {},
+            "stale_owner_rejections": 0,
+            "preemption_exit_p95_ms": None,
+            "watchdog_release_p95_ms": None,
+            "admission_rejects": {},
+        },
+        "profile_runtime": foreground_state.get("profile_runtime") or {
+            "card_count_max": 0,
+            "batch_count": 0,
+            "provider_calls_max": 0,
+            "stage_p95_ms": {},
+        },
         # The genesis import worker rides in the serve_worker process on its own
         # thread, and `run_loop` imports `genesis.worker` lazily — so that thread can
         # die while the turn loops keep beating. Without this field, a dead genesis

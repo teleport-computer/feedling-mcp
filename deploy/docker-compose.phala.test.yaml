@@ -98,7 +98,7 @@ services:
   # baked into REPORT_DATA. Moving this behind ingress would break the
   # Phase 3 pinning guarantee.
   enclave:
-    image: &enclave-image ghcr.io/teleport-computer/feedling:0294e5b
+    image: &enclave-image ghcr.io/teleport-computer/feedling:34d0115
     command: &enclave-command ["python", "-u", "backend/enclave_app.py"]
     restart: unless-stopped
     environment:
@@ -178,7 +178,7 @@ services:
   # a safe no-op unless invoked with --force.
 
   backend:
-    image: ghcr.io/teleport-computer/feedling:0294e5b
+    image: ghcr.io/teleport-computer/feedling:34d0115
     # gunicorn (uvicorn ASGI worker) = production server (the Werkzeug dev server stalls on large
     # responses under TDX). Worker count now comes from FEEDLING_BACKEND_WORKERS
     # (backend/gunicorn_conf.py, default 1) — NOT a `-w` flag — so the default is
@@ -361,7 +361,7 @@ services:
   # (deploy/docker-compose.phala.runner.yaml) is unrelated extra V2 capacity
   # and is untouched by this change.
   serve-worker:
-    image: ghcr.io/teleport-computer/feedling:0294e5b
+    image: ghcr.io/teleport-computer/feedling:34d0115
     container_name: serve-worker
     command: ["python", "-u", "backend/model_api_runtime/v2/serve_worker.py"]
     restart: unless-stopped
@@ -373,7 +373,13 @@ services:
       FEEDLING_ENCLAVE_URL: "https://enclave:5003"
       DATABASE_URL: "${DATABASE_URL:-}"
       FEEDLING_RUNTIME_TOKEN_SECRET: "${FEEDLING_RUNTIME_TOKEN_SECRET:-}"
-      FEEDLING_V2_MAX_WORKERS: "4"
+      # 1c/2g test CVM: resource-bounded three-pool topology. These are
+      # deployment values, not secrets, so keep them literal and reviewable.
+      FEEDLING_V2_FOREGROUND_SLOTS: "2"
+      FEEDLING_V2_WAKE_SLOTS: "1"
+      FEEDLING_V2_HEAVY_SLOTS: "1"
+      FEEDLING_V2_PROFILE_INSTANCE_CONCURRENCY: "1"
+      FEEDLING_V2_ENCLAVE_INSTANCE_CONCURRENCY: "4"
       FEEDLING_V2_FLEET_IDENTITY_REQUIRED: "1"
       FEEDLING_V2_RUNNER_CVM_ID: "${FEEDLING_V2_RUNNER_CVM_ID:-main-cvm}"
       FEEDLING_V2_DEPLOYED_BUILD: "${FEEDLING_V2_DEPLOYED_BUILD:-}"
@@ -423,6 +429,73 @@ services:
       enclave:
         condition: service_healthy
 
+  # --- Content-free CVM CPU history (no public endpoint or alerting). ---
+  # Only this proxy holds the Docker socket. Its method/path allowlist exposes
+  # container enumeration and one-shot stats to cpu-recorder, nothing else.
+  cpu-socket-proxy:
+    image: ghcr.io/wollomatic/socket-proxy:1.13.0@sha256:be7a61fc50baf0add95d94442c3d40cddc4594925a564f22ba870eb017ceae9f
+    container_name: cpu-socket-proxy
+    command:
+      - "-loglevel=INFO"
+      - "-listenip=0.0.0.0"
+      - "-allowfrom=cpu-recorder"
+      - '-allowGET=/containers/json'
+      - '-allowGET=/containers/[0-9a-f]{64}/stats'
+      - "-allowhealthcheck"
+      - "-watchdoginterval=60"
+      - "-stoponwatchdog"
+    restart: unless-stopped
+    cpus: 0.05
+    mem_limit: 64m
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - "no-new-privileges:true"
+    # dstack-dev-0.5.8 exposes docker.sock as root:996 mode 0660 (verified on
+    # feedling-io-test and feedling-enclave-v2 on 2026-08-13).
+    group_add:
+      - "996"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks:
+      - cpu-observability
+    healthcheck:
+      test: ["CMD", "./healthcheck"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  cpu-recorder:
+    image: ghcr.io/teleport-computer/feedling:34d0115
+    container_name: cpu-recorder
+    command: ["python", "-u", "ops/cpu_recorder.py"]
+    restart: unless-stopped
+    cpus: 0.10
+    mem_limit: 128m
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - "no-new-privileges:true"
+    environment:
+      CPU_RECORDER_CVM_NAME: "feedling-io-test"
+      CPU_RECORDER_DOCKER_URL: "http://cpu-socket-proxy:2375"
+      CPU_RECORDER_PROC_ROOT: "/host/proc"
+      CPU_RECORDER_DATA_DIR: "/var/lib/feedling-cpu"
+      CPU_RECORDER_INTERVAL_SEC: "60"
+      CPU_RECORDER_RETENTION_DAYS: "30"
+      CPU_RECORDER_DOCKER_TIMEOUT_SEC: "10"
+      CPU_RECORDER_DOCKER_CYCLE_TIMEOUT_SEC: "30"
+    volumes:
+      - /proc:/host/proc:ro
+      - feedling_cpu_history_test:/var/lib/feedling-cpu
+    networks:
+      - cpu-observability
+    depends_on:
+      cpu-socket-proxy:
+        condition: service_healthy
+
 volumes:
   feedling_enclave_data_test:
     name: feedling_enclave_data_test
@@ -432,3 +505,9 @@ volumes:
     name: feedling_ingress_letsencrypt_test
   feedling_ingress_evidences_test:
     name: feedling_ingress_evidences_test
+  feedling_cpu_history_test:
+    name: feedling_cpu_history_test
+
+networks:
+  cpu-observability:
+    internal: true

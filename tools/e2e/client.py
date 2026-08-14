@@ -14,6 +14,7 @@ import os
 import sys
 import time
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 
 _REPO = Path(__file__).resolve().parent.parent.parent
@@ -48,6 +49,25 @@ _ALLOWED_HOSTS = ("test-api.feedling.app", "pre-api.feedling.app",
                   "127.0.0.1", "localhost")
 # Credentials of not-yet-torn-down accounts (leak manifest; see provision()).
 _ORPHANS_DIR = Path.home() / ".feedling-e2e-orphans"
+_FAILURES_DIR = Path.home() / ".feedling-e2e-failures"
+_ADMIN_TOKEN_FILE = Path.home() / ".feedling" / "data-track-admin-token"
+FAILURE_RETENTION_DAYS = 7
+
+
+def _write_private_json(path: Path, body: dict) -> None:
+    """Write diagnostic data 0600 from birth; its parent is private too."""
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(path.parent, 0o700)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(body, f, ensure_ascii=False, indent=2)
+            f.write("\n")
+            f.flush()
+            os.fsync(f.fileno())
+    except BaseException:
+        path.unlink(missing_ok=True)
+        raise
 
 
 def _write_orphan_manifest(api_url: str, user_id: str, api_key: str) -> Path:
@@ -94,6 +114,11 @@ class E2EClient:
         self._http = httpx.Client(timeout=60, verify=False)
         self._deleted = False
         self._orphan_file: Path | None = None
+        self._preserve_reason = ""
+        self._failure_cell = "unknown"
+        self._failure_artifacts: dict[str, str] = {}
+        self._failure_locators: dict[str, set[str]] = {"job_id": set(), "trace_id": set()}
+        self.failure_evidence_path: Path | None = None
 
     # -- lifecycle ----------------------------------------------------------
     @classmethod
@@ -171,10 +196,157 @@ class E2EClient:
         if self._orphan_file is not None:
             self._orphan_file.unlink(missing_ok=True)
 
+    def configure_failure_evidence(self, *, cell: str,
+                                   artifacts: dict[str, str] | None = None) -> None:
+        """Attach non-secret P0 context before a step can fail."""
+        self._failure_cell = cell
+        self._failure_artifacts = dict(artifacts or {})
+
+    def preserve_failure(self, reason: str) -> None:
+        """Mark this account as failed: __exit__ captures evidence, not teardown."""
+        if not self._preserve_reason:
+            self._preserve_reason = reason or "P0 step failed"
+
+    def record_failure_locator(self, kind: str, value: object) -> None:
+        """Remember the exact turn/job before later diagnostics can race it."""
+        if kind in self._failure_locators and value:
+            self._failure_locators[kind].add(str(value))
+
+    @staticmethod
+    def _collect_locators(value, found: dict[str, set[str]]) -> None:
+        if isinstance(value, dict):
+            for key, child in value.items():
+                if key in ("job_id", "activity_job_id") and child:
+                    found["job_id"].add(str(child))
+                if key in ("trace_id", "activity_turn_id", "reply_to_message_id") and child:
+                    found["trace_id"].add(str(child))
+                E2EClient._collect_locators(child, found)
+        elif isinstance(value, list):
+            for child in value:
+                E2EClient._collect_locators(child, found)
+
+    def _capture_failure_evidence(self) -> Path:
+        """Capture redacted diagnostics while the failed account still exists.
+
+        Exact provider input stays in the server-side encrypted Runtime V2
+        trajectory; this bundle records the job/trace locators needed for the
+        audited inspector instead of creating a second plaintext copy.
+        """
+        run_dir = _FAILURES_DIR / self.user_id
+        run_dir.mkdir(parents=True, exist_ok=False, mode=0o700)
+        os.chmod(run_dir, 0o700)
+        captures: dict[str, object] = {}
+        errors: dict[str, str] = {}
+
+        try:
+            r = self.get("/v1/debug/trace", params={"limit": 200})
+            r.raise_for_status()
+            captures["user_trace"] = r.json()
+            _write_private_json(run_dir / "user-trace.json", r.json())
+        except Exception as e:  # noqa: BLE001 — preserving the account is primary
+            errors["user_trace"] = f"{type(e).__name__}: {e}"
+
+        # Chat history exposes fixed, content-free turn/job linkage even when
+        # the optional debug trace ring is disabled. Keep only those locators;
+        # never duplicate ciphertext or user-visible content into this index.
+        try:
+            r = self.get("/v1/chat/history", params={"limit": 50})
+            r.raise_for_status()
+            turn_index = []
+            for msg in r.json().get("messages") or []:
+                if not isinstance(msg, dict):
+                    continue
+                turn_index.append({
+                    key: msg.get(key) for key in (
+                        "id", "role", "ts", "reply_to_message_id", "activity_turn_id",
+                        "activity_job_id", "reply_status",
+                    ) if msg.get(key) is not None
+                })
+            captures["turn_index"] = turn_index
+            _write_private_json(run_dir / "turn-index.json", {"messages": turn_index})
+        except Exception as e:  # noqa: BLE001
+            errors["turn_index"] = f"{type(e).__name__}: {e}"
+
+        try:
+            token = _ADMIN_TOKEN_FILE.read_text().strip()
+            if not token:
+                raise RuntimeError("admin token file is empty")
+            r = httpx.get(
+                f"{self.api_url}/v1/admin/data-track/users/{self.user_id}",
+                headers={"X-Admin-Token": token}, timeout=60, verify=False,
+            )
+            r.raise_for_status()
+            captures["admin_user"] = r.json()
+            _write_private_json(run_dir / "admin-user.json", r.json())
+        except Exception as e:  # noqa: BLE001 — user trace/orphan still useful
+            errors["admin_user"] = f"{type(e).__name__}: {e}"
+
+        locators: dict[str, set[str]] = {"job_id": set(), "trace_id": set()}
+        self._collect_locators(captures, locators)
+        for key, values in self._failure_locators.items():
+            locators[key].update(values)
+        turn_activity: dict[str, object] = {}
+        for trace_id in sorted(locators["trace_id"]):
+            try:
+                r = self.get(f"/v1/chat/turn-activity/{trace_id}")
+                if r.status_code == 404:
+                    continue
+                r.raise_for_status()
+                turn_activity[trace_id] = r.json()
+            except Exception as e:  # noqa: BLE001
+                errors[f"turn_activity:{trace_id}"] = f"{type(e).__name__}: {e}"
+        if turn_activity:
+            captures["turn_activity"] = turn_activity
+            self._collect_locators(turn_activity, locators)
+            _write_private_json(run_dir / "turn-activity.json", turn_activity)
+        created = datetime.now(timezone.utc)
+        manifest = {
+            "schema": 1,
+            "created_at": created.isoformat(),
+            "retention_days": FAILURE_RETENTION_DAYS,
+            "cleanup_owner": "P0 operator",
+            "cleanup_command": "python3 tools/e2e/p0.py --cleanup-expired-failures",
+            "api_url": self.api_url,
+            "cell": self._failure_cell,
+            "user_id": self.user_id,
+            "reason": self._preserve_reason,
+            "orphan_manifest": str(self._orphan_file or ""),
+            "locators": {key: sorted(values) for key, values in locators.items()},
+            "final_provider_input": {
+                "storage": "server-side encrypted Runtime V2 trajectory",
+                "inspection": "audited break-glass trajectory inspector by job_id/trace_id",
+                "plaintext_copied_here": False,
+            },
+            "artifacts": self._failure_artifacts,
+            "capture_errors": errors,
+        }
+        _write_private_json(run_dir / "evidence.json", manifest)
+        return run_dir
+
     def __enter__(self) -> "E2EClient":
         return self
 
-    def __exit__(self, exc_type, _exc, _tb) -> bool:
+    def __exit__(self, exc_type, exc, _tb) -> bool:
+        if exc_type is not None and not self._preserve_reason:
+            self.preserve_failure(f"{exc_type.__name__}: {exc}")
+        if self._preserve_reason:
+            try:
+                self.failure_evidence_path = self._capture_failure_evidence()
+                print(
+                    f"[e2e] FAILURE SITE PRESERVED: user_id={self.user_id} "
+                    f"evidence={self.failure_evidence_path} "
+                    "cleanup='python3 tools/e2e/p0.py --cleanup-expired-failures'",
+                    file=sys.stderr,
+                )
+            except Exception as capture_error:  # noqa: BLE001
+                print(
+                    f"[e2e] FAILURE SITE PRESERVED: user_id={self.user_id} "
+                    f"orphan={self._orphan_file}; evidence capture failed: {capture_error}",
+                    file=sys.stderr,
+                )
+            finally:
+                self._http.close()
+            return False
         try:
             self.teardown()
         except Exception as teardown_error:  # noqa: BLE001
@@ -312,8 +484,10 @@ class E2EClient:
         retried POST can never double-ingest (memory ring / wake side effects
         included — envelope-id dedup alone only covers the DB row)."""
         sent_at = time.time()
+        envelope = self._seal(text)
+        self.record_failure_locator("trace_id", envelope.get("id"))
         r = self.post("/v1/chat/message", json={
-            "envelope": self._seal(text),
+            "envelope": envelope,
             "client_msg_id": str(uuid.uuid4()),
         })
         r.raise_for_status()
@@ -331,6 +505,10 @@ class E2EClient:
             for m in h.get("messages") or []:
                 if (m.get("role") in ("agent", "openclaw")
                         and float(m.get("ts") or 0) > since):
+                    self.record_failure_locator("job_id", m.get("activity_job_id"))
+                    self.record_failure_locator(
+                        "trace_id", m.get("activity_turn_id") or m.get("reply_to_message_id"),
+                    )
                     return m
             time.sleep(3)
         return None

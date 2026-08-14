@@ -501,7 +501,12 @@ def test_turn_child_main_starts_the_periodic_full_reload(monkeypatch):
     from model_api_runtime.v2 import serve_worker, turn_child
 
     started = {"n": 0}
-    monkeypatch.setattr(serve_worker, "_configure_db_pool_capacity", lambda *_a: None)
+    configured = []
+    monkeypatch.setattr(
+        turn_child.db,
+        "configure_pool_max_size",
+        lambda value: configured.append(value) or value,
+    )
     monkeypatch.setattr(turn_child.db, "init_schema", lambda: None)
     monkeypatch.setattr(serve_worker, "wire_assembly", lambda: None)
     monkeypatch.setattr(
@@ -517,6 +522,7 @@ def test_turn_child_main_starts_the_periodic_full_reload(monkeypatch):
 
     turn_child.main(FakeConn(), "worker-test", poll_interval=1.0)
     assert started["n"] == 1
+    assert configured == [2]
 
 
 # --- 6. env parsing must not crash import ----------------------------------

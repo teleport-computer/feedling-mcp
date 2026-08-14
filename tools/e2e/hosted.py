@@ -40,6 +40,7 @@ def _hosted_send(c: E2EClient, text: str) -> tuple[float, str]:
         })
         if r.status_code == 202:
             body = r.json()
+            c.record_failure_locator("trace_id", (body.get("user_message") or {}).get("id"))
             server_ts = float((body.get("user_message") or {}).get("ts") or sent_at)
             return server_ts, ""
         last = f"{r.status_code} {r.text[:120]}"
@@ -61,9 +62,12 @@ def run_hosted_cell(cell: HostedCell, pool: dict[str, str]) -> dict:
                 "steps": [("key", "skip", f"no {cell.key_env} in pool")]}
 
     steps: list[tuple[str, str, str]] = []
+    active_client: E2EClient | None = None
 
     def step(name: str, ok: bool, detail: str = "", *, warn: bool = False) -> bool:
         steps.append((name, "ok" if ok else ("warn" if warn else "fail"), detail))
+        if not ok and not warn and active_client is not None:
+            active_client.preserve_failure(f"{name}: {detail or 'failed'}")
         return ok
 
     models = cell.models or [m for m in [pool.get("E2E_RELAY_MODEL", "")] if m]
@@ -72,6 +76,8 @@ def run_hosted_cell(cell: HostedCell, pool: dict[str, str]) -> dict:
                 "steps": [("model", "skip", "no model candidates configured")]}
 
     with E2EClient.provision(route="model_api") as c:
+        active_client = c
+        c.configure_failure_evidence(cell=f"hosted:{cell.name}")
         # -- setup: try model candidates until the live self-test passes ------
         setup_detail, ok = "", False
         for model in models:

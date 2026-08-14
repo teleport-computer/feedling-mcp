@@ -247,3 +247,109 @@ def test_the_admin_panel_can_read_the_whole_ring_out():
     src = inspect.getsource(data_track)
 
     assert '"1000", "2500"' in src, "面板的 page size 选项没跟上环深,读不出整环"
+
+
+# --------------------------------------------------------------------------- #
+# 前缀折叠 —— 感知上报每个字段一个 purpose,精确匹配折不动
+#
+# 2026-08-12 实测:前面几批折叠都上线之后,活跃 V2 用户环里**仍有 100%**
+# 是 `perception:*` 的逐字段事件(actor=backend,一次上报 ~14 条),窗口被压在
+# 几小时。前面那些折叠包的都是 serve_worker 里的循环,而这条在 backend 进程。
+# --------------------------------------------------------------------------- #
+
+_REPORT_FIELDS = (
+    "location_signal", "weather", "motion_state",
+    "calendar_next_event", "playback", "audio_route", "battery",
+)
+
+
+def _report_round(purposes=_REPORT_FIELDS):
+    for field in purposes:
+        _ok(f"perception:{field}")
+
+
+def test_a_perception_report_folds_into_one_event(recorded):
+    """线上那个形状:七个字段 × 六轮上报。"""
+    with enclave.coalesced_success_trace("perception:", prefix=True):
+        for _ in range(6):
+            _report_round()
+
+    assert len(recorded) == 1, (
+        f"仍然写了 {len(recorded)} 条(不折叠是 84 条)—— 环还是会被上报冲掉"
+    )
+    assert recorded[0]["detail"]["calls"] == 42
+
+
+def test_the_batch_still_says_which_signals_were_in_it(recorded):
+    """折叠掉「一条条铺开」,不能折掉「这批里有哪些信号」。
+
+    分不清哪个字段来了、哪个没来,正是排查感知问题时唯一要看的东西。
+    """
+    with enclave.coalesced_success_trace("perception:", prefix=True):
+        _report_round(("weather", "battery", "battery"))
+
+    by_purpose = recorded[0]["detail"]["by_purpose"]
+
+    assert by_purpose == {"perception:weather": 1, "perception:battery": 2}
+
+
+def test_a_failure_inside_a_prefix_batch_is_still_traced_individually(recorded):
+    with enclave.coalesced_success_trace("perception:", prefix=True):
+        _ok("perception:weather")
+        enclave._trace_enclave(
+            _store(), "enclave.call.error", purpose="perception:weather",
+            status="error", detail={"status_code": 401},
+        )
+        _ok("perception:battery")
+
+    assert "enclave.call.error" in [e["type"] for e in recorded]
+
+
+def test_an_exact_scope_wins_over_an_enclosing_prefix_scope(recorded):
+    """更具体者优先:精确作用域自己成批,剩下的才归前缀。
+
+    顺序反过来的话,一个宽前缀会把本该独立成批的 purpose 全吸走,
+    那些批次的计数就再也分不出来了。
+    """
+    with enclave.coalesced_success_trace("perception:", prefix=True):
+        with enclave.coalesced_success_trace("perception:weather"):
+            for _ in range(3):
+                _ok("perception:weather")
+        for _ in range(2):
+            _ok("perception:battery")
+
+    batches = {e["detail"]["purpose"]: e["detail"] for e in recorded}
+
+    assert batches["perception:weather"]["calls"] == 3
+    assert batches["perception:"]["calls"] == 2
+    assert batches["perception:"]["by_purpose"] == {"perception:battery": 2}
+
+
+def test_a_plain_scope_does_not_absorb_other_purposes(recorded):
+    """不开 prefix 的老调用方行为一个字不变 —— 别的 purpose 照常单条落地。"""
+    with enclave.coalesced_success_trace("v2_chat_read"):
+        for _ in range(5):
+            _ok("v2_chat_read")
+        _ok("v2_caption_read")
+
+    types = [e["type"] for e in recorded]
+
+    assert "enclave.call.start" in types and "enclave.call.done" in types
+    assert len([e for e in recorded if e["type"] == "enclave.call.batch"]) == 1
+
+
+def test_the_perception_ingestion_actually_opens_a_prefix_scope():
+    """光有能力不算数 —— 入库那条路必须真的用上它。
+
+    这条是「机制存在」与「机制被接上」之间的差别;今天已经在别处栽过一次
+    (工具面 enum 做好了,但没登记进 CI 就等于没有)。
+    """
+    import inspect
+
+    from perception import service
+
+    src = inspect.getsource(service.ingest_snapshot_v2)
+
+    assert 'coalesced_success_trace("perception:", prefix=True)' in src, (
+        "感知入库没有开前缀折叠作用域,环还是会被逐字段事件填满"
+    )

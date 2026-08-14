@@ -63,7 +63,6 @@ tests/test_bucket_lang_normalize.py
 tests/test_bucket_language_normalize.py
 tests/test_capabilities_chat.py
 tests/test_capabilities_identity.py
-tests/test_capabilities_memory.py
 tests/test_capabilities_perception.py
 tests/test_capabilities_photo.py
 tests/test_capabilities_registry.py
@@ -110,7 +109,6 @@ tests/test_content_rewrap_subenvelopes.py
 tests/test_context_memories.py
 tests/test_copytext.py
 tests/test_data_track.py
-tests/test_data_track_debug.py
 tests/test_dau_snapshot_scheduler.py
 tests/test_db_health_timeouts.py
 tests/test_debug_trace_atomic.py
@@ -414,7 +412,6 @@ tests/test_v2_prompt_invariant.py
 tests/test_v2_provenance.py
 tests/test_v2_provider_usage_tool.py
 tests/test_v2_push_delivery.py
-tests/test_v2_push_endpoint.py
 tests/test_v2_quoted_memory.py
 tests/test_v2_reaper.py
 tests/test_v2_reply_cursor_seq.py

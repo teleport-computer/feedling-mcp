@@ -225,15 +225,17 @@ def test_chat_turn_offers_and_dispatches_configured_mcp_tool(monkeypatch):
     ])
     deps = _deps([{"id": "m1", "ts": 10.0, "role": "user", "content": "ping it"}],
                  load_mcp_turn=load_fn)
+    enclave_sem = asyncio.Semaphore(1)
 
     status = asyncio.run(worker.process_job(
-        job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt-turn"))
+        job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt-turn",
+        enclave_sem=enclave_sem))
 
     assert status == "completed"
     # load_turn_mcp was called with this turn's user + runtime token
     assert seen_load and seen_load[0]["user_id"] == uid
     assert seen_load[0]["runtime_token"] == "rt-turn"
-    assert seen_load[0]["enclave_sem"] is worker.ENCLAVE_SEMAPHORE
+    assert seen_load[0]["enclave_sem"] is enclave_sem
     # the MCP tool was offered to the provider in round 1
     assert any(s.name == "mcp__test__ping" for s in calls[0]["tools"])
     # the mcp__ call was routed to the MCP dispatcher (not the platform executor)
@@ -391,6 +393,7 @@ def test_mcp_turn_usage_records_two_offered_and_two_consecutive_calls(monkeypatc
         "lane": "chat",
         "outcome": "completed",
         "offered_tool_count": 2,
+        "offered_tool_count_lens": "turn_resolved_before_provider_budget",
         "called_tool_count": 1,
         "call_count": 2,
     }
@@ -425,8 +428,18 @@ def test_mcp_turn_usage_records_offered_but_zero_calls(monkeypatch):
     )) == "completed"
     usage = next(trace for trace in traces if trace["type"] == "mcp.turn.usage")
     assert usage["detail"]["offered_tool_count"] == 2
+    assert usage["detail"]["offered_tool_count_lens"] == (
+        "turn_resolved_before_provider_budget"
+    )
     assert usage["detail"]["called_tool_count"] == 0
     assert usage["detail"]["call_count"] == 0
+    provider_surface = next(
+        trace for trace in traces if trace["type"] == "mcp.surface.provider"
+    )
+    assert provider_surface["detail"]["mcp_candidate_tool_count"] == 2
+    assert provider_surface["detail"]["mcp_sent_tool_count"] == 2
+    assert provider_surface["detail"]["mcp_dropped_tool_count"] == 0
+    assert provider_surface["detail"]["reason"] == "none"
 
 
 def test_mcp_turn_usage_marks_failed_turns(monkeypatch):

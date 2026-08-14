@@ -11,6 +11,7 @@ not the pytest-asyncio marker, to avoid a plugin-config dependency.
 from __future__ import annotations
 
 import asyncio
+import json
 import sys
 from pathlib import Path
 
@@ -475,6 +476,124 @@ def test_foreground_semantic_empty_response_gets_one_correction(monkeypatch):
     correction = provider.calls[1]["messages"][0]
     assert correction["role"] == "system"
     assert "Do not return a thinking-only response" in correction["content"]
+
+
+def test_serialized_upstream_response_envelope_gets_one_correction(monkeypatch):
+    """usr_90184: a relay serialized Gemini's whole body as visible text."""
+    leaked = json.dumps(
+        {
+            "response": {
+                "candidates": [{"content": {}}],
+                "usageMetadata": {
+                    "promptTokenCount": 23894,
+                    "totalTokenCount": 24515,
+                    "thoughtsTokenCount": 621,
+                },
+                "modelVersion": "gemini-3-flash",
+                "responseId": "OTV9aoyAI9ronsEPuOK1kAM",
+            },
+            "traceId": "491379ee31653ba7",
+            "metadata": {},
+        },
+        ensure_ascii=False,
+    )
+    provider = _ScriptedProvider(
+        [
+            {
+                "reply": leaked,
+                "reasoning": "",
+                "stop_reason": "",
+                "tool_calls": [],
+                "usage": {"prompt_tokens": 23894, "completion_tokens": 621},
+            },
+            {
+                "reply": "正常回复",
+                "reasoning": "",
+                "stop_reason": "end_turn",
+                "tool_calls": [],
+                "usage": {"completion_tokens": 8},
+            },
+        ]
+    )
+    monkeypatch.setattr(provider_client, "chat_completion_async", provider)
+    published = []
+    provider_successes = []
+    events = []
+
+    async def publish(text, *, final, reasoning=""):
+        published.append((text, final, reasoning))
+
+    async def on_provider_success():
+        provider_successes.append(True)
+
+    async def record(kind, payload):
+        events.append((kind, payload))
+
+    outcome = asyncio.run(
+        tool_loop.run_tool_loop(
+            provider_config=_TEST_PROVIDER_CONFIG,
+            build_messages=_AdaptiveBuildMessages(),
+            dispatch_tools=_RecordingDispatch(),
+            on_reply=publish,
+            fold_new_messages=_RecordingFold([]),
+            add_usage=_noop_add_usage,
+            max_calls=5,
+            on_provider_success=on_provider_success,
+            on_trajectory_event=record,
+        )
+    )
+
+    assert outcome.final_text == "正常回复"
+    assert published == [("正常回复", True, "")]
+    assert provider_successes == [True]
+    assert len(provider.calls) == 2
+    correction = provider.calls[1]["messages"][0]
+    assert "without visible text" in correction["content"]
+    empty_event = next(
+        payload for kind, payload in events if kind == "empty_provider_response"
+    )
+    assert empty_event["reason"] == "upstream_response_envelope"
+    assert empty_event["response_shape"]["has_visible_text"] is True
+    assert leaked not in str(empty_event)
+
+
+def test_repeated_upstream_response_envelope_fails_without_publishing(monkeypatch):
+    leaked = json.dumps(
+        {
+            "response": {
+                "candidates": [{"content": {}}],
+                "usageMetadata": {"totalTokenCount": 24515},
+                "modelVersion": "gemini-3-flash",
+                "responseId": "response-id",
+            },
+            "traceId": "trace-id",
+            "metadata": {},
+        }
+    )
+    provider = _ScriptedProvider(
+        [
+            {"reply": leaked, "tool_calls": [], "usage": {}},
+            {"reply": leaked, "tool_calls": [], "usage": {}},
+        ]
+    )
+    monkeypatch.setattr(provider_client, "chat_completion_async", provider)
+    published = _RecordingReply()
+
+    with pytest.raises(tool_loop.ProviderEmptyReply, match="empty_reply"):
+        asyncio.run(
+            tool_loop.run_tool_loop(
+                provider_config=_TEST_PROVIDER_CONFIG,
+                build_messages=_AdaptiveBuildMessages(),
+                dispatch_tools=_RecordingDispatch(),
+                on_reply=published,
+                fold_new_messages=_RecordingFold([[]]),
+                add_usage=_noop_add_usage,
+                max_calls=5,
+            )
+        )
+
+    assert len(provider.calls) == 2
+    assert published.calls == []
 
 
 def test_semantic_empty_correction_retains_real_tool_flow(monkeypatch):
@@ -1408,6 +1527,163 @@ def test_same_batch_duplicate_memory_discovery_dispatches_only_once(monkeypatch)
     assert outcome.final_text == "direct answer"
 
 
+def test_memory_search_dispatches_different_queries_across_rounds(monkeypatch):
+    provider = _ScriptedProvider([
+        {
+            "reply": "",
+            "tool_calls": [
+                {"id": "m1", "name": "memory_search", "args": {"query": "生日"}}
+            ],
+            "usage": {},
+        },
+        {
+            "reply": "",
+            "tool_calls": [
+                {"id": "m2", "name": "memory_search", "args": {"query": "工作"}}
+            ],
+            "usage": {},
+        },
+        {"reply": "direct answer", "tool_calls": [], "usage": {}},
+    ])
+    monkeypatch.setattr(provider_client, "chat_completion_async", provider)
+    dispatch = _RecordingDispatch("matching memory")
+
+    outcome = asyncio.run(tool_loop.run_tool_loop(
+        provider_config=_TEST_PROVIDER_CONFIG,
+        build_messages=_RecordingBuildMessages(),
+        dispatch_tools=dispatch,
+        on_reply=_RecordingReply(),
+        fold_new_messages=_RecordingFold([[], []]),
+        add_usage=_noop_add_usage,
+        max_calls=4,
+    ))
+
+    assert [[tc.id for tc in batch] for batch in dispatch.calls] == [["m1"], ["m2"]]
+    assert outcome.final_text == "direct answer"
+
+
+def test_same_batch_memory_search_dispatches_different_queries(monkeypatch):
+    provider = _ScriptedProvider([
+        {
+            "reply": "",
+            "tool_calls": [
+                {"id": "m1", "name": "memory_search", "args": {"query": "生日"}},
+                {"id": "m2", "name": "memory_search", "args": {"query": "工作"}},
+            ],
+            "usage": {},
+        },
+        {"reply": "direct answer", "tool_calls": [], "usage": {}},
+    ])
+    monkeypatch.setattr(provider_client, "chat_completion_async", provider)
+    dispatch = _RecordingDispatch("matching memory")
+
+    outcome = asyncio.run(tool_loop.run_tool_loop(
+        provider_config=_TEST_PROVIDER_CONFIG,
+        build_messages=_RecordingBuildMessages(),
+        dispatch_tools=dispatch,
+        on_reply=_RecordingReply(),
+        fold_new_messages=_RecordingFold([[]]),
+        add_usage=_noop_add_usage,
+        max_calls=3,
+    ))
+
+    assert [[tc.id for tc in batch] for batch in dispatch.calls] == [["m1", "m2"]]
+    assert outcome.final_text == "direct answer"
+
+
+def test_memory_search_reuses_same_query_across_rounds(monkeypatch):
+    provider = _ScriptedProvider([
+        {
+            "reply": "",
+            "tool_calls": [
+                {
+                    "id": "m1",
+                    "name": "memory_search",
+                    "args": {"query": "生日", "limit": 5},
+                }
+            ],
+            "usage": {},
+        },
+        {
+            "reply": "",
+            "tool_calls": [
+                {
+                    "id": "m2",
+                    "name": "memory_search",
+                    "args": {"limit": 5, "query": "生日"},
+                }
+            ],
+            "usage": {},
+        },
+        {"reply": "direct answer", "tool_calls": [], "usage": {}},
+    ])
+    monkeypatch.setattr(provider_client, "chat_completion_async", provider)
+    dispatch = _RecordingDispatch("matching memory")
+    build_messages = _RecordingBuildMessages()
+
+    outcome = asyncio.run(tool_loop.run_tool_loop(
+        provider_config=_TEST_PROVIDER_CONFIG,
+        build_messages=build_messages,
+        dispatch_tools=dispatch,
+        on_reply=_RecordingReply(),
+        fold_new_messages=_RecordingFold([[], []]),
+        add_usage=_noop_add_usage,
+        max_calls=4,
+    ))
+
+    assert [[tc.id for tc in batch] for batch in dispatch.calls] == [["m1"]]
+    repeated_exchange = build_messages.calls[2][-1]
+    assert isinstance(repeated_exchange, ToolExchange)
+    assert repeated_exchange.results[0].call_id == "m2"
+    assert "already completed" in repeated_exchange.results[0].content
+    assert outcome.final_text == "direct answer"
+
+
+def test_same_batch_memory_search_reuses_same_query(monkeypatch):
+    provider = _ScriptedProvider([
+        {
+            "reply": "",
+            "tool_calls": [
+                {"id": "m1", "name": "memory_search", "args": {"query": "生日"}},
+                {"id": "m2", "name": "memory_search", "args": {"query": "生日"}},
+            ],
+            "usage": {},
+        },
+        {"reply": "direct answer", "tool_calls": [], "usage": {}},
+    ])
+    monkeypatch.setattr(provider_client, "chat_completion_async", provider)
+    dispatch = _RecordingDispatch("matching memory")
+    build_messages = _RecordingBuildMessages()
+    tool_events = []
+
+    async def record_tool_event(tc, event_kind, payload):
+        tool_events.append((tc, event_kind, payload))
+
+    outcome = asyncio.run(tool_loop.run_tool_loop(
+        provider_config=_TEST_PROVIDER_CONFIG,
+        build_messages=build_messages,
+        dispatch_tools=dispatch,
+        on_reply=_RecordingReply(),
+        fold_new_messages=_RecordingFold([[]]),
+        add_usage=_noop_add_usage,
+        on_tool_event=record_tool_event,
+        max_calls=3,
+    ))
+
+    assert [[tc.id for tc in batch] for batch in dispatch.calls] == [["m1"]]
+    exchange = build_messages.calls[1][-1]
+    assert [result.call_id for result in exchange.results] == ["m1", "m2"]
+    assert "already completed" in exchange.results[1].content
+    reused = [
+        payload["result"]
+        for tc, event_kind, payload in tool_events
+        if tc.id == "m2" and event_kind == "tool_call_result"
+    ]
+    assert len(reused) == 1
+    assert reused[0].metadata == {"memory_discovery_reused": True}
+    assert outcome.final_text == "direct answer"
+
+
 def test_openrouter_file_recovery_forces_write_then_send_file(monkeypatch):
     provider = _ScriptedProvider([
         {"reply": "# draft", "tool_calls": [], "usage": {}},
@@ -1438,6 +1714,7 @@ def test_openrouter_file_recovery_forces_write_then_send_file(monkeypatch):
     monkeypatch.setattr(provider_client, "chat_completion_async", provider)
     dispatched = []
     files = []
+    surfaces = []
 
     async def dispatch(tool_calls):
         dispatched.extend(tool_calls)
@@ -1455,6 +1732,9 @@ def test_openrouter_file_recovery_forces_write_then_send_file(monkeypatch):
     async def on_file(path, revision):
         files.append((path, revision))
 
+    async def record_surface(detail):
+        surfaces.append(detail)
+
     config = provider_client.ProviderConfig(
         provider="openrouter",
         model="deepseek/deepseek-v4-flash",
@@ -1470,6 +1750,7 @@ def test_openrouter_file_recovery_forces_write_then_send_file(monkeypatch):
         fold_new_messages=_RecordingFold([[], [], []]),
         add_usage=_noop_add_usage,
         max_calls=5,
+        on_provider_tool_surface=record_surface,
     ))
 
     assert [tc.name for tc in dispatched] == ["workspace_write"]
@@ -1485,6 +1766,12 @@ def test_openrouter_file_recovery_forces_write_then_send_file(monkeypatch):
     assert [spec.name for spec in provider.calls[2]["tools"]] == ["send_file"]
     assert files == [("/workspace/summary.md", 1)]
     assert outcome.final_text == "文档已生成。"
+    assert [item["reason"] for item in surfaces[:3]] == [
+        "file_delivery_forced",
+        "file_delivery_forced",
+        "file_delivery_forced",
+    ]
+    assert all(item["dropped_tool_count"] > 0 for item in surfaces[:3])
 
 
 def test_invalid_artifact_write_is_model_visible_and_retries_in_workspace(
@@ -1997,7 +2284,11 @@ def test_tool_schema_rejection_gets_exactly_one_tools_disabled_fallback(monkeypa
     provider = _RejectThenReply()
     monkeypatch.setattr(provider_client, "chat_completion_async", provider)
     usage = []
+    surfaces = []
     reply = _RecordingReply()
+
+    async def record_surface(detail):
+        surfaces.append(detail)
 
     outcome = asyncio.run(tool_loop.run_tool_loop(
         provider_config=_TEST_PROVIDER_CONFIG, build_messages=_RecordingBuildMessages(),
@@ -2005,6 +2296,7 @@ def test_tool_schema_rejection_gets_exactly_one_tools_disabled_fallback(monkeypa
         fold_new_messages=_RecordingFold([[]]), add_usage=usage.append,
         max_calls=5,
         allow_image_output=True,
+        on_provider_tool_surface=record_surface,
     ))
 
     assert provider.calls[0]["tools"] is not None
@@ -2015,6 +2307,40 @@ def test_tool_schema_rejection_gets_exactly_one_tools_disabled_fallback(monkeypa
     assert usage == [None, {}]
     assert reply.calls == [("fallback answer", True)]
     assert outcome.rounds == 2
+    assert [item["reason"] for item in surfaces] == [
+        "none",
+        "tool_schema_rejected",
+    ]
+    assert surfaces[0]["sent_tool_count"] > 0
+    assert surfaces[1]["sent_tool_count"] == 0
+    assert surfaces[1]["dropped_tool_count"] == surfaces[1]["candidate_tool_count"]
+
+
+def test_provider_surface_marks_reserved_terminal_text_round(monkeypatch):
+    provider = _ScriptedProvider([
+        {"reply": "terminal", "tool_calls": [], "usage": {}},
+    ])
+    monkeypatch.setattr(provider_client, "chat_completion_async", provider)
+    surfaces = []
+
+    async def record_surface(detail):
+        surfaces.append(detail)
+
+    outcome = asyncio.run(tool_loop.run_tool_loop(
+        provider_config=_TEST_PROVIDER_CONFIG,
+        build_messages=_RecordingBuildMessages(),
+        dispatch_tools=_RecordingDispatch(),
+        on_reply=_RecordingReply(),
+        fold_new_messages=_RecordingFold([]),
+        add_usage=_noop_add_usage,
+        max_calls=1,
+        on_provider_tool_surface=record_surface,
+    ))
+
+    assert outcome.final_text == "terminal"
+    assert surfaces[0]["reason"] == "terminal_text_round"
+    assert surfaces[0]["sent_tool_count"] == 0
+    assert surfaces[0]["dropped_tool_count"] == surfaces[0]["candidate_tool_count"]
 
 
 def test_provider_call_exception_still_counts_a_model_call(monkeypatch):

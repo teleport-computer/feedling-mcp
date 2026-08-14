@@ -1,7 +1,8 @@
 # tools/e2e — 发版 P0 冒烟（一键）
 
 `docs/testing/RELEASE_TESTING_PROTOCOL.md` §3 的可执行实现。**只打 test 环境**
-（client 硬拒 prod host）；每个测试账号用完即删（test-account-hygiene）。
+（client 硬拒 prod host）。成功格子的测试账号用完即删；失败格子保留七天供诊断，
+避免 teardown 把同一轮 trace / trajectory / jobs 一并级联删除。
 
 ## 用法
 
@@ -9,9 +10,18 @@
 python3 tools/e2e/p0.py --list                 # 看格子和 key 就位情况
 python3 tools/e2e/p0.py                        # 全量（无 key 的格子自动 SKIP）
 python3 tools/e2e/p0.py --only vps-claude-code # 只跑指定格子
+python3 tools/e2e/p0.py --cleanup-expired-failures # P0 值班人清理满七天的失败现场
+python3 tools/e2e/p0.py --cleanup-orphans      # 立即清理所有遗留账号
 ```
 
 退出码：0 = 无硬失败（skip/warn 允许），1 = 有 FAIL（发版阻断）。
+
+失败现场固定写入 `~/.feedling-e2e-failures/<user_id>/`（目录 0700、文件
+0600），同时保留 `~/.feedling-e2e-orphans/<user_id>.json` 中的删号凭据。
+输出会打印 `user_id`、现场路径和清理命令。bundle 保存用户 trace、admin
+诊断快照及 job/trace 定位符；最终 provider 输入继续只存在服务器端加密
+trajectory 中，不额外复制一份明文。七天清理由当班 P0 operator 执行；有本地
+admin token 时，清理器必须从 admin 用户接口复核 404 后才删除本地现场。
 
 ## key 池
 
@@ -48,6 +58,8 @@ E2E_KEY_DEEPSEEK=sk-…
 | `temporal_probe.py` | 模型真的读到了注入的时间锚点 | 动 V2 上下文组装时 |
 | `turn_failure_smoke.py` | 回合失败的字段/归责能下发到客户端 | 动错误分类或 consumer 兜底时 |
 | `resident_maintenance_smoke.py` | resident 识别/poll/notice/genesis claim | 动 consumer 这几条时 |
+| `provider_response_envelope_probe.py` | 上游完整响应包装器不会进入 V2 气泡，且只触发一次有界纠正 | 动 provider 回复解析、V2 tool loop 或最终回复闸时 |
+| `wake_tool_markup_probe.py` | V2 manual wake 的工具标记在封装前剥离，用户私钥解密后只见正文 | 动 V2 wake 最终回复闸时 |
 
 `repeat_wake_probe` 的两个坑（写新探针时同样适用）：
 - `/v1/proactive/scheduled/fire` **只触发已到期的**（`due_at <= now`），
@@ -88,6 +100,27 @@ materials 抖动。共同点:只在「真 provider + 多帧观察」下暴露。
 **合并前也能跑**:client 放行 `127.0.0.1`,配合本机 `serve_dev` + dev-seed
 enclave 可以在分支上先真跑一遍(见 docs/testing/TESTING.md 的本地全栈配方),
 再合 test。
+
+完整 provider 响应包专项探针还需要同一数据库上的 V2 worker；三项服务启动后运行：
+
+```bash
+python3 tools/e2e/provider_response_envelope_probe.py
+```
+
+它在本机临时启动 OpenAI-compatible provider stub：setup 测活返回正常文本，
+首个真实聊天回合返回现场截图的 Gemini relay 包，第二回合只返回恢复标记。真实
+HTTP、队列、worker、信封加解密与账号清理均不替换。
+
+V2 wake 工具标记专项探针使用同一套本地服务：
+
+```bash
+python3 tools/e2e/wake_tool_markup_probe.py
+```
+
+它用空历史强制触发 `manual_wake`（避免撞 active-conversation 延迟）；本地
+provider stub 只在 wake 回复里混入现场同形的 `<parameter>` 标记，最终断言
+钉在用户私钥解密后的正文。真实 HTTP、调度入队、worker、信封加解密与账号
+清理均不替换。
 
 **中转站要测两家**:不同中转站 `/models` 的目录格式差异很大(带日期后缀 /
 带方括号标签 / 裸名),推荐链路只测一家不够 —— `relay-openai-compatible`

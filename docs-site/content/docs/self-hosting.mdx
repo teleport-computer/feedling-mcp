@@ -76,6 +76,14 @@ A functional deployment can include:
 | WebSocket ingest | Screen/broadcast ingestion | The ASGI background service binds the configured ingest port, normally 9998. |
 | APNs credentials | Apple push and Live Activity | Optional; Chat storage works without push delivery. |
 | Object storage configuration | Large frames, chat files, and onboarding archives where enabled | Inventory and back up this data separately from PostgreSQL. |
+| CPU history recorder | Optional private operational history | Provide a protected, path-allowlisted Docker socket proxy and a dedicated persistent volume; expose neither service publicly. |
+
+The managed Phala CPU-history topology is optional operational infrastructure,
+not an application API. A self-hosted operator who adopts it must provide and
+secure their own Docker socket proxy and persistent volume, keep the recorder
+off public networks, and define retention appropriate to that deployment.
+Copying this topology does not create tenant isolation or make a generic host a
+confidential-computing boundary.
 
 The resident consumer requires an `openssl` binary on `PATH` if any
 user-configured [MCP server](/docs/workflows/mcp) is registered over HTTPS with a
@@ -138,9 +146,11 @@ these settings:
 | `FEEDLING_RUNTIME_TOKEN_SECRET` | Required by the current hosted topology. Generate a high-entropy secret, supply it to the backend and Runtime V2 workers through a secret manager, and never bake it into an image. |
 | `FEEDLING_RUNTIME_TOKEN_SECRET_PREVIOUS` | Optional one-generation rotation bridge for durable Perception anchor fingerprints. Set it to the immediately previous runtime-token secret while rolling out a new `FEEDLING_RUNTIME_TOKEN_SECRET`; keep it until all workers use the new secret. It does not authorize runtime tokens. |
 | `FEEDLING_PERCEPTION_REBASELINE_UNKNOWN_KEYS` | Emergency/post-rotation convergence switch, default `0`. After every old backend worker is confirmed stopped, set it to `1` so the next fresh observation of any dormant old-key anchor replaces that row with a non-waking baseline under the current key. Never enable it during a mixed-version rollout. Monitor old key-ID row counts, then disable it after they reach zero. |
-| `FEEDLING_V2_SELF_THINKING` | Kill switch for the self-authored thinking chain (io's own first-person `<think>` summary displayed in place of raw provider chain-of-thought). On by default; set to `0`/`false`/`no`/`off` to revert to showing the model's native reasoning verbatim. Applies to both Runtime V2 and resident V1, and does not change what the model reasons — only what the thinking display shows. Turning it off no longer disables the leak gate below: a model that emits `<think>` on its own is still stripped before delivery. |
+| `FEEDLING_V2_SELF_THINKING` | Kill switch for the self-authored thinking chain (io's own first-person `<think>` summary displayed in place of raw provider chain-of-thought). On by default; Runtime V2 shows no thinking attachment when the model omits that summary and never falls back to native reasoning. Set to `0`/`false`/`no`/`off` to restore the legacy native-reasoning display. Applies to both Runtime V2 and resident V1, and does not change what the model reasons — only what the thinking display shows. Turning it off does not disable the leak gate below: a model that emits `<think>` on its own is still stripped before delivery. |
 | `FEEDLING_THINK_GATE` | Kill switch for the thinking-leak gate, on by default. The gate strips every `<think>`/`<reasoning>`/`<thought>` block from user-visible text at all four delivery points (Runtime V2 chat and wake, resident V1 chat, proactive messages) and from assistant history before it is replayed to the model, and fails closed when a block cannot be cleanly resolved. Set it to `0`/`false`/`no`/`off` only to stop the bleeding if the gate misbehaves; that restores the previous parsing, delivery and history behaviour, but does not revert the model-facing instruction, which is governed by `FEEDLING_V2_SELF_THINKING`. |
-| `FEEDLING_V2_MAX_WORKERS` | Bounds concurrent Runtime V2 turn slots per worker container. Size it together with PostgreSQL pool capacity and provider limits. |
+| `FEEDLING_V2_FOREGROUND_SLOTS` / `FEEDLING_V2_WAKE_SLOTS` / `FEEDLING_V2_HEAVY_SLOTS` | Fixed Runtime V2 pool capacities. The supported 8c/16g starting topology is `4/2/2`: four Chat/manual-wake slots, two ambient-wake slots, and two Heavy maintenance slots. Runtime V2 no longer supports the former shared multi-slot child topology. |
+| `FEEDLING_V2_PROFILE_INSTANCE_CONCURRENCY` | Instance-level Profile concurrency. Keep it at `1`; Profile card reads are batched while the other Heavy slot remains available. |
+| `FEEDLING_V2_ENCLAVE_INSTANCE_CONCURRENCY` | Parent-broker Enclave permit total across all slot processes. The `4/2/2` topology uses `4`; do not multiply this value per child. |
 | `FEEDLING_V2_CHAT_TAIL_MAX_TURNS` | Optional maximum complete-turn replay target for foreground Chat (default 40). The model-aware prompt frontier may choose a smaller newest suffix. |
 | `FEEDLING_V2_WAKE_TAIL_MAX_TURNS` | Optional maximum complete-turn replay target for proactive wake lanes (default 16). Larger values increase user-BYOK prompt cost. |
 | `FEEDLING_V2_RECENT_TURN_ROW_CAP` | Defensive encrypted-row read cap used while locating complete recent turns (default 512). If the cap cuts the oldest selected turn, Runtime V2 drops that partial turn and records a tail fallback instead of rendering an incomplete group. |
@@ -191,6 +201,15 @@ history to a model provider. MEMORY/USER is the long-term semantic layer, while
 encrypted Chat rows remain the durable source ledger. Existing model-authored
 summary segments remain readable until a metadata-only checkpoint replaces
 them in the canonical frontier.
+
+Runtime V2's parent PostgreSQL pool is capped at 8 connections and every
+single-slot child at 2, for an approximate 24-connection budget with eight
+children. Monitor per-pool healthy/busy/restarting slots, queue age and claim
+latency, Enclave wait, database pool wait/timeouts, Profile stage progress, and
+watchdog recovery before increasing any slot count. Recover a bad deployment by
+redeploying the previously verified image or commit; there is no legacy mode
+switch. Leave additive schema migrations installed and verify fresh Foreground
+capacity and exact-claim recovery after recovery.
 
 ## Apple push without the official key (notify relay)
 
@@ -350,7 +369,8 @@ operator will respond to a leaked client credential.
   a secret manager.
 - Do not expose admin/debug routes or internal ports through the public proxy.
 - Monitor authentication failures, `5xx`, database pool exhaustion, stale
-  Runtime V2 worker heartbeats, enclave failures, queue age, disk use, and backup age.
+  Runtime V2 per-pool heartbeats, slot restarts, Enclave waits, queue age, disk
+  use, and backup age.
 - Keep unrelated tenant code and secrets out of a shared process runner.
 - Commission an isolation and abuse review before offering the deployment to
   untrusted public users.

@@ -152,11 +152,67 @@ def runtime_summaries_for_store(store) -> dict[str, dict]:
         recent = status["recent"]
         if not recent:
             continue
+        # NOT_OBSERVED rows are excluded from BOTH numerator and denominator.
+        # They mean "this turn produced no evidence either way" (V1: the server
+        # was still connecting at init and the model never needed it), which is
+        # the ordinary case for a server the user simply did not use. Counting
+        # them in the denominator would make a perfectly healthy server read as
+        # mostly-failing in the app. No-op for V2, which never emits this kind.
+        observed = [row for row in recent if row["kind"] != NOT_OBSERVED]
+        if not observed:
+            continue
         summaries[name] = {
-            "last_kind": status["last_kind"],
-            "last_at": status["last_at"],
+            "last_kind": observed[-1]["kind"],
+            "last_at": observed[-1]["at"],
             "recent_ok": sum(
-                1 for row in recent if row["kind"] == "available"),
-            "recent_total": len(recent),
+                1 for row in observed if row["kind"] == "available"),
+            "recent_total": len(observed),
         }
     return summaries
+
+
+# --- V1 (resident_cli / self-hosted) ----------------------------------------
+# V2 calls record_runtime_results directly from its own tool loop. V1's
+# equivalent evidence arrives as the consumer's `mcp.surface.registered` debug
+# trace, so it is projected here and injected from asgi_app (diagnostics must
+# not import hosted — CONTRIBUTING §2 "需要向上调用时用注入").
+#
+# Before this, record_runtime_results had exactly ONE caller (v2/serve_worker),
+# so every resident_cli user's `runtime` field in GET /v1/mcp/servers was
+# permanently absent — 323 of 340 activated prod users on 2026-08-13.
+NOT_OBSERVED = "not_observed"
+
+_VERDICT_TO_KIND = {
+    "ok": "available",
+    # Startup-pending but a real call succeeded: available is the honest answer;
+    # the user's question is "can my server be used", not "was it fast".
+    "recovered": "available",
+    "failed": "unavailable",
+    # Deliberately its own kind, not "unavailable": "the model did not call it"
+    # is not "the model could not call it" — the same distinction the consumer's
+    # verdict ladder exists to preserve. Folding it into unavailable would show
+    # a red dot for every server the user simply did not use this turn.
+    "inconclusive": NOT_OBSERVED,
+}
+
+
+def record_from_registered_trace(store, detail) -> bool:
+    """Project one V1 ``mcp.surface.registered`` detail into runtime status.
+
+    Returns False (and writes nothing) when the payload carries no usable
+    verdict map — an unparseable trace is not an observation, and inventing one
+    is how an absent signal becomes a fake green.
+    """
+    if not isinstance(detail, dict):
+        return False
+    verdicts = detail.get("verdict")
+    if not isinstance(verdicts, dict) or not verdicts:
+        return False
+    results = []
+    for raw_name, raw_verdict in verdicts.items():
+        kind = _VERDICT_TO_KIND.get(str(raw_verdict or "").strip().lower())
+        if kind:
+            results.append({"name": str(raw_name), "kind": kind})
+    if not results:
+        return False
+    return record_runtime_results(store, results)
