@@ -1033,11 +1033,11 @@ def test_run_turn_maintenance_resolve_failure_is_silent_no_user_error(monkeypatc
 
 
 def test_run_turn_heartbeat_resolve_failure_is_silent_no_user_error(monkeypatch):
-    """D3 Task 6: the same silence extends to wake lanes (heartbeat/scheduled/
-    manual_wake) — a heartbeat job whose provider can't be resolved must fail
-    SILENTLY, mirroring test_run_turn_maintenance_resolve_failure_is_silent_no_user_error
-    above. The _run_turn gate change (`lane == "chat"`, was `lane != "maintenance"`)
-    means only the chat lane still surfaces a user-visible error chip."""
+    """Weak wake lanes remain silent when provider resolution fails.
+
+    Scheduled is intentionally excluded: a due reminder has a delivery
+    obligation and gets its own visible failure result.
+    """
     uid = "u_w_heartbeat_resolve_fail"
     conftest.seed_user(uid)
     _reset(uid)
@@ -1060,6 +1060,39 @@ def test_run_turn_heartbeat_resolve_failure_is_silent_no_user_error(monkeypatch)
     # SILENT: no "error"-kind status event, no record_terminal_error callback.
     assert [e for e in _status_events(uid) if e["kind"] == "error"] == []
     assert recorded == []
+
+
+def test_run_turn_scheduled_resolve_failure_queues_visible_result(monkeypatch):
+    uid = "u_w_scheduled_resolve_fail"
+    conftest.seed_user(uid)
+    _reset(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, "scheduled")
+    job = jobs_store.claim_next_job("w")
+    surfaced = []
+    monkeypatch.setattr(
+        worker,
+        "_surface_terminal_error",
+        lambda deps, user_id, failed_job_id, code: surfaced.append(
+            (user_id, failed_job_id, code)
+        ),
+    )
+
+    deps = worker.TurnDeps(
+        read_messages=lambda *_args: [],
+        resolve_provider=lambda _uid: (None, {"error": "key_decrypt_failed"}),
+        mint_enclave_token=lambda *_args: "must-not-run",
+    )
+    status = asyncio.run(worker._run_turn(job, deps))
+
+    assert status == "failed"
+    assert surfaced == [(uid, job_id, "provider_unavailable")]
+    with db.get_pool().connection() as conn:
+        marker = conn.execute(
+            "SELECT error_code,reply_frontier_seq,reply_parent_message_id "
+            "FROM v2_terminal_failure_outbox WHERE job_id=%s",
+            (job_id,),
+        ).fetchone()
+    assert marker == ("provider_unavailable", None, None)
 
 
 # ------------------------------------------------------------------

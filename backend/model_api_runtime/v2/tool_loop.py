@@ -526,6 +526,11 @@ async def run_tool_loop(
     # response that means "nothing to say" (`required = require_reply and not
     # tool_calls`), and the wake fails silently.
     require_reply: bool = True,
+    # One lane-specific correction may be appended after a semantically empty
+    # provider success. Callers that carry a stronger delivery contract (for
+    # example, a due scheduled reminder) can restate that contract here without
+    # inventing a synthetic user turn.
+    empty_response_correction: str = _EMPTY_RESPONSE_CORRECTION,
     allow_image_output: bool = False,
     on_file_reply=None,
     on_image_reply=None,
@@ -623,6 +628,9 @@ async def run_tool_loop(
         max_assistant_tool_text_chars,
         name="max_assistant_tool_text_chars",
     )
+    normalized_empty_response_correction = str(
+        empty_response_correction or _EMPTY_RESPONSE_CORRECTION
+    ).strip()
     if tool_result_char_cap < MIN_TOOL_RESULT_ERROR_QUOTA:
         raise ValueError("tool_result_char_cap is too small for stable error results")
     if (
@@ -1390,7 +1398,9 @@ async def run_tool_loop(
             )
             if can_correct:
                 empty_response_recovery_used = True
-                empty_response_retry_instruction = _EMPTY_RESPONSE_CORRECTION
+                empty_response_retry_instruction = (
+                    normalized_empty_response_correction
+                )
                 reasoning_fragments.clear()
                 seen_reasoning_fragments.clear()
                 _progress("empty_response_retry_boundary")

@@ -137,6 +137,7 @@ PENDING_CHAT_TTL_SEC = _positive_float_env("FEEDLING_V2_CHAT_PENDING_TTL_SEC", "
 RUNNING_TTL_SEC = _positive_float_env("FEEDLING_V2_LEASE_TTL_SEC", "300")
 
 _ACTIVE_STATUSES = ("pending", "claimed", "running")
+SCHEDULED_WAKE_STREAM = "proactive_scheduled_wakes_v2"
 _TERMINAL_FAILURE_FALLBACK_REPLY = (
     os.environ.get(
         "FALLBACK_REPLY",
@@ -190,22 +191,30 @@ def _queue_terminal_failure_on_cursor(
     *,
     error_class: object = "",
 ) -> bool:
-    """Capture one chat failure's route and input frontier in its transaction."""
+    """Capture one user-visible turn failure in its terminal transaction.
+
+    Foreground chat keeps its parent/frontier so the existing reply sink can
+    close that exact turn. A scheduled wake has no user-authored parent; its
+    marker deliberately leaves those columns null and the reply sink emits a
+    standalone, explicitly labelled reminder-failure message instead.
+    """
     cur.execute(
         "INSERT INTO v2_terminal_failure_outbox "
         "(job_id,user_id,error_code,error_class,"
         " target_route_id,target_route_updated_at,"
         " reply_frontier_seq,reply_parent_message_id) "
         "SELECT j.id,j.user_id,%s,%s,r.id,r.updated_at,"
-        " input.seq,input.msg_id FROM agent_jobs j "
+        " CASE WHEN j.lane='chat' THEN input.seq END,"
+        " CASE WHEN j.lane='chat' THEN input.msg_id END FROM agent_jobs j "
         "LEFT JOIN LATERAL (SELECT id,updated_at FROM model_api_routes "
         "  WHERE user_id=j.user_id AND is_active LIMIT 1) r ON TRUE "
         "LEFT JOIN LATERAL (SELECT seq,msg_id FROM chat_messages "
         "  WHERE user_id=j.user_id AND doc->>'role' IN ('user','human') "
         "  AND COALESCE(doc->>'source','') "
         "    NOT IN ('verify_ping','resident_maintenance') "
-        "  ORDER BY seq DESC LIMIT 1) input ON TRUE "
-        "WHERE j.id=%s AND j.user_id=%s AND j.lane='chat' "
+        "  ORDER BY seq DESC LIMIT 1) input ON j.lane='chat' "
+        "WHERE j.id=%s AND j.user_id=%s "
+        "AND j.lane IN ('chat','scheduled') "
         "ON CONFLICT (job_id) DO NOTHING",
         (
             _terminal_error_code(error),
@@ -1382,12 +1391,13 @@ def mark_failed(
     wake_backoff_cap_sec: float | None = None,
     wake_backoff_now: float | None = None,
 ) -> bool:
-    """Fail an owned job and transactionally queue chat failure visibility.
+    """Fail an owned job and transactionally queue required visibility.
 
     Terminalization, the user-visible outbox obligation, and any trajectory
     review handoff share one explicit transaction, so there is no process-crash
-    window between them. Background lanes remain silent and do not get an
-    outbox row.
+    window between them. Scheduled reminders join chat because firing a timer
+    carries a delivery obligation; the other background lanes may still choose
+    silence and therefore do not get an outbox row.
     """
     recovered_reviews: list[tuple[str, str]] = []
     with _pool().connection() as conn:
@@ -1403,7 +1413,7 @@ def mark_failed(
             row = cur.fetchone()
             if row is None:
                 return False
-            if str(row[2]) == "chat":
+            if str(row[2]) in {"chat", "scheduled"}:
                 _queue_terminal_failure_on_cursor(
                     cur,
                     row[0],
@@ -1452,7 +1462,7 @@ def mark_expired(job_id, error: str = "runtime_expired") -> None:
             )
             row = cur.fetchone()
             if row is not None:
-                if str(row[2]) == "chat":
+                if str(row[2]) in {"chat", "scheduled"}:
                     _queue_terminal_failure_on_cursor(
                         cur, row[0], str(row[1]), error
                     )
@@ -1508,7 +1518,7 @@ def reap_stuck_job_rows(now=None) -> list[dict]:
                 )
                 rows = [dict(row) for row in cur.fetchall()]
                 for row in rows:
-                    if str(row["lane"]) == "chat":
+                    if str(row["lane"]) in {"chat", "scheduled"}:
                         _queue_terminal_failure_on_cursor(
                             cur,
                             row["id"],
@@ -2745,21 +2755,23 @@ def _pending_terminal_failure_rows(
     else:
         raise ValueError(f"unknown terminal failure sink: {sink!r}")
     bounded = max(1, min(int(limit), 1000))
-    where_job = " AND job_id=%s" if job_id is not None else ""
+    where_job = " AND o.job_id=%s" if job_id is not None else ""
     ts = float(now) if now is not None else None
     args: tuple = (ts, job_id, bounded) if job_id is not None else (ts, bounded)
     with _pool().connection() as conn:
         with conn.cursor(row_factory=dict_row) as cur:
             cur.execute(
-                "SELECT job_id,user_id,error_code,target_route_id,"
-                "target_route_updated_at,status_delivered_at,"
-                "runtime_error_delivered_at,error_class,reply_frontier_seq,"
-                "reply_parent_message_id,reply_delivered_at "
-                "FROM v2_terminal_failure_outbox "
-                f"WHERE {delivered_column} IS NULL "
-                f"AND {next_column} <= COALESCE(to_timestamp(%s),now())"
-                f"{where_job} ORDER BY {last_column} NULLS FIRST,"
-                f"{next_column},created_at,job_id LIMIT %s",
+                "SELECT o.job_id,o.user_id,o.error_code,o.target_route_id,"
+                "o.target_route_updated_at,o.status_delivered_at,"
+                "o.runtime_error_delivered_at,o.error_class,"
+                "o.reply_frontier_seq,o.reply_parent_message_id,"
+                "o.reply_delivered_at,j.lane "
+                "FROM v2_terminal_failure_outbox o "
+                "JOIN agent_jobs j ON j.id=o.job_id "
+                f"WHERE o.{delivered_column} IS NULL "
+                f"AND o.{next_column} <= COALESCE(to_timestamp(%s),now())"
+                f"{where_job} ORDER BY o.{last_column} NULLS FIRST,"
+                f"o.{next_column},o.created_at,o.job_id LIMIT %s",
                 args,
             )
             return [dict(row) for row in cur.fetchall()]
@@ -2817,8 +2829,10 @@ def _deliver_terminal_failure_status(
         with conn.transaction():
             with conn.cursor(row_factory=dict_row) as cur:
                 cur.execute(
-                    "SELECT user_id,status_delivered_at "
-                    "FROM v2_terminal_failure_outbox WHERE job_id=%s FOR UPDATE",
+                    "SELECT o.user_id,o.status_delivered_at,j.lane "
+                    "FROM v2_terminal_failure_outbox o "
+                    "JOIN agent_jobs j ON j.id=o.job_id "
+                    "WHERE o.job_id=%s FOR UPDATE OF o",
                     (job_id,),
                 )
                 row = cur.fetchone()
@@ -2829,22 +2843,24 @@ def _deliver_terminal_failure_status(
                 # job B has atomically published a real final reply. Key this
                 # to the applied final effect—not merely status=completed,
                 # which also covers empty handoffs/maintenance outcomes.
-                cur.execute(
-                    "SELECT 1 FROM v2_effect_outbox e "
-                    "WHERE e.user_id=%s AND e.job_id>%s AND e.status='applied' "
-                    "AND (e.effect_type='reply_final_fenced_v1' "
-                    " OR (e.effect_type='reply' "
-                    "     AND e.payload ? 'reply_through_seq')) LIMIT 1",
-                    (user_id, job_id),
-                )
-                if cur.fetchone() is not None:
+                if str(row["lane"] or "") == "chat":
                     cur.execute(
-                        "UPDATE v2_terminal_failure_outbox "
-                        "SET status_delivered_at=now(),updated_at=now() "
-                        "WHERE job_id=%s",
-                        (job_id,),
+                        "SELECT 1 FROM v2_effect_outbox e "
+                        "WHERE e.user_id=%s AND e.job_id>%s "
+                        "AND e.status='applied' "
+                        "AND (e.effect_type='reply_final_fenced_v1' "
+                        " OR (e.effect_type='reply' "
+                        "     AND e.payload ? 'reply_through_seq')) LIMIT 1",
+                        (user_id, job_id),
                     )
-                    return True
+                    if cur.fetchone() is not None:
+                        cur.execute(
+                            "UPDATE v2_terminal_failure_outbox "
+                            "SET status_delivered_at=now(),updated_at=now() "
+                            "WHERE job_id=%s",
+                            (job_id,),
+                        )
+                        return True
                 cur.execute(
                     "INSERT INTO agent_status_events "
                     "(job_id,user_id,kind,label,detail_json,seq) "
@@ -2890,21 +2906,86 @@ def _ack_terminal_failure_reply(job_id) -> bool:
         return cur.rowcount == 1
 
 
+def _scheduled_failure_notes(user_id: str, job_id) -> list[str]:
+    """Read the canonical reminder notes for one fired scheduled job."""
+    with _pool().connection() as conn:
+        rows = conn.execute(
+            "SELECT doc->>'note' FROM user_logs "
+            "WHERE user_id=%s AND stream=%s AND doc->>'status'='fired' "
+            "AND doc->>'fired_job_id'=%s ORDER BY seq LIMIT 10",
+            (str(user_id), SCHEDULED_WAKE_STREAM, str(int(job_id))),
+        ).fetchall()
+    return [
+        str(row[0]).strip()[:1000]
+        for row in rows
+        if str(row[0] or "").strip()
+    ]
+
+
+def _scheduled_failure_reply_text(
+    error_class: str,
+    *,
+    language: str,
+    user_text: str,
+    notes: list[str],
+) -> str:
+    """Explain a missed timer without impersonating a model-authored reply."""
+    if str(language or "").strip().lower().startswith("en"):
+        reminder = (
+            " (" + "; ".join(notes) + ")"
+            if notes
+            else ""
+        )
+        if error_class == "provider_empty_reply":
+            return (
+                "A scheduled reminder" + reminder
+                + " was due, but your model service returned "
+                "an empty reply, so it could not be delivered. Please set it "
+                "again; if this keeps happening, check the model provider or relay."
+            )
+        return (
+            "A scheduled reminder" + reminder
+            + " was due, but its reply could not be delivered. "
+            "Please set it again."
+        )
+    reminder = (
+        "（" + "；".join(f"“{note}”" for note in notes) + "）"
+        if notes
+        else ""
+    )
+    return (
+        "刚才的定时任务" + reminder + "已触发，但 TA 的回复没有成功送达。"
+        + str(user_text or "连接模型服务时出了问题。").strip()
+    )
+
+
 def _deliver_terminal_failure_reply(row: dict) -> bool:
-    """Write one encrypted, parent-linked failure bubble exactly once."""
+    """Write one encrypted failure result exactly once.
+
+    Chat failures remain parent-linked and cursor-fenced. Scheduled reminders
+    have no current user turn, so they are standalone, explicitly marked
+    system failures and never advance or re-parent the chat cursor.
+    """
     from core import envelope as core_envelope
     from core import store as core_store
 
     job_id = row["job_id"]
     user_id = str(row["user_id"])
+    # Rows from the durable reader always carry lane. Default to the historical
+    # chat behavior for compatibility/test callers that pass the pre-scheduled
+    # row shape directly.
+    lane = str(row.get("lane") or "chat")
     frontier = int(row.get("reply_frontier_seq") or 0)
     parent_id = str(row.get("reply_parent_message_id") or "").strip()
-    if frontier <= 0 or not parent_id:
+    if lane != "scheduled" and (frontier <= 0 or not parent_id):
         return _ack_terminal_failure_reply(job_id)
 
-    message_id = hashlib.sha256(
-        f"v2-terminal-failure:{job_id}".encode("utf-8")
-    ).hexdigest()[:32]
+    message_identity = (
+        f"v2-scheduled-terminal-failure:{job_id}"
+        if lane == "scheduled"
+        else f"v2-terminal-failure:{job_id}"
+    )
+    message_id = hashlib.sha256(message_identity.encode("utf-8")).hexdigest()[:32]
     existing = db.chat_get_strict(user_id, message_id)
     if existing is not None:
         if str(existing.get("terminal_failure_job_id") or "") != str(job_id):
@@ -2914,7 +2995,7 @@ def _deliver_terminal_failure_reply(row: dict) -> bool:
     # Same-turn supersede gate: 这个 parent 已经被一条真回复(reply_message_id 有值
     # 且没有失败章)回答过了,再投这条迟到的失败气泡只会自相矛盾——按「最终结果
     # 说了算」直接 ack 不投递。严格按本 parent 判定,别的 turn 的真实失败照常投。
-    if db.v2_turn_failure_supersede_enabled():
+    if lane == "chat" and db.v2_turn_failure_supersede_enabled():
         parent = db.chat_get_strict(user_id, parent_id)
         if (
             parent is not None
@@ -2958,10 +3039,18 @@ def _deliver_terminal_failure_reply(row: dict) -> bool:
         error_class,
         language=language,
     )
-    reply_text = (
-        user_text
-        if blame == "user_provider"
-        else _TERMINAL_FAILURE_FALLBACK_REPLY
+    scheduled_notes = (
+        _scheduled_failure_notes(user_id, job_id)
+        if lane == "scheduled"
+        else []
+    )
+    reply_text = _scheduled_failure_reply_text(
+        error_class,
+        language=language,
+        user_text=user_text,
+        notes=scheduled_notes,
+    ) if lane == "scheduled" else (
+        user_text if blame == "user_provider" else _TERMINAL_FAILURE_FALLBACK_REPLY
     )
     store = core_store.get_store(user_id)
     envelope, error = core_envelope._build_shared_envelope_for_store(
@@ -2971,19 +3060,49 @@ def _deliver_terminal_failure_reply(row: dict) -> bool:
     )
     if envelope is None:
         raise RuntimeError(error or "terminal failure envelope build failed")
+    extra = {
+        "turn_failure_error_class": error_class,
+        "turn_failure_blame": blame,
+        "turn_failure_user_text": user_text,
+        "terminal_failure_job_id": str(job_id),
+        **failure_identity,
+    }
+    if lane == "scheduled":
+        extra.update({
+            "wake_kind": "scheduled",
+            "notice_kind": "scheduled_wake_failure",
+        })
+    else:
+        extra["reply_to_message_id"] = parent_id
     message = store._build_chat_message(
         "openclaw",
         "model_api",
         envelope,
-        extra={
-            "turn_failure_error_class": error_class,
-            "turn_failure_blame": blame,
-            "turn_failure_user_text": user_text,
-            "terminal_failure_job_id": str(job_id),
-            "reply_to_message_id": parent_id,
-            **failure_identity,
-        },
+        extra=extra,
     )
+    if lane == "scheduled":
+        db.chat_append_strict(
+            user_id,
+            message_id,
+            float(message["ts"]),
+            message,
+            core_store.MAX_CHAT_MESSAGES,
+        )
+        persisted = db.chat_get_strict(user_id, message_id)
+        if (
+            persisted is None
+            or str(persisted.get("terminal_failure_job_id") or "")
+            != str(job_id)
+        ):
+            raise RuntimeError("scheduled failure reply delivery was not adopted")
+        store.reload()
+        store.notify_chat_waiters()
+        try:
+            wake_bus.notify("chat", user_id)
+        except Exception:  # noqa: BLE001 - poll timeout remains the fallback
+            pass
+        return _ack_terminal_failure_reply(job_id)
+
     seq, inserted = db.chat_append_effect_with_cursor(
         user_id,
         message_id,
@@ -3024,14 +3143,25 @@ def _deliver_terminal_failure_runtime_error(job_id) -> bool:
         with conn.transaction():
             with conn.cursor(row_factory=dict_row) as cur:
                 cur.execute(
-                    "SELECT user_id,error_code,error_class,target_route_id,"
-                    "target_route_updated_at,runtime_error_delivered_at "
-                    "FROM v2_terminal_failure_outbox WHERE job_id=%s FOR UPDATE",
+                    "SELECT o.user_id,o.error_code,o.error_class,"
+                    "o.target_route_id,o.target_route_updated_at,"
+                    "o.runtime_error_delivered_at,j.lane "
+                    "FROM v2_terminal_failure_outbox o "
+                    "JOIN agent_jobs j ON j.id=o.job_id "
+                    "WHERE o.job_id=%s FOR UPDATE OF o",
                     (job_id,),
                 )
                 row = cur.fetchone()
                 if row is None or row["runtime_error_delivered_at"] is not None:
                     return False
+                if str(row.get("lane") or "") == "scheduled":
+                    cur.execute(
+                        "UPDATE v2_terminal_failure_outbox "
+                        "SET runtime_error_delivered_at=now(),updated_at=now() "
+                        "WHERE job_id=%s",
+                        (job_id,),
+                    )
+                    return True
                 route_id = row.get("target_route_id")
                 if route_id is not None:
                     learns_vision_unsupported = (
@@ -3129,7 +3259,10 @@ def reconcile_terminal_failure_outbox(
     for row in runtime_rows:
         current_job_id = row["job_id"]
         try:
-            if record_terminal_error is not None:
+            if str(row.get("lane") or "") == "scheduled":
+                if _ack_terminal_runtime_error(current_job_id):
+                    runtime_error_count += 1
+            elif record_terminal_error is not None:
                 delivered = record_terminal_error(
                     str(row["user_id"]), str(row["error_code"])
                 )
@@ -10954,9 +11087,6 @@ def due_compaction_users(
                 (threshold, threshold, int(limit)),
             )
             return [(row[0], int(row[1])) for row in cur.fetchall()]
-
-
-SCHEDULED_WAKE_STREAM = "proactive_scheduled_wakes_v2"
 
 
 def due_scheduled_users(*, now: float | None = None, limit: int = 500) -> list[str]:

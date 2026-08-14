@@ -592,6 +592,100 @@ def test_terminal_failure_reply_is_encrypted_linked_classified_and_idempotent(
     assert v2_cursor.load_seq(core_store.get_store(uid)) == parent_seq
 
 
+def test_scheduled_failure_reply_is_standalone_visible_and_idempotent(monkeypatch):
+    uid = "u_js_scheduled_terminal_reply"
+    seed_user(uid)
+    _reset(uid)
+    _seed_active_route(uid)
+    _append_user_message(uid)
+    cursor_before = v2_cursor.load_seq(core_store.get_store(uid))
+    encrypted_plaintexts: list[str] = []
+
+    def capture_failure_envelope(store, plaintext, *, item_id=None):
+        encrypted_plaintexts.append(plaintext.decode("utf-8"))
+        return _fake_failure_envelope(store, plaintext, item_id=item_id)
+
+    monkeypatch.setattr(
+        core_envelope,
+        "_build_shared_envelope_for_store",
+        capture_failure_envelope,
+    )
+    job_id, _ = jobs_store.enqueue_job(uid, "scheduled")
+    db.log_append(
+        uid,
+        jobs_store.SCHEDULED_WAKE_STREAM,
+        {
+            "status": "fired",
+            "fired_job_id": job_id,
+            "note": "提醒我喝水",
+        },
+        item_key="timer-water",
+    )
+    jobs_store.claim_next_job("w")
+    assert jobs_store.mark_failed(
+        job_id,
+        "wake_failed:empty_reply",
+        claimed_by="w",
+        error_class="provider_empty_reply",
+    )
+
+    with db.get_pool().connection() as conn:
+        marker = conn.execute(
+            "SELECT reply_frontier_seq,reply_parent_message_id "
+            "FROM v2_terminal_failure_outbox WHERE job_id=%s",
+            (job_id,),
+        ).fetchone()
+    assert marker == (None, None)
+
+    recorded = []
+    first = jobs_store.reconcile_terminal_failure_outbox(
+        record_terminal_error=lambda *args: recorded.append(args),
+        job_id=job_id,
+    )
+    second = jobs_store.reconcile_terminal_failure_outbox(
+        record_terminal_error=lambda *args: recorded.append(args),
+        job_id=job_id,
+    )
+
+    assert first == {
+        "examined": 1,
+        "status_delivered": 1,
+        "runtime_error_delivered": 1,
+        "reply_delivered": 1,
+    }
+    assert second == {
+        "examined": 0,
+        "status_delivered": 0,
+        "runtime_error_delivered": 0,
+        "reply_delivered": 0,
+    }
+    assert recorded == [], "scheduled failure must not poison the active chat route"
+    failures = [
+        row for row in db.chat_load_strict(uid)
+        if str(row.get("terminal_failure_job_id") or "") == str(job_id)
+    ]
+    assert len(failures) == 1
+    failure = failures[0]
+    assert failure.get("reply_to_message_id") in {None, ""}
+    assert failure["wake_kind"] == "scheduled"
+    assert failure["notice_kind"] == "scheduled_wake_failure"
+    assert failure["turn_failure_error_class"] == "provider_empty_reply"
+    assert "定时任务" in encrypted_plaintexts[0]
+    assert "已触发" in encrypted_plaintexts[0]
+    assert "提醒我喝水" in encrypted_plaintexts[0]
+    assert "空回复" in encrypted_plaintexts[0]
+    parent = db.chat_get_strict(uid, "parent-user")
+    assert not str(parent.get("reply_message_id") or "")
+    assert v2_cursor.load_seq(core_store.get_store(uid)) == cursor_before
+    with db.get_pool().connection() as conn:
+        route_error = conn.execute(
+            "SELECT last_runtime_error FROM model_api_routes "
+            "WHERE user_id=%s AND is_active",
+            (uid,),
+        ).fetchone()[0]
+    assert route_error == ""
+
+
 def test_terminal_image_generation_configuration_failure_never_uses_slow_fallback(
     monkeypatch,
 ):

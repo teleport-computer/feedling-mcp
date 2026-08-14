@@ -10,6 +10,15 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **Hosted Runtime V2 scheduled reminders no longer disappear after a model or
+  provider failure.** A content-free reminder response gets one bounded retry
+  with a reminder-specific correction. If delivery still fails, the runtime
+  writes one encrypted, standalone failure result containing the original
+  reminder note and a safe error explanation. This result is idempotent,
+  survives worker crashes and lease expiry, does not attach itself to an older
+  user message, and does not advance that message's reply cursor. Heartbeat,
+  manual-wake, and screen-watch silence remains unchanged.
+
 - **`memory_search` guidance documents literal matching and allows a reworded
   retry.** Matching is a case-insensitive literal substring with no synonyms,
   translation, or stemming, so an empty result means that wording is absent
