@@ -143,16 +143,14 @@ def test_job_cancel_router_matches_supervisor_snapshot_job_and_owner():
 
     class _SnapshotSupervisor:
         def __init__(self):
-            self.kills = 0
+            self.restarts = []
 
         def snapshot(self):
             return snapshot
 
-        def kill(self):
-            self.kills += 1
-
-        def start(self):
-            return None
+        def restart_if_snapshot(self, expected):
+            self.restarts.append(expected)
+            return expected == snapshot
 
     supervisor = _SnapshotSupervisor()
     router = serve_worker._JobCancelRouter()
@@ -166,9 +164,33 @@ def test_job_cancel_router_matches_supervisor_snapshot_job_and_owner():
     )
 
     assert router.handle(wrong_job) is False
-    assert supervisor.kills == 0
+    assert supervisor.restarts == []
     assert router.handle(exact) is True
-    assert supervisor.kills == 1
+    assert supervisor.restarts == [snapshot]
+
+
+def test_job_cancel_router_reports_false_when_snapshot_fence_loses_race():
+    active = slot_protocol.ActiveJobIdentity(
+        3694, "profile", "worker:heavy:0:g8"
+    )
+    snapshot = slot_protocol.SlotProgress(
+        "heavy-0", "g8", 123.4, 120.0, "profile.cards.batch", active
+    )
+
+    class _AdvancedSupervisor:
+        def snapshot(self):
+            return snapshot
+
+        def restart_if_snapshot(self, _expected):
+            return False
+
+    router = serve_worker._JobCancelRouter()
+    router.watch(_AdvancedSupervisor())
+    event = serve_worker.core_wake_bus.JobCancellation(
+        active.job_id, active.claimed_by, "foreground_chat_preempted"
+    )
+
+    assert router.handle(event) is False
 
 
 def test_heartbeat_survives_missing_last_progress_age_sec(monkeypatch):

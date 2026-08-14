@@ -26,6 +26,7 @@ class _FakeSupervisor:
         self.spawn_args = spawn_args
         self.started = 0
         self.stopped = 0
+        self.restarts = 0
         self.pid = None
         self._snapshot = None
 
@@ -46,6 +47,14 @@ class _FakeSupervisor:
 
     def snapshot(self):
         return self._snapshot
+
+    def restart_if_snapshot(self, expected):
+        if self._snapshot != expected:
+            return False
+        self.restarts += 1
+        self.kill()
+        self.start()
+        return True
 
 
 def _fleet():
@@ -150,6 +159,7 @@ def test_restart_if_snapshot_is_generation_and_job_fenced():
 
     current = supervisor.snapshot()
     assert fleet.restart_if_snapshot(key, current) is True
+    assert supervisor.restarts == 1
     assert supervisor.pid != pid_before
 
 

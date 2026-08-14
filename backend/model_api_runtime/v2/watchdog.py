@@ -47,6 +47,8 @@ class _SupervisorLike(Protocol):
 
     def kill(self) -> slot_protocol.ActiveJobIdentity | None: ...
 
+    def kill_for_recovery(self): ...
+
     def start(self) -> None: ...
 
 
@@ -205,7 +207,21 @@ async def _watchdog_loop(
             await asyncio.to_thread(supervisor.kill_and_respawn)
             return
         snapshot = supervisor.snapshot()
-        killed_identity = await asyncio.to_thread(supervisor.kill)
+        kill_for_recovery = getattr(supervisor, "kill_for_recovery", None)
+        if callable(kill_for_recovery):
+            outcome = await asyncio.to_thread(kill_for_recovery)
+            if not bool(outcome.terminated):
+                log.error(
+                    "[v2.watchdog] child termination unconfirmed worker=%s; "
+                    "retaining DB claim and refusing replacement",
+                    worker_id,
+                )
+                return
+            killed_identity = outcome.active_job
+        else:
+            # Compatibility for narrow test doubles. Production supervisors
+            # expose the explicit, confirmed kill outcome above.
+            killed_identity = await asyncio.to_thread(supervisor.kill)
         active_job = killed_identity or (
             None if snapshot is None else snapshot.active_job
         )

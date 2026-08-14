@@ -256,6 +256,75 @@ def test_watchdog_orders_capacity_snapshot_kill_recover_start(monkeypatch):
     assert order[:5] == ["capacity_zero", "snapshot", "kill", "recover", "start"]
 
 
+def test_watchdog_does_not_recover_claim_when_kill_is_unconfirmed(monkeypatch):
+    monkeypatch.setattr(
+        watchdog.jobs_store, "record_worker_heartbeat", lambda *a, **k: None
+    )
+    recoveries = []
+    monkeypatch.setattr(
+        watchdog.jobs_store,
+        "recover_killed_job",
+        lambda **kwargs: recoveries.append(kwargs),
+    )
+    active = slot_protocol.ActiveJobIdentity(3694, "profile", "heavy-0:g7")
+    snapshot = slot_protocol.SlotProgress(
+        "heavy-0", "g7", 123.4, 120.0, "profile.cards.batch", active
+    )
+
+    class _Outcome:
+        terminated = False
+        active_job = active
+
+    class _Supervisor:
+        def __init__(self):
+            self.kill_calls = 0
+            self.start_calls = 0
+
+        def poll_liveness(self):
+            return {"alive": False, "last_progress_age_sec": math.inf}
+
+        def snapshot(self):
+            return snapshot
+
+        def kill_for_recovery(self):
+            self.kill_calls += 1
+            return _Outcome()
+
+        def kill(self):
+            raise AssertionError("watchdog must use confirmed kill outcome")
+
+        def start(self):
+            self.start_calls += 1
+
+    supervisor = _Supervisor()
+    stop_event = asyncio.Event()
+
+    async def _driver():
+        task = asyncio.create_task(
+            watchdog._watchdog_loop(
+                supervisor,
+                "worker-a",
+                stop_event,
+                jobs_claimable_fn=lambda: False,
+                interval=0.02,
+                turn_stall_timeout_sec=240.0,
+                turn_absolute_timeout_sec=1500.0,
+                child_liveness_timeout_sec=45.0,
+            )
+        )
+        for _ in range(50):
+            if supervisor.kill_calls:
+                break
+            await asyncio.sleep(0.01)
+        stop_event.set()
+        await asyncio.wait_for(task, timeout=1.0)
+
+    asyncio.run(_driver())
+    assert supervisor.kill_calls >= 1
+    assert supervisor.start_calls == 0
+    assert recoveries == []
+
+
 def test_watchdog_loop_does_not_kill_when_healthy(monkeypatch):
     from model_api_runtime.v2 import jobs_store
 
