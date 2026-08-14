@@ -7327,6 +7327,7 @@ async def _run_wake(
                         enclave_sem=enclave_sem,
                         turn_authorization=True,
                         identity_write_authorization=False,
+                        memory_delete_authorization=False,
                         enqueue_write_effect=_enqueue_write_effect,
                         before_write=_before_write,
                         observe_photo=observe_photo,
@@ -7412,6 +7413,7 @@ async def _run_wake(
                         enclave_sem=enclave_sem,
                         turn_authorization=True,
                         identity_write_authorization=False,
+                        memory_delete_authorization=False,
                         enqueue_write_effect=_enqueue_write_effect,
                         enqueue_workspace_batch_effect=(
                             _enqueue_workspace_batch_effect
@@ -8141,6 +8143,7 @@ async def _run_wake(
                 build_messages=build_messages,
                 suppress_native_reasoning=_st_wake_loop.enabled(),
                 disabled_tool_names=wake_disabled_tool_names,
+                memory_delete_allowed=False,
                 dispatch_tools=_dispatch_tools,
                 on_reply=_on_reply,
                 fold_new_messages=fold_new_messages,
@@ -10971,6 +10974,7 @@ async def process_job(
                         runtime_token=runtime_token,
                         enclave_sem=enclave_sem,
                         turn_authorization=(mutation_recovery_barrier is None),
+                        memory_delete_authorization=True,
                         enqueue_write_effect=_enqueue_write_effect,
                         before_write=_before_write,
                         observe_photo=observe_photo,
@@ -11049,6 +11053,7 @@ async def process_job(
                         runtime_token=runtime_token,
                         enclave_sem=enclave_sem,
                         turn_authorization=(mutation_recovery_barrier is None),
+                        memory_delete_authorization=True,
                         enqueue_write_effect=_enqueue_write_effect,
                         enqueue_workspace_batch_effect=(
                             _enqueue_workspace_batch_effect
@@ -12187,6 +12192,7 @@ async def process_job(
             provider_config=provider_config,
             include_reasoning=turn_include_reasoning,
             suppress_native_reasoning=_self_thinking_v2.enabled(),
+            memory_delete_allowed=True,
             allow_image_output=True,
             build_messages=build_messages,
             dispatch_tools=_dispatch_tools,
