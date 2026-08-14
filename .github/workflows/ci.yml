@@ -268,6 +268,126 @@ jobs:
           python -m pytest \
             tests/test_admin_usage.py
 
+      # These three batches were previously exempted by the uncovered baseline.
+      # Keep one pytest process per batch: the tests share one session database,
+      # so file-order pollution stays visible instead of being hidden by process
+      # isolation. The explicit paths also feed the discovery coverage ratchet.
+      - name: Run CI security tier 1 (33 files)
+        env:
+          FEEDLING_TEST_PG: "postgresql://postgres:postgres@127.0.0.1:5432/postgres"
+        run: |
+          python -m pytest \
+            tests/test_agent_runtime_keyless_gate.py \
+            tests/test_asgi_memory.py \
+            tests/test_enclave_history_probe_skips_memory.py \
+            tests/test_enclave_keys_attestation.py \
+            tests/test_enclave_routes_memory.py \
+            tests/test_identity_init_server_encrypt.py \
+            tests/test_memory_actions_guard.py \
+            tests/test_memory_backoff_notice.py \
+            tests/test_memory_capture_trace.py \
+            tests/test_memory_concurrent_write_no_lost_update.py \
+            tests/test_memory_floor_signal.py \
+            tests/test_memory_guard_endpoint.py \
+            tests/test_memory_index_selector.py \
+            tests/test_memory_lane_torn_protocol_no_write.py \
+            tests/test_memory_legacy_batch_token.py \
+            tests/test_memory_m2_write_loop.py \
+            tests/test_memory_migration.py \
+            tests/test_memory_readside.py \
+            tests/test_memory_readside_core.py \
+            tests/test_memory_readside_docker_e2e.py \
+            tests/test_memory_readside_sandbox.py \
+            tests/test_memory_upgrade_id_stable.py \
+            tests/test_memory_v1_readers.py \
+            tests/test_memory_v1_readside.py \
+            tests/test_memory_v1_schema.py \
+            tests/test_memory_write_guidance_parity.py \
+            tests/test_onboarding_memory_floor_hint.py \
+            tests/test_recover_memory_dream_churn.py \
+            tests/test_v2_memory_organize_tool.py \
+            tests/test_v2_memory_retype_fence.py \
+            tests/test_v2_memory_sink_robustness.py \
+            tests/test_v2_memory_tool_actions.py \
+            tests/test_v2_quoted_memory.py \
+            -v
+
+      - name: Run CI security tier 2 (69 files)
+        env:
+          FEEDLING_TEST_PG: "postgresql://postgres:postgres@127.0.0.1:5432/postgres"
+        run: |
+          python -m pytest \
+            tests/test_access_modes.py \
+            tests/test_agent_runtime_tokens.py \
+            tests/test_api_error_envelope.py \
+            tests/test_asgi_identity.py \
+            tests/test_auth_core.py \
+            tests/test_capabilities_identity.py \
+            tests/test_chat_envelope_fpr_guard.py \
+            tests/test_consumer_decrypt_health.py \
+            tests/test_content_rewrap.py \
+            tests/test_content_rewrap_identity_sanitize.py \
+            tests/test_content_rewrap_subenvelope_roundtrip.py \
+            tests/test_content_rewrap_subenvelopes.py \
+            tests/test_enclave_auth_async.py \
+            tests/test_enclave_backend_client.py \
+            tests/test_enclave_body_helper.py \
+            tests/test_enclave_config.py \
+            tests/test_enclave_cpu_offload.py \
+            tests/test_enclave_decrypt_selfcheck.py \
+            tests/test_enclave_dev_seed.py \
+            tests/test_enclave_domain_compose.py \
+            tests/test_enclave_envelope_core.py \
+            tests/test_enclave_gzip_scope.py \
+            tests/test_enclave_http_client_reuse.py \
+            tests/test_enclave_route_error_helpers.py \
+            tests/test_enclave_route_errors.py \
+            tests/test_enclave_routeb_readside.py \
+            tests/test_enclave_routes_chat.py \
+            tests/test_enclave_routes_envelope.py \
+            tests/test_enclave_routes_frames.py \
+            tests/test_enclave_routes_health.py \
+            tests/test_enclave_routes_identity.py \
+            tests/test_enclave_routes_storage.py \
+            tests/test_enclave_runtime_token.py \
+            tests/test_enclave_server_perf.py \
+            tests/test_enclave_serving_asgi.py \
+            tests/test_enclave_trace_coalescing.py \
+            tests/test_enclave_visual_readside_units.py \
+            tests/test_genesis_foreground_identity.py \
+            tests/test_genesis_lightweight_identity.py \
+            tests/test_health_route_isolation.py \
+            tests/test_history_import_identity.py \
+            tests/test_identity_actions.py \
+            tests/test_identity_bootstrap_atomic.py \
+            tests/test_identity_card_policy.py \
+            tests/test_identity_concurrency_baseline.py \
+            tests/test_identity_list_ops.py \
+            tests/test_identity_nudge_cap.py \
+            tests/test_identity_patch_bootstrap.py \
+            tests/test_identity_patch_no_wedge_integration.py \
+            tests/test_identity_policy_wiring.py \
+            tests/test_identity_relationship_anchor_b2.py \
+            tests/test_identity_rename_pairing.py \
+            tests/test_identity_replace_action.py \
+            tests/test_identity_replace_guard.py \
+            tests/test_identity_value_write_path.py \
+            tests/test_io_cli_auth.py \
+            tests/test_io_cli_identity.py \
+            tests/test_io_cli_identity_read.py \
+            tests/test_io_cli_identity_write_full.py \
+            tests/test_model_api_runtime_token_decrypt.py \
+            tests/test_onboarding_decrypt_health.py \
+            tests/test_protocol_leak.py \
+            tests/test_runtime_token_auth.py \
+            tests/test_screen_background_enclave_auth.py \
+            tests/test_screen_routes_auth.py \
+            tests/test_tee_ciphertext_prune.py \
+            tests/test_v2_model_identity.py \
+            tests/test_v2_trajectory_access_audit.py \
+            tests/test_verify_enclave_domain.py \
+            -v
+
       - name: Run Hosted Runtime V2 safety and prompt-cache suites
         env:
           FEEDLING_TEST_PG: "postgresql://postgres:postgres@127.0.0.1:5432/postgres"
