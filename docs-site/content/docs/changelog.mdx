@@ -10,6 +10,14 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **Hosted Runtime V2 proactive turns remain compatible with Claude 4.6 and
+  later.** Scheduled reminders, heartbeat, manual wake, and screen-watch turns
+  retain dynamic runtime context as non-user application data, then end the
+  provider request with one fixed, content-free transport marker. This avoids
+  the unsupported assistant-prefill request shape without attributing reminder
+  text, sensor context, or a new request to the user. The model still decides
+  whether weak wakes speak; scheduled reminders still require delivery.
+
 - **Hosted Runtime V2 scheduled reminders no longer disappear after a model or
   provider failure.** A content-free reminder response gets one bounded retry
   with a reminder-specific correction. If delivery still fails, the runtime

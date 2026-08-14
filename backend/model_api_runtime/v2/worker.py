@@ -3806,6 +3806,7 @@ def _make_build_messages_fn(
     tail_lane: str = "",
     tail_anchor_seq: int | None = None,
     application_data_role: str = "user",
+    proactive_turn_boundary: bool = False,
     manual_wake: bool = False,
     screen_frame_message: dict[str, Any] | None = None,
 ) -> Callable[[list], list]:
@@ -3828,7 +3829,9 @@ def _make_build_messages_fn(
     lane, rendered via `context.action_context_str`). It is serialized as an explicitly
     untrusted application-data block after the base conversation, never as system
     authority. Foreground chat uses user role and proactive turns use assistant role.
-    Dynamic tool results remain native exchanges after that base block.
+    A proactive turn may add a fixed user-role transport boundary after those blocks;
+    it carries no wake data or model-choice instruction. Dynamic tool results remain
+    native exchanges after that base block.
     """
 
     # 真实模型自称块排在用户可编辑的 workspace skill 之前：它是运行时事实，不能被
@@ -3887,6 +3890,7 @@ def _make_build_messages_fn(
             coverage_hole_notice=coverage_hole_notice,
             temporal_context=_temporal_for(rendered_tail),
             application_data_role=application_data_role,
+            proactive_turn_boundary=proactive_turn_boundary,
             manual_wake=manual_wake,
             screen_frame_message=screen_frame_message,
         )
@@ -9325,6 +9329,7 @@ async def _run_wake(
                 tail_source_truncated=tail_source_truncated,
                 tail_lane=lane,
                 application_data_role="assistant",
+                proactive_turn_boundary=True,
                 manual_wake=(lane == "manual_wake"),
             )
 

@@ -244,7 +244,7 @@ def test_run_wake_reply_written_and_job_completed(monkeypatch):
         message["content"]
         for message in seen["messages"]
         if message.get("role") == "user"
-    ] == ["hi"]
+    ] == ["hi", v2_context.PROACTIVE_TURN_BOUNDARY]
 
 
 def test_wake_self_thinking_on_drops_native_reasoning_fallback(monkeypatch):
@@ -521,7 +521,15 @@ def test_run_wake_reply_push_carries_is_wake_true_and_manual_wake_lane(monkeypat
     )
     runtime_payload = json.loads(runtime_message["content"].split("\n", 1)[1])
     assert runtime_payload["runtime_control"]["manual_wake"] is True
-    assert not any(message.get("role") == "user" for message in provider_messages[0])
+    assert provider_messages[0][-1] == {
+        "role": "user",
+        "content": v2_context.PROACTIVE_TURN_BOUNDARY,
+    }
+    assert not any(
+        message.get("role") == "user"
+        and message.get("content") != v2_context.PROACTIVE_TURN_BOUNDARY
+        for message in provider_messages[0]
+    )
     assert len(shadow) == 1
     shadow_uid, observed = shadow[0]
     assert shadow_uid == uid
@@ -1083,7 +1091,9 @@ def test_run_scheduled_wake_prompts_with_the_exact_due_reminders(monkeypatch):
         for message in seen["messages"]
         if message.get("role") == "user"
     )
-    assert user_text == ""
+    assert user_text == v2_context.PROACTIVE_TURN_BOUNDARY
+    assert "提醒我喝水" not in user_text
+    assert "提醒我拉伸" not in user_text
     runtime_text = "\n".join(
         str(message.get("content") or "")
         for message in seen["messages"]
@@ -1132,6 +1142,73 @@ def test_run_scheduled_wake_prompts_with_the_exact_due_reminders(monkeypatch):
     assert all(event["schedule_status"] == "fired" for event in events)
     assert "提醒我喝水" not in repr(events)
     assert "提醒我拉伸" not in repr(events)
+
+
+def test_scheduled_wake_does_not_send_claude_48_an_assistant_prefill(monkeypatch):
+    """Claude 4.6+ rejects a final assistant message with HTTP 400.
+
+    Keep the reminder in assistant-role application data, but terminate the
+    provider request with the fixed non-user transport marker. This reproduces
+    the OpenRouter/Opus 4.8 failure seen on Test on 2026-08-14: without the
+    boundary this fake provider raises exactly where the real route did.
+    """
+    uid = "u_wake_claude_48_prefill"
+    conftest.seed_user(uid)
+    _reset(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, "scheduled")
+    claimed_by = _claim(job_id)
+    config = provider_client.ProviderConfig(
+        provider="openrouter",
+        model="anthropic/claude-opus-4.8",
+        api_key="sk-user-byok",
+        base_url="https://openrouter.ai/api/v1",
+    )
+    calls = []
+
+    async def _claude_48(_config, messages, *, tools=None, **_kwargs):
+        calls.append(messages)
+        if messages[-1].get("role") == "assistant":
+            raise provider_client.ProviderError(
+                "provider_http_400: This model does not support assistant "
+                "message prefill. The conversation must end with a user message.",
+                status_code=400,
+            )
+        return _text_round("两分钟到了，该出门啦。")
+
+    monkeypatch.setattr(provider_client, "chat_completion_async", _claude_48)
+    monkeypatch.setattr(
+        worker,
+        "_write_encrypted_reply",
+        lambda _store, _text: {"id": "scheduled-claude-48-reply"},
+    )
+    deps = _wake_deps(tail=[])
+    deps.read_scheduled_wake_context = lambda _user_id, _job_id: [
+        {"note": "提醒我出门", "fired_at": 123.0}
+    ]
+
+    status = asyncio.run(
+        worker._run_wake(
+            job_id,
+            uid,
+            "scheduled",
+            deps,
+            config,
+            worker.ENCLAVE_SEMAPHORE,
+            claimed_by,
+        )
+    )
+
+    assert status == "completed"
+    assert len(calls) == 1
+    assert calls[0][-1] == {
+        "role": "user",
+        "content": v2_context.PROACTIVE_TURN_BOUNDARY,
+    }
+    assert any(
+        message.get("role") == "assistant"
+        and "提醒我出门" in str(message.get("content") or "")
+        for message in calls[0]
+    )
 
 
 def test_run_perception_wake_injects_trigger_as_untrusted_runtime_data(monkeypatch):
@@ -1196,7 +1273,7 @@ def test_run_perception_wake_injects_trigger_as_untrusted_runtime_data(monkeypat
         message.get("content")
         for message in seen["messages"]
         if message.get("role") == "user"
-    ] == ["hi"]
+    ] == ["hi", v2_context.PROACTIVE_TURN_BOUNDARY]
     runtime_text = str(runtime_messages[0]["content"])
     assert '"perception_wake"' in runtime_text
     assert "arrived_at_anchor" in runtime_text
