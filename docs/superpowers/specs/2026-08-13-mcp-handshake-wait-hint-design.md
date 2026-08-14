@@ -202,6 +202,42 @@ per-server verdict：ok / failed / inconclusive），也已经发回后端，只
 模型必须精确指定 `deepseek-v4-flash` 与 `deepseek-v4-pro`，runner 用 2.1.195，
 不能只写 `--model-class non-claude`。
 
+### 5.1.1 验收结果（2026-08-14，test 环境真实产品路径）
+
+**3/3 PASS**，逐次判据完全一致：
+
+```
+init_status     {slowprobe: pending}    ← 竞速真的发生了(不是恰好赶上)
+wait_attempted  true
+wait_count      1                       ← 只等一次,没有叠加
+wait_outcomes   ["ready"]
+called_ok       ["slowprobe"]
+verdict         {slowprobe: recovered}
+回复正文         SLOWPROBE-OK-7788       ← 只有该服务器会返回的串,证明真调了工具
+```
+
+runtime 收敛到 `resident_cli`、driver=claude、provider deepseek，即两个受害用户的同款形态。
+
+**被测服务器**：本地起的确定性慢服务器，经 ngrok 暴露给 CVM（全程握手 4~7s，
+稳超 claude 的 ~2.5s 预算）。用公共服务器不行：`deepwiki` 实测 2.2~3.5s 在生死线上抖，
+第一次跑就 `init_status=connected`、竞速根本没发生（那一轮判 FAIL 是对的）；
+`gitmcp` 稳定 22s，又超出 Wait 能救的量级。
+
+**部署确认**：`wait_count` / `wait_attempted` / `wait_outcomes` 这三个本批新增字段
+出现在 test 的真实 trace 里 —— 这是 runner CVM 确实重出镜像的硬证据（`/healthz`
+只报主 CVM，看不出 runner）。
+
+**⚠️ 第 5 条（去掉提示词必须失败）没有在 test 上做**：提示词已烤进部署镜像，
+关掉它需要另出一版构建。替代证据有两条，都不是人造的：
+① prod 仍跑旧代码，`usr_2f4d`/`usr_9894` 在**同一条 runtime、同一个 driver、同样
+pending** 的条件下 `called_ok` 全空；② 本地 40 轮矩阵的无提示对照臂 0 命中。
+**唯一差别就是这三行提示词。** 但这条仍记为「未在 test 上负向对照」，不含糊过去。
+
+**探针自身的修复**（本批附带）：原来钉完 runtime 只 `sleep(30)` 就发消息。实测
+2026-08-14 在 test 上不够——turn 被 V2 抢答，trace 里是 V2 的 `mcp.surface.resolved`，
+探针报「FAIL 没有 mcp.surface.wired」，读起来像修复坏了，实际是**测错了 runtime**。
+改成轮询 allowlist 的 `converged` + `actual`，收不敛按 SETUP 失败退出 2，不当判据。
+
 ### 5.2 单测
 
 - 三个闸各一条：非 chat lane / 非 claude cmd / 无 enabled server 时
