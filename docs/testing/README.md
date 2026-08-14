@@ -168,6 +168,9 @@ before=$(curl -s https://test-api.feedling.app/healthz | python3 -c "import json
 after=$(curl -s .../healthz | python3 -c "...")
 ```
 - **`after` 比本次 run 的时长还小 ⇒ 中途重启过**,这次失败是环境的,**重跑**
+- **同时比对 `release.git_commit`:before/after 必须是同一个 SHA**。
+  只看 uptime 有个漏洞 —— 服务可能重启后又跑了很久,uptime 照样大;
+  **SHA 不变才真正锁死「整轮跑的是同一个东西」**(codexcodex 2026-08-14 补的,比原判据严)
 - `uptime_s` 很小(< 120s)就开跑 ⇒ 你正踩在重启窗口上,**等一会儿再开**
 
 **另一条必须做的对照**:本机代理(MacPacket/Shadowrocket)也会间歇抽风,
