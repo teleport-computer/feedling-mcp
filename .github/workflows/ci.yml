@@ -388,6 +388,69 @@ jobs:
             tests/test_verify_enclave_domain.py \
             -v
 
+      - name: Run CI security tier 3 (56 files)
+        env:
+          FEEDLING_TEST_PG: "postgresql://postgres:postgres@127.0.0.1:5432/postgres"
+        run: |
+          python -m pytest \
+            tests/test_account_recover.py \
+            tests/test_account_reset_purges_all_tables.py \
+            tests/test_admin_tee_replication.py \
+            tests/test_agent_perception_route.py \
+            tests/test_asgi_perception.py \
+            tests/test_asgi_screen.py \
+            tests/test_asgi_worldbook.py \
+            tests/test_capabilities_perception.py \
+            tests/test_capabilities_photo.py \
+            tests/test_capabilities_screen.py \
+            tests/test_chat_file_r2.py \
+            tests/test_chat_history_selfheal.py \
+            tests/test_chat_history_selfheal_blocked_by_nonempty_page.py \
+            tests/test_content_export_world_book.py \
+            tests/test_content_offloaded_bodies.py \
+            tests/test_delete_user_cascades_all_tables.py \
+            tests/test_frame_r2.py \
+            tests/test_genesis_plaintext_routes.py \
+            tests/test_object_storage.py \
+            tests/test_perception_glance.py \
+            tests/test_perception_history.py \
+            tests/test_perception_recent_apps.py \
+            tests/test_perception_recent_apps_flow.py \
+            tests/test_perception_signal_state_v2.py \
+            tests/test_plaintext_job_exclusivity.py \
+            tests/test_screen_ws_revoked.py \
+            tests/test_store_append_chat_file.py \
+            tests/test_tee_dual_write.py \
+            tests/test_tee_mirror.py \
+            tests/test_tee_reconciler.py \
+            tests/test_tee_replicate_conn_retry.py \
+            tests/test_tee_replicator_frames.py \
+            tests/test_tee_replicator_main.py \
+            tests/test_tee_replicator_transforms.py \
+            tests/test_tee_replicator_worker.py \
+            tests/test_tee_requeue.py \
+            tests/test_tee_requeue_coverage.py \
+            tests/test_tee_schema.py \
+            tests/test_tee_snapshot.py \
+            tests/test_tee_sync_metrics.py \
+            tests/test_tee_sync_scheduler.py \
+            tests/test_tee_verify.py \
+            tests/test_user_mcp_ca_fetch.py \
+            tests/test_user_mcp_ca_fetch_leaf.py \
+            tests/test_user_mcp_materialize.py \
+            tests/test_user_mcp_poll.py \
+            tests/test_v2_perception_grounding.py \
+            tests/test_voice_context_filtering.py \
+            tests/test_voice_finalize_db.py \
+            tests/test_voice_gateway.py \
+            tests/test_voice_revision_latest_wins.py \
+            tests/test_voice_transcript_outbound_gate.py \
+            tests/test_worldbook_match.py \
+            tests/test_worldbook_readside_core.py \
+            tests/test_worldbook_routes.py \
+            tests/test_worldbook_store.py \
+            -v
+
       - name: Run Hosted Runtime V2 safety and prompt-cache suites
         env:
           FEEDLING_TEST_PG: "postgresql://postgres:postgres@127.0.0.1:5432/postgres"
