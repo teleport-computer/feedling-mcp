@@ -276,7 +276,8 @@ PYTHONPATH=backend .venv-test/bin/python - <<'PY'
 from alembic.config import Config
 from alembic.script import ScriptDirectory
 for tree in ("alembic", "alembic_tee"):
-    cfg = Config(f"backend/{tree}/alembic.ini")
+    ini = "backend/alembic.ini" if tree == "alembic" else "backend/alembic_tee/alembic.ini"
+    cfg = Config(ini)
     cfg.set_main_option("script_location", f"backend/{tree}")
     print(tree, ScriptDirectory.from_config(cfg).get_heads())
 PY
