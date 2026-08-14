@@ -37,6 +37,25 @@ accounts / bootstrap / core.store）。所有外部输入由调用方传参。�
 | 5 | 切 V2 read/tool → capture → dream | 高 | ⛔ 等拍板 |
 | 6 | 切 V1 resident（hosted/VPS 共用文件） | 高 | ⛔ 等拍板 |
 | 7 | 切 genesis（onboarding / add_memory / keep_all / recheck） | 高 | ⛔ 等拍板 |
+
+> **批 7 的一条具体待办（本轮实施中查出来的）**：
+> 除了「什么值得记」那把尺子，**结构性规则也重复了一份**。最硬的证据是语言规则——
+> 同一条要求在两边各写一遍，连标点风格都不同：
+>
+> ```
+> capture:  语言：所有字段（bucket/threads/summary/content）用 TA 跟你对话的语言记——
+>           中文对话就用中文（用「宠物」不是「pets」、「旅行」不是「travel」），英文对话用英文；
+>           只有专有名词/品牌名/TA 的原话才保留原文。
+> genesis:  语言:bucket/threads/summary/content 用素材原文的语言——中文素材就用中文
+>           (用「宠物」不是「pets」),别归成英文桶/线索;专有名词/原话保留原文。
+> ```
+>
+> **尺子本来就该不同，但语言规则应该完全一样。** 这类结构性规则（语言、字段语义、
+> 去重口径）才是真正该合并的部分。
+>
+> ⚠️ **本轮不动**：统一措辞等于改 prompt，而 prompt 行为的 bug 单测抓不到，
+> 只有真模型 e2e 能暴露（capture/migrate 的单测都 stub 了 agent）。
+> 合并这类规则必须配一次真模型 e2e，放在批 7 一起做。
 | 8 | dream_scheduler 拆两半 | 中 | ⛔ 等拍板 |
 | 9 | CLI / MCP 壳 | 低 | ⛔ 摸开源时再做 |
 
