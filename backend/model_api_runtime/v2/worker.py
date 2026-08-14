@@ -8522,9 +8522,16 @@ async def _enqueue_profile_if_due(
         "profile",
         reason=reason,
     )
-    if not coalesced:
+    made_ready = False
+    if force and coalesced:
+        made_ready = await asyncio.to_thread(
+            jobs_store.make_pending_job_ready,
+            user_id,
+            lane="profile",
+        )
+    if not coalesced or made_ready:
         await asyncio.to_thread(core_wake_bus.notify, "v2_jobs", user_id)
-    return not coalesced
+    return (not coalesced) or made_ready
 
 
 def _profile_attempt_count(previous: dict) -> int:

@@ -287,3 +287,60 @@ def test_dream_force_refresh_bypasses_healthy_profile_due_check(monkeypatch):
         worker._enqueue_profile_if_due("u", reason="dream_refresh", force=True)
     ) is True
     assert calls == [("u", "profile", "dream_refresh")]
+
+
+def test_non_force_profile_refresh_does_not_accelerate_delayed_job(monkeypatch):
+    monkeypatch.setattr(worker, "_profile_refresh_due", lambda _uid: True)
+    monkeypatch.setattr(
+        worker.jobs_store,
+        "enqueue_job",
+        lambda *_args, **_kwargs: (11, True),
+    )
+    monkeypatch.setattr(
+        worker.jobs_store,
+        "make_pending_job_ready",
+        lambda *_args, **_kwargs: pytest.fail(
+            "post-chat refresh must not accelerate delayed retry"
+        ),
+    )
+    monkeypatch.setattr(
+        worker.core_wake_bus,
+        "notify",
+        lambda *_args: pytest.fail("coalesced delayed retry needs no notify"),
+    )
+
+    assert asyncio.run(
+        worker._enqueue_profile_if_due("u", reason="post_turn_refresh")
+    ) is False
+
+
+def test_dream_force_makes_coalesced_delayed_profile_ready(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        worker,
+        "_profile_refresh_due",
+        lambda _uid: pytest.fail("force refresh must bypass due check"),
+    )
+    monkeypatch.setattr(
+        worker.jobs_store,
+        "enqueue_job",
+        lambda *_args, **_kwargs: (12, True),
+    )
+    monkeypatch.setattr(
+        worker.jobs_store,
+        "make_pending_job_ready",
+        lambda uid, **kwargs: calls.append(("ready", uid, kwargs["lane"])) or True,
+    )
+    monkeypatch.setattr(
+        worker.core_wake_bus,
+        "notify",
+        lambda topic, uid: calls.append(("notify", topic, uid)),
+    )
+
+    assert asyncio.run(
+        worker._enqueue_profile_if_due("u", reason="dream_refresh", force=True)
+    ) is True
+    assert calls == [
+        ("ready", "u", "profile"),
+        ("notify", "v2_jobs", "u"),
+    ]

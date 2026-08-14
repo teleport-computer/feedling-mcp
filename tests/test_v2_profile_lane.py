@@ -779,10 +779,23 @@ def test_cutover_profile_enqueue_occurs_after_config_lock_release(monkeypatch):
             inside["lock"] = False
 
     monkeypatch.setattr(config_store.db, "hosted_runtime_config_mutation_lock", _lock)
+    controls = iter(
+        [
+            ("resident", "resident", 1),
+            (config_store.HOSTED_RUNTIME_MODE_DB_ACTION_V2, "v2", 2),
+        ]
+    )
+
+    def _runtime_control(_uid):
+        value = next(controls)
+        if value[1] == "v2":
+            assert inside["lock"] is False
+        return value
+
     monkeypatch.setattr(
         config_store.db,
         "get_hosted_runtime_control_strict",
-        lambda _uid: ("resident", "resident", 1),
+        _runtime_control,
     )
     monkeypatch.setattr(
         config_store,
@@ -809,6 +822,68 @@ def test_cutover_profile_enqueue_occurs_after_config_lock_release(monkeypatch):
 
     assert result == config_store.HOSTED_RUNTIME_MODE_DB_ACTION_V2
     assert calls[0] == ("u", "profile", "runtime_v2_cutover")
+
+
+def test_hosted_profile_wake_force_readies_coalesced_v2_job(monkeypatch):
+    monkeypatch.setenv("FEEDLING_V2_PROFILE_ENABLED", "1")
+    calls = []
+    monkeypatch.setattr(
+        config_store.db,
+        "get_hosted_runtime_control_strict",
+        lambda _uid: (config_store.HOSTED_RUNTIME_MODE_DB_ACTION_V2, "v2", 3),
+    )
+    monkeypatch.setattr(
+        jobs_store,
+        "enqueue_job",
+        lambda uid, lane, **kwargs: calls.append(
+            ("enqueue", uid, lane, kwargs["reason"])
+        )
+        or (77, True),
+    )
+    monkeypatch.setattr(
+        jobs_store,
+        "make_pending_job_ready",
+        lambda uid, **kwargs: calls.append(("ready", uid, kwargs["lane"])) or True,
+    )
+    monkeypatch.setattr(
+        "core.wake_bus.notify",
+        lambda topic, uid: calls.append(("notify", topic, uid)),
+    )
+
+    assert config_store.enqueue_profile_best_effort(
+        "u", reason="provider_config_changed", force_ready=True
+    )
+    assert calls == [
+        ("enqueue", "u", "profile", "provider_config_changed"),
+        ("ready", "u", "profile"),
+        ("notify", "v2_jobs", "u"),
+    ]
+
+
+def test_hosted_profile_wake_ignores_resident_and_contains_failures(monkeypatch):
+    monkeypatch.setenv("FEEDLING_V2_PROFILE_ENABLED", "1")
+    monkeypatch.setattr(
+        config_store.db,
+        "get_hosted_runtime_control_strict",
+        lambda _uid: ("resident", "resident", 1),
+    )
+    monkeypatch.setattr(
+        jobs_store,
+        "enqueue_job",
+        lambda *_args, **_kwargs: pytest.fail("resident user cannot enqueue V2 profile"),
+    )
+    assert not config_store.enqueue_profile_best_effort(
+        "u", reason="provider_config_changed", force_ready=True
+    )
+
+    monkeypatch.setattr(
+        config_store.db,
+        "get_hosted_runtime_control_strict",
+        lambda _uid: (_ for _ in ()).throw(RuntimeError("secret database detail")),
+    )
+    assert not config_store.enqueue_profile_best_effort(
+        "u", reason="provider_config_changed", force_ready=True
+    )
 
 
 def test_cutover_profile_enqueue_is_absent_when_profile_disabled(monkeypatch):

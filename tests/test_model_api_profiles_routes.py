@@ -19,6 +19,7 @@ import db  # noqa: E402
 import provider_client  # noqa: E402
 from core import enclave as core_enclave  # noqa: E402
 from core import envelope as core_envelope  # noqa: E402
+from hosted import config_store as hosted_config_store  # noqa: E402
 
 _ENV = {"v": 1, "body_ct": "ct", "nonce": "n"}
 
@@ -65,6 +66,36 @@ def test_setup_is_idempotent_and_does_not_accumulate_routes(
 
     assert len(db.model_api_credentials_list(uid)) == 1
     assert len(db.model_api_routes_list(uid)) == 1
+
+
+def test_successful_setup_requests_profile_repair_wake(
+    client, fake_provider, fake_envelope, fake_enclave, monkeypatch
+):
+    uid, headers = _register(client)
+    wakes = []
+    monkeypatch.setattr(
+        hosted_config_store,
+        "enqueue_profile_best_effort",
+        lambda user_id, **kwargs: wakes.append((user_id, kwargs)) or True,
+    )
+
+    response = client.post(
+        "/v1/model_api/setup",
+        headers=headers,
+        json={
+            "provider": "anthropic",
+            "model": "claude-sonnet-4-5",
+            "api_key": "sk-ant-xxx",
+        },
+    )
+
+    assert response.status_code == 200, response.get_data(as_text=True)
+    assert wakes == [
+        (
+            uid,
+            {"reason": "provider_config_changed", "force_ready": True},
+        )
+    ]
 
 
 def test_setup_second_model_same_key_adds_route_reuses_credential(
@@ -199,6 +230,13 @@ def test_setup_returns_500_when_activate_loses_race(
     200「configured」描述一个从未激活的配置。patch 打在定义模块 db 上。"""
     _uid, headers = _register(client)
     monkeypatch.setattr(db, "model_api_route_activate", lambda user_id, route_id: False)
+    monkeypatch.setattr(
+        hosted_config_store,
+        "enqueue_profile_best_effort",
+        lambda *_args, **_kwargs: pytest.fail(
+            "failed setup must not request profile repair"
+        ),
+    )
 
     resp = client.post("/v1/model_api/setup", headers=headers, json={
         "provider": "anthropic", "model": "claude-sonnet-4-5", "api_key": "sk-ant-xxx"})
