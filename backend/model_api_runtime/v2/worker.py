@@ -3533,6 +3533,41 @@ def _flatten_turns(turns: list[list[dict]]) -> list[dict]:
     return [row for turn in turns for row in turn]
 
 
+@dataclass(frozen=True)
+class RecentPromptContext:
+    required_tail: list[dict[str, Any]]
+    optional_turns: list[list[dict[str, Any]]]
+    tail_source_truncated: bool
+    agent_memory: str
+    user_profile: str
+    profile_state: str
+    profile_memory_chars: int = 0
+    profile_user_chars: int = 0
+    profile_age_seconds: float | None = None
+
+
+def _split_recent_turn_window(
+    window: dict[str, Any],
+    *,
+    required_from_seq: int | None,
+) -> tuple[list[list[dict[str, Any]]], list[dict[str, Any]], bool]:
+    """Partition one frozen recent window without a summary coverage frontier."""
+    rows = [dict(row) for row in list(window.get("rows") or [])]
+    groups = _group_complete_turns(rows)
+    optional: list[list[dict[str, Any]]] = []
+    required: list[list[dict[str, Any]]] = []
+    for group in groups:
+        seed_seq = int(group[0]["seq"])
+        is_required = (
+            required_from_seq is not None
+            and seed_seq >= int(required_from_seq)
+        )
+        (required if is_required else optional).append(group)
+    leading_partial = bool(rows) and not _is_genuine_user_seed(rows[0])
+    truncated = bool(window.get("source_truncated")) or leading_partial
+    return optional, _flatten_turns(required), truncated
+
+
 def _adaptive_replay_parts(
     window: dict,
     *,
@@ -5943,6 +5978,89 @@ async def _select_profile_prompt_for_turn(
         best_effort=True,
     )
     return selection
+
+
+async def _read_recent_prompt_context(
+    *,
+    user_id: str,
+    deps: TurnDeps,
+    through_seq: int,
+    target_turns: int,
+    required_from_seq: int | None,
+    enclave_sem: "asyncio.Semaphore",
+    trajectory_recorder: "v2_trajectory.TrajectoryRecorder | None",
+    active_image_ids: set[str] | None = None,
+) -> RecentPromptContext:
+    """Read bounded recent turns plus Profile without summary/frontier state."""
+    async with enclave_sem:
+        if deps.read_recent_turns is None:
+            window: dict[str, Any] = {
+                "rows": [],
+                "source_truncated": False,
+            }
+        else:
+            window = await asyncio.to_thread(
+                deps.read_recent_turns,
+                user_id,
+                int(target_turns),
+                _RECENT_TURN_ROW_CAP,
+                through_seq=int(through_seq),
+            )
+        optional_turns, required_tail, tail_source_truncated = (
+            _split_recent_turn_window(
+                window,
+                required_from_seq=required_from_seq,
+            )
+        )
+
+        required_tail = await asyncio.to_thread(
+            _inject_tail_images,
+            required_tail,
+            user_id=user_id,
+            read_images=deps.read_images,
+            active_image_ids=active_image_ids,
+            read_vision_observations=deps.read_vision_observations,
+        )
+        required_tail = await asyncio.to_thread(
+            _inject_tail_files,
+            required_tail,
+            user_id=user_id,
+            read_files=deps.read_files,
+        )
+        if optional_turns:
+            optional_rows = await asyncio.to_thread(
+                _inject_tail_images,
+                _flatten_turns(optional_turns),
+                user_id=user_id,
+                read_images=deps.read_images,
+                active_image_ids=active_image_ids,
+                read_vision_observations=deps.read_vision_observations,
+            )
+            optional_rows = await asyncio.to_thread(
+                _inject_tail_files,
+                optional_rows,
+                user_id=user_id,
+                read_files=deps.read_files,
+            )
+            optional_turns = _group_complete_turns(optional_rows)
+
+        profile = await _select_profile_prompt_for_turn(
+            user_id=user_id,
+            deps=deps,
+            trajectory_recorder=trajectory_recorder,
+        )
+
+    return RecentPromptContext(
+        required_tail=required_tail,
+        optional_turns=optional_turns,
+        tail_source_truncated=tail_source_truncated,
+        agent_memory=profile.memory,
+        user_profile=profile.user,
+        profile_state=profile.state,
+        profile_memory_chars=profile.memory_chars,
+        profile_user_chars=profile.user_chars,
+        profile_age_seconds=profile.age_seconds,
+    )
 
 
 async def _read_seq_adaptive_prompt_context(
