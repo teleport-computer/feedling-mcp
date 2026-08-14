@@ -102,6 +102,9 @@ def _consumer_blame_map() -> dict[str, str]:
     out = {klass: blame for klass, blame, _text, _pat in crc._ERROR_CLASS_RULES}
     # classify_agent_error 里硬编码（非规则表）的几类：
     out.setdefault("turn_timeout", "system")
+    out.setdefault("platform_queue_timeout", "system")
+    out.setdefault("platform_execution_timeout", "system")
+    out.setdefault("provider_timeout", "provider_transient")
     out.setdefault("provider_empty_reply", "provider_transient")
     out.setdefault("reply_parse_failed", "system")
     out.setdefault("model_not_found", "user_provider")  # 裸 404+model 分支，和规则表一致
@@ -125,6 +128,18 @@ def test_catalog_blame_matches_consumer_blame_for_every_class():
         assert catalog.blame_for(ec) == blame, (
             f"blame mismatch for {ec}: catalog={catalog.blame_for(ec)!r} "
             f"consumer={blame!r}")
+
+
+def test_timeout_notice_classes_have_non_retry_loop_text():
+    assert catalog.user_text_for("platform_queue_timeout") == (
+        "这条消息没有及时开始处理，也没有生成回复。请稍后再试，不要连续发送。"
+    )
+    assert catalog.user_text_for("platform_execution_timeout") == (
+        "这轮回复因系统执行异常没有完成，也不会重复生成回复。请稍后再试，不要连续发送。"
+    )
+    assert catalog.user_text_for("provider_timeout") == (
+        "你配置的模型服务这次没有及时响应。请先检查模型渠道稳定性，不要连续重发。"
+    )
 
 
 def test_classify_upstream_mirrors_consumer_on_samples():

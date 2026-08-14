@@ -360,34 +360,54 @@ def test_run_forever_backoff_is_bounded(monkeypatch):
     assert sleeps[-1] == serve_worker._RELAUNCH_BACKOFF_MAX_SEC
 
 
-def test_db_pool_capacity_scales_for_nested_effect_sinks(monkeypatch):
-    monkeypatch.delenv("FEEDLING_DB_POOL_MAX_SIZE", raising=False)
-    monkeypatch.delenv(
-        "FEEDLING_V2_WORKSPACE_WRITE_PARALLELISM", raising=False
-    )
+def test_runtime_db_pool_limits_are_parent_eight_and_each_child_two(monkeypatch):
+    from model_api_runtime.v2 import pool_config
 
-    # Sixteen simultaneous drains may each hold an outer generation connection.
-    # While one workspace batch occupies four shared nested CAS slots, the other
-    # turns may each need an ordinary nested sink connection too. The
-    # conservative floor is 2*16 + 4 workspace + 4 operational headroom.
-    assert serve_worker._configure_db_pool_capacity(16) == 40
-    assert __import__("os").environ["FEEDLING_DB_POOL_MAX_SIZE"] == "40"
+    config = pool_config.RuntimePoolConfig.from_env()
 
-
-def test_db_pool_capacity_rejects_explicit_saturation_cliff(monkeypatch):
-    monkeypatch.setenv("FEEDLING_V2_WORKSPACE_WRITE_PARALLELISM", "4")
-    monkeypatch.setenv("FEEDLING_DB_POOL_MAX_SIZE", "39")
-
-    with pytest.raises(RuntimeError, match=r"too small.*require >= 40"):
-        serve_worker._configure_db_pool_capacity(16)
+    assert len(config.slots) == 8
+    assert serve_worker._runtime_db_pool_limits(config) == (8, 2)
+    assert 8 + (len(config.slots) * 2) == 24
 
 
 @pytest.mark.parametrize("raw", ["0", "-1", "nope"])
-def test_db_pool_capacity_bad_override_fails_closed(monkeypatch, raw):
-    monkeypatch.setenv("FEEDLING_DB_POOL_MAX_SIZE", raw)
+def test_db_explicit_process_pool_limit_fails_closed(monkeypatch, raw):
+    monkeypatch.setattr(serve_worker.db, "_pool", None)
 
-    with pytest.raises(RuntimeError, match="FEEDLING_DB_POOL_MAX_SIZE"):
-        serve_worker._configure_db_pool_capacity(4)
+    with pytest.raises(RuntimeError, match="pool max size"):
+        serve_worker.db.configure_pool_max_size(raw)
+
+
+def test_db_explicit_child_pool_limit_is_effectively_two(monkeypatch):
+    monkeypatch.setattr(serve_worker.db, "_pool", None)
+    monkeypatch.delenv("FEEDLING_DB_POOL_MAX_SIZE", raising=False)
+
+    assert serve_worker.db.configure_pool_max_size(2) == 2
+    assert serve_worker.db._pool_max_size() == 2
+
+
+def test_main_configures_parent_pool_to_eight_before_db_startup(monkeypatch):
+    order = []
+    monkeypatch.setattr(
+        serve_worker.runner_identity, "resolve_worker_id", lambda _default: "worker"
+    )
+    monkeypatch.setattr(
+        serve_worker.db,
+        "configure_pool_max_size",
+        lambda value: order.append(("configure", value)) or value,
+    )
+    monkeypatch.setattr(
+        serve_worker.db, "init_schema", lambda: order.append(("init", None))
+    )
+    monkeypatch.setattr(serve_worker, "wire_assembly", lambda: None)
+    monkeypatch.setattr(
+        serve_worker.accounts_registry, "start_periodic_full_reload", lambda: None
+    )
+    monkeypatch.setattr(serve_worker, "_run_forever", lambda *_args: None)
+
+    serve_worker.main()
+
+    assert order == [("configure", 8), ("init", None)]
 
 
 @pytest.mark.parametrize("raw", ["0", "-1", "nan", "inf", "nope"])
@@ -1363,7 +1383,6 @@ class _HealthySupervisor:
 
 def test_turn_heartbeat_advertises_slot_capacity(monkeypatch):
     calls = []
-    monkeypatch.setattr(worker, "MAX_WORKERS", 12)
     monkeypatch.setattr(
         jobs_store,
         "record_worker_heartbeat",
@@ -1383,8 +1402,95 @@ def test_turn_heartbeat_advertises_slot_capacity(monkeypatch):
         await asyncio.wait_for(task, timeout=1.0)
 
     asyncio.run(_driver())
-    assert calls[0] == ("worker-a", {"capacity": 12, "kind": "turn"})
-    assert calls[-1] == ("worker-a", {"capacity": 0, "kind": "turn"})
+    assert calls[0] == (
+        "worker-a",
+        {
+            "capacity": 1,
+            "kind": "turn",
+            "pool": "foreground",
+            "runtime_state": {
+                "slot": {"stage": "starting", "busy": False}
+            },
+        },
+    )
+    assert calls[-1] == (
+        "worker-a",
+        {
+            "capacity": 0,
+            "kind": "turn",
+            "pool": "foreground",
+            "runtime_state": {
+                "slot": {"stage": "stopping", "busy": False}
+            },
+        },
+    )
+
+
+def test_foreground_fleet_heartbeat_runtime_state_is_bounded_and_identifier_free(
+    monkeypatch,
+):
+    from model_api_runtime.v2 import pool_supervisor
+
+    stop = asyncio.Event()
+    calls = []
+
+    class _Pool:
+        def get_stats(self):
+            return {"pool_size": 8, "pool_available": 5, "requests_waiting": 0}
+
+    class _Fleet:
+        def keys(self):
+            return tuple(
+                [pool_supervisor.SlotKey("foreground", index) for index in range(4)]
+                + [pool_supervisor.SlotKey("wake", index) for index in range(2)]
+                + [pool_supervisor.SlotKey("heavy", index) for index in range(2)]
+            )
+
+        def healthy_capacity(self, pool, *, stale_sec):
+            return 4 if pool == "foreground" else 2
+
+        def snapshots(self):
+            return {key: None for key in self.keys()}
+
+        def broker_snapshot(self):
+            return {
+                "limit": 4,
+                "total_granted": 0,
+                "granted": {"foreground": 0, "wake": 0, "heavy": 0},
+                "waiting": {"foreground": 0, "wake": 0, "heavy": 0},
+            }
+
+    monkeypatch.setattr(serve_worker.db, "get_pool", lambda: _Pool())
+
+    def _record(worker_id, **kwargs):
+        calls.append((worker_id, kwargs))
+        stop.set()
+
+    monkeypatch.setattr(jobs_store, "record_worker_heartbeat", _record)
+    asyncio.run(
+        serve_worker._fleet_heartbeat_loop(
+            "worker",
+            "foreground",
+            _Fleet(),
+            stop,
+            interval=0.01,
+        )
+    )
+
+    state = calls[0][1]["runtime_state"]
+    encoded = json.dumps(state, sort_keys=True)
+    assert len(encoded.encode("utf-8")) < 4096
+    for forbidden in (
+        "user_id",
+        "job_id",
+        "claimed_by",
+        "slot_generation",
+        "provider_url",
+        "message_text",
+        "memory_content",
+        "exception",
+    ):
+        assert forbidden not in encoded
 
 
 # ------------------------------------------------------------------

@@ -22,7 +22,7 @@ def test_workers_alive_false_on_empty_table():
 
 def test_workers_alive_true_after_heartbeat():
     _clear()
-    jobs_store.record_worker_heartbeat("w1")
+    jobs_store.record_worker_heartbeat("w1", pool="foreground")
     assert jobs_store.workers_alive() is True
     _clear()
 
@@ -40,8 +40,8 @@ def test_workers_alive_false_when_only_heartbeat_is_stale():
 
 def test_record_worker_heartbeat_upserts_same_worker_id():
     _clear()
-    jobs_store.record_worker_heartbeat("w1")
-    jobs_store.record_worker_heartbeat("w1")
+    jobs_store.record_worker_heartbeat("w1", pool="foreground")
+    jobs_store.record_worker_heartbeat("w1", pool="foreground")
     with db.get_pool().connection() as conn:
         rows = conn.execute("SELECT worker_id FROM v2_worker_heartbeats").fetchall()
     assert [r[0] for r in rows] == ["w1"]
@@ -50,9 +50,48 @@ def test_record_worker_heartbeat_upserts_same_worker_id():
 
 def test_live_worker_capacity_sums_turn_slots_and_ignores_genesis():
     _clear()
-    jobs_store.record_worker_heartbeat("turn-a", capacity=4)
-    jobs_store.record_worker_heartbeat("turn-b", capacity=8)
-    jobs_store.record_worker_heartbeat("genesis", kind="genesis", capacity=0)
+    jobs_store.record_worker_heartbeat("turn-a", pool="foreground", capacity=4)
+    jobs_store.record_worker_heartbeat("turn-b", pool="heavy", capacity=8)
+    jobs_store.record_worker_heartbeat(
+        "genesis", pool="control", kind="genesis", capacity=0
+    )
     assert jobs_store.live_worker_count() == 2
     assert jobs_store.live_worker_capacity() == 12
+    assert jobs_store.live_worker_count(pool="foreground") == 1
+    assert jobs_store.live_worker_capacity(pool="foreground") == 4
+    assert jobs_store.live_worker_capacity(pool="heavy") == 8
+    _clear()
+
+
+def test_worker_liveness_can_be_restricted_to_foreground_pool():
+    _clear()
+    jobs_store.record_worker_heartbeat("heavy-only", pool="heavy", capacity=2)
+
+    assert jobs_store.workers_alive() is True
+    assert jobs_store.workers_alive(pool="foreground") is False
+    assert jobs_store.workers_alive(pool="heavy") is True
+    _clear()
+
+
+def test_heartbeat_runtime_state_replaces_previous_snapshot():
+    _clear()
+    jobs_store.record_worker_heartbeat(
+        "turn-a",
+        pool="foreground",
+        capacity=4,
+        runtime_state={"configured": 4, "healthy": 3},
+    )
+    jobs_store.record_worker_heartbeat(
+        "turn-a",
+        pool="foreground",
+        capacity=2,
+        runtime_state={"configured": 4, "healthy": 2},
+    )
+
+    with db.get_pool().connection() as conn:
+        row = conn.execute(
+            "SELECT pool, runtime_state FROM v2_worker_heartbeats WHERE worker_id='turn-a'"
+        ).fetchone()
+
+    assert row == ("foreground", {"configured": 4, "healthy": 2})
     _clear()

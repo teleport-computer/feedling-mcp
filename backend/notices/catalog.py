@@ -29,6 +29,9 @@ ERROR_CLASSES = frozenset({
     "rate_limited",
     "upstream_unavailable",
     "turn_timeout",
+    "platform_queue_timeout",
+    "platform_execution_timeout",
+    "provider_timeout",
     "provider_empty_reply",
     "reply_parse_failed",
     "unknown",
@@ -101,6 +104,12 @@ _CATALOG: dict[str, tuple[str, str]] = {
         "provider_transient", "你的模型服务暂时不可用，稍后会自动恢复。"),
     "turn_timeout": (
         "system", "这轮回复超时了，稍后再试。"),
+    "platform_queue_timeout": (
+        "system", "这条消息没有及时开始处理，也没有生成回复。请稍后再试，不要连续发送。"),
+    "platform_execution_timeout": (
+        "system", "这轮回复因系统执行异常没有完成，也不会重复生成回复。请稍后再试，不要连续发送。"),
+    "provider_timeout": (
+        "provider_transient", "你配置的模型服务这次没有及时响应。请先检查模型渠道稳定性，不要连续重发。"),
     "provider_empty_reply": (
         "provider_transient",
         "你的模型服务这次返回了空回复，稍后再试；反复出现请检查模型渠道或中转的稳定性。"),
