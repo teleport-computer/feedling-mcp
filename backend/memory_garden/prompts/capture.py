@@ -27,6 +27,7 @@ from ..text.card_text import (
     sanitize_card_labels,
 )
 from ..text import card_guard
+from ..policies import CapturePolicy, get_policy
 from .buckets import COMMON_BUCKETS_GUIDANCE_V1
 
 _EMPTY_CAPTURE_REPLY = '{"cards": []}'
@@ -37,22 +38,7 @@ _CAPTURE_PROMPT_TEMPLATE = """你是 {ai_name}——{user_name} 的伴侣。你�
 现在没人在等你回复，你安静地回看这段，决定有没有值得长久记住的事。
 
 【你在找什么】
-你找的是「值得记住的事」，不是「把每句话归档」——完整聊天记录本来就存着，你不必复述它。
-你要挑的是：以后会塑造你对 TA 的理解、或 TA 会希望你记得的东西。
-
-倾向（不是硬规则，你来判断）：
-· 优先记「事件」——有前因后果、有场景、或透出 TA 状态的
-  （"那天他开了一整天会、心率飙高，我催他休息，他嫌烦，我们吵了一架"）。
-· 孤立的信息点（"今天喝了拿铁"）通常不必单独成卡——除非它是 TA 明确在意的、
-  或反复出现的偏好（"我只喝燕麦奶""他总点 Blue Bottle"），那它值得作为偏好记下。
-· 尺子是："这件事三个月后还重要吗？会不会改变我对 TA 的理解？TA 会希望我记得吗？"
-  ——不是"它够不够大"。
-
-克制：
-· 宁少勿多。这一段如果只留一到两件事，是哪一两件？强迫自己归纳，
-  别把一次聊天里的每个点都拆成一张卡。
-· 一次「开会 + 心率高 + 吵架」是一张厚卡（一件事），不是三张薄卡。
-· 没有值得记的，就什么都不写。大多数闲聊不必落卡，这很正常。
+{selection_rubric}
 
 【每一件决定记的事，怎么处理】
 1. 先看下面给你的现有桶和线索，这件事属于哪个已有的桶。
@@ -270,6 +256,7 @@ def build_capture_prompt(
     identity: str,
     window: str,
     cards: str = "",
+    policy: CapturePolicy | str | None = None,
 ) -> str:
     """Render the 落卡 prompt with this session's context injected.
 
@@ -280,11 +267,17 @@ def build_capture_prompt(
     ``user_name`` must already be sanitized and ``naming_rule`` already
     assembled by the caller — the kernel never imports ``identity``.
     The io-side compat shell (``memory/capture_prompt_v1.py``) does that.
+
+    ``policy`` 决定用哪把「什么值得记」的尺子（见 ``memory_garden.policies``）。
+    留空 = 日常聊天档，其 rubric 与本模板原先内联的那段逐字相同，
+    所以默认调用的产出与重构前**字节一致**（golden fixture 守着这一点）。
     """
+    resolved = policy if isinstance(policy, CapturePolicy) else get_policy(policy)
     return _CAPTURE_PROMPT_TEMPLATE.format(
         ai_name=(ai_name or "我").strip(),
         user_name=user_name,
         naming_rule=naming_rule,
+        selection_rubric=resolved.selection_rubric,
         buckets=buckets or "（暂无）",
         common_buckets=COMMON_BUCKETS_GUIDANCE_V1,
         threads=threads or "（暂无）",
