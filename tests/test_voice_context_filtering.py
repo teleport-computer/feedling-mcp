@@ -96,7 +96,6 @@ def test_conversation_rows_keep_typed_dots_and_the_call_record_but_drop_artifact
 def test_v2_prompt_never_replays_voice_noise_and_labels_the_call_record():
     messages = context.build_turn_messages(
         system_prompt="SYS",
-        summary="",
         tail=_voice_rows(),
     )
     rendered = "\n".join(str(message.get("content") or "") for message in messages)

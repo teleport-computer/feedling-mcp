@@ -367,6 +367,17 @@ def test_p0_mid_turn_fold_no_restart_no_debounce(monkeypatch):
         apply_pending_effects=_apply_effects,
         read_messages_since=lambda uid, since_ts: list(live_rows["rows"]),
         read_tail_after_seq=lambda *_args, **_kwargs: [msg_a],
+        read_recent_turns=lambda _uid, _max_turns, row_cap, *, through_seq: {
+            "rows": [
+                {
+                    **row,
+                    "_genuine_user": row.get("role") in {"user", "human"},
+                }
+                for row in live_rows["rows"]
+                if int(row.get("seq") or 0) <= int(through_seq)
+            ][-int(row_cap):],
+            "source_truncated": False,
+        },
     )
 
     status = asyncio.run(worker.process_job(

@@ -227,6 +227,7 @@ def test_reconciled_human_message_is_replied_and_advances_seq_cursor(monkeypatch
         resolve_provider=lambda _uid: (config, {}),
         mint_enclave_token=lambda _uid: "rt",
         read_tail_after_seq=serve_worker._read_tail_after_seq,
+        read_recent_turns=serve_worker._read_recent_turns,
         apply_pending_effects=serve_worker._apply_pending_effects_for_user,
     )
 

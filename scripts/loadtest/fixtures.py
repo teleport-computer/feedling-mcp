@@ -7,17 +7,20 @@ from copy import deepcopy
 SHARED_TURN_FIXTURES = [
     {
         "prompt": "今天过得怎么样",
-        "summary": "",
+        "agent_memory": "",
+        "user_profile": "",
         "tail": [{"role": "user", "content": "今天过得怎么样"}],
     },
     {
         "prompt": "我还是有点焦虑，面试没过",
-        "summary": "",
+        "agent_memory": "",
+        "user_profile": "",
         "tail": [{"role": "user", "content": "我还是有点焦虑，面试没过"}],
     },
     {
         "prompt": "帮我回忆一下上周说的那个计划",
-        "summary": "- 用户上周提到过一个计划",
+        "agent_memory": "- 用户上周提到过一个计划",
+        "user_profile": "- 用户希望延续之前讨论的计划",
         "tail": [{"role": "user", "content": "帮我回忆一下上周说的那个计划"}],
         # The production V2 loop is provider-native: the mock emits this
         # function call while tools are enabled, then plain final text on the

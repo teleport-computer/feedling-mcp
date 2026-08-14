@@ -121,7 +121,7 @@ async def _measure_v2_tokens_per_turn_async(
 def measure_v2_tokens_per_turn(
     fixtures: list[dict[str, Any]], *, mock_base_url: str
 ) -> float:
-    """Drive each fixture (``{"summary": str, "tail": list[dict]}``) through
+    """Drive each Profile-pair + tail fixture through
     the real ``model_api_runtime.v2.tool_loop.run_tool_loop`` path against a
     mock provider listening at ``mock_base_url``, and return mean tokens/turn
     (prompt_tokens + completion_tokens across every call in each turn).
@@ -142,7 +142,8 @@ def _build_messages_for_fixture(fixture: dict[str, Any]):
     tail = list(fixture.get("tail") or [])
     base = v2_context.build_turn_messages(
         system_prompt=v2_context.CHAT_SYSTEM_PROMPT,
-        summary=str(fixture.get("summary") or ""),
+        agent_memory=str(fixture.get("agent_memory") or ""),
+        user_profile=str(fixture.get("user_profile") or ""),
         tail=tail,
     )
 

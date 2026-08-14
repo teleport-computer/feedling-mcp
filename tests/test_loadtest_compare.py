@@ -97,11 +97,13 @@ def test_nonfinite_v2_mean_is_rejected(value):
 
 _FIXTURES = [
     {
-        "summary": "",
+        "agent_memory": "",
+        "user_profile": "",
         "tail": [{"role": "user", "content": "hello there"}],
     },
     {
-        "summary": "- earlier chit chat",
+        "agent_memory": "- earlier chit chat",
+        "user_profile": "- prefers conversational continuity",
         "tail": [
             {"role": "user", "content": "hi"},
             {"role": "openclaw", "content": "hey"},
@@ -171,7 +173,11 @@ def test_regression_result_is_the_nonzero_exit_signal():
 
 
 def test_measure_turn_tokens_counts_one_shot_unified_loop():
-    fixtures = [{"summary": "", "tail": [{"role": "user", "content": "hello"}]}]
+    fixtures = [{
+        "agent_memory": "",
+        "user_profile": "",
+        "tail": [{"role": "user", "content": "hello"}],
+    }]
 
     with MockProvider(reply="final", estimate_tokens=True) as p:
         report = measure_turn_tokens(fixtures, provider=p)
@@ -184,8 +190,16 @@ def test_measure_turn_tokens_counts_one_shot_unified_loop():
 
 
 def test_measure_turn_tokens_grows_with_prompt_size():
-    small = [{"summary": "", "tail": [{"role": "user", "content": "hi"}]}]
-    large = [{"summary": "S" * 8000, "tail": [{"role": "user", "content": "hi"}]}]
+    small = [{
+        "agent_memory": "",
+        "user_profile": "",
+        "tail": [{"role": "user", "content": "hi"}],
+    }]
+    large = [{
+        "agent_memory": "M" * 8000,
+        "user_profile": "profile",
+        "tail": [{"role": "user", "content": "hi"}],
+    }]
 
     with MockProvider(reply="final", estimate_tokens=True) as p:
         small_report = measure_turn_tokens(small, provider=p)
@@ -198,7 +212,11 @@ def test_measure_turn_tokens_grows_with_prompt_size():
 def test_multi_round_turn_costs_more_llm_calls_than_single_round():
     """The loop's cost is real and the instrument must see it. If this passes trivially
     (equal call counts), the mock is not driving the loop and the gate is blind."""
-    fixtures = [{"summary": "", "tail": [{"role": "user", "content": "hello"}]}]
+    fixtures = [{
+        "agent_memory": "",
+        "user_profile": "",
+        "tail": [{"role": "user", "content": "hello"}],
+    }]
 
     with MockProvider(reply="final", estimate_tokens=True) as p:
         single = measure_turn_tokens(fixtures, provider=p)
@@ -207,7 +225,8 @@ def test_multi_round_turn_costs_more_llm_calls_than_single_round():
     assert single["tokens_per_turn"] > 0
 
     two_round = [{
-        "summary": "",
+        "agent_memory": "",
+        "user_profile": "",
         "tail": [{"role": "user", "content": "hello"}],
         "tool_call": _TOOL_CALL,
     }]

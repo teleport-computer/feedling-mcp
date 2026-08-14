@@ -322,7 +322,6 @@ tests/test_redistill_server_merge.py
 tests/test_registry_db_fallback.py
 tests/test_relationship_days.py
 tests/test_release_pin_cas.py
-tests/test_repair_v2_bricked_frontier.py
 tests/test_reply_language.py
 tests/test_request_id.py
 tests/test_resident_maintenance.py
@@ -364,7 +363,6 @@ tests/test_users_channel_broadcast.py
 tests/test_users_reload_review_fixes.py
 tests/test_users_reload_targeted.py
 tests/test_v2_admission.py
-tests/test_v2_bounded_tail_degrade.py
 tests/test_v2_capacity_health.py
 tests/test_v2_capture_batch_protocol.py
 tests/test_v2_capture_lifecycle.py
@@ -401,14 +399,12 @@ tests/test_v2_model_identity.py
 tests/test_v2_multimodal_e2e.py
 tests/test_v2_no_cursor_ts.py
 tests/test_v2_no_dispatch_tiering.py
-tests/test_v2_optional_anchor.py
 tests/test_v2_p0_aba.py
 tests/test_v2_p0_exactly_once.py
 tests/test_v2_p0_seq_integrity.py
 tests/test_v2_perception_grounding.py
 tests/test_v2_profile.py
 tests/test_v2_profile_cards.py
-tests/test_v2_prompt_invariant.py
 tests/test_v2_provenance.py
 tests/test_v2_provider_usage_tool.py
 tests/test_v2_push_delivery.py

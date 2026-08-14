@@ -58,7 +58,7 @@ def test_bedrock_config_alias_and_default_endpoint() -> None:
 def test_bedrock_payload_has_native_tools_images_and_stable_cache_points() -> None:
     messages = v2_context.build_turn_messages(
         system_prompt=v2_context.CHAT_SYSTEM_PROMPT,
-        summary="- user likes tea",
+        agent_memory="- user likes tea",
         tail=[
             {
                 "role": "user",

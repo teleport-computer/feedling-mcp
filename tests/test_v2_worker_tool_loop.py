@@ -277,6 +277,45 @@ def _late_input_deps(uid: str, written: list[str]) -> worker.TurnDeps:
             if row.get("role") == "user"
         ]
 
+    def read_recent_turns(
+        _user_id: str,
+        max_turns: int,
+        row_cap: int,
+        *,
+        through_seq: int,
+    ):
+        rows = db.chat_messages_after_seq(
+            uid,
+            0,
+            limit=None,
+            through_seq=through_seq,
+        )
+        user_seqs = [
+            int(row["seq"])
+            for row in rows
+            if row.get("role") in {"user", "human"}
+        ][-int(max_turns):]
+        if not user_seqs:
+            return {"rows": [], "source_truncated": False}
+        window = [row for row in rows if int(row["seq"]) >= user_seqs[0]]
+        source_truncated = len(window) > int(row_cap)
+        rendered = [
+            {
+                "id": row["id"],
+                "seq": int(row["seq"]),
+                "ts": float(row.get("ts") or 0.0),
+                "role": (
+                    "user"
+                    if row.get("role") in {"user", "human"}
+                    else "assistant"
+                ),
+                "content": row.get("test_plaintext", ""),
+                "_genuine_user": row.get("role") in {"user", "human"},
+            }
+            for row in window[-int(row_cap):]
+        ]
+        return {"rows": rendered, "source_truncated": source_truncated}
+
     def apply(user_id: str):
         def dispatch(effect_type, payload):
             if effect_type != "reply":
@@ -300,6 +339,7 @@ def _late_input_deps(uid: str, written: list[str]) -> worker.TurnDeps:
         resolve_provider=lambda _user_id: (_BYOK, {}),
         mint_enclave_token=lambda _user_id: "rt",
         apply_pending_effects=apply,
+        read_recent_turns=read_recent_turns,
     )
 
 
@@ -384,6 +424,19 @@ def test_chat_worldbook_matches_current_turn_without_rewriting_user_text(
     monkeypatch.setattr(worker.db, "chat_max_seq", lambda _uid: 1)
     monkeypatch.setattr(worker.db, "chat_seqs_after_seq", lambda *_a, **_k: [1])
     deps.read_tail_after_seq = lambda *_a, **_k: list(turn_messages)
+    deps.read_recent_turns = (
+        lambda _uid, _max_turns, row_cap, *, through_seq: {
+            "rows": [
+                {
+                    **row,
+                    "_genuine_user": row.get("role") in {"user", "human"},
+                }
+                for row in turn_messages
+                if int(row.get("seq") or 0) <= int(through_seq)
+            ][-int(row_cap):],
+            "source_truncated": False,
+        }
+    )
     deps.read_worldbook_context = read_worldbook
 
     status = asyncio.run(
@@ -1942,6 +1995,21 @@ def test_new_turn_after_intermediate_failure_starts_after_failure_cursor(
         mint_enclave_token=lambda _user_id: "rt",
         apply_pending_effects=serve_worker._apply_pending_effects_for_user,
         read_tail_after_seq=_read_tail_after_seq,
+        read_recent_turns=lambda _user_id, max_turns, row_cap, *, through_seq: {
+            "rows": [
+                {
+                    **row,
+                    "_genuine_user": row.get("role") == "user",
+                }
+                for row in _read_tail_after_seq(
+                    _user_id,
+                    0,
+                    row_cap,
+                    through_seq=through_seq,
+                )
+            ],
+            "source_truncated": False,
+        },
     )
 
     phase = "crash"
