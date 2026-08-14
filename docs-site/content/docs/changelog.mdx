@@ -15,6 +15,19 @@ change must not be interpreted as an API guarantee.
   tools, but deletion is absent from their provider tool schema and rejected at
   the execution boundary. Foreground Chat memory deletion remains available.
 
+- **Runtime V2 Profile generation now recovers without another Chat turn.**
+  Retryable provider failures persist the exact Profile Job as delayed pending
+  work with exponential backoff from five minutes to six hours; malformed
+  Memory/User output receives at most three delayed retries. Provider setup
+  failures wait for a successful configuration change, source failures wait for
+  the Memory Garden witness to change, and unknown internal failures terminate
+  instead of looping. Delayed Jobs occupy no worker slot and do not make the
+  watchdog treat an idle pool as wedged. Ordinary post-Chat freshness checks do
+  not accelerate them, while a successful provider repair or the existing Dream
+  force trigger can make the same Job ready immediately. Runtime V2 semantic
+  conversation compaction remains removed, so Memory/User is its only long-term
+  semantic layer beside content-free deterministic history coverage.
+
 - **Hosted Runtime V2 isolates foreground Chat from background maintenance.**
   Chat/manual-wake, ambient-wake, and Heavy maintenance work now use separate
   capacity pools with one OS process per worker slot. Background work therefore
@@ -638,14 +651,15 @@ change must not be interpreted as an API guarantee.
   retries now fetch the requested message directly rather than searching only
   the newest 20 Chat rows. Requests with neither credential still fail closed.
 
-- **Runtime V2 can replace its legacy summary with a bounded Memory/User
-  profile.** The default-off `FEEDLING_V2_PROFILE_ENABLED` switch now gates
+- **Runtime V2 can supply a bounded Memory/User profile as its long-term
+  semantic layer.** The default-off `FEEDLING_V2_PROFILE_ENABLED` switch gates
   both generation and turn-time selection. Only an `ok`, non-disabled profile
   whose two encrypted fields both validate and decrypt is injected, as one
   early user-role block explicitly labeled model-derived untrusted data.
   Missing, pending, degraded, disabled, invalid, or undecryptable profiles keep
-  the rollback-compatible summary. Verbatim replay wins on conflict, coverage
-  gaps remain a separate late data notice, and OpenAI Chat and Anthropic cache
+  deterministic history coverage plus the bounded verbatim tail, but no legacy
+  semantic summary. Verbatim replay wins on conflict, coverage gaps remain a
+  separate late data notice, and OpenAI Chat and Anthropic cache
   breakpoints prioritize the stable profile ahead of an older recent-user
   boundary.
 
@@ -655,8 +669,9 @@ change must not be interpreted as an API guarantee.
   generates Memory/User fields with a bounded provider-call budget, and writes
   them through the encrypted profile CAS. Runtime V2 cutover, successful dream
   writes, and best-effort post-Chat freshness checks can enqueue the job;
-  degraded profiles respect exponential retry metadata, and the seven-day
-  stale floor runs independently of the dream setting. Profile failures remain
+  delayed retryable failures persist the exact Job without requiring another
+  Chat, and the seven-day stale floor runs independently of the dream setting.
+  Profile failures remain
   background-only and never create a Chat bubble or terminal turn error.
   Managed production, pre-production, and test Compose configurations now
   explicitly enable capture and dream in `serve-worker`. Profile generation
