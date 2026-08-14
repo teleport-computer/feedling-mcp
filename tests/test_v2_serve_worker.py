@@ -590,6 +590,58 @@ def test_v2_debug_trace_user_seam_resolves_store_and_preserves_duration(monkeypa
         ),
     ]
 
+
+def test_context_truncation_reaches_final_debug_event_without_upstream_content(
+    monkeypatch,
+):
+    from admin import data_track
+    from diagnostics import diagnostics_core
+
+    store = types.SimpleNamespace(user_id="usr_t047")
+    monkeypatch.setattr(
+        serve_worker.core_store,
+        "get_store",
+        lambda _uid: store,
+    )
+    persisted = []
+    monkeypatch.setattr(
+        diagnostics_core.debug_trace,
+        "trace_event",
+        lambda resolved_store, **event: persisted.append(
+            {"user_id": resolved_store.user_id, **event}
+        ),
+    )
+    deps = serve_worker.build_production_deps()
+    rare_secret = "T047_UPSTREAM_SECRET_MUST_NOT_REACH_ADMIN"
+
+    worker._emit_context_truncation_trace(
+        deps,
+        store.user_id,
+        {
+            "tail_window": {
+                "profile_cards_truncated": True,
+                "worldbook_truncated": False,
+            },
+            "messages": [],
+            "unexpected_upstream_content": rare_secret,
+        },
+    )
+
+    assert len(persisted) == 1
+    event = persisted[0]
+    assert event["type"] == "context.truncation"
+    assert event["detail"] == {
+        "counts": {
+            "profile_cards_truncated": 1,
+            "worldbook_truncated": 0,
+        }
+    }
+    raw_admin_response = json.dumps(
+        data_track._debug_event_public_json(event),
+        ensure_ascii=False,
+    )
+    assert rare_secret not in raw_admin_response
+
 def test_v2_mcp_mixed_reachable_and_unreachable_servers_are_traced_and_recorded(
     monkeypatch,
 ):

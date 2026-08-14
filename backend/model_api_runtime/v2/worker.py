@@ -1869,6 +1869,84 @@ def _provider_tool_surface_callback(
     return _emit
 
 
+_CONTEXT_TRUNCATION_TRACE_EVENT = "context.truncation"
+_CONTEXT_TRUNCATION_COUNT_KEYS = (
+    "profile_cards_truncated",
+    "worldbook_truncated",
+)
+
+
+def _emit_context_truncation_trace(
+    deps: TurnDeps,
+    user_id: str,
+    provider_request: dict | None,
+) -> None:
+    """Emit one content-free admin event for a real provider-input clip.
+
+    Profile truncation arrives in the final provider request's tail-window
+    metadata. World Book truncation is also derived from the final messages,
+    because compatibility callers without an adaptive tail window still apply
+    the shared World Book cap. Keeping both as integer counters lets the admin
+    redactor pass them without opening a string field that could later carry
+    card or World Book content.
+    """
+
+    if deps.emit_debug_trace is None or not isinstance(provider_request, dict):
+        return
+    tail_window = provider_request.get("tail_window")
+    tail_window = tail_window if isinstance(tail_window, dict) else {}
+    counts = {
+        key: int(bool(tail_window.get(key)))
+        for key in _CONTEXT_TRUNCATION_COUNT_KEYS
+    }
+    for message in provider_request.get("messages") or ():
+        if not isinstance(message, dict):
+            continue
+        content = message.get("content")
+        if not isinstance(content, str):
+            continue
+        if (
+            content.startswith(context.WORLD_BOOK_CONTEXT_HEADER + "\n")
+            and context.WORLD_BOOK_TRUNCATION_MARKER in content
+        ):
+            counts["worldbook_truncated"] = 1
+            break
+    if not any(counts.values()):
+        return
+    try:
+        deps.emit_debug_trace(
+            user_id,
+            _CONTEXT_TRUNCATION_TRACE_EVENT,
+            status="warning",
+            summary="",
+            explain="",
+            detail={"counts": counts},
+        )
+    except Exception as exc:  # noqa: BLE001 — observability cannot fail a turn
+        log.warning(
+            "[v2.truncation_trace] emit failed user=%s code=%s",
+            user_id,
+            type(exc).__name__.lower(),
+        )
+
+
+def _tail_window_callback(
+    tm: "TurnMetrics | None",
+):
+    """Record tail-window metrics at the final provider window."""
+
+    if tm is None:
+        return None
+
+    def _record(item: dict) -> None:
+        tm.record_tail_window(
+            effective_turns=item["effective_turns"],
+            fallback=item["fallback"],
+        )
+
+    return _record
+
+
 async def _dispatch_mixed_tool_calls(
     tool_calls,
     *,
@@ -2774,7 +2852,12 @@ async def _record_trajectory(
     return recorded
 
 
-def _ledger_tapped_sink(recorder: v2_trajectory.TrajectoryRecorder | None):
+def _ledger_tapped_sink(
+    recorder: v2_trajectory.TrajectoryRecorder | None,
+    *,
+    deps: TurnDeps | None = None,
+    user_id: str = "",
+):
     """`recorder.record` plus the plaintext ledger mirror, for tool_loop.
 
     The foreground turn's provider calls reach the trajectory through
@@ -2782,12 +2865,20 @@ def _ledger_tapped_sink(recorder: v2_trajectory.TrajectoryRecorder | None):
     the latter would leave the lane that actually answers the user — the one
     whose failures the user sees — missing from the ledger.
     """
-    if recorder is None:
+    if recorder is None and (deps is None or deps.emit_debug_trace is None):
         return None
 
     async def _record(event_kind: str, payload: dict) -> None:
-        await recorder.record(event_kind, payload)
-        await _mirror_provider_attempt(recorder, event_kind, payload)
+        if recorder is not None:
+            await recorder.record(event_kind, payload)
+            await _mirror_provider_attempt(recorder, event_kind, payload)
+        if event_kind == "provider_request" and deps is not None:
+            await asyncio.to_thread(
+                _emit_context_truncation_trace,
+                deps,
+                user_id,
+                payload,
+            )
 
     return _record
 
@@ -9338,7 +9429,11 @@ async def _run_wake(
                 ),
                 fold_before_first=deps.read_messages_after_seq is not None,
                 on_progress=_report_turn_progress,
-                on_trajectory_event=_ledger_tapped_sink(trajectory_recorder),
+                on_trajectory_event=_ledger_tapped_sink(
+                    trajectory_recorder,
+                    deps=deps,
+                    user_id=user_id,
+                ),
                 outbound_blocking_read_tool_names=_PRIVATE_READ_TOOLS,
                 outbound_blocking_read_tool_predicate=_read_blocks_later_outbound,
                 max_tool_calls_per_round=MAX_TOOL_CALLS_PER_ROUND,
@@ -9356,16 +9451,7 @@ async def _run_wake(
                     PROMPT_ESTIMATOR_UTF8_BYTES_PER_TOKEN
                 ),
                 prompt_image_reserve_tokens=PROMPT_IMAGE_RESERVE_TOKENS,
-                on_tail_window=(
-                    (
-                        lambda item: tm.record_tail_window(
-                            effective_turns=item["effective_turns"],
-                            fallback=item["fallback"],
-                        )
-                    )
-                    if tm is not None
-                    else None
-                ),
+                on_tail_window=_tail_window_callback(tm),
                 on_prompt_frontier_exhaustion=(
                     tm.record_prompt_frontier_exhaustion
                     if tm is not None
@@ -9738,6 +9824,13 @@ async def _run_profile(
             {"lane": "profile", **payload},
             best_effort=True,
         )
+        if kind == "provider_request":
+            await asyncio.to_thread(
+                _emit_context_truncation_trace,
+                deps,
+                user_id,
+                payload,
+            )
 
     async def _fence_profile_write(effect: str) -> None:
         if claimed_by and not await asyncio.to_thread(
@@ -13390,7 +13483,11 @@ async def process_job(
             ),
             fold_before_first=seq_native and not ordered_chat_replies,
             on_progress=_report_turn_progress,
-            on_trajectory_event=_ledger_tapped_sink(trajectory_recorder),
+            on_trajectory_event=_ledger_tapped_sink(
+                trajectory_recorder,
+                deps=deps,
+                user_id=user_id,
+            ),
             extra_tool_specs=offered_mcp_tool_specs,
             refresh_extra_tool_specs=_current_offered_mcp_tool_specs,
             extra_mutating_tool_names=mcp_mutating_names,
@@ -13415,10 +13512,7 @@ async def process_job(
                 PROMPT_ESTIMATOR_UTF8_BYTES_PER_TOKEN
             ),
             prompt_image_reserve_tokens=PROMPT_IMAGE_RESERVE_TOKENS,
-            on_tail_window=lambda item: tm.record_tail_window(
-                effective_turns=item["effective_turns"],
-                fallback=item["fallback"],
-            ),
+            on_tail_window=_tail_window_callback(tm),
             on_prompt_frontier_exhaustion=(
                 tm.record_prompt_frontier_exhaustion
             ),

@@ -24,6 +24,8 @@ import pytest
 import conftest
 import db
 import provider_client
+import worldbook_match
+from admin import data_track as admin_data_track
 from provider_types import ToolCall, ToolExchange
 from capabilities import registry as cap_registry
 from core import envelope as core_envelope
@@ -425,6 +427,80 @@ def test_chat_worldbook_matches_current_turn_without_rewriting_user_text(
         for message in provider_messages
         if isinstance(message, dict) and message.get("role") == "system"
     )
+
+
+def test_worldbook_truncation_reaches_provider_and_data_track_without_content(
+    monkeypatch,
+):
+    monkeypatch.setenv("FEEDLING_V2_SELF_THINKING", "off")
+    uid = "u_toolloop_worldbook_truncation"
+    conftest.seed_user(uid)
+    _reset(uid)
+    jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("w-worldbook-truncation")
+    _patch_real_write(monkeypatch)
+
+    rare_secret = "T047_WORLDBOOK_SECRET_MUST_NOT_REACH_ADMIN"
+    raw_worldbook = (
+        "<world_book>\n"
+        + ("W" * worldbook_match.CONTEXT_CHAR_CAP)
+        + rare_secret
+        + "\n</world_book>"
+    )
+    calls = _script_provider(monkeypatch, [_text_round("bounded")])
+    traces = []
+    turn_messages = [{
+        "id": "m-worldbook-truncated",
+        "ts": 10.0,
+        "role": "user",
+        "content": "Tell me about this setting",
+    }]
+    deps = _deps(messages=turn_messages)
+    deps.read_summary = lambda _uid: ("", 0.0, 0)
+    deps.read_tail = lambda _uid, _after_ts, _limit: list(turn_messages)
+    deps.read_worldbook_context = lambda *_args, **_kwargs: {
+        "block": raw_worldbook,
+        "matched_names": [],
+    }
+    deps.emit_debug_trace = lambda user_id, event_type, **fields: traces.append(
+        {"user_id": user_id, "type": event_type, **fields}
+    )
+
+    status = asyncio.run(
+        worker.process_job(
+            job,
+            deps,
+            provider_config=_BYOK,
+            api_key=None,
+            runtime_token="rt",
+        )
+    )
+
+    assert status == "completed"
+    provider_payload = json.dumps(calls[0]["messages"], ensure_ascii=False)
+    assert worldbook_match.TRUNCATION_MARKER.strip() in provider_payload
+    truncation = next(
+        trace for trace in traces if trace["type"] == "context.truncation"
+    )
+    assert truncation == {
+        "user_id": uid,
+        "type": "context.truncation",
+        "status": "warning",
+        "summary": "",
+        "explain": "",
+        "detail": {
+            "counts": {
+                "profile_cards_truncated": 0,
+                "worldbook_truncated": 1,
+            }
+        },
+    }
+    raw_admin_material = json.dumps(
+        admin_data_track._debug_event_public_json(truncation),
+        ensure_ascii=False,
+    )
+    assert rare_secret not in provider_payload
+    assert rare_secret not in raw_admin_material
 
 
 def test_self_thinking_on_suppresses_native_reasoning(monkeypatch):
