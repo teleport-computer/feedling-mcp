@@ -302,10 +302,36 @@ enclave，发一条**真实加密**的用户消息：
              → 调 DeepSeek → POST /v1/chat/response
     回复     「好嘞阿哲，记住了：杭州后端、Go 选手、芒果过敏。」
 
+**落卡也真跑了**（等满 20 分钟静默窗口，走的是生产里同一个触发条件，不是改阈值凑出来的）：
+
+    capture/tick → 入队 → consumer 认领 → 蒸馏 → 封信封 → /v1/memory/actions
+
+    [健康] 阿哲对芒果过敏，吃了会起疹子
+    [工作] 阿哲是杭州后端开发，主力语言 Go
+
+三点都对：**卡数 = 2，正好压在 `conversation_capture` 的 `max_cards`
+上限**（这正是批 10 让 `parse_capture_cards` 真正消费 policy 之后才有的约束）；
+桶是中文单词、没有斜杠双语对；称呼用真名「阿哲」而不是「用户」。
+
 这条路径经过本批改动的全部 7 处 import（`agent_protocol_core.protocol_leak` /
 `self_thinking`、`memory_garden.text.card_guard` / `card_text`、
 `memory_garden.guards.dream_gates`、`memory_garden.prompts.buckets` /
 `migrate`）—— 任何一处解析失败，进程根本起不来。
+
+### 附带闭掉：dream 签名在**真实数据**上对拍 ✅
+
+风险最高的一项是签名漂移 —— 变了会让全体用户在部署当天误做梦。
+此前只用假卡验过；这次拿 V1 consumer**真写进去的**两张卡再验一次：
+
+    服务端 /v1/capture/tick 返回的 dream 快照
+        card_count=2  signature=92e30e1f5c13190d0c28915fdd5f6a5c
+
+    直接把这两张卡喂给内核 dream_snapshot()
+        card_count=2  seed_card_count=2
+        signature=92e30e1f5c13190d0c28915fdd5f6a5c   ← 完全一致
+
+同时 verdict 是 `night_not_due` —— 夜间窗口这层判据**留在 io 侧**、没被搬进内核，
+与设计一致。
 
 > 踩的坑：`tools/v1_envelope_roundtrip_test.py` 里的 `box_seal` 用的是
 > `salt=ek_pub||recipient` + 全零 nonce，与当前 enclave 的
