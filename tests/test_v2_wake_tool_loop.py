@@ -365,9 +365,15 @@ def test_wake_empty_tail_still_completes_no_no_user_messages_guard(monkeypatch):
         and not str(message.get("content") or "").startswith(
             v2_context.TEMPORAL_CONTEXT_HEADER
         )
+        and not str(message.get("content") or "").startswith(
+            v2_context.PROACTIVE_TURN_BOUNDARY_HEADER
+        )
     ]
     assert conversation_messages == []
-    assert not any(message.get("role") == "user" for message in seen["messages"])
+    assert seen["messages"][-1] == {
+        "role": "user",
+        "content": v2_context.PROACTIVE_TURN_BOUNDARY,
+    }
 
 
 # ------------------------------------------------------------------
