@@ -31,7 +31,7 @@ from pathlib import Path
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "backend"))
-from core import self_thinking as st  # noqa: E402
+from memory_garden.text import self_thinking as st  # noqa: E402
 
 ABSENT, COMPLETE, SILENT, FAILED = st.ABSENT, st.COMPLETE, st.SILENT, st.FAILED
 

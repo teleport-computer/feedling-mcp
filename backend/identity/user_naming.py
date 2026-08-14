@@ -107,7 +107,7 @@ def transcript_speaker_label(role: str, *, user_name: str, ai_name: str = "") ->
 # 安全边界不该承担一个 POS parser。真正的完整性靠:
 #   ① transcript_speaker_label —— 根因,不再把 "user:" 喂给模型;
 #   ② prompt 明令 —— 产品术语去掉「用户」前缀,只有模型知道自己想说哪个意思;
-#   ③ memory.card_text.count_user_token_residuals() —— 把残留量出来,不假装覆盖。
+#   ③ memory_garden.text.card_text.count_user_token_residuals() —— 把残留量出来,不假装覆盖。
 # 这一层只做「已观察到的、高置信的个人谓词」这一件小事。
 # ---------------------------------------------------------------------------
 
@@ -126,7 +126,7 @@ def rewrite_user_reference(text: str, user_name: str, subject: str = "") -> str:
     锚点必须**紧贴**「用户」——中间不许夹字,所以结构上不可能命中
     「用户+产品名词+…」。所有主语位规则都已删除(v4 被真例打穿:
     「用户界面这一版…」「用户最近流失很多」)。因此本函数**必然**有残留,
-    那不是 bug:残留由 memory.card_text.count_user_token_residuals() 计数,
+    那不是 bug:残留由 memory_garden.text.card_text.count_user_token_residuals() 计数,
     真正的完整性靠转写标签(transcript_speaker_label)和 prompt 明令。
     """
     raw = str(text or "")

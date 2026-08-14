@@ -13,7 +13,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 from enclave import readside  # noqa: E402
 from memory import actions as memory_actions  # noqa: E402
 from memory import service as memory_service  # noqa: E402
-from memory.source_policy import MEMORY_SOURCE_VALUES  # noqa: E402
+from memory_garden.types import MEMORY_SOURCE_VALUES  # noqa: E402
 
 
 # Known values observed in the 2026-07-29 production 500-user source sample.

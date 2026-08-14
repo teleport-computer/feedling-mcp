@@ -10,7 +10,7 @@ import json
 from typing import Any
 
 from identity.user_naming import _naming_rule
-from memory.prompts_v1 import COMMON_BUCKETS_GUIDANCE_V1
+from memory_garden.prompts.buckets import COMMON_BUCKETS_GUIDANCE_V1
 
 
 # Hard output contract appended to every JSON-emitting map/reduce prompt. Genesis

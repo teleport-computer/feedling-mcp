@@ -19,7 +19,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
 # Pure-function module — zero native deps, imports cleanly anywhere Python runs.
-from context_memory_selection import (  # noqa: E402
+from memory_garden.scoring.relevance import (  # noqa: E402
     char_bigrams as _char_bigrams,
     bigram_jaccard as _bigram_jaccard,
     select_context_memories as _select_context_memories,

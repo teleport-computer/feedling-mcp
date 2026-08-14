@@ -243,7 +243,7 @@ def chat_system_prompt(provider_config: Any = None) -> str:
     self-thinking kill switch is on and the selected V2 model supports it.
     Appended as a suffix so the cache-stable prefix is unchanged when the switch
     is off (byte-identical to today)."""
-    from core import self_thinking
+    from memory_garden.text import self_thinking
 
     if self_thinking.enabled() and _supports_mandatory_self_thinking(provider_config):
         return CHAT_SYSTEM_PROMPT + self_thinking.INSTRUCTION

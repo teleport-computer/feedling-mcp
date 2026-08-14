@@ -6,7 +6,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
-from memory_index_selector import select_memory_index_items  # noqa: E402
+from memory_garden.scoring.selector import select_memory_index_items  # noqa: E402
 
 
 def _index_item(

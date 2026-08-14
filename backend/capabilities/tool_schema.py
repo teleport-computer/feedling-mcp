@@ -21,7 +21,7 @@ from provider_types import ToolSpec
 from capabilities import registry
 # Card-writing rules live with the memory package (single source of truth shared
 # with the V1 guidance block); only the op names above are V2-specific.
-from memory import prompts_v1
+from memory_garden.prompts import buckets as prompts_v1
 from perception.agent_fields import (
     AGENT_PERCEPTION_SIGNALS,
     AGENT_SIGNAL_FIELDS,

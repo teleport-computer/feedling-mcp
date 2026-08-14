@@ -405,7 +405,7 @@ def test_v1_foreground_self_thinking_skips_only_exact_fable(
          patch.object(crc, "post_reply", return_value={"id": "reply-msg-fable"}):
         result_ts = crc._process_messages([msg])
 
-    from core import self_thinking
+    from memory_garden.text import self_thinking
 
     assert result_ts == pytest.approx(1112.75)
     instruction_present = self_thinking.INSTRUCTION.strip() in captured["message"]

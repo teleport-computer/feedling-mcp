@@ -228,7 +228,7 @@ if not _provisioned:
         "test_health_executor.py",
         "test_db_health_timeouts.py",
         "test_health_route_isolation.py",
-        # 记忆写入规则的 V1/V2 parity(2026-08-10)。纯:只读 memory.prompts_v1 与
+        # 记忆写入规则的 V1/V2 parity(2026-08-10)。纯:只读 memory_garden.prompts.buckets 与
         # capabilities.tool_schema 的常量,不碰 DB。
         "test_memory_write_guidance_parity.py",
         # enclave 批量解密的 trace 折叠(2026-08-10)。纯:debug_trace.trace_event

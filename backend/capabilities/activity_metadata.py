@@ -4,7 +4,7 @@ from __future__ import annotations
 from typing import Any, Mapping
 
 from capabilities import result_budget
-from memory.prompts_v1 import COMMON_BUCKETS_V1
+from memory_garden.prompts.buckets import COMMON_BUCKETS_V1
 
 
 _HISTORY_TOOL_NAMES = frozenset({"history_search", "history_fetch"})

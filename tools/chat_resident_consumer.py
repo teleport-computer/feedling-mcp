@@ -141,7 +141,7 @@ import generated_image
 
 # Shared torn-protocol-JSON leak detector (backend/core, pure). backend/ is on
 # sys.path via the insert above, so it imports as a top-level `core.*` name.
-from core import protocol_leak as _protocol_leak
+from memory_garden.text import protocol_leak as _protocol_leak
 # 世界书注入侧的标头/上限/截断标记与 V2 共用同一份定义(纯模块,无 enclave 依赖)。
 # 各写一份就会漂——本文件前台原本就漂成了没有 UNTRUSTED 标注的弱版本。
 import worldbook_match as _worldbook_match
@@ -154,10 +154,10 @@ from memory.capture_prompt_v1 import (
     sanitize_user_name,
 )
 from identity.user_naming import transcript_speaker_label
-from memory import card_guard
-from memory import dream_gates as memory_dream_gates
-from memory.prompts_v1 import normalize_bucket_language
-from memory.card_text import (
+from memory_garden.text import card_guard
+from memory_garden.guards import dream_gates as memory_dream_gates
+from memory_garden.prompts.buckets import normalize_bucket_language
+from memory_garden.text.card_text import (
     count_user_token_residuals,
     is_retryable_parse_error,
 )
@@ -166,7 +166,7 @@ from memory.dream_prompt_v1 import (
     build_dream_retry_prompt,
     parse_dream_consolidations,
 )
-from memory.migrate_prompt_v1 import build_migrate_prompt, parse_migrated_cards
+from memory_garden.prompts.migrate import build_migrate_prompt, parse_migrated_cards
 from chat.reply_language import (
     format_time_anchor,
     infer_reply_language_policy,
@@ -3916,13 +3916,13 @@ def _split_tagged_thinking(text: str) -> tuple[str, str]:
     plain terminal text where an upstream wrapper serialized reasoning as
     `<think>...</think>`, `<reasoning>...</reasoning>`, or `<thought>...</thought>`.
 
-    2026-08-08 起委托 ``core.self_thinking`` 的共享内核：此前 V1/V2 各一套判据、
+    2026-08-08 起委托 ``memory_garden.text.self_thinking`` 的共享内核：此前 V1/V2 各一套判据、
     各漏各的——这条正则要求开闭成对，一个孤立的 `</think>`（开标签在上游被吃掉）
     配不上对，于是整段思考原样进了用户气泡（prod 实例）。闸关掉时保留下面的
     原正则行为，逐字节不变。
     """
     raw = str(text or "")
-    from core import self_thinking as _st
+    from memory_garden.text import self_thinking as _st
 
     if _st.gate_enabled():
         # sanitize=False：本次统一的是剥离**判据**，V1 的展示格式（保留换行、
@@ -4557,7 +4557,7 @@ def _prefer_thinking(dst: AgentTurn, src: AgentTurn) -> None:
     if not dst.thinking_summary:
         take = True
     else:
-        from core import self_thinking as _self_thinking_v1
+        from memory_garden.text import self_thinking as _self_thinking_v1
 
         if _self_thinking_v1.enabled():
             take = src.thinking_self_authored and not dst.thinking_self_authored
@@ -13200,7 +13200,7 @@ def _memory_agent_parse_with_bounce(
     _note_agent_turn_success()
     parsed = parse(reply_text, strict=True)
     err = parsed[-1]
-    # 谓词与 V2 的 ParseRetry.should_retry 是同一个(memory.card_text)。两条 lane
+    # 谓词与 V2 的 ParseRetry.should_retry 是同一个(memory_garden.text.card_text)。两条 lane
     # 必须共用一份判据,否则同一个模型在托管和自建上会得到不同的重问行为 ——
     # json_decode_error 以前不在重问范围,注释说它「各有自己的退避路径」,实测那条
     # 路是空的:usr_450ee421e16a3b5a 连续 6 次失败,reask_count 全是 0。
@@ -15402,7 +15402,7 @@ def _process_messages(messages: list) -> float:
         # last message" framing) and the transcript header added below stays
         # topmost. The consumer's existing tagged-thinking extraction peels the
         # <think> block into thinking_summary. Same kill switch as V2.
-        from core import self_thinking as _self_thinking_v1
+        from memory_garden.text import self_thinking as _self_thinking_v1
 
         if (
             _self_thinking_v1.enabled()

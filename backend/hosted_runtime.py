@@ -5,7 +5,7 @@ import uuid
 from datetime import date
 from typing import Any
 
-from memory.prompts_v1 import MEMORY_WRITE_GUIDANCE_V1
+from memory_garden.prompts.buckets import MEMORY_WRITE_GUIDANCE_V1
 
 
 IDENTITY_STRING_FIELDS = (

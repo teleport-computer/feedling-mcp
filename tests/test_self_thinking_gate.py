@@ -13,7 +13,7 @@ import pathlib
 
 import pytest
 
-from core import self_thinking as st
+from memory_garden.text import self_thinking as st
 
 
 def test_two_blocks_both_stripped():

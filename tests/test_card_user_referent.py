@@ -21,7 +21,7 @@ from identity.user_naming import (  # noqa: E402
     _naming_rule,
     transcript_speaker_label,
 )
-from memory.card_text import count_user_token_residuals  # noqa: E402
+from memory_garden.text.card_text import count_user_token_residuals  # noqa: E402
 from identity.user_naming import rewrite_user_reference  # noqa: E402
 
 

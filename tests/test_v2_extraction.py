@@ -10,7 +10,7 @@ from memory.capture_prompt_v1 import (
     build_capture_retry_prompt,
     parse_capture_cards,
 )
-from memory.card_text import is_retryable_parse_error
+from memory_garden.text.card_text import is_retryable_parse_error
 from memory.dream_prompt_v1 import build_dream_prompt
 from model_api_runtime.v2 import extraction, worker
 

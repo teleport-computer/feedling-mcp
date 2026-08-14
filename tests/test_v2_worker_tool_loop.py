@@ -29,7 +29,7 @@ from admin import data_track as admin_data_track
 from provider_types import ToolCall, ToolExchange
 from capabilities import registry as cap_registry
 from core import envelope as core_envelope
-from core import self_thinking
+from memory_garden.text import self_thinking
 from core import store as core_store
 from model_api_runtime.v2 import cursor as v2_cursor
 from model_api_runtime.v2 import context as v2_context

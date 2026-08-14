@@ -27,7 +27,7 @@ from tools.e2e.probe_common import mem_fetch, mem_index, new_marker  # noqa: E40
 
 # card_text 的判据要在断言里复用 —— 探针和线上必须是同一把尺子。
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "backend"))
-from memory.card_text import card_text_rejection  # noqa: E402
+from memory_garden.text.card_text import card_text_rejection  # noqa: E402
 
 CAPTURE_POLL_SEC = 300.0
 POLL_EVERY_SEC = 15.0

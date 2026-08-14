@@ -19,7 +19,7 @@ WRITER_PATHS = [
 ]
 sys.path.insert(0, str(BACKEND))
 
-from memory.source_policy import (  # noqa: E402
+from memory_garden.types import (  # noqa: E402
     MEMORY_CAPTURE_MODE_VALUES,
     MEMORY_SOURCE_VALUES,
 )

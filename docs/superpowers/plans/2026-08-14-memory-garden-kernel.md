@@ -774,6 +774,32 @@ cd backend && python -m pytest ../tests -q 2>&1 | tail -20
 
 ---
 
+## ⚠️ 切调用方时的检查清单（批 5 踩过一次，切 V1/genesis 时照做）
+
+搬走一个模块、要删它的兼容壳之前，**必须把这四种引用形式都搜一遍**。
+批 5 只搜了前一种就删壳，结果 126 个测试集体 collection error：
+
+```
+1. from memory.prompts_v1 import foo      从模块导入名字   ← 容易想到
+2. from memory import prompts_v1          从包导入模块     ← 漏的就是这种
+3. import memory.prompts_v1               直接导入模块
+4. import memory_index_selector           顶层模块直接导入
+```
+
+第 2 种最阴：它读起来像「导入一个名字」，但 `prompts_v1` 是个模块，
+删掉文件之后报的是 `ImportError: cannot import name 'prompts_v1' from 'memory'`，
+和第 1 种的 `ModuleNotFoundError` 长得完全不一样。
+
+**另一条更重要的**：删除动作之前跑**全量**，不要只跑 `-k` 筛选的子集。
+批 5 跑的子集恰好没覆盖 `capabilities/tool_schema.py`，那正是漏网的那处。
+
+一条可直接用的搜索命令：
+
+```bash
+grep -rnE "from (memory|core) import [a-zA-Z_, ]*<模块名>|from (memory|core)\.<模块名> import|import (memory|core)\.<模块名>" \
+  backend/ tools/ tests/ --include="*.py"
+```
+
 ## 本轮不做（等 hx 拍板）
 
 - 批 5-8：切 V2 / V1 / genesis 的真实调用路径、拆 dream_scheduler

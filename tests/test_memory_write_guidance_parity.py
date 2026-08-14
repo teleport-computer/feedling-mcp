@@ -28,7 +28,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
 from capabilities import tool_schema  # noqa: E402
-from memory import prompts_v1  # noqa: E402
+from memory_garden.prompts import buckets as prompts_v1  # noqa: E402
 
 
 # --------------------------------------------------------------------------- #

@@ -209,19 +209,16 @@ result = chat_completion(runtime, messages)
 - ❌ 不准再造任何全局符号 re-export 门面；新代码直接 import 真正的模块。
 - ❌ 不准新建 `backend/app.py`。
 
-**一个有边界的例外：模块搬家时的路径兼容壳。**
-`memory_garden` 内核提取期间，被搬走的模块在原路径保留了一层 re-export
-（例：`memory/card_text.py` → `memory_garden/text/card_text.py`）。它与被禁的
-`app.py` 门面**不是一回事**：
+**关于 `memory_garden` 搬迁期的兼容壳**（2026-08-14 已收尾，仅存两个）：
 
-- 被禁的是**全局符号门面** —— 一个模块 re-export 整个后端的符号，谁都从它拿东西，
-  依赖关系彻底看不见。
-- 这里是**一对一的路径别名** —— 一个壳只转发一个模块，依赖关系不变，
-  只是文件搬了家。目的是让搬迁批次的正常路径逐字节不变，不必一次性改动
-  V1 consumer / V2 worker / genesis / enclave 等分散的调用点。
+内核提取时，被搬走的模块曾在原路径保留一层 re-export，让调用方不必一次性全改。
+**这些纯转发壳已全部删除**，调用方现在直接 `import memory_garden.*`。
 
-**它是过渡态，有退出条件**：调用方逐批改成直接 import `memory_garden.*` 之后，
-对应的壳即删除。新代码一律直接 import 内核，不要通过壳。
+仍保留的两个 —— `memory/capture_prompt_v1.py` 与 `memory/dream_prompt_v1.py` ——
+**不是 re-export 门面，是适配层**：内核不 import `identity`（那是宿主的身份体系），
+所以称呼规则的装配放在这两个文件里，它们有实际逻辑，不只是转发。
+
+新代码一律直接 import `memory_garden.*`。需要称呼装配时走上面这两个适配层。
 
 ---
 
