@@ -234,10 +234,9 @@ def main(
     logging.basicConfig(level=logging.INFO)
     log.info("[v2.turn_child] child process starting pid=%s worker_id=%s", os.getpid(), worker_id)
     try:
-        # Validate before db.init_schema() creates this fresh process's lazy
-        # pool.  The parent normally exports the computed ceiling before spawn;
-        # the child repeats the check so direct invocation cannot bypass it.
-        serve_worker._configure_db_pool_capacity(int(db_pool_max))
+        # Override the inherited parent value before this fresh process opens
+        # its own lazy pool. Every child owns exactly one turn slot.
+        db.configure_pool_max_size(int(db_pool_max))
         db.init_schema()
         serve_worker.wire_assembly()
         # 周期性全量自愈——和 serve_worker.main / backend lifespan 对称。turn_child

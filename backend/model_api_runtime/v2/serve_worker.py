@@ -371,58 +371,19 @@ def _dream_enabled_for_user(user_id: str) -> bool:
     return bool(settings.get("dream_enabled", True))
 
 
-def _configure_db_pool_capacity(max_workers: int) -> int:
-    """Guarantee enough pooled connections for every live V2 turn slot.
+def _runtime_db_pool_limits(
+    config: v2_pool_config.RuntimePoolConfig,
+) -> tuple[int, int]:
+    """Return explicit per-process ceilings for the isolated runtime layout.
 
-    ``effect_outbox.apply_pending_effects`` deliberately keeps one transaction
-    and generation lock open while its sink performs the durable write.  Most
-    sinks therefore need nested pooled connections.  A workspace batch holds
-    the outer generation transaction while up to
-    ``FEEDLING_V2_WORKSPACE_WRITE_PARALLELISM`` durable CAS operations run on
-    separate connections behind one process-wide admission ceiling. At the
-    same time, every other active turn can hold its own outer generation
-    transaction and one ordinary nested sink connection. With an unscaled
-    pool, those mixed drains can deadlock waiting for nested writes (the exact
-    silent concurrency cliff V2 is meant to remove). Conservatively reserve
-    two connections per turn slot, the process-wide workspace fan-out, and
-    four for queue, cursor, and reconciliation work. The historical backend
-    floor of 16 is retained for smaller pools.
-
-    An explicit operator override may raise the ceiling but may not undercut
-    the invariant.  This runs before ``db.init_schema()`` opens the lazy pool;
-    the spawned turn child inherits the resulting environment and revalidates
-    it at its own startup.
+    The parent owns queue/reaper/scheduler/metrics work and gets eight
+    connections.  Each one-slot child gets two: enough for the turn's outer
+    transaction plus one nested durable sink.  With the default eight slots,
+    the process fleet therefore caps pooled connections at ``8 + 8*2 = 24``.
     """
-    try:
-        slots = int(max_workers)
-    except (TypeError, ValueError) as exc:
-        raise RuntimeError("runtime slot count must be an integer > 0") from exc
-    if slots <= 0:
-        raise RuntimeError("runtime slot count must be an integer > 0")
-
-    workspace_parallelism = _workspace_write_parallelism()
-    required = max(16, (2 * slots) + workspace_parallelism + 4)
-    raw = os.environ.get("FEEDLING_DB_POOL_MAX_SIZE", "").strip()
-    if raw:
-        try:
-            configured = int(raw)
-        except ValueError as exc:
-            raise RuntimeError(
-                "FEEDLING_DB_POOL_MAX_SIZE must be an integer >= " + str(required)
-            ) from exc
-        if configured < required:
-            raise RuntimeError(
-                "FEEDLING_DB_POOL_MAX_SIZE="
-                + str(configured)
-                + " is too small for runtime_slots="
-                + str(slots)
-                + "; require >= "
-                + str(required)
-            )
-    else:
-        configured = required
-        os.environ["FEEDLING_DB_POOL_MAX_SIZE"] = str(configured)
-    return configured
+    if not config.slots:
+        raise RuntimeError("runtime must configure at least one slot")
+    return 8, 2
 
 
 # Keep the existing underscore-form scope stable so a future scope-enforcement
@@ -5791,7 +5752,7 @@ async def _serve(worker_id: str, *, poll_interval: float) -> None:
         spawn_target=turn_child.main,
         worker_id=worker_id,
         poll_interval=poll_interval,
-        db_pool_max=2,
+        db_pool_max=_runtime_db_pool_limits(config)[1],
         broker=enclave_broker,
     )
     # Synchronous: spawns the child process + starts the parent-side progress-pipe
@@ -5897,7 +5858,8 @@ def main() -> None:
     # without first applying an irreversible schema upgrade.
     worker_id = runner_identity.resolve_worker_id(_default_worker_id)
     config = v2_pool_config.RuntimePoolConfig.from_env()
-    db_pool_max = _configure_db_pool_capacity(len(config.slots))
+    db_pool_max, _child_db_pool_max = _runtime_db_pool_limits(config)
+    db.configure_pool_max_size(db_pool_max)
     # Schema single-point for this standalone process (idempotent — see
     # db.init_schema docstring). The ASGI backend's gunicorn on_starting also
     # runs this once per deploy; this worker is its own entrypoint in the runner

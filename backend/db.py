@@ -89,6 +89,21 @@ def _pool_max_size() -> int:
     return value
 
 
+def configure_pool_max_size(max_size: int | str) -> int:
+    """Set this process's explicit pool ceiling before the lazy pool opens."""
+    try:
+        value = int(str(max_size).strip())
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("database pool max size must be an integer >= 2") from exc
+    if value < 2:
+        raise RuntimeError("database pool max size must be an integer >= 2")
+    with _pool_lock:
+        if _pool is not None:
+            raise RuntimeError("database pool max size cannot change after pool startup")
+        os.environ["FEEDLING_DB_POOL_MAX_SIZE"] = str(value)
+    return value
+
+
 def get_pool() -> ConnectionPool:
     global _pool
     if _pool is not None:

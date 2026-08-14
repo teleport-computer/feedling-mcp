@@ -79,6 +79,7 @@ def test_default_fleet_builds_and_starts_eight_one_slot_children(monkeypatch):
         assert args[2] == spec.pool
         assert args[3] == spec.slot_id
         assert args[4] == tuple(sorted(spec.lanes))
+        assert args[5] == 2
         assert "chat" not in spec.lanes or spec.pool == "foreground"
         assert "profile" not in spec.lanes or key == pool_supervisor.SlotKey("heavy", 0)
 

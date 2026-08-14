@@ -360,34 +360,54 @@ def test_run_forever_backoff_is_bounded(monkeypatch):
     assert sleeps[-1] == serve_worker._RELAUNCH_BACKOFF_MAX_SEC
 
 
-def test_db_pool_capacity_scales_for_nested_effect_sinks(monkeypatch):
-    monkeypatch.delenv("FEEDLING_DB_POOL_MAX_SIZE", raising=False)
-    monkeypatch.delenv(
-        "FEEDLING_V2_WORKSPACE_WRITE_PARALLELISM", raising=False
-    )
+def test_runtime_db_pool_limits_are_parent_eight_and_each_child_two(monkeypatch):
+    from model_api_runtime.v2 import pool_config
 
-    # Sixteen simultaneous drains may each hold an outer generation connection.
-    # While one workspace batch occupies four shared nested CAS slots, the other
-    # turns may each need an ordinary nested sink connection too. The
-    # conservative floor is 2*16 + 4 workspace + 4 operational headroom.
-    assert serve_worker._configure_db_pool_capacity(16) == 40
-    assert __import__("os").environ["FEEDLING_DB_POOL_MAX_SIZE"] == "40"
+    config = pool_config.RuntimePoolConfig.from_env()
 
-
-def test_db_pool_capacity_rejects_explicit_saturation_cliff(monkeypatch):
-    monkeypatch.setenv("FEEDLING_V2_WORKSPACE_WRITE_PARALLELISM", "4")
-    monkeypatch.setenv("FEEDLING_DB_POOL_MAX_SIZE", "39")
-
-    with pytest.raises(RuntimeError, match=r"too small.*require >= 40"):
-        serve_worker._configure_db_pool_capacity(16)
+    assert len(config.slots) == 8
+    assert serve_worker._runtime_db_pool_limits(config) == (8, 2)
+    assert 8 + (len(config.slots) * 2) == 24
 
 
 @pytest.mark.parametrize("raw", ["0", "-1", "nope"])
-def test_db_pool_capacity_bad_override_fails_closed(monkeypatch, raw):
-    monkeypatch.setenv("FEEDLING_DB_POOL_MAX_SIZE", raw)
+def test_db_explicit_process_pool_limit_fails_closed(monkeypatch, raw):
+    monkeypatch.setattr(serve_worker.db, "_pool", None)
 
-    with pytest.raises(RuntimeError, match="FEEDLING_DB_POOL_MAX_SIZE"):
-        serve_worker._configure_db_pool_capacity(4)
+    with pytest.raises(RuntimeError, match="pool max size"):
+        serve_worker.db.configure_pool_max_size(raw)
+
+
+def test_db_explicit_child_pool_limit_is_effectively_two(monkeypatch):
+    monkeypatch.setattr(serve_worker.db, "_pool", None)
+    monkeypatch.delenv("FEEDLING_DB_POOL_MAX_SIZE", raising=False)
+
+    assert serve_worker.db.configure_pool_max_size(2) == 2
+    assert serve_worker.db._pool_max_size() == 2
+
+
+def test_main_configures_parent_pool_to_eight_before_db_startup(monkeypatch):
+    order = []
+    monkeypatch.setattr(
+        serve_worker.runner_identity, "resolve_worker_id", lambda _default: "worker"
+    )
+    monkeypatch.setattr(
+        serve_worker.db,
+        "configure_pool_max_size",
+        lambda value: order.append(("configure", value)) or value,
+    )
+    monkeypatch.setattr(
+        serve_worker.db, "init_schema", lambda: order.append(("init", None))
+    )
+    monkeypatch.setattr(serve_worker, "wire_assembly", lambda: None)
+    monkeypatch.setattr(
+        serve_worker.accounts_registry, "start_periodic_full_reload", lambda: None
+    )
+    monkeypatch.setattr(serve_worker, "_run_forever", lambda *_args: None)
+
+    serve_worker.main()
+
+    assert order == [("configure", 8), ("init", None)]
 
 
 @pytest.mark.parametrize("raw", ["0", "-1", "nan", "inf", "nope"])
