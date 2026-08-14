@@ -1,7 +1,8 @@
 # tools/e2e — 发版 P0 冒烟（一键）
 
 `docs/testing/RELEASE_TESTING_PROTOCOL.md` §3 的可执行实现。**只打 test 环境**
-（client 硬拒 prod host）；每个测试账号用完即删（test-account-hygiene）。
+（client 硬拒 prod host）。成功格子的测试账号用完即删；失败格子保留七天供诊断，
+避免 teardown 把同一轮 trace / trajectory / jobs 一并级联删除。
 
 ## 用法
 
@@ -9,9 +10,18 @@
 python3 tools/e2e/p0.py --list                 # 看格子和 key 就位情况
 python3 tools/e2e/p0.py                        # 全量（无 key 的格子自动 SKIP）
 python3 tools/e2e/p0.py --only vps-claude-code # 只跑指定格子
+python3 tools/e2e/p0.py --cleanup-expired-failures # P0 值班人清理满七天的失败现场
+python3 tools/e2e/p0.py --cleanup-orphans      # 立即清理所有遗留账号
 ```
 
 退出码：0 = 无硬失败（skip/warn 允许），1 = 有 FAIL（发版阻断）。
+
+失败现场固定写入 `~/.feedling-e2e-failures/<user_id>/`（目录 0700、文件
+0600），同时保留 `~/.feedling-e2e-orphans/<user_id>.json` 中的删号凭据。
+输出会打印 `user_id`、现场路径和清理命令。bundle 保存用户 trace、admin
+诊断快照及 job/trace 定位符；最终 provider 输入继续只存在服务器端加密
+trajectory 中，不额外复制一份明文。七天清理由当班 P0 operator 执行；有本地
+admin token 时，清理器必须从 admin 用户接口复核 404 后才删除本地现场。
 
 ## key 池
 

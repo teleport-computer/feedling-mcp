@@ -7,13 +7,17 @@
 
 Exit code: 0 = no hard failures (skips/warns allowed), 1 = at least one FAIL
 (protocol §8: any P0 fail blocks test→main). Test env only; every account
-created here is deleted in teardown.
+from a successful cell is deleted in teardown; failed cells retain a bounded
+diagnostic site for seven days.
 """
 from __future__ import annotations
 
 import argparse
+import json
+import shutil
 import sys
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
@@ -23,6 +27,7 @@ from tools.e2e.hosted import run_hosted_cell  # noqa: E402
 from tools.e2e.vps import run_vps_cell  # noqa: E402
 
 _ICON = {"ok": "✅", "fail": "❌", "skip": "⏭️", "warn": "⚠️"}
+_ADMIN_TOKEN_FILE = Path.home() / ".feedling" / "data-track-admin-token"
 
 
 def main() -> int:
@@ -31,10 +36,14 @@ def main() -> int:
     ap.add_argument("--list", action="store_true")
     ap.add_argument("--cleanup-orphans", action="store_true",
                     help="delete accounts left behind by crashed runs (leak manifest)")
+    ap.add_argument("--cleanup-expired-failures", action="store_true",
+                    help="delete preserved failure sites after their 7-day retention")
     args = ap.parse_args()
 
     if args.cleanup_orphans:
         return _cleanup_orphans()
+    if args.cleanup_expired_failures:
+        return _cleanup_expired_failures()
 
     pool = load_keys()
     only = {s.strip() for s in args.only.split(",") if s.strip()}
@@ -97,7 +106,37 @@ def p0_blocks_release(results: list[dict]) -> bool:
     return any(result.get("result") == "fail" for result in results)
 
 
-def _cleanup_orphans() -> int:
+def _admin_confirms_absent(api_url: str, user_id: str) -> tuple[bool | None, str]:
+    """Return True only for admin 404; None when no local admin token exists."""
+    import httpx as _httpx
+
+    try:
+        token = _ADMIN_TOKEN_FILE.read_text().strip()
+    except FileNotFoundError:
+        return None, "admin token unavailable"
+    if not token:
+        return None, "admin token empty"
+    try:
+        r = _httpx.get(
+            f"{api_url}/v1/admin/data-track/users/{user_id}",
+            headers={"X-Admin-Token": token}, timeout=30, verify=False,
+        )
+    except _httpx.TransportError as e:
+        return False, f"admin verification transport error: {e}"
+    if r.status_code == 404:
+        return True, "admin confirmed 404"
+    return False, f"admin verification returned {r.status_code}: {r.text[:80]}"
+
+
+def _remove_failure_evidence(user_id: str) -> None:
+    from tools.e2e.client import _FAILURES_DIR
+
+    target = _FAILURES_DIR / user_id
+    if target.is_dir() and target.parent == _FAILURES_DIR:
+        shutil.rmtree(target)
+
+
+def _cleanup_orphans(*, only_user_ids: set[str] | None = None) -> int:
     """Sweep ~/.feedling-e2e-orphans: reset each leaked account with its stored
     key. Manifest entries are removed ONLY on proof of deletion: 200 (deleted
     now) or 404 (account already gone). 401 means the key is invalid — the
@@ -112,6 +151,8 @@ def _cleanup_orphans() -> int:
 
     from tools.e2e.client import _ORPHANS_DIR, _refuse_prod
     files = sorted(_ORPHANS_DIR.glob("*.json")) if _ORPHANS_DIR.exists() else []
+    if only_user_ids is not None:
+        files = [f for f in files if f.stem in only_user_ids]
     if not files:
         print("no orphaned e2e accounts recorded")
         return 0
@@ -138,13 +179,47 @@ def _cleanup_orphans() -> int:
             continue
         if r.status_code in (200, 404):
             state = "deleted" if r.status_code == 200 else "already gone (404)"
-            print(f"  ✅ {user_id}: {state}")
+            verified, verify_detail = _admin_confirms_absent(api_url, user_id)
+            if verified is False:
+                print(f"  ❌ {user_id}: {state}, but {verify_detail}; kept")
+                remaining += 1
+                continue
+            suffix = f"; {verify_detail}" if verified else "; reset response is deletion proof"
+            print(f"  ✅ {user_id}: {state}{suffix}")
             f.unlink(missing_ok=True)
+            _remove_failure_evidence(user_id)
         else:
             # 401 lands here on purpose: invalid key ≠ deleted account.
             print(f"  ❌ {user_id}: {r.status_code} {r.text[:80]}; kept")
             remaining += 1
     return 1 if remaining else 0
+
+
+def _cleanup_expired_failures() -> int:
+    """Seven-day retention sweep. Account deletion precedes local evidence removal."""
+    from tools.e2e.client import FAILURE_RETENTION_DAYS, _FAILURES_DIR
+
+    if not _FAILURES_DIR.exists():
+        print("no preserved e2e failure sites recorded")
+        return 0
+    now = datetime.now(timezone.utc)
+    expired: set[str] = set()
+    remaining = 0
+    for run_dir in sorted(p for p in _FAILURES_DIR.iterdir() if p.is_dir()):
+        try:
+            manifest = json.loads((run_dir / "evidence.json").read_text())
+            created = datetime.fromisoformat(str(manifest["created_at"]).replace("Z", "+00:00"))
+            days = int(manifest.get("retention_days", FAILURE_RETENTION_DAYS))
+            if (now - created).total_seconds() >= days * 86400:
+                expired.add(str(manifest["user_id"]))
+        except Exception as e:  # noqa: BLE001
+            print(f"  ❌ {run_dir.name}: unreadable failure manifest ({e}); kept")
+            remaining += 1
+    if not expired:
+        print("no preserved e2e failure sites are past retention")
+        return 1 if remaining else 0
+    cleanup_rc = _cleanup_orphans(only_user_ids=expired)
+    return 1 if (remaining or cleanup_rc) else 0
 
 
 def _print_cell(r: dict) -> None:

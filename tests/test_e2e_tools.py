@@ -153,6 +153,9 @@ def test_hosted_503_retry_reuses_client_message_id(monkeypatch) -> None:
         def __init__(self):
             self.payloads: list[dict] = []
 
+        def record_failure_locator(self, _kind: str, _value: object) -> None:
+            pass
+
         def post(self, _path: str, *, json: dict) -> FakeResponse:
             self.payloads.append(json)
             return responses.pop(0)
@@ -310,6 +313,125 @@ def test_orphan_manifest_created_0600_and_removed_on_teardown(monkeypatch, tmp_p
     assert not path.exists()                          # manifest gone with the account
 
 
+def test_failed_context_preserves_account_and_private_diagnostic_site(
+    monkeypatch, tmp_path, capsys,
+) -> None:
+    import json as _json
+    import tools.e2e.client as client_mod
+
+    monkeypatch.setattr(client_mod, "_ORPHANS_DIR", tmp_path / "orphans")
+    monkeypatch.setattr(client_mod, "_FAILURES_DIR", tmp_path / "failures")
+    token_file = tmp_path / "admin-token"
+    token_file.write_text("admin-test")
+    monkeypatch.setattr(client_mod, "_ADMIN_TOKEN_FILE", token_file)
+    orphan = client_mod._write_orphan_manifest(TEST_API, "usr_failed", "secret-key")
+
+    calls: list[tuple[str, str]] = []
+
+    class DiagnosticHTTP:
+        def request(self, method, url, **_kw):
+            calls.append((method, url))
+            assert method == "GET"                   # reset must not be attempted
+            return FakeResponse(200, {
+                "events": [{"trace_id": "tr_turn", "job_id": "job_turn"}],
+            })
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(client_mod.httpx, "get", lambda *_a, **_kw: FakeResponse(
+        200, {"user": {"runtime": {"job_id": "job_admin", "trace_id": "tr_admin"}}},
+    ))
+    client = _client()
+    client.user_id = "usr_failed"
+    client.api_key = "secret-key"
+    client._http.close()
+    client._http = DiagnosticHTTP()  # type: ignore[assignment]
+    client._orphan_file = orphan
+    client.configure_failure_evidence(cell="hosted:test")
+    client.preserve_failure("continuity: target missing")
+
+    assert client.__exit__(None, None, None) is False
+
+    site = tmp_path / "failures" / "usr_failed"
+    evidence = _json.loads((site / "evidence.json").read_text())
+    assert orphan.exists()
+    assert not any(url.endswith("/v1/account/reset") for _method, url in calls)
+    assert evidence["user_id"] == "usr_failed"
+    assert evidence["locators"] == {
+        "job_id": ["job_admin", "job_turn"],
+        "trace_id": ["tr_admin", "tr_turn"],
+    }
+    assert evidence["final_provider_input"]["plaintext_copied_here"] is False
+    assert "secret-key" not in (site / "evidence.json").read_text()
+    assert (site.stat().st_mode & 0o777) == 0o700
+    assert all((path.stat().st_mode & 0o777) == 0o600 for path in site.iterdir())
+    output = capsys.readouterr().err
+    assert "FAILURE SITE PRESERVED" in output
+    assert "user_id=usr_failed" in output
+    assert str(site) in output
+
+
+def test_uncaught_exception_also_skips_teardown(monkeypatch, tmp_path) -> None:
+    import tools.e2e.client as client_mod
+
+    monkeypatch.setattr(client_mod, "_FAILURES_DIR", tmp_path / "failures")
+    monkeypatch.setattr(client_mod, "_ADMIN_TOKEN_FILE", tmp_path / "missing-token")
+    client = _client()
+    client.user_id = "usr_crash"
+    client._http.close()
+    methods: list[str] = []
+
+    class TraceHTTP:
+        def request(self, method, _url, **_kw):
+            methods.append(method)
+            return FakeResponse(200, {"events": []})
+
+        def close(self):
+            pass
+
+    client._http = TraceHTTP()  # type: ignore[assignment]
+    error = RuntimeError("runner crashed")
+    assert client.__exit__(RuntimeError, error, None) is False
+    assert methods and set(methods) == {"GET"}
+    assert (tmp_path / "failures" / "usr_crash" / "evidence.json").exists()
+
+
+def test_hosted_hard_step_marks_account_for_preservation(monkeypatch) -> None:
+    from tools.e2e.config import HostedCell
+
+    class FakeClient:
+        user_id = "usr_hosted_fail"
+
+        def __init__(self):
+            self.reason = ""
+            self.cell = ""
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def configure_failure_evidence(self, *, cell, artifacts=None):
+            self.cell = cell
+
+        def preserve_failure(self, reason):
+            self.reason = reason
+
+        def post(self, _path, *, json):
+            return FakeResponse(200, {"config": {"test_status": "failed"}})
+
+    fake = FakeClient()
+    monkeypatch.setattr(hosted.E2EClient, "provision", lambda **_kw: fake)
+    cell = HostedCell("guard", "openai", "KEY", ["model"])
+    result = hosted.run_hosted_cell(cell, {"KEY": "secret"})
+
+    assert result["result"] == "fail"
+    assert fake.cell == "hosted:guard"
+    assert fake.reason.startswith("setup:")
+
+
 def test_cleanup_orphans_semantics(monkeypatch, tmp_path) -> None:
     """200/404 → entry removed; 401 / transport error / bad JSON / non-test URL
     → kept, sweep continues, exit 1."""
@@ -322,6 +444,8 @@ def test_cleanup_orphans_semantics(monkeypatch, tmp_path) -> None:
     orphans = tmp_path / "orphans"
     orphans.mkdir()
     monkeypatch.setattr(client_mod, "_ORPHANS_DIR", orphans)
+    monkeypatch.setattr(client_mod, "_FAILURES_DIR", tmp_path / "failures")
+    monkeypatch.setattr(p0, "_ADMIN_TOKEN_FILE", tmp_path / "missing-admin-token")
 
     def manifest(name, api_url="https://test-api.feedling.app"):
         (orphans / f"{name}.json").write_text(_json.dumps(
@@ -356,3 +480,40 @@ def test_cleanup_orphans_semantics(monkeypatch, tmp_path) -> None:
     remaining = {f.name for f in orphans.glob("*.json")}
     assert remaining == {"usr_401.json", "usr_flap.json", "usr_prod.json", "corrupt.json"}
     assert not any("api.feedling.app/v1" in u and "test-api" not in u for u in posted)
+
+
+def test_expired_failure_cleanup_requires_admin_404_then_removes_site(
+    monkeypatch, tmp_path,
+) -> None:
+    import json as _json
+    from datetime import datetime, timedelta, timezone
+
+    import httpx
+    import tools.e2e.client as client_mod
+
+    orphans = tmp_path / "orphans"
+    failures = tmp_path / "failures"
+    orphans.mkdir()
+    site = failures / "usr_expired"
+    site.mkdir(parents=True)
+    (orphans / "usr_expired.json").write_text(_json.dumps({
+        "api_url": TEST_API, "user_id": "usr_expired", "api_key": "key-expired",
+    }))
+    (site / "evidence.json").write_text(_json.dumps({
+        "created_at": (datetime.now(timezone.utc) - timedelta(days=8)).isoformat(),
+        "retention_days": 7,
+        "user_id": "usr_expired",
+    }))
+    token_file = tmp_path / "admin-token"
+    token_file.write_text("admin-test")
+    monkeypatch.setattr(client_mod, "_ORPHANS_DIR", orphans)
+    monkeypatch.setattr(client_mod, "_FAILURES_DIR", failures)
+    monkeypatch.setattr(p0, "_ADMIN_TOKEN_FILE", token_file)
+    monkeypatch.setattr(httpx, "post", lambda *_a, **_kw: FakeResponse(200, {"deleted": True}))
+    monkeypatch.setattr(httpx, "get", lambda *_a, **_kw: FakeResponse(
+        404, {"error": "user_not_found"},
+    ))
+
+    assert p0._cleanup_expired_failures() == 0
+    assert not (orphans / "usr_expired.json").exists()
+    assert not site.exists()
