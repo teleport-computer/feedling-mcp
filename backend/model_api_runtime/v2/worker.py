@@ -286,11 +286,6 @@ def _positive_float_env(name: str, default: str) -> float:
     return value
 
 
-# —— 三个有界闸 ——（spec §6）
-# 每进程并发 job 数（= 并发回合数）。线上多进程 × CVM 共抢同一张 agent_jobs → 线性扩容。
-MAX_WORKERS = _positive_int_env("FEEDLING_V2_MAX_WORKERS", "4")
-
-
 # Capture is the one provider path whose disclosure lifetime is deliberately
 # coupled to a synchronous PostgreSQL transaction: D4, consent, Chat Clear, and
 # runtime-generation locks must stay held until the async provider attempt (and
@@ -305,13 +300,9 @@ _capture_provider_guard_executor_size = 0
 
 
 def _capture_provider_guard_pool_size() -> int:
-    try:
-        size = int(MAX_WORKERS)
-    except (TypeError, ValueError) as exc:
-        raise RuntimeError("FEEDLING_V2_MAX_WORKERS must be a positive integer") from exc
-    if size <= 0:
-        raise RuntimeError("FEEDLING_V2_MAX_WORKERS must be a positive integer")
-    return size
+    """Return the dedicated Capture guard size for this one-slot process."""
+
+    return 1
 
 
 def _reset_capture_provider_guard_executor_after_fork() -> None:

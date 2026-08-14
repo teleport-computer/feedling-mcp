@@ -6,6 +6,8 @@ stubbing enclave-bound reads, capability execution, and provider responses.
 from __future__ import annotations
 
 import asyncio
+import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -1333,10 +1335,33 @@ def test_run_worker_loop_propagates_unexpected_slot_exit(monkeypatch):
 
 
 def test_bounded_gates_exist():
-    assert isinstance(worker.MAX_WORKERS, int) and worker.MAX_WORKERS >= 1
     assert isinstance(worker.MAX_READ_ACTION_PARALLELISM, int)
     assert not hasattr(worker, "ENCLAVE_SEMAPHORE")
     assert isinstance(worker._new_direct_enclave_gate(), asyncio.Semaphore)
+
+
+def test_retired_max_workers_env_does_not_affect_worker_import():
+    backend = str(Path(__file__).parent.parent / "backend")
+    env = os.environ.copy()
+    env["FEEDLING_V2_MAX_WORKERS"] = "retired-invalid-value"
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                f"import sys; sys.path.insert(0, {backend!r}); "
+                "from model_api_runtime.v2 import worker; "
+                "print(worker._capture_provider_guard_pool_size())"
+            ),
+        ],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "1"
 
 
 @pytest.mark.parametrize("raw", ["0", "-1", "nan", "nope"])

@@ -2,8 +2,8 @@
 
 `serve_worker._heartbeat_loop` must derive the `capacity` it writes to the
 `kind='turn'` heartbeat row from the turn-child's ACTUAL health
-(`child_supervisor.ChildSupervisor.poll_liveness()`), not the constant
-`v2_worker.MAX_WORKERS` — otherwise a heartbeat tick ~10s after the watchdog
+(`child_supervisor.ChildSupervisor.poll_liveness()`), otherwise a heartbeat
+tick ~10s after the watchdog
 (Task 3) writes capacity=0 on a kill decision would silently re-advertise full
 capacity for a child that is mid-SIGKILL/respawn.
 
@@ -14,7 +14,7 @@ pytest-asyncio plugin in this repo, tests drive coroutines via `asyncio.run`.
 """
 import asyncio
 
-from model_api_runtime.v2 import jobs_store, serve_worker, slot_protocol, worker
+from model_api_runtime.v2 import jobs_store, serve_worker, slot_protocol
 
 
 class _FakeSupervisor:
@@ -29,13 +29,11 @@ class _FakeSupervisor:
         return self._snapshot
 
 
-def _drive_one_beat(monkeypatch, liveness: dict, *, max_workers: int = 4,
-                     pool: str = "foreground",
+def _drive_one_beat(monkeypatch, liveness: dict, *, pool: str = "foreground",
                      capacity_stale_sec: float = 45.0):
     """Run `_heartbeat_loop` until it records exactly one heartbeat, then stop it.
     Returns the captured `(worker_id, kwargs)` of the FIRST recorded call."""
     calls = []
-    monkeypatch.setattr(worker, "MAX_WORKERS", max_workers)
     monkeypatch.setattr(
         jobs_store,
         "record_worker_heartbeat",
@@ -62,7 +60,7 @@ def _drive_one_beat(monkeypatch, liveness: dict, *, max_workers: int = 4,
 
 def test_heartbeat_records_full_capacity_when_child_alive_and_fresh(monkeypatch):
     worker_id, kwargs = _drive_one_beat(
-        monkeypatch, {"alive": True, "last_progress_age_sec": 1.0}, max_workers=4)
+        monkeypatch, {"alive": True, "last_progress_age_sec": 1.0})
     assert worker_id == "worker-a"
     assert kwargs == {
         "capacity": 1,
@@ -74,7 +72,7 @@ def test_heartbeat_records_full_capacity_when_child_alive_and_fresh(monkeypatch)
 
 def test_heartbeat_records_zero_capacity_when_child_dead(monkeypatch):
     worker_id, kwargs = _drive_one_beat(
-        monkeypatch, {"alive": False, "last_progress_age_sec": 1.0}, max_workers=4)
+        monkeypatch, {"alive": False, "last_progress_age_sec": 1.0})
     assert worker_id == "worker-a"
     assert kwargs == {
         "capacity": 0,
@@ -91,7 +89,6 @@ def test_heartbeat_records_zero_capacity_when_progress_stale(monkeypatch):
     worker_id, kwargs = _drive_one_beat(
         monkeypatch,
         {"alive": True, "last_progress_age_sec": 999.0},
-        max_workers=4,
         capacity_stale_sec=45.0,
     )
     assert worker_id == "worker-a"
@@ -107,7 +104,6 @@ def test_heartbeat_records_full_capacity_when_progress_just_under_threshold(monk
     worker_id, kwargs = _drive_one_beat(
         monkeypatch,
         {"alive": True, "last_progress_age_sec": 10.0},
-        max_workers=4,
         capacity_stale_sec=45.0,
     )
     assert worker_id == "worker-a"
@@ -181,7 +177,7 @@ def test_heartbeat_survives_missing_last_progress_age_sec(monkeypatch):
     a missing age as "never reported progress" (i.e. stale/zero capacity), the
     same fail-safe direction `watchdog.should_kill` takes for `math.inf`."""
     worker_id, kwargs = _drive_one_beat(
-        monkeypatch, {"alive": True}, max_workers=4, capacity_stale_sec=45.0)
+        monkeypatch, {"alive": True}, capacity_stale_sec=45.0)
     assert worker_id == "worker-a"
     assert kwargs == {
         "capacity": 0,
@@ -195,7 +191,6 @@ def test_heartbeat_writes_the_explicit_pool_identity(monkeypatch):
     worker_id, kwargs = _drive_one_beat(
         monkeypatch,
         {"alive": True, "last_progress_age_sec": 1.0},
-        max_workers=2,
         pool="wake",
     )
 
