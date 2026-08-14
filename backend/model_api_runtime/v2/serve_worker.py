@@ -2623,6 +2623,7 @@ def _render_card_line(item: dict) -> str:
 
 
 _PROFILE_CARD_CONTENT_MAX_CHARS = 2_000
+PROFILE_CARD_BATCH_SIZE = 64
 
 
 def _render_profile_card(item: dict) -> str:
@@ -2644,7 +2645,10 @@ def _render_profile_card(item: dict) -> str:
     return "- " + " | ".join(parts)
 
 
-def _read_profile_cards(user_id: str) -> tuple[str, int, dict]:
+def _read_profile_cards(
+    user_id: str,
+    progress: Callable[[str], None] | None = None,
+) -> tuple[str, int, dict]:
     """Read every eligible Garden card or fail loudly on any truncation.
 
     The lightweight index proves the complete cardinality, then fetch obtains
@@ -2685,6 +2689,8 @@ def _read_profile_cards(user_id: str) -> tuple[str, int, dict]:
         raise RuntimeError(
             f"profile_cards_truncated:{user_card_count}/{len(items)}"
         )
+    if progress is not None:
+        progress("profile_index_completed")
     if not items:
         return "", 0, {
             "lane": "profile",
@@ -2693,22 +2699,33 @@ def _read_profile_cards(user_id: str) -> tuple[str, int, dict]:
     ids = [str(item.get("id") or "").strip() for item in items]
     if any(not memory_id for memory_id in ids):
         raise RuntimeError("profile_cards_id_missing")
-    fetched, fetch_status = memory_core.fetch(
-        store,
-        None,
-        {"ids": ids, "limit": 0, "include_sensitive": True},
-        post_enclave=_post,
-    )
-    fetched_items = (
-        fetched.get("items") if isinstance(fetched, dict) else None
-    )
-    if fetch_status != 200 or not isinstance(fetched_items, list):
-        raise RuntimeError(f"profile_cards_fetch_failed:{fetch_status}")
-    by_id = {
-        str(item.get("id") or ""): item
-        for item in fetched_items
-        if isinstance(item, dict)
-    }
+    by_id: dict[str, dict] = {}
+    batch_count = (len(ids) + PROFILE_CARD_BATCH_SIZE - 1) // PROFILE_CARD_BATCH_SIZE
+    for batch_index, offset in enumerate(
+        range(0, len(ids), PROFILE_CARD_BATCH_SIZE),
+        start=1,
+    ):
+        batch_ids = ids[offset : offset + PROFILE_CARD_BATCH_SIZE]
+        fetched, fetch_status = memory_core.fetch(
+            store,
+            None,
+            {"ids": batch_ids, "limit": 0, "include_sensitive": True},
+            post_enclave=_post,
+        )
+        fetched_items = (
+            fetched.get("items") if isinstance(fetched, dict) else None
+        )
+        if fetch_status != 200 or not isinstance(fetched_items, list):
+            raise RuntimeError(f"profile_cards_fetch_failed:{fetch_status}")
+        for item in fetched_items:
+            if isinstance(item, dict):
+                by_id[str(item.get("id") or "")] = item
+        if progress is not None:
+            progress(
+                "profile_fetch_batch_completed:"
+                f"{batch_index}:{batch_count}:{min(offset + len(batch_ids), len(ids))}:"
+                f"{len(ids)}"
+            )
     if len(by_id) != user_card_count or any(memory_id not in by_id for memory_id in ids):
         raise RuntimeError(
             f"profile_cards_truncated:{user_card_count}/{len(by_id)}"

@@ -64,7 +64,7 @@ class RuntimePoolConfig:
         )
         for index in range(heavy_slots):
             lanes = _HEAVY_LANES | ({"profile"} if index == 0 else set())
-            slots.append(SlotSpec("heavy", index, frozenset(lanes), 240.0, 1200.0))
+            slots.append(SlotSpec("heavy", index, frozenset(lanes), 120.0, 1200.0))
 
         return cls(
             slots=tuple(slots),

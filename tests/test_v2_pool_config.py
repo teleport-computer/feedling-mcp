@@ -56,7 +56,7 @@ def test_slots_have_fixed_lane_allowlists_and_initial_budgets(monkeypatch):
     )
     assert (slots["foreground-0"].stall_budget_sec, slots["foreground-0"].absolute_budget_sec) == (240.0, 1500.0)
     assert (slots["wake-0"].stall_budget_sec, slots["wake-0"].absolute_budget_sec) == (240.0, 900.0)
-    assert (slots["heavy-0"].stall_budget_sec, slots["heavy-0"].absolute_budget_sec) == (240.0, 1200.0)
+    assert (slots["heavy-0"].stall_budget_sec, slots["heavy-0"].absolute_budget_sec) == (120.0, 1200.0)
     assert sum("profile" in slot.lanes for slot in config.slots) == 1
 
 

@@ -29,7 +29,7 @@ def _deps(
         read_messages=lambda _uid: [],
         resolve_provider=lambda _uid: (object(), {}),
         mint_enclave_token=lambda _uid: "rt",
-        read_profile_cards=lambda _uid: cards,
+        read_profile_cards=lambda _uid, _progress=None: cards,
     )
 
 
@@ -187,7 +187,7 @@ def test_profile_provider_setup_failure_persists_degraded_backoff(monkeypatch):
     )
 
     deps = _deps()
-    deps.read_profile_cards = lambda _uid: pytest.fail(
+    deps.read_profile_cards = lambda _uid, _progress=None: pytest.fail(
         "provider setup failure must not decrypt Garden cards"
     )
     status = asyncio.run(
@@ -442,6 +442,66 @@ def test_profile_card_truncation_reaches_recorded_provider_request(monkeypatch):
         ensure_ascii=False,
     )
     assert rare_secret not in raw_outputs
+
+
+def test_profile_reports_read_provider_and_durable_write_boundaries(monkeypatch):
+    stages = []
+
+    def _read(_uid, progress):
+        progress("profile_index_completed")
+        progress("profile_fetch_batch_completed:1:1:1:1")
+        return (
+            "cards",
+            1,
+            {"lane": "profile", "profile_cards_truncated": False},
+        )
+
+    async def _generate(**kwargs):
+        await kwargs["llm"](
+            object(), [], max_tokens=10, temperature=0.2, timeout=90.0
+        )
+        return profile.ProfileGenerationResult(
+            fields={"memory": "事实", "user": "方式"},
+            reject_code="",
+            overlap=None,
+            provider_calls=1,
+        )
+
+    async def _cas(_uid, recompute):
+        document = await recompute({})
+        return _cas_result(document)
+
+    deps = _deps()
+    deps.read_profile_cards = _read
+    monkeypatch.setattr(worker, "_report_turn_progress", stages.append)
+    monkeypatch.setattr(profile, "generate_profile", _generate)
+    monkeypatch.setattr(profile_store, "update_profile_cas_async", _cas)
+    monkeypatch.setattr(
+        profile_store,
+        "build_profile_document",
+        lambda _uid, *, state, **_kwargs: {"state": state},
+    )
+    monkeypatch.setattr(
+        worker.provider_client,
+        "reliable_chat_completion_async",
+        lambda *_args, **_kwargs: asyncio.sleep(0, result={"reply": "ok"}),
+    )
+    monkeypatch.setattr(worker.db, "memory_profile_source_stats", lambda _uid: (1, "u1"))
+    monkeypatch.setattr(worker.jobs_store, "mark_completed", lambda *_a, **_kw: True)
+
+    assert asyncio.run(
+        worker._run_profile(12, "u", deps, object(), asyncio.Semaphore(1))
+    ) == "completed"
+    assert stages == [
+        "profile_index_started",
+        "profile_index_completed",
+        "profile_fetch_batch_completed:1:1:1:1",
+        "profile_cards_completed",
+        "profile_provider_request:1",
+        "profile_provider_response:1",
+        "profile_write_started",
+        "profile_write_completed",
+    ]
 
 
 def test_profile_roll_back_after_generation_blocks_profile_cas(monkeypatch):

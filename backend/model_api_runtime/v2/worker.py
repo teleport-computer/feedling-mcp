@@ -1369,7 +1369,7 @@ class TurnDeps:
     # tail-window metadata). Unlike read_memory_context this is fail-loud and
     # rejects any truncated cardinality read; bounded per-card content remains
     # observable through the metadata.
-    read_profile_cards: Callable[[str], tuple[str, int, dict]] | None = None
+    read_profile_cards: Callable[..., tuple[str, int, dict]] | None = None
     # (user_id, summary, enabled=...) -> ProfilePromptSelection. Production
     # performs a strict blob read and scoped enclave decrypt; any failure keeps
     # the rollback-compatible summary and returns a content-free reason.
@@ -9897,6 +9897,7 @@ async def _run_profile(
         attempts = _profile_attempt_count(previous)
         now_ts = time.time()
         await _fence_profile_write("failure metadata write")
+        _report_turn_progress("profile_write_started")
         return v2_profile_store.build_profile_document(
             user_id,
             state=("degraded" if previous.get("memory") is not None else "pending"),
@@ -9921,11 +9922,20 @@ async def _run_profile(
         nonlocal terminal_reject
         if deps.read_profile_cards is None:
             raise RuntimeError("profile_cards_reader_unavailable")
+        _report_turn_progress("profile_index_started")
+        loop = asyncio.get_running_loop()
+
+        def _thread_progress(stage: str) -> None:
+            loop.call_soon_threadsafe(_report_turn_progress, stage)
+
         async with enclave_sem:
             rendered, card_count, tail_window = await asyncio.to_thread(
                 deps.read_profile_cards,
                 user_id,
+                _thread_progress,
             )
+        await asyncio.sleep(0)
+        _report_turn_progress("profile_cards_completed")
         raw_count, max_updated_at = await asyncio.to_thread(
             db.memory_profile_source_stats,
             user_id,
@@ -9944,6 +9954,7 @@ async def _run_profile(
         if card_count == 0:
             terminal_reject = ""
             await _fence_profile_write("empty profile write")
+            _report_turn_progress("profile_write_started")
             return v2_profile_store.build_profile_document(
                 user_id,
                 state="empty",
@@ -9955,10 +9966,29 @@ async def _run_profile(
                     "retry_not_before": 0,
                 },
             )
+        provider_call_ordinal = 0
+
+        async def _profile_llm(*args, **kwargs):
+            nonlocal provider_call_ordinal
+            provider_call_ordinal += 1
+            ordinal = provider_call_ordinal
+            _report_turn_progress(f"profile_provider_request:{ordinal}")
+            kwargs.setdefault(
+                "progress_cb",
+                lambda stage, attempt: _report_turn_progress(
+                    f"profile_provider_{stage}:{ordinal}:{int(attempt)}"
+                ),
+            )
+            result = await provider_client.reliable_chat_completion_async(
+                *args, **kwargs
+            )
+            _report_turn_progress(f"profile_provider_response:{ordinal}")
+            return result
+
         generated = await v2_profile.generate_profile(
             provider_config=provider_config,
             rendered_cards=rendered,
-            llm=provider_client.reliable_chat_completion_async,
+            llm=_profile_llm,
             usage_out=(tm.add_call if tm is not None else None),
             trajectory_out=_trajectory,
             tail_window=tail_window,
@@ -9968,6 +9998,7 @@ async def _run_profile(
             return await _metadata_failure(previous, terminal_reject)
         terminal_reject = ""
         await _fence_profile_write("profile write")
+        _report_turn_progress("profile_write_started")
         return v2_profile_store.build_profile_document(
             user_id,
             state="ok",
@@ -10005,6 +10036,7 @@ async def _run_profile(
             user_id,
             _recompute,
         )
+        _report_turn_progress("profile_write_completed")
         if result.status == "superseded":
             winner_state = str(result.document.get("state") or "")
             if winner_state in {"ok", "empty"}:
@@ -10045,6 +10077,7 @@ async def _run_profile(
                 user_id,
                 lambda previous: _metadata_failure(previous, code),
             )
+            _report_turn_progress("profile_write_completed")
         except Exception as metadata_exc:  # noqa: BLE001
             log.warning(
                 "[v2.worker] profile failure metadata write failed user=%s code=%s",

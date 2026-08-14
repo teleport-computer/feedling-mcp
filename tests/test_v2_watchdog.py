@@ -146,6 +146,31 @@ def test_should_kill_true_when_progressing_turn_exceeds_absolute_timeout():
     assert watchdog.should_kill(liveness, **_kw(jobs_claimable=False)) is True
 
 
+def test_profile_batch_progress_survives_heavy_stall_but_absolute_budget_wins():
+    progressing_profile = {
+        "alive": True,
+        "event_loop_heartbeat_age_sec": 1.0,
+        "last_slot_progress_age_sec": 1.0,
+        "active_turn_count": 1,
+        "current_turn_age_sec": 1199.0,
+        "current_turn_stall_age_sec": 119.0,
+    }
+    assert watchdog.should_kill(
+        progressing_profile,
+        child_liveness_timeout_sec=45.0,
+        jobs_claimable=False,
+        turn_stall_timeout_sec=120.0,
+        turn_absolute_timeout_sec=1200.0,
+    ) is False
+    assert watchdog.should_kill(
+        {**progressing_profile, "current_turn_age_sec": 1201.0},
+        child_liveness_timeout_sec=45.0,
+        jobs_claimable=False,
+        turn_stall_timeout_sec=120.0,
+        turn_absolute_timeout_sec=1200.0,
+    ) is True
+
+
 # ---------------------------------------------------------------------------
 # _watchdog_loop — parent loop wiring
 # ---------------------------------------------------------------------------
