@@ -1,8 +1,8 @@
 # Runtime V2 Conversation Compaction Retirement Design
 
-**Date:** 2026-08-14  
-**Status:** Approved for implementation planning  
-**Target branch:** `refactor/v2-deterministic-only-coverage`  
+**Date:** 2026-08-14
+**Status:** Approved for implementation planning
+**Target branch:** `refactor/v2-deterministic-only-coverage`
 **Base branch:** `test`
 
 ## Objective
