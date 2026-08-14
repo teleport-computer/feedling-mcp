@@ -1114,6 +1114,7 @@ _EXTRACTION_FAILURE_REASONS = frozenset(
         "capture_provider_result_invalid",
         "dream_blast_radius_exceeded",
         "dream_no_memory_actions",
+        "dream_source_occurred_at_unavailable",
         "empty_reply",
         "extraction_memory_writer_unavailable",
         "memory_occurred_at_required",

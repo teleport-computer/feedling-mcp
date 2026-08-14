@@ -503,6 +503,10 @@ def test_empty_cards_is_not_an_error():
 # ---------- consolidations_to_actions ----------
 
 def test_consolidations_to_actions_supersedes_when_target_present():
+    cards = [
+        _existing("m1", occurred_at="2026-02-01T00:00:00Z"),
+        _existing("m2", occurred_at="2026-05-01T00:00:00Z"),
+    ]
     actions, added, superseded = extraction.consolidations_to_actions(
         [{
             "op": "merge",
@@ -510,22 +514,30 @@ def test_consolidations_to_actions_supersedes_when_target_present():
             "rationale": "同一事件的两条记录",
             "result": {"summary": "merged", "content": "merged body"},
         }],
-        occurred_at="T", source_ids=[], build_envelope=_env)
+        occurred_at="2099-01-01T00:00:00Z", source_ids=[], build_envelope=_env,
+        existing_cards=cards)
     assert added == 0 and superseded == 2
     assert actions[0]["type"] == "memory.supersede"
     assert actions[0]["supersedes"] == ["m1", "m2"]
     assert actions[0]["capture_mode"] == "memory_dream"
     assert actions[0]["envelope"]["type"] == "fact"
-    assert actions[0]["envelope"]["occurred_at"] == "T"
+    assert actions[0]["envelope"]["occurred_at"] == "2026-05-01T00:00:00Z"
 
 
-def _existing(memory_id, *, source="memory_capture", created_at="2026-07-01T00:00:00Z"):
+def _existing(
+    memory_id,
+    *,
+    source="memory_capture",
+    created_at="2026-07-01T00:00:00Z",
+    occurred_at="2026-06-01T00:00:00Z",
+):
     return {
         "id": memory_id,
         "summary": f"{memory_id} 的旧摘要",
         "content": f"{memory_id} 的旧卡正文，包含需要完整保留的具体事实。",
         "source": source,
         "created_at": created_at,
+        "occurred_at": occurred_at,
     }
 
 
@@ -616,8 +628,10 @@ def test_dream_guard_allows_prior_run_dream_output_to_evolve_immediately():
 
 def test_dream_guard_accepts_low_text_overlap_evolution_after_review():
     cards = [
-        {"id": "plan", "summary": "想去京都看红叶", "content": "希望今年秋天成行。"},
-        {"id": "ticket", "summary": "已经订好机票", "content": "11 月飞往关西机场。"},
+        {"id": "plan", "summary": "想去京都看红叶", "content": "希望今年秋天成行。",
+         "occurred_at": "2026-03-01T00:00:00Z"},
+        {"id": "ticket", "summary": "已经订好机票", "content": "11 月飞往关西机场。",
+         "occurred_at": "2026-05-01T00:00:00Z"},
     ]
 
     actions, _added, superseded = extraction.consolidations_to_actions(
@@ -629,6 +643,59 @@ def test_dream_guard_accepts_low_text_overlap_evolution_after_review():
     )
 
     assert len(actions) == 1 and superseded == 2
+
+
+def test_dream_merge_uses_latest_source_occurred_at_not_worker_now():
+    cards = [
+        _existing("feb", occurred_at="2026-02-08T09:00:00Z"),
+        _existing("mar", occurred_at="2026-03-17T10:00:00+08:00"),
+        _existing("may", occurred_at="2026-05-03"),
+    ]
+
+    actions, _added, superseded = extraction.consolidations_to_actions(
+        [_merge(["feb", "mar", "may"])],
+        occurred_at="2099-12-31T23:59:59Z",
+        source_ids=[],
+        build_envelope=_env,
+        existing_cards=cards,
+    )
+
+    assert superseded == 3
+    assert actions[0]["envelope"]["occurred_at"] == "2026-05-03"
+
+
+def test_dream_merge_with_today_source_naturally_keeps_today():
+    cards = [
+        _existing("old", occurred_at="2026-02-08T09:00:00Z"),
+        _existing("today", occurred_at="2026-08-14T07:30:00Z"),
+    ]
+
+    actions, _added, _superseded = extraction.consolidations_to_actions(
+        [_merge(["old", "today"])],
+        occurred_at="2099-12-31T23:59:59Z",
+        source_ids=[],
+        build_envelope=_env,
+        existing_cards=cards,
+    )
+
+    assert actions[0]["envelope"]["occurred_at"] == "2026-08-14T07:30:00Z"
+
+
+@pytest.mark.parametrize("bad_value", ["", None, "not-a-date", "1970-ish"])
+def test_dream_merge_fails_closed_when_any_source_time_is_unusable(bad_value):
+    cards = [
+        _existing("valid", occurred_at="2026-02-08T09:00:00Z"),
+        _existing("bad", occurred_at=bad_value),
+    ]
+
+    with pytest.raises(ValueError, match="dream_source_occurred_at_unavailable"):
+        extraction.consolidations_to_actions(
+            [_merge(["valid", "bad"])],
+            occurred_at="2099-12-31T23:59:59Z",
+            source_ids=[],
+            build_envelope=_env,
+            existing_cards=cards,
+        )
 
 
 def test_dream_prompt_pairs_evolution_example_with_independent_health_example():
