@@ -144,3 +144,40 @@ python3 tools/e2e/p0.py --list     # 先看有哪些格子、key 齐不齐
 | `RELEASE_TESTING_PROTOCOL.md` | **规范**:发版分层框架 + 能力矩阵 | 要推生产时 |
 | `CHAT_ACTIVITY_V2_MANUAL.md` | 手工用例:聊天活动轨迹 | 动了 turn-activity 时 |
 | `archive/` | 历史报告与模板,**不是规范** | 想看某次是怎么查的 |
+
+## 跑 E2E 之前:先确认你不会撞上部署重启
+
+`feedling-ci` 会在每次合入后自动 pin 一次 test 部署,**每 pin 一次 = test-api 重启一次**。
+2026-08-14 凌晨实测:**3 小时内部署了 12 次**,平均每 15 分钟一次。
+而一次 VPS P0 要跑 83~165 秒,整套 P0 更久 —— **撞上重启是常态,不是偶发**。
+
+撞上之后的症状**看起来像服务坏了**,实际只是你跑到一半它重启了:
+```
+httpx.ConnectError: EOF occurred in violation of protocol (_ssl.c:997)
+curl: SSL_ERROR_SYSCALL / HTTP 000
+consumer 退出:test-enclave TLS handshake timeout
+```
+
+**判据(可证伪,别靠感觉)**:
+
+```sh
+# 跑之前记一次
+before=$(curl -s https://test-api.feedling.app/healthz | python3 -c "import json,sys;print(json.load(sys.stdin)['uptime_s'])")
+# ... 跑你的 E2E ...
+# 跑完再记一次
+after=$(curl -s .../healthz | python3 -c "...")
+```
+- **`after` 比本次 run 的时长还小 ⇒ 中途重启过**,这次失败是环境的,**重跑**
+- `uptime_s` 很小(< 120s)就开跑 ⇒ 你正踩在重启窗口上,**等一会儿再开**
+
+**另一条必须做的对照**:本机代理(MacPacket/Shadowrocket)也会间歇抽风,
+症状同样是 `SSL_ERROR_SYSCALL`。所以判"服务挂了"之前**必须直连对照一次**:
+```sh
+curl -x http://127.0.0.1:1082 .../healthz    # 走代理
+curl --noproxy '*'            .../healthz    # 直连
+```
+**只有两者都挂,才是服务的问题。**
+
+⚠️ 反过来也要小心:**服务通 ≠ 你的修复在上面**。healthz 的 `release.git_commit`
+才是线上真正跑的那个 commit,合入到部署之间有 14~45 分钟的窗口。见 TESTING.md 里
+"E2E 绿 ≠ 修复生效"那条。
