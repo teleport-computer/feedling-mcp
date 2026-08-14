@@ -137,7 +137,7 @@ V2 走 provider 原生 tool-calling;resident 侧靠"在提示词里告诉模型�
 | | Runtime V2 | Resident consumer(由托管侧 agent-runner 生成家目录时) |
 |---|---|---|
 | 取出 | ✅ `backend/model_api_runtime/v2/serve_worker.py::_load_genesis_persona`(逐回合 JIT 解密 `genesis_persona` blob) | ✅ `backend/agent_runtime/spawners.py`:`_genesis_persona_content` 读同一个 blob,交给 `materialize_home(persona_content=...)` |
-| **拼进最终提示的位置** | ✅(实测)**人格在后**。`backend/model_api_runtime/v2/context.py` 里 `trusted_parts = [system_prompt, _RUNTIME_CONTEXT_POLICY]`,**之后**才 extend 人格块 | ✅(实测)**人格在前**。`backend/agent_runtime/spawners.py`:`system_append = f"{persona}\n\n---\n\n{system_append}"`,工具说明追加在后;identity block 再置于 persona 之前 |
+| **拼进最终提示的位置** | ✅(实测)**人格在后**。`backend/model_api_runtime/v2/context.py::trusted_parts` —— `[system_prompt, _RUNTIME_CONTEXT_POLICY]`,**之后**才 extend 人格块 | ✅(实测)**人格在前**。`backend/agent_runtime/spawners.py`:`system_append = f"{persona}\n\n---\n\n{system_append}"`,工具说明追加在后;identity block 再置于 persona 之前 |
 
 **这一格是整张表最值得看的一格。**两侧都有 persona、都不截断、blob 也是同一个 ——
 **所有"有没有"式的对照都会得出"parity 正常"**,而真实差异在**排第几**。
@@ -166,7 +166,7 @@ s = msgs[0]["content"]; print(len(s), s.find("<<<PERSONA-SENTINEL>>>"))
 | | Runtime V2 | Resident consumer |
 |---|---|---|
 | 执行入口 | ✅ `backend/model_api_runtime/v2/worker.py::_run_wake`(lane = heartbeat/scheduled/manual_wake/screen_watch) | ✅ `tools/chat_resident_consumer.py::_process_proactive_jobs` |
-| 拉取/触发 | ✅ 由 job 队列驱动(`agent_jobs`) | ✅ `tools/chat_resident_consumer.py` 轮询循环里按 `PROACTIVE_TICK_ENABLED` 打 tick,决策由后端下发 |
+| 拉取/触发 | ✅ 由 job 队列驱动(`agent_jobs`) | ✅ `tools/chat_resident_consumer.py::PROACTIVE_TICK_ENABLED` —— 轮询循环里据此打 tick,决策由后端下发 |
 
 ⚠️ **「要不要开口」不是一个决定,是两层,排查前先分清是哪一层坏了**:
 
@@ -208,21 +208,36 @@ s = msgs[0]["content"]; print(len(s), s.find("<<<PERSONA-SENTINEL>>>"))
 发现某一格过期(符号改名/文件搬家/机制变了),**直接改这里**,并更新顶部的快照提交。
 新增概念时照第 1–8 节的格式:**每格必须带证据等级标记,不许写「应该在 xxx」。**
 
-### 改完跑这个自检(它检查的是「本表的定位命令还跑不跑得通」)
+### 改完跑这个自检(路径 **和符号** 都查,查的是快照 `origin/test`)
 
 ```sh
 python3 - <<'PY'
-import re, pathlib
-s = pathlib.Path("docs/testing/RUNTIME_MAP.md").read_text()
-paths = {m.split("::")[0] for m in re.findall(r'`([^`]+?/[^`]*?\.py)(?:::[^`]*)?`', s)}
-bad = [p for p in sorted(paths) if not pathlib.Path(p).exists()]
-print("不可复跑:", bad or "无")
+import re, pathlib, subprocess
+S = pathlib.Path("docs/testing/RUNTIME_MAP.md").read_text()
+REF = "origin/test"          # 文档里的定位命令读的就是它,自检必须查同一个对象
+pairs = re.findall(r'`([^`]+?/[^`]*?\.py)::([A-Za-z_][A-Za-z0-9_]*)`', S)
+paths = {m.split("::")[0] for m in re.findall(r'`([^`]+?/[^`]*?\.py)(?:::[^`]*)?`', S)}
+def blob(f):
+    r = subprocess.run(["git","show",f"{REF}:{f}"],capture_output=True,text=True)
+    return r.stdout if r.returncode==0 else None
+cache = {f: blob(f) for f in paths}
+bad_paths   = sorted(f for f,c in cache.items() if c is None)
+bad_symbols = sorted({f"{f}::{sym}" for f,sym in pairs
+                      if cache.get(f) is not None and sym not in cache[f]})
+print("bad_paths  :", bad_paths   or "无")
+print("bad_symbols:", bad_symbols or "无")
 PY
 ```
 
-⚠️ **两个要点**:(a) 抽反引号里**所有带 `/` 的 python 路径**,别按 `backend/`/`tools/` 这种
-目录前缀筛;(b) 正则要求含 `/`,所以它同时把「必须写 repo-relative 路径」这条规矩也强制了。
-本表初版的自检写成了只匹配 `backend/` 和 `tools/` 开头的路径,于是
-`backend/core/self_thinking.py`(共享内核,两侧都调它)被自己的量具静默漏掉 ——
-自检报「全部通过」,而文档里那条命令实际 exit 128。
-**量具和被查对象有同一个盲区时,绿色是假的。**
+**为什么必须查符号,不能只查文件在不在**:本表的已知坑 #2 就是「符号会改名」
+(`_extract_visible_thinking` → `_split_tagged_thinking`)。
+只做 `Path.exists()` 的自检在改名时**照样报绿** —— 文件当然还在,
+而表里那个符号已经不存在了。**一个抓不到自己文档里列明的坑的自检,是装饰。**
+
+**另外两个口径**:
+(a) 查的必须是 `origin/test`(文档里的定位命令读的就是它),
+不是你本地 worktree —— 本地可能落后几十个提交,拿它自检等于验错对象。
+(b) 正则要求路径含 `/`,所以它同时强制了「本表只许写 repo-relative 路径」。
+
+⚠️ 术语表那一行的 `backend/model_api_runtime/v2/*` 之类是**目录指路**,不是定位目标,
+不带 `::symbol` 是故意的。其余每个事实格都应写成 `path.py::symbol`,否则自检覆盖不到它。
