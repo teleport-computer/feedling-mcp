@@ -16,7 +16,13 @@ def _enabled(monkeypatch):
     monkeypatch.setattr(worker, "_PROFILE_ENABLED", True)
 
 
-def _deps(cards=("cards", 1)):
+def _deps(
+    cards=(
+        "cards",
+        1,
+        {"lane": "profile", "profile_cards_truncated": False},
+    ),
+):
     return worker.TurnDeps(
         read_messages=lambda _uid: [],
         resolve_provider=lambda _uid: (object(), {}),
@@ -269,7 +275,13 @@ def test_empty_garden_completes_with_zero_provider_calls(monkeypatch):
         worker._run_profile(
             9,
             "u",
-            _deps(cards=("", 0)),
+            _deps(
+                cards=(
+                    "",
+                    0,
+                    {"lane": "profile", "profile_cards_truncated": False},
+                )
+            ),
             object(),
             asyncio.Semaphore(1),
         )
@@ -305,7 +317,13 @@ def test_empty_eligible_garden_persists_raw_source_witness(monkeypatch):
         worker._run_profile(
             10,
             "u",
-            _deps(cards=("", 0)),
+            _deps(
+                cards=(
+                    "",
+                    0,
+                    {"lane": "profile", "profile_cards_truncated": False},
+                )
+            ),
             object(),
             asyncio.Semaphore(1),
         )
@@ -318,6 +336,71 @@ def test_empty_eligible_garden_persists_raw_source_witness(monkeypatch):
         "max_updated_at": "2026-07-31T00:00:00Z",
         "generated_at": captured["document"]["source"]["generated_at"],
     }
+
+
+def test_profile_card_truncation_reaches_recorded_provider_request(monkeypatch):
+    provider_messages = []
+    events = []
+
+    async def _llm(_config, messages, **_kwargs):
+        provider_messages.append(messages)
+        return {"reply": '{"memory":"事实","user":"方式"}'}
+
+    async def _cas(_uid, recompute):
+        return _cas_result(await recompute({}))
+
+    build_document = profile_store.build_profile_document
+
+    def _build_document(user_id, **kwargs):
+        return build_document(
+            user_id,
+            **kwargs,
+            seal_text=lambda _uid, _text: {"body_ct": "ct", "nonce": "n"},
+        )
+
+    class Recorder:
+        async def record_best_effort(self, kind, payload):
+            events.append((kind, payload))
+            return True
+
+    monkeypatch.setattr(
+        worker.provider_client,
+        "reliable_chat_completion_async",
+        _llm,
+    )
+    monkeypatch.setattr(profile_store, "update_profile_cas_async", _cas)
+    monkeypatch.setattr(profile_store, "build_profile_document", _build_document)
+    monkeypatch.setattr(worker.db, "memory_profile_source_stats", lambda _uid: (1, "u1"))
+    monkeypatch.setattr(worker.jobs_store, "mark_completed", lambda *_a, **_kw: True)
+
+    status = asyncio.run(
+        worker._run_profile(
+            11,
+            "u",
+            _deps(
+                cards=(
+                    "rendered cards",
+                    1,
+                    {"lane": "profile", "profile_cards_truncated": True},
+                )
+            ),
+            object(),
+            asyncio.Semaphore(1),
+            trajectory_recorder=Recorder(),
+        )
+    )
+
+    assert status == "completed"
+    assert len(provider_messages) == 1
+    request = next(payload for kind, payload in events if kind == "provider_request")
+    assert request == {
+        "lane": "profile",
+        "tail_window": {
+            "lane": "profile",
+            "profile_cards_truncated": True,
+        },
+    }
+    assert "rendered cards" not in str(request)
 
 
 def test_profile_roll_back_after_generation_blocks_profile_cas(monkeypatch):
