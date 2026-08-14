@@ -408,12 +408,14 @@ admission。
 三池和单 Slot 进程隔离是 Runtime V2 的唯一拓扑，不保留 legacy 模式、共享多 Slot child，
 也不保留可拼成部分上线状态的独立开关。完整实现以一个 PR 合入 `test`，先在 test 环境验证。
 以下容量参数不是 Secret，直接写入 test 主 CVM compose 的 `serve-worker.environment`，不放入
-GitHub Secret、GitHub Variable 或 Phala encrypted env：
+GitHub Secret、GitHub Variable 或 Phala encrypted env。test/pre 机器本次不扩容，因此 test
+使用 `2/1/1 = 4` 验证完整三池；生产 8C16G 的目标仍为 `4/2/2 = 8`，prod/pre Compose
+本次不改：
 
 ```yaml
-FEEDLING_V2_FOREGROUND_SLOTS: "4"
-FEEDLING_V2_WAKE_SLOTS: "2"
-FEEDLING_V2_HEAVY_SLOTS: "2"
+FEEDLING_V2_FOREGROUND_SLOTS: "2"
+FEEDLING_V2_WAKE_SLOTS: "1"
+FEEDLING_V2_HEAVY_SLOTS: "1"
 FEEDLING_V2_PROFILE_INSTANCE_CONCURRENCY: "1"
 FEEDLING_V2_ENCLAVE_INSTANCE_CONCURRENCY: "4"
 ```
@@ -430,7 +432,7 @@ FEEDLING_V2_ENCLAVE_INSTANCE_CONCURRENCY: "4"
 直接修改 YAML 会改变 compose hash，需要按现有发布流程重新授权/部署。容量和故障域变更因此
 进入代码审查和部署记录，不能在 GitHub Secret 页面静默漂移。
 
-恢复不切换运行模式：重新部署此前已验证的 known-good image/commit。加法迁移 `0085` 保留
+恢复不切换运行模式：重新部署此前已验证的 known-good image/commit。加法迁移 `0086` 保留
 安装，不做降级；它与旧 image 向后兼容。恢复后重新核对 worker heartbeat、Foreground capacity、
 队列年龄和 exact-claim 回收，再决定是否继续测试。
 
@@ -490,8 +492,8 @@ Admin 和指标至少新增：
 
 - Chat claim latency P95 ≤ 2 秒；
 - watchdog kill → claim released P95 ≤ 5 秒；
-- 8-slot 稳态内存使用 < 70%（16G 机器）；
-- 8-slot 稳态 CPU 使用 < 70%（8C 机器，排除短时峰值）；
+- test 4-slot 在现有 1C2G 主机上无 OOM、无非预期容器重启，稳态 available memory ≥ 128 MiB；
+- test 4-slot 稳态 CPU < 85%（1C 机器，排除短时启动峰值）；
 - Enclave P95 相比 4-slot 基线无不可接受回退；
 - Provider 429/timeout 率无显著增长；
 - DB connection wait/timeout 不增长到影响 Chat。
@@ -504,7 +506,7 @@ Admin 和指标至少新增：
 完整三池实现以一个 PR 合入 `test`，不拆成可独立启停的部分拓扑。顺序是：
 
 1. 采集 test 的 pool、DB、Enclave、provider 与 claim latency 基线；
-2. 部署 `4/2/2 = 8`、Chat 原子抢占、per-slot watchdog、精确 claim 回收；
+2. 在不调整 test/pre 机器规格的前提下，test 部署 `2/1/1 = 4`、Chat 原子抢占、per-slot watchdog、精确 claim 回收；
 3. 同时启用 Profile batching/concurrency 1、Enclave broker 4 和 child DB pool 2；
 4. 完成 P0 故障注入、554-card 等价负载和资源检查；
 5. 观察完整 test 流量窗口后，另行评审是否增加 Foreground slot。
@@ -518,7 +520,7 @@ test/pre 的故障注入、资源和用户链路证据。该改动改变部署�
 
 | 风险 | 缓解 |
 | --- | --- |
-| 进程数增加导致内存膨胀 | test 的 8-slot 要求 <70% 内存；child DB pool 固定小上限 |
+| 进程数增加导致内存膨胀 | test 先用 2/1/1；要求无 OOM/重启且 available memory ≥128 MiB；child DB pool 固定小上限 |
 | Enclave semaphore 随进程倍增 | Parent 实例级 broker + Enclave 服务硬上限 |
 | 抢占时外部工具已发出 | lease/write fence + effect/call idempotency + 故障注入 |
 | Scheduled/Capture 被抢占后丢工作 | lane-specific durable successor/recovery，不做通用 `superseded` |

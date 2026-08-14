@@ -62,9 +62,9 @@ def test_test_environment_uses_literal_three_pool_runtime_values():
     environment = compose["services"]["serve-worker"]["environment"]
 
     assert environment | {
-        "FEEDLING_V2_FOREGROUND_SLOTS": "4",
-        "FEEDLING_V2_WAKE_SLOTS": "2",
-        "FEEDLING_V2_HEAVY_SLOTS": "2",
+        "FEEDLING_V2_FOREGROUND_SLOTS": "2",
+        "FEEDLING_V2_WAKE_SLOTS": "1",
+        "FEEDLING_V2_HEAVY_SLOTS": "1",
         "FEEDLING_V2_PROFILE_INSTANCE_CONCURRENCY": "1",
         "FEEDLING_V2_ENCLAVE_INSTANCE_CONCURRENCY": "4",
     } == environment

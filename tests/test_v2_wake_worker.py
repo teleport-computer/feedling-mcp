@@ -200,7 +200,7 @@ def test_shadow_signals_never_reach_the_wake_provider_prompt(monkeypatch):
             "manual_wake",
             _wake_deps(tail=[]),
             _BYOK,
-            worker.ENCLAVE_SEMAPHORE,
+            asyncio.Semaphore(4),
             claimed_by,
         )
     )
@@ -293,7 +293,7 @@ def test_wake_self_thinking_on_drops_native_reasoning_fallback(monkeypatch):
             "heartbeat",
             deps,
             _BYOK,
-            worker.ENCLAVE_SEMAPHORE,
+            asyncio.Semaphore(4),
             claimed_by,
         )
     )
@@ -345,7 +345,7 @@ def test_wake_full_chain_strips_tool_markup_after_user_decrypt(monkeypatch, lane
                 lane,
                 deps,
                 _BYOK,
-                worker.ENCLAVE_SEMAPHORE,
+                asyncio.Semaphore(4),
                 claimed_by,
             )
         )
@@ -399,7 +399,7 @@ def test_wake_markup_only_reply_fails_silently_without_bubble(monkeypatch):
             "heartbeat",
             deps,
             _BYOK,
-            worker.ENCLAVE_SEMAPHORE,
+            asyncio.Semaphore(4),
             claimed_by,
         )
     )
@@ -738,7 +738,7 @@ def test_wake_shadow_write_failure_cannot_change_the_decision(monkeypatch):
             "heartbeat",
             deps,
             _BYOK,
-            worker.ENCLAVE_SEMAPHORE,
+            asyncio.Semaphore(4),
             claimed_by,
         )
     )
@@ -1193,7 +1193,7 @@ def test_scheduled_wake_does_not_send_claude_48_an_assistant_prefill(monkeypatch
             "scheduled",
             deps,
             config,
-            worker.ENCLAVE_SEMAPHORE,
+            asyncio.Semaphore(4),
             claimed_by,
         )
     )
@@ -2290,7 +2290,7 @@ def test_wake_provider_tool_surface_trace_carries_wake_kind(monkeypatch):
         "scheduled",
         deps,
         _BYOK,
-        worker.ENCLAVE_SEMAPHORE,
+        asyncio.Semaphore(4),
         claimed_by,
     ))
 

@@ -2,9 +2,9 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use `superpowers:subagent-driven-development` (recommended) or `superpowers:executing-plans` to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking. Use `superpowers:test-driven-development` for every behavior change and `superpowers:verification-before-completion` before claiming a task complete.
 
-**Goal:** From the current `test` branch, replace Runtime V2's shared multi-slot worker with the complete 4-foreground/2-wake/2-heavy runtime, then validate it in the test environment.
+**Goal:** From the current `test` branch, replace Runtime V2's shared multi-slot worker with the complete three-pool runtime, then validate a resource-bounded 2-foreground/1-wake/1-heavy deployment on the existing test machine. The production target remains 4/2/2 in a later promotion.
 
-**Architecture:** Runtime V2 has one topology only: a `serve-worker` parent owns eight one-slot child processes grouped into three logical pools. PostgreSQL remains the source of truth for Job ownership and recovery; Chat atomically terminalizes/requeues conflicting same-user background work, while a typed notification asks the owning child to stop promptly. The parent watchdog kills only the affected slot, recovers only that slot's active claim, and then respawns it. Enclave concurrency is enforced by a parent IPC broker, not by process-local semaphores.
+**Architecture:** Runtime V2 has one topology only: a `serve-worker` parent owns configurable one-slot child processes grouped into three logical pools. Test uses 2/1/1 on its existing 1C2G CVM; the 8C16G production target remains 4/2/2. PostgreSQL remains the source of truth for Job ownership and recovery; Chat atomically terminalizes/requeues conflicting same-user background work, while a typed notification asks the owning child to stop promptly. The parent watchdog kills only the affected slot, recovers only that slot's active claim, and then respawns it. Enclave concurrency is enforced by a parent IPC broker, not by process-local semaphores.
 
 **Tech Stack:** Python 3.11, `asyncio`, `multiprocessing` with spawn, psycopg 3 and `psycopg_pool`, PostgreSQL/Alembic, pytest, Docker Compose, and the existing admin JSON metrics endpoint.
 
@@ -23,6 +23,7 @@
 - Enclave admission is instance-wide: total 4 permits, with initial reservations of foreground 2, wake 1, heavy 1. Unused reservations may be borrowed without violating a waiting pool's reservation.
 - Only one Heavy slot may claim `profile`; the other Heavy slot handles the remaining heavy lanes.
 - Non-secret pool and capacity settings belong directly in `deploy/docker-compose.phala.test.yaml`. Credentials and provider keys remain in encrypted environment configuration.
+- Keep test and pre machine sizes unchanged. Configure only test worker counts as 2/1/1; do not modify pre or prod Compose in this plan. Production retains the later 4/2/2 target.
 - Any architecture, trust-boundary, deployment-topology, or user-visible behavior change must update the affected public docs and `Unreleased` changelog in the same phase.
 - Use one behavior change per commit where practical. Do not mix formatting or unrelated cleanup into these commits.
 - All PostgreSQL tests must run against the test DSN and must not silently skip:
@@ -32,6 +33,8 @@
   ```
 
 ## Target Runtime Layout
+
+The code default and future 8C16G production target are 4/2/2 as listed below. The test deployment in Task 14 deliberately overrides slot counts to 2/1/1 while preserving all three pools and the same lane boundaries.
 
 | Pool | Slots | Lanes | Per-job watchdog |
 |---|---:|---|---|
@@ -156,7 +159,7 @@ Expected: the first command exits 0 and the second prints `0 N`, where `N` is th
 
 **Files:**
 
-- Create: `backend/alembic/versions/0085_v2_worker_pool_heartbeats.py`
+- Create: `backend/alembic/versions/0086_v2_worker_pool_heartbeats.py`
 - Modify: `backend/model_api_runtime/v2/jobs_store.py`
 - Modify: `backend/model_api_runtime/v2/serve_worker.py`
 - Modify: `tests/test_v2_jobs_migration.py`
@@ -165,7 +168,7 @@ Expected: the first command exits 0 and the second prints `0 N`, where `N` is th
 
 - [ ] **Step 1: Write failing migration and store tests**
 
-  Add assertions that migration `0085_v2_worker_pool_heartbeats` has `down_revision = "0084_wake_support_indexes"`, adds `pool TEXT NOT NULL DEFAULT 'unassigned'`, adds `runtime_state JSONB NOT NULL DEFAULT '{}'::jsonb`, and creates an index beginning with `(pool, kind, beat_at DESC)`.
+  Add assertions that migration `0086_v2_worker_pool_heartbeats` has `down_revision = "0085_v2_wake_shadow_decisions"`, adds `pool TEXT NOT NULL DEFAULT 'unassigned'`, adds `runtime_state JSONB NOT NULL DEFAULT '{}'::jsonb`, and creates an index beginning with `(pool, kind, beat_at DESC)`.
 
   Add behavior tests:
 
@@ -188,7 +191,7 @@ Expected: the first command exits 0 and the second prints `0 N`, where `N` is th
 
   Expected: FAIL on absent migration and unsupported `pool` parameters.
 
-- [ ] **Step 3: Add migration `0085`**
+- [ ] **Step 3: Add migration `0086`**
 
   Use Alembic operations to add the non-null column with server default `unassigned`. Existing/stale pre-deploy heartbeat rows remain distinguishable and never count as foreground capacity; all new turn and Genesis heartbeat call sites must write an explicit pool. Create the pool/kind/freshness index and remove both columns/indexes in downgrade.
 
@@ -232,7 +235,7 @@ Expected: the first command exits 0 and the second prints `0 N`, where `N` is th
 - [ ] **Step 7: Commit**
 
   ```bash
-  git add backend/alembic/versions/0085_v2_worker_pool_heartbeats.py backend/model_api_runtime/v2/jobs_store.py backend/model_api_runtime/v2/serve_worker.py tests/test_v2_jobs_migration.py tests/test_v2_worker_heartbeat.py tests/test_v2_capacity_health.py
+  git add backend/alembic/versions/0086_v2_worker_pool_heartbeats.py backend/model_api_runtime/v2/jobs_store.py backend/model_api_runtime/v2/serve_worker.py tests/test_v2_jobs_migration.py tests/test_v2_worker_heartbeat.py tests/test_v2_capacity_health.py
   git commit -m "feat(v2): track runtime capacity by pool"
   ```
 
@@ -1075,9 +1078,9 @@ Expected: the first command exits 0 and the second prints `0 N`, where `N` is th
   Parse the test Phala Compose file and assert the Runtime V2 `serve-worker` service contains these literal string values:
 
   ```yaml
-  FEEDLING_V2_FOREGROUND_SLOTS: "4"
-  FEEDLING_V2_WAKE_SLOTS: "2"
-  FEEDLING_V2_HEAVY_SLOTS: "2"
+  FEEDLING_V2_FOREGROUND_SLOTS: "2"
+  FEEDLING_V2_WAKE_SLOTS: "1"
+  FEEDLING_V2_HEAVY_SLOTS: "1"
   FEEDLING_V2_PROFILE_INSTANCE_CONCURRENCY: "1"
   FEEDLING_V2_ENCLAVE_INSTANCE_CONCURRENCY: "4"
   ```
@@ -1090,7 +1093,7 @@ Expected: the first command exits 0 and the second prints `0 N`, where `N` is th
   /Users/zhengzhihao/Projects/teleport/feedling-mcp/.venv-test/bin/python -m pytest tests/test_deploy_yaml_strict.py -q
   ```
 
-  Expected: FAIL because the test service still carries the former max-worker setting with value 4 and lacks the five pool-capacity settings.
+  Expected: FAIL because the test service still carries the former max-worker setting and lacks the five pool-capacity settings.
 
 - [ ] **Step 3: Write the non-secret settings directly into YAML**
 
@@ -1129,7 +1132,7 @@ Expected: the first command exits 0 and the second prints `0 N`, where `N` is th
 
 - [ ] **Step 1: Bring the design record forward to the approved no-legacy decision**
 
-  Remove `FEEDLING_V2_POOL_MODE`, the independent partial-rollout switches, shared-child configuration rollback, and pre/prod rollout instructions from the design record. State that the full implementation lands in one PR to `test`, and that recovery uses the previous known-good image/commit while leaving additive migration `0085` installed.
+  Remove `FEEDLING_V2_POOL_MODE`, the independent partial-rollout switches, shared-child configuration rollback, and pre/prod rollout instructions from the design record. State that the full implementation lands in one PR to `test`, and that recovery uses the previous known-good image/commit while leaving additive migration `0086` installed.
 
 - [ ] **Step 2: Update the architecture page and diagram**
 
@@ -1241,7 +1244,7 @@ Expected: the first command exits 0 and the second prints `0 N`, where `N` is th
 
 - [ ] **Step 2: Merge the implementation PR into `test` and deploy test**
 
-  Follow the repository's normal test deployment workflow. Confirm migration `0085` applies, the effective Runtime V2 environment is exactly 4/2/2 and Enclave 4, and eight distinct slot child PIDs are visible. Assert logs and process arguments contain no `POOL_MODE`, `MAX_WORKERS`, legacy supervisor startup, or disabled-isolation path: the first deployment must already be the complete topology.
+  Follow the repository's normal test deployment workflow. Confirm migration `0086` applies, the effective Runtime V2 environment is exactly 2/1/1 and Enclave 4, and four distinct slot child PIDs are visible. Assert logs and process arguments contain no `POOL_MODE`, `MAX_WORKERS`, legacy supervisor startup, or disabled-isolation path: the first deployment must already be the complete topology. Do not resize test/pre and do not modify pre/prod configuration.
 
 - [ ] **Step 3: Execute test-environment acceptance scenarios**
 
@@ -1259,24 +1262,24 @@ Expected: the first command exits 0 and the second prints `0 N`, where `N` is th
 
   - Chat claim latency P95 is at most 2 seconds;
   - watchdog kill to claim release P95 is at most 5 seconds;
-  - foreground healthy capacity remains at 4 except during bounded single-slot restarts;
+  - foreground healthy capacity remains at 2 except during bounded single-slot restarts;
   - no Chat expires solely because Heavy/Wake queues are non-empty;
   - no instance-wide restart from one slot watchdog;
   - no duplicate terminal Chat failure replies;
   - Enclave active permits never exceed 4;
-  - steady-state memory remains below 70% of 16G;
-  - steady-state CPU remains below 70% of 8 cores, excluding short peaks;
+  - the unchanged 1C2G test host has no OOM or unexpected container restart and retains at least 128 MiB available memory at steady state;
+  - steady-state CPU remains below 85% of one core, excluding short startup peaks;
   - DB connection usage stays within the measured safe envelope;
   - Enclave P95 and provider/DB error or wait rates remain inside the baseline-derived limits recorded in Step 1;
   - watchdog/preemption rates are explainable by injected tests or known failures.
 
 - [ ] **Step 5: Exercise image/commit recovery in test**
 
-  Record the previous known-good test image digest before deployment. Redeploy that image once and confirm the service returns healthy using its own default 4-worker behavior even though the new test YAML no longer defines `FEEDLING_V2_MAX_WORKERS`. Migration `0085` remains installed because its additive `pool='unassigned'` and `runtime_state={}` defaults are backward-compatible. Do not downgrade the database during operational recovery.
+  Record the previous known-good test image digest before deployment. Redeploy that image once and confirm the service returns healthy using its own default 4-worker behavior even though the new test YAML no longer defines `FEEDLING_V2_MAX_WORKERS`. Migration `0086` remains installed because its additive `pool='unassigned'` and `runtime_state={}` defaults are backward-compatible. Do not downgrade the database during operational recovery.
 
 - [ ] **Step 6: Redeploy the new image and repeat smoke tests**
 
-  Confirm all eight slot processes return, pool heartbeats report 4/2/2, Chat succeeds, and the controlled Heavy-Job isolation scenario still passes after recovery. This proves recovery does not leave test on the old image.
+  Confirm all four slot processes return, pool heartbeats report 2/1/1, Chat succeeds, and the controlled Heavy-Job isolation scenario still passes after recovery. This proves recovery does not leave test on the old image.
 
 - [ ] **Step 7: Record the test decision**
 
@@ -1296,9 +1299,9 @@ Expected: the first command exits 0 and the second prints `0 N`, where `N` is th
 - A hung Job can cause at most one slot process to be killed.
 - Only the killed slot's still-owned active claim is recovered immediately.
 - Runtime V2 has no legacy topology, pool-mode switch, max-worker fan-out, or isolation/preemption feature flags.
-- The test deployment runs 4 foreground, 2 wake, and 2 heavy slots; Profile instance concurrency is 1.
+- The test deployment runs 2 foreground, 1 wake, and 1 heavy slot; Profile instance concurrency is 1. Pre/prod configuration is unchanged, and the production target remains 4/2/2.
 - Instance-wide Enclave concurrency never exceeds 4 and recovers permits after child death.
-- Default maximum pooled DB connections are approximately 24 across the parent and eight children.
+- The test maximum pooled DB connection budget is approximately 16 across the parent and four children; the 4/2/2 production target remains approximately 24.
 - Test Compose YAML contains the five non-secret capacity settings directly and does not contain the four retired variables.
 - Focused, full Runtime V2, full backend, Compose, OpenAPI contract, and public-doc checks pass.
 - Test validation and previous-image recovery evidence is recorded; pre/prod promotion remains a separate decision.
