@@ -184,3 +184,48 @@ curl --noproxy '*'            .../healthz    # 直连
 ⚠️ 反过来也要小心:**服务通 ≠ 你的修复在上面**。healthz 的 `release.git_commit`
 才是线上真正跑的那个 commit,合入到部署之间有 14~45 分钟的窗口。见 TESTING.md 里
 "E2E 绿 ≠ 修复生效"那条。
+
+## 「我改好了」到「用户身上变了」中间有五道关,每道都会静默失败
+
+2026-08-14 一晚上,**这条链的三个不同环节各翻车一次**,而且三次的表象都是
+「我明明弄好了,怎么没生效」。把它写全,以后按环节查:
+
+| # | 环节 | 会怎样静默失败 | **验它的唯一方法** |
+|---|---|---|---|
+| 1 | 代码改好 | — | 跑测试,而且**变异验证**(见 V2_FAILURE_PATTERNS 模式 14/15) |
+| 2 | 合入本地分支 | 合了但**没推** | `git log origin/test..HEAD` 应为空 |
+| 3 | **推上 origin** | push 被拒 / 推了别的 | `git show origin/<branch>:<文件> \| grep <行为代码>` |
+| 4 | CI 绿 | 该文件**根本没被 CI 执行** | 查 `.github/workflows/ci.yml` 里有没有它;豁免名单 469 条,**CI 只跑 27%** |
+| 5 | **部署生效** | 部署滞后 14~45 分钟 | `healthz` 的 `release.git_commit`,再 `git show <该sha>:<文件>` |
+
+### 三次实际翻车
+
+- **环节 5**(T033):我判定「修复没合入 test」,实际早合了,**线上没变是部署滞后**。
+  我用的是 `git merge-base --is-ancestor` —— 它在 rebase/squash 后会说谎。
+- **环节 3**(T051):QA 报「已合入,内容核验命中,22 passed」——
+  它查的是**本地工作树**。`origin/test` 上那个符号命中 **0**。
+  merge commit 只存在于共享主树的本地分支,从没推上去。
+- **环节 4**(claude4):两条隐私守卫「测试存在、变异证明是真闸」,
+  但它们在 CI 豁免名单里,**CI 从来不执行**。
+
+### 一条通用判据
+
+**每一环都要用「那一环自己的观察点」去验,不能用上一环的证据推断下一环。**
+
+具体地:
+- 查「合入了吗」**按内容查,不按 ancestry、不按 PR 状态字**
+  (`--is-ancestor` 在 rebase/squash 后失效;PR 显示 MERGED 不代表你本地看到的那个 SHA 在)
+- 查「是同一份内容吗」用 **stable patch-id** 比对,cherry-pick 后 SHA 变了但 patch-id 不变
+  (codexcodex 2026-08-14 用这招确认 `f5e59cae` 与 `90c03764` 内容等价)
+- 查「线上跑的是什么」**只信 healthz 的 `release.git_commit`**
+
+### ⚠️ 推之前必做的夹带检查
+
+本地落后于 origin 时,`git diff origin/x HEAD` 会把**别人的新增算成你的删除**。
+2026-08-14 我据此差点推上去一个 **758 行的回滚**(含别人的测试文件和一个 deploy pin)。
+
+```sh
+git diff --name-only origin/test HEAD | grep -vE '^(你预期要改的路径)'
+```
+**有输出就停下。** 正确做法是从 `origin/test` 起一棵临时 worktree、
+cherry-pick 你要的提交、再推 —— 改动面会缩回你真正改的那些。
