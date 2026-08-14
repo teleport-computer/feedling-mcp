@@ -39,6 +39,7 @@ deployment topology.
 | PostgreSQL | Persist account, workflow, queue, and user-scoped state | Protected bodies in whichever shape the owning user's tier selects, plus plaintext IDs, timestamps, types, status, and other operational metadata |
 | Object storage | Offload enabled large-object flows | Screen and Chat objects are normally ciphertext; diagnostics and compatibility uploads can be stored as provided |
 | Hosted runner | Poll work, assemble authorized context, invoke an agent, and return an encrypted result | Plaintext selected for an agent turn, the provider credential, and encrypted API traffic |
+| Managed CPU recorder | Retain bounded host and per-container CPU history without a public endpoint | Infrastructure identifiers and numeric CPU/load samples only; no application content |
 | Model or push provider | Perform user-selected inference or device delivery | The plaintext and delivery material required by that external service |
 | ElevenLabs voice service | Transcribe and segment speech, manage interruption, and synthesize the selected voice | Call audio, transcript text, and the assistant text returned for speech |
 
@@ -56,9 +57,10 @@ since [content encryption is a per-user preference](#content-encryption-is-a-per
    `POST /v1/model_api/chat/send`.
 2. Inside the managed main VM, the API validates the request, creates a shared
    encrypted envelope, appends the user turn, and wakes the hosted queue.
-3. A bounded Runtime V2 worker pool claims the durable job and mints a scoped
-   runtime token for that turn. It requests only the Chat, Memory, and Perception
-   context authorized for that user.
+3. A Runtime V2 parent assigns the durable job to one of four foreground
+   single-slot child processes and mints a scoped runtime token for that turn.
+   PostgreSQL remains authoritative for the claim, and a cancellation bus can
+   target the exact child owner.
 4. The decrypt service opens the required shared envelopes. The runner sends the
    plaintext prompt and selected context to the configured model provider.
 5. The runner encrypts the assistant result into a new user-owned envelope before
@@ -68,6 +70,17 @@ The model provider is an external plaintext recipient. Envelope encryption
 protects persisted content and the storage path; it does not hide the prompt
 from the model selected to process it. When visible push text is enabled, that
 notification text also passes through the external push provider.
+
+Managed Phala deployments place the CPU recorder inside the measured main-CVM
+boundary. The recorder does not mount the Docker socket. A separate privileged
+socket proxy holds that mount and regex-allowlists only the two Docker GET path
+families needed to enumerate running containers and read CPU statistics. The
+recorder stores infrastructure identifiers and numeric CPU/load values in a
+private persistent volume for 30 UTC calendar days; it stores no labels,
+environment values, command lines, logs, requests, user identifiers, or other
+application content, and exposes no public metrics endpoint. Because the proxy
+can reach the Docker socket, it remains a privileged component of the measured
+CVM trust boundary even with this narrow allowlist.
 
 Runtime V2 builds each turn from an encrypted hierarchical summary frontier plus
 every uncovered source message verbatim. The trusted runner decrypts that
@@ -107,13 +120,13 @@ proactive wake lanes or subagents; a turn that reads history drops outbound
 web/MCP/task tools for the following round, and a deployment kill switch
 removes the capability entirely without touching the normal chat path.
 
-Deployments may opt into deterministic Runtime V2 coverage accounting as an
-independent precursor to the bounded Memory/User profile rollout. In that mode,
-maintenance and synchronous prompt catch-up advance the same exact source
-witnesses using content-free count sentinels, and deterministic fan-out
-checkpoints keep the frontier bounded without sending historical Chat plaintext
-to a model provider. The source ledger and rollback-compatible summary storage
-remain unchanged.
+Runtime V2 coverage accounting is permanently metadata-only. Maintenance and
+synchronous prompt catch-up advance exact source witnesses using content-free
+count sentinels, and deterministic fan-out checkpoints keep the frontier bounded
+without sending historical Chat plaintext to a model provider. MEMORY/USER is
+the sole long-term semantic layer; encrypted Chat rows remain the durable source
+ledger. Restoring provider-backed conversation summaries requires rolling back
+the worker image rather than changing a runtime flag.
 
 The bounded Memory/User profile storage contract uses one
 `v2_agent_profile` document so both fields advance under one compare-and-swap.
@@ -285,6 +298,15 @@ encrypted and expires automatically.
 4. A `local_only` body remains client-readable but is unavailable to agent-side
    index and fetch operations.
 
+The bounded, operator-only debug trace distinguishes an executed memory search
+from an index overview. It records the returned-card count, requested limit, and
+a 12-hex SHA-256 prefix of the trimmed search query; it never records the query
+text. Repeated Runtime V2 discovery calls that reuse an earlier result carry a
+separate content-free reuse flag. The fingerprint is operational metadata: it
+lets an authorized administrator compare whether two searches used the same
+trimmed query during the trace-retention window, but it is not ciphertext and
+must not be exposed through a public debug route.
+
 See the [Memory workflow](/docs/workflows/memory) for the complete envelope,
 selection, fetch, and action contracts.
 
@@ -443,11 +465,20 @@ The public API resolves each credential to one user, scopes storage queries by
 that user, and checks envelope ownership before protected reads and writes. This
 is the primary multi-tenant boundary for API and persistence access.
 
-Managed Hosted Runtime V2 uses a bounded worker pool. Durable jobs, conversation
-state, reply cursors, deadlines, and terminal errors live in PostgreSQL; there is
-no resident process, per-user home, CLI checkpoint, or lease to keep alive. A
-turn can run in a watchdog-controlled child process, but that is a failure and
-resource boundary rather than a strong sandbox for mutually hostile code.
+Managed Hosted Runtime V2 uses one parent with three logical pools: four
+Foreground slots for Chat and manual wakes, two Wake slots for ambient work,
+and two Heavy slots for Profile, Dream, Capture, and maintenance. Each of the
+eight slots is a separate one-Job OS process. The parent owns scheduling,
+per-slot watchdogs, the cancellation bus connection, and a four-permit Enclave
+broker shared across all children. All three pools still run inside one
+confidential VM and one service instance; process isolation limits a hung Job's
+failure domain but is not a sandbox for mutually hostile code.
+
+Durable jobs, conversation state, reply cursors, ownership fences, deadlines,
+and terminal errors live in PostgreSQL. A watchdog restarts only the exact
+stalled slot, and PostgreSQL recovery settles that slot's exact claim before
+replacement work proceeds. There is no resident process, per-user home, CLI
+checkpoint, or in-memory lease that becomes the source of truth.
 
 Newly registered Model API accounts can be admitted directly to this pooled V2
 runtime after a provider route has been successfully tested and activated. The

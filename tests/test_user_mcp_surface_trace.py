@@ -808,3 +808,114 @@ def test_empty_fingerprint_is_not_reported_as_a_fault():
     """
     _reset_materialize_dedup()
     assert _apply("") == []
+
+
+# ---------------------------------------------------------------------------
+# WaitForMcpServers 观测 —— 「提示词到底起没起作用」在 prod 里的唯一答案
+#
+# spec: docs/superpowers/specs/2026-08-13-mcp-handshake-wait-hint-design.md §2.2
+# 没有这几个字段,一轮「没调 MCP」在 prod 里是三种完全不同情况的同一个样子:
+# 模型压根没试 / 试了但没等到 / 反复等出不来。而这三种对应三种不同的下一步。
+# ---------------------------------------------------------------------------
+
+
+def _wait_stream(servers, waits=(), calls=()):
+    """init + 若干 WaitForMcpServers 往返 + 若干真实 MCP 调用。
+
+    waits 每项是 (outcome_text, is_error)，照实测到的回执形状写：
+    成功是 ``ready: true\\nConnected (...)``，失败带 is_error 且 ``ready: false``。
+    """
+    lines = [json.dumps({
+        "type": "system", "subtype": "init",
+        "tools": ["Bash", "WaitForMcpServers"], "mcp_servers": servers, "model": "m",
+    })]
+    for i, (text, is_err) in enumerate(waits):
+        tid = f"tw_{i}"
+        lines.append(json.dumps({"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "id": tid, "name": "WaitForMcpServers",
+             "input": {"servers": ["slow"]}}]}}))
+        lines.append(json.dumps({"type": "user", "message": {"content": [
+            {"type": "tool_result", "tool_use_id": tid, "is_error": is_err,
+             "content": [{"type": "text", "text": text}]}]}}))
+    for i, (srv, ok) in enumerate(calls):
+        tid = f"tu_{i}"
+        lines.append(json.dumps({"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "id": tid, "name": f"mcp__{srv}__do", "input": {}}]}}))
+        lines.append(json.dumps({"type": "user", "message": {"content": [
+            {"type": "tool_result", "tool_use_id": tid, "is_error": not ok,
+             "content": "pong" if ok else "boom"}]}}))
+    return "\n".join(lines) + "\n"
+
+
+def test_a_turn_that_never_waited_says_so_explicitly():
+    """默认必须是「没等过」,不能缺字段 —— 缺字段和 false 在看板上长得一样,
+    而它们的含义相反(没观测 vs 观测到没发生)。"""
+    kind, kw = _registered(_stream([{"name": "slow", "status": "pending"}]),
+                           enabled=("slow",))[0]
+    assert kw["detail"]["wait_attempted"] is False
+    assert kw["detail"]["wait_count"] == 0
+    assert kw["detail"]["wait_outcomes"] == []
+
+
+def test_the_measured_recovery_shape_is_fully_recorded():
+    """实测形态:pending → 模型自己 Wait → ready → 真调用成功。
+    这一整条链必须在一个事件里读得出来,否则没法证明是提示词起的作用
+    ——「called_ok 非空」可能只是服务器恰好赶上了(Codex 审出)。"""
+    raw = _wait_stream(
+        [{"name": "slow", "status": "pending"}],
+        waits=[("ready: true\nConnected (their tools are now available): slow", False)],
+        calls=[("slow", True)],
+    )
+    kind, kw = _registered(raw, enabled=("slow",))[0]
+    d = kw["detail"]
+    assert d["init_status"] == {"slow": "pending"}, "竞速确实发生过"
+    assert d["wait_attempted"] is True and d["wait_outcomes"] == ["ready"]
+    assert d["verdict"] == {"slow": "recovered"} and d["called_ok"] == ["slow"]
+
+
+def test_a_failed_wait_is_recorded_as_error_not_as_never_tried():
+    """模型猜错服务器名会拿到 is_error —— 本机实测撞到过(它把 piaoliuping_
+    写成 piaoliuping)。这跟「没试」必须分得开:前者要改提示词,后者要改别的。"""
+    raw = _wait_stream(
+        [{"name": "slow", "status": "pending"}],
+        waits=[("ready: false\nUnknown (no MCP server with this name is "
+                "configured): slo", True)],
+    )
+    _, kw = _registered(raw, enabled=("slow",))[0]
+    assert kw["detail"]["wait_attempted"] is True
+    assert kw["detail"]["wait_outcomes"] == ["error"]
+
+
+def test_repeated_waits_are_counted_so_a_looping_model_is_visible():
+    """Codex 提的失效模式:弱模型可能连着 Wait,每次叠加等待。
+    只有计数能抓到它 —— 单看「等到了没有」永远是一次成功的样子。"""
+    raw = _wait_stream(
+        [{"name": "slow", "status": "pending"}],
+        waits=[("ready: false", False), ("ready: false", False),
+               ("ready: true\nConnected: slow", False)],
+        calls=[("slow", True)],
+    )
+    _, kw = _registered(raw, enabled=("slow",))[0]
+    assert kw["detail"]["wait_count"] == 3
+    assert kw["detail"]["wait_outcomes"] == ["not_ready", "not_ready", "ready"]
+
+
+def test_an_unrecognised_wait_result_is_not_ready_not_a_new_bucket():
+    """回执文案是上游的,随时可能改。不认识的形状按「没有证据说明它成功」算,
+    和上面 verdict 阶梯对未知 init 状态的处理同一条规则 —— 而不是新开一档
+    让看板某天突然多出一种谁也没见过的状态。"""
+    raw = _wait_stream([{"name": "slow", "status": "pending"}],
+                       waits=[("some brand new wording from a future CLI", False)])
+    _, kw = _registered(raw, enabled=("slow",))[0]
+    assert kw["detail"]["wait_outcomes"] == ["not_ready"]
+
+
+def test_a_retried_attempt_does_not_inherit_the_previous_processs_waits():
+    """last-init-wins:重试是一个新进程、新握手。把上一次的等待算进来,
+    会让一轮实际没等过的重试看起来等过 —— 与 call_ok/call_err 同一条规则。"""
+    first = _wait_stream([{"name": "slow", "status": "pending"}],
+                         waits=[("ready: true", False)])
+    second = _stream([{"name": "slow", "status": "pending"}])
+    _, kw = _registered(first + second, enabled=("slow",))[0]
+    assert kw["detail"]["wait_attempted"] is False
+    assert kw["detail"]["wait_count"] == 0

@@ -464,6 +464,7 @@ async def generate_profile(
     usage_out: Callable[[dict | None], None] | None = None,
     reject_out: Callable[[str], None] | None = None,
     trajectory_out: Callable[[str, dict], Awaitable[None]] | None = None,
+    tail_window: dict | None = None,
 ) -> ProfileGenerationResult:
     """Generate both profile fields with bounded work and one shape bounce.
 
@@ -488,6 +489,13 @@ async def generate_profile(
     source = str(rendered_cards or "")
     source_chars = len(source)
     provider_calls = 0
+    # Route metadata only: never copy prompt/card content into this signal.
+    provider_tail_window = {
+        "lane": "profile",
+        "profile_cards_truncated": bool(
+            (tail_window or {}).get("profile_cards_truncated")
+        ),
+    }
 
     def _raise_budget_failure() -> None:
         code = f"profile_source_exceeds_budget:{source_chars}"
@@ -505,6 +513,11 @@ async def generate_profile(
         if provider_calls >= call_limit:
             _raise_budget_failure()
         provider_calls += 1
+        await _emit(
+            trajectory_out,
+            "provider_request",
+            {"tail_window": dict(provider_tail_window)},
+        )
         try:
             call_kwargs: dict[str, Any] = {
                 "max_tokens": max_tokens,

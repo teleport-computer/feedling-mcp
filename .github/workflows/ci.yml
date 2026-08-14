@@ -169,6 +169,9 @@ jobs:
             tests/test_enclave_visual_plaintext.py \
             tests/test_io_cli_web.py \
             tests/test_proactive_agent_protocol_v2.py \
+            tests/test_tool_markup_leak.py \
+            tests/test_memory_search_retry_guidance.py \
+            tests/test_v2_provider_output_edges.py \
             tests/test_runtime_v2_default_flag.py \
             tests/test_screen_vision_verdict_runtime.py \
             tests/test_capture_prompt_v1.py \
@@ -197,6 +200,16 @@ jobs:
           fi
           printf 'Running %d resident consumer test files\n' "${#consumer_tests[@]}"
           python -m pytest "${consumer_tests[@]}" -v
+
+      - name: Run Phala CPU recorder regression suite
+        env:
+          PYTHONPATH: backend
+        run: |
+          python -m pytest \
+            tests/test_cpu_recorder.py \
+            tests/test_cpu_recorder_compose.py \
+            tests/test_cpu_socket_proxy_integration.py \
+            -v
 
       - name: Guard top-level pytest discovery coverage
         run: |
@@ -278,12 +291,14 @@ jobs:
             tests/test_provider_malformed_tool_fallback.py \
             tests/test_perception_tool_surface_contract.py \
             tests/test_v2_tool_trace_privacy.py \
+            tests/test_capabilities_memory.py \
             tests/test_chat_activity_projection.py \
             tests/test_capabilities_tool_schema.py \
             tests/test_debug_trace.py \
             tests/test_access_mode_runtime_sync_unit.py \
             tests/test_pytest_coverage_ratchet.py \
             tests/test_mcp_client.py \
+            tests/test_mcp_probe_tools_required.py \
             tests/test_mcp_status.py \
             tests/test_user_mcp_core.py \
             tests/test_user_mcp_handshake_probe.py \
@@ -291,6 +306,7 @@ jobs:
             tests/test_user_mcp_routes.py \
             tests/test_v2_prompt_cache_key.py \
             tests/test_v2_prompt_frontier.py \
+            tests/test_v2_push_endpoint.py \
             tests/test_v2_adaptive_tail.py \
             tests/test_v2_metrics_endpoint.py \
             tests/test_prod_runner_fleet_gate.py \
@@ -298,8 +314,14 @@ jobs:
             tests/test_v2_whole_turn_metric.py \
             tests/test_admin_proactive_observability.py \
             tests/test_wake_support_indexes_migration.py \
+            tests/test_v2_first_chat_activation_backfill.py \
             tests/test_v2_jobs_migration.py \
             tests/test_v2_jobs_store.py \
+            tests/test_v2_enclave_broker.py \
+            tests/test_v2_job_lease_fencing.py \
+            tests/test_v2_pool_config.py \
+            tests/test_v2_pool_fault_injection.py \
+            tests/test_v2_pool_supervisor.py \
             tests/test_capture_prompt_v1.py \
             tests/test_data_track_runtime_view.py \
             tests/test_data_track_ops_views.py \
@@ -346,17 +368,15 @@ jobs:
             tests/test_tee_carry_verbatim.py \
             tests/test_uploaded_envelope_gate.py \
             tests/test_write_side_format_routing.py \
+            tests/test_data_track_debug.py \
             -v
 
-  # Both rollout switches are default-off, so ordinary CI cannot exercise
-  # their combined contract. Keep every state pair live until M6 removes them.
-  runtime-v2-compaction-matrix:
-    name: Runtime V2 rollout (det=${{ matrix.deterministic }}, profile=${{ matrix.profile_enabled }})
+  runtime-v2-coverage:
+    name: Runtime V2 coverage (profile=${{ matrix.profile_enabled }})
     runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
-        deterministic: ["0", "1"]
         profile_enabled: ["0", "1"]
     services:
       postgres:
@@ -385,10 +405,9 @@ jobs:
           pip install --require-hashes -r backend/requirements.lock
           pip install pytest-asyncio
 
-      - name: Run deterministic coverage matrix
+      - name: Run Runtime V2 coverage
         env:
           FEEDLING_TEST_PG: "postgresql://postgres:postgres@127.0.0.1:5432/postgres"
-          FEEDLING_V2_PROFILE_COVERAGE_DETERMINISTIC: "${{ matrix.deterministic }}"
           FEEDLING_V2_PROFILE_ENABLED: "${{ matrix.profile_enabled }}"
         run: |
           python -m pytest \
@@ -1285,10 +1304,8 @@ jobs:
           # with a redeploy and no new compose_hash — which is the whole
           # point, since the two prod stalls were both batch-size problems.
           FEEDLING_V2_COMPACTION_BATCH_MSGS: ${{ vars.PROD_FEEDLING_V2_COMPACTION_BATCH_MSGS }}
-          FEEDLING_V2_COMPACTION_BATCH_CHARS: ${{ vars.PROD_FEEDLING_V2_COMPACTION_BATCH_CHARS }}
           FEEDLING_V2_PROMPT_CATCHUP_DEADLINE_SEC: ${{ vars.PROD_FEEDLING_V2_PROMPT_CATCHUP_DEADLINE_SEC }}
           FEEDLING_V2_TAIL_BUDGET_MSGS: ${{ vars.PROD_FEEDLING_V2_TAIL_BUDGET_MSGS }}
-          FEEDLING_V2_COMPACTION_QUARANTINE_ENABLED: ${{ vars.PROD_FEEDLING_V2_COMPACTION_QUARANTINE_ENABLED }}
           # gunicorn worker counts (compose reads them; empty → compose default
           # 4/backend, 2/enclave). Encrypted env, NOT baked into compose_hash —
           # flip via repo var without on-chain re-auth. Gate: the deployed image
@@ -1341,10 +1358,8 @@ jobs:
             -e "FEEDLING_V2_PROFILE_ENABLED=$FEEDLING_V2_PROFILE_ENABLED" \
             -e "FEEDLING_V2_TRAJECTORY_INSPECT_ENABLED=$FEEDLING_V2_TRAJECTORY_INSPECT_ENABLED" \
             -e "FEEDLING_V2_COMPACTION_BATCH_MSGS=$FEEDLING_V2_COMPACTION_BATCH_MSGS" \
-            -e "FEEDLING_V2_COMPACTION_BATCH_CHARS=$FEEDLING_V2_COMPACTION_BATCH_CHARS" \
             -e "FEEDLING_V2_PROMPT_CATCHUP_DEADLINE_SEC=$FEEDLING_V2_PROMPT_CATCHUP_DEADLINE_SEC" \
             -e "FEEDLING_V2_TAIL_BUDGET_MSGS=$FEEDLING_V2_TAIL_BUDGET_MSGS" \
-            -e "FEEDLING_V2_COMPACTION_QUARANTINE_ENABLED=$FEEDLING_V2_COMPACTION_QUARANTINE_ENABLED" \
             -e "FEEDLING_BACKEND_WORKERS=$FEEDLING_BACKEND_WORKERS" \
             -e "FEEDLING_ENCLAVE_WORKERS=$FEEDLING_ENCLAVE_WORKERS" \
             -e "FEEDLING_V2_RUNNER_CVM_ID=$CVM_ID" \
@@ -1552,10 +1567,8 @@ jobs:
           # with a redeploy and no new compose_hash — which is the whole
           # point, since the two prod stalls were both batch-size problems.
           FEEDLING_V2_COMPACTION_BATCH_MSGS: ${{ vars.TEST_FEEDLING_V2_COMPACTION_BATCH_MSGS }}
-          FEEDLING_V2_COMPACTION_BATCH_CHARS: ${{ vars.TEST_FEEDLING_V2_COMPACTION_BATCH_CHARS }}
           FEEDLING_V2_PROMPT_CATCHUP_DEADLINE_SEC: ${{ vars.TEST_FEEDLING_V2_PROMPT_CATCHUP_DEADLINE_SEC }}
           FEEDLING_V2_TAIL_BUDGET_MSGS: ${{ vars.TEST_FEEDLING_V2_TAIL_BUDGET_MSGS }}
-          FEEDLING_V2_COMPACTION_QUARANTINE_ENABLED: ${{ vars.TEST_FEEDLING_V2_COMPACTION_QUARANTINE_ENABLED }}
           # gunicorn worker count (backend/gunicorn_conf.py reads it; empty → 1).
           # Encrypted env channel, NOT baked into compose_hash — flip without
           # on-chain re-auth. Gate: the deployed image must contain the leader-
@@ -1601,10 +1614,8 @@ jobs:
             -e "FEEDLING_V2_DREAM_ENABLED=$FEEDLING_V2_DREAM_ENABLED" \
             -e "FEEDLING_V2_TRAJECTORY_INSPECT_ENABLED=$FEEDLING_V2_TRAJECTORY_INSPECT_ENABLED" \
             -e "FEEDLING_V2_COMPACTION_BATCH_MSGS=$FEEDLING_V2_COMPACTION_BATCH_MSGS" \
-            -e "FEEDLING_V2_COMPACTION_BATCH_CHARS=$FEEDLING_V2_COMPACTION_BATCH_CHARS" \
             -e "FEEDLING_V2_PROMPT_CATCHUP_DEADLINE_SEC=$FEEDLING_V2_PROMPT_CATCHUP_DEADLINE_SEC" \
             -e "FEEDLING_V2_TAIL_BUDGET_MSGS=$FEEDLING_V2_TAIL_BUDGET_MSGS" \
-            -e "FEEDLING_V2_COMPACTION_QUARANTINE_ENABLED=$FEEDLING_V2_COMPACTION_QUARANTINE_ENABLED" \
             -e "FEEDLING_BACKEND_WORKERS=$FEEDLING_BACKEND_WORKERS" \
             -e "FEEDLING_V2_RUNNER_CVM_ID=$CVM_ID" \
             -e "FEEDLING_V2_DEPLOYED_BUILD=${GITHUB_SHA:0:7}"
@@ -1943,10 +1954,8 @@ jobs:
           # with a redeploy and no new compose_hash — which is the whole
           # point, since the two prod stalls were both batch-size problems.
           FEEDLING_V2_COMPACTION_BATCH_MSGS: ${{ vars.PRE_FEEDLING_V2_COMPACTION_BATCH_MSGS }}
-          FEEDLING_V2_COMPACTION_BATCH_CHARS: ${{ vars.PRE_FEEDLING_V2_COMPACTION_BATCH_CHARS }}
           FEEDLING_V2_PROMPT_CATCHUP_DEADLINE_SEC: ${{ vars.PRE_FEEDLING_V2_PROMPT_CATCHUP_DEADLINE_SEC }}
           FEEDLING_V2_TAIL_BUDGET_MSGS: ${{ vars.PRE_FEEDLING_V2_TAIL_BUDGET_MSGS }}
-          FEEDLING_V2_COMPACTION_QUARANTINE_ENABLED: ${{ vars.PRE_FEEDLING_V2_COMPACTION_QUARANTINE_ENABLED }}
           # gunicorn worker count (backend/gunicorn_conf.py reads it; empty → 1).
           # Encrypted env channel, NOT baked into compose_hash — flip without
           # on-chain re-auth. Gate: the deployed image must contain the leader-
@@ -1991,10 +2000,8 @@ jobs:
             -e "FEEDLING_V2_PROFILE_ENABLED=$FEEDLING_V2_PROFILE_ENABLED" \
             -e "FEEDLING_V2_TRAJECTORY_INSPECT_ENABLED=$FEEDLING_V2_TRAJECTORY_INSPECT_ENABLED" \
             -e "FEEDLING_V2_COMPACTION_BATCH_MSGS=$FEEDLING_V2_COMPACTION_BATCH_MSGS" \
-            -e "FEEDLING_V2_COMPACTION_BATCH_CHARS=$FEEDLING_V2_COMPACTION_BATCH_CHARS" \
             -e "FEEDLING_V2_PROMPT_CATCHUP_DEADLINE_SEC=$FEEDLING_V2_PROMPT_CATCHUP_DEADLINE_SEC" \
             -e "FEEDLING_V2_TAIL_BUDGET_MSGS=$FEEDLING_V2_TAIL_BUDGET_MSGS" \
-            -e "FEEDLING_V2_COMPACTION_QUARANTINE_ENABLED=$FEEDLING_V2_COMPACTION_QUARANTINE_ENABLED" \
             -e "FEEDLING_BACKEND_WORKERS=$FEEDLING_BACKEND_WORKERS" \
             -e "FEEDLING_V2_RUNNER_CVM_ID=$CVM_ID" \
             -e "FEEDLING_V2_DEPLOYED_BUILD=${GITHUB_SHA:0:7}" \

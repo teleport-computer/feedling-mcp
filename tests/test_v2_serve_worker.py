@@ -21,13 +21,6 @@ from model_api_runtime.v2 import (
 )
 
 
-@pytest.fixture(autouse=True)
-def _provider_backed_compaction_mode(monkeypatch):
-    # This suite's compaction case specifies media-decrypt failure behavior in
-    # the provider-backed fallback path.
-    monkeypatch.setattr(worker, "_PROFILE_COVERAGE_DETERMINISTIC", False)
-
-
 def _fake_serve_from_script(script, calls):
     """Return an async _serve fake that raises/returns each scripted item."""
     it = iter(script)
@@ -361,34 +354,54 @@ def test_run_forever_backoff_is_bounded(monkeypatch):
     assert sleeps[-1] == serve_worker._RELAUNCH_BACKOFF_MAX_SEC
 
 
-def test_db_pool_capacity_scales_for_nested_effect_sinks(monkeypatch):
-    monkeypatch.delenv("FEEDLING_DB_POOL_MAX_SIZE", raising=False)
-    monkeypatch.delenv(
-        "FEEDLING_V2_WORKSPACE_WRITE_PARALLELISM", raising=False
-    )
+def test_runtime_db_pool_limits_are_parent_eight_and_each_child_two(monkeypatch):
+    from model_api_runtime.v2 import pool_config
 
-    # Sixteen simultaneous drains may each hold an outer generation connection.
-    # While one workspace batch occupies four shared nested CAS slots, the other
-    # turns may each need an ordinary nested sink connection too. The
-    # conservative floor is 2*16 + 4 workspace + 4 operational headroom.
-    assert serve_worker._configure_db_pool_capacity(16) == 40
-    assert __import__("os").environ["FEEDLING_DB_POOL_MAX_SIZE"] == "40"
+    config = pool_config.RuntimePoolConfig.from_env()
 
-
-def test_db_pool_capacity_rejects_explicit_saturation_cliff(monkeypatch):
-    monkeypatch.setenv("FEEDLING_V2_WORKSPACE_WRITE_PARALLELISM", "4")
-    monkeypatch.setenv("FEEDLING_DB_POOL_MAX_SIZE", "39")
-
-    with pytest.raises(RuntimeError, match=r"too small.*require >= 40"):
-        serve_worker._configure_db_pool_capacity(16)
+    assert len(config.slots) == 8
+    assert serve_worker._runtime_db_pool_limits(config) == (8, 2)
+    assert 8 + (len(config.slots) * 2) == 24
 
 
 @pytest.mark.parametrize("raw", ["0", "-1", "nope"])
-def test_db_pool_capacity_bad_override_fails_closed(monkeypatch, raw):
-    monkeypatch.setenv("FEEDLING_DB_POOL_MAX_SIZE", raw)
+def test_db_explicit_process_pool_limit_fails_closed(monkeypatch, raw):
+    monkeypatch.setattr(serve_worker.db, "_pool", None)
 
-    with pytest.raises(RuntimeError, match="FEEDLING_DB_POOL_MAX_SIZE"):
-        serve_worker._configure_db_pool_capacity(4)
+    with pytest.raises(RuntimeError, match="pool max size"):
+        serve_worker.db.configure_pool_max_size(raw)
+
+
+def test_db_explicit_child_pool_limit_is_effectively_two(monkeypatch):
+    monkeypatch.setattr(serve_worker.db, "_pool", None)
+    monkeypatch.delenv("FEEDLING_DB_POOL_MAX_SIZE", raising=False)
+
+    assert serve_worker.db.configure_pool_max_size(2) == 2
+    assert serve_worker.db._pool_max_size() == 2
+
+
+def test_main_configures_parent_pool_to_eight_before_db_startup(monkeypatch):
+    order = []
+    monkeypatch.setattr(
+        serve_worker.runner_identity, "resolve_worker_id", lambda _default: "worker"
+    )
+    monkeypatch.setattr(
+        serve_worker.db,
+        "configure_pool_max_size",
+        lambda value: order.append(("configure", value)) or value,
+    )
+    monkeypatch.setattr(
+        serve_worker.db, "init_schema", lambda: order.append(("init", None))
+    )
+    monkeypatch.setattr(serve_worker, "wire_assembly", lambda: None)
+    monkeypatch.setattr(
+        serve_worker.accounts_registry, "start_periodic_full_reload", lambda: None
+    )
+    monkeypatch.setattr(serve_worker, "_run_forever", lambda *_args: None)
+
+    serve_worker.main()
+
+    assert order == [("configure", 8), ("init", None)]
 
 
 @pytest.mark.parametrize("raw", ["0", "-1", "nan", "inf", "nope"])
@@ -590,6 +603,58 @@ def test_v2_debug_trace_user_seam_resolves_store_and_preserves_duration(monkeypa
             },
         ),
     ]
+
+
+def test_context_truncation_reaches_final_debug_event_without_upstream_content(
+    monkeypatch,
+):
+    from admin import data_track
+    from diagnostics import diagnostics_core
+
+    store = types.SimpleNamespace(user_id="usr_t047")
+    monkeypatch.setattr(
+        serve_worker.core_store,
+        "get_store",
+        lambda _uid: store,
+    )
+    persisted = []
+    monkeypatch.setattr(
+        diagnostics_core.debug_trace,
+        "trace_event",
+        lambda resolved_store, **event: persisted.append(
+            {"user_id": resolved_store.user_id, **event}
+        ),
+    )
+    deps = serve_worker.build_production_deps()
+    rare_secret = "T047_UPSTREAM_SECRET_MUST_NOT_REACH_ADMIN"
+
+    worker._emit_context_truncation_trace(
+        deps,
+        store.user_id,
+        {
+            "tail_window": {
+                "profile_cards_truncated": True,
+                "worldbook_truncated": False,
+            },
+            "messages": [],
+            "unexpected_upstream_content": rare_secret,
+        },
+    )
+
+    assert len(persisted) == 1
+    event = persisted[0]
+    assert event["type"] == "context.truncation"
+    assert event["detail"] == {
+        "counts": {
+            "profile_cards_truncated": 1,
+            "worldbook_truncated": 0,
+        }
+    }
+    raw_admin_response = json.dumps(
+        data_track._debug_event_public_json(event),
+        ensure_ascii=False,
+    )
+    assert rare_secret not in raw_admin_response
 
 def test_v2_mcp_mixed_reachable_and_unreachable_servers_are_traced_and_recorded(
     monkeypatch,
@@ -919,26 +984,6 @@ def test_read_messages_propagates_strict_database_read_failure(monkeypatch):
         serve_worker._read_messages("u", after_seq=0)
 
 
-def test_compaction_reader_is_oldest_first_while_context_reader_is_newest(monkeypatch):
-    class _Store:
-        chat_messages = [
-            {"id": f"m{i}", "ts": float(i), "role": "user", "body_ct": "x", "K_enclave": "k"}
-            for i in range(1, 6)
-        ]
-
-    monkeypatch.setattr(serve_worker.core_store, "get_store", lambda uid: _Store())
-    monkeypatch.setattr(serve_worker, "_mint_runtime_token", lambda uid: "rt")
-    monkeypatch.setattr(
-        serve_worker.core_enclave,
-        "_decrypt_envelope_via_enclave",
-        lambda row, *args, **kwargs: row["id"].encode(),
-    )
-
-    newest = serve_worker._read_tail("u", 0.0, 2)
-    oldest = serve_worker._read_compaction_tail("u", 0.0, 2)
-    assert [row["id"] for row in newest] == ["m4", "m5"]
-    assert [row["id"] for row in oldest] == ["m1", "m2"]
-
 
 def test_tail_reader_selects_window_before_enclave_decrypt(monkeypatch):
     class _Store:
@@ -989,206 +1034,6 @@ def test_seq_catchup_reader_uses_strict_db_order_and_preserves_seq(monkeypatch):
     assert [(row["id"], row["seq"]) for row in out] == [("m1", 11), ("m2", 13)]
     assert [row["role"] for row in out] == ["user", "user"]
 
-
-def test_compaction_reader_decrypts_every_selected_media_caption_past_eight(
-    monkeypatch,
-):
-    rows = [
-        {
-            "id": f"m{i}",
-            "seq": i,
-            "ts": float(i),
-            "role": "user",
-            "content_type": "image" if i % 2 else "file",
-            "file_name": f"f{i}.pdf",
-            "caption_id": f"cap{i}",
-            "caption_body_ct": f"cipher-caption-{i}",
-            "caption_K_enclave": "k",
-            "caption_owner_user_id": "u",
-        }
-        for i in range(1, 13)
-    ]
-    selected = []
-    decrypted = []
-
-    def _read(uid, after_seq, *, limit, oldest_first=True, through_seq=None,
-              exclude_synthetic_sources=False):
-        selected.append((uid, after_seq, limit, oldest_first, through_seq))
-        return rows
-
-    def _decrypt(envelope, *args, **kwargs):
-        decrypted.append(envelope["id"])
-        return f"caption-{envelope['id']}".encode()
-
-    monkeypatch.setattr(serve_worker.db, "chat_messages_after_seq", _read)
-    monkeypatch.setattr(serve_worker, "_mint_runtime_token", lambda uid: "rt")
-    monkeypatch.setattr(
-        serve_worker.core_enclave,
-        "_decrypt_envelope_via_enclave",
-        _decrypt,
-    )
-
-    out = serve_worker._read_compaction_tail_after_seq(
-        "u", 0, 12, through_seq=12,
-    )
-
-    assert selected == [("u", 0, 12, True, 12)]
-    assert decrypted == [f"cap{i}" for i in range(1, 13)]
-    assert [row["content"] for row in out] == [
-        f"caption-cap{i}" for i in range(1, 13)
-    ]
-
-
-def test_compaction_caption_failure_aborts_the_whole_read(monkeypatch):
-    rows = [
-        {
-            "id": f"m{i}",
-            "seq": i,
-            "ts": float(i),
-            "role": "user",
-            "content_type": "image",
-            "caption_id": f"cap{i}",
-            "caption_body_ct": f"cipher-caption-{i}",
-            "caption_K_enclave": "k",
-            "caption_owner_user_id": "u",
-        }
-        for i in range(1, 10)
-    ]
-
-    monkeypatch.setattr(
-        serve_worker.db,
-        "chat_messages_after_seq",
-        lambda *args, **kwargs: rows,
-    )
-    monkeypatch.setattr(serve_worker, "_mint_runtime_token", lambda uid: "rt")
-
-    def _decrypt(envelope, *args, **kwargs):
-        if envelope["id"] == "cap9":
-            raise RuntimeError("caption unavailable")
-        return f"caption-{envelope['id']}".encode()
-
-    monkeypatch.setattr(
-        serve_worker.core_enclave,
-        "_decrypt_envelope_via_enclave",
-        _decrypt,
-    )
-
-    # No partial list reaches compaction, so its summary watermark cannot move
-    # past cap9 while that selected row's original text is unavailable.
-    with pytest.raises(RuntimeError, match="caption unavailable"):
-        serve_worker._read_compaction_tail_after_seq(
-            "u", 0, 9, through_seq=9,
-        )
-
-
-def test_media_caption_failure_does_not_advance_compaction_watermark(monkeypatch):
-    """The real maintenance path must fail before summary CAS on caption loss."""
-    import conftest
-    import db
-    import provider_client
-    from core import store as core_store
-    from model_api_runtime.v2 import compaction as v2_compaction
-
-    uid = "u_media_caption_compaction_fail_closed"
-    conftest.seed_user(uid)
-    with db.get_pool().connection() as conn:
-        conn.execute("DELETE FROM agent_jobs")
-        conn.execute("DELETE FROM v2_conversation_summary WHERE user_id=%s", (uid,))
-        conn.execute("DELETE FROM chat_messages WHERE user_id=%s", (uid,))
-    conftest.set_v2_runtime_owner(uid)
-
-    row_count = max(12, worker._TAIL_KEEP + 2)
-    for i in range(1, row_count + 1):
-        db.chat_append_strict(
-            uid,
-            f"m{i}",
-            float(i),
-            {
-                "id": f"m{i}",
-                "ts": float(i),
-                "role": "user",
-                "content_type": "image",
-                "body_ct": f"cipher-image-{i}",
-                "nonce": f"image-nonce-{i}",
-                "K_user": "wrapped-user-key",
-                "K_enclave": "wrapped-enclave-key",
-                "owner_user_id": uid,
-                "caption_id": f"cap{i}",
-                "caption_body_ct": f"cipher-caption-{i}",
-                "caption_nonce": f"caption-nonce-{i}",
-                "caption_K_enclave": "wrapped-caption-key",
-                "caption_owner_user_id": uid,
-            },
-            core_store.MAX_CHAT_MESSAGES,
-        )
-
-    monkeypatch.setattr(serve_worker, "_mint_runtime_token", lambda _uid: "rt")
-    decrypted = []
-
-    def _decrypt(envelope, *args, **kwargs):
-        decrypted.append(envelope["id"])
-        if envelope["id"] == "cap9":
-            raise RuntimeError("caption unavailable")
-        return f"caption-{envelope['id']}".encode()
-
-    monkeypatch.setattr(
-        serve_worker.core_enclave,
-        "_decrypt_envelope_via_enclave",
-        _decrypt,
-    )
-    monkeypatch.setattr(
-        v2_compaction,
-        "compact",
-        lambda **kwargs: (_ for _ in ()).throw(
-            AssertionError("provider compaction must not run after caption read failure")
-        ),
-    )
-    writes = []
-
-    def _write_summary(*args, **kwargs):
-        writes.append((args, kwargs))
-        return True
-
-    config = provider_client.ProviderConfig(
-        provider="anthropic",
-        model="claude-sonnet-4-test",
-        api_key="sk-test",
-        context_window_tokens=200_000,
-    )
-    job_id, _ = jobs_store.enqueue_job(uid, "maintenance")
-    job = jobs_store.claim_next_job("media-caption-worker")
-    deps = worker.TurnDeps(
-        read_messages=lambda _uid: [],
-        resolve_provider=lambda _uid: (config, {}),
-        mint_enclave_token=lambda _uid: "rt",
-        read_summary_with_seq=serve_worker._read_summary_with_seq,
-        read_compaction_tail_after_seq=(
-            serve_worker._read_compaction_tail_after_seq
-        ),
-        write_summary=_write_summary,
-    )
-
-    status = asyncio.run(
-        worker.process_job(
-            job,
-            deps,
-            provider_config=config,
-            api_key=None,
-            runtime_token="rt",
-        )
-    )
-
-    assert status == "failed"
-    assert decrypted == [f"cap{i}" for i in range(1, 10)]
-    assert writes == []
-    assert jobs_store.get_summary_row(uid) is None
-    with db.get_pool().connection() as conn:
-        job_row = conn.execute(
-            "SELECT status,last_error FROM agent_jobs WHERE id=%s",
-            (job_id,),
-        ).fetchone()
-    assert job_row[0] == "failed"
-    assert job_row[1] == "compaction_failed:runtimeerror"
 
 
 def test_seq_tail_readers_request_exact_oldest_and_newest_windows(monkeypatch):
@@ -1470,7 +1315,6 @@ class _HealthySupervisor:
 
 def test_turn_heartbeat_advertises_slot_capacity(monkeypatch):
     calls = []
-    monkeypatch.setattr(worker, "MAX_WORKERS", 12)
     monkeypatch.setattr(
         jobs_store,
         "record_worker_heartbeat",
@@ -1490,8 +1334,95 @@ def test_turn_heartbeat_advertises_slot_capacity(monkeypatch):
         await asyncio.wait_for(task, timeout=1.0)
 
     asyncio.run(_driver())
-    assert calls[0] == ("worker-a", {"capacity": 12, "kind": "turn"})
-    assert calls[-1] == ("worker-a", {"capacity": 0, "kind": "turn"})
+    assert calls[0] == (
+        "worker-a",
+        {
+            "capacity": 1,
+            "kind": "turn",
+            "pool": "foreground",
+            "runtime_state": {
+                "slot": {"stage": "starting", "busy": False}
+            },
+        },
+    )
+    assert calls[-1] == (
+        "worker-a",
+        {
+            "capacity": 0,
+            "kind": "turn",
+            "pool": "foreground",
+            "runtime_state": {
+                "slot": {"stage": "stopping", "busy": False}
+            },
+        },
+    )
+
+
+def test_foreground_fleet_heartbeat_runtime_state_is_bounded_and_identifier_free(
+    monkeypatch,
+):
+    from model_api_runtime.v2 import pool_supervisor
+
+    stop = asyncio.Event()
+    calls = []
+
+    class _Pool:
+        def get_stats(self):
+            return {"pool_size": 8, "pool_available": 5, "requests_waiting": 0}
+
+    class _Fleet:
+        def keys(self):
+            return tuple(
+                [pool_supervisor.SlotKey("foreground", index) for index in range(4)]
+                + [pool_supervisor.SlotKey("wake", index) for index in range(2)]
+                + [pool_supervisor.SlotKey("heavy", index) for index in range(2)]
+            )
+
+        def healthy_capacity(self, pool, *, stale_sec):
+            return 4 if pool == "foreground" else 2
+
+        def snapshots(self):
+            return {key: None for key in self.keys()}
+
+        def broker_snapshot(self):
+            return {
+                "limit": 4,
+                "total_granted": 0,
+                "granted": {"foreground": 0, "wake": 0, "heavy": 0},
+                "waiting": {"foreground": 0, "wake": 0, "heavy": 0},
+            }
+
+    monkeypatch.setattr(serve_worker.db, "get_pool", lambda: _Pool())
+
+    def _record(worker_id, **kwargs):
+        calls.append((worker_id, kwargs))
+        stop.set()
+
+    monkeypatch.setattr(jobs_store, "record_worker_heartbeat", _record)
+    asyncio.run(
+        serve_worker._fleet_heartbeat_loop(
+            "worker",
+            "foreground",
+            _Fleet(),
+            stop,
+            interval=0.01,
+        )
+    )
+
+    state = calls[0][1]["runtime_state"]
+    encoded = json.dumps(state, sort_keys=True)
+    assert len(encoded.encode("utf-8")) < 4096
+    for forbidden in (
+        "user_id",
+        "job_id",
+        "claimed_by",
+        "slot_generation",
+        "provider_url",
+        "message_text",
+        "memory_content",
+        "exception",
+    ):
+        assert forbidden not in encoded
 
 
 # ------------------------------------------------------------------
@@ -1618,8 +1549,7 @@ def test_read_tail_caps_to_limit(monkeypatch):
 
 
 # ------------------------------------------------------------------
-# Task 4: _read_summary / _write_summary — decrypt-on-read (enclave) +
-# encrypt-on-write (local) + CAS against v2_conversation_summary.
+# Summary compatibility rendering from the segmented metadata frontier.
 # ------------------------------------------------------------------
 
 def test_read_summary_missing_returns_empty(monkeypatch):
@@ -1628,9 +1558,6 @@ def test_read_summary_missing_returns_empty(monkeypatch):
     from model_api_runtime.v2 import jobs_store as v2_jobs_store
 
     monkeypatch.setattr(v2_jobs_store, "get_summary_frontier_state", lambda uid: None)
-
-    out = serve_worker._read_summary("u_summary_test")
-    assert out == ("", 0.0, 0)
 
     assert serve_worker._read_summary_with_seq("u_summary_test") == ("", 0.0, 0, 0)
 
@@ -1647,8 +1574,6 @@ def test_read_summary_decrypts_present_row(monkeypatch):
         core_enclave, "_decrypt_envelope_via_enclave",
         lambda envelope, key, *, purpose, runtime_token="": b"- prior chat")
 
-    out = serve_worker._read_summary("u_summary_test")
-    assert out == ("- prior chat", 7.0, 3)
     assert serve_worker._read_summary_with_seq("u_summary_test") == (
         "- prior chat", 7.0, 3, 19,
     )
@@ -1751,7 +1676,7 @@ def test_read_summary_nonzero_watermark_with_empty_plaintext_fails_closed(monkey
     )
 
     with pytest.raises(v2_summary_frontier.SummaryFrontierIntegrityError):
-        serve_worker._read_summary("u_summary_test")
+        serve_worker._read_summary_with_seq("u_summary_test")
 
 
 def test_canonical_summary_decrypt_rejection_is_integrity_failure(monkeypatch):
@@ -1884,47 +1809,6 @@ def test_read_segmented_summary_rejects_bound_ids_without_canonical_rows(monkeyp
         serve_worker._read_summary_with_seq("u_summary_test")
 
 
-def test_write_summary_builds_envelope_and_cas(monkeypatch):
-    from core import envelope as core_envelope
-    from core import store as core_store
-    from model_api_runtime.v2 import jobs_store as v2_jobs_store
-
-    monkeypatch.setattr(core_store, "get_store", lambda uid: object())
-    monkeypatch.setattr(
-        core_envelope, "_build_shared_envelope_for_store",
-        lambda store, plaintext: ({"body_ct": "e"}, ""))
-
-    calls = {}
-
-    def _fake_cas(uid, *, summary_envelope, watermark_ts, expected_version):
-        calls["args"] = (uid, summary_envelope, watermark_ts, expected_version)
-        return True
-
-    monkeypatch.setattr(v2_jobs_store, "upsert_summary_row_cas", _fake_cas)
-
-    ok = serve_worker._write_summary("u", "- s", 9.0, 2)
-    assert ok is True
-    assert calls["args"] == ("u", {"body_ct": "e"}, 9.0, 2)
-
-
-def test_write_summary_envelope_build_failure_returns_false(monkeypatch):
-    from core import envelope as core_envelope
-    from core import store as core_store
-    from model_api_runtime.v2 import jobs_store as v2_jobs_store
-
-    monkeypatch.setattr(core_store, "get_store", lambda uid: object())
-    monkeypatch.setattr(
-        core_envelope, "_build_shared_envelope_for_store",
-        lambda store, plaintext: (None, "boom"))
-
-    def _must_not_call(*a, **k):
-        raise AssertionError("CAS must not be called when envelope build fails")
-
-    monkeypatch.setattr(v2_jobs_store, "upsert_summary_row_cas", _must_not_call)
-
-    ok = serve_worker._write_summary("u", "- s", 9.0, 2)
-    assert ok is False
-
 
 def test_fire_scheduled_for_user_enqueues_a_scheduled_agent_job(monkeypatch, backend_env):
     """BUG-3: the timer machinery existed but submitted into the dead legacy proactive_jobs
@@ -2049,7 +1933,7 @@ def test_send_reply_push_posts_to_backend(monkeypatch):
         status_code = 200
 
         def json(self):
-            return {"status": "delivered"}
+            return {"status": "delivered", "apns_alert_sent": True}
 
     def _fake_post(url, json=None, headers=None, timeout=None):
         posted.update(url=url, json=json, headers=headers, timeout=timeout)
@@ -2058,8 +1942,16 @@ def test_send_reply_push_posts_to_backend(monkeypatch):
     monkeypatch.setenv("FEEDLING_API_URL", "http://backend:5001")
     monkeypatch.setattr(serve_worker.httpx, "post", _fake_post)
 
-    serve_worker._send_reply_push(
-        "u_push_send", msg_id="m1", body="hi", is_wake=True, lane="manual_wake")
+    assert (
+        serve_worker._send_reply_push(
+            "u_push_send",
+            msg_id="m1",
+            body="hi",
+            is_wake=True,
+            lane="manual_wake",
+        )
+        is True
+    )
 
     assert posted["url"] == "http://backend:5001/v1/internal/push/ai_reply"
     assert posted["json"] == {
@@ -2103,13 +1995,51 @@ def test_send_reply_push_swallows_transport_errors(monkeypatch):
     monkeypatch.setattr(serve_worker.httpx, "post", _boom)
 
     # 不抛：推送失败绝不能冒到回合上去。
-    serve_worker._send_reply_push("u_push_err", msg_id="m1", body="hi", is_wake=False)
+    assert serve_worker._send_reply_push(
+        "u_push_err", msg_id="m1", body="hi", is_wake=False) is False
+
+
+def test_record_wake_shadow_converts_decision_time_to_user_local_clock(monkeypatch):
+    from datetime import datetime, timezone
+
+    decided_at = datetime(2026, 8, 13, 16, 5, tzinfo=timezone.utc).timestamp()
+    monkeypatch.setattr(
+        serve_worker.accounts_registry,
+        "_get_user_timezone",
+        lambda _uid: "Asia/Shanghai",
+    )
+    observed = {}
+    monkeypatch.setattr(
+        serve_worker.jobs_store,
+        "record_wake_shadow_decision",
+        lambda **kwargs: observed.update(kwargs) or True,
+    )
+
+    assert serve_worker._record_wake_shadow_decision(
+        "u_shadow_local",
+        job_id=42,
+        lane="heartbeat",
+        decision_allowed=True,
+        apns_alert_sent=False,
+        decided_at=decided_at,
+    ) is True
+    assert observed == {
+        "job_id": 42,
+        "local_day": datetime(2026, 8, 14).date(),
+        "local_hour": 0,
+        "local_minute": 5,
+        "lane": "heartbeat",
+        "decision_allowed": True,
+        "apns_alert_sent": False,
+        "decided_at": decided_at,
+    }
 
 
 def test_kill_switch_unwires_the_push_dep(monkeypatch):
     monkeypatch.setenv("FEEDLING_V2_PUSH_ENABLED", "0")
     deps = serve_worker.build_production_deps()
     assert deps.send_reply_push is None
+    assert deps.record_wake_shadow_decision is serve_worker._record_wake_shadow_decision
 
 
 def test_worldbook_reader_forwards_current_turn_and_runtime_token(monkeypatch):

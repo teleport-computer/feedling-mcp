@@ -108,6 +108,7 @@ def test_delivers_and_writes_back_metadata(app_obj, user, monkeypatch):
 
     assert status == 200
     assert body["status"] == "delivered"
+    assert body["apns_alert_sent"] is True
     assert seen["body"] == "回复正文"
     assert seen["title"] == "IO"
     assert written["msg_id"] == "msg-abc"
@@ -138,6 +139,7 @@ def test_wake_respects_reminders_delivery_off(app_obj, user, monkeypatch):
 
     assert status == 200
     assert body["status"] == "suppressed"
+    assert body["apns_alert_sent"] is False
     assert called["n"] == 0
     assert written["fields"]["alert_status"] == "suppressed"
 
@@ -178,6 +180,7 @@ def test_manual_wake_bypasses_reminders_delivery_off(app_obj, user, monkeypatch)
 
     assert status == 200
     assert body["status"] == "delivered"
+    assert body["apns_alert_sent"] is True
     assert seen["body"] == "手动唤醒消息"
     assert written["fields"]["alert_status"] == "delivered"
 
@@ -212,6 +215,7 @@ def test_non_manual_wake_lane_still_respects_reminders_delivery_off(
 
     assert status == 200
     assert body["status"] == "suppressed"
+    assert body["apns_alert_sent"] is False
     assert called["n"] == 0
     assert written["fields"]["alert_status"] == "suppressed"
 
@@ -231,4 +235,5 @@ def test_empty_body_is_skipped(app_obj, user, monkeypatch):
 
     assert status == 200
     assert body["status"] == "skipped"
+    assert body["apns_alert_sent"] is False
     assert called["n"] == 0

@@ -72,6 +72,7 @@ def test_mcp_call_attempt_is_counted_even_when_dispatch_fails():
             ["mcp__files__search", "mcp__files__status"], called_names
         ) == {
             "offered_tool_count": 2,
+            "offered_tool_count_lens": "turn_resolved_before_provider_budget",
             "called_tool_count": 1,
             "call_count": 1,
         }
@@ -84,6 +85,7 @@ def test_mcp_turn_usage_detail_keeps_zero_call_turns_visible():
         ["mcp__files__search", "mcp__files__status"], []
     ) == {
         "offered_tool_count": 2,
+        "offered_tool_count_lens": "turn_resolved_before_provider_budget",
         "called_tool_count": 0,
         "call_count": 0,
     }

@@ -51,6 +51,12 @@ import object_storage  # lowest-layer peer: R2 offload for frame body_ct
 
 log = logging.getLogger("feedling.db")
 
+# A first-chat activation is earned only by a reply to ordinary user-authored
+# chat. Keep the resident response path and Runtime V2's transactional sink on
+# this one vocabulary so synthetic probes and background wakes cannot activate
+# proactive presence.
+FIRST_CHAT_OK_USER_SOURCES = frozenset({"chat", "model_api"})
+
 # ---------------------------------------------------------------------------
 # Connection pool (lazy: opened on first use so importing this module without a
 # DATABASE_URL — e.g. tooling — doesn't crash at import time).
@@ -103,6 +109,21 @@ def _pool_max_size() -> int:
         raise RuntimeError("FEEDLING_DB_POOL_MAX_SIZE must be an integer >= 2") from exc
     if value < 2:
         raise RuntimeError("FEEDLING_DB_POOL_MAX_SIZE must be an integer >= 2")
+    return value
+
+
+def configure_pool_max_size(max_size: int | str) -> int:
+    """Set this process's explicit pool ceiling before the lazy pool opens."""
+    try:
+        value = int(str(max_size).strip())
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("database pool max size must be an integer >= 2") from exc
+    if value < 2:
+        raise RuntimeError("database pool max size must be an integer >= 2")
+    with _pool_lock:
+        if _pool is not None:
+            raise RuntimeError("database pool max size cannot change after pool startup")
+        os.environ["FEEDLING_DB_POOL_MAX_SIZE"] = str(value)
     return value
 
 
@@ -8205,51 +8226,6 @@ def chat_genuine_turn_count_after_seq(
     return int(row[0]) if row and row[0] is not None else 0
 
 
-def v2_effective_batch_cap(user_id: str) -> int | None:
-    """The fold batch size this conversation was last observed to digest.
-
-    ``None`` means never measured — callers fall back to their configured
-    default, so existing rows and brand-new users behave exactly as before.
-    """
-    with get_pool().connection() as conn:
-        row = conn.execute(
-            "SELECT effective_batch_cap FROM v2_conversation_summary "
-            "WHERE user_id = %s",
-            (str(user_id),),
-        ).fetchone()
-    if not row or row[0] is None:
-        return None
-    return int(row[0])
-
-
-def v2_set_effective_batch_cap(user_id: str, value: int) -> None:
-    """Persist the working fold batch size (floored at 1).
-
-    Writes ONLY this column, and ONLY into a row that already exists.
-
-    Both restrictions are load-bearing. The watermark and its CAS ``version``
-    are fold coverage and must never move as a side effect of bookkeeping.
-    And inserting a row here would fabricate a ``version = 0`` summary for a
-    conversation that has never been folded — the fold then reads "no summary",
-    computes its write against that absence, and its CAS collides with the row
-    this bookkeeping call invented, failing the whole job with
-    ``summary_cas_lost``.
-
-    A conversation with no summary row therefore silently keeps no memory. It
-    gets one as soon as its first fold lands, which is also the first moment
-    the memory could be worth anything.
-
-    Zero or negative is floored rather than stored: a batch of zero would wedge
-    the fold on an empty slice forever.
-    """
-    capped = max(1, int(value))
-    with get_pool().connection() as conn:
-        conn.execute(
-            "UPDATE v2_conversation_summary SET effective_batch_cap = %s "
-            "WHERE user_id = %s",
-            (capped, str(user_id)),
-        )
-
 
 def chat_seq_for_msg_id(user_id: str, msg_id: str) -> int | None:
     """Exact ``seq`` for one message (its real primary-key identity), or
@@ -10227,6 +10203,62 @@ def v2_turn_failure_supersede_enabled() -> bool:
     ).strip().lower() not in {"0", "false", "off", "no"}
 
 
+def _mark_first_chat_ok_for_v2_reply_on_cursor(
+    cur,
+    user_id: str,
+    effect_doc: dict,
+    *,
+    reply_ts: float,
+) -> bool:
+    """Atomically activate proactive presence with a successful V2 reply.
+
+    Runtime V2 writes replies through the effect sink and never calls the
+    resident ``/v1/chat/response`` handler that historically set
+    ``first_chat_ok_at``. Validate the explicit reply parent under the same
+    chat transaction, then patch the marker without touching user switches.
+    """
+    if str(effect_doc.get("turn_failure_error_class") or "").strip():
+        return False
+    parent_id = str(effect_doc.get("reply_to_message_id") or "").strip()
+    if not parent_id:
+        return False
+    cur.execute(
+        "SELECT 1 FROM chat_messages "
+        "WHERE user_id=%s AND msg_id=%s "
+        "  AND doc->>'role' IN ('user','human') "
+        "  AND doc->>'source'=ANY(%s) "
+        "LIMIT 1",
+        (str(user_id), parent_id, list(FIRST_CHAT_OK_USER_SOURCES)),
+    )
+    if cur.fetchone() is None:
+        return False
+
+    # The caller already owns the chat-user fence. Match every other
+    # proactive-settings mutation's chat -> capture-consent lock order before
+    # merging this internal marker into the shared settings document.
+    _lock_capture_consent_on_cursor(cur, str(user_id))
+    activated_at = datetime.fromtimestamp(float(reply_ts)).isoformat()
+    cur.execute(
+        "INSERT INTO user_blobs (user_id,kind,doc) "
+        "VALUES (%s,'proactive_settings',%s) "
+        "ON CONFLICT (user_id,kind) DO UPDATE SET doc="
+        "user_blobs.doc || EXCLUDED.doc "
+        "WHERE COALESCE(user_blobs.doc->>'first_chat_ok_at','')='' "
+        "RETURNING user_id",
+        (
+            str(user_id),
+            Jsonb(
+                {
+                    "version": 2,
+                    "first_chat_ok_at": activated_at,
+                    "updated_at": activated_at,
+                }
+            ),
+        ),
+    )
+    return cur.fetchone() is not None
+
+
 def chat_append_effect_with_cursor(
     user_id: str,
     msg_id: str,
@@ -10278,6 +10310,7 @@ def chat_append_effect_with_cursor(
     replied_user_ids: list[str] = []
     superseded_turn_cleanup: list[tuple[str, str]] = []
     persisted_runtime_doc: dict | None = None
+    first_chat_activated = False
     replied_fields = {
         "reply_status": "replied",
         "reply_message_id": msg_id,
@@ -10566,6 +10599,15 @@ def chat_append_effect_with_cursor(
                         cursor_seq,
                     )
 
+                    first_chat_activated = (
+                        _mark_first_chat_ok_for_v2_reply_on_cursor(
+                            cur,
+                            user_id,
+                            effect_doc,
+                            reply_ts=float(ts),
+                        )
+                    )
+
     def _post_commit() -> None:
         _offload_chat_body_after_commit(
             user_id, msg_id, persisted_reply_doc, storage_generation,
@@ -10611,6 +10653,8 @@ def chat_append_effect_with_cursor(
         if persisted_runtime_doc is not None:
             _mirror_persisted_blob(
                 user_id, "model_api_runtime", persisted_runtime_doc)
+        if first_chat_activated:
+            _mirror_proactive_settings_current(user_id)
 
     if defer_post_commit:
         return seq, inserted, _post_commit
@@ -10781,7 +10825,9 @@ def chat_append_and_enqueue(
             "runtime-control CAS requires expected state, mode, and generation")
     priority = jobs_store.LANE_PRIORITY.get(lane, 0)
 
-    def _attempt() -> tuple[int, int | None, int, bool, list[str]]:
+    def _attempt() -> tuple[
+        int, int | None, int, bool, list[str], list[jobs_store.PreemptedJob]
+    ]:
         with get_pool().connection() as conn:
             with conn.transaction():
                 with conn.cursor() as fence_cur:
@@ -10839,7 +10885,14 @@ def chat_append_and_enqueue(
                         (user_id, client_msg_id, idempotency_window_sec),
                     ).fetchone()
                     if duplicate is not None:
-                        return int(duplicate[0]), None, 0, False, []
+                        return int(duplicate[0]), None, 0, False, [], []
+                preempted_jobs: list[jobs_store.PreemptedJob] = []
+                if lane == "chat":
+                    with conn.cursor(row_factory=dict_row) as preempt_cur:
+                        preempted_jobs = jobs_store.preempt_active_for_chat_on_cursor(
+                            preempt_cur,
+                            user_id=user_id,
+                        )
                 with conn.cursor() as mc:
                     superseded_ids = _supersede_previous_voice_revisions_on_cursor(
                         mc,
@@ -10857,14 +10910,45 @@ def chat_append_and_enqueue(
                         priority=priority, deadline_at=None,
                         expected_generation=expected_generation,
                     )
-        return seq, job_id, storage_generation, True, superseded_ids
+        return (
+            seq,
+            job_id,
+            storage_generation,
+            True,
+            superseded_ids,
+            preempted_jobs,
+        )
 
     def _finish(
-        result: tuple[int, int | None, int, bool, list[str]],
+        result: tuple[
+            int, int | None, int, bool, list[str], list[jobs_store.PreemptedJob]
+        ],
     ) -> tuple[int, int | None]:
-        seq, job_id, storage_generation, inserted, superseded_ids = result
+        (
+            seq,
+            job_id,
+            storage_generation,
+            inserted,
+            superseded_ids,
+            _preempted_jobs,
+        ) = result
         if not inserted:
             return seq, None
+        # The authoritative owner invalidation has committed before _finish is
+        # entered.  NOTIFY is intentionally best-effort acceleration; a lost
+        # event is repaired by the parent reconciliation loop.
+        from core import wake_bus as core_wake_bus
+
+        for preempted in _preempted_jobs:
+            if preempted.claimed_by is None:
+                continue
+            core_wake_bus.notify_job_cancel(
+                core_wake_bus.JobCancellation(
+                    job_id=preempted.job_id,
+                    claimed_by=preempted.claimed_by,
+                    reason="foreground_chat_preempted",
+                )
+            )
         _mirror_superseded_voice_revisions(
             user_id,
             superseded_ids,

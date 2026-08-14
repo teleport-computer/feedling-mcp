@@ -102,7 +102,7 @@ def _wake_deps(*, summary="", tail=None):
         resolve_provider=lambda uid: (_BYOK, {}),
         mint_enclave_token=lambda uid: "rt",
         read_tail=lambda uid, after_ts, limit: list(tail if tail is not None else []),
-        read_summary=lambda uid: (summary, 0.0, 0),
+        has_genuine_user_history=lambda _uid: True,
         apply_pending_effects=_apply_effects,
     )
 

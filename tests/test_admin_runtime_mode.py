@@ -35,6 +35,8 @@ pytestmark = pytest.mark.skipif(
 )
 
 ADMIN_TOKEN = "admin-test-token"
+_SEED_CREATED_AT = "2026-08-14T00:00:00+00:00"
+_SEEDED_USER_IDS: set[str] = set()
 
 
 def _build_asgi_app() -> FastAPI:
@@ -50,7 +52,32 @@ _ASGI = _build_asgi_app()
 @pytest.fixture()
 def env(monkeypatch):
     monkeypatch.setenv("FEEDLING_ADMIN_TOKEN", ADMIN_TOKEN)
-    yield
+    _SEEDED_USER_IDS.clear()
+    try:
+        yield
+    finally:
+        user_ids = tuple(_SEEDED_USER_IDS)
+        if user_ids:
+            try:
+                with db.get_pool().connection() as conn:
+                    conn.execute(
+                        "DELETE FROM v2_wake_schedule WHERE user_id = ANY(%s)",
+                        (list(user_ids),),
+                    )
+                    conn.execute(
+                        "DELETE FROM users WHERE user_id = ANY(%s)",
+                        (list(user_ids),),
+                    )
+            finally:
+                from accounts import registry
+
+                with registry._users_lock:
+                    registry._users[:] = [
+                        row
+                        for row in registry._users
+                        if row.get("user_id") not in user_ids
+                    ]
+        _SEEDED_USER_IDS.clear()
 
 
 def _uid(prefix: str) -> str:
@@ -58,7 +85,8 @@ def _uid(prefix: str) -> str:
 
 
 def _seed_model_api_user(user_id: str) -> None:
-    seed_user(user_id)
+    _SEEDED_USER_IDS.add(user_id)
+    seed_user(user_id, created_at=_SEED_CREATED_AT)
     configure_model_api_route(user_id, provider="anthropic", model="x", test_status="ok")
 
 
@@ -180,7 +208,8 @@ def test_post_resident_mode_rejected_under_v2_only_policy_env(env, monkeypatch):
 
 def test_post_user_with_no_model_api_config_returns_400(env):
     uid = _uid("rtmode_noconfig")
-    seed_user(uid)  # no model_api blob written
+    _SEEDED_USER_IDS.add(uid)
+    seed_user(uid, created_at=_SEED_CREATED_AT)  # no model_api blob written
 
     status, body = _asgi_json(
         "POST", "/v1/admin/hosted-runtime-mode", headers=_admin(),

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+from datetime import date, datetime, timezone
 import os
 import sys
 import threading
@@ -115,6 +116,7 @@ def _clean_agent_jobs_table(monkeypatch):
     monkeypatch.setenv("FEEDLING_V2_TRAJECTORY_REVIEW_ENABLED", "1")
     monkeypatch.setenv("FEEDLING_V2_TRAJECTORY_REVIEW_MAX_ACTIVE", "64")
     with db.get_pool().connection() as conn:
+        conn.execute("DELETE FROM v2_wake_shadow_decisions")
         conn.execute("DELETE FROM agent_jobs")
         conn.execute("DELETE FROM v2_runtime_state")
     yield
@@ -126,6 +128,158 @@ def test_enqueue_returns_job_id_and_not_coalesced_first_time():
     job_id, coalesced = jobs_store.enqueue_job("u_js_1", "chat", reason="hi")
     assert isinstance(job_id, int) and job_id > 0
     assert coalesced is False
+
+
+def test_wake_shadow_observations_are_idempotent_and_reportable():
+    uid = "u_wake_shadow_report"
+    seed_user(uid)
+    _reset(uid)
+    heartbeat_id, _ = jobs_store.enqueue_job(uid, "heartbeat")
+    scheduled_id, _ = jobs_store.enqueue_job(uid, "scheduled")
+    screen_id, _ = jobs_store.enqueue_job(uid, "screen_watch")
+    day = date(2026, 8, 14)
+    decided_at = datetime(2026, 8, 14, 15, 0, tzinfo=timezone.utc)
+
+    assert jobs_store.record_wake_shadow_decision(
+        job_id=heartbeat_id,
+        local_day=day,
+        local_hour=23,
+        local_minute=8,
+        lane="heartbeat",
+        decision_allowed=True,
+        apns_alert_sent=True,
+        decided_at=decided_at,
+    ) is True
+    assert jobs_store.record_wake_shadow_decision(
+        job_id=scheduled_id,
+        local_day=day,
+        local_hour=2,
+        local_minute=40,
+        lane="scheduled",
+        decision_allowed=True,
+        apns_alert_sent=False,
+        decided_at=decided_at,
+    ) is True
+    assert jobs_store.record_wake_shadow_decision(
+        job_id=screen_id,
+        local_day=day,
+        local_hour=12,
+        local_minute=0,
+        lane="screen_watch",
+        decision_allowed=False,
+        apns_alert_sent=False,
+        decided_at=decided_at,
+    ) is True
+    # Same source job cannot inflate the report if the best-effort observer is
+    # replayed after a worker retry.
+    assert jobs_store.record_wake_shadow_decision(
+        job_id=heartbeat_id,
+        local_day=day,
+        local_hour=9,
+        local_minute=9,
+        lane="heartbeat",
+        decision_allowed=False,
+        apns_alert_sent=False,
+        decided_at=decided_at,
+    ) is False
+
+    # Queue cleanup must not erase the observation window. job_id is only the
+    # stable idempotency key in this table, not a foreign-key lifecycle tie.
+    with db.get_pool().connection() as conn:
+        conn.execute("DELETE FROM agent_jobs WHERE id=%s", (heartbeat_id,))
+
+    report = jobs_store.wake_shadow_report(
+        days=2,
+        bucket_start_hour=23,
+        bucket_end_hour=7,
+        through_day=day,
+    )
+
+    assert report["bucket"] == {
+        "start_hour_inclusive": 23,
+        "end_hour_exclusive": 7,
+        "crosses_midnight": True,
+        "purpose": "observation_only_not_product_policy",
+    }
+    assert {
+        key: report[key]
+        for key in (
+            "total_decisions",
+            "allowed",
+            "suppressed",
+            "apns_alert_sent",
+            "bucket_allowed",
+            "bucket_allowed_apns_alert_sent",
+        )
+    } == {
+        "total_decisions": 3,
+        "allowed": 2,
+        "suppressed": 1,
+        "apns_alert_sent": 1,
+        "bucket_allowed": 2,
+        "bucket_allowed_apns_alert_sent": 1,
+    }
+    assert report["by_lane"]["heartbeat"]["total_decisions"] == 1
+    assert report["by_lane"]["scheduled"]["bucket_allowed"] == 1
+    assert report["by_lane"]["screen_watch"]["suppressed"] == 1
+
+
+def test_wake_shadow_prunes_its_own_90_day_retention_window():
+    uid = "u_wake_shadow_retention"
+    seed_user(uid)
+    _reset(uid)
+    old_id, _ = jobs_store.enqueue_job(uid, "heartbeat")
+    fresh_id, _ = jobs_store.enqueue_job(uid, "scheduled")
+
+    assert jobs_store.record_wake_shadow_decision(
+        job_id=old_id,
+        local_day=date.today(),
+        local_hour=1,
+        local_minute=0,
+        lane="heartbeat",
+        decision_allowed=False,
+        apns_alert_sent=False,
+        decided_at=time.time(),
+    ) is True
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            "UPDATE v2_wake_shadow_decisions "
+            "SET recorded_at=now() - interval '91 days' WHERE job_id=%s",
+            (old_id,),
+        )
+
+    assert jobs_store.record_wake_shadow_decision(
+        job_id=fresh_id,
+        local_day=date.today(),
+        local_hour=2,
+        local_minute=0,
+        lane="scheduled",
+        decision_allowed=True,
+        apns_alert_sent=False,
+        decided_at=time.time(),
+    ) is True
+    with db.get_pool().connection() as conn:
+        ids = {
+            int(row[0])
+            for row in conn.execute(
+                "SELECT job_id FROM v2_wake_shadow_decisions"
+            ).fetchall()
+        }
+    assert ids == {fresh_id}
+
+
+def test_wake_shadow_rejects_impossible_apns_alert_observation():
+    with pytest.raises(ValueError, match="suppressed wake cannot send an APNs alert"):
+        jobs_store.record_wake_shadow_decision(
+            job_id=1,
+            local_day="2026-08-14",
+            local_hour=1,
+            local_minute=2,
+            lane="heartbeat",
+            decision_allowed=False,
+            apns_alert_sent=True,
+            decided_at=0.0,
+        )
 
 
 @pytest.mark.parametrize("raw", ["0", "-1", "nan", "inf", "nope"])
@@ -436,6 +590,100 @@ def test_terminal_failure_reply_is_encrypted_linked_classified_and_idempotent(
     assert parent["reply_message_id"] == failure["id"]
     assert parent["reply_error_class"] == "quota_insufficient"
     assert v2_cursor.load_seq(core_store.get_store(uid)) == parent_seq
+
+
+def test_scheduled_failure_reply_is_standalone_visible_and_idempotent(monkeypatch):
+    uid = "u_js_scheduled_terminal_reply"
+    seed_user(uid)
+    _reset(uid)
+    _seed_active_route(uid)
+    _append_user_message(uid)
+    cursor_before = v2_cursor.load_seq(core_store.get_store(uid))
+    encrypted_plaintexts: list[str] = []
+
+    def capture_failure_envelope(store, plaintext, *, item_id=None):
+        encrypted_plaintexts.append(plaintext.decode("utf-8"))
+        return _fake_failure_envelope(store, plaintext, item_id=item_id)
+
+    monkeypatch.setattr(
+        core_envelope,
+        "_build_shared_envelope_for_store",
+        capture_failure_envelope,
+    )
+    job_id, _ = jobs_store.enqueue_job(uid, "scheduled")
+    db.log_append(
+        uid,
+        jobs_store.SCHEDULED_WAKE_STREAM,
+        {
+            "status": "fired",
+            "fired_job_id": job_id,
+            "note": "提醒我喝水",
+        },
+        item_key="timer-water",
+    )
+    jobs_store.claim_next_job("w")
+    assert jobs_store.mark_failed(
+        job_id,
+        "wake_failed:empty_reply",
+        claimed_by="w",
+        error_class="provider_empty_reply",
+    )
+
+    with db.get_pool().connection() as conn:
+        marker = conn.execute(
+            "SELECT reply_frontier_seq,reply_parent_message_id "
+            "FROM v2_terminal_failure_outbox WHERE job_id=%s",
+            (job_id,),
+        ).fetchone()
+    assert marker == (None, None)
+
+    recorded = []
+    first = jobs_store.reconcile_terminal_failure_outbox(
+        record_terminal_error=lambda *args: recorded.append(args),
+        job_id=job_id,
+    )
+    second = jobs_store.reconcile_terminal_failure_outbox(
+        record_terminal_error=lambda *args: recorded.append(args),
+        job_id=job_id,
+    )
+
+    assert first == {
+        "examined": 1,
+        "status_delivered": 1,
+        "runtime_error_delivered": 1,
+        "reply_delivered": 1,
+    }
+    assert second == {
+        "examined": 0,
+        "status_delivered": 0,
+        "runtime_error_delivered": 0,
+        "reply_delivered": 0,
+    }
+    assert recorded == [], "scheduled failure must not poison the active chat route"
+    failures = [
+        row for row in db.chat_load_strict(uid)
+        if str(row.get("terminal_failure_job_id") or "") == str(job_id)
+    ]
+    assert len(failures) == 1
+    failure = failures[0]
+    assert failure.get("reply_to_message_id") in {None, ""}
+    assert failure["wake_kind"] == "scheduled"
+    assert failure["notice_kind"] == "scheduled_wake_failure"
+    assert failure["turn_failure_error_class"] == "provider_empty_reply"
+    assert "定时任务" in encrypted_plaintexts[0]
+    assert "已触发" in encrypted_plaintexts[0]
+    assert "提醒我喝水" in encrypted_plaintexts[0]
+    assert "空回复" in encrypted_plaintexts[0]
+    parent = db.chat_get_strict(uid, "parent-user")
+    assert not str(parent.get("reply_message_id") or "")
+    assert v2_cursor.load_seq(core_store.get_store(uid)) == cursor_before
+    with db.get_pool().connection() as conn:
+        route_error = conn.execute(
+            "SELECT last_runtime_error FROM model_api_routes "
+            "WHERE user_id=%s AND is_active",
+            (uid,),
+        ).fetchone()[0]
+    assert route_error == ""
 
 
 def test_terminal_image_generation_configuration_failure_never_uses_slow_fallback(
@@ -1366,8 +1614,8 @@ def test_completed_wake_retry_cannot_overwrite_newer_glance_source():
 
 
 def test_live_worker_count_counts_only_recent():
-    jobs_store.record_worker_heartbeat("w-fresh-1")
-    jobs_store.record_worker_heartbeat("w-fresh-2")
+    jobs_store.record_worker_heartbeat("w-fresh-1", pool="foreground")
+    jobs_store.record_worker_heartbeat("w-fresh-2", pool="foreground")
     # 塞一个陈旧心跳（beat_at 在窗口外）
     with db.get_pool().connection() as conn:
         conn.execute(
@@ -1389,6 +1637,93 @@ def test_inflight_job_count_counts_active_states():
     before = jobs_store.inflight_job_count()
     jobs_store.enqueue_job("u_js_11", "chat", reason="t")
     assert jobs_store.inflight_job_count() == before + 1
+
+
+def test_inflight_job_count_filters_foreground_and_background_lanes():
+    foreground = {"chat", "manual_wake"}
+    background = {"profile", "dream"}
+    before_all = jobs_store.inflight_job_count()
+    before_foreground = jobs_store.inflight_job_count(lanes=foreground)
+    before_background = jobs_store.inflight_job_count(lanes=background)
+
+    seed_user("u_js_inflight_foreground")
+    jobs_store.enqueue_job("u_js_inflight_foreground", "chat", reason="t")
+    for index in range(7):
+        user_id = f"u_js_inflight_background_{index}"
+        lane = "profile" if index % 2 == 0 else "dream"
+        seed_user(user_id)
+        jobs_store.enqueue_job(user_id, lane, reason="t")
+
+    assert jobs_store.inflight_job_count(lanes=foreground) == before_foreground + 1
+    assert jobs_store.inflight_job_count(lanes=background) == before_background + 7
+    assert jobs_store.inflight_job_count() == before_all + 8
+
+
+def test_recover_killed_chat_is_exact_and_queues_terminal_failure():
+    uid = "u_js_exact_watchdog_chat"
+    seed_user(uid)
+    _reset(uid)
+    chat_id, _ = jobs_store.enqueue_job(uid, "chat")
+    other_id, _ = jobs_store.enqueue_job(uid, "profile")
+    claimed = jobs_store.claim_next_job("foreground-0:g7", lanes={"chat"})
+    assert claimed is not None and int(claimed["id"]) == chat_id
+    assert jobs_store.mark_running(chat_id, claimed_by="foreground-0:g7")
+
+    recovered = jobs_store.recover_killed_job(
+        job_id=chat_id, claimed_by="foreground-0:g7"
+    )
+
+    assert recovered == {
+        "job_id": chat_id,
+        "user_id": uid,
+        "lane": "chat",
+        "recovery": "terminal",
+    }
+    with db.get_pool().connection() as conn:
+        chat = conn.execute(
+            "SELECT status,last_error,claimed_by FROM agent_jobs WHERE id=%s",
+            (chat_id,),
+        ).fetchone()
+        other = conn.execute(
+            "SELECT status FROM agent_jobs WHERE id=%s", (other_id,)
+        ).fetchone()
+        outbox = conn.execute(
+            "SELECT error_code FROM v2_terminal_failure_outbox WHERE job_id=%s",
+            (chat_id,),
+        ).fetchone()
+    assert chat == ("expired", "slot_watchdog_timeout", None)
+    assert other == ("pending",)
+    assert outbox == ("slot_watchdog_timeout",)
+    assert jobs_store.recover_killed_job(
+        job_id=chat_id, claimed_by="foreground-0:g7"
+    ) is None
+
+
+@pytest.mark.parametrize("lane", ["profile", "scheduled", "capture"])
+def test_recover_killed_background_requeues_exact_claim(lane):
+    uid = f"u_js_exact_watchdog_{lane}"
+    seed_user(uid)
+    _reset(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, lane)
+    claimed = jobs_store.claim_next_job(f"{lane}-owner", lanes={lane})
+    assert claimed is not None and int(claimed["id"]) == job_id
+    assert jobs_store.mark_running(job_id, claimed_by=f"{lane}-owner")
+
+    assert jobs_store.recover_killed_job(
+        job_id=job_id, claimed_by="wrong-owner"
+    ) is None
+    recovered = jobs_store.recover_killed_job(
+        job_id=job_id, claimed_by=f"{lane}-owner"
+    )
+
+    assert recovered["recovery"] == "requeued"
+    with db.get_pool().connection() as conn:
+        row = conn.execute(
+            "SELECT status,last_error,claimed_by,lease_expires_at "
+            "FROM agent_jobs WHERE id=%s",
+            (job_id,),
+        ).fetchone()
+    assert row == ("pending", "slot_watchdog_timeout", None, None)
 
 
 def test_recent_mean_service_sec_none_without_history():
@@ -1431,8 +1766,10 @@ def test_genesis_heartbeat_does_not_inflate_turn_worker_liveness():
     single-process pool and over-admit onto turn slots that do not exist.
     """
     _clear_heartbeats()
-    jobs_store.record_worker_heartbeat("w1")  # default kind='turn'
-    jobs_store.record_worker_heartbeat("w1:genesis", kind="genesis")
+    jobs_store.record_worker_heartbeat("w1", pool="foreground")
+    jobs_store.record_worker_heartbeat(
+        "w1:genesis", pool="control", kind="genesis"
+    )
 
     assert jobs_store.live_worker_count() == 1
     assert jobs_store.workers_alive() is True
@@ -1442,7 +1779,9 @@ def test_genesis_heartbeat_does_not_inflate_turn_worker_liveness():
 def test_genesis_heartbeat_alone_does_not_open_the_send_gate():
     """Genesis alive but every turn worker dead => send must still 503."""
     _clear_heartbeats()
-    jobs_store.record_worker_heartbeat("only:genesis", kind="genesis")
+    jobs_store.record_worker_heartbeat(
+        "only:genesis", pool="control", kind="genesis"
+    )
 
     assert jobs_store.workers_alive() is False
     assert jobs_store.live_worker_count() == 0
@@ -1456,9 +1795,17 @@ def test_genesis_worker_alive_false_when_nothing_beats():
 
 def test_recent_worker_heartbeats_returns_identity_kind_capacity_and_db_age():
     _clear_heartbeats()
-    jobs_store.record_worker_heartbeat("v2-worker-new-deadbeef1234", capacity=4)
     jobs_store.record_worker_heartbeat(
-        "v2-worker-new-deadbeef1234:genesis", kind="genesis", capacity=0
+        "v2-worker-new-deadbeef1234",
+        pool="foreground",
+        capacity=4,
+        runtime_state={"slot": "foreground-0", "job_id": "job-123"},
+    )
+    jobs_store.record_worker_heartbeat(
+        "v2-worker-new-deadbeef1234:genesis",
+        pool="control",
+        kind="genesis",
+        capacity=0,
     )
     with db.get_pool().connection() as conn:
         conn.execute(
@@ -1476,7 +1823,14 @@ def test_recent_worker_heartbeats_returns_identity_kind_capacity_and_db_age():
     turn = next(row for row in rows if row["kind"] == "turn")
     genesis = next(row for row in rows if row["kind"] == "genesis")
     assert turn["capacity"] == 4
+    assert turn["pool"] == "foreground"
+    assert turn["runtime_state"] == {
+        "slot": "foreground-0",
+        "job_id": "job-123",
+    }
     assert genesis["capacity"] == 0
+    assert genesis["pool"] == "control"
+    assert genesis["runtime_state"] == {}
     assert turn["age_sec"] >= 0
     assert isinstance(turn["beat_at_epoch"], float)
 
@@ -1759,81 +2113,3 @@ def test_backlog_scanner_returns_the_worst_backlog_first():
     ]
 
     assert ordered == [large, small]
-
-
-# --- persisted effective batch cap ------------------------------------------
-#
-# Both folds shrink their batch on refusal, but the shrunk value used to be a
-# local: the next job started at the full batch again and burned one
-# guaranteed-to-fail model call rediscovering the same limit.
-
-
-def test_effective_batch_cap_is_unset_for_a_new_conversation():
-    uid = f"usr_cap_new_{uuid.uuid4().hex[:8]}"
-    seed_user(uid)
-    assert db.v2_effective_batch_cap(uid) is None
-
-
-def test_effective_batch_cap_round_trips():
-    uid = f"usr_cap_rt_{uuid.uuid4().hex[:8]}"
-    seed_user(uid)
-    _set_watermark(uid, 0)  # the row a first fold would have written
-    db.v2_set_effective_batch_cap(uid, 12)
-    assert db.v2_effective_batch_cap(uid) == 12
-    db.v2_set_effective_batch_cap(uid, 37)
-    assert db.v2_effective_batch_cap(uid) == 37
-
-
-def test_writing_the_cap_never_fabricates_a_summary_row():
-    """Inserting here would wedge the very fold this is meant to help.
-
-    A fabricated row carries version=0. The fold reads "no summary", computes
-    its write against that absence, and its CAS then collides with the row the
-    bookkeeping invented — failing the whole job with summary_cas_lost. So a
-    conversation with no summary keeps no memory until its first fold lands.
-    """
-    uid = f"usr_cap_nosummary_{uuid.uuid4().hex[:8]}"
-    seed_user(uid)
-    with db.get_pool().connection() as conn:
-        conn.execute("DELETE FROM v2_conversation_summary WHERE user_id=%s", (uid,))
-
-    db.v2_set_effective_batch_cap(uid, 8)
-
-    assert db.v2_effective_batch_cap(uid) is None
-    with db.get_pool().connection() as conn:
-        rows = conn.execute(
-            "SELECT count(*) FROM v2_conversation_summary WHERE user_id=%s", (uid,)
-        ).fetchone()[0]
-    assert rows == 0, "bookkeeping must not create a summary row"
-
-
-def test_effective_batch_cap_never_persists_a_useless_value():
-    """Zero or negative would wedge the fold at an empty batch forever."""
-    uid = f"usr_cap_floor_{uuid.uuid4().hex[:8]}"
-    seed_user(uid)
-    _set_watermark(uid, 0)
-    db.v2_set_effective_batch_cap(uid, 0)
-    assert db.v2_effective_batch_cap(uid) == 1
-    db.v2_set_effective_batch_cap(uid, -5)
-    assert db.v2_effective_batch_cap(uid) == 1
-
-
-def test_writing_the_cap_does_not_disturb_the_watermark():
-    """The cap is bookkeeping; it must never touch fold coverage or its CAS."""
-    uid = f"usr_cap_isolation_{uuid.uuid4().hex[:8]}"
-    seed_user(uid)
-    with db.get_pool().connection() as conn:
-        conn.execute(
-            "INSERT INTO v2_conversation_summary (user_id, watermark_seq, version) "
-            "VALUES (%s, 4242, 7) ON CONFLICT (user_id) DO UPDATE "
-            "SET watermark_seq=4242, version=7",
-            (uid,),
-        )
-    db.v2_set_effective_batch_cap(uid, 6)
-    with db.get_pool().connection() as conn:
-        watermark, version = conn.execute(
-            "SELECT watermark_seq, version FROM v2_conversation_summary "
-            "WHERE user_id=%s",
-            (uid,),
-        ).fetchone()
-    assert (watermark, version) == (4242, 7)

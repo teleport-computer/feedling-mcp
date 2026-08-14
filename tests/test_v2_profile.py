@@ -187,6 +187,15 @@ def test_generate_profile_single_call_returns_overlap_telemetry():
     assert usages == [{"input_tokens": 10}]
     assert events == [
         (
+            "provider_request",
+            {
+                "tail_window": {
+                    "lane": "profile",
+                    "profile_cards_truncated": False,
+                }
+            },
+        ),
+        (
             "profile_provider_response_observed",
             {
                 "provider_call": 1,
@@ -259,7 +268,12 @@ def test_shape_error_bounces_once_with_content_free_correction():
     assert "SECRET-REPLY" not in correction
     assert "SOURCE-CONTEXT" not in correction
     assert "JSON" in correction
-    assert events[1] == (
+    assert [kind for kind, _payload in events[:3]] == [
+        "provider_request",
+        "profile_provider_response_observed",
+        "profile_parse_bounced",
+    ]
+    assert events[2] == (
         "profile_parse_bounced",
         {"reason": "reply_not_json"},
     )

@@ -10,6 +10,78 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **Hosted Runtime V2 isolates foreground Chat from background maintenance.**
+  Chat/manual-wake, ambient-wake, and Heavy maintenance work now use separate
+  capacity pools with one OS process per worker slot. Background work therefore
+  cannot consume every Chat execution slot, and a hung Job can be recovered by
+  restarting its one slot without restarting healthy sibling Jobs. Profile
+  reads are batched and limited to one concurrent run per service instance.
+
+- **Hosted Runtime V2 proactive turns remain compatible with Claude 4.6 and
+  later.** Scheduled reminders, heartbeat, manual wake, and screen-watch turns
+  retain dynamic runtime context as non-user application data, then end the
+  provider request with one fixed, content-free transport marker. This avoids
+  the unsupported assistant-prefill request shape without attributing reminder
+  text, sensor context, or a new request to the user. The model still decides
+  whether weak wakes speak; scheduled reminders still require delivery.
+
+- **Hosted Runtime V2 scheduled reminders no longer disappear after a model or
+  provider failure.** A content-free reminder response gets one bounded retry
+  with a reminder-specific correction. If delivery still fails, the runtime
+  writes one encrypted, standalone failure result containing the original
+  reminder note and a safe error explanation. This result is idempotent,
+  survives worker crashes and lease expiry, does not attach itself to an older
+  user message, and does not advance that message's reply cursor. Heartbeat,
+  manual-wake, and screen-watch silence remains unchanged.
+
+- **`memory_search` guidance documents literal matching and allows a reworded
+  retry.** Matching is a case-insensitive literal substring with no synonyms,
+  translation, or stemming, so an empty result means that wording is absent
+  rather than that the memory is missing. The tool guidance no longer tells the
+  model to stop after one discovery result; it directs a retry with different
+  wording and refuses only an identical repeat of the same arguments. Request
+  and response shapes are unchanged.
+
+- **Hosted Runtime V2 no longer exposes serialized provider response wrappers
+  as assistant text.** A complete relay envelope containing Gemini response
+  metadata and a transport trace ID is treated as content-free provider output,
+  retried once with a bounded correction, and never delivered to foreground or
+  proactive reply surfaces. Ordinary JSON answers and code examples remain
+  unchanged.
+
+- **Hosted Runtime V2 removes leaked tool-call markup from visible replies.**
+  A closed set of XML-like function-call markers, including singular/plural
+  forms and optional namespace prefixes, is stripped before foreground or
+  proactive text is delivered, including heartbeat, scheduled, manual-wake,
+  and screen-watch replies. Normal angle-bracket text, HTML examples, and
+  fenced code remain unchanged. Useful text beside a leaked block is preserved,
+  and a reply wrapped entirely inside tool markup keeps its payload.
+
+- **Runtime V2 no longer falls back to raw provider chain-of-thought while
+  self-authored thinking is enabled.** Chat and proactive replies show io's
+  bounded `<think>` summary when present; otherwise the reply has no thinking
+  attachment. The existing incomplete-summary marker is unchanged. Setting
+  `FEEDLING_V2_SELF_THINKING=0` retains the legacy native-reasoning display for
+  self-hosted operators. A content-free per-turn diagnostic records only the
+  selected branch, character count, model name, and lane; it never includes the
+  thinking text or a fragment of it.
+- **Runtime V2 can search multiple memory subjects in one Chat turn.** Distinct
+  `memory_search` queries are now dispatched independently, including when the
+  model requests them in one batch; an exact repeated query still reuses its
+  prior result, and the once-per-turn `memory_index` overview is unchanged.
+- **Memory-search diagnostics now distinguish execution from reuse without
+  storing query text.** The operator-only debug trace separates
+  `memory.search.called` from `memory.index.called`, reports the confirmed hit
+  count and limit, and exposes only a short SHA-256 query fingerprint for
+  same-query comparison. Runtime V2 also marks discovery calls that were
+  deduplicated before dispatch.
+
+- **Managed Phala deployments can retain bounded CPU history.** The measured
+  test and production CVM topology records one-minute host and container CPU
+  samples in a private persistent volume for 30 UTC calendar days. A narrowly
+  allowlisted internal socket proxy exposes only the Docker reads required by
+  the recorder; no public metrics endpoint, application content collection, or
+  alerting is introduced.
 - **Plaintext accounts can send hosted Chat images and files and upload capture
   media without an enclave dependency.** Hosted image and PDF/file bodies now
   use the strict binary `body_b64` envelope instead of being decoded as UTF-8,
@@ -696,19 +768,12 @@ change must not be interpreted as an API guarantee.
   receive the same ciphertext document; only state, character counts, source
   counts, and generation/retry timestamps remain plaintext metadata.
 
-- **Runtime V2 can advance conversation coverage without steady-state
-  background model calls.** The default-off
-  `FEEDLING_V2_PROFILE_COVERAGE_DETERMINISTIC` worker switch replaces
-  provider-backed maintenance and inline catch-up folds with exact,
-  content-free count leaves. Deterministic fan-out checkpoints keep the
-  canonical frontier and encrypted materialized head bounded. Synthetic
-  `verify_ping` and `resident_maintenance` rows remain excluded from both the
-  source bounds and immutable coverage witnesses; encrypted Chat rows remain
-  the durable source ledger. Disabling the switch restores the existing
-  provider-backed summary path. Enable it only after the bounded Memory/User
-  prompt path is deployed and verified. Existing legacy model-written frontier
-  nodes can still require a provider-backed rollup during migration, so zero
-  background calls is the steady state.
+- **Runtime V2 removed provider-backed conversation summarization.** MEMORY/USER
+  is now the sole long-term semantic layer. Conversation maintenance advances
+  exact history coverage with local count sentinels, while encrypted Chat rows
+  remain the durable source ledger. Existing model-authored segments remain
+  readable until metadata-only checkpoints replace them in the canonical
+  frontier.
 
 - **Memory action batches now isolate item failures.** A structurally valid
   `POST /v1/memory/actions` batch processes every item and returns per-item

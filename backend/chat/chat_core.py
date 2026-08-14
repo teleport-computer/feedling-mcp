@@ -216,7 +216,7 @@ def _is_resident_maintenance_reply(store: UserStore, payload: dict | None) -> bo
     )
 
 
-FIRST_CHAT_OK_USER_SOURCES = {"chat", "model_api"}
+FIRST_CHAT_OK_USER_SOURCES = db.FIRST_CHAT_OK_USER_SOURCES
 
 
 def _maybe_mark_first_chat_ok(store: UserStore, reply_to_message_id: str) -> None:
@@ -1394,7 +1394,7 @@ def verify_loop(store: UserStore, payload: dict) -> tuple[dict, int]:
         if v2_mode:
             from model_api_runtime.v2 import jobs_store
 
-            alive = jobs_store.workers_alive()
+            alive = jobs_store.workers_alive(pool="foreground")
             if alive:
                 boot_gates._log_bootstrap_event(
                     store, "chat_loop_verified", success=True

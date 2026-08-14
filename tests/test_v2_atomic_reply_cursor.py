@@ -48,6 +48,7 @@ def _reset(uid: str) -> None:
         conn.execute("DELETE FROM v2_effect_outbox WHERE user_id=%s", (uid,))
         conn.execute("DELETE FROM v2_effect_sink_applied")
         conn.execute("DELETE FROM runtime_state WHERE user_id=%s", (uid,))
+        conn.execute("DELETE FROM v2_runtime_state WHERE user_id=%s", (uid,))
         conn.execute("DELETE FROM user_blobs WHERE user_id=%s", (uid,))
         conn.execute("DELETE FROM chat_messages WHERE user_id=%s", (uid,))
         # These tests exercise the V2 sink directly. Production reaches it only
@@ -135,6 +136,169 @@ def test_final_v2_reply_marks_consumed_user_rows_answered_for_resident_rollback(
             {"reply_claimed_by": "resident-consumer", "reply_claim_expires_at": "20"},
             redelivery=True,
         ) is None
+
+
+@pytest.mark.parametrize("source", ["chat", "model_api"])
+def test_final_v2_reply_activates_proactive_after_real_user_success(source):
+    uid = f"u_atomic_reply_activation_{source}"
+    conftest.seed_user(uid)
+    _reset(uid)
+    db.chat_append(
+        uid,
+        "first-user-message",
+        1.0,
+        {
+            "id": "first-user-message",
+            "role": "user",
+            "source": source,
+            "body_ct": "ct",
+        },
+        0,
+    )
+    through_seq = db.chat_seq_for_msg_id(uid, "first-user-message")
+    assert through_seq is not None
+
+    db.chat_append_effect_with_cursor(
+        uid,
+        "first-v2-reply",
+        2.0,
+        {
+            "id": "first-v2-reply",
+            "role": "openclaw",
+            "source": "model_api",
+            "body_ct": "reply",
+            "reply_to_message_id": "first-user-message",
+        },
+        0,
+        through_seq,
+    )
+
+    settings = db.get_blob_strict(uid, "proactive_settings") or {}
+    assert str(settings.get("first_chat_ok_at") or "").strip()
+
+
+@pytest.mark.parametrize(
+    "source",
+    ["verify_ping", "resident_maintenance", "agent_initiated_proactive"],
+)
+def test_final_v2_reply_does_not_activate_from_non_user_chat_sources(source):
+    uid = f"u_atomic_reply_no_activation_{source}"
+    conftest.seed_user(uid)
+    _reset(uid)
+    db.chat_append(
+        uid,
+        "non-chat-parent",
+        1.0,
+        {
+            "id": "non-chat-parent",
+            "role": "user",
+            "source": source,
+            "body_ct": "ct",
+        },
+        0,
+    )
+    through_seq = db.chat_seq_for_msg_id(uid, "non-chat-parent")
+    assert through_seq is not None
+
+    db.chat_append_effect_with_cursor(
+        uid,
+        "non-chat-reply",
+        2.0,
+        {
+            "id": "non-chat-reply",
+            "role": "openclaw",
+            "source": "model_api",
+            "body_ct": "reply",
+            "reply_to_message_id": "non-chat-parent",
+        },
+        0,
+        through_seq,
+    )
+
+    settings = db.get_blob_strict(uid, "proactive_settings") or {}
+    assert str(settings.get("first_chat_ok_at") or "").strip() == ""
+
+
+def test_final_v2_failure_reply_does_not_activate_proactive():
+    uid = "u_atomic_reply_no_activation_failure"
+    conftest.seed_user(uid)
+    _reset(uid)
+    db.chat_append(
+        uid,
+        "failed-user-message",
+        1.0,
+        {
+            "id": "failed-user-message",
+            "role": "user",
+            "source": "model_api",
+            "body_ct": "ct",
+        },
+        0,
+    )
+    through_seq = db.chat_seq_for_msg_id(uid, "failed-user-message")
+    assert through_seq is not None
+
+    db.chat_append_effect_with_cursor(
+        uid,
+        "failed-v2-reply",
+        2.0,
+        {
+            "id": "failed-v2-reply",
+            "role": "openclaw",
+            "source": "model_api",
+            "body_ct": "fallback",
+            "reply_to_message_id": "failed-user-message",
+            "turn_failure_error_class": "upstream_unavailable",
+        },
+        0,
+        through_seq,
+    )
+
+    settings = db.get_blob_strict(uid, "proactive_settings") or {}
+    assert str(settings.get("first_chat_ok_at") or "").strip() == ""
+
+
+def test_final_v2_reply_preserves_existing_activation_timestamp():
+    uid = "u_atomic_reply_activation_idempotent"
+    conftest.seed_user(uid)
+    _reset(uid)
+    existing = "2026-08-01T12:34:56"
+    db.patch_proactive_settings_strict(
+        uid,
+        {"version": 2, "first_chat_ok_at": existing},
+    )
+    db.chat_append(
+        uid,
+        "later-user-message",
+        1.0,
+        {
+            "id": "later-user-message",
+            "role": "user",
+            "source": "model_api",
+            "body_ct": "ct",
+        },
+        0,
+    )
+    through_seq = db.chat_seq_for_msg_id(uid, "later-user-message")
+    assert through_seq is not None
+
+    db.chat_append_effect_with_cursor(
+        uid,
+        "later-v2-reply",
+        2.0,
+        {
+            "id": "later-v2-reply",
+            "role": "openclaw",
+            "source": "model_api",
+            "body_ct": "reply",
+            "reply_to_message_id": "later-user-message",
+        },
+        0,
+        through_seq,
+    )
+
+    settings = db.get_blob_strict(uid, "proactive_settings") or {}
+    assert settings.get("first_chat_ok_at") == existing
 
 
 def test_final_v2_fallback_copies_failure_attribution_to_consumed_user_rows():
@@ -1038,7 +1202,6 @@ def test_wake_yields_snapshot_race_input_to_chat_without_duplicate_reply(
         read_summary_with_seq=_summary_with_send_race,
         resolve_provider=lambda _uid: (None, {}),
         mint_enclave_token=lambda _uid: "rt",
-        write_summary=lambda *_args: True,
         apply_pending_effects=serve_worker._apply_pending_effects_for_user,
     )
 
@@ -1190,7 +1353,6 @@ def test_same_timestamp_initial_midturn_and_successor_inputs_are_consumed_once(m
         read_summary_with_seq=_summary_with_snapshot_race,
         resolve_provider=lambda _uid: (None, {}),
         mint_enclave_token=lambda _uid: "rt",
-        write_summary=lambda *_args: True,
         apply_pending_effects=_apply,
     )
 

@@ -2,13 +2,12 @@
 
 from __future__ import annotations
 
-import asyncio
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
-from model_api_runtime.v2 import compaction, context, serve_worker, worker  # noqa: E402
+from model_api_runtime.v2 import context, serve_worker, worker  # noqa: E402
 from voice.message_filter import conversation_rows  # noqa: E402
 
 
@@ -121,48 +120,6 @@ def test_v2_prompt_never_replays_voice_noise_and_labels_the_call_record():
         "抬头必须在逐字记录之前,否则模型先读到对话体再读到说明"
     )
 
-
-def test_future_compaction_omits_voice_artifact_content_but_keeps_coverage():
-    calls = []
-
-    async def llm(_cfg, messages, **_kwargs):
-        calls.append(messages)
-        return {"reply": "- 用户今天在成都"}
-
-    out = asyncio.run(
-        compaction.compact_segment(
-            provider_config=object(),
-            old_messages=_voice_rows(),
-            llm=llm,
-            verbatim_max_chars=0,
-        )
-    )
-    request = str(calls)
-    assert out == "- 用户今天在成都"
-    assert "又是点点点" not in request
-    # 通话记录也要进滚动摘要:否则压缩之后那通电话就彻底不存在了。
-    assert "- 对方: 你好" in request, "通话记录不该被排除在压缩输入之外"
-    assert "那试一条语音吧" not in request
-    assert "可以啊，今天什么时候日落？" in request
-    assert "今天在成都" in request
-
-    calls.clear()
-    # 只含**真正不可见**的行:噪音用户行 + 挂在它下面的回复。
-    # 原来这里切的是 [1:4](多含一张通话卡),那时卡也被丢弃所以整段确实为空;
-    # 现在卡是**可见内容**(它代表真实发生过的一通电话),含卡的段落理应正常
-    # 走摘要而不是被确定性折叠掉 —— 那才是「整段不可见」这条捷径的本意。
-    hidden_only = _voice_rows()[1:3]
-    deterministic = asyncio.run(
-        compaction.compact_segment(
-            provider_config=object(),
-            old_messages=hidden_only,
-            llm=llm,
-        )
-    )
-    assert calls == []
-    assert deterministic == compaction.deterministic_fold(
-        source_message_count=len(hidden_only)
-    )
 
 
 def test_capture_still_expands_structured_archive_instead_of_card_preview():

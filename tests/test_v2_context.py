@@ -26,8 +26,8 @@ def test_build_turn_messages_orders_persona_summary_tail():
     assert msgs[-1]["content"] == "how are you"
 
 
-def test_proactive_application_data_never_serializes_as_a_user_request():
-    """Generated context may inform a wake, but only chat rows may speak as user."""
+def test_proactive_application_data_stays_non_user_with_labeled_turn_boundary():
+    """Dynamic wake data stays assistant-role; only a fixed wire marker is user-role."""
     messages = context.build_turn_messages(
         system_prompt="WAKE",
         summary="remembered summary",
@@ -42,19 +42,26 @@ def test_proactive_application_data_never_serializes_as_a_user_request():
         coverage_hole_notice="older rows omitted",
         temporal_context={"timezone": "Asia/Shanghai"},
         application_data_role="assistant",
+        proactive_turn_boundary=True,
     )
 
-    assert [
+    user_messages = [
         message["content"]
         for message in messages
         if message.get("role") == "user"
-    ] == ["真实消息"]
+    ]
+    assert user_messages == ["真实消息", context.PROACTIVE_TURN_BOUNDARY]
     assert all(
         message["role"] == "assistant"
-        for message in messages[1:]
+        for message in messages[1:-1]
         if message["content"] != "真实消息"
     )
+    assert messages[-1] == {
+        "role": "user",
+        "content": context.PROACTIVE_TURN_BOUNDARY,
+    }
     assert "assistant-role application-data blocks" in messages[0]["content"]
+    assert "does not mean the user spoke" in messages[0]["content"]
 
 
 def test_chat_prompt_forbids_memory_reads_for_standalone_reactions():

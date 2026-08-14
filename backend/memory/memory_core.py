@@ -20,6 +20,7 @@ the action executor) so the framework adapter just serializes it.
 
 from __future__ import annotations
 
+import hashlib
 import uuid
 from datetime import datetime
 
@@ -81,6 +82,15 @@ def existing_terms(store, api_key, *, post_enclave) -> tuple[list[str], list[str
 # --------------------------------------------------------------------------- #
 
 def index(store, api_key, payload: dict, *, post_enclave) -> tuple[dict, int]:
+    query = str(payload.get("query") or "").strip()
+    is_search = bool(query)
+    event_type = "memory.search.called" if is_search else "memory.index.called"
+    operation_label = "search" if is_search else "index"
+    query_fingerprint = (
+        hashlib.sha256(query.encode("utf-8")).hexdigest()[:12]
+        if is_search
+        else ""
+    )
     try:
         requested_limit = memory_readside_core.effective_readside_limit(payload.get("limit"))
     except ValueError:
@@ -93,15 +103,29 @@ def index(store, api_key, payload: dict, *, post_enclave) -> tuple[dict, int]:
             post_enclave=post_enclave,
         )
     except RuntimeError as e:
+        detail = {"counts": {"limit": requested_limit}}
+        if is_search:
+            # The query is end-to-end private. Even the upstream exception can
+            # echo it, so the search event keeps only a stable fingerprint and
+            # a closed failure category.
+            detail.update({
+                "query_fingerprint": query_fingerprint,
+                "reason": "readside_unavailable",
+            })
+        else:
+            detail["reason"] = str(e)[:80]
         debug_trace.trace_event(
-            store, subsystem="memory", type="memory.index.called", actor="agent",
-            status="failed", summary="index failed", detail={"reason": str(e)[:80]})
+            store, subsystem="memory", type=event_type, actor="agent",
+            status="failed", summary=f"{operation_label} failed", detail=detail)
         return {"error": str(e)}, 503
     _items = response.get("items") if isinstance(response.get("items"), list) else []
+    detail = {"counts": {"items": len(_items), "limit": requested_limit}}
+    if is_search:
+        detail["query_fingerprint"] = query_fingerprint
     debug_trace.trace_event(
-        store, subsystem="memory", type="memory.index.called", actor="agent",
-        summary=f"index returned {len(_items)} items",
-        detail={"counts": {"items": len(_items), "limit": requested_limit}},
+        store, subsystem="memory", type=event_type, actor="agent",
+        summary=f"{operation_label} returned {len(_items)} items",
+        detail=detail,
     )
     return response, 200
 

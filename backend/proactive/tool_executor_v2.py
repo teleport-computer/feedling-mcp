@@ -395,7 +395,12 @@ class ToolExecutorV2:
         if call.name == "send_message":
             if not self.adapters.send_message:
                 return ("send_message_adapter_missing", "send_message requires a hosted/resident output adapter")
-            text = sanitize_visible_message_text_v2(args.get("text"))
+            # Availability checking calls the same sanitizer again during real
+            # execution. Suppress the first warning so one leaked message emits
+            # one diagnostic rather than two.
+            text = sanitize_visible_message_text_v2(
+                args.get("text"), log_tool_markup=False
+            )
             if not text:
                 return ("send_message_text_required", "send_message requires non-empty text")
         if call.name == "screen.read" and not self.adapters.screen_read:

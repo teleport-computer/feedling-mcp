@@ -28,7 +28,8 @@
 
 - ✅ P0-1 persona 注入(95bbd545)、P0-2 wake attention_facts+禁令(a53a2923,
   叠加志豪 PR #158 的 nudge 移除/语义恢复/感知 baseline/画像闸)。
-- ✅ test 开关归一「常态全开」:CAPTURE/PROFILE/DETERMINISTIC 硬编码 1,
+- ✅ test 开关归一「常态全开」:CAPTURE/PROFILE 硬编码 1；conversation coverage
+  固定为 metadata-only 单路径,
   PUSH/SELF_THINKING 显式声明(86f0763c/ecb5c055/b49d8b2c;守门测试改为
   按环境分派,prod/pre 原样)。
 - ✅ 四路全环节审计结论:**wake/感知链 ~95% 对齐**(self-loop guard V2 反超
@@ -99,8 +100,8 @@
 
 ### GATED(需 Seven 拍板,不阻塞上述)
 - **PROFILE 双字段 rollout**(agent_memory+user_profile):隐私代价 = 花园
-  明文进 provider;回滚铁律:先关 DETERMINISTIC 再关 PROFILE。
-  P0-1/P1-3 落地后再评估边际收益,拿数据找 Seven 决策。
+  明文进 provider。conversation coverage 不再有运行时开关；需要恢复旧语义
+  compaction 时只能回滚 worker 镜像。
 
 ## 度量
 - 每项各自的 live E2E 探针(本地 rig:serve_dev + dev enclave + 本地 PG,

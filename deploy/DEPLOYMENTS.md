@@ -226,7 +226,7 @@ certificate-chain 与 hostname 验证；不得改成 unverified context、`verif
 | App ID | `9798850e096d770293c67305c6cfdceed68c1d28` |
 | Instance ID | `6fe9b54c9f2b428158c3e74de615d0f0a0c457ba` |
 | Current/live Compose | Deployment unit `deploy/docker-compose.phala.yaml`; recorded live service set: `ingress`, `backend`, `enclave`（`mcp` 服务已随 MCP 线于 2026-06-12 移除） |
-| Release/source topology | The staged `deploy/docker-compose.phala.yaml` definition has `ingress`, `backend`, `enclave`, `enclave-domain`, and `serve-worker`; this source row is not evidence that the custom domain has been deployed or is live. |
+| Release/source topology | The staged `deploy/docker-compose.phala.yaml` definition has `ingress`, `backend`, `enclave`, `enclave-domain`, `serve-worker`, `cpu-socket-proxy`, and `cpu-recorder`; this source row is not evidence that the custom domain or CPU recorder has been deployed or is live. |
 | Current image | `ghcr.io/teleport-computer/feedling:22b0ed6` |
 | Live git commit | `22b0ed6aa92a05d76951768f1924f45010ecda15` |
 | Live built at | `2026-07-02T19:04:02Z` |
@@ -263,7 +263,7 @@ python tools/verify_enclave_domain.py \
 | App ID | `173c7f49aeb54acb424676b17b17f78e5e2b2938` |
 | Created | 2026-07-01 as `feedling-io-test`, instance `tdx.small`, **Phala KMS** (prod9 chain-0). Account migration (path B): the old test CVM `19b13ebe-d12e-4d19-97d1-6cf41389b663` / app_id `bb9716955423faed3508888e7c654ff46f5f0c2d` under `sxysun` was abandoned (balance exhausted 2026-06-18). Fresh app_id → new `enclave_content_pk`, so the reused test RDS was wiped of undecryptable rows. iOS test build repointed to the new app_id. Bootstrapped via the one-shot `.github/workflows/bootstrap-test-cvm.yml` (push to `bootstrap-cvm` branch; workflow since removed). CI deploy key is now `TEST_PHALA_CLOUD_API_KEY` (separate from prod's `PHALA_CLOUD_API_KEY`). |
 | Current/live Compose | Deployment unit `deploy/docker-compose.phala.test.yaml`; recorded live service set matches prod: `ingress`, `backend`, `enclave`, with test domains + `_test` volumes |
-| Release/source topology | The staged `deploy/docker-compose.phala.test.yaml` definition has `ingress`, `backend`, `enclave`, `enclave-domain`, and `serve-worker`; this source row is not evidence that the custom domain has been deployed or is live. |
+| Release/source topology | The staged `deploy/docker-compose.phala.test.yaml` definition has `ingress`, `backend`, `enclave`, `enclave-domain`, `serve-worker`, `cpu-socket-proxy`, and `cpu-recorder`; this source row is not evidence that the custom domain or CPU recorder has been deployed or is live. |
 | Public API | `https://test-api.feedling.app` (via dstack-ingress — live, `/healthz` 200) |
 | Public MCP | 已下线（FastMCP 服务器 2026-06-12 移除） |
 | Database | Dedicated test RDS `feedling-mcp-test-t4g-micro.cgh0oucoe0x9.us-east-1.rds.amazonaws.com:5432/postgres` — fully isolated from prod (separate instance → separate `enclave_content_pk` self-consistent, no shared schema). Injected via `TEST_DATABASE_URL`. |
@@ -271,6 +271,28 @@ python tools/verify_enclave_domain.py \
 | Deploy path | GitHub Actions `deploy-test-cvm` job (in `ci.yml`) on push to the `test` branch. Mirrors prod but targets the test compose / CVM / DB / contract and is branch-gated to `refs/heads/test`. |
 | First-boot note | The CVM was first created 2026-06-09 WITHOUT a CF token (to mint the app_id quickly), so `dstack-ingress` couldn't issue the `test-*.feedling.app` LE certs initially. The `test`-branch CI deploy injects `CF_*` from GitHub secrets — domains + certs are now live. Backend also needed the test RDS reachable from the CVM (Publicly accessible + SG inbound 5432) before it stopped crash-looping. |
 | iOS | The iOS app source is not in this repo. Point its test build at app_id `173c7f49aeb54acb424676b17b17f78e5e2b2938` + gateway `dstack-pha-prod9.phala.network` + test contract `0x9AC034AAEf6Bb80690Be4d1f698b51796Bb7F2D5`. ⚠️ (Was `bb9716955423…` before the 2026-07-01 path-B account move — that app_id is **retired**; do not point new builds at it.) |
+
+#### Main-CVM CPU history (staged source topology)
+
+The test and production Compose sources add `cpu-socket-proxy` and
+`cpu-recorder` on a private internal network. The proxy is limited to 0.05 CPU
+and 64 MB; the recorder is limited to 0.10 CPU and 128 MB. Neither publishes a
+port or participates in business-service health dependencies, and this feature
+records history only—it does not alert.
+
+The recorder writes `/var/lib/feedling-cpu/cpu-YYYY-MM-DD.csv` to
+`feedling_cpu_history_test` in test and `feedling_cpu_history` in production.
+It keeps the current UTC date plus the previous 29 UTC dates. Read only a
+bounded tail through the existing Phala access path:
+
+```bash
+phala ssh feedling-io-test -- docker exec cpu-recorder python -c 'from pathlib import Path; files=sorted(Path("/var/lib/feedling-cpu").glob("cpu-*.csv")); print(files[-1].read_text()[-4000:] if files else "missing")'
+
+phala ssh feedling-enclave-v2 -- docker exec cpu-recorder python -c 'from pathlib import Path; files=sorted(Path("/var/lib/feedling-cpu").glob("cpu-*.csv")); print(files[-1].read_text()[-4000:] if files else "missing")'
+```
+
+These rows describe the staged source topology until the corresponding branch
+is deployed and live evidence is recorded above.
 
 部署后从仓库根目录验证 test 自定义 enclave 域名的 live ingress evidence；
 `TEST_COMPOSE_HASH` 必须是本次部署返回的 live compose hash：

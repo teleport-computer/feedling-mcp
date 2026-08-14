@@ -47,6 +47,89 @@
 
 ## 记录正文（最新的在上面）
 
+## 2026-08-14 — V2 wake 最终出口补齐工具标记清洗
+
+**[DONE] 四条 Runtime V2 wake lane 的模型正文在加密下发前统一剥离工具协议标记。**
+
+- T016 只接到了 chat 的 `_on_reply` 与结构化 proactive `send_message`，而
+  heartbeat / scheduled / manual-wake / screen-watch 共用的 wake `_on_reply`
+  没经过两者；现在它在封装前调用同一封闭词表清洗器。
+- 回归断言钉在用户私钥解密之后，并新增空历史本地全栈 manual-wake 探针，覆盖真实
+  HTTP、入队、worker、信封封装与用户解密；清洗事件只记录 lane/原因，不记录正文。
+- 同族扫描确认 torn-protocol、thinking surface 与 reasoning 清洗两侧都已有；
+  chat/wake 的空正文策略不同，暂不做会改变 lane 语义的共享出口重构。
+
+## 2026-08-14 — memory_search 一次搜不到不再宣告「记忆不存在」
+
+**[DONE] 工具描述不再禁止换关键词重搜；并明说匹配是字面子串，空结果 ≠ 记忆不存在。**
+
+- 起因：prod 用户 usr_7f30… 让伴侣找花园里的几张卡，伴侣回
+  「我搜遍了 ElevenLabs、MiniMax、西双版纳，一张卡都搜不到」，然后反过来求
+  用户把卡的正文粘贴回来。卡是中文写的（用户自己的说法是「捏声音」），
+  搜英文品牌名本就该 0 命中——匹配完全按设计工作，坏在模型把
+  「这个写法没命中」当成了「这段记忆不存在」。
+- 旧描述里的 "do not repeat it after one discovery result" 把模型钉死在一轮一次。
+  运行时那一半（去重键按工具名）已改成按 canonical args 去重，
+  于是描述反过来成了唯一还在拦重试的东西；现在只保留「别用完全相同的参数重复调」。
+- 新描述显式写明：匹配是 case-insensitive 字面子串，无同义词/翻译/词形还原；
+  空结果要换写法再搜（用户的原话、另一种语言、更短的特征片段），
+  不要告诉用户记忆不存在、也不要让用户粘贴正文。
+- 回归 `tests/test_memory_search_retry_guidance.py`：除文案判据外，
+  **把描述与 `tool_loop._memory_discovery_call_key` 钉在一起**——
+  描述承诺「换写法能再搜」，去重键就必须把不同 query 算成不同调用；
+  memory_index 仍是一轮一次。
+
+## 2026-08-14 — V2 不再把 provider 原始响应包当回复
+
+**[DONE] Gemini 中转把完整响应包装器序列化进可见文本时，不再原样进入聊天气泡。**
+
+- 只在整条回复精确符合 `response.candidates`、provider 元数据与 relay
+  `traceId` 的组合特征时判为上游响应包；普通 JSON、代码讨论与相似但不完整的
+  对象维持原样。
+- 前台 V2 将命中项视为无可见正文，给 provider 一次有界纠正机会；重复命中按
+  空回复失败处理。最终回复出口保留同一强证据闸，覆盖主动车道与 `reply` 工具。
+
+## 2026-08-14 — V2 可见回复剥离工具调用标签
+
+**[DONE] 自定义中转解析 function calling 不完整时，不再把 XML-like 工具标记发进聊天气泡。**
+
+- 新增共享的封闭词表清洗器，仅识别六个工具协议词干的单复数形态及可选
+  命名空间前缀，并跳过代码围栏；正常尖括号文本、HTML 和不等式不受影响。
+- 前台 V2 回复与主动消息共用同一实现：保留标签旁的有效正文，纯标签回复沿用
+  既有兜底；若完整工具块包住了整条真实回复，则退回只剥 marker、保留 payload；
+  命中会写 warning，前台另写不含正文的诊断 trace。
+- 回归覆盖线上截图原文、嵌套块、孤儿标签、代码围栏、误伤边界，以及真实
+  `worker._on_reply` 到持久聊天气泡的生产接线。
+
+## 2026-08-14 — Runtime V2 推理展示只认自撰摘要
+
+**[FEEDBACK] 推理过程不再在缺少 `<think>` 时退回 provider 原生 CoT。**
+
+- Runtime V2 的 chat 与 wake 两条最终回复统一走同一个选择器：
+  `FEEDLING_V2_SELF_THINKING` 开启时只展示 Agent 自撰的 `<think>` 摘要；
+  模型没写就不带 thinking 信封，解析失败仍保留既有失败标记。
+- 开关关闭时维持兼容契约，继续逐字展示 provider 原生 reasoning；不改 provider
+  请求、长度上限、prompt 或安全剥离闸。
+- 每条成功发布的终局回复最多记录一条 `thinking.surfaced`，仅含
+  `branch/chars/model/lane`，不含思考正文或片段，便于部署后核对四种分支分布。
+
+## 2026-08-14 — Runtime V2 工具面不再因保守预算静默清空
+
+**[DONE] 灰测用户已连接 35 个 MCP 工具，模型却只看得到生图能力。**
+
+- 根因是 prompt frontier 把 ASCII 工具 schema 沿用自然语言的 1 UTF-8
+  字节/token 估算，约放大四倍；而可选工具目录又是原子组件，预算不足时
+  `tool_loop` 会把 MCP、记忆、回复、主动能力一起清空。
+- 工具 schema 改为按实际 UTF-8 构成估算：ASCII 字节按保守 3 字节/token，
+  非 ASCII 字节仍按 1 字节/token；自然语言、工具结果和中文正文也维持
+  1 字节/token，避免中文 MCP 描述被 ASCII 校准反向低估、撑爆 provider。
+- 完整目录放不下时改为逐项择入，优先保留用户 MCP 与核心记忆/回复工具，
+  再按原目录顺序填入其余能力，不再 all-or-nothing。
+- 新增 `mcp.surface.provider`：每次 provider 请求记录候选/实收/裁剪工具数，
+  并区分 `frontier_omitted`、`tool_schema_rejected`、
+  `terminal_text_round`；`mcp.turn.usage.offered_tool_count` 同时标明它只是
+  prompt 预算前的解析口径，避免再次把“解析出来”误判成“模型实际拿到”。
+
 ## 2026-08-05 — Pre 明文用户 Runtime V2 Chat 启动失败修复
 
 ### [DONE] Flight recorder 的二进制明文 wire 补齐
@@ -83,6 +166,7 @@
 - 首次 base backup、direct-TLS、强制 WAL switch 与归档零失败均已验证。
 - pre compose/CI 接入独立 TEE DSN；PG deploy、TEE migrate、备份监控新增 pre lane。
   双写默认关闭，等 pre 应用部署与连通验证后再开启回填。
+
 ## 2026-08-07 — 首页顶部人话总结
 
 **[FEEDBACK] Xyn：指标太复杂看不懂——首页第一行改成一句人话。**
@@ -969,31 +1053,12 @@ reconciler.TABLES`）互不校验，谁都不是全集——Runtime V2 的 19 �
 `responder_error` 名下，现在改记 `prompt_coverage_incomplete[:code]`。按该字段
 分组的看板需要同步。
 
-**[FIX] 死锁本身：缩批 → 隔离 → 越过（quarantine-and-advance）**。参数怎么调都
-绕不开「全有全无 + 输入确定性」这个自锁结构，出路只能是给它一条出路。两级升级：
-
-1. **先缩批**。连续 `max_retries` 次无进展后，批次上限除以 4（200→50→12→3→1），
-   每个尺寸拿到自己的重试预算（它是一个真正不同的请求，不是失败请求的重复）。
-   多数拒绝是**批次**的属性而非某一条消息的属性——行数超预算、两条消息归纳出同一
-   条 bullet——换个尺寸就不再发生。健康路径完全不变（第一次就成功时永不缩批）。
-2. **缩到 1 条仍被拒 → 隔离那一条**。写一个确定性的替身段（`coverage_kind` 仍是
-   `exact`，seq 范围正好是它替换的那一行，所以 `validate_canonical_frontier` 的
-   三个见证依旧成立），文本明说「此处有 1 条消息未能被自动摘要，其内容不在本摘要
-   覆盖范围内，原文仍完整保留在聊天记录中」。**一次只越过一行，绝不牺牲整批**——
-   为解锁一行而丢掉 199 行完全折得动的消息是不可接受的。
-
-隔离**损失的是摘要覆盖，不是数据**：`chat_messages` 是不可变原文表，一行都没动，
-历史照常可读，将来更聪明的压缩器可以回头重折。每次隔离都打一行明文日志
-（`[v2-compaction] quarantined unfoldable row user=… seq=… reject=…`）并记一条
-`compaction_quarantined` trajectory 事件。开关
-`FEEDLING_V2_COMPACTION_QUARANTINE_ENABLED`（默认开），置 `0` 恢复严格 fail-closed。
-
-**另一条同样致命、但走不同代码路径的形状也一并修了**：`_bounded_compaction_prefix`
-遇到「首行单条就超过整批字符预算」时抛 `ValueError`（它拒绝跳过超大首行，因为跳过
-会让 seq 覆盖不诚实）——这条路径**根本到不了 provider**，所以缩批对它毫无作用。
-`usr_7f30…` 真正的墙就是这个：seq 682632 是一条 R2 外置、hydrate 后 798,262 字符
-的消息，卡在积压队头。现在这条路径直接走隔离。**如果只修了折叠被拒那一半，这个
-用户部署后仍然会卡在原地。**
+**[REFACTOR] Runtime V2 对话 coverage 收敛为 metadata-only 单一路径。**
+MEMORY/USER 成为唯一长期语义层；maintenance、inline catch-up 与 checkpoint
+只根据持久化 seq/count 元数据生成本地 sentinel，不再读取对话明文、调用 provider、
+缩批重试或 quarantine。加密 `chat_messages` 仍是不可变原文账本，历史模型摘要
+保持可读，直到新的 metadata-only checkpoint 在 canonical frontier 中替换它。
+该变更不再提供运行时真假开关；需要回退时只能回滚 worker 镜像版本。
 
 **[FIX] V2 的 provider 尝试也写明文台账**。V1 的常驻 consumer 一直往
 `user_logs.provider_attempts` 写一份纯元数据台账（outcome / usage / trigger），
@@ -1047,8 +1112,8 @@ CI 的 `phala deploy` 没传值，等于**只能用默认值**——"改 env 就
 不成立。现在三个环境的 5 个旋钮（batch msgs/chars、catchup deadline、tail budget、
 quarantine 开关）都接了 `-e` + `vars.<ENV>_<KNOB>`。刻意不写 `|| 默认值`：repo var
 未设时必须传空，让 compose 的 `${VAR:-默认}` 生效；设了才覆盖。这也是确定性复现
-隔离路径的前提——把 `COMPACTION_BATCH_CHARS` 临时调到几百，任何一条消息都能触发
-超预算隔离，不必去凑一个 R2 大文件。
+隔离路径的前提——把当时的字符批次阈值临时调小，任何一条消息都能触发超预算隔离，
+不必去凑一个 R2 大文件。该历史旋钮现已随语义 compaction 路径一并删除。
 
 **[ADD] `tools/v2_user_triage.py`** —— 把这次的排查路径固化成一条命令（只读、不
 解密）：runtime / jobs / metrics / summary / backlog head / trajectory / provider

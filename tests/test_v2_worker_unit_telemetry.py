@@ -79,6 +79,101 @@ def _minimal_deps():
     )
 
 
+@pytest.mark.parametrize(
+    ("self_on", "self_text", "failed", "provider_text", "expected"),
+    [
+        (True, "agent summary", False, "private native cot", "self"),
+        (True, "", True, "private native cot", "marker"),
+        (True, "", False, "private native cot", "none"),
+        (False, "", False, "private native cot", "native_legacy"),
+    ],
+)
+def test_thinking_surface_selector_has_four_explicit_branches(
+    self_on, self_text, failed, provider_text, expected
+):
+    text, kind, source, native, branch = worker._select_thinking_surface(
+        provider_text,
+        self_thinking_on=self_on,
+        self_thinking_text=self_text,
+        self_thinking_failed=failed,
+    )
+
+    assert branch == expected
+    if expected == "self":
+        assert text == self_text
+        assert (kind, source, native) == (
+            "agent_summary",
+            "self_thinking",
+            False,
+        )
+    elif expected == "marker":
+        assert text == worker.self_thinking.THINKING_FAILED_MARKER
+    elif expected == "none":
+        assert text == ""
+    else:
+        assert text == provider_text
+        assert (kind, source, native) == ("provider_reasoning", None, True)
+
+
+def test_thinking_surface_trace_contains_metadata_only():
+    captured = {}
+
+    def _emit(user_id, event_type, **fields):
+        captured.update(user_id=user_id, event_type=event_type, **fields)
+
+    config = type("Provider", (), {"model": "model-safe-name"})()
+    asyncio.run(
+        worker._emit_thinking_surfaced_trace(
+            _emit,
+            "u_trace",
+            config,
+            lane="chat",
+            branch="self",
+            chars=17,
+        )
+    )
+
+    assert captured["event_type"] == "thinking.surfaced"
+    assert captured["detail"] == {
+        "branch": "self",
+        "chars": 17,
+        "model": "model-safe-name",
+        "lane": "chat",
+    }
+    assert set(captured["detail"]) == {"branch", "chars", "model", "lane"}
+
+
+def test_thinking_surface_trace_bounds_user_configured_model_name():
+    captured = {}
+
+    def _emit(_user_id, _event_type, **fields):
+        captured.update(fields)
+
+    overlong_model = "relay-model-" * 20
+    config = type("Provider", (), {"model": overlong_model})()
+    asyncio.run(
+        worker._emit_thinking_surfaced_trace(
+            _emit,
+            "u_trace",
+            config,
+            lane="wake",
+            branch="none",
+            chars=0,
+        )
+    )
+
+    assert captured["detail"]["model"] == overlong_model[:96]
+    assert len(captured["detail"]["model"]) < len(overlong_model)
+
+
+def test_thinking_surface_has_dedicated_admin_timeline_label():
+    from admin import data_track
+
+    assert data_track._debug_friendly_step(
+        {"type": "thinking.surfaced", "subsystem": "agent"}
+    ) == ("💭", "思考展示 · 分支")
+
+
 def test_post_fold_checkpoint_exhaustion_is_content_free_degradation(monkeypatch):
     recorded = {}
 
@@ -100,7 +195,6 @@ def test_post_fold_checkpoint_exhaustion_is_content_free_degradation(monkeypatch
             _minimal_deps(),
             lane="maintenance",
             phase="post_fold",
-            provider_config=None,
             enclave_sem=None,
         )
     )
@@ -126,7 +220,6 @@ def test_post_fold_frontier_integrity_error_is_still_fatal(monkeypatch):
                 _minimal_deps(),
                 lane="maintenance",
                 phase="post_fold",
-                provider_config=None,
                 enclave_sem=None,
             )
         )
@@ -151,7 +244,6 @@ def test_post_fold_checkpoint_timeout_is_bounded_degradation(monkeypatch):
             _minimal_deps(),
             lane="maintenance",
             phase="post_fold",
-            provider_config=None,
             enclave_sem=None,
             timeout_sec=0.01,
         )
@@ -188,7 +280,6 @@ def test_checkpoint_degradation_never_logs_arbitrary_detail_or_code(
             _minimal_deps(),
             lane="maintenance",
             phase="post_fold",
-            provider_config=None,
             enclave_sem=None,
         )
     )

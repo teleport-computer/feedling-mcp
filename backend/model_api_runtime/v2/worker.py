@@ -24,7 +24,7 @@ this module so the worker never imports the hosted layer.
 并发：asyncio 事件循环 + asyncio.to_thread 把同步 jobs_store/enclave 调用移出 loop。
 四种 provider wire 全部 await 原生 async HTTP transport；provider 并发不再受默认线程池
 大小限制。
-ENCLAVE_SEMAPHORE 框住 turn 里所有 enclave-bound 调用（provider-key 解密 + 逐条 chat 解密
+父进程实例级 Enclave broker 框住 turn 里所有 enclave-bound 调用（provider-key 解密 + 逐条 chat 解密
 + capability 调用），治 spec R3。enclave 不是单线程（prod = 4 个 gunicorn worker，每个
 32 线程解密池），但它是全系统共享、容量有限、且解密 GIL-bound 的代理——多 worker 齐打
 照样会放大 502，闸门因此仍然必要。
@@ -46,7 +46,6 @@ import posixpath
 import re
 import threading
 import time
-import unicodedata
 from concurrent.futures import CancelledError as FutureCancelledError
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, replace
@@ -73,8 +72,10 @@ from capabilities import tool_schema as cap_tool_schema
 from core import chat_activity as core_chat_activity
 from core import envelope as core_envelope
 from core import protocol_leak
+from core import tool_markup_leak
 from core import util as core_util
 from core import provider_usage
+from core import self_thinking
 from core import store as core_store
 from core import wake_bus as core_wake_bus
 from core.downloadable_reply import sanitize_downloadable_reply
@@ -98,6 +99,7 @@ from model_api_runtime.v2 import effect_id as v2_effect_id
 from model_api_runtime.v2 import executor as v2_executor
 from model_api_runtime.v2 import extraction as v2_extraction
 from model_api_runtime.v2 import jobs_store
+from model_api_runtime.v2 import slot_protocol
 from model_api_runtime.v2 import kill_switch
 from model_api_runtime.v2 import model_identity as v2_model_identity
 from model_api_runtime.v2 import web_gate as v2_web_gate
@@ -284,11 +286,6 @@ def _positive_float_env(name: str, default: str) -> float:
     return value
 
 
-# —— 三个有界闸 ——（spec §6）
-# 每进程并发 job 数（= 并发回合数）。线上多进程 × CVM 共抢同一张 agent_jobs → 线性扩容。
-MAX_WORKERS = _positive_int_env("FEEDLING_V2_MAX_WORKERS", "4")
-
-
 # Capture is the one provider path whose disclosure lifetime is deliberately
 # coupled to a synchronous PostgreSQL transaction: D4, consent, Chat Clear, and
 # runtime-generation locks must stay held until the async provider attempt (and
@@ -303,13 +300,9 @@ _capture_provider_guard_executor_size = 0
 
 
 def _capture_provider_guard_pool_size() -> int:
-    try:
-        size = int(MAX_WORKERS)
-    except (TypeError, ValueError) as exc:
-        raise RuntimeError("FEEDLING_V2_MAX_WORKERS must be a positive integer") from exc
-    if size <= 0:
-        raise RuntimeError("FEEDLING_V2_MAX_WORKERS must be a positive integer")
-    return size
+    """Return the dedicated Capture guard size for this one-slot process."""
+
+    return 1
 
 
 def _reset_capture_provider_guard_executor_after_fork() -> None:
@@ -537,9 +530,15 @@ HISTORY_TURN_MAX_ROWS = _positive_int_env("FEEDLING_V2_HISTORY_TURN_MAX_ROWS", "
 HISTORY_TURN_MAX_WALL_SEC = _positive_float_env(
     "FEEDLING_V2_HISTORY_TURN_MAX_WALL_SEC", "8"
 )
-# 跨所有 job 共享的 enclave 并发闸（provider-key 解密 + chat 解密 + capability 调用都过它）。治 R3。
-ENCLAVE_CONCURRENCY = _positive_int_env("FEEDLING_V2_ENCLAVE_CONCURRENCY", "2")
-ENCLAVE_SEMAPHORE = asyncio.Semaphore(ENCLAVE_CONCURRENCY)
+# Production children receive one instance-wide broker-backed gate from
+# ``turn_child``. Direct helper tests that omit a gate get a private one below;
+# no process-global permit count is multiplied across isolated slot processes.
+_DEFAULT_ENCLAVE_GATE = object()
+
+
+def _new_direct_enclave_gate():
+    """Compatibility gate for direct helper calls outside the slot runtime."""
+    return asyncio.Semaphore(1)
 
 
 def _reserved_lane_slots(max_workers: int, reserved: int | None = None) -> list:
@@ -609,20 +608,6 @@ _VOICE_TRANSCRIPT_PROMPT_CHARS = _positive_int_env(
     "FEEDLING_V2_VOICE_TRANSCRIPT_PROMPT_CHARS", "30000"
 )
 _COMPACTION_BATCH = _positive_int_env("FEEDLING_V2_COMPACTION_BATCH_MSGS", "200")
-# A message-count cap alone is not a prompt-size bound: 200 maximum-size chat
-# rows can still produce a multi-megabyte compaction request.  Both inline
-# catch-up and the maintenance lane therefore take the oldest prefix that fits
-# this rendered-character budget.  A single row larger than the budget fails
-# loudly instead of advancing the watermark past content the model never saw.
-_COMPACTION_BATCH_CHARS = _positive_int_env(
-    "FEEDLING_V2_COMPACTION_BATCH_CHARS", "120000"
-)
-# Operational dependency: DO NOT enable this before M5 MEMORY/USER prompt
-# injection is deployed. Until then, deterministic count sentinels replace the
-# model-written summary head without supplying the long-term context elsewhere.
-_PROFILE_COVERAGE_DETERMINISTIC = _allowlisted_bool_env(
-    "FEEDLING_V2_PROFILE_COVERAGE_DETERMINISTIC"
-)
 _PROFILE_ENABLED = _allowlisted_bool_env("FEEDLING_V2_PROFILE_ENABLED")
 _PROFILE_MAX_AGE_SEC = float(
     os.environ.get("FEEDLING_V2_PROFILE_MAX_AGE_SEC", str(7 * 24 * 60 * 60))
@@ -658,8 +643,7 @@ if _SUMMARY_ROLLUP_FANOUT < 2:
     raise RuntimeError("FEEDLING_V2_SUMMARY_ROLLUP_FANOUT must be at least 2")
 # Catch-up may legitimately need many successful batches (for example after a
 # long worker outage), but it must not monopolise a turn forever.  This is an
-# overall wall-clock bound; the per-provider timeout remains independently
-# enforced by compaction.compact/provider_client.
+# overall wall-clock bound for metadata/CAS progress.
 _PROMPT_CATCHUP_DEADLINE_SEC = float(
     os.environ.get("FEEDLING_V2_PROMPT_CATCHUP_DEADLINE_SEC", "600")
 )
@@ -897,6 +881,12 @@ _SCHEDULED_WAKE_SYSTEM_PROMPT = (
     "do not greet the user, do not ask what they need, and do not replace the reminder "
     "with a generic check-in."
 )
+_SCHEDULED_WAKE_EMPTY_RESPONSE_CORRECTION = (
+    "The due scheduled reminder still has not been delivered. Read every item in "
+    "runtime_data.scheduled_wakes and return non-empty visible text that naturally "
+    "conveys every reminder now. Do not stay silent, do not return only thinking, "
+    "and do not answer an older conversation turn instead."
+)
 # screen_watch lane (Task 3): a wake grounded on recent shared-screen frames rather
 # than an ambient perception glance. Its own system prompt sits beside
 # _WAKE_SYSTEM_PROMPT; _run_wake selects it only for lane=="screen_watch". The
@@ -1005,13 +995,10 @@ def _coverage_incomplete_reason(reject_code: str = "") -> str:
     return f"{_COVERAGE_INCOMPLETE}:{code}"[:110]
 
 
-def _is_degenerate_reply(text: Any) -> bool:
-    """Return true for empty or punctuation/separator-only provider output."""
-    for char in str(text or ""):
-        category = unicodedata.category(char)
-        if category[0] in {"L", "N"} or category == "So":
-            return False
-    return True
+# Compatibility name retained for existing parity tests/callers; the predicate
+# itself lives in core so the markup fallback and the worker delivery gate can
+# never drift apart.
+_is_degenerate_reply = tool_markup_leak.is_degenerate_visible_text
 
 
 class DedicatedVisionUnavailable(RuntimeError):
@@ -1156,7 +1143,7 @@ def _turn_failure_error_class(exc: BaseException) -> str:
             return "unknown"
         return "context_overflow"
     if isinstance(exc, (asyncio.TimeoutError, TimeoutError)):
-        return "turn_timeout"
+        return "provider_timeout"
     if (
         isinstance(exc, v2_tool_loop.ProviderEmptyReply)
         or (isinstance(exc, TurnError) and str(exc) == "empty_reply")
@@ -1194,7 +1181,7 @@ def _turn_failure_error_class(exc: BaseException) -> str:
     if status_code in {400, 422}:
         return "provider_incompatible"
     if status_code == 408:
-        return "turn_timeout"
+        return "provider_timeout"
     if status_code == 429:
         return "rate_limited"
     if isinstance(status_code, int) and 500 <= status_code <= 599:
@@ -1266,7 +1253,6 @@ class TurnDeps:
     # "上次回复之后的 user 消息"那一批）。默认 None：worker.py 自身不 import hosted，
     # 测试/其他调用方不必提供；生产装配见 serve_worker.build_production_deps。
     read_tail: Callable[[str, float, int], list[dict]] | None = None
-    read_compaction_tail: Callable[[str, float, int], list[dict]] | None = None
     read_tail_after_seq: Callable[..., list[dict]] | None = None
     read_compaction_tail_after_seq: Callable[..., list[dict]] | None = None
     # (user_id, max_turns, row_cap, through_seq=...) -> content-free window
@@ -1287,7 +1273,6 @@ class TurnDeps:
     # 解密明文）；从未压缩过时 ("", 0.0, 0)（D1：turn 看 摘要+尾巴 而不是全量重放）。默认
     # None：worker.py 自身不 import hosted，测试/其他调用方不必提供；生产装配见
     # serve_worker.build_production_deps。
-    read_summary: Callable[[str], tuple[str, float, int]] | None = None
     # user_id -> (summary, watermark_ts, version, watermark_seq)
     read_summary_with_seq: Callable[[str], tuple[str, float, int, int]] | None = None
     # (user_id, summary, watermark_ts, expected_version[, watermark_seq]) -> True if CAS
@@ -1297,14 +1282,9 @@ class TurnDeps:
     # watermark_seq（D5/Task 9）是可选的第 5 个位置参数——_run_compaction 只有在能拿到折叠
     # 批次最后一行的精确 seq 时才会传它（生产路径总是能拿到；某些窄签名的测试 fake 只接 4
     # 个参数，_run_compaction 会退化成旧的 4 参调用，两边都不破）。
-    write_summary: Callable[..., bool] | None = None
     # Segmented production path. Leaf summaries and higher-level checkpoints
     # are immutable encrypted rows; ``read_summary_with_seq`` renders only the
-    # validated canonical cover. Legacy write_summary remains for isolated
-    # callers and rolling rollback compatibility.
-    read_summary_frontier: Callable[
-        [str], "v2_summary_frontier.SummaryFrontierSnapshot | None"
-    ] | None = None
+    # validated canonical cover.
     # Content-free equivalent used by deterministic coverage mode. Exact
     # segment payloads are reconstructed from their persisted row counts, so
     # normal roll-up never needs to decrypt historical summaries.
@@ -1314,8 +1294,8 @@ class TurnDeps:
     append_summary_segment: Callable[..., bool] | None = None
     append_summary_checkpoint: Callable[..., bool] | None = None
     # (user_id, message_ids) -> {message_id: {"image_mime": str, "image_b64": str}}：只对
-    # 指定的图片消息做 enclave 解密。**不能**并进 read_tail —— compaction 用 limit=10_000 调
-    # read_tail，b64 会进摘要器 prompt，且该用户历史上每张图都会被解密一次。默认 None：
+    # 指定的图片消息做 enclave 解密。不能并进通用历史读取，否则会让非视觉路径解密 b64。
+    # 默认 None：
     # worker.py 自身不 import hosted/capabilities 的装配细节；生产装配见 serve_worker。
     read_images: Callable[[str, list[str]], dict[str, dict]] | None = None
     # Foreground screen-share pixels. Production returns a bounded decrypted
@@ -1336,8 +1316,8 @@ class TurnDeps:
     observe_photo: Callable[..., str] | None = None
     # (user_id, message_ids) -> {message_id: {"file_name","file_mime","text","truncated"}}：
     # 优先读取加密 VFS text view；cache miss 时必须先拿到 sandbox 并记 usage，之后才从
-    # enclave 解密文件、交给 sandbox materialize/parse。与 read_images 同理**不能**并进 read_tail
-    # （compaction 用大 limit 复用 read_tail，抽出的全文会灌爆摘要器 prompt）。默认 None：
+    # enclave 解密文件、交给 sandbox materialize/parse。与 read_images 同理不能并进通用
+    # 历史读取。默认 None：
     # worker.py 不 import hosted/capabilities，生产装配见 serve_worker。
     read_files: Callable[[str, list[str]], dict[str, dict]] | None = None
     # —— capture/dream 记忆抽取 lane 的三个注入回调（Task 3）——
@@ -1354,9 +1334,11 @@ class TurnDeps:
     # (user_id, call_id) -> 归档的通话全文明文。缺省 None = 不展开通话卡
     # （老部署/测试注入）。生产实现在 serve_worker,走 enclave 解密。
     read_voice_transcript: Callable[[str, str], str] | None = None
-    # user_id -> (all rendered Garden cards, exact card count). Unlike
-    # read_memory_context this is fail-loud and rejects any truncated read.
-    read_profile_cards: Callable[[str], tuple[str, int]] | None = None
+    # user_id -> (all rendered Garden cards, exact card count, content-free
+    # tail-window metadata). Unlike read_memory_context this is fail-loud and
+    # rejects any truncated cardinality read; bounded per-card content remains
+    # observable through the metadata.
+    read_profile_cards: Callable[..., tuple[str, int, dict]] | None = None
     # (user_id, summary, enabled=...) -> ProfilePromptSelection. Production
     # performs a strict blob read and scoped enclave decrypt; any failure keeps
     # the rollback-compatible summary and returns a content-free reason.
@@ -1418,7 +1400,7 @@ class TurnDeps:
     # of an empty pending set; the field exists so the call site is already wired
     # ahead of the producer landing.
     apply_pending_effects: Callable[[str], dict] | None = None
-    # (user_id, *, msg_id, body, is_wake, lane) -> None：把本回合最后一条已落库回复的
+    # (user_id, *, msg_id, body, is_wake, lane) -> bool：把本回合最后一条已落库回复的
     # 明文正文交给 backend 发 APNs（serve-worker 容器没有 APNs 私钥，只有 backend
     # 有）。best-effort：实现方吞掉自身异常，调用点也再兜一层 —— 推送失败绝不能
     # 把一个已经成功发布回复的回合打成 failed。None（所有不接线的测试/legacy
@@ -1427,7 +1409,14 @@ class TurnDeps:
     # 真实 wake source，对齐 V1 `_proactive_delivery_decision_v2` 从 job 推 manual
     # 的做法 —— 之前这里硬编码 source="heartbeat"/manual=False，导致关了
     # reminders_delivery 的用户在 V2 手动唤醒收不到推送（V1 会走 manual_bypass）。
-    send_reply_push: Callable[..., None] | None = None
+    # 返回 True 只表示 APNs 接受了 alert（设备专注/静音/通知设置不可见，是实际响铃的
+    # 上界）；任何关闭、前台压制、无 token、出网失败都返回 False。chat lane 忽略该
+    # 返回值；wake lane 只把它写入决策后的影子观测，绝不回灌判据。
+    send_reply_push: Callable[..., bool] | None = None
+    # (user_id, *, job_id, lane, decision_allowed, apns_alert_sent, decided_at) -> bool。
+    # A′ 只写后验、content-free 观测；生产装配把用户时区转换成本地日/时/分再持久化。
+    # 回调缺失或失败都不得改变回合结果。
+    record_wake_shadow_decision: Callable[..., bool] | None = None
     # Final voice replies cross from the worker to the public Custom LLM gateway
     # through a narrow internal endpoint. The callback receives routing ids plus
     # plaintext only in memory; the backend encrypts it before temporary storage.
@@ -1807,15 +1796,137 @@ def _mcp_mutating_names_for_turn(mcp_turn) -> frozenset[str]:
 
 def _mcp_turn_usage_detail(
     offered_names: Iterable[str], called_names: Iterable[str]
-) -> dict[str, int]:
-    """Content-free MCP usage counts for one chat turn."""
+) -> dict[str, Any]:
+    """Content-free MCP usage counts for one chat turn.
+
+    ``offered_tool_count`` is retained for trace compatibility, but its lens is
+    explicit: this is the turn-start resolved surface before prompt-frontier or
+    terminal-round filtering. ``mcp.surface.provider`` records what each actual
+    provider request received.
+    """
     offered = {str(name) for name in offered_names if str(name)}
     calls = [str(name) for name in called_names if str(name)]
     return {
         "offered_tool_count": len(offered),
+        "offered_tool_count_lens": "turn_resolved_before_provider_budget",
         "called_tool_count": len(set(calls)),
         "call_count": len(calls),
     }
+
+
+def _provider_tool_surface_callback(
+    deps: TurnDeps,
+    user_id: str,
+    lane: str,
+):
+    """Build a best-effort plaintext-count trace sink for one runtime lane."""
+
+    if deps.emit_debug_trace is None:
+        return None
+
+    async def _emit(detail: dict[str, Any]) -> None:
+        trace_detail = {"lane": lane, **dict(detail)}
+        if lane != "chat":
+            trace_detail["wake_kind"] = lane
+        await asyncio.to_thread(
+            deps.emit_debug_trace,
+            user_id,
+            "mcp.surface.provider",
+            status=(
+                "warning"
+                if trace_detail["dropped_tool_count"]
+                else "ok"
+            ),
+            summary=(
+                f"Provider 实收 {trace_detail['sent_tool_count']} 个工具,"
+                f"裁剪 {trace_detail['dropped_tool_count']} 个"
+            ),
+            explain=(
+                "记录每次 provider 请求真正携带的工具数量;不记录工具参数、"
+                "返回值或用户内容。"
+            ),
+            detail=trace_detail,
+        )
+
+    return _emit
+
+
+_CONTEXT_TRUNCATION_TRACE_EVENT = "context.truncation"
+_CONTEXT_TRUNCATION_COUNT_KEYS = (
+    "profile_cards_truncated",
+    "worldbook_truncated",
+)
+
+
+def _emit_context_truncation_trace(
+    deps: TurnDeps,
+    user_id: str,
+    provider_request: dict | None,
+) -> None:
+    """Emit one content-free admin event for a real provider-input clip.
+
+    Profile truncation arrives in the final provider request's tail-window
+    metadata. World Book truncation is also derived from the final messages,
+    because compatibility callers without an adaptive tail window still apply
+    the shared World Book cap. Keeping both as integer counters lets the admin
+    redactor pass them without opening a string field that could later carry
+    card or World Book content.
+    """
+
+    if deps.emit_debug_trace is None or not isinstance(provider_request, dict):
+        return
+    tail_window = provider_request.get("tail_window")
+    tail_window = tail_window if isinstance(tail_window, dict) else {}
+    counts = {
+        key: int(bool(tail_window.get(key)))
+        for key in _CONTEXT_TRUNCATION_COUNT_KEYS
+    }
+    for message in provider_request.get("messages") or ():
+        if not isinstance(message, dict):
+            continue
+        content = message.get("content")
+        if not isinstance(content, str):
+            continue
+        if (
+            content.startswith(context.WORLD_BOOK_CONTEXT_HEADER + "\n")
+            and context.WORLD_BOOK_TRUNCATION_MARKER in content
+        ):
+            counts["worldbook_truncated"] = 1
+            break
+    if not any(counts.values()):
+        return
+    try:
+        deps.emit_debug_trace(
+            user_id,
+            _CONTEXT_TRUNCATION_TRACE_EVENT,
+            status="warning",
+            summary="",
+            explain="",
+            detail={"counts": counts},
+        )
+    except Exception as exc:  # noqa: BLE001 — observability cannot fail a turn
+        log.warning(
+            "[v2.truncation_trace] emit failed user=%s code=%s",
+            user_id,
+            type(exc).__name__.lower(),
+        )
+
+
+def _tail_window_callback(
+    tm: "TurnMetrics | None",
+):
+    """Record tail-window metrics at the final provider window."""
+
+    if tm is None:
+        return None
+
+    def _record(item: dict) -> None:
+        tm.record_tail_window(
+            effective_turns=item["effective_turns"],
+            fallback=item["fallback"],
+        )
+
+    return _record
 
 
 async def _dispatch_mixed_tool_calls(
@@ -2362,24 +2473,22 @@ class TurnMetrics:
     (`_run_wake` and chat's
     `process_job` both drive `tool_loop.run_tool_loop`, which calls `add_call`
     itself via its `add_usage` callback for every provider round; `_run_extraction`
-    → `v2_extraction.extract`, `_run_compaction` → `v2_compaction.compact`, the
-    last two only when the lane actually reaches its compaction/extraction call —
-    e.g. a compaction job whose tail is already under budget skips the call and
-    legitimately flushes `model_calls=0`; an empty Garden profile does the
-    same), so a provider-backed success there carries real
+    → `v2_extraction.extract`. Metadata-only `_run_compaction` always records
+    `model_calls=0`; an empty Garden profile does the same. Provider-backed
+    success elsewhere carries real
     token/usage data worth a row — this is precisely the lane that burns
     idle-user BYOK tokens on heartbeat/scheduled wakes, so it is the metric
     consumers most need. `tool_loop.run_tool_loop` surfaces usage via its
     `add_usage` callback (chat and wake alike, since PR C9b — see `process_job`/
     `_run_wake`), so both lanes record real prompt/completion/cache tokens per
-    provider round. `v2_extraction.extract` and `v2_compaction.compact` expose
-    the same usage callback, closing the former background-lane accounting gap.
+    provider round. `v2_extraction.extract` exposes the same usage callback,
+    closing the former background-lane accounting gap.
     Missing provider telemetry remains NULL rather than being invented as zero;
     explicit coverage counters make partial telemetry visible.
 
     `add_call` accumulates usage from a REAL provider call —
     `tool_loop.run_tool_loop` (chat and wake both use the same provider-native
-    rounds), `v2_extraction.extract`, and `v2_compaction.compact`. Provider
+    rounds) and `v2_extraction.extract`. Provider
     adapters surface a non-sensitive `provider_retry_count` in normalized
     usage, so `retries` includes hidden compatibility HTTP attempts (for
     example a rejected cache field or temperature) as well as outer transient
@@ -2723,7 +2832,12 @@ async def _record_trajectory(
     return recorded
 
 
-def _ledger_tapped_sink(recorder: v2_trajectory.TrajectoryRecorder | None):
+def _ledger_tapped_sink(
+    recorder: v2_trajectory.TrajectoryRecorder | None,
+    *,
+    deps: TurnDeps | None = None,
+    user_id: str = "",
+):
     """`recorder.record` plus the plaintext ledger mirror, for tool_loop.
 
     The foreground turn's provider calls reach the trajectory through
@@ -2731,12 +2845,20 @@ def _ledger_tapped_sink(recorder: v2_trajectory.TrajectoryRecorder | None):
     the latter would leave the lane that actually answers the user — the one
     whose failures the user sees — missing from the ledger.
     """
-    if recorder is None:
+    if recorder is None and (deps is None or deps.emit_debug_trace is None):
         return None
 
     async def _record(event_kind: str, payload: dict) -> None:
-        await recorder.record(event_kind, payload)
-        await _mirror_provider_attempt(recorder, event_kind, payload)
+        if recorder is not None:
+            await recorder.record(event_kind, payload)
+            await _mirror_provider_attempt(recorder, event_kind, payload)
+        if event_kind == "provider_request" and deps is not None:
+            await asyncio.to_thread(
+                _emit_context_truncation_trace,
+                deps,
+                user_id,
+                payload,
+            )
 
     return _record
 
@@ -2820,6 +2942,15 @@ def _v2_tool_trace_detail(
         "result_status": "err" if failed else "ok",
         "result_kind": result_kind,
     }
+    if (
+        tool in {"memory_index", "memory_search"}
+        and isinstance(metadata, dict)
+        and metadata.get("memory_discovery_reused") is True
+    ):
+        # This result never reached the capability dispatcher: the turn-level
+        # discovery deduper reused an earlier result. Preserve that edge as a
+        # content-free boolean so admin can distinguish it from a real search.
+        detail["memory_discovery_reused"] = True
     if duration_ms is not None:
         detail["dur_ms"] = duration_ms
     if failed:
@@ -3064,6 +3195,7 @@ async def _run_trajectory_review_turn(
     job: dict,
     deps: TurnDeps,
     tm: TurnMetrics,
+    enclave_sem=None,
 ) -> str:
     """Offline failure review with a deliberately absent side-effect surface.
 
@@ -3072,6 +3204,8 @@ async def _run_trajectory_review_turn(
     workspace writer to accidentally invoke. The provider receives tools=None
     exactly once; its encrypted analysis is stored only on the review row.
     """
+    if enclave_sem is None:
+        enclave_sem = _new_direct_enclave_gate()
     job_id = job["id"]
     user_id = str(job["user_id"])
     claimed_by = str(job.get("claimed_by") or "")
@@ -3148,7 +3282,7 @@ async def _run_trajectory_review_turn(
             raise RuntimeError("trajectory_codec_unavailable")
 
         _report_turn_progress("trajectory_review_provider_resolve_start")
-        async with ENCLAVE_SEMAPHORE:
+        async with enclave_sem:
             provider_config, _meta = await asyncio.to_thread(
                 deps.resolve_provider,
                 user_id,
@@ -3179,7 +3313,7 @@ async def _run_trajectory_review_turn(
         decoded_events: list[dict] = []
         for row in rows:
             await _review_fence("trajectory_review_decrypt_start")
-            async with ENCLAVE_SEMAPHORE:
+            async with enclave_sem:
                 plaintext = await asyncio.to_thread(
                     deps.open_trajectory_payload,
                     user_id,
@@ -3498,7 +3632,7 @@ def _make_fold_new_messages(
     user_id: str,
     deps: TurnDeps,
     cursor_box: dict,
-    enclave_sem: "asyncio.Semaphore | None" = ENCLAVE_SEMAPHORE,
+    enclave_sem=_DEFAULT_ENCLAVE_GATE,
     *,
     prompt_through_seq: int | None = None,
 ) -> Callable[[], Awaitable[list[dict]]]:
@@ -3523,9 +3657,9 @@ def _make_fold_new_messages(
     R3). This closure must do the same: it is called once per round by
     `tool_loop.run_tool_loop`, which `await`s it, so calling the sync reader directly here
     (no thread offload, no semaphore) would block the loop thread for the enclave round-trip
-    AND let concurrent workers hit the shared, capacity-bounded enclave ungated. `enclave_sem` defaults
-    to the module-level `ENCLAVE_SEMAPHORE` (the same shared gate `process_job` uses); tests
-    that want to exercise the closure with no gating pass `enclave_sem=None` (mirrors
+    AND let concurrent workers hit the shared, capacity-bounded enclave ungated. Production
+    passes the broker-backed turn gate explicitly; direct tests get a private gate unless they
+    pass `enclave_sem=None` to exercise the no-gate compatibility path (mirrors
     `_coalesce_inputs`/`_cap_data`'s own `enclave_sem is None` no-gate tolerance).
 
     `cursor_box` is a mutable `{"seq": int, "ts": float}` dict the caller owns and shares with
@@ -3550,6 +3684,9 @@ def _make_fold_new_messages(
     tie or a late-arriving earlier-ts message could strand a message below the boundary
     forever; that ts fragility is exactly the D5 no-reply bug this seq wiring fixes).
     """
+
+    if enclave_sem is _DEFAULT_ENCLAVE_GATE:
+        enclave_sem = _new_direct_enclave_gate()
 
     async def fold_new_messages() -> list[dict]:
         seq_native = "seq" in cursor_box
@@ -3649,13 +3786,14 @@ def _make_build_messages_fn(
     tail_lane: str = "",
     tail_anchor_seq: int | None = None,
     application_data_role: str = "user",
+    proactive_turn_boundary: bool = False,
     manual_wake: bool = False,
     screen_frame_message: dict[str, Any] | None = None,
 ) -> Callable[[list], list]:
     """Build the fixed base prompt plus the loop's chronological native transcript.
 
     `system_prompt`/`summary`/`tail` are the turn's base context — captured once at loop
-    entry (D1: the caller already resolved these once via `deps.read_summary`/`deps.read_tail`
+    entry (D1: the caller already resolved these once via the seq-native readers
     before starting the loop).  The transcript then contains, in arrival order:
 
     * newly folded user messages; and
@@ -3671,7 +3809,9 @@ def _make_build_messages_fn(
     lane, rendered via `context.action_context_str`). It is serialized as an explicitly
     untrusted application-data block after the base conversation, never as system
     authority. Foreground chat uses user role and proactive turns use assistant role.
-    Dynamic tool results remain native exchanges after that base block.
+    A proactive turn may add a fixed user-role transport boundary after those blocks;
+    it carries no wake data or model-choice instruction. Dynamic tool results remain
+    native exchanges after that base block.
     """
 
     # 真实模型自称块排在用户可编辑的 workspace skill 之前：它是运行时事实，不能被
@@ -3730,6 +3870,7 @@ def _make_build_messages_fn(
             coverage_hole_notice=coverage_hole_notice,
             temporal_context=_temporal_for(rendered_tail),
             application_data_role=application_data_role,
+            proactive_turn_boundary=proactive_turn_boundary,
             manual_wake=manual_wake,
             screen_frame_message=screen_frame_message,
         )
@@ -5043,6 +5184,99 @@ def _sanitize_reasoning(text: str) -> str:
     return cleaned
 
 
+def _select_thinking_surface(
+    provider_reasoning: str,
+    *,
+    self_thinking_on: bool,
+    self_thinking_text: str = "",
+    self_thinking_failed: bool = False,
+) -> tuple[str, str, str | None, bool, str]:
+    """Choose the only thinking text a final V2 reply may surface.
+
+    While self-thinking is enabled, provider-native chain-of-thought is never a
+    fallback: the model-authored ``<think>`` summary (or the existing failure
+    marker) is the complete display contract.  Disabling the feature preserves
+    the legacy native-reasoning behavior byte-for-byte.
+
+    The final item is a content-free observability branch name.  Keep this
+    decision shared by chat and wake so the two duplicated reply sinks cannot
+    drift again. Wake does not pass ``self_thinking_failed`` because malformed
+    wake output fails before sealing; the marker branch is reachable only from
+    foreground Chat.
+    """
+    if self_thinking_on:
+        if self_thinking_failed:
+            return (
+                self_thinking.THINKING_FAILED_MARKER,
+                "agent_summary",
+                "self_thinking",
+                False,
+                "marker",
+            )
+        if self_thinking_text:
+            return (
+                self_thinking_text,
+                "agent_summary",
+                "self_thinking",
+                False,
+                "self",
+            )
+        return "", "agent_summary", "self_thinking", False, "none"
+    if provider_reasoning:
+        return provider_reasoning, "provider_reasoning", None, True, "native_legacy"
+    return "", "provider_reasoning", None, True, "none"
+
+
+async def _emit_thinking_surfaced_trace(
+    emit_debug_trace: Callable[..., None] | None,
+    user_id: str,
+    provider_config,
+    *,
+    lane: str,
+    branch: str,
+    chars: int,
+) -> None:
+    """Emit one content-free terminal thinking decision, best-effort."""
+    if emit_debug_trace is None:
+        return
+    safe_branch = (
+        branch
+        if branch in {"self", "marker", "none", "native_legacy"}
+        else "none"
+    )
+    safe_lane = "wake" if lane == "wake" else "chat"
+    safe_chars = max(0, int(chars))
+    # ``model`` is user-configurable for compatible relays.  Match the existing
+    # plaintext thinking metadata bound instead of letting an arbitrary string
+    # expand the server-visible trace ring.
+    model = str(getattr(provider_config, "model", "") or "").strip()[:96]
+    try:
+        await asyncio.to_thread(
+            emit_debug_trace,
+            user_id,
+            "thinking.surfaced",
+            status="ok",
+            summary=f"V2 thinking {safe_branch} ({safe_chars} chars)",
+            explain=(
+                "Records only the selected branch, character count, model, and "
+                "lane; no thinking text or fragment is included."
+            ),
+            detail={
+                "branch": safe_branch,
+                "chars": safe_chars,
+                "model": model,
+                "lane": safe_lane,
+            },
+        )
+    except Exception as exc:  # noqa: BLE001 — diagnostics cannot fail a reply
+        log.warning(
+            "[v2.thinking] surface trace failed user=%s lane=%s code=%s",
+            user_id,
+            safe_lane,
+            type(exc).__name__.lower(),
+        )
+
+
 def _build_thinking_payload(
     store,
     reasoning: str,
@@ -5372,54 +5606,6 @@ def _surface_terminal_error(deps: TurnDeps, user_id: str, job_id, message: str) 
         )
 
 
-def _compaction_message_chars(message: dict) -> int:
-    """Conservative source-row size for a compaction batch.
-
-    The renderer omits UI-only voice artifacts with batch-level parent
-    correlation. Sizing their stored text here can only make a batch smaller;
-    it can never let a provider request exceed its configured budget.
-    """
-    return (
-        len(str(message.get("role") or ""))
-        + 2
-        + len(str(message.get("content") or ""))
-        + 1
-    )
-
-
-# Additive-increase step for the persisted fold batch size. Deliberately a
-# small CONSTANT rather than a fraction of the configured batch: the decrease
-# is multiplicative (//4), so an increment anywhere near that ratio walks
-# straight back up the ladder and re-pays the very refusal it just learned
-# from. Slow recovery is the point — a conversation whose content is uniformly
-# thin should not keep rediscovering that the full batch does not fold.
-_BATCH_CAP_INCREMENT = 2
-
-
-async def _load_batch_cap(user_id: str) -> int:
-    """The batch size this conversation last digested, clamped to config.
-
-    Never larger than ``_COMPACTION_BATCH``: the persisted value is a memory of
-    what worked, not a licence to exceed the configured budget (which may have
-    been lowered since it was written).
-    """
-    try:
-        stored = await asyncio.to_thread(db.v2_effective_batch_cap, user_id)
-    except Exception as exc:  # noqa: BLE001 — bookkeeping never blocks a fold
-        log.debug("[v2.worker] batch cap read failed for %s: %s", user_id, exc)
-        return _COMPACTION_BATCH
-    if not stored:
-        return _COMPACTION_BATCH
-    return max(1, min(_COMPACTION_BATCH, int(stored)))
-
-
-async def _persist_batch_cap(user_id: str, value: int) -> None:
-    """Best-effort write — a failed bookkeeping write must not fail the fold."""
-    try:
-        await asyncio.to_thread(db.v2_set_effective_batch_cap, user_id, int(value))
-    except Exception as exc:  # noqa: BLE001
-        log.debug("[v2.worker] batch cap persist failed for %s: %s", user_id, exc)
-
 
 def _bounded_voice_transcript(text: str, *, budget: int) -> str:
     """把一通电话的全文压进预算：超了就头尾采样并说明中间省了多少。"""
@@ -5461,83 +5647,18 @@ def _render_capture_line(message: dict, voice_transcripts: dict,
     return f"- {label}: {context.text_of(message.get('content'))}"
 
 
-def _bounded_compaction_prefix(
-    messages: list[dict],
-    *,
-    max_messages: int | None = None,
-    max_chars: int | None = None,
-) -> list[dict]:
-    """Return the oldest contiguous prefix within both compaction budgets.
-
-    Watermarks may only advance over a contiguous oldest-first prefix.  Never
-    skip an oversized first row to fit later rows: doing so would make the
-    summary's seq coverage dishonest.  Instead fail loudly and leave the
-    watermark untouched for diagnosis/retry.
-    """
-    max_messages = _COMPACTION_BATCH if max_messages is None else int(max_messages)
-    max_chars = _COMPACTION_BATCH_CHARS if max_chars is None else int(max_chars)
-    out: list[dict] = []
-    used = 0
-    for message in messages[:max_messages]:
-        size = _compaction_message_chars(message)
-        if size > max_chars and not out:
-            raise ValueError("compaction_message_exceeds_char_budget")
-        if used + size > max_chars:
-            break
-        out.append(message)
-        used += size
-    return out
-
-
-async def _compaction_llm_with_progress(
-    user_id: str,
-    *args: Any,
-    **kwargs: Any,
-) -> Any:
-    """Reliable compaction provider call with per-attempt stall heartbeats."""
-
-    def _attempt_progress(stage: str, attempt: int) -> None:
-        _report_turn_progress(f"compaction_provider_{stage}_{attempt}")
-
-    started = time.monotonic()
-    try:
-        result = await provider_client.reliable_chat_completion_async(
-            *args, progress_cb=_attempt_progress, **kwargs
-        )
-    except Exception as exc:
-        await _record_provider_failure(user_id, exc)
-        raise
-    await _record_provider_success(
-        user_id, latency_ms=(time.monotonic() - started) * 1000.0
-    )
-    return result
-
 
 async def _rebalance_summary_frontier(
     user_id: str,
     deps: TurnDeps,
     *,
-    provider_config: Any,
     enclave_sem: "asyncio.Semaphore | None",
     claimed_by: str | None = None,
     job_id=None,
-    add_usage: Callable[[dict | None], None] | None = None,
     trajectory_recorder: "v2_trajectory.TrajectoryRecorder | None" = None,
-    deterministic_coverage: bool = False,
 ) -> list:
-    """Roll immutable canonical nodes up until the prompt frontier is bounded.
-
-    Children are never updated or deleted. A failed/invalid provider response
-    inserts nothing, and a racing checkpoint writer is handled by re-reading
-    the canonical cover. Exhaustion is loud so no caller can substitute silent
-    truncation for a complete historical representation.
-    """
-    frontier_reader = (
-        deps.read_summary_frontier_metadata
-        if deterministic_coverage
-        and deps.read_summary_frontier_metadata is not None
-        else deps.read_summary_frontier
-    )
+    """Roll immutable canonical nodes up from authenticated metadata only."""
+    frontier_reader = deps.read_summary_frontier_metadata
     if frontier_reader is None or deps.append_summary_checkpoint is None:
         return []
 
@@ -5562,106 +5683,25 @@ async def _rebalance_summary_frontier(
             fanout=_SUMMARY_ROLLUP_FANOUT,
             max_frontier_segments=_SUMMARY_FRONTIER_MAX_SEGMENTS,
             max_frontier_chars=_SUMMARY_FRONTIER_MAX_CHARS,
-            max_rollup_input_chars=_COMPACTION_BATCH_CHARS,
         )
         if candidate is None:
             return frontier
 
         _report_turn_progress("summary_checkpoint_start")
-        checkpoint_messages = [item.text for item in candidate.children]
-
-        async def _recording_checkpoint_llm(*args: Any, **kwargs: Any) -> Any:
-            # A legacy aggregate may require several bounded map/reduce calls.
-            # Refresh ownership between them so useful progress cannot finish
-            # under an expired job lease and then publish stale coverage.
-            if claimed_by and job_id is not None:
-                renewed = await asyncio.to_thread(
-                    jobs_store.renew_job_lease,
-                    job_id,
-                    claimed_by,
-                    ttl_sec=jobs_store.RUNNING_TTL_SEC,
-                )
-                if not renewed:
-                    raise LostJobLease("summary checkpoint lease lost")
-            if deps.runtime_mode_enabled is not None and not await asyncio.to_thread(
-                deps.runtime_mode_enabled, user_id
-            ):
-                raise RuntimeModeChanged(
-                    "user rolled back during summary checkpoint"
-                )
-            messages = args[1] if len(args) > 1 else kwargs.get("messages", [])
-            await _record_trajectory(
-                trajectory_recorder,
-                "provider_request",
-                {
-                    "lane": "summary_checkpoint",
-                    "child_segment_ids": list(candidate.child_segment_ids),
-                    "messages": messages,
-                    "tools": None,
-                },
-            )
-            try:
-                result = await _compaction_llm_with_progress(
-                    user_id,
-                    *args,
-                    **kwargs,
-                )
-            except Exception as exc:
-                await _record_trajectory(
-                    trajectory_recorder,
-                    "provider_error",
-                    {
-                        "lane": "summary_checkpoint",
-                        "error_class": type(exc).__name__,
-                        "provider_attempt_trace": (
-                            provider_client.runtime_provider_attempt_trace(exc)
-                        ),
-                    },
-                    best_effort=True,
-                )
-                raise
-            await _record_trajectory(
-                trajectory_recorder,
-                "provider_response",
-                {"lane": "summary_checkpoint", "response": result},
-            )
-            return result
-
-        checkpoint = (
-            v2_compaction.deterministic_checkpoint(checkpoint_messages)
-            if deterministic_coverage
-            else None
+        includes_legacy = any(
+            item.coverage_kind == "legacy_opaque"
+            for item in candidate.children
         )
-        if checkpoint is None:
-            try:
-                checkpoint = await v2_compaction.compact_checkpoint(
-                    provider_config=provider_config,
-                    child_summaries=checkpoint_messages,
-                    llm=_recording_checkpoint_llm,
-                    usage_out=add_usage,
-                )
-            except v2_compaction.CheckpointCompactionExhausted as exc:
-                raise v2_summary_frontier.SummaryFrontierExhausted(
-                    "checkpoint_work_budget_exhausted"
-                ) from exc
-        if checkpoint is None:
-            raise v2_summary_frontier.SummaryFrontierExhausted(
-                "invalid_checkpoint_output"
-            )
-        if deterministic_coverage and not any(
-            item.coverage_kind == "legacy_opaque" for item in frontier
-        ):
-            materialized_head = v2_compaction.deterministic_fold(
-                source_message_count=sum(
-                    item.source_message_count for item in frontier
-                )
-            )
-        else:
-            materialized_head = v2_summary_frontier.render_replacement(
-                frontier,
-                child_segment_ids=candidate.child_segment_ids,
-                parent_text=checkpoint,
-            )
+        checkpoint = v2_compaction.deterministic_fold(
+            source_message_count=candidate.source_message_count,
+            includes_legacy_opaque=includes_legacy,
+        )
+        materialized_head = v2_compaction.deterministic_fold(
+            source_message_count=sum(item.source_message_count for item in frontier),
+            includes_legacy_opaque=any(
+                item.coverage_kind == "legacy_opaque" for item in frontier
+            ),
+        )
         if claimed_by and job_id is not None:
             renewed = await asyncio.to_thread(
                 jobs_store.renew_job_lease,
@@ -5675,6 +5715,16 @@ async def _rebalance_summary_frontier(
             deps.runtime_mode_enabled, user_id
         ):
             raise RuntimeModeChanged("user rolled back before summary checkpoint")
+        await _record_trajectory(
+            trajectory_recorder,
+            "summary_checkpoint",
+            {
+                "child_segment_ids": list(candidate.child_segment_ids),
+                "source_message_count": candidate.source_message_count,
+                "coverage_kind": candidate.coverage_kind,
+            },
+            best_effort=True,
+        )
         inserted = await asyncio.to_thread(
             deps.append_summary_checkpoint,
             user_id,
@@ -5707,12 +5757,7 @@ async def _rebalance_summary_frontier(
 _CHECKPOINT_EXHAUSTION_DETAILS = frozenset(
     {
         "empty_rollup_candidate",
-        "single_segment_exceeds_rollup_input",
-        "fanout_run_exceeds_rollup_input",
-        "frontier_head_exceeds_rollup_input",
         "no_reducing_rollup_candidate",
-        "checkpoint_work_budget_exhausted",
-        "invalid_checkpoint_output",
         "checkpoint_cas_no_progress",
         "checkpoint_pass_budget_exhausted",
         "materialized_prompt_view_over_target",
@@ -5745,13 +5790,10 @@ async def _rebalance_summary_frontier_best_effort(
     *,
     lane: str,
     phase: str,
-    provider_config: Any,
     enclave_sem: "asyncio.Semaphore | None",
     claimed_by: str | None = None,
     job_id=None,
-    add_usage: Callable[[dict | None], None] | None = None,
     trajectory_recorder: "v2_trajectory.TrajectoryRecorder | None" = None,
-    deterministic_coverage: bool = False,
     timeout_sec: float = 30.0,
 ) -> bool:
     """Run an optional checkpoint without undoing an already-durable leaf.
@@ -5769,13 +5811,10 @@ async def _rebalance_summary_frontier_best_effort(
             _rebalance_summary_frontier(
                 user_id,
                 deps,
-                provider_config=provider_config,
                 enclave_sem=enclave_sem,
                 claimed_by=claimed_by,
                 job_id=job_id,
-                add_usage=add_usage,
                 trajectory_recorder=trajectory_recorder,
-                deterministic_coverage=deterministic_coverage,
             ),
             timeout=float(timeout_sec),
         )
@@ -5813,11 +5852,9 @@ async def _bound_materialized_summary(
     summary: str,
     deps: TurnDeps,
     *,
-    provider_config: Any,
     enclave_sem: "asyncio.Semaphore",
     claimed_by: str | None,
     job_id,
-    add_usage: Callable[[dict | None], None] | None,
     trajectory_recorder: "v2_trajectory.TrajectoryRecorder | None",
 ) -> str:
     """Repair an over-target summary view before final per-route admission.
@@ -5829,7 +5866,7 @@ async def _bound_materialized_summary(
     """
     if (
         len(str(summary)) <= _SUMMARY_FRONTIER_MAX_CHARS
-        or deps.read_summary_frontier is None
+        or deps.read_summary_frontier_metadata is None
         or deps.append_summary_checkpoint is None
         or deps.read_summary_with_seq is None
     ):
@@ -5837,11 +5874,9 @@ async def _bound_materialized_summary(
     await _rebalance_summary_frontier(
         user_id,
         deps,
-        provider_config=provider_config,
         enclave_sem=enclave_sem,
         claimed_by=claimed_by,
         job_id=job_id,
-        add_usage=add_usage,
         trajectory_recorder=trajectory_recorder,
     )
     async with enclave_sem:
@@ -6038,11 +6073,9 @@ async def _read_seq_adaptive_prompt_context(
             user_id,
             summary,
             deps,
-            provider_config=provider_config,
             enclave_sem=enclave_sem,
             claimed_by=claimed_by,
             job_id=job_id,
-            add_usage=add_usage,
             trajectory_recorder=trajectory_recorder,
         )
     await _assert_prompt_tail_exact(
@@ -6096,425 +6129,116 @@ async def _run_compaction(
     job_id,
     user_id: str,
     deps: TurnDeps,
-    provider_config: Any,
-    enclave_sem: "asyncio.Semaphore",
+    enclave_sem: "asyncio.Semaphore | None",
     claimed_by: str | None = None,
     tm: "TurnMetrics | None" = None,
     trajectory_recorder: "v2_trajectory.TrajectoryRecorder | None" = None,
 ) -> str:
-    """maintenance-lane 压缩：把超预算 tail 的最旧一批写成加密不可变 leaf，
-    再按需生成同样不可变的分层 checkpoint；raw chat 永不因压缩而删除。
-    用户 BYOK key（provider_config 已由 `_run_turn` 单次解密并传入，压缩本身不再多解密一次）。
+    """Advance maintenance coverage with one exact metadata-only leaf."""
 
-    自成一体、自己的 try/except：这是后台维护 job，绝不写聊天气泡、失败绝不给用户弹
-    error chip（不调 `_surface_terminal_error`，不落 "error"-kind status 事件）——只是
-    静默 `mark_failed`，跟 chat turn 的用户可见失败路径彻底分开。
-    """
+    del enclave_sem  # No coverage operation decrypts chat or calls a provider.
     try:
-        if _PROFILE_COVERAGE_DETERMINISTIC:
-            if deps.append_summary_segment is None:
-                raise RuntimeError("deterministic_compaction_unwired")
-            summary_row = await asyncio.to_thread(
-                jobs_store.get_summary_row,
-                user_id,
-            )
-            watermark_seq = int(summary_row["watermark_seq"]) if summary_row else 0
-            watermark_ts = (
-                float(summary_row["watermark_ts"]) if summary_row else 0.0
-            )
-            version = int(summary_row["version"]) if summary_row else 0
-            unsummarized_count = await _unsummarized_count(
-                user_id,
-                watermark_seq,
-            )
-            if unsummarized_count <= _TAIL_KEEP:
-                await asyncio.to_thread(
-                    jobs_store.mark_completed,
-                    job_id,
-                    claimed_by=claimed_by,
-                )
-                if tm is not None:
-                    tm.flush(failed=False, status="ok")
-                return "completed"
-
-            fold_count = min(
-                _COMPACTION_BATCH,
-                unsummarized_count - _TAIL_KEEP,
-            )
-            first_seq, last_seq, source_count = await asyncio.to_thread(
-                db.chat_coverage_bounds_after_seq,
-                user_id,
-                watermark_seq,
-                limit=fold_count,
-                through_seq=None,
-            )
-            if (
-                source_count != fold_count
-                or first_seq <= watermark_seq
-                or last_seq < first_seq
-            ):
-                raise RuntimeError("deterministic_coverage_bounds_incomplete")
-            segment_text = v2_compaction.deterministic_fold(
-                source_message_count=source_count
-            )
-            covered_count = await asyncio.to_thread(
-                db.count_messages_after_seq,
-                user_id,
-                0,
-                through_seq=last_seq,
-                exclude_synthetic_sources=True,
-            )
-            head_text = v2_compaction.deterministic_fold(
-                source_message_count=covered_count
-            )
-            _report_turn_progress("deterministic_compaction_batch_start")
-            await _record_trajectory(
-                trajectory_recorder,
-                "deterministic_compaction_batch",
-                {
-                    "lane": "maintenance",
-                    "start_seq": first_seq,
-                    "end_seq": last_seq,
-                    "source_message_count": source_count,
-                },
-                best_effort=True,
-            )
-            if claimed_by and not await asyncio.to_thread(
-                jobs_store.renew_job_lease,
-                job_id,
-                claimed_by,
-                ttl_sec=jobs_store.RUNNING_TTL_SEC,
-            ):
-                raise LostJobLease(
-                    "compaction lease lost before deterministic summary write"
-                )
-            if deps.runtime_mode_enabled is not None and not await asyncio.to_thread(
-                deps.runtime_mode_enabled,
-                user_id,
-            ):
-                raise RuntimeModeChanged(
-                    "user rolled back before deterministic summary write"
-                )
-            ok = await asyncio.to_thread(
-                deps.append_summary_segment,
-                user_id,
-                segment_text,
-                current_summary="",
-                head_summary=head_text,
-                start_seq=first_seq,
-                end_seq=last_seq,
-                source_message_count=source_count,
-                watermark_ts=watermark_ts,
-                expected_version=version,
-                previous_watermark_seq=watermark_seq,
-            )
-            _report_turn_progress("deterministic_compaction_batch_complete")
-            if ok:
-                await _rebalance_summary_frontier_best_effort(
-                    user_id,
-                    deps,
-                    lane="maintenance",
-                    phase="post_fold_deterministic",
-                    provider_config=provider_config,
-                    enclave_sem=enclave_sem,
-                    claimed_by=claimed_by,
-                    job_id=job_id,
-                    add_usage=tm.add_call if tm is not None else None,
-                    trajectory_recorder=trajectory_recorder,
-                    deterministic_coverage=True,
-                )
-                remaining_count = await _unsummarized_count(
-                    user_id,
-                    last_seq,
-                )
-                completed = await asyncio.to_thread(
-                    jobs_store.mark_completed,
-                    job_id,
-                    claimed_by=claimed_by,
-                )
-                if completed and remaining_count > _TAIL_KEEP:
-                    await asyncio.to_thread(
-                        jobs_store.enqueue_job,
-                        user_id,
-                        "maintenance",
-                        reason="compaction_catchup",
-                    )
-                    await asyncio.to_thread(
-                        core_wake_bus.notify,
-                        "v2_jobs",
-                        user_id,
-                    )
-                if tm is not None:
-                    tm.flush(failed=False, status="ok")
-                return "completed"
-            failed_owned = await asyncio.to_thread(
-                jobs_store.mark_failed,
-                job_id,
-                "summary_cas_lost",
-                claimed_by=claimed_by,
-            )
-            if failed_owned:
-                await asyncio.to_thread(
-                    jobs_store.enqueue_job,
-                    user_id,
-                    "maintenance",
-                    reason="cas_lost_retry",
-                )
-                await asyncio.to_thread(core_wake_bus.notify, "v2_jobs", user_id)
-            if tm is not None:
-                tm.flush(failed=True, status="summary_cas_lost")
-            return "failed"
-
-        # Rebalance first, then read the head/version used by this leaf CAS.
-        # A checkpoint increments the head version; reading first would waste
-        # one provider call on a predictably stale leaf and force a retry job.
-        if deps.read_summary_frontier is not None:
-            await _rebalance_summary_frontier_best_effort(
-                user_id,
-                deps,
-                lane="maintenance",
-                phase="pre_fold",
-                provider_config=provider_config,
-                enclave_sem=enclave_sem,
-                claimed_by=claimed_by,
-                job_id=job_id,
-                add_usage=tm.add_call if tm is not None else None,
-                trajectory_recorder=trajectory_recorder,
-            )
-        async with enclave_sem:
-            if deps.read_summary_with_seq is not None and (
-                deps.read_compaction_tail_after_seq is not None
-                or deps.read_tail_after_seq is not None
-            ):
-                (
-                    summary,
-                    _watermark_ts,
-                    version,
-                    watermark_seq,
-                ) = await asyncio.to_thread(deps.read_summary_with_seq, user_id)
-                reader = deps.read_compaction_tail_after_seq or deps.read_tail_after_seq
-                tail = await asyncio.to_thread(
-                    reader, user_id, watermark_seq, _COMPACTION_BATCH + _TAIL_KEEP
-                )
-            else:
-                summary, watermark, version = await asyncio.to_thread(
-                    deps.read_summary, user_id
-                )
-                reader = deps.read_compaction_tail or deps.read_tail
-                tail = await asyncio.to_thread(
-                    reader, user_id, watermark, _COMPACTION_BATCH + _TAIL_KEEP
-                )
-        if len(tail) <= _TAIL_KEEP:
-            # No compaction call made at all (tail already under budget) — a
-            # legitimate model_calls=0 success.
+        if deps.append_summary_segment is None:
+            raise RuntimeError("deterministic_compaction_unwired")
+        summary_row = await asyncio.to_thread(jobs_store.get_summary_row, user_id)
+        watermark_seq = int(summary_row["watermark_seq"]) if summary_row else 0
+        watermark_ts = float(summary_row["watermark_ts"]) if summary_row else 0.0
+        version = int(summary_row["version"]) if summary_row else 0
+        unsummarized_count = await _unsummarized_count(user_id, watermark_seq)
+        if unsummarized_count <= _TAIL_KEEP:
             await asyncio.to_thread(
                 jobs_store.mark_completed, job_id, claimed_by=claimed_by
             )
             if tm is not None:
                 tm.flush(failed=False, status="ok")
             return "completed"
-        # A refused fold is a property of the BATCH, not a verdict on the
-        # backlog: shrink and retry before giving up, mirroring the inline
-        # catch-up's ladder. Reporting success without advancing (the old
-        # behaviour) left the watermark frozen while metrics said ok —
-        # usr_90184 on prod, job 130: model_calls=1, status=ok, summary
-        # untouched for an hour.
-        candidate_rows = tail[: max(0, len(tail) - _TAIL_KEEP)]
-        # Start at the size this conversation was last observed to digest.
-        # Draining a backlog runs this job over and over via compaction_catchup;
-        # without the memory each one re-pays a guaranteed refusal to relearn
-        # the same limit (~100 wasted model calls for a 1200-message backlog,
-        # billed to the user's own key).
-        fold_limit = min(len(candidate_rows), await _load_batch_cap(user_id))
-        while True:
-            old = _bounded_compaction_prefix(candidate_rows[:fold_limit])
-            if not old:
-                raise RuntimeError("compaction_batch_empty")
-            new_watermark = old[-1]["ts"]
-            # D5/Task 9: also advance the seq watermark, atomically, in the same CAS
-            # write as new_watermark below. The tail row dict itself may already carry
-            # "seq" (a seq-aware reader); if not (e.g. today's ts-windowed
-            # _read_compaction_tail, or a narrow test double), fall back to an exact
-            # by-id lookup — never a ts-range estimate, which would be ambiguous
-            # under same-ts ties (see db.chat_seq_for_msg_id's docstring). A tail row
-            # with no "id" at all (only synthetic test doubles) leaves the seq
-            # watermark unadvanced this round rather than guessing.
-            new_watermark_seq = old[-1].get("seq")
-            if new_watermark_seq is None:
-                last_id = old[-1].get("id")
-                if last_id is not None:
-                    new_watermark_seq = await asyncio.to_thread(
-                        db.chat_seq_for_msg_id, user_id, last_id
-                    )
-            first_watermark_seq = old[0].get("seq")
-            if first_watermark_seq is None:
-                first_id = old[0].get("id")
-                if first_id is not None:
-                    first_watermark_seq = await asyncio.to_thread(
-                        db.chat_seq_for_msg_id, user_id, first_id
-                    )
-            _report_turn_progress("compaction_batch_start")
 
-            async def _recording_compaction_llm(*args: Any, **kwargs: Any) -> Any:
-                messages = args[1] if len(args) > 1 else kwargs.get("messages", [])
-                await _record_trajectory(
-                    trajectory_recorder,
-                    "provider_request",
-                    {"lane": "maintenance", "messages": messages, "tools": None},
-                )
-                try:
-                    result = await _compaction_llm_with_progress(
-                        user_id,
-                        *args,
-                        **kwargs,
-                    )
-                except Exception as exc:
-                    await _record_trajectory(
-                        trajectory_recorder,
-                        "provider_error",
-                        {
-                            "error_class": type(exc).__name__,
-                            "provider_attempt_trace": (
-                                provider_client.runtime_provider_attempt_trace(exc)
-                            ),
-                        },
-                        best_effort=True,
-                    )
-                    raise
-                await _record_trajectory(
-                    trajectory_recorder,
-                    "provider_response",
-                    {"response": result},
-                )
-                return result
+        fold_count = min(_COMPACTION_BATCH, unsummarized_count - _TAIL_KEEP)
+        first_seq, last_seq, source_count = await asyncio.to_thread(
+            db.chat_coverage_bounds_after_seq,
+            user_id,
+            watermark_seq,
+            limit=fold_count,
+            through_seq=None,
+        )
+        if (
+            source_count != fold_count
+            or first_seq <= watermark_seq
+            or last_seq < first_seq
+        ):
+            raise RuntimeError("deterministic_coverage_bounds_incomplete")
 
-            segmented_write = (
-                deps.append_summary_segment is not None
-                and new_watermark_seq is not None
-                and first_watermark_seq is not None
-                and deps.read_summary_with_seq is not None
-            )
-            if segmented_write:
-                segment_text = await v2_compaction.compact_segment(
-                    provider_config=provider_config,
-                    old_messages=old,
-                    llm=_recording_compaction_llm,
-                    usage_out=tm.add_call if tm is not None else None,
-                )
-                new_summary = segment_text or ""
-            else:
-                new_summary = await v2_compaction.compact(
-                    provider_config=provider_config,
-                    current_summary=summary,
-                    old_messages=old,
-                    llm=_recording_compaction_llm,
-                    usage_out=tm.add_call if tm is not None else None,
-                )
-            _report_turn_progress("compaction_batch_complete")
-            if (
-                (segmented_write and not new_summary.strip())
-                or (not segmented_write and new_summary.strip() == summary.strip())
-            ):  # 空/no-op 折叠 → 不推进 watermark/version
-                if len(old) > 1:
-                    fold_limit = max(1, len(old) // 4)
-                    await _persist_batch_cap(user_id, fold_limit)
-                    _report_turn_progress(
-                        f"compaction_batch_shrunk_{fold_limit}"
-                    )
-                    await _record_trajectory(
-                        trajectory_recorder,
-                        "compaction_batch_shrunk",
-                        {
-                            "lane": "maintenance",
-                            "fold_limit": fold_limit,
-                        },
-                        best_effort=True,
-                    )
-                    continue
-                # A single row that still folds to nothing is genuinely
-                # unfoldable here. Leave it to the inline catch-up, which
-                # owns the quarantine path, rather than inventing coverage.
-                await asyncio.to_thread(
-                    jobs_store.mark_completed, job_id, claimed_by=claimed_by
-                )
-                if tm is not None:
-                    tm.flush(failed=False, status="ok")
-                return "completed"
-            break
+        segment_text = v2_compaction.deterministic_fold(
+            source_message_count=source_count
+        )
+        covered_count = await asyncio.to_thread(
+            db.count_messages_after_seq,
+            user_id,
+            0,
+            through_seq=last_seq,
+            exclude_synthetic_sources=True,
+        )
+        head_text = v2_compaction.deterministic_fold(
+            source_message_count=covered_count
+        )
+        _report_turn_progress("deterministic_compaction_batch_start")
+        await _record_trajectory(
+            trajectory_recorder,
+            "deterministic_compaction_batch",
+            {
+                "lane": "maintenance",
+                "start_seq": first_seq,
+                "end_seq": last_seq,
+                "source_message_count": source_count,
+            },
+            best_effort=True,
+        )
         if claimed_by and not await asyncio.to_thread(
             jobs_store.renew_job_lease,
             job_id,
             claimed_by,
             ttl_sec=jobs_store.RUNNING_TTL_SEC,
         ):
-            raise LostJobLease("compaction lease lost before summary write")
+            raise LostJobLease(
+                "compaction lease lost before deterministic summary write"
+            )
         if deps.runtime_mode_enabled is not None and not await asyncio.to_thread(
             deps.runtime_mode_enabled, user_id
         ):
-            raise RuntimeModeChanged("user rolled back before summary write")
-        # write_summary 是本地加密（core_envelope，非 enclave 往返）+ CAS 写库，不占用
-        # 稀缺的 enclave_sem——只有解密才走 enclave HTTP（见 _read_summary/_read_tail）。
-        # watermark_seq 只在算出来时才多传一个位置参数（见上）——narrow-signature 的旧
-        # fake（不接这个参数）走的正是这条 4 参分支，不受影响。
-        if segmented_write:
-            ok = await asyncio.to_thread(
-                deps.append_summary_segment,
+            raise RuntimeModeChanged(
+                "user rolled back before deterministic summary write"
+            )
+
+        inserted = await asyncio.to_thread(
+            deps.append_summary_segment,
+            user_id,
+            segment_text,
+            current_summary="",
+            head_summary=head_text,
+            start_seq=first_seq,
+            end_seq=last_seq,
+            source_message_count=source_count,
+            watermark_ts=watermark_ts,
+            expected_version=version,
+            previous_watermark_seq=watermark_seq,
+        )
+        _report_turn_progress("deterministic_compaction_batch_complete")
+        if inserted:
+            await _rebalance_summary_frontier_best_effort(
                 user_id,
-                new_summary,
-                current_summary=summary,
-                start_seq=int(first_watermark_seq),
-                end_seq=int(new_watermark_seq),
-                source_message_count=len(old),
-                watermark_ts=new_watermark,
-                expected_version=version,
-                previous_watermark_seq=int(watermark_seq),
+                deps,
+                lane="maintenance",
+                phase="post_fold_deterministic",
+                enclave_sem=None,
+                claimed_by=claimed_by,
+                job_id=job_id,
+                trajectory_recorder=trajectory_recorder,
             )
-        elif new_watermark_seq is not None:
-            ok = await asyncio.to_thread(
-                deps.write_summary,
-                user_id,
-                new_summary,
-                new_watermark,
-                version,
-                new_watermark_seq,
-            )
-        else:
-            ok = await asyncio.to_thread(
-                deps.write_summary, user_id, new_summary, new_watermark, version
-            )
-        if ok:
-            # That batch folded and landed: earn back a little headroom, so a
-            # conversation that recovers is not pinned at its worst size
-            # forever. Additive against the multiplicative decrease above.
-            if fold_limit < _COMPACTION_BATCH:
-                await _persist_batch_cap(
-                    user_id,
-                    min(_COMPACTION_BATCH, fold_limit + _BATCH_CAP_INCREMENT),
-                )
-            if segmented_write:
-                await _rebalance_summary_frontier_best_effort(
-                    user_id,
-                    deps,
-                    lane="maintenance",
-                    phase="post_fold",
-                    provider_config=provider_config,
-                    enclave_sem=enclave_sem,
-                    claimed_by=claimed_by,
-                    job_id=job_id,
-                    add_usage=tm.add_call if tm is not None else None,
-                    trajectory_recorder=trajectory_recorder,
-                )
+            remaining_count = await _unsummarized_count(user_id, last_seq)
             completed = await asyncio.to_thread(
                 jobs_store.mark_completed, job_id, claimed_by=claimed_by
             )
-            # A char-limited batch can be smaller than the message-count cap.
-            # Requeue whenever this snapshot still has more than the verbatim
-            # keep-tail after the rows we just folded, not only when the reader
-            # happened to hit its count limit.
-            if completed and (
-                len(tail) >= _COMPACTION_BATCH + _TAIL_KEEP
-                or len(tail) - len(old) > _TAIL_KEEP
-            ):
+            if completed and remaining_count > _TAIL_KEEP:
                 await asyncio.to_thread(
                     jobs_store.enqueue_job,
                     user_id,
@@ -6525,36 +6249,32 @@ async def _run_compaction(
             if tm is not None:
                 tm.flush(failed=False, status="ok")
             return "completed"
-        # CAS 没落地：别的写手已经推进过版本，本次压缩的 batch 作废——但 tail 是否
-        # 仍然超预算跟这次 CAS 输赢无关，绝不能静默放弃，否则超预算 tail 永久堆积、
-        # 加密开销/上下文预算一路涨上去没人再折。跟成功路径 (:674-677) 同一个
-        # "maintenance" lane + enqueue_job 的 per-user 单飞 coalesce（本来就防
-        # 重试风暴），reason 换成 cas_lost_retry 便于跟正常的 catch-up 区分。下一次
-        # 尝试会重新从（未被本次推进的）watermark 读 summary/tail，不复用这次算出
-        # 的、已经作废的 batch。
+
         failed_owned = await asyncio.to_thread(
-            jobs_store.mark_failed, job_id, "summary_cas_lost", claimed_by=claimed_by
+            jobs_store.mark_failed,
+            job_id,
+            "summary_cas_lost",
+            claimed_by=claimed_by,
         )
-        # A transcript clear supersedes the source job while this provider call is
-        # in flight.  Only the worker that still owns the terminal transition
-        # may schedule a CAS retry; otherwise stale maintenance work would
-        # recreate a new-generation job immediately after the clear.
         if failed_owned:
             await asyncio.to_thread(
-                jobs_store.enqueue_job, user_id, "maintenance", reason="cas_lost_retry"
+                jobs_store.enqueue_job,
+                user_id,
+                "maintenance",
+                reason="cas_lost_retry",
             )
             await asyncio.to_thread(core_wake_bus.notify, "v2_jobs", user_id)
         if tm is not None:
             tm.flush(failed=True, status="summary_cas_lost")
         return "failed"
-    except Exception as e:  # noqa: BLE001 — 后台 job：静默 mark_failed，绝不弹用户可见 error/写气泡
-        code = _safe_failure_code("compaction_failed", e)
+    except Exception as exc:  # noqa: BLE001 — maintenance stays user-invisible
+        code = _safe_failure_code("compaction_failed", exc)
         await _record_trajectory(
             trajectory_recorder,
             "turn_exception",
             {
                 "stage": "compaction",
-                "error_class": type(e).__name__,
+                "error_class": type(exc).__name__,
                 "error_code": code,
             },
             best_effort=True,
@@ -6566,7 +6286,6 @@ async def _run_compaction(
         if tm is not None:
             tm.flush(failed=True, status=code)
         return "failed"
-
 
 def _gap_from_count(unsummarized_count: int, tail_limit: int) -> bool:
     """Pure/no-I/O core of D6 gap detection: True when THIS USER has more
@@ -6607,8 +6326,8 @@ async def _unsummarized_count(
     global-seq-span estimate — see ``_gap_from_count``'s docstring for why
     that was wrong."""
     # Exclude GC-able synthetic rows (verify_ping/resident_maintenance) from the
-    # gap: the fold reader (serve_worker._read_compaction_tail_after_seq) and
-    # both frontier witnesses exclude them, so the gap/coverage math must too —
+    # gap: both metadata coverage witnesses exclude them, so the gap/coverage
+    # math must too —
     # otherwise a lone synthetic row after the watermark reports a phantom gap
     # that no fold can close (its row is never returned to be folded), and the
     # post-assembly _assert_prompt_covers would raise on a row that is not a
@@ -6727,257 +6446,23 @@ async def _assert_prompt_tail_exact(
         raise TurnError("prompt_coverage_incomplete")
 
 
-_QUARANTINE_ENABLED = os.environ.get(
-    "FEEDLING_V2_COMPACTION_QUARANTINE_ENABLED", "1"
-).strip().lower() not in {"0", "false", "no", "off"}
-
-
-def _quarantine_segment_text(reject_code: str) -> str:
-    """The stand-in summary written for a message no model would fold.
-
-    Deterministic and content-free by construction — it is generated here, not
-    by a provider, precisely because every provider attempt was refused. It
-    still has to read as a useful summary line, because it goes into the same
-    prompt position the real summary would have: it tells the assistant that a
-    message exists here which this summary does not represent, so the
-    assistant does not treat the gap as "nothing happened".
-
-    Quarantining loses summary coverage, NOT data: `chat_messages` is the
-    immutable transcript and is untouched. The row stays readable through
-    history and stays foldable by a future, smarter compactor.
-    """
-    detail = str(reject_code or "").strip() or "unknown"
-    return (
-        "- （系统记录）此处有 1 条历史消息未能被自动摘要"
-        f"（连续多次归纳失败，最后一次原因：{detail}），"
-        "其内容不在本摘要覆盖范围内；原始消息仍完整保留在聊天记录中。"
-    )
-
-
-async def _quarantine_unfoldable_head(
-    user_id: str,
-    deps: TurnDeps,
-    *,
-    enclave_sem: "asyncio.Semaphore | None",
-    seq_callbacks: bool,
-    watermark_seq: int,
-    compact_through_seq: int | None,
-    reject_code: str,
-    within_deadline: Callable[[Callable[[], Awaitable[Any]]], Awaitable[Any]],
-    renew_lease: Callable[[], Awaitable[None]],
-    trajectory_recorder: "v2_trajectory.TrajectoryRecorder | None" = None,
-) -> bool:
-    """Cover exactly the one oldest unsummarized row with a stand-in segment.
-
-    Head-of-line unblocking, the same shape as the TEE replication poison-row
-    fix: isolate the one row that cannot move, advance past it, and leave a
-    durable record of what was skipped. Coverage stays honest — the segment's
-    seq range is exactly the row it replaces, so
-    `validate_canonical_frontier`'s witnesses still hold — while the summary
-    text says plainly that this row's content is not represented.
-
-    Deliberately ONE row, never the failed batch: quarantining 200 messages to
-    unblock one would throw away 199 perfectly foldable ones.
-    """
-
-    async def _read_head() -> tuple[Any, list[dict]]:
-        if seq_callbacks:
-            summary_ = await asyncio.to_thread(deps.read_summary_with_seq, user_id)
-            reader_ = deps.read_compaction_tail_after_seq or deps.read_tail_after_seq
-            rows_ = await asyncio.to_thread(
-                reader_,
-                user_id,
-                watermark_seq,
-                1,
-                **(
-                    {"through_seq": int(compact_through_seq)}
-                    if compact_through_seq is not None
-                    else {}
-                ),
-            )
-            return summary_, list(rows_ or [])
-        summary_ = await asyncio.to_thread(deps.read_summary, user_id)
-        reader_ = deps.read_compaction_tail or deps.read_tail
-        rows_ = await asyncio.to_thread(reader_, user_id, summary_[1], 1)
-        return summary_, list(rows_ or [])
-
-    async def _read_head_gated() -> tuple[Any, list[dict]]:
-        if enclave_sem is not None:
-            async with enclave_sem:
-                return await _read_head()
-        return await _read_head()
-
-    summary_fields, head = await within_deadline(_read_head_gated)
-    if not head:
-        return False
-    summary, watermark_ts, version = summary_fields[:3]
-    if seq_callbacks and int(summary_fields[3]) != watermark_seq:
-        # A concurrent compactor moved the frontier — that IS progress; let the
-        # caller re-loop from the winning watermark rather than quarantining a
-        # row somebody else may already have folded.
-        return False
-
-    row = head[0]
-    # Resolve the seq from chat_messages by (user_id, msg_id) rather than
-    # trusting whatever the decrypted reader row carries. This value becomes
-    # an IMMUTABLE coverage claim, and `chat_messages.seq` is a table-wide
-    # identity shared by every user: a segment claiming a seq this user does
-    # not own permanently breaks `validate_canonical_frontier`, failing every
-    # later turn — strictly worse than the stall being escaped. Caught on test
-    # 2026-07-28, where a reader row produced 20090 while the user's oldest
-    # row was 20091 and 20090 belonged to no row at all.
-    row_id = row.get("id")
-    row_seq = None
-    if row_id is not None:
-        row_seq = await within_deadline(
-            lambda: asyncio.to_thread(db.chat_seq_for_msg_id, user_id, row_id)
-        )
-    if row_seq is None:
-        return False
-    row_seq = int(row_seq)
-    if row_seq <= int(watermark_seq):
-        # Not actually the head of the backlog (a concurrent compactor moved
-        # the frontier, or the reader handed back a stale row). Advancing here
-        # would rewrite coverage that is already claimed.
-        return False
-    row_ts = row["ts"]
-    text = _quarantine_segment_text(reject_code)
-
-    await renew_lease()
-    if deps.append_summary_segment is not None and seq_callbacks:
-        wrote = await within_deadline(
-            lambda: asyncio.to_thread(
-                deps.append_summary_segment,
-                user_id,
-                text,
-                current_summary=summary,
-                start_seq=row_seq,
-                end_seq=row_seq,
-                source_message_count=1,
-                watermark_ts=row_ts,
-                expected_version=version,
-                previous_watermark_seq=watermark_seq,
-            )
-        )
-    elif deps.write_summary is not None:
-        separator = "" if not summary or summary.endswith("\n") else "\n"
-        wrote = await within_deadline(
-            lambda: asyncio.to_thread(
-                deps.write_summary,
-                user_id,
-                (summary + separator + text) if summary else text,
-                row_ts,
-                version,
-                row_seq,
-            )
-        )
-    else:
-        return False
-
-    await _record_trajectory(
-        trajectory_recorder,
-        "compaction_quarantined",
-        {
-            "lane": "prompt_catchup",
-            "seq": row_seq,
-            "reject_code": str(reject_code or ""),
-            "written": bool(wrote),
-        },
-        best_effort=True,
-    )
-    if wrote:
-        # Plaintext, greppable, and rate-limited by construction (one line per
-        # row that ever needed this) — the signal that some user's history has
-        # a summary hole a future compactor should revisit.
-        print(
-            f"[v2-compaction] quarantined unfoldable row user={user_id} "
-            f"seq={row_seq} reject={reject_code or 'unknown'}",
-            flush=True,
-        )
-    return bool(wrote)
-
 
 async def _ensure_prompt_coverage(
     user_id: str,
     deps: TurnDeps,
     *,
-    provider_config: Any,
-    enclave_sem: "asyncio.Semaphore",
+    enclave_sem: "asyncio.Semaphore | None",
     tail_limit: int,
     max_retries: int = 3,
     job_id: Any | None = None,
     claimed_by: str | None = None,
     catchup_deadline_sec: float | None = None,
-    add_usage: Callable[[dict | None], None] | None = None,
     trajectory_recorder: "v2_trajectory.TrajectoryRecorder | None" = None,
     compact_through_seq: int | None = None,
 ) -> tuple[int, int]:
-    """D6 (Task 10): close a compaction backlog gap BEFORE assembling a turn's
-    prompt. Today's bug: ``_read_tail`` only ever returns the newest
-    ``tail_limit`` messages after the summary watermark (``result[-limit:]``,
-    see ``serve_worker._read_tail_window``) — if compaction has fallen more
-    than ``tail_limit`` messages behind, the messages strictly between the
-    watermark and the tail's start seq are SILENTLY DROPPED: not summarized
-    (compaction hasn't reached them yet) and not in the tail (the
-    newest-``tail_limit`` slice excludes them). This closes that hole with a
-    SYNCHRONOUS catch-up compaction run inline, before the caller reads the
-    actual prompt content — unlike the existing best-effort background
-    maintenance enqueue (``process_job``'s ``needs_compaction`` check), which
-    only fires AFTER a reply has already gone out on a tail that had the hole.
+    """Close a prompt-coverage gap with exact metadata-only segment writes."""
 
-    Gap math (COUNT-based on THIS USER's own rows — see ``_gap_from_count``/
-    ``_prompt_coverage_gap``, no enclave/decrypt work on the fast path):
-    ``watermark_seq`` comes from ``jobs_store.get_summary_row`` (already
-    performs the D5/Task 9 ts->seq back-compat translation for pre-migration
-    rows — that function's own docstring names this exact call site).
-    ``unsummarized_count`` is ``db.count_messages_after_seq(user_id,
-    watermark_seq)`` — deliberately NOT ``db.chat_max_seq`` seq-arithmetic
-    (``chat_messages.seq`` is a table-wide identity counter shared by every
-    user; other users' interleaved inserts make a global-seq span meaningless
-    as a per-user count — see ``_gap_from_count``'s docstring for the full
-    writeup of the bug this replaced). No gap is the overwhelmingly common
-    case and costs exactly two cheap indexed reads (summary row + COUNT) — no
-    tail decrypt, no LLM call, no compaction.
-
-    Gap found: run as many bounded inline catch-up batches as are needed to
-    cover ONLY the pre-tail gap. Each batch is the oldest contiguous prefix,
-    capped by both ``_COMPACTION_BATCH`` messages and
-    ``_COMPACTION_BATCH_CHARS`` rendered characters — reuses
-    ``deps.read_compaction_tail``/``_read_compaction_tail``'s
-    oldest-first-from-watermark contract, exactly like ``_run_compaction``'s
-    periodic fold. Each batch goes through ``v2_compaction.compact``, then
-    CAS-writes the advanced summary via ``deps.write_summary`` (watermark_ts
-    AND watermark_seq advance atomically in the same CAS row, per Task 9),
-    then loops to re-check from a fresh read. Looping (rather than assuming the
-    CAS landed) handles two real races: (a) CAS loss — a concurrently running
-    periodic maintenance job or another turn for this user advanced the
-    summary first; re-reading at the top of the next iteration picks up
-    whatever version won, which may already close the gap with zero extra
-    compaction work; (b) a genuine no-op fold (``compact`` returns unchanged
-    text, e.g. an empty/failed LLM reply) never advances the watermark and
-    must not spin forever. ``max_retries`` therefore bounds CONSECUTIVE
-    no-progress/CAS-loss attempts, and resets whenever a fresh read observes
-    the watermark advance; it does not cap successful batches. The whole
-    catch-up is additionally bounded by ``catchup_deadline_sec`` (default
-    ``_PROMPT_CATCHUP_DEADLINE_SEC``). Production callers pass ``job_id`` and
-    ``claimed_by`` so the active lease is renewed between batches.
-
-    Bounded-retry exhaustion is NOT a silent pass-through: raises
-    ``TurnError("prompt_coverage_incomplete")`` so the turn
-    fails visibly (``mark_failed``, requeue-able) rather than shipping a
-    prompt with a known coverage hole. ``deps.read_summary``/
-    ``deps.read_compaction_tail``-or-``deps.read_tail``/``deps.write_summary``
-    being unwired (``None`` — older/minimal test deps) is likewise NOT
-    treated as "can't happen here": it raises the same way on the first gap
-    found, since without those readers this function has no way to close it.
-
-    Returns ``(watermark_seq, max_seq)`` as of the last (successful, no-gap)
-    check purely for callers that want it cheaply (``max_seq`` is
-    ``db.chat_max_seq`` — a GLOBAL anchor, informational only, no longer part
-    of the gap math itself); the actual hard invariant enforcement after the
-    real tail read is ``_assert_prompt_covers``, which re-derives its own
-    fresh state rather than trusting this return value.
-    """
+    del enclave_sem  # Coverage reads are metadata-only and need no enclave slot.
     deadline_sec = (
         _PROMPT_CATCHUP_DEADLINE_SEC
         if catchup_deadline_sec is None
@@ -7002,44 +6487,22 @@ async def _ensure_prompt_coverage(
     async def _renew_catchup_lease() -> None:
         if job_id is None or not claimed_by:
             return
-        if not await _within_deadline(
+        renewed = await _within_deadline(
             lambda: asyncio.to_thread(
                 jobs_store.renew_job_lease,
                 job_id,
                 claimed_by,
                 ttl_sec=jobs_store.RUNNING_TTL_SEC,
             )
-        ):
+        )
+        if not renewed:
             raise LostJobLease("job lease lost during prompt catch-up")
 
-    # Successful batches may be arbitrarily numerous.  Only attempts after
-    # which a fresh DB read observes no watermark movement consume this
-    # budget.  This distinguishes a healthy large backlog from a stuck/no-op
-    # compactor or repeated CAS loss.
     no_progress_attempts = 0
     last_observed_watermark: int | None = None
     attempted_since_observation = False
-    # Why the most recent fold was refused, if it was.  Content-free (rule
-    # name plus a count) and overwritten each attempt: what matters is the
-    # reason the batch that finally exhausted the retry budget was rejected.
-    last_reject_code = ""
-    # Set when the most recent attempt failed because the PROVIDER did not
-    # answer (timeout/5xx), cleared by any attempt that did get an answer.
-    # Gates quarantine: see the escalation below.
-    last_provider_exc: BaseException | None = None
-    # Shrinks on repeated refusal (see the escalation below).  Starts at the
-    # size this conversation was last observed to digest, so a user whose
-    # content is uniformly thin does not re-pay one guaranteed-to-fail model
-    # call per job rediscovering the same limit.  Unmeasured conversations get
-    # the configured batch size, so the healthy path is unchanged.
-    batch_cap = await _load_batch_cap(user_id)
-
-    def _note_reject(code: str) -> None:
-        nonlocal last_reject_code
-        last_reject_code = str(code or "")[:80]
 
     while True:
-        _remaining()
         summary_row = await _within_deadline(
             lambda: asyncio.to_thread(jobs_store.get_summary_row, user_id)
         )
@@ -7047,16 +6510,10 @@ async def _ensure_prompt_coverage(
         if last_observed_watermark is not None:
             if watermark_seq > last_observed_watermark:
                 no_progress_attempts = 0
-                # That batch folded: earn back a little headroom (additive
-                # increase against the multiplicative decrease below), so a
-                # conversation that recovers is not stuck at its worst size.
-                if batch_cap < _COMPACTION_BATCH:
-                    batch_cap = min(
-                        _COMPACTION_BATCH, batch_cap + _BATCH_CAP_INCREMENT
-                    )
-                    await _persist_batch_cap(user_id, batch_cap)
             elif attempted_since_observation:
                 no_progress_attempts += 1
+        if no_progress_attempts >= max(1, int(max_retries)):
+            raise TurnError("prompt_coverage_incomplete")
         last_observed_watermark = watermark_seq
         attempted_since_observation = False
 
@@ -7068,545 +6525,105 @@ async def _ensure_prompt_coverage(
             )
         )
         target_mode = compact_through_seq is not None
-        needs_compaction = (
-            unsummarized_count > 0
+        required_gap_count = (
+            unsummarized_count
             if target_mode
-            else _gap_from_count(unsummarized_count, tail_limit)
+            else max(0, unsummarized_count - int(tail_limit))
         )
-        if not needs_compaction:
+        if required_gap_count <= 0:
             max_seq = await _within_deadline(
                 lambda: asyncio.to_thread(db.chat_max_seq, user_id)
             )
-            return watermark_seq, max_seq  # no gap — the common fast path
-        seq_callbacks = deps.read_summary_with_seq is not None and (
-            deps.read_compaction_tail_after_seq is not None
-            or deps.read_tail_after_seq is not None
-        )
-        legacy_callbacks = (
-            compact_through_seq is None
-            and deps.read_summary is not None
-            and (
-                deps.read_compaction_tail is not None
-                or deps.read_tail is not None
-            )
-        )
-        deterministic_callbacks = (
-            _PROFILE_COVERAGE_DETERMINISTIC
-            and deps.append_summary_segment is not None
-        )
-        if (
-            (
-                deps.write_summary is None
-                and deps.append_summary_segment is None
-            )
-            or not (
-                deterministic_callbacks
-                or seq_callbacks
-                or legacy_callbacks
-            )
-        ):
+            return watermark_seq, max_seq
+        if deps.append_summary_segment is None:
             raise TurnError(_coverage_incomplete_reason("catchup_unwired"))
-        if no_progress_attempts >= max_retries:
-            # This batch is unfoldable, not merely slow: `max_retries`
-            # consecutive attempts left the watermark exactly where it was,
-            # and the next read returns the identical batch, so retrying the
-            # same shape can only repeat. Escalate instead of raising here.
-            if batch_cap > 1:
-                # Shrink first. Most refusals are a property of the BATCH, not
-                # of any one message (too many lines to render under the
-                # output budget, two messages summarizing to the same bullet),
-                # and a quarter-size batch usually folds cleanly. Each new size
-                # gets its own retry budget because it is a genuinely
-                # different request, not a repeat of the failed one.
-                batch_cap = max(1, batch_cap // 4)
-                # Remember it: the next job would otherwise start at the full
-                # batch and spend another refusal relearning this same limit.
-                await _persist_batch_cap(user_id, batch_cap)
-                no_progress_attempts = 0
-                last_observed_watermark = None
-                _report_turn_progress(f"prompt_catchup_shrink_{batch_cap}")
-                await _record_trajectory(
-                    trajectory_recorder,
-                    "compaction_batch_shrunk",
-                    {
-                        "lane": "prompt_catchup",
-                        "batch_cap": batch_cap,
-                        "reject_code": last_reject_code,
-                    },
-                    best_effort=True,
-                )
-                continue
-            # Down to a single message and still refused: no smaller request
-            # exists. Without an escape hatch this user's every later message
-            # is blocked forever behind this one row (usr_7f30…, three days).
-            if last_provider_exc is not None:
-                # …but only a row we actually SAW and could not fold may be
-                # written off. The provider never answered here, so it said
-                # nothing about this row: quarantining now would permanently
-                # drop a message the next turn (once the provider recovers)
-                # would have folded fine. Fail honestly and leave the frontier
-                # untouched — a stalled catch-up is recoverable, a summary
-                # that silently omits a real message is not.
-                raise last_provider_exc
-            if not _QUARANTINE_ENABLED:
-                raise TurnError(_coverage_incomplete_reason(last_reject_code))
-            quarantined = await _quarantine_unfoldable_head(
+
+        fold_count = min(required_gap_count, _COMPACTION_BATCH)
+        first_seq, last_seq, source_count = await _within_deadline(
+            lambda: asyncio.to_thread(
+                db.chat_coverage_bounds_after_seq,
                 user_id,
-                deps,
-                enclave_sem=enclave_sem,
-                seq_callbacks=seq_callbacks,
-                watermark_seq=watermark_seq,
-                compact_through_seq=compact_through_seq,
-                reject_code=last_reject_code,
-                within_deadline=_within_deadline,
-                renew_lease=_renew_catchup_lease,
-                trajectory_recorder=trajectory_recorder,
+                watermark_seq,
+                limit=fold_count,
+                through_seq=compact_through_seq,
             )
-            if not quarantined:
-                raise TurnError(
-                    _coverage_incomplete_reason(
-                        last_reject_code or "quarantine_failed"
-                    )
-                )
-            # Advance past it and keep going: the rest of the backlog is
-            # almost certainly foldable, and the batch cap resets because the
-            # blocking row is behind us now — persisted too, so the next job
-            # does not inherit a small cap that only that one row justified.
-            batch_cap = _COMPACTION_BATCH
-            await _persist_batch_cap(user_id, batch_cap)
-            no_progress_attempts = 0
-            last_observed_watermark = None
-            last_reject_code = ""
-            continue
-        fold_count = min(
-            (
-                unsummarized_count
-                if target_mode
-                else unsummarized_count - tail_limit
-            ),
-            batch_cap,
         )
-        if fold_count <= 0:
-            continue
-        if deterministic_callbacks:
-            first_seq, last_seq, source_count = await _within_deadline(
-                lambda: asyncio.to_thread(
-                    db.chat_coverage_bounds_after_seq,
-                    user_id,
-                    watermark_seq,
-                    limit=fold_count,
-                    through_seq=compact_through_seq,
-                )
-            )
-            if (
-                source_count != fold_count
-                or first_seq <= watermark_seq
-                or last_seq < first_seq
-            ):
-                raise TurnError("prompt_coverage_incomplete")
-            segment_text = v2_compaction.deterministic_fold(
-                source_message_count=source_count
-            )
-            covered_count = await _within_deadline(
-                lambda: asyncio.to_thread(
-                    db.count_messages_after_seq,
-                    user_id,
-                    0,
-                    through_seq=last_seq,
-                    exclude_synthetic_sources=True,
-                )
-            )
-            head_text = v2_compaction.deterministic_fold(
-                source_message_count=covered_count
-            )
-            attempted_since_observation = True
-            _report_turn_progress("prompt_deterministic_catchup_batch_start")
-            await _renew_catchup_lease()
-            wrote = await _within_deadline(
-                lambda: asyncio.to_thread(
-                    deps.append_summary_segment,
-                    user_id,
-                    segment_text,
-                    current_summary="",
-                    head_summary=head_text,
-                    start_seq=first_seq,
-                    end_seq=last_seq,
-                    source_message_count=source_count,
-                    watermark_ts=(
-                        float(summary_row["watermark_ts"])
-                        if summary_row
-                        else 0.0
-                    ),
-                    expected_version=(
-                        int(summary_row["version"]) if summary_row else 0
-                    ),
-                    previous_watermark_seq=watermark_seq,
-                )
-            )
-            if wrote:
-                # Leave enough budget for the next authoritative coverage read;
-                # the checkpoint is optional, that verification is not.
-                checkpoint_budget = deadline_at - time.monotonic() - 2.0
-                if checkpoint_budget > 0:
-                    await _rebalance_summary_frontier_best_effort(
-                        user_id,
-                        deps,
-                        lane="prompt_catchup",
-                        phase="post_fold_deterministic",
-                        provider_config=provider_config,
-                        enclave_sem=enclave_sem,
-                        claimed_by=claimed_by,
-                        job_id=job_id,
-                        add_usage=add_usage,
-                        trajectory_recorder=trajectory_recorder,
-                        deterministic_coverage=True,
-                        timeout_sec=min(30.0, checkpoint_budget),
-                    )
-            _report_turn_progress("prompt_deterministic_catchup_batch_complete")
-            await _record_trajectory(
-                trajectory_recorder,
-                "deterministic_compaction_batch",
-                {
-                    "lane": "prompt_catchup",
-                    "start_seq": first_seq,
-                    "end_seq": last_seq,
-                    "source_message_count": source_count,
-                    "written": bool(wrote),
-                },
-                best_effort=True,
-            )
-            continue
-
-        async def _read_gap():
-            if seq_callbacks:
-                summary_ = await asyncio.to_thread(deps.read_summary_with_seq, user_id)
-                # A concurrent compactor advanced between the cheap metadata read
-                # and summary decrypt. Re-loop from its winning watermark.
-                if int(summary_[3]) != watermark_seq:
-                    return summary_, [], True
-                reader_ = (
-                    deps.read_compaction_tail_after_seq or deps.read_tail_after_seq
-                )
-                old_ = await asyncio.to_thread(
-                    reader_,
-                    user_id,
-                    watermark_seq,
-                    fold_count,
-                    **(
-                        {"through_seq": int(compact_through_seq)}
-                        if compact_through_seq is not None
-                        else {}
-                    ),
-                )
-                return summary_, old_, False
-
-            summary_ = await asyncio.to_thread(deps.read_summary, user_id)
-            reader_ = deps.read_compaction_tail or deps.read_tail
-            # Cover only the rows that would otherwise fall before the verbatim
-            # tail — not the tail itself. ``fold_count`` is the smaller of the
-            # actual per-user gap and the message-count batch cap; the char cap
-            # is applied after decrypting this already-bounded oldest prefix.
-            old_ = await asyncio.to_thread(reader_, user_id, summary_[1], fold_count)
-            return summary_, old_, False
-
-        # enclave_sem may be None in tests that call this helper directly
-        # (mirrors `_coalesce_inputs`/`_cap_data`'s own `enclave_sem is None`
-        # no-gate tolerance) — production callers always pass the shared gate.
-        async def _read_gap_gated():
-            if enclave_sem is not None:
-                async with enclave_sem:
-                    return await _read_gap()
-            return await _read_gap()
-
-        summary_fields, old, raced = await _within_deadline(_read_gap_gated)
-        if raced:
-            continue
-        summary, watermark_ts, version = summary_fields[:3]
-        try:
-            old = _bounded_compaction_prefix(old, max_messages=batch_cap)
-        except ValueError as exc:
-            # The oldest row alone exceeds the whole batch's char budget, so
-            # `_bounded_compaction_prefix` refuses to skip it (skipping would
-            # make the summary's seq coverage dishonest). No batch size can
-            # ever include it, which makes it permanently unfoldable rather
-            # than merely refused — shrinking would spin, so quarantine it
-            # directly. This is a real prod shape: an R2-offloaded row whose
-            # hydrated body is hundreds of KB sits in the backlog and stalls
-            # every message behind it (usr_7f30…, seq 682632).
-            if not _QUARANTINE_ENABLED:
-                raise TurnError(
-                    _coverage_incomplete_reason("message_exceeds_char_budget")
-                ) from exc
-            if not await _quarantine_unfoldable_head(
-                user_id,
-                deps,
-                enclave_sem=enclave_sem,
-                seq_callbacks=seq_callbacks,
-                watermark_seq=watermark_seq,
-                compact_through_seq=compact_through_seq,
-                reject_code="message_exceeds_char_budget",
-                within_deadline=_within_deadline,
-                renew_lease=_renew_catchup_lease,
-                trajectory_recorder=trajectory_recorder,
-            ):
-                raise TurnError(
-                    _coverage_incomplete_reason("message_exceeds_char_budget")
-                ) from exc
-            # The oversized row is behind us; the small cap was about that row,
-            # not about this conversation, so restore and remember the full one.
-            batch_cap = _COMPACTION_BATCH
-            await _persist_batch_cap(user_id, batch_cap)
-            no_progress_attempts = 0
-            last_observed_watermark = None
-            last_reject_code = ""
-            continue
-        if not old:
-            # The count says a gap exists but the reader returned nothing
-            # (e.g. a ts-windowed fake/reader whose window doesn't line up
-            # with the real seq boundary) — looping again would just burn
-            # retry budget for no benefit. Fail now rather than spin.
-            raise TurnError("prompt_coverage_incomplete")
-        attempted_since_observation = True
-        _report_turn_progress("prompt_catchup_batch_start")
-        segmented_write = (
-            seq_callbacks
-            and deps.append_summary_segment is not None
-            and len(summary_fields) >= 4
-        )
-
-        async def _recording_catchup_llm(*args: Any, **kwargs: Any) -> Any:
-            messages = args[1] if len(args) > 1 else kwargs.get("messages", [])
-            await _record_trajectory(
-                trajectory_recorder,
-                "provider_request",
-                {"lane": "prompt_catchup", "messages": messages, "tools": None},
-            )
-            try:
-                result = await _compaction_llm_with_progress(
-                    user_id,
-                    *args,
-                    **kwargs,
-                )
-            except Exception as exc:
-                await _record_trajectory(
-                    trajectory_recorder,
-                    "provider_error",
-                    {
-                        "lane": "prompt_catchup",
-                        "error_class": type(exc).__name__,
-                        "provider_attempt_trace": (
-                            provider_client.runtime_provider_attempt_trace(exc)
-                        ),
-                    },
-                    best_effort=True,
-                )
-                raise
-            await _record_trajectory(
-                trajectory_recorder,
-                "provider_response",
-                {"lane": "prompt_catchup", "response": result},
-            )
-            return result
-
-        try:
-            if segmented_write:
-                segment_text = await _within_deadline(
-                    lambda: v2_compaction.compact_segment(
-                        provider_config=provider_config,
-                        old_messages=old,
-                        llm=_recording_catchup_llm,
-                        usage_out=add_usage,
-                        reject_out=_note_reject,
-                    )
-                )
-                new_summary = segment_text or ""
-            else:
-                new_summary = await _within_deadline(
-                    lambda: v2_compaction.compact(
-                        provider_config=provider_config,
-                        current_summary=summary,
-                        old_messages=old,
-                        llm=_recording_catchup_llm,
-                        usage_out=add_usage,
-                        reject_out=_note_reject,
-                    )
-                )
-        except (LostJobLease, TurnError):
-            # Lease loss and this catch-up's own deadline are about US, not
-            # about the batch — a smaller retry cannot help and must not be
-            # attempted with a lease we may no longer hold.
-            raise
-        except Exception as exc:
-            # The provider never answered this batch (compaction's own
-            # `timeout=60.0`, a 5xx, a dropped connection), so it returned no
-            # text to reject and never reached the no-op guard below. Left
-            # alone it re-raises identically on every later turn at full size
-            # forever — usr_90184…'s stall.
-            if provider_client.classify_provider_error(exc) == "provider_config":
-                # A bad key / no credits is a property of the USER'S CONFIG,
-                # not of the batch: every smaller retry fails the same way
-                # while burning another round-trip and another deadline slice.
-                raise
-            # Anything else (transient/unknown) may well be "this batch was
-            # too big to finish in time" — take the same escalation ladder a
-            # refusal takes. `attempted_since_observation` is already set, so
-            # the next loop's fresh watermark read consumes one no-progress
-            # attempt and eventually shrinks `batch_cap`.
-            last_provider_exc = exc
-            _note_reject(f"provider_{provider_client.classify_provider_error(exc)}")
-            _report_turn_progress("prompt_catchup_batch_provider_error")
-            await _record_trajectory(
-                trajectory_recorder,
-                "compaction_provider_failed",
-                {
-                    "lane": "prompt_catchup",
-                    "error_class": type(exc).__name__,
-                    "batch_messages": len(old),
-                    "batch_cap": batch_cap,
-                    "no_progress_attempts": no_progress_attempts,
-                },
-                best_effort=True,
-            )
-            # A 60s timeout ate most of a lease TTL; renew before looping.
-            await _renew_catchup_lease()
-            # Shrink on the FIRST timeout rather than after `max_retries` of
-            # them. A refusal gets retried at the same size because the model
-            # is nondeterministic and often folds the identical batch on the
-            # next try; a timeout is not like that — it says this batch cannot
-            # finish in the time allowed, and re-sending it just burns another
-            # full provider timeout. Spending the retry budget at each rung
-            # costs 4 rungs × max_retries × 60s = 720s against a 600s deadline,
-            # so the ladder never reaches the small batches that would have
-            # worked. Shrinking immediately walks the whole ladder in ~4
-            # timeouts instead, and the rung that worked is persisted below so
-            # the next job starts there rather than at the top again.
-            if batch_cap > 1:
-                batch_cap = max(1, batch_cap // 4)
-                await _persist_batch_cap(user_id, batch_cap)
-                no_progress_attempts = 0
-                last_observed_watermark = None
-                _report_turn_progress(f"prompt_catchup_shrink_{batch_cap}")
-                await _record_trajectory(
-                    trajectory_recorder,
-                    "compaction_batch_shrunk",
-                    {
-                        "lane": "prompt_catchup",
-                        "batch_cap": batch_cap,
-                        "reject_code": last_reject_code,
-                    },
-                    best_effort=True,
-                )
-            continue
-        last_provider_exc = None
-        _report_turn_progress("prompt_catchup_batch_complete")
         if (
-            (segmented_write and not new_summary.strip())
-            or (not segmented_write and new_summary.strip() == summary.strip())
-        ):
-            # Genuine no-op fold (empty/failed LLM reply — mirrors
-            # `_run_compaction`'s identical guard). Do NOT advance the
-            # watermark: these messages were NOT actually folded into the
-            # summary text, so pretending they were covered would satisfy the
-            # seq arithmetic while silently losing their content — exactly
-            # the bug this task exists to close, just moved one layer down.
-            # Leave the gap in place; the `while` loop's fresh watermark read
-            # consumes one no-progress attempt and eventually raises.
-            _report_turn_progress("prompt_catchup_batch_rejected")
-            await _record_trajectory(
-                trajectory_recorder,
-                "compaction_rejected",
-                {
-                    "lane": "prompt_catchup",
-                    "reject_code": last_reject_code,
-                    "batch_messages": len(old),
-                    "segmented": bool(segmented_write),
-                    "no_progress_attempts": no_progress_attempts,
-                },
-                best_effort=True,
-            )
-            await _renew_catchup_lease()
-            continue
-        # Fence the summary CAS with current job ownership and refresh enough
-        # lease for the following batch.  Renew BEFORE the write so a batch
-        # whose lease expired during provider work cannot mutate coverage.
-        await _renew_catchup_lease()
-        new_watermark_ts = old[-1]["ts"]
-        new_watermark_seq = old[-1].get("seq")
-        first_watermark_seq = old[0].get("seq")
-        if first_watermark_seq is None:
-            first_id = old[0].get("id")
-            if first_id is not None:
-                first_watermark_seq = await _within_deadline(
-                    lambda: asyncio.to_thread(
-                        db.chat_seq_for_msg_id, user_id, first_id
-                    )
-                )
-        if new_watermark_seq is None:
-            last_id = old[-1].get("id")
-            if last_id is not None:
-                new_watermark_seq = await _within_deadline(
-                    lambda: asyncio.to_thread(db.chat_seq_for_msg_id, user_id, last_id)
-                )
-        if seq_callbacks and (
-            new_watermark_seq is None
-            or (segmented_write and first_watermark_seq is None)
+            source_count != fold_count
+            or first_seq <= watermark_seq
+            or last_seq < first_seq
         ):
             raise TurnError("prompt_coverage_incomplete")
-        if segmented_write:
-            wrote = await _within_deadline(
-                lambda: asyncio.to_thread(
-                    deps.append_summary_segment,
-                    user_id,
-                    new_summary,
-                    current_summary=summary,
-                    start_seq=int(first_watermark_seq),
-                    end_seq=int(new_watermark_seq),
-                    source_message_count=len(old),
-                    watermark_ts=new_watermark_ts,
-                    expected_version=version,
-                    previous_watermark_seq=int(summary_fields[3]),
-                )
-            )
-            if wrote:
-                # Leave enough budget for the next authoritative coverage read;
-                # the checkpoint is optional, that verification is not.
-                checkpoint_budget = deadline_at - time.monotonic() - 2.0
-                if checkpoint_budget > 0:
-                    await _rebalance_summary_frontier_best_effort(
-                        user_id,
-                        deps,
-                        lane="prompt_catchup",
-                        phase="post_fold",
-                        provider_config=provider_config,
-                        enclave_sem=enclave_sem,
-                        claimed_by=claimed_by,
-                        job_id=job_id,
-                        add_usage=add_usage,
-                        trajectory_recorder=trajectory_recorder,
-                        timeout_sec=min(30.0, checkpoint_budget),
-                    )
-        elif new_watermark_seq is not None:
-            await _within_deadline(
-                lambda: asyncio.to_thread(
-                    deps.write_summary,
-                    user_id,
-                    new_summary,
-                    new_watermark_ts,
-                    version,
-                    new_watermark_seq,
-                )
-            )
-        else:
-            await _within_deadline(
-                lambda: asyncio.to_thread(
-                    deps.write_summary, user_id, new_summary, new_watermark_ts, version
-                )
-            )
-        _report_turn_progress("prompt_catchup_watermark_write")
-        # Loop: the top of `while` re-reads and re-checks against whatever
-        # watermark actually landed (this write's, a concurrent writer's, or
-        # unchanged on CAS loss/no-op fold).
 
+        segment_text = v2_compaction.deterministic_fold(
+            source_message_count=source_count
+        )
+        covered_count = await _within_deadline(
+            lambda: asyncio.to_thread(
+                db.count_messages_after_seq,
+                user_id,
+                0,
+                through_seq=last_seq,
+                exclude_synthetic_sources=True,
+            )
+        )
+        head_text = v2_compaction.deterministic_fold(
+            source_message_count=covered_count
+        )
+        await _renew_catchup_lease()
+        if deps.runtime_mode_enabled is not None and not await _within_deadline(
+            lambda: asyncio.to_thread(deps.runtime_mode_enabled, user_id)
+        ):
+            raise RuntimeModeChanged("user rolled back during prompt catch-up")
+
+        attempted_since_observation = True
+        _report_turn_progress("prompt_deterministic_catchup_batch_start")
+        wrote = await _within_deadline(
+            lambda: asyncio.to_thread(
+                deps.append_summary_segment,
+                user_id,
+                segment_text,
+                current_summary="",
+                head_summary=head_text,
+                start_seq=first_seq,
+                end_seq=last_seq,
+                source_message_count=source_count,
+                watermark_ts=(
+                    float(summary_row["watermark_ts"]) if summary_row else 0.0
+                ),
+                expected_version=(
+                    int(summary_row["version"]) if summary_row else 0
+                ),
+                previous_watermark_seq=watermark_seq,
+            )
+        )
+        if wrote:
+            checkpoint_budget = deadline_at - time.monotonic() - 2.0
+            if checkpoint_budget > 0:
+                await _rebalance_summary_frontier_best_effort(
+                    user_id,
+                    deps,
+                    lane="prompt_catchup",
+                    phase="post_fold_deterministic",
+                    enclave_sem=None,
+                    claimed_by=claimed_by,
+                    job_id=job_id,
+                    trajectory_recorder=trajectory_recorder,
+                    timeout_sec=min(30.0, checkpoint_budget),
+                )
+        _report_turn_progress("prompt_deterministic_catchup_batch_complete")
+        await _record_trajectory(
+            trajectory_recorder,
+            "deterministic_compaction_batch",
+            {
+                "lane": "prompt_catchup",
+                "start_seq": first_seq,
+                "end_seq": last_seq,
+                "source_message_count": source_count,
+                "written": bool(wrote),
+            },
+            best_effort=True,
+        )
 
 async def _run_wake(
     job_id,
@@ -7621,8 +6638,8 @@ async def _run_wake(
 ) -> str:
     """wake-lane（heartbeat/scheduled/manual_wake/screen_watch）turn：让伴侣主动开口，而不是
     回答用户刚发的消息（用户根本没发消息——这就是唤醒的定义）。同 `_run_compaction` 一样自成
-    一体、自己的 try/except：这是后台/主动发起的 job，provider 解析失败或任何未预期异常
-    都静默 `mark_failed`，绝不 `_surface_terminal_error`、绝不写占位气泡。
+    一体、自己的 try/except。heartbeat/manual_wake/screen_watch 是弱唤醒，失败继续静默；
+    scheduled 是到点交付，最终失败通过 durable terminal outbox 写明确失败结果，不能无声消失。
 
     D3 Task 8 (PR C spec C8)：跟 chat 分支（`process_job`，Task 7）一样跑同一个
     `tool_loop.run_tool_loop`。`turn_authorization=True` 传给 `dispatch_tool_calls`（跟 chat
@@ -7635,8 +6652,8 @@ async def _run_wake(
       "终态空文本 = no-filler 失败"的语义**相反**。循环正常跑完（`run_tool_loop` 不抛异常）
       即视为成功，`mark_completed`，只是没写出气泡。
 
-    真 provider 错误（`chat_completion_async` 抛出的任何异常）：静默 `mark_failed`，同样
-    不弹用户可见 error chip——背景 job，同 maintenance 的隔离口径。402/401/403 一类
+    真 provider 错误（`chat_completion_async` 抛出的任何异常）：所有 lane 都
+    `mark_failed`；只有 scheduled 同步排入用户可见失败 outbox。402/401/403 一类
     "provider_config"错误（死/欠费 BYOK key）额外写一条 payment_cooldown（D3 Task 7），
     让 scheduler 的 `due_heartbeat_users` 停止对一把修不好的钥匙反复重试。
 
@@ -7651,6 +6668,7 @@ async def _run_wake(
     观测）是两回事。
     """
     push_slot: dict | None = None
+    shadow_decision_allowed: bool | None = None
     try:
         store = core_store.get_store(user_id)
         seq_native = deps.read_messages_after_seq is not None
@@ -7676,6 +6694,7 @@ async def _run_wake(
             )
 
         async def _sleep_heartbeat_without_history() -> str:
+            nonlocal shadow_decision_allowed
             wake_generation = observed_generation
             consumed_context_seq = 0
             if deps.read_perception_wake_context is not None:
@@ -7726,6 +6745,7 @@ async def _run_wake(
                 )
             if successor_id is not None:
                 await asyncio.to_thread(core_wake_bus.notify, "v2_jobs", user_id)
+            shadow_decision_allowed = False
             if tm is not None:
                 tm.flush(failed=False, status="slept_no_history")
             return "completed"
@@ -7781,14 +6801,12 @@ async def _run_wake(
 
         # D6/Task 10: close a compaction backlog gap BEFORE reading the actual
         # prompt content — see `_ensure_prompt_coverage`'s docstring. Only run
-        # when BOTH readers are wired (mirrors the joint `read_summary is not
-        # None and read_tail is not None` gate `process_job` uses below); a
+        # when both seq-native readers are wired; a
         # coverage check is meaningless without a real tail reader to bound.
         seq_context = (
             deps.read_summary_with_seq is not None
             and deps.read_tail_after_seq is not None
         )
-        legacy_context = deps.read_summary is not None and deps.read_tail is not None
         optional_tail_turns: list[list[dict]] = []
         tail_source_truncated = False
         agent_memory = ""
@@ -7808,16 +6826,14 @@ async def _run_wake(
             )
             if oldest_retained_seed is not None and oldest_retained_seed > 1:
                 compact_through_seq = oldest_retained_seed - 1
-        if seq_context or legacy_context:
+        if seq_context:
             await _ensure_prompt_coverage(
                 user_id,
                 deps,
-                provider_config=provider_config,
                 enclave_sem=enclave_sem,
                 tail_limit=_TAIL_BUDGET,
                 job_id=job_id,
                 claimed_by=claimed_by,
-                add_usage=tm.add_call if tm is not None else None,
                 trajectory_recorder=trajectory_recorder,
                 compact_through_seq=compact_through_seq,
             )
@@ -7845,15 +6861,7 @@ async def _run_wake(
             )
         else:
             async with enclave_sem:
-                if legacy_context:
-                    summary, watermark, _ver = await asyncio.to_thread(
-                        deps.read_summary, user_id
-                    )
-                    tail = await asyncio.to_thread(
-                        deps.read_tail, user_id, watermark, _TAIL_BUDGET
-                    )
-                else:
-                    summary, tail = "", []
+                summary, tail = "", []
                 tail = await asyncio.to_thread(
                     _inject_tail_images,
                     tail,
@@ -7882,11 +6890,9 @@ async def _run_wake(
                     user_id,
                     summary,
                     deps,
-                    provider_config=provider_config,
                     enclave_sem=enclave_sem,
                     claimed_by=claimed_by,
                     job_id=job_id,
-                    add_usage=tm.add_call if tm is not None else None,
                     trajectory_recorder=trajectory_recorder,
                 )
         if seq_context:
@@ -7939,11 +6945,6 @@ async def _run_wake(
                 if tm is not None:
                     tm.flush(failed=False, status="yielded_to_chat")
                 return "completed"
-        elif legacy_context:
-            # Post-assembly hard assertion (D6): independent re-derivation,
-            # not a reuse of `_ensure_prompt_coverage`'s return — see
-            # `_assert_prompt_covers`'s docstring for why.
-            await _assert_prompt_covers(user_id, _TAIL_BUDGET)
         wake_system_prompt = _WAKE_SYSTEM_PROMPT
         scheduled_activity_events: list[dict] = []
         scheduled_runtime_data: list[dict[str, Any]] = []
@@ -8077,7 +7078,7 @@ async def _run_wake(
         # block above: `_cap_data` acquires enclave_sem ITSELF (see its body), and
         # asyncio.Semaphore is NOT reentrant. Nesting it inside another
         # `async with enclave_sem` deadlocks whenever the semaphore value is 1
-        # (FEEDLING_V2_ENCLAVE_CONCURRENCY defaults to 2, so a naive test would pass
+        # (a gate wider than one would hide this, so a naive test would pass
         # while production wedges wherever the value is 1). The gate still bounds the
         # call — _cap_data holds the semaphore for its own turn.
         grounding_results = None
@@ -8508,7 +7509,10 @@ async def _run_wake(
                 ),
             )
 
+        thinking_trace_emitted = False
+
         async def _on_reply(text: str, *, final: bool, reasoning: str = "") -> None:
+            nonlocal thinking_trace_emitted, shadow_decision_allowed
             text = str(text or "").strip()
             # Self-authored thinking (same mechanism as the chat lane): peel a leading
             # <think> off the wake reply BEFORE the degenerate/torn checks so they see
@@ -8577,6 +7581,54 @@ async def _run_wake(
                 if final:
                     raise TurnError(_PROTOCOL_FRAGMENT_REASON)
                 return
+            # Keep this paired with the foreground guard in process_job._on_reply.
+            # The two lanes deliberately differ after sanitization (chat falls back;
+            # wake fails silently), but every user-visible text outlet must call the
+            # same closed-set parser before sealing an envelope.
+            if text:
+                text, removed_tool_markup = tool_markup_leak.strip_tool_markup(text)
+                if removed_tool_markup:
+                    log.warning(
+                        "[v2.worker] wake tool markup stripped user=%s job=%s "
+                        "lane=%s final=%s error_class=%s",
+                        user_id,
+                        job_id,
+                        lane,
+                        final,
+                        tool_markup_leak.ERROR_CLASS,
+                    )
+                    if deps.emit_debug_trace is not None:
+                        try:
+                            await asyncio.to_thread(
+                                deps.emit_debug_trace,
+                                user_id,
+                                "agent.reply.sanitized",
+                                status="error",
+                                summary="V2 主动回复已剥离工具调用标记",
+                                explain=(
+                                    "中转返回的可见文本混入工具协议标记；正文已保留，"
+                                    "标记已在下发前移除。"
+                                ),
+                                detail={
+                                    "lane": lane,
+                                    "final": bool(final),
+                                    "error_class": tool_markup_leak.ERROR_CLASS,
+                                    "reason": tool_markup_leak.REASON,
+                                },
+                            )
+                        except Exception as exc:  # noqa: BLE001 — best-effort trace
+                            log.warning(
+                                "[v2.worker] wake tool markup trace failed user=%s "
+                                "job=%s lane=%s code=%s",
+                                user_id,
+                                job_id,
+                                lane,
+                                type(exc).__name__.lower(),
+                            )
+                    if _is_degenerate_reply(text):
+                        if final:
+                            raise TurnError("degenerate_reply_suppressed")
+                        return
             if not text:
                 # Silence is a legitimate wake outcome — both mid-loop (an empty
                 # `reply{}` call) and terminal ("weak wake sleeps"): unlike the chat
@@ -8655,15 +7707,21 @@ async def _run_wake(
                         job_id=int(job_id),
                     )
                 )
-            # Surface thinking on the same effect (sealed into a separate envelope),
-            # matching the chat lane: PREFER the self-authored <think> when present,
-            # else the provider's native reasoning. Never mislabel one as the other.
-            # Only a final reply carries it; intermediate reply{} bubbles are agent-authored.
-            _wake_display_reasoning = reasoning
-            _wk_kind, _wk_source, _wk_native = "provider_reasoning", None, True
-            if _wake_self_thinking_on and _wake_self_thinking_text:
-                _wake_display_reasoning = _wake_self_thinking_text
-                _wk_kind, _wk_source, _wk_native = "agent_summary", "self_thinking", False
+            # Surface only the agent-authored summary while self-thinking is on.
+            # Native provider reasoning remains available solely behind the
+            # feature-off compatibility contract.
+            (
+                _wake_display_reasoning,
+                _wk_kind,
+                _wk_source,
+                _wk_native,
+                _wake_thinking_branch,
+            ) = _select_thinking_surface(
+                reasoning,
+                self_thinking_on=_wake_self_thinking_on,
+                self_thinking_text=_wake_self_thinking_text,
+            )
+            _wake_thinking_chars = 0
             if final and _wake_display_reasoning:
                 thinking_effect_id = v2_effect_id.derive(
                     job_id=job_id,
@@ -8682,6 +7740,11 @@ async def _run_wake(
                 )
                 if thinking_payload:
                     payload["thinking"] = thinking_payload
+                    _wake_thinking_chars = len(
+                        _sanitize_reasoning(_wake_display_reasoning)
+                    )
+                else:
+                    _wake_thinking_branch = "none"
             enqueued_id = await asyncio.to_thread(
                 v2_effect_outbox.enqueue_effect,
                 job_id=job_id,
@@ -8789,6 +7852,7 @@ async def _run_wake(
                     best_effort=True,
                 )
                 if status == "applied":
+                    shadow_decision_allowed = True
                     # 覆盖式：一个回合可能吐多条气泡，只有最后一条会成为推送。构建槽位
                     # 本身也是 best-effort：payload 缺 "envelope"（例如未来出现的非
                     # seq_native / 测试注入变体）不该把一个已经成功落库的回合打成
@@ -8819,6 +7883,16 @@ async def _run_wake(
                         if source_status != "completed":
                             raise RuntimeError(
                                 "wake final applied without completing source job"
+                            )
+                        if not thinking_trace_emitted:
+                            thinking_trace_emitted = True
+                            await _emit_thinking_surfaced_trace(
+                                deps.emit_debug_trace,
+                                user_id,
+                                provider_config,
+                                lane="wake",
+                                branch=_wake_thinking_branch,
+                                chars=_wake_thinking_chars,
                             )
                     return
                 if (
@@ -8872,6 +7946,16 @@ async def _run_wake(
                 },
                 best_effort=True,
             )
+            if final and not thinking_trace_emitted:
+                thinking_trace_emitted = True
+                await _emit_thinking_surfaced_trace(
+                    deps.emit_debug_trace,
+                    user_id,
+                    provider_config,
+                    lane="wake",
+                    branch=_wake_thinking_branch,
+                    chars=_wake_thinking_chars,
+                )
             # Legacy/non-seq assembly can enqueue without a sink. That proves
             # the model produced text, not that a user-visible bubble was
             # applied. Count only the applied-but-unverified path here; the
@@ -8982,6 +8066,7 @@ async def _run_wake(
                 tail_source_truncated=tail_source_truncated,
                 tail_lane=lane,
                 application_data_role="assistant",
+                proactive_turn_boundary=True,
                 manual_wake=(lane == "manual_wake"),
             )
 
@@ -9000,12 +8085,10 @@ async def _run_wake(
                 await _ensure_prompt_coverage(
                     user_id,
                     deps,
-                    provider_config=provider_config,
                     enclave_sem=enclave_sem,
                     tail_limit=0,
                     job_id=job_id,
                     claimed_by=claimed_by,
-                    add_usage=tm.add_call if tm is not None else None,
                     trajectory_recorder=trajectory_recorder,
                     compact_through_seq=wake_snapshot_seq,
                 )
@@ -9080,14 +8163,28 @@ async def _run_wake(
                 # 重放定时器（mark_fired 在入队时就落，不等 job 成功），只会 arm
                 # 60s 起、1h 封顶的 proactive 退避，用户下次说话即清。
                 require_reply=(lane == "scheduled"),
+                empty_response_correction=(
+                    _SCHEDULED_WAKE_EMPTY_RESPONSE_CORRECTION
+                    if lane == "scheduled"
+                    else v2_tool_loop._EMPTY_RESPONSE_CORRECTION
+                ),
                 on_provider_success=lambda: _record_provider_success(user_id),
                 on_provider_failure=lambda exc: _record_provider_failure(
                     user_id,
                     exc,
                 ),
+                on_provider_tool_surface=_provider_tool_surface_callback(
+                    deps,
+                    user_id,
+                    lane,
+                ),
                 fold_before_first=deps.read_messages_after_seq is not None,
                 on_progress=_report_turn_progress,
-                on_trajectory_event=_ledger_tapped_sink(trajectory_recorder),
+                on_trajectory_event=_ledger_tapped_sink(
+                    trajectory_recorder,
+                    deps=deps,
+                    user_id=user_id,
+                ),
                 outbound_blocking_read_tool_names=_PRIVATE_READ_TOOLS,
                 outbound_blocking_read_tool_predicate=_read_blocks_later_outbound,
                 max_tool_calls_per_round=MAX_TOOL_CALLS_PER_ROUND,
@@ -9105,26 +8202,22 @@ async def _run_wake(
                     PROMPT_ESTIMATOR_UTF8_BYTES_PER_TOKEN
                 ),
                 prompt_image_reserve_tokens=PROMPT_IMAGE_RESERVE_TOKENS,
-                on_tail_window=(
-                    (
-                        lambda item: tm.record_tail_window(
-                            effective_turns=item["effective_turns"],
-                            fallback=item["fallback"],
-                        )
-                    )
-                    if tm is not None
-                    else None
-                ),
+                on_tail_window=_tail_window_callback(tm),
                 on_prompt_frontier_exhaustion=(
                     tm.record_prompt_frontier_exhaustion
                     if tm is not None
                     else None
                 ),
             )
-        except Exception as e:  # noqa: BLE001 — classify below, then let it fall to the outer silent mark_failed
+            if shadow_decision_allowed is None:
+                # A successful weak-wake turn with no applied reply is the
+                # model's suppress/sleep outcome.  This assignment is after the
+                # tool loop and cannot influence any provider input or branch.
+                shadow_decision_allowed = False
+        except Exception as e:  # noqa: BLE001 — classify below, then terminalize outside
             if provider_client.classify_provider_error(e) == "provider_config":
                 # Dead/broke BYOK key (402 out-of-credits, 401/403 bad key) — back off
-                # BEFORE the silent mark_failed below, so the scheduler stops hammering
+                # BEFORE mark_failed below, so the scheduler stops hammering
                 # this key every heartbeat interval (Task 1's due_heartbeat_users query
                 # already excludes users still in cooldown).
                 await _fence_wake_effect("payment cooldown")
@@ -9207,7 +8300,7 @@ async def _run_wake(
         if tm is not None:
             tm.flush(failed=False, status="ok")
         return "completed"
-    except Exception as e:  # noqa: BLE001 — wake job: silent mark_failed, never surface/bubble
+    except Exception as e:  # noqa: BLE001 — scheduled failures surface below
         code = _safe_failure_code("wake_failed", e)
         await _record_trajectory(
             trajectory_recorder,
@@ -9226,11 +8319,12 @@ async def _run_wake(
             lane in _FAIL_BACKOFF_WAKE_LANES
             and not isinstance(e, (LostJobLease, RuntimeModeChanged))
         )
-        await asyncio.to_thread(
+        owned = await asyncio.to_thread(
             jobs_store.mark_failed,
             job_id,
             code,
             claimed_by=claimed_by,
+            error_class=_turn_failure_error_class(e),
             wake_backoff_base_sec=(
                 _WAKE_FAIL_BACKOFF_BASE_SEC if arm_wake_backoff else None
             ),
@@ -9238,13 +8332,28 @@ async def _run_wake(
                 _WAKE_FAIL_BACKOFF_CAP_SEC if arm_wake_backoff else None
             ),
         )
+        if owned and lane == "scheduled":
+            # A due timer is not a weak presence moment: it has a visible
+            # delivery obligation. mark_failed already wrote the durable
+            # outbox marker in the same transaction; this is only the prompt
+            # low-latency drain, and the independent reconciler remains the
+            # crash/retry boundary.
+            await asyncio.to_thread(
+                _surface_terminal_error,
+                deps,
+                user_id,
+                job_id,
+                code,
+            )
         if tm is not None:
             tm.flush(failed=True, status=code)
         return "failed"
     finally:
+        decided_at = time.time()
+        apns_alert_sent = False
         if push_slot is not None and deps.send_reply_push is not None:
             try:
-                await asyncio.to_thread(
+                push_result = await asyncio.to_thread(
                     deps.send_reply_push,
                     user_id,
                     msg_id=push_slot["msg_id"],
@@ -9252,9 +8361,33 @@ async def _run_wake(
                     is_wake=push_slot["is_wake"],
                     lane=push_slot["lane"],
                 )
+                apns_alert_sent = push_result is True
             except Exception as e:  # noqa: BLE001 — 推送绝不能影响回合结果
                 log.warning(
                     "[v2.worker] wake reply push failed user=%s: %s", user_id, e)
+        if (
+            shadow_decision_allowed is not None
+            and deps.record_wake_shadow_decision is not None
+        ):
+            try:
+                await asyncio.to_thread(
+                    deps.record_wake_shadow_decision,
+                    user_id,
+                    job_id=int(job_id),
+                    lane=lane,
+                    decision_allowed=shadow_decision_allowed,
+                    apns_alert_sent=(
+                        apns_alert_sent if shadow_decision_allowed else False
+                    ),
+                    decided_at=decided_at,
+                )
+            except Exception as e:  # noqa: BLE001 — 影子观测绝不能改变决策/回合
+                log.warning(
+                    "[v2.worker] wake shadow record failed user=%s job=%s: %s",
+                    user_id,
+                    job_id,
+                    e,
+                )
 
 
 def _memory_write_result_counts(
@@ -9456,6 +8589,13 @@ async def _run_profile(
             {"lane": "profile", **payload},
             best_effort=True,
         )
+        if kind == "provider_request":
+            await asyncio.to_thread(
+                _emit_context_truncation_trace,
+                deps,
+                user_id,
+                payload,
+            )
 
     async def _fence_profile_write(effect: str) -> None:
         if claimed_by and not await asyncio.to_thread(
@@ -9479,6 +8619,7 @@ async def _run_profile(
         attempts = _profile_attempt_count(previous)
         now_ts = time.time()
         await _fence_profile_write("failure metadata write")
+        _report_turn_progress("profile_write_started")
         return v2_profile_store.build_profile_document(
             user_id,
             state=("degraded" if previous.get("memory") is not None else "pending"),
@@ -9503,11 +8644,20 @@ async def _run_profile(
         nonlocal terminal_reject
         if deps.read_profile_cards is None:
             raise RuntimeError("profile_cards_reader_unavailable")
+        _report_turn_progress("profile_index_started")
+        loop = asyncio.get_running_loop()
+
+        def _thread_progress(stage: str) -> None:
+            loop.call_soon_threadsafe(_report_turn_progress, stage)
+
         async with enclave_sem:
-            rendered, card_count = await asyncio.to_thread(
+            rendered, card_count, tail_window = await asyncio.to_thread(
                 deps.read_profile_cards,
                 user_id,
+                _thread_progress,
             )
+        await asyncio.sleep(0)
+        _report_turn_progress("profile_cards_completed")
         raw_count, max_updated_at = await asyncio.to_thread(
             db.memory_profile_source_stats,
             user_id,
@@ -9526,6 +8676,7 @@ async def _run_profile(
         if card_count == 0:
             terminal_reject = ""
             await _fence_profile_write("empty profile write")
+            _report_turn_progress("profile_write_started")
             return v2_profile_store.build_profile_document(
                 user_id,
                 state="empty",
@@ -9537,18 +8688,39 @@ async def _run_profile(
                     "retry_not_before": 0,
                 },
             )
+        provider_call_ordinal = 0
+
+        async def _profile_llm(*args, **kwargs):
+            nonlocal provider_call_ordinal
+            provider_call_ordinal += 1
+            ordinal = provider_call_ordinal
+            _report_turn_progress(f"profile_provider_request:{ordinal}")
+            kwargs.setdefault(
+                "progress_cb",
+                lambda stage, attempt: _report_turn_progress(
+                    f"profile_provider_{stage}:{ordinal}:{int(attempt)}"
+                ),
+            )
+            result = await provider_client.reliable_chat_completion_async(
+                *args, **kwargs
+            )
+            _report_turn_progress(f"profile_provider_response:{ordinal}")
+            return result
+
         generated = await v2_profile.generate_profile(
             provider_config=provider_config,
             rendered_cards=rendered,
-            llm=provider_client.reliable_chat_completion_async,
+            llm=_profile_llm,
             usage_out=(tm.add_call if tm is not None else None),
             trajectory_out=_trajectory,
+            tail_window=tail_window,
         )
         if generated.fields is None:
             terminal_reject = generated.reject_code
             return await _metadata_failure(previous, terminal_reject)
         terminal_reject = ""
         await _fence_profile_write("profile write")
+        _report_turn_progress("profile_write_started")
         return v2_profile_store.build_profile_document(
             user_id,
             state="ok",
@@ -9586,6 +8758,7 @@ async def _run_profile(
             user_id,
             _recompute,
         )
+        _report_turn_progress("profile_write_completed")
         if result.status == "superseded":
             winner_state = str(result.document.get("state") or "")
             if winner_state in {"ok", "empty"}:
@@ -9626,6 +8799,7 @@ async def _run_profile(
                 user_id,
                 lambda previous: _metadata_failure(previous, code),
             )
+            _report_turn_progress("profile_write_completed")
         except Exception as metadata_exc:  # noqa: BLE001
             log.warning(
                 "[v2.worker] profile failure metadata write failed user=%s code=%s",
@@ -10649,7 +9823,7 @@ def _inject_tail_images(
 def _inject_tail_files(tail: list[dict], *, user_id: str, read_files) -> list[dict]:
     """把 tail 里最近 `_TAIL_FILE_LIMIT` 个文件行的 content 换成「文件名 + sandbox 抽取的
     纯文本」，让 tool-less 模型能真读到附件内容。返回**新列表**，绝不原地
-    改输入行（compaction 共用 read_tail 产出的 dict）。
+    改输入行。
 
     reader 整体失败会保留原 marker；单文件 fail-closed 会追加稳定的 unavailable code，
     让模型不会误以为自己已经读过附件。两种情况都不产生 UI error chip。
@@ -10721,12 +9895,10 @@ async def _ensure_prompt_coverage_or_degrade(
         await _ensure_prompt_coverage(
             user_id,
             deps,
-            provider_config=provider_config,
             enclave_sem=enclave_sem,
             tail_limit=tail_limit,
             job_id=job_id,
             claimed_by=claimed_by,
-            add_usage=add_usage,
             trajectory_recorder=trajectory_recorder,
             compact_through_seq=compact_through_seq,
         )
@@ -10781,7 +9953,7 @@ async def process_job(
     的终态 flush 点仍然生效。
     """
     if enclave_sem is None:
-        enclave_sem = ENCLAVE_SEMAPHORE
+        enclave_sem = _new_direct_enclave_gate()
     if read_parallelism is None:
         read_parallelism = MAX_READ_ACTION_PARALLELISM
 
@@ -10905,7 +10077,6 @@ async def process_job(
                 job_id,
                 user_id,
                 deps,
-                provider_config,
                 enclave_sem,
                 claimed_by,
                 tm,
@@ -11203,9 +10374,7 @@ async def process_job(
             ordinal_counter=ordinal,
         )
 
-        # D1 base context (summary + tail), read once at loop entry. deps.read_summary/
-        # read_tail being None (older/minimal test deps) degrades to empty
-        # summary/tail, exactly as before.
+        # D1 base context (summary + tail), read once at loop entry.
         seq_context = (
             deps.read_summary_with_seq is not None
             and deps.read_tail_after_seq is not None
@@ -11215,7 +10384,6 @@ async def process_job(
         # `cursor_seq`/`cursor_box["seq"]` and may advance only from user|human
         # rows returned by initial coalescing or a round-boundary fold.
         prompt_snapshot_through_seq = int(cursor_seq or 0) if seq_native else 0
-        legacy_context = deps.read_summary is not None and deps.read_tail is not None
         optional_tail_turns: list[list[dict]] = []
         tail_source_truncated = False
         agent_memory = ""
@@ -11290,7 +10458,7 @@ async def process_job(
                     type(exc).__name__,
                 )
                 optional_anchor_seq = None
-        if seq_context or legacy_context:
+        if seq_context:
             # D6/Task 10: close a compaction backlog gap BEFORE reading the
             # actual prompt content — see `_ensure_prompt_coverage`'s
             # docstring. Common case (no gap) costs two cheap indexed reads
@@ -11309,100 +10477,45 @@ async def process_job(
                 trajectory_recorder=trajectory_recorder,
                 compact_through_seq=compact_through_seq,
             )
-            if seq_context:
-                # The base tail already contains every row through this
-                # all-role snapshot. The fold still consumes user rows after
-                # the durable cursor, but suppresses duplicates through here.
-                prompt_snapshot_through_seq = max(
-                    prompt_snapshot_through_seq,
-                    int(through_seq),
-                )
-                (
-                    summary,
+            # The base tail already contains every row through this all-role
+            # snapshot. The fold still consumes user rows after the durable
+            # cursor, but suppresses duplicates through here.
+            prompt_snapshot_through_seq = max(
+                prompt_snapshot_through_seq,
+                int(through_seq),
+            )
+            (
+                summary,
+                tail,
+                optional_tail_turns,
+                tail_source_truncated,
+                watermark_seq,
+                agent_memory,
+                user_profile,
+                coverage_hole_notice,
+            ) = await _read_seq_adaptive_prompt_context(
+                user_id=user_id,
+                deps=deps,
+                through_seq=through_seq,
+                target_turns=_CHAT_TAIL_ANCHOR_MAX_TURNS,
+                provider_config=provider_config,
+                enclave_sem=enclave_sem,
+                claimed_by=claimed_by,
+                job_id=job_id,
+                add_usage=tm.add_call,
+                trajectory_recorder=trajectory_recorder,
+                active_image_ids={
+                    str(row.get("id") or "")
+                    for row in coalesced
+                    if row.get("has_image") and row.get("id")
+                },
+                tail_cap=_TAIL_HARD_CAP,
+            )
+            if ordered_chat_replies:
+                tail = context.ordered_reply_tail(
                     tail,
-                    optional_tail_turns,
-                    tail_source_truncated,
-                    watermark_seq,
-                    agent_memory,
-                    user_profile,
-                    coverage_hole_notice,
-                ) = await _read_seq_adaptive_prompt_context(
-                    user_id=user_id,
-                    deps=deps,
-                    through_seq=through_seq,
-                    target_turns=_CHAT_TAIL_ANCHOR_MAX_TURNS,
-                    provider_config=provider_config,
-                    enclave_sem=enclave_sem,
-                    claimed_by=claimed_by,
-                    job_id=job_id,
-                    add_usage=tm.add_call,
-                    trajectory_recorder=trajectory_recorder,
-                    active_image_ids={
-                        str(row.get("id") or "")
-                        for row in coalesced
-                        if row.get("has_image") and row.get("id")
-                    },
-                    # Option A: bound the verbatim tail; drop-oldest with a
-                    # disclosed hole rather than requiring a drained backlog.
-                    tail_cap=_TAIL_HARD_CAP,
+                    user_through_seq=int(cursor_seq),
                 )
-                if ordered_chat_replies:
-                    tail = context.ordered_reply_tail(
-                        tail,
-                        user_through_seq=int(cursor_seq),
-                    )
-            else:
-                async with enclave_sem:
-                    summary, watermark, _ver = await asyncio.to_thread(
-                        deps.read_summary, user_id
-                    )
-                    tail = await asyncio.to_thread(
-                        deps.read_tail, user_id, watermark, _TAIL_HARD_CAP
-                    )
-                    tail = await asyncio.to_thread(
-                        _inject_tail_images,
-                        tail,
-                        user_id=user_id,
-                        read_images=deps.read_images,
-                        active_image_ids={
-                            str(row.get("id") or "")
-                            for row in coalesced
-                            if row.get("has_image") and row.get("id")
-                        },
-                        read_vision_observations=deps.read_vision_observations,
-                    )
-                    tail = await asyncio.to_thread(
-                        _inject_tail_files,
-                        tail,
-                        user_id=user_id,
-                        read_files=deps.read_files,
-                    )
-                profile_selection = await _select_profile_prompt_for_turn(
-                    user_id=user_id,
-                    summary=summary,
-                    deps=deps,
-                    trajectory_recorder=trajectory_recorder,
-                )
-                summary = profile_selection.summary
-                agent_memory = profile_selection.memory
-                user_profile = profile_selection.user
-                if not profile_selection.used_profile:
-                    summary = await _bound_materialized_summary(
-                        user_id,
-                        summary,
-                        deps,
-                        provider_config=provider_config,
-                        enclave_sem=enclave_sem,
-                        claimed_by=claimed_by,
-                        job_id=job_id,
-                        add_usage=tm.add_call,
-                        trajectory_recorder=trajectory_recorder,
-                    )
-            # Post-assembly hard assertion (D6): independent re-derivation,
-            # not a reuse of `_ensure_prompt_coverage`'s return — see
-            # `_assert_prompt_covers`'s docstring for why.
-            if not seq_context:
-                await _assert_prompt_covers(user_id, _TAIL_HARD_CAP)
         else:
             summary, tail = "", []
 
@@ -12158,6 +11271,8 @@ async def process_job(
             pending_file_replies.clear()
             pending_file_keys.clear()
 
+        thinking_trace_emitted = False
+
         async def _on_reply(
             text: str | WorkspaceFileReply,
             *,
@@ -12167,6 +11282,7 @@ async def process_job(
         ) -> None:
             nonlocal final_job_completed_atomically, voice_reply_slot
             nonlocal voice_call_ended_atomically
+            nonlocal thinking_trace_emitted
             file_reply = text if isinstance(text, WorkspaceFileReply) else None
             text = "" if file_reply is not None else str(text or "").strip()
             image_replies: list[GeneratedImageReply] = []
@@ -12264,6 +11380,56 @@ async def process_job(
                 text = _DEGENERATE_REPLY_FALLBACK
                 turn_failure_error_class = _PROTOCOL_FRAGMENT_ERROR_CLASS
                 reasoning = ""
+            # Keep this paired with the wake guard in _run_wake._on_reply. Some
+            # OpenAI-compatible relays turn native tool calls into XML-like
+            # text and then incompletely parse that text back into structured
+            # calls.  Keep any useful reply body, but never render the closed set
+            # of known tool markers.  This intentionally runs after the JSON
+            # protocol guard and before downloadable-reply sanitization.
+            if file_reply is None and text:
+                text, removed_tool_markup = tool_markup_leak.strip_tool_markup(text)
+                if removed_tool_markup:
+                    log.warning(
+                        "[v2.worker] chat tool markup stripped user=%s job=%s "
+                        "final=%s error_class=%s",
+                        user_id,
+                        job_id,
+                        final,
+                        tool_markup_leak.ERROR_CLASS,
+                    )
+                    if deps.emit_debug_trace is not None:
+                        try:
+                            await asyncio.to_thread(
+                                deps.emit_debug_trace,
+                                user_id,
+                                "agent.reply.sanitized",
+                                status="error",
+                                summary="V2 回复已剥离工具调用标记",
+                                explain=(
+                                    "中转返回的可见文本混入工具协议标记；正文已保留，"
+                                    "标记已在下发前移除。"
+                                ),
+                                detail={
+                                    "lane": "chat",
+                                    "final": bool(final),
+                                    "error_class": tool_markup_leak.ERROR_CLASS,
+                                    "reason": tool_markup_leak.REASON,
+                                },
+                            )
+                        except Exception as exc:  # noqa: BLE001 — best-effort trace
+                            log.warning(
+                                "[v2.worker] tool markup trace failed user=%s "
+                                "job=%s code=%s",
+                                user_id,
+                                job_id,
+                                type(exc).__name__.lower(),
+                            )
+                    if _is_degenerate_reply(text):
+                        if not final:
+                            return
+                        text = _DEGENERATE_REPLY_FALLBACK
+                        turn_failure_error_class = tool_markup_leak.ERROR_CLASS
+                        reasoning = ""
             if final and not text and not image_replies:
                 # BUG-4 no-filler: chat lane always replies — an empty terminal
                 # text is a model/provider failure here (unlike wake, where
@@ -12403,28 +11569,21 @@ async def process_job(
                         job_id,
                         type(exc).__name__.lower(),
                     )
-            # Provider chain-of-thought rides the same effect as its final reply,
-            # sealed into a separate thinking envelope so the durable outbox holds
-            # only ciphertext and a retry re-addresses the same thinking row. Only
-            # final replies carry it — intermediate reply{} bubbles are
-            # agent-authored text, not provider reasoning.
-            # Decide which thinking to seal and its provenance. Self-authored
-            # <think> (or a "thinking failed" marker) is an agent summary, NOT
-            # provider-native chain-of-thought; the provider's native reasoning
-            # keeps its native metadata. Never mislabel one as the other.
-            _display_reasoning = reasoning
-            _thinking_kind, _thinking_source, _thinking_native = (
-                "provider_reasoning", None, True,
+            # Self-thinking ON has no native CoT fallback.  The feature-off path
+            # intentionally keeps the pre-existing native display behavior.
+            (
+                _display_reasoning,
+                _thinking_kind,
+                _thinking_source,
+                _thinking_native,
+                _thinking_branch,
+            ) = _select_thinking_surface(
+                reasoning,
+                self_thinking_on=self_thinking_on,
+                self_thinking_text=self_thinking_text,
+                self_thinking_failed=self_thinking_failed,
             )
-            if self_thinking_on and (self_thinking_text or self_thinking_failed):
-                _display_reasoning = (
-                    self_thinking.THINKING_FAILED_MARKER
-                    if self_thinking_failed
-                    else self_thinking_text
-                )
-                _thinking_kind, _thinking_source, _thinking_native = (
-                    "agent_summary", "self_thinking", False,
-                )
+            _thinking_chars = 0
             if final and _display_reasoning and file_reply is None:
                 thinking_payload = await asyncio.to_thread(
                     _build_thinking_payload,
@@ -12438,6 +11597,9 @@ async def process_job(
                 )
                 if thinking_payload:
                     payload["thinking"] = thinking_payload
+                    _thinking_chars = len(_sanitize_reasoning(_display_reasoning))
+                else:
+                    _thinking_branch = "none"
             enqueued_id = await asyncio.to_thread(
                 v2_effect_outbox.enqueue_effect,
                 job_id=job_id,
@@ -12615,6 +11777,16 @@ async def process_job(
                         raise RuntimeError(
                             "final reply applied without completing source job"
                         )
+                    if final and not thinking_trace_emitted:
+                        thinking_trace_emitted = True
+                        await _emit_thinking_surfaced_trace(
+                            deps.emit_debug_trace,
+                            user_id,
+                            provider_config,
+                            lane="chat",
+                            branch=_thinking_branch,
+                            chars=_thinking_chars,
+                        )
                     final_job_completed_atomically = True
                     return
                 if (
@@ -12681,6 +11853,16 @@ async def process_job(
                 },
                 best_effort=True,
             )
+            if final and not thinking_trace_emitted:
+                thinking_trace_emitted = True
+                await _emit_thinking_surfaced_trace(
+                    deps.emit_debug_trace,
+                    user_id,
+                    provider_config,
+                    lane="chat",
+                    branch=_thinking_branch,
+                    chars=_thinking_chars,
+                )
 
         # `seq` is exclusively the consumed user|human frontier. The base prompt's
         # all-role snapshot bound is passed separately to the fold closure so an
@@ -12932,12 +12114,10 @@ async def process_job(
                 await _ensure_prompt_coverage(
                     user_id,
                     deps,
-                    provider_config=provider_config,
                     enclave_sem=enclave_sem,
                     tail_limit=0,
                     job_id=job_id,
                     claimed_by=claimed_by,
-                    add_usage=tm.add_call,
                     trajectory_recorder=trajectory_recorder,
                     compact_through_seq=safe_through_seq,
                 )
@@ -13031,9 +12211,18 @@ async def process_job(
                 user_id,
                 exc,
             ),
+            on_provider_tool_surface=_provider_tool_surface_callback(
+                deps,
+                user_id,
+                lane,
+            ),
             fold_before_first=seq_native and not ordered_chat_replies,
             on_progress=_report_turn_progress,
-            on_trajectory_event=_ledger_tapped_sink(trajectory_recorder),
+            on_trajectory_event=_ledger_tapped_sink(
+                trajectory_recorder,
+                deps=deps,
+                user_id=user_id,
+            ),
             extra_tool_specs=offered_mcp_tool_specs,
             refresh_extra_tool_specs=_current_offered_mcp_tool_specs,
             extra_mutating_tool_names=mcp_mutating_names,
@@ -13058,10 +12247,7 @@ async def process_job(
                 PROMPT_ESTIMATOR_UTF8_BYTES_PER_TOKEN
             ),
             prompt_image_reserve_tokens=PROMPT_IMAGE_RESERVE_TOKENS,
-            on_tail_window=lambda item: tm.record_tail_window(
-                effective_turns=item["effective_turns"],
-                fallback=item["fallback"],
-            ),
+            on_tail_window=_tail_window_callback(tm),
             on_prompt_frontier_exhaustion=(
                 tm.record_prompt_frontier_exhaustion
             ),
@@ -13448,11 +12634,13 @@ async def process_job(
                     "mcp.turn.usage",
                     status="ok" if mcp_turn_outcome == "completed" else "error",
                     summary=(
-                        f"MCP 本轮提供 {detail['offered_tool_count']} 个工具,"
+                        f"MCP 本轮解析 {detail['offered_tool_count']} 个工具,"
                         f"调用 {detail['call_count']} 次"
                     ),
                     explain=(
-                        "仅记录工具数量和调用次数;不记录参数、返回值或用户内容。"
+                        "解析数是 prompt 预算前的回合工具面,不证明 provider 实收;"
+                        "实际下发见 mcp.surface.provider。仅记录数量和调用次数,"
+                        "不记录参数、返回值或用户内容。"
                     ),
                     detail={"lane": "chat", "outcome": mcp_turn_outcome, **detail},
                 )
@@ -13493,7 +12681,7 @@ async def process_job(
                 )
 
 
-async def _run_turn(job: dict, deps: TurnDeps) -> str:
+async def _run_turn(job: dict, deps: TurnDeps, *, enclave_sem=None) -> str:
     """把一个已 claim 的 job 交给 `process_job` 之前，先做一次性的 enclave-bound 解析：
     单次解密 BYOK provider key（single-decrypt-per-turn）+ 铸一个
     enclave-auth runtime_token。resolve_provider 失败（未配置/解密失败等）直接 mark_failed，
@@ -13503,6 +12691,8 @@ async def _run_turn(job: dict, deps: TurnDeps) -> str:
     whole-turn 累加器在这里创建（早于 `process_job`——provider 解析失败时根本不会进
     `process_job`，那次失败仍需要一行 v2_turn_metrics），再原样传给 `process_job`
     复用（同一个 job 只有一行，不会因为累加器实例不同而分裂成两次 upsert）。"""
+    if enclave_sem is None:
+        enclave_sem = _new_direct_enclave_gate()
     job_id = job["id"]
     user_id = str(job["user_id"])
     claimed_by = str(job.get("claimed_by") or "")
@@ -13534,7 +12724,7 @@ async def _run_turn(job: dict, deps: TurnDeps) -> str:
             )
 
     if lane == _TRAJECTORY_REVIEW_LANE:
-        return await _run_trajectory_review_turn(job, deps, tm)
+        return await _run_trajectory_review_turn(job, deps, tm, enclave_sem)
     if lane in _EXTRACTION_LANES:
         try:
             if await asyncio.to_thread(kill_switch.turns_halted):
@@ -13723,8 +12913,25 @@ async def _run_turn(job: dict, deps: TurnDeps) -> str:
                 "attempt_count": job.get("attempt_count", 0),
             },
         )
+        if lane == "maintenance":
+            outcome = await process_job(
+                job,
+                deps,
+                provider_config=None,
+                api_key=None,
+                runtime_token="",
+                tm=tm,
+                trajectory_recorder=recorder,
+            )
+            await _record_trajectory(
+                recorder,
+                "turn_terminal",
+                {"outcome": outcome},
+                best_effort=True,
+            )
+            return outcome
         try:
-            async with ENCLAVE_SEMAPHORE:
+            async with enclave_sem:
                 provider_config, _meta = await asyncio.to_thread(
                     deps.resolve_provider, user_id
                 )
@@ -13752,8 +12959,9 @@ async def _run_turn(job: dict, deps: TurnDeps) -> str:
                 owned = await asyncio.to_thread(
                     jobs_store.mark_failed, job_id, err, claimed_by=claimed_by
                 )
-                if owned and lane == "chat":
-                    await _settle_legacy_traced_chat_failure(err)
+                if owned and lane in {"chat", "scheduled"}:
+                    if lane == "chat":
+                        await _settle_legacy_traced_chat_failure(err)
                     await asyncio.to_thread(
                         _surface_terminal_error, deps, user_id, job_id, err
                     )
@@ -13783,6 +12991,7 @@ async def _run_turn(job: dict, deps: TurnDeps) -> str:
             provider_config=provider_config,
             api_key=None,
             runtime_token=runtime_token,
+            enclave_sem=enclave_sem,
             tm=tm,
             trajectory_recorder=recorder,
         )
@@ -13815,8 +13024,9 @@ async def _run_turn(job: dict, deps: TurnDeps) -> str:
             claimed_by=claimed_by,
             error_class=_turn_failure_error_class(e),
         )
-        if owned and lane == "chat":
-            await _settle_legacy_traced_chat_failure(message)
+        if owned and lane in {"chat", "scheduled"}:
+            if lane == "chat":
+                await _settle_legacy_traced_chat_failure(message)
             await asyncio.to_thread(
                 _surface_terminal_error, deps, user_id, job_id, message
             )
@@ -13895,8 +13105,10 @@ async def _slot_loop(
     deps: TurnDeps,
     wake_event: "asyncio.Event | None" = None,
     lanes: "set | None" = None,
-    slot_id: int = 0,
-    progress_cb: "Callable[[int, float | None], None] | None" = None,
+    slot_id: str = "slot-0",
+    slot_generation: str = "g0",
+    progress_cb: "Callable[[slot_protocol.SlotProgress], None] | None" = None,
+    enclave_sem=None,
 ) -> None:
     """一个 job-slot：抢一个 job 就跑一回合，抢不到就等待（poll_interval 兜底，
     wake_event 命中时立刻醒——见 `_wait_for_job_or_stop`）。stop_event 置位后不再抢新活，
@@ -13928,11 +13140,25 @@ async def _slot_loop(
     mark_running 撞到一次性 DB 错误）绝不允许冒出这个协程、拖垮 run_worker_loop 里其他
     仍然健康的 slot——记日志后 continue，下一轮再抢。"""
 
-    def _signal_progress(turn_start: float | None = None) -> None:
+    active_job: slot_protocol.ActiveJobIdentity | None = None
+
+    def _signal_progress(
+        stage: str,
+        turn_start: float | None = None,
+    ) -> None:
         if progress_cb is None:
             return
         try:
-            progress_cb(slot_id, turn_start)
+            progress_cb(
+                slot_protocol.SlotProgress(
+                    slot_id=slot_id,
+                    slot_generation=slot_generation,
+                    monotonic_at=time.monotonic(),
+                    turn_start=turn_start,
+                    stage=stage,
+                    active_job=active_job if turn_start is not None else None,
+                )
+            )
         except Exception as e:  # noqa: BLE001 — 心跳信号故障绝不能拖垮 slot 主循环
             log.debug("[v2.worker] slot %s progress_cb failed: %s", worker_id, e)
 
@@ -13946,38 +13172,50 @@ async def _slot_loop(
             # THIS read as a reason to stop draining jobs it may already own).
             if await asyncio.to_thread(kill_switch.turns_halted):
                 await _wait_for_job_or_stop(stop_event, wake_event, poll_interval)
-                _signal_progress()
+                _signal_progress("idle")
                 continue
             job = await asyncio.to_thread(
                 jobs_store.claim_next_job, worker_id, lanes=lanes
             )
             if job is None:
                 await _wait_for_job_or_stop(stop_event, wake_event, poll_interval)
-                _signal_progress()
+                _signal_progress("idle")
                 continue
             # (a) claimed a job, about to enter _run_turn — record the turn's start
             # time and report it so a wedge INSIDE _run_turn (the slot never reaches
             # (b) below) still shows up as a climbing current_turn_age_sec even
             # though this slot never sends another message.
             turn_start = time.monotonic()
-            _signal_progress(turn_start)
+            active_job = slot_protocol.ActiveJobIdentity(
+                job_id=int(job["id"]),
+                lane=str(job.get("lane") or "chat"),
+                claimed_by=str(job.get("claimed_by") or worker_id),
+            )
+            _signal_progress("claimed", turn_start)
 
             # Keep the public `_run_turn(job, deps)` seam unchanged (many tests
             # and assembly callers replace it directly).  A task-local callback
             # lets provider/tool/compaction helpers refresh this exact slot's
             # stall clock without leaking progress across concurrent slots.
-            def _active_turn_progress(_stage: str) -> None:
-                _signal_progress(turn_start)
+            def _active_turn_progress(stage: str) -> None:
+                _signal_progress(stage, turn_start)
 
             progress_token = _TURN_PROGRESS_CB.set(_active_turn_progress)
             try:
-                await _run_turn(job, deps)
+                if enclave_sem is None:
+                    await _run_turn(job, deps)
+                else:
+                    await _run_turn(job, deps, enclave_sem=enclave_sem)
             finally:
                 _TURN_PROGRESS_CB.reset(progress_token)
-            _signal_progress(None)  # (b) turn completed — back to idle
+            _signal_progress("durable_completion", turn_start)
+            active_job = None
+            _signal_progress("idle")  # (b) turn completed — back to idle
         except Exception as e:  # noqa: BLE001 — 单 slot 故障绝不冒出去拖垮其他 slot
             log.warning("[v2.worker] slot %s iteration failed: %s", worker_id, e)
             if job is not None:
+                if active_job is not None:
+                    _signal_progress("failure_cleanup", turn_start)
                 try:
                     user_id = str(job.get("user_id") or "")
                     message = f"slot_failure:{type(e).__name__.lower()}"
@@ -13987,7 +13225,10 @@ async def _slot_loop(
                         message,
                         claimed_by=str(job.get("claimed_by") or worker_id),
                     )
-                    if owned and str(job.get("lane") or "chat") == "chat":
+                    if owned and str(job.get("lane") or "chat") in {
+                        "chat",
+                        "scheduled",
+                    }:
                         await asyncio.to_thread(
                             _surface_terminal_error, deps, user_id, job["id"], message
                         )
@@ -14027,7 +13268,8 @@ async def _slot_loop(
                         _safe_failure_code("slot_recovery_failed", recovery_error),
                     )
             await _wait_for_job_or_stop(stop_event, wake_event, poll_interval)
-            _signal_progress()  # (c) idle/error poll wake — slot is alive, just cycling
+            active_job = None
+            _signal_progress("idle")  # (c) idle/error poll wake
             continue
 
 
@@ -14039,7 +13281,9 @@ async def run_worker_loop(
     stop_event: asyncio.Event,
     deps: TurnDeps,
     wake_event: "asyncio.Event | None" = None,
-    progress_cb: "Callable[[int, float | None], None] | None" = None,
+    progress_cb: "Callable[[slot_protocol.SlotProgress], None] | None" = None,
+    slot_generation: str = "g0",
+    slot_ids: "list[str] | None" = None,
 ) -> None:
     """起 max_workers 个 job-slot 协程共抢同一张 agent_jobs（SKIP LOCKED 无争用）。
     stop_event 置位 → 所有 slot 跑完手上 job 后退出（SIGTERM 优雅 drain 的落点）。
@@ -14063,6 +13307,9 @@ async def run_worker_loop(
     _reserved_env = os.environ.get("FEEDLING_V2_CHAT_RESERVED_SLOTS", "").strip()
     reserved = int(_reserved_env) if _reserved_env else None
     assignments = _reserved_lane_slots(max_workers, reserved)
+    resolved_slot_ids = slot_ids or [f"slot-{i}" for i in range(len(assignments))]
+    if len(resolved_slot_ids) != len(assignments):
+        raise ValueError("slot_ids must match max_workers")
     slots = [
         asyncio.create_task(
             _slot_loop(
@@ -14072,7 +13319,8 @@ async def run_worker_loop(
                 deps=deps,
                 wake_event=wake_event,
                 lanes=assignments[i],
-                slot_id=i,
+                slot_id=resolved_slot_ids[i],
+                slot_generation=slot_generation,
                 progress_cb=progress_cb,
             )
         )

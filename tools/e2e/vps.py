@@ -30,9 +30,12 @@ def run_vps_cell(cell: VpsCell) -> dict:
                 "steps": [("binary", "skip", f"{cell.needs_binary} not on PATH")]}
 
     steps: list[tuple[str, str, str]] = []
+    active_client: E2EClient | None = None
 
     def step(name: str, ok: bool, detail: str = "") -> bool:
         steps.append((name, "ok" if ok else "fail", detail))
+        if not ok and active_client is not None:
+            active_client.preserve_failure(f"{name}: {detail or 'failed'}")
         return ok
 
     workdir = Path(tempfile.mkdtemp(prefix=f"feedling_e2e_{cell.name}_"))
@@ -40,6 +43,10 @@ def run_vps_cell(cell: VpsCell) -> dict:
     log_path = workdir / "consumer.log"
     try:
         with E2EClient.provision(route="resident") as c:
+            active_client = c
+            c.configure_failure_evidence(
+                cell=f"vps:{cell.name}", artifacts={"consumer_log": str(log_path)},
+            )
             # No identity/genesis needed — the resident gate looks only at the
             # consumer heartbeat + verify_loop (see unlock.py docstring).
             env = os.environ.copy()
