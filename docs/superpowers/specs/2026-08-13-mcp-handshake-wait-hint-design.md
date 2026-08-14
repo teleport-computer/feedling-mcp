@@ -321,8 +321,15 @@ Codex 建议的矩阵已跑：2 个受影响模型 × 5 场景 × 4 次。服务
    （commit `ef30fbb4`）：读 0.18.2 源码确认 `mcp_discovery_timeout` 默认 **1.5s**，
    比 claude 的 ~2.5s 更紧，同一个病更严重。但它是可配的真上限
    （`wait_for_mcp_discovery` = `thread.join(timeout)`，发现完成即返回），故
-   `hermes_config_merged` 现在写 10.0（取自 `mcp_probe._CONNECT_TIMEOUT`）。
-   代价：一台彻底连不上的服务器会让每轮多等满 10s。**openclaw 仍未测。**
+   `hermes_config_merged` 现在写 **5.0**。
+   取值依据是实测而非类比：真实公网服务器全程握手 amap 0.85s / huggingface 1.29s /
+   edgeone 1.30s / coingecko 1.62s / context7 2.14s / deepwiki 2.53s，hermes 自己的
+   1.5s 只够前三台。hx 2026-08-13 要求压低，评估后取 5.0 而非 3.0：3.0 在本机网络下
+   刚好够，但 deepwiki 从更慢的出网看过去就回到 3.2s，那台又变回「时好时坏」。
+   代价：一台**彻底连不上**的服务器会让每轮多等满 5s；健康但慢的服务器只付真实
+   连接时间（join 在发现结束的瞬间返回），所以 5s 与 3s 的差额**只在坏服务器上支付**。
+   更该做的降低方式：等 §2.3 的 per-server 状态有真实数据后，跳过「连续 N 轮判死」
+   的服务器，而不是继续猜更小的数。**openclaw 仍未测。**
    原文如下————`user_mcp_materialize.hermes_config_merged`
    只写 url/headers，没有超时旋钮，等不等未知。若也不等，本方案覆盖不到。
 2. ~~**补测矩阵未跑**~~ —— **已跑完，见 §8.5。** 原计划如下（Codex 建议，接受）：两个受影响模型 × 5 种场景 × 4 次 = 40 个

@@ -252,8 +252,10 @@ def test_hermes_gets_a_discovery_timeout_that_real_servers_can_meet():
     out = yaml.safe_load(m.hermes_config_merged(
         None, [{"name": "ombre", "enabled": True, "url": "https://o/mcp"}], set()))
     assert out["mcp_discovery_timeout"] == m.HERMES_MCP_DISCOVERY_TIMEOUT_SEC
-    assert out["mcp_discovery_timeout"] > 2.5, (
-        "必须高过 claude 那条线实测出来的 ~2.5s 预算,否则等于没修")
+    # 实测的真实公网服务器最慢一台(deepwiki)全程 2.53s;这个值必须留出余量,
+    # 否则从更慢的出网看过去,那台又回到「时好时坏」——正是本次要修的病。
+    assert out["mcp_discovery_timeout"] >= 2.53 * 1.5, (
+        "必须显著高过实测最慢的健康服务器(2.53s),否则等于没修")
 
 
 def test_a_user_with_no_mcp_never_has_their_startup_touched():
