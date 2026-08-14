@@ -6776,7 +6776,7 @@ async def _run_wake(
     "provider_config"错误（死/欠费 BYOK key）额外写一条 payment_cooldown（D3 Task 7），
     让 scheduler 的 `due_heartbeat_users` 停止对一把修不好的钥匙反复重试。
 
-    prompt 组装：读 summary+tail（同 chat 路径的 D1 读法）；真实历史保留原 role，
+    prompt 组装：读 bounded recent turns + MEMORY/USER；真实历史保留原 role，
     主动场景的 application-data blocks 使用 assistant role。
     `system_prompt`：`_SCREEN_WATCH_SYSTEM_PROMPT`（screen_watch lane）或
     `_WAKE_SYSTEM_PROMPT`（其余三条 wake lane）。screen_watch 的 `screen_recent`、
@@ -6918,103 +6918,27 @@ async def _run_wake(
             ):
                 raise RuntimeModeChanged(f"user rolled back before {effect}")
 
-        # D6/Task 10: close a compaction backlog gap BEFORE reading the actual
-        # prompt content — see `_ensure_prompt_coverage`'s docstring. Only run
-        # when both seq-native readers are wired; a
-        # coverage check is meaningless without a real tail reader to bound.
-        seq_context = (
-            deps.read_summary_with_seq is not None
-            and deps.read_tail_after_seq is not None
+        # Freeze one raw-Chat snapshot. All wake history is optional because a
+        # proactive turn has no active user seed; the wake control payload
+        # remains the separate required boundary.
+        wake_snapshot_seq = await asyncio.to_thread(db.chat_max_seq, user_id)
+        recent_context = await _read_recent_prompt_context(
+            user_id=user_id,
+            deps=deps,
+            through_seq=wake_snapshot_seq,
+            target_turns=_WAKE_TAIL_MAX_TURNS,
+            required_from_seq=None,
+            enclave_sem=enclave_sem,
+            trajectory_recorder=trajectory_recorder,
         )
-        optional_tail_turns: list[list[dict]] = []
-        tail_source_truncated = False
-        agent_memory = ""
-        user_profile = ""
+        summary = ""
+        tail = recent_context.required_tail
+        optional_tail_turns = recent_context.optional_turns
+        tail_source_truncated = recent_context.tail_source_truncated
+        agent_memory = recent_context.agent_memory
+        user_profile = recent_context.user_profile
         coverage_hole_notice = ""
-        wake_snapshot_seq = 0
-        compact_through_seq = None
-        if seq_context:
-            wake_snapshot_seq = await asyncio.to_thread(
-                db.chat_max_seq, user_id
-            )
-            oldest_retained_seed = await asyncio.to_thread(
-                db.chat_recent_genuine_turn_boundary_seq,
-                user_id,
-                max_turns=_WAKE_TAIL_MAX_TURNS,
-                through_seq=wake_snapshot_seq,
-            )
-            if oldest_retained_seed is not None and oldest_retained_seed > 1:
-                compact_through_seq = oldest_retained_seed - 1
-        if seq_context:
-            await _ensure_prompt_coverage(
-                user_id,
-                deps,
-                enclave_sem=enclave_sem,
-                tail_limit=_TAIL_BUDGET,
-                job_id=job_id,
-                claimed_by=claimed_by,
-                trajectory_recorder=trajectory_recorder,
-                compact_through_seq=compact_through_seq,
-            )
-        if seq_context:
-            (
-                summary,
-                tail,
-                optional_tail_turns,
-                tail_source_truncated,
-                watermark_seq,
-                agent_memory,
-                user_profile,
-                coverage_hole_notice,
-            ) = await _read_seq_adaptive_prompt_context(
-                user_id=user_id,
-                deps=deps,
-                through_seq=wake_snapshot_seq,
-                target_turns=_WAKE_TAIL_MAX_TURNS,
-                provider_config=provider_config,
-                enclave_sem=enclave_sem,
-                claimed_by=claimed_by,
-                job_id=job_id,
-                add_usage=tm.add_call if tm is not None else None,
-                trajectory_recorder=trajectory_recorder,
-            )
-        else:
-            async with enclave_sem:
-                summary, tail = "", []
-                tail = await asyncio.to_thread(
-                    _inject_tail_images,
-                    tail,
-                    user_id=user_id,
-                    read_images=deps.read_images,
-                    active_image_ids=set(),
-                    read_vision_observations=deps.read_vision_observations,
-                )
-                tail = await asyncio.to_thread(
-                    _inject_tail_files,
-                    tail,
-                    user_id=user_id,
-                    read_files=deps.read_files,
-                )
-            profile_selection = await _select_profile_prompt_for_turn(
-                user_id=user_id,
-                deps=deps,
-                trajectory_recorder=trajectory_recorder,
-            )
-            agent_memory = profile_selection.memory
-            user_profile = profile_selection.user
-            if profile_selection.state in {"ok", "last_good"}:
-                summary = ""
-            else:
-                summary = await _bound_materialized_summary(
-                    user_id,
-                    summary,
-                    deps,
-                    enclave_sem=enclave_sem,
-                    claimed_by=claimed_by,
-                    job_id=job_id,
-                    trajectory_recorder=trajectory_recorder,
-                )
-        if seq_context:
+        if seq_native:
             # A wake is proactive work only while there is no unanswered user
             # input.  Keep the frozen prompt snapshot boundary separate from
             # the durable reply cursor: a send can commit after this wake was
@@ -7163,7 +7087,10 @@ async def _run_wake(
         if (
             lane == "heartbeat"
             and deps.has_genuine_user_history is None
-            and not any(_is_genuine_user_seed(row) for row in tail)
+            and not any(
+                _is_genuine_user_seed(row)
+                for row in (_flatten_turns(optional_tail_turns) + tail)
+            )
         ):
             # Legacy/test callers without the authoritative seam still fail
             # closed once their materialized tail is available. Production has
@@ -7173,14 +7100,14 @@ async def _run_wake(
             user_id=user_id,
             deps=deps,
             tail=tail,
-            through_seq=(wake_snapshot_seq if seq_context else None),
+            through_seq=wake_snapshot_seq,
         )
         if deps.read_wake_attention_snapshot is not None:
             attention_snapshot = await asyncio.to_thread(
                 deps.read_wake_attention_snapshot,
                 user_id,
                 now_ts=float(temporal_snapshot["now_ts"]),
-                through_seq=(wake_snapshot_seq if seq_context else None),
+                through_seq=wake_snapshot_seq,
             )
             if isinstance(attention_snapshot, dict):
                 temporal_snapshot.update(attention_snapshot)
@@ -8085,11 +8012,7 @@ async def _run_wake(
         # Snapshot the boundary at wake start. Production uses the same total-order
         # seq reader as chat; timestamp fallback remains only for narrow tests.
         if deps.read_messages_after_seq is not None:
-            wake_start_seq = (
-                wake_snapshot_seq
-                if seq_context
-                else await asyncio.to_thread(db.chat_max_seq, user_id)
-            )
+            wake_start_seq = wake_snapshot_seq
             cursor_box = {"seq": wake_start_seq, "ts": time.time()}
         else:
             wake_start_seq = 0
@@ -8179,9 +8102,7 @@ async def _run_wake(
                 provider_config=provider_config,
                 temporal_snapshot=temporal_snapshot,
                 optional_tail_turns=optional_tail_turns,
-                tail_target_turns=(
-                    _WAKE_TAIL_MAX_TURNS if seq_context else None
-                ),
+                tail_target_turns=_WAKE_TAIL_MAX_TURNS,
                 tail_source_truncated=tail_source_truncated,
                 tail_lane=lane,
                 application_data_role="assistant",
@@ -8190,59 +8111,15 @@ async def _run_wake(
             )
 
         build_messages = _wake_builder()
-        if seq_context:
-            try:
-                _preflight_adaptive_builder(
-                    build_messages,
-                    provider_config=provider_config,
-                )
-            except v2_prompt_frontier.PromptFrontierExhausted:
-                if tm is not None:
-                    tm.record_prompt_frontier_exhaustion()
-                if wake_snapshot_seq <= watermark_seq:
-                    raise
-                await _ensure_prompt_coverage(
-                    user_id,
-                    deps,
-                    enclave_sem=enclave_sem,
-                    tail_limit=0,
-                    job_id=job_id,
-                    claimed_by=claimed_by,
-                    trajectory_recorder=trajectory_recorder,
-                    compact_through_seq=wake_snapshot_seq,
-                )
-                (
-                    summary,
-                    tail,
-                    optional_tail_turns,
-                    tail_source_truncated,
-                    watermark_seq,
-                    agent_memory,
-                    user_profile,
-                    coverage_hole_notice,
-                ) = await _read_seq_adaptive_prompt_context(
-                    user_id=user_id,
-                    deps=deps,
-                    through_seq=wake_snapshot_seq,
-                    target_turns=_WAKE_TAIL_MAX_TURNS,
-                    provider_config=provider_config,
-                    enclave_sem=enclave_sem,
-                    claimed_by=claimed_by,
-                    job_id=job_id,
-                    add_usage=tm.add_call if tm is not None else None,
-                    trajectory_recorder=trajectory_recorder,
-                )
-                wake_tail = list(tail)
-                build_messages = _wake_builder()
-                try:
-                    _preflight_adaptive_builder(
-                        build_messages,
-                        provider_config=provider_config,
-                    )
-                except v2_prompt_frontier.PromptFrontierExhausted:
-                    if tm is not None:
-                        tm.record_prompt_frontier_exhaustion()
-                    raise
+        try:
+            _preflight_adaptive_builder(
+                build_messages,
+                provider_config=provider_config,
+            )
+        except v2_prompt_frontier.PromptFrontierExhausted:
+            if tm is not None:
+                tm.record_prompt_frontier_exhaustion()
+            raise
 
         await _fence_wake_effect("wake turn")
         from core import self_thinking as _st_wake_loop

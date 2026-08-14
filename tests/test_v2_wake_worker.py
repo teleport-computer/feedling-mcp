@@ -1852,7 +1852,7 @@ def test_run_wake_provider_error_silent_mark_failed(monkeypatch):
 
 
 def test_run_wake_unexpected_exception_also_silent_mark_failed(monkeypatch):
-    """Any other unexpected exception during the wake turn (e.g. read_tail
+    """Any other unexpected exception during the wake turn (e.g. recent history
     blowing up) must be caught by _run_wake's own try/except, same as
     _run_compaction — never propagate, never surface a user error chip."""
     uid = "u_wake_boom"
@@ -1861,16 +1861,15 @@ def test_run_wake_unexpected_exception_also_silent_mark_failed(monkeypatch):
     job_id, _ = jobs_store.enqueue_job(uid, "heartbeat")
     claimed_by = _claim(job_id)
 
-    def _boom_read_summary(uid_):
-        raise RuntimeError("tail read exploded")
+    def _boom_read_recent(*_args, **_kwargs):
+        raise RuntimeError("recent history read exploded")
 
     deps = worker.TurnDeps(
         read_messages=lambda uid_: [],
         resolve_provider=lambda uid_: (_BYOK, {}),
         mint_enclave_token=lambda uid_: "rt",
         has_genuine_user_history=lambda _uid: True,
-        read_summary_with_seq=_boom_read_summary,
-        read_tail_after_seq=lambda *_args, **_kwargs: [],
+        read_recent_turns=_boom_read_recent,
     )
     surface_called = {"n": 0}
     monkeypatch.setattr(
@@ -1885,6 +1884,81 @@ def test_run_wake_unexpected_exception_also_silent_mark_failed(monkeypatch):
     row = _job_status(job_id)
     assert row[0] == "failed"
     assert "wake_failed" in (row[1] or "")
+
+
+def test_wake_uses_recent_context_without_compact_dependencies(monkeypatch):
+    uid = "u_wake_recent_context"
+    conftest.seed_user(uid)
+    _reset(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, "manual_wake")
+    claimed_by = _claim(job_id)
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("conversation compact dependency was touched")
+
+    monkeypatch.setattr(worker.db, "chat_max_seq", lambda _uid: 20)
+    calls = _script_provider(monkeypatch, [_text_round("")])
+    recent_calls = []
+    recent_rows = [
+        {
+            "id": "m10",
+            "seq": 10,
+            "ts": 10.0,
+            "role": "user",
+            "content": "wake history user",
+            "_genuine_user": True,
+        },
+        {
+            "id": "m11",
+            "seq": 11,
+            "ts": 11.0,
+            "role": "assistant",
+            "content": "wake history assistant",
+            "_genuine_user": False,
+        },
+    ]
+    deps = worker.TurnDeps(
+        read_messages=lambda _uid: [],
+        resolve_provider=lambda _uid: (_BYOK, {}),
+        mint_enclave_token=lambda _uid: "rt",
+        read_summary_with_seq=forbidden,
+        read_tail_after_seq=forbidden,
+        read_recent_turns=lambda user_id, max_turns, row_cap, **kwargs: (
+            recent_calls.append((user_id, max_turns, row_cap, kwargs))
+            or {"rows": recent_rows, "source_truncated": False}
+        ),
+        select_profile_for_turn=lambda _uid, **_kwargs: (
+            worker.v2_profile_store.ProfilePromptSelection(
+                state="unavailable"
+            )
+        ),
+        apply_pending_effects=_apply_effects,
+    )
+
+    status = asyncio.run(
+        worker._run_wake(
+            job_id,
+            uid,
+            "manual_wake",
+            deps,
+            _BYOK,
+            asyncio.Semaphore(4),
+            claimed_by,
+        )
+    )
+
+    assert status == "completed"
+    assert recent_calls == [
+        (
+            uid,
+            16,
+            worker._RECENT_TURN_ROW_CAP,
+            {"through_seq": 20},
+        )
+    ]
+    rendered = json.dumps(calls[0]["messages"], ensure_ascii=False)
+    assert "wake history user" in rendered
+    assert "wake history assistant" in rendered
 
 
 def test_run_wake_tolerates_missing_read_summary_read_tail(monkeypatch):
