@@ -31,10 +31,27 @@
     schema）还没随档位变。批 7 接 genesis 时，必须回到 ``genesis/prompts.py``
     逐条核对原文，并为每个档位建立与旧 prompt 对照的 golden，才能放开。
 
+## 为什么是三档，不是四档
+
+VPS resident 那条线还有一个「记忆收口二次检查」（``genesis/prompts.py`` 的
+``MEMORY_RECHECK_PROMPT``，由 ``genesis/worker.py:build_memory_recheck_from_material``
+调用）。查过之后确认**它不需要第四个档位**：
+
+    它的过滤规则   闲聊、临时情绪、玩笑、未确认猜测、一次性无长期价值的内容不补
+    history_import 闲聊/临时情绪/玩笑/未确认猜测/一次性事件不抽
+                   ↑ 同一把尺子
+
+recheck 的独特之处不在「什么值得记」，而在**它是个补漏动作**：第二遍扫，输入里
+额外带上一轮已写的记忆，只补遗漏、不重写。那属于调用方的编排（多喂一份
+``written_memories``、并约束输出只出 memory 不出 identity），不是尺子的一部分。
+
+**判断某个新场景要不要加档位，就问这一句：它的「什么值得记」跟现有三档中的
+任何一把不同吗？** 不同才加档；只是调用方式不同，就复用现有档位。
+
 ## 现状
 
 本模块把三把尺子收拢到一处、用测试钉死它们不能被抹平。真正让 genesis 改调内核，
-是批 7 的事（会动 onboarding 流程，需拍板）。
+是批 7 的事（会动 onboarding 流程）。
 """
 from __future__ import annotations
 

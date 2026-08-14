@@ -22,6 +22,7 @@ from memory_garden.storage import (
     StoragePort,
     UnsupportedOperation,
     describe_capabilities,
+    describe_for_user,
     ensure_supported,
     missing_critical,
     plan_degradations,
@@ -134,6 +135,46 @@ def test_describe_mentions_both_kinds_separately():
 
 def test_describe_says_nothing_wrong_when_full():
     assert "支持全部能力" in describe_capabilities(FULL_CAPABILITIES)
+
+
+# --------------------------------------------------------------------------- #
+# 给接入方看的说明
+# --------------------------------------------------------------------------- #
+
+
+def test_user_facing_text_is_empty_when_nothing_is_lost():
+    assert describe_for_user(FULL_CAPABILITIES) == []
+
+
+def test_user_facing_text_covers_every_gap():
+    caps = Capabilities(
+        supports_supersede=False,
+        supports_atomic_batch=False,
+        supports_custom_fields=False,
+        supports_metadata_sort=False,
+    )
+    lines = describe_for_user(caps)
+    assert len(lines) == 4, "每一项缺失都要有一句给用户的说明"
+
+
+def test_user_facing_text_has_no_field_names():
+    """接入方看的是「你会失去什么」，不是内部字段名。"""
+    caps = Capabilities(False, False, False, False)
+    for line in describe_for_user(caps):
+        assert "supports_" not in line, f"话术里漏了字段名: {line}"
+        assert line.strip(), "不能有空话术"
+
+
+def test_user_facing_text_says_what_is_lost_not_just_what_is_missing():
+    """每句都要落到后果上，否则用户看了也不知道该不该在意。"""
+    caps = Capabilities(
+        supports_supersede=True,
+        supports_atomic_batch=True,
+        supports_custom_fields=True,
+        supports_metadata_sort=False,
+    )
+    (line,) = describe_for_user(caps)
+    assert "变慢" in line, "只说「不支持排序」没用，要说清用户会感觉到什么"
 
 
 # --------------------------------------------------------------------------- #

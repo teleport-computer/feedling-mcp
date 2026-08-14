@@ -180,7 +180,7 @@ def ensure_supported(caps: Capabilities, *, operation: str, requires: str) -> No
 
 
 def describe_capabilities(caps: Capabilities) -> str:
-    """渲染成一段人能读的说明，供日志或界面直接用。"""
+    """渲染成一段给工程看的说明（日志/诊断用），措辞偏技术。"""
     lines: list[str] = []
     critical = missing_critical(caps)
     if critical:
@@ -195,6 +195,51 @@ def describe_capabilities(caps: Capabilities) -> str:
     if not lines:
         return "该存储后端支持全部能力，无降级、无受限操作。"
     return "\n".join(lines)
+
+
+# 给接入方看的话术：不出现字段名，说清楚「你会失去什么」。
+_USER_FACING_CRITICAL: dict[str, str] = {
+    "supports_supersede": (
+        "这个记忆库不支持「标记为被取代」，只能覆盖或删除。"
+        "为避免记忆被不可追溯地改掉，整理记忆时的消矛盾会被跳过"
+    ),
+    "supports_atomic_batch": (
+        "这个记忆库不支持把一批改动作为整体提交。"
+        "为避免出现改了一半的状态，需要多步完成的整理（合并、取代）会被跳过"
+    ),
+}
+
+_USER_FACING_DEGRADED: dict[str, str] = {
+    "supports_custom_fields": (
+        "这个记忆库不能原样保存「桶」和「线索」，它们会被折叠进正文。"
+        "按桶浏览和分类展示会不可用"
+    ),
+    "supports_metadata_sort": (
+        "这个记忆库不能按重要度排序，需要每次把记忆全部取回本地再排。"
+        "记忆变多之后回复会变慢"
+    ),
+}
+
+
+def describe_for_user(caps: Capabilities) -> list[str]:
+    """给**接入方**看的说明：接了这个记忆库，你会失去什么。
+
+    与 ``describe_capabilities`` 的区别是措辞 —— 这里不出现
+    ``supports_supersede`` 这类字段名，只讲后果。
+
+    hx 2026-08-14 定：降级信息给用户看，让接入方知道自己失去了什么，
+    而不是只写进日志。返回空列表代表「什么都没损失」，调用方可以不展示。
+    """
+    out: list[str] = []
+    for name in missing_critical(caps):
+        text = _USER_FACING_CRITICAL.get(name)
+        if text:
+            out.append(text)
+    for d in plan_degradations(caps):
+        text = _USER_FACING_DEGRADED.get(d.capability)
+        if text:
+            out.append(text)
+    return out
 
 
 # --------------------------------------------------------------------------- #
