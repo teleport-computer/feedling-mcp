@@ -27,6 +27,13 @@ change must not be interpreted as an API guarantee.
   unavailable or changes before commit, so a stale request cannot append a
   second active successor. Successful receipts list only IDs actually retired.
 
+- **Dream consolidation now preserves the remembered event timeline.** A
+  Hosted Runtime V2 Dream successor uses the latest `occurred_at` value among
+  the source cards it consolidates instead of the Dream job time or most recent
+  chat time. If any selected source has no usable ISO-8601 event time, the whole
+  consolidation fails before retiring a card and records a content-free
+  `dream_source_occurred_at_unavailable` diagnostic.
+
 - **`memory_search` guidance documents literal matching and allows a reworded
   retry.** Matching is a case-insensitive literal substring with no synonyms,
   translation, or stemming, so an empty result means that wording is absent

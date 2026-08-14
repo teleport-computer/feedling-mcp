@@ -11,6 +11,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, NamedTuple
 
 import provider_client
@@ -333,6 +334,33 @@ def cards_to_actions(cards, *, occurred_at, source_ids, build_envelope,
     )
 
 
+def _latest_source_occurred_at(cards: list[dict]) -> str:
+    """Return the chronologically latest source timestamp, preserving its text.
+
+    Dream rewrites old memories, so neither the job time nor the latest chat
+    time is evidence of when the remembered event happened.  Every source must
+    carry a parseable ISO-8601 value: ignoring one missing value could select an
+    older sibling while claiming it is the latest.  Fail closed instead; the
+    worker persists the stable, content-free error code for operators.
+    """
+    ranked: list[tuple[datetime, str]] = []
+    for card in cards:
+        raw = str(card.get("occurred_at") or "").strip()
+        if not raw:
+            raise ValueError("dream_source_occurred_at_unavailable")
+        candidate = raw[:-1] + "+00:00" if raw.endswith("Z") else raw
+        try:
+            parsed = datetime.fromisoformat(candidate)
+        except ValueError:
+            raise ValueError("dream_source_occurred_at_unavailable") from None
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        ranked.append((parsed.astimezone(timezone.utc), raw))
+    if not ranked:
+        raise ValueError("dream_source_occurred_at_unavailable")
+    return max(ranked, key=lambda item: item[0])[1]
+
+
 def consolidations_to_actions(
     consolidations,
     *,
@@ -393,6 +421,12 @@ def consolidations_to_actions(
             ):
                 policy_rejections += 1
                 continue
+        else:
+            # Without the exact disclosed source cards there is no honest
+            # event time to carry forward.  The worker's shared ``occurred_at``
+            # is capture/chat time and must never become Dream's silent fallback.
+            raise ValueError("dream_source_occurred_at_unavailable")
+        source_occurred_at = _latest_source_occurred_at(old_cards)
         card = {"type": "fact", **result}
         actions.append(
             {
@@ -400,7 +434,7 @@ def consolidations_to_actions(
                 "supersedes": card_ids,
                 "envelope": _memory_envelope_from_card(
                     card,
-                    occurred_at=occurred_at,
+                    occurred_at=source_occurred_at,
                     source="memory_dream",
                     build_envelope=build_envelope,
                     default_type="fact",

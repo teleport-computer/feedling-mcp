@@ -38,6 +38,7 @@ def test_dream_context_fetches_full_cards_without_cross_run_cooldown(monkeypatch
                 "summary": "完整摘要",
                 "content": "只有 fetch 才返回的完整正文。",
                 "source": "memory_capture",
+                "occurred_at": "2026-05-01T00:00:00Z",
                 "created_at": "2026-07-31T00:00:00Z",
             },
             {
@@ -45,6 +46,7 @@ def test_dream_context_fetches_full_cards_without_cross_run_cooldown(monkeypatch
                 "summary": "新 dream 卡",
                 "content": "上一轮 Dream 卡可在后续运行重新参与整理。",
                 "source": "memory_dream",
+                "occurred_at": "2026-07-01T00:00:00Z",
                 "created_at": "2026-07-31T00:00:00Z",
             },
         ]}, 200),
@@ -57,6 +59,10 @@ def test_dream_context_fetches_full_cards_without_cross_run_cooldown(monkeypatch
     assert "dream-new" in ctx["cards"]
     assert "上一轮 Dream 卡可在后续运行重新参与整理。" in ctx["cards"]
     assert [item["id"] for item in ctx["card_items"]] == ["capture-old", "dream-new"]
+    assert [item["occurred_at"] for item in ctx["card_items"]] == [
+        "2026-05-01T00:00:00Z",
+        "2026-07-01T00:00:00Z",
+    ]
 
 
 def test_dream_context_budget_keeps_only_whole_cards(monkeypatch):
@@ -76,6 +82,7 @@ def test_dream_context_budget_keeps_only_whole_cards(monkeypatch):
             "summary": f"摘要-{memory_id}",
             "content": "正文" * 40,
             "source": "memory_capture",
+            "occurred_at": "2026-07-01T00:00:00Z",
             "created_at": "2026-07-01T00:00:00Z",
         }
         for memory_id in ("m1", "m2")
