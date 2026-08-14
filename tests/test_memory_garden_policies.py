@@ -148,3 +148,41 @@ def test_language_rule_is_not_wired_yet():
         "capture 模板已接入共用语言规则 —— 请确认已跑过真模型 e2e，"
         "并重新生成各档位的 golden fixture，然后删掉这条测试。"
     )
+
+
+# --------------------------------------------------------------------------- #
+# 与 genesis 的关系：curated 已是唯一来源，history 仍是副本
+# --------------------------------------------------------------------------- #
+
+
+def test_genesis_keep_all_comes_from_policies_not_its_own_copy():
+    """curated_archive 那两段的重复**已真正消除** —— genesis 引用本模块。
+
+    这条一旦红，说明有人在 genesis 那边又写回了一份字面量。
+    """
+    from genesis import prompts as gp
+    from memory_garden.policies import KEEP_ALL_MAP_SUFFIX, KEEP_ALL_WRITE_SUFFIX
+
+    assert gp.FACT_MAP_KEEP_ALL_SUFFIX == "\n\n" + KEEP_ALL_MAP_SUFFIX
+    assert gp.FACT_WRITE_KEEP_ALL_SUFFIX == "\n\n" + KEEP_ALL_WRITE_SUFFIX
+
+
+def test_history_import_rubric_still_matches_genesis_verbatim():
+    """history_import 仍是副本（原文在 genesis 里不连续，抽出来会改行为）。
+
+    既然是副本，就必须逐字相同 —— 这条钉住两边不许漂移。
+    真正消除这份重复需要改动 FACT_MAP_PROMPT 的文本顺序，得先过真模型 e2e。
+    """
+    from genesis import prompts as gp
+    from memory_garden.policies import HISTORY_IMPORT
+
+    for line in HISTORY_IMPORT.selection_rubric.splitlines():
+        assert line in gp.FACT_MAP_PROMPT, f"与 genesis 原文漂移了: {line!r}"
+
+
+def test_keep_all_text_keeps_genesis_original_punctuation():
+    """逐字保留意味着连半角标点都不许「顺手改成全角」—— 那也是改 prompt。"""
+    from memory_garden.policies import KEEP_ALL_MAP_SUFFIX
+
+    assert "不是聊天记录:" in KEEP_ALL_MAP_SUFFIX, "半角冒号被改掉了"
+    assert "宁多勿漏。" in KEEP_ALL_MAP_SUFFIX
