@@ -216,7 +216,7 @@ def _is_resident_maintenance_reply(store: UserStore, payload: dict | None) -> bo
     )
 
 
-FIRST_CHAT_OK_USER_SOURCES = {"chat", "model_api"}
+FIRST_CHAT_OK_USER_SOURCES = db.FIRST_CHAT_OK_USER_SOURCES
 
 
 def _maybe_mark_first_chat_ok(store: UserStore, reply_to_message_id: str) -> None:
