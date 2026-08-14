@@ -10,24 +10,26 @@ ROOT = Path(__file__).parent.parent
 WORKFLOW = ROOT / ".github" / "workflows" / "ci.yml"
 
 
-def test_tee_migrate_has_one_head_after_voice_primary_alignment():
+def test_tee_migrate_has_one_head_after_runtime_v2_alignment():
     cfg = Config(str(ROOT / "backend" / "alembic_tee" / "alembic.ini"))
     cfg.set_main_option("script_location", str(ROOT / "backend" / "alembic_tee"))
     script = ScriptDirectory.from_config(cfg)
 
-    assert script.get_heads() == ["0017_voice_primary_alignment"]
+    assert script.get_heads() == ["0020_v2_first_chat_activation"]
     assert (
-        script.get_revision("0017_voice_primary_alignment").down_revision
-        == "0016_merge_screen_pre_perception"
+        script.get_revision("0020_v2_first_chat_activation").down_revision
+        == "0019_v2_worker_pool_heartbeats"
     )
-    assert set(
-        script.get_revision("0016_merge_screen_pre_perception").down_revision
-    ) == {
-        "0014_screen_chat_frames",
-        "0015_merge_pre_perception",
-    }
-    migration = script.get_revision("0017_voice_primary_alignment").module
-    assert "'[\"0017_voice_primary_alignment\"]'::jsonb" in (
+    assert (
+        script.get_revision("0019_v2_worker_pool_heartbeats").down_revision
+        == "0018_v2_wake_shadow_decisions"
+    )
+    assert (
+        script.get_revision("0018_v2_wake_shadow_decisions").down_revision
+        == "0017_voice_primary_alignment"
+    )
+    migration = script.get_revision("0020_v2_first_chat_activation").module
+    assert "'[\"0020_v2_first_chat_activation\"]'::jsonb" in (
         migration._UPDATE_PREPARED_HEAD
     )
 

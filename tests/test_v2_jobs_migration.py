@@ -66,7 +66,12 @@ def test_voice_shape_and_wake_indexes_are_merged_into_single_installed_head():
     cfg.set_main_option("script_location", str(backend / "alembic"))
     script = ScriptDirectory.from_config(cfg)
 
-    assert script.get_heads() == ["0086_merge_voice_wake"]
+    assert script.get_heads() == ["0088_merge_pre_test_heads"]
+    convergence = script.get_revision("0088_merge_pre_test_heads")
+    assert set(convergence.down_revision) == {
+        "0086_merge_voice_wake",
+        "0087_v2_first_chat_activation",
+    }
     merge = script.get_revision("0086_merge_voice_wake")
     assert set(merge.down_revision) == {
         "0085_voice_transcript_shapes",
@@ -148,7 +153,7 @@ def test_perception_signal_schema_is_installed_at_the_merged_head():
             "AND tc.table_name='perception_signal_state_v2'"
         ).fetchone()
 
-    assert installed_head == ("0086_merge_voice_wake",)
+    assert installed_head == ("0088_merge_pre_test_heads",)
     assert columns == {
         "user_id": ("text", "NO"),
         "signal": ("text", "NO"),
@@ -213,7 +218,7 @@ def test_0075_usage_rollup_schema_is_installed_without_source_backfill():
             "AND tgrelid='v2_turn_metrics'::regclass"
         ).fetchone()[0]
 
-    assert heads == {"0086_merge_voice_wake"}
+    assert heads == {"0088_merge_pre_test_heads"}
     assert tables == {
         "v2_usage_daily_users",
         "v2_usage_daily_dimensions",
