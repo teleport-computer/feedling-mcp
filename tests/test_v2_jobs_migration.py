@@ -70,14 +70,16 @@ def _migration_0085_module():
     )
 
 
-def test_worker_pool_heartbeats_is_the_single_installed_head():
+def test_first_chat_activation_is_the_single_installed_head():
     """A deploy missing the durable baseline migration must fail before rollout."""
     backend = Path(__file__).parent.parent / "backend"
     cfg = Config(str(backend / "alembic.ini"))
     cfg.set_main_option("script_location", str(backend / "alembic"))
     script = ScriptDirectory.from_config(cfg)
 
-    assert script.get_heads() == ["0086_v2_worker_pool_heartbeats"]
+    assert script.get_heads() == ["0087_v2_first_chat_activation"]
+    migration = script.get_revision("0087_v2_first_chat_activation")
+    assert migration.down_revision == "0086_v2_worker_pool_heartbeats"
     migration = script.get_revision("0086_v2_worker_pool_heartbeats")
     assert migration.down_revision == "0085_v2_wake_shadow_decisions"
     migration = script.get_revision("0085_v2_wake_shadow_decisions")
@@ -141,7 +143,7 @@ def test_worker_pool_heartbeats_is_the_single_installed_head():
             "AND tc.table_name='perception_signal_state_v2'"
         ).fetchone()
 
-    assert installed_head == ("0086_v2_worker_pool_heartbeats",)
+    assert installed_head == ("0087_v2_first_chat_activation",)
     assert columns == {
         "user_id": ("text", "NO"),
         "signal": ("text", "NO"),
@@ -203,7 +205,7 @@ def test_0075_usage_rollup_schema_is_installed_without_source_backfill():
             "AND tgrelid='v2_turn_metrics'::regclass"
         ).fetchone()[0]
 
-    assert head == ("0086_v2_worker_pool_heartbeats",)
+    assert head == ("0087_v2_first_chat_activation",)
     assert tables == {
         "v2_usage_daily_users",
         "v2_usage_daily_dimensions",

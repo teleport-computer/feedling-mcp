@@ -49,6 +49,12 @@ import object_storage  # lowest-layer peer: R2 offload for frame body_ct
 
 log = logging.getLogger("feedling.db")
 
+# A first-chat activation is earned only by a reply to ordinary user-authored
+# chat. Keep the resident response path and Runtime V2's transactional sink on
+# this one vocabulary so synthetic probes and background wakes cannot activate
+# proactive presence.
+FIRST_CHAT_OK_USER_SOURCES = frozenset({"chat", "model_api"})
+
 # ---------------------------------------------------------------------------
 # Connection pool (lazy: opened on first use so importing this module without a
 # DATABASE_URL — e.g. tooling — doesn't crash at import time).
@@ -9757,6 +9763,62 @@ def v2_turn_failure_supersede_enabled() -> bool:
     ).strip().lower() not in {"0", "false", "off", "no"}
 
 
+def _mark_first_chat_ok_for_v2_reply_on_cursor(
+    cur,
+    user_id: str,
+    effect_doc: dict,
+    *,
+    reply_ts: float,
+) -> bool:
+    """Atomically activate proactive presence with a successful V2 reply.
+
+    Runtime V2 writes replies through the effect sink and never calls the
+    resident ``/v1/chat/response`` handler that historically set
+    ``first_chat_ok_at``. Validate the explicit reply parent under the same
+    chat transaction, then patch the marker without touching user switches.
+    """
+    if str(effect_doc.get("turn_failure_error_class") or "").strip():
+        return False
+    parent_id = str(effect_doc.get("reply_to_message_id") or "").strip()
+    if not parent_id:
+        return False
+    cur.execute(
+        "SELECT 1 FROM chat_messages "
+        "WHERE user_id=%s AND msg_id=%s "
+        "  AND doc->>'role' IN ('user','human') "
+        "  AND doc->>'source'=ANY(%s) "
+        "LIMIT 1",
+        (str(user_id), parent_id, list(FIRST_CHAT_OK_USER_SOURCES)),
+    )
+    if cur.fetchone() is None:
+        return False
+
+    # The caller already owns the chat-user fence. Match every other
+    # proactive-settings mutation's chat -> capture-consent lock order before
+    # merging this internal marker into the shared settings document.
+    _lock_capture_consent_on_cursor(cur, str(user_id))
+    activated_at = datetime.fromtimestamp(float(reply_ts)).isoformat()
+    cur.execute(
+        "INSERT INTO user_blobs (user_id,kind,doc) "
+        "VALUES (%s,'proactive_settings',%s) "
+        "ON CONFLICT (user_id,kind) DO UPDATE SET doc="
+        "user_blobs.doc || EXCLUDED.doc "
+        "WHERE COALESCE(user_blobs.doc->>'first_chat_ok_at','')='' "
+        "RETURNING user_id",
+        (
+            str(user_id),
+            Jsonb(
+                {
+                    "version": 2,
+                    "first_chat_ok_at": activated_at,
+                    "updated_at": activated_at,
+                }
+            ),
+        ),
+    )
+    return cur.fetchone() is not None
+
+
 def chat_append_effect_with_cursor(
     user_id: str,
     msg_id: str,
@@ -9808,6 +9870,7 @@ def chat_append_effect_with_cursor(
     replied_user_ids: list[str] = []
     superseded_turn_cleanup: list[tuple[str, str]] = []
     persisted_runtime_doc: dict | None = None
+    first_chat_activated = False
     replied_fields = {
         "reply_status": "replied",
         "reply_message_id": msg_id,
@@ -10096,6 +10159,15 @@ def chat_append_effect_with_cursor(
                         cursor_seq,
                     )
 
+                    first_chat_activated = (
+                        _mark_first_chat_ok_for_v2_reply_on_cursor(
+                            cur,
+                            user_id,
+                            effect_doc,
+                            reply_ts=float(ts),
+                        )
+                    )
+
     def _post_commit() -> None:
         _offload_chat_body_after_commit(
             user_id, msg_id, persisted_reply_doc, storage_generation,
@@ -10141,6 +10213,8 @@ def chat_append_effect_with_cursor(
         if persisted_runtime_doc is not None:
             _mirror_persisted_blob(
                 user_id, "model_api_runtime", persisted_runtime_doc)
+        if first_chat_activated:
+            _mirror_proactive_settings_current(user_id)
 
     if defer_post_commit:
         return seq, inserted, _post_commit
