@@ -1027,6 +1027,7 @@ jobs:
           export TEE_MIGRATION_DATABASE_URL="${PRE_DSN}&sslrootcert=/tmp/pre-tee-ca.crt"
           python - <<'PY'
           import os
+          import sys
           import psycopg
           from alembic.config import Config
           from alembic.script import ScriptDirectory
@@ -1050,6 +1051,15 @@ jobs:
                   "No PRE CVM was changed."
               )
               raise SystemExit(1)
+
+          sys.path.insert(0, "backend")
+          os.environ["FEEDLING_DATABASE_SCHEMA"] = "tee"
+          os.environ["DATABASE_URL"] = os.environ["TEE_MIGRATION_DATABASE_URL"]
+
+          import db
+
+          db.init_schema()
+          print("PRE TEE application startup contract: ok")
           PY
 
       - name: Build and verify the content-addressed E2B template

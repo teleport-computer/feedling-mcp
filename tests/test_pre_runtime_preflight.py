@@ -8,6 +8,7 @@ from alembic.script import ScriptDirectory
 
 ROOT = Path(__file__).parent.parent
 WORKFLOW = ROOT / ".github" / "workflows" / "ci.yml"
+TEE_MIGRATE_WORKFLOW = ROOT / ".github" / "workflows" / "tee-migrate.yml"
 
 
 def test_tee_migrate_has_one_head_after_runtime_v2_alignment():
@@ -111,6 +112,22 @@ def test_preflight_blocks_tee_primary_deploy_before_mutating_a_cvm():
         "Require both Runtime V2 images before mutating either CVM"
     )
     assert schema_gate < image_gate
+
+
+def test_pre_release_gates_run_the_application_startup_contract():
+    preflight = _job(
+        WORKFLOW.read_text(),
+        "validate-pre-runtime-prerequisites",
+        "deploy-cvm",
+    )
+    tee_migrate = TEE_MIGRATE_WORKFLOW.read_text()
+
+    for source in (preflight, tee_migrate):
+        assert 'os.environ["FEEDLING_DATABASE_SCHEMA"] = "tee"' in source
+        assert 'os.environ["DATABASE_URL"] = os.environ["TEE_MIGRATION_DATABASE_URL"]' in source
+        assert "db.init_schema()" in source
+
+    assert "Assert PRE application startup contract" in tee_migrate
 
 
 def test_preflight_is_triggered_by_both_cvm_inventory_files():

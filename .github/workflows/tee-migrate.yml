@@ -131,3 +131,24 @@ jobs:
           print(f"code head={want} db={got}")
           assert got == want, f"alembic_tee 未落到 head: db={got} want={want}"
           PY
+
+      - name: Assert PRE application startup contract
+        if: ${{ inputs.environment == 'pre' }}
+        env:
+          PRE_DSN: ${{ secrets.PRE_TEE_MIGRATION_DSN }}
+        run: |
+          test -n "$PRE_DSN" || { echo "::error::pre 的 TEE_MIGRATION_DSN secret 为空或未创建"; exit 1; }
+          export TEE_MIGRATION_DATABASE_URL="${PRE_DSN}&sslrootcert=/tmp/tee-ca.crt"
+          python - <<'PY'
+          import os
+          import sys
+
+          sys.path.insert(0, "backend")
+          os.environ["FEEDLING_DATABASE_SCHEMA"] = "tee"
+          os.environ["DATABASE_URL"] = os.environ["TEE_MIGRATION_DATABASE_URL"]
+
+          import db
+
+          db.init_schema()
+          print("PRE application startup contract: ok")
+          PY

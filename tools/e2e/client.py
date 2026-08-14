@@ -521,8 +521,10 @@ class E2EClient:
         retried POST can never double-ingest (memory ring / wake side effects
         included — envelope-id dedup alone only covers the DB row)."""
         sent_at = time.time()
+        plaintext_envelope_id = str(uuid.uuid4())
         envelope = (
             {
+                "id": plaintext_envelope_id,
                 "body": text,
                 "owner_user_id": self.user_id,
                 "visibility": "shared",

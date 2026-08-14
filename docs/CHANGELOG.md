@@ -130,43 +130,6 @@
   `terminal_text_round`；`mcp.turn.usage.offered_tool_count` 同时标明它只是
   prompt 预算前的解析口径，避免再次把“解析出来”误判成“模型实际拿到”。
 
-## 2026-08-05 — Pre 明文用户 Runtime V2 Chat 启动失败修复
-
-### [DONE] Flight recorder 的二进制明文 wire 补齐
-
-- 根因：开启 `FEEDLING_PLAINTEXT_WRITES_ACCEPTED=1` 后，V2 trajectory 的 zlib
-  二进制载荷误走只接受 UTF-8 的普通明文信封构造器，第一条 `turn_started` 轨迹
-  即抛 `trajectory_encryption_failed:plaintext_body_not_utf8`，模型调用数始终为 0。
-- 修复：明文档 trajectory 用带版本前缀的 Base64 文本承载压缩字节，review 时
-  严格校验并还原；密文档继续使用原 `body_ct` 信封。新增二进制 round-trip 和
-  非法编码拒绝测试。
-
-## 2026-08-05 — Pre 明文/密文双线身份与记忆兼容修复
-
-### [DONE] 客户端展示、Runtime V2 上下文与回复写入形状重新对齐
-
-- Runtime V2 每轮同时读取 genesis persona 与当前 identity card，兼容 `body`
-  明文和 `body_ct` 密文，避免 agent 忘记自己的名称和身份。
-- iOS identity / memory 解码补齐结构化明文 `body`，旧密文解密路径保持不变，
-  修复身份缺失和记忆卡片全部显示「未分类」。
-- Pre backend、V2 serve-worker 与独立 V1 runner 统一开启明文写入 gate；runner
-  健康检查显式声明 1 个预期实例，避免 API 宣告 `effective=off` 时 worker 仍
-  fail-safe 回写密文，或健康接口因缺少期望数量配置而固定报错。
-- 记忆质量扫描同时识别 V1 `summary/content` 与 V2 `title/description` 字段，
-  不再把可用的存量明文记忆误报成 noisy。
-
-## 2026-07-31 — Pre 专用 TEE Postgres 开通并纳入发布链
-
-### [DONE] Pre 不再复用 test 影子库
-
-- 新建 `feedling-io-db-pre`（prod9 node 18、2 vCPU / 4GB、30GB），使用独立角色密码、
-  TLS CA/server 证书、WAL-G libsodium key 与 `pre/wal-g` 备份前缀。
-- schema 升至 `0009_provider_latency`（55 张表），app/replicator 的 CRUD + TRUNCATE
-  权限全量验证，monitoring 业务表负向权限验证通过。
-- 首次 base backup、direct-TLS、强制 WAL switch 与归档零失败均已验证。
-- pre compose/CI 接入独立 TEE DSN；PG deploy、TEE migrate、备份监控新增 pre lane。
-  双写默认关闭，等 pre 应用部署与连通验证后再开启回填。
-
 ## 2026-08-07 — 首页顶部人话总结
 
 **[FEEDBACK] Xyn：指标太复杂看不懂——首页第一行改成一句人话。**
@@ -388,6 +351,31 @@
   ~25ms vs 用户页 ~100ms（本地）。测试 296 通过；`test_asgi_admin` 两个
   parity 失败为存量（cache-note vs 旧断言，已另立任务）。
 
+## 2026-08-05 — Pre 明文用户 Runtime V2 Chat 启动失败修复
+
+### [DONE] Flight recorder 的二进制明文 wire 补齐
+
+- 根因：开启 `FEEDLING_PLAINTEXT_WRITES_ACCEPTED=1` 后，V2 trajectory 的 zlib
+  二进制载荷误走只接受 UTF-8 的普通明文信封构造器，第一条 `turn_started` 轨迹
+  即抛 `trajectory_encryption_failed:plaintext_body_not_utf8`，模型调用数始终为 0。
+- 修复：明文档 trajectory 用带版本前缀的 Base64 文本承载压缩字节，review 时
+  严格校验并还原；密文档继续使用原 `body_ct` 信封。新增二进制 round-trip 和
+  非法编码拒绝测试。
+
+## 2026-08-05 — Pre 明文/密文双线身份与记忆兼容修复
+
+### [DONE] 客户端展示、Runtime V2 上下文与回复写入形状重新对齐
+
+- Runtime V2 每轮同时读取 genesis persona 与当前 identity card，兼容 `body`
+  明文和 `body_ct` 密文，避免 agent 忘记自己的名称和身份。
+- iOS identity / memory 解码补齐结构化明文 `body`，旧密文解密路径保持不变，
+  修复身份缺失和记忆卡片全部显示「未分类」。
+- Pre backend、V2 serve-worker 与独立 V1 runner 统一开启明文写入 gate；runner
+  健康检查显式声明 1 个预期实例，避免 API 宣告 `effective=off` 时 worker 仍
+  fail-safe 回写密文，或健康接口因缺少期望数量配置而固定报错。
+- 记忆质量扫描同时识别 V1 `summary/content` 与 V2 `title/description` 字段，
+  不再把可用的存量明文记忆误报成 noisy。
+
 ## 2026-08-05 — Dream 阀门重构：拆内容闸、只留确定性「明显不对」闸（V1/V2 同步）
 
 **[DECISION]+[DONE] usr_a40e 墓碑卡事故复盘，Seven 定产品哲学：出口只拦「明显不对」，绝不判内容质量、绝不拒绝内容上的可能性。**
@@ -509,6 +497,18 @@
   副作用→V1 差异)、docs/RUNTIME_V2_PARITY.md(债务台账)。
 - 遗留(归 Seven):prod 放 V2/用户迁回、PROFILE 上 prod、chat_image_read
   P2、reminder 列表 API P2。
+
+## 2026-07-31 — Pre 专用 TEE Postgres 开通并纳入发布链
+
+### [DONE] Pre 不再复用 test 影子库
+
+- 新建 `feedling-io-db-pre`（prod9 node 18、2 vCPU / 4GB、30GB），使用独立角色密码、
+  TLS CA/server 证书、WAL-G libsodium key 与 `pre/wal-g` 备份前缀。
+- schema 升至 `0009_provider_latency`（55 张表），app/replicator 的 CRUD + TRUNCATE
+  权限全量验证，monitoring 业务表负向权限验证通过。
+- 首次 base backup、direct-TLS、强制 WAL switch 与归档零失败均已验证。
+- pre compose/CI 接入独立 TEE DSN；PG deploy、TEE migrate、备份监控新增 pre lane。
+  双写默认关闭，等 pre 应用部署与连通验证后再开启回填。
 
 ## 2026-07-31 — V2 照片唤醒按需读取真实图片
 

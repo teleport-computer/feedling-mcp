@@ -317,11 +317,15 @@ def test_send_chat_uses_plaintext_envelope_when_effective_off() -> None:
 
     client._http = CaptureHTTP()  # type: ignore[assignment]
     assert client.send_chat("plain hello") == 456.0
-    assert payloads[0]["envelope"] == {
+    envelope = payloads[0]["envelope"]
+    envelope_id = envelope.pop("id")
+    uuid.UUID(envelope_id)
+    assert envelope == {
         "body": "plain hello",
         "owner_user_id": "e2e-user",
         "visibility": "shared",
     }
+    assert client._failure_locators["trace_id"] == {envelope_id}
 
 
 def test_orphan_manifest_created_0600_and_removed_on_teardown(monkeypatch, tmp_path) -> None:
