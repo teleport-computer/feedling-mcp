@@ -2741,7 +2741,7 @@ def _read_memory_context(user_id: str, *, full_cards: bool = False) -> dict:
                     if not line:
                         continue
                     added_chars = len(line) + (1 if lines else 0)
-                    if lines and rendered_chars + added_chars > _DREAM_CARDS_MAX_CHARS:
+                    if rendered_chars + added_chars > _DREAM_CARDS_MAX_CHARS:
                         break
                     selected.append(item)
                     lines.append(line)
