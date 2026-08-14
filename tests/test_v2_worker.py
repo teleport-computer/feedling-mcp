@@ -1521,6 +1521,104 @@ def test_process_job_reply_skips_compaction_enqueue_when_under_budget(monkeypatc
     assert enqueue_calls == []
 
 
+def test_chat_uses_recent_profile_context_without_compact_dependencies(monkeypatch):
+    uid = "u_w_recent_profile_chat"
+    conftest.seed_user(uid)
+    _reset(uid)
+    jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("w")
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("conversation compact dependency was touched")
+
+    monkeypatch.setattr(worker.db, "chat_max_seq", lambda _uid: 20)
+    monkeypatch.setattr(
+        cap_registry,
+        "run_capability",
+        lambda *a, **k: _FakeCapResult({}),
+    )
+    monkeypatch.setattr(
+        worker,
+        "_write_encrypted_reply",
+        lambda store, text: {"id": "r"},
+    )
+    calls = _script_provider(monkeypatch, [_text_round("REPLY")])
+    recent_calls = []
+    recent_rows = [
+        {
+            "id": "m10",
+            "seq": 10,
+            "ts": 10.0,
+            "role": "user",
+            "content": "older user turn",
+            "_genuine_user": True,
+        },
+        {
+            "id": "m11",
+            "seq": 11,
+            "ts": 11.0,
+            "role": "assistant",
+            "content": "older assistant reply",
+            "_genuine_user": False,
+        },
+        {
+            "id": "m20",
+            "seq": 20,
+            "ts": 20.0,
+            "role": "user",
+            "content": "active user turn",
+            "_genuine_user": True,
+        },
+    ]
+    deps = worker.TurnDeps(
+        read_messages=lambda _uid: [recent_rows[-1]],
+        resolve_provider=lambda _uid: (_BYOK, {}),
+        mint_enclave_token=lambda _uid: "rt",
+        read_summary_with_seq=forbidden,
+        read_tail_after_seq=forbidden,
+        read_recent_turns=lambda user_id, max_turns, row_cap, **kwargs: (
+            recent_calls.append((user_id, max_turns, row_cap, kwargs))
+            or {"rows": recent_rows, "source_truncated": False}
+        ),
+        select_profile_for_turn=lambda _uid, **_kwargs: (
+            worker.v2_profile_store.ProfilePromptSelection(
+                memory="remembered relationship",
+                user="preferred interaction style",
+                state="last_good",
+            )
+        ),
+        apply_pending_effects=_apply_effects,
+    )
+
+    status = asyncio.run(
+        worker.process_job(
+            job,
+            deps,
+            provider_config=_BYOK,
+            api_key=None,
+            runtime_token="rt",
+        )
+    )
+
+    assert status == "completed"
+    assert recent_calls == [
+        (
+            uid,
+            40,
+            worker._RECENT_TURN_ROW_CAP,
+            {"through_seq": 20},
+        )
+    ]
+    rendered = "\n".join(
+        str(message.get("content") or "") for message in calls[0]["messages"]
+    )
+    assert "remembered relationship" in rendered
+    assert "preferred interaction style" in rendered
+    assert "older user turn" in rendered
+    assert "older assistant reply" in rendered
+    assert "active user turn" in rendered
+
+
 def test_semantic_compaction_api_is_removed():
     assert not hasattr(v2_compaction, "compact")
 

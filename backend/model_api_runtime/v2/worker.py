@@ -10493,150 +10493,46 @@ async def process_job(
             ordinal_counter=ordinal,
         )
 
-        # D1 base context (summary + tail), read once at loop entry.
-        seq_context = (
-            deps.read_summary_with_seq is not None
-            and deps.read_tail_after_seq is not None
-        )
+        # Read one frozen, bounded raw-Chat window plus the latest usable
+        # MEMORY/USER profile. Conversation summary coverage is not a turn
+        # dependency: Profile lag/failure yields an empty profile and Chat
+        # continues from recent turns.
         # This all-role upper bound controls prompt membership/de-duplication
         # only. The durable consumed-input frontier is kept separately in
         # `cursor_seq`/`cursor_box["seq"]` and may advance only from user|human
         # rows returned by initial coalescing or a round-boundary fold.
         prompt_snapshot_through_seq = int(cursor_seq or 0) if seq_native else 0
-        optional_tail_turns: list[list[dict]] = []
-        tail_source_truncated = False
-        agent_memory = ""
-        user_profile = ""
+        through_seq = await asyncio.to_thread(db.chat_max_seq, user_id)
+        prompt_snapshot_through_seq = max(
+            prompt_snapshot_through_seq,
+            int(through_seq),
+        )
+        recent_context = await _read_recent_prompt_context(
+            user_id=user_id,
+            deps=deps,
+            through_seq=through_seq,
+            target_turns=_CHAT_TAIL_MAX_TURNS,
+            required_from_seq=int(cursor_seq),
+            enclave_sem=enclave_sem,
+            trajectory_recorder=trajectory_recorder,
+            active_image_ids={
+                str(row.get("id") or "")
+                for row in coalesced
+                if row.get("has_image") and row.get("id")
+            },
+        )
+        summary = ""
+        tail = recent_context.required_tail
+        optional_tail_turns = recent_context.optional_turns
+        tail_source_truncated = recent_context.tail_source_truncated
+        agent_memory = recent_context.agent_memory
+        user_profile = recent_context.user_profile
         coverage_hole_notice = ""
-        through_seq = 0
-        compact_through_seq = None
-        optional_anchor_seq: int | None = None
-        if seq_context:
-            through_seq = await asyncio.to_thread(db.chat_max_seq, user_id)
-            oldest_retained_seed = await asyncio.to_thread(
-                db.chat_recent_genuine_turn_boundary_seq,
-                user_id,
-                max_turns=_CHAT_TAIL_MAX_TURNS,
-                through_seq=through_seq,
-            )
-            if oldest_retained_seed is not None and oldest_retained_seed > 1:
-                compact_through_seq = oldest_retained_seed - 1
-            # Tail-anchor bookkeeping is a pure optimization (stable prompt
-            # prefix / prompt-cache reuse) — never a correctness path. Any
-            # read/write failure here must degrade to the pre-anchor
-            # behavior (optional_anchor_seq=None), not fail the whole chat
-            # turn. Same best-effort shape as `_capture_turn_temporal_snapshot`.
-            try:
-                stored_anchor = await asyncio.to_thread(
-                    jobs_store.get_chat_tail_anchor, user_id
-                )
-                turns_after_anchor = (
-                    await asyncio.to_thread(
-                        db.chat_genuine_turn_count_after_seq,
-                        user_id,
-                        after_seq=int(stored_anchor),
-                        through_seq=through_seq,
-                    )
-                    if stored_anchor is not None
-                    else 0
-                )
-                # 滞后区内跳过最重的那次边界查询（仍需读锚点与计数）。
-                anchor_boundary_seq = None
-                if (
-                    stored_anchor is None
-                    or turns_after_anchor >= _CHAT_TAIL_ANCHOR_MAX_TURNS
-                ):
-                    anchor_boundary_seq = await asyncio.to_thread(
-                        db.chat_recent_genuine_turn_boundary_seq,
-                        user_id,
-                        max_turns=_CHAT_TAIL_MAX_TURNS,
-                        through_seq=through_seq,
-                    )
-                anchor_decision = v2_tail_anchor.decide_anchor(
-                    current_anchor=stored_anchor,
-                    turns_after_anchor=turns_after_anchor,
-                    boundary_seq_for_target=anchor_boundary_seq,
-                    target_turns=_CHAT_TAIL_MAX_TURNS,
-                    max_turns_before_advance=_CHAT_TAIL_ANCHOR_MAX_TURNS,
-                )
-                if anchor_decision.advanced and anchor_decision.anchor_seq > 0:
-                    await asyncio.to_thread(
-                        jobs_store.set_chat_tail_anchor,
-                        user_id,
-                        anchor_decision.anchor_seq,
-                    )
-                optional_anchor_seq = (
-                    anchor_decision.anchor_seq
-                    if anchor_decision.anchor_seq > 0
-                    else None
-                )
-            except Exception as exc:  # noqa: BLE001 — anchor bookkeeping is best-effort
-                log.warning(
-                    "[v2.worker] tail anchor bootstrap failed user=%s: %s",
-                    user_id,
-                    type(exc).__name__,
-                )
-                optional_anchor_seq = None
-        if seq_context:
-            # D6/Task 10: close a compaction backlog gap BEFORE reading the
-            # actual prompt content — see `_ensure_prompt_coverage`'s
-            # docstring. Common case (no gap) costs two cheap indexed reads
-            # and returns immediately without touching the enclave/LLM.
-            # Option A: degrade instead of failing the reply when catch-up can't
-            # finish — the bounded tail below carries the turn.
-            await _ensure_prompt_coverage_or_degrade(
-                user_id,
-                deps,
-                provider_config=provider_config,
-                enclave_sem=enclave_sem,
-                tail_limit=_TAIL_HARD_CAP,
-                job_id=job_id,
-                claimed_by=claimed_by,
-                add_usage=tm.add_call,
-                trajectory_recorder=trajectory_recorder,
-                compact_through_seq=compact_through_seq,
-            )
-            # The base tail already contains every row through this all-role
-            # snapshot. The fold still consumes user rows after the durable
-            # cursor, but suppresses duplicates through here.
-            prompt_snapshot_through_seq = max(
-                prompt_snapshot_through_seq,
-                int(through_seq),
-            )
-            (
-                summary,
+        if ordered_chat_replies:
+            tail = context.ordered_reply_tail(
                 tail,
-                optional_tail_turns,
-                tail_source_truncated,
-                watermark_seq,
-                agent_memory,
-                user_profile,
-                coverage_hole_notice,
-            ) = await _read_seq_adaptive_prompt_context(
-                user_id=user_id,
-                deps=deps,
-                through_seq=through_seq,
-                target_turns=_CHAT_TAIL_ANCHOR_MAX_TURNS,
-                provider_config=provider_config,
-                enclave_sem=enclave_sem,
-                claimed_by=claimed_by,
-                job_id=job_id,
-                add_usage=tm.add_call,
-                trajectory_recorder=trajectory_recorder,
-                active_image_ids={
-                    str(row.get("id") or "")
-                    for row in coalesced
-                    if row.get("has_image") and row.get("id")
-                },
-                tail_cap=_TAIL_HARD_CAP,
+                user_through_seq=int(cursor_seq),
             )
-            if ordered_chat_replies:
-                tail = context.ordered_reply_tail(
-                    tail,
-                    user_through_seq=int(cursor_seq),
-                )
-        else:
-            summary, tail = "", []
 
         worldbook_context = ""
         if lane == "chat" and deps.read_worldbook_context is not None:
@@ -12201,86 +12097,21 @@ async def process_job(
                 provider_config=provider_config,
                 temporal_snapshot=temporal_snapshot,
                 optional_tail_turns=optional_tail_turns,
-                tail_target_turns=(
-                    _CHAT_TAIL_MAX_TURNS if seq_context else None
-                ),
+                tail_target_turns=_CHAT_TAIL_MAX_TURNS,
                 tail_source_truncated=tail_source_truncated,
                 tail_lane=lane,
-                tail_anchor_seq=optional_anchor_seq,
                 screen_frame_message=screen_frame_message,
             )
 
         build_messages = _chat_builder()
-        if seq_context:
-            try:
-                _preflight_adaptive_builder(
-                    build_messages,
-                    provider_config=provider_config,
-                )
-            except v2_prompt_frontier.PromptFrontierExhausted:
-                tm.record_prompt_frontier_exhaustion()
-                pending_seqs = [
-                    int(row["seq"])
-                    for row in coalesced
-                    if row.get("seq") is not None
-                    and str(row.get("role") or "") in {"user", "human"}
-                ]
-                safe_through_seq = (
-                    min(pending_seqs) - 1 if pending_seqs else watermark_seq
-                )
-                if safe_through_seq <= watermark_seq:
-                    raise
-                await _ensure_prompt_coverage(
-                    user_id,
-                    deps,
-                    enclave_sem=enclave_sem,
-                    tail_limit=0,
-                    job_id=job_id,
-                    claimed_by=claimed_by,
-                    trajectory_recorder=trajectory_recorder,
-                    compact_through_seq=safe_through_seq,
-                )
-                (
-                    summary,
-                    tail,
-                    optional_tail_turns,
-                    tail_source_truncated,
-                    watermark_seq,
-                    agent_memory,
-                    user_profile,
-                    coverage_hole_notice,
-                ) = await _read_seq_adaptive_prompt_context(
-                    user_id=user_id,
-                    deps=deps,
-                    through_seq=through_seq,
-                    target_turns=_CHAT_TAIL_ANCHOR_MAX_TURNS,
-                    provider_config=provider_config,
-                    enclave_sem=enclave_sem,
-                    claimed_by=claimed_by,
-                    job_id=job_id,
-                    add_usage=tm.add_call,
-                    trajectory_recorder=trajectory_recorder,
-                    active_image_ids={
-                        str(row.get("id") or "")
-                        for row in coalesced
-                        if row.get("has_image") and row.get("id")
-                    },
-                    tail_cap=_TAIL_HARD_CAP,
-                )
-                if ordered_chat_replies:
-                    tail = context.ordered_reply_tail(
-                        tail,
-                        user_through_seq=int(cursor_seq),
-                    )
-                build_messages = _chat_builder()
-                try:
-                    _preflight_adaptive_builder(
-                        build_messages,
-                        provider_config=provider_config,
-                    )
-                except v2_prompt_frontier.PromptFrontierExhausted:
-                    tm.record_prompt_frontier_exhaustion()
-                    raise
+        try:
+            _preflight_adaptive_builder(
+                build_messages,
+                provider_config=provider_config,
+            )
+        except v2_prompt_frontier.PromptFrontierExhausted:
+            tm.record_prompt_frontier_exhaustion()
+            raise
 
         await _ensure_runtime_mode()
         await _renew_lease()
@@ -12456,17 +12287,6 @@ async def process_job(
             if durable_seq < cursor_box["seq"]:
                 raise RuntimeError("final reply cursor was not durably committed")
 
-        # 超预算 → best-effort 入队一个 maintenance lane 的压缩 job（不阻塞、不拖垮
-        # 本回合——enqueue_job 本身命中 single-flight 会 coalesce，失败只记日志）。
-        if tail and context.needs_compaction(tail, budget=_TAIL_BUDGET):
-            try:
-                await asyncio.to_thread(
-                    jobs_store.enqueue_job, user_id, "maintenance", reason="compaction"
-                )
-            except Exception as e:  # noqa: BLE001 — 压缩入队失败绝不能拖垮已经写成的这条回复
-                log.warning(
-                    "[v2.worker] enqueue compaction failed for %s: %s", user_id, e
-                )
         try:
             await _enqueue_profile_if_due(
                 user_id,
