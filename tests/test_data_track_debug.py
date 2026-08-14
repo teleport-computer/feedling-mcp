@@ -74,6 +74,31 @@ def test_memory_search_and_index_have_distinct_admin_labels():
     assert search != index
 
 
+def test_context_truncation_has_explicit_admin_label_and_visible_counts():
+    event = _event(
+        1,
+        "user_t047",
+        "context.truncation",
+        trace_id="t047",
+        status="warning",
+        detail={
+            "counts": {
+                "profile_cards_truncated": 1,
+                "worldbook_truncated": 0,
+            }
+        },
+    )
+
+    assert data_track._debug_friendly_step(event) == ("✂️", "上下文裁剪")
+    public = data_track._debug_event_public_json(event)
+    assert public["detail"] == {
+        "counts": {
+            "profile_cards_truncated": 1,
+            "worldbook_truncated": 0,
+        }
+    }
+
+
 def test_query_fingerprint_is_visible_but_plaintext_query_stays_redacted():
     fingerprint = "0123456789ab"
 
