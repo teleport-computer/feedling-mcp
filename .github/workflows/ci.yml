@@ -413,6 +413,7 @@ jobs:
             tests/test_v2_profile_lane.py \
             tests/test_v2_profile_prompt.py \
             tests/test_v2_profile_refresh.py \
+            tests/test_v2_profile_retry.py \
             tests/test_v2_profile_storage.py \
             tests/test_v2_reconcile.py \
             tests/test_v2_reconcile_sweeper.py \
