@@ -12,10 +12,10 @@
 
 - 有人用 `grep 'memory_search' tools/chat_resident_consumer.py → 0 命中` 论证
   「resident 侧没有这套逻辑」。**实测 `memory_search` 在 resident 侧出现 0 次,
-  `memory-search` 在 `io_cli.py` 也是 0 次** —— 那条 grep 不可能命中,
+  `memory-search` 在 `tools/io_cli.py` 也是 0 次** —— 那条 grep 不可能命中,
   它证明不了任何事。resident 侧对应的是 `memory-index` / `memory-fetch`。
 - 有人把 `occurred_at = now` 归因到 Runtime V2,实际先命中的是 resident consumer。
-- 有人把 `chat_resident_consumer.py` 直接叫「V1」——
+- 有人把 `tools/chat_resident_consumer.py` 直接叫「V1」——
   `docs/testing/README.md` 明写现在只剩两条路径:**Runtime V2** 和 **Resident / VPS**,
   「V1 托管已不再维护」。
 
@@ -51,15 +51,17 @@ git show origin/test:<file> | grep -n "<symbol>"
 - ⛔ **这一侧没有对应实现** —— 结论。后面写明我按哪些命名/路径找过才敢这么说
 - ❓ **我没找到** —— 状态,不是结论。不要当成「不存在」
 
+⚠️ 只作**附加提醒**,不是证据等级;每个事实格都必须带 ✅/⛔/❓ 之一。
+
 ---
 
 ## 一、记忆读
 
 | | Runtime V2 | Resident consumer |
 |---|---|---|
-| 索引/列表 | ✅ `capabilities/memory.py::index`(工具名 `memory_index`) | ✅ `io_cli.py::cmd_memory_index`(CLI 子命令 `memory-index`) |
-| 取全文 | ✅ `capabilities/memory.py::fetch`(工具名 `memory_fetch`) | ✅ `io_cli.py::cmd_memory_fetch`(`memory-fetch`) |
-| 搜索 | ✅ `capabilities/memory.py::search`(工具名 **`memory_search`**) | ⛔ **没有同名入口**。实测 `memory_search` 在 `chat_resident_consumer.py` 出现 0 次、`memory-search` 在 `io_cli.py` 出现 0 次;resident 侧要检索就是带 query 走 `memory-index` |
+| 索引/列表 | ✅ `backend/capabilities/memory.py::index`(工具名 `memory_index`) | ✅ `tools/io_cli.py::cmd_memory_index`(CLI 子命令 `memory-index`) |
+| 取全文 | ✅ `backend/capabilities/memory.py::fetch`(工具名 `memory_fetch`) | ✅ `tools/io_cli.py::cmd_memory_fetch`(`memory-fetch`) |
+| 搜索 | ✅ `backend/capabilities/memory.py::search`(工具名 **`memory_search`**) | ⛔ **没有同名入口**。实测 `memory_search` 在 `tools/chat_resident_consumer.py` 出现 0 次、`memory-search` 在 `tools/io_cli.py` 出现 0 次;resident 侧要检索就是带 query 走 `memory-index` |
 
 ⚠️ **这一行就是 2026-08-14 那次错误归因的现场。**用 `memory_search` 去 grep resident 侧,
 永远是 0,而那个 0 不代表 resident 没有检索能力。
@@ -68,25 +70,27 @@ git show origin/test:<file> | grep -n "<symbol>"
 
 | | Runtime V2 | Resident consumer |
 |---|---|---|
-| 模型侧写入 | ✅ `capabilities/memory.py::write`(工具名 `memory_write`,`op=add/update/delete`) | ✅ `io_cli.py::cmd_memory_write` / `cmd_memory_patch` / `cmd_memory_delete`(三个独立 CLI 子命令) |
-| 后台批量写 | ✅ `v2/serve_worker.py::_apply_memory_actions` | ✅ `chat_resident_consumer.py::execute_memory_actions` |
+| 模型侧写入 | ✅ `backend/capabilities/memory.py::write`(工具名 `memory_write`,`op=add/update/delete`) | ✅ `tools/io_cli.py::cmd_memory_write` / `cmd_memory_patch` / `cmd_memory_delete`(三个独立 CLI 子命令) |
+| 后台批量写 | ✅ `backend/model_api_runtime/v2/serve_worker.py::_apply_memory_actions` | ✅ `tools/chat_resident_consumer.py::execute_memory_actions` |
 
 **命名差异要点**:V2 把增/改/删收敛进**一个工具 + op 参数**;resident 侧是**三个 CLI 子命令**。
 所以「模型能不能删记忆」这个问题,两侧要查的东西完全不同。
-⚠️ 两侧最终都打到同一套 HTTP 端点(`/v1/memory/index|fetch|actions`),差别在调用方式
-(V2 进程内库调用,resident 是 HTTP 客户端)。**看到端点相同不等于行为相同。**
+⚠️ **两侧复用同一套 core 与数据契约,但调用方式不同**:V2 的 `backend/capabilities/memory.py`
+是 `backend/memory/memory_core.py` 的**进程内 facade**(直接调 `memory_core.index/fetch/actions`);
+resident 侧才是 HTTP 客户端,POST `/v1/memory/*`。
+**别写成「两侧都打同一个 HTTP 端点」——V2 不经过 HTTP。**
 
 ## 三、capture(对话中抓取记忆)
 
 | | Runtime V2 | Resident consumer |
 |---|---|---|
-| 执行入口 | ✅ `v2/worker.py::_run_extraction`(`lane == "capture"`) | ✅ `chat_resident_consumer.py::_process_capture_jobs` |
+| 执行入口 | ✅ `backend/model_api_runtime/v2/worker.py::_run_extraction`(`lane == "capture"`) | ✅ `tools/chat_resident_consumer.py::_process_capture_jobs` |
 
 ## 四、dream(整理已有记忆)
 
 | | Runtime V2 | Resident consumer |
 |---|---|---|
-| 执行入口 | ✅ `v2/worker.py::_run_extraction`(`lane == "dream"`,与 capture **同一个函数**,靠 lane 分流) | ✅ `chat_resident_consumer.py::_process_dream_jobs`(与 capture **是两个独立函数**) |
+| 执行入口 | ✅ `backend/model_api_runtime/v2/worker.py::_run_extraction`(`lane == "dream"`,与 capture **同一个函数**,靠 lane 分流) | ✅ `tools/chat_resident_consumer.py::_process_dream_jobs`(与 capture **是两个独立函数**) |
 
 ⚠️ **结构差异**:V2 的 capture 和 dream 是同一个函数的两个 lane,resident 侧是两个函数。
 所以"改 dream 会不会影响 capture"在两侧答案不同。
@@ -95,8 +99,8 @@ git show origin/test:<file> | grep -n "<symbol>"
 
 | | Runtime V2 | Resident consumer |
 |---|---|---|
-| capture | ✅ `v2/worker.py` `_run_extraction` 内:默认 `now`,再**倒序**扫 `prompt_tail` 取最后一条有 `ts` 的消息覆盖 | ✅ `chat_resident_consumer.py::_capture_occurred_at`:优先 `job.window.until_ts` → 否则最后一条消息 ts → 否则 `time.time()` |
-| dream | 同上(走同一函数) | ✅ `_process_dream_jobs` 内直接 `time.time()`,**不看历史消息** |
+| capture | ✅ `backend/model_api_runtime/v2/worker.py` `_run_extraction` 内:默认 `now`,再**倒序**扫 `prompt_tail` 取最后一条有 `ts` 的消息覆盖 | ✅ `tools/chat_resident_consumer.py::_capture_occurred_at`:优先 `job.window.until_ts` → 否则最后一条消息 ts → 否则 `time.time()` |
+| dream | ✅ 同上(与 capture 走同一函数) | ✅ `_process_dream_jobs` 内直接 `time.time()`,**不看历史消息** |
 
 ⚠️ **两侧逻辑独立,不是一份代码。**排查 `occurred_at` 异常时先确定这个用户走哪条路径,
 否则会像 2026-08-14 那次一样改错地方。
@@ -105,7 +109,7 @@ git show origin/test:<file> | grep -n "<symbol>"
 
 | | Runtime V2 | Resident consumer |
 |---|---|---|
-| 机制 | ✅ `v2/tool_loop.py::_turn_catalog` —— **作为结构化 tools 参数传给 provider**,每轮重算、按 `disabled_names` 过滤 | ✅ `tools/io_cli_catalog.py::build_catalog` + `chat_resident_consumer.py::_prepend_io_cli_capability_catalog` —— **没有 tools 参数,是把 `io_cli --help` 生成的目录文本前置进 prompt** |
+| 机制 | ✅ `backend/model_api_runtime/v2/tool_loop.py::_turn_catalog` —— **作为结构化 tools 参数传给 provider**,每轮重算、按 `disabled_names` 过滤 | ✅ `tools/io_cli_catalog.py::build_catalog` + `tools/chat_resident_consumer.py::_prepend_io_cli_capability_catalog` —— **Feedling 不为 io_cli catalog 构造/传 provider tools 数组**,而是把 `io_cli --help` 生成的目录文本前置进 prompt(⚠️ 底层 claude/codex/pi agent 自己仍有原生工具,别读成「resident 完全没有 tools」) |
 
 ⚠️ **这是全表差异最大的一格。**两侧不是"同一件事的不同实现",是**两种机制**:
 V2 走 provider 原生 tool-calling;resident 侧靠"在提示词里告诉模型有哪些命令可用"。
@@ -116,10 +120,10 @@ V2 走 provider 原生 tool-calling;resident 侧靠"在提示词里告诉模型�
 
 | 出口 | Runtime V2 | Resident consumer |
 |---|---|---|
-| 前台聊天 | ✅ `v2/worker.py` chat lane `_on_reply` 内调 `self_thinking.strip_all_thinking` | ✅ `chat_resident_consumer.py::_split_tagged_thinking` 内调 `_st.strip_all_thinking(raw, sanitize=False)` |
-| 主动/唤醒 | ✅ `v2/worker.py` wake lane `_on_reply` 内调 `_st_wake.strip_all_thinking` | ❓ 未单独确认 resident 侧主动消息是否复用同一条剥离路径 |
-| 喂回模型的历史 | ✅ `v2/serve_worker.py::_scrub_leaked_thinking_rows` | ❓ 未确认 |
-| 协议残片抑制 | ✅ chat/wake 两个 lane 各有 `_torn_protocol_evidence` 判定 | ✅ `chat_resident_consumer.py::_suppress_torn_protocol_leaks` |
+| 前台聊天 | ✅ `backend/model_api_runtime/v2/worker.py` chat lane `_on_reply` 内调 `self_thinking.strip_all_thinking` | ✅ `tools/chat_resident_consumer.py::_split_tagged_thinking` 内调 `_st.strip_all_thinking(raw, sanitize=False)` |
+| 主动/唤醒 | ✅ `backend/model_api_runtime/v2/worker.py` wake lane `_on_reply` 内调 `_st_wake.strip_all_thinking` | ✅ 复用同一条链:`_process_proactive_jobs` → `_split_agent_turn` → `_agent_turn_from_obj` → `_split_tagged_thinking` → `core/self_thinking.py::strip_all_thinking`(codex3 实测:喂 `<think>private</think>visible`,messages 只剩 `['visible']`) |
+| 喂回模型的历史 | ✅ `backend/model_api_runtime/v2/serve_worker.py::_scrub_leaked_thinking_rows` | ⛔ **没有 replay 期的二次剥离**。`_clean_messages_for_proactive_context` → `_message_text_for_context` 只压空白 + 截 500 字;codex3 实测直接喂历史行,原样得到 `<think>old private</think>old visible` |
+| 协议残片抑制 | ✅ chat/wake 两个 lane 各有 `_torn_protocol_evidence` 判定 | ✅ `tools/chat_resident_consumer.py::_suppress_torn_protocol_leaks` |
 
 ⚠️ **共享内核**:两侧的 `<think>` 剥离都调 `core/self_thinking.py` 的同一个
 `strip_all_thinking`,**判据共享、调用点各自独立**。所以「闸有没有生效」要分两问:
@@ -132,8 +136,8 @@ V2 走 provider 原生 tool-calling;resident 侧靠"在提示词里告诉模型�
 
 | | Runtime V2 | Resident consumer(由托管侧 agent-runner 生成家目录时) |
 |---|---|---|
-| 取出 | ✅ `v2/serve_worker.py::_load_genesis_persona`(逐回合 JIT 解密 `genesis_persona` blob) | ✅ `agent_runtime/spawners.py`:`_genesis_persona_content` 读同一个 blob,交给 `materialize_home(persona_content=...)` |
-| **拼进最终提示的位置** | ⚠️ **人格在后**。`v2/context.py` 里 `trusted_parts = [system_prompt, _RUNTIME_CONTEXT_POLICY]`,**之后**才 extend 人格块 | ⚠️ **人格在前**。`spawners.py`:`system_append = f"{persona}\n\n---\n\n{system_append}"`,工具说明追加在后;identity block 再置于 persona 之前 |
+| 取出 | ✅ `backend/model_api_runtime/v2/serve_worker.py::_load_genesis_persona`(逐回合 JIT 解密 `genesis_persona` blob) | ✅ `backend/agent_runtime/spawners.py`:`_genesis_persona_content` 读同一个 blob,交给 `materialize_home(persona_content=...)` |
+| **拼进最终提示的位置** | ✅(实测)**人格在后**。`backend/model_api_runtime/v2/context.py` 里 `trusted_parts = [system_prompt, _RUNTIME_CONTEXT_POLICY]`,**之后**才 extend 人格块 | ✅(实测)**人格在前**。`backend/agent_runtime/spawners.py`:`system_append = f"{persona}\n\n---\n\n{system_append}"`,工具说明追加在后;identity block 再置于 persona 之前 |
 
 **这一格是整张表最值得看的一格。**两侧都有 persona、都不截断、blob 也是同一个 ——
 **所有"有没有"式的对照都会得出"parity 正常"**,而真实差异在**排第几**。
@@ -161,18 +165,26 @@ s = msgs[0]["content"]; print(len(s), s.find("<<<PERSONA-SENTINEL>>>"))
 
 | | Runtime V2 | Resident consumer |
 |---|---|---|
-| 执行入口 | ✅ `v2/worker.py::_run_wake`(lane = heartbeat/scheduled/manual_wake/screen_watch) | ✅ `chat_resident_consumer.py::_process_proactive_jobs` |
-| 拉取/触发 | 由 job 队列驱动 | ✅ `chat_resident_consumer.py` 轮询循环里按 `PROACTIVE_TICK_ENABLED` 打 tick,决策由后端下发 |
+| 执行入口 | ✅ `backend/model_api_runtime/v2/worker.py::_run_wake`(lane = heartbeat/scheduled/manual_wake/screen_watch) | ✅ `tools/chat_resident_consumer.py::_process_proactive_jobs` |
+| 拉取/触发 | ✅ 由 job 队列驱动(`agent_jobs`) | ✅ `tools/chat_resident_consumer.py` 轮询循环里按 `PROACTIVE_TICK_ENABLED` 打 tick,决策由后端下发 |
 
-⚠️ **两侧都不是自己决定"要不要开口"** —— 决策在后端下发,consumer/worker 是执行者。
-排查「不该说话时说了」不要从这两个入口找,要往上游的决策/闸走。
+⚠️ **「要不要开口」不是一个决定,是两层,排查前先分清是哪一层坏了**:
+
+| 层 | 谁决定 | 排查去哪 |
+|---|---|---|
+| **① 要不要启动这一轮** | 后端(创建/下发一个 wake job) | 上游的调度与闸,不在本表这两个入口里 |
+| **② 这一轮最终有没有可见气泡** | **本地** —— 模型可能选择沉默/空回复,还要过本地闸 | ✅ V2:`backend/model_api_runtime/v2/worker.py` wake lane `_on_reply`(SILENT/FAILED 分支)<br>✅ resident:`tools/chat_resident_consumer.py::_proactive_chat_collision` 等本地闸 |
+
+所以「不该说话时说了」要查 ①,「该说话时没说」多半在 ② ——
+**把两层混成一句"决策在上游",会让人把 ② 的问题全赶去上游白找。**
+(这一条是 codex3 审计时纠正的,原文写成了"两侧都不是自己决定",太绝对。)
 
 ---
 
 ## 已知的坑(这些是我们真的踩过的)
 
 1. **只 grep `backend/` 会得到假的「resident 侧没有」。**
-   resident 侧的实现大量在 **`tools/`** 下(`chat_resident_consumer.py`、`io_cli.py`、
+   resident 侧的实现大量在 **`tools/`** 下(`tools/chat_resident_consumer.py`、`tools/io_cli.py`、
    `io_cli_catalog.py`)。2026-08-14 我据此错判「V1 整条没有剥离闸」,
    实际闸就在 `tools/chat_resident_consumer.py`。
    **做对照时 grep 范围必须含 `tools/`。**
