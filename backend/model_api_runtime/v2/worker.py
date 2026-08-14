@@ -24,7 +24,7 @@ this module so the worker never imports the hosted layer.
 并发：asyncio 事件循环 + asyncio.to_thread 把同步 jobs_store/enclave 调用移出 loop。
 四种 provider wire 全部 await 原生 async HTTP transport；provider 并发不再受默认线程池
 大小限制。
-ENCLAVE_SEMAPHORE 框住 turn 里所有 enclave-bound 调用（provider-key 解密 + 逐条 chat 解密
+父进程实例级 Enclave broker 框住 turn 里所有 enclave-bound 调用（provider-key 解密 + 逐条 chat 解密
 + capability 调用），治 spec R3。enclave 不是单线程（prod = 4 个 gunicorn worker，每个
 32 线程解密池），但它是全系统共享、容量有限、且解密 GIL-bound 的代理——多 worker 齐打
 照样会放大 502，闸门因此仍然必要。
@@ -46,7 +46,6 @@ import posixpath
 import re
 import threading
 import time
-import unicodedata
 from concurrent.futures import CancelledError as FutureCancelledError
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, replace
@@ -73,8 +72,10 @@ from capabilities import tool_schema as cap_tool_schema
 from core import chat_activity as core_chat_activity
 from core import envelope as core_envelope
 from core import protocol_leak
+from core import tool_markup_leak
 from core import util as core_util
 from core import provider_usage
+from core import self_thinking
 from core import store as core_store
 from core import wake_bus as core_wake_bus
 from core.downloadable_reply import sanitize_downloadable_reply
@@ -98,6 +99,7 @@ from model_api_runtime.v2 import effect_id as v2_effect_id
 from model_api_runtime.v2 import executor as v2_executor
 from model_api_runtime.v2 import extraction as v2_extraction
 from model_api_runtime.v2 import jobs_store
+from model_api_runtime.v2 import slot_protocol
 from model_api_runtime.v2 import kill_switch
 from model_api_runtime.v2 import model_identity as v2_model_identity
 from model_api_runtime.v2 import web_gate as v2_web_gate
@@ -284,11 +286,6 @@ def _positive_float_env(name: str, default: str) -> float:
     return value
 
 
-# —— 三个有界闸 ——（spec §6）
-# 每进程并发 job 数（= 并发回合数）。线上多进程 × CVM 共抢同一张 agent_jobs → 线性扩容。
-MAX_WORKERS = _positive_int_env("FEEDLING_V2_MAX_WORKERS", "4")
-
-
 # Capture is the one provider path whose disclosure lifetime is deliberately
 # coupled to a synchronous PostgreSQL transaction: D4, consent, Chat Clear, and
 # runtime-generation locks must stay held until the async provider attempt (and
@@ -303,13 +300,9 @@ _capture_provider_guard_executor_size = 0
 
 
 def _capture_provider_guard_pool_size() -> int:
-    try:
-        size = int(MAX_WORKERS)
-    except (TypeError, ValueError) as exc:
-        raise RuntimeError("FEEDLING_V2_MAX_WORKERS must be a positive integer") from exc
-    if size <= 0:
-        raise RuntimeError("FEEDLING_V2_MAX_WORKERS must be a positive integer")
-    return size
+    """Return the dedicated Capture guard size for this one-slot process."""
+
+    return 1
 
 
 def _reset_capture_provider_guard_executor_after_fork() -> None:
@@ -537,9 +530,15 @@ HISTORY_TURN_MAX_ROWS = _positive_int_env("FEEDLING_V2_HISTORY_TURN_MAX_ROWS", "
 HISTORY_TURN_MAX_WALL_SEC = _positive_float_env(
     "FEEDLING_V2_HISTORY_TURN_MAX_WALL_SEC", "8"
 )
-# 跨所有 job 共享的 enclave 并发闸（provider-key 解密 + chat 解密 + capability 调用都过它）。治 R3。
-ENCLAVE_CONCURRENCY = _positive_int_env("FEEDLING_V2_ENCLAVE_CONCURRENCY", "2")
-ENCLAVE_SEMAPHORE = asyncio.Semaphore(ENCLAVE_CONCURRENCY)
+# Production children receive one instance-wide broker-backed gate from
+# ``turn_child``. Direct helper tests that omit a gate get a private one below;
+# no process-global permit count is multiplied across isolated slot processes.
+_DEFAULT_ENCLAVE_GATE = object()
+
+
+def _new_direct_enclave_gate():
+    """Compatibility gate for direct helper calls outside the slot runtime."""
+    return asyncio.Semaphore(1)
 
 
 def _reserved_lane_slots(max_workers: int, reserved: int | None = None) -> list:
@@ -897,6 +896,12 @@ _SCHEDULED_WAKE_SYSTEM_PROMPT = (
     "do not greet the user, do not ask what they need, and do not replace the reminder "
     "with a generic check-in."
 )
+_SCHEDULED_WAKE_EMPTY_RESPONSE_CORRECTION = (
+    "The due scheduled reminder still has not been delivered. Read every item in "
+    "runtime_data.scheduled_wakes and return non-empty visible text that naturally "
+    "conveys every reminder now. Do not stay silent, do not return only thinking, "
+    "and do not answer an older conversation turn instead."
+)
 # screen_watch lane (Task 3): a wake grounded on recent shared-screen frames rather
 # than an ambient perception glance. Its own system prompt sits beside
 # _WAKE_SYSTEM_PROMPT; _run_wake selects it only for lane=="screen_watch". The
@@ -1005,13 +1010,10 @@ def _coverage_incomplete_reason(reject_code: str = "") -> str:
     return f"{_COVERAGE_INCOMPLETE}:{code}"[:110]
 
 
-def _is_degenerate_reply(text: Any) -> bool:
-    """Return true for empty or punctuation/separator-only provider output."""
-    for char in str(text or ""):
-        category = unicodedata.category(char)
-        if category[0] in {"L", "N"} or category == "So":
-            return False
-    return True
+# Compatibility name retained for existing parity tests/callers; the predicate
+# itself lives in core so the markup fallback and the worker delivery gate can
+# never drift apart.
+_is_degenerate_reply = tool_markup_leak.is_degenerate_visible_text
 
 
 class DedicatedVisionUnavailable(RuntimeError):
@@ -1156,7 +1158,7 @@ def _turn_failure_error_class(exc: BaseException) -> str:
             return "unknown"
         return "context_overflow"
     if isinstance(exc, (asyncio.TimeoutError, TimeoutError)):
-        return "turn_timeout"
+        return "provider_timeout"
     if (
         isinstance(exc, v2_tool_loop.ProviderEmptyReply)
         or (isinstance(exc, TurnError) and str(exc) == "empty_reply")
@@ -1194,7 +1196,7 @@ def _turn_failure_error_class(exc: BaseException) -> str:
     if status_code in {400, 422}:
         return "provider_incompatible"
     if status_code == 408:
-        return "turn_timeout"
+        return "provider_timeout"
     if status_code == 429:
         return "rate_limited"
     if isinstance(status_code, int) and 500 <= status_code <= 599:
@@ -1273,9 +1275,11 @@ class TurnDeps:
     # metadata plus decrypted rows. A turn starts at a genuine user row and
     # includes every following row before the next genuine user seed.
     read_recent_turns: Callable[..., dict] | None = None
-    # (user_id, through_seq|None) -> {"timezone","last_user_message_ts"}.
-    # Production resolves registry timezone -> perception fallback -> UTC and
-    # bounds the genuine-user timestamp to the turn's frozen prompt frontier.
+    # (user_id, through_seq|None) -> timezone, locale/archive-language hints,
+    # and last_user_message_ts. Production resolves registry timezone ->
+    # perception fallback -> China default and bounds the genuine-user timestamp
+    # to the turn's frozen prompt frontier. Language hints localize only the
+    # derived calendar labels; they do not add user content to this snapshot.
     read_temporal_snapshot: Callable[..., dict] | None = None
     # Wake-only content-free social-attention metadata. Kept separate from the
     # ordinary temporal reader so foreground Chat does not pay an extra count
@@ -1352,9 +1356,11 @@ class TurnDeps:
     # (user_id, call_id) -> 归档的通话全文明文。缺省 None = 不展开通话卡
     # （老部署/测试注入）。生产实现在 serve_worker,走 enclave 解密。
     read_voice_transcript: Callable[[str, str], str] | None = None
-    # user_id -> (all rendered Garden cards, exact card count). Unlike
-    # read_memory_context this is fail-loud and rejects any truncated read.
-    read_profile_cards: Callable[[str], tuple[str, int]] | None = None
+    # user_id -> (all rendered Garden cards, exact card count, content-free
+    # tail-window metadata). Unlike read_memory_context this is fail-loud and
+    # rejects any truncated cardinality read; bounded per-card content remains
+    # observable through the metadata.
+    read_profile_cards: Callable[..., tuple[str, int, dict]] | None = None
     # (user_id, summary, enabled=...) -> ProfilePromptSelection. Production
     # performs a strict blob read and scoped enclave decrypt; any failure keeps
     # the rollback-compatible summary and returns a content-free reason.
@@ -1416,7 +1422,7 @@ class TurnDeps:
     # of an empty pending set; the field exists so the call site is already wired
     # ahead of the producer landing.
     apply_pending_effects: Callable[[str], dict] | None = None
-    # (user_id, *, msg_id, body, is_wake, lane) -> None：把本回合最后一条已落库回复的
+    # (user_id, *, msg_id, body, is_wake, lane) -> bool：把本回合最后一条已落库回复的
     # 明文正文交给 backend 发 APNs（serve-worker 容器没有 APNs 私钥，只有 backend
     # 有）。best-effort：实现方吞掉自身异常，调用点也再兜一层 —— 推送失败绝不能
     # 把一个已经成功发布回复的回合打成 failed。None（所有不接线的测试/legacy
@@ -1425,7 +1431,14 @@ class TurnDeps:
     # 真实 wake source，对齐 V1 `_proactive_delivery_decision_v2` 从 job 推 manual
     # 的做法 —— 之前这里硬编码 source="heartbeat"/manual=False，导致关了
     # reminders_delivery 的用户在 V2 手动唤醒收不到推送（V1 会走 manual_bypass）。
-    send_reply_push: Callable[..., None] | None = None
+    # 返回 True 只表示 APNs 接受了 alert（设备专注/静音/通知设置不可见，是实际响铃的
+    # 上界）；任何关闭、前台压制、无 token、出网失败都返回 False。chat lane 忽略该
+    # 返回值；wake lane 只把它写入决策后的影子观测，绝不回灌判据。
+    send_reply_push: Callable[..., bool] | None = None
+    # (user_id, *, job_id, lane, decision_allowed, apns_alert_sent, decided_at) -> bool。
+    # A′ 只写后验、content-free 观测；生产装配把用户时区转换成本地日/时/分再持久化。
+    # 回调缺失或失败都不得改变回合结果。
+    record_wake_shadow_decision: Callable[..., bool] | None = None
     # Final voice replies cross from the worker to the public Custom LLM gateway
     # through a narrow internal endpoint. The callback receives routing ids plus
     # plaintext only in memory; the backend encrypts it before temporary storage.
@@ -1805,15 +1818,137 @@ def _mcp_mutating_names_for_turn(mcp_turn) -> frozenset[str]:
 
 def _mcp_turn_usage_detail(
     offered_names: Iterable[str], called_names: Iterable[str]
-) -> dict[str, int]:
-    """Content-free MCP usage counts for one chat turn."""
+) -> dict[str, Any]:
+    """Content-free MCP usage counts for one chat turn.
+
+    ``offered_tool_count`` is retained for trace compatibility, but its lens is
+    explicit: this is the turn-start resolved surface before prompt-frontier or
+    terminal-round filtering. ``mcp.surface.provider`` records what each actual
+    provider request received.
+    """
     offered = {str(name) for name in offered_names if str(name)}
     calls = [str(name) for name in called_names if str(name)]
     return {
         "offered_tool_count": len(offered),
+        "offered_tool_count_lens": "turn_resolved_before_provider_budget",
         "called_tool_count": len(set(calls)),
         "call_count": len(calls),
     }
+
+
+def _provider_tool_surface_callback(
+    deps: TurnDeps,
+    user_id: str,
+    lane: str,
+):
+    """Build a best-effort plaintext-count trace sink for one runtime lane."""
+
+    if deps.emit_debug_trace is None:
+        return None
+
+    async def _emit(detail: dict[str, Any]) -> None:
+        trace_detail = {"lane": lane, **dict(detail)}
+        if lane != "chat":
+            trace_detail["wake_kind"] = lane
+        await asyncio.to_thread(
+            deps.emit_debug_trace,
+            user_id,
+            "mcp.surface.provider",
+            status=(
+                "warning"
+                if trace_detail["dropped_tool_count"]
+                else "ok"
+            ),
+            summary=(
+                f"Provider 实收 {trace_detail['sent_tool_count']} 个工具,"
+                f"裁剪 {trace_detail['dropped_tool_count']} 个"
+            ),
+            explain=(
+                "记录每次 provider 请求真正携带的工具数量;不记录工具参数、"
+                "返回值或用户内容。"
+            ),
+            detail=trace_detail,
+        )
+
+    return _emit
+
+
+_CONTEXT_TRUNCATION_TRACE_EVENT = "context.truncation"
+_CONTEXT_TRUNCATION_COUNT_KEYS = (
+    "profile_cards_truncated",
+    "worldbook_truncated",
+)
+
+
+def _emit_context_truncation_trace(
+    deps: TurnDeps,
+    user_id: str,
+    provider_request: dict | None,
+) -> None:
+    """Emit one content-free admin event for a real provider-input clip.
+
+    Profile truncation arrives in the final provider request's tail-window
+    metadata. World Book truncation is also derived from the final messages,
+    because compatibility callers without an adaptive tail window still apply
+    the shared World Book cap. Keeping both as integer counters lets the admin
+    redactor pass them without opening a string field that could later carry
+    card or World Book content.
+    """
+
+    if deps.emit_debug_trace is None or not isinstance(provider_request, dict):
+        return
+    tail_window = provider_request.get("tail_window")
+    tail_window = tail_window if isinstance(tail_window, dict) else {}
+    counts = {
+        key: int(bool(tail_window.get(key)))
+        for key in _CONTEXT_TRUNCATION_COUNT_KEYS
+    }
+    for message in provider_request.get("messages") or ():
+        if not isinstance(message, dict):
+            continue
+        content = message.get("content")
+        if not isinstance(content, str):
+            continue
+        if (
+            content.startswith(context.WORLD_BOOK_CONTEXT_HEADER + "\n")
+            and context.WORLD_BOOK_TRUNCATION_MARKER in content
+        ):
+            counts["worldbook_truncated"] = 1
+            break
+    if not any(counts.values()):
+        return
+    try:
+        deps.emit_debug_trace(
+            user_id,
+            _CONTEXT_TRUNCATION_TRACE_EVENT,
+            status="warning",
+            summary="",
+            explain="",
+            detail={"counts": counts},
+        )
+    except Exception as exc:  # noqa: BLE001 — observability cannot fail a turn
+        log.warning(
+            "[v2.truncation_trace] emit failed user=%s code=%s",
+            user_id,
+            type(exc).__name__.lower(),
+        )
+
+
+def _tail_window_callback(
+    tm: "TurnMetrics | None",
+):
+    """Record tail-window metrics at the final provider window."""
+
+    if tm is None:
+        return None
+
+    def _record(item: dict) -> None:
+        tm.record_tail_window(
+            effective_turns=item["effective_turns"],
+            fallback=item["fallback"],
+        )
+
+    return _record
 
 
 async def _dispatch_mixed_tool_calls(
@@ -2721,7 +2856,12 @@ async def _record_trajectory(
     return recorded
 
 
-def _ledger_tapped_sink(recorder: v2_trajectory.TrajectoryRecorder | None):
+def _ledger_tapped_sink(
+    recorder: v2_trajectory.TrajectoryRecorder | None,
+    *,
+    deps: TurnDeps | None = None,
+    user_id: str = "",
+):
     """`recorder.record` plus the plaintext ledger mirror, for tool_loop.
 
     The foreground turn's provider calls reach the trajectory through
@@ -2729,12 +2869,20 @@ def _ledger_tapped_sink(recorder: v2_trajectory.TrajectoryRecorder | None):
     the latter would leave the lane that actually answers the user — the one
     whose failures the user sees — missing from the ledger.
     """
-    if recorder is None:
+    if recorder is None and (deps is None or deps.emit_debug_trace is None):
         return None
 
     async def _record(event_kind: str, payload: dict) -> None:
-        await recorder.record(event_kind, payload)
-        await _mirror_provider_attempt(recorder, event_kind, payload)
+        if recorder is not None:
+            await recorder.record(event_kind, payload)
+            await _mirror_provider_attempt(recorder, event_kind, payload)
+        if event_kind == "provider_request" and deps is not None:
+            await asyncio.to_thread(
+                _emit_context_truncation_trace,
+                deps,
+                user_id,
+                payload,
+            )
 
     return _record
 
@@ -2818,6 +2966,15 @@ def _v2_tool_trace_detail(
         "result_status": "err" if failed else "ok",
         "result_kind": result_kind,
     }
+    if (
+        tool in {"memory_index", "memory_search"}
+        and isinstance(metadata, dict)
+        and metadata.get("memory_discovery_reused") is True
+    ):
+        # This result never reached the capability dispatcher: the turn-level
+        # discovery deduper reused an earlier result. Preserve that edge as a
+        # content-free boolean so admin can distinguish it from a real search.
+        detail["memory_discovery_reused"] = True
     if duration_ms is not None:
         detail["dur_ms"] = duration_ms
     if failed:
@@ -3062,6 +3219,7 @@ async def _run_trajectory_review_turn(
     job: dict,
     deps: TurnDeps,
     tm: TurnMetrics,
+    enclave_sem=None,
 ) -> str:
     """Offline failure review with a deliberately absent side-effect surface.
 
@@ -3070,6 +3228,8 @@ async def _run_trajectory_review_turn(
     workspace writer to accidentally invoke. The provider receives tools=None
     exactly once; its encrypted analysis is stored only on the review row.
     """
+    if enclave_sem is None:
+        enclave_sem = _new_direct_enclave_gate()
     job_id = job["id"]
     user_id = str(job["user_id"])
     claimed_by = str(job.get("claimed_by") or "")
@@ -3146,7 +3306,7 @@ async def _run_trajectory_review_turn(
             raise RuntimeError("trajectory_codec_unavailable")
 
         _report_turn_progress("trajectory_review_provider_resolve_start")
-        async with ENCLAVE_SEMAPHORE:
+        async with enclave_sem:
             provider_config, _meta = await asyncio.to_thread(
                 deps.resolve_provider,
                 user_id,
@@ -3177,7 +3337,7 @@ async def _run_trajectory_review_turn(
         decoded_events: list[dict] = []
         for row in rows:
             await _review_fence("trajectory_review_decrypt_start")
-            async with ENCLAVE_SEMAPHORE:
+            async with enclave_sem:
                 plaintext = await asyncio.to_thread(
                     deps.open_trajectory_payload,
                     user_id,
@@ -3496,7 +3656,7 @@ def _make_fold_new_messages(
     user_id: str,
     deps: TurnDeps,
     cursor_box: dict,
-    enclave_sem: "asyncio.Semaphore | None" = ENCLAVE_SEMAPHORE,
+    enclave_sem=_DEFAULT_ENCLAVE_GATE,
     *,
     prompt_through_seq: int | None = None,
 ) -> Callable[[], Awaitable[list[dict]]]:
@@ -3521,9 +3681,9 @@ def _make_fold_new_messages(
     R3). This closure must do the same: it is called once per round by
     `tool_loop.run_tool_loop`, which `await`s it, so calling the sync reader directly here
     (no thread offload, no semaphore) would block the loop thread for the enclave round-trip
-    AND let concurrent workers hit the shared, capacity-bounded enclave ungated. `enclave_sem` defaults
-    to the module-level `ENCLAVE_SEMAPHORE` (the same shared gate `process_job` uses); tests
-    that want to exercise the closure with no gating pass `enclave_sem=None` (mirrors
+    AND let concurrent workers hit the shared, capacity-bounded enclave ungated. Production
+    passes the broker-backed turn gate explicitly; direct tests get a private gate unless they
+    pass `enclave_sem=None` to exercise the no-gate compatibility path (mirrors
     `_coalesce_inputs`/`_cap_data`'s own `enclave_sem is None` no-gate tolerance).
 
     `cursor_box` is a mutable `{"seq": int, "ts": float}` dict the caller owns and shares with
@@ -3548,6 +3708,9 @@ def _make_fold_new_messages(
     tie or a late-arriving earlier-ts message could strand a message below the boundary
     forever; that ts fragility is exactly the D5 no-reply bug this seq wiring fixes).
     """
+
+    if enclave_sem is _DEFAULT_ENCLAVE_GATE:
+        enclave_sem = _new_direct_enclave_gate()
 
     async def fold_new_messages() -> list[dict]:
         seq_native = "seq" in cursor_box
@@ -3647,6 +3810,7 @@ def _make_build_messages_fn(
     tail_lane: str = "",
     tail_anchor_seq: int | None = None,
     application_data_role: str = "user",
+    proactive_turn_boundary: bool = False,
     manual_wake: bool = False,
     screen_frame_message: dict[str, Any] | None = None,
 ) -> Callable[[list], list]:
@@ -3669,7 +3833,9 @@ def _make_build_messages_fn(
     lane, rendered via `context.action_context_str`). It is serialized as an explicitly
     untrusted application-data block after the base conversation, never as system
     authority. Foreground chat uses user role and proactive turns use assistant role.
-    Dynamic tool results remain native exchanges after that base block.
+    A proactive turn may add a fixed user-role transport boundary after those blocks;
+    it carries no wake data or model-choice instruction. Dynamic tool results remain
+    native exchanges after that base block.
     """
 
     # 真实模型自称块排在用户可编辑的 workspace skill 之前：它是运行时事实，不能被
@@ -3695,6 +3861,10 @@ def _make_build_messages_fn(
                 "last_user_message_ts"
             ),
             tail=rendered_tail,
+            locale=str(temporal_snapshot.get("locale") or ""),
+            archive_language=str(
+                temporal_snapshot.get("archive_language") or ""
+            ),
             visible_proactive_count_24h=temporal_snapshot.get(
                 "visible_proactive_count_24h"
             ),
@@ -3724,6 +3894,7 @@ def _make_build_messages_fn(
             coverage_hole_notice=coverage_hole_notice,
             temporal_context=_temporal_for(rendered_tail),
             application_data_role=application_data_role,
+            proactive_turn_boundary=proactive_turn_boundary,
             manual_wake=manual_wake,
             screen_frame_message=screen_frame_message,
         )
@@ -3951,6 +4122,8 @@ async def _capture_turn_temporal_snapshot(
         # Never a silent UTC clock: align with the resident anchor's China
         # default so the two time sources in one prompt cannot disagree.
         "timezone": str(snapshot.get("timezone") or context.DEFAULT_TIMEZONE),
+        "locale": str(snapshot.get("locale") or ""),
+        "archive_language": str(snapshot.get("archive_language") or ""),
         "last_user_message_ts": last_user_ts,
     }
 
@@ -3974,6 +4147,8 @@ async def _resolve_turn_temporal_context(
         timezone_name=str(snapshot["timezone"]),
         last_user_message_ts=snapshot.get("last_user_message_ts"),
         tail=tail,
+        locale=str(snapshot.get("locale") or ""),
+        archive_language=str(snapshot.get("archive_language") or ""),
     )
 
 
@@ -5031,6 +5206,99 @@ def _sanitize_reasoning(text: str) -> str:
     if len(cleaned) > _THINKING_MAX_CHARS:
         cleaned = cleaned[:_THINKING_MAX_CHARS]
     return cleaned
+
+
+def _select_thinking_surface(
+    provider_reasoning: str,
+    *,
+    self_thinking_on: bool,
+    self_thinking_text: str = "",
+    self_thinking_failed: bool = False,
+) -> tuple[str, str, str | None, bool, str]:
+    """Choose the only thinking text a final V2 reply may surface.
+
+    While self-thinking is enabled, provider-native chain-of-thought is never a
+    fallback: the model-authored ``<think>`` summary (or the existing failure
+    marker) is the complete display contract.  Disabling the feature preserves
+    the legacy native-reasoning behavior byte-for-byte.
+
+    The final item is a content-free observability branch name.  Keep this
+    decision shared by chat and wake so the two duplicated reply sinks cannot
+    drift again. Wake does not pass ``self_thinking_failed`` because malformed
+    wake output fails before sealing; the marker branch is reachable only from
+    foreground Chat.
+    """
+    if self_thinking_on:
+        if self_thinking_failed:
+            return (
+                self_thinking.THINKING_FAILED_MARKER,
+                "agent_summary",
+                "self_thinking",
+                False,
+                "marker",
+            )
+        if self_thinking_text:
+            return (
+                self_thinking_text,
+                "agent_summary",
+                "self_thinking",
+                False,
+                "self",
+            )
+        return "", "agent_summary", "self_thinking", False, "none"
+    if provider_reasoning:
+        return provider_reasoning, "provider_reasoning", None, True, "native_legacy"
+    return "", "provider_reasoning", None, True, "none"
+
+
+async def _emit_thinking_surfaced_trace(
+    emit_debug_trace: Callable[..., None] | None,
+    user_id: str,
+    provider_config,
+    *,
+    lane: str,
+    branch: str,
+    chars: int,
+) -> None:
+    """Emit one content-free terminal thinking decision, best-effort."""
+    if emit_debug_trace is None:
+        return
+    safe_branch = (
+        branch
+        if branch in {"self", "marker", "none", "native_legacy"}
+        else "none"
+    )
+    safe_lane = "wake" if lane == "wake" else "chat"
+    safe_chars = max(0, int(chars))
+    # ``model`` is user-configurable for compatible relays.  Match the existing
+    # plaintext thinking metadata bound instead of letting an arbitrary string
+    # expand the server-visible trace ring.
+    model = str(getattr(provider_config, "model", "") or "").strip()[:96]
+    try:
+        await asyncio.to_thread(
+            emit_debug_trace,
+            user_id,
+            "thinking.surfaced",
+            status="ok",
+            summary=f"V2 thinking {safe_branch} ({safe_chars} chars)",
+            explain=(
+                "Records only the selected branch, character count, model, and "
+                "lane; no thinking text or fragment is included."
+            ),
+            detail={
+                "branch": safe_branch,
+                "chars": safe_chars,
+                "model": model,
+                "lane": safe_lane,
+            },
+        )
+    except Exception as exc:  # noqa: BLE001 — diagnostics cannot fail a reply
+        log.warning(
+            "[v2.thinking] surface trace failed user=%s lane=%s code=%s",
+            user_id,
+            safe_lane,
+            type(exc).__name__.lower(),
+        )
 
 
 def _build_thinking_payload(
@@ -7618,8 +7886,8 @@ async def _run_wake(
 ) -> str:
     """wake-lane（heartbeat/scheduled/manual_wake/screen_watch）turn：让伴侣主动开口，而不是
     回答用户刚发的消息（用户根本没发消息——这就是唤醒的定义）。同 `_run_compaction` 一样自成
-    一体、自己的 try/except：这是后台/主动发起的 job，provider 解析失败或任何未预期异常
-    都静默 `mark_failed`，绝不 `_surface_terminal_error`、绝不写占位气泡。
+    一体、自己的 try/except。heartbeat/manual_wake/screen_watch 是弱唤醒，失败继续静默；
+    scheduled 是到点交付，最终失败通过 durable terminal outbox 写明确失败结果，不能无声消失。
 
     D3 Task 8 (PR C spec C8)：跟 chat 分支（`process_job`，Task 7）一样跑同一个
     `tool_loop.run_tool_loop`。`turn_authorization=True` 传给 `dispatch_tool_calls`（跟 chat
@@ -7632,8 +7900,8 @@ async def _run_wake(
       "终态空文本 = no-filler 失败"的语义**相反**。循环正常跑完（`run_tool_loop` 不抛异常）
       即视为成功，`mark_completed`，只是没写出气泡。
 
-    真 provider 错误（`chat_completion_async` 抛出的任何异常）：静默 `mark_failed`，同样
-    不弹用户可见 error chip——背景 job，同 maintenance 的隔离口径。402/401/403 一类
+    真 provider 错误（`chat_completion_async` 抛出的任何异常）：所有 lane 都
+    `mark_failed`；只有 scheduled 同步排入用户可见失败 outbox。402/401/403 一类
     "provider_config"错误（死/欠费 BYOK key）额外写一条 payment_cooldown（D3 Task 7），
     让 scheduler 的 `due_heartbeat_users` 停止对一把修不好的钥匙反复重试。
 
@@ -7648,6 +7916,7 @@ async def _run_wake(
     观测）是两回事。
     """
     push_slot: dict | None = None
+    shadow_decision_allowed: bool | None = None
     try:
         store = core_store.get_store(user_id)
         seq_native = deps.read_messages_after_seq is not None
@@ -7673,6 +7942,7 @@ async def _run_wake(
             )
 
         async def _sleep_heartbeat_without_history() -> str:
+            nonlocal shadow_decision_allowed
             wake_generation = observed_generation
             consumed_context_seq = 0
             if deps.read_perception_wake_context is not None:
@@ -7723,6 +7993,7 @@ async def _run_wake(
                 )
             if successor_id is not None:
                 await asyncio.to_thread(core_wake_bus.notify, "v2_jobs", user_id)
+            shadow_decision_allowed = False
             if tm is not None:
                 tm.flush(failed=False, status="slept_no_history")
             return "completed"
@@ -8074,7 +8345,7 @@ async def _run_wake(
         # block above: `_cap_data` acquires enclave_sem ITSELF (see its body), and
         # asyncio.Semaphore is NOT reentrant. Nesting it inside another
         # `async with enclave_sem` deadlocks whenever the semaphore value is 1
-        # (FEEDLING_V2_ENCLAVE_CONCURRENCY defaults to 2, so a naive test would pass
+        # (a gate wider than one would hide this, so a naive test would pass
         # while production wedges wherever the value is 1). The gate still bounds the
         # call — _cap_data holds the semaphore for its own turn.
         grounding_results = None
@@ -8505,7 +8776,10 @@ async def _run_wake(
                 ),
             )
 
+        thinking_trace_emitted = False
+
         async def _on_reply(text: str, *, final: bool, reasoning: str = "") -> None:
+            nonlocal thinking_trace_emitted, shadow_decision_allowed
             text = str(text or "").strip()
             # Self-authored thinking (same mechanism as the chat lane): peel a leading
             # <think> off the wake reply BEFORE the degenerate/torn checks so they see
@@ -8574,6 +8848,54 @@ async def _run_wake(
                 if final:
                     raise TurnError(_PROTOCOL_FRAGMENT_REASON)
                 return
+            # Keep this paired with the foreground guard in process_job._on_reply.
+            # The two lanes deliberately differ after sanitization (chat falls back;
+            # wake fails silently), but every user-visible text outlet must call the
+            # same closed-set parser before sealing an envelope.
+            if text:
+                text, removed_tool_markup = tool_markup_leak.strip_tool_markup(text)
+                if removed_tool_markup:
+                    log.warning(
+                        "[v2.worker] wake tool markup stripped user=%s job=%s "
+                        "lane=%s final=%s error_class=%s",
+                        user_id,
+                        job_id,
+                        lane,
+                        final,
+                        tool_markup_leak.ERROR_CLASS,
+                    )
+                    if deps.emit_debug_trace is not None:
+                        try:
+                            await asyncio.to_thread(
+                                deps.emit_debug_trace,
+                                user_id,
+                                "agent.reply.sanitized",
+                                status="error",
+                                summary="V2 主动回复已剥离工具调用标记",
+                                explain=(
+                                    "中转返回的可见文本混入工具协议标记；正文已保留，"
+                                    "标记已在下发前移除。"
+                                ),
+                                detail={
+                                    "lane": lane,
+                                    "final": bool(final),
+                                    "error_class": tool_markup_leak.ERROR_CLASS,
+                                    "reason": tool_markup_leak.REASON,
+                                },
+                            )
+                        except Exception as exc:  # noqa: BLE001 — best-effort trace
+                            log.warning(
+                                "[v2.worker] wake tool markup trace failed user=%s "
+                                "job=%s lane=%s code=%s",
+                                user_id,
+                                job_id,
+                                lane,
+                                type(exc).__name__.lower(),
+                            )
+                    if _is_degenerate_reply(text):
+                        if final:
+                            raise TurnError("degenerate_reply_suppressed")
+                        return
             if not text:
                 # Silence is a legitimate wake outcome — both mid-loop (an empty
                 # `reply{}` call) and terminal ("weak wake sleeps"): unlike the chat
@@ -8652,15 +8974,21 @@ async def _run_wake(
                         job_id=int(job_id),
                     )
                 )
-            # Surface thinking on the same effect (sealed into a separate envelope),
-            # matching the chat lane: PREFER the self-authored <think> when present,
-            # else the provider's native reasoning. Never mislabel one as the other.
-            # Only a final reply carries it; intermediate reply{} bubbles are agent-authored.
-            _wake_display_reasoning = reasoning
-            _wk_kind, _wk_source, _wk_native = "provider_reasoning", None, True
-            if _wake_self_thinking_on and _wake_self_thinking_text:
-                _wake_display_reasoning = _wake_self_thinking_text
-                _wk_kind, _wk_source, _wk_native = "agent_summary", "self_thinking", False
+            # Surface only the agent-authored summary while self-thinking is on.
+            # Native provider reasoning remains available solely behind the
+            # feature-off compatibility contract.
+            (
+                _wake_display_reasoning,
+                _wk_kind,
+                _wk_source,
+                _wk_native,
+                _wake_thinking_branch,
+            ) = _select_thinking_surface(
+                reasoning,
+                self_thinking_on=_wake_self_thinking_on,
+                self_thinking_text=_wake_self_thinking_text,
+            )
+            _wake_thinking_chars = 0
             if final and _wake_display_reasoning:
                 thinking_effect_id = v2_effect_id.derive(
                     job_id=job_id,
@@ -8679,6 +9007,11 @@ async def _run_wake(
                 )
                 if thinking_payload:
                     payload["thinking"] = thinking_payload
+                    _wake_thinking_chars = len(
+                        _sanitize_reasoning(_wake_display_reasoning)
+                    )
+                else:
+                    _wake_thinking_branch = "none"
             enqueued_id = await asyncio.to_thread(
                 v2_effect_outbox.enqueue_effect,
                 job_id=job_id,
@@ -8786,6 +9119,7 @@ async def _run_wake(
                     best_effort=True,
                 )
                 if status == "applied":
+                    shadow_decision_allowed = True
                     # 覆盖式：一个回合可能吐多条气泡，只有最后一条会成为推送。构建槽位
                     # 本身也是 best-effort：payload 缺 "envelope"（例如未来出现的非
                     # seq_native / 测试注入变体）不该把一个已经成功落库的回合打成
@@ -8816,6 +9150,16 @@ async def _run_wake(
                         if source_status != "completed":
                             raise RuntimeError(
                                 "wake final applied without completing source job"
+                            )
+                        if not thinking_trace_emitted:
+                            thinking_trace_emitted = True
+                            await _emit_thinking_surfaced_trace(
+                                deps.emit_debug_trace,
+                                user_id,
+                                provider_config,
+                                lane="wake",
+                                branch=_wake_thinking_branch,
+                                chars=_wake_thinking_chars,
                             )
                     return
                 if (
@@ -8869,6 +9213,16 @@ async def _run_wake(
                 },
                 best_effort=True,
             )
+            if final and not thinking_trace_emitted:
+                thinking_trace_emitted = True
+                await _emit_thinking_surfaced_trace(
+                    deps.emit_debug_trace,
+                    user_id,
+                    provider_config,
+                    lane="wake",
+                    branch=_wake_thinking_branch,
+                    chars=_wake_thinking_chars,
+                )
             # Legacy/non-seq assembly can enqueue without a sink. That proves
             # the model produced text, not that a user-visible bubble was
             # applied. Count only the applied-but-unverified path here; the
@@ -8979,6 +9333,7 @@ async def _run_wake(
                 tail_source_truncated=tail_source_truncated,
                 tail_lane=lane,
                 application_data_role="assistant",
+                proactive_turn_boundary=True,
                 manual_wake=(lane == "manual_wake"),
             )
 
@@ -9077,14 +9432,28 @@ async def _run_wake(
                 # 重放定时器（mark_fired 在入队时就落，不等 job 成功），只会 arm
                 # 60s 起、1h 封顶的 proactive 退避，用户下次说话即清。
                 require_reply=(lane == "scheduled"),
+                empty_response_correction=(
+                    _SCHEDULED_WAKE_EMPTY_RESPONSE_CORRECTION
+                    if lane == "scheduled"
+                    else v2_tool_loop._EMPTY_RESPONSE_CORRECTION
+                ),
                 on_provider_success=lambda: _record_provider_success(user_id),
                 on_provider_failure=lambda exc: _record_provider_failure(
                     user_id,
                     exc,
                 ),
+                on_provider_tool_surface=_provider_tool_surface_callback(
+                    deps,
+                    user_id,
+                    lane,
+                ),
                 fold_before_first=deps.read_messages_after_seq is not None,
                 on_progress=_report_turn_progress,
-                on_trajectory_event=_ledger_tapped_sink(trajectory_recorder),
+                on_trajectory_event=_ledger_tapped_sink(
+                    trajectory_recorder,
+                    deps=deps,
+                    user_id=user_id,
+                ),
                 outbound_blocking_read_tool_names=_PRIVATE_READ_TOOLS,
                 outbound_blocking_read_tool_predicate=_read_blocks_later_outbound,
                 max_tool_calls_per_round=MAX_TOOL_CALLS_PER_ROUND,
@@ -9102,26 +9471,22 @@ async def _run_wake(
                     PROMPT_ESTIMATOR_UTF8_BYTES_PER_TOKEN
                 ),
                 prompt_image_reserve_tokens=PROMPT_IMAGE_RESERVE_TOKENS,
-                on_tail_window=(
-                    (
-                        lambda item: tm.record_tail_window(
-                            effective_turns=item["effective_turns"],
-                            fallback=item["fallback"],
-                        )
-                    )
-                    if tm is not None
-                    else None
-                ),
+                on_tail_window=_tail_window_callback(tm),
                 on_prompt_frontier_exhaustion=(
                     tm.record_prompt_frontier_exhaustion
                     if tm is not None
                     else None
                 ),
             )
-        except Exception as e:  # noqa: BLE001 — classify below, then let it fall to the outer silent mark_failed
+            if shadow_decision_allowed is None:
+                # A successful weak-wake turn with no applied reply is the
+                # model's suppress/sleep outcome.  This assignment is after the
+                # tool loop and cannot influence any provider input or branch.
+                shadow_decision_allowed = False
+        except Exception as e:  # noqa: BLE001 — classify below, then terminalize outside
             if provider_client.classify_provider_error(e) == "provider_config":
                 # Dead/broke BYOK key (402 out-of-credits, 401/403 bad key) — back off
-                # BEFORE the silent mark_failed below, so the scheduler stops hammering
+                # BEFORE mark_failed below, so the scheduler stops hammering
                 # this key every heartbeat interval (Task 1's due_heartbeat_users query
                 # already excludes users still in cooldown).
                 await _fence_wake_effect("payment cooldown")
@@ -9204,7 +9569,7 @@ async def _run_wake(
         if tm is not None:
             tm.flush(failed=False, status="ok")
         return "completed"
-    except Exception as e:  # noqa: BLE001 — wake job: silent mark_failed, never surface/bubble
+    except Exception as e:  # noqa: BLE001 — scheduled failures surface below
         code = _safe_failure_code("wake_failed", e)
         await _record_trajectory(
             trajectory_recorder,
@@ -9223,11 +9588,12 @@ async def _run_wake(
             lane in _FAIL_BACKOFF_WAKE_LANES
             and not isinstance(e, (LostJobLease, RuntimeModeChanged))
         )
-        await asyncio.to_thread(
+        owned = await asyncio.to_thread(
             jobs_store.mark_failed,
             job_id,
             code,
             claimed_by=claimed_by,
+            error_class=_turn_failure_error_class(e),
             wake_backoff_base_sec=(
                 _WAKE_FAIL_BACKOFF_BASE_SEC if arm_wake_backoff else None
             ),
@@ -9235,13 +9601,28 @@ async def _run_wake(
                 _WAKE_FAIL_BACKOFF_CAP_SEC if arm_wake_backoff else None
             ),
         )
+        if owned and lane == "scheduled":
+            # A due timer is not a weak presence moment: it has a visible
+            # delivery obligation. mark_failed already wrote the durable
+            # outbox marker in the same transaction; this is only the prompt
+            # low-latency drain, and the independent reconciler remains the
+            # crash/retry boundary.
+            await asyncio.to_thread(
+                _surface_terminal_error,
+                deps,
+                user_id,
+                job_id,
+                code,
+            )
         if tm is not None:
             tm.flush(failed=True, status=code)
         return "failed"
     finally:
+        decided_at = time.time()
+        apns_alert_sent = False
         if push_slot is not None and deps.send_reply_push is not None:
             try:
-                await asyncio.to_thread(
+                push_result = await asyncio.to_thread(
                     deps.send_reply_push,
                     user_id,
                     msg_id=push_slot["msg_id"],
@@ -9249,9 +9630,33 @@ async def _run_wake(
                     is_wake=push_slot["is_wake"],
                     lane=push_slot["lane"],
                 )
+                apns_alert_sent = push_result is True
             except Exception as e:  # noqa: BLE001 — 推送绝不能影响回合结果
                 log.warning(
                     "[v2.worker] wake reply push failed user=%s: %s", user_id, e)
+        if (
+            shadow_decision_allowed is not None
+            and deps.record_wake_shadow_decision is not None
+        ):
+            try:
+                await asyncio.to_thread(
+                    deps.record_wake_shadow_decision,
+                    user_id,
+                    job_id=int(job_id),
+                    lane=lane,
+                    decision_allowed=shadow_decision_allowed,
+                    apns_alert_sent=(
+                        apns_alert_sent if shadow_decision_allowed else False
+                    ),
+                    decided_at=decided_at,
+                )
+            except Exception as e:  # noqa: BLE001 — 影子观测绝不能改变决策/回合
+                log.warning(
+                    "[v2.worker] wake shadow record failed user=%s job=%s: %s",
+                    user_id,
+                    job_id,
+                    e,
+                )
 
 
 def _memory_write_result_counts(
@@ -9453,6 +9858,13 @@ async def _run_profile(
             {"lane": "profile", **payload},
             best_effort=True,
         )
+        if kind == "provider_request":
+            await asyncio.to_thread(
+                _emit_context_truncation_trace,
+                deps,
+                user_id,
+                payload,
+            )
 
     async def _fence_profile_write(effect: str) -> None:
         if claimed_by and not await asyncio.to_thread(
@@ -9476,6 +9888,7 @@ async def _run_profile(
         attempts = _profile_attempt_count(previous)
         now_ts = time.time()
         await _fence_profile_write("failure metadata write")
+        _report_turn_progress("profile_write_started")
         return v2_profile_store.build_profile_document(
             user_id,
             state=("degraded" if previous.get("memory") is not None else "pending"),
@@ -9500,11 +9913,20 @@ async def _run_profile(
         nonlocal terminal_reject
         if deps.read_profile_cards is None:
             raise RuntimeError("profile_cards_reader_unavailable")
+        _report_turn_progress("profile_index_started")
+        loop = asyncio.get_running_loop()
+
+        def _thread_progress(stage: str) -> None:
+            loop.call_soon_threadsafe(_report_turn_progress, stage)
+
         async with enclave_sem:
-            rendered, card_count = await asyncio.to_thread(
+            rendered, card_count, tail_window = await asyncio.to_thread(
                 deps.read_profile_cards,
                 user_id,
+                _thread_progress,
             )
+        await asyncio.sleep(0)
+        _report_turn_progress("profile_cards_completed")
         raw_count, max_updated_at = await asyncio.to_thread(
             db.memory_profile_source_stats,
             user_id,
@@ -9523,6 +9945,7 @@ async def _run_profile(
         if card_count == 0:
             terminal_reject = ""
             await _fence_profile_write("empty profile write")
+            _report_turn_progress("profile_write_started")
             return v2_profile_store.build_profile_document(
                 user_id,
                 state="empty",
@@ -9534,18 +9957,39 @@ async def _run_profile(
                     "retry_not_before": 0,
                 },
             )
+        provider_call_ordinal = 0
+
+        async def _profile_llm(*args, **kwargs):
+            nonlocal provider_call_ordinal
+            provider_call_ordinal += 1
+            ordinal = provider_call_ordinal
+            _report_turn_progress(f"profile_provider_request:{ordinal}")
+            kwargs.setdefault(
+                "progress_cb",
+                lambda stage, attempt: _report_turn_progress(
+                    f"profile_provider_{stage}:{ordinal}:{int(attempt)}"
+                ),
+            )
+            result = await provider_client.reliable_chat_completion_async(
+                *args, **kwargs
+            )
+            _report_turn_progress(f"profile_provider_response:{ordinal}")
+            return result
+
         generated = await v2_profile.generate_profile(
             provider_config=provider_config,
             rendered_cards=rendered,
-            llm=provider_client.reliable_chat_completion_async,
+            llm=_profile_llm,
             usage_out=(tm.add_call if tm is not None else None),
             trajectory_out=_trajectory,
+            tail_window=tail_window,
         )
         if generated.fields is None:
             terminal_reject = generated.reject_code
             return await _metadata_failure(previous, terminal_reject)
         terminal_reject = ""
         await _fence_profile_write("profile write")
+        _report_turn_progress("profile_write_started")
         return v2_profile_store.build_profile_document(
             user_id,
             state="ok",
@@ -9583,6 +10027,7 @@ async def _run_profile(
             user_id,
             _recompute,
         )
+        _report_turn_progress("profile_write_completed")
         if result.status == "superseded":
             winner_state = str(result.document.get("state") or "")
             if winner_state in {"ok", "empty"}:
@@ -9623,6 +10068,7 @@ async def _run_profile(
                 user_id,
                 lambda previous: _metadata_failure(previous, code),
             )
+            _report_turn_progress("profile_write_completed")
         except Exception as metadata_exc:  # noqa: BLE001
             log.warning(
                 "[v2.worker] profile failure metadata write failed user=%s code=%s",
@@ -10778,7 +11224,7 @@ async def process_job(
     的终态 flush 点仍然生效。
     """
     if enclave_sem is None:
-        enclave_sem = ENCLAVE_SEMAPHORE
+        enclave_sem = _new_direct_enclave_gate()
     if read_parallelism is None:
         read_parallelism = MAX_READ_ACTION_PARALLELISM
 
@@ -12155,6 +12601,8 @@ async def process_job(
             pending_file_replies.clear()
             pending_file_keys.clear()
 
+        thinking_trace_emitted = False
+
         async def _on_reply(
             text: str | WorkspaceFileReply,
             *,
@@ -12164,6 +12612,7 @@ async def process_job(
         ) -> None:
             nonlocal final_job_completed_atomically, voice_reply_slot
             nonlocal voice_call_ended_atomically
+            nonlocal thinking_trace_emitted
             file_reply = text if isinstance(text, WorkspaceFileReply) else None
             text = "" if file_reply is not None else str(text or "").strip()
             image_replies: list[GeneratedImageReply] = []
@@ -12261,6 +12710,56 @@ async def process_job(
                 text = _DEGENERATE_REPLY_FALLBACK
                 turn_failure_error_class = _PROTOCOL_FRAGMENT_ERROR_CLASS
                 reasoning = ""
+            # Keep this paired with the wake guard in _run_wake._on_reply. Some
+            # OpenAI-compatible relays turn native tool calls into XML-like
+            # text and then incompletely parse that text back into structured
+            # calls.  Keep any useful reply body, but never render the closed set
+            # of known tool markers.  This intentionally runs after the JSON
+            # protocol guard and before downloadable-reply sanitization.
+            if file_reply is None and text:
+                text, removed_tool_markup = tool_markup_leak.strip_tool_markup(text)
+                if removed_tool_markup:
+                    log.warning(
+                        "[v2.worker] chat tool markup stripped user=%s job=%s "
+                        "final=%s error_class=%s",
+                        user_id,
+                        job_id,
+                        final,
+                        tool_markup_leak.ERROR_CLASS,
+                    )
+                    if deps.emit_debug_trace is not None:
+                        try:
+                            await asyncio.to_thread(
+                                deps.emit_debug_trace,
+                                user_id,
+                                "agent.reply.sanitized",
+                                status="error",
+                                summary="V2 回复已剥离工具调用标记",
+                                explain=(
+                                    "中转返回的可见文本混入工具协议标记；正文已保留，"
+                                    "标记已在下发前移除。"
+                                ),
+                                detail={
+                                    "lane": "chat",
+                                    "final": bool(final),
+                                    "error_class": tool_markup_leak.ERROR_CLASS,
+                                    "reason": tool_markup_leak.REASON,
+                                },
+                            )
+                        except Exception as exc:  # noqa: BLE001 — best-effort trace
+                            log.warning(
+                                "[v2.worker] tool markup trace failed user=%s "
+                                "job=%s code=%s",
+                                user_id,
+                                job_id,
+                                type(exc).__name__.lower(),
+                            )
+                    if _is_degenerate_reply(text):
+                        if not final:
+                            return
+                        text = _DEGENERATE_REPLY_FALLBACK
+                        turn_failure_error_class = tool_markup_leak.ERROR_CLASS
+                        reasoning = ""
             if final and not text and not image_replies:
                 # BUG-4 no-filler: chat lane always replies — an empty terminal
                 # text is a model/provider failure here (unlike wake, where
@@ -12400,28 +12899,21 @@ async def process_job(
                         job_id,
                         type(exc).__name__.lower(),
                     )
-            # Provider chain-of-thought rides the same effect as its final reply,
-            # sealed into a separate thinking envelope so the durable outbox holds
-            # only ciphertext and a retry re-addresses the same thinking row. Only
-            # final replies carry it — intermediate reply{} bubbles are
-            # agent-authored text, not provider reasoning.
-            # Decide which thinking to seal and its provenance. Self-authored
-            # <think> (or a "thinking failed" marker) is an agent summary, NOT
-            # provider-native chain-of-thought; the provider's native reasoning
-            # keeps its native metadata. Never mislabel one as the other.
-            _display_reasoning = reasoning
-            _thinking_kind, _thinking_source, _thinking_native = (
-                "provider_reasoning", None, True,
+            # Self-thinking ON has no native CoT fallback.  The feature-off path
+            # intentionally keeps the pre-existing native display behavior.
+            (
+                _display_reasoning,
+                _thinking_kind,
+                _thinking_source,
+                _thinking_native,
+                _thinking_branch,
+            ) = _select_thinking_surface(
+                reasoning,
+                self_thinking_on=self_thinking_on,
+                self_thinking_text=self_thinking_text,
+                self_thinking_failed=self_thinking_failed,
             )
-            if self_thinking_on and (self_thinking_text or self_thinking_failed):
-                _display_reasoning = (
-                    self_thinking.THINKING_FAILED_MARKER
-                    if self_thinking_failed
-                    else self_thinking_text
-                )
-                _thinking_kind, _thinking_source, _thinking_native = (
-                    "agent_summary", "self_thinking", False,
-                )
+            _thinking_chars = 0
             if final and _display_reasoning and file_reply is None:
                 thinking_payload = await asyncio.to_thread(
                     _build_thinking_payload,
@@ -12435,6 +12927,9 @@ async def process_job(
                 )
                 if thinking_payload:
                     payload["thinking"] = thinking_payload
+                    _thinking_chars = len(_sanitize_reasoning(_display_reasoning))
+                else:
+                    _thinking_branch = "none"
             enqueued_id = await asyncio.to_thread(
                 v2_effect_outbox.enqueue_effect,
                 job_id=job_id,
@@ -12612,6 +13107,16 @@ async def process_job(
                         raise RuntimeError(
                             "final reply applied without completing source job"
                         )
+                    if final and not thinking_trace_emitted:
+                        thinking_trace_emitted = True
+                        await _emit_thinking_surfaced_trace(
+                            deps.emit_debug_trace,
+                            user_id,
+                            provider_config,
+                            lane="chat",
+                            branch=_thinking_branch,
+                            chars=_thinking_chars,
+                        )
                     final_job_completed_atomically = True
                     return
                 if (
@@ -12678,6 +13183,16 @@ async def process_job(
                 },
                 best_effort=True,
             )
+            if final and not thinking_trace_emitted:
+                thinking_trace_emitted = True
+                await _emit_thinking_surfaced_trace(
+                    deps.emit_debug_trace,
+                    user_id,
+                    provider_config,
+                    lane="chat",
+                    branch=_thinking_branch,
+                    chars=_thinking_chars,
+                )
 
         # `seq` is exclusively the consumed user|human frontier. The base prompt's
         # all-role snapshot bound is passed separately to the fold closure so an
@@ -13028,9 +13543,18 @@ async def process_job(
                 user_id,
                 exc,
             ),
+            on_provider_tool_surface=_provider_tool_surface_callback(
+                deps,
+                user_id,
+                lane,
+            ),
             fold_before_first=seq_native and not ordered_chat_replies,
             on_progress=_report_turn_progress,
-            on_trajectory_event=_ledger_tapped_sink(trajectory_recorder),
+            on_trajectory_event=_ledger_tapped_sink(
+                trajectory_recorder,
+                deps=deps,
+                user_id=user_id,
+            ),
             extra_tool_specs=offered_mcp_tool_specs,
             refresh_extra_tool_specs=_current_offered_mcp_tool_specs,
             extra_mutating_tool_names=mcp_mutating_names,
@@ -13055,10 +13579,7 @@ async def process_job(
                 PROMPT_ESTIMATOR_UTF8_BYTES_PER_TOKEN
             ),
             prompt_image_reserve_tokens=PROMPT_IMAGE_RESERVE_TOKENS,
-            on_tail_window=lambda item: tm.record_tail_window(
-                effective_turns=item["effective_turns"],
-                fallback=item["fallback"],
-            ),
+            on_tail_window=_tail_window_callback(tm),
             on_prompt_frontier_exhaustion=(
                 tm.record_prompt_frontier_exhaustion
             ),
@@ -13445,11 +13966,13 @@ async def process_job(
                     "mcp.turn.usage",
                     status="ok" if mcp_turn_outcome == "completed" else "error",
                     summary=(
-                        f"MCP 本轮提供 {detail['offered_tool_count']} 个工具,"
+                        f"MCP 本轮解析 {detail['offered_tool_count']} 个工具,"
                         f"调用 {detail['call_count']} 次"
                     ),
                     explain=(
-                        "仅记录工具数量和调用次数;不记录参数、返回值或用户内容。"
+                        "解析数是 prompt 预算前的回合工具面,不证明 provider 实收;"
+                        "实际下发见 mcp.surface.provider。仅记录数量和调用次数,"
+                        "不记录参数、返回值或用户内容。"
                     ),
                     detail={"lane": "chat", "outcome": mcp_turn_outcome, **detail},
                 )
@@ -13490,7 +14013,7 @@ async def process_job(
                 )
 
 
-async def _run_turn(job: dict, deps: TurnDeps) -> str:
+async def _run_turn(job: dict, deps: TurnDeps, *, enclave_sem=None) -> str:
     """把一个已 claim 的 job 交给 `process_job` 之前，先做一次性的 enclave-bound 解析：
     单次解密 BYOK provider key（single-decrypt-per-turn）+ 铸一个
     enclave-auth runtime_token。resolve_provider 失败（未配置/解密失败等）直接 mark_failed，
@@ -13500,6 +14023,8 @@ async def _run_turn(job: dict, deps: TurnDeps) -> str:
     whole-turn 累加器在这里创建（早于 `process_job`——provider 解析失败时根本不会进
     `process_job`，那次失败仍需要一行 v2_turn_metrics），再原样传给 `process_job`
     复用（同一个 job 只有一行，不会因为累加器实例不同而分裂成两次 upsert）。"""
+    if enclave_sem is None:
+        enclave_sem = _new_direct_enclave_gate()
     job_id = job["id"]
     user_id = str(job["user_id"])
     claimed_by = str(job.get("claimed_by") or "")
@@ -13531,7 +14056,7 @@ async def _run_turn(job: dict, deps: TurnDeps) -> str:
             )
 
     if lane == _TRAJECTORY_REVIEW_LANE:
-        return await _run_trajectory_review_turn(job, deps, tm)
+        return await _run_trajectory_review_turn(job, deps, tm, enclave_sem)
     if lane in _EXTRACTION_LANES:
         try:
             if await asyncio.to_thread(kill_switch.turns_halted):
@@ -13721,7 +14246,7 @@ async def _run_turn(job: dict, deps: TurnDeps) -> str:
             },
         )
         try:
-            async with ENCLAVE_SEMAPHORE:
+            async with enclave_sem:
                 provider_config, _meta = await asyncio.to_thread(
                     deps.resolve_provider, user_id
                 )
@@ -13749,8 +14274,9 @@ async def _run_turn(job: dict, deps: TurnDeps) -> str:
                 owned = await asyncio.to_thread(
                     jobs_store.mark_failed, job_id, err, claimed_by=claimed_by
                 )
-                if owned and lane == "chat":
-                    await _settle_legacy_traced_chat_failure(err)
+                if owned and lane in {"chat", "scheduled"}:
+                    if lane == "chat":
+                        await _settle_legacy_traced_chat_failure(err)
                     await asyncio.to_thread(
                         _surface_terminal_error, deps, user_id, job_id, err
                     )
@@ -13780,6 +14306,7 @@ async def _run_turn(job: dict, deps: TurnDeps) -> str:
             provider_config=provider_config,
             api_key=None,
             runtime_token=runtime_token,
+            enclave_sem=enclave_sem,
             tm=tm,
             trajectory_recorder=recorder,
         )
@@ -13812,8 +14339,9 @@ async def _run_turn(job: dict, deps: TurnDeps) -> str:
             claimed_by=claimed_by,
             error_class=_turn_failure_error_class(e),
         )
-        if owned and lane == "chat":
-            await _settle_legacy_traced_chat_failure(message)
+        if owned and lane in {"chat", "scheduled"}:
+            if lane == "chat":
+                await _settle_legacy_traced_chat_failure(message)
             await asyncio.to_thread(
                 _surface_terminal_error, deps, user_id, job_id, message
             )
@@ -13892,8 +14420,10 @@ async def _slot_loop(
     deps: TurnDeps,
     wake_event: "asyncio.Event | None" = None,
     lanes: "set | None" = None,
-    slot_id: int = 0,
-    progress_cb: "Callable[[int, float | None], None] | None" = None,
+    slot_id: str = "slot-0",
+    slot_generation: str = "g0",
+    progress_cb: "Callable[[slot_protocol.SlotProgress], None] | None" = None,
+    enclave_sem=None,
 ) -> None:
     """一个 job-slot：抢一个 job 就跑一回合，抢不到就等待（poll_interval 兜底，
     wake_event 命中时立刻醒——见 `_wait_for_job_or_stop`）。stop_event 置位后不再抢新活，
@@ -13925,11 +14455,25 @@ async def _slot_loop(
     mark_running 撞到一次性 DB 错误）绝不允许冒出这个协程、拖垮 run_worker_loop 里其他
     仍然健康的 slot——记日志后 continue，下一轮再抢。"""
 
-    def _signal_progress(turn_start: float | None = None) -> None:
+    active_job: slot_protocol.ActiveJobIdentity | None = None
+
+    def _signal_progress(
+        stage: str,
+        turn_start: float | None = None,
+    ) -> None:
         if progress_cb is None:
             return
         try:
-            progress_cb(slot_id, turn_start)
+            progress_cb(
+                slot_protocol.SlotProgress(
+                    slot_id=slot_id,
+                    slot_generation=slot_generation,
+                    monotonic_at=time.monotonic(),
+                    turn_start=turn_start,
+                    stage=stage,
+                    active_job=active_job if turn_start is not None else None,
+                )
+            )
         except Exception as e:  # noqa: BLE001 — 心跳信号故障绝不能拖垮 slot 主循环
             log.debug("[v2.worker] slot %s progress_cb failed: %s", worker_id, e)
 
@@ -13943,38 +14487,50 @@ async def _slot_loop(
             # THIS read as a reason to stop draining jobs it may already own).
             if await asyncio.to_thread(kill_switch.turns_halted):
                 await _wait_for_job_or_stop(stop_event, wake_event, poll_interval)
-                _signal_progress()
+                _signal_progress("idle")
                 continue
             job = await asyncio.to_thread(
                 jobs_store.claim_next_job, worker_id, lanes=lanes
             )
             if job is None:
                 await _wait_for_job_or_stop(stop_event, wake_event, poll_interval)
-                _signal_progress()
+                _signal_progress("idle")
                 continue
             # (a) claimed a job, about to enter _run_turn — record the turn's start
             # time and report it so a wedge INSIDE _run_turn (the slot never reaches
             # (b) below) still shows up as a climbing current_turn_age_sec even
             # though this slot never sends another message.
             turn_start = time.monotonic()
-            _signal_progress(turn_start)
+            active_job = slot_protocol.ActiveJobIdentity(
+                job_id=int(job["id"]),
+                lane=str(job.get("lane") or "chat"),
+                claimed_by=str(job.get("claimed_by") or worker_id),
+            )
+            _signal_progress("claimed", turn_start)
 
             # Keep the public `_run_turn(job, deps)` seam unchanged (many tests
             # and assembly callers replace it directly).  A task-local callback
             # lets provider/tool/compaction helpers refresh this exact slot's
             # stall clock without leaking progress across concurrent slots.
-            def _active_turn_progress(_stage: str) -> None:
-                _signal_progress(turn_start)
+            def _active_turn_progress(stage: str) -> None:
+                _signal_progress(stage, turn_start)
 
             progress_token = _TURN_PROGRESS_CB.set(_active_turn_progress)
             try:
-                await _run_turn(job, deps)
+                if enclave_sem is None:
+                    await _run_turn(job, deps)
+                else:
+                    await _run_turn(job, deps, enclave_sem=enclave_sem)
             finally:
                 _TURN_PROGRESS_CB.reset(progress_token)
-            _signal_progress(None)  # (b) turn completed — back to idle
+            _signal_progress("durable_completion", turn_start)
+            active_job = None
+            _signal_progress("idle")  # (b) turn completed — back to idle
         except Exception as e:  # noqa: BLE001 — 单 slot 故障绝不冒出去拖垮其他 slot
             log.warning("[v2.worker] slot %s iteration failed: %s", worker_id, e)
             if job is not None:
+                if active_job is not None:
+                    _signal_progress("failure_cleanup", turn_start)
                 try:
                     user_id = str(job.get("user_id") or "")
                     message = f"slot_failure:{type(e).__name__.lower()}"
@@ -13984,7 +14540,10 @@ async def _slot_loop(
                         message,
                         claimed_by=str(job.get("claimed_by") or worker_id),
                     )
-                    if owned and str(job.get("lane") or "chat") == "chat":
+                    if owned and str(job.get("lane") or "chat") in {
+                        "chat",
+                        "scheduled",
+                    }:
                         await asyncio.to_thread(
                             _surface_terminal_error, deps, user_id, job["id"], message
                         )
@@ -14024,7 +14583,8 @@ async def _slot_loop(
                         _safe_failure_code("slot_recovery_failed", recovery_error),
                     )
             await _wait_for_job_or_stop(stop_event, wake_event, poll_interval)
-            _signal_progress()  # (c) idle/error poll wake — slot is alive, just cycling
+            active_job = None
+            _signal_progress("idle")  # (c) idle/error poll wake
             continue
 
 
@@ -14036,7 +14596,9 @@ async def run_worker_loop(
     stop_event: asyncio.Event,
     deps: TurnDeps,
     wake_event: "asyncio.Event | None" = None,
-    progress_cb: "Callable[[int, float | None], None] | None" = None,
+    progress_cb: "Callable[[slot_protocol.SlotProgress], None] | None" = None,
+    slot_generation: str = "g0",
+    slot_ids: "list[str] | None" = None,
 ) -> None:
     """起 max_workers 个 job-slot 协程共抢同一张 agent_jobs（SKIP LOCKED 无争用）。
     stop_event 置位 → 所有 slot 跑完手上 job 后退出（SIGTERM 优雅 drain 的落点）。
@@ -14060,6 +14622,9 @@ async def run_worker_loop(
     _reserved_env = os.environ.get("FEEDLING_V2_CHAT_RESERVED_SLOTS", "").strip()
     reserved = int(_reserved_env) if _reserved_env else None
     assignments = _reserved_lane_slots(max_workers, reserved)
+    resolved_slot_ids = slot_ids or [f"slot-{i}" for i in range(len(assignments))]
+    if len(resolved_slot_ids) != len(assignments):
+        raise ValueError("slot_ids must match max_workers")
     slots = [
         asyncio.create_task(
             _slot_loop(
@@ -14069,7 +14634,8 @@ async def run_worker_loop(
                 deps=deps,
                 wake_event=wake_event,
                 lanes=assignments[i],
-                slot_id=i,
+                slot_id=resolved_slot_ids[i],
+                slot_generation=slot_generation,
                 progress_cb=progress_cb,
             )
         )

@@ -17,6 +17,9 @@ silence) lives in each runtime, not here.
 
 Evidence tiers, strongest first:
 
+- ``UPSTREAM_RESPONSE_ENVELOPE`` — the visible reply is a complete serialized
+  provider transport wrapper (for example ``response.candidates`` plus the
+  relay's ``traceId``), not model-authored foreground text.
 - ``JOINED_KNOWN_PROTOCOL`` — reasoning-suffix + visible rejoin to a complete,
   known protocol envelope that consumes to the end. Proof of a single-cut tear.
 - ``HEAD_IN_REASONING`` — the rejoin does not parse (multi-cut / lost middle) but
@@ -40,10 +43,18 @@ from typing import Any
 JOINED_KNOWN_PROTOCOL = "joined_known_protocol"
 HEAD_IN_REASONING = "head_in_reasoning"
 TRANSPORT_CUT = "transport_cut"
+UPSTREAM_RESPONSE_ENVELOPE = "upstream_response_envelope"
 ORPHAN_JSON_TAIL = "orphan_json_tail"
 NONE = "none"
 
-_STRONG = frozenset({JOINED_KNOWN_PROTOCOL, HEAD_IN_REASONING, TRANSPORT_CUT})
+_STRONG = frozenset(
+    {
+        JOINED_KNOWN_PROTOCOL,
+        HEAD_IN_REASONING,
+        TRANSPORT_CUT,
+        UPSTREAM_RESPONSE_ENVELOPE,
+    }
+)
 
 # Known protocol action vocabulary (union across V1 + both V2 subsystems). Used
 # only to decide "is a rejoined object a *known* protocol envelope", never to
@@ -186,12 +197,57 @@ def _visible_is_fragmentish(visible_text: str) -> bool:
     return is_orphan_json_tail(visible_text) or looks_like_protocol_head(visible_text)
 
 
+def is_upstream_response_envelope(text: Any) -> bool:
+    """True for the complete relay wrapper leaked in usr_90184's V2 bubble.
+
+    This deliberately requires the *whole* visible reply to parse as one object
+    and requires both sides of the transport signature: a non-empty relay
+    ``traceId`` at the top level, plus Gemini response metadata around a
+    ``candidates`` list. Merely discussing JSON, returning an ordinary JSON
+    object, or mentioning ``response``/``metadata`` is not enough to suppress a
+    foreground answer. This intentionally covers only the observed Gemini relay
+    shape; it does not claim generic coverage for OpenAI-shaped wrappers,
+    additional outer envelopes, or JSON surrounded by model-authored prose.
+    """
+    visible = str(text or "").strip()
+    if (
+        len(visible) < 2
+        or len(visible) > 1_000_000
+        or visible[0] != "{"
+        or visible[-1] != "}"
+    ):
+        return False
+    try:
+        wrapper = json.loads(visible)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return False
+    if not isinstance(wrapper, dict):
+        return False
+    if not str(wrapper.get("traceId") or "").strip():
+        return False
+    if not isinstance(wrapper.get("metadata"), dict):
+        return False
+    response = wrapper.get("response")
+    if not isinstance(response, dict) or not isinstance(response.get("candidates"), list):
+        return False
+    provider_markers = sum(
+        (
+            isinstance(response.get("usageMetadata"), dict),
+            bool(str(response.get("modelVersion") or "").strip()),
+            bool(str(response.get("responseId") or "").strip()),
+        )
+    )
+    return provider_markers >= 2
+
+
 def classify(visible_text: Any, *, reasoning_text: Any = "", transport_cut: bool = False) -> str:
     """Classify a visible reply into an evidence tier (see module docstring).
     Returns an enum string, never an action."""
     v = str(visible_text or "")
     if not v.strip():
         return NONE
+    if is_upstream_response_envelope(v):
+        return UPSTREAM_RESPONSE_ENVELOPE
     r = str(reasoning_text or "")
     if r and _rejoins_to_protocol(r, v):
         return JOINED_KNOWN_PROTOCOL

@@ -307,7 +307,30 @@ def ingest_snapshot_v2(
     Plain operation values still update the existing snapshot store. Encrypted
     sensitive values are accepted as envelopes, but they do not become differ
     observations until an enclave/decrypt adapter supplies plaintext values.
+
+    每个加密字段各解密一次(`perception:<field>`),一次上报就是 ~7 次 enclave
+    调用、14 条 trace 事件。2026-08-12 实测:前面几批折叠上线后,活跃 V2 用户
+    环里**仍有 100% 是这些 `perception:*` 事件**,窗口被压在几小时 —— 48 小时的
+    TTL 因此一直是装饰性的。这里按前缀整批折成一条,失败照旧单条落地。
     """
+    with core_enclave.coalesced_success_trace("perception:", prefix=True):
+        return _ingest_snapshot_v2_inner(
+            user_id,
+            items,
+            client_ts,
+            api_key=api_key,
+            decrypt_envelope=decrypt_envelope,
+        )
+
+
+def _ingest_snapshot_v2_inner(
+    user_id: str,
+    items: list,
+    client_ts=None,
+    *,
+    api_key: str | None = None,
+    decrypt_envelope: Callable[..., bytes | str | Mapping[str, Any] | list[Any]] | None = None,
+) -> dict:
     now = _coerce_ts(client_ts)
     storage_items: list[dict] = []
     location_anchor_observations: list[tuple[str, Any]] = []
@@ -1013,6 +1036,15 @@ def stable_context_timezone(user_id: str) -> str | None:
     if isinstance(cell, dict):
         v = str(cell.get("v") or "").strip()
         return v or None
+    return None
+
+
+def stable_context_locale(user_id: str) -> str | None:
+    """Device locale from the same TTL-exempt context state as timezone."""
+    cell = store.get_state(user_id).get("locale")
+    if isinstance(cell, dict):
+        value = str(cell.get("v") or "").strip()
+        return value or None
     return None
 
 

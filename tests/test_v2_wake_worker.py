@@ -1,8 +1,9 @@
 """Wake-lane processing on the unified `tool_loop.run_tool_loop`.
 
-`_run_wake` mirrors `_run_compaction`'s self-contained shape (own try/except,
-silent `mark_failed`, never `_surface_terminal_error`, never a chat bubble on
-failure) but on a SUCCESSFUL model-authored reply it DOES write an encrypted
+`_run_wake` mirrors `_run_compaction`'s self-contained shape (own try/except).
+Weak wake failures remain silent; a scheduled reminder failure is durably
+surfaced because that lane has an explicit delivery obligation. On a
+SUCCESSFUL model-authored reply it writes an encrypted
 chat bubble via the PR A effect outbox (`on_reply` -> `enqueue_effect` ->
 `apply_pending_effects`, same mechanism the chat lane uses) — the whole point
 of a wake lane is letting the companion reach out proactively.
@@ -15,8 +16,8 @@ history completes without calling the provider; explicitly scheduled and
 manual wakes remain valid with an empty coalesce/read_tail.
 
 A real provider failure (`provider_client.chat_completion_async` raising) IS
-a failure — silent `mark_failed`, still no user-visible error chip
-(background job, same isolation as maintenance).
+a failure. Scheduled wakes surface it; other wake lanes keep the background
+isolation used by maintenance.
 
 Style: real jobs_store/core_store (real DB claim/mark_*/status events) +
 stubbed `provider_client.chat_completion_async` (the LLM wire boundary
@@ -35,10 +36,12 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
 import pytest
+from nacl.public import PrivateKey
 
 import conftest
 import db
 import provider_client
+from content_encryption import build_envelope
 from capabilities import registry as cap_registry
 from core import store as core_store
 from model_api_runtime.v2 import context as v2_context
@@ -47,6 +50,7 @@ from model_api_runtime.v2 import jobs_store
 from model_api_runtime.v2 import coalesce as v2_coalesce
 from model_api_runtime.v2 import serve_worker
 from model_api_runtime.v2 import worker
+from tools.e2e.client import E2EClient, TEST_API
 
 
 @pytest.fixture(autouse=True)
@@ -65,6 +69,7 @@ def _reset(uid):
         conn.execute("DELETE FROM agent_jobs WHERE user_id=%s", (uid,))
         conn.execute("DELETE FROM runtime_state WHERE user_id=%s", (uid,))
         conn.execute("DELETE FROM v2_effect_outbox WHERE user_id=%s", (uid,))
+        conn.execute("DELETE FROM chat_messages WHERE user_id=%s", (uid,))
     conftest.set_v2_runtime_owner(uid)
 
 
@@ -136,9 +141,76 @@ def _text_round(text, *, prompt_tokens=1, completion_tokens=1):
             "usage": {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens}}
 
 
+def _patch_user_decryptable_envelopes(monkeypatch, user_id: str) -> E2EClient:
+    """Use real reply-envelope crypto and return the user-side decryptor."""
+    user_sk = PrivateKey.generate()
+    enclave_pk = bytes(PrivateKey.generate().public_key)
+    client = E2EClient(
+        TEST_API,
+        user_id,
+        "test-api-key",
+        user_sk,
+        enclave_pk,
+    )
+
+    def _build(store, plaintext, *, item_id=None):
+        assert store.user_id == user_id
+        return (
+            build_envelope(
+                plaintext=bytes(plaintext),
+                owner_user_id=user_id,
+                user_pk_bytes=bytes(user_sk.public_key),
+                enclave_pk_bytes=enclave_pk,
+                visibility="shared",
+                item_id=item_id,
+            ),
+            "",
+        )
+
+    monkeypatch.setattr(
+        worker.core_envelope,
+        "_build_shared_envelope_for_store",
+        _build,
+    )
+    return client
+
+
 # ------------------------------------------------------------------
 # _run_wake direct unit coverage
 # ------------------------------------------------------------------
+
+def test_shadow_signals_never_reach_the_wake_provider_prompt(monkeypatch):
+    """A′ signals are post-decision observations, never provider inputs.
+
+    This invariant is what permits shadow telemetry to ship without changing
+    wake product policy. Exercise the real `_run_wake` prompt assembly so both
+    its wake system prompt and runtime application data are covered.
+    """
+    uid = "u_wake_shadow_prompt_purity"
+    conftest.seed_user(uid)
+    _reset(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, "manual_wake")
+    claimed_by = _claim(job_id)
+    calls = _script_provider(monkeypatch, [_text_round("")])
+
+    status = asyncio.run(
+        worker._run_wake(
+            job_id,
+            uid,
+            "manual_wake",
+            _wake_deps(tail=[]),
+            _BYOK,
+            asyncio.Semaphore(4),
+            claimed_by,
+        )
+    )
+
+    assert status == "completed"
+    assert len(calls) == 1
+    provider_wire = json.dumps(calls[0]["messages"], ensure_ascii=False)
+    assert "apns_alert_sent" not in provider_wire
+    assert "local_hour" not in provider_wire
+
 
 def test_run_wake_reply_written_and_job_completed(monkeypatch):
     uid = "u_wake_reply"
@@ -161,7 +233,7 @@ def test_run_wake_reply_written_and_job_completed(monkeypatch):
 
     deps = _wake_deps(tail=[{"id": "m1", "ts": 1.0, "role": "user", "content": "hi"}])
     status = asyncio.run(worker._run_wake(
-        job_id, uid, "heartbeat", deps, _BYOK, worker.ENCLAVE_SEMAPHORE, claimed_by))
+        job_id, uid, "heartbeat", deps, _BYOK, asyncio.Semaphore(4), claimed_by))
 
     assert status == "completed"
     assert written == {"text": "hey, how did that go?", "user_id": uid}
@@ -172,7 +244,172 @@ def test_run_wake_reply_written_and_job_completed(monkeypatch):
         message["content"]
         for message in seen["messages"]
         if message.get("role") == "user"
-    ] == ["hi"]
+    ] == ["hi", v2_context.PROACTIVE_TURN_BOUNDARY]
+
+
+def test_wake_self_thinking_on_drops_native_reasoning_fallback(monkeypatch):
+    """Wake follows Chat: native CoT is not displayed while self-thinking is ON."""
+    monkeypatch.delenv("FEEDLING_V2_SELF_THINKING", raising=False)
+    uid = "u_wake_selfthink_no_fallback"
+    conftest.seed_user(uid)
+    _reset(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, "heartbeat")
+    claimed_by = _claim(job_id)
+    _script_provider(
+        monkeypatch,
+        [{
+            "reply": "hey, how did that go?",
+            "reasoning": "private native cot",
+            "tool_calls": [],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+        }],
+    )
+    monkeypatch.setattr(
+        worker,
+        "_build_thinking_payload",
+        lambda *_args, **_kwargs: pytest.fail(
+            "native reasoning must not be sealed while self-thinking is on"
+        ),
+    )
+    written = {}
+    monkeypatch.setattr(
+        worker,
+        "_write_encrypted_reply",
+        lambda store, text: written.update(text=text, user_id=store.user_id)
+        or {"id": "wake-no-fallback"},
+    )
+    traces = []
+    deps = _wake_deps(
+        tail=[{"id": "m1", "ts": 1.0, "role": "user", "content": "hi"}]
+    )
+    deps.emit_debug_trace = lambda user_id, event_type, **fields: traces.append(
+        {"user_id": user_id, "event_type": event_type, **fields}
+    )
+
+    status = asyncio.run(
+        worker._run_wake(
+            job_id,
+            uid,
+            "heartbeat",
+            deps,
+            _BYOK,
+            asyncio.Semaphore(4),
+            claimed_by,
+        )
+    )
+
+    assert status == "completed"
+    assert written == {"text": "hey, how did that go?", "user_id": uid}
+    thinking_traces = [
+        trace for trace in traces if trace["event_type"] == "thinking.surfaced"
+    ]
+    assert [trace["detail"] for trace in thinking_traces] == [{
+        "branch": "none",
+        "chars": 0,
+        "model": _BYOK.model,
+        "lane": "wake",
+    }]
+
+
+@pytest.mark.parametrize(
+    "lane", ["heartbeat", "scheduled", "manual_wake", "screen_watch"]
+)
+def test_wake_full_chain_strips_tool_markup_after_user_decrypt(monkeypatch, lane):
+    """The wake outlet must apply the same visible-text guard as chat before
+    sealing; the assertion is intentionally after strict user-key decrypt."""
+    uid = f"u_wake_tool_markup_user_view_{lane}"
+    conftest.seed_user(uid)
+    _reset(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, lane)
+    claimed_by = _claim(job_id)
+    leaked = (
+        '<parameter name="tool_name">reply</parameter>\n'
+        "好，棋先停着\n你要干嘛去了"
+    )
+    _script_provider(monkeypatch, [_text_round(leaked)])
+    decryptor = _patch_user_decryptable_envelopes(monkeypatch, uid)
+    deps = _wake_deps(
+        tail=[{"id": "m1", "ts": 1.0, "role": "user", "content": "先停一下"}]
+    )
+    deps.apply_pending_effects = serve_worker._apply_pending_effects_for_user
+    traces = []
+    deps.emit_debug_trace = lambda user_id, event_type, **fields: traces.append(
+        {"user_id": user_id, "event_type": event_type, **fields}
+    )
+
+    try:
+        status = asyncio.run(
+            worker._run_wake(
+                job_id,
+                uid,
+                lane,
+                deps,
+                _BYOK,
+                asyncio.Semaphore(4),
+                claimed_by,
+            )
+        )
+        store = core_store.get_store(uid)
+        store.reload()
+        bubble = next(
+            row for row in store.chat_messages
+            if row.get("role") == "openclaw" and row.get("source") == "model_api"
+        )
+        plaintext = decryptor.decrypt_reply(bubble)
+    finally:
+        decryptor._http.close()
+
+    assert status == "completed"
+    assert plaintext == "好，棋先停着\n你要干嘛去了"
+    sanitized = [
+        trace for trace in traces if trace["event_type"] == "agent.reply.sanitized"
+    ]
+    assert [trace["detail"] for trace in sanitized] == [
+        {
+            "lane": lane,
+            "final": True,
+            "error_class": "upstream_unavailable",
+            "reason": "tool_markup_leak_sanitized",
+        }
+    ]
+
+
+def test_wake_markup_only_reply_fails_silently_without_bubble(monkeypatch):
+    """Wake keeps its existing degenerate lifecycle after sanitization."""
+    uid = "u_wake_tool_markup_only"
+    conftest.seed_user(uid)
+    _reset(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, "heartbeat")
+    claimed_by = _claim(job_id)
+    _script_provider(monkeypatch, [_text_round("<tool_call></tool_call>")])
+    writes = []
+    monkeypatch.setattr(
+        worker,
+        "_write_encrypted_reply",
+        lambda *_args, **_kwargs: writes.append(True),
+    )
+    deps = _wake_deps(
+        tail=[{"id": "m1", "ts": 1.0, "role": "user", "content": "在吗"}]
+    )
+
+    status = asyncio.run(
+        worker._run_wake(
+            job_id,
+            uid,
+            "heartbeat",
+            deps,
+            _BYOK,
+            asyncio.Semaphore(4),
+            claimed_by,
+        )
+    )
+
+    assert status == "failed"
+    assert writes == []
+    assert _job_status(job_id) == (
+        "failed",
+        "wake_failed:degenerate_reply_suppressed",
+    )
 
 
 def test_run_wake_reply_push_carries_is_wake_true_and_manual_wake_lane(monkeypatch):
@@ -233,6 +470,12 @@ def test_run_wake_reply_push_carries_is_wake_true_and_manual_wake_lane(monkeypat
     monkeypatch.setattr(provider_client, "chat_completion_async", _fake)
 
     pushes = []
+    shadow = []
+
+    def _send_push(uid, **kwargs):
+        pushes.append((uid, kwargs))
+        return True
+
     deps = worker.TurnDeps(
         read_messages=lambda uid: [],
         resolve_provider=lambda uid: (_BYOK, {}),
@@ -241,11 +484,14 @@ def test_run_wake_reply_push_carries_is_wake_true_and_manual_wake_lane(monkeypat
         read_summary=lambda uid: ("", 0.0, 0),
         read_messages_after_seq=lambda uid, after_seq: [],
         apply_pending_effects=serve_worker._apply_pending_effects_for_user,
-        send_reply_push=lambda uid, **kw: pushes.append((uid, kw)),
+        send_reply_push=_send_push,
+        record_wake_shadow_decision=(
+            lambda uid, **kw: shadow.append((uid, kw)) or True
+        ),
     )
 
     status = asyncio.run(worker._run_wake(
-        job_id, uid, "manual_wake", deps, _BYOK, worker.ENCLAVE_SEMAPHORE, claimed_by))
+        job_id, uid, "manual_wake", deps, _BYOK, asyncio.Semaphore(4), claimed_by))
 
     assert status == "completed"
     store = core_store.get_store(uid)
@@ -275,7 +521,23 @@ def test_run_wake_reply_push_carries_is_wake_true_and_manual_wake_lane(monkeypat
     )
     runtime_payload = json.loads(runtime_message["content"].split("\n", 1)[1])
     assert runtime_payload["runtime_control"]["manual_wake"] is True
-    assert not any(message.get("role") == "user" for message in provider_messages[0])
+    assert provider_messages[0][-1] == {
+        "role": "user",
+        "content": v2_context.PROACTIVE_TURN_BOUNDARY,
+    }
+    assert not any(
+        message.get("role") == "user"
+        and message.get("content") != v2_context.PROACTIVE_TURN_BOUNDARY
+        for message in provider_messages[0]
+    )
+    assert len(shadow) == 1
+    shadow_uid, observed = shadow[0]
+    assert shadow_uid == uid
+    assert observed["job_id"] == job_id
+    assert observed["lane"] == "manual_wake"
+    assert observed["decision_allowed"] is True
+    assert observed["apns_alert_sent"] is True
+    assert isinstance(observed["decided_at"], float)
 
 
 def test_wake_workspace_prompt_snapshot_is_loaded_once_across_rounds(
@@ -343,7 +605,7 @@ def test_wake_workspace_prompt_snapshot_is_loaded_once_across_rounds(
         "heartbeat",
         deps,
         _BYOK,
-        worker.ENCLAVE_SEMAPHORE,
+        asyncio.Semaphore(4),
         claimed_by,
     ))
 
@@ -368,7 +630,11 @@ def test_wake_workspace_prompt_failure_is_silent_before_provider(
     _reset(uid)
     job_id, _ = jobs_store.enqueue_job(uid, "heartbeat")
     claimed_by = _claim(job_id)
+    shadow = []
     deps = _wake_deps(tail=[])
+    deps.record_wake_shadow_decision = (
+        lambda uid, **kw: shadow.append((uid, kw)) or True
+    )
     deps.load_workspace_prompt = lambda *_args, **_kwargs: (
         (_ for _ in ()).throw(RuntimeError("private workspace plaintext"))
     )
@@ -396,7 +662,7 @@ def test_wake_workspace_prompt_failure_is_silent_before_provider(
         "heartbeat",
         deps,
         _BYOK,
-        worker.ENCLAVE_SEMAPHORE,
+        asyncio.Semaphore(4),
         claimed_by,
     ))
 
@@ -407,6 +673,7 @@ def test_wake_workspace_prompt_failure_is_silent_before_provider(
         "failed",
         "wake_failed:workspace_prompt_unavailable",
     )
+    assert shadow == []
 
 
 def test_run_wake_weak_wake_sleeps_no_bubble_no_error(monkeypatch):
@@ -430,15 +697,54 @@ def test_run_wake_weak_wake_sleeps_no_bubble_no_error(monkeypatch):
         worker, "_surface_terminal_error",
         lambda *a, **k: surface_called.update(n=surface_called["n"] + 1))
 
+    shadow = []
     deps = _wake_deps(tail=[{"id": "m1", "ts": 1.0, "role": "user", "content": "hi"}])
+    deps.record_wake_shadow_decision = (
+        lambda uid, **kw: shadow.append((uid, kw)) or True
+    )
     status = asyncio.run(worker._run_wake(
-        job_id, uid, "heartbeat", deps, _BYOK, worker.ENCLAVE_SEMAPHORE, claimed_by))
+        job_id, uid, "heartbeat", deps, _BYOK, asyncio.Semaphore(4), claimed_by))
 
     assert status == "completed"
     assert write_called["n"] == 0
     assert surface_called["n"] == 0
     assert _job_status(job_id)[0] == "completed"
     assert not any(e["kind"] == "error" for e in _status_events(uid))
+    assert len(shadow) == 1
+    assert shadow[0][1]["decision_allowed"] is False
+    assert shadow[0][1]["apns_alert_sent"] is False
+
+
+def test_wake_shadow_write_failure_cannot_change_the_decision(monkeypatch):
+    uid = "u_wake_shadow_fail_open"
+    conftest.seed_user(uid)
+    _reset(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, "heartbeat")
+    claimed_by = _claim(job_id)
+    _script_provider(monkeypatch, [_text_round("")])
+    deps = _wake_deps(
+        tail=[{"id": "m1", "ts": 1.0, "role": "user", "content": "hi"}]
+    )
+
+    def _observer_failure(*_args, **_kwargs):
+        raise RuntimeError("shadow database unavailable")
+
+    deps.record_wake_shadow_decision = _observer_failure
+
+    status = asyncio.run(
+        worker._run_wake(
+            job_id,
+            uid,
+            "heartbeat",
+            deps,
+            _BYOK,
+            asyncio.Semaphore(4),
+            claimed_by,
+        )
+    )
+
+    assert status == "completed"
+    assert _job_status(job_id)[0] == "completed"
 
 
 def test_automatic_heartbeat_with_empty_history_skips_the_provider(monkeypatch):
@@ -461,14 +767,21 @@ def test_automatic_heartbeat_with_empty_history_skips_the_provider(monkeypatch):
         worker, "_write_encrypted_reply",
         lambda store, text: write_called.update(n=write_called["n"] + 1) or {"id": "r"})
 
+    shadow = []
     deps = _wake_deps(tail=[])
+    deps.record_wake_shadow_decision = (
+        lambda uid, **kw: shadow.append((uid, kw)) or True
+    )
     status = asyncio.run(worker._run_wake(
-        job_id, uid, "heartbeat", deps, _BYOK, worker.ENCLAVE_SEMAPHORE, claimed_by))
+        job_id, uid, "heartbeat", deps, _BYOK, asyncio.Semaphore(4), claimed_by))
 
     assert status == "completed"
     assert provider_calls == []
     assert write_called["n"] == 0
     assert _job_status(job_id)[0] == "completed"
+    assert len(shadow) == 1
+    assert shadow[0][1]["decision_allowed"] is False
+    assert shadow[0][1]["apns_alert_sent"] is False
 
 
 @pytest.mark.parametrize(
@@ -508,7 +821,7 @@ def test_automatic_heartbeat_authoritative_no_user_history_skips_all_prompt_work
     ) or {"trusted_system_blocks": [], "working_memory": ""}
 
     status = asyncio.run(worker._run_wake(
-        job_id, uid, "heartbeat", deps, _BYOK, worker.ENCLAVE_SEMAPHORE, claimed_by))
+        job_id, uid, "heartbeat", deps, _BYOK, asyncio.Semaphore(4), claimed_by))
 
     assert status == "completed"
     assert provider_calls == []
@@ -570,7 +883,7 @@ def test_wake_injects_attention_facts_as_non_user_application_data(monkeypatch):
             "heartbeat",
             deps,
             _BYOK,
-            worker.ENCLAVE_SEMAPHORE,
+            asyncio.Semaphore(4),
             claimed_by,
         )
     )
@@ -627,7 +940,7 @@ def test_run_wake_degenerate_reply_fails_silently(monkeypatch):
             "heartbeat",
             deps,
             _BYOK,
-            worker.ENCLAVE_SEMAPHORE,
+            asyncio.Semaphore(4),
             claimed_by,
         )
     )
@@ -669,7 +982,7 @@ def test_heartbeat_thinking_only_is_successful_silence_without_backoff(
             "heartbeat",
             deps,
             _BYOK,
-            worker.ENCLAVE_SEMAPHORE,
+            asyncio.Semaphore(4),
             claimed_by,
         )
     )
@@ -703,7 +1016,7 @@ def test_scheduled_thinking_only_remains_a_must_deliver_failure(monkeypatch):
             "scheduled",
             _wake_deps(tail=[]),
             _BYOK,
-            worker.ENCLAVE_SEMAPHORE,
+            asyncio.Semaphore(4),
             claimed_by,
         )
     )
@@ -762,7 +1075,7 @@ def test_run_scheduled_wake_prompts_with_the_exact_due_reminders(monkeypatch):
         "scheduled",
         deps,
         _BYOK,
-        worker.ENCLAVE_SEMAPHORE,
+        asyncio.Semaphore(4),
         claimed_by,
     ))
 
@@ -778,7 +1091,9 @@ def test_run_scheduled_wake_prompts_with_the_exact_due_reminders(monkeypatch):
         for message in seen["messages"]
         if message.get("role") == "user"
     )
-    assert user_text == ""
+    assert user_text == v2_context.PROACTIVE_TURN_BOUNDARY
+    assert "提醒我喝水" not in user_text
+    assert "提醒我拉伸" not in user_text
     runtime_text = "\n".join(
         str(message.get("content") or "")
         for message in seen["messages"]
@@ -829,6 +1144,73 @@ def test_run_scheduled_wake_prompts_with_the_exact_due_reminders(monkeypatch):
     assert "提醒我拉伸" not in repr(events)
 
 
+def test_scheduled_wake_does_not_send_claude_48_an_assistant_prefill(monkeypatch):
+    """Claude 4.6+ rejects a final assistant message with HTTP 400.
+
+    Keep the reminder in assistant-role application data, but terminate the
+    provider request with the fixed non-user transport marker. This reproduces
+    the OpenRouter/Opus 4.8 failure seen on Test on 2026-08-14: without the
+    boundary this fake provider raises exactly where the real route did.
+    """
+    uid = "u_wake_claude_48_prefill"
+    conftest.seed_user(uid)
+    _reset(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, "scheduled")
+    claimed_by = _claim(job_id)
+    config = provider_client.ProviderConfig(
+        provider="openrouter",
+        model="anthropic/claude-opus-4.8",
+        api_key="sk-user-byok",
+        base_url="https://openrouter.ai/api/v1",
+    )
+    calls = []
+
+    async def _claude_48(_config, messages, *, tools=None, **_kwargs):
+        calls.append(messages)
+        if messages[-1].get("role") == "assistant":
+            raise provider_client.ProviderError(
+                "provider_http_400: This model does not support assistant "
+                "message prefill. The conversation must end with a user message.",
+                status_code=400,
+            )
+        return _text_round("两分钟到了，该出门啦。")
+
+    monkeypatch.setattr(provider_client, "chat_completion_async", _claude_48)
+    monkeypatch.setattr(
+        worker,
+        "_write_encrypted_reply",
+        lambda _store, _text: {"id": "scheduled-claude-48-reply"},
+    )
+    deps = _wake_deps(tail=[])
+    deps.read_scheduled_wake_context = lambda _user_id, _job_id: [
+        {"note": "提醒我出门", "fired_at": 123.0}
+    ]
+
+    status = asyncio.run(
+        worker._run_wake(
+            job_id,
+            uid,
+            "scheduled",
+            deps,
+            config,
+            asyncio.Semaphore(4),
+            claimed_by,
+        )
+    )
+
+    assert status == "completed"
+    assert len(calls) == 1
+    assert calls[0][-1] == {
+        "role": "user",
+        "content": v2_context.PROACTIVE_TURN_BOUNDARY,
+    }
+    assert any(
+        message.get("role") == "assistant"
+        and "提醒我出门" in str(message.get("content") or "")
+        for message in calls[0]
+    )
+
+
 def test_run_perception_wake_injects_trigger_as_untrusted_runtime_data(monkeypatch):
     uid = "u_wake_perception_context"
     conftest.seed_user(uid)
@@ -867,7 +1249,7 @@ def test_run_perception_wake_injects_trigger_as_untrusted_runtime_data(monkeypat
         "heartbeat",
         deps,
         _BYOK,
-        worker.ENCLAVE_SEMAPHORE,
+        asyncio.Semaphore(4),
         claimed_by,
     ))
 
@@ -891,7 +1273,7 @@ def test_run_perception_wake_injects_trigger_as_untrusted_runtime_data(monkeypat
         message.get("content")
         for message in seen["messages"]
         if message.get("role") == "user"
-    ] == ["hi"]
+    ] == ["hi", v2_context.PROACTIVE_TURN_BOUNDARY]
     runtime_text = str(runtime_messages[0]["content"])
     assert '"perception_wake"' in runtime_text
     assert "arrived_at_anchor" in runtime_text
@@ -950,7 +1332,7 @@ def test_broadcast_edge_wake_reply_policy(
             "heartbeat",
             deps,
             _BYOK,
-            worker.ENCLAVE_SEMAPHORE,
+            asyncio.Semaphore(4),
             claimed_by,
         )
     )
@@ -1149,7 +1531,7 @@ def test_ordinary_heartbeat_final_reply_persists_glance_before_finish(
             "heartbeat",
             deps,
             _BYOK,
-            worker.ENCLAVE_SEMAPHORE,
+            asyncio.Semaphore(4),
             claimed_by,
         )
     )
@@ -1365,7 +1747,7 @@ def test_run_perception_wake_hands_late_context_to_successor(monkeypatch):
         "heartbeat",
         deps,
         _BYOK,
-        worker.ENCLAVE_SEMAPHORE,
+        asyncio.Semaphore(4),
         claimed_by,
     ))
 
@@ -1448,9 +1830,13 @@ def test_run_wake_provider_error_silent_mark_failed(monkeypatch):
         worker, "_surface_terminal_error",
         lambda *a, **k: surface_called.update(n=surface_called["n"] + 1))
 
+    shadow = []
     deps = _wake_deps(tail=[{"id": "m1", "ts": 1.0, "role": "user", "content": "hi"}])
+    deps.record_wake_shadow_decision = (
+        lambda uid, **kw: shadow.append((uid, kw)) or True
+    )
     status = asyncio.run(worker._run_wake(
-        job_id, uid, "manual_wake", deps, _BYOK, worker.ENCLAVE_SEMAPHORE, claimed_by))
+        job_id, uid, "manual_wake", deps, _BYOK, asyncio.Semaphore(4), claimed_by))
 
     assert status == "failed"
     assert write_called["n"] == 0
@@ -1460,6 +1846,7 @@ def test_run_wake_provider_error_silent_mark_failed(monkeypatch):
     assert row[1] == "wake_failed:runtimeerror"
     assert not any(e["kind"] == "error" for e in _status_events(uid))
     assert jobs_store.get_wake_schedule(uid) is None
+    assert shadow == [], "provider failures are not model allow/suppress decisions"
 
 
 def test_run_wake_unexpected_exception_also_silent_mark_failed(monkeypatch):
@@ -1488,7 +1875,7 @@ def test_run_wake_unexpected_exception_also_silent_mark_failed(monkeypatch):
         lambda *a, **k: surface_called.update(n=surface_called["n"] + 1))
 
     status = asyncio.run(worker._run_wake(
-        job_id, uid, "heartbeat", deps, _BYOK, worker.ENCLAVE_SEMAPHORE, claimed_by))
+        job_id, uid, "heartbeat", deps, _BYOK, asyncio.Semaphore(4), claimed_by))
 
     assert status == "failed"
     assert surface_called["n"] == 0
@@ -1533,7 +1920,7 @@ def test_run_wake_tolerates_missing_read_summary_read_tail(monkeypatch):
     )
 
     status = asyncio.run(worker._run_wake(
-        job_id, uid, "heartbeat", deps, _BYOK, worker.ENCLAVE_SEMAPHORE, claimed_by))
+        job_id, uid, "heartbeat", deps, _BYOK, asyncio.Semaphore(4), claimed_by))
 
     assert status == "completed"
     assert provider_calls == []
@@ -1584,7 +1971,7 @@ def test_run_wake_provider_config_error_sets_payment_cooldown(monkeypatch):
     deps = _wake_deps(tail=[{"id": "m1", "ts": 1.0, "role": "user", "content": "hi"}])
     before = time.time()
     status = asyncio.run(worker._run_wake(
-        job_id, uid, "heartbeat", deps, _BYOK, worker.ENCLAVE_SEMAPHORE, claimed_by))
+        job_id, uid, "heartbeat", deps, _BYOK, asyncio.Semaphore(4), claimed_by))
     after = time.time()
 
     assert status == "failed"
@@ -1632,7 +2019,7 @@ def test_run_wake_rollback_blocks_provider_cooldown_write(monkeypatch):
     deps.runtime_mode_enabled = lambda _uid: next(mode_checks)
 
     status = asyncio.run(worker._run_wake(
-        job_id, uid, "heartbeat", deps, _BYOK, worker.ENCLAVE_SEMAPHORE, claimed_by))
+        job_id, uid, "heartbeat", deps, _BYOK, asyncio.Semaphore(4), claimed_by))
 
     assert status == "failed"
     assert cooldown_calls == []
@@ -1663,7 +2050,7 @@ def test_run_wake_lost_lease_blocks_provider_cooldown_write(monkeypatch):
     )
     status = asyncio.run(worker._run_wake(
         job_id, uid, "heartbeat", deps, _BYOK,
-        worker.ENCLAVE_SEMAPHORE, claimed_by))
+        asyncio.Semaphore(4), claimed_by))
 
     assert status == "failed"
     assert cooldown_calls == []
@@ -1693,7 +2080,7 @@ def test_run_wake_transient_error_does_not_set_payment_cooldown(monkeypatch):
 
     deps = _wake_deps(tail=[{"id": "m1", "ts": 1.0, "role": "user", "content": "hi"}])
     status = asyncio.run(worker._run_wake(
-        job_id, uid, "heartbeat", deps, _BYOK, worker.ENCLAVE_SEMAPHORE, claimed_by))
+        job_id, uid, "heartbeat", deps, _BYOK, asyncio.Semaphore(4), claimed_by))
 
     assert status == "failed"
     assert _job_status(job_id)[0] == "failed"
@@ -1797,7 +2184,7 @@ def test_wake_tells_the_provider_that_an_empty_reply_is_acceptable(monkeypatch):
 
     deps = _wake_deps(tail=[{"id": "m1", "ts": 1.0, "role": "user", "content": "hi"}])
     status = asyncio.run(worker._run_wake(
-        job_id, uid, "heartbeat", deps, _BYOK, worker.ENCLAVE_SEMAPHORE, claimed_by))
+        job_id, uid, "heartbeat", deps, _BYOK, asyncio.Semaphore(4), claimed_by))
 
     # 这一条断言的**主体是 tool_loop**，不是 wake lane 的策略：a0ac5257（V2 空回复
     # 恢复）之后 `run_tool_loop` 对 provider_client 恒传 `require_reply=False`
@@ -1825,12 +2212,13 @@ def _empty_round(*, stop_reason="end_turn"):
 
 
 def _seen_lane_policy(monkeypatch):
-    """记录 `_run_wake` 交给 `run_tool_loop` 的 require_reply —— 唯一还有意义的边界。"""
+    """记录 `_run_wake` 交给 `run_tool_loop` 的 lane-specific seams。"""
     seen = {}
     orig = worker.v2_tool_loop.run_tool_loop
 
     async def _spy(*a, **kw):
         seen["require_reply"] = kw.get("require_reply")
+        seen["on_provider_tool_surface"] = kw.get("on_provider_tool_surface")
         return await orig(*a, **kw)
 
     monkeypatch.setattr(worker.v2_tool_loop, "run_tool_loop", _spy)
@@ -1864,14 +2252,55 @@ def test_only_scheduled_wake_demands_a_reply(monkeypatch, lane, expected_require
     _script_provider(monkeypatch, [_text_round("something to say")])
     monkeypatch.setattr(
         worker, "_write_encrypted_reply", lambda store, text: {"id": "r"})
+    deps = _wake_deps(
+        tail=[{"id": "m1", "ts": 1.0, "role": "user", "content": "hi"}]
+    )
+    deps.emit_debug_trace = lambda *_args, **_kwargs: None
 
     asyncio.run(worker._run_wake(
-        job_id, uid, lane, deps := _wake_deps(
-            tail=[{"id": "m1", "ts": 1.0, "role": "user", "content": "hi"}]),
-        _BYOK, worker.ENCLAVE_SEMAPHORE, claimed_by))
+        job_id, uid, lane, deps,
+        _BYOK, asyncio.Semaphore(4), claimed_by))
     assert deps is not None
 
     assert seen["require_reply"] is expected_require_reply, seen
+    assert seen["on_provider_tool_surface"] is not None, seen
+
+
+def test_wake_provider_tool_surface_trace_carries_wake_kind(monkeypatch):
+    uid = "u_wake_provider_surface_trace"
+    conftest.seed_user(uid)
+    _reset(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, "scheduled")
+    claimed_by = _claim(job_id)
+    traces = []
+    _script_provider(monkeypatch, [_text_round("scheduled reply")])
+    monkeypatch.setattr(
+        worker, "_write_encrypted_reply", lambda store, text: {"id": "r"}
+    )
+    deps = _wake_deps(
+        tail=[{"id": "m1", "ts": 1.0, "role": "user", "content": "hi"}]
+    )
+    deps.emit_debug_trace = lambda user_id, event_type, **fields: traces.append(
+        {"user_id": user_id, "type": event_type, **fields}
+    )
+
+    status = asyncio.run(worker._run_wake(
+        job_id,
+        uid,
+        "scheduled",
+        deps,
+        _BYOK,
+        asyncio.Semaphore(4),
+        claimed_by,
+    ))
+
+    assert status == "completed"
+    surface = next(
+        trace for trace in traces if trace["type"] == "mcp.surface.provider"
+    )
+    assert surface["detail"]["lane"] == "scheduled"
+    assert surface["detail"]["wake_kind"] == "scheduled"
+    assert surface["detail"]["sent_tool_count"] > 0
 
 
 def test_scheduled_wake_empty_reply_fails_instead_of_completing_silently(monkeypatch):
@@ -1883,9 +2312,8 @@ def test_scheduled_wake_empty_reply_fails_instead_of_completing_silently(monkeyp
     空回复走聊天道时是可见的 `turn_failed:empty_reply`——两条道对同一个事实
     给出相反的结论，而只有静默的那条是用户在踩的。
 
-    这里锁的是「不许静默成功」。至于失败**该不该让用户看见**是另一个问题：
-    `_run_wake` 的 except 明写 "silent mark_failed, never surface/bubble"，
-    本用例不碰那个决定。
+    这里同时锁两层：不许静默成功，而且最终失败必须进入 durable visibility
+    outbox；否则后台虽然红了，手机端仍和旧行为一样什么都看不到。
     """
     uid = "u_wake_sched_empty"
     conftest.seed_user(uid)
@@ -1894,6 +2322,14 @@ def test_scheduled_wake_empty_reply_fails_instead_of_completing_silently(monkeyp
     claimed_by = _claim(job_id)
 
     calls = _script_provider(monkeypatch, [_empty_round(), _empty_round()])
+    surfaced = []
+    monkeypatch.setattr(
+        worker,
+        "_surface_terminal_error",
+        lambda deps, user_id, failed_job_id, code: surfaced.append(
+            (user_id, failed_job_id, code)
+        ),
+    )
     write_called = {"n": 0}
     monkeypatch.setattr(
         worker, "_write_encrypted_reply",
@@ -1902,7 +2338,7 @@ def test_scheduled_wake_empty_reply_fails_instead_of_completing_silently(monkeyp
     status = asyncio.run(worker._run_wake(
         job_id, uid, "scheduled",
         _wake_deps(tail=[{"id": "m1", "ts": 1.0, "role": "user", "content": "hi"}]),
-        _BYOK, worker.ENCLAVE_SEMAPHORE, claimed_by))
+        _BYOK, asyncio.Semaphore(4), claimed_by))
 
     assert status != "completed", "定时提醒返空竟然算成功了——正是本用例要挡的回归"
     st, last_error = _job_status(job_id)
@@ -1912,6 +2348,26 @@ def test_scheduled_wake_empty_reply_fails_instead_of_completing_silently(monkeyp
     # 先重试一轮再判死：判死前必须真的给过第二次机会，否则这就退化成
     # 「把静默成功换成快速失败」，用户拿到的东西一样少。
     assert len(calls) == 2, calls
+    correction_text = "\n".join(
+        str(message.get("content") or "")
+        for message in calls[1]["messages"]
+        if message.get("role") == "system"
+    )
+    assert worker._SCHEDULED_WAKE_EMPTY_RESPONSE_CORRECTION in correction_text
+    assert surfaced == [(uid, job_id, "wake_failed:empty_reply")]
+    with db.get_pool().connection() as conn:
+        marker = conn.execute(
+            "SELECT error_code,error_class,reply_frontier_seq,"
+            "reply_parent_message_id FROM v2_terminal_failure_outbox "
+            "WHERE job_id=%s",
+            (job_id,),
+        ).fetchone()
+    assert marker == (
+        "wake_failed:empty_reply",
+        "provider_empty_reply",
+        None,
+        None,
+    )
 
 
 def test_scheduled_wake_empty_reply_recovers_on_the_correction_retry(monkeypatch):
@@ -1936,7 +2392,7 @@ def test_scheduled_wake_empty_reply_recovers_on_the_correction_retry(monkeypatch
     status = asyncio.run(worker._run_wake(
         job_id, uid, "scheduled",
         _wake_deps(tail=[{"id": "m1", "ts": 1.0, "role": "user", "content": "hi"}]),
-        _BYOK, worker.ENCLAVE_SEMAPHORE, claimed_by))
+        _BYOK, asyncio.Semaphore(4), claimed_by))
 
     assert status == "completed", _job_status(job_id)
     assert written.get("text") == "该喝水啦"
@@ -1987,7 +2443,7 @@ def test_wake_lanes_without_fresh_text_ask_for_alwayson_only(monkeypatch, lane):
 
     status = asyncio.run(worker._run_wake(
         job_id, uid, lane, _wake_deps_with_worldbook(seen),
-        _BYOK, worker.ENCLAVE_SEMAPHORE, claimed_by))
+        _BYOK, asyncio.Semaphore(4), claimed_by))
 
     assert status == "completed", _job_status(job_id)
     assert seen.get("n") == 1, f"{lane} 没有去取世界书: {seen}"
@@ -2026,7 +2482,7 @@ def test_scheduled_wake_matches_the_reminder_note(monkeypatch):
     })
 
     status = asyncio.run(worker._run_wake(
-        job_id, uid, "scheduled", deps, _BYOK, worker.ENCLAVE_SEMAPHORE, claimed_by))
+        job_id, uid, "scheduled", deps, _BYOK, asyncio.Semaphore(4), claimed_by))
 
     assert status == "completed", _job_status(job_id)
     contents = [m.get("content") for m in seen.get("messages") or []]
@@ -2050,7 +2506,7 @@ def test_worldbook_failure_does_not_kill_the_wake(monkeypatch):
 
     status = asyncio.run(worker._run_wake(
         job_id, uid, "heartbeat", _wake_deps_with_worldbook(seen, boom=True),
-        _BYOK, worker.ENCLAVE_SEMAPHORE, claimed_by))
+        _BYOK, asyncio.Semaphore(4), claimed_by))
 
     assert status == "completed", _job_status(job_id)
     assert written.get("text") == "在想你呢"

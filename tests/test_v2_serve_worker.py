@@ -82,9 +82,19 @@ def test_temporal_snapshot_prefers_registry_timezone_and_freezes_timestamp(
         lambda _user_id: "Asia/Shanghai",
     )
     monkeypatch.setattr(
+        serve_worker.accounts_registry,
+        "_get_user_archive_language",
+        lambda _user_id: "zh-Hans",
+    )
+    monkeypatch.setattr(
         serve_worker.perception_service,
         "stable_context_timezone",
         lambda _user_id: calls.append("perception") or "Europe/Berlin",
+    )
+    monkeypatch.setattr(
+        serve_worker.perception_service,
+        "stable_context_locale",
+        lambda _user_id: "en-US",
     )
     monkeypatch.setattr(
         serve_worker.db,
@@ -101,6 +111,8 @@ def test_temporal_snapshot_prefers_registry_timezone_and_freezes_timestamp(
 
     assert snapshot == {
         "timezone": "Asia/Shanghai",
+        "locale": "en-US",
+        "archive_language": "zh-Hans",
         "last_user_message_ts": 123.0,
     }
     assert calls == [("u-time", 42)]
@@ -113,6 +125,11 @@ def test_temporal_snapshot_uses_perception_then_china_default(monkeypatch):
         lambda _user_id: None,
     )
     monkeypatch.setattr(
+        serve_worker.accounts_registry,
+        "_get_user_archive_language",
+        lambda _user_id: "",
+    )
+    monkeypatch.setattr(
         serve_worker.db,
         "chat_latest_genuine_user_ts",
         lambda _user_id, *, through_seq=None: None,
@@ -121,6 +138,11 @@ def test_temporal_snapshot_uses_perception_then_china_default(monkeypatch):
         serve_worker.perception_service,
         "stable_context_timezone",
         lambda _user_id: "Europe/Berlin",
+    )
+    monkeypatch.setattr(
+        serve_worker.perception_service,
+        "stable_context_locale",
+        lambda _user_id: "",
     )
     assert serve_worker._read_temporal_snapshot("u-time")["timezone"] == (
         "Europe/Berlin"
@@ -338,34 +360,54 @@ def test_run_forever_backoff_is_bounded(monkeypatch):
     assert sleeps[-1] == serve_worker._RELAUNCH_BACKOFF_MAX_SEC
 
 
-def test_db_pool_capacity_scales_for_nested_effect_sinks(monkeypatch):
-    monkeypatch.delenv("FEEDLING_DB_POOL_MAX_SIZE", raising=False)
-    monkeypatch.delenv(
-        "FEEDLING_V2_WORKSPACE_WRITE_PARALLELISM", raising=False
-    )
+def test_runtime_db_pool_limits_are_parent_eight_and_each_child_two(monkeypatch):
+    from model_api_runtime.v2 import pool_config
 
-    # Sixteen simultaneous drains may each hold an outer generation connection.
-    # While one workspace batch occupies four shared nested CAS slots, the other
-    # turns may each need an ordinary nested sink connection too. The
-    # conservative floor is 2*16 + 4 workspace + 4 operational headroom.
-    assert serve_worker._configure_db_pool_capacity(16) == 40
-    assert __import__("os").environ["FEEDLING_DB_POOL_MAX_SIZE"] == "40"
+    config = pool_config.RuntimePoolConfig.from_env()
 
-
-def test_db_pool_capacity_rejects_explicit_saturation_cliff(monkeypatch):
-    monkeypatch.setenv("FEEDLING_V2_WORKSPACE_WRITE_PARALLELISM", "4")
-    monkeypatch.setenv("FEEDLING_DB_POOL_MAX_SIZE", "39")
-
-    with pytest.raises(RuntimeError, match=r"too small.*require >= 40"):
-        serve_worker._configure_db_pool_capacity(16)
+    assert len(config.slots) == 8
+    assert serve_worker._runtime_db_pool_limits(config) == (8, 2)
+    assert 8 + (len(config.slots) * 2) == 24
 
 
 @pytest.mark.parametrize("raw", ["0", "-1", "nope"])
-def test_db_pool_capacity_bad_override_fails_closed(monkeypatch, raw):
-    monkeypatch.setenv("FEEDLING_DB_POOL_MAX_SIZE", raw)
+def test_db_explicit_process_pool_limit_fails_closed(monkeypatch, raw):
+    monkeypatch.setattr(serve_worker.db, "_pool", None)
 
-    with pytest.raises(RuntimeError, match="FEEDLING_DB_POOL_MAX_SIZE"):
-        serve_worker._configure_db_pool_capacity(4)
+    with pytest.raises(RuntimeError, match="pool max size"):
+        serve_worker.db.configure_pool_max_size(raw)
+
+
+def test_db_explicit_child_pool_limit_is_effectively_two(monkeypatch):
+    monkeypatch.setattr(serve_worker.db, "_pool", None)
+    monkeypatch.delenv("FEEDLING_DB_POOL_MAX_SIZE", raising=False)
+
+    assert serve_worker.db.configure_pool_max_size(2) == 2
+    assert serve_worker.db._pool_max_size() == 2
+
+
+def test_main_configures_parent_pool_to_eight_before_db_startup(monkeypatch):
+    order = []
+    monkeypatch.setattr(
+        serve_worker.runner_identity, "resolve_worker_id", lambda _default: "worker"
+    )
+    monkeypatch.setattr(
+        serve_worker.db,
+        "configure_pool_max_size",
+        lambda value: order.append(("configure", value)) or value,
+    )
+    monkeypatch.setattr(
+        serve_worker.db, "init_schema", lambda: order.append(("init", None))
+    )
+    monkeypatch.setattr(serve_worker, "wire_assembly", lambda: None)
+    monkeypatch.setattr(
+        serve_worker.accounts_registry, "start_periodic_full_reload", lambda: None
+    )
+    monkeypatch.setattr(serve_worker, "_run_forever", lambda *_args: None)
+
+    serve_worker.main()
+
+    assert order == [("configure", 8), ("init", None)]
 
 
 @pytest.mark.parametrize("raw", ["0", "-1", "nan", "inf", "nope"])
@@ -567,6 +609,58 @@ def test_v2_debug_trace_user_seam_resolves_store_and_preserves_duration(monkeypa
             },
         ),
     ]
+
+
+def test_context_truncation_reaches_final_debug_event_without_upstream_content(
+    monkeypatch,
+):
+    from admin import data_track
+    from diagnostics import diagnostics_core
+
+    store = types.SimpleNamespace(user_id="usr_t047")
+    monkeypatch.setattr(
+        serve_worker.core_store,
+        "get_store",
+        lambda _uid: store,
+    )
+    persisted = []
+    monkeypatch.setattr(
+        diagnostics_core.debug_trace,
+        "trace_event",
+        lambda resolved_store, **event: persisted.append(
+            {"user_id": resolved_store.user_id, **event}
+        ),
+    )
+    deps = serve_worker.build_production_deps()
+    rare_secret = "T047_UPSTREAM_SECRET_MUST_NOT_REACH_ADMIN"
+
+    worker._emit_context_truncation_trace(
+        deps,
+        store.user_id,
+        {
+            "tail_window": {
+                "profile_cards_truncated": True,
+                "worldbook_truncated": False,
+            },
+            "messages": [],
+            "unexpected_upstream_content": rare_secret,
+        },
+    )
+
+    assert len(persisted) == 1
+    event = persisted[0]
+    assert event["type"] == "context.truncation"
+    assert event["detail"] == {
+        "counts": {
+            "profile_cards_truncated": 1,
+            "worldbook_truncated": 0,
+        }
+    }
+    raw_admin_response = json.dumps(
+        data_track._debug_event_public_json(event),
+        ensure_ascii=False,
+    )
+    assert rare_secret not in raw_admin_response
 
 def test_v2_mcp_mixed_reachable_and_unreachable_servers_are_traced_and_recorded(
     monkeypatch,
@@ -1289,7 +1383,6 @@ class _HealthySupervisor:
 
 def test_turn_heartbeat_advertises_slot_capacity(monkeypatch):
     calls = []
-    monkeypatch.setattr(worker, "MAX_WORKERS", 12)
     monkeypatch.setattr(
         jobs_store,
         "record_worker_heartbeat",
@@ -1309,8 +1402,95 @@ def test_turn_heartbeat_advertises_slot_capacity(monkeypatch):
         await asyncio.wait_for(task, timeout=1.0)
 
     asyncio.run(_driver())
-    assert calls[0] == ("worker-a", {"capacity": 12, "kind": "turn"})
-    assert calls[-1] == ("worker-a", {"capacity": 0, "kind": "turn"})
+    assert calls[0] == (
+        "worker-a",
+        {
+            "capacity": 1,
+            "kind": "turn",
+            "pool": "foreground",
+            "runtime_state": {
+                "slot": {"stage": "starting", "busy": False}
+            },
+        },
+    )
+    assert calls[-1] == (
+        "worker-a",
+        {
+            "capacity": 0,
+            "kind": "turn",
+            "pool": "foreground",
+            "runtime_state": {
+                "slot": {"stage": "stopping", "busy": False}
+            },
+        },
+    )
+
+
+def test_foreground_fleet_heartbeat_runtime_state_is_bounded_and_identifier_free(
+    monkeypatch,
+):
+    from model_api_runtime.v2 import pool_supervisor
+
+    stop = asyncio.Event()
+    calls = []
+
+    class _Pool:
+        def get_stats(self):
+            return {"pool_size": 8, "pool_available": 5, "requests_waiting": 0}
+
+    class _Fleet:
+        def keys(self):
+            return tuple(
+                [pool_supervisor.SlotKey("foreground", index) for index in range(4)]
+                + [pool_supervisor.SlotKey("wake", index) for index in range(2)]
+                + [pool_supervisor.SlotKey("heavy", index) for index in range(2)]
+            )
+
+        def healthy_capacity(self, pool, *, stale_sec):
+            return 4 if pool == "foreground" else 2
+
+        def snapshots(self):
+            return {key: None for key in self.keys()}
+
+        def broker_snapshot(self):
+            return {
+                "limit": 4,
+                "total_granted": 0,
+                "granted": {"foreground": 0, "wake": 0, "heavy": 0},
+                "waiting": {"foreground": 0, "wake": 0, "heavy": 0},
+            }
+
+    monkeypatch.setattr(serve_worker.db, "get_pool", lambda: _Pool())
+
+    def _record(worker_id, **kwargs):
+        calls.append((worker_id, kwargs))
+        stop.set()
+
+    monkeypatch.setattr(jobs_store, "record_worker_heartbeat", _record)
+    asyncio.run(
+        serve_worker._fleet_heartbeat_loop(
+            "worker",
+            "foreground",
+            _Fleet(),
+            stop,
+            interval=0.01,
+        )
+    )
+
+    state = calls[0][1]["runtime_state"]
+    encoded = json.dumps(state, sort_keys=True)
+    assert len(encoded.encode("utf-8")) < 4096
+    for forbidden in (
+        "user_id",
+        "job_id",
+        "claimed_by",
+        "slot_generation",
+        "provider_url",
+        "message_text",
+        "memory_content",
+        "exception",
+    ):
+        assert forbidden not in encoded
 
 
 # ------------------------------------------------------------------
@@ -1868,7 +2048,7 @@ def test_send_reply_push_posts_to_backend(monkeypatch):
         status_code = 200
 
         def json(self):
-            return {"status": "delivered"}
+            return {"status": "delivered", "apns_alert_sent": True}
 
     def _fake_post(url, json=None, headers=None, timeout=None):
         posted.update(url=url, json=json, headers=headers, timeout=timeout)
@@ -1877,8 +2057,16 @@ def test_send_reply_push_posts_to_backend(monkeypatch):
     monkeypatch.setenv("FEEDLING_API_URL", "http://backend:5001")
     monkeypatch.setattr(serve_worker.httpx, "post", _fake_post)
 
-    serve_worker._send_reply_push(
-        "u_push_send", msg_id="m1", body="hi", is_wake=True, lane="manual_wake")
+    assert (
+        serve_worker._send_reply_push(
+            "u_push_send",
+            msg_id="m1",
+            body="hi",
+            is_wake=True,
+            lane="manual_wake",
+        )
+        is True
+    )
 
     assert posted["url"] == "http://backend:5001/v1/internal/push/ai_reply"
     assert posted["json"] == {
@@ -1922,13 +2110,51 @@ def test_send_reply_push_swallows_transport_errors(monkeypatch):
     monkeypatch.setattr(serve_worker.httpx, "post", _boom)
 
     # 不抛：推送失败绝不能冒到回合上去。
-    serve_worker._send_reply_push("u_push_err", msg_id="m1", body="hi", is_wake=False)
+    assert serve_worker._send_reply_push(
+        "u_push_err", msg_id="m1", body="hi", is_wake=False) is False
+
+
+def test_record_wake_shadow_converts_decision_time_to_user_local_clock(monkeypatch):
+    from datetime import datetime, timezone
+
+    decided_at = datetime(2026, 8, 13, 16, 5, tzinfo=timezone.utc).timestamp()
+    monkeypatch.setattr(
+        serve_worker.accounts_registry,
+        "_get_user_timezone",
+        lambda _uid: "Asia/Shanghai",
+    )
+    observed = {}
+    monkeypatch.setattr(
+        serve_worker.jobs_store,
+        "record_wake_shadow_decision",
+        lambda **kwargs: observed.update(kwargs) or True,
+    )
+
+    assert serve_worker._record_wake_shadow_decision(
+        "u_shadow_local",
+        job_id=42,
+        lane="heartbeat",
+        decision_allowed=True,
+        apns_alert_sent=False,
+        decided_at=decided_at,
+    ) is True
+    assert observed == {
+        "job_id": 42,
+        "local_day": datetime(2026, 8, 14).date(),
+        "local_hour": 0,
+        "local_minute": 5,
+        "lane": "heartbeat",
+        "decision_allowed": True,
+        "apns_alert_sent": False,
+        "decided_at": decided_at,
+    }
 
 
 def test_kill_switch_unwires_the_push_dep(monkeypatch):
     monkeypatch.setenv("FEEDLING_V2_PUSH_ENABLED", "0")
     deps = serve_worker.build_production_deps()
     assert deps.send_reply_push is None
+    assert deps.record_wake_shadow_decision is serve_worker._record_wake_shadow_decision
 
 
 def test_worldbook_reader_forwards_current_turn_and_runtime_token(monkeypatch):

@@ -38,6 +38,61 @@ def _build_asgi_app() -> FastAPI:
 
 _ASGI = _build_asgi_app()
 
+_HEARTBEATS = [
+    {
+        "worker_id": "worker:foreground",
+        "kind": "turn",
+        "capacity": 4,
+        "pool": "foreground",
+        "runtime_state": {
+            "slots": {"configured": 4, "healthy": 4, "busy": 2, "restarting": 0},
+            "enclave": {
+                "limit": 4,
+                "granted": {"foreground": 2, "wake": 1, "heavy": 1},
+                "waiting": {"foreground": 0, "wake": 0, "heavy": 2},
+                "wait_p95_ms": {"foreground": 5.0, "wake": 12.0, "heavy": 300.0},
+            },
+            "db_pools": {
+                "parent": {"max": 8, "used": 3, "waiting": 0, "timeouts": 0},
+                "slot": {"processes": 8, "max_each": 2, "used": 7, "waiting": 0, "timeouts": 0},
+            },
+            "isolation_events": {
+                "watchdog_kills": {"heavy:profile:stall": 1},
+                "stale_owner_rejections": 2,
+                "preemption_exit_p95_ms": 140.0,
+                "watchdog_release_p95_ms": 250.0,
+                "admission_rejects": {"no_foreground_capacity": 0, "over_sla": 1, "control_halted": 0},
+            },
+            "profile_runtime": {
+                "card_count_max": 554,
+                "batch_count": 9,
+                "provider_calls_max": 3,
+                "stage_p95_ms": {"fetch_batch": 410.0, "provider": 42000.0},
+            },
+        },
+        "beat_at_epoch": 1234.0,
+        "age_sec": 2.0,
+    },
+    {
+        "worker_id": "worker:wake",
+        "kind": "turn",
+        "capacity": 2,
+        "pool": "wake",
+        "runtime_state": {"slots": {"configured": 2, "healthy": 2, "busy": 1, "restarting": 0}},
+        "beat_at_epoch": 1233.0,
+        "age_sec": 3.0,
+    },
+    {
+        "worker_id": "worker:heavy",
+        "kind": "turn",
+        "capacity": 2,
+        "pool": "heavy",
+        "runtime_state": {"slots": {"configured": 2, "healthy": 2, "busy": 1, "restarting": 0}},
+        "beat_at_epoch": 1232.0,
+        "age_sec": 4.0,
+    },
+]
+
 
 @pytest.fixture()
 def env(monkeypatch):
@@ -46,18 +101,32 @@ def env(monkeypatch):
     monkeypatch.setattr(jobs_store, "pending_job_count", lambda: 1)
     monkeypatch.setattr(jobs_store, "live_worker_count", lambda **kw: 2)
     monkeypatch.setattr(jobs_store, "live_worker_capacity", lambda **kw: 8)
+    monkeypatch.setattr(jobs_store, "recent_worker_heartbeats", lambda **kw: _HEARTBEATS)
+    monkeypatch.setattr(jobs_store, "recent_worker_heartbeat_count", lambda **kw: 3)
     monkeypatch.setattr(
         jobs_store,
-        "recent_worker_heartbeats",
-        lambda **kw: [{
-            "worker_id": "v2-worker-pod-1-abcd-deadbeef1234",
-            "kind": "turn",
-            "capacity": 8,
-            "beat_at_epoch": 1234.0,
-            "age_sec": 2.0,
-        }],
+        "pool_queue_metrics",
+        lambda: {
+            "foreground": {"pending": 1, "oldest_pending_sec": 3.5, "claim_p95_ms": 80.0},
+            "wake": {"pending": 0, "oldest_pending_sec": None, "claim_p95_ms": 120.0},
+            "heavy": {"pending": 2, "oldest_pending_sec": 40.0, "claim_p95_ms": 900.0},
+        },
     )
-    monkeypatch.setattr(jobs_store, "recent_worker_heartbeat_count", lambda **kw: 1)
+    monkeypatch.setattr(
+        jobs_store,
+        "job_counts_by_lane",
+        lambda: {"chat": {"pending": 1, "active": 2}, "profile": {"pending": 0, "active": 1}},
+    )
+    monkeypatch.setattr(
+        jobs_store,
+        "recent_preemption_counts",
+        lambda **kw: {"profile:terminal": 1, "scheduled:requeued": 2},
+    )
+    monkeypatch.setattr(
+        jobs_store,
+        "recent_watchdog_recovery_counts",
+        lambda **kw: {"chat:terminal": 1, "profile:requeued": 1},
+    )
     monkeypatch.setattr(jobs_store, "recent_mean_service_sec", lambda **kw: 4.5)
     monkeypatch.setattr(jobs_store, "recent_mean_tokens_per_turn", lambda **kw: 123.0)
     monkeypatch.setattr(
@@ -241,14 +310,8 @@ def test_v2_metrics_returns_every_field(env):
         "pending": 1,
         "live_workers": 2,
         "live_worker_capacity": 8,
-        "worker_heartbeats": [{
-            "worker_id": "v2-worker-pod-1-abcd-deadbeef1234",
-            "kind": "turn",
-            "capacity": 8,
-            "beat_at_epoch": 1234.0,
-            "age_sec": 2.0,
-        }],
-        "worker_heartbeat_count": 1,
+        "worker_heartbeats": _HEARTBEATS,
+        "worker_heartbeat_count": 3,
         "runtime_policy": {
             "policy": "v2_only",
             "target_mode": "db_action_v2",
@@ -371,6 +434,18 @@ def test_v2_metrics_returns_every_field(env):
             "needs_reconciliation": 1,
             "oldest_unresolved_age_sec": 45.0,
         },
+        "pools": {
+            "foreground": {"configured": 4, "healthy": 4, "busy": 2, "restarting": 0, "pending": 1, "oldest_pending_sec": 3.5, "claim_p95_ms": 80.0},
+            "wake": {"configured": 2, "healthy": 2, "busy": 1, "restarting": 0, "pending": 0, "oldest_pending_sec": None, "claim_p95_ms": 120.0},
+            "heavy": {"configured": 2, "healthy": 2, "busy": 1, "restarting": 0, "pending": 2, "oldest_pending_sec": 40.0, "claim_p95_ms": 900.0},
+        },
+        "jobs_by_lane": {"chat": {"pending": 1, "active": 2}, "profile": {"pending": 0, "active": 1}},
+        "preemptions_24h": {"profile:terminal": 1, "scheduled:requeued": 2},
+        "watchdog_recoveries_24h": {"chat:terminal": 1, "profile:requeued": 1},
+        "enclave": _HEARTBEATS[0]["runtime_state"]["enclave"],
+        "db_pools": _HEARTBEATS[0]["runtime_state"]["db_pools"],
+        "isolation_events": _HEARTBEATS[0]["runtime_state"]["isolation_events"],
+        "profile_runtime": _HEARTBEATS[0]["runtime_state"]["profile_runtime"],
         "genesis_alive": True,
     }
 
@@ -470,6 +545,67 @@ def test_v2_metrics_no_token_is_401(env):
 
 def test_v2_metrics_wrong_token_is_401(env):
     status, body = _asgi_json("GET", "/v1/admin/v2-metrics", headers=_admin("wrong-token"))
+
+    assert status == 401
+    assert body == {"error": "unauthorized"}
+
+
+def test_v2_wake_shadow_uses_explicit_report_bucket(env, monkeypatch):
+    seen = {}
+
+    def _report(**kwargs):
+        seen.update(kwargs)
+        return {
+            "days": kwargs["days"],
+            "bucket": {
+                "start_hour_inclusive": kwargs["bucket_start_hour"],
+                "end_hour_exclusive": kwargs["bucket_end_hour"],
+                "purpose": "observation_only_not_product_policy",
+            },
+            "allowed": 20,
+            "bucket_allowed": 7,
+            "bucket_allowed_apns_alert_sent": 3,
+        }
+
+    monkeypatch.setattr(jobs_store, "wake_shadow_report", _report)
+    status, body = _asgi_json(
+        "GET",
+        "/v1/admin/v2-wake-shadow?days=14&start_hour=23&end_hour=7",
+        headers=_admin(),
+    )
+
+    assert status == 200
+    assert seen == {
+        "days": 14,
+        "bucket_start_hour": 23,
+        "bucket_end_hour": 7,
+    }
+    assert body["allowed"] == 20
+    assert body["bucket_allowed"] == 7
+    assert body["bucket_allowed_apns_alert_sent"] == 3
+    assert body["bucket"]["purpose"] == "observation_only_not_product_policy"
+
+
+@pytest.mark.parametrize(
+    ("query", "error"),
+    [
+        ("start_hour=23&end_hour=7", "invalid_days"),
+        ("days=0&start_hour=23&end_hour=7", "invalid_days"),
+        ("days=7&start_hour=24&end_hour=7", "invalid_start_hour"),
+        ("days=7&start_hour=23&end_hour=23", "invalid_hour_bucket"),
+    ],
+)
+def test_v2_wake_shadow_rejects_implicit_or_invalid_bucket(env, query, error):
+    status, body = _asgi_json(
+        "GET", f"/v1/admin/v2-wake-shadow?{query}", headers=_admin())
+
+    assert status == 400
+    assert body == {"error": error}
+
+
+def test_v2_wake_shadow_requires_admin(env):
+    status, body = _asgi_json(
+        "GET", "/v1/admin/v2-wake-shadow?days=7&start_hour=23&end_hour=7")
 
     assert status == 401
     assert body == {"error": "unauthorized"}

@@ -40,30 +40,50 @@ _bulk_scope = threading.local()
 class _BulkTrace:
     __slots__ = (
         "purpose",
+        "prefix",
         "store",
         "count",
+        "by_purpose",
         "started_at",
         "path",
         "explain",
     )
 
-    def __init__(self, purpose: str) -> None:
+    def __init__(self, purpose: str, *, prefix: bool = False) -> None:
         self.purpose = purpose
+        self.prefix = prefix
         self.store = None
         self.count = 0
+        # 前缀批次里,每个具体 purpose 各自的次数。折叠掉的是「一条条铺开」,
+        # **不是**「这批里有哪些信号、各几次」—— 后者留在这里,否则查问题
+        # 会真的变瞎(感知上报一批七个字段,分不清哪个来了才是问题)。
+        self.by_purpose: dict[str, int] = {}
         self.started_at = time.time()
         self.path: str | None = None
         self.explain: str | None = None
 
 
 @contextlib.contextmanager
-def coalesced_success_trace(purpose: str):
+def coalesced_success_trace(purpose: str, *, prefix: bool = False):
     """Collapse a bulk decrypt loop's per-call success events into one event.
 
     Errors and timeouts still emit individually — a failure inside a batch is
     exactly what someone reading the trace is looking for. Nested scopes of the
     same purpose join the outer batch; different purposes are tracked
     independently so a chat-row loop can fold both body and caption decrypts.
+
+    ``prefix=True`` folds every purpose starting with ``purpose``. Perception
+    ingestion needs it: each field decrypts under its own ``perception:<field>``
+    purpose, so exact matching folds nothing. Measured 2026-08-12 on a live V2
+    user — after the earlier folds shipped, 100% of the retained ring was still
+    per-field ``perception:*`` pairs from the backend process (~14 events per
+    report), which is what kept the window at hours instead of the 48h the TTL
+    promises.
+
+    ⚠️ The per-field purpose stays untouched on the decrypt call itself — seven
+    tests pin those exact strings, and the field name is what tells you WHICH
+    signal was decrypted. Folding must not cost that, so the batch event carries
+    ``by_purpose`` counts.
     """
     scopes = getattr(_bulk_scope, "active_by_purpose", None)
     if scopes is None:
@@ -72,7 +92,7 @@ def coalesced_success_trace(purpose: str):
     if purpose in scopes:
         yield
         return
-    scope = _BulkTrace(purpose)
+    scope = _BulkTrace(purpose, prefix=prefix)
     scopes[purpose] = scope
     try:
         yield
@@ -84,13 +104,16 @@ def coalesced_success_trace(purpose: str):
             except AttributeError:
                 pass
         if scope.store is not None and scope.count:
+            detail: dict = {"calls": scope.count}
+            if scope.prefix and scope.by_purpose:
+                detail["by_purpose"] = dict(sorted(scope.by_purpose.items()))
             _trace_enclave(
                 scope.store,
                 "enclave.call.batch",
                 purpose=purpose,
                 path=scope.path or "",
                 summary=f"enclave decrypt x{scope.count}",
-                detail={"calls": scope.count},
+                detail=detail,
                 dur_ms=(time.time() - scope.started_at) * 1000,
                 explain=scope.explain
                 or ("Backend called the enclave over HTTP; only metadata is recorded."),
@@ -175,15 +198,28 @@ def _trace_enclave(
         return
     scopes = getattr(_bulk_scope, "active_by_purpose", None) or {}
     scope = scopes.get(purpose)
+    if scope is None:
+        # 没有精确作用域时才看前缀作用域。顺序不能反:精确的更具体,
+        # 前缀的是兜底;反过来会让一个宽前缀把本该独立成批的 purpose 吸走。
+        # 同时命中多个前缀时取最长的那个(同样是「更具体者优先」)。
+        candidates = [
+            s for s in scopes.values()
+            if s.prefix and purpose.startswith(s.purpose)
+        ]
+        if candidates:
+            scope = max(candidates, key=lambda s: len(s.purpose))
     if (
         scope is not None
         and status == "ok"
         and event_type in _SUCCESS_TRACE_EVENT_TYPES
-        and purpose == scope.purpose
+        and (purpose == scope.purpose
+             or (scope.prefix and purpose.startswith(scope.purpose)))
     ):
         # Count the pair once, on `.done`, so the rollup reports calls not events.
         if event_type == "enclave.call.done":
             scope.count += 1
+            if scope.prefix:
+                scope.by_purpose[purpose] = scope.by_purpose.get(purpose, 0) + 1
         if scope.store is None:
             scope.store = store
         if scope.path is None:

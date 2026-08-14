@@ -28,7 +28,8 @@ import os
 import threading
 import time
 import uuid
-from typing import Callable
+from dataclasses import dataclass
+from typing import Any, Callable, Mapping
 
 import db
 
@@ -37,8 +38,8 @@ log = logging.getLogger("feedling.wake_bus")
 # Single Postgres NOTIFY channel; the JSON payload carries the logical channel.
 PG_CHANNEL = "feedling_wake"
 
-# This worker's identity. A genuine write tags its NOTIFY with this so the same
-# worker's listener can skip it (the local fast path already handled it).
+# Gunicorn can import this before forking, so children would inherit one id and
+# discard cross-worker notifications as self-origin. Rotate it after each fork.
 WORKER_ID = uuid.uuid4().hex
 
 # Logical channels whose target is a per-user cached store: a cross-worker
@@ -49,10 +50,28 @@ _STORE_CHANNELS = frozenset({"chat", "proactive", "frames", "blob"})
 # not import upward (channel -> [fn(user_id)]). E.g. asgi/lifespan.py wires the
 # accounts registry reload onto the "users" channel.
 _extra_handlers: dict[str, list[Callable[[str], None]]] = {}
+_job_cancel_handlers: list[Callable[["JobCancellation"], None]] = []
+
+_JOB_CANCEL_CHANNEL = "job_cancel"
+_MAX_JOB_CANCEL_PAYLOAD_BYTES = 1024
+_MAX_CLAIMED_BY_LENGTH = 200
+_MAX_CANCEL_REASON_LENGTH = 120
 
 _RECONNECT_DELAY_SEC = 5.0
 _listener_started = False
 _listener_lock = threading.Lock()
+
+
+def _after_fork_child() -> None:
+    """Give a forked process its own wake identity and listener state."""
+    global WORKER_ID, _listener_started, _listener_lock
+    WORKER_ID = uuid.uuid4().hex
+    _listener_started = False
+    _listener_lock = threading.Lock()
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_after_fork_child)
 
 
 def _enabled() -> bool:
@@ -67,6 +86,77 @@ def register_handler(channel: str, fn: Callable[[str], None]) -> None:
     handlers = _extra_handlers.setdefault(channel, [])
     if fn not in handlers:
         handlers.append(fn)
+
+
+@dataclass(frozen=True)
+class JobCancellation:
+    job_id: int
+    claimed_by: str
+    reason: str
+
+    def to_payload(self) -> dict[str, object]:
+        return self._validated_payload(
+            {"j": self.job_id, "b": self.claimed_by, "r": self.reason}
+        )
+
+    @classmethod
+    def from_payload(cls, payload: Mapping[str, Any]) -> "JobCancellation":
+        data = cls._validated_payload(payload)
+        return cls(
+            job_id=int(data["j"]),
+            claimed_by=str(data["b"]),
+            reason=str(data["r"]),
+        )
+
+    @staticmethod
+    def _validated_payload(payload: Mapping[str, Any]) -> dict[str, object]:
+        if not isinstance(payload, Mapping) or set(payload) != {"j", "b", "r"}:
+            raise ValueError("invalid job cancellation payload keys")
+        job_id = payload.get("j")
+        claimed_by = payload.get("b")
+        reason = payload.get("r")
+        if type(job_id) is not int or job_id <= 0:
+            raise ValueError("job cancellation job_id must be a positive integer")
+        if (
+            not isinstance(claimed_by, str)
+            or not claimed_by
+            or len(claimed_by) > _MAX_CLAIMED_BY_LENGTH
+        ):
+            raise ValueError("invalid job cancellation claimed_by")
+        if (
+            not isinstance(reason, str)
+            or not reason
+            or len(reason) > _MAX_CANCEL_REASON_LENGTH
+        ):
+            raise ValueError("invalid job cancellation reason")
+        data: dict[str, object] = {"j": job_id, "b": claimed_by, "r": reason}
+        encoded = json.dumps(data, separators=(",", ":")).encode("utf-8")
+        if len(encoded) > _MAX_JOB_CANCEL_PAYLOAD_BYTES:
+            raise ValueError("job cancellation payload is too large")
+        return data
+
+
+def register_job_cancel_handler(
+    fn: Callable[[JobCancellation], None],
+) -> None:
+    """Register an idempotent typed handler on the existing wake listener."""
+    if fn not in _job_cancel_handlers:
+        _job_cancel_handlers.append(fn)
+
+
+def notify_job_cancel(event: JobCancellation) -> None:
+    """Publish one compact Job cancellation after its DB transaction commits."""
+    if not _enabled():
+        return
+    payload = {
+        "c": _JOB_CANCEL_CHANNEL,
+        "o": WORKER_ID,
+        **event.to_payload(),
+    }
+    encoded = json.dumps(payload, separators=(",", ":"))
+    if len(encoded.encode("utf-8")) > _MAX_JOB_CANCEL_PAYLOAD_BYTES:
+        raise ValueError("job cancellation notification is too large")
+    db.pg_notify(PG_CHANNEL, encoded)
 
 
 def notify(channel: str, user_id: str = "") -> None:
@@ -86,9 +176,31 @@ def _dispatch(payload: str) -> None:
         data = json.loads(payload)
     except Exception:
         return
+    if not isinstance(data, dict):
+        return
     if data.get("o") == WORKER_ID:
         return  # our own write — the local fast path already handled it
     channel = data.get("c") or ""
+    if channel == _JOB_CANCEL_CHANNEL:
+        if set(data) != {"c", "o", "j", "b", "r"}:
+            return
+        origin = data.get("o")
+        if not isinstance(origin, str) or not origin or len(origin) > 128:
+            return
+        try:
+            event = JobCancellation.from_payload(
+                {"j": data["j"], "b": data["b"], "r": data["r"]}
+            )
+        except (KeyError, ValueError, TypeError):
+            return
+        for fn in tuple(_job_cancel_handlers):
+            try:
+                fn(event)
+            except Exception:
+                log.exception(
+                    "[wake_bus] typed handler failed for channel=%s", channel
+                )
+        return
     user_id = data.get("u") or ""
     if channel in _STORE_CHANNELS and user_id:
         # Lazy import breaks the core.store <-> core.wake_bus cycle (store

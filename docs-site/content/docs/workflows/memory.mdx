@@ -5,6 +5,16 @@ description: Store encrypted memory cards, inspect the index, and fetch selected
 
 Memory separates ciphertext storage from enclave-authorized read projections.
 
+## Hosted profile refresh execution
+
+Runtime V2 generates its bounded Memory/User profile as low-priority Heavy-pool
+work, separate from foreground Chat. It first verifies the complete lightweight
+Garden index, then fetches card bodies in stable batches of 64 and fails closed
+if any batch is incomplete. At most one Profile Job runs in a serve-worker
+instance; the second Heavy slot remains available for Dream, Capture, and other
+maintenance. Provider and write stages report progress so a slow but advancing
+profile is not mistaken for a hung Job.
+
 | Operation | Returns |
 | --- | --- |
 | `POST /v1/memory/add` | The stored v1 encrypted record. |
@@ -26,6 +36,14 @@ unchanged. Specific questions should use `memory_search` followed by
 `memory_fetch`; broad reviews should reconcile partition counts against
 `total`, without indiscriminately loading every card. Bulk cleanup requests
 belong to `memory_organize`, not a chat-loop sequence of single-card edits.
+
+`memory_search` matches a literal, case-insensitive substring of the card text;
+it applies no synonyms, translation, or stemming. An empty result therefore means
+that exact wording does not appear on any card, not that the memory is missing —
+a card written in one language is not found by searching for the other. The tool
+guidance directs the model to retry with different wording before concluding that
+a memory does not exist; only an identical repeat of the same arguments is
+refused within a turn.
 
 `GET /v1/dream/status` also returns `capture_cards_added` and
 `capture_completed_at`. The count is a monotonic total of cards actually added

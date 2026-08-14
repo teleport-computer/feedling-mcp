@@ -135,9 +135,9 @@ def ai_reply_push(store: UserStore, *, payload: dict) -> dict:
     body = str(payload.get("body") or "").strip()
     is_wake = bool(payload.get("is_wake"))
     if not msg_id:
-        return {"status": "skipped", "reason": "missing_msg_id"}
+        return {"status": "skipped", "reason": "missing_msg_id", "apns_alert_sent": False}
     if not body:
-        return {"status": "skipped", "reason": "empty_body"}
+        return {"status": "skipped", "reason": "empty_body", "apns_alert_sent": False}
 
     if is_wake:
         # ``lane`` is the V2 lane name (heartbeat/scheduled/manual_wake/
@@ -167,12 +167,20 @@ def ai_reply_push(store: UserStore, *, payload: dict) -> dict:
                 "live_activity_reason": decision.reason,
             }
             store.update_chat_message_metadata(msg_id, fields)
-            return {"status": "suppressed", "reason": decision.reason}
+            return {
+                "status": "suppressed",
+                "reason": decision.reason,
+                "apns_alert_sent": False,
+            }
 
     fields = push_service._deliver_ai_message_push_if_background(
         store, body=body[:240], title="IO", data={}, visual_state="reply")
     store.update_chat_message_metadata(msg_id, fields)
+    alert_status = str(fields.get("alert_status") or "unknown")
     return {
-        "status": str(fields.get("alert_status") or "unknown"),
+        "status": alert_status,
         "reason": str(fields.get("push_reason") or ""),
+        # This is an upper bound: APNs accepted an alert. Device Focus, mute,
+        # notification settings, and summary delivery remain invisible here.
+        "apns_alert_sent": alert_status == "delivered",
     }

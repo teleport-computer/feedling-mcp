@@ -37,6 +37,14 @@ and a live Hosted Runtime V2 worker pool. Runtime-control, worker-liveness,
 kill-switch, and admission failures are returned before the user message is
 stored.
 
+Accepted Chat work has dedicated Foreground execution capacity. During the same
+database transaction that enqueues a new Chat Job, Runtime V2 can supersede or
+requeue that user's active non-Chat background Job and publish an exact-owner
+cancellation. Ownership fences prevent the old process from committing after
+the transaction, even if delivery of the cancellation notification is delayed;
+periodic claim reconciliation is the notification-loss backstop. Other users'
+Jobs and other slot processes are not cancelled.
+
 The account's selected onboarding route is the execution-ownership switch.
 Hosted Runtime V1 is eligible only when that selector is positively
 `model_api`; Runtime V2's `v2`/`draining` ownership fence excludes V1
@@ -51,6 +59,19 @@ report success until both the tested active provider route and durable V2
 ownership are recorded. If that ownership transition cannot complete, setup
 fails closed with a retryable error rather than silently falling back to the
 resident path.
+
+### Time grounding
+
+Hosted Runtime V2 freezes one user-local temporal snapshot for the whole turn
+and keeps it in the trailing application-data context. Alongside the local ISO
+timestamp and IANA timezone, the snapshot includes the local weekday and
+day-period label so models do not have to infer them from a numeric offset. The
+weekday is computed after timezone conversion, including across local midnight.
+
+Runtime V1's time anchor and Runtime V2 use the same weekday and day-period
+boundaries. Labels follow the same device-locale, account-language, then default
+language policy used by the resident reply guardrail. The snapshot deliberately
+does not add a second UTC clock representation.
 
 ### 1. Send the turn
 

@@ -6,6 +6,8 @@ stubbing enclave-bound reads, capability execution, and provider responses.
 from __future__ import annotations
 
 import asyncio
+import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -521,7 +523,7 @@ def test_process_job_acquires_enclave_semaphore_for_read_messages_and_prefetch(m
 def test_coalesce_inputs_and_cap_data_tolerate_enclave_sem_none(monkeypatch):
     """Direct unit coverage of the `enclave_sem is None` guard added to the two
     newly-wrapped helpers (mirrors executor._run_one's tolerance): calling them
-    with no semaphore at all — not even process_job's ENCLAVE_SEMAPHORE default
+    with no semaphore at all — not even process_job's private direct-call default
     substitution — must not raise."""
     uid = "u_w_semaphore_none"
     conftest.seed_user(uid)
@@ -1033,11 +1035,11 @@ def test_run_turn_maintenance_resolve_failure_is_silent_no_user_error(monkeypatc
 
 
 def test_run_turn_heartbeat_resolve_failure_is_silent_no_user_error(monkeypatch):
-    """D3 Task 6: the same silence extends to wake lanes (heartbeat/scheduled/
-    manual_wake) — a heartbeat job whose provider can't be resolved must fail
-    SILENTLY, mirroring test_run_turn_maintenance_resolve_failure_is_silent_no_user_error
-    above. The _run_turn gate change (`lane == "chat"`, was `lane != "maintenance"`)
-    means only the chat lane still surfaces a user-visible error chip."""
+    """Weak wake lanes remain silent when provider resolution fails.
+
+    Scheduled is intentionally excluded: a due reminder has a delivery
+    obligation and gets its own visible failure result.
+    """
     uid = "u_w_heartbeat_resolve_fail"
     conftest.seed_user(uid)
     _reset(uid)
@@ -1060,6 +1062,39 @@ def test_run_turn_heartbeat_resolve_failure_is_silent_no_user_error(monkeypatch)
     # SILENT: no "error"-kind status event, no record_terminal_error callback.
     assert [e for e in _status_events(uid) if e["kind"] == "error"] == []
     assert recorded == []
+
+
+def test_run_turn_scheduled_resolve_failure_queues_visible_result(monkeypatch):
+    uid = "u_w_scheduled_resolve_fail"
+    conftest.seed_user(uid)
+    _reset(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, "scheduled")
+    job = jobs_store.claim_next_job("w")
+    surfaced = []
+    monkeypatch.setattr(
+        worker,
+        "_surface_terminal_error",
+        lambda deps, user_id, failed_job_id, code: surfaced.append(
+            (user_id, failed_job_id, code)
+        ),
+    )
+
+    deps = worker.TurnDeps(
+        read_messages=lambda *_args: [],
+        resolve_provider=lambda _uid: (None, {"error": "key_decrypt_failed"}),
+        mint_enclave_token=lambda *_args: "must-not-run",
+    )
+    status = asyncio.run(worker._run_turn(job, deps))
+
+    assert status == "failed"
+    assert surfaced == [(uid, job_id, "provider_unavailable")]
+    with db.get_pool().connection() as conn:
+        marker = conn.execute(
+            "SELECT error_code,reply_frontier_seq,reply_parent_message_id "
+            "FROM v2_terminal_failure_outbox WHERE job_id=%s",
+            (job_id,),
+        ).fetchone()
+    assert marker == ("provider_unavailable", None, None)
 
 
 # ------------------------------------------------------------------
@@ -1265,7 +1300,7 @@ def test_slot_recovery_failure_does_not_kill_slot(monkeypatch):
     def _claim(worker_id, lanes=None):
         claim_calls["n"] += 1
         if claim_calls["n"] == 1:
-            return {"id": "job-1", "user_id": "u", "lane": "chat",
+            return {"id": 1, "user_id": "u", "lane": "chat",
                     "claimed_by": worker_id}
         stop.set()
         return None
@@ -1300,9 +1335,33 @@ def test_run_worker_loop_propagates_unexpected_slot_exit(monkeypatch):
 
 
 def test_bounded_gates_exist():
-    assert isinstance(worker.MAX_WORKERS, int) and worker.MAX_WORKERS >= 1
     assert isinstance(worker.MAX_READ_ACTION_PARALLELISM, int)
-    assert isinstance(worker.ENCLAVE_SEMAPHORE, asyncio.Semaphore)
+    assert not hasattr(worker, "ENCLAVE_SEMAPHORE")
+    assert isinstance(worker._new_direct_enclave_gate(), asyncio.Semaphore)
+
+
+def test_retired_max_workers_env_does_not_affect_worker_import():
+    backend = str(Path(__file__).parent.parent / "backend")
+    env = os.environ.copy()
+    env["FEEDLING_V2_MAX_WORKERS"] = "retired-invalid-value"
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                f"import sys; sys.path.insert(0, {backend!r}); "
+                "from model_api_runtime.v2 import worker; "
+                "print(worker._capture_provider_guard_pool_size())"
+            ),
+        ],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "1"
 
 
 @pytest.mark.parametrize("raw", ["0", "-1", "nan", "nope"])
@@ -2116,7 +2175,7 @@ def test_slot_loop_progress_cb_called_on_claim_and_turn_completion(monkeypatch):
     def _claim(worker_id, lanes=None):
         claim_calls["n"] += 1
         if claim_calls["n"] == 1:
-            return {"id": "job-1", "user_id": "u", "lane": "chat", "claimed_by": worker_id}
+            return {"id": 1, "user_id": "u", "lane": "chat", "claimed_by": worker_id}
         stop.set()
         return None
 
@@ -2130,19 +2189,23 @@ def test_slot_loop_progress_cb_called_on_claim_and_turn_completion(monkeypatch):
 
     asyncio.run(worker._slot_loop(
         "w-progress", poll_interval=0.001, stop_event=stop, deps=_ok_deps({}),
-        slot_id=7, progress_cb=lambda slot_id, turn_start=None: events.append((slot_id, turn_start))))
+        slot_id="foreground-7", slot_generation="g7", progress_cb=events.append))
 
     assert claim_calls["n"] >= 2
     assert turn_calls["n"] == 1
     # (a) claim + (b) turn-completion signals, both tagged with this slot's id —
     # plus (c) an idle-poll signal once claim_next_job starts returning None.
     assert len(events) >= 2
-    assert all(slot_id == 7 for slot_id, _turn_start in events)
+    assert all(event.slot_id == "foreground-7" for event in events)
+    assert all(event.slot_generation == "g7" for event in events)
+    assert events[0].active_job == worker.slot_protocol.ActiveJobIdentity(
+        1, "chat", "w-progress"
+    )
     # (a) the claim signal must carry a non-None turn_start (hard-timeout fix);
     # (b)/(c) idle signals must carry None.
-    claim_events = [ts for sid, ts in events if ts is not None]
-    idle_events = [ts for sid, ts in events if ts is None]
-    assert len(claim_events) == 1, "exactly one turn was claimed and started"
+    claim_events = [event.turn_start for event in events if event.turn_start is not None]
+    idle_events = [event.turn_start for event in events if event.turn_start is None]
+    assert len(claim_events) == 2, "claimed and durable-completion share one turn"
     assert isinstance(claim_events[0], float) and claim_events[0] > 0
     assert len(idle_events) >= 1, "turn-completion and/or idle-poll signals report turn_start=None"
 
@@ -2161,13 +2224,13 @@ def test_slot_loop_progress_cb_exception_does_not_crash_loop(monkeypatch):
 
     monkeypatch.setattr(jobs_store, "claim_next_job", _claim)
 
-    def _boom(slot_id, turn_start=None):
+    def _boom(_progress):
         raise RuntimeError("boom")
 
     # Must not raise despite progress_cb always raising.
     asyncio.run(worker._slot_loop(
         "w-progress-boom", poll_interval=0.001, stop_event=stop, deps=_ok_deps({}),
-        slot_id=0, progress_cb=_boom))
+        slot_id="foreground-0", slot_generation="g0", progress_cb=_boom))
 
     assert calls["n"] >= 3
 
@@ -2180,17 +2243,19 @@ def test_run_worker_loop_threads_progress_cb_with_slot_index(monkeypatch):
     stop = asyncio.Event()
 
     async def _fake_slot_loop(worker_id, *, poll_interval, stop_event, deps,
-                               wake_event=None, lanes=None, slot_id=0, progress_cb=None):
+                               wake_event=None, lanes=None, slot_id="slot-0",
+                               slot_generation="g0", progress_cb=None):
         if progress_cb is not None:
-            progress_cb(slot_id, None)
+            progress_cb(worker.slot_protocol.SlotProgress(
+                slot_id, slot_generation, 1.0, None, "idle", None))
         stop_event.set()
 
     monkeypatch.setattr(worker, "_slot_loop", _fake_slot_loop)
     events = []
     asyncio.run(worker.run_worker_loop(
         "w-thread", max_workers=2, poll_interval=0.01, stop_event=stop, deps=_ok_deps({}),
-        progress_cb=lambda slot_id, turn_start=None: events.append(slot_id)))
-    assert sorted(events) == [0, 1]
+        progress_cb=events.append))
+    assert sorted(event.slot_id for event in events) == ["slot-0", "slot-1"]
 
 
 def test_slot_loop_progress_cb_reports_turn_start_at_claim_and_none_after_completion(monkeypatch):
@@ -2206,7 +2271,7 @@ def test_slot_loop_progress_cb_reports_turn_start_at_claim_and_none_after_comple
     def _claim(worker_id, lanes=None):
         claim_calls["n"] += 1
         if claim_calls["n"] == 1:
-            return {"id": "job-1", "user_id": "u", "lane": "chat", "claimed_by": worker_id}
+            return {"id": 1, "user_id": "u", "lane": "chat", "claimed_by": worker_id}
         stop.set()
         return None
 
@@ -2220,18 +2285,22 @@ def test_slot_loop_progress_cb_reports_turn_start_at_claim_and_none_after_comple
 
     asyncio.run(worker._slot_loop(
         "w-turnstart", poll_interval=0.001, stop_event=stop, deps=_ok_deps({}),
-        slot_id=3, progress_cb=lambda slot_id, turn_start=None: calls.append((slot_id, turn_start))))
+        slot_id="foreground-3", slot_generation="g3", progress_cb=calls.append))
 
     # First call: claim just happened, about to run the turn -> non-None turn_start.
-    first_slot_id, first_turn_start = calls[0]
-    assert first_slot_id == 3
+    first_slot_id, first_turn_start = calls[0].slot_id, calls[0].turn_start
+    assert first_slot_id == "foreground-3"
+    assert calls[0].stage == "claimed"
     assert first_turn_start is not None
     assert isinstance(first_turn_start, float) and first_turn_start > 0
 
     # Second call: the turn just completed -> back to idle (turn_start=None).
-    second_slot_id, second_turn_start = calls[1]
-    assert second_slot_id == 3
-    assert second_turn_start is None
+    second_slot_id, second_turn_start = calls[1].slot_id, calls[1].turn_start
+    assert second_slot_id == "foreground-3"
+    assert calls[1].stage == "durable_completion"
+    assert second_turn_start == first_turn_start
+    assert calls[2].stage == "idle"
+    assert calls[2].active_job is None
 
 
 def test_slot_loop_in_turn_boundaries_refresh_same_turn_stall_clock(monkeypatch):
@@ -2246,7 +2315,7 @@ def test_slot_loop_in_turn_boundaries_refresh_same_turn_stall_clock(monkeypatch)
     def _claim(worker_id, lanes=None):
         claims["n"] += 1
         if claims["n"] == 1:
-            return {"id": "job-progress", "user_id": "u", "lane": "chat",
+            return {"id": 2, "user_id": "u", "lane": "chat",
                     "claimed_by": worker_id}
         stop.set()
         return None
@@ -2261,15 +2330,23 @@ def test_slot_loop_in_turn_boundaries_refresh_same_turn_stall_clock(monkeypatch)
 
     asyncio.run(worker._slot_loop(
         "w-in-turn-progress", poll_interval=0.001, stop_event=stop,
-        deps=_ok_deps({}), slot_id=4,
-        progress_cb=lambda slot_id, turn_start=None: events.append(
-            (slot_id, turn_start))))
+        deps=_ok_deps({}), slot_id="foreground-4", slot_generation="g4",
+        progress_cb=events.append))
 
-    active = [event for event in events if event[1] is not None]
-    assert len(active) == 3  # claim plus two real in-turn boundaries
-    assert {event[0] for event in active} == {4}
-    assert len({event[1] for event in active}) == 1  # absolute start never resets
-    assert any(turn_start is None for _slot, turn_start in events)
+    active = [event for event in events if event.turn_start is not None]
+    assert len(active) == 4  # claim, two boundaries, durable completion
+    assert {event.slot_id for event in active} == {"foreground-4"}
+    assert len({event.turn_start for event in active}) == 1
+    assert {event.active_job for event in active} == {
+        worker.slot_protocol.ActiveJobIdentity(2, "chat", "w-in-turn-progress")
+    }
+    assert [event.stage for event in active] == [
+        "claimed",
+        "provider_complete",
+        "prompt_catchup_batch_complete",
+        "durable_completion",
+    ]
+    assert any(event.turn_start is None for event in events)
 
 
 def test_active_job_lease_keeper_renews_until_stopped(monkeypatch):

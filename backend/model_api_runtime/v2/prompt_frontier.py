@@ -8,13 +8,17 @@ workers, providers, or the tool loop.  It answers two small questions:
    and safety headroom?
 
 The estimator uses canonical UTF-8 JSON bytes as conservative *admission
-units*.  They are not billing-token estimates.  The default treats every byte
-as one token, intentionally overestimating ordinary tokenizers while keeping
-the implementation provider-independent and monotonic. Image payload bytes are
-replaced by a separately configurable per-image reserve so base64 transport
-encoding does not masquerade as text tokens. Deployments may calibrate the byte
-ratio or provide route context metadata, but must not weaken the
-all-required-or-error contract implemented here.
+units*.  They are not billing-token estimates. Natural-language prompt content
+defaults to one byte per token, intentionally overestimating multilingual text.
+ASCII-heavy tool schemas use a separate conservative 3.5-byte ratio instead
+of inheriting that text estimate; applying one byte per token to schemas can
+inflate their cost by roughly four times and silently erase the whole tool
+surface. Non-ASCII schema bytes still count one-for-one, so multilingual tool
+descriptions cannot become underestimates through the ASCII calibration. Image
+payload bytes are replaced by a separately configurable per-image reserve so
+base64 transport encoding does not masquerade as text tokens. Deployments may
+calibrate the natural-language byte ratio or provide route context metadata,
+but must not weaken the all-required-or-error contract implemented here.
 
 Conversation text never enters :class:`PromptFrontierPlan`; components retain
 only a name and a bounded integer estimate.  This makes the result safe to
@@ -40,13 +44,24 @@ MIN_SAFETY_MARGIN_TOKENS = 512
 MIN_CONTEXT_WINDOW_TOKENS = 2_048
 MAX_CONTEXT_WINDOW_TOKENS = 2_000_000
 DEFAULT_ESTIMATOR_UTF8_BYTES_PER_TOKEN = 1.0
+# Tool/function schemas are overwhelmingly ASCII JSON. Keep this calibration
+# inside the frontier so every caller accounts for the same provider-visible
+# structure; the deployment knob above remains scoped to natural-language and
+# transcript content, where increasing it would undercount CJK text.
+TOOL_SCHEMA_UTF8_BYTES_PER_TOKEN = 3.5
 DEFAULT_IMAGE_RESERVE_TOKENS = 8_192
 
 # Provider message framing is not present in a content string itself.  The
 # canonical JSON estimate already counts roles/keys/delimiters; this small
 # fixed allowance covers wire-specific framing that adapters add around it.
 MESSAGE_STRUCTURAL_OVERHEAD_TOKENS = 8
-TOOL_SCHEMA_STRUCTURAL_OVERHEAD_TOKENS = 64
+# The canonical ToolSpec JSON does not contain each provider's outer wrapper.
+# The widest current wrapper adds about 31 ASCII bytes per tool (OpenAI chat;
+# the captured 69-tool catalog is 32,684 canonical bytes and 34,823 wire bytes).
+# Sixteen tokens/tool therefore reserves well above that framing at the
+# calibrated 3.5-byte ratio without reintroducing the multi-thousand-token
+# overcount that previously erased the complete tool surface on 16K/32K/40K.
+TOOL_SCHEMA_STRUCTURAL_OVERHEAD_TOKENS = 16
 TOOL_EXCHANGE_STRUCTURAL_OVERHEAD_TOKENS = 12
 
 LimitSource = Literal[
@@ -56,6 +71,23 @@ LimitSource = Literal[
     "unaudited_default",
 ]
 PlanStatus = Literal["fits", "fits_optional_omitted"]
+
+# When the complete catalog does not fit, retain the user-selected MCP surface
+# and the smallest useful memory/reply loop before admitting less essential
+# platform capabilities. The priority decision belongs here, beside the budget
+# that applies it, rather than being copied into each worker/tool-loop caller.
+_MCP_TOOL_PREFIX = "mcp__"
+_CORE_TOOL_FLOOR_NAMES = frozenset(
+    {
+        "memory_index",
+        "memory_search",
+        "memory_fetch",
+        "memory_write",
+        "memory_organize",
+        "reply",
+        "send_file",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -132,6 +164,8 @@ class PromptFrontierPlan:
     estimated_input_tokens: int
     remaining_input_tokens: int
     status: PlanStatus
+    offered_tool_names: tuple[str, ...] = ()
+    included_tool_names: tuple[str, ...] = ()
 
     @property
     def included_components(self) -> tuple[str, ...]:
@@ -759,18 +793,29 @@ def tool_schemas_component(
     name: str = "tool_schemas",
     required: bool = True,
     priority: int = 0,
-    utf8_bytes_per_token: float = DEFAULT_ESTIMATOR_UTF8_BYTES_PER_TOKEN,
 ) -> PromptComponent:
     """Account for the complete offered tool catalog as one atomic component."""
 
     overhead = len(tools) * TOOL_SCHEMA_STRUCTURAL_OVERHEAD_TOKENS
-    return structured_component(
-        name,
-        list(tools),
+    rendered = canonical_json(list(tools)).encode("utf-8")
+    ascii_bytes = sum(byte < 0x80 for byte in rendered)
+    non_ascii_bytes = len(rendered) - ascii_bytes
+    # JSON syntax, field names, and most schemas are ASCII-heavy and use the
+    # calibrated ratio. The captured 32,684-byte production catalog encodes to
+    # 7,355-7,851 tokens across cl100k/o200k and all current provider wrappers;
+    # 3.5 bytes/token plus the explicit wrapper reserve estimates 10,443.
+    # Server-authored descriptions/enums may be CJK or any
+    # other UTF-8 text; count every non-ASCII byte as a full admission token so
+    # the ASCII calibration can never turn multilingual schemas into an
+    # under-estimate (for example, one Chinese character contributes 3 bytes).
+    estimated_tokens = int(
+        math.ceil(ascii_bytes / TOOL_SCHEMA_UTF8_BYTES_PER_TOKEN)
+    ) + non_ascii_bytes + overhead
+    return PromptComponent(
         required=required,
+        name=name,
         priority=priority,
-        structural_overhead_tokens=overhead,
-        utf8_bytes_per_token=utf8_bytes_per_token,
+        estimated_tokens=estimated_tokens,
     )
 
 
@@ -968,6 +1013,9 @@ def plan_provider_round(
                 utf8_bytes_per_token=utf8_bytes_per_token,
             )
         )
+    offered_tools = list(tools or [])
+    required_tools: list[Any] = []
+    optional_tools: list[Any] = []
     if tools is not None:
         required_names = {str(name) for name in required_tool_names if str(name)}
         required_tools = [
@@ -986,7 +1034,6 @@ def plan_provider_round(
                     required_tools,
                     name="required_tool_schemas",
                     required=True,
-                    utf8_bytes_per_token=utf8_bytes_per_token,
                 )
             )
         if optional_tools:
@@ -995,14 +1042,73 @@ def plan_provider_round(
                     optional_tools,
                     required=False,
                     priority=1,
-                    utf8_bytes_per_token=utf8_bytes_per_token,
                 )
             )
-    return plan_prompt(
+    plan = plan_prompt(
         model_limit=model_limit,
         components=components,
         output_reserve_tokens=output_reserve_tokens,
         safety_margin_tokens=safety_margin_tokens,
+    )
+    offered_names = tuple(str(getattr(tool, "name", "")) for tool in offered_tools)
+    required_name_set = {
+        str(getattr(tool, "name", "")) for tool in required_tools
+    }
+    if not optional_tools or "tool_schemas" not in plan.omitted_optional_components:
+        return dataclasses.replace(
+            plan,
+            offered_tool_names=offered_names,
+            included_tool_names=offered_names,
+        )
+
+    # The complete optional catalog is too large. Re-plan the same exact prompt
+    # with one atomic component per remaining schema so pressure trims a
+    # deterministic tail instead of turning every tool off. User MCP and the
+    # core memory/reply loop are admitted first; schemas referenced by retained
+    # native history remain required exactly as above.
+    granular_components = [
+        component for component in components if component.name != "tool_schemas"
+    ]
+    optional_component_names: list[tuple[str, str]] = []
+    for index, tool in enumerate(optional_tools):
+        tool_name = str(getattr(tool, "name", ""))
+        component_name = f"tool_schema_{index}"
+        priority = (
+            2
+            if tool_name.startswith(_MCP_TOOL_PREFIX)
+            or tool_name in _CORE_TOOL_FLOOR_NAMES
+            else 1
+        )
+        granular_components.append(
+            tool_schemas_component(
+                [tool],
+                name=component_name,
+                required=False,
+                priority=priority,
+            )
+        )
+        optional_component_names.append((component_name, tool_name))
+    plan = plan_prompt(
+        model_limit=model_limit,
+        components=granular_components,
+        output_reserve_tokens=output_reserve_tokens,
+        safety_margin_tokens=safety_margin_tokens,
+    )
+    included_components = set(plan.included_components)
+    included_optional_names = {
+        tool_name
+        for component_name, tool_name in optional_component_names
+        if component_name in included_components
+    }
+    included_names = tuple(
+        name
+        for name in offered_names
+        if name in required_name_set or name in included_optional_names
+    )
+    return dataclasses.replace(
+        plan,
+        offered_tool_names=offered_names,
+        included_tool_names=included_names,
     )
 
 

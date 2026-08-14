@@ -181,6 +181,11 @@ REGISTRY: dict[str, Entry] = {
         "Admin 用量页从 v2_turn_metrics 可重建的按日用户投影；已知用户行在 RDS 通过 FK 随销号级联，"
         "无需在 TEE 保存第二份派生副本",
     ),
+    "v2_wake_shadow_decisions": Entry(
+        SKIP,
+        "主动唤醒 A′ 影子观测；只含本地日期/时分、lane、放行与 APNs 告警投递布尔，"
+        "独立保留 90 天且不依赖 agent_jobs 生命周期，RDS Admin 报表是唯一消费者",
+    ),
     "v2_usage_rollup_watermarks": Entry(
         SKIP,
         "Admin 用量 rollup 的 bootstrap/cursor/error 控制面；不含用户内容，必须跟 RDS 派生表同库推进",

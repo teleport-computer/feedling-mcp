@@ -11,6 +11,7 @@ from provider_types import ProviderResponse, ToolExchange, ToolResult
 from capabilities import registry as cap_registry
 from capabilities import result_budget
 from capabilities import tool_schema
+from core import protocol_leak
 from model_api_runtime.v2 import prompt_frontier
 from model_api_runtime.v2 import provenance
 import provider_client
@@ -105,6 +106,30 @@ def _catalog():
     if _CATALOG is None:
         _CATALOG = tool_schema.build_tool_specs()
     return _CATALOG
+
+
+def _memory_discovery_call_key(tool_call) -> tuple[str, str] | None:
+    """Return the per-turn deduplication key for a memory discovery call.
+
+    ``memory_index`` remains a once-per-turn overview regardless of filters.
+    Other discovery tools (currently ``memory_search``) may legitimately run more
+    than once for different subjects, so only an exact canonical-JSON argument
+    match is repeated. Query whitespace and case stay significant; normalizing
+    either could merge distinct searches.
+    """
+    if tool_call.name not in _MEMORY_DISCOVERY_TOOLS:
+        return None
+    if tool_call.name == "memory_index":
+        return (tool_call.name, "")
+    return (
+        tool_call.name,
+        json.dumps(
+            tool_call.args,
+            sort_keys=True,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ),
+    )
 
 
 def _is_probably_tool_schema_rejection(exc: provider_client.ProviderError) -> bool:
@@ -472,6 +497,7 @@ async def run_tool_loop(
     add_usage,
     max_calls: int,
     before_provider_call=None,
+    on_provider_tool_surface=None,
     on_provider_success=None,
     on_provider_failure=None,
     fold_before_first: bool = False,
@@ -500,6 +526,11 @@ async def run_tool_loop(
     # response that means "nothing to say" (`required = require_reply and not
     # tool_calls`), and the wake fails silently.
     require_reply: bool = True,
+    # One lane-specific correction may be appended after a semantically empty
+    # provider success. Callers that carry a stronger delivery contract (for
+    # example, a due scheduled reminder) can restate that contract here without
+    # inventing a synthetic user turn.
+    empty_response_correction: str = _EMPTY_RESPONSE_CORRECTION,
     allow_image_output: bool = False,
     on_file_reply=None,
     on_image_reply=None,
@@ -597,6 +628,9 @@ async def run_tool_loop(
         max_assistant_tool_text_chars,
         name="max_assistant_tool_text_chars",
     )
+    normalized_empty_response_correction = str(
+        empty_response_correction or _EMPTY_RESPONSE_CORRECTION
+    ).strip()
     if tool_result_char_cap < MIN_TOOL_RESULT_ERROR_QUOTA:
         raise ValueError("tool_result_char_cap is too small for stable error results")
     if (
@@ -628,6 +662,7 @@ async def run_tool_loop(
     reasoning_fragments: list[str] = []
     seen_reasoning_fragments: set[str] = set()
     force_text_fallback = False
+    force_text_fallback_reason = ""
     empty_response_recovery_used = False
     empty_response_retry_instruction = ""
     external_content_seen = False
@@ -669,7 +704,11 @@ async def run_tool_loop(
     file_delivery_fallback_reasoning = ""
     file_delivery_recovery_needed = False
     workspace_write_applied = False
+    # Names keep required schemas visible and completed discovery calls valid in
+    # native history. Exact call keys independently decide whether dispatch would
+    # repeat work; do not collapse these sets back into one name-only concept.
     completed_memory_discovery_tools: set[str] = set()
+    completed_memory_discovery_calls: set[tuple[str, str]] = set()
     outbound_blocking_reads = {
         str(name) for name in (outbound_blocking_read_tool_names or ()) if str(name)
     }
@@ -870,12 +909,20 @@ async def run_tool_loop(
             and provider_name
             in {"anthropic", "openrouter", "openai_compatible", "deepseek"}
         )
+        surface_candidate_tools = list(turn_catalog)
+        surface_reason = ""
         if terminal_schema_guard:
             tools = [
                 spec for spec in turn_catalog if spec.name in historical_tool_names
             ] or None
+            surface_reason = (
+                force_text_fallback_reason or "terminal_text_round"
+            )
         elif terminal_text_round:
             tools = None
+            surface_reason = (
+                force_text_fallback_reason or "terminal_text_round"
+            )
         elif (
             external_content_seen or mutation_outcome_unknown or outbound_tools_blocked
         ):
@@ -928,8 +975,10 @@ async def run_tool_loop(
                 # web/task 仍然拦着:那是模型自己选的目的地,MCP 是用户选的。
                 blocked_tools.add(tool_schema.TASK_TOOL)
             tools = [spec for spec in turn_catalog if spec.name not in blocked_tools]
+            surface_candidate_tools = list(tools)
         else:
             tools = turn_catalog
+            surface_candidate_tools = list(tools)
         requirement_already_met = (
             not file_delivery_required
             or (
@@ -947,6 +996,7 @@ async def run_tool_loop(
         ):
             # Keep the recovery path narrow enough for weaker tool-using models.
             tools = [spec for spec in tools if spec.name in _FILE_DELIVERY_TOOLS]
+            surface_reason = "file_delivery_forced"
             if file_delivery_recovery_needed:
                 forced_delivery_tool = (
                     tool_schema.FILE_REPLY_TOOL
@@ -997,16 +1047,40 @@ async def run_tool_loop(
                 on_tail_window(dict(tail_window))
             except Exception:
                 pass
-        if "tool_schemas" in frontier_plan.omitted_optional_components:
+        planned_tool_names = tuple(
+            getattr(frontier_plan, "included_tool_names", ()) or ()
+        )
+        planned_offered_tool_names = tuple(
+            getattr(frontier_plan, "offered_tool_names", ()) or ()
+        )
+        if planned_offered_tool_names:
+            included_tool_names = set(planned_tool_names)
+            tools = [
+                spec
+                for spec in (tools or [])
+                if spec.name in included_tool_names
+            ] or None
+            if (
+                not surface_reason
+                and len(tools or []) < len(surface_candidate_tools)
+            ):
+                surface_reason = "frontier_omitted"
+        elif "tool_schemas" in frontier_plan.omitted_optional_components:
             # Once a memory discovery result is present in the required native
             # transcript, keep that matching schema even when the remaining
-            # optional catalog no longer fits. This avoids a provider-visible
-            # call/result history whose tool definition has disappeared.
+            # optional catalog no longer fits. This compatibility branch also
+            # supports injected/legacy planners that predate per-tool frontier
+            # decisions.
             tools = [
                 spec
                 for spec in (tools or [])
                 if spec.name in required_schema_names
             ] or None
+            if (
+                not surface_reason
+                and len(tools or []) < len(surface_candidate_tools)
+            ):
+                surface_reason = "frontier_omitted"
         if before_provider_call is not None:
             before_provider_call()
         if tagged_image_fallback_active:
@@ -1076,6 +1150,30 @@ async def run_tool_loop(
                 # frontier; wake/child/screen lanes omit on_file_reply and keep
                 # their existing limits unchanged.
                 provider_kwargs["max_tokens"] = prompt_output_reserve_tokens
+            if on_provider_tool_surface is not None:
+                candidate_names = {
+                    str(spec.name) for spec in surface_candidate_tools
+                }
+                sent_names = {str(spec.name) for spec in (tools or [])}
+                mcp_candidate_names = candidate_names & mcp_names
+                mcp_sent_names = sent_names & mcp_names
+                try:
+                    await on_provider_tool_surface(
+                        {
+                            "round": attempts,
+                            "candidate_tool_count": len(candidate_names),
+                            "sent_tool_count": len(sent_names),
+                            "dropped_tool_count": len(candidate_names - sent_names),
+                            "mcp_candidate_tool_count": len(mcp_candidate_names),
+                            "mcp_sent_tool_count": len(mcp_sent_names),
+                            "mcp_dropped_tool_count": len(
+                                mcp_candidate_names - mcp_sent_names
+                            ),
+                            "reason": surface_reason or "none",
+                        }
+                    )
+                except Exception:
+                    pass
             result = await provider_client.reliable_chat_completion_async(
                 provider_config,
                 messages,
@@ -1212,6 +1310,7 @@ async def run_tool_loop(
                 and _is_probably_tool_schema_rejection(exc)
             ):
                 force_text_fallback = True
+                force_text_fallback_reason = "tool_schema_rejected"
                 await _trajectory(
                     "protocol_fallback",
                     {"round": attempts, "reason": "tool_schema_rejected"},
@@ -1221,8 +1320,14 @@ async def run_tool_loop(
             raise provider_error
         _progress("provider_complete")
         add_usage(result.get("usage"))
+        upstream_response_envelope = protocol_leak.is_upstream_response_envelope(
+            result.get("reply")
+        )
         raw_has_usable_output = bool(
-            str(result.get("reply") or "").strip()
+            (
+                str(result.get("reply") or "").strip()
+                and not upstream_response_envelope
+            )
             or result.get("tool_calls")
             or result.get("media")
         )
@@ -1260,12 +1365,13 @@ async def run_tool_loop(
 
         if (
             require_reply
-            and not pr.text.strip()
+            and (not pr.text.strip() or upstream_response_envelope)
             and not pr.tool_calls
             and not pr.media
         ):
             semantic_empty = bool(
-                str(pr.raw.get("reasoning") or "").strip()
+                upstream_response_envelope
+                or str(pr.raw.get("reasoning") or "").strip()
                 or str(pr.raw.get("stop_reason") or "").strip()
             )
             can_correct = (
@@ -1277,7 +1383,11 @@ async def run_tool_loop(
                 "empty_provider_response",
                 {
                     "round": attempts,
-                    "reason": "empty_provider_success",
+                    "reason": (
+                        "upstream_response_envelope"
+                        if upstream_response_envelope
+                        else "empty_provider_success"
+                    ),
                     "response_shape": _empty_response_shape(pr),
                     "action": (
                         "semantic_correction"
@@ -1288,7 +1398,9 @@ async def run_tool_loop(
             )
             if can_correct:
                 empty_response_recovery_used = True
-                empty_response_retry_instruction = _EMPTY_RESPONSE_CORRECTION
+                empty_response_retry_instruction = (
+                    normalized_empty_response_correction
+                )
                 reasoning_fragments.clear()
                 seen_reasoning_fragments.clear()
                 _progress("empty_response_retry_boundary")
@@ -1385,6 +1497,7 @@ async def run_tool_loop(
                         "terminal reply."
                     )
                 force_text_fallback = False
+                force_text_fallback_reason = ""
                 # One guard-triggered recovery is enough. Tool calls emitted by
                 # that recovery may still take later rounds to write, deliver,
                 # and finish; the guard itself must not keep re-arming or consume
@@ -1578,6 +1691,7 @@ async def run_tool_loop(
                 },
             )
             force_text_fallback = True
+            force_text_fallback_reason = ""
             continue
 
         tool_calls_used += len(pr.tool_calls)
@@ -1596,18 +1710,19 @@ async def run_tool_loop(
         reply_results: dict[str, ToolResult] = {}
         repeated_memory_calls = []
         dispatch_calls = []
-        discovery_names_in_batch: set[str] = set()
+        discovery_calls_in_batch: set[tuple[str, str]] = set()
         for tc in other_calls:
-            repeated_discovery = (
-                tc.name in completed_memory_discovery_tools
-                or tc.name in discovery_names_in_batch
+            discovery_call_key = _memory_discovery_call_key(tc)
+            repeated_discovery = discovery_call_key is not None and (
+                discovery_call_key in completed_memory_discovery_calls
+                or discovery_call_key in discovery_calls_in_batch
             )
             if repeated_discovery:
                 repeated_memory_calls.append(tc)
                 continue
             dispatch_calls.append(tc)
-            if tc.name in _MEMORY_DISCOVERY_TOOLS:
-                discovery_names_in_batch.add(tc.name)
+            if discovery_call_key is not None:
+                discovery_calls_in_batch.add(discovery_call_key)
         for tc in repeated_memory_calls:
             await _tool_event(tc, "tool_call_started", {})
             repeated_result = ToolResult(
@@ -1616,6 +1731,7 @@ async def run_tool_loop(
                     "ok: this memory discovery was already completed; use its "
                     "prior result and continue without calling it again"
                 ),
+                metadata={"memory_discovery_reused": True},
             )
             reply_results[tc.id] = repeated_result
             await _tool_event(
@@ -1845,9 +1961,11 @@ async def run_tool_loop(
                 allowed_fetch_urls.update(_search_result_urls(result.content))
             elif tc.name == "web_fetch":
                 allowed_fetch_urls.discard(str(tc.args.get("url") or "").strip())
-        completed_memory_discovery_tools.update(
-            tc.name for tc in dispatch_calls if tc.name in _MEMORY_DISCOVERY_TOOLS
-        )
+        for tc in dispatch_calls:
+            discovery_call_key = _memory_discovery_call_key(tc)
+            if discovery_call_key is not None:
+                completed_memory_discovery_tools.add(tc.name)
+                completed_memory_discovery_calls.add(discovery_call_key)
         if any(
             tc.name == "workspace_write"
             and str(ordered_results_by_id[tc.id].content).strip().lower().startswith("ok")
