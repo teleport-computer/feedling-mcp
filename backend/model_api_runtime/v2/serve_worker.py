@@ -2741,7 +2741,17 @@ def _read_memory_context(user_id: str, *, full_cards: bool = False) -> dict:
                     if not line:
                         continue
                     added_chars = len(line) + (1 if lines else 0)
-                    if lines and rendered_chars + added_chars > _DREAM_CARDS_MAX_CHARS:
+                    if rendered_chars + added_chars > _DREAM_CARDS_MAX_CHARS:
+                        log.warning(
+                            "[v2.serve_worker] dream cards truncated user=%s "
+                            "kept=%d/%d chars=%d cap=%d empty_context=%s",
+                            user_id,
+                            len(selected),
+                            len(ids),
+                            rendered_chars,
+                            _DREAM_CARDS_MAX_CHARS,
+                            not selected,
+                        )
                         break
                     selected.append(item)
                     lines.append(line)
