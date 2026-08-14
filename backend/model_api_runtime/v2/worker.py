@@ -898,6 +898,12 @@ _SCHEDULED_WAKE_SYSTEM_PROMPT = (
     "do not greet the user, do not ask what they need, and do not replace the reminder "
     "with a generic check-in."
 )
+_SCHEDULED_WAKE_EMPTY_RESPONSE_CORRECTION = (
+    "The due scheduled reminder still has not been delivered. Read every item in "
+    "runtime_data.scheduled_wakes and return non-empty visible text that naturally "
+    "conveys every reminder now. Do not stay silent, do not return only thinking, "
+    "and do not answer an older conversation turn instead."
+)
 # screen_watch lane (Task 3): a wake grounded on recent shared-screen frames rather
 # than an ambient perception glance. Its own system prompt sits beside
 # _WAKE_SYSTEM_PROMPT; _run_wake selects it only for lane=="screen_watch". The
@@ -7781,8 +7787,8 @@ async def _run_wake(
 ) -> str:
     """wake-lane（heartbeat/scheduled/manual_wake/screen_watch）turn：让伴侣主动开口，而不是
     回答用户刚发的消息（用户根本没发消息——这就是唤醒的定义）。同 `_run_compaction` 一样自成
-    一体、自己的 try/except：这是后台/主动发起的 job，provider 解析失败或任何未预期异常
-    都静默 `mark_failed`，绝不 `_surface_terminal_error`、绝不写占位气泡。
+    一体、自己的 try/except。heartbeat/manual_wake/screen_watch 是弱唤醒，失败继续静默；
+    scheduled 是到点交付，最终失败通过 durable terminal outbox 写明确失败结果，不能无声消失。
 
     D3 Task 8 (PR C spec C8)：跟 chat 分支（`process_job`，Task 7）一样跑同一个
     `tool_loop.run_tool_loop`。`turn_authorization=True` 传给 `dispatch_tool_calls`（跟 chat
@@ -7795,8 +7801,8 @@ async def _run_wake(
       "终态空文本 = no-filler 失败"的语义**相反**。循环正常跑完（`run_tool_loop` 不抛异常）
       即视为成功，`mark_completed`，只是没写出气泡。
 
-    真 provider 错误（`chat_completion_async` 抛出的任何异常）：静默 `mark_failed`，同样
-    不弹用户可见 error chip——背景 job，同 maintenance 的隔离口径。402/401/403 一类
+    真 provider 错误（`chat_completion_async` 抛出的任何异常）：所有 lane 都
+    `mark_failed`；只有 scheduled 同步排入用户可见失败 outbox。402/401/403 一类
     "provider_config"错误（死/欠费 BYOK key）额外写一条 payment_cooldown（D3 Task 7），
     让 scheduler 的 `due_heartbeat_users` 停止对一把修不好的钥匙反复重试。
 
@@ -9326,6 +9332,11 @@ async def _run_wake(
                 # 重放定时器（mark_fired 在入队时就落，不等 job 成功），只会 arm
                 # 60s 起、1h 封顶的 proactive 退避，用户下次说话即清。
                 require_reply=(lane == "scheduled"),
+                empty_response_correction=(
+                    _SCHEDULED_WAKE_EMPTY_RESPONSE_CORRECTION
+                    if lane == "scheduled"
+                    else v2_tool_loop._EMPTY_RESPONSE_CORRECTION
+                ),
                 on_provider_success=lambda: _record_provider_success(user_id),
                 on_provider_failure=lambda exc: _record_provider_failure(
                     user_id,
@@ -9377,10 +9388,10 @@ async def _run_wake(
                 # model's suppress/sleep outcome.  This assignment is after the
                 # tool loop and cannot influence any provider input or branch.
                 shadow_decision_allowed = False
-        except Exception as e:  # noqa: BLE001 — classify below, then let it fall to the outer silent mark_failed
+        except Exception as e:  # noqa: BLE001 — classify below, then terminalize outside
             if provider_client.classify_provider_error(e) == "provider_config":
                 # Dead/broke BYOK key (402 out-of-credits, 401/403 bad key) — back off
-                # BEFORE the silent mark_failed below, so the scheduler stops hammering
+                # BEFORE mark_failed below, so the scheduler stops hammering
                 # this key every heartbeat interval (Task 1's due_heartbeat_users query
                 # already excludes users still in cooldown).
                 await _fence_wake_effect("payment cooldown")
@@ -9463,7 +9474,7 @@ async def _run_wake(
         if tm is not None:
             tm.flush(failed=False, status="ok")
         return "completed"
-    except Exception as e:  # noqa: BLE001 — wake job: silent mark_failed, never surface/bubble
+    except Exception as e:  # noqa: BLE001 — scheduled failures surface below
         code = _safe_failure_code("wake_failed", e)
         await _record_trajectory(
             trajectory_recorder,
@@ -9482,11 +9493,12 @@ async def _run_wake(
             lane in _FAIL_BACKOFF_WAKE_LANES
             and not isinstance(e, (LostJobLease, RuntimeModeChanged))
         )
-        await asyncio.to_thread(
+        owned = await asyncio.to_thread(
             jobs_store.mark_failed,
             job_id,
             code,
             claimed_by=claimed_by,
+            error_class=_turn_failure_error_class(e),
             wake_backoff_base_sec=(
                 _WAKE_FAIL_BACKOFF_BASE_SEC if arm_wake_backoff else None
             ),
@@ -9494,6 +9506,19 @@ async def _run_wake(
                 _WAKE_FAIL_BACKOFF_CAP_SEC if arm_wake_backoff else None
             ),
         )
+        if owned and lane == "scheduled":
+            # A due timer is not a weak presence moment: it has a visible
+            # delivery obligation. mark_failed already wrote the durable
+            # outbox marker in the same transaction; this is only the prompt
+            # low-latency drain, and the independent reconciler remains the
+            # crash/retry boundary.
+            await asyncio.to_thread(
+                _surface_terminal_error,
+                deps,
+                user_id,
+                job_id,
+                code,
+            )
         if tm is not None:
             tm.flush(failed=True, status=code)
         return "failed"
@@ -14111,8 +14136,9 @@ async def _run_turn(job: dict, deps: TurnDeps) -> str:
                 owned = await asyncio.to_thread(
                     jobs_store.mark_failed, job_id, err, claimed_by=claimed_by
                 )
-                if owned and lane == "chat":
-                    await _settle_legacy_traced_chat_failure(err)
+                if owned and lane in {"chat", "scheduled"}:
+                    if lane == "chat":
+                        await _settle_legacy_traced_chat_failure(err)
                     await asyncio.to_thread(
                         _surface_terminal_error, deps, user_id, job_id, err
                     )
@@ -14174,8 +14200,9 @@ async def _run_turn(job: dict, deps: TurnDeps) -> str:
             claimed_by=claimed_by,
             error_class=_turn_failure_error_class(e),
         )
-        if owned and lane == "chat":
-            await _settle_legacy_traced_chat_failure(message)
+        if owned and lane in {"chat", "scheduled"}:
+            if lane == "chat":
+                await _settle_legacy_traced_chat_failure(message)
             await asyncio.to_thread(
                 _surface_terminal_error, deps, user_id, job_id, message
             )
@@ -14346,7 +14373,10 @@ async def _slot_loop(
                         message,
                         claimed_by=str(job.get("claimed_by") or worker_id),
                     )
-                    if owned and str(job.get("lane") or "chat") == "chat":
+                    if owned and str(job.get("lane") or "chat") in {
+                        "chat",
+                        "scheduled",
+                    }:
                         await asyncio.to_thread(
                             _surface_terminal_error, deps, user_id, job["id"], message
                         )

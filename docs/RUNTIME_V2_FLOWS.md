@@ -128,7 +128,11 @@ enqueue heartbeat job → 完成后推进 `next_heartbeat_at = now + wake_interv
 **语义**:必须送达——prompt 明令"deliver every supplied reminder now,不许
 沉默、不许寒暄替代"(worker.py:868-872);一次最多批 10 条最早提醒
 (worker.py:7252-7289)。撞车门**不**适用(用户授权的送达优先);DND 下
-提醒投递由 controls_v2 单独把关。取消:cancel_wake(wake_id)。
+提醒投递由 controls_v2 单独把关。模型/provider 给空结果时,tool loop 用
+scheduled 专用纠正语再试一次;仍失败时,job 终态与 terminal-failure outbox
+在同一事务落下,重放器写一条独立的加密失败消息(含原提醒 note + 安全错误说明)。
+该消息不挂到最近 user turn、不推进 reply cursor,且以 job id 幂等。取消:
+cancel_wake(wake_id)。
 
 ## 4. manual_wake
 

@@ -1,8 +1,9 @@
 """Wake-lane processing on the unified `tool_loop.run_tool_loop`.
 
-`_run_wake` mirrors `_run_compaction`'s self-contained shape (own try/except,
-silent `mark_failed`, never `_surface_terminal_error`, never a chat bubble on
-failure) but on a SUCCESSFUL model-authored reply it DOES write an encrypted
+`_run_wake` mirrors `_run_compaction`'s self-contained shape (own try/except).
+Weak wake failures remain silent; a scheduled reminder failure is durably
+surfaced because that lane has an explicit delivery obligation. On a
+SUCCESSFUL model-authored reply it writes an encrypted
 chat bubble via the PR A effect outbox (`on_reply` -> `enqueue_effect` ->
 `apply_pending_effects`, same mechanism the chat lane uses) — the whole point
 of a wake lane is letting the companion reach out proactively.
@@ -15,8 +16,8 @@ history completes without calling the provider; explicitly scheduled and
 manual wakes remain valid with an empty coalesce/read_tail.
 
 A real provider failure (`provider_client.chat_completion_async` raising) IS
-a failure — silent `mark_failed`, still no user-visible error chip
-(background job, same isolation as maintenance).
+a failure. Scheduled wakes surface it; other wake lanes keep the background
+isolation used by maintenance.
 
 Style: real jobs_store/core_store (real DB claim/mark_*/status events) +
 stubbed `provider_client.chat_completion_async` (the LLM wire boundary
@@ -2234,9 +2235,8 @@ def test_scheduled_wake_empty_reply_fails_instead_of_completing_silently(monkeyp
     空回复走聊天道时是可见的 `turn_failed:empty_reply`——两条道对同一个事实
     给出相反的结论，而只有静默的那条是用户在踩的。
 
-    这里锁的是「不许静默成功」。至于失败**该不该让用户看见**是另一个问题：
-    `_run_wake` 的 except 明写 "silent mark_failed, never surface/bubble"，
-    本用例不碰那个决定。
+    这里同时锁两层：不许静默成功，而且最终失败必须进入 durable visibility
+    outbox；否则后台虽然红了，手机端仍和旧行为一样什么都看不到。
     """
     uid = "u_wake_sched_empty"
     conftest.seed_user(uid)
@@ -2245,6 +2245,14 @@ def test_scheduled_wake_empty_reply_fails_instead_of_completing_silently(monkeyp
     claimed_by = _claim(job_id)
 
     calls = _script_provider(monkeypatch, [_empty_round(), _empty_round()])
+    surfaced = []
+    monkeypatch.setattr(
+        worker,
+        "_surface_terminal_error",
+        lambda deps, user_id, failed_job_id, code: surfaced.append(
+            (user_id, failed_job_id, code)
+        ),
+    )
     write_called = {"n": 0}
     monkeypatch.setattr(
         worker, "_write_encrypted_reply",
@@ -2263,6 +2271,26 @@ def test_scheduled_wake_empty_reply_fails_instead_of_completing_silently(monkeyp
     # 先重试一轮再判死：判死前必须真的给过第二次机会，否则这就退化成
     # 「把静默成功换成快速失败」，用户拿到的东西一样少。
     assert len(calls) == 2, calls
+    correction_text = "\n".join(
+        str(message.get("content") or "")
+        for message in calls[1]["messages"]
+        if message.get("role") == "system"
+    )
+    assert worker._SCHEDULED_WAKE_EMPTY_RESPONSE_CORRECTION in correction_text
+    assert surfaced == [(uid, job_id, "wake_failed:empty_reply")]
+    with db.get_pool().connection() as conn:
+        marker = conn.execute(
+            "SELECT error_code,error_class,reply_frontier_seq,"
+            "reply_parent_message_id FROM v2_terminal_failure_outbox "
+            "WHERE job_id=%s",
+            (job_id,),
+        ).fetchone()
+    assert marker == (
+        "wake_failed:empty_reply",
+        "provider_empty_reply",
+        None,
+        None,
+    )
 
 
 def test_scheduled_wake_empty_reply_recovers_on_the_correction_retry(monkeypatch):
