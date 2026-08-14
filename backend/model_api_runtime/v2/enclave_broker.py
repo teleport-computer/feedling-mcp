@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import math
 import threading
+import time
 import uuid
-from collections import Counter
+from collections import Counter, deque
 from dataclasses import dataclass
 from typing import Any, Callable, Mapping
 
@@ -117,6 +119,7 @@ class EnclaveBroker:
         limit: int,
         reservations: Mapping[PoolName, int],
         on_grant: Callable[[EnclaveRequest], None],
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self.limit = int(limit)
         self.reservations = {
@@ -129,10 +132,15 @@ class EnclaveBroker:
         if sum(self.reservations.values()) > self.limit:
             raise ValueError("enclave reservations exceed limit")
         self._on_grant = on_grant
+        self._clock = clock
         self._lock = threading.RLock()
         self._granted: dict[str, EnclaveRequest] = {}
         self._waiters: list[tuple[int, EnclaveRequest]] = []
         self._sequence = 0
+        self._wait_started: dict[str, float] = {}
+        self._wait_samples_ms = {
+            pool: deque(maxlen=256) for pool in _POOLS
+        }
 
     def request(self, request: EnclaveRequest) -> bool:
         callbacks: list[EnclaveRequest]
@@ -144,6 +152,7 @@ class EnclaveBroker:
                 return False
             self._sequence += 1
             self._waiters.append((self._sequence, request))
+            self._wait_started[request.request_id] = self._clock()
             callbacks = self._drain_locked()
         self._notify(callbacks)
         return request.request_id in {item.request_id for item in callbacks}
@@ -173,6 +182,7 @@ class EnclaveBroker:
                     and request.slot_generation == str(slot_generation)
                 ):
                     removed = True
+                    self._wait_started.pop(request.request_id, None)
                 else:
                     kept.append((sequence, request))
             self._waiters = kept
@@ -199,6 +209,14 @@ class EnclaveBroker:
                 for sequence, request in self._waiters
                 if request.slot_generation != generation
             ]
+            waiting_ids = {
+                request.request_id for _sequence, request in self._waiters
+            }
+            self._wait_started = {
+                request_id: started
+                for request_id, started in self._wait_started.items()
+                if request_id in waiting_ids
+            }
             callbacks = self._drain_locked()
         self._notify(callbacks)
 
@@ -211,6 +229,10 @@ class EnclaveBroker:
                 "total_granted": len(self._granted),
                 "granted": {pool: int(granted[pool]) for pool in _POOLS},
                 "waiting": {pool: int(waiting[pool]) for pool in _POOLS},
+                "wait_p95_ms": {
+                    pool: self._percentile95(self._wait_samples_ms[pool])
+                    for pool in _POOLS
+                },
             }
 
     def _drain_locked(self) -> list[EnclaveRequest]:
@@ -236,6 +258,10 @@ class EnclaveBroker:
                 ),
             )
             _sequence, request = self._waiters.pop(index)
+            started = self._wait_started.pop(request.request_id, self._clock())
+            self._wait_samples_ms[request.pool].append(
+                max(0.0, (self._clock() - started) * 1000.0)
+            )
             self._granted[request.request_id] = request
             granted.append(request)
         return granted
@@ -243,6 +269,14 @@ class EnclaveBroker:
     def _notify(self, requests: list[EnclaveRequest]) -> None:
         for request in requests:
             self._on_grant(request)
+
+    @staticmethod
+    def _percentile95(samples) -> float:
+        if not samples:
+            return 0.0
+        ordered = sorted(float(value) for value in samples)
+        index = max(0, math.ceil(len(ordered) * 0.95) - 1)
+        return round(ordered[index], 3)
 
 
 class BrokerSemaphore:

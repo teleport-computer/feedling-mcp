@@ -5074,20 +5074,78 @@ async def _fleet_heartbeat_loop(
                     and snapshot.active_job is not None
                     for key, snapshot in snapshots.items()
                 )
+                runtime_state = {
+                    "slots": {
+                        "configured": configured,
+                        "healthy": capacity,
+                        "busy": busy,
+                        "restarting": max(0, configured - capacity),
+                    }
+                }
+                if pool == "foreground":
+                    broker_state = fleet.broker_snapshot()
+                    broker_state.pop("total_granted", None)
+                    broker_state.setdefault(
+                        "wait_p95_ms",
+                        {name: 0.0 for name in ("foreground", "wake", "heavy")},
+                    )
+                    parent_stats = db.get_pool().get_stats()
+                    parent_size = int(parent_stats.get("pool_size") or 0)
+                    parent_available = int(
+                        parent_stats.get("pool_available") or 0
+                    )
+                    runtime_state.update(
+                        {
+                            "enclave": broker_state,
+                            "db_pools": {
+                                "parent": {
+                                    "max": 8,
+                                    "used": max(0, parent_size - parent_available),
+                                    "waiting": int(
+                                        parent_stats.get("requests_waiting") or 0
+                                    ),
+                                    "timeouts": int(
+                                        parent_stats.get("requests_errors") or 0
+                                    ),
+                                },
+                                "slot": {
+                                    "processes": len(fleet.keys()),
+                                    "max_each": 2,
+                                    "used": sum(
+                                        snapshot is not None
+                                        and snapshot.active_job is not None
+                                        for snapshot in snapshots.values()
+                                    ),
+                                    "waiting": 0,
+                                    "timeouts": 0,
+                                },
+                            },
+                            "isolation_events": {
+                                "watchdog_kills": {},
+                                "stale_owner_rejections": 0,
+                                "preemption_exit_p95_ms": None,
+                                "watchdog_release_p95_ms": None,
+                                "admission_rejects": {
+                                    "no_foreground_capacity": 0,
+                                    "over_sla": 0,
+                                    "control_halted": 0,
+                                },
+                            },
+                            "profile_runtime": {
+                                "card_count_max": 0,
+                                "batch_count": 0,
+                                "provider_calls_max": 0,
+                                "stage_p95_ms": {},
+                            },
+                        }
+                    )
                 await asyncio.to_thread(
                     jobs_store.record_worker_heartbeat,
                     heartbeat_id,
                     pool=pool,
                     kind="turn",
                     capacity=capacity,
-                    runtime_state={
-                        "slots": {
-                            "configured": configured,
-                            "healthy": capacity,
-                            "busy": busy,
-                            "restarting": max(0, configured - capacity),
-                        }
-                    },
+                    runtime_state=runtime_state,
                 )
             except Exception as exc:  # noqa: BLE001
                 log.warning("[v2.serve_worker] fleet heartbeat failed pool=%s: %s", pool, exc)

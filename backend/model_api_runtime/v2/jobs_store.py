@@ -4154,6 +4154,105 @@ def recent_worker_heartbeat_count(*, within_sec: int = 300) -> int:
             return int(cur.fetchone()[0])
 
 
+def _job_pool_case_sql() -> str:
+    return (
+        "CASE WHEN lane IN ('chat','manual_wake') THEN 'foreground' "
+        "WHEN lane IN ('heartbeat','scheduled','screen_watch') THEN 'wake' "
+        "ELSE 'heavy' END"
+    )
+
+
+def pool_queue_metrics() -> dict[str, dict[str, int | float | None]]:
+    """Bounded queue/claim aggregates for the three fixed runtime pools."""
+    query = (
+        "WITH tagged AS (SELECT " + _job_pool_case_sql() + " AS pool, "
+        "status,created_at,claimed_at FROM agent_jobs "
+        "WHERE created_at > now() - interval '24 hours' "
+        "OR status IN ('pending','claimed','running')) "
+        "SELECT pool, count(*) FILTER (WHERE status='pending') AS pending, "
+        "MAX(EXTRACT(EPOCH FROM (now()-created_at))) "
+        "FILTER (WHERE status='pending') AS oldest_pending_sec, "
+        "percentile_cont(0.95) WITHIN GROUP (ORDER BY "
+        "EXTRACT(EPOCH FROM (claimed_at-created_at))*1000) "
+        "FILTER (WHERE claimed_at IS NOT NULL) AS claim_p95_ms "
+        "FROM tagged GROUP BY pool"
+    )
+    result = {
+        pool: {"pending": 0, "oldest_pending_sec": None, "claim_p95_ms": None}
+        for pool in ("foreground", "wake", "heavy")
+    }
+    with _pool().connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(query)
+            for row in cur.fetchall():
+                result[str(row["pool"])] = {
+                    "pending": int(row["pending"] or 0),
+                    "oldest_pending_sec": (
+                        None
+                        if row["oldest_pending_sec"] is None
+                        else float(row["oldest_pending_sec"])
+                    ),
+                    "claim_p95_ms": (
+                        None
+                        if row["claim_p95_ms"] is None
+                        else float(row["claim_p95_ms"])
+                    ),
+                }
+    return result
+
+
+def job_counts_by_lane() -> dict[str, dict[str, int]]:
+    """Current pending and owner-held counts, omitting all-zero lanes."""
+    with _pool().connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "SELECT lane, count(*) FILTER (WHERE status='pending') AS pending, "
+                "count(*) FILTER (WHERE status IN ('claimed','running')) AS active "
+                "FROM agent_jobs WHERE status IN ('pending','claimed','running') "
+                "GROUP BY lane ORDER BY lane"
+            )
+            rows = cur.fetchall()
+    return {
+        str(row["lane"]): {
+            "pending": int(row["pending"] or 0),
+            "active": int(row["active"] or 0),
+        }
+        for row in rows
+    }
+
+
+def recent_preemption_counts(*, within_hours: int = 24) -> dict[str, int]:
+    safe_hours = max(1, min(int(within_hours), 24 * 30))
+    with _pool().connection() as conn:
+        rows = conn.execute(
+            "SELECT lane, count(*) FROM agent_jobs "
+            "WHERE last_error='foreground_chat_preempted' "
+            "AND COALESCE(finished_at,created_at) > "
+            "now()-make_interval(hours => %s) GROUP BY lane ORDER BY lane",
+            (safe_hours,),
+        ).fetchall()
+    return {
+        f"{str(lane)}:{'requeued' if str(lane) in {'scheduled', 'capture'} else 'terminal'}": int(count)
+        for lane, count in rows
+    }
+
+
+def recent_watchdog_recovery_counts(*, within_hours: int = 24) -> dict[str, int]:
+    safe_hours = max(1, min(int(within_hours), 24 * 30))
+    with _pool().connection() as conn:
+        rows = conn.execute(
+            "SELECT lane, count(*) FROM agent_jobs "
+            "WHERE last_error='slot_watchdog_timeout' "
+            "AND COALESCE(finished_at,created_at) > "
+            "now()-make_interval(hours => %s) GROUP BY lane ORDER BY lane",
+            (safe_hours,),
+        ).fetchall()
+    return {
+        f"{str(lane)}:{'terminal' if str(lane) == 'chat' else 'requeued'}": int(count)
+        for lane, count in rows
+    }
+
+
 def inflight_job_count(*, lanes: set[str] | None = None) -> int:
     """Count pending/claimed/running Jobs, optionally within selected lanes.
 

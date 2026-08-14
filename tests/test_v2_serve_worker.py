@@ -1426,6 +1426,73 @@ def test_turn_heartbeat_advertises_slot_capacity(monkeypatch):
     )
 
 
+def test_foreground_fleet_heartbeat_runtime_state_is_bounded_and_identifier_free(
+    monkeypatch,
+):
+    from model_api_runtime.v2 import pool_supervisor
+
+    stop = asyncio.Event()
+    calls = []
+
+    class _Pool:
+        def get_stats(self):
+            return {"pool_size": 8, "pool_available": 5, "requests_waiting": 0}
+
+    class _Fleet:
+        def keys(self):
+            return tuple(
+                [pool_supervisor.SlotKey("foreground", index) for index in range(4)]
+                + [pool_supervisor.SlotKey("wake", index) for index in range(2)]
+                + [pool_supervisor.SlotKey("heavy", index) for index in range(2)]
+            )
+
+        def healthy_capacity(self, pool, *, stale_sec):
+            return 4 if pool == "foreground" else 2
+
+        def snapshots(self):
+            return {key: None for key in self.keys()}
+
+        def broker_snapshot(self):
+            return {
+                "limit": 4,
+                "total_granted": 0,
+                "granted": {"foreground": 0, "wake": 0, "heavy": 0},
+                "waiting": {"foreground": 0, "wake": 0, "heavy": 0},
+            }
+
+    monkeypatch.setattr(serve_worker.db, "get_pool", lambda: _Pool())
+
+    def _record(worker_id, **kwargs):
+        calls.append((worker_id, kwargs))
+        stop.set()
+
+    monkeypatch.setattr(jobs_store, "record_worker_heartbeat", _record)
+    asyncio.run(
+        serve_worker._fleet_heartbeat_loop(
+            "worker",
+            "foreground",
+            _Fleet(),
+            stop,
+            interval=0.01,
+        )
+    )
+
+    state = calls[0][1]["runtime_state"]
+    encoded = json.dumps(state, sort_keys=True)
+    assert len(encoded.encode("utf-8")) < 4096
+    for forbidden in (
+        "user_id",
+        "job_id",
+        "claimed_by",
+        "slot_generation",
+        "provider_url",
+        "message_text",
+        "memory_content",
+        "exception",
+    ):
+        assert forbidden not in encoded
+
+
 # ------------------------------------------------------------------
 # FIX 3: "v2_jobs" immediate-wake bridge (wake_bus notify -> asyncio.Event)
 # ------------------------------------------------------------------

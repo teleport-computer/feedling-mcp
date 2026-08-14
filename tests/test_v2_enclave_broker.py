@@ -149,6 +149,27 @@ def test_cancel_waiter_removes_it_without_leaking_capacity():
     assert broker.snapshot()["waiting"]["foreground"] == 0
 
 
+def test_snapshot_reports_bounded_wait_p95_by_pool():
+    now = [100.0]
+    broker = enclave_broker.EnclaveBroker(
+        limit=1,
+        reservations={"foreground": 1, "wake": 0, "heavy": 0},
+        on_grant=lambda _request: None,
+        clock=lambda: now[0],
+    )
+    broker.request(_request(1, "foreground"))
+    broker.request(_request(2, "heavy"))
+
+    now[0] += 0.3
+    broker.release("r1", "g7")
+
+    assert broker.snapshot()["wait_p95_ms"] == {
+        "foreground": 0.0,
+        "wake": 0.0,
+        "heavy": 300.0,
+    }
+
+
 def test_child_semaphore_waits_for_matching_parent_grant_and_releases():
     parent, child = multiprocessing.Pipe(duplex=True)
 

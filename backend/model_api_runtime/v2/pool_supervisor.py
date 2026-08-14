@@ -34,6 +34,7 @@ class SlotFleet:
         supervisor_factory=child_supervisor.ChildSupervisor,
     ) -> None:
         self.config = config
+        self._broker = broker
         self._lock = threading.RLock()
         self._specs: dict[SlotKey, pool_config.SlotSpec] = {}
         self._supervisors: dict[SlotKey, child_supervisor.ChildSupervisor] = {}
@@ -125,3 +126,13 @@ class SlotFleet:
     def _grant_enclave(self, request: enclave_broker.EnclaveRequest) -> None:
         for supervisor in self._supervisors.values():
             supervisor.grant_enclave(request)
+
+    def broker_snapshot(self) -> dict[str, object]:
+        if self._broker is None:
+            return {
+                "limit": 0,
+                "total_granted": 0,
+                "granted": {pool: 0 for pool in ("foreground", "wake", "heavy")},
+                "waiting": {pool: 0 for pool in ("foreground", "wake", "heavy")},
+            }
+        return self._broker.snapshot()
