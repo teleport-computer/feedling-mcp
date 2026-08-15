@@ -80,8 +80,10 @@ def _deps(**over):
             "ai_name": "小克", "user_name": "Z", "buckets": "B",
             "threads": "T", "identity": "I", "cards": "C",
             "card_items": [
-                {"id": "old-a", "summary": "计划去京都", "content": "想看红叶。"},
-                {"id": "old-b", "summary": "订了京都机票", "content": "11 月出发。"},
+                {"id": "old-a", "summary": "计划去京都", "content": "想看红叶。",
+                 "occurred_at": "2026-03-01T00:00:00Z"},
+                {"id": "old-b", "summary": "订了京都机票", "content": "11 月出发。",
+                 "occurred_at": "2026-05-01T00:00:00Z"},
             ]},
         build_memory_envelope=_envelope,
         apply_memory_actions=lambda uid, actions: {
@@ -167,7 +169,8 @@ def test_dream_blast_radius_fuse_fails_whole_job(monkeypatch):
     job = jobs_store.claim_next_job("w")
 
     cards = [
-        {"id": f"card-{i}", "summary": f"S{i}", "content": f"C{i}"}
+        {"id": f"card-{i}", "summary": f"S{i}", "content": f"C{i}",
+         "occurred_at": f"2026-07-{i + 1:02d}T00:00:00Z"}
         for i in range(15)
     ]
 
@@ -216,7 +219,8 @@ def test_dream_below_fuse_threshold_applies_normally(monkeypatch):
     job = jobs_store.claim_next_job("w")
 
     cards = [
-        {"id": f"card-{i}", "summary": f"S{i}", "content": f"C{i}"}
+        {"id": f"card-{i}", "summary": f"S{i}", "content": f"C{i}",
+         "occurred_at": f"2026-07-{i + 1:02d}T00:00:00Z"}
         for i in range(15)
     ]
 
@@ -255,6 +259,44 @@ def test_dream_below_fuse_threshold_applies_normally(monkeypatch):
     assert status == "completed"
     assert applied == {"n": 2}
     assert _job_row(job_id)[0] == "completed"
+
+
+def test_dream_unusable_source_time_is_observable_and_writes_nothing(monkeypatch):
+    uid = "u_x_dream_missing_occurred_at"
+    _seed_v2(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, "dream")
+    job = jobs_store.claim_next_job("w")
+
+    async def _fake_extract(**_kwargs):
+        return ([{
+            "op": "merge",
+            "card_ids": ["old-a", "old-b"],
+            "rationale": "同一线索",
+            "result": {"summary": "s", "content": "c"},
+        }], None)
+
+    monkeypatch.setattr(extraction, "extract", _fake_extract)
+    applied = []
+    deps = _deps(
+        read_memory_context=lambda _uid: {
+            "ai_name": "小克", "user_name": "Z", "cards": "C",
+            "card_items": [
+                {"id": "old-a", "occurred_at": "2026-03-01T00:00:00Z"},
+                {"id": "old-b", "occurred_at": ""},
+            ],
+        },
+        apply_memory_actions=lambda _uid, actions: applied.extend(actions),
+    )
+
+    status = asyncio.run(worker.process_job(
+        job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"))
+
+    assert status == "failed"
+    assert applied == []
+    assert _job_row(job_id) == (
+        "failed",
+        "extraction_failed:dream_source_occurred_at_unavailable",
+    )
 
 
 @pytest.mark.parametrize("lane", ["capture", "dream"])
