@@ -119,13 +119,13 @@ proactive wake lanes or subagents; a turn that reads history drops outbound
 web/MCP/task tools for the following round, and a deployment kill switch
 removes the capability entirely without touching the normal chat path.
 
-Deployments may opt into deterministic Runtime V2 coverage accounting as an
-independent precursor to the bounded Memory/User profile rollout. In that mode,
-maintenance and synchronous prompt catch-up advance the same exact source
-witnesses using content-free count sentinels, and deterministic fan-out
-checkpoints keep the frontier bounded without sending historical Chat plaintext
-to a model provider. The source ledger and rollback-compatible summary storage
-remain unchanged.
+Runtime V2 coverage accounting is permanently metadata-only. Maintenance and
+synchronous prompt catch-up advance exact source witnesses using content-free
+count sentinels, and deterministic fan-out checkpoints keep the frontier bounded
+without sending historical Chat plaintext to a model provider. MEMORY/USER is
+the sole long-term semantic layer; encrypted Chat rows remain the durable source
+ledger. Restoring provider-backed conversation summaries requires rolling back
+the worker image rather than changing a runtime flag.
 
 The bounded Memory/User profile storage contract uses one
 `v2_agent_profile` document so both fields advance under one compare-and-swap.

@@ -180,7 +180,6 @@ def test_post_fold_checkpoint_exhaustion_is_content_free_degradation(monkeypatch
             _minimal_deps(),
             lane="maintenance",
             phase="post_fold",
-            provider_config=None,
             enclave_sem=None,
         )
     )
@@ -206,7 +205,6 @@ def test_post_fold_frontier_integrity_error_is_still_fatal(monkeypatch):
                 _minimal_deps(),
                 lane="maintenance",
                 phase="post_fold",
-                provider_config=None,
                 enclave_sem=None,
             )
         )
@@ -231,7 +229,6 @@ def test_post_fold_checkpoint_timeout_is_bounded_degradation(monkeypatch):
             _minimal_deps(),
             lane="maintenance",
             phase="post_fold",
-            provider_config=None,
             enclave_sem=None,
             timeout_sec=0.01,
         )
@@ -268,7 +265,6 @@ def test_checkpoint_degradation_never_logs_arbitrary_detail_or_code(
             _minimal_deps(),
             lane="maintenance",
             phase="post_fold",
-            provider_config=None,
             enclave_sem=None,
         )
     )

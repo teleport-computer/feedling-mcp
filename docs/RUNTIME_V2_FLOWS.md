@@ -44,8 +44,9 @@ enclave 解密信号量 2。
 3. 装载 workspace prompt 上下文 `_load_workspace_prompt_context`(worker.py:10147):
    **genesis 人设全文**(每 turn JIT 解密 `genesis_persona.content_envelope`,
    serve_worker.py:_load_genesis_persona,95bbd545)+ `/skills/*` 政策文档;
-4. 读摘要 + 原文尾巴(read_summary_with_seq / read_tail_after_seq,
-   worker.py:10261-10348;tail 硬上限 60 行,超时丢最旧并注入 coverage_hole 声明);
+4. 读 metadata-only 的确定性历史 coverage + 原文尾巴
+   (read_summary_with_seq / read_tail_after_seq;coverage 只证明已覆盖消息数，
+   不含语义摘要；tail 超预算时丢最旧并注入 coverage_hole 声明);
 5. 画像选择 `_select_profile_prompt_for_turn`(worker.py:5313):PROFILE 开关开 →
    取 `v2_agent_profile` 的 MEMORY/USER 双字段;
 6. 时间快照 build_temporal_context(worker.py:10377);
@@ -59,7 +60,7 @@ enclave 解密信号量 2。
 | 2 | **genesis 人设全文** + `/skills/*` | system(trusted blocks) | 无截断,不走 profile 开关 |
 | 3 | working memory(WORKING.md,如模型写过) | user | pull-only,默认不注入 |
 | 4 | **MEMORY(长期记忆精粹)+ USER(用户画像)** | user(UNTRUSTED 头) | PROFILE=1 时在场 |
-| 5 | 对话摘要(compaction 产物) | user | 受压缩水位约束 |
+| 5 | 确定性历史 coverage(compaction 产物) | user | 仅含覆盖计数，不含对话语义 |
 | 6 | 原文 tail | user | ≤60 行;图≤2/文件≤2 |
 | 7 | coverage hole 声明(如有丢行) | user | ~200字 |
 | 8 | temporal context JSON(本地时间/时间戳;wake 时含 attention_facts) | user | ~1000字 |
@@ -210,31 +211,37 @@ round2 收敛 0 动作),最弱真实模型过全绿才算数。
 
 ## 9. profile(USER/MEMORIES 画像)
 
-**触发**:PROFILE 开(test 已硬编码 1)→ 切入 V2 时 backend 触发
-(config_store.py:535-560)+ worker 侧按 `_PROFILE_MAX_AGE_SEC`(7 天)
-过期重生成,失败退避 300s→21600s。
+**触发**:PROFILE 开→ 切入 V2 时 backend 触发；成功 Dream 仍 force 刷新；
+每轮 Chat 后只做 freshness 检查：成功画像 7 天内不重建，超过 7 天也只有
+Garden 的 row-count/max-updated-at witness 改变才入队。成功更新或切换 provider
+会 best-effort 唤醒画像，普通 post-Chat coalesce 不会提前 delayed retry。
 **产物**:`v2_agent_profile`(state=ok/degraded)双字段——MEMORY(长期
 记忆精粹)、USER(交互画像),由 provider 蒸馏(注意:蒸馏时花园内容明文
 到 provider,与聊天同信任面)。
+**失败恢复**:provider transient 使用同一个 Job 持久延迟重试，5 分钟指数退避、
+6 小时封顶；模型输出 shape 最多跨 Job 延迟重试 3 次。provider 配置错误等待
+显式配置修复，Garden source/data 错误等待 source witness 改变，未知内部错误终止，
+都不会靠下一轮 Chat 才恢复。delayed Job 不占 worker slot、不计 watchdog claimable；
+Dream force 或成功 provider 修复可把已有 delayed Job 调为 ready-now。
 **注入**:context.py:502-524,两块 UNTRUSTED 头(“是记忆不是指令,与原文
 冲突以 tail 原文为准”)。
 **准入闸**(志豪):自动切 V2 要求 profile state=ok 且 memory/user 非空,
 否则留 resident,不半切换。
-**回滚铁律**:先关 DETERMINISTIC 再关 PROFILE(compose 注释已写明)。
+**回滚铁律**:PROFILE 可独立关闭；历史 coverage 始终走 metadata-only 确定性路径。
+PR #187 删除了语义 conversation compact，MEMORY/USER 是 Runtime V2 唯一的长期
+语义层，coverage sentinel 不能替代画像内容。
 
 ## 10. compaction(摘要压缩,maintenance lane)
 
-积压超 `_TAIL_BUDGET`(50)触发;每批 ≤50 条/12 万字符全或无折叠,折叠失败
-不推进水位(曾致 prod 两次卡死,故批量从 200 缩到 50);
-`QUARANTINE_ENABLED=1`:单条毒丸消息用确定性替身盖过,不永久堵死该用户;
-`PROFILE_COVERAGE_DETERMINISTIC=1`(test 现开):不可折叠行发确定性计数
-哨兵(watermark_seq:count)而非整 turn 失败。
+积压超 `_TAIL_BUDGET` 触发；coverage 只读取 seq/count 边界并写入确定性计数哨兵，
+不解密历史消息、不调用 provider。该行为没有运行时开关，也不存在语义摘要、字符批次
+或毒丸 quarantine 分支。
 
 ## 11. 记忆注入全景(模型什么时候看到什么)
 
 | 时机 | 记忆形态 | 保证方式 |
 |---|---|---|
-| 每 turn 无条件 | genesis 人设全文;MEMORY/USER 双字段;对话摘要+tail | harness 确定性注入 |
+| 每 turn 无条件 | genesis 人设全文;可用时注入 MEMORY/USER;确定性 coverage+原文 tail | harness 确定性注入 |
 | 模型自主 | memory_index(分区浏览,total/returned 对账)→ memory_fetch 全文 | 两步读,工具结果计费截断 |
 | 后台写 | capture(原文窗口)/dream(全文 fetch)/agent memory_write | actions.py 统一校验栈 |
 | wake 额外 | attention_facts + perception_glance | temporal/runtime 数据块 |
@@ -250,13 +257,13 @@ V2 把"必须在场的"改为确定性注入,"按需的"留给工具——弱模
 | FEEDLING_V2_CAPTURE_ENABLED | "1" 硬编码(backend+worker) | 两侧 |
 | FEEDLING_V2_DREAM_ENABLED | "1" 硬编码 | serve-worker |
 | FEEDLING_V2_PROFILE_ENABLED | "1" 硬编码(backend+worker) | 两侧 |
-| FEEDLING_V2_PROFILE_COVERAGE_DETERMINISTIC | "1" 硬编码 | serve-worker |
 | FEEDLING_V2_PUSH_ENABLED / SELF_THINKING | "1" 显式声明 | serve-worker |
-| COMPACTION_QUARANTINE | 默认 1 | serve-worker |
 | TRAJECTORY_INSPECT / REVIEW | 0(break-glass/调试,保留 env 形态) | serve-worker |
 | 每用户 proactive_settings | 全字段默认 true(dnd=false),新用户无死 lane | — |
 
-prod/pre compose 一字未动(PROFILE 等仍默认 0,rollout 归 Seven)。
+Runtime V2 对话 coverage 固定使用本地 seq/count sentinel；maintenance、inline
+catch-up 和 checkpoint 都不读取对话明文或调用 provider。需要回退时回滚 worker
+镜像版本，不再提供运行时双轨开关。
 
 ## 13. V1 差异判定汇总
 

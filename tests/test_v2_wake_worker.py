@@ -115,8 +115,11 @@ def _wake_deps(*, summary="", tail=None, has_genuine_user_history=None):
         resolve_provider=lambda uid: (_BYOK, {}),
         mint_enclave_token=lambda uid: "rt",
         read_tail=lambda uid, after_ts, limit: list(tail if tail is not None else []),
-        read_summary=lambda uid: (summary, 0.0, 0),
-        has_genuine_user_history=has_genuine_user_history,
+        has_genuine_user_history=(
+            has_genuine_user_history
+            if has_genuine_user_history is not None
+            else (lambda _uid: bool(tail))
+        ),
         apply_pending_effects=_apply_effects,
     )
 
@@ -240,11 +243,12 @@ def test_run_wake_reply_written_and_job_completed(monkeypatch):
     assert _job_status(job_id)[0] == "completed"
     system_msg = next(m for m in seen["messages"] if m["role"] == "system")
     assert worker._WAKE_SYSTEM_PROMPT in system_msg["content"]
+    assert worker._OPTIONAL_WAKE_SELF_THINKING_INSTRUCTION in system_msg["content"]
     assert [
         message["content"]
         for message in seen["messages"]
         if message.get("role") == "user"
-    ] == ["hi", v2_context.PROACTIVE_TURN_BOUNDARY]
+    ] == [v2_context.PROACTIVE_TURN_BOUNDARY]
 
 
 def test_wake_self_thinking_on_drops_native_reasoning_fallback(monkeypatch):
@@ -481,7 +485,6 @@ def test_run_wake_reply_push_carries_is_wake_true_and_manual_wake_lane(monkeypat
         resolve_provider=lambda uid: (_BYOK, {}),
         mint_enclave_token=lambda uid: "rt",
         read_tail=lambda uid, after_ts, limit: [],
-        read_summary=lambda uid: ("", 0.0, 0),
         read_messages_after_seq=lambda uid, after_seq: [],
         apply_pending_effects=serve_worker._apply_pending_effects_for_user,
         send_reply_push=_send_push,
@@ -631,7 +634,7 @@ def test_wake_workspace_prompt_failure_is_silent_before_provider(
     job_id, _ = jobs_store.enqueue_job(uid, "heartbeat")
     claimed_by = _claim(job_id)
     shadow = []
-    deps = _wake_deps(tail=[])
+    deps = _wake_deps(tail=[], has_genuine_user_history=lambda _uid: True)
     deps.record_wake_shadow_decision = (
         lambda uid, **kw: shadow.append((uid, kw)) or True
     )
@@ -964,7 +967,9 @@ def test_heartbeat_thinking_only_is_successful_silence_without_backoff(
     _reset(uid)
     job_id, _ = jobs_store.enqueue_job(uid, "heartbeat")
     claimed_by = _claim(job_id)
-    _script_provider(monkeypatch, [_text_round("<think>这次不打扰她了</think>")])
+    calls = _script_provider(
+        monkeypatch, [_text_round("<think>这次不打扰她了</think>")]
+    )
     writes = []
     monkeypatch.setattr(
         worker,
@@ -990,6 +995,14 @@ def test_heartbeat_thinking_only_is_successful_silence_without_backoff(
     assert status == "completed"
     assert _job_status(job_id) == ("completed", None)
     assert writes == []
+    system_text = "\n".join(
+        str(message.get("content") or "")
+        for message in calls[0]["messages"]
+        if message.get("role") == "system"
+    )
+    assert worker._OPTIONAL_WAKE_SELF_THINKING_INSTRUCTION in system_text
+    assert "nothing after its closing tag" in system_text
+    assert "the user receives nothing from that turn" in system_text
     schedule = jobs_store.get_wake_schedule(uid)
     assert schedule is None or schedule["proactive_backoff_until"] is None
 
@@ -1001,7 +1014,9 @@ def test_scheduled_thinking_only_remains_a_must_deliver_failure(monkeypatch):
     _reset(uid)
     job_id, _ = jobs_store.enqueue_job(uid, "scheduled")
     claimed_by = _claim(job_id)
-    _script_provider(monkeypatch, [_text_round("<think>提醒必须送达</think>")])
+    calls = _script_provider(
+        monkeypatch, [_text_round("<think>提醒必须送达</think>")]
+    )
     writes = []
     monkeypatch.setattr(
         worker,
@@ -1026,6 +1041,12 @@ def test_scheduled_thinking_only_remains_a_must_deliver_failure(monkeypatch):
     # 剥空的,与「provider 什么都没给」必须能在 admin 上分开看(归因仍是 system)。
     assert _job_status(job_id) == ("failed", "wake_failed:thinking_only_no_reply")
     assert writes == []
+    system_text = "\n".join(
+        str(message.get("content") or "")
+        for message in calls[0]["messages"]
+        if message.get("role") == "system"
+    )
+    assert worker._OPTIONAL_WAKE_SELF_THINKING_INSTRUCTION not in system_text
     assert jobs_store.get_wake_schedule(uid)["proactive_backoff_until"] is not None
 
 
@@ -1273,7 +1294,7 @@ def test_run_perception_wake_injects_trigger_as_untrusted_runtime_data(monkeypat
         message.get("content")
         for message in seen["messages"]
         if message.get("role") == "user"
-    ] == ["hi", v2_context.PROACTIVE_TURN_BOUNDARY]
+    ] == [v2_context.PROACTIVE_TURN_BOUNDARY]
     runtime_text = str(runtime_messages[0]["content"])
     assert '"perception_wake"' in runtime_text
     assert "arrived_at_anchor" in runtime_text
@@ -1518,7 +1539,7 @@ def test_ordinary_heartbeat_final_reply_persists_glance_before_finish(
         read_tail=lambda uid, after_ts, limit: [
             {"id": "m1", "ts": 1.0, "role": "user", "content": "hi"}
         ],
-        read_summary=lambda uid: ("", 0.0, 0),
+        has_genuine_user_history=lambda _uid: True,
         read_messages_after_seq=lambda uid, after_seq: [],
         read_perception_wake_context=lambda uid, job_id: [],
         apply_pending_effects=serve_worker._apply_pending_effects_for_user,
@@ -1859,15 +1880,16 @@ def test_run_wake_unexpected_exception_also_silent_mark_failed(monkeypatch):
     job_id, _ = jobs_store.enqueue_job(uid, "heartbeat")
     claimed_by = _claim(job_id)
 
-    def _boom_read_tail(uid_, after_ts, limit):
+    def _boom_read_summary(uid_):
         raise RuntimeError("tail read exploded")
 
     deps = worker.TurnDeps(
         read_messages=lambda uid_: [],
         resolve_provider=lambda uid_: (_BYOK, {}),
         mint_enclave_token=lambda uid_: "rt",
-        read_tail=_boom_read_tail,
-        read_summary=lambda uid_: ("", 0.0, 0),
+        has_genuine_user_history=lambda _uid: True,
+        read_summary_with_seq=_boom_read_summary,
+        read_tail_after_seq=lambda *_args, **_kwargs: [],
     )
     surface_called = {"n": 0}
     monkeypatch.setattr(
@@ -2126,7 +2148,7 @@ def test_process_job_dispatches_wake_lanes_to_run_wake_not_chat_path(monkeypatch
         read_tail=lambda uid_, after_ts, limit: [
             {"id": "m1", "ts": 1.0, "role": "user", "content": "hi"}
         ],
-        read_summary=lambda uid_: ("", 0.0, 0),
+        has_genuine_user_history=lambda _uid: True,
         apply_pending_effects=_apply_effects,
     )
 

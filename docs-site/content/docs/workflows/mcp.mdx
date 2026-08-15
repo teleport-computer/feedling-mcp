@@ -389,7 +389,8 @@ Other `400` kinds from this endpoint:
 | `timeout` | Connect or read timeout, or the whole probe exceeded its 45-second wall-clock ceiling. A legacy HTTP+SSE endpoint that answers with a never-ending event stream lands here instead of hanging the request. |
 | `response_too_large` | An MCP response exceeded the 1 MiB probe limit. |
 | `http_401` / `http_403` / `http_404` / `http_4xx` / `http_5xx` | The server responded with an HTTP error status. |
-| `protocol` | The response wasn't a valid MCP handshake (bad JSON-RPC envelope, redirect, or empty SSE stream). |
+| `protocol` | The response wasn't a valid MCP handshake (bad JSON-RPC envelope, redirect, or empty SSE stream). A `200` whose body carries no `result` and no `error` lands here too — some vendors answer an auth failure with their own payload instead of a JSON-RPC error. |
+| `no_tools` | The handshake succeeded but the server advertised no tools. Most often the URL is missing its API key, or the server requires authentication: such servers frequently degrade to an empty catalogue rather than failing outright. A server with no tools is reported as a failed test, because the agent would have nothing to call. |
 | `decrypt_failed` | The stored config could not be decrypted for this caller. |
 
 This probe runs from this backend's own network and only ever trusts a

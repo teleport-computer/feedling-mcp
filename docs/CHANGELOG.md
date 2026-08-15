@@ -47,6 +47,20 @@
 
 ## 记录正文（最新的在上面）
 
+## 2026-08-14 — Runtime V2 profile 失败可自动持久恢复
+
+**[DONE] profile retry 不再依赖用户下一轮 Chat，且不挤占前台或触发 watchdog 误杀。**
+
+- `agent_jobs.available_at` 把重试时间变成持久 claim fence；未来 Job 不占 slot，
+  `pending_ready`/`pending_delayed` 分开观测，旧 `pending` 保留 ready 别名。
+- transient provider 失败按 5 分钟指数退避、6 小时封顶重排同一个 owner/generation/
+  lease-fenced Job；shape 最多延迟重试 3 次。provider config 等显式修复，source/data
+  等 Garden witness 改变，未知内部错误终止。
+- 普通 post-Chat freshness 不提前 delayed Job；Dream force 和成功 provider
+  setup/activate 可 ready-now。Dream 的夜间窗口、23 小时最短间隔和 3 张新卡门槛未改。
+- PR #187 删除语义 conversation compact 后，MEMORY/USER 成为唯一长期语义层；
+  metadata-only coverage 继续只证明历史覆盖，不承载对话语义。
+
 ## 2026-08-14 — V2 wake 最终出口补齐工具标记清洗
 
 **[DONE] 四条 Runtime V2 wake lane 的模型正文在加密下发前统一剥离工具协议标记。**
@@ -963,31 +977,12 @@ reconciler.TABLES`）互不校验，谁都不是全集——Runtime V2 的 19 �
 `responder_error` 名下，现在改记 `prompt_coverage_incomplete[:code]`。按该字段
 分组的看板需要同步。
 
-**[FIX] 死锁本身：缩批 → 隔离 → 越过（quarantine-and-advance）**。参数怎么调都
-绕不开「全有全无 + 输入确定性」这个自锁结构，出路只能是给它一条出路。两级升级：
-
-1. **先缩批**。连续 `max_retries` 次无进展后，批次上限除以 4（200→50→12→3→1），
-   每个尺寸拿到自己的重试预算（它是一个真正不同的请求，不是失败请求的重复）。
-   多数拒绝是**批次**的属性而非某一条消息的属性——行数超预算、两条消息归纳出同一
-   条 bullet——换个尺寸就不再发生。健康路径完全不变（第一次就成功时永不缩批）。
-2. **缩到 1 条仍被拒 → 隔离那一条**。写一个确定性的替身段（`coverage_kind` 仍是
-   `exact`，seq 范围正好是它替换的那一行，所以 `validate_canonical_frontier` 的
-   三个见证依旧成立），文本明说「此处有 1 条消息未能被自动摘要，其内容不在本摘要
-   覆盖范围内，原文仍完整保留在聊天记录中」。**一次只越过一行，绝不牺牲整批**——
-   为解锁一行而丢掉 199 行完全折得动的消息是不可接受的。
-
-隔离**损失的是摘要覆盖，不是数据**：`chat_messages` 是不可变原文表，一行都没动，
-历史照常可读，将来更聪明的压缩器可以回头重折。每次隔离都打一行明文日志
-（`[v2-compaction] quarantined unfoldable row user=… seq=… reject=…`）并记一条
-`compaction_quarantined` trajectory 事件。开关
-`FEEDLING_V2_COMPACTION_QUARANTINE_ENABLED`（默认开），置 `0` 恢复严格 fail-closed。
-
-**另一条同样致命、但走不同代码路径的形状也一并修了**：`_bounded_compaction_prefix`
-遇到「首行单条就超过整批字符预算」时抛 `ValueError`（它拒绝跳过超大首行，因为跳过
-会让 seq 覆盖不诚实）——这条路径**根本到不了 provider**，所以缩批对它毫无作用。
-`usr_7f30…` 真正的墙就是这个：seq 682632 是一条 R2 外置、hydrate 后 798,262 字符
-的消息，卡在积压队头。现在这条路径直接走隔离。**如果只修了折叠被拒那一半，这个
-用户部署后仍然会卡在原地。**
+**[REFACTOR] Runtime V2 对话 coverage 收敛为 metadata-only 单一路径。**
+MEMORY/USER 成为唯一长期语义层；maintenance、inline catch-up 与 checkpoint
+只根据持久化 seq/count 元数据生成本地 sentinel，不再读取对话明文、调用 provider、
+缩批重试或 quarantine。加密 `chat_messages` 仍是不可变原文账本，历史模型摘要
+保持可读，直到新的 metadata-only checkpoint 在 canonical frontier 中替换它。
+该变更不再提供运行时真假开关；需要回退时只能回滚 worker 镜像版本。
 
 **[FIX] V2 的 provider 尝试也写明文台账**。V1 的常驻 consumer 一直往
 `user_logs.provider_attempts` 写一份纯元数据台账（outcome / usage / trigger），
@@ -1041,8 +1036,8 @@ CI 的 `phala deploy` 没传值，等于**只能用默认值**——"改 env 就
 不成立。现在三个环境的 5 个旋钮（batch msgs/chars、catchup deadline、tail budget、
 quarantine 开关）都接了 `-e` + `vars.<ENV>_<KNOB>`。刻意不写 `|| 默认值`：repo var
 未设时必须传空，让 compose 的 `${VAR:-默认}` 生效；设了才覆盖。这也是确定性复现
-隔离路径的前提——把 `COMPACTION_BATCH_CHARS` 临时调到几百，任何一条消息都能触发
-超预算隔离，不必去凑一个 R2 大文件。
+隔离路径的前提——把当时的字符批次阈值临时调小，任何一条消息都能触发超预算隔离，
+不必去凑一个 R2 大文件。该历史旋钮现已随语义 compaction 路径一并删除。
 
 **[ADD] `tools/v2_user_triage.py`** —— 把这次的排查路径固化成一条命令（只读、不
 解密）：runtime / jobs / metrics / summary / backlog head / trajectory / provider

@@ -302,8 +302,8 @@ def test_p0_mid_turn_fold_no_restart_no_debounce(monkeypatch):
     job = jobs_store.claim_next_job("w")
     _patch_real_write(monkeypatch)
 
-    msg_a = {"id": "mA", "ts": 10.0, "role": "user", "content": "gate-message-A-unique"}
-    msg_b = {"id": "mB", "ts": 20.0, "role": "user", "content": "gate-message-B-unique"}
+    msg_a = {"id": "mA", "ts": 10.0, "seq": 1, "role": "user", "content": "gate-message-A-unique"}
+    msg_b = {"id": "mB", "ts": 20.0, "seq": 2, "role": "user", "content": "gate-message-B-unique"}
     live_rows = {"rows": [msg_a]}  # grows to [msg_a, msg_b] mid-turn, simulating B's commit.
 
     def _run_capability(action_type, store, *, api_key, runtime_token, params):
@@ -340,6 +340,22 @@ def test_p0_mid_turn_fold_no_restart_no_debounce(monkeypatch):
         return outcome
 
     monkeypatch.setattr(v2_tool_loop, "run_tool_loop", _spy_run_tool_loop)
+    monkeypatch.setattr(worker.db, "chat_max_seq", lambda _uid: 1)
+    monkeypatch.setattr(
+        worker.db,
+        "chat_recent_genuine_turn_boundary_seq",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        worker.db,
+        "count_messages_after_seq",
+        lambda *_args, **_kwargs: 1,
+    )
+    monkeypatch.setattr(
+        worker.db,
+        "chat_seqs_after_seq",
+        lambda *_args, **_kwargs: [1],
+    )
 
     deps = worker.TurnDeps(
         # web_search/web_fetch are gated per user now (default OFF); these
@@ -350,8 +366,8 @@ def test_p0_mid_turn_fold_no_restart_no_debounce(monkeypatch):
         mint_enclave_token=lambda uid: "rt-enclave",
         apply_pending_effects=_apply_effects,
         read_messages_since=lambda uid, since_ts: list(live_rows["rows"]),
-        read_summary=lambda uid: ("", 0.0, 0),
-        read_tail=lambda uid, watermark, limit: [msg_a],  # D1 tail captured once at loop entry
+        read_summary_with_seq=lambda _uid: ("", 0.0, 0, 0),
+        read_tail_after_seq=lambda *_args, **_kwargs: [msg_a],
     )
 
     status = asyncio.run(worker.process_job(
@@ -372,7 +388,12 @@ def test_p0_mid_turn_fold_no_restart_no_debounce(monkeypatch):
         for m in calls[1]["messages"]
         if isinstance(m, dict)
     )
-    assert "gate-message-A-unique" in round1_joined     # A: base tail context.
+    round0_joined = " ".join(
+        str(m.get("content", ""))
+        for m in calls[0]["messages"]
+        if isinstance(m, dict)
+    )
+    assert "gate-message-A-unique" in round0_joined     # A: initial input.
     assert "gate-message-B-unique" in round1_joined     # B: folded in mid-turn, no restart.
     exchange = next(m for m in calls[1]["messages"] if isinstance(m, ToolExchange))
     assert "search-result-unique" in " ".join(r.content for r in exchange.results)

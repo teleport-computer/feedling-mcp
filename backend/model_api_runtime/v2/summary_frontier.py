@@ -23,7 +23,6 @@ SUMMARY_FORMAT_VERSION = 1
 DEFAULT_ROLLUP_FANOUT = 8
 DEFAULT_MAX_FRONTIER_SEGMENTS = 24
 DEFAULT_MAX_FRONTIER_CHARS = 48_000
-DEFAULT_MAX_ROLLUP_INPUT_CHARS = 120_000
 
 
 class SummaryFrontierIntegrityError(RuntimeError):
@@ -276,7 +275,6 @@ def choose_rollup_candidate(
     fanout: int = DEFAULT_ROLLUP_FANOUT,
     max_frontier_segments: int = DEFAULT_MAX_FRONTIER_SEGMENTS,
     max_frontier_chars: int = DEFAULT_MAX_FRONTIER_CHARS,
-    max_rollup_input_chars: int = DEFAULT_MAX_ROLLUP_INPUT_CHARS,
 ) -> RollupCandidate | None:
     """Choose a deterministic immutable roll-up, or ``None`` when bounded.
 
@@ -294,22 +292,15 @@ def choose_rollup_candidate(
     fanout = int(fanout)
     max_segments = int(max_frontier_segments)
     max_chars = int(max_frontier_chars)
-    max_input = int(max_rollup_input_chars)
-    if fanout < 2 or max_segments < 1 or max_chars < 1 or max_input < 1:
+    if fanout < 2 or max_segments < 1 or max_chars < 1:
         raise ValueError("summary frontier limits must be positive")
 
     # One inherited legacy blob can already exceed the desired frontier before
     # segmented storage lands.  Checkpoint it without deleting the original.
-    # The compactor map/reduces an arbitrarily large legacy child through
-    # bounded provider requests; exact post-cutover nodes are already bounded
-    # at creation and remain subject to the single-request guard below.
+    # Parent text is derived from metadata, so inherited child prose size does
+    # not constrain the roll-up operation.
     for item in items:
         if segment_chars(item) > max_chars:
-            if (
-                segment_chars(item) > max_input
-                and item.coverage_kind != "legacy_opaque"
-            ):
-                raise SummaryFrontierExhausted("single_segment_exceeds_rollup_input")
             return _candidate((item,), reason="oversized_legacy_segment")
 
     # Standard hierarchical carry: oldest complete same-level run first.
@@ -320,29 +311,15 @@ def choose_rollup_candidate(
             run_end += 1
         if run_end - run_start >= fanout:
             selected = items[run_start : run_start + fanout]
-            if frontier_chars(selected) > max_input:
-                raise SummaryFrontierExhausted("fanout_run_exceeds_rollup_input")
             return _candidate(selected, reason="fanout")
         run_start = run_end
 
     if len(items) <= max_segments and frontier_chars(items) <= max_chars:
         return None
 
-    # Emergency bound: compact the oldest largest prefix that safely fits the
-    # roll-up request.  At least two nodes are required here; otherwise no
-    # checkpoint could reduce the canonical frontier cardinality.
-    selected: list[SummarySegment] = []
-    used = 0
-    for item in items:
-        size = segment_chars(item)
-        if selected and used + size > max_input:
-            break
-        if not selected and size > max_input:
-            raise SummaryFrontierExhausted("frontier_head_exceeds_rollup_input")
-        selected.append(item)
-        used += size
-        if len(selected) >= fanout:
-            break
+    # Emergency bound: metadata-only roll-up can always take the oldest
+    # structural prefix without rendering child text into a provider request.
+    selected = list(items[: min(fanout, len(items))])
     if len(selected) < 2:
         raise SummaryFrontierExhausted("no_reducing_rollup_candidate")
     return _candidate(selected, reason="frontier_bound")

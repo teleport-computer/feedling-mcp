@@ -87,6 +87,79 @@ def test_degraded_respects_retry_not_before(monkeypatch):
     assert worker._profile_refresh_due("u", now=now + 61) is True
 
 
+def _failed_profile(
+    *,
+    disposition: str,
+    family: str,
+    retry_not_before: float = 0,
+    count: int = 5,
+    updated: str = "u5",
+):
+    return profile_store.build_profile_document(
+        "u",
+        state="pending",
+        source={"card_count": count, "max_updated_at": updated, "generated_at": ""},
+        last_attempt={
+            "at": _iso(1),
+            "reject_code": "reply_not_json",
+            "attempts": 1,
+            "retry_disposition": disposition,
+            "retry_family": family,
+            "retry_attempts": 1,
+            "retry_not_before": retry_not_before,
+        },
+        seal_text=_seal,
+    )
+
+
+def test_scheduled_profile_refresh_respects_persisted_retry_time(monkeypatch):
+    document = _failed_profile(
+        disposition="scheduled",
+        family="shape",
+        retry_not_before=1060,
+    )
+    monkeypatch.setattr(worker.db, "get_blob_strict", lambda *_args: document)
+
+    assert worker._profile_refresh_due("u", now=1000) is False
+    assert worker._profile_refresh_due("u", now=1061) is True
+
+
+@pytest.mark.parametrize("disposition", ["provider_config", "terminal"])
+def test_non_timed_profile_failure_waits_for_explicit_repair(
+    monkeypatch, disposition
+):
+    document = _failed_profile(
+        disposition=disposition,
+        family="provider_config" if disposition == "provider_config" else "terminal",
+    )
+    monkeypatch.setattr(worker.db, "get_blob_strict", lambda *_args: document)
+    monkeypatch.setattr(
+        worker.db,
+        "memory_profile_source_stats",
+        lambda _uid: pytest.fail("non-timed retry must not query Garden"),
+    )
+
+    assert worker._profile_refresh_due("u", now=2_000_000_000) is False
+
+
+def test_source_change_retry_only_requeues_after_garden_witness_changes(monkeypatch):
+    document = _failed_profile(disposition="source_change", family="source")
+    monkeypatch.setattr(worker.db, "get_blob_strict", lambda *_args: document)
+    monkeypatch.setattr(
+        worker.db,
+        "memory_profile_source_stats",
+        lambda _uid: (5, "u5"),
+    )
+    assert worker._profile_refresh_due("u", now=2_000_000_000) is False
+
+    monkeypatch.setattr(
+        worker.db,
+        "memory_profile_source_stats",
+        lambda _uid: (6, "u6"),
+    )
+    assert worker._profile_refresh_due("u", now=2_000_000_000) is True
+
+
 def test_stale_floor_is_independent_of_dream_setting(monkeypatch):
     now = 2_000_000_000.0
     document = _ok(generated_at=_iso(now - 8 * 86400))
@@ -214,3 +287,60 @@ def test_dream_force_refresh_bypasses_healthy_profile_due_check(monkeypatch):
         worker._enqueue_profile_if_due("u", reason="dream_refresh", force=True)
     ) is True
     assert calls == [("u", "profile", "dream_refresh")]
+
+
+def test_non_force_profile_refresh_does_not_accelerate_delayed_job(monkeypatch):
+    monkeypatch.setattr(worker, "_profile_refresh_due", lambda _uid: True)
+    monkeypatch.setattr(
+        worker.jobs_store,
+        "enqueue_job",
+        lambda *_args, **_kwargs: (11, True),
+    )
+    monkeypatch.setattr(
+        worker.jobs_store,
+        "make_pending_job_ready",
+        lambda *_args, **_kwargs: pytest.fail(
+            "post-chat refresh must not accelerate delayed retry"
+        ),
+    )
+    monkeypatch.setattr(
+        worker.core_wake_bus,
+        "notify",
+        lambda *_args: pytest.fail("coalesced delayed retry needs no notify"),
+    )
+
+    assert asyncio.run(
+        worker._enqueue_profile_if_due("u", reason="post_turn_refresh")
+    ) is False
+
+
+def test_dream_force_makes_coalesced_delayed_profile_ready(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        worker,
+        "_profile_refresh_due",
+        lambda _uid: pytest.fail("force refresh must bypass due check"),
+    )
+    monkeypatch.setattr(
+        worker.jobs_store,
+        "enqueue_job",
+        lambda *_args, **_kwargs: (12, True),
+    )
+    monkeypatch.setattr(
+        worker.jobs_store,
+        "make_pending_job_ready",
+        lambda uid, **kwargs: calls.append(("ready", uid, kwargs["lane"])) or True,
+    )
+    monkeypatch.setattr(
+        worker.core_wake_bus,
+        "notify",
+        lambda topic, uid: calls.append(("notify", topic, uid)),
+    )
+
+    assert asyncio.run(
+        worker._enqueue_profile_if_due("u", reason="dream_refresh", force=True)
+    ) is True
+    assert calls == [
+        ("ready", "u", "profile"),
+        ("notify", "v2_jobs", "u"),
+    ]

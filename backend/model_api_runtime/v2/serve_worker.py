@@ -1374,19 +1374,6 @@ def _read_tail(user_id: str, after_ts: float, limit: int) -> list[dict]:
     )
 
 
-def _read_compaction_tail(user_id: str, after_ts: float, limit: int) -> list[dict]:
-    """Oldest contiguous batch so summary watermarks never skip backlog rows."""
-    return _read_tail_window(
-        user_id,
-        after_ts,
-        limit,
-        oldest_first=True,
-        # Coverage claims made from this batch are immutable — never let a
-        # GC-able synthetic row into one (mirrors
-        # `_read_compaction_tail_after_seq`).
-        exclude_synthetic_sources=True,
-    )
-
 
 def _read_temporal_snapshot(
     user_id: str,
@@ -1544,42 +1531,9 @@ def _open_summary_frontier_state(user_id: str) -> tuple[dict | None, list]:
     return state, opened
 
 
-def _read_summary_frontier(user_id: str):
-    """Production roll-up seam: one head-version-pinned decrypted cover."""
-    state, frontier = _open_summary_frontier_state(user_id)
-    if state is None:
-        return None
-    if not frontier and state.get("summary_envelope"):
-        seeded = jobs_store.seed_legacy_summary_segment(
-            user_id,
-            expected_version=int(state.get("version") or 0),
-            translated_watermark_seq=int(state.get("watermark_seq") or 0),
-        )
-        if not seeded:
-            raise v2_summary_frontier.SummaryFrontierIntegrityError(
-                "legacy_summary_seed_race"
-            )
-        state, frontier = _open_summary_frontier_state(user_id)
-    if state is not None and not frontier and state.get("summary_envelope"):
-        raise v2_summary_frontier.SummaryFrontierIntegrityError(
-            "legacy_summary_seed_missing"
-        )
-    if state is None or not frontier:
-        return None
-    return v2_summary_frontier.SummaryFrontierSnapshot(
-        segments=tuple(frontier),
-        head_version=int(state.get("version") or 0),
-        watermark_seq=int(state.get("watermark_seq") or 0),
-    )
-
 
 def _read_summary_frontier_metadata(user_id: str):
-    """Read a deterministic canonical cover without opening exact segments.
-
-    Exact-node text is fully determined by its authenticated row count.  A
-    legacy opaque node has no such witness, so the one migration case falls
-    back to the existing decrypting reader rather than inventing coverage.
-    """
+    """Read a deterministic canonical cover without opening segment prose."""
 
     state = jobs_store.get_summary_frontier_state(user_id)
     if state is None:
@@ -1598,8 +1552,6 @@ def _read_summary_frontier_metadata(user_id: str):
     if state is None or not state.get("segments"):
         return None
     metadata = _summary_metadata_frontier(state)
-    if any(item.coverage_kind == "legacy_opaque" for item in metadata):
-        return _read_summary_frontier(user_id)
     deterministic = tuple(
         v2_summary_frontier.SummarySegment(
             segment_id=item.segment_id,
@@ -1611,7 +1563,10 @@ def _read_summary_frontier_metadata(user_id: str):
             legacy_opaque_through_seq=item.legacy_opaque_through_seq,
             child_segment_ids=item.child_segment_ids,
             text=v2_compaction.deterministic_fold(
-                source_message_count=item.source_message_count
+                source_message_count=item.source_message_count,
+                includes_legacy_opaque=(
+                    item.coverage_kind == "legacy_opaque"
+                ),
             ),
         )
         for item in metadata
@@ -1665,16 +1620,6 @@ def _read_summary_with_seq(user_id: str) -> tuple[str, float, int, int]:
     return plaintext, watermark_ts, version, watermark_seq
 
 
-def _read_summary(user_id: str) -> tuple[str, float, int]:
-    """Backward-compatible three-field summary reader for pre-seq worker code.
-
-    Worker integration should switch to :func:`_read_summary_with_seq`; keeping
-    this wrapper prevents a half-landed infrastructure commit from breaking
-    the currently wired ``TurnDeps`` tuple unpacking.
-    """
-    summary, watermark_ts, version, _watermark_seq = _read_summary_with_seq(user_id)
-    return summary, watermark_ts, version
-
 
 def _select_agent_profile_for_turn(
     user_id: str,
@@ -1712,51 +1657,6 @@ def _select_agent_profile_for_turn(
                 read_blob=db.get_blob_strict,
             )
 
-
-def _write_summary(
-    user_id: str,
-    summary: str,
-    watermark_ts: float,
-    expected_version: int,
-    watermark_seq: int | None = None,
-) -> bool:
-    """把新压缩出的摘要**本地**加密（core_envelope，非 enclave 往返——跟 worker._write_encrypted_reply
-    同一套写法）后 CAS 写回 v2_conversation_summary。信封构建失败（用户从未 onboard 过加密
-    身份）时直接返回 False、不调用 CAS——调用方应当把本次压缩当作丢弃处理，不重试。
-
-    ``watermark_seq``（D5/Task 9，可选第 5 参）跟 ``watermark_ts`` 在同一次 CAS 里原子
-    推进——见 ``jobs_store.upsert_summary_row_cas``。``worker._run_compaction`` 算不出精确
-    seq 时（罕见：折叠批次最后一行连 id 都没有）省略这个参数，CAS 只推进 ts，watermark_seq
-    保持不变（COALESCE 在 jobs_store 那一层兜底，不在这里假造一个值）。"""
-    store = core_store.get_store(user_id)
-    env, err = core_envelope._build_shared_envelope_for_store(
-        store, summary.encode("utf-8")
-    )
-    if env is None:
-        log.warning(
-            "[v2.serve_worker] _write_summary build envelope failed for %s: %s",
-            user_id,
-            err,
-        )
-        return False
-    # Only pass watermark_seq through when the caller actually has one — keeps
-    # the call shape identical to pre-D5 callers (incl. narrow-signature test
-    # doubles) when it's omitted, rather than always sending an extra kwarg.
-    if watermark_seq is not None:
-        return jobs_store.upsert_summary_row_cas(
-            user_id,
-            summary_envelope=env,
-            watermark_ts=watermark_ts,
-            expected_version=expected_version,
-            watermark_seq=watermark_seq,
-            require_source_row=True,
-        )
-    return jobs_store.upsert_summary_row_cas(
-        user_id,
-        summary_envelope=env,
-        watermark_ts=watermark_ts,
-        expected_version=expected_version,
-    )
 
 
 def _append_summary_segment(
@@ -1905,7 +1805,6 @@ def _fire_scheduled_for_user(user_id: str) -> int:
     ):
         return 0
 
-    from proactive.controls_v2 import WakeControlDecisionV2
     from proactive.scheduled_wake_v2 import (
         DBScheduledWakeStoreV2,
         ScheduledWakeServiceV2,
@@ -2622,7 +2521,6 @@ def _render_card_line(item: dict) -> str:
     return "- " + " | ".join(parts)
 
 
-_PROFILE_CARD_CONTENT_MAX_CHARS = 2_000
 PROFILE_CARD_BATCH_SIZE = 64
 
 
@@ -2640,7 +2538,7 @@ def _render_profile_card(item: dict) -> str:
         f"bucket={str(item.get('bucket') or '').strip()}",
         f"occurred_at={str(item.get('occurred_at') or '').strip()}",
         f"summary={summary}",
-        f"content={content[:_PROFILE_CARD_CONTENT_MAX_CHARS]}",
+        f"content={content}",
     ]
     return "- " + " | ".join(parts)
 
@@ -2649,13 +2547,12 @@ def _read_profile_cards(
     user_id: str,
     progress: Callable[[str], None] | None = None,
 ) -> tuple[str, int, dict]:
-    """Read every eligible Garden card or fail loudly on any truncation.
+    """Read every eligible Garden card and preserve its fetched content.
 
     The lightweight index proves the complete cardinality, then fetch obtains
-    each card's bounded content. Both use the scoped runtime token; no API key
-    or server-side envelope decryption is involved. Per-card bodies keep their
-    separate ``_PROFILE_CARD_CONTENT_MAX_CHARS`` bound; the returned tail-window
-    metadata makes any such clipping observable without changing prompt text.
+    each card's readside-bounded content. Both use the scoped runtime token; no
+    API key or server-side envelope decryption is involved. Profile rendering
+    adds no second per-card cap on top of that source contract.
     """
 
     store = core_store.get_store(user_id)
@@ -2733,15 +2630,10 @@ def _read_profile_cards(
     rendered = [_render_profile_card(by_id[memory_id]) for memory_id in ids]
     if any(not line for line in rendered):
         raise RuntimeError("profile_cards_render_incomplete")
-    # Derive the signal at the reader's final outlet from the source lengths
-    # and the cap that actually produced ``rendered``. Do not set a side flag
-    # next to the slice: a future rendering refactor must not silently detach
-    # the telemetry from the effective output.
-    profile_cards_truncated = any(
-        len(str(by_id[memory_id].get("content") or "").strip())
-        > _PROFILE_CARD_CONTENT_MAX_CHARS
-        for memory_id in ids
-    )
+    # Keep the established provider/trace field as a regression sentinel. The
+    # profile renderer now has no per-card cap, so this must stay false unless a
+    # future change deliberately reintroduces clipping at this final outlet.
+    profile_cards_truncated = False
     return "\n".join(rendered), user_card_count, {
         "lane": "profile",
         "profile_cards_truncated": profile_cards_truncated,
@@ -2842,7 +2734,17 @@ def _read_memory_context(user_id: str, *, full_cards: bool = False) -> dict:
                     if not line:
                         continue
                     added_chars = len(line) + (1 if lines else 0)
-                    if lines and rendered_chars + added_chars > _DREAM_CARDS_MAX_CHARS:
+                    if rendered_chars + added_chars > _DREAM_CARDS_MAX_CHARS:
+                        log.warning(
+                            "[v2.serve_worker] dream cards truncated user=%s "
+                            "kept=%d/%d chars=%d cap=%d empty_context=%s",
+                            user_id,
+                            len(selected),
+                            len(ids),
+                            rendered_chars,
+                            _DREAM_CARDS_MAX_CHARS,
+                            not selected,
+                        )
                         break
                     selected.append(item)
                     lines.append(line)
@@ -2954,7 +2856,7 @@ def _build_memory_envelope(
     user_id: str, inner: dict, item_id: str | None = None
 ) -> dict:
     """把一张记忆卡的明文草稿 inner 封成 shared 客户端加密信封（E2E，本地加密，非 enclave
-    往返 —— 同 worker._write_encrypted_reply / _write_summary 的写法）。
+    往返 —— 同 worker._write_encrypted_reply 的写法）。
 
     **失败必抛**（不返回 None）：一张我们加密不了的记忆卡绝不能被静默丢弃。
     extraction._to_actions 在 build_envelope 抛出时会把整批 to_actions 一并冒出去，交给
@@ -4695,17 +4597,13 @@ def build_production_deps() -> v2_worker.TurnDeps:
         resolve_provider=_resolve_provider,
         mint_enclave_token=_mint_runtime_token,
         read_tail=_read_tail,
-        read_compaction_tail=_read_compaction_tail,
         read_tail_after_seq=_read_tail_after_seq,
         read_compaction_tail_after_seq=_read_compaction_tail_after_seq,
         read_voice_transcript=_read_voice_transcript,
         read_recent_turns=_read_recent_turns,
         read_temporal_snapshot=_read_temporal_snapshot,
         read_wake_attention_snapshot=_read_wake_attention_snapshot,
-        read_summary=_read_summary,
         read_summary_with_seq=_read_summary_with_seq,
-        write_summary=_write_summary,
-        read_summary_frontier=_read_summary_frontier,
         read_summary_frontier_metadata=_read_summary_frontier_metadata,
         append_summary_segment=_append_summary_segment,
         append_summary_checkpoint=_append_summary_checkpoint,
@@ -5176,16 +5074,23 @@ _CLAIM_RECONCILE_INTERVAL_SEC = _positive_float_env(
 async def _reconcile_fleet_claims_once(
     fleet: v2_pool_supervisor.SlotFleet,
 ) -> int:
+    # `_slot_loop` reports this stage only after the Job reached its durable
+    # terminal state, then immediately reports idle.  Do not let the periodic
+    # DB check land between those pipe messages and misread the terminal row as
+    # an invalid in-flight claim.  Process liveness/watchdog recovery still
+    # covers a child that wedges before the idle signal arrives.
     snapshots = {
         key: snapshot
         for key, snapshot in fleet.snapshots().items()
-        if snapshot is not None and snapshot.active_job is not None
+        if snapshot is not None
+        and snapshot.active_job is not None
+        and snapshot.stage != "durable_completion"
     }
     pairs = [
         (snapshot.active_job.job_id, snapshot.active_job.claimed_by)
         for snapshot in snapshots.values()
     ]
-    valid = await asyncio.to_thread(jobs_store.valid_active_claims, pairs)
+    valid = await asyncio.to_thread(jobs_store.valid_reconcile_claims, pairs)
     restarted = 0
     for key, snapshot in snapshots.items():
         active = snapshot.active_job
@@ -5236,6 +5141,14 @@ _SCHEDULER_INTERVAL_SEC = _positive_float_env(
 _CHILD_LIVENESS_TIMEOUT_SEC = _positive_float_env(
     "FEEDLING_V2_CHILD_LIVENESS_TIMEOUT_SEC", "45"
 )
+_CHILD_STARTUP_TIMEOUT_SEC = _positive_float_env(
+    "FEEDLING_V2_CHILD_STARTUP_TIMEOUT_SEC", "120"
+)
+if _CHILD_STARTUP_TIMEOUT_SEC <= _CHILD_LIVENESS_TIMEOUT_SEC:
+    raise RuntimeError(
+        "FEEDLING_V2_CHILD_STARTUP_TIMEOUT_SEC must exceed "
+        "FEEDLING_V2_CHILD_LIVENESS_TIMEOUT_SEC"
+    )
 
 # A turn has two different clocks and they must never be conflated:
 #
@@ -5341,7 +5254,8 @@ _WATCHDOG_DB_TIMEOUT_SEC = _positive_float_env(
 def _jobs_claimable() -> bool:
     """Watchdog's "is there work waiting" predicate (`watchdog.should_kill`'s
     `jobs_claimable` guard) — `pending_job_count()` counts only rows still
-    `status='pending'` (queued, not yet claimed by ANY worker slot), which is
+    `status='pending'` whose durable `available_at` fence is due (queued and
+    ready, not yet claimed by ANY worker slot), which is
     exactly "all slots stuck while work waits": a wedged child claims nothing, so
     genuinely queued work sits at `pending` instead of draining into `claimed`/
     `running`. Deliberately NOT `inflight_job_count()` (pending+claimed+running) —
@@ -5375,6 +5289,7 @@ async def _watchdog_loop(
         turn_stall_timeout_sec=turn_stall_timeout_sec,
         turn_absolute_timeout_sec=turn_absolute_timeout_sec,
         child_liveness_timeout_sec=_CHILD_LIVENESS_TIMEOUT_SEC,
+        child_startup_timeout_sec=_CHILD_STARTUP_TIMEOUT_SEC,
         jobs_claimable_timeout_sec=_WATCHDOG_DB_TIMEOUT_SEC,
         capacity_write_timeout_sec=_WATCHDOG_DB_TIMEOUT_SEC,
         recovery_timeout_sec=_WATCHDOG_DB_TIMEOUT_SEC,

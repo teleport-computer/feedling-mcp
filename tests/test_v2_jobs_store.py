@@ -1659,6 +1659,203 @@ def test_inflight_job_count_filters_foreground_and_background_lanes():
     assert jobs_store.inflight_job_count() == before_all + 8
 
 
+def test_claim_skips_profile_job_until_available_at():
+    uid = "u_delayed_claim"
+    seed_user(uid)
+    _reset(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, "profile", reason="retry")
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            "UPDATE agent_jobs "
+            "SET available_at=clock_timestamp()+interval '1 hour' WHERE id=%s",
+            (job_id,),
+        )
+
+    assert jobs_store.claim_next_job("heavy-delayed", lanes={"profile"}) is None
+
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            "UPDATE agent_jobs "
+            "SET available_at=clock_timestamp()-interval '1 second' WHERE id=%s",
+            (job_id,),
+        )
+    claimed = jobs_store.claim_next_job("heavy-ready", lanes={"profile"})
+    assert claimed is not None
+    assert int(claimed["id"]) == job_id
+
+
+def test_future_job_with_missing_runtime_state_is_not_orphan_retired():
+    uid = "u_delayed_orphan_probe"
+    seed_user(uid)
+    _reset(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, "profile", reason="retry")
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            "UPDATE agent_jobs "
+            "SET available_at=clock_timestamp()+interval '1 hour' WHERE id=%s",
+            (job_id,),
+        )
+        conn.execute("DELETE FROM v2_runtime_state WHERE user_id=%s", (uid,))
+
+    assert jobs_store.claim_next_job("heavy-orphan", lanes={"profile"}) is None
+    with db.get_pool().connection() as conn:
+        row = conn.execute(
+            "SELECT status FROM agent_jobs WHERE id=%s", (job_id,)
+        ).fetchone()
+    assert row == ("pending",)
+
+
+def test_reschedule_owned_job_preserves_exact_profile_singleflight():
+    uid = "u_profile_reschedule_owned"
+    owner = "heavy-0:g3"
+    seed_user(uid)
+    _reset(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, "profile", reason="retry")
+    claimed = jobs_store.claim_next_job(owner, lanes={"profile"})
+    assert claimed is not None and int(claimed["id"]) == job_id
+    assert jobs_store.mark_running(job_id, claimed_by=owner)
+    available_at = time.time() + 300
+
+    assert jobs_store.reschedule_owned_job(
+        job_id,
+        claimed_by=owner,
+        error="profile_generation_failed:providererror",
+        available_at=available_at,
+    )
+
+    with db.get_pool().connection() as conn:
+        row = conn.execute(
+            "SELECT status,attempt_count,EXTRACT(EPOCH FROM available_at),"
+            "claimed_by,claimed_at,started_at,finished_at,lease_expires_at,"
+            "deadline_at FROM agent_jobs WHERE id=%s",
+            (job_id,),
+        ).fetchone()
+    assert row[0:2] == ("pending", 1)
+    assert abs(float(row[2]) - available_at) < 1
+    assert row[3:] == (None, None, None, None, None, None)
+
+    coalesced_id, coalesced = jobs_store.enqueue_job(
+        uid, "profile", reason="postchat_due"
+    )
+    assert (coalesced_id, coalesced) == (job_id, True)
+
+
+def test_reschedule_owned_job_rejects_wrong_owner_without_mutation():
+    uid = "u_profile_reschedule_wrong_owner"
+    owner = "heavy-1:g8"
+    seed_user(uid)
+    _reset(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, "profile", reason="retry")
+    claimed = jobs_store.claim_next_job(owner, lanes={"profile"})
+    assert claimed is not None and int(claimed["id"]) == job_id
+    assert jobs_store.mark_running(job_id, claimed_by=owner)
+    with db.get_pool().connection() as conn:
+        before = conn.execute(
+            "SELECT status,attempt_count,available_at,claimed_by,lease_expires_at "
+            "FROM agent_jobs WHERE id=%s",
+            (job_id,),
+        ).fetchone()
+
+    assert not jobs_store.reschedule_owned_job(
+        job_id,
+        claimed_by="heavy-1:g9",
+        error="profile_generation_failed:providererror",
+        available_at=time.time() + 300,
+    )
+
+    with db.get_pool().connection() as conn:
+        after = conn.execute(
+            "SELECT status,attempt_count,available_at,claimed_by,lease_expires_at "
+            "FROM agent_jobs WHERE id=%s",
+            (job_id,),
+        ).fetchone()
+    assert after == before
+
+
+def test_make_pending_profile_job_ready_updates_only_delayed_row():
+    uid = "u_profile_make_ready"
+    seed_user(uid)
+    _reset(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, "profile", reason="retry")
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            "UPDATE agent_jobs "
+            "SET available_at=clock_timestamp()+interval '1 hour' WHERE id=%s",
+            (job_id,),
+        )
+
+    assert jobs_store.make_pending_job_ready(uid, lane="profile")
+    with db.get_pool().connection() as conn:
+        row = conn.execute(
+            "SELECT available_at <= clock_timestamp() FROM agent_jobs WHERE id=%s",
+            (job_id,),
+        ).fetchone()
+    assert row == (True,)
+    assert not jobs_store.make_pending_job_ready(uid, lane="profile")
+
+
+def test_make_pending_job_ready_rejects_owned_terminal_and_orphan_rows():
+    claimed_uid = "u_profile_make_ready_claimed"
+    seed_user(claimed_uid)
+    _reset(claimed_uid)
+    claimed_id, _ = jobs_store.enqueue_job(claimed_uid, "profile", reason="retry")
+    claimed = jobs_store.claim_next_job("heavy-ready-owned", lanes={"profile"})
+    assert claimed is not None and int(claimed["id"]) == claimed_id
+    assert not jobs_store.make_pending_job_ready(claimed_uid, lane="profile")
+    assert jobs_store.mark_failed(
+        claimed_id, "terminal", claimed_by="heavy-ready-owned"
+    )
+    assert not jobs_store.make_pending_job_ready(claimed_uid, lane="profile")
+
+    orphan_uid = "u_profile_make_ready_orphan"
+    seed_user(orphan_uid)
+    _reset(orphan_uid)
+    orphan_id, _ = jobs_store.enqueue_job(orphan_uid, "profile", reason="retry")
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            "UPDATE agent_jobs "
+            "SET available_at=clock_timestamp()+interval '1 hour' WHERE id=%s",
+            (orphan_id,),
+        )
+        conn.execute("DELETE FROM v2_runtime_state WHERE user_id=%s", (orphan_uid,))
+    assert not jobs_store.make_pending_job_ready(orphan_uid, lane="profile")
+
+
+def test_delayed_pending_is_not_claimable_and_is_split_in_queue_metrics():
+    uid = "u_profile_delayed_metrics"
+    seed_user(uid)
+    _reset(uid)
+    before_count = jobs_store.pending_job_count()
+    before_pool = jobs_store.pool_queue_metrics()["heavy"]
+    before_lane = jobs_store.job_counts_by_lane().get(
+        "profile", {"pending": 0, "pending_ready": 0, "pending_delayed": 0}
+    )
+    job_id, _ = jobs_store.enqueue_job(uid, "profile", reason="retry")
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            "UPDATE agent_jobs "
+            "SET available_at=clock_timestamp()+interval '1 hour' WHERE id=%s",
+            (job_id,),
+        )
+
+    assert jobs_store.pending_job_count() == before_count
+    metrics = jobs_store.pool_queue_metrics()["heavy"]
+    assert metrics["pending_ready"] == before_pool.get(
+        "pending_ready", before_pool["pending"]
+    )
+    assert metrics["pending_delayed"] == before_pool.get("pending_delayed", 0) + 1
+    assert metrics["pending"] == metrics["pending_ready"]
+    if before_pool["oldest_pending_sec"] is None:
+        assert metrics["oldest_pending_sec"] is None
+
+    lane = jobs_store.job_counts_by_lane()["profile"]
+    assert lane["pending_ready"] == before_lane.get(
+        "pending_ready", before_lane["pending"]
+    )
+    assert lane["pending_delayed"] == before_lane.get("pending_delayed", 0) + 1
+    assert lane["pending"] == lane["pending_ready"]
+
+
 def test_recover_killed_chat_is_exact_and_queues_terminal_failure():
     uid = "u_js_exact_watchdog_chat"
     seed_user(uid)
@@ -2113,81 +2310,3 @@ def test_backlog_scanner_returns_the_worst_backlog_first():
     ]
 
     assert ordered == [large, small]
-
-
-# --- persisted effective batch cap ------------------------------------------
-#
-# Both folds shrink their batch on refusal, but the shrunk value used to be a
-# local: the next job started at the full batch again and burned one
-# guaranteed-to-fail model call rediscovering the same limit.
-
-
-def test_effective_batch_cap_is_unset_for_a_new_conversation():
-    uid = f"usr_cap_new_{uuid.uuid4().hex[:8]}"
-    seed_user(uid)
-    assert db.v2_effective_batch_cap(uid) is None
-
-
-def test_effective_batch_cap_round_trips():
-    uid = f"usr_cap_rt_{uuid.uuid4().hex[:8]}"
-    seed_user(uid)
-    _set_watermark(uid, 0)  # the row a first fold would have written
-    db.v2_set_effective_batch_cap(uid, 12)
-    assert db.v2_effective_batch_cap(uid) == 12
-    db.v2_set_effective_batch_cap(uid, 37)
-    assert db.v2_effective_batch_cap(uid) == 37
-
-
-def test_writing_the_cap_never_fabricates_a_summary_row():
-    """Inserting here would wedge the very fold this is meant to help.
-
-    A fabricated row carries version=0. The fold reads "no summary", computes
-    its write against that absence, and its CAS then collides with the row the
-    bookkeeping invented — failing the whole job with summary_cas_lost. So a
-    conversation with no summary keeps no memory until its first fold lands.
-    """
-    uid = f"usr_cap_nosummary_{uuid.uuid4().hex[:8]}"
-    seed_user(uid)
-    with db.get_pool().connection() as conn:
-        conn.execute("DELETE FROM v2_conversation_summary WHERE user_id=%s", (uid,))
-
-    db.v2_set_effective_batch_cap(uid, 8)
-
-    assert db.v2_effective_batch_cap(uid) is None
-    with db.get_pool().connection() as conn:
-        rows = conn.execute(
-            "SELECT count(*) FROM v2_conversation_summary WHERE user_id=%s", (uid,)
-        ).fetchone()[0]
-    assert rows == 0, "bookkeeping must not create a summary row"
-
-
-def test_effective_batch_cap_never_persists_a_useless_value():
-    """Zero or negative would wedge the fold at an empty batch forever."""
-    uid = f"usr_cap_floor_{uuid.uuid4().hex[:8]}"
-    seed_user(uid)
-    _set_watermark(uid, 0)
-    db.v2_set_effective_batch_cap(uid, 0)
-    assert db.v2_effective_batch_cap(uid) == 1
-    db.v2_set_effective_batch_cap(uid, -5)
-    assert db.v2_effective_batch_cap(uid) == 1
-
-
-def test_writing_the_cap_does_not_disturb_the_watermark():
-    """The cap is bookkeeping; it must never touch fold coverage or its CAS."""
-    uid = f"usr_cap_isolation_{uuid.uuid4().hex[:8]}"
-    seed_user(uid)
-    with db.get_pool().connection() as conn:
-        conn.execute(
-            "INSERT INTO v2_conversation_summary (user_id, watermark_seq, version) "
-            "VALUES (%s, 4242, 7) ON CONFLICT (user_id) DO UPDATE "
-            "SET watermark_seq=4242, version=7",
-            (uid,),
-        )
-    db.v2_set_effective_batch_cap(uid, 6)
-    with db.get_pool().connection() as conn:
-        watermark, version = conn.execute(
-            "SELECT watermark_seq, version FROM v2_conversation_summary "
-            "WHERE user_id=%s",
-            (uid,),
-        ).fetchone()
-    assert (watermark, version) == (4242, 7)

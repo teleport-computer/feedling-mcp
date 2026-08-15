@@ -913,6 +913,7 @@ def claim_next_job(worker_id: str, *, lanes: set[str] | None = None) -> dict | N
         "JOIN users u ON u.user_id=j.user_id "
         "CROSS JOIN cfg "
         "WHERE j.status='pending' "
+        "AND j.available_at <= clock_timestamp() "
         "AND (COALESCE(j.queue_deadline_at, j.deadline_at, "
         "CASE WHEN j.lane='chat' THEN "
         "j.created_at + make_interval(secs => %s) END) IS NULL OR "
@@ -939,6 +940,7 @@ def claim_next_job(worker_id: str, *, lanes: set[str] | None = None) -> dict | N
         "JOIN users u ON u.user_id=j.user_id "
         "CROSS JOIN cfg "
         "WHERE j.status='pending' "
+        "AND j.available_at <= clock_timestamp() "
         "AND (COALESCE(j.queue_deadline_at, j.deadline_at, "
         "CASE WHEN j.lane='chat' THEN "
         "j.created_at + make_interval(secs => %s) END) IS NULL OR "
@@ -968,6 +970,7 @@ def claim_next_job(worker_id: str, *, lanes: set[str] | None = None) -> dict | N
         "WITH locked AS ("
         "SELECT j.id, j.expected_runtime_generation AS eg FROM agent_jobs j "
         "WHERE j.id=%s AND j.status='pending' "
+        "AND j.available_at <= clock_timestamp() "
         "AND (COALESCE(j.queue_deadline_at, j.deadline_at, "
         "CASE WHEN j.lane='chat' THEN "
         "j.created_at + make_interval(secs => %s) END) IS NULL OR "
@@ -1101,6 +1104,37 @@ def valid_active_claims(
             "JOIN agent_jobs j ON j.id=w.job_id AND j.claimed_by=w.claimed_by "
             "WHERE j.status IN ('claimed','running') "
             "AND j.lease_expires_at > clock_timestamp()",
+            (job_ids, owners),
+        ).fetchall()
+    return {(int(row[0]), str(row[1])) for row in rows}
+
+
+def valid_reconcile_claims(
+    claims: list[tuple[int, str]],
+) -> set[tuple[int, str]]:
+    """Return snapshot pairs that do not justify cancelling their slot.
+
+    Besides a live claimed/running lease, accept ``completed`` and ``failed``
+    rows fenced by the same owner.  The worker commits those terminal states
+    before its final trajectory/unwind work and parent pipe signal, so treating
+    that bounded window as an invalid claim kills a healthy slot after every
+    normal turn.  Cancellation states and missing/reassigned rows deliberately
+    remain invalid so the reconciler still backs up dropped cancellation
+    notifications.
+    """
+    if not claims:
+        return set()
+    job_ids = [int(job_id) for job_id, _claimed_by in claims]
+    owners = [str(claimed_by) for _job_id, claimed_by in claims]
+    with _pool().connection() as conn:
+        rows = conn.execute(
+            "WITH wanted(job_id, claimed_by) AS ("
+            "SELECT * FROM unnest(%s::bigint[], %s::text[])"
+            ") SELECT j.id, j.claimed_by FROM wanted w "
+            "JOIN agent_jobs j ON j.id=w.job_id AND j.claimed_by=w.claimed_by "
+            "WHERE (j.status IN ('claimed','running') "
+            "AND j.lease_expires_at > clock_timestamp()) "
+            "OR j.status IN ('completed','failed')",
             (job_ids, owners),
         ).fetchall()
     return {(int(row[0]), str(row[1])) for row in rows}
@@ -1556,6 +1590,67 @@ def mark_failed(
             mirror.mark_pending(
                 user_id, "v2_trajectory_reviews", source_job_id, "requeue")
     return True
+
+
+def reschedule_owned_job(
+    job_id: int,
+    *,
+    claimed_by: str,
+    error: str,
+    available_at: float,
+) -> bool:
+    """Move the exact live claim back to pending at a durable future time."""
+    with _pool().connection() as conn:
+        with conn.transaction():
+            identity = conn.execute(
+                "SELECT user_id FROM agent_jobs WHERE id=%s",
+                (int(job_id),),
+            ).fetchone()
+            if identity is None:
+                return False
+            control = conn.execute(
+                "SELECT hosted_runtime_state,runtime_generation "
+                "FROM v2_runtime_state WHERE user_id=%s FOR UPDATE",
+                (str(identity[0]),),
+            ).fetchone()
+            if control is None or str(control[0]) != "v2":
+                return False
+            runtime_generation = int(control[1])
+            cur = conn.execute(
+                "UPDATE agent_jobs SET status='pending',"
+                "available_at=to_timestamp(%s),last_error=%s,"
+                "attempt_count=attempt_count+1,claimed_by=NULL,claimed_at=NULL,"
+                "started_at=NULL,finished_at=NULL,lease_expires_at=NULL,"
+                "deadline_at=NULL "
+                "WHERE id=%s AND claimed_by=%s "
+                "AND status IN ('claimed','running') "
+                "AND lease_expires_at > clock_timestamp() "
+                "AND expected_runtime_generation=%s",
+                (
+                    float(available_at),
+                    str(error)[:500],
+                    int(job_id),
+                    str(claimed_by),
+                    runtime_generation,
+                ),
+            )
+            return cur.rowcount == 1
+
+
+def make_pending_job_ready(user_id: str, *, lane: str = "profile") -> bool:
+    """Make one current-generation delayed pending job immediately claimable."""
+    with _pool().connection() as conn:
+        cur = conn.execute(
+            "UPDATE agent_jobs AS job SET available_at=clock_timestamp() "
+            "WHERE job.user_id=%s AND job.lane=%s AND job.status='pending' "
+            "AND job.available_at > clock_timestamp() "
+            "AND EXISTS (SELECT 1 FROM v2_runtime_state AS state "
+            "WHERE state.user_id=job.user_id "
+            "AND state.hosted_runtime_state='v2' "
+            "AND state.runtime_generation=job.expected_runtime_generation)",
+            (str(user_id), str(lane)),
+        )
+        return cur.rowcount == 1
 
 
 def mark_expired(job_id, error: str = "runtime_expired") -> None:
@@ -4166,27 +4261,40 @@ def pool_queue_metrics() -> dict[str, dict[str, int | float | None]]:
     """Bounded queue/claim aggregates for the three fixed runtime pools."""
     query = (
         "WITH tagged AS (SELECT " + _job_pool_case_sql() + " AS pool, "
-        "status,created_at,claimed_at FROM agent_jobs "
+        "status,created_at,claimed_at,available_at FROM agent_jobs "
         "WHERE created_at > now() - interval '24 hours' "
         "OR status IN ('pending','claimed','running')) "
-        "SELECT pool, count(*) FILTER (WHERE status='pending') AS pending, "
+        "SELECT pool, count(*) FILTER (WHERE status='pending' "
+        "AND available_at <= clock_timestamp()) AS pending_ready, "
+        "count(*) FILTER (WHERE status='pending' "
+        "AND available_at > clock_timestamp()) AS pending_delayed, "
         "MAX(EXTRACT(EPOCH FROM (now()-created_at))) "
-        "FILTER (WHERE status='pending') AS oldest_pending_sec, "
+        "FILTER (WHERE status='pending' "
+        "AND available_at <= clock_timestamp()) AS oldest_pending_sec, "
         "percentile_cont(0.95) WITHIN GROUP (ORDER BY "
         "EXTRACT(EPOCH FROM (claimed_at-created_at))*1000) "
         "FILTER (WHERE claimed_at IS NOT NULL) AS claim_p95_ms "
         "FROM tagged GROUP BY pool"
     )
     result = {
-        pool: {"pending": 0, "oldest_pending_sec": None, "claim_p95_ms": None}
+        pool: {
+            "pending": 0,
+            "pending_ready": 0,
+            "pending_delayed": 0,
+            "oldest_pending_sec": None,
+            "claim_p95_ms": None,
+        }
         for pool in ("foreground", "wake", "heavy")
     }
     with _pool().connection() as conn:
         with conn.cursor(row_factory=dict_row) as cur:
             cur.execute(query)
             for row in cur.fetchall():
+                pending_ready = int(row["pending_ready"] or 0)
                 result[str(row["pool"])] = {
-                    "pending": int(row["pending"] or 0),
+                    "pending": pending_ready,
+                    "pending_ready": pending_ready,
+                    "pending_delayed": int(row["pending_delayed"] or 0),
                     "oldest_pending_sec": (
                         None
                         if row["oldest_pending_sec"] is None
@@ -4206,19 +4314,25 @@ def job_counts_by_lane() -> dict[str, dict[str, int]]:
     with _pool().connection() as conn:
         with conn.cursor(row_factory=dict_row) as cur:
             cur.execute(
-                "SELECT lane, count(*) FILTER (WHERE status='pending') AS pending, "
+                "SELECT lane, count(*) FILTER (WHERE status='pending' "
+                "AND available_at <= clock_timestamp()) AS pending_ready, "
+                "count(*) FILTER (WHERE status='pending' "
+                "AND available_at > clock_timestamp()) AS pending_delayed, "
                 "count(*) FILTER (WHERE status IN ('claimed','running')) AS active "
                 "FROM agent_jobs WHERE status IN ('pending','claimed','running') "
                 "GROUP BY lane ORDER BY lane"
             )
             rows = cur.fetchall()
-    return {
-        str(row["lane"]): {
-            "pending": int(row["pending"] or 0),
+    result: dict[str, dict[str, int]] = {}
+    for row in rows:
+        pending_ready = int(row["pending_ready"] or 0)
+        result[str(row["lane"])] = {
+            "pending": pending_ready,
+            "pending_ready": pending_ready,
+            "pending_delayed": int(row["pending_delayed"] or 0),
             "active": int(row["active"] or 0),
         }
-        for row in rows
-    }
+    return result
 
 
 def recent_preemption_counts(*, within_hours: int = 24) -> dict[str, int]:
@@ -9390,10 +9504,13 @@ def memory_lane_health(*, within_hours: int = 24) -> dict:
 
 
 def pending_job_count() -> int:
-    """当前排队中（status='pending'，尚未被任何 worker claim）的 job 数。"""
+    """Count pending jobs that are ready for a worker to claim now."""
     with _pool().connection() as conn:
         with conn.cursor() as cur:
-            cur.execute("SELECT count(*) FROM agent_jobs WHERE status='pending'")
+            cur.execute(
+                "SELECT count(*) FROM agent_jobs WHERE status='pending' "
+                "AND available_at <= clock_timestamp()"
+            )
             return int(cur.fetchone()[0])
 
 

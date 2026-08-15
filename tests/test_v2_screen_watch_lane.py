@@ -102,7 +102,7 @@ def _wake_deps(*, summary="", tail=None):
         resolve_provider=lambda uid: (_BYOK, {}),
         mint_enclave_token=lambda uid: "rt",
         read_tail=lambda uid, after_ts, limit: list(tail if tail is not None else []),
-        read_summary=lambda uid: (summary, 0.0, 0),
+        has_genuine_user_history=lambda _uid: True,
         apply_pending_effects=_apply_effects,
     )
 
@@ -163,6 +163,7 @@ def test_screen_watch_turn_passes_safe_screen_context_and_its_own_prompt(monkeyp
     system_msg = next(m for m in seen["messages"] if m["role"] == "system")
     assert system_msg["content"] is not None
     assert "watching the screen" in system_msg["content"]  # _SCREEN_WATCH_SYSTEM_PROMPT, not _WAKE_SYSTEM_PROMPT
+    assert worker._OPTIONAL_WAKE_SELF_THINKING_INSTRUCTION in system_msg["content"]
     joined = " ".join(str(m.get("content", "")) for m in seen["messages"])
     assert "a stack trace" not in joined                    # caption is pull-only
     assert '"recent_count":1' in joined

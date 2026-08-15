@@ -10,25 +10,9 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
 import conftest
 import db
-import provider_client
 from core import store as core_store
 from model_api_runtime.v2 import jobs_store
 from model_api_runtime.v2 import worker
-
-
-_BYOK = provider_client.ProviderConfig(
-    provider="anthropic",
-    model="claude-sonnet-4-test",
-    api_key="sk-test",
-    base_url="",
-)
-
-
-@pytest.fixture(autouse=True)
-def _provider_backed_frontier_mode(monkeypatch):
-    # This suite exercises provider fold failure/quarantine behavior. Pin that
-    # fallback contract independently of the process-wide rollout setting.
-    monkeypatch.setattr(worker, "_PROFILE_COVERAGE_DETERMINISTIC", False)
 
 
 def _reset(uid: str) -> None:
@@ -211,18 +195,6 @@ def test_inline_prompt_catchup_appends_immutable_leaf_not_legacy_blob(monkeypatc
         watermark_seq=messages[0]["seq"],
     )
 
-    def _read_summary(user_id):
-        row = jobs_store.get_summary_row(user_id)
-        return (
-            str((row["summary_envelope"] or {}).get("plaintext") or ""),
-            row["watermark_ts"],
-            row["version"],
-            row["watermark_seq"],
-        )
-
-    def _read_oldest(user_id, after_seq, limit):
-        return [row for row in messages if row["seq"] > after_seq][:limit]
-
     def _append(user_id, segment, **kwargs):
         current = kwargs.pop("current_summary")
         head = kwargs.pop("head_summary", None)
@@ -239,33 +211,22 @@ def test_inline_prompt_catchup_appends_immutable_leaf_not_legacy_blob(monkeypatc
             **kwargs,
         )
 
-    legacy_write_calls = []
     deps = worker.TurnDeps(
         read_messages=lambda _uid: [],
-        resolve_provider=lambda _uid: (_BYOK, {}),
+        resolve_provider=lambda _uid: (object(), {}),
         mint_enclave_token=lambda _uid: "rt",
-        read_summary_with_seq=_read_summary,
-        read_compaction_tail_after_seq=_read_oldest,
-        read_tail_after_seq=_read_oldest,
-        write_summary=lambda *args, **kwargs: legacy_write_calls.append((args, kwargs)),
         append_summary_segment=_append,
     )
 
-    async def _fake_llm(_config, _messages, **_kwargs):
-        return {"reply": "- immutable catchup leaf"}
-
-    monkeypatch.setattr(provider_client, "reliable_chat_completion_async", _fake_llm)
     asyncio.run(
         worker._ensure_prompt_coverage(
             uid,
             deps,
-            provider_config=_BYOK,
             enclave_sem=asyncio.Semaphore(1),
             tail_limit=2,
             catchup_deadline_sec=5,
         )
     )
-    assert legacy_write_calls == []
     state = jobs_store.get_summary_frontier_state(uid)
     assert state["watermark_seq"] == messages[-3]["seq"]
     assert [row["coverage_kind"] for row in state["segments"]] == [
@@ -368,13 +329,29 @@ def _seq_aware_deps(uid: str, messages: list[dict], *, tail_limit: int = 2):
 
     return worker.TurnDeps(
         read_messages=lambda _uid: [],
-        resolve_provider=lambda _uid: (_BYOK, {}),
-        mint_enclave_token=lambda _uid: "rt",
         read_summary_with_seq=_read_summary,
         read_compaction_tail_after_seq=_read_oldest,
         read_tail_after_seq=_read_oldest,
         append_summary_segment=_append,
     )
+
+
+def _append_row(uid: str, msg_id: str, ts: float, *, source: str = "model_api") -> int:
+    db.chat_append_strict(
+        uid,
+        msg_id,
+        ts,
+        {
+            "id": msg_id,
+            "role": "user",
+            "source": source,
+            "body_ct": f"cipher-{msg_id}",
+        },
+        core_store.MAX_CHAT_MESSAGES,
+    )
+    seq = db.chat_seq_for_msg_id(uid, msg_id)
+    assert seq is not None
+    return seq
 
 
 def _assert_frontier_passes_production_validator(uid: str):
@@ -385,256 +362,6 @@ def _assert_frontier_passes_production_validator(uid: str):
     assert state is not None, "quarantine must leave a readable frontier"
     return v2_serve_worker._summary_metadata_frontier(state)
 
-
-def test_quarantined_segment_still_passes_the_canonical_frontier_validator(
-    monkeypatch
-):
-    """The invariant the seq bug broke, checked by the real validator.
-
-    Asserting on `watermark_seq` alone would have passed even while the
-    frontier was corrupt: the watermark did advance, it just advanced to a seq
-    no row of this user owned, so `frontier_start_mismatch` fired on the next
-    turn instead.
-    """
-    uid = "u_summary_quarantine_frontier"
-    _reset(uid)
-    messages = _messages_with_seq_gaps(uid, 12)
-    assert jobs_store.upsert_summary_row_cas(
-        uid,
-        summary_envelope={"plaintext": "- legacy first row"},
-        watermark_ts=messages[0]["ts"],
-        expected_version=0,
-        watermark_seq=messages[0]["seq"],
-    )
-    blocking_seq = messages[1]["seq"]
-
-    # The oldest unsummarized row alone blows the whole batch's char budget —
-    # the usr_7f30… shape, the one path that reaches quarantine directly.
-    monkeypatch.setattr(worker, "_COMPACTION_BATCH_CHARS", 50)
-    monkeypatch.setattr(
-        worker,
-        "_compaction_message_chars",
-        lambda m: 5_000 if m["seq"] == blocking_seq else 10,
-    )
-
-    async def _fake_llm(_config, _messages, **_kwargs):
-        return {"reply": "- folded leaf"}
-
-    monkeypatch.setattr(provider_client, "reliable_chat_completion_async", _fake_llm)
-
-    watermark_seq, _max_seq = asyncio.run(
-        worker._ensure_prompt_coverage(
-            uid,
-            _seq_aware_deps(uid, messages),
-            provider_config=_BYOK,
-            enclave_sem=asyncio.Semaphore(1),
-            tail_limit=2,
-            catchup_deadline_sec=10,
-        )
-    )
-
-    assert watermark_seq > blocking_seq, "must have moved past the blocking row"
-    validated = _assert_frontier_passes_production_validator(uid)
-
-    # The quarantined row is covered by exactly one 1-row `exact` segment
-    # carrying its OWN seq — not a seq invented from the reader's row.
-    quarantine_segments = [
-        seg for seg in validated
-        if seg.coverage_kind == "exact"
-        and seg.start_seq == seg.end_seq == blocking_seq
-    ]
-    assert len(quarantine_segments) == 1, [
-        (s.segment_id, s.start_seq, s.end_seq, s.source_message_count)
-        for s in validated
-    ]
-    assert quarantine_segments[0].source_message_count == 1
-
-
-def test_frontier_stays_valid_across_several_quarantines(monkeypatch):
-    """Consecutive unfoldable rows must each get their own honest segment.
-
-    One quarantine landing correctly does not prove the next one does: the
-    witnesses are cumulative (`covered_source_count` sums across every
-    segment, and each segment must start strictly after the previous one
-    ends), so an off-by-one that a single quarantine hides shows up once they
-    chain.
-    """
-    uid = "u_summary_quarantine_chain"
-    _reset(uid)
-    messages = _messages_with_seq_gaps(uid, 12)
-    assert jobs_store.upsert_summary_row_cas(
-        uid,
-        summary_envelope={"plaintext": "- legacy first row"},
-        watermark_ts=messages[0]["ts"],
-        expected_version=0,
-        watermark_seq=messages[0]["seq"],
-    )
-    # Three consecutive oversized rows right behind the watermark.
-    blocking = {m["seq"] for m in messages[1:4]}
-
-    monkeypatch.setattr(worker, "_COMPACTION_BATCH_CHARS", 50)
-    monkeypatch.setattr(
-        worker,
-        "_compaction_message_chars",
-        lambda m: 5_000 if m["seq"] in blocking else 10,
-    )
-
-    async def _fake_llm(_config, _messages, **_kwargs):
-        return {"reply": "- folded leaf"}
-
-    monkeypatch.setattr(provider_client, "reliable_chat_completion_async", _fake_llm)
-
-    watermark_seq, _max_seq = asyncio.run(
-        worker._ensure_prompt_coverage(
-            uid,
-            _seq_aware_deps(uid, messages),
-            provider_config=_BYOK,
-            enclave_sem=asyncio.Semaphore(1),
-            tail_limit=2,
-            catchup_deadline_sec=10,
-        )
-    )
-
-    assert watermark_seq > max(blocking)
-    validated = _assert_frontier_passes_production_validator(uid)
-
-    # Each blocked row got its own 1-row segment; none was skipped silently.
-    quarantined_seqs = {
-        seg.start_seq for seg in validated
-        if seg.start_seq == seg.end_seq and seg.source_message_count == 1
-        and seg.coverage_kind == "exact"
-    }
-    assert blocking <= quarantined_seqs, (blocking, quarantined_seqs)
-
-
-# --- chaos: the frontier must survive ANY interleaving of failures ----------
-# Each failure mode has its own escalation (refusal → shrink, oversized row →
-# quarantine, provider timeout → shrink-then-fail), and each was verified in
-# isolation. The dangerous case is the COMBINATION: shrink, then hit an
-# oversized row, then time out at the smaller cap, then recover. There is one
-# property that must hold across every such path, including the ones that end
-# in an exception: whatever is on disk when catch-up stops is a valid
-# canonical frontier. A stalled catch-up is recoverable; a corrupt frontier
-# fails every later turn forever (see the seq bug above).
-
-
-@pytest.mark.parametrize("seed", [1, 2, 3, 4, 5, 6, 7, 8])
-def test_frontier_survives_any_mix_of_fold_failures(monkeypatch, seed):
-    import random
-
-    uid = f"u_summary_chaos_{seed}"
-    _reset(uid)
-    messages = _messages_with_seq_gaps(uid, 16)
-    assert jobs_store.upsert_summary_row_cas(
-        uid,
-        summary_envelope={"plaintext": "- legacy first row"},
-        watermark_ts=messages[0]["ts"],
-        expected_version=0,
-        watermark_seq=messages[0]["seq"],
-    )
-
-    rng = random.Random(seed)
-    # Some rows are individually unfoldable (R2-offloaded giants); the rest
-    # fold or fail per the script below.
-    oversized = {
-        row["seq"] for row in messages[1:] if rng.random() < 0.2
-    }
-    monkeypatch.setattr(worker, "_COMPACTION_BATCH_CHARS", 500)
-    monkeypatch.setattr(
-        worker,
-        "_compaction_message_chars",
-        lambda m: 5_000 if m["seq"] in oversized else 10,
-    )
-
-    calls = {"n": 0}
-
-    async def _chaotic_fold(
-        *, provider_config, old_messages, llm, usage_out=None, reject_out=None,
-        current_summary=None,
-    ):
-        calls["n"] += 1
-        roll = rng.random()
-        if roll < 0.25:
-            # Provider never answered (compaction's own 60s timeout).
-            raise provider_client.ProviderError("read timeout", status_code=None)
-        if roll < 0.45:
-            # Answered, but the reply failed bullet validation.
-            if reject_out is not None:
-                reject_out("line_not_bullet:0")
-            return "" if current_summary is None else current_summary
-        return "- folded leaf"
-
-    monkeypatch.setattr(
-        worker.v2_compaction, "compact_segment",
-        lambda **kw: _chaotic_fold(current_summary=None, **kw),
-    )
-
-    before = jobs_store.get_summary_frontier_state(uid)["watermark_seq"]
-    try:
-        asyncio.run(
-            worker._ensure_prompt_coverage(
-                uid,
-                _seq_aware_deps(uid, messages),
-                provider_config=_BYOK,
-                enclave_sem=asyncio.Semaphore(1),
-                tail_limit=2,
-                catchup_deadline_sec=10,
-            )
-        )
-    except (worker.TurnError, provider_client.ProviderError):
-        # A catch-up that gives up is allowed; a corrupt frontier is not.
-        pass
-
-    # Coverage guard: an oversized head row is quarantined BEFORE any provider
-    # call, so a future change that made every row look oversized would leave
-    # this test silently exercising only the quarantine path while still
-    # passing. The provider must actually have been reached.
-    assert calls["n"] > 0, "chaos never reached the provider — test lost its teeth"
-
-    # THE invariant, on whatever state we ended up in.
-    from model_api_runtime.v2 import serve_worker as v2_serve_worker
-
-    state = jobs_store.get_summary_frontier_state(uid)
-    validated = v2_serve_worker._summary_metadata_frontier(state)
-
-    # The watermark never moves backwards, and never past the newest row.
-    assert state["watermark_seq"] >= before
-    assert state["watermark_seq"] <= messages[-1]["seq"]
-    # Every claimed seq belongs to a real row of THIS user.
-    owned = {row["seq"] for row in messages}
-    for seg in validated:
-        if seg.coverage_kind == "legacy_opaque":
-            continue
-        assert seg.start_seq in owned, (seg.segment_id, seg.start_seq, sorted(owned))
-        assert seg.end_seq in owned, (seg.segment_id, seg.end_seq, sorted(owned))
-    # Anything written off was written off ONE row at a time.
-    for seg in validated:
-        if seg.coverage_kind == "exact" and seg.source_message_count == 1:
-            assert seg.start_seq == seg.end_seq
-
-
-# --- verify_ping / resident_maintenance synthetic rows must never enter the
-# --- immutable summary coverage (found on test 2026-07-28) -----------------
-# A `verify_ping`/`resident_maintenance` row IS stored in `chat_messages`
-# (see core/store.py), but a verify_ping is DELETED once /v1/chat/verify_loop
-# completes. If the compaction fold folds one into an immutable level-0 leaf,
-# its seq becomes a permanent coverage claim; the moment the row is GC'd the
-# canonical witness (a LIVE `COUNT`/`MIN` over `chat_messages`) stops matching
-# the leaf's frozen `source_message_count`/`start_seq`, so
-# `validate_canonical_frontier` raises `v2_summary_frontier_integrity_error` on
-# EVERY later turn — the permanent multi-turn brick reproduced end to end. These
-# rows must be invisible to the whole coverage machinery consistently: the fold
-# reader, the gap counter, and BOTH the write-time and read-time witnesses.
-
-
-def _append_row(uid: str, msg_id: str, ts: float, *, source: str | None = None) -> int:
-    doc = {"id": msg_id, "role": "user", "body_ct": f"ct-{msg_id}"}
-    if source is not None:
-        doc["source"] = source
-    db.chat_append_strict(uid, msg_id, ts, doc, core_store.MAX_CHAT_MESSAGES)
-    seq = db.chat_seq_for_msg_id(uid, msg_id)
-    assert seq is not None
-    return int(seq)
 
 
 def test_coverage_readers_exclude_synthetic_sources():

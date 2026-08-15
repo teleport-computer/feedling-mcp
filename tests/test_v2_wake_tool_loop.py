@@ -159,7 +159,7 @@ def _wake_deps(
         mint_enclave_token=lambda uid: token,
         observe_photo=observe_photo,
         read_tail=lambda uid, after_ts, limit: list(tail if tail is not None else []),
-        read_summary=lambda uid: (summary, 0.0, 0),
+        has_genuine_user_history=lambda _uid: True,
         apply_pending_effects=_apply_effects_factory(sink_calls if sink_calls is not None else []),
 )
 
@@ -460,6 +460,64 @@ def test_wake_memory_write_is_authorized_applied_and_not_refused(monkeypatch):
         ).fetchone()[0]
     assert "likes tea" not in stored_payload
     assert "effect_envelope" in stored_payload
+
+
+@pytest.mark.parametrize(
+    "lane", ["heartbeat", "scheduled", "manual_wake", "screen_watch"]
+)
+def test_wake_lanes_hide_and_reject_memory_delete(monkeypatch, lane):
+    """One shared wake path must protect every proactive lane at both gates."""
+    uid = f"u_wake_no_memory_delete_{lane}"
+    conftest.seed_user(uid)
+    _reset(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, lane)
+    job = jobs_store.claim_next_job("w")
+
+    _patch_real_write(monkeypatch)
+    calls = _script_provider(monkeypatch, [
+        _tool_round(_tc(
+            "delete-1",
+            "memory_write",
+            actions=[{"op": "delete", "target_id": "memory-1"}],
+        )),
+        _text_round("wake finished"),
+    ])
+    sink_calls = []
+    deps = _wake_deps(tail=[], sink_calls=sink_calls)
+
+    status = asyncio.run(worker._run_wake(
+        job_id,
+        uid,
+        lane,
+        deps,
+        _BYOK,
+        asyncio.Semaphore(4),
+        str(job["claimed_by"]),
+    ))
+
+    assert status == "completed"
+    assert len(calls) == 2
+    memory_spec = next(
+        spec for spec in calls[0]["tools"] if spec.name == "memory_write"
+    )
+    wake_ops = memory_spec.parameters["properties"]["actions"]["items"][
+        "properties"
+    ]["op"]["enum"]
+    assert wake_ops == ["add", "update"]
+    assert "delete" not in memory_spec.description.lower()
+
+    exchanges = [
+        message
+        for message in calls[1]["messages"]
+        if isinstance(message, ToolExchange)
+    ]
+    assert len(exchanges) == 1
+    assert exchanges[0].results[0].content == (
+        "error: memory delete refused in background turn"
+    )
+    assert not [
+        payload for effect_type, payload in sink_calls if effect_type == "memory"
+    ]
     assert _job_status(job_id)[0] == "completed"
 
 

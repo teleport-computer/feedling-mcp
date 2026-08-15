@@ -8,7 +8,6 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
-from admin import data_track as admin_data_track
 from hosted import config_store
 from model_api_runtime.v2 import jobs_store, profile, profile_store, serve_worker, worker
 
@@ -48,7 +47,7 @@ def test_profile_is_registered_at_background_priority():
     assert jobs_store.LANE_PRIORITY["profile"] == jobs_store.LANE_PRIORITY["dream"]
 
 
-def test_profile_shape_reject_writes_pending_metadata_and_fails_silently(
+def test_profile_shape_reject_writes_pending_metadata_and_reschedules_silently(
     monkeypatch,
 ):
     captured = {}
@@ -66,14 +65,23 @@ def test_profile_shape_reject_writes_pending_metadata_and_fails_silently(
         captured["document"] = document
         return _cas_result(document)
 
-    failed = []
+    rescheduled = []
     monkeypatch.setattr(profile, "generate_profile", _generate)
     monkeypatch.setattr(profile_store, "update_profile_cas_async", _cas)
     monkeypatch.setattr(worker.db, "memory_profile_source_stats", lambda _uid: (1, "u1"))
     monkeypatch.setattr(
         worker.jobs_store,
         "mark_failed",
-        lambda job_id, code, **_kw: failed.append((job_id, code)) or True,
+        lambda *_args, **_kwargs: pytest.fail("retryable profile cannot fail"),
+    )
+    monkeypatch.setattr(worker.jobs_store, "renew_job_lease", lambda *_a, **_kw: True)
+    monkeypatch.setattr(
+        worker.jobs_store,
+        "reschedule_owned_job",
+        lambda job_id, **kwargs: rescheduled.append(
+            (job_id, kwargs["claimed_by"], kwargs["available_at"])
+        )
+        or True,
     )
     monkeypatch.setattr(
         worker.jobs_store,
@@ -98,13 +106,140 @@ def test_profile_shape_reject_writes_pending_metadata_and_fails_silently(
             _deps(),
             object(),
             asyncio.Semaphore(1),
+            claimed_by="heavy-0:g1",
+        )
+    )
+
+    assert status == "rescheduled"
+    assert len(rescheduled) == 1
+    assert rescheduled[0][0:2] == (7, "heavy-0:g1")
+    assert captured["document"]["state"] == "pending"
+    assert captured["document"]["last_attempt"]["reject_code"] == "reply_not_json"
+    assert captured["document"]["last_attempt"]["retry_disposition"] == "scheduled"
+    assert captured["document"]["last_attempt"]["retry_family"] == "shape"
+    assert captured["document"]["last_attempt"]["retry_attempts"] == 1
+    assert rescheduled[0][2] == captured["document"]["last_attempt"][
+        "retry_not_before"
+    ]
+
+
+def test_profile_fourth_consecutive_shape_failure_is_terminal(monkeypatch):
+    previous = profile_store.build_profile_document(
+        "u",
+        state="pending",
+        source={"card_count": 1, "max_updated_at": "u1", "generated_at": ""},
+        last_attempt={
+            "at": "2026-08-14T00:00:00Z",
+            "reject_code": "reply_not_json",
+            "attempts": 3,
+            "retry_disposition": "scheduled",
+            "retry_family": "shape",
+            "retry_attempts": 3,
+            "retry_not_before": 1,
+        },
+        seal_text=lambda _uid, _text: {"body_ct": "ct", "nonce": "n"},
+    )
+    captured = {}
+
+    async def _generate(**_kwargs):
+        return profile.ProfileGenerationResult(
+            fields=None,
+            reject_code="reply_not_json",
+            overlap=None,
+            provider_calls=1,
+        )
+
+    async def _cas(_uid, recompute):
+        document = await recompute(previous)
+        captured["document"] = document
+        return _cas_result(document)
+
+    failed = []
+    monkeypatch.setattr(profile, "generate_profile", _generate)
+    monkeypatch.setattr(profile_store, "update_profile_cas_async", _cas)
+    monkeypatch.setattr(worker.db, "memory_profile_source_stats", lambda _uid: (1, "u1"))
+    monkeypatch.setattr(worker.jobs_store, "renew_job_lease", lambda *_a, **_kw: True)
+    monkeypatch.setattr(
+        worker.jobs_store,
+        "reschedule_owned_job",
+        lambda *_args, **_kwargs: pytest.fail("fourth shape failure is terminal"),
+    )
+    monkeypatch.setattr(
+        worker.jobs_store,
+        "mark_failed",
+        lambda job_id, code, **_kw: failed.append((job_id, code)) or True,
+    )
+
+    status = asyncio.run(
+        worker._run_profile(
+            70,
+            "u",
+            _deps(),
+            object(),
+            asyncio.Semaphore(1),
+            claimed_by="heavy-0:g4",
         )
     )
 
     assert status == "failed"
-    assert failed == [(7, "reply_not_json")]
-    assert captured["document"]["state"] == "pending"
-    assert captured["document"]["last_attempt"]["reject_code"] == "reply_not_json"
+    assert failed == [(70, "reply_not_json")]
+    assert captured["document"]["last_attempt"]["retry_disposition"] == "terminal"
+    assert captured["document"]["last_attempt"]["retry_attempts"] == 4
+
+
+def test_profile_transient_provider_failure_reschedules_exact_job(monkeypatch):
+    captured = {}
+    calls = 0
+    provider_error = worker.provider_client.ProviderError("secret upstream detail")
+    provider_error.feedling_error_class = "transient_exhausted"
+
+    async def _generate(**_kwargs):
+        raise provider_error
+
+    async def _cas(_uid, recompute):
+        nonlocal calls
+        calls += 1
+        document = await recompute({})
+        captured["document"] = document
+        return _cas_result(document)
+
+    rescheduled = []
+    monkeypatch.setattr(profile, "generate_profile", _generate)
+    monkeypatch.setattr(profile_store, "update_profile_cas_async", _cas)
+    monkeypatch.setattr(worker.db, "memory_profile_source_stats", lambda _uid: (1, "u1"))
+    monkeypatch.setattr(worker.jobs_store, "renew_job_lease", lambda *_a, **_kw: True)
+    monkeypatch.setattr(
+        worker.jobs_store,
+        "reschedule_owned_job",
+        lambda job_id, **kwargs: rescheduled.append(
+            (job_id, kwargs["claimed_by"], kwargs["available_at"], kwargs["error"])
+        )
+        or True,
+    )
+    monkeypatch.setattr(
+        worker.jobs_store,
+        "mark_failed",
+        lambda *_args, **_kwargs: pytest.fail("transient profile cannot fail"),
+    )
+
+    status = asyncio.run(
+        worker._run_profile(
+            71,
+            "u",
+            _deps(),
+            object(),
+            asyncio.Semaphore(1),
+            claimed_by="heavy-0:g5",
+        )
+    )
+
+    assert status == "rescheduled"
+    assert calls == 2
+    assert len(rescheduled) == 1
+    assert rescheduled[0][0:2] == (71, "heavy-0:g5")
+    assert rescheduled[0][3] == "profile_generation_failed:providererror"
+    assert captured["document"]["last_attempt"]["retry_disposition"] == "scheduled"
+    assert captured["document"]["last_attempt"]["retry_family"] == "transient"
 
 
 def test_profile_budget_exception_message_is_persisted_as_reject_code(monkeypatch):
@@ -151,7 +286,7 @@ def test_profile_budget_exception_message_is_persisted_as_reject_code(monkeypatc
     )
 
 
-def test_profile_provider_setup_failure_persists_degraded_backoff(monkeypatch):
+def test_profile_provider_setup_failure_waits_for_explicit_repair(monkeypatch):
     previous = profile_store.build_profile_document(
         "u",
         state="ok",
@@ -208,7 +343,13 @@ def test_profile_provider_setup_failure_persists_degraded_backoff(monkeypatch):
     assert captured["document"]["last_attempt"]["reject_code"] == (
         "profile_provider_unavailable:runtimeerror"
     )
-    assert captured["document"]["last_attempt"]["retry_not_before"] > 0
+    assert captured["document"]["last_attempt"]["retry_disposition"] == (
+        "provider_config"
+    )
+    assert captured["document"]["last_attempt"]["retry_family"] == (
+        "provider_config"
+    )
+    assert captured["document"]["last_attempt"]["retry_not_before"] == 0
 
 
 def test_run_turn_routes_profile_provider_resolution_failure_to_handler(monkeypatch):
@@ -249,6 +390,86 @@ def test_run_turn_routes_profile_provider_resolution_failure_to_handler(monkeypa
         "profile_provider_unavailable:runtimeerror"
     )
     assert captured["runtime_token"] == ""
+
+
+def test_recovered_profile_job_honors_persisted_future_retry_before_provider(
+    monkeypatch,
+):
+    retry_at = 2_000_000_000.0
+    document = profile_store.build_profile_document(
+        "u",
+        state="pending",
+        source={"card_count": 1, "max_updated_at": "u1", "generated_at": ""},
+        last_attempt={
+            "at": "2026-08-14T00:00:00Z",
+            "reject_code": "profile_generation_failed:providererror",
+            "attempts": 1,
+            "retry_disposition": "scheduled",
+            "retry_family": "transient",
+            "retry_attempts": 1,
+            "retry_not_before": retry_at,
+        },
+        seal_text=lambda _uid, _text: {"body_ct": "ct", "nonce": "n"},
+    )
+    deps = _deps()
+    deps.resolve_provider = lambda _uid: pytest.fail(
+        "future retry must not resolve/decrypt provider config"
+    )
+    deps.read_profile_cards = lambda *_args: pytest.fail(
+        "future retry must not read Garden cards"
+    )
+    rescheduled = []
+    flushed = []
+
+    class _Metrics:
+        def __init__(self, **_kwargs):
+            pass
+
+        def flush(self, **kwargs):
+            flushed.append(kwargs)
+
+    monkeypatch.setattr(worker, "TurnMetrics", _Metrics)
+    monkeypatch.setattr(worker.time, "time", lambda: retry_at - 60)
+    monkeypatch.setattr(worker.db, "get_blob_strict", lambda *_args: document)
+    monkeypatch.setattr(worker.jobs_store, "renew_job_lease", lambda *_a, **_kw: True)
+    monkeypatch.setattr(
+        worker.jobs_store,
+        "reschedule_owned_job",
+        lambda job_id, **kwargs: rescheduled.append(
+            (job_id, kwargs["claimed_by"], kwargs["available_at"], kwargs["error"])
+        )
+        or True,
+    )
+    monkeypatch.setattr(
+        worker,
+        "process_job",
+        lambda *_args, **_kwargs: pytest.fail(
+            "future retry must not enter process_job"
+        ),
+    )
+
+    status = asyncio.run(
+        worker._run_turn(
+            {
+                "id": 72,
+                "user_id": "u",
+                "lane": "profile",
+                "claimed_by": "heavy-0:g6",
+            },
+            deps,
+        )
+    )
+
+    assert status == "rescheduled"
+    assert rescheduled == [
+        (
+            72,
+            "heavy-0:g6",
+            retry_at,
+            "profile_generation_failed:providererror",
+        )
+    ]
+    assert flushed == [{"failed": True, "status": "profile_retry_scheduled"}]
 
 
 def test_empty_garden_completes_with_zero_provider_calls(monkeypatch):
@@ -340,14 +561,14 @@ def test_empty_eligible_garden_persists_raw_source_witness(monkeypatch):
     }
 
 
-def test_profile_card_truncation_reaches_recorded_provider_request(monkeypatch):
+def test_profile_full_card_reaches_recorded_provider_request(monkeypatch):
     provider_messages = []
     events = []
     traces = []
-    rare_secret = "T047_PROFILE_SECRET_MUST_NOT_REACH_ADMIN"
+    tail_sentinel = "T062_PROFILE_CARD_TAIL_REACHES_PROVIDER_ONLY"
     content = (
-        "P" * serve_worker._PROFILE_CARD_CONTENT_MAX_CHARS
-        + rare_secret
+        "P" * (profile.PROFILE_MEMORY_MAX_CHARS + profile.PROFILE_USER_MAX_CHARS)
+        + tail_sentinel
     )
     rendered_cards = serve_worker._render_profile_card({
         "id": "m1",
@@ -389,7 +610,7 @@ def test_profile_card_truncation_reaches_recorded_provider_request(monkeypatch):
         cards=(
             rendered_cards,
             1,
-            {"lane": "profile", "profile_cards_truncated": True},
+            {"lane": "profile", "profile_cards_truncated": False},
         )
     )
     deps.emit_debug_trace = lambda user_id, event_type, **fields: traces.append(
@@ -414,34 +635,14 @@ def test_profile_card_truncation_reaches_recorded_provider_request(monkeypatch):
         "lane": "profile",
         "tail_window": {
             "lane": "profile",
-            "profile_cards_truncated": True,
+            "profile_cards_truncated": False,
         },
     }
-    truncation = next(
-        trace for trace in traces if trace["type"] == "context.truncation"
-    )
-    assert truncation == {
-        "user_id": "u",
-        "type": "context.truncation",
-        "status": "warning",
-        "summary": "",
-        "explain": "",
-        "detail": {
-            "counts": {
-                "profile_cards_truncated": 1,
-                "worldbook_truncated": 0,
-            }
-        },
-    }
-    raw_outputs = json.dumps(
-        {
-            "provider_messages": provider_messages,
-            "trajectory": events,
-            "data_track": admin_data_track._debug_event_public_json(truncation),
-        },
-        ensure_ascii=False,
-    )
-    assert rare_secret not in raw_outputs
+    provider_payload = json.dumps(provider_messages, ensure_ascii=False)
+    assert content in provider_payload
+    assert tail_sentinel in provider_payload
+    assert traces == []
+    assert tail_sentinel not in json.dumps(events, ensure_ascii=False)
 
 
 def test_profile_reports_read_provider_and_durable_write_boundaries(monkeypatch):
@@ -557,10 +758,23 @@ def test_cutover_profile_enqueue_occurs_after_config_lock_release(monkeypatch):
             inside["lock"] = False
 
     monkeypatch.setattr(config_store.db, "hosted_runtime_config_mutation_lock", _lock)
+    controls = iter(
+        [
+            ("resident", "resident", 1),
+            (config_store.HOSTED_RUNTIME_MODE_DB_ACTION_V2, "v2", 2),
+        ]
+    )
+
+    def _runtime_control(_uid):
+        value = next(controls)
+        if value[1] == "v2":
+            assert inside["lock"] is False
+        return value
+
     monkeypatch.setattr(
         config_store.db,
         "get_hosted_runtime_control_strict",
-        lambda _uid: ("resident", "resident", 1),
+        _runtime_control,
     )
     monkeypatch.setattr(
         config_store,
@@ -587,6 +801,68 @@ def test_cutover_profile_enqueue_occurs_after_config_lock_release(monkeypatch):
 
     assert result == config_store.HOSTED_RUNTIME_MODE_DB_ACTION_V2
     assert calls[0] == ("u", "profile", "runtime_v2_cutover")
+
+
+def test_hosted_profile_wake_force_readies_coalesced_v2_job(monkeypatch):
+    monkeypatch.setenv("FEEDLING_V2_PROFILE_ENABLED", "1")
+    calls = []
+    monkeypatch.setattr(
+        config_store.db,
+        "get_hosted_runtime_control_strict",
+        lambda _uid: (config_store.HOSTED_RUNTIME_MODE_DB_ACTION_V2, "v2", 3),
+    )
+    monkeypatch.setattr(
+        jobs_store,
+        "enqueue_job",
+        lambda uid, lane, **kwargs: calls.append(
+            ("enqueue", uid, lane, kwargs["reason"])
+        )
+        or (77, True),
+    )
+    monkeypatch.setattr(
+        jobs_store,
+        "make_pending_job_ready",
+        lambda uid, **kwargs: calls.append(("ready", uid, kwargs["lane"])) or True,
+    )
+    monkeypatch.setattr(
+        "core.wake_bus.notify",
+        lambda topic, uid: calls.append(("notify", topic, uid)),
+    )
+
+    assert config_store.enqueue_profile_best_effort(
+        "u", reason="provider_config_changed", force_ready=True
+    )
+    assert calls == [
+        ("enqueue", "u", "profile", "provider_config_changed"),
+        ("ready", "u", "profile"),
+        ("notify", "v2_jobs", "u"),
+    ]
+
+
+def test_hosted_profile_wake_ignores_resident_and_contains_failures(monkeypatch):
+    monkeypatch.setenv("FEEDLING_V2_PROFILE_ENABLED", "1")
+    monkeypatch.setattr(
+        config_store.db,
+        "get_hosted_runtime_control_strict",
+        lambda _uid: ("resident", "resident", 1),
+    )
+    monkeypatch.setattr(
+        jobs_store,
+        "enqueue_job",
+        lambda *_args, **_kwargs: pytest.fail("resident user cannot enqueue V2 profile"),
+    )
+    assert not config_store.enqueue_profile_best_effort(
+        "u", reason="provider_config_changed", force_ready=True
+    )
+
+    monkeypatch.setattr(
+        config_store.db,
+        "get_hosted_runtime_control_strict",
+        lambda _uid: (_ for _ in ()).throw(RuntimeError("secret database detail")),
+    )
+    assert not config_store.enqueue_profile_best_effort(
+        "u", reason="provider_config_changed", force_ready=True
+    )
 
 
 def test_cutover_profile_enqueue_is_absent_when_profile_disabled(monkeypatch):

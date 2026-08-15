@@ -120,3 +120,61 @@ def test_valid_active_claims_matches_job_and_owner_as_one_fence():
     assert jobs_store.valid_active_claims(
         [(job_id, "worker:foreground:0:g7")]
     ) == set()
+
+
+def test_valid_reconcile_claims_accepts_owned_completion_but_not_cancellation():
+    """A worker-owned terminal commit precedes its final pipe message.
+
+    Reconciliation must tolerate that bounded unwind window, while an external
+    cancellation remains an invalid claim that requires slot cancellation.
+    """
+    _seed_v2("u_reconcile_terminal_owner")
+    completed_id, _ = jobs_store.enqueue_job(
+        "u_reconcile_terminal_owner", "chat"
+    )
+    completed = jobs_store.claim_next_job("worker:foreground:0:g7")
+    assert completed is not None and completed["id"] == completed_id
+    assert jobs_store.mark_running(
+        completed_id, claimed_by="worker:foreground:0:g7"
+    ) is True
+    assert jobs_store.mark_completed(
+        completed_id, claimed_by="worker:foreground:0:g7"
+    ) is True
+
+    failed_id, _ = jobs_store.enqueue_job(
+        "u_reconcile_terminal_owner", "profile"
+    )
+    failed = jobs_store.claim_next_job(
+        "worker:heavy:0:g9", lanes={"profile"}
+    )
+    assert failed is not None and failed["id"] == failed_id
+    assert jobs_store.mark_running(
+        failed_id, claimed_by="worker:heavy:0:g9"
+    ) is True
+    assert jobs_store.mark_failed(
+        failed_id, "provider_failed", claimed_by="worker:heavy:0:g9"
+    ) is True
+
+    cancelled_id, _ = jobs_store.enqueue_job(
+        "u_reconcile_terminal_owner", "chat"
+    )
+    cancelled = jobs_store.claim_next_job("worker:foreground:1:g8")
+    assert cancelled is not None and cancelled["id"] == cancelled_id
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            "UPDATE agent_jobs SET status='cancelled',finished_at=now() "
+            "WHERE id=%s",
+            (cancelled_id,),
+        )
+
+    assert jobs_store.valid_reconcile_claims(
+        [
+            (completed_id, "worker:foreground:0:g7"),
+            (completed_id, "worker:foreground:0:wrong"),
+            (failed_id, "worker:heavy:0:g9"),
+            (cancelled_id, "worker:foreground:1:g8"),
+        ]
+    ) == {
+        (completed_id, "worker:foreground:0:g7"),
+        (failed_id, "worker:heavy:0:g9"),
+    }

@@ -348,6 +348,33 @@ def test_single_round_plain_text_writes_exactly_one_bubble(monkeypatch):
     assert _job_status_row(job_id)[0] == "completed"
 
 
+def test_chat_tool_surface_keeps_memory_delete(monkeypatch):
+    """Foreground Chat retains the destructive operation Seven left enabled."""
+    uid = "u_chat_keeps_memory_delete"
+    conftest.seed_user(uid)
+    _reset(uid)
+    jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("w")
+    _patch_real_write(monkeypatch)
+    calls = _script_provider(monkeypatch, [_text_round("done")])
+    deps = _deps(messages=[{
+        "id": "m1", "ts": 10.0, "role": "user", "content": "delete that memory",
+    }])
+
+    status = asyncio.run(worker.process_job(
+        job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"
+    ))
+
+    assert status == "completed"
+    memory_spec = next(
+        spec for spec in calls[0]["tools"] if spec.name == "memory_write"
+    )
+    chat_ops = memory_spec.parameters["properties"]["actions"]["items"][
+        "properties"
+    ]["op"]["enum"]
+    assert chat_ops == ["add", "update", "delete"]
+
+
 def test_chat_worldbook_matches_current_turn_without_rewriting_user_text(
     monkeypatch,
 ):
@@ -375,17 +402,16 @@ def test_chat_worldbook_matches_current_turn_without_rewriting_user_text(
 
     turn_messages = [{
         "id": "m-worldbook",
+        "seq": 1,
         "ts": 10.0,
         "role": "user",
         "content": "Tell me about Luna",
     }]
     deps = _deps(messages=turn_messages)
-    # Production prompt assembly reads the same current turn back through its
-    # history dependency. The suite's minimal `_deps` helper intentionally
-    # omits those readers, which would exercise the empty-context degradation
-    # path and make this integration assertion inspect a prompt with no tail.
-    deps.read_summary = lambda _uid: ("", 0.0, 0)
-    deps.read_tail = lambda _uid, _after_ts, _limit: list(turn_messages)
+    monkeypatch.setattr(worker.db, "chat_max_seq", lambda _uid: 1)
+    monkeypatch.setattr(worker.db, "chat_seqs_after_seq", lambda *_a, **_k: [1])
+    deps.read_summary_with_seq = lambda _uid: ("", 0.0, 0, 0)
+    deps.read_tail_after_seq = lambda *_a, **_k: list(turn_messages)
     deps.read_worldbook_context = read_worldbook
 
     status = asyncio.run(
@@ -1748,6 +1774,8 @@ def test_ordered_chat_replies_settle_each_user_message_separately(monkeypatch):
             (uid,),
         )
     db.chat_append_strict(uid, "A", 10.0, _user_doc("A", "first A"), 5000)
+    seq_a = db.chat_seq_for_msg_id(uid, "A")
+    assert seq_a is not None
     generation = db.get_runtime_generation(uid)
     job_id, _ = jobs_store.enqueue_job(uid, "chat", expected_generation=generation)
     job = jobs_store.claim_next_job("w-ordered-replies")
@@ -1766,9 +1794,9 @@ def test_ordered_chat_replies_settle_each_user_message_separately(monkeypatch):
     written: list[str] = []
     deps = _late_input_deps(uid, written)
     deps.ordered_chat_replies = True
-    deps.read_summary = lambda _uid: ("", 0.0, 0)
-    deps.read_tail = lambda _uid, _watermark, _limit: [
-        {"id": "A", "ts": 10.0, "role": "user", "content": "first A"}
+    deps.read_summary_with_seq = lambda _uid: ("", 0.0, 0, 0)
+    deps.read_tail_after_seq = lambda *_a, **_k: [
+        {"id": "A", "seq": seq_a, "ts": 10.0, "role": "user", "content": "first A"}
     ]
     calls = []
 
