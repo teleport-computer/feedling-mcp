@@ -738,9 +738,14 @@ def test_empty_response_trajectory_records_only_content_free_shape(monkeypatch):
     ])
     monkeypatch.setattr(provider_client, "chat_completion_async", provider)
     events = []
+    debug_shapes = []
 
     async def record(event_kind, payload):
         events.append((event_kind, payload))
+
+    async def record_debug(response_shape):
+        debug_shapes.append(response_shape)
+        raise RuntimeError("diagnostics unavailable")
 
     asyncio.run(tool_loop.run_tool_loop(
         provider_config=_TEST_PROVIDER_CONFIG,
@@ -751,6 +756,7 @@ def test_empty_response_trajectory_records_only_content_free_shape(monkeypatch):
         add_usage=_noop_add_usage,
         max_calls=5,
         on_trajectory_event=record,
+        on_empty_provider_response=record_debug,
     ))
 
     empty_events = [
@@ -770,6 +776,14 @@ def test_empty_response_trajectory_records_only_content_free_shape(monkeypatch):
     }]
     assert "private trajectory content" not in str(empty_events)
     assert "messages" not in str(empty_events)
+    assert debug_shapes == [empty_events[0]["response_shape"]]
+    assert set(debug_shapes[0]) == {
+        "stop_reason",
+        "has_visible_text",
+        "reasoning_present",
+        "tool_call_count",
+        "completion_tokens",
+    }
 
 
 def test_usable_provider_success_survives_response_trajectory_failure(monkeypatch):

@@ -529,6 +529,64 @@ def test_worldbook_truncation_reaches_provider_and_data_track_without_content(
     assert rare_secret not in raw_admin_material
 
 
+def test_empty_provider_response_reaches_debug_trace_without_content(monkeypatch):
+    monkeypatch.setenv("FEEDLING_V2_SELF_THINKING", "off")
+    uid = "u_toolloop_empty_response_trace"
+    conftest.seed_user(uid)
+    _reset(uid)
+    jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("w-empty-response-trace")
+    _patch_real_write(monkeypatch)
+
+    private_reasoning = "T079_PRIVATE_REASONING_MUST_NOT_REACH_DEBUG_TRACE"
+    _script_provider(monkeypatch, [
+        {
+            "reply": "",
+            "reasoning": private_reasoning,
+            "stop_reason": "content_filter",
+            "tool_calls": [],
+            "usage": {"completion_tokens": 41},
+        },
+        _text_round("recovered visible reply"),
+    ])
+    traces = []
+    deps = _deps(messages=[{
+        "id": "m-empty-response-trace",
+        "ts": 10.0,
+        "role": "user",
+        "content": "hello",
+    }])
+    deps.emit_debug_trace = lambda user_id, event_type, **fields: traces.append(
+        {"user_id": user_id, "type": event_type, **fields}
+    )
+
+    status = asyncio.run(worker.process_job(
+        job,
+        deps,
+        provider_config=_BYOK,
+        api_key=None,
+        runtime_token="rt",
+    ))
+
+    assert status == "completed"
+    diagnostics = [
+        trace for trace in traces if trace["type"] == "provider.empty_response"
+    ]
+    assert len(diagnostics) == 1
+    assert diagnostics[0]["detail"] == {
+        "stop_reason": "content_filter",
+        "has_visible_text": False,
+        "reasoning_present": True,
+        "tool_call_count": 0,
+        "completion_tokens": 41,
+        "lane": "chat",
+    }
+    assert admin_data_track._debug_event_public_json(diagnostics[0])["detail"] == (
+        diagnostics[0]["detail"]
+    )
+    assert private_reasoning not in json.dumps(diagnostics, ensure_ascii=False)
+
+
 def test_self_thinking_on_suppresses_native_reasoning(monkeypatch):
     """Self-authored thinking ON (shipped default): even an explicit
     include_reasoning request is suppressed at the provider, so a reasoning-capable
