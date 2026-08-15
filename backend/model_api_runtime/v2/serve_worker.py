@@ -199,11 +199,9 @@ def _load_workspace_prompt(store, *, runtime_token: str) -> dict:
     trusted_system_blocks: list[str] = []
     persona = _load_genesis_persona(store, runtime_token=runtime_token).strip()
     if persona:
-        # Persona is first only within trusted_system_blocks. build_turn_messages
-        # appends this list after system_prompt and the runtime policy, so the
-        # final V2 system message remains persona-last, unlike V1; whether to
-        # restore V1's ordering is an unresolved product decision. It remains
-        # outside runtime-data and profile truncation.
+        # build_turn_messages places trusted blocks before the common system
+        # prompt and runtime policy, restoring V1's persona-first ordering.
+        # Persona remains outside runtime-data and profile truncation.
         trusted_system_blocks.append(persona)
     for block in render_trusted_prefix_blocks(
         backend,
