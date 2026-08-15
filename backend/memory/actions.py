@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+import logging
 import re
 import unicodedata
 import uuid
@@ -24,6 +25,9 @@ from memory.source_policy import (
     MEMORY_CAPTURE_MODE_VALUES,
     MEMORY_SOURCE_VALUES,
 )
+
+
+log = logging.getLogger(__name__)
 
 
 def _memory_action_metadata_error(action: dict) -> dict | None:
@@ -195,22 +199,29 @@ def trace_memory_content_truncation(
     truncated_chars = max(0, original_chars - MEMORY_CONTENT_MAX_CHARS)
     if not truncated_chars:
         return
-    debug_trace.trace_event(
-        store,
-        subsystem="memory",
-        type=MEMORY_CONTENT_TRUNCATION_EVENT,
-        actor="backend",
-        status="warning",
-        summary="",
-        explain="",
-        detail={
-            "route": route,
-            "counts": {
-                "original_chars": original_chars,
-                "truncated_chars": truncated_chars,
+    try:
+        debug_trace.trace_event(
+            store,
+            subsystem="memory",
+            type=MEMORY_CONTENT_TRUNCATION_EVENT,
+            actor="backend",
+            status="warning",
+            summary="",
+            explain="",
+            detail={
+                "route": route,
+                "counts": {
+                    "original_chars": original_chars,
+                    "truncated_chars": truncated_chars,
+                },
             },
-        },
-    )
+        )
+    except Exception as e:  # noqa: BLE001 — observability must never block a memory write
+        log.warning(
+            "[memory.actions] truncation trace failed route=%s error=%s",
+            route,
+            type(e).__name__,
+        )
 
 
 def _memory_content_from_action(data: dict, summary: str) -> str:
