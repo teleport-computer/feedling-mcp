@@ -110,7 +110,10 @@ def _system_of(**kwargs) -> str:
     from model_api_runtime.v2 import worker
 
     build_messages = worker._make_build_messages_fn(
-        system_prompt="SYS", summary="", tail=[{"role": "user", "content": "hi"}], **kwargs
+        system_prompt="SYSPROMPT-SENTINEL",
+        summary="",
+        tail=[{"role": "user", "content": "hi"}],
+        **kwargs,
     )
     messages = build_messages([])
     assert messages[0]["role"] == "system"
@@ -118,12 +121,20 @@ def _system_of(**kwargs) -> str:
 
 
 def test_turn_system_prompt_carries_the_identity_block_for_third_party_routes():
+    provider_config = _cfg(
+        "deepseek", "deepseek-chat", "https://api.deepseek.com"
+    )
+    identity_block = model_identity.override_block_for_config(provider_config)
+    persona_block = "PERSONA-SENTINEL"
     system = _system_of(
-        provider_config=_cfg("deepseek", "deepseek-chat", "https://api.deepseek.com")
+        provider_config=provider_config,
+        trusted_system_blocks=(persona_block,),
     )
     assert "deepseek-chat" in system
-    # 特权 system 位，不能降级成 untrusted 数据块。
-    assert system.startswith("SYS\n\n")
+    # 平台身份事实必须拥有最高优先级，其次才是用户可编辑 persona 和通用提示。
+    assert system.startswith(identity_block)
+    assert system.index(identity_block) < system.index(persona_block)
+    assert system.index(identity_block) < system.index("SYSPROMPT-SENTINEL")
 
 
 def test_turn_system_prompt_pins_the_model_id_for_official_routes_too():
