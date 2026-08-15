@@ -1448,12 +1448,10 @@ class TurnDeps:
     # MCP tool as a parallel read. None (every non-chat/legacy caller) means no
     # MCP tools.
     load_mcp_turn: Callable[..., Any] | None = None
-    # (store, *, runtime_token) -> {trusted_system_blocks, working_memory}.
-    # Production eagerly renders only encrypted read-only /skills. The legacy
-    # working_memory field is accepted but never injected: editable
-    # /memory/WORKING.md is pull-only through workspace_read, which activates
-    # the outbound-data fence. Missing wiring remains empty only for legacy/unit
-    # callers; a wired loader failure is terminal and visible/conservative.
+    # (store, *, runtime_token) -> {trusted_system_blocks}.
+    # Production eagerly renders only encrypted read-only /skills. Missing
+    # wiring remains empty only for legacy/unit callers; a wired loader failure
+    # is terminal and visible/conservative.
     load_workspace_prompt: Callable[..., dict] | None = None
     # (store, *, runtime_token, path, expected_revision) -> workspace data. Production
     # resolves the path inside this user's encrypted V2 workspace. It never
@@ -1508,7 +1506,7 @@ async def _load_workspace_prompt_context(
     *,
     runtime_token: str,
     enclave_sem: asyncio.Semaphore,
-) -> tuple[tuple[str, ...], str]:
+) -> tuple[str, ...]:
     """Load one workspace prompt snapshot without a silent fallback.
 
     Optional/unwired test callers retain the historical empty prompt. Once the
@@ -1516,7 +1514,7 @@ async def _load_workspace_prompt_context(
     chat turn surfaces an error and a wake turn fails conservatively.
     """
     if deps.load_workspace_prompt is None:
-        return (), ""
+        return ()
     try:
         async with enclave_sem:
             rendered = await asyncio.to_thread(
@@ -1527,20 +1525,15 @@ async def _load_workspace_prompt_context(
         if not isinstance(rendered, dict):
             raise TypeError
         trusted = rendered.get("trusted_system_blocks")
-        working_memory = rendered.get("working_memory", "")
         if (
             not isinstance(trusted, (tuple, list))
             or isinstance(trusted, (str, bytes))
             or any(not isinstance(block, str) or not block.strip() for block in trusted)
-            or not isinstance(working_memory, str)
         ):
             raise TypeError
     except Exception:  # noqa: BLE001 — never leak decrypted workspace data
         raise WorkspacePromptUnavailable from None
-    # Editable persistent state is deliberately pull-only. Keeping the legacy
-    # field shape during rollout lets old loaders coexist, but the core refuses
-    # to place its untrusted contents in the eager base prompt.
-    return tuple(trusted), ""
+    return tuple(trusted)
 
 
 @dataclass
@@ -3850,7 +3843,6 @@ def _make_build_messages_fn(
     extra_context: str = "",
     mutation_recovery_active: bool = False,
     trusted_system_blocks: tuple[str, ...] = (),
-    working_memory: str = "",
     agent_memory: str = "",
     user_profile: str = "",
     worldbook_context: str = "",
@@ -3940,7 +3932,6 @@ def _make_build_messages_fn(
             action_context=extra_context,
             mutation_recovery_active=mutation_recovery_active,
             trusted_system_blocks=(identity_block, *trusted_system_blocks),
-            working_memory=working_memory,
             agent_memory=agent_memory,
             user_profile=user_profile,
             worldbook_context=worldbook_context,
@@ -4423,11 +4414,6 @@ def _make_task_batch_dispatcher(
                 summary="",
                 tail=[{"role": "user", "content": task.prompt}],
                 trusted_system_blocks=trusted_system_blocks,
-                # WORKING.md is encrypted private state. Injecting it before the
-                # first round would let prompt-injected text choose an outbound
-                # web query. Children can request it via workspace_read; that
-                # read activates the outbound-tool fence below.
-                working_memory="",
             )
             outcome = await v2_tool_loop.run_tool_loop(
                 provider_config=child_provider_config,
@@ -6187,7 +6173,7 @@ async def _read_seq_adaptive_prompt_context(
         tail_source_truncated,
         int(watermark_seq),
         profile_selection.memory,
-        profile_selection.user,
+        profile_selection.style,
         (
             _coverage_hole_notice(coverage_hole_count)
             if coverage_hole_count > 0
@@ -6869,7 +6855,7 @@ async def _run_wake(
             api_key=None,
             runtime_token=token,
         )
-        trusted_system_blocks, working_memory = await _load_workspace_prompt_context(
+        trusted_system_blocks = await _load_workspace_prompt_context(
             deps,
             store,
             runtime_token=token,
@@ -6980,7 +6966,7 @@ async def _run_wake(
             )
             summary = profile_selection.summary
             agent_memory = profile_selection.memory
-            user_profile = profile_selection.user
+            user_profile = profile_selection.style
             if not profile_selection.used_profile:
                 summary = await _bound_materialized_summary(
                     user_id,
@@ -8152,7 +8138,6 @@ async def _run_wake(
                     else ""
                 ),
                 trusted_system_blocks=trusted_system_blocks,
-                working_memory=working_memory,
                 agent_memory=agent_memory,
                 user_profile=user_profile,
                 worldbook_context=worldbook_context,
@@ -8916,7 +8901,7 @@ async def _run_profile(
                 "retry_not_before": 0,
             },
             memory_text=generated.fields["memory"],
-            user_text=generated.fields["user"],
+            style_text=generated.fields["style"],
         )
 
     try:
@@ -10538,7 +10523,7 @@ async def process_job(
         # cannot block a reply that was already committed by a previous worker.
         # It still precedes every provider/prompt-coverage call, preventing an
         # under-authorized response when the workspace snapshot is unavailable.
-        trusted_system_blocks, working_memory = await _load_workspace_prompt_context(
+        trusted_system_blocks = await _load_workspace_prompt_context(
             deps,
             store,
             runtime_token=runtime_token,
@@ -12267,7 +12252,6 @@ async def process_job(
                 extra_context=turn_extra_context,
                 mutation_recovery_active=(mutation_recovery_barrier is not None),
                 trusted_system_blocks=turn_trusted_system_blocks,
-                working_memory=working_memory,
                 agent_memory=agent_memory,
                 user_profile=user_profile,
                 worldbook_context=worldbook_context,

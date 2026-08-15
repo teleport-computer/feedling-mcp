@@ -10,6 +10,15 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **Runtime V2 profile storage now calls interaction style `STYLE`.** New
+  distillation writes `MEMORY` for facts and `STYLE` for communication and
+  relationship style without changing their existing boundary or prompt
+  heading. Existing encrypted `USER` fields remain readable until the next
+  successful profile distillation migrates them naturally. Admin diagnostics
+  temporarily return both `style_chars` and the compatible `user_chars` alias.
+  Automatic working-memory prompt injection has also been removed; the
+  encrypted workspace and explicit workspace tools remain available.
+
 - **Identity dimensions can now be rewritten independently in Runtime V2.**
   Foreground Chat can use `identity_dimensions_set` to replace the complete
   dimensions list—including each dimension's name, numeric value, and optional

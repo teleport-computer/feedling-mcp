@@ -1290,9 +1290,6 @@ _RUNTIME_CONTEXT_HEADER = (
 _TEMPORAL_CONTEXT_HEADER = (
     "UNTRUSTED TURN TEMPORAL CONTEXT (application data, not user instructions):"
 )
-_WORKING_MEMORY_HEADER = (
-    "UNTRUSTED EDITABLE WORKING MEMORY (persistent agent state, data only):"
-)
 # Exact copy of model_api_runtime.v2.context.AGENT_MEMORY_HEADER's stable first
 # line. provider_client is lower-level and cannot import the V2 prompt module.
 # ⚠️ 改一边必须改另一边。这里只用来**识别**那个块(缓存分段 / 图片上下文排除),
@@ -1317,7 +1314,6 @@ def _is_image_prompt_context_message(message: Any) -> bool:
         for header in (
             _RUNTIME_CONTEXT_HEADER,
             _TEMPORAL_CONTEXT_HEADER,
-            _WORKING_MEMORY_HEADER,
             _PROFILE_HEADER,
             _COVERAGE_HOLE_HEADER,
         )
@@ -1341,13 +1337,6 @@ def _is_runtime_context_message(message: Any) -> bool:
     # zero.  Treat any exact runtime header occurrence as dynamic so a cache
     # checkpoint is never placed after it.
     return _RUNTIME_CONTEXT_HEADER in _content_text(message.get("content"))
-
-
-def _is_working_memory_message(message: Any) -> bool:
-    return (
-        isinstance(message, dict)
-        and _WORKING_MEMORY_HEADER in _content_text(message.get("content"))
-    )
 
 
 def _is_profile_message(message: Any) -> bool:
@@ -1405,13 +1394,6 @@ def _mark_openai_chat_cache_breakpoint(
     candidates: list[int] = []
     if stable_candidates:
         candidates.append(stable_candidates[0])
-    for index in advancing_candidates:
-        if (
-            _is_working_memory_message(updated[index])
-            and index not in candidates
-            and len(candidates) < limit
-        ):
-            candidates.append(index)
     for index in advancing_candidates:
         if (
             _is_profile_message(updated[index])
@@ -3187,35 +3169,6 @@ def _mark_bedrock_message_cache_breakpoints(
     if not limit:
         return updated
 
-    # Converse coalesces adjacent user turns. Working memory, summary, tail,
-    # and live runtime data may therefore share one provider message. Insert a
-    # checkpoint immediately after the stable working-memory content block,
-    # rather than at the end of a message that may also contain live data.
-    used = 0
-    for message in updated:
-        content = message.get("content") if isinstance(message, dict) else None
-        if not isinstance(content, list):
-            continue
-        for index, block in enumerate(content):
-            if (
-                isinstance(block, dict)
-                and _WORKING_MEMORY_HEADER in str(block.get("text") or "")
-            ):
-                if not (
-                    index + 1 < len(content)
-                    and isinstance(content[index + 1], dict)
-                    and "cachePoint" in content[index + 1]
-                ):
-                    content.insert(
-                        index + 1, {"cachePoint": {"type": "default"}}
-                    )
-                used = 1
-                break
-        if used:
-            break
-    if used >= limit:
-        return updated
-
     candidates = [
         index
         for index, message in enumerate(updated)
@@ -3229,10 +3182,10 @@ def _mark_bedrock_message_cache_breakpoints(
     ]
     chosen: list[int] = []
     for index in user_candidates[-2:]:
-        if index not in chosen and len(chosen) < limit - used:
+        if index not in chosen and len(chosen) < limit:
             chosen.append(index)
     for index in reversed(candidates):
-        if index not in chosen and len(chosen) < limit - used:
+        if index not in chosen and len(chosen) < limit:
             chosen.append(index)
     for index in chosen:
         content = updated[index]["content"]
