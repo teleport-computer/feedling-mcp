@@ -178,8 +178,8 @@ def test_chat_turn_does_not_prefetch_or_inject_perception(monkeypatch):
         if message.get("role") == "system"
     )
     assert "use the available perception, photo, or screen tools" in system
-    assert "missing, disabled, or null tool readings as unavailable" in system
-    assert "never as zero or evidence of a broken device" in system
+    assert "工具返回缺失、禁用或 null 时，就当作暂时拿不到" in system
+    assert "别当成 0，也别据此说设备坏了" in system
     assert {"perception_snapshot", "perception_trend", "perception_history"} <= {
         spec.name for spec in seen["tools"]
     }
@@ -245,8 +245,8 @@ def test_chat_turn_explains_stalled_screen_share_without_old_pixels(monkeypatch)
         if message.get("role") == "system"
     )
     assert "screen_share.stalled" in system
-    assert "may have disconnected" in system
-    assert "Do not describe an old frame as current" in system
+    assert "共享连接可能断了" in system
+    assert "别把旧画面说成现在的" in system
 
 
 def test_chat_turn_explains_ended_screen_share_without_old_pixels(monkeypatch):
@@ -306,8 +306,8 @@ def test_chat_turn_explains_ended_screen_share_without_old_pixels(monkeypatch):
         if message.get("role") == "system"
     )
     assert "screen_share.ended" in system
-    assert "remain available for discussion" in system
-    assert "restart sharing or send a screenshot" in system
+    assert "屏幕图片仍可继续聊，但别说成当前屏幕" in system
+    assert "重启屏幕共享或发张截图" in system
 
 
 def test_chat_can_pull_exact_perception_after_first_round(monkeypatch):

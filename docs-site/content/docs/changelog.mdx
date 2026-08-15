@@ -10,6 +10,15 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **Hosted Runtime V2 now separates platform behavior from protocol and user
+  content by language.** Companion-speaking and response-behavior guidance is
+  written in Chinese, machine labels and tool-timing protocol remain in
+  English, and memory, STYLE, persona, World Book, and conversation content stay
+  verbatim. A new positive memory rule asks the companion to search before
+  answering about a specific past event or person when its current summary has
+  no answer, while greetings, casual chat, and already-answered context remain
+  search-free.
+
 - **Runtime V2 profile storage now calls interaction style `STYLE`.** New
   distillation writes `MEMORY` for facts and `STYLE` for communication and
   relationship style without changing their existing boundary or prompt
