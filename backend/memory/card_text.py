@@ -366,3 +366,12 @@ def build_format_retry_prompt(prompt: str, err: str, *, empty_example: str) -> s
         f"· 如果其实没有值得写的,就输出 {empty_example} —— 空结果完全可以接受,"
         "比填占位符好得多。\n"
     )
+
+
+def build_truncation_retry_prompt(prompt: str) -> str:
+    """重问一次被输出上限截断的抽取，保持原预算但要求更紧凑。"""
+    return (
+        f"{prompt}\n\n"
+        "【上一次输出因长度上限被截断，请完整重做】\n"
+        "请保持原有 JSON 结构，只保留必要信息并更简洁地表达，确保 JSON 完整闭合。\n"
+    )

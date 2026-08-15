@@ -127,6 +127,7 @@ from memory.capture_prompt_v1 import (
 )
 from identity.user_naming import transcript_speaker_label
 from memory.card_text import (
+    build_truncation_retry_prompt,
     count_user_token_residuals,
     is_retryable_parse_error,
 )
@@ -9431,6 +9432,7 @@ async def _run_extraction(
                 parse=lambda reply: parse_capture_cards(reply, strict=False),
                 semantic_reasons=capture_semantic_retry_reasons,
                 build_semantic_prompt=build_capture_semantic_retry_prompt,
+                build_truncation_prompt=build_truncation_retry_prompt,
             )
         else:
             prompt = build_dream_prompt(
@@ -9460,6 +9462,7 @@ async def _run_extraction(
                 parse=lambda reply: parse_dream_consolidations(
                     reply, strict=False, known_ids=dream_known_ids
                 ),
+                build_truncation_prompt=build_truncation_retry_prompt,
             )
 
         if lane == "capture" and not prompt_tail:

@@ -56,7 +56,7 @@ _TEMPERATURE = 0.3
 _TIMEOUT_SEC = 90.0
 
 class ParseRetry(NamedTuple):
-    """「解析/语义结果不合格 → 原样打回去重问一次」的注入点。
+    """「截断/解析/语义结果不合格 → 原样打回去重问一次」的注入点。
 
     判据与纠错文案属于 memory/ 层（依赖方向不允许本模块 import 它），
     所以由 worker 组装三个纯回调传进来：
@@ -64,9 +64,10 @@ class ParseRetry(NamedTuple):
       build_prompt(prompt, err)  -> 第二次的 prompt（含「哪个字段没填」）；
       parse(reply)               -> 第二次的解析（通常放宽成「只丢脏行」）。
 
-    Capture 可选再注入 ``semantic_reasons`` / ``build_semantic_prompt``：
-    格式打回和语义打回**共享一次** provider 预算。若格式重问后
-    仍少 target_id，直接 fail closed，不再发第三问。
+    Capture 可选再注入 ``semantic_reasons`` / ``build_semantic_prompt``；
+    capture / Dream 都可注入 ``build_truncation_prompt``。截断、格式打回和
+    语义打回**共享一次** provider 预算，任何第二问失败都直接 fail closed，
+    不再发第三问。
     """
 
     should_retry: Callable[[str], bool]
@@ -74,6 +75,7 @@ class ParseRetry(NamedTuple):
     parse: Callable[[str], tuple]
     semantic_reasons: Callable[[Any], list[str]] | None = None
     build_semantic_prompt: Callable[[str, list[str]], str] | None = None
+    build_truncation_prompt: Callable[[str], str] | None = None
 
 
 _PROVIDER_FAILURE_CODES = frozenset(
@@ -153,10 +155,9 @@ async def extract(
     `parse` 是 memory/*_prompt_v1 里的纯解析函数。它的返回是 (value, err) 或
     (value, questions, err)；我们只取首项与末项（末项恒为 err）。
 
-    给了 `parse_retry` 时，内容闸判为「模型把输出示例的占位符抄了回来」的回复会被
-    打回、带着「哪个字段没填」重问一次（**最多一次**，第二次的结果直接采信）。
-    provider 报错 / 空回复 / JSON 根本没出来不走这条路——重问同一段 prompt 也没用，
-    它们各有自己的重试与退避。
+    给了 `parse_retry` 时，截断、内容闸或语义闸可带原因重问一次；三条路径共享
+    **最多一次**的 provider 预算。provider 报错 / 空回复不走这条路，它们各有
+    自己的重试与退避。
     """
 
     async def _call(
@@ -220,32 +221,62 @@ async def extract(
             return None, "empty_reply", response_shape
         return reply, None, response_shape
 
-    async def _report_truncated(response_shape: dict[str, Any]) -> bool:
+    async def _report_truncated(
+        response_shape: dict[str, Any], *, attempt: int
+    ) -> bool:
         if response_shape.get("stop_reason") != "length":
             return False
-        if failure_detail_out is not None:
-            failure_detail_out(dict(response_shape))
         if trajectory_out is not None:
-            await trajectory_out("extraction_output_truncated", dict(response_shape))
+            await trajectory_out(
+                "extraction_output_truncated",
+                {**response_shape, "attempt": attempt},
+            )
         return True
 
+    def _record_truncation_failure(response_shape: dict[str, Any]) -> None:
+        if failure_detail_out is not None:
+            failure_detail_out(dict(response_shape))
+
+    retried_once = False
     reply, call_error, response_shape = await _call(prompt)
-    if await _report_truncated(response_shape):
-        return None, "output_truncated"
+    if await _report_truncated(response_shape, attempt=1):
+        if parse_retry is None or parse_retry.build_truncation_prompt is None:
+            _record_truncation_failure(response_shape)
+            return None, "output_truncated"
+        if trajectory_out is not None:
+            await trajectory_out(
+                "extraction_output_truncation_retry",
+                {
+                    "attempt": 2,
+                    "strategy": "concise_prompt",
+                    "max_tokens": max_tokens,
+                },
+            )
+        reply, call_error, response_shape = await _call(
+            parse_retry.build_truncation_prompt(prompt)
+        )
+        retried_once = True
+        if await _report_truncated(response_shape, attempt=2):
+            _record_truncation_failure(response_shape)
+            return None, "output_truncated"
     if call_error is not None:
         return None, call_error
     parsed = parse(reply)
     value, err = parsed[0], parsed[-1]
-    retried_once = False
     if err:
-        if parse_retry is None or not parse_retry.should_retry(str(err)):
+        if (
+            retried_once
+            or parse_retry is None
+            or not parse_retry.should_retry(str(err))
+        ):
             return None, str(err)
         if trajectory_out is not None:
             await trajectory_out("parse_bounced", {"reason": str(err)})
         retry_reply, retry_call_error, _retry_response_shape = await _call(
             parse_retry.build_prompt(prompt, str(err))
         )
-        if await _report_truncated(_retry_response_shape):
+        if await _report_truncated(_retry_response_shape, attempt=2):
+            _record_truncation_failure(_retry_response_shape)
             return None, "output_truncated"
         if retry_call_error is not None:
             # 重问这一跳自己挂了：如实报重问的失败原因，别把它伪装成原来的格式问题。
@@ -273,7 +304,8 @@ async def extract(
     retry_reply, retry_call_error, _retry_response_shape = await _call(
         parse_retry.build_semantic_prompt(prompt, semantic_reasons)
     )
-    if await _report_truncated(_retry_response_shape):
+    if await _report_truncated(_retry_response_shape, attempt=2):
+        _record_truncation_failure(_retry_response_shape)
         return None, "output_truncated"
     if retry_call_error is not None:
         return None, retry_call_error
