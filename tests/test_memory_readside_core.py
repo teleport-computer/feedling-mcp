@@ -98,6 +98,27 @@ def test_index_core_prefilters_sorts_caps_and_reports_card_count(monkeypatch):
     assert "other_user" not in captured["ids"]
 
 
+def test_readside_time_tiebreak_compares_instants_and_puts_garbage_last():
+    moments = [
+        _moment("bad", occurred_at="garbage"),
+        _moment("older_offset", occurred_at="2026-08-13T20:00:00+08:00"),
+        _moment("newer_z", occurred_at="2026-08-13T13:00:00Z"),
+        _moment("date_only", occurred_at="2026-08-13"),
+        _moment("pre_epoch", occurred_at="1960-01-01"),
+    ]
+
+    candidates, total = readside_core.readside_candidates(moments, "usr_core", limit=10)
+
+    assert total == 5
+    assert [moment["id"] for moment in candidates] == [
+        "newer_z",
+        "older_offset",
+        "date_only",
+        "pre_epoch",
+        "bad",
+    ]
+
+
 def test_index_core_ignores_old_recall_window_env_and_returns_full_light_index(monkeypatch):
     monkeypatch.setenv("FEEDLING_MEMORY_READSIDE_LIMIT", "120")
     monkeypatch.delenv("FEEDLING_MEMORY_READSIDE_HARD_MAX", raising=False)
