@@ -5074,10 +5074,17 @@ _CLAIM_RECONCILE_INTERVAL_SEC = _positive_float_env(
 async def _reconcile_fleet_claims_once(
     fleet: v2_pool_supervisor.SlotFleet,
 ) -> int:
+    # `_slot_loop` reports this stage only after the Job reached its durable
+    # terminal state, then immediately reports idle.  Do not let the periodic
+    # DB check land between those pipe messages and misread the terminal row as
+    # an invalid in-flight claim.  Process liveness/watchdog recovery still
+    # covers a child that wedges before the idle signal arrives.
     snapshots = {
         key: snapshot
         for key, snapshot in fleet.snapshots().items()
-        if snapshot is not None and snapshot.active_job is not None
+        if snapshot is not None
+        and snapshot.active_job is not None
+        and snapshot.stage != "durable_completion"
     }
     pairs = [
         (snapshot.active_job.job_id, snapshot.active_job.claimed_by)

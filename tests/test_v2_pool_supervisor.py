@@ -194,3 +194,39 @@ def test_periodic_reconcile_restarts_only_the_invalid_exact_claim(monkeypatch):
     assert {key: pid for key, pid in after.items() if key != invalid_key} == {
         key: pid for key, pid in before.items() if key != invalid_key
     }
+
+
+def test_periodic_reconcile_ignores_durable_completion_snapshot(monkeypatch):
+    fleet = _fleet()
+    fleet.start_all()
+    completed_key = pool_supervisor.SlotKey("wake", 0)
+    invalid_key = pool_supervisor.SlotKey("heavy", 0)
+    completed = slot_protocol.ActiveJobIdentity(
+        5291, "scheduled", "worker:wake:0:g9"
+    )
+    invalid = slot_protocol.ActiveJobIdentity(
+        5292, "profile", "worker:heavy:0:g8"
+    )
+    fleet.supervisor(completed_key)._snapshot = slot_protocol.SlotProgress(
+        "wake-0", "g9", 12.0, 9.0, "durable_completion", completed
+    )
+    fleet.supervisor(invalid_key)._snapshot = slot_protocol.SlotProgress(
+        "heavy-0", "g8", 12.0, 9.0, "profile.provider", invalid
+    )
+    queried = []
+
+    def _valid_active_claims(pairs):
+        queried.extend(pairs)
+        return set()
+
+    monkeypatch.setattr(
+        serve_worker.jobs_store, "valid_active_claims", _valid_active_claims
+    )
+    before = {key: fleet.supervisor(key).pid for key in fleet.keys()}
+
+    assert asyncio.run(serve_worker._reconcile_fleet_claims_once(fleet)) == 1
+    assert queried == [(invalid.job_id, invalid.claimed_by)]
+
+    after = {key: fleet.supervisor(key).pid for key in fleet.keys()}
+    assert after[completed_key] == before[completed_key]
+    assert after[invalid_key] != before[invalid_key]
