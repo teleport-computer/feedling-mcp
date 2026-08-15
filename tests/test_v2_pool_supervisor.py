@@ -183,7 +183,7 @@ def test_periodic_reconcile_restarts_only_the_invalid_exact_claim(monkeypatch):
     before = {key: fleet.supervisor(key).pid for key in fleet.keys()}
     monkeypatch.setattr(
         serve_worker.jobs_store,
-        "valid_active_claims",
+        "valid_reconcile_claims",
         lambda pairs: {(valid.job_id, valid.claimed_by)},
     )
 
@@ -215,12 +215,12 @@ def test_periodic_reconcile_ignores_durable_completion_snapshot(monkeypatch):
     )
     queried = []
 
-    def _valid_active_claims(pairs):
+    def _valid_reconcile_claims(pairs):
         queried.extend(pairs)
         return set()
 
     monkeypatch.setattr(
-        serve_worker.jobs_store, "valid_active_claims", _valid_active_claims
+        serve_worker.jobs_store, "valid_reconcile_claims", _valid_reconcile_claims
     )
     before = {key: fleet.supervisor(key).pid for key in fleet.keys()}
 
@@ -230,3 +230,40 @@ def test_periodic_reconcile_ignores_durable_completion_snapshot(monkeypatch):
     after = {key: fleet.supervisor(key).pid for key in fleet.keys()}
     assert after[completed_key] == before[completed_key]
     assert after[invalid_key] != before[invalid_key]
+
+
+def test_periodic_reconcile_accepts_owned_terminal_before_final_pipe_signal(
+    monkeypatch,
+):
+    """DB completion can commit before trajectory unwind reaches the final
+    durable_completion pipe signal; the matching owner must remain valid."""
+    fleet = _fleet()
+    fleet.start_all()
+    key = pool_supervisor.SlotKey("foreground", 0)
+    terminal = slot_protocol.ActiveJobIdentity(
+        5371, "chat", "worker:foreground:0:g7"
+    )
+    fleet.supervisor(key)._snapshot = slot_protocol.SlotProgress(
+        "foreground-0",
+        "g7",
+        12.0,
+        9.0,
+        "turn_terminal_trajectory",
+        terminal,
+    )
+    queried = []
+
+    def _valid_reconcile_claims(pairs):
+        queried.extend(pairs)
+        return {(terminal.job_id, terminal.claimed_by)}
+
+    monkeypatch.setattr(
+        serve_worker.jobs_store,
+        "valid_reconcile_claims",
+        _valid_reconcile_claims,
+    )
+    before = fleet.supervisor(key).pid
+
+    assert asyncio.run(serve_worker._reconcile_fleet_claims_once(fleet)) == 0
+    assert queried == [(terminal.job_id, terminal.claimed_by)]
+    assert fleet.supervisor(key).pid == before

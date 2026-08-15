@@ -5090,7 +5090,7 @@ async def _reconcile_fleet_claims_once(
         (snapshot.active_job.job_id, snapshot.active_job.claimed_by)
         for snapshot in snapshots.values()
     ]
-    valid = await asyncio.to_thread(jobs_store.valid_active_claims, pairs)
+    valid = await asyncio.to_thread(jobs_store.valid_reconcile_claims, pairs)
     restarted = 0
     for key, snapshot in snapshots.items():
         active = snapshot.active_job

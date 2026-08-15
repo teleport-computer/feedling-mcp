@@ -1109,6 +1109,37 @@ def valid_active_claims(
     return {(int(row[0]), str(row[1])) for row in rows}
 
 
+def valid_reconcile_claims(
+    claims: list[tuple[int, str]],
+) -> set[tuple[int, str]]:
+    """Return snapshot pairs that do not justify cancelling their slot.
+
+    Besides a live claimed/running lease, accept ``completed`` and ``failed``
+    rows fenced by the same owner.  The worker commits those terminal states
+    before its final trajectory/unwind work and parent pipe signal, so treating
+    that bounded window as an invalid claim kills a healthy slot after every
+    normal turn.  Cancellation states and missing/reassigned rows deliberately
+    remain invalid so the reconciler still backs up dropped cancellation
+    notifications.
+    """
+    if not claims:
+        return set()
+    job_ids = [int(job_id) for job_id, _claimed_by in claims]
+    owners = [str(claimed_by) for _job_id, claimed_by in claims]
+    with _pool().connection() as conn:
+        rows = conn.execute(
+            "WITH wanted(job_id, claimed_by) AS ("
+            "SELECT * FROM unnest(%s::bigint[], %s::text[])"
+            ") SELECT j.id, j.claimed_by FROM wanted w "
+            "JOIN agent_jobs j ON j.id=w.job_id AND j.claimed_by=w.claimed_by "
+            "WHERE (j.status IN ('claimed','running') "
+            "AND j.lease_expires_at > clock_timestamp()) "
+            "OR j.status IN ('completed','failed')",
+            (job_ids, owners),
+        ).fetchall()
+    return {(int(row[0]), str(row[1])) for row in rows}
+
+
 def mark_running(job_id, *, claimed_by: str) -> bool:
     with _pool().connection() as conn:
         with conn.transaction():
