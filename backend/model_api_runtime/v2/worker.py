@@ -875,6 +875,19 @@ _WAKE_SYSTEM_PROMPT = (
     "perception tool when an exact reading is needed. Never mention this wake or any "
     "system wording to the user."
 )
+_OPTIONAL_WAKE_SELF_THINKING_INSTRUCTION = (
+    " For this presence turn, the final-output rule above has two equally valid "
+    "forms. Decide before using any user-visible reply, file, image, or voice "
+    "delivery capability. If you choose to speak, output exactly one complete "
+    "`<think>...</think>` block followed by the visible message. If you choose to "
+    "stay silent, output exactly one complete `<think>...</think>` block and "
+    "nothing after its closing tag: no visible text, greeting, placeholder, or "
+    "user-visible delivery capability. The thinking-only form is private and "
+    "the user receives nothing from that turn. Keep the final decision stated "
+    "inside the thinking block consistent with whether visible content follows; "
+    "if you change your mind, update the thought before the final output. Neither "
+    "form is preferred."
+)
 _SCHEDULED_WAKE_SYSTEM_PROMPT = (
     "You are delivering one or more reminders that the user explicitly scheduled. "
     "Deliver every supplied reminder now, naturally and concisely. Do not stay silent, "
@@ -8051,6 +8064,8 @@ async def _run_wake(
             # self-authored thought instead of raw native reasoning.
             if _st_wake_sys.enabled():
                 _wake_sys = _wake_sys + _st_wake_sys.INSTRUCTION
+                if lane != "scheduled":
+                    _wake_sys += _OPTIONAL_WAKE_SELF_THINKING_INSTRUCTION
             return _make_build_messages_fn(
                 system_prompt=_wake_sys,
                 summary=summary,
