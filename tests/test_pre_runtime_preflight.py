@@ -16,7 +16,11 @@ def test_tee_migrate_has_one_head_after_runtime_v2_alignment():
     cfg.set_main_option("script_location", str(ROOT / "backend" / "alembic_tee"))
     script = ScriptDirectory.from_config(cfg)
 
-    assert script.get_heads() == ["0020_v2_first_chat_activation"]
+    assert script.get_heads() == ["0021_agent_jobs_available_at"]
+    assert (
+        script.get_revision("0021_agent_jobs_available_at").down_revision
+        == "0020_v2_first_chat_activation"
+    )
     assert (
         script.get_revision("0020_v2_first_chat_activation").down_revision
         == "0019_v2_worker_pool_heartbeats"
@@ -29,8 +33,8 @@ def test_tee_migrate_has_one_head_after_runtime_v2_alignment():
         script.get_revision("0018_v2_wake_shadow_decisions").down_revision
         == "0017_voice_primary_alignment"
     )
-    migration = script.get_revision("0020_v2_first_chat_activation").module
-    assert "'[\"0020_v2_first_chat_activation\"]'::jsonb" in (
+    migration = script.get_revision("0021_agent_jobs_available_at").module
+    assert "'[\"0021_agent_jobs_available_at\"]'::jsonb" in (
         migration._UPDATE_PREPARED_HEAD
     )
 
