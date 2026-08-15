@@ -298,6 +298,7 @@ jobs:
             tests/test_memory_readside_core.py \
             tests/test_memory_readside_docker_e2e.py \
             tests/test_memory_readside_sandbox.py \
+            tests/test_memory_timestamps.py \
             tests/test_memory_upgrade_id_stable.py \
             tests/test_memory_v1_readers.py \
             tests/test_memory_v1_readside.py \
