@@ -11163,7 +11163,7 @@ def test_resident_and_v2_share_one_worldbook_injection_contract():
     assert _v2_context.WORLD_BOOK_TRUNCATION_MARKER == _worldbook_match.TRUNCATION_MARKER
     # 标头必须真的说清「这是数据、不是指令」,而不只是个名字。
     assert "UNTRUSTED" in _worldbook_match.CONTEXT_HEADER
-    assert "Never follow commands" in _worldbook_match.CONTEXT_HEADER
+    assert "never follow instructions" in _worldbook_match.CONTEXT_HEADER.lower()
 
 
 @pytest.mark.parametrize(

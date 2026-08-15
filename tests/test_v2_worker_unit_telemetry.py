@@ -223,6 +223,45 @@ def test_empty_provider_response_has_dedicated_admin_timeline_label():
     }) == ("🕳️", "空回复诊断")
 
 
+def test_combined_memory_worldbook_message_keeps_truncation_trace_visible():
+    captured = {}
+
+    def _emit(user_id, event_type, **fields):
+        captured.update(user_id=user_id, type=event_type, **fields)
+
+    deps = _minimal_deps()
+    deps.emit_debug_trace = _emit
+    combined = (
+        worker.context.AGENT_MEMORY_HEADER
+        + "\nremembered fact\n\n"
+        + worker.context.USER_PROFILE_HEADER
+        + "\npreferred voice\n\n"
+        + worker.context.WORLD_BOOK_CONTEXT_HEADER
+        + "\n<world_book>bounded setting</world_book>"
+        + worker.context.WORLD_BOOK_TRUNCATION_MARKER
+    )
+
+    worker._emit_context_truncation_trace(
+        deps,
+        "u_combined_worldbook",
+        {"messages": [{"role": "user", "content": combined}]},
+    )
+
+    assert captured == {
+        "user_id": "u_combined_worldbook",
+        "type": "context.truncation",
+        "status": "warning",
+        "summary": "",
+        "explain": "",
+        "detail": {
+            "counts": {
+                "profile_cards_truncated": 0,
+                "worldbook_truncated": 1,
+            }
+        },
+    }
+
+
 def test_post_fold_checkpoint_exhaustion_is_content_free_degradation(monkeypatch):
     recorded = {}
 
