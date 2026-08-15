@@ -17,6 +17,12 @@ change must not be interpreted as an API guarantee.
   still produces the ordinary visible reply, while scheduled reminders retain
   their required-delivery contract.
 
+- **Accepted memory adds always create a new card.** `memory.add` no longer
+  decrypts the incoming or existing cards to search for normalized exact
+  duplicates. Repeating an add with the same title and content therefore
+  creates another memory ID and emits another write effect; callers must not
+  treat `POST /v1/memory/actions` as idempotent.
+
 - **Runtime V2 background wake turns cannot delete memory cards.** Heartbeat,
   scheduled, manual-wake, and screen-watch turns retain memory add and update
   tools, but deletion is absent from their provider tool schema and rejected at

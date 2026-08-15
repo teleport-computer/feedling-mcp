@@ -1479,7 +1479,11 @@ COMPONENT_SCHEMAS: dict[str, dict[str, Any]] = {
         "type": "object",
         "required": ["type"],
         "properties": {
-            "type": {"type": "string", "enum": ["memory.add", "memory.supersede", "memory.delete", "memory.retype"]},
+            "type": {
+                "type": "string",
+                "enum": ["memory.add", "memory.supersede", "memory.delete", "memory.retype"],
+                "description": "Accepted memory.add actions always create a new card; repeated content is not deduplicated.",
+            },
             "envelope": {"$ref": "#/components/schemas/MemoryEnvelope"},
             "memory": {
                 "$ref": "#/components/schemas/MemoryRecordInput",

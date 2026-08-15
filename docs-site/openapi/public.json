@@ -10729,7 +10729,8 @@
               "memory.supersede",
               "memory.delete",
               "memory.retype"
-            ]
+            ],
+            "description": "Accepted memory.add actions always create a new card; repeated content is not deduplicated."
           },
           "envelope": {
             "$ref": "#/components/schemas/MemoryEnvelope"

@@ -448,46 +448,100 @@ def test_memory_batch_skipped_plus_failed_without_apply_returns_400(monkeypatch)
     assert [row["http_status"] for row in body["results"]] == [200, 404]
 
 
-def test_memory_add_skips_normalized_duplicate_but_keeps_distinct_content(monkeypatch):
+def test_memory_add_always_creates_duplicate_without_decrypting_existing_cards(monkeypatch):
     store = types.SimpleNamespace(user_id="usr_v1")
-    moments: list[dict] = []
+    moments = [{
+        "id": f"mem_existing_{index}",
+        "owner_user_id": store.user_id,
+        "visibility": "shared",
+        "status": "active",
+        "body_ct": json.dumps({
+            "summary": "Coffee Preference",
+            "content": "Likes oat milk.",
+        }),
+    } for index in range(80)]
     saved = _install_memory_action_fakes(monkeypatch, moments)
+
+    decrypt_calls = []
+
+    def fail_if_decrypted(moment, _api_key, runtime_token=""):
+        decrypt_calls.append((moment["id"], runtime_token))
+        raise AssertionError("memory.add must not decrypt existing cards")
+
     monkeypatch.setattr(
         memory_actions,
         "_memory_plain_from_envelope",
-        lambda moment, _api_key, runtime_token="": (
-            json.loads(moment["body_ct"]),
-            "",
-        ),
+        fail_if_decrypted,
     )
 
-    def add(summary: str, content: str):
-        return memory_actions._execute_memory_actions(store, "api_key", [{
+    body, status = memory_actions._execute_memory_actions(
+        store,
+        "api_key",
+        [{
             "type": "memory.add",
             "memory": {
-                "summary": summary,
-                "content": content,
+                "summary": "  Ｃｏｆｆｅｅ   Preference ",
+                "content": "LIKES   OAT MILK.",
                 "source": "chat",
             },
-        }])
-
-    first, first_status = add("Coffee Preference", "Likes oat milk.")
-    duplicate, duplicate_status = add(
-        "  Ｃｏｆｆｅｅ   Preference ",
-        "LIKES   OAT MILK.",
-    )
-    distinct, distinct_status = add(
-        "Coffee Preference",
-        "Likes espresso without milk.",
+        }],
+        runtime_token="rt-hosted",
     )
 
-    assert first_status == duplicate_status == distinct_status == 200
-    assert first["results"][0]["status"] == "ok"
-    assert duplicate["results"][0]["skipped"] == "duplicate_active"
-    assert duplicate["results"][0]["noop"] is True
-    assert duplicate["effects"] == []
-    assert distinct["results"][0].get("skipped") is None
-    assert len(saved) == 2
+    assert status == 200
+    assert body["results"][0]["status"] == "ok"
+    assert body["results"][0].get("skipped") is None
+    assert body["effects"][0]["type"] == "memory_added"
+    assert len(saved) == 81
+    assert decrypt_calls == []
+
+
+def test_memory_add_prebuilt_envelope_does_not_decrypt_for_duplicate_scan(monkeypatch):
+    store = types.SimpleNamespace(user_id="usr_v1")
+    moments = [{
+        "id": f"mem_existing_{index}",
+        "owner_user_id": store.user_id,
+        "visibility": "shared",
+        "status": "active",
+        "body_ct": "existing-ciphertext",
+    } for index in range(80)]
+    saved = _install_memory_action_fakes(monkeypatch, moments)
+    decrypt_calls = []
+
+    def fail_if_decrypted(moment, _api_key, runtime_token=""):
+        decrypt_calls.append((moment["id"], runtime_token))
+        raise AssertionError("prebuilt memory.add must not decrypt for duplicate scan")
+
+    monkeypatch.setattr(
+        memory_actions,
+        "_memory_plain_from_envelope",
+        fail_if_decrypted,
+    )
+
+    body, status = memory_actions._execute_memory_actions(
+        store,
+        "api_key",
+        [{
+            "type": "memory.add",
+            "envelope": {
+                "id": "mem_prebuilt_new",
+                "body_ct": "new-ciphertext",
+                "nonce": "nonce-new",
+                "K_user": "ku-new",
+                "K_enclave": "ke-new",
+                "visibility": "shared",
+                "owner_user_id": store.user_id,
+                "type": "fact",
+                "occurred_at": "2026-08-15T00:00:00Z",
+            },
+        }],
+        runtime_token="rt-hosted",
+    )
+
+    assert status == 200
+    assert body["results"][0]["memory"]["id"] == "mem_prebuilt_new"
+    assert len(saved) == 81
+    assert decrypt_calls == []
 
 
 def test_backend_envelope_adapter_normalizes_only_plaintext_fields():
