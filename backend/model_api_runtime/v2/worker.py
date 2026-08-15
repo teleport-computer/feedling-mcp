@@ -4827,7 +4827,7 @@ def _write_tool_effect_payload(tc) -> tuple[str, dict]:
         if frozen is not None:
             payload["relationship_started_at"] = frozen
         return "identity", payload
-    if tc.name == "identity_nudge":
+    if tc.name in ("identity_nudge", "identity_dimensions_set"):
         # Same ``identity`` effect_type/sink as identity_patch, disambiguated by
         # a trusted ``op`` taken from the tool NAME (mirrors schedule/workspace):
         # ``{**tc.args, "op": tc.name}`` puts op LAST so a model that smuggled an

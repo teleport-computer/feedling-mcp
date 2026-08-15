@@ -10,6 +10,21 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **Identity dimensions can now be rewritten independently in Runtime V2.**
+  Foreground Chat can use `identity_dimensions_set` to replace the complete
+  dimensions list—including each dimension's name, numeric value, and optional
+  description—without changing profile text fields. This supports renaming,
+  adding, and deleting dimensions as well as assigning any valid value. The
+  corresponding `identity.dimensions_set` action on
+  `POST /v1/identity/actions` reuses the existing 12-item, unique-name, and
+  0–100 value rules and requires a reason. The reason and tool source are kept
+  inside the encrypted card; admin diagnostics receive only change/add/delete
+  counts and a label-set-changed flag, never labels or reason text.
+  `identity_nudge` remains available—with its existing ±10 limit—for small
+  model-initiated relative score adjustments, while `identity_dimensions_set`
+  has no delta limit because it represents an explicit user request.
+  Proactive/background turns cannot use any identity write path.
+
 - **Optional Runtime V2 proactive wakes now describe silence unambiguously.**
   Heartbeat, manual-wake, and screen-watch turns tell the model that choosing
   silence means returning only its private thinking block, which is discarded

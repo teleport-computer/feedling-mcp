@@ -21,6 +21,7 @@ from copy import deepcopy
 
 from provider_types import ToolSpec
 from capabilities import registry
+from identity import card_policy
 # Card-writing rules live with the memory package (single source of truth shared
 # with the V1 guidance block); only the op names above are V2-specific.
 from memory import prompts_v1
@@ -45,6 +46,20 @@ _STR = {"type": "string"}
 _INT = {"type": "integer"}
 _BOOL = {"type": "boolean"}
 _NO_ARGS: dict = {"type": "object", "properties": {}}
+
+_IDENTITY_DIMENSION = {
+    "type": "object",
+    "properties": {
+        "name": _STR,
+        "value": {
+            "type": "number",
+            "minimum": card_policy._VALUE_MIN,
+            "maximum": card_policy._VALUE_MAX,
+        },
+        "description": _STR,
+    },
+    "required": ["name", "value"],
+}
 
 # Keep the provider-visible vocabulary tied to the same projection catalog the
 # capability executor consumes.  A copied enum silently drifts and turns an
@@ -127,6 +142,20 @@ PARAMS: dict[str, dict] = {
             "reason": _STR,
         },
         "required": ["dimension", "delta"],
+    },
+    # identity.set_dimensions(store, ...): full replacement of the dimensions
+    # list. The action layer reuses card_policy.validate_dimensions_structure.
+    "identity_dimensions_set": {
+        "type": "object",
+        "properties": {
+            "dimensions": {
+                "type": "array",
+                "items": _IDENTITY_DIMENSION,
+                "maxItems": card_policy.MAX_DIMENSIONS,
+            },
+            "reason": _STR,
+        },
+        "required": ["dimensions", "reason"],
     },
 
     # -- memory.py (backed by memory_core.index/fetch/actions) --
@@ -441,11 +470,23 @@ DESCRIPTIONS: dict[str, str] = {
                        "in the app: the day you met is day 1, not day 0). So if the user says "
                        "'make it day 45', pass 45 and the app will show 45. Whole number, "
                        "day 1 = the day you met. Only act on an explicit request."),
-    "identity_nudge": ("Adjust ONE of the persona's relationship/personality dimension "
+    "identity_nudge": ("Make a small conversational adjustment the model infers for ONE "
+                       "of the persona's relationship/personality dimension "
                        "scores by a signed integer 'delta' (|delta| ≤ 10). 'dimension' "
                        "must name a dimension that already exists — call identity_get "
                        "first to see the current dimensions and values. Optional "
-                       "'reason'. To add or rename dimensions, use identity_patch."),
+                       "'reason'. For a user-requested rename/content/value rewrite, "
+                       "add, or delete, use identity_dimensions_set instead."),
+    "identity_dimensions_set": (
+        "Replace the persona's COMPLETE dimensions list without changing identity/profile "
+        "text fields. Use only for an explicit user-requested rewrite; call identity_get "
+        "first, then provide every dimension that should remain. Each item has a 'name', "
+        f"a numeric 'value' from {card_policy._VALUE_MIN} to {card_policy._VALUE_MAX}, "
+        "and optional 'description' content. Renaming edits 'name'; an empty list deletes "
+        f"all dimensions; at most {card_policy.MAX_DIMENSIONS} are allowed. A non-empty "
+        "'reason' describing the explicit user request is required for the encrypted audit. "
+        "For a small conversational score adjustment, keep using identity_nudge."
+    ),
     "memory_index": ("Browse memory-card summaries, optionally filtered by one exact "
                      "bucket or thread and capped by limit. Set ambient/include_sensitive "
                      "only when that broader or sensitive recall is genuinely needed. "
@@ -789,6 +830,14 @@ def validate_tool_args(name: str, args, *, live_model_call: bool = False) -> str
             return bool(value)
         if not any(_has_content(k, v) for k, v in merged.items()):
             return "identity_patch requires a non-empty patch or profile field"
+    if name == "identity_dimensions_set":
+        valid, dimensions_error = card_policy.validate_dimensions_structure(
+            args.get("dimensions")
+        )
+        if not valid:
+            return dimensions_error
+        if not str(args.get("reason") or "").strip():
+            return "identity_dimensions_set requires a non-empty reason"
     if name == "memory_write":
         actions = args.get("actions") or []
         if not actions:

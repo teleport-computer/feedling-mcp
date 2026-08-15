@@ -94,9 +94,12 @@ clipped. If the required core is too large, the runner first compacts only a
 safe answered prefix and rebuilds the prompt from the new durable watermark.
 
 Proactive wake turns may read the agent identity card but cannot mutate it:
-Runtime V2 visibly refuses `identity_patch` and `identity_nudge` in background
-turns. Foreground Chat identity changes and wake-time Memory writes retain their
-existing authorization.
+Runtime V2 visibly refuses `identity_patch`, `identity_nudge`, and
+`identity_dimensions_set` in background turns. Foreground Chat identity changes
+and wake-time Memory writes retain their existing authorization. Foreground
+profile-text edits use `identity_patch`; full dimension name/value/description
+rewrites use `identity_dimensions_set`; small relative dimension-score changes
+continue to use `identity_nudge`.
 
 Exact immutable leaf segments carry source-range/count
 witnesses; immutable higher-level checkpoints retain and name their ordered
