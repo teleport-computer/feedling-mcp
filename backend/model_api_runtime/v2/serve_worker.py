@@ -5141,6 +5141,14 @@ _SCHEDULER_INTERVAL_SEC = _positive_float_env(
 _CHILD_LIVENESS_TIMEOUT_SEC = _positive_float_env(
     "FEEDLING_V2_CHILD_LIVENESS_TIMEOUT_SEC", "45"
 )
+_CHILD_STARTUP_TIMEOUT_SEC = _positive_float_env(
+    "FEEDLING_V2_CHILD_STARTUP_TIMEOUT_SEC", "120"
+)
+if _CHILD_STARTUP_TIMEOUT_SEC <= _CHILD_LIVENESS_TIMEOUT_SEC:
+    raise RuntimeError(
+        "FEEDLING_V2_CHILD_STARTUP_TIMEOUT_SEC must exceed "
+        "FEEDLING_V2_CHILD_LIVENESS_TIMEOUT_SEC"
+    )
 
 # A turn has two different clocks and they must never be conflated:
 #
@@ -5281,6 +5289,7 @@ async def _watchdog_loop(
         turn_stall_timeout_sec=turn_stall_timeout_sec,
         turn_absolute_timeout_sec=turn_absolute_timeout_sec,
         child_liveness_timeout_sec=_CHILD_LIVENESS_TIMEOUT_SEC,
+        child_startup_timeout_sec=_CHILD_STARTUP_TIMEOUT_SEC,
         jobs_claimable_timeout_sec=_WATCHDOG_DB_TIMEOUT_SEC,
         capacity_write_timeout_sec=_WATCHDOG_DB_TIMEOUT_SEC,
         recovery_timeout_sec=_WATCHDOG_DB_TIMEOUT_SEC,
