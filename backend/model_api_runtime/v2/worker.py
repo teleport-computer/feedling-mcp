@@ -1866,6 +1866,63 @@ def _provider_tool_surface_callback(
     return _emit
 
 
+def _empty_provider_response_debug_callback(
+    deps: TurnDeps,
+    user_id: str,
+    lane: str,
+):
+    """Build a content-free admin trace sink for provider-empty responses."""
+    if deps.emit_debug_trace is None:
+        return None
+
+    safe_lane = lane if lane == "chat" or lane in _WAKE_LANES else "other"
+
+    async def _emit(response_shape: dict[str, Any]) -> None:
+        raw_stop_reason = str(response_shape.get("stop_reason") or "")
+        stop_reason = (
+            raw_stop_reason
+            if raw_stop_reason in v2_tool_loop._CONTENT_FREE_STOP_REASONS
+            else ("other" if raw_stop_reason else "")
+        )
+        completion_tokens = response_shape.get("completion_tokens")
+        detail = {
+            "stop_reason": stop_reason,
+            "has_visible_text": bool(response_shape.get("has_visible_text")),
+            "reasoning_present": bool(response_shape.get("reasoning_present")),
+            "tool_call_count": max(
+                0, int(response_shape.get("tool_call_count") or 0)
+            ),
+            "completion_tokens": (
+                max(0, int(completion_tokens))
+                if isinstance(completion_tokens, (int, float))
+                else None
+            ),
+            "lane": safe_lane,
+        }
+        try:
+            await asyncio.to_thread(
+                deps.emit_debug_trace,
+                user_id,
+                "provider.empty_response",
+                status="warning",
+                summary="V2 provider 返回空回复",
+                explain=(
+                    "仅记录归一化 stop reason、布尔/计数与 lane；"
+                    "不记录回复、reasoning、prompt 或错误正文。"
+                ),
+                detail=detail,
+            )
+        except Exception as exc:  # noqa: BLE001 — diagnostics cannot fail a turn
+            log.warning(
+                "[v2.empty_response] trace failed user=%s lane=%s code=%s",
+                user_id,
+                safe_lane,
+                type(exc).__name__.lower(),
+            )
+
+    return _emit
+
+
 _CONTEXT_TRUNCATION_TRACE_EVENT = "context.truncation"
 _CONTEXT_TRUNCATION_COUNT_KEYS = (
     "profile_cards_truncated",
@@ -8216,6 +8273,9 @@ async def _run_wake(
                     user_id,
                     lane,
                 ),
+                on_empty_provider_response=(
+                    _empty_provider_response_debug_callback(deps, user_id, lane)
+                ),
                 fold_before_first=deps.read_messages_after_seq is not None,
                 on_progress=_report_turn_progress,
                 on_trajectory_event=_ledger_tapped_sink(
@@ -12343,6 +12403,9 @@ async def process_job(
                 deps,
                 user_id,
                 lane,
+            ),
+            on_empty_provider_response=(
+                _empty_provider_response_debug_callback(deps, user_id, lane)
             ),
             fold_before_first=seq_native and not ordered_chat_replies,
             on_progress=_report_turn_progress,

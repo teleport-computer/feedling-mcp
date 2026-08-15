@@ -2357,9 +2357,17 @@ def test_scheduled_wake_empty_reply_fails_instead_of_completing_silently(monkeyp
         worker, "_write_encrypted_reply",
         lambda store, text: write_called.update(n=write_called["n"] + 1) or {"id": "r"})
 
+    traces = []
+    deps = _wake_deps(
+        tail=[{"id": "m1", "ts": 1.0, "role": "user", "content": "hi"}]
+    )
+    deps.emit_debug_trace = lambda user_id, event_type, **fields: traces.append(
+        {"user_id": user_id, "type": event_type, **fields}
+    )
+
     status = asyncio.run(worker._run_wake(
         job_id, uid, "scheduled",
-        _wake_deps(tail=[{"id": "m1", "ts": 1.0, "role": "user", "content": "hi"}]),
+        deps,
         _BYOK, asyncio.Semaphore(4), claimed_by))
 
     assert status != "completed", "定时提醒返空竟然算成功了——正是本用例要挡的回归"
@@ -2390,6 +2398,18 @@ def test_scheduled_wake_empty_reply_fails_instead_of_completing_silently(monkeyp
         None,
         None,
     )
+    diagnostics = [
+        trace for trace in traces if trace["type"] == "provider.empty_response"
+    ]
+    assert len(diagnostics) == 2
+    assert all(trace["detail"] == {
+        "stop_reason": "end_turn",
+        "has_visible_text": False,
+        "reasoning_present": False,
+        "tool_call_count": 0,
+        "completion_tokens": 1,
+        "lane": "scheduled",
+    } for trace in diagnostics)
 
 
 def test_scheduled_wake_empty_reply_recovers_on_the_correction_retry(monkeypatch):

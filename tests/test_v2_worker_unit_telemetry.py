@@ -159,6 +159,70 @@ def test_thinking_surface_has_dedicated_admin_timeline_label():
     ) == ("💭", "思考展示 · 分支")
 
 
+def test_empty_provider_response_trace_is_content_free_and_admin_readable():
+    from admin import data_track
+
+    captured = {}
+
+    def _emit(user_id, event_type, **fields):
+        captured.update(user_id=user_id, type=event_type, **fields)
+
+    deps = _minimal_deps()
+    deps.emit_debug_trace = _emit
+    callback = worker._empty_provider_response_debug_callback(
+        deps, "u_trace", "chat"
+    )
+    assert callback is not None
+    asyncio.run(callback({
+        "stop_reason": "content_filter",
+        "has_visible_text": False,
+        "reasoning_present": True,
+        "tool_call_count": 0,
+        "completion_tokens": 41,
+        "reply_excerpt": "MUST NEVER REACH DEBUG TRACE",
+    }))
+
+    assert captured["type"] == "provider.empty_response"
+    assert captured["detail"] == {
+        "stop_reason": "content_filter",
+        "has_visible_text": False,
+        "reasoning_present": True,
+        "tool_call_count": 0,
+        "completion_tokens": 41,
+        "lane": "chat",
+    }
+    assert set(captured["detail"]) == {
+        "stop_reason",
+        "has_visible_text",
+        "reasoning_present",
+        "tool_call_count",
+        "completion_tokens",
+        "lane",
+    }
+    public = data_track._debug_event_public_json(captured)
+    assert public["detail"] == captured["detail"]
+    assert "MUST NEVER REACH DEBUG TRACE" not in str(captured)
+
+    malicious = dict(captured)
+    malicious["detail"] = {
+        **captured["detail"],
+        "stop_reason": "short_private_text",
+        "lane": "another_private_text",
+    }
+    redacted = data_track._debug_event_public_json(malicious)["detail"]
+    assert redacted["stop_reason"] == "<redacted string len=18>"
+    assert redacted["lane"] == "<redacted string len=20>"
+
+
+def test_empty_provider_response_has_dedicated_admin_timeline_label():
+    from admin import data_track
+
+    assert data_track._debug_friendly_step({
+        "type": "provider.empty_response",
+        "subsystem": "agent",
+    }) == ("🕳️", "空回复诊断")
+
+
 def test_post_fold_checkpoint_exhaustion_is_content_free_degradation(monkeypatch):
     recorded = {}
 
