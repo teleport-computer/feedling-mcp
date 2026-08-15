@@ -463,6 +463,26 @@ def test_parse_openai_compat_body_treats_untyped_text_block_as_visible():
     assert out["reply"] == "visible relay text"
 
 
+def test_parse_openai_compat_body_drops_untyped_sibling_when_typed_blocks_exist():
+    """Mixed typed/untyped output fails closed for its ambiguous siblings.
+
+    A fully untyped list remains inherently ambiguous: without a type or
+    protocol marker there is no signal that can distinguish visible text from
+    reasoning. That residual risk is limited to all-untyped relay output.
+    """
+    resp = FakeResponse(200, {
+        "choices": [{"message": {"content": [
+            {"text": "ambiguous private reasoning"},
+            {"type": "text", "text": "visible answer"},
+        ]}}],
+    })
+
+    out = pc._parse_openai_compat_body(
+        resp, provider="openai_compatible", model="relay-model", require_reply=True)
+
+    assert out["reply"] == "visible answer"
+
+
 def test_parse_deepseek_body_extracts_reasoning_content():
     resp = FakeResponse(200, {
         "id": "chatcmpl-deepseek",

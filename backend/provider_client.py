@@ -1802,6 +1802,11 @@ def _extract_reply(body: dict[str, Any], *, required: bool = True) -> str:
                 if isinstance(content, str) and content.strip():
                     return content.strip()
                 if isinstance(content, list):
+                    any_typed = any(
+                        str(part.get("type") or "").strip()
+                        for part in content
+                        if isinstance(part, dict)
+                    )
                     text_parts: list[str] = []
                     for part in content:
                         if not isinstance(part, dict):
@@ -1811,6 +1816,12 @@ def _extract_reply(body: dict[str, Any], *, required: bool = True) -> str:
                         # visible text as sibling content blocks. Reasoning is
                         # extracted separately and must never leak into reply.
                         if "reason" in part_type or "think" in part_type:
+                            continue
+                        # A lone untyped block is a compatibility shape used by
+                        # minimal relays. Mixed typed/untyped output is ambiguous:
+                        # exclude the untyped siblings instead of risking hidden
+                        # reasoning entering the visible reply.
+                        if not part_type and any_typed:
                             continue
                         if part_type not in {"", "text", "output_text"}:
                             continue

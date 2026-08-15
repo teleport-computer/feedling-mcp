@@ -572,10 +572,10 @@ def build_turn_messages(
     # This policy is unconditional so a transiently empty perception prefetch or
     # a recovery-state transition changes only the final data block, never the
     # privileged cache prefix.
-    trusted_parts = [system_prompt, _RUNTIME_CONTEXT_POLICY]
-    trusted_parts.extend(
+    trusted_parts = [
         str(block).strip() for block in trusted_system_blocks if str(block).strip()
-    )
+    ]
+    trusted_parts.extend((system_prompt, _RUNTIME_CONTEXT_POLICY))
     trusted_system = "\n\n".join(trusted_parts).strip()
     messages: list[dict] = [{"role": "system", "content": trusted_system}]
 

@@ -369,7 +369,7 @@ def test_skills_are_trusted_but_editable_working_memory_is_user_role_data():
     )
 
     assert messages[0]["role"] == "system"
-    assert messages[0]["content"].endswith("<skill>stable instructions</skill>")
+    assert messages[0]["content"].startswith("<skill>stable instructions</skill>")
     assert messages[1] == {
         "role": "user",
         "content": (
@@ -377,6 +377,23 @@ def test_skills_are_trusted_but_editable_working_memory_is_user_role_data():
         ),
     }
     assert messages[2]["content"].startswith(context._SUMMARY_HEADER)
+
+
+def test_trusted_persona_sentinel_precedes_common_system_prompt_and_runtime_policy():
+    sentinel = "<<<PERSONA-SENTINEL>>>"
+    messages = context.build_turn_messages(
+        system_prompt="<<<COMMON-SYSTEM-PROMPT>>>",
+        summary="",
+        tail=[],
+        trusted_system_blocks=(sentinel,),
+    )
+
+    system = messages[0]["content"]
+    assert system.startswith(sentinel)
+    assert system.index(sentinel) < system.index("<<<COMMON-SYSTEM-PROMPT>>>")
+    assert system.index("<<<COMMON-SYSTEM-PROMPT>>>") < system.index(
+        context._RUNTIME_CONTEXT_POLICY
+    )
 
 
 def test_profile_is_one_stable_user_role_block_before_summary_and_tail():
