@@ -152,6 +152,102 @@ def test_extract_treats_empty_reply_as_a_reason_not_a_crash(monkeypatch):
     assert parsed is None and err == "empty_reply"
 
 
+def test_extract_attributes_length_stop_before_parsing_and_records_safe_shape(
+    monkeypatch,
+):
+    limit = extraction.CAPTURE_MAX_OUTPUT_TOKENS
+
+    async def _truncated(_cfg, _messages, **_kwargs):
+        return {
+            "reply": '{"cards":[{"summary":"half',
+            "stop_reason": "length",
+            "usage": {
+                "prompt_tokens": 16576,
+                "completion_tokens": limit,
+            },
+        }
+
+    monkeypatch.setattr(
+        extraction.provider_client,
+        "reliable_chat_completion_async",
+        _truncated,
+    )
+    details = []
+    events = []
+
+    async def _record(kind, payload):
+        if kind == "extraction_output_truncated":
+            events.append(payload)
+
+    def _must_not_parse(_reply):
+        raise AssertionError("a length-stopped response must be attributed before parsing")
+
+    parsed, err = asyncio.run(
+        extraction.extract(
+            provider_config=object(),
+            prompt="P",
+            parse=_must_not_parse,
+            max_tokens=limit,
+            trajectory_out=_record,
+            failure_detail_out=details.append,
+        )
+    )
+
+    expected = {
+        "stop_reason": "length",
+        "completion_tokens": limit,
+        "max_tokens": limit,
+    }
+    assert parsed is None and err == "output_truncated"
+    assert details == [expected]
+    assert events == [expected]
+
+
+def test_extract_attributes_length_stop_on_existing_parse_retry(monkeypatch):
+    limit = extraction.CAPTURE_MAX_OUTPUT_TOKENS
+    calls = 0
+
+    async def _responses(_cfg, _messages, **_kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return {"reply": "bad format", "stop_reason": "end_turn"}
+        return {
+            "reply": '{"cards":[{"summary":"half',
+            "stop_reason": "length",
+            "usage": {"completion_tokens": limit},
+        }
+
+    monkeypatch.setattr(
+        extraction.provider_client,
+        "reliable_chat_completion_async",
+        _responses,
+    )
+    details = []
+    parsed, err = asyncio.run(
+        extraction.extract(
+            provider_config=object(),
+            prompt="P",
+            parse=lambda _raw: (None, "invalid_card_content:summary_empty"),
+            max_tokens=limit,
+            failure_detail_out=details.append,
+            parse_retry=extraction.ParseRetry(
+                should_retry=lambda _err: True,
+                build_prompt=lambda prompt, _err: prompt + "|retry",
+                parse=lambda _raw: (None, "no_json_object"),
+            ),
+        )
+    )
+
+    assert parsed is None and err == "output_truncated"
+    assert calls == 2
+    assert details == [{
+        "stop_reason": "length",
+        "completion_tokens": limit,
+        "max_tokens": limit,
+    }]
+
+
 # ---------- parse_retry(内容闸打回)----------
 
 def _stub_provider(replies):
@@ -409,6 +505,9 @@ def test_extraction_failure_codes_are_allowlisted_and_drop_raw_details():
     assert worker._extraction_failure_code(
         RuntimeError("extraction_memory_write_rejected:private-db-detail")
     ) == "extraction_failed:memory_write_rejected"
+    assert worker._extraction_failure_code(
+        RuntimeError("output_truncated")
+    ) == "extraction_failed:output_truncated"
 
 
 def test_extract_provider_reason_records_failure_not_false_success(monkeypatch):
