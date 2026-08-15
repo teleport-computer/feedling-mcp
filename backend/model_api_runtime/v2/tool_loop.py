@@ -498,6 +498,7 @@ async def run_tool_loop(
     max_calls: int,
     before_provider_call=None,
     on_provider_tool_surface=None,
+    on_empty_provider_response=None,
     on_provider_success=None,
     on_provider_failure=None,
     fold_before_first: bool = False,
@@ -1403,6 +1404,13 @@ async def run_tool_loop(
                     ),
                 },
             )
+            if on_empty_provider_response is not None:
+                try:
+                    await on_empty_provider_response(_empty_response_shape(pr))
+                except Exception:
+                    # Plaintext diagnostics are best-effort and must never
+                    # alter the retry/failure decision below.
+                    pass
             if can_correct:
                 empty_response_recovery_used = True
                 empty_response_retry_instruction = (

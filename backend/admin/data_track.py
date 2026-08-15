@@ -2416,7 +2416,36 @@ def _debug_content_summary(value) -> dict:
     return out
 
 
+_EMPTY_RESPONSE_PUBLIC_ENUMS = {
+    "stop_reason": frozenset({
+        "", "blocklist", "content_filter", "end_turn", "function_call",
+        "image_safety", "language", "length", "malformed_function_call",
+        "max_tokens", "other", "pause_turn", "prohibited_content",
+        "recitation", "refusal", "safety", "spii", "stop",
+        "stop_sequence", "tool_calls", "tool_use",
+    }),
+    "lane": frozenset({
+        "chat", "heartbeat", "scheduled", "manual_wake", "screen_watch",
+        "other",
+    }),
+}
+
+
 def _debug_event_public_json(ev: dict) -> dict:
+    raw_detail = ev.get("detail") or {}
+    public_detail = _debug_redact_value(raw_detail)
+    if (
+        ev.get("type") == "provider.empty_response"
+        and isinstance(raw_detail, dict)
+        and isinstance(public_detail, dict)
+    ):
+        # This producer normalizes both values to closed internal enums before
+        # writing. Expose them so admin can distinguish true filtering from a
+        # parser/content-free response without opening any general string field.
+        for key, allowed_values in _EMPTY_RESPONSE_PUBLIC_ENUMS.items():
+            value = raw_detail.get(key)
+            if isinstance(value, str) and value in allowed_values:
+                public_detail[key] = value
     return {
         "ts": ev.get("ts"),
         "user_id": ev.get("user_id"),
@@ -2427,7 +2456,7 @@ def _debug_event_public_json(ev: dict) -> dict:
         "dur_ms": ev.get("dur_ms"),
         "summary": ev.get("summary"),
         "explain": ev.get("explain"),
-        "detail": _debug_redact_value(ev.get("detail") or {}),
+        "detail": public_detail,
         "content_excerpt": _debug_content_summary(ev.get("content_excerpt") or {}),
     }
 
@@ -8020,6 +8049,7 @@ _DEBUG_STEP_LABELS = {
     "agent.model.call.done": ("🧠", "调用模型 · 完成"),
     "agent.tool.call": ("🔧", "调用工具"),
     "thinking.surfaced": ("💭", "思考展示 · 分支"),
+    "provider.empty_response": ("🕳️", "空回复诊断"),
     "mcp.surface.resolved": ("🧩", "MCP 工具面"),
     "mcp.surface.provider": ("🧩", "MCP Provider 实收工具面"),
     "mcp.surface.missing": ("🧩", "MCP 工具面缺失"),
