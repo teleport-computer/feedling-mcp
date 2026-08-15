@@ -592,12 +592,14 @@ jobs:
             tests/test_provider_prompt_cache.py \
             tests/test_v2_adaptive_tail.py \
             tests/test_v2_context.py \
+            tests/test_v2_maintenance_retired.py \
             tests/test_v2_p0_history_safety.py \
             tests/test_v2_profile_lane.py \
             tests/test_v2_profile_prompt.py \
             tests/test_v2_profile_refresh.py \
             tests/test_v2_profile_retry.py \
             tests/test_v2_profile_storage.py \
+            tests/test_v2_recent_prompt_context.py \
             tests/test_v2_reconcile.py \
             tests/test_v2_reconcile_sweeper.py \
             tests/test_v2_serve_worker.py \
