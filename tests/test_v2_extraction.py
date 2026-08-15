@@ -1,4 +1,5 @@
 import asyncio
+import importlib
 import sys
 from pathlib import Path
 
@@ -20,6 +21,35 @@ def _env(inner):
 
 
 # ---------- extract ----------
+
+def test_extraction_lane_output_budgets_are_independent_and_dream_is_larger():
+    assert extraction.DREAM_MAX_OUTPUT_TOKENS > extraction.CAPTURE_MAX_OUTPUT_TOKENS
+    assert extraction.max_output_tokens_for_lane("capture") == (
+        extraction.CAPTURE_MAX_OUTPUT_TOKENS
+    )
+    assert extraction.max_output_tokens_for_lane("dream") == (
+        extraction.DREAM_MAX_OUTPUT_TOKENS
+    )
+
+
+@pytest.mark.parametrize(
+    ("lane", "env_name"),
+    [
+        ("capture", "FEEDLING_V2_CAPTURE_MAX_OUTPUT_TOKENS"),
+        ("dream", "FEEDLING_V2_DREAM_MAX_OUTPUT_TOKENS"),
+    ],
+)
+def test_extraction_lane_output_budget_has_its_own_env(monkeypatch, lane, env_name):
+    try:
+        with monkeypatch.context() as env:
+            env.setenv(env_name, "1777")
+            reloaded = importlib.reload(extraction)
+            assert reloaded.max_output_tokens_for_lane(lane) == 1777
+    finally:
+        # The module object is shared with worker; restore startup-resolved values
+        # before the next test observes it.
+        importlib.reload(extraction)
+
 
 def test_extract_returns_parsed_on_success(monkeypatch):
     async def _fake(cfg, messages, **kw):

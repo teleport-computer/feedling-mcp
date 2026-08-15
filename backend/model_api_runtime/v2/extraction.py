@@ -12,11 +12,46 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import os
 from typing import Any, Awaitable, Callable, NamedTuple
 
 import provider_client
 
-_MAX_TOKENS = 1500
+_MAX_OUTPUT_TOKEN_SETTINGS = {
+    "capture": ("FEEDLING_V2_CAPTURE_MAX_OUTPUT_TOKENS", 1500),
+    "dream": ("FEEDLING_V2_DREAM_MAX_OUTPUT_TOKENS", 4000),
+}
+
+
+def _max_output_tokens_from_env(lane: str) -> int:
+    """Resolve one extraction lane's positive output budget."""
+    try:
+        env_name, default = _MAX_OUTPUT_TOKEN_SETTINGS[lane]
+    except KeyError as exc:
+        raise ValueError(f"unsupported extraction lane: {lane}") from exc
+    raw = os.environ.get(env_name, str(default))
+    try:
+        value = int(str(raw).strip())
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(f"{env_name} must be a positive integer") from exc
+    if value <= 0:
+        raise RuntimeError(f"{env_name} must be a positive integer")
+    return value
+
+
+CAPTURE_MAX_OUTPUT_TOKENS = _max_output_tokens_from_env("capture")
+DREAM_MAX_OUTPUT_TOKENS = _max_output_tokens_from_env("dream")
+
+
+def max_output_tokens_for_lane(lane: str) -> int:
+    """Return the startup-resolved budget without coupling capture to Dream."""
+    if lane == "capture":
+        return CAPTURE_MAX_OUTPUT_TOKENS
+    if lane == "dream":
+        return DREAM_MAX_OUTPUT_TOKENS
+    raise ValueError(f"unsupported extraction lane: {lane}")
+
+
 _TEMPERATURE = 0.3
 _TIMEOUT_SEC = 90.0
 
@@ -106,7 +141,7 @@ async def extract(
     provider_config: Any,
     prompt: str,
     parse: Callable[[str], tuple],
-    max_tokens: int = _MAX_TOKENS,
+    max_tokens: int = CAPTURE_MAX_OUTPUT_TOKENS,
     progress_cb: Callable[[str, int], None] | None = None,
     usage_out: Callable[[dict | None], None] | None = None,
     trajectory_out: Callable[[str, dict], Awaitable[None]] | None = None,

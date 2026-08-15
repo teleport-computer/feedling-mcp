@@ -113,6 +113,33 @@ def test_dream_is_a_lane_with_background_priority():
 
 
 @pytest.mark.parametrize("lane", ["capture", "dream"])
+def test_extraction_lane_passes_its_own_output_budget(monkeypatch, lane):
+    uid = f"u_x_budget_{lane}"
+    _seed_v2(uid)
+    jobs_store.enqueue_job(uid, lane)
+    job = jobs_store.claim_next_job("w")
+    seen = []
+
+    async def _fake_extract(**kwargs):
+        seen.append(kwargs["max_tokens"])
+        return [], None
+
+    monkeypatch.setattr(extraction, "extract", _fake_extract)
+    status = asyncio.run(
+        worker.process_job(
+            job,
+            _deps(),
+            provider_config=_BYOK,
+            api_key=None,
+            runtime_token="rt",
+        )
+    )
+
+    assert status == "completed"
+    assert seen == [extraction.max_output_tokens_for_lane(lane)]
+
+
+@pytest.mark.parametrize("lane", ["capture", "dream"])
 def test_extraction_lane_applies_actions_and_completes(monkeypatch, lane):
     uid = f"u_x_{lane}"
     _seed_v2(uid)
