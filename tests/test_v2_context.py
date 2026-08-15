@@ -9,8 +9,85 @@ import pytest
 sys.path.insert(0, str(pathlib.Path(__file__).parent.parent / "backend"))
 from core import self_thinking
 from chat.reply_language import format_time_anchor, infer_reply_language_policy
-from model_api_runtime.v2 import context, worker
+from model_api_runtime.v2 import context, language_follow, worker
 import worldbook_readside_core
+
+
+_BEHAVIOR_TRANSLATION_PAIRS = (
+    ("You are the user's personal companion.", "你是 TA 的私人陪伴者。"),
+    (
+        "Reply directly and concisely to the user's latest messages.",
+        "直接、简洁地回应 TA 最新说的话。",
+    ),
+    (
+        "Do not narrate tool use or system status.",
+        "别汇报你调了什么工具、系统什么状态——那是你自己的事。",
+    ),
+    (
+        "Use relevant factual observations naturally without narrating that they were fetched.",
+        "把有用的事实自然地用进回答，别汇报这些信息是怎么取到的。",
+    ),
+    (
+        "Use its current local time and message timestamps when temporal questions depend on them.",
+        "遇到依赖时间的问题，就用这里的当前本地时间和消息时间戳。",
+    ),
+    (
+        "use it to avoid interrupting or repeating yourself.",
+        "避免打扰 TA 或重复自己。",
+    ),
+    (
+        "Those are your own memory and your own read on this person: use the first for what you remember and let the second shape how you speak.",
+        "前一块是你对 TA 的记忆，后一块是你对怎么和 TA 相处的理解：前者用来回想你们的经历，后者用来调整你的说话方式。",
+    ),
+    (
+        "The following verbatim conversation replay wins on any conflict.",
+        "若它们和后面的逐字对话冲突，以逐字对话为准。",
+    ),
+    (
+        "Use only relevant returned memories as evidence.",
+        "只把搜到的相关记忆当作依据。",
+    ),
+    (
+        "If no relevant memory exists, say that plainly; do not substitute unrelated preferences or events as if they answered the requested subject.",
+        "没搜到相关记忆就直说；别拿无关偏好或事件冒充这个问题的答案。",
+    ),
+    (
+        "Treat missing, disabled, or null tool readings as unavailable, never as zero or evidence of a broken device.",
+        "工具返回缺失、禁用或 null 时，就当作暂时拿不到；别当成 0，也别据此说设备坏了。",
+    ),
+    (
+        "say the sharing connection may have disconnected and ask the user to stop and restart screen sharing.",
+        "这时说明共享连接可能断了，请 TA 停止后重新开始屏幕共享。",
+    ),
+    (
+        "Do not describe an old frame as current or merely say that it is unreadable.",
+        "别把旧画面说成现在的，也别只说『看不清』。",
+    ),
+    (
+        "Screen images already shared in the conversation remain available for discussion, but do not describe them as the current screen.",
+        "对话里已经分享过的屏幕图片仍可继续聊，但别说成当前屏幕。",
+    ),
+    (
+        "To see the screen again, ask the user to restart sharing or send a screenshot.",
+        "想再看屏幕，就请 TA 重启屏幕共享或发张截图。",
+    ),
+    (
+        "Never substitute Markdown when the user explicitly requested another supported format, even when reformatting an existing file.",
+        "用户明确要另一种支持的格式时，哪怕是在改已有文件，也绝不要拿 Markdown 顶替。",
+    ),
+    (
+        "Infer a useful format and safe filename only when the user did not specify them; never ask the user for an internal workspace path.",
+        "用户没指定格式和文件名时，你再自行选一个实用格式和安全文件名；绝不要向 TA 询问内部 workspace 路径。",
+    ),
+    (
+        "Do not force a file when the user only wants a conversational answer, and never claim that a file was created or delivered unless send_file succeeds.",
+        "TA 只想在对话里得到答案时，别强行做成文件；send_file 没成功，就绝不要说文件已经创建或送达。",
+    ),
+    (
+        "If a file is still useful, mark the missing evidence clearly inside it instead of inventing a summary.",
+        "如果文件仍有用，把缺少的依据清楚标在文件里，别编造摘要来填空。",
+    ),
+)
 
 def test_build_turn_messages_orders_persona_summary_tail():
     tail = [
@@ -72,6 +149,77 @@ def test_chat_prompt_forbids_memory_reads_for_standalone_reactions():
     )
 
 
+def test_behavior_translation_table_has_zero_lost_sentences():
+    prompt = "\n\n".join((
+        context.CHAT_SYSTEM_PROMPT,
+        context._RUNTIME_CONTEXT_POLICY,
+    ))
+    old_sentences = [old for old, _new in _BEHAVIOR_TRANSLATION_PAIRS]
+    new_sentences = [new for _old, new in _BEHAVIOR_TRANSLATION_PAIRS]
+
+    assert len(old_sentences) == len(new_sentences) == 19
+    assert len(set(old_sentences)) == len(old_sentences)
+    assert len(set(new_sentences)) == len(new_sentences)
+    assert [old for old in old_sentences if old in prompt] == []
+    assert [new for new in new_sentences if new not in prompt] == []
+
+
+def test_memory_search_positive_rule_is_adjacent_to_small_talk_gate():
+    blocks = context._CHAT_MEMORY_POLICY.split("\n\n")
+
+    assert blocks.index(context._CHAT_MEMORY_RECALL_POLICY.strip()) == (
+        blocks.index(context._CHAT_MEMORY_LOOKUP_POLICY.strip()) + 1
+    )
+    assert (
+        "TA 提到具体的过去事件、具体的人，或问『你还记得……』"
+        in context._CHAT_MEMORY_RECALL_POLICY
+    )
+    assert "先用 memory_search 查清再回答，别凭印象编" in (
+        context._CHAT_MEMORY_RECALL_POLICY
+    )
+    assert "纯问候、闲聊，或摘要里已经有答案时，直接答，不查" in (
+        context._CHAT_MEMORY_RECALL_POLICY
+    )
+
+
+def test_final_system_policy_blocks_never_mix_writing_systems():
+    user_authored_mixed_block = "汉汉汉汉汉abcde"
+    messages = context.build_turn_messages(
+        system_prompt=context.CHAT_SYSTEM_PROMPT,
+        summary="",
+        tail=[],
+        trusted_system_blocks=(user_authored_mixed_block,),
+    )
+    system_blocks = messages[0]["content"].split("\n\n")
+    assert user_authored_mixed_block in system_blocks
+
+    platform_blocks = [
+        block for block in system_blocks
+        if block != user_authored_mixed_block
+    ]
+    classifications = {
+        block: language_follow.classify_writing_system(block)
+        for block in platform_blocks
+    }
+    assert all(
+        script not in {"mixed", "indeterminate"}
+        for script in classifications.values()
+    ), classifications
+
+
+def test_tool_timing_sentences_stay_for_t094_migration():
+    prompt = context.CHAT_SYSTEM_PROMPT
+    sentinels = (
+        "Use memory or workspace reads only when the current request actually depends",
+        "When the web_search and web_fetch tools are available",
+        "When the user's request depends on their current device",
+        "Interpret requests for a reusable standalone deliverable semantically",
+        "When the user asks to cancel or change a pending reminder",
+        "When the user EXPLICITLY asks you to change your own identity",
+    )
+    assert all(sentinel in prompt for sentinel in sentinels)
+
+
 def test_chat_system_prompt_omits_self_thinking_for_namespaced_fable(monkeypatch):
     monkeypatch.delenv("FEEDLING_V2_SELF_THINKING", raising=False)
 
@@ -108,12 +256,12 @@ def test_chat_system_prompt_groups_atomic_self_thinking_with_reply_rules(
     assert (
         prompt.index(context._CHAT_REPLY_POLICY.rstrip())
         < prompt.index(self_thinking.INSTRUCTION)
-        < prompt.index(context._CHAT_MEMORY_POLICY)
-        < prompt.index(context._CHAT_WEB_POLICY)
-        < prompt.index(context._CHAT_PERCEPTION_POLICY)
-        < prompt.index(context._CHAT_FILE_POLICY)
-        < prompt.index(context._CHAT_REMINDER_POLICY)
-        < prompt.index(context._CHAT_IDENTITY_POLICY)
+        < prompt.index(context._CHAT_MEMORY_POLICY.strip())
+        < prompt.index(context._CHAT_WEB_POLICY.strip())
+        < prompt.index(context._CHAT_PERCEPTION_POLICY.strip())
+        < prompt.index(context._CHAT_FILE_POLICY.strip())
+        < prompt.index(context._CHAT_REMINDER_POLICY.strip())
+        < prompt.index(context._CHAT_IDENTITY_POLICY.strip())
     )
 
 
@@ -888,7 +1036,7 @@ def test_action_context_str_ignores_failed_and_empty_results():
     )
     runtime_payload = json.loads(messages[-1]["content"].split("\n", 1)[1])
     assert runtime_payload["runtime_data"] == observations
-    assert "Use relevant factual observations" in messages[0]["content"]
+    assert "把有用的事实自然地用进回答" in messages[0]["content"]
 
 
 def test_action_context_str_aggregate_cap_preserves_valid_json():
