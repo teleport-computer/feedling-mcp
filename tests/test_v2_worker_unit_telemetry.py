@@ -10,6 +10,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
 from model_api_runtime.v2 import worker  # noqa: E402
+from model_api_runtime.v2 import language_follow  # noqa: E402
 from model_api_runtime.v2 import summary_frontier  # noqa: E402
 
 
@@ -62,6 +63,126 @@ def _minimal_deps():
         resolve_provider=lambda _uid: (None, {}),
         mint_enclave_token=lambda _uid: "token",
     )
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("这是一个用于测试的完整中文句子", "han"),
+        ("This is a complete English sentence", "latin"),
+        ("これはひらがなとカタカナのテストです", "kana"),
+        ("한국어로 작성한 충분히 긴 문장입니다", "hangul"),
+        ("Это достаточно длинное русское предложение", "cyrillic"),
+        ("汉汉汉汉汉abcde", "mixed"),
+        ("😀🎉 123 !!!", "indeterminate"),
+        ("hello!", "indeterminate"),
+        ("def compute_value(items): return items", "latin"),
+    ],
+)
+def test_writing_system_classifier_uses_only_letters(text, expected):
+    assert language_follow.classify_writing_system(text) == expected
+
+
+def test_writing_system_classifier_requires_strictly_more_than_sixty_percent():
+    assert language_follow.classify_writing_system("汉汉汉汉汉汉abcd") == "mixed"
+    assert language_follow.classify_writing_system("汉汉汉汉汉汉汉abc") == "han"
+
+
+def test_latest_user_writing_system_skips_short_newest_message():
+    rows = [
+        {
+            "role": "user",
+            "content": "这是前一条足够长而且有实质内容的中文消息",
+        },
+        {"role": "assistant", "content": "assistant text is ignored"},
+        {"role": "user", "content": "ok"},
+    ]
+
+    assert worker._latest_user_writing_system(rows) == "han"
+
+
+def test_language_follow_trace_is_closed_enum_only_and_admin_readable():
+    from admin import data_track
+
+    captured = {}
+
+    def _emit(user_id, event_type, **fields):
+        captured.update(user_id=user_id, type=event_type, **fields)
+
+    asyncio.run(worker._emit_reply_language_follow_trace(
+        _emit,
+        "u_language_trace",
+        user_rows=[{
+            "role": "user",
+            "content": "这是用户不会进入遥测的私密中文正文",
+        }],
+        visible_reply="This private reply body must not enter telemetry",
+        lane="chat",
+    ))
+
+    assert captured["type"] == "reply.language_follow"
+    assert captured["detail"] == {
+        "user_script": "han",
+        "reply_script": "latin",
+        "outcome": "mismatch",
+        "lane": "chat",
+    }
+    assert set(captured["detail"]) == {
+        "user_script", "reply_script", "outcome", "lane",
+    }
+    assert "私密中文正文" not in str(captured)
+    assert "private reply body" not in str(captured)
+    assert data_track._debug_event_public_json(captured)["detail"] == (
+        captured["detail"]
+    )
+
+    malicious = dict(captured)
+    malicious["detail"] = {
+        **captured["detail"],
+        "reply_script": "private reply body",
+        "body": "private user text",
+    }
+    redacted = data_track._debug_event_public_json(malicious)["detail"]
+    assert redacted["reply_script"] == "<redacted string len=18>"
+    assert redacted["body"] == "<redacted string len=17>"
+
+
+def test_language_follow_trace_skips_without_anchor_and_never_raises():
+    captured = {}
+
+    def _emit(_user_id, _event_type, **fields):
+        captured.update(fields)
+
+    asyncio.run(worker._emit_reply_language_follow_trace(
+        _emit,
+        "u_language_skip",
+        user_rows=[{"role": "user", "content": "ok"}],
+        visible_reply="A sufficiently long visible English reply",
+        lane="wake",
+    ))
+    assert captured["detail"] == {
+        "user_script": "indeterminate",
+        "reply_script": "latin",
+        "outcome": "skip",
+        "lane": "wake",
+    }
+
+    asyncio.run(worker._emit_reply_language_follow_trace(
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("boom")),
+        "u_language_fail_open",
+        user_rows=[{"role": "user", "content": "A long English user message"}],
+        visible_reply="A long English visible reply",
+        lane="chat",
+    ))
+
+
+def test_language_follow_has_dedicated_admin_timeline_label():
+    from admin import data_track
+
+    assert data_track._debug_friendly_step({
+        "type": "reply.language_follow",
+        "subsystem": "agent",
+    }) == ("🌐", "语言跟随")
 
 
 @pytest.mark.parametrize(

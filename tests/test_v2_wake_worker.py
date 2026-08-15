@@ -313,6 +313,16 @@ def test_wake_self_thinking_on_drops_native_reasoning_fallback(monkeypatch):
         "model": _BYOK.model,
         "lane": "wake",
     }]
+    language_traces = [
+        trace for trace in traces
+        if trace["event_type"] == "reply.language_follow"
+    ]
+    assert [trace["detail"] for trace in language_traces] == [{
+        "user_script": "indeterminate",
+        "reply_script": "latin",
+        "outcome": "skip",
+        "lane": "wake",
+    }]
 
 
 @pytest.mark.parametrize(

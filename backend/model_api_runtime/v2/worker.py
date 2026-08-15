@@ -102,6 +102,7 @@ from model_api_runtime.v2 import extraction as v2_extraction
 from model_api_runtime.v2 import jobs_store
 from model_api_runtime.v2 import slot_protocol
 from model_api_runtime.v2 import kill_switch
+from model_api_runtime.v2 import language_follow as v2_language_follow
 from model_api_runtime.v2 import model_identity as v2_model_identity
 from model_api_runtime.v2 import web_gate as v2_web_gate
 from model_api_runtime.v2 import prompt_frontier as v2_prompt_frontier
@@ -5352,6 +5353,75 @@ async def _emit_thinking_surfaced_trace(
         )
 
 
+def _latest_user_writing_system(rows: Iterable[dict]) -> str:
+    """Find the newest classifiable user-authored text without retaining it."""
+
+    for row in reversed(list(rows)):
+        if str(row.get("role") or "") not in {"user", "human"}:
+            continue
+        text = context.text_of(row.get("content")).strip()
+        if not text:
+            continue
+        script = v2_language_follow.classify_writing_system(text)
+        if script != "indeterminate":
+            return script
+    return "indeterminate"
+
+
+async def _emit_reply_language_follow_trace(
+    emit_debug_trace: Callable[..., None] | None,
+    user_id: str,
+    *,
+    user_rows: Iterable[dict],
+    visible_reply: str,
+    lane: str,
+) -> None:
+    """Emit one terminal, content-free language-follow observation.
+
+    This first layer measures writing systems only.  Legitimate cross-language
+    requests (for example, asking for an English translation in Chinese) are
+    expected mismatch noise; correction/retry policy is explicitly out of
+    scope until aggregate data justifies a second layer.
+    """
+
+    if emit_debug_trace is None:
+        return
+    user_script = _latest_user_writing_system(user_rows)
+    reply_script = v2_language_follow.classify_writing_system(visible_reply)
+    if "indeterminate" in {user_script, reply_script}:
+        outcome = "skip"
+    elif user_script == reply_script:
+        outcome = "match"
+    else:
+        outcome = "mismatch"
+    safe_lane = "wake" if lane == "wake" else "chat"
+    try:
+        await asyncio.to_thread(
+            emit_debug_trace,
+            user_id,
+            "reply.language_follow",
+            status="warning" if outcome == "mismatch" else "ok",
+            summary="V2 回复文字系统跟随观测",
+            explain=(
+                "仅记录用户与可见回复的主导文字系统、匹配结果和 lane；"
+                "不记录正文、比例或思考内容。"
+            ),
+            detail={
+                "user_script": user_script,
+                "reply_script": reply_script,
+                "outcome": outcome,
+                "lane": safe_lane,
+            },
+        )
+    except Exception as exc:  # noqa: BLE001 — diagnostics cannot fail a reply
+        log.warning(
+            "[v2.language_follow] trace failed user=%s lane=%s code=%s",
+            user_id,
+            safe_lane,
+            type(exc).__name__.lower(),
+        )
+
+
 def _build_thinking_payload(
     store,
     reasoning: str,
@@ -6751,6 +6821,7 @@ async def _run_wake(
     """
     push_slot: dict | None = None
     shadow_decision_allowed: bool | None = None
+    language_user_rows: list[dict] = []
     try:
         store = core_store.get_store(user_id)
         seq_native = deps.read_messages_after_seq is not None
@@ -7148,6 +7219,9 @@ async def _run_wake(
             if isinstance(attention_snapshot, dict):
                 temporal_snapshot.update(attention_snapshot)
         wake_tail = list(tail)
+        language_user_rows[:] = (
+            _flatten_turns(optional_tail_turns) + wake_tail
+        )
 
         # screen_watch lane grounds on recent shared-screen availability (Task 3).
         # Fetch ONLY screen_recent — no perception_glance or perception_snapshot: the
@@ -7594,9 +7668,11 @@ async def _run_wake(
             )
 
         thinking_trace_emitted = False
+        language_trace_emitted = False
 
         async def _on_reply(text: str, *, final: bool, reasoning: str = "") -> None:
-            nonlocal thinking_trace_emitted, shadow_decision_allowed
+            nonlocal thinking_trace_emitted, language_trace_emitted
+            nonlocal shadow_decision_allowed
             text = str(text or "").strip()
             # Self-authored thinking (same mechanism as the chat lane): peel a leading
             # <think> off the wake reply BEFORE the degenerate/torn checks so they see
@@ -7978,6 +8054,15 @@ async def _run_wake(
                                 branch=_wake_thinking_branch,
                                 chars=_wake_thinking_chars,
                             )
+                        if not language_trace_emitted:
+                            language_trace_emitted = True
+                            await _emit_reply_language_follow_trace(
+                                deps.emit_debug_trace,
+                                user_id,
+                                user_rows=language_user_rows,
+                                visible_reply=text,
+                                lane="wake",
+                            )
                     return
                 if (
                     status == "discarded"
@@ -8040,6 +8125,15 @@ async def _run_wake(
                     branch=_wake_thinking_branch,
                     chars=_wake_thinking_chars,
                 )
+            if final and not language_trace_emitted:
+                language_trace_emitted = True
+                await _emit_reply_language_follow_trace(
+                    deps.emit_debug_trace,
+                    user_id,
+                    user_rows=language_user_rows,
+                    visible_reply=text,
+                    lane="wake",
+                )
             # Legacy/non-seq assembly can enqueue without a sink. That proves
             # the model produced text, not that a user-visible bubble was
             # applied. Count only the applied-but-unverified path here; the
@@ -8059,9 +8153,19 @@ async def _run_wake(
         else:
             wake_start_seq = 0
             cursor_box = {"ts": time.time()}
-        fold_new_messages = _make_fold_new_messages(
+        base_fold_new_messages = _make_fold_new_messages(
             user_id, deps, cursor_box, enclave_sem=enclave_sem
         )
+
+        async def fold_new_messages() -> list[dict]:
+            rows = await base_fold_new_messages()
+            # ``_make_fold_new_messages`` returns coalesced user-only rows and
+            # intentionally omits the redundant role field.  Restore that
+            # known provenance only in this private telemetry snapshot.
+            language_user_rows.extend(
+                {**row, "role": "user"} for row in rows
+            )
+            return rows
 
         # ── 世界书:主动开口的四条道也要认得这个世界（Seven 2026-08-10）
         #
@@ -8199,6 +8303,9 @@ async def _run_wake(
                     trajectory_recorder=trajectory_recorder,
                 )
                 wake_tail = list(tail)
+                language_user_rows[:] = (
+                    _flatten_turns(optional_tail_turns) + wake_tail
+                )
                 build_messages = _wake_builder()
                 try:
                     _preflight_adaptive_builder(
@@ -11450,6 +11557,8 @@ async def process_job(
             pending_file_keys.clear()
 
         thinking_trace_emitted = False
+        language_trace_emitted = False
+        language_user_rows: list[dict] = []
 
         async def _on_reply(
             text: str | WorkspaceFileReply,
@@ -11460,7 +11569,7 @@ async def process_job(
         ) -> None:
             nonlocal final_job_completed_atomically, voice_reply_slot
             nonlocal voice_call_ended_atomically
-            nonlocal thinking_trace_emitted
+            nonlocal thinking_trace_emitted, language_trace_emitted
             file_reply = text if isinstance(text, WorkspaceFileReply) else None
             text = "" if file_reply is not None else str(text or "").strip()
             image_replies: list[GeneratedImageReply] = []
@@ -11965,6 +12074,15 @@ async def process_job(
                             branch=_thinking_branch,
                             chars=_thinking_chars,
                         )
+                    if final and not language_trace_emitted:
+                        language_trace_emitted = True
+                        await _emit_reply_language_follow_trace(
+                            deps.emit_debug_trace,
+                            user_id,
+                            user_rows=language_user_rows,
+                            visible_reply=text,
+                            lane="chat",
+                        )
                     final_job_completed_atomically = True
                     return
                 if (
@@ -12040,6 +12158,15 @@ async def process_job(
                     lane="chat",
                     branch=_thinking_branch,
                     chars=_thinking_chars,
+                )
+            if final and not language_trace_emitted:
+                language_trace_emitted = True
+                await _emit_reply_language_follow_trace(
+                    deps.emit_debug_trace,
+                    user_id,
+                    user_rows=language_user_rows,
+                    visible_reply=text,
+                    lane="chat",
                 )
 
         # `seq` is exclusively the consumed user|human frontier. The base prompt's
@@ -12149,7 +12276,13 @@ async def process_job(
             if boundary_generation is None:
                 raise LostJobLease("job ownership lost at round boundary")
             observed_generation = int(boundary_generation)
-            return await base_fold_new_messages()
+            rows = await base_fold_new_messages()
+            # Folded rows are user-only by contract, though coalescing removes
+            # their redundant role field.
+            language_user_rows.extend(
+                {**row, "role": "user"} for row in rows
+            )
+            return rows
 
         grounding_results: dict[str, Any] = {}
         if pending_schedule_results:
@@ -12340,6 +12473,11 @@ async def process_job(
                     tm.record_prompt_frontier_exhaustion()
                     raise
 
+        language_user_rows[:] = (
+            _flatten_turns(optional_tail_turns)
+            + list(tail)
+            + [{**row, "role": "user"} for row in coalesced]
+        )
         await _ensure_runtime_mode()
         await _renew_lease()
         await asyncio.to_thread(_emit_status, user_id, job_id, "writing_reply")

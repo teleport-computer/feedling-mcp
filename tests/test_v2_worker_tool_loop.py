@@ -348,6 +348,69 @@ def test_single_round_plain_text_writes_exactly_one_bubble(monkeypatch):
     assert _job_status_row(job_id)[0] == "completed"
 
 
+def test_language_follow_emits_once_for_terminal_visible_body_after_thinking(
+    monkeypatch,
+):
+    uid = "u_toolloop_language_follow_once"
+    conftest.seed_user(uid)
+    _reset(uid)
+    jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("w-language-follow")
+    _patch_real_write(monkeypatch)
+    _stub_envelope_build(monkeypatch)
+    monkeypatch.setattr(
+        cap_registry,
+        "run_capability",
+        lambda *_args, **_kwargs: _FakeCapResult({"snippet": "result"}),
+    )
+    private_thinking = "这是绝对不能参与回复文字系统分类的私密中文思考内容"
+    _script_provider(monkeypatch, [
+        _tool_round(
+            _tc("r1", "reply", text="我先查一下"),
+            _tc("s1", "web_search", query="x"),
+        ),
+        _text_round(
+            f"<think>{private_thinking}</think>"
+            "This is the final visible English response"
+        ),
+    ])
+    traces = []
+    deps = _deps(messages=[{
+        "id": "m-language-follow",
+        "ts": 10.0,
+        "role": "user",
+        "content": "Please search for the requested information",
+    }])
+    deps.emit_debug_trace = lambda user_id, event_type, **fields: traces.append(
+        {"user_id": user_id, "type": event_type, **fields}
+    )
+
+    status = asyncio.run(worker.process_job(
+        job,
+        deps,
+        provider_config=_BYOK,
+        api_key=None,
+        runtime_token="rt",
+    ))
+
+    assert status == "completed", _job_status_row(job["id"])
+    assert [row["body_ct"] for row in _bubbles(uid)] == [
+        "我先查一下",
+        "This is the final visible English response",
+    ]
+    language_traces = [
+        trace for trace in traces if trace["type"] == "reply.language_follow"
+    ]
+    assert len(language_traces) == 1
+    assert language_traces[0]["detail"] == {
+        "user_script": "latin",
+        "reply_script": "latin",
+        "outcome": "match",
+        "lane": "chat",
+    }
+    assert private_thinking not in json.dumps(language_traces, ensure_ascii=False)
+
+
 def test_chat_tool_surface_keeps_memory_delete(monkeypatch):
     """Foreground Chat retains the destructive operation Seven left enabled."""
     uid = "u_chat_keeps_memory_delete"
