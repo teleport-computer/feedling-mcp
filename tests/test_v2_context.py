@@ -182,10 +182,13 @@ def test_memory_search_positive_rule_is_adjacent_to_small_talk_gate():
     )
 
 
-def test_final_system_policy_blocks_never_mix_writing_systems():
+def test_final_system_policy_blocks_never_mix_writing_systems(monkeypatch):
+    monkeypatch.delenv("FEEDLING_V2_SELF_THINKING", raising=False)
     user_authored_mixed_block = "汉汉汉汉汉abcde"
     messages = context.build_turn_messages(
-        system_prompt=context.CHAT_SYSTEM_PROMPT,
+        system_prompt=context.chat_system_prompt(
+            SimpleNamespace(model="deepseek-chat")
+        ),
         summary="",
         tail=[],
         trusted_system_blocks=(user_authored_mixed_block,),
