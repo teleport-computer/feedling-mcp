@@ -25,7 +25,11 @@ def test_write_gate_allows_writes_with_authorization():
 
 
 def test_write_gate_refuses_background_identity_writes_only():
-    for tool_name in ("identity_patch", "identity_nudge"):
+    for tool_name in (
+        "identity_patch",
+        "identity_nudge",
+        "identity_dimensions_set",
+    ):
         allowed, reason = prov.write_gate(
             tool_name,
             turn_authorization=True,
@@ -87,7 +91,13 @@ def test_write_gate_refuses_only_memory_delete_when_background_delete_is_disable
 
 
 def test_write_gate_refuses_writes_without_authorization():
-    for w in ("memory_write", "identity_patch", "schedule_wake", "cancel_wake"):
+    for w in (
+        "memory_write",
+        "identity_patch",
+        "identity_dimensions_set",
+        "schedule_wake",
+        "cancel_wake",
+    ):
         allowed, reason = prov.write_gate(w, turn_authorization=False)
         assert allowed is False and "authorization" in reason
 

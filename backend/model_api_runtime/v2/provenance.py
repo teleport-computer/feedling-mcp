@@ -21,7 +21,11 @@ INTERNAL = "internal"
 # A child summary can contain remote web text or user-editable workspace/memory
 # content. Treat it exactly like other external model input in the parent loop.
 EXTERNAL_READS = frozenset({"web_search", "web_fetch", "task"})
-IDENTITY_WRITE_ACTIONS = frozenset({"identity_patch", "identity_nudge"})
+IDENTITY_WRITE_ACTIONS = frozenset({
+    "identity_patch",
+    "identity_nudge",
+    "identity_dimensions_set",
+})
 
 
 def provenance_for_read(tool_name: str) -> str:
