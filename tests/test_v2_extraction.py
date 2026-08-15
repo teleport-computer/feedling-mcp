@@ -200,7 +200,173 @@ def test_extract_attributes_length_stop_before_parsing_and_records_safe_shape(
     }
     assert parsed is None and err == "output_truncated"
     assert details == [expected]
-    assert events == [expected]
+    assert events == [{**expected, "attempt": 1}]
+
+
+def test_extract_retries_truncated_output_once_with_same_budget_and_recovers(
+    monkeypatch,
+):
+    limit = extraction.DREAM_MAX_OUTPUT_TOKENS
+    calls = []
+
+    async def _responses(_cfg, messages, **kwargs):
+        calls.append((messages[0]["content"], kwargs["max_tokens"]))
+        if len(calls) == 1:
+            return {
+                "reply": '{"consolidations":[{"result":{"summary":"half',
+                "stop_reason": "length",
+                "usage": {"completion_tokens": limit},
+            }
+        return {
+            "reply": '{"consolidations":[]}',
+            "stop_reason": "end_turn",
+            "usage": {"completion_tokens": 12},
+        }
+
+    monkeypatch.setattr(
+        extraction.provider_client,
+        "reliable_chat_completion_async",
+        _responses,
+    )
+    events = []
+    parsed_replies = []
+
+    async def _record(kind, payload):
+        if kind.startswith("extraction_output_"):
+            events.append((kind, payload))
+
+    def _parse(raw):
+        parsed_replies.append(raw)
+        return (["ok"], None)
+
+    parsed, err = asyncio.run(
+        extraction.extract(
+            provider_config=object(),
+            prompt="P",
+            parse=_parse,
+            max_tokens=limit,
+            trajectory_out=_record,
+            parse_retry=extraction.ParseRetry(
+                should_retry=lambda _err: True,
+                build_prompt=lambda prompt, _err: prompt + "|format",
+                parse=lambda _raw: (["retry-parser"], None),
+                build_truncation_prompt=lambda prompt: prompt + "|更简洁并闭合 JSON",
+            ),
+        )
+    )
+
+    assert parsed == ["ok"] and err is None
+    assert parsed_replies == ['{"consolidations":[]}']
+    assert calls == [
+        ("P", limit),
+        ("P|更简洁并闭合 JSON", limit),
+    ]
+    assert events == [
+        (
+            "extraction_output_truncated",
+            {
+                "stop_reason": "length",
+                "completion_tokens": limit,
+                "max_tokens": limit,
+                "attempt": 1,
+            },
+        ),
+        (
+            "extraction_output_truncation_retry",
+            {
+                "attempt": 2,
+                "strategy": "concise_prompt",
+                "max_tokens": limit,
+            },
+        ),
+    ]
+
+
+def test_extract_stops_after_second_truncation(monkeypatch):
+    limit = extraction.CAPTURE_MAX_OUTPUT_TOKENS
+    calls = 0
+
+    async def _truncated(_cfg, _messages, **_kwargs):
+        nonlocal calls
+        calls += 1
+        return {
+            "reply": '{"cards":[{"summary":"half',
+            "stop_reason": "length",
+            "usage": {"completion_tokens": limit},
+        }
+
+    monkeypatch.setattr(
+        extraction.provider_client,
+        "reliable_chat_completion_async",
+        _truncated,
+    )
+    events = []
+    details = []
+
+    async def _record(kind, payload):
+        if kind == "extraction_output_truncated":
+            events.append(payload)
+
+    parsed, err = asyncio.run(
+        extraction.extract(
+            provider_config=object(),
+            prompt="P",
+            parse=lambda _raw: (["never"], None),
+            max_tokens=limit,
+            trajectory_out=_record,
+            failure_detail_out=details.append,
+            parse_retry=extraction.ParseRetry(
+                should_retry=lambda _err: True,
+                build_prompt=lambda prompt, _err: prompt,
+                parse=lambda _raw: (["never"], None),
+                build_truncation_prompt=lambda prompt: prompt + "|concise",
+            ),
+        )
+    )
+
+    assert parsed is None and err == "output_truncated"
+    assert calls == 2
+    assert [event["attempt"] for event in events] == [1, 2]
+    assert details == [{
+        "stop_reason": "length",
+        "completion_tokens": limit,
+        "max_tokens": limit,
+    }]
+
+
+def test_extract_does_not_issue_third_call_after_truncation_retry_parse_error(
+    monkeypatch,
+):
+    calls = 0
+
+    async def _responses(_cfg, _messages, **_kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return {"reply": '{"cards":[', "stop_reason": "length"}
+        return {"reply": "still bad", "stop_reason": "end_turn"}
+
+    monkeypatch.setattr(
+        extraction.provider_client,
+        "reliable_chat_completion_async",
+        _responses,
+    )
+    parsed, err = asyncio.run(
+        extraction.extract(
+            provider_config=object(),
+            prompt="P",
+            parse=lambda _raw: (None, "invalid_card_content:summary_empty"),
+            parse_retry=extraction.ParseRetry(
+                should_retry=lambda _err: True,
+                build_prompt=lambda prompt, _err: prompt + "|format",
+                parse=lambda _raw: (["must-not-run"], None),
+                build_truncation_prompt=lambda prompt: prompt + "|concise",
+            ),
+        )
+    )
+
+    assert parsed is None and err == "invalid_card_content:summary_empty"
+    assert calls == 2
 
 
 def test_extract_attributes_length_stop_on_existing_parse_retry(monkeypatch):

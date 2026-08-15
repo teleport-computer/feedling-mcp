@@ -121,7 +121,8 @@ def test_extraction_lane_passes_its_own_output_budget(monkeypatch, lane):
     seen = []
 
     async def _fake_extract(**kwargs):
-        seen.append(kwargs["max_tokens"])
+        retry_prompt = kwargs["parse_retry"].build_truncation_prompt("P")
+        seen.append((kwargs["max_tokens"], retry_prompt))
         return [], None
 
     monkeypatch.setattr(extraction, "extract", _fake_extract)
@@ -136,7 +137,11 @@ def test_extraction_lane_passes_its_own_output_budget(monkeypatch, lane):
     )
 
     assert status == "completed"
-    assert seen == [extraction.max_output_tokens_for_lane(lane)]
+    assert len(seen) == 1
+    budget, retry_prompt = seen[0]
+    assert budget == extraction.max_output_tokens_for_lane(lane)
+    assert "截断" in retry_prompt
+    assert retry_prompt != "P"
 
 
 @pytest.mark.parametrize("lane", ["capture", "dream"])
