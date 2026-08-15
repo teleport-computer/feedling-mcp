@@ -434,6 +434,58 @@ def test_extraction_failure_is_silent_no_bubble_no_error_chip(monkeypatch, lane)
     assert row == ("failed", "extraction_failed:upstream_unavailable")
 
 
+def test_truncated_extraction_persists_content_free_failure_shape(monkeypatch):
+    uid = "u_x_truncated_dream"
+    _seed_v2(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, "dream")
+    job = jobs_store.claim_next_job("w")
+    limit = extraction.DREAM_MAX_OUTPUT_TOKENS
+
+    async def _truncated(**kwargs):
+        kwargs["failure_detail_out"]({
+            "stop_reason": "length",
+            "completion_tokens": limit,
+            "max_tokens": kwargs["max_tokens"],
+        })
+        return None, "output_truncated"
+
+    class Recorder:
+        def __init__(self):
+            self.events = []
+
+        async def record(self, kind, payload):
+            self.events.append((kind, payload))
+
+        async def record_best_effort(self, kind, payload):
+            await self.record(kind, payload)
+            return True
+
+    recorder = Recorder()
+    monkeypatch.setattr(extraction, "extract", _truncated)
+    status = asyncio.run(
+        worker.process_job(
+            job,
+            _deps(),
+            provider_config=_BYOK,
+            api_key=None,
+            runtime_token="rt",
+            trajectory_recorder=recorder,
+        )
+    )
+
+    assert status == "failed"
+    assert _job_row(job_id) == ("failed", "extraction_failed:output_truncated")
+    turn_error = next(payload for kind, payload in recorder.events if kind == "turn_exception")
+    assert turn_error == {
+        "stage": "extraction",
+        "error_class": "RuntimeError",
+        "error_code": "extraction_failed:output_truncated",
+        "stop_reason": "length",
+        "completion_tokens": limit,
+        "max_tokens": limit,
+    }
+
+
 def test_rejected_memory_write_fails_job_instead_of_marking_completed(monkeypatch):
     uid = "u_x_write_rejected"
     _seed_v2(uid)

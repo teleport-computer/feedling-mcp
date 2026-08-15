@@ -145,6 +145,7 @@ async def extract(
     progress_cb: Callable[[str, int], None] | None = None,
     usage_out: Callable[[dict | None], None] | None = None,
     trajectory_out: Callable[[str, dict], Awaitable[None]] | None = None,
+    failure_detail_out: Callable[[dict], None] | None = None,
     parse_retry: ParseRetry | None = None,
 ) -> tuple[Any, str | None]:
     """跑一次 BYOK 抽取调用并解析。**永不抛**——失败一律返回 (None, reason)。
@@ -158,8 +159,10 @@ async def extract(
     它们各有自己的重试与退避。
     """
 
-    async def _call(attempt_prompt: str) -> tuple[str | None, str | None]:
-        """跑一次 provider，返回 (reply, error_reason)。"""
+    async def _call(
+        attempt_prompt: str,
+    ) -> tuple[str | None, str | None, dict[str, Any]]:
+        """跑一次 provider，返回 reply、error 与 content-free 响应形状。"""
         messages = [{"role": "user", "content": attempt_prompt}]
         if trajectory_out is not None:
             await trajectory_out(
@@ -188,17 +191,47 @@ async def extract(
                 )
             if usage_out is not None:
                 usage_out(None)
-            return None, f"provider_call_failed:{error_code}"
+            return None, f"provider_call_failed:{error_code}", {}
         if usage_out is not None:
             usage_out(result.get("usage") if isinstance(result, dict) else None)
         if trajectory_out is not None:
             await trajectory_out("provider_response", {"response": result})
+        raw_stop_reason = str((result or {}).get("stop_reason") or "").strip().lower()
+        usage = (result or {}).get("usage")
+        raw_completion_tokens = (
+            usage.get("completion_tokens") if isinstance(usage, dict) else None
+        )
+        response_shape = {
+            "stop_reason": (
+                "length"
+                if raw_stop_reason == "length"
+                else ("other" if raw_stop_reason else "")
+            ),
+            "completion_tokens": (
+                max(0, int(raw_completion_tokens))
+                if isinstance(raw_completion_tokens, (int, float))
+                and not isinstance(raw_completion_tokens, bool)
+                else None
+            ),
+            "max_tokens": max_tokens,
+        }
         reply = str((result or {}).get("reply") or "").strip()
         if not reply:
-            return None, "empty_reply"
-        return reply, None
+            return None, "empty_reply", response_shape
+        return reply, None, response_shape
 
-    reply, call_error = await _call(prompt)
+    async def _report_truncated(response_shape: dict[str, Any]) -> bool:
+        if response_shape.get("stop_reason") != "length":
+            return False
+        if failure_detail_out is not None:
+            failure_detail_out(dict(response_shape))
+        if trajectory_out is not None:
+            await trajectory_out("extraction_output_truncated", dict(response_shape))
+        return True
+
+    reply, call_error, response_shape = await _call(prompt)
+    if await _report_truncated(response_shape):
+        return None, "output_truncated"
     if call_error is not None:
         return None, call_error
     parsed = parse(reply)
@@ -209,9 +242,11 @@ async def extract(
             return None, str(err)
         if trajectory_out is not None:
             await trajectory_out("parse_bounced", {"reason": str(err)})
-        retry_reply, retry_call_error = await _call(
+        retry_reply, retry_call_error, _retry_response_shape = await _call(
             parse_retry.build_prompt(prompt, str(err))
         )
+        if await _report_truncated(_retry_response_shape):
+            return None, "output_truncated"
         if retry_call_error is not None:
             # 重问这一跳自己挂了：如实报重问的失败原因，别把它伪装成原来的格式问题。
             return None, retry_call_error
@@ -235,9 +270,11 @@ async def extract(
         await trajectory_out(
             "semantic_bounced", {"reason_count": len(semantic_reasons)}
         )
-    retry_reply, retry_call_error = await _call(
+    retry_reply, retry_call_error, _retry_response_shape = await _call(
         parse_retry.build_semantic_prompt(prompt, semantic_reasons)
     )
+    if await _report_truncated(_retry_response_shape):
+        return None, "output_truncated"
     if retry_call_error is not None:
         return None, retry_call_error
     retried = parse_retry.parse(retry_reply)

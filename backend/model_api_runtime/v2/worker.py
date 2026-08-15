@@ -1124,6 +1124,7 @@ _EXTRACTION_FAILURE_REASONS = frozenset(
         "missing_consolidations_list",
         "no_json_object",
         "not_an_object",
+        "output_truncated",
         "semantic_validation_failed_after_retry",
     }
 )
@@ -9128,6 +9129,7 @@ async def _run_extraction(
     「弱唤醒睡回去」同口径 —— 模型选择什么都不做，不是失败。
     """
     extraction_status_recorded = False
+    extraction_failure_detail: dict[str, Any] = {}
     capture_window: dict[str, Any] = {}
     # call_id -> 该通电话的全文明文。只在 capture lane 填充（见 enclave_sem 闸内）。
     voice_transcripts: dict[str, str] = {}
@@ -9498,6 +9500,7 @@ async def _run_extraction(
                     parse=parse,
                     parse_retry=parse_retry,
                     max_tokens=v2_extraction.max_output_tokens_for_lane(lane),
+                    failure_detail_out=extraction_failure_detail.update,
                     progress_cb=lambda stage, attempt: _report_turn_progress(
                         f"extraction_provider_{stage}_{attempt}"
                     ),
@@ -9627,6 +9630,7 @@ async def _run_extraction(
                 parse=parse,
                 parse_retry=parse_retry,
                 max_tokens=v2_extraction.max_output_tokens_for_lane(lane),
+                failure_detail_out=extraction_failure_detail.update,
                 progress_cb=lambda stage, attempt: _report_turn_progress(
                     f"extraction_provider_{stage}_{attempt}"
                 ),
@@ -9886,14 +9890,16 @@ async def _run_extraction(
                     lane,
                     type(status_exc).__name__.lower(),
                 )
+        failure_payload = {
+            "stage": "extraction",
+            "error_class": type(e).__name__,
+            "error_code": code,
+        }
+        failure_payload.update(extraction_failure_detail)
         await _record_trajectory(
             trajectory_recorder,
             "turn_exception",
-            {
-                "stage": "extraction",
-                "error_class": type(e).__name__,
-                "error_code": code,
-            },
+            failure_payload,
             best_effort=True,
         )
         log.warning(
