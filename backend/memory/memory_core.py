@@ -32,6 +32,7 @@ from identity import service as identity_service
 from memory import actions as memory_actions_mod
 from memory import migration as memory_migration
 from memory import service as memory_service
+from memory import timestamps as memory_timestamps
 import memory_readside_core
 
 
@@ -276,9 +277,21 @@ def list_moments(store, *, limit_raw, since: str, include_archived_raw) -> tuple
     moments = memory_service._load_moments(store)
     if not include_archived:
         moments = memory_service._active_memory_moments(moments)
-    if since:
-        moments = [m for m in moments if m.get("occurred_at", "") >= since]
-    moments = sorted(moments, key=lambda m: m.get("occurred_at", ""), reverse=True)
+    since_ts = memory_timestamps.parse_ts(since)
+    if since_ts is not None:
+        moments = [
+            m
+            for m in moments
+            if (
+                occurred_ts := memory_timestamps.parse_ts(m.get("occurred_at"))
+            ) is not None
+            and occurred_ts >= since_ts
+        ]
+    moments = sorted(
+        moments,
+        key=lambda m: memory_timestamps.sort_key(m.get("occurred_at")),
+        reverse=True,
+    )
     return {"moments": moments[:limit], "total": len(moments)}, 200
 
 

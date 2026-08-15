@@ -9,6 +9,7 @@ from typing import Any, Callable
 import httpx
 
 from memory import service as memory_service
+from memory import timestamps as memory_timestamps
 
 
 MEMORY_READSIDE_DEFAULT_HARD_MAX = 1000
@@ -18,6 +19,14 @@ _INACTIVE_STATUSES = {
     "deleted",
     "superseded",
 }
+
+_TIME_FIELDS = (
+    "last_referenced_at",
+    "last_active",
+    "updated_at",
+    "occurred_at",
+    "created_at",
+)
 
 
 def _status(moment: dict) -> str:
@@ -31,25 +40,21 @@ def _float(value: Any, default: float = 0.0) -> float:
         return default
 
 
-def _time_key(moment: dict) -> str:
-    for key in ("last_referenced_at", "last_active", "updated_at", "occurred_at", "created_at"):
+def _time_key(moment: dict) -> tuple[bool, datetime]:
+    for key in _TIME_FIELDS:
         value = str(moment.get(key) or "").strip()
         if value:
-            return value
-    return ""
+            return memory_timestamps.sort_key(value)
+    return memory_timestamps.sort_key("")
+
+
+def _has_time_value(moment: dict) -> bool:
+    return any(str(moment.get(key) or "").strip() for key in _TIME_FIELDS)
 
 
 def _time_ts(moment: dict) -> float:
-    value = _time_key(moment)
-    if not value:
-        return 0.0
-    try:
-        dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return dt.timestamp()
-    except Exception:
-        return 0.0
+    valid, parsed = _time_key(moment)
+    return parsed.timestamp() if valid else float("-inf")
 
 
 def _now_iso() -> str:
@@ -62,7 +67,7 @@ def _now_ts() -> float:
 
 def _decay_multiplier(moment: dict) -> float:
     importance = _float(moment.get("importance"), 0.5)
-    if not _time_key(moment):
+    if not _has_time_value(moment):
         return 1.0
     last_ref_ts = _time_ts(moment)
     age_days = max(0.0, (_now_ts() - last_ref_ts) / 86400.0)

@@ -165,6 +165,42 @@ def test_memory_list_returns_clean_v1_cards_without_legacy_type(monkeypatch):
     assert "type" not in body["moments"][0]
 
 
+def test_memory_list_compares_parsed_instants_and_puts_garbage_last(monkeypatch):
+    store = types.SimpleNamespace(user_id="usr_list_times")
+    monkeypatch.setattr(memory_service, "_load_moments", lambda _store: [
+        {"id": "bad", "status": "active", "occurred_at": "garbage"},
+        {
+            "id": "older_offset",
+            "status": "active",
+            "occurred_at": "2026-08-13T20:00:00+08:00",
+        },
+        {"id": "newer_z", "status": "active", "occurred_at": "2026-08-13T13:00:00Z"},
+        {"id": "date_only", "status": "active", "occurred_at": "2026-08-13"},
+    ])
+
+    all_cards, status = memory_core.list_moments(
+        store,
+        limit_raw=20,
+        since="",
+        include_archived_raw=True,
+    )
+    filtered, filtered_status = memory_core.list_moments(
+        store,
+        limit_raw=20,
+        since="2026-08-13T12:30:00Z",
+        include_archived_raw=True,
+    )
+
+    assert status == filtered_status == 200
+    assert [card["id"] for card in all_cards["moments"]] == [
+        "newer_z",
+        "older_offset",
+        "date_only",
+        "bad",
+    ]
+    assert [card["id"] for card in filtered["moments"]] == ["newer_z"]
+
+
 def test_memory_verify_degrades_for_clean_v1_cards(monkeypatch):
     store = types.SimpleNamespace(user_id="usr_verify")
     monkeypatch.setattr(identity_service, "_relationship_age_days", lambda _store: 1)
