@@ -30,7 +30,7 @@ def _ok(*, generated_at: str, count: int = 5, updated: str = "u5"):
             "retry_not_before": 0,
         },
         memory_text="共同事实",
-        user_text="沟通方式",
+        style_text="沟通方式",
         seal_text=_seal,
     )
 

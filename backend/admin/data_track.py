@@ -1703,14 +1703,20 @@ def _v2_profile_detail(user_id: str) -> dict:
     memory = document.get("memory")
     if not isinstance(memory, dict):
         memory = {}
-    user = document.get("user")
-    if not isinstance(user, dict):
-        user = {}
+    style = document.get("style")
+    if not isinstance(style, dict):
+        # Legacy USER survives until the user's next successful redistill.
+        style = document.get("user")
+    if not isinstance(style, dict):
+        style = {}
+    style_chars = _count(style.get("chars"))
 
     return {
         "state": state,
         "memory_chars": _count(memory.get("chars")),
-        "user_chars": _count(user.get("chars")),
+        "style_chars": style_chars,
+        # One-version compatibility alias for external admin consumers.
+        "user_chars": style_chars,
         "source": {
             "card_count": _count(source.get("card_count")),
             "max_updated_at": str(source.get("max_updated_at") or ""),

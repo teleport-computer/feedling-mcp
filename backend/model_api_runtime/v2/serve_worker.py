@@ -187,11 +187,8 @@ def _load_workspace_prompt(store, *, runtime_token: str) -> dict:
     """Render one authoritative workspace prompt snapshot for a turn.
 
     Skill entries come only from the backend's read-only ``/skills`` namespace
-    and therefore retain system authority. Agent-editable ``WORKING.md`` stays
-    encrypted at rest and is available through ``workspace_read``; it is not
-    eagerly injected, because persistent untrusted text must not be able to
-    choose a future outbound web/MCP/subagent call. Any malformed/unknown skill
-    block fails the turn instead of silently dropping policy.
+    and therefore retain system authority. Any malformed/unknown skill block
+    fails the turn instead of silently dropping policy.
     """
     backend = production_workspace_backend(
         store, runtime_token=str(runtime_token or "")
@@ -203,18 +200,12 @@ def _load_workspace_prompt(store, *, runtime_token: str) -> dict:
         # prompt and runtime policy, restoring V1's persona-first ordering.
         # Persona remains outside runtime-data and profile truncation.
         trusted_system_blocks.append(persona)
-    for block in render_trusted_prefix_blocks(
-        backend,
-        include_working_memory=False,
-    ):
+    for block in render_trusted_prefix_blocks(backend):
         if block.name.startswith("skill:/skills/"):
             trusted_system_blocks.append(block.content)
             continue
         raise RuntimeError("invalid workspace prompt block")
-    return {
-        "trusted_system_blocks": tuple(trusted_system_blocks),
-        "working_memory": "",
-    }
+    return {"trusted_system_blocks": tuple(trusted_system_blocks)}
 
 
 def _load_workspace_file(
@@ -1646,7 +1637,7 @@ def _select_agent_profile_for_turn(
         )
 
     with core_enclave.coalesced_success_trace("v2_profile_memory_read"):
-        with core_enclave.coalesced_success_trace("v2_profile_user_read"):
+        with core_enclave.coalesced_success_trace("v2_profile_style_read"):
             return v2_profile_store.select_profile_for_turn(
                 user_id,
                 summary,

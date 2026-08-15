@@ -116,10 +116,12 @@ def test_transient_retry_uses_bounded_exponential_delay(previous_attempts, delay
         "reply_not_text",
         "reply_empty",
         "reply_not_json",
-        "missing_field:user",
+        "missing_field:style",
         "field_empty:memory",
-        "placeholder_detected:user",
+        "placeholder_detected:style",
         "memory_chars_over_budget:9001",
+        "style_chars_over_budget:9001",
+        # Legacy stored code remains retryable during natural redistillation.
         "user_chars_over_budget:9001",
     ],
 )
