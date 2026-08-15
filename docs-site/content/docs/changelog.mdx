@@ -10,6 +10,13 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **Hosted Runtime V2 now keeps tool-selection timing beside each provider-visible
+  tool schema.** Memory, web, perception, screen, file-delivery, reminder, and
+  identity call conditions moved out of the general system prompt and into the
+  corresponding tool descriptions without changing their selection rules. The
+  stable system prompt now carries companion behavior independently of which
+  tools are offered on a turn.
+
 - **Hosted Runtime V2 now separates platform behavior from protocol and user
   content by language.** Companion-speaking and response-behavior guidance is
   written in Chinese, machine labels and tool-timing protocol remain in
