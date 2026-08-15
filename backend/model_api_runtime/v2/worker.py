@@ -9390,6 +9390,7 @@ async def _run_extraction(
                     prompt=prompt,
                     parse=parse,
                     parse_retry=parse_retry,
+                    max_tokens=v2_extraction.max_output_tokens_for_lane(lane),
                     progress_cb=lambda stage, attempt: _report_turn_progress(
                         f"extraction_provider_{stage}_{attempt}"
                     ),
@@ -9518,6 +9519,7 @@ async def _run_extraction(
                 prompt=prompt,
                 parse=parse,
                 parse_retry=parse_retry,
+                max_tokens=v2_extraction.max_output_tokens_for_lane(lane),
                 progress_cb=lambda stage, attempt: _report_turn_progress(
                     f"extraction_provider_{stage}_{attempt}"
                 ),
