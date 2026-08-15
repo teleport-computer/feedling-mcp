@@ -1801,6 +1801,35 @@ def _extract_reply(body: dict[str, Any], *, required: bool = True) -> str:
                 content = message.get("content")
                 if isinstance(content, str) and content.strip():
                     return content.strip()
+                if isinstance(content, list):
+                    any_typed = any(
+                        str(part.get("type") or "").strip()
+                        for part in content
+                        if isinstance(part, dict)
+                    )
+                    text_parts: list[str] = []
+                    for part in content:
+                        if not isinstance(part, dict):
+                            continue
+                        part_type = str(part.get("type") or "").strip().lower()
+                        # Some OpenAI-compatible relays return reasoning and
+                        # visible text as sibling content blocks. Reasoning is
+                        # extracted separately and must never leak into reply.
+                        if "reason" in part_type or "think" in part_type:
+                            continue
+                        # A lone untyped block is a compatibility shape used by
+                        # minimal relays. Mixed typed/untyped output is ambiguous:
+                        # exclude the untyped siblings instead of risking hidden
+                        # reasoning entering the visible reply.
+                        if not part_type and any_typed:
+                            continue
+                        if part_type not in {"", "text", "output_text"}:
+                            continue
+                        part_text = part.get("text")
+                        if isinstance(part_text, str) and part_text.strip():
+                            text_parts.append(part_text.strip())
+                    if text_parts:
+                        return "\n".join(text_parts).strip()
             text = first.get("text")
             if isinstance(text, str) and text.strip():
                 return text.strip()
