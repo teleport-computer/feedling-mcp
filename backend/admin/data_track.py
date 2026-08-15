@@ -8034,6 +8034,7 @@ _DEBUG_STEP_LABELS = {
     "memory.capture.done": ("🧩", "记忆抓取 · 完成"),
     "memory.index.called": ("🧩", "浏览记忆总览"),
     "memory.search.called": ("🔍", "搜索记忆"),
+    "memory.content.truncation": ("✂️", "记忆卡截断"),
     "context.truncation": ("✂️", "上下文裁剪"),
 }
 _DEBUG_SUBSYSTEM_FALLBACK = {

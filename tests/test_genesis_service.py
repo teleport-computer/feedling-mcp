@@ -1103,6 +1103,54 @@ def test_apply_memory_outputs_batches_memory_actions(monkeypatch):
     assert calls[0][0]["memory"]["occurred_at"] == ""
 
 
+def test_apply_memory_outputs_truncation_emits_genesis_counts_without_behavior_change(monkeypatch):
+    calls = []
+    events = []
+
+    def fake_execute(_store, _api_key, actions):
+        calls.append(actions)
+        return {"status": "ok", "results": [{"memory": {"id": "m1"}}]}, 200
+
+    monkeypatch.setattr(service.memory_actions, "_execute_memory_actions", fake_execute)
+    monkeypatch.setattr(
+        service.memory_actions.debug_trace,
+        "trace_event",
+        lambda _store, **event: events.append(event),
+    )
+    secret = "T074_GENESIS_SECRET_MUST_NOT_REACH_TRACE"
+    raw_content = ("y" * 5007) + secret
+
+    count, results = service.apply_memory_outputs(
+        _store(),
+        "api_key",
+        {"memories": [{
+            "type": "fact",
+            "summary": "Imported long card",
+            "content": raw_content,
+        }]},
+    )
+
+    assert count == 1
+    assert results == [{"memory": {"id": "m1"}}]
+    assert calls[0][0]["memory"]["content"] == raw_content[:5000]
+    assert events == [{
+        "subsystem": "memory",
+        "type": "memory.content.truncation",
+        "actor": "backend",
+        "status": "warning",
+        "summary": "",
+        "explain": "",
+        "detail": {
+            "route": "genesis_history_import",
+            "counts": {
+                "original_chars": len(raw_content),
+                "truncated_chars": len(raw_content) - 5000,
+            },
+        },
+    }]
+    assert secret not in json.dumps(events, ensure_ascii=False)
+
+
 def test_apply_memory_outputs_preserves_memory_summary_dates_tags_and_fallback(monkeypatch):
     calls = []
 
