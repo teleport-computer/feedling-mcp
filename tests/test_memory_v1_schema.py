@@ -157,6 +157,30 @@ def test_memory_add_truncation_emits_content_free_counts_without_behavior_change
     assert secret not in json.dumps(events, ensure_ascii=False)
 
 
+def test_memory_add_truncation_trace_failure_does_not_block_write(monkeypatch):
+    store = types.SimpleNamespace(user_id="usr_v1_trace_failure")
+    saved = _install_memory_action_fakes(monkeypatch, [])
+
+    def fail_trace(*_args, **_kwargs):
+        raise RuntimeError("trace backend unavailable")
+
+    monkeypatch.setattr(memory_actions.debug_trace, "trace_event", fail_trace)
+    raw_content = "x" * 5017
+
+    body, status = memory_actions._execute_memory_actions(store, "api_key", [{
+        "type": "memory.add",
+        "memory": {
+            "summary": "Long card",
+            "content": raw_content,
+            "source": "chat",
+        },
+    }])
+
+    assert status == 200
+    assert body["status"] == "ok"
+    assert json.loads(saved[0]["body_ct"])["content"] == raw_content[:5000]
+
+
 def test_memory_add_preserves_explicit_empty_occurred_at(monkeypatch):
     store = types.SimpleNamespace(user_id="usr_v1")
     saved = _install_memory_action_fakes(monkeypatch, [])
