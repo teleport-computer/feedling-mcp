@@ -337,6 +337,56 @@ def test_dau_day_selector_and_invalid_day_parity(env):
     assert f_bad == a_bad == (400, {"error": "invalid_day"})
 
 
+def test_events_day_selector_shape_and_invalid_day(env, monkeypatch):
+    raw = {
+        "proactive": [{
+            "route": "model_api", "lane": "heartbeat", "total": 3,
+            "success": 2, "failed": 1, "pending": 0, "median_dur": 4.5,
+        }],
+        "capture": [{
+            "route": "resident", "total": 7, "success": 5,
+            "failed": 2, "median_dur": 8.0,
+        }],
+        "genesis": [{
+            "route": "resident", "distill": "first", "total": 1,
+            "success": 1, "failed": 0,
+        }],
+        "reply": [{
+            "route": "model_api", "user_msgs": 4, "real_replies": 3,
+            "fallback_replies": 1, "median_latency": 2.0,
+        }],
+    }
+    seen_days = []
+
+    def fake_overview(*, day, tz="Asia/Shanghai"):
+        seen_days.append((day, tz))
+        return raw
+
+    monkeypatch.setattr(db, "admin_events_overview", fake_overview)
+    path = "/v1/admin/data-track/events?day=2035-05-06"
+    expected = {
+        "filters": {"day": "2035-05-06", "timezone": "Asia/Shanghai"},
+        **raw,
+    }
+    assert _flask_get_json(path, headers=_admin()) == (200, expected)
+    assert _asgi_json("GET", path, headers=_admin()) == (200, expected)
+    assert seen_days == [
+        ("2035-05-06", "Asia/Shanghai"),
+        ("2035-05-06", "Asia/Shanghai"),
+    ]
+
+    invalid_path = "/v1/admin/data-track/events?day=2035-02-30"
+    assert _flask_get_json(invalid_path, headers=_admin()) == (
+        400,
+        {"error": "invalid_day"},
+    )
+    assert _asgi_json("GET", invalid_path, headers=_admin()) == (
+        400,
+        {"error": "invalid_day"},
+    )
+    assert len(seen_days) == 2
+
+
 def test_user_detail_parity(env):
     uid, _key = _register()
     f = _flask_get_json(f"/v1/admin/data-track/users/{uid}", headers=_admin())
@@ -865,6 +915,7 @@ def test_admin_delete_user_archive_failure_aborts(env, monkeypatch):
     "path,method",
     [
         ("/v1/admin/data-track/summary", "GET"),
+        ("/v1/admin/data-track/events", "GET"),
         ("/admin/data-track", "GET"),
         ("/v1/admin/store/evict", "POST"),
         ("/v1/admin/users/usr_admin_delete/delete", "POST"),
