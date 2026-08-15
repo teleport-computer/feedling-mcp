@@ -424,6 +424,28 @@ def test_parse_openai_compat_body_result_shape():
             provider="openrouter", model="m", require_reply=False)
 
 
+def test_parse_openai_compat_body_preserves_all_visible_text_blocks():
+    resp = FakeResponse(200, {
+        "id": "chatcmpl-blocks",
+        "choices": [{
+            "message": {
+                "content": [
+                    {"type": "text", "text": "first visible block"},
+                    {"type": "reasoning", "text": "hidden chain of thought"},
+                    {"type": "output_text", "text": "second visible block"},
+                ],
+            },
+            "finish_reason": "stop",
+        }],
+    })
+
+    out = pc._parse_openai_compat_body(
+        resp, provider="openai_compatible", model="gpt-5.5", require_reply=True)
+
+    assert out["reply"] == "first visible block\nsecond visible block"
+    assert out["reasoning"] == "hidden chain of thought"
+
+
 def test_parse_deepseek_body_extracts_reasoning_content():
     resp = FakeResponse(200, {
         "id": "chatcmpl-deepseek",
