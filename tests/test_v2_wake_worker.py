@@ -243,6 +243,7 @@ def test_run_wake_reply_written_and_job_completed(monkeypatch):
     assert _job_status(job_id)[0] == "completed"
     system_msg = next(m for m in seen["messages"] if m["role"] == "system")
     assert worker._WAKE_SYSTEM_PROMPT in system_msg["content"]
+    assert worker._OPTIONAL_WAKE_SELF_THINKING_INSTRUCTION in system_msg["content"]
     assert [
         message["content"]
         for message in seen["messages"]
@@ -964,7 +965,9 @@ def test_heartbeat_thinking_only_is_successful_silence_without_backoff(
     _reset(uid)
     job_id, _ = jobs_store.enqueue_job(uid, "heartbeat")
     claimed_by = _claim(job_id)
-    _script_provider(monkeypatch, [_text_round("<think>这次不打扰她了</think>")])
+    calls = _script_provider(
+        monkeypatch, [_text_round("<think>这次不打扰她了</think>")]
+    )
     writes = []
     monkeypatch.setattr(
         worker,
@@ -990,6 +993,14 @@ def test_heartbeat_thinking_only_is_successful_silence_without_backoff(
     assert status == "completed"
     assert _job_status(job_id) == ("completed", None)
     assert writes == []
+    system_text = "\n".join(
+        str(message.get("content") or "")
+        for message in calls[0]["messages"]
+        if message.get("role") == "system"
+    )
+    assert worker._OPTIONAL_WAKE_SELF_THINKING_INSTRUCTION in system_text
+    assert "nothing after its closing tag" in system_text
+    assert "the user receives nothing from that turn" in system_text
     schedule = jobs_store.get_wake_schedule(uid)
     assert schedule is None or schedule["proactive_backoff_until"] is None
 
@@ -1001,7 +1012,9 @@ def test_scheduled_thinking_only_remains_a_must_deliver_failure(monkeypatch):
     _reset(uid)
     job_id, _ = jobs_store.enqueue_job(uid, "scheduled")
     claimed_by = _claim(job_id)
-    _script_provider(monkeypatch, [_text_round("<think>提醒必须送达</think>")])
+    calls = _script_provider(
+        monkeypatch, [_text_round("<think>提醒必须送达</think>")]
+    )
     writes = []
     monkeypatch.setattr(
         worker,
@@ -1026,6 +1039,12 @@ def test_scheduled_thinking_only_remains_a_must_deliver_failure(monkeypatch):
     # 剥空的,与「provider 什么都没给」必须能在 admin 上分开看(归因仍是 system)。
     assert _job_status(job_id) == ("failed", "wake_failed:thinking_only_no_reply")
     assert writes == []
+    system_text = "\n".join(
+        str(message.get("content") or "")
+        for message in calls[0]["messages"]
+        if message.get("role") == "system"
+    )
+    assert worker._OPTIONAL_WAKE_SELF_THINKING_INSTRUCTION not in system_text
     assert jobs_store.get_wake_schedule(uid)["proactive_backoff_until"] is not None
 
 

@@ -1189,6 +1189,11 @@ def model_api_setup(store, payload: dict, *, caller_api_key: str | None) -> tupl
     if cohort_error is not None:
         return cohort_error
     accounts_onboarding._save_onboarding_route(store, "model_api")
+    hosted_config_store.enqueue_profile_best_effort(
+        store.user_id,
+        reason="provider_config_changed",
+        force_ready=True,
+    )
     print(f"[model_api:{store.user_id}] setup provider={provider} model={model}")
 
     route = hosted_config_store.load_active_route(store)
@@ -2291,6 +2296,11 @@ def model_api_route_activate(store, route_id: str, *, caller_api_key: str | None
     if cohort_error is not None:
         return cohort_error
     accounts_onboarding._save_onboarding_route(store, "model_api")
+    hosted_config_store.enqueue_profile_best_effort(
+        store.user_id,
+        reason="provider_config_changed",
+        force_ready=True,
+    )
     # V2 provider config is pinned once per turn. The fence+restore above bumps
     # its generation around activation, so a turn on the old route can spend
     # provider quota but cannot commit a reply/tool effect after this endpoint

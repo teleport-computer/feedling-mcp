@@ -16,7 +16,15 @@ import asyncio
 import math
 import threading
 
-from model_api_runtime.v2 import claim_recovery, slot_protocol, watchdog
+import db
+from conftest import seed_user
+from model_api_runtime.v2 import (
+    claim_recovery,
+    jobs_store,
+    serve_worker,
+    slot_protocol,
+    watchdog,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -169,6 +177,30 @@ def test_profile_batch_progress_survives_heavy_stall_but_absolute_budget_wins():
         turn_stall_timeout_sec=120.0,
         turn_absolute_timeout_sec=1200.0,
     ) is True
+
+
+def test_jobs_claimable_ignores_future_pending_job():
+    uid = "u_watchdog_delayed_profile"
+    seed_user(uid)
+    with db.get_pool().connection() as conn:
+        conn.execute("DELETE FROM agent_jobs")
+        conn.execute(
+            "INSERT INTO v2_runtime_state "
+            "(user_id,hosted_runtime_state,runtime_generation) "
+            "VALUES (%s,'v2',1) ON CONFLICT (user_id) DO UPDATE SET "
+            "hosted_runtime_state='v2',runtime_generation=1",
+            (uid,),
+        )
+    job_id, _ = jobs_store.enqueue_job(uid, "profile", reason="retry")
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            "UPDATE agent_jobs "
+            "SET available_at=clock_timestamp()+interval '1 hour' WHERE id=%s",
+            (job_id,),
+        )
+
+    assert jobs_store.pending_job_count() == 0
+    assert serve_worker._jobs_claimable() is False
 
 
 # ---------------------------------------------------------------------------

@@ -163,6 +163,7 @@ def test_screen_watch_turn_passes_safe_screen_context_and_its_own_prompt(monkeyp
     system_msg = next(m for m in seen["messages"] if m["role"] == "system")
     assert system_msg["content"] is not None
     assert "watching the screen" in system_msg["content"]  # _SCREEN_WATCH_SYSTEM_PROMPT, not _WAKE_SYSTEM_PROMPT
+    assert worker._OPTIONAL_WAKE_SELF_THINKING_INSTRUCTION in system_msg["content"]
     joined = " ".join(str(m.get("content", "")) for m in seen["messages"])
     assert "a stack trace" not in joined                    # caption is pull-only
     assert '"recent_count":1' in joined

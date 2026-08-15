@@ -76,6 +76,16 @@ def test_non_dry_run_replicate_wrong_confirm_literal_is_400(client, monkeypatch)
 
 def test_verify_never_needs_confirm_even_with_dry_run_false(client, monkeypatch):
     _set_admin_token(monkeypatch)
+    calls = []
+
+    def _stub(**kwargs):
+        calls.append(kwargs)
+        return {"tables": [], "failures": 0}
+
+    # This is an endpoint guardrail test, not a verifier integration test.
+    # Keep it independent of rows left by earlier tests in the session and
+    # prove that the requested sampling policy reaches the verifier boundary.
+    monkeypatch.setattr("tee_shadow.verify.run", _stub)
     res = client.post(
         "/v1/admin/tee-replication/run",
         headers=_admin_headers(),
@@ -85,6 +95,7 @@ def test_verify_never_needs_confirm_even_with_dry_run_false(client, monkeypatch)
     body = res.get_json()
     assert body["action"] == "verify"
     assert body["dry_run"] is False
+    assert calls == [{"sample_rate": 0.0}]
 
 
 def test_dry_run_must_be_json_bool(client, monkeypatch):
