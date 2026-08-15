@@ -10,6 +10,13 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **Optional Runtime V2 proactive wakes now describe silence unambiguously.**
+  Heartbeat, manual-wake, and screen-watch turns tell the model that choosing
+  silence means returning only its private thinking block, which is discarded
+  without creating a chat item, thinking UI, or notification. Choosing to speak
+  still produces the ordinary visible reply, while scheduled reminders retain
+  their required-delivery contract.
+
 - **Runtime V2 background wake turns cannot delete memory cards.** Heartbeat,
   scheduled, manual-wake, and screen-watch turns retain memory add and update
   tools, but deletion is absent from their provider tool schema and rejected at
