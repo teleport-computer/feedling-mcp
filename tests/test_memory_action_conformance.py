@@ -4,6 +4,7 @@ import sys
 import os
 from pathlib import Path
 
+import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 sys.path.insert(0, str(Path(__file__).parent.parent / "tools"))
@@ -34,6 +35,9 @@ def test_route_b_memory_create_coerces_to_clean_v1_add():
     )
 
     assert coerced is not None
+    occurred_at = coerced["executor_action"]["memory"]["occurred_at"]
+    assert "T" in occurred_at
+    assert occurred_at.endswith("Z")
     assert coerced["executor_action"] == {
         "type": "memory.add",
         "memory": {
@@ -72,6 +76,80 @@ def test_route_b_memory_patch_coerces_to_supersede_not_content_patch():
     assert coerced["executor_action"]["type"] == "memory.supersede"
     assert coerced["executor_action"]["supersedes"] == "mem_old"
     assert coerced["executor_action"]["memory"]["summary"] == "蛋子是一只比熊。"
+
+
+@pytest.mark.parametrize(
+    "action,candidates",
+    [
+        (
+            {
+                "type": "memory.create",
+                "payload": {
+                    "summary": "New fact",
+                    "content": "New fact content",
+                    "occurred_at": "2026-08-15T20:00:00+08:00",
+                },
+            },
+            [],
+        ),
+        (
+            {
+                "type": "memory.supersede",
+                "target": {"memory_id": "mem_old"},
+                "payload": {
+                    "memory": {
+                        "summary": "Replacement",
+                        "content": "Replacement content",
+                        "occurred_at": "2026-08-15T20:00:00+08:00",
+                    }
+                },
+            },
+            [{"id": "mem_old"}],
+        ),
+        (
+            {
+                "type": "memory.patch",
+                "target": {"memory_id": "mem_old"},
+                "payload": {
+                    "patch": {
+                        "summary": "Patch",
+                        "content": "Patch content",
+                        "occurred_at": "2026-08-15T20:00:00+08:00",
+                    }
+                },
+            },
+            [{"id": "mem_old"}],
+        ),
+    ],
+)
+def test_route_b_memory_actions_normalize_caller_timestamp(action, candidates):
+    coerced = runtime.coerce_runtime_action(
+        action, candidates, direct_confidence=0.9
+    )
+
+    assert coerced is not None
+    assert (
+        coerced["executor_action"]["memory"]["occurred_at"]
+        == "2026-08-15T12:00:00Z"
+    )
+
+
+def test_route_b_memory_action_preserves_explicit_empty_occurred_at():
+    coerced = runtime.coerce_runtime_action(
+        {
+            "type": "memory.create",
+            "payload": {
+                "summary": "Undated fact",
+                "content": "The source does not provide an event date.",
+                "occurred_at": "",
+            },
+        },
+        [],
+        direct_confidence=0.9,
+    )
+
+    assert coerced is not None
+    assert coerced["executor_action"]["memory"]["occurred_at"] == ""
 
 
 def test_route_a_v2_normalizes_legacy_memory_action_names():

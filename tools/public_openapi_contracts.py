@@ -806,7 +806,15 @@ COMPONENT_SCHEMAS: dict[str, dict[str, Any]] = {
             "owner_user_id": {"type": "string"},
             "enclave_pk_fpr": {"type": "string"},
             "type": {"type": "string", "enum": ["moment", "quote", "fact", "event", "insight", "reflection"]},
-            "occurred_at": {"type": "string", "minLength": 1, "description": "Plaintext ISO-8601 ordering metadata."},
+            "occurred_at": {
+                "type": "string",
+                "minLength": 1,
+                "description": (
+                    "Plaintext ISO-8601 event time. Accepted datetime values are "
+                    "normalized to the equivalent UTC value with a Z suffix; "
+                    "date-only values remain date-only."
+                ),
+            },
             "source": {
                 "type": "string",
                 "enum": [

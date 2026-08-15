@@ -32,6 +32,7 @@ from psycopg.types.json import Jsonb
 
 import db
 from core import wake_bus
+from memory import timestamps as memory_timestamps
 from model_api_runtime.v2 import usage_reporting
 from notices import catalog as notices_catalog
 from proactive import capture_daily
@@ -2031,6 +2032,9 @@ def _validate_capture_actions(user_id: str, actions: list[dict]) -> list[dict]:
         ):
             if not envelope.get(field):
                 raise ValueError(f"capture envelope missing {field}")
+        occurred_at = memory_timestamps.normalize(envelope.get("occurred_at"))
+        if not occurred_at:
+            raise ValueError("capture envelope invalid occurred_at")
         if str(envelope["visibility"]) != "shared":
             raise ValueError("capture envelope must be shared")
         if str(envelope["type"]) not in {"moment", "quote", "fact", "event"}:
@@ -2052,6 +2056,7 @@ def _validate_capture_actions(user_id: str, actions: list[dict]) -> list[dict]:
                 if key in envelope
             },
         }
+        clean_action["envelope"]["occurred_at"] = occurred_at
         if action_type == "memory.supersede":
             clean_action["supersedes"] = targets
         normalized.append(clean_action)
@@ -2255,8 +2260,8 @@ def get_prepared_capture_batch(
 
 def _capture_memory_doc(user_id: str, action: dict) -> dict:
     envelope = dict(action["envelope"])
-    occurred_at = str(envelope["occurred_at"])
-    now_iso = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    occurred_at = memory_timestamps.normalize(envelope["occurred_at"])
+    now_iso = memory_timestamps.now_iso()
     doc = {
         "v": 1,
         "id": str(envelope["id"]),

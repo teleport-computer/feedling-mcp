@@ -324,7 +324,7 @@ def delete_moment(store, moment_id: str) -> tuple[dict, int]:
 
 def add(store, payload: dict) -> tuple[dict, int]:
     envelope = payload.get("envelope")
-    now = datetime.now().isoformat()
+    now = memory_timestamps.now_iso()
 
     if envelope is None:
         return {"error": "envelope required (v1 encryption is mandatory)"}, 400
@@ -337,7 +337,7 @@ def add(store, payload: dict) -> tuple[dict, int]:
         return {"error": "envelope.visibility must be 'shared' or 'local_only'"}, 400
     if envelope["visibility"] == "shared" and not envelope.get("K_enclave"):
         return {"error": "envelope with visibility=shared requires K_enclave"}, 400
-    occurred_at = (envelope.get("occurred_at") or "").strip()
+    occurred_at = memory_timestamps.normalize(envelope.get("occurred_at"))
     if not occurred_at:
         return {"error": "occurred_at required (plaintext metadata for ordering)"}, 400
     if envelope["owner_user_id"] != store.user_id:

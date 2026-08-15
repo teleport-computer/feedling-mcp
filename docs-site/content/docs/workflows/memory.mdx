@@ -141,6 +141,12 @@ The authenticated user must own every anchor. Reflection creation also has an
 endpoint-specific relationship-age cap and can return `429`; that response is
 not a generic service-wide rate limit.
 
+For new cards, datetime-valued `occurred_at` metadata is normalized to the same
+instant in UTC with a `Z` suffix. A date-only `YYYY-MM-DD` value remains
+date-only. The server stamps `created_at` in UTC with a `Z` suffix. Existing
+cards keep their stored timestamp strings when they are retyped, rewrapped, or
+otherwise updated; this does not backfill historical records.
+
 ```http
 HTTP/1.1 201 Created
 Content-Type: application/json
@@ -152,7 +158,7 @@ Content-Type: application/json
     "id": "mom_7f20d39af321",
     "type": "fact",
     "occurred_at": "2026-07-13T12:30:00Z",
-    "created_at": "2026-07-13T12:31:02.125000",
+    "created_at": "2026-07-13T12:31:02Z",
     "source": "live_conversation",
     "body_ct": "BASE64_CIPHERTEXT",
     "nonce": "BASE64_NONCE",
@@ -570,10 +576,14 @@ X-API-Key: YOUR_FEEDLING_API_KEY
 }
 ```
 
-`since` is compared with the ISO-8601 `occurred_at` metadata. Results are newest
-first, `limit` is capped at 200, and `total` is the number matching the filters
-before the page slice. This endpoint does not expose a universal cursor token;
-see [pagination rules](/docs/reliability#pagination).
+`since` and card `occurred_at` values are parsed as ISO-8601 instants before
+comparison, so equivalent `Z`, offset, and legacy naive datetime strings sort
+consistently. Date-only values are interpreted at UTC midnight. Invalid card
+timestamps sort after valid timestamps and are excluded when a valid `since`
+filter is active. Results are newest first, `limit` is capped at 200, and
+`total` is the number matching the filters before the page slice. This endpoint
+does not expose a universal cursor token; see
+[pagination rules](/docs/reliability#pagination).
 
 ## Retype an existing card
 

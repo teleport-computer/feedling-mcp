@@ -31,6 +31,13 @@ change must not be interpreted as an API guarantee.
   telemetry. Runtime-control, worker-liveness, kill-switch, and provider setup
   failures remain fail-closed before persistence.
 
+- **Memory Garden timestamps now compare and write consistently.** Reads parse
+  historical `Z`, offset, naive datetime, microsecond, and date-only values as
+  instants instead of ordering their strings; malformed values sort last. New
+  card datetime metadata is written in UTC with a `Z` suffix while date-only
+  and intentionally empty event dates retain their precision. Existing cards
+  are not backfilled when they are updated.
+
 - **Optional Runtime V2 proactive wakes now describe silence unambiguously.**
   Heartbeat, manual-wake, and screen-watch turns tell the model that choosing
   silence means returning only its private thinking block, which is discarded
