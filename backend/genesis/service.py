@@ -978,14 +978,21 @@ def _memory_occurred_at_from_output(
 def _memory_action_from_output(
     item: dict,
     *,
+    store: UserStore | None = None,
     preserve_dates: bool = False,
     fallback_occurred_at: str = "",
 ) -> dict:
     mem_type = _coerce_memory_type(item.get("type"))
+    if store is not None and item.get("content"):
+        memory_actions.trace_memory_content_truncation(
+            store,
+            item.get("content"),
+            route="genesis_history_import",
+        )
     memory = {
         "type": mem_type,
         "summary": _text(item.get("summary") or item.get("title") or item.get("description"), 2000),
-        "content": str(item.get("content") or "").strip()[:5000],
+        "content": str(item.get("content") or "").strip()[:memory_actions.MEMORY_CONTENT_MAX_CHARS],
         "bucket": _text(item.get("bucket"), 80),
         "threads": _memory_threads_from_output(item, preserve_tags=preserve_dates),
         "occurred_at": _memory_occurred_at_from_output(
@@ -1043,6 +1050,7 @@ def apply_memory_outputs(
         try:
             actions.append(_memory_action_from_output(
                 item,
+                store=store,
                 preserve_dates=item_preserve_dates,
                 fallback_occurred_at=effective_fallback_occurred_at,
             ))

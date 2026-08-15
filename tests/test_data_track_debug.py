@@ -99,6 +99,37 @@ def test_context_truncation_has_explicit_admin_label_and_visible_counts():
     }
 
 
+def test_memory_content_truncation_has_visible_route_and_counts_without_body():
+    secret = "T074_ADMIN_SECRET_MUST_NOT_APPEAR"
+    event = _event(
+        1,
+        "user_t074",
+        "memory.content.truncation",
+        trace_id="t074",
+        status="warning",
+        detail={
+            "route": "genesis_history_import",
+            "counts": {
+                "original_chars": 5042,
+                "truncated_chars": 42,
+            },
+        },
+        content_excerpt={},
+    )
+    event["unexpected_upstream_content"] = secret
+
+    assert data_track._debug_friendly_step(event) == ("✂️", "记忆卡截断")
+    public = data_track._debug_event_public_json(event)
+    assert public["detail"] == {
+        "route": "genesis_history_import",
+        "counts": {
+            "original_chars": 5042,
+            "truncated_chars": 42,
+        },
+    }
+    assert secret not in str(public)
+
+
 def test_query_fingerprint_is_visible_but_plaintext_query_stays_redacted():
     fingerprint = "0123456789ab"
 
