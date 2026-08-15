@@ -446,6 +446,23 @@ def test_parse_openai_compat_body_preserves_all_visible_text_blocks():
     assert out["reasoning"] == "hidden chain of thought"
 
 
+def test_parse_openai_compat_body_treats_untyped_text_block_as_visible():
+    """Accept minimal relay text blocks that omit ``type``.
+
+    This is an explicit compatibility tradeoff: an untyped reasoning block
+    would be indistinguishable from visible text. Unknown *typed* blocks remain
+    fail-closed, while observed minimal relays keep their ordinary reply text.
+    """
+    resp = FakeResponse(200, {
+        "choices": [{"message": {"content": [{"text": "visible relay text"}]}}],
+    })
+
+    out = pc._parse_openai_compat_body(
+        resp, provider="openai_compatible", model="relay-model", require_reply=True)
+
+    assert out["reply"] == "visible relay text"
+
+
 def test_parse_deepseek_body_extracts_reasoning_content():
     resp = FakeResponse(200, {
         "id": "chatcmpl-deepseek",
