@@ -12,6 +12,7 @@ def test_route_activation_repairs_model_api_onboarding_route(monkeypatch):
         "is_active": False,
     }
     selected_routes = []
+    profile_wakes = []
 
     monkeypatch.setattr(
         setup_core.db,
@@ -48,6 +49,11 @@ def test_route_activation_repairs_model_api_onboarding_route(monkeypatch):
         "_save_onboarding_route",
         lambda _store, value: selected_routes.append(value),
     )
+    monkeypatch.setattr(
+        setup_core.hosted_config_store,
+        "enqueue_profile_best_effort",
+        lambda uid, **kwargs: profile_wakes.append((uid, kwargs)) or True,
+    )
 
     body, status = setup_core.model_api_route_activate(
         SimpleNamespace(user_id="user-route-repair"),
@@ -58,3 +64,9 @@ def test_route_activation_repairs_model_api_onboarding_route(monkeypatch):
     assert status == 200
     assert body["active_route_id"] == route["id"]
     assert selected_routes == ["model_api"]
+    assert profile_wakes == [
+        (
+            "user-route-repair",
+            {"reason": "provider_config_changed", "force_ready": True},
+        )
+    ]

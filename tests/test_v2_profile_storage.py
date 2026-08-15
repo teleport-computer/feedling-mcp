@@ -120,6 +120,91 @@ def test_profile_document_rejects_torn_or_plaintext_fields():
         profile_store.validate_profile_document(doc)
 
 
+def test_old_profile_document_defaults_retry_policy_metadata():
+    document = profile_store.validate_profile_document(
+        _ok_doc("u-profile-old-retry-metadata", 1)
+    )
+
+    assert document["last_attempt"]["retry_disposition"] == ""
+    assert document["last_attempt"]["retry_family"] == ""
+    assert document["last_attempt"]["retry_attempts"] == 0
+
+
+@pytest.mark.parametrize(
+    ("disposition", "family"),
+    [
+        ("scheduled", "transient"),
+        ("scheduled", "shape"),
+        ("provider_config", "provider_config"),
+        ("source_change", "source"),
+        ("terminal", "terminal"),
+        ("terminal", "shape"),
+    ],
+)
+def test_profile_document_accepts_bounded_retry_policy_metadata(
+    disposition, family
+):
+    doc = _ok_doc("u-profile-retry-policy", 1)
+    doc["state"] = "degraded"
+    doc["last_attempt"].update(
+        {
+            "reject_code": "reply_not_json",
+            "retry_disposition": disposition,
+            "retry_family": family,
+            "retry_attempts": 2,
+            "retry_not_before": 1234.0 if disposition == "scheduled" else 0,
+        }
+    )
+
+    normalized = profile_store.validate_profile_document(doc)
+
+    assert normalized["last_attempt"]["retry_disposition"] == disposition
+    assert normalized["last_attempt"]["retry_family"] == family
+    assert normalized["last_attempt"]["retry_attempts"] == 2
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "error"),
+    [
+        ("retry_disposition", "later", "profile_retry_disposition_invalid"),
+        ("retry_family", "network-ish", "profile_retry_family_invalid"),
+    ],
+)
+def test_profile_document_rejects_unknown_retry_policy_metadata(
+    field, value, error
+):
+    doc = _ok_doc("u-profile-invalid-retry-policy", 1)
+    doc["last_attempt"][field] = value
+
+    with pytest.raises(profile_store.ProfileStorageError, match=error):
+        profile_store.validate_profile_document(doc)
+
+
+@pytest.mark.parametrize("state", ["ok", "empty"])
+def test_successful_profile_state_clears_retry_family_and_schedule(state):
+    doc = _ok_doc("u-profile-cleared-retry-policy", 1)
+    doc["state"] = state
+    if state == "empty":
+        doc.pop("memory")
+        doc.pop("user")
+    doc["last_attempt"].update(
+        {
+            "reject_code": "",
+            "retry_disposition": "scheduled",
+            "retry_family": "transient",
+            "retry_attempts": 7,
+            "retry_not_before": 9999.0,
+        }
+    )
+
+    normalized = profile_store.validate_profile_document(doc)
+
+    assert normalized["last_attempt"]["retry_disposition"] == ""
+    assert normalized["last_attempt"]["retry_family"] == ""
+    assert normalized["last_attempt"]["retry_attempts"] == 0
+    assert normalized["last_attempt"]["retry_not_before"] == 0.0
+
+
 def test_production_builder_locally_seals_each_field_before_jsonb(monkeypatch):
     store = object()
     calls: list[tuple[object, bytes]] = []
