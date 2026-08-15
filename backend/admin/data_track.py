@@ -2436,6 +2436,19 @@ _EMPTY_RESPONSE_PUBLIC_ENUMS = {
     }),
 }
 
+_LANGUAGE_FOLLOW_PUBLIC_ENUMS = {
+    "user_script": frozenset({
+        "han", "latin", "kana", "hangul", "cyrillic", "other", "mixed",
+        "indeterminate",
+    }),
+    "reply_script": frozenset({
+        "han", "latin", "kana", "hangul", "cyrillic", "other", "mixed",
+        "indeterminate",
+    }),
+    "outcome": frozenset({"match", "mismatch", "skip"}),
+    "lane": frozenset({"chat", "wake"}),
+}
+
 
 def _debug_event_public_json(ev: dict) -> dict:
     raw_detail = ev.get("detail") or {}
@@ -2449,6 +2462,18 @@ def _debug_event_public_json(ev: dict) -> dict:
         # writing. Expose them so admin can distinguish true filtering from a
         # parser/content-free response without opening any general string field.
         for key, allowed_values in _EMPTY_RESPONSE_PUBLIC_ENUMS.items():
+            value = raw_detail.get(key)
+            if isinstance(value, str) and value in allowed_values:
+                public_detail[key] = value
+    if (
+        ev.get("type") == "reply.language_follow"
+        and isinstance(raw_detail, dict)
+        and isinstance(public_detail, dict)
+    ):
+        # Every exposed string is a producer-normalized closed enum.  Unknown
+        # or newly injected strings keep the generic redaction above, so this
+        # observability event cannot become an accidental plaintext outlet.
+        for key, allowed_values in _LANGUAGE_FOLLOW_PUBLIC_ENUMS.items():
             value = raw_detail.get(key)
             if isinstance(value, str) and value in allowed_values:
                 public_detail[key] = value
@@ -8055,6 +8080,7 @@ _DEBUG_STEP_LABELS = {
     "agent.model.call.done": ("🧠", "调用模型 · 完成"),
     "agent.tool.call": ("🔧", "调用工具"),
     "thinking.surfaced": ("💭", "思考展示 · 分支"),
+    "reply.language_follow": ("🌐", "语言跟随"),
     "provider.empty_response": ("🕳️", "空回复诊断"),
     "mcp.surface.resolved": ("🧩", "MCP 工具面"),
     "mcp.surface.provider": ("🧩", "MCP Provider 实收工具面"),
