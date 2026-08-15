@@ -24,6 +24,12 @@ change must not be interpreted as an API guarantee.
   model-initiated relative score adjustments, while `identity_dimensions_set`
   has no delta limit because it represents an explicit user request.
   Proactive/background turns cannot use any identity write path.
+- **Hosted Chat no longer rejects user messages merely because the live worker
+  pool is overloaded.** `POST /v1/model_api/chat/send` now persists the encrypted
+  user row and queues or coalesces its Chat Job atomically, returning the usual
+  asynchronous `202` response while retaining the queue estimate as operational
+  telemetry. Runtime-control, worker-liveness, kill-switch, and provider setup
+  failures remain fail-closed before persistence.
 
 - **Optional Runtime V2 proactive wakes now describe silence unambiguously.**
   Heartbeat, manual-wake, and screen-watch turns tell the model that choosing

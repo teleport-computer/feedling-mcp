@@ -34,8 +34,10 @@ preserves one-time reminder behavior.
 
 Before sending, the account needs a content public key, a configured model route,
 and a live Hosted Runtime V2 worker pool. Runtime-control, worker-liveness,
-kill-switch, and admission failures are returned before the user message is
-stored.
+kill-switch, and provider/configuration failures are returned before the user
+message is stored. A live but overloaded worker pool still accepts the encrypted
+message and queues or coalesces its Chat Job; capacity estimates are telemetry,
+not a reason to make the client retain the only copy of the user's words.
 
 Accepted Chat work has dedicated Foreground execution capacity. During the same
 database transaction that enqueues a new Chat Job, Runtime V2 can supersede or
