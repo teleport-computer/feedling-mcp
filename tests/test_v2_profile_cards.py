@@ -168,16 +168,22 @@ def test_profile_cards_truncation_fails_before_generation(monkeypatch, body):
         serve_worker._read_profile_cards("u")
 
 
-def test_profile_card_content_has_explicit_per_card_bound():
-    rendered = serve_worker._render_profile_card(
-        {"id": "m", "content": "中" * 3000}
+def test_profile_card_content_has_no_second_per_card_bound():
+    content = "中" * (
+        profile.PROFILE_MEMORY_MAX_CHARS + profile.PROFILE_USER_MAX_CHARS
     )
-    assert rendered.count("中") == serve_worker._PROFILE_CARD_CONTENT_MAX_CHARS
+    rendered = serve_worker._render_profile_card(
+        {"id": "m", "content": content}
+    )
+    assert rendered.endswith(f"content={content}")
 
 
-def test_profile_card_truncation_reaches_provider_request_trace(monkeypatch):
-    cap = serve_worker._PROFILE_CARD_CONTENT_MAX_CHARS
-    clipped_body = "Q" * (cap + 1)
+def test_profile_card_full_content_reaches_provider_request_trace(monkeypatch):
+    tail_sentinel = "T062_PROFILE_CARD_TAIL_REACHES_PROVIDER"
+    full_body = (
+        "Q" * (profile.PROFILE_MEMORY_MAX_CHARS + profile.PROFILE_USER_MAX_CHARS)
+        + tail_sentinel
+    )
     _wire(
         monkeypatch,
         index_body={
@@ -185,7 +191,7 @@ def test_profile_card_truncation_reaches_provider_request_trace(monkeypatch):
             "user_card_count": 1,
             "truncated": False,
         },
-        fetched_items=[{"id": "m1", "content": clipped_body}],
+        fetched_items=[{"id": "m1", "content": full_body}],
     )
     rendered, count, tail_window = serve_worker._read_profile_cards("u")
     provider_messages = []
@@ -211,13 +217,13 @@ def test_profile_card_truncation_reaches_provider_request_trace(monkeypatch):
     assert count == 1
     assert result.fields == {"memory": "事实", "user": "方式"}
     provider_payload = json.dumps(provider_messages, ensure_ascii=False)
-    assert provider_payload.count("Q") == cap
-    assert clipped_body not in provider_payload
+    assert full_body in provider_payload
+    assert tail_sentinel in provider_payload
     request = next(payload for kind, payload in events if kind == "provider_request")
     assert request == {
         "tail_window": {
             "lane": "profile",
-            "profile_cards_truncated": True,
+            "profile_cards_truncated": False,
         }
     }
     assert "Q" not in json.dumps(request, ensure_ascii=False)

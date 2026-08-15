@@ -33,6 +33,44 @@ def _profile_generation_enabled() -> bool:
     ).strip().lower() in {"1", "true", "yes", "on"}
 
 
+def enqueue_profile_best_effort(
+    user_id: str,
+    *,
+    reason: str,
+    force_ready: bool = False,
+) -> bool:
+    """Advisory V2 profile wake that cannot roll back durable config work."""
+    try:
+        if not _profile_generation_enabled():
+            return False
+        _mode, state, _generation = db.get_hosted_runtime_control_strict(user_id)
+        if state != "v2":
+            return False
+        from core import wake_bus
+        from model_api_runtime.v2 import jobs_store
+
+        _job_id, coalesced = jobs_store.enqueue_job(
+            user_id,
+            "profile",
+            reason=reason,
+        )
+        made_ready = bool(
+            force_ready
+            and coalesced
+            and jobs_store.make_pending_job_ready(user_id, lane="profile")
+        )
+        if not coalesced or made_ready:
+            wake_bus.notify("v2_jobs", user_id)
+        return (not coalesced) or made_ready
+    except Exception as exc:  # noqa: BLE001 — config mutation is already durable
+        log.warning(
+            "[hosted.config_store] profile wake failed user=%s code=%s",
+            user_id,
+            type(exc).__name__.lower(),
+        )
+        return False
+
+
 def _load_model_api_config(store: UserStore) -> dict | None:
     """The user's active model_api config, projected to the legacy blob shape.
 
@@ -554,24 +592,10 @@ def _set_hosted_runtime_mode_for_user_id(
     # lock: generation can read provider/runtime state and must never nest work
     # behind the ownership transaction.
     if should_enqueue_profile:
-        try:
-            from core import wake_bus
-            from model_api_runtime.v2 import jobs_store
-
-            _job_id, coalesced = jobs_store.enqueue_job(
-                user_id,
-                "profile",
-                reason="runtime_v2_cutover",
-            )
-            if not coalesced:
-                wake_bus.notify("v2_jobs", user_id)
-        except Exception as exc:  # noqa: BLE001 — ownership already committed
-            log.warning(
-                "[hosted.config_store] profile enqueue after V2 cutover failed "
-                "user=%s code=%s",
-                user_id,
-                type(exc).__name__.lower(),
-            )
+        enqueue_profile_best_effort(
+            user_id,
+            reason="runtime_v2_cutover",
+        )
     return result
 
 

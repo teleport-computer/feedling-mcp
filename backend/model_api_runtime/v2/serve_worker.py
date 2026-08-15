@@ -2593,7 +2593,6 @@ def _render_card_line(item: dict) -> str:
     return "- " + " | ".join(parts)
 
 
-_PROFILE_CARD_CONTENT_MAX_CHARS = 2_000
 PROFILE_CARD_BATCH_SIZE = 64
 
 
@@ -2611,7 +2610,7 @@ def _render_profile_card(item: dict) -> str:
         f"bucket={str(item.get('bucket') or '').strip()}",
         f"occurred_at={str(item.get('occurred_at') or '').strip()}",
         f"summary={summary}",
-        f"content={content[:_PROFILE_CARD_CONTENT_MAX_CHARS]}",
+        f"content={content}",
     ]
     return "- " + " | ".join(parts)
 
@@ -2620,13 +2619,12 @@ def _read_profile_cards(
     user_id: str,
     progress: Callable[[str], None] | None = None,
 ) -> tuple[str, int, dict]:
-    """Read every eligible Garden card or fail loudly on any truncation.
+    """Read every eligible Garden card and preserve its fetched content.
 
     The lightweight index proves the complete cardinality, then fetch obtains
-    each card's bounded content. Both use the scoped runtime token; no API key
-    or server-side envelope decryption is involved. Per-card bodies keep their
-    separate ``_PROFILE_CARD_CONTENT_MAX_CHARS`` bound; the returned tail-window
-    metadata makes any such clipping observable without changing prompt text.
+    each card's readside-bounded content. Both use the scoped runtime token; no
+    API key or server-side envelope decryption is involved. Profile rendering
+    adds no second per-card cap on top of that source contract.
     """
 
     store = core_store.get_store(user_id)
@@ -2704,15 +2702,10 @@ def _read_profile_cards(
     rendered = [_render_profile_card(by_id[memory_id]) for memory_id in ids]
     if any(not line for line in rendered):
         raise RuntimeError("profile_cards_render_incomplete")
-    # Derive the signal at the reader's final outlet from the source lengths
-    # and the cap that actually produced ``rendered``. Do not set a side flag
-    # next to the slice: a future rendering refactor must not silently detach
-    # the telemetry from the effective output.
-    profile_cards_truncated = any(
-        len(str(by_id[memory_id].get("content") or "").strip())
-        > _PROFILE_CARD_CONTENT_MAX_CHARS
-        for memory_id in ids
-    )
+    # Keep the established provider/trace field as a regression sentinel. The
+    # profile renderer now has no per-card cap, so this must stay false unless a
+    # future change deliberately reintroduces clipping at this final outlet.
+    profile_cards_truncated = False
     return "\n".join(rendered), user_card_count, {
         "lane": "profile",
         "profile_cards_truncated": profile_cards_truncated,
@@ -2812,7 +2805,17 @@ def _read_memory_context(user_id: str, *, full_cards: bool = False) -> dict:
                     if not line:
                         continue
                     added_chars = len(line) + (1 if lines else 0)
-                    if lines and rendered_chars + added_chars > _DREAM_CARDS_MAX_CHARS:
+                    if rendered_chars + added_chars > _DREAM_CARDS_MAX_CHARS:
+                        log.warning(
+                            "[v2.serve_worker] dream cards truncated user=%s "
+                            "kept=%d/%d chars=%d cap=%d empty_context=%s",
+                            user_id,
+                            len(selected),
+                            len(ids),
+                            rendered_chars,
+                            _DREAM_CARDS_MAX_CHARS,
+                            not selected,
+                        )
                         break
                     selected.append(item)
                     lines.append(line)
@@ -5339,7 +5342,8 @@ _WATCHDOG_DB_TIMEOUT_SEC = _positive_float_env(
 def _jobs_claimable() -> bool:
     """Watchdog's "is there work waiting" predicate (`watchdog.should_kill`'s
     `jobs_claimable` guard) — `pending_job_count()` counts only rows still
-    `status='pending'` (queued, not yet claimed by ANY worker slot), which is
+    `status='pending'` whose durable `available_at` fence is due (queued and
+    ready, not yet claimed by ANY worker slot), which is
     exactly "all slots stuck while work waits": a wedged child claims nothing, so
     genuinely queued work sits at `pending` instead of draining into `claimed`/
     `running`. Deliberately NOT `inflight_job_count()` (pending+claimed+running) —

@@ -36,6 +36,7 @@ to=""
 msg_type="message"
 subject=""
 no_wake=0
+ack_ids=""
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -44,6 +45,7 @@ while [ "$#" -gt 0 ]; do
     --type) [ "$#" -ge 2 ] || usage; msg_type="$2"; shift 2 ;;
     --subject) [ "$#" -ge 2 ] || usage; subject="$2"; shift 2 ;;
     --no-wake) no_wake=1; shift ;;
+    --ack) [ "$#" -ge 2 ] || usage; ack_ids="${ack_ids} $2"; shift 2 ;;
     -h|--help) usage ;;
     *) usage ;;
   esac
@@ -125,6 +127,19 @@ cp "$file" "$inbox_dir/$id.md"
 cp "$file" "$outbox_dir/$id.md"
 
 echo "posted $id"
+
+# 自动 ack(2026-08-15):`--ack <收到的信id>` 在发信成功后顺手归档那几封。
+# 由来:claude3 连续三次漏 ack,两次都发生在连续深度工作时 —— 注意力在任务上,
+# 「回完顺手 ack」这个附加动作整批掉。它自己的结论:「靠自律的机制不是机制」。
+# 所以把 ack 变成发信的一部分,而不是一个要记得做的额外步骤。
+for _aid in $ack_ids; do
+  [ -n "$_aid" ] || continue
+  if "$(dirname "$0")/ack.sh" "$from" "$_aid" >/dev/null 2>&1; then
+    echo "  acked $_aid"
+  else
+    echo "  ⚠️ ack 失败:$_aid(信已发出,只是没归档)" >&2
+  fi
+done
 
 if [ "$no_wake" -eq 1 ]; then
   exit 0

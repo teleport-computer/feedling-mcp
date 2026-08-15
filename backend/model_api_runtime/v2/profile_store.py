@@ -137,6 +137,33 @@ def validate_profile_document(value: Any) -> dict:
         raise ProfileStorageError("profile_retry_not_before_invalid") from exc
     if not math.isfinite(retry_not_before) or retry_not_before < 0:
         raise ProfileStorageError("profile_retry_not_before_invalid")
+    retry_disposition = str(attempt.get("retry_disposition") or "")
+    if retry_disposition not in {
+        "",
+        "scheduled",
+        "provider_config",
+        "source_change",
+        "terminal",
+    }:
+        raise ProfileStorageError("profile_retry_disposition_invalid")
+    retry_family = str(attempt.get("retry_family") or "")
+    if retry_family not in {
+        "",
+        "transient",
+        "shape",
+        "provider_config",
+        "source",
+        "terminal",
+    }:
+        raise ProfileStorageError("profile_retry_family_invalid")
+    retry_attempts = _nonnegative_int(
+        attempt.get("retry_attempts", 0), "last_attempt_retry_attempts"
+    )
+    if state in {"ok", "empty"} and not reject_code:
+        retry_disposition = ""
+        retry_family = ""
+        retry_attempts = 0
+        retry_not_before = 0.0
 
     normalized = {
         "v": PROFILE_VERSION,
@@ -154,6 +181,9 @@ def validate_profile_document(value: Any) -> dict:
             "attempts": _nonnegative_int(
                 attempt.get("attempts", 0), "last_attempt_attempts"
             ),
+            "retry_disposition": retry_disposition,
+            "retry_family": retry_family,
+            "retry_attempts": retry_attempts,
             "retry_not_before": retry_not_before,
         },
         "disabled": disabled,

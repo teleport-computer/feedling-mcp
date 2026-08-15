@@ -28,6 +28,9 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
 from capabilities import tool_schema  # noqa: E402
+from genesis import prompts as genesis_prompts  # noqa: E402
+from memory.capture_prompt_v1 import build_capture_prompt  # noqa: E402
+from memory.migrate_prompt_v1 import build_migrate_prompt  # noqa: E402
 from memory import prompts_v1  # noqa: E402
 
 
@@ -95,6 +98,57 @@ def test_both_runtimes_share_one_rules_constant():
 
     assert rules in prompts_v1.MEMORY_WRITE_GUIDANCE_V1, "V1 没在用共享规则"
     assert rules in tool_schema.DESCRIPTIONS["memory_write"], "V2 没在用共享规则"
+
+
+def _assert_exact_length_rule_once(rendered_prompt: str) -> None:
+    """The canonical rule must arrive intact, without a second copied wording."""
+    rule = prompts_v1.MEMORY_CARD_LENGTH_RULE_V1
+
+    assert rendered_prompt.splitlines().count(rule) == 1
+
+
+def test_card_length_rule_states_the_agreed_number():
+    # 1000 is Seven's 2026-08-14 product decision, not an implementation detail.
+    # Keep the literal here so changing that decision requires an explicit review.
+    assert "1000" in prompts_v1.MEMORY_CARD_LENGTH_RULE_V1
+
+
+def test_memory_card_length_rule_reaches_memory_write_tool_descriptions():
+    for description in (
+        tool_schema.DESCRIPTIONS["memory_write"],
+        tool_schema._MEMORY_WRITE_UPSERT_DESCRIPTION,
+    ):
+        _assert_exact_length_rule_once(description)
+
+
+def test_memory_card_length_rule_reaches_capture_prompt():
+    prompt = build_capture_prompt(
+        ai_name="io",
+        user_name="Seven",
+        buckets="（暂无）",
+        threads="（暂无）",
+        identity="（暂无）",
+        window="一段对话",
+    )
+
+    _assert_exact_length_rule_once(prompt)
+
+
+def test_memory_card_length_rule_reaches_migrate_prompt():
+    prompt = build_migrate_prompt(
+        ai_name="io",
+        user_name="Seven",
+        old_cards="一张旧卡",
+        vocab="（暂无）",
+    )
+
+    _assert_exact_length_rule_once(prompt)
+
+
+def test_memory_card_length_rule_reaches_genesis_prompt():
+    prompt = genesis_prompts.fact_write_messages([])[0]["content"]
+
+    _assert_exact_length_rule_once(prompt)
 
 
 @pytest.mark.parametrize("rule", [

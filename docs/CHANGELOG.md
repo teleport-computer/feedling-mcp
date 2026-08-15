@@ -47,6 +47,20 @@
 
 ## 记录正文（最新的在上面）
 
+## 2026-08-14 — Runtime V2 profile 失败可自动持久恢复
+
+**[DONE] profile retry 不再依赖用户下一轮 Chat，且不挤占前台或触发 watchdog 误杀。**
+
+- `agent_jobs.available_at` 把重试时间变成持久 claim fence；未来 Job 不占 slot，
+  `pending_ready`/`pending_delayed` 分开观测，旧 `pending` 保留 ready 别名。
+- transient provider 失败按 5 分钟指数退避、6 小时封顶重排同一个 owner/generation/
+  lease-fenced Job；shape 最多延迟重试 3 次。provider config 等显式修复，source/data
+  等 Garden witness 改变，未知内部错误终止。
+- 普通 post-Chat freshness 不提前 delayed Job；Dream force 和成功 provider
+  setup/activate 可 ready-now。Dream 的夜间窗口、23 小时最短间隔和 3 张新卡门槛未改。
+- PR #187 删除语义 conversation compact 后，MEMORY/USER 成为唯一长期语义层；
+  metadata-only coverage 继续只证明历史覆盖，不承载对话语义。
+
 ## 2026-08-14 — V2 wake 最终出口补齐工具标记清洗
 
 **[DONE] 四条 Runtime V2 wake lane 的模型正文在加密下发前统一剥离工具协议标记。**
