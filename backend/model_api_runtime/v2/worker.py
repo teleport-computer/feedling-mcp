@@ -915,10 +915,24 @@ _SCREEN_WATCH_SYSTEM_PROMPT = (
     "neither is the default or safer answer, and you do not need a strong reason to speak. "
     "Decide naturally from your personality, the real conversation, and what is happening "
     "on screen now. Use attention_facts to avoid interrupting or repeating yourself. If you "
-    "speak, choose one coherent thought rather than reporting the screen state. Never mention "
-    "this wake or any system wording, and never narrate that you are watching or that you "
-    "looked at frames."
+    "speak, choose one coherent thought rather than reporting the screen state. In the visible "
+    "message, never mention this wake or any system wording, and never narrate that you are "
+    "watching or that you looked at frames."
 )
+
+
+def _wake_system_prompt_for_lane(lane: str, base_prompt: str) -> str:
+    """Attach the shared thinking contract and lane-specific suffixes."""
+    if not self_thinking.enabled():
+        return base_prompt
+    blocks = [base_prompt, self_thinking.INSTRUCTION]
+    if lane == "screen_watch":
+        blocks.append(self_thinking.SCREEN_WATCH_INSTRUCTION)
+    if lane != "scheduled":
+        blocks.append(_OPTIONAL_WAKE_SELF_THINKING_INSTRUCTION)
+    return context._join_policy_blocks(*blocks)
+
+
 # D3 Task 7 (BYOK payment cooldown): a "provider_config" wake failure (402 out-of-credits,
 # 401/403 bad key) means the user's BYOK key is dead/broke — retrying it every heartbeat
 # interval is a retry storm against a key that cannot succeed until the user fixes it
@@ -8220,8 +8234,6 @@ async def _run_wake(
                 )
 
         def _wake_builder():
-            from core import self_thinking as _st_wake_sys
-
             _wake_sys = (
                 _SCREEN_WATCH_SYSTEM_PROMPT
                 if lane == "screen_watch"
@@ -8230,10 +8242,7 @@ async def _run_wake(
             # Same as the chat lane's context.chat_system_prompt(): ask the model to
             # open its reply with a <think> block so proactive turns show a clean
             # self-authored thought instead of raw native reasoning.
-            if _st_wake_sys.enabled():
-                _wake_sys = _wake_sys + _st_wake_sys.INSTRUCTION
-                if lane != "scheduled":
-                    _wake_sys += _OPTIONAL_WAKE_SELF_THINKING_INSTRUCTION
+            _wake_sys = _wake_system_prompt_for_lane(lane, _wake_sys)
             return _make_build_messages_fn(
                 system_prompt=_wake_sys,
                 summary=summary,

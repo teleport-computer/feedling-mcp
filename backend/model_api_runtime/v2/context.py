@@ -23,6 +23,7 @@ from typing import Any, Sequence
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from chat.reply_language import infer_reply_language_policy, local_time_labels
+from core import self_thinking
 import worldbook_match
 from voice.message_filter import VOICE_CALL_RECORD_ROLE, conversation_rows
 
@@ -293,15 +294,11 @@ def chat_system_prompt(provider_config: Any = None) -> str:
     sits beside the reply rules it governs rather than after unrelated memory,
     screen, file, reminder, and identity policies.
     """
-    from core import self_thinking
-
     if self_thinking.enabled() and _supports_mandatory_self_thinking(provider_config):
-        return (
-            _CHAT_REPLY_POLICY.rstrip()
-            + "\n\n"
-            + self_thinking.INSTRUCTION
-            + "\n\n"
-            + _CHAT_POLICY_AFTER_THINKING
+        return _join_policy_blocks(
+            _CHAT_REPLY_POLICY,
+            self_thinking.INSTRUCTION,
+            _CHAT_POLICY_AFTER_THINKING,
         )
     return CHAT_SYSTEM_PROMPT
 

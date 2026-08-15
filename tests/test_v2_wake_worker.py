@@ -43,6 +43,7 @@ import db
 import provider_client
 from content_encryption import build_envelope
 from capabilities import registry as cap_registry
+from core import self_thinking
 from core import store as core_store
 from model_api_runtime.v2 import context as v2_context
 from model_api_runtime.v2 import effect_outbox as v2_effect_outbox
@@ -243,7 +244,10 @@ def test_run_wake_reply_written_and_job_completed(monkeypatch):
     assert _job_status(job_id)[0] == "completed"
     system_msg = next(m for m in seen["messages"] if m["role"] == "system")
     assert worker._WAKE_SYSTEM_PROMPT in system_msg["content"]
-    assert worker._OPTIONAL_WAKE_SELF_THINKING_INSTRUCTION in system_msg["content"]
+    assert self_thinking.INSTRUCTION.strip() in system_msg["content"]
+    assert worker._OPTIONAL_WAKE_SELF_THINKING_INSTRUCTION.strip() in (
+        system_msg["content"]
+    )
     assert [
         message["content"]
         for message in seen["messages"]
@@ -1008,7 +1012,7 @@ def test_heartbeat_thinking_only_is_successful_silence_without_backoff(
         for message in calls[0]["messages"]
         if message.get("role") == "system"
     )
-    assert worker._OPTIONAL_WAKE_SELF_THINKING_INSTRUCTION in system_text
+    assert worker._OPTIONAL_WAKE_SELF_THINKING_INSTRUCTION.strip() in system_text
     assert "nothing after its closing tag" in system_text
     assert "the user receives nothing from that turn" in system_text
     schedule = jobs_store.get_wake_schedule(uid)
@@ -1054,7 +1058,7 @@ def test_scheduled_thinking_only_remains_a_must_deliver_failure(monkeypatch):
         for message in calls[0]["messages"]
         if message.get("role") == "system"
     )
-    assert worker._OPTIONAL_WAKE_SELF_THINKING_INSTRUCTION not in system_text
+    assert worker._OPTIONAL_WAKE_SELF_THINKING_INSTRUCTION.strip() not in system_text
     assert jobs_store.get_wake_schedule(uid)["proactive_backoff_until"] is not None
 
 

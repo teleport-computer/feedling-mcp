@@ -688,7 +688,7 @@ def test_self_thinking_on_suppresses_native_reasoning(monkeypatch):
         for message in calls[0]["messages"]
         if isinstance(message, dict) and message.get("role") == "system"
     )
-    assert self_thinking.INSTRUCTION in system_text
+    assert self_thinking.INSTRUCTION.strip() in system_text
 
 
 def test_fable_chat_omits_mandatory_self_thinking_prompt(monkeypatch):
@@ -723,7 +723,7 @@ def test_fable_chat_omits_mandatory_self_thinking_prompt(monkeypatch):
         for message in calls[0]["messages"]
         if isinstance(message, dict) and message.get("role") == "system"
     )
-    assert self_thinking.INSTRUCTION not in system_text
+    assert self_thinking.INSTRUCTION.strip() not in system_text
     assert _bubbles(uid)[-1]["body_ct"] == "Fable plain reply"
 
 

@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import inspect
 import json
 import pathlib
@@ -298,7 +299,7 @@ def test_chat_system_prompt_omits_self_thinking_for_namespaced_fable(monkeypatch
     )
 
     assert prompt == context.CHAT_SYSTEM_PROMPT
-    assert self_thinking.INSTRUCTION not in prompt
+    assert self_thinking.INSTRUCTION.strip() not in prompt
 
 
 @pytest.mark.parametrize(
@@ -312,7 +313,7 @@ def test_chat_system_prompt_keeps_self_thinking_for_non_fable_boundaries(
 
     prompt = context.chat_system_prompt(SimpleNamespace(model=model))
 
-    assert self_thinking.INSTRUCTION in prompt
+    assert self_thinking.INSTRUCTION.strip() in prompt
 
 
 def test_chat_system_prompt_groups_atomic_self_thinking_with_reply_rules(
@@ -322,14 +323,42 @@ def test_chat_system_prompt_groups_atomic_self_thinking_with_reply_rules(
 
     prompt = context.chat_system_prompt(SimpleNamespace(model="deepseek-chat"))
 
-    assert prompt.count(self_thinking.INSTRUCTION) == 1
+    instruction = self_thinking.INSTRUCTION.strip()
+    assert prompt.count(instruction) == 1
     assert (
         prompt.index(context._CHAT_REPLY_POLICY.rstrip())
-        < prompt.index(self_thinking.INSTRUCTION)
+        < prompt.index(instruction)
         < prompt.index(context._CHAT_MEMORY_POLICY.strip())
         < prompt.index(context._CHAT_PERCEPTION_POLICY.strip())
         < prompt.index(context._CHAT_FILE_POLICY.strip())
     )
+
+
+def test_finalized_self_thinking_copy_is_exact_and_has_no_old_length_cap():
+    assert hashlib.sha256(self_thinking.INSTRUCTION.encode()).hexdigest() == (
+        "ba10dbe93e7716ea96a2593769fcb03c0a8370dbbcb88cbcaa9bdde65fc7c745"
+    )
+    assert "240 字" not in self_thinking.INSTRUCTION
+    assert "写不完就收住" not in self_thinking.INSTRUCTION
+
+
+def test_chat_heartbeat_and_screen_watch_use_one_shared_instruction(monkeypatch):
+    monkeypatch.delenv("FEEDLING_V2_SELF_THINKING", raising=False)
+    shared = self_thinking.INSTRUCTION
+
+    assert context.self_thinking.INSTRUCTION is shared
+    assert worker.self_thinking.INSTRUCTION is shared
+
+    prompts = {
+        "chat": context.chat_system_prompt(SimpleNamespace(model="deepseek-chat")),
+        "heartbeat": worker._wake_system_prompt_for_lane(
+            "heartbeat", worker._WAKE_SYSTEM_PROMPT
+        ),
+        "screen_watch": worker._wake_system_prompt_for_lane(
+            "screen_watch", worker._SCREEN_WATCH_SYSTEM_PROMPT
+        ),
+    }
+    assert all(prompt.count(shared.strip()) == 1 for prompt in prompts.values())
 
 
 def test_ordered_reply_tail_restores_causal_order_and_hides_later_users():
