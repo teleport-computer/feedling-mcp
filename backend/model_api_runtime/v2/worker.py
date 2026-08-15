@@ -1959,8 +1959,13 @@ def _emit_context_truncation_trace(
         content = message.get("content")
         if not isinstance(content, str):
             continue
+        worldbook_prefix = context.WORLD_BOOK_CONTEXT_HEADER + "\n"
+        has_worldbook_block = content.startswith(worldbook_prefix) or (
+            content.startswith(context.AGENT_MEMORY_HEADER + "\n")
+            and ("\n\n" + worldbook_prefix) in content
+        )
         if (
-            content.startswith(context.WORLD_BOOK_CONTEXT_HEADER + "\n")
+            has_worldbook_block
             and context.WORLD_BOOK_TRUNCATION_MARKER in content
         ):
             counts["worldbook_truncated"] = 1
