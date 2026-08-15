@@ -447,7 +447,12 @@ for _parameters in PARAMS.values():
 
 DESCRIPTIONS: dict[str, str] = {
     "identity_get": "Read the persona's current identity/profile fields.",
-    "identity_patch": ("Update the persona's own identity/profile. Use 'agent_name' "
+    "identity_patch": ("Update the persona's own identity/profile in the SAME turn when "
+                       "the user explicitly asks to change your name, how you introduce "
+                       "yourself, or the relationship day count shown in the app. Do not "
+                       "merely say the change is done, and do not claim the day count is "
+                       "automatic or immutable. Only act on an explicit request, not a "
+                       "passing mention. Use 'agent_name' "
                        "when the user renames you — that is the name shown to them, "
                        "and rewriting only 'self_introduction' does NOT rename you; "
                        "pass both when the new name should also appear in how you "
@@ -487,7 +492,13 @@ DESCRIPTIONS: dict[str, str] = {
         "'reason' describing the explicit user request is required for the encrypted audit. "
         "For a small conversational score adjustment, keep using identity_nudge."
     ),
-    "memory_index": ("Browse memory-card summaries, optionally filtered by one exact "
+    "memory_index": ("Use only when the current request actually depends on remembered "
+                     "information; ordinary conversation and model/runtime identity "
+                     "questions do not. Never run memory discovery for a standalone "
+                     "greeting, acknowledgement, emoji, interjection, or casual small "
+                     "talk, and do not resume an earlier answered memory workflow unless "
+                     "the current message explicitly asks. Browse memory-card summaries, "
+                     "optionally filtered by one exact "
                      "bucket or thread and capped by limit. Set ambient/include_sensitive "
                      "only when that broader or sensitive recall is genuinely needed. "
                      "Do not indiscriminately pull "
@@ -495,9 +506,24 @@ DESCRIPTIONS: dict[str, str] = {
                      "total/returned counts and browse bucket by bucket (or thread by "
                      "thread) until the partition counts reconcile with total. For a "
                      "specific subject use memory_search then memory_fetch instead. For "
+                     "an open-ended request about all memories or the overall relationship, "
+                     "use memory_index once instead of guessing keywords or repeating "
+                     "memory_search. For "
                      "a user-requested bulk rewrite or cleanup, call memory_organize "
                      "instead of trying to edit every card in chat."),
-    "memory_search": ("Keyword-search memory cards by a required query string, then use "
+    "memory_search": ("Use only when the current request actually depends on remembered "
+                      "information; ordinary conversation and model/runtime identity "
+                      "questions do not. Never run memory discovery for a standalone "
+                      "greeting, acknowledgement, emoji, interjection, or casual small "
+                      "talk, and do not resume an earlier answered memory workflow unless "
+                      "the current message explicitly asks. If the user mentions a "
+                      "specific past event or person, or asks whether you remember "
+                      "something, and the supplied memory summary has no answer, search "
+                      "before replying instead of guessing. If the summary already answers "
+                      "the question, reply directly. For a requested memory-grounded "
+                      "summary or deliverable about a specific subject, search that subject "
+                      "instead of relying only on general recollection. Keyword-search "
+                      "memory cards by a required query string, then use "
                       "memory_fetch for the selected ids. This is the normal path for a "
                       "specific remembered subject, person, phrase, or event. Never use "
                       "it for ordinary conversation, model/runtime identity, or an "
@@ -573,7 +599,11 @@ DESCRIPTIONS: dict[str, str] = {
                      "memory_search/memory_index again for current active ids, then "
                      "retry the merge.\n"
                      + prompts_v1.MEMORY_WRITE_RULES_V1),
-    "perception_snapshot": ("Read the latest perception snapshot for named signals across "
+    "perception_snapshot": ("Use when the user's request depends on their current device, "
+                            "environment, activity, health, calendar, or reminders; do not "
+                            "call for unrelated conversation or claim those readings are "
+                            "inaccessible while this tool is available. Read the latest "
+                            "perception snapshot for named signals across "
                             + _PERCEPTION_DOMAINS + ". "
                             "If signals is omitted, ONLY the fast defaults are returned: "
                             + _PERCEPTION_DEFAULTS + ". Health and activity signals are "
@@ -596,7 +626,15 @@ DESCRIPTIONS: dict[str, str] = {
                            "signal from " + _PERCEPTION_DOMAINS + ". Snapshot defaults do "
                            "not apply: always request the signal explicitly."),
     "screen_recent": "List recent screen-share frame metadata.",
-    "screen_read": ("Read a specific screen-share frame, or the latest one if no frame_id "
+    "screen_read": ("Use when the user's message plausibly refers to a shared screen; do "
+                    "not call for unrelated conversation. screen_share.active means the "
+                    "user is sharing RIGHT NOW but reports availability only, never "
+                    "screen contents: call screen_read rather than claiming you cannot "
+                    "see a screen reported as live. "
+                    "screen_share.stalled means the device still reports sharing but "
+                    "current frames stopped arriving; screen_share.ended means the share "
+                    "ended; no active, stalled, or ended block means no share is running. "
+                    "Read a specific screen-share frame, or the latest one if no frame_id "
                     "is given. During an active screen share, omitting include_image shows "
                     "the pixels by default; set include_image=false only when text/OCR is "
                     "explicitly sufficient. Outside an active share, pixels remain opt-in. "
@@ -606,8 +644,11 @@ DESCRIPTIONS: dict[str, str] = {
                     "Runtime V2 inspects pixels through its native vision observer and "
                     "returns an untrusted visual_observation instead of a local image_file "
                     "path."),
-    "photo_recent": "List recent photos, optionally capped by limit.",
-    "photo_read": ("Read a specific photo by id. Set include_image=true only when metadata "
+    "photo_recent": ("Use when the user's request depends on their photos; do not call for "
+                     "unrelated conversation. List recent photos, optionally capped by limit."),
+    "photo_read": ("Use when the user's request depends on a specific photo; do not call "
+                   "for unrelated conversation. Read a specific photo by id. Set "
+                   "include_image=true only when metadata "
                    "is insufficient; Runtime V2 inspects the decrypted pixels through its "
                    "native vision observer and returns an untrusted visual_observation "
                    "instead of a local image_file path."),
@@ -617,11 +658,18 @@ DESCRIPTIONS: dict[str, str] = {
                       "time such as 'in 2 hours', '+30m', or '两小时后', with optional "
                       "timezone, reason, and repeat ('daily' every 24 hours or "
                       "'weekly' every 7 days)."),
-    "cancel_wake": "Cancel a previously scheduled self-wake by its wake_id.",
+    "cancel_wake": ("When the user asks to cancel or change a pending reminder, use the "
+                    "exact wake_id from runtime_data.scheduled_wakes.timers; do not search "
+                    "memories for reminder identifiers. Cancel a previously scheduled "
+                    "self-wake by its wake_id."),
     "workspace_list": ("List encrypted virtual workspace entries and revisions. "
                        "Namespaces are /artifacts (read-only), /skills (read-only), "
                        "/workspace (editable), and /memory/WORKING.md (editable)."),
-    "workspace_read": ("Read a line range from a virtual text entry. This reads a "
+    "workspace_read": ("Use only when the current request actually depends on stored "
+                       "workspace information; ordinary conversation and model/runtime "
+                       "identity questions do not. Do not resume an earlier answered file "
+                       "workflow unless the current message explicitly asks. Read a line "
+                       "range from a virtual text entry. This reads a "
                        "stored text view and does not materialize a physical artifact."),
     "workspace_write": ("Create or replace editable UTF-8 source using optimistic "
                         "revision control. For a downloadable .docx or .pdf target, "

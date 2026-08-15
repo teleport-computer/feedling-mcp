@@ -9,6 +9,7 @@ import pytest
 sys.path.insert(0, str(pathlib.Path(__file__).parent.parent / "backend"))
 from core import self_thinking
 from chat.reply_language import format_time_anchor, infer_reply_language_policy
+from capabilities import tool_schema
 from model_api_runtime.v2 import context, language_follow, worker
 import worldbook_readside_core
 
@@ -142,11 +143,14 @@ def test_proactive_application_data_stays_non_user_with_labeled_turn_boundary():
     assert "也不表达该不该说话的偏好" in messages[0]["content"]
 
 
-def test_chat_prompt_forbids_memory_reads_for_standalone_reactions():
-    assert "only a greeting, acknowledgement, emoji" in context.CHAT_SYSTEM_PROMPT
-    assert "do not resume its memory lookup or file workflow" in (
-        context.CHAT_SYSTEM_PROMPT
+def test_provider_memory_tool_descriptions_forbid_reads_for_standalone_reactions():
+    specs = {spec.name: spec.description for spec in tool_schema.build_tool_specs()}
+
+    assert "standalone greeting, acknowledgement, emoji" in specs["memory_search"]
+    assert "do not resume an earlier answered memory workflow" in (
+        specs["memory_search"]
     )
+    assert "Do not resume an earlier answered file workflow" in specs["workspace_read"]
 
 
 def test_behavior_translation_table_has_zero_lost_sentences():
@@ -164,22 +168,17 @@ def test_behavior_translation_table_has_zero_lost_sentences():
     assert [new for new in new_sentences if new not in prompt] == []
 
 
-def test_memory_search_positive_rule_is_adjacent_to_small_talk_gate():
-    blocks = context._CHAT_MEMORY_POLICY.split("\n\n")
+def test_provider_memory_search_description_keeps_positive_and_small_talk_gates():
+    description = next(
+        spec.description
+        for spec in tool_schema.build_tool_specs()
+        if spec.name == "memory_search"
+    )
 
-    assert blocks.index(context._CHAT_MEMORY_RECALL_POLICY.strip()) == (
-        blocks.index(context._CHAT_MEMORY_LOOKUP_POLICY.strip()) + 1
-    )
-    assert (
-        "TA 提到具体的过去事件、具体的人，或问『你还记得……』"
-        in context._CHAT_MEMORY_RECALL_POLICY
-    )
-    assert "先用 memory_search 查清再回答，别凭印象编" in (
-        context._CHAT_MEMORY_RECALL_POLICY
-    )
-    assert "纯问候、闲聊，或摘要里已经有答案时，直接答，不查" in (
-        context._CHAT_MEMORY_RECALL_POLICY
-    )
+    assert "specific past event or person" in description
+    assert "search before replying instead of guessing" in description
+    assert "standalone greeting, acknowledgement, emoji" in description
+    assert "If the summary already answers the question, reply directly" in description
 
 
 def test_final_system_policy_blocks_never_mix_writing_systems(monkeypatch):
@@ -210,17 +209,85 @@ def test_final_system_policy_blocks_never_mix_writing_systems(monkeypatch):
     ), classifications
 
 
-def test_tool_timing_sentences_stay_for_t094_migration():
+def test_tool_timing_sentences_move_from_prompt_to_provider_tool_descriptions():
     prompt = context.CHAT_SYSTEM_PROMPT
-    sentinels = (
-        "Use memory or workspace reads only when the current request actually depends",
-        "When the web_search and web_fetch tools are available",
-        "When the user's request depends on their current device",
-        "Interpret requests for a reusable standalone deliverable semantically",
-        "When the user asks to cancel or change a pending reminder",
-        "When the user EXPLICITLY asks you to change your own identity",
+    specs = {spec.name: spec.description for spec in tool_schema.build_tool_specs()}
+    migrations = (
+        (
+            "Use memory or workspace reads only when the current request actually depends",
+            "memory_search",
+            "current request actually depends on remembered information",
+        ),
+        (
+            "A current message that is only a greeting, acknowledgement, emoji",
+            "memory_index",
+            "standalone greeting, acknowledgement, emoji",
+        ),
+        (
+            "TA 提到具体的过去事件、具体的人",
+            "memory_search",
+            "specific past event or person",
+        ),
+        (
+            "When the user asks for a summary or deliverable grounded in memory",
+            "memory_search",
+            "memory-grounded summary or deliverable about a specific subject",
+        ),
+        (
+            "For an open-ended request about all memories or the overall relationship",
+            "memory_index",
+            "open-ended request about all memories or the overall relationship",
+        ),
+        (
+            "When the web_search and web_fetch tools are available",
+            "web_search",
+            "Search the live public web for current information",
+        ),
+        (
+            "When the user's request depends on their current device",
+            "perception_snapshot",
+            "request depends on their current device",
+        ),
+        (
+            "When the live runtime context contains screen_share.active",
+            "screen_read",
+            "screen_share.active means the user is sharing RIGHT NOW",
+        ),
+        (
+            "When screen_share.ended is present",
+            "screen_read",
+            "screen_share.ended means the share ended",
+        ),
+        (
+            "No active, stalled, or ended screen_share block",
+            "screen_read",
+            "no active, stalled, or ended block means no share is running",
+        ),
+        (
+            "Interpret requests for a reusable standalone deliverable semantically",
+            "send_file",
+            "reusable standalone artifact they can save, open, download, share",
+        ),
+        (
+            "When the user asks to cancel or change a pending reminder",
+            "cancel_wake",
+            "asks to cancel or change a pending reminder",
+        ),
+        (
+            "When the user EXPLICITLY asks you to change your own identity",
+            "identity_patch",
+            "explicitly asks to change your name, how you introduce yourself",
+        ),
     )
-    assert all(sentinel in prompt for sentinel in sentinels)
+
+    assert len(migrations) == 13
+    assert len({old for old, _tool, _new in migrations}) == len(migrations)
+    assert [old for old, _tool, _new in migrations if old in prompt] == []
+    assert [
+        (tool, new)
+        for _old, tool, new in migrations
+        if new not in specs[tool]
+    ] == []
 
 
 def test_chat_system_prompt_omits_self_thinking_for_namespaced_fable(monkeypatch):
@@ -260,11 +327,8 @@ def test_chat_system_prompt_groups_atomic_self_thinking_with_reply_rules(
         prompt.index(context._CHAT_REPLY_POLICY.rstrip())
         < prompt.index(self_thinking.INSTRUCTION)
         < prompt.index(context._CHAT_MEMORY_POLICY.strip())
-        < prompt.index(context._CHAT_WEB_POLICY.strip())
         < prompt.index(context._CHAT_PERCEPTION_POLICY.strip())
         < prompt.index(context._CHAT_FILE_POLICY.strip())
-        < prompt.index(context._CHAT_REMINDER_POLICY.strip())
-        < prompt.index(context._CHAT_IDENTITY_POLICY.strip())
     )
 
 

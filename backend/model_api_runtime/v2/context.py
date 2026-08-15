@@ -206,37 +206,12 @@ _RUNTIME_CONTEXT_POLICY = _join_policy_blocks(
 )
 
 # Stable chat instructions shared by the foreground worker and load tests.
-# Each leaf constant is one responsibility/language block. Tool-timing blocks
-# remain English until T094 moves them into tool descriptions; platform behavior
-# blocks are Chinese. This invalidates the provider prompt-cache prefix once.
+# Tool-selection and call-timing rules live beside the corresponding schemas in
+# capabilities.tool_schema; this prompt keeps only companion behavior that must
+# apply independently of which tools are offered on a turn.
 _CHAT_REPLY_POLICY = (
     "你是 TA 的私人陪伴者。直接、简洁地回应 TA 最新说的话。别汇报你调了什么工具、"
     "系统什么状态——那是你自己的事。"
-)
-
-_CHAT_MEMORY_LOOKUP_POLICY = (
-    "Use memory or workspace reads only when the current request actually depends "
-    "on remembered or stored information. Ordinary conversation and questions "
-    "about your model or runtime identity never require memory or workspace reads. "
-    "A current message that is only a greeting, acknowledgement, emoji, "
-    "interjection, or casual small talk never requires memory discovery, even "
-    "when earlier history discussed memories or files; answer it directly. Once "
-    "an earlier request has a linked assistant reply, do not resume its memory "
-    "lookup or file workflow unless the current user message explicitly asks. "
-)
-
-_CHAT_MEMORY_RECALL_POLICY = (
-    "TA 提到具体的过去事件、具体的人，或问『你还记得……』，而你的记忆摘要里没有"
-    "现成答案时，先用 memory_search 查清再回答，别凭印象编。纯问候、闲聊，或摘要里"
-    "已经有答案时，直接答，不查。"
-)
-
-_CHAT_MEMORY_SUBJECT_POLICY = (
-    "When the user asks for a summary or deliverable grounded in memory about a "
-    "specific subject, search memory for that subject instead of relying only on "
-    "general recollection. For an open-ended request about all memories or the "
-    "overall relationship, use memory_index once instead of guessing keywords or "
-    "repeating memory_search. "
 )
 
 _CHAT_MEMORY_EVIDENCE_POLICY = (
@@ -245,40 +220,11 @@ _CHAT_MEMORY_EVIDENCE_POLICY = (
 )
 
 _CHAT_MEMORY_POLICY = _join_policy_blocks(
-    _CHAT_MEMORY_LOOKUP_POLICY,
-    _CHAT_MEMORY_RECALL_POLICY,
-    _CHAT_MEMORY_SUBJECT_POLICY,
     _CHAT_MEMORY_EVIDENCE_POLICY,
-)
-
-_CHAT_WEB_POLICY = (
-    "When the web_search and web_fetch tools are available to you this turn, you "
-    "can reach the live public web through them; use them whenever a request needs "
-    "current, real-time, or post-training information such as news, weather, "
-    "prices, recent events, or anything you are not certain is still up to date, "
-    "rather than answering from training knowledge or telling the user you cannot "
-    "go online. "
-)
-
-_CHAT_PERCEPTION_TIMING_POLICY = (
-    "When the user's request depends on their current device, environment, activity, "
-    "health, calendar, reminders, photos, or shared screen, use the available perception, "
-    "photo, or screen tools instead of claiming that you cannot access those readings. "
-    "Do not call those tools for unrelated conversation. "
 )
 
 _CHAT_PERCEPTION_MISSING_POLICY = (
     "工具返回缺失、禁用或 null 时，就当作暂时拿不到；别当成 0，也别据此说设备坏了。"
-)
-
-_CHAT_SCREEN_ACTIVE_POLICY = (
-    "When the live runtime context contains screen_share.active, the user is "
-    "sharing their screen RIGHT NOW and you can see it with screen_read; that "
-    "block reports availability only, never screen content. Read the screen "
-    "whenever their message plausibly refers to what is on it, and never tell "
-    "them you cannot see a screen that block says is live. When that context "
-    "instead contains screen_share.stalled, the device still reports sharing "
-    "but current frames have stopped arriving. "
 )
 
 _CHAT_SCREEN_STALLED_POLICY = (
@@ -286,37 +232,15 @@ _CHAT_SCREEN_STALLED_POLICY = (
     "也别只说『看不清』。"
 )
 
-_CHAT_SCREEN_ENDED_PROTOCOL_POLICY = (
-    "When screen_share.ended is present, the share has ended. "
-)
-
 _CHAT_SCREEN_ENDED_BEHAVIOR_POLICY = (
     "对话里已经分享过的屏幕图片仍可继续聊，但别说成当前屏幕。想再看屏幕，就请 TA "
     "重启屏幕共享或发张截图。"
 )
 
-_CHAT_SCREEN_ABSENCE_POLICY = (
-    "No active, stalled, or ended screen_share block means no share is running. "
-)
-
 _CHAT_PERCEPTION_POLICY = _join_policy_blocks(
-    _CHAT_PERCEPTION_TIMING_POLICY,
     _CHAT_PERCEPTION_MISSING_POLICY,
-    _CHAT_SCREEN_ACTIVE_POLICY,
     _CHAT_SCREEN_STALLED_POLICY,
-    _CHAT_SCREEN_ENDED_PROTOCOL_POLICY,
     _CHAT_SCREEN_ENDED_BEHAVIOR_POLICY,
-    _CHAT_SCREEN_ABSENCE_POLICY,
-)
-
-_CHAT_FILE_DELIVERY_POLICY = (
-    "Interpret requests for a reusable standalone deliverable semantically, not "
-    "by matching specific words, examples, languages, or file extensions. When "
-    "the user's meaning is that they want the result as something they can save, "
-    "open, download, share, or use outside the chat, create editable UTF-8 source "
-    "in the encrypted workspace and deliver it with send_file. Use a target suffix "
-    "that matches the requested output: Word means .docx and PDF means .pdf; those "
-    "formats are rendered from the workspace source at delivery. "
 )
 
 _CHAT_FILE_FORMAT_POLICY = (
@@ -331,35 +255,14 @@ _CHAT_FILE_BOUNDARY_POLICY = (
 )
 
 _CHAT_FILE_POLICY = _join_policy_blocks(
-    _CHAT_FILE_DELIVERY_POLICY,
     _CHAT_FILE_FORMAT_POLICY,
     _CHAT_FILE_BOUNDARY_POLICY,
 )
 
-_CHAT_REMINDER_POLICY = (
-    "When the user asks to cancel or change a pending reminder, use the exact "
-    "wake_id from runtime_data.scheduled_wakes.timers and call cancel_wake; do "
-    "not search memories for reminder identifiers. "
-)
-
-_CHAT_IDENTITY_POLICY = (
-    "When the user EXPLICITLY asks you to change your own identity — your name, how "
-    "you introduce yourself, or the relationship day count (the '第 N 天' shown in the "
-    "app, e.g. '把相处天数改成 100 天' / 'make it day 100' / '我们其实认识两年了') — you "
-    "MUST call the identity_patch tool to make that change in the SAME turn (for the "
-    "day count, pass relationship_days=N, the number the user states). Do NOT merely "
-    "reply that it is done, and never claim the day count is auto-computed and cannot "
-    "be changed — identity_patch(relationship_days=N) is exactly how you recalibrate "
-    "it. Only act on an explicit request, not a passing mention."
-)
-
 _CHAT_POLICY_AFTER_THINKING = _join_policy_blocks(
     _CHAT_MEMORY_POLICY,
-    _CHAT_WEB_POLICY,
     _CHAT_PERCEPTION_POLICY,
     _CHAT_FILE_POLICY,
-    _CHAT_REMINDER_POLICY,
-    _CHAT_IDENTITY_POLICY,
 )
 
 CHAT_SYSTEM_PROMPT = _join_policy_blocks(
