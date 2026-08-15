@@ -526,15 +526,13 @@ action and returns that action's HTTP status. Earlier results and effects remain
 committed; they are included in the error response and are not rolled back.
 Split independent writes when partial completion would be hard to reconcile.
 
-There is no `Idempotency-Key` support. Before an add, the server compares the
-normalized title and content with readable active shared cards. An exact
-normalized duplicate is not written: its result has `status: "ok"`, `noop: true`,
-`skipped: "duplicate_active"`, and `duplicate_of` set to the active card ID.
-Normalization applies Unicode NFKC, case folding, and whitespace collapsing.
-This protects exact retries but does not make a mixed batch idempotent: later
-actions can still target state changed by an earlier attempt. Read `index` or
-`fetch`, reconcile stable memory IDs, and construct a new batch instead of
-replaying the original blindly.
+There is no `Idempotency-Key` support and the server does not scan existing
+cards for duplicate content. Every accepted add creates a new memory ID and
+emits a write effect, even when its title and content match an active card.
+Prebuilt envelopes are validated from their plaintext metadata and envelope
+shape without decrypting their body during the add. Read `index` or `fetch`,
+reconcile stable memory IDs, and construct a new batch instead of replaying the
+original blindly.
 
 `memory.upgrade` exists for controlled legacy migration, but it is not part of
 the public Memory workflow and should not be emitted by ordinary clients.

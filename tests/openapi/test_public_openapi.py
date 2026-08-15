@@ -489,6 +489,8 @@ def test_memory_actions_response_exposes_independent_item_outcomes(
     assert {"error", "detail"} <= set(schema["properties"])
     result_schema = public_schema["components"]["schemas"]["MemoryActionResult"]
     assert {"status", "http_status"} <= set(result_schema["required"])
+    action_type = public_schema["components"]["schemas"]["MemoryAction"]["properties"]["type"]
+    assert "always create a new card" in action_type["description"]
 
 
 def test_dream_status_documents_monotonic_capture_banner_fields(

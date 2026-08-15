@@ -4,7 +4,6 @@ import hashlib
 import json
 import logging
 import re
-import unicodedata
 import uuid
 
 
@@ -59,52 +58,6 @@ def _memory_action_metadata_error(action: dict) -> dict | None:
                 "allowed": sorted(MEMORY_CAPTURE_MODE_VALUES),
             }
     return None
-
-
-def _memory_normalized_identity(inner: dict | None) -> tuple[str, str]:
-    if not isinstance(inner, dict):
-        return "", ""
-
-    def normalize(value) -> str:
-        text = unicodedata.normalize("NFKC", str(value or "")).casefold()
-        return " ".join(text.split())
-
-    title = normalize(
-        inner.get("summary") or inner.get("title") or inner.get("description")
-    )
-    content = normalize(inner.get("content") or inner.get("description"))
-    return title, content
-
-
-def _memory_active_duplicate(
-    moments: list,
-    inner: dict,
-    api_key: str | None,
-    *,
-    runtime_token: str = "",
-) -> dict | None:
-    identity = _memory_normalized_identity(inner)
-    if not all(identity):
-        return None
-    for moment in memory_service._active_memory_moments(moments):
-        if moment.get("visibility") == "local_only":
-            continue
-        existing_inner, _err = _memory_plain_from_envelope(
-            moment, api_key, runtime_token=runtime_token
-        )
-        if existing_inner is not None and _memory_normalized_identity(existing_inner) == identity:
-            return moment
-    return None
-
-
-def _memory_duplicate_result(duplicate: dict) -> tuple[dict, list[dict], int]:
-    return {
-        "status": "ok",
-        "action": "memory.add",
-        "noop": True,
-        "skipped": "duplicate_active",
-        "duplicate_of": str(duplicate.get("id") or ""),
-    }, [], 200
 
 
 def _memory_tombstone_reason(summary: str, content: str) -> str | None:
@@ -567,11 +520,6 @@ def _memory_add_action(
     # validation only) so a concurrent same-user write can't lost-update.
     with memory_service.mutation_lock(store):
         moments = memory_service._load_moments(store)
-        duplicate = _memory_active_duplicate(
-            moments, inner, api_key, runtime_token=runtime_token
-        )
-        if duplicate is not None:
-            return _memory_duplicate_result(duplicate)
         moments.append(moment)
         memory_service._save_moments(store, moments)
     boot_gates._log_bootstrap_event(store, "memory_action_added_v1", success=True)
@@ -611,26 +559,9 @@ def _memory_add_envelope_action(
     if not ok:
         return {"status": "error", **(err or {}), "action": "memory.add"}, [], 400
 
-    incoming_inner = None
-    if api_key or runtime_token:
-        incoming_inner, incoming_err = _memory_plain_from_envelope(
-            envelope, api_key, runtime_token=runtime_token
-        )
-        if incoming_inner is None:
-            return {
-                "status": "error",
-                "error": incoming_err or "memory_plaintext_unavailable",
-                "action": "memory.add",
-            }, [], 409
     moment = _memory_record_from_prebuilt_envelope(store, envelope)
     with memory_service.mutation_lock(store):
         moments = memory_service._load_moments(store)
-        if incoming_inner is not None:
-            duplicate = _memory_active_duplicate(
-                moments, incoming_inner, api_key, runtime_token=runtime_token
-            )
-            if duplicate is not None:
-                return _memory_duplicate_result(duplicate)
         moments.append(moment)
         memory_service._save_moments(store, moments)
     boot_gates._log_bootstrap_event(store, "memory_action_added_envelope_v1", success=True)
