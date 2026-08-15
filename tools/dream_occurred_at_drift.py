@@ -26,6 +26,7 @@ import json
 import os
 import statistics
 import sys
+import ssl
 import urllib.request
 from datetime import datetime, timezone
 
@@ -142,18 +143,35 @@ def analyse(cards: list[dict]) -> dict:
     return out
 
 
+def _ssl_context() -> ssl.SSLContext:
+    """macOS 的 python.org 安装不带系统根证书,默认会 CERTIFICATE_VERIFY_FAILED
+    (curl 却是好的,所以很容易误判成"端点坏了")。有 certifi 就用它。"""
+    try:
+        import certifi
+
+        return ssl.create_default_context(cafile=certifi.where())
+    except ImportError:
+        return ssl.create_default_context()
+
+
 def fetch_all(host: str, uid: str, token: str, page: int = 500) -> list[dict]:
     cards, offset = [], 0
     while True:
         url = f"{host}/v1/admin/users/{uid}/memory-card-metadata?limit={page}&offset={offset}"
         req = urllib.request.Request(url, headers={"X-Admin-Token": token})
-        with urllib.request.urlopen(req, timeout=120) as resp:
+        with urllib.request.urlopen(req, timeout=120, context=_ssl_context()) as resp:
             body = json.load(resp)
         batch = body.get("cards") or []
         cards += batch
-        total = int(body.get("total") or 0)
+        # 分页信息在 `pagination` 下,不在顶层。读顶层会拿到 None -> total=0 ->
+        # 第一页就 return,**静默只取一页**(实测 2026-08-15:真实形状是
+        # {"user_id":..,"cards":[..],"pagination":{"limit","offset","total","has_more"}})。
+        page_info = body.get("pagination") or {}
+        total = int(page_info.get("total") or 0)
         offset += len(batch)
         if not batch or offset >= total:
+            if total and len(cards) < total:
+                raise RuntimeError(f"分页未取全:{len(cards)}/{total} —— 拒绝用残缺样本出数")
             return cards
 
 
