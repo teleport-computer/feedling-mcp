@@ -84,6 +84,26 @@ def dau_payload(query_string: str) -> dict:
         return data_track._data_track_dau_payload()
 
 
+def events_payload(query_string: str) -> dict:
+    """Return the content-free event-health aggregates for one Beijing day.
+
+    ``capture`` deliberately preserves :func:`db.admin_events_overview`'s
+    category-level contract: it combines capture, dream, and migrate jobs.  It
+    must not be presented downstream as a dream-only metric.
+    """
+    with bind(query_string):
+        raw_day = str(request.args.get("day") or "").strip()
+        day = (
+            data_track._validated_dau_day(raw_day)
+            if raw_day
+            else data_track._events_today()
+        )
+        return {
+            "filters": {"day": day, "timezone": "Asia/Shanghai"},
+            **db.admin_events_overview(day=day, tz="Asia/Shanghai"),
+        }
+
+
 def growth_payload(query_string: str) -> dict:
     with bind(query_string):
         return data_track._data_track_growth_payload()
