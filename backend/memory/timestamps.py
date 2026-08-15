@@ -8,11 +8,13 @@ comparison convention.
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+import re
+from datetime import date, datetime, timezone
 from typing import Any
 
 
 _MIN_UTC = datetime.min.replace(tzinfo=timezone.utc)
+_DATE_ONLY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 
 def parse_ts(raw: Any) -> datetime | None:
@@ -34,3 +36,31 @@ def sort_key(raw: Any) -> tuple[bool, datetime]:
     """Descending-sort key: valid instants first, malformed/empty values last."""
     parsed = parse_ts(raw)
     return parsed is not None, parsed or _MIN_UTC
+
+
+def now_iso() -> str:
+    """Return the canonical timestamp for a newly written Memory Garden card."""
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def normalize(raw: Any) -> str:
+    """Normalize a supplied card timestamp without inventing missing precision.
+
+    Date-only values stay date-only. Datetimes are converted to their UTC
+    instant and emitted with ``Z``; supplied microseconds are preserved.
+    Empty or malformed values stay empty so callers never silently invent a
+    date for undated material.
+    """
+    value = str(raw or "").strip()
+    if not value:
+        return ""
+    if _DATE_ONLY_RE.fullmatch(value):
+        try:
+            date.fromisoformat(value)
+        except ValueError:
+            return ""
+        return value
+    parsed = parse_ts(value)
+    if parsed is None:
+        return ""
+    return parsed.isoformat().replace("+00:00", "Z")

@@ -78,6 +78,7 @@ from core import provider_usage
 from core import self_thinking
 from core import store as core_store
 from core import wake_bus as core_wake_bus
+from memory import timestamps as memory_timestamps
 from core.downloadable_reply import sanitize_downloadable_reply
 from perception.glance import (
     perception_glance_fingerprint,
@@ -4715,7 +4716,7 @@ def _memory_tool_actions(raw_actions) -> list[dict]:
             #
             # 刻意放在字典**前面**、且不读 a.get("occurred_at"):这是服务端的可信元数据,
             # 不接受模型自报(schema 里也没有这个字段)。
-            "occurred_at": core_util._now_iso(),
+            "occurred_at": memory_timestamps.now_iso(),
         }
         # ⚠️ 只在模型**真的传了**的时候才放这两个键。
         #

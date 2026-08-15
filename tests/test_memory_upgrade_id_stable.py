@@ -17,6 +17,7 @@ from __future__ import annotations
 import sys
 import threading
 import types
+from contextlib import nullcontext
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
@@ -64,6 +65,11 @@ def _patch(monkeypatch, existing: dict, captured: dict):
     from memory import migration as _migration  # noqa: E402
     monkeypatch.setattr(_migration, "migration_enabled", lambda: True)
     monkeypatch.setattr(memory_actions.memory_service, "_load_moments", lambda _s: [dict(existing)])
+    monkeypatch.setattr(
+        memory_actions.memory_service,
+        "mutation_lock",
+        lambda _store: nullcontext(),
+    )
     monkeypatch.setattr(memory_actions.db, "memory_upsert", fake_upsert)
     monkeypatch.setattr(memory_actions.memory_service, "_append_memory_change", lambda _s, c: {"id": "chg", **c})
 
@@ -86,7 +92,10 @@ def test_upgrade_rejects_envelope_id_mismatch(monkeypatch):
 def test_upgrade_writes_when_envelope_id_matches(monkeypatch):
     memory_id = "mom_original_123"
     captured: dict = {}
-    _patch(monkeypatch, _existing(memory_id), captured)
+    existing = _existing(memory_id)
+    existing["occurred_at"] = "2026-01-01T08:00:00+08:00"
+    existing["created_at"] = "2026-01-01T00:00:00.123456"
+    _patch(monkeypatch, existing, captured)
     store = types.SimpleNamespace(user_id="usr_test", memory_lock=threading.Lock())
 
     action = {"id": memory_id, "old_body_hash": "", "envelope": _envelope(memory_id)}
@@ -97,3 +106,6 @@ def test_upgrade_writes_when_envelope_id_matches(monkeypatch):
     assert captured["slot_id"] == memory_id
     assert captured["doc"]["id"] == memory_id  # id stays
     assert captured["doc"]["body_ct"] == "new_v1_ciphertext"  # content upgraded
+    # An in-place mutation must not become an implicit historical backfill.
+    assert captured["doc"]["occurred_at"] == "2026-01-01T08:00:00+08:00"
+    assert captured["doc"]["created_at"] == "2026-01-01T00:00:00.123456"

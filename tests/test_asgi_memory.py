@@ -367,12 +367,17 @@ def test_add_success_201_parity(user, monkeypatch):
     uid, api_key = user
     _patch_empty_store(monkeypatch)
     env = _envelope(uid)
+    env["occurred_at"] = "2026-06-20T18:00:00+08:00"
     f = _flask("POST", "/v1/memory/add", headers=_headers(api_key), json_body={"envelope": env})
     a = _asgi("POST", "/v1/memory/add", headers=_headers(api_key), json_body={"envelope": env})
     assert f[0] == a[0] == 201
     # created_at is stamped with datetime.now() at add time — blank before compare.
     assert _blank(f[1], "created_at") == _blank(a[1], "created_at")
     assert f[1]["moment"]["id"] == "mom_test"
+    assert f[1]["moment"]["occurred_at"] == "2026-06-20T10:00:00Z"
+    assert a[1]["moment"]["occurred_at"] == "2026-06-20T10:00:00Z"
+    assert f[1]["moment"]["created_at"].endswith("Z")
+    assert a[1]["moment"]["created_at"].endswith("Z")
     assert f[1]["v"] == 1
 
 

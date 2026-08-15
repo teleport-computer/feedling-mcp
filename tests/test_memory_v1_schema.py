@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import sys
 import types
+from contextlib import nullcontext
 from pathlib import Path
 
 import pytest
@@ -12,6 +13,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
 from enclave import readside  # noqa: E402
 from memory import actions as memory_actions  # noqa: E402
+from memory import memory_core  # noqa: E402
 from memory import service as memory_service  # noqa: E402
 from memory.source_policy import MEMORY_SOURCE_VALUES  # noqa: E402
 
@@ -89,7 +91,7 @@ def test_memory_add_writes_clean_v1_schema_without_legacy_fields(monkeypatch):
                 "threads": ["蛋子", "狗狗"],
                 "importance": 0.72,
                 "pulse": 0.45,
-                "occurred_at": "2026-06-25T12:24:00",
+                "occurred_at": "2026-06-25T20:24:00+08:00",
                 "source": "chat",
             },
         }
@@ -101,6 +103,8 @@ def test_memory_add_writes_clean_v1_schema_without_legacy_fields(monkeypatch):
     assert moment["importance"] == 0.72
     assert moment["pulse"] == 0.45
     assert moment["status"] == "active"
+    assert moment["occurred_at"] == "2026-06-25T12:24:00Z"
+    assert moment["created_at"].endswith("Z")
     assert moment["last_referenced_at"] == moment["occurred_at"]
     for legacy_key in ("type", "card_v", "salience", "source_type", "anchor_memory_ids"):
         assert legacy_key not in moment
@@ -112,6 +116,50 @@ def test_memory_add_writes_clean_v1_schema_without_legacy_fields(monkeypatch):
         "bucket": "宠物",
         "threads": ["蛋子", "狗狗"],
     }
+
+
+def test_memory_add_route_normalizes_supplied_timestamp(monkeypatch):
+    store = types.SimpleNamespace(user_id="usr_v1_route")
+    saved: list[dict] = []
+    monkeypatch.setattr(memory_core.memory_service, "_load_moments", lambda _store: [])
+    monkeypatch.setattr(
+        memory_core.memory_service,
+        "_save_moments",
+        lambda _store, moments: saved.extend(moments),
+    )
+    monkeypatch.setattr(
+        memory_core.memory_service,
+        "mutation_lock",
+        lambda _store: nullcontext(),
+    )
+    monkeypatch.setattr(
+        memory_core.boot_gates,
+        "_log_bootstrap_event",
+        lambda *_args, **_kwargs: None,
+    )
+    envelope = {
+        "id": "mem_route_timestamp",
+        "type": "fact",
+        "body_ct": "ciphertext",
+        "nonce": "nonce",
+        "K_user": "ku",
+        "K_enclave": "ke",
+        "visibility": "shared",
+        "owner_user_id": store.user_id,
+        "occurred_at": "2026-08-15T20:00:00+08:00",
+    }
+
+    body, status = memory_core.add(store, {"envelope": envelope})
+
+    assert status == 201, body
+    assert saved[0]["occurred_at"] == "2026-08-15T12:00:00Z"
+    assert saved[0]["created_at"].endswith("Z")
+    assert "." not in saved[0]["created_at"]
+
+    envelope["occurred_at"] = "not-a-date"
+    body, status = memory_core.add(store, {"envelope": envelope})
+    assert status == 400
+    assert body["error"].startswith("occurred_at required")
 
 
 def test_memory_add_truncation_emits_content_free_counts_without_behavior_change(monkeypatch):

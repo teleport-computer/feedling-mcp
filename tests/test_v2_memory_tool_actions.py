@@ -273,30 +273,42 @@ def test_occurred_at_is_frozen_at_enqueue_not_at_apply(monkeypatch):
     对齐 V1 的做法就是在入队时冻结,和 identity 的 relationship_anchor
     (`_frozen_relationship_anchor`,同样在 ENQUEUE 冻结)是同一条惯例。
     """
-    monkeypatch.setattr(worker.core_util, "_now_iso", lambda: "2026-08-10T23:00:00")
+    monkeypatch.setattr(
+        worker.memory_timestamps,
+        "now_iso",
+        lambda: "2026-08-10T23:00:00Z",
+    )
 
     out = worker._memory_tool_actions([{"op": "add", "summary": "s", "content": "c"}])
 
-    assert out[0]["memory"]["occurred_at"] == "2026-08-10T23:00:00"
+    assert out[0]["memory"]["occurred_at"] == "2026-08-10T23:00:00Z"
 
 
 def test_model_cannot_forge_occurred_at(monkeypatch):
     """时间是服务端的可信元数据,不接受模型自报 —— schema 里也没这个字段。"""
-    monkeypatch.setattr(worker.core_util, "_now_iso", lambda: "2026-08-10T23:00:00")
+    monkeypatch.setattr(
+        worker.memory_timestamps,
+        "now_iso",
+        lambda: "2026-08-10T23:00:00Z",
+    )
 
     out = worker._memory_tool_actions([{
         "op": "add", "summary": "s", "content": "c",
         "occurred_at": "1999-01-01T00:00:00",
     }])
 
-    assert out[0]["memory"]["occurred_at"] == "2026-08-10T23:00:00"
+    assert out[0]["memory"]["occurred_at"] == "2026-08-10T23:00:00Z"
 
 
 def test_update_also_carries_a_frozen_time(monkeypatch):
     """supersede 走的是同一个 raw（action["memory"]），同样要带上。"""
-    monkeypatch.setattr(worker.core_util, "_now_iso", lambda: "2026-08-10T23:00:00")
+    monkeypatch.setattr(
+        worker.memory_timestamps,
+        "now_iso",
+        lambda: "2026-08-10T23:00:00Z",
+    )
 
     out = worker._memory_tool_actions([
         {"op": "update", "target_id": "mem_1", "summary": "新", "content": "内容"}])
 
-    assert out[0]["memory"]["occurred_at"] == "2026-08-10T23:00:00"
+    assert out[0]["memory"]["occurred_at"] == "2026-08-10T23:00:00Z"
