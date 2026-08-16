@@ -470,3 +470,27 @@ git show origin/test:<file> | grep -c '<行为代码>'
 **同族**:`merge-base --is-ancestor` 在 squash/rebase 合入后会说「不在」,
 而内容明明在(2026-08-15 同一晚也误报过一次,差点把 Seven 亲自合的 PR 判成没合)。
 **合入/等价/多余这三类问题,一律按内容或 patch-id 查,不要用祖先关系或跨底座 diff。**
+
+## 模式 19:切运行时要动**两个**控制面,只翻一个会被调和器悄悄回滚
+
+**案例(2026-08-16,prod)**:把一个账号从 V1 切到 V2,只 POST
+`/v1/admin/hosted-runtime-mode {mode: db_action_v2}` —— **返回 200,但什么都没发生**。
+因为白名单里 `desired` 还是 `resident`,**调和器会把 resident 重新拉起来**
+(实测 20 秒内 generation 涨 4 代),`effective_responder` 纹丝不动。
+
+**正确做法:两个控制面一起翻。**
+```
+POST /v1/admin/hosted-runtime-mode  {mode: db_action_v2}
+POST /v1/admin/runtime-allowlist    {desired: v2}
+```
+
+**判据:只认 `effective_responder`,不认 HTTP 200。**
+切完还要看 `generation` 是否稳定(收敛后不再跳代)+ `converged=True`,
+观察至少 2 分钟 —— 因为调和器的回拉不是瞬时的,立刻查会看到"已经切好了"的假象。
+
+**留回滚点**:切换前把原 `desired` 和 `generation` 存一份
+(例:`/tmp/rollback_<uid>.json`),否则回退时不知道原值。
+
+**同族**:这是「状态字段 ≠ 实际产出」的又一实例 ——
+**写操作返回 200 只证明请求被接受,不证明系统状态真的变了。**
+凡是有调和器/控制循环的地方,判据必须锚在**被调和的那个值**上,不是在写请求的响应码上。
