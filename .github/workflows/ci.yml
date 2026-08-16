@@ -221,6 +221,7 @@ jobs:
             tests/test_memory_garden_purity.py \
             tests/test_memory_garden_policies.py \
             tests/test_memory_garden_capture_golden.py \
+            tests/test_memory_garden_dream_migrate_golden.py \
             tests/test_memory_garden_prompt_params.py \
             tests/test_memory_garden_storage_port.py \
             tests/test_memory_garden_dreaming.py \
