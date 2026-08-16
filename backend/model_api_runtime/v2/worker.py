@@ -5360,12 +5360,19 @@ def _self_thinking_internal_terms() -> frozenset[str]:
 
 
 def _self_thinking_internal_term(text: str) -> str | None:
-    """Return the first model-facing tool name leaked into thinking, if any."""
+    """Return the first internal identifier leaked into visible thinking.
+
+    两类都查,因为它们互补:
+      · **工具名**(B2-1 已有):从 build_tool_specs 派生,随工具面自动扩展
+      · **内部字段名/协议词**(本批补):共享内核的闭集,V1 早有、V2 一直缺 ——
+        `_sanitize_reasoning` 的 docstring 明写「只截长度,原样渲染」,
+        所以 `session_id: …` / `permission_denials` / `costUSD` 会直达用户。
+    """
     value = str(text or "")
     for name in sorted(_self_thinking_internal_terms(), key=len, reverse=True):
         if name in value:
             return name
-    return None
+    return self_thinking.internal_field_leak(value)
 
 
 def _self_thinking_language_mismatch(
