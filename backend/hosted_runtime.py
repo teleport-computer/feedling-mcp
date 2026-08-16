@@ -5,7 +5,7 @@ import uuid
 from datetime import date
 from typing import Any
 
-from memory import timestamps as memory_timestamps
+from memory_garden import timestamps as memory_timestamps
 from memory_garden.prompts.buckets import MEMORY_WRITE_GUIDANCE_V1
 
 

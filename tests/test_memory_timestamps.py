@@ -9,7 +9,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
-from memory import timestamps as memory_timestamps  # noqa: E402
+from memory_garden import timestamps as memory_timestamps  # noqa: E402
 
 
 @pytest.mark.parametrize(

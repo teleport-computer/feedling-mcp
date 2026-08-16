@@ -78,7 +78,7 @@ from core import provider_usage
 from core import self_thinking
 from core import store as core_store
 from core import wake_bus as core_wake_bus
-from memory import timestamps as memory_timestamps
+from memory_garden import timestamps as memory_timestamps
 from core.downloadable_reply import sanitize_downloadable_reply
 from perception.glance import (
     perception_glance_fingerprint,

@@ -132,15 +132,27 @@ def test_kernel_modules_import_without_side_effects():
 # core 同样必须是纯的
 # --------------------------------------------------------------------------- #
 
+# 内核与聊天主链路**共用**的那两个协议模块。它们住在 io 的 `core/` 包里
+# （主线的既定落点），但 core 整体不是纯包，所以只能点名守这两个文件，
+# 不能对整个 core/ 断言纯度。
+#
+# 2026-08-15：这两个模块曾被短暂放进 memory_garden，Codex 指出那会让
+# **普通聊天反向依赖记忆包**；同期主线独立把它们放进了 core/。两边结论一致，
+# 按主线走。这里守的就是"放对了地方之后不许再漂回去"。
+_PROTOCOL_MODULES = ("self_thinking.py", "protocol_leak.py")
 _PROTOCOL_ROOT = _BACKEND_ROOT / "core"
 
 
 def _protocol_files() -> list[pathlib.Path]:
-    return sorted(p for p in _PROTOCOL_ROOT.rglob("*.py") if "__pycache__" not in p.parts)
+    return [_PROTOCOL_ROOT / name for name in _PROTOCOL_MODULES]
 
 
 def test_protocol_core_is_not_empty():
-    assert _protocol_files(), f"core 为空：{_PROTOCOL_ROOT}"
+    missing = [p.name for p in _protocol_files() if not p.exists()]
+    assert not missing, (
+        f"共用协议模块不在 {_PROTOCOL_ROOT}：{missing} —— "
+        "被搬走了就要同步改这里，别让守卫空转"
+    )
 
 
 def test_protocol_core_imports_only_stdlib():

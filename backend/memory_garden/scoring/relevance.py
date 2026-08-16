@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import re
 
-from memory import timestamps as memory_timestamps
+from .. import timestamps as memory_timestamps
 
 
 _MEMORY_TEXT_FIELDS = ("title", "description", "her_quote", "context", "linked_dimension")
