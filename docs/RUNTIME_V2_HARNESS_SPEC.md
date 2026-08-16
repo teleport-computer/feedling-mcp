@@ -43,8 +43,14 @@ pull-only 不是错的,错的是「只有 pull」。V1 = 直接注入 + 工具�
   健康 notables),构建在 `backend/perception/history.py:538-561`;
   另有 `:12921-12940` presence hints(`place_label` / `motion_state` /
   `now_playing` / `locale` / `broadcast_state`)。
-- **要求**:V2 心跳/screen_watch 唤醒注入等价内容。字段与上限逐条对齐 V1,
+- **要求**:V2 **心跳(heartbeat)** 唤醒注入等价内容。字段与上限逐条对齐 V1,
   不新增、不扩容。工具仍保留,模型可自行深挖。
+- ⚠️ **screen_watch 不在本条范围内**(codex2 2026-08-16 核出,claude2 复核确认)。
+  V1 `chat_resident_consumer.py:14462` 显式
+  `perception_digest = None if _is_screen_watch_job(job) else ...`,
+  注释写明「Screen-watch is a light lane… its prompt **deliberately** omits the board」。
+  给 screen_watch 灌跨域板 = 做得比 V1 多,违反本规格「对齐 V1」的总口径。
+  **screen_watch 只补 B1-3 的 OCR / app 名 / 像素。**
 
 ### B1-2 感知唤醒记录的孤儿字段
 
