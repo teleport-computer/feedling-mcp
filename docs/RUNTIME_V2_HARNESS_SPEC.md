@@ -339,7 +339,28 @@ B4-1 `#21` → B4-2 `#17` → B4-3 `#15` → B4-4 `#18` → B4-5 `#3` → B4-6 `
   V1 有 `reclaim_stale_resident_jobs`(600s 租约)把它退回 pending。
 - 叠加 `scheduled_wake_v2.py:1152-1166` 在**入队时**就 `mark_fired`,
   于是一个卡住的提醒**永久丢失**且不重试。
-- **修法**:给 V2 一条等价回收路径。⚠️ 注意 V2 有自己的租约/世代栅栏,
+> ⚠️ **2026-08-17 实现前核查:根因与上面写的不同,以本框为准。**
+>
+> V2 **不是**「没有回收器」—— 它有自己的一套(`jobs_store.reap_stuck_job_rows:1752`
+> / `reap_stuck_jobs:3601` / `serve_worker._reaper_loop` / `v2/reaper.py`)。
+> 被 `poll_core.py:63` 豁免的是 **V1 的** `reclaim_stale_resident_jobs`,
+> 那条豁免本身是**正确**的(V2 不该用 V1 的回收器)。
+>
+> **真正的洞**:V2 的回收器把租约过期的任务判成 **`status='expired'`(终结)**,
+> `last_error='lease_timeout'`,并对 `chat`/`scheduled` 调
+> `_queue_terminal_failure_on_cursor` —— **不重投**。
+> 叠加 `scheduled_wake_v2.py:1152` 在**入队时**就 `mark_fired`,
+> 一个进程死掉造成的卡顿 = **提醒永久丢失**。
+>
+> **仓内已有正确形状可抄**:同文件 `:653` 的前台抢占路径已经按道分流 ——
+> `scheduled`/`capture` → `recovery="requeued"`(退回 pending),其余 → `terminal`。
+> **这个仓知道「提醒必须重投」,只是回收器那条路没这么做。**
+>
+> **修法**:让回收器对 `scheduled` 走 requeue 而非 expire,并加**有界重试次数**
+> (`attempt_count` 已在自增,用它设上限,避免一个永远失败的提醒无限重投)。
+> 其余道保持 terminal 不变。
+
+- **修法(原文,已被上面更正)**:给 V2 一条等价回收路径。⚠️ 注意 V2 有自己的租约/世代栅栏,
   不要照搬 resident 的 600s 常量 —— **先读 V2 的租约语义再定**,对不上就回报。
 - **验收**:构造一个卡在 realizing 的 V2 job,断言超过租约后回到 pending 并被重投。
 
