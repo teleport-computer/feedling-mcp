@@ -73,39 +73,80 @@ def test_migrate_prompt_is_byte_identical_to_baseline(case_name: str) -> None:
 
 
 def test_fixture_covers_the_shapes_that_break_templates() -> None:
-    """基线必须覆盖会撞 str.format 的花括号与全空输入 —— 否则守卫有洞。
+    """基线必须真的覆盖这两类形状 —— 断言**参数本身**,不是 case 名字。
 
-    这两类是模板类 bug 的高发形状:花括号会被 ``str.format`` 当占位符,
-    全空输入会暴露"默认档措辞"被改。少了任一类,golden 就只守住了顺风路径。
+    早先这条只检查 key 名里有没有 ``braces_in_content`` / ``all_empty``,
+    于是把 ``all_empty`` 的参数全填上值、把 ``braces_in_content`` 的花括号去掉,
+    它照样通过 —— 名字检查冒充了形状检查。判据改成看真实取值。
+
+    为什么钉这两类:全空用例暴露"默认档措辞"被改;含花括号的用例守住
+    参数里的 ``{}`` 原样进入产出(防未来有人加二次 format / 改拼装顺序时静默吃掉它)。
     """
     baseline = _baseline()
     for kind in ("dream", "migrate"):
-        names = set(baseline[kind])
-        assert "braces_in_content" in names, f"{kind} 基线缺花括号用例"
-        assert "all_empty" in names, f"{kind} 基线缺全空用例"
+        cases = baseline[kind]
 
-
-def test_dream_shell_and_kernel_are_not_two_implementations() -> None:
-    """壳只许装配参数,不许自己复制一份模板。
-
-    ``memory/dream_prompt_v1.py`` 是适配层(补 ``naming_rule`` 后转调内核),
-    不是纯 re-export —— 所以不能用 ``is`` 判定。判据改成:
-    壳的产出必须**包含**内核在同样输入下的模板主体。
-    若哪天有人在壳里复制一份模板改改,这条会红。
-    """
-    from memory_garden.prompts import dream as kernel
-
-    params = _baseline()["dream"]["typical"]["params"]
-    via_shell = build_dream_via_shell(**params)
-    naming_rule = "叫他老王。"
-    via_kernel = kernel.build_dream_prompt(naming_rule=naming_rule, **params)
-
-    # 壳与内核只应差在称呼那一段:去掉各自的称呼行之后必须逐字节相同。
-    def _strip_naming(text: str) -> str:
-        return "\n".join(
-            line for line in text.splitlines() if "称呼" not in line
+        assert "all_empty" in cases, f"{kind} 基线缺全空用例"
+        empty_params = cases["all_empty"]["params"]
+        non_empty = {k: v for k, v in empty_params.items() if str(v).strip()}
+        assert not non_empty, (
+            f"{kind}.all_empty 已经不是全空了:{sorted(non_empty)} —— "
+            "这个用例的意义就是压默认档措辞,填了值就守不住了"
         )
 
-    assert _strip_naming(via_shell) == _strip_naming(via_kernel), (
-        "壳与内核的模板主体不一致 —— 壳里可能复制了一份模板。"
+        assert "braces_in_content" in cases, f"{kind} 基线缺花括号用例"
+        braces_params = cases["braces_in_content"]["params"]
+        with_braces = [
+            k for k, v in braces_params.items() if "{" in str(v) and "}" in str(v)
+        ]
+        assert with_braces, (
+            f"{kind}.braces_in_content 的参数里已经没有花括号了:{braces_params} —— "
+            "名字还在但形状没了"
+        )
+        text = cases["braces_in_content"]["text"]
+        assert "{" in text and "}" in text, (
+            f"{kind}.braces_in_content 的产出里没有花括号 —— "
+            "参数里的 {} 应当原样出现在 prompt 中"
+        )
+
+
+def test_dream_shell_is_an_adapter_not_a_second_template() -> None:
+    """壳只许装配参数后转调内核,不许自己复制一份模板。
+
+    判据是**完全相等**,不做任何 strip:用壳内部同样的两个助手
+    (``sanitize_user_name`` / ``_naming_rule``)构造出内核入参,
+    两边产出必须一字不差。
+
+    早先这条用「删掉所有含『称呼』的行再比对」,那会把模板主体里静态的
+    称呼说明一起删掉 —— 改动那行时测试照样绿,声明不成立。
+
+    顺带钉住壳里那个刻意的不对称(见壳的 docstring):
+    ``naming_rule`` 取**未 sanitize** 的原始 user_name,
+    模板里的 ``user_name`` 取 **sanitize 后**的值。两者不同源。
+    """
+    from identity.user_naming import _naming_rule, sanitize_user_name
+    from memory_garden.prompts import dream as kernel
+
+    # 刻意用带前后空格的名字:sanitize 与否会产生不同结果,
+    # 抄错一边就会被这条抓住。
+    raw_user_name = "  老王 "
+    params = dict(
+        ai_name="io",
+        user_name=raw_user_name,
+        cards="卡1: 老婆是重庆人",
+        recent_conversations="用户:今天开了一天会",
+    )
+
+    via_shell = build_dream_via_shell(**params)
+    via_kernel = kernel.build_dream_prompt(
+        ai_name=params["ai_name"],
+        user_name=sanitize_user_name(raw_user_name),
+        naming_rule=_naming_rule(raw_user_name),
+        cards=params["cards"],
+        recent_conversations=params["recent_conversations"],
+    )
+
+    assert via_shell == via_kernel, (
+        "壳的产出与内核不一致 —— 壳里可能复制了一份模板,"
+        "或者 naming_rule / user_name 的 sanitize 取值被改成了同源。"
     )
