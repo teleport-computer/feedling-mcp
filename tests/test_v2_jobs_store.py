@@ -453,6 +453,36 @@ def test_lifecycle_running_completed_frees_singleflight_slot():
     assert coalesced is False
 
 
+def test_completed_wake_persists_auditable_sleep_reason():
+    uid = "u_js_stay_silent"
+    seed_user(uid)
+    _reset(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, "manual_wake")
+    jobs_store.claim_next_job("w")
+    jobs_store.mark_running(job_id, claimed_by="w")
+
+    assert jobs_store.mark_completed(
+        job_id,
+        claimed_by="w",
+        wake_result="sleep",
+        wake_result_reason="刚刚已经主动联系过",
+    )
+    with db.get_pool().connection() as conn:
+        row = conn.execute(
+            "SELECT status,wake_result,wake_result_reason FROM agent_jobs WHERE id=%s",
+            (job_id,),
+        ).fetchone()
+    assert row == ("completed", "sleep", "刚刚已经主动联系过")
+    activity = jobs_store.wake_lane_activity_for_user(uid)
+    assert activity["recent_silences"] == [{
+        "job_id": job_id,
+        "lane": "manual_wake",
+        "wake_result": "sleep",
+        "reason": "刚刚已经主动联系过",
+        "finished_at": activity["recent_silences"][0]["finished_at"],
+    }]
+
+
 def test_mark_failed_increments_attempt_count():
     seed_user("u_js_6")
     _reset("u_js_6")

@@ -6970,6 +6970,7 @@ async def _run_wake(
     """
     push_slot: dict | None = None
     shadow_decision_allowed: bool | None = None
+    stay_silent_reason: str | None = None
     language_user_rows: list[dict] = []
     try:
         store = core_store.get_store(user_id)
@@ -8564,12 +8565,18 @@ async def _run_wake(
                 screen_vision_verdict,
             )
 
+        async def _on_stay_silent(reason: str) -> None:
+            nonlocal stay_silent_reason, shadow_decision_allowed
+            stay_silent_reason = str(reason or "").strip()[:500]
+            shadow_decision_allowed = False
+
         try:
             await v2_tool_loop.run_tool_loop(
                 provider_config=provider_config,
                 build_messages=build_messages,
                 suppress_native_reasoning=_st_wake_loop.enabled(),
                 disabled_tool_names=wake_disabled_tool_names,
+                on_stay_silent=(_on_stay_silent if lane != "scheduled" else None),
                 memory_delete_allowed=False,
                 dispatch_tools=_dispatch_tools,
                 on_reply=_on_reply,
@@ -8698,6 +8705,8 @@ async def _run_wake(
                 completed_perception_glance_fingerprint=(
                     completed_glance_fingerprint
                 ),
+                wake_result=("sleep" if stay_silent_reason is not None else None),
+                wake_result_reason=stay_silent_reason,
             )
             heartbeat_terminalized = completed
         else:
@@ -8712,6 +8721,8 @@ async def _run_wake(
                 job_id,
                 claimed_by=claimed_by,
                 clear_wake_backoff=(lane in _FAIL_BACKOFF_WAKE_LANES),
+                wake_result=("sleep" if stay_silent_reason is not None else None),
+                wake_result_reason=stay_silent_reason,
             )
             if lane == "heartbeat":
                 heartbeat_terminalized = transitioned
