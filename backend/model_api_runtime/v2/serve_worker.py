@@ -5268,7 +5268,7 @@ _validate_mcp_timeout_below_stall(
 )
 
 _TURN_ABSOLUTE_TIMEOUT_SEC = _positive_float_env(
-    "FEEDLING_V2_TURN_ABSOLUTE_TIMEOUT_SEC", "1800"
+    "FEEDLING_V2_TURN_ABSOLUTE_TIMEOUT_SEC", "3000"
 )
 _CHAT_TURN_BUDGET_SEC = (
     float(v2_worker._PROMPT_CATCHUP_DEADLINE_SEC)
