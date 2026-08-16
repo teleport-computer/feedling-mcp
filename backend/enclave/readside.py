@@ -87,7 +87,10 @@ def context_moment_to_index_item(moment: dict) -> dict:
         "status": "active",
         "salience": "medium",
         "is_open_thread": False,
-        "is_sensitive": False,
+        # 由 moments_to_cards 带上来的真实标记。此前这里硬写 False，
+        # selector 的敏感闸（scoring/selector.py 的 sensitive_not_allowed_for_query）
+        # 因而永不触发 —— 标了敏感的卡在普通闲聊里照样会被选中喂给模型。
+        "is_sensitive": bool(moment.get("is_sensitive")),
         "score": 0,
         "occurred_at": memory_readside_text(moment.get("occurred_at"), 80),
         "created_at": memory_readside_text(moment.get("created_at"), 80),
@@ -407,5 +410,10 @@ def moments_to_cards(moments: list, authorized_user_id: str, content_sk) -> list
             "her_quote": inner.get("her_quote"),
             "context": inner.get("context"),
             "linked_dimension": inner.get("linked_dimension"),
+            # 敏感标记必须跟着卡走 —— Route B 以前在 context_moment_to_index_item
+            # 里硬写 is_sensitive=False，于是 selector 的「敏感卡不给非敏感提问」
+            # 那道闸永远看不到真实标记，等于空转（2026-08-16 查实）。
+            # 这里用与 index/fetch 同一个判据，避免第三套语义。
+            "is_sensitive": memory_readside_is_sensitive(m, inner),
         })
     return out
