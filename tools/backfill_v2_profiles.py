@@ -16,7 +16,6 @@ from __future__ import annotations
 import argparse
 import asyncio
 from collections import Counter
-from copy import deepcopy
 import json
 import os
 from pathlib import Path
@@ -118,30 +117,14 @@ def rescue_stuck_profile(
 ) -> str:
     """CAS-clear a permanent retry disposition, preserving both envelopes."""
 
-    for _cas_attempt in (1, 2):
-        raw = read_profile(str(user_id), profile_store.PROFILE_BLOB_KIND)
-        state, disposition, document = _metadata(raw)
-        if document is None or state == "ok":
-            return "skipped_fresh"
-        if document.get("disabled") is True:
-            return "skipped_disabled"
-        if disposition not in profile_store.PROFILE_STUCK_RETRY_DISPOSITIONS:
-            return "skipped_fresh"
-
-        last_attempt = deepcopy(document["last_attempt"])
-        last_attempt["retry_disposition"] = ""
-        last_attempt["retry_not_before"] = 0.0
-        candidate = deepcopy(document)
-        candidate["last_attempt"] = last_attempt
-        candidate = profile_store.validate_profile_document(candidate)
-        if compare_and_swap(
-            str(user_id),
-            profile_store.PROFILE_BLOB_KIND,
-            raw,
-            candidate,
-        ):
-            return f"rescued_{disposition}"
-    raise RuntimeError("profile_rescue_cas_failed")
+    result = profile_store.repair_stuck_profile_retry(
+        str(user_id),
+        read_profile=read_profile,
+        compare_and_swap=compare_and_swap,
+    )
+    if result.status == "repaired":
+        return f"rescued_{result.disposition}"
+    return result.status
 
 
 def _enqueue_profile(user_id: str) -> bool:

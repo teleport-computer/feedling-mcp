@@ -51,6 +51,7 @@ from model_api_runtime.v2 import effect_outbox as v2_effect_outbox
 from model_api_runtime.v2 import screen_chat as v2_screen_chat
 from model_api_runtime.v2 import jobs_store
 from model_api_runtime.v2 import coalesce as v2_coalesce
+from model_api_runtime.v2 import profile_store
 from model_api_runtime.v2 import serve_worker
 from model_api_runtime.v2 import worker
 from tools.e2e.client import E2EClient, TEST_API
@@ -1560,6 +1561,13 @@ def test_ordinary_heartbeat_gives_fingerprint_to_atomic_finish(monkeypatch):
         return True, None
 
     monkeypatch.setattr(provider_client, "chat_completion_async", fake_provider)
+    monkeypatch.setattr(
+        profile_store,
+        "repair_stuck_profile_retry",
+        lambda *_args, **_kwargs: pytest.fail(
+            "wake success must not repair foreground provider state"
+        ),
+    )
     monkeypatch.setattr(worker, "_cap_data", fake_cap_data)
     monkeypatch.setattr(jobs_store, "finish_wake_job", fake_finish)
     monkeypatch.setattr(

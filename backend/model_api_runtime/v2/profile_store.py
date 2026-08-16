@@ -36,6 +36,10 @@ PROFILE_RETRY_DISPOSITIONS = frozenset(
 # one source of truth: copying these strings into an operator script can leave
 # a newly introduced permanent disposition stranded forever.
 PROFILE_STUCK_RETRY_DISPOSITIONS = frozenset({"provider_config", "terminal"})
+# A successful foreground chat proves only that the user's provider credential
+# works again.  It may automatically re-arm provider-config failures, but a
+# terminal disposition remains an explicit operator-only decision.
+PROFILE_PROVIDER_SUCCESS_RECOVERABLE_DISPOSITIONS = frozenset({"provider_config"})
 _REJECT_CODE_RE = re.compile(r"^[A-Za-z0-9_.:-]{0,160}$")
 
 
@@ -58,6 +62,13 @@ class ProfileCasResult:
     document: dict
     cas_attempts: int
     recomputations: int
+
+
+@dataclass(frozen=True)
+class ProfileRetryRepairResult:
+    status: str
+    disposition: str = ""
+    cas_attempts: int = 0
 
 
 _fallback_lock = threading.Lock()
@@ -366,6 +377,58 @@ def _winner_supersedes(winner: dict, candidate: dict) -> bool:
         and _timestamp_rank(winner_source["max_updated_at"])
         >= _timestamp_rank(candidate_source["max_updated_at"])
     )
+
+
+def repair_stuck_profile_retry(
+    user_id: str,
+    *,
+    target_dispositions: frozenset[str] = PROFILE_STUCK_RETRY_DISPOSITIONS,
+    read_profile: Callable[[str, str], Any] | None = None,
+    compare_and_swap: Callable[..., bool] | None = None,
+) -> ProfileRetryRepairResult:
+    """CAS-clear selected stuck retry metadata without touching profile fields.
+
+    The document is re-read on every CAS attempt.  That second predicate check
+    is load-bearing: a concurrent profile lane may have already moved the user
+    to a scheduled retry or healthy state, which must not be cleared using a
+    stale plan.  Callers choose the allowed stuck subset; terminal is therefore
+    kept operator-only when chat success passes only provider_config.
+    """
+
+    targets = frozenset(str(value) for value in target_dispositions)
+    if not targets or not targets.issubset(PROFILE_STUCK_RETRY_DISPOSITIONS):
+        raise ProfileStorageError("profile_retry_repair_target_invalid")
+    read = read_profile or db.get_blob_strict
+    cas = compare_and_swap or db.set_blob_if_unchanged
+    for cas_attempt in (1, 2):
+        raw = read(str(user_id), PROFILE_BLOB_KIND)
+        if raw is None:
+            return ProfileRetryRepairResult("skipped_fresh", cas_attempts=cas_attempt)
+        document = validate_profile_document(raw)
+        if document.get("disabled") is True:
+            return ProfileRetryRepairResult(
+                "skipped_disabled", cas_attempts=cas_attempt
+            )
+        state = str(document.get("state") or "")
+        disposition = str(
+            (document.get("last_attempt") or {}).get("retry_disposition") or ""
+        )
+        if state == "ok" or disposition not in targets:
+            return ProfileRetryRepairResult("skipped_fresh", cas_attempts=cas_attempt)
+
+        candidate = deepcopy(document)
+        last_attempt = deepcopy(candidate["last_attempt"])
+        last_attempt["retry_disposition"] = ""
+        last_attempt["retry_not_before"] = 0.0
+        candidate["last_attempt"] = last_attempt
+        candidate = validate_profile_document(candidate)
+        if cas(str(user_id), PROFILE_BLOB_KIND, raw, candidate):
+            return ProfileRetryRepairResult(
+                "repaired",
+                disposition=disposition,
+                cas_attempts=cas_attempt,
+            )
+    raise ProfileStorageError("profile_retry_repair_cas_failed")
 
 
 def update_profile_cas(
