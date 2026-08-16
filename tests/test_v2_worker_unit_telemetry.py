@@ -236,6 +236,26 @@ def test_thinking_surface_selector_has_four_explicit_branches(
         assert (kind, source, native) == ("provider_reasoning", None, True)
 
 
+def test_self_thinking_internal_terms_are_derived_from_tool_specs():
+    terms = worker._self_thinking_internal_terms()
+    assert terms == {
+        str(spec.name)
+        for spec in worker.cap_tool_schema.build_tool_specs()
+        if str(spec.name).strip()
+    }
+    assert worker._self_thinking_internal_term("我会调用 memory_write") == "memory_write"
+    assert worker._self_thinking_internal_term("我会聊天") is None
+
+
+def test_self_thinking_language_mismatch_is_closed_and_content_free():
+    assert worker._self_thinking_language_mismatch(
+        "Let me check this carefully", [{"role": "user", "content": "请帮我看看这个内容好吗"}]
+    ) == ("han", "latin")
+    assert worker._self_thinking_language_mismatch(
+        "我来认真看看这个内容好吗", [{"role": "user", "content": "请帮我看看这个内容好吗"}]
+    ) is None
+
+
 def test_thinking_surface_trace_contains_metadata_only():
     captured = {}
 

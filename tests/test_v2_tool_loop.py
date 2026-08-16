@@ -20,6 +20,8 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 import pytest
 
 import provider_client
+from capabilities import registry as cap_registry
+from capabilities import tool_schema as cap_tool_schema
 from provider_types import ProviderMedia, ToolExchange, ToolResult
 from model_api_runtime.v2 import executor as v2_executor
 from model_api_runtime.v2 import tool_loop
@@ -392,6 +394,36 @@ def test_initial_outbound_fence_is_armed_before_first_provider_call(monkeypatch)
 
     offered = {spec.name for spec in (provider.calls[0]["tools"] or ())}
     assert {"web_search", "web_fetch", "task"}.isdisjoint(offered)
+
+
+def test_foreground_screen_context_does_not_remove_write_surface(monkeypatch):
+    provider = _ScriptedProvider([
+        {"reply": "已看到", "tool_calls": [], "usage": {}},
+    ])
+    monkeypatch.setattr(provider_client, "chat_completion_async", provider)
+    screen_message = {
+        "role": "user",
+        "content": [{"type": "text", "text": "ocr_text (untrusted): note"}],
+        "_screen_test": True,
+    }
+
+    asyncio.run(tool_loop.run_tool_loop(
+        provider_config=_TEST_PROVIDER_CONFIG,
+        build_messages=lambda _transcript: [screen_message],
+        dispatch_tools=_RecordingDispatch(),
+        on_reply=_RecordingReply(),
+        fold_new_messages=_RecordingFold([]),
+        add_usage=_noop_add_usage,
+        max_calls=2,
+        initial_outbound_tools_blocked=False,
+    ))
+
+    offered = {spec.name for spec in provider.calls[0]["tools"]}
+    identity_writes = {
+        name for name in cap_registry.WRITE_ACTIONS if name.startswith("identity_")
+    }
+    assert identity_writes <= offered
+    assert {"memory_write", "schedule_wake", cap_tool_schema.REPLY_TOOL} <= offered
 
 
 def test_provider_image_is_a_terminal_reply_without_synthetic_text(monkeypatch):

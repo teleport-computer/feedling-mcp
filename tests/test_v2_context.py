@@ -152,6 +152,35 @@ def test_build_turn_messages_orders_persona_summary_tail():
     assert msgs[-1]["content"] == "how are you"
 
 
+def test_proactive_history_source_is_structured_without_changing_assistant_role():
+    messages = context.build_turn_messages(
+        system_prompt="SYS",
+        summary="",
+        tail=[
+            {"role": "assistant", "source": "chat", "content": "ordinary"},
+            {
+                "role": "openclaw",
+                "source": "agent_initiated_proactive",
+                "content": "你睡了吗",
+            },
+        ],
+    )
+
+    assert messages[1] == {"role": "assistant", "content": "ordinary"}
+    assert messages[2]["role"] == "assistant"
+    assert messages[2]["content"] == "你睡了吗"
+    temporal = context.build_temporal_context(
+        now_ts=1000.0,
+        timezone_name="Asia/Shanghai",
+        last_user_message_ts=None,
+        tail=[
+            {"role": "assistant", "source": "chat", "content": "ordinary", "ts": 900.0},
+            {"role": "openclaw", "source": "agent_initiated_proactive", "content": "你睡了吗", "ts": 950.0},
+        ],
+    )
+    assert temporal["proactive_tail_indices"] == [1]
+
+
 def test_proactive_application_data_stays_non_user_with_labeled_turn_boundary():
     """Dynamic wake data stays assistant-role; only a fixed wire marker is user-role."""
     messages = context.build_turn_messages(

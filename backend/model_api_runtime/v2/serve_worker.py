@@ -119,6 +119,7 @@ from proactive import capture_scheduler
 from proactive import dream_scheduler
 from proactive import gate as proactive_gate
 from perception import service as perception_service
+from perception.glance import V1_PRESENCE_HINT_FIELDS
 from workspace.artifacts import ArtifactWorkspace, artifact_text_view_path
 from workspace.backends import WorkspaceNotFound, model_writable_path
 from workspace.prompt import render_trusted_prefix_blocks
@@ -1939,7 +1940,8 @@ def _read_perception_wake_context(user_id: str, job_id: int) -> list[dict]:
         hints: dict[str, bool | int | float | str] = {}
         raw_hints = raw.get("presence_hints")
         if isinstance(raw_hints, dict):
-            for key, value in list(raw_hints.items())[:10]:
+            for key in V1_PRESENCE_HINT_FIELDS:
+                value = raw_hints.get(key)
                 safe_key = str(key)[:80]
                 if isinstance(value, bool):
                     hints[safe_key] = value
@@ -1950,6 +1952,10 @@ def _read_perception_wake_context(user_id: str, job_id: int) -> list[dict]:
                 elif isinstance(value, str):
                     hints[safe_key] = value[:200]
         item["presence_hints"] = hints
+        if item["trigger"] == "photo_added":
+            item["photo_id"] = str(raw.get("photo_id") or "")[:160]
+            item["scene"] = str(raw.get("scene") or "")[:200]
+            item["time_of_day"] = str(raw.get("time_of_day") or "")[:80]
         try:
             created_at = float(raw.get("created_at") or 0.0)
         except (TypeError, ValueError, OverflowError):
@@ -2040,12 +2046,16 @@ def _decode_screen_frame_result(result) -> dict | None:
     image_b64 = str(body.get("image_b64") or "").strip()
     if image_b64.startswith("data:") and "," in image_b64:
         image_b64 = image_b64.split(",", 1)[1]
-    if not image_b64:
+    ocr_text = str(body.get("ocr_text") or "").strip()[:2000]
+    app = str(body.get("app") or body.get("app_name") or "").strip()[:200]
+    if not image_b64 and not ocr_text and not app:
         return None
     return {
-        "image_b64": image_b64,
+        **({"image_b64": image_b64} if image_b64 else {}),
         "image_mime": str(body.get("image_mime") or "image/jpeg"),
         "ts": body.get("ts"),
+        "ocr_text": ocr_text,
+        "app": app,
     }
 
 
