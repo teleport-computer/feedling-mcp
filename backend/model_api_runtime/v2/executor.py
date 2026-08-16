@@ -336,7 +336,18 @@ async def dispatch_tool_calls(
                 continue
         if before_write is not None:
             await before_write()
-        enqueued = enqueue_write_effect(tc)  # producer -> PR A outbox (drained at turn end)
+        try:
+            enqueued = enqueue_write_effect(tc)  # producer -> PR A outbox (drained at turn end)
+        except ValueError as exc:
+            # Content gates are model-recoverable: return a bounded tool error so
+            # the loop can ask for a corrected card instead of failing the turn.
+            reason = str(exc).strip()[:200] or "invalid_memory_card"
+            results_by_id[tc.id] = ToolResult(
+                call_id=tc.id,
+                content=f"error: {reason}",
+            )
+            write_index += 1
+            continue
         if inspect.isawaitable(enqueued):
             await enqueued
         results_by_id[tc.id] = ToolResult(call_id=tc.id, content=f"queued: {tc.name}")
