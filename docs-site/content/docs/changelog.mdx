@@ -10,6 +10,11 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **Hosted Runtime V2 refreshes an active memory profile after three days by
+  default instead of seven.** Refresh still requires Memory Garden source
+  changes, and deployments can continue to override the interval with
+  `FEEDLING_V2_PROFILE_MAX_AGE_SEC`.
+
 - **Companion prompts no longer use the internal `TA` placeholder to refer to
   the person.** Hosted Runtime V2, Memory Garden capture and Dream, and voice
   transcript guidance now describe the relationship as “你们” or refer to the

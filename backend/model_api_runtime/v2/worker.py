@@ -614,7 +614,7 @@ _VOICE_TRANSCRIPT_PROMPT_CHARS = _positive_int_env(
 _COMPACTION_BATCH = _positive_int_env("FEEDLING_V2_COMPACTION_BATCH_MSGS", "200")
 _PROFILE_ENABLED = _allowlisted_bool_env("FEEDLING_V2_PROFILE_ENABLED")
 _PROFILE_MAX_AGE_SEC = float(
-    os.environ.get("FEEDLING_V2_PROFILE_MAX_AGE_SEC", str(7 * 24 * 60 * 60))
+    os.environ.get("FEEDLING_V2_PROFILE_MAX_AGE_SEC", str(3 * 24 * 60 * 60))
 )
 _PROFILE_RETRY_BASE_SEC = float(
     os.environ.get("FEEDLING_V2_PROFILE_RETRY_BASE_SEC", "300")
