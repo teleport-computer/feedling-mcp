@@ -289,7 +289,7 @@ jobs:
       # Keep one pytest process per batch: the tests share one session database,
       # so file-order pollution stays visible instead of being hidden by process
       # isolation. The explicit paths also feed the discovery coverage ratchet.
-      - name: Run CI security tier 1 (33 files)
+      - name: Run CI security tier 1 (35 files)
         env:
           FEEDLING_TEST_PG: "postgresql://postgres:postgres@127.0.0.1:5432/postgres"
         run: |
@@ -299,6 +299,7 @@ jobs:
             tests/test_enclave_history_probe_skips_memory.py \
             tests/test_enclave_keys_attestation.py \
             tests/test_enclave_routes_memory.py \
+            tests/test_genesis_profile_dual_write.py \
             tests/test_identity_init_server_encrypt.py \
             tests/test_memory_actions_guard.py \
             tests/test_memory_backoff_notice.py \
@@ -330,7 +331,7 @@ jobs:
             tests/test_v2_quoted_memory.py \
             -v
 
-      - name: Run CI security tier 2 (69 files)
+      - name: Run CI security tier 2 (72 files)
         env:
           FEEDLING_TEST_PG: "postgresql://postgres:postgres@127.0.0.1:5432/postgres"
         run: |
@@ -373,7 +374,10 @@ jobs:
             tests/test_enclave_trace_coalescing.py \
             tests/test_enclave_visual_readside_units.py \
             tests/test_genesis_foreground_identity.py \
+            tests/test_genesis_identity_field_lock.py \
             tests/test_genesis_lightweight_identity.py \
+            tests/test_genesis_notice.py \
+            tests/test_genesis_v2_orchestration.py \
             tests/test_health_route_isolation.py \
             tests/test_history_import_identity.py \
             tests/test_identity_actions.py \

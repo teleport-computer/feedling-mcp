@@ -354,6 +354,10 @@ if not _provisioned:
         "test_consumer_web_advertise.py",
         "test_identity_redistill_ipc.py",
         "test_redistill_server_merge.py",
+        # Genesis dual-write + per-field concurrency fences are fully mocked
+        # units; keep them collectable when local PostgreSQL is unavailable.
+        "test_genesis_profile_dual_write.py",
+        "test_genesis_identity_field_lock.py",
         "test_update_stall_reason.py",
         "test_resident_maintenance_unit.py",
         "test_genesis_failure_codes.py",

@@ -88,6 +88,24 @@ class ProfileGenerationResult:
     provider_calls: int
 
 
+def render_profile_card(item: dict) -> str:
+    """Render one complete Garden card for MEMORY/STYLE distillation."""
+    if not isinstance(item, dict):
+        return ""
+    summary = str(item.get("summary") or item.get("title") or "").strip()
+    content = str(item.get("content") or "").strip()
+    if not summary and not content:
+        return ""
+    parts = [
+        f"id={str(item.get('id') or '').strip()}",
+        f"bucket={str(item.get('bucket') or '').strip()}",
+        f"occurred_at={str(item.get('occurred_at') or '').strip()}",
+        f"summary={summary}",
+        f"content={content}",
+    ]
+    return "- " + " | ".join(parts)
+
+
 def _positive_int(value: Any, *, name: str) -> int:
     try:
         parsed = int(value)
@@ -182,6 +200,8 @@ def _validate_profile_with_observation(
     memory_max_chars: int = PROFILE_MEMORY_MAX_CHARS,
     style_max_chars: int = PROFILE_STYLE_MAX_CHARS,
     overlap_threshold: float = PROFILE_OVERLAP_OBSERVE_THRESHOLD,
+    require_memory: bool = True,
+    require_style: bool = True,
 ) -> tuple[
     dict[str, str] | None,
     str,
@@ -215,10 +235,16 @@ def _validate_profile_with_observation(
     if set(payload) != {"memory", "style"}:
         return None, "reply_not_json", None
 
+    required = {
+        "memory": bool(require_memory),
+        "style": bool(require_style),
+    }
     normalized_fields: dict[str, str] = {}
     for field_name in ("memory", "style"):
         value = payload[field_name]
-        if not isinstance(value, str) or not value.strip():
+        if not isinstance(value, str):
+            return None, f"field_empty:{field_name}", None
+        if required[field_name] and not value.strip():
             return None, f"field_empty:{field_name}", None
         normalized_fields[field_name] = value.strip()
 
@@ -249,6 +275,8 @@ def _validate_profile(
     memory_max_chars: int = PROFILE_MEMORY_MAX_CHARS,
     style_max_chars: int = PROFILE_STYLE_MAX_CHARS,
     overlap_threshold: float = PROFILE_OVERLAP_OBSERVE_THRESHOLD,
+    require_memory: bool = True,
+    require_style: bool = True,
 ) -> tuple[dict[str, str] | None, str]:
     """Return ``(both_fields | None, reject_code)`` with no partial salvage."""
 
@@ -257,6 +285,8 @@ def _validate_profile(
         memory_max_chars=memory_max_chars,
         style_max_chars=style_max_chars,
         overlap_threshold=overlap_threshold,
+        require_memory=require_memory,
+        require_style=require_style,
     )
     return fields, reject_code
 
@@ -374,6 +404,7 @@ def _retryable_shape_reject(code: str) -> bool:
     return bool(
         code == "reply_not_json"
         or code.startswith("missing_field:")
+        or code.startswith("field_empty:")
         or code.startswith("placeholder_detected:")
         or code.startswith("memory_chars_over_budget:")
         or code.startswith("style_chars_over_budget:")
@@ -388,6 +419,8 @@ def _retry_instruction(code: str) -> str:
         detail = "上次输出不是符合契约的 JSON 对象"
     elif code.startswith("missing_field:"):
         detail = f"上次输出缺少 {code.split(':', 1)[1].upper()} 字段"
+    elif code.startswith("field_empty:"):
+        detail = f"上次 {code.split(':', 1)[1].upper()} 字段为空"
     elif code.startswith("placeholder_detected:"):
         detail = f"上次 {code.split(':', 1)[1].upper()} 字段仍是占位符"
     elif code.startswith("memory_chars_over_budget:"):
@@ -443,6 +476,8 @@ async def generate_profile(
     reject_out: Callable[[str], None] | None = None,
     trajectory_out: Callable[[str, dict], Awaitable[None]] | None = None,
     tail_window: dict | None = None,
+    require_memory: bool = True,
+    require_style: bool = True,
 ) -> ProfileGenerationResult:
     """Generate both profile fields with bounded work and one shape bounce.
 
@@ -570,6 +605,8 @@ async def generate_profile(
         memory_max_chars=memory_limit,
         style_max_chars=style_limit,
         overlap_threshold=checked_threshold,
+        require_memory=require_memory,
+        require_style=require_style,
     )
     if fields is not None:
         if observation is not None:
@@ -615,6 +652,8 @@ async def generate_profile(
         memory_max_chars=memory_limit,
         style_max_chars=style_limit,
         overlap_threshold=checked_threshold,
+        require_memory=require_memory,
+        require_style=require_style,
     )
     if fields is None:
         _report_reject(reject_out, retry_reject)
