@@ -70,6 +70,11 @@ _FILE_DELIVERY_TOOLS = frozenset(
         tool_schema.FILE_REPLY_TOOL,
     }
 )
+# These wires accept the OpenAI-style named-function ``tool_choice`` payload.
+# Other providers may expose tools but do not accept this exact forcing shape.
+_NAMED_TOOL_CHOICE_PROVIDERS = frozenset(
+    {"openai", "openrouter", "openai_compatible", "deepseek"}
+)
 _EMPTY_RESPONSE_CORRECTION = (
     "The previous response completed without visible text or a client tool call. "
     "Complete the user's request now. Return either non-empty visible answer text "
@@ -1191,8 +1196,7 @@ async def run_tool_loop(
                 forced_delivery_tool
                 and not terminal_text_round
                 and tools is not None
-                and str(getattr(provider_config, "provider", "")).strip().lower()
-                == "openrouter"
+                and provider_name in _NAMED_TOOL_CHOICE_PROVIDERS
             ):
                 provider_kwargs["tool_choice"] = {
                     "type": "function",
