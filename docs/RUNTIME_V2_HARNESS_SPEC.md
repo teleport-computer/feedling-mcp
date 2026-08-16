@@ -390,3 +390,48 @@ B4-1 `#21` → B4-2 `#17` → B4-3 `#15` → B4-4 `#18` → B4-5 `#3` → B4-6 `
   (本机 zsh 不做词分割,文件列表塞进变量会静默收集 0 个用例)。
 - 不接受 seeded 绿,验收用最弱档真实模型。
 - 前提不成立**停下回报,不要顺手改设计**。
+
+## B4-1b (#21 续) 具名 tool_choice 的按 provider 翻译(Seven 2026-08-16 追加)
+
+B4-1 把强制从「只有 openrouter」放宽到 OpenAI 家族四家。但**用户可选的 provider 有
+七个**,仍有三家收不到这句话:
+
+| provider | `tools` 翻译 | 具名 `tool_choice` 翻译 |
+|---|---|---|
+| openai / openrouter / openai_compatible / deepseek | ✅ | ✅ B4-1 已补 |
+| **anthropic**(官方 key,用户可选) | ✅ `_encode_tools_anthropic` | ❌ `provider_client.py:3021` **只处理 `"none"`**,具名的静默丢弃 |
+| **gemini** | ✅ | ❌ 完全没有 |
+| **bedrock** | ✅ `_encode_tools_bedrock` | ❌ 完全没有 |
+
+**症状**:这三家的用户,凡是「必须调某个工具」的轮次(主要是要文件)都不受强制 ——
+模型可以直接返回文字 → `required_file_missing` → 用户拿到散文而不是承诺的文件。
+anthropic 尤其要紧:那是**用户可以自己填官方 key 的一等选项**,不是边缘配置。
+
+**根因形状(值得记住)**:工具**列表**早就按各家翻译好了(`_encode_tools_openai_chat` /
+`_encode_tools_anthropic` / `_encode_tools_bedrock`),但「这轮必须用哪个」这句话
+**只会用一种语言说**。听不懂那种语言的三家,等于没听见。
+——**翻译层建好了,但只翻译了一半的字段。**
+
+### 要求
+
+在**已有的** per-provider payload 组装层里补上具名 forcing 的翻译。
+不新开一条路 —— `_encode_tools_*` 这个模式已经在那儿了。
+
+⚠️ **各家的 wire 形状必须自己去核实,不要照抄本规格里的示意**。
+下面几行是 claude2 凭印象写的**方向提示**,不是可信来源:
+
+    anthropic : {"type": "tool", "name": "<tool>"}
+    gemini    : tool_config.function_calling_config.mode="ANY" + allowed_function_names
+    bedrock   : toolChoice: {"tool": {"name": "<tool>"}}
+
+**实现前请以厂商现行 API 文档或仓内既有编码函数为准核对**;对不上就停下回报,
+不要按我写的这几行硬做。
+
+### 验收
+
+- 把 B4-1 那条参数化用例扩到**全部七个 provider**,每家两侧都断言:
+  该发的真的进了 payload(且**形状正确**,不是 OpenAI 形状套皮),不该发的不进。
+- 突变两个方向都要红:①去掉某家的翻译 → 该家用例红;
+  ②把某家错翻成 OpenAI 形状 → 该家用例红(**这条最重要** —— 发出去一个对方
+  不认的 payload,可能被静默忽略,和没发一样,只测「发了没」抓不到)。
+- 常量/集合从模块读取,测试不得写死 provider 名单。
