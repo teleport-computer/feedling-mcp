@@ -10,6 +10,13 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **Companion prompts no longer use the internal `TA` placeholder to refer to
+  the person.** Hosted Runtime V2, Memory Garden capture and Dream, and voice
+  transcript guidance now describe the relationship as “你们” or refer to the
+  person directly. Uses where `TA` names the AI companion or explicitly warns
+  against leaking the placeholder remain unchanged; memory selection,
+  retention, and reply behavior are otherwise unchanged.
+
 - **Hosted Runtime V2 now keeps tool-selection timing beside each provider-visible
   tool schema.** Memory, web, perception, screen, file-delivery, reminder, and
   identity call conditions moved out of the general system prompt and into the

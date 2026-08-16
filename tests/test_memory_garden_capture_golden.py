@@ -85,6 +85,32 @@ def test_fixture_covers_every_case():
 #: 基线快照仍是改造前的原文，不更新 —— 它的价值就在于持续证明「只改了那一段」。
 _LANG_BLOCK_MARKERS = ("   · 语言：", "   · 称呼：")
 
+_T100_WORDING_PAIRS = (
+    ("你刚和 TA 聊了一段", "你们刚聊了一段"),
+    ("（TA 改主意/纠正了）", "（这个人改主意/纠正了）"),
+    ("对 TA 的影响", "对这个人的影响"),
+    ("这些卡是 TA 会亲眼看到的、你写下的记忆", "这些卡会由这个人亲眼看到，是你写下的记忆"),
+    ("不是你对 TA 本人的称呼", "不是你对这个人的称呼"),
+    ("说的是 TA 还是 TA 的客户", "说的是这个人还是这个人的客户"),
+    ("这事对理解 TA 多重要", "这事对理解这个人多重要"),
+    ("不是 TA 多激动", "不是这个人多激动"),
+    ("你作为 TA 的伴侣", "你作为这个人的伴侣"),
+    ("这些卡 TA 会亲眼看到", "这些卡会由这个人亲眼看到"),
+    ("你和 TA 的关系", "你们的关系"),
+    ("TA 的原话值得留", "这个人的原话值得留"),
+    ("塑造你对 TA 的理解、或 TA 会希望你记得", "塑造你对眼前这个人的理解、或这个人会希望你记得"),
+    ("透出 TA 状态", "透出这个人状态"),
+    ("它是 TA 明确在意的", "它是这个人明确在意的"),
+    ("改变我对 TA 的理解？TA 会希望我记得吗？", "改变我对这个人的理解？这个人会希望我记得吗？"),
+)
+
+
+def _apply_t100_wording(text: str) -> str:
+    for old, new in _T100_WORDING_PAIRS:
+        assert old in text, f"T100 基线措辞缺失：{old}"
+        text = text.replace(old, new)
+    return text.replace("——TA 的伴侣", "——这个人 的伴侣")
+
 
 def _strip_language_block(text: str) -> str:
     start = text.index(_LANG_BLOCK_MARKERS[0])
@@ -95,7 +121,7 @@ def _strip_language_block(text: str) -> str:
 @pytest.mark.parametrize("case_name", sorted(CASES))
 def test_everything_except_the_language_block_is_byte_identical_to_baseline(case_name):
     """除语言段外逐字节不变 —— 守住「这次只动了语言那一段」。"""
-    expected = _baseline()[case_name]["text"]
+    expected = _apply_t100_wording(_baseline()[case_name]["text"])
     actual = build_via_shell(**CASES[case_name])
     assert _strip_language_block(actual) == _strip_language_block(expected)
 
@@ -129,7 +155,7 @@ def test_kernel_default_and_fallbacks_match_baseline_typical(policy_name):
         **args,
     )
     assert _strip_language_block(text) == _strip_language_block(
-        _baseline()["typical"]["text"]
+        _apply_t100_wording(_baseline()["typical"]["text"])
     )
     # 三种传法（没传 / 空串 / 显式默认档）必须产出完全同一份
     assert text == build_via_shell(**CASES["typical"])

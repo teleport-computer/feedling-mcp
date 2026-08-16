@@ -113,6 +113,8 @@ def test_capture_header_spells_out_who_is_who():
     header = transcript_store.capture_window_header(turn_count=24, ai_name="小满")
     assert "「我」是" in header and "不是你" in header
     assert "「小满」才是你自己" in header
+    assert "这个人明确讲出来的每一件事" in header
+    assert "TA" not in header
     # 「宁少勿多」是为闲聊窗口写的;不显式推翻它,一通电话只会留下一两张卡。
     assert "不适用于这里" in header
 

@@ -8,8 +8,8 @@
   - 少而厚:默认 0–2 张厚卡,不是 N 张薄卡;强迫归纳,不穷举。
   - 并优于增:落卡前先看现有桶/卡,能并进已有卡就别新开。
   - 事件倾向:优先记有前因后果/场景的事件;孤立信息点通常不单独成卡,
-    除非是 TA 明确在意的或反复出现的偏好。
-  - importance(对理解 TA 多重要,固有不衰) vs pulse(在 TA 自己心里激起多大波动,
+    除非是这个人明确在意的或反复出现的偏好。
+  - importance(对理解这个人多重要,固有不衰) vs pulse(在这个人自己心里激起多大波动,
     只影响鲜活度/语气,不进保留)。
   - 输出严格 JSON;没有值得记的就 {"cards": []}。
 
@@ -35,7 +35,7 @@ _EMPTY_CAPTURE_REPLY = '{"cards": []}'
 
 # action 取值:并入(merge)/ 新增(add)/ 覆盖(supersede)/ 不动(noop)
 
-_CAPTURE_PROMPT_TEMPLATE = """你是 {ai_name}——{user_name} 的伴侣。你刚和 TA 聊了一段，这段告一段落了。
+_CAPTURE_PROMPT_TEMPLATE = """你是 {ai_name}——{user_name} 的伴侣。你们刚聊了一段，这段告一段落了。
 现在没人在等你回复，你安静地回看这段，决定有没有值得长久记住的事。
 
 【你在找什么】
@@ -48,36 +48,36 @@ _CAPTURE_PROMPT_TEMPLATE = """你是 {ai_name}——{user_name} 的伴侣。你�
        - 若新内容和旧卡是同一个意思、没有新信息 → 不动（noop），别为复述而更新。
        - 若新内容让这件事更完整/有进展 → 把旧卡改写得更厚（含旧的 + 新的）。
    · 新增：确实是新的事、没有对应的已有卡 → 开一张新卡。
-   · 覆盖：新信息和某张旧卡直接矛盾（TA 改主意/纠正了）→ 写新卡，把旧卡标记为被取代
+   · 覆盖：新信息和某张旧卡直接矛盾（这个人改主意/纠正了）→ 写新卡，把旧卡标记为被取代
      （superseded，不要删）。
 3. 写卡：
    · content：一段「厚」的正文，像你在心里完整记住这件事——发生了什么、前因后果、
-     对 TA 的影响、当时的情绪心理。不是一句话标题。
+     对这个人的影响、当时的情绪心理。不是一句话标题。
    · summary：一句话，让未来的你一眼知道这张卡是什么。
    · bucket：归一个主桶。短、复用已有的，别造近义新桶。
    · threads：几条线索（人物/事件/情绪/关键点）。复用已有线索，别把"吵架"另写成"争执"。
 {language_rule}
-   · 称呼：{naming_rule}这些卡是 TA 会亲眼看到的、你写下的记忆——
+   · 称呼：{naming_rule}这些卡会由这个人亲眼看到，是你写下的记忆——
      写进卡里的字段（bucket/threads/summary/content）永远不要用"用户"/"user"
      这类系统称谓，也不要用「TA」指代本人——「TA」只是这份指令里的标记，
-     不是你对 TA 本人的称呼。转写里的说话人标签同理：有名字时是真名，
+     不是你对这个人的称呼。转写里的说话人标签同理：有名字时是真名，
      没名字时是「对方」，那只是标签——卡里怎么称呼，按上面那条规则判断。
      卡里的字段最好整个不出现「用户」/"user"这两个词：如果你要写的确实是产品术语，
      就去掉这个前缀（写「界面」「留存」「满意度」，而不是「用户界面」「用户留存」）——
-     这样就不会有人分不清那个「用户」说的是 TA 还是 TA 的客户。
-   · importance：这事对理解 TA 多重要（0-1）。随手提 .1-.3 / 偏好习惯 .4-.6 /
+     这样就不会有人分不清那个「用户」说的是这个人还是这个人的客户。
+   · importance：这事对理解这个人多重要（0-1）。随手提 .1-.3 / 偏好习惯 .4-.6 /
      情绪·关系·边界 .7-.85 / 核心承诺与转折 .9-1。
-   · pulse：这事在「你自己」心里激起多大波动（0-1）。不是 TA 多激动，
-     是你作为 TA 的伴侣，对这件事多在乎、多被触动。
+   · pulse：这事在「你自己」心里激起多大波动（0-1）。不是这个人多激动，
+     是你作为这个人的伴侣，对这件事多在乎、多被触动。
    · 下面输出示例里的 `...` 只是占位。每个字段都必须是真内容——任何字段都不能是 `...`、
      方括号里的说明文字、或空字符串。宁可整份留空（cards 为空），也不要交占位符：
-     这些卡 TA 会亲眼看到。
+     这些卡会由这个人亲眼看到。
 
 【现有的桶】{buckets}
 【通用桶（先复用现有桶，没有就从这里选，都不贴合再起具体新桶）】{common_buckets}
 【现有的线索】{threads}
 【现有记忆索引（merge/supersede 只能从这里复制确切 target_id）】{cards}
-【你和 TA 的关系】{identity}
+【你们的关系】{identity}
 【这段对话】{window}
 
 【输出】只输出 JSON，不要别的话。没有值得记的就输出 {{"cards": []}}。
@@ -97,7 +97,7 @@ _CAPTURE_PROMPT_TEMPLATE = """你是 {ai_name}——{user_name} 的伴侣。你�
   ]
 }}
 
-说明 type：有前因后果的事件→event；偏好/习惯/稳定事实→fact；TA 的原话值得留→quote；
+说明 type：有前因后果的事件→event；偏好/习惯/稳定事实→fact；这个人的原话值得留→quote；
 其它一段值得记的片段→moment。落卡只产这四类，不产 insight/reflection（那是做梦时的事）。"""
 
 
@@ -280,7 +280,9 @@ def build_capture_prompt(
     the companion framing; fall back to neutral defaults if unknown.
 
     ``user_name`` must already be sanitized and ``naming_rule`` already
-    assembled by the caller — the kernel never imports ``identity``.
+    assembled by the caller — the kernel never imports ``identity``. The
+    internal unknown-name marker is rendered as a natural referent rather than
+    leaking into the platform prompt.
     The io-side compat shell (``memory/capture_prompt_v1.py``) does that.
 
     ``policy`` 决定用哪把「什么值得记」的尺子（见 ``memory_garden.policies``）。
@@ -304,9 +306,12 @@ def build_capture_prompt(
             "其余档位的模板结构（动作偏好/日期/tags/输出 schema）尚未策略化，"
             "见批 7。"
         )
+    prompt_user_name = str(user_name or "").strip()
+    if prompt_user_name == "TA":
+        prompt_user_name = "这个人"
     return _CAPTURE_PROMPT_TEMPLATE.format(
         ai_name=(ai_name or "我").strip(),
-        user_name=user_name,
+        user_name=prompt_user_name or "这个人",
         naming_rule=naming_rule,
         selection_rubric=resolved.selection_rubric,
         language_rule=policies_language_rule(resolved.name, indent="     ", first_prefix="   · "),

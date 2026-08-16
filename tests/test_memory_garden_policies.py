@@ -111,12 +111,11 @@ def test_language_rule_is_shared_text_with_only_the_basis_swapped():
     imported = language_rule("history_import")
 
     assert chat != imported
-    assert "TA 跟你对话" in chat
+    assert "你们对话" in chat
     assert "素材原文" in imported
     # 除了依据那几个字，其余逐字相同。
-    # 注意「 TA 跟你对话」带前导空格（中英混排），换算时要连空格一起换；
     # 指代输入的那个词也跟着依据走（对话 / 素材），两边基线原文就是这么写的。
-    assert chat.replace(" TA 跟你对话", "素材原文").replace("对话", "素材") == imported
+    assert chat.replace("你们对话", "素材原文").replace("对话", "素材") == imported
 
 
 def test_language_rule_is_conditional_not_unconditional():
@@ -173,8 +172,8 @@ def test_language_rule_rejects_unknown_policy_like_get_policy_does():
     with _pytest.raises(UnknownPolicyError):
         language_rule("nonexistent")
     # None / 空串仍回落，代表「旧调用方没传」
-    assert "TA 跟你对话" in language_rule(None)
-    assert "TA 跟你对话" in language_rule("")
+    assert "你们对话" in language_rule(None)
+    assert "你们对话" in language_rule("")
 
 
 def test_language_rule_is_wired_into_both_sides():
@@ -198,14 +197,11 @@ def test_language_rule_is_wired_into_both_sides():
         assert "用素材原文的语言——中文素材" not in src, f"{name} 里还留着旧的内联文本"
 
 
-def test_language_basis_keeps_the_cjk_latin_spacing():
-    """「TA 跟你对话」带前导空格 —— 中英混排时「用」和字母之间要留空格。
-
-    丢了空格会产出「用TA 跟你对话的语言」，是排版退化。
-    """
+def test_language_basis_reads_as_a_relationship_not_a_placeholder():
+    """对话语言以双方关系表达，不再用内部占位词指用户。"""
     from memory_garden.policies import language_rule
 
-    assert "用 TA 跟你对话的语言" in language_rule("conversation_capture")
+    assert "用你们对话的语言" in language_rule("conversation_capture")
     assert "用素材原文的语言" in language_rule("history_import")
 
 
