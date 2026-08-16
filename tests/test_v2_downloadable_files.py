@@ -46,7 +46,7 @@ def test_file_delivery_policy_is_semantic_and_hides_internal_paths():
 
     assert "not from exact keywords, wording, language" in description
     assert "save, open, download, share, or use outside the chat" in description
-    assert "绝不要向 TA 询问内部 workspace 路径" in prompt
+    assert "绝不要向这个人询问内部 workspace 路径" in prompt
     assert "user never needs to know /workspace" in description
     assert "Do not call this merely because" in description
     assert "Word means .docx and PDF means .pdf" in description

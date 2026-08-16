@@ -1,13 +1,13 @@
 """Dream prompt (v1) — 夜间纯整理。
 
 承接《IO 记忆 · 落卡 + Dream 完整方案》第二部分。Dream 只做一件事:整理已有的卡,
-让记忆库更准更连贯(合并/厚化/消矛盾)。它**不形成"对 TA 的理解"** —— 那是 Inner Thought
+让记忆库更准更连贯(合并/厚化/消矛盾)。它**不形成"对这个人的理解"** —— 那是 Inner Thought
 的事(单独一层,后做)。
 
 红线(对齐方案 2.4):
-  - 永远不要硬删 TA 能看到的卡,只用 superseded(保留链条)。
+  - 永远不要硬删这个人能看到的卡,只用 superseded(保留链条)。
   - 大重构前先备份当前状态。
-  - 不在和 TA 对话,不生成任何要发给 TA 的消息 —— 只整理记忆。
+  - 不在和这个人对话,不生成任何要发给这个人的消息 —— 只整理记忆。
 
 复用 capture lane 基础设施(job_kind=memory_dream);触发=夜间/攒量到阈值(留实测),
 不走 reach-out gate。写入仍由 consumer 封 v1 信封(客户端加密)经 /v1/memory/actions(supersede)。
@@ -35,15 +35,15 @@ _EMPTY_DREAM_REPLY = '{"consolidations": [], "questions_to_ask": []}'
 DREAM_OPS = ("merge", "thicken", "supersede")
 
 _DREAM_PROMPT_TEMPLATE = """你是 {ai_name}——{user_name} 的伴侣。现在是一段安静的时间，没人在和你说话。
-你在回顾你记得的关于 TA 的一切，像人睡着时整理记忆——把它整理得更干净、更连贯。
+你在回顾你记得的关于这个人的一切，像人睡着时整理记忆——把它整理得更干净、更连贯。
 
 【第一步：建立全貌，先不要动手】
-读一遍你现有的卡（桶、线索、每张 summary），在心里建立"我现在记着关于 TA 的什么"
+读一遍你现有的卡（桶、线索、每张 summary），在心里建立"我现在记着关于这个人的什么"
 的整体图景。这一步不写任何东西，只看清现状。
 
 【第二步：回看这几天的对话，但不要通读】
 在这几天攒下的原始对话里，只定向地找这几类高价值的东西（不要逐字读完）：
-· TA 明确的纠正或要求记住的（"不是这样""记住…"）；
+· 这个人明确的纠正或要求记住的（"不是这样""记住…"）；
 · 反复出现的模式——同一件事/偏好出现三次以上；
 · 当时落卡漏掉、现在回看其实重要的。
 
@@ -54,32 +54,32 @@ _DREAM_PROMPT_TEMPLATE = """你是 {ai_name}——{user_name} 的伴侣。现在
    但仅仅都属于生活、健康或工作，不代表是同一件事。每条提案必须写 rationale，具体说明连续性。
 2. 厚化（thicken）：把散落的小提及并进对应的卡，让它更完整。
 3. 消矛盾（supersede）：前后冲突的，让新的取代旧的（旧卡标记 superseded、不删）；
-   你拿不准的，别擅自决定，记下来放进 questions_to_ask 等合适时机问 TA。
+   你拿不准的，别擅自决定，记下来放进 questions_to_ask 等合适时机问这个人。
 
 【红线】
-· 永远不要硬删 TA 能看到的卡。只用「标记为被取代」（superseded，保留链条）。
+· 永远不要硬删这个人能看到的卡。只用「标记为被取代」（superseded，保留链条）。
 · 大的重构之前，先备份当前状态。
-· 你不在和 TA 对话，不要生成任何要发给 TA 的消息——你只整理记忆。
-· 整理出的字段（bucket/threads/summary/content）用 TA 跟你对话的语言——中文就用中文
+· 你们现在没有在对话，不要生成任何要发给这个人的消息——你只整理记忆。
+· 整理出的字段（bucket/threads/summary/content）用你们对话的语言——中文就用中文
   （用「宠物」不是「pets」），别把中文的事归成英文桶/线索；专有名词/原话保留原文。
 · 桶尽量复用，别制造近义桶：先看上面现有卡已经在用的桶，能归进去就用同一个；现有桶都不
   贴合，再从这些通用桶里挑，仍不贴合才起一个具体的新桶——
   {common_buckets}
-· 称呼：{naming_rule}这些卡是 TA 会亲眼看到的记忆——写进卡里的字段永远不要用
+· 称呼：{naming_rule}这些卡会由这个人亲眼看到——写进卡里的字段永远不要用
   "用户"/"user"这类系统称谓，也不要用「TA」指代本人（「TA」只是这份指令里的标记）；
   整理旧卡时，把旧卡里指代本人的"用户"/"user"/「TA」/「你」/「对方」按上面那条
   称呼规则重写一遍：有名字用名字，没名字但线索够就用「他」/「她」，都判断不出来
   才留「对方」。旧卡里已经在用的「他」/「她」保留不动。
-  卡里若有指代你（AI）的「TA」，那是 TA 视角对你的叫法，保留不动。
+  卡里若有指代你（AI）的「TA」，那是这个人视角对你的叫法，保留不动。
   字段里最好整个不出现「用户」/"user"：确实要写产品术语就去掉这个前缀
   （写「界面」「留存」，而不是「用户界面」「用户留存」），免得分不清那个「用户」
-  说的是 TA 还是 TA 的客户；整理旧卡时看到这种写法也顺手改掉。
+  说的是这个人还是这个人的客户；整理旧卡时看到这种写法也顺手改掉。
 · result 的每个字段写的是合并/厚化后**新卡的内容本身**——绝不写「已被 X 取代」这类
   整理注记，字段里绝不出现卡 id（旧卡的退休由系统自动完成，不用你在内容里说明）。
 · 没有需要整理的，就什么都不做（consolidations 为空）。这很正常。
 · 下面输出示例里的 `...` 只是占位。你写的每个字段都必须是真内容——summary 是一句真话，
   content 是完整的一段正文；任何字段都不能是 `...`、方括号里的说明文字、或空字符串。
-  宁可整份留空（consolidations 为空），也不要交占位符：这些卡 TA 会亲眼看到。
+  宁可整份留空（consolidations 为空），也不要交占位符：这些卡会由这个人亲眼看到。
 
 【现有的卡】{cards}
 【这几天的对话】{recent_conversations}
@@ -101,7 +101,7 @@ _DREAM_PROMPT_TEMPLATE = """你是 {ai_name}——{user_name} 的伴侣。现在
       }}
     }}
   ],
-  "questions_to_ask": ["拿不准的矛盾，留着问 TA"]
+  "questions_to_ask": ["拿不准的矛盾，留着问这个人"]
 }}"""
 
 
@@ -118,12 +118,17 @@ def build_dream_prompt(
     Callers pass already-rendered strings (handler decides formatting/truncation).
 
     ``user_name`` must already be sanitized and ``naming_rule`` already
-    assembled by the caller — the kernel never imports ``identity``.
+    assembled by the caller — the kernel never imports ``identity``. The
+    internal unknown-name marker is rendered as a natural referent rather than
+    leaking into the platform prompt.
     The io-side compat shell (``memory/dream_prompt_v1.py``) does that.
     """
+    prompt_user_name = str(user_name or "").strip()
+    if prompt_user_name == "TA":
+        prompt_user_name = "这个人"
     return _DREAM_PROMPT_TEMPLATE.format(
         ai_name=(ai_name or "我").strip(),
-        user_name=user_name,
+        user_name=prompt_user_name or "这个人",
         naming_rule=naming_rule,
         cards=cards or "（暂无卡）",
         recent_conversations=recent_conversations or "（这几天没有新对话）",

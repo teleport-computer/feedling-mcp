@@ -70,9 +70,12 @@ def build_migrate_prompt(
 ) -> str:
     """Render the migration prompt. Callers pass already-rendered strings
     (handler decides formatting/truncation of the batch + the bucket/thread vocab)."""
+    prompt_user_name = str(user_name or "").strip()
+    if prompt_user_name.casefold() == "ta":
+        prompt_user_name = "这个人"
     return _MIGRATE_PROMPT_TEMPLATE.format(
         ai_name=(ai_name or "我").strip(),
-        user_name=(user_name or "TA").strip(),
+        user_name=prompt_user_name or "这个人",
         old_cards=old_cards or "（没有要升级的卡）",
         vocab=vocab or "（暂无已有桶/线索）",
         common_buckets=COMMON_BUCKETS_GUIDANCE_V1,

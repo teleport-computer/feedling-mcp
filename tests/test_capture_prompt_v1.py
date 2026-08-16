@@ -35,6 +35,9 @@ def test_prompt_renders_with_context_and_escaped_json():
     assert '"action": "add | merge | supersede | noop"' in p
     assert "[mom_123]" in p
     assert "只能从这里复制确切 target_id" in p
+    assert "你们刚聊了一段" in p
+    assert "【你们的关系】" in p
+    assert "这个人的原话值得留" in p
 
 
 def test_prompt_falls_back_to_neutral_defaults():
@@ -42,6 +45,7 @@ def test_prompt_falls_back_to_neutral_defaults():
         ai_name="", user_name="", buckets="", threads="", identity="", window="",
     )
     assert "（暂无）" in p and "（空）" in p
+    assert p.startswith("你是 我——这个人 的伴侣。")
 
 
 def test_prompt_naming_rule_uses_known_name():
@@ -56,6 +60,7 @@ def test_prompt_naming_rule_uses_known_name():
     assert '永远不要用"用户"/"user"' in p
     # TA is an instruction/transcript marker only — outputs must not use it.
     assert "不要用「TA」指代本人" in p
+    assert "这些卡会由这个人亲眼看到" in p
 
 
 def test_prompt_naming_rule_without_name_uses_relationship_referent():
@@ -268,3 +273,12 @@ def test_migrate_and_genesis_share_the_same_canonical_buckets():
     # onboarding (genesis FACT_WRITE) had NO bucket guidance before A9 — now it converges too
     assert _COMMON_BUCKETS_ZH in FACT_WRITE_PROMPT
     assert "桶名收敛" in FACT_WRITE_PROMPT
+
+
+def test_migrate_prompt_unknown_person_does_not_leak_ta_marker():
+    from memory_garden.prompts.migrate import build_migrate_prompt
+
+    prompt = build_migrate_prompt(
+        ai_name="", user_name="TA", old_cards="", vocab=""
+    )
+    assert prompt.startswith("你是 我——这个人 的伴侣。")
