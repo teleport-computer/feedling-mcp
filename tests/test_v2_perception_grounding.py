@@ -565,9 +565,9 @@ def test_ambient_wake_injects_screen_share_grounding(monkeypatch, lane):
     assert _runtime_payload(seen)["runtime_data"]["screen_share"] == ended
 
 
-def test_heartbeat_injects_boolean_glance_without_snapshot_values(monkeypatch):
-    """Catches eager numeric snapshot data replacing the boolean glance."""
-    uid = "u_pg_boolean_heartbeat"
+def test_heartbeat_injects_v1_factual_board(monkeypatch):
+    """The proactive turn sees V1's bounded facts without a pull round."""
+    uid = "u_pg_factual_heartbeat"
     conftest.seed_user(uid)
     _reset(uid)
     monkeypatch.setattr(
@@ -579,10 +579,17 @@ def test_heartbeat_injects_boolean_glance_without_snapshot_values(monkeypatch):
     async def fake_cap_data(store, action_type, **kwargs):
         assert action_type == "perception_glance"
         return {
-            "glance": {
-                "weather": {"available": True, "notable_change": False},
-                "health": {"available": True, "notable_change": True},
-            }
+            "presence_hints": {
+                "place_label": "图书馆",
+                "now_playing": {"title": "Blue", "artist": "Joni Mitchell"},
+            },
+            "cross_domain_board": {
+                "location": {"now": "图书馆"},
+                "media": {"now": {"title": "Blue", "artist": "Joni Mitchell"}},
+                "app": {"now": "Notes", "recent": ["Notes", "Safari"]},
+                "weather": {"condition": "clear", "temperature": 21.5},
+                "health": {"notable": [{"field": "step_count", "current": 365}]},
+            },
         }
 
     monkeypatch.setattr(worker, "_cap_data", fake_cap_data)
@@ -602,15 +609,22 @@ def test_heartbeat_injects_boolean_glance_without_snapshot_values(monkeypatch):
 
     runtime_data = _runtime_payload(seen)["runtime_data"]
     assert status == "completed"
-    assert runtime_data["perception_glance"]["glance"] == {
-        "weather": {"available": True, "notable_change": False},
-        "health": {"available": True, "notable_change": True},
+    assert runtime_data["perception_glance"]["presence_hints"] == {
+        "place_label": "图书馆",
+        "now_playing": {"title": "Blue", "artist": "Joni Mitchell"},
+    }
+    assert runtime_data["perception_glance"]["cross_domain_board"]["app"] == {
+        "now": "Notes",
+        "recent": ["Notes", "Safari"],
     }
     assert runtime_data["perception_glance"]["glance_changed"] is True
     joined = _joined(seen)
-    assert "365" not in joined
-    assert "21.5" not in joined
-    assert "step_count" not in joined
+    assert "图书馆" in joined
+    assert "Blue" in joined
+    assert "Notes" in joined
+    assert "365" in joined
+    assert "21.5" in joined
+    assert "step_count" in joined
 
 
 def test_repeated_completed_ordinary_heartbeat_marks_glance_unchanged(
@@ -904,8 +918,8 @@ def test_successful_heartbeat_without_context_reader_does_not_persist_fingerprin
     )
 
 
-def test_perception_wake_injects_only_projected_trigger(monkeypatch):
-    """Catches raw perception event fields crossing into the model prompt."""
+def test_perception_wake_injects_bounded_producer_grounding(monkeypatch):
+    """Producer facts cross the prompt boundary, internal cursor fields do not."""
     uid = "u_pg_event_projection"
     conftest.seed_user(uid)
     _reset(uid)
@@ -933,7 +947,7 @@ def test_perception_wake_injects_only_projected_trigger(monkeypatch):
             "_input_generation": 2,
             "trigger": "photo_added",
             "change_digest": "battery 17, steps 365",
-            "presence_hints": {"place": "private home"},
+            "presence_hints": {"place_label": "private home"},
             "origin_refs": ["photo:secret-id"],
         }
     ]
@@ -951,12 +965,18 @@ def test_perception_wake_injects_only_projected_trigger(monkeypatch):
 
     runtime_data = _runtime_payload(seen)["runtime_data"]
     assert status == "completed"
-    assert runtime_data["perception_wake"] == [
-        {"trigger": "photo_added", "new_photo": True}
-    ]
+    assert runtime_data["perception_wake"] == [{
+        "trigger": "photo_added",
+        "new_photo": True,
+        "change_digest": "battery 17, steps 365",
+        "presence_hints": {"place_label": "private home"},
+        "origin_refs": ["photo:secret-id"],
+    }]
     joined = _joined(seen)
-    for hidden in ("battery 17", "steps 365", "private home", "secret-id"):
-        assert hidden not in joined
+    for fact in ("battery 17", "steps 365", "private home", "secret-id"):
+        assert fact in joined
+    assert "_context_seq" not in joined
+    assert "_input_generation" not in joined
 
 
 @pytest.mark.parametrize("lane", ["chat", "scheduled"])

@@ -411,8 +411,8 @@ def test_language_follow_emits_once_for_terminal_visible_body_after_thinking(
         "reply_script": "latin",
         "outcome": "match",
         "lane": "chat",
-        "correction_attempted": False,
-        "correction_outcome": "skipped",
+        "correction_attempted": True,
+        "correction_outcome": "retry_error",
     }
     assert private_thinking not in json.dumps(language_traces, ensure_ascii=False)
 
@@ -1372,6 +1372,33 @@ def test_self_thinking_off_preserves_native_reasoning_bubble(monkeypatch):
         "model": _BYOK.model,
         "lane": "chat",
     }]
+
+
+def test_self_thinking_internal_tool_name_publishes_marker_only(monkeypatch):
+    monkeypatch.delenv("FEEDLING_V2_SELF_THINKING", raising=False)
+    uid = "u_toolloop_selfthink_internal_term"
+    conftest.seed_user(uid)
+    _reset(uid)
+    jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("w-selfthink-internal-term")
+    _stub_envelope_build(monkeypatch)
+    _script_provider(monkeypatch, [{
+        "reply": "<think>memory_write</think>可见回复仍然正常",
+        "tool_calls": [],
+        "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+    }])
+    deps = _deps(messages=[{"id": "m1", "ts": 10.0, "role": "user", "content": "hi"}])
+
+    status = asyncio.run(
+        worker.process_job(
+            job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"
+        )
+    )
+
+    assert status == "completed"
+    bubble = _bubbles(uid)[0]
+    assert bubble["body_ct"] == "可见回复仍然正常"
+    assert bubble["thinking_body_ct"] == self_thinking.THINKING_FAILED_MARKER
 
 
 def test_self_thinking_on_drops_native_reasoning_without_authored_block(

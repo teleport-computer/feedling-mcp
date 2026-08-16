@@ -92,19 +92,80 @@ def test_steps_notable_change_uses_the_canonical_health_vitals_signal():
     ) == {"health": {"available": True, "notable_change": True}}
 
 
-def test_event_projection_is_allowlist_only():
+def test_event_projection_keeps_only_bounded_grounding_fields():
     assert project_perception_wake_events([
-        {"trigger": "photo_added", "change_digest": "battery 17", "origin_refs": ["photo:secret"]},
-        {"trigger": "arrived_at_anchor", "presence_hints": {"place": "private"}},
+        {
+            "trigger": "photo_added",
+            "wake_id": "wake-1",
+            "source": "perception_event",
+            "change_digest": "new photo arrived",
+            "origin_refs": ["photo:p1"],
+            "photo_id": "p1",
+            "scene": "cafe",
+            "time_of_day": "evening",
+            "payload": "must not pass through",
+        },
+        {"trigger": "arrived_at_anchor", "presence_hints": {"place_label": "private"}},
         {"trigger": "broadcast_opened", "change_digest": "private screen state"},
         {"trigger": "broadcast_closed", "origin_refs": ["private-ref"]},
         {"trigger": "unknown_trigger", "payload": "private"},
     ]) == [
-        {"trigger": "photo_added", "new_photo": True},
-        {"trigger": "arrived_at_anchor", "anchor_changed": True},
-        {"trigger": "broadcast_opened", "screen_share_started": True},
-        {"trigger": "broadcast_closed", "screen_share_ended": True},
+        {
+            "trigger": "photo_added",
+            "new_photo": True,
+            "wake_id": "wake-1",
+            "source": "perception_event",
+            "change_digest": "new photo arrived",
+            "origin_refs": ["photo:p1"],
+            "photo_id": "p1",
+            "scene": "cafe",
+            "time_of_day": "evening",
+        },
+        {
+            "trigger": "arrived_at_anchor",
+            "anchor_changed": True,
+            "presence_hints": {"place_label": "private"},
+        },
+        {
+            "trigger": "broadcast_opened",
+            "screen_share_started": True,
+            "change_digest": "private screen state",
+        },
+        {
+            "trigger": "broadcast_closed",
+            "screen_share_ended": True,
+            "origin_refs": ["private-ref"],
+        },
     ]
+
+
+def test_event_projection_defensively_reapplies_producer_caps():
+    projected = project_perception_wake_events([{
+        "trigger": "photo_added",
+        "wake_id": "w" * 300,
+        "change_digest": "d" * 3000,
+        "origin_refs": ["r" * 300] * 20,
+        "presence_hints": {
+            key: "v" * 300
+            for key in (
+                "place_label", "motion_state", "now_playing", "locale",
+                "broadcast_state", "broadcast_active", "ignored_extra",
+            )
+        },
+        "photo_id": "p" * 300,
+        "scene": "s" * 300,
+        "time_of_day": "t" * 100,
+    }])[0]
+
+    assert len(projected["wake_id"]) == 160
+    assert len(projected["change_digest"]) == 2000
+    assert len(projected["origin_refs"]) == 10
+    assert len(projected["origin_refs"][0]) == 200
+    assert len(projected["presence_hints"]) == 6
+    assert all(len(value) == 200 for value in projected["presence_hints"].values())
+    assert len(projected["photo_id"]) == 160
+    assert len(projected["scene"]) == 200
+    assert len(projected["time_of_day"]) == 80
 
 
 def test_fingerprint_is_canonical_and_changes_with_boolean_state():
