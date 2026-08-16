@@ -209,6 +209,71 @@ _NOT_A_CLAIM_RE = re.compile(
     re.IGNORECASE,
 )
 _IMAGE_NOUN = r"(?:自画像|画像|插画|图片|图像|图)"
+# 「改名/改身份已完成」的断言。**只列明确的完成态**,不列意向态 ——
+# 「我以后叫你999吧」是提议,「好，以后叫你999」才是断言。
+#
+# 偏置与图片那条一致:**宁可漏判也不要误判**。误判会把一句诚实的
+# 「我改不了」当成谎话打回去,等于逼它把真话改成假话。
+# 身份写动作**从 WRITE_ACTIONS 派生**,不硬编码 —— 将来新增身份写动作时
+# 自动纳入,不会静默漏掉(与 B4-4 的 _IDENTITY_WRITE_ACTIONS 同一理由)。
+_IDENTITY_WRITE_TOOL_NAMES = frozenset(
+    a for a in cap_registry.WRITE_ACTIONS if a.startswith("identity_")
+)
+# ⚠️ 这里**曾经**有一整套「模型是否声称改好了」的词法检测(正则 + 小句切分 +
+# 意向/条件/征询排除)。2026-08-17 整个删掉,Seven 定 D 方案。
+#
+# 删的理由不是没写好,是**方向错了**:判「这句是断言还是意向」是语用问题,
+# 中文里这个差别不在词形、在语境。四轮迭代的轨迹是误伤↔漏判来回摆 ——
+#   窗口太宽 → 误伤「文件我帮你改好了」
+#   收紧     → 漏判「好的，以后叫你999」
+#   加边界   → 漏判「以后叫你**小想**」(新名字里含意向词「想」)
+# 最后一条最能说明问题:**用户起的名字**被当成了意向词。
+# 那不是参数问题,是判据维度问题。
+#
+# D 方案只保留**完全结构化**的那一半:工具调了、但结果不是成功。
+# 覆盖面窄(漏掉「压根没调就说改好了」),但零误伤、不需要理解任何一句话。
+# 改不改仍然由模型自己判断 —— 我们只在它「想改却失败了」时兜一次底。
+
+
+def _identity_write_attempted(transcript) -> bool:
+    """这一轮**调过**身份写工具吗?(不看成败)"""
+    for item in transcript:
+        if isinstance(item, ToolExchange) and any(
+            call.name in _IDENTITY_WRITE_TOOL_NAMES for call in item.calls
+        ):
+            return True
+    return False
+
+
+def _identity_write_succeeded(transcript) -> bool:
+    """这一轮**真的**成功写过身份吗?
+
+    ⚠️ 不能只看调用名(codex2 审出):`identity_patch` 返回 `error: denied` 之后
+    仍声称「名字已经改好了」,按调用名判会被豁免 —— 而纠正文案说的是
+    「没有任何身份写操作**真的发生**」,那样就自相矛盾。
+
+    失败判据沿用仓内既有口径:`core.chat_activity.result_code` ——
+    content 以 `error:` 开头即失败。不另造一套。
+    """
+    from core import chat_activity as _ca
+
+    for item in transcript:
+        if not isinstance(item, ToolExchange):
+            continue
+        by_id = {str(r.call_id): r for r in item.results}
+        for call in item.calls:
+            if call.name not in _IDENTITY_WRITE_TOOL_NAMES:
+                continue
+            result = by_id.get(str(call.id))
+            if result is None:
+                continue
+            if _ca.result_code(result.content) == "ok":
+                return True
+    return False
+
+
+
+
 _IMAGE_CLAIM_RE = re.compile(
     r"("
     # 图 + (已经) + 完成动词:「图片已经生成」「图片生成好了」
@@ -739,7 +804,9 @@ async def run_tool_loop(
     required_file_missing_recorded = False
     file_delivery_fallback_text = ""
     image_claim_bounces = 0
+    identity_write_failed_bounces = 0
     image_claim_retry_instruction = ""
+    identity_write_failed_instruction = ""
     file_delivery_fallback_reasoning = ""
     file_delivery_recovery_needed = False
     workspace_write_applied = False
@@ -964,6 +1031,7 @@ async def run_tool_loop(
             for instruction in (
                 delivery_retry_instruction,
                 image_claim_retry_instruction,
+                identity_write_failed_instruction,
                 empty_response_retry_instruction,
                 final_reply_correction_instruction,
             )
@@ -1660,6 +1728,44 @@ async def run_tool_loop(
                     )
                 )
             )
+
+            # 同族第二条:「说改好了却没调身份写工具」。
+            # 用户看到「好的，以后叫你999」,身份卡纹丝不动,下一轮打回原名 ——
+            # 他会以为是 AI 记性差,其实是它根本没做。
+            #
+            # 与图片那条**完全同构**:同一套小句切分/剥引号/排除疑问与元话语,
+            # 只换词表;同样**只退一次**;同样**只拦不改写** —— 退回去让它自己
+            # 选择真去调工具、或者老实说改不了。弹完仍不调就照原样发,不再纠缠。
+            if (
+                pr.text
+                # 「只兜一次」计数器保留:实测拆掉它测试仍绿(第一次兜底后模型
+                # 若不再调工具,条件自然不成立),但那依赖**模型的选择**。
+                # 模型若每轮都重试同一个失败的写,没有这个计数器就会无限兜底。
+                # 这是**防御性**约束,不是当前流程下的承重件 —— 如实标注,
+                # 不假装它有测试守着(claude2 自测突变发现)。
+                and identity_write_failed_bounces < 1
+                and _identity_write_attempted(transcript)
+                and not _identity_write_succeeded(transcript)
+            ):
+                identity_write_failed_bounces += 1
+                await _trajectory(
+                    "identity_write_failed_bounced",
+                    {"round": attempts, "text_chars": len(pr.text)},
+                )
+                # 文案如实描述**我们知道的事**:工具调了、没成功。
+                # 不说「你声称改好了」—— D 方案下我们并不判断它说了什么。
+                identity_write_failed_instruction = (
+                    "上一轮你调用了身份写工具,但那次调用**没有成功**"
+                    "(被拒绝、出错或仍在排队),身份没有真的改动。"
+                    "请据实处理:要么重试一次,要么照实告诉他没改成 —— "
+                    "不要把这次未生效的改动说成已经完成。"
+                )
+                # 与图片那条同一条边界:只要还有下一轮就纠正。
+                # ⚠️ 第一版漏了这个 continue —— 指令设了、循环没重来,
+                # 等于回炉从未发生,而单测 helper 照样全绿(claude2 自测抓到)。
+                if attempts < max_calls:
+                    _progress("identity_write_failed_retry_boundary")
+                    continue
             if not requirement_met:
                 missing_suffixes = sorted(
                     normalized_required_suffixes - delivered_file_suffixes

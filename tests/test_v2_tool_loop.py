@@ -2894,3 +2894,159 @@ def test_stay_silent_is_hidden_without_callback(monkeypatch):
         max_calls=2,
     ))
     assert "stay_silent" not in {spec.name for spec in provider.calls[0]["tools"]}
+
+
+# ── B4-7 (#6):身份写调用失败时兜一次底(D 方案,Seven 2026-08-17 定) ────
+#
+# ⚠️ 这里**曾经**有 49 句中英文语料 + 六组词法突变,测的是「模型是否声称改好了」。
+# 整批删掉,因为那条路方向错了:判断「断言 vs 意向」是语用问题,中文里差别在语境
+# 不在词形。四轮迭代误伤↔漏判来回摆,最后卡在「以后叫你**小想**」——
+# **用户起的名字被当成了意向词**。那不是参数问题。
+#
+# D 方案只保留完全结构化的一半:调了工具、结果不是成功 → 兜一次底。
+# 改不改仍由模型自己判断;我们只在它「想改却失败了」时提醒一次。
+
+
+def _identity_call(cid="c1"):
+    return {"id": cid, "name": "identity_patch", "args": {"agent_name": "小七"}}
+
+
+class _ResultDispatch(_RecordingDispatch):
+    """按给定 content 返回工具结果。"""
+
+    def __init__(self, content):
+        super().__init__()
+        self._content = content
+
+    async def __call__(self, calls, **kw):
+        from provider_types import ToolResult
+        return tuple(ToolResult(call_id=c.id, content=self._content) for c in calls)
+
+
+def _run(provider, dispatch, max_calls=3):
+    """跑一轮工具循环，返回**用户实际收到的终局文本**。
+
+    第一版这里是 `async def on_reply(...): pass` —— 整组 B4-7 用例因此
+    只看得见「往 provider 发了什么」，看不见「用户拿到了什么」。
+    而 Seven 给这条兜底划的边界正是「弹完仍不调就**照常发**，不要把回复吞掉」，
+    那条边界当时没有任何断言绑着。
+    """
+    delivered: list[str] = []
+
+    async def on_reply(text, *, final, reasoning="", media=()):
+        if final:
+            delivered.append(text)
+
+    asyncio.run(
+        tool_loop.run_tool_loop(
+            provider_config=_TEST_PROVIDER_CONFIG,
+            build_messages=_RecordingBuildMessages(),
+            dispatch_tools=dispatch,
+            on_reply=on_reply,
+            fold_new_messages=_RecordingFold([]),
+            add_usage=_noop_add_usage,
+            max_calls=max_calls,
+        )
+    )
+    return delivered
+
+
+@pytest.mark.parametrize("content", [
+    "error: denied",
+    "error: validation failed",
+    "queued: identity_patch",     # 排了队不等于生效
+])
+def test_failed_identity_write_is_bounced_once(content, monkeypatch):
+    """调了、没成功 → 兜一次底。**不看模型说了什么**。"""
+    provider = _ScriptedProvider([
+        {"reply": "", "tool_calls": [_identity_call()], "usage": {}},
+        {"reply": "好的", "tool_calls": [], "usage": {}},
+        {"reply": "好的", "tool_calls": [], "usage": {}},
+    ])
+    monkeypatch.setattr(provider_client, "chat_completion_async", provider)
+    delivered = _run(provider, _ResultDispatch(content))
+    assert len(provider.calls) == 3, f"{content} 没有触发兜底"
+    assert any(
+        "没有成功" in str(m.get("content", ""))
+        for m in provider.calls[2]["messages"] if isinstance(m, dict)
+    ), "纠正文案没注入"
+    # 只拦不改写:兜底是**多问一轮**,不是把这一轮的回复吞掉。
+    assert delivered == ["好的"], f"用户该收到回复,实际收到 {delivered!r}"
+
+
+def test_successful_identity_write_is_not_bounced(monkeypatch):
+    """成功了就不打扰 —— 不误伤。"""
+    provider = _ScriptedProvider([
+        {"reply": "", "tool_calls": [_identity_call()], "usage": {}},
+        {"reply": "名字已经改好了", "tool_calls": [], "usage": {}},
+    ])
+    monkeypatch.setattr(provider_client, "chat_completion_async", provider)
+    _run(provider, _ResultDispatch("ok: identity_patch applied"))
+    assert len(provider.calls) == 2
+
+
+@pytest.mark.parametrize("text", [
+    "好的，以后叫你999",
+    "名字已经改好了",
+    "我记住了",
+    "文件我帮你改好了",
+])
+def test_no_bounce_when_no_identity_tool_was_called(text, monkeypatch):
+    """**D 方案的边界**:压根没调工具 → 不管它说什么都不兜底。
+
+    这正是我们放弃的那一半覆盖面 —— 明确记录为**有意的漏判**,
+    而不是让一个会误伤日常应答的词法检测去够它。
+    这四句里前两句是真谎报、后两句是无辜句,现在**都不触发** ——
+    这就是取舍本身。
+    """
+    provider = _ScriptedProvider([
+        {"reply": text, "tool_calls": [], "usage": {}},
+        {"reply": text, "tool_calls": [], "usage": {}},
+    ])
+    monkeypatch.setattr(provider_client, "chat_completion_async", provider)
+    _run(provider, _RecordingDispatch())
+    assert len(provider.calls) == 1, "没调身份工具却触发了兜底"
+
+
+def test_bounce_happens_at_most_once(monkeypatch):
+    """只兜一次:第二次仍失败就照原样发,不跟模型较劲。
+
+    ⚠️ 这条用例被自测突变打脸过**两次**,两次都是「测试和被测物撞在同一个上限上」:
+
+    第一版断言 `injected <= max_calls` —— 恒真,循环本来就不会超。
+    第二版改成 `injected == 1`,但剧本只有 5 轮、`max_calls=5`:拆掉
+    「只兜一次」闸之后,**第二次兜底根本没轮次可用**,injected 仍是 1 → 照样全绿。
+    挡住第二次的是**预算**,不是那道闸,而我拿它当那道闸的证据。
+
+    所以现在剧本留足余量(ROUNDS 远大于兜底所需),并且**先断言余量确实存在** ——
+    否则这条用例会随着 `_TURN_MAX_LLM_CALLS` 之类的常量变化悄悄退化回恒真。
+    """
+    ROUNDS = 8
+    provider = _ScriptedProvider(
+        [{"reply": "", "tool_calls": [_identity_call("c1")], "usage": {}}]
+        + [{"reply": "好的", "tool_calls": [], "usage": {}} for _ in range(ROUNDS)]
+    )
+    monkeypatch.setattr(provider_client, "chat_completion_async", provider)
+    delivered = _run(provider, _ResultDispatch("error: denied"), max_calls=ROUNDS)
+    injected = sum(
+        1 for call in provider.calls
+        for m in call["messages"] if isinstance(m, dict)
+        and "没有成功" in str(m.get("content", ""))
+    )
+    # 余量守卫:兜底之后还剩好几轮可用,所以「只注入一次」只能是闸的功劳。
+    assert len(provider.calls) >= 3, (
+        f"剧本只跑了 {len(provider.calls)} 轮 —— 没有余量,这条用例证明不了任何事"
+    )
+    assert injected == 1, f"纠正被注入了 {injected} 次 —— 兜底应恰好发生一次"
+    # 兜完第二次仍然没调成 → 照原样发,不跟模型较劲、更不吞掉回复。
+    assert delivered == ["好的"], f"用户该收到回复,实际收到 {delivered!r}"
+
+
+def test_identity_write_tool_names_are_derived_not_hardcoded():
+    """闭集从 WRITE_ACTIONS 派生 —— 将来新增身份写动作自动纳入。"""
+    from capabilities import registry as cap_registry
+
+    assert tool_loop._IDENTITY_WRITE_TOOL_NAMES == frozenset(
+        a for a in cap_registry.WRITE_ACTIONS if a.startswith("identity_")
+    )
+    assert tool_loop._IDENTITY_WRITE_TOOL_NAMES
