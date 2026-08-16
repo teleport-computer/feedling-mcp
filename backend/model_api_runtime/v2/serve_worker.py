@@ -70,6 +70,7 @@ if str(_BACKEND_DIR) not in sys.path:
 from accounts import registry as accounts_registry  # noqa: E402
 from admin import admin_core
 from capabilities import registry as cap_registry
+from capabilities import identity as cap_identity
 from capabilities import tool_schema as cap_tool_schema
 from core import enclave as core_enclave
 from core import envelope as core_envelope
@@ -83,6 +84,7 @@ from hosted import mcp_status
 from hosted import mcp_tools
 from hosted import vision_observer
 from identity import identity_core
+from identity import card_policy
 from memory import memory_core
 from screen import screen_read_core
 from model_api_runtime.v2 import context as v2_context
@@ -183,6 +185,59 @@ def _load_genesis_persona(store, *, runtime_token: str) -> str:
         return ""
 
 
+_IDENTITY_CARD_SUBSTANTIVE_FIELDS = tuple(dict.fromkeys((
+    *card_policy.PROFILE_STRING_FIELDS,
+    *card_policy.PROFILE_LIST_FIELDS,
+    "dimensions",
+)))
+
+
+def _identity_card_has_substance(card: dict) -> bool:
+    """Ignore empty/default card scaffolding when choosing card over persona."""
+
+    for key in _IDENTITY_CARD_SUBSTANTIVE_FIELDS:
+        value = card.get(key)
+        if key == "agent_name" and str(value or "").strip() == "TA":
+            continue
+        if isinstance(value, str):
+            if value.strip():
+                return True
+            continue
+        if isinstance(value, (list, tuple, dict, set)):
+            if value:
+                return True
+            continue
+        if value is not None:
+            return True
+    return False
+
+
+def _load_identity_card_block(store, *, runtime_token: str) -> str:
+    """Read and render the model-visible card through the capability decrypt seam."""
+
+    try:
+        result = cap_identity.get(
+            store,
+            api_key=None,
+            runtime_token=str(runtime_token or ""),
+        )
+    except Exception as exc:  # noqa: BLE001 — transition fallback is deliberate
+        log.warning(
+            "identity card read failed for %s: %s",
+            str(getattr(store, "user_id", "") or ""),
+            type(exc).__name__,
+        )
+        return ""
+    if not result.ok:
+        return ""
+    card = result.data.get("identity")
+    if not isinstance(card, dict) or card.get("decrypt_status") != "ok":
+        return ""
+    if not _identity_card_has_substance(card):
+        return ""
+    return v2_context.render_identity_card(card)
+
+
 def _load_workspace_prompt(store, *, runtime_token: str) -> dict:
     """Render one authoritative workspace prompt snapshot for a turn.
 
@@ -194,18 +249,24 @@ def _load_workspace_prompt(store, *, runtime_token: str) -> dict:
         store, runtime_token=str(runtime_token or "")
     )
     trusted_system_blocks: list[str] = []
-    persona = _load_genesis_persona(store, runtime_token=runtime_token).strip()
-    if persona:
-        # build_turn_messages places trusted blocks before the common system
-        # prompt and runtime policy, restoring V1's persona-first ordering.
-        # Persona remains outside runtime-data and profile truncation.
-        trusted_system_blocks.append(persona)
+    identity_card_or_persona = _load_identity_card_block(
+        store,
+        runtime_token=runtime_token,
+    ).strip()
+    if not identity_card_or_persona:
+        identity_card_or_persona = _load_genesis_persona(
+            store,
+            runtime_token=runtime_token,
+        ).strip()
     for block in render_trusted_prefix_blocks(backend):
         if block.name.startswith("skill:/skills/"):
             trusted_system_blocks.append(block.content)
             continue
         raise RuntimeError("invalid workspace prompt block")
-    return {"trusted_system_blocks": tuple(trusted_system_blocks)}
+    return {
+        "identity_card_or_persona": identity_card_or_persona,
+        "trusted_system_blocks": tuple(trusted_system_blocks),
+    }
 
 
 def _load_workspace_file(

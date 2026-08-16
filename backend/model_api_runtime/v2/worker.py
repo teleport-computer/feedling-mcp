@@ -1465,8 +1465,9 @@ class TurnDeps:
     # MCP tool as a parallel read. None (every non-chat/legacy caller) means no
     # MCP tools.
     load_mcp_turn: Callable[..., Any] | None = None
-    # (store, *, runtime_token) -> {trusted_system_blocks}.
-    # Production eagerly renders only encrypted read-only /skills. Missing
+    # (store, *, runtime_token) -> {identity_card_or_persona, trusted_system_blocks}.
+    # Production eagerly renders the decrypted identity card (or transition
+    # persona fallback) plus encrypted read-only /skills. Missing
     # wiring remains empty only for legacy/unit callers; a wired loader failure
     # is terminal and visible/conservative.
     load_workspace_prompt: Callable[..., dict] | None = None
@@ -1517,13 +1518,19 @@ _EMPTY_MCP_TURN = _EmptyMcpTurn()
 MCP_TURN_WALL_BUDGET_EXHAUSTED_ERROR = "error: mcp_turn_wall_budget_exhausted"
 
 
+@dataclass(frozen=True)
+class WorkspacePromptContext:
+    identity_card_or_persona: str = ""
+    trusted_system_blocks: tuple[str, ...] = ()
+
+
 async def _load_workspace_prompt_context(
     deps: TurnDeps,
     store,
     *,
     runtime_token: str,
     enclave_sem: asyncio.Semaphore,
-) -> tuple[str, ...]:
+) -> WorkspacePromptContext:
     """Load one workspace prompt snapshot without a silent fallback.
 
     Optional/unwired test callers retain the historical empty prompt. Once the
@@ -1531,7 +1538,7 @@ async def _load_workspace_prompt_context(
     chat turn surfaces an error and a wake turn fails conservatively.
     """
     if deps.load_workspace_prompt is None:
-        return ()
+        return WorkspacePromptContext()
     try:
         async with enclave_sem:
             rendered = await asyncio.to_thread(
@@ -1541,8 +1548,11 @@ async def _load_workspace_prompt_context(
             )
         if not isinstance(rendered, dict):
             raise TypeError
+        identity_card_or_persona = rendered.get("identity_card_or_persona")
         trusted = rendered.get("trusted_system_blocks")
         if (
+            not isinstance(identity_card_or_persona, str)
+            or
             not isinstance(trusted, (tuple, list))
             or isinstance(trusted, (str, bytes))
             or any(not isinstance(block, str) or not block.strip() for block in trusted)
@@ -1550,7 +1560,10 @@ async def _load_workspace_prompt_context(
             raise TypeError
     except Exception:  # noqa: BLE001 — never leak decrypted workspace data
         raise WorkspacePromptUnavailable from None
-    return tuple(trusted)
+    return WorkspacePromptContext(
+        identity_card_or_persona=identity_card_or_persona.strip(),
+        trusted_system_blocks=tuple(trusted),
+    )
 
 
 @dataclass
@@ -3859,6 +3872,7 @@ def _make_build_messages_fn(
     tail: list[dict],
     extra_context: str = "",
     mutation_recovery_active: bool = False,
+    identity_card_or_persona: str = "",
     trusted_system_blocks: tuple[str, ...] = (),
     agent_memory: str = "",
     user_profile: str = "",
@@ -3948,7 +3962,9 @@ def _make_build_messages_fn(
             tail=rendered_tail,
             action_context=extra_context,
             mutation_recovery_active=mutation_recovery_active,
-            trusted_system_blocks=(identity_block, *trusted_system_blocks),
+            runtime_identity_block=identity_block,
+            identity_card_or_persona=identity_card_or_persona,
+            trusted_system_blocks=trusted_system_blocks,
             agent_memory=agent_memory,
             user_profile=user_profile,
             worldbook_context=worldbook_context,
@@ -4272,6 +4288,7 @@ def _make_task_batch_dispatcher(
     api_key,
     runtime_token: str,
     enclave_sem: asyncio.Semaphore,
+    identity_card_or_persona: str = "",
     trusted_system_blocks: tuple[str, ...],
     add_usage: Callable[[dict | None], None],
     observe_photo=None,
@@ -4430,6 +4447,7 @@ def _make_task_batch_dispatcher(
                 system_prompt=_SUBAGENT_SYSTEM_PROMPT,
                 summary="",
                 tail=[{"role": "user", "content": task.prompt}],
+                identity_card_or_persona=identity_card_or_persona,
                 trusted_system_blocks=trusted_system_blocks,
             )
             outcome = await v2_tool_loop.run_tool_loop(
@@ -6968,12 +6986,14 @@ async def _run_wake(
             api_key=None,
             runtime_token=token,
         )
-        trusted_system_blocks = await _load_workspace_prompt_context(
+        workspace_prompt = await _load_workspace_prompt_context(
             deps,
             store,
             runtime_token=token,
             enclave_sem=enclave_sem,
         )
+        identity_card_or_persona = workspace_prompt.identity_card_or_persona
+        trusted_system_blocks = workspace_prompt.trusted_system_blocks
 
         async def _fence_wake_effect(effect: str) -> None:
             if not await asyncio.to_thread(
@@ -7492,6 +7512,7 @@ async def _run_wake(
             api_key=None,
             runtime_token=token,
             enclave_sem=enclave_sem,
+            identity_card_or_persona=identity_card_or_persona,
             trusted_system_blocks=trusted_system_blocks,
             add_usage=_add_usage,
             observe_photo=observe_photo,
@@ -8278,6 +8299,7 @@ async def _run_wake(
                     if grounding_results
                     else ""
                 ),
+                identity_card_or_persona=identity_card_or_persona,
                 trusted_system_blocks=trusted_system_blocks,
                 agent_memory=agent_memory,
                 user_profile=user_profile,
@@ -10676,12 +10698,14 @@ async def process_job(
         # cannot block a reply that was already committed by a previous worker.
         # It still precedes every provider/prompt-coverage call, preventing an
         # under-authorized response when the workspace snapshot is unavailable.
-        trusted_system_blocks = await _load_workspace_prompt_context(
+        workspace_prompt = await _load_workspace_prompt_context(
             deps,
             store,
             runtime_token=runtime_token,
             enclave_sem=enclave_sem,
         )
+        identity_card_or_persona = workspace_prompt.identity_card_or_persona
+        trusted_system_blocks = workspace_prompt.trusted_system_blocks
 
         # —— Unified provider-native tool loop (spec C6 + C9a) ——
         # Every model drives the same catalog through the same loop. Writes
@@ -11174,6 +11198,7 @@ async def process_job(
             api_key=api_key,
             runtime_token=runtime_token,
             enclave_sem=enclave_sem,
+            identity_card_or_persona=identity_card_or_persona,
             trusted_system_blocks=trusted_system_blocks,
             add_usage=tm.add_call,
             observe_photo=observe_photo,
@@ -12498,6 +12523,7 @@ async def process_job(
                 tail=tail,
                 extra_context=turn_extra_context,
                 mutation_recovery_active=(mutation_recovery_barrier is not None),
+                identity_card_or_persona=identity_card_or_persona,
                 trusted_system_blocks=turn_trusted_system_blocks,
                 agent_memory=agent_memory,
                 user_profile=user_profile,
