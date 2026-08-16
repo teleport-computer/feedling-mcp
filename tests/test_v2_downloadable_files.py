@@ -46,11 +46,15 @@ def test_file_delivery_policy_is_semantic_and_hides_internal_paths():
 
     assert "not from exact keywords, wording, language" in description
     assert "save, open, download, share, or use outside the chat" in description
-    assert "绝不要向这个人询问内部 workspace 路径" in prompt
+    assert "绝不要询问对方内部 workspace 路径" in prompt
     assert "user never needs to know /workspace" in description
     assert "Do not call this merely because" in description
     assert "Word means .docx and PDF means .pdf" in description
-    assert "绝不要拿 Markdown 顶替" in prompt
+    assert "绝不要拿 Markdown 顶替" not in prompt
+    assert (
+        "Even when reformatting an existing file, never substitute Markdown for "
+        "another supported format the user explicitly requested."
+    ) in description
     assert "memory-grounded summary or deliverable about a specific subject" in next(
         spec.description
         for spec in tool_schema.build_tool_specs()

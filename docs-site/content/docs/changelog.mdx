@@ -10,6 +10,15 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **Hosted Runtime V2 now makes prompt boundaries and tool timing more
+  explicit.** Runtime-control authority remains in the stable system policy
+  while conditional recovery rules remain runtime data. Perception and screen
+  tools now carry consistent relevance gates, progress bubbles are explicitly
+  separate from the final reply, identity-dimension edits point to their owned
+  tool, and file-format preservation lives with `send_file`. Screen-share
+  fallback and proactive-attention wording are also conditioned on the state
+  actually present in the turn.
+
 - **Hosted Runtime V2 refreshes an active memory profile after three days by
   default instead of seven.** Refresh still requires Memory Garden source
   changes, and deployments can continue to override the interval with

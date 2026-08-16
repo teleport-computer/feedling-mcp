@@ -32,6 +32,48 @@ def test_reply_tool_schema_shape():
     assert reply.parameters["properties"]["text"]["type"] == "string"
 
 
+def test_t101_reply_description_keeps_progress_separate_from_final_reply():
+    description = next(
+        spec.description for spec in tool_schema.build_tool_specs()
+        if spec.name == "reply"
+    )
+
+    assert "long-running task" in description
+    assert "immediate reply bubble" in description
+    assert "not the final reply" in description
+    assert "must not include <think>" in description
+    assert "must not replace the final reply" in description
+
+
+def test_t101_perception_and_screen_gates_reach_final_tool_descriptions():
+    descriptions = {
+        spec.name: spec.description for spec in tool_schema.build_tool_specs()
+    }
+
+    for name in (
+        "perception_recent_apps",
+        "perception_trend",
+        "perception_history",
+    ):
+        description = descriptions[name]
+        assert "user's request depends on their current device" in description
+        assert "do not call for unrelated conversation" in description
+
+    screen_description = descriptions["screen_recent"]
+    assert "plausibly refers to a shared screen" in screen_description
+    assert "do not call for unrelated conversation" in screen_description
+
+
+def test_t101_identity_patch_redirects_dimensions_to_the_owned_tool():
+    description = next(
+        spec.description for spec in tool_schema.build_tool_specs()
+        if spec.name == "identity_patch"
+    )
+
+    assert "Dimensions are not managed by this tool" in description
+    assert "use identity_dimensions_set" in description
+
+
 def test_screen_read_description_defaults_live_shares_to_pixels():
     description = tool_schema.DESCRIPTIONS["screen_read"]
     assert "active screen share" in description
