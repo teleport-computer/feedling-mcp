@@ -80,6 +80,58 @@ pull-only 不是错的,错的是「只有 pull」。V1 = 直接注入 + 工具�
 - **要求**:逐条对齐,**保留 V1 的 `(untrusted)` 标注**——那是提示注入的边界标记,
   不是装饰。
 
+#### B1-3a 屏幕文本进首轮之后的执行闸(Seven 2026-08-16 拍板)
+
+把屏幕 OCR 文本放进首轮 prompt = 把**任何人都能写的内容**放进模型的输入
+(网页、别人发来的消息、一份文档)。V1 对此**只贴了一个 `(untrusted)` 文字标签**
+(`chat_resident_consumer.py:3688`),没有执行闸 —— 而且 V1 **做不到**:它的工具面
+由外部 CLI(pi)按轮决定,后端插不上手。V2 拥有循环控制权,所以这是
+**V2 能做而 V1 做不到**的一处收紧。
+
+**分道处理,判据是「这一轮里有没有用户本人的授权」:**
+
+- **前台聊天(共享中)——不收紧。** 用户本人发了消息,那条消息就是授权
+  (`tool_loop.py:1041` 注释:「still carries the original user/wake seed」)。
+  保持现有 `initial_outbound_tools_blocked`(拦 web/fetch/task,不拦写操作)。
+  若收紧写操作,会打断「一边共享一边说『帮我记一下这个』」这个核心流程 ——
+  `external_content_seen` 一旦置位**整轮不解除**(全文件无复位点)。
+  ⚠️ 残留风险如实记录:此路暴露面与 V1 相同,不优于 V1。
+
+- **screen_watch 唤醒——收紧,但只收身份写。** 这条道用户**完全没说话**,
+  整轮唯一输入就是屏幕上的字,没有任何人授权过任何写操作。
+  但**不是**把 8 个写操作全拿掉:`memory_write` / `schedule_wake` 在唤醒里
+  有正当用途(看到屏幕上有事,记一笔或提醒一下),砍掉会伤产品。
+  **只拿掉身份写**——它改的是「伴侣认为你是谁」,用户最难察觉、最难还原,
+  且 screen_watch 没有任何正当理由去改身份。
+
+**实现要点:**
+
+1. 复用**已有**的 `wake_disabled_tool_names`(`worker.py:7588`),在 screen_watch
+   且有屏幕帧时并入身份写集合。**不动 `tool_loop`** —— 因此不触碰共享执行路径,
+   不需要架构红线裁定(这是本方案相对「加 `initial_external_content_seen`」的
+   主要优点)。
+2. 身份写集合**必须派生,不许硬编码那三个名字**:
+
+   ```python
+   _IDENTITY_WRITE_ACTIONS = frozenset(
+       a for a in cap_registry.WRITE_ACTIONS if a.startswith("identity_")
+   )
+   ```
+
+   硬编码 `{"identity_patch","identity_nudge","identity_dimensions_set"}` 会在
+   将来新增身份写操作时**静默漏掉**,而且不会有任何测试变红。
+3. **其余写操作只埋点不拦**:记录 screen_watch 轮内发生的每一次写操作
+   (工具名 + 是否有屏幕帧)。零产品代价,且把「这个风险到底发不发生」变成可测。
+   目前**没有任何证据表明该攻击发生过** —— 先测量再决定是否继续收紧。
+
+**验收(与本规格「安全闸必须断言全集」判据一致,案例库模式 22):**
+
+- screen_watch + 有屏幕帧 → 首轮 tools **不含**任何 `identity_*` 写操作;
+  且**仍含** `memory_write` / `schedule_wake` / `reply` / `screen_read`。
+- screen_watch + 无屏幕帧 → 身份写仍在架上(证明是帧触发的,不是常态禁用)。
+- 前台聊天 + 有屏幕帧 → 写操作**全部仍在架上**(证明没有误伤前台)。
+- 测试里的工具名集合**从模块读取**,不得写死(否则常量一改测试静默失配)。
+
 ### B1-4 回复语言指令
 
 - **现状**:`backend/chat/reply_language.py:153` 从未被 V2 调用。
