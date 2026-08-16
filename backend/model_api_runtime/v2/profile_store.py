@@ -28,6 +28,14 @@ log = logging.getLogger("feedling.runtime_v2.profile_store")
 PROFILE_BLOB_KIND = "v2_agent_profile"
 PROFILE_VERSION = 1
 PROFILE_STATES = frozenset({"ok", "pending", "degraded", "empty"})
+PROFILE_RETRY_DISPOSITIONS = frozenset(
+    {"", "scheduled", "provider_config", "source_change", "terminal"}
+)
+# These dispositions deliberately stop the ordinary refresh scheduler until an
+# operator repairs the metadata.  Keep the rescue CLI and worker scheduler on
+# one source of truth: copying these strings into an operator script can leave
+# a newly introduced permanent disposition stranded forever.
+PROFILE_STUCK_RETRY_DISPOSITIONS = frozenset({"provider_config", "terminal"})
 _REJECT_CODE_RE = re.compile(r"^[A-Za-z0-9_.:-]{0,160}$")
 
 
@@ -133,13 +141,7 @@ def validate_profile_document(value: Any) -> dict:
     if not math.isfinite(retry_not_before) or retry_not_before < 0:
         raise ProfileStorageError("profile_retry_not_before_invalid")
     retry_disposition = str(attempt.get("retry_disposition") or "")
-    if retry_disposition not in {
-        "",
-        "scheduled",
-        "provider_config",
-        "source_change",
-        "terminal",
-    }:
+    if retry_disposition not in PROFILE_RETRY_DISPOSITIONS:
         raise ProfileStorageError("profile_retry_disposition_invalid")
     retry_family = str(attempt.get("retry_family") or "")
     if retry_family not in {

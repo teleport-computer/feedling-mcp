@@ -1,0 +1,85 @@
+name: backfill-v2-profiles
+
+# Manual operator surface for tools/backfill_v2_profiles.py. Database DSNs stay
+# in GitHub secrets; stdout contains only user ids and bounded profile metadata.
+on:
+  workflow_dispatch:
+    inputs:
+      env:
+        description: "Target environment"
+        required: true
+        default: "test"
+        type: choice
+        options:
+          - test
+          - prod
+      user_ids:
+        description: "Optional comma-separated greylist; blank selects every eligible user"
+        required: false
+        default: ""
+        type: string
+      mode:
+        description: "Set to EXECUTE to write; anything else is dry-run"
+        required: false
+        default: "DRY_RUN"
+        type: string
+      force_all:
+        description: "Also enqueue fresh state=ok profiles"
+        required: false
+        default: false
+        type: boolean
+      prod_approval:
+        description: "For prod EXECUTE only: enter SEVEN_APPROVED after explicit approval"
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: backfill-v2-profiles-${{ inputs.env }}
+  cancel-in-progress: false
+
+jobs:
+  backfill:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install backend dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install --require-hashes -r backend/requirements.lock
+      - name: Run profile backfill (dry-run unless mode=EXECUTE)
+        env:
+          TEST_DATABASE_URL: ${{ secrets.TEST_DATABASE_URL }}
+          PROD_DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          BACKFILL_USER_IDS: ${{ inputs.user_ids }}
+        run: |
+          set -euo pipefail
+          args=(--env "${{ inputs.env }}")
+          IFS=',' read -ra user_ids <<< "$BACKFILL_USER_IDS"
+          for user_id in "${user_ids[@]}"; do
+            user_id="$(echo "$user_id" | xargs)"
+            [ -n "$user_id" ] && args+=(--user-id "$user_id")
+          done
+          if [ "${{ inputs.force_all }}" = "true" ]; then
+            args+=(--force-all)
+          fi
+          if [ "${{ inputs.mode }}" = "EXECUTE" ]; then
+            args+=(--execute)
+            if [ "${{ inputs.env }}" = "prod" ]; then
+              if [ "${{ inputs.prod_approval }}" != "SEVEN_APPROVED" ]; then
+                echo "prod EXECUTE requires explicit Seven approval" >&2
+                exit 2
+              fi
+              args+=(--confirm-prod-seven-approved)
+            fi
+          else
+            args+=(--dry-run)
+          fi
+          python3 tools/backfill_v2_profiles.py "${args[@]}"

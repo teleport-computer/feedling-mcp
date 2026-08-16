@@ -8901,7 +8901,7 @@ def _profile_refresh_due(user_id: str, *, now: float | None = None) -> bool:
     if state != "ok":
         attempt = document.get("last_attempt") or {}
         disposition = str(attempt.get("retry_disposition") or "")
-        if disposition in {"provider_config", "terminal"}:
+        if disposition in v2_profile_store.PROFILE_STUCK_RETRY_DISPOSITIONS:
             return False
         if disposition == "source_change":
             card_count, max_updated_at = db.memory_profile_source_stats(user_id)
@@ -8926,8 +8926,10 @@ async def _enqueue_profile_if_due(
     *,
     reason: str,
     force: bool = False,
+    enabled: bool | None = None,
 ) -> bool:
-    if not _PROFILE_ENABLED:
+    effective_enabled = _PROFILE_ENABLED if enabled is None else bool(enabled)
+    if not effective_enabled:
         return False
     if not force and not await asyncio.to_thread(_profile_refresh_due, user_id):
         return False
