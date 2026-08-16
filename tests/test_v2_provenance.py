@@ -25,7 +25,11 @@ def test_write_gate_allows_writes_with_authorization():
 
 
 def test_write_gate_refuses_background_identity_writes_only():
-    for tool_name in ("identity_patch", "identity_nudge"):
+    for tool_name in (
+        "identity_patch",
+        "identity_nudge",
+        "identity_dimensions_set",
+    ):
         allowed, reason = prov.write_gate(
             tool_name,
             turn_authorization=True,
@@ -50,8 +54,50 @@ def test_write_gate_refuses_background_identity_writes_only():
     assert allowed is True and reason == ""
 
 
+def test_write_gate_refuses_only_memory_delete_when_background_delete_is_disabled():
+    for op in ("add", "update"):
+        allowed, reason = prov.write_gate(
+            "memory_write",
+            turn_authorization=True,
+            memory_delete_authorization=False,
+            tool_args={"actions": [{"op": op}]},
+        )
+        assert allowed is True and reason == ""
+
+    allowed, reason = prov.write_gate(
+        "memory_write",
+        turn_authorization=True,
+        memory_delete_authorization=False,
+        tool_args={"actions": [{"op": "delete", "target_id": "m1"}]},
+    )
+    assert allowed is False
+    assert reason == "error: memory delete refused in background turn"
+
+    allowed, reason = prov.write_gate(
+        "memory_write",
+        turn_authorization=True,
+        tool_args={"actions": [{"op": "delete", "target_id": "m1"}]},
+    )
+    assert allowed is False
+    assert reason == "error: memory delete refused in background turn"
+
+    allowed, reason = prov.write_gate(
+        "memory_write",
+        turn_authorization=True,
+        memory_delete_authorization=True,
+        tool_args={"actions": [{"op": "delete", "target_id": "m1"}]},
+    )
+    assert allowed is True and reason == ""
+
+
 def test_write_gate_refuses_writes_without_authorization():
-    for w in ("memory_write", "identity_patch", "schedule_wake", "cancel_wake"):
+    for w in (
+        "memory_write",
+        "identity_patch",
+        "identity_dimensions_set",
+        "schedule_wake",
+        "cancel_wake",
+    ):
         allowed, reason = prov.write_gate(w, turn_authorization=False)
         assert allowed is False and "authorization" in reason
 

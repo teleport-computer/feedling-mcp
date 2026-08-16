@@ -187,11 +187,8 @@ def _load_workspace_prompt(store, *, runtime_token: str) -> dict:
     """Render one authoritative workspace prompt snapshot for a turn.
 
     Skill entries come only from the backend's read-only ``/skills`` namespace
-    and therefore retain system authority. Agent-editable ``WORKING.md`` stays
-    encrypted at rest and is available through ``workspace_read``; it is not
-    eagerly injected, because persistent untrusted text must not be able to
-    choose a future outbound web/MCP/subagent call. Any malformed/unknown skill
-    block fails the turn instead of silently dropping policy.
+    and therefore retain system authority. Any malformed/unknown skill block
+    fails the turn instead of silently dropping policy.
     """
     backend = production_workspace_backend(
         store, runtime_token=str(runtime_token or "")
@@ -199,24 +196,16 @@ def _load_workspace_prompt(store, *, runtime_token: str) -> dict:
     trusted_system_blocks: list[str] = []
     persona = _load_genesis_persona(store, runtime_token=runtime_token).strip()
     if persona:
-        # Persona is first only within trusted_system_blocks. build_turn_messages
-        # appends this list after system_prompt and the runtime policy, so the
-        # final V2 system message remains persona-last, unlike V1; whether to
-        # restore V1's ordering is an unresolved product decision. It remains
-        # outside runtime-data and profile truncation.
+        # build_turn_messages places trusted blocks before the common system
+        # prompt and runtime policy, restoring V1's persona-first ordering.
+        # Persona remains outside runtime-data and profile truncation.
         trusted_system_blocks.append(persona)
-    for block in render_trusted_prefix_blocks(
-        backend,
-        include_working_memory=False,
-    ):
+    for block in render_trusted_prefix_blocks(backend):
         if block.name.startswith("skill:/skills/"):
             trusted_system_blocks.append(block.content)
             continue
         raise RuntimeError("invalid workspace prompt block")
-    return {
-        "trusted_system_blocks": tuple(trusted_system_blocks),
-        "working_memory": "",
-    }
+    return {"trusted_system_blocks": tuple(trusted_system_blocks)}
 
 
 def _load_workspace_file(
@@ -1100,7 +1089,7 @@ def _scrub_leaked_thinking_rows(rows: list[dict]) -> list[dict]:
     保留文字，格式没了、内容还在。行的 id/ts/seq 一律原样保留，compaction /
     capture 的水位连续性不受影响。
     """
-    from agent_protocol_core import self_thinking as _st
+    from core import self_thinking as _st
 
     if not _st.gate_enabled():
         return rows
@@ -1648,7 +1637,7 @@ def _select_agent_profile_for_turn(
         )
 
     with core_enclave.coalesced_success_trace("v2_profile_memory_read"):
-        with core_enclave.coalesced_success_trace("v2_profile_user_read"):
+        with core_enclave.coalesced_success_trace("v2_profile_style_read"):
             return v2_profile_store.select_profile_for_turn(
                 user_id,
                 summary,
@@ -2521,7 +2510,6 @@ def _render_card_line(item: dict) -> str:
     return "- " + " | ".join(parts)
 
 
-_PROFILE_CARD_CONTENT_MAX_CHARS = 2_000
 PROFILE_CARD_BATCH_SIZE = 64
 
 
@@ -2539,7 +2527,7 @@ def _render_profile_card(item: dict) -> str:
         f"bucket={str(item.get('bucket') or '').strip()}",
         f"occurred_at={str(item.get('occurred_at') or '').strip()}",
         f"summary={summary}",
-        f"content={content[:_PROFILE_CARD_CONTENT_MAX_CHARS]}",
+        f"content={content}",
     ]
     return "- " + " | ".join(parts)
 
@@ -2548,13 +2536,12 @@ def _read_profile_cards(
     user_id: str,
     progress: Callable[[str], None] | None = None,
 ) -> tuple[str, int, dict]:
-    """Read every eligible Garden card or fail loudly on any truncation.
+    """Read every eligible Garden card and preserve its fetched content.
 
     The lightweight index proves the complete cardinality, then fetch obtains
-    each card's bounded content. Both use the scoped runtime token; no API key
-    or server-side envelope decryption is involved. Per-card bodies keep their
-    separate ``_PROFILE_CARD_CONTENT_MAX_CHARS`` bound; the returned tail-window
-    metadata makes any such clipping observable without changing prompt text.
+    each card's readside-bounded content. Both use the scoped runtime token; no
+    API key or server-side envelope decryption is involved. Profile rendering
+    adds no second per-card cap on top of that source contract.
     """
 
     store = core_store.get_store(user_id)
@@ -2632,15 +2619,10 @@ def _read_profile_cards(
     rendered = [_render_profile_card(by_id[memory_id]) for memory_id in ids]
     if any(not line for line in rendered):
         raise RuntimeError("profile_cards_render_incomplete")
-    # Derive the signal at the reader's final outlet from the source lengths
-    # and the cap that actually produced ``rendered``. Do not set a side flag
-    # next to the slice: a future rendering refactor must not silently detach
-    # the telemetry from the effective output.
-    profile_cards_truncated = any(
-        len(str(by_id[memory_id].get("content") or "").strip())
-        > _PROFILE_CARD_CONTENT_MAX_CHARS
-        for memory_id in ids
-    )
+    # Keep the established provider/trace field as a regression sentinel. The
+    # profile renderer now has no per-card cap, so this must stay false unless a
+    # future change deliberately reintroduces clipping at this final outlet.
+    profile_cards_truncated = False
     return "\n".join(rendered), user_card_count, {
         "lane": "profile",
         "profile_cards_truncated": profile_cards_truncated,
@@ -2741,7 +2723,17 @@ def _read_memory_context(user_id: str, *, full_cards: bool = False) -> dict:
                     if not line:
                         continue
                     added_chars = len(line) + (1 if lines else 0)
-                    if lines and rendered_chars + added_chars > _DREAM_CARDS_MAX_CHARS:
+                    if rendered_chars + added_chars > _DREAM_CARDS_MAX_CHARS:
+                        log.warning(
+                            "[v2.serve_worker] dream cards truncated user=%s "
+                            "kept=%d/%d chars=%d cap=%d empty_context=%s",
+                            user_id,
+                            len(selected),
+                            len(ids),
+                            rendered_chars,
+                            _DREAM_CARDS_MAX_CHARS,
+                            not selected,
+                        )
                         break
                     selected.append(item)
                     lines.append(line)
@@ -3530,7 +3522,7 @@ def _capability_effect_error(result, code: str) -> Exception:
 
 
 def _sink_identity(user_id: str, payload: dict, *, runtime_token: str) -> None:
-    """`identity` sink. One ``identity`` effect_type carries two producers,
+    """`identity` sink. One ``identity`` effect_type carries multiple producers,
     disambiguated by a trusted ``op`` (set from the tool name in
     worker._write_tool_effect_payload):
 
@@ -3540,6 +3532,8 @@ def _sink_identity(user_id: str, payload: dict, *, runtime_token: str) -> None:
         every pre-nudge and in-flight row uses — it MUST keep working.
       * ``op == "identity_nudge"`` -> identity_nudge capability
         (``{"dimension", "delta", optional "reason"}``).
+      * ``op == "identity_dimensions_set"`` -> full dimensions-list rewrite
+        (``{"dimensions", optional "reason"}``).
 
     An unknown op is NOT silently applied as a patch: it terminal-discards.
     The encrypted path already re-validated op in
@@ -3555,7 +3549,11 @@ def _sink_identity(user_id: str, payload: dict, *, runtime_token: str) -> None:
         op = payload.get("op")
         if op is None:
             op = "identity_patch"  # legacy shape: no op key was ever written
-        elif op not in ("identity_patch", "identity_nudge"):
+        elif op not in (
+            "identity_patch",
+            "identity_nudge",
+            "identity_dimensions_set",
+        ):
             # Deterministic bad row — never guess it into identity_patch.
             raise db.EffectTerminalError("identity_operation_invalid")
         store = core_store.get_store(user_id)
@@ -4129,8 +4127,9 @@ def _validate_decrypted_tool_effect(effect_type: str, payload: dict) -> None:
         # Trusted op set by the producer from the tool name (see
         # worker._write_tool_effect_payload). A MISSING op is the legacy
         # identity_patch shape — every pre-nudge enqueued/in-flight row — and
-        # must keep validating as identity_patch. identity_nudge routes to its
-        # own schema. A present-but-unknown op is fail-closed: it raises the
+        # must keep validating as identity_patch. Explicit identity operations
+        # route to their own schemas. A present-but-unknown op is fail-closed:
+        # it raises the
         # same plain RuntimeError as every other validation failure here (which
         # the outbox treats as RETRYABLE, so a payload a newer worker would
         # understand is never terminal-discarded during a deploy overlap —
@@ -4138,8 +4137,8 @@ def _validate_decrypted_tool_effect(effect_type: str, payload: dict) -> None:
         op = payload.get("op")
         if op is None or op == "identity_patch":
             tool_name = "identity_patch"
-        elif op == "identity_nudge":
-            tool_name = "identity_nudge"
+        elif op in ("identity_nudge", "identity_dimensions_set"):
+            tool_name = op
         else:
             raise RuntimeError("invalid encrypted identity operation")
         # `relationship_started_at` is the trusted FROZEN anchor the producer
@@ -5071,16 +5070,23 @@ _CLAIM_RECONCILE_INTERVAL_SEC = _positive_float_env(
 async def _reconcile_fleet_claims_once(
     fleet: v2_pool_supervisor.SlotFleet,
 ) -> int:
+    # `_slot_loop` reports this stage only after the Job reached its durable
+    # terminal state, then immediately reports idle.  Do not let the periodic
+    # DB check land between those pipe messages and misread the terminal row as
+    # an invalid in-flight claim.  Process liveness/watchdog recovery still
+    # covers a child that wedges before the idle signal arrives.
     snapshots = {
         key: snapshot
         for key, snapshot in fleet.snapshots().items()
-        if snapshot is not None and snapshot.active_job is not None
+        if snapshot is not None
+        and snapshot.active_job is not None
+        and snapshot.stage != "durable_completion"
     }
     pairs = [
         (snapshot.active_job.job_id, snapshot.active_job.claimed_by)
         for snapshot in snapshots.values()
     ]
-    valid = await asyncio.to_thread(jobs_store.valid_active_claims, pairs)
+    valid = await asyncio.to_thread(jobs_store.valid_reconcile_claims, pairs)
     restarted = 0
     for key, snapshot in snapshots.items():
         active = snapshot.active_job
@@ -5131,6 +5137,14 @@ _SCHEDULER_INTERVAL_SEC = _positive_float_env(
 _CHILD_LIVENESS_TIMEOUT_SEC = _positive_float_env(
     "FEEDLING_V2_CHILD_LIVENESS_TIMEOUT_SEC", "45"
 )
+_CHILD_STARTUP_TIMEOUT_SEC = _positive_float_env(
+    "FEEDLING_V2_CHILD_STARTUP_TIMEOUT_SEC", "120"
+)
+if _CHILD_STARTUP_TIMEOUT_SEC <= _CHILD_LIVENESS_TIMEOUT_SEC:
+    raise RuntimeError(
+        "FEEDLING_V2_CHILD_STARTUP_TIMEOUT_SEC must exceed "
+        "FEEDLING_V2_CHILD_LIVENESS_TIMEOUT_SEC"
+    )
 
 # A turn has two different clocks and they must never be conflated:
 #
@@ -5236,7 +5250,8 @@ _WATCHDOG_DB_TIMEOUT_SEC = _positive_float_env(
 def _jobs_claimable() -> bool:
     """Watchdog's "is there work waiting" predicate (`watchdog.should_kill`'s
     `jobs_claimable` guard) — `pending_job_count()` counts only rows still
-    `status='pending'` (queued, not yet claimed by ANY worker slot), which is
+    `status='pending'` whose durable `available_at` fence is due (queued and
+    ready, not yet claimed by ANY worker slot), which is
     exactly "all slots stuck while work waits": a wedged child claims nothing, so
     genuinely queued work sits at `pending` instead of draining into `claimed`/
     `running`. Deliberately NOT `inflight_job_count()` (pending+claimed+running) —
@@ -5270,6 +5285,7 @@ async def _watchdog_loop(
         turn_stall_timeout_sec=turn_stall_timeout_sec,
         turn_absolute_timeout_sec=turn_absolute_timeout_sec,
         child_liveness_timeout_sec=_CHILD_LIVENESS_TIMEOUT_SEC,
+        child_startup_timeout_sec=_CHILD_STARTUP_TIMEOUT_SEC,
         jobs_claimable_timeout_sec=_WATCHDOG_DB_TIMEOUT_SEC,
         capacity_write_timeout_sec=_WATCHDOG_DB_TIMEOUT_SEC,
         recovery_timeout_sec=_WATCHDOG_DB_TIMEOUT_SEC,

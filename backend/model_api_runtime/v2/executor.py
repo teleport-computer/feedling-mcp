@@ -130,6 +130,8 @@ async def dispatch_tool_calls(
     observe_photo=None,
     read_parallelism: int = 4,
     identity_write_authorization: bool = True,
+    # Destructive memory mutation is fail-closed. Only foreground Chat opts in.
+    memory_delete_authorization: bool = False,
     # History tools' dispatch gate (spec §6): catalog omission is the
     # provider-facing control; this flag is the independent fail-closed
     # boundary. Default False means every caller that does not explicitly
@@ -282,6 +284,8 @@ async def dispatch_tool_calls(
                     candidate.name,
                     turn_authorization=turn_authorization,
                     identity_write_authorization=identity_write_authorization,
+                    memory_delete_authorization=memory_delete_authorization,
+                    tool_args=candidate.args,
                 )
                 if not allowed:
                     results_by_id[candidate.id] = ToolResult(
@@ -311,6 +315,8 @@ async def dispatch_tool_calls(
             tc.name,
             turn_authorization=turn_authorization,
             identity_write_authorization=identity_write_authorization,
+            memory_delete_authorization=memory_delete_authorization,
+            tool_args=tc.args,
         )
         if not allowed:
             results_by_id[tc.id] = ToolResult(call_id=tc.id, content=reason)

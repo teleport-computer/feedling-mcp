@@ -38,18 +38,25 @@ _PROVIDER = provider_client.ProviderConfig(
 
 def test_file_delivery_policy_is_semantic_and_hides_internal_paths():
     prompt = v2_context.CHAT_SYSTEM_PROMPT
-    description = tool_schema.DESCRIPTIONS[tool_schema.FILE_REPLY_TOOL]
+    description = next(
+        spec.description
+        for spec in tool_schema.build_tool_specs()
+        if spec.name == tool_schema.FILE_REPLY_TOOL
+    )
 
-    assert "semantically, not by matching specific words" in prompt
-    assert "save, open, download, share, or use outside the chat" in prompt
-    assert "never ask the user for an internal workspace path" in prompt
     assert "not from exact keywords, wording, language" in description
+    assert "save, open, download, share, or use outside the chat" in description
+    assert "绝不要向 TA 询问内部 workspace 路径" in prompt
     assert "user never needs to know /workspace" in description
     assert "Do not call this merely because" in description
-    assert "Word means .docx and PDF means .pdf" in prompt
-    assert "Never substitute Markdown" in prompt
-    assert "search memory for that subject" in prompt
-    assert "do not substitute unrelated preferences or events" in prompt
+    assert "Word means .docx and PDF means .pdf" in description
+    assert "绝不要拿 Markdown 顶替" in prompt
+    assert "memory-grounded summary or deliverable about a specific subject" in next(
+        spec.description
+        for spec in tool_schema.build_tool_specs()
+        if spec.name == "memory_search"
+    )
+    assert "别拿无关偏好或事件冒充这个问题的答案" in prompt
     assert "real Word/PDF bytes" in description
 
 

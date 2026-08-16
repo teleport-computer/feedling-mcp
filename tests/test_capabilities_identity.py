@@ -2,6 +2,7 @@ import sys, pathlib
 sys.path.insert(0, str(pathlib.Path(__file__).parent.parent / "backend"))  # noqa: E402
 
 from identity import identity_core  # noqa: E402
+from identity import card_policy  # noqa: E402
 from capabilities import identity as cap_identity  # noqa: E402
 
 
@@ -148,6 +149,82 @@ def test_nudge_builds_dimension_nudge_action(monkeypatch):
     assert action["delta"] == 3
     assert action["reason"] == "更活泼"
     assert captured["rt"] == "rt"
+
+
+def test_dimensions_set_builds_full_replacement_action(monkeypatch):
+    captured = {}
+
+    def fake_run_actions(
+        store, payload, *, api_key, runtime_token, trusted_relationship_anchor=None
+    ):
+        captured["payload"] = payload
+        captured["runtime_token"] = runtime_token
+        return {"status": "ok", "action": "identity.dimensions_set"}, 200
+
+    monkeypatch.setattr(identity_core, "run_actions", fake_run_actions)
+    dimensions = [{
+        "name": "直率",
+        "value": card_policy._VALUE_MAX,
+        "description": "用户明确要求更直接。",
+    }]
+
+    result = cap_identity.set_dimensions(
+        "STORE",
+        runtime_token="rt",
+        params={"dimensions": dimensions, "reason": "explicit user rewrite"},
+    )
+
+    assert result.ok is True
+    assert captured == {
+        "payload": {"action": {
+            "type": "identity.dimensions_set",
+            "dimensions": dimensions,
+            "reason": "explicit user rewrite",
+        }},
+        "runtime_token": "rt",
+    }
+
+
+def test_dimensions_set_reuses_card_policy_validation_before_dispatch(monkeypatch):
+    monkeypatch.setattr(
+        identity_core,
+        "run_actions",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("invalid dimensions must not reach the action endpoint")
+        ),
+    )
+    too_many = [
+        {"name": f"dimension-{index}", "value": card_policy._VALUE_MIN}
+        for index in range(card_policy.MAX_DIMENSIONS + 1)
+    ]
+
+    result = cap_identity.set_dimensions("STORE", params={"dimensions": too_many})
+
+    assert result.ok is False
+    assert result.error["retryable"] is False
+    assert result.error["message"] == "identity_dimensions_set: too_many_dimensions"
+
+
+def test_dimensions_set_requires_actionable_reason_before_dispatch(monkeypatch):
+    monkeypatch.setattr(
+        identity_core,
+        "run_actions",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("missing reason must not reach the action endpoint")
+        ),
+    )
+
+    result = cap_identity.set_dimensions(
+        "STORE",
+        params={"dimensions": [{"name": "directness", "value": 80}]},
+    )
+
+    assert result.ok is False
+    assert result.error["retryable"] is False
+    assert result.error["message"] == (
+        "identity_dimensions_set requires a non-empty reason explaining "
+        "the user-requested rewrite"
+    )
 
 
 def test_nudge_coerces_numeric_string_delta_and_omits_blank_reason(monkeypatch):

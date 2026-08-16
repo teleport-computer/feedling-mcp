@@ -10,6 +10,90 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **Hosted Runtime V2 now keeps tool-selection timing beside each provider-visible
+  tool schema.** Memory, web, perception, screen, file-delivery, reminder, and
+  identity call conditions moved out of the general system prompt and into the
+  corresponding tool descriptions without changing their selection rules. The
+  stable system prompt now carries companion behavior independently of which
+  tools are offered on a turn.
+
+- **Hosted Runtime V2 now separates platform behavior from protocol and user
+  content by language.** Companion-speaking and response-behavior guidance is
+  written in Chinese, machine labels and tool-timing protocol remain in
+  English, and memory, STYLE, persona, World Book, and conversation content stay
+  verbatim. A new positive memory rule asks the companion to search before
+  answering about a specific past event or person when its current summary has
+  no answer, while greetings, casual chat, and already-answered context remain
+  search-free.
+
+- **Runtime V2 profile storage now calls interaction style `STYLE`.** New
+  distillation writes `MEMORY` for facts and `STYLE` for communication and
+  relationship style without changing their existing boundary or prompt
+  heading. Existing encrypted `USER` fields remain readable until the next
+  successful profile distillation migrates them naturally. Admin diagnostics
+  temporarily return both `style_chars` and the compatible `user_chars` alias.
+  Automatic working-memory prompt injection has also been removed; the
+  encrypted workspace and explicit workspace tools remain available.
+
+- **Identity dimensions can now be rewritten independently in Runtime V2.**
+  Foreground Chat can use `identity_dimensions_set` to replace the complete
+  dimensions list—including each dimension's name, numeric value, and optional
+  description—without changing profile text fields. This supports renaming,
+  adding, and deleting dimensions as well as assigning any valid value. The
+  corresponding `identity.dimensions_set` action on
+  `POST /v1/identity/actions` reuses the existing 12-item, unique-name, and
+  0–100 value rules and requires a reason. The reason and tool source are kept
+  inside the encrypted card; admin diagnostics receive only change/add/delete
+  counts and a label-set-changed flag, never labels or reason text.
+  `identity_nudge` remains available—with its existing ±10 limit—for small
+  model-initiated relative score adjustments, while `identity_dimensions_set`
+  has no delta limit because it represents an explicit user request.
+  Proactive/background turns cannot use any identity write path.
+- **Hosted Chat no longer rejects user messages merely because the live worker
+  pool is overloaded.** `POST /v1/model_api/chat/send` now persists the encrypted
+  user row and queues or coalesces its Chat Job atomically, returning the usual
+  asynchronous `202` response while retaining the queue estimate as operational
+  telemetry. Runtime-control, worker-liveness, kill-switch, and provider setup
+  failures remain fail-closed before persistence.
+
+- **Memory Garden timestamps now compare and write consistently.** Reads parse
+  historical `Z`, offset, naive datetime, microsecond, and date-only values as
+  instants instead of ordering their strings; malformed values sort last. New
+  card datetime metadata is written in UTC with a `Z` suffix while date-only
+  and intentionally empty event dates retain their precision. Existing cards
+  are not backfilled when they are updated.
+
+- **Optional Runtime V2 proactive wakes now describe silence unambiguously.**
+  Heartbeat, manual-wake, and screen-watch turns tell the model that choosing
+  silence means returning only its private thinking block, which is discarded
+  without creating a chat item, thinking UI, or notification. Choosing to speak
+  still produces the ordinary visible reply, while scheduled reminders retain
+  their required-delivery contract.
+
+- **Accepted memory adds always create a new card.** `memory.add` no longer
+  decrypts the incoming or existing cards to search for normalized exact
+  duplicates. Repeating an add with the same title and content therefore
+  creates another memory ID and emits another write effect; callers must not
+  treat `POST /v1/memory/actions` as idempotent.
+
+- **Runtime V2 background wake turns cannot delete memory cards.** Heartbeat,
+  scheduled, manual-wake, and screen-watch turns retain memory add and update
+  tools, but deletion is absent from their provider tool schema and rejected at
+  the execution boundary. Foreground Chat memory deletion remains available.
+
+- **Runtime V2 Profile generation now recovers without another Chat turn.**
+  Retryable provider failures persist the exact Profile Job as delayed pending
+  work with exponential backoff from five minutes to six hours; malformed
+  Memory/User output receives at most three delayed retries. Provider setup
+  failures wait for a successful configuration change, source failures wait for
+  the Memory Garden witness to change, and unknown internal failures terminate
+  instead of looping. Delayed Jobs occupy no worker slot and do not make the
+  watchdog treat an idle pool as wedged. Ordinary post-Chat freshness checks do
+  not accelerate them, while a successful provider repair or the existing Dream
+  force trigger can make the same Job ready immediately. Runtime V2 semantic
+  conversation compaction remains removed, so Memory/User is its only long-term
+  semantic layer beside content-free deterministic history coverage.
+
 - **Hosted Runtime V2 isolates foreground Chat from background maintenance.**
   Chat/manual-wake, ambient-wake, and Heavy maintenance work now use separate
   capacity pools with one OS process per worker slot. Background work therefore
@@ -33,6 +117,21 @@ change must not be interpreted as an API guarantee.
   survives worker crashes and lease expiry, does not attach itself to an older
   user message, and does not advance that message's reply cursor. Heartbeat,
   manual-wake, and screen-watch silence remains unchanged.
+
+- **Multi-card memory consolidation no longer leaves a silently unretired
+  suffix.** Hosted Runtime V2 can supply up to 20 source IDs when writing one
+  consolidated successor. Oversized `memory.supersede` requests now fail with
+  `too_many_supersedes` before changing any card instead of silently applying
+  only the first 20. A merge also fails atomically if any source card is already
+  unavailable or changes before commit, so a stale request cannot append a
+  second active successor. Successful receipts list only IDs actually retired.
+
+- **Dream consolidation now preserves the remembered event timeline.** A
+  Hosted Runtime V2 Dream successor uses the latest `occurred_at` value among
+  the source cards it consolidates instead of the Dream job time or most recent
+  chat time. If any selected source has no usable ISO-8601 event time, the whole
+  consolidation fails before retiring a card and records a content-free
+  `dream_source_occurred_at_unavailable` diagnostic.
 
 - **`memory_search` guidance documents literal matching and allows a reworded
   retry.** Matching is a case-insensitive literal substring with no synonyms,
@@ -633,14 +732,15 @@ change must not be interpreted as an API guarantee.
   retries now fetch the requested message directly rather than searching only
   the newest 20 Chat rows. Requests with neither credential still fail closed.
 
-- **Runtime V2 can replace its legacy summary with a bounded Memory/User
-  profile.** The default-off `FEEDLING_V2_PROFILE_ENABLED` switch now gates
+- **Runtime V2 can supply a bounded Memory/User profile as its long-term
+  semantic layer.** The default-off `FEEDLING_V2_PROFILE_ENABLED` switch gates
   both generation and turn-time selection. Only an `ok`, non-disabled profile
   whose two encrypted fields both validate and decrypt is injected, as one
   early user-role block explicitly labeled model-derived untrusted data.
   Missing, pending, degraded, disabled, invalid, or undecryptable profiles keep
-  the rollback-compatible summary. Verbatim replay wins on conflict, coverage
-  gaps remain a separate late data notice, and OpenAI Chat and Anthropic cache
+  deterministic history coverage plus the bounded verbatim tail, but no legacy
+  semantic summary. Verbatim replay wins on conflict, coverage gaps remain a
+  separate late data notice, and OpenAI Chat and Anthropic cache
   breakpoints prioritize the stable profile ahead of an older recent-user
   boundary.
 
@@ -650,8 +750,9 @@ change must not be interpreted as an API guarantee.
   generates Memory/User fields with a bounded provider-call budget, and writes
   them through the encrypted profile CAS. Runtime V2 cutover, successful dream
   writes, and best-effort post-Chat freshness checks can enqueue the job;
-  degraded profiles respect exponential retry metadata, and the seven-day
-  stale floor runs independently of the dream setting. Profile failures remain
+  delayed retryable failures persist the exact Job without requiring another
+  Chat, and the seven-day stale floor runs independently of the dream setting.
+  Profile failures remain
   background-only and never create a Chat bubble or terminal turn error.
   Managed production, pre-production, and test Compose configurations now
   explicitly enable capture and dream in `serve-worker`. Profile generation

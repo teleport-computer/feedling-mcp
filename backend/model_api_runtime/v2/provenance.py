@@ -21,7 +21,11 @@ INTERNAL = "internal"
 # A child summary can contain remote web text or user-editable workspace/memory
 # content. Treat it exactly like other external model input in the parent loop.
 EXTERNAL_READS = frozenset({"web_search", "web_fetch", "task"})
-IDENTITY_WRITE_ACTIONS = frozenset({"identity_patch", "identity_nudge"})
+IDENTITY_WRITE_ACTIONS = frozenset({
+    "identity_patch",
+    "identity_nudge",
+    "identity_dimensions_set",
+})
 
 
 def provenance_for_read(tool_name: str) -> str:
@@ -35,13 +39,26 @@ def turn_has_write_authorization(seed: str) -> bool:
 def write_gate(
     tool_name: str, *, turn_authorization: bool,
     identity_write_authorization: bool = True,
+    memory_delete_authorization: bool = False,
+    tool_args: dict | None = None,
 ) -> tuple[bool, str]:
-    """Reads are never gated. A WRITE_ACTIONS tool is allowed only when the turn holds a
-    user/wake authorization; otherwise deterministically refused."""
+    """Apply seed authorization and narrower lane-specific write policies.
+
+    Reads are never gated. Durable writes require a user/wake seed, while
+    background lanes can independently remove destructive or identity-changing
+    operations without disabling the whole compound write tool.
+    """
     if tool_name not in cap_registry.WRITE_ACTIONS:
         return True, ""
     if tool_name in IDENTITY_WRITE_ACTIONS and not identity_write_authorization:
         return False, f"error: identity write refused in background turn for {tool_name}"
+    if tool_name == "memory_write" and not memory_delete_authorization:
+        actions = (tool_args or {}).get("actions") or []
+        if any(
+            isinstance(action, dict) and action.get("op") == "delete"
+            for action in actions
+        ):
+            return False, "error: memory delete refused in background turn"
     if turn_authorization:
         return True, ""
     return False, f"write refused: no user/wake authorization in this turn for {tool_name}"

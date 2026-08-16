@@ -11,7 +11,7 @@ from provider_types import ProviderResponse, ToolExchange, ToolResult
 from capabilities import registry as cap_registry
 from capabilities import result_budget
 from capabilities import tool_schema
-from agent_protocol_core import protocol_leak
+from core import protocol_leak
 from model_api_runtime.v2 import prompt_frontier
 from model_api_runtime.v2 import provenance
 import provider_client
@@ -498,6 +498,7 @@ async def run_tool_loop(
     max_calls: int,
     before_provider_call=None,
     on_provider_tool_surface=None,
+    on_empty_provider_response=None,
     on_provider_success=None,
     on_provider_failure=None,
     fold_before_first: bool = False,
@@ -507,6 +508,10 @@ async def run_tool_loop(
     refresh_extra_tool_specs=None,
     extra_mutating_tool_names=None,
     disabled_tool_names=None,
+    # Wake turns retain memory add/update but must never be offered delete.
+    # Execution authorization is independently enforced by the caller's
+    # dispatch_tools closure; this parameter controls only the provider surface.
+    memory_delete_allowed: bool = False,
     allow_reply_tool: bool = True,
     include_reasoning: bool = False,
     # Self-authored thinking: when True, NEVER request provider-native reasoning —
@@ -766,11 +771,14 @@ async def run_tool_loop(
             current_extra_specs = [
                 spec for spec in refreshed if spec.name in mcp_names
             ]
-        return [
+        catalog = [
             spec
             for spec in (_catalog() + current_extra_specs)
             if spec.name not in disabled_names
         ]
+        if not memory_delete_allowed:
+            catalog = [tool_schema.without_memory_delete(spec) for spec in catalog]
+        return catalog
     # Only offered MCP tools can gain mutating semantics through this injected
     # set. Intersecting avoids a stale/buggy loader accidentally reclassifying a
     # platform read or a tool that was never shown to the provider.
@@ -1396,6 +1404,13 @@ async def run_tool_loop(
                     ),
                 },
             )
+            if on_empty_provider_response is not None:
+                try:
+                    await on_empty_provider_response(_empty_response_shape(pr))
+                except Exception:
+                    # Plaintext diagnostics are best-effort and must never
+                    # alter the retry/failure decision below.
+                    pass
             if can_correct:
                 empty_response_recovery_used = True
                 empty_response_retry_instruction = (

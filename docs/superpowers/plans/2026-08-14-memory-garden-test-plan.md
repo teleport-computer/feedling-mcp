@@ -339,7 +339,7 @@ enclave，发一条**真实加密**的用户消息：
 上限**（这正是批 10 让 `parse_capture_cards` 真正消费 policy 之后才有的约束）；
 桶是中文单词、没有斜杠双语对；称呼用真名「阿哲」而不是「用户」。
 
-这条路径经过本批改动的全部 7 处 import（`agent_protocol_core.protocol_leak` /
+这条路径经过本批改动的全部 7 处 import（`core.protocol_leak` /
 `self_thinking`、`memory_garden.text.card_guard` / `card_text`、
 `memory_garden.guards.dream_gates`、`memory_garden.prompts.buckets` /
 `migrate`）—— 任何一处解析失败，进程根本起不来。

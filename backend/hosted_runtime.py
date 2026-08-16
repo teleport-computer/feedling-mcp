@@ -5,6 +5,7 @@ import uuid
 from datetime import date
 from typing import Any
 
+from memory import timestamps as memory_timestamps
 from memory_garden.prompts.buckets import MEMORY_WRITE_GUIDANCE_V1
 
 
@@ -40,6 +41,13 @@ def clean_list(value: Any, max_items: int = 12, max_chars: int = 240) -> list[st
     else:
         raw = []
     return [item for item in (clean_text(part, max_chars) for part in raw[:max_items]) if item]
+
+
+def _memory_occurred_at(raw: dict) -> str:
+    """Normalize a supplied event time or freeze a full UTC time when absent."""
+    if "occurred_at" in raw:
+        return memory_timestamps.normalize(clean_text(raw.get("occurred_at"), 80))
+    return memory_timestamps.now_iso()
 
 
 def compact_pending_items(pending_items: list[dict]) -> list[dict]:
@@ -283,7 +291,7 @@ def coerce_runtime_action(
                 if isinstance(raw.get("threads"), list) else [],
                 "importance": raw.get("importance", 0.5),
                 "pulse": raw.get("pulse", 0.3),
-                "occurred_at": clean_text(raw.get("occurred_at") or date.today().isoformat(), 80),
+                "occurred_at": _memory_occurred_at(raw),
                 "source": clean_text(raw.get("source") or source, 80),
             },
             "reason": reason,
@@ -313,7 +321,7 @@ def coerce_runtime_action(
             if isinstance(raw.get("threads"), list) else [],
             "importance": raw.get("importance", 0.5),
             "pulse": raw.get("pulse", 0.3),
-            "occurred_at": clean_text(raw.get("occurred_at") or date.today().isoformat(), 80),
+            "occurred_at": _memory_occurred_at(raw),
             "source": clean_text(raw.get("source") or "hosted_runtime_state", 80),
         }
         runtime_action["domain"] = "memory"
@@ -371,7 +379,7 @@ def coerce_runtime_action(
                 if isinstance(raw_patch.get("threads"), list) else [],
                 "importance": raw_patch.get("importance", 0.5),
                 "pulse": raw_patch.get("pulse", 0.3),
-                "occurred_at": clean_text(raw_patch.get("occurred_at") or date.today().isoformat(), 80),
+                "occurred_at": _memory_occurred_at(raw_patch),
                 "source": clean_text(raw_patch.get("source") or "hosted_runtime_state", 80),
             },
             "reason": reason,

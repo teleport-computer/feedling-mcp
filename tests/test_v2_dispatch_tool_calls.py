@@ -49,6 +49,7 @@ def _run(
     run_capability,
     enqueue_write_effect=None,
     observe_photo=None,
+    memory_delete_authorization=True,
     monkeypatch,
 ):
     monkeypatch.setattr(cap_registry, "run_capability", run_capability)
@@ -61,6 +62,7 @@ def _run(
         enclave_sem=asyncio.Semaphore(8), turn_authorization=turn_authorization,
         enqueue_write_effect=enqueue_write_effect,
         observe_photo=observe_photo,
+        memory_delete_authorization=memory_delete_authorization,
     )), calls
 
 
@@ -326,6 +328,57 @@ def test_write_with_authorization_is_enqueued_not_run_inline(monkeypatch):
     assert "memory_write" in results[0].content
 
 
+def test_background_memory_delete_is_refused_but_chat_opt_in_still_enqueues(monkeypatch):
+    delete_call = ToolCall(id="delete-1", name="memory_write", args={"actions": [{
+        "op": "delete", "target_id": "m1",
+    }]})
+
+    refused, refused_enqueued = _run(
+        [delete_call],
+        turn_authorization=True,
+        memory_delete_authorization=False,
+        run_capability=lambda *_args, **_kwargs: None,
+        monkeypatch=monkeypatch,
+    )
+    assert refused_enqueued == []
+    assert refused[0].content == "error: memory delete refused in background turn"
+
+    allowed, allowed_enqueued = _run(
+        [delete_call],
+        turn_authorization=True,
+        memory_delete_authorization=True,
+        run_capability=lambda *_args, **_kwargs: None,
+        monkeypatch=monkeypatch,
+    )
+    assert [call.id for call in allowed_enqueued] == ["delete-1"]
+    assert allowed[0].content == "queued: memory_write"
+
+
+def test_memory_delete_is_fail_closed_when_caller_omits_authorization(monkeypatch):
+    monkeypatch.setattr(
+        cap_registry,
+        "run_capability",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("write must not run inline")
+        ),
+    )
+    enqueued = []
+    results = asyncio.run(v2_executor.dispatch_tool_calls(
+        [ToolCall(id="delete-default", name="memory_write", args={"actions": [{
+            "op": "delete", "target_id": "m1",
+        }]})],
+        store=_Store(),
+        api_key="k",
+        runtime_token="rt",
+        enclave_sem=asyncio.Semaphore(8),
+        turn_authorization=True,
+        enqueue_write_effect=enqueued.append,
+    ))
+
+    assert enqueued == []
+    assert results[0].content == "error: memory delete refused in background turn"
+
+
 def test_async_write_enqueue_is_awaited_without_blocking_event_loop(monkeypatch):
     monkeypatch.setattr(
         cap_registry,
@@ -563,6 +616,26 @@ def test_identity_non_rename_patch_is_enqueued(monkeypatch):
 
     assert [tc.id for tc in enqueued] == ["r4"]
     assert results[0].content == "queued: identity_patch"
+
+
+def test_identity_dimensions_set_is_enqueued_as_an_identity_write(monkeypatch):
+    tool_calls = [ToolCall(
+        id="dimensions-set",
+        name="identity_dimensions_set",
+        args={
+            "dimensions": [{"name": "directness", "value": 73}],
+            "reason": "user requested rewrite",
+        },
+    )]
+    results, enqueued = _run(
+        tool_calls,
+        turn_authorization=True,
+        run_capability=_ok_run_capability,
+        monkeypatch=monkeypatch,
+    )
+
+    assert [tc.id for tc in enqueued] == ["dimensions-set"]
+    assert results[0].content == "queued: identity_dimensions_set"
 
 
 # ------------------------------------------------------------------

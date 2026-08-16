@@ -1,4 +1,5 @@
 import asyncio
+import importlib
 import sys
 from pathlib import Path
 
@@ -20,6 +21,35 @@ def _env(inner):
 
 
 # ---------- extract ----------
+
+def test_extraction_lane_output_budgets_are_independent_and_dream_is_larger():
+    assert extraction.DREAM_MAX_OUTPUT_TOKENS > extraction.CAPTURE_MAX_OUTPUT_TOKENS
+    assert extraction.max_output_tokens_for_lane("capture") == (
+        extraction.CAPTURE_MAX_OUTPUT_TOKENS
+    )
+    assert extraction.max_output_tokens_for_lane("dream") == (
+        extraction.DREAM_MAX_OUTPUT_TOKENS
+    )
+
+
+@pytest.mark.parametrize(
+    ("lane", "env_name"),
+    [
+        ("capture", "FEEDLING_V2_CAPTURE_MAX_OUTPUT_TOKENS"),
+        ("dream", "FEEDLING_V2_DREAM_MAX_OUTPUT_TOKENS"),
+    ],
+)
+def test_extraction_lane_output_budget_has_its_own_env(monkeypatch, lane, env_name):
+    try:
+        with monkeypatch.context() as env:
+            env.setenv(env_name, "1777")
+            reloaded = importlib.reload(extraction)
+            assert reloaded.max_output_tokens_for_lane(lane) == 1777
+    finally:
+        # The module object is shared with worker; restore startup-resolved values
+        # before the next test observes it.
+        importlib.reload(extraction)
+
 
 def test_extract_returns_parsed_on_success(monkeypatch):
     async def _fake(cfg, messages, **kw):
@@ -120,6 +150,268 @@ def test_extract_treats_empty_reply_as_a_reason_not_a_crash(monkeypatch):
     parsed, err = asyncio.run(extraction.extract(
         provider_config=object(), prompt="P", parse=lambda raw: (["never"], None)))
     assert parsed is None and err == "empty_reply"
+
+
+def test_extract_attributes_length_stop_before_parsing_and_records_safe_shape(
+    monkeypatch,
+):
+    limit = extraction.CAPTURE_MAX_OUTPUT_TOKENS
+
+    async def _truncated(_cfg, _messages, **_kwargs):
+        return {
+            "reply": '{"cards":[{"summary":"half',
+            "stop_reason": "length",
+            "usage": {
+                "prompt_tokens": 16576,
+                "completion_tokens": limit,
+            },
+        }
+
+    monkeypatch.setattr(
+        extraction.provider_client,
+        "reliable_chat_completion_async",
+        _truncated,
+    )
+    details = []
+    events = []
+
+    async def _record(kind, payload):
+        if kind == "extraction_output_truncated":
+            events.append(payload)
+
+    def _must_not_parse(_reply):
+        raise AssertionError("a length-stopped response must be attributed before parsing")
+
+    parsed, err = asyncio.run(
+        extraction.extract(
+            provider_config=object(),
+            prompt="P",
+            parse=_must_not_parse,
+            max_tokens=limit,
+            trajectory_out=_record,
+            failure_detail_out=details.append,
+        )
+    )
+
+    expected = {
+        "stop_reason": "length",
+        "completion_tokens": limit,
+        "max_tokens": limit,
+    }
+    assert parsed is None and err == "output_truncated"
+    assert details == [expected]
+    assert events == [{**expected, "attempt": 1}]
+
+
+def test_extract_retries_truncated_output_once_with_same_budget_and_recovers(
+    monkeypatch,
+):
+    limit = extraction.DREAM_MAX_OUTPUT_TOKENS
+    calls = []
+
+    async def _responses(_cfg, messages, **kwargs):
+        calls.append((messages[0]["content"], kwargs["max_tokens"]))
+        if len(calls) == 1:
+            return {
+                "reply": '{"consolidations":[{"result":{"summary":"half',
+                "stop_reason": "length",
+                "usage": {"completion_tokens": limit},
+            }
+        return {
+            "reply": '{"consolidations":[]}',
+            "stop_reason": "end_turn",
+            "usage": {"completion_tokens": 12},
+        }
+
+    monkeypatch.setattr(
+        extraction.provider_client,
+        "reliable_chat_completion_async",
+        _responses,
+    )
+    events = []
+    parsed_replies = []
+
+    async def _record(kind, payload):
+        if kind.startswith("extraction_output_"):
+            events.append((kind, payload))
+
+    def _parse(raw):
+        parsed_replies.append(raw)
+        return (["ok"], None)
+
+    parsed, err = asyncio.run(
+        extraction.extract(
+            provider_config=object(),
+            prompt="P",
+            parse=_parse,
+            max_tokens=limit,
+            trajectory_out=_record,
+            parse_retry=extraction.ParseRetry(
+                should_retry=lambda _err: True,
+                build_prompt=lambda prompt, _err: prompt + "|format",
+                parse=lambda _raw: (["retry-parser"], None),
+                build_truncation_prompt=lambda prompt: prompt + "|更简洁并闭合 JSON",
+            ),
+        )
+    )
+
+    assert parsed == ["ok"] and err is None
+    assert parsed_replies == ['{"consolidations":[]}']
+    assert calls == [
+        ("P", limit),
+        ("P|更简洁并闭合 JSON", limit),
+    ]
+    assert events == [
+        (
+            "extraction_output_truncated",
+            {
+                "stop_reason": "length",
+                "completion_tokens": limit,
+                "max_tokens": limit,
+                "attempt": 1,
+            },
+        ),
+        (
+            "extraction_output_truncation_retry",
+            {
+                "attempt": 2,
+                "strategy": "concise_prompt",
+                "max_tokens": limit,
+            },
+        ),
+    ]
+
+
+def test_extract_stops_after_second_truncation(monkeypatch):
+    limit = extraction.CAPTURE_MAX_OUTPUT_TOKENS
+    calls = 0
+
+    async def _truncated(_cfg, _messages, **_kwargs):
+        nonlocal calls
+        calls += 1
+        return {
+            "reply": '{"cards":[{"summary":"half',
+            "stop_reason": "length",
+            "usage": {"completion_tokens": limit},
+        }
+
+    monkeypatch.setattr(
+        extraction.provider_client,
+        "reliable_chat_completion_async",
+        _truncated,
+    )
+    events = []
+    details = []
+
+    async def _record(kind, payload):
+        if kind == "extraction_output_truncated":
+            events.append(payload)
+
+    parsed, err = asyncio.run(
+        extraction.extract(
+            provider_config=object(),
+            prompt="P",
+            parse=lambda _raw: (["never"], None),
+            max_tokens=limit,
+            trajectory_out=_record,
+            failure_detail_out=details.append,
+            parse_retry=extraction.ParseRetry(
+                should_retry=lambda _err: True,
+                build_prompt=lambda prompt, _err: prompt,
+                parse=lambda _raw: (["never"], None),
+                build_truncation_prompt=lambda prompt: prompt + "|concise",
+            ),
+        )
+    )
+
+    assert parsed is None and err == "output_truncated"
+    assert calls == 2
+    assert [event["attempt"] for event in events] == [1, 2]
+    assert details == [{
+        "stop_reason": "length",
+        "completion_tokens": limit,
+        "max_tokens": limit,
+    }]
+
+
+def test_extract_does_not_issue_third_call_after_truncation_retry_parse_error(
+    monkeypatch,
+):
+    calls = 0
+
+    async def _responses(_cfg, _messages, **_kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return {"reply": '{"cards":[', "stop_reason": "length"}
+        return {"reply": "still bad", "stop_reason": "end_turn"}
+
+    monkeypatch.setattr(
+        extraction.provider_client,
+        "reliable_chat_completion_async",
+        _responses,
+    )
+    parsed, err = asyncio.run(
+        extraction.extract(
+            provider_config=object(),
+            prompt="P",
+            parse=lambda _raw: (None, "invalid_card_content:summary_empty"),
+            parse_retry=extraction.ParseRetry(
+                should_retry=lambda _err: True,
+                build_prompt=lambda prompt, _err: prompt + "|format",
+                parse=lambda _raw: (["must-not-run"], None),
+                build_truncation_prompt=lambda prompt: prompt + "|concise",
+            ),
+        )
+    )
+
+    assert parsed is None and err == "invalid_card_content:summary_empty"
+    assert calls == 2
+
+
+def test_extract_attributes_length_stop_on_existing_parse_retry(monkeypatch):
+    limit = extraction.CAPTURE_MAX_OUTPUT_TOKENS
+    calls = 0
+
+    async def _responses(_cfg, _messages, **_kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return {"reply": "bad format", "stop_reason": "end_turn"}
+        return {
+            "reply": '{"cards":[{"summary":"half',
+            "stop_reason": "length",
+            "usage": {"completion_tokens": limit},
+        }
+
+    monkeypatch.setattr(
+        extraction.provider_client,
+        "reliable_chat_completion_async",
+        _responses,
+    )
+    details = []
+    parsed, err = asyncio.run(
+        extraction.extract(
+            provider_config=object(),
+            prompt="P",
+            parse=lambda _raw: (None, "invalid_card_content:summary_empty"),
+            max_tokens=limit,
+            failure_detail_out=details.append,
+            parse_retry=extraction.ParseRetry(
+                should_retry=lambda _err: True,
+                build_prompt=lambda prompt, _err: prompt + "|retry",
+                parse=lambda _raw: (None, "no_json_object"),
+            ),
+        )
+    )
+
+    assert parsed is None and err == "output_truncated"
+    assert calls == 2
+    assert details == [{
+        "stop_reason": "length",
+        "completion_tokens": limit,
+        "max_tokens": limit,
+    }]
 
 
 # ---------- parse_retry(内容闸打回)----------
@@ -379,6 +671,9 @@ def test_extraction_failure_codes_are_allowlisted_and_drop_raw_details():
     assert worker._extraction_failure_code(
         RuntimeError("extraction_memory_write_rejected:private-db-detail")
     ) == "extraction_failed:memory_write_rejected"
+    assert worker._extraction_failure_code(
+        RuntimeError("output_truncated")
+    ) == "extraction_failed:output_truncated"
 
 
 def test_extract_provider_reason_records_failure_not_false_success(monkeypatch):
@@ -503,6 +798,10 @@ def test_empty_cards_is_not_an_error():
 # ---------- consolidations_to_actions ----------
 
 def test_consolidations_to_actions_supersedes_when_target_present():
+    cards = [
+        _existing("m1", occurred_at="2026-02-01T00:00:00Z"),
+        _existing("m2", occurred_at="2026-05-01T00:00:00Z"),
+    ]
     actions, added, superseded = extraction.consolidations_to_actions(
         [{
             "op": "merge",
@@ -510,22 +809,30 @@ def test_consolidations_to_actions_supersedes_when_target_present():
             "rationale": "同一事件的两条记录",
             "result": {"summary": "merged", "content": "merged body"},
         }],
-        occurred_at="T", source_ids=[], build_envelope=_env)
+        occurred_at="2099-01-01T00:00:00Z", source_ids=[], build_envelope=_env,
+        existing_cards=cards)
     assert added == 0 and superseded == 2
     assert actions[0]["type"] == "memory.supersede"
     assert actions[0]["supersedes"] == ["m1", "m2"]
     assert actions[0]["capture_mode"] == "memory_dream"
     assert actions[0]["envelope"]["type"] == "fact"
-    assert actions[0]["envelope"]["occurred_at"] == "T"
+    assert actions[0]["envelope"]["occurred_at"] == "2026-05-01T00:00:00Z"
 
 
-def _existing(memory_id, *, source="memory_capture", created_at="2026-07-01T00:00:00Z"):
+def _existing(
+    memory_id,
+    *,
+    source="memory_capture",
+    created_at="2026-07-01T00:00:00Z",
+    occurred_at="2026-06-01T00:00:00Z",
+):
     return {
         "id": memory_id,
         "summary": f"{memory_id} 的旧摘要",
         "content": f"{memory_id} 的旧卡正文，包含需要完整保留的具体事实。",
         "source": source,
         "created_at": created_at,
+        "occurred_at": occurred_at,
     }
 
 
@@ -616,8 +923,10 @@ def test_dream_guard_allows_prior_run_dream_output_to_evolve_immediately():
 
 def test_dream_guard_accepts_low_text_overlap_evolution_after_review():
     cards = [
-        {"id": "plan", "summary": "想去京都看红叶", "content": "希望今年秋天成行。"},
-        {"id": "ticket", "summary": "已经订好机票", "content": "11 月飞往关西机场。"},
+        {"id": "plan", "summary": "想去京都看红叶", "content": "希望今年秋天成行。",
+         "occurred_at": "2026-03-01T00:00:00Z"},
+        {"id": "ticket", "summary": "已经订好机票", "content": "11 月飞往关西机场。",
+         "occurred_at": "2026-05-01T00:00:00Z"},
     ]
 
     actions, _added, superseded = extraction.consolidations_to_actions(
@@ -629,6 +938,59 @@ def test_dream_guard_accepts_low_text_overlap_evolution_after_review():
     )
 
     assert len(actions) == 1 and superseded == 2
+
+
+def test_dream_merge_uses_latest_source_occurred_at_not_worker_now():
+    cards = [
+        _existing("feb", occurred_at="2026-02-08T09:00:00Z"),
+        _existing("mar", occurred_at="2026-03-17T10:00:00+08:00"),
+        _existing("may", occurred_at="2026-05-03"),
+    ]
+
+    actions, _added, superseded = extraction.consolidations_to_actions(
+        [_merge(["feb", "mar", "may"])],
+        occurred_at="2099-12-31T23:59:59Z",
+        source_ids=[],
+        build_envelope=_env,
+        existing_cards=cards,
+    )
+
+    assert superseded == 3
+    assert actions[0]["envelope"]["occurred_at"] == "2026-05-03"
+
+
+def test_dream_merge_with_today_source_naturally_keeps_today():
+    cards = [
+        _existing("old", occurred_at="2026-02-08T09:00:00Z"),
+        _existing("today", occurred_at="2026-08-14T07:30:00Z"),
+    ]
+
+    actions, _added, _superseded = extraction.consolidations_to_actions(
+        [_merge(["old", "today"])],
+        occurred_at="2099-12-31T23:59:59Z",
+        source_ids=[],
+        build_envelope=_env,
+        existing_cards=cards,
+    )
+
+    assert actions[0]["envelope"]["occurred_at"] == "2026-08-14T07:30:00Z"
+
+
+@pytest.mark.parametrize("bad_value", ["", None, "not-a-date", "1970-ish"])
+def test_dream_merge_fails_closed_when_any_source_time_is_unusable(bad_value):
+    cards = [
+        _existing("valid", occurred_at="2026-02-08T09:00:00Z"),
+        _existing("bad", occurred_at=bad_value),
+    ]
+
+    with pytest.raises(ValueError, match="dream_source_occurred_at_unavailable"):
+        extraction.consolidations_to_actions(
+            [_merge(["valid", "bad"])],
+            occurred_at="2099-12-31T23:59:59Z",
+            source_ids=[],
+            build_envelope=_env,
+            existing_cards=cards,
+        )
 
 
 def test_dream_prompt_pairs_evolution_example_with_independent_health_example():

@@ -77,22 +77,23 @@ def test_prompt_prefix_is_deterministic_and_excludes_dynamic_workspace():
         "/skills/a.md", "A", kind="skill", expected_revision=0,
     )
     backend.write("/workspace/dynamic.md", "DO NOT CACHE", expected_revision=0)
+    memory = backend.write(
+        "/memory/WORKING.md", "# Initial", expected_revision=0,
+    )
 
     first = render_trusted_prefix_blocks(backend)
     second = render_trusted_prefix_blocks(backend)
     assert first == second
     assert [block.name for block in first] == [
-        "skill:/skills/a.md", "skill:/skills/z.md", "working-memory",
+        "skill:/skills/a.md", "skill:/skills/z.md",
     ]
     assert "DO NOT CACHE" not in "\n".join(block.content for block in first)
 
-    memory = backend.read("/memory/WORKING.md")
     backend.write(
         "/memory/WORKING.md", "# Updated", expected_revision=memory.revision,
     )
     third = render_trusted_prefix_blocks(backend)
-    assert third[:-1] == first[:-1]
-    assert third[-1].cache_key != first[-1].cache_key
+    assert third == first
 
 
 def test_prompt_prefix_fails_instead_of_silently_truncating_skills():
@@ -139,10 +140,8 @@ def test_production_workspace_prompt_loader_preserves_trust_partition(
     assert len(rendered["trusted_system_blocks"]) == 1
     assert "<feedling-skill" in rendered["trusted_system_blocks"][0]
     assert "Always preserve" in rendered["trusted_system_blocks"][0]
-    assert rendered["working_memory"] == ""
-    assert "Editable scratch state" not in str(
-        rendered["trusted_system_blocks"]
-    )
+    assert "working_memory" not in rendered
+    assert "Editable scratch state" not in str(rendered)
 
 
 def test_explicit_working_memory_read_lazily_creates_default():
@@ -166,10 +165,7 @@ def test_workspace_prompt_context_loads_once_and_fails_with_stable_code():
         mint_enclave_token=lambda _uid: "token",
         load_workspace_prompt=lambda _store, **kwargs: (
             calls.append(kwargs["runtime_token"])
-            or {
-                "trusted_system_blocks": ("skill",),
-                "working_memory": "scratch",
-            }
+            or {"trusted_system_blocks": ("skill",)}
         ),
     )
 
@@ -179,7 +175,7 @@ def test_workspace_prompt_context_loads_once_and_fails_with_stable_code():
         runtime_token="token",
         enclave_sem=asyncio.Semaphore(1),
     ))
-    assert loaded == (("skill",), "")
+    assert loaded == ("skill",)
     assert calls == ["token"]
 
     deps.load_workspace_prompt = lambda *_args, **_kwargs: (
@@ -195,7 +191,6 @@ def test_workspace_prompt_context_loads_once_and_fails_with_stable_code():
 
     deps.load_workspace_prompt = lambda *_args, **_kwargs: {
         "trusted_system_blocks": ("",),
-        "working_memory": "scratch",
     }
     with pytest.raises(worker.WorkspacePromptUnavailable):
         asyncio.run(worker._load_workspace_prompt_context(
@@ -271,7 +266,7 @@ def test_workspace_prompt_without_genesis_persona_keeps_existing_shape(monkeypat
         runtime_token="rt",
     )
 
-    assert rendered == {"trusted_system_blocks": (), "working_memory": ""}
+    assert rendered == {"trusted_system_blocks": ()}
 
 
 def test_sandbox_is_lazy_and_artifact_ingest_never_uses_host_filesystem():

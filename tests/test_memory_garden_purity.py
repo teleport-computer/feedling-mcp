@@ -20,11 +20,11 @@ _KERNEL_ROOT = _BACKEND_ROOT / "memory_garden"
 
 # 允许的非标准库依赖。
 #
-# ``agent_protocol_core`` 是模型协议层的纯共享判据（思维链剥离、协议残片识别），
+# ``core`` 是模型协议层的纯共享判据（思维链剥离、协议残片识别），
 # 与「记忆」无关 —— 聊天主链路、工具循环、主动唤醒都在用。把它单独成包是因为
 # 第一版把它塞进了 memory_garden，导致**普通聊天反向依赖记忆包**
 # （codex review 2026-08-14 指出）。它自己同样不 import 任何 io 模块。
-_ALLOWED_THIRD_PARTY: frozenset[str] = frozenset({"agent_protocol_core"})
+_ALLOWED_THIRD_PARTY: frozenset[str] = frozenset({"core"})
 
 
 def _backend_top_level_names() -> frozenset[str]:
@@ -37,7 +37,7 @@ def _backend_top_level_names() -> frozenset[str]:
     """
     names: set[str] = set()
     # 这两个包本身就是「非 io」的纯包，不算在禁止集合里。
-    _NOT_IO = {"memory_garden", "agent_protocol_core"}
+    _NOT_IO = {"memory_garden", "core"}
     for entry in _BACKEND_ROOT.iterdir():
         if entry.name.startswith((".", "_")) or entry.name in _NOT_IO:
             continue
@@ -129,10 +129,10 @@ def test_kernel_modules_import_without_side_effects():
 
 
 # --------------------------------------------------------------------------- #
-# agent_protocol_core 同样必须是纯的
+# core 同样必须是纯的
 # --------------------------------------------------------------------------- #
 
-_PROTOCOL_ROOT = _BACKEND_ROOT / "agent_protocol_core"
+_PROTOCOL_ROOT = _BACKEND_ROOT / "core"
 
 
 def _protocol_files() -> list[pathlib.Path]:
@@ -140,7 +140,7 @@ def _protocol_files() -> list[pathlib.Path]:
 
 
 def test_protocol_core_is_not_empty():
-    assert _protocol_files(), f"agent_protocol_core 为空：{_PROTOCOL_ROOT}"
+    assert _protocol_files(), f"core 为空：{_PROTOCOL_ROOT}"
 
 
 def test_protocol_core_imports_only_stdlib():
@@ -153,12 +153,12 @@ def test_protocol_core_imports_only_stdlib():
                 continue
             offenders.append(f"{path.name}: import {root}")
     assert not offenders, (
-        "agent_protocol_core 出现了非标准库依赖：\n  " + "\n  ".join(offenders)
+        "core 出现了非标准库依赖：\n  " + "\n  ".join(offenders)
     )
 
 
 def test_protocol_core_does_not_depend_on_memory_garden():
-    """方向必须是单向的：memory_garden → agent_protocol_core，不能反过来。"""
+    """方向必须是单向的：memory_garden → core，不能反过来。"""
     for path in _protocol_files():
         assert "memory_garden" not in _imported_roots(path), (
             f"{path.name} 反向依赖了 memory_garden"

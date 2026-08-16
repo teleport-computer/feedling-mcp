@@ -29,7 +29,7 @@ from admin import data_track as admin_data_track
 from provider_types import ToolCall, ToolExchange
 from capabilities import registry as cap_registry
 from core import envelope as core_envelope
-from agent_protocol_core import self_thinking
+from core import self_thinking
 from core import store as core_store
 from model_api_runtime.v2 import cursor as v2_cursor
 from model_api_runtime.v2 import context as v2_context
@@ -348,6 +348,96 @@ def test_single_round_plain_text_writes_exactly_one_bubble(monkeypatch):
     assert _job_status_row(job_id)[0] == "completed"
 
 
+def test_language_follow_emits_once_for_terminal_visible_body_after_thinking(
+    monkeypatch,
+):
+    uid = "u_toolloop_language_follow_once"
+    conftest.seed_user(uid)
+    _reset(uid)
+    jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("w-language-follow")
+    _patch_real_write(monkeypatch)
+    _stub_envelope_build(monkeypatch)
+    monkeypatch.setattr(
+        cap_registry,
+        "run_capability",
+        lambda *_args, **_kwargs: _FakeCapResult({"snippet": "result"}),
+    )
+    private_thinking = "这是绝对不能参与回复文字系统分类的私密中文思考内容"
+    _script_provider(monkeypatch, [
+        _tool_round(
+            _tc("r1", "reply", text="我先查一下"),
+            _tc("s1", "web_search", query="x"),
+        ),
+        _text_round(
+            f"<think>{private_thinking}</think>"
+            "This is the final visible English response"
+        ),
+    ])
+    traces = []
+    deps = _deps(messages=[{
+        "id": "m-language-follow",
+        "ts": 10.0,
+        "role": "user",
+        "content": "Please search for the requested information",
+    }])
+    deps.emit_debug_trace = lambda user_id, event_type, **fields: traces.append(
+        {"user_id": user_id, "type": event_type, **fields}
+    )
+
+    status = asyncio.run(worker.process_job(
+        job,
+        deps,
+        provider_config=_BYOK,
+        api_key=None,
+        runtime_token="rt",
+    ))
+
+    assert status == "completed", _job_status_row(job["id"])
+    assert [row["body_ct"] for row in _bubbles(uid)] == [
+        "我先查一下",
+        "This is the final visible English response",
+    ]
+    language_traces = [
+        trace for trace in traces if trace["type"] == "reply.language_follow"
+    ]
+    assert len(language_traces) == 1
+    assert language_traces[0]["detail"] == {
+        "user_script": "latin",
+        "reply_script": "latin",
+        "outcome": "match",
+        "lane": "chat",
+    }
+    assert private_thinking not in json.dumps(language_traces, ensure_ascii=False)
+
+
+def test_chat_tool_surface_keeps_memory_delete(monkeypatch):
+    """Foreground Chat retains the destructive operation Seven left enabled."""
+    uid = "u_chat_keeps_memory_delete"
+    conftest.seed_user(uid)
+    _reset(uid)
+    jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("w")
+    _patch_real_write(monkeypatch)
+    calls = _script_provider(monkeypatch, [_text_round("done")])
+    deps = _deps(messages=[{
+        "id": "m1", "ts": 10.0, "role": "user", "content": "delete that memory",
+    }])
+
+    status = asyncio.run(worker.process_job(
+        job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"
+    ))
+
+    assert status == "completed"
+    memory_spec = next(
+        spec for spec in calls[0]["tools"] if spec.name == "memory_write"
+    )
+    chat_ops = memory_spec.parameters["properties"]["actions"]["items"][
+        "properties"
+    ]["op"]["enum"]
+    assert chat_ops == ["add", "update", "delete"]
+
+
 def test_chat_worldbook_matches_current_turn_without_rewriting_user_text(
     monkeypatch,
 ):
@@ -500,6 +590,64 @@ def test_worldbook_truncation_reaches_provider_and_data_track_without_content(
     )
     assert rare_secret not in provider_payload
     assert rare_secret not in raw_admin_material
+
+
+def test_empty_provider_response_reaches_debug_trace_without_content(monkeypatch):
+    monkeypatch.setenv("FEEDLING_V2_SELF_THINKING", "off")
+    uid = "u_toolloop_empty_response_trace"
+    conftest.seed_user(uid)
+    _reset(uid)
+    jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("w-empty-response-trace")
+    _patch_real_write(monkeypatch)
+
+    private_reasoning = "T079_PRIVATE_REASONING_MUST_NOT_REACH_DEBUG_TRACE"
+    _script_provider(monkeypatch, [
+        {
+            "reply": "",
+            "reasoning": private_reasoning,
+            "stop_reason": "content_filter",
+            "tool_calls": [],
+            "usage": {"completion_tokens": 41},
+        },
+        _text_round("recovered visible reply"),
+    ])
+    traces = []
+    deps = _deps(messages=[{
+        "id": "m-empty-response-trace",
+        "ts": 10.0,
+        "role": "user",
+        "content": "hello",
+    }])
+    deps.emit_debug_trace = lambda user_id, event_type, **fields: traces.append(
+        {"user_id": user_id, "type": event_type, **fields}
+    )
+
+    status = asyncio.run(worker.process_job(
+        job,
+        deps,
+        provider_config=_BYOK,
+        api_key=None,
+        runtime_token="rt",
+    ))
+
+    assert status == "completed"
+    diagnostics = [
+        trace for trace in traces if trace["type"] == "provider.empty_response"
+    ]
+    assert len(diagnostics) == 1
+    assert diagnostics[0]["detail"] == {
+        "stop_reason": "content_filter",
+        "has_visible_text": False,
+        "reasoning_present": True,
+        "tool_call_count": 0,
+        "completion_tokens": 41,
+        "lane": "chat",
+    }
+    assert admin_data_track._debug_event_public_json(diagnostics[0])["detail"] == (
+        diagnostics[0]["detail"]
+    )
+    assert private_reasoning not in json.dumps(diagnostics, ensure_ascii=False)
 
 
 def test_self_thinking_on_suppresses_native_reasoning(monkeypatch):
@@ -1385,7 +1533,6 @@ def test_chat_workspace_prompt_snapshot_is_loaded_once_across_rounds(
             "trusted_system_blocks": (
                 "<feedling-skill>trusted skill</feedling-skill>",
             ),
-            "working_memory": "DO_NOT_EAGERLY_INJECT",
         }
     )
 
@@ -1405,16 +1552,11 @@ def test_chat_workspace_prompt_snapshot_is_loaded_once_across_rounds(
     for call in calls:
         prompt = str(call["messages"])
         assert "trusted skill" in prompt
-        assert "DO_NOT_EAGERLY_INJECT" not in prompt
-        assert "/memory/WORKING.md" in prompt
+        assert "/memory/WORKING.md" not in prompt
     system = next(
         message for message in calls[0]["messages"] if message["role"] == "system"
     )
     assert "trusted skill" in str(system["content"])
-    assert not any(
-        worker.context.WORKING_MEMORY_HEADER in str(message.get("content"))
-        for message in calls[0]["messages"]
-    )
     second_offered = {spec.name for spec in calls[1]["tools"]}
     assert {"web_search", "web_fetch", "task"}.isdisjoint(second_offered)
 

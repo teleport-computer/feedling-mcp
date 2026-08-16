@@ -13,7 +13,7 @@ import pathlib
 
 import pytest
 
-from agent_protocol_core import self_thinking as st
+from core import self_thinking as st
 
 
 def test_two_blocks_both_stripped():

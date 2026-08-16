@@ -34,6 +34,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, Red
 
 import db
 from admin import admin_core
+from admin import memory_metadata
 from admin import tee_replication as admin_tee_replication
 from asgi import threadpool
 from asgi.http import read_json_silent
@@ -188,6 +189,16 @@ async def data_track_dau(request: Request):
     return JSONResponse(payload)
 
 
+@router.get("/v1/admin/data-track/events")
+async def data_track_events(request: Request):
+    _require_admin(request)
+    try:
+        payload = await threadpool.run_db(admin_core.events_payload, request.url.query)
+    except admin_core.InvalidDauDay:
+        return JSONResponse({"error": "invalid_day"}, status_code=400)
+    return JSONResponse(payload)
+
+
 @router.get("/v1/admin/data-track/growth")
 async def data_track_growth(request: Request):
     _require_admin(request)
@@ -243,6 +254,41 @@ async def data_track_user(user_id: str, request: Request):
     _require_admin(request)
     body, status = await threadpool.run_db(admin_core.user_payload, request.url.query, user_id)
     return JSONResponse(body, status_code=status)
+
+
+@router.get("/v1/admin/users/{user_id}/memory-card-metadata")
+async def memory_card_metadata(user_id: str, request: Request):
+    """Paginated card lifecycle metadata; encrypted bodies are not selected."""
+    _require_admin(request)
+    limit, offset = memory_metadata.pagination(
+        request.query_params.get("limit"), request.query_params.get("offset")
+    )
+    payload = await threadpool.run_db(
+        memory_metadata.list_card_metadata,
+        user_id,
+        limit=limit,
+        offset=offset,
+    )
+    return JSONResponse(payload)
+
+
+@router.get("/v1/admin/memory-dream-jobs")
+async def memory_dream_jobs(request: Request):
+    """Paginated, content-free dream job timing/failure diagnostics."""
+    _require_admin(request)
+    limit, offset = memory_metadata.pagination(
+        request.query_params.get("limit"),
+        request.query_params.get("offset"),
+        jobs=True,
+    )
+    payload = await threadpool.run_db(
+        memory_metadata.list_dream_job_metadata,
+        limit=limit,
+        offset=offset,
+        user_id=(request.query_params.get("user_id") or "").strip(),
+        status=(request.query_params.get("status") or "").strip(),
+    )
+    return JSONResponse(payload)
 
 
 @router.get("/admin/data-track")

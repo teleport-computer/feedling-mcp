@@ -2,6 +2,7 @@ import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 from capabilities import tool_schema, registry
+from identity import card_policy
 from perception.agent_fields import (
     AGENT_PERCEPTION_SIGNALS,
     AGENT_SIGNAL_FIELDS,
@@ -275,6 +276,96 @@ def test_identity_nudge_is_model_facing_and_requires_dimension_and_delta():
         "identity_nudge", {"dimension": "warmth", "delta": 1, "x": 1})
 
 
+def test_identity_dimensions_set_schema_uses_card_policy_contract():
+    spec = next(
+        item for item in tool_schema.build_tool_specs()
+        if item.name == "identity_dimensions_set"
+    )
+    dimensions_schema = spec.parameters["properties"]["dimensions"]
+    value_schema = dimensions_schema["items"]["properties"]["value"]
+    assert spec.parameters["required"] == ["dimensions", "reason"]
+    assert dimensions_schema["maxItems"] == card_policy.MAX_DIMENSIONS
+    assert value_schema["minimum"] == card_policy._VALUE_MIN
+    assert value_schema["maximum"] == card_policy._VALUE_MAX
+    assert "description" in dimensions_schema["items"]["properties"]
+
+    midpoint = (card_policy._VALUE_MIN + card_policy._VALUE_MAX) // 2
+    valid = {"dimensions": [
+        {"name": "minimum", "value": card_policy._VALUE_MIN},
+        {"name": "middle", "value": midpoint},
+        {"name": "maximum", "value": card_policy._VALUE_MAX},
+    ], "reason": "user requested these values"}
+    assert tool_schema.validate_tool_args("identity_dimensions_set", valid) is None
+    assert tool_schema.validate_tool_args(
+        "identity_dimensions_set",
+        {"dimensions": [], "reason": "user requested deletion"},
+    ) is None
+    assert tool_schema.validate_tool_args(
+        "identity_dimensions_set", {"dimensions": []}
+    ) == "missing required field: reason"
+    assert tool_schema.validate_tool_args(
+        "identity_dimensions_set", {"dimensions": [], "reason": "   "}
+    ) == "identity_dimensions_set requires a non-empty reason"
+
+
+def test_identity_dimensions_set_schema_rejects_shared_policy_failures():
+    too_many = [
+        {"name": f"dimension-{index}", "value": card_policy._VALUE_MIN}
+        for index in range(card_policy.MAX_DIMENSIONS + 1)
+    ]
+    assert tool_schema.validate_tool_args(
+        "identity_dimensions_set", {"dimensions": too_many, "reason": "rewrite"}
+    ) == "too_many_dimensions"
+    assert tool_schema.validate_tool_args(
+        "identity_dimensions_set",
+        {"dimensions": [
+            {"name": "same", "value": card_policy._VALUE_MIN},
+            {"name": "SAME", "value": card_policy._VALUE_MAX},
+        ], "reason": "rewrite"},
+    ) == "dimension_name_duplicate"
+    for invalid_value in (
+        card_policy._VALUE_MIN - 1,
+        card_policy._VALUE_MAX + 1,
+    ):
+        assert tool_schema.validate_tool_args(
+            "identity_dimensions_set",
+            {
+                "dimensions": [{"name": "range", "value": invalid_value}],
+                "reason": "rewrite",
+            },
+        ) == "dimension_value_out_of_range"
+
+
+def test_identity_dimensions_set_validation_tracks_card_policy_constants(monkeypatch):
+    """A policy mutation must move this tool's gate without a copied validator."""
+    dimensions = [
+        {"name": f"dimension-{index}", "value": card_policy._VALUE_MIN}
+        for index in range(card_policy.MAX_DIMENSIONS + 3)
+    ]
+    monkeypatch.setattr(card_policy, "MAX_DIMENSIONS", len(dimensions) + 5)
+
+    assert card_policy.validate_dimensions_structure(dimensions) == (True, "")
+    assert tool_schema.validate_tool_args(
+        "identity_dimensions_set", {"dimensions": dimensions, "reason": "rewrite"}
+    ) is None
+
+    monkeypatch.setattr(card_policy, "MAX_DIMENSIONS", len(dimensions) - 1)
+
+    assert tool_schema.validate_tool_args(
+        "identity_dimensions_set", {"dimensions": dimensions, "reason": "rewrite"}
+    ) == "too_many_dimensions"
+
+    monkeypatch.setattr(card_policy, "MAX_DIMENSIONS", len(dimensions))
+    monkeypatch.setattr(card_policy, "_VALUE_MAX", card_policy._VALUE_MIN)
+    assert tool_schema.validate_tool_args(
+        "identity_dimensions_set",
+        {
+            "dimensions": [{"name": "range", "value": card_policy._VALUE_MIN + 1}],
+            "reason": "rewrite",
+        },
+    ) == "dimension_value_out_of_range"
+
+
 def test_identity_patch_description_advertises_list_fields_and_ops():
     spec = next(s for s in tool_schema.build_tool_specs() if s.name == "identity_patch")
     d = spec.description
@@ -296,6 +387,21 @@ def test_memory_write_reason_and_relative_wake_are_described_and_valid():
         }]},
     ) is None
     assert "in 2 hours" in specs["schedule_wake"].description
+
+
+def test_wake_memory_write_surface_removes_only_delete_without_mutating_chat():
+    chat_spec = next(
+        item for item in tool_schema.build_tool_specs()
+        if item.name == "memory_write"
+    )
+    wake_spec = tool_schema.without_memory_delete(chat_spec)
+
+    chat_ops = chat_spec.parameters["properties"]["actions"]["items"]["properties"]["op"]["enum"]
+    wake_ops = wake_spec.parameters["properties"]["actions"]["items"]["properties"]["op"]["enum"]
+    assert chat_ops == ["add", "update", "delete"]
+    assert wake_ops == ["add", "update"]
+    assert "delete" not in wake_spec.description.lower()
+    assert "add" in wake_spec.description and "update" in wake_spec.description
 
 
 def test_memory_search_shares_the_index_filters_it_already_consumes():

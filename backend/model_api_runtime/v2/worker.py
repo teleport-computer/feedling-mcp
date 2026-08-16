@@ -71,13 +71,14 @@ from capabilities import result_budget as cap_result_budget
 from capabilities import tool_schema as cap_tool_schema
 from core import chat_activity as core_chat_activity
 from core import envelope as core_envelope
-from agent_protocol_core import protocol_leak
+from core import protocol_leak
 from core import tool_markup_leak
 from core import util as core_util
 from core import provider_usage
-from agent_protocol_core import self_thinking
+from core import self_thinking
 from core import store as core_store
 from core import wake_bus as core_wake_bus
+from memory import timestamps as memory_timestamps
 from core.downloadable_reply import sanitize_downloadable_reply
 from perception.glance import (
     perception_glance_fingerprint,
@@ -101,10 +102,12 @@ from model_api_runtime.v2 import extraction as v2_extraction
 from model_api_runtime.v2 import jobs_store
 from model_api_runtime.v2 import slot_protocol
 from model_api_runtime.v2 import kill_switch
+from model_api_runtime.v2 import language_follow as v2_language_follow
 from model_api_runtime.v2 import model_identity as v2_model_identity
 from model_api_runtime.v2 import web_gate as v2_web_gate
 from model_api_runtime.v2 import prompt_frontier as v2_prompt_frontier
 from model_api_runtime.v2 import profile as v2_profile
+from model_api_runtime.v2 import profile_retry as v2_profile_retry
 from model_api_runtime.v2 import profile_store as v2_profile_store
 from model_api_runtime.v2 import status_stream
 from model_api_runtime.v2 import subagents as v2_subagents
@@ -124,6 +127,7 @@ from memory.capture_prompt_v1 import (
 )
 from identity.user_naming import transcript_speaker_label
 from memory_garden.text.card_text import (
+    build_truncation_retry_prompt,
     count_user_token_residuals,
     is_retryable_parse_error,
 )
@@ -875,6 +879,19 @@ _WAKE_SYSTEM_PROMPT = (
     "perception tool when an exact reading is needed. Never mention this wake or any "
     "system wording to the user."
 )
+_OPTIONAL_WAKE_SELF_THINKING_INSTRUCTION = (
+    " For this presence turn, the final-output rule above has two equally valid "
+    "forms. Decide before using any user-visible reply, file, image, or voice "
+    "delivery capability. If you choose to speak, output exactly one complete "
+    "`<think>...</think>` block followed by the visible message. If you choose to "
+    "stay silent, output exactly one complete `<think>...</think>` block and "
+    "nothing after its closing tag: no visible text, greeting, placeholder, or "
+    "user-visible delivery capability. The thinking-only form is private and "
+    "the user receives nothing from that turn. Keep the final decision stated "
+    "inside the thinking block consistent with whether visible content follows; "
+    "if you change your mind, update the thought before the final output. Neither "
+    "form is preferred."
+)
 _SCHEDULED_WAKE_SYSTEM_PROMPT = (
     "You are delivering one or more reminders that the user explicitly scheduled. "
     "Deliver every supplied reminder now, naturally and concisely. Do not stay silent, "
@@ -1100,6 +1117,7 @@ _EXTRACTION_FAILURE_REASONS = frozenset(
         "capture_provider_result_invalid",
         "dream_blast_radius_exceeded",
         "dream_no_memory_actions",
+        "dream_source_occurred_at_unavailable",
         "empty_reply",
         "extraction_memory_writer_unavailable",
         "memory_occurred_at_required",
@@ -1107,6 +1125,7 @@ _EXTRACTION_FAILURE_REASONS = frozenset(
         "missing_consolidations_list",
         "no_json_object",
         "not_an_object",
+        "output_truncated",
         "semantic_validation_failed_after_retry",
     }
 )
@@ -1432,12 +1451,10 @@ class TurnDeps:
     # MCP tool as a parallel read. None (every non-chat/legacy caller) means no
     # MCP tools.
     load_mcp_turn: Callable[..., Any] | None = None
-    # (store, *, runtime_token) -> {trusted_system_blocks, working_memory}.
-    # Production eagerly renders only encrypted read-only /skills. The legacy
-    # working_memory field is accepted but never injected: editable
-    # /memory/WORKING.md is pull-only through workspace_read, which activates
-    # the outbound-data fence. Missing wiring remains empty only for legacy/unit
-    # callers; a wired loader failure is terminal and visible/conservative.
+    # (store, *, runtime_token) -> {trusted_system_blocks}.
+    # Production eagerly renders only encrypted read-only /skills. Missing
+    # wiring remains empty only for legacy/unit callers; a wired loader failure
+    # is terminal and visible/conservative.
     load_workspace_prompt: Callable[..., dict] | None = None
     # (store, *, runtime_token, path, expected_revision) -> workspace data. Production
     # resolves the path inside this user's encrypted V2 workspace. It never
@@ -1492,7 +1509,7 @@ async def _load_workspace_prompt_context(
     *,
     runtime_token: str,
     enclave_sem: asyncio.Semaphore,
-) -> tuple[tuple[str, ...], str]:
+) -> tuple[str, ...]:
     """Load one workspace prompt snapshot without a silent fallback.
 
     Optional/unwired test callers retain the historical empty prompt. Once the
@@ -1500,7 +1517,7 @@ async def _load_workspace_prompt_context(
     chat turn surfaces an error and a wake turn fails conservatively.
     """
     if deps.load_workspace_prompt is None:
-        return (), ""
+        return ()
     try:
         async with enclave_sem:
             rendered = await asyncio.to_thread(
@@ -1511,20 +1528,15 @@ async def _load_workspace_prompt_context(
         if not isinstance(rendered, dict):
             raise TypeError
         trusted = rendered.get("trusted_system_blocks")
-        working_memory = rendered.get("working_memory", "")
         if (
             not isinstance(trusted, (tuple, list))
             or isinstance(trusted, (str, bytes))
             or any(not isinstance(block, str) or not block.strip() for block in trusted)
-            or not isinstance(working_memory, str)
         ):
             raise TypeError
     except Exception:  # noqa: BLE001 — never leak decrypted workspace data
         raise WorkspacePromptUnavailable from None
-    # Editable persistent state is deliberately pull-only. Keeping the legacy
-    # field shape during rollout lets old loaders coexist, but the core refuses
-    # to place its untrusted contents in the eager base prompt.
-    return tuple(trusted), ""
+    return tuple(trusted)
 
 
 @dataclass
@@ -1851,6 +1863,63 @@ def _provider_tool_surface_callback(
     return _emit
 
 
+def _empty_provider_response_debug_callback(
+    deps: TurnDeps,
+    user_id: str,
+    lane: str,
+):
+    """Build a content-free admin trace sink for provider-empty responses."""
+    if deps.emit_debug_trace is None:
+        return None
+
+    safe_lane = lane if lane == "chat" or lane in _WAKE_LANES else "other"
+
+    async def _emit(response_shape: dict[str, Any]) -> None:
+        raw_stop_reason = str(response_shape.get("stop_reason") or "")
+        stop_reason = (
+            raw_stop_reason
+            if raw_stop_reason in v2_tool_loop._CONTENT_FREE_STOP_REASONS
+            else ("other" if raw_stop_reason else "")
+        )
+        completion_tokens = response_shape.get("completion_tokens")
+        detail = {
+            "stop_reason": stop_reason,
+            "has_visible_text": bool(response_shape.get("has_visible_text")),
+            "reasoning_present": bool(response_shape.get("reasoning_present")),
+            "tool_call_count": max(
+                0, int(response_shape.get("tool_call_count") or 0)
+            ),
+            "completion_tokens": (
+                max(0, int(completion_tokens))
+                if isinstance(completion_tokens, (int, float))
+                else None
+            ),
+            "lane": safe_lane,
+        }
+        try:
+            await asyncio.to_thread(
+                deps.emit_debug_trace,
+                user_id,
+                "provider.empty_response",
+                status="warning",
+                summary="V2 provider 返回空回复",
+                explain=(
+                    "仅记录归一化 stop reason、布尔/计数与 lane；"
+                    "不记录回复、reasoning、prompt 或错误正文。"
+                ),
+                detail=detail,
+            )
+        except Exception as exc:  # noqa: BLE001 — diagnostics cannot fail a turn
+            log.warning(
+                "[v2.empty_response] trace failed user=%s lane=%s code=%s",
+                user_id,
+                safe_lane,
+                type(exc).__name__.lower(),
+            )
+
+    return _emit
+
+
 _CONTEXT_TRUNCATION_TRACE_EVENT = "context.truncation"
 _CONTEXT_TRUNCATION_COUNT_KEYS = (
     "profile_cards_truncated",
@@ -1887,8 +1956,13 @@ def _emit_context_truncation_trace(
         content = message.get("content")
         if not isinstance(content, str):
             continue
+        worldbook_prefix = context.WORLD_BOOK_CONTEXT_HEADER + "\n"
+        has_worldbook_block = content.startswith(worldbook_prefix) or (
+            content.startswith(context.AGENT_MEMORY_HEADER + "\n")
+            and ("\n\n" + worldbook_prefix) in content
+        )
         if (
-            content.startswith(context.WORLD_BOOK_CONTEXT_HEADER + "\n")
+            has_worldbook_block
             and context.WORLD_BOOK_TRUNCATION_MARKER in content
         ):
             counts["worldbook_truncated"] = 1
@@ -3772,7 +3846,6 @@ def _make_build_messages_fn(
     extra_context: str = "",
     mutation_recovery_active: bool = False,
     trusted_system_blocks: tuple[str, ...] = (),
-    working_memory: str = "",
     agent_memory: str = "",
     user_profile: str = "",
     worldbook_context: str = "",
@@ -3862,7 +3935,6 @@ def _make_build_messages_fn(
             action_context=extra_context,
             mutation_recovery_active=mutation_recovery_active,
             trusted_system_blocks=(identity_block, *trusted_system_blocks),
-            working_memory=working_memory,
             agent_memory=agent_memory,
             user_profile=user_profile,
             worldbook_context=worldbook_context,
@@ -4345,11 +4417,6 @@ def _make_task_batch_dispatcher(
                 summary="",
                 tail=[{"role": "user", "content": task.prompt}],
                 trusted_system_blocks=trusted_system_blocks,
-                # WORKING.md is encrypted private state. Injecting it before the
-                # first round would let prompt-injected text choose an outbound
-                # web query. Children can request it via workspace_read; that
-                # read activates the outbound-tool fence below.
-                working_memory="",
             )
             outcome = await v2_tool_loop.run_tool_loop(
                 provider_config=child_provider_config,
@@ -4599,25 +4666,36 @@ def _memory_tool_actions(raw_actions) -> list[dict]:
         ).strip()
         if not summary:
             summary = content[:80]
-        target = str(
+        raw_targets = a.get("target_ids")
+        if not isinstance(raw_targets, list):
+            raw_supersedes = a.get("supersedes")
+            raw_targets = raw_supersedes if isinstance(raw_supersedes, list) else []
+        targets: list[str] = []
+        for value in raw_targets:
+            target_id = str(value or "").strip()
+            if target_id and target_id not in targets:
+                targets.append(target_id)
+        legacy_target = str(
             a.get("target_id")
             or a.get("id")
-            or a.get("supersedes")
+            or (a.get("supersedes") if not isinstance(a.get("supersedes"), list) else "")
             or a.get("memory_id")
             or ""
         ).strip()
+        if legacy_target and legacy_target not in targets:
+            targets.append(legacy_target)
         reason = str(a.get("reason") or "").strip()[:1000]
         if not reason:
             reason = "Written by the agent via the memory_write tool."
         if op in ("delete", "remove"):
-            if target:
+            if legacy_target:
                 out.append({
                     "type": "memory.delete",
-                    "memory_id": target,
+                    "memory_id": legacy_target,
                     "reason": reason,
                 })
             continue
-        if op in ("update", "supersede", "merge", "patch") and not target:
+        if op in ("update", "supersede", "merge", "patch") and not targets:
             # Never turn an invalid targeted mutation into a new memory.add.
             continue
         if op not in ("add", "create", "update", "supersede", "merge", "patch"):
@@ -4632,7 +4710,7 @@ def _memory_tool_actions(raw_actions) -> list[dict]:
             #
             # 刻意放在字典**前面**、且不读 a.get("occurred_at"):这是服务端的可信元数据,
             # 不接受模型自报(schema 里也没有这个字段)。
-            "occurred_at": core_util._now_iso(),
+            "occurred_at": memory_timestamps.now_iso(),
         }
         # ⚠️ 只在模型**真的传了**的时候才放这两个键。
         #
@@ -4667,7 +4745,7 @@ def _memory_tool_actions(raw_actions) -> list[dict]:
             out.append(
                 {
                     "type": "memory.supersede",
-                    "supersedes": target,
+                    "supersedes": targets[0] if len(targets) == 1 else targets,
                     "memory": inner,
                     **base,
                 }
@@ -4744,7 +4822,7 @@ def _write_tool_effect_payload(tc) -> tuple[str, dict]:
         if frozen is not None:
             payload["relationship_started_at"] = frozen
         return "identity", payload
-    if tc.name == "identity_nudge":
+    if tc.name in ("identity_nudge", "identity_dimensions_set"):
         # Same ``identity`` effect_type/sink as identity_patch, disambiguated by
         # a trusted ``op`` taken from the tool NAME (mirrors schedule/workspace):
         # ``{**tc.args, "op": tc.name}`` puts op LAST so a model that smuggled an
@@ -5271,6 +5349,75 @@ async def _emit_thinking_surfaced_trace(
     except Exception as exc:  # noqa: BLE001 — diagnostics cannot fail a reply
         log.warning(
             "[v2.thinking] surface trace failed user=%s lane=%s code=%s",
+            user_id,
+            safe_lane,
+            type(exc).__name__.lower(),
+        )
+
+
+def _latest_user_writing_system(rows: Iterable[dict]) -> str:
+    """Find the newest classifiable user-authored text without retaining it."""
+
+    for row in reversed(list(rows)):
+        if str(row.get("role") or "") not in {"user", "human"}:
+            continue
+        text = context.text_of(row.get("content")).strip()
+        if not text:
+            continue
+        script = v2_language_follow.classify_writing_system(text)
+        if script != "indeterminate":
+            return script
+    return "indeterminate"
+
+
+async def _emit_reply_language_follow_trace(
+    emit_debug_trace: Callable[..., None] | None,
+    user_id: str,
+    *,
+    user_rows: Iterable[dict],
+    visible_reply: str,
+    lane: str,
+) -> None:
+    """Emit one terminal, content-free language-follow observation.
+
+    This first layer measures writing systems only.  Legitimate cross-language
+    requests (for example, asking for an English translation in Chinese) are
+    expected mismatch noise; correction/retry policy is explicitly out of
+    scope until aggregate data justifies a second layer.
+    """
+
+    if emit_debug_trace is None:
+        return
+    user_script = _latest_user_writing_system(user_rows)
+    reply_script = v2_language_follow.classify_writing_system(visible_reply)
+    if "indeterminate" in {user_script, reply_script}:
+        outcome = "skip"
+    elif user_script == reply_script:
+        outcome = "match"
+    else:
+        outcome = "mismatch"
+    safe_lane = "wake" if lane == "wake" else "chat"
+    try:
+        await asyncio.to_thread(
+            emit_debug_trace,
+            user_id,
+            "reply.language_follow",
+            status="warning" if outcome == "mismatch" else "ok",
+            summary="V2 回复文字系统跟随观测",
+            explain=(
+                "仅记录用户与可见回复的主导文字系统、匹配结果和 lane；"
+                "不记录正文、比例或思考内容。"
+            ),
+            detail={
+                "user_script": user_script,
+                "reply_script": reply_script,
+                "outcome": outcome,
+                "lane": safe_lane,
+            },
+        )
+    except Exception as exc:  # noqa: BLE001 — diagnostics cannot fail a reply
+        log.warning(
+            "[v2.language_follow] trace failed user=%s lane=%s code=%s",
             user_id,
             safe_lane,
             type(exc).__name__.lower(),
@@ -6098,7 +6245,7 @@ async def _read_seq_adaptive_prompt_context(
         tail_source_truncated,
         int(watermark_seq),
         profile_selection.memory,
-        profile_selection.user,
+        profile_selection.style,
         (
             _coverage_hole_notice(coverage_hole_count)
             if coverage_hole_count > 0
@@ -6676,6 +6823,7 @@ async def _run_wake(
     """
     push_slot: dict | None = None
     shadow_decision_allowed: bool | None = None
+    language_user_rows: list[dict] = []
     try:
         store = core_store.get_store(user_id)
         seq_native = deps.read_messages_after_seq is not None
@@ -6780,7 +6928,7 @@ async def _run_wake(
             api_key=None,
             runtime_token=token,
         )
-        trusted_system_blocks, working_memory = await _load_workspace_prompt_context(
+        trusted_system_blocks = await _load_workspace_prompt_context(
             deps,
             store,
             runtime_token=token,
@@ -6891,7 +7039,7 @@ async def _run_wake(
             )
             summary = profile_selection.summary
             agent_memory = profile_selection.memory
-            user_profile = profile_selection.user
+            user_profile = profile_selection.style
             if not profile_selection.used_profile:
                 summary = await _bound_materialized_summary(
                     user_id,
@@ -7073,6 +7221,9 @@ async def _run_wake(
             if isinstance(attention_snapshot, dict):
                 temporal_snapshot.update(attention_snapshot)
         wake_tail = list(tail)
+        language_user_rows[:] = (
+            _flatten_turns(optional_tail_turns) + wake_tail
+        )
 
         # screen_watch lane grounds on recent shared-screen availability (Task 3).
         # Fetch ONLY screen_recent — no perception_glance or perception_snapshot: the
@@ -7327,6 +7478,7 @@ async def _run_wake(
                         enclave_sem=enclave_sem,
                         turn_authorization=True,
                         identity_write_authorization=False,
+                        memory_delete_authorization=False,
                         enqueue_write_effect=_enqueue_write_effect,
                         before_write=_before_write,
                         observe_photo=observe_photo,
@@ -7412,6 +7564,7 @@ async def _run_wake(
                         enclave_sem=enclave_sem,
                         turn_authorization=True,
                         identity_write_authorization=False,
+                        memory_delete_authorization=False,
                         enqueue_write_effect=_enqueue_write_effect,
                         enqueue_workspace_batch_effect=(
                             _enqueue_workspace_batch_effect
@@ -7517,16 +7670,18 @@ async def _run_wake(
             )
 
         thinking_trace_emitted = False
+        language_trace_emitted = False
 
         async def _on_reply(text: str, *, final: bool, reasoning: str = "") -> None:
-            nonlocal thinking_trace_emitted, shadow_decision_allowed
+            nonlocal thinking_trace_emitted, language_trace_emitted
+            nonlocal shadow_decision_allowed
             text = str(text or "").strip()
             # Self-authored thinking (same mechanism as the chat lane): peel a leading
             # <think> off the wake reply BEFORE the degenerate/torn checks so they see
             # the real reply, and surface the block in the thinking channel instead of
             # native reasoning. Same kill switch. Fail-closed: a malformed block →
             # silence (a legitimate wake outcome), never a leaked tag.
-            from agent_protocol_core import self_thinking as _st_wake
+            from core import self_thinking as _st_wake
 
             _wake_self_thinking_on = _st_wake.enabled()
             # 与聊天出口同样解耦：关掉 self-thinking 不能顺带关掉安全剥离
@@ -7901,6 +8056,15 @@ async def _run_wake(
                                 branch=_wake_thinking_branch,
                                 chars=_wake_thinking_chars,
                             )
+                        if not language_trace_emitted:
+                            language_trace_emitted = True
+                            await _emit_reply_language_follow_trace(
+                                deps.emit_debug_trace,
+                                user_id,
+                                user_rows=language_user_rows,
+                                visible_reply=text,
+                                lane="wake",
+                            )
                     return
                 if (
                     status == "discarded"
@@ -7963,6 +8127,15 @@ async def _run_wake(
                     branch=_wake_thinking_branch,
                     chars=_wake_thinking_chars,
                 )
+            if final and not language_trace_emitted:
+                language_trace_emitted = True
+                await _emit_reply_language_follow_trace(
+                    deps.emit_debug_trace,
+                    user_id,
+                    user_rows=language_user_rows,
+                    visible_reply=text,
+                    lane="wake",
+                )
             # Legacy/non-seq assembly can enqueue without a sink. That proves
             # the model produced text, not that a user-visible bubble was
             # applied. Count only the applied-but-unverified path here; the
@@ -7982,9 +8155,19 @@ async def _run_wake(
         else:
             wake_start_seq = 0
             cursor_box = {"ts": time.time()}
-        fold_new_messages = _make_fold_new_messages(
+        base_fold_new_messages = _make_fold_new_messages(
             user_id, deps, cursor_box, enclave_sem=enclave_sem
         )
+
+        async def fold_new_messages() -> list[dict]:
+            rows = await base_fold_new_messages()
+            # ``_make_fold_new_messages`` returns coalesced user-only rows and
+            # intentionally omits the redundant role field.  Restore that
+            # known provenance only in this private telemetry snapshot.
+            language_user_rows.extend(
+                {**row, "role": "user"} for row in rows
+            )
+            return rows
 
         # ── 世界书:主动开口的四条道也要认得这个世界（Seven 2026-08-10）
         #
@@ -8037,7 +8220,7 @@ async def _run_wake(
                 )
 
         def _wake_builder():
-            from agent_protocol_core import self_thinking as _st_wake_sys
+            from core import self_thinking as _st_wake_sys
 
             _wake_sys = (
                 _SCREEN_WATCH_SYSTEM_PROMPT
@@ -8049,6 +8232,8 @@ async def _run_wake(
             # self-authored thought instead of raw native reasoning.
             if _st_wake_sys.enabled():
                 _wake_sys = _wake_sys + _st_wake_sys.INSTRUCTION
+                if lane != "scheduled":
+                    _wake_sys += _OPTIONAL_WAKE_SELF_THINKING_INSTRUCTION
             return _make_build_messages_fn(
                 system_prompt=_wake_sys,
                 summary=summary,
@@ -8059,7 +8244,6 @@ async def _run_wake(
                     else ""
                 ),
                 trusted_system_blocks=trusted_system_blocks,
-                working_memory=working_memory,
                 agent_memory=agent_memory,
                 user_profile=user_profile,
                 worldbook_context=worldbook_context,
@@ -8121,6 +8305,9 @@ async def _run_wake(
                     trajectory_recorder=trajectory_recorder,
                 )
                 wake_tail = list(tail)
+                language_user_rows[:] = (
+                    _flatten_turns(optional_tail_turns) + wake_tail
+                )
                 build_messages = _wake_builder()
                 try:
                     _preflight_adaptive_builder(
@@ -8133,7 +8320,7 @@ async def _run_wake(
                     raise
 
         await _fence_wake_effect("wake turn")
-        from agent_protocol_core import self_thinking as _st_wake_loop
+        from core import self_thinking as _st_wake_loop
 
         try:
             await v2_tool_loop.run_tool_loop(
@@ -8141,6 +8328,7 @@ async def _run_wake(
                 build_messages=build_messages,
                 suppress_native_reasoning=_st_wake_loop.enabled(),
                 disabled_tool_names=wake_disabled_tool_names,
+                memory_delete_allowed=False,
                 dispatch_tools=_dispatch_tools,
                 on_reply=_on_reply,
                 fold_new_messages=fold_new_messages,
@@ -8184,6 +8372,9 @@ async def _run_wake(
                     deps,
                     user_id,
                     lane,
+                ),
+                on_empty_provider_response=(
+                    _empty_provider_response_debug_callback(deps, user_id, lane)
                 ),
                 fold_before_first=deps.read_messages_after_seq is not None,
                 on_progress=_report_turn_progress,
@@ -8480,9 +8671,17 @@ def _profile_refresh_due(user_id: str, *, now: float | None = None) -> bool:
             or str(source.get("max_updated_at") or "") != max_updated_at
         )
     if state != "ok":
-        retry_not_before = float(
-            (document.get("last_attempt") or {}).get("retry_not_before") or 0
-        )
+        attempt = document.get("last_attempt") or {}
+        disposition = str(attempt.get("retry_disposition") or "")
+        if disposition in {"provider_config", "terminal"}:
+            return False
+        if disposition == "source_change":
+            card_count, max_updated_at = db.memory_profile_source_stats(user_id)
+            return (
+                int(source.get("card_count") or 0) != card_count
+                or str(source.get("max_updated_at") or "") != max_updated_at
+            )
+        retry_not_before = float(attempt.get("retry_not_before") or 0)
         return current_time >= retry_not_before
     generated_at = _profile_generated_timestamp(source.get("generated_at"))
     if generated_at <= 0 or current_time - generated_at < _PROFILE_MAX_AGE_SEC:
@@ -8510,9 +8709,16 @@ async def _enqueue_profile_if_due(
         "profile",
         reason=reason,
     )
-    if not coalesced:
+    made_ready = False
+    if force and coalesced:
+        made_ready = await asyncio.to_thread(
+            jobs_store.make_pending_job_ready,
+            user_id,
+            lane="profile",
+        )
+    if not coalesced or made_ready:
         await asyncio.to_thread(core_wake_bus.notify, "v2_jobs", user_id)
-    return not coalesced
+    return (not coalesced) or made_ready
 
 
 def _profile_attempt_count(previous: dict) -> int:
@@ -8533,6 +8739,8 @@ def _profile_retry_not_before(attempts: int, *, now: float) -> float:
 
 class _ProfileProviderSetupFailure(RuntimeError):
     """Content-free provider-resolution failure routed into profile handling."""
+
+    feedling_error_class = "provider_config"
 
 
 def _profile_failure_code(exc: BaseException) -> str:
@@ -8618,13 +8826,30 @@ async def _run_profile(
         ):
             raise RuntimeModeChanged(f"user rolled back before {effect}")
 
-    async def _metadata_failure(previous: dict, code: str) -> dict:
+    async def _metadata_failure(
+        previous: dict,
+        code: str,
+        *,
+        error_class: str = "",
+    ) -> dict:
         card_count, max_updated_at = await asyncio.to_thread(
             db.memory_profile_source_stats,
             user_id,
         )
         attempts = _profile_attempt_count(previous)
         now_ts = time.time()
+        previous_attempt = previous.get("last_attempt") or {}
+        decision = v2_profile_retry.decide_profile_retry(
+            error_class=str(error_class or ""),
+            reject_code=code,
+            previous_retry_family=str(
+                previous_attempt.get("retry_family") or ""
+            ),
+            previous_retry_attempts=int(
+                previous_attempt.get("retry_attempts") or 0
+            ),
+            now=now_ts,
+        )
         await _fence_profile_write("failure metadata write")
         _report_turn_progress("profile_write_started")
         return v2_profile_store.build_profile_document(
@@ -8639,13 +8864,53 @@ async def _run_profile(
                 "at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
                 "reject_code": code,
                 "attempts": attempts,
-                "retry_not_before": _profile_retry_not_before(
-                    attempts,
-                    now=now_ts,
-                ),
+                "retry_disposition": decision.disposition,
+                "retry_family": decision.retry_family,
+                "retry_attempts": decision.retry_attempts,
+                "retry_not_before": decision.retry_not_before,
             },
             previous=previous,
         )
+
+    async def _settle_failure(document: dict, code: str) -> str:
+        attempt = document.get("last_attempt") or {}
+        disposition = str(attempt.get("retry_disposition") or "")
+        if disposition == "scheduled":
+            retry_not_before = float(attempt.get("retry_not_before") or 0.0)
+            moved = await asyncio.to_thread(
+                jobs_store.reschedule_owned_job,
+                job_id,
+                claimed_by=claimed_by,
+                error=code,
+                available_at=retry_not_before,
+            )
+            if not moved:
+                raise LostJobLease("profile retry ownership lost")
+            await _record_trajectory(
+                trajectory_recorder,
+                "profile_retry",
+                {
+                    "lane": "profile",
+                    "disposition": disposition,
+                    "retry_family": str(attempt.get("retry_family") or ""),
+                    "retry_attempts": int(attempt.get("retry_attempts") or 0),
+                    "retry_not_before": retry_not_before,
+                    "error_code": code,
+                },
+                best_effort=True,
+            )
+            if tm is not None:
+                tm.flush(failed=True, status="profile_retry_scheduled")
+            return "rescheduled"
+        await asyncio.to_thread(
+            jobs_store.mark_failed,
+            job_id,
+            code,
+            claimed_by=claimed_by,
+        )
+        if tm is not None:
+            tm.flush(failed=True, status=code)
+        return "failed"
 
     async def _recompute(previous: dict) -> dict:
         nonlocal terminal_reject
@@ -8692,6 +8957,9 @@ async def _run_profile(
                     "at": now_iso,
                     "reject_code": "",
                     "attempts": attempts,
+                    "retry_disposition": "",
+                    "retry_family": "",
+                    "retry_attempts": 0,
                     "retry_not_before": 0,
                 },
             )
@@ -8736,10 +9004,13 @@ async def _run_profile(
                 "at": now_iso,
                 "reject_code": "",
                 "attempts": attempts,
+                "retry_disposition": "",
+                "retry_family": "",
+                "retry_attempts": 0,
                 "retry_not_before": 0,
             },
             memory_text=generated.fields["memory"],
-            user_text=generated.fields["user"],
+            style_text=generated.fields["style"],
         )
 
     try:
@@ -8780,15 +9051,7 @@ async def _run_profile(
         if result.status == "cas_failed":
             terminal_reject = "profile_cas_failed"
         if terminal_reject:
-            await asyncio.to_thread(
-                jobs_store.mark_failed,
-                job_id,
-                terminal_reject,
-                claimed_by=claimed_by,
-            )
-            if tm is not None:
-                tm.flush(failed=True, status=terminal_reject)
-            return "failed"
+            return await _settle_failure(result.document, terminal_reject)
         await asyncio.to_thread(
             jobs_store.mark_completed,
             job_id,
@@ -8801,11 +9064,21 @@ async def _run_profile(
         raise
     except Exception as exc:  # noqa: BLE001 — background-only, never surface UI
         code = _profile_failure_code(exc)
+        provider_error_class = str(
+            getattr(exc, "feedling_error_class", "") or ""
+        )
+        exception_type = type(exc).__name__
+        failure_document: dict = {}
         try:
-            await v2_profile_store.update_profile_cas_async(
+            metadata_result = await v2_profile_store.update_profile_cas_async(
                 user_id,
-                lambda previous: _metadata_failure(previous, code),
+                lambda previous: _metadata_failure(
+                    previous,
+                    code,
+                    error_class=provider_error_class,
+                ),
             )
+            failure_document = metadata_result.document
             _report_turn_progress("profile_write_completed")
         except Exception as metadata_exc:  # noqa: BLE001
             log.warning(
@@ -8818,16 +9091,21 @@ async def _run_profile(
             "turn_exception",
             {
                 "lane": "profile",
-                "error_class": type(exc).__name__,
+                "error_class": exception_type,
                 "error_code": code,
+                "retry_disposition": str(
+                    (failure_document.get("last_attempt") or {}).get(
+                        "retry_disposition"
+                    )
+                    or "terminal"
+                ),
             },
             best_effort=True,
         )
+        if failure_document:
+            return await _settle_failure(failure_document, code)
         await asyncio.to_thread(
-            jobs_store.mark_failed,
-            job_id,
-            code,
-            claimed_by=claimed_by,
+            jobs_store.mark_failed, job_id, code, claimed_by=claimed_by
         )
         if tm is not None:
             tm.flush(failed=True, status=code)
@@ -8852,6 +9130,7 @@ async def _run_extraction(
     「弱唤醒睡回去」同口径 —— 模型选择什么都不做，不是失败。
     """
     extraction_status_recorded = False
+    extraction_failure_detail: dict[str, Any] = {}
     capture_window: dict[str, Any] = {}
     # call_id -> 该通电话的全文明文。只在 capture lane 填充（见 enclave_sem 闸内）。
     voice_transcripts: dict[str, str] = {}
@@ -9153,6 +9432,7 @@ async def _run_extraction(
                 parse=lambda reply: parse_capture_cards(reply, strict=False),
                 semantic_reasons=capture_semantic_retry_reasons,
                 build_semantic_prompt=build_capture_semantic_retry_prompt,
+                build_truncation_prompt=build_truncation_retry_prompt,
             )
         else:
             prompt = build_dream_prompt(
@@ -9182,6 +9462,7 @@ async def _run_extraction(
                 parse=lambda reply: parse_dream_consolidations(
                     reply, strict=False, known_ids=dream_known_ids
                 ),
+                build_truncation_prompt=build_truncation_retry_prompt,
             )
 
         if lane == "capture" and not prompt_tail:
@@ -9221,6 +9502,8 @@ async def _run_extraction(
                     prompt=prompt,
                     parse=parse,
                     parse_retry=parse_retry,
+                    max_tokens=v2_extraction.max_output_tokens_for_lane(lane),
+                    failure_detail_out=extraction_failure_detail.update,
                     progress_cb=lambda stage, attempt: _report_turn_progress(
                         f"extraction_provider_{stage}_{attempt}"
                     ),
@@ -9349,6 +9632,8 @@ async def _run_extraction(
                 prompt=prompt,
                 parse=parse,
                 parse_retry=parse_retry,
+                max_tokens=v2_extraction.max_output_tokens_for_lane(lane),
+                failure_detail_out=extraction_failure_detail.update,
                 progress_cb=lambda stage, attempt: _report_turn_progress(
                     f"extraction_provider_{stage}_{attempt}"
                 ),
@@ -9608,14 +9893,16 @@ async def _run_extraction(
                     lane,
                     type(status_exc).__name__.lower(),
                 )
+        failure_payload = {
+            "stage": "extraction",
+            "error_class": type(e).__name__,
+            "error_code": code,
+        }
+        failure_payload.update(extraction_failure_detail)
         await _record_trajectory(
             trajectory_recorder,
             "turn_exception",
-            {
-                "stage": "extraction",
-                "error_class": type(e).__name__,
-                "error_code": code,
-            },
+            failure_payload,
             best_effort=True,
         )
         log.warning(
@@ -10354,7 +10641,7 @@ async def process_job(
         # cannot block a reply that was already committed by a previous worker.
         # It still precedes every provider/prompt-coverage call, preventing an
         # under-authorized response when the workspace snapshot is unavailable.
-        trusted_system_blocks, working_memory = await _load_workspace_prompt_context(
+        trusted_system_blocks = await _load_workspace_prompt_context(
             deps,
             store,
             runtime_token=runtime_token,
@@ -10971,6 +11258,7 @@ async def process_job(
                         runtime_token=runtime_token,
                         enclave_sem=enclave_sem,
                         turn_authorization=(mutation_recovery_barrier is None),
+                        memory_delete_authorization=True,
                         enqueue_write_effect=_enqueue_write_effect,
                         before_write=_before_write,
                         observe_photo=observe_photo,
@@ -11049,6 +11337,7 @@ async def process_job(
                         runtime_token=runtime_token,
                         enclave_sem=enclave_sem,
                         turn_authorization=(mutation_recovery_barrier is None),
+                        memory_delete_authorization=True,
                         enqueue_write_effect=_enqueue_write_effect,
                         enqueue_workspace_batch_effect=(
                             _enqueue_workspace_batch_effect
@@ -11279,6 +11568,8 @@ async def process_job(
             pending_file_keys.clear()
 
         thinking_trace_emitted = False
+        language_trace_emitted = False
+        language_user_rows: list[dict] = []
 
         async def _on_reply(
             text: str | WorkspaceFileReply,
@@ -11289,7 +11580,7 @@ async def process_job(
         ) -> None:
             nonlocal final_job_completed_atomically, voice_reply_slot
             nonlocal voice_call_ended_atomically
-            nonlocal thinking_trace_emitted
+            nonlocal thinking_trace_emitted, language_trace_emitted
             file_reply = text if isinstance(text, WorkspaceFileReply) else None
             text = "" if file_reply is not None else str(text or "").strip()
             image_replies: list[GeneratedImageReply] = []
@@ -11320,7 +11611,7 @@ async def process_job(
             # text; which thinking to surface (self-authored vs native) and its
             # provenance are decided at seal time. Fail-closed on malformed <think>:
             # never leak a raw tag, never promote private thinking to the reply.
-            from agent_protocol_core import self_thinking
+            from core import self_thinking
 
             self_thinking_on = self_thinking.enabled()
             # 安全剥离与「要不要写/展示自写 thinking」必须解耦：FEEDLING_V2_SELF_THINKING
@@ -11794,6 +12085,15 @@ async def process_job(
                             branch=_thinking_branch,
                             chars=_thinking_chars,
                         )
+                    if final and not language_trace_emitted:
+                        language_trace_emitted = True
+                        await _emit_reply_language_follow_trace(
+                            deps.emit_debug_trace,
+                            user_id,
+                            user_rows=language_user_rows,
+                            visible_reply=text,
+                            lane="chat",
+                        )
                     final_job_completed_atomically = True
                     return
                 if (
@@ -11869,6 +12169,15 @@ async def process_job(
                     lane="chat",
                     branch=_thinking_branch,
                     chars=_thinking_chars,
+                )
+            if final and not language_trace_emitted:
+                language_trace_emitted = True
+                await _emit_reply_language_follow_trace(
+                    deps.emit_debug_trace,
+                    user_id,
+                    user_rows=language_user_rows,
+                    visible_reply=text,
+                    lane="chat",
                 )
 
         # `seq` is exclusively the consumed user|human frontier. The base prompt's
@@ -11978,7 +12287,13 @@ async def process_job(
             if boundary_generation is None:
                 raise LostJobLease("job ownership lost at round boundary")
             observed_generation = int(boundary_generation)
-            return await base_fold_new_messages()
+            rows = await base_fold_new_messages()
+            # Folded rows are user-only by contract, though coalescing removes
+            # their redundant role field.
+            language_user_rows.extend(
+                {**row, "role": "user"} for row in rows
+            )
+            return rows
 
         grounding_results: dict[str, Any] = {}
         if pending_schedule_results:
@@ -12081,7 +12396,6 @@ async def process_job(
                 extra_context=turn_extra_context,
                 mutation_recovery_active=(mutation_recovery_barrier is not None),
                 trusted_system_blocks=turn_trusted_system_blocks,
-                working_memory=working_memory,
                 agent_memory=agent_memory,
                 user_profile=user_profile,
                 worldbook_context=worldbook_context,
@@ -12170,6 +12484,11 @@ async def process_job(
                     tm.record_prompt_frontier_exhaustion()
                     raise
 
+        language_user_rows[:] = (
+            _flatten_turns(optional_tail_turns)
+            + list(tail)
+            + [{**row, "role": "user"} for row in coalesced]
+        )
         await _ensure_runtime_mode()
         await _renew_lease()
         await asyncio.to_thread(_emit_status, user_id, job_id, "writing_reply")
@@ -12181,12 +12500,13 @@ async def process_job(
         # which the seal surfaces cleanly (same as V1). Gated on the same kill switch;
         # when self-thinking is OFF this is False and the old include_reasoning path is
         # unchanged.
-        from agent_protocol_core import self_thinking as _self_thinking_v2
+        from core import self_thinking as _self_thinking_v2
 
         outcome = await v2_tool_loop.run_tool_loop(
             provider_config=provider_config,
             include_reasoning=turn_include_reasoning,
             suppress_native_reasoning=_self_thinking_v2.enabled(),
+            memory_delete_allowed=True,
             allow_image_output=True,
             build_messages=build_messages,
             dispatch_tools=_dispatch_tools,
@@ -12222,6 +12542,9 @@ async def process_job(
                 deps,
                 user_id,
                 lane,
+            ),
+            on_empty_provider_response=(
+                _empty_provider_response_debug_callback(deps, user_id, lane)
             ),
             fold_before_first=seq_native and not ordered_chat_replies,
             on_progress=_report_turn_progress,
@@ -12920,6 +13243,74 @@ async def _run_turn(job: dict, deps: TurnDeps, *, enclave_sem=None) -> str:
                 "attempt_count": job.get("attempt_count", 0),
             },
         )
+        if lane == "profile":
+            raw_profile = await asyncio.to_thread(
+                db.get_blob_strict,
+                user_id,
+                v2_profile_store.PROFILE_BLOB_KIND,
+            )
+            if raw_profile is not None:
+                profile_document = v2_profile_store.validate_profile_document(
+                    raw_profile
+                )
+                attempt = profile_document.get("last_attempt") or {}
+                retry_not_before = float(
+                    attempt.get("retry_not_before") or 0.0
+                )
+                if (
+                    str(attempt.get("retry_disposition") or "") == "scheduled"
+                    and retry_not_before > time.time()
+                ):
+                    renewed = await asyncio.to_thread(
+                        jobs_store.renew_job_lease,
+                        job_id,
+                        claimed_by,
+                        ttl_sec=jobs_store.RUNNING_TTL_SEC,
+                    )
+                    if not renewed:
+                        raise LostJobLease(
+                            "profile retry ownership lost before preflight"
+                        )
+                    retry_code = str(
+                        attempt.get("reject_code") or "profile_retry_scheduled"
+                    )
+                    moved = await asyncio.to_thread(
+                        jobs_store.reschedule_owned_job,
+                        job_id,
+                        claimed_by=claimed_by,
+                        error=retry_code,
+                        available_at=retry_not_before,
+                    )
+                    if not moved:
+                        raise LostJobLease(
+                            "profile retry ownership lost during preflight"
+                        )
+                    await _record_trajectory(
+                        recorder,
+                        "profile_retry",
+                        {
+                            "lane": "profile",
+                            "disposition": "scheduled",
+                            "retry_family": str(
+                                attempt.get("retry_family") or ""
+                            ),
+                            "retry_attempts": int(
+                                attempt.get("retry_attempts") or 0
+                            ),
+                            "retry_not_before": retry_not_before,
+                            "error_code": retry_code,
+                            "preflight": True,
+                        },
+                        best_effort=True,
+                    )
+                    tm.flush(failed=True, status="profile_retry_scheduled")
+                    await _record_trajectory(
+                        recorder,
+                        "turn_terminal",
+                        {"outcome": "rescheduled"},
+                        best_effort=True,
+                    )
+                    return "rescheduled"
         if lane == "maintenance":
             outcome = await process_job(
                 job,

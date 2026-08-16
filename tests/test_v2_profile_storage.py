@@ -75,7 +75,7 @@ def _ok_doc(user_id: str, count: int, *, suffix: str = "") -> dict:
         source=_source(count),
         last_attempt=_attempt(),
         memory_text=f"memory-{count}{suffix}",
-        user_text=f"user-{count}{suffix}",
+        style_text=f"style-{count}{suffix}",
         seal_text=_seal,
     )
 
@@ -85,15 +85,15 @@ def test_profile_document_seals_both_fields_and_keeps_only_bounded_metadata():
     rendered = json.dumps(doc, ensure_ascii=False, sort_keys=True)
 
     assert doc["memory"]["chars"] == len("memory-3")
-    assert doc["user"]["chars"] == len("user-3")
+    assert doc["style"]["chars"] == len("style-3")
     assert "memory-3" not in rendered
-    assert "user-3" not in rendered
+    assert "style-3" not in rendered
     assert doc["memory"]["envelope"]["body_ct"].startswith("cipher:")
     assert set(doc) == {
         "v",
         "state",
         "memory",
-        "user",
+        "style",
         "source",
         "last_attempt",
         "disabled",
@@ -108,7 +108,7 @@ def test_profile_document_rejects_torn_or_plaintext_fields():
             source=_source(1),
             last_attempt=_attempt(),
             memory_text="memory only",
-            user_text=None,
+            style_text=None,
             seal_text=_seal,
         )
 
@@ -118,6 +118,91 @@ def test_profile_document_rejects_torn_or_plaintext_fields():
         profile_store.ProfileStorageError, match="plaintext_memory_envelope"
     ):
         profile_store.validate_profile_document(doc)
+
+
+def test_old_profile_document_defaults_retry_policy_metadata():
+    document = profile_store.validate_profile_document(
+        _ok_doc("u-profile-old-retry-metadata", 1)
+    )
+
+    assert document["last_attempt"]["retry_disposition"] == ""
+    assert document["last_attempt"]["retry_family"] == ""
+    assert document["last_attempt"]["retry_attempts"] == 0
+
+
+@pytest.mark.parametrize(
+    ("disposition", "family"),
+    [
+        ("scheduled", "transient"),
+        ("scheduled", "shape"),
+        ("provider_config", "provider_config"),
+        ("source_change", "source"),
+        ("terminal", "terminal"),
+        ("terminal", "shape"),
+    ],
+)
+def test_profile_document_accepts_bounded_retry_policy_metadata(
+    disposition, family
+):
+    doc = _ok_doc("u-profile-retry-policy", 1)
+    doc["state"] = "degraded"
+    doc["last_attempt"].update(
+        {
+            "reject_code": "reply_not_json",
+            "retry_disposition": disposition,
+            "retry_family": family,
+            "retry_attempts": 2,
+            "retry_not_before": 1234.0 if disposition == "scheduled" else 0,
+        }
+    )
+
+    normalized = profile_store.validate_profile_document(doc)
+
+    assert normalized["last_attempt"]["retry_disposition"] == disposition
+    assert normalized["last_attempt"]["retry_family"] == family
+    assert normalized["last_attempt"]["retry_attempts"] == 2
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "error"),
+    [
+        ("retry_disposition", "later", "profile_retry_disposition_invalid"),
+        ("retry_family", "network-ish", "profile_retry_family_invalid"),
+    ],
+)
+def test_profile_document_rejects_unknown_retry_policy_metadata(
+    field, value, error
+):
+    doc = _ok_doc("u-profile-invalid-retry-policy", 1)
+    doc["last_attempt"][field] = value
+
+    with pytest.raises(profile_store.ProfileStorageError, match=error):
+        profile_store.validate_profile_document(doc)
+
+
+@pytest.mark.parametrize("state", ["ok", "empty"])
+def test_successful_profile_state_clears_retry_family_and_schedule(state):
+    doc = _ok_doc("u-profile-cleared-retry-policy", 1)
+    doc["state"] = state
+    if state == "empty":
+        doc.pop("memory")
+        doc.pop("style")
+    doc["last_attempt"].update(
+        {
+            "reject_code": "",
+            "retry_disposition": "scheduled",
+            "retry_family": "transient",
+            "retry_attempts": 7,
+            "retry_not_before": 9999.0,
+        }
+    )
+
+    normalized = profile_store.validate_profile_document(doc)
+
+    assert normalized["last_attempt"]["retry_disposition"] == ""
+    assert normalized["last_attempt"]["retry_family"] == ""
+    assert normalized["last_attempt"]["retry_attempts"] == 0
+    assert normalized["last_attempt"]["retry_not_before"] == 0.0
 
 
 def test_production_builder_locally_seals_each_field_before_jsonb(monkeypatch):
@@ -148,16 +233,16 @@ def test_production_builder_locally_seals_each_field_before_jsonb(monkeypatch):
         source=_source(1),
         last_attempt=_attempt(),
         memory_text="memory plaintext",
-        user_text="user plaintext",
+        style_text="style plaintext",
     )
 
     assert calls == [
         (store, b"memory plaintext"),
-        (store, b"user plaintext"),
+        (store, b"style plaintext"),
     ]
     rendered = json.dumps(document, sort_keys=True)
     assert "memory plaintext" not in rendered
-    assert "user plaintext" not in rendered
+    assert "style plaintext" not in rendered
 
 
 def test_initial_insert_and_ok_degraded_ok_state_machine_true_pg():
@@ -350,7 +435,7 @@ def test_newer_winner_discards_stale_candidate_without_replay(monkeypatch):
         source=_source(3, generated_at="2026-08-01T00:00:00Z"),
         last_attempt=_attempt(),
         memory_text="newer-memory",
-        user_text="newer-user",
+        style_text="newer-style",
         seal_text=_seal,
     )
     reads = iter([{}, winner])
@@ -523,7 +608,7 @@ def test_production_turn_adapter_uses_strict_read_and_observable_summary_fallbac
 
 def test_production_profile_decrypts_declare_both_trace_scopes(monkeypatch):
     doc = _ok_doc("u-profile-scopes", 1)
-    plaintext = iter((b"memory-1", b"user-1"))
+    plaintext = iter((b"memory-1", b"style-1"))
     scopes = []
 
     @contextmanager
@@ -551,14 +636,14 @@ def test_production_profile_decrypts_declare_both_trace_scopes(monkeypatch):
     )
 
     assert selection.used_profile is True
-    assert scopes == ["v2_profile_memory_read", "v2_profile_user_read"]
+    assert scopes == ["v2_profile_memory_read", "v2_profile_style_read"]
 
 
 def test_ok_profile_suppresses_summary_only_after_both_fields_decrypt():
     doc = _ok_doc("u-profile-turn", 1)
     plaintext = {
         doc["memory"]["envelope"]["body_ct"]: b"memory-1",
-        doc["user"]["envelope"]["body_ct"]: b"user-1",
+        doc["style"]["envelope"]["body_ct"]: b"style-1",
     }
     selection = profile_store.select_profile_for_turn(
         "u-profile-turn",
@@ -571,7 +656,7 @@ def test_ok_profile_suppresses_summary_only_after_both_fields_decrypt():
     assert selection.used_profile is True
     assert selection.summary == ""
     assert selection.memory == "memory-1"
-    assert selection.user == "user-1"
+    assert selection.style == "style-1"
 
 
 def test_disabled_ok_profile_keeps_summary_without_decrypting_fields():
@@ -581,7 +666,7 @@ def test_disabled_ok_profile_keeps_summary_without_decrypting_fields():
         source=_source(1),
         last_attempt=_attempt(),
         memory_text="memory-disabled",
-        user_text="user-disabled",
+        style_text="style-disabled",
         disabled=True,
         seal_text=_seal,
     )
@@ -608,14 +693,14 @@ def test_winning_cas_mirrors_only_ciphertext_to_real_tee_shadow(monkeypatch):
     monkeypatch.setenv("FEEDLING_TEE_DUAL_WRITE", "1")
 
     memory_plaintext = "PRIVATE MEMORY PLAINTEXT"
-    user_plaintext = "PRIVATE USER PLAINTEXT"
+    style_plaintext = "PRIVATE STYLE PLAINTEXT"
     document = profile_store.build_profile_document(
         uid,
         state="ok",
         source=_source(4),
         last_attempt=_attempt(),
         memory_text=memory_plaintext,
-        user_text=user_plaintext,
+        style_text=style_plaintext,
         seal_text=_seal,
     )
     result = profile_store.update_profile_cas(uid, lambda _expected: document)
@@ -631,6 +716,31 @@ def test_winning_cas_mirrors_only_ciphertext_to_real_tee_shadow(monkeypatch):
     assert shadow == db.get_blob_strict(uid, profile_store.PROFILE_BLOB_KIND)
     rendered = json.dumps(shadow, ensure_ascii=False, sort_keys=True)
     assert memory_plaintext not in rendered
-    assert user_plaintext not in rendered
+    assert style_plaintext not in rendered
     assert set(shadow["memory"]) == {"envelope", "chars"}
-    assert set(shadow["user"]) == {"envelope", "chars"}
+    assert set(shadow["style"]) == {"envelope", "chars"}
+
+
+def test_legacy_user_field_reads_as_style_until_natural_redistillation():
+    document = _ok_doc("u-profile-legacy-style", 1)
+    document["user"] = document.pop("style")
+    document["user"]["chars"] = len("legacy-style-1")
+    plaintext = {
+        document["memory"]["envelope"]["body_ct"]: b"memory-1",
+        document["user"]["envelope"]["body_ct"]: b"legacy-style-1",
+    }
+    fields = []
+
+    selection = profile_store.select_profile_for_turn(
+        "u-profile-legacy-style",
+        "- old summary",
+        enabled=True,
+        read_blob=lambda *_args: document,
+        decrypt_envelope=lambda envelope, field: (
+            fields.append(field) or plaintext[envelope["body_ct"]]
+        ),
+    )
+
+    assert selection.style == "legacy-style-1"
+    assert selection.used_profile is True
+    assert fields == ["memory", "user"]

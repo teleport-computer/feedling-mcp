@@ -6,6 +6,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
 from model_api_runtime.v2 import serve_worker
+from memory.dream_prompt_v1 import build_dream_prompt
 
 
 def test_memory_context_degrades_each_field_independently(monkeypatch):
@@ -23,8 +24,12 @@ def test_dream_context_fetches_full_cards_without_cross_run_cooldown(monkeypatch
     serve_worker.wire_assembly()
     monkeypatch.setattr(serve_worker, "_mint_runtime_token", lambda _uid: "token")
     monkeypatch.setattr(serve_worker.time, "time", lambda: 1785542400.0)  # 2026-08-01 UTC
-    monkeypatch.setattr("memory.memory_core.buckets", lambda *a, **k: ({"buckets": []}, 200))
-    monkeypatch.setattr("memory.memory_core.threads", lambda *a, **k: ({"threads": []}, 200))
+    monkeypatch.setattr(
+        "memory.memory_core.buckets", lambda *a, **k: ({"buckets": []}, 200)
+    )
+    monkeypatch.setattr(
+        "memory.memory_core.threads", lambda *a, **k: ({"threads": []}, 200)
+    )
     monkeypatch.setattr("identity.identity_core.get_identity", lambda *a, **k: ({}, 200))
     monkeypatch.setattr(
         "memory.memory_core.index",
@@ -38,6 +43,7 @@ def test_dream_context_fetches_full_cards_without_cross_run_cooldown(monkeypatch
                 "summary": "完整摘要",
                 "content": "只有 fetch 才返回的完整正文。",
                 "source": "memory_capture",
+                "occurred_at": "2026-05-01T00:00:00Z",
                 "created_at": "2026-07-31T00:00:00Z",
             },
             {
@@ -45,6 +51,7 @@ def test_dream_context_fetches_full_cards_without_cross_run_cooldown(monkeypatch
                 "summary": "新 dream 卡",
                 "content": "上一轮 Dream 卡可在后续运行重新参与整理。",
                 "source": "memory_dream",
+                "occurred_at": "2026-07-01T00:00:00Z",
                 "created_at": "2026-07-31T00:00:00Z",
             },
         ]}, 200),
@@ -57,12 +64,16 @@ def test_dream_context_fetches_full_cards_without_cross_run_cooldown(monkeypatch
     assert "dream-new" in ctx["cards"]
     assert "上一轮 Dream 卡可在后续运行重新参与整理。" in ctx["cards"]
     assert [item["id"] for item in ctx["card_items"]] == ["capture-old", "dream-new"]
+    assert [item["occurred_at"] for item in ctx["card_items"]] == [
+        "2026-05-01T00:00:00Z",
+        "2026-07-01T00:00:00Z",
+    ]
 
 
 def test_dream_context_budget_keeps_only_whole_cards(monkeypatch):
     serve_worker.wire_assembly()
     monkeypatch.setattr(serve_worker, "_mint_runtime_token", lambda _uid: "token")
-    monkeypatch.setattr(serve_worker, "_DREAM_CARDS_MAX_CHARS", 150)
+    monkeypatch.setattr(serve_worker, "_DREAM_CARDS_MAX_CHARS", 250)
     monkeypatch.setattr("memory.memory_core.buckets", lambda *a, **k: ({"buckets": []}, 200))
     monkeypatch.setattr("memory.memory_core.threads", lambda *a, **k: ({"threads": []}, 200))
     monkeypatch.setattr("identity.identity_core.get_identity", lambda *a, **k: ({}, 200))
@@ -76,6 +87,7 @@ def test_dream_context_budget_keeps_only_whole_cards(monkeypatch):
             "summary": f"摘要-{memory_id}",
             "content": "正文" * 40,
             "source": "memory_capture",
+            "occurred_at": "2026-07-01T00:00:00Z",
             "created_at": "2026-07-01T00:00:00Z",
         }
         for memory_id in ("m1", "m2")
@@ -90,6 +102,66 @@ def test_dream_context_budget_keeps_only_whole_cards(monkeypatch):
     assert "id=m1" in ctx["cards"]
     assert "id=m2" not in ctx["cards"]
     assert ctx["card_items"][0]["content"] == "正文" * 40
+
+
+def test_dream_context_budget_rejects_oversized_first_card_from_final_prompt(
+    monkeypatch, caplog,
+):
+    serve_worker.wire_assembly()
+    monkeypatch.setattr(serve_worker, "_mint_runtime_token", lambda _uid: "token")
+    monkeypatch.setattr(serve_worker, "_DREAM_CARDS_MAX_CHARS", 150)
+    monkeypatch.setattr("memory.memory_core.buckets", lambda *a, **k: ({"buckets": []}, 200))
+    monkeypatch.setattr("memory.memory_core.threads", lambda *a, **k: ({"threads": []}, 200))
+    monkeypatch.setattr("identity.identity_core.get_identity", lambda *a, **k: ({}, 200))
+    monkeypatch.setattr(
+        "memory.memory_core.index",
+        lambda *a, **k: ({"items": [{"id": "oversized-first"}]}, 200),
+    )
+    monkeypatch.setattr(
+        "memory.memory_core.fetch",
+        lambda *a, **k: (
+            {
+                "items": [
+                    {
+                        "id": "oversized-first",
+                        "summary": "超限首卡",
+                        "content": "正文" * 100,
+                        "source": "memory_capture",
+                        "created_at": "2026-07-01T00:00:00Z",
+                    }
+                ]
+            },
+            200,
+        ),
+    )
+
+    with caplog.at_level("WARNING", logger="feedling.runtime_v2.serve_worker"):
+        ctx = serve_worker._read_dream_memory_context("u_ctx_oversized_first")
+    prompt = build_dream_prompt(
+        ai_name=ctx["ai_name"],
+        user_name=ctx["user_name"],
+        cards=ctx["cards"],
+        recent_conversations="",
+    )
+    empty_prompt = build_dream_prompt(
+        ai_name=ctx["ai_name"],
+        user_name=ctx["user_name"],
+        cards="",
+        recent_conversations="",
+    )
+
+    assert ctx["card_items"] == []
+    assert len(prompt) == len(empty_prompt)
+    assert "oversized-first" not in prompt
+    budget_logs = [
+        record.getMessage()
+        for record in caplog.records
+        if "dream cards truncated" in record.getMessage()
+    ]
+    assert len(budget_logs) == 1
+    assert "kept=0/1" in budget_logs[0]
+    assert "empty_context=True" in budget_logs[0]
+    assert "oversized-first" not in budget_logs[0]
 
 
 def test_capture_submit_enqueues_a_capture_agent_job(monkeypatch):

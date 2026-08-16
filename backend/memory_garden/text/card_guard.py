@@ -23,7 +23,7 @@ from __future__ import annotations
 import os
 import re
 
-from agent_protocol_core import protocol_leak
+from core import protocol_leak
 from ..prompts.buckets import _text_is_chinese
 
 

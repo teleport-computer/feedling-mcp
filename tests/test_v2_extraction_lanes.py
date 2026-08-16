@@ -80,8 +80,10 @@ def _deps(**over):
             "ai_name": "小克", "user_name": "Z", "buckets": "B",
             "threads": "T", "identity": "I", "cards": "C",
             "card_items": [
-                {"id": "old-a", "summary": "计划去京都", "content": "想看红叶。"},
-                {"id": "old-b", "summary": "订了京都机票", "content": "11 月出发。"},
+                {"id": "old-a", "summary": "计划去京都", "content": "想看红叶。",
+                 "occurred_at": "2026-03-01T00:00:00Z"},
+                {"id": "old-b", "summary": "订了京都机票", "content": "11 月出发。",
+                 "occurred_at": "2026-05-01T00:00:00Z"},
             ]},
         build_memory_envelope=_envelope,
         apply_memory_actions=lambda uid, actions: {
@@ -108,6 +110,38 @@ def _deps(**over):
 def test_dream_is_a_lane_with_background_priority():
     assert "dream" in jobs_store.LANES
     assert jobs_store.LANE_PRIORITY["dream"] == jobs_store.LANE_PRIORITY["capture"]
+
+
+@pytest.mark.parametrize("lane", ["capture", "dream"])
+def test_extraction_lane_passes_its_own_output_budget(monkeypatch, lane):
+    uid = f"u_x_budget_{lane}"
+    _seed_v2(uid)
+    jobs_store.enqueue_job(uid, lane)
+    job = jobs_store.claim_next_job("w")
+    seen = []
+
+    async def _fake_extract(**kwargs):
+        retry_prompt = kwargs["parse_retry"].build_truncation_prompt("P")
+        seen.append((kwargs["max_tokens"], retry_prompt))
+        return [], None
+
+    monkeypatch.setattr(extraction, "extract", _fake_extract)
+    status = asyncio.run(
+        worker.process_job(
+            job,
+            _deps(),
+            provider_config=_BYOK,
+            api_key=None,
+            runtime_token="rt",
+        )
+    )
+
+    assert status == "completed"
+    assert len(seen) == 1
+    budget, retry_prompt = seen[0]
+    assert budget == extraction.max_output_tokens_for_lane(lane)
+    assert "截断" in retry_prompt
+    assert retry_prompt != "P"
 
 
 @pytest.mark.parametrize("lane", ["capture", "dream"])
@@ -167,7 +201,8 @@ def test_dream_blast_radius_fuse_fails_whole_job(monkeypatch):
     job = jobs_store.claim_next_job("w")
 
     cards = [
-        {"id": f"card-{i}", "summary": f"S{i}", "content": f"C{i}"}
+        {"id": f"card-{i}", "summary": f"S{i}", "content": f"C{i}",
+         "occurred_at": f"2026-07-{i + 1:02d}T00:00:00Z"}
         for i in range(15)
     ]
 
@@ -216,7 +251,8 @@ def test_dream_below_fuse_threshold_applies_normally(monkeypatch):
     job = jobs_store.claim_next_job("w")
 
     cards = [
-        {"id": f"card-{i}", "summary": f"S{i}", "content": f"C{i}"}
+        {"id": f"card-{i}", "summary": f"S{i}", "content": f"C{i}",
+         "occurred_at": f"2026-07-{i + 1:02d}T00:00:00Z"}
         for i in range(15)
     ]
 
@@ -255,6 +291,44 @@ def test_dream_below_fuse_threshold_applies_normally(monkeypatch):
     assert status == "completed"
     assert applied == {"n": 2}
     assert _job_row(job_id)[0] == "completed"
+
+
+def test_dream_unusable_source_time_is_observable_and_writes_nothing(monkeypatch):
+    uid = "u_x_dream_missing_occurred_at"
+    _seed_v2(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, "dream")
+    job = jobs_store.claim_next_job("w")
+
+    async def _fake_extract(**_kwargs):
+        return ([{
+            "op": "merge",
+            "card_ids": ["old-a", "old-b"],
+            "rationale": "同一线索",
+            "result": {"summary": "s", "content": "c"},
+        }], None)
+
+    monkeypatch.setattr(extraction, "extract", _fake_extract)
+    applied = []
+    deps = _deps(
+        read_memory_context=lambda _uid: {
+            "ai_name": "小克", "user_name": "Z", "cards": "C",
+            "card_items": [
+                {"id": "old-a", "occurred_at": "2026-03-01T00:00:00Z"},
+                {"id": "old-b", "occurred_at": ""},
+            ],
+        },
+        apply_memory_actions=lambda _uid, actions: applied.extend(actions),
+    )
+
+    status = asyncio.run(worker.process_job(
+        job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"))
+
+    assert status == "failed"
+    assert applied == []
+    assert _job_row(job_id) == (
+        "failed",
+        "extraction_failed:dream_source_occurred_at_unavailable",
+    )
 
 
 @pytest.mark.parametrize("lane", ["capture", "dream"])
@@ -363,6 +437,58 @@ def test_extraction_failure_is_silent_no_bubble_no_error_chip(monkeypatch, lane)
     assert emitted == []                       # no user-visible status/error chip
     row = _job_row(job_id)
     assert row == ("failed", "extraction_failed:upstream_unavailable")
+
+
+def test_truncated_extraction_persists_content_free_failure_shape(monkeypatch):
+    uid = "u_x_truncated_dream"
+    _seed_v2(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, "dream")
+    job = jobs_store.claim_next_job("w")
+    limit = extraction.DREAM_MAX_OUTPUT_TOKENS
+
+    async def _truncated(**kwargs):
+        kwargs["failure_detail_out"]({
+            "stop_reason": "length",
+            "completion_tokens": limit,
+            "max_tokens": kwargs["max_tokens"],
+        })
+        return None, "output_truncated"
+
+    class Recorder:
+        def __init__(self):
+            self.events = []
+
+        async def record(self, kind, payload):
+            self.events.append((kind, payload))
+
+        async def record_best_effort(self, kind, payload):
+            await self.record(kind, payload)
+            return True
+
+    recorder = Recorder()
+    monkeypatch.setattr(extraction, "extract", _truncated)
+    status = asyncio.run(
+        worker.process_job(
+            job,
+            _deps(),
+            provider_config=_BYOK,
+            api_key=None,
+            runtime_token="rt",
+            trajectory_recorder=recorder,
+        )
+    )
+
+    assert status == "failed"
+    assert _job_row(job_id) == ("failed", "extraction_failed:output_truncated")
+    turn_error = next(payload for kind, payload in recorder.events if kind == "turn_exception")
+    assert turn_error == {
+        "stage": "extraction",
+        "error_class": "RuntimeError",
+        "error_code": "extraction_failed:output_truncated",
+        "stop_reason": "length",
+        "completion_tokens": limit,
+        "max_tokens": limit,
+    }
 
 
 def test_rejected_memory_write_fails_job_instead_of_marking_completed(monkeypatch):

@@ -16,7 +16,15 @@ import asyncio
 import math
 import threading
 
-from model_api_runtime.v2 import claim_recovery, slot_protocol, watchdog
+import db
+from conftest import seed_user
+from model_api_runtime.v2 import (
+    claim_recovery,
+    jobs_store,
+    serve_worker,
+    slot_protocol,
+    watchdog,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -70,6 +78,34 @@ def test_explicit_event_loop_heartbeat_staleness_kills_without_queue_query():
         "active_turn_count": 0,
     }
     assert watchdog.should_kill(liveness, **_kw(jobs_claimable=False)) is True
+
+
+def test_live_child_cold_start_gets_bounded_grace_before_first_heartbeat():
+    """Schema/user bootstrap may exceed the steady-state 45s heartbeat budget.
+
+    A live generation that has not emitted its first valid runtime heartbeat is
+    allowed the separate startup budget, but a genuinely wedged bootstrap is
+    still killed once that bounded budget expires.
+    """
+    booting = {
+        "alive": True,
+        "startup_complete": False,
+        "startup_age_sec": 50.0,
+        "last_progress_age_sec": 50.0,
+        "event_loop_heartbeat_age_sec": 50.0,
+        "last_slot_progress_age_sec": 50.0,
+        "active_turn_count": 0,
+    }
+    assert watchdog.should_kill(
+        booting,
+        **_kw(jobs_claimable=True),
+        child_startup_timeout_sec=120.0,
+    ) is False
+    assert watchdog.should_kill(
+        {**booting, "startup_age_sec": 121.0},
+        **_kw(jobs_claimable=False),
+        child_startup_timeout_sec=120.0,
+    ) is True
 
 
 def test_stale_slot_progress_with_healthy_loop_kills_only_if_pre_turn_work_waits():
@@ -169,6 +205,30 @@ def test_profile_batch_progress_survives_heavy_stall_but_absolute_budget_wins():
         turn_stall_timeout_sec=120.0,
         turn_absolute_timeout_sec=1200.0,
     ) is True
+
+
+def test_jobs_claimable_ignores_future_pending_job():
+    uid = "u_watchdog_delayed_profile"
+    seed_user(uid)
+    with db.get_pool().connection() as conn:
+        conn.execute("DELETE FROM agent_jobs")
+        conn.execute(
+            "INSERT INTO v2_runtime_state "
+            "(user_id,hosted_runtime_state,runtime_generation) "
+            "VALUES (%s,'v2',1) ON CONFLICT (user_id) DO UPDATE SET "
+            "hosted_runtime_state='v2',runtime_generation=1",
+            (uid,),
+        )
+    job_id, _ = jobs_store.enqueue_job(uid, "profile", reason="retry")
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            "UPDATE agent_jobs "
+            "SET available_at=clock_timestamp()+interval '1 hour' WHERE id=%s",
+            (job_id,),
+        )
+
+    assert jobs_store.pending_job_count() == 0
+    assert serve_worker._jobs_claimable() is False
 
 
 # ---------------------------------------------------------------------------
