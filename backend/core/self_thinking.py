@@ -33,6 +33,69 @@ FAILED = "failed"       # unresolvable (truncated/mismatched/nested)
 
 MAX_THINKING_CHARS = 240
 
+# 内部字段名/协议词。**思考是用户可见面**,这些词出现在里面等于把运行时内脏
+# 端到用户眼前(「session_id: …」「permission_denials」「costUSD」)。
+#
+# 来源:V1 consumer 早有一份逐行黑名单(chat_resident_consumer.py 的
+# `_sanitize_thinking_summary`),V2 一直只有长度截断 —— 这是真回归。
+# 放在共享内核是为了让两代**共用同一份词表**;V1 的运行时行为本批不动
+# (它逐行丢弃、V2 整段不发布,两种处置各有来由),但词表由此单一来源,
+# 并有漂移守卫钉住(见 tests)。
+#
+# ⚠️ 只列**内部/协议**词汇,不列日常词。这里每多一个常见词,就多一次
+# 把正常内心话误判为泄漏的机会 —— 那会让用户看到「(思考没写完)」而不是真话。
+INTERNAL_FIELD_TERMS = (
+    "system prompt", "developer message", "chain-of-thought", "chain of thought",
+    "modelUsage", "terminal_reason", "permission_denials",
+    "cache_read", "cache_creation", "session_id", "uuid", "costUSD",
+    "input_tokens", "output_tokens",
+)
+
+
+# 词表单一来源,**宽度按道分开** —— codex2 审出来的关键设计点:
+#   · V1 consumer 逐行丢弃:命中就删那一行,其余保留 → 宽匹配代价低
+#   · V2 整段替换成 THINKING_FAILED_MARKER:命中就把整段内心话换掉 → 代价高得多
+# 所以两代共享**词表**、各用各的**宽度**,而不是硬共用一个 matcher。
+#
+# V2 用下面这个窄判据:只认「字段泄漏的形状」,不认「概念提及」。
+# codex2 实测的三句必须放行 —— 用户完全可能跟伴侣聊这些:
+#   「用户问 UUID 是什么」「讨论 system prompt 的设计」「学习 chain of thought prompting」
+# 整段吞掉的话,用户只会看到「(思考没写完)」,而且不知道为什么。
+#
+# 泄漏形状 = 词后面紧跟分隔符/取值:`session_id: abc`、`"input_tokens": 12`、
+# `costUSD=0.02`、`terminal_reason -> x`。概念提及不会长这样。
+# 结尾允许先闭合引号再跟分隔符 —— JSON 形态 `"input_tokens": 12` 就长这样,
+# 第一版漏了它(claude2 自测发现)。
+_FIELD_LEAK_TAIL = r"""["'`]?\s*(?:[:=]|=>|->|→)"""
+_INTERNAL_FIELD_LEAK_RE = re.compile(
+    r"""(?:^|[\s"'`\[{(,])("""
+    + "|".join(re.escape(t) for t in sorted(INTERNAL_FIELD_TERMS,
+                                            key=len, reverse=True))
+    + r")" + _FIELD_LEAK_TAIL,
+    re.IGNORECASE,
+)
+
+
+def internal_field_leak(text: str) -> str | None:
+    """V2 用:只在**字段泄漏形状**下命中,概念提及放行。
+
+    宽度刻意窄于 V1 的逐行黑名单 —— 见上面注释,两者处置代价不同。
+    """
+    m = _INTERNAL_FIELD_LEAK_RE.search(str(text or ""))
+    return m.group(1) if m else None
+
+
+def internal_field_terms_pattern() -> str:
+    """V1 用:从共享词表构造它那份**宽**的逐行正则,行为不变。
+
+    由构造保证单一来源 —— V1 不再自己维护一份字面量,
+    「两边词表漂移」在结构上不可能发生,不必靠测试去追源码。
+    """
+    return "(" + "|".join(
+        [re.escape(t) for t in INTERNAL_FIELD_TERMS]
+        + [r"chain[-\s]*of[-\s]*thought"]   # V1 原有的宽形态,保留
+    ) + ")"
+
 # Shown in the thinking channel when the block is malformed, so the user sees that
 # io tried to think rather than nothing/garbage. (zh for now; localization TBD.)
 THINKING_FAILED_MARKER = "（思考没写完）"
