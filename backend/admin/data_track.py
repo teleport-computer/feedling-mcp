@@ -2446,6 +2446,10 @@ _LANGUAGE_FOLLOW_PUBLIC_ENUMS = {
         "indeterminate",
     }),
     "outcome": frozenset({"match", "mismatch", "skip"}),
+    "correction_outcome": frozenset({
+        "corrected", "kept_original_still_mismatch", "retry_error",
+        "retry_empty", "skipped",
+    }),
     "lane": frozenset({"chat", "wake"}),
 }
 

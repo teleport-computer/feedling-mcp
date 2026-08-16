@@ -258,12 +258,17 @@ def test_run_wake_reply_written_and_job_completed(monkeypatch):
 def test_wake_self_thinking_on_drops_native_reasoning_fallback(monkeypatch):
     """Wake follows Chat: native CoT is not displayed while self-thinking is ON."""
     monkeypatch.delenv("FEEDLING_V2_SELF_THINKING", raising=False)
+    # Force the shared observer to report a definite mismatch. Wake still must
+    # remain observation-only and make exactly one provider call.
+    monkeypatch.setattr(
+        worker, "_latest_user_writing_system", lambda _rows: "han"
+    )
     uid = "u_wake_selfthink_no_fallback"
     conftest.seed_user(uid)
     _reset(uid)
     job_id, _ = jobs_store.enqueue_job(uid, "heartbeat")
     claimed_by = _claim(job_id)
-    _script_provider(
+    calls = _script_provider(
         monkeypatch,
         [{
             "reply": "hey, how did that go?",
@@ -288,7 +293,12 @@ def test_wake_self_thinking_on_drops_native_reasoning_fallback(monkeypatch):
     )
     traces = []
     deps = _wake_deps(
-        tail=[{"id": "m1", "ts": 1.0, "role": "user", "content": "hi"}]
+        tail=[{
+            "id": "m1",
+            "ts": 1.0,
+            "role": "user",
+            "content": "这是用户正在使用中文说出的完整消息内容",
+        }]
     )
     deps.emit_debug_trace = lambda user_id, event_type, **fields: traces.append(
         {"user_id": user_id, "event_type": event_type, **fields}
@@ -307,6 +317,7 @@ def test_wake_self_thinking_on_drops_native_reasoning_fallback(monkeypatch):
     )
 
     assert status == "completed"
+    assert len(calls) == 1
     assert written == {"text": "hey, how did that go?", "user_id": uid}
     thinking_traces = [
         trace for trace in traces if trace["event_type"] == "thinking.surfaced"
@@ -322,10 +333,12 @@ def test_wake_self_thinking_on_drops_native_reasoning_fallback(monkeypatch):
         if trace["event_type"] == "reply.language_follow"
     ]
     assert [trace["detail"] for trace in language_traces] == [{
-        "user_script": "indeterminate",
+        "user_script": "han",
         "reply_script": "latin",
-        "outcome": "skip",
+        "outcome": "mismatch",
         "lane": "wake",
+        "correction_attempted": False,
+        "correction_outcome": "skipped",
     }]
 
 

@@ -36,6 +36,7 @@ from model_api_runtime.v2 import context as v2_context
 from model_api_runtime.v2 import effect_id as v2_effect_id
 from model_api_runtime.v2 import effect_outbox as v2_effect_outbox
 from model_api_runtime.v2 import jobs_store
+from model_api_runtime.v2 import language_follow
 from model_api_runtime.v2 import serve_worker
 from model_api_runtime.v2 import worker
 
@@ -167,7 +168,10 @@ def _script_provider(monkeypatch, responses):
 
     async def _fake(config, messages, *, tools=None, **kwargs):
         calls.append({"messages": messages, "tools": tools, **kwargs})
-        return next(it)
+        response = next(it)
+        if isinstance(response, BaseException):
+            raise response
+        return response
 
     monkeypatch.setattr(provider_client, "chat_completion_async", _fake)
     return calls
@@ -407,8 +411,181 @@ def test_language_follow_emits_once_for_terminal_visible_body_after_thinking(
         "reply_script": "latin",
         "outcome": "match",
         "lane": "chat",
+        "correction_attempted": False,
+        "correction_outcome": "skipped",
     }
     assert private_thinking not in json.dumps(language_traces, ensure_ascii=False)
+
+
+def test_chat_language_mismatch_rewrites_once_and_publishes_matching_reply(
+    monkeypatch,
+):
+    uid = "u_language_correction_success"
+    conftest.seed_user(uid)
+    _reset(uid)
+    jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("w-language-correction-success")
+    _patch_real_write(monkeypatch)
+    calls = _script_provider(monkeypatch, [
+        _text_round("This is the original answer in the wrong language"),
+        _text_round("这是改写后与用户语言一致的完整中文回复"),
+    ])
+    traces = []
+    deps = _deps(messages=[{
+        "id": "m-language-correction-success",
+        "ts": 10.0,
+        "role": "user",
+        "content": "这是用户正在使用中文提出的完整问题内容",
+    }])
+    deps.emit_debug_trace = lambda user_id, event_type, **fields: traces.append(
+        {"user_id": user_id, "type": event_type, **fields}
+    )
+
+    status = asyncio.run(worker.process_job(
+        job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"
+    ))
+
+    assert status == "completed"
+    assert len(calls) == 2
+    assert calls[1]["tools"] is None
+    assert language_follow.CORRECTION_INSTRUCTION in json.dumps(
+        calls[1]["messages"], ensure_ascii=False
+    )
+    assert [row["body_ct"] for row in _bubbles(uid)] == [
+        "这是改写后与用户语言一致的完整中文回复"
+    ]
+    language_trace = next(
+        trace for trace in traces if trace["type"] == "reply.language_follow"
+    )
+    assert language_trace["detail"] == {
+        "user_script": "han",
+        "reply_script": "han",
+        "outcome": "match",
+        "lane": "chat",
+        "correction_attempted": True,
+        "correction_outcome": "corrected",
+    }
+
+
+@pytest.mark.parametrize(
+    ("retry", "expected_outcome"),
+    [
+        (
+            provider_client.ProviderError("rewrite unavailable", status_code=400),
+            "retry_error",
+        ),
+        (_text_round(""), "retry_empty"),
+    ],
+)
+def test_chat_language_correction_failure_keeps_original(
+    monkeypatch, retry, expected_outcome,
+):
+    uid = f"u_language_correction_{expected_outcome}"
+    conftest.seed_user(uid)
+    _reset(uid)
+    jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job(f"w-{expected_outcome}")
+    _patch_real_write(monkeypatch)
+    original = "This usable original answer must survive correction failure"
+    calls = _script_provider(monkeypatch, [_text_round(original), retry])
+    traces = []
+    deps = _deps(messages=[{
+        "id": f"m-{expected_outcome}",
+        "ts": 10.0,
+        "role": "user",
+        "content": "这是用户正在使用中文提出的完整问题内容",
+    }])
+    deps.emit_debug_trace = lambda user_id, event_type, **fields: traces.append(
+        {"user_id": user_id, "type": event_type, **fields}
+    )
+
+    status = asyncio.run(worker.process_job(
+        job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"
+    ))
+
+    assert status == "completed"
+    assert len(calls) == 2
+    assert [row["body_ct"] for row in _bubbles(uid)] == [original]
+    language_trace = next(
+        trace for trace in traces if trace["type"] == "reply.language_follow"
+    )
+    assert language_trace["detail"]["correction_attempted"] is True
+    assert language_trace["detail"]["correction_outcome"] == expected_outcome
+
+
+def test_chat_language_correction_still_mismatch_keeps_original_and_stops(
+    monkeypatch,
+):
+    uid = "u_language_correction_still_mismatch"
+    conftest.seed_user(uid)
+    _reset(uid)
+    jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("w-language-correction-still-mismatch")
+    _patch_real_write(monkeypatch)
+    original = "This is the first usable answer in the wrong language"
+    calls = _script_provider(monkeypatch, [
+        _text_round(original),
+        _text_round("This retry is still written in the wrong language"),
+    ])
+    traces = []
+    deps = _deps(messages=[{
+        "id": "m-language-correction-still-mismatch",
+        "ts": 10.0,
+        "role": "user",
+        "content": "这是用户正在使用中文提出的完整问题内容",
+    }])
+    deps.emit_debug_trace = lambda user_id, event_type, **fields: traces.append(
+        {"user_id": user_id, "type": event_type, **fields}
+    )
+
+    status = asyncio.run(worker.process_job(
+        job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"
+    ))
+
+    assert status == "completed"
+    assert len(calls) == 2
+    assert [row["body_ct"] for row in _bubbles(uid)] == [original]
+    language_trace = next(
+        trace for trace in traces if trace["type"] == "reply.language_follow"
+    )
+    assert language_trace["detail"]["correction_outcome"] == (
+        "kept_original_still_mismatch"
+    )
+
+
+@pytest.mark.parametrize(
+    ("user_text", "reply_text"),
+    [
+        ("好的", "This sufficiently long reply stays untouched"),
+        ("这是用户正在使用中文提出的完整问题内容", "这是同语言的完整中文回答内容"),
+        ("汉汉汉汉汉abcde", "This sufficiently long reply stays untouched"),
+        ("这是用户正在使用中文提出的完整问题内容", "okay"),
+    ],
+)
+def test_chat_language_correction_skips_uncertain_or_matching_scripts(
+    monkeypatch, user_text, reply_text,
+):
+    uid = "u_language_correction_skip_" + str(abs(hash((user_text, reply_text))))
+    conftest.seed_user(uid)
+    _reset(uid)
+    jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("w-language-correction-skip")
+    _patch_real_write(monkeypatch)
+    calls = _script_provider(monkeypatch, [_text_round(reply_text)])
+    deps = _deps(messages=[{
+        "id": "m-language-correction-skip",
+        "ts": 10.0,
+        "role": "user",
+        "content": user_text,
+    }])
+
+    status = asyncio.run(worker.process_job(
+        job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"
+    ))
+
+    assert status == "completed"
+    assert len(calls) == 1
+    assert [row["body_ct"] for row in _bubbles(uid)] == [reply_text]
 
 
 def test_chat_tool_surface_keeps_memory_delete(monkeypatch):
