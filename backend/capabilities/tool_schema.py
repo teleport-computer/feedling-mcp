@@ -24,8 +24,8 @@ from capabilities import registry
 from identity import card_policy
 # Card-writing rules live with the memory package (single source of truth shared
 # with the V1 guidance block); only the op names above are V2-specific.
-from memory import prompts_v1
-from memory.source_policy import MAX_MEMORY_SUPERSEDE_TARGETS
+from memory_garden.prompts import buckets as prompts_v1
+from memory_garden.types import MAX_MEMORY_SUPERSEDE_TARGETS
 from perception.agent_fields import (
     AGENT_PERCEPTION_SIGNALS,
     AGENT_SIGNAL_FIELDS,

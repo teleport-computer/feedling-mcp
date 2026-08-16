@@ -12,7 +12,7 @@ from __future__ import annotations
 import re
 from typing import Any
 
-from context_memory_selection import memory_relevance_details
+from .relevance import memory_relevance_details
 
 
 SENSITIVE_QUERY_MARKERS = {

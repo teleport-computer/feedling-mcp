@@ -19,9 +19,9 @@ from __future__ import annotations
 import re
 import unicodedata
 
+from . import card_guard
 from core import self_thinking
-from memory import card_guard
-from memory.prompts_v1 import normalize_bucket_language
+from ..prompts.buckets import normalize_bucket_language
 
 # 卡上会被用户亲眼看到的文字字段(bucket/threads 也显示在花园里)。
 _VISIBLE_TEXT_FIELDS = ("summary", "content", "bucket")

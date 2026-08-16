@@ -30,8 +30,8 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 from capabilities import tool_schema  # noqa: E402
 from genesis import prompts as genesis_prompts  # noqa: E402
 from memory.capture_prompt_v1 import build_capture_prompt  # noqa: E402
-from memory.migrate_prompt_v1 import build_migrate_prompt  # noqa: E402
-from memory import prompts_v1  # noqa: E402
+from memory_garden.prompts import buckets as prompts_v1  # noqa: E402
+from memory_garden.prompts.migrate import build_migrate_prompt  # noqa: E402
 
 
 # --------------------------------------------------------------------------- #

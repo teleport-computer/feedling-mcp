@@ -16,12 +16,12 @@ from core import enclave as core_enclave
 from core import envelope as core_envelope
 from core import util as core_util
 from identity import service as identity_service
-from memory import card_guard
-from memory import card_text
+from memory_garden.text import card_guard
+from memory_garden.text import card_text
 from memory import service as memory_service
-from memory import timestamps as memory_timestamps
-from memory.prompts_v1 import normalize_bucket_language
-from memory.source_policy import (
+from memory_garden import timestamps as memory_timestamps
+from memory_garden.prompts.buckets import normalize_bucket_language
+from memory_garden.types import (
     MAX_MEMORY_SUPERSEDE_TARGETS,
     MEMORY_CAPTURE_MODE_VALUES,
     MEMORY_SOURCE_VALUES,

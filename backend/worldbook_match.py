@@ -1,6 +1,6 @@
 """Deterministic world book matcher. Pure (no nacl/crypto), so it unit-tests
 without the enclave stack — enclave_app.py imports and calls it after decrypt.
-Mirrors the context_memory_selection.py "pure selection module" convention.
+Mirrors the memory_garden.scoring.relevance "pure selection module" convention.
 
 Rules (see docs/superpowers/specs/2026-07-03-worldbook-server-design.md §2B):
   - scan the last N=5 messages (user + assistant);

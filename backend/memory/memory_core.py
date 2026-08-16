@@ -32,7 +32,7 @@ from identity import service as identity_service
 from memory import actions as memory_actions_mod
 from memory import migration as memory_migration
 from memory import service as memory_service
-from memory import timestamps as memory_timestamps
+from memory_garden import timestamps as memory_timestamps
 import memory_readside_core
 
 

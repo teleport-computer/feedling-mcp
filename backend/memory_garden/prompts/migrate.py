@@ -13,9 +13,9 @@
 """
 from __future__ import annotations
 
-from memory import card_guard
-from memory.card_text import extract_json_block, sanitize_card_labels
-from memory.prompts_v1 import COMMON_BUCKETS_GUIDANCE_V1
+from ..text import card_guard
+from ..text.card_text import extract_json_block, sanitize_card_labels
+from .buckets import COMMON_BUCKETS_GUIDANCE_V1
 
 _MIGRATE_PROMPT_TEMPLATE = """你是 {ai_name}——{user_name} 的伴侣。现在是一段安静的时间，没人在和你说话。
 你在把一些**旧格式**的记忆卡整理成新格式。这不是重新理解、不是合并、不是新增——

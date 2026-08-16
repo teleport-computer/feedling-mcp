@@ -10,7 +10,8 @@ import json
 from typing import Any
 
 from identity.user_naming import _naming_rule
-from memory.prompts_v1 import COMMON_BUCKETS_GUIDANCE_V1
+from memory_garden import policies as mg_policies
+from memory_garden.prompts.buckets import COMMON_BUCKETS_GUIDANCE_V1
 
 
 # Hard output contract appended to every JSON-emitting map/reduce prompt. Genesis
@@ -93,15 +94,18 @@ PERSONA_UPDATE_MERGE_SUFFIX = """
 - 保持【连贯】:输出是【一个】一致的 persona,不是旧+新拼接。"""
 
 
-FACT_MAP_PROMPT = """你在看一段「用户 ↔ TA」真实历史的【其中一块】。抽出值得长期留存的【事实】候选:
-关于「用户」和「他们的关系」的 durable 事实。候选阶段,落卡/去重后面做。
+FACT_MAP_PROMPT = """{__OPENING__}
 
 防火墙:用户档案/用户关于自己说的话 = 关于【用户】的事实;绝不当成 TA 的性格。
 如果输入标注 source_kind=user_profile,整段都按用户档案处理:只能抽关于用户的 facts,不能推断 TA 的身份/维度/语气。
-闲聊/临时情绪/玩笑/未确认猜测/一次性事件不抽。
+{__FILTER__}
 
 输出 JSON:{"fact_candidates":[{"about":"user|relationship","summary":"一句话事实","evidence":"出处原话(短)"}]}
-没有就 {"fact_candidates":[]}。"""
+没有就 {"fact_candidates":[]}。""".replace(
+    "{__OPENING__}", mg_policies.HISTORY_IMPORT_OPENING_RUBRIC
+).replace(
+    "{__FILTER__}", mg_policies.HISTORY_IMPORT_FILTER_RUBRIC
+)
 
 
 COMBINED_MAP_PROMPT = """你在看一段「用户 ↔ TA(AI 伴侣)」真实历史的【其中一块】。
@@ -111,7 +115,7 @@ COMBINED_MAP_PROMPT = """你在看一段「用户 ↔ TA(AI 伴侣)」真实历�
 
 事实规则:
 - 用户档案/用户关于自己说的话 = 关于【用户】的事实;绝不当成 TA 的性格。
-- 闲聊/临时情绪/玩笑/未确认猜测/一次性事件不抽。
+- {__FILTER__}
 
 声音规则:
 - 声音 = 不管聊什么都成立的形式:怎么开口/怎么接情绪/句长/标点语气词/惯用动作/绝不做的事。
@@ -122,15 +126,19 @@ grounding:只用这块真实出现的原话。这块太薄/全寒暄 -> 两边�
 输出 JSON:
 {"fact_candidates":[{"about":"user|relationship","summary":"一句话事实","evidence":"出处原话(短)"}],
  "voice_candidates":{"behavior_notes_candidates":["..."],"exemplar_candidates":[{"turns":[{"role":"user","text":"..."},{"role":"ta","text":"..."}],"axis":["opening"],"why":"..."}]}}
-没有就 {"fact_candidates":[],"voice_candidates":{"behavior_notes_candidates":[],"exemplar_candidates":[]}}。"""
+没有就 {"fact_candidates":[],"voice_candidates":{"behavior_notes_candidates":[],"exemplar_candidates":[]}}。""".replace(
+    "{__FILTER__}", mg_policies.HISTORY_IMPORT_FILTER_RUBRIC
+)
 
 
 FACT_WRITE_PROMPT = """你收到从整段历史抽出的事实候选 digest(+ 可能有 AI persona / memory summary / known_memories)。把该长期留存的写进 IO。
 只写候选真实支持的,绝不编。
 去重:known_memories 里是【已经保存过】的记忆。这些事实别再写一遍——哪怕你换了说法、合并了措辞、或拆/并了句子,只要说的是同一件事,就算重复,【跳过】。只写 known_memories 里【没有】的新事实。注意区分:同一件事换个说法=重复(别写);同一类但具体值不同=不同事实(要写,例:「喜欢美式咖啡」和「喜欢拿铁」是两条、「狗叫蛋子」和「养了金毛」是两条)。
-语言:bucket/threads/summary/content 用素材原文的语言——中文素材就用中文(用「宠物」不是「pets」),别归成英文桶/线索;专有名词/原话保留原文。
+{__LANG__}
 
-桶名收敛(onboarding 一次产很多卡,别让桶太分散):""" + COMMON_BUCKETS_GUIDANCE_V1 + """
+桶名收敛(onboarding 一次产很多卡,别让桶太分散):""".replace(
+    "{__LANG__}", mg_policies.language_rule("history_import")
+) + COMMON_BUCKETS_GUIDANCE_V1 + """
 
 防火墙:
 - 用户档案/关于用户的事实 -> 只能进 memory,绝不成为 agent 的性格/维度/身份(agent_name/dimensions/category)。
@@ -221,17 +229,9 @@ def persona_build_messages(
 
 # ── DRAFT(措辞待 Seven 定稿):"尽量收"追加指令,仅长期记忆档案(source_family=memory_summary)
 # 二次上传时启用。见 docs/genesis-distill-panorama.md §9 / Seven 校准第 2 点。行为需真机 e2e。
-FACT_MAP_KEEP_ALL_SUFFIX = """
+FACT_MAP_KEEP_ALL_SUFFIX = "\n\n" + mg_policies.KEEP_ALL_MAP_SUFFIX
 
-★ 本块是用户【手动整理好的长期记忆档案】,不是聊天记录:其中每条陈述基本都是用户特意要长期留存的事实。
-尽量【完整保留】每一条事实候选,不要用"闲聊/一次性/不够 durable"去过滤——除非是空行、标题或明显无意义的重复。宁多勿漏。"""
-
-FACT_WRITE_KEEP_ALL_SUFFIX = """
-
-★ 素材是用户整理好的长期档案:把候选里的事实【尽量都写成卡】,不要为了"少而精"丢弃条目。
-仍然按 known_memories 去重、仍然归好 bucket/threads,但不要因"不够重要"而跳过用户特意整理的条目。
-如果源卡/候选里有 date 或 occurred_at 且是 YYYY-MM-DD,原样填进输出卡的 occurred_at;没有真实日期就留空。
-如果源卡/候选里有 tags,把这些标签播种进 threads;你仍可按语义重新组织/合并,但不要丢掉有用标签。"""
+FACT_WRITE_KEEP_ALL_SUFFIX = "\n\n" + mg_policies.KEEP_ALL_WRITE_SUFFIX
 
 MEMORY_RECHECK_PROMPT = """你在做 VPS resident 记忆蒸馏的【收口二次检查】。
 输入包含:

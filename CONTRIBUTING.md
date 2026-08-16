@@ -142,7 +142,24 @@ asgi_app.py（装配，最高）
   ↑ db / content_encryption / provider_client / dstack_tls / hosted_runtime /
      semantic_analysis / memory_readside_core / memory_index_selector /
      context_memory_selection（最低；均为无业务依赖的共享/底层模块）
+  ↑ memory_garden（最低；记忆判断力内核，**不 import 任何 io 模块**，
+     由 tests/test_memory_garden_purity.py 的 AST 守卫钉死）
+  ↑ core（最低；模型协议层的纯共享判据：思维链剥离、
+     协议残片识别。**与记忆无关** —— 聊天主链路、工具循环、主动唤醒、
+     记忆落卡都在用，所以它不属于任何一个领域。只依赖标准库）
 ```
+
+> `memory_garden` 是被抽出来的纯函数内核（什么值得记 / 怎么归桶 / 打分排序 /
+> 要不要整理 / 解析并算 mutation）。它只依赖标准库，所以天然处在最低层，
+> 被 `memory` / `genesis` / `model_api_runtime` 等上层 import。
+> 加解密、身份装配、锁、审计、调模型一律不在其中 —— 那些由调用方提供。
+>
+> `core` 与它平级、互不依赖。方向是单向的：
+> `memory_garden` → `core`，聊天链路也 → `core`。
+> 第一版曾把这两个模块塞进 `memory_garden`，导致普通聊天反向依赖记忆包，
+> 已在 2026-08-14 拆开。
+>
+> 设计见 `docs/MEMORY_GARDEN_EXTRACTION_DESIGN.zh.md`。
 
 - `routes.py` 可以 import 平级或更低的任何 service；`service.py` 只准向下。
 - **需要「向上」调用时，用注入，不用 import。** 现有范例：
@@ -200,6 +217,17 @@ result = chat_completion(runtime, messages)
 
 - ❌ 不准再造任何全局符号 re-export 门面；新代码直接 import 真正的模块。
 - ❌ 不准新建 `backend/app.py`。
+
+**关于 `memory_garden` 搬迁期的兼容壳**（2026-08-14 已收尾，仅存两个）：
+
+内核提取时，被搬走的模块曾在原路径保留一层 re-export，让调用方不必一次性全改。
+**这些纯转发壳已全部删除**，调用方现在直接 `import memory_garden.*`。
+
+仍保留的两个 —— `memory/capture_prompt_v1.py` 与 `memory/dream_prompt_v1.py` ——
+**不是 re-export 门面，是适配层**：内核不 import `identity`（那是宿主的身份体系），
+所以称呼规则的装配放在这两个文件里，它们有实际逻辑，不只是转发。
+
+新代码一律直接 import `memory_garden.*`。需要称呼装配时走上面这两个适配层。
 
 ---
 

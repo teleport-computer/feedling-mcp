@@ -9,7 +9,7 @@ from typing import Any, Callable
 import httpx
 
 from memory import service as memory_service
-from memory import timestamps as memory_timestamps
+from memory_garden import timestamps as memory_timestamps
 
 
 MEMORY_READSIDE_DEFAULT_HARD_MAX = 1000

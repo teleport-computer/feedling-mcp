@@ -24,7 +24,7 @@ for _k, _v in {
 
 import pytest  # noqa: E402
 
-from memory import dream_gates  # noqa: E402
+from memory_garden.guards import dream_gates  # noqa: E402
 
 
 # ---------------------------------------------------------------------------

@@ -11,7 +11,7 @@ import pytest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "backend"))
 
 from memory import migration  # noqa: E402
-from memory import migrate_prompt_v1 as mp  # noqa: E402
+from memory_garden.prompts import migrate as mp  # noqa: E402
 from proactive import capture_jobs  # noqa: E402
 from proactive import capture_scheduler  # noqa: E402
 

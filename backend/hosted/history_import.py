@@ -22,10 +22,10 @@ from bootstrap import gates as boot_gates
 from core import util as core_util
 from identity import service as identity_service
 from identity.user_naming import _naming_rule, rewrite_user_reference, sanitize_user_name
-from memory import card_guard
-from memory.prompts_v1 import normalize_bucket_language
+from memory_garden.text import card_guard
+from memory_garden.prompts.buckets import normalize_bucket_language
 from memory import service as memory_service
-from memory import timestamps as memory_timestamps
+from memory_garden import timestamps as memory_timestamps
 import provider_client
 from hosted import config_store as hosted_config_store
 from notices import core as notices

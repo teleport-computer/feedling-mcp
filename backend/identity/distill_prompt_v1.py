@@ -15,7 +15,7 @@ import json
 
 from identity import card_policy
 from identity.user_naming import sanitize_user_name
-from memory.card_text import extract_json_block
+from memory_garden.text.card_text import extract_json_block
 
 # consumer 侧"部分补全"读取现有卡时要保留的字段集(Task 3 使用)。
 #
