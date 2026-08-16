@@ -249,3 +249,144 @@ if (forced_delivery_tool and not terminal_text_round and tools is not None
   (两个符号计数为 0)、B3-1(provider 等值判断)、以及三个模型的线上 thinking 数据。
 - **子代理报告、我未逐条复核**:B1-4、B1-5、B2-3,以及各条中的部分 V1 行号。
   实现前请先自行核对 file:line,对不上就回报。
+
+---
+
+# B4 — V1 拦了 V2 没拦的真回归 + 明确会遇到的洞(Seven 2026-08-16 定稿)
+
+全量审计枚举 22 处「指望模型自觉」,Seven 按两条规则筛定:
+**① V1 拦的 V2 也要拦(V2 只会更软);② V1 没拦但重要/遇到过/明确判定会遇到的也要拦。**
+
+**收敛结果:22 条 → 7 条要修。** 其余 15 条的处置与理由见本节末尾,**不要重新翻案**。
+
+## 顺序(有依赖,不要乱序)
+
+B4-1 `#21` → B4-2 `#17` → B4-3 `#15` → B4-4 `#18` → B4-5 `#3` → B4-6 `#5` → B4-7 `#6`
+
+`#21` 必须先做:`#17` 的强制版依赖它。
+
+---
+
+## B4-1 (#21) `tool_choice` 强制只对 openrouter 生效
+
+- **事实(claude2 亲验)**:`tool_loop.py:1191-1200` 的强制分支带
+  `str(getattr(provider_config,"provider","")).strip().lower() == "openrouter"`。
+  其他 provider 上工具面收窄只是**建议性**的,模型照样能返回纯文本 →
+  掉进 `required_file_missing`(:1663-1690),用户拿到散文而非承诺的文件。
+- **影响面(prod 实测)**:23 个 V2 用户里 openrouter 只有 **2** 个;
+  `openai_compatible` 15、`deepseek` 5、`gemini` 1 —— **21/23 空转**。
+- **修法**:换成按「该 provider 的 wire 支不支持具名函数强制」分派。
+  紧邻的 `tool_choice="none"`(:1186-1187)已经演示了按能力分派的写法,照抄形状。
+- **验收**:每个受支持 provider 各一条用例断言 `tool_choice` 真的进了 provider_kwargs;
+  不支持的 provider 断言**不进**(别把不支持的打挂)。
+
+## B4-2 (#17) 沉默不是一等表达
+
+- **V1 怎么做的(已查实)**:`chat_resident_consumer.py:12708-12719` 的
+  `_reply_protocol_block()` 给两个**并列出口**:
+
+      - speak:      {"messages":["..."]}
+      - stay quiet: {"actions":[{"type":"proactive.sleep","reason":"..."}]}
+
+  沉默是**有名字、带理由的动作**;`:14742-14756` 落库为
+  `status=completed, wake_result=sleep`,理由进 admin 行。
+- **V2 现状**:沉默 = 输出一个完整 `<think>` 块、后面什么都不写
+  (`worker.py:975 _THINKING_ONLY_NO_REPLY_REASON`, `:7763`)。
+  **而这个形状在 V1 里恰恰被记为 `failed / empty_agent_reply`** —— 两个运行时
+  对「它选择了不说话」的定义是**相反的**。
+- **后果**:弱模型写不出 `<think>` → **沉默物理上不可达** → 每次唤醒必说话。
+  这正是 Seven 反复反馈的「V2 主动唤醒乱说话」。
+- **修法**:唤醒道工具面加 **`stay_silent(reason)`**。
+  说话=调 reply/出文本;沉默=调 `stay_silent` 带理由。两者**都机器可判**,不解析自由文本。
+  弱模型调工具远比精确吐 `<think>` 标签可靠。
+  落库对齐 V1:`completed` + `wake_result=sleep` + 保留 reason(V2 目前完全没有理由字段)。
+- ⚠️ **不要删除现有的 thinking-only 沉默路径** —— 那是既有行为,新增出口不等于移除旧出口。
+- **强制版(依赖 B4-1)**:唤醒轮 `tool_choice` 限定 `{reply, stay_silent}` 二选一。
+  B4-1 未落地前先只做「提供工具 + 落库」。
+- **验收**:弱模型 live E2E —— 高「24h 已主动次数」情境下能走 `stay_silent` 并留下理由;
+  admin 能看到该理由。
+
+## B4-3 (#15) 回复写入没有 CAS(消息重复)
+
+- **V1(已查实)**:`backend/core/store.py:980 chat_finalize_reply_once` 是数据库 CAS;
+  `chat/service.py:622 chat_try_claim_reply`;重复认领返回
+  `chat_core.py:1214 {"error":"already_answered"} 409`。
+- **V2(claude2 亲验)**:`v2/serve_worker.py:3361` **直接调 `store._build_chat_message`**,
+  绕过 `chat_finalize_reply_once`,`reply_to_message_id` 只是个普通字段,**无 CAS、无 409**。
+  `v2/jobs_store.py:4029 turn_answered_by_real_reply` 存在但只是只读遥测,不是写闸。
+- **这就是 Seven 反复报的「消息重复」一族的结构性来源。**
+- **修法**:V2 回复写入走**同一条** CAS 终结路径。⚠️ 共享实现,禁止另写一份。
+- **验收**:并发两次终结同一 turn → 第二次必须被拒;突变(拆掉 CAS)必须有用例变红。
+
+## B4-4 (#18) V2 被显式豁免卡死回收(定时提醒丢失)
+
+- **事实(claude2 亲验)**:`backend/proactive/poll_core.py:35`
+  `_HOSTED_CONSUMER_IDS = frozenset({"hosted_runtime","hosted_runtime_v2"})`,
+  `:63` `if consumer_id in _HOSTED_CONSUMER_IDS: continue` ——
+  **V2 卡在 claimed/realizing 的任务永远不会被回收重投**。
+  V1 有 `reclaim_stale_resident_jobs`(600s 租约)把它退回 pending。
+- 叠加 `scheduled_wake_v2.py:1152-1166` 在**入队时**就 `mark_fired`,
+  于是一个卡住的提醒**永久丢失**且不重试。
+- **修法**:给 V2 一条等价回收路径。⚠️ 注意 V2 有自己的租约/世代栅栏,
+  不要照搬 resident 的 600s 常量 —— **先读 V2 的租约语义再定**,对不上就回报。
+- **验收**:构造一个卡在 realizing 的 V2 job,断言超过租约后回到 pending 并被重投。
+
+## B4-5 (#3) 思考气泡缺内部**字段名**黑名单
+
+- **V1(已查实)**:`chat_resident_consumer.py:4456-4468` 的 denylist
+  (`session_id`/`uuid`/`input_tokens`/`cache_read`/`permission_denials`/
+  `terminal_reason`/`modelUsage`/`costUSD`),在 `:4853` 逐行丢弃。
+- **V2**:B2-1 已补**工具名**(从 `build_tool_specs` 派生),但**没有这份字段名黑名单**;
+  `worker.py:5286-5294 _sanitize_reasoning` 的 docstring 明写
+  "Only length-caps and trims; renders reasoning as-provided"。
+- **两份是互补的**:V1 拦字段名不拦工具名,V2 现在拦工具名不拦字段名。
+- **修法**:V2 补上等价字段名判据。⚠️ 与 V1 **共享一份**,别两处各写。
+- **验收**:突变(移除判据)必须红;且**接线**与**机制**分别有用例
+  (B2-1 上一轮就是机制有测、两个接线点都能删掉而全绿)。
+
+## B4-6 (#5) 编造记忆 —— 注入事实,不是加闸
+
+- **现状**:`v2/context.py:238-241` 四十个中文字的提示词,作用于**每一轮前台对话**,
+  **无任何代码检查**。V1 同样只有提示词(`agent_runtime/agent_tools_prompt.md:105-120`),
+  所以这不是回归,是两代都欠的债 —— Seven 按规则②纳入。
+- **关键**:**不要做出口内容判定**(会撞上「出口只拦明显不对、永不判内容」的定论)。
+  正解是**给事实**:dispatcher 本来就知道这一轮 `memory_search`/`memory_fetch`
+  返回了几条。返回 0 条时,把「已检索、无命中」作为**确定性事实**注入
+  `runtime_control`(`context.py:134-140` 声明该块为权威),而不是求模型自己承认。
+  与 B1 给心跳灌真实事实是同一招。
+- **验收**:弱模型 + 花园里没有相关卡 → 回复不出现编造的回忆;
+  且**零次模型主动工具调用**时该事实依然在场。
+
+## B4-7 (#6) 声称改了却没调工具
+
+- **现状**:`capabilities/tool_schema.py:461-464` 提示词「Do not merely say the change
+  is done」,两代都无检测器。用户看到「好的,以后叫你999」→ 身份卡没动,下轮打回原形。
+- **修法**:抄现成的 `_claims_image_delivered`(`v2/tool_loop.py:229`,弹一次回炉
+  `:1601-1620`)。检测「终局文本声称改名/改身份完成」且本轮 `historical_tool_names`
+  里没有身份写动作 → 注入一次纠正后重来。
+- ⚠️ **只弹一次,只拦不改写**;弹完仍不调就照常发,不要把回复吞掉。
+- **验收**:突变(拆检测器)必须红;并断言**不误伤**——正常闲聊不触发回炉。
+
+---
+
+## 明确不修的 15 条(定稿,不要翻案)
+
+| 处置 | 条目 | 理由 |
+|---|---|---|
+| 已修(本轮 B1/B2) | #1 卡面校验、#2 思考语言、#22 threads 边界 | #2 V2 现已**强于** V1 |
+| 改无可改 | #7 文件/图片声称、#8 屏幕陈旧、#16 屏幕 live、#19 capture JSON | V1/V2 **字面同一份实现** |
+| V2 已更强 | #11 历史缺口、#13 花园卡片指令、#14 压缩摘要 | V1 根本没有这些防护/功能 |
+| 提示词足够 | #9 提到唤醒、#10 叙述看屏幕 | 根因(user 角色 nudge)已在 B1 结构性移除;出口按内容拦会撞上「永不判内容」定论 |
+| **Seven 定:不修** | #20 capture 产出下限 | **和 V1 一样,没有下限,不写卡也行** |
+| **Seven 定:不修** | #4 capture 卡带「用户」 | 提示词已是最强措辞;确定性改写器**实测会改坏真实内容**(「月活用户在下降」→「月活小雨在下降」);真因(转写标签未透传姓名)已修;残留指标只落 trajectory(48h 环、需 runner 本地工具)**fleet 级不可读**;且该计数**本就不等于泄漏**(本人正当谈论产品用户也会计上) |
+| 延后 | #12 外部文字当指令 | 执行闸,B1-3a 已做一部分 |
+
+## 通用约束(沿用,已被证明有效)
+
+- **接线与机制分别可突变打红** —— 两者是**两个不同的洞**。
+- 断言**全集**不是子集;常量/集合**从模块读取**,测试不得写死。
+- **只拦不改写**;共享实现,禁止两处各写。
+- **改过的文件跑它自己的测试**再报数;确认看到 `N passed`
+  (本机 zsh 不做词分割,文件列表塞进变量会静默收集 0 个用例)。
+- 不接受 seeded 绿,验收用最弱档真实模型。
+- 前提不成立**停下回报,不要顺手改设计**。
