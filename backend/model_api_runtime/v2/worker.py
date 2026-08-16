@@ -1860,23 +1860,46 @@ def _mcp_turn_usage_detail(
     }
 
 
-def _provider_tool_surface_callback(
-    deps: TurnDeps,
-    user_id: str,
-    lane: str,
-):
-    """Build a best-effort plaintext-count trace sink for one runtime lane."""
+@dataclass
+class _ProviderRoundtripTrace:
+    """Collect one turn's content-free provider-round budget evidence."""
 
-    if deps.emit_debug_trace is None:
-        return None
+    deps: TurnDeps
+    user_id: str
+    lane: str
+    provider_roundtrips: int = 0
+    terminal_text_round_reached: bool = False
+    terminal_text_round_reason: str = "none"
+    force_text_fallback_reason: str = "none"
+    empty_response_recovery_used: bool = False
 
-    async def _emit(detail: dict[str, Any]) -> None:
-        trace_detail = {"lane": lane, **dict(detail)}
-        if lane != "chat":
-            trace_detail["wake_kind"] = lane
+    async def __call__(self, detail: dict[str, Any]) -> None:
+        try:
+            self.provider_roundtrips = max(
+                self.provider_roundtrips,
+                int(detail.get("round") or 0),
+            )
+        except (TypeError, ValueError, OverflowError):
+            pass
+        if detail.get("terminal_text_round") is True:
+            self.terminal_text_round_reached = True
+            self.terminal_text_round_reason = str(
+                detail.get("terminal_text_round_reason") or "none"
+            )
+        fallback_reason = str(
+            detail.get("force_text_fallback_reason") or "none"
+        )
+        if fallback_reason != "none":
+            self.force_text_fallback_reason = fallback_reason
+        if detail.get("empty_response_recovery") is True:
+            self.empty_response_recovery_used = True
+
+        trace_detail = {"lane": self.lane, **dict(detail)}
+        if self.lane != "chat":
+            trace_detail["wake_kind"] = self.lane
         await asyncio.to_thread(
-            deps.emit_debug_trace,
-            user_id,
+            self.deps.emit_debug_trace,
+            self.user_id,
             "mcp.surface.provider",
             status=(
                 "warning"
@@ -1894,7 +1917,56 @@ def _provider_tool_surface_callback(
             detail=trace_detail,
         )
 
-    return _emit
+    async def emit_summary(self) -> None:
+        detail = {
+            "lane": self.lane,
+            "provider_roundtrips": self.provider_roundtrips,
+            "roundtrip_lens": "tool_loop_provider_round_excludes_transport_retries",
+            "terminal_text_round_reached": self.terminal_text_round_reached,
+            "terminal_text_round_reason": self.terminal_text_round_reason,
+            "force_text_fallback_reason": self.force_text_fallback_reason,
+            "empty_response_recovery_used": self.empty_response_recovery_used,
+        }
+        if self.lane != "chat":
+            detail["wake_kind"] = self.lane
+        try:
+            await asyncio.to_thread(
+                self.deps.emit_debug_trace,
+                self.user_id,
+                "mcp.roundtrip.provider",
+                status=(
+                    "warning"
+                    if self.terminal_text_round_reason == "max_calls"
+                    else "ok"
+                ),
+                summary=(
+                    f"Provider 本轮往返 {self.provider_roundtrips} 次,"
+                    f"收口原因 {self.terminal_text_round_reason}"
+                ),
+                explain=(
+                    "计数口径是会消耗工具循环 max_calls 的 provider 轮次;"
+                    "不含 transport 内部重试,不记录 prompt、回复、工具参数或结果。"
+                ),
+                detail=detail,
+            )
+        except Exception as exc:  # noqa: BLE001 -- telemetry is best-effort
+            log.warning(
+                "[v2.mcp] provider roundtrip trace failed user=%s code=%s",
+                self.user_id,
+                type(exc).__name__.lower(),
+            )
+
+
+def _provider_tool_surface_callback(
+    deps: TurnDeps,
+    user_id: str,
+    lane: str,
+):
+    """Build a best-effort content-free trace sink for one runtime lane."""
+
+    if deps.emit_debug_trace is None:
+        return None
+    return _ProviderRoundtripTrace(deps, user_id, lane)
 
 
 def _empty_provider_response_debug_callback(
@@ -6979,6 +7051,11 @@ async def _run_wake(
     shadow_decision_allowed: bool | None = None
     stay_silent_reason: str | None = None
     language_user_rows: list[dict] = []
+    provider_roundtrip_trace = _provider_tool_surface_callback(
+        deps,
+        user_id,
+        lane,
+    )
     try:
         store = core_store.get_store(user_id)
         seq_native = deps.read_messages_after_seq is not None
@@ -8624,11 +8701,7 @@ async def _run_wake(
                     user_id,
                     exc,
                 ),
-                on_provider_tool_surface=_provider_tool_surface_callback(
-                    deps,
-                    user_id,
-                    lane,
-                ),
+                on_provider_tool_surface=provider_roundtrip_trace,
                 on_empty_provider_response=(
                     _empty_provider_response_debug_callback(deps, user_id, lane)
                 ),
@@ -8814,6 +8887,8 @@ async def _run_wake(
             tm.flush(failed=True, status=code)
         return "failed"
     finally:
+        if provider_roundtrip_trace is not None:
+            await provider_roundtrip_trace.emit_summary()
         decided_at = time.time()
         apns_alert_sent = False
         if push_slot is not None and deps.send_reply_push is not None:
@@ -10562,6 +10637,11 @@ async def process_job(
     mcp_offered_names: tuple[str, ...] = ()
     mcp_called_names: list[str] = []
     mcp_turn_outcome = "failed"
+    provider_roundtrip_trace = (
+        _provider_tool_surface_callback(deps, user_id, lane)
+        if lane == "chat"
+        else None
+    )
 
     try:
         if not claimed_by or not await asyncio.to_thread(
@@ -12927,11 +13007,7 @@ async def process_job(
                 user_id,
                 exc,
             ),
-            on_provider_tool_surface=_provider_tool_surface_callback(
-                deps,
-                user_id,
-                lane,
-            ),
+            on_provider_tool_surface=provider_roundtrip_trace,
             on_empty_provider_response=(
                 _empty_provider_response_debug_callback(deps, user_id, lane)
             ),
@@ -13350,6 +13426,8 @@ async def process_job(
         if lease_keepalive_task is not None:
             lease_keepalive_task.cancel()
             await asyncio.gather(lease_keepalive_task, return_exceptions=True)
+        if provider_roundtrip_trace is not None:
+            await provider_roundtrip_trace.emit_summary()
         if mcp_offered_names and deps.emit_debug_trace is not None:
             detail = _mcp_turn_usage_detail(mcp_offered_names, mcp_called_names)
             try:

@@ -2660,6 +2660,19 @@ def test_wake_provider_tool_surface_trace_carries_wake_kind(monkeypatch):
     assert surface["detail"]["lane"] == "scheduled"
     assert surface["detail"]["wake_kind"] == "scheduled"
     assert surface["detail"]["sent_tool_count"] > 0
+    roundtrip = next(
+        trace for trace in traces if trace["type"] == "mcp.roundtrip.provider"
+    )
+    assert roundtrip["detail"] == {
+        "lane": "scheduled",
+        "provider_roundtrips": 1,
+        "roundtrip_lens": "tool_loop_provider_round_excludes_transport_retries",
+        "terminal_text_round_reached": False,
+        "terminal_text_round_reason": "none",
+        "force_text_fallback_reason": "none",
+        "empty_response_recovery_used": False,
+        "wake_kind": "scheduled",
+    }
 
 
 def test_scheduled_wake_empty_reply_fails_instead_of_completing_silently(monkeypatch):

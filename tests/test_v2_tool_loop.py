@@ -601,9 +601,13 @@ def test_foreground_semantic_empty_response_gets_one_correction(monkeypatch):
     ])
     monkeypatch.setattr(provider_client, "chat_completion_async", provider)
     published = []
+    surfaces = []
 
     async def publish(text, *, final, reasoning=""):
         published.append((text, final, reasoning))
+
+    async def record_surface(detail):
+        surfaces.append(detail)
 
     outcome = asyncio.run(tool_loop.run_tool_loop(
         provider_config=_TEST_PROVIDER_CONFIG,
@@ -613,6 +617,7 @@ def test_foreground_semantic_empty_response_gets_one_correction(monkeypatch):
         fold_new_messages=_RecordingFold([]),
         add_usage=_noop_add_usage,
         max_calls=5,
+        on_provider_tool_surface=record_surface,
     ))
 
     assert outcome.final_text == "recovered"
@@ -621,6 +626,13 @@ def test_foreground_semantic_empty_response_gets_one_correction(monkeypatch):
     correction = provider.calls[1]["messages"][0]
     assert correction["role"] == "system"
     assert "Do not return a thinking-only response" in correction["content"]
+    assert [item["empty_response_recovery"] for item in surfaces] == [
+        False,
+        True,
+    ]
+    assert all(
+        item["force_text_fallback_reason"] == "none" for item in surfaces
+    )
 
 
 def test_serialized_upstream_response_envelope_gets_one_correction(monkeypatch):
@@ -2494,6 +2506,9 @@ def test_tool_schema_rejection_gets_exactly_one_tools_disabled_fallback(monkeypa
     assert surfaces[0]["sent_tool_count"] > 0
     assert surfaces[1]["sent_tool_count"] == 0
     assert surfaces[1]["dropped_tool_count"] == surfaces[1]["candidate_tool_count"]
+    assert surfaces[1]["terminal_text_round"] is True
+    assert surfaces[1]["terminal_text_round_reason"] == "force_text_fallback"
+    assert surfaces[1]["force_text_fallback_reason"] == "tool_schema_rejected"
 
 
 def test_provider_surface_marks_reserved_terminal_text_round(monkeypatch):
@@ -2521,6 +2536,9 @@ def test_provider_surface_marks_reserved_terminal_text_round(monkeypatch):
     assert surfaces[0]["reason"] == "terminal_text_round"
     assert surfaces[0]["sent_tool_count"] == 0
     assert surfaces[0]["dropped_tool_count"] == surfaces[0]["candidate_tool_count"]
+    assert surfaces[0]["terminal_text_round"] is True
+    assert surfaces[0]["terminal_text_round_reason"] == "max_calls"
+    assert surfaces[0]["force_text_fallback_reason"] == "none"
 
 
 def test_provider_call_exception_still_counts_a_model_call(monkeypatch):
