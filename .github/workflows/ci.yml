@@ -218,6 +218,8 @@ jobs:
           PYTHONPATH: backend
         run: |
           python -m pytest \
+            tests/test_memory_garden_card_fields.py \
+            tests/test_route_b_card_shape_recall.py \
             tests/test_route_b_sensitive_gate.py \
             tests/test_memory_garden_purity.py \
             tests/test_memory_garden_policies.py \
