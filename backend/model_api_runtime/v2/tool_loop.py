@@ -73,7 +73,7 @@ _FILE_DELIVERY_TOOLS = frozenset(
 # These wires accept the OpenAI-style named-function ``tool_choice`` payload.
 # Other providers may expose tools but do not accept this exact forcing shape.
 _NAMED_TOOL_CHOICE_PROVIDERS = frozenset(
-    {"openai", "openrouter", "openai_compatible", "deepseek"}
+    {"openai", "openrouter", "openai_compatible", "deepseek", "anthropic", "gemini", "bedrock"}
 )
 _EMPTY_RESPONSE_CORRECTION = (
     "The previous response completed without visible text or a client tool call. "

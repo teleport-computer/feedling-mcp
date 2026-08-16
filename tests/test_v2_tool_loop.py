@@ -1850,8 +1850,9 @@ def test_same_batch_memory_search_reuses_same_query(monkeypatch):
         ("openrouter", True),
         ("openai_compatible", True),
         ("deepseek", True),
-        ("anthropic", False),
-        ("gemini", False),
+        ("anthropic", True),
+        ("gemini", True),
+        ("bedrock", True),
     ],
 )
 def test_file_recovery_tool_choice_dispatches_by_provider_capability(
