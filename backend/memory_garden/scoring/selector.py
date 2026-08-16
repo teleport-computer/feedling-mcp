@@ -132,6 +132,10 @@ def index_item_to_relevance_memory(item: dict) -> dict:
         # Do not synthesize her_quote from index. The index should remain a
         # no-raw-quote surface.
         "her_quote": "",
+        # 私有搜索语料走 canonical 的 content 位 —— 于是 card_fields.text_for_match
+        # 会把它追加进 haystack，正文里的关键词才搜得到（本批要修的核心）。
+        # 这个 dict 只在 enclave 内用于打分，用完即弃，不会被序列化。
+        "content": _text(item.get("_search_content"), 5000),
         "occurred_at": _text(item.get("occurred_at"), 80),
         "created_at": _text(item.get("created_at"), 80),
         "type": "memory_index_item",
@@ -162,6 +166,10 @@ def _topic_match(query: str, item: dict) -> bool:
     query_text = str(query or "").lower()
     haystack = " ".join([
         str(item.get("summary") or "").lower(),
+        # 私有搜索语料：正文只在 enclave 内参与匹配，序列化前由出口剥掉。
+        # 这道关口和下面的词法打分**必须同时**认它 —— 只接一处的话，
+        # 卡会分别卡在 no_index_topic_match 或 no_query_overlap 上（codex 2026-08-16）。
+        str(item.get("_search_content") or "").lower(),
         " ".join(str(bucket or "").lower() for bucket in (item.get("bucket_refs") or [])),
         str(item.get("bucket") or "").lower(),
         " ".join(str(thread or "").lower() for thread in (item.get("threads") or [])),

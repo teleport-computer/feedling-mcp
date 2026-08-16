@@ -22,10 +22,14 @@ from __future__ import annotations
 
 import re
 
+from .. import card_fields
+
 from .. import timestamps as memory_timestamps
 
 
-_MEMORY_TEXT_FIELDS = ("title", "description", "her_quote", "context", "linked_dimension")
+#: 字段知识已收进 card_fields —— 别在这里改「正文在哪个字段」。
+#: 保留这个名字只为不打断既有引用；真正的规则见 card_fields.DEFAULT_FIELD_MAP。
+_MEMORY_TEXT_FIELDS = card_fields.DEFAULT_FIELD_MAP.legacy_match_fields
 
 
 def char_bigrams(s: str) -> set:
@@ -75,7 +79,8 @@ _ZH_GENERIC_PHRASES = {
 
 
 def _text_for_memory(memory: dict) -> str:
-    return " ".join(str(memory.get(key) or "") for key in _MEMORY_TEXT_FIELDS)
+    """匹配用的 haystack。规则（含空格）由 card_fields 定，见那里的「硬约束 2」。"""
+    return card_fields.text_for_match(memory)
 
 
 def _norm_compact(text: str) -> str:
