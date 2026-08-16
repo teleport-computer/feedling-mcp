@@ -132,9 +132,12 @@ from memory.capture_prompt_v1 import (
 from identity.user_naming import transcript_speaker_label
 from memory_garden.text.card_text import (
     build_truncation_retry_prompt,
+    card_text_rejection,
     count_user_token_residuals,
     is_retryable_parse_error,
+    sanitize_card_labels,
 )
+from memory_garden.text import card_guard
 from memory_garden.guards import dream_gates as memory_dream_gates
 from memory.dream_prompt_v1 import (
     build_dream_prompt,
@@ -4798,6 +4801,24 @@ def _memory_tool_actions(raw_actions) -> list[dict]:
         )
         if threads_raw is not None:
             inner["threads"] = list(threads_raw)
+        guard_on = card_guard.guard_enabled()
+        rejection = card_text_rejection(
+            summary=summary,
+            content=content or summary,
+            guard=guard_on,
+        )
+        if rejection:
+            raise ValueError(f"memory_card_rejected:{rejection}")
+        bucket, clean_threads, _label_reasons = sanitize_card_labels(
+            bucket=str(inner.get("bucket") or ""),
+            threads=list(inner.get("threads") or []),
+            guard=guard_on,
+            lang_text=f"{summary}\n{content}",
+        )
+        if bucket:
+            inner["bucket"] = bucket
+        if threads_raw is not None:
+            inner["threads"] = clean_threads
         # 评分同理:同样要区分「没传」(继承旧卡)和「传了」。⚠️ 不能用 `or`——
         # importance=0 / pulse=0 是合法取值,`or` 会把它们吞成没传。
         for score in ("importance", "pulse"):
