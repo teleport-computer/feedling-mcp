@@ -1,4 +1,4 @@
-"""Encrypted storage contract for the Runtime V2 MEMORY/USER profile.
+"""Encrypted storage contract for the Runtime V2 MEMORY/STYLE profile.
 
 ``user_blobs.doc`` is ordinary JSONB.  Only bounded metadata may live outside
 the two shared envelopes; profile plaintext must be sealed before this module
@@ -39,7 +39,7 @@ class ProfileStorageError(RuntimeError):
 class ProfilePromptSelection:
     summary: str
     memory: str = ""
-    user: str = ""
+    style: str = ""
     used_profile: bool = False
     fallback_reason: str = ""
 
@@ -184,12 +184,22 @@ def validate_profile_document(value: Any) -> dict:
         "disabled": disabled,
     }
     memory = value.get("memory")
-    user = value.get("user")
-    if (memory is None) != (user is None):
+    style = value.get("style")
+    legacy_user = value.get("user")
+    if style is not None and legacy_user is not None:
+        raise ProfileStorageError("profile_style_alias_conflict")
+    # TODO(profile-style-migration): remove the legacy USER read fallback after
+    # every stored profile has completed one successful MEMORY/STYLE redistill.
+    style_key = "style" if style is not None else "user"
+    style_value = style if style is not None else legacy_user
+    if (memory is None) != (style_value is None):
         raise ProfileStorageError("profile_fields_torn")
     if memory is not None:
         normalized["memory"] = _validate_encrypted_field(memory, "memory")
-        normalized["user"] = _validate_encrypted_field(user, "user")
+        normalized[style_key] = _validate_encrypted_field(
+            style_value,
+            style_key,
+        )
     if state == "ok" and memory is None:
         raise ProfileStorageError("profile_ok_fields_missing")
     return normalized
@@ -213,7 +223,7 @@ def build_profile_document(
     source: dict,
     last_attempt: dict,
     memory_text: str | None = None,
-    user_text: str | None = None,
+    style_text: str | None = None,
     previous: dict | None = None,
     disabled: bool = False,
     seal_text: Callable[[str, str], dict] = _seal_text,
@@ -224,7 +234,7 @@ def build_profile_document(
     the previous winning envelopes.  Supplying only one field is always a torn
     write and fails before any CAS.
     """
-    if (memory_text is None) != (user_text is None):
+    if (memory_text is None) != (style_text is None):
         raise ProfileStorageError("profile_fields_torn")
     document: dict[str, Any] = {
         "v": PROFILE_VERSION,
@@ -233,23 +243,30 @@ def build_profile_document(
         "last_attempt": deepcopy(last_attempt),
         "disabled": bool(disabled),
     }
-    if memory_text is not None and user_text is not None:
-        if not memory_text.strip() or not user_text.strip():
+    if memory_text is not None and style_text is not None:
+        if not memory_text.strip() or not style_text.strip():
             raise ProfileStorageError("profile_field_empty")
         document["memory"] = {
             "envelope": seal_text(str(user_id), memory_text),
             "chars": len(memory_text),
         }
-        document["user"] = {
-            "envelope": seal_text(str(user_id), user_text),
-            "chars": len(user_text),
+        document["style"] = {
+            "envelope": seal_text(str(user_id), style_text),
+            "chars": len(style_text),
         }
     elif isinstance(previous, dict):
-        if previous.get("memory") is not None or previous.get("user") is not None:
+        if (
+            previous.get("memory") is not None
+            or previous.get("style") is not None
+            or previous.get("user") is not None
+        ):
             prior = validate_profile_document(previous)
             if prior.get("memory") is not None:
                 document["memory"] = prior["memory"]
-                document["user"] = prior["user"]
+                if prior.get("style") is not None:
+                    document["style"] = prior["style"]
+                else:
+                    document["user"] = prior["user"]
     return validate_profile_document(document)
 
 
@@ -446,11 +463,18 @@ def select_profile_for_turn(
         memory = decrypt_envelope(document["memory"]["envelope"], "memory").decode(
             "utf-8"
         )
-        user = decrypt_envelope(document["user"]["envelope"], "user").decode("utf-8")
+        # TODO(profile-style-migration): delete the USER fallback after the
+        # fleet has naturally rewritten every profile through distillation.
+        style_key = "style" if document.get("style") is not None else "user"
+        style_field = document[style_key]
+        style = decrypt_envelope(
+            style_field["envelope"],
+            style_key,
+        ).decode("utf-8")
         if len(memory) != document["memory"]["chars"]:
             raise ProfileStorageError("memory_chars_mismatch")
-        if len(user) != document["user"]["chars"]:
-            raise ProfileStorageError("user_chars_mismatch")
+        if len(style) != style_field["chars"]:
+            raise ProfileStorageError(f"{style_key}_chars_mismatch")
     except Exception as exc:
         reason = f"decrypt_failed:{type(exc).__name__.lower()}"
         _record_turn_fallback(reason)
@@ -460,6 +484,6 @@ def select_profile_for_turn(
     return ProfilePromptSelection(
         summary="",
         memory=memory,
-        user=user,
+        style=style,
         used_profile=True,
     )

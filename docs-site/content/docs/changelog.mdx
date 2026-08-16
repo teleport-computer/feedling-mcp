@@ -10,12 +10,99 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **Hosted Runtime V2 Chat now makes one bounded attempt to correct a reply
+  written in a different dominant writing system from the person's latest
+  substantive message.** The retry changes only the reply language and never
+  repeats tools. If the rewrite fails, is empty, remains mismatched, or cannot
+  be classified confidently, Chat delivers the original usable reply. Proactive
+  wake and background lanes are unchanged.
+
+- **Hosted Runtime V2 now makes prompt boundaries and tool timing more
+  explicit.** Runtime-control authority remains in the stable system policy
+  while conditional recovery rules remain runtime data. Perception and screen
+  tools now carry consistent relevance gates, progress bubbles are explicitly
+  separate from the final reply, identity-dimension edits point to their owned
+  tool, and file-format preservation lives with `send_file`. Screen-share
+  fallback and proactive-attention wording are also conditioned on the state
+  actually present in the turn.
+
+- **Hosted Runtime V2 refreshes an active memory profile after three days by
+  default instead of seven.** Refresh still requires Memory Garden source
+  changes, and deployments can continue to override the interval with
+  `FEEDLING_V2_PROFILE_MAX_AGE_SEC`.
+
+- **Companion prompts no longer use the internal `TA` placeholder to refer to
+  the person.** Hosted Runtime V2, Memory Garden capture and Dream, and voice
+  transcript guidance now describe the relationship as “你们” or refer to the
+  person directly. Uses where `TA` names the AI companion or explicitly warns
+  against leaking the placeholder remain unchanged; memory selection,
+  retention, and reply behavior are otherwise unchanged.
+
+- **Hosted Runtime V2 now keeps tool-selection timing beside each provider-visible
+  tool schema.** Memory, web, perception, screen, file-delivery, reminder, and
+  identity call conditions moved out of the general system prompt and into the
+  corresponding tool descriptions without changing their selection rules. The
+  stable system prompt now carries companion behavior independently of which
+  tools are offered on a turn.
+
+- **Hosted Runtime V2 now separates platform behavior from protocol and user
+  content by language.** Companion-speaking and response-behavior guidance is
+  written in Chinese, machine labels and tool-timing protocol remain in
+  English, and memory, STYLE, persona, World Book, and conversation content stay
+  verbatim. A new positive memory rule asks the companion to search before
+  answering about a specific past event or person when its current summary has
+  no answer, while greetings, casual chat, and already-answered context remain
+  search-free.
+
+- **Runtime V2 profile storage now calls interaction style `STYLE`.** New
+  distillation writes `MEMORY` for facts and `STYLE` for communication and
+  relationship style without changing their existing boundary or prompt
+  heading. Existing encrypted `USER` fields remain readable until the next
+  successful profile distillation migrates them naturally. Admin diagnostics
+  temporarily return both `style_chars` and the compatible `user_chars` alias.
+  Automatic working-memory prompt injection has also been removed; the
+  encrypted workspace and explicit workspace tools remain available.
+
+- **Identity dimensions can now be rewritten independently in Runtime V2.**
+  Foreground Chat can use `identity_dimensions_set` to replace the complete
+  dimensions list—including each dimension's name, numeric value, and optional
+  description—without changing profile text fields. This supports renaming,
+  adding, and deleting dimensions as well as assigning any valid value. The
+  corresponding `identity.dimensions_set` action on
+  `POST /v1/identity/actions` reuses the existing 12-item, unique-name, and
+  0–100 value rules and requires a reason. The reason and tool source are kept
+  inside the encrypted card; admin diagnostics receive only change/add/delete
+  counts and a label-set-changed flag, never labels or reason text.
+  `identity_nudge` remains available—with its existing ±10 limit—for small
+  model-initiated relative score adjustments, while `identity_dimensions_set`
+  has no delta limit because it represents an explicit user request.
+  Proactive/background turns cannot use any identity write path.
+- **Hosted Chat no longer rejects user messages merely because the live worker
+  pool is overloaded.** `POST /v1/model_api/chat/send` now persists the encrypted
+  user row and queues or coalesces its Chat Job atomically, returning the usual
+  asynchronous `202` response while retaining the queue estimate as operational
+  telemetry. Runtime-control, worker-liveness, kill-switch, and provider setup
+  failures remain fail-closed before persistence.
+
+- **Memory Garden timestamps now compare and write consistently.** Reads parse
+  historical `Z`, offset, naive datetime, microsecond, and date-only values as
+  instants instead of ordering their strings; malformed values sort last. New
+  card datetime metadata is written in UTC with a `Z` suffix while date-only
+  and intentionally empty event dates retain their precision. Existing cards
+  are not backfilled when they are updated.
+
 - **Optional Runtime V2 proactive wakes now describe silence unambiguously.**
   Heartbeat, manual-wake, and screen-watch turns tell the model that choosing
   silence means returning only its private thinking block, which is discarded
   without creating a chat item, thinking UI, or notification. Choosing to speak
   still produces the ordinary visible reply, while scheduled reminders retain
   their required-delivery contract.
+
+- **Accepted memory adds always create a new card.** `memory.add` no longer
+  decrypts the incoming or existing cards to search for normalized exact
+  duplicates. Repeating an add with the same title and content therefore
+  creates another memory ID and emits another write effect; callers must not
+  treat `POST /v1/memory/actions` as idempotent.
 
 - **Runtime V2 background wake turns cannot delete memory cards.** Heartbeat,
   scheduled, manual-wake, and screen-watch turns retain memory add and update
@@ -58,6 +145,21 @@ change must not be interpreted as an API guarantee.
   survives worker crashes and lease expiry, does not attach itself to an older
   user message, and does not advance that message's reply cursor. Heartbeat,
   manual-wake, and screen-watch silence remains unchanged.
+
+- **Multi-card memory consolidation no longer leaves a silently unretired
+  suffix.** Hosted Runtime V2 can supply up to 20 source IDs when writing one
+  consolidated successor. Oversized `memory.supersede` requests now fail with
+  `too_many_supersedes` before changing any card instead of silently applying
+  only the first 20. A merge also fails atomically if any source card is already
+  unavailable or changes before commit, so a stale request cannot append a
+  second active successor. Successful receipts list only IDs actually retired.
+
+- **Dream consolidation now preserves the remembered event timeline.** A
+  Hosted Runtime V2 Dream successor uses the latest `occurred_at` value among
+  the source cards it consolidates instead of the Dream job time or most recent
+  chat time. If any selected source has no usable ISO-8601 event time, the whole
+  consolidation fails before retiring a card and records a content-free
+  `dream_source_occurred_at_unavailable` diagnostic.
 
 - **`memory_search` guidance documents literal matching and allows a reworded
   retry.** Matching is a case-insensitive literal substring with no synonyms,

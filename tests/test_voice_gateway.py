@@ -39,6 +39,17 @@ def test_internal_voice_delta_requires_voice_reply_scope():
     ]
 
 
+def test_capture_header_refers_to_the_person_without_user_ta_placeholder():
+    from voice import transcript_store
+
+    header = transcript_store.capture_window_header(
+        turn_count=24, user_name="小雨", ai_name="小满"
+    )
+
+    assert "这个人明确讲出来的每一件事" in header
+    assert "TA" not in header
+
+
 def test_voice_token_is_scoped_signed_and_expires():
     token, expires_at = voice_token.mint(
         b"voice-secret", user_id="user-1", call_id="call-1", now=100.0, ttl=30.0

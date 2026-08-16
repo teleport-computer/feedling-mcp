@@ -335,8 +335,8 @@ def test_identity_sink_forwards_enclave_runtime_token(pg_clean, monkeypatch):
 
 
 # ------------------------------------------------------------------
-# Codex C1: one `identity` effect_type, two ops. A trusted `op` (missing =>
-# legacy identity_patch; "identity_nudge" => nudge) selects the capability;
+# Codex C1: one `identity` effect_type, multiple ops. A trusted `op` (missing =>
+# legacy identity_patch) selects the matching identity capability;
 # op and effect_id are stripped from the forwarded params; an unknown op is
 # fail-closed (terminal discard), never silently applied as a patch.
 # ------------------------------------------------------------------
@@ -364,6 +364,34 @@ def test_identity_sink_routes_nudge_op_to_identity_nudge_capability(pg_clean, mo
         {"dimension": "trust", "delta": 3, "reason": "kept a promise"},
     )]
     assert _sink_claim_state("job_idn:identity:0") == "completed"
+
+
+def test_identity_sink_routes_dimensions_set_to_matching_capability(pg_clean, monkeypatch):
+    seed_user("u_sink_id_dimensions")
+    seen = []
+    monkeypatch.setattr(
+        serve_worker.cap_registry,
+        "run_capability",
+        _record_run_capability(seen),
+    )
+    dispatch = serve_worker.build_production_effect_dispatch(
+        "u_sink_id_dimensions", runtime_token_provider=lambda: "rt"
+    )
+    dimensions = [{"name": "directness", "value": 73}]
+
+    dispatch("identity", {
+        "effect_id": "job_ids:identity:0",
+        "op": "identity_dimensions_set",
+        "dimensions": dimensions,
+        "reason": "explicit rewrite",
+    })
+
+    assert seen == [(
+        "identity_dimensions_set",
+        "u_sink_id_dimensions",
+        {"dimensions": dimensions, "reason": "explicit rewrite"},
+    )]
+    assert _sink_claim_state("job_ids:identity:0") == "completed"
 
 
 def test_identity_sink_without_op_routes_to_identity_patch(pg_clean, monkeypatch):

@@ -43,6 +43,7 @@ import db
 import provider_client
 from content_encryption import build_envelope
 from capabilities import registry as cap_registry
+from core import self_thinking
 from core import store as core_store
 from model_api_runtime.v2 import context as v2_context
 from model_api_runtime.v2 import effect_outbox as v2_effect_outbox
@@ -243,7 +244,10 @@ def test_run_wake_reply_written_and_job_completed(monkeypatch):
     assert _job_status(job_id)[0] == "completed"
     system_msg = next(m for m in seen["messages"] if m["role"] == "system")
     assert worker._WAKE_SYSTEM_PROMPT in system_msg["content"]
-    assert worker._OPTIONAL_WAKE_SELF_THINKING_INSTRUCTION in system_msg["content"]
+    assert self_thinking.INSTRUCTION.strip() in system_msg["content"]
+    assert worker._OPTIONAL_WAKE_SELF_THINKING_INSTRUCTION.strip() in (
+        system_msg["content"]
+    )
     assert [
         message["content"]
         for message in seen["messages"]
@@ -254,12 +258,17 @@ def test_run_wake_reply_written_and_job_completed(monkeypatch):
 def test_wake_self_thinking_on_drops_native_reasoning_fallback(monkeypatch):
     """Wake follows Chat: native CoT is not displayed while self-thinking is ON."""
     monkeypatch.delenv("FEEDLING_V2_SELF_THINKING", raising=False)
+    # Force the shared observer to report a definite mismatch. Wake still must
+    # remain observation-only and make exactly one provider call.
+    monkeypatch.setattr(
+        worker, "_latest_user_writing_system", lambda _rows: "han"
+    )
     uid = "u_wake_selfthink_no_fallback"
     conftest.seed_user(uid)
     _reset(uid)
     job_id, _ = jobs_store.enqueue_job(uid, "heartbeat")
     claimed_by = _claim(job_id)
-    _script_provider(
+    calls = _script_provider(
         monkeypatch,
         [{
             "reply": "hey, how did that go?",
@@ -284,7 +293,12 @@ def test_wake_self_thinking_on_drops_native_reasoning_fallback(monkeypatch):
     )
     traces = []
     deps = _wake_deps(
-        tail=[{"id": "m1", "ts": 1.0, "role": "user", "content": "hi"}]
+        tail=[{
+            "id": "m1",
+            "ts": 1.0,
+            "role": "user",
+            "content": "这是用户正在使用中文说出的完整消息内容",
+        }]
     )
     deps.emit_debug_trace = lambda user_id, event_type, **fields: traces.append(
         {"user_id": user_id, "event_type": event_type, **fields}
@@ -303,6 +317,7 @@ def test_wake_self_thinking_on_drops_native_reasoning_fallback(monkeypatch):
     )
 
     assert status == "completed"
+    assert len(calls) == 1
     assert written == {"text": "hey, how did that go?", "user_id": uid}
     thinking_traces = [
         trace for trace in traces if trace["event_type"] == "thinking.surfaced"
@@ -312,6 +327,18 @@ def test_wake_self_thinking_on_drops_native_reasoning_fallback(monkeypatch):
         "chars": 0,
         "model": _BYOK.model,
         "lane": "wake",
+    }]
+    language_traces = [
+        trace for trace in traces
+        if trace["event_type"] == "reply.language_follow"
+    ]
+    assert [trace["detail"] for trace in language_traces] == [{
+        "user_script": "han",
+        "reply_script": "latin",
+        "outcome": "mismatch",
+        "lane": "wake",
+        "correction_attempted": False,
+        "correction_outcome": "skipped",
     }]
 
 
@@ -598,7 +625,6 @@ def test_wake_workspace_prompt_snapshot_is_loaded_once_across_rounds(
             "trusted_system_blocks": (
                 "<feedling-skill>wake skill</feedling-skill>",
             ),
-            "working_memory": "wake scratch",
         }
     )
 
@@ -617,8 +643,7 @@ def test_wake_workspace_prompt_snapshot_is_loaded_once_across_rounds(
     assert len(provider_calls) == 2
     assert all(
         "wake skill" in str(call["messages"])
-        and "wake scratch" not in str(call["messages"])
-        and "/memory/WORKING.md" in str(call["messages"])
+        and "/memory/WORKING.md" not in str(call["messages"])
         for call in provider_calls
     )
     second_offered = {spec.name for spec in provider_calls[1]["tools"]}
@@ -821,7 +846,7 @@ def test_automatic_heartbeat_authoritative_no_user_history_skips_all_prompt_work
     )
     deps.load_workspace_prompt = lambda *args, **kwargs: workspace_calls.append(
         (args, kwargs)
-    ) or {"trusted_system_blocks": [], "working_memory": ""}
+    ) or {"trusted_system_blocks": []}
 
     status = asyncio.run(worker._run_wake(
         job_id, uid, "heartbeat", deps, _BYOK, asyncio.Semaphore(4), claimed_by))
@@ -1000,7 +1025,7 @@ def test_heartbeat_thinking_only_is_successful_silence_without_backoff(
         for message in calls[0]["messages"]
         if message.get("role") == "system"
     )
-    assert worker._OPTIONAL_WAKE_SELF_THINKING_INSTRUCTION in system_text
+    assert worker._OPTIONAL_WAKE_SELF_THINKING_INSTRUCTION.strip() in system_text
     assert "nothing after its closing tag" in system_text
     assert "the user receives nothing from that turn" in system_text
     schedule = jobs_store.get_wake_schedule(uid)
@@ -1046,7 +1071,7 @@ def test_scheduled_thinking_only_remains_a_must_deliver_failure(monkeypatch):
         for message in calls[0]["messages"]
         if message.get("role") == "system"
     )
-    assert worker._OPTIONAL_WAKE_SELF_THINKING_INSTRUCTION not in system_text
+    assert worker._OPTIONAL_WAKE_SELF_THINKING_INSTRUCTION.strip() not in system_text
     assert jobs_store.get_wake_schedule(uid)["proactive_backoff_until"] is not None
 
 
@@ -2357,9 +2382,17 @@ def test_scheduled_wake_empty_reply_fails_instead_of_completing_silently(monkeyp
         worker, "_write_encrypted_reply",
         lambda store, text: write_called.update(n=write_called["n"] + 1) or {"id": "r"})
 
+    traces = []
+    deps = _wake_deps(
+        tail=[{"id": "m1", "ts": 1.0, "role": "user", "content": "hi"}]
+    )
+    deps.emit_debug_trace = lambda user_id, event_type, **fields: traces.append(
+        {"user_id": user_id, "type": event_type, **fields}
+    )
+
     status = asyncio.run(worker._run_wake(
         job_id, uid, "scheduled",
-        _wake_deps(tail=[{"id": "m1", "ts": 1.0, "role": "user", "content": "hi"}]),
+        deps,
         _BYOK, asyncio.Semaphore(4), claimed_by))
 
     assert status != "completed", "定时提醒返空竟然算成功了——正是本用例要挡的回归"
@@ -2390,6 +2423,18 @@ def test_scheduled_wake_empty_reply_fails_instead_of_completing_silently(monkeyp
         None,
         None,
     )
+    diagnostics = [
+        trace for trace in traces if trace["type"] == "provider.empty_response"
+    ]
+    assert len(diagnostics) == 2
+    assert all(trace["detail"] == {
+        "stop_reason": "end_turn",
+        "has_visible_text": False,
+        "reasoning_present": False,
+        "tool_call_count": 0,
+        "completion_tokens": 1,
+        "lane": "scheduled",
+    } for trace in diagnostics)
 
 
 def test_scheduled_wake_empty_reply_recovers_on_the_correction_retry(monkeypatch):

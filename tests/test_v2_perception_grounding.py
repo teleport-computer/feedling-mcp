@@ -80,6 +80,10 @@ def _spy_provider(monkeypatch, seen):
     monkeypatch.setattr(provider_client, "chat_completion_async", _fake)
 
 
+def _provider_tool_description(seen, name):
+    return next(spec.description for spec in seen["tools"] if spec.name == name)
+
+
 def _spy_cap_data(monkeypatch, calls, *, data=None):
     async def _fake_cap_data(store, action_type, **kw):
         calls.append({"action": action_type, "params": kw.get("params")})
@@ -177,9 +181,11 @@ def test_chat_turn_does_not_prefetch_or_inject_perception(monkeypatch):
         for message in seen["messages"]
         if message.get("role") == "system"
     )
-    assert "use the available perception, photo, or screen tools" in system
-    assert "missing, disabled, or null tool readings as unavailable" in system
-    assert "never as zero or evidence of a broken device" in system
+    perception_description = _provider_tool_description(seen, "perception_snapshot")
+    assert "request depends on their current device" in perception_description
+    assert "do not call for unrelated conversation" in perception_description
+    assert "工具返回缺失、禁用或 null 时，就当作暂时拿不到" in system
+    assert "别当成 0，也别据此说设备坏了" in system
     assert {"perception_snapshot", "perception_trend", "perception_history"} <= {
         spec.name for spec in seen["tools"]
     }
@@ -244,9 +250,14 @@ def test_chat_turn_explains_stalled_screen_share_without_old_pixels(monkeypatch)
         for message in seen["messages"]
         if message.get("role") == "system"
     )
-    assert "screen_share.stalled" in system
-    assert "may have disconnected" in system
-    assert "Do not describe an old frame as current" in system
+    assert "screen_share.stalled means" in _provider_tool_description(
+        seen, "screen_read"
+    )
+    assert (
+        "屏幕共享还开着、画面却停住不再更新时：说明连接可能断了，"
+        "请对方停止后重新开始共享。"
+    ) in system
+    assert "别把旧画面说成现在的" in system
 
 
 def test_chat_turn_explains_ended_screen_share_without_old_pixels(monkeypatch):
@@ -305,9 +316,13 @@ def test_chat_turn_explains_ended_screen_share_without_old_pixels(monkeypatch):
         for message in seen["messages"]
         if message.get("role") == "system"
     )
-    assert "screen_share.ended" in system
-    assert "remain available for discussion" in system
-    assert "restart sharing or send a screenshot" in system
+    assert "screen_share.ended means" in _provider_tool_description(
+        seen, "screen_read"
+    )
+    assert (
+        "屏幕共享已经结束后：之前聊过的屏幕图片还可以继续聊，"
+        "但别说成当前屏幕；想再看，就请对方重启共享或发张截图。"
+    ) in system
 
 
 def test_chat_can_pull_exact_perception_after_first_round(monkeypatch):
@@ -441,8 +456,11 @@ def test_chat_turn_injects_renewed_repeat_wake_id(monkeypatch):
         for message in seen["messages"]
         if message.get("role") == "system"
     )
-    assert "call cancel_wake" in system
-    assert "do not search memories" in system
+    cancel_description = _provider_tool_description(seen, "cancel_wake")
+    assert "exact wake_id from runtime_data.scheduled_wakes.timers" in (
+        cancel_description
+    )
+    assert "do not search memories" in cancel_description
 
 
 @pytest.mark.parametrize(

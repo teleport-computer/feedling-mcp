@@ -9343,7 +9343,7 @@
           "occurred_at": {
             "type": "string",
             "minLength": 1,
-            "description": "Plaintext ISO-8601 ordering metadata."
+            "description": "Plaintext ISO-8601 event time. Accepted datetime values are normalized to the equivalent UTC value with a Z suffix; date-only values remain date-only."
           },
           "source": {
             "type": "string",
@@ -10729,7 +10729,8 @@
               "memory.supersede",
               "memory.delete",
               "memory.retype"
-            ]
+            ],
+            "description": "Accepted memory.add actions always create a new card; repeated content is not deduplicated."
           },
           "envelope": {
             "$ref": "#/components/schemas/MemoryEnvelope"

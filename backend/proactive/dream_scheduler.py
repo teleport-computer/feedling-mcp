@@ -6,7 +6,6 @@ agent, write chat, or consult proactive reach-out gates.
 """
 from __future__ import annotations
 
-import hashlib
 import os
 import time
 from datetime import datetime, timezone
@@ -15,6 +14,7 @@ from zoneinfo import ZoneInfo
 
 import db
 import memory_readside_core
+from memory_garden import dreaming as mg_dreaming
 from memory import service as memory_service
 from proactive import capture_jobs
 
@@ -157,6 +157,10 @@ def _live_user_turn_count(store) -> int:
 
 
 def _dream_snapshot(store) -> dict[str, Any]:
+    """取花园形状。**「什么算种子卡」「签名怎么算」已搬进内核** —— 那是 Garden
+    内部结构的知识；这里只负责取数（查库、按归属和可见性过滤）与拼上 io 侧的
+    对话轮数。见 memory_garden/dreaming.py 的模块说明。
+    """
     all_moments = [
         dict(moment)
         for moment in memory_service._load_moments(store)
@@ -171,26 +175,7 @@ def _dream_snapshot(store) -> dict[str, Any]:
         ],
         key=lambda item: str(item.get("id") or ""),
     )
-    # Dream output is intentionally excluded from the durable trigger source.
-    # Count historical seed cards (including ones Dream later superseded), so
-    # Dream's own retire/add writes cannot decrease/increase this frontier.
-    seed_moments = sorted(
-        [
-            moment
-            for moment in all_moments
-            if str(moment.get("source") or "").strip() != "memory_dream"
-        ],
-        key=lambda item: str(item.get("id") or ""),
-    )
-    digest = hashlib.sha256(
-        "\n".join(
-            "|".join(
-                str(moment.get(key) or "")
-                for key in ("id", "source", "created_at", "occurred_at")
-            )
-            for moment in seed_moments
-        ).encode("utf-8")
-    ).hexdigest()[:32]
+    snap = mg_dreaming.dream_snapshot(available_cards=moments, all_cards=all_moments)
     last = moments[-1] if moments else {}
     last_until = str(
         last.get("updated_at")
@@ -199,24 +184,28 @@ def _dream_snapshot(store) -> dict[str, Any]:
         or ""
     )[:240]
     return {
-        "card_count": len(moments),
-        "seed_card_count": len(seed_moments),
+        "card_count": snap.card_count,
+        "seed_card_count": snap.seed_card_count,
         "turn_count": _live_user_turn_count(store),
-        "signature": digest,
+        "signature": snap.signature,
         "last_until": last_until,
     }
 
 
 def dream_key_for_snapshot(state: Mapping[str, Any], snapshot: Mapping[str, Any]) -> str:
-    material = "|".join(
-        [
-            str(state.get("last_dream_signature") or ""),
-            str(snapshot.get("signature") or ""),
-            str(snapshot.get("seed_card_count") or 0),
-            str(snapshot.get("turn_count") or 0),
-        ]
+    """幂等键。键的算法在内核，io 只把自己那侧的材料（对话轮数）拌进去。"""
+    return mg_dreaming.dream_idempotency_key(
+        mg_dreaming.DreamLedger(
+            last_seed_card_count=int(state.get("last_dreamed_seed_card_count") or 0),
+            last_signature=str(state.get("last_dream_signature") or ""),
+        ),
+        mg_dreaming.DreamSnapshot(
+            card_count=int(snapshot.get("card_count") or 0),
+            seed_card_count=int(snapshot.get("seed_card_count") or 0),
+            signature=str(snapshot.get("signature") or ""),
+        ),
+        extra=(int(snapshot.get("turn_count") or 0),),
     )
-    return "dream:" + hashlib.sha256(material.encode("utf-8")).hexdigest()[:32]
 
 
 def _dream_enabled(store) -> bool:
@@ -256,14 +245,28 @@ def tick_memory_dream(
         now_ts,
     ):
         return {"enqueued": False, "reason": "failure_backoff", "state": state, "job": None, "snapshot": snapshot}
-    seed_card_count = max(0, int(snapshot.get("seed_card_count") or 0))
-    last_count = max(0, int(state.get("last_dreamed_card_count") or 0))
-    last_seed_count = max(0, int(state.get("last_dreamed_seed_card_count") or 0))
-    new_cards = max(0, seed_card_count - last_seed_count)
     turn_count = max(0, int(snapshot.get("turn_count") or 0))
     last_turn_count = max(0, int(state.get("last_dreamed_turn_count") or 0))
     new_turns = max(0, turn_count - last_turn_count)
-    if str(state.get("last_dream_signature") or "") == str(snapshot.get("signature") or ""):
+
+    # 「值不值得整理」的判据在内核 —— 只数种子卡、比指纹，不看时间不看内容。
+    # 这里保留的是「能不能 / 什么时候」那半（上面的开关/防重/夜间窗口/失败退避，
+    # 以及下面的 min_interval），它们跟哪个记忆库无关。
+    verdict = mg_dreaming.needs_dream(
+        mg_dreaming.DreamSnapshot(
+            card_count=int(snapshot.get("card_count") or 0),
+            seed_card_count=max(0, int(snapshot.get("seed_card_count") or 0)),
+            signature=str(snapshot.get("signature") or ""),
+        ),
+        mg_dreaming.DreamLedger(
+            last_seed_card_count=max(0, int(state.get("last_dreamed_seed_card_count") or 0)),
+            last_signature=str(state.get("last_dream_signature") or ""),
+        ),
+        min_new_cards=min_new_cards(),
+    )
+    new_cards = verdict.new_cards
+
+    if verdict.reason == "already_dreamed":
         return {
             "enqueued": False,
             "reason": "already_dreamed",
@@ -276,13 +279,11 @@ def tick_memory_dream(
     last_completed = _safe_float(state.get("last_dream_completed_at"), 0.0)
     if last_completed and not force and now_ts - last_completed < min_interval_sec():
         return {"enqueued": False, "reason": "min_interval", "state": state, "job": None, "snapshot": snapshot}
-    # User turns no longer independently trigger Dream.  Only new cards from a
-    # non-Dream source advance the durable seed frontier; otherwise normal
-    # conversation plus Dream's own rewritten snapshot caused nightly churn.
-    if not force and new_cards < min_new_cards():
+    # force 绕过内核判据（人工触发不受「攒够没」限制），与原实现一致。
+    if not force and not verdict.needed:
         return {
             "enqueued": False,
-            "reason": "not_enough_new_cards",
+            "reason": verdict.reason,
             "state": state,
             "job": None,
             "snapshot": snapshot,
@@ -308,9 +309,11 @@ def tick_memory_dream(
             "card_count": card_count,
             "new_cards": new_cards,
             "new_turns": new_turns,
-            "last_dreamed_card_count": last_count,
-            "last_dreamed_seed_card_count": last_seed_count,
-            "seed_card_count": seed_card_count,
+            "last_dreamed_card_count": max(0, int(state.get("last_dreamed_card_count") or 0)),
+            "last_dreamed_seed_card_count": max(
+                0, int(state.get("last_dreamed_seed_card_count") or 0)
+            ),
+            "seed_card_count": max(0, int(snapshot.get("seed_card_count") or 0)),
             "last_dreamed_turn_count": last_turn_count,
             "turn_count": turn_count,
             "signature": snapshot.get("signature") or "",

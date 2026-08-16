@@ -22,6 +22,8 @@ from __future__ import annotations
 
 import re
 
+from .. import timestamps as memory_timestamps
+
 
 _MEMORY_TEXT_FIELDS = ("title", "description", "her_quote", "context", "linked_dimension")
 
@@ -386,7 +388,12 @@ def select_context_memories_with_trace(
                     "reason": "global_correction",
                 }
             if global_boundary or rel.get("confidence") in {"strong", "medium"}:
-                corrections.append((float(rel.get("score") or 0.0), m.get("created_at") or "", m, rel))
+                corrections.append((
+                    float(rel.get("score") or 0.0),
+                    memory_timestamps.sort_key(m.get("created_at")),
+                    m,
+                    rel,
+                ))
         corrections.sort(key=lambda item: (item[0], item[1]), reverse=True)
         for _, __, m, rel in corrections[:2]:
             choose(m, rel, bucket="correction")
@@ -399,9 +406,19 @@ def select_context_memories_with_trace(
             reason = str(rel.get("reason") or "")
             score = float(rel.get("score") or 0.0)
             if conf == "strong" and score >= 0.55:
-                query_relevant.append((score, m.get("occurred_at") or "", m, rel))
+                query_relevant.append((
+                    score,
+                    memory_timestamps.sort_key(m.get("occurred_at")),
+                    m,
+                    rel,
+                ))
             elif conf == "medium" and score >= 0.35 and reason != "weak_generic_overlap":
-                query_relevant.append((score, m.get("occurred_at") or "", m, rel))
+                query_relevant.append((
+                    score,
+                    memory_timestamps.sort_key(m.get("occurred_at")),
+                    m,
+                    rel,
+                ))
             elif score > 0:
                 rejected.append((score, reason, m, rel))
         query_relevant.sort(key=lambda x: (x[0], x[1]), reverse=True)
@@ -428,8 +445,8 @@ def select_context_memories_with_trace(
             [m for m in moments if m.get("id") not in index_ids],
             key=lambda m: (
                 str(m.get("title") or "").startswith("转折｜"),
-                m.get("occurred_at") or "",
-                m.get("created_at") or "",
+                memory_timestamps.sort_key(m.get("occurred_at")),
+                memory_timestamps.sort_key(m.get("created_at")),
             ),
             reverse=True,
         )[:20]
@@ -457,7 +474,7 @@ def select_context_memories_with_trace(
     # Bucket 1 — turning points by occurred_at desc, max 3
     turning = sorted(
         [m for m in moments if (m.get("title") or "").startswith("转折｜")],
-        key=lambda m: m.get("occurred_at") or "",
+        key=lambda m: memory_timestamps.sort_key(m.get("occurred_at")),
         reverse=True,
     )[:3]
     for m in turning:
@@ -467,7 +484,7 @@ def select_context_memories_with_trace(
     recent_pool = [m for m in moments if m.get("id") not in chosen_ids]
     recent = sorted(
         recent_pool,
-        key=lambda m: m.get("created_at") or "",
+        key=lambda m: memory_timestamps.sort_key(m.get("created_at")),
         reverse=True,
     )[:2]
     for m in recent:

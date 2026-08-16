@@ -36,6 +36,7 @@ from model_api_runtime.v2 import context as v2_context
 from model_api_runtime.v2 import effect_id as v2_effect_id
 from model_api_runtime.v2 import effect_outbox as v2_effect_outbox
 from model_api_runtime.v2 import jobs_store
+from model_api_runtime.v2 import language_follow
 from model_api_runtime.v2 import serve_worker
 from model_api_runtime.v2 import worker
 
@@ -167,7 +168,10 @@ def _script_provider(monkeypatch, responses):
 
     async def _fake(config, messages, *, tools=None, **kwargs):
         calls.append({"messages": messages, "tools": tools, **kwargs})
-        return next(it)
+        response = next(it)
+        if isinstance(response, BaseException):
+            raise response
+        return response
 
     monkeypatch.setattr(provider_client, "chat_completion_async", _fake)
     return calls
@@ -346,6 +350,242 @@ def test_single_round_plain_text_writes_exactly_one_bubble(monkeypatch):
     assert row[1] is False  # not failed
     assert row[2] == "ok"
     assert _job_status_row(job_id)[0] == "completed"
+
+
+def test_language_follow_emits_once_for_terminal_visible_body_after_thinking(
+    monkeypatch,
+):
+    uid = "u_toolloop_language_follow_once"
+    conftest.seed_user(uid)
+    _reset(uid)
+    jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("w-language-follow")
+    _patch_real_write(monkeypatch)
+    _stub_envelope_build(monkeypatch)
+    monkeypatch.setattr(
+        cap_registry,
+        "run_capability",
+        lambda *_args, **_kwargs: _FakeCapResult({"snippet": "result"}),
+    )
+    private_thinking = "这是绝对不能参与回复文字系统分类的私密中文思考内容"
+    _script_provider(monkeypatch, [
+        _tool_round(
+            _tc("r1", "reply", text="我先查一下"),
+            _tc("s1", "web_search", query="x"),
+        ),
+        _text_round(
+            f"<think>{private_thinking}</think>"
+            "This is the final visible English response"
+        ),
+    ])
+    traces = []
+    deps = _deps(messages=[{
+        "id": "m-language-follow",
+        "ts": 10.0,
+        "role": "user",
+        "content": "Please search for the requested information",
+    }])
+    deps.emit_debug_trace = lambda user_id, event_type, **fields: traces.append(
+        {"user_id": user_id, "type": event_type, **fields}
+    )
+
+    status = asyncio.run(worker.process_job(
+        job,
+        deps,
+        provider_config=_BYOK,
+        api_key=None,
+        runtime_token="rt",
+    ))
+
+    assert status == "completed", _job_status_row(job["id"])
+    assert [row["body_ct"] for row in _bubbles(uid)] == [
+        "我先查一下",
+        "This is the final visible English response",
+    ]
+    language_traces = [
+        trace for trace in traces if trace["type"] == "reply.language_follow"
+    ]
+    assert len(language_traces) == 1
+    assert language_traces[0]["detail"] == {
+        "user_script": "latin",
+        "reply_script": "latin",
+        "outcome": "match",
+        "lane": "chat",
+        "correction_attempted": False,
+        "correction_outcome": "skipped",
+    }
+    assert private_thinking not in json.dumps(language_traces, ensure_ascii=False)
+
+
+def test_chat_language_mismatch_rewrites_once_and_publishes_matching_reply(
+    monkeypatch,
+):
+    uid = "u_language_correction_success"
+    conftest.seed_user(uid)
+    _reset(uid)
+    jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("w-language-correction-success")
+    _patch_real_write(monkeypatch)
+    calls = _script_provider(monkeypatch, [
+        _text_round("This is the original answer in the wrong language"),
+        _text_round("这是改写后与用户语言一致的完整中文回复"),
+    ])
+    traces = []
+    deps = _deps(messages=[{
+        "id": "m-language-correction-success",
+        "ts": 10.0,
+        "role": "user",
+        "content": "这是用户正在使用中文提出的完整问题内容",
+    }])
+    deps.emit_debug_trace = lambda user_id, event_type, **fields: traces.append(
+        {"user_id": user_id, "type": event_type, **fields}
+    )
+
+    status = asyncio.run(worker.process_job(
+        job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"
+    ))
+
+    assert status == "completed"
+    assert len(calls) == 2
+    assert calls[1]["tools"] is None
+    assert language_follow.CORRECTION_INSTRUCTION in json.dumps(
+        calls[1]["messages"], ensure_ascii=False
+    )
+    assert [row["body_ct"] for row in _bubbles(uid)] == [
+        "这是改写后与用户语言一致的完整中文回复"
+    ]
+    language_trace = next(
+        trace for trace in traces if trace["type"] == "reply.language_follow"
+    )
+    assert language_trace["detail"] == {
+        "user_script": "han",
+        "reply_script": "han",
+        "outcome": "match",
+        "lane": "chat",
+        "correction_attempted": True,
+        "correction_outcome": "corrected",
+    }
+
+
+@pytest.mark.parametrize(
+    ("retry", "expected_outcome"),
+    [
+        (
+            provider_client.ProviderError("rewrite unavailable", status_code=400),
+            "retry_error",
+        ),
+        (_text_round(""), "retry_empty"),
+    ],
+)
+def test_chat_language_correction_failure_keeps_original(
+    monkeypatch, retry, expected_outcome,
+):
+    uid = f"u_language_correction_{expected_outcome}"
+    conftest.seed_user(uid)
+    _reset(uid)
+    jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job(f"w-{expected_outcome}")
+    _patch_real_write(monkeypatch)
+    original = "This usable original answer must survive correction failure"
+    calls = _script_provider(monkeypatch, [_text_round(original), retry])
+    traces = []
+    deps = _deps(messages=[{
+        "id": f"m-{expected_outcome}",
+        "ts": 10.0,
+        "role": "user",
+        "content": "这是用户正在使用中文提出的完整问题内容",
+    }])
+    deps.emit_debug_trace = lambda user_id, event_type, **fields: traces.append(
+        {"user_id": user_id, "type": event_type, **fields}
+    )
+
+    status = asyncio.run(worker.process_job(
+        job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"
+    ))
+
+    assert status == "completed"
+    assert len(calls) == 2
+    assert [row["body_ct"] for row in _bubbles(uid)] == [original]
+    language_trace = next(
+        trace for trace in traces if trace["type"] == "reply.language_follow"
+    )
+    assert language_trace["detail"]["correction_attempted"] is True
+    assert language_trace["detail"]["correction_outcome"] == expected_outcome
+
+
+def test_chat_language_correction_still_mismatch_keeps_original_and_stops(
+    monkeypatch,
+):
+    uid = "u_language_correction_still_mismatch"
+    conftest.seed_user(uid)
+    _reset(uid)
+    jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("w-language-correction-still-mismatch")
+    _patch_real_write(monkeypatch)
+    original = "This is the first usable answer in the wrong language"
+    calls = _script_provider(monkeypatch, [
+        _text_round(original),
+        _text_round("This retry is still written in the wrong language"),
+    ])
+    traces = []
+    deps = _deps(messages=[{
+        "id": "m-language-correction-still-mismatch",
+        "ts": 10.0,
+        "role": "user",
+        "content": "这是用户正在使用中文提出的完整问题内容",
+    }])
+    deps.emit_debug_trace = lambda user_id, event_type, **fields: traces.append(
+        {"user_id": user_id, "type": event_type, **fields}
+    )
+
+    status = asyncio.run(worker.process_job(
+        job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"
+    ))
+
+    assert status == "completed"
+    assert len(calls) == 2
+    assert [row["body_ct"] for row in _bubbles(uid)] == [original]
+    language_trace = next(
+        trace for trace in traces if trace["type"] == "reply.language_follow"
+    )
+    assert language_trace["detail"]["correction_outcome"] == (
+        "kept_original_still_mismatch"
+    )
+
+
+@pytest.mark.parametrize(
+    ("user_text", "reply_text"),
+    [
+        ("好的", "This sufficiently long reply stays untouched"),
+        ("这是用户正在使用中文提出的完整问题内容", "这是同语言的完整中文回答内容"),
+        ("汉汉汉汉汉abcde", "This sufficiently long reply stays untouched"),
+        ("这是用户正在使用中文提出的完整问题内容", "okay"),
+    ],
+)
+def test_chat_language_correction_skips_uncertain_or_matching_scripts(
+    monkeypatch, user_text, reply_text,
+):
+    uid = "u_language_correction_skip_" + str(abs(hash((user_text, reply_text))))
+    conftest.seed_user(uid)
+    _reset(uid)
+    jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("w-language-correction-skip")
+    _patch_real_write(monkeypatch)
+    calls = _script_provider(monkeypatch, [_text_round(reply_text)])
+    deps = _deps(messages=[{
+        "id": "m-language-correction-skip",
+        "ts": 10.0,
+        "role": "user",
+        "content": user_text,
+    }])
+
+    status = asyncio.run(worker.process_job(
+        job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"
+    ))
+
+    assert status == "completed"
+    assert len(calls) == 1
+    assert [row["body_ct"] for row in _bubbles(uid)] == [reply_text]
 
 
 def test_chat_tool_surface_keeps_memory_delete(monkeypatch):
@@ -529,6 +769,64 @@ def test_worldbook_truncation_reaches_provider_and_data_track_without_content(
     assert rare_secret not in raw_admin_material
 
 
+def test_empty_provider_response_reaches_debug_trace_without_content(monkeypatch):
+    monkeypatch.setenv("FEEDLING_V2_SELF_THINKING", "off")
+    uid = "u_toolloop_empty_response_trace"
+    conftest.seed_user(uid)
+    _reset(uid)
+    jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("w-empty-response-trace")
+    _patch_real_write(monkeypatch)
+
+    private_reasoning = "T079_PRIVATE_REASONING_MUST_NOT_REACH_DEBUG_TRACE"
+    _script_provider(monkeypatch, [
+        {
+            "reply": "",
+            "reasoning": private_reasoning,
+            "stop_reason": "content_filter",
+            "tool_calls": [],
+            "usage": {"completion_tokens": 41},
+        },
+        _text_round("recovered visible reply"),
+    ])
+    traces = []
+    deps = _deps(messages=[{
+        "id": "m-empty-response-trace",
+        "ts": 10.0,
+        "role": "user",
+        "content": "hello",
+    }])
+    deps.emit_debug_trace = lambda user_id, event_type, **fields: traces.append(
+        {"user_id": user_id, "type": event_type, **fields}
+    )
+
+    status = asyncio.run(worker.process_job(
+        job,
+        deps,
+        provider_config=_BYOK,
+        api_key=None,
+        runtime_token="rt",
+    ))
+
+    assert status == "completed"
+    diagnostics = [
+        trace for trace in traces if trace["type"] == "provider.empty_response"
+    ]
+    assert len(diagnostics) == 1
+    assert diagnostics[0]["detail"] == {
+        "stop_reason": "content_filter",
+        "has_visible_text": False,
+        "reasoning_present": True,
+        "tool_call_count": 0,
+        "completion_tokens": 41,
+        "lane": "chat",
+    }
+    assert admin_data_track._debug_event_public_json(diagnostics[0])["detail"] == (
+        diagnostics[0]["detail"]
+    )
+    assert private_reasoning not in json.dumps(diagnostics, ensure_ascii=False)
+
+
 def test_self_thinking_on_suppresses_native_reasoning(monkeypatch):
     """Self-authored thinking ON (shipped default): even an explicit
     include_reasoning request is suppressed at the provider, so a reasoning-capable
@@ -567,7 +865,7 @@ def test_self_thinking_on_suppresses_native_reasoning(monkeypatch):
         for message in calls[0]["messages"]
         if isinstance(message, dict) and message.get("role") == "system"
     )
-    assert self_thinking.INSTRUCTION in system_text
+    assert self_thinking.INSTRUCTION.strip() in system_text
 
 
 def test_fable_chat_omits_mandatory_self_thinking_prompt(monkeypatch):
@@ -602,7 +900,7 @@ def test_fable_chat_omits_mandatory_self_thinking_prompt(monkeypatch):
         for message in calls[0]["messages"]
         if isinstance(message, dict) and message.get("role") == "system"
     )
-    assert self_thinking.INSTRUCTION not in system_text
+    assert self_thinking.INSTRUCTION.strip() not in system_text
     assert _bubbles(uid)[-1]["body_ct"] == "Fable plain reply"
 
 
@@ -1412,7 +1710,6 @@ def test_chat_workspace_prompt_snapshot_is_loaded_once_across_rounds(
             "trusted_system_blocks": (
                 "<feedling-skill>trusted skill</feedling-skill>",
             ),
-            "working_memory": "DO_NOT_EAGERLY_INJECT",
         }
     )
 
@@ -1432,16 +1729,11 @@ def test_chat_workspace_prompt_snapshot_is_loaded_once_across_rounds(
     for call in calls:
         prompt = str(call["messages"])
         assert "trusted skill" in prompt
-        assert "DO_NOT_EAGERLY_INJECT" not in prompt
-        assert "/memory/WORKING.md" in prompt
+        assert "/memory/WORKING.md" not in prompt
     system = next(
         message for message in calls[0]["messages"] if message["role"] == "system"
     )
     assert "trusted skill" in str(system["content"])
-    assert not any(
-        worker.context.WORKING_MEMORY_HEADER in str(message.get("content"))
-        for message in calls[0]["messages"]
-    )
     second_offered = {spec.name for spec in calls[1]["tools"]}
     assert {"web_search", "web_fetch", "task"}.isdisjoint(second_offered)
 

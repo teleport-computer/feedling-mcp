@@ -1,5 +1,9 @@
 # V1 and V2 chat activity — local manual test
 
+> **状态说明(2026-08-15,Seven 定)**:V1 部分作为**对照组**保留 —— 查 V2 的问题时
+> 先拿 V1 当对照(V1 大多数功能是好的,对比能快速定位差异在哪一层)。
+> V1 **不是必测路径**:README 里「只剩两条路径需要测」的口径不变,与本文档不矛盾。
+
 Run this only after both local branches are built:
 
 - backend: `codex/chat-activity-timeline`

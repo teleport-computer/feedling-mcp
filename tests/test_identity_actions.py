@@ -4,6 +4,7 @@ import base64
 import json
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -17,6 +18,7 @@ from core import config as core_config  # noqa: E402
 from core import enclave as core_enclave  # noqa: E402
 from core import envelope as core_envelope  # noqa: E402
 from core import store as core_store  # noqa: E402
+from capabilities import identity as cap_identity  # noqa: E402
 from identity import actions as identity_actions_mod  # noqa: E402
 from identity import card_policy  # noqa: E402
 from identity import identity_core  # noqa: E402
@@ -218,6 +220,210 @@ def test_identity_profile_patch_passes_runtime_token_to_enclave(client, monkeypa
         "runtime_token": "rtok_identity",
     }
     assert captured_plaintexts[-1]["self_introduction"] == "我已经回来了。"
+
+
+def test_identity_dimensions_set_round_trips_through_identity_get(monkeypatch):
+    store = SimpleNamespace(user_id="usr_dimensions_set_round_trip")
+    original = _plain_identity()
+    original["dimensions"][-1]["value"] = 20
+    latest_plain = {"value": original}
+    trace_events = []
+    saved_audits = []
+    monkeypatch.setattr(identity_service, "_live_days_with_user", lambda *_args, **_kwargs: 1)
+    monkeypatch.setattr(
+        identity_actions_mod.debug_trace,
+        "trace_event",
+        lambda _store, **event: trace_events.append(event),
+    )
+    existing = {
+        "id": "identity_dimensions_set",
+        "body_ct": "old_dimensions",
+        "visibility": "shared",
+        "owner_user_id": store.user_id,
+    }
+    monkeypatch.setattr(
+        identity_actions_mod,
+        "_load_identity_snapshot_for_write",
+        lambda _store: (existing, ""),
+    )
+    monkeypatch.setattr(
+        identity_actions_mod,
+        "_identity_plain_for_action",
+        lambda _store, _api_key, runtime_token="": (latest_plain["value"], ""),
+    )
+    monkeypatch.setattr(
+        identity_actions_mod,
+        "_with_identity_mutation_lock_and_retry",
+        lambda _store, _action_type, fn: fn(),
+    )
+
+    def fake_save(_store, payload, *, existing, audit, event_type, **_kwargs):
+        latest_plain["value"] = payload
+        saved_audits.append({**audit, "event_type": event_type})
+        return (
+            {"id": existing["id"], "updated_at": "2026-08-16"},
+            {"id": "chg", **audit},
+            "",
+        )
+
+    monkeypatch.setattr(
+        identity_actions_mod, "_save_identity_action_payload", fake_save
+    )
+    midpoint = (card_policy._VALUE_MIN + card_policy._VALUE_MAX) // 2
+    secret_dimension = "T085_DIMENSION_SECRET_NEVER_ADMIN"
+    secret_reason = "T085_REASON_SECRET_NEVER_ADMIN: user requested full rewrite"
+    rewritten = [
+        {
+            "name": "Signal clarity",
+            "value": card_policy._VALUE_MIN,
+            "description": "Renamed label and rewritten content.",
+        },
+        {
+            "name": secret_dimension,
+            "value": midpoint,
+            "description": "Added by explicit user request.",
+        },
+        {
+            "name": "Context retention",
+            "value": card_policy._VALUE_MAX,
+            "description": "Existing dimension, new value and content.",
+        },
+        {
+            "name": "Tenderness under pressure",
+            "value": 80,
+            "description": "Direct rewrite from 20 to 80 in one operation.",
+        },
+    ]
+    expected_dimensions = [
+        {
+            **dimension,
+            "last_nudge_reason": secret_reason,
+            "last_nudge_tool": "set",
+        }
+        for dimension in rewritten
+    ]
+
+    result = cap_identity.set_dimensions(
+        store,
+        runtime_token="rt_dimensions_set",
+        params={"dimensions": rewritten, "reason": secret_reason},
+    )
+    assert result.ok is True
+
+    monkeypatch.setattr(
+        identity_core,
+        "get_identity",
+        lambda _store: ({"identity": {
+            **existing,
+            "days_with_user": 1,
+        }}, 200),
+    )
+    monkeypatch.setattr(
+        core_enclave,
+        "_decrypt_envelope_via_enclave",
+        lambda *_args, **_kwargs: json.dumps(latest_plain["value"]).encode("utf-8"),
+    )
+    final_card = cap_identity.get(
+        store, runtime_token="rt_dimensions_set"
+    ).data["identity"]
+
+    assert final_card["dimensions"] == expected_dimensions
+    assert final_card["last_dimensions_set"] == {
+        "reason": secret_reason,
+        "tool": "set",
+        "changed_count": 9,
+        "added_count": 2,
+        "deleted_count": 5,
+        "labels_changed": 1,
+    }
+    assert len(final_card["dimensions"]) < len(original["dimensions"])
+    assert final_card["agent_name"] == original["agent_name"]
+    assert final_card["self_introduction"] == original["self_introduction"]
+    assert saved_audits == [{
+        "action": "dimensions_set",
+        "old_value": len(original["dimensions"]),
+        "new_value": len(rewritten),
+        "event_type": "identity_action_dimensions_set",
+    }]
+    assert trace_events == [{
+        "subsystem": "identity",
+        "type": "identity.dimensions_set",
+        "actor": "backend",
+        "status": "ok",
+        "summary": "",
+        "explain": "",
+        "detail": {"counts": {
+            "changed_count": 9,
+            "added_count": 2,
+            "deleted_count": 5,
+            "labels_changed": 1,
+        }},
+    }]
+    admin_trace_json = json.dumps(trace_events, ensure_ascii=False)
+    assert secret_dimension not in admin_trace_json
+    assert secret_reason not in admin_trace_json
+
+
+def test_identity_dimensions_set_server_reuses_shared_structure_errors():
+    store = core_store.get_store("usr_dimensions_set_invalid")
+    cases = [
+        (
+            [
+                {"name": f"dimension-{index}", "value": card_policy._VALUE_MIN}
+                for index in range(card_policy.MAX_DIMENSIONS + 1)
+            ],
+            "too_many_dimensions",
+        ),
+        (
+            [
+                {"name": "same", "value": card_policy._VALUE_MIN},
+                {"name": "SAME", "value": card_policy._VALUE_MAX},
+            ],
+            "dimension_name_duplicate",
+        ),
+        (
+            [{"name": "range", "value": card_policy._VALUE_MAX + 1}],
+            "dimension_value_out_of_range",
+        ),
+    ]
+    for dimensions, expected_error in cases:
+        body, status = identity_actions_mod._execute_identity_actions(
+            store,
+            None,
+            [{
+                "type": "identity.dimensions_set",
+                "dimensions": dimensions,
+                "reason": "user requested rewrite",
+            }],
+        )
+        assert status == 400
+        assert body["results"][0]["error"] == expected_error
+
+
+def test_identity_dimensions_set_requires_reason_and_nudge_keeps_delta_cap():
+    store = core_store.get_store("usr_dimensions_set_reason_and_cap")
+    body, status = identity_actions_mod._execute_identity_actions(
+        store,
+        None,
+        [{
+            "type": "identity.dimensions_set",
+            "dimensions": [{"name": "directness", "value": 80}],
+        }],
+    )
+    assert status == 400
+    assert body["results"][0]["error"] == "reason_required"
+
+    body, status = identity_actions_mod._execute_identity_actions(
+        store,
+        None,
+        [{
+            "type": "identity.dimension_nudge",
+            "dimension": "directness",
+            "delta": 11,
+        }],
+    )
+    assert status == 400
+    assert body["error"] == "nudge_delta_exceeds_cap"
 
 
 @pytest.mark.xfail(reason="inline background runtime removed in chat-send 收口 (Task 3); behavior moved to agent-runner consumer — needs consumer-side coverage", strict=False)

@@ -72,7 +72,7 @@ def test_clean_card_passes_the_guard(api_key):
     assert "memory_card_polluted" not in str(body), (status, body)
 
 
-def test_write_validation_and_duplicate_skip_at_real_endpoint(api_key, monkeypatch):
+def test_write_validation_and_duplicate_create_at_real_endpoint(api_key, monkeypatch):
     counter = {"n": 0}
 
     def build_envelope(store, inner, *, item_id=None):
@@ -91,15 +91,6 @@ def test_write_validation_and_duplicate_skip_at_real_endpoint(api_key, monkeypat
     monkeypatch.setattr(
         memory_actions, "_build_memory_envelope_for_store", build_envelope
     )
-    monkeypatch.setattr(
-        memory_actions,
-        "_memory_plain_from_envelope",
-        lambda moment, _api_key, runtime_token="": (
-            json.loads(moment["body_ct"]),
-            "",
-        ),
-    )
-
     client = make_client()
     headers = {"X-API-Key": api_key}
 
@@ -159,15 +150,15 @@ def test_write_validation_and_duplicate_skip_at_real_endpoint(api_key, monkeypat
 
     assert first.status_code == 200, first.get_data(as_text=True)
     assert duplicate.status_code == 200, duplicate.get_data(as_text=True)
-    assert duplicate.get_json()["results"][0]["skipped"] == "duplicate_active"
-    assert duplicate.get_json()["effects"] == []
+    assert duplicate.get_json()["results"][0].get("skipped") is None
+    assert duplicate.get_json()["effects"][0]["type"] == "memory_added"
     assert distinct.status_code == 200, distinct.get_data(as_text=True)
 
     store = core_store.get_store(registry._resolve_user(api_key))
     active = memory_actions.memory_service._active_memory_moments(
         memory_actions.memory_service._load_moments(store)
     )
-    assert len(active) == 2
+    assert len(active) == 3
 
 
 def test_supersede_target_errors_keep_item_level_400_404_and_403(api_key):

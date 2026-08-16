@@ -1703,14 +1703,20 @@ def _v2_profile_detail(user_id: str) -> dict:
     memory = document.get("memory")
     if not isinstance(memory, dict):
         memory = {}
-    user = document.get("user")
-    if not isinstance(user, dict):
-        user = {}
+    style = document.get("style")
+    if not isinstance(style, dict):
+        # Legacy USER survives until the user's next successful redistill.
+        style = document.get("user")
+    if not isinstance(style, dict):
+        style = {}
+    style_chars = _count(style.get("chars"))
 
     return {
         "state": state,
         "memory_chars": _count(memory.get("chars")),
-        "user_chars": _count(user.get("chars")),
+        "style_chars": style_chars,
+        # One-version compatibility alias for external admin consumers.
+        "user_chars": style_chars,
         "source": {
             "card_count": _count(source.get("card_count")),
             "max_updated_at": str(source.get("max_updated_at") or ""),
@@ -2416,7 +2422,65 @@ def _debug_content_summary(value) -> dict:
     return out
 
 
+_EMPTY_RESPONSE_PUBLIC_ENUMS = {
+    "stop_reason": frozenset({
+        "", "blocklist", "content_filter", "end_turn", "function_call",
+        "image_safety", "language", "length", "malformed_function_call",
+        "max_tokens", "other", "pause_turn", "prohibited_content",
+        "recitation", "refusal", "safety", "spii", "stop",
+        "stop_sequence", "tool_calls", "tool_use",
+    }),
+    "lane": frozenset({
+        "chat", "heartbeat", "scheduled", "manual_wake", "screen_watch",
+        "other",
+    }),
+}
+
+_LANGUAGE_FOLLOW_PUBLIC_ENUMS = {
+    "user_script": frozenset({
+        "han", "latin", "kana", "hangul", "cyrillic", "other", "mixed",
+        "indeterminate",
+    }),
+    "reply_script": frozenset({
+        "han", "latin", "kana", "hangul", "cyrillic", "other", "mixed",
+        "indeterminate",
+    }),
+    "outcome": frozenset({"match", "mismatch", "skip"}),
+    "correction_outcome": frozenset({
+        "corrected", "kept_original_still_mismatch", "retry_error",
+        "retry_empty", "skipped",
+    }),
+    "lane": frozenset({"chat", "wake"}),
+}
+
+
 def _debug_event_public_json(ev: dict) -> dict:
+    raw_detail = ev.get("detail") or {}
+    public_detail = _debug_redact_value(raw_detail)
+    if (
+        ev.get("type") == "provider.empty_response"
+        and isinstance(raw_detail, dict)
+        and isinstance(public_detail, dict)
+    ):
+        # This producer normalizes both values to closed internal enums before
+        # writing. Expose them so admin can distinguish true filtering from a
+        # parser/content-free response without opening any general string field.
+        for key, allowed_values in _EMPTY_RESPONSE_PUBLIC_ENUMS.items():
+            value = raw_detail.get(key)
+            if isinstance(value, str) and value in allowed_values:
+                public_detail[key] = value
+    if (
+        ev.get("type") == "reply.language_follow"
+        and isinstance(raw_detail, dict)
+        and isinstance(public_detail, dict)
+    ):
+        # Every exposed string is a producer-normalized closed enum.  Unknown
+        # or newly injected strings keep the generic redaction above, so this
+        # observability event cannot become an accidental plaintext outlet.
+        for key, allowed_values in _LANGUAGE_FOLLOW_PUBLIC_ENUMS.items():
+            value = raw_detail.get(key)
+            if isinstance(value, str) and value in allowed_values:
+                public_detail[key] = value
     return {
         "ts": ev.get("ts"),
         "user_id": ev.get("user_id"),
@@ -2427,7 +2491,7 @@ def _debug_event_public_json(ev: dict) -> dict:
         "dur_ms": ev.get("dur_ms"),
         "summary": ev.get("summary"),
         "explain": ev.get("explain"),
-        "detail": _debug_redact_value(ev.get("detail") or {}),
+        "detail": public_detail,
         "content_excerpt": _debug_content_summary(ev.get("content_excerpt") or {}),
     }
 
@@ -8020,6 +8084,8 @@ _DEBUG_STEP_LABELS = {
     "agent.model.call.done": ("🧠", "调用模型 · 完成"),
     "agent.tool.call": ("🔧", "调用工具"),
     "thinking.surfaced": ("💭", "思考展示 · 分支"),
+    "reply.language_follow": ("🌐", "语言跟随"),
+    "provider.empty_response": ("🕳️", "空回复诊断"),
     "mcp.surface.resolved": ("🧩", "MCP 工具面"),
     "mcp.surface.provider": ("🧩", "MCP Provider 实收工具面"),
     "mcp.surface.missing": ("🧩", "MCP 工具面缺失"),
@@ -8035,6 +8101,7 @@ _DEBUG_STEP_LABELS = {
     "memory.index.called": ("🧩", "浏览记忆总览"),
     "memory.search.called": ("🔍", "搜索记忆"),
     "memory.content.truncation": ("✂️", "记忆卡截断"),
+    "identity.dimensions_set": ("🪪", "身份维度重写"),
     "context.truncation": ("✂️", "上下文裁剪"),
 }
 _DEBUG_SUBSYSTEM_FALLBACK = {

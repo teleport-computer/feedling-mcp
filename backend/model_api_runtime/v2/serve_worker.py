@@ -187,11 +187,8 @@ def _load_workspace_prompt(store, *, runtime_token: str) -> dict:
     """Render one authoritative workspace prompt snapshot for a turn.
 
     Skill entries come only from the backend's read-only ``/skills`` namespace
-    and therefore retain system authority. Agent-editable ``WORKING.md`` stays
-    encrypted at rest and is available through ``workspace_read``; it is not
-    eagerly injected, because persistent untrusted text must not be able to
-    choose a future outbound web/MCP/subagent call. Any malformed/unknown skill
-    block fails the turn instead of silently dropping policy.
+    and therefore retain system authority. Any malformed/unknown skill block
+    fails the turn instead of silently dropping policy.
     """
     backend = production_workspace_backend(
         store, runtime_token=str(runtime_token or "")
@@ -199,24 +196,16 @@ def _load_workspace_prompt(store, *, runtime_token: str) -> dict:
     trusted_system_blocks: list[str] = []
     persona = _load_genesis_persona(store, runtime_token=runtime_token).strip()
     if persona:
-        # Persona is first only within trusted_system_blocks. build_turn_messages
-        # appends this list after system_prompt and the runtime policy, so the
-        # final V2 system message remains persona-last, unlike V1; whether to
-        # restore V1's ordering is an unresolved product decision. It remains
-        # outside runtime-data and profile truncation.
+        # build_turn_messages places trusted blocks before the common system
+        # prompt and runtime policy, restoring V1's persona-first ordering.
+        # Persona remains outside runtime-data and profile truncation.
         trusted_system_blocks.append(persona)
-    for block in render_trusted_prefix_blocks(
-        backend,
-        include_working_memory=False,
-    ):
+    for block in render_trusted_prefix_blocks(backend):
         if block.name.startswith("skill:/skills/"):
             trusted_system_blocks.append(block.content)
             continue
         raise RuntimeError("invalid workspace prompt block")
-    return {
-        "trusted_system_blocks": tuple(trusted_system_blocks),
-        "working_memory": "",
-    }
+    return {"trusted_system_blocks": tuple(trusted_system_blocks)}
 
 
 def _load_workspace_file(
@@ -1648,7 +1637,7 @@ def _select_agent_profile_for_turn(
         )
 
     with core_enclave.coalesced_success_trace("v2_profile_memory_read"):
-        with core_enclave.coalesced_success_trace("v2_profile_user_read"):
+        with core_enclave.coalesced_success_trace("v2_profile_style_read"):
             return v2_profile_store.select_profile_for_turn(
                 user_id,
                 summary,
@@ -3533,7 +3522,7 @@ def _capability_effect_error(result, code: str) -> Exception:
 
 
 def _sink_identity(user_id: str, payload: dict, *, runtime_token: str) -> None:
-    """`identity` sink. One ``identity`` effect_type carries two producers,
+    """`identity` sink. One ``identity`` effect_type carries multiple producers,
     disambiguated by a trusted ``op`` (set from the tool name in
     worker._write_tool_effect_payload):
 
@@ -3543,6 +3532,8 @@ def _sink_identity(user_id: str, payload: dict, *, runtime_token: str) -> None:
         every pre-nudge and in-flight row uses — it MUST keep working.
       * ``op == "identity_nudge"`` -> identity_nudge capability
         (``{"dimension", "delta", optional "reason"}``).
+      * ``op == "identity_dimensions_set"`` -> full dimensions-list rewrite
+        (``{"dimensions", optional "reason"}``).
 
     An unknown op is NOT silently applied as a patch: it terminal-discards.
     The encrypted path already re-validated op in
@@ -3558,7 +3549,11 @@ def _sink_identity(user_id: str, payload: dict, *, runtime_token: str) -> None:
         op = payload.get("op")
         if op is None:
             op = "identity_patch"  # legacy shape: no op key was ever written
-        elif op not in ("identity_patch", "identity_nudge"):
+        elif op not in (
+            "identity_patch",
+            "identity_nudge",
+            "identity_dimensions_set",
+        ):
             # Deterministic bad row — never guess it into identity_patch.
             raise db.EffectTerminalError("identity_operation_invalid")
         store = core_store.get_store(user_id)
@@ -4132,8 +4127,9 @@ def _validate_decrypted_tool_effect(effect_type: str, payload: dict) -> None:
         # Trusted op set by the producer from the tool name (see
         # worker._write_tool_effect_payload). A MISSING op is the legacy
         # identity_patch shape — every pre-nudge enqueued/in-flight row — and
-        # must keep validating as identity_patch. identity_nudge routes to its
-        # own schema. A present-but-unknown op is fail-closed: it raises the
+        # must keep validating as identity_patch. Explicit identity operations
+        # route to their own schemas. A present-but-unknown op is fail-closed:
+        # it raises the
         # same plain RuntimeError as every other validation failure here (which
         # the outbox treats as RETRYABLE, so a payload a newer worker would
         # understand is never terminal-discarded during a deploy overlap —
@@ -4141,8 +4137,8 @@ def _validate_decrypted_tool_effect(effect_type: str, payload: dict) -> None:
         op = payload.get("op")
         if op is None or op == "identity_patch":
             tool_name = "identity_patch"
-        elif op == "identity_nudge":
-            tool_name = "identity_nudge"
+        elif op in ("identity_nudge", "identity_dimensions_set"):
+            tool_name = op
         else:
             raise RuntimeError("invalid encrypted identity operation")
         # `relationship_started_at` is the trusted FROZEN anchor the producer

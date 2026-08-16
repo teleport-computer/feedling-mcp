@@ -213,6 +213,20 @@ jobs:
             tests/test_cpu_socket_proxy_integration.py \
             -v
 
+      - name: Memory Garden kernel unit tests
+        env:
+          PYTHONPATH: backend
+        run: |
+          python -m pytest \
+            tests/test_memory_garden_purity.py \
+            tests/test_memory_garden_policies.py \
+            tests/test_memory_garden_capture_golden.py \
+            tests/test_memory_garden_dream_migrate_golden.py \
+            tests/test_memory_garden_prompt_params.py \
+            tests/test_memory_garden_storage_port.py \
+            tests/test_memory_garden_dreaming.py \
+            -v
+
       - name: Guard top-level pytest discovery coverage
         run: |
           export LC_ALL=C
@@ -298,6 +312,7 @@ jobs:
             tests/test_memory_readside_core.py \
             tests/test_memory_readside_docker_e2e.py \
             tests/test_memory_readside_sandbox.py \
+            tests/test_memory_timestamps.py \
             tests/test_memory_upgrade_id_stable.py \
             tests/test_memory_v1_readers.py \
             tests/test_memory_v1_readside.py \

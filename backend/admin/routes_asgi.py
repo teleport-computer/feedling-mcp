@@ -189,6 +189,16 @@ async def data_track_dau(request: Request):
     return JSONResponse(payload)
 
 
+@router.get("/v1/admin/data-track/events")
+async def data_track_events(request: Request):
+    _require_admin(request)
+    try:
+        payload = await threadpool.run_db(admin_core.events_payload, request.url.query)
+    except admin_core.InvalidDauDay:
+        return JSONResponse({"error": "invalid_day"}, status_code=400)
+    return JSONResponse(payload)
+
+
 @router.get("/v1/admin/data-track/growth")
 async def data_track_growth(request: Request):
     _require_admin(request)

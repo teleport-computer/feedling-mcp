@@ -618,6 +618,26 @@ def test_identity_non_rename_patch_is_enqueued(monkeypatch):
     assert results[0].content == "queued: identity_patch"
 
 
+def test_identity_dimensions_set_is_enqueued_as_an_identity_write(monkeypatch):
+    tool_calls = [ToolCall(
+        id="dimensions-set",
+        name="identity_dimensions_set",
+        args={
+            "dimensions": [{"name": "directness", "value": 73}],
+            "reason": "user requested rewrite",
+        },
+    )]
+    results, enqueued = _run(
+        tool_calls,
+        turn_authorization=True,
+        run_capability=_ok_run_capability,
+        monkeypatch=monkeypatch,
+    )
+
+    assert [tc.id for tc in enqueued] == ["dimensions-set"]
+    assert results[0].content == "queued: identity_dimensions_set"
+
+
 # ------------------------------------------------------------------
 # Item 3/4: relationship_days is validated LIVE, pre-enqueue (like the rename
 # pairing check) — a malformed / over-cap value hands the model a fixable error

@@ -262,6 +262,14 @@ if not _provisioned:
     # no-Postgres dev machine still runs something useful.
     _PURE_UNIT = {
         "test_card_guard.py",
+        # Memory Garden 内核（2026-08-14）：纯函数包，零 DB / 零网络。
+        # 六个文件都在「DATABASE_URL 指向不可达地址」的环境下实测通过。
+        "test_memory_garden_purity.py",
+        "test_memory_garden_policies.py",
+        "test_memory_garden_capture_golden.py",
+        "test_memory_garden_prompt_params.py",
+        "test_memory_garden_storage_port.py",
+        "test_memory_garden_dreaming.py",
         # Fully monkeypatched consumer prompt-gate unit — no DB, no network.
         "test_user_mcp_wait_hint.py",
         "test_bucket_lang_normalize.py",
@@ -384,7 +392,7 @@ if not _provisioned:
         "test_health_executor.py",
         "test_db_health_timeouts.py",
         "test_health_route_isolation.py",
-        # 记忆写入规则的 V1/V2 parity(2026-08-10)。纯:只读 memory.prompts_v1 与
+        # 记忆写入规则的 V1/V2 parity(2026-08-10)。纯:只读 memory_garden.prompts.buckets 与
         # capabilities.tool_schema 的常量,不碰 DB。
         "test_memory_write_guidance_parity.py",
         # enclave 批量解密的 trace 折叠(2026-08-10)。纯:debug_trace.trace_event

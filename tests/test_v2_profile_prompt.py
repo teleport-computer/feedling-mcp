@@ -49,7 +49,7 @@ def test_ok_profile_suppresses_summary_and_skips_summary_bounding(monkeypatch):
     selection = profile_store.ProfilePromptSelection(
         summary="",
         memory="relationship facts",
-        user="interaction style",
+        style="interaction style",
         used_profile=True,
     )
     monkeypatch.setattr(

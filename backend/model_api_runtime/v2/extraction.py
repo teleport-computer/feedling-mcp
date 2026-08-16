@@ -11,16 +11,52 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
+import os
 from typing import Any, Awaitable, Callable, NamedTuple
 
 import provider_client
 
-_MAX_TOKENS = 1500
+_MAX_OUTPUT_TOKEN_SETTINGS = {
+    "capture": ("FEEDLING_V2_CAPTURE_MAX_OUTPUT_TOKENS", 1500),
+    "dream": ("FEEDLING_V2_DREAM_MAX_OUTPUT_TOKENS", 4000),
+}
+
+
+def _max_output_tokens_from_env(lane: str) -> int:
+    """Resolve one extraction lane's positive output budget."""
+    try:
+        env_name, default = _MAX_OUTPUT_TOKEN_SETTINGS[lane]
+    except KeyError as exc:
+        raise ValueError(f"unsupported extraction lane: {lane}") from exc
+    raw = os.environ.get(env_name, str(default))
+    try:
+        value = int(str(raw).strip())
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(f"{env_name} must be a positive integer") from exc
+    if value <= 0:
+        raise RuntimeError(f"{env_name} must be a positive integer")
+    return value
+
+
+CAPTURE_MAX_OUTPUT_TOKENS = _max_output_tokens_from_env("capture")
+DREAM_MAX_OUTPUT_TOKENS = _max_output_tokens_from_env("dream")
+
+
+def max_output_tokens_for_lane(lane: str) -> int:
+    """Return the startup-resolved budget without coupling capture to Dream."""
+    if lane == "capture":
+        return CAPTURE_MAX_OUTPUT_TOKENS
+    if lane == "dream":
+        return DREAM_MAX_OUTPUT_TOKENS
+    raise ValueError(f"unsupported extraction lane: {lane}")
+
+
 _TEMPERATURE = 0.3
 _TIMEOUT_SEC = 90.0
 
 class ParseRetry(NamedTuple):
-    """「解析/语义结果不合格 → 原样打回去重问一次」的注入点。
+    """「截断/解析/语义结果不合格 → 原样打回去重问一次」的注入点。
 
     判据与纠错文案属于 memory/ 层（依赖方向不允许本模块 import 它），
     所以由 worker 组装三个纯回调传进来：
@@ -28,9 +64,10 @@ class ParseRetry(NamedTuple):
       build_prompt(prompt, err)  -> 第二次的 prompt（含「哪个字段没填」）；
       parse(reply)               -> 第二次的解析（通常放宽成「只丢脏行」）。
 
-    Capture 可选再注入 ``semantic_reasons`` / ``build_semantic_prompt``：
-    格式打回和语义打回**共享一次** provider 预算。若格式重问后
-    仍少 target_id，直接 fail closed，不再发第三问。
+    Capture 可选再注入 ``semantic_reasons`` / ``build_semantic_prompt``；
+    capture / Dream 都可注入 ``build_truncation_prompt``。截断、格式打回和
+    语义打回**共享一次** provider 预算，任何第二问失败都直接 fail closed，
+    不再发第三问。
     """
 
     should_retry: Callable[[str], bool]
@@ -38,6 +75,7 @@ class ParseRetry(NamedTuple):
     parse: Callable[[str], tuple]
     semantic_reasons: Callable[[Any], list[str]] | None = None
     build_semantic_prompt: Callable[[str, list[str]], str] | None = None
+    build_truncation_prompt: Callable[[str], str] | None = None
 
 
 _PROVIDER_FAILURE_CODES = frozenset(
@@ -105,10 +143,11 @@ async def extract(
     provider_config: Any,
     prompt: str,
     parse: Callable[[str], tuple],
-    max_tokens: int = _MAX_TOKENS,
+    max_tokens: int = CAPTURE_MAX_OUTPUT_TOKENS,
     progress_cb: Callable[[str, int], None] | None = None,
     usage_out: Callable[[dict | None], None] | None = None,
     trajectory_out: Callable[[str, dict], Awaitable[None]] | None = None,
+    failure_detail_out: Callable[[dict], None] | None = None,
     parse_retry: ParseRetry | None = None,
 ) -> tuple[Any, str | None]:
     """跑一次 BYOK 抽取调用并解析。**永不抛**——失败一律返回 (None, reason)。
@@ -116,14 +155,15 @@ async def extract(
     `parse` 是 memory/*_prompt_v1 里的纯解析函数。它的返回是 (value, err) 或
     (value, questions, err)；我们只取首项与末项（末项恒为 err）。
 
-    给了 `parse_retry` 时，内容闸判为「模型把输出示例的占位符抄了回来」的回复会被
-    打回、带着「哪个字段没填」重问一次（**最多一次**，第二次的结果直接采信）。
-    provider 报错 / 空回复 / JSON 根本没出来不走这条路——重问同一段 prompt 也没用，
-    它们各有自己的重试与退避。
+    给了 `parse_retry` 时，截断、内容闸或语义闸可带原因重问一次；三条路径共享
+    **最多一次**的 provider 预算。provider 报错 / 空回复不走这条路，它们各有
+    自己的重试与退避。
     """
 
-    async def _call(attempt_prompt: str) -> tuple[str | None, str | None]:
-        """跑一次 provider，返回 (reply, error_reason)。"""
+    async def _call(
+        attempt_prompt: str,
+    ) -> tuple[str | None, str | None, dict[str, Any]]:
+        """跑一次 provider，返回 reply、error 与 content-free 响应形状。"""
         messages = [{"role": "user", "content": attempt_prompt}]
         if trajectory_out is not None:
             await trajectory_out(
@@ -152,30 +192,92 @@ async def extract(
                 )
             if usage_out is not None:
                 usage_out(None)
-            return None, f"provider_call_failed:{error_code}"
+            return None, f"provider_call_failed:{error_code}", {}
         if usage_out is not None:
             usage_out(result.get("usage") if isinstance(result, dict) else None)
         if trajectory_out is not None:
             await trajectory_out("provider_response", {"response": result})
+        raw_stop_reason = str((result or {}).get("stop_reason") or "").strip().lower()
+        usage = (result or {}).get("usage")
+        raw_completion_tokens = (
+            usage.get("completion_tokens") if isinstance(usage, dict) else None
+        )
+        response_shape = {
+            "stop_reason": (
+                "length"
+                if raw_stop_reason == "length"
+                else ("other" if raw_stop_reason else "")
+            ),
+            "completion_tokens": (
+                max(0, int(raw_completion_tokens))
+                if isinstance(raw_completion_tokens, (int, float))
+                and not isinstance(raw_completion_tokens, bool)
+                else None
+            ),
+            "max_tokens": max_tokens,
+        }
         reply = str((result or {}).get("reply") or "").strip()
         if not reply:
-            return None, "empty_reply"
-        return reply, None
+            return None, "empty_reply", response_shape
+        return reply, None, response_shape
 
-    reply, call_error = await _call(prompt)
+    async def _report_truncated(
+        response_shape: dict[str, Any], *, attempt: int
+    ) -> bool:
+        if response_shape.get("stop_reason") != "length":
+            return False
+        if trajectory_out is not None:
+            await trajectory_out(
+                "extraction_output_truncated",
+                {**response_shape, "attempt": attempt},
+            )
+        return True
+
+    def _record_truncation_failure(response_shape: dict[str, Any]) -> None:
+        if failure_detail_out is not None:
+            failure_detail_out(dict(response_shape))
+
+    retried_once = False
+    reply, call_error, response_shape = await _call(prompt)
+    if await _report_truncated(response_shape, attempt=1):
+        if parse_retry is None or parse_retry.build_truncation_prompt is None:
+            _record_truncation_failure(response_shape)
+            return None, "output_truncated"
+        if trajectory_out is not None:
+            await trajectory_out(
+                "extraction_output_truncation_retry",
+                {
+                    "attempt": 2,
+                    "strategy": "concise_prompt",
+                    "max_tokens": max_tokens,
+                },
+            )
+        reply, call_error, response_shape = await _call(
+            parse_retry.build_truncation_prompt(prompt)
+        )
+        retried_once = True
+        if await _report_truncated(response_shape, attempt=2):
+            _record_truncation_failure(response_shape)
+            return None, "output_truncated"
     if call_error is not None:
         return None, call_error
     parsed = parse(reply)
     value, err = parsed[0], parsed[-1]
-    retried_once = False
     if err:
-        if parse_retry is None or not parse_retry.should_retry(str(err)):
+        if (
+            retried_once
+            or parse_retry is None
+            or not parse_retry.should_retry(str(err))
+        ):
             return None, str(err)
         if trajectory_out is not None:
             await trajectory_out("parse_bounced", {"reason": str(err)})
-        retry_reply, retry_call_error = await _call(
+        retry_reply, retry_call_error, _retry_response_shape = await _call(
             parse_retry.build_prompt(prompt, str(err))
         )
+        if await _report_truncated(_retry_response_shape, attempt=2):
+            _record_truncation_failure(_retry_response_shape)
+            return None, "output_truncated"
         if retry_call_error is not None:
             # 重问这一跳自己挂了：如实报重问的失败原因，别把它伪装成原来的格式问题。
             return None, retry_call_error
@@ -199,9 +301,12 @@ async def extract(
         await trajectory_out(
             "semantic_bounced", {"reason_count": len(semantic_reasons)}
         )
-    retry_reply, retry_call_error = await _call(
+    retry_reply, retry_call_error, _retry_response_shape = await _call(
         parse_retry.build_semantic_prompt(prompt, semantic_reasons)
     )
+    if await _report_truncated(_retry_response_shape, attempt=2):
+        _record_truncation_failure(_retry_response_shape)
+        return None, "output_truncated"
     if retry_call_error is not None:
         return None, retry_call_error
     retried = parse_retry.parse(retry_reply)
@@ -333,6 +438,33 @@ def cards_to_actions(cards, *, occurred_at, source_ids, build_envelope,
     )
 
 
+def _latest_source_occurred_at(cards: list[dict]) -> str:
+    """Return the chronologically latest source timestamp, preserving its text.
+
+    Dream rewrites old memories, so neither the job time nor the latest chat
+    time is evidence of when the remembered event happened.  Every source must
+    carry a parseable ISO-8601 value: ignoring one missing value could select an
+    older sibling while claiming it is the latest.  Fail closed instead; the
+    worker persists the stable, content-free error code for operators.
+    """
+    ranked: list[tuple[datetime, str]] = []
+    for card in cards:
+        raw = str(card.get("occurred_at") or "").strip()
+        if not raw:
+            raise ValueError("dream_source_occurred_at_unavailable")
+        candidate = raw[:-1] + "+00:00" if raw.endswith("Z") else raw
+        try:
+            parsed = datetime.fromisoformat(candidate)
+        except ValueError:
+            raise ValueError("dream_source_occurred_at_unavailable") from None
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        ranked.append((parsed.astimezone(timezone.utc), raw))
+    if not ranked:
+        raise ValueError("dream_source_occurred_at_unavailable")
+    return max(ranked, key=lambda item: item[0])[1]
+
+
 def consolidations_to_actions(
     consolidations,
     *,
@@ -393,6 +525,12 @@ def consolidations_to_actions(
             ):
                 policy_rejections += 1
                 continue
+        else:
+            # Without the exact disclosed source cards there is no honest
+            # event time to carry forward.  The worker's shared ``occurred_at``
+            # is capture/chat time and must never become Dream's silent fallback.
+            raise ValueError("dream_source_occurred_at_unavailable")
+        source_occurred_at = _latest_source_occurred_at(old_cards)
         card = {"type": "fact", **result}
         actions.append(
             {
@@ -400,7 +538,7 @@ def consolidations_to_actions(
                 "supersedes": card_ids,
                 "envelope": _memory_envelope_from_card(
                     card,
-                    occurred_at=occurred_at,
+                    occurred_at=source_occurred_at,
                     source="memory_dream",
                     build_envelope=build_envelope,
                     default_type="fact",

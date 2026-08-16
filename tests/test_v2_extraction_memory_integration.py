@@ -12,6 +12,8 @@ import sys
 import types
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
 from memory import actions as memory_actions  # noqa: E402
@@ -67,7 +69,12 @@ def _builder(user_id: str):
     return _build
 
 
-def _old_card(user_id: str, memory_id: str) -> dict:
+def _old_card(
+    user_id: str,
+    memory_id: str,
+    *,
+    occurred_at: str = "2026-07-17T00:00:00Z",
+) -> dict:
     return {
         "id": memory_id,
         "body_ct": json.dumps({"summary": memory_id, "content": memory_id}),
@@ -77,7 +84,7 @@ def _old_card(user_id: str, memory_id: str) -> dict:
         "visibility": "shared",
         "owner_user_id": user_id,
         "type": "fact",
-        "occurred_at": "2026-07-17T00:00:00Z",
+        "occurred_at": occurred_at,
         "created_at": "2026-07-17T00:00:00Z",
         "updated_at": "2026-07-17T00:00:00Z",
         "source": "memory_capture",
@@ -123,7 +130,10 @@ def test_capture_parser_mapper_and_real_validator_persist_nonempty_card(monkeypa
 def test_dream_parser_mapper_and_real_validator_supersede_all_sources(monkeypatch):
     user_id = "dream-integration-user"
     store = types.SimpleNamespace(user_id=user_id)
-    moments = [_old_card(user_id, "memory-a"), _old_card(user_id, "memory-b")]
+    moments = [
+        _old_card(user_id, "memory-a", occurred_at="2026-02-08T09:00:00Z"),
+        _old_card(user_id, "memory-b", occurred_at="2026-05-03T00:00:00Z"),
+    ]
     saved = _install_storage(monkeypatch, moments)
     consolidations, questions, parse_error = parse_dream_consolidations(json.dumps({
         "consolidations": [{
@@ -148,6 +158,7 @@ def test_dream_parser_mapper_and_real_validator_supersede_all_sources(monkeypatc
         occurred_at="2026-07-18T10:00:00Z",
         source_ids=["chat-1", "chat-2"],
         build_envelope=_builder(user_id),
+        existing_cards=moments,
     )
     body, status = memory_actions._execute_memory_actions(store, None, actions)
 
@@ -161,7 +172,64 @@ def test_dream_parser_mapper_and_real_validator_supersede_all_sources(monkeypatc
     assert all(item["superseded_by"] == new["id"] for item in old.values())
     assert new["supersedes"] == ["memory-a", "memory-b"]
     assert new["source"] == "memory_dream"
-    assert new["occurred_at"] == "2026-07-18T10:00:00Z"
+    # Assert the persisted record, not the mapper's intermediate action.  The
+    # worker timestamp is deliberately newer and must never win for Dream.
+    assert new["occurred_at"] == "2026-05-03T00:00:00Z"
+
+
+def test_dream_persisted_envelope_keeps_today_when_today_is_latest(monkeypatch):
+    user_id = "dream-today-integration-user"
+    store = types.SimpleNamespace(user_id=user_id)
+    moments = [
+        _old_card(user_id, "memory-old", occurred_at="2026-02-08T09:00:00Z"),
+        _old_card(user_id, "memory-today", occurred_at="2026-08-14T07:30:00Z"),
+    ]
+    saved = _install_storage(monkeypatch, moments)
+    actions, _added, _superseded = extraction.consolidations_to_actions(
+        [{
+            "op": "merge",
+            "card_ids": ["memory-old", "memory-today"],
+            "rationale": "同一线索今天有新进展",
+            "result": {"summary": "new", "content": "new body"},
+        }],
+        occurred_at="2099-12-31T23:59:59Z",
+        source_ids=[],
+        build_envelope=_builder(user_id),
+        existing_cards=moments,
+    )
+
+    body, status = memory_actions._execute_memory_actions(store, None, actions)
+
+    assert status == 200 and body["applied_count"] == 1
+    new = next(item for item in saved if item["id"].startswith("mem-generated-"))
+    assert new["occurred_at"] == "2026-08-14T07:30:00Z"
+
+
+def test_dream_unusable_source_time_does_not_retire_or_write(monkeypatch):
+    user_id = "dream-missing-time-integration-user"
+    store = types.SimpleNamespace(user_id=user_id)
+    moments = [
+        _old_card(user_id, "memory-valid", occurred_at="2026-02-08T09:00:00Z"),
+        _old_card(user_id, "memory-missing", occurred_at=""),
+    ]
+    saved = _install_storage(monkeypatch, moments)
+
+    with pytest.raises(ValueError, match="dream_source_occurred_at_unavailable"):
+        extraction.consolidations_to_actions(
+            [{
+                "op": "merge",
+                "card_ids": ["memory-valid", "memory-missing"],
+                "rationale": "同一线索",
+                "result": {"summary": "new", "content": "new body"},
+            }],
+            occurred_at="2099-12-31T23:59:59Z",
+            source_ids=[],
+            build_envelope=_builder(user_id),
+            existing_cards=moments,
+        )
+
+    assert saved == []
+    assert [moment["status"] for moment in moments] == ["active", "active"]
 
 
 def test_dream_apply_allows_prior_run_dream_output_without_long_cooldown(monkeypatch):
@@ -182,6 +250,7 @@ def test_dream_apply_allows_prior_run_dream_output_without_long_cooldown(monkeyp
         occurred_at="2026-08-01T00:00:00Z",
         source_ids=[],
         build_envelope=_builder(user_id),
+        existing_cards=moments,
     )
 
     body, status = memory_actions._execute_memory_actions(store, None, actions)
@@ -209,6 +278,7 @@ def test_dream_apply_has_no_five_rewrite_cap(monkeypatch):
             occurred_at="2026-08-01T00:00:00Z",
             source_ids=[],
             build_envelope=builder,
+            existing_cards=moments,
         )
         actions.extend(mapped)
 
@@ -241,6 +311,7 @@ def test_dream_apply_has_no_four_retired_card_cap(monkeypatch):
             occurred_at="2026-08-01T00:00:00Z",
             source_ids=[],
             build_envelope=builder,
+            existing_cards=moments,
         )
         actions.extend(mapped)
 
@@ -270,6 +341,8 @@ def test_dream_live_rig_shape_persists_all_structural_merges(monkeypatch):
         {"id": "birthday", "summary": "家人生日", "content": "妈妈生日是五月十二日。"},
         {"id": "insomnia", "summary": "最近失眠", "content": "连续三晚凌晨两点后才睡着。"},
     ]
+    for index, candidate in enumerate(candidates, start=1):
+        candidate["occurred_at"] = f"2026-07-{index:02d}T00:00:00Z"
     shared_prompt = build_dream_prompt(
         ai_name="小柒",
         user_name="阿霖",

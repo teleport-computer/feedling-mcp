@@ -424,6 +424,65 @@ def test_parse_openai_compat_body_result_shape():
             provider="openrouter", model="m", require_reply=False)
 
 
+def test_parse_openai_compat_body_preserves_all_visible_text_blocks():
+    resp = FakeResponse(200, {
+        "id": "chatcmpl-blocks",
+        "choices": [{
+            "message": {
+                "content": [
+                    {"type": "text", "text": "first visible block"},
+                    {"type": "reasoning", "text": "hidden chain of thought"},
+                    {"type": "output_text", "text": "second visible block"},
+                ],
+            },
+            "finish_reason": "stop",
+        }],
+    })
+
+    out = pc._parse_openai_compat_body(
+        resp, provider="openai_compatible", model="gpt-5.5", require_reply=True)
+
+    assert out["reply"] == "first visible block\nsecond visible block"
+    assert out["reasoning"] == "hidden chain of thought"
+
+
+def test_parse_openai_compat_body_treats_untyped_text_block_as_visible():
+    """Accept minimal relay text blocks that omit ``type``.
+
+    This is an explicit compatibility tradeoff: an untyped reasoning block
+    would be indistinguishable from visible text. Unknown *typed* blocks remain
+    fail-closed, while observed minimal relays keep their ordinary reply text.
+    """
+    resp = FakeResponse(200, {
+        "choices": [{"message": {"content": [{"text": "visible relay text"}]}}],
+    })
+
+    out = pc._parse_openai_compat_body(
+        resp, provider="openai_compatible", model="relay-model", require_reply=True)
+
+    assert out["reply"] == "visible relay text"
+
+
+def test_parse_openai_compat_body_drops_untyped_sibling_when_typed_blocks_exist():
+    """Mixed typed/untyped output fails closed for its ambiguous siblings.
+
+    A fully untyped list remains inherently ambiguous: without a type or
+    protocol marker there is no signal that can distinguish visible text from
+    reasoning. That residual risk is limited to all-untyped relay output.
+    """
+    resp = FakeResponse(200, {
+        "choices": [{"message": {"content": [
+            {"text": "ambiguous private reasoning"},
+            {"type": "text", "text": "visible answer"},
+        ]}}],
+    })
+
+    out = pc._parse_openai_compat_body(
+        resp, provider="openai_compatible", model="relay-model", require_reply=True)
+
+    assert out["reply"] == "visible answer"
+
+
 def test_parse_deepseek_body_extracts_reasoning_content():
     resp = FakeResponse(200, {
         "id": "chatcmpl-deepseek",

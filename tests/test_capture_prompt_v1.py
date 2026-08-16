@@ -15,7 +15,7 @@ from memory.capture_prompt_v1 import (  # noqa: E402
     capture_semantic_retry_reasons,
     parse_capture_cards,
 )
-from memory.card_text import extract_json_block  # noqa: E402
+from memory_garden.text.card_text import extract_json_block  # noqa: E402
 from core import self_thinking  # noqa: E402
 
 _FENCE = "`" * 3
@@ -35,6 +35,9 @@ def test_prompt_renders_with_context_and_escaped_json():
     assert '"action": "add | merge | supersede | noop"' in p
     assert "[mom_123]" in p
     assert "只能从这里复制确切 target_id" in p
+    assert "你们刚聊了一段" in p
+    assert "【你们的关系】" in p
+    assert "这个人的原话值得留" in p
 
 
 def test_prompt_falls_back_to_neutral_defaults():
@@ -42,6 +45,7 @@ def test_prompt_falls_back_to_neutral_defaults():
         ai_name="", user_name="", buckets="", threads="", identity="", window="",
     )
     assert "（暂无）" in p and "（空）" in p
+    assert p.startswith("你是 我——这个人 的伴侣。")
 
 
 def test_prompt_naming_rule_uses_known_name():
@@ -56,6 +60,7 @@ def test_prompt_naming_rule_uses_known_name():
     assert '永远不要用"用户"/"user"' in p
     # TA is an instruction/transcript marker only — outputs must not use it.
     assert "不要用「TA」指代本人" in p
+    assert "这些卡会由这个人亲眼看到" in p
 
 
 def test_prompt_naming_rule_without_name_uses_relationship_referent():
@@ -241,7 +246,7 @@ def test_capture_semantic_retry_requires_the_complete_batch():
 # instead of each card minting a fresh near-synonym (工作/职业/事业) or scattering.
 
 def test_capture_prompt_carries_canonical_buckets():
-    from memory.prompts_v1 import COMMON_BUCKETS_V1, _COMMON_BUCKETS_ZH, _COMMON_BUCKETS_EN
+    from memory_garden.prompts.buckets import COMMON_BUCKETS_V1, _COMMON_BUCKETS_ZH, _COMMON_BUCKETS_EN
     p = build_capture_prompt(
         ai_name="io", user_name="hx", buckets="（暂无）", threads="（暂无）",
         identity="x", window="y",
@@ -260,11 +265,20 @@ def test_capture_prompt_carries_canonical_buckets():
 
 
 def test_migrate_and_genesis_share_the_same_canonical_buckets():
-    from memory.prompts_v1 import _COMMON_BUCKETS_ZH
-    from memory.migrate_prompt_v1 import build_migrate_prompt
+    from memory_garden.prompts.buckets import _COMMON_BUCKETS_ZH
+    from memory_garden.prompts.migrate import build_migrate_prompt
     from genesis.prompts import FACT_WRITE_PROMPT
     mig = build_migrate_prompt(ai_name="io", user_name="hx", old_cards="c", vocab="（暂无）")
     assert _COMMON_BUCKETS_ZH in mig
     # onboarding (genesis FACT_WRITE) had NO bucket guidance before A9 — now it converges too
     assert _COMMON_BUCKETS_ZH in FACT_WRITE_PROMPT
     assert "桶名收敛" in FACT_WRITE_PROMPT
+
+
+def test_migrate_prompt_unknown_person_does_not_leak_ta_marker():
+    from memory_garden.prompts.migrate import build_migrate_prompt
+
+    prompt = build_migrate_prompt(
+        ai_name="", user_name="TA", old_cards="", vocab=""
+    )
+    assert prompt.startswith("你是 我——这个人 的伴侣。")

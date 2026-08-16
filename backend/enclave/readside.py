@@ -7,7 +7,7 @@ and routing cross-module calls through `config.env_flag_enabled` /
 monkeypatch them.
 
 `select_context_memories_via_readside` still reaches into the root
-`memory_index_selector` module (not moved as part of this migration).
+`memory_garden.scoring.selector` module (not moved as part of this migration).
 """
 
 from __future__ import annotations
@@ -16,7 +16,7 @@ import json
 import os
 
 from enclave import config, envelope
-from memory_index_selector import select_memory_index_items  # noqa: E402
+from memory_garden.scoring.selector import select_memory_index_items  # noqa: E402
 
 
 def memory_readside_for_model_api_enabled() -> bool:

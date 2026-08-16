@@ -9,7 +9,7 @@ import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "backend"))
 
-from memory.prompts_v1 import normalize_bucket_language  # noqa: E402
+from memory_garden.prompts.buckets import normalize_bucket_language  # noqa: E402
 
 
 def test_chinese_card_english_common_bucket_maps_to_chinese():
