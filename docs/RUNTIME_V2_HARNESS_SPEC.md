@@ -468,3 +468,33 @@ anthropic 尤其要紧:那是**用户可以自己填官方 key 的一等选项**
   ②把某家错翻成 OpenAI 形状 → 该家用例红(**这条最重要** —— 发出去一个对方
   不认的 payload,可能被静默忽略,和没发一样,只测「发了没」抓不到)。
 - 常量/集合从模块读取,测试不得写死 provider 名单。
+
+
+### B4-2 第二步:③④ 的分岔点已定位(claude2 2026-08-17)
+
+实现难点原本是「怎么在不误伤 thinking-only 的前提下识别结局④」。分岔点找到了,
+在 `worker.py` 唤醒段的这一行:
+
+    if (_wake_gate_on or _wake_self_thinking_on) and text:
+                                                   ^^^^^^^^
+
+**整段 think 剥离挂在 `and text:` 上**。所以:
+
+    ③ thinking-only:text 非空 → 剥离跑 → 得到 _st_wake.SILENT → 合法沉默
+    ④ 彻底空      :text 为空 → **剥离整段跳过** → 没有任何状态 → 静默完成
+
+两者在这里天然分开,**不需要新的判据,只需要把「有没有走过 SILENT」记下来**。
+
+实现建议(未做,留给下一轮):
+1. 唤醒段加一个布尔:走过 `_st_wake.SILENT` 或调过 `stay_silent` → True
+2. 轮末若「无可见消息」且该布尔为 False → 结局④
+3. 结局④ 注入**一次**有界纠正:「你这轮既没有可见内容也没调 stay_silent,
+   要么说话,要么调 stay_silent 并写理由」
+4. 纠正后仍是④ → 按现状接受(不能把可修复的场景变成永久失败)
+
+⚠️ 注意 `stay_silent` 在 tool_loop 有 `invalid_silence_batch` 校验
+(必须单独调用、不能和别的工具混批),实现时别绕过它。
+
+⚠️ 也要记得:实测显示**一部分「沉默」根本不是模型的选择** ——
+同一个号 72 小时内 38 次 heartbeat 是 `wake_failed:providererror`(整点失败,
+每 61 分钟一次)。那条是独立问题,不要被本条的纠正掩盖掉。
