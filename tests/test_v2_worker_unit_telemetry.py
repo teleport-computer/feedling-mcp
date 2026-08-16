@@ -5,10 +5,13 @@ import asyncio
 import sys
 from pathlib import Path
 
+import re
+
 import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
+from core import self_thinking  # noqa: E402
 from model_api_runtime.v2 import worker  # noqa: E402
 from model_api_runtime.v2 import language_follow  # noqa: E402
 from model_api_runtime.v2 import summary_frontier  # noqa: E402
@@ -534,3 +537,57 @@ def test_checkpoint_degradation_never_logs_arbitrary_detail_or_code(
     assert "sk_live_customer_secret" not in combined
     assert "private_user_content" not in combined
     assert "raw-secret-message" not in combined
+
+
+# ── B4-5 (#3):思考气泡的内部【字段名】黑名单 ─────────────────────────
+# 词表共享(core.self_thinking),**宽度按道分开**:
+#   V1 逐行丢弃 → 宽匹配;V2 整段替换成 marker → 窄匹配(只认泄漏形状)。
+
+
+@pytest.mark.parametrize("ordinary", [
+    "用户问 UUID 是什么",
+    "讨论 system prompt 的设计",
+    "学习 chain of thought prompting",
+    "他在研究 chain - of thought",
+    "他刚吃完脑花，撑得不行，我陪他消化一会儿",
+])
+def test_normal_technical_talk_is_not_suppressed(ordinary):
+    """不误伤(codex2 实测挑出的三句真会发生的话)。
+
+    V2 命中即把**整段**内心话换成「(思考没写完)」。用户完全可能跟伴侣聊
+    prompt 设计、聊 UUID 是什么 —— 把这些吞掉,他只会看到一句占位符,
+    而且不知道为什么。**误判的代价比漏判高。**
+    """
+    assert self_thinking.internal_field_leak(ordinary) is None
+
+
+@pytest.mark.parametrize("leak", [
+    "session_id: abc123",
+    '"input_tokens": 12',
+    "costUSD=0.02",
+    "terminal_reason -> x",
+    "permission_denials: []",
+    '{"uuid":"x"}',
+])
+def test_real_field_leaks_are_caught(leak):
+    """真泄漏必须命中:词后面紧跟分隔符/取值,概念提及不会长这样。"""
+    assert self_thinking.internal_field_leak(leak) is not None
+
+
+def test_shared_pattern_keeps_v1_wide_forms():
+    """共享 pattern 必须保留 V1 原有的宽形态,否则 V1 会开始漏。"""
+    pattern = self_thinking.internal_field_terms_pattern()
+    for term in self_thinking.INTERNAL_FIELD_TERMS:
+        assert re.escape(term) in pattern
+    assert re.search(pattern, "chain - of thought", re.IGNORECASE), (
+        "V1 原有的 chain[-\\s]*of[-\\s]*thought 宽形态丢了"
+    )
+
+
+def test_v2_guard_covers_tool_names_and_field_leaks():
+    """V2 判据同时盖两类,且对概念提及放行。"""
+    from model_api_runtime.v2 import worker as v2_worker
+
+    assert v2_worker._self_thinking_internal_term("我调 memory_write 存一下")
+    assert v2_worker._self_thinking_internal_term("session_id: 我看下这个")
+    assert v2_worker._self_thinking_internal_term("讨论 system prompt 的设计") is None

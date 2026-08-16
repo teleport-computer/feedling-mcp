@@ -11238,3 +11238,31 @@ def test_skipped_proactive_job_pays_no_context_fetches(
     assert crc._process_proactive_jobs([job]) == pytest.approx(321.0)
     assert (job_id_unique, expected_status) in statuses, statuses
     assert calls == [], f"被跳过的 job 仍然付了这些代价: {calls}"
+
+
+def test_thinking_denylist_calls_through_to_shared_vocabulary(monkeypatch):
+    """接线守卫:V1 的思考黑名单必须**真的**调共享词表,不能自己留一份。
+
+    ⚠️ 两版教训都在这条上:
+      1. 第一版只验 helper 自己能生成 pattern —— codex2 实测把 V1 退回本地 regex
+         仍全绿,典型「测了机制、没测接线」。
+      2. 第二版改用 importlib 动态导入生产 consumer —— 那会把已配置的模块
+         留在 sys.modules,污染同进程后续用例(codex2 实测 1 failed)。
+    本条放在这里,复用本文件顶部**已受控**的 crc 导入,不再动态导入。
+
+    做法:把共享 helper 换成只认 sentinel 的替身,再调真实的 V1 函数。
+      · sentinel 行被丢 → 证明真的走了共享 helper
+      · 旧词表的词在替身下不被误判 → 证明没有第二个词表来源
+    """
+    from core import self_thinking
+
+    monkeypatch.setattr(
+        self_thinking, "internal_field_terms_pattern", lambda: "(zzsentinelzz)"
+    )
+    out = crc._sanitize_thinking_summary(
+        "第一行 zzsentinelzz 应该被丢掉\n第二行 session_id 在替身下应当保留"
+    )
+    assert "zzsentinelzz" not in out, (
+        "V1 没有走共享 helper —— 它多半还留着自己的本地 regex"
+    )
+    assert "第二行" in out, "V1 用的不是替身给的 pattern,说明有另一个词表来源"
