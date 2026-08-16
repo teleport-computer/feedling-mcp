@@ -253,7 +253,10 @@ def test_chat_turn_explains_stalled_screen_share_without_old_pixels(monkeypatch)
     assert "screen_share.stalled means" in _provider_tool_description(
         seen, "screen_read"
     )
-    assert "共享连接可能断了" in system
+    assert (
+        "屏幕共享还开着、画面却停住不再更新时：说明连接可能断了，"
+        "请对方停止后重新开始共享。"
+    ) in system
     assert "别把旧画面说成现在的" in system
 
 
@@ -316,8 +319,10 @@ def test_chat_turn_explains_ended_screen_share_without_old_pixels(monkeypatch):
     assert "screen_share.ended means" in _provider_tool_description(
         seen, "screen_read"
     )
-    assert "屏幕图片仍可继续聊，但别说成当前屏幕" in system
-    assert "重启屏幕共享或发张截图" in system
+    assert (
+        "屏幕共享已经结束后：之前聊过的屏幕图片还可以继续聊，"
+        "但别说成当前屏幕；想再看，就请对方重启共享或发张截图。"
+    ) in system
 
 
 def test_chat_can_pull_exact_perception_after_first_round(monkeypatch):

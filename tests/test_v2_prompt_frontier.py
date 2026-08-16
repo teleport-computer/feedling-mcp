@@ -26,15 +26,15 @@ def _model_limit(context_window_tokens: int = 2_048) -> frontier.ModelPromptLimi
 
 
 _REAL_TOOL_COUNT = 69
-_REAL_TOOL_CATALOG_BYTES = 32_684
+_REAL_TOOL_CATALOG_BYTES = 33_710
 
 
 def _real_sized_mixed_tool_catalog() -> tuple[list[ToolSpec], list[ToolSpec]]:
-    """34-ish platform tools + user MCP, matching the captured production size.
+    """34-ish platform tools + user MCP at the post-audit production size.
 
     The fixture is derived from the real platform catalog rather than copying a
     toy schema list. ASCII description padding makes the combined canonical
-    payload exactly 32,684 bytes while keeping 69 independently named tools.
+    payload exactly 33,710 bytes while keeping 69 independently named tools.
     """
     platform = list(tool_schema.build_tool_specs())
     mcp_count = _REAL_TOOL_COUNT - len(platform)
@@ -1057,10 +1057,12 @@ def test_real_sized_mixed_catalog_reaches_provider_at_common_window_boundaries(
 ):
     """A production-sized catalog must not turn into a text-only request.
 
-    The captured failure had 69 tools / 32,684 canonical UTF-8 bytes. Previous
-    fixtures used a handful of tiny schemas, so the atomic omission branch was
-    never reached. This assertion is at the final provider exit: accounting a
-    catalog upstream does not count if ``tool_loop`` later sends ``tools=None``.
+    The captured failure had 69 tools / 32,684 canonical UTF-8 bytes; the
+    post-audit catalog is 33,710 bytes after adding approved relevance gates.
+    Previous fixtures used a handful of tiny schemas, so the atomic omission
+    branch was never reached. This assertion is at the final provider exit:
+    accounting a catalog upstream does not count if ``tool_loop`` later sends
+    ``tools=None``.
     """
     platform, mcp = _real_sized_mixed_tool_catalog()
     calls = []

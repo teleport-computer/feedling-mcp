@@ -445,6 +445,17 @@ for _parameters in PARAMS.values():
     if _parameters.get("type") == "object":
         _parameters["additionalProperties"] = False
 
+_PERCEPTION_USAGE_GATE = (
+    "Use when the user's request depends on their current device, environment, "
+    "activity, health, calendar, or reminders; do not call for unrelated "
+    "conversation or claim those readings are inaccessible while this tool is "
+    "available. "
+)
+_SCREEN_USAGE_GATE = (
+    "Use when the user's message plausibly refers to a shared screen; do not call "
+    "for unrelated conversation. "
+)
+
 DESCRIPTIONS: dict[str, str] = {
     "identity_get": "Read the persona's current identity/profile fields.",
     "identity_patch": ("Update the persona's own identity/profile in the SAME turn when "
@@ -468,7 +479,8 @@ DESCRIPTIONS: dict[str, str] = {
                        "replace_signatures, NOT replace_signature. For each list field, "
                        "use only one method in a call: whole replacement, add, remove, "
                        "or replace. D4 rename rule: changing agent_name requires "
-                       "self_introduction in the same call. To recalibrate how "
+                       "self_introduction in the same call. Dimensions are not managed "
+                       "by this tool; use identity_dimensions_set. To recalibrate how "
                        "long you and the user have known each other, set the "
                        "'relationship_days' argument directly — e.g. identity_patch(relationship_days=300). "
                        "This is the day number AS THE USER SEES AND SAYS IT (the '第 N 天' shown "
@@ -599,10 +611,8 @@ DESCRIPTIONS: dict[str, str] = {
                      "memory_search/memory_index again for current active ids, then "
                      "retry the merge.\n"
                      + prompts_v1.MEMORY_WRITE_RULES_V1),
-    "perception_snapshot": ("Use when the user's request depends on their current device, "
-                            "environment, activity, health, calendar, or reminders; do not "
-                            "call for unrelated conversation or claim those readings are "
-                            "inaccessible while this tool is available. Read the latest "
+    "perception_snapshot": (_PERCEPTION_USAGE_GATE
+                            + "Read the latest "
                             "perception snapshot for named signals across "
                             + _PERCEPTION_DOMAINS + ". "
                             "If signals is omitted, ONLY the fast defaults are returned: "
@@ -611,23 +621,27 @@ DESCRIPTIONS: dict[str, str] = {
                             "The app field is only the latest open/close event observed "
                             "within 15 minutes; never claim it is the app currently in use. "
                             "Use perception_recent_apps for an activity trajectory."),
-    "perception_recent_apps": ("Read the merged app open/close trajectory, newest first, "
+    "perception_recent_apps": (_PERCEPTION_USAGE_GATE
+                               + "Read the merged app open/close trajectory, newest first, "
                                "with event, minutes_ago, and category. Use hours to bound "
                                "the time window and check minutes_ago before saying 'just "
                                "now'. apps=[] means no data; disabled=true means access is "
                                "off, not that no apps were used."),
-    "perception_trend": ("Read a numeric-field trend over recent days for one named signal "
+    "perception_trend": (_PERCEPTION_USAGE_GATE
+                         + "Read a numeric-field trend over recent days for one named signal "
                          "from " + _PERCEPTION_DOMAINS + ". Snapshot defaults do not apply: "
                          "always name the signal, and name the field when the signal has "
                          "multiple numeric fields. "
                          "Interpret the rolling baseline as the usual level and delta as "
                          "the current change from that baseline; do not conflate them."),
-    "perception_history": ("Read raw daily historical values over recent days for one named "
+    "perception_history": (_PERCEPTION_USAGE_GATE
+                           + "Read raw daily historical values over recent days for one named "
                            "signal from " + _PERCEPTION_DOMAINS + ". Snapshot defaults do "
                            "not apply: always request the signal explicitly."),
-    "screen_recent": "List recent screen-share frame metadata.",
-    "screen_read": ("Use when the user's message plausibly refers to a shared screen; do "
-                    "not call for unrelated conversation. screen_share.active means the "
+    "screen_recent": (_SCREEN_USAGE_GATE
+                      + "List recent screen-share frame metadata."),
+    "screen_read": (_SCREEN_USAGE_GATE
+                    + "screen_share.active means the "
                     "user is sharing RIGHT NOW but reports availability only, never "
                     "screen contents: call screen_read rather than claiming you cannot "
                     "see a screen reported as live. "
@@ -683,12 +697,19 @@ DESCRIPTIONS: dict[str, str] = {
     TASK_TOOL: ("Run a bounded isolated subagent on one focused task. The child can "
                 "read workspace/artifact, memory, and web data but cannot reply to "
                 "the user, mutate state, call MCP, or spawn another task."),
-    REPLY_TOOL: "Send an immediate reply bubble to the user with the given text.",
+    REPLY_TOOL: (
+        "Send an immediate reply bubble to the user with the given text during a "
+        "long-running task when timely progress feedback is useful. This bubble is "
+        "not the final reply, does not need and must not include <think>, and must "
+        "not replace the final reply."
+    ),
     FILE_REPLY_TOOL: (
         "Deliver an existing /workspace source as a downloadable attachment. "
         "Plain-text formats are sent directly; .docx and .pdf targets are rendered "
         "into real Word/PDF bytes. Preserve any format the user explicitly requested: "
         "Word means .docx and PDF means .pdf, and never replace either with Markdown. "
+        "Even when reformatting an existing file, never substitute Markdown for another "
+        "supported format the user explicitly requested. "
         "Choose this tool from the user's meaning, not from exact "
         "keywords, wording, language, or a named extension: use it whenever the "
         "requested result is meant to be a reusable standalone artifact they can "
