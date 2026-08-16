@@ -5384,24 +5384,11 @@ def _latest_user_writing_system(rows: Iterable[dict]) -> str:
     return "indeterminate"
 
 
-async def _emit_reply_language_follow_trace(
-    emit_debug_trace: Callable[..., None] | None,
-    user_id: str,
-    *,
-    user_rows: Iterable[dict],
-    visible_reply: str,
-    lane: str,
-) -> None:
-    """Emit one terminal, content-free language-follow observation.
+def _reply_language_follow_observation(
+    user_rows: Iterable[dict], visible_reply: str
+) -> tuple[str, str, str]:
+    """Return the shared closed-enum language-follow observation."""
 
-    This first layer measures writing systems only.  Legitimate cross-language
-    requests (for example, asking for an English translation in Chinese) are
-    expected mismatch noise; correction/retry policy is explicitly out of
-    scope until aggregate data justifies a second layer.
-    """
-
-    if emit_debug_trace is None:
-        return
     user_script = _latest_user_writing_system(user_rows)
     reply_script = v2_language_follow.classify_writing_system(visible_reply)
     if "indeterminate" in {user_script, reply_script}:
@@ -5410,6 +5397,43 @@ async def _emit_reply_language_follow_trace(
         outcome = "match"
     else:
         outcome = "mismatch"
+    return user_script, reply_script, outcome
+
+
+async def _emit_reply_language_follow_trace(
+    emit_debug_trace: Callable[..., None] | None,
+    user_id: str,
+    *,
+    user_rows: Iterable[dict],
+    visible_reply: str,
+    lane: str,
+    correction_attempted: bool = False,
+    correction_outcome: str = "skipped",
+) -> None:
+    """Emit one terminal, content-free language-follow observation.
+
+    The event stays content-free while also recording the bounded foreground
+    correction disposition. Wake lanes never attempt correction and report the
+    default ``False``/``skipped`` pair.
+    """
+
+    if emit_debug_trace is None:
+        return
+    user_script, reply_script, outcome = _reply_language_follow_observation(
+        user_rows, visible_reply
+    )
+    safe_correction_outcome = (
+        correction_outcome
+        if correction_outcome
+        in {
+            "corrected",
+            "kept_original_still_mismatch",
+            "retry_error",
+            "retry_empty",
+            "skipped",
+        }
+        else "skipped"
+    )
     safe_lane = "wake" if lane == "wake" else "chat"
     try:
         await asyncio.to_thread(
@@ -5419,7 +5443,7 @@ async def _emit_reply_language_follow_trace(
             status="warning" if outcome == "mismatch" else "ok",
             summary="V2 回复文字系统跟随观测",
             explain=(
-                "仅记录用户与可见回复的主导文字系统、匹配结果和 lane；"
+                "仅记录用户与可见回复的主导文字系统、匹配结果、纠偏处置和 lane；"
                 "不记录正文、比例或思考内容。"
             ),
             detail={
@@ -5427,6 +5451,8 @@ async def _emit_reply_language_follow_trace(
                 "reply_script": reply_script,
                 "outcome": outcome,
                 "lane": safe_lane,
+                "correction_attempted": bool(correction_attempted),
+                "correction_outcome": safe_correction_outcome,
             },
         )
     except Exception as exc:  # noqa: BLE001 — diagnostics cannot fail a reply
@@ -11579,6 +11605,16 @@ async def process_job(
         thinking_trace_emitted = False
         language_trace_emitted = False
         language_user_rows: list[dict] = []
+        language_correction_attempted = False
+        language_correction_pending = False
+        language_correction_outcome = "skipped"
+
+        def _cancel_language_correction() -> None:
+            nonlocal language_correction_attempted
+            nonlocal language_correction_pending, language_correction_outcome
+            language_correction_attempted = False
+            language_correction_pending = False
+            language_correction_outcome = "skipped"
 
         async def _on_reply(
             text: str | WorkspaceFileReply,
@@ -11586,12 +11622,20 @@ async def process_job(
             final: bool,
             reasoning: str = "",
             media: tuple[ProviderMedia, ...] = (),
-        ) -> None:
+            correction_outcome: str = "",
+        ) -> (
+            v2_tool_loop.FinalReplyCorrectionRequest
+            | v2_tool_loop.FinalReplyCorrectionRejected
+            | None
+        ):
             nonlocal final_job_completed_atomically, voice_reply_slot
             nonlocal voice_call_ended_atomically
             nonlocal thinking_trace_emitted, language_trace_emitted
+            nonlocal language_correction_attempted
+            nonlocal language_correction_pending, language_correction_outcome
             file_reply = text if isinstance(text, WorkspaceFileReply) else None
-            text = "" if file_reply is not None else str(text or "").strip()
+            raw_reply_text = "" if file_reply is not None else str(text or "").strip()
+            text = raw_reply_text
             image_replies: list[GeneratedImageReply] = []
             if media:
                 if file_reply is not None or not final:
@@ -11761,6 +11805,52 @@ async def process_job(
                     )
                     if not pending_file_replies:
                         raise TurnError("internal_file_reference_without_attachment")
+            if correction_outcome:
+                safe_outcomes = {
+                    "corrected",
+                    "kept_original_still_mismatch",
+                    "retry_error",
+                    "retry_empty",
+                    "skipped",
+                }
+                language_correction_outcome = (
+                    correction_outcome
+                    if correction_outcome in safe_outcomes
+                    else "skipped"
+                )
+                language_correction_attempted = (
+                    language_correction_outcome != "skipped"
+                )
+                language_correction_pending = False
+            elif final and file_reply is None and not image_replies and text:
+                (
+                    user_script,
+                    reply_script,
+                    follow_outcome,
+                ) = _reply_language_follow_observation(language_user_rows, text)
+                if language_correction_pending:
+                    if reply_script == user_script:
+                        language_correction_pending = False
+                        language_correction_outcome = "corrected"
+                    else:
+                        # The loop still owns the original candidate. Reject this
+                        # one without publishing so it can fail-open to that exact
+                        # original rather than exposing a second wrong-language
+                        # rewrite.
+                        return v2_tool_loop.FinalReplyCorrectionRejected()
+                elif (
+                    follow_outcome == "mismatch"
+                    and user_script not in {"indeterminate", "mixed"}
+                    and reply_script not in {"indeterminate", "mixed"}
+                ):
+                    language_correction_attempted = True
+                    language_correction_pending = True
+                    return v2_tool_loop.FinalReplyCorrectionRequest(
+                        instruction=v2_language_follow.CORRECTION_INSTRUCTION,
+                        original_text=raw_reply_text,
+                        original_reasoning=reasoning,
+                        on_cancel=_cancel_language_correction,
+                    )
             delivery_started_ns = time.monotonic_ns()
             # A cutover/ABA can happen while awaiting the provider. Fence at
             # the reply effect itself; the pre-round check is not sufficient.
@@ -12102,6 +12192,8 @@ async def process_job(
                             user_rows=language_user_rows,
                             visible_reply=text,
                             lane="chat",
+                            correction_attempted=language_correction_attempted,
+                            correction_outcome=language_correction_outcome,
                         )
                     final_job_completed_atomically = True
                     return
@@ -12187,6 +12279,8 @@ async def process_job(
                     user_rows=language_user_rows,
                     visible_reply=text,
                     lane="chat",
+                    correction_attempted=language_correction_attempted,
+                    correction_outcome=language_correction_outcome,
                 )
 
         # `seq` is exclusively the consumed user|human frontier. The base prompt's

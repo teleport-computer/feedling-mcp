@@ -1,11 +1,11 @@
 """Deterministic, content-free writing-system classification.
 
 This module deliberately has no Runtime, database, provider, or locale
-dependencies.  The first telemetry layer measures Unicode writing systems,
-not linguistic intent: a legitimate request such as "translate this to
-English" can therefore be recorded as a mismatch.  Any future correction
-policy must handle those exemptions separately instead of changing this
-observer's historical meaning.
+dependencies.  It measures Unicode writing systems, not linguistic intent: a
+legitimate request such as "translate this to English" can therefore be
+classified as a mismatch.  Foreground correction gives the model one explicit
+escape to repeat the original in that case instead of changing this shared
+classifier's historical meaning.
 """
 from __future__ import annotations
 
@@ -15,6 +15,12 @@ from typing import Literal
 
 MIN_LETTER_COUNT = 10
 DOMINANT_SHARE = 0.60
+
+CORRECTION_INSTRUCTION = (
+    "你刚才这条回复,语言和这个人正在说的语言对不上。除非这个人要求过你用别的语言,"
+    "否则用这个人的语言把同一条回复重说一遍:内容、语气、分寸都不变,只换语言。"
+    "要是这个人确实要求过现在这种语言,就原样重复原回复。"
+)
 
 WritingSystem = Literal[
     "han",

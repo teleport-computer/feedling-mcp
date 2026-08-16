@@ -10,6 +10,13 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **Hosted Runtime V2 Chat now makes one bounded attempt to correct a reply
+  written in a different dominant writing system from the person's latest
+  substantive message.** The retry changes only the reply language and never
+  repeats tools. If the rewrite fails, is empty, remains mismatched, or cannot
+  be classified confidently, Chat delivers the original usable reply. Proactive
+  wake and background lanes are unchanged.
+
 - **Hosted Runtime V2 now makes prompt boundaries and tool timing more
   explicit.** Runtime-control authority remains in the stable system policy
   while conditional recovery rules remain runtime data. Perception and screen

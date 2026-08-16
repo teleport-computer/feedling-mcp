@@ -2,6 +2,7 @@
 all side effects injected. One loop for every model — no is_official branch."""
 
 from __future__ import annotations
+from collections.abc import Callable
 from dataclasses import dataclass
 import inspect
 import json
@@ -447,6 +448,27 @@ class ProviderEmptyReply(RuntimeError):
     """A structurally valid provider success had no foreground-usable output."""
 
 
+@dataclass(frozen=True)
+class FinalReplyCorrectionRequest:
+    """Ask the loop for one text-only rewrite before publishing a final reply.
+
+    ``original_text`` is the caller's pre-publication provider text.  It stays
+    private to the loop and is published unchanged if the bounded rewrite is
+    unusable.  Only foreground Chat returns this marker; other lanes keep the
+    historical ``on_reply -> None`` contract.
+    """
+
+    instruction: str
+    original_text: str
+    original_reasoning: str = ""
+    on_cancel: Callable[[], None] | None = None
+
+
+@dataclass(frozen=True)
+class FinalReplyCorrectionRejected:
+    """The one rewrite was usable text but failed the caller's acceptance gate."""
+
+
 def _empty_response_shape(pr: ProviderResponse) -> dict[str, object]:
     """Return content-free diagnostics for a provider success with no output."""
     raw_stop_reason = str(pr.raw.get("stop_reason") or "").strip().lower()
@@ -586,6 +608,10 @@ async def run_tool_loop(
     write; the drain itself is `asyncio.to_thread`-offloaded on the caller's side, so
     ``on_reply`` must be awaited here, never called synchronously (a sync call would
     reintroduce the event-loop-blocking write the offload is meant to avoid).
+    Foreground Chat may instead return :class:`FinalReplyCorrectionRequest` before
+    publishing, then either publish the accepted rewrite or return
+    :class:`FinalReplyCorrectionRejected`.  The loop gives that request exactly one
+    text-only provider call and otherwise republishes the original fail-open.
 
     ``on_file_reply`` is an optional async chat-lane callback. When absent, the
     ``send_file`` tool is removed from the offered catalog. Production resolves
@@ -670,6 +696,8 @@ async def run_tool_loop(
     force_text_fallback_reason = ""
     empty_response_recovery_used = False
     empty_response_retry_instruction = ""
+    final_reply_correction_request: FinalReplyCorrectionRequest | None = None
+    final_reply_correction_instruction = ""
     external_content_seen = False
     mutation_outcome_unknown = False
     outbound_tools_blocked = bool(initial_outbound_tools_blocked)
@@ -829,6 +857,39 @@ async def run_tool_loop(
     def _merged_reasoning() -> str:
         return "\n\n".join(reasoning_fragments)
 
+    async def _publish_final_correction_fallback(outcome: str) -> None:
+        """Publish the saved usable answer when its one rewrite cannot be used."""
+
+        request = final_reply_correction_request
+        if request is None:
+            raise RuntimeError("final reply correction fallback without request")
+        decision = await on_reply(
+            request.original_text,
+            final=True,
+            reasoning=request.original_reasoning,
+            correction_outcome=outcome,
+        )
+        if decision is not None:
+            raise RuntimeError("final reply correction fallback was not published")
+
+    def _cancel_final_reply_correction() -> None:
+        """Drop an old-target correction when newly folded input supersedes it."""
+
+        nonlocal final_reply_correction_request
+        nonlocal final_reply_correction_instruction
+        nonlocal force_text_fallback, force_text_fallback_reason
+        request = final_reply_correction_request
+        if request is not None and request.on_cancel is not None:
+            try:
+                request.on_cancel()
+            except Exception:
+                pass
+        final_reply_correction_request = None
+        final_reply_correction_instruction = ""
+        if force_text_fallback_reason == "final_reply_correction":
+            force_text_fallback = False
+            force_text_fallback_reason = ""
+
     async def _tool_event(tc, event_kind: str, payload: dict) -> None:
         if on_tool_event is not None:
             await on_tool_event(tc, event_kind, payload)
@@ -841,6 +902,8 @@ async def run_tool_loop(
             # after-first behavior until their timestamp seam is removed.
             folded = await fold_new_messages()
             if folded:
+                if final_reply_correction_request is not None:
+                    _cancel_final_reply_correction()
                 # A newly arrived user message changes the answer target. Do not
                 # attach reasoning produced for the superseded prompt to the
                 # revised final reply.
@@ -883,14 +946,16 @@ async def run_tool_loop(
 
         messages = build_messages(list(transcript))
         turn_catalog = _turn_catalog()
-        # 三道有界纠正共用同一条临时 system suffix 注入通道：文件投递缺失、
-        # 生图谎报，以及语义空回复。各自最多打回一次，不写入 transcript。
+        # 四道有界纠正共用同一条临时 system suffix 注入通道：文件投递缺失、
+        # 生图谎报、语义空回复，以及 chat 最终回复的语言纠偏。各自最多打回
+        # 一次，不写入 transcript。
         retry_instructions = "\n\n".join(
             instruction
             for instruction in (
                 delivery_retry_instruction,
                 image_claim_retry_instruction,
                 empty_response_retry_instruction,
+                final_reply_correction_instruction,
             )
             if instruction
         )
@@ -900,7 +965,11 @@ async def run_tool_loop(
         # a real tool_choice=none keep schemas referenced by their native history;
         # other wires omit tools as before. A 400/422 schema rejection or repeated
         # malformed call also forces this bounded fallback.
-        terminal_text_round = force_text_fallback or attempts == max_calls - 1
+        terminal_text_round = (
+            force_text_fallback
+            or final_reply_correction_request is not None
+            or attempts == max_calls - 1
+        )
         historical_tool_names = {
             call.name
             for item in transcript
@@ -1262,6 +1331,32 @@ async def run_tool_loop(
                     await on_provider_failure(exc)
                 except Exception:
                     pass
+            if final_reply_correction_request is not None:
+                # Language correction is a best-effort polish over an already
+                # usable answer. A failed rewrite must never turn that answer
+                # into a failed Chat turn.
+                try:
+                    await _publish_final_correction_fallback("retry_error")
+                except FinalReplySuperseded:
+                    _cancel_final_reply_correction()
+                    reasoning_fragments.clear()
+                    seen_reasoning_fragments.clear()
+                    _progress("final_reply_superseded")
+                    await _trajectory(
+                        "final_reply_superseded",
+                        {"round": attempts},
+                    )
+                    if attempts < max_calls:
+                        continue
+                    return LoopOutcome(
+                        "", attempts, "input_advanced", replied_intermediate
+                    )
+                return LoopOutcome(
+                    final_reply_correction_request.original_text,
+                    attempts,
+                    "final_text",
+                    replied_intermediate,
+                )
             if (
                 file_delivery_retry_used
                 and not normalized_required_suffixes.issubset(
@@ -1370,6 +1465,55 @@ async def run_tool_loop(
         # ProviderResponse.raw keeps its input mapping alive.
         result = provider_client.without_runtime_provider_attempt_trace(result)
         pr = ProviderResponse.from_result(result)
+
+        if (
+            final_reply_correction_request is not None
+            and (not pr.text.strip() or upstream_response_envelope)
+            and not pr.tool_calls
+            and not pr.media
+        ):
+            # Do not hand an empty language rewrite to the ordinary empty-response
+            # recovery, which would create a second correction loop. The original
+            # answer is already usable, so publish it immediately instead.
+            await _trajectory(
+                "empty_provider_response",
+                {
+                    "round": attempts,
+                    "reason": (
+                        "upstream_response_envelope"
+                        if upstream_response_envelope
+                        else "empty_provider_success"
+                    ),
+                    "response_shape": _empty_response_shape(pr),
+                    "action": "language_correction_fallback",
+                },
+            )
+            if on_empty_provider_response is not None:
+                try:
+                    await on_empty_provider_response(_empty_response_shape(pr))
+                except Exception:
+                    pass
+            try:
+                await _publish_final_correction_fallback("retry_empty")
+            except FinalReplySuperseded:
+                if final_reply_correction_request is not None:
+                    _cancel_final_reply_correction()
+                reasoning_fragments.clear()
+                seen_reasoning_fragments.clear()
+                _progress("final_reply_superseded")
+                await _trajectory(
+                    "final_reply_superseded",
+                    {"round": attempts},
+                )
+                if attempts < max_calls:
+                    continue
+                return LoopOutcome("", attempts, "input_advanced", replied_intermediate)
+            return LoopOutcome(
+                final_reply_correction_request.original_text,
+                attempts,
+                "final_text",
+                replied_intermediate,
+            )
 
         if (
             require_reply
@@ -1589,8 +1733,70 @@ async def run_tool_loop(
                 }
                 if pr.media:
                     reply_kwargs["media"] = pr.media
-                await on_reply(pr.text, **reply_kwargs)
+                reply_decision = await on_reply(pr.text, **reply_kwargs)
+                if isinstance(reply_decision, FinalReplyCorrectionRequest):
+                    if (
+                        final_reply_correction_request is None
+                        and attempts < max_calls
+                    ):
+                        final_reply_correction_request = reply_decision
+                        final_reply_correction_instruction = str(
+                            reply_decision.instruction or ""
+                        ).strip()
+                        if not final_reply_correction_instruction:
+                            await on_reply(
+                                reply_decision.original_text,
+                                final=True,
+                                reasoning=reply_decision.original_reasoning,
+                                correction_outcome="skipped",
+                            )
+                            return LoopOutcome(
+                                reply_decision.original_text,
+                                attempts,
+                                "final_text",
+                                replied_intermediate,
+                            )
+                        # A rewrite is not authorized to repeat tools or side
+                        # effects. Keep historical schemas only where the wire
+                        # requires them, paired with tool_choice=none.
+                        force_text_fallback = True
+                        force_text_fallback_reason = "final_reply_correction"
+                        reasoning_fragments.clear()
+                        seen_reasoning_fragments.clear()
+                        _progress("final_reply_correction_boundary")
+                        continue
+                    # No call budget (or a malformed second request): publish
+                    # the already usable original instead of failing the turn.
+                    fallback = (
+                        final_reply_correction_request or reply_decision
+                    )
+                    final_reply_correction_request = fallback
+                    await _publish_final_correction_fallback("skipped")
+                    return LoopOutcome(
+                        fallback.original_text,
+                        attempts,
+                        "final_text",
+                        replied_intermediate,
+                    )
+                if isinstance(reply_decision, FinalReplyCorrectionRejected):
+                    if final_reply_correction_request is None:
+                        raise RuntimeError(
+                            "final reply correction rejected without request"
+                        )
+                    await _publish_final_correction_fallback(
+                        "kept_original_still_mismatch"
+                    )
+                    return LoopOutcome(
+                        final_reply_correction_request.original_text,
+                        attempts,
+                        "final_text",
+                        replied_intermediate,
+                    )
+                if reply_decision is not None:
+                    raise RuntimeError("unsupported final reply decision")
             except FinalReplySuperseded:
+                if final_reply_correction_request is not None:
+                    _cancel_final_reply_correction()
                 reasoning_fragments.clear()
                 seen_reasoning_fragments.clear()
                 _progress("final_reply_superseded")
