@@ -2,7 +2,7 @@
 
 ## Objective
 
-Promote the complete backend state at `origin/test@d94e5261ec69e3f5afddef4f5368a3a7ec146d4e` onto `origin/pre@3ebc700ff006bca7d54d141028c4f85596ef72fc` without weakening PRE's per-user plaintext/encrypted content routing, TEE-primary startup contract, or dual enclave-entry deployment topology.
+Promote the complete backend state at `origin/test@8034690eef39104511c31870a33b18eb338d6074` onto `origin/pre@3ebc700ff006bca7d54d141028c4f85596ef72fc` without weakening PRE's per-user plaintext/encrypted content routing, TEE-primary startup contract, or dual enclave-entry deployment topology.
 
 The release must update both the PRE main CVM and PRE runner CVM. The resulting commit must remain a descendant of both frozen inputs.
 
@@ -59,6 +59,9 @@ The known content conflicts and required outcomes are:
    - use the Memory Garden prompt module while retaining PRE action-path coverage.
 8. `tests/test_v2_profile_storage.py`
    - retain plaintext/mixed-shape tests and add TEST's untouched-side, MEMORY/STYLE, and retry tests.
+9. `tests/test_v2_jobs_migration.py`
+   - retain TEST's derived-head installation checks during the merge;
+   - advance PRE's exact release-head assertions to the converged RDS revision in the migration task.
 
 Any additional conflict found by the real merge must be stopped and assessed against these same rules before resolution.
 
@@ -93,7 +96,7 @@ Verification is performed on the exact merged commit:
 
 1. Assert both frozen inputs are ancestors and the worktree has no unresolved conflicts.
 2. Run migration graph, upgrade/downgrade, convergence, and PRE startup-preflight tests.
-3. Run focused suites for the eight conflict areas, Runtime V2 wake outcomes, Genesis dual publication, Memory Garden, identity, and plaintext/encrypted routing.
+3. Run focused suites for the nine conflict areas, Runtime V2 wake outcomes, Genesis dual publication, Memory Garden, identity, and plaintext/encrypted routing.
 4. Run the repository's full PostgreSQL-backed pytest suite; no database-backed module may be silently skipped because PostgreSQL is unavailable.
 5. Run OpenAPI contract tests.
 6. Regenerate the public OpenAPI artifact and confirm the generated diff is intentional.

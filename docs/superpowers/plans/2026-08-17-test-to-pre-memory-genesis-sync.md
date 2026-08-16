@@ -2,16 +2,16 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Merge `test@d94e5261` into `pre@3ebc700f`, preserve PRE content-encryption and TEE boundaries, converge the RDS/TEE migration chains, and deploy the verified result to both PRE CVMs.
+**Goal:** Merge `test@8034690e` into `pre@3ebc700f`, preserve PRE content-encryption and TEE boundaries, converge the RDS/TEE migration chains, and deploy the verified result to both PRE CVMs.
 
-**Architecture:** Use a normal two-parent Git merge and resolve the eight known conflicts by composing TEST's Memory Garden, Genesis, identity, profile, and wake behavior with PRE's content-shape-aware paths. Add one no-op RDS merge revision and one schema-equivalent TEE revision so both runtime schema modes have a single release head. Verification gates the remote PRE push, TEE migration, main-CVM deployment, runner deployment, and three-entrypoint live acceptance.
+**Architecture:** Use a normal two-parent Git merge and resolve the nine known conflicts by composing TEST's Memory Garden, Genesis, identity, profile, wake, and migration-test behavior with PRE's content-shape-aware paths. Add one no-op RDS merge revision and one schema-equivalent TEE revision so both runtime schema modes have a single release head. Verification gates the remote PRE push, TEE migration, main-CVM deployment, runner deployment, and three-entrypoint live acceptance.
 
 **Tech Stack:** Python 3.11, pytest, PostgreSQL 16, Alembic, ASGI, Phala CVM, Docker Compose, GitHub Actions, MDX/OpenAPI, npm.
 
 ## Global Constraints
 
 - Frozen base: `origin/pre@3ebc700ff006bca7d54d141028c4f85596ef72fc`.
-- Frozen input: `origin/test@d94e5261ec69e3f5afddef4f5368a3a7ec146d4e`.
+- Frozen input: `origin/test@8034690eef39104511c31870a33b18eb338d6074`.
 - Preserve PRE per-user plaintext/encrypted content routing and strict enclave boundary.
 - Preserve PRE TEE-primary startup contract and dual enclave entry topology.
 - Update both PRE main and runner CVMs; do not deploy production.
@@ -30,6 +30,7 @@
 - Modify: `backend/model_api_runtime/v2/serve_worker.py`
 - Modify: `docs-site/content/docs/architecture.mdx`
 - Modify: `tests/test_memory_migration.py`
+- Modify: `tests/test_v2_jobs_migration.py`
 - Modify: `tests/test_v2_profile_storage.py`
 
 **Interfaces:**
@@ -43,7 +44,7 @@ Run:
 ```bash
 git fetch origin test pre
 test "$(git rev-parse origin/pre)" = "3ebc700ff006bca7d54d141028c4f85596ef72fc"
-test "$(git rev-parse origin/test)" = "d94e5261ec69e3f5afddef4f5368a3a7ec146d4e"
+test "$(git rev-parse origin/test)" = "8034690eef39104511c31870a33b18eb338d6074"
 git status --short
 ```
 
@@ -54,7 +55,7 @@ Expected: both assertions succeed and the only branch change is this committed p
 Run:
 
 ```bash
-git merge --no-ff --no-commit d94e5261ec69e3f5afddef4f5368a3a7ec146d4e
+git merge --no-ff --no-commit 8034690eef39104511c31870a33b18eb338d6074
 git diff --name-only --diff-filter=U
 ```
 
@@ -68,6 +69,7 @@ backend/model_api_runtime/v2/profile_store.py
 backend/model_api_runtime/v2/serve_worker.py
 docs-site/content/docs/architecture.mdx
 tests/test_memory_migration.py
+tests/test_v2_jobs_migration.py
 tests/test_v2_profile_storage.py
 ```
 
@@ -140,6 +142,8 @@ In `tests/test_memory_migration.py`, retain `actions` and import the migrated pr
 from memory import actions, migration
 from memory_garden.prompts import migrate as mp
 ```
+
+In `tests/test_v2_jobs_migration.py`, retain TEST's derived-head database-install checks during the merge. Task 2 will then add exact assertions for the new release head before creating the convergence revisions.
 
 In `tests/test_v2_profile_storage.py`, retain both plaintext/mixed-shape cases and TEST's untouched-side/MEMORY-STYLE/retry cases.
 
@@ -424,7 +428,7 @@ If OpenAPI regeneration changes `docs-site/openapi/public.json`, review and comm
 
 ```bash
 git merge-base --is-ancestor 3ebc700ff006bca7d54d141028c4f85596ef72fc HEAD
-git merge-base --is-ancestor d94e5261ec69e3f5afddef4f5368a3a7ec146d4e HEAD
+git merge-base --is-ancestor 8034690eef39104511c31870a33b18eb338d6074 HEAD
 PYTHONPATH=backend /Users/zhengzhihao/Projects/teleport/feedling-mcp/.venv-test/bin/python - <<'PY'
 from alembic.config import Config
 from alembic.script import ScriptDirectory
