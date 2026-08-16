@@ -343,6 +343,7 @@ def test_identity_dimensions_set_round_trips_through_identity_get(monkeypatch):
         "action": "dimensions_set",
         "old_value": len(original["dimensions"]),
         "new_value": len(rewritten),
+        "fields": ["dimensions"],
         "event_type": "identity_action_dimensions_set",
     }]
     assert trace_events == [{

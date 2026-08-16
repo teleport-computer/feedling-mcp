@@ -169,6 +169,29 @@ then seals the generated Memory/User fields before the compare-and-swap write.
 Generation failure only updates bounded retry metadata and fails the background
 job; it does not publish a Chat bubble or terminal turn error.
 
+Genesis onboarding and identity redistillation also publish this profile
+contract directly. Each pass generates and validates the identity-card overlay,
+MEMORY/STYLE, and the transitional Genesis persona before it begins publishing
+that pass. Genesis never reads the existing encrypted Garden for this purpose:
+MEMORY uses only valid cards proposed by the current upload's reducer, while
+STYLE receives only persona and voice material produced from that upload.
+An explicit durable-card signal requires non-empty MEMORY, and explicit
+persona, behavior-note, or exemplar material requires non-empty STYLE. A
+required empty field gets one bounded shape correction and then fails the job.
+The profile CAS copies an untouched encrypted side byte-for-byte without
+decrypting or resealing it. Onboarding and identity redistillation keep profile
+publication required. Add-memory imports only write memory cards; their changed
+Garden fingerprint lets the ordinary profile lane perform the later
+Garden-to-MEMORY/STYLE refresh.
+
+Every Genesis job records a server-side cursor into the content-free identity
+change log. Identity mutations expose canonical changed-field labels in
+`GET /v1/identity/changes`; when a distill result lands, fields changed after
+that cursor are locked and the newer user or agent edit wins. A legacy
+post-cursor record without field labels locks the whole identity-card overlay
+and emits a content-free `genesis.field_lock` trace, while profile/persona
+publication and job completion continue.
+
 The staged worker refreshes after a successful dream write, after Runtime V2
 cutover, and best-effort after Chat when a profile is missing, eligible for
 retry, or at least seven days old and the Garden's content-free source witness

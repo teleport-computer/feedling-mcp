@@ -124,7 +124,11 @@ def _seed_done_plaintext_job(uid: str, input_hash: str) -> None:
 def _blank(obj, drop=()):  # blank any *_at / ts / updated field + explicit drop keys
     if isinstance(obj, dict):
         return {
-            k: ("<v>" if (k in drop or k in {"updated", "ts"} or str(k).endswith("_at"))
+            k: ("<v>" if (
+                k in drop
+                or k in {"updated", "ts", "identity_change_anchor_ts"}
+                or str(k).endswith("_at")
+            )
                 else _blank(v, drop))
             for k, v in obj.items()
         }
@@ -224,6 +228,10 @@ def test_create_happy_parity(user):
     _reset_genesis(uid)
     a = _asgi("POST", "/v1/genesis/imports", headers=_headers(api_key), json_body=payload)
     assert f[0] == a[0] == 201
+    for response in (f, a):
+        metadata = response[1]["job"]["metadata"]
+        assert metadata["identity_change_anchor_ts"]
+        assert "identity_change_anchor_id" in metadata
     assert _norm(f) == _norm(a)
     assert f[1]["status"] == "created"
     assert f[1]["job"]["job_id"] == "createjob1"

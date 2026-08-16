@@ -296,7 +296,6 @@ def test_shape_error_is_bounced_at_most_once():
     [
         None,
         "",
-        _reply("", "有效方式"),
     ],
 )
 def test_non_retryable_parse_failures_are_terminal(terminal_reply):
@@ -317,11 +316,24 @@ def test_non_retryable_parse_failures_are_terminal(terminal_reply):
 
     assert calls == 1
     assert result.provider_calls == 1
-    assert result.reject_code in {
-        "reply_not_text",
-        "reply_empty",
-        "field_empty:memory",
-    }
+    assert result.reject_code in {"reply_not_text", "reply_empty"}
+
+
+def test_required_empty_field_gets_one_shape_bounce():
+    replies = iter([_reply("", "有效方式"), _reply("有效事实", "有效方式")])
+
+    async def _llm(_config, _messages, **_kwargs):
+        return {"reply": next(replies)}
+
+    result = asyncio.run(profile.generate_profile(
+        provider_config=object(),
+        rendered_cards="cards",
+        llm=_llm,
+    ))
+
+    assert result.provider_calls == 2
+    assert result.reject_code == ""
+    assert result.fields == {"memory": "有效事实", "style": "有效方式"}
 
 
 def test_provider_exception_is_not_treated_as_parse_retry():

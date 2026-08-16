@@ -37,6 +37,16 @@ def _stub_full_fact_write(monkeypatch):
         }
 
     monkeypatch.setattr(worker, "build_memory_output_from_fact_candidates", fake_full_fact_write)
+    monkeypatch.setattr(
+        plaintext,
+        "_attach_plaintext_profile",
+        lambda _store, _api_key, _job_id, *, output, **_kwargs: output,
+    )
+    monkeypatch.setattr(
+        service,
+        "write_profile_artifact",
+        lambda *_args, **_kwargs: ("", "", "skipped"),
+    )
 
 
 def _groups():
@@ -87,6 +97,63 @@ def test_v2_foreground_completes_then_background_skips_only_history_core(monkeyp
     assert calls["bg_skip"] == foreground.core_skip_texts([{"summary": "我家狗叫蛋子"}])
     # the foreground core memory text is handed to the background as "already saved"
     assert calls["bg_known"] == ["用户养了一只狗叫蛋子"]
+
+
+def test_v2_full_distill_profile_failure_remains_required(monkeypatch):
+    calls = {}
+    monkeypatch.setattr(db, "genesis_set_job_status", lambda *a, **k: None)
+    monkeypatch.setattr(worker, "build_foreground_output_from_texts", _greetable_fg)
+    monkeypatch.setattr(
+        plaintext,
+        "_plaintext_merge_reducer_outputs",
+        lambda outputs, **_kwargs: {
+            "memories": [{"summary": "用户养狗"}],
+            "identity": {"agent_name": "小柒", "dimensions": []},
+        },
+    )
+    monkeypatch.setattr(
+        plaintext,
+        "_attach_plaintext_profile",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("profile_required_failure")
+        ),
+    )
+    monkeypatch.setattr(
+        foreground_identity,
+        "derive_foreground_identity",
+        lambda **_kwargs: ({"agent_name": "小柒", "dimensions": []}, []),
+    )
+    monkeypatch.setattr(history_import, "_import_language_for_store", lambda *_a: "zh")
+    monkeypatch.setattr(service, "apply_memory_outputs", lambda *_a, **_k: (1, []))
+    monkeypatch.setattr(service, "write_profile_artifact", lambda *_a, **_k: ("", "", ""))
+    monkeypatch.setattr(history_import, "_store_identity_payload", lambda *_a, **_k: None)
+    monkeypatch.setattr(
+        history_import,
+        "_generate_model_api_onboarding_greeting",
+        lambda *_a, **_k: ("", []),
+    )
+    monkeypatch.setattr(
+        history_import,
+        "_append_model_api_onboarding_greeting",
+        lambda *_a, **_k: None,
+    )
+    monkeypatch.setattr(
+        plaintext,
+        "_run_plaintext_background_enrichment",
+        lambda *_a, **_k: calls.__setitem__("background", True),
+    )
+
+    with pytest.raises(RuntimeError, match="profile_required_failure"):
+        plaintext._run_plaintext_genesis_v2(
+            _Store(),
+            "key",
+            "job-required-profile",
+            runtime=object(),
+            source_groups=_groups(),
+            analysis_messages=[{"role": "user", "content": "真实历史"}],
+        )
+
+    assert "background" not in calls
 
 
 def test_v2_sampled_foreground_checkpoints_full_history_indices(monkeypatch):

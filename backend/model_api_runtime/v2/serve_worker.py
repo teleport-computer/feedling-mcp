@@ -98,6 +98,7 @@ from model_api_runtime.v2 import enclave_broker as v2_enclave_broker
 from model_api_runtime.v2 import jobs_store
 from model_api_runtime.v2 import pool_config as v2_pool_config
 from model_api_runtime.v2 import pool_supervisor as v2_pool_supervisor
+from model_api_runtime.v2 import profile as v2_profile
 from model_api_runtime.v2 import profile_store as v2_profile_store
 from model_api_runtime.v2 import reaper as v2_reaper
 from model_api_runtime.v2 import runner_identity
@@ -2586,21 +2587,7 @@ PROFILE_CARD_BATCH_SIZE = 64
 
 def _render_profile_card(item: dict) -> str:
     """Render one complete Garden card for profile distillation."""
-
-    if not isinstance(item, dict):
-        return ""
-    summary = str(item.get("summary") or item.get("title") or "").strip()
-    content = str(item.get("content") or "").strip()
-    if not summary and not content:
-        return ""
-    parts = [
-        f"id={str(item.get('id') or '').strip()}",
-        f"bucket={str(item.get('bucket') or '').strip()}",
-        f"occurred_at={str(item.get('occurred_at') or '').strip()}",
-        f"summary={summary}",
-        f"content={content}",
-    ]
-    return "- " + " | ".join(parts)
+    return v2_profile.render_profile_card(item)
 
 
 def _read_profile_cards(
