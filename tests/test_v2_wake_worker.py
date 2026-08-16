@@ -622,6 +622,7 @@ def test_wake_workspace_prompt_snapshot_is_loaded_once_across_rounds(
     deps.load_workspace_prompt = lambda _store, **kwargs: (
         loader_calls.append(kwargs["runtime_token"])
         or {
+            "identity_card_or_persona": "<identity-card>wake identity</identity-card>",
             "trusted_system_blocks": (
                 "<feedling-skill>wake skill</feedling-skill>",
             ),
@@ -642,10 +643,17 @@ def test_wake_workspace_prompt_snapshot_is_loaded_once_across_rounds(
     assert loader_calls == ["rt"]
     assert len(provider_calls) == 2
     assert all(
-        "wake skill" in str(call["messages"])
+        "wake identity" in str(call["messages"])
+        and "wake skill" in str(call["messages"])
         and "/memory/WORKING.md" not in str(call["messages"])
         for call in provider_calls
     )
+    first_system = next(
+        message
+        for message in provider_calls[0]["messages"]
+        if message["role"] == "system"
+    )["content"]
+    assert first_system.index("wake identity") < first_system.index("wake skill")
     second_offered = {spec.name for spec in provider_calls[1]["tools"]}
     assert {"web_search", "web_fetch", "task"}.isdisjoint(second_offered)
 
@@ -846,7 +854,7 @@ def test_automatic_heartbeat_authoritative_no_user_history_skips_all_prompt_work
     )
     deps.load_workspace_prompt = lambda *args, **kwargs: workspace_calls.append(
         (args, kwargs)
-    ) or {"trusted_system_blocks": []}
+    ) or {"identity_card_or_persona": "", "trusted_system_blocks": []}
 
     status = asyncio.run(worker._run_wake(
         job_id, uid, "heartbeat", deps, _BYOK, asyncio.Semaphore(4), claimed_by))

@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import asyncio
-import sys
 import base64
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -131,6 +131,11 @@ def test_production_workspace_prompt_loader_preserves_trust_partition(
         "production_workspace_backend",
         lambda *_args, **_kwargs: backend,
     )
+    monkeypatch.setattr(
+        serve_worker.cap_identity,
+        "get",
+        lambda *_args, **_kwargs: SimpleNamespace(ok=True, data={}),
+    )
 
     rendered = serve_worker._load_workspace_prompt(
         SimpleNamespace(),
@@ -165,7 +170,10 @@ def test_workspace_prompt_context_loads_once_and_fails_with_stable_code():
         mint_enclave_token=lambda _uid: "token",
         load_workspace_prompt=lambda _store, **kwargs: (
             calls.append(kwargs["runtime_token"])
-            or {"trusted_system_blocks": ("skill",)}
+            or {
+                "identity_card_or_persona": "card",
+                "trusted_system_blocks": ("skill",),
+            }
         ),
     )
 
@@ -175,7 +183,10 @@ def test_workspace_prompt_context_loads_once_and_fails_with_stable_code():
         runtime_token="token",
         enclave_sem=asyncio.Semaphore(1),
     ))
-    assert loaded == ("skill",)
+    assert loaded == worker.WorkspacePromptContext(
+        identity_card_or_persona="card",
+        trusted_system_blocks=("skill",),
+    )
     assert calls == ["token"]
 
     deps.load_workspace_prompt = lambda *_args, **_kwargs: (
@@ -190,6 +201,7 @@ def test_workspace_prompt_context_loads_once_and_fails_with_stable_code():
         ))
 
     deps.load_workspace_prompt = lambda *_args, **_kwargs: {
+        "identity_card_or_persona": "card",
         "trusted_system_blocks": ("",),
     }
     with pytest.raises(worker.WorkspacePromptUnavailable):
@@ -239,14 +251,19 @@ def test_workspace_prompt_jit_injects_complete_genesis_persona(monkeypatch):
         "production_workspace_backend",
         lambda *_args, **_kwargs: InMemoryWorkspaceBackend(),
     )
+    monkeypatch.setattr(
+        serve_worker.cap_identity,
+        "get",
+        lambda *_args, **_kwargs: SimpleNamespace(ok=True, data={}),
+    )
 
     store = SimpleNamespace(user_id="u-persona")
     first = serve_worker._load_workspace_prompt(store, runtime_token="rt-1")
     second = serve_worker._load_workspace_prompt(store, runtime_token="rt-2")
 
-    assert first["trusted_system_blocks"][0] == persona_versions[0].strip()
-    assert len(first["trusted_system_blocks"][0]) > 2_000
-    assert second["trusted_system_blocks"][0] == persona_versions[1].strip()
+    assert first["identity_card_or_persona"] == persona_versions[0].strip()
+    assert len(first["identity_card_or_persona"]) > 2_000
+    assert second["identity_card_or_persona"] == persona_versions[1].strip()
     assert [call[2:] for call in decrypt_calls] == [
         ("genesis_persona", "rt-1"),
         ("genesis_persona", "rt-2"),
@@ -260,13 +277,21 @@ def test_workspace_prompt_without_genesis_persona_keeps_existing_shape(monkeypat
         "production_workspace_backend",
         lambda *_args, **_kwargs: InMemoryWorkspaceBackend(),
     )
+    monkeypatch.setattr(
+        serve_worker.cap_identity,
+        "get",
+        lambda *_args, **_kwargs: SimpleNamespace(ok=True, data={}),
+    )
 
     rendered = serve_worker._load_workspace_prompt(
         SimpleNamespace(user_id="u-no-persona"),
         runtime_token="rt",
     )
 
-    assert rendered == {"trusted_system_blocks": ()}
+    assert rendered == {
+        "identity_card_or_persona": "",
+        "trusted_system_blocks": (),
+    }
 
 
 def test_sandbox_is_lazy_and_artifact_ingest_never_uses_host_filesystem():

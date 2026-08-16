@@ -10,6 +10,16 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **Hosted Runtime V2 now builds Chat and proactive wake identity context from
+  the current decrypted identity card.** The complete readable card replaces
+  the transitional Genesis persona when it contains substantive content; an
+  absent, unreadable, local-only, empty, or default-`TA`-only card falls back to
+  the persona. MEMORY and STYLE now follow that identity in the trusted system
+  prefix, render independently when non-empty, and keep explicit
+  verbatim-conversation-wins guidance. World Book and changing runtime context
+  remain non-privileged application data. Each profile refresh consequently
+  invalidates that user's provider prompt cache once.
+
 - **Hosted Runtime V2 Chat now makes one bounded attempt to correct a reply
   written in a different dominant writing system from the person's latest
   substantive message.** The retry changes only the reply language and never
