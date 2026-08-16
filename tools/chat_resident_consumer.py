@@ -141,7 +141,7 @@ import generated_image
 
 # Shared torn-protocol-JSON leak detector (backend/core, pure). backend/ is on
 # sys.path via the insert above, so it imports as a top-level `core.*` name.
-from agent_protocol_core import protocol_leak as _protocol_leak
+from core import protocol_leak as _protocol_leak
 # 世界书注入侧的标头/上限/截断标记与 V2 共用同一份定义(纯模块,无 enclave 依赖)。
 # 各写一份就会漂——本文件前台原本就漂成了没有 UNTRUSTED 标注的弱版本。
 import worldbook_match as _worldbook_match
@@ -3917,13 +3917,13 @@ def _split_tagged_thinking(text: str) -> tuple[str, str]:
     plain terminal text where an upstream wrapper serialized reasoning as
     `<think>...</think>`, `<reasoning>...</reasoning>`, or `<thought>...</thought>`.
 
-    2026-08-08 起委托 ``agent_protocol_core.self_thinking`` 的共享内核：此前 V1/V2 各一套判据、
+    2026-08-08 起委托 ``core.self_thinking`` 的共享内核：此前 V1/V2 各一套判据、
     各漏各的——这条正则要求开闭成对，一个孤立的 `</think>`（开标签在上游被吃掉）
     配不上对，于是整段思考原样进了用户气泡（prod 实例）。闸关掉时保留下面的
     原正则行为，逐字节不变。
     """
     raw = str(text or "")
-    from agent_protocol_core import self_thinking as _st
+    from core import self_thinking as _st
 
     if _st.gate_enabled():
         # sanitize=False：本次统一的是剥离**判据**，V1 的展示格式（保留换行、
@@ -4558,7 +4558,7 @@ def _prefer_thinking(dst: AgentTurn, src: AgentTurn) -> None:
     if not dst.thinking_summary:
         take = True
     else:
-        from agent_protocol_core import self_thinking as _self_thinking_v1
+        from core import self_thinking as _self_thinking_v1
 
         if _self_thinking_v1.enabled():
             take = src.thinking_self_authored and not dst.thinking_self_authored
@@ -15543,7 +15543,7 @@ def _process_messages(messages: list) -> float:
         # last message" framing) and the transcript header added below stays
         # topmost. The consumer's existing tagged-thinking extraction peels the
         # <think> block into thinking_summary. Same kill switch as V2.
-        from agent_protocol_core import self_thinking as _self_thinking_v1
+        from core import self_thinking as _self_thinking_v1
 
         if (
             _self_thinking_v1.enabled()
