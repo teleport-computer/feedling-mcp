@@ -379,7 +379,7 @@ def test_stable_skills_precede_dynamic_cache_frontier() -> None:
     assert "<skill>stable skill</skill>" in str(bedrock["system"])
 
 
-def test_profile_header_contract_and_cache_priority_on_openai_and_anthropic():
+def test_memory_header_contract_and_system_cache_priority_on_openai_and_anthropic():
     assert pc._PROFILE_HEADER == v2_context.AGENT_MEMORY_HEADER.splitlines()[0]
     messages = v2_context.build_turn_messages(
         system_prompt="stable system",
@@ -396,12 +396,13 @@ def test_profile_header_contract_and_cache_priority_on_openai_and_anthropic():
     )
 
     marked_openai = pc._mark_openai_chat_cache_breakpoint(messages)
-    openai_profile = next(
-        message
-        for message in marked_openai
-        if pc._is_profile_message(message)
+    assert v2_context.AGENT_MEMORY_HEADER in pc._content_text(
+        marked_openai[0]["content"]
     )
-    assert _nested_cache_controls(openai_profile) == [{"type": "ephemeral"}]
+    assert v2_context.USER_PROFILE_HEADER in pc._content_text(
+        marked_openai[0]["content"]
+    )
+    assert not any(pc._is_profile_message(message) for message in marked_openai)
     assert _nested_cache_controls(marked_openai[0]) == [{"type": "ephemeral"}]
     openai_newest = next(
         message
@@ -431,11 +432,9 @@ def test_profile_header_contract_and_cache_priority_on_openai_and_anthropic():
         messages[1:],
     )
     assert _nested_cache_controls(anthropic_system) == [{"type": "ephemeral"}]
-    anthropic_profile = next(
-        message
-        for message in marked_anthropic
-        if pc._is_profile_message(message)
-    )
+    assert v2_context.AGENT_MEMORY_HEADER in pc._content_text(anthropic_system)
+    assert v2_context.USER_PROFILE_HEADER in pc._content_text(anthropic_system)
+    assert not any(pc._is_profile_message(message) for message in marked_anthropic)
     newest_user = next(
         message
         for message in marked_anthropic
@@ -446,7 +445,6 @@ def test_profile_header_contract_and_cache_priority_on_openai_and_anthropic():
         for message in marked_anthropic
         if pc._content_text(message.get("content")) == "older request"
     )
-    assert _nested_cache_controls(anthropic_profile) == [{"type": "ephemeral"}]
     assert _nested_cache_controls(newest_user) == [{"type": "ephemeral"}]
     assert _nested_cache_controls(older_user) == [{"type": "ephemeral"}]
     assert not any(

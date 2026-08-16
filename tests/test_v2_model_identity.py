@@ -15,12 +15,17 @@
 """
 from __future__ import annotations
 
+import json
 import pathlib
 import sys
+from types import SimpleNamespace
+
+import pytest
 
 sys.path.insert(0, str(pathlib.Path(__file__).parent.parent / "backend"))
 
-from model_api_runtime.v2 import model_identity
+from model_api_runtime.v2 import model_identity, serve_worker
+from workspace.backends import InMemoryWorkspaceBackend
 
 
 def test_official_provider_pins_the_exact_model_id():
@@ -128,7 +133,7 @@ def test_turn_system_prompt_carries_the_identity_block_for_third_party_routes():
     persona_block = "PERSONA-SENTINEL"
     system = _system_of(
         provider_config=provider_config,
-        trusted_system_blocks=(persona_block,),
+        identity_card_or_persona=persona_block,
     )
     assert "deepseek-chat" in system
     # 平台身份事实必须拥有最高优先级，其次才是用户可编辑 persona 和通用提示。
@@ -154,3 +159,125 @@ def test_identity_block_precedes_user_editable_skill_blocks():
 
 def test_callers_without_a_provider_config_are_unchanged():
     assert "你的真实身份" not in _system_of()
+
+
+def test_workspace_prompt_prefers_complete_identity_card_without_loading_persona(
+    monkeypatch,
+):
+    card = {
+        "decrypt_status": "ok",
+        "visibility": "shared",
+        "created_at": "secret-metadata",
+        "body_ct": "must-never-render",
+        "dimensions": [{"name": "curiosity", "value": 88}],
+        "days_with_user": 23,
+    }
+    for key in serve_worker.card_policy.PROFILE_STRING_FIELDS:
+        card[key] = f"value-{key}"
+    for key in serve_worker.card_policy.PROFILE_LIST_FIELDS:
+        card[key] = [f"value-{key}"]
+
+    monkeypatch.setattr(
+        serve_worker.cap_identity,
+        "get",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            ok=True,
+            data={"identity": card},
+        ),
+    )
+    monkeypatch.setattr(
+        serve_worker,
+        "_load_genesis_persona",
+        lambda *_args, **_kwargs: pytest.fail("card must suppress persona fallback"),
+    )
+    monkeypatch.setattr(
+        serve_worker,
+        "production_workspace_backend",
+        lambda *_args, **_kwargs: InMemoryWorkspaceBackend(),
+    )
+
+    rendered = serve_worker._load_workspace_prompt(
+        SimpleNamespace(user_id="u-card"),
+        runtime_token="rt-card",
+    )
+    block = rendered["identity_card_or_persona"]
+
+    canonical_fields = tuple(dict.fromkeys((
+        *serve_worker.card_policy.PROFILE_STRING_FIELDS,
+        *serve_worker.card_policy.PROFILE_LIST_FIELDS,
+        "dimensions",
+        "days_with_user",
+    )))
+    assert serve_worker.v2_context.IDENTITY_CARD_RENDER_FIELDS == canonical_fields
+    expected_lines = [
+        f"{key}: {json.dumps(card[key], ensure_ascii=False, separators=(',', ':'))}"
+        for key in canonical_fields
+    ]
+    assert block == (
+        serve_worker.v2_context.IDENTITY_CARD_HEADER
+        + "\n"
+        + "\n".join(expected_lines)
+    )
+    assert "must-never-render" not in block
+    assert "secret-metadata" not in block
+    assert "visibility:" not in block
+    assert "decrypt_status:" not in block
+
+
+@pytest.mark.parametrize(
+    "result",
+    [
+        SimpleNamespace(ok=True, data={}),
+        SimpleNamespace(
+            ok=True,
+            data={"identity": {
+                "decrypt_status": "ok",
+                "agent_name": "TA",
+                "days_with_user": 17,
+            }},
+        ),
+        SimpleNamespace(
+            ok=True,
+            data={"identity": {
+                "decrypt_status": "ok",
+                "agent_name": "",
+                "dimensions": [],
+                "days_with_user": 0,
+            }},
+        ),
+        SimpleNamespace(
+            ok=True,
+            data={"identity": {
+                "decrypt_status": "local_only_agent_cannot_read",
+            }},
+        ),
+        SimpleNamespace(ok=False, data={}),
+    ],
+    ids=("no-card", "default-ta-only", "empty-card", "local-only", "decrypt-failure"),
+)
+def test_workspace_prompt_falls_back_to_persona_for_unusable_cards(
+    monkeypatch,
+    result,
+):
+    monkeypatch.setattr(
+        serve_worker.cap_identity,
+        "get",
+        lambda *_args, **_kwargs: result,
+    )
+    monkeypatch.setattr(
+        serve_worker,
+        "_load_genesis_persona",
+        lambda *_args, **_kwargs: "PERSONA-FALLBACK",
+    )
+    monkeypatch.setattr(
+        serve_worker,
+        "production_workspace_backend",
+        lambda *_args, **_kwargs: InMemoryWorkspaceBackend(),
+    )
+
+    rendered = serve_worker._load_workspace_prompt(
+        SimpleNamespace(user_id="u-fallback"),
+        runtime_token="rt-fallback",
+    )
+
+    assert rendered["identity_card_or_persona"] == "PERSONA-FALLBACK"

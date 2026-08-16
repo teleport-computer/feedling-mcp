@@ -1707,6 +1707,7 @@ def test_chat_workspace_prompt_snapshot_is_loaded_once_across_rounds(
     deps.load_workspace_prompt = lambda _store, **kwargs: (
         loader_calls.append(kwargs["runtime_token"])
         or {
+            "identity_card_or_persona": "<identity-card>chat identity</identity-card>",
             "trusted_system_blocks": (
                 "<feedling-skill>trusted skill</feedling-skill>",
             ),
@@ -1732,6 +1733,10 @@ def test_chat_workspace_prompt_snapshot_is_loaded_once_across_rounds(
         assert "/memory/WORKING.md" not in prompt
     system = next(
         message for message in calls[0]["messages"] if message["role"] == "system"
+    )
+    assert "chat identity" in system["content"]
+    assert system["content"].index("chat identity") < system["content"].index(
+        "trusted skill"
     )
     assert "trusted skill" in str(system["content"])
     second_offered = {spec.name for spec in calls[1]["tools"]}

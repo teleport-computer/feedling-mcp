@@ -93,13 +93,17 @@ transcript. Only summary-covered replay is optional; uncovered rows are never
 clipped. If the required core is too large, the runner first compacts only a
 safe answered prefix and rebuilds the prompt from the new durable watermark.
 
-Proactive wake turns may read the agent identity card but cannot mutate it:
-Runtime V2 visibly refuses `identity_patch`, `identity_nudge`, and
-`identity_dimensions_set` in background turns. Foreground Chat identity changes
-and wake-time Memory writes retain their existing authorization. Foreground
-profile-text edits use `identity_patch`; full dimension name/value/description
-rewrites use `identity_dimensions_set`; small relative dimension-score changes
-continue to use `identity_nudge`.
+Every Chat and proactive wake turn decrypts the current agent identity card just
+in time and places its complete readable view in the trusted system prefix. An
+absent, unreadable, local-only, or still-default card falls back to the encrypted
+Genesis persona during the transition; the card and persona are never included
+together. Proactive wake turns still cannot mutate identity: Runtime V2 visibly
+refuses `identity_patch`, `identity_nudge`, and `identity_dimensions_set` in
+background turns. Foreground Chat identity changes and wake-time Memory writes
+retain their existing authorization. Foreground profile-text edits use
+`identity_patch`; full dimension name/value/description rewrites use
+`identity_dimensions_set`; small relative dimension-score changes continue to
+use `identity_nudge`.
 
 Exact immutable leaf segments carry source-range/count
 witnesses; immutable higher-level checkpoints retain and name their ordered
@@ -140,13 +144,21 @@ re-read and recompute rather than replaying its earlier result.
 
 When the default-off profile switch is enabled, a turn strictly reads that
 document and decrypts both fields together. Only an `ok`, non-disabled document
-whose two fields both validate replaces the rollback-compatible summary. The
-Memory and User fields are serialized into one early user-role block, labeled
-as model-derived untrusted data; they are never system instructions, and later
-verbatim conversation replay wins on conflict. Missing, pending, degraded,
-disabled, invalid, or undecryptable profiles retain the existing summary path.
-Any bounded-tail coverage-hole count is a separate late user-role data block,
-so it cannot perturb the stable profile prefix.
+whose fields validate enters the prompt. The stable system prefix is ordered as
+runtime model identity, identity card (or Genesis persona fallback), non-empty
+MEMORY, non-empty STYLE, and then behavior rules. MEMORY and STYLE are the
+companion's own context, with explicit guidance that the later verbatim
+conversation wins on conflict; World Book, temporal context, coverage notices,
+and model-authored summaries remain non-privileged application data. Missing,
+pending, degraded, disabled, invalid, or undecryptable profiles retain
+deterministic coverage plus the bounded verbatim tail without inventing a
+semantic replacement. Any bounded-tail coverage-hole count remains a separate
+late data block, so it cannot perturb the stable prefix.
+
+Because MEMORY and STYLE are part of the system prefix, each successful profile
+refresh changes that user's provider prompt-cache prefix once. Other users'
+caches are unaffected, and subsequent turns reuse the refreshed prefix until the
+next profile change.
 
 Profile generation is a separate low-priority Runtime V2 job, alongside
 maintenance, capture, and dream rather than foreground Chat or wake work. The
