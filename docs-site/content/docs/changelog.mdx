@@ -10,6 +10,21 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **Genesis imports now publish the identity card, MEMORY/STYLE, and the
+  transitional persona together.** Genesis reuses Runtime V2's bounded profile
+  generation and encrypted CAS storage, requires a non-empty field when the
+  current upload reducer proposes corresponding memory or persona/voice
+  material, and copies an untouched encrypted side without decrypting or
+  resealing it. Genesis does not read the existing Garden; scheduled profile
+  refresh remains the exclusive Garden-to-MEMORY/STYLE path, while add-memory
+  imports only write cards. Identity edits made while a distill is running win
+  at canonical field granularity; `GET /v1/identity/changes` now adds a
+  content-free `fields` array to new change records so this lock is observable
+  and deterministic. Legacy records without field labels trigger a traced
+  whole-card fail-safe without preventing profile/persona publication or job
+  completion. Onboarding and identity redistillation keep profile generation
+  required.
+
 - **Hosted Runtime V2 now builds Chat and proactive wake identity context from
   the current decrypted identity card.** The complete readable card replaces
   the transitional Genesis persona when it contains substantive content; an

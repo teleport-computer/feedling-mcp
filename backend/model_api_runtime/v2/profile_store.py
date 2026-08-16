@@ -244,8 +244,6 @@ def build_profile_document(
         "disabled": bool(disabled),
     }
     if memory_text is not None and style_text is not None:
-        if not memory_text.strip() or not style_text.strip():
-            raise ProfileStorageError("profile_field_empty")
         document["memory"] = {
             "envelope": seal_text(str(user_id), memory_text),
             "chars": len(memory_text),
@@ -267,6 +265,72 @@ def build_profile_document(
                     document["style"] = prior["style"]
                 else:
                     document["user"] = prior["user"]
+    return validate_profile_document(document)
+
+
+def build_profile_document_patching_fields(
+    user_id: str,
+    *,
+    state: str,
+    source: dict,
+    last_attempt: dict,
+    memory_text: str | None,
+    style_text: str | None,
+    previous: dict | None,
+    disabled: bool | None = None,
+    seal_text: Callable[[str, str], dict] = _seal_text,
+) -> dict:
+    """Seal touched fields and byte-preserve untouched encrypted fields.
+
+    Genesis can derive only MEMORY or only STYLE from one upload.  Requiring it
+    to decrypt and reseal the untouched side adds an enclave dependency and can
+    change ciphertext for data the pass did not own.  A missing prior side is
+    initialized as an encrypted empty string so the paired-field contract stays
+    atomic.
+    """
+    prior = (
+        validate_profile_document(previous)
+        if isinstance(previous, dict) and previous
+        else {}
+    )
+    document: dict[str, Any] = {
+        "v": PROFILE_VERSION,
+        "state": str(state),
+        "source": deepcopy(source),
+        "last_attempt": deepcopy(last_attempt),
+        "disabled": (
+            bool(prior.get("disabled"))
+            if disabled is None
+            else bool(disabled)
+        ),
+    }
+    if memory_text is not None:
+        document["memory"] = {
+            "envelope": seal_text(str(user_id), memory_text),
+            "chars": len(memory_text),
+        }
+    elif prior.get("memory") is not None:
+        document["memory"] = deepcopy(prior["memory"])
+    else:
+        document["memory"] = {
+            "envelope": seal_text(str(user_id), ""),
+            "chars": 0,
+        }
+
+    if style_text is not None:
+        document["style"] = {
+            "envelope": seal_text(str(user_id), style_text),
+            "chars": len(style_text),
+        }
+    elif prior.get("style") is not None:
+        document["style"] = deepcopy(prior["style"])
+    elif prior.get("user") is not None:
+        document["user"] = deepcopy(prior["user"])
+    else:
+        document["style"] = {
+            "envelope": seal_text(str(user_id), ""),
+            "chars": 0,
+        }
     return validate_profile_document(document)
 
 
@@ -305,6 +369,8 @@ def _winner_supersedes(winner: dict, candidate: dict) -> bool:
 def update_profile_cas(
     user_id: str,
     recompute: Callable[[dict], dict],
+    *,
+    allow_freshness_supersede: bool = True,
 ) -> ProfileCasResult:
     """CAS one profile, recomputing once against the winning race document.
 
@@ -314,13 +380,20 @@ def update_profile_cas(
     """
     expected_raw = db.get_blob_strict(str(user_id), PROFILE_BLOB_KIND)
     expected = deepcopy(expected_raw) if isinstance(expected_raw, dict) else {}
-    return _update_profile_cas_from_expected(str(user_id), expected, recompute)
+    return _update_profile_cas_from_expected(
+        str(user_id),
+        expected,
+        recompute,
+        allow_freshness_supersede=allow_freshness_supersede,
+    )
 
 
 def _update_profile_cas_from_expected(
     user_id: str,
     expected_doc: dict,
     recompute: Callable[[dict], dict],
+    *,
+    allow_freshness_supersede: bool = True,
 ) -> ProfileCasResult:
     """Internal snapshot form used by the true two-connection race test."""
     expected = deepcopy(expected_doc)
@@ -343,7 +416,11 @@ def _update_profile_cas_from_expected(
             )
         winner_raw = db.get_blob_strict(str(user_id), PROFILE_BLOB_KIND)
         winner = deepcopy(winner_raw) if isinstance(winner_raw, dict) else {}
-        if winner and _winner_supersedes(winner, candidate):
+        if (
+            allow_freshness_supersede
+            and winner
+            and _winner_supersedes(winner, candidate)
+        ):
             return ProfileCasResult(
                 status="superseded",
                 document=validate_profile_document(winner),

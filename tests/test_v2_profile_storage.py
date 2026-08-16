@@ -120,6 +120,21 @@ def test_profile_document_rejects_torn_or_plaintext_fields():
         profile_store.validate_profile_document(doc)
 
 
+def test_profile_document_accepts_empty_strings_for_explicitly_untouched_side():
+    document = profile_store.build_profile_document(
+        "u-profile-empty-side",
+        state="ok",
+        source=_source(0),
+        last_attempt=_attempt(),
+        memory_text="",
+        style_text="style only",
+        seal_text=_seal,
+    )
+
+    assert document["memory"]["chars"] == 0
+    assert document["style"]["chars"] == len("style only")
+
+
 def test_old_profile_document_defaults_retry_policy_metadata():
     document = profile_store.validate_profile_document(
         _ok_doc("u-profile-old-retry-metadata", 1)
@@ -459,6 +474,42 @@ def test_newer_winner_discards_stale_candidate_without_replay(monkeypatch):
     assert result.document == winner
     assert result.recomputations == 1
     assert calls == [{}]
+
+
+def test_genesis_side_update_recomputes_even_when_winner_is_fresher(monkeypatch):
+    uid = "u-profile-genesis-side-race"
+    winner = profile_store.build_profile_document(
+        uid,
+        state="ok",
+        source=_source(3, generated_at="2026-08-01T00:00:00Z"),
+        last_attempt=_attempt(),
+        memory_text="winner-memory",
+        style_text="winner-style",
+        seal_text=_seal,
+    )
+    reads = iter([{}, winner])
+    landed = iter([False, True])
+    inputs: list[dict] = []
+    monkeypatch.setattr(profile_store.db, "get_blob_strict", lambda *_args: next(reads))
+    monkeypatch.setattr(
+        profile_store.db,
+        "set_blob_if_unchanged",
+        lambda *_args, **_kwargs: next(landed),
+    )
+
+    def recompute(expected):
+        inputs.append(expected)
+        return _ok_doc(uid, 4, suffix=f"-attempt-{len(inputs)}")
+
+    result = profile_store.update_profile_cas(
+        uid,
+        recompute,
+        allow_freshness_supersede=False,
+    )
+
+    assert result.status == "written"
+    assert result.recomputations == 2
+    assert inputs == [{}, winner]
 
 
 def test_metadata_only_winner_cannot_supersede_successful_candidate(monkeypatch):

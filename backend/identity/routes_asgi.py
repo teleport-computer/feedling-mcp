@@ -52,6 +52,11 @@ async def identity_verify(auth: AuthResult = Depends(require_auth)):
 
 @router.get("/v1/identity/changes")
 async def identity_changes(request: Request, auth: AuthResult = Depends(require_auth)):
+    """List content-free identity mutations, newest first.
+
+    Newly written records include ``fields`` with canonical changed-field
+    labels. Legacy records may omit it and clients must tolerate that shape.
+    """
     body, status = await threadpool.run_db(
         identity_core.list_changes,
         auth.store,

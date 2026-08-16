@@ -38,6 +38,16 @@ def _memory_checkpoint(monkeypatch):
     monkeypatch.setattr(plaintext.service, "delete_genesis_checkpoint", lambda *_args: None)
     monkeypatch.setattr(plaintext.db, "genesis_get_job", lambda *_args: None)
     monkeypatch.setattr(plaintext, "_fail_stale_plaintext_job", lambda *_args: None)
+    monkeypatch.setattr(
+        plaintext,
+        "_attach_plaintext_profile",
+        lambda _store, _api_key, _job_id, *, output, **_kwargs: output,
+    )
+    monkeypatch.setattr(
+        plaintext.service,
+        "write_profile_artifact",
+        lambda *_args, **_kwargs: ("", "", "skipped"),
+    )
 
 
 class _Resp:
@@ -2179,6 +2189,13 @@ def test_add_memory_mode_writes_only_memory(monkeypatch):
     monkeypatch.setattr(plaintext.service, "write_persona_artifact", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("add_memory must not write persona")))
     monkeypatch.setattr(plaintext.service, "write_voice_artifact", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("add_memory must not write voice")))
     monkeypatch.setattr(
+        plaintext.service,
+        "write_profile_artifact",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("add_memory must not write profile")
+        ),
+    )
+    monkeypatch.setattr(
         plaintext.db,
         "genesis_complete_job",
         lambda _user_id, _job_id, **kwargs: calls.update({"completed": kwargs}) or {"job_id": "job_add", "status": "done"},
@@ -2204,6 +2221,9 @@ def test_add_memory_mode_writes_only_memory(monkeypatch):
     }
     assert calls["completed"]["memory_action_count"] == 1
     assert calls["completed"]["identity_status"] == "skipped"
+    assert not any(
+        key.startswith("profile_") for key in calls["completed"]["output"]
+    )
 
 
 def test_add_memory_keep_all_zero_cards_fails_with_map_diagnostics(monkeypatch):
@@ -2310,6 +2330,12 @@ def test_update_identity_mode_replaces_identity_without_writing_memory(monkeypat
     monkeypatch.setattr(plaintext.service, "replace_identity_preserving_anchor", lambda _store, output, *_a, **_k: calls.update({"identity_output": output}) or "updated")
     monkeypatch.setattr(plaintext.service, "apply_memory_outputs", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("update_identity must not write memory")))
     monkeypatch.setattr(
+        plaintext.service,
+        "write_profile_artifact",
+        lambda *_args, **_kwargs: calls.update({"profile_written": True})
+        or ("profile-ref", "profile-sha", "written"),
+    )
+    monkeypatch.setattr(
         plaintext.db,
         "genesis_complete_job",
         lambda _user_id, _job_id, **kwargs: calls.update({"completed": kwargs}) or {"job_id": "job_identity", "status": "done"},
@@ -2333,8 +2359,72 @@ def test_update_identity_mode_replaces_identity_without_writing_memory(monkeypat
     assert calls["identity_output"]["identity"]["agent_name"] == "乔伊"
     assert calls["completed"]["memory_action_count"] == 0
     assert calls["completed"]["identity_status"] == "updated"
+    assert calls["completed"]["output"]["profile_status"] == "written"
+    assert calls["profile_written"] is True
     done = next(event for event in trace_events if event["event_type"] == "genesis.plaintext.done")
     assert done["detail"] == {"mode": "update_identity", "identity_status": "updated"}
+
+
+def test_update_identity_profile_failure_is_required_before_identity_write(monkeypatch):
+    store = _store()
+    monkeypatch.setattr(
+        plaintext,
+        "_plaintext_existing_identity_for_update",
+        lambda *_args, **_kwargs: {"agent_name": "Old"},
+    )
+    monkeypatch.setattr(
+        plaintext.history_import,
+        "_import_language_for_store",
+        lambda *_args, **_kwargs: "zh",
+    )
+    monkeypatch.setattr(
+        plaintext.history_import,
+        "_derive_identity_with_provider",
+        lambda *_args, **_kwargs: ({"agent_name": "New", "dimensions": []}, []),
+    )
+    monkeypatch.setattr(
+        plaintext,
+        "_plaintext_persona_material_from_messages",
+        lambda *_args, **_kwargs: "persona material",
+    )
+    monkeypatch.setattr(
+        plaintext,
+        "_plaintext_existing_voice_workset_for_update",
+        lambda *_args, **_kwargs: {},
+    )
+    monkeypatch.setattr(
+        plaintext,
+        "_plaintext_existing_persona_for_update",
+        lambda *_args, **_kwargs: {},
+    )
+    monkeypatch.setattr(
+        plaintext.worker,
+        "build_persona_output_from_material",
+        lambda **_kwargs: {"persona": {"content": "new persona"}},
+    )
+    monkeypatch.setattr(
+        plaintext,
+        "_attach_plaintext_profile",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("profile_required_failure")
+        ),
+    )
+    monkeypatch.setattr(
+        plaintext.service,
+        "replace_identity_preserving_anchor",
+        lambda *_args, **_kwargs: pytest.fail(
+            "required profile must validate before identity write"
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="profile_required_failure"):
+        plaintext._run_plaintext_update_identity_job(
+            store,
+            "api_key",
+            "job-required-update-profile",
+            runtime=object(),
+            analysis_messages=[{"role": "user", "content": "Name: New"}],
+        )
 
 
 def test_update_identity_mode_initializes_missing_identity(monkeypatch):

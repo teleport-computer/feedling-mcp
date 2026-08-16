@@ -14,6 +14,21 @@ import provider_client  # noqa: E402
 from genesis import prompts, service, worker  # noqa: E402
 
 
+@pytest.fixture(autouse=True)
+def _isolate_legacy_worker_cases_from_profile_lane(monkeypatch):
+    """These cases cover the pre-existing reducer contract; profile has its own tests."""
+    monkeypatch.setattr(
+        worker.service,
+        "render_genesis_profile_source",
+        lambda *_args, **_kwargs: ("", 0, False),
+    )
+    monkeypatch.setattr(
+        worker,
+        "build_profile_output_from_sources",
+        lambda **_kwargs: {},
+    )
+
+
 def _chunk(seq: int, body: bytes = b"ct") -> dict:
     return {
         "seq": seq,

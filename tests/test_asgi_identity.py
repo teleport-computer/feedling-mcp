@@ -285,13 +285,21 @@ def test_changes_seeded_parity(user):
     uid, api_key = user
     # Deterministic log rows (fixed id + ts) so both frameworks read identical data.
     db.log_append(uid, "identity_changes", {"id": "c1", "ts": "2026-06-01T00:00:00", "action": "init", "reason": "first"})
-    db.log_append(uid, "identity_changes", {"id": "c2", "ts": "2026-06-02T00:00:00", "action": "replace", "reason": "second"})
+    db.log_append(uid, "identity_changes", {
+        "id": "c2",
+        "ts": "2026-06-02T00:00:00",
+        "action": "replace",
+        "reason": "second",
+        "fields": ["agent_name", "dimensions"],
+    })
     f = _flask("GET", "/v1/identity/changes", headers=_headers(api_key))
     a = _asgi("GET", "/v1/identity/changes", headers=_headers(api_key))
     assert f == a
     assert f[0] == 200
     assert f[1]["total"] == 2
     assert [c["id"] for c in f[1]["changes"]] == ["c2", "c1"]  # newest-first
+    assert f[1]["changes"][0]["fields"] == ["agent_name", "dimensions"]
+    assert "fields" not in f[1]["changes"][1]  # legacy records remain readable
 
     # `since` filter parity
     f2 = _flask("GET", "/v1/identity/changes?since=2026-06-01T12:00:00", headers=_headers(api_key))

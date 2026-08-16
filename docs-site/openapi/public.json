@@ -3133,6 +3133,7 @@
     "/v1/identity/changes": {
       "get": {
         "summary": "Identity Changes",
+        "description": "List content-free identity mutations, newest first.\n\nNewly written records include ``fields`` with canonical changed-field\nlabels. Legacy records may omit it and clients must tolerate that shape.",
         "operationId": "identity_changes_v1_identity_changes_get",
         "responses": {
           "200": {
