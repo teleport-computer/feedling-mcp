@@ -95,6 +95,23 @@ resident 侧才是 HTTP 客户端,POST `/v1/memory/*`。
 ⚠️ **结构差异**:V2 的 capture 和 dream 是同一个函数的两个 lane,resident 侧是两个函数。
 所以"改 dream 会不会影响 capture"在两侧答案不同。
 
+### ⚠️ 提示词已统一到内核(2026-08-16 `ec660613` 之后,本表初稿早于它两天)
+
+**执行入口仍如上表分两侧,但提示词文本现在只有一份**:
+
+| prompt | 唯一实现 | 谁在用 |
+|---|---|---|
+| capture | `backend/memory_garden/prompts/capture.py` | V2 + resident(都经 `memory/capture_prompt_v1.py` 适配壳) |
+| dream | `backend/memory_garden/prompts/dream.py` | V2 + resident(都经 `memory/dream_prompt_v1.py` 适配壳) |
+| migrate | `backend/memory_garden/prompts/migrate.py` | **只有 resident**;V2 侧无调用方,老壳 `memory/migrate_prompt_v1.py` 已在 `5e50e79e` 删除 |
+
+`memory/*_prompt_v1.py` 现在**不是纯 re-export**:它们是适配层,补齐称呼规则后转调内核
+(所以壳与内核签名不同,别用 `is` 判定两者等同)。
+
+**改动影响面**:动 capture / dream 的模板 = **同时改变托管用户与自建服务器用户的行为**。
+逐字节 golden 见 `tests/test_memory_garden_capture_golden.py` 与
+`tests/test_memory_garden_dream_migrate_golden.py` —— 有意改动要更新基线并在提交里说明。
+
 ### `occurred_at` 谁在写(这是被错误归因过的字段)
 
 | | Runtime V2 | Resident consumer |
