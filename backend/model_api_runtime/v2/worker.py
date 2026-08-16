@@ -8983,6 +8983,27 @@ async def _enqueue_profile_if_due(
     return (not coalesced) or made_ready
 
 
+async def _repair_profile_after_chat_provider_success(user_id: str) -> bool:
+    """Best-effort re-arm of provider-config profile failures after chat works."""
+
+    try:
+        result = await asyncio.to_thread(
+            v2_profile_store.repair_stuck_profile_retry,
+            str(user_id),
+            target_dispositions=(
+                v2_profile_store.PROFILE_PROVIDER_SUCCESS_RECOVERABLE_DISPOSITIONS
+            ),
+        )
+    except Exception as exc:  # noqa: BLE001 — a delivered chat is authoritative
+        log.warning(
+            "[v2.worker] post-chat profile repair failed user=%s code=%s",
+            user_id,
+            type(exc).__name__.lower(),
+        )
+        return False
+    return result.status == "repaired"
+
+
 def _profile_attempt_count(previous: dict) -> int:
     try:
         prior = int((previous.get("last_attempt") or {}).get("attempts") or 0)
@@ -13137,6 +13158,12 @@ async def process_job(
             )
             if not completed:
                 raise LostJobLease("job ownership lost during finalization")
+        # A successfully committed foreground reply proves the user's provider
+        # credential is working again.  Re-arm only provider_config profile
+        # failures; terminal remains operator-only.  This runs after the current
+        # turn's profile scheduling check, so the next natural trigger owns the
+        # retry, and any read/CAS failure cannot rewrite the delivered chat.
+        await _repair_profile_after_chat_provider_success(user_id)
         # The reply/cursor/job lifecycle transition above is authoritative.  In
         # the seq-native path it is one transaction; in the compatibility path
         # ``finish_chat_job`` has already committed before we get here.  Status
