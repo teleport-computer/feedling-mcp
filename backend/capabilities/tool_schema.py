@@ -33,6 +33,7 @@ from perception.agent_fields import (
 )
 
 REPLY_TOOL = "reply"
+STAY_SILENT_TOOL = "stay_silent"
 FILE_REPLY_TOOL = "send_file"
 IMAGE_REPLY_TOOL = "generate_image"
 TASK_TOOL = "task"
@@ -407,6 +408,11 @@ PARAMS: dict[str, dict] = {
         "properties": {"text": _STR},
         "required": ["text"],
     },
+    STAY_SILENT_TOOL: {
+        "type": "object",
+        "properties": {"reason": _STR},
+        "required": ["reason"],
+    },
     # Explicitly publish one file that already exists in the encrypted V2
     # workspace. The worker resolves the path for the current user; this never
     # accepts a host filesystem path.
@@ -709,6 +715,11 @@ DESCRIPTIONS: dict[str, str] = {
         "not the final reply, does not need and must not include <think>, and must "
         "not replace the final reply."
     ),
+    STAY_SILENT_TOOL: (
+        "Choose not to send a proactive message on this wake. Give one short, "
+        "specific reason based on the current attention facts. This is a successful, "
+        "auditable outcome, not an error."
+    ),
     FILE_REPLY_TOOL: (
         "Deliver an existing /workspace source as a downloadable attachment. "
         "Plain-text formats are sent directly; .docx and .pdf targets are rendered "
@@ -993,6 +1004,7 @@ def build_tool_specs() -> list[ToolSpec]:
     for name in (
         TASK_TOOL,
         REPLY_TOOL,
+        STAY_SILENT_TOOL,
         FILE_REPLY_TOOL,
         IMAGE_REPLY_TOOL,
         PROVIDER_USAGE_TOOL,

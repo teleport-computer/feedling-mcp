@@ -1080,6 +1080,44 @@ def test_heartbeat_thinking_only_is_successful_silence_without_backoff(
     assert schedule is None or schedule["proactive_backoff_until"] is None
 
 
+def test_heartbeat_stay_silent_completes_with_auditable_reason(monkeypatch):
+    uid = "u_wake_stay_silent"
+    conftest.seed_user(uid)
+    _reset(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, "heartbeat")
+    claimed_by = _claim(job_id)
+    calls = _script_provider(monkeypatch, [{
+        "reply": "",
+        "tool_calls": [{
+            "id": "silent-1",
+            "name": cap_tool_schema.STAY_SILENT_TOOL,
+            "args": {"reason": "48 秒前刚主动联系过"},
+        }],
+        "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+    }])
+
+    status = asyncio.run(worker._run_wake(
+        job_id,
+        uid,
+        "heartbeat",
+        _wake_deps(tail=[{"id": "m1", "ts": 1.0, "role": "user", "content": "hi"}]),
+        _BYOK,
+        asyncio.Semaphore(4),
+        claimed_by,
+    ))
+
+    assert status == "completed"
+    assert cap_tool_schema.STAY_SILENT_TOOL in {
+        spec.name for spec in calls[0]["tools"]
+    }
+    with db.get_pool().connection() as conn:
+        row = conn.execute(
+            "SELECT status,wake_result,wake_result_reason FROM agent_jobs WHERE id=%s",
+            (job_id,),
+        ).fetchone()
+    assert row == ("completed", "sleep", "48 秒前刚主动联系过")
+
+
 def test_scheduled_thinking_only_remains_a_must_deliver_failure(monkeypatch):
     monkeypatch.delenv("FEEDLING_V2_SELF_THINKING", raising=False)
     uid = "u_scheduled_thinking_only"
@@ -1114,6 +1152,9 @@ def test_scheduled_thinking_only_remains_a_must_deliver_failure(monkeypatch):
     # 剥空的,与「provider 什么都没给」必须能在 admin 上分开看(归因仍是 system)。
     assert _job_status(job_id) == ("failed", "wake_failed:thinking_only_no_reply")
     assert writes == []
+    assert cap_tool_schema.STAY_SILENT_TOOL not in {
+        spec.name for spec in calls[0]["tools"]
+    }
     system_text = "\n".join(
         str(message.get("content") or "")
         for message in calls[0]["messages"]
