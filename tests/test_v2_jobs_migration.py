@@ -70,14 +70,15 @@ def _migration_0085_module():
     )
 
 
-def test_agent_jobs_available_at_is_the_single_installed_head():
+def test_agent_jobs_chain_has_one_installed_head_and_available_at_baseline():
     """A deploy missing the durable baseline migration must fail before rollout."""
     backend = Path(__file__).parent.parent / "backend"
     cfg = Config(str(backend / "alembic.ini"))
     cfg.set_main_option("script_location", str(backend / "alembic"))
     script = ScriptDirectory.from_config(cfg)
 
-    assert script.get_heads() == ["0088_agent_jobs_available_at"]
+    heads = script.get_heads()
+    assert len(heads) == 1
     migration = script.get_revision("0088_agent_jobs_available_at")
     assert migration.down_revision == "0087_v2_first_chat_activation"
     migration = script.get_revision("0087_v2_first_chat_activation")
@@ -156,7 +157,7 @@ def test_agent_jobs_available_at_is_the_single_installed_head():
             "AND indexname='ix_agent_jobs_pending_available_at'"
         ).fetchone()
 
-    assert installed_head == ("0088_agent_jobs_available_at",)
+    assert installed_head == (heads[0],)
     assert available_at[:2] == ("timestamp with time zone", "NO")
     assert "now()" in str(available_at[2])
     assert pending_index is not None
@@ -221,7 +222,12 @@ def test_0075_usage_rollup_schema_is_installed_without_source_backfill():
             "AND tgrelid='v2_turn_metrics'::regclass"
         ).fetchone()[0]
 
-    assert head == ("0088_agent_jobs_available_at",)
+    backend = Path(__file__).parent.parent / "backend"
+    cfg = Config(str(backend / "alembic.ini"))
+    cfg.set_main_option("script_location", str(backend / "alembic"))
+    heads = ScriptDirectory.from_config(cfg).get_heads()
+    assert len(heads) == 1
+    assert head == (heads[0],)
     assert tables == {
         "v2_usage_daily_users",
         "v2_usage_daily_dimensions",
