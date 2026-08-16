@@ -1,4 +1,4 @@
-"""Per-user content-shape storage contract for Runtime V2 MEMORY/USER profile.
+"""Content-shape-aware storage contract for the Runtime V2 MEMORY/STYLE profile.
 
 ``user_blobs.doc`` is ordinary JSONB.  Only bounded metadata may live outside
 the two content records. Each record follows the user's effective content
@@ -29,6 +29,14 @@ log = logging.getLogger("feedling.runtime_v2.profile_store")
 PROFILE_BLOB_KIND = "v2_agent_profile"
 PROFILE_VERSION = 1
 PROFILE_STATES = frozenset({"ok", "pending", "degraded", "empty"})
+PROFILE_RETRY_DISPOSITIONS = frozenset(
+    {"", "scheduled", "provider_config", "source_change", "terminal"}
+)
+# These dispositions deliberately stop the ordinary refresh scheduler until an
+# operator repairs the metadata.  Keep the rescue CLI and worker scheduler on
+# one source of truth: copying these strings into an operator script can leave
+# a newly introduced permanent disposition stranded forever.
+PROFILE_STUCK_RETRY_DISPOSITIONS = frozenset({"provider_config", "terminal"})
 _REJECT_CODE_RE = re.compile(r"^[A-Za-z0-9_.:-]{0,160}$")
 
 
@@ -40,7 +48,7 @@ class ProfileStorageError(RuntimeError):
 class ProfilePromptSelection:
     summary: str
     memory: str = ""
-    user: str = ""
+    style: str = ""
     used_profile: bool = False
     fallback_reason: str = ""
 
@@ -138,13 +146,7 @@ def validate_profile_document(value: Any) -> dict:
     if not math.isfinite(retry_not_before) or retry_not_before < 0:
         raise ProfileStorageError("profile_retry_not_before_invalid")
     retry_disposition = str(attempt.get("retry_disposition") or "")
-    if retry_disposition not in {
-        "",
-        "scheduled",
-        "provider_config",
-        "source_change",
-        "terminal",
-    }:
+    if retry_disposition not in PROFILE_RETRY_DISPOSITIONS:
         raise ProfileStorageError("profile_retry_disposition_invalid")
     retry_family = str(attempt.get("retry_family") or "")
     if retry_family not in {
@@ -189,12 +191,22 @@ def validate_profile_document(value: Any) -> dict:
         "disabled": disabled,
     }
     memory = value.get("memory")
-    user = value.get("user")
-    if (memory is None) != (user is None):
+    style = value.get("style")
+    legacy_user = value.get("user")
+    if style is not None and legacy_user is not None:
+        raise ProfileStorageError("profile_style_alias_conflict")
+    # TODO(profile-style-migration): remove the legacy USER read fallback after
+    # every stored profile has completed one successful MEMORY/STYLE redistill.
+    style_key = "style" if style is not None else "user"
+    style_value = style if style is not None else legacy_user
+    if (memory is None) != (style_value is None):
         raise ProfileStorageError("profile_fields_torn")
     if memory is not None:
         normalized["memory"] = _validate_content_field(memory, "memory")
-        normalized["user"] = _validate_content_field(user, "user")
+        normalized[style_key] = _validate_content_field(
+            style_value,
+            style_key,
+        )
     if state == "ok" and memory is None:
         raise ProfileStorageError("profile_ok_fields_missing")
     return normalized
@@ -218,7 +230,7 @@ def build_profile_document(
     source: dict,
     last_attempt: dict,
     memory_text: str | None = None,
-    user_text: str | None = None,
+    style_text: str | None = None,
     previous: dict | None = None,
     disabled: bool = False,
     seal_text: Callable[[str, str], dict] = _seal_text,
@@ -232,7 +244,7 @@ def build_profile_document(
     ``content_encryption``. Supplying only one field is always a torn write and
     fails before any CAS.
     """
-    if (memory_text is None) != (user_text is None):
+    if (memory_text is None) != (style_text is None):
         raise ProfileStorageError("profile_fields_torn")
     document: dict[str, Any] = {
         "v": PROFILE_VERSION,
@@ -241,23 +253,94 @@ def build_profile_document(
         "last_attempt": deepcopy(last_attempt),
         "disabled": bool(disabled),
     }
-    if memory_text is not None and user_text is not None:
-        if not memory_text.strip() or not user_text.strip():
-            raise ProfileStorageError("profile_field_empty")
+    if memory_text is not None and style_text is not None:
         document["memory"] = {
             "envelope": seal_text(str(user_id), memory_text),
             "chars": len(memory_text),
         }
-        document["user"] = {
-            "envelope": seal_text(str(user_id), user_text),
-            "chars": len(user_text),
+        document["style"] = {
+            "envelope": seal_text(str(user_id), style_text),
+            "chars": len(style_text),
         }
     elif isinstance(previous, dict):
-        if previous.get("memory") is not None or previous.get("user") is not None:
+        if (
+            previous.get("memory") is not None
+            or previous.get("style") is not None
+            or previous.get("user") is not None
+        ):
             prior = validate_profile_document(previous)
             if prior.get("memory") is not None:
                 document["memory"] = prior["memory"]
-                document["user"] = prior["user"]
+                if prior.get("style") is not None:
+                    document["style"] = prior["style"]
+                else:
+                    document["user"] = prior["user"]
+    return validate_profile_document(document)
+
+
+def build_profile_document_patching_fields(
+    user_id: str,
+    *,
+    state: str,
+    source: dict,
+    last_attempt: dict,
+    memory_text: str | None,
+    style_text: str | None,
+    previous: dict | None,
+    disabled: bool | None = None,
+    seal_text: Callable[[str, str], dict] = _seal_text,
+) -> dict:
+    """Seal touched fields and byte-preserve untouched encrypted fields.
+
+    Genesis can derive only MEMORY or only STYLE from one upload.  Requiring it
+    to decrypt and reseal the untouched side adds an enclave dependency and can
+    change ciphertext for data the pass did not own.  A missing prior side is
+    initialized as an encrypted empty string so the paired-field contract stays
+    atomic.
+    """
+    prior = (
+        validate_profile_document(previous)
+        if isinstance(previous, dict) and previous
+        else {}
+    )
+    document: dict[str, Any] = {
+        "v": PROFILE_VERSION,
+        "state": str(state),
+        "source": deepcopy(source),
+        "last_attempt": deepcopy(last_attempt),
+        "disabled": (
+            bool(prior.get("disabled"))
+            if disabled is None
+            else bool(disabled)
+        ),
+    }
+    if memory_text is not None:
+        document["memory"] = {
+            "envelope": seal_text(str(user_id), memory_text),
+            "chars": len(memory_text),
+        }
+    elif prior.get("memory") is not None:
+        document["memory"] = deepcopy(prior["memory"])
+    else:
+        document["memory"] = {
+            "envelope": seal_text(str(user_id), ""),
+            "chars": 0,
+        }
+
+    if style_text is not None:
+        document["style"] = {
+            "envelope": seal_text(str(user_id), style_text),
+            "chars": len(style_text),
+        }
+    elif prior.get("style") is not None:
+        document["style"] = deepcopy(prior["style"])
+    elif prior.get("user") is not None:
+        document["user"] = deepcopy(prior["user"])
+    else:
+        document["style"] = {
+            "envelope": seal_text(str(user_id), ""),
+            "chars": 0,
+        }
     return validate_profile_document(document)
 
 
@@ -296,6 +379,8 @@ def _winner_supersedes(winner: dict, candidate: dict) -> bool:
 def update_profile_cas(
     user_id: str,
     recompute: Callable[[dict], dict],
+    *,
+    allow_freshness_supersede: bool = True,
 ) -> ProfileCasResult:
     """CAS one profile, recomputing once against the winning race document.
 
@@ -305,13 +390,20 @@ def update_profile_cas(
     """
     expected_raw = db.get_blob_strict(str(user_id), PROFILE_BLOB_KIND)
     expected = deepcopy(expected_raw) if isinstance(expected_raw, dict) else {}
-    return _update_profile_cas_from_expected(str(user_id), expected, recompute)
+    return _update_profile_cas_from_expected(
+        str(user_id),
+        expected,
+        recompute,
+        allow_freshness_supersede=allow_freshness_supersede,
+    )
 
 
 def _update_profile_cas_from_expected(
     user_id: str,
     expected_doc: dict,
     recompute: Callable[[dict], dict],
+    *,
+    allow_freshness_supersede: bool = True,
 ) -> ProfileCasResult:
     """Internal snapshot form used by the true two-connection race test."""
     expected = deepcopy(expected_doc)
@@ -334,7 +426,11 @@ def _update_profile_cas_from_expected(
             )
         winner_raw = db.get_blob_strict(str(user_id), PROFILE_BLOB_KIND)
         winner = deepcopy(winner_raw) if isinstance(winner_raw, dict) else {}
-        if winner and _winner_supersedes(winner, candidate):
+        if (
+            allow_freshness_supersede
+            and winner
+            and _winner_supersedes(winner, candidate)
+        ):
             return ProfileCasResult(
                 status="superseded",
                 document=validate_profile_document(winner),
@@ -461,11 +557,15 @@ def select_profile_for_turn(
 
     try:
         memory = _read_field("memory")
-        user = _read_field("user")
+        # TODO(profile-style-migration): delete the USER fallback after the
+        # fleet has naturally rewritten every profile through distillation.
+        style_key = "style" if document.get("style") is not None else "user"
+        style_field = document[style_key]
+        style = _read_field(style_key)
         if len(memory) != document["memory"]["chars"]:
             raise ProfileStorageError("memory_chars_mismatch")
-        if len(user) != document["user"]["chars"]:
-            raise ProfileStorageError("user_chars_mismatch")
+        if len(style) != style_field["chars"]:
+            raise ProfileStorageError(f"{style_key}_chars_mismatch")
     except Exception as exc:
         reason = f"decrypt_failed:{type(exc).__name__.lower()}"
         _record_turn_fallback(reason)
@@ -475,6 +575,6 @@ def select_profile_for_turn(
     return ProfilePromptSelection(
         summary="",
         memory=memory,
-        user=user,
+        style=style,
         used_profile=True,
     )

@@ -155,10 +155,10 @@ from memory.capture_prompt_v1 import (
     sanitize_user_name,
 )
 from identity.user_naming import transcript_speaker_label
-from memory import card_guard
-from memory import dream_gates as memory_dream_gates
-from memory.prompts_v1 import normalize_bucket_language
-from memory.card_text import (
+from memory_garden.text import card_guard
+from memory_garden.guards import dream_gates as memory_dream_gates
+from memory_garden.prompts.buckets import normalize_bucket_language
+from memory_garden.text.card_text import (
     count_user_token_residuals,
     is_retryable_parse_error,
 )
@@ -167,7 +167,7 @@ from memory.dream_prompt_v1 import (
     build_dream_retry_prompt,
     parse_dream_consolidations,
 )
-from memory.migrate_prompt_v1 import build_migrate_prompt, parse_migrated_cards
+from memory_garden.prompts.migrate import build_migrate_prompt, parse_migrated_cards
 from chat.reply_language import (
     format_time_anchor,
     infer_reply_language_policy,
@@ -13514,7 +13514,7 @@ def _memory_agent_parse_with_bounce(
     _note_agent_turn_success()
     parsed = parse(reply_text, strict=True)
     err = parsed[-1]
-    # 谓词与 V2 的 ParseRetry.should_retry 是同一个(memory.card_text)。两条 lane
+    # 谓词与 V2 的 ParseRetry.should_retry 是同一个(memory_garden.text.card_text)。两条 lane
     # 必须共用一份判据,否则同一个模型在托管和自建上会得到不同的重问行为 ——
     # json_decode_error 以前不在重问范围,注释说它「各有自己的退避路径」,实测那条
     # 路是空的:usr_450ee421e16a3b5a 连续 6 次失败,reask_count 全是 0。

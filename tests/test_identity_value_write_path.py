@@ -35,6 +35,24 @@ def test_actions_payload_from_plain_normalizes_float_values():
         assert type(d["value"]) is int
 
 
+def test_actions_payload_preserves_encrypted_dimensions_set_marker():
+    marker = {
+        "reason": "user requested a complete rewrite",
+        "tool": "set",
+        "changed_count": 3,
+        "added_count": 1,
+        "deleted_count": 1,
+        "labels_changed": 1,
+    }
+    payload = identity_actions_mod._identity_payload_from_plain({
+        "agent_name": "阿锐",
+        "dimensions": [{"name": "锐利", "value": 80}],
+        "last_dimensions_set": marker,
+    })
+
+    assert payload["last_dimensions_set"] == marker
+
+
 def test_genesis_payload_from_output_restores_0_1_scale():
     # The genesis distill/import path previously int()-truncated (0.95 -> 0),
     # silently zeroing a BYOK 0–1-scale card. It must rescale to 0–100 ints.

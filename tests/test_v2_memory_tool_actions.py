@@ -11,8 +11,35 @@ title_required/400.
 import sys
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 from model_api_runtime.v2 import worker
+
+
+def test_interactive_memory_card_rejection_is_bounded_and_recoverable():
+    with pytest.raises(ValueError, match=r"^memory_card_rejected:"):
+        worker._memory_tool_actions([{
+            "op": "add",
+            "summary": "...",
+            "content": "...",
+        }])
+
+
+def test_threads_schema_enforces_one_to_four_items():
+    from capabilities.tool_schema import validate_tool_args
+
+    base = {
+        "op": "add",
+        "summary": "一条完整的记忆标题",
+        "content": "这是一段足够长的记忆正文内容。",
+    }
+    assert "at least 1" in validate_tool_args(
+        "memory_write", {"actions": [{**base, "threads": []}]}
+    )
+    assert "at most 4" in validate_tool_args(
+        "memory_write", {"actions": [{**base, "threads": ["a"] * 5}]}
+    )
 
 
 def test_add_maps_to_memory_add_with_nested_plaintext_and_no_envelope():
@@ -37,19 +64,90 @@ def test_add_maps_to_memory_add_with_nested_plaintext_and_no_envelope():
 
 
 def test_add_without_summary_falls_back_to_content_prefix():
-    out = worker._memory_tool_actions([{"op": "add", "content": "x" * 200}])
-    assert out[0]["memory"]["summary"] == "x" * 80
-    assert out[0]["memory"]["content"] == "x" * 200
+    out = worker._memory_tool_actions([{"op": "add", "content": "这是一段足够长且有实际含义的记忆正文，用于验证摘要回退逻辑。"}])
+    assert out[0]["memory"]["summary"] == "这是一段足够长且有实际含义的记忆正文，用于验证摘要回退逻辑。"
+    assert out[0]["memory"]["content"] == out[0]["memory"]["summary"]
 
 
 def test_update_maps_to_supersede_with_target():
     out = worker._memory_tool_actions([
-        {"op": "update", "target_id": "mem_1", "summary": "新", "content": "更新后的内容"}])
+        {"op": "update", "target_id": "mem_1", "summary": "新的记忆标题", "content": "这是更新后的记忆正文，包含足够的实际内容。"}])
     a = out[0]
     assert a["type"] == "memory.supersede"
     assert a["supersedes"] == "mem_1"
-    assert a["memory"]["content"] == "更新后的内容"
+    assert a["memory"]["content"] == "这是更新后的记忆正文，包含足够的实际内容。"
     assert "envelope" not in a
+
+
+def test_merge_update_can_supersede_every_source_card():
+    """A consolidated successor must retire every card it replaced.
+
+    The server-side memory.supersede action has always accepted a list, but the
+    model-facing tool exposed only one target_id.  That made a real multi-card
+    merge impossible: one old card could be retired while the others remained
+    active beside the merged successor.
+    """
+    from capabilities.tool_schema import validate_tool_args
+
+    raw = {
+        "actions": [{
+            "op": "update",
+            "target_ids": ["mem_old_1", "mem_old_2", "mem_old_1"],
+            "summary": "合并后的记忆",
+            "content": "两张旧卡整理成的一张新卡。",
+        }]
+    }
+
+    assert validate_tool_args("memory_write", raw) is None
+    out = worker._memory_tool_actions(raw["actions"])
+    assert len(out) == 1
+    assert out[0]["type"] == "memory.supersede"
+    assert out[0]["supersedes"] == ["mem_old_1", "mem_old_2"]
+
+
+def test_merge_update_rejects_empty_target_ids():
+    from capabilities.tool_schema import validate_tool_args
+
+    err = validate_tool_args("memory_write", {"actions": [{
+        "op": "update", "target_ids": [], "summary": "s", "content": "c",
+    }]})
+
+    assert err == "args.actions[0] update requires target_id or target_ids, summary, and content"
+
+
+def test_merge_update_over_limit_is_rejected_without_silent_truncation():
+    from capabilities.tool_schema import validate_tool_args
+
+    actions = [{
+        "op": "update",
+        "target_ids": [f"mem_{index}" for index in range(25)],
+        "summary": "合并后的记忆标题",
+        "content": "这是合并后的记忆正文，包含足够的实际内容。",
+    }]
+
+    assert "maximum 20" in validate_tool_args("memory_write", {"actions": actions})
+    # Translation is deliberately lossless as a second guard.  Live model
+    # calls stop at validation; any trusted/internal caller that bypasses it is
+    # rejected explicitly by memory.actions instead of receiving a partial 20.
+    assert worker._memory_tool_actions(actions)[0]["supersedes"] == [
+        f"mem_{index}" for index in range(25)
+    ]
+
+
+def test_merge_limit_counts_target_id_together_with_target_ids():
+    from capabilities.tool_schema import validate_tool_args
+
+    action = {
+        "op": "update",
+        "target_id": "mem_20",
+        "target_ids": [f"mem_{index}" for index in range(20)],
+        "summary": "超过目标的记忆标题",
+        "content": "这是超过目标的记忆正文，包含足够的实际内容。",
+    }
+
+    assert validate_tool_args("memory_write", {"actions": [action]}) == (
+        "args.actions[0] target_ids exceeds maximum 20"
+    )
 
 
 def test_delete_maps_to_memory_delete():
@@ -64,9 +162,9 @@ def test_delete_maps_to_memory_delete():
 def test_reason_is_forwarded_to_add_update_and_delete_with_bound():
     long_reason = "r" * 1200
     add, update, delete = worker._memory_tool_actions([
-        {"op": "add", "summary": "s", "content": "c", "reason": "because"},
+        {"op": "add", "summary": "一条完整的记忆标题", "content": "这是一段完整的记忆正文内容。", "reason": "because"},
         {
-            "op": "update", "target_id": "m1", "summary": "s", "content": "c",
+            "op": "update", "target_id": "m1", "summary": "更新后的记忆标题", "content": "这是一段更新后的记忆正文内容。",
             "reason": long_reason,
         },
         {"op": "delete", "target_id": "m2", "reason": "obsolete"},
@@ -98,7 +196,7 @@ def test_lenient_synonyms_action_title_description():
 
 def test_memory_dot_prefixed_op_normalized():
     out = worker._memory_tool_actions([
-        {"type": "memory.add", "summary": "s", "content": "c"}])
+        {"type": "memory.add", "summary": "点号格式记忆标题", "content": "这是一段点号格式的记忆正文。"}])
     assert out[0]["type"] == "memory.add"
 
 
@@ -119,7 +217,7 @@ def test_update_without_bucket_or_threads_does_not_author_empty_ones():
     schema 根本不允许模型传,所以每一次 update 都必然清空标签。
     """
     out = worker._memory_tool_actions([
-        {"op": "update", "target_id": "mem_1", "summary": "新", "content": "更新后的内容"}])
+        {"op": "update", "target_id": "mem_1", "summary": "新的记忆标题", "content": "这是更新后的记忆正文，包含足够的实际内容。"}])
     inner = out[0]["memory"]
 
     assert "bucket" not in inner, "没传桶就不该出现这个键,否则会盖掉旧卡的桶"
@@ -129,7 +227,7 @@ def test_update_without_bucket_or_threads_does_not_author_empty_ones():
 def test_update_with_explicit_bucket_still_overrides():
     """模型确实传了就照传 —— 别把修复做成「永远不能改桶」。"""
     out = worker._memory_tool_actions([{
-        "op": "update", "target_id": "mem_1", "summary": "新", "content": "内容",
+        "op": "update", "target_id": "mem_1", "summary": "新的记忆标题", "content": "这是更新后的记忆正文，包含足够的实际内容。",
         "bucket": "健康",
     }])
     assert out[0]["memory"]["bucket"] == "健康"
@@ -138,7 +236,7 @@ def test_update_with_explicit_bucket_still_overrides():
 def test_add_still_carries_whatever_the_model_gave():
     """add 没有可继承的旧卡,行为不变。"""
     out = worker._memory_tool_actions([{
-        "op": "add", "summary": "s", "content": "c", "bucket": "爱好",
+        "op": "add", "summary": "兴趣爱好记忆标题", "content": "这是一段兴趣爱好记忆正文内容。", "bucket": "爱好",
     }])
     assert out[0]["memory"]["bucket"] == "爱好"
 
@@ -156,13 +254,13 @@ def test_model_can_supply_threads_importance_and_pulse():
     from capabilities.tool_schema import validate_tool_args
 
     err = validate_tool_args("memory_write", {"actions": [{
-        "op": "add", "summary": "s", "content": "c", "bucket": "爱好",
+        "op": "add", "summary": "兴趣爱好记忆标题", "content": "这是一段兴趣爱好记忆正文内容。", "bucket": "爱好",
         "threads": ["自行车", "瓜车"], "importance": 0.8, "pulse": 0.6,
     }]})
     assert err is None, f"schema 该放行这三个字段,却拒了:{err}"
 
     out = worker._memory_tool_actions([{
-        "op": "add", "summary": "s", "content": "c",
+        "op": "add", "summary": "骑行偏好记忆标题", "content": "这是一段骑行偏好记忆正文内容。",
         "threads": ["自行车"], "importance": 0.8, "pulse": 0.6,
     }])
     inner = out[0]["memory"]
@@ -174,7 +272,7 @@ def test_model_can_supply_threads_importance_and_pulse():
 def test_zero_importance_is_not_swallowed_as_missing():
     """importance=0 / pulse=0 是合法取值,不能被 `or default` 吞成「没传」。"""
     out = worker._memory_tool_actions([{
-        "op": "add", "summary": "s", "content": "c", "importance": 0, "pulse": 0,
+        "op": "add", "summary": "权重为零的记忆标题", "content": "这是一段用于验证权重的记忆正文。", "importance": 0, "pulse": 0,
     }])
     inner = out[0]["memory"]
     assert inner["importance"] == 0, "0 被当成没传了"
@@ -184,7 +282,7 @@ def test_zero_importance_is_not_swallowed_as_missing():
 def test_update_still_inherits_when_scores_absent():
     """没传评分时仍然不写这两个键 —— 和 bucket/threads 同一条规矩。"""
     out = worker._memory_tool_actions([
-        {"op": "update", "target_id": "mem_1", "summary": "新", "content": "内容"}])
+        {"op": "update", "target_id": "mem_1", "summary": "新的记忆标题", "content": "这是更新后的记忆正文，包含足够的实际内容。"}])
     inner = out[0]["memory"]
     assert "importance" not in inner
     assert "pulse" not in inner
@@ -200,30 +298,42 @@ def test_occurred_at_is_frozen_at_enqueue_not_at_apply(monkeypatch):
     对齐 V1 的做法就是在入队时冻结,和 identity 的 relationship_anchor
     (`_frozen_relationship_anchor`,同样在 ENQUEUE 冻结)是同一条惯例。
     """
-    monkeypatch.setattr(worker.core_util, "_now_iso", lambda: "2026-08-10T23:00:00")
+    monkeypatch.setattr(
+        worker.memory_timestamps,
+        "now_iso",
+        lambda: "2026-08-10T23:00:00Z",
+    )
 
-    out = worker._memory_tool_actions([{"op": "add", "summary": "s", "content": "c"}])
+    out = worker._memory_tool_actions([{"op": "add", "summary": "发生时间记忆标题", "content": "这是一段用于验证发生时间的记忆正文内容。"}])
 
-    assert out[0]["memory"]["occurred_at"] == "2026-08-10T23:00:00"
+    assert out[0]["memory"]["occurred_at"] == "2026-08-10T23:00:00Z"
 
 
 def test_model_cannot_forge_occurred_at(monkeypatch):
     """时间是服务端的可信元数据,不接受模型自报 —— schema 里也没这个字段。"""
-    monkeypatch.setattr(worker.core_util, "_now_iso", lambda: "2026-08-10T23:00:00")
+    monkeypatch.setattr(
+        worker.memory_timestamps,
+        "now_iso",
+        lambda: "2026-08-10T23:00:00Z",
+    )
 
     out = worker._memory_tool_actions([{
-        "op": "add", "summary": "s", "content": "c",
+        "op": "add", "summary": "模型时间记忆标题", "content": "这是一段用于验证模型时间字段的正文内容。",
         "occurred_at": "1999-01-01T00:00:00",
     }])
 
-    assert out[0]["memory"]["occurred_at"] == "2026-08-10T23:00:00"
+    assert out[0]["memory"]["occurred_at"] == "2026-08-10T23:00:00Z"
 
 
 def test_update_also_carries_a_frozen_time(monkeypatch):
     """supersede 走的是同一个 raw（action["memory"]），同样要带上。"""
-    monkeypatch.setattr(worker.core_util, "_now_iso", lambda: "2026-08-10T23:00:00")
+    monkeypatch.setattr(
+        worker.memory_timestamps,
+        "now_iso",
+        lambda: "2026-08-10T23:00:00Z",
+    )
 
     out = worker._memory_tool_actions([
-        {"op": "update", "target_id": "mem_1", "summary": "新", "content": "内容"}])
+        {"op": "update", "target_id": "mem_1", "summary": "新的记忆标题", "content": "这是更新后的记忆正文，包含足够的实际内容。"}])
 
-    assert out[0]["memory"]["occurred_at"] == "2026-08-10T23:00:00"
+    assert out[0]["memory"]["occurred_at"] == "2026-08-10T23:00:00Z"

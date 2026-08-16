@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import asyncio
-import sys
 import base64
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -77,22 +77,23 @@ def test_prompt_prefix_is_deterministic_and_excludes_dynamic_workspace():
         "/skills/a.md", "A", kind="skill", expected_revision=0,
     )
     backend.write("/workspace/dynamic.md", "DO NOT CACHE", expected_revision=0)
+    memory = backend.write(
+        "/memory/WORKING.md", "# Initial", expected_revision=0,
+    )
 
     first = render_trusted_prefix_blocks(backend)
     second = render_trusted_prefix_blocks(backend)
     assert first == second
     assert [block.name for block in first] == [
-        "skill:/skills/a.md", "skill:/skills/z.md", "working-memory",
+        "skill:/skills/a.md", "skill:/skills/z.md",
     ]
     assert "DO NOT CACHE" not in "\n".join(block.content for block in first)
 
-    memory = backend.read("/memory/WORKING.md")
     backend.write(
         "/memory/WORKING.md", "# Updated", expected_revision=memory.revision,
     )
     third = render_trusted_prefix_blocks(backend)
-    assert third[:-1] == first[:-1]
-    assert third[-1].cache_key != first[-1].cache_key
+    assert third == first
 
 
 def test_prompt_prefix_fails_instead_of_silently_truncating_skills():
@@ -130,6 +131,11 @@ def test_production_workspace_prompt_loader_preserves_trust_partition(
         "production_workspace_backend",
         lambda *_args, **_kwargs: backend,
     )
+    monkeypatch.setattr(
+        serve_worker.cap_identity,
+        "get",
+        lambda *_args, **_kwargs: SimpleNamespace(ok=True, data={}),
+    )
 
     rendered = serve_worker._load_workspace_prompt(
         SimpleNamespace(),
@@ -139,10 +145,8 @@ def test_production_workspace_prompt_loader_preserves_trust_partition(
     assert len(rendered["trusted_system_blocks"]) == 1
     assert "<feedling-skill" in rendered["trusted_system_blocks"][0]
     assert "Always preserve" in rendered["trusted_system_blocks"][0]
-    assert rendered["working_memory"] == ""
-    assert "Editable scratch state" not in str(
-        rendered["trusted_system_blocks"]
-    )
+    assert "working_memory" not in rendered
+    assert "Editable scratch state" not in str(rendered)
 
 
 def test_explicit_working_memory_read_lazily_creates_default():
@@ -167,8 +171,8 @@ def test_workspace_prompt_context_loads_once_and_fails_with_stable_code():
         load_workspace_prompt=lambda _store, **kwargs: (
             calls.append(kwargs["runtime_token"])
             or {
+                "identity_card_or_persona": "card",
                 "trusted_system_blocks": ("skill",),
-                "working_memory": "scratch",
             }
         ),
     )
@@ -179,7 +183,10 @@ def test_workspace_prompt_context_loads_once_and_fails_with_stable_code():
         runtime_token="token",
         enclave_sem=asyncio.Semaphore(1),
     ))
-    assert loaded == (("skill",), "")
+    assert loaded == worker.WorkspacePromptContext(
+        identity_card_or_persona="card",
+        trusted_system_blocks=("skill",),
+    )
     assert calls == ["token"]
 
     deps.load_workspace_prompt = lambda *_args, **_kwargs: (
@@ -194,8 +201,8 @@ def test_workspace_prompt_context_loads_once_and_fails_with_stable_code():
         ))
 
     deps.load_workspace_prompt = lambda *_args, **_kwargs: {
+        "identity_card_or_persona": "card",
         "trusted_system_blocks": ("",),
-        "working_memory": "scratch",
     }
     with pytest.raises(worker.WorkspacePromptUnavailable):
         asyncio.run(worker._load_workspace_prompt_context(
@@ -244,33 +251,42 @@ def test_workspace_prompt_jit_injects_complete_genesis_persona(monkeypatch):
         "production_workspace_backend",
         lambda *_args, **_kwargs: InMemoryWorkspaceBackend(),
     )
+    monkeypatch.setattr(
+        serve_worker.cap_identity,
+        "get",
+        lambda *_args, **_kwargs: SimpleNamespace(ok=True, data={}),
+    )
 
     store = SimpleNamespace(user_id="u-persona")
     first = serve_worker._load_workspace_prompt(store, runtime_token="rt-1")
     second = serve_worker._load_workspace_prompt(store, runtime_token="rt-2")
 
-    assert first["trusted_system_blocks"][0] == persona_versions[0].strip()
-    assert len(first["trusted_system_blocks"][0]) > 2_000
-    assert second["trusted_system_blocks"][0] == persona_versions[1].strip()
+    assert first["identity_card_or_persona"] == persona_versions[0].strip()
+    assert len(first["identity_card_or_persona"]) > 2_000
+    assert second["identity_card_or_persona"] == persona_versions[1].strip()
     assert [call[2:] for call in decrypt_calls] == [
         ("genesis_persona", "rt-1"),
         ("genesis_persona", "rt-2"),
     ]
 
 
-def test_workspace_prompt_reads_plaintext_persona_and_current_identity(monkeypatch):
-    blobs = {
-        "genesis_persona": {
-            "content_envelope": {"body": "# Persona\nCook carefully"}
-        },
-        "identity": {
-            "body": '{"agent_name":"pre c","user_preferred_name":"Seven"}'
-        },
-    }
+def test_workspace_prompt_prefers_current_plaintext_identity_view(monkeypatch):
     monkeypatch.setattr(
-        serve_worker.db,
-        "get_blob",
-        lambda _user_id, name: blobs.get(name),
+        serve_worker.cap_identity,
+        "get",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            ok=True,
+            data={"identity": {
+                "decrypt_status": "ok",
+                "agent_name": "pre c",
+                "user_preferred_name": "Seven",
+            }},
+        ),
+    )
+    monkeypatch.setattr(
+        serve_worker,
+        "_load_genesis_persona",
+        lambda *_args, **_kwargs: pytest.fail("identity card must suppress persona"),
     )
     monkeypatch.setattr(
         serve_worker,
@@ -282,11 +298,10 @@ def test_workspace_prompt_reads_plaintext_persona_and_current_identity(monkeypat
         SimpleNamespace(user_id="u-plaintext"), runtime_token="rt"
     )
 
-    assert rendered["trusted_system_blocks"][0] == "# Persona\nCook carefully"
-    identity = rendered["trusted_system_blocks"][1]
-    assert "<feedling-current-identity>" in identity
-    assert '"agent_name": "pre c"' in identity
-    assert '"user_preferred_name": "Seven"' in identity
+    identity = rendered["identity_card_or_persona"]
+    assert "agent_name: \"pre c\"" in identity
+    assert "user_preferred_name: \"Seven\"" in identity
+    assert rendered["trusted_system_blocks"] == ()
 
 
 def test_workspace_prompt_without_genesis_persona_keeps_existing_shape(monkeypatch):
@@ -296,13 +311,21 @@ def test_workspace_prompt_without_genesis_persona_keeps_existing_shape(monkeypat
         "production_workspace_backend",
         lambda *_args, **_kwargs: InMemoryWorkspaceBackend(),
     )
+    monkeypatch.setattr(
+        serve_worker.cap_identity,
+        "get",
+        lambda *_args, **_kwargs: SimpleNamespace(ok=True, data={}),
+    )
 
     rendered = serve_worker._load_workspace_prompt(
         SimpleNamespace(user_id="u-no-persona"),
         runtime_token="rt",
     )
 
-    assert rendered == {"trusted_system_blocks": (), "working_memory": ""}
+    assert rendered == {
+        "identity_card_or_persona": "",
+        "trusted_system_blocks": (),
+    }
 
 
 def test_sandbox_is_lazy_and_artifact_ingest_never_uses_host_filesystem():

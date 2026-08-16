@@ -116,7 +116,7 @@ SELECT doc FROM memory_moments WHERE user_id = %s ORDER BY occurred_at, moment_i
 ### 4.2 上下文记忆选择（聊天补记忆，重点）
 
 入口在 `/v1/chat/history`（`backend/enclave_app.py:907` 附近），参数 `context_mode`、`context_trace`。
-核心：`select_context_memories_with_trace()`（`backend/context_memory_selection.py:348`）。
+核心：`select_context_memories_with_trace()`（`backend/memory_garden/scoring/relevance.py:348`）。
 
 两种模式：
 
@@ -131,7 +131,7 @@ SELECT doc FROM memory_moments WHERE user_id = %s ORDER BY occurred_at, moment_i
 
 ### 4.3 相关性评分：`_memory_relevance()`
 
-`backend/context_memory_selection.py:191`，对外封装 `memory_relevance_details()`（`:285`）。分层打分：
+`backend/memory_garden/scoring/relevance.py:191`，对外封装 `memory_relevance_details()`（`:285`）。分层打分：
 
 | 匹配类型 | 分数 | 置信度 |
 |---------|------|--------|
@@ -144,7 +144,7 @@ SELECT doc FROM memory_moments WHERE user_id = %s ORDER BY occurred_at, moment_i
 | 仅字符二元组相似 | ≤0.16 | weak |
 | 无重叠 | 0.0 | none |
 
-**稀有词 vs 通用词**由两张表区分（`context_memory_selection.py:54` 起）：
+**稀有词 vs 通用词**由两张表区分（`memory_garden/scoring/relevance.py:54` 起）：
 
 - `_EN_GENERIC_TERMS`：`project / api / model / memory / task / code …` 等通用英文词，降级为「弱词」，必须组合才有意义。
 - `_ZH_GENERIC_PHRASES`：`项目 / 任务 / 今天 / 东西 …` 等通用中文短语。
@@ -161,7 +161,7 @@ SELECT doc FROM memory_moments WHERE user_id = %s ORDER BY occurred_at, moment_i
 
 **修复两处**：
 
-1. **引入通用词表 + 分层评分**（`context_memory_selection.py`）
+1. **引入通用词表 + 分层评分**（`memory_garden/scoring/relevance.py`）
    - 新增 `_EN_GENERIC_TERMS` / `_ZH_GENERIC_PHRASES`，把通用词降级；
    - 只有长度 ≥4、完整命中的实体才算 strong；
    - 用返回详情的 `_memory_relevance()` 取代旧的纯重叠计分。
@@ -205,10 +205,10 @@ SELECT doc FROM memory_moments WHERE user_id = %s ORDER BY occurred_at, moment_i
 |------|------|
 | 路由 `GET /v1/memory/list` | `backend/app.py:14017` |
 | `db.memory_load` | `backend/db.py:751` |
-| 上下文选择主算法 | `backend/context_memory_selection.py:348` |
-| 相关性评分核心 | `backend/context_memory_selection.py:191` |
-| 对外封装 `memory_relevance_details` | `backend/context_memory_selection.py:285` |
-| 通用词表 | `backend/context_memory_selection.py:54` / `67` |
+| 上下文选择主算法 | `backend/memory_garden/scoring/relevance.py:348` |
+| 相关性评分核心 | `backend/memory_garden/scoring/relevance.py:191` |
+| 对外封装 `memory_relevance_details` | `backend/memory_garden/scoring/relevance.py:285` |
+| 通用词表 | `backend/memory_garden/scoring/relevance.py:54` / `67` |
 
 ### model_api 严格选择（857c09e 修复点）
 | 功能 | 位置 |

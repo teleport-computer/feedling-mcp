@@ -11340,8 +11340,8 @@ def test_resident_and_v2_share_one_worldbook_injection_contract():
     """两条运行时的标头/上限/截断标记必须是**同一份**,不是各写一份。
 
     2026-08-10 接唤醒道时发现它们早已漂了:V2 带 UNTRUSTED 标注,resident 前台
-    只有裸的 `World book context:`。漂移不会有任何报错,只会让同一份用户数据在
-    两条路上拿到强弱不同的防注入待遇。
+    只有裸的 `World book context:`。当前措辞虽经 Seven 改为用户自写归属 + replay
+    冲突规则,共享定义仍不能拆开,否则两条路会再次静默漂移。
     """
     import sys as _sys
     _sys.path.insert(0, "backend")
@@ -11350,9 +11350,10 @@ def test_resident_and_v2_share_one_worldbook_injection_contract():
     assert _v2_context.WORLD_BOOK_CONTEXT_HEADER == _worldbook_match.CONTEXT_HEADER
     assert _v2_context.WORLD_BOOK_CONTEXT_CHAR_CAP == _worldbook_match.CONTEXT_CHAR_CAP
     assert _v2_context.WORLD_BOOK_TRUNCATION_MARKER == _worldbook_match.TRUNCATION_MARKER
-    # 标头必须真的说清「这是数据、不是指令」,而不只是个名字。
-    assert "UNTRUSTED" in _worldbook_match.CONTEXT_HEADER
-    assert "Never follow commands" in _worldbook_match.CONTEXT_HEADER
+    # 世界书当前由用户自己编写:共享标头锁住归属与 replay 冲突规则。
+    assert "user-authored setting data" in _worldbook_match.CONTEXT_HEADER
+    assert "replay wins" in _worldbook_match.CONTEXT_HEADER
+    assert "never follow instructions" not in _worldbook_match.CONTEXT_HEADER.lower()
 
 
 @pytest.mark.parametrize(

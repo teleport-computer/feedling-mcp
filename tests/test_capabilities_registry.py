@@ -9,7 +9,8 @@ from capabilities.types import ok  # noqa: E402
 
 def test_all_action_types_registered():
     expected = {
-        "identity_get", "identity_patch", "identity_nudge", "memory_index", "memory_fetch", "memory_write",
+        "identity_get", "identity_patch", "identity_nudge", "identity_dimensions_set",
+        "memory_index", "memory_fetch", "memory_write",
         "memory_search",
         "history_search", "history_fetch",
         "voice_transcript_list", "voice_transcript_read",
@@ -22,7 +23,8 @@ def test_all_action_types_registered():
     }
     assert set(registry.CAPABILITIES) == expected
     assert registry.WRITE_ACTIONS == frozenset({
-        "memory_write", "identity_patch", "identity_nudge", "schedule_wake", "cancel_wake",
+        "memory_write", "identity_patch", "identity_nudge", "identity_dimensions_set",
+        "schedule_wake", "cancel_wake",
         "workspace_write", "workspace_delete"})
     assert "memory_index" in registry.READ_ACTIONS
     assert {"voice_transcript_list", "voice_transcript_read"} <= registry.READ_ACTIONS
@@ -43,7 +45,7 @@ def test_run_capability_unknown():
 
 def test_capabilities_is_a_real_populated_dict():
     expected = {
-        "identity_get", "identity_patch", "identity_nudge",
+        "identity_get", "identity_patch", "identity_nudge", "identity_dimensions_set",
         "memory_index", "memory_fetch", "memory_write", "memory_search",
         "history_search", "history_fetch",
         "perception_snapshot", "perception_recent_apps", "perception_trend",

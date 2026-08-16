@@ -15,7 +15,7 @@ from fastapi import APIRouter
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
-from context_memory_selection import (
+from memory_garden.scoring.relevance import (
     select_context_memories,
     select_context_memories_with_trace,
 )

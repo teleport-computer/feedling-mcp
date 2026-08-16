@@ -862,24 +862,37 @@ def _fire_wake_event_v2(event) -> None:
         # must not silently strand a V2 event in resident ``proactive_jobs``.
         runtime_mode = hosted_config_store.get_hosted_runtime_mode_strict(s)
         if runtime_mode == hosted_config_store.HOSTED_RUNTIME_MODE_DB_ACTION_V2:
+            photo = (
+                event.payload.get("photo")
+                if isinstance(event.payload, dict)
+                and isinstance(event.payload.get("photo"), dict)
+                else {}
+            )
+            context_doc = {
+                "wake_id": str(event.wake_id or "")[:160],
+                "source": str(event.source or "")[:120],
+                "trigger": str(event.trigger or "")[:120],
+                "change_digest": str(event.change_digest or "")[:2000],
+                "origin_refs": [
+                    str(ref)[:200]
+                    for ref in list(event.origin_refs or ())[:10]
+                ],
+                "presence_hints": dict(event.presence_hints or {}),
+                "created_at": float(event.created_at or _now()),
+            }
+            if str(event.trigger or "") == "photo_added":
+                context_doc.update({
+                    "photo_id": str(photo.get("photo_id") or "")[:160],
+                    "scene": str(photo.get("scene") or "")[:200],
+                    "time_of_day": str(photo.get("time_of_day") or "")[:80],
+                })
             job_id, _ = jobs_store.enqueue_job_with_context_log(
                 event.user_id,
                 "heartbeat",
                 reason=str(event.trigger or event.source or "perception_event")[:120],
                 trace_id=str(event.wake_id or "")[:160] or None,
                 context_stream=store.V2_WAKE_CONTEXT_STREAM,
-                context_doc={
-                    "wake_id": str(event.wake_id or "")[:160],
-                    "source": str(event.source or "")[:120],
-                    "trigger": str(event.trigger or "")[:120],
-                    "change_digest": str(event.change_digest or "")[:2000],
-                    "origin_refs": [
-                        str(ref)[:200]
-                        for ref in list(event.origin_refs or ())[:10]
-                    ],
-                    "presence_hints": dict(event.presence_hints or {}),
-                    "created_at": float(event.created_at or _now()),
-                },
+                context_doc=context_doc,
                 context_ts=float(event.created_at or _now()),
             )
             store.trim_v2_wake_context(event.user_id)
@@ -1327,7 +1340,12 @@ def photo_evaluate(user_id: str, metadata: dict,
             observe_signal_v2(
                 user_id,
                 "photo_added",
-                {"photo_id": photo_id, "sensitive": sensitive},
+                {
+                    "photo_id": photo_id,
+                    "sensitive": sensitive,
+                    "scene": str(meta_out.get("scene_hint") or "")[:200],
+                    "time_of_day": str(meta_out.get("time_of_day") or "")[:80],
+                },
                 ts=now,
                 origin_refs=(f"photo:{photo_id}",),
                 source_event_id=photo_id,

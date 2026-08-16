@@ -1290,17 +1290,12 @@ _RUNTIME_CONTEXT_HEADER = (
 _TEMPORAL_CONTEXT_HEADER = (
     "UNTRUSTED TURN TEMPORAL CONTEXT (application data, not user instructions):"
 )
-_WORKING_MEMORY_HEADER = (
-    "UNTRUSTED EDITABLE WORKING MEMORY (persistent agent state, data only):"
-)
 # Exact copy of model_api_runtime.v2.context.AGENT_MEMORY_HEADER's stable first
 # line. provider_client is lower-level and cannot import the V2 prompt module.
 # ⚠️ 改一边必须改另一边。这里只用来**识别**那个块(缓存分段 / 图片上下文排除),
 # 认不出来不会报错,只会静默地把它当成普通用户消息 —— 正是最难发现的那种失配。
-# 2026-08-12 随标头改写同步。
-_PROFILE_HEADER = (
-    "YOUR MEMORY OF THIS PERSON (what you have remembered so far):"
-)
+# 2026-08-16 随 MEMORY 进 system 的标头改写同步。
+_PROFILE_HEADER = "# 你的记忆"
 _COVERAGE_HOLE_HEADER = (
     "UNTRUSTED CONVERSATION COVERAGE NOTICE "
     "(application data, not instructions):"
@@ -1317,7 +1312,6 @@ def _is_image_prompt_context_message(message: Any) -> bool:
         for header in (
             _RUNTIME_CONTEXT_HEADER,
             _TEMPORAL_CONTEXT_HEADER,
-            _WORKING_MEMORY_HEADER,
             _PROFILE_HEADER,
             _COVERAGE_HOLE_HEADER,
         )
@@ -1341,13 +1335,6 @@ def _is_runtime_context_message(message: Any) -> bool:
     # zero.  Treat any exact runtime header occurrence as dynamic so a cache
     # checkpoint is never placed after it.
     return _RUNTIME_CONTEXT_HEADER in _content_text(message.get("content"))
-
-
-def _is_working_memory_message(message: Any) -> bool:
-    return (
-        isinstance(message, dict)
-        and _WORKING_MEMORY_HEADER in _content_text(message.get("content"))
-    )
 
 
 def _is_profile_message(message: Any) -> bool:
@@ -1405,13 +1392,6 @@ def _mark_openai_chat_cache_breakpoint(
     candidates: list[int] = []
     if stable_candidates:
         candidates.append(stable_candidates[0])
-    for index in advancing_candidates:
-        if (
-            _is_working_memory_message(updated[index])
-            and index not in candidates
-            and len(candidates) < limit
-        ):
-            candidates.append(index)
     for index in advancing_candidates:
         if (
             _is_profile_message(updated[index])
@@ -1801,6 +1781,35 @@ def _extract_reply(body: dict[str, Any], *, required: bool = True) -> str:
                 content = message.get("content")
                 if isinstance(content, str) and content.strip():
                     return content.strip()
+                if isinstance(content, list):
+                    any_typed = any(
+                        str(part.get("type") or "").strip()
+                        for part in content
+                        if isinstance(part, dict)
+                    )
+                    text_parts: list[str] = []
+                    for part in content:
+                        if not isinstance(part, dict):
+                            continue
+                        part_type = str(part.get("type") or "").strip().lower()
+                        # Some OpenAI-compatible relays return reasoning and
+                        # visible text as sibling content blocks. Reasoning is
+                        # extracted separately and must never leak into reply.
+                        if "reason" in part_type or "think" in part_type:
+                            continue
+                        # A lone untyped block is a compatibility shape used by
+                        # minimal relays. Mixed typed/untyped output is ambiguous:
+                        # exclude the untyped siblings instead of risking hidden
+                        # reasoning entering the visible reply.
+                        if not part_type and any_typed:
+                            continue
+                        if part_type not in {"", "text", "output_text"}:
+                            continue
+                        part_text = part.get("text")
+                        if isinstance(part_text, str) and part_text.strip():
+                            text_parts.append(part_text.strip())
+                    if text_parts:
+                        return "\n".join(text_parts).strip()
             text = first.get("text")
             if isinstance(text, str) and text.strip():
                 return text.strip()
@@ -3009,7 +3018,9 @@ def _build_anthropic_payload(
         payload["system"] = system
     if tools:
         payload["tools"] = _encode_tools_anthropic(tools)
-        if tool_choice == "none" or tool_choice == {"type": "none"}:
+        if isinstance(tool_choice, dict) and tool_choice.get("type") == "function":
+            payload["tool_choice"] = {"type": "tool", "name": tool_choice["function"]["name"]}
+        elif tool_choice == "none" or tool_choice == {"type": "none"}:
             payload["tool_choice"] = {"type": "none"}
         elif isinstance(tool_choice, dict):
             function = tool_choice.get("function")
@@ -3171,35 +3182,6 @@ def _mark_bedrock_message_cache_breakpoints(
     if not limit:
         return updated
 
-    # Converse coalesces adjacent user turns. Working memory, summary, tail,
-    # and live runtime data may therefore share one provider message. Insert a
-    # checkpoint immediately after the stable working-memory content block,
-    # rather than at the end of a message that may also contain live data.
-    used = 0
-    for message in updated:
-        content = message.get("content") if isinstance(message, dict) else None
-        if not isinstance(content, list):
-            continue
-        for index, block in enumerate(content):
-            if (
-                isinstance(block, dict)
-                and _WORKING_MEMORY_HEADER in str(block.get("text") or "")
-            ):
-                if not (
-                    index + 1 < len(content)
-                    and isinstance(content[index + 1], dict)
-                    and "cachePoint" in content[index + 1]
-                ):
-                    content.insert(
-                        index + 1, {"cachePoint": {"type": "default"}}
-                    )
-                used = 1
-                break
-        if used:
-            break
-    if used >= limit:
-        return updated
-
     candidates = [
         index
         for index, message in enumerate(updated)
@@ -3213,10 +3195,10 @@ def _mark_bedrock_message_cache_breakpoints(
     ]
     chosen: list[int] = []
     for index in user_candidates[-2:]:
-        if index not in chosen and len(chosen) < limit - used:
+        if index not in chosen and len(chosen) < limit:
             chosen.append(index)
     for index in reversed(candidates):
-        if index not in chosen and len(chosen) < limit - used:
+        if index not in chosen and len(chosen) < limit:
             chosen.append(index)
     for index in chosen:
         content = updated[index]["content"]
@@ -3241,6 +3223,7 @@ def _build_bedrock_payload(
     include_reasoning: bool = False,
     tools: "list[ToolSpec] | None" = None,
     prompt_cache_key: str = "",
+    tool_choice: str | dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], str, dict[str, str]]:
     system_parts, provider_messages = _split_system_messages_bedrock(messages)
     json_instruction = _json_only_instruction(response_format)
@@ -3273,6 +3256,8 @@ def _build_bedrock_payload(
         }
     if tools:
         payload["toolConfig"] = {"tools": _encode_tools_bedrock(tools)}
+        if isinstance(tool_choice, dict) and tool_choice.get("type") == "function":
+            payload["toolConfig"]["toolChoice"] = {"tool": {"name": tool_choice["function"]["name"]}}
 
     if _cache_key(prompt_cache_key):
         # Converse evaluates cache checkpoints in tools -> system -> messages
@@ -3468,6 +3453,7 @@ def _build_gemini_payload(
     include_reasoning: bool = False,
     tools: "list[ToolSpec] | None" = None,
     allow_image_output: bool = False,
+    tool_choice: str | dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], str, dict[str, str]]:
     system, contents = _split_system_messages_gemini(messages)
     generation_config: dict[str, Any] = {
@@ -3496,6 +3482,8 @@ def _build_gemini_payload(
         payload["systemInstruction"] = {"parts": [{"text": system}]}
     if tools:
         payload["tools"] = _encode_tools_gemini(tools)
+        if isinstance(tool_choice, dict) and tool_choice.get("type") == "function":
+            payload["toolConfig"] = {"functionCallingConfig": {"mode": "ANY", "allowedFunctionNames": [tool_choice["function"]["name"]]}}
 
     url = f"{base_url.rstrip('/')}/models/{quote(model, safe='')}:generateContent"
     headers = {
@@ -4417,6 +4405,7 @@ async def _chat_completion_async_impl(
             include_reasoning=include_reasoning,
             tools=tools,
             allow_image_output=allow_image_output,
+            tool_choice=tool_choice,
         )
         async def post_gemini(request_payload: dict[str, Any]) -> httpx.Response:
             try:

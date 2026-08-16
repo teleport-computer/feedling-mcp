@@ -24,9 +24,10 @@ from bootstrap import gates as boot_gates
 from core import util as core_util
 from identity import service as identity_service
 from identity.user_naming import _naming_rule, rewrite_user_reference, sanitize_user_name
-from memory import card_guard
-from memory.prompts_v1 import normalize_bucket_language
+from memory_garden.text import card_guard
+from memory_garden.prompts.buckets import normalize_bucket_language
 from memory import service as memory_service
+from memory_garden import timestamps as memory_timestamps
 import provider_client
 from hosted import config_store as hosted_config_store
 from notices import core as notices
@@ -2445,8 +2446,8 @@ def _new_cards_only(existing_cards: list[dict], candidate_cards: list[dict]) -> 
 
 
 def _moment_from_memory_card(store: UserStore, card: dict, envelope: dict) -> dict:
-    now = core_util._now_iso()
-    occurred_at = str(card.get("occurred_at") or "")
+    now = memory_timestamps.now_iso()
+    occurred_at = memory_timestamps.normalize(card.get("occurred_at"))
     moment = {
         "v": 1,
         "id": envelope.get("id") or f"mom_{uuid.uuid4().hex[:12]}",
@@ -2506,7 +2507,7 @@ def _append_import_memory_cards(store: UserStore, cards: list[dict]) -> list[dic
         )
         if envelope is None:
             raise RuntimeError(f"memory_envelope_failed:{err}")
-        envelope["occurred_at"] = str(card.get("occurred_at") or "")
+        envelope["occurred_at"] = memory_timestamps.normalize(card.get("occurred_at"))
         envelope["source"] = "history_import"
         created.append(_moment_from_memory_card(store, card, envelope))
     # Re-read + extend + save under one memory_lock hold so a concurrent

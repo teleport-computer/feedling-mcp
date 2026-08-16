@@ -80,6 +80,10 @@ def _spy_provider(monkeypatch, seen):
     monkeypatch.setattr(provider_client, "chat_completion_async", _fake)
 
 
+def _provider_tool_description(seen, name):
+    return next(spec.description for spec in seen["tools"] if spec.name == name)
+
+
 def _spy_cap_data(monkeypatch, calls, *, data=None):
     async def _fake_cap_data(store, action_type, **kw):
         calls.append({"action": action_type, "params": kw.get("params")})
@@ -177,9 +181,11 @@ def test_chat_turn_does_not_prefetch_or_inject_perception(monkeypatch):
         for message in seen["messages"]
         if message.get("role") == "system"
     )
-    assert "use the available perception, photo, or screen tools" in system
-    assert "missing, disabled, or null tool readings as unavailable" in system
-    assert "never as zero or evidence of a broken device" in system
+    perception_description = _provider_tool_description(seen, "perception_snapshot")
+    assert "request depends on their current device" in perception_description
+    assert "do not call for unrelated conversation" in perception_description
+    assert "工具返回缺失、禁用或 null 时，就当作暂时拿不到" in system
+    assert "别当成 0，也别据此说设备坏了" in system
     assert {"perception_snapshot", "perception_trend", "perception_history"} <= {
         spec.name for spec in seen["tools"]
     }
@@ -244,9 +250,14 @@ def test_chat_turn_explains_stalled_screen_share_without_old_pixels(monkeypatch)
         for message in seen["messages"]
         if message.get("role") == "system"
     )
-    assert "screen_share.stalled" in system
-    assert "may have disconnected" in system
-    assert "Do not describe an old frame as current" in system
+    assert "screen_share.stalled means" in _provider_tool_description(
+        seen, "screen_read"
+    )
+    assert (
+        "屏幕共享还开着、画面却停住不再更新时：说明连接可能断了，"
+        "请对方停止后重新开始共享。"
+    ) in system
+    assert "别把旧画面说成现在的" in system
 
 
 def test_chat_turn_explains_ended_screen_share_without_old_pixels(monkeypatch):
@@ -305,9 +316,13 @@ def test_chat_turn_explains_ended_screen_share_without_old_pixels(monkeypatch):
         for message in seen["messages"]
         if message.get("role") == "system"
     )
-    assert "screen_share.ended" in system
-    assert "remain available for discussion" in system
-    assert "restart sharing or send a screenshot" in system
+    assert "screen_share.ended means" in _provider_tool_description(
+        seen, "screen_read"
+    )
+    assert (
+        "屏幕共享已经结束后：之前聊过的屏幕图片还可以继续聊，"
+        "但别说成当前屏幕；想再看，就请对方重启共享或发张截图。"
+    ) in system
 
 
 def test_chat_can_pull_exact_perception_after_first_round(monkeypatch):
@@ -441,8 +456,11 @@ def test_chat_turn_injects_renewed_repeat_wake_id(monkeypatch):
         for message in seen["messages"]
         if message.get("role") == "system"
     )
-    assert "call cancel_wake" in system
-    assert "do not search memories" in system
+    cancel_description = _provider_tool_description(seen, "cancel_wake")
+    assert "exact wake_id from runtime_data.scheduled_wakes.timers" in (
+        cancel_description
+    )
+    assert "do not search memories" in cancel_description
 
 
 @pytest.mark.parametrize(
@@ -547,9 +565,9 @@ def test_ambient_wake_injects_screen_share_grounding(monkeypatch, lane):
     assert _runtime_payload(seen)["runtime_data"]["screen_share"] == ended
 
 
-def test_heartbeat_injects_boolean_glance_without_snapshot_values(monkeypatch):
-    """Catches eager numeric snapshot data replacing the boolean glance."""
-    uid = "u_pg_boolean_heartbeat"
+def test_heartbeat_injects_v1_factual_board(monkeypatch):
+    """The proactive turn sees V1's bounded facts without a pull round."""
+    uid = "u_pg_factual_heartbeat"
     conftest.seed_user(uid)
     _reset(uid)
     monkeypatch.setattr(
@@ -561,10 +579,17 @@ def test_heartbeat_injects_boolean_glance_without_snapshot_values(monkeypatch):
     async def fake_cap_data(store, action_type, **kwargs):
         assert action_type == "perception_glance"
         return {
-            "glance": {
-                "weather": {"available": True, "notable_change": False},
-                "health": {"available": True, "notable_change": True},
-            }
+            "presence_hints": {
+                "place_label": "图书馆",
+                "now_playing": {"title": "Blue", "artist": "Joni Mitchell"},
+            },
+            "cross_domain_board": {
+                "location": {"now": "图书馆"},
+                "media": {"now": {"title": "Blue", "artist": "Joni Mitchell"}},
+                "app": {"now": "Notes", "recent": ["Notes", "Safari"]},
+                "weather": {"condition": "clear", "temperature": 21.5},
+                "health": {"notable": [{"field": "step_count", "current": 365}]},
+            },
         }
 
     monkeypatch.setattr(worker, "_cap_data", fake_cap_data)
@@ -584,15 +609,22 @@ def test_heartbeat_injects_boolean_glance_without_snapshot_values(monkeypatch):
 
     runtime_data = _runtime_payload(seen)["runtime_data"]
     assert status == "completed"
-    assert runtime_data["perception_glance"]["glance"] == {
-        "weather": {"available": True, "notable_change": False},
-        "health": {"available": True, "notable_change": True},
+    assert runtime_data["perception_glance"]["presence_hints"] == {
+        "place_label": "图书馆",
+        "now_playing": {"title": "Blue", "artist": "Joni Mitchell"},
+    }
+    assert runtime_data["perception_glance"]["cross_domain_board"]["app"] == {
+        "now": "Notes",
+        "recent": ["Notes", "Safari"],
     }
     assert runtime_data["perception_glance"]["glance_changed"] is True
     joined = _joined(seen)
-    assert "365" not in joined
-    assert "21.5" not in joined
-    assert "step_count" not in joined
+    assert "图书馆" in joined
+    assert "Blue" in joined
+    assert "Notes" in joined
+    assert "365" in joined
+    assert "21.5" in joined
+    assert "step_count" in joined
 
 
 def test_repeated_completed_ordinary_heartbeat_marks_glance_unchanged(
@@ -886,8 +918,8 @@ def test_successful_heartbeat_without_context_reader_does_not_persist_fingerprin
     )
 
 
-def test_perception_wake_injects_only_projected_trigger(monkeypatch):
-    """Catches raw perception event fields crossing into the model prompt."""
+def test_perception_wake_injects_bounded_producer_grounding(monkeypatch):
+    """Producer facts cross the prompt boundary, internal cursor fields do not."""
     uid = "u_pg_event_projection"
     conftest.seed_user(uid)
     _reset(uid)
@@ -915,7 +947,7 @@ def test_perception_wake_injects_only_projected_trigger(monkeypatch):
             "_input_generation": 2,
             "trigger": "photo_added",
             "change_digest": "battery 17, steps 365",
-            "presence_hints": {"place": "private home"},
+            "presence_hints": {"place_label": "private home"},
             "origin_refs": ["photo:secret-id"],
         }
     ]
@@ -933,12 +965,18 @@ def test_perception_wake_injects_only_projected_trigger(monkeypatch):
 
     runtime_data = _runtime_payload(seen)["runtime_data"]
     assert status == "completed"
-    assert runtime_data["perception_wake"] == [
-        {"trigger": "photo_added", "new_photo": True}
-    ]
+    assert runtime_data["perception_wake"] == [{
+        "trigger": "photo_added",
+        "new_photo": True,
+        "change_digest": "battery 17, steps 365",
+        "presence_hints": {"place_label": "private home"},
+        "origin_refs": ["photo:secret-id"],
+    }]
     joined = _joined(seen)
-    for hidden in ("battery 17", "steps 365", "private home", "secret-id"):
-        assert hidden not in joined
+    for fact in ("battery 17", "steps 365", "private home", "secret-id"):
+        assert fact in joined
+    assert "_context_seq" not in joined
+    assert "_input_generation" not in joined
 
 
 @pytest.mark.parametrize("lane", ["chat", "scheduled"])

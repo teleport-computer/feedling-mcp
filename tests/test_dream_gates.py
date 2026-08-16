@@ -24,7 +24,7 @@ for _k, _v in {
 
 import pytest  # noqa: E402
 
-from memory import dream_gates  # noqa: E402
+from memory_garden.guards import dream_gates  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -95,7 +95,8 @@ def test_fuse_env_overrides(monkeypatch):
 
 def _cross_lane_fixture():
     cards = [
-        {"id": f"m{i}", "summary": f"S{i}", "content": f"C{i} 的旧正文。"}
+        {"id": f"m{i}", "summary": f"S{i}", "content": f"C{i} 的旧正文。",
+         "occurred_at": f"2026-08-0{i + 1}T00:00:00Z"}
         for i in range(5)
     ]
     rows = [

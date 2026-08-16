@@ -15,7 +15,7 @@ resource.
 | Endpoint family | Parameters | Ordering and continuation |
 | --- | --- | --- |
 | `GET /v1/chat/history` | `limit` 1–200; preferred `after_seq` / `before_seq`; legacy `since` / `before` Unix seconds | No cursor returns the latest page. Sequence cursors are exact even when messages share a timestamp. Use `oldest_seq`, `latest_seq`, `has_more_older`, and `has_more_newer`. |
-| `GET /v1/memory/list` | `limit` up to 200, `since` ISO-8601 | Newest `occurred_at` first. The implementation keeps records whose `occurred_at >= since`, so de-duplicate by memory ID at page boundaries. `total` is the filtered count before slicing. |
+| `GET /v1/memory/list` | `limit` up to 200, `since` ISO-8601 | Newest parsed `occurred_at` instant first. Equivalent `Z`, offset, and legacy naive values compare consistently; invalid card timestamps sort last and are excluded by a valid `since`. De-duplicate by memory ID at page boundaries. `total` is the filtered count before slicing. |
 | `GET /v1/perception/photos` and `/items/{kind}` | `limit` 1–200, default 20 | Returns the most recent items. These endpoints do not currently return a continuation cursor. |
 | Event and receipt streams | Usually `since` plus `limit` | `since` is endpoint-specific; inspect the operation contract before assuming Unix time or ISO-8601. |
 

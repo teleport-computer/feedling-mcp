@@ -117,6 +117,12 @@ class ChildSupervisor:
         self._lock = threading.Lock()
         self._proc: mp.process.BaseProcess | None = None
         self._read_conn = None
+        # A fresh spawned interpreter must finish schema/user/runtime bootstrap
+        # before its steady-state event-loop heartbeat exists. Keep that phase
+        # explicit so the parent can apply a bounded startup budget instead of
+        # mistaking a slow-but-live cold start for a 45s event-loop wedge.
+        self._started_at: float | None = None
+        self._startup_complete = False
         # Process/event-loop liveness.  Kept under the historical attribute
         # name because a few narrow tests inspect the startup seed directly.
         self._last_progress_at: float | None = None
@@ -184,8 +190,11 @@ class ChildSupervisor:
             # 立即打一个时间戳，而不是等第一条 progress 消息——否则 spawn 刚完成、子
             # 进程还没来得及发第一条心跳的这一小段窗口里，poll_liveness() 会读到一个
             # `last_progress_at is None` → age=inf 的假阳性"卡死"读数。
-            self._last_progress_at = time.monotonic()
-            self._last_slot_progress_at = self._last_progress_at
+            started_at = time.monotonic()
+            self._started_at = started_at
+            self._startup_complete = False
+            self._last_progress_at = started_at
+            self._last_slot_progress_at = started_at
             # Fresh generation of child == fresh turn-tracking state. A prior
             # generation's slot_ids/turn_starts must never leak into this one
             # (kill_and_respawn() calls start() again after killing the old proc).
@@ -227,6 +236,8 @@ class ChildSupervisor:
             last_slot = self._last_slot_progress_at
             snapshot = self._snapshot
             turn_progress_at = self._turn_progress_at
+            started_at = self._started_at
+            startup_complete = self._startup_complete
         alive = bool(proc is not None and proc.is_alive())
         age = math.inf if last is None else max(0.0, time.monotonic() - last)
         slot_age = (
@@ -244,8 +255,14 @@ class ChildSupervisor:
             0.0 if turn_progress_at is None else now - turn_progress_at
         )
         current_turn_stall_age_sec = max(0.0, current_turn_stall_age_sec)
+        startup_age_sec = (
+            math.inf if started_at is None
+            else max(0.0, now - started_at)
+        )
         return {
             "alive": alive,
+            "startup_complete": startup_complete,
+            "startup_age_sec": startup_age_sec,
             # Historical name now means event-loop/process progress; explicit
             # alias makes the split unambiguous for the watchdog.
             "last_progress_age_sec": age,
@@ -574,9 +591,11 @@ class ChildSupervisor:
                 # refresh a particular turn's stall clock: an await that never
                 # returns leaves that slot's ``_turn_progress_at`` untouched and
                 # is still killed by the per-turn stall watchdog.
+                self._startup_complete = True
                 self._last_progress_at = time.monotonic()
                 return
             received_at = time.monotonic()
+            self._startup_complete = True
             self._last_progress_at = received_at
             self._last_slot_progress_at = received_at
             self._snapshot = decoded

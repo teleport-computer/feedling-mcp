@@ -70,14 +70,15 @@ def _migration_0085_module():
     )
 
 
-def test_pre_and_test_migrations_merge_with_agent_jobs_into_single_head():
+def test_agent_jobs_chain_has_one_installed_head_and_available_at_baseline():
     """A deploy missing the durable baseline migration must fail before rollout."""
     backend = Path(__file__).parent.parent / "backend"
     cfg = Config(str(backend / "alembic.ini"))
     cfg.set_main_option("script_location", str(backend / "alembic"))
     script = ScriptDirectory.from_config(cfg)
 
-    assert script.get_heads() == ["0089_merge_pre_test_agent_jobs"]
+    heads = script.get_heads()
+    assert len(heads) == 1
     final_merge = script.get_revision("0089_merge_pre_test_agent_jobs")
     assert set(final_merge.down_revision) == {
         "0088_merge_pre_test_heads",
@@ -188,7 +189,7 @@ def test_perception_signal_schema_is_installed_at_the_merged_head():
             "AND indexname='ix_agent_jobs_pending_available_at'"
         ).fetchone()
 
-    assert installed_head == ("0089_merge_pre_test_agent_jobs",)
+    assert installed_head == (heads[0],)
     assert available_at[:2] == ("timestamp with time zone", "NO")
     assert "now()" in str(available_at[2])
     assert pending_index is not None
@@ -256,7 +257,12 @@ def test_0075_usage_rollup_schema_is_installed_without_source_backfill():
             "AND tgrelid='v2_turn_metrics'::regclass"
         ).fetchone()[0]
 
-    assert heads == {"0089_merge_pre_test_agent_jobs"}
+    backend = Path(__file__).parent.parent / "backend"
+    cfg = Config(str(backend / "alembic.ini"))
+    cfg.set_main_option("script_location", str(backend / "alembic"))
+    script_heads = ScriptDirectory.from_config(cfg).get_heads()
+    assert len(script_heads) == 1
+    assert heads == {script_heads[0]}
     assert tables == {
         "v2_usage_daily_users",
         "v2_usage_daily_dimensions",

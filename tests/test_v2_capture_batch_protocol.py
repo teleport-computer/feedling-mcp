@@ -123,11 +123,27 @@ def _manual_card(user_id: str, memory_id: str) -> dict:
     }
 
 
+def test_capture_action_validation_normalizes_occurred_at_and_rejects_garbage():
+    action = _add("u_capture_timestamp", "mom-timestamp")
+    action["envelope"]["occurred_at"] = "2026-07-20T20:00:00+08:00"
+
+    normalized = jobs_store._validate_capture_actions(
+        "u_capture_timestamp", [action]
+    )
+
+    assert normalized[0]["envelope"]["occurred_at"] == "2026-07-20T12:00:00Z"
+
+    action["envelope"]["occurred_at"] = "not-a-date"
+    with pytest.raises(ValueError, match="invalid occurred_at"):
+        jobs_store._validate_capture_actions("u_capture_timestamp", [action])
+
+
 def test_capture_commit_is_atomic_strips_plaintext_and_keeps_canonical_logs():
     uid = "u_capture_atomic"
     _seed(uid)
     job_id, _job = _running(uid)
     action = _add(uid, "mom-atomic")
+    action["envelope"]["occurred_at"] = "2026-07-20T20:00:00+08:00"
     action["envelope"]["_inner"] = {"content": "DO_NOT_STORE"}
     batch = jobs_store.prepare_capture_batch(
         job_id=job_id,
@@ -177,7 +193,9 @@ def test_capture_commit_is_atomic_strips_plaintext_and_keeps_canonical_logs():
     assert status == "completed"
     assert state["last_captured_until_seq"] == 1
     assert state["capture_seq_initialized"] is True
-    assert moment["created_at"] != moment["occurred_at"]
+    assert moment["occurred_at"] == "2026-07-20T12:00:00Z"
+    assert moment["created_at"].endswith("Z")
+    assert "." not in moment["created_at"]
     assert batch_count == 0
     assert {"memory_changes", "bootstrap_events"}.issubset(streams)
 

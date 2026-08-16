@@ -532,3 +532,42 @@ def test_append_import_memory_cards_preserves_undated_occurred_at(monkeypatch):
     assert saved == created
     assert created[0]["occurred_at"] == ""
     assert created[0]["last_referenced_at"] == created[0]["created_at"]
+
+
+def test_append_import_memory_cards_normalizes_dated_card_timestamp(monkeypatch):
+    store = types.SimpleNamespace(user_id="usr_history_import")
+    saved: list[dict] = []
+
+    monkeypatch.setattr(
+        hi.core_envelope,
+        "_build_shared_envelope_for_store",
+        lambda _store, _plaintext: ({
+            "id": "mom_import_offset",
+            "body_ct": "encrypted",
+            "nonce": "nonce",
+            "K_user": "ku",
+            "K_enclave": "ke",
+            "visibility": "shared",
+            "owner_user_id": store.user_id,
+        }, ""),
+    )
+    monkeypatch.setattr(hi.memory_service, "_load_moments", lambda _store: [])
+    monkeypatch.setattr(
+        hi.memory_service,
+        "_save_moments",
+        lambda _store, moments: saved.extend(moments),
+    )
+    monkeypatch.setattr(
+        hi.boot_gates, "_log_bootstrap_event", lambda *_args, **_kwargs: None
+    )
+
+    created = hi._append_import_memory_cards(store, [{
+        "summary": "Dated memory",
+        "content": "The user supplied a timestamp with an explicit offset.",
+        "occurred_at": "2026-08-15T20:00:00+08:00",
+    }])
+
+    assert saved == created
+    assert created[0]["occurred_at"] == "2026-08-15T12:00:00Z"
+    assert created[0]["created_at"].endswith("Z")
+    assert "." not in created[0]["created_at"]

@@ -24,7 +24,7 @@ sys.path.insert(0, str(TOOLS))
 sys.path.insert(0, str(BACKEND))
 
 from export_public_openapi import _build_public_schema, _load_schema  # noqa: E402
-from memory.source_policy import MEMORY_SOURCE_VALUES  # noqa: E402
+from memory_garden.types import MEMORY_SOURCE_VALUES  # noqa: E402
 
 
 HTTP_METHODS = {"get", "post", "put", "patch", "delete", "options", "head", "trace"}
@@ -516,6 +516,8 @@ def test_memory_actions_response_exposes_independent_item_outcomes(
     assert {"error", "detail"} <= set(schema["properties"])
     result_schema = public_schema["components"]["schemas"]["MemoryActionResult"]
     assert {"status", "http_status"} <= set(result_schema["required"])
+    action_type = public_schema["components"]["schemas"]["MemoryAction"]["properties"]["type"]
+    assert "always create a new card" in action_type["description"]
 
 
 def test_dream_status_documents_monotonic_capture_banner_fields(

@@ -1232,6 +1232,34 @@ def _attach_plaintext_user_name(output: dict, user_name: str) -> dict:
     return output
 
 
+def _attach_plaintext_profile(
+    store,
+    api_key: str | None,
+    job_id: str,
+    *,
+    runtime,
+    output: dict,
+    key_prefix: str,
+    llm: GenesisLLMClient | None,
+) -> dict:
+    """Generate MEMORY/STYLE from this pass only, before any output lands."""
+    del api_key
+    rendered_cards, _source_count, memory_material = (
+        service.render_genesis_profile_source(output)
+    )
+    output.update(worker.build_profile_output_from_sources(
+        user_id=store.user_id,
+        job_id=job_id,
+        key_prefix=key_prefix,
+        runtime=runtime,
+        rendered_cards=rendered_cards,
+        memory_material=memory_material,
+        output=output,
+        llm=llm,
+    ))
+    return output
+
+
 def _write_back_plaintext_user_name(store, api_key: str | None, user_name: str) -> str:
     """Best-effort preferred-name merge for paths that intentionally skip identity."""
     name = sanitize_user_name(user_name)
@@ -1506,6 +1534,15 @@ def _run_plaintext_genesis_v2(
             relationship_anchor=relationship_anchor,
         )
     _attach_plaintext_user_name(fg_merged, user_name)
+    _attach_plaintext_profile(
+        store,
+        api_key,
+        job_id,
+        runtime=runtime,
+        output=fg_merged,
+        key_prefix=f"{job_id}:foreground_profile",
+        llm=llm,
+    )
     full_memories = fg_merged.get("memories") or []
     days = int((relationship_anchor or {}).get("days_with_user") or 0)
     # explicit relationship_started_at (user typed a date) -> honored verbatim below,
@@ -1558,6 +1595,7 @@ def _run_plaintext_genesis_v2(
         # core memories now; identity via the legacy _store_identity_payload (exact old
         # path — writes the card + relationship anchor); greeting via the legacy pair.
         mem_count, _mr = service.apply_memory_outputs(store, api_key, {"memories": full_memories})
+        service.write_profile_artifact(store, job_id, fg_merged, api_key)
         history_import._store_identity_payload(
             store, identity_payload, days_with_user=days,
             evidence=f"genesis_foreground:{job_id}", language=language,
@@ -1811,38 +1849,48 @@ def _run_plaintext_background_enrichment(
         kept, dropped = dedup.filter_semantic_dups(merged["memories"], known)
         if dropped:
             merged["memories"] = kept
+    # Generate every derived output for this pass before any of them is
+    # persisted. When foreground had no identity signal, the background may
+    # derive a baseline from the already-generated persona; absence remains
+    # valid and does not block the other products.
+    if write_identity and not _merged_has_identity(merged) and isinstance(merged.get("persona"), dict):
+        persona_content = str(merged["persona"].get("content") or "").strip()
+        if persona_content:
+            baseline = worker.derive_identity_from_persona(
+                user_id=store.user_id,
+                job_id=job_id,
+                runtime=runtime,
+                persona_content=persona_content,
+                user_name=user_name,
+            )
+            if baseline.get("agent_name") or baseline.get("dimensions"):
+                # B2: merge, don't overwrite — ``merged["identity"]`` may
+                # already carry user-layer signal from a user_profile pass.
+                existing_identity = merged.get("identity") if isinstance(merged.get("identity"), dict) else {}
+                merged["identity"] = {**existing_identity, **baseline}
+    _attach_plaintext_user_name(merged, user_name)
+    _attach_plaintext_profile(
+        store,
+        api_key,
+        job_id,
+        runtime=runtime,
+        output=merged,
+        key_prefix=f"{job_id}:background_profile",
+        llm=llm,
+    )
     # apply the REST without re-completing: memories (core already excluded), persona, voice
     background_memory_count = 0
     if include_memory:
         apply_result = service.apply_memory_outputs(store, api_key, merged)
         if isinstance(apply_result, tuple) and apply_result:
             background_memory_count = int(apply_result[0] or 0)
-    # Identity is normally written by the FOREGROUND now (identity-first contract), so the
-    # background skips it (write_identity=False). When foreground had no signal,
-    # background may still derive one from the full reduce or persona; absence remains valid.
+    service.write_profile_artifact(store, job_id, merged, api_key)
+    # Identity is normally written by the foreground (identity-first contract),
+    # so the background skips it when write_identity=False.
     background_identity_status = ""
     if write_identity:
-        if not _merged_has_identity(merged) and isinstance(merged.get("persona"), dict):
-            persona_content = str(merged["persona"].get("content") or "").strip()
-            if persona_content:
-                baseline = worker.derive_identity_from_persona(
-                    user_id=store.user_id,
-                    job_id=job_id,
-                    runtime=runtime,
-                    persona_content=persona_content,
-                    user_name=user_name,
-                )
-                if baseline.get("agent_name") or baseline.get("dimensions"):
-                    # B2: merge, don't overwrite — `merged["identity"]` may already
-                    # carry user-layer signal (custom_persona_prompt etc, which
-                    # _merged_has_identity deliberately doesn't count as "usable
-                    # identity" below) from a user_profile pass; a plain assignment
-                    # here would silently wipe it the moment a persona baseline
-                    # also exists.
-                    existing_identity = merged.get("identity") if isinstance(merged.get("identity"), dict) else {}
-                    merged["identity"] = {**existing_identity, **baseline}
         background_identity_status = service.init_identity_if_absent(
-            store, _attach_plaintext_user_name(merged, user_name), api_key
+            store, merged, api_key
         )
     background_persona_ref, background_persona_sha = service.write_persona_artifact(
         store, job_id, merged)
@@ -2062,7 +2110,9 @@ def _run_plaintext_add_memory_job(
     completed = db.genesis_complete_job(
         store.user_id,
         job_id,
-        output={"stage": "plaintext_add_memory_done"},
+        output={
+            "stage": "plaintext_add_memory_done",
+        },
         memory_action_count=mem_count,
         identity_status="skipped",
         persona_ref="",
@@ -2135,19 +2185,40 @@ def _run_plaintext_update_identity_job(
             store, job_id, f"persona_rebuild_failed:{type(e).__name__}:{str(e)[:160]}", exc=e,
         )
         return
-    status = service.replace_identity_preserving_anchor(
-        store, {"identity": identity_payload, "relationship_anchor": relationship_anchor or {}}, api_key
+    _attach_plaintext_profile(
+        store,
+        api_key,
+        job_id,
+        runtime=runtime,
+        output=persona_output,
+        key_prefix=f"{job_id}:update_identity",
+        llm=llm,
     )
-    if status not in {"initialized", "updated"}:
+    identity_field_lock = service.identity_field_lock_for_job(store, job_id)
+    status = service.replace_identity_preserving_anchor(
+        store,
+        {"identity": identity_payload, "relationship_anchor": relationship_anchor or {}},
+        api_key,
+        field_lock=identity_field_lock,
+    )
+    if status not in {"initialized", "updated", "locked"}:
         service.mark_failed(store, job_id, status)
         return
     try:
-        persona_ref, persona_sha = service.write_persona_artifact(store, job_id, persona_output)
+        persona_ref, persona_sha = service.write_persona_artifact(
+            store, job_id, persona_output
+        )
     except Exception as e:  # noqa: BLE001
         service.mark_failed(
             store, job_id, f"persona_write_failed:{type(e).__name__}:{str(e)[:160]}", exc=e,
         )
         return
+    profile_ref, profile_sha, profile_status = service.write_profile_artifact(
+        store,
+        job_id,
+        persona_output,
+        api_key,
+    )
     if progress:
         for source_pass, group in enumerate(progress.source_groups, start=1):
             family = str(group.get("source_family") or "ai_persona")
@@ -2155,7 +2226,13 @@ def _run_plaintext_update_identity_job(
     completed = db.genesis_complete_job(
         store.user_id,
         job_id,
-        output={"stage": "plaintext_update_identity_done"},
+        output={
+            "stage": "plaintext_update_identity_done",
+            "identity_field_lock": identity_field_lock,
+            "profile_ref": profile_ref,
+            "profile_sha256": profile_sha,
+            "profile_status": profile_status,
+        },
         memory_action_count=0,
         identity_status=status,
         persona_ref=persona_ref,
@@ -2380,6 +2457,15 @@ def _run_plaintext_genesis_job(
             relationship_anchor=relationship_anchor,
         )
         _attach_plaintext_user_name(reducer_output, user_name)
+        _attach_plaintext_profile(
+            store,
+            api_key,
+            job_id,
+            runtime=runtime,
+            output=reducer_output,
+            key_prefix=f"{job_id}:merged_profile",
+            llm=llm,
+        )
         progress.publish(stage="plaintext_reducer_done")
         _trace_genesis(
             store,

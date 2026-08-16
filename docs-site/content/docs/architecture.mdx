@@ -94,10 +94,17 @@ transcript. Only summary-covered replay is optional; uncovered rows are never
 clipped. If the required core is too large, the runner first compacts only a
 safe answered prefix and rebuilds the prompt from the new durable watermark.
 
-Proactive wake turns may read the agent identity card but cannot mutate it:
-Runtime V2 visibly refuses `identity_patch` and `identity_nudge` in background
-turns. Foreground Chat identity changes and wake-time Memory writes retain their
-existing authorization.
+Every Chat and proactive wake turn decrypts the current agent identity card just
+in time and places its complete readable view in the trusted system prefix. An
+absent, unreadable, local-only, or still-default card falls back to the encrypted
+Genesis persona during the transition; the card and persona are never included
+together. Proactive wake turns still cannot mutate identity: Runtime V2 visibly
+refuses `identity_patch`, `identity_nudge`, and `identity_dimensions_set` in
+background turns. Foreground Chat identity changes and wake-time Memory writes
+retain their existing authorization. Foreground profile-text edits use
+`identity_patch`; full dimension name/value/description rewrites use
+`identity_dimensions_set`; small relative dimension-score changes continue to
+use `identity_nudge`.
 
 Exact immutable leaf segments carry source-range/count
 witnesses; immutable higher-level checkpoints retain and name their ordered
@@ -123,12 +130,12 @@ removes the capability entirely without touching the normal chat path.
 Runtime V2 coverage accounting is permanently metadata-only. Maintenance and
 synchronous prompt catch-up advance exact source witnesses using content-free
 count sentinels, and deterministic fan-out checkpoints keep the frontier bounded
-without sending historical Chat plaintext to a model provider. MEMORY/USER is
+without sending historical Chat plaintext to a model provider. MEMORY/STYLE is
 the sole long-term semantic layer; encrypted Chat rows remain the durable source
 ledger. Restoring provider-backed conversation summaries requires rolling back
 the worker image rather than changing a runtime flag.
 
-The bounded Memory/User profile storage contract uses one
+The bounded Memory/Style profile storage contract uses one
 `v2_agent_profile` document so both fields advance under one compare-and-swap.
 The two field bodies are separate shared encrypted envelopes; the PostgreSQL
 primary stores the same ciphertext document. Field character counts,
@@ -138,13 +145,21 @@ re-read and recompute rather than replaying its earlier result.
 
 When the default-off profile switch is enabled, a turn strictly reads that
 document and decrypts both fields together. Only an `ok`, non-disabled document
-whose two fields both validate replaces the rollback-compatible summary. The
-Memory and User fields are serialized into one early user-role block, labeled
-as model-derived untrusted data; they are never system instructions, and later
-verbatim conversation replay wins on conflict. Missing, pending, degraded,
-disabled, invalid, or undecryptable profiles retain the existing summary path.
-Any bounded-tail coverage-hole count is a separate late user-role data block,
-so it cannot perturb the stable profile prefix.
+whose fields validate enters the prompt. The stable system prefix is ordered as
+runtime model identity, identity card (or Genesis persona fallback), non-empty
+MEMORY, non-empty STYLE, and then behavior rules. MEMORY and STYLE are the
+companion's own context, with explicit guidance that the later verbatim
+conversation wins on conflict; World Book, temporal context, coverage notices,
+and model-authored summaries remain non-privileged application data. Missing,
+pending, degraded, disabled, invalid, or undecryptable profiles retain
+deterministic coverage plus the bounded verbatim tail without inventing a
+semantic replacement. Any bounded-tail coverage-hole count remains a separate
+late data block, so it cannot perturb the stable prefix.
+
+Because MEMORY and STYLE are part of the system prefix, each successful profile
+refresh changes that user's provider prompt-cache prefix once. Other users'
+caches are unaffected, and subsequent turns reuse the refreshed prefix until the
+next profile change.
 
 Profile generation is a separate low-priority Runtime V2 job, alongside
 maintenance, capture, and dream rather than foreground Chat or wake work. The
@@ -154,6 +169,29 @@ It sends that plaintext Garden view to the user's configured model provider,
 then seals the generated Memory/User fields before the compare-and-swap write.
 Generation failure only updates bounded retry metadata and fails the background
 job; it does not publish a Chat bubble or terminal turn error.
+
+Genesis onboarding and identity redistillation also publish this profile
+contract directly. Each pass generates and validates the identity-card overlay,
+MEMORY/STYLE, and the transitional Genesis persona before it begins publishing
+that pass. Genesis never reads the existing encrypted Garden for this purpose:
+MEMORY uses only valid cards proposed by the current upload's reducer, while
+STYLE receives only persona and voice material produced from that upload.
+An explicit durable-card signal requires non-empty MEMORY, and explicit
+persona, behavior-note, or exemplar material requires non-empty STYLE. A
+required empty field gets one bounded shape correction and then fails the job.
+The profile CAS copies an untouched encrypted side byte-for-byte without
+decrypting or resealing it. Onboarding and identity redistillation keep profile
+publication required. Add-memory imports only write memory cards; their changed
+Garden fingerprint lets the ordinary profile lane perform the later
+Garden-to-MEMORY/STYLE refresh.
+
+Every Genesis job records a server-side cursor into the content-free identity
+change log. Identity mutations expose canonical changed-field labels in
+`GET /v1/identity/changes`; when a distill result lands, fields changed after
+that cursor are locked and the newer user or agent edit wins. A legacy
+post-cursor record without field labels locks the whole identity-card overlay
+and emits a content-free `genesis.field_lock` trace, while profile/persona
+publication and job completion continue.
 
 ### Managed PostgreSQL promotion
 

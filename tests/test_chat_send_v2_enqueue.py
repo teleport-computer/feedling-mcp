@@ -32,6 +32,70 @@ def _seed(uid):
         envelope={"body_ct": "x", "nonce": "n", "K_user": "k"})
 
 
+def _stub_live_overloaded_runtime(monkeypatch, *, message_id: str) -> list[dict]:
+    """Make admission observe a live but severely overloaded foreground pool."""
+    monkeypatch.setattr(
+        chat_send_core.core_envelope,
+        "_build_shared_envelope_for_store",
+        lambda s, pt, **kw: (
+            {"id": message_id, "body_ct": "c", "nonce": "n", "K_user": "k"},
+            "",
+        ),
+    )
+    monkeypatch.setattr(
+        chat_send_core.agent_runtime_cutover,
+        "resolve_driver",
+        lambda cfg: "claude",
+    )
+    monkeypatch.setattr(
+        chat_send_core.jobs_store, "workers_alive", lambda **kw: True
+    )
+    monkeypatch.setattr(
+        chat_send_core.jobs_store, "live_worker_capacity", lambda **kw: 1
+    )
+
+    def _foreground_inflight(*, lanes):
+        assert lanes == {"chat", "manual_wake"}
+        return 999
+
+    monkeypatch.setattr(
+        chat_send_core.jobs_store, "inflight_job_count", _foreground_inflight
+    )
+    monkeypatch.setattr(
+        chat_send_core.jobs_store,
+        "recent_mean_service_sec",
+        lambda **kw: None,
+    )
+    monkeypatch.setattr(
+        chat_send_core.kill_switch,
+        "turns_halted",
+        lambda **kw: False,
+    )
+    monkeypatch.setattr(
+        chat_send_core.core_wake_bus, "notify", lambda *args, **kwargs: None
+    )
+    trace_events: list[dict] = []
+    monkeypatch.setattr(
+        chat_send_core.debug_trace,
+        "trace_event",
+        lambda *args, **kwargs: trace_events.append(dict(kwargs)),
+    )
+    return trace_events
+
+
+def _start_running_job(user_id: str, lane: str, worker_id: str) -> int:
+    # This module historically leaves pending Jobs for its direct `_seed`
+    # users. Give the target a test-only priority so claim_next_job selects the
+    # row this helper just created instead of an older fixture row.
+    job_id, _ = chat_send_core.jobs_store.enqueue_job(
+        user_id, lane, priority=10_000
+    )
+    claimed = chat_send_core.jobs_store.claim_next_job(worker_id, lanes={lane})
+    assert claimed is not None and int(claimed["id"]) == job_id
+    assert chat_send_core.jobs_store.mark_running(job_id, claimed_by=worker_id)
+    return job_id
+
+
 def test_db_action_v2_enqueues_job_and_skips_resident(monkeypatch):
     _seed("u_send_v2")
     store = core_store.get_store("u_send_v2")
@@ -380,62 +444,134 @@ def test_db_action_v2_with_no_live_workers_refuses_before_persist(monkeypatch):
     assert jobs_after == 0
 
 
-def test_db_action_v2_over_sla_admission_rejects_before_persist(monkeypatch):
-    """§6 admission ceiling: the resident wedge guard is skipped for db_action_v2
-    (Task 9) and the dead-pool liveness guard above only catches a fully dead
-    worker pool (Task 2) — it says nothing about a *live but overloaded* pool.
-    If estimated queue wait exceeds the SLA, send must refuse with a distinct
-    "busy"/"queue_over_sla" 503 BEFORE persisting anything (same
-    persist-nothing-on-refusal principle as the two guards above)."""
-    _seed("u_send_v2_over_sla")
-    store = core_store.get_store("u_send_v2_over_sla")
+def test_db_action_v2_over_sla_persists_and_enqueues(monkeypatch):
+    """Capacity telemetry must never discard a user's message.
+
+    The old contract asserted a 503 before persistence. That made the retry UI
+    responsible for retaining the only copy of the user's words and kept the
+    runtime's durable queue and wake-preemption machinery blind to the input.
+    A live-but-overloaded pool must instead accept the encrypted row and Chat
+    Job atomically, then return the ordinary asynchronous 202 response.
+    """
+    uid = "u_send_v2_over_sla"
+    message_id = "u-msg-over-sla"
+    _seed(uid)
+    store = core_store.get_store(uid)
     hosted_config_store.set_hosted_runtime_mode(store, "db_action_v2")
-
-    monkeypatch.setattr(
-        chat_send_core.core_envelope, "_build_shared_envelope_for_store",
-        lambda s, pt, **kw: ({"id": "u-msg-1", "body_ct": "c", "nonce": "n", "K_user": "k"}, ""),
+    trace_events = _stub_live_overloaded_runtime(
+        monkeypatch, message_id=message_id
     )
-    monkeypatch.setattr(
-        core_enclave, "_decrypt_envelope_via_enclave",
-        lambda envelope, key, purpose, **kw: b"sk-or-test",
-    )
-    monkeypatch.setattr(chat_send_core.agent_runtime_cutover, "resolve_driver", lambda cfg: "claude")
-    monkeypatch.setattr(chat_send_core.jobs_store, "workers_alive", lambda **kw: True)
-    # 1 worker, 999 in-flight, no history (falls back to the 20s default
-    # service time) → est_wait = ceil(999/1)*20 = 19980s, far over the 60s SLA.
-    monkeypatch.setattr(chat_send_core.jobs_store, "live_worker_capacity", lambda **kw: 1)
-    def _foreground_inflight(*, lanes):
-        assert lanes == {"chat", "manual_wake"}
-        return 999
-
-    monkeypatch.setattr(
-        chat_send_core.jobs_store, "inflight_job_count", _foreground_inflight
-    )
-    monkeypatch.setattr(chat_send_core.jobs_store, "recent_mean_service_sec", lambda **kw: None)
-
-    enqueue_called = {"n": 0}
-    monkeypatch.setattr(
-        chat_send_core.jobs_store, "enqueue_job",
-        lambda *a, **k: enqueue_called.update(n=enqueue_called["n"] + 1) or (0, False),
-    )
-    append_chat_calls = {"n": 0}
-
-    def _append_chat_spy(*a, **k):
-        append_chat_calls["n"] += 1
-        raise AssertionError("append_chat must not be called on admission refusal")
-
-    monkeypatch.setattr(store, "append_chat", _append_chat_spy)
 
     body, status = chat_send_core.model_api_chat_send_core(
         store, api_key="key", runtime_tok="", payload={"message": "hi"},
     )
 
-    assert status == 503
-    assert body["error"] == "busy"
-    assert body["reason"] == "queue_over_sla"
-    assert body["est_wait_sec"] == 19980
-    assert append_chat_calls["n"] == 0
-    assert enqueue_called["n"] == 0
+    assert status == 202
+    assert body["status"] == "processing"
+    assert body["user_message"]["id"] == message_id
+    with db.get_pool().connection() as conn:
+        message_count = conn.execute(
+            "SELECT count(*) FROM chat_messages "
+            "WHERE user_id=%s AND msg_id=%s AND doc->>'role'='user'",
+            (uid, message_id),
+        ).fetchone()[0]
+        jobs = conn.execute(
+            "SELECT lane,status,reason,trace_id FROM agent_jobs WHERE user_id=%s",
+            (uid,),
+        ).fetchall()
+    assert message_count == 1
+    assert jobs == [("chat", "pending", "chat_send", message_id)]
+    overload = [
+        event for event in trace_events
+        if event.get("summary") == "admission_over_sla"
+    ]
+    assert len(overload) == 1
+    assert overload[0]["status"] == "ok"
+    assert overload[0]["detail"] == {
+        "mode": "admit",
+        "reason": "queue_over_sla",
+        "est_wait_sec": 19980,
+        "inflight": 999,
+        "workers": 1,
+    }
+
+
+def test_db_action_v2_over_sla_coalesces_active_chat(monkeypatch):
+    uid = "u_send_v2_over_sla_active_chat"
+    message_id = "u-msg-over-sla-active-chat"
+    _seed(uid)
+    store = core_store.get_store(uid)
+    hosted_config_store.set_hosted_runtime_mode(store, "db_action_v2")
+    existing_job_id = _start_running_job(uid, "chat", "foreground-over-sla")
+    _stub_live_overloaded_runtime(monkeypatch, message_id=message_id)
+
+    body, status = chat_send_core.model_api_chat_send_core(
+        store, api_key="key", runtime_tok="", payload={"message": "latest"},
+    )
+
+    assert status == 202
+    assert body["user_message"]["id"] == message_id
+    with db.get_pool().connection() as conn:
+        message_count = conn.execute(
+            "SELECT count(*) FROM chat_messages WHERE user_id=%s AND msg_id=%s",
+            (uid, message_id),
+        ).fetchone()[0]
+        jobs = conn.execute(
+            "SELECT id,lane,status,input_generation FROM agent_jobs "
+            "WHERE user_id=%s",
+            (uid,),
+        ).fetchall()
+    assert message_count == 1
+    assert jobs == [(existing_job_id, "chat", "running", 1)]
+
+
+def test_db_action_v2_over_sla_preempts_active_wake(monkeypatch):
+    uid = "u_send_v2_over_sla_active_wake"
+    message_id = "u-msg-over-sla-active-wake"
+    _seed(uid)
+    store = core_store.get_store(uid)
+    hosted_config_store.set_hosted_runtime_mode(store, "db_action_v2")
+    wake_job_id = _start_running_job(uid, "heartbeat", "wake-over-sla")
+    _stub_live_overloaded_runtime(monkeypatch, message_id=message_id)
+    cancellations = []
+    monkeypatch.setattr(
+        chat_send_core.core_wake_bus,
+        "notify_job_cancel",
+        cancellations.append,
+    )
+
+    body, status = chat_send_core.model_api_chat_send_core(
+        store, api_key="key", runtime_tok="", payload={"message": "interrupt"},
+    )
+
+    assert status == 202
+    assert body["user_message"]["id"] == message_id
+    with db.get_pool().connection() as conn:
+        message_count = conn.execute(
+            "SELECT count(*) FROM chat_messages WHERE user_id=%s AND msg_id=%s",
+            (uid, message_id),
+        ).fetchone()[0]
+        jobs = conn.execute(
+            "SELECT id,lane,status,last_error FROM agent_jobs "
+            "WHERE user_id=%s ORDER BY id",
+            (uid,),
+        ).fetchall()
+    assert message_count == 1
+    assert len(jobs) == 2
+    assert jobs[0] == (
+        wake_job_id,
+        "heartbeat",
+        "superseded",
+        "foreground_chat_preempted",
+    )
+    assert jobs[1][1:] == ("chat", "pending", None)
+    assert cancellations == [
+        chat_send_core.core_wake_bus.JobCancellation(
+            wake_job_id,
+            "wake-over-sla",
+            "foreground_chat_preempted",
+        )
+    ]
 
 
 def test_db_action_v2_admission_check_fails_open_on_exception(monkeypatch):

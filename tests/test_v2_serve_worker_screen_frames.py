@@ -109,6 +109,26 @@ def test_failed_screen_decrypt_is_briefly_negative_cached(monkeypatch):
     assert calls == ["decrypt"]
 
 
+def test_screen_decrypt_keeps_bounded_ocr_and_app_with_pixels():
+    decoded = serve_worker._decode_screen_frame_result(
+        ScreenResult(
+            200,
+            json_body={
+                "image_b64": "YWJj",
+                "image_mime": "image/png",
+                "ts": 1.0,
+                "ocr_text": "x" * 3000,
+                "app_name": "Notes",
+            },
+        )
+    )
+
+    assert decoded is not None
+    assert decoded["image_b64"] == "YWJj"
+    assert decoded["app"] == "Notes"
+    assert len(decoded["ocr_text"]) == 2000
+
+
 def test_screen_frame_batch_is_bounded_to_latest_four_contract(monkeypatch):
     seen = []
     scopes = []

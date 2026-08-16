@@ -21,9 +21,11 @@ from copy import deepcopy
 
 from provider_types import ToolSpec
 from capabilities import registry
+from identity import card_policy
 # Card-writing rules live with the memory package (single source of truth shared
 # with the V1 guidance block); only the op names above are V2-specific.
-from memory import prompts_v1
+from memory_garden.prompts import buckets as prompts_v1
+from memory_garden.types import MAX_MEMORY_SUPERSEDE_TARGETS
 from perception.agent_fields import (
     AGENT_PERCEPTION_SIGNALS,
     AGENT_SIGNAL_FIELDS,
@@ -31,6 +33,7 @@ from perception.agent_fields import (
 )
 
 REPLY_TOOL = "reply"
+STAY_SILENT_TOOL = "stay_silent"
 FILE_REPLY_TOOL = "send_file"
 IMAGE_REPLY_TOOL = "generate_image"
 TASK_TOOL = "task"
@@ -44,6 +47,20 @@ _STR = {"type": "string"}
 _INT = {"type": "integer"}
 _BOOL = {"type": "boolean"}
 _NO_ARGS: dict = {"type": "object", "properties": {}}
+
+_IDENTITY_DIMENSION = {
+    "type": "object",
+    "properties": {
+        "name": _STR,
+        "value": {
+            "type": "number",
+            "minimum": card_policy._VALUE_MIN,
+            "maximum": card_policy._VALUE_MAX,
+        },
+        "description": _STR,
+    },
+    "required": ["name", "value"],
+}
 
 # Keep the provider-visible vocabulary tied to the same projection catalog the
 # capability executor consumes.  A copied enum silently drifts and turns an
@@ -71,12 +88,27 @@ _MEMORY_TOOL_ACTION = {
         # 线索标签。后端(worker 翻译层 + actions)一直在消费它,capture/dream 也产它,
         # 共享的 MEMORY_WRITE_RULES_V1 还明确教模型「一张卡 1-4 个」——只有这道闸
         # 拦着,于是 V2 手写的卡标签永远是空的(2026-08-10 真机)。
-        "threads": {"type": "array", "items": _STR},
+        "threads": {
+            "type": "array",
+            "items": _STR,
+            "minItems": 1,
+            "maxItems": 4,
+            "enforceItemBounds": True,
+        },
         # 这两个直接参与 ambient 排序(memory_readside_core)。schema 不开的话
         # actions 一律落 0.5/0.3,V2 每张卡权重完全一样。
         "importance": {"type": "number"},
         "pulse": {"type": "number"},
         "target_id": _STR,
+        # Consolidating several existing cards creates one successor and must
+        # retire every source card atomically.  The downstream
+        # memory.supersede action already supports a list; expose that ability
+        # at the model-facing boundary instead of forcing a one-target update.
+        "target_ids": {
+            "type": "array",
+            "items": _STR,
+            "maxItems": MAX_MEMORY_SUPERSEDE_TARGETS,
+        },
         "reason": _STR,
     },
     "required": ["op"],
@@ -117,6 +149,20 @@ PARAMS: dict[str, dict] = {
             "reason": _STR,
         },
         "required": ["dimension", "delta"],
+    },
+    # identity.set_dimensions(store, ...): full replacement of the dimensions
+    # list. The action layer reuses card_policy.validate_dimensions_structure.
+    "identity_dimensions_set": {
+        "type": "object",
+        "properties": {
+            "dimensions": {
+                "type": "array",
+                "items": _IDENTITY_DIMENSION,
+                "maxItems": card_policy.MAX_DIMENSIONS,
+            },
+            "reason": _STR,
+        },
+        "required": ["dimensions", "reason"],
     },
 
     # -- memory.py (backed by memory_core.index/fetch/actions) --
@@ -362,6 +408,11 @@ PARAMS: dict[str, dict] = {
         "properties": {"text": _STR},
         "required": ["text"],
     },
+    STAY_SILENT_TOOL: {
+        "type": "object",
+        "properties": {"reason": _STR},
+        "required": ["reason"],
+    },
     # Explicitly publish one file that already exists in the encrypted V2
     # workspace. The worker resolves the path for the current user; this never
     # accepts a host filesystem path.
@@ -406,9 +457,25 @@ for _parameters in PARAMS.values():
     if _parameters.get("type") == "object":
         _parameters["additionalProperties"] = False
 
+_PERCEPTION_USAGE_GATE = (
+    "Use when the user's request depends on their current device, environment, "
+    "activity, health, calendar, or reminders; do not call for unrelated "
+    "conversation or claim those readings are inaccessible while this tool is "
+    "available. "
+)
+_SCREEN_USAGE_GATE = (
+    "Use when the user's message plausibly refers to a shared screen; do not call "
+    "for unrelated conversation. "
+)
+
 DESCRIPTIONS: dict[str, str] = {
     "identity_get": "Read the persona's current identity/profile fields.",
-    "identity_patch": ("Update the persona's own identity/profile. Use 'agent_name' "
+    "identity_patch": ("Update the persona's own identity/profile in the SAME turn when "
+                       "the user explicitly asks to change your name, how you introduce "
+                       "yourself, or the relationship day count shown in the app. Do not "
+                       "merely say the change is done, and do not claim the day count is "
+                       "automatic or immutable. Only act on an explicit request, not a "
+                       "passing mention. Use 'agent_name' "
                        "when the user renames you — that is the name shown to them, "
                        "and rewriting only 'self_introduction' does NOT rename you; "
                        "pass both when the new name should also appear in how you "
@@ -424,19 +491,38 @@ DESCRIPTIONS: dict[str, str] = {
                        "replace_signatures, NOT replace_signature. For each list field, "
                        "use only one method in a call: whole replacement, add, remove, "
                        "or replace. D4 rename rule: changing agent_name requires "
-                       "self_introduction in the same call. To recalibrate how "
+                       "self_introduction in the same call. Dimensions are not managed "
+                       "by this tool; use identity_dimensions_set. To recalibrate how "
                        "long you and the user have known each other, set the "
                        "'relationship_days' argument directly — e.g. identity_patch(relationship_days=300). "
                        "This is the day number AS THE USER SEES AND SAYS IT (the '第 N 天' shown "
                        "in the app: the day you met is day 1, not day 0). So if the user says "
                        "'make it day 45', pass 45 and the app will show 45. Whole number, "
                        "day 1 = the day you met. Only act on an explicit request."),
-    "identity_nudge": ("Adjust ONE of the persona's relationship/personality dimension "
+    "identity_nudge": ("Make a small conversational adjustment the model infers for ONE "
+                       "of the persona's relationship/personality dimension "
                        "scores by a signed integer 'delta' (|delta| ≤ 10). 'dimension' "
                        "must name a dimension that already exists — call identity_get "
                        "first to see the current dimensions and values. Optional "
-                       "'reason'. To add or rename dimensions, use identity_patch."),
-    "memory_index": ("Browse memory-card summaries, optionally filtered by one exact "
+                       "'reason'. For a user-requested rename/content/value rewrite, "
+                       "add, or delete, use identity_dimensions_set instead."),
+    "identity_dimensions_set": (
+        "Replace the persona's COMPLETE dimensions list without changing identity/profile "
+        "text fields. Use only for an explicit user-requested rewrite; call identity_get "
+        "first, then provide every dimension that should remain. Each item has a 'name', "
+        f"a numeric 'value' from {card_policy._VALUE_MIN} to {card_policy._VALUE_MAX}, "
+        "and optional 'description' content. Renaming edits 'name'; an empty list deletes "
+        f"all dimensions; at most {card_policy.MAX_DIMENSIONS} are allowed. A non-empty "
+        "'reason' describing the explicit user request is required for the encrypted audit. "
+        "For a small conversational score adjustment, keep using identity_nudge."
+    ),
+    "memory_index": ("Use only when the current request actually depends on remembered "
+                     "information; ordinary conversation and model/runtime identity "
+                     "questions do not. Never run memory discovery for a standalone "
+                     "greeting, acknowledgement, emoji, interjection, or casual small "
+                     "talk, and do not resume an earlier answered memory workflow unless "
+                     "the current message explicitly asks. Browse memory-card summaries, "
+                     "optionally filtered by one exact "
                      "bucket or thread and capped by limit. Set ambient/include_sensitive "
                      "only when that broader or sensitive recall is genuinely needed. "
                      "Do not indiscriminately pull "
@@ -444,9 +530,24 @@ DESCRIPTIONS: dict[str, str] = {
                      "total/returned counts and browse bucket by bucket (or thread by "
                      "thread) until the partition counts reconcile with total. For a "
                      "specific subject use memory_search then memory_fetch instead. For "
+                     "an open-ended request about all memories or the overall relationship, "
+                     "use memory_index once instead of guessing keywords or repeating "
+                     "memory_search. For "
                      "a user-requested bulk rewrite or cleanup, call memory_organize "
                      "instead of trying to edit every card in chat."),
-    "memory_search": ("Keyword-search memory cards by a required query string, then use "
+    "memory_search": ("Use only when the current request actually depends on remembered "
+                      "information; ordinary conversation and model/runtime identity "
+                      "questions do not. Never run memory discovery for a standalone "
+                      "greeting, acknowledgement, emoji, interjection, or casual small "
+                      "talk, and do not resume an earlier answered memory workflow unless "
+                      "the current message explicitly asks. If the user mentions a "
+                      "specific past event or person, or asks whether you remember "
+                      "something, and the supplied memory summary has no answer, search "
+                      "before replying instead of guessing. If the summary already answers "
+                      "the question, reply directly. For a requested memory-grounded "
+                      "summary or deliverable about a specific subject, search that subject "
+                      "instead of relying only on general recollection. Keyword-search "
+                      "memory cards by a required query string, then use "
                       "memory_fetch for the selected ids. This is the normal path for a "
                       "specific remembered subject, person, phrase, or event. Never use "
                       "it for ordinary conversation, model/runtime identity, or an "
@@ -508,11 +609,23 @@ DESCRIPTIONS: dict[str, str] = {
     "memory_write": ("Write, update, or delete memory cards. Each action needs an "
                      "'op': 'add' (supply a one-line 'summary' AND full 'content', "
                      "optional 'bucket'), 'update' (supply 'target_id' plus new "
-                     "'summary'/'content'), or 'delete' (supply 'target_id'). Each action "
+                     "'summary'/'content'), or 'delete' (supply 'target_id'). To merge "
+                     "multiple existing cards into one successor, use one 'update' with "
+                     "'target_ids' containing every old card id (at most 20 per update); "
+                     "all of them are retired only if the successor is written successfully. "
+                     "For a larger merge, continue in another tool round and include the "
+                     "returned successor id among that round's at most 20 ids. 'delete' "
+                     "accepts one 'target_id' only. Each action "
                      "may include an audit 'reason'. Get "
-                     "target_ids from memory_search/memory_index first.\n"
+                     "target_ids from memory_search/memory_index first. If an update "
+                     "returns supersede_targets_unavailable or "
+                     "supersede_targets_changed, do not retry the stale ids: run "
+                     "memory_search/memory_index again for current active ids, then "
+                     "retry the merge.\n"
                      + prompts_v1.MEMORY_WRITE_RULES_V1),
-    "perception_snapshot": ("Read the latest perception snapshot for named signals across "
+    "perception_snapshot": (_PERCEPTION_USAGE_GATE
+                            + "Read the latest "
+                            "perception snapshot for named signals across "
                             + _PERCEPTION_DOMAINS + ". "
                             "If signals is omitted, ONLY the fast defaults are returned: "
                             + _PERCEPTION_DEFAULTS + ". Health and activity signals are "
@@ -520,22 +633,34 @@ DESCRIPTIONS: dict[str, str] = {
                             "The app field is only the latest open/close event observed "
                             "within 15 minutes; never claim it is the app currently in use. "
                             "Use perception_recent_apps for an activity trajectory."),
-    "perception_recent_apps": ("Read the merged app open/close trajectory, newest first, "
+    "perception_recent_apps": (_PERCEPTION_USAGE_GATE
+                               + "Read the merged app open/close trajectory, newest first, "
                                "with event, minutes_ago, and category. Use hours to bound "
                                "the time window and check minutes_ago before saying 'just "
                                "now'. apps=[] means no data; disabled=true means access is "
                                "off, not that no apps were used."),
-    "perception_trend": ("Read a numeric-field trend over recent days for one named signal "
+    "perception_trend": (_PERCEPTION_USAGE_GATE
+                         + "Read a numeric-field trend over recent days for one named signal "
                          "from " + _PERCEPTION_DOMAINS + ". Snapshot defaults do not apply: "
                          "always name the signal, and name the field when the signal has "
                          "multiple numeric fields. "
                          "Interpret the rolling baseline as the usual level and delta as "
                          "the current change from that baseline; do not conflate them."),
-    "perception_history": ("Read raw daily historical values over recent days for one named "
+    "perception_history": (_PERCEPTION_USAGE_GATE
+                           + "Read raw daily historical values over recent days for one named "
                            "signal from " + _PERCEPTION_DOMAINS + ". Snapshot defaults do "
                            "not apply: always request the signal explicitly."),
-    "screen_recent": "List recent screen-share frame metadata.",
-    "screen_read": ("Read a specific screen-share frame, or the latest one if no frame_id "
+    "screen_recent": (_SCREEN_USAGE_GATE
+                      + "List recent screen-share frame metadata."),
+    "screen_read": (_SCREEN_USAGE_GATE
+                    + "screen_share.active means the "
+                    "user is sharing RIGHT NOW but reports availability only, never "
+                    "screen contents: call screen_read rather than claiming you cannot "
+                    "see a screen reported as live. "
+                    "screen_share.stalled means the device still reports sharing but "
+                    "current frames stopped arriving; screen_share.ended means the share "
+                    "ended; no active, stalled, or ended block means no share is running. "
+                    "Read a specific screen-share frame, or the latest one if no frame_id "
                     "is given. During an active screen share, omitting include_image shows "
                     "the pixels by default; set include_image=false only when text/OCR is "
                     "explicitly sufficient. Outside an active share, pixels remain opt-in. "
@@ -545,8 +670,11 @@ DESCRIPTIONS: dict[str, str] = {
                     "Runtime V2 inspects pixels through its native vision observer and "
                     "returns an untrusted visual_observation instead of a local image_file "
                     "path."),
-    "photo_recent": "List recent photos, optionally capped by limit.",
-    "photo_read": ("Read a specific photo by id. Set include_image=true only when metadata "
+    "photo_recent": ("Use when the user's request depends on their photos; do not call for "
+                     "unrelated conversation. List recent photos, optionally capped by limit."),
+    "photo_read": ("Use when the user's request depends on a specific photo; do not call "
+                   "for unrelated conversation. Read a specific photo by id. Set "
+                   "include_image=true only when metadata "
                    "is insufficient; Runtime V2 inspects the decrypted pixels through its "
                    "native vision observer and returns an untrusted visual_observation "
                    "instead of a local image_file path."),
@@ -556,11 +684,18 @@ DESCRIPTIONS: dict[str, str] = {
                       "time such as 'in 2 hours', '+30m', or '两小时后', with optional "
                       "timezone, reason, and repeat ('daily' every 24 hours or "
                       "'weekly' every 7 days)."),
-    "cancel_wake": "Cancel a previously scheduled self-wake by its wake_id.",
+    "cancel_wake": ("When the user asks to cancel or change a pending reminder, use the "
+                    "exact wake_id from runtime_data.scheduled_wakes.timers; do not search "
+                    "memories for reminder identifiers. Cancel a previously scheduled "
+                    "self-wake by its wake_id."),
     "workspace_list": ("List encrypted virtual workspace entries and revisions. "
                        "Namespaces are /artifacts (read-only), /skills (read-only), "
                        "/workspace (editable), and /memory/WORKING.md (editable)."),
-    "workspace_read": ("Read a line range from a virtual text entry. This reads a "
+    "workspace_read": ("Use only when the current request actually depends on stored "
+                       "workspace information; ordinary conversation and model/runtime "
+                       "identity questions do not. Do not resume an earlier answered file "
+                       "workflow unless the current message explicitly asks. Read a line "
+                       "range from a virtual text entry. This reads a "
                        "stored text view and does not materialize a physical artifact."),
     "workspace_write": ("Create or replace editable UTF-8 source using optimistic "
                         "revision control. For a downloadable .docx or .pdf target, "
@@ -574,12 +709,24 @@ DESCRIPTIONS: dict[str, str] = {
     TASK_TOOL: ("Run a bounded isolated subagent on one focused task. The child can "
                 "read workspace/artifact, memory, and web data but cannot reply to "
                 "the user, mutate state, call MCP, or spawn another task."),
-    REPLY_TOOL: "Send an immediate reply bubble to the user with the given text.",
+    REPLY_TOOL: (
+        "Send an immediate reply bubble to the user with the given text during a "
+        "long-running task when timely progress feedback is useful. This bubble is "
+        "not the final reply, does not need and must not include <think>, and must "
+        "not replace the final reply."
+    ),
+    STAY_SILENT_TOOL: (
+        "Choose not to send a proactive message on this wake. Give one short, "
+        "specific reason based on the current attention facts. This is a successful, "
+        "auditable outcome, not an error."
+    ),
     FILE_REPLY_TOOL: (
         "Deliver an existing /workspace source as a downloadable attachment. "
         "Plain-text formats are sent directly; .docx and .pdf targets are rendered "
         "into real Word/PDF bytes. Preserve any format the user explicitly requested: "
         "Word means .docx and PDF means .pdf, and never replace either with Markdown. "
+        "Even when reformatting an existing file, never substitute Markdown for another "
+        "supported format the user explicitly requested. "
         "Choose this tool from the user's meaning, not from exact "
         "keywords, wording, language, or a named extension: use it whenever the "
         "requested result is meant to be a reusable standalone artifact they can "
@@ -704,6 +851,12 @@ def _validate_value(value, schema: dict, *, path: str) -> str | None:
                     return error
 
     if expected == "array" and "items" in schema:
+        min_items = schema.get("minItems") if schema.get("enforceItemBounds") else None
+        if min_items is not None and len(value) < int(min_items):
+            return f"{path} must contain at least {int(min_items)} items"
+        max_items = schema.get("maxItems") if schema.get("enforceItemBounds") else None
+        if max_items is not None and len(value) > int(max_items):
+            return f"{path} must contain at most {int(max_items)} items"
         for index, item in enumerate(value):
             error = _validate_value(item, schema["items"], path=f"{path}[{index}]")
             if error:
@@ -769,6 +922,14 @@ def validate_tool_args(name: str, args, *, live_model_call: bool = False) -> str
             return bool(value)
         if not any(_has_content(k, v) for k, v in merged.items()):
             return "identity_patch requires a non-empty patch or profile field"
+    if name == "identity_dimensions_set":
+        valid, dimensions_error = card_policy.validate_dimensions_structure(
+            args.get("dimensions")
+        )
+        if not valid:
+            return dimensions_error
+        if not str(args.get("reason") or "").strip():
+            return "identity_dimensions_set requires a non-empty reason"
     if name == "memory_write":
         actions = args.get("actions") or []
         if not actions:
@@ -778,10 +939,29 @@ def validate_tool_args(name: str, args, *, live_model_call: bool = False) -> str
             summary = str(action.get("summary") or "").strip()
             content = str(action.get("content") or "").strip()
             target_id = str(action.get("target_id") or "").strip()
+            target_ids = [
+                str(value or "").strip()
+                for value in (action.get("target_ids") or [])
+                if str(value or "").strip()
+            ]
+            combined_targets = set(target_ids)
+            if target_id:
+                combined_targets.add(target_id)
+            if (
+                len(action.get("target_ids") or []) > MAX_MEMORY_SUPERSEDE_TARGETS
+                or len(combined_targets) > MAX_MEMORY_SUPERSEDE_TARGETS
+            ):
+                return (
+                    f"args.actions[{index}] target_ids exceeds maximum "
+                    f"{MAX_MEMORY_SUPERSEDE_TARGETS}"
+                )
             if op == "add" and (not summary or not content):
                 return f"args.actions[{index}] add requires summary and content"
-            if op == "update" and (not target_id or not summary or not content):
-                return f"args.actions[{index}] update requires target_id, summary, and content"
+            if op == "update" and (not (target_id or target_ids) or not summary or not content):
+                return (
+                    f"args.actions[{index}] update requires target_id or target_ids, "
+                    "summary, and content"
+                )
             if op == "delete" and not target_id:
                 return f"args.actions[{index}] delete requires target_id"
     if name in {"workspace_write", "workspace_delete"}:
@@ -824,6 +1004,7 @@ def build_tool_specs() -> list[ToolSpec]:
     for name in (
         TASK_TOOL,
         REPLY_TOOL,
+        STAY_SILENT_TOOL,
         FILE_REPLY_TOOL,
         IMAGE_REPLY_TOOL,
         PROVIDER_USAGE_TOOL,

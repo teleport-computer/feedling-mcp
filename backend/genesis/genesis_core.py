@@ -257,6 +257,7 @@ def _resident_sealed_import(store, payload: dict) -> tuple[dict, int]:
     # field) → "" (back-compat: "" means "no baseline, skip the check").
     current_identity = identity_service._load_identity(store)
     base_identity_replaced_at = str((current_identity or {}).get("replaced_at") or "")
+    identity_change_anchor = identity_service.identity_change_anchor(store)
     job_kind_hint = str(payload.get("job_kind") or "").strip().lower()
     # I1b: source_kind used to be job_kind_hint-or-mode_hint, i.e. the DB-level
     # redistill exclusivity (0023) depended on the client remembering to also
@@ -287,7 +288,9 @@ def _resident_sealed_import(store, payload: dict) -> tuple[dict, int]:
             "privacy_mode": "resident_sealed",
             "metadata": {"mode": mode_hint, "material_kind": material_kind,
                          "client_job_id": client_job_id, "ingest": "resident_sealed",
-                         "base_identity_replaced_at": base_identity_replaced_at},
+                         "base_identity_replaced_at": base_identity_replaced_at,
+                         "identity_change_anchor_ts": identity_change_anchor["ts"],
+                         "identity_change_anchor_id": identity_change_anchor["id"]},
         })
     except db.GenesisRedistillJobActive as e:
         # DB-level exclusivity (0023_redistill_job_exclusivity.py): this user already has

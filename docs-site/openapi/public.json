@@ -3133,6 +3133,7 @@
     "/v1/identity/changes": {
       "get": {
         "summary": "Identity Changes",
+        "description": "List content-free identity mutations, newest first.\n\nNewly written records include ``fields`` with canonical changed-field\nlabels. Legacy records may omit it and clients must tolerate that shape.",
         "operationId": "identity_changes_v1_identity_changes_get",
         "responses": {
           "200": {
@@ -9391,7 +9392,7 @@
           "occurred_at": {
             "type": "string",
             "minLength": 1,
-            "description": "Plaintext ISO-8601 ordering metadata."
+            "description": "Plaintext ISO-8601 event time. Accepted datetime values are normalized to the equivalent UTC value with a Z suffix; date-only values remain date-only."
           },
           "source": {
             "type": "string",
@@ -10809,7 +10810,8 @@
               "memory.supersede",
               "memory.delete",
               "memory.retype"
-            ]
+            ],
+            "description": "Accepted memory.add actions always create a new card; repeated content is not deduplicated."
           },
           "envelope": {
             "$ref": "#/components/schemas/MemoryEnvelope"

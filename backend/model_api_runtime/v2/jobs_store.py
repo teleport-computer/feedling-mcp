@@ -32,6 +32,7 @@ from psycopg.types.json import Jsonb
 
 import db
 from core import wake_bus
+from memory_garden import timestamps as memory_timestamps
 from model_api_runtime.v2 import usage_reporting
 from notices import catalog as notices_catalog
 from proactive import capture_daily
@@ -1120,6 +1121,37 @@ def valid_active_claims(
     return {(int(row[0]), str(row[1])) for row in rows}
 
 
+def valid_reconcile_claims(
+    claims: list[tuple[int, str]],
+) -> set[tuple[int, str]]:
+    """Return snapshot pairs that do not justify cancelling their slot.
+
+    Besides a live claimed/running lease, accept ``completed`` and ``failed``
+    rows fenced by the same owner.  The worker commits those terminal states
+    before its final trajectory/unwind work and parent pipe signal, so treating
+    that bounded window as an invalid claim kills a healthy slot after every
+    normal turn.  Cancellation states and missing/reassigned rows deliberately
+    remain invalid so the reconciler still backs up dropped cancellation
+    notifications.
+    """
+    if not claims:
+        return set()
+    job_ids = [int(job_id) for job_id, _claimed_by in claims]
+    owners = [str(claimed_by) for _job_id, claimed_by in claims]
+    with _pool().connection() as conn:
+        rows = conn.execute(
+            "WITH wanted(job_id, claimed_by) AS ("
+            "SELECT * FROM unnest(%s::bigint[], %s::text[])"
+            ") SELECT j.id, j.claimed_by FROM wanted w "
+            "JOIN agent_jobs j ON j.id=w.job_id AND j.claimed_by=w.claimed_by "
+            "WHERE (j.status IN ('claimed','running') "
+            "AND j.lease_expires_at > clock_timestamp()) "
+            "OR j.status IN ('completed','failed')",
+            (job_ids, owners),
+        ).fetchall()
+    return {(int(row[0]), str(row[1])) for row in rows}
+
+
 def mark_running(job_id, *, claimed_by: str) -> bool:
     with _pool().connection() as conn:
         with conn.transaction():
@@ -1268,15 +1300,18 @@ def mark_completed(
     *,
     claimed_by: str,
     clear_wake_backoff: bool = False,
+    wake_result: str | None = None,
+    wake_result_reason: str | None = None,
 ) -> bool:
     with _pool().connection() as conn:
         with conn.transaction():
             cur = conn.execute(
-                "UPDATE agent_jobs SET status='completed', finished_at=now() "
+                "UPDATE agent_jobs SET status='completed', finished_at=now(), "
+                "wake_result=%s, wake_result_reason=%s "
                 "WHERE id=%s AND status IN ('claimed','running') "
                 "AND claimed_by=%s AND lease_expires_at > now() "
                 "RETURNING user_id,lane",
-                (job_id, str(claimed_by)),
+                (wake_result, wake_result_reason, job_id, str(claimed_by)),
             )
             row = cur.fetchone()
             if row is None:
@@ -1359,6 +1394,8 @@ def finish_wake_job(
     consumed_context_seq: int,
     clear_wake_backoff: bool = False,
     completed_perception_glance_fingerprint: str | None = None,
+    wake_result: str | None = None,
+    wake_result_reason: str | None = None,
 ) -> tuple[bool, int | None]:
     """Complete a wake, persist its glance, and hand input to one successor.
 
@@ -1439,9 +1476,10 @@ def finish_wake_job(
                     observed_generation
                 )
                 cur.execute(
-                    "UPDATE agent_jobs SET status='completed',finished_at=now() "
+                    "UPDATE agent_jobs SET status='completed',finished_at=now(), "
+                    "wake_result=%s,wake_result_reason=%s "
                     "WHERE id=%s",
-                    (int(job_id),),
+                    (wake_result, wake_result_reason, int(job_id)),
                 )
                 if completed_fingerprint is not None:
                     _merge_completed_perception_glance_on_cursor(
@@ -2024,6 +2062,9 @@ def _validate_capture_actions(user_id: str, actions: list[dict]) -> list[dict]:
                 for field in ("nonce", "K_user", "K_enclave")
             ):
                 raise ValueError("capture plaintext envelope has crypto fields")
+        occurred_at = memory_timestamps.normalize(envelope.get("occurred_at"))
+        if not occurred_at:
+            raise ValueError("capture envelope invalid occurred_at")
         if str(envelope["visibility"]) != "shared":
             raise ValueError("capture envelope must be shared")
         if str(envelope["type"]) not in {"moment", "quote", "fact", "event"}:
@@ -2045,6 +2086,7 @@ def _validate_capture_actions(user_id: str, actions: list[dict]) -> list[dict]:
                 if key in envelope
             },
         }
+        clean_action["envelope"]["occurred_at"] = occurred_at
         if action_type == "memory.supersede":
             clean_action["supersedes"] = targets
         normalized.append(clean_action)
@@ -2250,8 +2292,8 @@ def _capture_memory_doc(user_id: str, action: dict) -> dict:
     from core import envelope as core_envelope  # 延迟导入：与本模块既有惯例一致
 
     envelope = dict(action["envelope"])
-    occurred_at = str(envelope["occurred_at"])
-    now_iso = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    occurred_at = memory_timestamps.normalize(envelope["occurred_at"])
+    now_iso = memory_timestamps.now_iso()
     doc = {
         "v": 1,
         "id": str(envelope["id"]),
@@ -4763,6 +4805,7 @@ def wake_lane_activity_for_user(user_id: str, *, within_hours: int = 72) -> dict
         "by_lane": {},
         "totals": {"jobs": 0, "completed": 0, "failed": 0, "pending": 0},
         "recent_failures": [],
+        "recent_silences": [],
         "last_terminal_at": "",
     }
     if not uid:
@@ -4789,6 +4832,15 @@ def wake_lane_activity_for_user(user_id: str, *, within_hours: int = 72) -> dict
                 (uid, list(WAKE_LANES_FOR_SUPPORT), safe_hours),
             )
             failures = cur.fetchall()
+            cur.execute(
+                "SELECT id, lane, wake_result_reason, finished_at FROM agent_jobs "
+                "WHERE user_id=%s AND lane = ANY(%s) "
+                "  AND status='completed' AND wake_result='sleep' "
+                "  AND finished_at >= now() - make_interval(hours => %s) "
+                "ORDER BY finished_at DESC, id DESC LIMIT 20",
+                (uid, list(WAKE_LANES_FOR_SUPPORT), safe_hours),
+            )
+            silences = cur.fetchall()
 
     by_lane: dict[str, dict] = {}
     totals = {"jobs": 0, "completed": 0, "failed": 0, "pending": 0}
@@ -4823,6 +4875,16 @@ def wake_lane_activity_for_user(user_id: str, *, within_hours: int = 72) -> dict
                 "finished_at": _iso_or_empty(r["finished_at"]),
             }
             for r in failures
+        ],
+        "recent_silences": [
+            {
+                "job_id": int(r["id"]),
+                "lane": str(r["lane"] or ""),
+                "wake_result": "sleep",
+                "reason": str(r["wake_result_reason"] or "")[:500],
+                "finished_at": _iso_or_empty(r["finished_at"]),
+            }
+            for r in silences
         ],
         "last_terminal_at": _iso_or_empty(last_terminal),
     }

@@ -1,26 +1,32 @@
 """Memory write actions (add / patch / retype / delete) + executor."""
 
 import json
+import logging
 import re
-import unicodedata
 import uuid
 
 
 import db
+import debug_trace
 from core.store import UserStore
 
 from bootstrap import gates as boot_gates
 from core import envelope as core_envelope
 from core import util as core_util
 from identity import service as identity_service
-from memory import card_guard
-from memory import card_text
+from memory_garden.text import card_guard
+from memory_garden.text import card_text
 from memory import service as memory_service
-from memory.prompts_v1 import normalize_bucket_language
-from memory.source_policy import (
+from memory_garden import timestamps as memory_timestamps
+from memory_garden.prompts.buckets import normalize_bucket_language
+from memory_garden.types import (
+    MAX_MEMORY_SUPERSEDE_TARGETS,
     MEMORY_CAPTURE_MODE_VALUES,
     MEMORY_SOURCE_VALUES,
 )
+
+
+log = logging.getLogger(__name__)
 
 
 def _memory_action_metadata_error(action: dict) -> dict | None:
@@ -53,52 +59,6 @@ def _memory_action_metadata_error(action: dict) -> dict | None:
     return None
 
 
-def _memory_normalized_identity(inner: dict | None) -> tuple[str, str]:
-    if not isinstance(inner, dict):
-        return "", ""
-
-    def normalize(value) -> str:
-        text = unicodedata.normalize("NFKC", str(value or "")).casefold()
-        return " ".join(text.split())
-
-    title = normalize(
-        inner.get("summary") or inner.get("title") or inner.get("description")
-    )
-    content = normalize(inner.get("content") or inner.get("description"))
-    return title, content
-
-
-def _memory_active_duplicate(
-    moments: list,
-    inner: dict,
-    api_key: str | None,
-    *,
-    runtime_token: str = "",
-) -> dict | None:
-    identity = _memory_normalized_identity(inner)
-    if not all(identity):
-        return None
-    for moment in memory_service._active_memory_moments(moments):
-        if moment.get("visibility") == "local_only":
-            continue
-        existing_inner, _err = _memory_plain_from_envelope(
-            moment, api_key, runtime_token=runtime_token
-        )
-        if existing_inner is not None and _memory_normalized_identity(existing_inner) == identity:
-            return moment
-    return None
-
-
-def _memory_duplicate_result(duplicate: dict) -> tuple[dict, list[dict], int]:
-    return {
-        "status": "ok",
-        "action": "memory.add",
-        "noop": True,
-        "skipped": "duplicate_active",
-        "duplicate_of": str(duplicate.get("id") or ""),
-    }, [], 200
-
-
 def _memory_tombstone_reason(summary: str, content: str) -> str | None:
     """明文写入路的墓碑注记闸(2026-08-06,usr_a40e 徒手 patch 潮)。
 
@@ -121,10 +81,10 @@ def _memory_action_text(value, max_chars: int) -> str:
 
 def _memory_action_occurred_at(raw: dict, envelope: dict | None = None, *, default: str = "") -> str:
     if isinstance(raw, dict) and "occurred_at" in raw:
-        return _memory_action_text(raw.get("occurred_at"), 80)
+        return memory_timestamps.normalize(_memory_action_text(raw.get("occurred_at"), 80))
     if isinstance(envelope, dict) and "occurred_at" in envelope:
-        return _memory_action_text(envelope.get("occurred_at"), 80)
-    return _memory_action_text(default, 80)
+        return memory_timestamps.normalize(_memory_action_text(envelope.get("occurred_at"), 80))
+    return memory_timestamps.normalize(_memory_action_text(default, 80))
 
 
 def _memory_action_float(value, default: float) -> float:
@@ -152,7 +112,11 @@ def _memory_action_list(value, max_items: int = 8, max_chars: int = 80) -> list[
     return out
 
 
-def _memory_supersedes_list(action: dict, *, max_items: int = 20) -> list[str]:
+def _memory_supersedes_list(
+    action: dict,
+    *,
+    max_items: int = MAX_MEMORY_SUPERSEDE_TARGETS + 1,
+) -> list[str]:
     for key in ("supersedes", "old_id", "target_id", "memory_id"):
         if key not in action:
             continue
@@ -160,6 +124,21 @@ def _memory_supersedes_list(action: dict, *, max_items: int = 20) -> list[str]:
         if ids:
             return ids
     return []
+
+
+def _memory_supersede_target_is_active(moment: dict | None) -> bool:
+    """Only a currently visible source card may be replaced.
+
+    Supersede builds its successor before taking the mutation lock.  Rechecking
+    both the row and its active state under that lock is the compare-and-swap
+    fence: a concurrent delete/supersede must make this action fail instead of
+    allowing a second active successor to be appended.
+    """
+    return bool(
+        isinstance(moment, dict)
+        and str(moment.get("status") or "active").strip().lower() == "active"
+        and not memory_service._memory_is_archived(moment)
+    )
 
 
 def _memory_default_bucket(value) -> str:
@@ -171,8 +150,54 @@ def _memory_default_bucket(value) -> str:
     return "未分类"
 
 
+MEMORY_CONTENT_MAX_CHARS = 5000
+MEMORY_CONTENT_TRUNCATION_EVENT = "memory.content.truncation"
+
+
+def trace_memory_content_truncation(
+    store: UserStore,
+    value,
+    *,
+    route: str,
+) -> None:
+    """Record a content-free counter when the existing 5k slice will clip.
+
+    ``route`` is a closed caller-supplied label stored under an admin-redactor
+    allowlisted key. The body itself never enters the event, including through
+    summary/explain/content_excerpt.
+    """
+    original = str(value or "").strip()
+    original_chars = len(original)
+    truncated_chars = max(0, original_chars - MEMORY_CONTENT_MAX_CHARS)
+    if not truncated_chars:
+        return
+    try:
+        debug_trace.trace_event(
+            store,
+            subsystem="memory",
+            type=MEMORY_CONTENT_TRUNCATION_EVENT,
+            actor="backend",
+            status="warning",
+            summary="",
+            explain="",
+            detail={
+                "route": route,
+                "counts": {
+                    "original_chars": original_chars,
+                    "truncated_chars": truncated_chars,
+                },
+            },
+        )
+    except Exception as e:  # noqa: BLE001 — observability must never block a memory write
+        log.warning(
+            "[memory.actions] truncation trace failed route=%s error=%s",
+            route,
+            type(e).__name__,
+        )
+
+
 def _memory_content_from_action(data: dict, summary: str) -> str:
-    content = str(data.get("content") or "").strip()[:5000]
+    content = str(data.get("content") or "").strip()[:MEMORY_CONTENT_MAX_CHARS]
     if content:
         return content
     description = str(data.get("description") or summary or "").strip()[:2000]
@@ -219,12 +244,22 @@ def _memory_plain_from_envelope(moment: dict, api_key: str | None, runtime_token
         return None, f"memory_decrypt_failed:{type(e).__name__}:{str(e)[:180]}"
 
 
-def _memory_inner_from_action(data: dict) -> dict:
+def _memory_inner_from_action(
+    data: dict,
+    *,
+    trace_store: UserStore | None = None,
+) -> dict:
     summary = str(data.get("summary") or data.get("description") or data.get("title") or "").strip()[:2000]
     threads = _memory_action_list(data.get("threads"), max_items=8, max_chars=80)
     if not threads:
         linked = _memory_action_list(data.get("linked_dimension"), max_items=1, max_chars=80)
         threads.extend(linked)
+    if trace_store is not None and data.get("content"):
+        trace_memory_content_truncation(
+            trace_store,
+            data.get("content"),
+            route="memory_actions",
+        )
     content = _memory_content_from_action(data, summary)
     bucket = _memory_action_text(data.get("bucket") or _memory_default_bucket(data.get("type")), 80)
     if card_guard.guard_enabled():
@@ -306,7 +341,9 @@ def _memory_validate_prebuilt_envelope(
         return False, {"error": "envelope_visibility_invalid", "allowed": ["shared", "local_only"]}
     if core_envelope.requires_enclave_key(envelope):
         return False, {"error": "envelope_shared_requires_K_enclave"}
-    occurred_at = _memory_action_text(envelope.get("occurred_at"), 80)
+    occurred_at = memory_timestamps.normalize(
+        _memory_action_text(envelope.get("occurred_at"), 80)
+    )
     if not occurred_at:
         return False, {
             "error": "occurred_at_required",
@@ -359,17 +396,21 @@ def _memory_record_from_prebuilt_envelope(store: UserStore, envelope: dict, *, e
 
 def _memory_record_from_envelope(store: UserStore, envelope: dict, *, existing: dict | None = None) -> dict:
     now = core_util._now_iso()
-    if "occurred_at" in envelope:
-        occurred_at = str(envelope.get("occurred_at") or "")
-    elif existing and "occurred_at" in existing:
+    card_now = memory_timestamps.now_iso()
+    if existing is not None:
         occurred_at = str(existing.get("occurred_at") or "")
+        created_at = str(existing.get("created_at") or "")
+    elif "occurred_at" in envelope:
+        occurred_at = memory_timestamps.normalize(envelope.get("occurred_at"))
+        created_at = card_now
     else:
-        occurred_at = now
+        occurred_at = card_now
+        created_at = card_now
     moment = {
         "v": 1,
         "id": envelope.get("id") or (existing.get("id") if existing else f"mom_{uuid.uuid4().hex[:12]}"),
         "occurred_at": occurred_at,
-        "created_at": (existing or {}).get("created_at") or now,
+        "created_at": created_at,
         "updated_at": now,
         "source": str(envelope.get("source") or (existing or {}).get("source") or "live_conversation"),
         "enclave_pk_fpr": "",
@@ -399,7 +440,7 @@ def _memory_apply_v1_metadata(envelope: dict, raw: dict, *, source: str, default
     envelope["status"] = default_status
     envelope["importance"] = _memory_action_float(raw.get("importance"), 0.5)
     envelope["pulse"] = _memory_action_float(raw.get("pulse"), 0.3)
-    occurred_at = _memory_action_occurred_at(raw, envelope, default=core_util._now_iso())
+    occurred_at = _memory_action_occurred_at(raw, envelope, default=memory_timestamps.now_iso())
     last_referenced_at = _memory_action_text(raw.get("last_referenced_at"), 80)
     if not last_referenced_at and occurred_at:
         last_referenced_at = occurred_at
@@ -463,12 +504,15 @@ def _memory_add_action(
     if not ok:
         return {"status": "error", **(err or {}), "action": "memory.add"}, [], 400
 
-    inner = _memory_inner_from_action({**raw, "type": mem_type, "title": title, "description": description})
+    inner = _memory_inner_from_action(
+        {**raw, "type": mem_type, "title": title, "description": description},
+        trace_store=store,
+    )
     envelope, env_err = _build_memory_envelope_for_store(store, inner)
     if envelope is None:
         return {"status": "error", "error": env_err, "action": "memory.add"}, [], 409
     envelope["type"] = mem_type
-    envelope["occurred_at"] = _memory_action_occurred_at(raw, default=core_util._now_iso())
+    envelope["occurred_at"] = _memory_action_occurred_at(raw, default=memory_timestamps.now_iso())
     envelope["source"] = _memory_action_text(raw.get("source") or action.get("source") or "model_api_capture", 80)
     _memory_apply_v1_metadata(envelope, raw, source=envelope["source"])
     if anchor_ids:
@@ -478,11 +522,6 @@ def _memory_add_action(
     # validation only) so a concurrent same-user write can't lost-update.
     with memory_service.mutation_lock(store):
         moments = memory_service._load_moments(store)
-        duplicate = _memory_active_duplicate(
-            moments, inner, api_key, runtime_token=runtime_token
-        )
-        if duplicate is not None:
-            return _memory_duplicate_result(duplicate)
         moments.append(moment)
         memory_service._save_moments(store, moments)
     boot_gates._log_bootstrap_event(store, "memory_action_added_v1", success=True)
@@ -522,26 +561,9 @@ def _memory_add_envelope_action(
     if not ok:
         return {"status": "error", **(err or {}), "action": "memory.add"}, [], 400
 
-    incoming_inner = None
-    if api_key or runtime_token:
-        incoming_inner, incoming_err = _memory_plain_from_envelope(
-            envelope, api_key, runtime_token=runtime_token
-        )
-        if incoming_inner is None:
-            return {
-                "status": "error",
-                "error": incoming_err or "memory_plaintext_unavailable",
-                "action": "memory.add",
-            }, [], 409
     moment = _memory_record_from_prebuilt_envelope(store, envelope)
     with memory_service.mutation_lock(store):
         moments = memory_service._load_moments(store)
-        if incoming_inner is not None:
-            duplicate = _memory_active_duplicate(
-                moments, incoming_inner, api_key, runtime_token=runtime_token
-            )
-            if duplicate is not None:
-                return _memory_duplicate_result(duplicate)
         moments.append(moment)
         memory_service._save_moments(store, moments)
     boot_gates._log_bootstrap_event(store, "memory_action_added_envelope_v1", success=True)
@@ -618,7 +640,11 @@ def _memory_upgrade_apply(
             # the migrator re-detects this card by shape next quiet window.
             return {"status": "ok", "action": "memory.upgrade", "skipped": "stale", "noop": True}, [], 200
         envelope = dict(envelope)
-        envelope["occurred_at"] = str(existing.get("occurred_at") or envelope.get("occurred_at") or core_util._now_iso())
+        envelope["occurred_at"] = str(
+            existing.get("occurred_at")
+            or envelope.get("occurred_at")
+            or memory_timestamps.now_iso()
+        )
         envelope["source"] = str(existing.get("source") or envelope.get("source") or "live_conversation")
         for key in ("status", "importance", "pulse", "last_referenced_at", "is_sensitive", "sensitivity_class"):
             if key not in envelope and key in existing:
@@ -652,7 +678,7 @@ def _memory_upgrade_action(store: UserStore, api_key: str | None, action: dict) 
     if not memory_id:
         return {"status": "error", "error": "memory_id_required", "action": "memory.upgrade"}, [], 400
     v1 = action.get("v1") if isinstance(action.get("v1"), dict) else action
-    inner = _memory_inner_from_action(v1)
+    inner = _memory_inner_from_action(v1, trace_store=store)
     if not inner.get("summary"):
         return {"status": "error", "error": "summary_required", "action": "memory.upgrade"}, [], 400
     if card_guard.guard_enabled() and (
@@ -772,6 +798,13 @@ def _memory_supersede_action(
     old_ids = _memory_supersedes_list(action)
     if not old_ids:
         return {"status": "error", "error": "supersedes_required", "action": "memory.supersede"}, [], 400
+    if len(old_ids) > MAX_MEMORY_SUPERSEDE_TARGETS:
+        return {
+            "status": "error",
+            "error": "too_many_supersedes",
+            "max_supersedes": MAX_MEMORY_SUPERSEDE_TARGETS,
+            "action": "memory.supersede",
+        }, [], 400
 
     mem_type = str(raw.get("type") or "fact").strip().lower()
     summary = str(raw.get("summary") or raw.get("description") or raw.get("title") or "").strip()[:2000]
@@ -823,6 +856,14 @@ def _memory_supersede_action(
     old_cards = [moments[idx] for idx in old_indices]
     if any(old.get("owner_user_id") != store.user_id for old in old_cards):
         return {"status": "error", "error": "not_owned", "action": "memory.supersede"}, [], 403
+    inactive = [str(old.get("id") or "") for old in old_cards if not _memory_supersede_target_is_active(old)]
+    if inactive:
+        return {
+            "status": "error",
+            "error": "supersede_targets_unavailable",
+            "target_ids": inactive,
+            "action": "memory.supersede",
+        }, [], 409
 
     ok, err = _memory_validate_write(store, moments, mem_type=mem_type, anchor_ids=anchor_ids)
     if not ok:
@@ -843,12 +884,14 @@ def _memory_supersede_action(
     if "pulse" not in raw_for_inner and old_cards[0].get("pulse") is not None:
         raw_for_inner["pulse"] = old_cards[0].get("pulse")
 
-    inner = _memory_inner_from_action(raw_for_inner)
+    inner = _memory_inner_from_action(raw_for_inner, trace_store=store)
     envelope, env_err = _build_memory_envelope_for_store(store, inner)
     if envelope is None:
         return {"status": "error", "error": env_err, "action": "memory.supersede"}, [], 409
     envelope["type"] = mem_type
-    envelope["occurred_at"] = _memory_action_text(raw.get("occurred_at") or core_util._now_iso(), 80)
+    envelope["occurred_at"] = _memory_action_occurred_at(
+        raw, default=memory_timestamps.now_iso()
+    )
     envelope["source"] = _memory_action_text(raw.get("source") or action.get("source") or "hosted_runtime_state", 80)
     _memory_apply_v1_metadata(envelope, raw_for_inner, source=envelope["source"])
     envelope["supersedes"] = list(old_ids)
@@ -864,10 +907,19 @@ def _memory_supersede_action(
     with memory_service.mutation_lock(store):
         moments = memory_service._load_moments(store)
         by_id = {m.get("id"): m for m in moments if isinstance(m, dict)}
+        unavailable = [
+            old_id for old_id in old_ids
+            if not _memory_supersede_target_is_active(by_id.get(old_id))
+        ]
+        if unavailable:
+            return {
+                "status": "error",
+                "error": "supersede_targets_changed",
+                "target_ids": unavailable,
+                "action": "memory.supersede",
+            }, [], 409
         for old_id in old_ids:
             retired = by_id.get(old_id)
-            if retired is None:
-                continue
             retired["status"] = "superseded"
             retired["superseded_by"] = new_moment["id"]
             retired["updated_at"] = now
@@ -891,12 +943,13 @@ def _memory_supersede_action(
         "source_chat_message_ids": action.get("source_chat_message_ids") or [],
         "anchor_memory_ids": anchor_ids,
     })
+    retired_ids = [str(doc.get("id") or "") for doc in retired_docs if str(doc.get("id") or "")]
     effect = {
         "type": "memory_superseded",
         "action": "memory.supersede",
         "memory_id": new_moment["id"],
-        "supersedes": old_ids[0] if len(old_ids) == 1 else list(old_ids),
-        "superseded_ids": list(old_ids),
+        "supersedes": retired_ids[0] if len(retired_ids) == 1 else retired_ids,
+        "superseded_ids": retired_ids,
         "fields": ["created", "status", "supersedes", "superseded_by"],
     }
     return {
@@ -904,7 +957,7 @@ def _memory_supersede_action(
         "action": "memory.supersede",
         "memory": {"id": new_moment["id"], "type": mem_type, "occurred_at": new_moment["occurred_at"], "status": "active"},
         "superseded": retired_docs[0] if len(retired_docs) == 1 else retired_docs,
-        "superseded_ids": list(old_ids),
+        "superseded_ids": retired_ids,
         "change": change,
     }, [effect], 201
 
@@ -913,6 +966,13 @@ def _memory_supersede_envelope_action(store: UserStore, action: dict) -> tuple[d
     old_ids = _memory_supersedes_list(action)
     if not old_ids:
         return {"status": "error", "error": "supersedes_required", "action": "memory.supersede"}, [], 400
+    if len(old_ids) > MAX_MEMORY_SUPERSEDE_TARGETS:
+        return {
+            "status": "error",
+            "error": "too_many_supersedes",
+            "max_supersedes": MAX_MEMORY_SUPERSEDE_TARGETS,
+            "action": "memory.supersede",
+        }, [], 400
     envelope = dict(action.get("envelope") or {})
     moments = memory_service._load_moments(store)
     old_indices: list[int] = []
@@ -928,6 +988,14 @@ def _memory_supersede_envelope_action(store: UserStore, action: dict) -> tuple[d
     old_cards = [moments[idx] for idx in old_indices]
     if any(old.get("owner_user_id") != store.user_id for old in old_cards):
         return {"status": "error", "error": "not_owned", "action": "memory.supersede"}, [], 403
+    inactive = [str(old.get("id") or "") for old in old_cards if not _memory_supersede_target_is_active(old)]
+    if inactive:
+        return {
+            "status": "error",
+            "error": "supersede_targets_unavailable",
+            "target_ids": inactive,
+            "action": "memory.supersede",
+        }, [], 409
 
     envelope["supersedes"] = list(old_ids)
     ok, err = _memory_validate_prebuilt_envelope(
@@ -948,10 +1016,19 @@ def _memory_supersede_envelope_action(store: UserStore, action: dict) -> tuple[d
     with memory_service.mutation_lock(store):
         moments = memory_service._load_moments(store)
         by_id = {m.get("id"): m for m in moments if isinstance(m, dict)}
+        unavailable = [
+            old_id for old_id in old_ids
+            if not _memory_supersede_target_is_active(by_id.get(old_id))
+        ]
+        if unavailable:
+            return {
+                "status": "error",
+                "error": "supersede_targets_changed",
+                "target_ids": unavailable,
+                "action": "memory.supersede",
+            }, [], 409
         for old_id in old_ids:
             retired = by_id.get(old_id)
-            if retired is None:
-                continue
             retired["status"] = "superseded"
             retired["superseded_by"] = new_moment["id"]
             retired["updated_at"] = now
@@ -976,12 +1053,13 @@ def _memory_supersede_envelope_action(store: UserStore, action: dict) -> tuple[d
         "source_chat_message_ids": action.get("source_chat_message_ids") or [],
         "anchor_memory_ids": anchor_ids,
     })
+    retired_ids = [str(doc.get("id") or "") for doc in retired_docs if str(doc.get("id") or "")]
     effect = {
         "type": "memory_superseded",
         "action": "memory.supersede",
         "memory_id": new_moment["id"],
-        "supersedes": old_ids[0] if len(old_ids) == 1 else list(old_ids),
-        "superseded_ids": list(old_ids),
+        "supersedes": retired_ids[0] if len(retired_ids) == 1 else retired_ids,
+        "superseded_ids": retired_ids,
         "fields": ["created", "status", "supersedes", "superseded_by"],
     }
     return {
@@ -994,7 +1072,7 @@ def _memory_supersede_envelope_action(store: UserStore, action: dict) -> tuple[d
             "status": new_moment.get("status", "active"),
         },
         "superseded": retired_docs[0] if len(retired_docs) == 1 else retired_docs,
-        "superseded_ids": list(old_ids),
+        "superseded_ids": retired_ids,
         "change": change,
     }, [effect], 201
 

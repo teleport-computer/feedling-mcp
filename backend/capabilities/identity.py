@@ -5,7 +5,7 @@ import json
 
 from core import enclave as core_enclave
 from core import envelope as core_envelope
-from identity import card_view, identity_core
+from identity import card_policy, card_view, identity_core
 
 from capabilities import errors
 from capabilities.types import CapabilityResult, ok, err
@@ -224,3 +224,38 @@ def nudge(store, *, api_key=None, runtime_token=None, params=None) -> Capability
     body, status = identity_core.run_actions(store, payload, api_key=api_key,
                                              runtime_token=runtime_token or "")
     return _norm(body, status, default_msg="identity nudge unavailable")
+
+
+def set_dimensions(
+    store, *, api_key=None, runtime_token=None, params=None
+) -> CapabilityResult:
+    """Replace the complete dimensions list without touching profile fields."""
+    params = params or {}
+    dimensions = params.get("dimensions")
+    valid, validation_error = card_policy.validate_dimensions_structure(dimensions)
+    if not valid:
+        return err(
+            errors.INVALID,
+            f"identity_dimensions_set: {validation_error}",
+            retryable=False,
+        )
+    reason = params.get("reason")
+    if not isinstance(reason, str) or not reason.strip():
+        return err(
+            errors.INVALID,
+            "identity_dimensions_set requires a non-empty reason explaining "
+            "the user-requested rewrite",
+            retryable=False,
+        )
+    action = {
+        "type": "identity.dimensions_set",
+        "dimensions": dimensions,
+        "reason": reason.strip(),
+    }
+    body, status = identity_core.run_actions(
+        store,
+        {"action": action},
+        api_key=api_key,
+        runtime_token=runtime_token or "",
+    )
+    return _norm(body, status, default_msg="identity dimensions rewrite unavailable")

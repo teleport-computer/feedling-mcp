@@ -2,6 +2,7 @@ import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 from capabilities import tool_schema, registry
+from identity import card_policy
 from perception.agent_fields import (
     AGENT_PERCEPTION_SIGNALS,
     AGENT_SIGNAL_FIELDS,
@@ -29,6 +30,48 @@ def test_reply_tool_schema_shape():
     reply = next(s for s in tool_schema.build_tool_specs() if s.name == "reply")
     assert reply.parameters["required"] == ["text"]
     assert reply.parameters["properties"]["text"]["type"] == "string"
+
+
+def test_t101_reply_description_keeps_progress_separate_from_final_reply():
+    description = next(
+        spec.description for spec in tool_schema.build_tool_specs()
+        if spec.name == "reply"
+    )
+
+    assert "long-running task" in description
+    assert "immediate reply bubble" in description
+    assert "not the final reply" in description
+    assert "must not include <think>" in description
+    assert "must not replace the final reply" in description
+
+
+def test_t101_perception_and_screen_gates_reach_final_tool_descriptions():
+    descriptions = {
+        spec.name: spec.description for spec in tool_schema.build_tool_specs()
+    }
+
+    for name in (
+        "perception_recent_apps",
+        "perception_trend",
+        "perception_history",
+    ):
+        description = descriptions[name]
+        assert "user's request depends on their current device" in description
+        assert "do not call for unrelated conversation" in description
+
+    screen_description = descriptions["screen_recent"]
+    assert "plausibly refers to a shared screen" in screen_description
+    assert "do not call for unrelated conversation" in screen_description
+
+
+def test_t101_identity_patch_redirects_dimensions_to_the_owned_tool():
+    description = next(
+        spec.description for spec in tool_schema.build_tool_specs()
+        if spec.name == "identity_patch"
+    )
+
+    assert "Dimensions are not managed by this tool" in description
+    assert "use identity_dimensions_set" in description
 
 
 def test_screen_read_description_defaults_live_shares_to_pixels():
@@ -273,6 +316,96 @@ def test_identity_nudge_is_model_facing_and_requires_dimension_and_delta():
     assert tool_schema.validate_tool_args("identity_nudge", {"dimension": "warmth", "delta": True}) is not None
     assert "unknown field" in tool_schema.validate_tool_args(
         "identity_nudge", {"dimension": "warmth", "delta": 1, "x": 1})
+
+
+def test_identity_dimensions_set_schema_uses_card_policy_contract():
+    spec = next(
+        item for item in tool_schema.build_tool_specs()
+        if item.name == "identity_dimensions_set"
+    )
+    dimensions_schema = spec.parameters["properties"]["dimensions"]
+    value_schema = dimensions_schema["items"]["properties"]["value"]
+    assert spec.parameters["required"] == ["dimensions", "reason"]
+    assert dimensions_schema["maxItems"] == card_policy.MAX_DIMENSIONS
+    assert value_schema["minimum"] == card_policy._VALUE_MIN
+    assert value_schema["maximum"] == card_policy._VALUE_MAX
+    assert "description" in dimensions_schema["items"]["properties"]
+
+    midpoint = (card_policy._VALUE_MIN + card_policy._VALUE_MAX) // 2
+    valid = {"dimensions": [
+        {"name": "minimum", "value": card_policy._VALUE_MIN},
+        {"name": "middle", "value": midpoint},
+        {"name": "maximum", "value": card_policy._VALUE_MAX},
+    ], "reason": "user requested these values"}
+    assert tool_schema.validate_tool_args("identity_dimensions_set", valid) is None
+    assert tool_schema.validate_tool_args(
+        "identity_dimensions_set",
+        {"dimensions": [], "reason": "user requested deletion"},
+    ) is None
+    assert tool_schema.validate_tool_args(
+        "identity_dimensions_set", {"dimensions": []}
+    ) == "missing required field: reason"
+    assert tool_schema.validate_tool_args(
+        "identity_dimensions_set", {"dimensions": [], "reason": "   "}
+    ) == "identity_dimensions_set requires a non-empty reason"
+
+
+def test_identity_dimensions_set_schema_rejects_shared_policy_failures():
+    too_many = [
+        {"name": f"dimension-{index}", "value": card_policy._VALUE_MIN}
+        for index in range(card_policy.MAX_DIMENSIONS + 1)
+    ]
+    assert tool_schema.validate_tool_args(
+        "identity_dimensions_set", {"dimensions": too_many, "reason": "rewrite"}
+    ) == "too_many_dimensions"
+    assert tool_schema.validate_tool_args(
+        "identity_dimensions_set",
+        {"dimensions": [
+            {"name": "same", "value": card_policy._VALUE_MIN},
+            {"name": "SAME", "value": card_policy._VALUE_MAX},
+        ], "reason": "rewrite"},
+    ) == "dimension_name_duplicate"
+    for invalid_value in (
+        card_policy._VALUE_MIN - 1,
+        card_policy._VALUE_MAX + 1,
+    ):
+        assert tool_schema.validate_tool_args(
+            "identity_dimensions_set",
+            {
+                "dimensions": [{"name": "range", "value": invalid_value}],
+                "reason": "rewrite",
+            },
+        ) == "dimension_value_out_of_range"
+
+
+def test_identity_dimensions_set_validation_tracks_card_policy_constants(monkeypatch):
+    """A policy mutation must move this tool's gate without a copied validator."""
+    dimensions = [
+        {"name": f"dimension-{index}", "value": card_policy._VALUE_MIN}
+        for index in range(card_policy.MAX_DIMENSIONS + 3)
+    ]
+    monkeypatch.setattr(card_policy, "MAX_DIMENSIONS", len(dimensions) + 5)
+
+    assert card_policy.validate_dimensions_structure(dimensions) == (True, "")
+    assert tool_schema.validate_tool_args(
+        "identity_dimensions_set", {"dimensions": dimensions, "reason": "rewrite"}
+    ) is None
+
+    monkeypatch.setattr(card_policy, "MAX_DIMENSIONS", len(dimensions) - 1)
+
+    assert tool_schema.validate_tool_args(
+        "identity_dimensions_set", {"dimensions": dimensions, "reason": "rewrite"}
+    ) == "too_many_dimensions"
+
+    monkeypatch.setattr(card_policy, "MAX_DIMENSIONS", len(dimensions))
+    monkeypatch.setattr(card_policy, "_VALUE_MAX", card_policy._VALUE_MIN)
+    assert tool_schema.validate_tool_args(
+        "identity_dimensions_set",
+        {
+            "dimensions": [{"name": "range", "value": card_policy._VALUE_MIN + 1}],
+            "reason": "rewrite",
+        },
+    ) == "dimension_value_out_of_range"
 
 
 def test_identity_patch_description_advertises_list_fields_and_ops():

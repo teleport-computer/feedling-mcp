@@ -334,11 +334,11 @@ def test_new_user_send_after_crashed_mutation_runs_one_text_only_recovery_turn(
     async def provider(_config, messages, *, tools=None, **_kwargs):
         names = {spec.name for spec in (tools or [])}
         provider_calls.append({"messages": list(messages), "names": names})
-        assert any(
-            isinstance(message, dict)
-            and message.get("role") == "system"
-            and "RECOVERY SAFETY RULE" in str(message.get("content") or "")
+        assert all(
+            v2_context._RUNTIME_RECOVERY_POLICY
+            not in str(message.get("content") or "")
             for message in messages
+            if isinstance(message, dict) and message.get("role") == "system"
         )
         runtime_blocks = [
             message
@@ -355,6 +355,7 @@ def test_new_user_send_after_crashed_mutation_runs_one_text_only_recovery_turn(
         )
         assert runtime_payload["runtime_control"] == {
             "mutation_recovery_active": True,
+            "recovery_safety_rule": v2_context._RUNTIME_RECOVERY_POLICY,
         }
         if len(provider_calls) == 1:
             assert names.isdisjoint(cap_registry.WRITE_ACTIONS)
