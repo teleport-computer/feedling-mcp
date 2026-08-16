@@ -468,3 +468,59 @@ anthropic 尤其要紧:那是**用户可以自己填官方 key 的一等选项**
   ②把某家错翻成 OpenAI 形状 → 该家用例红(**这条最重要** —— 发出去一个对方
   不认的 payload,可能被静默忽略,和没发一样,只测「发了没」抓不到)。
 - 常量/集合从模块读取,测试不得写死 provider 名单。
+
+## B4-2 第二步(#17 续)实测数据 + 设计调查(claude2 2026-08-17)
+
+### 实测:出口给了,一部分模型用、一部分不用
+
+test 环境真实模型探针(每格 seed 一轮对话 + 连续 4 次强制唤醒),
+admin 侧 `v2_wake_activity.recent_silences` 拆分:
+
+| 模型 | 说话/沉默 | 走 stay_silent 吗 |
+|---|---|---|
+| `deepseek/deepseek-v4-flash-0731` | 0 / 4 | ✅ `wake_result=sleep` + 真实理由 |
+| `deepseek-v4-flash` | 0 / 4 | ❌ `recent_silences` 为空 |
+| `anthropic/claude-haiku-4.5` | 1 / 3 | (未取到,环境部署窗口) |
+
+`deepseek-v4-flash-0731` 的理由原文(证明它真的读了 attention_facts 和时间锚点):
+
+> 「他上一句刚回完还在瘫着，凌晨一点多不该打扰，等他先开口。」
+> 「他几分钟前才回过话还在缓，凌晨一点多了，不打断他瘫着歇着。」
+
+**结论:B4-2 第一步对至少一部分弱模型确实有效** —— 这个模型写不出 `<think>`,
+但调得动工具。**但不是所有弱模型都会用这个出口。**
+
+### 唤醒轮的四种结局,③④ 目前混在一起
+
+    ① 说了话                          → 有可见文本
+    ② 调了 stay_silent                → wake_result=sleep + 理由
+    ③ thinking-only 干净沉默          → 合法沉默(worker.py:7925 _st_wake.SILENT)
+    ④ 什么都没有(无文本/无 think/无工具) → **不明**,当前被当成 ③ 放过
+
+`deepseek-v4-flash` 落在 ④。
+
+### 两条实现路线的调查结果
+
+**路线 A:`tool_choice` 强制二选一 —— 不建议**
+- 终局轮当前是 `tool_choice="none"`(只准出文本,`tool_loop.py:1197`)
+- provider 层**没有 required/any 模式** —— 要再补一轮三家 wire 翻译
+- 且要把唤醒的输出路径从「文本」改成「必须调工具」,影响**所有**唤醒
+- 收益只针对少数不用新出口的模型,**改动面与收益严重不匹配**
+
+**路线 B:对结局 ④ 注入一次有界纠正 —— 建议**
+- 复用已有机制:`empty_response_correction` + `empty_response_retry_instruction`
+- ⚠️ **但不能直接开**:该路径的闸是
+  `semantic_empty = bool(envelope or reasoning or stop_reason)`
+  (`tool_loop.py:1533`),而唤醒道传 `require_reply=False`
+  (「weak wake sleeps」),空回复被直接接受,**纠正根本不会触发**
+- 所以要做的是:给唤醒道一个**只对结局 ④** 生效的纠正开关,
+  且**必须绕开 ③** —— thinking-only 是合法沉默,不能被纠正打扰
+- 纠正文案的语义应是「**明确选一个**」:要么说话,要么调 stay_silent 并写理由。
+  **不强制沉默、也不强制说话** —— 符合本规格的「补能力,不补判断」
+
+### 未决
+
+路线 B 的关键难点是**在不误伤 ③ 的前提下识别 ④**。
+`_st_wake.SILENT`(干净 think 块)与「彻底空」在 tool_loop 层是同一个「无文本」;
+区分点在 worker 的 `split/strip_all_thinking` 结果,不在 tool_loop。
+实现时需要把这个区分**从 worker 传下去**,或者把纠正判定上移到 worker。
