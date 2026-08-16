@@ -384,6 +384,27 @@ def test_anthropic_payload_encodes_tool_choice_none_with_tools():
     assert payload["tool_choice"] == {"type": "none"}
 
 
+def test_provider_specific_named_tool_choice_wire_shapes():
+    choice = {"type": "function", "function": {"name": "workspace_write"}}
+    tool = ToolSpec("workspace_write", "write", {"type": "object", "properties": {}})
+    anthropic, _url, _headers = pc._build_anthropic_payload(
+        model="claude-opus-4-8", base_url="https://api.anthropic.com/v1", key="k",
+        messages=[{"role": "user", "content": "write"}], max_tokens=700,
+        temperature=None, response_format=None, tools=[tool], tool_choice=choice)
+    assert anthropic["tool_choice"] == {"type": "tool", "name": "workspace_write"}
+    gemini, _url, _headers = pc._build_gemini_payload(
+        model="gemini-2.5-pro", base_url="https://generativelanguage.googleapis.com/v1beta", key="k",
+        messages=[{"role": "user", "content": "write"}], max_tokens=700,
+        temperature=None, response_format=None, tools=[tool], tool_choice=choice)
+    assert gemini["toolConfig"]["functionCallingConfig"] == {
+        "mode": "ANY", "allowedFunctionNames": ["workspace_write"]}
+    bedrock, _url, _headers = pc._build_bedrock_payload(
+        model="anthropic.claude-3", base_url="https://bedrock.example", key="k",
+        messages=[{"role": "user", "content": [{"text": "write"}]}], max_tokens=700,
+        temperature=None, response_format=None, tools=[tool], tool_choice=choice)
+    assert bedrock["toolConfig"]["toolChoice"] == {"tool": {"name": "workspace_write"}}
+
+
 def test_parse_openai_compat_body_result_shape():
     resp = FakeResponse(200, {
         "id": "chatcmpl-1",

@@ -132,9 +132,12 @@ from memory.capture_prompt_v1 import (
 from identity.user_naming import transcript_speaker_label
 from memory_garden.text.card_text import (
     build_truncation_retry_prompt,
+    card_text_rejection,
     count_user_token_residuals,
     is_retryable_parse_error,
+    sanitize_card_labels,
 )
+from memory_garden.text import card_guard
 from memory_garden.guards import dream_gates as memory_dream_gates
 from memory.dream_prompt_v1 import (
     build_dream_prompt,
@@ -4798,6 +4801,24 @@ def _memory_tool_actions(raw_actions) -> list[dict]:
         )
         if threads_raw is not None:
             inner["threads"] = list(threads_raw)
+        guard_on = card_guard.guard_enabled()
+        rejection = card_text_rejection(
+            summary=summary,
+            content=content or summary,
+            guard=guard_on,
+        )
+        if rejection:
+            raise ValueError(f"memory_card_rejected:{rejection}")
+        bucket, clean_threads, _label_reasons = sanitize_card_labels(
+            bucket=str(inner.get("bucket") or ""),
+            threads=list(inner.get("threads") or []),
+            guard=guard_on,
+            lang_text=f"{summary}\n{content}",
+        )
+        if bucket:
+            inner["bucket"] = bucket
+        if threads_raw is not None:
+            inner["threads"] = clean_threads
         # 评分同理:同样要区分「没传」(继承旧卡)和「传了」。⚠️ 不能用 `or`——
         # importance=0 / pulse=0 是合法取值,`or` 会把它们吞成没传。
         for score in ("importance", "pulse"):
@@ -6949,6 +6970,7 @@ async def _run_wake(
     """
     push_slot: dict | None = None
     shadow_decision_allowed: bool | None = None
+    stay_silent_reason: str | None = None
     language_user_rows: list[dict] = []
     try:
         store = core_store.get_store(user_id)
@@ -8543,12 +8565,18 @@ async def _run_wake(
                 screen_vision_verdict,
             )
 
+        async def _on_stay_silent(reason: str) -> None:
+            nonlocal stay_silent_reason, shadow_decision_allowed
+            stay_silent_reason = str(reason or "").strip()[:500]
+            shadow_decision_allowed = False
+
         try:
             await v2_tool_loop.run_tool_loop(
                 provider_config=provider_config,
                 build_messages=build_messages,
                 suppress_native_reasoning=_st_wake_loop.enabled(),
                 disabled_tool_names=wake_disabled_tool_names,
+                on_stay_silent=(_on_stay_silent if lane != "scheduled" else None),
                 memory_delete_allowed=False,
                 dispatch_tools=_dispatch_tools,
                 on_reply=_on_reply,
@@ -8677,6 +8705,8 @@ async def _run_wake(
                 completed_perception_glance_fingerprint=(
                     completed_glance_fingerprint
                 ),
+                wake_result=("sleep" if stay_silent_reason is not None else None),
+                wake_result_reason=stay_silent_reason,
             )
             heartbeat_terminalized = completed
         else:
@@ -8691,6 +8721,8 @@ async def _run_wake(
                 job_id,
                 claimed_by=claimed_by,
                 clear_wake_backoff=(lane in _FAIL_BACKOFF_WAKE_LANES),
+                wake_result=("sleep" if stay_silent_reason is not None else None),
+                wake_result_reason=stay_silent_reason,
             )
             if lane == "heartbeat":
                 heartbeat_terminalized = transitioned

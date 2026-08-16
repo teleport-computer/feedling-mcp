@@ -1843,7 +1843,21 @@ def test_same_batch_memory_search_reuses_same_query(monkeypatch):
     assert outcome.final_text == "direct answer"
 
 
-def test_openrouter_file_recovery_forces_write_then_send_file(monkeypatch):
+@pytest.mark.parametrize(
+    "provider_name, supports_named_choice",
+    [
+        ("openai", True),
+        ("openrouter", True),
+        ("openai_compatible", True),
+        ("deepseek", True),
+        ("anthropic", True),
+        ("gemini", True),
+        ("bedrock", True),
+    ],
+)
+def test_file_recovery_tool_choice_dispatches_by_provider_capability(
+    monkeypatch, provider_name, supports_named_choice
+):
     provider = _ScriptedProvider([
         {"reply": "# draft", "tool_calls": [], "usage": {}},
         {
@@ -1895,7 +1909,7 @@ def test_openrouter_file_recovery_forces_write_then_send_file(monkeypatch):
         surfaces.append(detail)
 
     config = provider_client.ProviderConfig(
-        provider="openrouter",
+        provider=provider_name,
         model="deepseek/deepseek-v4-flash",
         api_key="test-key",
     )
@@ -1913,15 +1927,22 @@ def test_openrouter_file_recovery_forces_write_then_send_file(monkeypatch):
     ))
 
     assert [tc.name for tc in dispatched] == ["workspace_write"]
-    assert provider.calls[1]["tool_choice"] == {
+    expected_choice = {
         "type": "function",
         "function": {"name": "workspace_write"},
     }
+    if supports_named_choice:
+        assert provider.calls[1]["tool_choice"] == expected_choice
+    else:
+        assert "tool_choice" not in provider.calls[1]
     assert [spec.name for spec in provider.calls[1]["tools"]] == ["workspace_write"]
-    assert provider.calls[2]["tool_choice"] == {
-        "type": "function",
-        "function": {"name": "send_file"},
-    }
+    if supports_named_choice:
+        assert provider.calls[2]["tool_choice"] == {
+            "type": "function",
+            "function": {"name": "send_file"},
+        }
+    else:
+        assert "tool_choice" not in provider.calls[2]
     assert [spec.name for spec in provider.calls[2]["tools"]] == ["send_file"]
     assert files == [("/workspace/summary.md", 1)]
     assert outcome.final_text == "文档已生成。"
@@ -2812,3 +2833,46 @@ def test_superseded_image_final_folds_like_a_text_final_not_a_turn_failure(monke
     # 被抢占的那轮**没有**变成异常,而是回到外层重答了新的对话
     assert published == [("刚说到哪儿了?", True, ())]
     assert outcome.stop_reason != "final_media"
+def test_stay_silent_is_offered_only_with_callback_and_ends_wake(monkeypatch):
+    provider = _ScriptedProvider([{
+        "reply": "",
+        "tool_calls": [{"id": "s1", "name": "stay_silent", "args": {"reason": "刚主动说过话"}}],
+        "usage": {},
+    }])
+    monkeypatch.setattr(provider_client, "chat_completion_async", provider)
+    reasons = []
+
+    async def on_stay_silent(reason):
+        reasons.append(reason)
+
+    outcome = asyncio.run(tool_loop.run_tool_loop(
+        provider_config=_TEST_PROVIDER_CONFIG,
+        build_messages=_RecordingBuildMessages(),
+        dispatch_tools=_RecordingDispatch(),
+        on_reply=_RecordingReply(),
+        on_stay_silent=on_stay_silent,
+        fold_new_messages=_RecordingFold([]),
+        add_usage=_noop_add_usage,
+        max_calls=2,
+        require_reply=False,
+    ))
+
+    assert "stay_silent" in {spec.name for spec in provider.calls[0]["tools"]}
+    assert reasons == ["刚主动说过话"]
+    assert outcome.stop_reason == "stay_silent"
+    assert outcome.final_text == ""
+
+
+def test_stay_silent_is_hidden_without_callback(monkeypatch):
+    provider = _ScriptedProvider([{"reply": "done", "tool_calls": [], "usage": {}}])
+    monkeypatch.setattr(provider_client, "chat_completion_async", provider)
+    asyncio.run(tool_loop.run_tool_loop(
+        provider_config=_TEST_PROVIDER_CONFIG,
+        build_messages=_RecordingBuildMessages(),
+        dispatch_tools=_RecordingDispatch(),
+        on_reply=_RecordingReply(),
+        fold_new_messages=_RecordingFold([]),
+        add_usage=_noop_add_usage,
+        max_calls=2,
+    ))
+    assert "stay_silent" not in {spec.name for spec in provider.calls[0]["tools"]}

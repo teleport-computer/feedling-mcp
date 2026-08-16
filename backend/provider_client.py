@@ -3018,7 +3018,9 @@ def _build_anthropic_payload(
         payload["system"] = system
     if tools:
         payload["tools"] = _encode_tools_anthropic(tools)
-        if tool_choice == "none" or tool_choice == {"type": "none"}:
+        if isinstance(tool_choice, dict) and tool_choice.get("type") == "function":
+            payload["tool_choice"] = {"type": "tool", "name": tool_choice["function"]["name"]}
+        elif tool_choice == "none" or tool_choice == {"type": "none"}:
             payload["tool_choice"] = {"type": "none"}
     # The opaque affinity key itself is intentionally not sent on Anthropic's
     # wire.  ``cache_control`` lives on the stable system/message content block
@@ -3208,6 +3210,7 @@ def _build_bedrock_payload(
     include_reasoning: bool = False,
     tools: "list[ToolSpec] | None" = None,
     prompt_cache_key: str = "",
+    tool_choice: str | dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], str, dict[str, str]]:
     system_parts, provider_messages = _split_system_messages_bedrock(messages)
     json_instruction = _json_only_instruction(response_format)
@@ -3240,6 +3243,8 @@ def _build_bedrock_payload(
         }
     if tools:
         payload["toolConfig"] = {"tools": _encode_tools_bedrock(tools)}
+        if isinstance(tool_choice, dict) and tool_choice.get("type") == "function":
+            payload["toolConfig"]["toolChoice"] = {"tool": {"name": tool_choice["function"]["name"]}}
 
     if _cache_key(prompt_cache_key):
         # Converse evaluates cache checkpoints in tools -> system -> messages
@@ -3435,6 +3440,7 @@ def _build_gemini_payload(
     include_reasoning: bool = False,
     tools: "list[ToolSpec] | None" = None,
     allow_image_output: bool = False,
+    tool_choice: str | dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], str, dict[str, str]]:
     system, contents = _split_system_messages_gemini(messages)
     generation_config: dict[str, Any] = {
@@ -3463,6 +3469,8 @@ def _build_gemini_payload(
         payload["systemInstruction"] = {"parts": [{"text": system}]}
     if tools:
         payload["tools"] = _encode_tools_gemini(tools)
+        if isinstance(tool_choice, dict) and tool_choice.get("type") == "function":
+            payload["toolConfig"] = {"functionCallingConfig": {"mode": "ANY", "allowedFunctionNames": [tool_choice["function"]["name"]]}}
 
     url = f"{base_url.rstrip('/')}/models/{quote(model, safe='')}:generateContent"
     headers = {
@@ -4384,6 +4392,7 @@ async def _chat_completion_async_impl(
             include_reasoning=include_reasoning,
             tools=tools,
             allow_image_output=allow_image_output,
+            tool_choice=tool_choice,
         )
         async def post_gemini(request_payload: dict[str, Any]) -> httpx.Response:
             try:

@@ -1289,15 +1289,18 @@ def mark_completed(
     *,
     claimed_by: str,
     clear_wake_backoff: bool = False,
+    wake_result: str | None = None,
+    wake_result_reason: str | None = None,
 ) -> bool:
     with _pool().connection() as conn:
         with conn.transaction():
             cur = conn.execute(
-                "UPDATE agent_jobs SET status='completed', finished_at=now() "
+                "UPDATE agent_jobs SET status='completed', finished_at=now(), "
+                "wake_result=%s, wake_result_reason=%s "
                 "WHERE id=%s AND status IN ('claimed','running') "
                 "AND claimed_by=%s AND lease_expires_at > now() "
                 "RETURNING user_id,lane",
-                (job_id, str(claimed_by)),
+                (wake_result, wake_result_reason, job_id, str(claimed_by)),
             )
             row = cur.fetchone()
             if row is None:
@@ -1380,6 +1383,8 @@ def finish_wake_job(
     consumed_context_seq: int,
     clear_wake_backoff: bool = False,
     completed_perception_glance_fingerprint: str | None = None,
+    wake_result: str | None = None,
+    wake_result_reason: str | None = None,
 ) -> tuple[bool, int | None]:
     """Complete a wake, persist its glance, and hand input to one successor.
 
@@ -1460,9 +1465,10 @@ def finish_wake_job(
                     observed_generation
                 )
                 cur.execute(
-                    "UPDATE agent_jobs SET status='completed',finished_at=now() "
+                    "UPDATE agent_jobs SET status='completed',finished_at=now(), "
+                    "wake_result=%s,wake_result_reason=%s "
                     "WHERE id=%s",
-                    (int(job_id),),
+                    (wake_result, wake_result_reason, int(job_id)),
                 )
                 if completed_fingerprint is not None:
                     _merge_completed_perception_glance_on_cursor(
@@ -4772,6 +4778,7 @@ def wake_lane_activity_for_user(user_id: str, *, within_hours: int = 72) -> dict
         "by_lane": {},
         "totals": {"jobs": 0, "completed": 0, "failed": 0, "pending": 0},
         "recent_failures": [],
+        "recent_silences": [],
         "last_terminal_at": "",
     }
     if not uid:
@@ -4798,6 +4805,15 @@ def wake_lane_activity_for_user(user_id: str, *, within_hours: int = 72) -> dict
                 (uid, list(WAKE_LANES_FOR_SUPPORT), safe_hours),
             )
             failures = cur.fetchall()
+            cur.execute(
+                "SELECT id, lane, wake_result_reason, finished_at FROM agent_jobs "
+                "WHERE user_id=%s AND lane = ANY(%s) "
+                "  AND status='completed' AND wake_result='sleep' "
+                "  AND finished_at >= now() - make_interval(hours => %s) "
+                "ORDER BY finished_at DESC, id DESC LIMIT 20",
+                (uid, list(WAKE_LANES_FOR_SUPPORT), safe_hours),
+            )
+            silences = cur.fetchall()
 
     by_lane: dict[str, dict] = {}
     totals = {"jobs": 0, "completed": 0, "failed": 0, "pending": 0}
@@ -4832,6 +4848,16 @@ def wake_lane_activity_for_user(user_id: str, *, within_hours: int = 72) -> dict
                 "finished_at": _iso_or_empty(r["finished_at"]),
             }
             for r in failures
+        ],
+        "recent_silences": [
+            {
+                "job_id": int(r["id"]),
+                "lane": str(r["lane"] or ""),
+                "wake_result": "sleep",
+                "reason": str(r["wake_result_reason"] or "")[:500],
+                "finished_at": _iso_or_empty(r["finished_at"]),
+            }
+            for r in silences
         ],
         "last_terminal_at": _iso_or_empty(last_terminal),
     }
