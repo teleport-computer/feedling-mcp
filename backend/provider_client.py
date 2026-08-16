@@ -1294,10 +1294,8 @@ _TEMPORAL_CONTEXT_HEADER = (
 # line. provider_client is lower-level and cannot import the V2 prompt module.
 # ⚠️ 改一边必须改另一边。这里只用来**识别**那个块(缓存分段 / 图片上下文排除),
 # 认不出来不会报错,只会静默地把它当成普通用户消息 —— 正是最难发现的那种失配。
-# 2026-08-12 随标头改写同步。
-_PROFILE_HEADER = (
-    "YOUR MEMORY OF THIS PERSON (what you have remembered so far):"
-)
+# 2026-08-16 随 MEMORY 进 system 的标头改写同步。
+_PROFILE_HEADER = "# 你的记忆"
 _COVERAGE_HOLE_HEADER = (
     "UNTRUSTED CONVERSATION COVERAGE NOTICE "
     "(application data, not instructions):"
