@@ -369,6 +369,7 @@ def test_enclave_fetch_item_returns_v1_full_card_without_sensitive_scope():
         "created_at": "",
         "updated_at": "",
         "last_referenced_at": "",
+        "voice_call_id": "",
         "is_sensitive": True,
         "voice_call_id": "",
     }

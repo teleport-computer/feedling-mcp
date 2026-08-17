@@ -7,17 +7,16 @@ responses. No ``flask.request`` here — every route reads already-parsed params
 the resolved store (and, for the enclave proxies, the caller's credential) as
 explicit arguments.
 
-E2E boundary (unchanged): frames are v1 E2E envelopes. The server NEVER decrypts
-them.
+Content boundary: encrypted-tier frames remain v1 E2E envelopes; plaintext-tier
+frames are strict ``body_b64`` envelopes and are decoded locally.
 
-  - ``serve_frame`` / ``frame_envelope`` return the opaque envelope JSON
-    (``body_ct`` ciphertext) verbatim — no decryption.
+  - ``serve_frame`` / ``frame_envelope`` return the stored shape verbatim.
   - ``frame_decrypt`` / ``frame_image`` are pure PROXIES to the enclave: they
     forward the caller's credential (runtime token OR api key, runtime token
     winning — mirroring the old ``_enclave_forward_auth``) to the enclave's own
     ``/decrypt`` / ``/image`` endpoint and stream its bytes/status/headers back.
-    Decryption happens INSIDE the enclave; this process only relays ciphertext
-    requests and opaque response bytes. No plaintext is produced server-side.
+    Encrypted decryption happens INSIDE the enclave; plaintext-tier reads bypass
+    that proxy and decode inside the managed service boundary.
 
 All store / DB / enclave work is blocking, so ASGI callers run these through
 ``threadpool.run_db`` off the event loop (plan §5.2).
@@ -25,6 +24,7 @@ All store / DB / enclave work is blocking, so ASGI callers run these through
 
 from __future__ import annotations
 
+import base64
 import json
 import logging
 import os
@@ -339,8 +339,27 @@ def frame_decrypt(
     credential + the ``include_image`` flag and relays the enclave's response
     bytes/status/content-type. No plaintext is produced here.
     """
-    if not frames._frame_exists(store, frame_id):
+    env = db.frame_get(store.user_id, frame_id)
+    if env is None:
         return ScreenResult(404, json_body={"error": "not found"})
+    inner = frames._read_plaintext_frame(env)
+    if inner is not None:
+        include = str(include_image).lower() != "false"
+        result = {
+            "id": frame_id, "ts": inner.get("ts") or env.get("ts"),
+            "app": inner.get("app"), "bundle": inner.get("bundle"),
+            "ocr_text": inner.get("ocr_text", ""), "urls": inner.get("urls", []),
+            "w": inner.get("w", 0), "h": inner.get("h", 0),
+            "tier_hint": inner.get("tier_hint"), "v": int(env.get("v", 1)),
+            "owner_user_id": store.user_id, "decrypt_status": "plaintext",
+        }
+        if include:
+            result["image_b64"] = inner.get("image", "")
+            result["image_mime"] = inner.get("image_mime") or "image/jpeg"
+        else:
+            result["image_b64"] = None
+            result["image_bytes_omitted"] = True
+        return ScreenResult(200, json_body=result)
 
     enclave_url = os.environ.get("FEEDLING_ENCLAVE_URL", "").rstrip("/")
     if not enclave_url:
@@ -401,8 +420,18 @@ def frame_image(
     Returns the enclave's Content-Type image/jpeg with Accept-Ranges: bytes (and
     Content-Range on 206). The enclave owns decryption; this only relays bytes.
     """
-    if not frames._frame_exists(store, frame_id):
+    env = db.frame_get(store.user_id, frame_id)
+    if env is None:
         return ScreenResult(404, json_body={"error": "not found"})
+    inner = frames._read_plaintext_frame(env)
+    if inner is not None:
+        try:
+            image = base64.b64decode(str(inner.get("image") or ""), validate=True)
+        except Exception:
+            return ScreenResult(502, json_body={"error": "image_b64_decode"})
+        return ScreenResult(200, raw_body=image,
+                            media_type=str(inner.get("image_mime") or "image/jpeg"),
+                            headers={"Accept-Ranges": "bytes", "Content-Length": str(len(image))})
 
     enclave_url = os.environ.get("FEEDLING_ENCLAVE_URL", "").rstrip("/")
     if not enclave_url:

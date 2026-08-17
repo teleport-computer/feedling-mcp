@@ -1,6 +1,5 @@
 """Memory write actions (add / patch / retype / delete) + executor."""
 
-import hashlib
 import json
 import logging
 import re
@@ -12,7 +11,6 @@ import debug_trace
 from core.store import UserStore
 
 from bootstrap import gates as boot_gates
-from core import enclave as core_enclave
 from core import envelope as core_envelope
 from core import util as core_util
 from identity import service as identity_service
@@ -236,7 +234,7 @@ def _memory_plain_from_envelope(moment: dict, api_key: str | None, runtime_token
     if moment.get("visibility") == "local_only":
         return None, "memory_local_only_agent_cannot_read"
     try:
-        raw = core_enclave._decrypt_envelope_via_enclave(
+        raw = core_envelope.read_envelope_body(
             moment, api_key, purpose="memory_action", runtime_token=runtime_token)
         inner = json.loads(raw.decode("utf-8"))
         if not isinstance(inner, dict):
@@ -332,13 +330,16 @@ def _memory_validate_prebuilt_envelope(
     memory_id: str = "",
     enforce_reflection_cap: bool = True,
 ) -> tuple[bool, dict | None]:
-    required = ["body_ct", "nonce", "K_user", "visibility", "owner_user_id"]
+    required, shape_err = core_envelope.upload_shape_gate(
+        envelope, user_id=store.user_id)
+    if shape_err is not None:
+        return False, shape_err
     missing = [field for field in required if not envelope.get(field)]
     if missing:
         return False, {"error": "envelope_missing_fields", "missing": missing}
     if envelope["visibility"] not in ("shared", "local_only"):
         return False, {"error": "envelope_visibility_invalid", "allowed": ["shared", "local_only"]}
-    if envelope["visibility"] == "shared" and not envelope.get("K_enclave"):
+    if core_envelope.requires_enclave_key(envelope):
         return False, {"error": "envelope_shared_requires_K_enclave"}
     occurred_at = memory_timestamps.normalize(
         _memory_action_text(envelope.get("occurred_at"), 80)
@@ -412,15 +413,9 @@ def _memory_record_from_envelope(store: UserStore, envelope: dict, *, existing: 
         "created_at": created_at,
         "updated_at": now,
         "source": str(envelope.get("source") or (existing or {}).get("source") or "live_conversation"),
-        "body_ct": envelope["body_ct"],
-        "nonce": envelope["nonce"],
-        "K_user": envelope["K_user"],
-        "enclave_pk_fpr": envelope.get("enclave_pk_fpr", ""),
-        "visibility": envelope["visibility"],
-        "owner_user_id": envelope["owner_user_id"],
+        "enclave_pk_fpr": "",
+        **core_envelope.envelope_storage_fields(envelope),
     }
-    if envelope.get("K_enclave"):
-        moment["K_enclave"] = envelope["K_enclave"]
     for key in (
         "status",
         "importance",
@@ -596,10 +591,8 @@ def _memory_add_envelope_action(
 
 
 def _memory_body_hash(moment: dict | None) -> str:
-    """Stable CAS token = sha256 of the stored ciphertext. `to_v1_card` never
-    looks inside `body_ct`, so this is invariant across reads until a genuine
-    re-encrypt — exactly what a read-modify-write needs to detect concurrent edits."""
-    return hashlib.sha256(str((moment or {}).get("body_ct") or "").encode("utf-8")).hexdigest()
+    """Stable CAS token over the authoritative persisted content shape."""
+    return core_envelope.envelope_content_token(moment or {})
 
 
 def _memory_upgrade_apply(
@@ -711,12 +704,16 @@ def _memory_upgrade_envelope_action(store: UserStore, action: dict) -> tuple[dic
     if not memory_id:
         return {"status": "error", "error": "memory_id_required", "action": "memory.upgrade"}, [], 400
     envelope = dict(action.get("envelope") or {})
-    missing = [f for f in ("body_ct", "nonce", "K_user", "visibility", "owner_user_id") if not envelope.get(f)]
+    required, shape_err = core_envelope.upload_shape_gate(
+        envelope, user_id=store.user_id)
+    if shape_err is not None:
+        return {"status": "error", **shape_err, "action": "memory.upgrade"}, [], 400
+    missing = [f for f in required if not envelope.get(f)]
     if missing:
         return {"status": "error", "error": "envelope_missing_fields", "missing": missing, "action": "memory.upgrade"}, [], 400
     if envelope["owner_user_id"] != store.user_id:
         return {"status": "error", "error": "not_owned", "action": "memory.upgrade"}, [], 403
-    if envelope["visibility"] == "shared" and not envelope.get("K_enclave"):
+    if core_envelope.requires_enclave_key(envelope):
         return {"status": "error", "error": "envelope_shared_requires_K_enclave", "action": "memory.upgrade"}, [], 400
     old_body_hash = _memory_action_text(action.get("old_body_hash"), 80)
     return _memory_upgrade_apply(store, memory_id=memory_id, envelope=envelope, old_body_hash=old_body_hash)

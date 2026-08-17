@@ -18,6 +18,7 @@ from bootstrap import gates as boot_gates
 from core import util as core_util
 from core import enclave as core_enclave
 from core import envelope as core_envelope
+from identity import card_view
 from identity import service as identity_service
 
 
@@ -242,6 +243,24 @@ def apply_list_ops(existing: dict, patch: dict) -> dict:
 
 def _identity_plain_for_action(store: UserStore, api_key: str | None,
                                runtime_token: str = "") -> tuple[dict | None, str]:
+    stored = identity_service._load_identity(store)
+    shape = core_envelope.classify_envelope_shape(stored)
+    if shape in ("plaintext_text", "plaintext_binary"):
+        try:
+            raw = core_envelope.read_plaintext_envelope_body(
+                stored, owner_user_id=store.user_id)
+            inner = json.loads(raw.decode("utf-8"))
+            if not isinstance(inner, dict):
+                raise ValueError("identity plaintext is not an object")
+            return card_view.plaintext_view(
+                card_view.envelope_base(stored),
+                inner,
+                stored,
+                days_with_user=identity_service._live_days_with_user(
+                    stored, store=store),
+            ), ""
+        except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+            return None, f"identity_plaintext_invalid:{type(exc).__name__}"
     # Only pass runtime_token when present, so the api_key path keeps the original
     # 2-arg call shape (mocks/monkeypatches that predate the runtime_token param).
     if runtime_token:
@@ -333,12 +352,8 @@ def _save_identity_action_payload(
     identity = {
         "v": 1,
         "id": envelope.get("id") or existing.get("id") or uuid.uuid4().hex,
-        "body_ct": envelope["body_ct"],
-        "nonce": envelope["nonce"],
-        "K_user": envelope["K_user"],
-        "enclave_pk_fpr": envelope.get("enclave_pk_fpr", ""),
-        "visibility": envelope["visibility"],
-        "owner_user_id": envelope["owner_user_id"],
+        "enclave_pk_fpr": "",
+        **core_envelope.envelope_storage_fields(envelope),
         "created_at": existing.get("created_at") or now,
         "updated_at": now,
         # replaced_at is the P5 concurrency baseline: it is stamped ONLY by
@@ -479,12 +494,8 @@ def _create_identity_action_payload(
     identity = {
         "v": 1,
         "id": envelope.get("id") or core_util._new_public_id("identity"),
-        "body_ct": envelope["body_ct"],
-        "nonce": envelope["nonce"],
-        "K_user": envelope["K_user"],
-        "enclave_pk_fpr": envelope.get("enclave_pk_fpr", ""),
-        "visibility": envelope["visibility"],
-        "owner_user_id": envelope["owner_user_id"],
+        "enclave_pk_fpr": "",
+        **core_envelope.envelope_storage_fields(envelope),
         "created_at": now,
         "updated_at": now,
         # A create IS a full-card write, so it stamps the replaced_at baseline

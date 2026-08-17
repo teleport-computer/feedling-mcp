@@ -20,7 +20,16 @@ def _route(**overrides):
         "provider": "openai",
         "model": "gpt-image-2",
         "base_url": "https://api.openai.com/v1",
-        "api_key_envelope": {"ciphertext": "sealed"},
+        "api_key_envelope": {
+            "body_ct": "sealed",
+            "nonce": "nonce",
+            "K_user": "user-key",
+            "K_enclave": "enclave-key",
+            "id": "credential-image",
+            "owner_user_id": "image-user",
+            "visibility": "shared",
+            "v": 1,
+        },
         "image_generation_test_status": "ok",
         "last_image_generation_test_error": "",
     }
@@ -265,7 +274,7 @@ def test_resident_generate_uses_only_the_pinned_image_route(monkeypatch):
     ]
     assert decrypted == [
         (
-            {"ciphertext": "sealed"},
+            _route()["api_key_envelope"],
             "caller-key",
             "model_api_provider_key",
             "runtime-token",

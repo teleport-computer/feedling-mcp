@@ -465,6 +465,19 @@ def _safe_job_metadata(metadata: Any) -> dict:
 def _chunk_envelope_meta(store: UserStore, envelope_meta: dict | None, encrypted_body: bytes) -> dict:
     if not isinstance(envelope_meta, dict):
         raise ValueError("chunk_envelope_required")
+    shape_error = core_envelope.validate_uploaded_envelope(
+        envelope_meta, user_id=store.user_id)
+    if shape_error is not None:
+        raise ValueError(str(shape_error.get("error") or "chunk_envelope_invalid"))
+    if envelope_meta.get("body") is not None:
+        if str(envelope_meta.get("body") or "").encode("utf-8") != encrypted_body:
+            raise ValueError("chunk_envelope_body_mismatch")
+        return {
+            "v": int(envelope_meta.get("v") or 1),
+            "id": _text(envelope_meta.get("id"), 160),
+            "visibility": "shared", "owner_user_id": store.user_id,
+            "body_object_format": "plaintext_v1",
+        }
     body_ct = str(envelope_meta.get("body_ct") or "")
     if body_ct:
         if b64decode_required(body_ct) != encrypted_body:
@@ -516,6 +529,9 @@ def chunk_envelope_from_row(chunk: dict) -> dict:
         raise ValueError("chunk_encrypted_body_required")
     if not meta:
         raise ValueError("chunk_envelope_meta_missing")
+    if meta.get("body_object_format") == "plaintext_v1":
+        clean = {k: v for k, v in meta.items() if k != "body_object_format"}
+        return {**clean, "body": bytes(encrypted_body).decode("utf-8")}
     return {**meta, "body_ct": b64encode(bytes(encrypted_body))}
 
 
@@ -578,8 +594,11 @@ def load_genesis_staged_payload(
     envelope = blob.get("content_envelope")
     if not isinstance(envelope, dict):
         raise RuntimeError("staged_import_payload_missing")
-    raw = core_enclave._decrypt_envelope_via_enclave(
-        envelope, api_key, purpose="genesis_staged_payload")
+    try:
+        raw = core_envelope.read_envelope_body(
+            envelope, api_key, purpose="genesis_staged_payload")
+    except ValueError as exc:
+        raise RuntimeError(f"staged_import_envelope_invalid:{exc}") from exc
     if _sha256_hex(raw) != str(blob.get("sha256") or ""):
         raise RuntimeError("staged_import_sha256_mismatch")
     try:
@@ -687,12 +706,15 @@ def load_genesis_checkpoint(
     envelope = blob.get("content_envelope") if isinstance(blob, dict) else None
     if not isinstance(envelope, dict):
         raise RuntimeError("genesis_checkpoint_envelope_missing")
-    raw = core_enclave._decrypt_envelope_via_enclave(
-        envelope,
-        api_key,
-        purpose="genesis_checkpoint",
-        runtime_token=runtime_token,
-    )
+    try:
+        raw = core_envelope.read_envelope_body(
+            envelope,
+            api_key,
+            purpose="genesis_checkpoint",
+            runtime_token=runtime_token,
+        )
+    except ValueError as exc:
+        raise RuntimeError(f"genesis_checkpoint_envelope_invalid:{exc}") from exc
     digest = _sha256_hex(raw)
     if digest != str(blob.get("sha256") or ""):
         raise RuntimeError("genesis_checkpoint_sha256_mismatch")
@@ -1408,7 +1430,23 @@ def _identity_payload_from_existing_plain(identity: dict | None) -> dict:
     return payload
 
 
-def _existing_identity_plain_for_update(api_key: str | None, runtime_token: str = "") -> tuple[dict | None, str]:
+def _existing_identity_plain_for_update(
+    store: UserStore,
+    api_key: str | None,
+    runtime_token: str = "",
+) -> tuple[dict | None, str]:
+    stored = identity_service._load_identity(store)
+    shape = core_envelope.classify_envelope_shape(stored)
+    if shape in ("plaintext_text", "plaintext_binary"):
+        try:
+            raw = core_envelope.read_plaintext_envelope_body(
+                stored, owner_user_id=store.user_id)
+            inner = json.loads(raw.decode("utf-8"))
+            if not isinstance(inner, dict):
+                raise ValueError("identity plaintext is not an object")
+            return inner, ""
+        except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+            return None, f"identity_plain_invalid:{type(exc).__name__}"
     if not api_key and not runtime_token:
         return None, "api_key_unavailable"
     data, err = core_enclave._enclave_get_json_for_gate(
@@ -1449,7 +1487,8 @@ def init_identity_if_absent(
 
     base_payload = {"agent_name": "", "self_introduction": "", "dimensions": []}
     if existing:
-        existing_plain, err = _existing_identity_plain_for_update(api_key, runtime_token)
+        existing_plain, err = _existing_identity_plain_for_update(
+            store, api_key, runtime_token)
         if existing_plain is not None:
             base_payload = _identity_payload_from_existing_plain(existing_plain)
         elif str(existing.get("relationship_anchor_source") or "") != GENESIS_SOURCE:
@@ -1501,12 +1540,8 @@ def init_identity_if_absent(
     identity_doc = {
         "v": 1,
         "id": envelope.get("id") or (existing or {}).get("id") or core_util._new_public_id("identity"),
-        "body_ct": envelope["body_ct"],
-        "nonce": envelope["nonce"],
-        "K_user": envelope["K_user"],
-        "enclave_pk_fpr": envelope.get("enclave_pk_fpr", ""),
-        "visibility": envelope["visibility"],
-        "owner_user_id": envelope["owner_user_id"],
+        "enclave_pk_fpr": "",
+        **core_envelope.envelope_storage_fields(envelope),
         "created_at": (existing or {}).get("created_at") or now,
         "updated_at": now,
         "replaced_at": now,
@@ -1784,7 +1819,8 @@ def replace_identity_preserving_anchor(
             snapshot = identity_service._load_identity(store)
             if not snapshot:
                 return "identity_not_initialized"
-            existing_plain, _plain_err = _existing_identity_plain_for_update(api_key, runtime_token)
+            existing_plain, _plain_err = _existing_identity_plain_for_update(
+                store, api_key, runtime_token)
             if existing_plain is None:
                 return "identity_plain_unavailable"
 
@@ -1805,12 +1841,8 @@ def replace_identity_preserving_anchor(
                 **snapshot,
                 "v": 1,
                 "id": snapshot.get("id") or envelope.get("id") or core_util._new_public_id("identity"),
-                "body_ct": envelope["body_ct"],
-                "nonce": envelope["nonce"],
-                "K_user": envelope["K_user"],
-                "enclave_pk_fpr": envelope.get("enclave_pk_fpr", snapshot.get("enclave_pk_fpr", "")),
-                "visibility": envelope["visibility"],
-                "owner_user_id": envelope["owner_user_id"],
+                "enclave_pk_fpr": snapshot.get("enclave_pk_fpr", ""),
+                **core_envelope.envelope_storage_fields(envelope),
                 "created_at": snapshot.get("created_at") or now,
                 "updated_at": now,
                 "replaced_at": now,

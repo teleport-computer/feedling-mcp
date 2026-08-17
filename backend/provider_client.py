@@ -3022,6 +3022,19 @@ def _build_anthropic_payload(
             payload["tool_choice"] = {"type": "tool", "name": tool_choice["function"]["name"]}
         elif tool_choice == "none" or tool_choice == {"type": "none"}:
             payload["tool_choice"] = {"type": "none"}
+        elif isinstance(tool_choice, dict):
+            function = tool_choice.get("function")
+            name = (
+                str(function.get("name") or "")
+                if isinstance(function, dict)
+                else str(tool_choice.get("name") or "")
+            )
+            if name:
+                payload["tool_choice"] = {"type": "tool", "name": name}
+        elif tool_choice == "required":
+            payload["tool_choice"] = {"type": "any"}
+        elif tool_choice == "auto":
+            payload["tool_choice"] = {"type": "auto"}
     # The opaque affinity key itself is intentionally not sent on Anthropic's
     # wire.  ``cache_control`` lives on the stable system/message content block
     # above; top-level cache_control is not part of the Messages API schema.

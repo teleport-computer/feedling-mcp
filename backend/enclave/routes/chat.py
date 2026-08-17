@@ -51,18 +51,20 @@ def _decrypt_caption(m, authorized_user_id, content_sk, errors):
     """Decrypt the optional caption envelope (user text sent alongside an
     image/file). Returns the caption string, or "" when absent/failed."""
     cap_ct = m.get("caption_body_ct")
-    if not cap_ct:
+    cap_body = m.get("caption_body")
+    if not cap_ct and cap_body is None:
         return ""
     cap_env = {
         "id": m.get("caption_id") or m.get("id"),
         "v": int(m.get("caption_v", m.get("v", 1)) or m.get("v", 1)),
         "body_ct": cap_ct,
+        "body": cap_body,
         "nonce": m.get("caption_nonce"),
         "K_enclave": m.get("caption_K_enclave"),
         "owner_user_id": m.get("caption_owner_user_id") or m.get("owner_user_id"),
     }
     try:
-        return envelope.decrypt_envelope(
+        return envelope.read_envelope(
             cap_env, authorized_user_id, content_sk
         ).decode("utf-8", errors="replace")
     except Exception as e:
@@ -142,7 +144,7 @@ def _decrypt_history_items(messages, authorized_user_id, content_sk):
             continue
 
         try:
-            plaintext = envelope.decrypt_envelope(m, authorized_user_id, content_sk)
+            plaintext = envelope.read_envelope(m, authorized_user_id, content_sk)
             entry: dict = {
                 "id": m["id"],
                 "seq": m.get("seq"),

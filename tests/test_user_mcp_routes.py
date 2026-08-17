@@ -73,7 +73,7 @@ def _fake_envelope(monkeypatch):
 
     monkeypatch.setattr(
         core_envelope, "_build_shared_envelope_for_store",
-        lambda store, raw, item_id=None: ({"v": 1, "id": item_id, "ct": raw.hex()}, ""),
+        lambda store, raw, item_id=None: ({"v": 1, "id": item_id, "body_ct": raw.hex()}, ""),
     )
     # SSRF DNS resolve is environment-dependent; stub the upsert-time guard so
     # these route tests only exercise mcp_routes_asgi wiring.
@@ -252,7 +252,7 @@ def test_patch_read_only_approvals_without_resending_secrets(
         core_enclave,
         "_decrypt_envelope_via_enclave",
         lambda envelope, key, *, purpose, runtime_token="": bytes.fromhex(
-            envelope["ct"]
+            envelope["body_ct"]
         ),
     )
     _, key = _register(client)

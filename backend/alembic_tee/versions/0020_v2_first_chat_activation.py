@@ -1,0 +1,74 @@
+"""Backfill first-chat activation in the TEE primary.
+
+Revision ID: 0020_v2_first_chat_activation
+Revises: 0019_v2_worker_pool_heartbeats
+"""
+
+from alembic import op
+
+
+revision = "0020_v2_first_chat_activation"
+down_revision = "0019_v2_worker_pool_heartbeats"
+branch_labels = None
+depends_on = None
+
+
+_BACKFILL_SQL = """
+WITH first_success AS (
+  SELECT parent.user_id, MIN(reply.ts) AS first_ok_ts
+  FROM chat_messages AS reply
+  JOIN chat_messages AS parent
+    ON parent.user_id=reply.user_id
+   AND parent.msg_id=reply.doc->>'reply_to_message_id'
+  WHERE parent.doc->>'role' IN ('user','human')
+    AND parent.doc->>'source' IN ('chat','model_api')
+    -- The transactional V2 reply sink first existed on 2026-07-15. Bound the
+    -- repair to its full possible lifetime and use ix_chat_messages_ts.
+    AND reply.ts >= EXTRACT(EPOCH FROM TIMESTAMPTZ '2026-07-15 00:00:00+00')
+    AND reply.doc->>'role' IN ('agent','openclaw')
+    AND reply.doc->>'source'='model_api'
+    AND COALESCE(reply.doc->>'turn_failure_error_class','')=''
+  GROUP BY parent.user_id
+), activation AS (
+  SELECT user_id,
+         to_char(
+           timezone('UTC', to_timestamp(first_ok_ts)),
+           'YYYY-MM-DD"T"HH24:MI:SS.US'
+         ) || 'Z' AS first_chat_ok_at
+  FROM first_success
+)
+INSERT INTO user_blobs (user_id,kind,doc)
+SELECT user_id,
+       'proactive_settings',
+       jsonb_build_object(
+         'version', 2,
+         'first_chat_ok_at', first_chat_ok_at,
+         'updated_at', first_chat_ok_at
+       )
+FROM activation
+ON CONFLICT (user_id,kind) DO UPDATE SET doc=
+  user_blobs.doc || EXCLUDED.doc
+WHERE COALESCE(user_blobs.doc->>'first_chat_ok_at','')=''
+"""
+
+_UPDATE_PREPARED_HEAD = """
+UPDATE server_config
+SET value = convert_to(
+  jsonb_set(convert_from(value, 'UTF8')::jsonb, '{tee_heads}',
+            '["0020_v2_first_chat_activation"]'::jsonb)::text,
+  'UTF8'
+)
+WHERE key = 'phase4_primary_prepared'
+  AND COALESCE(convert_from(value, 'UTF8')::jsonb->>'prepared', 'false') = 'true';
+"""
+
+
+def upgrade() -> None:
+    op.execute(_BACKFILL_SQL)
+    op.execute(_UPDATE_PREPARED_HEAD)
+
+
+def downgrade() -> None:
+    raise NotImplementedError(
+        "alembic_tee downgrade is not supported; restore from backup"
+    )

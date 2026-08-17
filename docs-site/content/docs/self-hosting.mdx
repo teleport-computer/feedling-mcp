@@ -31,8 +31,14 @@ per-tenant secrets and storage, or keep the deployment single-tenant.
 
 On a generic VPS, the local enclave service is software/process separation. It
 does not provide Intel TDX attestation or protection from the machine operator.
-Envelope encryption still protects backups and accidental storage exposure, but
-the host operator controls the processes that can request decryption.
+For accounts on the encrypted tier, envelope encryption still protects backups and
+accidental storage exposure, but the host operator controls the processes that can
+request decryption. Accounts on the plaintext tier get no such protection: inline
+bodies are readable in the database, and heavy Chat image/file objects are stored
+as raw bytes in object storage. Database backups, object-storage backups, and
+operators with either form of storage access are plaintext recipients. Decide the
+tier deliberately for the deployment, not per user, when the host operator is not
+the data subject.
 
 ### Managed enclave-domain access is a separate trust model
 
@@ -142,6 +148,7 @@ these settings:
 | Setting | Requirement |
 | --- | --- |
 | `DATABASE_URL` | Required. Use a dedicated PostgreSQL role and database. External connections must use TLS, such as `sslmode=require`, and should verify the server certificate where the environment supports it. |
+| `FEEDLING_DATABASE_SCHEMA` | Defaults to `rds`, which applies the repository's normal Alembic chain at startup. `tee` is reserved for an independently owner-migrated managed database: startup becomes a read-only `alembic_tee_version` head assertion and fails closed on drift. Do not set it merely because PostgreSQL happens to run in a TEE, and never change it without switching every backend/worker DSN in the same maintenance window. |
 | `FEEDLING_HOSTED_RUNTIME_POLICY` | The code default and managed deployments are `dual` (V1 resident supervisor and Runtime V2 coexist behind a per-user fence). The reference self-hosting Compose file pins `v2_only`, a fail-closed override under which resident/per-user selectors are rejected. |
 | `FEEDLING_RUNTIME_TOKEN_SECRET` | Required by the current hosted topology. Generate a high-entropy secret, supply it to the backend and Runtime V2 workers through a secret manager, and never bake it into an image. |
 | `FEEDLING_RUNTIME_TOKEN_SECRET_PREVIOUS` | Optional one-generation rotation bridge for durable Perception anchor fingerprints. Set it to the immediately previous runtime-token secret while rolling out a new `FEEDLING_RUNTIME_TOKEN_SECRET`; keep it until all workers use the new secret. It does not authorize runtime tokens. |
@@ -165,7 +172,7 @@ these settings:
 | `FEEDLING_V2_E2B_ALLOW_INTERNET` | Defaults to `0`. Enabling sandbox internet is a deployment-level trust and egress decision, never a model-selected option. |
 | `FEEDLING_V2_TRAJECTORY_REVIEW_ENABLED` | Defaults to `0`. Encrypted trajectory capture remains on, but provider-backed offline failure review must stay opt-in because it uses the account's configured provider credential and is not a production retry. |
 | `FEEDLING_V2_TRAJECTORY_REVIEW_MAX_ACTIVE` | Must be valid when review is enabled; bounds pending plus running review work across the database-backed fleet. The current default is 64. This is an admission ceiling, not a retention policy. |
-| `FEEDLING_ENCLAVE_URL` | Required for enclave-backed Memory, screen, worldbook, and decrypt operations. Use a private authenticated network path. |
+| `FEEDLING_ENCLAVE_URL` | Required for encrypted-record decrypt operations and enclave-backed screen reads. Plaintext-tier content reads stay local and do not depend on this URL; mixed batches send only their sealed partition. Use a private authenticated network path. |
 | `FEEDLING_DECRYPT_HEALTH_REFRESH_SEC` | Optional resident idle-probe cadence in seconds (default 210, minimum 5). Keep it below the backend's 300-second freshness window *minus one poll round trip* — the probe only runs on an idle poll cycle, so a value near 300 reports stale health and blocks onboarding. |
 | `FEEDLING_DECRYPT_DEGRADE_AFTER` | Optional number of consecutive claimed-but-unreadable messages before the resident reports `degraded` (default 2, minimum 1). A real ordinary user-message decrypt resets the streak; a server maintenance turn does not. |
 | `FEEDLING_RESIDENT_DECRYPT_FAILURE_GRACE_SEC` | Optional backend persistence window before an explicit decrypt failure can inject a maintenance Chat turn for an established resident (default 1800 seconds, minimum 1). New onboarding remains immediately actionable, and all explicit failures can still produce an in-app notice before this window elapses. |
