@@ -686,5 +686,16 @@ perception/service.py:889
 只是没一致地应用到 `trace_id` 上。这让根因从推测变成实证:
 **仓库知道这个手法,只是漏了这一处。**
 
+**⚠️ 本条的验证状态(2026-08-17,claude 主动标注)**:
+「perception 触发的 heartbeat 带 trace_id」是**读代码读出的预测,尚未实弹观测** ——
+部署后 heartbeat 样本只有 2 条且都来自另一条路。**引用时不得当已验证前提。**
+
+**但有一个现成判别器,不用加埋点**:
+```
+serve_worker.py:4792  enqueue_job(uid,"heartbeat")  没传 reason,默认 None → DB 为 NULL
+perception/service.py:892  reason=str(... or "perception_event")[:120]  → 必非空
+```
+→ 在 heartbeat lane 内,**`reason IS NULL` vs `NOT NULL` 即可切开两个入队来源**。
+
 **同族**:模式 24(适配层只翻译一半字段)、模式 22(选错闸不会有测试变红)。
 共同点:**缺失的东西不会主动现身,只有把维度摊成矩阵才看得见空格。**
