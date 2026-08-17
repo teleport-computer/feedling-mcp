@@ -1874,6 +1874,9 @@ class _ProviderRoundtripTrace:
     force_text_fallback_reason: str = "none"
     empty_response_recovery_used: bool = False
 
+    def __post_init__(self) -> None:
+        self.lane = _normalize_provider_trace_lane(self.lane)
+
     async def __call__(self, detail: dict[str, Any]) -> None:
         try:
             self.provider_roundtrips = max(
@@ -1884,11 +1887,13 @@ class _ProviderRoundtripTrace:
             pass
         if detail.get("terminal_text_round") is True:
             self.terminal_text_round_reached = True
-            self.terminal_text_round_reason = str(
-                detail.get("terminal_text_round_reason") or "none"
+            self.terminal_text_round_reason = _normalize_provider_trace_reason(
+                detail.get("terminal_text_round_reason"),
+                v2_tool_loop._PROVIDER_TERMINAL_TEXT_ROUND_REASONS,
             )
-        fallback_reason = str(
-            detail.get("force_text_fallback_reason") or "none"
+        fallback_reason = _normalize_provider_trace_reason(
+            detail.get("force_text_fallback_reason"),
+            v2_tool_loop._PROVIDER_FORCE_TEXT_FALLBACK_REASONS,
         )
         if fallback_reason != "none":
             self.force_text_fallback_reason = fallback_reason
@@ -1970,6 +1975,18 @@ def _provider_tool_surface_callback(
     return _ProviderRoundtripTrace(deps, user_id, lane)
 
 
+def _normalize_provider_trace_lane(lane: object) -> str:
+    raw_lane = str(lane or "").strip()
+    return raw_lane if raw_lane == "chat" or raw_lane in _WAKE_LANES else "other"
+
+
+def _normalize_provider_trace_reason(
+    reason: object, allowed_values: frozenset[str]
+) -> str:
+    raw_reason = str(reason or "none").strip()
+    return raw_reason if raw_reason in allowed_values else "other"
+
+
 def _empty_provider_response_debug_callback(
     deps: TurnDeps,
     user_id: str,
@@ -1979,7 +1996,7 @@ def _empty_provider_response_debug_callback(
     if deps.emit_debug_trace is None:
         return None
 
-    safe_lane = lane if lane == "chat" or lane in _WAKE_LANES else "other"
+    safe_lane = _normalize_provider_trace_lane(lane)
 
     async def _emit(response_shape: dict[str, Any]) -> None:
         raw_stop_reason = str(response_shape.get("stop_reason") or "")
