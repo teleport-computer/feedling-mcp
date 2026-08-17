@@ -9,7 +9,7 @@ tested by earlier tasks:
     replication (hits the enclave for real decrypts).
   - ``tee_shadow.verify.run`` — read-only sampled consistency check.
   - ``tee_shadow.snapshot.snapshot_all`` / ``snapshot_table`` — SNAPSHOT lane
-    full-table TRUNCATE+COPY atomic replace.
+    full-table staged primary-key merge.
 
 This module owns no business logic of its own beyond the execution
 guardrails (spec §5 四要素): a literal ``confirm == "MIGRATE"`` gate on any
@@ -134,7 +134,7 @@ def run_action(
                 # `dry_run=payload.get("dry_run", True)`，默认 True。
                 # 少了这条短路，一个 `{"action": "snapshot"}` 的探测请求（admin 按
                 # reconcile/replicate 的既有习惯，会以为这是安全的演练）就会直接对
-                # TEE 侧 25 张表做真实 TRUNCATE+COPY，且绕过全部确认门。
+                # TEE 侧 25 张表做真实 stage+merge，且绕过全部确认门。
                 tables = list(tee_snapshot.snapshot_order()) if table is None else [table]
                 report = {"planned": tables, "tables": [], "copied": 0, "failures": 0}
             else:

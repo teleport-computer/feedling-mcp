@@ -23,7 +23,7 @@ MIRROR = "MIRROR"
 # 解密、写 TEE 明文行。适用于装信封的表。
 CIPHERTEXT = "CIPHERTEXT"
 
-# 整表快照刷：TRUNCATE + COPY 原子替换（tee_shadow.snapshot）。适用于数据量
+# 整表快照刷：临时表 COPY + 主键精确合并（tee_shadow.snapshot）。适用于数据量
 # 小、但有 UPDATE/DELETE 的明文表——全量替换天然处理可变行，不需要 requeue
 # 补偿和 prune。
 SNAPSHOT = "SNAPSHOT"

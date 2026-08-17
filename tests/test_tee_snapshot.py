@@ -1,4 +1,4 @@
-"""SNAPSHOT lane：整表 TRUNCATE + COPY 原子替换。
+"""SNAPSHOT lane：临时表 COPY + 主键精确合并。
 
 为什么是全量替换而不是增量：这批表数据量极小（prod 实测 25 张合计 1340 行 /
 约 2 MB），但有大量 UPDATE/DELETE（队列 status 流转、心跳、allowlist）。现有的
@@ -41,6 +41,37 @@ def _tee_rows(table: str) -> list[tuple]:
         return c.execute(f"SELECT k, v FROM {table} ORDER BY k").fetchall()
 
 
+@pytest.fixture
+def fk_tables():
+    """A SNAPSHOT parent with a child owned by another replication lane.
+
+    This mirrors the live TEE relationship where CIPHERTEXT-lane
+    v2_trajectory_reviews references SNAPSHOT-lane agent_jobs.  Refreshing the
+    parent must not require truncating or rebuilding the external child.
+    """
+    parent = "_snap_fk_parent"
+    child = "_snap_fk_external_child"
+    parent_ddl = (
+        f"CREATE TABLE {parent} (k TEXT PRIMARY KEY, v TEXT NOT NULL)"
+    )
+    child_ddl = (
+        f"CREATE TABLE {child} ("
+        f"  id TEXT PRIMARY KEY, parent_k TEXT NOT NULL REFERENCES {parent}(k) "
+        f"  ON DELETE CASCADE, v TEXT NOT NULL)"
+    )
+    for pool in (db.get_pool(), mirror.get_tee_pool()):
+        with pool.connection() as c:
+            c.execute(f"DROP TABLE IF EXISTS {child}")
+            c.execute(f"DROP TABLE IF EXISTS {parent}")
+            c.execute(parent_ddl)
+            c.execute(child_ddl)
+    yield parent, child
+    for pool in (db.get_pool(), mirror.get_tee_pool()):
+        with pool.connection() as c:
+            c.execute(f"DROP TABLE IF EXISTS {child}")
+            c.execute(f"DROP TABLE IF EXISTS {parent}")
+
+
 def test_snapshot_copies_rows(sample_table):
     with db.get_pool().connection() as c:
         c.execute("INSERT INTO _snap_probe (k, v) VALUES ('a','1'), ('b','2')")
@@ -73,16 +104,64 @@ def test_snapshot_propagates_update_and_delete(sample_table):
     assert _tee_rows(sample_table) == [("a", "changed")]
 
 
+def test_snapshot_parent_update_preserves_external_child(fk_tables):
+    """Refreshing a retained parent must update in place, not TRUNCATE it.
+
+    The old implementation fails before COPY because PostgreSQL refuses to
+    truncate a table referenced by an external lane's foreign key.
+    """
+    parent, child = fk_tables
+    with db.get_pool().connection() as c:
+        c.execute(f"INSERT INTO {parent} (k, v) VALUES ('a', 'new')")
+    with mirror.get_tee_pool().connection() as c:
+        c.execute(f"INSERT INTO {parent} (k, v) VALUES ('a', 'old')")
+        c.execute(
+            f"INSERT INTO {child} (id, parent_k, v) VALUES ('c1', 'a', 'keep')"
+        )
+
+    rep = snapshot.snapshot_table(parent)
+
+    assert rep["ok"] is True
+    with mirror.get_tee_pool().connection() as c:
+        assert c.execute(f"SELECT k, v FROM {parent}").fetchall() == [("a", "new")]
+        assert c.execute(
+            f"SELECT id, parent_k, v FROM {child}"
+        ).fetchall() == [("c1", "a", "keep")]
+
+
+def test_snapshot_parent_delete_uses_normal_fk_semantics(fk_tables):
+    """Only a source-absent parent is deleted, so only its child cascades."""
+    parent, child = fk_tables
+    with db.get_pool().connection() as c:
+        c.execute(f"INSERT INTO {parent} (k, v) VALUES ('keep', 'new')")
+    with mirror.get_tee_pool().connection() as c:
+        c.execute(
+            f"INSERT INTO {parent} (k, v) VALUES ('keep', 'old'), ('stale', 'old')"
+        )
+        c.execute(
+            f"INSERT INTO {child} (id, parent_k, v) VALUES "
+            f"('c-keep', 'keep', 'retained'), ('c-stale', 'stale', 'removed')"
+        )
+
+    rep = snapshot.snapshot_table(parent)
+
+    assert rep["ok"] is True
+    with mirror.get_tee_pool().connection() as c:
+        assert c.execute(
+            f"SELECT k, v FROM {parent} ORDER BY k"
+        ).fetchall() == [("keep", "new")]
+        assert c.execute(
+            f"SELECT id, parent_k, v FROM {child} ORDER BY id"
+        ).fetchall() == [("c-keep", "keep", "retained")]
+
+
 def test_failed_snapshot_leaves_old_data_intact(sample_table, monkeypatch):
-    """TRUNCATE + COPY 必须在同一事务：中途失败时 TEE 侧保留旧的完整快照，
-    绝不出现空表窗口（读路径会读到空表 = 用户数据凭空消失）。
+    """目标 merge 必须在同一事务：中途失败时 TEE 侧保留旧的完整快照。
 
     失败必须真实发生在 dst 侧执行 `COPY ... FROM STDIN` 的过程中——此时
-    `TRUNCATE` 已经在同一事务里跑过。如果只在源库读取阶段（`_stream_rows`）
-    注入异常，异常永远不会传到 `mirror.get_tee_pool()` 那一侧，`TRUNCATE`
-    和 `dst.transaction()` 根本没被执行到，这条测试就测不出"有没有把两条
-    语句包在同一事务里"这件事——所以让 `_stream_rows` 正常返回，但返回一段
-    postgres 无法解析的损坏 COPY BINARY 载荷，让失败落在 dst 端。
+    临时表已在事务里创建。如果只在源库读取阶段（`_stream_rows`）注入异常，
+    目标事务根本不会开始，测试就守不到目标侧的回滚边界；所以返回一段
+    PostgreSQL 无法解析的损坏 COPY BINARY 载荷，让失败落在 dst 端。
     """
     with db.get_pool().connection() as c:
         c.execute("INSERT INTO _snap_probe (k, v) VALUES ('a','1')")
@@ -99,14 +178,33 @@ def test_failed_snapshot_leaves_old_data_intact(sample_table, monkeypatch):
     rep = snapshot.snapshot_table(sample_table)
     assert rep["ok"] is False
     assert rep["error"]
-    # 旧快照原样还在，没被 TRUNCATE 掉——证明 TRUNCATE 与 COPY 在同一事务里：
-    # COPY 因载荷损坏而失败时，先前跑过的 TRUNCATE 也随事务一起回滚了。
+    # 旧快照原样还在，证明 stage COPY 与后续目标 merge 共享一个回滚边界。
     assert _tee_rows(sample_table) == [("a", "1")]
+
+
+def test_prune_failure_rolls_back_completed_upsert(sample_table, monkeypatch):
+    """A failure after UPSERT must roll the earlier target changes back too."""
+    with db.get_pool().connection() as c:
+        c.execute("INSERT INTO _snap_probe (k, v) VALUES ('a', 'old')")
+    snapshot.snapshot_table(sample_table)
+    with db.get_pool().connection() as c:
+        c.execute("UPDATE _snap_probe SET v='new' WHERE k='a'")
+        c.execute("INSERT INTO _snap_probe (k, v) VALUES ('b', 'new')")
+
+    def fail_prune(*args, **kwargs):
+        raise RuntimeError("injected prune failure")
+
+    monkeypatch.setattr(snapshot, "_prune_target", fail_prune)
+    rep = snapshot.snapshot_table(sample_table)
+
+    assert rep["ok"] is False
+    assert "injected prune failure" in (rep["error"] or "")
+    assert _tee_rows(sample_table) == [("a", "old")]
 
 
 def test_snapshot_refuses_when_table_exceeds_max_rows(sample_table, monkeypatch):
     """超限必须失败，不能静默截断——否则 TEE 会悄悄缺数据而无人察觉。
-    早退分支不该碰 TEE 侧：旧快照必须原样保留，证明真的没有执行到 TRUNCATE/COPY。
+    早退分支不该碰 TEE 侧：旧快照必须原样保留，证明没有执行目标合并。
     """
     with db.get_pool().connection() as c:
         c.execute("INSERT INTO _snap_probe (k, v) VALUES ('a','1')")
@@ -122,6 +220,33 @@ def test_snapshot_refuses_when_table_exceeds_max_rows(sample_table, monkeypatch)
     assert "MAX_ROWS" in (rep["error"] or "")
     # 早退分支没碰 TEE 侧：旧快照原样还在。
     assert _tee_rows(sample_table) == [("a", "1")]
+
+
+def test_snapshot_refuses_table_without_primary_key_before_mutation():
+    table = "_snap_no_pk"
+    ddl = f"CREATE TABLE {table} (k TEXT, v TEXT NOT NULL)"
+    for pool in (db.get_pool(), mirror.get_tee_pool()):
+        with pool.connection() as c:
+            c.execute(f"DROP TABLE IF EXISTS {table}")
+            c.execute(ddl)
+    try:
+        with db.get_pool().connection() as c:
+            c.execute(f"INSERT INTO {table} (k, v) VALUES ('source', 'new')")
+        with mirror.get_tee_pool().connection() as c:
+            c.execute(f"INSERT INTO {table} (k, v) VALUES ('target', 'keep')")
+
+        rep = snapshot.snapshot_table(table)
+
+        assert rep["ok"] is False
+        assert "primary key" in (rep["error"] or "").lower()
+        with mirror.get_tee_pool().connection() as c:
+            assert c.execute(f"SELECT k, v FROM {table}").fetchall() == [
+                ("target", "keep")
+            ]
+    finally:
+        for pool in (db.get_pool(), mirror.get_tee_pool()):
+            with pool.connection() as c:
+                c.execute(f"DROP TABLE IF EXISTS {table}")
 
 
 def test_snapshot_all_continues_past_a_failing_table(monkeypatch):
@@ -205,6 +330,17 @@ def test_snapshot_survives_tee_only_column(drift_table_tee_extra):
         rows = c.execute("SELECT k, v FROM t_drift2 ORDER BY k").fetchall()
     assert rows == [("a", "1")]
 
+    # Retained rows keep target-only values while common columns converge.
+    with db.get_pool().connection() as c:
+        c.execute("UPDATE t_drift2 SET v='2' WHERE k='a'")
+    with mirror.get_tee_pool().connection() as c:
+        c.execute("UPDATE t_drift2 SET tee_only_col='tee-local' WHERE k='a'")
+    rep = snapshot.snapshot_table(drift_table_tee_extra)
+    assert rep["ok"] is True
+    with mirror.get_tee_pool().connection() as c:
+        rows = c.execute("SELECT k, v, tee_only_col FROM t_drift2").fetchall()
+    assert rows == [("a", "2", "tee-local")]
+
 
 @pytest.fixture
 def drift_table_disjoint():
@@ -223,8 +359,8 @@ def drift_table_disjoint():
         c.execute("DROP TABLE IF EXISTS t_drift3")
 
 
-def test_snapshot_refuses_to_truncate_when_no_common_columns(drift_table_disjoint):
-    """列集完全不相交时必须拒绝执行，而不是 TRUNCATE 完再写不回任何东西。
+def test_snapshot_refuses_merge_when_no_common_columns(drift_table_disjoint):
+    """列集完全不相交时必须拒绝执行，而不是清空后再写不回任何东西。
 
     没有这条护栏，交集逻辑会把"两侧完全对不上"降级成"共同列为空的正常快照"：
     TEE 那张表被清空、一行都写不回去，而报告还是 ok=True——比原先的整表失败
@@ -256,3 +392,28 @@ def test_users_is_snapshotted_before_per_user_tables():
     assert set(order) == snap
     if "users" in snap:
         assert order.index("users") == 0
+
+
+def test_snapshot_parents_are_ordered_before_known_children():
+    order = snapshot.snapshot_order()
+    agent_job_children = (
+        "agent_action_queue",
+        "v2_capture_batches",
+        "v2_mcp_mutation_attempts",
+        "v2_terminal_failure_outbox",
+        "v2_trajectory_streams",
+    )
+    for child in agent_job_children:
+        assert order.index("agent_jobs") < order.index(child)
+
+
+def test_every_registered_snapshot_table_has_a_primary_key():
+    """Exact replacement needs a stable key for upsert and source-absence prune."""
+    from tee_shadow import table_registry as reg
+
+    with mirror.get_tee_pool().connection() as c:
+        missing = [
+            table for table in reg.tables_in_lane(reg.SNAPSHOT)
+            if not snapshot._primary_key_columns(c, table)
+        ]
+    assert missing == []
