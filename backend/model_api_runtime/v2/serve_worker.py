@@ -1902,6 +1902,7 @@ def _fire_scheduled_for_user(user_id: str) -> int:
             user_id,
             "scheduled",
             reason="scheduled_wake",
+            trace_id=str(event.wake_id),
         )
         fired += 1
         return types.SimpleNamespace(
@@ -2958,7 +2959,7 @@ def _tick_capture_for_user(user_id: str) -> int:
 
     def _submit(store, *, trigger, now, window, capture_key):
         job_id, coalesced = jobs_store.enqueue_job(
-            user_id, "capture", reason=trigger
+            user_id, "capture", reason=trigger, trace_id=None
         )
         if not coalesced:
             core_wake_bus.notify("v2_jobs", user_id)
@@ -2988,7 +2989,9 @@ def _tick_dream_for_user(user_id: str) -> int:
     store = core_store.get_store(user_id)
 
     def _submit(store, *, trigger, now):
-        job_id, coalesced = jobs_store.enqueue_job(user_id, "dream", reason=trigger)
+        job_id, coalesced = jobs_store.enqueue_job(
+            user_id, "dream", reason=trigger, trace_id=None
+        )
         if not coalesced:
             core_wake_bus.notify("v2_jobs", user_id)
         return {
@@ -3100,7 +3103,12 @@ def _tick_screen_watch_for_user(user_id: str) -> int:
     if should and bool(
         _wake_decision_for_user(user_id, trigger="screen_watch").get("should_wake")
     ):
-        jobs_store.enqueue_job(user_id, "screen_watch", reason="screen_watch")
+        jobs_store.enqueue_job(
+            user_id,
+            "screen_watch",
+            reason="screen_watch",
+            trace_id=uuid.uuid4().hex,
+        )
         core_wake_bus.notify("v2_jobs", user_id)
         # 真醒：推进到期时间 **且** 消费这一帧（记 last_screen_watch_frame_id）。
         jobs_store.upsert_wake_schedule(
@@ -3564,6 +3572,7 @@ def _sink_job(user_id: str, payload: dict) -> None:
             user_id,
             str(payload.get("lane") or "chat"),
             reason=payload.get("reason"),
+            trace_id=None,
             expected_generation=int(expected_generation),
         )
     except Exception:
@@ -4789,7 +4798,9 @@ def _build_scheduler_deps():
         ),
         due_users=lambda: jobs_store.due_heartbeat_users(),
         wake_decision=_wake_decision_for_user,
-        enqueue_heartbeat=lambda uid: jobs_store.enqueue_job(uid, "heartbeat"),
+        enqueue_heartbeat=lambda uid: jobs_store.enqueue_job(
+            uid, "heartbeat", trace_id=uuid.uuid4().hex
+        ),
         advance_heartbeat=lambda uid, next_at: jobs_store.upsert_wake_schedule(
             uid, next_heartbeat_at=next_at
         ),

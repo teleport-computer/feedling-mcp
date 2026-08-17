@@ -53,6 +53,7 @@ def enqueue_profile_best_effort(
             user_id,
             "profile",
             reason=reason,
+            trace_id=None,
         )
         made_ready = bool(
             force_ready
