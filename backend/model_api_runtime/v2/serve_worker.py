@@ -4376,7 +4376,9 @@ def _apply_pending_effects_for_user(user_id: str) -> dict:
     )
 
 
-_TRAJECTORY_PLAINTEXT_B64_PREFIX = "feedling-v2-trajectory-b64-v1:"
+_TRAJECTORY_PLAINTEXT_B64_PREFIX = (
+    jobs_store.TRAJECTORY_PLAINTEXT_B64_PREFIX
+)
 
 
 def _seal_trajectory_payload(
@@ -4394,7 +4396,7 @@ def _seal_trajectory_payload(
     store = core_store.get_store(str(user_id))
     if core_envelope.resolve_content_encryption(store.user_id) == "off":
         return {
-            "body": _TRAJECTORY_PLAINTEXT_B64_PREFIX
+            "body": jobs_store.TRAJECTORY_PLAINTEXT_B64_PREFIX
             + base64.b64encode(bytes(plaintext)).decode("ascii"),
             "id": str(item_id),
             "owner_user_id": store.user_id,
@@ -4420,11 +4422,12 @@ def _open_trajectory_payload(
         raise RuntimeError("trajectory_owner_mismatch")
     body = envelope.get("body")
     if isinstance(body, str):
-        if not body.startswith(_TRAJECTORY_PLAINTEXT_B64_PREFIX):
+        prefix = jobs_store.TRAJECTORY_PLAINTEXT_B64_PREFIX
+        if not body.startswith(prefix):
             raise RuntimeError("trajectory_plaintext_encoding_invalid")
         try:
             return base64.b64decode(
-                body[len(_TRAJECTORY_PLAINTEXT_B64_PREFIX) :],
+                body[len(prefix) :],
                 validate=True,
             )
         except (ValueError, TypeError) as exc:

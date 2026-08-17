@@ -7,6 +7,8 @@ CONTRIBUTING §2：新表存取逻辑全部收进本模块（jobs_store）。连
 
 from __future__ import annotations
 
+import base64
+import binascii
 import hashlib
 import logging
 import math
@@ -347,6 +349,7 @@ _TRAJECTORY_SEALED_ALLOWED = frozenset(
 _TRAJECTORY_PLAINTEXT_REQUIRED = frozenset(
     {"id", "owner_user_id", "visibility", "body"}
 )
+TRAJECTORY_PLAINTEXT_B64_PREFIX = "feedling-v2-trajectory-b64-v1:"
 
 
 def trajectory_review_admission_cap() -> int:
@@ -418,6 +421,21 @@ def _validate_trajectory_envelope(user_id: str, envelope: object) -> dict:
     for field in required:
         if not isinstance(envelope.get(field), str) or not envelope[field]:
             raise ValueError(f"trajectory payload envelope {field} required")
+    if "body_ct" not in envelope:
+        from core import envelope as core_envelope
+
+        if core_envelope.resolve_content_encryption(str(user_id)) != "off":
+            raise ValueError("trajectory plaintext payload not enabled")
+        encoded = envelope["body"]
+        if not encoded.startswith(TRAJECTORY_PLAINTEXT_B64_PREFIX):
+            raise ValueError("trajectory plaintext encoding invalid")
+        encoded = encoded[len(TRAJECTORY_PLAINTEXT_B64_PREFIX) :]
+        if not encoded:
+            raise ValueError("trajectory plaintext encoding invalid")
+        try:
+            base64.b64decode(encoded, validate=True)
+        except (binascii.Error, ValueError) as exc:
+            raise ValueError("trajectory plaintext encoding invalid") from exc
     return envelope
 
 
