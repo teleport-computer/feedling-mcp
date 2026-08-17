@@ -940,6 +940,7 @@ def list_runtime_modes() -> dict:
 
 def v2_metrics(
     *,
+    user_id: str | None = None,
     cache_provider: str | None = None,
     cache_model: str | None = None,
     cache_route_fingerprint: str | None = None,
@@ -997,7 +998,7 @@ def v2_metrics(
         # All-lane view, including dream/capture.  The legacy ``wake`` field is
         # intentionally narrower (heartbeat/scheduled/manual_wake) and cannot
         # reveal a silent extraction lane.
-        "runtime_health": jobs_store.recent_runtime_health(),
+        "runtime_health": jobs_store.recent_runtime_health(user_id=user_id),
         "prompt_cache": jobs_store.recent_prompt_cache_stats(
             lane="chat",
             provider=cache_provider,

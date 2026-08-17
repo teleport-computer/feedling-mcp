@@ -118,6 +118,36 @@ def _require_admin(request: Request) -> None:
         raise HTTPException(status_code=401)
 
 
+def _reject_unknown_query_params(
+    request: Request, allowed: "set[str] | frozenset[str]"
+) -> JSONResponse | None:
+    """未在白名单里的 query 参数一律 400。
+
+    为什么不是「忽略」:2026-08-17,``/v1/admin/v2-metrics`` 和
+    ``/v1/admin/v2-wake-shadow`` 都接受 ``?user_id=`` 却根本不读它,返回的是
+    **全环境**的数字。claude2 据此把全局的 22 次 heartbeat 失败当成某一个用户
+    的失败报了出去 —— 传了假 user_id、真 user_id、不传,三者返回完全相同,
+    没有任何信号说「你问的这个问题我答不了」。
+
+    静默丢弃最坏的地方在于:它让**问错的问题**和**问对的问题**返回同样可信的
+    200。宁可 400 让调用方当场知道不支持,也不要给一个看起来对的答案。
+
+    这也顺带暴露了 admin 面三种不一致的叫法(``user_id`` / ``cache_user_id``
+    / ``uid``)—— 拼错的那一种从此会响,而不是悄悄退回全局口径。
+    """
+    unknown = sorted(set(request.query_params.keys()) - set(allowed))
+    if unknown:
+        return JSONResponse(
+            {
+                "error": "unknown_query_params",
+                "params": unknown,
+                "supported": sorted(allowed),
+            },
+            status_code=400,
+        )
+    return None
+
+
 @router.get("/admin/login")
 async def admin_login_page(request: Request):
     next_url = _safe_admin_next(request.query_params.get("next") or "")
@@ -448,6 +478,24 @@ async def runtime_allowlist_get(request: Request):
 @router.get("/v1/admin/v2-metrics")
 async def v2_metrics(request: Request):
     _require_admin(request)
+    unknown = _reject_unknown_query_params(
+        request,
+        {
+            "cache_provider",
+            "cache_model",
+            "cache_route_fingerprint",
+            "cache_user_id",
+            "cache_since_ts",
+            "cache_until_ts",
+            "user_id",
+        },
+    )
+    if unknown is not None:
+        return unknown
+    # `user_id` 收窄 runtime_health 的 lane 口径(数据源 agent_jobs 有 user_id);
+    # `cache_user_id` 是另一码事,只过滤 provider 缓存证据块。两者同名不同义,
+    # 这正是当初 user_id 被静默丢弃的由来 —— 别再合并它们。
+    user_id = (request.query_params.get("user_id") or "").strip() or None
     cache_provider = (request.query_params.get("cache_provider") or "").strip() or None
     cache_model = (request.query_params.get("cache_model") or "").strip() or None
     cache_route_fingerprint = (
@@ -483,6 +531,7 @@ async def v2_metrics(request: Request):
         return JSONResponse({"error": "invalid_cache_window"}, status_code=400)
     payload = await threadpool.run_db(
         admin_core.v2_metrics,
+        user_id=user_id,
         cache_provider=cache_provider,
         cache_model=cache_model,
         cache_route_fingerprint=cache_route_fingerprint,
@@ -501,6 +550,14 @@ async def v2_wake_shadow(request: Request):
     sleep-window definition and never enter wake policy.
     """
     _require_admin(request)
+    # ⚠️ 这里**故意不支持** user_id:``v2_wake_shadow_decisions`` 只有 job_id,
+    # 没有 user_id 列(0085),按用户过滤在表结构上就做不到。以前传了会被静默
+    # 丢弃、照样返回全环境数字;现在明确 400,让调用方知道这个问题问不了。
+    unknown = _reject_unknown_query_params(
+        request, {"days", "start_hour", "end_hour"}
+    )
+    if unknown is not None:
+        return unknown
 
     def _int_arg(
         name: str,
