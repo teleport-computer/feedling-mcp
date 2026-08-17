@@ -189,6 +189,20 @@ SCHEDULED_LEASE_REQUEUE_MAX_ATTEMPTS = _positive_int_env(
     "FEEDLING_V2_SCHEDULED_REQUEUE_MAX_ATTEMPTS", "3"
 )
 
+# Shared by the periodic lease reaper and the eager watchdog recovery path.
+# Keeping the SQL predicate single-sourced prevents either recovery mechanism
+# from silently widening scheduled whole-turn replay in the future.
+_SCHEDULED_REQUEUE_SAFETY_SQL = (
+    "AND attempt_count < %s "
+    "AND NOT EXISTS ("
+    "  SELECT 1 FROM v2_mcp_mutation_attempts a "
+    "  WHERE a.job_id=agent_jobs.id) "
+    "AND NOT EXISTS ("
+    "  SELECT 1 FROM v2_effect_outbox e "
+    "  WHERE e.job_id=agent_jobs.id "
+    "    AND e.effect_type = ANY(%s)) "
+)
+
 _ACTIVE_STATUSES = ("pending", "claimed", "running")
 SCHEDULED_WAKE_STREAM = "proactive_scheduled_wakes_v2"
 _TERMINAL_FAILURE_FALLBACK_REPLY = (
@@ -1779,6 +1793,69 @@ def recover_killed_job(
                         cur, int(job_id)
                     )
                     _queue_failure_review_on_cursor(cur, int(job_id))
+                elif lane == "scheduled":
+                    # Watchdog recovery is an eager form of the lease reaper.
+                    # It must use the same replay-safety contract: only a
+                    # pristine scheduled turn with retry budget remaining may
+                    # run again.  Any MCP attempt or durable platform effect
+                    # makes whole-turn replay unsafe, even when the recorded
+                    # MCP outcome is known-success.
+                    cur.execute(
+                        "UPDATE agent_jobs SET status='pending',created_at=now(), "
+                        "last_error=%s,attempt_count=attempt_count+1,"
+                        "claimed_by=NULL,claimed_at=NULL,started_at=NULL,"
+                        "finished_at=NULL,lease_expires_at=NULL,deadline_at=NULL,"
+                        "queue_deadline_at=NULL "
+                        "WHERE id=%s AND claimed_by=%s AND lane='scheduled' "
+                        "AND status IN ('claimed','running') "
+                        + _SCHEDULED_REQUEUE_SAFETY_SQL,
+                        (
+                            str(reason)[:500],
+                            int(job_id),
+                            str(claimed_by),
+                            int(SCHEDULED_LEASE_REQUEUE_MAX_ATTEMPTS),
+                            sorted(DURABLE_TOOL_EFFECT_TYPES),
+                        ),
+                    )
+                    if cur.rowcount == 1:
+                        recovery = "requeued"
+                    else:
+                        recovery = "terminal"
+                        cur.execute(
+                            "UPDATE agent_jobs SET status='expired',finished_at=now(), "
+                            "last_error=CASE WHEN EXISTS ("
+                            "  SELECT 1 FROM v2_mcp_mutation_attempts a "
+                            "  WHERE a.job_id=agent_jobs.id "
+                            "    AND (a.outcome IS NULL OR a.outcome='unknown')"
+                            ") THEN 'mcp_mutation_outcome_unknown' ELSE %s END, "
+                            "attempt_count=attempt_count+1,"
+                            "claimed_by=NULL,claimed_at=NULL,started_at=NULL,"
+                            "lease_expires_at=NULL,deadline_at=NULL "
+                            "WHERE id=%s AND claimed_by=%s "
+                            "AND status IN ('claimed','running') "
+                            "RETURNING last_error",
+                            (str(reason)[:500], int(job_id), str(claimed_by)),
+                        )
+                        terminal = cur.fetchone()
+                        if terminal is None:
+                            return None
+                        terminal_error = str(terminal["last_error"])
+                        cur.execute(
+                            "UPDATE v2_mcp_mutation_attempts "
+                            "SET outcome='unknown',resolved_at=clock_timestamp() "
+                            "WHERE job_id=%s AND outcome IS NULL",
+                            (int(job_id),),
+                        )
+                        _queue_terminal_failure_on_cursor(
+                            cur,
+                            int(job_id),
+                            str(row["user_id"]),
+                            terminal_error,
+                        )
+                        recovered_reviews = _recover_review_runner_on_cursor(
+                            cur, int(job_id)
+                        )
+                        _queue_failure_review_on_cursor(cur, int(job_id))
                 else:
                     recovery = "requeued"
                     cur.execute(
@@ -1838,7 +1915,8 @@ def reap_stuck_job_rows(now=None) -> list[dict]:
                     "AND COALESCE(lease_expires_at, deadline_at) IS NOT NULL "
                     "AND COALESCE(lease_expires_at, deadline_at) "
                     "    <= COALESCE(to_timestamp(%s), now()) "
-                    "AND attempt_count < %s "
+                    # Replay-safety predicate is shared with eager watchdog
+                    # recovery; neither path may widen it independently.
                     # ⚠️ P0(codex2 交叉审计):**碰过 MCP 写的这一轮,一律不重投** ——
                     # 不看 outcome。理由(get_chat_mutation_recovery_barrier 的契约原文):
                     #   "Outcomes ... do not weaken the barrier:
@@ -1852,17 +1930,11 @@ def reap_stuck_job_rows(now=None) -> list[dict]:
                     # 而重投复用同一个 job_id,worker 侧的 mutation recovery barrier
                     # 查询又**只覆盖 lane='chat'**,保护不到 scheduled;模型重跑后会
                     # 生成新的 call_id 再写一次 —— 一次已成功的远端写就被重复执行了。
-                    "AND NOT EXISTS ("
-                    "  SELECT 1 FROM v2_mcp_mutation_attempts a "
-                    "  WHERE a.job_id=agent_jobs.id) "
                     # 同族第二层(codex2 交叉审计):不只 MCP。
                     # worker._write_tool_effect_payload 是**所有道共享**的,
                     # scheduled 一样能落 memory/identity/schedule/workspace 写。
-                    "AND NOT EXISTS ("
-                    "  SELECT 1 FROM v2_effect_outbox e "
-                    "  WHERE e.job_id=agent_jobs.id "
-                    "    AND e.effect_type = ANY(%s)) "
-                    "RETURNING id",
+                    + _SCHEDULED_REQUEUE_SAFETY_SQL
+                    + "RETURNING id",
                     (ts, int(SCHEDULED_LEASE_REQUEUE_MAX_ATTEMPTS),
                      sorted(DURABLE_TOOL_EFFECT_TYPES)),
                 )
