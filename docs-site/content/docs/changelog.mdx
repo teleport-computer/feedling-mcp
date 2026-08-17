@@ -169,12 +169,17 @@ change must not be interpreted as an API guarantee.
   whether weak wakes speak; scheduled reminders still require delivery.
 
 - **Hosted Runtime V2 scheduled reminders no longer disappear after a model or
-  provider failure.** A content-free reminder response gets one bounded retry
-  with a reminder-specific correction. If delivery still fails, the runtime
-  writes one encrypted, standalone failure result containing the original
-  reminder note and a safe error explanation. This result is idempotent,
-  survives worker crashes and lease expiry, does not attach itself to an older
-  user message, and does not advance that message's reply cursor. Heartbeat,
+  provider failure.** A pristine delivery can make up to three total attempts,
+  delayed by 30 seconds and then 120 seconds. Authentication, payment,
+  configuration, mutation, durable-write, lease, runtime-mode, and exhausted-
+  budget failures terminate immediately rather than retrying. Generic heartbeat
+  failure backoff never postpones reminders, while payment cooldown still does.
+  If delivery ultimately fails, the runtime writes one encrypted, standalone
+  system notice naming the reminder and its original local time; quota failures
+  receive dedicated recharge guidance. Intermediate attempts and later retry
+  success produce no failure notice. The final result is idempotent, survives
+  worker crashes and lease expiry, does not attach itself to an older user
+  message, and does not advance that message's reply cursor. Heartbeat,
   manual-wake, and screen-watch silence remains unchanged.
 
 - **Multi-card memory consolidation no longer leaves a silently unretired

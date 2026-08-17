@@ -3357,56 +3357,97 @@ def _ack_terminal_failure_reply(job_id) -> bool:
         return cur.rowcount == 1
 
 
-def _scheduled_failure_notes(user_id: str, job_id) -> list[str]:
-    """Read the canonical reminder notes for one fired scheduled job."""
+def _scheduled_failure_contexts(user_id: str, job_id) -> list[dict[str, object]]:
+    """Read bounded canonical reminder identity for one fired scheduled job."""
     with _pool().connection() as conn:
         rows = conn.execute(
-            "SELECT doc->>'note' FROM user_logs "
+            "SELECT doc->>'note',doc->>'at',doc->>'timezone',doc->>'due_at' "
+            "FROM user_logs "
             "WHERE user_id=%s AND stream=%s AND doc->>'status'='fired' "
             "AND doc->>'fired_job_id'=%s ORDER BY seq LIMIT 10",
             (str(user_id), SCHEDULED_WAKE_STREAM, str(int(job_id))),
         ).fetchall()
     return [
-        str(row[0]).strip()[:1000]
+        {
+            "note": str(row[0]).strip()[:1000],
+            "at": str(row[1] or "").strip()[:120],
+            "timezone": str(row[2] or "").strip()[:80],
+            "due_at": str(row[3] or "").strip()[:40],
+        }
         for row in rows
         if str(row[0] or "").strip()
     ]
+
+
+def _scheduled_failure_display_time(
+    context: dict[str, object], *, language: str
+) -> str:
+    raw_at = str(context.get("at") or "").strip()
+    zone = str(context.get("timezone") or "").strip()
+    try:
+        local = datetime.fromisoformat(raw_at)
+    except (TypeError, ValueError):
+        local = None
+    if local is not None:
+        clock = (
+            f"{local.hour:02d}:{local.minute:02d}:{local.second:02d}"
+            if local.second or local.microsecond
+            else f"{local.hour:02d}:{local.minute:02d}"
+        )
+        if str(language or "").strip().lower().startswith("en"):
+            rendered = f"{local.year:04d}-{local.month:02d}-{local.day:02d} {clock}"
+            return f"{rendered} ({zone})" if zone else rendered
+        rendered = f"{local.year}年{local.month}月{local.day}日 {clock}"
+        return f"{rendered}（{zone}）" if zone else rendered
+    if raw_at:
+        return f"{raw_at}（{zone}）" if zone else raw_at
+    try:
+        due = datetime.fromtimestamp(float(context.get("due_at") or 0), timezone.utc)
+    except (TypeError, ValueError, OSError):
+        due = None
+    if due is not None and due.timestamp() > 0:
+        return due.strftime("%Y-%m-%d %H:%M UTC")
+    return "the scheduled time" if str(language or "").lower().startswith("en") else "原定时间"
 
 
 def _scheduled_failure_reply_text(
     error_class: str,
     *,
     language: str,
-    user_text: str,
-    notes: list[str],
+    contexts: list[dict[str, object]],
 ) -> str:
-    """Explain a missed timer without impersonating a model-authored reply."""
+    """Render approved system copy without impersonating the companion."""
+    notes = [str(item.get("note") or "").strip() for item in contexts]
+    title = "；".join(note for note in notes if note) or "这条提醒"
+    scheduled_time = _scheduled_failure_display_time(
+        contexts[0] if contexts else {}, language=language
+    )
     if str(language or "").strip().lower().startswith("en"):
-        reminder = (
-            " (" + "; ".join(notes) + ")"
-            if notes
-            else ""
-        )
-        if error_class == "provider_empty_reply":
+        if error_class == "quota_insufficient":
             return (
-                "A scheduled reminder" + reminder
-                + " was due, but your model service returned "
-                "an empty reply, so it could not be delivered. Please set it "
-                "again; if this keeps happening, check the model provider or relay."
+                "Reminder couldn't be delivered\n"
+                f"“{title}” was scheduled for {scheduled_time}, but could not be "
+                "delivered because the model-service quota was insufficient.\n"
+                "New reminders will work after you add credit; this one will not "
+                "be delivered automatically."
             )
         return (
-            "A scheduled reminder" + reminder
-            + " was due, but its reply could not be delivered. "
-            "Please set it again."
+            "Reminder couldn't be delivered\n"
+            f"“{title}” was scheduled for {scheduled_time}, but delivery still "
+            "failed after several attempts.\n"
+            "This reminder will not be delivered automatically; set a new one if "
+            "you still need it."
         )
-    reminder = (
-        "（" + "；".join(f"“{note}”" for note in notes) + "）"
-        if notes
-        else ""
-    )
+    if error_class == "quota_insufficient":
+        return (
+            "提醒没能送到\n"
+            f"「{title}」原定 {scheduled_time} 提醒你,因为模型服务额度不足没能送出。\n"
+            "充值后新的提醒就能正常工作;这一条不会自动补发。"
+        )
     return (
-        "刚才的定时任务" + reminder + "已触发，但 TA 的回复没有成功送达。"
-        + str(user_text or "连接模型服务时出了问题。").strip()
+        "提醒没能送到\n"
+        f"「{title}」原定 {scheduled_time} 提醒你,试了几次都没成功。\n"
+        "这条提醒不会自动补发,需要的话可以重新设一个。"
     )
 
 
@@ -3490,8 +3531,8 @@ def _deliver_terminal_failure_reply(row: dict) -> bool:
         error_class,
         language=language,
     )
-    scheduled_notes = (
-        _scheduled_failure_notes(user_id, job_id)
+    scheduled_contexts = (
+        _scheduled_failure_contexts(user_id, job_id)
         if lane == "scheduled"
         else []
     )
@@ -3499,8 +3540,7 @@ def _deliver_terminal_failure_reply(row: dict) -> bool:
         _scheduled_failure_reply_text(
             error_class,
             language=language,
-            user_text=user_text,
-            notes=scheduled_notes,
+            contexts=scheduled_contexts,
         )
         if lane == "scheduled"
         else (

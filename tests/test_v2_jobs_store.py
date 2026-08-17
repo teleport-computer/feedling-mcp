@@ -648,6 +648,9 @@ def test_scheduled_failure_reply_is_standalone_visible_and_idempotent(monkeypatc
             "status": "fired",
             "fired_job_id": job_id,
             "note": "提醒我喝水",
+            "at": "2026-08-17T09:30:00",
+            "timezone": "Asia/Shanghai",
+            "due_at": 1_787_110_200.0,
         },
         item_key="timer-water",
     )
@@ -700,10 +703,12 @@ def test_scheduled_failure_reply_is_standalone_visible_and_idempotent(monkeypatc
     assert failure["wake_kind"] == "scheduled"
     assert failure["notice_kind"] == "scheduled_wake_failure"
     assert failure["turn_failure_error_class"] == "provider_empty_reply"
-    assert "定时任务" in encrypted_plaintexts[0]
-    assert "已触发" in encrypted_plaintexts[0]
-    assert "提醒我喝水" in encrypted_plaintexts[0]
-    assert "空回复" in encrypted_plaintexts[0]
+    assert encrypted_plaintexts == [
+        "提醒没能送到\n"
+        "「提醒我喝水」原定 2026年8月17日 09:30（Asia/Shanghai） 提醒你,"
+        "试了几次都没成功。\n"
+        "这条提醒不会自动补发,需要的话可以重新设一个。"
+    ]
     parent = db.chat_get_strict(uid, "parent-user")
     assert not str(parent.get("reply_message_id") or "")
     assert v2_cursor.load_seq(core_store.get_store(uid)) == cursor_before
@@ -714,6 +719,28 @@ def test_scheduled_failure_reply_is_standalone_visible_and_idempotent(monkeypatc
             (uid,),
         ).fetchone()[0]
     assert route_error == ""
+
+
+def test_scheduled_quota_failure_uses_approved_copy_with_original_time():
+    text = jobs_store._scheduled_failure_reply_text(
+        "quota_insufficient",
+        language="zh-CN",
+        contexts=[{
+            "note": "喝水",
+            "at": "2026-08-17T09:30:00",
+            "timezone": "Asia/Shanghai",
+            "due_at": "",
+        }],
+    )
+
+    assert text == (
+        "提醒没能送到\n"
+        "「喝水」原定 2026年8月17日 09:30（Asia/Shanghai） 提醒你,"
+        "因为模型服务额度不足没能送出。\n"
+        "充值后新的提醒就能正常工作;这一条不会自动补发。"
+    )
+    for internal_term in ("provider", "Runtime", "job", "retry", "空回复", "定时任务"):
+        assert internal_term not in text
 
 
 def test_terminal_image_generation_configuration_failure_never_uses_slow_fallback(
