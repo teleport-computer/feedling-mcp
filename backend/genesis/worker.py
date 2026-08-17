@@ -839,6 +839,7 @@ def _complete_text(
     max_tokens: int,
     idempotency_key: str,
     temperature: float = 0.2,
+    response_format: dict[str, Any] | None = None,
 ) -> str:
     result = llm.complete(
         user_id=user_id,
@@ -850,6 +851,7 @@ def _complete_text(
         timeout=float(_env_int("FEEDLING_GENESIS_LLM_TIMEOUT_SEC", 90)),
         idempotency_key=idempotency_key,
         temperature=temperature,
+        response_format=response_format,
     )
     return result.text
 
@@ -1598,8 +1600,15 @@ def build_profile_output_from_sources(
         max_tokens,
         temperature,
         timeout,
+        response_format=None,
+        tools=None,
+        tool_choice=None,
     ):
-        del timeout
+        # Genesis uses the synchronous provider surface, which supports native
+        # JSON mode but not forced tool choice.  The shared profile prompt is
+        # already strict JSON, so preserve JSON mode and intentionally ignore
+        # the optional tool hint instead of rejecting the V2 call contract.
+        del timeout, tools, tool_choice
         nonlocal call_number
         call_number += 1
         reply = _complete_text(
@@ -1611,6 +1620,7 @@ def build_profile_output_from_sources(
             messages=messages,
             max_tokens=max_tokens,
             temperature=temperature,
+            response_format=response_format,
             idempotency_key=f"{prefix}:profile:{call_number}",
         )
         return {"reply": reply}
