@@ -266,9 +266,10 @@ Starlette 后添加的中间件位于外层，因此注册时按上述顺序的�
 - `latency_ms`；
 - principal 类型。
 
-日志不记录认证 header、原始 secret、完整敏感 query 或请求/响应正文。使用标准库
-`logging` 配合 JSON formatter，并统一 Uvicorn 与 Celery 的日志格式；Loguru 不作为
-起步硬依赖。
+日志不记录认证 header、原始 secret、完整敏感 query 或请求/响应正文。应用代码统一
+使用 Loguru，并配置 JSON sink 输出结构化日志。Uvicorn 与 Celery 仍通过标准库
+`logging` 产生日志，因此在应用入口设置单向 interception handler，把标准日志转发到
+Loguru；禁止同时保留两套输出 handler，避免重复日志和上下文字段漂移。
 
 ## 11. 健康检查与指标
 
@@ -395,14 +396,47 @@ CI 至少包含：
 | 异步任务 | Celery + Redis |
 | Redis 客户端 | redis-py |
 | 指标 | prometheus-client |
-| 日志 | 标准库 logging + JSON formatter |
+| 日志 | Loguru；统一接管 Uvicorn/Celery 的标准 logging 输出 |
 | 包管理 | uv |
 | 测试 | pytest + HTTPX |
 | lint/format | Ruff |
 
-Python minor 版本和基础镜像必须显式固定，并选择所有关键依赖共同支持的稳定版本。
-依赖声明使用合理兼容范围，`uv.lock` 固定实际构建版本。不要在长期架构文档中写
-“永远不要使用某个未来 Python 版本”之类会过期的规则。
+项目声明 `requires-python = ">=3.12,<3.14"`，开发环境与 Runtime 镜像默认固定
+Python 3.13。升级到新的 Python minor 版本前，必须先确认 FastAPI、Celery、psycopg
+及其二进制依赖均已支持，并在 CI 和镜像中完成验证。
+
+运行时 Python 依赖：
+
+```toml
+[project]
+requires-python = ">=3.12,<3.14"
+dependencies = [
+  "fastapi",
+  "uvicorn[standard]",
+  "pydantic",
+  "pydantic-settings",
+  "celery[redis]",
+  "redis",
+  "psycopg[binary,pool]",
+  "alembic",
+  "loguru",
+  "prometheus-client",
+  "python-dotenv",
+]
+
+[dependency-groups]
+test = [
+  "pytest",
+  "httpx",
+]
+lint = [
+  "ruff",
+]
+```
+
+`pytest`、HTTPX 和 Ruff 只用于开发与 CI，不进入生产 Runtime 依赖。Python、uv、
+PostgreSQL、Redis Server、Docker 和 Compose 是语言工具或外部运行组件，不写入
+`project.dependencies`。依赖声明使用合理兼容范围，`uv.lock` 固定实际构建版本。
 
 暂不引入 SQLAlchemy ORM、LangChain、RabbitMQ、Kafka、MySQL、Poetry、pip-tools、
 Flask 或 Django。新依赖必须由真实需求触发，而不是为了预留扩展点。
