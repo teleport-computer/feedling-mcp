@@ -64,6 +64,9 @@ Phala ingress / Load Balancer
              └──► TEE Redis Celery Broker ──► Phala CVM: Celery Worker Nodes
                                              │
                                              └──► TEE PostgreSQL
+
+API / Worker / PostgreSQL / Redis JSON logs
+             └──► Vector collectors ──► Phala CVM: VictoriaLogs + persistent volume
 ```
 
 同一镜像支持三个角色：
@@ -452,6 +455,48 @@ interception handler 转发到 Loguru，禁止同时保留两套输出 handler�
 日志不记录密码、Authorization header、JWT、Refresh Token、SSE ticket、完整敏感
 query 或默认记录请求/响应正文。
 
+### 17.1 日志采集与长期查询
+
+Phala 自带日志只作为近实时排障和采集链路故障时的短窗口兜底，不承担长期留存。
+IO V2 自建一条轻量日志链路：
+
+```text
+Loguru / service JSON stdout
+        │
+        ▼
+每个 Phala CVM 的 Vector collector
+        │ HTTP 批量发送 + 有界磁盘 buffer
+        ▼
+独立 Phala CVM 的单节点 VictoriaLogs
+        │
+        └── persistent volume + 内置 Web UI / LogsQL
+```
+
+- API、Worker、Migration、PostgreSQL 和 Redis 输出可解析日志到 stdout；应用日志统一为
+  JSON。PostgreSQL 默认不记录完整 SQL 参数或业务正文。
+- 每个业务/数据 CVM 运行一个 Vector collector，采集容器 stdout，补充
+  `environment`、`service`、`node_id` 和镜像版本后发送到 VictoriaLogs。采集器使用
+  只读日志文件或受限日志接口，不挂载可控制 Docker daemon 的不受限 socket。
+- Vector 使用有界磁盘 buffer 和批量发送；VictoriaLogs 暂时不可用时不得阻塞或拖垮
+  API、Worker、PostgreSQL 或 Redis。buffer 满后使用 `drop_newest` 丢弃新到达的普通运行
+  日志并告警，不把 backpressure 传回业务进程。
+- VictoriaLogs 使用独立 Phala CVM 和持久卷，第一阶段为单节点，不承诺日志查询高可用；
+  日志服务故障不能影响业务服务 readiness。
+- 默认设置 `-retentionPeriod=30d` 和 `-retention.maxDiskUsagePercent=80`。时间或磁盘
+  任一条件达到时删除最旧日志，始终预留磁盘余量。
+- 查询入口只允许内部网络或管理员凭证访问，不对公网匿名开放。test、pre、prod 各用
+  独立的单节点 VictoriaLogs 实例和凭证，不共享日志存储，避免跨环境误查。
+- 常用查询字段包括 `timestamp`、`level`、`environment`、`service`、`node_id`、
+  `request_id`、路由模板、status 和稳定错误码。`request_id` 等高基数字段不作为固定
+  stream label。
+- Vector 在发送前再次执行敏感字段删除规则。日志服务保存的是运行日志，不得接收密码、
+  Token、请求/响应正文、Celery 敏感 payload 或数据库明文业务内容。
+- 安全审计事件写入 PostgreSQL 的专用 append-only 业务表；VictoriaLogs 不是唯一审计
+  账本，也不用于恢复业务状态。
+
+第一阶段不部署 Elasticsearch/OpenSearch、Loki、Grafana 或 VictoriaLogs cluster。出现
+单节点容量瓶颈、查询高可用要求或合规归档要求后，再设计集群或对象存储归档。
+
 ## 18. 健康检查与指标
 
 ### 18.1 `/healthz`
@@ -535,6 +580,9 @@ API 关闭顺序：
 13. Refresh 原子消费、family replay 撤销 access session，以及 pepper 轮换。
 14. PostgreSQL outbox 到 Redis Stream 的崩溃恢复和重复投递去重。
 15. lookup hit/miss 的响应时序分布、dormant 用户 pepper 轮换和退休条件。
+16. Vector 能采集各服务 JSON 日志、执行脱敏并投递 VictoriaLogs。
+17. VictoriaLogs 不可用、Vector buffer 满和日志 CVM 重启时，业务请求与任务不被阻塞。
+18. 日志查询鉴权、环境隔离、30 天/80% retention 和敏感内容回归测试。
 
 架构护栏：
 
@@ -603,8 +651,8 @@ lint = [
 ]
 ```
 
-Python、uv、TEE PostgreSQL、Redis Server、Docker 和 Compose 是语言工具或外部组件，
-不写入 `project.dependencies`。`uv.lock` 固定实际构建版本。
+Python、uv、TEE PostgreSQL、Redis Server、Vector、VictoriaLogs、Docker 和 Compose
+是语言工具或外部组件，不写入 `project.dependencies`。`uv.lock` 固定实际构建版本。
 
 暂不引入 SQLAlchemy ORM、LangChain、RabbitMQ、Kafka、MySQL、Poetry、pip-tools、
 Flask 或 Django。新依赖必须由真实需求触发。
@@ -618,10 +666,11 @@ API 默认监听 `0.0.0.0:8000`，Dockerfile、Compose、探针和文档统一�
 自建 TEE PostgreSQL 与 TEE Redis，不把本地 Compose 直接当生产发布拓扑。
 
 生产部署平台固定为 Phala。Phala 部署规格负责定义 API/Worker CVM、PostgreSQL CVM、
-Redis CVM、ingress、网络策略、持久卷、环境隔离和资源配额；本文不写死任何具体 app ID、
-CVM 名或域名。生产 manifest 必须固定镜像 digest，并把会影响信任边界的 Compose 配置
-纳入可验证 measurement/compose hash。test、pre、prod 使用独立 workload 与 secrets，
-不得共享数据库、Redis namespace 或签名密钥。
+Redis CVM、VictoriaLogs CVM、各节点 Vector collector、ingress、网络策略、持久卷、环境
+隔离和资源配额；本文不写死任何具体 app ID、CVM 名或域名。生产 manifest 必须固定镜像
+digest，并把会影响信任边界的 Compose 配置纳入可验证 measurement/compose hash。test、
+pre、prod 使用独立 workload 与 secrets，不得共享数据库、Redis namespace、日志 tenant
+或签名密钥。
 
 生产上线前必须具备：
 
@@ -634,6 +683,8 @@ CVM 名或域名。生产 manifest 必须固定镜像 digest，并把会影响�
 - 多节点滚动发布和 SSE 恢复验证。
 - Phala CVM 部署、attestation/measurement 校验和镜像 digest/compose hash 留档；
 - 在 test → pre 验证后再发布 prod，并保留上一版可恢复镜像与数据库兼容回滚窗口。
+- VictoriaLogs 持久卷、30 天/80% retention、查询鉴权和容量告警；
+- Vector collector 健康、buffer 使用量、投递失败和丢弃计数告警。
 
 TEE 的具体信任根、远程证明、measurement 白名单、secret release、重启/unseal、管理员
 权限和备份密钥托管由部署规格定义；本服务规格不把“运行在 TEE”本身等同于这些控制已
@@ -645,6 +696,7 @@ TEE 的具体信任根、远程证明、measurement 白名单、secret release�
 
 - TEE PostgreSQL 自动故障切换或只读副本；
 - 多 Celery 队列和工作流；
+- VictoriaLogs cluster、Grafana/Loki 和日志对象存储归档；
 - 独立任务状态表与长期任务审计；
 - 对象存储和大文件上传；
 - 外部 HTTP client 熔断策略；
