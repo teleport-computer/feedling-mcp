@@ -2458,6 +2458,96 @@ def _job_row(job_id: int):
         ).fetchone()
 
 
+def test_watchdog_recovery_expires_scheduled_once_requeue_budget_is_spent():
+    """The exact watchdog path must honor the same bounded retry budget."""
+
+    job_id = _stuck_scheduled("u_js_sched_watchdog_budget")
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            "UPDATE agent_jobs SET attempt_count=%s WHERE id=%s",
+            (jobs_store.SCHEDULED_LEASE_REQUEUE_MAX_ATTEMPTS, job_id),
+        )
+
+    recovered = jobs_store.recover_killed_job(
+        job_id=job_id,
+        claimed_by="w",
+        reason="slot_watchdog_timeout",
+    )
+
+    assert recovered is not None and recovered["recovery"] == "terminal"
+    status, attempts, last_error = _job_row(job_id)
+    assert status == "expired"
+    assert attempts == jobs_store.SCHEDULED_LEASE_REQUEUE_MAX_ATTEMPTS + 1
+    assert last_error == "slot_watchdog_timeout"
+
+
+@pytest.mark.parametrize("outcome", [None, "known"])
+def test_watchdog_recovery_does_not_requeue_scheduled_with_mcp_attempt(outcome):
+    """Any MCP attempt makes replay unsafe, regardless of recorded outcome."""
+
+    uid = f"u_js_sched_watchdog_mcp_{outcome or 'unknown'}"
+    job_id = _stuck_scheduled(uid)
+    jobs_store.start_mcp_mutation_attempt(
+        job_id,
+        user_id=uid,
+        claimed_by="w",
+        call_id=f"watchdog-{outcome or 'unknown'}",
+        tool_name="mcp__calendar__create",
+        input_frontier_seq=0,
+    )
+    if outcome is not None:
+        with db.get_pool().connection() as conn:
+            conn.execute(
+                "UPDATE v2_mcp_mutation_attempts SET outcome=%s, "
+                "resolved_at=clock_timestamp() WHERE job_id=%s",
+                (outcome, job_id),
+            )
+
+    recovered = jobs_store.recover_killed_job(
+        job_id=job_id,
+        claimed_by="w",
+        reason="slot_watchdog_timeout",
+    )
+
+    assert recovered is not None and recovered["recovery"] == "terminal"
+    status, _attempts, last_error = _job_row(job_id)
+    assert status == "expired"
+    assert last_error == (
+        "mcp_mutation_outcome_unknown" if outcome is None
+        else "slot_watchdog_timeout"
+    )
+
+
+@pytest.mark.parametrize("effect_type", sorted(jobs_store.DURABLE_TOOL_EFFECT_TYPES))
+def test_watchdog_recovery_does_not_requeue_scheduled_with_durable_effect(
+    effect_type,
+):
+    """A durable platform write makes exact scheduled replay unsafe."""
+
+    from model_api_runtime.v2 import effect_outbox
+
+    uid = f"u_js_sched_watchdog_effect_{effect_type[:10]}"
+    job_id = _stuck_scheduled(uid)
+    effect_outbox.enqueue_effect(
+        job_id=job_id,
+        user_id=uid,
+        effect_type=effect_type,
+        ordinal=0,
+        expected_generation=1,
+        payload={"ciphertext": "shell"},
+        input_frontier_seq=0,
+    )
+
+    recovered = jobs_store.recover_killed_job(
+        job_id=job_id,
+        claimed_by="w",
+        reason="slot_watchdog_timeout",
+    )
+
+    assert recovered is not None and recovered["recovery"] == "terminal"
+    assert _job_row(job_id)[0] == "expired"
+
+
 def test_reap_requeues_stuck_scheduled_instead_of_expiring():
     """租约超时 = worker 死了、活儿没干 → 退回 pending 重投,不是丢掉。"""
     import time
