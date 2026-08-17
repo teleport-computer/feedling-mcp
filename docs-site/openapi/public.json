@@ -5375,7 +5375,8 @@
             }
           }
         },
-        "x-feedling-contract-level": "compatibility"
+        "x-feedling-contract-level": "compatibility",
+        "description": "Create or update the active hosted model route. context_window_tokens is treated as route metadata: a value below Runtime V2's deployment-tunable trust floor (32,768 by default) falls through to the audited-family or unaudited-route default rather than becoming the prompt budget. The resolved value is returned and persisted."
       }
     },
     "/v1/model_api/test": {

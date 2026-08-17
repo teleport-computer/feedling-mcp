@@ -10,6 +10,15 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **Hosted Runtime V2 no longer trusts route context-window metadata below a
+  deployment-tunable floor.** Values below the default 32,768-token floor now
+  fall through to the audited-family or unaudited-route default instead of
+  silently shrinking the required prompt surface. A content-free warning records
+  the reported value, floor, resolved value/source, and closed provider class;
+  it never records the model name or prompt content. Because saved routes do not
+  carry provenance for this field, the same rule also applies to a small value
+  entered explicitly during Model API setup.
+
 - **Hosted Runtime V2 now allows up to 15 provider rounds in an ordinary Chat
   or proactive turn before its hard terminal-reply round, up from six.** The
   final allowed round still withholds new tool use so the limit remains a real
