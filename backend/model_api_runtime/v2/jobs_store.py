@@ -1686,6 +1686,79 @@ def reschedule_owned_job(
             return cur.rowcount == 1
 
 
+def reschedule_pristine_scheduled_failure(
+    job_id: int,
+    *,
+    claimed_by: str,
+    error: str,
+    available_at: float,
+    expected_attempt_count: int,
+    max_attempts: int,
+) -> bool:
+    """Retry one failed scheduled delivery only while the turn is pristine.
+
+    The same job id is retained because fired reminder context and deterministic
+    effect ids are keyed by it.  Any MCP mutation attempt or durable platform
+    write makes a whole-turn replay unsafe even when its recorded outcome is
+    known: a successful side effect must never be executed a second time.
+
+    This transition deliberately does not enqueue terminal-failure visibility.
+    The worker calls :func:`mark_failed` only when this bounded retry is
+    ineligible or exhausted.
+    """
+    attempt_count = int(expected_attempt_count)
+    attempt_limit = int(max_attempts)
+    if attempt_count < 0:
+        raise ValueError("expected_attempt_count must be non-negative")
+    if attempt_limit <= 0:
+        raise ValueError("max_attempts must be positive")
+
+    with _pool().connection() as conn:
+        with conn.transaction():
+            identity = conn.execute(
+                "SELECT user_id FROM agent_jobs WHERE id=%s",
+                (int(job_id),),
+            ).fetchone()
+            if identity is None:
+                return False
+            control = conn.execute(
+                "SELECT hosted_runtime_state,runtime_generation "
+                "FROM v2_runtime_state WHERE user_id=%s FOR UPDATE",
+                (str(identity[0]),),
+            ).fetchone()
+            if control is None or str(control[0]) != "v2":
+                return False
+            runtime_generation = int(control[1])
+            cur = conn.execute(
+                "UPDATE agent_jobs AS job SET status='pending',"
+                "available_at=to_timestamp(%s),last_error=%s,"
+                "attempt_count=attempt_count+1,claimed_by=NULL,claimed_at=NULL,"
+                "started_at=NULL,finished_at=NULL,lease_expires_at=NULL,"
+                "deadline_at=NULL "
+                "WHERE job.id=%s AND job.lane='scheduled' "
+                "AND job.claimed_by=%s AND job.status IN ('claimed','running') "
+                "AND job.lease_expires_at > clock_timestamp() "
+                "AND job.expected_runtime_generation=%s "
+                "AND job.attempt_count=%s AND job.attempt_count<%s "
+                "AND NOT EXISTS (SELECT 1 FROM v2_mcp_mutation_attempts mcp "
+                "  WHERE mcp.job_id=job.id) "
+                "AND NOT EXISTS (SELECT 1 FROM v2_effect_outbox effect "
+                "  WHERE effect.job_id=job.id "
+                "  AND effect.effect_type = ANY(%s))",
+                (
+                    float(available_at),
+                    str(error)[:500],
+                    int(job_id),
+                    str(claimed_by),
+                    runtime_generation,
+                    attempt_count,
+                    attempt_limit - 1,
+                    sorted(DURABLE_TOOL_EFFECT_TYPES),
+                ),
+            )
+            return cur.rowcount == 1
+
+
 def make_pending_job_ready(user_id: str, *, lane: str = "profile") -> bool:
     """Make one current-generation delayed pending job immediately claimable."""
     with _pool().connection() as conn:

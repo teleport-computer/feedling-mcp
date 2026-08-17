@@ -1802,6 +1802,70 @@ def test_reschedule_owned_job_rejects_wrong_owner_without_mutation():
     assert after == before
 
 
+def test_pristine_scheduled_failure_reschedule_rejects_any_mcp_attempt():
+    uid = "u_scheduled_failure_mcp_fence"
+    owner = "wake:g1"
+    seed_user(uid)
+    _reset(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, "scheduled")
+    claimed = jobs_store.claim_next_job(owner, lanes={"scheduled"})
+    assert claimed is not None and int(claimed["id"]) == job_id
+    assert jobs_store.mark_running(job_id, claimed_by=owner)
+    assert jobs_store.start_mcp_mutation_attempt(
+        job_id,
+        user_id=uid,
+        claimed_by=owner,
+        call_id="calendar-write",
+        tool_name="mcp__calendar__create",
+        input_frontier_seq=0,
+    )
+
+    assert not jobs_store.reschedule_pristine_scheduled_failure(
+        job_id,
+        claimed_by=owner,
+        error="scheduled_retry:wake_failed:providererror",
+        available_at=time.time() + 30,
+        expected_attempt_count=0,
+        max_attempts=3,
+    )
+    assert _job_row(job_id)[0:2] == ("running", 0)
+
+
+@pytest.mark.parametrize("effect_type", sorted(jobs_store.DURABLE_TOOL_EFFECT_TYPES))
+def test_pristine_scheduled_failure_reschedule_rejects_durable_effect(
+    effect_type,
+):
+    from model_api_runtime.v2 import effect_outbox
+
+    uid = f"u_scheduled_failure_effect_{effect_type[:10]}"
+    owner = "wake:g2"
+    seed_user(uid)
+    _reset(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, "scheduled")
+    claimed = jobs_store.claim_next_job(owner, lanes={"scheduled"})
+    assert claimed is not None and int(claimed["id"]) == job_id
+    assert jobs_store.mark_running(job_id, claimed_by=owner)
+    effect_outbox.enqueue_effect(
+        job_id=job_id,
+        user_id=uid,
+        effect_type=effect_type,
+        ordinal=0,
+        expected_generation=1,
+        payload={"ciphertext": "shell"},
+        input_frontier_seq=0,
+    )
+
+    assert not jobs_store.reschedule_pristine_scheduled_failure(
+        job_id,
+        claimed_by=owner,
+        error="scheduled_retry:wake_failed:providererror",
+        available_at=time.time() + 30,
+        expected_attempt_count=0,
+        max_attempts=3,
+    )
+    assert _job_row(job_id)[0:2] == ("running", 0)
+
+
 def test_make_pending_profile_job_ready_updates_only_delayed_row():
     uid = "u_profile_make_ready"
     seed_user(uid)

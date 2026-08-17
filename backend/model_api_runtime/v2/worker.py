@@ -954,6 +954,7 @@ _WAKE_FAIL_BACKOFF_CAP_SEC = float(
     os.environ.get("PROACTIVE_FAIL_BACKOFF_CAP_SEC", "3600")
 )
 _FAIL_BACKOFF_WAKE_LANES = frozenset({"heartbeat", "scheduled"})
+_SCHEDULED_FAILURE_RETRY_DELAYS_SEC = (30.0, 120.0)
 
 _DEGENERATE_REPLY_FALLBACK = (
     os.environ.get(
@@ -7015,6 +7016,7 @@ async def _run_wake(
     claimed_by: str,
     tm: "TurnMetrics | None" = None,
     trajectory_recorder: "v2_trajectory.TrajectoryRecorder | None" = None,
+    attempt_count: int = 0,
 ) -> str:
     """wake-lane（heartbeat/scheduled/manual_wake/screen_watch）turn：让伴侣主动开口，而不是
     回答用户刚发的消息（用户根本没发消息——这就是唤醒的定义）。同 `_run_compaction` 一样自成
@@ -8853,6 +8855,47 @@ async def _run_wake(
         log.warning(
             "[v2.worker] wake job %s lane=%s failed code=%s", job_id, lane, code
         )
+        scheduled_retry_delay = None
+        if (
+            lane == "scheduled"
+            and not isinstance(e, (LostJobLease, RuntimeModeChanged))
+            and not (
+                isinstance(e, TurnError)
+                and str(e) == _TOOL_BUDGET_EXHAUSTED_REASON
+            )
+            and provider_client.classify_provider_error(e) != "provider_config"
+            and 0 <= int(attempt_count) < len(
+                _SCHEDULED_FAILURE_RETRY_DELAYS_SEC
+            )
+        ):
+            scheduled_retry_delay = _SCHEDULED_FAILURE_RETRY_DELAYS_SEC[
+                int(attempt_count)
+            ]
+        if scheduled_retry_delay is not None:
+            rescheduled = await asyncio.to_thread(
+                jobs_store.reschedule_pristine_scheduled_failure,
+                job_id,
+                claimed_by=claimed_by,
+                error=f"scheduled_retry:{code}",
+                available_at=time.time() + scheduled_retry_delay,
+                expected_attempt_count=int(attempt_count),
+                max_attempts=len(_SCHEDULED_FAILURE_RETRY_DELAYS_SEC) + 1,
+            )
+            if rescheduled:
+                await _record_trajectory(
+                    trajectory_recorder,
+                    "scheduled_failure_retry",
+                    {
+                        "lane": "scheduled",
+                        "attempt_count": int(attempt_count) + 1,
+                        "retry_delay_sec": scheduled_retry_delay,
+                        "error_code": code,
+                    },
+                    best_effort=True,
+                )
+                if tm is not None:
+                    tm.flush(failed=True, status="scheduled_retry_scheduled")
+                return "rescheduled"
         arm_wake_backoff = (
             lane in _FAIL_BACKOFF_WAKE_LANES
             and not isinstance(e, (LostJobLease, RuntimeModeChanged))
@@ -10797,6 +10840,7 @@ async def process_job(
                 claimed_by,
                 tm,
                 trajectory_recorder,
+                attempt_count=int(job.get("attempt_count") or 0),
             )
         if lane in _EXTRACTION_LANES:
             # 自成一体的记忆抽取路径（capture/dream，Task 3）：build prompt → BYOK 抽取 →

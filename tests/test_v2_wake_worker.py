@@ -27,6 +27,7 @@ a unit test) reached through a real PR A effect-outbox drain wired via
 `TurnDeps.apply_pending_effects`."""
 from __future__ import annotations
 
+import ast
 import asyncio
 import json
 import sys
@@ -1145,6 +1146,7 @@ def test_scheduled_thinking_only_remains_a_must_deliver_failure(monkeypatch):
             _BYOK,
             asyncio.Semaphore(4),
             claimed_by,
+            attempt_count=2,
         )
     )
 
@@ -1994,6 +1996,275 @@ def test_run_wake_provider_error_silent_mark_failed(monkeypatch):
     assert shadow == [], "provider failures are not model allow/suppress decisions"
 
 
+def test_scheduled_failure_retry_wiring_source_guard():
+    source_path = Path(worker.__file__)
+    tree = ast.parse(source_path.read_text())
+    run_wake = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.AsyncFunctionDef) and node.name == "_run_wake"
+    )
+    retry_calls = [
+        node.lineno
+        for node in ast.walk(run_wake)
+        if isinstance(node, ast.Attribute)
+        and node.attr == "reschedule_pristine_scheduled_failure"
+    ]
+    assert len(retry_calls) == 1, (
+        f"worker.py:{run_wake.lineno} scheduled failure retry wiring missing; "
+        f"found calls at {retry_calls}"
+    )
+
+
+def test_scheduled_transient_failure_retries_then_succeeds_without_notice(
+    monkeypatch,
+):
+    uid = "u_wake_scheduled_retry_success"
+    conftest.seed_user(uid)
+    _reset(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, "scheduled")
+    claimed_by = _claim(job_id)
+    fail_provider = {"value": True}
+    provider_calls = []
+
+    async def _provider(config, messages, *, tools=None, **_kwargs):
+        provider_calls.append(fail_provider["value"])
+        if fail_provider["value"]:
+            raise provider_client.ProviderError("temporary", status_code=503)
+        return _text_round("remembered")
+
+    monkeypatch.setattr(provider_client, "chat_completion_async", _provider)
+    surfaced = []
+    monkeypatch.setattr(
+        worker,
+        "_surface_terminal_error",
+        lambda deps, user_id, failed_job_id, code: surfaced.append(
+            (user_id, failed_job_id, code)
+        ),
+    )
+    monkeypatch.setattr(
+        worker,
+        "_write_encrypted_reply",
+        lambda store, text: {"id": "scheduled-retry-reply"},
+    )
+    deps = _wake_deps(
+        tail=[{"id": "m1", "ts": 1.0, "role": "user", "content": "hi"}]
+    )
+
+    first = asyncio.run(worker._run_wake(
+        job_id,
+        uid,
+        "scheduled",
+        deps,
+        _BYOK,
+        asyncio.Semaphore(4),
+        claimed_by,
+        attempt_count=0,
+    ))
+    assert first == "rescheduled"
+    with db.get_pool().connection() as conn:
+        retry_row = conn.execute(
+            "SELECT status,attempt_count,"
+            "EXTRACT(EPOCH FROM available_at)-EXTRACT(EPOCH FROM now()) "
+            "FROM agent_jobs WHERE id=%s",
+            (job_id,),
+        ).fetchone()
+        marker_count = conn.execute(
+            "SELECT count(*) FROM v2_terminal_failure_outbox WHERE job_id=%s",
+            (job_id,),
+        ).fetchone()[0]
+    assert retry_row[0:2] == ("pending", 1)
+    assert 25 <= float(retry_row[2]) <= 35
+    assert marker_count == 0
+    assert surfaced == []
+
+    assert jobs_store.make_pending_job_ready(uid, lane="scheduled")
+    claimed_by = _claim(job_id)
+    fail_provider["value"] = False
+    second = asyncio.run(worker._run_wake(
+        job_id,
+        uid,
+        "scheduled",
+        deps,
+        _BYOK,
+        asyncio.Semaphore(4),
+        claimed_by,
+        attempt_count=1,
+    ))
+
+    assert second == "completed"
+    assert _job_status(job_id)[0] == "completed"
+    with db.get_pool().connection() as conn:
+        marker_count = conn.execute(
+            "SELECT count(*) FROM v2_terminal_failure_outbox WHERE job_id=%s",
+            (job_id,),
+        ).fetchone()[0]
+    assert marker_count == 0
+    assert surfaced == []
+    assert provider_calls == [True, True, False]
+
+
+def test_scheduled_transient_failure_notifies_once_only_after_retry_exhaustion(
+    monkeypatch,
+):
+    uid = "u_wake_scheduled_retry_exhausted"
+    conftest.seed_user(uid)
+    _reset(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, "scheduled")
+    surfaced = []
+    monkeypatch.setattr(
+        worker,
+        "_surface_terminal_error",
+        lambda deps, user_id, failed_job_id, code: surfaced.append(
+            (user_id, failed_job_id, code)
+        ),
+    )
+
+    async def _boom(config, messages, *, tools=None, **_kwargs):
+        raise provider_client.ProviderError("temporary", status_code=503)
+
+    monkeypatch.setattr(provider_client, "chat_completion_async", _boom)
+    deps = _wake_deps(
+        tail=[{"id": "m1", "ts": 1.0, "role": "user", "content": "hi"}]
+    )
+
+    for attempt_count, expected_status in (
+        (0, "rescheduled"),
+        (1, "rescheduled"),
+        (2, "failed"),
+    ):
+        claimed_by = _claim(job_id)
+        status = asyncio.run(worker._run_wake(
+            job_id,
+            uid,
+            "scheduled",
+            deps,
+            _BYOK,
+            asyncio.Semaphore(4),
+            claimed_by,
+            attempt_count=attempt_count,
+        ))
+        assert status == expected_status
+        with db.get_pool().connection() as conn:
+            marker_count = conn.execute(
+                "SELECT count(*) FROM v2_terminal_failure_outbox WHERE job_id=%s",
+                (job_id,),
+            ).fetchone()[0]
+        assert marker_count == (1 if expected_status == "failed" else 0)
+        assert len(surfaced) == (1 if expected_status == "failed" else 0)
+        if expected_status == "rescheduled":
+            with db.get_pool().connection() as conn:
+                delay = conn.execute(
+                    "SELECT EXTRACT(EPOCH FROM available_at)-"
+                    "EXTRACT(EPOCH FROM now()) FROM agent_jobs WHERE id=%s",
+                    (job_id,),
+                ).fetchone()[0]
+            expected_delay = worker._SCHEDULED_FAILURE_RETRY_DELAYS_SEC[
+                attempt_count
+            ]
+            assert expected_delay - 5 <= float(delay) <= expected_delay + 5
+            assert jobs_store.make_pending_job_ready(uid, lane="scheduled")
+
+    assert _job_status(job_id)[0] == "failed"
+    assert len(surfaced) == 1
+
+
+@pytest.mark.parametrize("status_code", [401, 402, 403])
+def test_scheduled_provider_config_failure_never_retries(monkeypatch, status_code):
+    uid = f"u_wake_scheduled_no_retry_{status_code}"
+    conftest.seed_user(uid)
+    _reset(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, "scheduled")
+    claimed_by = _claim(job_id)
+    provider_calls = []
+
+    async def _boom(config, messages, *, tools=None, **_kwargs):
+        provider_calls.append(status_code)
+        raise provider_client.ProviderError("provider config", status_code=status_code)
+
+    monkeypatch.setattr(provider_client, "chat_completion_async", _boom)
+    retry_calls = []
+    original_retry = jobs_store.reschedule_pristine_scheduled_failure
+
+    def _retry_spy(*args, **kwargs):
+        retry_calls.append((args, kwargs))
+        return original_retry(*args, **kwargs)
+
+    monkeypatch.setattr(
+        jobs_store,
+        "reschedule_pristine_scheduled_failure",
+        _retry_spy,
+    )
+    monkeypatch.setattr(worker, "_surface_terminal_error", lambda *args: None)
+    deps = _wake_deps(
+        tail=[{"id": "m1", "ts": 1.0, "role": "user", "content": "hi"}]
+    )
+
+    status = asyncio.run(worker._run_wake(
+        job_id,
+        uid,
+        "scheduled",
+        deps,
+        _BYOK,
+        asyncio.Semaphore(4),
+        claimed_by,
+        attempt_count=0,
+    ))
+
+    assert status == "failed"
+    assert retry_calls == []
+    assert provider_calls == [status_code]
+    with db.get_pool().connection() as conn:
+        row = conn.execute(
+            "SELECT status,attempt_count FROM agent_jobs WHERE id=%s",
+            (job_id,),
+        ).fetchone()
+        marker_count = conn.execute(
+            "SELECT count(*) FROM v2_terminal_failure_outbox WHERE job_id=%s",
+            (job_id,),
+        ).fetchone()[0]
+    assert row == ("failed", 1)
+    assert marker_count == 1
+
+
+def test_scheduled_tool_budget_exhaustion_never_retries(monkeypatch):
+    uid = "u_wake_scheduled_no_retry_budget"
+    conftest.seed_user(uid)
+    _reset(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, "scheduled")
+    claimed_by = _claim(job_id)
+
+    async def _exhausted(*_args, **_kwargs):
+        raise worker.TurnError(worker._TOOL_BUDGET_EXHAUSTED_REASON)
+
+    monkeypatch.setattr(worker.v2_tool_loop, "run_tool_loop", _exhausted)
+    retry_calls = []
+    monkeypatch.setattr(
+        jobs_store,
+        "reschedule_pristine_scheduled_failure",
+        lambda *args, **kwargs: retry_calls.append((args, kwargs)) or True,
+    )
+    monkeypatch.setattr(worker, "_surface_terminal_error", lambda *args: None)
+
+    status = asyncio.run(worker._run_wake(
+        job_id,
+        uid,
+        "scheduled",
+        _wake_deps(tail=[]),
+        _BYOK,
+        asyncio.Semaphore(4),
+        claimed_by,
+        attempt_count=0,
+    ))
+
+    assert status == "failed"
+    assert retry_calls == []
+    assert _job_status(job_id) == (
+        "failed",
+        "wake_failed:tool_budget_exhausted",
+    )
+
+
 def test_run_wake_unexpected_exception_also_silent_mark_failed(monkeypatch):
     """Any other unexpected exception during the wake turn (e.g. read_tail
     blowing up) must be caught by _run_wake's own try/except, same as
@@ -2718,7 +2989,7 @@ def test_scheduled_wake_empty_reply_fails_instead_of_completing_silently(monkeyp
     status = asyncio.run(worker._run_wake(
         job_id, uid, "scheduled",
         deps,
-        _BYOK, asyncio.Semaphore(4), claimed_by))
+        _BYOK, asyncio.Semaphore(4), claimed_by, attempt_count=2))
 
     assert status != "completed", "定时提醒返空竟然算成功了——正是本用例要挡的回归"
     st, last_error = _job_status(job_id)
