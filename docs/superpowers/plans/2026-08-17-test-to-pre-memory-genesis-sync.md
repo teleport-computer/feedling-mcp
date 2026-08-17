@@ -185,7 +185,7 @@ Expected: one two-parent merge commit.
 ### Task 2: Converge RDS and TEE wake-outcome migrations with TDD
 
 **Files:**
-- Create: `backend/alembic/versions/0090_merge_pre_test_wake_outcomes.py`
+- Create: `backend/alembic/versions/0090_merge_wake_outcomes.py`
 - Create: `backend/alembic_tee/versions/0022_v2_wake_outcomes.py`
 - Modify: `tests/test_v2_jobs_migration.py`
 - Modify: `tests/test_pre_runtime_preflight.py`
@@ -193,15 +193,15 @@ Expected: one two-parent merge commit.
 
 **Interfaces:**
 - Consumes: RDS heads `0089_merge_pre_test_agent_jobs` and `0089_v2_wake_outcomes`; TEE head `0021_agent_jobs_available_at`.
-- Produces: sole RDS head `0090_merge_pre_test_wake_outcomes`; sole TEE head `0022_v2_wake_outcomes` with equivalent columns and updated frozen marker.
+- Produces: sole RDS head `0090_merge_wake_outcomes`; sole TEE head `0022_v2_wake_outcomes` with equivalent columns and updated frozen marker.
 
 - [ ] **Step 1: Update tests first to state the new heads and parity contract**
 
 Change graph assertions to:
 
 ```python
-assert script.get_heads() == ["0090_merge_pre_test_wake_outcomes"]
-assert set(script.get_revision("0090_merge_pre_test_wake_outcomes").down_revision) == {
+assert script.get_heads() == ["0090_merge_wake_outcomes"]
+assert set(script.get_revision("0090_merge_wake_outcomes").down_revision) == {
     "0089_merge_pre_test_agent_jobs",
     "0089_v2_wake_outcomes",
 }
@@ -230,7 +230,7 @@ FEEDLING_TEST_PG='postgresql://postgres:test@127.0.0.1:55432/postgres' \
   tests/test_pre_test_migration_convergence.py -q
 ```
 
-Expected: failure because `0090_merge_pre_test_wake_outcomes` and `0022_v2_wake_outcomes` do not exist and the graph still has two RDS heads.
+Expected: failure because `0090_merge_wake_outcomes` and `0022_v2_wake_outcomes` do not exist and the graph still has two RDS heads.
 
 - [ ] **Step 3: Add the RDS merge revision**
 
@@ -239,7 +239,7 @@ Create:
 ```python
 """Merge PRE history with auditable Runtime V2 wake outcomes."""
 
-revision = "0090_merge_pre_test_wake_outcomes"
+revision = "0090_merge_wake_outcomes"
 down_revision = (
     "0089_merge_pre_test_agent_jobs",
     "0089_v2_wake_outcomes",
@@ -272,35 +272,28 @@ _UP = """
 ALTER TABLE agent_jobs
   ADD COLUMN IF NOT EXISTS wake_result TEXT,
   ADD COLUMN IF NOT EXISTS wake_result_reason TEXT;
+"""
+
+_UPDATE_PREPARED_HEAD = """
 UPDATE server_config
 SET value = convert_to(
   jsonb_set(convert_from(value, 'UTF8')::jsonb, '{tee_heads}',
             '["0022_v2_wake_outcomes"]'::jsonb)::text,
   'UTF8'
 )
-WHERE key = 'phase4_migration';
+WHERE key = 'phase4_primary_prepared'
+  AND COALESCE(convert_from(value, 'UTF8')::jsonb->>'prepared', 'false') = 'true';
 """
-
-_DOWN = """
-ALTER TABLE agent_jobs
-  DROP COLUMN IF EXISTS wake_result_reason,
-  DROP COLUMN IF EXISTS wake_result;
-UPDATE server_config
-SET value = convert_to(
-  jsonb_set(convert_from(value, 'UTF8')::jsonb, '{tee_heads}',
-            '["0021_agent_jobs_available_at"]'::jsonb)::text,
-  'UTF8'
-)
-WHERE key = 'phase4_migration';
-"""
-
 
 def upgrade() -> None:
     op.execute(_UP)
+    op.execute(_UPDATE_PREPARED_HEAD)
 
 
 def downgrade() -> None:
-    op.execute(_DOWN)
+    raise NotImplementedError(
+        "alembic_tee downgrade is not supported; restore from backup"
+    )
 ```
 
 - [ ] **Step 5: Run migration tests and confirm GREEN**
@@ -433,7 +426,7 @@ PYTHONPATH=backend /Users/zhengzhihao/Projects/teleport/feedling-mcp/.venv-test/
 from alembic.config import Config
 from alembic.script import ScriptDirectory
 for ini, loc, expected in (
-    ("backend/alembic.ini", "backend/alembic", ["0090_merge_pre_test_wake_outcomes"]),
+    ("backend/alembic.ini", "backend/alembic", ["0090_merge_wake_outcomes"]),
     ("backend/alembic_tee.ini", "backend/alembic_tee", ["0022_v2_wake_outcomes"]),
 ):
     cfg = Config(ini)

@@ -69,13 +69,13 @@ Any additional conflict found by the real merge must be stopped and assessed aga
 
 TEST adds RDS revision `0089_v2_wake_outcomes`, whose parent is `0088_agent_jobs_available_at`. PRE already has head `0089_merge_pre_test_agent_jobs`, so the combined RDS graph would have two heads.
 
-Add an RDS merge revision named `0090_merge_pre_test_wake_outcomes` with both `0089_merge_pre_test_agent_jobs` and `0089_v2_wake_outcomes` as parents. It performs no schema operation; the TEST branch migration owns the two new `agent_jobs` columns.
+Add an RDS merge revision named `0090_merge_wake_outcomes` with both `0089_merge_pre_test_agent_jobs` and `0089_v2_wake_outcomes` as parents. It performs no schema operation; the TEST branch migration owns the two new `agent_jobs` columns. The revision identifier remains within Alembic's default 32-character version column.
 
 PRE can run with `FEEDLING_DATABASE_SCHEMA=tee`, so add TEE revision `0022_v2_wake_outcomes` after `0021_agent_jobs_available_at`. It must:
 
 - add `wake_result TEXT` and `wake_result_reason TEXT` to `agent_jobs` using idempotent SQL equivalent to the RDS revision;
 - update the frozen PRE migration marker to `0022_v2_wake_outcomes`;
-- downgrade by dropping the two columns and restoring the marker to `0021_agent_jobs_available_at`.
+- preserve the TEE chain's fail-safe no-downgrade contract; rollback requires the documented backup/restore path.
 
 Update migration convergence and PRE preflight tests to require exactly one RDS head and one TEE head at these new revisions. RDS and TEE column semantics must be tested for parity.
 

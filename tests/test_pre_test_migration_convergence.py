@@ -16,7 +16,13 @@ def _scripts(tree: str) -> ScriptDirectory:
 
 def test_rds_pre_and_test_heads_converge():
     script = _scripts("alembic")
-    assert script.get_heads() == ["0089_merge_pre_test_agent_jobs"]
+    assert script.get_heads() == ["0090_merge_wake_outcomes"]
+    assert set(
+        script.get_revision("0090_merge_wake_outcomes").down_revision
+    ) == {
+        "0089_merge_pre_test_agent_jobs",
+        "0089_v2_wake_outcomes",
+    }
     assert set(
         script.get_revision("0089_merge_pre_test_agent_jobs").down_revision
     ) == {
@@ -31,7 +37,11 @@ def test_rds_pre_and_test_heads_converge():
 
 def test_tee_chain_carries_test_runtime_schema():
     script = _scripts("alembic_tee")
-    assert script.get_heads() == ["0021_agent_jobs_available_at"]
+    assert script.get_heads() == ["0022_v2_wake_outcomes"]
+    assert (
+        script.get_revision("0022_v2_wake_outcomes").down_revision
+        == "0021_agent_jobs_available_at"
+    )
     assert (
         script.get_revision("0021_agent_jobs_available_at").down_revision
         == "0020_v2_first_chat_activation"
@@ -68,4 +78,8 @@ def test_tee_migrations_reuse_the_rds_contract_sql():
     assert (
         tee.get_revision("0021_agent_jobs_available_at").module._UP
         == rds.get_revision("0088_agent_jobs_available_at").module._UP
+    )
+    assert (
+        tee.get_revision("0022_v2_wake_outcomes").module._UP
+        == rds.get_revision("0089_v2_wake_outcomes").module._UP
     )
