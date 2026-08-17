@@ -279,6 +279,28 @@ def test_provider_memory_search_description_keeps_positive_and_small_talk_gates(
     assert "If the summary already answers the question, reply directly" in description
 
 
+def test_provider_memory_search_description_leads_with_the_search_trigger():
+    """搜索触发条件必须排在「什么时候别搜」前面，且抑制只说一遍。
+
+    改这段描述的**唯一目的**就是语序：原文三句「不要搜」压在最前，
+    「该搜」埋在第四句；而且 "model/runtime identity" 这组排除项在开头和
+    中间各说了一遍 —— 抑制是双份权重。上面那条用例只钉「这些句子还在」，
+    把顺序整个倒回去它照样绿，所以顺序必须单独钉。
+    """
+    description = next(
+        spec.description
+        for spec in tool_schema.build_tool_specs()
+        if spec.name == "memory_search"
+    )
+
+    trigger = description.index("search before replying instead of guessing")
+    suppression = description.index("skip a standalone greeting")
+    assert trigger < suppression, "「该搜」必须排在「别搜」前面 —— 语序倒回去了"
+
+    assert description.count("model/runtime identity") == 1
+    assert description.count("all-memory overview") == 1
+
+
 def test_final_system_policy_blocks_never_mix_writing_systems(monkeypatch):
     monkeypatch.delenv("FEEDLING_V2_SELF_THINKING", raising=False)
     user_authored_mixed_block = "汉汉汉汉汉abcde"
