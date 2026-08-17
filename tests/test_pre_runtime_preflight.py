@@ -98,3 +98,16 @@ def test_test_deploys_when_the_hosted_v1_consumer_changes():
         "validate-test-runtime-prerequisites",
     )
     assert "tools/chat_resident_consumer.py" in detection
+
+
+def test_test_stage_a_keeps_rds_primary_and_tee_shadow_wiring():
+    source = WORKFLOW.read_text()
+    main = _job(source, "deploy-test-cvm", "deploy-test-runner-cvm")
+    runner = _job(source, "deploy-test-runner-cvm", "deploy-pre-cvm")
+
+    assert "${{ secrets.TEST_DATABASE_URL }}" in main
+    assert "${{ secrets.TEST_TEE_DATABASE_URL }}" in main
+    assert "${{ secrets.TEST_FEEDLING_TEE_DUAL_WRITE }}" in main
+    assert "${{ secrets.TEST_DATABASE_URL }}" in runner
+    assert "PRE_DATABASE_URL" not in main
+    assert "PRE_DATABASE_URL" not in runner
