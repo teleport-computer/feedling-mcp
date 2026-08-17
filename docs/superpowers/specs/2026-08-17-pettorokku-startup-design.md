@@ -11,7 +11,7 @@ Status: 已批准的 IO V2 起步规格
 IO V2 使用 FastAPI + asyncio 提供 REST 与 SSE 接口，使用自建 TEE PostgreSQL 保存
 业务明文，使用同样自建在 TEE 内的 Redis 协调会话、缓存、SSE 和 Celery。API 与
 Celery Worker 使用同一代码和镜像，通过不同入口启动，并支持多 worker、多节点独立
-扩缩容。
+扩缩容。生产环境继续部署在 Phala 平台，运行单元为 Phala CVM/dstack TEE workload。
 
 本文定义运行时边界、数据与鉴权模型、迁移方式和交付要求。本文暂不冻结源码目录，
 只规定 Router 必须使用独立包，与业务代码和基础设施实现分开。
@@ -27,6 +27,8 @@ Celery Worker 使用同一代码和镜像，通过不同入口启动，并支持
 - **多 worker 缓存一致**：共享 Redis、版本化缓存失效事件、短 TTL 和数据库回源。
 - **Router 与业务分离**：Router 只处理 HTTP/SSE 适配，不写 SQL、不操作具体缓存。
 - **多节点部署**：API、Worker 都可以增加副本，节点不依赖粘性会话。
+- **Phala 是生产部署平台**：API、Worker、Migration、自建 PostgreSQL 与 Redis 均作为
+  Phala CVM/dstack workload 交付；应用层不直接依赖 Phala SDK。
 - **SSE 可恢复**：事件进入 Redis Streams，客户端可以通过 `Last-Event-ID` 续传。
 - **默认拒绝**：除明确公开探针和登录接口外，HTTP/SSE 默认需要认证。
 
@@ -41,7 +43,8 @@ Celery Worker 使用同一代码和镜像，通过不同入口启动，并支持
 - ORM、自动生成 repository 或覆盖所有业务的万能 Store。
 - 单个 API 容器内运行多个 Web 进程。
 - 数据库自动故障切换或多主写入。
-- 云厂商 SDK、资源命名或厂商专属发布流程。
+- 在业务代码中引入 Phala SDK、写死 CVM/app ID、环境域名或资源名称。
+- 把其他云厂商 SDK、资源命名或发布流程带入 IO V2。
 - 把 Compose 当作正式生产发布系统。
 
 ## 4. 运行时拓扑
@@ -50,15 +53,15 @@ Celery Worker 使用同一代码和镜像，通过不同入口启动，并支持
 Clients
    │ HTTPS / SSE
    ▼
-Load Balancer
+Phala ingress / Load Balancer
    │
-   ├────► FastAPI Node A ─┐
-   ├────► FastAPI Node B ─┼──► TEE PostgreSQL（唯一主库，业务明文）
-   └────► FastAPI Node N ─┘
+   ├────► Phala CVM: FastAPI Node A ─┐
+   ├────► Phala CVM: FastAPI Node B ─┼──► Phala CVM: TEE PostgreSQL
+   └────► Phala CVM: FastAPI Node N ─┘             （唯一主库，业务明文）
              │
-             ├──► TEE Redis Session / Cache / Streams
+             ├──► Phala CVM: TEE Redis Session / Cache / Streams
              │
-             └──► TEE Redis Celery Broker ──► Celery Worker Nodes
+             └──► TEE Redis Celery Broker ──► Phala CVM: Celery Worker Nodes
                                              │
                                              └──► TEE PostgreSQL
 ```
@@ -70,7 +73,7 @@ Load Balancer
 3. **Migration**：执行 `alembic upgrade head` 或 V1→V2 数据迁移后退出。
 
 单个 API 容器运行一个 Uvicorn 进程，通过增加容器副本扩容。Worker 独立扩缩容。
-TEE Redis 和 TEE PostgreSQL 独立部署。
+TEE Redis 和 TEE PostgreSQL 使用独立 Phala CVM workload 部署，不与 API 进程混跑。
 
 第一阶段的 TEE PostgreSQL 是单主库。自动备份、异地保存和恢复演练提供可恢复性，
 但不把单主库描述为高可用。数据库自动故障切换需要后续独立设计。
@@ -614,6 +617,12 @@ API 默认监听 `0.0.0.0:8000`，Dockerfile、Compose、探针和文档统一�
 本地 Compose 可以启动 API、Worker、Migration、PostgreSQL 和 Redis。生产使用独立的
 自建 TEE PostgreSQL 与 TEE Redis，不把本地 Compose 直接当生产发布拓扑。
 
+生产部署平台固定为 Phala。Phala 部署规格负责定义 API/Worker CVM、PostgreSQL CVM、
+Redis CVM、ingress、网络策略、持久卷、环境隔离和资源配额；本文不写死任何具体 app ID、
+CVM 名或域名。生产 manifest 必须固定镜像 digest，并把会影响信任边界的 Compose 配置
+纳入可验证 measurement/compose hash。test、pre、prod 使用独立 workload 与 secrets，
+不得共享数据库、Redis namespace 或签名密钥。
+
 生产上线前必须具备：
 
 - TEE PostgreSQL 自动备份与异地保存；
@@ -623,6 +632,8 @@ API 默认监听 `0.0.0.0:8000`，Dockerfile、Compose、探针和文档统一�
 - API/Worker/数据库角色最小权限；
 - JWT signing key 与 password pepper 的备份、访问审计和轮换方案；
 - 多节点滚动发布和 SSE 恢复验证。
+- Phala CVM 部署、attestation/measurement 校验和镜像 digest/compose hash 留档；
+- 在 test → pre 验证后再发布 prod，并保留上一版可恢复镜像与数据库兼容回滚窗口。
 
 TEE 的具体信任根、远程证明、measurement 白名单、secret release、重启/unseal、管理员
 权限和备份密钥托管由部署规格定义；本服务规格不把“运行在 TEE”本身等同于这些控制已
@@ -640,7 +651,7 @@ TEE 的具体信任根、远程证明、measurement 白名单、secret release�
 - 向量检索；
 - Webhook 验签；
 - 多进程 Web 容器；
-- 云厂商发布和基础设施即代码。
+- Phala 之外的多云发布和通用基础设施即代码。
 
 ## 26. 与 V1/当前 Feedling 的边界
 
