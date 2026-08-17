@@ -10,6 +10,12 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **Hosted Runtime V2 now allows up to 15 provider rounds in an ordinary Chat
+  or proactive turn before its hard terminal-reply round, up from six.** The
+  final allowed round still withholds new tool use so the limit remains a real
+  BYOK-spend guard rather than a target. The worker absolute-timeout default
+  increases with the larger bounded provider envelope.
+
 - **Genesis imports now publish the identity card, MEMORY/STYLE, and the
   transitional persona together.** Genesis reuses Runtime V2's bounded profile
   generation and content-shape-aware CAS storage, requires a non-empty field

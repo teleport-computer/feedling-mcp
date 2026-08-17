@@ -102,6 +102,23 @@ LANES = {
 }
 
 
+def _positive_int_env(name: str, default: str) -> int:
+    """正整数,fail-closed。形状对齐 `_positive_float_env`。
+
+    为什么不能沉默兜底(codex2 审出):这个值是**重投预算**。配成 0 或负数会让
+    每个 scheduled 第一次租约超时就直接终结 —— 等于**把修复静默关掉**,
+    而且没有任何现象:提醒照常丢,日志照常安静。配错必须启动即炸。
+    """
+    raw = os.environ.get(name, default)
+    try:
+        value = int(str(raw).strip())
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(f"{name} must be an integer > 0") from exc
+    if value <= 0:
+        raise RuntimeError(f"{name} must be an integer > 0")
+    return value
+
+
 def _positive_float_env(name: str, default: str) -> float:
     raw = os.environ.get(name, default)
     try:
@@ -146,6 +163,31 @@ class PreemptedJob:
 # wedged therefore cannot keep a blind heartbeat alive forever.
 PENDING_CHAT_TTL_SEC = _positive_float_env("FEEDLING_V2_CHAT_PENDING_TTL_SEC", "120")
 RUNNING_TTL_SEC = _positive_float_env("FEEDLING_V2_LEASE_TTL_SEC", "300")
+# 到期提醒的租约超时重投上限。scheduled 是**必须送达**的道:入队时就 mark_fired
+# (scheduled_wake_v2.py),所以一次 worker 进程死亡造成的租约超时若按终结处理,
+# 这条提醒就永久消失且不会重试 —— 用户侧完全无感。
+#
+# 同文件的前台抢占路径早已按道分流:scheduled/capture 重投、其余终结。
+# 本常量把同一条语义补给租约回收器。有界是必须的:一个每次都失败的提醒若无限
+# 重投,会变成永不停歇的唤醒循环。
+# 「可重投」= pristine:这一轮**没有产生过任何持久副作用**。
+# 重投复用同一 job_id 并重跑整轮,而 mutation recovery barrier 只保护 lane='chat',
+# 保护不到 scheduled —— 所以任何已落地的写都可能被再执行一次。
+# 闭集与 worker.ENCRYPTED_TOOL_EFFECT_TYPES 的值域一致(见 test 里的漂移守卫);
+# 这里不 import worker:jobs_store 是底层,反向依赖会成环。
+# ⚠️ 只拦持久平台写,**不拦**普通 reply/status effect —— 那些重放无害,
+# 拦了会把可修复的场景无谓地变成永久丢失。
+DURABLE_TOOL_EFFECT_TYPES = frozenset({
+    "memory_encrypted_v1",
+    "identity_encrypted_v1",
+    "schedule_encrypted_v1",
+    "workspace_encrypted_v1",
+    "workspace_batch_encrypted_v1",
+})
+
+SCHEDULED_LEASE_REQUEUE_MAX_ATTEMPTS = _positive_int_env(
+    "FEEDLING_V2_SCHEDULED_REQUEUE_MAX_ATTEMPTS", "3"
+)
 
 _ACTIVE_STATUSES = ("pending", "claimed", "running")
 SCHEDULED_WAKE_STREAM = "proactive_scheduled_wakes_v2"
@@ -1778,6 +1820,53 @@ def reap_stuck_job_rows(now=None) -> list[dict]:
     with _pool().connection() as conn:
         with conn.transaction():
             with conn.cursor(row_factory=dict_row) as cur:
+                # 租约超时的 scheduled 先摘走重投,不进下面的终结扫描。
+                # 只认 lease_timeout(claimed/running 且租约过期 = worker 死了,
+                # 活儿根本没干),**不认 queue_timeout** —— 那是队列本身堵了,
+                # 重投只会再排一次队。
+                # 字段清理逐条对齐前台抢占的 requeued 分支;额外清 queue_deadline_at,
+                # 否则一个已过期的入队截止会让刚重投的行在下一轮立刻再次终结。
+                cur.execute(
+                    "UPDATE agent_jobs SET status='pending', "
+                    "attempt_count=attempt_count+1, "
+                    "last_error='scheduled_lease_timeout_requeued', "
+                    "claimed_by=NULL, claimed_at=NULL, started_at=NULL, "
+                    "finished_at=NULL, lease_expires_at=NULL, deadline_at=NULL, "
+                    "queue_deadline_at=NULL, created_at=now() "
+                    "WHERE lane='scheduled' "
+                    "AND status IN ('claimed','running') "
+                    "AND COALESCE(lease_expires_at, deadline_at) IS NOT NULL "
+                    "AND COALESCE(lease_expires_at, deadline_at) "
+                    "    <= COALESCE(to_timestamp(%s), now()) "
+                    "AND attempt_count < %s "
+                    # ⚠️ P0(codex2 交叉审计):**碰过 MCP 写的这一轮,一律不重投** ——
+                    # 不看 outcome。理由(get_chat_mutation_recovery_barrier 的契约原文):
+                    #   "Outcomes ... do not weaken the barrier:
+                    #    a known success is exactly the case that must not be repeated"
+                    #
+                    # 我第一版只排 NULL/unknown,依据是「与下面的终结 CTE 保持一致」——
+                    # 那是**类别错误**:终结 CTE 里那个 EXISTS 是在**选错误标签**
+                    # (mcp_mutation_outcome_unknown vs lease_timeout),**不是**在决定
+                    # 终结还是重投 —— 它对 known 也照样终结。原实现从来没有重跑过整轮。
+                    #
+                    # 而重投复用同一个 job_id,worker 侧的 mutation recovery barrier
+                    # 查询又**只覆盖 lane='chat'**,保护不到 scheduled;模型重跑后会
+                    # 生成新的 call_id 再写一次 —— 一次已成功的远端写就被重复执行了。
+                    "AND NOT EXISTS ("
+                    "  SELECT 1 FROM v2_mcp_mutation_attempts a "
+                    "  WHERE a.job_id=agent_jobs.id) "
+                    # 同族第二层(codex2 交叉审计):不只 MCP。
+                    # worker._write_tool_effect_payload 是**所有道共享**的,
+                    # scheduled 一样能落 memory/identity/schedule/workspace 写。
+                    "AND NOT EXISTS ("
+                    "  SELECT 1 FROM v2_effect_outbox e "
+                    "  WHERE e.job_id=agent_jobs.id "
+                    "    AND e.effect_type = ANY(%s)) "
+                    "RETURNING id",
+                    (ts, int(SCHEDULED_LEASE_REQUEUE_MAX_ATTEMPTS),
+                     sorted(DURABLE_TOOL_EFFECT_TYPES)),
+                )
+                requeued_scheduled = [int(r["id"]) for r in cur.fetchall()]
                 cur.execute(
                     "WITH terminal AS ("
                     "  UPDATE agent_jobs SET status='expired', finished_at=now(), "
@@ -1838,6 +1927,11 @@ def reap_stuck_job_rows(now=None) -> list[dict]:
         for user_id, source_job_id in recovered_reviews:
             mirror.mark_pending(
                 user_id, "v2_trajectory_reviews", source_job_id, "requeue")
+    if requeued_scheduled:
+        log.info(
+            "[v2.reaper] scheduled lease timeout requeued job_ids=%s",
+            requeued_scheduled,
+        )
     return rows
 
 

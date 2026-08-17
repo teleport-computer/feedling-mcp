@@ -677,7 +677,7 @@ _TAIL_FILE_LIMIT = int(os.environ.get("FEEDLING_V2_TAIL_FILE_LIMIT", "2"))
 
 # 单个 native tool loop 的 provider 调用硬闸。最后一次调用会禁用
 # tools 来强制收口，使模型无法用无限工具链烧穿用户的 BYOK key。
-_TURN_MAX_LLM_CALLS = int(os.environ.get("FEEDLING_V2_TURN_MAX_LLM_CALLS", "6"))
+_TURN_MAX_LLM_CALLS = int(os.environ.get("FEEDLING_V2_TURN_MAX_LLM_CALLS", "15"))
 _FILE_TURN_MAX_LLM_CALLS = int(
     os.environ.get("FEEDLING_V2_FILE_TURN_MAX_LLM_CALLS", "10")
 )
@@ -1860,23 +1860,46 @@ def _mcp_turn_usage_detail(
     }
 
 
-def _provider_tool_surface_callback(
-    deps: TurnDeps,
-    user_id: str,
-    lane: str,
-):
-    """Build a best-effort plaintext-count trace sink for one runtime lane."""
+@dataclass
+class _ProviderRoundtripTrace:
+    """Collect one turn's content-free provider-round budget evidence."""
 
-    if deps.emit_debug_trace is None:
-        return None
+    deps: TurnDeps
+    user_id: str
+    lane: str
+    provider_roundtrips: int = 0
+    terminal_text_round_reached: bool = False
+    terminal_text_round_reason: str = "none"
+    force_text_fallback_reason: str = "none"
+    empty_response_recovery_used: bool = False
 
-    async def _emit(detail: dict[str, Any]) -> None:
-        trace_detail = {"lane": lane, **dict(detail)}
-        if lane != "chat":
-            trace_detail["wake_kind"] = lane
+    async def __call__(self, detail: dict[str, Any]) -> None:
+        try:
+            self.provider_roundtrips = max(
+                self.provider_roundtrips,
+                int(detail.get("round") or 0),
+            )
+        except (TypeError, ValueError, OverflowError):
+            pass
+        if detail.get("terminal_text_round") is True:
+            self.terminal_text_round_reached = True
+            self.terminal_text_round_reason = str(
+                detail.get("terminal_text_round_reason") or "none"
+            )
+        fallback_reason = str(
+            detail.get("force_text_fallback_reason") or "none"
+        )
+        if fallback_reason != "none":
+            self.force_text_fallback_reason = fallback_reason
+        if detail.get("empty_response_recovery") is True:
+            self.empty_response_recovery_used = True
+
+        trace_detail = {"lane": self.lane, **dict(detail)}
+        if self.lane != "chat":
+            trace_detail["wake_kind"] = self.lane
         await asyncio.to_thread(
-            deps.emit_debug_trace,
-            user_id,
+            self.deps.emit_debug_trace,
+            self.user_id,
             "mcp.surface.provider",
             status=(
                 "warning"
@@ -1894,7 +1917,56 @@ def _provider_tool_surface_callback(
             detail=trace_detail,
         )
 
-    return _emit
+    async def emit_summary(self) -> None:
+        detail = {
+            "lane": self.lane,
+            "provider_roundtrips": self.provider_roundtrips,
+            "roundtrip_lens": "tool_loop_provider_round_excludes_transport_retries",
+            "terminal_text_round_reached": self.terminal_text_round_reached,
+            "terminal_text_round_reason": self.terminal_text_round_reason,
+            "force_text_fallback_reason": self.force_text_fallback_reason,
+            "empty_response_recovery_used": self.empty_response_recovery_used,
+        }
+        if self.lane != "chat":
+            detail["wake_kind"] = self.lane
+        try:
+            await asyncio.to_thread(
+                self.deps.emit_debug_trace,
+                self.user_id,
+                "mcp.roundtrip.provider",
+                status=(
+                    "warning"
+                    if self.terminal_text_round_reason == "max_calls"
+                    else "ok"
+                ),
+                summary=(
+                    f"Provider 本轮往返 {self.provider_roundtrips} 次,"
+                    f"收口原因 {self.terminal_text_round_reason}"
+                ),
+                explain=(
+                    "计数口径是会消耗工具循环 max_calls 的 provider 轮次;"
+                    "不含 transport 内部重试,不记录 prompt、回复、工具参数或结果。"
+                ),
+                detail=detail,
+            )
+        except Exception as exc:  # noqa: BLE001 -- telemetry is best-effort
+            log.warning(
+                "[v2.mcp] provider roundtrip trace failed user=%s code=%s",
+                self.user_id,
+                type(exc).__name__.lower(),
+            )
+
+
+def _provider_tool_surface_callback(
+    deps: TurnDeps,
+    user_id: str,
+    lane: str,
+):
+    """Build a best-effort content-free trace sink for one runtime lane."""
+
+    if deps.emit_debug_trace is None:
+        return None
+    return _ProviderRoundtripTrace(deps, user_id, lane)
 
 
 def _empty_provider_response_debug_callback(
@@ -5360,12 +5432,19 @@ def _self_thinking_internal_terms() -> frozenset[str]:
 
 
 def _self_thinking_internal_term(text: str) -> str | None:
-    """Return the first model-facing tool name leaked into thinking, if any."""
+    """Return the first internal identifier leaked into visible thinking.
+
+    两类都查,因为它们互补:
+      · **工具名**(B2-1 已有):从 build_tool_specs 派生,随工具面自动扩展
+      · **内部字段名/协议词**(本批补):共享内核的闭集,V1 早有、V2 一直缺 ——
+        `_sanitize_reasoning` 的 docstring 明写「只截长度,原样渲染」,
+        所以 `session_id: …` / `permission_denials` / `costUSD` 会直达用户。
+    """
     value = str(text or "")
     for name in sorted(_self_thinking_internal_terms(), key=len, reverse=True):
         if name in value:
             return name
-    return None
+    return self_thinking.internal_field_leak(value)
 
 
 def _self_thinking_language_mismatch(
@@ -6965,6 +7044,11 @@ async def _run_wake(
     shadow_decision_allowed: bool | None = None
     stay_silent_reason: str | None = None
     language_user_rows: list[dict] = []
+    provider_roundtrip_trace = _provider_tool_surface_callback(
+        deps,
+        user_id,
+        lane,
+    )
     try:
         store = core_store.get_store(user_id)
         seq_native = deps.read_messages_after_seq is not None
@@ -8610,11 +8694,7 @@ async def _run_wake(
                     user_id,
                     exc,
                 ),
-                on_provider_tool_surface=_provider_tool_surface_callback(
-                    deps,
-                    user_id,
-                    lane,
-                ),
+                on_provider_tool_surface=provider_roundtrip_trace,
                 on_empty_provider_response=(
                     _empty_provider_response_debug_callback(deps, user_id, lane)
                 ),
@@ -8800,6 +8880,8 @@ async def _run_wake(
             tm.flush(failed=True, status=code)
         return "failed"
     finally:
+        if provider_roundtrip_trace is not None:
+            await provider_roundtrip_trace.emit_summary()
         decided_at = time.time()
         apns_alert_sent = False
         if push_slot is not None and deps.send_reply_push is not None:
@@ -8974,6 +9056,27 @@ async def _enqueue_profile_if_due(
     if not coalesced or made_ready:
         await asyncio.to_thread(core_wake_bus.notify, "v2_jobs", user_id)
     return (not coalesced) or made_ready
+
+
+async def _repair_profile_after_chat_provider_success(user_id: str) -> bool:
+    """Best-effort re-arm of provider-config profile failures after chat works."""
+
+    try:
+        result = await asyncio.to_thread(
+            v2_profile_store.repair_stuck_profile_retry,
+            str(user_id),
+            target_dispositions=(
+                v2_profile_store.PROFILE_PROVIDER_SUCCESS_RECOVERABLE_DISPOSITIONS
+            ),
+        )
+    except Exception as exc:  # noqa: BLE001 — a delivered chat is authoritative
+        log.warning(
+            "[v2.worker] post-chat profile repair failed user=%s code=%s",
+            user_id,
+            type(exc).__name__.lower(),
+        )
+        return False
+    return result.status == "repaired"
 
 
 def _profile_attempt_count(previous: dict) -> int:
@@ -10527,6 +10630,11 @@ async def process_job(
     mcp_offered_names: tuple[str, ...] = ()
     mcp_called_names: list[str] = []
     mcp_turn_outcome = "failed"
+    provider_roundtrip_trace = (
+        _provider_tool_surface_callback(deps, user_id, lane)
+        if lane == "chat"
+        else None
+    )
 
     try:
         if not claimed_by or not await asyncio.to_thread(
@@ -12892,11 +13000,7 @@ async def process_job(
                 user_id,
                 exc,
             ),
-            on_provider_tool_surface=_provider_tool_surface_callback(
-                deps,
-                user_id,
-                lane,
-            ),
+            on_provider_tool_surface=provider_roundtrip_trace,
             on_empty_provider_response=(
                 _empty_provider_response_debug_callback(deps, user_id, lane)
             ),
@@ -13130,6 +13234,12 @@ async def process_job(
             )
             if not completed:
                 raise LostJobLease("job ownership lost during finalization")
+        # A successfully committed foreground reply proves the user's provider
+        # credential is working again.  Re-arm only provider_config profile
+        # failures; terminal remains operator-only.  This runs after the current
+        # turn's profile scheduling check, so the next natural trigger owns the
+        # retry, and any read/CAS failure cannot rewrite the delivered chat.
+        await _repair_profile_after_chat_provider_success(user_id)
         # The reply/cursor/job lifecycle transition above is authoritative.  In
         # the seq-native path it is one transaction; in the compatibility path
         # ``finish_chat_job`` has already committed before we get here.  Status
@@ -13309,6 +13419,8 @@ async def process_job(
         if lease_keepalive_task is not None:
             lease_keepalive_task.cancel()
             await asyncio.gather(lease_keepalive_task, return_exceptions=True)
+        if provider_roundtrip_trace is not None:
+            await provider_roundtrip_trace.emit_summary()
         if mcp_offered_names and deps.emit_debug_trace is not None:
             detail = _mcp_turn_usage_detail(mcp_offered_names, mcp_called_names)
             try:

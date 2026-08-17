@@ -980,6 +980,17 @@ async def run_tool_loop(
             or final_reply_correction_request is not None
             or attempts == max_calls - 1
         )
+        terminal_text_round_reason = "none"
+        if terminal_text_round:
+            terminal_text_round_reason = (
+                "force_text_fallback"
+                if force_text_fallback
+                else (
+                    "final_reply_correction"
+                    if final_reply_correction_request is not None
+                    else "max_calls"
+                )
+            )
         historical_tool_names = {
             call.name
             for item in transcript
@@ -1256,6 +1267,16 @@ async def run_tool_loop(
                                 mcp_candidate_names - mcp_sent_names
                             ),
                             "reason": surface_reason or "none",
+                            "terminal_text_round": terminal_text_round,
+                            "terminal_text_round_reason": (
+                                terminal_text_round_reason
+                            ),
+                            "force_text_fallback_reason": (
+                                force_text_fallback_reason or "none"
+                            ),
+                            "empty_response_recovery": bool(
+                                empty_response_retry_instruction
+                            ),
                         }
                     )
                 except Exception:
@@ -1929,7 +1950,9 @@ async def run_tool_loop(
                 },
             )
             force_text_fallback = True
-            force_text_fallback_reason = ""
+            force_text_fallback_reason = (
+                "invalid_or_over_budget_tool_exchange"
+            )
             continue
 
         tool_calls_used += len(pr.tool_calls)

@@ -2340,3 +2340,269 @@ def test_backlog_scanner_returns_the_worst_backlog_first():
     ]
 
     assert ordered == [large, small]
+
+
+# ── B4-4 (#18):到期提醒卡死后必须重投,不能终结 ──────────────────────────
+#
+# scheduled 是**必须送达**的道:scheduled_wake_v2 在**入队时**就 mark_fired,
+# 所以一次 worker 进程死亡如果按终结处理,这条提醒就永久消失且不重试。
+# 同文件的前台抢占路径早已按道分流(scheduled/capture 重投、其余终结);
+# 这几条锁住租约回收器上的同一语义。
+
+
+def _stuck_scheduled(uid: str) -> int:
+    seed_user(uid)
+    _reset(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, "scheduled")
+    jobs_store.claim_next_job("w")
+    jobs_store.mark_running(job_id, claimed_by="w")
+    return job_id
+
+
+def _job_row(job_id: int):
+    with db.get_pool().connection() as conn:
+        return conn.execute(
+            "SELECT status, attempt_count, last_error FROM agent_jobs WHERE id=%s",
+            (job_id,),
+        ).fetchone()
+
+
+def test_reap_requeues_stuck_scheduled_instead_of_expiring():
+    """租约超时 = worker 死了、活儿没干 → 退回 pending 重投,不是丢掉。"""
+    import time
+
+    job_id = _stuck_scheduled("u_js_sched_requeue")
+    jobs_store.reap_stuck_jobs(now=time.time() + jobs_store.RUNNING_TTL_SEC + 10)
+    status, attempts, last_error = _job_row(job_id)
+    assert status == "pending", "到期提醒卡死后被终结了 —— 这条提醒永久丢失"
+    assert attempts == 1
+    assert last_error == "scheduled_lease_timeout_requeued"
+    with db.get_pool().connection() as conn:
+        marker = conn.execute(
+            "SELECT error_code FROM v2_terminal_failure_outbox WHERE job_id=%s",
+            (job_id,),
+        ).fetchone()
+    assert marker is None, "重投的任务不该写终结失败回执"
+
+
+def test_reap_expires_scheduled_once_requeue_budget_is_spent():
+    """有界:一个每次都失败的提醒不能变成永不停歇的唤醒循环。"""
+    import time
+
+    job_id = _stuck_scheduled("u_js_sched_budget")
+    cap = jobs_store.SCHEDULED_LEASE_REQUEUE_MAX_ATTEMPTS
+    assert cap >= 1
+    for _ in range(cap):
+        jobs_store.reap_stuck_jobs(now=time.time() + jobs_store.RUNNING_TTL_SEC + 10)
+        assert _job_row(job_id)[0] == "pending"
+        jobs_store.claim_next_job("w")
+        jobs_store.mark_running(job_id, claimed_by="w")
+    jobs_store.reap_stuck_jobs(now=time.time() + jobs_store.RUNNING_TTL_SEC + 10)
+    assert _job_row(job_id)[0] == "expired", (
+        f"重投预算({cap})用尽后仍未终结 —— 会无限重投"
+    )
+
+
+def test_reap_still_expires_stuck_chat_job():
+    """不误伤:chat 卡死仍是终结,重投语义只给 scheduled。"""
+    import time
+
+    seed_user("u_js_sched_chat_guard")
+    _reset("u_js_sched_chat_guard")
+    job_id, _ = jobs_store.enqueue_job("u_js_sched_chat_guard", "chat")
+    jobs_store.claim_next_job("w")
+    jobs_store.mark_running(job_id, claimed_by="w")
+    jobs_store.reap_stuck_jobs(now=time.time() + jobs_store.RUNNING_TTL_SEC + 10)
+    assert _job_row(job_id)[0] == "expired"
+
+
+def test_reap_does_not_touch_scheduled_still_in_pending():
+    """重投只认 lease_timeout(worker 死了、活儿没干)。
+
+    pending 的 scheduled 不该被本条路径碰:它还没被认领,重投没有意义 ——
+    只会把 attempt_count 白白烧掉,预算耗尽后反而变成终结。
+
+    ⚠️ 断言的是「**我这条路径没动它**」(attempt_count 与 last_error 不变),
+    不是「它会被终结」—— 没有 deadline 的 pending 非 chat 任务在既有终结扫描里
+    本来就永不匹配(COALESCE(queue_deadline_at, deadline_at, chat-only TTL)
+    求值为 NULL),那是**改动前就有的**行为,不属于本条守的范围。
+    """
+    import time
+
+    seed_user("u_js_sched_pending")
+    _reset("u_js_sched_pending")
+    job_id, _ = jobs_store.enqueue_job("u_js_sched_pending", "scheduled")
+    # 不 claim:停在 pending
+    jobs_store.reap_stuck_jobs(now=time.time() + jobs_store.RUNNING_TTL_SEC + 10_000)
+    status, attempts, last_error = _job_row(job_id)
+    assert attempts == 0, "pending 的 scheduled 被重投路径烧掉了一次预算"
+    assert last_error != "scheduled_lease_timeout_requeued"
+
+
+def test_requeued_scheduled_survives_stale_deadlines_and_is_claimable():
+    """终点守卫(codex2 审出:这两处清理是承重的,原实现没有测试钉住它)。
+
+    一个**旧的、已过期的**入队/执行截止如果留在重投后的行上,同一轮 reaper
+    会立刻把它再次终结 —— 重投等于没做。删掉 queue_deadline_at=NULL 或
+    deadline_at=NULL 任意一处,本条必红。
+
+    断言的是**终点状态**:reap 之后仍 pending、旧 owner 已被 fence、
+    并且能被新 owner 重新认领(=这条提醒真的还会再送一次)。
+    """
+    import time
+
+    uid = "u_js_sched_endstate"
+    job_id = _stuck_scheduled(uid)
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            "UPDATE agent_jobs SET queue_deadline_at=now()-interval '1 hour', "
+            "deadline_at=now()-interval '1 hour' WHERE id=%s",
+            (job_id,),
+        )
+    future = time.time() + jobs_store.RUNNING_TTL_SEC + 10
+    jobs_store.reap_stuck_jobs(now=future)
+    with db.get_pool().connection() as conn:
+        row = conn.execute(
+            "SELECT status, attempt_count, claimed_by, queue_deadline_at, deadline_at "
+            "FROM agent_jobs WHERE id=%s", (job_id,)
+        ).fetchone()
+    assert row[0] == "pending", "带着过期截止被重投 → 同一轮又被终结,提醒仍然丢"
+    assert row[1] == 1
+    assert row[2] is None, "旧 owner 没被 fence"
+    assert row[3] is None and row[4] is None, "过期截止没清干净"
+    assert jobs_store.claim_next_job("w2") is not None, "重投后无法被重新认领"
+
+
+def test_scheduled_requeue_budget_config_is_fail_closed(monkeypatch):
+    """配成 0/负数/非数字必须启动即炸,不能静默把修复关掉。"""
+    import pytest as _pytest
+
+    for bad in ("0", "-1", "abc", ""):
+        monkeypatch.setenv("FEEDLING_V2_SCHEDULED_REQUEUE_MAX_ATTEMPTS", bad)
+        with _pytest.raises(RuntimeError):
+            jobs_store._positive_int_env(
+                "FEEDLING_V2_SCHEDULED_REQUEUE_MAX_ATTEMPTS", "3")
+    monkeypatch.setenv("FEEDLING_V2_SCHEDULED_REQUEUE_MAX_ATTEMPTS", "5")
+    assert jobs_store._positive_int_env(
+        "FEEDLING_V2_SCHEDULED_REQUEUE_MAX_ATTEMPTS", "3") == 5
+
+
+def test_scheduled_with_unresolved_mcp_mutation_is_not_requeued():
+    """P0(codex2 交叉审计):未决/unknown 的 MCP 写**绝不能**被重投。
+
+    一个超时的 MCP 写可能**远端已经成功、只是回执丢了**。终结 CTE 正是为此把
+    这类任务判成 `mcp_mutation_outcome_unknown` 并终结。重投路径若不排除它,
+    会重复执行一次已生效的远端副作用(重复建日程 / 重复发消息),
+    而用户侧只看得到「提醒来了两次」,看不到真正发生了什么。
+
+    ⚠️ **错误标签**仍由 terminal CTE 按 outcome 选择
+    (mcp_mutation_outcome_unknown vs lease_timeout);但**是否重投**看的是
+    「这一轮有没有 **任何** MCP attempt」,不看 outcome。
+
+    这两件事一度被我混为一谈:第一版把「选标签的条件」抄成了「重投的闸」,
+    结果 known-success 也会被重投 —— 而 barrier 契约的原话正是
+    「a known success is exactly the case that must not be repeated」。
+    别再把这个闸按 outcome 窄回去。
+    """
+    import time
+
+    uid = "u_js_sched_mcp_unknown"
+    job_id = _stuck_scheduled(uid)
+    jobs_store.start_mcp_mutation_attempt(
+        job_id,
+        user_id=uid,
+        claimed_by="w",
+        call_id="lost-receipt",
+        tool_name="mcp__calendar__create",
+        input_frontier_seq=0,
+    )
+    rows = jobs_store.reap_stuck_job_rows(
+        now=time.time() + jobs_store.RUNNING_TTL_SEC + 10)
+    assert [(r["id"], r["last_error"]) for r in rows] == [
+        (job_id, "mcp_mutation_outcome_unknown")
+    ], "带未决 MCP 写的到期提醒被重投了 —— 可能重复执行远端副作用"
+    status, _attempts, _err = _job_row(job_id)
+    assert status == "expired"
+    with db.get_pool().connection() as conn:
+        outcome = conn.execute(
+            "SELECT outcome FROM v2_mcp_mutation_attempts WHERE job_id=%s",
+            (job_id,),
+        ).fetchone()
+    assert outcome == ("unknown",)
+
+
+def test_scheduled_with_known_mcp_mutation_is_also_not_requeued():
+    """`known` 成功**尤其**不能重投 —— barrier 契约的原话就是这个。
+
+    终结 CTE 对 known 也终结(只是 last_error=lease_timeout),原实现从未重跑整轮。
+    重投复用同一 job_id,而 worker 的 mutation recovery barrier 只覆盖 lane='chat',
+    保护不到 scheduled;模型重跑会生成新 call_id 再写一次。
+    """
+    import time
+
+    uid = "u_js_sched_mcp_known"
+    job_id = _stuck_scheduled(uid)
+    jobs_store.start_mcp_mutation_attempt(
+        job_id, user_id=uid, claimed_by="w", call_id="already-done",
+        tool_name="mcp__calendar__create", input_frontier_seq=0,
+    )
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            "UPDATE v2_mcp_mutation_attempts SET outcome='known', "
+            "resolved_at=clock_timestamp() WHERE job_id=%s", (job_id,))
+    jobs_store.reap_stuck_jobs(now=time.time() + jobs_store.RUNNING_TTL_SEC + 10)
+    status, _a, _e = _job_row(job_id)
+    assert status != "pending", (
+        "已知成功的 MCP 写被重投了 —— 这正是 barrier 契约点名不能重复的那一种"
+    )
+
+
+@pytest.mark.parametrize("effect_type", sorted(jobs_store.DURABLE_TOOL_EFFECT_TYPES))
+def test_scheduled_with_durable_effect_is_not_requeued(effect_type):
+    """产生过持久平台写的这一轮,一律不重投(codex2 交叉审计第二层)。
+
+    不只 MCP:`worker._write_tool_effect_payload` 是**所有道共享**的,
+    scheduled 一样能落 memory/identity/schedule/workspace 写。重投复用同一
+    job_id 并重跑整轮,而 mutation recovery barrier 只保护 lane='chat'。
+
+    **参数化整个闭集**,而不是只测 memory —— 否则新增一种 effect 类型时
+    (例如 workspace_batch)会静默漏掉,且不会有任何东西变红。
+
+    用生产入口 `effect_outbox.enqueue_effect` 造数据,不手写 INSERT:
+    手写会绑死当下的列结构,schema 一改测试就以错误的理由红。
+    """
+    import time
+    from model_api_runtime.v2 import effect_outbox
+
+    uid = f"u_js_eff_{effect_type[:12]}"
+    job_id = _stuck_scheduled(uid)
+    effect_outbox.enqueue_effect(
+        job_id=job_id,
+        user_id=uid,
+        effect_type=effect_type,
+        ordinal=0,
+        expected_generation=1,
+        payload={"ciphertext": "shell"},
+        input_frontier_seq=0,
+    )
+    jobs_store.reap_stuck_jobs(now=time.time() + jobs_store.RUNNING_TTL_SEC + 10)
+    status, _a, _e = _job_row(job_id)
+    assert status != "pending", (
+        f"落过 {effect_type} 的到期提醒被重投 —— 会重复执行一次已生效的写"
+    )
+
+
+def test_durable_effect_closed_set_matches_worker():
+    """漂移守卫:jobs_store 的闭集必须与 worker 的值域一致。
+
+    jobs_store 是底层,不能反向 import worker(会成环),所以闭集在本地重写了一份。
+    两份定义必然漂移 —— 除非有东西在漂移时变红。这条就是那个东西。
+
+    ⚠️ 顺带记录:serve_worker.py 里还有**第三份**拷贝(_ENCRYPTED_TOOL_EFFECT_TYPES)。
+    本条只钉住 jobs_store↔worker;那一份是既有状况,不在本批范围。
+    """
+    from model_api_runtime.v2 import worker as v2_worker
+
+    assert jobs_store.DURABLE_TOOL_EFFECT_TYPES == frozenset(
+        v2_worker.ENCRYPTED_TOOL_EFFECT_TYPES.values()
+    )

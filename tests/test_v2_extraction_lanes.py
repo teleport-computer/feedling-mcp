@@ -11,7 +11,7 @@ import conftest
 import db
 import provider_client
 from core import store as core_store
-from model_api_runtime.v2 import extraction, jobs_store, worker
+from model_api_runtime.v2 import extraction, jobs_store, profile_store, worker
 
 _BYOK = provider_client.ProviderConfig(
     provider="anthropic", model="claude-sonnet-4-test", api_key="sk-user", base_url="")
@@ -163,6 +163,13 @@ def test_extraction_lane_applies_actions_and_completes(monkeypatch, lane):
         }], None)
 
     monkeypatch.setattr(extraction, "extract", _fake_extract)
+    monkeypatch.setattr(
+        profile_store,
+        "repair_stuck_profile_retry",
+        lambda *_args, **_kwargs: pytest.fail(
+            "extraction success must not repair foreground provider state"
+        ),
+    )
     applied = {}
     ordering = []
 

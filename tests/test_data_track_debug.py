@@ -57,6 +57,14 @@ def test_provider_tool_surface_has_explicit_admin_step_label():
     }) == ("🧩", "MCP Provider 实收工具面")
 
 
+def test_provider_roundtrip_summary_has_explicit_admin_step_label():
+    assert data_track._debug_friendly_step({
+        "type": "mcp.roundtrip.provider",
+        "subsystem": "mcp",
+        "detail": {},
+    }) == ("🔁", "Provider 本轮往返")
+
+
 def test_memory_search_and_index_have_distinct_admin_labels():
     search = data_track._debug_friendly_step({
         "type": "memory.search.called",

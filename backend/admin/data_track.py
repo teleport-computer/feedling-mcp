@@ -8088,6 +8088,7 @@ _DEBUG_STEP_LABELS = {
     "provider.empty_response": ("🕳️", "空回复诊断"),
     "mcp.surface.resolved": ("🧩", "MCP 工具面"),
     "mcp.surface.provider": ("🧩", "MCP Provider 实收工具面"),
+    "mcp.roundtrip.provider": ("🔁", "Provider 本轮往返"),
     "mcp.surface.missing": ("🧩", "MCP 工具面缺失"),
     "mcp.surface.wired": ("🧩", "MCP 已接线"),
     "agent.reasoning": ("💭", "思考 / reasoning"),
