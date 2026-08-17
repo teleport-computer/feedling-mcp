@@ -300,7 +300,12 @@ def test_dream_below_fuse_threshold_applies_normally(monkeypatch):
     assert _job_row(job_id)[0] == "completed"
 
 
-def test_dream_unusable_source_time_is_observable_and_writes_nothing(monkeypatch):
+def test_dream_missing_source_time_degrades_and_still_writes(monkeypatch):
+    """2026-08-17(Seven 定):一张源卡缺时间不再让整轮失败,改为退到已知的最晚。
+
+    ⚠️ 这是**端到端**的一条 —— 它同时证明降级留痕真的接在生产路径上,
+    而不是只在 helper 单测里传(那正是 codex2 审出的第①项)。
+    """
     uid = "u_x_dream_missing_occurred_at"
     _seed_v2(uid)
     job_id, _ = jobs_store.enqueue_job(uid, "dream")
@@ -324,18 +329,36 @@ def test_dream_unusable_source_time_is_observable_and_writes_nothing(monkeypatch
                 {"id": "old-b", "occurred_at": ""},
             ],
         },
-        apply_memory_actions=lambda _uid, actions: applied.extend(actions),
+        # 夹具必须返回 {"status": "ok"} —— 返回 None 会被 _memory_write_result_counts
+        # 判成「全部失败」,于是撞上 memory_write_rejected,看起来像降级没生效。
+        # (原用例断言的是 failed,所以这个缺陷一直没暴露。)
+        apply_memory_actions=lambda _uid, actions: (
+            applied.extend(actions) or {"status": "ok"}
+        ),
     )
 
+    class _Rec:
+        def __init__(self): self.events = []
+        async def record(self, kind, payload): self.events.append((kind, payload))
+        async def record_best_effort(self, kind, payload):
+            await self.record(kind, payload); return True
+
+    recorder = _Rec()
     status = asyncio.run(worker.process_job(
-        job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"))
+        job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt",
+        trajectory_recorder=recorder))
 
-    assert status == "failed"
-    assert applied == []
-    assert _job_row(job_id) == (
-        "failed",
-        "extraction_failed:dream_source_occurred_at_unavailable",
+    assert status != "failed", (
+        "一张源卡缺时间仍让整轮失败 —— 那正是要修掉的永久阻塞"
     )
+    assert applied, "降级后应当照常产出动作"
+    payload = str(applied)
+    assert "2026-03-01T00:00:00Z" in payload, "没有退到已知的那张源卡时间"
+    # **生产接线守卫**:降级必须真的留痕。只在 helper 单测里传回调 = 零留痕
+    # (codex2 审出第①项)。拆掉 worker 里那行 action_kwargs 赋值,本断言必红。
+    assert any(
+        kind == "dream_source_time_degraded" for kind, _ in recorder.events
+    ), "降级没有进 trajectory —— 生产侧根本没接回调"
 
 
 @pytest.mark.parametrize("lane", ["capture", "dream"])
