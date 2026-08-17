@@ -12,6 +12,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
 from core import self_thinking  # noqa: E402
+from model_api_runtime.v2 import tool_loop  # noqa: E402
 from model_api_runtime.v2 import worker  # noqa: E402
 from model_api_runtime.v2 import language_follow  # noqa: E402
 from model_api_runtime.v2 import prompt_frontier  # noqa: E402
@@ -545,7 +546,7 @@ def test_empty_provider_response_trace_is_content_free_and_admin_readable():
     deps = _minimal_deps()
     deps.emit_debug_trace = _emit
     callback = worker._empty_provider_response_debug_callback(
-        deps, "u_trace", "chat"
+        deps, "u_trace", "chat", "trace-empty-response"
     )
     assert callback is not None
     asyncio.run(callback({
@@ -558,6 +559,7 @@ def test_empty_provider_response_trace_is_content_free_and_admin_readable():
     }))
 
     assert captured["type"] == "provider.empty_response"
+    assert captured["trace_id"] == "trace-empty-response"
     assert captured["detail"] == {
         "stop_reason": "content_filter",
         "has_visible_text": False,
@@ -575,6 +577,7 @@ def test_empty_provider_response_trace_is_content_free_and_admin_readable():
         "lane",
     }
     public = data_track._debug_event_public_json(captured)
+    assert public["trace_id"] == "trace-empty-response"
     assert public["detail"] == captured["detail"]
     assert "MUST NEVER REACH DEBUG TRACE" not in str(captured)
 
@@ -596,6 +599,131 @@ def test_empty_provider_response_has_dedicated_admin_timeline_label():
         "type": "provider.empty_response",
         "subsystem": "agent",
     }) == ("🕳️", "空回复诊断")
+
+
+def test_provider_roundtrip_trace_closed_enums_are_admin_readable():
+    from admin import data_track
+
+    assert "force_text_fallback" in (
+        tool_loop._PROVIDER_TERMINAL_TEXT_ROUND_REASONS
+    )
+    assert "tool_schema_rejected" in (
+        tool_loop._PROVIDER_FORCE_TEXT_FALLBACK_REASONS
+    )
+    captured = []
+    deps = _minimal_deps()
+    deps.emit_debug_trace = lambda user_id, event_type, **fields: captured.append(
+        {"user_id": user_id, "type": event_type, **fields}
+    )
+    trace = worker._provider_tool_surface_callback(
+        deps, "u_roundtrip_trace", "chat", "trace-roundtrip"
+    )
+    assert trace is not None
+    asyncio.run(trace({
+        "round": 2,
+        "candidate_tool_count": 4,
+        "sent_tool_count": 0,
+        "dropped_tool_count": 4,
+        "mcp_candidate_tool_count": 2,
+        "mcp_sent_tool_count": 0,
+        "mcp_dropped_tool_count": 2,
+        "reason": "tool_schema_rejected",
+        "terminal_text_round": True,
+        "terminal_text_round_reason": "force_text_fallback",
+        "force_text_fallback_reason": "tool_schema_rejected",
+        "empty_response_recovery": False,
+    }))
+    asyncio.run(trace.emit_summary())
+
+    roundtrip = next(
+        event for event in captured if event["type"] == "mcp.roundtrip.provider"
+    )
+    assert roundtrip["trace_id"] == "trace-roundtrip"
+    public = data_track._debug_event_public_json(roundtrip)
+    assert public["detail"]["lane"] == "chat"
+    assert public["detail"]["terminal_text_round_reason"] == (
+        "force_text_fallback"
+    )
+    assert public["detail"]["force_text_fallback_reason"] == (
+        "tool_schema_rejected"
+    )
+
+    surface = next(
+        event for event in captured if event["type"] == "mcp.surface.provider"
+    )
+    assert surface["trace_id"] == "trace-roundtrip"
+    surface_public = data_track._debug_event_public_json(surface)["detail"]
+    assert surface_public["lane"].startswith("<redacted string")
+    assert surface_public["terminal_text_round_reason"].startswith(
+        "<redacted string"
+    )
+
+
+def test_provider_roundtrip_trace_normalizes_unknowns_and_admin_redacts_forgery():
+    from admin import data_track
+
+    private_lane = "private lane from caller"
+    private_terminal = "private terminal reason"
+    private_fallback = "private fallback reason"
+    captured = []
+    deps = _minimal_deps()
+    deps.emit_debug_trace = lambda user_id, event_type, **fields: captured.append(
+        {"user_id": user_id, "type": event_type, **fields}
+    )
+    trace = worker._provider_tool_surface_callback(
+        deps, "u_roundtrip_unknown", private_lane
+    )
+    assert trace is not None
+    asyncio.run(trace({
+        "round": 1,
+        "candidate_tool_count": 0,
+        "sent_tool_count": 0,
+        "dropped_tool_count": 0,
+        "mcp_candidate_tool_count": 0,
+        "mcp_sent_tool_count": 0,
+        "mcp_dropped_tool_count": 0,
+        "reason": "none",
+        "terminal_text_round": True,
+        "terminal_text_round_reason": private_terminal,
+        "force_text_fallback_reason": private_fallback,
+        "empty_response_recovery": False,
+    }))
+    asyncio.run(trace.emit_summary())
+
+    roundtrip = next(
+        event for event in captured if event["type"] == "mcp.roundtrip.provider"
+    )
+    assert roundtrip["detail"]["lane"] == "other"
+    assert roundtrip["detail"]["wake_kind"] == "other"
+    assert roundtrip["detail"]["terminal_text_round_reason"] == "other"
+    assert roundtrip["detail"]["force_text_fallback_reason"] == "other"
+    assert private_lane not in str(roundtrip)
+    assert private_terminal not in str(roundtrip)
+    assert private_fallback not in str(roundtrip)
+    normalized_public = data_track._debug_event_public_json(roundtrip)["detail"]
+    assert normalized_public["lane"] == "other"
+    assert normalized_public["wake_kind"] == "other"
+    assert normalized_public["terminal_text_round_reason"] == "other"
+    assert normalized_public["force_text_fallback_reason"] == "other"
+
+    forged = {
+        **roundtrip,
+        "detail": {
+            **roundtrip["detail"],
+            "lane": private_lane,
+            "wake_kind": private_lane,
+            "terminal_text_round_reason": private_terminal,
+            "force_text_fallback_reason": private_fallback,
+        },
+    }
+    forged_public = data_track._debug_event_public_json(forged)["detail"]
+    for key in (
+        "lane",
+        "wake_kind",
+        "terminal_text_round_reason",
+        "force_text_fallback_reason",
+    ):
+        assert forged_public[key].startswith("<redacted string")
 
 
 def test_combined_memory_worldbook_message_keeps_truncation_trace_visible():

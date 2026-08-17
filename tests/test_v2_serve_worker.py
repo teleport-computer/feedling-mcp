@@ -587,6 +587,7 @@ def test_v2_debug_trace_user_seam_resolves_store_and_preserves_duration(monkeypa
         explain="safe",
         detail={"tool": "perception_snapshot"},
         dur_ms=7.5,
+        trace_id="trace-v2-seam",
     )
 
     assert calls == [
@@ -600,9 +601,35 @@ def test_v2_debug_trace_user_seam_resolves_store_and_preserves_duration(monkeypa
                 "explain": "safe",
                 "detail": {"tool": "perception_snapshot"},
                 "dur_ms": 7.5,
+                "trace_id": "trace-v2-seam",
             },
         ),
     ]
+
+
+def test_v2_debug_trace_payload_preserves_turn_trace_id(monkeypatch):
+    from diagnostics import diagnostics_core
+
+    captured = []
+    monkeypatch.setattr(
+        diagnostics_core,
+        "emit_trace_event_payload",
+        lambda store, payload: captured.append((store, payload)),
+    )
+    store = object()
+
+    serve_worker._emit_v2_debug_trace(
+        store,
+        "provider.empty_response",
+        status="warning",
+        summary="safe",
+        explain="content-free",
+        detail={"lane": "chat"},
+        trace_id="trace-current-turn",
+    )
+
+    assert captured[0][0] is store
+    assert captured[0][1]["event"]["trace_id"] == "trace-current-turn"
 
 
 def test_context_truncation_reaches_final_debug_event_without_upstream_content(

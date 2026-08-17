@@ -105,6 +105,28 @@ _CONTENT_FREE_STOP_REASONS = frozenset(
         "tool_use",
     }
 )
+# These values are emitted by the provider-surface callback and later summarized
+# for admin diagnostics.  Keep the producer vocabulary here, beside the state
+# machine that creates it; worker/admin consume these sets instead of copying
+# telemetry enums that can silently drift apart.
+_PROVIDER_TERMINAL_TEXT_ROUND_REASONS = frozenset(
+    {
+        "none",
+        "force_text_fallback",
+        "final_reply_correction",
+        "max_calls",
+        "other",
+    }
+)
+_PROVIDER_FORCE_TEXT_FALLBACK_REASONS = frozenset(
+    {
+        "none",
+        "tool_schema_rejected",
+        "final_reply_correction",
+        "invalid_or_over_budget_tool_exchange",
+        "other",
+    }
+)
 
 
 def _catalog():

@@ -2539,6 +2539,36 @@ def _debug_event_public_json(ev: dict) -> dict:
             )
         ):
             public_detail["components"] = [dict(item) for item in components]
+    if (
+        ev.get("type") == "mcp.roundtrip.provider"
+        and isinstance(raw_detail, dict)
+        and isinstance(public_detail, dict)
+    ):
+        # The tool loop owns these finite producer vocabularies. Import lazily
+        # to preserve admin module startup while avoiding a copied allowlist
+        # that could drift open or silently redact newly added producer values.
+        from model_api_runtime.v2 import tool_loop as v2_tool_loop
+        from model_api_runtime.v2 import worker as v2_worker
+
+        public_enums = {
+            "terminal_text_round_reason": (
+                v2_tool_loop._PROVIDER_TERMINAL_TEXT_ROUND_REASONS
+            ),
+            "force_text_fallback_reason": (
+                v2_tool_loop._PROVIDER_FORCE_TEXT_FALLBACK_REASONS
+            ),
+        }
+        for key, allowed_values in public_enums.items():
+            value = raw_detail.get(key)
+            if isinstance(value, str) and value in allowed_values:
+                public_detail[key] = value
+        for key in ("lane", "wake_kind"):
+            value = raw_detail.get(key)
+            if (
+                isinstance(value, str)
+                and v2_worker._normalize_provider_trace_lane(value) == value
+            ):
+                public_detail[key] = value
     return {
         "ts": ev.get("ts"),
         "user_id": ev.get("user_id"),
