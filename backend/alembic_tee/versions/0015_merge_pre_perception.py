@@ -1,0 +1,38 @@
+"""Merge TEE-primary catch-up and durable-perception branches.
+
+Revision ID: 0015_merge_pre_perception
+Revises: 0014_test_runtime_catchup, 0011_perception_signal_state_v2
+"""
+
+from alembic import op
+
+
+revision = "0015_merge_pre_perception"
+down_revision = (
+    "0014_test_runtime_catchup",
+    "0011_perception_signal_state_v2",
+)
+branch_labels = None
+depends_on = None
+
+
+_UPDATE_PREPARED_HEAD = """
+UPDATE server_config
+SET value = convert_to(
+  jsonb_set(convert_from(value, 'UTF8')::jsonb, '{tee_heads}',
+            '["0015_merge_pre_perception"]'::jsonb)::text,
+  'UTF8'
+)
+WHERE key = 'phase4_primary_prepared'
+  AND COALESCE(convert_from(value, 'UTF8')::jsonb->>'prepared', 'false') = 'true';
+"""
+
+
+def upgrade() -> None:
+    op.execute(_UPDATE_PREPARED_HEAD)
+
+
+def downgrade() -> None:
+    raise NotImplementedError(
+        "alembic_tee downgrade is not supported; restore from backup"
+    )

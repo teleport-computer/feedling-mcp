@@ -1,58 +1,63 @@
-# TEE 库扶正 + 明文默认/可选加密 — 主实施计划（v3）
+# TEE 库扶正 + 加密改可选（默认明文，enclave 保留）— 主实施计划（v6）
 
 > **For agentic workers:** 这是**主计划（program plan）**。每个 Phase 开工时用
 > superpowers:writing-plans 基于本计划的该节另立带完整代码的细案（子计划），再用
 > superpowers:subagent-driven-development 或 executing-plans 执行。本文锁定阶段
 > 边界、门禁（gate）、顺序依赖和验收标准。步骤用 `- [ ]` 跟踪。
 >
-> **v2 变更（2026-07-23 用户拍板）**：加密从「全部移除」改为「**默认明文、
-> 按用户全局开关可选加密**」；存量 local_only **原地保留为加密**（客户端解密
-> 路径保留）。因此：私钥收集整个删除（原 v1 Phase 1）、local_only 迁移删除
-> （原 v1 Task 2.3）、服务端双格式从「过渡态」升级为「**永久常态**」。
->
-> **v3 修订（2026-07-25，对照 test 分支两天 517 commits 的实际状态）**：
-> Runtime V2 + TEE Redis 落地带来四个调整——① V2 成为新的最大加密面（
-> `serve_worker.py` 15+ 调用点、迁移 0043 表级 CHECK 强制 K_enclave），新增
-> 全局约束「冻结加密面扩张」与 Phase 0 协调任务；② RDS 表 29→55（19 张
-> `v2_*` + V2 队列/归档表），TEE 全未镜像，Phase 1 新增 v2 表迁移策略任务；
-> ③ V1 supervisor 已在退役（`agent_runtime/supervisor.py` 已删、TEE 镜像已
-> 撤 V1 表），原 Phase 2 清单中对应调用点作废；④ 各改动点清单降级为
-> 「快照」——两天 5.5 万行的变更速度下，**每个细案开工时必须以 grep 重扫
-> 现场为准**，不得信任本文冻结的行号。
->
-> **v3.1 复审（2026-07-27）**：⑤ TEE 同步是三层白名单手工登记制且
-> alembic_tee 无 CI 落地通道（0002 至今未在实库执行）→ 新增 Task 0.6
-> （先还账再建通道）；⑥ 冻结约束从人工周扫升级为 CI 守卫测试（Task 0.5）；
-> ⑦ Phase 1 出口 gate 明确 verify 表范围必须随新增表扩展。
+> **修订史（浓缩）：**
+> - v2–v5（07-23~28）：一路把方案从「全部去加密 + enclave 退役」逐步收窄，
+>   曾走过「收私钥解 local_only」等弯路，后经尾账实测（local_only 仅 3 用户
+>   7 条）删除私钥方案。
+> - **v6（07-28，方向性澄清）**：**加密不是"纯存储降级"，而是保留现有 enclave
+>   加密路线作为可选项**。加密开关 on = 双收件人信封（K_user + K_enclave，
+>   enclave 在 TEE 内可解）→ **加密用户功能不降级**（agent/记忆/proactive 照常，
+>   靠 enclave 解密投影）。默认 off = 明文直读。**enclave 与 TEE 信任链保留**，
+>   从"所有人的必经解密路径"降为"加密用户的专用路径"。本质是「**加密从强制
+>   改可选、默认明文**」+「TEE 库扶正、移除 RDS」两件正交的事——不再是"去
+>   加密"。现有用户 cutover 默认迁明文（enclave 解存量），加密 opt-in。
 
-**Goal:** 把 TEE 明文库扶正为唯一主库、移除 RDS 与 enclave；内容默认明文直写
-直读，保留客户端信封加密作为按用户开关的可选行为（服务端对加密内容只存不读）。
+**Goal:** 把 TEE 明文库扶正为唯一主库、移除 RDS；内容加密从**强制**改为**按用户
+全局开关可选**——默认明文直写直读（服务端可读、agent 全功能、不经 enclave），
+开关打开则走现有 enclave 双收件人加密路线（DB/R2 密文、TEE 内解密、功能不降级）；
+enclave 与链上信任链**保留**，专服务加密用户；取消 local_only 可见性。
 
-**Architecture:** 信封从双收件人退化为单收件人（**v2 信封 = v1 去掉
-`K_enclave`**）：明文用户走 plaintext doc，加密用户走 K_user-only 信封，服务端
-按行自识别格式路由，对信封永远只做校验与搬运、零解密代码。enclave 只需活到
-存量服务端可解密文（BYOK 凭证、R2 storage-key/K_enclave 对象）重写完成，之后
-与链上信任组件一起退役。客户端加解密路径（`ContentEncryption`/`ContentKeyStore`）
-保留，仅摘除 K_enclave 收件人与 rewrap 自愈。
+**Architecture:** 加密维度从「强制 shared（人人 K_enclave）+ 罕用 local_only」
+简化为「per-user 全局开关」两态：
+
+| 档位 | 存储形态 | 服务端可读性 | 功能 | 路径 |
+|---|---|---|---|---|
+| **明文（默认）** | doc 明文 | 直读 | 全 | 不经 enclave（快） |
+| **加密（opt-in）** | 双收件人信封 K_user+K_enclave | 仅 TEE enclave 解 | 全（enclave 投影） | 经 enclave（现状路径） |
+
+加密档的隐私保证 = 产品现有的 attested-decrypt 模型（内容钥在被 attest 的 TEE
+飞地内，DB/运维层看不到明文，但飞地能解来服务 agent）——**docs 的 E2E/attested
+叙事对加密档保留**，只新增「默认明文」这一档。信封**仍是双收件人**（不去
+K_enclave）。local_only（K_user-only、谁都读不到）这一 per-content 维度取消。
+TEE 库扶正与加密可选化是两件正交的事：库照扶、RDS 照移除，enclave 不退役。
+客户端加解密路径（`ContentEncryption`/`ContentKeyStore`）**保留服务加密用户**。
 
 **Tech Stack:** Python/FastAPI backend、psycopg3、Phala dstack CVM（pg 17.10）、
-WAL-G→R2、iOS Swift（CryptoKit X25519/ChaChaPoly）、alembic（cutover 后
-alembic_tee 升格为唯一迁移链）。
+enclave（TDX + KMS + attestation，保留）、WAL-G→R2、iOS Swift（CryptoKit
+X25519/ChaChaPoly）、alembic（cutover 后 alembic_tee 升格为唯一迁移链）。
 
 ## Global Constraints
 
-- **enclave 死于 Phase 1 之后、Phase 5 之内**：`/v1/envelope/decrypt` 与 KMS
-  storage key 是存量（BYOK/R2）解密唯一通道，Phase 1 完成前不得下线 enclave
-  任何解密端点、不得重建主 CVM（翻钥即永久丢失）。
-- **服务端对加密内容永远只存不读**：任何新代码不得引入服务端解开 K_user 的
-  能力；「可选加密」的承诺就是服务端读不了。
-- **冻结加密面扩张（v3 新增，立即生效）**：本计划执行期间，新增代码不得再
-  引入「强制信封」的 schema 约束（如 0043 的 `ck_v2_trajectory_envelope` 要求
-  K_enclave）或新的 enclave 解密依赖；V2 等在途特性新增存储一律做成「格式
-  自识别」（明文/信封双形状），否则 Phase 2 永远在追移动靶。此约束需要与
-  V2 开发线明确对齐，是 Phase 0 的协调任务（Task 0.5）。
-- **v2 信封 = v1 信封去掉 `K_enclave` 字段**；读侧对存量 v1 信封（带
-  K_enclave）原样兼容——K_enclave 从此只是无人能用的死字段，不迁移不清洗。
+- **enclave 永久保留（v6）**：服务加密档用户。KMS 内容钥、storage key、
+  attestation、链上 AppAuth、iOS pinning 全部保留。Phase 1 也依赖 enclave 解
+  现有 shared 存量为明文——**Phase 1 完成前不得重建主 CVM**（翻钥即丢现有
+  加密存量的可解性）。
+- **服务端不持有用户私钥**：enclave 持有的是 KMS 派生的 K_enclave 内容钥（信封
+  第二收件人），**不是**用户设备的 K_user 私钥。加密档的信任对象是「TEE 硬件 +
+  attestation」，与现状 shared 模型一致；不建任何用户私钥收集通道。
+- **默认明文、加密可选（v6）**：新写按用户 `content_encryption` 偏好——off 写
+  明文、on 写双收件人信封。现有用户 cutover 默认迁明文（存量 enclave 解密）。
+- **去 local_only（v6）**：写侧不再接受/产生 `visibility=local_only`；存量
+  3 用户 7 条由 iOS swap 自解为明文或入丢弃。
+- **冻结"强制加密"扩张（v6 调整）**：在途特性（尤其 V2）不得再引入「表级强制
+  信封」约束（如 0043 的 `ck_v2_trajectory_envelope` 要求所有行带 K_enclave）
+  ——存储必须按用户偏好支持明文/信封两形状，否则明文档用户的该类数据无法
+  直读。做成 CI 守卫（Task 0.5）。
 - **fail-open 不变**：Phase 4 cutover 前对 TEE 库的写入沿用 mirror fail-open
   语义，TEE 故障不得传染主路径。
 - **每个 Phase 出口必须过自己的 gate 才能进下一 Phase**；回滚手段在各 Phase 注明。
@@ -62,7 +67,7 @@ alembic_tee 升格为唯一迁移链）。
 - 测试基线：起本地 PG 55432 后 `python -m pytest tests/ -q --ignore=tests/e2e_model_api_test.py --ignore=tests/test_api.py`
   ≈ 2440 passed / 7 pre-existing 红；没起 PG 会静默少跑 ~2000 用例。
 
-## 已确认的事实基线（2026-07-23 实测 + 2026-07-25/26 v3 复核）
+## 已确认的事实基线（07-23 实测 + 07-25/26/27/28 复核）
 
 ⚠️ 行号/清单是快照，细案开工时以 grep 重扫为准。
 
@@ -70,325 +75,937 @@ alembic_tee 升格为唯一迁移链）。
   100GB、max_connections=400（已生效）；test 同规格 400/30GB。
 - prod RDS：db.t3.medium 4GB/100GB gp3/**单 AZ 无热备**/PG 17.9；30 天连接峰值
   119；TEE 侧 pg 17.10。
-- **（v3，07-25 四库实连核对）test RDS=55 张基表、prod RDS=60 张**（多出的
-  5 张是 `bak_20260710_usr450_*`/`usr5d4a_*` 事故期手工备份表，处置进
-  Phase 4）；TEE 影子库 test/prod 均 20 张。**RDS→TEE 未镜像共 39 张**：
-  19 张 `v2_*`、`agent_jobs`/`agent_action_queue`/`agent_status_events`/
-  `runtime_state`（V2 队列与运行时）、`chat_message_archive`（**归档聊天，
-  用户数据必迁**）、`chat_r2_cleanup`/`chat_r2_lifecycle`（R2 GC 簿记）、
-  `model_api_credentials`/`model_api_routes`、`notify_relay_configs`/`_logs`、
-  `dau/growth/retention` 三张、`genesis_import_chunks`、`tee_reconcile_*` ×2、
-  `tee_sync_runs`、`alembic_version`、`frame_envelopes`（TEE 侧对应新形状
-  `frames`）。alembic 主链到 0057；alembic_tee 到 0003（0002 撤 V1 supervisor
-  两表镜像，**尚未在 test TEE 生效**——实库仍有这两张）。
-- **（v3）Runtime V2 是当前最大的新增加密面**：`model_api_runtime/v2/
-  serve_worker.py` 15+ 个信封读写/enclave 解密调用点（含
-  `purpose="v2_caption_read"` 等 runtime_token 形态）；迁移
-  `0043_v2_encrypted_trajectories.py` 用表级 CHECK **强制** `payload_envelope`
-  带 K_enclave（`v2_trajectory_events`/`v2_conversation_summary`/
-  `v2_workspace_entries` 同模式）。V2 信封是**服务端自封**（运行时持有明文再
-  封存）——按本计划「服务端自产内容一律明文」原则，这些列在 Phase 2 转明文，
-  CHECK 约束随之改写。
-- **（v3）V1 supervisor 在退役中**：`agent_runtime/supervisor.py` 已删除
-  （原引用 supervisor.py:527 作废），RDS 的 `agent_runtime_instances`/
-  `agent_runtime_supervisor_heartbeats` 表尚存（灰度残留）；V1↔V2 以
-  allowlist 灰度共存。Phase 2 细案按当时的 V1 退役进度决定 V1 调用点是
-  「改造」还是「随 V1 一起删」。
-- **（v3）新增 TEE Redis CVM**（`backend/redis_pool.py` + `docs/REDIS_USAGE.md`，
-  cache/lock/rate-limit/queue，key 前缀 `IO:`）：内容易失可重建，**与切库
-  正交**，不进迁移范围；但进 Phase 4 的存储清单核对（确认无持久业务状态）。
-- 影子库已镜表列结构与 RDS 逐列对齐；`chat_messages.seq` 的 cutover
-  setval 逻辑已内建（`tee_replicator/worker.py:765-777`）。
-- **（v3，07-26 确认）TEE 同步是三层白名单手工登记制，且迁移落地是人工的**：
-  ① DDL 靠手写 alembic_tee revision（与 RDS alembic 链零派生关系）；② 数据
-  流靠 db.py 写点显式加 `mirror.execute` / replicator 表清单 / reconciler
-  `TABLES` 白名单，三处都没有 v2；③ **alembic_tee 无任何 CI 钩子**，靠人工
-  `python -m backend.alembic_tee`（`TEE_MIGRATION_DATABASE_URL` owner 角色）
-  执行——已合并的 0002 至今未在 test/prod 实库执行。V2 新表「没同步」是这套
-  机制的必然结果，不是故障。
-- 存量密文分层：① shared 带 K_enclave → **已被 replicator 解进 TEE**（DB 侧
-  无需再动），其 R2 重体需重写（见 Phase 1）；② local_only / 无 K_enclave →
-  **原地保留为加密，不动**；③ `tee_pending_device_migration` 里
-  `decrypt_failed:` 行（prod ~790）→ 设备也解不开，确定丢失（D1）。
-- R2 四桶：frames（E2E 密文 + frames-tee/ storage-key 密文）、chat-files（E2E
-  密文）、io-user-logs（明文，不动）、WAL-G 备份桶（libsodium，保留）。
+- **表同步现状**：RDS prod=61 / test=56、TEE 各 20；缺口 45 张、约 3189 行。TEE
+  同步是三层白名单手工登记制，alembic_tee 无 CI 钩子（0002/0003 合了从未在
+  实库执行）。**这部分由独立工作流承接**（见
+  `docs/superpowers/specs/2026-07-27-tee-full-table-alignment-design.md`，权威
+  事实源），本文 Task 0.6/1.5 不再重复维护其数字。
+- **Runtime V2 强制加密**：`serve_worker.py` 15+ 信封调用点；迁移 0043 用表级
+  CHECK 强制 `payload_envelope` 带 K_enclave。v6 下需改为**按偏好**（明文档
+  用户 V2 轨迹存明文），CHECK 放宽为「允许明文或信封」。
+- **V1 supervisor 在退役中**：`agent_runtime/supervisor.py` 已删除；RDS 两张
+  `agent_runtime_*` 表尚存；V1↔V2 allowlist 灰度共存。
+- **新增 TEE Redis CVM**（`IO:` 前缀）：易失可重建，与切库正交，仅进 Phase 4
+  存储清单核对。
+- **存量密文分层（v6）**：① 现有全体 shared（带 K_enclave）→ 默认迁明文，
+  Phase 1 由 enclave 解密进 TEE（影子库本来就在做）；② BYOK / R2 storage-key
+  → Phase 1 enclave 明文化；③ local_only 孤岛（只 K_user）→ 仅 prod 3 用户
+  7 条 chat、test 1 条，其余内容域全 0，iOS swap 自解或丢弃；④ quarantine
+  `decrypt_failed:` 797/13 用户 → 确定丢失（D1）。
+- R2 四桶：frames、chat-files（密文）、io-user-logs（明文）、WAL-G 备份桶
+  （libsodium）。frame_envelopes island=0 → R2 帧 body 全 enclave 可解、无
+  K_user-only 孤岛。
 - enclave 与账号体系零耦合（注册/api_key/whoami/runtime-token 全在 backend）；
-  唯二要搬的计算：帧 VLM caption（`enclave/routes/frames.py:165`）、memory
-  index 筛选（`enclave/routes/memory.py:37`）——**只对明文内容服务**。
-- iOS 设备内容钥 = 账号所有权凭证（register 公钥 + recover 解挑战），**钥保留**
-  （既是认证凭证也是可选加密的内容钥）；BoxSeal 挑战信封由 backend 用公钥封，
-  不依赖 enclave（`accounts_core.py:218` 保留）。
-- 已知慢性病：`tee_sync_runs.reconcile_ok` 全 false（07-25 复核 test/prod 均
-  未修，Phase 0 必修）。
+  两处 enclave 内计算（帧 VLM caption `enclave/routes/frames.py:165`、memory
+  index `enclave/routes/memory.py:37`）**保留**——它们服务加密用户。
+- iOS 设备内容钥 = 账号所有权凭证 + 内容加密钥，私钥始终只在设备；BoxSeal 挑战
+  信封由 backend 用公钥封，不依赖 enclave。
+- 已知慢性病：`tee_sync_runs.reconcile_ok` 全 false，prod tick 11 分钟、
+  `requeue_backlog` 增长（717→776→3028）。Phase 0 Task 0.2 必修，且必须在表
+  同步铺开前完成。
 
-## 产品级后果（写进 D2 告知口径，工程无法绕开）
+## 产品级后果（写进 D2 告知口径）
 
-**开了加密开关的用户 = 存储级服务**：聊天正文/记忆/帧对服务端不可见 ⇒ hosted
-agent 回合、记忆蒸馏、proactive 感知、genesis 导入、VLM caption 对该用户全部
-不可用或退化（BYOK provider key 除外——它是服务端运行时必须读的，不随开关加密，
-见 Phase 2 Task 2.3）。开关 UI 文案必须如实陈述这一点。
+- **默认（明文）用户**：新数据 + 全部存量（含现有 shared 解密后）明文，服务端
+  可读，全功能，读路径不经 enclave（更快）。绝大多数用户。
+- **加密（opt-in）用户**：内容 DB/R2 密文、TEE 内解密、**功能不降级**；隐私
+  保证 = attested-decrypt（信任 TEE 硬件而非"服务端无钥"）。读经 enclave、
+  稍慢。这是现状 shared 模型的延续。
+- **D2 冲击面比 v5 小得多**：加密档保留原 E2E/attested 叙事，只需新增「默认
+  明文」一档的说明 + 加密开关是"更强隐私、稍慢"而非"功能全废"。
 
 ---
 
 ## Phase 0 — 决策拍板 + 侦察修病 + 备份演练（不写业务代码）
 
 **入口 gate：** 无。
-**出口 gate：** 三个决策有书面结论；`reconcile_ok=true` 连续 3 个 tick；restore
-演练成功且 RTO 落账；尾账表（附录 A）填上真实数字。
+**出口 gate：** 决策有书面结论；`reconcile_ok=true` 连续 3 个 tick；restore 演练
+成功且 RTO 落账；尾账（附录 A）已实测完成。
 
-### Task 0.1: 三个决策（需要用户拍板，agent 只准备材料）
+### Task 0.1: 决策（已基本拍定，剩 D2 文案）
 
-- [ ] **D1 丢弃面**：确认 `decrypt_failed:` 隔离行（~790）永久丢失可接受。
-- [ ] **D2 信任承诺与告知**：docs-site 新叙事口径（「默认明文 + 可选客户端加密
-      + TEE 磁盘加密的托管库」替代「E2E+attested decrypt」）；加密开关的功能
-      降级矩阵文案；对现有用户的告知方式与时点。
-- [ ] **D3 账号恢复机制**：确认保留现有钥恢复（推荐，改动为零：backend 封挑战
-      不依赖 enclave）。
-- [ ] （v1 的 D4 私钥留存已随私钥收集一并删除。）
+- [x] **D1 丢弃面**：quarantine `decrypt_failed:` 797/13 用户丢弃；3 用户 7 条
+      local_only 走 iOS swap 自解、够不着则丢弃。**（07-28 确认）**
+- [x] **D2 信任承诺与告知**：docs 新增「默认明文」档说明 + 加密开关定位为
+      「更强隐私（TEE 保护）、功能不减、稍慢」；加密档保留现有 attested-decrypt
+      叙事；现有用户默认迁明文的告知方式与时点。
+      **（2026-07-28 文案初稿 + 告知方案已拍板 A-1）**
+      文案见 `docs/superpowers/specs/2026-07-28-D2-trust-disclosure-draft.md`。
+      - **关键结论：这不是信任承诺的回退。** 现网公开文档
+        `architecture.mdx:153` 原文已写明 "**not a claim that no server-side
+        component ever sees plaintext**"，并列举 5 处显式明文边界（Perception
+        早有明文分支）。v6 只是把明文边界从「若干例外」扩成「默认档」，
+        叙事类型没变、变的是默认值 → D2 冲击面远小于计划原先的假设。
+      - **已拍板 A-1（事前告知 + 先行 opt-in，调整 Phase 顺序）**：Phase 3 发
+        iOS 开关时先告知，让在意的用户在存量迁明文**之前**就能打开加密档。
+        选 A-1 而非 A-2 的理由：方案 A 的全部价值就在「迁移前 opt-in」，A-2
+        （保持顺序、事后告知）与该理由自相矛盾；且一旦迁了明文，用户再回加密
+        档要重新加密存量，成本高得多。
+      - 剩余待定（不阻塞开工）：两档的对外命名、加密档「稍慢」是否给量化数字
+        （需 Phase 2 实测）、以及 D1 那 797 条 /13 用户是否单独告知。
+- [x] **D3 账号恢复机制**：保留现有钥恢复（改动为零）。**（07-28 确认）**
+- [x] **存量默认态**：现有用户 cutover 默认迁明文，加密 opt-in。**（07-28 确认）**
 
-### Task 0.5: 与 V2 开发线对齐「冻结加密面扩张」（v3 新增，优先级最高）
+### Task 0.5: 与 V2 开发线对齐 + 冻结「强制加密」CI 守卫
 
-- [ ] 与 V2 负责人确认：后续 V2 新表/新列不再加「强制信封」约束，存储形状
-      做成明文/信封自识别；已有的 `ck_v2_trajectory_envelope` 类约束列入
-      Phase 2 改写清单而不是继续复制该模式。
-- [ ] **把冻结约束做成 CI 守卫测试（比人工周扫强一档）**：照
-      `test_no_flask_anywhere` 的既有模式写一个
-      `tests/test_encryption_surface_frozen.py`——grep 源码里
-      `_decrypt_envelope_via_enclave` / `_build_shared_envelope_for_store` /
-      `K_enclave` 的出现位置，与仓库里登记的 allowlist 文件比对，新增调用点
-      直接红——想加就必须显式登记，登记即触发归类（Phase 2 待改 / 违反冻结
-      需回退）。人工「加密面增量对照」降级为每次 V2 大合并后的抽查。
+- [ ] 与 V2 负责人确认：V2 新表/新列不再加「表级强制信封」约束，改为按用户
+      `content_encryption` 偏好支持明文/信封两形状；已有
+      `ck_v2_trajectory_envelope` 类约束列入 Phase 2 改写清单。
+- [x] **CI 守卫测试**：照 `test_no_flask_anywhere` 模式写
+      `tests/test_encryption_surface_frozen.py`——扫「表级强制 K_enclave 的
+      CHECK 约束」与「无偏好分支的强制信封写入点」，新增违规直接红。
+      **（2026-07-28 完成，6 tests，端到端验证过「造违规必红、移除即绿」）**
+      - CHECK 面：扫 `alembic` **与 `alembic_tee` 两条链**（后者是表同步工作流
+        正在建 30+ 张表的地方，最可能引入新约束），识别 4 种等价写法
+        `? 'K_enclave'` / `length(->>)` / `IS NOT NULL` / `jsonb_exists`——
+        只堵第一种等于没堵，**0043 自己就同时用了前两种**。allowlist = 0043。
+      - 写入点面：per-file 计数基线 **44 处 / 19 文件**，只许减不许增，另有防
+        基线失效的 stale 检查。⚠️ 计划正文记的「14 处」是 07-23 快照，**三周
+        翻了三倍**——这是「加密面仍在扩张」的量化证据，Phase 2 Task 2.2 的改造
+        面比原估大得多。
 
-### Task 0.2: 修 reconcile_ok 慢性 false
+### Task 0.2: 修 verify 毒行卡死（~~⚠️ 表同步前必完成~~ 排序约束已撤销）
 
-- [ ] 取证：`select * from tee_sync_runs order by ran_at desc limit 5`（RDS），
-      对照 backend 日志 `tee_sync_scheduler` 的 reconcile 段报错；疑点方向：
-      单表独占窗口饥饿（memory `tee-replicate-poison-row-headofline-quarantine`）
-      或 reconcile 在 tick 预算内跑不完只标 false。
-- [ ] 根因修复（另立细案），验收：连续 3 个 tick `reconcile_ok=t` 且
-      `unconverged_tables` 为空。
+> ~~prod 单趟 tick 已 11 分钟、`verify_ran=f`、`requeue_backlog` 增长~~
+> ~~（717→776→3028）。表同步工作流会再挂 30+ 张表，本任务必须先完成。~~
+>
+> **2026-07-28 取证推翻了上述病症描述与两个疑点方向**，细案见
+> `docs/superpowers/specs/2026-07-28-tee-sync-verify-poison-row-design.md`。
+> 实测 24h / 139 趟 tick：`reconcile_ok` = true 1 次 / false 49 次 / **NULL 89 次**，
+> `verify_ran=t` **0 次**，均值 306s（非 11 分钟），`requeue_backlog` 恒 NULL。
+> **排序约束方向是反的**：不是 0.2 挡着表同步，而是表同步（Task 0.6）修好了
+> 0.2 的一半——故撤销「表同步前必完成」。
+
+- [x] 取证：`tee_sync_runs` + prod backend 日志。**（2026-07-28 完成）**
+      两条互相独立的根因，都不是原疑点方向：
+      - **根因 1（已自愈，无需修）**：`reconcile 失败: relation
+        "notify_relay_configs" does not exist` —— TEE 侧缺表让整趟 reconcile 抛
+        异常。表已补齐（TEE prod 现 **54 张表**），`02:51` 那趟
+        `reconcile_copied=850445`（85 万行）是真成功，不是 `AlreadyRunning` 假成功。
+      - **根因 2（唯一剩余真问题）**：`verify 失败:
+        enclave_http_403:{"error":"decrypt_failed: envelope missing body_ct"}`
+        —— `tee_shadow/verify.py:306` 只 catch `PendingDeviceMigration`，enclave
+        403 直接冒泡冲垮整趟 verify，再被 `tee_sync_scheduler.py:211` 静默吞掉。
+        **一条坏行 = verify 永久瘫痪**；与 replicate 侧 2026-07-15 已修的毒行
+        队头阻塞是同一模式，只是 verify 这条路径当时没跟着加 quarantine。
+- [x] 根因修复（细案见上）。**（2026-07-28 完成，严格 TDD，两轮红→绿）**
+      - `tee_shadow/verify.py`：抽样解密 `except` 分两级——`PendingDeviceMigration`
+        维持跳过；**其它任何解密异常记为 `field="<decrypt-failed>"` 的 mismatch
+        并 continue**。坏行**记成 mismatch 而非跳过**：跳过等于宣称「两库一致」，
+        用虚假全绿掩盖真问题，比崩掉更危险。
+      - `admin/tee_sync_scheduler.py`：`report.verify` 增 `decrypt_failures`
+        计数并进 log——「解不开」与「内容不一致」处置不同，混在一个 mismatches
+        总数里等于把告警埋掉（修好 verify 只是把一种静默换成另一种）。
+      - 测试：`test_undecryptable_row_is_reported_not_fatal`、
+        `test_sync_tick_surfaces_verify_decrypt_failures`，均先验证过 RED
+        （分别是 `RuntimeError` 冒泡、`KeyError: 'decrypt_failures'`）。
+      - 未加 DB 列：计数走已有的 `report` JSONB，避免与在途分支抢 alembic 版本号。
+- [x] **验收标准已改写**（2026-07-31）。原标准「连续 3 个 tick `reconcile_ok=t`」
+      不可执行：`FEEDLING_TEE_RECONCILE_INTERVAL_SEC` 默认 86400s，reconcile 成功
+      后 24h 内 `reconcile_ok` 恒为 NULL，所以「连续 3 个 tick 都为 t」要么等 3 天、
+      要么只可能出现在**反复失败重试**时——把「健康」定义成了「刚失败过」，自相矛盾。
+
+      **新验收标准**（三条全过才算 Task 0.2 出口）：
+
+      1. **reconcile 侧**：最近 3 趟**真的执行了** reconcile 的 tick
+         （`did_reconcile = true`）全部 `reconcile_ok = true`。
+         判据 SQL：
+         ```sql
+         SELECT started_at, reconcile_ok
+         FROM tee_sync_runs
+         WHERE did_reconcile
+         ORDER BY started_at DESC
+         LIMIT 3;
+         ```
+      2. **verify 侧（本 Task 真正要保证的东西）**：最近一趟 `verify_ran = true`
+         的 tick 满足 `report->'verify'->>'decrypt_failures' = '0'` 且
+         `report->'verify'->'unconverged'` 为空数组。
+         —— 毒行修复的**直接**判据就是它：`decrypt_failures` 是本 Task 新加的指标，
+         原标准里根本没有它，而「reconcile 没报错」并不能证明毒行不再冲垮 verify。
+      3. **不再被静默吞掉**：`verify_ran` 在最近 24h 内至少为 true 一次。
+         2026-07-28 prod 的病征正是 `verify_ran` 恒 false——一条毒行让 verify 整趟
+         抛异常、被 scheduler 的兜底 except 吞掉，收敛度彻底失去量测却毫无告警。
+
+      ⚠️ Task 2.4 的 carry-verbatim 上线后，**加密档用户的行不再解密**，
+      `decrypt_failures` 对他们恒为 0。届时第 2 条只能证明「明文档用户没毒行」，
+      加密档的对账健康要看密文逐字比对的 mismatch 数（`verify._expected_doc`）。
+
+### Task 0.6: TEE 迁移落地机制（**已由独立工作流承接**）
+
+> 本任务与 Task 1.5 由
+> `docs/superpowers/specs/2026-07-27-tee-full-table-alignment-design.md`（设计
+> 已获批）承接。交接提醒：v6 下加密用户的密文行仍要能进 TEE（双写/复制原样
+> 搬运信封），新建表 envelope 列做成明文/信封自识别、**不带强制 K_enclave
+> CHECK**；verify 白名单随新表扩展。
+
+**✅ 已完成**（承接方 `2026-07-27-tee-full-table-alignment` 交付，状态自 test 分支
+`c756ec2a` 合入 v6，2026-07-29）：
+
+- [x] **先还账**：已合并未执行的 alembic_tee 0002/0003 应用到 test 与 prod 实库
+      （撤 V1 supervisor 两表镜像）。0004 落地时一并把两个实库从 0001 推到 0004
+      head（**各 54 张表**），`alembic_tee_version` 已核对。
+- [x] **再建通道**：新增 `.github/workflows/tee-migrate.yml`（手动触发、typo
+      guard、owner 角色 direct-TLS、落地后强制断言 `alembic_tee_version == 代码
+      head`），alembic_tee 从此不再是「纯人工执行、无 CI 钩子」。
+
+> 这两条正是 Task 0.2 根因 1（reconcile 撞 TEE 缺表）得以自愈的原因——排序约束
+> 「0.2 必须先于表同步」的方向因此被证反，见 Task 0.2。
 
 ### Task 0.3: WAL-G restore 演练（扶正的硬前置）
 
-- [ ] test 环境按 `deploy/postgres/restore.sh` 从 R2 全量恢复到一次性容器，
-      对比行数与 `alembic_tee_version`。
-- [ ] 记录 RTO；写进 `docs/TEE_POSTGRES_SHADOW_PROVISIONING.md` §4。
-- [ ] prod 备份链健康核查：`wal-g backup-list` 最新 base backup < 24h。
+- [x] test 环境按 `deploy/postgres/restore.sh` 从 R2 全量恢复到一次性容器，
+      对比行数与 `alembic_tee_version`。**（2026-07-28 完成，演练成功）**
+      `alembic_tee_version` 与表数（54）与实库**完全一致**；逐表行数
+      **50/54 逐行一致**，有差异的 4 张全是持续写入表（`user_logs`
+      16123→16082、`v2_worker_heartbeats` 130→128、
+      `agent_runtime_supervisor_heartbeats` 4→3、`chat_r2_lifecycle` 227→226），
+      差量与「实库仍在写、恢复库停在 13:34:36」吻合，非数据丢失。全部用户内容表
+      （chat_messages/memory_moments/users/frames…）逐行一致。
+- [x] 记录 RTO；写进 `docs/TEE_POSTGRES_SHADOW_PROVISIONING.md` **§5**（§4 是
+      「停用/回滚」，演练记录另起一节更清晰）。**（2026-07-28 完成）**
+      **RTO ≈ 7 分钟**（backup-fetch 141s + WAL 回放 240s + 启动/修正 ~30s；
+      本机 arm64 跑 amd64 镜像走模拟，属**上限**）；**RPO ≈ 0**（恢复点
+      13:34:36，演练 13:25 启动 —— WAL 归档及时）。
+- [x] **`restore.sh` 缺陷已修**（2026-07-31）。原缺陷：线上 `max_connections=400`
+      是部署参数注入的（compose `-c max_connections=400`）、**不在备份带出来的
+      `postgresql.conf` 里**，恢复端默认 100 → 回放直接
+      `FATAL: recovery aborted because of insufficient parameter settings`。
+      演练当时是手工追加参数才继续的。
 
-### Task 0.6: TEE 迁移落地机制（v3.1 新增，07-26 发现的机制缺口）
+      **修法不是写死 400**，而是从刚取回的 backup 的 `pg_control` 里读主库当时的
+      真实值（`pg_controldata`）—— 主库调参后脚本自动跟上，不会漂移。覆盖 PG 有
+      「≥ primary」硬要求的全部五个参数，并处理了标签与参数名不同名的映射
+      （`max_prepared_xacts` → `max_prepared_transactions`、
+      `max_locks_per_xact` → `max_locks_per_transaction`）。
 
-- [x] 先还账：把已合并未执行的 alembic_tee 0002/0003 应用到 test 与 prod TEE
-      实库（撤 V1 supervisor 两表镜像），核对 `alembic_tee_version`。—— 由
-      `2026-07-27-tee-full-table-alignment` 完成：0004 落地时一并把两个实库
-      从 0001 推到 0004 head（各 54 张表），`alembic_tee_version` 已核对。
-- [x] 再建通道：alembic_tee 目前**无 CI 钩子、纯人工执行**——Phase 1 会新增
-      多个 revision，必须先定落地机制（二选一）：接一个手动触发的 GitHub
-      workflow（仿 pg-deploy，带 typo guard），或写成 runbook 固定步骤进
-      `TEE_POSTGRES_SHADOW_PROVISIONING.md`。没有这个通道，Phase 1 的建表
-      任务全是空转。—— 由 `2026-07-27-tee-full-table-alignment` 完成：新增
-      `.github/workflows/tee-migrate.yml`（手动触发、typo guard、owner 角色
-      direct-TLS、落地后强制断言 `alembic_tee_version == 代码 head`），用法
-      见 `TEE_POSTGRES_SHADOW_PROVISIONING.md` §"迁移落地通道"。
+      已用真 `postgres:18` 实测：注入 `max_connections=400 max_locks_per_transaction=128`
+      起停一次后，提取逻辑从 pg_control 读回 400 / 128，正是演练撞的场景。
 
-### Task 0.4: 尾账量化（只读查询，填附录 A）
+      另两处非阻塞坑一并处理：`pg_ctl` 不在 PATH（从 `pg_controldata` 反推 PGBIN
+      并前置到 PATH）、恢复实例无 `postgres` 角色（脚本末尾打印提示，要用
+      `-U <owner>` 连）。
+- [x] prod 备份链健康核查：`wal-g backup-list` 最新 base backup < 24h。
+      **（2026-07-28 完成）** 最新 `base_00000001000001E3000000D3 @
+      2026-07-28T03:00:22Z`，距核查约 8.8h；07-25/26/27/28 每天 03:00 各一条，
+      cron 稳定 → 07-24 那次「重部署抄旧 tag 丢 PATH 修复导致 base backup 全断」
+      确认已闭环。当前镜像 `35f2a9eb…`，容器 healthy。
 
-- [ ] TEE：`select table_name, count(*) from tee_pending_device_migration group by 1`
-      按 reason 前缀分列。
-- [ ] R2：frames-tee/ 对象数（storage-key 密文，Phase 1 要重写的工作量）；
-      chat R2 对象里带 K_enclave 的行数（从 RDS doc 统计）。
-- [ ] 存量 local_only 行数（各表 `doc->>'visibility'='local_only'`）——只为
-      D2 告知口径提供数字，**不迁移**。
+### Task 0.4: 尾账量化 ✅（2026-07-28 完成，见附录 A）
+
+- [x] local_only 孤岛：prod 3 用户 7 条 chat、test 1 条，其余内容域全 0。
+- [x] quarantine `decrypt_failed:` 797/13 用户；R2 帧无 K_user-only 孤岛。
 
 ---
 
-## Phase 1 — 存量服务端解密重写（enclave 在世期间全部做完）
+## Phase 1 — 现有 shared 存量迁明文 + BYOK/R2 明文化（enclave 解密）
 
 **入口 gate：** Phase 0 出口 gate 全过。
-**出口 gate：** R2 无 storage-key 密文对象残留；带 K_enclave 的 R2 聊天重体全部
-重写为明文；BYOK 凭证明文列迁移完成且新旧对账一致；`verify` 全绿
-（`rds == tee + pending`，requeue_backlog=0），**且 verify 的表范围已扩到
-Task 1.1/1.4/1.5 新增的全部必迁表**（verify 只查白名单，不扩范围的全绿是
-假象）。
+
+> ⚠️ **D2 拍板 A-1 后新增的顺序约束（2026-07-28）**
+>
+> 本 Phase 里**触及用户内容**的存量迁明文（Task 1.2/1.3/1.4 以及 chat/memory
+> 等内容域）**不得早于 Phase 3**（iOS 开关发版 + 告知）——A-1 的全部价值就在
+> 于让用户**在自己的存量被迁成明文之前**就能选择打开加密档；迁完再告知，用户
+> 要回加密档就得重新加密存量，代价高得多。
+>
+> 直接照搬「Phase 3 先于 Phase 1」会形成循环依赖（Phase 2 入口依赖本 Phase 的
+> Task 1.1，Phase 3 又依赖 Phase 2）。按**内容性质**拆解即可解开：
+> **Task 1.1（BYOK provider 凭证明文化）不是用户内容、不触发告知义务，维持原位**；
+> 其余触及用户内容的子任务后移到 Phase 3 之后。
+>
+> 实际执行顺序：**1.1 → 2 → 3（发版 + 告知）→ 1.2 / 1.3 / 1.4 → 4 → 5**。
+> Phase 4 的入口 gate（「Phase 1 出口 gate 全过」）因此自然满足，无需再改。
+**出口 gate：** 现有用户 shared 存量在 TEE 侧为明文；R2 无 storage-key 密文残留、
+带 K_enclave 的 R2 重体已明文化；BYOK 凭证明文列迁移完成且对账一致；`verify`
+全绿且表范围已扩到全部新增必迁表。
+
+> 说明：TEE 影子库现在做的「shared 经 enclave 解密进 TEE」正是 Phase 1 的主体
+> ——现有全体用户默认迁明文，与此一致。opt-in 加密是 Phase 2 上线后用户主动
+> 选择、届时新写才是密文。
 
 ### Task 1.1: BYOK 凭证明文化迁移
 
-- [ ] alembic_tee 新 revision：`model_api_credentials`（列同 RDS，
-      `api_key_envelope JSONB` → `api_key TEXT` 明文列）+ `model_api_routes`
-      （纯照抄）。
-- [ ] 一次性迁移工具（`tools/`，dry-run 优先）：逐行经
-      `_decrypt_envelope_via_enclave(purpose="model_api_provider_key")` 解出
-      明文 → 写 TEE；失败行落清单人工跟进。
-- [ ] 读侧改造在 Phase 2（此处只迁数据，RDS 侧照旧供线上使用）。
+> **2026-07-29 侦察后本 Task 范围已重定**，细案见
+> `docs/superpowers/plans/2026-07-29-byok-credential-plaintext-read-routing.md`。
+> 实测：RDS(test) 25 行**全密文**、TEE(test) 同表 25 行**全明文**
+> （key 集合 `body,id,owner_user_id,visibility`，`body_ct`=0）——**表对齐工作流的
+> CIPHERTEXT lane 已在复制时解密**（`tee_replicator/worker.py:627-670`），
+> 与 Task 0.2 根因 1 是同一模式：表同步已经替本 Task 做掉了数据侧。
+> **真正的缺口在读侧**：`hosted/config_store.py:378` 等 7 处**无条件**打 enclave
+> 解密，cutover 后遇到 TEE 的明文行会全线返回 `model_api_key_decrypt_failed`。
+
+- [x] ~~一次性迁移工具（`tools/`，dry-run 优先）~~ **不再需要**：replicator 持续
+      在做，且已收敛（TEE 侧 25/25 明文）。原设想的「逐行解密→写 TEE→失败行落清单」
+      与现有复制链重复。
+- [x] **读侧按形状路由**（本 Task 的实际主体）。**（2026-07-29 完成，严格 TDD，
+      细案 3 个 Task 全绿；9 个新测试）**
+      - 新增 `core.envelope.decrypt_provider_key_envelope`：`body_ct` 优先走
+        enclave、只有 `body` 则**本地直读**（明文分支绝不联网）。
+      - **5 处** Python 直调点改调它：`hosted/config_store.py`(1) +
+        `hosted/setup_core.py`(4)。⚠️ 细案初稿写的「7 处」与
+        `hosted/vision_observer.py` 均来自**主仓** grep；worktree 基线
+        `ed6f2053` 无该文件，行号也全不同——合并回 test 时若 `vision_observer.py`
+        已存在，那一处需照改（守卫测试会自动抓出来）。
+      - **2 处 HTTP 路径**短路：`agent_runtime/supervisor.py::_decrypt_provider_key`
+        与 `genesis/worker.py::_provider_key_from_envelope`（**后者是细案漏项**，
+        靠全仓重扫 `model_api_provider_key` 发现——它走自己的 `_decrypt_envelope`）。
+      - 守卫测试 `test_no_unrouted_provider_key_decrypt_sites_remain`：今后新增
+        「无形状路由」的 provider-key 解密点直接红。
+      - **过程中发现并修好两处既有问题**：①helper 初版无脑透传空 `runtime_token`，
+        破坏了「api-key 调用方入参不变」的既有语义（被
+        `test_model_api_profiles_config_store.py` 抓住，已加测试锁死）；
+        ②`test_model_api_models_route.py` 的假信封是 `{"ciphertext": "x"}` 这种
+        不真实形状，导致 `..._decrypt_failure_is_400` 实际**从未走到 enclave**
+        就返回 400（测试空转），已改成真实的 `{"body_ct": "x"}`。
+      - `hosted/setup_core.py` 的 `core_enclave` import 替换后成 unused，但模块
+        docstring 写明「preserved so tests can monkeypatch」→ **加 noqa 保留不删**
+        （memory `autoflake-kills-module-attr-reexports`）。
+- [ ] ~~alembic_tee 新 revision（`api_key_envelope JSONB` → `api_key TEXT`）~~
+      **推迟到 Phase 5**：TEE 侧现存形状是 `{body,…}` 而非裸文本，读侧路由后已可
+      直读；列改名要同时动 replicator upsert、verify 表登记与 alembic_tee，收益仅
+      「清爽」，风险却压在 cutover 关键路径上。留到 RDS 退役、不必维护双形状时再做。
+
+> ⚠️ **本 Phase 的 R2 两条写于 v5「彻底删加密」时代，v6 下必须重新划范围**：
+> 加密是每用户偏好了，所以**绝不能全量明文化**——加密档用户的 R2 重体必须原样保留
+> 密文。两个工具都按档位过滤（只处理显式 `content_encryption="off"` 的用户），
+> 判据与 `tee_replicator.worker._carries_verbatim` 一致、失败方向同样是「宁可多
+> 留密文」。
 
 ### Task 1.2: R2 storage-key 密文重写（frames-tee/）
 
-- [ ] 工具遍历 `frames-tee/<user_id>/<frame_id>` → enclave storage key `open_`
-      解密 → 明文写回（同 key 或新前缀，细案定）→ TEE `frames` 表指针列同步。
-- [ ] 断点续跑（R2 list 游标 + 已处理标记）；限速防打爆 enclave（502 前科）。
-- [ ] **范围排除**：`frames/` 前缀的 E2E `body_ct`（K_user only）不动——那是
-      local_only 存量，原地保留为加密。
+- [ ] ⛔ **阻塞：需要一个新的 enclave 端点，属信任边界改动，需拍板。**
+      `frames-tee/` 里的对象是用 **enclave 存储钥**加密的（`/v1/storage/reencrypt-frame`
+      派生的 AES-256-GCM），而那个端点的设计原则白纸黑字写着**「明文不出 enclave」
+      ——只有存储密文离开**。要「解密→明文写回 R2」，就必须新增一个会吐明文帧正文
+      的端点，这与现有 enclave 设计直接冲突。
+      **不要绕过它**（比如在 backend 侧另存一份钥），那会让 enclave 的度量与
+      attestation 叙事失去意义。先决定：v6 下 frames 是否也分档、明文档的帧是否
+      干脆不再经存储层加密（写入时就明文进 R2）。后者可能比"先加密再解密回来"更对。
 
-### Task 1.3: R2 聊天重体重写（带 K_enclave 的）
+### Task 1.3: R2 聊天重体明文化（带 K_enclave 的）
 
-- [ ] 从 RDS `chat_messages.doc` 找出 `body_key` 指向 R2 且信封带 `K_enclave`
-      的行 → 经 `/v1/envelope/decrypt` 解密 → R2 明文重写 + TEE 行指针核对
-      （TEE 明文行 replicator 已产出，此处只补 R2 对象）。
-- [ ] 无 K_enclave 的对象跳过（= 加密存量，保留）。
+- [ ] 🟡 **backend 协议与工具已完成；生产执行等待 iOS 强更/rollout gate。**
+      `backend/backfill_chat_bodies_to_plaintext.py` 缺省仍是**只读盘点**；apply
+      需要 CLI 双确认与部署 feature gate。2026-07-31 接手审计发现首版工具不能
+      安全执行：
+
+      1. `object_storage.get_chat_body()` 返回的是重新 base64 后的 `body_ct`；
+         `put_chat_body()` 又会 base64 解码并按参数生成 key。首版把明文字符串交给
+         后者，普通正文会报错，恰好长得像 base64 的正文会被静默改坏。
+      2. 现网指针是带 generation/version 的持久化 `body_key`，普通 put 生成另一
+         个 legacy key；不更新数据库指针就等于写了一个永远读不到的对象。
+      3. 即使原地覆盖成功，行仍是 `{body_key, body_ct_len, K_enclave...}` 密文
+         形状；`hydrate_chat_file_body()` 会把对象装回 `body_ct`，客户端仍按密文解。
+      4. 原地覆盖还有不可恢复的崩溃窗口：R2 已变明文、数据库尚未切形状时，原密文
+         已丢失，重跑无法恢复。
+
+      正确实现必须先定义明文 pointer 形状（含二进制策略），再做：
+      **新 key 写明文 → CAS 切数据库 pointer/形状 → 旧 key 进入 durable cleanup**。
+      还要同时覆盖 `chat_messages` 与保留历史的 `chat_message_archive`，并让 app
+      读侧、TEE replicator/verify 对这个形状按行路由。完成该协议前不得真跑。
+
+      **设计草案已补**：
+      `docs/superpowers/specs/2026-07-31-r2-plaintext-body-pointer-design.md`。
+      推荐新 pointer 用 `body_object_format="plaintext_v1"` + size/hash，水合后以
+      `body_b64` 传 raw 明文字节；迁移复用现有 upload_guard/advisory-lock/CAS/
+      cleanup 状态机，绝不原地覆盖。这个新 wire shape 也证明原 Phase 顺序需要调整：
+      代码可先做，但存量 apply 必须后移到 iOS 支持 `body_b64` 且完成强更之后。
+      **2026-07-31：spec §14 四项推荐方案已全部拍板。** 允许开始代码实现；
+      这不等于批准生产 apply，后者仍受 iOS 强更与 rollout gate 约束。
+
+      **2026-07-31 backend 实现完成：** raw object helper、`plaintext_v1`
+      size/hash pointer、`body_b64` 写入/读取、live JSONB CAS、archive
+      delete+insert、upload guard/advisory-lock/durable cleanup、TEE requeue、
+      verify 的 R2 完整性抽样与双闸 backfill CLI 已落地。此 checkbox 保持未完成，
+      直到支持该 wire shape 的 iOS 版本完成强更并实际跑完生产迁移验收。
 
 ### Task 1.4: 分析表与杂项
 
-- [ ] `dau/growth/retention` 三张快照表建到 TEE + 一次性 INSERT SELECT 搬数。
-- [ ] 确认 `genesis_import_chunks` 无在途 job 后弃。
+- [ ] `dau/growth/retention` 建到 TEE + 一次性搬数。确认 `genesis_import_chunks`
+      无在途 job 后弃。
 
-### Task 1.5: v2_* 表 + V2 队列/归档表的镜像/迁移策略（v3 新增）
-
-> **由 `2026-07-27-tee-full-table-alignment` 完成**：39 张未镜像表已全部登记进
-> `backend/tee_shadow/table_registry.py`（新增的单一真源），分入 MIRROR/
-> CIPHERTEXT/SNAPSHOT 三条 lane（`v2_*` 队列/运行时状态大多落 SNAPSHOT 整表
-> 快照替换；`chat_message_archive`/`model_api_credentials`/`v2_conversation_
-> summary(+_segments)`/`v2_trajectory_events`/`v2_trajectory_reviews`/
-> `v2_workspace_entries` 落 CIPHERTEXT），alembic_tee 0004 已建表、`verify`
-> 覆盖范围已随之扩到全部 51 张非 SKIP 表。以下按持久性分类的初判清单保留作为
-> 历史决策记录，实际 lane 归类以 `table_registry.py` 为准。
-
-- [ ] 按持久性给 39 张未镜像表中的 V2/运行时部分分类（细案逐表定，初判）：
-      **新发现必迁**——`chat_message_archive`（归档聊天，用户数据）；
-      **随 V2 队列语义定**——`agent_action_queue`/`agent_status_events`/
-      `runtime_state`（排空或搬未完成项）；**GC 簿记**——`chat_r2_cleanup`/
-      `chat_r2_lifecycle`（在途清理排空后重建）；其余：
-      **用户数据必迁**——`v2_trajectory_streams/events/reviews/access_audit`、
-      `v2_conversation_summary(+_segments)`、`v2_workspace_entries`、
-      `v2_capture_batches`；**运行时状态可弃/可重建**——`v2_worker_heartbeats`、
-      `v2_runtime_control/state`、`v2_turn_metrics`、`v2_sandbox_usage_events`、
-      各 outbox（排空后弃）；**配置小表直接搬**——`v2_user_allowlist`、
-      `v2_wake_schedule`；`agent_jobs` 队列在冻结窗口排空后只搬未完成 job。
-- [ ] 「必迁」类补进 alembic_tee（明文形状：envelope 列建为明文/信封自识别
-      JSONB，**不带** K_enclave CHECK）+ 接入 mirror 双写或 reconciler。
-- [ ] 此任务与 Phase 2 的 V2 明文化（Task 2.2/2.3）联动：先定形状再迁数，
-      避免二次迁移。
+### Task 1.5: v2_* 表 + V2 队列/归档表（**已由表同步工作流承接**，见 Task 0.6）
 
 ---
 
-## Phase 2 — 服务端双格式常态化（明文默认 + 信封透传）
+## Phase 2 — 明文快路径 + 加密开关（按行格式路由，enclave 保留）
 
-**入口 gate：** Phase 1 Task 1.1 完成（BYOK 明文列就绪）；1.2/1.3 可并行推进。
-**出口 gate：** test 环境四象限回归（明文用户/加密用户 × 新 App/旧 App）全绿；
-L1 测试基线全绿；加密开关端到端（改偏好 → 新写走信封 → 服务端透传 → 客户端
-可读）跑通。
+**入口 gate：** Phase 1 Task 1.1 完成；1.2/1.3 可并行。
+**出口 gate：** test 四象限回归（明文用户/加密用户 × 新 App/旧 App）全绿；L1
+基线全绿；加密开关端到端跑通（开关 on → enclave 加密路径全功能；off → 明文
+直读）；写侧确认不再产生 local_only。
 
-> 本 Phase 改动点最多，**必须另立细案**；以下锁定改动清单与设计决定。
+> 本 Phase 改动点最多，**必须另立细案**。核心是「按行格式路由」：明文行走新
+> 快路径，信封行走**保留的** enclave 路径——不是删 enclave，是给它加一条明文旁路。
 
-### Task 2.1: 用户级加密开关偏好
+### Task 2.1: 用户级加密开关偏好（取代 local_only）
 
-- [ ] 新偏好 `content_encryption`（`on|off`，默认 `off`），照抄
-      `archive_language`/`timezone` 一等偏好模式：preferences 写、whoami 读
-      （memory `timezone-first-class-shipped-not-committed` 的既有套路）。
-- [ ] 开关语义：**只影响新写入**；存量不批量转换（历史行混格式是常态，读侧
-      按行自识别）。whoami 不再下发 `enclave_content_public_key_hex`。
+- [x] 新偏好 `content_encryption`（`on|off`，默认 `off`），照抄
+      `archive_language`/`timezone` 一等偏好模式。**（2026-07-29 完成，TDD，
+      15 个新测试；细案 `2026-07-29-content-encryption-preference.md`）**
+      `registry._get/_set_user_content_encryption`（含**值未变即 no-op**，防
+      `persist_user` 触发全表重载风暴）+ prefs 入口接受该字段 + whoami 下发
+      （未设置显式下发 `"off"`，不让客户端猜默认）。
+- [ ] ⚠️ ~~whoami 按偏好决定是否下发 `enclave_content_public_key_hex`~~
+      **推迟到 Phase 3 之后**：现役 iOS 用该公钥封双收件人信封，这是它**唯一**
+      的写入路径。Phase 2 上线时 Phase 3 尚未发生，默认 `off` + 停发公钥 =
+      现役 App 立刻写不进任何内容。下发一个明文档用不到的**公钥**没有安全代价
+      （它本就在 `/attestation` 公开），停发的代价却是全量写入中断。待 iOS 开关
+      发版且旧版本淘汰后另立小细案。
+- [ ] 开关只影响新写入；切换走 swap 通道逐条转换（Task 2.3）。
+- [ ] **去 local_only**：写侧不再接受 `visibility=local_only`；旧客户端仍传则
+      按偏好归一。
 
-### Task 2.2: 写闸改格式路由（各 *_core.py）
+### Task 2.2: 写侧格式路由
 
-- [ ] `chat/chat_core.py:51,488-495,607-632`（含 v3 新增的 `caption_envelope`
-      字段，commit 08d5b122 的公开契约）、`memory/memory_core.py:275`、
-      `identity/identity_core.py:86-111,192`、`worldbook/worldbook_core.py:42`、
-      `genesis/genesis_core.py:71-91`：接受两种 body 形状——明文
-      `{body: ...}` 与 v2 信封 `{body_ct, nonce, K_user, ...}`；按行存储原样
-      形状，不做服务端转换。校验规则：v2 信封不得带 K_enclave（新写）；
-      形状与用户偏好不匹配只记指标不拒绝（容忍开关切换窗口）。
-- [ ] 服务端封装点（`_build_shared_envelope_for_store` 调用：chat/service.py、
-      memory/actions.py、hosted/setup_core.py 等，07-23 快照 14 处，细案重扫）
-      改明文直写——**服务端自产内容（agent 回复、蒸馏产物、V2 轨迹/摘要/
-      工作区）一律明文**；加密用户本就不产生这些（功能降级矩阵）。
-- [ ] **（v3）V2 存储明文化**：`0043_v2_encrypted_trajectories` 等迁移的
-      `payload_envelope`/`summary_envelope`/`content_envelope` 列转明文形状，
-      删除/改写 `ck_v2_trajectory_envelope` 类 K_enclave 强制约束（新迁移）；
-      `serve_worker.py` 的信封封装/解封调用点（07-25 快照 15+ 处）改直读直写。
-      与 Task 1.5 的表形状决定联动。
+#### 2026-07-30：客户端写闸按形状路由（10 处，Task 2.2 最后一步）
 
-### Task 2.3: 读侧去 enclave
+写闸原本一律硬要 `body_ct/nonce/K_user` 且「shared 必须有 K_enclave」——明文信封
+会被拦死。普查到 **10 处**，全部迁完：`chat_core` ×4（主 send / 另一条 send /
+file_followup / thinking_envelope）、`memory_core` ×1、`memory/actions` ×2、
+`identity_core` ×2、`worldbook_core` ×1。
 
-- [ ] `core/enclave.py` 的全部调用点改为：明文行直读；信封行按调用方语义
-      跳过/返回不可读标记（memory/actions.py:116、hosted/config_store.py:315、
-      genesis/plaintext.py:578、**model_api_runtime/v2/serve_worker.py 全部
-      解密点** 等；~~agent_runtime/supervisor.py:527~~ 已随 V1 supervisor 删除
-      作废——细案开工时 grep 重扫为准，V1 残余调用点按当时退役进度决定改造
-      还是随 V1 删）。BYOK 读侧改读 TEE 明文列（Task 1.1 产出）。
-- [ ] 两处计算搬家：VLM caption 搬 backend（只对明文帧）、memory index 筛选搬
-      backend（只对明文 moment）。
-- [ ] `content/content_core.py`：rewrap 端点删除；swap 保留但改为「客户端提交
-      新形状（明文↔信封），服务端原地替换」——这就是开关切换后逐条转换的通道。
-- [ ] `tee_replicator/worker.py` 增量适配：新的明文行走 mirror 双写即可，
-      replicator 只剩消化存量密文表的职责，Phase 4 cutover 后整体退役。
+**策略集中、消息分散**：这些写闸的错误消息有**四种方言**
+（`envelope_missing_fields` 带 `detail` / 带 `missing` / f-string / 加前缀），
+客户端各按自己那套读。所以形状策略抽成 `core.envelope.upload_shape_gate()` +
+`requires_enclave_key()`，**各站点的消息逐字不动**；只有 chat/memory 那三处消息
+本来就完全相同的，才真收口成 `validate_uploaded_envelope()`。
+
+**明文分支默认关闭**：`upload_shape_gate` 只在生效形状为 `"off"` 时才收明文。
+否则任何客户端都能**单方面把自己的加密档降级成明文**——用户在设置页开着加密、
+内容却已明文落库。这是本计划最严重失败模式的客户端版本，
+`tests/test_uploaded_envelope_gate.py` 有专门一条锁它。
+
+明文 + `local_only` 同样拒（与 swap 通道同一条边界）。
+
+L1 **7262 passed / 0 failed**。
+
+> **至此 Task 2.2 / 2.3 全部完成，现网仍然一行明文都不会产生。**
+> 唯一剩下的动作是把 `core.envelope.PLAINTEXT_WRITES_ACCEPTED` 翻成 `True`
+> ——那一刻服务端自产内容、客户端上传、whoami 下发的 effective 值**同时**切换。
+> **这是上线开关，需要人拍板**，不是代码收尾。
+
+- [ ] 各写闸（`chat/chat_core.py` 含 `caption_envelope`、`memory/memory_core.py`、
+      `identity/identity_core.py`、`worldbook/worldbook_core.py`、
+      `genesis/genesis_core.py`，07-23 快照行号细案重扫）：明文档用户接受
+      `{body:...}` 明文直存；加密档用户接受双收件人信封（K_user+K_enclave）
+      原样存。按行存原样，服务端不转换。
+#### 2026-07-30：写侧路由第三次尝试 —— 成了
+
+前两次回退的记录留在 `tests/test_write_side_format_routing.py` 的模块 docstring 里。
+这次先做完 29 个拆包点的普查与迁移（见下节）+ B3 swap 通道，才动写侧。
+**L1 7249 passed / 0 failed**，且 skip 从 6 降到 1（那 5 条一直被跳过的 spec 测试
+终于真跑了）。
+
+**依赖方向的解法**：`core` 不能 import `accounts`，所以用本文件已有的装配层注入
+模式（`get_user_public_key` 就是这么做的）新增
+`core.envelope.resolve_content_encryption(user_id) -> "on"|"off"`，由
+`asgi/lifespan.py` (4c) 接到 `registry.effective_content_encryption`。
+
+三个刻意的设计点：
+
+- **未接线时默认 `"on"` 而不是 raise。** 写侧的安全失败方向是加密：某个 worker
+  漏接线不能变成「把用户内容明文落库」。副作用是所有不接装配层的纯单元测试行为
+  与改造前逐字一致——这也是这次 L1 一把过的原因之一。
+- **接的是 effective 而不是原始偏好。** 于是服务端自产内容与客户端上传闸受
+  **同一个开关**（`PLAINTEXT_WRITES_ACCEPTED`）管，不可能一边放开一边没放。
+- **明文分支完全不取 enclave 公钥、也不取用户内容公钥。** 明文档因此不被 enclave
+  故障或「老账号没有内容公钥」连坐（有测试把这两个都换成 raise 来锁）。
+
+二进制正文（非 UTF-8）在明文分支返回 `plaintext_body_not_utf8` 而不是静默乱码——
+明文列是 text，二进制走 R2 指针，走到这里说明调用方错了。
+
+> **现网仍然一行明文都不会产生**：`PLAINTEXT_WRITES_ACCEPTED is False` ⇒ effective
+> 恒 `"on"`。剩下的是**放开客户端各写闸**（下面那条），然后翻那个常量。
+
+- [ ] 服务端封装点：**按目标用户偏好** —— 明文用户直写明文，加密用户仍封双收件人
+      信封（服务端自产内容如 agent 回复，对加密用户经 enclave 公钥封存）。
+      > **2026-07-29 侦察：不必逐个改。** 实测 43 个封装点里 **40 处都经
+      > `core.envelope._build_shared_envelope_for_store(store, plaintext, *, item_id)`**，
+      > 而该函数**已经接收 `store`**——用户偏好唾手可得。**在这一个函数内部按偏好
+      > 路由即可收口 40 处**：`off` 返回明文形状
+      > `{body, id, owner_user_id, visibility}`（与 TEE 侧实测形状一致，读侧
+      > Task 1.1 的判据已能识别），`on` 维持现有双收件人信封。
+      > 只有 **3 处直调 `build_envelope`** 绕过 helper，需单独处理：
+      > `accounts/accounts_core.py`、`content/content_core.py`、
+      > `model_api_runtime/v2/extraction.py`。
+      > ⚠️ 计划正文原写「14 处」是 07-23 快照，实测已 43 处——但因为可以一处收口，
+      > 这条**服务端自产内容**的路径改动面反而比原估小得多。
+      >
+      > ⚠️⚠️ **但「一处收口」只覆盖服务端自产内容，不要误以为整个 2.2 都收口了。**
+      > **客户端上传的内容走写闸，是另一条独立路径，且写闸有硬形状校验**：
+      > `chat/chat_core.py:51` `_ENVELOPE_REQUIRED = ["body_ct","nonce","K_user",
+      > "visibility","owner_user_id"]`、`memory/memory_core.py:284` 同款 `required`
+      > 清单——明文形状会被这些写闸直接拒掉。所以上面那条 bullet（各写闸按偏好
+      > 接受明文/信封两形状）**必须逐个改，无法收口**，范围以开工时 grep
+      > `_ENVELOPE_REQUIRED`/`required = \[` 重扫为准。
+      > 好消息：**DB 层不拦**——`chat_messages` 等表的 `doc` 列没有 body_ct 级
+      > CHECK 约束（只有 V2 的 0043 有，见下条）。
+      >
+      > 🔴 **2026-07-29 实测：一刀切收口会造成安全退化，已回退。**
+      > 在 helper 里只按「用户偏好」路由是**错的**——该 helper 被 V2 trajectory /
+      > effect payload 等**本该始终加密**的系统内部路径共用。改完之后
+      > `test_v2_encrypted_effect_payload::test_tool_effect_payload_real_crypto_round_trip`
+      > 直接抓到**明文出现在存储内容里**，L1 从 2 failed 涨到 16 failed。
+      > **正确做法是按两个维度路由**：先逐条把 40 个封装点分成「用户内容（可按
+      > 偏好明文）」与「系统内部必须加密」（V2 轨迹/effect/review 等），再叠加
+      > 用户偏好；且必须**先**放宽 0043 的表级 CHECK。
+      > 规格已留在 `tests/test_write_side_format_routing.py`（当前整文件
+      > `pytest.mark.skip`，含回退原因），下一轮开工直接启用。
+      >
+      > ✅ **V2 的 13 处已按调用点逐条核实完（2026-07-29），结论与按文件的粗分类
+      > 几乎相反——13 处里 11 处是用户内容：**
+      >
+      > | 调用点 | 写的是什么 | 类别 |
+      > |---|---|---|
+      > | `serve_worker.py` 1163 / 1207 / 1221 / 1261 / 1271 | 对话摘要的 leaf / head / parent CAS 封装 | **A 用户内容** |
+      > | `serve_worker.py` 1699 | 记忆卡（`memory.actions` 入口） | **A 用户内容** |
+      > | `worker.py` 3914 / 3991 | thinking / chain-of-thought 子信封 | **A 用户内容** |
+      > | `worker.py` 4024 / 4063 | AI 回复、附件卡 | **A 用户内容** |
+      > | `jobs_store.py` 2494 | 兜底回复 `_TERMINAL_FAILURE_FALLBACK_REPLY` | **A 用户内容** |
+      > | `serve_worker.py` 2991 | flight-recorder（"Seal flight-recorder content"，轨迹诊断） | ⚠️ **待判** |
+      > | `worker.py` 4112 | tool effect payload（`_tool_effect_item_id`）——**上一轮回退的肇事者** | ⚠️ **待判** |
+      >
+      > **待判 2 处的初步结论（2026-07-29 查证，⚠️ 尚未经实现验证）：两处都倾向 A 类。**
+      > 依据：`test_v2_encrypted_effect_payload::test_tool_effect_payload_real_crypto_round_trip`
+      > 的断言是 `plaintext_payload["signature"] not in json.dumps(stored)`
+      > **配合** `json.loads(decrypted) == plaintext_payload`——它测的是
+      > **「加密确实生效且能还原」**（函数名 `real_crypto_round_trip` 也是这个意思），
+      > **不是**「无论偏好都必须加密」。它之所以在上一轮变红，只是因为其建的用户
+      > 没设偏好（默认 `off`）而走了明文分支。
+      > 同理 flight-recorder 是对话轨迹的诊断副本，明文档用户本就该服务端可读
+      > （v6 的卖点之一就是便于排查）。
+      >
+      > **若结论成立，V2 这 13 处全属 A 类**，Task 2.2 的 V2 部分可整体按偏好路由，
+      > 相关测试改为**显式设 `content_encryption=on`** 后其断言依然成立。
+      > ⚠️ **但必须先验证再动手**：先只改测试（给它显式设 on）跑一遍确认它仍绿，
+      > 证明「该测试与偏好无关、只验加密正确性」，再改实现。上一轮的教训就是
+      > 跳过验证直接动实现。另需确认 `0043` 的表级 CHECK 已放宽，否则明文行会被
+      > DB 拒掉（`v2_trajectory_events` / `v2_trajectory_reviews` 两个约束）。
+      >
+      > ## 🔴 第二次回退（2026-07-29）：真实阻塞是**下游消费者**，不是 helper 本身
+      >
+      > 三态 fail-safe 与 0072 放宽 CHECK 都就位后再次实现 helper 路由，L1 仍
+      > **15 failed**。查到失败点在 **`backend/hosted/history_import.py:3024`——
+      > 生产代码，不是测试**：
+      >
+      > ```python
+      > "body_ct": envelope["body_ct"],        # ← KeyError，helper 已返回明文形状
+      > "enclave_pk_fpr": envelope.get("enclave_pk_fpr", ""),
+      > ...
+      > ```
+      >
+      > **调用点拿到 helper 的返回值后会把它拆开重组成 doc**，字段名硬编码。
+      > 所以 Task 2.2 的真实范围是「40 个调用点 **× 各自的下游消费代码**」，
+      > 而不是「helper 一处收口」。15 个 L1 失败 ≈ 15 个这样的下游拆包点。
+      >
+      > **这是本 Task 第三次范围低估**（一刀切 → 按文件粗分类 → 以为一处收口）。
+      > 下一轮的正确做法：
+      > 1. 先 `grep -rn 'envelope\["body_ct"\]\|envelope\.get("body_ct"' backend/`
+      >    列出所有**下游拆包点**，与 40 个调用点做交叉；
+      > 2. 给拆包处统一提供一个形状无关的取值 helper（如
+      >    `core.envelope.read_body(envelope) -> str`，明文读 `body`、信封走 enclave），
+      >    **先把拆包点全部迁到它**、L1 保持绿；
+      > 3. **最后**才切 helper 的写侧形状——那时下游已经形状无关，切换才是安全的。
+      >
+      > 已保住的绿色成果（均已提交、L1 绿）：`0072` 放宽 CHECK、偏好三态
+      > fail-safe、40 处分类、规格测试（`test_write_side_format_routing.py`，
+      > 当前 `pytest.mark.skip`）。
+      >
+      > ## 🔑 实现前必须先解决的设计问题（2026-07-29 验证时发现）
+      >
+      > **`registry._get_user_content_encryption` 对「用户不存在」与「用户存在但
+      > 未设偏好」都返回 `None`，两者无法区分**——而它们的正确处置**相反**：
+      >
+      > | 情形 | 正确行为 | 理由 |
+      > |---|---|---|
+      > | 用户存在、未设偏好 | **明文** | v6 默认就是明文档 |
+      > | 用户查不到记录 | **加密**（fail-safe） | 查不到就写明文 = 任何 registry 未命中都静默降级成明文，这是安全事故 |
+      >
+      > 实证：`test_v2_encrypted_effect_payload::test_tool_effect_payload_real_crypto_round_trip`
+      > 的用户 `u_effect_real_crypto` 是**纯单元测试用户、不在 registry 里**（只
+      > monkeypatch 了公钥与 enclave info）。所以它既不能靠「设 `content_encryption=on`」
+      > 走加密分支，也正好是「查不到记录」这一类的活样本——上一轮回退时它变红，
+      > 根因其实就是这个未区分的缺口，而不只是「测试没设偏好」。
+      >
+      > **实现方案（二选一，动手前定）**：
+      > 1. 新增 `registry.user_exists(user_id)`，helper 先判存在性：不存在 → 加密；
+      >    存在且偏好 != "on" → 明文。
+      > 2. 让 `_get_user_content_encryption` 返回三态（`"on"` / `"off"` / `None`=用户
+      >    不存在），helper 对 `None` 走加密。**推荐这个**——改动集中在一个函数，
+      >    且调用方被迫显式处理第三态，不会像布尔那样被无意中吞掉。
+      >
+      > ⚠️ 无论选哪个，都要给「用户不存在 → 加密」单独写一条测试锁死。这是
+      > fail-safe 方向的落点：**写侧任何拿不准的情况都必须偏向加密**。
+      >
+      > ## ✅ 40 处分类已全部完成（2026-07-29，全部逐调用点核实）
+      >
+      > **结论：A 类 34 处 / B 类 6 处。**
+      >
+      > **~~B 类（6 处，始终加密）~~ —— 2026-07-29 经用户拍板取消，40 处统一按偏好。**
+      >
+      > 原提案是把 `hosted/mcp_core.py`(3，`json.dumps(secret_doc)` 含鉴权头) 与
+      > `hosted/setup_core.py`(3，provider 凭证) 列为「始终加密、绝不按偏好降级」，
+      > 理由是它们封的是**凭证**而非用户内容。**该提案已被否决**：用户明确要求
+      > B 类也不加密。
+      >
+      > 📌 **决策留痕（不是待办，无需再争）**：明文档用户的 **MCP 鉴权头与
+      > provider API key 将以明文存于服务端**。这是产品有意接受的权衡——v6 的
+      > 「明文档 = 服务端可读」贯彻到底，不为凭证开特例。若日后要收回这个决定，
+      > 改动点就是这 6 处（在 helper 里加类别参数即可，分类清单仍保留在下方）。
+      >
+      > **A 类（34 处，按 `content_encryption` 偏好路由）**：
+      > - V2 13 处：对话摘要 CAS 5、记忆卡 1、thinking 子信封 2、AI 回复与附件卡 2、
+      >   兜底回复 1、flight-recorder 1、tool effect payload 1
+      > - 聊天 6 处：`chat_send_core` 的 `user_env`/`caption_env`/`cap_env`
+      >   （`model_api_chat_send_core` 与 `_send_resident` 各 3）
+      > - 入住 5 处：`genesis/service` 的 `init_identity_if_absent` /
+      >   `replace_identity_preserving_anchor` / `write_persona_artifact` /
+      >   `write_voice_artifact`、`persona_backfill.run_persona_backfill`
+      > - 历史导入 3 处：`_append_import_memory_cards` / `_store_identity_payload` /
+      >   `_append_model_api_onboarding_greeting`
+      > - 身份 3 处：`identity/actions` 的 `_save/_create_identity_action_payload`、
+      >   `identity_core.init_identity`
+      > - 其余 4 处：`chat/service._chat_plaintext_thinking_extra_for_store`、
+      >   `chat/resident_maintenance._append_maintenance_message`、
+      >   `memory/actions._build_memory_envelope_for_store`、
+      >   `workspace/service.seal`
+      > - （另有 test 侧新增的 `voice/routes_asgi.py` 1 处，已登记进守卫基线，同属 A）
+      >
+      > ⚠️ **`workspace/service.seal` 有配对约束**：同类里唯一一个有对称 `open()`
+      > 的——`open()` 目前**无条件**走 `_decrypt_envelope_via_enclave`（`service.py:49`
+      > 附近），**改 seal 必须同时给 open 加形状路由**，否则写下去的明文行读不回来。
+      > 其余 A 类调用点的读侧走各自的读路径（Task 2.3 统一处理）。
+      >
+      > **非-V2 的 27 处明细（保留原三档标注以备追溯；🟡 档已于同日补齐为逐条核实）：**
+      >
+      > | 处数 | 调用点 | 类别 | 核实深度 |
+      > |---|---|---|---|
+      > | 6 | `hosted/mcp_core.py`(3)：封 `json.dumps(secret_doc)`（**含鉴权头**）；`hosted/setup_core.py`(3)：封 **provider 凭证** | **B 始终加密** | 🟢 **已读实际代码**——这两处是凭证不是用户内容，用户关掉加密开关≠愿意把 API key 明文存服务端 |
+      > | 20 | `chat_send_core`(6，其中 2 处是 caption)、`genesis/service`(4)、`history_import`(3)、`identity/actions`(2)、`chat/service`(1，`_chat_plaintext_thinking_extra_for_store`)、`chat/resident_maintenance`(1，`_append_maintenance_message`)、`memory/actions`(1)、`identity/identity_core`(1)、`genesis/persona_backfill`(1) | **A 用户内容**（倾向） | 🟡 **仅凭函数名与所在模块语义判定，未逐行读**——聊天正文 / 图片 caption / thinking / 维护消息 / 记忆 / 身份卡 / 入住产出。动手前需照 V2 那样逐条核实 |
+      > | 1 | `workspace/service.py` 的 `seal(self, path, plaintext)` | ⚠️ **待判** | 🔴 只看到签名，未确认写入内容与目标表 |
+      >
+      > 🟡 **以下是最初按文件的粗分类，已被上面两张表取代，仅作历史留存：**
+      > 复核时发现：`v2/serve_worker.py` 的 7 处写的是 `summary` / `turn` / `payload`
+      > （对话摘要与回合，**用户内容衍生**）、`v2/worker.py` 的 5 处含 `reply`
+      > （AI 回复，也是用户内容）与 `effect_*`（工具效果，可能含凭证）——**V2 内部
+      > 本身就是混合的**。把 V2 一律归入「始终加密」会正中风险登记簿那条高风险
+      > 「V2 强制加密未改按偏好 → 明文档用户 V2 数据无法直读」。
+      > 正确粒度是**逐调用点判定**，尤其要把 `effect payload`（上一轮回退的肇事者）
+      > 与 `summary`/`turn`/`reply` 分开。
+      >
+      > **40 个封装点的初步分类（2026-07-29，按文件；A/B 边界仅供起步参考）：**
+      >
+      > | 类别 | 文件（处数） | 处置 |
+      > |---|---|---|
+      > | **A：用户内容**——可按 `content_encryption` 偏好选明文/信封 | `hosted/chat_send_core.py`(6)、`genesis/service.py`(4)、`hosted/history_import.py`(3)、`identity/actions.py`(2)、`memory/actions.py`(1)、`identity/identity_core.py`(1)、`genesis/persona_backfill.py`(1)、`chat/service.py`(1)、`chat/resident_maintenance.py`(1) | 合计 **20 处**，按偏好路由 |
+      > | **B：凭证 / 系统内部**——**始终加密，绝不按偏好降级** | `model_api_runtime/v2/serve_worker.py`(7)、`v2/worker.py`(5)、`v2/jobs_store.py`(1)（V2 轨迹/effect，另受 0043 表级 CHECK 约束）；`hosted/setup_core.py`(3)（**provider 凭证**）；`hosted/mcp_core.py`(3)（**MCP secret，含鉴权头**）；`workspace/service.py`(1)（V2 工作区 `seal()`） | 合计 **20 处**，维持信封 |
+      >
+      > 判据不是「谁写的」而是「写的是什么」：B 类里 `mcp_core` 封的是
+      > `json.dumps(secret_doc)`（鉴权头）、`setup_core` 封的是 provider 凭证——
+      > 这些是**凭证**不是用户内容，用户把加密开关关掉不代表他要把自己的
+      > API key 明文存在服务端。上一轮回退正是因为漏了这层区分。
+      >
+      > 实现建议：helper 增加显式参数（如 `system_internal: bool = False`）由调用点
+      > 声明类别，**默认 False 但 B 类 20 处必须显式传 True**；或反过来默认加密、
+      > A 类显式声明可明文（更 fail-safe，推荐后者）。
+- [ ] **V2 存储改按偏好**：`0043` 等迁移的 envelope 列放宽 CHECK 为「明文或
+      信封」；`serve_worker.py` 写路径按用户偏好选明文/信封。与 Task 1.5 联动。
+
+#### 2026-07-30：下游拆包点普查（第一步，已完成）
+
+AST 扫全仓 `X["body_ct"]`，把每处反向定位到其所属函数，再判断该函数内是否含
+生产者调用（`_build_shared_envelope_for_store` / `build_envelope`）：
+
+**硬拆包点 29 处**（软判别 `.get("body_ct")` 另有 38 处，天然形状无关，不计）。
+
+| 类 | 数量 | 处理 |
+|---|---|---|
+| **A. 与生产者同函数** | 7 | ✅ 已迁移 |
+| **B1. callee，服务端写路径** | 6 | ✅ 已迁移 |
+| **B2. 前缀子信封**（`thinking_*` / `caption_*`） | 3 | ✅ 已迁移（`envelope_prefixed_fields`） |
+| **B3. swap 通道**（`content_core.py` ×4） | 4 | ✅ 3 处已迁（`replace_record_shape`）；第 4 处 `_apply_sub_envelope_fields` 是 rewrap 专用、输入恒为重封信封，硬拆包在那里是正确的断言，**核实无需改动** |
+| **B4. R2 卸载/注水**（`db.py`） | 4 | ✅ 核实全部已被 `body_ct is not None` 守卫，明文行只跳过、不会炸 |
+| **B5. 不该动** | 2 | `enclave/envelope.py:109`（解密实现本身）、`genesis/genesis_core.py:365`（赋值构造） |
+
+**B2 顺带抓到一个静默数据丢失**：`core/store.py` 的 extra 白名单是硬编码元组，
+里面**没有** `thinking_body` / `caption_body`。一旦出现明文子信封，thinking /
+caption 正文会被白名单**静默丢掉且不报错**。两份白名单都已补上，并加了守卫测试
+（照 `test_no_flask_anywhere` 的文本扫描模式，防后人再漏）。
+
+**B4 核实结论**：4 处硬拆包全在 `doc.get("body_ct") is not None` 的分支里，所以
+明文行只是**跳过 R2 卸载**、正文留在行内——不崩、不丢。但由此引出一条**新待办**：
+明文档用户的图片/文件正文会一直内联在 Postgres 行里，行膨胀问题绕过了 R2 卸载
+这条设计。归到 Task 1.3（R2 明文化）一并解决。
+
+**B4 顺带修一个真 bug**：`db._same_reply_envelope` 的 `immutable_reply_fields`
+漏了 `body`。密文行有 `body_ct` 在清单里兜着，明文行什么都没兜——「同 id 不同
+正文」的两条回复会被判成同一条而**静默丢弃后者**。已补 `body` + 守卫测试。
+
+**已交付的形状无关 helper**：`core.envelope.envelope_storage_fields(envelope,
+*, default_owner_user_id="")` —— 只返回**信封落库字段**（信封行给
+`body_ct/nonce/K_user/[K_enclave]/…`，明文行给 `body`），站点自有字段
+（id/role/ts/type/source…）仍由调用方写。所以迁移是纯机械的，且**在写侧形状真
+正切换前行为逐字不变**（生产者此刻仍恒出信封）。
+
+两个刻意的设计点：缺失的可选字段**整键省略**而非写 `None`（尾账判据「有
+K_user 无 K_enclave = 孤岛」靠的正是键在不在）；`body_ct` 优先于 `body`。
+
+**已迁移的 13 处**：`core/store.py`（`_build_chat_message` / `append_chat`）、
+`memory/memory_core.py:add`、`memory/actions.py:_memory_record_from_envelope`、
+`identity/identity_core.py` ×2、`identity/actions.py` ×2、
+`hosted/history_import.py` ×3、`genesis/service.py` ×2、
+`v2/jobs_store.py:_capture_memory_doc`。
+
+L1 **7219 passed / 0 failed**（含 `tests/test_envelope_storage_fields.py` 16 例）。
+
+> 注意这一步**没有**改变任何写入形状——它只是把「切形状」这件事从「会炸 16
+> 处」变成「改一个 helper」。
+>
+> **写侧真正切换的剩余前置只有 B3（swap 通道，属 Task 2.3）。** 服务端自产内容
+> 的写路径已经形状无关了。
+
+### Task 2.3: 读侧明文旁路（enclave 保留给信封行）
+
+- [x] `core/enclave.py` 调用点改「按行格式路由」（2026-07-30 完成）。
+
+      **helper**：`core.envelope.read_envelope_body(envelope, api_key, *,
+      purpose, runtime_token="")` —— 由 Task 1.1 的
+      `decrypt_provider_key_envelope` **泛化**而来（唯一区别是 purpose 可传），
+      后者保留为薄 wrapper，故 1.1 的调用点逐字不变、没造第二个 helper。
+
+      **普查**：23 个真实调用点（另有 6 处是 docstring 提及）。已迁 19 处：
+      memory/actions、serve_worker ×6、trajectory_inspect、workspace/service、
+      history_import、mcp_core ×2、mcp_tools、spawners、genesis/plaintext ×3、
+      perception/service（注入默认值）、tee_replicator/worker（回调）。
+
+      **刻意不改的 2 处**：
+      - `content/content_core.py:416` rewrap —— 已被上面的
+        `if not record.get("K_enclave"): return "skipped_missing_enclave_key"`
+        守住，明文行天然跳过。rewrap 对明文行本就无意义。**核实无需改动。**
+      - `core/envelope.py` 内部 —— 就是 helper 的实现本身。
+
+      > ⚠️ **踩了 memory `autoflake-kills-module-attr-reexports` 那个坑**：迁移
+      > 后 12 个 `core_enclave` import 变成 unused，我删了，结果 17 个测试红——
+      > 它们 monkeypatch 的是**导入方模块**上的 `<module>.core_enclave`
+      > （patch 的其实是共享的 `core.enclave` 模块对象，仍然生效）。已恢复
+      > serve_worker / perception.service / history_import 三处并加
+      > `noqa: F401` + 原因注释。`hosted/setup_core.py:34` 早就有同样的注释，
+      > 我当时没照着做。判据：删 unused import 前要 grep **测试里的
+      > `<module>.<alias>`**，不能只看本文件内的引用。
+
+      **顺带修 17 个「造假信封」测试**：fixture 用 `{"ct": ...}` 或
+      `{"envelope": {"id": ...}}` —— 这两种形状生产里**不存在**
+      （`_build_shared_envelope_for_store` 恒出 `body_ct`）。老代码把整个 dict
+      直接甩给被 patch 的解密函数、从不检查形状，所以这些测试一直"绿"着却没验
+      证过真实形状。已统一改成带 `body_ct`（27 + 16 处）。**这是 Task 1.1 抓到
+      的 `{"ciphertext": "x"}` 同一类问题的第二次出现。**
+
+      BYOK 读侧改读 TEE 明文列（Task 1.1）已完成。
+- [ ] 两处 enclave 内计算（VLM caption、memory index）**保留**——服务加密用户；
+      明文用户可选走 backend 内联明文版（性能优化，细案定，非必须）。
+- [x] `content/content_core.py`：rewrap **保留**且已核实对明文行安全（见上）。
+- [x] **swap 通道跨形状替换**（2026-07-30 完成）。它是加密开关切换的执行通道：
+      偏好 on→off，存量行要逐条从双收件人信封换成明文；也是那 7 条 local_only
+      转明文的通道。
+
+      新增 `core.envelope.replace_record_shape(record, envelope)`：**先把两种形状
+      的内容字段全删掉，再合入新形状**。要害不是「写新字段」而是「删对面残留」
+      ——读侧规则是 `body_ct` 优先于 `body`，信封转明文时若留下旧 `body_ct`，
+      读到的永远是换之前的过期内容，**而且完全静默**。反向留下 `body` 则等于
+      服务端仍能读到本该被加密的正文。三处（`_swap_chat` /
+      `_swap_memory_inplace` / `_apply_envelope_fields`）收敛到它，各自原本略有
+      差异的 `enclave_pk_fpr` / `content_pk_fpr` 处理也在 helper 里统一了。
+
+      `_swap_envelope_missing` 改成两种形状都收；`shared 必须有 K_enclave` 这道闸
+      **只对信封行生效**（明文行没有 K_enclave 会被它拦死）。
+
+      **新增一条安全边界**：明文 + `local_only` 必须拒。`local_only` 的含义是
+      「只有设备解得开」，靠的就是没有 K_enclave；一行明文服务端天然读得到，
+      标成 local_only 等于给用户一个**假的隐私承诺**。
+
+      `tests/test_swap_shape_transition.py` 14 例，含四象限残留检查与该边界。
+- [ ] `tee_replicator/worker.py`：~~decrypt 回调~~已改形状路由（明文行不白跑一趟
+      enclave）；明文行走 mirror 双写；密文行（加密用户）继续
+      经 enclave 解密复制进 TEE 或原样搬运信封（细案定 cutover 后 TEE 主库里
+      加密用户存密文、明文用户存明文的共存形态，见 Task 2.4）。
+
+### Task 2.4: 加密用户在 TEE 主库的存储形态（v6 关键设计）
+
+- [x] **设计已定**（2026-07-31）：`docs/superpowers/specs/2026-07-31-tee-encrypted-tier-storage-design.md`
+
+      决策 = **按行原样搬运**：一行进来什么形状、出去就什么形状，复制层不再做
+      任何加解密。Task 2.3 的读侧按行路由是本决策的前置（此前 TEE 读路径假定
+      「行一定是明文」，所以复制时非解密不可）。
+
+      **schema 无需改动**：TEE 内容表的 `doc` 是裸 `JSONB`、**没有任何 CHECK**
+      （已核对 `0001_tee_baseline` 及后续全部迁移），信封行结构上直接存得进去。
+      不要与 RDS 侧 V2 轨迹表那个由 `0072` 放宽的表级 CHECK 混淆。
+
+      **两个必须处理的既有事实**（详见 spec §2）：
+
+      1. **今天直接 cutover 会把加密档用户的数据静默变明文** ——
+         `transforms.py` 对每一行无条件调 enclave 解密并丢弃全部加密学字段，
+         `_decryptable()` 只看 local_only / K_enclave，**跟用户档位无关**。
+      2. **影子库里现在就已经有全体用户的明文副本** ——这不是 cutover 才产生的。
+         用户一旦选加密档，其此前内容的明文副本仍在影子库、并会随 cutover 进入
+         主库。**必须显式重放清理，不能靠「以后不再解密」自然消化。**
+         顺序硬约束：先改 `transforms.py` → 再重放 → 最后才 cutover。
+
+      **好副作用**：毒行隔离机制（quarantine-and-advance）在 carry-verbatim 下
+      不再需要——毒行之所以是毒行，正因为复制时非解密不可。但存量清理还要用它，
+      退役放到 Phase 5。
+
+- [x] **复制侧已实现**（2026-07-31）：`transforms.carry_verbatim()` +
+      `worker._carries_verbatim()`，收口在 `_transform_with_retry` 这一处（所有表
+      的 transform 都过它）。判据是**用户意图**而非行形状——见 spec 里的修正说明。
+      fail-safe 方向：查不到用户就**不解密**（搬运的失败方向是「多留了密文」可事后
+      重放修，解密的失败方向是「明文泄漏」不可逆）。带 60s TTL 缓存，因为
+      `_get_user_content_encryption` 是 O(用户数) 全表扫描、按行调用会拖垮长跑 pass。
+      `tests/test_tee_carry_verbatim.py` 7 例；L1 7281 passed / 0 failed。
+
+- [x] `verify.py` 按档位分流对账（2026-07-31）：抽出 `_expected_doc()`，加密档
+      走密文逐字比对（不占 enclave、比解密后比对更快更可靠），明文档维持现状。
+      三态返回把「跳过」与「解不开」分清：`(None, None)` = PendingDeviceMigration
+      跳过；`(None, err)` = 记 mismatch 而非跳过——跳过等于宣称两库一致，会用虚假
+      的全绿掩盖真问题。
+- [ ] cutover 前：盘点 opt-in 加密档用户 → 「清空 + 重置水位线 + 重放」清理其
+      存量明文副本 → 核对 `doc ? 'body_ct'` 行数与 RDS 侧一致
 
 ---
 
-## Phase 3 — iOS：明文默认 + 开关 UI
+## Phase 3 — iOS：明文默认 + 开关 UI + local_only 自解（加密代码保留）
 
 **入口 gate：** Phase 2 部署 test 且双格式验证通过。
-**出口 gate：** 发版；强制升级窗口启动（服务端对低版本返回升级提示）；信封
-新写流量中 v1（带 K_enclave）占比降到 0。
+**出口 gate：** 发版；强制升级窗口启动；那 3 用户的 local_only 经 swap 转明文
+（或到期归丢弃）。
 
-- [ ] 写侧：默认明文直传；`content_encryption=on` 时走 v2 信封（复用
-      `ContentEncryption.envelope` 去掉 enclave 收件人分支，
-      `ContentEncryption.swift:52` 的 K_enclave 封装删除）。
-- [ ] 读侧：按行自识别——有 `body_ct` 走 `unseal`（保留），有 `body` 直读。
-      存量 local_only 与加密用户历史照常可读。
-- [ ] 删：rewrap 自愈全套（`FeedlingAPI.swift:1572-1636` 与四处触发）、
-      `refreshEnclaveAttestation` 的 enclave_content_pk 拉取（:4713）、
-      `FrameEnvelope.swift` 的 K_enclave 分支（帧跟随开关：明文用户明文上帧）。
-- [ ] 保留：`ContentKeyStore` 全部（认证 + 可选加密内容钥）、register/recover
-      流程原样、Audit 卡按 D2 口径改造或移除。
-- [ ] 新增：设置页加密开关 UI + 功能降级告知文案（D2 产出）；写 whoami
-      偏好接口。
-- [ ] pbxproj 手工登记新文件（历史坑）。
+> **2026-07-29 进展（分支 `feat/content-encryption-toggle`，iOS 仓）**
+>
+> 入口 gate **未达成**就先开工了（Task 2.2 未完成）。为此加了一个 enabler，让
+> 两仓的发版顺序互不依赖——**这是本轮最重要的设计决定**：
+>
+> whoami 现在下发**两个**字段：
+>   - `content_encryption`——用户**意图**，设置页开关绑它；
+>   - `content_encryption_effective`——客户端**写侧必须遵守**的形状。
+>
+> 生效值由 `registry.effective_content_encryption()` 算：只要
+> `core.envelope.PLAINTEXT_WRITES_ACCEPTED is False`（Task 2.2 完成前恒 False），
+> 一律返回 `"on"`。**因为客户端写闸此刻仍硬校验 K_enclave**
+> （`worldbook_core._validate_envelope:51` 等），iOS 若按意图直接走明文，全量写入
+> 会 400。分成意图/生效两个字段后，iOS 先发版也写不坏；后端把那个常量翻成 True
+> 才真正开始产生明文行。翻之前**必须确认所有写闸都已接受明文形状**。
+>
+> 后端侧改动（本 worktree，L1 **7203 passed / 0 failed**）：
+> `core/envelope.py` 新增 `PLAINTEXT_WRITES_ACCEPTED`、`accounts/registry.py`
+> 新增 `effective_content_encryption()`、`whoami_core.py` 下发新字段，
+> `tests/test_content_encryption_preference.py` +4 例覆盖四个边界。
+
+- [x] 写侧：`ContentWire.envelope(format:)` 一处收口，明文出
+      `{body,id,owner_user_id,visibility}`（与 TEE 侧实测字段集逐字一致）、加密出
+      双收件人信封。`ContentWriteFormat(serverEffectiveValue:)` **fail-safe 到加密**
+      ——字段缺失/空值/不认识的值一律加密，且整值相等匹配（`offline` 不会被当
+      `off`）。`FeedlingAPI.wireEnvelopeForCurrentUser` 是应用侧入口；加密档缺
+      enclave 公钥才报错，明文档不被 enclave 抖动连坐。
+- [x] 读侧：`ContentWire.readBody` 按行自识别，`body_ct` 优先于 `body`（迁移中间
+      态密文是真源）；解不开抛错、绝不静默返回空 Data。
+      `ContentEncryption.Envelope.init?(wire:)` 负责从 wire 字典重建信封。
+- [x] 世界书读写已迁到形状无关：`fetchWorldBookRows()` 改回原始 wire 行——原来的
+      Codable 把 `body_ct` 声明成必填，**混格式表会让整个响应解码失败**。
+- [x] 回归 `Tests/ContentWireFormatRegression.swift`（10 例，独立 `swiftc` 跑，
+      与仓内既有 regression 同模式）；`xcodebuild` BUILD SUCCEEDED。
+- [ ] **其余写入路径尚未迁移**：genesis（`sealForCurrentUser`，payload 标
+      `format: "sealed_v1"` 且服务端 enclave 必须能读，明文语义要另定）、chat/
+      memory/perception 各写闸。迁移前先照 Task 2.2 的教训做一遍**下游拆包点
+      普查**——iOS 侧同样有直接吃 `Envelope.bodyCT` 的消费者。
+- [ ] **`local_only` 仍在产生**：`flipMemoryVisibility(toLocalOnly:)` 未动。停产
+      = 砍掉现有的可见性开关功能，属产品决策，未擅自做。
+- [ ] **local_only 存量自解**：App 检测到本地 local_only 历史 → 设备端解密 →
+      swap 通道明文重传。目标仅 3 用户 7 条，无覆盖率压力。
+- [ ] **保留**（服务加密用户）：`ContentKeyStore` 全部、`ContentEncryption`
+      信封构建/解封、`FrameEnvelope` 的 K_enclave 分支、rewrap 自愈、
+      attestation 拉取与 Audit 卡、register/recover。
+- [x] 新增：设置页加密开关 UI + 文案（`ContentEncryptionCard`，挂在隐私页）。
+      开关位置绑**意图**、说明文字反映**生效**值；意图=关但服务端还没开闸时显示
+      专门的「加密仍然生效」文案，不让用户误以为已经切过去了。zh/en 六条文案入
+      `Localizable.xcstrings`，品牌名用 `IO`。
+- [x] pbxproj 手工登记新文件（历史坑）：两个新文件 × 4 处（PBXBuildFile /
+      PBXFileReference / group children / Sources phase）全部登记，build 已验证。
+
+> v6 下 iOS 几乎不删加密代码——现状是人人加密，新方案是加密变可选、默认明文，
+> 主要工作是「加一条明文快路径 + 一个开关」，风险远小于删整个加密体系。
 
 ---
 
 ## Phase 4 — Cutover 切库（维护窗口执行）
 
-**入口 gate：** Phase 1 出口 gate 全过；Phase 3 强制升级窗口结束（v1 信封写入
-流量 = 0，以 Task 2.2 的格式指标为准）；restore 演练复跑过一次（<30 天）。
+**入口 gate：** Phase 1 出口 gate 全过；Phase 3 强制升级窗口结束（local_only 已
+清或入丢弃）；restore 演练复跑过一次（<30 天）。
 **出口 gate：** 全站在 TEE 主库上 5xx=0 运行 48h；RDS 转只读观察。
 
 - [ ] 预热：`python -m backend.tee_shadow reconcile` 全量收敛 + `verify` 全绿 +
       `requeue_backlog=0` + 三张 seq 表 setval 核对。
 - [ ] 冻结窗口（分钟级）：停写 → 最后一轮增量 replicate/reconcile → verify →
-      切 `DATABASE_URL` 指向 TEE pg（backend、runner、consumer 全部）→ 停
-      `FEEDLING_TEE_DUAL_WRITE`、停 scheduler/replicator → 解冻。
-- [ ] 存量密文行随库带走：RDS 密文内容表的 local_only/加密行在 TEE 侧本无明文
-      镜像——cutover 前最后一轮 reconcile 必须把这些行**原样信封搬进 TEE**
-      （细案确认 reconciler 对密文表的搬运语义；如无则 cutover 细案补一个
-      「密文行原样搬运」步骤，这是 v2 新增的关键差异点）。
-- [ ] **（v3）存储清单核对扩展**：Redis CVM（`IO:` 前缀 cache/lock/rl/queue）
-      确认无持久业务状态、切库无需处理；`agent_jobs`/`agent_action_queue`
-      队列冻结窗口排空；各 `v2_*_outbox` 排空；`v2_*` 必迁表已按 Task 1.5
-      收敛（verify 覆盖）；prod 的 5 张 `bak_20260710_*` 事故备份表在切库前
-      决定去留（建议 pg_dump 归档后弃，不迁）。
-- [ ] 连接容量已备好（max_connections=400 已生效）；cutover 后连续 3 天盯
-      `pg_stat_activity` 峰值与 CVM `free -m`（available<1000MB 告警线）。
-- [ ] 回滚预案：观察期内 RDS 保持只读在线，任何 P0 → 切回 RDS DSN。
+      切 `DATABASE_URL` 指向 TEE pg（backend、runner、consumer；**enclave 回调
+      的 backend URL 不变**）→ 停 `FEEDLING_TEE_DUAL_WRITE`、停 scheduler/
+      replicator → 解冻。
+- [ ] **Phase 4 运行时契约补齐（切 DSN 前硬 gate）**：先以 owner workflow 将
+      `alembic_tee` 升到 `0011_primary_runtime_bridge`。backend、主 CVM
+      `serve-worker`、独立 runner 必须同时设置 `FEEDLING_DATABASE_SCHEMA=tee`；该模式
+      启动只读核对 `alembic_tee_version=head`，不得拿 app role 跑 RDS Alembic。
+      同时核对 frozen-prepare marker 与三张 Chat lifecycle trigger 已启用；仅迁 schema
+      未 prepare 也拒绝启动。selector 与 DSN 任一错配都按启动失败处理；回滚时二者
+      也必须一起恢复为 RDS。
+- [ ] **冻结后的离线 prepare**：停掉全部写进程后先跑
+      `python -m admin.phase4_cutover`（dry-run），再用
+      `--apply --confirm-writes-frozen`。工具硬拦 genesis chunks/活跃 job、voice
+      临时态、agent job/action queue、两张 V2 outbox 与 TEE pending-device 队列；随后原样搬
+      `frame_envelopes` 兼容桥、补齐 live chat 的 `storage_generation` R2 fence、逐行
+      digest 校验，并把 TEE 全部 identity sequence `setval(max)`。它不切 DSN、不
+      部署；apply 另需同库 owner `TEE_MIGRATION_DATABASE_URL`，最后才启用 0011 预建
+      但默认 disabled 的 R2/Archive triggers 并写 prepared marker，避免工具失败留下
+      能被应用误启动的半切状态。
+- [ ] **FrameEnvelope v1 临时桥**：TEE 原 `frames` 是 enclave storage-key 的
+      `frames-tee/` 投影，无法还原现有客户端需要的原始信封，Phase 4 不新增吐帧明文的
+      enclave 端点。`0011` 在 TEE 主库暂留同形 `frame_envelopes`，冻结窗口原样复制
+      metadata + 旧 R2 pointer；新写继续走现有协议。该桥与 `frames` 并存，留 Phase 5
+      的版本化 frame 协议迁移后删除，不能把两表混读。
+- [ ] **加密用户密文行随库带走（v6 必做）**：opt-in 加密用户的双收件人信封行
+      要原样在 TEE 主库（cutover 前最后一轮 reconcile 确认密文行搬运语义已就位，
+      见 Task 2.4）。
+- [ ] 存储清单核对：Redis 无持久业务状态；`agent_jobs`/`agent_action_queue`
+      排空；`v2_*_outbox` 排空；`v2_*` 必迁表按 Task 1.5 收敛；prod 5 张
+      `bak_20260710_*` pg_dump 归档后弃。
+- [ ] 连接容量已备好（400）；cutover 后连续 3 天盯 `pg_stat_activity` 峰值与
+      CVM `free -m`（available<1000MB 告警线）。
+- [ ] 回滚预案分界必须写清：**解冻前**尚无 TEE-only 新写，可原子切回 RDS DSN；
+      **解冻后的第一笔写开始，RDS 只读副本就不再是无损热回滚点**，直接切回会丢窗口内
+      的新增/更新并复活已删除行。观察期 P0 默认先停写、保全 TEE 快照、以前向修复恢复；
+      若仍要回 RDS，必须先做经逐表校验的 reverse reconcile/restore，不能只改 secret。
+      pre 首轮用测试账号验证并明确接受必要时丢弃窗口内测试写；prod 前必须另行完成反向
+      回迁演练或决定不承诺解冻后热回滚。
 - [ ] 观察 7-14 天后 RDS 快照留档 → 停实例。
 
 ---
 
-## Phase 5 — 退役与文档
+## Phase 5 — 退役 RDS + 文档（enclave 保留）
 
 **入口 gate：** Phase 4 观察期结束。
-**出口 gate：** enclave 容器/链上组件下线；docs 重写并 build 通过；RDS 终删。
+**出口 gate：** RDS 终删；docs 重写并 build 通过。**enclave 与链上组件保留。**
 
-- [ ] enclave：全部路由下线 → 容器移出 compose → `backend/enclave/` 删除
-      （`/attestation` 按 D2 去留；BoxSeal 挑战封装逻辑先抽到 backend 侧——
-      recover 依赖它，不随 enclave 死）。
-- [ ] 链上：AppAuth 停止 addComposeHash、CI publish-compose-hash 步骤移除；
-      KMS 钥随 enclave 死（storage key 死前确认 Task 1.2 无残留）。
-- [ ] 代码清理：`core/enclave.py`、`tee_shadow/`、`tee_replicator/`、
-      `alembic/`（RDS 链）删除；`alembic_tee` 升格唯一迁移链。
-      **保留** `content_encryption.py` 的信封校验/BoxSeal（写闸校验 + recover
-      挑战用），删除其中服务端解密相关部分。
-- [ ] 文档：docs-site architecture/self-hosting/api-keys/index 按「默认明文 +
-      可选客户端加密」重写 + OpenAPI `npm run openapi:generate` + changelog；
+- [ ] 代码清理：`tee_shadow/`、`tee_replicator/`（若加密用户密文复制不再需要则
+      删、否则保留其密文行搬运部分——细案定）、`alembic/`（RDS 链）删除；
+      `alembic_tee` 升格唯一迁移链。**enclave 包、`core/enclave.py`、
+      `content_encryption.py` 全部保留**（服务加密用户）。
+- [ ] **enclave 保留项确认**：`/v1/envelope/decrypt`、storage 重加密、attestation、
+      KMS 内容钥、链上 AppAuth/compose_hash、iOS pinning——全部继续运行。仅确认
+      它们的 backend 依赖在 cutover 后指向 TEE 主库。
+- [ ] 文档：docs-site architecture/self-hosting/api-keys/index **新增「默认明文
+      档」说明**（加密档的 E2E/attested 叙事保留）+ OpenAPI 重生成 + changelog；
       io-onboarding 三件套；`deploy/DEPLOYMENTS.md`、
       `docs/TEE_POSTGRES_SHADOW_PROVISIONING.md` 改写为主库运维手册。
+- [ ] **R2 凭证收尾**：轮换 R2 access key + 最小权限化；清理
+      `scripts/user_logs.py:56` 硬编码只读 token。
 - [ ] 收尾运维：TEE 主库监控告警（连接数、available 内存、WAL-G 新鲜度）；
       restore 演练排成季度例行。
 
@@ -399,22 +1016,30 @@ L1 测试基线全绿；加密开关端到端（改偏好 → 新写走信封 �
 | 风险 | 等级 | 缓解 |
 |---|---|---|
 | 单实例 TEE pg 成唯一主库后 CVM 硬故障（RCU stall 前科） | 高 | Phase 0 restore 演练 + RTO 落账；观察期 RDS 只读兜底；季度演练 |
-| enclave 过早失能（误下线/主 CVM 重建翻钥）致 Phase 1 存量解不开 | 高 | Global Constraint 第一条；Phase 1 完成前禁碰 enclave/主 CVM |
-| 混格式行（明文/v1 信封/v2 信封共存）读侧漏判 | 中 | Task 2.2 格式指标 + 四象限回归；读侧统一走单一格式判别函数 |
-| 加密用户功能降级沟通不足引发投诉 | 中 | D2 降级矩阵进开关 UI 文案；默认 off 限制影响面 |
-| cutover 时密文行未随库搬运造成加密存量丢失 | 高 | Phase 4 专项步骤：密文行原样信封搬进 TEE，verify 覆盖 |
-| reconcile 慢性病掩盖真实不收敛 | 中 | Phase 0 Task 0.2 前置修复，verify 才可信 |
-| **加密面是移动靶**（V2 两天新增 15+ 调用点 + 表级 K_enclave 约束） | 高 | 全局约束「冻结加密面扩张」+ Task 0.5 与 V2 线对齐 + 每次大合并后 grep 重扫 |
-| v2_* 用户数据表（轨迹/摘要/工作区）漏迁 | 高 | Task 1.5 逐表分类 + Phase 4 verify 覆盖 v2 必迁表 |
+| Phase 1 前重建主 CVM 翻钥 → 现有 shared 存量解不开 | 高 | Global Constraint 第一条；Phase 1 完成前禁碰主 CVM |
+| reconcile 慢性病掩盖真实不收敛 + 表同步放大负载 | 高 | Phase 0 Task 0.2 表同步前必修 |
+| V2 强制加密未改按偏好 → 明文档用户 V2 数据无法直读 | 高 | Task 0.5 CI 守卫 + 与 V2 线对齐 + Task 2.2 放宽 CHECK |
+| v2_* 用户数据表漏迁 | 高 | 表同步工作流逐表分类 + Phase 4 verify 覆盖 |
+| 加密用户密文行在 TEE 主库的搬运/共存语义没定 | 中 | Task 2.4 专项设计 + Phase 4 verify 覆盖密文行 |
+| 混格式行（明文/信封）读侧漏判 | 中 | Task 2.3 按行格式路由 + 四象限回归；统一格式判别函数 |
+| alembic_tee 无落地通道，建表任务空转 | 中 | 表同步工作流建通道 |
 | 迁移工具打爆 enclave（502 前科） | 中 | Task 1.2/1.3 限速 + 断点续跑 |
-| alembic_tee 无落地通道，Phase 1 建表任务空转（0002 未执行的前科） | 中 | Task 0.6 先还账再建通道（workflow 或 runbook 固定步骤） |
-| verify 白名单不扩范围 → 新增表「全绿假象」 | 中 | Phase 1 出口 gate 明确 verify 范围扩展要求 |
 
-## 附录 A：尾账表模板（Phase 0 Task 0.4 填数）
+## 附录 A：尾账实测（Task 0.4，2026-07-28 完成）
 
-| 数据域 | 服务端可解（Phase 1 重写） | 保留为加密（不动） | 确定丢失 |
+判据：孤岛 = 有 K_user 但 K_enclave 为空（服务端与 enclave 都解不开、只有设备
+私钥能解）。全表扫 prod/test 六张内容表。
+
+| 数据域 | enclave 可解（Phase 1 迁明文） | 需设备（iOS swap） | 确定丢失 |
 |---|---|---|---|
-| frames-tee/ R2 对象 | | — | |
-| chat R2 对象（带 K_enclave） | | | |
-| chat/memory/frames/perception local_only DB 行 | — | | |
-| quarantine（decrypt_failed:） | — | — | ~790 |
+| chat_messages 孤岛 | — | **prod 7（3 用户）/ test 1** | — |
+| memory/frames/perception/worldbook/user_blobs 孤岛 | — | **0（全表实测）** | — |
+| frames/ R2 E2E 对象（K_user only） | — | **0**（frame_envelopes island=0） | — |
+| quarantine `decrypt_failed:` | — | — | **797（13 用户）** |
+
+**prod 那 7 条归属**：usr_d980a3a2（4，04-24）、usr_994f8891（2，07-10）、
+usr_23b73597（1，07-21）。处置：iOS swap 自解，或入丢弃。
+
+**注**：附录判据针对「local_only（K_user-only）孤岛」。v6 下现有全体 shared
+用户（带 K_enclave）默认迁明文由 enclave 解密（Phase 1 主体），不属此表——它们
+是"enclave 可解"，不是孤岛。

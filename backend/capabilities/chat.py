@@ -6,6 +6,8 @@ from urllib.parse import quote
 
 import httpx
 
+import db
+from core import envelope as core_envelope
 from screen import screen_read_core   # reuse enclave_forward_headers
 from capabilities import errors
 from capabilities.types import CapabilityResult, ok, err
@@ -23,6 +25,23 @@ def image_read(store, *, api_key=None, runtime_token=None, params=None) -> Capab
     message_id = params.get("message_id") or params.get("id")
     if not message_id:
         return err(errors.INVALID, "chat image needs message id", retryable=False)
+    user_id = str(getattr(store, "user_id", "") or "")
+    if user_id:
+        row = db.chat_get_strict(user_id, str(message_id))
+        if isinstance(row, dict) and core_envelope.classify_envelope_shape(
+                row) == "plaintext_binary":
+            try:
+                core_envelope.read_plaintext_envelope_body(
+                    row, owner_user_id=user_id)
+            except ValueError:
+                return err(errors.NOT_FOUND, f"message {message_id} not found", retryable=False)
+            if str(row.get("content_type") or "") != "image":
+                return err(errors.NOT_FOUND, "message has no image", retryable=False)
+            return ok(data={
+                "message_id": str(message_id),
+                "image_mime": row.get("image_mime", "image/jpeg"),
+                "image_b64": str(row.get("body_b64") or ""),
+            })
     enclave = os.environ.get("FEEDLING_ENCLAVE_URL", "").rstrip("/")
     if not enclave:
         return err(errors.UNAVAILABLE, "enclave url not configured", retryable=False)
@@ -68,6 +87,24 @@ def file_read(store, *, api_key=None, runtime_token=None, params=None) -> Capabi
     message_id = params.get("message_id") or params.get("id")
     if not message_id:
         return err(errors.INVALID, "chat file needs message id", retryable=False)
+    user_id = str(getattr(store, "user_id", "") or "")
+    if user_id:
+        row = db.chat_get_strict(user_id, str(message_id))
+        if isinstance(row, dict) and core_envelope.classify_envelope_shape(
+                row) == "plaintext_binary":
+            try:
+                core_envelope.read_plaintext_envelope_body(
+                    row, owner_user_id=user_id)
+            except ValueError:
+                return err(errors.NOT_FOUND, f"message {message_id} not found", retryable=False)
+            if str(row.get("content_type") or "") != "file":
+                return err(errors.NOT_FOUND, "message has no file", retryable=False)
+            return ok(data={
+                "message_id": str(message_id),
+                "file_mime": row.get("file_mime", "application/octet-stream"),
+                "file_name": row.get("file_name", "file"),
+                "file_b64": str(row.get("body_b64") or ""),
+            })
     enclave = os.environ.get("FEEDLING_ENCLAVE_URL", "").rstrip("/")
     if not enclave:
         return err(errors.UNAVAILABLE, "enclave url not configured", retryable=False)

@@ -36,7 +36,7 @@ deployment topology.
 | TLS ingress | Terminate the public API certificate and route configured traffic | Transport plaintext inside the managed confidential-VM boundary |
 | ASGI API | Authenticate, enforce user ownership, validate requests, coordinate workflows, and persist state | Envelopes and metadata; transient plaintext for operations that explicitly accept plaintext |
 | Attested decrypt service | Own the content private key and authorize envelope decryption or read-side projection | Plaintext while servicing an authorized operation |
-| PostgreSQL | Persist account, workflow, queue, and user-scoped state | Encrypted protected bodies plus plaintext IDs, timestamps, types, status, and other operational metadata |
+| PostgreSQL | Persist account, workflow, queue, and user-scoped state | Protected bodies in whichever shape the owning user's tier selects, plus plaintext IDs, timestamps, types, status, and other operational metadata |
 | Object storage | Offload enabled large-object flows | Screen and Chat objects are normally ciphertext; diagnostics and compatibility uploads can be stored as provided |
 | Hosted runner | Poll work, assemble authorized context, invoke an agent, and return an encrypted result | Plaintext selected for an agent turn, the provider credential, and encrypted API traffic |
 | Managed CPU recorder | Retain bounded host and per-container CPU history without a public endpoint | Infrastructure identifiers and numeric CPU/load samples only; no application content |
@@ -46,7 +46,8 @@ deployment topology.
 The component that stores a record is therefore not always the component that
 can interpret its protected body. Conversely, “encrypted at rest” does not mean
 that every identifier, status field, compatibility payload, normalized signal,
-or diagnostic upload is encrypted.
+or diagnostic upload is encrypted — nor that every protected body is encrypted,
+since [content encryption is a per-user preference](#content-encryption-is-a-per-user-preference).
 
 ## Core data flows
 
@@ -136,24 +137,28 @@ the worker image rather than changing a runtime flag.
 
 The bounded Memory/Style profile storage contract uses one
 `v2_agent_profile` document so both fields advance under one compare-and-swap.
-The two field bodies are separate shared encrypted envelopes; PostgreSQL and
-the TEE shadow see the same ciphertext document. Field character counts,
-state, disabled status, source-card counts, and generation/retry timestamps
-remain plaintext routing and observability metadata. A stale CAS loser must
-re-read and recompute rather than replaying its earlier result.
+The two field bodies are separate content records that follow the owner's
+effective content shape: encrypted users store shared ciphertext envelopes,
+while plaintext users store `body` values in the same document. The PostgreSQL
+primary and TEE mirror preserve that selected shape verbatim. Field character
+counts, state, disabled status, source-card counts, and generation/retry
+timestamps remain plaintext routing and observability metadata. A stale CAS
+loser must re-read and recompute rather than replaying its earlier result.
 
 When the default-off profile switch is enabled, a turn strictly reads that
-document and decrypts both fields together. Only an `ok`, non-disabled document
-whose fields validate enters the prompt. The stable system prefix is ordered as
-runtime model identity, identity card (or Genesis persona fallback), non-empty
-MEMORY, non-empty STYLE, and then behavior rules. MEMORY and STYLE are the
-companion's own context, with explicit guidance that the later verbatim
-conversation wins on conflict; World Book, temporal context, coverage notices,
-and model-authored summaries remain non-privileged application data. Missing,
-pending, degraded, disabled, invalid, or undecryptable profiles retain
-deterministic coverage plus the bounded verbatim tail without inventing a
-semantic replacement. Any bounded-tail coverage-hole count remains a separate
-late data block, so it cannot perturb the stable prefix.
+document and resolves both fields together. Plaintext `body` fields are read
+locally without an enclave call; ciphertext fields are decrypted through the
+enclave. Only an `ok`, non-disabled document whose fields validate enters the
+prompt. The stable system prefix is ordered as runtime model identity, identity
+card (or Genesis persona fallback), non-empty MEMORY, non-empty STYLE, and then
+behavior rules. MEMORY and STYLE are the companion's own context, with explicit
+guidance that the later verbatim conversation wins on conflict; World Book,
+temporal context, coverage notices, and model-authored summaries remain
+non-privileged application data. Missing, pending, degraded, disabled, invalid,
+or unreadable profiles retain deterministic coverage plus the bounded verbatim
+tail without inventing a semantic replacement. Any bounded-tail coverage-hole
+count remains a separate late data block, so it cannot perturb the stable
+prefix.
 
 Because MEMORY and STYLE are part of the system prefix, each successful profile
 refresh changes that user's provider prompt-cache prefix once. Other users'
@@ -165,7 +170,8 @@ maintenance, capture, and dream rather than foreground Chat or wake work. The
 worker reads the complete eligible Memory Garden through a user-bound runtime
 token and fails loudly if the read-side response is truncated or incomplete.
 It sends that plaintext Garden view to the user's configured model provider,
-then seals the generated Memory/User fields before the compare-and-swap write.
+then writes the generated MEMORY/STYLE fields in the owner's effective content
+shape before the compare-and-swap write.
 Generation failure only updates bounded retry metadata and fails the background
 job; it does not publish a Chat bubble or terminal turn error.
 
@@ -178,11 +184,11 @@ STYLE receives only persona and voice material produced from that upload.
 An explicit durable-card signal requires non-empty MEMORY, and explicit
 persona, behavior-note, or exemplar material requires non-empty STYLE. A
 required empty field gets one bounded shape correction and then fails the job.
-The profile CAS copies an untouched encrypted side byte-for-byte without
-decrypting or resealing it. Onboarding and identity redistillation keep profile
-publication required. Add-memory imports only write memory cards; their changed
-Garden fingerprint lets the ordinary profile lane perform the later
-Garden-to-MEMORY/STYLE refresh.
+The profile CAS copies an untouched side byte-for-byte regardless of whether it
+is plaintext or encrypted, without decrypting or resealing it. Onboarding and
+identity redistillation keep profile publication required. Add-memory imports
+only write memory cards; their changed Garden fingerprint lets the ordinary
+profile lane perform the later Garden-to-MEMORY/STYLE refresh.
 
 Every Genesis job records a server-side cursor into the content-free identity
 change log. Identity mutations expose canonical changed-field labels in
@@ -191,6 +197,33 @@ that cursor are locked and the newer user or agent edit wins. A legacy
 post-cursor record without field labels locks the whole identity-card overlay
 and emits a content-free `genesis.field_lock` trace, while profile/persona
 publication and job completion continue.
+
+### Managed PostgreSQL promotion
+
+The managed rollout can promote an independently migrated PostgreSQL instance
+inside a confidential VM from a replication target to the application primary.
+This is an operator-controlled maintenance-window change, not an API-selected
+data route. Every backend and runner must switch `DATABASE_URL` and the explicit
+schema contract together. In the promoted mode, application startup performs a
+read-only assertion against `alembic_tee_version`; it never applies the legacy
+RDS migration chain with the application role. Startup also requires the
+head-bound frozen-prepare marker and enabled Chat lifecycle triggers, so a
+schema-only or partial cutover fails closed. Shadow dual-write and its
+reconciliation scheduler are disabled in this mode, including when stale
+shadow variables remain present.
+
+Current FrameEnvelope v1 clients still require the original envelope metadata
+and object pointer. During promotion, the managed deployment therefore copies a
+temporary `frame_envelopes` compatibility bridge into the confidential-VM
+database without decrypting the body. The storage-key-encrypted `frames`
+projection remains separate. Removing that bridge requires a later versioned
+frame protocol and is not implied by database promotion.
+
+The former primary can remain frozen as a rollback snapshot, but it is a
+lossless switch-back target only until the first write reaches the promoted
+database. After that boundary, rollback requires a stopped-write reverse
+reconciliation or restore; changing only the connection string would discard
+new and updated rows and could resurrect deleted state.
 
 The staged worker refreshes after a successful dream write, after Runtime V2
 cutover, and best-effort after Chat when a profile is missing, eligible for
@@ -245,7 +278,7 @@ account's chat route, provider URL, or credential.
    persisted as ordinary Chat rows in their original order.
 5. At hang-up the client posts the call transcript to
    `POST /v1/voice/finalize`. The full transcript is archived — permanently,
-   sealed to the account's content key — and the chat stream keeps ONE bounded
+   using the account's effective content-encryption tier — and the chat stream keeps ONE bounded
    preview card (`voice_call_transcript`, deterministic id, idempotent
    retries). Only after the archive is durable are the call's per-turn rows
    deleted, so the raw back-and-forth stops occupying chat history and model
@@ -268,12 +301,14 @@ account's chat route, provider URL, or credential.
    Finalize claims its lifecycle state before writing the archive, so a
    concurrent cancel cannot downgrade or partially delete a successful call.
 7. Archived calls stay readable: `GET /v1/voice/transcripts` lists them and
-   `GET /v1/voice/transcripts/{call_id}` returns the sealed envelope for the
-   client to open locally. The agent reaches the same archive through the
+   `GET /v1/voice/transcripts/{call_id}` returns the shape-aware content envelope
+   (ciphertext for encrypted-tier accounts, plaintext for plaintext-tier
+   accounts). The agent reaches the same archive through the
    `voice_transcript_list` / `voice_transcript_read` tools, and memory cards
    distilled from a call carry that call's id so it can go back to the source.
-   The server stores and serves ciphertext; it never holds the transcript
-   after the finalize request that archived it. Transcript trust
+   For encrypted-tier accounts the server stores and serves ciphertext; for
+   plaintext-tier accounts the promoted TEE database stores the plaintext
+   envelope under the same tenant-bound schema. Transcript trust
    boundary: the transcript is client-supplied plaintext (chat rows are
    ciphertext the server cannot read); an authenticated user can therefore
    only shape their own summary and delete their own call rows. Known
@@ -320,14 +355,17 @@ selection, fetch, and action contracts.
 
 ### Perception and screen content
 
-Sensitive Perception signals and photo bodies use encrypted envelopes. Ordinary
-operational context fields can be submitted as plaintext. Encrypted sensitive
-signals are opened for authorized processing, after which normalized state and
-metadata can be persisted separately from the original body. The legacy
-collection branch stores each `doc` as provided.
+Sensitive Perception signals and photo bodies follow the owning account's
+effective content shape. Ordinary operational context fields can be submitted
+as plaintext in either tier. Encrypted sensitive signals are opened for
+authorized processing; plaintext-tier envelopes are read locally inside the
+managed service boundary. Normalized state and metadata can then be persisted
+separately from the original body. The legacy collection branch stores each
+`doc` as provided.
 
-Screen pixels use encrypted frame envelopes; large frame ciphertext can be
-offloaded to object storage without giving that store the content key. The
+Screen pixels use encrypted frame envelopes on the encrypted tier and strict
+`body_b64` envelopes on the plaintext tier. Large frame bodies can be offloaded
+to object storage; plaintext-tier frame objects are plaintext recipients. The
 authenticated screen WebSocket is an ingest path only—Chat uses HTTP send,
 history, and long polling.
 
@@ -345,13 +383,19 @@ repeated enclave decrypts, while the shared decrypt proxy remains
 concurrency-limited. Aggregate frame counts and cache counters contain neither
 pixels nor visible text.
 
-Heavy Chat bodies—image and file ciphertext—can be offloaded the same way. The
-message row keeps its envelope metadata plus a pointer, and the ciphertext is
-re-fetched from object storage only at the exits that actually deliver a body.
-The object store receives ciphertext and never receives the content key, so this
-does not move the decrypt boundary. It does make the object store part of the
-read path: a body that is unreachable there degrades that one message rather
-than the conversation.
+Heavy Chat image and file bodies can be offloaded to object storage. On the
+encrypted tier the object remains ciphertext and the row keeps the envelope
+metadata plus a pointer; the object store receives no content key. On the
+plaintext tier the object is the raw image/file bytes, while the row keeps an
+explicit `plaintext_v1` pointer with byte length and SHA-256 integrity metadata.
+That means object storage and its backups are plaintext recipients for
+plaintext-tier attachments. Reads verify both values before returning the bytes
+as `body_b64`; storage keys and hashes are not exposed by the public API.
+
+Object storage is therefore part of the Chat read path in both tiers. A missing
+object degrades that one message rather than the conversation, and an unknown
+format or integrity mismatch fails closed rather than guessing whether bytes
+are encrypted.
 
 The [Perception workflow](/docs/workflows/perception) identifies the encrypted,
 plaintext, and legacy compatibility branches. Clients should choose the
@@ -379,6 +423,69 @@ This is dual-recipient envelope encryption, not a claim that no server-side
 component ever sees plaintext. Hosted Chat, enclave-backed read projections,
 normalized Perception processing, user-approved diagnostics, and external
 inference each have an explicit plaintext boundary.
+
+### Content encryption is a per-user preference
+
+Protected-body encryption is moving from an always-on property to a per-user
+choice with two storage tiers:
+
+| Tier | Stored shape | Who can read the body |
+| --- | --- | --- |
+| Encrypted | Dual-recipient envelope (`body_ct`, `K_user`, `K_enclave`) | The user's device, and the measured decrypt service for `shared` records |
+| Plaintext | UTF-8 `body`, or strict-base64 `body_b64` for binary media, alongside `id`, `owner_user_id`, and `visibility` | The service, within the same tenant-isolation boundary as every other row |
+
+Two `whoami` fields describe this. `content_encryption` is the user's stated
+preference. `content_encryption_effective` is the shape a client must actually
+write, and it is the only one a write path may act on — a deployment that has
+not enabled plaintext storage reports `on` regardless of the preference, so a
+client that ships support for plaintext ahead of the server still writes
+envelopes. Treat an absent, empty, or unrecognized value as `on`.
+
+The deployment gate is closed by default and opens only when
+`FEEDLING_PLAINTEXT_WRITES_ACCEPTED=1` is set. The pre-production environment
+currently enables it for functional testing; test and production remain closed.
+Even in an enabled deployment, an unknown user remains fail-safe encrypted.
+
+Two boundaries hold in both tiers:
+
+- A record is never silently downgraded. If a user's effective shape is `on` and
+  the decrypt service is unreachable, the write fails rather than falling back to
+  plaintext, and an upload carrying a plaintext body is rejected rather than
+  quietly accepted.
+- `local_only` requires encryption. That visibility means only the user's device
+  holds a usable key, which a plaintext body cannot express, so the combination is
+  rejected on both the upload and swap paths.
+
+Hosted Chat explicitly declares image and file bodies as binary when it builds a
+server-owned envelope. Effective-plaintext accounts therefore store those bytes
+as `body_b64`; the route never guesses from whether arbitrary bytes happen to be
+valid UTF-8. Screen frames and perception photos use the same binary shape. A
+plaintext perception photo does not promote the locally derived place label into
+a plaintext metadata envelope; that sensitive context is sent only with the
+encrypted photo shape.
+
+Reads route per record rather than per user: a row carrying `body_ct` is opened
+through the decrypt service, `body_b64` is strictly base64-decoded locally, and
+`body` is read as UTF-8. Mixed rows therefore coexist for a user who changes the
+preference, and precedence is `body_ct`, then `body_b64`, then `body`. The
+[`/v1/content/swap`](/docs/workflows/memory) endpoint converts existing inline
+records between encrypted and plaintext shapes.
+
+This routing rule is also a service boundary, not only a decoding convenience.
+Normal backend and hosted-runtime workflows do not submit `body` or `body_b64`
+to enclave decrypt or readside endpoints. Batch features such as Memory,
+History Search/Fetch, and World Book partition mixed inputs by record, process
+plaintext partitions locally, and send only sealed projections to the enclave.
+Consequently, an enclave outage does not make plaintext-tier Chat, Genesis,
+Identity, attachments, or readside operations unavailable. Defensive plaintext
+handling may remain inside compatibility endpoints, but it is not the normal
+application path.
+
+Changing the preference does not re-encrypt or decrypt history on its own; it
+governs new writes, and existing records convert only through the swap endpoint.
+Encrypted old-client uploads remain accepted for a plaintext-tier account so a
+staged client rollout and mixed history stay readable. Environment migration
+must preserve explicit encrypted accounts and fail closed for unknown users.
 
 ## Authentication and credential roles
 
@@ -543,7 +650,7 @@ tool results. Provider adapters use route-bound cache affinity or provider-nativ
 cache controls/checkpoints where supported and normalize cache read/write/miss
 usage into whole-turn telemetry.
 
-An enabled, usable Memory/User profile forms a deterministic early prompt
+An enabled, usable Memory/Style profile forms a deterministic early prompt
 prefix after editable working memory. OpenAI Chat and Anthropic cache
 breakpoints prioritize that profile ahead of an older recent-user boundary;
 dynamic runtime context and coverage-hole notices are excluded from the stable

@@ -32,7 +32,6 @@ import logging
 from psycopg.types.json import Jsonb
 
 import db
-from core import enclave as core_enclave
 from core import envelope as core_envelope
 from identity import identity_core
 from identity import user_naming
@@ -288,7 +287,7 @@ def load_plaintext(user_id: str, call_id: str, *, runtime_token: str = "",
     row = get_envelope(user_id, call_id)
     if not row or not isinstance(row.get("transcript"), dict):
         raise RuntimeError("voice_transcript_not_found")
-    plaintext = core_enclave._decrypt_envelope_via_enclave(
+    plaintext = core_envelope.read_envelope_body(
         row["transcript"],
         api_key,
         purpose="voice_transcript_read",

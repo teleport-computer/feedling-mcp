@@ -5307,7 +5307,7 @@ class WorkspaceFileReply:
 
 @dataclass(frozen=True)
 class GeneratedImageReply:
-    """One validated provider image ready for encrypted chat publication."""
+    """One validated provider image ready for native Chat publication."""
 
     name: str
     mime_type: str
@@ -5702,18 +5702,10 @@ def _thinking_extra(thinking: dict | None) -> dict:
     env = thinking.get("envelope")
     if not isinstance(env, dict):
         return {}
-    extra = {
-        "thinking_v": str(env.get("v", 1)),
-        "thinking_id": str(env.get("id") or ""),
-        "thinking_body_ct": str(env.get("body_ct") or ""),
-        "thinking_nonce": str(env.get("nonce") or ""),
-        "thinking_K_user": str(env.get("K_user") or ""),
-        "thinking_visibility": str(env.get("visibility") or "shared"),
-        "thinking_owner_user_id": str(env.get("owner_user_id") or ""),
-        "thinking_enclave_pk_fpr": str(env.get("enclave_pk_fpr") or ""),
-    }
-    if env.get("K_enclave"):
-        extra["thinking_K_enclave"] = str(env.get("K_enclave") or "")
+    try:
+        extra = core_envelope.envelope_prefixed_fields(env, "thinking")
+    except ValueError:
+        return {}
     extra = {k: v for k, v in extra.items() if str(v).strip()}
     meta = thinking.get("metadata") or {}
     for key in ("thinking_kind", "thinking_source", "thinking_model"):
@@ -5867,12 +5859,13 @@ def _build_encrypted_image_reply_effect_payload(
     *,
     effect_id: str,
 ) -> dict:
-    """Seal one normalized image into a deterministic Chat image message."""
+    """Wrap one normalized image into a deterministic Chat image message."""
     item_id = hashlib.sha256(effect_id.encode("utf-8")).hexdigest()[:32]
     envelope, error = core_envelope._build_shared_envelope_for_store(
         store,
         bytes(image_reply.data),
         item_id=item_id,
+        content_kind="binary",
     )
     if envelope is None:
         raise RuntimeError(error or "image reply envelope build failed")

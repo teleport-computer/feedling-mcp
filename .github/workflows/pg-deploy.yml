@@ -16,7 +16,7 @@ on:
     inputs:
       environment:
         type: choice
-        options: [test, prod]
+        options: [test, pre, prod]
         required: true
       confirm:
         description: '输入 DEPLOY-PG（prod 需输入 DEPLOY-PG-PROD）确认（防误触）'
@@ -38,9 +38,9 @@ jobs:
           if [ "$ENVIRONMENT" = "prod" ]; then WANT=DEPLOY-PG-PROD; else WANT=DEPLOY-PG; fi
           test "$CONFIRM" = "$WANT" || { echo "::error::confirm mismatch — ${ENVIRONMENT} 需要输入 ${WANT}"; exit 1; }
       - uses: actions/checkout@v4
-        # test 环境部署 test 分支、prod 部署 main：与 app 的发布流向一致。
+        # test/pre/prod 分别部署 test/pre/main：与 app 的发布流向一致。
         with:
-          ref: ${{ inputs.environment == 'prod' && 'main' || 'test' }}
+          ref: ${{ inputs.environment == 'prod' && 'main' || inputs.environment == 'pre' && 'pre' || 'test' }}
       - name: Resolve image tag from checked-out HEAD
         id: img
         # 不能用 ${{ github.sha }}：workflow_dispatch 下它指向触发时所在 ref 的 sha，
@@ -99,6 +99,7 @@ jobs:
           # 那种三元在 PROD_X 恰好为空时会短路 fallback 到 TEST_X，于是「非空校验」
           # 通过、注进 prod CVM 的却是 test 的密码。这里挑错只会挑到空值 → fail-closed。
           TEST_PHALA_TOKEN: ${{ secrets.TEST_PHALA_CLOUD_API_KEY }}
+          PRE_PHALA_TOKEN: ${{ secrets.TEST_PHALA_CLOUD_API_KEY }}   # pre 与 test 同 Phala workspace
           PROD_PHALA_TOKEN: ${{ secrets.PHALA_CLOUD_API_KEY }}   # prod 在 sxysun workspace，key 无 PROD_ 前缀
           TEST_PG_OWNER_PASSWORD: ${{ secrets.TEST_PG_OWNER_PASSWORD }}
           TEST_APP_DB_PASSWORD: ${{ secrets.TEST_APP_DB_PASSWORD }}
@@ -111,6 +112,17 @@ jobs:
           TEST_PG_BACKUP_R2_ENDPOINT: ${{ secrets.TEST_PG_BACKUP_R2_ENDPOINT }}
           TEST_PG_BACKUP_R2_ACCESS_KEY_ID: ${{ secrets.TEST_PG_BACKUP_R2_ACCESS_KEY_ID }}
           TEST_PG_BACKUP_R2_SECRET_ACCESS_KEY: ${{ secrets.TEST_PG_BACKUP_R2_SECRET_ACCESS_KEY }}
+          PRE_PG_OWNER_PASSWORD: ${{ secrets.PRE_PG_OWNER_PASSWORD }}
+          PRE_APP_DB_PASSWORD: ${{ secrets.PRE_APP_DB_PASSWORD }}
+          PRE_REPLICATOR_DB_PASSWORD: ${{ secrets.PRE_REPLICATOR_DB_PASSWORD }}
+          PRE_MONITORING_DB_PASSWORD: ${{ secrets.PRE_MONITORING_DB_PASSWORD }}
+          PRE_PG_SERVER_CERT_B64: ${{ secrets.PRE_PG_SERVER_CERT_B64 }}
+          PRE_PG_SERVER_KEY_B64: ${{ secrets.PRE_PG_SERVER_KEY_B64 }}
+          PRE_WALG_S3_PREFIX: ${{ secrets.PRE_WALG_S3_PREFIX }}
+          PRE_WALG_LIBSODIUM_KEY: ${{ secrets.PRE_WALG_LIBSODIUM_KEY }}
+          PRE_PG_BACKUP_R2_ENDPOINT: ${{ secrets.PRE_PG_BACKUP_R2_ENDPOINT }}
+          PRE_PG_BACKUP_R2_ACCESS_KEY_ID: ${{ secrets.PRE_PG_BACKUP_R2_ACCESS_KEY_ID }}
+          PRE_PG_BACKUP_R2_SECRET_ACCESS_KEY: ${{ secrets.PRE_PG_BACKUP_R2_SECRET_ACCESS_KEY }}
           PROD_PG_OWNER_PASSWORD: ${{ secrets.PROD_PG_OWNER_PASSWORD }}
           PROD_APP_DB_PASSWORD: ${{ secrets.PROD_APP_DB_PASSWORD }}
           PROD_REPLICATOR_DB_PASSWORD: ${{ secrets.PROD_REPLICATOR_DB_PASSWORD }}
@@ -154,6 +166,7 @@ jobs:
           ENVIRONMENT: ${{ inputs.environment }}
           CVM_ID: ${{ steps.cvm.outputs.id }}
           TEST_PHALA_TOKEN: ${{ secrets.TEST_PHALA_CLOUD_API_KEY }}
+          PRE_PHALA_TOKEN: ${{ secrets.TEST_PHALA_CLOUD_API_KEY }}
           PROD_PHALA_TOKEN: ${{ secrets.PHALA_CLOUD_API_KEY }}
         run: |
           UP=$(echo "$ENVIRONMENT" | tr '[:lower:]' '[:upper:]')

@@ -57,7 +57,7 @@ def _headers(api_key: str) -> dict[str, str]:
     return {"X-API-Key": api_key}
 
 
-_FAKE_ENVELOPE = {"v": 1, "ct": "Zm9v", "item_id": "model_api_key_abc"}
+_FAKE_ENVELOPE = {"v": 1, "body_ct": "Zm9v", "item_id": "model_api_key_abc"}
 
 
 def _seed_config(user_id: str, **extra):

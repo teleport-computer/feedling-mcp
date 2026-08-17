@@ -8,7 +8,7 @@ import uuid
 
 import db
 import provider_health
-from core import enclave as core_enclave
+from core import envelope as core_envelope
 from core import util as core_util
 from core.store import UserStore
 from notices import catalog as notices_catalog
@@ -445,10 +445,9 @@ def _load_runtime_provider_config(store: UserStore, api_key: str | None, *, runt
     # runtime_token through when present, so api-key callers are unchanged.
     decrypt_kwargs = {"runtime_token": runtime_token} if runtime_token else {}
     try:
-        provider_key = core_enclave._decrypt_envelope_via_enclave(
+        provider_key = core_envelope.decrypt_provider_key_envelope(
             envelope,
             api_key,
-            purpose="model_api_provider_key",
             **decrypt_kwargs,
         ).decode("utf-8")
     except Exception as e:

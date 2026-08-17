@@ -72,7 +72,6 @@ from admin import admin_core
 from capabilities import registry as cap_registry
 from capabilities import identity as cap_identity
 from capabilities import tool_schema as cap_tool_schema
-from core import enclave as core_enclave
 from core import envelope as core_envelope
 from core import runtime_token
 from core import store as core_store
@@ -83,7 +82,6 @@ from hosted import mcp_core
 from hosted import mcp_status
 from hosted import mcp_tools
 from hosted import vision_observer
-from identity import identity_core
 from identity import card_policy
 from memory import memory_core
 from screen import screen_read_core
@@ -106,6 +104,10 @@ from model_api_runtime.v2 import scheduler
 from model_api_runtime.v2 import screen_chat as v2_screen_chat
 from model_api_runtime.v2 import screen_watch
 from model_api_runtime.v2 import summary_frontier as v2_summary_frontier
+
+# Compatibility alias: existing tests patch ``serve_worker.core_enclave``;
+# reads route through core_envelope while keeping the shared module patchable.
+core_enclave = core_envelope.enclave
 from model_api_runtime.v2 import usage_rollup
 from model_api_runtime.v2 import watchdog as v2_watchdog
 from model_api_runtime.v2 import worker as v2_worker
@@ -144,7 +146,7 @@ log = logging.getLogger("feedling.runtime_v2.serve_worker")
 
 
 def _load_genesis_persona(store, *, runtime_token: str) -> str:
-    """JIT-decrypt this user's complete genesis persona for one model turn.
+    """JIT-read this user's complete genesis persona for one model turn.
 
     Runtime V1 reads the same ``genesis_persona.content_envelope`` and sends the
     resulting Markdown as trusted system text on every freshly spawned turn.
@@ -167,11 +169,11 @@ def _load_genesis_persona(store, *, runtime_token: str) -> str:
     if not isinstance(blob, dict):
         return ""
     envelope = blob.get("content_envelope")
-    if not (isinstance(envelope, dict) and envelope.get("body_ct")):
+    if not isinstance(envelope, dict):
         return ""
     try:
         with core_enclave.coalesced_success_trace("genesis_persona"):
-            raw = core_enclave._decrypt_envelope_via_enclave(
+            raw = core_envelope.read_envelope_body(
                 envelope,
                 None,
                 purpose="genesis_persona",
@@ -214,9 +216,8 @@ def _identity_card_has_substance(card: dict) -> bool:
     return False
 
 
-def _load_identity_card_block(store, *, runtime_token: str) -> str:
-    """Read and render the model-visible card through the capability decrypt seam."""
-
+def _load_identity_card_view(store, *, runtime_token: str) -> dict:
+    """Read one usable card through the content-shape-aware capability seam."""
     try:
         result = cap_identity.get(
             store,
@@ -229,15 +230,22 @@ def _load_identity_card_block(store, *, runtime_token: str) -> str:
             str(getattr(store, "user_id", "") or ""),
             type(exc).__name__,
         )
-        return ""
+        return {}
     if not result.ok:
-        return ""
+        return {}
     card = result.data.get("identity")
     if not isinstance(card, dict) or card.get("decrypt_status") != "ok":
-        return ""
+        return {}
     if not _identity_card_has_substance(card):
-        return ""
-    return v2_context.render_identity_card(card)
+        return {}
+    return card
+
+
+def _load_identity_card_block(store, *, runtime_token: str) -> str:
+    """Read and render the model-visible card through the capability decrypt seam."""
+
+    card = _load_identity_card_view(store, runtime_token=runtime_token)
+    return v2_context.render_identity_card(card) if card else ""
 
 
 def _load_workspace_prompt(store, *, runtime_token: str) -> dict:
@@ -510,7 +518,7 @@ def _caption_text(m, *, mid, token, fallback: str) -> str:
     if cap_env is None:
         return fallback
     caption = (
-        core_enclave._decrypt_envelope_via_enclave(
+        core_envelope.read_envelope_body(
             cap_env, None, purpose="v2_caption_read", runtime_token=token
         )
         .decode("utf-8")
@@ -540,7 +548,7 @@ def _file_row(m, *, mid, ts, role, token) -> dict:
 
     文件消息的明文是**原始文件字节**（`chat_send_core`: `user_plaintext = file_parse["bytes"]`，
     `content_type="file"`）。没有这个分支，这一行会掉进下面通用的
-    `_decrypt_envelope_via_enclave(...).decode("utf-8")`，一个 PDF 立刻 `UnicodeDecodeError`
+    通用内容解密分支，一个 PDF 立刻 `UnicodeDecodeError`
     —— 而它会**抛出整个 `_read_tail`**，连带打死该用户的 chat / wake / extraction /
     compaction 四条路径（compaction 用 limit=10_000 调同一个函数）。
 
@@ -927,7 +935,26 @@ def _decrypt_chat_rows_inner(
                 token=token,
             )
         else:
-            if not m.get("body_ct") or m.get("K_enclave") is None:
+            # Chat rows are mixed-shape during the encryption-optional rollout:
+            # encrypted rows carry body_ct/K_enclave, while plaintext-tier rows
+            # carry body.  Route by the row's actual shape instead of assuming
+            # every prompt row needs enclave decryption.  The old ciphertext-
+            # only check turned every valid plaintext user message into
+            # "[message unavailable]", leaving the model to answer from stale
+            # assistant history (and potentially continue an unrelated tool
+            # workflow) even though the current message was stored correctly.
+            # Keep ciphertext authoritative when a malformed/mid-migration row
+            # also retains a stale plaintext field.  Missing K_enclave must stay
+            # unreadable instead of silently falling back to that stale body.
+            has_readable_shape = (
+                m.get("K_enclave") is not None
+                if m.get("body_ct")
+                else (
+                    m.get("body_b64") is not None
+                    or isinstance(m.get("body"), str)
+                )
+            )
+            if not has_readable_shape:
                 if not preserve_unreadable:
                     continue  # legacy ts path keeps the historical skip rule
                 item = {
@@ -937,7 +964,7 @@ def _decrypt_chat_rows_inner(
                     "content": _UNAVAILABLE_CHAT_MARKER,
                 }
             else:
-                plaintext = core_enclave._decrypt_envelope_via_enclave(
+                plaintext = core_envelope.read_envelope_body(
                     m, None, purpose="v2_chat_read", runtime_token=token
                 ).decode("utf-8")
                 if not plaintext.strip():
@@ -1068,7 +1095,7 @@ def _read_messages(user_id: str, after_seq: int = 0) -> list[dict]:
     shared ``core.store`` cache with a seq key.
 
     服务器永不本地解密——每条信封走 enclave /v1/envelope/decrypt。 The full stored
-    message dict is forwarded to ``_decrypt_envelope_via_enclave`` (not a
+    message dict is forwarded to the shared envelope reader (not a
     hand-picked subset) — the enclave's AEAD additional-data is
     ``owner_user_id||v||id``, so dropping ``id`` would fail AEAD verification.
 
@@ -1519,7 +1546,7 @@ def _decrypt_summary_text(
     itself cannot be opened and must never be downgraded to best effort.
     """
     try:
-        raw = core_enclave._decrypt_envelope_via_enclave(
+        raw = core_envelope.read_envelope_body(
             envelope,
             None,
             purpose=purpose,
@@ -1692,7 +1719,7 @@ def _select_agent_profile_for_turn(
         nonlocal token
         if token is None:
             token = _mint_runtime_token(user_id)
-        return core_enclave._decrypt_envelope_via_enclave(
+        return core_envelope.read_envelope_body(
             envelope,
             None,
             purpose=f"v2_profile_{field}_read",
@@ -2415,10 +2442,9 @@ async def _generate_image_for_chat(
             )
         try:
             provider_key = await asyncio.to_thread(
-                core_enclave._decrypt_envelope_via_enclave,
+                core_envelope.decrypt_provider_key_envelope,
                 envelope,
                 api_key,
-                purpose="model_api_provider_key",
                 runtime_token=runtime_token,
             )
             config = provider_client.ProviderConfig(
@@ -2695,9 +2721,8 @@ def _read_memory_context(user_id: str, *, full_cards: bool = False) -> dict:
     enclave readside（用 runtime token 认证，服务器不本地解密）；runtime token 铸造失败
     也只让这三项降级（token=""，post_enclave 会 raise 被各自 try 吞掉），不影响 identity。
 
-    identity 是 E2E 信封，服务器侧拿不到明文人格文本 —— 只取 get_identity 暴露的顶层
-    非敏感明文（如有），否则降级为 ""。ai_name/user_name 同样无服务器侧明文来源，保持 ""，
-    由 prompt builder fallback（"我"/"TA"）。"""
+    identity 与记忆一样按行形状读取：密文经 enclave，明文 body 本地读取。
+    agent_name/user_preferred_name 同步作为抽取 prompt 的说话人标签。"""
     store = core_store.get_store(user_id)
     try:
         token = _mint_runtime_token(user_id)
@@ -2804,12 +2829,17 @@ def _read_memory_context(user_id: str, *, full_cards: bool = False) -> dict:
     except Exception as e:  # noqa: BLE001 — 单项降级
         log.warning("[v2.serve_worker] memory index unavailable for %s: %s", user_id, e)
     try:
-        body, status = identity_core.get_identity(store)
-        ident = body.get("identity") if isinstance(body, dict) else None
-        if status == 200 and isinstance(ident, dict):
-            # E2E 信封：服务器侧只有顶层非敏感明文（summary/title 若曾以明文写入），否则 ""。
-            ctx["identity"] = str(
-                ident.get("summary") or ident.get("title") or ""
+        ident = _load_identity_card_view(store, runtime_token=token)
+        if ident:
+            ctx["identity"] = json.dumps(
+                ident,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            ctx["ai_name"] = str(ident.get("agent_name") or "").strip()
+            ctx["user_name"] = str(
+                ident.get("user_preferred_name") or ""
             ).strip()
     except Exception as e:  # noqa: BLE001 — 单项降级
         log.warning("[v2.serve_worker] identity unavailable for %s: %s", user_id, e)
@@ -4067,7 +4097,7 @@ def _decrypt_tool_effect_payload(
     if owner_user_id != user_id:
         raise RuntimeError("encrypted effect owner mismatch")
     try:
-        plaintext = core_enclave._decrypt_envelope_via_enclave(
+        plaintext = core_envelope.read_envelope_body(
             envelope,
             None,
             purpose="v2_effect_apply",
@@ -4346,13 +4376,32 @@ def _apply_pending_effects_for_user(user_id: str) -> dict:
     )
 
 
+_TRAJECTORY_PLAINTEXT_B64_PREFIX = (
+    jobs_store.TRAJECTORY_PLAINTEXT_B64_PREFIX
+)
+
+
 def _seal_trajectory_payload(
     user_id: str,
     plaintext: bytes,
     item_id: str,
 ) -> dict:
-    """Seal flight-recorder content before any database write."""
+    """Build the per-user trajectory wire shape before any database write.
+
+    Trajectory payloads are compressed binary, unlike the UTF-8 documents
+    accepted by ``_build_shared_envelope_for_store``.  The plaintext tier
+    therefore stores those bytes as explicitly prefixed base64 text; encrypted
+    accounts retain the existing shared envelope unchanged.
+    """
     store = core_store.get_store(str(user_id))
+    if core_envelope.resolve_content_encryption(store.user_id) == "off":
+        return {
+            "body": jobs_store.TRAJECTORY_PLAINTEXT_B64_PREFIX
+            + base64.b64encode(bytes(plaintext)).decode("ascii"),
+            "id": str(item_id),
+            "owner_user_id": store.user_id,
+            "visibility": "shared",
+        }
     envelope, error = core_envelope._build_shared_envelope_for_store(
         store,
         bytes(plaintext),
@@ -4371,7 +4420,19 @@ def _open_trajectory_payload(
     """Open one event only inside the trusted worker for offline review."""
     if str(envelope.get("owner_user_id") or "") != str(user_id):
         raise RuntimeError("trajectory_owner_mismatch")
-    return core_enclave._decrypt_envelope_via_enclave(
+    body = envelope.get("body")
+    if isinstance(body, str):
+        prefix = jobs_store.TRAJECTORY_PLAINTEXT_B64_PREFIX
+        if not body.startswith(prefix):
+            raise RuntimeError("trajectory_plaintext_encoding_invalid")
+        try:
+            return base64.b64decode(
+                body[len(prefix) :],
+                validate=True,
+            )
+        except (ValueError, TypeError) as exc:
+            raise RuntimeError("trajectory_plaintext_encoding_invalid") from exc
+    return core_envelope.read_envelope_body(
         envelope,
         None,
         purpose="runtime_v2_trajectory_review",
@@ -4842,6 +4903,9 @@ def wire_assembly() -> None:
     只是把它桥到本进程 event loop 的一个 asyncio.Event（context 由 `_serve` 在 loop 起来后
     经 `v2_worker.set_job_wake_context` 设置——这里只负责注册 handler，不依赖 running loop）。"""
     core_envelope.get_user_public_key = accounts_registry._get_user_public_key
+    core_envelope.resolve_content_encryption = (
+        accounts_registry.effective_content_encryption
+    )
     accounts_registry.load_users()
     core_wake_bus.register_handler("users", _reload_accounts_registry)
     core_wake_bus.register_handler("v2_jobs", v2_worker.on_v2_job_notify)

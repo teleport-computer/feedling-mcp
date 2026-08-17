@@ -1007,6 +1007,40 @@ def test_reply_payload_sequence_accepts_image_primary_and_image_followups():
     ]
 
 
+def test_generated_image_effect_uses_plaintext_binary_envelope_when_off(monkeypatch):
+    """非加密 V2 生图必须把二进制保存成 body_b64，而不是当 UTF-8 文本。"""
+
+    class Store:
+        user_id = "u_v2_plaintext_generated_image"
+
+    monkeypatch.setattr(
+        worker.core_envelope,
+        "resolve_content_encryption",
+        lambda _user_id: "off",
+    )
+    raw = b"\x89PNG\r\n\x1a\n\x00binary-image"
+
+    payload = worker._build_encrypted_image_reply_effect_payload(
+        Store(),
+        worker.GeneratedImageReply(
+            name="result.png",
+            mime_type="image/png",
+            data=raw,
+        ),
+        effect_id="generated-image-effect",
+    )
+
+    envelope = payload["envelope"]
+    assert base64.b64decode(envelope["body_b64"], validate=True) == raw
+    assert envelope["body_size_bytes"] == len(raw)
+    assert "body" not in envelope and "body_ct" not in envelope
+    assert payload["message_extra"] == {
+        "content_type": "image",
+        "image_mime": "image/png",
+        "image_byte_count": len(raw),
+    }
+
+
 def test_process_job_commits_single_generated_image_without_empty_followups(
     monkeypatch,
 ):
@@ -1044,7 +1078,14 @@ def test_process_job_commits_single_generated_image_without_empty_followups(
     job = jobs_store.claim_next_job("image-worker")
     assert job is not None and job["id"] == job_id
 
-    def build_envelope(store, plaintext, *, item_id=None):
+    def build_envelope(
+        store,
+        plaintext,
+        *,
+        item_id=None,
+        content_kind="text",
+    ):
+        assert content_kind == "binary"
         return (
             {
                 "v": 1,

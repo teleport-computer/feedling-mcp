@@ -39,6 +39,7 @@ from accounts import registry  # noqa: E402
 from asgi import middleware  # noqa: E402
 from asgi_test_client import make_client  # noqa: E402
 from core import config as core_config  # noqa: E402
+from core import envelope as core_envelope  # noqa: E402
 from core import runtime_token as rt_mod  # noqa: E402
 from core import store as core_store  # noqa: E402
 from fastapi import FastAPI  # noqa: E402
@@ -369,6 +370,41 @@ def test_frame_envelope_not_found_404_parity(env):
     f = _flask_get(path, _key(api_key))
     a = _asgi("GET", path, headers=_key(api_key))
     assert f == a == (404, {"error": "not found"})
+
+
+def test_plaintext_frame_ingest_and_reads_bypass_enclave(env, monkeypatch):
+    uid, _api_key = _register()
+    fid = uuid.uuid4().hex
+    inner = {"ts": 123.0, "app": "Safari", "ocr_text": "hello", "w": 100,
+             "h": 200, "image": base64.b64encode(b"jpeg-bytes").decode(),
+             "image_mime": "image/jpeg"}
+    raw = json.dumps(inner).encode()
+    wire = {"v": 1, "id": fid, "body_b64": base64.b64encode(raw).decode(),
+            "body_size_bytes": len(raw), "visibility": "shared", "owner_user_id": uid}
+    monkeypatch.setattr(core_envelope, "resolve_content_encryption", lambda user_id: "off")
+    store = core_store.get_store(uid)
+    screen_frames._save_frame(store, {"type": "frame", "ts": 123.0, "envelope": wire})
+    decrypted = screen_read_core.frame_decrypt(
+        store, fid, include_image="true", api_key=None, runtime_token=None)
+    image = screen_read_core.frame_image(
+        store, fid, range_header=None, api_key=None, runtime_token=None)
+    assert decrypted.status == 200
+    assert decrypted.json_body["decrypt_status"] == "plaintext"
+    assert decrypted.json_body["ocr_text"] == "hello"
+    assert decrypted.json_body["image_b64"] == inner["image"]
+    assert image.status == 200 and image.raw_body == b"jpeg-bytes"
+
+
+def test_encrypted_account_rejects_plaintext_frame_ingest(env, monkeypatch):
+    uid, _api_key = _register()
+    fid = uuid.uuid4().hex
+    raw = b'{"image":"AA=="}'
+    wire = {"v": 1, "id": fid, "body_b64": base64.b64encode(raw).decode(),
+            "body_size_bytes": len(raw), "visibility": "shared", "owner_user_id": uid}
+    monkeypatch.setattr(core_envelope, "resolve_content_encryption", lambda user_id: "on")
+    store = core_store.get_store(uid)
+    screen_frames._save_frame(store, {"type": "frame", "envelope": wire})
+    assert screen_frames._frame_exists(store, fid) is False
 
 
 # =========================================================================== #
