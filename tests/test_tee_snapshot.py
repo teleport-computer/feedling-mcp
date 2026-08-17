@@ -36,6 +36,23 @@ def sample_table():
         c.execute("DROP TABLE IF EXISTS _snap_probe")
 
 
+@pytest.fixture
+def unique_key_table():
+    table = "_snap_unique_probe"
+    ddl = (
+        f"CREATE TABLE {table} ("
+        "id TEXT PRIMARY KEY, business_key TEXT NOT NULL UNIQUE, v TEXT NOT NULL)"
+    )
+    for pool in (db.get_pool(), mirror.get_tee_pool()):
+        with pool.connection() as c:
+            c.execute(f"DROP TABLE IF EXISTS {table}")
+            c.execute(ddl)
+    yield table
+    for pool in (db.get_pool(), mirror.get_tee_pool()):
+        with pool.connection() as c:
+            c.execute(f"DROP TABLE IF EXISTS {table}")
+
+
 def _tee_rows(table: str) -> list[tuple]:
     with mirror.get_tee_pool().connection() as c:
         return c.execute(f"SELECT k, v FROM {table} ORDER BY k").fetchall()
@@ -102,6 +119,27 @@ def test_snapshot_propagates_update_and_delete(sample_table):
     snapshot.snapshot_table(sample_table)
 
     assert _tee_rows(sample_table) == [("a", "changed")]
+
+
+def test_snapshot_releases_stale_secondary_unique_key_before_upsert(unique_key_table):
+    with db.get_pool().connection() as c:
+        c.execute(
+            f"INSERT INTO {unique_key_table} (id, business_key, v) "
+            "VALUES ('source-id', 'same-key', 'source')"
+        )
+    with mirror.get_tee_pool().connection() as c:
+        c.execute(
+            f"INSERT INTO {unique_key_table} (id, business_key, v) "
+            "VALUES ('stale-id', 'same-key', 'target')"
+        )
+
+    rep = snapshot.snapshot_table(unique_key_table)
+
+    assert rep["ok"] is True
+    with mirror.get_tee_pool().connection() as c:
+        assert c.execute(
+            f"SELECT id, business_key, v FROM {unique_key_table}"
+        ).fetchall() == [("source-id", "same-key", "source")]
 
 
 def test_snapshot_parent_update_preserves_external_child(fk_tables):
@@ -182,24 +220,30 @@ def test_failed_snapshot_leaves_old_data_intact(sample_table, monkeypatch):
     assert _tee_rows(sample_table) == [("a", "1")]
 
 
-def test_prune_failure_rolls_back_completed_upsert(sample_table, monkeypatch):
-    """A failure after UPSERT must roll the earlier target changes back too."""
+def test_failure_after_prune_rolls_back_stale_delete(sample_table, monkeypatch):
+    """A failure after stale-row prune must roll the completed delete back."""
     with db.get_pool().connection() as c:
-        c.execute("INSERT INTO _snap_probe (k, v) VALUES ('a', 'old')")
+        c.execute(
+            "INSERT INTO _snap_probe (k, v) VALUES "
+            "('a', 'old'), ('stale', 'old')"
+        )
     snapshot.snapshot_table(sample_table)
     with db.get_pool().connection() as c:
         c.execute("UPDATE _snap_probe SET v='new' WHERE k='a'")
-        c.execute("INSERT INTO _snap_probe (k, v) VALUES ('b', 'new')")
+        c.execute("DELETE FROM _snap_probe WHERE k='stale'")
 
-    def fail_prune(*args, **kwargs):
-        raise RuntimeError("injected prune failure")
+    real_prune = snapshot._prune_target
 
-    monkeypatch.setattr(snapshot, "_prune_target", fail_prune)
+    def fail_after_prune(*args, **kwargs):
+        real_prune(*args, **kwargs)
+        raise RuntimeError("injected failure after prune")
+
+    monkeypatch.setattr(snapshot, "_prune_target", fail_after_prune)
     rep = snapshot.snapshot_table(sample_table)
 
     assert rep["ok"] is False
-    assert "injected prune failure" in (rep["error"] or "")
-    assert _tee_rows(sample_table) == [("a", "old")]
+    assert "injected failure after prune" in (rep["error"] or "")
+    assert _tee_rows(sample_table) == [("a", "old"), ("stale", "old")]
 
 
 def test_snapshot_refuses_when_table_exceeds_max_rows(sample_table, monkeypatch):

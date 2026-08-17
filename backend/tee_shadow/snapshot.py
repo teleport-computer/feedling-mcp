@@ -134,6 +134,11 @@ def _merge_payload(
             stage_ident, sql.SQL(", ").join(col_idents))) as cp:
         cp.write(payload)
 
+    # A stale row can own a secondary/partial unique key that a source row
+    # with a different primary key now needs.  Release source-absent primary
+    # keys before inserting, while both operations remain in this transaction.
+    _prune_target(dst, table_ident, stage_ident, pk_idents)
+
     mutable_cols = [c for c in cols if c not in set(pk_cols)]
     if mutable_cols:
         assignments = sql.SQL(", ").join(
@@ -162,8 +167,6 @@ def _merge_payload(
         sql.SQL(", ").join(pk_idents),
         conflict_action,
     ))
-
-    _prune_target(dst, table_ident, stage_ident, pk_idents)
 
 
 def snapshot_table(table: str) -> dict:
