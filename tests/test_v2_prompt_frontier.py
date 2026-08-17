@@ -26,7 +26,7 @@ def _model_limit(context_window_tokens: int = 2_048) -> frontier.ModelPromptLimi
 
 
 _REAL_TOOL_COUNT = 69
-_REAL_TOOL_CATALOG_BYTES = 33_977
+_REAL_TOOL_CATALOG_BYTES = 34_148
 
 
 def _real_sized_mixed_tool_catalog() -> tuple[list[ToolSpec], list[ToolSpec]]:
@@ -34,10 +34,12 @@ def _real_sized_mixed_tool_catalog() -> tuple[list[ToolSpec], list[ToolSpec]]:
 
     The fixture is derived from the real platform catalog rather than copying a
     toy schema list. ASCII description padding makes the combined canonical
-    payload exactly 33,977 bytes while keeping 69 independently named tools.
+    payload exactly 34,148 bytes while keeping 69 independently named tools.
     The 2026-08-17 increase records the real `stay_silent` wake schema: it adds
     341 bytes by itself and 267 bytes net when replacing one synthetic MCP tool
     in this fixed-count mixed catalog.
+    The 2026-08-18 increase records the visual-by-default `photo_read` contract,
+    which adds 171 bytes while preserving the captured MCP description padding.
     """
     platform = list(tool_schema.build_tool_specs())
     mcp_count = _REAL_TOOL_COUNT - len(platform)
