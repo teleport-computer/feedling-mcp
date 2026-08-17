@@ -190,13 +190,7 @@ async def dispatch_tool_calls(
             writes.append(tc)
 
     async def _read(tc):
-        params = dict(tc.args)
-        # photo_recent is the metadata-only surface. Once the model chooses
-        # photo_read, make the visual read real even if it omits the optional
-        # compatibility flag; an explicit false is rejected by the schema.
-        if tc.name == "photo_read":
-            params.setdefault("include_image", True)
-        step = {"type": tc.name, "payload": params}
+        step = {"type": tc.name, "payload": tc.args}
         metadata = None
         try:
             _t, data = await _run_one(

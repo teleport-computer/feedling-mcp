@@ -81,24 +81,6 @@ def test_screen_read_description_defaults_live_shares_to_pixels():
     assert "Start without include_image" not in description
 
 
-def test_photo_read_defaults_to_pixels_and_rejects_metadata_only_flag():
-    spec = next(
-        item for item in tool_schema.build_tool_specs()
-        if item.name == "photo_read"
-    )
-    include_image = spec.parameters["properties"]["include_image"]
-
-    assert include_image["default"] is True
-    assert include_image["enum"] == [True]
-    assert "Pixels are included by default" in spec.description
-    assert tool_schema.validate_tool_args(
-        "photo_read", {"photo_id": "p1"}
-    ) is None
-    assert "unsupported value" in tool_schema.validate_tool_args(
-        "photo_read", {"photo_id": "p1", "include_image": False}
-    )
-
-
 def test_task_tool_is_read_only_and_requires_a_nonempty_prompt():
     task = next(s for s in tool_schema.build_tool_specs() if s.name == "task")
     assert task.parameters["required"] == ["prompt"]

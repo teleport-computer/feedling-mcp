@@ -46,7 +46,6 @@ _EXCLUDED = frozenset({"chat_image_read", "chat_file_read", "perception_glance"}
 _STR = {"type": "string"}
 _INT = {"type": "integer"}
 _BOOL = {"type": "boolean"}
-_TRUE_BOOL = {"type": "boolean", "enum": [True], "default": True}
 _NO_ARGS: dict = {"type": "object", "properties": {}}
 
 _IDENTITY_DIMENSION = {
@@ -321,7 +320,7 @@ PARAMS: dict[str, dict] = {
     # params.get("include_image") (bool).
     "photo_read": {
         "type": "object",
-        "properties": {"photo_id": _STR, "include_image": _TRUE_BOOL},
+        "properties": {"photo_id": _STR, "include_image": _BOOL},
         "required": ["photo_id"],
     },
 
@@ -671,13 +670,11 @@ DESCRIPTIONS: dict[str, str] = {
                     "returns an untrusted visual_observation instead of a local image_file "
                     "path."),
     "photo_recent": ("Use when the user's request depends on their photos; do not call for "
-                     "unrelated conversation. List recent photo metadata, optionally capped "
-                     "by limit. This does not show you the actual image; call photo_read for "
-                     "a photo whose visual content you need."),
+                     "unrelated conversation. List recent photos, optionally capped by limit."),
     "photo_read": ("Use when the user's request depends on a specific photo; do not call "
-                   "for unrelated conversation. Read and visually inspect a specific photo "
-                   "by id. Pixels are included by default; photo_recent is the metadata-only "
-                   "tool. Runtime V2 inspects the decrypted pixels through its "
+                   "for unrelated conversation. Read a specific photo by id. Set "
+                   "include_image=true only when metadata "
+                   "is insufficient; Runtime V2 inspects the decrypted pixels through its "
                    "native vision observer and returns an untrusted visual_observation "
                    "instead of a local image_file path."),
     "web_search": "Search the live public web for current information such as news, weather, prices, or recent events, or anything past your training data that you are not sure is current. Prefer this over guessing or telling the user you cannot access the internet.",
