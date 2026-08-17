@@ -614,6 +614,7 @@ async def run_tool_loop(
     prompt_image_reserve_tokens: int = prompt_frontier.DEFAULT_IMAGE_RESERVE_TOKENS,
     on_tail_window=None,
     on_prompt_frontier_exhaustion=None,
+    on_prompt_frontier_exhausted_detail=None,
 ) -> LoopOutcome:
     """Run one chronological, provider-native tool transcript.
 
@@ -1155,7 +1156,14 @@ async def run_tool_loop(
                     utf8_bytes_per_token=prompt_estimator_utf8_bytes_per_token,
                     image_reserve_tokens=prompt_image_reserve_tokens,
                 )
-        except prompt_frontier.PromptFrontierExhausted:
+        except prompt_frontier.PromptFrontierExhausted as exc:
+            if on_prompt_frontier_exhausted_detail is not None:
+                try:
+                    emitted = on_prompt_frontier_exhausted_detail(exc)
+                    if inspect.isawaitable(emitted):
+                        await emitted
+                except Exception:
+                    pass
             if on_prompt_frontier_exhaustion is not None:
                 try:
                     on_prompt_frontier_exhaustion()

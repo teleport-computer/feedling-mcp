@@ -2453,6 +2453,27 @@ _LANGUAGE_FOLLOW_PUBLIC_ENUMS = {
     "lane": frozenset({"chat", "wake"}),
 }
 
+_PROMPT_FRONTIER_TRACE_TYPES = frozenset({
+    "v2.prompt_frontier.budget",
+    "v2.prompt_frontier.exhausted",
+})
+_PROMPT_FRONTIER_PUBLIC_ENUMS = {
+    "limit_source": frozenset({
+        "provider_metadata", "caller", "audited_family",
+        "unaudited_default", "deployment_override",
+    }),
+    "lane": frozenset({
+        "chat", "heartbeat", "scheduled", "manual_wake", "screen_watch",
+    }),
+}
+_PROMPT_FRONTIER_PUBLIC_REQUIRED_COMPONENTS = frozenset({
+    "message_context", "tool_transcript", "required_tool_schemas",
+})
+_PROMPT_FRONTIER_PUBLIC_BYTE_COMPONENTS = frozenset({
+    "tools", "system", "summary", "tail", "worldbook", "runtime_data",
+    "screen", "tool_transcript",
+})
+
 
 def _debug_event_public_json(ev: dict) -> dict:
     raw_detail = ev.get("detail") or {}
@@ -2481,6 +2502,43 @@ def _debug_event_public_json(ev: dict) -> dict:
             value = raw_detail.get(key)
             if isinstance(value, str) and value in allowed_values:
                 public_detail[key] = value
+    if (
+        ev.get("type") in _PROMPT_FRONTIER_TRACE_TYPES
+        and isinstance(raw_detail, dict)
+        and isinstance(public_detail, dict)
+    ):
+        # Prompt-budget traces expose only producer-validated closed enums and
+        # integer counts.  Any extra key or string leaves the generic redaction
+        # intact, so a future producer cannot turn ``components`` into a prompt
+        # plaintext side channel by adding (for example) a ``content`` field.
+        for key, allowed_values in _PROMPT_FRONTIER_PUBLIC_ENUMS.items():
+            value = raw_detail.get(key)
+            if isinstance(value, str) and value in allowed_values:
+                public_detail[key] = value
+        required = raw_detail.get("required_components")
+        if (
+            isinstance(required, list)
+            and all(
+                isinstance(value, str)
+                and value in _PROMPT_FRONTIER_PUBLIC_REQUIRED_COMPONENTS
+                for value in required
+            )
+        ):
+            public_detail["required_components"] = list(required)
+        components = raw_detail.get("components")
+        if (
+            isinstance(components, list)
+            and all(
+                isinstance(item, dict)
+                and set(item) == {"name", "bytes"}
+                and isinstance(item.get("name"), str)
+                and item["name"] in _PROMPT_FRONTIER_PUBLIC_BYTE_COMPONENTS
+                and type(item.get("bytes")) is int
+                and item["bytes"] >= 0
+                for item in components
+            )
+        ):
+            public_detail["components"] = [dict(item) for item in components]
     if (
         ev.get("type") == "mcp.roundtrip.provider"
         and isinstance(raw_detail, dict)

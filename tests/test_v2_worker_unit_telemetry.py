@@ -15,6 +15,7 @@ from core import self_thinking  # noqa: E402
 from model_api_runtime.v2 import tool_loop  # noqa: E402
 from model_api_runtime.v2 import worker  # noqa: E402
 from model_api_runtime.v2 import language_follow  # noqa: E402
+from model_api_runtime.v2 import prompt_frontier  # noqa: E402
 from model_api_runtime.v2 import summary_frontier  # noqa: E402
 
 
@@ -217,6 +218,206 @@ def test_language_follow_has_dedicated_admin_timeline_label():
         "type": "reply.language_follow",
         "subsystem": "agent",
     }) == ("🌐", "语言跟随")
+
+
+def test_prompt_frontier_trace_reaches_final_sink_with_closed_content_free_shape():
+    from admin import data_track
+
+    sentinel = "PRIVATE_PROMPT_BODY_must_never_reach_trace"
+    traces = []
+    deps = _minimal_deps()
+    deps.emit_debug_trace = lambda user_id, event_type, **fields: traces.append({
+        "user_id": user_id,
+        "type": event_type,
+        **fields,
+    })
+    limit = prompt_frontier.ModelPromptLimit(
+        provider="test",
+        model="budget-test",
+        context_window_tokens=2_048,
+        source="caller",
+    )
+    plan = prompt_frontier.plan_provider_round(
+        model_limit=limit,
+        messages=[{"role": "system", "content": "x" * 750}],
+        tools=None,
+        output_reserve_tokens=512,
+        safety_margin_tokens=512,
+        message_component_bytes=(
+            prompt_frontier.PromptByteComponent("system", 750),
+        ),
+    )
+    sink = worker._ledger_tapped_sink(
+        None,
+        deps=deps,
+        user_id="u_budget_trace",
+        lane="chat",
+    )
+    asyncio.run(sink("provider_request", {
+        "prompt_frontier": plan,
+        "messages": [{"role": "user", "content": sentinel}],
+    }))
+
+    budget_trace = traces[-1]
+    assert budget_trace["type"] == "v2.prompt_frontier.budget"
+    assert budget_trace["status"] == "warning"
+    assert budget_trace["detail"] == {
+        "context_window_tokens": 2_048,
+        "input_budget_tokens": 1_024,
+        "required_tokens": plan.estimated_input_tokens,
+        "estimated_input_tokens": plan.estimated_input_tokens,
+        "overflow_tokens": 0,
+        "output_reserve_tokens": 512,
+        "safety_margin_tokens": 512,
+        "utf8_bytes_per_token": 1.0,
+        "limit_source": "caller",
+        "lane": "chat",
+        "required_components": ["message_context"],
+        "components": [{"name": "system", "bytes": 750}],
+    }
+    assert sentinel not in repr(budget_trace)
+
+    with pytest.raises(prompt_frontier.PromptFrontierExhausted) as caught:
+        prompt_frontier.plan_provider_round(
+            model_limit=limit,
+            messages=[{"role": "system", "content": sentinel * 40}],
+            tools=None,
+            output_reserve_tokens=512,
+            safety_margin_tokens=512,
+            message_component_bytes=(
+                prompt_frontier.PromptByteComponent("system", 1_700),
+            ),
+        )
+    callback = worker._prompt_frontier_exhaustion_trace_callback(
+        deps, "u_budget_trace", "heartbeat"
+    )
+    asyncio.run(callback(caught.value))
+
+    exhausted = traces[-1]
+    assert exhausted["type"] == "v2.prompt_frontier.exhausted"
+    assert exhausted["status"] == "warning"
+    assert exhausted["detail"]["overflow_tokens"] == (
+        exhausted["detail"]["required_tokens"] - 1_024
+    )
+    assert exhausted["detail"]["limit_source"] == "caller"
+    assert exhausted["detail"]["lane"] == "heartbeat"
+    assert exhausted["detail"]["components"] == [
+        {"name": "system", "bytes": 1_700},
+    ]
+    assert sentinel not in repr(exhausted)
+    assert data_track._debug_event_public_json(exhausted)["detail"] == (
+        exhausted["detail"]
+    )
+
+
+def test_prompt_frontier_trace_rejects_component_plaintext_before_emit():
+    sentinel = "PRIVATE_COMPONENT_TEXT"
+    traces = []
+    deps = _minimal_deps()
+    deps.emit_debug_trace = lambda user_id, event_type, **fields: traces.append({
+        "user_id": user_id,
+        "type": event_type,
+        **fields,
+    })
+    error = prompt_frontier.PromptFrontierExhausted(
+        required_tokens=2_000,
+        input_budget_tokens=1_000,
+        context_window_tokens=2_000,
+        required_components=("message_context",),
+        limit_source="caller",
+        output_reserve_tokens=500,
+        safety_margin_tokens=500,
+        utf8_bytes_per_token=1.0,
+        component_bytes=(
+            prompt_frontier.PromptByteComponent("system", 2_000),
+        ),
+    )
+    error.component_bytes = ({
+        "name": "system",
+        "bytes": 2_000,
+        "content": sentinel,
+    },)
+
+    worker._emit_prompt_frontier_trace(
+        deps,
+        "u_budget_guard",
+        error,
+        lane="chat",
+    )
+
+    assert traces == []
+
+
+def test_prompt_frontier_trace_rejects_plaintext_component_name_before_emit():
+    traces = []
+    deps = _minimal_deps()
+    deps.emit_debug_trace = lambda user_id, event_type, **fields: traces.append({
+        "user_id": user_id,
+        "type": event_type,
+        **fields,
+    })
+    error = prompt_frontier.PromptFrontierExhausted(
+        required_tokens=2_000,
+        input_budget_tokens=1_000,
+        context_window_tokens=2_000,
+        required_components=("message_context",),
+        limit_source="caller",
+        output_reserve_tokens=500,
+        safety_margin_tokens=500,
+        utf8_bytes_per_token=1.0,
+        component_bytes=(
+            prompt_frontier.PromptByteComponent("system", 2_000),
+        ),
+    )
+    error.component_bytes = ({
+        "name": "她说她今天很累",
+        "bytes": 2_000,
+    },)
+
+    worker._emit_prompt_frontier_trace(
+        deps,
+        "u_budget_guard",
+        error,
+        lane="chat",
+    )
+
+    assert traces == []
+
+
+def test_prompt_frontier_message_breakdown_uses_only_semantic_closed_names():
+    messages = [
+        {"role": "system", "content": "private system"},
+        {
+            "role": "user",
+            "content": worker.context._SUMMARY_HEADER + "private summary",
+        },
+        {
+            "role": "user",
+            "content": (
+                worker.context.WORLD_BOOK_CONTEXT_HEADER + "\nprivate world"
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                worker.context.RUNTIME_CONTEXT_HEADER + "\nprivate runtime"
+            ),
+        },
+        {
+            "role": "user",
+            "content": [{"type": "text", "text": "private screen"}],
+            worker.v2_screen_chat.MESSAGE_TAG: True,
+        },
+        {"role": "user", "content": "private tail"},
+    ]
+
+    breakdown = worker._prompt_frontier_message_component_bytes(messages)
+
+    assert [item.name for item in breakdown] == [
+        "system", "summary", "tail", "worldbook", "runtime_data", "screen",
+    ]
+    assert all(type(item.bytes) is int and item.bytes > 0 for item in breakdown)
+    assert "private" not in repr(breakdown)
 
 
 @pytest.mark.parametrize(
