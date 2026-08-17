@@ -8,6 +8,7 @@ import db
 import generated_image
 import provider_client
 from core import enclave as core_enclave
+from core import envelope as core_envelope
 from provider_types import ProviderResponse
 
 
@@ -91,16 +92,10 @@ def generate_with_pinned_route(
         return {"error": code, "error_class": code}, _status_for_error(code)
 
     try:
-        decrypt_kwargs = (
-            {"runtime_token": caller_runtime_token}
-            if caller_runtime_token
-            else {}
-        )
-        provider_key = core_enclave._decrypt_envelope_via_enclave(
+        provider_key = core_envelope.decrypt_provider_key_envelope(
             envelope,
             caller_api_key,
-            purpose="model_api_provider_key",
-            **decrypt_kwargs,
+            runtime_token=caller_runtime_token,
         ).decode("utf-8")
         config = provider_client.ProviderConfig(
             provider,

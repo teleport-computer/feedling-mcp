@@ -119,6 +119,30 @@ def test_plaintext_user_name_prefers_encrypted_identity_without_provider(monkeyp
     ) == "Seven"
 
 
+def test_existing_plaintext_identity_is_available_for_update(monkeypatch):
+    store = _store("usr_existing_plain")
+    monkeypatch.setattr(
+        plaintext.identity_service,
+        "_load_identity",
+        lambda _store: {
+            "body": '{"agent_name":"Mira","user_preferred_name":"Seven"}',
+            "owner_user_id": "usr_existing_plain",
+        },
+    )
+    monkeypatch.setattr(
+        plaintext.core_envelope.enclave,
+        "_decrypt_envelope_via_enclave",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("plaintext identity must not call enclave")
+        ),
+    )
+
+    assert plaintext._plaintext_existing_identity_for_update(store, "key") == {
+        "agent_name": "Mira",
+        "user_preferred_name": "Seven",
+    }
+
+
 def test_plaintext_worker_owner_metadata_is_not_public():
     body = genesis_core._job_response({
         "job_id": "job_owner",

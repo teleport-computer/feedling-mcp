@@ -12,10 +12,11 @@ a legacy card read there looks v1 and would never be detected.
 """
 from __future__ import annotations
 
-import hashlib
 import os
 import time
 from typing import Any, Mapping
+
+from core import envelope as core_envelope
 
 MIGRATION_STATE_BLOB = "memory_migration_state"
 DEFAULT_MIGRATE_BATCH = 8
@@ -76,9 +77,8 @@ def is_legacy_card_inner(inner: Mapping[str, Any] | None) -> bool:
 
 
 def body_hash(moment: Mapping[str, Any] | None) -> str:
-    """CAS token = sha256 of the stored ciphertext (same token memory.upgrade
-    checks). `to_v1_card` never touches body_ct, so it's stable across reads."""
-    return hashlib.sha256(str((moment or {}).get("body_ct") or "").encode("utf-8")).hexdigest()
+    """CAS token over the authoritative persisted content shape."""
+    return core_envelope.envelope_content_token(dict(moment or {}))
 
 
 def select_legacy_batch(

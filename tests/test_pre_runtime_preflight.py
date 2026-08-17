@@ -2,9 +2,45 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from alembic.config import Config
+from alembic.script import ScriptDirectory
+
 
 ROOT = Path(__file__).parent.parent
 WORKFLOW = ROOT / ".github" / "workflows" / "ci.yml"
+TEE_MIGRATE_WORKFLOW = ROOT / ".github" / "workflows" / "tee-migrate.yml"
+
+
+def test_tee_migrate_has_one_head_after_runtime_v2_alignment():
+    cfg = Config(str(ROOT / "backend" / "alembic_tee" / "alembic.ini"))
+    cfg.set_main_option("script_location", str(ROOT / "backend" / "alembic_tee"))
+    script = ScriptDirectory.from_config(cfg)
+
+    assert script.get_heads() == ["0022_v2_wake_outcomes"]
+    assert (
+        script.get_revision("0022_v2_wake_outcomes").down_revision
+        == "0021_agent_jobs_available_at"
+    )
+    assert (
+        script.get_revision("0021_agent_jobs_available_at").down_revision
+        == "0020_v2_first_chat_activation"
+    )
+    assert (
+        script.get_revision("0020_v2_first_chat_activation").down_revision
+        == "0019_v2_worker_pool_heartbeats"
+    )
+    assert (
+        script.get_revision("0019_v2_worker_pool_heartbeats").down_revision
+        == "0018_v2_wake_shadow_decisions"
+    )
+    assert (
+        script.get_revision("0018_v2_wake_shadow_decisions").down_revision
+        == "0017_voice_primary_alignment"
+    )
+    migration = script.get_revision("0022_v2_wake_outcomes").module
+    assert "'[\"0022_v2_wake_outcomes\"]'::jsonb" in (
+        migration._UPDATE_PREPARED_HEAD
+    )
 
 
 def _job(source: str, name: str, next_name: str) -> str:
@@ -55,6 +91,51 @@ def test_preflight_validates_entire_two_cvm_release_before_mutation():
         "no pre CVM was changed",
     ):
         assert required in preflight
+
+
+def test_preflight_blocks_tee_primary_deploy_before_mutating_a_cvm():
+    source = WORKFLOW.read_text()
+    preflight = _job(
+        source,
+        "validate-pre-runtime-prerequisites",
+        "deploy-cvm",
+    )
+
+    for required in (
+        "PRE_FEEDLING_DATABASE_SCHEMA == 'tee'",
+        "PRE_TEE_MIGRATION_DSN",
+        "PRE_TEE_PG_CA_PEM",
+        "backend/alembic_tee/alembic.ini",
+        "SELECT version_num FROM alembic_tee_version",
+        "PRE TEE schema migration required",
+        "run the TEE migrate workflow for pre",
+        "No PRE CVM was changed",
+    ):
+        assert required in preflight
+
+    schema_gate = preflight.index(
+        "Require PRE TEE schema at release head before mutating either CVM"
+    )
+    image_gate = preflight.index(
+        "Require both Runtime V2 images before mutating either CVM"
+    )
+    assert schema_gate < image_gate
+
+
+def test_pre_release_gates_run_the_application_startup_contract():
+    preflight = _job(
+        WORKFLOW.read_text(),
+        "validate-pre-runtime-prerequisites",
+        "deploy-cvm",
+    )
+    tee_migrate = TEE_MIGRATE_WORKFLOW.read_text()
+
+    for source in (preflight, tee_migrate):
+        assert 'os.environ["FEEDLING_DATABASE_SCHEMA"] = "tee"' in source
+        assert 'os.environ["DATABASE_URL"] = os.environ["TEE_MIGRATION_DATABASE_URL"]' in source
+        assert "db.init_schema()" in source
+
+    assert "Assert PRE application startup contract" in tee_migrate
 
 
 def test_preflight_is_triggered_by_both_cvm_inventory_files():

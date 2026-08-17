@@ -311,7 +311,16 @@ def test_fetch_parity_with_stubbed_enclave(user, monkeypatch):
 
 def test_buckets_and_threads_parity_with_stubbed_enclave(user, monkeypatch):
     uid, api_key = user
-    monkeypatch.setattr(memory_service, "_load_moments", lambda _store: [])
+    moments = [{
+        "v": 1, "id": "m1", "owner_user_id": uid, "visibility": "shared",
+        "body_ct": "ct", "nonce": "n", "K_user": "ku", "K_enclave": "ke",
+        "status": "active", "importance": 0.5,
+    }]
+    monkeypatch.setattr(
+        memory_service,
+        "_load_moments",
+        lambda _store: [dict(moment) for moment in moments],
+    )
 
     def fake_enclave(api_key_arg, candidates, *, operation, payload=None, runtime_token=None):
         return {"items": [

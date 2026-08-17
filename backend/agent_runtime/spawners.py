@@ -1011,7 +1011,10 @@ def _persona_from_blob(blob, decrypt_fn) -> str:
     if not isinstance(blob, dict):
         return ""
     env = blob.get("content_envelope")
-    if not (isinstance(env, dict) and env.get("body_ct")):
+    if not isinstance(env, dict):
+        return ""
+    from core import envelope as core_envelope
+    if core_envelope.classify_envelope_shape(env) == "invalid":
         return ""
     try:
         return str(decrypt_fn(env) or "")
@@ -1039,8 +1042,8 @@ def _genesis_persona_content(user_id: str, api_key: str | None = None,
         return ""
 
     def _decrypt(env: dict) -> str:
-        from core import enclave as core_enclave
-        raw = core_enclave._decrypt_envelope_via_enclave(
+        from core import envelope as core_envelope
+        raw = core_envelope.read_envelope_body(
             env, api_key, purpose="genesis_persona", runtime_token=runtime_token)
         return raw.decode("utf-8")
 

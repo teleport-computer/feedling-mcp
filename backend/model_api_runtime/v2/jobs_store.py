@@ -318,7 +318,7 @@ _TRAJECTORY_ACCESS_RESULT_RE = re.compile(r"^[a-z][a-z0-9_]{0,79}$")
 _TRAJECTORY_ACCESS_REASONS = frozenset(
     {"incident", "support", "security", "debug"}
 )
-_TRAJECTORY_ENVELOPE_REQUIRED = frozenset(
+_TRAJECTORY_SEALED_REQUIRED = frozenset(
     {
         "v",
         "id",
@@ -330,7 +330,7 @@ _TRAJECTORY_ENVELOPE_REQUIRED = frozenset(
         "K_enclave",
     }
 )
-_TRAJECTORY_ENVELOPE_ALLOWED = frozenset(
+_TRAJECTORY_SEALED_ALLOWED = frozenset(
     {
         "v",
         "id",
@@ -343,6 +343,9 @@ _TRAJECTORY_ENVELOPE_ALLOWED = frozenset(
         "enclave_pk_fpr",
         "content_pk_fpr",
     }
+)
+_TRAJECTORY_PLAINTEXT_REQUIRED = frozenset(
+    {"id", "owner_user_id", "visibility", "body"}
 )
 
 
@@ -394,17 +397,25 @@ def _review_admission_available_on_cursor(cur) -> bool:
 def _validate_trajectory_envelope(user_id: str, envelope: object) -> dict:
     if not isinstance(envelope, dict):
         raise ValueError("trajectory payload envelope must be an object")
-    if not _TRAJECTORY_ENVELOPE_REQUIRED.issubset(envelope):
-        raise ValueError("trajectory payload envelope is incomplete")
-    if set(envelope) - _TRAJECTORY_ENVELOPE_ALLOWED:
-        raise ValueError("trajectory payload envelope has unsupported fields")
-    if type(envelope.get("v")) is not int:
-        raise ValueError("trajectory payload envelope version must be an integer")
     if envelope.get("owner_user_id") != str(user_id):
         raise ValueError("trajectory payload envelope owner mismatch")
     if envelope.get("visibility") != "shared":
         raise ValueError("trajectory payload envelope must be shared")
-    for field in ("id", "body_ct", "nonce", "K_user", "K_enclave"):
+    if "body_ct" in envelope:
+        if not _TRAJECTORY_SEALED_REQUIRED.issubset(envelope):
+            raise ValueError("trajectory payload envelope is incomplete")
+        if set(envelope) - _TRAJECTORY_SEALED_ALLOWED:
+            raise ValueError("trajectory payload envelope has unsupported fields")
+        if type(envelope.get("v")) is not int:
+            raise ValueError("trajectory payload envelope version must be an integer")
+        required = ("id", "body_ct", "nonce", "K_user", "K_enclave")
+    else:
+        if not _TRAJECTORY_PLAINTEXT_REQUIRED.issubset(envelope):
+            raise ValueError("trajectory plaintext payload is incomplete")
+        if set(envelope) != _TRAJECTORY_PLAINTEXT_REQUIRED:
+            raise ValueError("trajectory plaintext payload has unsupported fields")
+        required = ("id", "body")
+    for field in required:
         if not isinstance(envelope.get(field), str) or not envelope[field]:
             raise ValueError(f"trajectory payload envelope {field} required")
     return envelope
@@ -2117,6 +2128,7 @@ _CAPTURE_PROVIDER_DB_KEEPALIVE_SEC = 15.0
 _CAPTURE_ENVELOPE_FIELDS = frozenset(
     {
         "id",
+        "body",
         "body_ct",
         "nonce",
         "K_user",
@@ -2244,6 +2256,8 @@ def _capture_owned_job_on_cursor(cur, job_id, user_id: str, claimed_by: str):
 
 
 def _validate_capture_actions(user_id: str, actions: list[dict]) -> list[dict]:
+    from core import envelope as core_envelope  # keep jobs_store import-light
+
     if not isinstance(actions, list) or len(actions) > 20:
         raise ValueError("capture actions must be a list of at most 20 items")
     normalized: list[dict] = []
@@ -2266,17 +2280,27 @@ def _validate_capture_actions(user_id: str, actions: list[dict]) -> list[dict]:
         ):
             raise ValueError("invalid capture memory identity")
         seen_ids.add(memory_id)
-        for field in (
-            "body_ct",
-            "nonce",
-            "K_user",
-            "K_enclave",
-            "visibility",
-            "occurred_at",
-            "type",
-        ):
+        for field in ("visibility", "occurred_at", "type"):
             if not envelope.get(field):
                 raise ValueError(f"capture envelope missing {field}")
+        has_ciphertext = bool(envelope.get("body_ct"))
+        has_plaintext_field = envelope.get("body") is not None
+        if has_ciphertext == has_plaintext_field:
+            raise ValueError("capture envelope content shape invalid")
+        if has_ciphertext:
+            for field in ("nonce", "K_user", "K_enclave"):
+                if not envelope.get(field):
+                    raise ValueError(f"capture envelope missing {field}")
+        else:
+            if not isinstance(envelope.get("body"), str) or not envelope["body"]:
+                raise ValueError("capture plaintext body invalid")
+            if core_envelope.resolve_content_encryption(str(user_id)) != "off":
+                raise ValueError("capture plaintext envelope not enabled")
+            if any(
+                envelope.get(field) is not None
+                for field in ("nonce", "K_user", "K_enclave")
+            ):
+                raise ValueError("capture plaintext envelope has crypto fields")
         occurred_at = memory_timestamps.normalize(envelope.get("occurred_at"))
         if not occurred_at:
             raise ValueError("capture envelope invalid occurred_at")
@@ -2504,6 +2528,8 @@ def get_prepared_capture_batch(
 
 
 def _capture_memory_doc(user_id: str, action: dict) -> dict:
+    from core import envelope as core_envelope  # 延迟导入：与本模块既有惯例一致
+
     envelope = dict(action["envelope"])
     occurred_at = memory_timestamps.normalize(envelope["occurred_at"])
     now_iso = memory_timestamps.now_iso()
@@ -2515,11 +2541,11 @@ def _capture_memory_doc(user_id: str, action: dict) -> dict:
         "created_at": now_iso,
         "updated_at": now_iso,
         "source": str(envelope.get("source") or "memory_capture"),
-        "body_ct": envelope["body_ct"],
-        "nonce": envelope["nonce"],
-        "K_user": envelope["K_user"],
-        "K_enclave": envelope["K_enclave"],
-        "enclave_pk_fpr": envelope.get("enclave_pk_fpr", ""),
+        "enclave_pk_fpr": "",
+        # splice 之后再钉死 visibility/owner：本站点刻意忽略信封里的值。
+        # 注意 K_enclave 由 splice 决定「在不在」——信封行必带（shared 封装
+        # 一定有），明文行本就没有。
+        **core_envelope.envelope_storage_fields(envelope),
         "visibility": "shared",
         "owner_user_id": str(user_id),
         "status": str(envelope.get("status") or "active"),
@@ -2546,6 +2572,7 @@ def _capture_same_memory(existing: dict, wanted: dict) -> bool:
         for key in (
             "id",
             "type",
+            "body",
             "body_ct",
             "nonce",
             "K_user",

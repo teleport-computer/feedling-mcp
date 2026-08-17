@@ -22,7 +22,7 @@ on:
       environment:
         description: 目标环境
         type: choice
-        options: [test, prod]
+        options: [test, pre, prod]
         required: true
       confirm:
         description: '输入 MIGRATE-TEE（prod 需输入 MIGRATE-TEE-PROD）确认（防误触）'
@@ -45,9 +45,9 @@ jobs:
           test "$CONFIRM" = "$WANT" || { echo "::error::confirm mismatch — ${ENVIRONMENT} 需要输入 ${WANT}"; exit 1; }
 
       - uses: actions/checkout@v4
-        # test 环境跑 test 分支、prod 跑 main：与 app 发布流向一致。
+        # test/pre/prod 分别跑 test/pre/main：与 app 发布流向一致。
         with:
-          ref: ${{ inputs.environment == 'prod' && 'main' || 'test' }}
+          ref: ${{ inputs.environment == 'prod' && 'main' || inputs.environment == 'pre' && 'pre' || 'test' }}
 
       - uses: actions/setup-python@v5
         with:
@@ -72,10 +72,16 @@ jobs:
         env:
           ENVIRONMENT: ${{ inputs.environment }}
           TEST_CA_PEM: ${{ secrets.TEST_TEE_PG_CA_PEM }}
+          PRE_CA_PEM: ${{ secrets.PRE_TEE_PG_CA_PEM }}
           PROD_CA_PEM: ${{ secrets.PROD_TEE_PG_CA_PEM }}
         run: |
           umask 077
-          if [ "$ENVIRONMENT" = "prod" ]; then CA_PEM="$PROD_CA_PEM"; else CA_PEM="$TEST_CA_PEM"; fi
+          case "$ENVIRONMENT" in
+            test) CA_PEM="$TEST_CA_PEM" ;;
+            pre)  CA_PEM="$PRE_CA_PEM" ;;
+            prod) CA_PEM="$PROD_CA_PEM" ;;
+            *) echo "::error::unknown environment: $ENVIRONMENT"; exit 1 ;;
+          esac
           printf '%s' "$CA_PEM" > /tmp/tee-ca.crt
           test -s /tmp/tee-ca.crt || { echo "::error::${ENVIRONMENT} 的 CA cert secret 为空或未创建"; exit 1; }
 
@@ -83,9 +89,15 @@ jobs:
         env:
           ENVIRONMENT: ${{ inputs.environment }}
           TEST_DSN: ${{ secrets.TEST_TEE_MIGRATION_DSN }}
+          PRE_DSN: ${{ secrets.PRE_TEE_MIGRATION_DSN }}
           PROD_DSN: ${{ secrets.PROD_TEE_MIGRATION_DSN }}
         run: |
-          if [ "$ENVIRONMENT" = "prod" ]; then DSN="$PROD_DSN"; else DSN="$TEST_DSN"; fi
+          case "$ENVIRONMENT" in
+            test) DSN="$TEST_DSN" ;;
+            pre)  DSN="$PRE_DSN" ;;
+            prod) DSN="$PROD_DSN" ;;
+            *) echo "::error::unknown environment: $ENVIRONMENT"; exit 1 ;;
+          esac
           test -n "$DSN" || { echo "::error::${ENVIRONMENT} 的 TEE_MIGRATION_DSN secret 为空或未创建"; exit 1; }
           # DSN 里必须已含 sslmode=verify-full&sslnegotiation=direct；这里只补 CA 路径。
           export TEE_MIGRATION_DATABASE_URL="${DSN}&sslrootcert=/tmp/tee-ca.crt"
@@ -95,9 +107,15 @@ jobs:
         env:
           ENVIRONMENT: ${{ inputs.environment }}
           TEST_DSN: ${{ secrets.TEST_TEE_MIGRATION_DSN }}
+          PRE_DSN: ${{ secrets.PRE_TEE_MIGRATION_DSN }}
           PROD_DSN: ${{ secrets.PROD_TEE_MIGRATION_DSN }}
         run: |
-          if [ "$ENVIRONMENT" = "prod" ]; then DSN="$PROD_DSN"; else DSN="$TEST_DSN"; fi
+          case "$ENVIRONMENT" in
+            test) DSN="$TEST_DSN" ;;
+            pre)  DSN="$PRE_DSN" ;;
+            prod) DSN="$PROD_DSN" ;;
+            *) echo "::error::unknown environment: $ENVIRONMENT"; exit 1 ;;
+          esac
           test -n "$DSN" || { echo "::error::${ENVIRONMENT} 的 TEE_MIGRATION_DSN secret 为空或未创建"; exit 1; }
           export TEE_MIGRATION_DATABASE_URL="${DSN}&sslrootcert=/tmp/tee-ca.crt"
           python - <<'PY'
@@ -112,4 +130,25 @@ jobs:
               got = c.execute("select version_num from alembic_tee_version").fetchone()[0]
           print(f"code head={want} db={got}")
           assert got == want, f"alembic_tee 未落到 head: db={got} want={want}"
+          PY
+
+      - name: Assert PRE application startup contract
+        if: ${{ inputs.environment == 'pre' }}
+        env:
+          PRE_DSN: ${{ secrets.PRE_TEE_MIGRATION_DSN }}
+        run: |
+          test -n "$PRE_DSN" || { echo "::error::pre 的 TEE_MIGRATION_DSN secret 为空或未创建"; exit 1; }
+          export TEE_MIGRATION_DATABASE_URL="${PRE_DSN}&sslrootcert=/tmp/tee-ca.crt"
+          python - <<'PY'
+          import os
+          import sys
+
+          sys.path.insert(0, "backend")
+          os.environ["FEEDLING_DATABASE_SCHEMA"] = "tee"
+          os.environ["DATABASE_URL"] = os.environ["TEE_MIGRATION_DATABASE_URL"]
+
+          import db
+
+          db.init_schema()
+          print("PRE application startup contract: ok")
           PY

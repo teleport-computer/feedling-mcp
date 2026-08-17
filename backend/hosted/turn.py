@@ -9,6 +9,7 @@ from datetime import date, timedelta
 
 import db
 from core import enclave as core_enclave
+from core import envelope as core_envelope
 from chat import service as chat_service
 from core.store import UserStore
 
@@ -89,18 +90,26 @@ def _model_api_latest_recap_job(store: UserStore) -> dict | None:
 
 def _model_api_recent_recap_chat(store: UserStore, api_key: str | None, limit: int = 160) -> tuple[list[dict], list[str]]:
     warnings: list[str] = []
-    hist, hist_err = core_enclave._enclave_get_json_for_gate(
-        "/v1/chat/history",
-        api_key,
-        {
-            "limit": str(max(20, min(limit, 200))),
-            "include_image_body": "false",
-            "context_mode": "model_api",
-        },
-    )
-    if hist_err:
-        warnings.append(f"history_read:{hist_err[:180]}")
-    raw_messages = hist.get("messages") if isinstance(hist, dict) and isinstance(hist.get("messages"), list) else []
+    try:
+        rows = db.chat_history_page_strict(
+            store.user_id, limit=max(20, min(limit, 200)))
+    except Exception as exc:  # noqa: BLE001
+        warnings.append(f"history_read:{type(exc).__name__}")
+        rows = []
+    raw_messages: list[dict] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        if str(row.get("content_type") or "text") != "text":
+            continue
+        try:
+            raw = core_envelope.read_envelope_body(
+                row, api_key, purpose="model_api_recap_history")
+            item = dict(row)
+            item["content"] = raw.decode("utf-8")
+            raw_messages.append(item)
+        except (UnicodeDecodeError, ValueError, RuntimeError) as exc:
+            warnings.append(f"history_row_read:{type(exc).__name__}")
     messages: list[dict] = []
     for msg in raw_messages:
         if not isinstance(msg, dict):
@@ -153,8 +162,11 @@ def _memory_quality_card_issues(
     *,
     archive_language: str = "",
 ) -> list[str]:
-    title = str(inner.get("title") or "").strip()
-    desc = str(inner.get("description") or "").strip()
+    # Typed-memory cards use title/description; the v1 plaintext Garden uses
+    # summary/content.  Both shapes coexist during migration and quality checks
+    # must judge the actual text instead of flagging every v1 card as empty.
+    title = str(inner.get("title") or inner.get("summary") or "").strip()
+    desc = str(inner.get("description") or inner.get("content") or "").strip()
     context = str(inner.get("context") or "").strip()
     mem_type = str(moment.get("type") or inner.get("type") or "fact")
     issues: list[str] = []

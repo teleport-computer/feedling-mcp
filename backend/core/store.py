@@ -17,6 +17,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import db
 from core import config
+from core import envelope as core_envelope
 from core import wake_bus
 
 MAX_FRAMES = 200
@@ -425,16 +426,17 @@ class UserStore:
             "ts": time.time(),
             "source": source,
             "v": envelope.get("v", 1),
-            "body_ct": envelope["body_ct"],
-            "nonce": envelope["nonce"],
-            "K_user": envelope["K_user"],
-            "enclave_pk_fpr": envelope.get("enclave_pk_fpr", ""),
+            # 这两个指纹保持「键恒在、缺省空串」的既有行为：老客户端不传，而
+            # rewrap 的跳过逻辑直接从落库行上读它们。下面的 splice 只在信封真
+            # 带了值时覆盖。
+            "enclave_pk_fpr": "",
             # Seal-time label of the user pk K_user was wrapped to; rewrap's
             # skip logic reads it off the stored row (empty for old clients).
-            "content_pk_fpr": envelope.get("content_pk_fpr", ""),
-            "visibility": envelope.get("visibility", "shared"),
-            "owner_user_id": envelope.get("owner_user_id", self.user_id),
+            "content_pk_fpr": "",
             "content_type": ct,
+            # 形状无关：信封行取 body_ct/nonce/K_user/…，明文行取 body。
+            **core_envelope.envelope_storage_fields(
+                envelope, default_owner_user_id=self.user_id),
         }
         # Synthetic verify pings are not real user content and are removed
         # after /v1/chat/verify_loop completes. They still need plaintext
@@ -518,6 +520,9 @@ class UserStore:
                 "caption_K_enclave",
                 "caption_enclave_pk_fpr",
                 "caption_content_pk_fpr",
+                # 明文形状的子信封正文（v6）。漏登记会被静默丢掉——正文凭空
+                # 消失且不报错，见 tests/test_envelope_storage_fields.py。
+                "caption_body",
                 "caption_visibility",
                 "caption_owner_user_id",
                 "thinking_v",
@@ -528,6 +533,7 @@ class UserStore:
                 "thinking_K_enclave",
                 "thinking_enclave_pk_fpr",
                 "thinking_content_pk_fpr",
+                "thinking_body",
                 "thinking_visibility",
                 "thinking_owner_user_id",
                 "thinking_kind",
@@ -658,16 +664,17 @@ class UserStore:
             "ts": time.time(),
             "source": source,
             "v": envelope.get("v", 1),
-            "body_ct": envelope["body_ct"],
-            "nonce": envelope["nonce"],
-            "K_user": envelope["K_user"],
-            "enclave_pk_fpr": envelope.get("enclave_pk_fpr", ""),
+            # 这两个指纹保持「键恒在、缺省空串」的既有行为：老客户端不传，而
+            # rewrap 的跳过逻辑直接从落库行上读它们。下面的 splice 只在信封真
+            # 带了值时覆盖。
+            "enclave_pk_fpr": "",
             # Seal-time label of the user pk K_user was wrapped to; rewrap's
             # skip logic reads it off the stored row (empty for old clients).
-            "content_pk_fpr": envelope.get("content_pk_fpr", ""),
-            "visibility": envelope.get("visibility", "shared"),
-            "owner_user_id": envelope.get("owner_user_id", self.user_id),
+            "content_pk_fpr": "",
             "content_type": ct,
+            # 形状无关：信封行取 body_ct/nonce/K_user/…，明文行取 body。
+            **core_envelope.envelope_storage_fields(
+                envelope, default_owner_user_id=self.user_id),
         }
         # Synthetic verify pings are not real user content and are removed
         # after /v1/chat/verify_loop completes. They still need plaintext
@@ -741,6 +748,9 @@ class UserStore:
                 "caption_K_enclave",
                 "caption_enclave_pk_fpr",
                 "caption_content_pk_fpr",
+                # 明文形状的子信封正文（v6）。漏登记会被静默丢掉——正文凭空
+                # 消失且不报错，见 tests/test_envelope_storage_fields.py。
+                "caption_body",
                 "caption_visibility",
                 "caption_owner_user_id",
                 "thinking_v",
@@ -751,6 +761,7 @@ class UserStore:
                 "thinking_K_enclave",
                 "thinking_enclave_pk_fpr",
                 "thinking_content_pk_fpr",
+                "thinking_body",
                 "thinking_visibility",
                 "thinking_owner_user_id",
                 "thinking_kind",

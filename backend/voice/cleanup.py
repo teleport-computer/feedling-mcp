@@ -17,7 +17,6 @@ import uuid
 import logging
 
 import db
-from core import enclave as core_enclave
 from core import envelope as core_envelope
 
 log = logging.getLogger("feedling.voice.cleanup")
@@ -227,10 +226,18 @@ def transcript_turns_from_rows(
         role = "user" if raw_role in {"user", "human"} else "assistant"
         text = ""
         try:
-            text = core_enclave._decrypt_envelope_via_enclave(
-                doc, None, purpose="voice_transcript_capture",
-                runtime_token=runtime_token,
-            ).decode("utf-8").strip()
+            shape = core_envelope.classify_envelope_shape(doc)
+            if shape in ("plaintext_text", "plaintext_binary"):
+                raw = core_envelope.read_plaintext_envelope_body(
+                    doc, owner_user_id=user_id)
+            else:
+                raw = core_envelope.read_envelope_body(
+                    doc,
+                    None,
+                    purpose="voice_transcript_capture",
+                    runtime_token=runtime_token,
+                )
+            text = raw.decode("utf-8").strip()
         except Exception as exc:  # noqa: BLE001 — 一轮读不出不该丢掉整通
             log.warning(
                 "[voice.reconstruct] row undecryptable user=%s call=%s msg=%s: %s",
