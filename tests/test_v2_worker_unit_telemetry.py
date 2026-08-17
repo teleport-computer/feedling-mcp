@@ -310,6 +310,119 @@ def test_prompt_frontier_trace_reaches_final_sink_with_closed_content_free_shape
     )
 
 
+def test_rejected_provider_metadata_warning_reaches_final_sink_without_model(
+    monkeypatch,
+):
+    from admin import data_track
+
+    model_sentinel = "[PRIVATE GROUP]gemini-3.1-flash-lite"
+    traces = []
+    deps = _minimal_deps()
+    deps.emit_debug_trace = lambda user_id, event_type, **fields: traces.append({
+        "user_id": user_id,
+        "type": event_type,
+        **fields,
+    })
+    monkeypatch.setenv(prompt_frontier._UNAUDITED_DEFAULT_ENV, "131072")
+    limit = prompt_frontier.resolve_model_limit(
+        "openai_compatible",
+        model_sentinel,
+        base_url="https://relay.example/v1",
+        provider_context_window_tokens=16_384,
+    )
+    plan = prompt_frontier.plan_provider_round(
+        model_limit=limit,
+        messages=[{"role": "system", "content": "fixed"}],
+        tools=None,
+        output_reserve_tokens=512,
+        safety_margin_tokens=512,
+    )
+    sink = worker._ledger_tapped_sink(
+        None,
+        deps=deps,
+        user_id="u_metadata_rejected",
+        lane="heartbeat",
+    )
+    asyncio.run(sink("provider_request", {"prompt_frontier": plan}))
+
+    assert traces[0]["type"] == "v2.prompt_frontier.budget"
+    warning = traces[1]
+    assert warning["type"] == "v2.prompt_frontier.metadata_rejected"
+    assert warning["status"] == "warning"
+    assert warning["detail"] == {
+        "reported_tokens": 16_384,
+        "floor_tokens": (
+            prompt_frontier.DEFAULT_PROVIDER_METADATA_CONTEXT_WINDOW_FLOOR_TOKENS
+        ),
+        "resolved_tokens": 131_072,
+        "resolved_source": "unaudited_default",
+        "provider": "openai_compatible",
+    }
+    assert set(warning["detail"]) == {
+        "reported_tokens",
+        "floor_tokens",
+        "resolved_tokens",
+        "resolved_source",
+        "provider",
+    }
+    assert "model" not in warning["detail"]
+    assert model_sentinel not in repr(warning)
+    assert data_track._debug_event_public_json(warning)["detail"] == warning["detail"]
+
+    forged = {**warning, "detail": {**warning["detail"], "model": model_sentinel}}
+    assert data_track._debug_event_public_json(forged)["detail"] == {}
+
+    traces.clear()
+    accepted = prompt_frontier.resolve_model_limit(
+        "openai_compatible",
+        model_sentinel,
+        base_url="https://relay.example/v1",
+        provider_context_window_tokens=131_072,
+    )
+    accepted_plan = prompt_frontier.plan_provider_round(
+        model_limit=accepted,
+        messages=[{"role": "system", "content": "fixed"}],
+        tools=None,
+        output_reserve_tokens=512,
+        safety_margin_tokens=512,
+    )
+    asyncio.run(sink("provider_request", {"prompt_frontier": accepted_plan}))
+    assert [item["type"] for item in traces] == ["v2.prompt_frontier.budget"]
+
+
+def test_invalid_metadata_warning_cannot_suppress_budget_trace():
+    traces = []
+    deps = _minimal_deps()
+    deps.emit_debug_trace = lambda user_id, event_type, **fields: traces.append({
+        "type": event_type,
+        **fields,
+    })
+    limit = prompt_frontier.ModelPromptLimit(
+        provider="PRIVATE_PROVIDER_TEXT",
+        model="",
+        context_window_tokens=65_536,
+        source="unaudited_default",
+        rejected_provider_metadata_tokens=16_384,
+        provider_metadata_floor_tokens=32_768,
+    )
+    plan = prompt_frontier.plan_provider_round(
+        model_limit=limit,
+        messages=[{"role": "system", "content": "fixed"}],
+        tools=None,
+        output_reserve_tokens=512,
+        safety_margin_tokens=512,
+    )
+
+    worker._emit_prompt_frontier_trace(
+        deps,
+        "u_metadata_guard",
+        plan,
+        lane="chat",
+    )
+
+    assert [item["type"] for item in traces] == ["v2.prompt_frontier.budget"]
+
+
 def test_prompt_frontier_trace_rejects_component_plaintext_before_emit():
     sentinel = "PRIVATE_COMPONENT_TEXT"
     traces = []

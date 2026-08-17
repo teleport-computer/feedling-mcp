@@ -85,11 +85,11 @@ def _resolve_route_context_window(
 ) -> tuple[int | None, tuple[dict, int] | None]:
     """Resolve and preflight the context-window contract for a saved route.
 
-    ``context_window_tokens`` is a conservative lower bound for this exact
-    provider/model/destination, not a marketing maximum.  Audited first-party
-    families and deployment overrides may supply it automatically.  Every
-    unaudited route must provide it explicitly; otherwise setup is rejected
-    before encryption, provider I/O, or a DB mutation.
+    ``context_window_tokens`` is route metadata, not a marketing maximum.
+    Values below Runtime V2's metadata floor fall through to audited family or
+    deployment/default knowledge; this prevents stale small metadata from
+    silently removing the required prompt surface. Audited first-party families
+    and deployment overrides may also supply the resolved lower bound.
     """
 
     try:

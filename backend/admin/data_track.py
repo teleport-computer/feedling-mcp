@@ -2457,6 +2457,7 @@ _PROMPT_FRONTIER_TRACE_TYPES = frozenset({
     "v2.prompt_frontier.budget",
     "v2.prompt_frontier.exhausted",
 })
+_PROMPT_FRONTIER_METADATA_TRACE_TYPE = "v2.prompt_frontier.metadata_rejected"
 _PROMPT_FRONTIER_PUBLIC_ENUMS = {
     "limit_source": frozenset({
         "provider_metadata", "caller", "audited_family",
@@ -2464,6 +2465,13 @@ _PROMPT_FRONTIER_PUBLIC_ENUMS = {
     }),
     "lane": frozenset({
         "chat", "heartbeat", "scheduled", "manual_wake", "screen_watch",
+    }),
+    "resolved_source": frozenset({
+        "caller", "audited_family", "unaudited_default", "deployment_override",
+    }),
+    "provider": frozenset({
+        "openai", "openrouter", "anthropic", "bedrock", "gemini",
+        "deepseek", "openai_compatible",
     }),
 }
 _PROMPT_FRONTIER_PUBLIC_REQUIRED_COMPONENTS = frozenset({
@@ -2502,6 +2510,30 @@ def _debug_event_public_json(ev: dict) -> dict:
             value = raw_detail.get(key)
             if isinstance(value, str) and value in allowed_values:
                 public_detail[key] = value
+    if (
+        ev.get("type") == _PROMPT_FRONTIER_METADATA_TRACE_TYPE
+        and isinstance(raw_detail, dict)
+    ):
+        expected_keys = {
+            "reported_tokens", "floor_tokens", "resolved_tokens",
+            "resolved_source", "provider",
+        }
+        counts = tuple(
+            raw_detail.get(key)
+            for key in ("reported_tokens", "floor_tokens", "resolved_tokens")
+        )
+        valid = (
+            set(raw_detail) == expected_keys
+            and all(type(value) is int and value > 0 for value in counts)
+            and counts[0] < counts[1]
+            and raw_detail.get("provider")
+            in _PROMPT_FRONTIER_PUBLIC_ENUMS["provider"]
+            and raw_detail.get("resolved_source")
+            in _PROMPT_FRONTIER_PUBLIC_ENUMS["resolved_source"]
+        )
+        # Exact-shape projection: an extra model/free-text key invalidates the
+        # whole detail instead of inheriting the generic model/provider allowlist.
+        public_detail = dict(raw_detail) if valid else {}
     if (
         ev.get("type") in _PROMPT_FRONTIER_TRACE_TYPES
         and isinstance(raw_detail, dict)

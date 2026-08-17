@@ -2326,6 +2326,13 @@ OPERATION_DESCRIPTIONS: dict[Operation, str] = {
     ("post", "/v1/chat/response"): "Store an agent reply as a v1 ciphertext envelope plus optional thinking and encrypted file/image followups. A text primary and its attachment rows commit as one ordered transaction; generated images are returned as native content_type=image Chat messages. Replies carrying reply_to_message_id are finalized atomically across backend workers: exactly one request inserts the reply and marks the parent answered, while a losing contender returns 409 already_answered without storing its reply. A hidden source=verify_ping reply is accepted only when reply_to_message_id identifies an outstanding verify ping exactly. role=system notices bypass reply exclusivity. Labeled envelopes sealed to a key that is no longer the user's registered content key are rejected with 409 content_pk_fpr_mismatch — the writer should re-fetch whoami, re-seal, and retry once.",
     ("post", "/v1/chat/verify_loop"): "Insert a hidden liveness ping and wait for its exact hidden reply (source=verify_ping and reply_to_message_id equal to this ping). loop_alive reports whether the reply arrived; passing additionally requires resident decrypt health to satisfy the onboarding policy before sticky live-loop verification is recorded.",
     ("post", "/v1/model_api/chat/send"): "Queue an asynchronous hosted-agent turn. A successful response is always 202 and never contains a plaintext assistant reply.",
+    ("post", "/v1/model_api/setup"): (
+        "Create or update the active hosted model route. context_window_tokens "
+        "is treated as route metadata: a value below Runtime V2's "
+        "deployment-tunable trust floor (32,768 by default) falls through to "
+        "the audited-family or unaudited-route default rather than becoming "
+        "the prompt budget. The resolved value is returned and persisted."
+    ),
     ("post", "/v1/model_api/models"): "列出某 provider 在该凭据下可见的模型清单（实时拉取，非 io 兼容性保证）。unsupported / partial 时客户端退回手填。",
     ("post", "/v1/model_api/runtime_error"): "Record or clear the resident runtime's latest provider error. provider_result=success refreshes provider health immediately; provider_result=failure applies error_class to the provider-health policy.",
     ("get", "/v1/image-generation/config"): "Return the effective image-generation route, candidate routes, and validation state. The response mirrors vision routing semantics: follow_main uses the active chat route and dedicated pins a separately validated route.",

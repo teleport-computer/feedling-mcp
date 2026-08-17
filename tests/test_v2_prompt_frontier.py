@@ -1,4 +1,5 @@
 import pathlib
+import re
 import sys
 import asyncio
 import math
@@ -216,20 +217,134 @@ def test_unaudited_default_is_env_tunable_and_zero_restores_fail_closed(monkeypa
 
 
 def test_unaudited_default_is_lowest_precedence(monkeypatch):
-    """Override > caller-supplied > audited family all still win over the default,
-    so enabling the default never masks a value someone stated explicitly."""
+    """Override and audited-family knowledge still win over the default."""
     monkeypatch.delenv(frontier._UNAUDITED_DEFAULT_ENV, raising=False)
-    supplied = frontier.resolve_model_limit(
-        "some-relay", "m", provider_context_window_tokens=4096
-    )
-    assert supplied.source == "provider_metadata"
-    assert supplied.context_window_tokens == 4096
     override = frontier.resolve_model_limit(
         "some-relay", "m", deployment_overrides={"*:*": 12000}
     )
     assert override.source == "deployment_override"
     audited = frontier.resolve_model_limit("open-ai", "gpt-4o-mini")
     assert audited.source == "audited_family"
+
+
+def test_provider_metadata_below_floor_falls_through_without_constraining_explicit_limits(
+    monkeypatch,
+):
+    monkeypatch.setenv(frontier._UNAUDITED_DEFAULT_ENV, "131072")
+    monkeypatch.delenv(frontier._PROVIDER_METADATA_FLOOR_ENV, raising=False)
+
+    rejected = frontier.resolve_model_limit(
+        "openai_compatible",
+        "[AG]gemini-3.1-flash-lite",
+        base_url="https://relay.example/v1",
+        provider_context_window_tokens=16_384,
+    )
+    assert rejected.context_window_tokens == 131_072
+    assert rejected.source == "unaudited_default"
+    assert rejected.rejected_provider_metadata_tokens == 16_384
+    assert (
+        rejected.provider_metadata_floor_tokens
+        == frontier.DEFAULT_PROVIDER_METADATA_CONTEXT_WINDOW_FLOOR_TOKENS
+    )
+
+    accepted = frontier.resolve_model_limit(
+        "openai_compatible",
+        "m",
+        base_url="https://relay.example/v1",
+        provider_context_window_tokens=131_072,
+    )
+    assert accepted.source == "provider_metadata"
+    assert accepted.rejected_provider_metadata_tokens is None
+
+    boundary = frontier.resolve_model_limit(
+        "openai_compatible",
+        "m",
+        base_url="https://relay.example/v1",
+        provider_context_window_tokens=(
+            frontier.DEFAULT_PROVIDER_METADATA_CONTEXT_WINDOW_FLOOR_TOKENS
+        ),
+    )
+    assert boundary.source == "provider_metadata"
+
+    override = frontier.resolve_model_limit(
+        "openai_compatible",
+        "m",
+        base_url="https://relay.example/v1",
+        provider_context_window_tokens=16_384,
+        deployment_overrides={"openai_compatible:*": 8_192},
+    )
+    assert override.context_window_tokens == 8_192
+    assert override.source == "deployment_override"
+    assert override.rejected_provider_metadata_tokens is None
+
+    caller = frontier.ModelPromptLimit(
+        provider="openai_compatible",
+        model="",
+        context_window_tokens=8_192,
+        source="caller",
+    )
+    assert caller.context_window_tokens == 8_192
+    assert caller.source == "caller"
+
+
+def test_provider_metadata_floor_env_uses_blank_as_default(monkeypatch):
+    monkeypatch.setenv(frontier._PROVIDER_METADATA_FLOOR_ENV, "")
+    assert (
+        frontier.provider_metadata_context_window_floor()
+        == frontier.DEFAULT_PROVIDER_METADATA_CONTEXT_WINDOW_FLOOR_TOKENS
+    )
+    monkeypatch.setenv(frontier._PROVIDER_METADATA_FLOOR_ENV, "64000")
+    assert frontier.provider_metadata_context_window_floor() == 64_000
+
+
+def test_provider_metadata_floor_compose_defaults_match_runtime_constant():
+    compose = (
+        pathlib.Path(__file__).resolve().parents[1]
+        / "deploy"
+        / "docker-compose.phala.yaml"
+    ).read_text(encoding="utf-8")
+    matches = re.findall(
+        r"FEEDLING_V2_PROVIDER_METADATA_CONTEXT_WINDOW_FLOOR_TOKENS: "
+        r'"\$\{FEEDLING_V2_PROVIDER_METADATA_CONTEXT_WINDOW_FLOOR_TOKENS:-'
+        r"(\d+)\}\"",
+        compose,
+    )
+    assert matches, "deployment does not expose the metadata floor with ${VAR:-default}"
+    assert {int(value) for value in matches} == {
+        frontier.DEFAULT_PROVIDER_METADATA_CONTEXT_WINDOW_FLOOR_TOKENS
+    }
+
+
+def test_rejected_16k_metadata_allows_observed_wake_required_frontier(monkeypatch):
+    """At the frontier layer, the observed 31,693-token wake prefix now fits.
+
+    This does not assert that the user's whole wake path is recovered; tool
+    surface sizing remains a separate acceptance boundary.
+    """
+
+    monkeypatch.setenv(frontier._UNAUDITED_DEFAULT_ENV, "131072")
+    limit = frontier.resolve_model_limit(
+        "openai_compatible",
+        "[AG]gemini-3.1-flash-lite",
+        base_url="https://relay.example/v1",
+        provider_context_window_tokens=16_384,
+    )
+    plan = frontier.plan_prompt(
+        model_limit=limit,
+        components=(
+            frontier.PromptComponent("required_tool_schemas", 25_264),
+            frontier.PromptComponent("message_context", 6_429),
+        ),
+        output_reserve_tokens=4_096,
+        safety_margin_tokens=1_024,
+    )
+
+    assert plan.estimated_input_tokens == 31_693
+    assert plan.budget.context_window_tokens == 131_072
+    assert set(plan.included_components) == {
+        "required_tool_schemas",
+        "message_context",
+    }
 
 
 def test_unknown_route_override_is_explicit_and_applies_before_rejection():
@@ -959,6 +1074,7 @@ def test_late_input_is_in_required_frontier_before_first_provider_call(monkeypat
                 context_window_tokens=8_192,
             ),
             fold_before_first=True,
+            prompt_context_window_overrides={"*:*": 8_192},
             prompt_output_reserve_tokens=1_024,
             prompt_safety_margin_tokens=0,
         )
@@ -1018,6 +1134,7 @@ def test_fourteen_mcp_catalog_pressure_reaches_provider_with_memory_floor(
                 {"type": "object", "properties": {}},
             )
         ],
+        prompt_context_window_overrides={"*:*": 20_000},
         prompt_output_reserve_tokens=2_000,
         prompt_safety_margin_tokens=0,
         on_provider_tool_surface=record_surface,

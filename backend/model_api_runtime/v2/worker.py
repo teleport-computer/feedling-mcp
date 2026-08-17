@@ -2059,6 +2059,7 @@ _CONTEXT_TRUNCATION_COUNT_KEYS = (
 _PROMPT_FRONTIER_TRACE_EVENTS = frozenset({
     "v2.prompt_frontier.budget",
     "v2.prompt_frontier.exhausted",
+    "v2.prompt_frontier.metadata_rejected",
 })
 _PROMPT_FRONTIER_TRACE_LANES = frozenset({"chat", *_WAKE_LANES})
 _PROMPT_FRONTIER_LIMIT_SOURCES = frozenset({
@@ -2074,6 +2075,15 @@ _PROMPT_FRONTIER_REQUIRED_COMPONENTS = frozenset({
     "required_tool_schemas",
 })
 _PROMPT_FRONTIER_WARNING_RATIO = 0.70
+_PROMPT_FRONTIER_TRACE_PROVIDERS = frozenset({
+    "openai",
+    "openrouter",
+    "anthropic",
+    "bedrock",
+    "gemini",
+    "deepseek",
+    "openai_compatible",
+})
 
 
 def _prompt_frontier_message_component_bytes(
@@ -2231,6 +2241,58 @@ def _prompt_frontier_trace_detail(
     return event_type, status, detail
 
 
+def _prompt_frontier_metadata_rejection_detail(
+    observation: Any,
+) -> dict[str, Any] | None:
+    """Project a rejected metadata limit to one closed, content-free shape."""
+
+    if isinstance(observation, v2_prompt_frontier.PromptFrontierPlan):
+        model_limit = observation.model_limit
+        provider = model_limit.provider
+        reported_tokens = model_limit.rejected_provider_metadata_tokens
+        floor_tokens = model_limit.provider_metadata_floor_tokens
+        resolved_tokens = model_limit.context_window_tokens
+        resolved_source = model_limit.source
+    elif isinstance(observation, v2_prompt_frontier.PromptFrontierExhausted):
+        provider = observation.provider
+        reported_tokens = observation.rejected_provider_metadata_tokens
+        floor_tokens = observation.provider_metadata_floor_tokens
+        resolved_tokens = observation.context_window_tokens
+        resolved_source = observation.limit_source
+    else:
+        raise ValueError("unsupported prompt frontier observation")
+    if reported_tokens is None and floor_tokens is None:
+        return None
+    numeric_values = (reported_tokens, floor_tokens, resolved_tokens)
+    if any(type(value) is not int or value <= 0 for value in numeric_values):
+        raise ValueError("prompt frontier metadata rejection counts are invalid")
+    if reported_tokens >= floor_tokens:
+        raise ValueError("prompt frontier metadata rejection is below no floor")
+    if provider not in _PROMPT_FRONTIER_TRACE_PROVIDERS:
+        raise ValueError("prompt frontier provider is not in the closed set")
+    if (
+        resolved_source not in _PROMPT_FRONTIER_LIMIT_SOURCES
+        or resolved_source == "provider_metadata"
+    ):
+        raise ValueError("prompt frontier resolved source is invalid")
+    detail = {
+        "reported_tokens": reported_tokens,
+        "floor_tokens": floor_tokens,
+        "resolved_tokens": resolved_tokens,
+        "resolved_source": resolved_source,
+        "provider": provider,
+    }
+    if set(detail) != {
+        "reported_tokens",
+        "floor_tokens",
+        "resolved_tokens",
+        "resolved_source",
+        "provider",
+    }:
+        raise ValueError("prompt frontier metadata rejection shape is invalid")
+    return detail
+
+
 def _emit_prompt_frontier_trace(
     deps: TurnDeps,
     user_id: str,
@@ -2261,6 +2323,26 @@ def _emit_prompt_frontier_trace(
     except Exception as exc:  # noqa: BLE001 — observability cannot fail a turn
         log.warning(
             "[v2.prompt_frontier_trace] emit failed user=%s code=%s",
+            user_id,
+            type(exc).__name__.lower(),
+        )
+    try:
+        rejection_detail = _prompt_frontier_metadata_rejection_detail(observation)
+        if rejection_detail is not None:
+            deps.emit_debug_trace(
+                user_id,
+                "v2.prompt_frontier.metadata_rejected",
+                status="warning",
+                summary="V2 provider 元数据窗口过小",
+                explain=(
+                    "仅记录闭集 provider/source 与窗口计数；"
+                    "不记录模型名、prompt、回复或用户正文。"
+                ),
+                detail=rejection_detail,
+            )
+    except Exception as exc:  # noqa: BLE001 — observability cannot fail a turn
+        log.warning(
+            "[v2.prompt_frontier_metadata_trace] emit failed user=%s code=%s",
             user_id,
             type(exc).__name__.lower(),
         )

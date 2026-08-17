@@ -124,6 +124,8 @@ class ModelPromptLimit:
     source: LimitSource
     family: str | None = None
     override_key: str | None = None
+    rejected_provider_metadata_tokens: int | None = None
+    provider_metadata_floor_tokens: int | None = None
 
 
 @dataclass(frozen=True)
@@ -262,6 +264,9 @@ class PromptFrontierExhausted(RuntimeError):
         safety_margin_tokens: int | None = None,
         utf8_bytes_per_token: float | None = None,
         component_bytes: Sequence[PromptByteComponent | Mapping[str, Any]] = (),
+        provider: str = "",
+        rejected_provider_metadata_tokens: int | None = None,
+        provider_metadata_floor_tokens: int | None = None,
     ) -> None:
         self.required_tokens = int(required_tokens)
         self.input_budget_tokens = int(input_budget_tokens)
@@ -284,6 +289,17 @@ class PromptFrontierExhausted(RuntimeError):
             else None
         )
         self.component_bytes = normalize_prompt_byte_components(component_bytes)
+        self.provider = str(provider)
+        self.rejected_provider_metadata_tokens = (
+            int(rejected_provider_metadata_tokens)
+            if rejected_provider_metadata_tokens is not None
+            else None
+        )
+        self.provider_metadata_floor_tokens = (
+            int(provider_metadata_floor_tokens)
+            if provider_metadata_floor_tokens is not None
+            else None
+        )
         super().__init__(
             f"{self.code}: required_tokens={self.required_tokens} "
             f"input_budget_tokens={self.input_budget_tokens} "
@@ -532,6 +548,14 @@ def _normalized_overrides(overrides: Mapping[str, Any] | None) -> dict[str, int]
 
 
 _UNAUDITED_DEFAULT_ENV = "FEEDLING_V2_UNAUDITED_DEFAULT_CONTEXT_WINDOW_TOKENS"
+_PROVIDER_METADATA_FLOOR_ENV = (
+    "FEEDLING_V2_PROVIDER_METADATA_CONTEXT_WINDOW_FLOOR_TOKENS"
+)
+# The current 25-user Runtime V2 route population has no observed window below
+# 64,000 tokens. 32,768 is one full tier lower, so it rejects stale/implausibly
+# small automatic metadata without changing any route in that measured
+# population. Re-evaluate this floor if the route population changes.
+DEFAULT_PROVIDER_METADATA_CONTEXT_WINDOW_FLOOR_TOKENS = 32_768
 # A smaller fallback caused custom-relay users with non-trivial persona/world-book
 # prompts to hit prompt_frontier_exhausted before any provider call, even with a
 # tiny chat history (observed in production). 65536 leaves 58,163 input tokens
@@ -545,6 +569,28 @@ _UNAUDITED_DEFAULT_ENV = "FEEDLING_V2_UNAUDITED_DEFAULT_CONTEXT_WINDOW_TOKENS"
 # Explicit deployment knowledge still belongs in the env override, and zero
 # retains strict fail-closed mode.
 _UNAUDITED_DEFAULT_FALLBACK_TOKENS = 65536
+
+
+def provider_metadata_context_window_floor() -> int:
+    """Return the minimum automatically trusted provider-metadata window.
+
+    Blank values follow shell ``${VAR:-default}`` semantics so a deployment
+    cannot accidentally disable the guard by rendering an empty variable.
+    """
+
+    raw = os.environ.get(_PROVIDER_METADATA_FLOOR_ENV)
+    if raw is None or not str(raw).strip():
+        return DEFAULT_PROVIDER_METADATA_CONTEXT_WINDOW_FLOOR_TOKENS
+    try:
+        parsed = int(str(raw).strip())
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(
+            f"{_PROVIDER_METADATA_FLOOR_ENV} must be an integer context window"
+        ) from exc
+    return _validated_context_window(
+        parsed,
+        label=_PROVIDER_METADATA_FLOOR_ENV,
+    )
 
 
 def unaudited_default_context_window() -> int:
@@ -580,11 +626,13 @@ def resolve_model_limit(
     provider_context_window_tokens: Any | None = None,
     deployment_overrides: Mapping[str, Any] | None = None,
 ) -> ModelPromptLimit:
-    """Resolve deployment override > provider metadata > audited family.
+    """Resolve deployment override > trusted provider metadata > audited family.
 
     Override lookup is deterministic and most-specific first:
     ``provider:model``, ``provider:*``, ``*:model``, then ``*:*``.
-    Deployment overrides intentionally apply even to custom destinations; a
+    Provider metadata below the deployment-tunable floor is not trusted and
+    falls through to audited-family/default resolution. Deployment overrides
+    intentionally apply even to custom destinations; a
     custom route without one never inherits a first-party model assumption and
     fails before any provider request. Because override keys do not encode a
     destination, an override must be a safe lower bound for every route it
@@ -610,16 +658,23 @@ def resolve_model_limit(
                 override_key=key,
             )
 
+    rejected_provider_metadata_tokens: int | None = None
+    provider_metadata_floor_tokens: int | None = None
     if provider_context_window_tokens is not None:
-        return ModelPromptLimit(
-            provider=normalized_provider,
-            model=normalized_model,
-            context_window_tokens=_validated_context_window(
-                provider_context_window_tokens,
-                label="provider context-window metadata",
-            ),
-            source="provider_metadata",
+        reported_tokens = _validated_context_window(
+            provider_context_window_tokens,
+            label="provider context-window metadata",
         )
+        floor_tokens = provider_metadata_context_window_floor()
+        if reported_tokens >= floor_tokens:
+            return ModelPromptLimit(
+                provider=normalized_provider,
+                model=normalized_model,
+                context_window_tokens=reported_tokens,
+                source="provider_metadata",
+            )
+        rejected_provider_metadata_tokens = reported_tokens
+        provider_metadata_floor_tokens = floor_tokens
 
     if _is_audited_destination(normalized_provider, base_url):
         for family in _AUDITED_FAMILIES:
@@ -634,6 +689,10 @@ def resolve_model_limit(
                     context_window_tokens=family.lower_bound_tokens,
                     source="audited_family",
                     family=family.name,
+                    rejected_provider_metadata_tokens=(
+                        rejected_provider_metadata_tokens
+                    ),
+                    provider_metadata_floor_tokens=provider_metadata_floor_tokens,
                 )
 
     # Lowest-precedence fallback: an unaudited route (custom relay / unknown
@@ -651,6 +710,8 @@ def resolve_model_limit(
                 default_tokens, label="unaudited default context window"
             ),
             source="unaudited_default",
+            rejected_provider_metadata_tokens=rejected_provider_metadata_tokens,
+            provider_metadata_floor_tokens=provider_metadata_floor_tokens,
         )
 
     raise PromptContextLimitUnconfigured(
@@ -666,10 +727,9 @@ def resolve_model_limit_from_config(
 ) -> ModelPromptLimit:
     """Resolve a limit from the dependency-neutral ProviderConfig protocol.
 
-    Provider adapters may attach audited ``context_window_tokens`` metadata. The
-    current hosted BYOK config does not require it, so operator overrides and
-    audited family floors remain fallbacks. An unaudited route with neither is
-    rejected before any provider request; there is no safe numeric default.
+    Provider adapters may attach ``context_window_tokens`` metadata. Values
+    below the metadata floor fall through to operator, audited-family, or
+    unaudited-default knowledge instead of silently shrinking every prompt.
     """
 
     return resolve_model_limit(
@@ -1027,6 +1087,13 @@ def plan_prompt(
             limit_source=model_limit.source,
             output_reserve_tokens=budget.output_reserve_tokens,
             safety_margin_tokens=budget.safety_margin_tokens,
+            provider=model_limit.provider,
+            rejected_provider_metadata_tokens=(
+                model_limit.rejected_provider_metadata_tokens
+            ),
+            provider_metadata_floor_tokens=(
+                model_limit.provider_metadata_floor_tokens
+            ),
         )
 
     optional_by_admission_order = sorted(
