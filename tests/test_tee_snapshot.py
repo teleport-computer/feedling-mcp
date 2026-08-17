@@ -182,6 +182,26 @@ def test_failed_snapshot_leaves_old_data_intact(sample_table, monkeypatch):
     assert _tee_rows(sample_table) == [("a", "1")]
 
 
+def test_prune_failure_rolls_back_completed_upsert(sample_table, monkeypatch):
+    """A failure after UPSERT must roll the earlier target changes back too."""
+    with db.get_pool().connection() as c:
+        c.execute("INSERT INTO _snap_probe (k, v) VALUES ('a', 'old')")
+    snapshot.snapshot_table(sample_table)
+    with db.get_pool().connection() as c:
+        c.execute("UPDATE _snap_probe SET v='new' WHERE k='a'")
+        c.execute("INSERT INTO _snap_probe (k, v) VALUES ('b', 'new')")
+
+    def fail_prune(*args, **kwargs):
+        raise RuntimeError("injected prune failure")
+
+    monkeypatch.setattr(snapshot, "_prune_target", fail_prune)
+    rep = snapshot.snapshot_table(sample_table)
+
+    assert rep["ok"] is False
+    assert "injected prune failure" in (rep["error"] or "")
+    assert _tee_rows(sample_table) == [("a", "old")]
+
+
 def test_snapshot_refuses_when_table_exceeds_max_rows(sample_table, monkeypatch):
     """超限必须失败，不能静默截断——否则 TEE 会悄悄缺数据而无人察觉。
     早退分支不该碰 TEE 侧：旧快照必须原样保留，证明没有执行目标合并。
@@ -372,6 +392,19 @@ def test_users_is_snapshotted_before_per_user_tables():
     assert set(order) == snap
     if "users" in snap:
         assert order.index("users") == 0
+
+
+def test_snapshot_parents_are_ordered_before_known_children():
+    order = snapshot.snapshot_order()
+    agent_job_children = (
+        "agent_action_queue",
+        "v2_capture_batches",
+        "v2_mcp_mutation_attempts",
+        "v2_terminal_failure_outbox",
+        "v2_trajectory_streams",
+    )
+    for child in agent_job_children:
+        assert order.index("agent_jobs") < order.index(child)
 
 
 def test_every_registered_snapshot_table_has_a_primary_key():

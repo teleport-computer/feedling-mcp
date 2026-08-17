@@ -104,4 +104,3 @@ FEEDLING_TEST_PG='postgresql://postgres:test@127.0.0.1:55432/postgres' \
 5. Rerun Phase 4 dry-run and report remaining blockers.
 6. Stop before write freeze, Phase 4 apply, secret changes, or TEE-primary
    deployment and request a separate explicit approval.
-

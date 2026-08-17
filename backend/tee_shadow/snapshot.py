@@ -30,6 +30,10 @@ log = logging.getLogger("feedling.tee_shadow")
 # 复制）lane。超限不静默截断——那会让 TEE 悄悄缺数据；直接失败并要求人来判。
 MAX_ROWS = 200_000
 
+# Keep this pure-data ordering explicit: snapshot_order() is also consumed by
+# the admin dry-run path, which must not open a TEE connection merely to plan.
+_PARENT_FIRST = ("users", "agent_jobs")
+
 
 def snapshot_order() -> tuple[str, ...]:
     """SNAPSHOT lane 的执行顺序。
@@ -38,11 +42,9 @@ def snapshot_order() -> tuple[str, ...]:
     v2_* 子表之前。users 归 MIRROR lane（由 reconcile 灌），本 lane 通常不含
     它；但若将来有人把 users 挪进来，它必须排第一。
     """
-    tables = sorted(reg.tables_in_lane(reg.SNAPSHOT))
-    if "users" in tables:
-        tables.remove("users")
-        tables.insert(0, "users")
-    return tuple(tables)
+    tables = set(reg.tables_in_lane(reg.SNAPSHOT))
+    parents = [table for table in _PARENT_FIRST if table in tables]
+    return tuple(parents + sorted(tables - set(parents)))
 
 
 def _row_count(conn, table: str) -> int:
@@ -98,6 +100,18 @@ def _stream_rows(src_conn, table: str, cols: list[str]) -> bytes:
     return buf.getvalue()
 
 
+def _prune_target(dst, table_ident, stage_ident, pk_idents) -> None:
+    """Delete target rows absent from the staged source snapshot."""
+    key_match = sql.SQL(" AND ").join(
+        sql.SQL("target.{} IS NOT DISTINCT FROM staged.{}").format(pk, pk)
+        for pk in pk_idents
+    )
+    dst.execute(sql.SQL(
+        "DELETE FROM {} AS target WHERE NOT EXISTS "
+        "(SELECT 1 FROM {} AS staged WHERE {})"
+    ).format(table_ident, stage_ident, key_match))
+
+
 def _merge_payload(
     dst, table: str, cols: list[str], pk_cols: list[str], payload: bytes,
 ) -> None:
@@ -126,11 +140,19 @@ def _merge_payload(
             sql.SQL("{} = EXCLUDED.{}").format(sql.Identifier(c), sql.Identifier(c))
             for c in mutable_cols
         )
-        conflict_action = sql.SQL("DO UPDATE SET {}").format(assignments)
+        changed = sql.SQL(" OR ").join(
+            sql.SQL("target.{} IS DISTINCT FROM EXCLUDED.{}").format(
+                sql.Identifier(c), sql.Identifier(c),
+            )
+            for c in mutable_cols
+        )
+        conflict_action = sql.SQL("DO UPDATE SET {} WHERE {}").format(
+            assignments, changed,
+        )
     else:
         conflict_action = sql.SQL("DO NOTHING")
     dst.execute(sql.SQL(
-        "INSERT INTO {} ({}) OVERRIDING SYSTEM VALUE "
+        "INSERT INTO {} AS target ({}) OVERRIDING SYSTEM VALUE "
         "SELECT {} FROM {} ON CONFLICT ({}) {}"
     ).format(
         table_ident,
@@ -141,14 +163,7 @@ def _merge_payload(
         conflict_action,
     ))
 
-    key_match = sql.SQL(" AND ").join(
-        sql.SQL("target.{} IS NOT DISTINCT FROM staged.{}").format(pk, pk)
-        for pk in pk_idents
-    )
-    dst.execute(sql.SQL(
-        "DELETE FROM {} AS target WHERE NOT EXISTS "
-        "(SELECT 1 FROM {} AS staged WHERE {})"
-    ).format(table_ident, stage_ident, key_match))
+    _prune_target(dst, table_ident, stage_ident, pk_idents)
 
 
 def snapshot_table(table: str) -> dict:
