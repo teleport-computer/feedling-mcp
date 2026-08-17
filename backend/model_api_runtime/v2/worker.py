@@ -10088,6 +10088,13 @@ async def _run_extraction(
                     "card_user_token_residual",
                     {"lane": lane, "count": leak_count, "cards": len(items)},
                 )
+            # 源卡时间降级留痕。**必须接到生产上** —— 只在 helper 单测里传
+            # 等于零留痕。那批脏卡的 created_at 集中在 08-10~08-14,是最近两周
+            # 写的,说明产生它们的写入路径可能还开着;不留痕就把源头永久盖住了。
+            #
+            # 回调在 extraction 里是**同步**调用的,所以这里只收集事实,
+            # 等 to_actions 返回后再统一 await —— 不在同步回调里造未 await 的协程。
+            source_time_degraded: list[tuple[int, int, bool]] = []
             action_kwargs = {
                 "occurred_at": occurred_at,
                 "source_ids": source_ids,
@@ -10099,7 +10106,25 @@ async def _run_extraction(
                 # rejected deterministically by the pure mapper before any
                 # write reaches Memory Garden.
                 action_kwargs["existing_cards"] = list(ctx.get("card_items") or [])
+            if lane == "dream":
+                action_kwargs["on_source_time_degraded"] = (
+                    lambda known, missing, fb: source_time_degraded.append(
+                        (int(known), int(missing), bool(fb))
+                    )
+                )
             actions, _added, _superseded = to_actions(items, **action_kwargs)
+            for _known, _missing, _fb in source_time_degraded:
+                log.warning(
+                    "[v2.dream] source occurred_at degraded user=%s job=%s "
+                    "known=%d missing=%d created_at_fallback=%s",
+                    user_id, job_id, _known, _missing, _fb,
+                )
+                if trajectory_recorder is not None:
+                    await trajectory_recorder.record(
+                        "dream_source_time_degraded",
+                        {"known": _known, "missing": _missing,
+                         "created_at_fallback": _fb},
+                    )
             if lane == "dream":
                 # 爆炸半径保险丝:单晚要退休的卡超过花园的绝大部分 = 规模明显
                 # 不对(834→1 事故的最后防线),整个 job 失败等人查,不部分执行。
