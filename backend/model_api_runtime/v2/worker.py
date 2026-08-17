@@ -1868,6 +1868,7 @@ class _ProviderRoundtripTrace:
     deps: TurnDeps
     user_id: str
     lane: str
+    trace_id: str = ""
     provider_roundtrips: int = 0
     terminal_text_round_reached: bool = False
     terminal_text_round_reason: str = "none"
@@ -1907,6 +1908,7 @@ class _ProviderRoundtripTrace:
             self.deps.emit_debug_trace,
             self.user_id,
             "mcp.surface.provider",
+            trace_id=self.trace_id,
             status=(
                 "warning"
                 if trace_detail["dropped_tool_count"]
@@ -1940,6 +1942,7 @@ class _ProviderRoundtripTrace:
                 self.deps.emit_debug_trace,
                 self.user_id,
                 "mcp.roundtrip.provider",
+                trace_id=self.trace_id,
                 status=(
                     "warning"
                     if self.terminal_text_round_reason == "max_calls"
@@ -1967,12 +1970,13 @@ def _provider_tool_surface_callback(
     deps: TurnDeps,
     user_id: str,
     lane: str,
+    trace_id: str = "",
 ):
     """Build a best-effort content-free trace sink for one runtime lane."""
 
     if deps.emit_debug_trace is None:
         return None
-    return _ProviderRoundtripTrace(deps, user_id, lane)
+    return _ProviderRoundtripTrace(deps, user_id, lane, str(trace_id or ""))
 
 
 def _normalize_provider_trace_lane(lane: object) -> str:
@@ -1991,6 +1995,7 @@ def _empty_provider_response_debug_callback(
     deps: TurnDeps,
     user_id: str,
     lane: str,
+    trace_id: str = "",
 ):
     """Build a content-free admin trace sink for provider-empty responses."""
     if deps.emit_debug_trace is None:
@@ -2025,6 +2030,7 @@ def _empty_provider_response_debug_callback(
                 deps.emit_debug_trace,
                 user_id,
                 "provider.empty_response",
+                trace_id=str(trace_id or ""),
                 status="warning",
                 summary="V2 provider 返回空回复",
                 explain=(
@@ -7027,6 +7033,7 @@ async def _run_wake(
     tm: "TurnMetrics | None" = None,
     trajectory_recorder: "v2_trajectory.TrajectoryRecorder | None" = None,
     attempt_count: int = 0,
+    trace_id: str = "",
 ) -> str:
     """wake-lane（heartbeat/scheduled/manual_wake/screen_watch）turn：让伴侣主动开口，而不是
     回答用户刚发的消息（用户根本没发消息——这就是唤醒的定义）。同 `_run_compaction` 一样自成
@@ -7067,6 +7074,7 @@ async def _run_wake(
         deps,
         user_id,
         lane,
+        trace_id,
     )
     try:
         store = core_store.get_store(user_id)
@@ -8715,7 +8723,9 @@ async def _run_wake(
                 ),
                 on_provider_tool_surface=provider_roundtrip_trace,
                 on_empty_provider_response=(
-                    _empty_provider_response_debug_callback(deps, user_id, lane)
+                    _empty_provider_response_debug_callback(
+                        deps, user_id, lane, trace_id
+                    )
                 ),
                 fold_before_first=deps.read_messages_after_seq is not None,
                 on_progress=_report_turn_progress,
@@ -10716,7 +10726,12 @@ async def process_job(
     mcp_called_names: list[str] = []
     mcp_turn_outcome = "failed"
     provider_roundtrip_trace = (
-        _provider_tool_surface_callback(deps, user_id, lane)
+        _provider_tool_surface_callback(
+            deps,
+            user_id,
+            lane,
+            str(job.get("trace_id") or ""),
+        )
         if lane == "chat"
         else None
     )
@@ -10851,6 +10866,7 @@ async def process_job(
                 tm,
                 trajectory_recorder,
                 attempt_count=int(job.get("attempt_count") or 0),
+                trace_id=str(job.get("trace_id") or ""),
             )
         if lane in _EXTRACTION_LANES:
             # 自成一体的记忆抽取路径（capture/dream，Task 3）：build prompt → BYOK 抽取 →
@@ -13088,7 +13104,12 @@ async def process_job(
             ),
             on_provider_tool_surface=provider_roundtrip_trace,
             on_empty_provider_response=(
-                _empty_provider_response_debug_callback(deps, user_id, lane)
+                _empty_provider_response_debug_callback(
+                    deps,
+                    user_id,
+                    lane,
+                    str(job.get("trace_id") or ""),
+                )
             ),
             fold_before_first=seq_native and not ordered_chat_replies,
             on_progress=_report_turn_progress,

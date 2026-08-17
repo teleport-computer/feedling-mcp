@@ -345,7 +345,7 @@ def test_empty_provider_response_trace_is_content_free_and_admin_readable():
     deps = _minimal_deps()
     deps.emit_debug_trace = _emit
     callback = worker._empty_provider_response_debug_callback(
-        deps, "u_trace", "chat"
+        deps, "u_trace", "chat", "trace-empty-response"
     )
     assert callback is not None
     asyncio.run(callback({
@@ -358,6 +358,7 @@ def test_empty_provider_response_trace_is_content_free_and_admin_readable():
     }))
 
     assert captured["type"] == "provider.empty_response"
+    assert captured["trace_id"] == "trace-empty-response"
     assert captured["detail"] == {
         "stop_reason": "content_filter",
         "has_visible_text": False,
@@ -375,6 +376,7 @@ def test_empty_provider_response_trace_is_content_free_and_admin_readable():
         "lane",
     }
     public = data_track._debug_event_public_json(captured)
+    assert public["trace_id"] == "trace-empty-response"
     assert public["detail"] == captured["detail"]
     assert "MUST NEVER REACH DEBUG TRACE" not in str(captured)
 
@@ -413,7 +415,7 @@ def test_provider_roundtrip_trace_closed_enums_are_admin_readable():
         {"user_id": user_id, "type": event_type, **fields}
     )
     trace = worker._provider_tool_surface_callback(
-        deps, "u_roundtrip_trace", "chat"
+        deps, "u_roundtrip_trace", "chat", "trace-roundtrip"
     )
     assert trace is not None
     asyncio.run(trace({
@@ -435,6 +437,7 @@ def test_provider_roundtrip_trace_closed_enums_are_admin_readable():
     roundtrip = next(
         event for event in captured if event["type"] == "mcp.roundtrip.provider"
     )
+    assert roundtrip["trace_id"] == "trace-roundtrip"
     public = data_track._debug_event_public_json(roundtrip)
     assert public["detail"]["lane"] == "chat"
     assert public["detail"]["terminal_text_round_reason"] == (
@@ -447,6 +450,7 @@ def test_provider_roundtrip_trace_closed_enums_are_admin_readable():
     surface = next(
         event for event in captured if event["type"] == "mcp.surface.provider"
     )
+    assert surface["trace_id"] == "trace-roundtrip"
     surface_public = data_track._debug_event_public_json(surface)["detail"]
     assert surface_public["lane"].startswith("<redacted string")
     assert surface_public["terminal_text_round_reason"].startswith(

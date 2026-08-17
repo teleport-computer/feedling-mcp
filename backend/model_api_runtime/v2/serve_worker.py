@@ -4672,13 +4672,14 @@ async def _load_mcp_turn_observed(store, **kwargs):
 
 def _emit_v2_debug_trace(store, event_type: str, *, status: str,
                          summary: str, explain: str, detail: dict,
-                         dur_ms: float | None = None) -> None:
+                         dur_ms: float | None = None,
+                         trace_id: str = "") -> None:
     from diagnostics import diagnostics_core
 
     event = {
         "subsystem": "agent", "type": event_type, "status": status,
         "summary": summary, "explain": explain, "detail": detail,
-        "actor": "hosted_v2",
+        "actor": "hosted_v2", "trace_id": str(trace_id or ""),
     }
     if dur_ms is not None:
         event["dur_ms"] = dur_ms
