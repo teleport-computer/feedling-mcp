@@ -214,20 +214,30 @@ def test_dream_unusable_source_time_does_not_retire_or_write(monkeypatch):
     ]
     saved = _install_storage(monkeypatch, moments)
 
-    with pytest.raises(ValueError, match="dream_source_occurred_at_unavailable"):
-        extraction.consolidations_to_actions(
-            [{
-                "op": "merge",
-                "card_ids": ["memory-valid", "memory-missing"],
-                "rationale": "同一线索",
-                "result": {"summary": "new", "content": "new body"},
-            }],
-            occurred_at="2099-12-31T23:59:59Z",
-            source_ids=[],
-            build_envelope=_builder(user_id),
-            existing_cards=moments,
-        )
+    # 2026-08-17(Seven 定):一张源卡缺时间不再整轮失败,改为退到已知的最晚。
+    # ⚠️ 本用例**真正在守的两件事没变**:①不该写就别写 ②不该退休就别退休。
+    # 只是「不该」的条件变了 —— 从「有一张缺时间」变成「拿不到源卡」。
+    degraded = []
+    actions = extraction.consolidations_to_actions(
+        [{
+            "op": "merge",
+            "card_ids": ["memory-valid", "memory-missing"],
+            "rationale": "同一线索",
+            "result": {"summary": "new", "content": "new body"},
+        }],
+        occurred_at="2099-12-31T23:59:59Z",
+        source_ids=[],
+        build_envelope=_builder(user_id),
+        existing_cards=moments,
+        on_source_time_degraded=lambda k, m, fb: degraded.append((k, m, fb)),
+    )
 
+    assert actions, "一张源卡缺时间就整轮产不出动作 —— 那正是要修掉的阻塞"
+    assert degraded == [(1, 1, False)], "降级没留痕"
+    payload = str(actions)
+    assert "2026-02-08T09:00:00Z" in payload, "没有退到已知的那张源卡时间"
+    assert "2099" not in payload, "job 时间泄漏成事件时间 —— 这条红线不能破"
+    # 纯 mapper 不落库:退休与写入由 worker 执行,这一层只产动作。
     assert saved == []
     assert [moment["status"] for moment in moments] == ["active", "active"]
 
