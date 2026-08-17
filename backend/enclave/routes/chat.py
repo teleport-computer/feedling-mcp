@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import time
 from urllib.parse import quote
 
 import anyio.to_thread
@@ -15,6 +16,7 @@ from fastapi import APIRouter
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
+from memory_garden import observability as mg_observability
 from memory_garden.scoring.relevance import (
     select_context_memories,
     select_context_memories_with_trace,
@@ -266,24 +268,43 @@ def _build_context_memories(moments, decrypted, query_args):
     # does not affect the context_memories selection below.
     _attach_quoted_memories(decrypted, cards)
 
+    # 无论调用方要不要实时 trace，都算一条**内容无关**的记录带出去 ——
+    # enclave 没有数据库发不了 debug_trace，由调用方（consumer / hosted turn）落库。
+    # 这是 2026-08-17 补的最大盲区：此前「每轮注入了哪几张卡」服务端查不到，
+    # 导致排查只能靠推断（而那次推断后来被对照实验推翻）。
+    started = time.monotonic()
+    selection_trace: dict | None = None
+
     if use_readside:
-        context_memories, context_memory_trace = readside.select_context_memories_via_readside(
+        mode = "readside_relevance"
+        context_memories, selection_trace = readside.select_context_memories_via_readside(
             cards,
             latest_user_text,
             cap=8,
         )
-        if not want_trace:
-            context_memory_trace = None
-    elif want_trace:
-        context_memories, context_memory_trace = select_context_memories_with_trace(
+        context_memory_trace = selection_trace if want_trace else None
+    else:
+        mode = f"bucketed:{context_mode or 'default'}"
+        # 原本只有 want_trace 时才走带 trace 的那支；现在一律走它，
+        # 因为落库记录需要 selection_trace。两个函数选出的卡完全一致
+        # （带 trace 那支只是多返回一份说明），所以行为不变。
+        context_memories, selection_trace = select_context_memories_with_trace(
             cards,
             latest_user_text,
             mode=context_mode,
         )
-    else:
-        context_memories = select_context_memories(cards, latest_user_text, mode=context_mode)
+        context_memory_trace = selection_trace if want_trace else None
 
-    return context_memories, context_memory_trace
+    context_memory_log = mg_observability.injection_record(
+        mode=mode,
+        query=latest_user_text,
+        candidate_pool=len(cards),
+        selection_trace=selection_trace,
+        injected_ids=[str(c.get("id") or "") for c in context_memories],
+        cap=8,
+        duration_ms=(time.monotonic() - started) * 1000.0,
+    )
+    return context_memories, context_memory_trace, context_memory_log
 
 
 # HEAD 显式声明（同 frames.py）：Flask 自动给 GET 挂 HEAD，FastAPI 不会；
@@ -386,20 +407,27 @@ async def v1_chat_history(request: Request):
             listing_task.cancel()  # 解密意外失败时不留孤儿任务
         raise
 
+    context_memory_log: dict | None = None
     if listing_task is not None:
         try:
             listing = await listing_task
             moments = listing.get("moments", []) or []
-            context_memories, context_memory_trace = await anyio.to_thread.run_sync(
+            context_memories, context_memory_trace, context_memory_log = await anyio.to_thread.run_sync(
                 _build_context_memories, moments, decrypted, query_args)
         except Exception as e:
             print(f"[chat/history:{user_id}] context_memories failed: {e}")
             context_memories, context_memory_trace = [], None
+            # 失败也要留痕 —— 否则「这轮一张都没注入」和「挑卡整个崩了」
+            # 在日志里长得一模一样，排查时分不开。
+            context_memory_log = {"mode": "failed", "error": type(e).__name__,
+                                  "counts": {"candidate_pool": len(moments), "injected": 0}}
 
     payload = {
         "user_id": user_id,
         "messages": decrypted,
         "context_memories": context_memories,
+        # 内容无关的注入记录，由调用方落库（enclave 自己没有数据库）。
+        "context_memory_log": context_memory_log,
         "total": hist.get("total", len(decrypted)),
         "decrypt_errors": errors,
     }
