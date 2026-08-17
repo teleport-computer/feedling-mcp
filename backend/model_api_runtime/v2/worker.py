@@ -2033,6 +2033,235 @@ _CONTEXT_TRUNCATION_COUNT_KEYS = (
     "worldbook_truncated",
 )
 
+_PROMPT_FRONTIER_TRACE_EVENTS = frozenset({
+    "v2.prompt_frontier.budget",
+    "v2.prompt_frontier.exhausted",
+})
+_PROMPT_FRONTIER_TRACE_LANES = frozenset({"chat", *_WAKE_LANES})
+_PROMPT_FRONTIER_LIMIT_SOURCES = frozenset({
+    "provider_metadata",
+    "caller",
+    "audited_family",
+    "unaudited_default",
+    "deployment_override",
+})
+_PROMPT_FRONTIER_REQUIRED_COMPONENTS = frozenset({
+    "message_context",
+    "tool_transcript",
+    "required_tool_schemas",
+})
+_PROMPT_FRONTIER_WARNING_RATIO = 0.70
+
+
+def _prompt_frontier_message_component_bytes(
+    messages: Iterable[Any],
+) -> tuple[v2_prompt_frontier.PromptByteComponent, ...]:
+    """Project exact assembled messages to closed, content-free byte families."""
+
+    totals: dict[str, int] = {}
+    for message in messages:
+        if isinstance(message, ToolExchange):
+            name = "tool_transcript"
+        elif not isinstance(message, dict):
+            name = "tail"
+        else:
+            role = str(message.get("role") or "")
+            content = message.get("content")
+            text = content if isinstance(content, str) else ""
+            if role == "system":
+                name = "system"
+            elif message.get(v2_screen_chat.MESSAGE_TAG) is True:
+                name = "screen"
+            elif text.startswith(context.WORLD_BOOK_CONTEXT_HEADER + "\n"):
+                name = "worldbook"
+            elif text.startswith(context._SUMMARY_HEADER):
+                name = "summary"
+            elif any(
+                text.startswith(prefix)
+                for prefix in (
+                    context.RUNTIME_CONTEXT_HEADER + "\n",
+                    context.TEMPORAL_CONTEXT_HEADER + "\n",
+                    context.COVERAGE_HOLE_HEADER + "\n",
+                    context.PROACTIVE_TURN_BOUNDARY,
+                )
+            ):
+                name = "runtime_data"
+            else:
+                name = "tail"
+        totals[name] = totals.get(name, 0) + (
+            v2_prompt_frontier.prompt_structure_utf8_bytes(message)
+        )
+    return tuple(
+        v2_prompt_frontier.PromptByteComponent(name=name, bytes=byte_count)
+        for name in (
+            "system",
+            "summary",
+            "tail",
+            "worldbook",
+            "runtime_data",
+            "screen",
+            "tool_transcript",
+        )
+        if (byte_count := totals.get(name, 0)) > 0
+    )
+
+
+def _validated_prompt_frontier_trace_components(
+    components: Iterable[Any],
+) -> list[dict[str, Any]]:
+    """Allow only closed names and integer byte counts into plaintext trace."""
+
+    normalized = v2_prompt_frontier.normalize_prompt_byte_components(
+        tuple(components)
+    )
+    return [
+        {"name": item.name, "bytes": item.bytes}
+        for item in normalized
+    ]
+
+
+def _prompt_frontier_trace_detail(
+    observation: Any,
+    *,
+    lane: str,
+) -> tuple[str, str, dict[str, Any]]:
+    """Build one same-shape success/exhaustion observation with no prompt text."""
+
+    safe_lane = str(lane or "")
+    if safe_lane not in _PROMPT_FRONTIER_TRACE_LANES:
+        raise ValueError("prompt frontier trace lane is not in the closed set")
+    if isinstance(observation, v2_prompt_frontier.PromptFrontierPlan):
+        budget = observation.budget
+        required_tokens = sum(
+            item.estimated_tokens
+            for item in observation.decisions
+            if item.required
+        )
+        estimated_input_tokens = int(observation.estimated_input_tokens)
+        context_window_tokens = int(budget.context_window_tokens)
+        input_budget_tokens = int(budget.input_budget_tokens)
+        output_reserve_tokens = int(budget.output_reserve_tokens)
+        safety_margin_tokens = int(budget.safety_margin_tokens)
+        limit_source = str(observation.model_limit.source)
+        required_components = [
+            item.name for item in observation.decisions if item.required
+        ]
+        event_type = "v2.prompt_frontier.budget"
+        utilization = (
+            estimated_input_tokens / input_budget_tokens
+            if input_budget_tokens > 0
+            else 1.0
+        )
+        status = (
+            "warning"
+            if utilization >= _PROMPT_FRONTIER_WARNING_RATIO
+            else "ok"
+        )
+        utf8_bytes_per_token = float(observation.utf8_bytes_per_token)
+    elif isinstance(observation, v2_prompt_frontier.PromptFrontierExhausted):
+        required_tokens = int(observation.required_tokens)
+        estimated_input_tokens = required_tokens
+        context_window_tokens = int(observation.context_window_tokens)
+        input_budget_tokens = int(observation.input_budget_tokens)
+        output_reserve_tokens = observation.output_reserve_tokens
+        safety_margin_tokens = observation.safety_margin_tokens
+        if output_reserve_tokens is None or safety_margin_tokens is None:
+            raise ValueError("prompt frontier exhaustion lacks budget partitions")
+        output_reserve_tokens = int(output_reserve_tokens)
+        safety_margin_tokens = int(safety_margin_tokens)
+        limit_source = str(observation.limit_source)
+        required_components = list(observation.required_components)
+        event_type = "v2.prompt_frontier.exhausted"
+        status = "warning"
+        if observation.utf8_bytes_per_token is None:
+            raise ValueError("prompt frontier exhaustion lacks estimator ratio")
+        utf8_bytes_per_token = float(observation.utf8_bytes_per_token)
+    else:
+        raise ValueError("unsupported prompt frontier observation")
+    if event_type not in _PROMPT_FRONTIER_TRACE_EVENTS:
+        raise ValueError("prompt frontier trace event is not in the closed set")
+    if limit_source not in _PROMPT_FRONTIER_LIMIT_SOURCES:
+        raise ValueError("prompt frontier limit source is not in the closed set")
+    if any(
+        str(name) not in _PROMPT_FRONTIER_REQUIRED_COMPONENTS
+        for name in required_components
+    ):
+        raise ValueError("required prompt component is not in the closed set")
+    if not math.isfinite(utf8_bytes_per_token) or utf8_bytes_per_token <= 0:
+        raise ValueError("prompt frontier estimator ratio is invalid")
+    detail = {
+        "context_window_tokens": context_window_tokens,
+        "input_budget_tokens": input_budget_tokens,
+        "required_tokens": required_tokens,
+        "estimated_input_tokens": estimated_input_tokens,
+        "overflow_tokens": max(0, required_tokens - input_budget_tokens),
+        "output_reserve_tokens": output_reserve_tokens,
+        "safety_margin_tokens": safety_margin_tokens,
+        "utf8_bytes_per_token": utf8_bytes_per_token,
+        "limit_source": limit_source,
+        "lane": safe_lane,
+        "required_components": required_components,
+        "components": _validated_prompt_frontier_trace_components(
+            observation.component_bytes
+        ),
+    }
+    return event_type, status, detail
+
+
+def _emit_prompt_frontier_trace(
+    deps: TurnDeps,
+    user_id: str,
+    observation: Any,
+    *,
+    lane: str,
+) -> None:
+    """Best-effort final debug-trace boundary for one prompt budget decision."""
+
+    if deps.emit_debug_trace is None:
+        return
+    try:
+        event_type, status, detail = _prompt_frontier_trace_detail(
+            observation,
+            lane=lane,
+        )
+        deps.emit_debug_trace(
+            user_id,
+            event_type,
+            status=status,
+            summary="V2 prompt 预算观测",
+            explain=(
+                "仅记录闭集组件名、字节/预算计数、lane 与 limit source；"
+                "不记录 prompt、工具 schema、回复或用户正文。"
+            ),
+            detail=detail,
+        )
+    except Exception as exc:  # noqa: BLE001 — observability cannot fail a turn
+        log.warning(
+            "[v2.prompt_frontier_trace] emit failed user=%s code=%s",
+            user_id,
+            type(exc).__name__.lower(),
+        )
+
+
+def _prompt_frontier_exhaustion_trace_callback(
+    deps: TurnDeps,
+    user_id: str,
+    lane: str,
+):
+    if deps.emit_debug_trace is None:
+        return None
+
+    async def _emit(observation: Any) -> None:
+        await asyncio.to_thread(
+            _emit_prompt_frontier_trace,
+            deps,
+            user_id,
+            observation,
+            lane=lane,
+        )
+
+    return _emit
+
 
 def _emit_context_truncation_trace(
     deps: TurnDeps,
@@ -3018,6 +3247,7 @@ def _ledger_tapped_sink(
     *,
     deps: TurnDeps | None = None,
     user_id: str = "",
+    lane: str = "chat",
 ):
     """`recorder.record` plus the plaintext ledger mirror, for tool_loop.
 
@@ -3034,6 +3264,13 @@ def _ledger_tapped_sink(
             await recorder.record(event_kind, payload)
             await _mirror_provider_attempt(recorder, event_kind, payload)
         if event_kind == "provider_request" and deps is not None:
+            await asyncio.to_thread(
+                _emit_prompt_frontier_trace,
+                deps,
+                user_id,
+                payload.get("prompt_frontier"),
+                lane=lane,
+            )
             await asyncio.to_thread(
                 _emit_context_truncation_trace,
                 deps,
@@ -4184,6 +4421,9 @@ def _make_build_messages_fn(
                     safety_margin_tokens=safety_margin_tokens,
                     utf8_bytes_per_token=utf8_bytes_per_token,
                     image_reserve_tokens=image_reserve_tokens,
+                    message_component_bytes=(
+                        _prompt_frontier_message_component_bytes(messages)
+                    ),
                 )
                 return messages, plan
 
@@ -8581,7 +8821,14 @@ async def _run_wake(
                     build_messages,
                     provider_config=provider_config,
                 )
-            except v2_prompt_frontier.PromptFrontierExhausted:
+            except v2_prompt_frontier.PromptFrontierExhausted as exc:
+                await asyncio.to_thread(
+                    _emit_prompt_frontier_trace,
+                    deps,
+                    user_id,
+                    exc,
+                    lane=lane,
+                )
                 if tm is not None:
                     tm.record_prompt_frontier_exhaustion()
                 if wake_snapshot_seq <= watermark_seq:
@@ -8627,7 +8874,14 @@ async def _run_wake(
                         build_messages,
                         provider_config=provider_config,
                     )
-                except v2_prompt_frontier.PromptFrontierExhausted:
+                except v2_prompt_frontier.PromptFrontierExhausted as exc:
+                    await asyncio.to_thread(
+                        _emit_prompt_frontier_trace,
+                        deps,
+                        user_id,
+                        exc,
+                        lane=lane,
+                    )
                     if tm is not None:
                         tm.record_prompt_frontier_exhaustion()
                     raise
@@ -8706,6 +8960,7 @@ async def _run_wake(
                     trajectory_recorder,
                     deps=deps,
                     user_id=user_id,
+                    lane=lane,
                 ),
                 outbound_blocking_read_tool_names=_PRIVATE_READ_TOOLS,
                 outbound_blocking_read_tool_predicate=_read_blocks_later_outbound,
@@ -8736,6 +8991,11 @@ async def _run_wake(
                     tm.record_prompt_frontier_exhaustion
                     if tm is not None
                     else None
+                ),
+                on_prompt_frontier_exhausted_detail=(
+                    _prompt_frontier_exhaustion_trace_callback(
+                        deps, user_id, lane
+                    )
                 ),
             )
             if shadow_decision_allowed is None:
@@ -12950,7 +13210,14 @@ async def process_job(
                     build_messages,
                     provider_config=provider_config,
                 )
-            except v2_prompt_frontier.PromptFrontierExhausted:
+            except v2_prompt_frontier.PromptFrontierExhausted as exc:
+                await asyncio.to_thread(
+                    _emit_prompt_frontier_trace,
+                    deps,
+                    user_id,
+                    exc,
+                    lane=lane,
+                )
                 tm.record_prompt_frontier_exhaustion()
                 pending_seqs = [
                     int(row["seq"])
@@ -13011,7 +13278,14 @@ async def process_job(
                         build_messages,
                         provider_config=provider_config,
                     )
-                except v2_prompt_frontier.PromptFrontierExhausted:
+                except v2_prompt_frontier.PromptFrontierExhausted as exc:
+                    await asyncio.to_thread(
+                        _emit_prompt_frontier_trace,
+                        deps,
+                        user_id,
+                        exc,
+                        lane=lane,
+                    )
                     tm.record_prompt_frontier_exhaustion()
                     raise
 
@@ -13079,6 +13353,7 @@ async def process_job(
                 trajectory_recorder,
                 deps=deps,
                 user_id=user_id,
+                lane=lane,
             ),
             extra_tool_specs=offered_mcp_tool_specs,
             refresh_extra_tool_specs=_current_offered_mcp_tool_specs,
@@ -13107,6 +13382,11 @@ async def process_job(
             on_tail_window=_tail_window_callback(tm),
             on_prompt_frontier_exhaustion=(
                 tm.record_prompt_frontier_exhaustion
+            ),
+            on_prompt_frontier_exhausted_detail=(
+                _prompt_frontier_exhaustion_trace_callback(
+                    deps, user_id, lane
+                )
             ),
         )
         if pushed_screen_frame_ids:

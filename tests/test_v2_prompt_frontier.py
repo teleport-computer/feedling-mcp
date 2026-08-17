@@ -1232,3 +1232,71 @@ def test_adaptive_required_exhaustion_is_counted_and_still_raised(monkeypatch):
 
     assert counted == [True]
     assert provider_calls == []
+
+
+def test_provider_round_carries_closed_component_bytes_on_success_and_exhaustion():
+    tool = ToolSpec(
+        name="lookup",
+        description="fixed schema",
+        parameters={"type": "object", "properties": {}},
+    )
+    message_bytes = (
+        frontier.PromptByteComponent("system", 321),
+        frontier.PromptByteComponent("tail", 123),
+    )
+    plan = frontier.plan_provider_round(
+        model_limit=_model_limit(8_192),
+        messages=[
+            {"role": "system", "content": "fixed system"},
+            {"role": "user", "content": "private user body"},
+        ],
+        tools=[tool],
+        output_reserve_tokens=512,
+        safety_margin_tokens=512,
+        message_component_bytes=message_bytes,
+    )
+
+    assert [(item.name, item.bytes) for item in plan.component_bytes] == [
+        ("system", 321),
+        ("tail", 123),
+        (
+            "tools",
+            frontier.prompt_structure_utf8_bytes([tool]),
+        ),
+    ]
+    assert plan.utf8_bytes_per_token == 1.0
+
+    with pytest.raises(frontier.PromptFrontierExhausted) as caught:
+        frontier.plan_provider_round(
+            model_limit=_model_limit(2_048),
+            messages=[{"role": "system", "content": "x" * 1_500}],
+            tools=[tool],
+            output_reserve_tokens=512,
+            safety_margin_tokens=512,
+            message_component_bytes=(
+                frontier.PromptByteComponent("system", 1_500),
+            ),
+        )
+
+    error = caught.value
+    assert error.output_reserve_tokens == 512
+    assert error.safety_margin_tokens == 512
+    assert error.utf8_bytes_per_token == 1.0
+    # Optional schemas are not blamed for a required-message failure.
+    assert [(item.name, item.bytes) for item in error.component_bytes] == [
+        ("system", 1_500),
+    ]
+
+
+def test_prompt_byte_component_guard_rejects_extra_plaintext_fields():
+    with pytest.raises(ValueError, match="exactly name and bytes"):
+        frontier.normalize_prompt_byte_components(({
+            "name": "system",
+            "bytes": 12,
+            "content": "private prompt body",
+        },))
+
+
+def test_prompt_byte_component_guard_rejects_plaintext_as_component_name():
+    with pytest.raises(ValueError, match="name is not in the closed set"):
+        frontier.PromptByteComponent("她说她今天很累", 12)
