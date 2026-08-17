@@ -1260,7 +1260,7 @@ def renew_job_lease(
             return cur.rowcount == 1
 
 
-_FAIL_BACKOFF_WAKE_LANES = frozenset({"heartbeat", "scheduled"})
+_FAIL_BACKOFF_WAKE_LANES = frozenset({"heartbeat"})
 
 
 def _latest_genuine_user_seq_on_cursor(cur, user_id: str) -> int:
@@ -11737,7 +11737,9 @@ def due_scheduled_users(*, now: float | None = None, limit: int = 500) -> list[s
     `DISTINCT ON (user_id, item_key) ... ORDER BY seq DESC` 只取每个 timer 的**最新一版**，
     否则早已 fire 的 timer 会被当成 pending 反复唤醒。
 
-    到期 = pending，或 claimed 但 claim 租约已过期（持有者死了）。触发的原子性由
+    到期 = pending，或 claimed 但 claim 租约已过期（持有者死了）。通用主动唤醒
+    失败退避只属于 heartbeat，不能推迟明确的提醒交付；但 BYOK 支付冷却仍会阻止
+    必然失败的模型调用。触发的原子性由
     `ScheduledWakeServiceV2.fire_due_timers` 内部的 claim_due CAS 保证——本函数只是个
     廉价的候选人筛子，允许假阳性（多个 scheduler 抢同一个 timer 是安全的）。"""
     ts = time.time() if now is None else float(now)
@@ -11754,11 +11756,8 @@ def due_scheduled_users(*, now: float | None = None, limit: int = 500) -> list[s
         "WHERE COALESCE(NULLIF(doc->>'due_at','')::float8, 0) <= %s "
         "  AND (doc->>'status' = 'pending' OR (doc->>'status' = 'claimed' "
         "       AND COALESCE(NULLIF(doc->>'claim_expires_at','')::float8, 0) <= %s)) "
-        "  AND (schedule.proactive_backoff_until IS NULL "
-        "       OR schedule.proactive_backoff_until <= to_timestamp(%s) "
-        "       OR schedule.proactive_fail_user_seq < "
-        + _LATEST_GENUINE_USER_SEQ_SQL
-        + ") "
+        "  AND (schedule.payment_cooldown_until IS NULL "
+        "       OR schedule.payment_cooldown_until <= to_timestamp(%s)) "
         "LIMIT %s"
     )
     with _pool().connection() as conn:

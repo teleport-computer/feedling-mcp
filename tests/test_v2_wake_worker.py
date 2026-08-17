@@ -1164,7 +1164,8 @@ def test_scheduled_thinking_only_remains_a_must_deliver_failure(monkeypatch):
         if message.get("role") == "system"
     )
     assert worker._OPTIONAL_WAKE_SELF_THINKING_INSTRUCTION.strip() not in system_text
-    assert jobs_store.get_wake_schedule(uid)["proactive_backoff_until"] is not None
+    schedule = jobs_store.get_wake_schedule(uid)
+    assert schedule is None or schedule["proactive_backoff_until"] is None
 
 
 def test_run_scheduled_wake_prompts_with_the_exact_due_reminders(monkeypatch):
@@ -2014,6 +2015,29 @@ def test_scheduled_failure_retry_wiring_source_guard():
         f"worker.py:{run_wake.lineno} scheduled failure retry wiring missing; "
         f"found calls at {retry_calls}"
     )
+
+
+def test_scheduled_is_excluded_from_failure_backoff_source_guard():
+    for source_path in (Path(worker.__file__), Path(jobs_store.__file__)):
+        tree = ast.parse(source_path.read_text())
+        assignments = [
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Assign)
+            and any(
+                isinstance(target, ast.Name)
+                and target.id == "_FAIL_BACKOFF_WAKE_LANES"
+                for target in node.targets
+            )
+        ]
+        assert len(assignments) == 1, (
+            f"{source_path}: expected one _FAIL_BACKOFF_WAKE_LANES assignment"
+        )
+        assignment = assignments[0]
+        assert ast.literal_eval(assignment.value.args[0]) == {"heartbeat"}, (
+            f"{source_path}:{assignment.lineno}: scheduled must not participate "
+            "in generic failure backoff"
+        )
 
 
 def test_scheduled_transient_failure_retries_then_succeeds_without_notice(

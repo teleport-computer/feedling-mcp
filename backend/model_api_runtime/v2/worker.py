@@ -953,7 +953,7 @@ _WAKE_FAIL_BACKOFF_BASE_SEC = float(
 _WAKE_FAIL_BACKOFF_CAP_SEC = float(
     os.environ.get("PROACTIVE_FAIL_BACKOFF_CAP_SEC", "3600")
 )
-_FAIL_BACKOFF_WAKE_LANES = frozenset({"heartbeat", "scheduled"})
+_FAIL_BACKOFF_WAKE_LANES = frozenset({"heartbeat"})
 _SCHEDULED_FAILURE_RETRY_DELAYS_SEC = (30.0, 120.0)
 
 _DEGENERATE_REPLY_FALLBACK = (
