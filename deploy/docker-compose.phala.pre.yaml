@@ -346,7 +346,7 @@ services:
       FEEDLING_V2_TRAJECTORY_INSPECT_ENABLED: "${FEEDLING_V2_TRAJECTORY_INSPECT_ENABLED:-0}"
       # Maximum source rows advanced by one metadata-only coverage batch.
       FEEDLING_V2_COMPACTION_BATCH_MSGS: "${FEEDLING_V2_COMPACTION_BATCH_MSGS:-50}"
-      # MEMORY/USER prompt replacement is normal-on and aligned with prod/test.
+      # MEMORY/STYLE prompt replacement is normal-on and aligned with prod/test.
       FEEDLING_V2_PROFILE_ENABLED: "1"
       FEEDLING_V2_PROMPT_CATCHUP_DEADLINE_SEC: "${FEEDLING_V2_PROMPT_CATCHUP_DEADLINE_SEC:-600}"
       # 20 -> 50 (2026-07-28). This threshold decides whether a turn enters

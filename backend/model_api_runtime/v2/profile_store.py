@@ -290,13 +290,13 @@ def build_profile_document_patching_fields(
     disabled: bool | None = None,
     seal_text: Callable[[str, str], dict] = _seal_text,
 ) -> dict:
-    """Seal touched fields and byte-preserve untouched encrypted fields.
+    """Write touched fields and byte-preserve untouched content shapes.
 
     Genesis can derive only MEMORY or only STYLE from one upload.  Requiring it
     to decrypt and reseal the untouched side adds an enclave dependency and can
-    change ciphertext for data the pass did not own.  A missing prior side is
-    initialized as an encrypted empty string so the paired-field contract stays
-    atomic.
+    change content for data the pass did not own. A missing prior side is
+    initialized through ``seal_text`` using the owner's effective content shape
+    so the paired-field contract stays atomic.
     """
     prior = (
         validate_profile_document(previous)

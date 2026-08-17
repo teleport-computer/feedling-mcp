@@ -12,12 +12,12 @@ change must not be interpreted as an API guarantee.
 
 - **Genesis imports now publish the identity card, MEMORY/STYLE, and the
   transitional persona together.** Genesis reuses Runtime V2's bounded profile
-  generation and encrypted CAS storage, requires a non-empty field when the
-  current upload reducer proposes corresponding memory or persona/voice
-  material, and copies an untouched encrypted side without decrypting or
-  resealing it. Genesis does not read the existing Garden; scheduled profile
-  refresh remains the exclusive Garden-to-MEMORY/STYLE path, while add-memory
-  imports only write cards. Identity edits made while a distill is running win
+  generation and content-shape-aware CAS storage, requires a non-empty field
+  when the current upload reducer proposes corresponding memory or persona/voice
+  material, and copies an untouched side byte-for-byte regardless of whether it
+  is plaintext or encrypted. Genesis does not read the existing Garden;
+  scheduled profile refresh remains the exclusive Garden-to-MEMORY/STYLE path,
+  while add-memory imports only write cards. Identity edits made while a distill is running win
   at canonical field granularity; `GET /v1/identity/changes` now adds a
   content-free `fields` array to new change records so this lock is observable
   and deterministic. Legacy records without field labels trigger a traced
@@ -137,14 +137,14 @@ change must not be interpreted as an API guarantee.
 - **Runtime V2 Profile generation now recovers without another Chat turn.**
   Retryable provider failures persist the exact Profile Job as delayed pending
   work with exponential backoff from five minutes to six hours; malformed
-  Memory/User output receives at most three delayed retries. Provider setup
+  MEMORY/STYLE output receives at most three delayed retries. Provider setup
   failures wait for a successful configuration change, source failures wait for
   the Memory Garden witness to change, and unknown internal failures terminate
   instead of looping. Delayed Jobs occupy no worker slot and do not make the
   watchdog treat an idle pool as wedged. Ordinary post-Chat freshness checks do
   not accelerate them, while a successful provider repair or the existing Dream
   force trigger can make the same Job ready immediately. Runtime V2 semantic
-  conversation compaction remains removed, so Memory/User is its only long-term
+  conversation compaction remains removed, so MEMORY/STYLE is its only long-term
   semantic layer beside content-free deterministic history coverage.
 
 - **Hosted Runtime V2 isolates foreground Chat from background maintenance.**
@@ -880,12 +880,13 @@ change must not be interpreted as an API guarantee.
   retries now fetch the requested message directly rather than searching only
   the newest 20 Chat rows. Requests with neither credential still fail closed.
 
-- **Runtime V2 can supply a bounded Memory/User profile as its long-term
+- **Runtime V2 can supply a bounded MEMORY/STYLE profile as its long-term
   semantic layer.** The default-off `FEEDLING_V2_PROFILE_ENABLED` switch gates
   both generation and turn-time selection. Only an `ok`, non-disabled profile
-  whose two encrypted fields both validate and decrypt is injected, as one
-  early user-role block explicitly labeled model-derived untrusted data.
-  Missing, pending, degraded, disabled, invalid, or undecryptable profiles keep
+  whose two content fields validate and resolve is injected into the trusted
+  system prefix: plaintext fields are read locally and ciphertext fields are
+  decrypted through the enclave. Missing, pending, degraded, disabled, invalid,
+  or unreadable profiles keep
   deterministic history coverage plus the bounded verbatim tail, but no legacy
   semantic summary. Verbatim replay wins on conflict, coverage gaps remain a
   separate late data notice, and OpenAI Chat and Anthropic cache
@@ -895,8 +896,8 @@ change must not be interpreted as an API guarantee.
 - **Runtime V2 stages bounded profile generation and restores the pooled
   worker's Memory lanes.** A new low-priority `profile` job reads the complete
   eligible Memory Garden with a scoped runtime token, rejects truncated views,
-  generates Memory/User fields with a bounded provider-call budget, and writes
-  them through the encrypted profile CAS. Runtime V2 cutover, successful dream
+  generates MEMORY/STYLE fields with a bounded provider-call budget, and writes
+  them through the content-shape-aware profile CAS. Runtime V2 cutover, successful dream
   writes, and best-effort post-Chat freshness checks can enqueue the job;
   delayed retryable failures persist the exact Job without requiring another
   Chat, and the seven-day stale floor runs independently of the dream setting.
@@ -916,13 +917,14 @@ change must not be interpreted as an API guarantee.
   respond to the actual change. The pooled worker also runs the independently
   consent-gated Memory Capture and Dream producers; each fleet lane remains
   independently reversible through deployment configuration.
-- **Encrypted Runtime V2 profile storage is staged for the bounded
-  Memory/User rollout.** Both fields share one `v2_agent_profile` CAS document
-  but remain separate shared encrypted envelopes. PostgreSQL and the TEE shadow
-  receive the same ciphertext document; only state, character counts, source
-  counts, and generation/retry timestamps remain plaintext metadata.
+- **Content-shape-aware Runtime V2 profile storage is staged for the bounded
+  MEMORY/STYLE rollout.** Both fields share one `v2_agent_profile` CAS document
+  but remain separate content records. Each follows the owner's effective
+  content shape, and PostgreSQL plus the TEE mirror preserve that shape; only
+  state, character counts, source counts, and generation/retry timestamps are
+  always plaintext metadata.
 
-- **Runtime V2 removed provider-backed conversation summarization.** MEMORY/USER
+- **Runtime V2 removed provider-backed conversation summarization.** MEMORY/STYLE
   is now the sole long-term semantic layer. Conversation maintenance advances
   exact history coverage with local count sentinels, while encrypted Chat rows
   remain the durable source ledger. Existing model-authored segments remain
