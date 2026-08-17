@@ -21,6 +21,24 @@ instance; the second Heavy slot remains available for Dream, Capture, and other
 maintenance. Provider and write stages report progress so a slow but advancing
 profile is not mistaken for a hung Job.
 
+On Chat and proactive wake turns, non-empty MEMORY and STYLE fields enter the
+trusted system prefix after the current identity card (or transitional Genesis
+persona fallback) and before general behavior rules. They are presented as the
+companion's own memory and learned speaking style, while the verbatim
+conversation remains authoritative on conflict. World Book and changing runtime
+context stay in non-privileged application-data messages. A successful profile
+refresh changes that user's provider prompt-cache prefix once.
+
+Genesis onboarding and identity redistillation do not wait for the later
+maintenance refresh to create this profile. They use only valid cards,
+persona, and voice material produced from the current upload; Genesis never
+reads the existing encrypted Garden. The fields share Runtime V2's validation
+and encrypted CAS contract, and an untouched side keeps its existing envelope
+byte-for-byte. Profile publication remains required for these two paths.
+Add-memory imports do not write a profile at all: they write cards, changing
+the Garden fingerprint that causes the ordinary profile lane to perform the
+later full-Garden refresh.
+
 | Operation | Returns |
 | --- | --- |
 | `POST /v1/memory/add` | The stored v1 encrypted record. |

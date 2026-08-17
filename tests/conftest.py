@@ -261,6 +261,9 @@ if not _provisioned:
     # Pure-unit modules that don't touch the DB — keep them collectable so a
     # no-Postgres dev machine still runs something useful.
     _PURE_UNIT = {
+    "test_memory_garden_card_fields.py",
+    "test_route_b_card_shape_recall.py",
+    "test_route_b_sensitive_gate.py",
         "test_card_guard.py",
         # Memory Garden 内核（2026-08-14）：纯函数包，零 DB / 零网络。
         # 六个文件都在「DATABASE_URL 指向不可达地址」的环境下实测通过。
@@ -351,6 +354,10 @@ if not _provisioned:
         "test_consumer_web_advertise.py",
         "test_identity_redistill_ipc.py",
         "test_redistill_server_merge.py",
+        # Genesis dual-write + per-field concurrency fences are fully mocked
+        # units; keep them collectable when local PostgreSQL is unavailable.
+        "test_genesis_profile_dual_write.py",
+        "test_genesis_identity_field_lock.py",
         "test_update_stall_reason.py",
         "test_resident_maintenance_unit.py",
         "test_genesis_failure_codes.py",
@@ -385,6 +392,8 @@ if not _provisioned:
         # 也就是说无 PG 的机器上它们一直没跑。superseded 那条新用例就在
         # test_v2_tool_loop.py 里,不登记等于白写。
         "test_v2_tool_loop.py",
+        # Runtime V2 provider-round/timeout defaults: AST-only source guard.
+        "test_v2_turn_budget_defaults.py",
         "test_chat_resident_consumer_image.py",
         # MCP 工具面可观测性(2026-08-09)。纯:只解析字符串 + 读两个 JS 源文件。
         "test_user_mcp_surface_trace.py",

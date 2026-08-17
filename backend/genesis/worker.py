@@ -9,6 +9,7 @@ reducer output back to the backend apply route.
 from __future__ import annotations
 
 import base64
+import asyncio
 import json
 import os
 import re
@@ -25,6 +26,7 @@ from genesis import checkpoint, foreground, prompts, service
 from genesis.llm_client import GenesisLLMClient
 from identity.user_naming import rewrite_user_reference
 from notices import catalog as notices_catalog, core as notices_core
+from model_api_runtime.v2 import profile as v2_profile
 
 GENESIS_WORKER_SCOPES = ["envelope_decrypt", "genesis"]
 AI_PERSONA_SOURCE_KINDS = {
@@ -1490,6 +1492,124 @@ def build_persona_output_from_material(
     }
 
 
+def build_profile_output_from_sources(
+    *,
+    user_id: str,
+    job_id: str,
+    key_prefix: str | None = None,
+    runtime: provider_client.ProviderConfig,
+    rendered_cards: str,
+    memory_material: bool,
+    output: dict,
+    llm: GenesisLLMClient | None = None,
+) -> dict:
+    """Reuse Runtime V2's exact profile prompt/validation for Genesis.
+
+    Cards proposed by this reducer pass are the MEMORY source. Persona and
+    voice workset are appended only as inert tagged data for STYLE. The two
+    ``*_touched`` flags are derived from explicit material signals and later
+    drive CAS-side preservation.
+    """
+    llm = llm or GenesisLLMClient()
+    persona = output.get("persona")
+    persona_content = (
+        str(persona.get("content") or persona.get("text") or "").strip()
+        if isinstance(persona, dict)
+        else str(persona or "").strip()
+    )
+    workset = output.get("voice_workset") if isinstance(output.get("voice_workset"), dict) else {}
+    behavior_notes = (
+        [str(item).strip() for item in workset.get("behavior_notes", []) if str(item).strip()]
+        if isinstance(workset.get("behavior_notes"), list)
+        else []
+    )
+    exemplars = (
+        [item for item in workset.get("exemplars", []) if isinstance(item, dict)]
+        if isinstance(workset.get("exemplars"), list)
+        else []
+    )
+    style_material = bool(persona_content or behavior_notes or exemplars)
+    if not memory_material and not style_material:
+        return {
+            "profile": {
+                "memory": "",
+                "style": "",
+                "memory_touched": False,
+                "style_touched": False,
+                "provider_calls": 0,
+            }
+        }
+
+    source = str(rendered_cards or "")
+    if style_material:
+        style_source = json.dumps(
+            {
+                "persona": persona_content,
+                "behavior_notes": behavior_notes,
+                "exemplars": exemplars,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        source += (
+            "\n<UNTRUSTED_GENESIS_STYLE_SOURCE>\n"
+            + style_source
+            + "\n</UNTRUSTED_GENESIS_STYLE_SOURCE>"
+        )
+
+    prefix = _idempotency_prefix(job_id, key_prefix)
+    call_number = 0
+
+    async def _profile_llm(
+        _provider_config,
+        messages,
+        *,
+        max_tokens,
+        temperature,
+        timeout,
+    ):
+        del timeout
+        nonlocal call_number
+        call_number += 1
+        reply = _complete_text(
+            llm,
+            user_id=user_id,
+            job_id=job_id,
+            task_id=f"profile-{call_number}",
+            runtime=runtime,
+            messages=messages,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            idempotency_key=f"{prefix}:profile:{call_number}",
+        )
+        return {"reply": reply}
+
+    try:
+        result = asyncio.run(v2_profile.generate_profile(
+            provider_config=runtime,
+            rendered_cards=source,
+            llm=_profile_llm,
+            require_memory=bool(memory_material),
+            require_style=style_material,
+        ))
+    except v2_profile.ProfileGenerationExhausted as exc:
+        raise GenesisWorkerError(str(exc)) from exc
+    if result.fields is None:
+        raise GenesisWorkerError(
+            f"genesis_profile_invalid:{result.reject_code or 'unknown'}"
+        )
+    return {
+        "profile": {
+            "memory": result.fields["memory"],
+            "style": result.fields["style"],
+            "memory_touched": bool(memory_material),
+            "style_touched": style_material,
+            "provider_calls": result.provider_calls,
+        }
+    }
+
+
 def genesis_v2_enabled() -> bool:
     """Genesis v2 (foreground-fast) runs ONLY when FEEDLING_GENESIS_V2_ENABLED is
     truthy. Default OFF — the existing one-shot path stays byte-for-byte the
@@ -1792,6 +1912,18 @@ def _process_job(job: dict, *, api_url: str, enclave_url: str, mint_runtime_toke
         existing_persona=existing_persona,
         existing_voice=existing_voice,
     )
+    rendered_cards, _source_count, memory_material = (
+        service.render_genesis_profile_source(reducer_output)
+    )
+    reducer_output.update(build_profile_output_from_sources(
+        user_id=user_id,
+        job_id=job_id,
+        key_prefix=f"{job_id}:worker_profile",
+        runtime=runtime,
+        rendered_cards=rendered_cards,
+        memory_material=memory_material,
+        output=reducer_output,
+    ))
     _trace_genesis(
         store,
         "genesis.worker.reducer.done",

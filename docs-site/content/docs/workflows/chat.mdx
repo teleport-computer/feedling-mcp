@@ -30,6 +30,18 @@ trigger, the scheduler creates the next pending occurrence with a new
 reminder context and cancels the whole repeating series. Omitting `repeat`
 preserves one-time reminder behavior.
 
+Hosted Runtime V2 gives a pristine failed reminder delivery up to three total
+attempts, waiting 30 seconds and then 120 seconds. It does not retry failures
+that cannot safely repeat, including provider configuration/payment failures,
+attempts that mutated an MCP service or staged a durable platform write, lost
+leases, runtime-mode changes, and exhausted budgets. Generic heartbeat failure
+backoff does not delay reminder delivery; payment cooldown still prevents calls
+that cannot succeed. Intermediate failures and a later successful retry remain
+silent. After a terminal failure, the chat stream receives one standalone
+system notice with the reminder title and original local time, plus recharge
+guidance when model-service quota is insufficient; the failed occurrence is not
+automatically delivered later.
+
 ## Hosted chat
 
 Before sending, the account needs a content public key, a configured model route,

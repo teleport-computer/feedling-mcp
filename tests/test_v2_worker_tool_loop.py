@@ -37,6 +37,7 @@ from model_api_runtime.v2 import effect_id as v2_effect_id
 from model_api_runtime.v2 import effect_outbox as v2_effect_outbox
 from model_api_runtime.v2 import jobs_store
 from model_api_runtime.v2 import language_follow
+from model_api_runtime.v2 import profile_store
 from model_api_runtime.v2 import serve_worker
 from model_api_runtime.v2 import worker
 
@@ -264,6 +265,37 @@ def _user_doc(message_id: str, text: str) -> dict:
     }
 
 
+def _stuck_profile(uid: str, disposition: str) -> dict:
+    def _seal(_user_id: str, text: str) -> dict:
+        return {
+            "body_ct": f"cipher-{text}",
+            "nonce": f"nonce-{text}",
+            "aad": {"purpose": "profile-recovery-test"},
+        }
+
+    return profile_store.build_profile_document(
+        uid,
+        state="degraded",
+        source={
+            "card_count": 3,
+            "max_updated_at": "2026-08-16T00:00:00Z",
+            "generated_at": "",
+        },
+        last_attempt={
+            "at": "2026-08-16T00:00:00Z",
+            "reject_code": "provider_unavailable",
+            "attempts": 2,
+            "retry_disposition": disposition,
+            "retry_family": disposition,
+            "retry_attempts": 2,
+            "retry_not_before": 0.0,
+        },
+        memory_text="memory-before-repair",
+        style_text="style-before-repair",
+        seal_text=_seal,
+    )
+
+
 def _late_input_deps(uid: str, written: list[str]) -> worker.TurnDeps:
     def read_after_seq(_user_id: str, after_seq: int):
         rows = db.chat_messages_after_seq(uid, after_seq, limit=None)
@@ -352,6 +384,171 @@ def test_single_round_plain_text_writes_exactly_one_bubble(monkeypatch):
     assert _job_status_row(job_id)[0] == "completed"
 
 
+def test_successful_chat_rearms_provider_config_profile_without_resealing(
+    monkeypatch,
+):
+    uid = "u_toolloop_profile_provider_recovered"
+    conftest.seed_user(uid)
+    _reset(uid)
+    raw = _stuck_profile(uid, "provider_config")
+    db.set_blob_strict(uid, profile_store.PROFILE_BLOB_KIND, raw)
+    before_memory = json.dumps(raw["memory"]["envelope"], sort_keys=True)
+    before_style = json.dumps(raw["style"]["envelope"], sort_keys=True)
+    jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("w-profile-provider-recovered")
+    _patch_real_write(monkeypatch)
+    _script_provider(monkeypatch, [_text_round("provider works again")])
+    monkeypatch.setattr(worker, "_PROFILE_ENABLED", True)
+    repair_calls = []
+    real_repair = profile_store.repair_stuck_profile_retry
+
+    def _counted_repair(user_id, **kwargs):
+        repair_calls.append((user_id, kwargs["target_dispositions"]))
+        return real_repair(user_id, **kwargs)
+
+    monkeypatch.setattr(profile_store, "repair_stuck_profile_retry", _counted_repair)
+
+    status = asyncio.run(
+        worker.process_job(
+            job,
+            _deps(messages=[{
+                "id": "m-profile-provider-recovered",
+                "ts": 10.0,
+                "role": "user",
+                "content": "hello",
+            }]),
+            provider_config=_BYOK,
+            api_key=None,
+            runtime_token="rt",
+        )
+    )
+
+    repaired = db.get_blob_strict(uid, profile_store.PROFILE_BLOB_KIND)
+    assert status == "completed"
+    assert repair_calls == [
+        (uid, profile_store.PROFILE_PROVIDER_SUCCESS_RECOVERABLE_DISPOSITIONS)
+    ]
+    assert repaired["last_attempt"]["retry_disposition"] == ""
+    assert repaired["last_attempt"]["retry_not_before"] == 0.0
+    assert json.dumps(repaired["memory"]["envelope"], sort_keys=True) == before_memory
+    assert json.dumps(repaired["style"]["envelope"], sort_keys=True) == before_style
+    assert worker._profile_refresh_due(uid, now=2_000_000_000) is True
+
+
+def test_successful_chat_never_rearms_terminal_profile(monkeypatch):
+    uid = "u_toolloop_profile_terminal_stays_stuck"
+    conftest.seed_user(uid)
+    _reset(uid)
+    raw = _stuck_profile(uid, "terminal")
+    db.set_blob_strict(uid, profile_store.PROFILE_BLOB_KIND, raw)
+    jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("w-profile-terminal-stays-stuck")
+    _patch_real_write(monkeypatch)
+    _script_provider(monkeypatch, [_text_round("ordinary successful reply")])
+    monkeypatch.setattr(worker, "_PROFILE_ENABLED", True)
+
+    status = asyncio.run(
+        worker.process_job(
+            job,
+            _deps(messages=[{
+                "id": "m-profile-terminal-stays-stuck",
+                "ts": 10.0,
+                "role": "user",
+                "content": "hello",
+            }]),
+            provider_config=_BYOK,
+            api_key=None,
+            runtime_token="rt",
+        )
+    )
+
+    assert status == "completed"
+    assert profile_store.PROFILE_PROVIDER_SUCCESS_RECOVERABLE_DISPOSITIONS == {
+        "provider_config"
+    }
+    assert db.get_blob_strict(uid, profile_store.PROFILE_BLOB_KIND) == raw
+    assert worker._profile_refresh_due(uid, now=2_000_000_000) is False
+
+
+def test_failed_chat_does_not_rearm_provider_config_profile(monkeypatch):
+    uid = "u_toolloop_failed_chat_keeps_profile_stuck"
+    conftest.seed_user(uid)
+    _reset(uid)
+    raw = _stuck_profile(uid, "provider_config")
+    db.set_blob_strict(uid, profile_store.PROFILE_BLOB_KIND, raw)
+    jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("w-failed-chat-keeps-profile-stuck")
+    _script_provider(
+        monkeypatch,
+        [provider_client.ProviderError("bad key", status_code=401)],
+    )
+    repair_calls = []
+    monkeypatch.setattr(
+        profile_store,
+        "repair_stuck_profile_retry",
+        lambda *_args, **_kwargs: repair_calls.append(True),
+    )
+
+    status = asyncio.run(
+        worker.process_job(
+            job,
+            _deps(messages=[{
+                "id": "m-failed-chat-keeps-profile-stuck",
+                "ts": 10.0,
+                "role": "user",
+                "content": "hello",
+            }]),
+            provider_config=_BYOK,
+            api_key=None,
+            runtime_token="rt",
+        )
+    )
+
+    assert status == "failed"
+    assert repair_calls == []
+    assert db.get_blob_strict(uid, profile_store.PROFILE_BLOB_KIND) == raw
+
+
+def test_profile_repair_error_cannot_fail_a_successful_chat(monkeypatch):
+    uid = "u_toolloop_profile_repair_error_isolated"
+    conftest.seed_user(uid)
+    _reset(uid)
+    jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("w-profile-repair-error-isolated")
+    _patch_real_write(monkeypatch)
+    _script_provider(monkeypatch, [_text_round("reply remains successful")])
+    repair_calls = []
+
+    def _raise_repair(*_args, **_kwargs):
+        repair_calls.append(True)
+        raise RuntimeError("simulated profile read failure")
+
+    monkeypatch.setattr(
+        profile_store, "repair_stuck_profile_retry", _raise_repair
+    )
+
+    status = asyncio.run(
+        worker.process_job(
+            job,
+            _deps(messages=[{
+                "id": "m-profile-repair-error-isolated",
+                "ts": 10.0,
+                "role": "user",
+                "content": "hello",
+            }]),
+            provider_config=_BYOK,
+            api_key=None,
+            runtime_token="rt",
+        )
+    )
+
+    assert status == "completed"
+    assert repair_calls == [True]
+    assert [row["body_ct"] for row in _bubbles(uid)] == [
+        "reply remains successful"
+    ]
+
+
 def test_language_follow_emits_once_for_terminal_visible_body_after_thinking(
     monkeypatch,
 ):
@@ -411,8 +608,8 @@ def test_language_follow_emits_once_for_terminal_visible_body_after_thinking(
         "reply_script": "latin",
         "outcome": "match",
         "lane": "chat",
-        "correction_attempted": False,
-        "correction_outcome": "skipped",
+        "correction_attempted": True,
+        "correction_outcome": "retry_error",
     }
     assert private_thinking not in json.dumps(language_traces, ensure_ascii=False)
 
@@ -1374,6 +1571,33 @@ def test_self_thinking_off_preserves_native_reasoning_bubble(monkeypatch):
     }]
 
 
+def test_self_thinking_internal_tool_name_publishes_marker_only(monkeypatch):
+    monkeypatch.delenv("FEEDLING_V2_SELF_THINKING", raising=False)
+    uid = "u_toolloop_selfthink_internal_term"
+    conftest.seed_user(uid)
+    _reset(uid)
+    jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("w-selfthink-internal-term")
+    _stub_envelope_build(monkeypatch)
+    _script_provider(monkeypatch, [{
+        "reply": "<think>memory_write</think>可见回复仍然正常",
+        "tool_calls": [],
+        "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+    }])
+    deps = _deps(messages=[{"id": "m1", "ts": 10.0, "role": "user", "content": "hi"}])
+
+    status = asyncio.run(
+        worker.process_job(
+            job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"
+        )
+    )
+
+    assert status == "completed"
+    bubble = _bubbles(uid)[0]
+    assert bubble["body_ct"] == "可见回复仍然正常"
+    assert bubble["thinking_body_ct"] == self_thinking.THINKING_FAILED_MARKER
+
+
 def test_self_thinking_on_drops_native_reasoning_without_authored_block(
     monkeypatch,
 ):
@@ -1707,6 +1931,7 @@ def test_chat_workspace_prompt_snapshot_is_loaded_once_across_rounds(
     deps.load_workspace_prompt = lambda _store, **kwargs: (
         loader_calls.append(kwargs["runtime_token"])
         or {
+            "identity_card_or_persona": "<identity-card>chat identity</identity-card>",
             "trusted_system_blocks": (
                 "<feedling-skill>trusted skill</feedling-skill>",
             ),
@@ -1732,6 +1957,10 @@ def test_chat_workspace_prompt_snapshot_is_loaded_once_across_rounds(
         assert "/memory/WORKING.md" not in prompt
     system = next(
         message for message in calls[0]["messages"] if message["role"] == "system"
+    )
+    assert "chat identity" in system["content"]
+    assert system["content"].index("chat identity") < system["content"].index(
+        "trusted skill"
     )
     assert "trusted skill" in str(system["content"])
     second_offered = {spec.name for spec in calls[1]["tools"]}

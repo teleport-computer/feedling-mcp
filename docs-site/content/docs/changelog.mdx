@@ -10,6 +10,37 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **Hosted Runtime V2 now allows up to 15 provider rounds in an ordinary Chat
+  or proactive turn before its hard terminal-reply round, up from six.** The
+  final allowed round still withholds new tool use so the limit remains a real
+  BYOK-spend guard rather than a target. The worker absolute-timeout default
+  increases with the larger bounded provider envelope.
+
+- **Genesis imports now publish the identity card, MEMORY/STYLE, and the
+  transitional persona together.** Genesis reuses Runtime V2's bounded profile
+  generation and encrypted CAS storage, requires a non-empty field when the
+  current upload reducer proposes corresponding memory or persona/voice
+  material, and copies an untouched encrypted side without decrypting or
+  resealing it. Genesis does not read the existing Garden; scheduled profile
+  refresh remains the exclusive Garden-to-MEMORY/STYLE path, while add-memory
+  imports only write cards. Identity edits made while a distill is running win
+  at canonical field granularity; `GET /v1/identity/changes` now adds a
+  content-free `fields` array to new change records so this lock is observable
+  and deterministic. Legacy records without field labels trigger a traced
+  whole-card fail-safe without preventing profile/persona publication or job
+  completion. Onboarding and identity redistillation keep profile generation
+  required.
+
+- **Hosted Runtime V2 now builds Chat and proactive wake identity context from
+  the current decrypted identity card.** The complete readable card replaces
+  the transitional Genesis persona when it contains substantive content; an
+  absent, unreadable, local-only, empty, or default-`TA`-only card falls back to
+  the persona. MEMORY and STYLE now follow that identity in the trusted system
+  prefix, render independently when non-empty, and keep explicit
+  verbatim-conversation-wins guidance. World Book and changing runtime context
+  remain non-privileged application data. Each profile refresh consequently
+  invalidates that user's provider prompt cache once.
+
 - **Hosted Runtime V2 Chat now makes one bounded attempt to correct a reply
   written in a different dominant writing system from the person's latest
   substantive message.** The retry changes only the reply language and never
@@ -138,12 +169,17 @@ change must not be interpreted as an API guarantee.
   whether weak wakes speak; scheduled reminders still require delivery.
 
 - **Hosted Runtime V2 scheduled reminders no longer disappear after a model or
-  provider failure.** A content-free reminder response gets one bounded retry
-  with a reminder-specific correction. If delivery still fails, the runtime
-  writes one encrypted, standalone failure result containing the original
-  reminder note and a safe error explanation. This result is idempotent,
-  survives worker crashes and lease expiry, does not attach itself to an older
-  user message, and does not advance that message's reply cursor. Heartbeat,
+  provider failure.** A pristine delivery can make up to three total attempts,
+  delayed by 30 seconds and then 120 seconds. Authentication, payment,
+  configuration, mutation, durable-write, lease, runtime-mode, and exhausted-
+  budget failures terminate immediately rather than retrying. Generic heartbeat
+  failure backoff never postpones reminders, while payment cooldown still does.
+  If delivery ultimately fails, the runtime writes one encrypted, standalone
+  system notice naming the reminder and its original local time; quota failures
+  receive dedicated recharge guidance. Intermediate attempts and later retry
+  success produce no failure notice. The final result is idempotent, survives
+  worker crashes and lease expiry, does not attach itself to an older user
+  message, and does not advance that message's reply cursor. Heartbeat,
   manual-wake, and screen-watch silence remains unchanged.
 
 - **Multi-card memory consolidation no longer leaves a silently unretired

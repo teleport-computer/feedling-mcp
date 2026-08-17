@@ -132,7 +132,9 @@ def test_scheduled_profile_refresh_respects_persisted_retry_time(monkeypatch):
     assert worker._profile_refresh_due("u", now=1061) is True
 
 
-@pytest.mark.parametrize("disposition", ["provider_config", "terminal"])
+@pytest.mark.parametrize(
+    "disposition", sorted(profile_store.PROFILE_STUCK_RETRY_DISPOSITIONS)
+)
 def test_non_timed_profile_failure_waits_for_explicit_repair(
     monkeypatch, disposition
 ):

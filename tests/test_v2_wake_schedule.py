@@ -173,7 +173,7 @@ def test_failure_backoff_grows_caps_and_success_clears():
     assert state["proactive_fail_streak"] == 1
     assert state["proactive_backoff_until"] == pytest.approx(1_060)
 
-    second = _claim_wake(uid, "scheduled", "backoff-2")
+    second = _claim_wake(uid, "heartbeat", "backoff-2")
     assert jobs_store.mark_failed(
         second,
         "wake_failed:runtimeerror",
@@ -230,7 +230,7 @@ def test_due_heartbeat_backoff_is_bypassed_only_by_genuine_user_input():
     }
 
 
-@pytest.mark.parametrize("lane", ["manual_wake", "screen_watch"])
+@pytest.mark.parametrize("lane", ["manual_wake", "scheduled", "screen_watch"])
 def test_non_idle_wake_lanes_never_arm_generic_backoff(lane):
     uid = f"u_ws_failure_scope_{lane}"
     seed_user(uid)

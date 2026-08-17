@@ -18,6 +18,19 @@ from identity.card_policy import RUNTIME_LABELS as _IDENTITY_RUNTIME_LABELS  # n
 from identity import card_policy
 
 
+# Public, content-free field labels carried by ``/v1/identity/changes``.  Genesis
+# snapshots that feed and uses it as a per-field redistill lock: user/agent edits
+# that land while a long distill is running must win over the stale distill
+# result.  Keep this derived from the card policy so a newly writable profile
+# field cannot silently fall outside the lock contract.
+IDENTITY_CHANGE_FIELDS = (
+    *card_policy.PROFILE_FIELDS,
+    "dimensions",
+    "days_with_user",
+)
+_IDENTITY_CHANGE_FIELD_SET = frozenset(IDENTITY_CHANGE_FIELDS)
+
+
 # Per-user identity-mutation mutex. Broader than UserStore.identity_lock below
 # (which only wraps the final db.set_blob write in _save_identity): that lock
 # leaves the read-existing-card -> merge -> re-encrypt span unguarded, so two
@@ -183,10 +196,74 @@ def _append_identity_change(store: UserStore, entry: dict) -> dict:
     for k in ("dimension", "old_value", "new_value", "delta", "reason"):
         if k in entry:
             record[k] = entry[k]
+    raw_fields = entry.get("fields")
+    if isinstance(raw_fields, (list, tuple, set, frozenset)):
+        requested = {str(field or "").strip() for field in raw_fields}
+        record["fields"] = [
+            field for field in IDENTITY_CHANGE_FIELDS if field in requested
+        ]
+    elif record["action"] in {"init", "replace"}:
+        record["fields"] = list(IDENTITY_CHANGE_FIELDS)
+    elif record["action"] in {"nudge", "dimensions_set"}:
+        record["fields"] = ["dimensions"]
+    elif record["action"] == "relationship_days":
+        record["fields"] = ["days_with_user"]
     # ts here is an ISO string, not an epoch — leave the indexed ts column NULL
     # and keep the since/sort filtering in Python (string comparison) below.
     db.log_append(store.user_id, "identity_changes", record)
     return record
+
+
+def identity_change_anchor(store: UserStore) -> dict[str, str]:
+    """Return the latest content-free audit cursor for a newly-created job."""
+    latest = _load_identity_changes(store, limit=1)
+    if not latest:
+        # An empty log still needs a real time fence. Using "" would make the
+        # resolver treat the job as legacy/unanchored and miss the first edit
+        # that lands while the distill is running.
+        return {"ts": datetime.now().isoformat(), "id": ""}
+    change = latest[0]
+    return {
+        "ts": str(change.get("ts") or ""),
+        "id": str(change.get("id") or ""),
+    }
+
+
+def identity_fields_changed_since(
+    store: UserStore,
+    *,
+    since: str,
+) -> dict:
+    """Resolve a Genesis field lock from the public change-feed shape.
+
+    A post-anchor legacy record without ``fields`` is intentionally ambiguous.
+    The only safe response is to lock the whole card rather than guess which
+    decrypted field that historical write touched.
+    """
+    if not str(since or "").strip():
+        return {
+            "outcome": "per_field",
+            "fields": [],
+            "change_count": 0,
+        }
+    changes = _load_identity_changes(store, since=str(since), limit=0)
+    if any(not isinstance(change.get("fields"), list) for change in changes):
+        return {
+            "outcome": "whole_card_fail_safe",
+            "fields": list(IDENTITY_CHANGE_FIELDS),
+            "change_count": len(changes),
+        }
+    changed = {
+        str(field or "").strip()
+        for change in changes
+        for field in change.get("fields", [])
+        if str(field or "").strip() in _IDENTITY_CHANGE_FIELD_SET
+    }
+    return {
+        "outcome": "per_field",
+        "fields": [field for field in IDENTITY_CHANGE_FIELDS if field in changed],
+        "change_count": len(changes),
+    }
 
 
 def _load_identity_changes(store: UserStore, since: str = "", limit: int = 50) -> list:
@@ -196,7 +273,7 @@ def _load_identity_changes(store: UserStore, since: str = "", limit: int = 50) -
     if since:
         entries = [e for e in entries if e.get("ts", "") > since]
     entries.sort(key=lambda e: e.get("ts", ""), reverse=True)
-    return entries[:limit]
+    return entries if limit <= 0 else entries[:limit]
 
 
 def _parse_iso_calendar_date(value: str) -> date | None:

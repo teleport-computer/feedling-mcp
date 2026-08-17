@@ -28,7 +28,7 @@ from perception.agent_fields import (
     FAST_AGENT_PERCEPTION_SIGNALS,
     project_signal,
 )
-from perception.glance import build_perception_glance
+from perception.glance import V1_PRESENCE_HINT_FIELDS
 
 
 class AgentRouteError(Exception):
@@ -271,31 +271,25 @@ def perception_history_payload(store, *, signal_raw: str | None, days_raw: str |
 
 
 def perception_glance_payload(store, *, days_raw: str | None) -> dict[str, Any]:
-    """Permission-aware, number-free perception overview for proactive runtime use."""
-    days = _parse_days(days_raw, "30")
-    snapshot = agent_perception_payload(
-        store,
-        signals_raw=",".join(AGENT_PERCEPTION_SIGNALS),
-    )
-    signal_docs = (
-        snapshot.get("signals")
-        if isinstance(snapshot.get("signals"), Mapping)
-        else {}
-    )
-    rows_by_signal = {
-        signal: perception_store.list_perception_daily(store.user_id, signal, days)
-        for signal in perception_history.comparable_signals()
+    """V1-equivalent factual board for Runtime V2 proactive grounding.
+
+    This capability is runtime-internal (it has no model-facing tool schema).
+    V1 preloads the same bounded presence fields and balanced digest board before
+    a proactive turn, then leaves the ordinary perception tools available for
+    deeper reads.  Keep that hybrid shape here instead of reducing the already
+    fetched facts to availability booleans.
+    """
+    snapshot = perception_service.snapshot(store.user_id)
+    digest = perception_digest_payload(store, days_raw=days_raw)
+    presence_hints = {
+        field: snapshot.get(field)
+        for field in V1_PRESENCE_HINT_FIELDS
+        if snapshot.get(field) is not None
     }
-    changes = perception_history.notable_changes(
-        _permission_mask_history_rows(rows_by_signal, signal_docs),
-        max_changes=_digest_notable_max(),
-    )
     return {
         "ok": True,
-        "glance": build_perception_glance(
-            signal_docs,
-            notable_changes=changes,
-        ),
+        "presence_hints": presence_hints,
+        "cross_domain_board": digest.get("domains") or {},
     }
 
 

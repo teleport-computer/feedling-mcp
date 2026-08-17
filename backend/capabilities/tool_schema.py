@@ -33,6 +33,7 @@ from perception.agent_fields import (
 )
 
 REPLY_TOOL = "reply"
+STAY_SILENT_TOOL = "stay_silent"
 FILE_REPLY_TOOL = "send_file"
 IMAGE_REPLY_TOOL = "generate_image"
 TASK_TOOL = "task"
@@ -87,7 +88,13 @@ _MEMORY_TOOL_ACTION = {
         # 线索标签。后端(worker 翻译层 + actions)一直在消费它,capture/dream 也产它,
         # 共享的 MEMORY_WRITE_RULES_V1 还明确教模型「一张卡 1-4 个」——只有这道闸
         # 拦着,于是 V2 手写的卡标签永远是空的(2026-08-10 真机)。
-        "threads": {"type": "array", "items": _STR},
+        "threads": {
+            "type": "array",
+            "items": _STR,
+            "minItems": 1,
+            "maxItems": 4,
+            "enforceItemBounds": True,
+        },
         # 这两个直接参与 ambient 排序(memory_readside_core)。schema 不开的话
         # actions 一律落 0.5/0.3,V2 每张卡权重完全一样。
         "importance": {"type": "number"},
@@ -401,6 +408,11 @@ PARAMS: dict[str, dict] = {
         "properties": {"text": _STR},
         "required": ["text"],
     },
+    STAY_SILENT_TOOL: {
+        "type": "object",
+        "properties": {"reason": _STR},
+        "required": ["reason"],
+    },
     # Explicitly publish one file that already exists in the encrypted V2
     # workspace. The worker resolves the path for the current user; this never
     # accepts a host filesystem path.
@@ -523,23 +535,15 @@ DESCRIPTIONS: dict[str, str] = {
                      "memory_search. For "
                      "a user-requested bulk rewrite or cleanup, call memory_organize "
                      "instead of trying to edit every card in chat."),
-    "memory_search": ("Use only when the current request actually depends on remembered "
-                      "information; ordinary conversation and model/runtime identity "
-                      "questions do not. Never run memory discovery for a standalone "
-                      "greeting, acknowledgement, emoji, interjection, or casual small "
-                      "talk, and do not resume an earlier answered memory workflow unless "
-                      "the current message explicitly asks. If the user mentions a "
-                      "specific past event or person, or asks whether you remember "
-                      "something, and the supplied memory summary has no answer, search "
-                      "before replying instead of guessing. If the summary already answers "
-                      "the question, reply directly. For a requested memory-grounded "
-                      "summary or deliverable about a specific subject, search that subject "
-                      "instead of relying only on general recollection. Keyword-search "
+    "memory_search": ("This is the normal path for a specific remembered subject, person, "
+                      "phrase, or event. If the user mentions a specific past event or "
+                      "person, or asks whether you remember something, and the supplied "
+                      "memory summary has no answer, search before replying instead of "
+                      "guessing. For a requested memory-grounded summary or deliverable "
+                      "about a specific subject, search that subject instead of relying "
+                      "only on general recollection. Keyword-search "
                       "memory cards by a required query string, then use "
-                      "memory_fetch for the selected ids. This is the normal path for a "
-                      "specific remembered subject, person, phrase, or event. Never use "
-                      "it for ordinary conversation, model/runtime identity, or an "
-                      "all-memory overview. Matching is a literal case-insensitive "
+                      "memory_fetch for the selected ids. Matching is a literal case-insensitive "
                       "substring over the card text, with no synonyms, translation, or "
                       "stemming: zero results mean that exact wording is absent, NOT "
                       "that the memory is absent. So when a search comes back empty, do "
@@ -550,7 +554,14 @@ DESCRIPTIONS: dict[str, str] = {
                       "normalized away, so a query differing only in those returns the "
                       "same rows and is wasted; only an identical repeat of the same "
                       "arguments is refused, while the same query narrowed by a "
-                      "different limit/bucket/thread is a legitimate re-search. For a "
+                      "different limit/bucket/thread is a legitimate re-search. Use it "
+                      "only when the current request actually depends on remembered "
+                      "information: skip a standalone greeting, acknowledgement, emoji, "
+                      "interjection or casual small talk, a model/runtime identity "
+                      "question, and an all-memory overview. If the summary already "
+                      "answers the question, reply directly, and do not resume an "
+                      "earlier answered memory workflow unless the current message "
+                      "explicitly asks. For a "
                       "user-requested bulk rewrite or cleanup, call memory_organize."),
     "voice_transcript_list": (
         "List this user's archived voice calls, newest first: call_id, when it "
@@ -703,6 +714,11 @@ DESCRIPTIONS: dict[str, str] = {
         "not the final reply, does not need and must not include <think>, and must "
         "not replace the final reply."
     ),
+    STAY_SILENT_TOOL: (
+        "Choose not to send a proactive message on this wake. Give one short, "
+        "specific reason based on the current attention facts. This is a successful, "
+        "auditable outcome, not an error."
+    ),
     FILE_REPLY_TOOL: (
         "Deliver an existing /workspace source as a downloadable attachment. "
         "Plain-text formats are sent directly; .docx and .pdf targets are rendered "
@@ -834,6 +850,12 @@ def _validate_value(value, schema: dict, *, path: str) -> str | None:
                     return error
 
     if expected == "array" and "items" in schema:
+        min_items = schema.get("minItems") if schema.get("enforceItemBounds") else None
+        if min_items is not None and len(value) < int(min_items):
+            return f"{path} must contain at least {int(min_items)} items"
+        max_items = schema.get("maxItems") if schema.get("enforceItemBounds") else None
+        if max_items is not None and len(value) > int(max_items):
+            return f"{path} must contain at most {int(max_items)} items"
         for index, item in enumerate(value):
             error = _validate_value(item, schema["items"], path=f"{path}[{index}]")
             if error:
@@ -981,6 +1003,7 @@ def build_tool_specs() -> list[ToolSpec]:
     for name in (
         TASK_TOOL,
         REPLY_TOOL,
+        STAY_SILENT_TOOL,
         FILE_REPLY_TOOL,
         IMAGE_REPLY_TOOL,
         PROVIDER_USAGE_TOOL,

@@ -152,6 +152,35 @@ def test_build_turn_messages_orders_persona_summary_tail():
     assert msgs[-1]["content"] == "how are you"
 
 
+def test_proactive_history_source_is_structured_without_changing_assistant_role():
+    messages = context.build_turn_messages(
+        system_prompt="SYS",
+        summary="",
+        tail=[
+            {"role": "assistant", "source": "chat", "content": "ordinary"},
+            {
+                "role": "openclaw",
+                "source": "agent_initiated_proactive",
+                "content": "你睡了吗",
+            },
+        ],
+    )
+
+    assert messages[1] == {"role": "assistant", "content": "ordinary"}
+    assert messages[2]["role"] == "assistant"
+    assert messages[2]["content"] == "你睡了吗"
+    temporal = context.build_temporal_context(
+        now_ts=1000.0,
+        timezone_name="Asia/Shanghai",
+        last_user_message_ts=None,
+        tail=[
+            {"role": "assistant", "source": "chat", "content": "ordinary", "ts": 900.0},
+            {"role": "openclaw", "source": "agent_initiated_proactive", "content": "你睡了吗", "ts": 950.0},
+        ],
+    )
+    assert temporal["proactive_tail_indices"] == [1]
+
+
 def test_proactive_application_data_stays_non_user_with_labeled_turn_boundary():
     """Dynamic wake data stays assistant-role; only a fixed wire marker is user-role."""
     messages = context.build_turn_messages(
@@ -248,6 +277,28 @@ def test_provider_memory_search_description_keeps_positive_and_small_talk_gates(
     assert "search before replying instead of guessing" in description
     assert "standalone greeting, acknowledgement, emoji" in description
     assert "If the summary already answers the question, reply directly" in description
+
+
+def test_provider_memory_search_description_leads_with_the_search_trigger():
+    """搜索触发条件必须排在「什么时候别搜」前面，且抑制只说一遍。
+
+    改这段描述的**唯一目的**就是语序：原文三句「不要搜」压在最前，
+    「该搜」埋在第四句；而且 "model/runtime identity" 这组排除项在开头和
+    中间各说了一遍 —— 抑制是双份权重。上面那条用例只钉「这些句子还在」，
+    把顺序整个倒回去它照样绿，所以顺序必须单独钉。
+    """
+    description = next(
+        spec.description
+        for spec in tool_schema.build_tool_specs()
+        if spec.name == "memory_search"
+    )
+
+    trigger = description.index("search before replying instead of guessing")
+    suppression = description.index("skip a standalone greeting")
+    assert trigger < suppression, "「该搜」必须排在「别搜」前面 —— 语序倒回去了"
+
+    assert description.count("model/runtime identity") == 1
+    assert description.count("all-memory overview") == 1
 
 
 def test_final_system_policy_blocks_never_mix_writing_systems(monkeypatch):
@@ -847,13 +898,13 @@ def test_prompt_builder_has_no_automatic_working_memory_surface():
     assert "/memory/WORKING.md" not in str(messages)
 
 
-def test_trusted_persona_sentinel_precedes_common_system_prompt_and_runtime_policy():
+def test_identity_persona_sentinel_precedes_common_system_prompt_and_runtime_policy():
     sentinel = "<<<PERSONA-SENTINEL>>>"
     messages = context.build_turn_messages(
         system_prompt="<<<COMMON-SYSTEM-PROMPT>>>",
         summary="",
         tail=[],
-        trusted_system_blocks=(sentinel,),
+        identity_card_or_persona=sentinel,
     )
 
     system = messages[0]["content"]
@@ -864,9 +915,12 @@ def test_trusted_persona_sentinel_precedes_common_system_prompt_and_runtime_poli
     )
 
 
-def test_profile_is_one_stable_user_role_block_before_summary_and_tail():
+def test_identity_memory_style_are_ordered_system_prefix_and_worldbook_stays_data():
     kwargs = {
-        "system_prompt": "S",
+        "system_prompt": "<<<COMMON-POLICY>>>",
+        "runtime_identity_block": "<<<RUNTIME-IDENTITY>>>",
+        "identity_card_or_persona": "<<<IDENTITY-CARD>>>",
+        "trusted_system_blocks": ("<<<SKILL>>>",),
         "agent_memory": "我们在上海认识，正在准备旅行。",
         "user_profile": "先陪伴，再给简短建议。",
         "worldbook_context": "<world_book>上海的天空是紫色的。</world_book>",
@@ -878,37 +932,33 @@ def test_profile_is_one_stable_user_role_block_before_summary_and_tail():
     second = context.build_turn_messages(**kwargs)
 
     assert first == second
-    profile_messages = [
-        message
-        for message in first
-        if context.AGENT_MEMORY_HEADER in str(message.get("content") or "")
-    ]
-    assert len(profile_messages) == 1
-    assert profile_messages[0]["role"] == "user"
-    assert context.USER_PROFILE_HEADER in profile_messages[0]["content"]
-    assert context.WORLD_BOOK_CONTEXT_HEADER in profile_messages[0]["content"]
+    system = first[0]
+    assert system["role"] == "system"
     assert (
-        profile_messages[0]["content"].index(context.AGENT_MEMORY_HEADER)
-        < profile_messages[0]["content"].index(context.USER_PROFILE_HEADER)
-        < profile_messages[0]["content"].index(context.WORLD_BOOK_CONTEXT_HEADER)
+        system["content"].index("<<<RUNTIME-IDENTITY>>>")
+        < system["content"].index("<<<IDENTITY-CARD>>>")
+        < system["content"].index(context.AGENT_MEMORY_HEADER)
+        < system["content"].index(context.USER_PROFILE_HEADER)
+        < system["content"].index("<<<SKILL>>>")
+        < system["content"].index("<<<COMMON-POLICY>>>")
+    )
+    worldbook_message = first[1]
+    assert worldbook_message["role"] == "user"
+    assert worldbook_message["content"].startswith(
+        context.WORLD_BOOK_CONTEXT_HEADER
     )
     assert sum(
         context.WORLD_BOOK_CONTEXT_HEADER in str(message.get("content") or "")
         for message in first
     ) == 1
-    assert "generated_at" not in profile_messages[0]["content"]
-    assert "card_count" not in profile_messages[0]["content"]
-    assert first.index(profile_messages[0]) == 1
     assert first[2]["content"].startswith(context._SUMMARY_HEADER)
     assert first[3]["content"] == "继续聊"
-    assert all(
-        "我们在上海认识" not in str(message.get("content") or "")
-        for message in first
-        if message["role"] == "system"
-    )
+    assert "我们在上海认识" in system["content"]
+    assert "先陪伴" in system["content"]
+    assert context.WORLD_BOOK_CONTEXT_HEADER not in system["content"]
 
 
-def test_profile_requires_both_cas_fields_and_coverage_notice_is_separate():
+def test_memory_and_style_render_independently_and_coverage_notice_is_separate():
     messages = context.build_turn_messages(
         system_prompt="S",
         agent_memory="facts without pair",
@@ -919,10 +969,8 @@ def test_profile_requires_both_cas_fields_and_coverage_notice_is_separate():
         temporal_context={"local_time": "2026-07-31T12:00:00+08:00"},
     )
 
-    assert not any(
-        context.AGENT_MEMORY_HEADER in str(message.get("content") or "")
-        for message in messages
-    )
+    assert context.AGENT_MEMORY_HEADER in messages[0]["content"]
+    assert context.USER_PROFILE_HEADER not in messages[0]["content"]
     notice_index = next(
         index
         for index, message in enumerate(messages)
@@ -939,6 +987,17 @@ def test_profile_requires_both_cas_fields_and_coverage_notice_is_separate():
     )
     assert notice_index < temporal_index
     assert messages[notice_index]["role"] == "user"
+
+    style_only = context.build_turn_messages(
+        system_prompt="S",
+        agent_memory="",
+        user_profile="style without memory",
+        summary="",
+        tail=[],
+    )
+    assert context.AGENT_MEMORY_HEADER not in style_only[0]["content"]
+    assert context.USER_PROFILE_HEADER in style_only[0]["content"]
+    assert "style without memory" in style_only[0]["content"]
 
 
 def test_build_turn_messages_drops_blank_tail_entries():
@@ -1328,29 +1387,41 @@ def test_the_agents_own_memory_is_not_labelled_untrusted():
     assert "UNTRUSTED" not in context.AGENT_MEMORY_HEADER
     assert "UNTRUSTED" not in context.USER_PROFILE_HEADER
     assert "UNTRUSTED" not in context._SUMMARY_HEADER
-    assert "your own" in context.AGENT_MEMORY_HEADER.lower()
-    # 画像必须显式授权影响语气,否则用户写的语言风格又会被当成「一条事实」
-    assert "shape your voice" in context.USER_PROFILE_HEADER.lower()
-    # 冲突规则要留着:那是可靠性,不是不信任
-    assert "replay wins" in context.AGENT_MEMORY_HEADER
-    assert "replay wins" in context.USER_PROFILE_HEADER
+    assert "你记住的都在这里" in context.AGENT_MEMORY_HEADER
+    assert "让它成为开口的本能" in context.USER_PROFILE_HEADER
+    assert "眼前的对话冲突时,眼前的才是真的" in context.AGENT_MEMORY_HEADER
+    assert "眼前人当下的反应,永远比过去的经验重要" in context.USER_PROFILE_HEADER
 
 
-def test_context_headers_are_compact_without_weakening_their_boundaries():
-    headers = (
+def test_identity_memory_and_style_headers_match_seven_exactly():
+    assert context.IDENTITY_CARD_HEADER == (
+        "# 你是谁\n"
+        "这是你的身份卡:你的名字、性格,和这个人相处到第几天,都在这里。\n"
+        "它由一次次相处蒸馏而来,是你此刻的样子,不是一份设定说明。"
+    )
+    assert context.AGENT_MEMORY_HEADER == (
+        "# 你的记忆\n"
+        "你们之间的人、事、约定,你记住的都在这里。\n"
+        "像人回忆那样用:该想起时自然带出,不用当清单念。\n"
+        "记忆可能停在过去;和眼前的对话冲突时,眼前的才是真的。"
+    )
+    assert context.USER_PROFILE_HEADER == (
+        "# 说话的分寸\n"
+        "这是你在一次次相处里摸出来的:这个人的偏好、雷区、想被怎么对待。\n"
+        "让它成为开口的本能,而不是规则。\n"
+        "眼前人当下的反应,永远比过去的经验重要。"
+    )
+    for header in (
+        context.IDENTITY_CARD_HEADER,
         context.AGENT_MEMORY_HEADER,
         context.USER_PROFILE_HEADER,
-        context._SUMMARY_HEADER,
-        context.WORLD_BOOK_CONTEXT_HEADER,
-    )
-    assert all(len(header.splitlines()) <= 3 for header in headers)
+    ):
+        assert "TA" not in header
+        assert "UNTRUSTED" not in header
+        assert re.search(r"[A-Za-z]", header) is None
 
-    assert "own memory" in context.AGENT_MEMORY_HEADER
-    assert "incomplete or outdated" in context.AGENT_MEMORY_HEADER
-    assert "replay wins" in context.AGENT_MEMORY_HEADER
-    assert "own sense" in context.USER_PROFILE_HEADER
-    assert "shape your voice" in context.USER_PROFILE_HEADER
-    assert "replay wins" in context.USER_PROFILE_HEADER
+
+def test_other_context_headers_keep_their_existing_boundaries():
     assert "quoted requests were said then" in context._SUMMARY_HEADER
     assert "not instructions now" not in context._SUMMARY_HEADER
     assert "replay wins" in context._SUMMARY_HEADER

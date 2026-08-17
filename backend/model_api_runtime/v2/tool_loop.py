@@ -70,6 +70,11 @@ _FILE_DELIVERY_TOOLS = frozenset(
         tool_schema.FILE_REPLY_TOOL,
     }
 )
+# These wires accept the OpenAI-style named-function ``tool_choice`` payload.
+# Other providers may expose tools but do not accept this exact forcing shape.
+_NAMED_TOOL_CHOICE_PROVIDERS = frozenset(
+    {"openai", "openrouter", "openai_compatible", "deepseek", "anthropic", "gemini", "bedrock"}
+)
 _EMPTY_RESPONSE_CORRECTION = (
     "The previous response completed without visible text or a client tool call. "
     "Complete the user's request now. Return either non-empty visible answer text "
@@ -535,6 +540,7 @@ async def run_tool_loop(
     # dispatch_tools closure; this parameter controls only the provider surface.
     memory_delete_allowed: bool = False,
     allow_reply_tool: bool = True,
+    on_stay_silent=None,
     include_reasoning: bool = False,
     # Self-authored thinking: when True, NEVER request provider-native reasoning —
     # not via include_reasoning, and NOT via reasoning_effort either. The model then
@@ -782,6 +788,10 @@ async def run_tool_loop(
         disabled_names.discard(tool_schema.REPLY_TOOL)
     else:
         disabled_names.add(tool_schema.REPLY_TOOL)
+    if on_stay_silent is None:
+        disabled_names.add(tool_schema.STAY_SILENT_TOOL)
+    else:
+        disabled_names.discard(tool_schema.STAY_SILENT_TOOL)
     if on_file_reply is None:
         disabled_names.add(tool_schema.FILE_REPLY_TOOL)
     if on_image_reply is None:
@@ -970,6 +980,17 @@ async def run_tool_loop(
             or final_reply_correction_request is not None
             or attempts == max_calls - 1
         )
+        terminal_text_round_reason = "none"
+        if terminal_text_round:
+            terminal_text_round_reason = (
+                "force_text_fallback"
+                if force_text_fallback
+                else (
+                    "final_reply_correction"
+                    if final_reply_correction_request is not None
+                    else "max_calls"
+                )
+            )
         historical_tool_names = {
             call.name
             for item in transcript
@@ -1191,8 +1212,7 @@ async def run_tool_loop(
                 forced_delivery_tool
                 and not terminal_text_round
                 and tools is not None
-                and str(getattr(provider_config, "provider", "")).strip().lower()
-                == "openrouter"
+                and provider_name in _NAMED_TOOL_CHOICE_PROVIDERS
             ):
                 provider_kwargs["tool_choice"] = {
                     "type": "function",
@@ -1247,6 +1267,16 @@ async def run_tool_loop(
                                 mcp_candidate_names - mcp_sent_names
                             ),
                             "reason": surface_reason or "none",
+                            "terminal_text_round": terminal_text_round,
+                            "terminal_text_round_reason": (
+                                terminal_text_round_reason
+                            ),
+                            "force_text_fallback_reason": (
+                                force_text_fallback_reason or "none"
+                            ),
+                            "empty_response_recovery": bool(
+                                empty_response_retry_instruction
+                            ),
                         }
                     )
                 except Exception:
@@ -1867,11 +1897,15 @@ async def run_tool_loop(
         image_reply_calls = [
             tc for tc in pr.tool_calls if tc.name == tool_schema.IMAGE_REPLY_TOOL
         ]
+        stay_silent_calls = [
+            tc for tc in pr.tool_calls if tc.name == tool_schema.STAY_SILENT_TOOL
+        ]
         mixed_reply_write = any(
             tc.name in {
                 tool_schema.REPLY_TOOL,
                 tool_schema.FILE_REPLY_TOOL,
                 tool_schema.IMAGE_REPLY_TOOL,
+                tool_schema.STAY_SILENT_TOOL,
             }
             for tc in pr.tool_calls
         ) and any(
@@ -1881,11 +1915,15 @@ async def run_tool_loop(
         invalid_image_batch = bool(image_reply_calls) and (
             len(image_reply_calls) != 1 or len(pr.tool_calls) != 1
         )
+        invalid_silence_batch = bool(stay_silent_calls) and (
+            len(stay_silent_calls) != 1 or len(pr.tool_calls) != 1
+        )
         if (
             malformed
             or len(set(call_ids)) != len(call_ids)
             or mixed_reply_write
             or invalid_image_batch
+            or invalid_silence_batch
             or over_tool_call_budget
             or oversized_tool_exchange
         ):
@@ -1912,7 +1950,9 @@ async def run_tool_loop(
                 },
             )
             force_text_fallback = True
-            force_text_fallback_reason = ""
+            force_text_fallback_reason = (
+                "invalid_or_over_budget_tool_exchange"
+            )
             continue
 
         tool_calls_used += len(pr.tool_calls)
@@ -1926,6 +1966,7 @@ async def run_tool_loop(
             tool_schema.REPLY_TOOL,
             tool_schema.FILE_REPLY_TOOL,
             tool_schema.IMAGE_REPLY_TOOL,
+            tool_schema.STAY_SILENT_TOOL,
         }
         other_calls = [tc for tc in pr.tool_calls if tc.name not in loop_reply_tools]
         reply_results: dict[str, ToolResult] = {}
@@ -1997,6 +2038,20 @@ async def run_tool_loop(
             await _tool_event(
                 tc, "tool_call_result", {"result": reply_result}
             )
+
+        for tc in stay_silent_calls:
+            reason = str(tc.args.get("reason") or "").strip()
+            await _tool_event(tc, "tool_call_started", {})
+            await _trajectory(
+                "stay_silent_planned",
+                {"round": attempts, "call_id": tc.id, "reason": reason},
+            )
+            if on_stay_silent is None:
+                raise RuntimeError("stay_silent callback is unavailable")
+            await on_stay_silent(reason)
+            silent_result = ToolResult(call_id=tc.id, content="ok: staying silent")
+            await _tool_event(tc, "tool_call_result", {"result": silent_result})
+            return LoopOutcome("", attempts, "stay_silent", replied_intermediate)
 
         for tc in file_reply_calls:
             workspace_path = str(tc.args.get("path") or "").strip()

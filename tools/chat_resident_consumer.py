@@ -4452,12 +4452,12 @@ def _sanitize_thinking_summary(text: str) -> str:
     text = text.replace("\r\n", "\n").strip()
     if not text:
         return ""
-    blocked = re.compile(
-        r"(system prompt|developer message|chain[-\s]*of[-\s]*thought|"
-        r"modelUsage|terminal_reason|permission_denials|cache_read|"
-        r"cache_creation|session_id|uuid|costUSD|input_tokens|output_tokens)",
-        re.IGNORECASE,
-    )
+    # 词表来自共享内核(core.self_thinking.INTERNAL_FIELD_TERMS)。
+    # V1 的**处置**不变:仍逐行丢弃、仍用宽匹配 —— 只是不再自己维护一份字面量,
+    # 「两代词表漂移」由构造消除,不必靠测试去追源码(codex2 review 2026-08-17)。
+    from core import self_thinking as _st_terms
+
+    blocked = re.compile(_st_terms.internal_field_terms_pattern(), re.IGNORECASE)
     kept: list[str] = []
     for raw_ln in text.splitlines():
         ln = raw_ln.strip()

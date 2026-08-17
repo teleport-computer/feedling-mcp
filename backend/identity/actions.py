@@ -846,6 +846,7 @@ def _identity_profile_patch(
             "old_value": audit_old,
             "new_value": audit_new,
             "reason": reason,
+            "fields": changed,
         }
         if bootstrap:
             # No existing card yet — atomically mint one (see
@@ -972,6 +973,7 @@ def _identity_dimension_nudge(
                 "new_value": new_value,
                 "delta": delta,
                 "reason": reason,
+                "fields": ["dimensions"],
             },
             event_type="identity_action_dimension_nudge",
         )
@@ -1134,6 +1136,7 @@ def _identity_dimensions_set(
                 "action": "dimensions_set",
                 "old_value": len(old_dimensions),
                 "new_value": len(stamped_dimensions),
+                "fields": ["dimensions"],
             },
             event_type="identity_action_dimensions_set",
         )
@@ -1270,6 +1273,7 @@ def _identity_relationship_days_set(store: UserStore, action: dict) -> tuple[dic
         "new_value": days,
         "delta": days - old_days,
         "reason": evidence or "Relationship day count recalibrated.",
+        "fields": ["days_with_user"],
     })
     effect = {
         "type": "identity_updated",
@@ -1355,7 +1359,9 @@ def _identity_replace_action(
     # Omitted or "" (every existing caller, and legacy jobs pre-dating the baseline) skips the
     # check entirely — back-compat, not a security gate.
     base_identity_replaced_at = str(action.get("base_identity_replaced_at") or "").strip()
-    if base_identity_replaced_at:
+    job_metadata = job.get("metadata") if isinstance(job.get("metadata"), dict) else {}
+    has_field_lock_anchor = "identity_change_anchor_ts" in job_metadata
+    if base_identity_replaced_at and not has_field_lock_anchor:
         current_identity = identity_service._load_identity(store)
         current_replaced_at = str((current_identity or {}).get("replaced_at") or "")
         if base_identity_replaced_at != current_replaced_at:
@@ -1369,25 +1375,35 @@ def _identity_replace_action(
     # T12 (spec 3.6 / D5): replace_identity_preserving_anchor now reads the LATEST
     # decrypted card at write time and key-level merges the distilled payload onto
     # it under identity_mutation_lock + a CAS retry loop — the base_identity_replaced_at
-    # check above stays as the coarser replace-vs-replace guard (P5), but it is no
-    # longer the only concurrency protection: a profile_patch/dimension_nudge/
+    # check above remains only for legacy jobs without a field-lock anchor. New
+    # jobs use the finer per-field change-log lock below, so a concurrent full
+    # replace locks every distilled field without preventing profile/persona
+    # persistence or completion. A profile_patch/dimension_nudge/
     # dimensions_set landing
     # between this function's reads and its write can no longer be silently clobbered
     # (closes the KNOWN RESIDUAL this comment used to document).
     from genesis import service as genesis_service  # lazy — avoid import cycle
+    field_lock = genesis_service.identity_field_lock_for_job(store, job_id)
     result = genesis_service.replace_identity_preserving_anchor(
         store,
         {"identity": identity_payload, "relationship_anchor": _replace_relationship_anchor(action)},
         api_key,
         runtime_token=runtime_token,
+        field_lock=field_lock,
     )
-    if result != "updated":
+    if result not in {"updated", "locked"}:
         status = 409 if result in (
             "identity_not_initialized", "identity_update_empty", "not_provided",
             "identity_plain_unavailable", "identity_write_conflict",
         ) else 400
         return {"status": "error", "error": result, "action": "identity.replace"}, [], status
-    return {"status": "ok", "action": "identity.replace", "job_id": job_id}, [], 200
+    return {
+        "status": "ok",
+        "action": "identity.replace",
+        "job_id": job_id,
+        "identity_status": result,
+        "identity_field_lock": field_lock,
+    }, [], 200
 
 
 def _execute_identity_action(

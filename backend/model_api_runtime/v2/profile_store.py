@@ -28,6 +28,18 @@ log = logging.getLogger("feedling.runtime_v2.profile_store")
 PROFILE_BLOB_KIND = "v2_agent_profile"
 PROFILE_VERSION = 1
 PROFILE_STATES = frozenset({"ok", "pending", "degraded", "empty"})
+PROFILE_RETRY_DISPOSITIONS = frozenset(
+    {"", "scheduled", "provider_config", "source_change", "terminal"}
+)
+# These dispositions deliberately stop the ordinary refresh scheduler until an
+# operator repairs the metadata.  Keep the rescue CLI and worker scheduler on
+# one source of truth: copying these strings into an operator script can leave
+# a newly introduced permanent disposition stranded forever.
+PROFILE_STUCK_RETRY_DISPOSITIONS = frozenset({"provider_config", "terminal"})
+# A successful foreground chat proves only that the user's provider credential
+# works again.  It may automatically re-arm provider-config failures, but a
+# terminal disposition remains an explicit operator-only decision.
+PROFILE_PROVIDER_SUCCESS_RECOVERABLE_DISPOSITIONS = frozenset({"provider_config"})
 _REJECT_CODE_RE = re.compile(r"^[A-Za-z0-9_.:-]{0,160}$")
 
 
@@ -50,6 +62,13 @@ class ProfileCasResult:
     document: dict
     cas_attempts: int
     recomputations: int
+
+
+@dataclass(frozen=True)
+class ProfileRetryRepairResult:
+    status: str
+    disposition: str = ""
+    cas_attempts: int = 0
 
 
 _fallback_lock = threading.Lock()
@@ -133,13 +152,7 @@ def validate_profile_document(value: Any) -> dict:
     if not math.isfinite(retry_not_before) or retry_not_before < 0:
         raise ProfileStorageError("profile_retry_not_before_invalid")
     retry_disposition = str(attempt.get("retry_disposition") or "")
-    if retry_disposition not in {
-        "",
-        "scheduled",
-        "provider_config",
-        "source_change",
-        "terminal",
-    }:
+    if retry_disposition not in PROFILE_RETRY_DISPOSITIONS:
         raise ProfileStorageError("profile_retry_disposition_invalid")
     retry_family = str(attempt.get("retry_family") or "")
     if retry_family not in {
@@ -244,8 +257,6 @@ def build_profile_document(
         "disabled": bool(disabled),
     }
     if memory_text is not None and style_text is not None:
-        if not memory_text.strip() or not style_text.strip():
-            raise ProfileStorageError("profile_field_empty")
         document["memory"] = {
             "envelope": seal_text(str(user_id), memory_text),
             "chars": len(memory_text),
@@ -267,6 +278,72 @@ def build_profile_document(
                     document["style"] = prior["style"]
                 else:
                     document["user"] = prior["user"]
+    return validate_profile_document(document)
+
+
+def build_profile_document_patching_fields(
+    user_id: str,
+    *,
+    state: str,
+    source: dict,
+    last_attempt: dict,
+    memory_text: str | None,
+    style_text: str | None,
+    previous: dict | None,
+    disabled: bool | None = None,
+    seal_text: Callable[[str, str], dict] = _seal_text,
+) -> dict:
+    """Seal touched fields and byte-preserve untouched encrypted fields.
+
+    Genesis can derive only MEMORY or only STYLE from one upload.  Requiring it
+    to decrypt and reseal the untouched side adds an enclave dependency and can
+    change ciphertext for data the pass did not own.  A missing prior side is
+    initialized as an encrypted empty string so the paired-field contract stays
+    atomic.
+    """
+    prior = (
+        validate_profile_document(previous)
+        if isinstance(previous, dict) and previous
+        else {}
+    )
+    document: dict[str, Any] = {
+        "v": PROFILE_VERSION,
+        "state": str(state),
+        "source": deepcopy(source),
+        "last_attempt": deepcopy(last_attempt),
+        "disabled": (
+            bool(prior.get("disabled"))
+            if disabled is None
+            else bool(disabled)
+        ),
+    }
+    if memory_text is not None:
+        document["memory"] = {
+            "envelope": seal_text(str(user_id), memory_text),
+            "chars": len(memory_text),
+        }
+    elif prior.get("memory") is not None:
+        document["memory"] = deepcopy(prior["memory"])
+    else:
+        document["memory"] = {
+            "envelope": seal_text(str(user_id), ""),
+            "chars": 0,
+        }
+
+    if style_text is not None:
+        document["style"] = {
+            "envelope": seal_text(str(user_id), style_text),
+            "chars": len(style_text),
+        }
+    elif prior.get("style") is not None:
+        document["style"] = deepcopy(prior["style"])
+    elif prior.get("user") is not None:
+        document["user"] = deepcopy(prior["user"])
+    else:
+        document["style"] = {
+            "envelope": seal_text(str(user_id), ""),
+            "chars": 0,
+        }
     return validate_profile_document(document)
 
 
@@ -302,9 +379,63 @@ def _winner_supersedes(winner: dict, candidate: dict) -> bool:
     )
 
 
+def repair_stuck_profile_retry(
+    user_id: str,
+    *,
+    target_dispositions: frozenset[str] = PROFILE_STUCK_RETRY_DISPOSITIONS,
+    read_profile: Callable[[str, str], Any] | None = None,
+    compare_and_swap: Callable[..., bool] | None = None,
+) -> ProfileRetryRepairResult:
+    """CAS-clear selected stuck retry metadata without touching profile fields.
+
+    The document is re-read on every CAS attempt.  That second predicate check
+    is load-bearing: a concurrent profile lane may have already moved the user
+    to a scheduled retry or healthy state, which must not be cleared using a
+    stale plan.  Callers choose the allowed stuck subset; terminal is therefore
+    kept operator-only when chat success passes only provider_config.
+    """
+
+    targets = frozenset(str(value) for value in target_dispositions)
+    if not targets or not targets.issubset(PROFILE_STUCK_RETRY_DISPOSITIONS):
+        raise ProfileStorageError("profile_retry_repair_target_invalid")
+    read = read_profile or db.get_blob_strict
+    cas = compare_and_swap or db.set_blob_if_unchanged
+    for cas_attempt in (1, 2):
+        raw = read(str(user_id), PROFILE_BLOB_KIND)
+        if raw is None:
+            return ProfileRetryRepairResult("skipped_fresh", cas_attempts=cas_attempt)
+        document = validate_profile_document(raw)
+        if document.get("disabled") is True:
+            return ProfileRetryRepairResult(
+                "skipped_disabled", cas_attempts=cas_attempt
+            )
+        state = str(document.get("state") or "")
+        disposition = str(
+            (document.get("last_attempt") or {}).get("retry_disposition") or ""
+        )
+        if state == "ok" or disposition not in targets:
+            return ProfileRetryRepairResult("skipped_fresh", cas_attempts=cas_attempt)
+
+        candidate = deepcopy(document)
+        last_attempt = deepcopy(candidate["last_attempt"])
+        last_attempt["retry_disposition"] = ""
+        last_attempt["retry_not_before"] = 0.0
+        candidate["last_attempt"] = last_attempt
+        candidate = validate_profile_document(candidate)
+        if cas(str(user_id), PROFILE_BLOB_KIND, raw, candidate):
+            return ProfileRetryRepairResult(
+                "repaired",
+                disposition=disposition,
+                cas_attempts=cas_attempt,
+            )
+    raise ProfileStorageError("profile_retry_repair_cas_failed")
+
+
 def update_profile_cas(
     user_id: str,
     recompute: Callable[[dict], dict],
+    *,
+    allow_freshness_supersede: bool = True,
 ) -> ProfileCasResult:
     """CAS one profile, recomputing once against the winning race document.
 
@@ -314,13 +445,20 @@ def update_profile_cas(
     """
     expected_raw = db.get_blob_strict(str(user_id), PROFILE_BLOB_KIND)
     expected = deepcopy(expected_raw) if isinstance(expected_raw, dict) else {}
-    return _update_profile_cas_from_expected(str(user_id), expected, recompute)
+    return _update_profile_cas_from_expected(
+        str(user_id),
+        expected,
+        recompute,
+        allow_freshness_supersede=allow_freshness_supersede,
+    )
 
 
 def _update_profile_cas_from_expected(
     user_id: str,
     expected_doc: dict,
     recompute: Callable[[dict], dict],
+    *,
+    allow_freshness_supersede: bool = True,
 ) -> ProfileCasResult:
     """Internal snapshot form used by the true two-connection race test."""
     expected = deepcopy(expected_doc)
@@ -343,7 +481,11 @@ def _update_profile_cas_from_expected(
             )
         winner_raw = db.get_blob_strict(str(user_id), PROFILE_BLOB_KIND)
         winner = deepcopy(winner_raw) if isinstance(winner_raw, dict) else {}
-        if winner and _winner_supersedes(winner, candidate):
+        if (
+            allow_freshness_supersede
+            and winner
+            and _winner_supersedes(winner, candidate)
+        ):
             return ProfileCasResult(
                 status="superseded",
                 document=validate_profile_document(winner),

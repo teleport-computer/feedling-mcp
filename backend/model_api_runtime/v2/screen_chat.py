@@ -90,7 +90,11 @@ def build_untrusted_frame_message(
     valid_frames = [
         frame
         for frame in frames
-        if _frame_id(frame) and str(frame.get("image_b64") or "").strip()
+        if _frame_id(frame)
+        and any(
+            str(frame.get(field) or "").strip()
+            for field in ("image_b64", "ocr_text", "app", "app_name")
+        )
     ]
     admitted = 0
     for index, frame in enumerate(valid_frames):
@@ -121,17 +125,25 @@ def build_untrusted_frame_message(
                     + "\n"
                     f"frame_id: {frame_id}\n"
                     f"captured_at_utc: {captured_at}\n"
-                    f"relative_age_sec: {age_sec if age_sec is not None else 'unknown'}"
+                    f"relative_age_sec: {age_sec if age_sec is not None else 'unknown'}\n"
+                    f"app: {str(frame.get('app') or frame.get('app_name') or 'unknown')[:200]}"
+                    + (
+                        "\nocr_text (untrusted):\n"
+                        + str(frame.get("ocr_text") or "").strip()[:2000]
+                        if str(frame.get("ocr_text") or "").strip()
+                        else ""
+                    )
                 ),
             }
         )
-        mime = str(frame.get("image_mime") or "image/jpeg")
-        blocks.append(
-            {
-                "type": "image_url",
-                "image_url": {"url": f"data:{mime};base64,{image_b64}"},
-            }
-        )
+        if image_b64:
+            mime = str(frame.get("image_mime") or "image/jpeg")
+            blocks.append(
+                {
+                    "type": "image_url",
+                    "image_url": {"url": f"data:{mime};base64,{image_b64}"},
+                }
+            )
         admitted += 1
     if admitted == 0:
         return None
