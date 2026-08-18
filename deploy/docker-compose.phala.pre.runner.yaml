@@ -20,6 +20,7 @@
 #   FEEDLING_RUNTIME_TOKEN_SECRET same value as the main backend
 #   FEEDLING_API_URL              main CVM public ingress URL
 #   FEEDLING_ENCLAVE_URL          main CVM enclave gateway-passthrough URL
+#   R2_*                          same frame-object store as the backend
 #   FEEDLING_HOST_ALL=1           mirror the backend
 #   AGENT_MAX_CHILDREN            per-runner capacity ceiling (must cover the
 #                                 user count or some users go unserved)
@@ -36,6 +37,10 @@ x-agent-runner-env: &agent-runner-env
   AGENT_RESOLVE_CONCURRENCY: "${AGENT_RESOLVE_CONCURRENCY:-8}"
   AGENT_RUNTIME_ISOLATION: "process"
   DATABASE_URL: "${DATABASE_URL:-}"
+  R2_ENDPOINT: "${R2_ENDPOINT:-}"
+  R2_ACCESS_KEY_ID: "${R2_ACCESS_KEY_ID:-}"
+  R2_SECRET_ACCESS_KEY: "${R2_SECRET_ACCESS_KEY:-}"
+  R2_FRAMES_BUCKET: "${R2_FRAMES_BUCKET:-}"
   # Must flip atomically with DATABASE_URL during Phase-4 promotion. Child
   # processes inherit it and perform the same read-only TEE-head assertion.
   FEEDLING_DATABASE_SCHEMA: "${FEEDLING_DATABASE_SCHEMA:-rds}"
