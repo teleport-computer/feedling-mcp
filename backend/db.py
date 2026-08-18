@@ -4466,7 +4466,13 @@ _LANE_ROLLUP_STUCK_AFTER_HOURS = 6.0
 #                        表结构不动。
 #
 # 承重恒等式（写漏任何一侧都会破）：
-#     completed = (spoke - spoke_completed) + silent_declared + silent_undeclared
+#     completed = spoke_completed + silent_declared + silent_undeclared
+#
+# ⚠️ 完成侧**直接数**，不要改回 (spoke - 某个扣减项) 的减法形态。减法曾经在这里
+# 待过，被 codex2 在全新 PG 上实证打掉：一次尝试可以先投出中间气泡、再因租约超时
+# 终结成 expired（或 superseded），只扣 failed 的减法盖不住，等式当场不闭合。直接
+# 数 completed 那一侧，除 completed 外的终态根本不进这个和，同类洞长不出来。
+# 「投了气泡但没完成」需要时用 spoke - spoke_completed 现算，信息没丢。
 #
 # ⚠️ 逐 lane 一律计算，不按 lane 名开白名单——lane 是开集，写死枚举那次漏了 9 个
 # 里的 3 个。代价是 capture/dream 这类结构上就不说话的 lane 恒为 spoke=0，读侧据此
