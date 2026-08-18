@@ -41,10 +41,19 @@ Silence is then split, because "silent" hides two very different things:
   instead of silently absorbing it. When the planned silent_empty_response
   trace lands, it subdivides THIS column; the schema does not change.
 
-``spoke_failed`` keeps the decomposition exact for attempts that delivered a
-bubble and then failed, giving the load-bearing invariant:
+``spoke_completed`` is stored directly rather than deriving the completed-side
+share by subtraction, so the decomposition is exact BY CONSTRUCTION:
 
-    completed = (spoke - spoke_failed) + silent_declared + silent_undeclared
+    completed = spoke_completed + silent_declared + silent_undeclared
+
+The subtractive form (spoke minus a "spoke then failed" column) was tried and
+rejected: a job can deliver an intermediate bubble and then terminate
+``expired`` (lease timeout) or ``superseded``, which no failed-only deduction
+covers — codex2 reproduced exactly that on a fresh PG head and the identity
+broke. Counting the completed side directly cannot develop that class of hole,
+because every terminal status other than ``completed`` is simply not in the
+sum. ``spoke - spoke_completed`` still yields "delivered but did not complete"
+for anyone who wants it.
 
 Backfill is deliberately absent: existing frozen cells keep 0 in the new
 columns rather than being retro-computed, because the sources they were frozen
@@ -62,10 +71,37 @@ branch_labels = None
 depends_on = None
 
 
+# resident's speak criterion resolves the delivery by (user_id, job_id) with NO
+# time window. The window it replaced assumed the chat row and the terminal
+# patch land milliseconds apart; nothing in the code guarantees that — the
+# consumer's post_reply and update_proactive_job_status are two separate calls
+# and the second only warns on failure, so a restart can delay it across days.
+# Without this index the freeze degrades into a per-job sequential scan of
+# chat_messages. The index is partial, covering only proactive rows.
+# CONCURRENTLY + validity self-check follow 0079's established pattern.
+_PROACTIVE_ANCHOR_INDEX = "ix_chat_messages_proactive_job"
+_PROACTIVE_ANCHOR_DDL = (
+    f"CREATE INDEX CONCURRENTLY {_PROACTIVE_ANCHOR_INDEX} "
+    "ON chat_messages (user_id, (doc->>'proactive_job_id')) "
+    "WHERE COALESCE(doc->>'proactive_job_id','') <> ''"
+)
+
+
+def _index_validity(name: str) -> bool | None:
+    """None = absent, False = an invalid shell left by a canceled build."""
+    row = op.get_bind().exec_driver_sql(
+        "SELECT idx.indisvalid FROM pg_class AS cls "
+        "JOIN pg_index AS idx ON idx.indexrelid=cls.oid "
+        f"WHERE cls.relkind='i' AND cls.relname='{name}' "
+        "AND pg_table_is_visible(cls.oid)"
+    ).fetchone()
+    return None if row is None else bool(row[0])
+
+
 _UP = """
 ALTER TABLE lane_daily_rollup
     ADD COLUMN IF NOT EXISTS spoke             INTEGER NOT NULL DEFAULT 0,
-    ADD COLUMN IF NOT EXISTS spoke_failed      INTEGER NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS spoke_completed   INTEGER NOT NULL DEFAULT 0,
     ADD COLUMN IF NOT EXISTS silent_declared   INTEGER NOT NULL DEFAULT 0,
     ADD COLUMN IF NOT EXISTS silent_undeclared INTEGER NOT NULL DEFAULT 0;
 
@@ -73,9 +109,9 @@ ALTER TABLE lane_daily_rollup
     DROP CONSTRAINT IF EXISTS lane_daily_rollup_voice_nonneg;
 ALTER TABLE lane_daily_rollup
     ADD CONSTRAINT lane_daily_rollup_voice_nonneg
-    CHECK (spoke >= 0 AND spoke_failed >= 0
+    CHECK (spoke >= 0 AND spoke_completed >= 0
            AND silent_declared >= 0 AND silent_undeclared >= 0
-           AND spoke_failed <= spoke);
+           AND spoke_completed <= spoke);
 
 -- One watermark row per route already records count coverage; voice coverage
 -- starts later than the counts do (the columns did not exist before this
@@ -131,14 +167,22 @@ ALTER TABLE lane_daily_rollup
 ALTER TABLE lane_daily_rollup
     DROP COLUMN IF EXISTS silent_undeclared,
     DROP COLUMN IF EXISTS silent_declared,
-    DROP COLUMN IF EXISTS spoke_failed,
+    DROP COLUMN IF EXISTS spoke_completed,
     DROP COLUMN IF EXISTS spoke;
 """
 
 
 def upgrade() -> None:
     op.execute(_UP)
+    validity = _index_validity(_PROACTIVE_ANCHOR_INDEX)
+    with op.get_context().autocommit_block():
+        if validity is False:
+            op.execute(f"DROP INDEX CONCURRENTLY IF EXISTS {_PROACTIVE_ANCHOR_INDEX}")
+        if validity is not True:
+            op.execute(_PROACTIVE_ANCHOR_DDL)
 
 
 def downgrade() -> None:
+    with op.get_context().autocommit_block():
+        op.execute(f"DROP INDEX CONCURRENTLY IF EXISTS {_PROACTIVE_ANCHOR_INDEX}")
     op.execute(_DOWN)

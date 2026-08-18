@@ -1253,15 +1253,25 @@ def test_spoke_counts_a_delivered_bubble_not_a_status_column(clean_rollup):
 
 
 def test_voice_decomposition_is_exact_for_every_frozen_cell(clean_rollup):
-    """completed = (spoke - spoke_failed) + silent_declared + silent_undeclared.
+    """completed = spoke_completed + silent_declared + silent_undeclared.
 
     This identity is the whole reason the four columns can be trusted: any
     attempt that terminates ok lands in exactly one bucket. If a future edit
     drops a case (say a new wake_result value that matches neither branch),
-    the sum stops closing and this fails — which is the point."""
+    the sum stops closing and this fails — which is the point.
+
+    Every NON-completed terminal status that still delivered a bubble is
+    represented below, because that is where the earlier subtractive form
+    broke: it deducted only ``failed`` and let expired/superseded leak."""
     uid = "usr_rollup_voice_identity"
     seed_user(uid)
     t = datetime(2030, 6, 1, 2, 0, tzinfo=timezone.utc)
+    # TWO completed-and-spoke against ONE failed-and-spoke. The counts must
+    # differ: with one of each, a deduction that wrongly keys on ``failed``
+    # still makes the sum close by pure numeric coincidence, and this test goes
+    # green against the very bug it exists to catch (observed — the first
+    # version of this case had 1:1 and survived that mutation).
+    _deliver(_insert_job(uid, "heartbeat", "completed", finished=t), uid)
     _deliver(_insert_job(uid, "heartbeat", "completed", finished=t), uid)
     _insert_job(uid, "heartbeat", "completed", finished=t, wake_result="sleep")
     _insert_job(uid, "heartbeat", "completed", finished=t)
@@ -1269,11 +1279,15 @@ def test_voice_decomposition_is_exact_for_every_frozen_cell(clean_rollup):
     # undeclared silence, not a fourth invisible bucket.
     _insert_job(uid, "heartbeat", "completed", finished=t,
                 wake_result="some_future_value")
-    # Delivered a bubble, then the attempt failed — counted in spoke and in
-    # spoke_failed, so it is excluded from the completed-side sum.
-    failed_but_spoke = _insert_job(uid, "heartbeat", "failed", finished=t,
-                                   last_error="provider_error")
-    _deliver(failed_but_spoke, uid)
+    # Delivered a bubble, then did NOT complete. codex2's counter-example on a
+    # fresh PG head: an intermediate reply is applied, the lease then times out
+    # and the reaper terminalizes the job ``expired``. Under the subtractive
+    # form this produced completed=0 against a right-hand side of 1.
+    for terminal in ("failed", "expired", "superseded"):
+        spoke_then = _insert_job(uid, "heartbeat", terminal, finished=t,
+                                 last_error="lease_timeout")
+        _deliver(spoke_then, uid,
+                 effect_type="reply_intermediate_fenced_v1")
     _insert_job(uid, "scheduled", "completed", finished=t)
 
     db.freeze_completed_lane_days(now_epoch=_NOW_EPOCH)
@@ -1281,13 +1295,15 @@ def test_voice_decomposition_is_exact_for_every_frozen_cell(clean_rollup):
     assert cells, "no cells frozen — the identity below would be vacuous"
     for cell in cells:
         assert cell["completed"] == (
-            (cell["spoke"] - cell["spoke_failed"])
+            cell["spoke_completed"]
             + cell["silent_declared"] + cell["silent_undeclared"]
         ), f"decomposition does not close for {cell['lane']}: {cell}"
     (hb,) = [r for r in cells if r["lane"] == "heartbeat"]
-    assert hb["spoke"] == 2 and hb["spoke_failed"] == 1
+    # 5 spoke: two completed + the three non-completed terminals.
+    assert hb["spoke"] == 5 and hb["spoke_completed"] == 2
     assert hb["silent_declared"] == 1
     assert hb["silent_undeclared"] == 2
+    assert hb["expired"] == 1 and hb["superseded"] == 1
 
 
 def test_spoke_uses_the_wide_reply_predicate_from_its_single_source():
@@ -1393,8 +1409,17 @@ def _log_job_id(user_id: str, **kwargs) -> str:
     if kwargs.get("wake_result"):
         doc["wake_result"] = kwargs["wake_result"]
     terminal_at = kwargs.get("terminal_at") or ts
-    key = ("failed_at" if kwargs["status"] in ("failed", "error", "skipped")
-           else "completed_at")
+    # Field name per status, matching the production bucketing CASE — 'posted'
+    # reads posted_at, NOT completed_at. Writing the wrong key here silently
+    # sends the row down the l.ts fallback and lands the cell on the creation
+    # day, which looks like a code bug rather than a fixture bug.
+    key = {
+        "posted": "posted_at",
+        "delivered": "posted_at",
+        "failed": "failed_at",
+        "error": "failed_at",
+        "skipped": "failed_at",
+    }.get(kwargs["status"], "completed_at")
     doc[key] = terminal_at.isoformat()
     db.log_append(user_id, "proactive_jobs", doc, ts=ts.timestamp())
     return job_id
@@ -1427,7 +1452,7 @@ def test_resident_spoke_follows_the_chat_row_not_the_posted_status(clean_rollup)
     assert cell["silent_declared"] == 1
     assert cell["silent_undeclared"] == 2
     assert cell["completed"] == (
-        (cell["spoke"] - cell["spoke_failed"])
+        (cell["spoke_completed"])
         + cell["silent_declared"] + cell["silent_undeclared"]
     )
 
@@ -1477,6 +1502,69 @@ def test_live_topup_reports_voice_for_the_still_open_day(clean_rollup):
     assert row["spoke"] == 1
     assert row["silent_declared"] == 1
     assert row["completed"] == (
-        (row["spoke"] - row["spoke_failed"])
+        (row["spoke_completed"])
         + row["silent_declared"] + row["silent_undeclared"]
     )
+
+
+def test_resident_spoke_survives_a_terminal_patch_days_after_delivery(clean_rollup):
+    """The delivery is found by job id, never by a time window.
+
+    codex2's counter-example on a fresh PG head: the chat row lands on day D,
+    the consumer's separate ``update_proactive_job_status`` call only stamps
+    the terminal state on D+2 (its failure path merely warns, and a restart
+    can delay it arbitrarily). A window with a one-day lower bound dropped the
+    real delivery and recorded the attempt as ``silent_undeclared`` — inflating
+    precisely the column whose whole job is to be an honest blind-spot count.
+    """
+    uid = "usr_rollup_res_late_patch"
+    _seed_resident(uid)
+    delivered_on = datetime(2030, 5, 29, 3, 0, tzinfo=timezone.utc)
+    terminal_on = datetime(2030, 6, 1, 3, 0, tzinfo=timezone.utc)
+    job = _log_job_id(uid, job_id="pj-late", ts=delivered_on, status="posted",
+                      kind="heartbeat_tick", terminal_at=terminal_on)
+    _post_proactive_reply(uid, job, ts=delivered_on)
+
+    db.freeze_completed_resident_lane_days(now_epoch=_NOW_EPOCH)
+    cells = {(r["day"], r["lane"]): r for r in _cells(user_id=uid)}
+    cell = cells[("2030-06-01", "heartbeat")]
+    assert cell["completed"] == 1
+    assert cell["spoke"] == 1, "delivery 3 days before the terminal patch was lost"
+    assert cell["silent_undeclared"] == 0
+    assert cell["completed"] == (
+        cell["spoke_completed"]
+        + cell["silent_declared"] + cell["silent_undeclared"]
+    )
+
+
+def test_the_resident_anchor_has_an_index_to_stand_on():
+    """The windowless anchor is only affordable because 0093/0025 build a
+    partial expression index; without it each freeze degrades into a per-job
+    sequential scan of chat_messages. Both chains must create it — test's
+    primary is the TEE database, so the freezer queries THAT one."""
+    import importlib.util
+    from pathlib import Path as _P
+
+    def _load(rel: str, name: str):
+        spec = importlib.util.spec_from_file_location(
+            name, _P(__file__).parent.parent / rel)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    rds = _load("backend/alembic/versions/0093_lane_rollup_voice.py", "rds93")
+    tee = _load("backend/alembic_tee/versions/0025_lane_rollup_voice.py", "tee25")
+
+    assert rds._PROACTIVE_ANCHOR_DDL == tee._PROACTIVE_ANCHOR_DDL
+    ddl = rds._PROACTIVE_ANCHOR_DDL
+    # The predicate the freeze actually issues must be coverable by this index:
+    # both the user and the job id, and the same partial WHERE so the planner
+    # can prove applicability.
+    assert "chat_messages (user_id, (doc->>'proactive_job_id'))" in ddl
+    assert "WHERE COALESCE(doc->>'proactive_job_id','') <> ''" in ddl
+    assert "CONCURRENTLY" in ddl
+    for source in ("backend/alembic/versions/0093_lane_rollup_voice.py",
+                   "backend/alembic_tee/versions/0025_lane_rollup_voice.py"):
+        # CONCURRENTLY cannot run inside the migration's transaction.
+        assert "autocommit_block()" in (_P(__file__).parent.parent
+                                        / source).read_text()

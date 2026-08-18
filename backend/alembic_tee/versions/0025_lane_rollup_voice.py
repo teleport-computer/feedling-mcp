@@ -18,6 +18,28 @@ branch_labels = None
 depends_on = None
 
 
+# Same index as RDS 0093 — and it matters most HERE: test's primary is the TEE
+# database, so this is the chain the freezer actually queries. Why the resident
+# anchor carries no time window at all is documented in 0093.
+_PROACTIVE_ANCHOR_INDEX = "ix_chat_messages_proactive_job"
+_PROACTIVE_ANCHOR_DDL = (
+    f"CREATE INDEX CONCURRENTLY {_PROACTIVE_ANCHOR_INDEX} "
+    "ON chat_messages (user_id, (doc->>'proactive_job_id')) "
+    "WHERE COALESCE(doc->>'proactive_job_id','') <> ''"
+)
+
+
+def _index_validity(name: str) -> bool | None:
+    """None = absent, False = an invalid shell left by a canceled build."""
+    row = op.get_bind().exec_driver_sql(
+        "SELECT idx.indisvalid FROM pg_class AS cls "
+        "JOIN pg_index AS idx ON idx.indexrelid=cls.oid "
+        f"WHERE cls.relkind='i' AND cls.relname='{name}' "
+        "AND pg_table_is_visible(cls.oid)"
+    ).fetchone()
+    return None if row is None else bool(row[0])
+
+
 # Byte-identical to RDS 0093's ``_UP``. Alembic revision modules are not
 # importable by name (they start with a digit), so the two chains cannot share
 # the literal at runtime — instead ``test_tee_migrations_reuse_the_rds_contract_sql``
@@ -26,7 +48,7 @@ depends_on = None
 _UP = """
 ALTER TABLE lane_daily_rollup
     ADD COLUMN IF NOT EXISTS spoke             INTEGER NOT NULL DEFAULT 0,
-    ADD COLUMN IF NOT EXISTS spoke_failed      INTEGER NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS spoke_completed   INTEGER NOT NULL DEFAULT 0,
     ADD COLUMN IF NOT EXISTS silent_declared   INTEGER NOT NULL DEFAULT 0,
     ADD COLUMN IF NOT EXISTS silent_undeclared INTEGER NOT NULL DEFAULT 0;
 
@@ -34,9 +56,9 @@ ALTER TABLE lane_daily_rollup
     DROP CONSTRAINT IF EXISTS lane_daily_rollup_voice_nonneg;
 ALTER TABLE lane_daily_rollup
     ADD CONSTRAINT lane_daily_rollup_voice_nonneg
-    CHECK (spoke >= 0 AND spoke_failed >= 0
+    CHECK (spoke >= 0 AND spoke_completed >= 0
            AND silent_declared >= 0 AND silent_undeclared >= 0
-           AND spoke_failed <= spoke);
+           AND spoke_completed <= spoke);
 
 -- One watermark row per route already records count coverage; voice coverage
 -- starts later than the counts do (the columns did not exist before this
@@ -97,6 +119,12 @@ WHERE key = 'phase4_primary_prepared'
 
 def upgrade() -> None:
     op.execute(_UP)
+    validity = _index_validity(_PROACTIVE_ANCHOR_INDEX)
+    with op.get_context().autocommit_block():
+        if validity is False:
+            op.execute(f"DROP INDEX CONCURRENTLY IF EXISTS {_PROACTIVE_ANCHOR_INDEX}")
+        if validity is not True:
+            op.execute(_PROACTIVE_ANCHOR_DDL)
     op.execute(_UPDATE_PREPARED_HEAD)
 
 
