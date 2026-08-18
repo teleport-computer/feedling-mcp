@@ -141,6 +141,35 @@ def _merge_payload(
 
     mutable_cols = [c for c in cols if c not in set(pk_cols)]
     if mutable_cols:
+        retained_assignments = sql.SQL(", ").join(
+            sql.SQL("{} = staged.{}").format(sql.Identifier(c), sql.Identifier(c))
+            for c in mutable_cols
+        )
+        retained_key_match = sql.SQL(" AND ").join(
+            sql.SQL("target.{} IS NOT DISTINCT FROM staged.{}").format(pk, pk)
+            for pk in pk_idents
+        )
+        retained_changed = sql.SQL(" OR ").join(
+            sql.SQL("target.{} IS DISTINCT FROM staged.{}").format(
+                sql.Identifier(c), sql.Identifier(c),
+            )
+            for c in mutable_cols
+        )
+        # Release secondary/partial unique keys held by retained rows before
+        # the UPSERT is allowed to insert new primary keys.  A single set-based
+        # UPDATE also lets PostgreSQL validate retained-row key transitions as
+        # one statement rather than in arbitrary COPY order.
+        dst.execute(sql.SQL(
+            "UPDATE {} AS target SET {} FROM {} AS staged "
+            "WHERE {} AND ({})"
+        ).format(
+            table_ident,
+            retained_assignments,
+            stage_ident,
+            retained_key_match,
+            retained_changed,
+        ))
+
         assignments = sql.SQL(", ").join(
             sql.SQL("{} = EXCLUDED.{}").format(sql.Identifier(c), sql.Identifier(c))
             for c in mutable_cols
