@@ -4395,17 +4395,27 @@
         "operationId": "memory_list_v1_memory_list_get",
         "responses": {
           "200": {
-            "description": "Successful Response",
+            "description": "One deterministic page of encrypted memory records.",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/GenericJsonResponse"
+                  "$ref": "#/components/schemas/MemoryListResponse"
                 }
               }
             }
           },
           "default": {
             "description": "Error response.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "The limit or opaque cursor is invalid.",
             "content": {
               "application/json": {
                 "schema": {
@@ -4423,14 +4433,26 @@
             "name": "limit",
             "in": "query",
             "required": false,
-            "description": "Recommended page size; values above 200 are capped.",
+            "description": "Page size; values above 500 are capped.",
             "schema": {
               "type": "integer",
               "minimum": 1,
-              "maximum": 200,
+              "maximum": 500,
               "default": 50
             },
             "example": 50
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "required": false,
+            "description": "Opaque continuation token from next_cursor. Omit for the first page.",
+            "schema": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 1024
+            },
+            "example": "eyJoIjp0cnVlLCJpIjoibWVtXzEyMyIsInQiOiIyMDI2LTA3LTEzVDEyOjMwOjAwKzAwOjAwIiwidiI6MX0"
           },
           {
             "name": "since",
@@ -9114,6 +9136,41 @@
         "type": "object",
         "description": "JSON response object. Endpoint-specific fields may be added compatibly.",
         "additionalProperties": true
+      },
+      "MemoryListResponse": {
+        "type": "object",
+        "description": "One page of raw encrypted Memory Garden records. total is the filtered full count and is independent of limit and cursor.",
+        "required": [
+          "moments",
+          "total",
+          "next_cursor"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "moments": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/FreeFormJsonObject"
+            }
+          },
+          "total": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "next_cursor": {
+            "anyOf": [
+              {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 1024
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Opaque continuation token; null exactly when the filtered result is exhausted."
+          }
+        }
       },
       "DreamStatusResponse": {
         "type": "object",

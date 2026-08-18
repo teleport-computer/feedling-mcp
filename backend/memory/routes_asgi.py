@@ -164,7 +164,10 @@ async def memory_list(request: Request, auth: AuthResult = Depends(require_auth)
     body, status = await threadpool.run_db(
         memory_core.list_moments,
         auth.store,
-        limit_raw=request.query_params.get("limit", 50),
+        limit_raw=request.query_params.get(
+            "limit", memory_core.MEMORY_LIST_DEFAULT_LIMIT
+        ),
+        cursor=request.query_params.get("cursor", ""),
         since=request.query_params.get("since", ""),
         include_archived_raw=request.query_params.get("include_archived"),
     )

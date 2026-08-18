@@ -15,6 +15,8 @@ from __future__ import annotations
 import asyncio
 import base64
 import sys
+import types
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import httpx
@@ -34,6 +36,7 @@ from memory import memory_core  # noqa: E402
 from memory import routes_asgi as memory_asgi  # noqa: E402
 from memory import service as memory_service  # noqa: E402
 import memory_readside_core  # noqa: E402
+from memory_garden import timestamps as memory_timestamps  # noqa: E402
 
 _SECRET = "test-runtime-secret"
 
@@ -204,13 +207,161 @@ def test_migration_state_get_allows_scopeless_token_parity(user, monkeypatch):
 def test_list_empty_parity(user):
     _uid, api_key = user
     f, a = _both("GET", "/v1/memory/list", api_key=api_key)
-    assert f == a == (200, {"moments": [], "total": 0})
+    assert f == a == (200, {"moments": [], "total": 0, "next_cursor": None})
 
 
 def test_list_invalid_limit_400_parity(user):
     _uid, api_key = user
     f, a = _both("GET", "/v1/memory/list?limit=abc", api_key=api_key)
     assert f == a == (400, {"error": "invalid limit"})
+
+
+def _pagination_cards(count: int = 221) -> list[dict]:
+    newest = datetime(2026, 8, 18, 8, 0, tzinfo=timezone.utc)
+    cards = []
+    for index in range(count):
+        occurred_at = newest - timedelta(seconds=index)
+        # Five cards straddle the first 100-card boundary with the exact same
+        # timestamp, so a time-only cursor necessarily loses or repeats rows.
+        if 98 <= index <= 102:
+            occurred_at = newest - timedelta(seconds=98)
+        cards.append({
+            "id": f"mem_{index:03d}",
+            "status": "active",
+            "occurred_at": occurred_at.isoformat().replace("+00:00", "Z"),
+            "body_ct": f"ciphertext-{index}",
+        })
+    cards[-2].pop("occurred_at")
+    cards[-1]["occurred_at"] = "not-a-timestamp"
+    # Match db.memory_load's storage order; list_moments owns presentation order.
+    return sorted(cards, key=lambda card: (str(card.get("occurred_at") or ""), card["id"]))
+
+
+@pytest.fixture()
+def list_route_store():
+    store = types.SimpleNamespace(user_id="usr_memory_list_cursor")
+
+    async def resolved_auth():
+        return memory_asgi.AuthResult(
+            store=store,
+            user_id=store.user_id,
+            runtime_token_claims=None,
+            api_key="test-api-key",
+        )
+
+    _ASGI.dependency_overrides[memory_asgi.require_auth] = resolved_auth
+    try:
+        yield store
+    finally:
+        _ASGI.dependency_overrides.pop(memory_asgi.require_auth, None)
+
+
+def test_list_cursor_paginates_221_cards_without_duplicates_or_omissions(
+    list_route_store, monkeypatch
+):
+    cards = _pagination_cards()
+    monkeypatch.setattr(memory_service, "_load_moments", lambda _store: cards)
+
+    pages = []
+    cursor = ""
+    for _ in range(3):
+        query = "/v1/memory/list?limit=100"
+        if cursor:
+            query += f"&cursor={cursor}"
+        status, body = _asgi("GET", query)
+        assert status == 200
+        assert body["total"] == 221
+        pages.append(body)
+        cursor = body["next_cursor"] or ""
+
+    ids = [card["id"] for page in pages for card in page["moments"]]
+    assert [len(page["moments"]) for page in pages] == [100, 100, 21]
+    assert len(ids) == len(set(ids)) == 221
+    assert set(ids) == {card["id"] for card in cards}
+    assert pages[0]["next_cursor"]
+    assert pages[1]["next_cursor"]
+    assert pages[2]["next_cursor"] is None
+    assert {card["id"] for card in pages[2]["moments"]} >= {"mem_219", "mem_220"}
+
+
+def test_list_without_cursor_preserves_legacy_first_page(
+    list_route_store, monkeypatch
+):
+    cards = _pagination_cards()
+    monkeypatch.setattr(memory_service, "_load_moments", lambda _store: cards)
+    legacy_order = sorted(
+        cards,
+        key=lambda card: memory_timestamps.sort_key(card.get("occurred_at")),
+        reverse=True,
+    )
+
+    status, body = _asgi("GET", "/v1/memory/list?limit=100")
+
+    assert status == 200
+    assert body["moments"] == legacy_order[:100]
+    assert body["total"] == len(legacy_order)
+    assert body["next_cursor"]
+
+
+def test_list_total_is_independent_of_cursor_and_limit(
+    list_route_store, monkeypatch
+):
+    cards = _pagination_cards()
+    monkeypatch.setattr(memory_service, "_load_moments", lambda _store: cards)
+
+    first_status, first = _asgi("GET", "/v1/memory/list?limit=17")
+    next_status, second = _asgi(
+        "GET",
+        f"/v1/memory/list?limit=3&cursor={first['next_cursor']}",
+    )
+
+    assert first_status == next_status == 200
+    assert len(first["moments"]) == 17
+    assert len(second["moments"]) == 3
+    assert first["total"] == second["total"] == 221
+
+
+def test_list_default_and_max_page_sizes(list_route_store, monkeypatch):
+    cards = _pagination_cards(501)
+    monkeypatch.setattr(memory_service, "_load_moments", lambda _store: cards)
+
+    default_status, default_page = _asgi("GET", "/v1/memory/list")
+    capped_status, capped_page = _asgi("GET", "/v1/memory/list?limit=999")
+
+    assert default_status == capped_status == 200
+    assert len(default_page["moments"]) == 50
+    assert len(capped_page["moments"]) == 500
+    assert default_page["total"] == capped_page["total"] == 501
+    assert default_page["next_cursor"] and capped_page["next_cursor"]
+
+
+@pytest.mark.parametrize(
+    "cursor", ["garbage", "e30", "eyJ2IjoxLCJoIjp0cnVlfQ"]
+)
+def test_list_rejects_invalid_cursor_with_400(
+    list_route_store, monkeypatch, cursor
+):
+    monkeypatch.setattr(
+        memory_service, "_load_moments", lambda _store: _pagination_cards()
+    )
+    status, body = _asgi("GET", f"/v1/memory/list?cursor={cursor}")
+    assert (status, body) == (400, {"error": "invalid cursor"})
+
+
+def test_list_rejects_well_formed_cursor_without_matching_anchor(
+    list_route_store, monkeypatch
+):
+    monkeypatch.setattr(
+        memory_service, "_load_moments", lambda _store: _pagination_cards()
+    )
+    forged = memory_core._encode_memory_list_cursor({
+        "id": "mem_not_present",
+        "occurred_at": "2026-08-18T08:00:00Z",
+    })
+
+    status, body = _asgi("GET", f"/v1/memory/list?cursor={forged}")
+
+    assert (status, body) == (400, {"error": "invalid cursor"})
 
 
 def test_get_missing_id_400_parity(user):
