@@ -18,7 +18,11 @@ def test_tee_migrate_has_one_head_after_runtime_v2_alignment():
     cfg.set_main_option("script_location", str(ROOT / "backend" / "alembic_tee"))
     script = ScriptDirectory.from_config(cfg)
 
-    assert script.get_heads() == ["0023_lane_daily_rollup"]
+    assert script.get_heads() == ["0024_lane_rollup_safe_ts"]
+    assert (
+        script.get_revision("0024_lane_rollup_safe_ts").down_revision
+        == "0023_lane_daily_rollup"
+    )
     assert (
         script.get_revision("0023_lane_daily_rollup").down_revision
         == "0022_v2_wake_outcomes"
@@ -43,8 +47,8 @@ def test_tee_migrate_has_one_head_after_runtime_v2_alignment():
         script.get_revision("0018_v2_wake_shadow_decisions").down_revision
         == "0017_voice_primary_alignment"
     )
-    migration = script.get_revision("0023_lane_daily_rollup").module
-    assert "'[\"0023_lane_daily_rollup\"]'::jsonb" in (
+    migration = script.get_revision("0024_lane_rollup_safe_ts").module
+    assert "'[\"0024_lane_rollup_safe_ts\"]'::jsonb" in (
         migration._UPDATE_PREPARED_HEAD
     )
 

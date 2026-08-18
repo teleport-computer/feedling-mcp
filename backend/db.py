@@ -39,7 +39,7 @@ import threading
 import time
 from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -4400,6 +4400,33 @@ def _lane_rollup_freeze_day(conn, *, day: date, zone: ZoneInfo,
 # 2026-07) closes within a few 300s ticks.
 _LANE_ROLLUP_MAX_DAYS_PER_TICK = 45
 
+# 读侧 live 补齐窗口的上限（天）。冻结器长期停摆时,admin 的一次 GET 不该退化成
+# 无界历史聚合——那正是本表要退休的失败形态。超出部分不静默丢弃,而是在
+# coverage.live_truncated_before 里声明。
+_LANE_ROLLUP_LIVE_MAX_DAYS = 3
+
+# --- stuck：与失败率并列的一等指标（Seven 2026-08-18 拍板 A） --------------- #
+#
+# 口径：失败率只统计「已终结」的尝试——非终态既不进分子也不进分母。代价是永久卡在
+# pending/claimed/realizing 的 job 会从失败率里彻底消失,所以它必须有自己的出口,
+# 且与失败率**并排**呈现,否则就是下一个「用户完全看不见」。
+#
+# ⚠️ stuck 刻意**不进冻结格子**,是读时的实时查询。理由:stuck 是「此刻」状态,
+# 不是历史事实——D 日卡住、D+5 才完成的 job,若按天冻进格子就被永久钉成 stuck,
+# 且需要回头改写已冻结的行,直接拆掉「Frozen cells win + ON CONFLICT DO NOTHING」
+# 这块刚钉稳的地基。4h lag 是冻结等待,不是 stuck 的分类规则(两者无关)。
+#
+# 判据分两条源:
+#   model_api → 用 agent_jobs **自带的 deadline 契约**(queue_deadline_at /
+#     pending 看 queue_deadline_at;claimed/running 逐字照抄 jobs_store 的权威
+#     stale 契约 COALESCE(lease_expires_at, deadline_at) <= clock_timestamp()),
+#     判据只有一份、不是我拍的小时数;
+#   resident  → user_logs 没有 deadline 列,只能用年龄阈值,故阈值随 payload 一起
+#     返回(stuck_after_hours),让读的人知道这个数是怎么来的。
+_LANE_ROLLUP_NONTERMINAL = ("pending", "claimed", "running")
+_LANE_ROLLUP_V1_NONTERMINAL = ("pending", "active", "claimed", "realizing")
+_LANE_ROLLUP_STUCK_AFTER_HOURS = 6.0
+
 
 def freeze_completed_lane_days(*, now_epoch: float | None = None,
                                tz: str = "Asia/Shanghai") -> list[str]:
@@ -4462,6 +4489,270 @@ def freeze_completed_lane_days(*, now_epoch: float | None = None,
         return frozen
     except Exception as e:
         log.error("[db] freeze_completed_lane_days failed: %s", e)
+        return []
+
+
+# --- 期 2：V1/resident 源（user_logs → 格子） ------------------------------ #
+# 只冻 route='resident' 用户的 user_logs 流：hosted 用户的 user_logs 条目与
+# agent_jobs 是同一事件的第二份记录。⚠️ 注意它**不会**撞主键——PK 含 route 列，
+# 两条源写的 route 不同，插入会成功，于是 hosted 用户凭空多出一条 route='resident'
+# 的幽灵格子：跨 route 汇总时双计，且给 hosted 用户贴了错误的路线标签。
+# 静默多一行比撞键报错危险得多，所以这条过滤是本期最要害的一行。
+# hosted 的权威源是永不清理的 agent_jobs，环形缓冲滚掉的只是副本；resident 的
+# user_logs 是唯一记录（环 500 条/人正在滚动丢失），这正是本期止血的对象。
+# 口径抄 admin_events_overview（lane 推断/成败集合），使格子可与 events 页互核。
+
+# 分桶时刻 = **终态时刻**（Seven 定 A：失败率只统计「有终态时刻的已终结尝试」，
+# 这条口径本身就预设了按终态时刻分桶）。
+#
+# 为什么不能按创建时刻（l.ts）：codex2 独立 PG 复现——D 日创建、当时 pending、
+# D+5 才完成的 resident job 会**彻底消失**：D 日冻结时它非终态、不入格子，而 D 日
+# 一旦冻结永不回访；等它完成后又不再是 stuck。两头都不计，等于凭空蒸发。
+# 按终态时刻分桶则落在 D+5 的格子里，那天还开着。
+#
+# 字段按**最终状态**选，不用固定 COALESCE：一个最终 failed 却仍留着旧 posted_at
+# 的 job，固定顺序会取到 posted_at，把失败记到前一天、当天记成空（同为 codex2 复现）。
+#
+# 解析走 lane_rollup_safe_ts（migration 0092/tee 0024）。实测 PG 16：直接 cast 与
+# to_timestamp **都会抛**（'2026-99-99'、'2026-02-30' 皆然），一行坏数据就能让整日
+# 聚合失败；形状正则也挡不住 '2026-02-29' 这种合法形状的非法日期。解析失败或缺字段
+# 一律 fallback 到 to_timestamp(l.ts)，让「解析不了」与「压根没有」退化成同一条路。
+#
+# ⚠️ 由此与 admin_events_overview 产生**有意的**分歧：events 页按创建时刻分桶
+# （_day_filter('l.ts')），所以跨零点的 job 两边会落在不同日子。这不是 bug，是两个
+# 口径回答两个问题（「那天发起了多少」vs「那天出了多少结果」）。互核测试因此只在
+# 不含跨零点 job 的日子上断言相等，并在用例里写明理由。
+_LANE_ROLLUP_V1_TERMINAL_FIELD = (
+    "CASE COALESCE(l.doc->>'status','') "
+    "WHEN 'completed' THEN l.doc->>'completed_at' "
+    "WHEN 'posted' THEN l.doc->>'posted_at' "
+    "WHEN 'delivered' THEN COALESCE(l.doc->>'posted_at', l.doc->>'completed_at') "
+    "WHEN 'failed' THEN l.doc->>'failed_at' "
+    "WHEN 'error' THEN l.doc->>'failed_at' "
+    "WHEN 'skipped' THEN l.doc->>'failed_at' "
+    "ELSE NULL END"
+)
+_LANE_ROLLUP_V1_TS = (
+    f"COALESCE(lane_rollup_safe_ts({_LANE_ROLLUP_V1_TERMINAL_FIELD}), "
+    "to_timestamp(l.ts))"
+)
+
+# 旧口径（创建时刻，与 events 页逐字同源）保留给 stuck 用：非终态 job 没有终态
+# 时刻，只能按创建时刻判年龄。
+#
+# 这里曾经按 doc 里的 ISO 终态字段（completed_at/posted_at/failed_at）分桶，被
+# codex2 独立 PG 实证打掉三处，根子是同一个：**doc 里的时间是自由文本，l.ts 是列**。
+#   1. 与 events 页分歧：events 按创建时刻分桶，跨零点 job（23:58 建、00:03 完成）
+#      两边会落在不同日子——「格子与 events 一致」这个承重判据会在真实数据上失效，
+#      而我的互核测试只因样本里没有跨零点数据才绿（假绿）。
+#   2. 形状正则挡不住非法日期：'2026-99-99T…' 能过 ^[0-9]{4}-[0-9]{2}-[0-9]{2}，
+#      ::timestamptz 直接抛 DatetimeFieldOverflow，**整日聚合失败**——与「坏值退化
+#      成 NULL」的原注释正相反。
+#   3. 固定 COALESCE 顺序选错字段：最终 failed 却仍留着旧 posted_at 时，会取到
+#      posted_at 的日子，把失败记到前一天、当天记成空。
+# l.ts 是 double 列，三个问题一次消失。
+#
+# 4 小时 lag 与分桶口径无关，仍然必需且理由更清晰：D 日创建的 job 可能在 D+1 凌晨
+# 才被打上终态补丁，lag 保证冻 D 日时其状态字段已经定稿。
+#
+# stuck 专用：非终态 job **没有**终态时刻，只能按创建时刻算年龄。刻意与上面的
+# 分桶时刻分成两个名字——它们回答不同问题，早先共用一个常量时后定义的那份会
+# 静默盖掉前一份（本轮自查发现）。
+_LANE_ROLLUP_V1_CREATED_TS = "to_timestamp(l.ts)"
+
+# 成败谓词抽成常量，供计数与失败码分布**共用同一份**——codex2 实证：原先失败码
+# 查询对所有 lane 用 {failed,error,skipped}，而计数按家族分谓词，于是 proactive
+# 的 status='error' 不计入 failed 却计入 failure_codes，原因分布之和超过失败分子。
+_LANE_ROLLUP_V1_OK_PRED = (
+    "((NOT {mem} AND COALESCE(l.doc->>'status','') IN ('posted','delivered','completed')) "
+    "OR ({mem} AND COALESCE(l.doc->>'status','') = 'completed'))"
+)
+_LANE_ROLLUP_V1_FAIL_PRED = (
+    "((NOT {mem} AND COALESCE(l.doc->>'status','') IN ('failed','skipped')) "
+    "OR ({mem} AND COALESCE(l.doc->>'status','') IN ('failed','error','skipped')))"
+)
+
+# lane 推断与 admin_events_overview 同一 CASE；memory 三种 job_kind 在这里拆成
+# 独立 lane（capture/dream/migrate）——events 页的合并 category 等于三者之和，
+# 互核仍然成立，粒度更高。
+_LANE_ROLLUP_V1_LANE = (
+    "CASE "
+    "WHEN l.stream = 'memory_capture_jobs' THEN 'capture' "
+    "WHEN COALESCE(l.doc->>'job_kind','') = 'memory_capture' THEN 'capture' "
+    "WHEN COALESCE(l.doc->>'job_kind','') = 'memory_dream' THEN 'dream' "
+    "WHEN COALESCE(l.doc->>'job_kind','') = 'memory_migrate' THEN 'migrate' "
+    "WHEN k.kind IN ('screen_watch','screen_tick','broadcast_opened',"
+    "'broadcast_closed','heartbeat_broadcast_on') THEN 'screen' "
+    "WHEN k.kind IN ('perception_event','scene_change','photo_added',"
+    "'arrived_at_anchor','location','unlock_after_absence','scheduled_wake') "
+    "THEN 'trigger' "
+    "WHEN k.kind = 'presence' OR left(k.kind, 9) = 'heartbeat' THEN 'heartbeat' "
+    "ELSE 'other' END"
+)
+
+# 成败集合与 events 页一致：proactive 家族 success={posted,delivered,completed}
+# fail={failed,skipped}；memory 家族 success={completed} fail={failed,error,skipped}。
+#
+# 词汇完整性不是靠「与 events 页一致」自证的（抄错会一致地错），而是拿 prod 实测
+# 恒等式验的：2026-08-18 查 08-17/08-18 两天，resident 的 proactive 四行全部
+# success+failed+pending == total，即没有状态落在这套词汇之外。
+#
+# 非终态 job 不入格子 —— 这是口径本身（Seven 2026-08-18 定 A：失败率只统计有终态
+# 时刻的已终结尝试，非终态既不进分子也不进分母），不是缺口。
+# 它的代价是永久卡住的 job 会从失败率里彻底消失，补偿在 admin_lane_rollup 返回的
+# **stuck** 区块（实时查询 + 面板与失败率并排 + 能定位到具体 job）。两者必须一起读。
+# 实测量级（2026-08-18 prod）：resident proactive 0；resident capture 约 1/天。
+_LANE_ROLLUP_V1_IS_MEMORY = (
+    "(l.stream = 'memory_capture_jobs' OR COALESCE(l.doc->>'job_kind','') IN "
+    "('memory_capture','memory_dream','memory_migrate'))"
+)
+
+
+def _lane_rollup_freeze_resident_day(conn, *, day: date, zone: ZoneInfo,
+                                     mirror_batch: list | None = None) -> int:
+    """Insert route='resident' cells for one closed Beijing day from the
+    ring-buffered user_logs streams. Same idempotency/mirroring/users-guard
+    contract as the agent_jobs freezer."""
+    start, end = _lane_rollup_day_bounds(day, zone)
+    ok_pred = _LANE_ROLLUP_V1_OK_PRED.format(mem=_LANE_ROLLUP_V1_IS_MEMORY)
+    fail_pred = _LANE_ROLLUP_V1_FAIL_PRED.format(mem=_LANE_ROLLUP_V1_IS_MEMORY)
+    rows = conn.execute(
+        f"""
+        WITH routes AS (
+            SELECT user_id,
+                   lower(COALESCE(NULLIF(doc->>'route',''),'resident')) AS route
+            FROM user_blobs WHERE kind = 'onboarding_route'
+        )
+        SELECT l.user_id,
+               {_LANE_ROLLUP_V1_LANE} AS lane,
+               COUNT(*) FILTER (WHERE {ok_pred})::int AS completed,
+               COUNT(*) FILTER (WHERE {fail_pred})::int AS failed
+        FROM user_logs l
+        LEFT JOIN routes r ON r.user_id = l.user_id,
+        LATERAL (SELECT COALESCE(NULLIF(l.doc->>'job_kind',''),
+                                 NULLIF(l.doc->>'wake_kind',''),
+                                 NULLIF(l.doc->>'trigger',''),'unknown') AS kind) k
+        WHERE l.stream IN ('proactive_jobs','memory_capture_jobs')
+          AND COALESCE(r.route,'resident') = 'resident'
+          AND {_LANE_ROLLUP_V1_TS} >= %s
+          AND {_LANE_ROLLUP_V1_TS} < %s
+        GROUP BY l.user_id, lane
+        """,
+        (start, end),
+    ).fetchall()
+    if not rows:
+        return 0
+    codes: dict[tuple[str, str], dict[str, int]] = {}
+    for uid, lane, code, n in conn.execute(
+        f"""
+        WITH routes AS (
+            SELECT user_id,
+                   lower(COALESCE(NULLIF(doc->>'route',''),'resident')) AS route
+            FROM user_blobs WHERE kind = 'onboarding_route'
+        )
+        SELECT l.user_id, {_LANE_ROLLUP_V1_LANE} AS lane,
+               l.doc->>'status_reason', COUNT(*)::int
+        FROM user_logs l
+        LEFT JOIN routes r ON r.user_id = l.user_id,
+        LATERAL (SELECT COALESCE(NULLIF(l.doc->>'job_kind',''),
+                                 NULLIF(l.doc->>'wake_kind',''),
+                                 NULLIF(l.doc->>'trigger',''),'unknown') AS kind) k
+        WHERE l.stream IN ('proactive_jobs','memory_capture_jobs')
+          AND COALESCE(r.route,'resident') = 'resident'
+          AND {fail_pred}
+          AND NULLIF(l.doc->>'status_reason','') IS NOT NULL
+          AND {_LANE_ROLLUP_V1_TS} >= %s
+          AND {_LANE_ROLLUP_V1_TS} < %s
+        GROUP BY l.user_id, lane, l.doc->>'status_reason'
+        """,
+        (start, end),
+    ).fetchall():
+        key = (str(uid), str(lane))
+        clean = (str(code) if _LANE_ROLLUP_CODE_RE.match(str(code))
+                 else "runtime_failed")
+        cell = codes.setdefault(key, {})
+        cell[clean] = cell.get(clean, 0) + int(n)
+    written = 0
+    day_s = day.isoformat()
+    cell_sql = """
+            INSERT INTO lane_daily_rollup
+                (user_id, day, route, lane, enqueue_source,
+                 completed, failed, expired, superseded, failure_codes)
+            SELECT u.user_id, %s, 'resident', %s, '', %s, %s, 0, 0, %s
+            FROM users u WHERE u.user_id = %s FOR KEY SHARE OF u
+            ON CONFLICT (user_id, day, route, lane, enqueue_source) DO NOTHING
+            RETURNING user_id
+            """
+    for uid, lane, completed, failed in rows:
+        if not completed and not failed:
+            continue  # 该组全是非终态,不落格子
+        params = (day_s, lane, completed, failed,
+                  Jsonb(codes.get((str(uid), str(lane)), {})), uid)
+        saved = conn.execute(cell_sql, params).fetchone()
+        if saved:
+            written += 1
+        if mirror_batch is not None:
+            mirror_batch.append((cell_sql, params))
+    return written
+
+
+def freeze_completed_resident_lane_days(*, now_epoch: float | None = None,
+                                        tz: str = "Asia/Shanghai") -> list[str]:
+    """Freeze route='resident' cells with a 4h lag (a job created 23:58 that
+    terminates 00:03 patches its user_logs doc after its creation day closed —
+    the lag guarantees day D is only frozen once no D job can still be
+    patched). First run anchors ``backfill_from`` at the oldest surviving
+    user_logs row — the ring already ate everything older, and that loss is
+    recorded honestly as coverage.partial_before rather than papered over.
+    ⚠️ The ring rolls per user, so days shortly AFTER partial_before may still
+    be per-user incomplete near the boundary; partial_before means "nothing
+    before this", not "everything after this".
+    """
+    try:
+        zone = ZoneInfo(tz)
+        now = (datetime.fromtimestamp(float(now_epoch), zone)
+               if now_epoch is not None else datetime.now(zone))
+        last_completed = (now - timedelta(hours=4)).date() - timedelta(days=1)
+        frozen: list[str] = []
+        with get_pool().connection() as conn:
+            row = conn.execute(
+                "SELECT backfill_from, through_day FROM lane_rollup_watermark "
+                "WHERE route = 'resident'",
+            ).fetchone()
+            if row:
+                cursor = date.fromisoformat(row[1]) + timedelta(days=1)
+                backfill_from = row[0]
+            else:
+                oldest = conn.execute(
+                    "SELECT MIN(ts) FROM user_logs "
+                    "WHERE stream IN ('proactive_jobs','memory_capture_jobs')",
+                ).fetchone()
+                if not oldest or oldest[0] is None:
+                    return []
+                cursor = datetime.fromtimestamp(float(oldest[0]), zone).date()
+                backfill_from = cursor.isoformat()
+            steps = 0
+            watermark_sql = """
+                    INSERT INTO lane_rollup_watermark (route, backfill_from, through_day)
+                    VALUES ('resident', %s, %s)
+                    ON CONFLICT (route) DO UPDATE
+                        SET through_day = EXCLUDED.through_day, frozen_at = now()
+                    """
+            from tee_shadow import mirror
+            while cursor <= last_completed and steps < _LANE_ROLLUP_MAX_DAYS_PER_TICK:
+                mirror_batch: list[tuple[str, tuple]] = []
+                _lane_rollup_freeze_resident_day(conn, day=cursor, zone=zone,
+                                                 mirror_batch=mirror_batch)
+                wm_params = (backfill_from, cursor.isoformat())
+                conn.execute(watermark_sql, wm_params)
+                mirror_batch.append((watermark_sql, wm_params))
+                mirror.execute_many(mirror_batch)
+                frozen.append(cursor.isoformat())
+                cursor += timedelta(days=1)
+                steps += 1
+        return frozen
+    except Exception as e:
+        log.error("[db] freeze_completed_resident_lane_days failed: %s", e)
         return []
 
 
@@ -4583,26 +4874,55 @@ def admin_lane_rollup(*, user_id: str = "", lane: str = "", route: str = "",
                 "through_day": r[2],
                 "partial_before": r[1],
             }
-        # The open Beijing day cannot be frozen yet — surface it as a live,
-        # explicitly non-frozen estimate so "today looks empty" never reads
-        # as an outage. Same aggregation as the freezer, same filters.
+        # Days after the watermark cannot be frozen yet — surface them live and
+        # explicitly non-frozen, so a still-open day (or resident's 4h freeze
+        # lag) never reads as "no activity". Deriving the window from the
+        # WATERMARK rather than hardcoding "today" also means a stalled freezer
+        # widens the live window instead of silently showing an empty gap.
         today_rows: list[dict] = []
-        include_today = ((not route or route == "model_api")
-                         and (not until_day or until_day >= today.isoformat())
-                         and (not since_day or since_day <= today.isoformat()))
-        if include_today:
-            start, end = _lane_rollup_day_bounds(today, zone)
-            live_where = ["status = ANY(%s)", "finished_at >= %s", "finished_at < %s"]
-            live_params: list = [list(_LANE_ROLLUP_TERMINAL), start, end]
-            if user_id:
-                live_where.append("user_id = %s")
-                live_params.append(user_id)
-            if lane:
-                live_where.append("lane = %s")
-                live_params.append(lane)
-            for r in conn.execute(
-                f"""
-                SELECT user_id, lane,
+        for live_route in ("model_api", "resident"):
+            if route and route != live_route:
+                continue
+            wm = coverage.get(live_route)
+            # 无水位 = 冻结器从未跑过（首次启动）或彻底停摆。此时若只补「今天」，
+            # 昨天既没冻结也不在 live 窗口里 —— 端点会把它显示成「没有活动」。
+            # codex2 实证过这条静默漏报，所以无水位时按受限缺口的最大宽度回看。
+            gap_start = (date.fromisoformat(wm["through_day"]) + timedelta(days=1)
+                         if wm
+                         else today - timedelta(days=_LANE_ROLLUP_LIVE_MAX_DAYS - 1))
+            if gap_start > today:
+                continue
+            # Bound the live scan: a long-dead freezer must not turn one admin
+            # GET into an unbounded historical aggregate (the exact failure
+            # this whole table exists to retire). What we refuse to compute is
+            # declared, not silently dropped.
+            if (today - gap_start).days >= _LANE_ROLLUP_LIVE_MAX_DAYS:
+                gap_start = today - timedelta(days=_LANE_ROLLUP_LIVE_MAX_DAYS - 1)
+            if wm is None or gap_start > date.fromisoformat(wm["through_day"]) + timedelta(days=1):
+                # 有水位时=水位落后于窗口上限;无水位时=从未冻结。两种情况读的人都
+                # 必须能分辨「这天真没活动」与「这天在我的回看范围之外」。
+                coverage.setdefault(live_route, {})["live_truncated_before"] = (
+                    gap_start.isoformat())
+            if until_day and until_day < gap_start.isoformat():
+                continue
+            if since_day and since_day > today.isoformat():
+                continue
+            win_start, _ = _lane_rollup_day_bounds(gap_start, zone)
+            _, win_end = _lane_rollup_day_bounds(today, zone)
+            live_params: list = [tz]
+            if live_route == "model_api":
+                live_where = ["status = ANY(%s)",
+                              "finished_at >= %s", "finished_at < %s"]
+                live_params += [list(_LANE_ROLLUP_TERMINAL), win_start, win_end]
+                if user_id:
+                    live_where.append("user_id = %s")
+                    live_params.append(user_id)
+                if lane:
+                    live_where.append("lane = %s")
+                    live_params.append(lane)
+                live_sql = f"""
+                SELECT to_char(timezone(%s, finished_at), 'YYYY-MM-DD') AS day,
+                       user_id, lane,
                        CASE WHEN lane = 'heartbeat'
                             THEN CASE WHEN reason IS NULL THEN 'clock' ELSE 'perception' END
                             ELSE '' END AS enqueue_source,
@@ -4612,20 +4932,160 @@ def admin_lane_rollup(*, user_id: str = "", lane: str = "", route: str = "",
                        COUNT(*) FILTER (WHERE status = 'superseded')::int
                 FROM agent_jobs
                 WHERE {' AND '.join(live_where)}
-                GROUP BY user_id, lane, enqueue_source
-                ORDER BY user_id, lane, enqueue_source
-                """,
-                live_params,
-            ).fetchall():
-                today_rows.append(
-                    {"user_id": r[0], "day": today.isoformat(),
-                     "route": "model_api", "lane": r[1], "enqueue_source": r[2],
-                     "completed": r[3], "failed": r[4], "expired": r[5],
-                     "superseded": r[6], "failure_codes": {}, "frozen": False}
+                GROUP BY day, user_id, lane, enqueue_source
+                ORDER BY day, user_id, lane, enqueue_source
+                """
+            else:
+                live_where = [f"{_LANE_ROLLUP_V1_TS} >= %s",
+                              f"{_LANE_ROLLUP_V1_TS} < %s"]
+                live_params += [win_start, win_end]
+                if user_id:
+                    live_where.append("l.user_id = %s")
+                    live_params.append(user_id)
+                _ok = _LANE_ROLLUP_V1_OK_PRED.format(mem=_LANE_ROLLUP_V1_IS_MEMORY)
+                _fail = _LANE_ROLLUP_V1_FAIL_PRED.format(mem=_LANE_ROLLUP_V1_IS_MEMORY)
+                live_sql = f"""
+                WITH routes AS (
+                    SELECT user_id,
+                           lower(COALESCE(NULLIF(doc->>'route',''),'resident')) AS route
+                    FROM user_blobs WHERE kind = 'onboarding_route'
                 )
+                SELECT to_char(timezone(%s, {_LANE_ROLLUP_V1_TS}),
+                               'YYYY-MM-DD') AS day,
+                       l.user_id, {_LANE_ROLLUP_V1_LANE} AS lane, '' AS enqueue_source,
+                       COUNT(*) FILTER (WHERE {_ok})::int,
+                       COUNT(*) FILTER (WHERE {_fail})::int,
+                       0, 0
+                FROM user_logs l
+                LEFT JOIN routes r ON r.user_id = l.user_id,
+                LATERAL (SELECT COALESCE(NULLIF(l.doc->>'job_kind',''),
+                                         NULLIF(l.doc->>'wake_kind',''),
+                                         NULLIF(l.doc->>'trigger',''),'unknown') AS kind) k
+                WHERE l.stream IN ('proactive_jobs','memory_capture_jobs')
+                  AND COALESCE(r.route,'resident') = 'resident'
+                  AND {' AND '.join(live_where)}
+                GROUP BY day, l.user_id, lane
+                ORDER BY day, l.user_id, lane
+                """
+            for r in conn.execute(live_sql, live_params).fetchall():
+                if lane and str(r[2]) != lane:
+                    continue  # resident lane is a derived CASE — filter in Python
+                if since_day and r[0] < since_day:
+                    continue
+                if until_day and r[0] > until_day:
+                    continue
+                if not r[4] and not r[5] and not r[6] and not r[7]:
+                    continue
+                today_rows.append(
+                    {"user_id": r[1], "day": r[0], "route": live_route,
+                     "lane": r[2], "enqueue_source": r[3],
+                     "completed": r[4], "failed": r[5], "expired": r[6],
+                     "superseded": r[7], "failure_codes": {}, "frozen": False}
+                )
+        # stuck：实时查询，与失败率并排返回（见常量处的口径说明）。带 job 定位信息
+        # ——Seven 要求「能点到具体 job」，只给数字等于又造一个查不下去的聚合。
+        stuck_rows: list[dict] = []
+        # deadline 判据必须 status-aware：一个 running 的 job 早就离开队列了，
+        # 它的 queue_deadline_at 过期是**正常**的，只要租约还在就没卡住。三字段
+        # 无差别 OR 会把健康的 running 报成 stuck（codex2 PG 复现），而 stuck 一旦
+        # 有假阳性就没人会再认真看它——那等于这个指标白加。
+        #
+        # **整条 CASE 逐字照抄 jobs_store 的权威 stale 契约**
+        # （jobs_store.py:631-638 / :2045-2051），TTL 直接 import 同一个常量而不
+        # 另造一份——判据只能有一份来源，两处各写一份迟早会漂。
+        #
+        # 分两轮才抄全，两轮的教训是同一个：**「差不多」不算同源**。
+        #   第一轮 claimed/running 我写成「lease 过期 AND COALESCE(...) 过期」，
+        #     比权威更严 → 租约过 1 分钟、deadline 还有 1 小时的 job 被漏判；
+        #   第二轮 pending 我只判 queue_deadline_at，漏了 deadline_at 与 chat 的
+        #     created_at+TTL 两级 fallback → queue_deadline 为 NULL 的 dream/chat
+        #     pending 被漏判（两条都由 codex2 在全新 PG head 上实证）。
+        # 同一个 job，jobs_store 判 stale 而面板判不 stuck，比缺这个指标更坏。
+        from model_api_runtime.v2.jobs_store import PENDING_CHAT_TTL_SEC
+        stuck_where = [
+            "status = ANY(%s)",
+            "(CASE WHEN status='pending' THEN "
+            "  COALESCE(queue_deadline_at,deadline_at,"
+            "    CASE WHEN lane='chat' THEN "
+            "      created_at + make_interval(secs => %s) END) "
+            "      <= clock_timestamp() "
+            "ELSE COALESCE(lease_expires_at,deadline_at) IS NOT NULL "
+            "  AND COALESCE(lease_expires_at,deadline_at) "
+            "      <= clock_timestamp() END)",
+        ]
+        stuck_params: list = [list(_LANE_ROLLUP_NONTERMINAL),
+                              float(PENDING_CHAT_TTL_SEC)]
+        if user_id:
+            stuck_where.append("user_id = %s")
+            stuck_params.append(user_id)
+        if lane:
+            stuck_where.append("lane = %s")
+            stuck_params.append(lane)
+        if not route or route == "model_api":
+            for r in conn.execute(
+                f"""
+                SELECT user_id, lane, COUNT(*)::int,
+                       MIN(created_at), (array_agg(id ORDER BY created_at))[1:5]
+                FROM agent_jobs
+                WHERE {' AND '.join(stuck_where)}
+                GROUP BY user_id, lane ORDER BY 3 DESC
+                """,
+                stuck_params,
+            ).fetchall():
+                stuck_rows.append(
+                    {"user_id": r[0], "route": "model_api", "lane": r[1],
+                     "count": r[2], "oldest_at": r[3].isoformat() if r[3] else None,
+                     "job_ids": [int(x) for x in (r[4] or [])],
+                     "basis": "past_own_deadline"})
+        if not route or route == "resident":
+            cutoff = (datetime.now(zone)
+                      - timedelta(hours=_LANE_ROLLUP_STUCK_AFTER_HOURS))
+            v1_where = ["l.stream IN ('proactive_jobs','memory_capture_jobs')",
+                        "COALESCE(r.route,'resident') = 'resident'",
+                        "COALESCE(l.doc->>'status','') = ANY(%s)",
+                        f"{_LANE_ROLLUP_V1_CREATED_TS} < %s"]
+            v1_params: list = [list(_LANE_ROLLUP_V1_NONTERMINAL), cutoff]
+            if user_id:
+                v1_where.append("l.user_id = %s")
+                v1_params.append(user_id)
+            for r in conn.execute(
+                f"""
+                WITH routes AS (
+                    SELECT user_id,
+                           lower(COALESCE(NULLIF(doc->>'route',''),'resident')) AS route
+                    FROM user_blobs WHERE kind = 'onboarding_route'
+                )
+                SELECT l.user_id, {_LANE_ROLLUP_V1_LANE} AS lane, COUNT(*)::int,
+                       MIN(l.ts), (array_agg(l.seq ORDER BY l.ts))[1:5]  -- noqa
+                FROM user_logs l
+                LEFT JOIN routes r ON r.user_id = l.user_id,
+                LATERAL (SELECT COALESCE(NULLIF(l.doc->>'job_kind',''),
+                                         NULLIF(l.doc->>'wake_kind',''),
+                                         NULLIF(l.doc->>'trigger',''),'unknown') AS kind) k
+                WHERE {' AND '.join(v1_where)}
+                GROUP BY l.user_id, lane ORDER BY 3 DESC
+                """,
+                v1_params,
+            ).fetchall():
+                if lane and str(r[1]) != lane:
+                    continue
+                stuck_rows.append(
+                    {"user_id": r[0], "route": "resident", "lane": r[1],
+                     "count": r[2],
+                     "oldest_at": (datetime.fromtimestamp(float(r[3]), timezone.utc)
+                                   .isoformat() if r[3] else None),
+                     "job_seqs": [int(x) for x in (r[4] or [])],
+                     "basis": "older_than_threshold"})
     return {
         "rows": out_rows,
         "today_partial": today_rows,
+        "stuck": {
+            "rows": stuck_rows,
+            "total": sum(r["count"] for r in stuck_rows),
+            "stuck_after_hours": _LANE_ROLLUP_STUCK_AFTER_HOURS,
+            "note": ("非终态尝试不进失败率的分子或分母（Seven 2026-08-18 定 A）；"
+                     "它们只出现在这里，必须与失败率并排读"),
+        },
         "coverage": coverage,
         "pagination": {"limit": int(limit), "offset": int(offset),
                        "returned": len(out_rows), "total": int(total)},

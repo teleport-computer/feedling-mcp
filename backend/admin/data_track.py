@@ -3981,11 +3981,52 @@ _HOME_WIDGET_CSS = """
 _HOME_PAGE_CSS = _RUNTIME_PAGE_CSS + _HOME_WIDGET_CSS
 
 
+def _render_stuck_block(stuck: dict | None) -> str:
+    """卡住的非终态尝试 —— 与失败率并排（Seven 2026-08-18 定 A）。
+
+    失败率只统计已终结的尝试，永久卡在 pending/claimed/realizing 的 job 因此
+    从失败率里彻底消失。这个区块是它唯一的出口，所以刻意放在 lane 表旁边而不是
+    次级页面。``stuck`` 为 None（独立失败域取不到）时显「暂不可用」而不是 0 ——
+    0 意味着「确认过是零」，与本页其余部分同一姿态。
+    """
+    if stuck is None:
+        return ("<section class='card'><h3>卡住的尝试</h3>"
+                "<p class='muted'>暂不可用</p></section>")
+    rows = stuck.get("rows") or []
+    total = int(stuck.get("total") or 0)
+    hours = stuck.get("stuck_after_hours")
+    head = (f"<section class='card'><h3>卡住的尝试 · {total}</h3>"
+            f"<p class='muted'>非终态尝试不计入失败率的分子或分母，只在这里出现；"
+            f"resident 判据为超过 {hours} 小时未终结，model_api 判据为已过其自身"
+            f" deadline。</p>")
+    if not rows:
+        return head + "<p class='muted'>窗口内没有卡住的尝试。</p></section>"
+    body = ["<table><thead><tr><th>用户</th><th>路线</th><th>道</th>"
+            "<th>数量</th><th>最早</th><th>定位</th></tr></thead><tbody>"]
+    for r in rows[:50]:
+        ids = r.get("job_ids") or r.get("job_seqs") or []
+        body.append(
+            "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td>"
+            "<td>{}</td></tr>".format(
+                html.escape(str(r.get("user_id") or "")),
+                html.escape(str(r.get("route") or "")),
+                html.escape(str(r.get("lane") or "")),
+                int(r.get("count") or 0),
+                html.escape(str(r.get("oldest_at") or "—")),
+                html.escape(",".join(str(x) for x in ids[:5])) or "—",
+            ))
+    body.append("</tbody></table>")
+    if len(rows) > 50:
+        body.append(f"<p class='muted'>另有 {len(rows) - 50} 组未列出。</p>")
+    return head + "".join(body) + "</section>"
+
+
 def _render_runtime_health_page(
     payload: dict,
     tokens: dict | None = None,
     delivery: dict | None = None,
     user_report: dict | None = None,
+    stuck: dict | None = None,
 ) -> str:
     """Runtime V2 全 lane 运行时健康值班台（?view=runtime）。
 
@@ -4389,6 +4430,7 @@ def _render_runtime_health_page(
     <thead><tr><th>Lane</th><th>样本</th><th>成功</th><th>原始失败</th><th>过期</th><th>系统故障<br><span class='muted'>含过期</span></th><th>控制切流</th><th>安全抑制</th><th>终态未成功率</th><th>系统故障率</th><th>p50(成功)</th><th>p95(成功)</th><th>捕获 见终态·无缺口/有缺口/漏写/在飞</th><th>开口回合/回合<br><span class='muted'>仅 screen_watch</span></th><th>token 入/出</th><th>缓存命中</th><th>上报 usage/cache</th></tr></thead>
     <tbody>{''.join(lane_rows) if lane_rows else "<tr><td colspan='17' class='muted'>当前窗口无 job。</td></tr>"}</tbody>
   </table></div>
+  {_render_stuck_block(stuck)}
   {_render_runtime_user_report(user_report)}
   <h2>未成功原因 Top</h2>
   <div class="table-wrap"><table>
