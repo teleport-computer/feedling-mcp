@@ -42,10 +42,14 @@ TEE-primary 配置；也不在代码里枚举三张已知失败表的业务键�
 单条 UPSERT 的输入行没有顺序保证，可能先插入新 active 行，再更新旧 active 行，
 从而撞 partial unique index `model_api_routes_one_active`。
 
-本机 PostgreSQL 临时事务验证了同一条 set-based UPDATE 可将两个 retained rows 的
-partial-unique 状态从 `(true, false)` 原子切换为 `(false, true)`。因此新增步骤 3：
-先批量更新所有 retained rows，使它们释放旧业务唯一键，再允许步骤 4 插入新主键。
-该操作仍按公共列和主键生成 SQL，不感知 `is_active`、表名或任何具体唯一索引。
+因此新增步骤 3：先批量更新 retained rows，使当前线上旧 active owner 释放业务唯一
+键，再允许步骤 4 插入尚不存在于 TEE 的新 active 主键。该操作仍按公共列和主键生成
+SQL，不感知 `is_active`、表名或任何具体唯一索引。
+
+该顺序不承诺解决所有 retained-to-retained 唯一键交换：如果新旧 owner 两个主键都已
+存在于目标端，PostgreSQL 的 non-deferrable unique index 仍可能在 set-based UPDATE
+内部报冲突。此形状不属于当前 TEST 现场；若出现会继续作为 `snapshot_failures` 红灯
+保留旧快照并要求单独设计，而不会静默产生错误数据。
 
 ## 错误处理与安全边界
 

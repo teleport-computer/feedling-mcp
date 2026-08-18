@@ -156,9 +156,9 @@ def _merge_payload(
             for c in mutable_cols
         )
         # Release secondary/partial unique keys held by retained rows before
-        # the UPSERT is allowed to insert new primary keys.  A single set-based
-        # UPDATE also lets PostgreSQL validate retained-row key transitions as
-        # one statement rather than in arbitrary COPY order.
+        # the UPSERT is allowed to insert new primary keys.  This covers the
+        # live shape where an existing owner is disabled before its replacement
+        # primary key is inserted, independently of arbitrary COPY order.
         dst.execute(sql.SQL(
             "UPDATE {} AS target SET {} FROM {} AS staged "
             "WHERE {} AND ({})"
