@@ -10,6 +10,13 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **Managed database promotion now validates the complete API-and-runner release
+  unit before deployment.** The TEST deployment forwards one explicit database
+  schema selector to the API, in-CVM worker, and independent runner. When TEE
+  primary mode is selected, CI requires the owner migration credentials, checks
+  the exact TEE migration head, and exercises the application startup contract
+  before changing either confidential VM.
+
 - **Self-hosted resident replies no longer become permanently lost when a long
   agent turn crosses the consumer freshness window.** Resident liveness now
   follows the newest poll or accepted response activity, and a current response
