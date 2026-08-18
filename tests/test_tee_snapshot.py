@@ -53,6 +53,27 @@ def unique_key_table():
             c.execute(f"DROP TABLE IF EXISTS {table}")
 
 
+@pytest.fixture
+def partial_unique_key_table():
+    table = "_snap_partial_unique_probe"
+    ddl = (
+        f"CREATE TABLE {table} ("
+        "id TEXT PRIMARY KEY, user_id TEXT NOT NULL, is_active BOOLEAN NOT NULL)"
+    )
+    for pool in (db.get_pool(), mirror.get_tee_pool()):
+        with pool.connection() as c:
+            c.execute(f"DROP TABLE IF EXISTS {table}")
+            c.execute(ddl)
+            c.execute(
+                f"CREATE UNIQUE INDEX {table}_one_active "
+                f"ON {table} (user_id) WHERE is_active"
+            )
+    yield table
+    for pool in (db.get_pool(), mirror.get_tee_pool()):
+        with pool.connection() as c:
+            c.execute(f"DROP TABLE IF EXISTS {table}")
+
+
 def _tee_rows(table: str) -> list[tuple]:
     with mirror.get_tee_pool().connection() as c:
         return c.execute(f"SELECT k, v FROM {table} ORDER BY k").fetchall()
@@ -140,6 +161,33 @@ def test_snapshot_releases_stale_secondary_unique_key_before_upsert(unique_key_t
         assert c.execute(
             f"SELECT id, business_key, v FROM {unique_key_table}"
         ).fetchall() == [("source-id", "same-key", "source")]
+
+
+def test_snapshot_updates_retained_unique_owner_before_inserting_new_owner(
+        partial_unique_key_table):
+    with db.get_pool().connection() as c:
+        c.execute(
+            f"INSERT INTO {partial_unique_key_table} (id, user_id, is_active) VALUES "
+            "('new-active', 'user', TRUE), "
+            "('retained-old', 'user', FALSE)"
+        )
+    with mirror.get_tee_pool().connection() as c:
+        c.execute(
+            f"INSERT INTO {partial_unique_key_table} (id, user_id, is_active) "
+            "VALUES ('retained-old', 'user', TRUE)"
+        )
+
+    rep = snapshot.snapshot_table(partial_unique_key_table)
+
+    assert rep["ok"] is True
+    with mirror.get_tee_pool().connection() as c:
+        assert c.execute(
+            f"SELECT id, user_id, is_active FROM {partial_unique_key_table} "
+            "ORDER BY id"
+        ).fetchall() == [
+            ("new-active", "user", True),
+            ("retained-old", "user", False),
+        ]
 
 
 def test_snapshot_parent_update_preserves_external_child(fk_tables):
