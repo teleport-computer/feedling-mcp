@@ -6,6 +6,15 @@ on:
   pull_request:
     branches: [main, test, pre]
   workflow_dispatch:
+    inputs:
+      operation:
+        description: "Optional maintenance operation"
+        required: false
+        default: validate
+        type: choice
+        options:
+          - validate
+          - restart-test-cvm
 
 # Pull-request validation is replaceable, but branch pushes may already be
 # between the main-CVM and runner-CVM mutations. Never cancel a release unit.
@@ -14,6 +23,82 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  # Restart the existing Test CVM without changing its compose, image, sealed
+  # environment, database, or on-chain authorization. This is intentionally
+  # dispatch-only and branch-locked so it can never target prod by accident.
+  restart-test-cvm:
+    name: restart CVM (test)
+    if: >-
+      github.event_name == 'workflow_dispatch' &&
+      github.ref == 'refs/heads/test' &&
+      inputs.operation == 'restart-test-cvm'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    concurrency:
+      group: restart-test-cvm
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install phala CLI
+        run: npm install -g phala@1.1.19
+
+      - name: Restart Test CVM and wait for Phala readiness
+        env:
+          PHALA_CLOUD_API_KEY: ${{ secrets.TEST_PHALA_CLOUD_API_KEY }}
+        run: |
+          if [ -z "$PHALA_CLOUD_API_KEY" ]; then
+            echo "::error::TEST_PHALA_CLOUD_API_KEY is not configured"
+            exit 1
+          fi
+          CVM_ID=$(tr -d '[:space:]' < deploy/test-cvm-id.txt)
+          if [ -z "$CVM_ID" ]; then
+            echo "::error::deploy/test-cvm-id.txt is empty"
+            exit 1
+          fi
+          phala cvms restart "$CVM_ID" --api-token "$PHALA_CLOUD_API_KEY"
+          ./deploy/wait-cvm-ready.sh "$CVM_ID" 900
+
+      - name: Require stable Test API transport
+        env:
+          TEST_API_URL: https://test-api.feedling.app
+          TEST_ENCLAVE_URL: ${{ vars.TEST_MAIN_ENCLAVE_URL }}
+        run: |
+          if [ -z "$TEST_ENCLAVE_URL" ]; then
+            echo "::error::TEST_MAIN_ENCLAVE_URL is not configured"
+            exit 1
+          fi
+          deadline=$((SECONDS + 600))
+          consecutive=0
+          attempt=0
+          while [ "$SECONDS" -lt "$deadline" ]; do
+            attempt=$((attempt + 1))
+            api_code=$(curl --silent --show-error \
+              --connect-timeout 8 --max-time 15 \
+              --output /dev/null --write-out '%{http_code}' \
+              "$TEST_API_URL/healthz" || true)
+            enclave_code=$(curl --silent --show-error \
+              --connect-timeout 8 --max-time 15 \
+              --output /dev/null --write-out '%{http_code}' \
+              "$TEST_ENCLAVE_URL/healthz" || true)
+            if [ "$api_code" = "200" ] && [ "$enclave_code" = "200" ]; then
+              consecutive=$((consecutive + 1))
+              echo "probe $attempt: API 200, enclave 200 ($consecutive/10 consecutive)"
+              if [ "$consecutive" -ge 10 ]; then
+                echo "Test API and enclave transports are stable"
+                exit 0
+              fi
+            else
+              echo "probe $attempt: API ${api_code:-transport-error}, enclave ${enclave_code:-transport-error}; resetting streak"
+              consecutive=0
+            fi
+            sleep 10
+          done
+          echo "::error::Test API did not reach 10 consecutive healthy probes within 10 minutes"
+          exit 1
+
   # -------------------------------------------------------------------------
   # Solidity — FeedlingAppAuth contract tests
   # -------------------------------------------------------------------------
