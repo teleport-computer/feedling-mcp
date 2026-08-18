@@ -167,16 +167,26 @@ and not media` 整条判断不成立,空回复静默走完、终态 ok、零条�
 正常路径零事件;唯一一处是 `setup_core.py:262` 的目录/探测打架分支。
 种子清单写的"零 trace"精确说法应为"**正常路径零 trace,仅异常分支一处**"。
 
-### 【存疑,不入红格】broadcast_opened「源头三个配置关着」
-种子清单称源头配置关闭导致下游六处成孤儿。**代码不支持这个说法**:
-`proactive/controls_v2.py:44-55` 的 `default_switches_v2()` 里
-`SWITCH_SCREEN_WATCH_ENABLED` 默认 **True**,消费侧的门(`controls_v2.py:263-268`)
-默认是开的。
+### 【UNKNOWN,不入红格】broadcast_opened「源头三个配置关着 / 下游六处是孤儿」
 
-结论:要么该说法指的不是这个后端开关(可能是 iOS 侧广播状态上报,或 perception
-的 `broadcast_state` 信号源),要么它已经过时。**在弄清"三个配置"具体指哪三个
-之前,这一格标 UNKNOWN 而不是红** —— 编码一个假红格会把修复引向错的地方,
-比留空更坏。待与提出者(claude4 / Supervisor)对齐后回填。
+**来源**:Supervisor 的长期记忆条目(「边沿要是一等事件」),给种子清单时未回核。
+
+**代码层已证伪**(claude2 与 Supervisor 各自独立核过,结论一致):
+- `proactive/controls_v2.py:44-55` `default_switches_v2()` —— 九个开关
+  **全部默认 True**,不存在"三个关着";
+- `broadcast_opened` **有产有消,不是孤儿**:
+  产于 `perception/differ_v2.py:200`、`perception/service.py:736`;
+  消费于 `controls_v2.py:265`、`proactive/gate.py:84,97`、`glance.py:22`、
+  `adapters_v2.py:27`、`admin/data_track.py:826`。
+
+**仅存的可能**:那句"三个配置"指的不是代码默认值,而是 **prod 上的按用户配置 /
+运行时开关**。代码默认 True ≠ 生产实际开着 —— V2 记忆维护 lane 刚出过同款:
+开关要声明在 serve-worker,prod 漏配导致整条 lane 从未在生产跑过。
+**这需要查 prod 实际配置才能定,未查之前不下结论。**
+
+**为什么保持 UNKNOWN 而不是红**:红格是要排优先级、派人干活的。编码一个假红格
+会把修复引向错的地方,比留空更坏。这一格的存在本身也是提醒:
+**记忆记录的是写下那一刻的事实,不保证今天仍成立;拿记忆当实证之前要回核。**
 
 ## 四、下一步
 
