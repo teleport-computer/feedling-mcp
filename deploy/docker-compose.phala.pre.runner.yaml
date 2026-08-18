@@ -64,7 +64,7 @@ services:
   # re-acquires here resumes from a consistent cursor (no cross-runner
   # stale-checkpoint wedge).
   agent-runner:
-    image: ghcr.io/teleport-computer/feedling-agent-runner:73a80ab   # CI pins the sha
+    image: ghcr.io/teleport-computer/feedling-agent-runner:a58d6e0   # CI pins the sha
     container_name: agent-runner
     command: ["python", "-u", "backend/agent_runtime/supervisor.py"]
     restart: unless-stopped
