@@ -32,7 +32,7 @@ def test_reply_tool_schema_shape():
     assert reply.parameters["properties"]["text"]["type"] == "string"
 
 
-def test_t101_reply_description_keeps_progress_separate_from_final_reply():
+def test_t140_reply_description_allows_complete_bubble_to_end_turn():
     description = next(
         spec.description for spec in tool_schema.build_tool_specs()
         if spec.name == "reply"
@@ -40,9 +40,11 @@ def test_t101_reply_description_keeps_progress_separate_from_final_reply():
 
     assert "long-running task" in description
     assert "immediate reply bubble" in description
-    assert "not the final reply" in description
-    assert "must not include <think>" in description
-    assert "must not replace the final reply" in description
+    assert "without <think>" in description
+    assert "end the turn with no additional visible text" in description
+    assert "do not repeat it" in description
+    assert "only when you still have new content" in description
+    assert "must not replace the final reply" not in description
 
 
 def test_t101_perception_and_screen_gates_reach_final_tool_descriptions():
