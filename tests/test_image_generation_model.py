@@ -433,3 +433,102 @@ def test_route_probe_maps_text_only_model_to_configuration_error(monkeypatch):
             "error": "image_generation_model_incompatible",
         }
     ]
+
+
+def _configure_rollback_env(monkeypatch, *, select_status, routes_before=()):
+    """Wire image_generation_route_configure so create succeeds and select
+    returns select_status; record every rollback delete in order."""
+    deleted = []
+    monkeypatch.setattr(
+        setup_core.db,
+        "model_api_routes_list",
+        lambda _uid: [{"id": route_id} for route_id in routes_before],
+    )
+    monkeypatch.setattr(
+        setup_core.model_api_route_create,
+        "__wrapped__",
+        lambda _store, _payload, **_kwargs: ({
+            "route": {"id": "new-route", "credential_id": "new-credential"}
+        }, 200),
+    )
+    monkeypatch.setattr(
+        setup_core.image_generation_config_set,
+        "__wrapped__",
+        lambda _store, _payload, **_kwargs: (
+            ({"config": {}}, 200)
+            if select_status == 200
+            else ({"error": "image_generation_invalid_output"}, select_status)
+        ),
+    )
+    monkeypatch.setattr(
+        setup_core.db,
+        "model_api_route_delete",
+        lambda uid, route_id: deleted.append(("route", uid, route_id)) or True,
+    )
+    monkeypatch.setattr(
+        setup_core.db,
+        "model_api_credential_delete",
+        lambda uid, credential_id: deleted.append(
+            ("credential", uid, credential_id)
+        ) or True,
+    )
+    return deleted
+
+
+def test_failed_configure_with_new_key_rolls_back_route_and_credential(monkeypatch):
+    deleted = _configure_rollback_env(monkeypatch, select_status=502)
+
+    body, status = setup_core.image_generation_route_configure.__wrapped__(
+        _store(),
+        {"provider": "openai", "model": "gpt-image-2", "api_key": "secret"},
+        caller_api_key="caller-key",
+    )
+
+    assert (body, status) == ({"error": "image_generation_invalid_output"}, 502)
+    # 路线必须显式删:tee schema 没有 credential→route 级联,只删凭据会留下
+    # JOIN 不出来、用户也删不掉的僵尸路线(2026-08 生图排查实锤)。
+    assert deleted == [
+        ("route", "image-user", "new-route"),
+        ("credential", "image-user", "new-credential"),
+    ]
+
+
+def test_failed_configure_with_reused_credential_keeps_credential(monkeypatch):
+    deleted = _configure_rollback_env(monkeypatch, select_status=502)
+
+    body, status = setup_core.image_generation_route_configure.__wrapped__(
+        _store(),
+        {"credential_id": "new-credential", "model": "gpt-image-2"},
+        caller_api_key="caller-key",
+    )
+
+    assert status == 502
+    assert deleted == [("route", "image-user", "new-route")]
+
+
+def test_failed_configure_leaves_preexisting_route_untouched(monkeypatch):
+    deleted = _configure_rollback_env(
+        monkeypatch, select_status=502, routes_before=("new-route",)
+    )
+
+    body, status = setup_core.image_generation_route_configure.__wrapped__(
+        _store(),
+        {"provider": "openai", "model": "gpt-image-2", "api_key": "secret"},
+        caller_api_key="caller-key",
+    )
+
+    assert status == 502
+    assert deleted == []
+
+
+def test_successful_configure_deletes_nothing(monkeypatch):
+    deleted = _configure_rollback_env(monkeypatch, select_status=200)
+
+    body, status = setup_core.image_generation_route_configure.__wrapped__(
+        _store(),
+        {"provider": "openai", "model": "gpt-image-2", "api_key": "secret"},
+        caller_api_key="caller-key",
+    )
+
+    assert status == 200
+    assert deleted == []
