@@ -15,7 +15,7 @@ from provider_types import ToolSpec
 MAX_COLLAPSED_DESCRIPTION_CHARS = 120
 COLLAPSE_POLICY_ALWAYS = "always"
 COLLAPSE_POLICY_UNDER_PRESSURE = "under_pressure"
-DEFAULT_COLLAPSE_POLICY = COLLAPSE_POLICY_ALWAYS
+DEFAULT_COLLAPSE_POLICY = COLLAPSE_POLICY_UNDER_PRESSURE
 COLLAPSE_POLICIES = frozenset(
     {COLLAPSE_POLICY_ALWAYS, COLLAPSE_POLICY_UNDER_PRESSURE}
 )
@@ -25,17 +25,10 @@ COLLAPSE_POLICIES = frozenset(
 RESIDENT_TOOL_NAMES = frozenset(
     {
         "reply",
-        "stay_silent",
         "mcp_tool_search",
-        "memory_index",
         "memory_search",
-        "memory_fetch",
         "memory_write",
         "perception_snapshot",
-        "schedule_wake",
-        "cancel_wake",
-        "web_search",
-        "web_fetch",
     }
 )
 
