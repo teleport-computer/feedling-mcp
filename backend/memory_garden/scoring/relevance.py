@@ -357,7 +357,17 @@ def _query_trace(query: str) -> dict:
 
 
 def _is_global_correction(memory: dict) -> bool:
-    text = " ".join(str(memory.get(k) or "") for k in ("title", "description", "context")).lower()
+    """这条纠正是不是「全局边界」类（改称呼/改人设/立规矩），要享受加权。
+
+    2026-08-17 边界整理：改读规范字段与宿主给的 search_text ——
+    此前读 title/description/context，那是 io 的字段名，翻译后就没了。
+
+    ⚠️ 关键词表本身仍是中文为主，属于**宿主的语言约定**。提示词英文化那批
+    会把它一起挪走（届时这个判断也该由宿主在 roles 里表达，内核只认标签）。
+    """
+    text = " ".join(
+        str(memory.get(k) or "") for k in ("summary", "content", "search_text")
+    ).lower()
     return any(
         marker in text
         for marker in (

@@ -333,7 +333,9 @@ def test_select_caps_turning_points_at_3():
         for i in range(5)
     ]
     out = _select_context_memories(moments, "")
-    turning_ids = [m["id"] for m in out if m["title"].startswith("转折｜")]
+    # 2026-08-17 边界整理：内核拿到的是翻译产物，没有 title —— 角色改看 roles。
+    # 「靠标题前缀认转折卡」的识别逻辑已收到宿主侧（card_shape.roles_of）。
+    turning_ids = [m["id"] for m in out if "turning_point" in (m.get("roles") or [])]
     # Top 3 by occurred_at desc should be t4, t3, t2
     assert turning_ids[:3] == ["t4", "t3", "t2"]
 
@@ -351,7 +353,9 @@ def test_turning_points_compare_instants_and_put_garbage_last():
     ]
 
     out = _select_context_memories(moments, "")
-    turning_ids = [m["id"] for m in out if m["title"].startswith("转折｜")]
+    # 2026-08-17 边界整理：内核拿到的是翻译产物，没有 title —— 角色改看 roles。
+    # 「靠标题前缀认转折卡」的识别逻辑已收到宿主侧（card_shape.roles_of）。
+    turning_ids = [m["id"] for m in out if "turning_point" in (m.get("roles") or [])]
 
     assert turning_ids[:3] == ["newer_z", "older_offset", "date_only"]
 

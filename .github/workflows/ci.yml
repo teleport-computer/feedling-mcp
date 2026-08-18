@@ -417,6 +417,7 @@ jobs:
           PYTHONPATH: backend
         run: |
           python -m pytest \
+            tests/test_garden_selection_pluggable.py \
             tests/test_garden_card_shape.py \
             tests/test_route_b_card_shape_recall.py \
             tests/test_route_b_sensitive_gate.py \
