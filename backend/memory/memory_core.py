@@ -20,7 +20,10 @@ the action executor) so the framework adapter just serializes it.
 
 from __future__ import annotations
 
+import base64
+import binascii
 import hashlib
+import json
 import uuid
 from datetime import datetime
 
@@ -269,10 +272,109 @@ def legacy_batch(store, api_key, runtime_token: str, payload: dict) -> tuple[dic
 # plain store reads
 # --------------------------------------------------------------------------- #
 
-def list_moments(store, *, limit_raw, since: str, include_archived_raw) -> tuple[dict, int]:
+MEMORY_LIST_DEFAULT_LIMIT = 50
+MEMORY_LIST_MAX_LIMIT = 500
+_MEMORY_LIST_CURSOR_VERSION = 1
+_MEMORY_LIST_CURSOR_MAX_CHARS = 1024
+
+
+class _MemoryListCursorInvalid(ValueError):
+    pass
+
+
+def _memory_list_key(moment: dict) -> tuple[bool, datetime, str]:
+    has_valid_ts, occurred_at = memory_timestamps.sort_key(moment.get("occurred_at"))
+    return has_valid_ts, occurred_at, str(moment.get("id") or "")
+
+
+def _encode_memory_list_cursor(moment: dict) -> str:
+    has_valid_ts, occurred_at, moment_id = _memory_list_key(moment)
+    payload = {
+        "v": _MEMORY_LIST_CURSOR_VERSION,
+        "h": has_valid_ts,
+        "t": occurred_at.isoformat() if has_valid_ts else None,
+        "i": moment_id,
+    }
+    raw = json.dumps(
+        payload,
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
+
+
+def _decode_memory_list_cursor(token: str) -> tuple[bool, datetime, str]:
+    text = str(token or "")
+    if not text or len(text) > _MEMORY_LIST_CURSOR_MAX_CHARS:
+        raise _MemoryListCursorInvalid
     try:
-        limit = min(int(limit_raw), 200)
+        raw = base64.b64decode(
+            (text + "=" * (-len(text) % 4)).encode("ascii"),
+            altchars=b"-_",
+            validate=True,
+        )
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeEncodeError, UnicodeDecodeError, binascii.Error, json.JSONDecodeError):
+        raise _MemoryListCursorInvalid from None
+    if not isinstance(payload, dict) or set(payload) != {"v", "h", "t", "i"}:
+        raise _MemoryListCursorInvalid
+    if (
+        type(payload.get("v")) is not int
+        or payload["v"] != _MEMORY_LIST_CURSOR_VERSION
+        or not isinstance(payload.get("h"), bool)
+    ):
+        raise _MemoryListCursorInvalid
+    moment_id = payload.get("i")
+    if not isinstance(moment_id, str) or not moment_id:
+        raise _MemoryListCursorInvalid
+    if payload["h"]:
+        if not isinstance(payload.get("t"), str):
+            raise _MemoryListCursorInvalid
+        occurred_at = memory_timestamps.parse_ts(payload["t"])
+        if occurred_at is None:
+            raise _MemoryListCursorInvalid
+    else:
+        if payload.get("t") is not None:
+            raise _MemoryListCursorInvalid
+        occurred_at = memory_timestamps.sort_key(None)[1]
+    key = payload["h"], occurred_at, moment_id
+    canonical_moment = {
+        "id": moment_id,
+        "occurred_at": occurred_at.isoformat() if payload["h"] else "",
+    }
+    canonical = _encode_memory_list_cursor(canonical_moment)
+    if canonical != text:
+        raise _MemoryListCursorInvalid
+    return key
+
+
+def _sort_memory_list(moments: list[dict]) -> list[dict]:
+    # ``db.memory_load`` already returns identical raw timestamps by moment_id
+    # ascending.  Repeat that tie-break here so test doubles and future storage
+    # adapters get the same deterministic order, then use the historical stable
+    # timestamp sort to preserve the no-cursor first-page behavior.
+    by_id = sorted(moments, key=lambda m: str(m.get("id") or ""))
+    return sorted(
+        by_id,
+        key=lambda m: memory_timestamps.sort_key(m.get("occurred_at")),
+        reverse=True,
+    )
+
+
+def list_moments(
+    store,
+    *,
+    limit_raw,
+    cursor: str = "",
+    since: str,
+    include_archived_raw,
+) -> tuple[dict, int]:
+    try:
+        limit = min(int(limit_raw), MEMORY_LIST_MAX_LIMIT)
     except (TypeError, ValueError):
+        return {"error": "invalid limit"}, 400
+    if limit < 1:
         return {"error": "invalid limit"}, 400
     include_archived = str(include_archived_raw or "").lower() in {"1", "true", "yes"}
     moments = memory_service._load_moments(store)
@@ -288,12 +390,29 @@ def list_moments(store, *, limit_raw, since: str, include_archived_raw) -> tuple
             ) is not None
             and occurred_ts >= since_ts
         ]
-    moments = sorted(
-        moments,
-        key=lambda m: memory_timestamps.sort_key(m.get("occurred_at")),
-        reverse=True,
+    moments = _sort_memory_list(moments)
+    total = len(moments)
+    if cursor:
+        try:
+            cursor_key = _decode_memory_list_cursor(cursor)
+        except _MemoryListCursorInvalid:
+            return {"error": "invalid cursor"}, 400
+        try:
+            start = next(
+                index + 1
+                for index, moment in enumerate(moments)
+                if _memory_list_key(moment) == cursor_key
+            )
+        except StopIteration:
+            return {"error": "invalid cursor"}, 400
+        moments = moments[start:]
+    page = moments[:limit]
+    next_cursor = (
+        _encode_memory_list_cursor(page[-1])
+        if page and len(moments) > limit
+        else None
     )
-    return {"moments": moments[:limit], "total": len(moments)}, 200
+    return {"moments": page, "total": total, "next_cursor": next_cursor}, 200
 
 
 def get_moment(store, moment_id: str) -> tuple[dict, int]:
