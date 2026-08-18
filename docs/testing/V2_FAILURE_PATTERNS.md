@@ -644,3 +644,58 @@ _encode_tools_anthropic / _encode_tools_bedrock / _encode_tools_gemini
 
 **同族**:模式 21(约束在强模型上永远是绿的)、模式 22(选错闸不会有测试变红)。
 共同点都是:**缺失的东西不会主动现身,只有把维度摊成矩阵才看得见空格。**
+
+## 模式 25:同一条 lane 的可观测性,取决于**谁把它入的队**
+
+**案例(2026-08-17,T130 L3)**:修完埋点可读性后实弹验证,
+`chat` lane 的 `trace_id` 3/3 都有、join 成立;`heartbeat` lane 2/2 全是空串。
+
+第一层根因:wake 类 job **入队时就没有 trace_id**,没有东西可透传。
+
+第二层(结构):`jobs_store.py` 里两个入队函数**对 trace_id 的态度相反** ——
+```
+:778  def enqueue_job(... trace_id=None ...)                       ← 可省,默认 None
+:872  def enqueue_job_with_context_log(... trace_id: str | None)   ← 必填,无默认值
+```
+**一个逼调用方表态,一个默默给 None。**
+
+**第三层(最尖锐,claude 补的)**:走「必填」那条路的调用方**真的传了**:
+```
+perception/service.py:889
+    jobs_store.enqueue_job_with_context_log(
+        event.user_id, "heartbeat",                        ← 同一个 lane
+        trace_id=str(event.wake_id or "")[:160] or None,   ← 传了真 wake_id
+    )
+```
+> **同一个 `heartbeat` lane,由 perception 入队的有 trace_id,
+> 由 scheduler 入队的没有。** 于是「heartbeat 能不能 join」这个问题
+> **没有统一答案** —— 取决于那一条具体是谁入的队。
+
+**这为什么是诊断陷阱**:
+- 抽样看到有 trace_id 的那几条 → 结论「heartbeat 可观测」→ 错
+- 抽样看到没有的那几条 → 结论「heartbeat 不可观测」→ 也错
+- **两个结论都能被数据支持,而且都不完整。**
+
+**判据**:
+> 发现某个字段「有时有有时没有」时,**先按「谁产生了这条记录」分组,
+> 再看每组的比例** —— 而不是把它当成随机缺失。
+> 「随机缺失」和「按来源分裂」在聚合数字上长得一模一样。
+
+**附带的正面观察**:`coalesce_or_insert_on_cursor` 的 `priority` 也是必填无默认。
+说明**「用无默认值逼调用方表态」在这个仓里是刻意的惯用法**,不是偶然 ——
+只是没一致地应用到 `trace_id` 上。这让根因从推测变成实证:
+**仓库知道这个手法,只是漏了这一处。**
+
+**⚠️ 本条的验证状态(2026-08-17,claude 主动标注)**:
+「perception 触发的 heartbeat 带 trace_id」是**读代码读出的预测,尚未实弹观测** ——
+部署后 heartbeat 样本只有 2 条且都来自另一条路。**引用时不得当已验证前提。**
+
+**但有一个现成判别器,不用加埋点**:
+```
+serve_worker.py:4792  enqueue_job(uid,"heartbeat")  没传 reason,默认 None → DB 为 NULL
+perception/service.py:892  reason=str(... or "perception_event")[:120]  → 必非空
+```
+→ 在 heartbeat lane 内,**`reason IS NULL` vs `NOT NULL` 即可切开两个入队来源**。
+
+**同族**:模式 24(适配层只翻译一半字段)、模式 22(选错闸不会有测试变红)。
+共同点:**缺失的东西不会主动现身,只有把维度摊成矩阵才看得见空格。**

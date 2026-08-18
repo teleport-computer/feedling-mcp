@@ -67,10 +67,34 @@ TOOL_EXCHANGE_STRUCTURAL_OVERHEAD_TOKENS = 12
 LimitSource = Literal[
     "deployment_override",
     "provider_metadata",
+    "caller",
     "audited_family",
     "unaudited_default",
 ]
 PlanStatus = Literal["fits", "fits_optional_omitted"]
+
+PromptByteComponentName = Literal[
+    "tools",
+    "system",
+    "summary",
+    "tail",
+    "worldbook",
+    "runtime_data",
+    "screen",
+    "tool_transcript",
+]
+PROMPT_BYTE_COMPONENT_NAMES = frozenset(
+    {
+        "tools",
+        "system",
+        "summary",
+        "tail",
+        "worldbook",
+        "runtime_data",
+        "screen",
+        "tool_transcript",
+    }
+)
 
 # When the complete catalog does not fit, retain the user-selected MCP surface
 # and the smallest useful memory/reply loop before admitting less essential
@@ -100,6 +124,8 @@ class ModelPromptLimit:
     source: LimitSource
     family: str | None = None
     override_key: str | None = None
+    rejected_provider_metadata_tokens: int | None = None
+    provider_metadata_floor_tokens: int | None = None
 
 
 @dataclass(frozen=True)
@@ -155,6 +181,31 @@ class ComponentDecision:
 
 
 @dataclass(frozen=True)
+class PromptByteComponent:
+    """Content-free byte count for one closed prompt component family."""
+
+    name: PromptByteComponentName
+    bytes: int
+
+    def __post_init__(self) -> None:
+        name = str(self.name or "")
+        if name not in PROMPT_BYTE_COMPONENT_NAMES:
+            raise ValueError("prompt byte component name is not in the closed set")
+        if isinstance(self.bytes, bool):
+            raise ValueError("prompt byte component bytes must be a non-negative integer")
+        try:
+            byte_count = int(self.bytes)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(
+                "prompt byte component bytes must be a non-negative integer"
+            ) from exc
+        if byte_count != self.bytes or byte_count < 0:
+            raise ValueError("prompt byte component bytes must be a non-negative integer")
+        object.__setattr__(self, "name", name)
+        object.__setattr__(self, "bytes", byte_count)
+
+
+@dataclass(frozen=True)
 class PromptFrontierPlan:
     """Successful prompt accounting result; it is impossible to be over budget."""
 
@@ -166,6 +217,8 @@ class PromptFrontierPlan:
     status: PlanStatus
     offered_tool_names: tuple[str, ...] = ()
     included_tool_names: tuple[str, ...] = ()
+    component_bytes: tuple[PromptByteComponent, ...] = ()
+    utf8_bytes_per_token: float = DEFAULT_ESTIMATOR_UTF8_BYTES_PER_TOKEN
 
     @property
     def included_components(self) -> tuple[str, ...]:
@@ -207,12 +260,46 @@ class PromptFrontierExhausted(RuntimeError):
         context_window_tokens: int,
         required_components: Sequence[str],
         limit_source: LimitSource,
+        output_reserve_tokens: int | None = None,
+        safety_margin_tokens: int | None = None,
+        utf8_bytes_per_token: float | None = None,
+        component_bytes: Sequence[PromptByteComponent | Mapping[str, Any]] = (),
+        provider: str = "",
+        rejected_provider_metadata_tokens: int | None = None,
+        provider_metadata_floor_tokens: int | None = None,
     ) -> None:
         self.required_tokens = int(required_tokens)
         self.input_budget_tokens = int(input_budget_tokens)
         self.context_window_tokens = int(context_window_tokens)
         self.required_components = tuple(str(name) for name in required_components)
         self.limit_source = limit_source
+        self.output_reserve_tokens = (
+            int(output_reserve_tokens)
+            if output_reserve_tokens is not None
+            else None
+        )
+        self.safety_margin_tokens = (
+            int(safety_margin_tokens)
+            if safety_margin_tokens is not None
+            else None
+        )
+        self.utf8_bytes_per_token = (
+            _validated_estimator_ratio(utf8_bytes_per_token)
+            if utf8_bytes_per_token is not None
+            else None
+        )
+        self.component_bytes = normalize_prompt_byte_components(component_bytes)
+        self.provider = str(provider)
+        self.rejected_provider_metadata_tokens = (
+            int(rejected_provider_metadata_tokens)
+            if rejected_provider_metadata_tokens is not None
+            else None
+        )
+        self.provider_metadata_floor_tokens = (
+            int(provider_metadata_floor_tokens)
+            if provider_metadata_floor_tokens is not None
+            else None
+        )
         super().__init__(
             f"{self.code}: required_tokens={self.required_tokens} "
             f"input_budget_tokens={self.input_budget_tokens} "
@@ -461,6 +548,14 @@ def _normalized_overrides(overrides: Mapping[str, Any] | None) -> dict[str, int]
 
 
 _UNAUDITED_DEFAULT_ENV = "FEEDLING_V2_UNAUDITED_DEFAULT_CONTEXT_WINDOW_TOKENS"
+_PROVIDER_METADATA_FLOOR_ENV = (
+    "FEEDLING_V2_PROVIDER_METADATA_CONTEXT_WINDOW_FLOOR_TOKENS"
+)
+# The current 25-user Runtime V2 route population has no observed window below
+# 64,000 tokens. 32,768 is one full tier lower, so it rejects stale/implausibly
+# small automatic metadata without changing any route in that measured
+# population. Re-evaluate this floor if the route population changes.
+DEFAULT_PROVIDER_METADATA_CONTEXT_WINDOW_FLOOR_TOKENS = 32_768
 # A smaller fallback caused custom-relay users with non-trivial persona/world-book
 # prompts to hit prompt_frontier_exhausted before any provider call, even with a
 # tiny chat history (observed in production). 65536 leaves 58,163 input tokens
@@ -474,6 +569,28 @@ _UNAUDITED_DEFAULT_ENV = "FEEDLING_V2_UNAUDITED_DEFAULT_CONTEXT_WINDOW_TOKENS"
 # Explicit deployment knowledge still belongs in the env override, and zero
 # retains strict fail-closed mode.
 _UNAUDITED_DEFAULT_FALLBACK_TOKENS = 65536
+
+
+def provider_metadata_context_window_floor() -> int:
+    """Return the minimum automatically trusted provider-metadata window.
+
+    Blank values follow shell ``${VAR:-default}`` semantics so a deployment
+    cannot accidentally disable the guard by rendering an empty variable.
+    """
+
+    raw = os.environ.get(_PROVIDER_METADATA_FLOOR_ENV)
+    if raw is None or not str(raw).strip():
+        return DEFAULT_PROVIDER_METADATA_CONTEXT_WINDOW_FLOOR_TOKENS
+    try:
+        parsed = int(str(raw).strip())
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(
+            f"{_PROVIDER_METADATA_FLOOR_ENV} must be an integer context window"
+        ) from exc
+    return _validated_context_window(
+        parsed,
+        label=_PROVIDER_METADATA_FLOOR_ENV,
+    )
 
 
 def unaudited_default_context_window() -> int:
@@ -509,11 +626,13 @@ def resolve_model_limit(
     provider_context_window_tokens: Any | None = None,
     deployment_overrides: Mapping[str, Any] | None = None,
 ) -> ModelPromptLimit:
-    """Resolve deployment override > provider metadata > audited family.
+    """Resolve deployment override > trusted provider metadata > audited family.
 
     Override lookup is deterministic and most-specific first:
     ``provider:model``, ``provider:*``, ``*:model``, then ``*:*``.
-    Deployment overrides intentionally apply even to custom destinations; a
+    Provider metadata below the deployment-tunable floor is not trusted and
+    falls through to audited-family/default resolution. Deployment overrides
+    intentionally apply even to custom destinations; a
     custom route without one never inherits a first-party model assumption and
     fails before any provider request. Because override keys do not encode a
     destination, an override must be a safe lower bound for every route it
@@ -539,16 +658,23 @@ def resolve_model_limit(
                 override_key=key,
             )
 
+    rejected_provider_metadata_tokens: int | None = None
+    provider_metadata_floor_tokens: int | None = None
     if provider_context_window_tokens is not None:
-        return ModelPromptLimit(
-            provider=normalized_provider,
-            model=normalized_model,
-            context_window_tokens=_validated_context_window(
-                provider_context_window_tokens,
-                label="provider context-window metadata",
-            ),
-            source="provider_metadata",
+        reported_tokens = _validated_context_window(
+            provider_context_window_tokens,
+            label="provider context-window metadata",
         )
+        floor_tokens = provider_metadata_context_window_floor()
+        if reported_tokens >= floor_tokens:
+            return ModelPromptLimit(
+                provider=normalized_provider,
+                model=normalized_model,
+                context_window_tokens=reported_tokens,
+                source="provider_metadata",
+            )
+        rejected_provider_metadata_tokens = reported_tokens
+        provider_metadata_floor_tokens = floor_tokens
 
     if _is_audited_destination(normalized_provider, base_url):
         for family in _AUDITED_FAMILIES:
@@ -563,6 +689,10 @@ def resolve_model_limit(
                     context_window_tokens=family.lower_bound_tokens,
                     source="audited_family",
                     family=family.name,
+                    rejected_provider_metadata_tokens=(
+                        rejected_provider_metadata_tokens
+                    ),
+                    provider_metadata_floor_tokens=provider_metadata_floor_tokens,
                 )
 
     # Lowest-precedence fallback: an unaudited route (custom relay / unknown
@@ -580,6 +710,8 @@ def resolve_model_limit(
                 default_tokens, label="unaudited default context window"
             ),
             source="unaudited_default",
+            rejected_provider_metadata_tokens=rejected_provider_metadata_tokens,
+            provider_metadata_floor_tokens=provider_metadata_floor_tokens,
         )
 
     raise PromptContextLimitUnconfigured(
@@ -595,10 +727,9 @@ def resolve_model_limit_from_config(
 ) -> ModelPromptLimit:
     """Resolve a limit from the dependency-neutral ProviderConfig protocol.
 
-    Provider adapters may attach audited ``context_window_tokens`` metadata. The
-    current hosted BYOK config does not require it, so operator overrides and
-    audited family floors remain fallbacks. An unaudited route with neither is
-    rejected before any provider request; there is no safe numeric default.
+    Provider adapters may attach ``context_window_tokens`` metadata. Values
+    below the metadata floor fall through to operator, audited-family, or
+    unaudited-default knowledge instead of silently shrinking every prompt.
     """
 
     return resolve_model_limit(
@@ -658,6 +789,38 @@ def canonical_json(value: Any) -> str:
         separators=(",", ":"),
         allow_nan=False,
         default=_json_default,
+    )
+
+
+def normalize_prompt_byte_components(
+    components: Sequence[PromptByteComponent | Mapping[str, Any]],
+) -> tuple[PromptByteComponent, ...]:
+    """Validate and aggregate the sole plaintext shape allowed in budget traces.
+
+    Mapping inputs must contain exactly ``name`` and ``bytes``.  Rejecting extra
+    keys, rather than field-picking them, keeps a future caller from silently
+    smuggling prompt text beside an otherwise valid count.
+    """
+
+    totals: dict[str, int] = {}
+    order: list[str] = []
+    for raw in components:
+        if isinstance(raw, PromptByteComponent):
+            item = raw
+        elif isinstance(raw, Mapping):
+            if set(raw) != {"name", "bytes"}:
+                raise ValueError(
+                    "prompt byte component mappings require exactly name and bytes"
+                )
+            item = PromptByteComponent(name=raw["name"], bytes=raw["bytes"])
+        else:
+            raise ValueError("prompt byte components must be records")
+        if item.name not in totals:
+            order.append(item.name)
+            totals[item.name] = 0
+        totals[item.name] += item.bytes
+    return tuple(
+        PromptByteComponent(name=name, bytes=totals[name]) for name in order
     )
 
 
@@ -751,6 +914,13 @@ def _image_accounting_value(value: Any) -> tuple[Any, int]:
             image_count += nested_count
         return rendered_items, image_count
     return value, 0
+
+
+def prompt_structure_utf8_bytes(value: Any) -> int:
+    """Canonical prompt bytes with image payloads replaced by budget markers."""
+
+    accounted, _image_count = _image_accounting_value(value)
+    return len(canonical_json(accounted).encode("utf-8"))
 
 
 def messages_component(
@@ -915,6 +1085,15 @@ def plan_prompt(
             context_window_tokens=budget.context_window_tokens,
             required_components=[component.name for component in required],
             limit_source=model_limit.source,
+            output_reserve_tokens=budget.output_reserve_tokens,
+            safety_margin_tokens=budget.safety_margin_tokens,
+            provider=model_limit.provider,
+            rejected_provider_metadata_tokens=(
+                model_limit.rejected_provider_metadata_tokens
+            ),
+            provider_metadata_floor_tokens=(
+                model_limit.provider_metadata_floor_tokens
+            ),
         )
 
     optional_by_admission_order = sorted(
@@ -982,6 +1161,9 @@ def plan_provider_round(
     safety_margin_tokens: int | None = None,
     utf8_bytes_per_token: float = DEFAULT_ESTIMATOR_UTF8_BYTES_PER_TOKEN,
     image_reserve_tokens: int = DEFAULT_IMAGE_RESERVE_TOKENS,
+    message_component_bytes: Sequence[
+        PromptByteComponent | Mapping[str, Any]
+    ] = (),
 ) -> PromptFrontierPlan:
     """Budget the exact messages and exact offered schemas for one provider call.
 
@@ -998,6 +1180,55 @@ def plan_provider_round(
         message for message in messages if not _is_tool_exchange(message)
     ]
     exchanges = [message for message in messages if _is_tool_exchange(message)]
+    if message_component_bytes:
+        normalized_message_bytes = tuple(
+            item
+            for item in normalize_prompt_byte_components(message_component_bytes)
+            if item.name != "tools"
+        )
+    else:
+        generic_components: list[PromptByteComponent] = []
+        system_messages = [
+            message
+            for message in ordinary_messages
+            if isinstance(message, Mapping)
+            and str(message.get("role") or "") == "system"
+        ]
+        tail_messages = [
+            message for message in ordinary_messages if message not in system_messages
+        ]
+        if system_messages:
+            generic_components.append(PromptByteComponent(
+                "system", prompt_structure_utf8_bytes(system_messages)
+            ))
+        if tail_messages:
+            generic_components.append(PromptByteComponent(
+                "tail", prompt_structure_utf8_bytes(tail_messages)
+            ))
+        if exchanges:
+            generic_components.append(PromptByteComponent(
+                "tool_transcript", prompt_structure_utf8_bytes(exchanges)
+            ))
+        normalized_message_bytes = tuple(generic_components)
+
+    def _observed_components(observed_tools: Sequence[Any]) -> tuple[PromptByteComponent, ...]:
+        components = list(normalized_message_bytes)
+        if observed_tools:
+            components.append(PromptByteComponent(
+                "tools", prompt_structure_utf8_bytes(list(observed_tools))
+            ))
+        return normalize_prompt_byte_components(components)
+
+    def _attach_exhaustion(
+        exc: PromptFrontierExhausted,
+        *,
+        observed_tools: Sequence[Any],
+    ) -> None:
+        exc.utf8_bytes_per_token = _validated_estimator_ratio(
+            utf8_bytes_per_token
+        )
+        exc.component_bytes = _observed_components(observed_tools)
+
     components = [
         messages_component(
             ordinary_messages,
@@ -1044,12 +1275,16 @@ def plan_provider_round(
                     priority=1,
                 )
             )
-    plan = plan_prompt(
-        model_limit=model_limit,
-        components=components,
-        output_reserve_tokens=output_reserve_tokens,
-        safety_margin_tokens=safety_margin_tokens,
-    )
+    try:
+        plan = plan_prompt(
+            model_limit=model_limit,
+            components=components,
+            output_reserve_tokens=output_reserve_tokens,
+            safety_margin_tokens=safety_margin_tokens,
+        )
+    except PromptFrontierExhausted as exc:
+        _attach_exhaustion(exc, observed_tools=required_tools)
+        raise
     offered_names = tuple(str(getattr(tool, "name", "")) for tool in offered_tools)
     required_name_set = {
         str(getattr(tool, "name", "")) for tool in required_tools
@@ -1059,6 +1294,10 @@ def plan_provider_round(
             plan,
             offered_tool_names=offered_names,
             included_tool_names=offered_names,
+            component_bytes=_observed_components(offered_tools),
+            utf8_bytes_per_token=_validated_estimator_ratio(
+                utf8_bytes_per_token
+            ),
         )
 
     # The complete optional catalog is too large. Re-plan the same exact prompt
@@ -1088,12 +1327,16 @@ def plan_provider_round(
             )
         )
         optional_component_names.append((component_name, tool_name))
-    plan = plan_prompt(
-        model_limit=model_limit,
-        components=granular_components,
-        output_reserve_tokens=output_reserve_tokens,
-        safety_margin_tokens=safety_margin_tokens,
-    )
+    try:
+        plan = plan_prompt(
+            model_limit=model_limit,
+            components=granular_components,
+            output_reserve_tokens=output_reserve_tokens,
+            safety_margin_tokens=safety_margin_tokens,
+        )
+    except PromptFrontierExhausted as exc:
+        _attach_exhaustion(exc, observed_tools=required_tools)
+        raise
     included_components = set(plan.included_components)
     included_optional_names = {
         tool_name
@@ -1105,10 +1348,20 @@ def plan_provider_round(
         for name in offered_names
         if name in required_name_set or name in included_optional_names
     )
+    included_name_set = set(included_names)
+    included_tools = [
+        tool
+        for tool in offered_tools
+        if str(getattr(tool, "name", "")) in included_name_set
+    ]
     return dataclasses.replace(
         plan,
         offered_tool_names=offered_names,
         included_tool_names=included_names,
+        component_bytes=_observed_components(included_tools),
+        utf8_bytes_per_token=_validated_estimator_ratio(
+            utf8_bytes_per_token
+        ),
     )
 
 

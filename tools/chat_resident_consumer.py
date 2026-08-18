@@ -73,6 +73,11 @@ Optional:
                         Short retry count before encrypted reply writes (default: 3)
   WHOAMI_REFRESH_RETRY_DELAY_SEC
                         Initial reply whoami retry backoff in seconds (default: 0.5)
+  FEEDLING_CHAT_RESPONSE_MAX_RETRIES
+                        Retryable bootstrap 409 retries (default: 3, maximum: 10)
+  FEEDLING_CHAT_RESPONSE_RETRY_BASE_SEC /
+  FEEDLING_CHAT_RESPONSE_RETRY_MAX_ELAPSED_SEC
+                        Reply retry backoff base and total wait budget (defaults: 1 / 15)
   SEND_FALLBACK_ON_AGENT_ERROR
                         Default true. Agent failures post a visible, bounded
                         failure reply instead of silently dropping the turn.
@@ -644,6 +649,22 @@ WHOAMI_STARTUP_RETRY_DELAY_SEC = float(
 )
 WHOAMI_REFRESH_RETRIES = int(os.environ.get("WHOAMI_REFRESH_RETRIES", "3"))
 WHOAMI_REFRESH_RETRY_DELAY_SEC = float(os.environ.get("WHOAMI_REFRESH_RETRY_DELAY_SEC", "0.5"))
+# A stale resident liveness decision can reject the reply that proves the
+# resident is alive. New backends mark that exact bootstrap 409 retryable; retry
+# it in-process so the generated reply is not terminally discarded. Old
+# backends omit the flag and retain the historical one-shot behavior.
+CHAT_RESPONSE_MAX_RETRIES = max(
+    0,
+    min(10, int(os.environ.get("FEEDLING_CHAT_RESPONSE_MAX_RETRIES", "3"))),
+)
+CHAT_RESPONSE_RETRY_BASE_SEC = max(
+    0.0,
+    float(os.environ.get("FEEDLING_CHAT_RESPONSE_RETRY_BASE_SEC", "1")),
+)
+CHAT_RESPONSE_RETRY_MAX_ELAPSED_SEC = max(
+    0.0,
+    float(os.environ.get("FEEDLING_CHAT_RESPONSE_RETRY_MAX_ELAPSED_SEC", "15")),
+)
 # TTL gate for the pre-reply whoami refresh. Encryption keys are stable (the
 # user's own pubkey never changes; the enclave content pubkey is dstack-KMS
 # derived and stable across compose rotations), so re-fetching before every
@@ -2446,6 +2467,33 @@ def _unmark_seen(keys) -> None:
 # Decrypt sources — plaintext content for v1 encrypted messages
 # ---------------------------------------------------------------------------
 
+
+def _emit_injection_trace(log: dict | None) -> None:
+    """把 enclave 带回来的注入记录落成一条 debug trace。
+
+    记录本身已经是内容无关的（见 memory_garden/observability.py）；
+    这里只负责转发，不再加工 —— 加工会让「什么算内容」这件事散成两处。
+    失败一律吞掉：可观测性绝不能拖垮聊天。
+    """
+    if not isinstance(log, dict) or not log:
+        return
+    try:
+        counts = log.get("counts") or {}
+        injected = counts.get("injected", 0)
+        pool = counts.get("candidate_pool", 0)
+        mode = log.get("mode", "?")
+        _emit_debug_trace(
+            "memory", "memory.inject",
+            status="ok" if mode != "failed" else "failed",
+            summary=f"注入 {injected} 张（{mode}，候选 {pool}）",
+            explain="每轮自动挑卡的结果。id 与计数落库，卡片正文不落库。",
+            detail=log,
+            dur_ms=log.get("dur_ms"),
+        )
+    except Exception:  # noqa: BLE001 — 观测失败绝不能影响这一轮对话
+        pass
+
+
 def _filter_since(msgs: list, since: float) -> list:
     return [m for m in msgs if float(m.get("ts", m.get("timestamp", 0)) or 0) > since]
 
@@ -2479,6 +2527,10 @@ def _fetch_from_enclave(
             )
             resp.raise_for_status()
             data = resp.json()
+            # 自动注入的内容无关记录：enclave 算好带出来，由这里落库 ——
+            # enclave 自己没有数据库发不了 debug_trace（2026-08-17 补的盲区，
+            # 此前「每轮注入了哪几张卡」服务端一个字都查不到）。
+            _emit_injection_trace(data.get("context_memory_log"))
             msgs = data.get("messages") or data.get("history") or []
             return _filter_since(msgs, since)
         except httpx.HTTPStatusError as e:
@@ -11938,7 +11990,15 @@ def post_reply(
                 }
             return body
 
-        resp = _HTTP.post(url, json=_reply_body(), headers=_HEADERS, timeout=15)
+        def _send_encrypted_reply():
+            return _HTTP.post(
+                url,
+                json=_reply_body(),
+                headers=_HEADERS,
+                timeout=15,
+            )
+
+        resp = _post_reply_with_bootstrap_retry(_send_encrypted_reply)
         if _is_fpr_mismatch_response(resp):
             # The backend bounced the envelope: our cached user pk is no longer
             # the registered content key (rotated since the last whoami). Force
@@ -11957,7 +12017,7 @@ def post_reply(
                 context="stale-key reseal",
                 backoff_multiplier=2.0,
             ) and _whoami_cache.get("user_pk"):
-                resp = _HTTP.post(url, json=_reply_body(), headers=_HEADERS, timeout=15)
+                resp = _post_reply_with_bootstrap_retry(_send_encrypted_reply)
         return _handle_post_reply_response(resp)
 
     if file_followups or image_followups:
@@ -11969,26 +12029,30 @@ def post_reply(
         "ENCRYPTION UNAVAILABLE — posting plaintext will fail on v1 backends. "
         "Ensure content_encryption.py is importable and whoami succeeded."
     )
-    resp = _HTTP.post(
-        url,
-        json={
-            "content": content,
-            "push_live_activity": source == PROACTIVE_JOB_SOURCE and not suppress_push,
-            "push_body": content[:240] if (source == PROACTIVE_JOB_SOURCE and not suppress_push) else "",
-            "alert_body": "" if suppress_push else content[:240],
-            "source": source,
-            "gate_decision_id": gate_decision_id,
-            "proactive_job_id": proactive_job_id,
-            "reply_to_message_id": reply_to_message_id,
-            "thinking_summary": _sanitize_thinking_summary(thinking_summary),
-            "thinking_kind": _sanitize_thinking_kind(thinking_kind),
-            "thinking_source": _sanitize_thinking_meta(thinking_source, max_len=80),
-            "thinking_model": _sanitize_thinking_meta(thinking_model, max_len=96),
-            "thinking_native": thinking_native,
-            "role": role,
-            "notice_kind": notice_kind,
-        },
-        headers=_HEADERS, timeout=15,
+    plaintext_body = {
+        "content": content,
+        "push_live_activity": source == PROACTIVE_JOB_SOURCE and not suppress_push,
+        "push_body": content[:240] if (source == PROACTIVE_JOB_SOURCE and not suppress_push) else "",
+        "alert_body": "" if suppress_push else content[:240],
+        "source": source,
+        "gate_decision_id": gate_decision_id,
+        "proactive_job_id": proactive_job_id,
+        "reply_to_message_id": reply_to_message_id,
+        "thinking_summary": _sanitize_thinking_summary(thinking_summary),
+        "thinking_kind": _sanitize_thinking_kind(thinking_kind),
+        "thinking_source": _sanitize_thinking_meta(thinking_source, max_len=80),
+        "thinking_model": _sanitize_thinking_meta(thinking_model, max_len=96),
+        "thinking_native": thinking_native,
+        "role": role,
+        "notice_kind": notice_kind,
+    }
+    resp = _post_reply_with_bootstrap_retry(
+        lambda: _HTTP.post(
+            url,
+            json=plaintext_body,
+            headers=_HEADERS,
+            timeout=15,
+        )
     )
     return _handle_post_reply_response(resp)
 
@@ -12006,6 +12070,47 @@ def _is_fpr_mismatch_response(resp) -> bool:
     return isinstance(body, dict) and body.get("error") == "content_pk_fpr_mismatch"
 
 
+def _retryable_bootstrap_body(resp) -> dict | None:
+    if resp.status_code != 409:
+        return None
+    try:
+        body = resp.json()
+    except Exception:
+        return None
+    if not isinstance(body, dict):
+        return None
+    if body.get("error") != "bootstrap_incomplete":
+        return None
+    # Exact True is intentional: false and missing preserve compatibility with
+    # non-retryable and old servers.
+    return body if body.get("retryable") is True else None
+
+
+def _post_reply_with_bootstrap_retry(send: Callable[[], Any]) -> Any:
+    """Retry only an explicitly retryable bootstrap 409, with hard bounds."""
+    started = time.monotonic()
+    response = send()
+    for retry_index in range(CHAT_RESPONSE_MAX_RETRIES):
+        body = _retryable_bootstrap_body(response)
+        if body is None:
+            return response
+        delay = CHAT_RESPONSE_RETRY_BASE_SEC * (2 ** retry_index)
+        elapsed = max(0.0, time.monotonic() - started)
+        if elapsed + delay > CHAT_RESPONSE_RETRY_MAX_ELAPSED_SEC:
+            break
+        log.warning(
+            "chat_response temporarily rejected stage=%s; retrying %d/%d in %.1fs",
+            body.get("stage"),
+            retry_index + 1,
+            CHAT_RESPONSE_MAX_RETRIES,
+            delay,
+        )
+        if delay > 0:
+            time.sleep(delay)
+        response = send()
+    return response
+
+
 def _handle_post_reply_response(resp) -> dict:
     """Inspect a /v1/chat/response response. Re-raises 4xx/5xx EXCEPT for
     the structured `bootstrap_incomplete` 409, which we want to surface in
@@ -12018,16 +12123,21 @@ def _handle_post_reply_response(resp) -> dict:
         except Exception:
             body = {}
         if body.get("error") == "bootstrap_incomplete":
-            log.error(
-                "chat_response rejected: bootstrap_incomplete stage=%s "
-                "memory_count=%s identity_written=%s — the upstream agent "
-                "hasn't completed onboarding (identity + live chat). Have the "
-                "user re-run onboarding from the start prompt; until then this "
-                "user's Feedling chat is dead-ended.",
-                body.get("stage"),
-                body.get("memory_count"),
-                body.get("identity_written"),
-            )
+            if body.get("retryable") is True:
+                log.error(
+                    "chat_response temporarily rejected after bounded retries: "
+                    "bootstrap_incomplete stage=%s; the reply was not accepted",
+                    body.get("stage"),
+                )
+            else:
+                log.error(
+                    "chat_response rejected: bootstrap_incomplete stage=%s "
+                    "memory_count=%s identity_written=%s — onboarding is not "
+                    "complete; re-run the required onboarding step before retrying.",
+                    body.get("stage"),
+                    body.get("memory_count"),
+                    body.get("identity_written"),
+                )
             return body
     resp.raise_for_status()
     try:

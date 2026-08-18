@@ -25,7 +25,7 @@ from identity import card_policy
 # Card-writing rules live with the memory package (single source of truth shared
 # with the V1 guidance block); only the op names above are V2-specific.
 from memory_garden.prompts import buckets as prompts_v1
-from memory_garden.types import MAX_MEMORY_SUPERSEDE_TARGETS
+from memory.source_policy import MAX_MEMORY_SUPERSEDE_TARGETS
 from perception.agent_fields import (
     AGENT_PERCEPTION_SIGNALS,
     AGENT_SIGNAL_FIELDS,
@@ -46,6 +46,7 @@ _EXCLUDED = frozenset({"chat_image_read", "chat_file_read", "perception_glance"}
 _STR = {"type": "string"}
 _INT = {"type": "integer"}
 _BOOL = {"type": "boolean"}
+_TRUE_BOOL = {"type": "boolean", "enum": [True], "default": True}
 _NO_ARGS: dict = {"type": "object", "properties": {}}
 
 _IDENTITY_DIMENSION = {
@@ -320,7 +321,7 @@ PARAMS: dict[str, dict] = {
     # params.get("include_image") (bool).
     "photo_read": {
         "type": "object",
-        "properties": {"photo_id": _STR, "include_image": _BOOL},
+        "properties": {"photo_id": _STR, "include_image": _TRUE_BOOL},
         "required": ["photo_id"],
     },
 
@@ -535,23 +536,15 @@ DESCRIPTIONS: dict[str, str] = {
                      "memory_search. For "
                      "a user-requested bulk rewrite or cleanup, call memory_organize "
                      "instead of trying to edit every card in chat."),
-    "memory_search": ("Use only when the current request actually depends on remembered "
-                      "information; ordinary conversation and model/runtime identity "
-                      "questions do not. Never run memory discovery for a standalone "
-                      "greeting, acknowledgement, emoji, interjection, or casual small "
-                      "talk, and do not resume an earlier answered memory workflow unless "
-                      "the current message explicitly asks. If the user mentions a "
-                      "specific past event or person, or asks whether you remember "
-                      "something, and the supplied memory summary has no answer, search "
-                      "before replying instead of guessing. If the summary already answers "
-                      "the question, reply directly. For a requested memory-grounded "
-                      "summary or deliverable about a specific subject, search that subject "
-                      "instead of relying only on general recollection. Keyword-search "
+    "memory_search": ("This is the normal path for a specific remembered subject, person, "
+                      "phrase, or event. If the user mentions a specific past event or "
+                      "person, or asks whether you remember something, and the supplied "
+                      "memory summary has no answer, search before replying instead of "
+                      "guessing. For a requested memory-grounded summary or deliverable "
+                      "about a specific subject, search that subject instead of relying "
+                      "only on general recollection. Keyword-search "
                       "memory cards by a required query string, then use "
-                      "memory_fetch for the selected ids. This is the normal path for a "
-                      "specific remembered subject, person, phrase, or event. Never use "
-                      "it for ordinary conversation, model/runtime identity, or an "
-                      "all-memory overview. Matching is a literal case-insensitive "
+                      "memory_fetch for the selected ids. Matching is a literal case-insensitive "
                       "substring over the card text, with no synonyms, translation, or "
                       "stemming: zero results mean that exact wording is absent, NOT "
                       "that the memory is absent. So when a search comes back empty, do "
@@ -562,7 +555,14 @@ DESCRIPTIONS: dict[str, str] = {
                       "normalized away, so a query differing only in those returns the "
                       "same rows and is wasted; only an identical repeat of the same "
                       "arguments is refused, while the same query narrowed by a "
-                      "different limit/bucket/thread is a legitimate re-search. For a "
+                      "different limit/bucket/thread is a legitimate re-search. Use it "
+                      "only when the current request actually depends on remembered "
+                      "information: skip a standalone greeting, acknowledgement, emoji, "
+                      "interjection or casual small talk, a model/runtime identity "
+                      "question, and an all-memory overview. If the summary already "
+                      "answers the question, reply directly, and do not resume an "
+                      "earlier answered memory workflow unless the current message "
+                      "explicitly asks. For a "
                       "user-requested bulk rewrite or cleanup, call memory_organize."),
     "voice_transcript_list": (
         "List this user's archived voice calls, newest first: call_id, when it "
@@ -671,11 +671,13 @@ DESCRIPTIONS: dict[str, str] = {
                     "returns an untrusted visual_observation instead of a local image_file "
                     "path."),
     "photo_recent": ("Use when the user's request depends on their photos; do not call for "
-                     "unrelated conversation. List recent photos, optionally capped by limit."),
+                     "unrelated conversation. List recent photo metadata, optionally capped "
+                     "by limit. This does not show you the actual image; call photo_read for "
+                     "a photo whose visual content you need."),
     "photo_read": ("Use when the user's request depends on a specific photo; do not call "
-                   "for unrelated conversation. Read a specific photo by id. Set "
-                   "include_image=true only when metadata "
-                   "is insufficient; Runtime V2 inspects the decrypted pixels through its "
+                   "for unrelated conversation. Read and visually inspect a specific photo "
+                   "by id. Pixels are included by default; photo_recent is the metadata-only "
+                   "tool. Runtime V2 inspects the decrypted pixels through its "
                    "native vision observer and returns an untrusted visual_observation "
                    "instead of a local image_file path."),
     "web_search": "Search the live public web for current information such as news, weather, prices, or recent events, or anything past your training data that you are not sure is current. Prefer this over guessing or telling the user you cannot access the internet.",
@@ -712,8 +714,9 @@ DESCRIPTIONS: dict[str, str] = {
     REPLY_TOOL: (
         "Send an immediate reply bubble to the user with the given text during a "
         "long-running task when timely progress feedback is useful. This bubble is "
-        "not the final reply, does not need and must not include <think>, and must "
-        "not replace the final reply."
+        "sent without <think>. If it already says everything you need to say, end "
+        "the turn with no additional visible text and do not repeat it. Continue "
+        "to a final visible answer only when you still have new content for the user."
     ),
     STAY_SILENT_TOOL: (
         "Choose not to send a proactive message on this wake. Give one short, "

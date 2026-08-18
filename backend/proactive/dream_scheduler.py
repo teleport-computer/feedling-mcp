@@ -13,6 +13,7 @@ from typing import Any, Callable, Mapping
 from zoneinfo import ZoneInfo
 
 import db
+import debug_trace
 import memory_readside_core
 from memory_garden import dreaming as mg_dreaming
 from memory import service as memory_service
@@ -216,6 +217,63 @@ def _dream_enabled(store) -> bool:
 
 
 def tick_memory_dream(
+    store, *, now: float | None = None, force: bool = False,
+    submit: Callable[..., dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """做梦判定 —— 外层只负责留痕，判定逻辑一行没动（见 `_tick_memory_dream`）。
+
+    2026-08-17 补：此前 7 种早退理由全是裸 return，服务端查不到「为什么没做梦」。
+    实测代价：某用户六天没做过梦，从日志里完全看不出是没攒够卡、还是被夜间
+    窗口挡住、还是失败退避 —— 只能去猜。
+    """
+    started = time.monotonic()
+    outcome = _tick_memory_dream(store, now=now, force=force, submit=submit)
+    try:
+        _emit_dream_trace(store, outcome, duration_ms=(time.monotonic() - started) * 1000.0,
+                          forced=bool(force))
+    except Exception:  # noqa: BLE001 — 观测失败绝不能挡住做梦
+        pass
+    return outcome
+
+
+def _emit_dream_trace(store, outcome: Mapping[str, Any], *, duration_ms: float,
+                      forced: bool) -> None:
+    """一条内容无关的做梦判定记录。卡片正文、摘要一律不进。"""
+    snapshot = outcome.get("snapshot") if isinstance(outcome.get("snapshot"), Mapping) else {}
+    enqueued = bool(outcome.get("enqueued"))
+    reason = str(outcome.get("reason") or ("enqueued" if enqueued else "unknown"))
+    detail = {
+        "enqueued": enqueued,
+        "reason": reason,
+        "forced": forced,
+        "counts": {
+            # 「攒够没」这个判据的两个输入 —— 没有它们就说不清为什么没触发
+            "seed_cards": _safe_int(snapshot.get("seed_card_count")),
+            "new_since_last": _safe_int(snapshot.get("new_since_last")),
+            "min_new_cards": min_new_cards(),
+            "user_turns": _safe_int(snapshot.get("user_turn_count")),
+        },
+        "signature_changed": bool(snapshot.get("signature")
+                                  and snapshot.get("signature") != outcome.get("last_signature")),
+        "dur_ms": round(float(duration_ms), 1),
+    }
+    debug_trace.trace_event(
+        store, subsystem="memory", type="memory.dream.tick", actor="backend",
+        status="ok" if (enqueued or reason in _EXPECTED_SKIP_REASONS) else "warning",
+        summary=("已排入做梦" if enqueued else f"未做梦：{reason}"),
+        explain="每次做梦判定都留一条。计数与理由落库，卡片内容不落库。",
+        detail=detail,
+    )
+
+
+#: 这些「没做梦」是正常的，不该在面板上显示成告警。
+_EXPECTED_SKIP_REASONS = frozenset({
+    "dream_disabled", "no_memory_cards", "dream_already_pending",
+    "night_not_due", "min_interval", "not_enough_new_cards", "already_dreamed",
+})
+
+
+def _tick_memory_dream(
     store, *, now: float | None = None, force: bool = False,
     submit: Callable[..., dict[str, Any]] | None = None,
 ) -> dict[str, Any]:

@@ -15,6 +15,7 @@ from psycopg.types.json import Jsonb
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
 from conftest import seed_user, set_v2_runtime_owner
+from core import envelope as core_envelope
 import db
 from model_api_runtime.v2 import jobs_store
 from model_api_runtime.v2 import trajectory
@@ -39,12 +40,16 @@ def _envelope(user_id: str, item_id: str, plaintext: str) -> dict:
     }
 
 
+_PLAINTEXT_PREFIX = "feedling-v2-trajectory-b64-v1:"
+
+
 def _plaintext_envelope(user_id: str, item_id: str, plaintext: str) -> dict:
     return {
         "id": item_id,
         "owner_user_id": user_id,
         "visibility": "shared",
-        "body": plaintext,
+        "body": _PLAINTEXT_PREFIX
+        + base64.b64encode(plaintext.encode()).decode("ascii"),
     }
 
 
@@ -140,8 +145,15 @@ def test_encrypted_events_are_ordered_idempotent_and_immutable():
             )
 
 
-def test_plaintext_tier_trajectory_event_is_accepted_and_stored_verbatim():
+def test_plaintext_tier_trajectory_event_is_accepted_and_stored_verbatim(
+    monkeypatch,
+):
     uid = "u_trajectory_plaintext"
+    monkeypatch.setattr(
+        core_envelope,
+        "resolve_content_encryption",
+        lambda _user_id: "off",
+    )
     job_id, _job = _source_job(uid)
     payload = _plaintext_envelope(uid, "event-plain", '{"kind":"tool"}')
 
@@ -158,6 +170,66 @@ def test_plaintext_tier_trajectory_event_is_accepted_and_stored_verbatim():
     stored = jobs_store.list_trajectory_events(job_id, uid)[0]["payload_envelope"]
     assert stored == payload
     assert "body_ct" not in stored
+
+
+def test_plaintext_trajectory_is_rejected_for_encrypted_account():
+    uid = "u_trajectory_plaintext_encrypted"
+    job_id, _job = _source_job(uid)
+    payload = _plaintext_envelope(uid, "event-plain-encrypted", "payload")
+
+    with pytest.raises(ValueError, match="not enabled"):
+        jobs_store.append_trajectory_event(
+            job_id,
+            uid,
+            event_kind="tool_call",
+            idempotency_key="plain_encrypted",
+            payload_envelope=payload,
+            payload_bytes=len(payload["body"]),
+        )
+
+
+def test_plaintext_trajectory_rejects_unprefixed_body(monkeypatch):
+    uid = "u_trajectory_plaintext_unprefixed"
+    monkeypatch.setattr(
+        core_envelope,
+        "resolve_content_encryption",
+        lambda _user_id: "off",
+    )
+    job_id, _job = _source_job(uid)
+    payload = _plaintext_envelope(uid, "event-plain-unprefixed", "payload")
+    payload["body"] = "payload"
+
+    with pytest.raises(ValueError, match="encoding invalid"):
+        jobs_store.append_trajectory_event(
+            job_id,
+            uid,
+            event_kind="tool_call",
+            idempotency_key="plain_unprefixed",
+            payload_envelope=payload,
+            payload_bytes=len(payload["body"]),
+        )
+
+
+def test_plaintext_trajectory_rejects_invalid_base64(monkeypatch):
+    uid = "u_trajectory_plaintext_invalid_base64"
+    monkeypatch.setattr(
+        core_envelope,
+        "resolve_content_encryption",
+        lambda _user_id: "off",
+    )
+    job_id, _job = _source_job(uid)
+    payload = _plaintext_envelope(uid, "event-plain-invalid-base64", "payload")
+    payload["body"] = _PLAINTEXT_PREFIX + "not!base64"
+
+    with pytest.raises(ValueError, match="encoding invalid"):
+        jobs_store.append_trajectory_event(
+            job_id,
+            uid,
+            event_kind="tool_call",
+            idempotency_key="plain_invalid_base64",
+            payload_envelope=payload,
+            payload_bytes=len(payload["body"]),
+        )
 
 
 def test_plaintext_trajectory_rejects_mixed_or_extra_fields():

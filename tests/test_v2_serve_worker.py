@@ -587,6 +587,7 @@ def test_v2_debug_trace_user_seam_resolves_store_and_preserves_duration(monkeypa
         explain="safe",
         detail={"tool": "perception_snapshot"},
         dur_ms=7.5,
+        trace_id="trace-v2-seam",
     )
 
     assert calls == [
@@ -600,9 +601,35 @@ def test_v2_debug_trace_user_seam_resolves_store_and_preserves_duration(monkeypa
                 "explain": "safe",
                 "detail": {"tool": "perception_snapshot"},
                 "dur_ms": 7.5,
+                "trace_id": "trace-v2-seam",
             },
         ),
     ]
+
+
+def test_v2_debug_trace_payload_preserves_turn_trace_id(monkeypatch):
+    from diagnostics import diagnostics_core
+
+    captured = []
+    monkeypatch.setattr(
+        diagnostics_core,
+        "emit_trace_event_payload",
+        lambda store, payload: captured.append((store, payload)),
+    )
+    store = object()
+
+    serve_worker._emit_v2_debug_trace(
+        store,
+        "provider.empty_response",
+        status="warning",
+        summary="safe",
+        explain="content-free",
+        detail={"lane": "chat"},
+        trace_id="trace-current-turn",
+    )
+
+    assert captured[0][0] is store
+    assert captured[0][1]["event"]["trace_id"] == "trace-current-turn"
 
 
 def test_context_truncation_reaches_final_debug_event_without_upstream_content(
@@ -1826,20 +1853,25 @@ def test_fire_scheduled_for_user_enqueues_a_scheduled_agent_job(monkeypatch, bac
     )
 
     calls = []
-    monkeypatch.setattr(jobs_store, "enqueue_job",
-                        lambda u, lane, **kw: calls.append((u, lane)) or (101, False))
+    monkeypatch.setattr(
+        jobs_store,
+        "enqueue_job",
+        lambda u, lane, **kw: calls.append((u, lane, kw)) or (101, False),
+    )
 
     class _FakeService:
         def __init__(self, *a, **kw):
             pass
 
         def fire_due_timers(self, user_id, *, settings, submit_wake, owner_id):
-            submit_wake(object())
+            submit_wake(types.SimpleNamespace(wake_id="wake_scheduled_test"))
             return ()
 
     monkeypatch.setattr("proactive.scheduled_wake_v2.ScheduledWakeServiceV2", _FakeService)
     assert serve_worker._fire_scheduled_for_user(uid) == 1
-    assert calls == [(uid, "scheduled")]
+    assert calls == [
+        (uid, "scheduled", {"reason": "scheduled_wake", "trace_id": "wake_scheduled_test"})
+    ]
 
 
 def test_read_scheduled_wake_context_returns_notes_and_confirmed_metadata_for_one_job(

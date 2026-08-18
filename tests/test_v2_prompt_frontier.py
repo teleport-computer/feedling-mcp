@@ -1,4 +1,5 @@
 import pathlib
+import re
 import sys
 import asyncio
 import math
@@ -26,7 +27,7 @@ def _model_limit(context_window_tokens: int = 2_048) -> frontier.ModelPromptLimi
 
 
 _REAL_TOOL_COUNT = 69
-_REAL_TOOL_CATALOG_BYTES = 33_977
+_REAL_TOOL_CATALOG_BYTES = 34_148
 
 
 def _real_sized_mixed_tool_catalog() -> tuple[list[ToolSpec], list[ToolSpec]]:
@@ -34,10 +35,12 @@ def _real_sized_mixed_tool_catalog() -> tuple[list[ToolSpec], list[ToolSpec]]:
 
     The fixture is derived from the real platform catalog rather than copying a
     toy schema list. ASCII description padding makes the combined canonical
-    payload exactly 33,977 bytes while keeping 69 independently named tools.
+    payload exactly 34,148 bytes while keeping 69 independently named tools.
     The 2026-08-17 increase records the real `stay_silent` wake schema: it adds
     341 bytes by itself and 267 bytes net when replacing one synthetic MCP tool
     in this fixed-count mixed catalog.
+    The 2026-08-18 increase records the visual-by-default `photo_read` contract,
+    which adds 171 bytes while preserving the captured MCP description padding.
     """
     platform = list(tool_schema.build_tool_specs())
     mcp_count = _REAL_TOOL_COUNT - len(platform)
@@ -214,20 +217,134 @@ def test_unaudited_default_is_env_tunable_and_zero_restores_fail_closed(monkeypa
 
 
 def test_unaudited_default_is_lowest_precedence(monkeypatch):
-    """Override > caller-supplied > audited family all still win over the default,
-    so enabling the default never masks a value someone stated explicitly."""
+    """Override and audited-family knowledge still win over the default."""
     monkeypatch.delenv(frontier._UNAUDITED_DEFAULT_ENV, raising=False)
-    supplied = frontier.resolve_model_limit(
-        "some-relay", "m", provider_context_window_tokens=4096
-    )
-    assert supplied.source == "provider_metadata"
-    assert supplied.context_window_tokens == 4096
     override = frontier.resolve_model_limit(
         "some-relay", "m", deployment_overrides={"*:*": 12000}
     )
     assert override.source == "deployment_override"
     audited = frontier.resolve_model_limit("open-ai", "gpt-4o-mini")
     assert audited.source == "audited_family"
+
+
+def test_provider_metadata_below_floor_falls_through_without_constraining_explicit_limits(
+    monkeypatch,
+):
+    monkeypatch.setenv(frontier._UNAUDITED_DEFAULT_ENV, "131072")
+    monkeypatch.delenv(frontier._PROVIDER_METADATA_FLOOR_ENV, raising=False)
+
+    rejected = frontier.resolve_model_limit(
+        "openai_compatible",
+        "[AG]gemini-3.1-flash-lite",
+        base_url="https://relay.example/v1",
+        provider_context_window_tokens=16_384,
+    )
+    assert rejected.context_window_tokens == 131_072
+    assert rejected.source == "unaudited_default"
+    assert rejected.rejected_provider_metadata_tokens == 16_384
+    assert (
+        rejected.provider_metadata_floor_tokens
+        == frontier.DEFAULT_PROVIDER_METADATA_CONTEXT_WINDOW_FLOOR_TOKENS
+    )
+
+    accepted = frontier.resolve_model_limit(
+        "openai_compatible",
+        "m",
+        base_url="https://relay.example/v1",
+        provider_context_window_tokens=131_072,
+    )
+    assert accepted.source == "provider_metadata"
+    assert accepted.rejected_provider_metadata_tokens is None
+
+    boundary = frontier.resolve_model_limit(
+        "openai_compatible",
+        "m",
+        base_url="https://relay.example/v1",
+        provider_context_window_tokens=(
+            frontier.DEFAULT_PROVIDER_METADATA_CONTEXT_WINDOW_FLOOR_TOKENS
+        ),
+    )
+    assert boundary.source == "provider_metadata"
+
+    override = frontier.resolve_model_limit(
+        "openai_compatible",
+        "m",
+        base_url="https://relay.example/v1",
+        provider_context_window_tokens=16_384,
+        deployment_overrides={"openai_compatible:*": 8_192},
+    )
+    assert override.context_window_tokens == 8_192
+    assert override.source == "deployment_override"
+    assert override.rejected_provider_metadata_tokens is None
+
+    caller = frontier.ModelPromptLimit(
+        provider="openai_compatible",
+        model="",
+        context_window_tokens=8_192,
+        source="caller",
+    )
+    assert caller.context_window_tokens == 8_192
+    assert caller.source == "caller"
+
+
+def test_provider_metadata_floor_env_uses_blank_as_default(monkeypatch):
+    monkeypatch.setenv(frontier._PROVIDER_METADATA_FLOOR_ENV, "")
+    assert (
+        frontier.provider_metadata_context_window_floor()
+        == frontier.DEFAULT_PROVIDER_METADATA_CONTEXT_WINDOW_FLOOR_TOKENS
+    )
+    monkeypatch.setenv(frontier._PROVIDER_METADATA_FLOOR_ENV, "64000")
+    assert frontier.provider_metadata_context_window_floor() == 64_000
+
+
+def test_provider_metadata_floor_compose_defaults_match_runtime_constant():
+    compose = (
+        pathlib.Path(__file__).resolve().parents[1]
+        / "deploy"
+        / "docker-compose.phala.yaml"
+    ).read_text(encoding="utf-8")
+    matches = re.findall(
+        r"FEEDLING_V2_PROVIDER_METADATA_CONTEXT_WINDOW_FLOOR_TOKENS: "
+        r'"\$\{FEEDLING_V2_PROVIDER_METADATA_CONTEXT_WINDOW_FLOOR_TOKENS:-'
+        r"(\d+)\}\"",
+        compose,
+    )
+    assert matches, "deployment does not expose the metadata floor with ${VAR:-default}"
+    assert {int(value) for value in matches} == {
+        frontier.DEFAULT_PROVIDER_METADATA_CONTEXT_WINDOW_FLOOR_TOKENS
+    }
+
+
+def test_rejected_16k_metadata_allows_observed_wake_required_frontier(monkeypatch):
+    """At the frontier layer, the observed 31,693-token wake prefix now fits.
+
+    This does not assert that the user's whole wake path is recovered; tool
+    surface sizing remains a separate acceptance boundary.
+    """
+
+    monkeypatch.setenv(frontier._UNAUDITED_DEFAULT_ENV, "131072")
+    limit = frontier.resolve_model_limit(
+        "openai_compatible",
+        "[AG]gemini-3.1-flash-lite",
+        base_url="https://relay.example/v1",
+        provider_context_window_tokens=16_384,
+    )
+    plan = frontier.plan_prompt(
+        model_limit=limit,
+        components=(
+            frontier.PromptComponent("required_tool_schemas", 25_264),
+            frontier.PromptComponent("message_context", 6_429),
+        ),
+        output_reserve_tokens=4_096,
+        safety_margin_tokens=1_024,
+    )
+
+    assert plan.estimated_input_tokens == 31_693
+    assert plan.budget.context_window_tokens == 131_072
+    assert set(plan.included_components) == {
+        "required_tool_schemas",
+        "message_context",
+    }
 
 
 def test_unknown_route_override_is_explicit_and_applies_before_rejection():
@@ -957,6 +1074,7 @@ def test_late_input_is_in_required_frontier_before_first_provider_call(monkeypat
                 context_window_tokens=8_192,
             ),
             fold_before_first=True,
+            prompt_context_window_overrides={"*:*": 8_192},
             prompt_output_reserve_tokens=1_024,
             prompt_safety_margin_tokens=0,
         )
@@ -1016,6 +1134,7 @@ def test_fourteen_mcp_catalog_pressure_reaches_provider_with_memory_floor(
                 {"type": "object", "properties": {}},
             )
         ],
+        prompt_context_window_overrides={"*:*": 20_000},
         prompt_output_reserve_tokens=2_000,
         prompt_safety_margin_tokens=0,
         on_provider_tool_surface=record_surface,
@@ -1230,3 +1349,71 @@ def test_adaptive_required_exhaustion_is_counted_and_still_raised(monkeypatch):
 
     assert counted == [True]
     assert provider_calls == []
+
+
+def test_provider_round_carries_closed_component_bytes_on_success_and_exhaustion():
+    tool = ToolSpec(
+        name="lookup",
+        description="fixed schema",
+        parameters={"type": "object", "properties": {}},
+    )
+    message_bytes = (
+        frontier.PromptByteComponent("system", 321),
+        frontier.PromptByteComponent("tail", 123),
+    )
+    plan = frontier.plan_provider_round(
+        model_limit=_model_limit(8_192),
+        messages=[
+            {"role": "system", "content": "fixed system"},
+            {"role": "user", "content": "private user body"},
+        ],
+        tools=[tool],
+        output_reserve_tokens=512,
+        safety_margin_tokens=512,
+        message_component_bytes=message_bytes,
+    )
+
+    assert [(item.name, item.bytes) for item in plan.component_bytes] == [
+        ("system", 321),
+        ("tail", 123),
+        (
+            "tools",
+            frontier.prompt_structure_utf8_bytes([tool]),
+        ),
+    ]
+    assert plan.utf8_bytes_per_token == 1.0
+
+    with pytest.raises(frontier.PromptFrontierExhausted) as caught:
+        frontier.plan_provider_round(
+            model_limit=_model_limit(2_048),
+            messages=[{"role": "system", "content": "x" * 1_500}],
+            tools=[tool],
+            output_reserve_tokens=512,
+            safety_margin_tokens=512,
+            message_component_bytes=(
+                frontier.PromptByteComponent("system", 1_500),
+            ),
+        )
+
+    error = caught.value
+    assert error.output_reserve_tokens == 512
+    assert error.safety_margin_tokens == 512
+    assert error.utf8_bytes_per_token == 1.0
+    # Optional schemas are not blamed for a required-message failure.
+    assert [(item.name, item.bytes) for item in error.component_bytes] == [
+        ("system", 1_500),
+    ]
+
+
+def test_prompt_byte_component_guard_rejects_extra_plaintext_fields():
+    with pytest.raises(ValueError, match="exactly name and bytes"):
+        frontier.normalize_prompt_byte_components(({
+            "name": "system",
+            "bytes": 12,
+            "content": "private prompt body",
+        },))
+
+
+def test_prompt_byte_component_guard_rejects_plaintext_as_component_name():
+    with pytest.raises(ValueError, match="name is not in the closed set"):
+        frontier.PromptByteComponent("她说她今天很累", 12)

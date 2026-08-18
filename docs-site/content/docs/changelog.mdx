@@ -10,6 +10,31 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **Managed database promotion now validates the complete API-and-runner release
+  unit before deployment.** The TEST deployment forwards one explicit database
+  schema selector to the API, in-CVM worker, and independent runner. When TEE
+  primary mode is selected, CI requires the owner migration credentials, checks
+  the exact TEE migration head, and exercises the application startup contract
+  before changing either confidential VM.
+
+- **Self-hosted resident replies no longer become permanently lost when a long
+  agent turn crosses the consumer freshness window.** Resident liveness now
+  follows the newest poll or accepted response activity, and a current response
+  from the same identity that previously polled is valid liveness evidence
+  without changing the separate poll timestamp. `409 bootstrap_incomplete`
+  responses now include `retryable`; only `needs_resident_consumer` is retryable,
+  and the standard resident uses a configurable, bounded exponential backoff.
+  Other stages and older servers without the field remain terminal.
+
+- **Hosted Runtime V2 no longer trusts route context-window metadata below a
+  deployment-tunable floor.** Values below the default 32,768-token floor now
+  fall through to the audited-family or unaudited-route default instead of
+  silently shrinking the required prompt surface. A content-free warning records
+  the reported value, floor, resolved value/source, and closed provider class;
+  it never records the model name or prompt content. Because saved routes do not
+  carry provenance for this field, the same rule also applies to a small value
+  entered explicitly during Model API setup.
+
 - **Hosted Runtime V2 now allows up to 15 provider rounds in an ordinary Chat
   or proactive turn before its hard terminal-reply round, up from six.** The
   final allowed round still withholds new tool use so the limit remains a real
@@ -169,12 +194,17 @@ change must not be interpreted as an API guarantee.
   whether weak wakes speak; scheduled reminders still require delivery.
 
 - **Hosted Runtime V2 scheduled reminders no longer disappear after a model or
-  provider failure.** A content-free reminder response gets one bounded retry
-  with a reminder-specific correction. If delivery still fails, the runtime
-  writes one encrypted, standalone failure result containing the original
-  reminder note and a safe error explanation. This result is idempotent,
-  survives worker crashes and lease expiry, does not attach itself to an older
-  user message, and does not advance that message's reply cursor. Heartbeat,
+  provider failure.** A pristine delivery can make up to three total attempts,
+  delayed by 30 seconds and then 120 seconds. Authentication, payment,
+  configuration, mutation, durable-write, lease, runtime-mode, and exhausted-
+  budget failures terminate immediately rather than retrying. Generic heartbeat
+  failure backoff never postpones reminders, while payment cooldown still does.
+  If delivery ultimately fails, the runtime writes one encrypted, standalone
+  system notice naming the reminder and its original local time; quota failures
+  receive dedicated recharge guidance. Intermediate attempts and later retry
+  success produce no failure notice. The final result is idempotent, survives
+  worker crashes and lease expiry, does not attach itself to an older user
+  message, and does not advance that message's reply cursor. Heartbeat,
   manual-wake, and screen-watch silence remains unchanged.
 
 - **Multi-card memory consolidation no longer leaves a silently unretired

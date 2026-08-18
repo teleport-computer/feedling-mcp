@@ -526,7 +526,8 @@ def test_provider_roundtrip_trace_distinguishes_empty_response_recovery(monkeypa
     uid = "u_provider_roundtrip_empty_recovery"
     conftest.seed_user(uid)
     _reset(uid)
-    jobs_store.enqueue_job(uid, "chat")
+    turn_trace_id = "trace-roundtrip-empty-recovery"
+    jobs_store.enqueue_job(uid, "chat", trace_id=turn_trace_id)
     job = jobs_store.claim_next_job("w")
     _patch_real_write(monkeypatch)
 
@@ -561,6 +562,21 @@ def test_provider_roundtrip_trace_distinguishes_empty_response_recovery(monkeypa
     assert roundtrip["detail"]["terminal_text_round_reason"] == "none"
     assert roundtrip["detail"]["force_text_fallback_reason"] == "none"
     assert roundtrip["detail"]["empty_response_recovery_used"] is True
+    joinable = [
+        trace
+        for trace in traces
+        if trace["type"] in {
+            "provider.empty_response",
+            "mcp.roundtrip.provider",
+            "mcp.surface.provider",
+        }
+    ]
+    assert {trace["type"] for trace in joinable} == {
+        "provider.empty_response",
+        "mcp.roundtrip.provider",
+        "mcp.surface.provider",
+    }
+    assert {trace["trace_id"] for trace in joinable} == {turn_trace_id}
 
 
 def test_mcp_turn_usage_records_offered_but_zero_calls(monkeypatch):

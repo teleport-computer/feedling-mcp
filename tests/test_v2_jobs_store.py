@@ -648,6 +648,9 @@ def test_scheduled_failure_reply_is_standalone_visible_and_idempotent(monkeypatc
             "status": "fired",
             "fired_job_id": job_id,
             "note": "提醒我喝水",
+            "at": "2026-08-17T09:30:00",
+            "timezone": "Asia/Shanghai",
+            "due_at": 1_787_110_200.0,
         },
         item_key="timer-water",
     )
@@ -700,10 +703,12 @@ def test_scheduled_failure_reply_is_standalone_visible_and_idempotent(monkeypatc
     assert failure["wake_kind"] == "scheduled"
     assert failure["notice_kind"] == "scheduled_wake_failure"
     assert failure["turn_failure_error_class"] == "provider_empty_reply"
-    assert "定时任务" in encrypted_plaintexts[0]
-    assert "已触发" in encrypted_plaintexts[0]
-    assert "提醒我喝水" in encrypted_plaintexts[0]
-    assert "空回复" in encrypted_plaintexts[0]
+    assert encrypted_plaintexts == [
+        "提醒没能送到\n"
+        "「提醒我喝水」原定 2026年8月17日 09:30（Asia/Shanghai） 提醒你,"
+        "试了几次都没成功。\n"
+        "这条提醒不会自动补发,需要的话可以重新设一个。"
+    ]
     parent = db.chat_get_strict(uid, "parent-user")
     assert not str(parent.get("reply_message_id") or "")
     assert v2_cursor.load_seq(core_store.get_store(uid)) == cursor_before
@@ -714,6 +719,28 @@ def test_scheduled_failure_reply_is_standalone_visible_and_idempotent(monkeypatc
             (uid,),
         ).fetchone()[0]
     assert route_error == ""
+
+
+def test_scheduled_quota_failure_uses_approved_copy_with_original_time():
+    text = jobs_store._scheduled_failure_reply_text(
+        "quota_insufficient",
+        language="zh-CN",
+        contexts=[{
+            "note": "喝水",
+            "at": "2026-08-17T09:30:00",
+            "timezone": "Asia/Shanghai",
+            "due_at": "",
+        }],
+    )
+
+    assert text == (
+        "提醒没能送到\n"
+        "「喝水」原定 2026年8月17日 09:30（Asia/Shanghai） 提醒你,"
+        "因为模型服务额度不足没能送出。\n"
+        "充值后新的提醒就能正常工作;这一条不会自动补发。"
+    )
+    for internal_term in ("provider", "Runtime", "job", "retry", "空回复", "定时任务"):
+        assert internal_term not in text
 
 
 def test_terminal_image_generation_configuration_failure_never_uses_slow_fallback(
@@ -1800,6 +1827,70 @@ def test_reschedule_owned_job_rejects_wrong_owner_without_mutation():
             (job_id,),
         ).fetchone()
     assert after == before
+
+
+def test_pristine_scheduled_failure_reschedule_rejects_any_mcp_attempt():
+    uid = "u_scheduled_failure_mcp_fence"
+    owner = "wake:g1"
+    seed_user(uid)
+    _reset(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, "scheduled")
+    claimed = jobs_store.claim_next_job(owner, lanes={"scheduled"})
+    assert claimed is not None and int(claimed["id"]) == job_id
+    assert jobs_store.mark_running(job_id, claimed_by=owner)
+    assert jobs_store.start_mcp_mutation_attempt(
+        job_id,
+        user_id=uid,
+        claimed_by=owner,
+        call_id="calendar-write",
+        tool_name="mcp__calendar__create",
+        input_frontier_seq=0,
+    )
+
+    assert not jobs_store.reschedule_pristine_scheduled_failure(
+        job_id,
+        claimed_by=owner,
+        error="scheduled_retry:wake_failed:providererror",
+        available_at=time.time() + 30,
+        expected_attempt_count=0,
+        max_attempts=3,
+    )
+    assert _job_row(job_id)[0:2] == ("running", 0)
+
+
+@pytest.mark.parametrize("effect_type", sorted(jobs_store.DURABLE_TOOL_EFFECT_TYPES))
+def test_pristine_scheduled_failure_reschedule_rejects_durable_effect(
+    effect_type,
+):
+    from model_api_runtime.v2 import effect_outbox
+
+    uid = f"u_scheduled_failure_effect_{effect_type[:10]}"
+    owner = "wake:g2"
+    seed_user(uid)
+    _reset(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, "scheduled")
+    claimed = jobs_store.claim_next_job(owner, lanes={"scheduled"})
+    assert claimed is not None and int(claimed["id"]) == job_id
+    assert jobs_store.mark_running(job_id, claimed_by=owner)
+    effect_outbox.enqueue_effect(
+        job_id=job_id,
+        user_id=uid,
+        effect_type=effect_type,
+        ordinal=0,
+        expected_generation=1,
+        payload={"ciphertext": "shell"},
+        input_frontier_seq=0,
+    )
+
+    assert not jobs_store.reschedule_pristine_scheduled_failure(
+        job_id,
+        claimed_by=owner,
+        error="scheduled_retry:wake_failed:providererror",
+        available_at=time.time() + 30,
+        expected_attempt_count=0,
+        max_attempts=3,
+    )
+    assert _job_row(job_id)[0:2] == ("running", 0)
 
 
 def test_make_pending_profile_job_ready_updates_only_delayed_row():

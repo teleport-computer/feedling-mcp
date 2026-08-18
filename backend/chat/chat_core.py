@@ -782,7 +782,12 @@ def trace_response_gated(store: UserStore, payload: dict, allow_verify_reply: bo
     )
 
 
-def gate_response_dict(store: UserStore, allow_verify_reply: bool, payload: dict | None = None):
+def gate_response_dict(
+    store: UserStore,
+    allow_verify_reply: bool,
+    payload: dict | None = None,
+    consumer_info: dict | None = None,
+):
     """Bridge to the shared bootstrap gate.
 
     ``boot_gates._gate_bootstrap_for_chat`` returns a framework-neutral
@@ -793,9 +798,10 @@ def gate_response_dict(store: UserStore, allow_verify_reply: bool, payload: dict
     Identity Card presence/content is not part of this gate. The remaining VPS
     checks prove that a resident consumer and live chat loop are available.
     """
-    gated = boot_gates._gate_bootstrap_for_chat(
-        store, allow_verify_reply=allow_verify_reply
-    )
+    gate_kwargs = {"allow_verify_reply": allow_verify_reply}
+    if consumer_info:
+        gate_kwargs["consumer_info"] = consumer_info
+    gated = boot_gates._gate_bootstrap_for_chat(store, **gate_kwargs)
     if gated is None:
         return None
     if _is_resident_maintenance_reply(store, payload):
@@ -821,7 +827,6 @@ def write_response(
     ``consumer_info`` is the X-Feedling-Consumer identity for the liveness state.
     Both are parsed framework-neutrally by the adapter.
     """
-    chat_consumer._record_consumer_event(store, "response", info=consumer_info)
     envelope = payload.get("envelope")
     if envelope is None:
         return {"error": "envelope required"}, 400
@@ -1169,6 +1174,9 @@ def write_response(
             # A resident may finish after the phone has hung up. This is an
             # accepted terminal disposition, not a transport error that should
             # keep the local consumer retrying the same stale answer forever.
+            chat_consumer._record_consumer_event(
+                store, "response", info=consumer_info
+            )
             return {
                 "status": "ignored",
                 "reason": str(exc),
@@ -1194,6 +1202,9 @@ def write_response(
                 winner = db.chat_get_strict(store.user_id, winner_reply_id)
                 if winner is not None:
                     _maybe_mark_first_chat_ok(store, reply_to_message_id)
+                    chat_consumer._record_consumer_event(
+                        store, "response", info=consumer_info
+                    )
                     return {
                         "id": winner["id"],
                         "ts": winner["ts"],
@@ -1217,6 +1228,10 @@ def write_response(
             content_type=content_type,
             extra=extra,
         )
+    # Persist liveness only after the response has been accepted (or on the two
+    # explicit accepted/idempotent return paths above). Malformed or conflicting
+    # submissions must not update the shared activity clock.
+    chat_consumer._record_consumer_event(store, "response", info=consumer_info)
     delivery_fields: dict = {}
     visible_push_body = (push_body or alert_body).strip()
     # Defense-in-depth: synthetic/maintenance replies must NEVER surface as push

@@ -30,6 +30,18 @@ trigger, the scheduler creates the next pending occurrence with a new
 reminder context and cancels the whole repeating series. Omitting `repeat`
 preserves one-time reminder behavior.
 
+Hosted Runtime V2 gives a pristine failed reminder delivery up to three total
+attempts, waiting 30 seconds and then 120 seconds. It does not retry failures
+that cannot safely repeat, including provider configuration/payment failures,
+attempts that mutated an MCP service or staged a durable platform write, lost
+leases, runtime-mode changes, and exhausted budgets. Generic heartbeat failure
+backoff does not delay reminder delivery; payment cooldown still prevents calls
+that cannot succeed. Intermediate failures and a later successful retry remain
+silent. After a terminal failure, the chat stream receives one standalone
+system notice with the reminder title and original local time, plus recharge
+guidance when model-service quota is insufficient; the failed occurrence is not
+automatically delivered later.
+
 ## Hosted chat
 
 Before sending, the account needs a content public key, a configured model route,
@@ -671,6 +683,22 @@ seconds. Missing, malformed, future, or stale reports normalize to `unknown`.
 Every official poll is authoritative: omitting the two headers clears any
 previous cached green report instead of inheriting it. Response requests do not
 update this poll-heartbeat state.
+
+Resident liveness itself uses the newest accepted poll or response activity.
+When an official resident takes longer than the normal 180-second freshness
+window to answer, its current response can still prove liveness only if that
+same consumer identity previously polled. A client that never polled cannot mint
+liveness by copying resident headers. Successful responses refresh the shared
+activity clock without overwriting the separate poll timestamp.
+
+Every `409 bootstrap_incomplete` response includes `retryable`. The
+`needs_resident_consumer` stage returns `true`, allowing the standard resident
+to retry the same reply with up to three bounded exponential-backoff retries. Other
+bootstrap stages return `false`; clients must also treat a missing field from an
+older server as false. The backoff uses
+`FEEDLING_CHAT_RESPONSE_RETRY_BASE_SEC` (default 1 second) and stops after
+`FEEDLING_CHAT_RESPONSE_RETRY_MAX_ELAPSED_SEC` (default 15 seconds); deployments
+can change the retry count with `FEEDLING_CHAT_RESPONSE_MAX_RETRIES`.
 
 For a resident-route account that has not completed one ordinary user/agent
 exchange, every non-`ok` result blocks onboarding validation, live-loop

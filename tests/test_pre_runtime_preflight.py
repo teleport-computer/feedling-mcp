@@ -9,6 +9,8 @@ from alembic.script import ScriptDirectory
 ROOT = Path(__file__).parent.parent
 WORKFLOW = ROOT / ".github" / "workflows" / "ci.yml"
 TEE_MIGRATE_WORKFLOW = ROOT / ".github" / "workflows" / "tee-migrate.yml"
+TEST_COMPOSE = ROOT / "deploy" / "docker-compose.phala.test.yaml"
+TEST_RUNNER_COMPOSE = ROOT / "deploy" / "docker-compose.phala.runner.yaml"
 
 
 def test_tee_migrate_has_one_head_after_runtime_v2_alignment():
@@ -16,7 +18,11 @@ def test_tee_migrate_has_one_head_after_runtime_v2_alignment():
     cfg.set_main_option("script_location", str(ROOT / "backend" / "alembic_tee"))
     script = ScriptDirectory.from_config(cfg)
 
-    assert script.get_heads() == ["0022_v2_wake_outcomes"]
+    assert script.get_heads() == ["0023_lane_daily_rollup"]
+    assert (
+        script.get_revision("0023_lane_daily_rollup").down_revision
+        == "0022_v2_wake_outcomes"
+    )
     assert (
         script.get_revision("0022_v2_wake_outcomes").down_revision
         == "0021_agent_jobs_available_at"
@@ -37,8 +43,8 @@ def test_tee_migrate_has_one_head_after_runtime_v2_alignment():
         script.get_revision("0018_v2_wake_shadow_decisions").down_revision
         == "0017_voice_primary_alignment"
     )
-    migration = script.get_revision("0022_v2_wake_outcomes").module
-    assert "'[\"0022_v2_wake_outcomes\"]'::jsonb" in (
+    migration = script.get_revision("0023_lane_daily_rollup").module
+    assert "'[\"0023_lane_daily_rollup\"]'::jsonb" in (
         migration._UPDATE_PREPARED_HEAD
     )
 
@@ -179,3 +185,90 @@ def test_test_deploys_when_the_hosted_v1_consumer_changes():
         "validate-test-runtime-prerequisites",
     )
     assert "tools/chat_resident_consumer.py" in detection
+
+
+def test_test_stage_a_keeps_rds_primary_and_tee_shadow_wiring():
+    source = WORKFLOW.read_text()
+    main = _job(source, "deploy-test-cvm", "deploy-test-runner-cvm")
+    runner = _job(source, "deploy-test-runner-cvm", "deploy-pre-cvm")
+
+    assert "${{ secrets.TEST_DATABASE_URL }}" in main
+    assert "${{ secrets.TEST_TEE_DATABASE_URL }}" in main
+    assert "${{ secrets.TEST_FEEDLING_TEE_DUAL_WRITE }}" in main
+    assert "${{ secrets.TEST_DATABASE_URL }}" in runner
+    assert "PRE_DATABASE_URL" not in main
+    assert "PRE_DATABASE_URL" not in runner
+
+
+def test_test_deploys_forward_one_database_schema_selector_to_both_cvms():
+    source = WORKFLOW.read_text()
+    main = _job(source, "deploy-test-cvm", "deploy-test-runner-cvm")
+    runner = _job(source, "deploy-test-runner-cvm", "deploy-pre-cvm")
+
+    selector = "${{ vars.TEST_FEEDLING_DATABASE_SCHEMA || 'rds' }}"
+    for deploy in (main, runner):
+        assert "FEEDLING_DATABASE_SCHEMA:" in deploy
+        assert selector in deploy
+        assert '-e "FEEDLING_DATABASE_SCHEMA=$FEEDLING_DATABASE_SCHEMA"' in deploy
+
+
+def test_test_compose_forwards_database_schema_to_every_database_client():
+    main = TEST_COMPOSE.read_text()
+    backend = main.split("\n  backend:\n", 1)[1].split("\n  serve-worker:\n", 1)[0]
+    worker = main.split("\n  serve-worker:\n", 1)[1]
+    runner = TEST_RUNNER_COMPOSE.read_text()
+    selector = 'FEEDLING_DATABASE_SCHEMA: "${FEEDLING_DATABASE_SCHEMA:-rds}"'
+
+    assert selector in backend
+    assert selector in worker
+    assert selector in runner
+
+
+def test_test_preflight_blocks_tee_primary_before_mutating_either_cvm():
+    preflight = _job(
+        WORKFLOW.read_text(),
+        "validate-test-runtime-prerequisites",
+        "validate-prod-runner-topology",
+    )
+
+    for required in (
+        "TEST_FEEDLING_DATABASE_SCHEMA == 'tee'",
+        "TEST_TEE_MIGRATION_DSN",
+        "TEST_TEE_PG_CA_PEM",
+        "APP_DATABASE_URL",
+        "backend/alembic_tee/alembic.ini",
+        "SELECT version_num FROM alembic_tee_version",
+        "owner_fingerprint != app_fingerprint",
+        "TEST TEE schema migration required",
+        "run the TEE migrate workflow for test",
+        "No TEST CVM was changed",
+        'os.environ["FEEDLING_DATABASE_SCHEMA"] = "tee"',
+        'os.environ["DATABASE_URL"] = os.environ["APP_DATABASE_URL"]',
+        "db.init_schema()",
+    ):
+        assert required in preflight
+
+    schema_gate = preflight.index(
+        "Require TEST TEE schema at release head before mutating either CVM"
+    )
+    image_gate = preflight.index(
+        "Require both Runtime V2 images before mutating either CVM"
+    )
+    assert schema_gate < image_gate
+
+
+def test_test_preflight_rejects_noncanonical_database_schema_selector():
+    preflight = _job(
+        WORKFLOW.read_text(),
+        "validate-test-runtime-prerequisites",
+        "validate-prod-runner-topology",
+    )
+    complete_config = preflight.split(
+        "- name: Require complete Runtime V2 configuration", 1
+    )[1].split("\n      - name:", 1)[0]
+
+    assert "FEEDLING_DATABASE_SCHEMA:" in complete_config
+    assert "${{ vars.TEST_FEEDLING_DATABASE_SCHEMA || 'rds' }}" in complete_config
+    assert 'case "$FEEDLING_DATABASE_SCHEMA" in' in complete_config
+    assert "rds|tee)" in complete_config
+    assert "must be exactly rds or tee" in complete_config

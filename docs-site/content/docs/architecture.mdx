@@ -212,6 +212,12 @@ schema-only or partial cutover fails closed. Shadow dual-write and its
 reconciliation scheduler are disabled in this mode, including when stale
 shadow variables remain present.
 
+Managed release units pass the same schema selector to the API, in-CVM worker,
+and independent runner. Before a TEE-primary deployment mutates any confidential
+VM, CI connects with the migration role, checks the exact release head, and runs
+the application's startup assertion. A missing credential, stale head, or
+partial configuration therefore leaves the currently running release intact.
+
 Current FrameEnvelope v1 clients still require the original envelope metadata
 and object pointer. During promotion, the managed deployment therefore copies a
 temporary `frame_envelopes` compatibility bridge into the confidential-VM

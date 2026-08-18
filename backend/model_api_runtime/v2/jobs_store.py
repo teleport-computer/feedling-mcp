@@ -7,6 +7,8 @@ CONTRIBUTING §2：新表存取逻辑全部收进本模块（jobs_store）。连
 
 from __future__ import annotations
 
+import base64
+import binascii
 import hashlib
 import logging
 import math
@@ -347,6 +349,7 @@ _TRAJECTORY_SEALED_ALLOWED = frozenset(
 _TRAJECTORY_PLAINTEXT_REQUIRED = frozenset(
     {"id", "owner_user_id", "visibility", "body"}
 )
+TRAJECTORY_PLAINTEXT_B64_PREFIX = "feedling-v2-trajectory-b64-v1:"
 
 
 def trajectory_review_admission_cap() -> int:
@@ -418,6 +421,21 @@ def _validate_trajectory_envelope(user_id: str, envelope: object) -> dict:
     for field in required:
         if not isinstance(envelope.get(field), str) or not envelope[field]:
             raise ValueError(f"trajectory payload envelope {field} required")
+    if "body_ct" not in envelope:
+        from core import envelope as core_envelope
+
+        if core_envelope.resolve_content_encryption(str(user_id)) != "off":
+            raise ValueError("trajectory plaintext payload not enabled")
+        encoded = envelope["body"]
+        if not encoded.startswith(TRAJECTORY_PLAINTEXT_B64_PREFIX):
+            raise ValueError("trajectory plaintext encoding invalid")
+        encoded = encoded[len(TRAJECTORY_PLAINTEXT_B64_PREFIX) :]
+        if not encoded:
+            raise ValueError("trajectory plaintext encoding invalid")
+        try:
+            base64.b64decode(encoded, validate=True)
+        except (binascii.Error, ValueError) as exc:
+            raise ValueError("trajectory plaintext encoding invalid") from exc
     return envelope
 
 
@@ -1285,7 +1303,7 @@ def renew_job_lease(
             return cur.rowcount == 1
 
 
-_FAIL_BACKOFF_WAKE_LANES = frozenset({"heartbeat", "scheduled"})
+_FAIL_BACKOFF_WAKE_LANES = frozenset({"heartbeat"})
 
 
 def _latest_genuine_user_seq_on_cursor(cur, user_id: str) -> int:
@@ -1711,6 +1729,79 @@ def reschedule_owned_job(
             return cur.rowcount == 1
 
 
+def reschedule_pristine_scheduled_failure(
+    job_id: int,
+    *,
+    claimed_by: str,
+    error: str,
+    available_at: float,
+    expected_attempt_count: int,
+    max_attempts: int,
+) -> bool:
+    """Retry one failed scheduled delivery only while the turn is pristine.
+
+    The same job id is retained because fired reminder context and deterministic
+    effect ids are keyed by it.  Any MCP mutation attempt or durable platform
+    write makes a whole-turn replay unsafe even when its recorded outcome is
+    known: a successful side effect must never be executed a second time.
+
+    This transition deliberately does not enqueue terminal-failure visibility.
+    The worker calls :func:`mark_failed` only when this bounded retry is
+    ineligible or exhausted.
+    """
+    attempt_count = int(expected_attempt_count)
+    attempt_limit = int(max_attempts)
+    if attempt_count < 0:
+        raise ValueError("expected_attempt_count must be non-negative")
+    if attempt_limit <= 0:
+        raise ValueError("max_attempts must be positive")
+
+    with _pool().connection() as conn:
+        with conn.transaction():
+            identity = conn.execute(
+                "SELECT user_id FROM agent_jobs WHERE id=%s",
+                (int(job_id),),
+            ).fetchone()
+            if identity is None:
+                return False
+            control = conn.execute(
+                "SELECT hosted_runtime_state,runtime_generation "
+                "FROM v2_runtime_state WHERE user_id=%s FOR UPDATE",
+                (str(identity[0]),),
+            ).fetchone()
+            if control is None or str(control[0]) != "v2":
+                return False
+            runtime_generation = int(control[1])
+            cur = conn.execute(
+                "UPDATE agent_jobs AS job SET status='pending',"
+                "available_at=to_timestamp(%s),last_error=%s,"
+                "attempt_count=attempt_count+1,claimed_by=NULL,claimed_at=NULL,"
+                "started_at=NULL,finished_at=NULL,lease_expires_at=NULL,"
+                "deadline_at=NULL "
+                "WHERE job.id=%s AND job.lane='scheduled' "
+                "AND job.claimed_by=%s AND job.status IN ('claimed','running') "
+                "AND job.lease_expires_at > clock_timestamp() "
+                "AND job.expected_runtime_generation=%s "
+                "AND job.attempt_count=%s AND job.attempt_count<%s "
+                "AND NOT EXISTS (SELECT 1 FROM v2_mcp_mutation_attempts mcp "
+                "  WHERE mcp.job_id=job.id) "
+                "AND NOT EXISTS (SELECT 1 FROM v2_effect_outbox effect "
+                "  WHERE effect.job_id=job.id "
+                "  AND effect.effect_type = ANY(%s))",
+                (
+                    float(available_at),
+                    str(error)[:500],
+                    int(job_id),
+                    str(claimed_by),
+                    runtime_generation,
+                    attempt_count,
+                    attempt_limit - 1,
+                    sorted(DURABLE_TOOL_EFFECT_TYPES),
+                ),
+            )
+            return cur.rowcount == 1
+
+
 def make_pending_job_ready(user_id: str, *, lane: str = "profile") -> bool:
     """Make one current-generation delayed pending job immediately claimable."""
     with _pool().connection() as conn:
@@ -1797,7 +1888,7 @@ def recover_killed_job(
                     # Watchdog recovery is an eager form of the lease reaper.
                     # It must use the same replay-safety contract: only a
                     # pristine scheduled turn with retry budget remaining may
-                    # run again.  Any MCP attempt or durable platform effect
+                    # run again. Any MCP attempt or durable platform effect
                     # makes whole-turn replay unsafe, even when the recorded
                     # MCP outcome is known-success.
                     cur.execute(
@@ -3383,56 +3474,97 @@ def _ack_terminal_failure_reply(job_id) -> bool:
         return cur.rowcount == 1
 
 
-def _scheduled_failure_notes(user_id: str, job_id) -> list[str]:
-    """Read the canonical reminder notes for one fired scheduled job."""
+def _scheduled_failure_contexts(user_id: str, job_id) -> list[dict[str, object]]:
+    """Read bounded canonical reminder identity for one fired scheduled job."""
     with _pool().connection() as conn:
         rows = conn.execute(
-            "SELECT doc->>'note' FROM user_logs "
+            "SELECT doc->>'note',doc->>'at',doc->>'timezone',doc->>'due_at' "
+            "FROM user_logs "
             "WHERE user_id=%s AND stream=%s AND doc->>'status'='fired' "
             "AND doc->>'fired_job_id'=%s ORDER BY seq LIMIT 10",
             (str(user_id), SCHEDULED_WAKE_STREAM, str(int(job_id))),
         ).fetchall()
     return [
-        str(row[0]).strip()[:1000]
+        {
+            "note": str(row[0]).strip()[:1000],
+            "at": str(row[1] or "").strip()[:120],
+            "timezone": str(row[2] or "").strip()[:80],
+            "due_at": str(row[3] or "").strip()[:40],
+        }
         for row in rows
         if str(row[0] or "").strip()
     ]
+
+
+def _scheduled_failure_display_time(
+    context: dict[str, object], *, language: str
+) -> str:
+    raw_at = str(context.get("at") or "").strip()
+    zone = str(context.get("timezone") or "").strip()
+    try:
+        local = datetime.fromisoformat(raw_at)
+    except (TypeError, ValueError):
+        local = None
+    if local is not None:
+        clock = (
+            f"{local.hour:02d}:{local.minute:02d}:{local.second:02d}"
+            if local.second or local.microsecond
+            else f"{local.hour:02d}:{local.minute:02d}"
+        )
+        if str(language or "").strip().lower().startswith("en"):
+            rendered = f"{local.year:04d}-{local.month:02d}-{local.day:02d} {clock}"
+            return f"{rendered} ({zone})" if zone else rendered
+        rendered = f"{local.year}年{local.month}月{local.day}日 {clock}"
+        return f"{rendered}（{zone}）" if zone else rendered
+    if raw_at:
+        return f"{raw_at}（{zone}）" if zone else raw_at
+    try:
+        due = datetime.fromtimestamp(float(context.get("due_at") or 0), timezone.utc)
+    except (TypeError, ValueError, OSError):
+        due = None
+    if due is not None and due.timestamp() > 0:
+        return due.strftime("%Y-%m-%d %H:%M UTC")
+    return "the scheduled time" if str(language or "").lower().startswith("en") else "原定时间"
 
 
 def _scheduled_failure_reply_text(
     error_class: str,
     *,
     language: str,
-    user_text: str,
-    notes: list[str],
+    contexts: list[dict[str, object]],
 ) -> str:
-    """Explain a missed timer without impersonating a model-authored reply."""
+    """Render approved system copy without impersonating the companion."""
+    notes = [str(item.get("note") or "").strip() for item in contexts]
+    title = "；".join(note for note in notes if note) or "这条提醒"
+    scheduled_time = _scheduled_failure_display_time(
+        contexts[0] if contexts else {}, language=language
+    )
     if str(language or "").strip().lower().startswith("en"):
-        reminder = (
-            " (" + "; ".join(notes) + ")"
-            if notes
-            else ""
-        )
-        if error_class == "provider_empty_reply":
+        if error_class == "quota_insufficient":
             return (
-                "A scheduled reminder" + reminder
-                + " was due, but your model service returned "
-                "an empty reply, so it could not be delivered. Please set it "
-                "again; if this keeps happening, check the model provider or relay."
+                "Reminder couldn't be delivered\n"
+                f"“{title}” was scheduled for {scheduled_time}, but could not be "
+                "delivered because the model-service quota was insufficient.\n"
+                "New reminders will work after you add credit; this one will not "
+                "be delivered automatically."
             )
         return (
-            "A scheduled reminder" + reminder
-            + " was due, but its reply could not be delivered. "
-            "Please set it again."
+            "Reminder couldn't be delivered\n"
+            f"“{title}” was scheduled for {scheduled_time}, but delivery still "
+            "failed after several attempts.\n"
+            "This reminder will not be delivered automatically; set a new one if "
+            "you still need it."
         )
-    reminder = (
-        "（" + "；".join(f"“{note}”" for note in notes) + "）"
-        if notes
-        else ""
-    )
+    if error_class == "quota_insufficient":
+        return (
+            "提醒没能送到\n"
+            f"「{title}」原定 {scheduled_time} 提醒你,因为模型服务额度不足没能送出。\n"
+            "充值后新的提醒就能正常工作;这一条不会自动补发。"
+        )
     return (
-        "刚才的定时任务" + reminder + "已触发，但 TA 的回复没有成功送达。"
-        + str(user_text or "连接模型服务时出了问题。").strip()
+        "提醒没能送到\n"
+        f"「{title}」原定 {scheduled_time} 提醒你,试了几次都没成功。\n"
+        "这条提醒不会自动补发,需要的话可以重新设一个。"
     )
 
 
@@ -3516,8 +3648,8 @@ def _deliver_terminal_failure_reply(row: dict) -> bool:
         error_class,
         language=language,
     )
-    scheduled_notes = (
-        _scheduled_failure_notes(user_id, job_id)
+    scheduled_contexts = (
+        _scheduled_failure_contexts(user_id, job_id)
         if lane == "scheduled"
         else []
     )
@@ -3525,8 +3657,7 @@ def _deliver_terminal_failure_reply(row: dict) -> bool:
         _scheduled_failure_reply_text(
             error_class,
             language=language,
-            user_text=user_text,
-            notes=scheduled_notes,
+            contexts=scheduled_contexts,
         )
         if lane == "scheduled"
         else (
@@ -11763,7 +11894,9 @@ def due_scheduled_users(*, now: float | None = None, limit: int = 500) -> list[s
     `DISTINCT ON (user_id, item_key) ... ORDER BY seq DESC` 只取每个 timer 的**最新一版**，
     否则早已 fire 的 timer 会被当成 pending 反复唤醒。
 
-    到期 = pending，或 claimed 但 claim 租约已过期（持有者死了）。触发的原子性由
+    到期 = pending，或 claimed 但 claim 租约已过期（持有者死了）。通用主动唤醒
+    失败退避只属于 heartbeat，不能推迟明确的提醒交付；但 BYOK 支付冷却仍会阻止
+    必然失败的模型调用。触发的原子性由
     `ScheduledWakeServiceV2.fire_due_timers` 内部的 claim_due CAS 保证——本函数只是个
     廉价的候选人筛子，允许假阳性（多个 scheduler 抢同一个 timer 是安全的）。"""
     ts = time.time() if now is None else float(now)
@@ -11780,11 +11913,8 @@ def due_scheduled_users(*, now: float | None = None, limit: int = 500) -> list[s
         "WHERE COALESCE(NULLIF(doc->>'due_at','')::float8, 0) <= %s "
         "  AND (doc->>'status' = 'pending' OR (doc->>'status' = 'claimed' "
         "       AND COALESCE(NULLIF(doc->>'claim_expires_at','')::float8, 0) <= %s)) "
-        "  AND (schedule.proactive_backoff_until IS NULL "
-        "       OR schedule.proactive_backoff_until <= to_timestamp(%s) "
-        "       OR schedule.proactive_fail_user_seq < "
-        + _LATEST_GENUINE_USER_SEQ_SQL
-        + ") "
+        "  AND (schedule.payment_cooldown_until IS NULL "
+        "       OR schedule.payment_cooldown_until <= to_timestamp(%s)) "
         "LIMIT %s"
     )
     with _pool().connection() as conn:

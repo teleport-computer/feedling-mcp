@@ -3,6 +3,7 @@ proactive oracle 的两关判定、frame-id 消费的有意修正（相对 resid
 next_screen_watch_at。不起真 worker/真 enclave/真 provider；两个 gate 输入全走明文路径。
 
 Parity matrix 行：§B `screen-watch`（producer=`serve_worker._tick_screen_watch_for_user`）。"""
+import re
 import sys
 import types
 from pathlib import Path
@@ -65,7 +66,11 @@ def test_wakes_and_persists_the_frame_id(monkeypatch):
         should_wake=True,
     )
     assert serve_worker._tick_screen_watch_for_user("u_wake") == 1
-    assert enqueue == [("u_wake", "screen_watch", {"reason": "screen_watch"})]
+    assert len(enqueue) == 1
+    uid, lane, kwargs = enqueue[0]
+    assert (uid, lane) == ("u_wake", "screen_watch")
+    assert kwargs["reason"] == "screen_watch"
+    assert re.fullmatch(r"[0-9a-f]{32}", kwargs["trace_id"])
     assert notify == [("v2_jobs", "u_wake")]
     # exactly one upsert, carrying BOTH the advanced next_at and the consumed frame id
     assert len(upsert) == 1
@@ -85,9 +90,11 @@ def test_recent_chat_no_longer_suppresses_or_leaves_the_frame_unconsumed(monkeyp
         should_wake=True,
     )
     assert serve_worker._tick_screen_watch_for_user("u_chat") == 1
-    assert enqueue == [
-        ("u_chat", "screen_watch", {"reason": "screen_watch"})
-    ]
+    assert len(enqueue) == 1
+    uid, lane, kwargs = enqueue[0]
+    assert (uid, lane) == ("u_chat", "screen_watch")
+    assert kwargs["reason"] == "screen_watch"
+    assert re.fullmatch(r"[0-9a-f]{32}", kwargs["trace_id"])
     assert notify == [("v2_jobs", "u_chat")]
     assert len(upsert) == 1
     uid, kw = upsert[0]

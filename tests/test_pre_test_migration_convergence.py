@@ -16,7 +16,11 @@ def _scripts(tree: str) -> ScriptDirectory:
 
 def test_rds_pre_and_test_heads_converge():
     script = _scripts("alembic")
-    assert script.get_heads() == ["0090_merge_wake_outcomes"]
+    assert script.get_heads() == ["0091_lane_daily_rollup"]
+    assert (
+        script.get_revision("0091_lane_daily_rollup").down_revision
+        == "0090_merge_wake_outcomes"
+    )
     assert set(
         script.get_revision("0090_merge_wake_outcomes").down_revision
     ) == {
@@ -37,7 +41,11 @@ def test_rds_pre_and_test_heads_converge():
 
 def test_tee_chain_carries_test_runtime_schema():
     script = _scripts("alembic_tee")
-    assert script.get_heads() == ["0022_v2_wake_outcomes"]
+    assert script.get_heads() == ["0023_lane_daily_rollup"]
+    assert (
+        script.get_revision("0023_lane_daily_rollup").down_revision
+        == "0022_v2_wake_outcomes"
+    )
     assert (
         script.get_revision("0022_v2_wake_outcomes").down_revision
         == "0021_agent_jobs_available_at"

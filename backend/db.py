@@ -829,6 +829,17 @@ def save_all_users(users: list[dict]) -> None:
                         mirror_group.append(
                             ("DELETE FROM users WHERE user_id=%s", (removed_id,))
                         )
+                # Bulk removal is an account deletion just as much as
+                # delete_user() — same authoritative anonymize-merge, same
+                # ordering rationale (users DELETE first, merge second), same
+                # mirror statements appended from the same operation.
+                for removed_id in removed_ids:
+                    if lane_rollup_anonymize_user(conn, removed_id):
+                        mirror_group.append(
+                            (_LANE_ROLLUP_ANON_MERGE_SQL,
+                             (_LANE_ROLLUP_DELETED_USER, removed_id)))
+                        mirror_group.append(
+                            (_LANE_ROLLUP_ANON_DELETE_SQL, (removed_id,)))
                 for entry in users:
                     uid = entry.get("user_id")
                     if not uid:
@@ -869,8 +880,23 @@ def delete_user(user_id: str) -> bool:
                 )
                 _delete_runtime_allowlist_on_cursor(cur, user_id)
                 cur.execute(sql, (user_id,))
+            # Rollup anonymize-merge AFTER the users DELETE, inside the same
+            # transaction (this is the AUTHORITATIVE site — delete_user_data
+            # is only a swallowed best-effort belt and must not be the load
+            # bearer; codex2 2026-08-18 live repro). Ordering closes the
+            # freeze race: the DELETE above blocks on any in-flight freeze's
+            # FOR KEY SHARE on this users row, so by the time it proceeds the
+            # freeze's cells are committed and visible to this merge; and any
+            # later freeze finds no users row, so its guarded INSERT..SELECT
+            # inserts nothing.
+            anonymized = lane_rollup_anonymize_user(conn, user_id)
     from tee_shadow import mirror
-    mirror.execute(sql, (user_id,))
+    group: list[tuple[str, tuple]] = [(sql, (user_id,))]
+    if anonymized:
+        group.append((_LANE_ROLLUP_ANON_MERGE_SQL,
+                      (_LANE_ROLLUP_DELETED_USER, user_id)))
+        group.append((_LANE_ROLLUP_ANON_DELETE_SQL, (user_id,)))
+    mirror.execute_many(group)
     return True
 
 
@@ -4257,6 +4283,356 @@ def freeze_completed_retention_cohorts(*, now_epoch: float | None = None,
     except Exception as e:
         log.error("[db] freeze_completed_retention_cohorts failed: %s", e)
         return []
+
+
+# --- Per-user per-lane daily rollup cells (lane_daily_rollup) --------------- #
+# Same frozen-cell philosophy as the DAU/retention snapshots above, but keyed
+# per user so the admin surface can answer "is lane X's failure rate carried
+# by dormant accounts" without a read-time full-history scan. See migration
+# 0091 for the table rationale and the column vocabulary.
+
+# Failure-code identifiers only — anything else is collapsed so no free text
+# (and therefore no user content) can ever reach a frozen cell. Same regex as
+# admin/memory_metadata.py's dream-job surface.
+_LANE_ROLLUP_CODE_RE = re.compile(r"^[a-z0-9_:-]{1,120}$")
+
+_LANE_ROLLUP_TERMINAL = ("completed", "failed", "expired", "superseded")
+
+
+def _lane_rollup_day_bounds(day: date, zone: ZoneInfo) -> tuple[datetime, datetime]:
+    """[start, end) UTC-comparable bounds of one Beijing calendar day.
+
+    Computed in Python so the SQL predicate stays sargable on ``finished_at``
+    (``to_char(timezone(...))`` equality would force a per-day full scan)."""
+    start = datetime.combine(day, datetime.min.time(), tzinfo=zone)
+    return start, start + timedelta(days=1)
+
+
+def _lane_rollup_freeze_day(conn, *, day: date, zone: ZoneInfo,
+                            mirror_batch: list | None = None) -> int:
+    """Insert route='model_api' cells for one closed Beijing day. Idempotent
+    (ON CONFLICT DO NOTHING); returns how many cells were newly written.
+    When ``mirror_batch`` is given, every executed (sql, params) is appended
+    verbatim so the caller can replay the day into the TEE shadow as one
+    atomic group (MIRROR lane; SNAPSHOT was rejected — the table grows
+    forever and would hit snapshot's 200k MAX_ROWS hard stop).
+
+    Source is ``agent_jobs`` — the business terminal-state table, deliberately
+    NOT the trace ring: traces can be missing (that is pillar-① of the trace
+    overhaul), and statistics must not be built on something that can be
+    missing. Bucketing is by ``finished_at`` (terminal transitions stamp
+    ``finished_at=now()``), so once a day has closed no new row can ever land
+    in it and the cell is immutable by construction.
+
+    ``enqueue_source`` discriminates heartbeat's two enqueue paths via
+    ``reason IS NULL`` (serve_worker's hourly tick omits reason; the
+    perception path always sets one). Other lanes carry ''.
+    """
+    start, end = _lane_rollup_day_bounds(day, zone)
+    counts = conn.execute(
+        """
+        SELECT user_id, lane,
+               CASE WHEN lane = 'heartbeat'
+                    THEN CASE WHEN reason IS NULL THEN 'clock' ELSE 'perception' END
+                    ELSE '' END AS enqueue_source,
+               COUNT(*) FILTER (WHERE status = 'completed')::int AS completed,
+               COUNT(*) FILTER (WHERE status = 'failed')::int AS failed,
+               COUNT(*) FILTER (WHERE status = 'expired')::int AS expired,
+               COUNT(*) FILTER (WHERE status = 'superseded')::int AS superseded
+        FROM agent_jobs
+        WHERE status = ANY(%s)
+          AND finished_at >= %s AND finished_at < %s
+        GROUP BY user_id, lane, enqueue_source
+        """,
+        (list(_LANE_ROLLUP_TERMINAL), start, end),
+    ).fetchall()
+    if not counts:
+        return 0
+    codes: dict[tuple[str, str, str], dict[str, int]] = {}
+    for uid, lane, src, code, n in conn.execute(
+        """
+        SELECT user_id, lane,
+               CASE WHEN lane = 'heartbeat'
+                    THEN CASE WHEN reason IS NULL THEN 'clock' ELSE 'perception' END
+                    ELSE '' END AS enqueue_source,
+               last_error, COUNT(*)::int
+        FROM agent_jobs
+        WHERE status IN ('failed', 'expired') AND last_error IS NOT NULL
+          AND finished_at >= %s AND finished_at < %s
+        GROUP BY user_id, lane, enqueue_source, last_error
+        """,
+        (start, end),
+    ).fetchall():
+        key = (str(uid), str(lane), str(src))
+        clean = str(code) if _LANE_ROLLUP_CODE_RE.match(str(code)) else "runtime_failed"
+        cell = codes.setdefault(key, {})
+        cell[clean] = cell.get(clean, 0) + int(n)
+    written = 0
+    day_s = day.isoformat()
+    # INSERT..SELECT sourced from the users row under FOR KEY SHARE — the
+    # race guard against concurrent account deletion (codex2 2026-08-18):
+    # a live users row is key-share-locked until this freeze transaction
+    # commits, so delete_user's users DELETE waits and its anonymize-merge
+    # then sees these cells; an already-deleted user yields no source row,
+    # so the insert is a no-op and the original id can never reappear.
+    cell_sql = """
+            INSERT INTO lane_daily_rollup
+                (user_id, day, route, lane, enqueue_source,
+                 completed, failed, expired, superseded, failure_codes)
+            SELECT u.user_id, %s, 'model_api', %s, %s, %s, %s, %s, %s, %s
+            FROM users u WHERE u.user_id = %s FOR KEY SHARE OF u
+            ON CONFLICT (user_id, day, route, lane, enqueue_source) DO NOTHING
+            RETURNING user_id
+            """
+    for uid, lane, src, completed, failed, expired, superseded in counts:
+        params = (day_s, lane, src, completed, failed, expired, superseded,
+                  Jsonb(codes.get((str(uid), str(lane), str(src)), {})), uid)
+        saved = conn.execute(cell_sql, params).fetchone()
+        if saved:
+            written += 1
+        if mirror_batch is not None:
+            mirror_batch.append((cell_sql, params))
+    return written
+
+
+# Bounds one tick's catch-up work so the single-leader thread never wedges on
+# a huge backfill: at 45 days/tick the full agent_jobs history (V2 rollout was
+# 2026-07) closes within a few 300s ticks.
+_LANE_ROLLUP_MAX_DAYS_PER_TICK = 45
+
+
+def freeze_completed_lane_days(*, now_epoch: float | None = None,
+                               tz: str = "Asia/Shanghai") -> list[str]:
+    """Freeze route='model_api' rollup cells for every closed Beijing day.
+
+    First run establishes ``backfill_from`` = the Beijing day of the oldest
+    terminal ``agent_jobs`` row (agent_jobs is never pruned, so cells can be
+    backfilled to the very start of V2 history — unlike user_logs, whose ring
+    buffer already ate its tail; that source arrives in a later phase with its
+    own watermark). Later runs advance ``through_day`` one day at a time; the
+    watermark only moves AFTER a day's cells are inserted, so a crash between
+    the two steps re-freezes the same day and ON CONFLICT dedups.
+    """
+    try:
+        zone = ZoneInfo(tz)
+        now = (datetime.fromtimestamp(float(now_epoch), zone)
+               if now_epoch is not None else datetime.now(zone))
+        last_completed = now.date() - timedelta(days=1)
+        frozen: list[str] = []
+        with get_pool().connection() as conn:
+            row = conn.execute(
+                "SELECT backfill_from, through_day FROM lane_rollup_watermark "
+                "WHERE route = 'model_api'",
+            ).fetchone()
+            if row:
+                cursor = date.fromisoformat(row[1]) + timedelta(days=1)
+                backfill_from = row[0]
+            else:
+                oldest = conn.execute(
+                    "SELECT MIN(finished_at) FROM agent_jobs WHERE status = ANY(%s)",
+                    (list(_LANE_ROLLUP_TERMINAL),),
+                ).fetchone()
+                if not oldest or oldest[0] is None:
+                    return []
+                cursor = oldest[0].astimezone(zone).date()
+                backfill_from = cursor.isoformat()
+            steps = 0
+            watermark_sql = """
+                    INSERT INTO lane_rollup_watermark (route, backfill_from, through_day)
+                    VALUES ('model_api', %s, %s)
+                    ON CONFLICT (route) DO UPDATE
+                        SET through_day = EXCLUDED.through_day, frozen_at = now()
+                    """
+            from tee_shadow import mirror
+            while cursor <= last_completed and steps < _LANE_ROLLUP_MAX_DAYS_PER_TICK:
+                # One day's cells + its watermark advance mirror to the TEE
+                # shadow as a single atomic group: a torn mirror would leave
+                # the TEE watermark claiming a day whose cells never arrived,
+                # which after cutover reads as "genuinely zero".
+                mirror_batch: list[tuple[str, tuple]] = []
+                _lane_rollup_freeze_day(conn, day=cursor, zone=zone,
+                                        mirror_batch=mirror_batch)
+                wm_params = (backfill_from, cursor.isoformat())
+                conn.execute(watermark_sql, wm_params)
+                mirror_batch.append((watermark_sql, wm_params))
+                mirror.execute_many(mirror_batch)
+                frozen.append(cursor.isoformat())
+                cursor += timedelta(days=1)
+                steps += 1
+        return frozen
+    except Exception as e:
+        log.error("[db] freeze_completed_lane_days failed: %s", e)
+        return []
+
+
+# 删号后的格子处置（Seven 2026-08-18 拍板）：匿名化归并——既非级联删除（会让
+# 冻结的历史聚合数字事后变动），也非带 id 永久保留（0021 先例是匿名 cohort，
+# 与逐用户行不等价，codex2 审出）。归并目标行 user_id='deleted'。
+_LANE_ROLLUP_DELETED_USER = "deleted"
+
+# 加法式 upsert：把一个用户的格子并进匿名行。加法语句对「同一初始状态的两个库」
+# 重放产生同一终态，所以 RDS 与 TEE 镜像走同一条语句即可保持一致；failure_codes
+# 逐 key 相加（scalar 子查询在 ON CONFLICT SET 里合法）。
+_LANE_ROLLUP_ANON_MERGE_SQL = """
+INSERT INTO lane_daily_rollup
+    (user_id, day, route, lane, enqueue_source,
+     completed, failed, expired, superseded, failure_codes)
+SELECT %s, day, route, lane, enqueue_source,
+       completed, failed, expired, superseded, failure_codes
+FROM lane_daily_rollup WHERE user_id = %s
+ON CONFLICT (user_id, day, route, lane, enqueue_source) DO UPDATE SET
+    completed = lane_daily_rollup.completed + EXCLUDED.completed,
+    failed = lane_daily_rollup.failed + EXCLUDED.failed,
+    expired = lane_daily_rollup.expired + EXCLUDED.expired,
+    superseded = lane_daily_rollup.superseded + EXCLUDED.superseded,
+    failure_codes = (
+        SELECT COALESCE(
+            jsonb_object_agg(
+                keys.k,
+                COALESCE((lane_daily_rollup.failure_codes ->> keys.k)::int, 0)
+                + COALESCE((EXCLUDED.failure_codes ->> keys.k)::int, 0)
+            ), '{}'::jsonb)
+        FROM (
+            SELECT jsonb_object_keys(
+                lane_daily_rollup.failure_codes || EXCLUDED.failure_codes
+            ) AS k
+        ) keys
+    ),
+    frozen_at = now()
+"""
+
+_LANE_ROLLUP_ANON_DELETE_SQL = "DELETE FROM lane_daily_rollup WHERE user_id = %s"
+
+
+def lane_rollup_anonymize_user(conn, user_id: str) -> int:
+    """Merge one user's frozen cells into the anonymous 'deleted' rows and
+    drop the originals. Runs on the caller's connection so delete_user_data
+    can keep it inside its cascade transaction; returns the merged cell count.
+    The caller is responsible for mirroring the same two statements to TEE
+    (delete_user_data's mirror group) — additive SQL replays consistently.
+    """
+    if not user_id or user_id == _LANE_ROLLUP_DELETED_USER:
+        return 0
+    n = conn.execute(
+        "SELECT COUNT(*) FROM lane_daily_rollup WHERE user_id = %s", (user_id,),
+    ).fetchone()[0]
+    if not n:
+        return 0
+    conn.execute(_LANE_ROLLUP_ANON_MERGE_SQL,
+                 (_LANE_ROLLUP_DELETED_USER, user_id))
+    conn.execute(_LANE_ROLLUP_ANON_DELETE_SQL, (user_id,))
+    return int(n)
+
+
+def admin_lane_rollup(*, user_id: str = "", lane: str = "", route: str = "",
+                      since_day: str = "", until_day: str = "",
+                      limit: int = 100, offset: int = 0,
+                      tz: str = "Asia/Shanghai") -> dict:
+    """Read frozen rollup cells, plus a live (clearly-flagged) partial for the
+    still-open Beijing day. Content-free: counts, sanitized failure codes and
+    ids only.
+
+    ``coverage`` echoes the watermark so a reader can distinguish "genuinely
+    zero" from "before recorded history": querying earlier than
+    ``partial_before`` means the cells simply do not cover that range.
+    """
+    zone = ZoneInfo(tz)
+    today = datetime.now(zone).date()
+    where = ["route = %s"] if route else []
+    params: list = [route] if route else []
+    if user_id:
+        where.append("user_id = %s")
+        params.append(user_id)
+    if lane:
+        where.append("lane = %s")
+        params.append(lane)
+    if since_day:
+        where.append("day >= %s")
+        params.append(since_day)
+    if until_day:
+        where.append("day <= %s")
+        params.append(until_day)
+    clause = (" WHERE " + " AND ".join(where)) if where else ""
+    with get_pool().connection() as conn:
+        total = conn.execute(
+            f"SELECT COUNT(*) FROM lane_daily_rollup{clause}", params,
+        ).fetchone()[0]
+        rows = conn.execute(
+            f"""
+            SELECT user_id, day, route, lane, enqueue_source,
+                   completed, failed, expired, superseded, failure_codes
+            FROM lane_daily_rollup{clause}
+            ORDER BY day DESC, user_id, lane, enqueue_source
+            LIMIT %s OFFSET %s
+            """,
+            params + [int(limit), int(offset)],
+        ).fetchall()
+        out_rows = [
+            {"user_id": r[0], "day": r[1], "route": r[2], "lane": r[3],
+             "enqueue_source": r[4], "completed": r[5], "failed": r[6],
+             "expired": r[7], "superseded": r[8],
+             "failure_codes": dict(r[9] or {}), "frozen": True}
+            for r in rows
+        ]
+        coverage: dict[str, dict] = {}
+        for r in conn.execute(
+            "SELECT route, backfill_from, through_day FROM lane_rollup_watermark",
+        ).fetchall():
+            coverage[str(r[0])] = {
+                "backfill_from": r[1],
+                "through_day": r[2],
+                "partial_before": r[1],
+            }
+        # The open Beijing day cannot be frozen yet — surface it as a live,
+        # explicitly non-frozen estimate so "today looks empty" never reads
+        # as an outage. Same aggregation as the freezer, same filters.
+        today_rows: list[dict] = []
+        include_today = ((not route or route == "model_api")
+                         and (not until_day or until_day >= today.isoformat())
+                         and (not since_day or since_day <= today.isoformat()))
+        if include_today:
+            start, end = _lane_rollup_day_bounds(today, zone)
+            live_where = ["status = ANY(%s)", "finished_at >= %s", "finished_at < %s"]
+            live_params: list = [list(_LANE_ROLLUP_TERMINAL), start, end]
+            if user_id:
+                live_where.append("user_id = %s")
+                live_params.append(user_id)
+            if lane:
+                live_where.append("lane = %s")
+                live_params.append(lane)
+            for r in conn.execute(
+                f"""
+                SELECT user_id, lane,
+                       CASE WHEN lane = 'heartbeat'
+                            THEN CASE WHEN reason IS NULL THEN 'clock' ELSE 'perception' END
+                            ELSE '' END AS enqueue_source,
+                       COUNT(*) FILTER (WHERE status = 'completed')::int,
+                       COUNT(*) FILTER (WHERE status = 'failed')::int,
+                       COUNT(*) FILTER (WHERE status = 'expired')::int,
+                       COUNT(*) FILTER (WHERE status = 'superseded')::int
+                FROM agent_jobs
+                WHERE {' AND '.join(live_where)}
+                GROUP BY user_id, lane, enqueue_source
+                ORDER BY user_id, lane, enqueue_source
+                """,
+                live_params,
+            ).fetchall():
+                today_rows.append(
+                    {"user_id": r[0], "day": today.isoformat(),
+                     "route": "model_api", "lane": r[1], "enqueue_source": r[2],
+                     "completed": r[3], "failed": r[4], "expired": r[5],
+                     "superseded": r[6], "failure_codes": {}, "frozen": False}
+                )
+    return {
+        "rows": out_rows,
+        "today_partial": today_rows,
+        "coverage": coverage,
+        "pagination": {"limit": int(limit), "offset": int(offset),
+                       "returned": len(out_rows), "total": int(total)},
+        "filters": {"user_id": user_id, "lane": lane, "route": route,
+                    "since_day": since_day, "until_day": until_day,
+                    "timezone": tz},
+    }
 
 
 def admin_data_track_proactive_daily(*, since_epoch: float = 0.0, days: int = 30,
@@ -13121,6 +13497,10 @@ def model_api_autoselect_active(user_id: str) -> str | None:
 # ---------------------------------------------------------------------------
 
 
+class FrameReadUnavailable(RuntimeError):
+    """The frame may exist, but its durable store could not be read."""
+
+
 def _frame_write_row(user_id: str, frame_id: str, ts: float,
                      doc: dict | None, env_meta: dict | None, body_key: str | None) -> bool:
     """Upsert one frame_envelopes row. Returns True on success; swallows-and-logs
@@ -13144,7 +13524,7 @@ def _frame_write_row(user_id: str, frame_id: str, ts: float,
         return False
 
 
-def frame_upsert(user_id: str, frame_id: str, ts: float, doc: dict) -> None:
+def frame_upsert(user_id: str, frame_id: str, ts: float, doc: dict) -> bool:
     """Persist a v1 frame envelope.
 
     With R2 configured, the heavy ``body_ct`` is offloaded to object storage and
@@ -13161,7 +13541,8 @@ def frame_upsert(user_id: str, frame_id: str, ts: float, doc: dict) -> None:
     A crash/abort at any point leaves either an inline (readable) row or a
     pointer whose object is already present; a failed upload just keeps the
     inline row. ``doc`` is offloaded out of the row only after the body is in
-    R2, so the at-rest table stays small without a missing-object window."""
+    R2, so the at-rest table stays small without a missing-object window.
+    Returns whether a readable row was durably stored."""
     body_field = (
         "body_ct" if isinstance(doc, dict) and doc.get("body_ct") is not None
         else "body_b64" if isinstance(doc, dict) and doc.get("body_b64") is not None
@@ -13170,14 +13551,14 @@ def frame_upsert(user_id: str, frame_id: str, ts: float, doc: dict) -> None:
     if object_storage.enabled() and body_field is not None:
         # 1) inline first — frame readable, references no R2 object yet.
         if not _frame_write_row(user_id, frame_id, ts, doc, None, None):
-            return  # DB write failed → nothing committed, R2 untouched.
+            return False  # DB write failed → nothing committed, R2 untouched.
         # 2) upload; on failure keep the inline row (frame stays readable).
         try:
             object_storage.put_frame_body(user_id, frame_id, doc[body_field])
         except Exception as e:  # noqa: BLE001
             log.error("[db] frame_upsert(%s,%s) R2 upload failed, leaving inline: %s",
                       user_id, frame_id, e)
-            return
+            return True
         # 3) object now exists → flip to pointer as the last durable step. If
         #    this write fails the row stays inline (readable); the uploaded
         #    object is a harmless orphan.
@@ -13188,8 +13569,8 @@ def frame_upsert(user_id: str, frame_id: str, ts: float, doc: dict) -> None:
             env_meta["body_sha256"] = hashlib.sha256(raw).hexdigest()
         body_key = object_storage.frame_key(user_id, frame_id)
         _frame_write_row(user_id, frame_id, ts, None, env_meta, body_key)
-        return
-    _frame_write_row(user_id, frame_id, ts, doc, None, None)
+        return True
+    return _frame_write_row(user_id, frame_id, ts, doc, None, None)
 
 
 def frame_exists(user_id: str, frame_id: str) -> bool:
@@ -13238,10 +13619,19 @@ def perception_broadcast_meta(user_id: str) -> dict:
     }
 
 
-def frame_get(user_id: str, frame_id: str) -> dict | None:
+def frame_get(
+    user_id: str,
+    frame_id: str,
+    *,
+    unavailable_raises: bool = False,
+) -> dict | None:
     """Return the full v1 envelope, reconstructing ``body_ct`` from R2 for
     offloaded rows (``body_key`` set) and returning the inline ``doc`` for
-    legacy rows."""
+    legacy rows.
+
+    When ``unavailable_raises`` is true, storage outages are distinguished from
+    a definitive missing row or object so request handlers can return 503.
+    """
     try:
         with get_pool().connection() as conn:
             row = conn.execute(
@@ -13251,14 +13641,31 @@ def frame_get(user_id: str, frame_id: str) -> dict | None:
             ).fetchone()
     except Exception as e:
         log.error("[db] frame_get(%s,%s) failed: %s", user_id, frame_id, e)
+        if unavailable_raises:
+            raise FrameReadUnavailable("frame row read unavailable") from e
         return None
     if row is None:
         return None
     doc, env_meta, body_key = row
     if body_key:
-        body = object_storage.get_frame_body(user_id, frame_id)
+        body = None
+        for attempt in range(2):
+            try:
+                body = object_storage.get_frame_body_strict(user_id, frame_id)
+                break
+            except Exception as e:  # noqa: BLE001
+                if attempt == 0:
+                    # One fresh read covers a broken pooled connection after
+                    # the SDK's own bounded HTTP retries are exhausted.
+                    time.sleep(0.15)
+                    continue
+                log.error("[db] frame_get(%s,%s) R2 read unavailable: %s",
+                          user_id, frame_id, e)
+                if unavailable_raises:
+                    raise FrameReadUnavailable("frame body read unavailable") from e
+                return None
         if body is None:
-            # The pointer row exists but its R2 body is missing/unreadable.
+            # The pointer row exists but its R2 body is definitively missing.
             # Report not-found rather than a metadata-only dict — callers treat
             # any dict as a valid envelope and would serve an undecryptable frame.
             log.error("[db] frame_get(%s,%s) R2 body missing for key %s",
@@ -13632,6 +14039,11 @@ def delete_user_data(user_id: str) -> None:
             with conn.transaction():
                 for table in tables:
                     conn.execute(f"DELETE FROM {table} WHERE user_id = %s", (user_id,))
+                # lane_daily_rollup is deliberately NOT in the delete list:
+                # frozen cells are anonymize-merged into user_id='deleted'
+                # instead of dropped (Seven 2026-08-18) so aggregate history
+                # stays true while the per-user linkage dies with the account.
+                anonymized_cells = lane_rollup_anonymize_user(conn, user_id)
     except Exception as e:
         log.error("[db] delete_user_data(%s) failed: %s", user_id, e)
         return
@@ -13664,6 +14076,12 @@ def delete_user_data(user_id: str) -> None:
     # re-deriving it table-by-table.
     mirror_group.append(
         ("DELETE FROM tee_pending_device_migration WHERE user_id = %s", (user_id,)))
+    if anonymized_cells:
+        # Same additive merge + delete replayed on TEE: additive statements
+        # take two consistent stores to the same end state.
+        mirror_group.append(
+            (_LANE_ROLLUP_ANON_MERGE_SQL, (_LANE_ROLLUP_DELETED_USER, user_id)))
+        mirror_group.append((_LANE_ROLLUP_ANON_DELETE_SQL, (user_id,)))
     from tee_shadow import mirror
     mirror.execute_many(mirror_group)
 

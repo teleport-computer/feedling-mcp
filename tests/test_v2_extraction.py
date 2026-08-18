@@ -977,20 +977,34 @@ def test_dream_merge_with_today_source_naturally_keeps_today():
 
 
 @pytest.mark.parametrize("bad_value", ["", None, "not-a-date", "1970-ish"])
-def test_dream_merge_fails_closed_when_any_source_time_is_unusable(bad_value):
+def test_dream_merge_degrades_to_known_source_time_not_job_time(bad_value):
+    """一张源卡时间不可用 → **跳过它、取已知的**,不再整轮失败。
+
+    ⚠️ 本用例 2026-08-17 由 fail-closed 改写(Seven 定)。它原来断言的是
+    「任何一张不可用就抛」—— 实测那会让缺失率 12%~64% 的用户 dream 永久阻塞。
+
+    **但它真正在守的那件事没变、也不能变**:传进来的 `occurred_at`
+    (这里是 2099-12-31,job 时间)**绝不能**成为事件时间。降级只允许退到
+    「其他源卡的已知时间」或「created_at 的日期」,永远不退到 job 时间。
+    """
     cards = [
         _existing("valid", occurred_at="2026-02-08T09:00:00Z"),
         _existing("bad", occurred_at=bad_value),
     ]
 
-    with pytest.raises(ValueError, match="dream_source_occurred_at_unavailable"):
-        extraction.consolidations_to_actions(
-            [_merge(["valid", "bad"])],
-            occurred_at="2099-12-31T23:59:59Z",
-            source_ids=[],
-            build_envelope=_env,
-            existing_cards=cards,
-        )
+    actions = extraction.consolidations_to_actions(
+        [_merge(["valid", "bad"])],
+        occurred_at="2099-12-31T23:59:59Z",
+        source_ids=[],
+        build_envelope=_env,
+        existing_cards=cards,
+    )
+    assert actions, "一张源卡缺时间就整轮产不出动作 —— 那正是我们要修掉的阻塞"
+    payload = str(actions[0])
+    assert "2026-02-08T09:00:00Z" in payload, "没有退到已知的那张源卡时间"
+    assert "2099" not in payload, (
+        "job 时间泄漏成了事件时间 —— 这是本用例从一开始就在守的红线"
+    )
 
 
 def test_dream_prompt_pairs_evolution_example_with_independent_health_example():
@@ -1035,3 +1049,125 @@ def test_extraction_is_pure():
     for forbidden in ("import hosted", "from hosted", "agent_runtime", "jobs_store",
                       "core.store", "psycopg", "memory_core"):
         assert forbidden not in src, f"extraction.py must not reference {forbidden}"
+
+
+# ── dream 源卡时间降级(Seven 2026-08-17 定) ────────────────────────────
+# 原来只要一张源卡缺 occurred_at 就整轮 fail-closed。实测四个受影响用户的
+# 花园缺失率 12%~64%,dream 每次挑几张源卡碰上一张就废 = 永久阻塞且用户无感。
+# 代价对比:降级 → 排序位置偏(显示);拦死 → dream 整个不跑(功能)。
+
+
+def _card(occurred_at=None, created_at=None):
+    c = {}
+    if occurred_at is not None:
+        c["occurred_at"] = occurred_at
+    if created_at is not None:
+        c["created_at"] = created_at
+    return c
+
+
+def test_picks_latest_known_not_just_any():
+    """取**已知里最晚的** —— 随手取一张可能取到旧的,而明明有更新的已知值。"""
+    from model_api_runtime.v2 import extraction
+
+    out = extraction._latest_source_occurred_at([
+        _card("2026-08-10T09:00:00Z"),
+        _card(""),                       # 缺失,跳过
+        _card("2026-08-14T09:00:00Z"),   # 最晚
+        _card("2026-08-12T09:00:00Z"),
+    ])
+    assert out == "2026-08-14T09:00:00Z"
+
+
+def test_one_missing_source_no_longer_blocks_the_whole_run():
+    """核心行为变更:一张缺失不再让整轮失败。"""
+    from model_api_runtime.v2 import extraction
+
+    assert extraction._latest_source_occurred_at([
+        _card(""), _card("2026-08-14T09:00:00Z"),
+    ]) == "2026-08-14T09:00:00Z"
+
+
+def test_unparseable_occurred_at_is_skipped_not_fatal():
+    """解析不了的也只是跳过 —— 与「缺失」同等对待。"""
+    from model_api_runtime.v2 import extraction
+
+    assert extraction._latest_source_occurred_at([
+        _card("not-a-timestamp"), _card("2026-08-14T09:00:00Z"),
+    ]) == "2026-08-14T09:00:00Z"
+
+
+def test_falls_back_to_created_at_date_when_none_known():
+    """全都没有 → 退到 created_at 的**日期**(不是完整时刻)。
+
+    created_at 是写入时间;只有日期这一档是对事件时间的诚实近似。
+    """
+    from model_api_runtime.v2 import extraction
+
+    out = extraction._latest_source_occurred_at([
+        _card("", created_at="2026-08-11T08:53:58Z"),
+        _card("", created_at="2026-08-10T09:23:03Z"),
+    ])
+    assert out == "2026-08-11", f"应取日期,实际 {out!r}"
+
+
+def test_created_at_fallback_also_takes_the_latest_not_the_first():
+    """fallback 那一半同样取**最晚**,不是遍历到的第一张。
+
+    ⚠️ 我第一版写成「第一张能解析的就返回」,输入顺序一变结果就变
+    (codex2 实测正序 08-10 / 反序 08-11) —— 而我自己的 docstring
+    写着「取已知里最晚的」。**实现没照着自己的注释做。**
+    """
+    from model_api_runtime.v2 import extraction
+
+    cards = [_card("", created_at="2026-08-10T09:23:03Z"),
+             _card("", created_at="2026-08-11T08:53:58Z")]
+    assert extraction._latest_source_occurred_at(cards) == "2026-08-11"
+    assert extraction._latest_source_occurred_at(cards[::-1]) == "2026-08-11", (
+        "结果依赖输入顺序 —— 说明取的是第一张而不是最晚"
+    )
+
+
+def test_still_fails_closed_when_created_at_also_unusable():
+    """created_at 也全没有 → 仍然失败。到这步没有任何可信来源,编不如失败。
+
+    (实测 260 张真实卡里 0 例,但判据要在。)
+    """
+    import pytest as _p
+    from model_api_runtime.v2 import extraction
+
+    with _p.raises(ValueError, match="dream_source_occurred_at_unavailable"):
+        extraction._latest_source_occurred_at([_card(""), _card("")])
+
+
+def test_degradation_is_recorded_both_kinds():
+    """**必须留痕**:那批脏卡 created_at 集中在 08-10~08-14,是最近两周写的,
+    说明产生它们的写入路径可能还开着。降级不留痕 = 把源头永久盖住。
+    """
+    from model_api_runtime.v2 import extraction
+
+    seen = []
+    extraction._latest_source_occurred_at(
+        [_card(""), _card("2026-08-14T09:00:00Z")],
+        on_degraded=lambda known, missing, fb: seen.append((known, missing, fb)),
+    )
+    assert seen == [(1, 1, False)], "部分缺失没留痕"
+
+    seen.clear()
+    extraction._latest_source_occurred_at(
+        [_card("", created_at="2026-08-11T08:53:58Z")],
+        on_degraded=lambda known, missing, fb: seen.append((known, missing, fb)),
+    )
+    assert seen == [(0, 1, True)], "退到 created_at 没留痕"
+
+
+def test_no_degradation_signal_when_everything_is_clean():
+    """不误报:全都有 occurred_at 时不该记降级。"""
+    from model_api_runtime.v2 import extraction
+
+    seen = []
+    extraction._latest_source_occurred_at(
+        [_card("2026-08-14T09:00:00Z"), _card("2026-08-12T09:00:00Z")],
+        on_degraded=lambda *a: seen.append(a),
+    )
+    assert seen == []

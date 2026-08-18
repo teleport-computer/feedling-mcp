@@ -26,6 +26,7 @@ import hashlib
 import hmac
 import math
 import os
+import re
 import time
 from urllib.parse import parse_qs, quote, urlencode
 
@@ -375,6 +376,7 @@ async def tee_replication_run(request: Request):
             confirm=payload.get("confirm"),
             qps=payload.get("qps"),
             sample_rate=payload.get("sample_rate"),
+            expected_stale=payload.get("expected_stale"),
         )
     except admin_tee_replication.BadRequest as exc:
         return JSONResponse({"error": exc.error}, status_code=400)
@@ -532,6 +534,69 @@ async def v2_wake_shadow(request: Request):
         days=days,
         bucket_start_hour=start_hour,
         bucket_end_hour=end_hour,
+    )
+    return JSONResponse(payload)
+
+
+_LANE_ROLLUP_PARAMS = frozenset(
+    {"user_id", "lane", "route", "since_day", "until_day", "limit", "offset",
+     "admin_key"}  # admin_key: legacy auth channel _require_admin still accepts
+)
+_LANE_ROLLUP_DAY_RE = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}$")
+
+
+@router.get("/v1/admin/lane-rollup")
+async def lane_rollup(request: Request):
+    """Frozen per-user per-lane daily job-outcome cells (content-free).
+
+    Unknown query params are a 400, not silently ignored — this surface
+    exists because v2-metrics/v2-wake-shadow silently dropping ``user_id``
+    made global numbers read as one user's (2026-08-17). ``coverage`` echoes
+    the backfill watermark so "genuinely zero" and "before recorded history"
+    stay distinguishable; the open Beijing day rides along as an explicitly
+    non-frozen ``today_partial``.
+    """
+    _require_admin(request)
+    unknown = sorted(set(request.query_params.keys()) - _LANE_ROLLUP_PARAMS)
+    if unknown:
+        return JSONResponse(
+            {"error": "unknown_query_params", "params": unknown,
+             "supported": sorted(_LANE_ROLLUP_PARAMS - {"admin_key"})},
+            status_code=400,
+        )
+    for name in ("since_day", "until_day"):
+        raw = (request.query_params.get(name) or "").strip()
+        if raw and not _LANE_ROLLUP_DAY_RE.match(raw):
+            return JSONResponse({"error": f"invalid_{name}"}, status_code=400)
+
+    def _int_arg(name: str, default: int, minimum: int,
+                 maximum: int) -> tuple[int | None, JSONResponse | None]:
+        raw = (request.query_params.get(name) or "").strip()
+        if not raw:
+            return default, None
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            return None, JSONResponse({"error": f"invalid_{name}"}, status_code=400)
+        if value < minimum or value > maximum:
+            return None, JSONResponse({"error": f"invalid_{name}"}, status_code=400)
+        return value, None
+
+    limit, invalid = _int_arg("limit", 100, 1, 500)
+    if invalid is not None:
+        return invalid
+    offset, invalid = _int_arg("offset", 0, 0, 1_000_000)
+    if invalid is not None:
+        return invalid
+    payload = await threadpool.run_db(
+        db.admin_lane_rollup,
+        user_id=(request.query_params.get("user_id") or "").strip(),
+        lane=(request.query_params.get("lane") or "").strip(),
+        route=(request.query_params.get("route") or "").strip(),
+        since_day=(request.query_params.get("since_day") or "").strip(),
+        until_day=(request.query_params.get("until_day") or "").strip(),
+        limit=limit,
+        offset=offset,
     )
     return JSONResponse(payload)
 

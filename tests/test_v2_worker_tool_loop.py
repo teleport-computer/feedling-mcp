@@ -3085,6 +3085,211 @@ def _job_status_row(job_id):
     return row
 
 
+def test_reply_tool_bubble_can_atomically_close_chat_without_second_message(
+    monkeypatch,
+):
+    uid = "u_toolloop_promote_intermediate"
+    conftest.seed_user(uid)
+    _reset(uid)
+    generation = db.get_runtime_generation(uid)
+    input_seq, job_id = db.chat_append_and_enqueue(
+        uid,
+        "promotion-parent",
+        10.0,
+        _user_doc("promotion-parent", "answer this"),
+        5000,
+        "chat",
+        expected_generation=generation,
+    )
+    job = jobs_store.claim_next_job("w-promote-intermediate")
+    assert job is not None and job["id"] == job_id
+    _stub_envelope_build(monkeypatch)
+
+    def read_after_seq(_user_id: str, after_seq: int):
+        return [
+            {
+                "id": row["id"],
+                "seq": int(row["seq"]),
+                "ts": float(row.get("ts") or 0),
+                "role": row.get("role"),
+                "content": row.get("test_plaintext") or "",
+            }
+            for row in db.chat_messages_after_seq(uid, after_seq, limit=None)
+            if row.get("role") == "user"
+        ]
+
+    calls = _script_provider(
+        monkeypatch,
+        [
+            _tool_round(_tc("r1", "reply", text="complete answer")),
+            {
+                "reply": "",
+                "reasoning": "no additional visible body",
+                "stop_reason": "end_turn",
+                "tool_calls": [],
+                "usage": {"completion_tokens": 3930},
+            },
+            {
+                "reply": "",
+                "reasoning": "still complete",
+                "stop_reason": "end_turn",
+                "tool_calls": [],
+                "usage": {"completion_tokens": 2},
+            },
+        ],
+    )
+    deps = worker.TurnDeps(
+        web_tools_enabled=lambda _uid: True,
+        read_messages=lambda _uid: read_after_seq(uid, 0),
+        read_messages_after_seq=read_after_seq,
+        read_tail_after_seq=lambda _uid, after_seq, limit, **kwargs: read_after_seq(
+            uid, after_seq
+        ),
+        read_summary_with_seq=lambda _uid: ("", 0.0, 0, 0),
+        resolve_provider=lambda _uid: (_BYOK, {}),
+        mint_enclave_token=lambda _uid: "rt",
+        apply_pending_effects=serve_worker._apply_pending_effects_for_user,
+    )
+
+    status = asyncio.run(
+        worker.process_job(
+            job,
+            deps,
+            provider_config=_BYOK,
+            api_key=None,
+            runtime_token="rt",
+        )
+    )
+
+    assert status == "completed"
+    assert len(calls) == 3  # the existing semantic-empty recovery still ran once
+    bubbles = _bubbles(uid)
+    assert len(bubbles) == 1
+    assert bubbles[0]["body_ct"] == "complete answer"
+    assert _job_status_row(job_id) == ("completed", None)
+    assert v2_cursor.load_seq(core_store.get_store(uid)) == input_seq
+    parent = db.chat_doc_for_seq(uid, input_seq)
+    assert parent["reply_status"] == "replied"
+    assert parent["reply_message_id"] == bubbles[0]["id"]
+
+    with db.get_pool().connection() as conn:
+        effects = conn.execute(
+            "SELECT effect_id,effect_type,status,payload "
+            "FROM v2_effect_outbox WHERE user_id=%s AND job_id=%s "
+            "ORDER BY enqueue_seq",
+            (uid, job_id),
+        ).fetchall()
+    assert [(row[1], row[2]) for row in effects] == [
+        (v2_effect_outbox.INTERMEDIATE_REPLY_EFFECT_TYPE, "applied"),
+        (v2_effect_outbox.FINAL_REPLY_EFFECT_TYPE, "applied"),
+    ]
+    source_effect_id = str(effects[0][0])
+    final_payload = effects[1][3]
+    replay_id = v2_effect_outbox.enqueue_reply_promotion(
+        intermediate_effect_id=source_effect_id,
+        job_id=job_id,
+        user_id=uid,
+        expected_generation=generation,
+        payload=final_payload,
+    )
+    assert replay_id == str(effects[1][0])
+    assert serve_worker._apply_pending_effects_for_user(uid) == {
+        "applied": 0,
+        "discarded": 0,
+    }
+    assert len(_bubbles(uid)) == 1
+
+
+def test_removing_reply_promotion_regresses_to_two_chat_messages(monkeypatch):
+    """Mutation guard: the old empty-reply failure adds a terminal error bubble."""
+    uid = "u_toolloop_promote_intermediate_mutation"
+    conftest.seed_user(uid)
+    _reset(uid)
+    generation = db.get_runtime_generation(uid)
+    _input_seq, job_id = db.chat_append_and_enqueue(
+        uid,
+        "promotion-mutation-parent",
+        10.0,
+        _user_doc("promotion-mutation-parent", "answer this"),
+        5000,
+        "chat",
+        expected_generation=generation,
+    )
+    job = jobs_store.claim_next_job("w-promote-intermediate-mutation")
+    assert job is not None and job["id"] == job_id
+    _stub_envelope_build(monkeypatch)
+
+    def read_after_seq(_user_id: str, after_seq: int):
+        return [
+            {
+                "id": row["id"],
+                "seq": int(row["seq"]),
+                "ts": float(row.get("ts") or 0),
+                "role": row.get("role"),
+                "content": row.get("test_plaintext") or "",
+            }
+            for row in db.chat_messages_after_seq(uid, after_seq, limit=None)
+            if row.get("role") == "user"
+        ]
+
+    _script_provider(
+        monkeypatch,
+        [
+            _tool_round(_tc("r1", "reply", text="complete answer")),
+            {
+                "reply": "",
+                "reasoning": "no additional visible body",
+                "stop_reason": "end_turn",
+                "tool_calls": [],
+                "usage": {},
+            },
+            {
+                "reply": "",
+                "reasoning": "still complete",
+                "stop_reason": "end_turn",
+                "tool_calls": [],
+                "usage": {},
+            },
+        ],
+    )
+    real_loop = worker.v2_tool_loop.run_tool_loop
+
+    async def run_without_promotion(**kwargs):
+        kwargs["on_promote_last_intermediate"] = None
+        return await real_loop(**kwargs)
+
+    monkeypatch.setattr(
+        worker.v2_tool_loop,
+        "run_tool_loop",
+        run_without_promotion,
+    )
+    deps = worker.TurnDeps(
+        web_tools_enabled=lambda _uid: True,
+        read_messages=lambda _uid: read_after_seq(uid, 0),
+        read_messages_after_seq=read_after_seq,
+        read_tail_after_seq=lambda _uid, after_seq, limit, **kwargs: read_after_seq(
+            uid, after_seq
+        ),
+        read_summary_with_seq=lambda _uid: ("", 0.0, 0, 0),
+        resolve_provider=lambda _uid: (_BYOK, {}),
+        mint_enclave_token=lambda _uid: "rt",
+        apply_pending_effects=serve_worker._apply_pending_effects_for_user,
+    )
+
+    status = asyncio.run(
+        worker.process_job(
+            job,
+            deps,
+            provider_config=_BYOK,
+            api_key=None,
+            runtime_token="rt",
+        )
+    )
+
+    assert status == "failed"
+    assert len(_bubbles(uid)) == 2
+
+
 def test_intermediate_reply_then_terminal_text_and_exactly_once_replay(monkeypatch):
     """Two-round script: round 0 the model calls `reply` (intermediate bubble)
     ALONGSIDE a `web_search` read tool call; round 1 the model stops with plain

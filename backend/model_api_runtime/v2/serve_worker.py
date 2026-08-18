@@ -1902,6 +1902,7 @@ def _fire_scheduled_for_user(user_id: str) -> int:
             user_id,
             "scheduled",
             reason="scheduled_wake",
+            trace_id=str(event.wake_id),
         )
         fired += 1
         return types.SimpleNamespace(
@@ -2958,7 +2959,7 @@ def _tick_capture_for_user(user_id: str) -> int:
 
     def _submit(store, *, trigger, now, window, capture_key):
         job_id, coalesced = jobs_store.enqueue_job(
-            user_id, "capture", reason=trigger
+            user_id, "capture", reason=trigger, trace_id=None
         )
         if not coalesced:
             core_wake_bus.notify("v2_jobs", user_id)
@@ -2988,7 +2989,9 @@ def _tick_dream_for_user(user_id: str) -> int:
     store = core_store.get_store(user_id)
 
     def _submit(store, *, trigger, now):
-        job_id, coalesced = jobs_store.enqueue_job(user_id, "dream", reason=trigger)
+        job_id, coalesced = jobs_store.enqueue_job(
+            user_id, "dream", reason=trigger, trace_id=None
+        )
         if not coalesced:
             core_wake_bus.notify("v2_jobs", user_id)
         return {
@@ -3100,7 +3103,12 @@ def _tick_screen_watch_for_user(user_id: str) -> int:
     if should and bool(
         _wake_decision_for_user(user_id, trigger="screen_watch").get("should_wake")
     ):
-        jobs_store.enqueue_job(user_id, "screen_watch", reason="screen_watch")
+        jobs_store.enqueue_job(
+            user_id,
+            "screen_watch",
+            reason="screen_watch",
+            trace_id=uuid.uuid4().hex,
+        )
         core_wake_bus.notify("v2_jobs", user_id)
         # 真醒：推进到期时间 **且** 消费这一帧（记 last_screen_watch_frame_id）。
         jobs_store.upsert_wake_schedule(
@@ -3564,6 +3572,7 @@ def _sink_job(user_id: str, payload: dict) -> None:
             user_id,
             str(payload.get("lane") or "chat"),
             reason=payload.get("reason"),
+            trace_id=None,
             expected_generation=int(expected_generation),
         )
     except Exception:
@@ -4376,7 +4385,9 @@ def _apply_pending_effects_for_user(user_id: str) -> dict:
     )
 
 
-_TRAJECTORY_PLAINTEXT_B64_PREFIX = "feedling-v2-trajectory-b64-v1:"
+_TRAJECTORY_PLAINTEXT_B64_PREFIX = (
+    jobs_store.TRAJECTORY_PLAINTEXT_B64_PREFIX
+)
 
 
 def _seal_trajectory_payload(
@@ -4394,7 +4405,7 @@ def _seal_trajectory_payload(
     store = core_store.get_store(str(user_id))
     if core_envelope.resolve_content_encryption(store.user_id) == "off":
         return {
-            "body": _TRAJECTORY_PLAINTEXT_B64_PREFIX
+            "body": jobs_store.TRAJECTORY_PLAINTEXT_B64_PREFIX
             + base64.b64encode(bytes(plaintext)).decode("ascii"),
             "id": str(item_id),
             "owner_user_id": store.user_id,
@@ -4420,11 +4431,12 @@ def _open_trajectory_payload(
         raise RuntimeError("trajectory_owner_mismatch")
     body = envelope.get("body")
     if isinstance(body, str):
-        if not body.startswith(_TRAJECTORY_PLAINTEXT_B64_PREFIX):
+        prefix = jobs_store.TRAJECTORY_PLAINTEXT_B64_PREFIX
+        if not body.startswith(prefix):
             raise RuntimeError("trajectory_plaintext_encoding_invalid")
         try:
             return base64.b64decode(
-                body[len(_TRAJECTORY_PLAINTEXT_B64_PREFIX) :],
+                body[len(prefix) :],
                 validate=True,
             )
         except (ValueError, TypeError) as exc:
@@ -4669,13 +4681,14 @@ async def _load_mcp_turn_observed(store, **kwargs):
 
 def _emit_v2_debug_trace(store, event_type: str, *, status: str,
                          summary: str, explain: str, detail: dict,
-                         dur_ms: float | None = None) -> None:
+                         dur_ms: float | None = None,
+                         trace_id: str = "") -> None:
     from diagnostics import diagnostics_core
 
     event = {
         "subsystem": "agent", "type": event_type, "status": status,
         "summary": summary, "explain": explain, "detail": detail,
-        "actor": "hosted_v2",
+        "actor": "hosted_v2", "trace_id": str(trace_id or ""),
     }
     if dur_ms is not None:
         event["dur_ms"] = dur_ms
@@ -4785,7 +4798,9 @@ def _build_scheduler_deps():
         ),
         due_users=lambda: jobs_store.due_heartbeat_users(),
         wake_decision=_wake_decision_for_user,
-        enqueue_heartbeat=lambda uid: jobs_store.enqueue_job(uid, "heartbeat"),
+        enqueue_heartbeat=lambda uid: jobs_store.enqueue_job(
+            uid, "heartbeat", trace_id=uuid.uuid4().hex
+        ),
         advance_heartbeat=lambda uid, next_at: jobs_store.upsert_wake_schedule(
             uid, next_heartbeat_at=next_at
         ),

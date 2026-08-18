@@ -2453,6 +2453,35 @@ _LANGUAGE_FOLLOW_PUBLIC_ENUMS = {
     "lane": frozenset({"chat", "wake"}),
 }
 
+_PROMPT_FRONTIER_TRACE_TYPES = frozenset({
+    "v2.prompt_frontier.budget",
+    "v2.prompt_frontier.exhausted",
+})
+_PROMPT_FRONTIER_METADATA_TRACE_TYPE = "v2.prompt_frontier.metadata_rejected"
+_PROMPT_FRONTIER_PUBLIC_ENUMS = {
+    "limit_source": frozenset({
+        "provider_metadata", "caller", "audited_family",
+        "unaudited_default", "deployment_override",
+    }),
+    "lane": frozenset({
+        "chat", "heartbeat", "scheduled", "manual_wake", "screen_watch",
+    }),
+    "resolved_source": frozenset({
+        "caller", "audited_family", "unaudited_default", "deployment_override",
+    }),
+    "provider": frozenset({
+        "openai", "openrouter", "anthropic", "bedrock", "gemini",
+        "deepseek", "openai_compatible",
+    }),
+}
+_PROMPT_FRONTIER_PUBLIC_REQUIRED_COMPONENTS = frozenset({
+    "message_context", "tool_transcript", "required_tool_schemas",
+})
+_PROMPT_FRONTIER_PUBLIC_BYTE_COMPONENTS = frozenset({
+    "tools", "system", "summary", "tail", "worldbook", "runtime_data",
+    "screen", "tool_transcript",
+})
+
 
 def _debug_event_public_json(ev: dict) -> dict:
     raw_detail = ev.get("detail") or {}
@@ -2480,6 +2509,97 @@ def _debug_event_public_json(ev: dict) -> dict:
         for key, allowed_values in _LANGUAGE_FOLLOW_PUBLIC_ENUMS.items():
             value = raw_detail.get(key)
             if isinstance(value, str) and value in allowed_values:
+                public_detail[key] = value
+    if (
+        ev.get("type") == _PROMPT_FRONTIER_METADATA_TRACE_TYPE
+        and isinstance(raw_detail, dict)
+    ):
+        expected_keys = {
+            "reported_tokens", "floor_tokens", "resolved_tokens",
+            "resolved_source", "provider",
+        }
+        counts = tuple(
+            raw_detail.get(key)
+            for key in ("reported_tokens", "floor_tokens", "resolved_tokens")
+        )
+        valid = (
+            set(raw_detail) == expected_keys
+            and all(type(value) is int and value > 0 for value in counts)
+            and counts[0] < counts[1]
+            and raw_detail.get("provider")
+            in _PROMPT_FRONTIER_PUBLIC_ENUMS["provider"]
+            and raw_detail.get("resolved_source")
+            in _PROMPT_FRONTIER_PUBLIC_ENUMS["resolved_source"]
+        )
+        # Exact-shape projection: an extra model/free-text key invalidates the
+        # whole detail instead of inheriting the generic model/provider allowlist.
+        public_detail = dict(raw_detail) if valid else {}
+    if (
+        ev.get("type") in _PROMPT_FRONTIER_TRACE_TYPES
+        and isinstance(raw_detail, dict)
+        and isinstance(public_detail, dict)
+    ):
+        # Prompt-budget traces expose only producer-validated closed enums and
+        # integer counts.  Any extra key or string leaves the generic redaction
+        # intact, so a future producer cannot turn ``components`` into a prompt
+        # plaintext side channel by adding (for example) a ``content`` field.
+        for key, allowed_values in _PROMPT_FRONTIER_PUBLIC_ENUMS.items():
+            value = raw_detail.get(key)
+            if isinstance(value, str) and value in allowed_values:
+                public_detail[key] = value
+        required = raw_detail.get("required_components")
+        if (
+            isinstance(required, list)
+            and all(
+                isinstance(value, str)
+                and value in _PROMPT_FRONTIER_PUBLIC_REQUIRED_COMPONENTS
+                for value in required
+            )
+        ):
+            public_detail["required_components"] = list(required)
+        components = raw_detail.get("components")
+        if (
+            isinstance(components, list)
+            and all(
+                isinstance(item, dict)
+                and set(item) == {"name", "bytes"}
+                and isinstance(item.get("name"), str)
+                and item["name"] in _PROMPT_FRONTIER_PUBLIC_BYTE_COMPONENTS
+                and type(item.get("bytes")) is int
+                and item["bytes"] >= 0
+                for item in components
+            )
+        ):
+            public_detail["components"] = [dict(item) for item in components]
+    if (
+        ev.get("type") == "mcp.roundtrip.provider"
+        and isinstance(raw_detail, dict)
+        and isinstance(public_detail, dict)
+    ):
+        # The tool loop owns these finite producer vocabularies. Import lazily
+        # to preserve admin module startup while avoiding a copied allowlist
+        # that could drift open or silently redact newly added producer values.
+        from model_api_runtime.v2 import tool_loop as v2_tool_loop
+        from model_api_runtime.v2 import worker as v2_worker
+
+        public_enums = {
+            "terminal_text_round_reason": (
+                v2_tool_loop._PROVIDER_TERMINAL_TEXT_ROUND_REASONS
+            ),
+            "force_text_fallback_reason": (
+                v2_tool_loop._PROVIDER_FORCE_TEXT_FALLBACK_REASONS
+            ),
+        }
+        for key, allowed_values in public_enums.items():
+            value = raw_detail.get(key)
+            if isinstance(value, str) and value in allowed_values:
+                public_detail[key] = value
+        for key in ("lane", "wake_kind"):
+            value = raw_detail.get(key)
+            if (
+                isinstance(value, str)
+                and v2_worker._normalize_provider_trace_lane(value) == value
+            ):
                 public_detail[key] = value
     return {
         "ts": ev.get("ts"),
@@ -8080,6 +8200,8 @@ def _debug_time(ts) -> str:
 _DEBUG_STEP_LABELS = {
     "route.decided": ("🧭", "路由决策"),
     "context.build": ("📎", "组装上下文"),
+    "memory.inject": ("🧠", "自动注入记忆"),
+    "memory.dream.tick": ("🌙", "做梦判定"),
     "agent.model.call.start": ("🧠", "调用模型 · 开始"),
     "agent.model.call.done": ("🧠", "调用模型 · 完成"),
     "agent.tool.call": ("🔧", "调用工具"),

@@ -24,7 +24,7 @@ sys.path.insert(0, str(TOOLS))
 sys.path.insert(0, str(BACKEND))
 
 from export_public_openapi import _build_public_schema, _load_schema  # noqa: E402
-from memory_garden.types import MEMORY_SOURCE_VALUES  # noqa: E402
+from memory.source_policy import MEMORY_SOURCE_VALUES  # noqa: E402
 
 
 HTTP_METHODS = {"get", "post", "put", "patch", "delete", "options", "head", "trace"}
@@ -372,6 +372,15 @@ def test_chat_memory_and_perception_contracts_are_concrete(
 
     response_sources = schemas["ChatResponseRequest"]["properties"]["source"]["enum"]
     assert "resident_maintenance" in response_sources
+    bootstrap_error = schemas["ChatBootstrapIncompleteResponse"]
+    assert set(bootstrap_error["required"]) == {"error", "stage", "retryable"}
+    assert bootstrap_error["properties"]["retryable"]["type"] == "boolean"
+    response_409 = operations[("post", "/v1/chat/response")]["responses"]["409"]
+    response_409_schema = response_409["content"]["application/json"]["schema"]
+    assert {item["$ref"] for item in response_409_schema["anyOf"]} == {
+        "#/components/schemas/ChatBootstrapIncompleteResponse",
+        "#/components/schemas/ErrorResponse",
+    }
 
     poll_query = _parameters(operations[("get", "/v1/chat/poll")], "query")
     assert set(poll_query) == {"since", "timeout", "consumer_id", "claim"}

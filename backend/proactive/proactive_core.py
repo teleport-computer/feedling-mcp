@@ -20,6 +20,7 @@ string + Accept-Language header (same technique as ``admin.admin_core``).
 from __future__ import annotations
 
 import os
+import uuid
 from datetime import datetime
 
 from core import reqctx
@@ -284,6 +285,7 @@ def _submit_v2_capture(store, *, trigger, now, window, capture_key) -> dict:
         store.user_id,
         "capture",
         reason=str(trigger or "capture")[:200],
+        trace_id=None,
     )
     if not coalesced:
         core_wake_bus.notify("v2_jobs", store.user_id)
@@ -371,7 +373,12 @@ def proactive_tick(store, payload: dict, *, api_key) -> dict:
             or bool(str(payload.get("context_hint") or "").strip())
         )
         if is_manual:
-            job_id, coalesced = jobs_store.enqueue_job(store.user_id, "manual_wake", reason="manual_tick")
+            job_id, coalesced = jobs_store.enqueue_job(
+                store.user_id,
+                "manual_wake",
+                reason="manual_tick",
+                trace_id=uuid.uuid4().hex,
+            )
             core_wake_bus.notify("v2_jobs", store.user_id)
             return {"decision": None, "job": {"id": job_id, "lane": "manual_wake"}, "enqueued": not coalesced, "v2": True}
         return {"decision": None, "job": None, "enqueued": False, "v2": True}

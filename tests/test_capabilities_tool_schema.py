@@ -32,7 +32,7 @@ def test_reply_tool_schema_shape():
     assert reply.parameters["properties"]["text"]["type"] == "string"
 
 
-def test_t101_reply_description_keeps_progress_separate_from_final_reply():
+def test_t140_reply_description_allows_complete_bubble_to_end_turn():
     description = next(
         spec.description for spec in tool_schema.build_tool_specs()
         if spec.name == "reply"
@@ -40,9 +40,11 @@ def test_t101_reply_description_keeps_progress_separate_from_final_reply():
 
     assert "long-running task" in description
     assert "immediate reply bubble" in description
-    assert "not the final reply" in description
-    assert "must not include <think>" in description
-    assert "must not replace the final reply" in description
+    assert "without <think>" in description
+    assert "end the turn with no additional visible text" in description
+    assert "do not repeat it" in description
+    assert "only when you still have new content" in description
+    assert "must not replace the final reply" not in description
 
 
 def test_t101_perception_and_screen_gates_reach_final_tool_descriptions():
@@ -79,6 +81,24 @@ def test_screen_read_description_defaults_live_shares_to_pixels():
     assert "active screen share" in description
     assert "pixels by default" in description
     assert "Start without include_image" not in description
+
+
+def test_photo_read_defaults_to_pixels_and_rejects_metadata_only_flag():
+    spec = next(
+        item for item in tool_schema.build_tool_specs()
+        if item.name == "photo_read"
+    )
+    include_image = spec.parameters["properties"]["include_image"]
+
+    assert include_image["default"] is True
+    assert include_image["enum"] == [True]
+    assert "Pixels are included by default" in spec.description
+    assert tool_schema.validate_tool_args(
+        "photo_read", {"photo_id": "p1"}
+    ) is None
+    assert "unsupported value" in tool_schema.validate_tool_args(
+        "photo_read", {"photo_id": "p1", "include_image": False}
+    )
 
 
 def test_task_tool_is_read_only_and_requires_a_nonempty_prompt():

@@ -2,7 +2,6 @@
 
 import json
 import os
-import re
 import time
 import uuid
 
@@ -11,6 +10,7 @@ import httpx
 import db
 from core import envelope as core_envelope
 from core import store as core_store
+from core.frame_ids import is_supported_frame_id
 from core.reqctx import request
 from core.store import UserStore
 
@@ -79,7 +79,8 @@ def _save_frame_envelope(store: UserStore, payload: dict, env: dict):
     """
     item_id = env.get("id") or uuid.uuid4().hex
     ts = payload.get("ts") or time.time()
-    db.frame_upsert(store.user_id, item_id, ts, env)
+    if db.frame_upsert(store.user_id, item_id, ts, env) is False:
+        return
 
     encrypted = bool(env.get("body_ct"))
     inner = _read_plaintext_frame(env) if not encrypted else None
@@ -276,7 +277,7 @@ def _ocr_summary(frames: list[dict]) -> str:
 
 def _load_envelope(store, frame_id: str) -> dict | None:
     """Load a frame's stored v1 envelope doc by id, or None if absent/invalid."""
-    if not re.match(r"^[a-f0-9]{16,64}$", frame_id):
+    if not is_supported_frame_id(frame_id):
         return None
     env = db.frame_get(store.user_id, frame_id)
     return env if isinstance(env, dict) else None
@@ -284,6 +285,6 @@ def _load_envelope(store, frame_id: str) -> dict | None:
 
 def _frame_exists(store, frame_id: str) -> bool:
     """Existence guard for the proxy endpoints (no heavy body_ct fetch)."""
-    if not re.match(r"^[a-f0-9]{16,64}$", frame_id):
+    if not is_supported_frame_id(frame_id):
         return False
     return db.frame_exists(store.user_id, frame_id)

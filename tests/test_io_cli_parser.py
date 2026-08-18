@@ -14,7 +14,7 @@ TOOLS = Path(__file__).parent.parent / "tools"
 sys.path.insert(0, str(TOOLS))
 
 import io_cli  # noqa: E402
-from memory_garden.types import (  # noqa: E402
+from memory.source_policy import (  # noqa: E402
     MEMORY_SOURCE_VALUES,
     RESIDENT_ABSORB_SOURCE,
     RESIDENT_PATCH_SOURCE,

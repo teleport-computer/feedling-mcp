@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import time
 from urllib.parse import quote
 
 import anyio.to_thread
@@ -15,10 +16,12 @@ from fastapi import APIRouter
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
+from memory_garden import observability as mg_observability
 from memory_garden.scoring.relevance import (
     select_context_memories,
     select_context_memories_with_trace,
 )
+from memory import card_shape
 from enclave import auth, backend_client, envelope, readside
 from enclave.routes._errors import backend_call_or_error, content_sk_or_503
 from enclave.routes._json import json_response_offthread
@@ -262,30 +265,67 @@ def _build_context_memories(moments, decrypted, query_args):
 
     cards = readside.moments_to_cards(
         moments, query_args["authorized_user_id"], query_args["content_sk"])
+    # 生命周期过滤归宿主 —— **必须在翻译之前**。
+    # 翻译产物里没有 io 的 archive 字段，放到翻译之后就漏了，已归档的卡
+    # 会重新进上下文（codex 2026-08-17 指出）。
+    selectable = [c for c in cards if not card_shape.is_retired(c)]
+    # 翻成内核认的形状：内核只读 summary/content/bucket + 宿主显式给的
+    # search_text，不认 title/her_quote/linked_dimension。
+    garden_cards = [card_shape.to_garden_card(c) for c in selectable]
 
     # Expand any user-selected memory references (Garden「talk in chat」) onto
     # their message using the already-decrypted cards. Best-effort side pass;
     # does not affect the context_memories selection below.
     _attach_quoted_memories(decrypted, cards)
 
+    # 挑卡用翻译后的卡（内核只认那一种形状），但**注入给模型的是原卡** ——
+    # 原卡带着 title/her_quote 等 io 侧要渲染和留痕的字段，翻译产物只是
+    # 给内核打分用的中间态，不该外流。
+    by_original = {str(c.get("id") or ""): c for c in cards if c.get("id")}
+
+    def _back_to_original(picked: list[dict]) -> list[dict]:
+        out = []
+        for item in picked:
+            src = by_original.get(str(item.get("id") or ""))
+            out.append(dict(src) if src else item)
+        return out
+
+    # 无论调用方要不要实时 trace，都算一条**内容无关**的记录带出去 ——
+    # enclave 没有数据库发不了 debug_trace，由调用方（consumer / hosted turn）落库。
+    started = time.monotonic()
+    selection_trace: dict | None = None
+
     if use_readside:
-        context_memories, context_memory_trace = readside.select_context_memories_via_readside(
-            cards,
+        mode = "readside_relevance"
+        picked, selection_trace = readside.select_context_memories_via_readside(
+            garden_cards,
             latest_user_text,
             cap=8,
         )
-        if not want_trace:
-            context_memory_trace = None
-    elif want_trace:
-        context_memories, context_memory_trace = select_context_memories_with_trace(
-            cards,
+        context_memories = _back_to_original(picked)
+        context_memory_trace = selection_trace if want_trace else None
+    else:
+        mode = f"bucketed:{context_mode or 'default'}"
+        # 一律走带 trace 那支：落库记录需要 selection_trace，
+        # 且它与不带 trace 那支选出的卡完全一致（只是多返回一份说明）。
+        picked, selection_trace = select_context_memories_with_trace(
+            garden_cards,
             latest_user_text,
             mode=context_mode,
         )
-    else:
-        context_memories = select_context_memories(cards, latest_user_text, mode=context_mode)
+        context_memories = _back_to_original(picked)
+        context_memory_trace = selection_trace if want_trace else None
 
-    return context_memories, context_memory_trace
+    context_memory_log = mg_observability.injection_record(
+        mode=mode,
+        query=latest_user_text,
+        candidate_pool=len(cards),
+        selection_trace=selection_trace,
+        injected_ids=[str(c.get("id") or "") for c in context_memories],
+        cap=8,
+        duration_ms=(time.monotonic() - started) * 1000.0,
+    )
+    return context_memories, context_memory_trace, context_memory_log
 
 
 # HEAD 显式声明（同 frames.py）：Flask 自动给 GET 挂 HEAD，FastAPI 不会；
@@ -388,20 +428,27 @@ async def v1_chat_history(request: Request):
             listing_task.cancel()  # 解密意外失败时不留孤儿任务
         raise
 
+    context_memory_log: dict | None = None
     if listing_task is not None:
         try:
             listing = await listing_task
             moments = listing.get("moments", []) or []
-            context_memories, context_memory_trace = await anyio.to_thread.run_sync(
+            context_memories, context_memory_trace, context_memory_log = await anyio.to_thread.run_sync(
                 _build_context_memories, moments, decrypted, query_args)
         except Exception as e:
             print(f"[chat/history:{user_id}] context_memories failed: {e}")
             context_memories, context_memory_trace = [], None
+            # 失败也要留痕 —— 否则「这轮一张都没注入」和「挑卡整个崩了」
+            # 在日志里长得一模一样，排查时分不开。
+            context_memory_log = {"mode": "failed", "error": type(e).__name__,
+                                  "counts": {"candidate_pool": len(moments), "injected": 0}}
 
     payload = {
         "user_id": user_id,
         "messages": decrypted,
         "context_memories": context_memories,
+        # 内容无关的注入记录，由调用方落库（enclave 自己没有数据库）。
+        "context_memory_log": context_memory_log,
         "total": hist.get("total", len(decrypted)),
         "decrypt_errors": errors,
     }

@@ -51,7 +51,7 @@ services:
   # process-specific lease ownership remains independent.
   # No per-runner config: every prod runner CVM deploys this identical compose.
   agent-runner:
-    image: ghcr.io/teleport-computer/feedling-agent-runner:1592823   # CI pins the sha
+    image: ghcr.io/teleport-computer/feedling-agent-runner:f7c1f84   # CI pins the sha
     command: ["python", "-u", "backend/agent_runtime/supervisor.py"]
     restart: unless-stopped
     environment:
@@ -73,6 +73,11 @@ services:
       # runner CVMs (each also 0 -> any one can hold the whole fleet).
       AGENT_MAX_CHILDREN: "${AGENT_MAX_CHILDREN:-0}"
       DATABASE_URL: "${DATABASE_URL:-}"
+      # Resident photo tools resolve the same R2-backed frame pointers as V2.
+      R2_ENDPOINT: "${R2_ENDPOINT:-}"
+      R2_ACCESS_KEY_ID: "${R2_ACCESS_KEY_ID:-}"
+      R2_SECRET_ACCESS_KEY: "${R2_SECRET_ACCESS_KEY:-}"
+      R2_FRAMES_BUCKET: "${R2_FRAMES_BUCKET:-}"
       AGENT_RUNTIME_USERS: "${AGENT_RUNTIME_USERS:-}"
       AGENT_RUNTIME_AUTODISCOVER: "${AGENT_RUNTIME_AUTODISCOVER:-}"
       FEEDLING_RUNTIME_TOKEN_SECRET: "${FEEDLING_RUNTIME_TOKEN_SECRET:-}"

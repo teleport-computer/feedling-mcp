@@ -438,31 +438,78 @@ def cards_to_actions(cards, *, occurred_at, source_ids, build_envelope,
     )
 
 
-def _latest_source_occurred_at(cards: list[dict]) -> str:
-    """Return the chronologically latest source timestamp, preserving its text.
+def _latest_source_occurred_at(
+    cards: list[dict],
+    *,
+    on_degraded=None,
+) -> str:
+    """源卡里**已知的最晚**事件时间;全都没有时退到 created_at 的日期。
 
-    Dream rewrites old memories, so neither the job time nor the latest chat
-    time is evidence of when the remembered event happened.  Every source must
-    carry a parseable ISO-8601 value: ignoring one missing value could select an
-    older sibling while claiming it is the latest.  Fail closed instead; the
-    worker persists the stable, content-free error code for operators.
+    Dream 重写旧记忆,所以 job 时间和最新聊天时间都不能代表事件何时发生 ——
+    这一点没变,`consolidations_to_actions` 里「拿不到源卡」那条仍然 fail-closed。
+
+    ⚠️ 2026-08-17 由 fail-closed 改为降级(Seven 定)。原来只要**一张**源卡缺
+    `occurred_at` 就整轮抛错,而实测四个受影响用户的花园里缺失率 12%~64% ——
+    dream 每次挑几张源卡,碰上一张就废,等于这些用户的 dream **永久阻塞且无感**。
+    代价对比:
+      · 降级 → 合并卡的时间可能偏 → 花园里排序位置偏(显示问题)
+      · 拦死 → 那个用户的 dream 整个不跑(功能没了)
+    排序偏远轻于功能没了。
+
+    取**已知里最晚的**而不是随便一张:这个函数的语义就是「最晚」,
+    随手取一张可能取到旧的,而明明有更新的已知值。
+
+    `on_degraded(known, missing, fallback_used)` 用于留痕。**必须留痕**:
+    那批缺 occurred_at 的卡 created_at 集中在 08-10~08-14,**是最近两周写的**,
+    说明产生脏数据的写入路径**可能还开着**。降级如果不留痕,就把源头永久盖住了。
     """
     ranked: list[tuple[datetime, str]] = []
+    missing = 0
     for card in cards:
         raw = str(card.get("occurred_at") or "").strip()
         if not raw:
-            raise ValueError("dream_source_occurred_at_unavailable")
+            missing += 1
+            continue
         candidate = raw[:-1] + "+00:00" if raw.endswith("Z") else raw
         try:
             parsed = datetime.fromisoformat(candidate)
         except ValueError:
-            raise ValueError("dream_source_occurred_at_unavailable") from None
+            missing += 1
+            continue
         if parsed.tzinfo is None:
             parsed = parsed.replace(tzinfo=timezone.utc)
         ranked.append((parsed.astimezone(timezone.utc), raw))
-    if not ranked:
-        raise ValueError("dream_source_occurred_at_unavailable")
-    return max(ranked, key=lambda item: item[0])[1]
+    if ranked:
+        if missing and on_degraded is not None:
+            on_degraded(len(ranked), missing, False)
+        return max(ranked, key=lambda item: item[0])[1]
+
+    # 一张可用的都没有 → 退到 created_at 的**日期**(不是完整时刻:
+    # created_at 是写入时间,只有日期这一档是对事件时间的诚实近似)。
+    # ⚠️ 这里同样取**最晚**,不是第一张 —— 我第一版写成了「遍历到第一张能解析的
+    # 就返回」,结果输入顺序一变结果就变(codex2 实测正序 08-10 / 反序 08-11)。
+    # 我自己的 docstring 写着「取已知里最晚的」,实现却没照做。
+    created_ranked: list[datetime] = []
+    for card in cards:
+        created = str(card.get("created_at") or "").strip()
+        if not created:
+            continue
+        candidate = created[:-1] + "+00:00" if created.endswith("Z") else created
+        try:
+            parsed = datetime.fromisoformat(candidate)
+        except ValueError:
+            continue
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        created_ranked.append(parsed.astimezone(timezone.utc))
+    if created_ranked:
+        if on_degraded is not None:
+            on_degraded(0, missing, True)
+        return max(created_ranked).date().isoformat()
+
+    # created_at 也全都没有/解析不了 —— 实测 260 张卡里 0 例,但仍然 fail-closed:
+    # 到这一步已经没有任何可信的时间来源,编一个不如失败。
+    raise ValueError("dream_source_occurred_at_unavailable")
 
 
 def consolidations_to_actions(
@@ -472,6 +519,7 @@ def consolidations_to_actions(
     source_ids,
     build_envelope,
     existing_cards: list[dict] | None = None,
+    on_source_time_degraded=None,
 ):
     """Map Dream's native ``op/card_ids/result`` shape to multi-card
     ``memory.supersede`` actions.
@@ -530,7 +578,9 @@ def consolidations_to_actions(
             # event time to carry forward.  The worker's shared ``occurred_at``
             # is capture/chat time and must never become Dream's silent fallback.
             raise ValueError("dream_source_occurred_at_unavailable")
-        source_occurred_at = _latest_source_occurred_at(old_cards)
+        source_occurred_at = _latest_source_occurred_at(
+            old_cards, on_degraded=on_source_time_degraded
+        )
         card = {"type": "fact", **result}
         actions.append(
             {
