@@ -27,6 +27,7 @@ from dataclasses import dataclass, field
 
 from provider_types import MCP_TRANSPORT_FAILURE_ERROR, ToolResult, ToolSpec
 from hosted import mcp_core, mcp_client, mcp_probe, mcp_ca_fetch
+from model_api_runtime.v2 import tool_surface
 
 log = logging.getLogger("feedling.hosted.mcp_tools")
 
@@ -60,9 +61,8 @@ MCP_TOOL_PREFIX = "mcp__"
 # (usr_1baf,6 台共 107 个)**整个装下,一个都不用裁**。
 MAX_MCP_TOOLS_PER_TURN = 128
 # 2026-08-10 上调:同一天开始 schema 里带上说明/enum/default,体积自然变大。
-# 不上调的话,原来能用的工具会**新**撞上这道闸而被丢掉 —— 而丢弃只有一行
-# log.warning,又是一次静默失败。丢弃数现在也进 summary(见 _allocate_round_robin),
-# 所以真撞上了运维看得见。
+# 这些上限现在只决定哪些参数说明书初始展开;有效工具的名字、路由与完整
+# process-local schema 都会注册,超限项折叠后可由 mcp_tool_search 按需恢复。
 MAX_MCP_TOOL_SCHEMA_CHARS = 32768
 MAX_MCP_TOOL_CATALOG_CHARS = 65536
 # 服务器自己写的使用说明进系统提示的预算。**这是远端可控文本**,所以必须有硬上限:
@@ -72,7 +72,7 @@ MAX_MCP_INSTRUCTIONS_CHARS_PER_SERVER = 4096
 MAX_MCP_INSTRUCTIONS_CHARS_TOTAL = 16384
 MAX_PROVIDER_TOOL_NAME_CHARS = 64
 MAX_MCP_TOOL_SEARCH_RESULTS = 8
-MAX_COLLAPSED_DESCRIPTION_CHARS = 240
+MAX_COLLAPSED_DESCRIPTION_CHARS = tool_surface.MAX_COLLAPSED_DESCRIPTION_CHARS
 _PROVIDER_TOOL_NAME_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 
 
@@ -122,6 +122,7 @@ class _CatalogCandidate:
     offered_spec: ToolSpec
     route: _Route
     serialized_chars: int
+    resident: bool = True
 
 
 @dataclass(frozen=True)
@@ -162,6 +163,7 @@ class McpTurn:
     full_specs: dict[str, ToolSpec] = field(default_factory=dict)
     collapsed_names: set[str] = field(default_factory=set)
     resolved_names: set[str] = field(default_factory=set)
+    pressure_collapsed_names: set[str] = field(default_factory=set)
     # 服务器自己写的使用说明(MCP spec 的 initialize.result.instructions)。
     # [(server_name, text), ...],按服务器名排序,提示词组装层原样注入。
     # 这是协议里「服务器告诉模型该怎么用我」的官方通道 —— 我们以前把整个
@@ -177,21 +179,58 @@ class McpTurn:
         return name in self.routes
 
     def requires_resolution(self, name: str) -> bool:
-        return name in self.collapsed_names and name not in self.resolved_names
+        return (
+            name in (self.collapsed_names | self.pressure_collapsed_names)
+            and name not in self.resolved_names
+        )
 
     def current_tool_specs(self) -> list[ToolSpec]:
         """Return the provider surface after any in-turn schema resolutions."""
         return list(self.tool_specs)
+
+    def pressure_collapsed_tool_specs(self) -> dict[str, ToolSpec]:
+        """Return deterministic collapsed variants for unresolved MCP schemas."""
+        return {
+            name: _collapsed_spec(spec)
+            for name, spec in self.full_specs.items()
+            if name not in self.resolved_names
+        }
+
+    def protected_tool_names(self) -> set[str]:
+        """Schemas explicitly resolved this turn must survive later planning."""
+        return set(self.resolved_names)
+
+    def recovery_needed(self) -> bool:
+        hidden = (
+            self.collapsed_names
+            | self.pressure_collapsed_names
+        )
+        return bool(hidden - self.resolved_names)
+
+    def set_pressure_tool_surface(self, decision: dict | None) -> None:
+        """Commit one final pure-planner decision for later search/refresh."""
+        detail = decision if isinstance(decision, dict) else {}
+        known = set(self.full_specs)
+        collapsed = {
+            str(name)
+            for name in detail.get("pressure_collapsed_names", ())
+            if str(name) in known and str(name) not in self.resolved_names
+        }
+        self.pressure_collapsed_names = collapsed
 
     def resolve_tool_schemas(self, args: dict | None) -> dict:
         """Resolve folded schemas without expanding this turn's admitted names."""
         args = args if isinstance(args, dict) else {}
         raw_names = args.get("names")
         query = str(args.get("query") or "").strip()
+        discoverable_names = (
+            self.collapsed_names
+            | self.pressure_collapsed_names
+        )
         folded_specs = {
             name: spec
             for name, spec in self.full_specs.items()
-            if name in self.collapsed_names
+            if name in discoverable_names
         }
 
         requested: list[str] = []
@@ -237,40 +276,11 @@ class McpTurn:
                 "tools": [],
             }
 
-        current_by_name = {spec.name: spec for spec in self.tool_specs}
-        catalog_chars = sum(
-            _serialized_chars({
-                "name": spec.name,
-                "description": spec.description,
-                "parameters": spec.parameters,
-            }) or MAX_MCP_TOOL_CATALOG_CHARS + 1
-            for spec in self.tool_specs
-        )
         resolved: list[str] = []
-        schema_budget_exceeded: list[str] = []
         for name in requested:
             if name in self.resolved_names:
                 resolved.append(name)
                 continue
-            current = current_by_name[name]
-            full = self.full_specs[name]
-            current_chars = _serialized_chars({
-                "name": current.name,
-                "description": current.description,
-                "parameters": current.parameters,
-            })
-            full_chars = _serialized_chars({
-                "name": full.name,
-                "description": full.description,
-                "parameters": full.parameters,
-            })
-            if current_chars is None or full_chars is None or (
-                catalog_chars - current_chars + full_chars
-                > MAX_MCP_TOOL_CATALOG_CHARS
-            ):
-                schema_budget_exceeded.append(name)
-                continue
-            catalog_chars = catalog_chars - current_chars + full_chars
             self.resolved_names.add(name)
             resolved.append(name)
 
@@ -284,7 +294,7 @@ class McpTurn:
         return {
             "resolved": resolved,
             "not_found": not_found,
-            "schema_budget_exceeded": schema_budget_exceeded,
+            "schema_budget_exceeded": [],
             "tools": [
                 {
                     "name": self.full_specs[name].name,
@@ -513,20 +523,7 @@ def _serialized_chars(value) -> int | None:
 
 def _collapsed_spec(spec: ToolSpec) -> ToolSpec:
     """Keep discovery text resident while withholding the remote arg schema."""
-    description = " ".join(str(spec.description or "").split())
-    if len(description) > MAX_COLLAPSED_DESCRIPTION_CHARS:
-        description = description[: MAX_COLLAPSED_DESCRIPTION_CHARS - 3].rstrip() + "..."
-    return ToolSpec(
-        name=spec.name,
-        description=description,
-        # Provider tool protocols require a schema object even for a no-arg
-        # tool. This empty closed object carries no remote parameter details.
-        parameters={
-            "type": "object",
-            "properties": {},
-            "additionalProperties": False,
-        },
-    )
+    return tool_surface.collapsed_tool_spec(spec)
 
 
 def _read_only_hint(tool: dict) -> bool:
@@ -681,9 +678,9 @@ async def load_turn_mcp(
     # provider-facing catalog independent of server/tools-list ordering.
     candidates: list[_CatalogCandidate] = []
     seen_qualified_names: set[str] = set()
-    # 因 schema 太大 / 结构非法被整个丢掉的工具。以前只有 log.warning ——
-    # 模型少了一个工具,而运维在 admin 里什么都看不到。
+    # 因结构非法被整个丢掉的工具。有效但过大的说明书只折叠,不丢工具名。
     schema_rejected: list[str] = []
+    schema_cap_collapsed: list[str] = []
     for result in results:
         if not result.available:
             continue
@@ -709,13 +706,18 @@ async def load_turn_mcp(
                 schema_rejected.append(f"{name}/{raw}")
                 continue
             schema_chars = _serialized_chars(parameters)
-            if (
-                schema_chars is None
-                or schema_chars > MAX_MCP_TOOL_SCHEMA_CHARS
-            ):
-                log.warning("mcp tool %r/%r skipped: schema too large", name, raw)
+            if schema_chars is None:
+                log.warning("mcp tool %r/%r skipped: schema unavailable", name, raw)
                 schema_rejected.append(f"{name}/{raw}")
                 continue
+            schema_over_cap = schema_chars > MAX_MCP_TOOL_SCHEMA_CHARS
+            if schema_over_cap:
+                log.warning(
+                    "mcp tool %r/%r schema folded: manual too large",
+                    name,
+                    raw,
+                )
+                schema_cap_collapsed.append(f"{name}/{raw}")
             # 原样透传服务器写的说明。
             #
             # 这里原本把每个工具的说明都换成同一句「用户连接的 MCP 工具,输出
@@ -736,7 +738,8 @@ async def load_turn_mcp(
                 description=description,
                 parameters=parameters,
             )
-            offered_spec = candidate if result.resident else _collapsed_spec(candidate)
+            starts_expanded = result.resident and not schema_over_cap
+            offered_spec = candidate if starts_expanded else _collapsed_spec(candidate)
             candidate_chars = _serialized_chars({
                 "name": offered_spec.name,
                 "description": offered_spec.description,
@@ -775,9 +778,14 @@ async def load_turn_mcp(
                 offered_spec=offered_spec,
                 route=route,
                 serialized_chars=candidate_chars,
+                resident=starts_expanded,
             ))
 
-    turn = _allocate_round_robin(candidates, schema_rejected=schema_rejected)
+    turn = _allocate_round_robin(
+        candidates,
+        schema_rejected=schema_rejected,
+        schema_cap_collapsed=schema_cap_collapsed,
+    )
     turn.server_results = [result.public() for result in results]
     # 服务器说明:按服务器名排序(确定性,便于提示缓存),逐台截断后再受总量约束。
     # 空白/非字符串直接丢弃 —— 没有说明和「有一份空说明」对模型是两回事。
@@ -814,8 +822,9 @@ def _allocate_round_robin(
     candidates: list[_CatalogCandidate],
     *,
     schema_rejected: list[str] | None = None,
+    schema_cap_collapsed: list[str] | None = None,
 ) -> McpTurn:
-    """Fill the turn's tool budget round-robin across servers, not in name order.
+    """Choose initially expanded manuals round-robin across servers.
 
     The previous allocator sorted every candidate into one list keyed by server
     name and truncated at the caps. That starves whole servers by alphabet: with
@@ -827,24 +836,16 @@ def _allocate_round_robin(
     (``tools/pi_mcp_bridge/tool_mapping.js``); this is the same allocation for the
     hosted V2 catalog, so both runtimes now behave the same.
 
-    Round-robin means every server lands at least one tool before any server
-    lands its second, so a small server is never starved by a large one; only
-    the largest get trimmed. Determinism is preserved exactly as before —
-    servers sorted by name, tools sorted within a server, fixed rounds — so the
-    provider-facing catalog bytes stay stable for a given input.
+    Every valid candidate is registered and remains visible. Round-robin only
+    decides which resident-server schemas start expanded before the count/char
+    manual budgets run out; later candidates fold to discovery entries. This
+    prevents a cap from making a connected tool disappear while preserving
+    deterministic fairness across servers.
 
-    BOTH caps are enforced in the same pass, and they are NOT symmetric:
-
-    - The count cap ends allocation — nothing more can fit, by definition.
-    - The char cap must NOT. It rejects the one candidate that would overflow
-      and allocation continues, because a later candidate can still be small
-      enough to fit. Ending the round-robin on the first oversized schema
-      starves every server still holding candidates for a reason that has
-      nothing to do with them (measured on the regression case: a server drops
-      from 20 tools to 12).
-
-    The cursor advances BEFORE the char check, so a repeatedly rejected
-    candidate can never spin the loop.
+    Explicit ``resident=false`` remains folded independent of pressure and does
+    not consume the expanded-manual budgets. The cursor advances before every
+    decision, and char overflow folds only that candidate so a later smaller
+    manual may still start expanded.
     """
     by_server: dict[str, list[_CatalogCandidate]] = {}
     for item in candidates:
@@ -859,14 +860,14 @@ def _allocate_round_robin(
     collapsed_names: set[str] = set()
     catalog_chars = 0
     kept: dict[str, int] = {name: 0 for name in names}
-    dropped_chars = 0
+    count_cap_collapses = 0
+    char_cap_collapses = 0
+    expanded_count = 0
     cursor = {name: 0 for name in names}
     progressed = True
-    while progressed and len(specs) < MAX_MCP_TOOLS_PER_TURN:
+    while progressed:
         progressed = False
         for server in names:
-            if len(specs) >= MAX_MCP_TOOLS_PER_TURN:
-                break
             index = cursor[server]
             items = by_server[server]
             if index >= len(items):
@@ -874,18 +875,25 @@ def _allocate_round_robin(
             cursor[server] = index + 1
             progressed = True
             item = items[index]
-            if (
-                catalog_chars + item.serialized_chars
-                > MAX_MCP_TOOL_CATALOG_CHARS
-            ):
-                dropped_chars += 1
-                continue
-            specs.append(item.offered_spec)
             routes[item.full_spec.name] = item.route
             full_specs[item.full_spec.name] = item.full_spec
-            if item.offered_spec is not item.full_spec:
+            offered_spec = item.offered_spec
+            if item.resident:
+                if expanded_count >= MAX_MCP_TOOLS_PER_TURN:
+                    offered_spec = _collapsed_spec(item.full_spec)
+                    count_cap_collapses += 1
+                elif (
+                    catalog_chars + item.serialized_chars
+                    > MAX_MCP_TOOL_CATALOG_CHARS
+                ):
+                    offered_spec = _collapsed_spec(item.full_spec)
+                    char_cap_collapses += 1
+                else:
+                    expanded_count += 1
+                    catalog_chars += item.serialized_chars
+            if not item.resident or offered_spec is not item.full_spec:
                 collapsed_names.add(item.full_spec.name)
-            catalog_chars += item.serialized_chars
+            specs.append(offered_spec)
             kept[server] += 1
 
     summary = {
@@ -893,7 +901,11 @@ def _allocate_round_robin(
         "offered": len(candidates),
         "count_cap": MAX_MCP_TOOLS_PER_TURN,
         "char_cap": MAX_MCP_TOOL_CATALOG_CHARS,
-        "char_cap_skips": dropped_chars,
+        "char_cap_skips": char_cap_collapses,
+        "count_cap_collapses": count_cap_collapses,
+        "char_cap_collapses": char_cap_collapses,
+        "expanded": expanded_count,
+        "collapsed": len(collapsed_names),
         "catalog_chars": catalog_chars,
         # `服务器:注册数/发现数` —— 必须是**分配后**的注册数。只报发现数的话,
         # 一台服务器的工具全被裁掉时仍会显示它有 N 个,恰好把这条埋点要回答的
@@ -902,25 +914,24 @@ def _allocate_round_robin(
             f"{name}:{kept[name]}/{len(by_server[name])}" for name in names
         ),
         "servers": len(names),
-        # 连候选都没进来的:schema 太大或结构非法,整个工具消失。
-        # 和「进了候选但被上限裁掉」是两种不同的失踪,分开报才诊断得动。
+        # 只有结构非法才整项拒绝;有效但过大的说明书另报折叠数。
         "schema_rejected": len(schema_rejected or []),
         "schema_rejected_names": ",".join((schema_rejected or [])[:10]),
+        "schema_cap_collapsed": len(schema_cap_collapsed or []),
+        "schema_cap_collapsed_names": ",".join(
+            (schema_cap_collapsed or [])[:10]
+        ),
     }
 
-    # Never truncate silently: the count cap used to drop whole servers with no
-    # log line at all, which is exactly why this took a user report to find.
-    # Report kept/offered PER SERVER and post-allocation — a total alone cannot
-    # answer "which server did the model lose", and reporting the offered count
-    # would name a server whose tools were all dropped as if it were fine.
-    if len(specs) < len(candidates):
+    if count_cap_collapses or char_cap_collapses:
         log.warning(
-            "mcp catalog capped: kept=%d offered=%d count_cap=%d "
-            "char_cap_skips=%d detail=%s",
+            "mcp manuals capped: registered=%d offered=%d expanded=%d "
+            "count_cap_collapses=%d char_cap_collapses=%d detail=%s",
             len(specs),
             len(candidates),
-            MAX_MCP_TOOLS_PER_TURN,
-            dropped_chars,
+            expanded_count,
+            count_cap_collapses,
+            char_cap_collapses,
             ",".join(
                 f"{name}:{kept[name]}/{len(by_server[name])}" for name in names
             ),

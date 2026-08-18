@@ -118,6 +118,7 @@ from model_api_runtime.v2 import subagents as v2_subagents
 from model_api_runtime.v2 import summary_frontier as v2_summary_frontier
 from model_api_runtime.v2 import tail_anchor as v2_tail_anchor
 from model_api_runtime.v2 import tool_loop as v2_tool_loop
+from model_api_runtime.v2 import tool_surface as v2_tool_surface
 from model_api_runtime.v2 import trajectory as v2_trajectory
 
 # 纯 prompt/parse 模块（无 I/O、不碰 DB/enclave）——依赖方向允许 worker 直接 import
@@ -472,6 +473,14 @@ PROMPT_ESTIMATOR_UTF8_BYTES_PER_TOKEN = _positive_float_env(
 PROMPT_IMAGE_RESERVE_TOKENS = _positive_int_env(
     "FEEDLING_V2_PROMPT_IMAGE_RESERVE_TOKENS", "8192"
 )
+try:
+    TOOL_SCHEMA_COLLAPSE_POLICY = v2_tool_surface.normalize_collapse_policy(
+        os.environ.get("FEEDLING_V2_TOOL_SCHEMA_COLLAPSE_POLICY", "always")
+    )
+except ValueError as exc:
+    raise RuntimeError(
+        "FEEDLING_V2_TOOL_SCHEMA_COLLAPSE_POLICY is invalid"
+    ) from exc
 if any(
     context_window <= PROMPT_OUTPUT_RESERVE_TOKENS + PROMPT_SAFETY_MARGIN_TOKENS
     for context_window in PROMPT_CONTEXT_WINDOW_OVERRIDES.values()
@@ -4489,6 +4498,13 @@ def _make_build_messages_fn(
             utf8_bytes_per_token: float,
             image_reserve_tokens: int,
             required_tool_names=(),
+            protected_tool_names=(),
+            collapsed_tool_specs=None,
+            recovery_tool_name: str = "",
+            recovery_tool_active: bool = False,
+            tool_schema_collapse_policy: str = (
+                v2_tool_surface.DEFAULT_COLLAPSE_POLICY
+            ),
             system_suffix: str = "",
         ) -> tuple[list, Any, dict]:
             rendered_transcript: list = []
@@ -4522,6 +4538,13 @@ def _make_build_messages_fn(
                     messages=messages,
                     tools=tools,
                     required_tool_names=required_tool_names,
+                    protected_tool_names=protected_tool_names,
+                    collapsed_tool_specs=collapsed_tool_specs,
+                    recovery_tool_name=recovery_tool_name,
+                    recovery_tool_active=recovery_tool_active,
+                    tool_schema_collapse_policy=(
+                        tool_schema_collapse_policy
+                    ),
                     output_reserve_tokens=output_reserve_tokens,
                     safety_margin_tokens=safety_margin_tokens,
                     utf8_bytes_per_token=utf8_bytes_per_token,
@@ -11829,9 +11852,139 @@ async def process_job(
             )
 
         offered_mcp_tool_specs = _current_offered_mcp_tool_specs()
+        platform_schema_recovery = v2_tool_surface.SchemaRecoveryState({
+            spec.name: spec for spec in cap_tool_schema.build_tool_specs()
+        })
+        pressure_mcp_specs = getattr(
+            mcp_turn, "pressure_collapsed_tool_specs", None
+        )
+        protected_mcp_names = getattr(
+            mcp_turn, "protected_tool_names", None
+        )
+        mcp_recovery_needed = getattr(mcp_turn, "recovery_needed", None)
+        record_mcp_pressure_surface = getattr(
+            mcp_turn, "set_pressure_tool_surface", None
+        )
         mcp_offered_names = tuple(
             str(spec.name) for spec in offered_mcp_tool_specs if str(spec.name)
         )
+        if not callable(mcp_recovery_needed):
+            requires_mcp_resolution = getattr(
+                mcp_turn, "requires_resolution", None
+            )
+
+            def _legacy_mcp_recovery_needed() -> bool:
+                return callable(requires_mcp_resolution) and any(
+                    requires_mcp_resolution(name) for name in mcp_offered_names
+                )
+
+            mcp_recovery_needed = _legacy_mcp_recovery_needed
+        if not callable(protected_mcp_names):
+            requires_mcp_resolution = getattr(
+                mcp_turn, "requires_resolution", None
+            )
+
+            def _legacy_protected_mcp_names() -> set[str]:
+                collapsed = set(
+                    getattr(mcp_turn, "collapsed_names", ()) or ()
+                )
+                if not callable(requires_mcp_resolution):
+                    return set()
+                return {
+                    name for name in collapsed
+                    if not requires_mcp_resolution(name)
+                }
+
+            protected_mcp_names = _legacy_protected_mcp_names
+
+        def _record_pressure_tool_surface(decision: dict | None) -> None:
+            detail = decision if isinstance(decision, dict) else {}
+            collapsed = detail.get("pressure_collapsed_names", ())
+            platform_schema_recovery.set_pressure_collapsed(collapsed)
+            if callable(record_mcp_pressure_surface):
+                record_mcp_pressure_surface(detail)
+
+        def _protected_pressure_tool_names() -> set[str]:
+            protected = platform_schema_recovery.protected_names()
+            if callable(protected_mcp_names):
+                protected.update(protected_mcp_names() or ())
+            return protected
+
+        def _pressure_tool_recovery_needed() -> bool:
+            return platform_schema_recovery.recovery_needed() or (
+                callable(mcp_recovery_needed) and bool(mcp_recovery_needed())
+            )
+
+        def _resolve_pressure_tool_schemas(args: dict | None) -> dict:
+            requires_mcp_resolution = getattr(
+                mcp_turn, "requires_resolution", None
+            )
+            mcp_candidates = {
+                spec.name: spec
+                for spec in _current_offered_mcp_tool_specs()
+                if callable(requires_mcp_resolution)
+                and requires_mcp_resolution(spec.name)
+            }
+            candidates = {
+                **platform_schema_recovery.discoverable_specs(),
+                **mcp_candidates,
+            }
+            selection = v2_tool_surface.select_schema_names(
+                args,
+                candidates,
+                max_results=8,
+            )
+            if selection.get("error"):
+                return {"error": selection["error"], "tools": []}
+            selected = list(selection.get("selected") or [])
+            platform_selected = [
+                name for name in selected
+                if name in platform_schema_recovery.full_specs
+            ]
+            platform_resolved = platform_schema_recovery.resolve(
+                platform_selected
+            )
+            tools_by_name = {
+                name: platform_schema_recovery.full_specs[name]
+                for name in platform_resolved
+            }
+            mcp_selected = [name for name in selected if name in mcp_candidates]
+            mcp_result = {"resolved": [], "not_found": [], "tools": []}
+            resolve_mcp = getattr(mcp_turn, "resolve_tool_schemas", None)
+            if mcp_selected and callable(resolve_mcp):
+                mcp_result = resolve_mcp({"names": mcp_selected})
+                for item in mcp_result.get("tools") or []:
+                    if isinstance(item, dict) and item.get("name"):
+                        tools_by_name[str(item["name"])] = item
+            resolved_set = set(platform_resolved) | set(
+                mcp_result.get("resolved") or []
+            )
+
+            def _public_tool(name: str) -> dict | None:
+                item = tools_by_name.get(name)
+                if isinstance(item, dict):
+                    return item
+                if item is None:
+                    return None
+                return {
+                    "name": item.name,
+                    "description": item.description,
+                    "parameters": item.parameters,
+                }
+
+            return {
+                "resolved": [name for name in selected if name in resolved_set],
+                "not_found": list(selection.get("not_found") or [])
+                + list(mcp_result.get("not_found") or []),
+                "schema_budget_exceeded": list(
+                    mcp_result.get("schema_budget_exceeded") or []
+                ),
+                "tools": [
+                    public
+                    for name in selected
+                    if (public := _public_tool(name)) is not None
+                ],
+            }
         if mutation_recovery_barrier is not None:
             disabled_mutation_tool_names = frozenset(
                 set(cap_registry.WRITE_ACTIONS)
@@ -11887,12 +12040,10 @@ async def process_job(
             if history_tools_offered
             else frozenset(cap_history.HISTORY_TOOL_NAMES)
         )
-        disabled_mcp_search_tool_names = (
-            frozenset()
-            if set(getattr(mcp_turn, "collapsed_names", ()) or ())
-            & {spec.name for spec in offered_mcp_tool_specs}
-            else frozenset({cap_tool_schema.MCP_TOOL_SEARCH_TOOL})
-        )
+        # The search schema remains latent in full-fit plans. It must stay in
+        # the planner's candidate catalog even without MCP, because prompt
+        # pressure can fold non-resident platform manuals too.
+        disabled_mcp_search_tool_names = frozenset()
         disabled_tool_names_for_turn = (
             frozenset(disabled_mutation_tool_names)
             | disabled_web_tool_names
@@ -12041,16 +12192,10 @@ async def process_job(
                 # worker-level gate as MCP reads. Executor still owns validation,
                 # provenance, encrypted outbox writes, and terminal write failures.
                 if tc.name == cap_tool_schema.MCP_TOOL_SEARCH_TOOL:
-                    resolve = getattr(mcp_turn, "resolve_tool_schemas", None)
-                    if not callable(resolve):
-                        return ToolResult(
-                            call_id=tc.id,
-                            content="error: no folded MCP tools are available",
-                        )
                     return ToolResult(
                         call_id=tc.id,
                         content=json.dumps(
-                            resolve(tc.args),
+                            _resolve_pressure_tool_schemas(tc.args),
                             ensure_ascii=False,
                             sort_keys=True,
                             separators=(",", ":"),
@@ -12235,8 +12380,8 @@ async def process_job(
                     for tc, result in zip(calls, results)
                 ]
 
-            # Schema omission is the provider-facing control; this runtime gate
-            # independently refuses unresolved MCP calls before any durable
+            # Folding is the provider-facing control; this runtime gate
+            # independently refuses every unresolved call before a durable
             # mutation marker or remote request.
             blocked_by_id: dict[str, ToolResult] = {}
             dispatchable_calls = list(tool_calls)
@@ -12244,14 +12389,20 @@ async def process_job(
                 str(tc.id): ToolResult(
                     call_id=tc.id,
                     content=(
-                        "error: mcp tool schema is not loaded; call "
+                        "error: tool schema is not loaded; call "
                         f'{cap_tool_schema.MCP_TOOL_SEARCH_TOOL} with '
                         f'names=["{tc.name}"] first'
                     ),
                 )
                 for tc in dispatchable_calls
-                if callable(getattr(mcp_turn, "requires_resolution", None))
-                and mcp_turn.requires_resolution(tc.name)
+                if (
+                    tc.name
+                    in platform_schema_recovery.discoverable_specs()
+                    or (
+                        callable(getattr(mcp_turn, "requires_resolution", None))
+                        and mcp_turn.requires_resolution(tc.name)
+                    )
+                )
             }
             if unresolved_by_id:
                 blocked_by_id.update(unresolved_by_id)
@@ -13659,6 +13810,19 @@ async def process_job(
             ),
             extra_tool_specs=offered_mcp_tool_specs,
             refresh_extra_tool_specs=_current_offered_mcp_tool_specs,
+            refresh_pressure_collapsed_extra_tool_specs=(
+                pressure_mcp_specs if callable(pressure_mcp_specs) else None
+            ),
+            refresh_protected_extra_tool_names=(
+                _protected_pressure_tool_names
+            ),
+            extra_tool_recovery_name=cap_tool_schema.MCP_TOOL_SEARCH_TOOL,
+            extra_tool_recovery_active=(
+                _pressure_tool_recovery_needed
+            ),
+            on_extra_tool_surface_plan=(
+                _record_pressure_tool_surface
+            ),
             extra_mutating_tool_names=mcp_mutating_names,
             disabled_tool_names=disabled_tool_names_for_turn,
             outbound_blocking_read_tool_names=_PRIVATE_READ_TOOLS,
@@ -13681,6 +13845,7 @@ async def process_job(
                 PROMPT_ESTIMATOR_UTF8_BYTES_PER_TOKEN
             ),
             prompt_image_reserve_tokens=PROMPT_IMAGE_RESERVE_TOKENS,
+            tool_schema_collapse_policy=TOOL_SCHEMA_COLLAPSE_POLICY,
             on_tail_window=_tail_window_callback(tm),
             on_prompt_frontier_exhaustion=(
                 tm.record_prompt_frontier_exhaustion

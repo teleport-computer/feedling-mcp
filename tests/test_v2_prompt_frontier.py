@@ -11,6 +11,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).parent.parent / "backend"))
 
 from model_api_runtime.v2 import prompt_frontier as frontier
 from model_api_runtime.v2 import tool_loop
+from model_api_runtime.v2 import tool_surface
 import provider_client
 from capabilities import tool_schema
 from provider_types import ToolCall, ToolExchange, ToolResult, ToolSpec
@@ -27,7 +28,7 @@ def _model_limit(context_window_tokens: int = 2_048) -> frontier.ModelPromptLimi
 
 
 _REAL_TOOL_COUNT = 69
-_REAL_TOOL_CATALOG_BYTES = 34_148
+_REAL_TOOL_CATALOG_BYTES = 34_160
 
 
 def _real_sized_mixed_tool_catalog() -> tuple[list[ToolSpec], list[ToolSpec]]:
@@ -35,12 +36,13 @@ def _real_sized_mixed_tool_catalog() -> tuple[list[ToolSpec], list[ToolSpec]]:
 
     The fixture is derived from the real platform catalog rather than copying a
     toy schema list. ASCII description padding makes the combined canonical
-    payload exactly 34,148 bytes while keeping 69 independently named tools.
+    payload exactly 34,160 bytes while keeping 69 independently named tools.
     The 2026-08-17 increase records the real `stay_silent` wake schema: it adds
     341 bytes by itself and 267 bytes net when replacing one synthetic MCP tool
     in this fixed-count mixed catalog.
     The 2026-08-18 increase records the visual-by-default `photo_read` contract,
     which adds 171 bytes while preserving the captured MCP description padding.
+    The T143 increase records schema-search coverage for folded platform tools.
     """
     platform = list(tool_schema.build_tool_specs())
     mcp_count = _REAL_TOOL_COUNT - len(platform)
@@ -779,44 +781,57 @@ def test_historical_tool_schema_is_required_when_optional_catalog_does_not_fit()
     )
 
     assert "required_tool_schemas" in plan.included_components
-    assert plan.included_tool_names == ("memory_index",)
+    assert plan.included_tool_names == ("memory_index", "large_optional")
     assert plan.offered_tool_names == ("memory_index", "large_optional")
+    assert plan.pressure_collapsed_tool_names == ("large_optional",)
 
 
-def test_budget_pressure_keeps_mcp_memory_and_reply_floor_before_tail():
+def test_budget_pressure_keeps_complete_directory_and_folds_only_non_resident():
     messages = [{"role": "user", "content": "use my connected service"}]
     floor_tools = [
-        ToolSpec("memory_index", "browse memory", {"type": "object"}),
-        ToolSpec("memory_write", "write memory", {"type": "object"}),
-        ToolSpec("reply", "reply now", {"type": "object"}),
-        ToolSpec("mcp__calendar__events", "calendar", {"type": "object"}),
+        ToolSpec(name, f"resident {name}", {"type": "object"})
+        for name in sorted(frontier._CORE_TOOL_FLOOR_NAMES)
     ]
     tail_tools = [
         ToolSpec(
             f"optional_tail_{index}",
-            "non-core capability " * 20,
-            {"type": "object", "properties": {}},
+            "non-core capability " * 30,
+            {
+                "type": "object",
+                "properties": {
+                    f"argument_{field}": {"type": "string"}
+                    for field in range(8)
+                },
+            },
         )
-        for index in range(40)
+        for index in range(24)
     ]
     tools = [*tail_tools, *floor_tools]
     message_cost = frontier.messages_component(
         messages, name="message_context"
     ).estimated_tokens
-    floor_cost = frontier.tool_schemas_component(floor_tools).estimated_tokens
+    collapsed_tools = [
+        tool_surface.collapsed_tool_spec(tool)
+        if tool.name not in frontier._CORE_TOOL_FLOOR_NAMES
+        else tool
+        for tool in tools
+    ]
+    collapsed_cost = frontier.tool_schemas_component(
+        collapsed_tools
+    ).estimated_tokens
     full_cost = frontier.tool_schemas_component(tools).estimated_tokens
     output_reserve = 128
     safety_margin = 128
     context_window = max(
         frontier.MIN_CONTEXT_WINDOW_TOKENS,
-        message_cost + floor_cost + output_reserve + safety_margin + 128,
+        message_cost + collapsed_cost + output_reserve + safety_margin + 128,
     )
     budget = frontier.build_prompt_budget(
         context_window,
         output_reserve_tokens=output_reserve,
         safety_margin_tokens=safety_margin,
     )
-    assert message_cost + floor_cost <= budget.input_budget_tokens
+    assert message_cost + collapsed_cost <= budget.input_budget_tokens
     assert message_cost + full_cost > budget.input_budget_tokens, (
         "fixture did not cross the complete-catalog budget gate"
     )
@@ -825,13 +840,206 @@ def test_budget_pressure_keeps_mcp_memory_and_reply_floor_before_tail():
         model_limit=_model_limit(context_window),
         messages=messages,
         tools=tools,
+        recovery_tool_name="mcp_tool_search",
+        recovery_tool_active=False,
+        tool_schema_collapse_policy=(
+            tool_surface.COLLAPSE_POLICY_UNDER_PRESSURE
+        ),
         output_reserve_tokens=output_reserve,
         safety_margin_tokens=safety_margin,
     )
 
-    included = set(plan.included_tool_names)
-    assert {tool.name for tool in floor_tools}.issubset(included)
-    assert len(plan.included_tool_names) < len(plan.offered_tool_names)
+    assert plan.included_tool_names == plan.offered_tool_names
+    assert set(plan.pressure_collapsed_tool_names) == {
+        tool.name for tool in tail_tools
+    }
+    assert not (
+        set(plan.pressure_collapsed_tool_names)
+        & frontier._CORE_TOOL_FLOOR_NAMES
+    )
+    assert plan == frontier.plan_provider_round(
+        model_limit=_model_limit(context_window),
+        messages=messages,
+        tools=tools,
+        recovery_tool_name="mcp_tool_search",
+        recovery_tool_active=False,
+        tool_schema_collapse_policy=(
+            tool_surface.COLLAPSE_POLICY_UNDER_PRESSURE
+        ),
+        output_reserve_tokens=output_reserve,
+        safety_margin_tokens=safety_margin,
+    )
+
+
+def test_pressure_keeps_explicitly_resolved_schema_full():
+    messages = [{"role": "user", "content": "use the resolved tool"}]
+    floor = ToolSpec("reply", "reply", {"type": "object"})
+    resolved = ToolSpec(
+        "mcp__calendar__events",
+        "calendar events " * 20,
+        {
+            "type": "object",
+            "properties": {
+                f"field_{index}": {"type": "string"}
+                for index in range(20)
+            },
+        },
+    )
+    pressure_tail = ToolSpec(
+        "large_optional",
+        "optional " * 2_000,
+        {"type": "object", "properties": {"query": {"type": "string"}}},
+    )
+    tools = [floor, resolved, pressure_tail]
+    degraded = [floor, resolved, tool_surface.collapsed_tool_spec(pressure_tail)]
+    message_cost = frontier.messages_component(
+        messages, name="message_context"
+    ).estimated_tokens
+    degraded_cost = frontier.tool_schemas_component(degraded).estimated_tokens
+    output_reserve = 128
+    safety_margin = 128
+    context_window = max(
+        frontier.MIN_CONTEXT_WINDOW_TOKENS,
+        message_cost + degraded_cost + output_reserve + safety_margin + 64,
+    )
+
+    plan = frontier.plan_provider_round(
+        model_limit=_model_limit(context_window),
+        messages=messages,
+        tools=tools,
+        protected_tool_names={resolved.name},
+        output_reserve_tokens=output_reserve,
+        safety_margin_tokens=safety_margin,
+    )
+
+    assert plan.included_tool_names == tuple(tool.name for tool in tools)
+    assert plan.pressure_collapsed_tool_names == (pressure_tail.name,)
+
+
+def test_required_resident_floor_exhaustion_fails_loud_without_trimming():
+    resident_tools = [
+        ToolSpec(
+            name,
+            ("oversized resident manual " * 1_000 if name == "reply" else name),
+            {"type": "object"},
+        )
+        for name in sorted(frontier._CORE_TOOL_FLOOR_NAMES)
+    ]
+
+    with pytest.raises(frontier.PromptFrontierExhausted) as caught:
+        frontier.plan_provider_round(
+            model_limit=_model_limit(4_096),
+            messages=[{"role": "user", "content": "hello"}],
+            tools=resident_tools,
+            output_reserve_tokens=128,
+            safety_margin_tokens=128,
+        )
+
+    assert caught.value.required_components == (
+        "message_context",
+        "required_tool_schemas",
+    )
+
+
+def test_pressure_folded_platform_schema_search_becomes_protected():
+    spec = ToolSpec(
+        "workspace_read",
+        "Read a workspace file",
+        {
+            "type": "object",
+            "properties": {"path": {"type": "string"}},
+            "required": ["path"],
+        },
+    )
+    state = tool_surface.SchemaRecoveryState({spec.name: spec})
+    state.set_pressure_collapsed([spec.name])
+    selection = tool_surface.select_schema_names(
+        {"query": "workspace file"},
+        state.discoverable_specs(),
+        max_results=8,
+    )
+
+    assert selection == {"selected": [spec.name], "not_found": []}
+    assert state.resolve(selection["selected"]) == [spec.name]
+    assert state.protected_names() == {spec.name}
+    assert not state.recovery_needed()
+
+
+def test_under_pressure_policy_keeps_full_fit_and_leaves_search_latent():
+    tools = [
+        ToolSpec("reply", "reply", {"type": "object"}),
+        ToolSpec(
+            "workspace_read",
+            "read a file",
+            {
+                "type": "object",
+                "properties": {"path": {"type": "string"}},
+                "required": ["path"],
+            },
+        ),
+        ToolSpec("mcp_tool_search", "load schemas", {"type": "object"}),
+    ]
+
+    plan = frontier.plan_provider_round(
+        model_limit=_model_limit(8_192),
+        messages=[{"role": "user", "content": "hello"}],
+        tools=tools,
+        recovery_tool_name="mcp_tool_search",
+        recovery_tool_active=False,
+        tool_schema_collapse_policy=(
+            tool_surface.COLLAPSE_POLICY_UNDER_PRESSURE
+        ),
+        output_reserve_tokens=128,
+        safety_margin_tokens=128,
+    )
+
+    assert plan.included_tool_names == ("reply", "workspace_read")
+    assert plan.pressure_collapsed_tool_names == ()
+    assert not plan.schema_recovery_needed
+
+
+def test_runtime_v2_catalog_has_twelve_resident_and_twenty_four_foldable_tools():
+    specs = tool_schema.build_tool_specs()
+    resident = [
+        spec for spec in specs
+        if spec.name in frontier._CORE_TOOL_FLOOR_NAMES
+    ]
+    foldable = [
+        spec for spec in specs
+        if spec.name not in frontier._CORE_TOOL_FLOOR_NAMES
+    ]
+
+    assert len(resident) == 12
+    assert len(foldable) == 24
+    assert all(
+        len(tool_surface.collapsed_tool_spec(spec).description)
+        <= tool_surface.MAX_COLLAPSED_DESCRIPTION_CHARS
+        for spec in foldable
+    )
+
+    plan = frontier.plan_provider_round(
+        model_limit=_model_limit(128_000),
+        messages=[{"role": "user", "content": "hello"}],
+        tools=specs,
+        recovery_tool_name="mcp_tool_search",
+        output_reserve_tokens=128,
+        safety_margin_tokens=128,
+    )
+    assert plan.included_tool_names == tuple(spec.name for spec in specs)
+    assert set(plan.pressure_collapsed_tool_names) == {
+        spec.name for spec in foldable
+    }
+    assert "mcp_tool_search" in plan.included_tool_names
+    assert plan.schema_recovery_needed
+
+
+def test_tool_schema_collapse_policy_is_explicit_and_validated():
+    assert tool_surface.DEFAULT_COLLAPSE_POLICY == "always"
+    assert tool_surface.normalize_collapse_policy("under_pressure") == (
+        "under_pressure"
+    )
+    with pytest.raises(ValueError, match="always or under_pressure"):
+        tool_surface.normalize_collapse_policy("sometimes")
 
 
 def test_historical_tool_schema_fails_closed_when_required_frontier_is_exhausted():
@@ -1080,7 +1288,10 @@ def test_late_input_is_in_required_frontier_before_first_provider_call(monkeypat
         )
 
     assert calls == []
-    assert caught.value.required_components == ("message_context",)
+    assert caught.value.required_components == (
+        "message_context",
+        "required_tool_schemas",
+    )
 
 
 def test_fourteen_mcp_catalog_pressure_reaches_provider_with_memory_floor(
@@ -1152,20 +1363,22 @@ def test_fourteen_mcp_catalog_pressure_reaches_provider_with_memory_floor(
         "reply",
     }.issubset(sent_names)
     assert {tool.name for tool in mcp_tools}.issubset(sent_names)
-    assert "large_read" not in sent_names
-    assert len(sent_names) < len(tool_loop._catalog()) + len(mcp_tools) + 1
+    assert "large_read" in sent_names
+    sent_by_name = {spec.name: spec for spec in calls[0][1]}
+    assert sent_by_name["large_read"].parameters["properties"] == {}
+    assert len(sent_by_name["large_read"].description) <= (
+        tool_surface.MAX_COLLAPSED_DESCRIPTION_CHARS
+    )
     assert len(surfaces) == 1
     surface = surfaces[0]
     assert surface["round"] == 1
     assert surface["sent_tool_count"] == len(sent_names)
-    assert surface["candidate_tool_count"] > surface["sent_tool_count"]
-    assert surface["dropped_tool_count"] == (
-        surface["candidate_tool_count"] - surface["sent_tool_count"]
-    )
+    assert surface["candidate_tool_count"] == surface["sent_tool_count"]
+    assert surface["dropped_tool_count"] == 0
     assert surface["mcp_candidate_tool_count"] == 15
-    assert surface["mcp_sent_tool_count"] == 14
-    assert surface["mcp_dropped_tool_count"] == 1
-    assert surface["reason"] == "frontier_omitted"
+    assert surface["mcp_sent_tool_count"] == 15
+    assert surface["mcp_dropped_tool_count"] == 0
+    assert surface["reason"] == "frontier_collapsed"
     assert calls[0][0] == [{"role": "system", "content": "stable prefix"}]
 
 
@@ -1378,7 +1591,9 @@ def test_provider_round_carries_closed_component_bytes_on_success_and_exhaustion
         ("tail", 123),
         (
             "tools",
-            frontier.prompt_structure_utf8_bytes([tool]),
+            frontier.prompt_structure_utf8_bytes([
+                tool_surface.collapsed_tool_spec(tool)
+            ]),
         ),
     ]
     assert plan.utf8_bytes_per_token == 1.0
@@ -1399,9 +1614,15 @@ def test_provider_round_carries_closed_component_bytes_on_success_and_exhaustion
     assert error.output_reserve_tokens == 512
     assert error.safety_margin_tokens == 512
     assert error.utf8_bytes_per_token == 1.0
-    # Optional schemas are not blamed for a required-message failure.
+    # The default folded directory is required and reported without content.
     assert [(item.name, item.bytes) for item in error.component_bytes] == [
         ("system", 1_500),
+        (
+            "tools",
+            frontier.prompt_structure_utf8_bytes([
+                tool_surface.collapsed_tool_spec(tool)
+            ]),
+        ),
     ]
 
 

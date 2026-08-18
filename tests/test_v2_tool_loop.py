@@ -111,6 +111,11 @@ class _AdaptiveBuildMessages(_RecordingBuildMessages):
         transcript,
         tools,
         required_tool_names,
+        protected_tool_names,
+        collapsed_tool_specs,
+        recovery_tool_name,
+        recovery_tool_active,
+        tool_schema_collapse_policy,
         model_limit,
         output_reserve_tokens,
         safety_margin_tokens,
@@ -126,6 +131,11 @@ class _AdaptiveBuildMessages(_RecordingBuildMessages):
             messages=messages,
             tools=tools,
             required_tool_names=required_tool_names,
+            protected_tool_names=protected_tool_names,
+            collapsed_tool_specs=collapsed_tool_specs,
+            recovery_tool_name=recovery_tool_name,
+            recovery_tool_active=recovery_tool_active,
+            tool_schema_collapse_policy=tool_schema_collapse_policy,
             output_reserve_tokens=output_reserve_tokens,
             safety_margin_tokens=safety_margin_tokens,
             utf8_bytes_per_token=utf8_bytes_per_token,
@@ -2083,6 +2093,8 @@ def test_file_recovery_tool_choice_dispatches_by_provider_capability(
         add_usage=_noop_add_usage,
         max_calls=5,
         on_provider_tool_surface=record_surface,
+        extra_tool_recovery_name="mcp_tool_search",
+        tool_schema_collapse_policy="always",
     ))
 
     assert [tc.name for tc in dispatched] == ["workspace_write"]
@@ -2094,7 +2106,14 @@ def test_file_recovery_tool_choice_dispatches_by_provider_capability(
         assert provider.calls[1]["tool_choice"] == expected_choice
     else:
         assert "tool_choice" not in provider.calls[1]
-    assert [spec.name for spec in provider.calls[1]["tools"]] == ["workspace_write"]
+    assert {spec.name for spec in provider.calls[1]["tools"]} == {
+        "workspace_write",
+        "mcp_tool_search",
+    }
+    assert next(
+        spec for spec in provider.calls[1]["tools"]
+        if spec.name == "workspace_write"
+    ).parameters["required"] == ["path", "content", "expected_revision"]
     if supports_named_choice:
         assert provider.calls[2]["tool_choice"] == {
             "type": "function",
@@ -2102,7 +2121,10 @@ def test_file_recovery_tool_choice_dispatches_by_provider_capability(
         }
     else:
         assert "tool_choice" not in provider.calls[2]
-    assert [spec.name for spec in provider.calls[2]["tools"]] == ["send_file"]
+    assert {spec.name for spec in provider.calls[2]["tools"]} == {
+        "send_file",
+        "mcp_tool_search",
+    }
     assert files == [("/workspace/summary.md", 1)]
     assert outcome.final_text == "文档已生成。"
     assert [item["reason"] for item in surfaces[:3]] == [
