@@ -31,7 +31,9 @@ ROLE_CORRECTION = "correction"
 RESIDENT_POLICY = Chain(stages=(
     RoleStage(ROLE_TURNING_POINT, limit=3, order_by="occurred_at"),
     RecentStage(limit=2, order_by="created_at"),
-    RelevanceStage(limit=3),
+    # any_score=True 复刻 resident 原有判据：「score > 0 就要」，不卡 confidence。
+    # 陪伴场景宁可多带一张弱相关的，也不要该想起来的想不起来。
+    RelevanceStage(limit=3, any_score=True),
 ))
 
 #: model_api 那套：纠正优先（用户明确纠正过的事不能再记错），其余全给相关性。

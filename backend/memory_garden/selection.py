@@ -179,6 +179,13 @@ class RelevanceStage:
     medium_min: float = 0.0
     #: 这些理由不算数（例如泛词碰巧撞上）
     excluded_reasons: tuple[str, ...] = ()
+    #: True 时**只看分数**，不要求 confidence 达到 strong/medium。
+    #:
+    #: io 的 resident 那套原本就是「score > 0 就要」—— 宽松是有意的：
+    #: 陪伴场景宁可多带一张弱相关的，也不要该想起来的想不起来。
+    #: 2026-08-17 实测踩到：不给这个开关，弱相关卡全被滤掉，
+    #: 同一个用户问「我的狗是什么品种」也召不回狗卡。
+    any_score: bool = False
 
     def pick(self, remaining, query, *, budget) -> list[Pick]:
         from .scoring.relevance import memory_relevance_details
@@ -191,7 +198,10 @@ class RelevanceStage:
             reason = str(rel.get("reason") or "")
             if reason in self.excluded_reasons:
                 continue
-            if conf == "strong" and score >= self.strong_min:
+            if self.any_score:
+                if score <= 0:
+                    continue
+            elif conf == "strong" and score >= self.strong_min:
                 pass
             elif conf == "medium" and score >= self.medium_min:
                 pass
