@@ -753,6 +753,37 @@ COMPONENT_SCHEMAS: dict[str, dict[str, Any]] = {
         "additionalProperties": True,
         "example": {"error": "invalid_payload", "detail": "The request body is invalid", "request_id": "req_abc123"},
     },
+    "ChatBootstrapIncompleteResponse": {
+        "type": "object",
+        "required": ["error", "stage", "retryable"],
+        "properties": {
+            "error": {"type": "string", "const": "bootstrap_incomplete"},
+            "stage": {
+                "type": "string",
+                "enum": [
+                    "needs_resident_consumer",
+                    "needs_decrypt_source",
+                    "needs_live_connection",
+                ],
+            },
+            "retryable": {
+                "type": "boolean",
+                "description": (
+                    "True only when the current resident response may be retried "
+                    "without repeating onboarding. Missing is false for compatibility "
+                    "with older servers."
+                ),
+            },
+        },
+        "allOf": [
+            {
+                "if": {"properties": {"stage": {"const": "needs_resident_consumer"}}},
+                "then": {"properties": {"retryable": {"const": True}}},
+                "else": {"properties": {"retryable": {"const": False}}},
+            },
+        ],
+        "additionalProperties": True,
+    },
     "EncryptedEnvelope": {
         "type": "object",
         "required": ["visibility", "owner_user_id"],
@@ -2323,7 +2354,7 @@ OPERATION_DESCRIPTIONS: dict[Operation, str] = {
     ("get", "/v1/onboarding/validate"): "Return ordered onboarding checks. Resident routes include a decrypt_source step between resident_consumer and live_loop, with status, checked_at_epoch, reason, policy, and remediation fields.",
     ("get", "/v1/chat/poll"): "Long-poll and optionally claim resident chat work. Official residents report their running commit and may report an intentionally skipped compatible backend target with X-Feedling-Consumer-Compat-Commit. They also report decrypt-source status and its confirmation time on every poll heartbeat with X-Feedling-Decrypt-Status and X-Feedling-Decrypt-Checked-At.",
     ("post", "/v1/chat/message"): "Store a user chat message as a v1 ciphertext envelope; the server never decrypts it. If the envelope carries a content_pk_fpr label that does not match the user's currently registered content key, the write is rejected with 409 content_pk_fpr_mismatch (re-fetch whoami and re-seal); unlabeled envelopes are accepted for compatibility.",
-    ("post", "/v1/chat/response"): "Store an agent reply as a v1 ciphertext envelope plus optional thinking and encrypted file/image followups. A text primary and its attachment rows commit as one ordered transaction; generated images are returned as native content_type=image Chat messages. Replies carrying reply_to_message_id are finalized atomically across backend workers: exactly one request inserts the reply and marks the parent answered, while a losing contender returns 409 already_answered without storing its reply. A hidden source=verify_ping reply is accepted only when reply_to_message_id identifies an outstanding verify ping exactly. role=system notices bypass reply exclusivity. Labeled envelopes sealed to a key that is no longer the user's registered content key are rejected with 409 content_pk_fpr_mismatch — the writer should re-fetch whoami, re-seal, and retry once.",
+    ("post", "/v1/chat/response"): "Store an agent reply as a v1 ciphertext envelope plus optional thinking and encrypted file/image followups. A text primary and its attachment rows commit as one ordered transaction; generated images are returned as native content_type=image Chat messages. Replies carrying reply_to_message_id are finalized atomically across backend workers: exactly one request inserts the reply and marks the parent answered, while a losing contender returns 409 already_answered without storing its reply. A hidden source=verify_ping reply is accepted only when reply_to_message_id identifies an outstanding verify ping exactly. role=system notices bypass reply exclusivity. A bootstrap_incomplete 409 always includes retryable: needs_resident_consumer is true so an official identity that previously polled may retry the same reply with bounded backoff; other stages are false, and a missing field from an old server must be treated as false. Labeled envelopes sealed to a key that is no longer the user's registered content key are rejected with 409 content_pk_fpr_mismatch — the writer should re-fetch whoami, re-seal, and retry once.",
     ("post", "/v1/chat/verify_loop"): "Insert a hidden liveness ping and wait for its exact hidden reply (source=verify_ping and reply_to_message_id equal to this ping). loop_alive reports whether the reply arrived; passing additionally requires resident decrypt health to satisfy the onboarding policy before sticky live-loop verification is recorded.",
     ("post", "/v1/model_api/chat/send"): "Queue an asynchronous hosted-agent turn. A successful response is always 202 and never contains a plaintext assistant reply.",
     ("post", "/v1/model_api/setup"): (
@@ -2466,6 +2497,26 @@ OPERATION_DESCRIPTIONS: dict[Operation, str] = {
 
 
 RESPONSE_OVERRIDES: dict[Operation, dict[str, Any]] = {
+    ("post", "/v1/chat/response"): {
+        "409": {
+            "description": (
+                "The reply conflicted with an existing answer/key, or Chat bootstrap "
+                "is incomplete. bootstrap_incomplete responses include a required "
+                "retryable boolean; clients must treat a missing field from an older "
+                "server as false."
+            ),
+            "content": {
+                "application/json": {
+                    "schema": {
+                        "anyOf": [
+                            {"$ref": "#/components/schemas/ChatBootstrapIncompleteResponse"},
+                            {"$ref": "#/components/schemas/ErrorResponse"},
+                        ]
+                    }
+                }
+            },
+        },
+    },
     ("get", "/v1/dream/status"): {
         "200": {
             "description": "Current Dream and Capture banner status.",

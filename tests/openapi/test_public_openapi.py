@@ -372,6 +372,15 @@ def test_chat_memory_and_perception_contracts_are_concrete(
 
     response_sources = schemas["ChatResponseRequest"]["properties"]["source"]["enum"]
     assert "resident_maintenance" in response_sources
+    bootstrap_error = schemas["ChatBootstrapIncompleteResponse"]
+    assert set(bootstrap_error["required"]) == {"error", "stage", "retryable"}
+    assert bootstrap_error["properties"]["retryable"]["type"] == "boolean"
+    response_409 = operations[("post", "/v1/chat/response")]["responses"]["409"]
+    response_409_schema = response_409["content"]["application/json"]["schema"]
+    assert {item["$ref"] for item in response_409_schema["anyOf"]} == {
+        "#/components/schemas/ChatBootstrapIncompleteResponse",
+        "#/components/schemas/ErrorResponse",
+    }
 
     poll_query = _parameters(operations[("get", "/v1/chat/poll")], "query")
     assert set(poll_query) == {"since", "timeout", "consumer_id", "claim"}

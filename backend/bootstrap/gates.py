@@ -135,7 +135,11 @@ def _reply_is_for_pending_verify_ping(
     return target in pending_ids if target else bool(pending_ids)
 
 
-def _gate_bootstrap_for_chat(store, allow_verify_reply: bool = False):
+def _gate_bootstrap_for_chat(
+    store,
+    allow_verify_reply: bool = False,
+    consumer_info: dict | None = None,
+):
     """Refuse /v1/chat/response when bootstrap is incomplete.
 
     Returns a (response, status) tuple to be returned by the caller, or None
@@ -157,7 +161,15 @@ def _gate_bootstrap_for_chat(store, allow_verify_reply: bool = False):
         # written at main_loop, so let host accounts through.
         if accounts_onboarding._load_onboarding_route(store) == "model_api":
             return None
-        consumer_state = chat_consumer._consumer_validation_state(store)
+        if consumer_info:
+            consumer_state = chat_consumer._consumer_validation_state(
+                store,
+                response_info=consumer_info,
+            )
+        else:
+            # Preserve the established call shape for internal callers and
+            # test doubles that are not evaluating a concrete response request.
+            consumer_state = chat_consumer._consumer_validation_state(store)
         if not consumer_state["passing"]:
             print(
                 f"[gate:{store.user_id}] chat_response blocked stage=needs_resident_consumer "
@@ -166,6 +178,7 @@ def _gate_bootstrap_for_chat(store, allow_verify_reply: bool = False):
             return ({
                 "error": "bootstrap_incomplete",
                 "stage": "needs_resident_consumer",
+                "retryable": True,
                 "memory_count": state["memory_count"],
                 "memory_floor": state["memory_floor"],
                 "identity_written": state["identity_written"],
@@ -188,6 +201,7 @@ def _gate_bootstrap_for_chat(store, allow_verify_reply: bool = False):
             return ({
                 "error": "bootstrap_incomplete",
                 "stage": "needs_decrypt_source",
+                "retryable": False,
                 "memory_count": state["memory_count"],
                 "memory_floor": state["memory_floor"],
                 "identity_written": state["identity_written"],
@@ -207,6 +221,7 @@ def _gate_bootstrap_for_chat(store, allow_verify_reply: bool = False):
             return ({
                 "error": "bootstrap_incomplete",
                 "stage": "needs_live_connection",
+                "retryable": False,
                 "memory_count": state["memory_count"],
                 "memory_floor": state["memory_floor"],
                 "identity_written": state["identity_written"],

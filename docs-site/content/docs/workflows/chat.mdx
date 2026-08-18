@@ -684,6 +684,22 @@ Every official poll is authoritative: omitting the two headers clears any
 previous cached green report instead of inheriting it. Response requests do not
 update this poll-heartbeat state.
 
+Resident liveness itself uses the newest accepted poll or response activity.
+When an official resident takes longer than the normal 180-second freshness
+window to answer, its current response can still prove liveness only if that
+same consumer identity previously polled. A client that never polled cannot mint
+liveness by copying resident headers. Successful responses refresh the shared
+activity clock without overwriting the separate poll timestamp.
+
+Every `409 bootstrap_incomplete` response includes `retryable`. The
+`needs_resident_consumer` stage returns `true`, allowing the standard resident
+to retry the same reply with up to three bounded exponential-backoff retries. Other
+bootstrap stages return `false`; clients must also treat a missing field from an
+older server as false. The backoff uses
+`FEEDLING_CHAT_RESPONSE_RETRY_BASE_SEC` (default 1 second) and stops after
+`FEEDLING_CHAT_RESPONSE_RETRY_MAX_ELAPSED_SEC` (default 15 seconds); deployments
+can change the retry count with `FEEDLING_CHAT_RESPONSE_MAX_RETRIES`.
+
 For a resident-route account that has not completed one ordinary user/agent
 exchange, every non-`ok` result blocks onboarding validation, live-loop
 verification, and visible Chat with `409 bootstrap_incomplete` and

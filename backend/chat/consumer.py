@@ -229,6 +229,13 @@ def _record_consumer_event(store: UserStore, event_type: str, *, info: dict | No
         state["last_event"] = event_type
         state["last_seen_at"] = now_iso
         state["last_seen_epoch"] = now_epoch
+        if event_type in {"poll", "response"}:
+            # Poll and accepted reply submission are both authenticated proof
+            # that the resident process is alive. Keep their individual clocks
+            # for diagnostics, plus one semantic clock for the liveness gate.
+            state["last_activity_at"] = now_iso
+            state["last_activity_epoch"] = now_epoch
+            state["last_activity_type"] = event_type
         if event_type == "poll":
             state["last_poll_at"] = now_iso
             state["last_poll_epoch"] = now_epoch
@@ -499,17 +506,26 @@ def _consumer_validation_state(
     store: UserStore,
     *,
     now_epoch: float | None = None,
+    response_info: dict | None = None,
 ) -> dict:
     with store.consumer_state_lock:
         state = _load_consumer_state(store)
     now = time.time() if now_epoch is None else float(now_epoch)
-    last_poll_epoch = 0.0
-    try:
-        last_poll_epoch = float(state.get("last_poll_epoch") or 0)
-    except Exception:
-        last_poll_epoch = 0.0
-    age_sec = now - last_poll_epoch if last_poll_epoch > 0 else None
-    official = bool(state.get("official"))
+    last_poll_epoch = _safe_epoch(state.get("last_poll_epoch"))
+    last_response_epoch = _safe_epoch(state.get("last_response_epoch"))
+    last_activity_epoch = max(
+        _safe_epoch(state.get("last_activity_epoch")),
+        last_poll_epoch,
+        last_response_epoch,
+    )
+    current_response_activity = _response_matches_prior_poll(state, response_info)
+    if current_response_activity:
+        # Do not persist an attempt before the reply itself validates and
+        # commits. For this gate evaluation only, a response from an official
+        # identity that has previously polled is current liveness evidence.
+        last_activity_epoch = now
+    age_sec = now - last_activity_epoch if last_activity_epoch > 0 else None
+    official = bool(state.get("official")) or current_response_activity
     recent = age_sec is not None and age_sec <= _CONSUMER_RECENT_SEC
     passing = official and recent
     return {
@@ -533,6 +549,12 @@ def _consumer_validation_state(
         "update_stall_reason": state.get("update_stall_reason", ""),
         "last_poll_at": state.get("last_poll_at", ""),
         "last_response_at": state.get("last_response_at", ""),
+        "last_activity_at": state.get("last_activity_at", ""),
+        "last_activity_epoch": last_activity_epoch,
+        "last_activity_type": (
+            "response" if current_response_activity
+            else state.get("last_activity_type", "")
+        ),
         "age_sec": age_sec,
         "recent_window_sec": _CONSUMER_RECENT_SEC,
         "decrypt_health": _decrypt_health_from_state(state, now_epoch=now),
@@ -543,6 +565,45 @@ def _consumer_validation_state(
             "X-Feedling-Consumer headers."
         ),
     }
+
+
+def _response_matches_prior_poll(state: dict, response_info: dict | None) -> bool:
+    """Whether this response comes from an official identity seen polling.
+
+    A current response may refresh the liveness decision even when its original
+    claim took longer than the 180-second freshness window. Requiring a prior
+    poll by the same identity prevents arbitrary authenticated requests from
+    minting resident liveness merely by copying the public consumer name.
+    """
+    if not isinstance(response_info, dict) or not response_info.get("official"):
+        return False
+    if _safe_epoch(state.get("last_poll_epoch")) <= 0:
+        return False
+
+    consumer_id = str(response_info.get("consumer_id") or "").strip()
+    consumer_name = str(response_info.get("consumer_name") or "").strip()
+    raw_pollers = state.get("poll_consumers")
+    pollers = raw_pollers if isinstance(raw_pollers, dict) else {}
+    if consumer_id:
+        prior = pollers.get(consumer_id)
+        if (
+            isinstance(prior, dict)
+            and _safe_epoch(prior.get("last_poll_epoch")) > 0
+            and str(prior.get("consumer_name") or "").strip()
+            == _OFFICIAL_CONSUMER_NAME
+        ):
+            return True
+        # Legacy states predate poll_consumers but still have one authoritative
+        # top-level poll identity.
+        return (
+            str(state.get("consumer_id") or "").strip() == consumer_id
+            and bool(state.get("official"))
+        )
+    return (
+        bool(consumer_name)
+        and bool(state.get("official"))
+        and str(state.get("consumer_name") or "").strip() == consumer_name
+    )
 
 
 def consumer_supports_capability(
