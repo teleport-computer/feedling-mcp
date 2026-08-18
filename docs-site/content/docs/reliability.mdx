@@ -15,7 +15,7 @@ resource.
 | Endpoint family | Parameters | Ordering and continuation |
 | --- | --- | --- |
 | `GET /v1/chat/history` | `limit` 1–200; preferred `after_seq` / `before_seq`; legacy `since` / `before` Unix seconds | No cursor returns the latest page. Sequence cursors are exact even when messages share a timestamp. Use `oldest_seq`, `latest_seq`, `has_more_older`, and `has_more_newer`. |
-| `GET /v1/memory/list` | `limit` up to 200, `since` ISO-8601 | Newest parsed `occurred_at` instant first. Equivalent `Z`, offset, and legacy naive values compare consistently; invalid card timestamps sort last and are excluded by a valid `since`. De-duplicate by memory ID at page boundaries. `total` is the filtered count before slicing. |
+| `GET /v1/memory/list` | `limit` 1–500 (default 50), opaque `cursor`, `since` ISO-8601 | Newest parsed `occurred_at` instant first, with memory ID as the stable tie-break. Equivalent `Z`, offset, and legacy naive values compare consistently; invalid card timestamps sort last and are excluded by a valid `since`. Follow `next_cursor` until it is `null`. `total` is the filtered full count and does not change across pages or page sizes. |
 | `GET /v1/perception/photos` and `/items/{kind}` | `limit` 1–200, default 20 | Returns the most recent items. These endpoints do not currently return a continuation cursor. |
 | Event and receipt streams | Usually `since` plus `limit` | `since` is endpoint-specific; inspect the operation contract before assuming Unix time or ISO-8601. |
 
@@ -31,6 +31,13 @@ been processed. Request `after_seq=<latest_seq>` and continue while
 `has_more_newer` is true. IDs remain the final de-duplication key. Timestamp
 cursors stay available for older clients, but cannot distinguish messages that
 share a timestamp and therefore are not the lossless contract.
+
+For Memory Garden synchronization, omit `cursor` on the first request and pass
+each non-null `next_cursor` unchanged to the next request. The token includes the
+timestamp-validity class, parsed occurrence time, and memory ID, so records that
+share a timestamp are not skipped at a page boundary. A malformed or stale token
+returns `400`; restart from the first page instead of treating that response as
+an empty or complete Garden.
 
 ## Rate limits and capacity responses
 

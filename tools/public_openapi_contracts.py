@@ -201,7 +201,8 @@ OPERATION_PARAMETERS: dict[Operation, list[dict[str, Any]]] = {
         _query("since", _schema("string"), "Return changes whose ISO-8601 ts is strictly newer than this value.", example="2026-07-01T00:00:00Z"),
     ],
     ("get", "/v1/memory/list"): [
-        _query("limit", _schema("integer", minimum=1, maximum=200, default=50), "Recommended page size; values above 200 are capped.", example=50),
+        _query("limit", _schema("integer", minimum=1, maximum=500, default=50), "Page size; values above 500 are capped.", example=50),
+        _query("cursor", _schema("string", minLength=1, maxLength=1024), "Opaque continuation token from next_cursor. Omit for the first page.", example="eyJoIjp0cnVlLCJpIjoibWVtXzEyMyIsInQiOiIyMDI2LTA3LTEzVDEyOjMwOjAwKzAwOjAwIiwidiI6MX0"),
         _query("since", _schema("string"), "Return memories whose occurred_at is at or after this ISO-8601 value.", example="2026-07-01T00:00:00Z"),
         _query("include_archived", _schema("boolean", default=False), "Include archived memories.", example=False),
     ],
@@ -655,6 +656,29 @@ COMPONENT_SCHEMAS: dict[str, dict[str, Any]] = {
         "type": "object",
         "description": "JSON response object. Endpoint-specific fields may be added compatibly.",
         "additionalProperties": True,
+    },
+    "MemoryListResponse": {
+        "type": "object",
+        "description": (
+            "One page of raw encrypted Memory Garden records. total is the "
+            "filtered full count and is independent of limit and cursor."
+        ),
+        "required": ["moments", "total", "next_cursor"],
+        "additionalProperties": False,
+        "properties": {
+            "moments": {
+                "type": "array",
+                "items": {"$ref": "#/components/schemas/FreeFormJsonObject"},
+            },
+            "total": {"type": "integer", "minimum": 0},
+            "next_cursor": {
+                "anyOf": [
+                    {"type": "string", "minLength": 1, "maxLength": 1024},
+                    {"type": "null"},
+                ],
+                "description": "Opaque continuation token; null exactly when the filtered result is exhausted.",
+            },
+        },
     },
     "DreamStatusResponse": {
         "type": "object",
@@ -2523,6 +2547,24 @@ RESPONSE_OVERRIDES: dict[Operation, dict[str, Any]] = {
             "content": {
                 "application/json": {
                     "schema": {"$ref": "#/components/schemas/DreamStatusResponse"}
+                }
+            },
+        },
+    },
+    ("get", "/v1/memory/list"): {
+        "200": {
+            "description": "One deterministic page of encrypted memory records.",
+            "content": {
+                "application/json": {
+                    "schema": {"$ref": "#/components/schemas/MemoryListResponse"}
+                }
+            },
+        },
+        "400": {
+            "description": "The limit or opaque cursor is invalid.",
+            "content": {
+                "application/json": {
+                    "schema": {"$ref": "#/components/schemas/ErrorResponse"}
                 }
             },
         },
