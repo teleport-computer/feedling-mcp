@@ -12,8 +12,10 @@ from typing import Any
 
 
 import db
-from core import enclave as core_enclave
 from core import envelope as core_envelope
+from core import enclave as core_enclave  # noqa: F401 — 读侧已改走 core_envelope.read_envelope_body；
+# 这行保留是因为测试 monkeypatch `<module>.core_enclave` 上的
+# _decrypt_envelope_via_enclave（patch 的是共享模块对象，仍然生效）。
 from core.store import UserStore
 
 
@@ -944,13 +946,18 @@ def _existing_import_user_name(store: UserStore, api_key: str | None) -> str:
     """
     try:
         identity = identity_service._load_identity(store)
-        if not isinstance(identity, dict) or not identity.get("body_ct"):
+        if not isinstance(identity, dict):
             return "TA"
-        raw = core_enclave._decrypt_envelope_via_enclave(
-            identity,
-            api_key,
-            purpose="identity_update_merge",
-        )
+        shape = core_envelope.classify_envelope_shape(identity)
+        if shape in ("plaintext_text", "plaintext_binary"):
+            raw = core_envelope.read_plaintext_envelope_body(
+                identity, owner_user_id=store.user_id)
+        else:
+            raw = core_envelope.read_envelope_body(
+                identity,
+                api_key,
+                purpose="identity_update_merge",
+            )
         payload = json.loads(raw.decode("utf-8"))
         if not isinstance(payload, dict):
             return "TA"
@@ -2448,12 +2455,8 @@ def _moment_from_memory_card(store: UserStore, card: dict, envelope: dict) -> di
         "created_at": now,
         "updated_at": now,
         "source": "history_import",
-        "body_ct": envelope["body_ct"],
-        "nonce": envelope["nonce"],
-        "K_user": envelope["K_user"],
-        "enclave_pk_fpr": envelope.get("enclave_pk_fpr", ""),
-        "visibility": envelope["visibility"],
-        "owner_user_id": envelope["owner_user_id"],
+        "enclave_pk_fpr": "",
+        **core_envelope.envelope_storage_fields(envelope),
         "status": "active",
         "importance": max(0.0, min(1.0, float(card.get("importance") or 0.55))),
         "pulse": max(0.0, min(1.0, float(card.get("pulse") or 0.3))),
@@ -2857,12 +2860,8 @@ def _store_identity_payload(
     identity = {
         "v": 1,
         "id": envelope.get("id") or (existing.get("id") if existing else uuid.uuid4().hex),
-        "body_ct": envelope["body_ct"],
-        "nonce": envelope["nonce"],
-        "K_user": envelope["K_user"],
-        "enclave_pk_fpr": envelope.get("enclave_pk_fpr", ""),
-        "visibility": envelope["visibility"],
-        "owner_user_id": envelope["owner_user_id"],
+        "enclave_pk_fpr": "",
+        **core_envelope.envelope_storage_fields(envelope),
         "created_at": existing.get("created_at") if existing else now,
         "updated_at": now,
         "replaced_at": now,
@@ -3022,17 +3021,12 @@ def _onboarding_greeting_msg(store: UserStore, envelope: dict) -> dict:
         "ts": time.time(),
         "source": "model_api",
         "v": envelope.get("v", 1),
-        "body_ct": envelope["body_ct"],
-        "nonce": envelope["nonce"],
-        "K_user": envelope["K_user"],
-        "enclave_pk_fpr": envelope.get("enclave_pk_fpr", ""),
-        "visibility": envelope.get("visibility", "shared"),
-        "owner_user_id": envelope.get("owner_user_id", store.user_id),
+        "enclave_pk_fpr": "",
         "content_type": "text",
         "model_api_kind": "onboarding_greeting",
+        **core_envelope.envelope_storage_fields(
+            envelope, default_owner_user_id=store.user_id),
     }
-    if envelope.get("K_enclave") is not None:
-        msg["K_enclave"] = envelope["K_enclave"]
     return msg
 
 

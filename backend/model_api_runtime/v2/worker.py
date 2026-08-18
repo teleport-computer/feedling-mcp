@@ -1868,11 +1868,15 @@ class _ProviderRoundtripTrace:
     deps: TurnDeps
     user_id: str
     lane: str
+    trace_id: str = ""
     provider_roundtrips: int = 0
     terminal_text_round_reached: bool = False
     terminal_text_round_reason: str = "none"
     force_text_fallback_reason: str = "none"
     empty_response_recovery_used: bool = False
+
+    def __post_init__(self) -> None:
+        self.lane = _normalize_provider_trace_lane(self.lane)
 
     async def __call__(self, detail: dict[str, Any]) -> None:
         try:
@@ -1884,11 +1888,13 @@ class _ProviderRoundtripTrace:
             pass
         if detail.get("terminal_text_round") is True:
             self.terminal_text_round_reached = True
-            self.terminal_text_round_reason = str(
-                detail.get("terminal_text_round_reason") or "none"
+            self.terminal_text_round_reason = _normalize_provider_trace_reason(
+                detail.get("terminal_text_round_reason"),
+                v2_tool_loop._PROVIDER_TERMINAL_TEXT_ROUND_REASONS,
             )
-        fallback_reason = str(
-            detail.get("force_text_fallback_reason") or "none"
+        fallback_reason = _normalize_provider_trace_reason(
+            detail.get("force_text_fallback_reason"),
+            v2_tool_loop._PROVIDER_FORCE_TEXT_FALLBACK_REASONS,
         )
         if fallback_reason != "none":
             self.force_text_fallback_reason = fallback_reason
@@ -1902,6 +1908,7 @@ class _ProviderRoundtripTrace:
             self.deps.emit_debug_trace,
             self.user_id,
             "mcp.surface.provider",
+            trace_id=self.trace_id,
             status=(
                 "warning"
                 if trace_detail["dropped_tool_count"]
@@ -1935,6 +1942,7 @@ class _ProviderRoundtripTrace:
                 self.deps.emit_debug_trace,
                 self.user_id,
                 "mcp.roundtrip.provider",
+                trace_id=self.trace_id,
                 status=(
                     "warning"
                     if self.terminal_text_round_reason == "max_calls"
@@ -1962,24 +1970,38 @@ def _provider_tool_surface_callback(
     deps: TurnDeps,
     user_id: str,
     lane: str,
+    trace_id: str = "",
 ):
     """Build a best-effort content-free trace sink for one runtime lane."""
 
     if deps.emit_debug_trace is None:
         return None
-    return _ProviderRoundtripTrace(deps, user_id, lane)
+    return _ProviderRoundtripTrace(deps, user_id, lane, str(trace_id or ""))
+
+
+def _normalize_provider_trace_lane(lane: object) -> str:
+    raw_lane = str(lane or "").strip()
+    return raw_lane if raw_lane == "chat" or raw_lane in _WAKE_LANES else "other"
+
+
+def _normalize_provider_trace_reason(
+    reason: object, allowed_values: frozenset[str]
+) -> str:
+    raw_reason = str(reason or "none").strip()
+    return raw_reason if raw_reason in allowed_values else "other"
 
 
 def _empty_provider_response_debug_callback(
     deps: TurnDeps,
     user_id: str,
     lane: str,
+    trace_id: str = "",
 ):
     """Build a content-free admin trace sink for provider-empty responses."""
     if deps.emit_debug_trace is None:
         return None
 
-    safe_lane = lane if lane == "chat" or lane in _WAKE_LANES else "other"
+    safe_lane = _normalize_provider_trace_lane(lane)
 
     async def _emit(response_shape: dict[str, Any]) -> None:
         raw_stop_reason = str(response_shape.get("stop_reason") or "")
@@ -2008,6 +2030,7 @@ def _empty_provider_response_debug_callback(
                 deps.emit_debug_trace,
                 user_id,
                 "provider.empty_response",
+                trace_id=str(trace_id or ""),
                 status="warning",
                 summary="V2 provider 返回空回复",
                 explain=(
@@ -2032,6 +2055,317 @@ _CONTEXT_TRUNCATION_COUNT_KEYS = (
     "profile_cards_truncated",
     "worldbook_truncated",
 )
+
+_PROMPT_FRONTIER_TRACE_EVENTS = frozenset({
+    "v2.prompt_frontier.budget",
+    "v2.prompt_frontier.exhausted",
+    "v2.prompt_frontier.metadata_rejected",
+})
+_PROMPT_FRONTIER_TRACE_LANES = frozenset({"chat", *_WAKE_LANES})
+_PROMPT_FRONTIER_LIMIT_SOURCES = frozenset({
+    "provider_metadata",
+    "caller",
+    "audited_family",
+    "unaudited_default",
+    "deployment_override",
+})
+_PROMPT_FRONTIER_REQUIRED_COMPONENTS = frozenset({
+    "message_context",
+    "tool_transcript",
+    "required_tool_schemas",
+})
+_PROMPT_FRONTIER_WARNING_RATIO = 0.70
+_PROMPT_FRONTIER_TRACE_PROVIDERS = frozenset({
+    "openai",
+    "openrouter",
+    "anthropic",
+    "bedrock",
+    "gemini",
+    "deepseek",
+    "openai_compatible",
+})
+
+
+def _prompt_frontier_message_component_bytes(
+    messages: Iterable[Any],
+) -> tuple[v2_prompt_frontier.PromptByteComponent, ...]:
+    """Project exact assembled messages to closed, content-free byte families."""
+
+    totals: dict[str, int] = {}
+    for message in messages:
+        if isinstance(message, ToolExchange):
+            name = "tool_transcript"
+        elif not isinstance(message, dict):
+            name = "tail"
+        else:
+            role = str(message.get("role") or "")
+            content = message.get("content")
+            text = content if isinstance(content, str) else ""
+            if role == "system":
+                name = "system"
+            elif message.get(v2_screen_chat.MESSAGE_TAG) is True:
+                name = "screen"
+            elif text.startswith(context.WORLD_BOOK_CONTEXT_HEADER + "\n"):
+                name = "worldbook"
+            elif text.startswith(context._SUMMARY_HEADER):
+                name = "summary"
+            elif any(
+                text.startswith(prefix)
+                for prefix in (
+                    context.RUNTIME_CONTEXT_HEADER + "\n",
+                    context.TEMPORAL_CONTEXT_HEADER + "\n",
+                    context.COVERAGE_HOLE_HEADER + "\n",
+                    context.PROACTIVE_TURN_BOUNDARY,
+                )
+            ):
+                name = "runtime_data"
+            else:
+                name = "tail"
+        totals[name] = totals.get(name, 0) + (
+            v2_prompt_frontier.prompt_structure_utf8_bytes(message)
+        )
+    return tuple(
+        v2_prompt_frontier.PromptByteComponent(name=name, bytes=byte_count)
+        for name in (
+            "system",
+            "summary",
+            "tail",
+            "worldbook",
+            "runtime_data",
+            "screen",
+            "tool_transcript",
+        )
+        if (byte_count := totals.get(name, 0)) > 0
+    )
+
+
+def _validated_prompt_frontier_trace_components(
+    components: Iterable[Any],
+) -> list[dict[str, Any]]:
+    """Allow only closed names and integer byte counts into plaintext trace."""
+
+    normalized = v2_prompt_frontier.normalize_prompt_byte_components(
+        tuple(components)
+    )
+    return [
+        {"name": item.name, "bytes": item.bytes}
+        for item in normalized
+    ]
+
+
+def _prompt_frontier_trace_detail(
+    observation: Any,
+    *,
+    lane: str,
+) -> tuple[str, str, dict[str, Any]]:
+    """Build one same-shape success/exhaustion observation with no prompt text."""
+
+    safe_lane = str(lane or "")
+    if safe_lane not in _PROMPT_FRONTIER_TRACE_LANES:
+        raise ValueError("prompt frontier trace lane is not in the closed set")
+    if isinstance(observation, v2_prompt_frontier.PromptFrontierPlan):
+        budget = observation.budget
+        required_tokens = sum(
+            item.estimated_tokens
+            for item in observation.decisions
+            if item.required
+        )
+        estimated_input_tokens = int(observation.estimated_input_tokens)
+        context_window_tokens = int(budget.context_window_tokens)
+        input_budget_tokens = int(budget.input_budget_tokens)
+        output_reserve_tokens = int(budget.output_reserve_tokens)
+        safety_margin_tokens = int(budget.safety_margin_tokens)
+        limit_source = str(observation.model_limit.source)
+        required_components = [
+            item.name for item in observation.decisions if item.required
+        ]
+        event_type = "v2.prompt_frontier.budget"
+        utilization = (
+            estimated_input_tokens / input_budget_tokens
+            if input_budget_tokens > 0
+            else 1.0
+        )
+        status = (
+            "warning"
+            if utilization >= _PROMPT_FRONTIER_WARNING_RATIO
+            else "ok"
+        )
+        utf8_bytes_per_token = float(observation.utf8_bytes_per_token)
+    elif isinstance(observation, v2_prompt_frontier.PromptFrontierExhausted):
+        required_tokens = int(observation.required_tokens)
+        estimated_input_tokens = required_tokens
+        context_window_tokens = int(observation.context_window_tokens)
+        input_budget_tokens = int(observation.input_budget_tokens)
+        output_reserve_tokens = observation.output_reserve_tokens
+        safety_margin_tokens = observation.safety_margin_tokens
+        if output_reserve_tokens is None or safety_margin_tokens is None:
+            raise ValueError("prompt frontier exhaustion lacks budget partitions")
+        output_reserve_tokens = int(output_reserve_tokens)
+        safety_margin_tokens = int(safety_margin_tokens)
+        limit_source = str(observation.limit_source)
+        required_components = list(observation.required_components)
+        event_type = "v2.prompt_frontier.exhausted"
+        status = "warning"
+        if observation.utf8_bytes_per_token is None:
+            raise ValueError("prompt frontier exhaustion lacks estimator ratio")
+        utf8_bytes_per_token = float(observation.utf8_bytes_per_token)
+    else:
+        raise ValueError("unsupported prompt frontier observation")
+    if event_type not in _PROMPT_FRONTIER_TRACE_EVENTS:
+        raise ValueError("prompt frontier trace event is not in the closed set")
+    if limit_source not in _PROMPT_FRONTIER_LIMIT_SOURCES:
+        raise ValueError("prompt frontier limit source is not in the closed set")
+    if any(
+        str(name) not in _PROMPT_FRONTIER_REQUIRED_COMPONENTS
+        for name in required_components
+    ):
+        raise ValueError("required prompt component is not in the closed set")
+    if not math.isfinite(utf8_bytes_per_token) or utf8_bytes_per_token <= 0:
+        raise ValueError("prompt frontier estimator ratio is invalid")
+    detail = {
+        "context_window_tokens": context_window_tokens,
+        "input_budget_tokens": input_budget_tokens,
+        "required_tokens": required_tokens,
+        "estimated_input_tokens": estimated_input_tokens,
+        "overflow_tokens": max(0, required_tokens - input_budget_tokens),
+        "output_reserve_tokens": output_reserve_tokens,
+        "safety_margin_tokens": safety_margin_tokens,
+        "utf8_bytes_per_token": utf8_bytes_per_token,
+        "limit_source": limit_source,
+        "lane": safe_lane,
+        "required_components": required_components,
+        "components": _validated_prompt_frontier_trace_components(
+            observation.component_bytes
+        ),
+    }
+    return event_type, status, detail
+
+
+def _prompt_frontier_metadata_rejection_detail(
+    observation: Any,
+) -> dict[str, Any] | None:
+    """Project a rejected metadata limit to one closed, content-free shape."""
+
+    if isinstance(observation, v2_prompt_frontier.PromptFrontierPlan):
+        model_limit = observation.model_limit
+        provider = model_limit.provider
+        reported_tokens = model_limit.rejected_provider_metadata_tokens
+        floor_tokens = model_limit.provider_metadata_floor_tokens
+        resolved_tokens = model_limit.context_window_tokens
+        resolved_source = model_limit.source
+    elif isinstance(observation, v2_prompt_frontier.PromptFrontierExhausted):
+        provider = observation.provider
+        reported_tokens = observation.rejected_provider_metadata_tokens
+        floor_tokens = observation.provider_metadata_floor_tokens
+        resolved_tokens = observation.context_window_tokens
+        resolved_source = observation.limit_source
+    else:
+        raise ValueError("unsupported prompt frontier observation")
+    if reported_tokens is None and floor_tokens is None:
+        return None
+    numeric_values = (reported_tokens, floor_tokens, resolved_tokens)
+    if any(type(value) is not int or value <= 0 for value in numeric_values):
+        raise ValueError("prompt frontier metadata rejection counts are invalid")
+    if reported_tokens >= floor_tokens:
+        raise ValueError("prompt frontier metadata rejection is below no floor")
+    if provider not in _PROMPT_FRONTIER_TRACE_PROVIDERS:
+        raise ValueError("prompt frontier provider is not in the closed set")
+    if (
+        resolved_source not in _PROMPT_FRONTIER_LIMIT_SOURCES
+        or resolved_source == "provider_metadata"
+    ):
+        raise ValueError("prompt frontier resolved source is invalid")
+    detail = {
+        "reported_tokens": reported_tokens,
+        "floor_tokens": floor_tokens,
+        "resolved_tokens": resolved_tokens,
+        "resolved_source": resolved_source,
+        "provider": provider,
+    }
+    if set(detail) != {
+        "reported_tokens",
+        "floor_tokens",
+        "resolved_tokens",
+        "resolved_source",
+        "provider",
+    }:
+        raise ValueError("prompt frontier metadata rejection shape is invalid")
+    return detail
+
+
+def _emit_prompt_frontier_trace(
+    deps: TurnDeps,
+    user_id: str,
+    observation: Any,
+    *,
+    lane: str,
+) -> None:
+    """Best-effort final debug-trace boundary for one prompt budget decision."""
+
+    if deps.emit_debug_trace is None:
+        return
+    try:
+        event_type, status, detail = _prompt_frontier_trace_detail(
+            observation,
+            lane=lane,
+        )
+        deps.emit_debug_trace(
+            user_id,
+            event_type,
+            status=status,
+            summary="V2 prompt 预算观测",
+            explain=(
+                "仅记录闭集组件名、字节/预算计数、lane 与 limit source；"
+                "不记录 prompt、工具 schema、回复或用户正文。"
+            ),
+            detail=detail,
+        )
+    except Exception as exc:  # noqa: BLE001 — observability cannot fail a turn
+        log.warning(
+            "[v2.prompt_frontier_trace] emit failed user=%s code=%s",
+            user_id,
+            type(exc).__name__.lower(),
+        )
+    try:
+        rejection_detail = _prompt_frontier_metadata_rejection_detail(observation)
+        if rejection_detail is not None:
+            deps.emit_debug_trace(
+                user_id,
+                "v2.prompt_frontier.metadata_rejected",
+                status="warning",
+                summary="V2 provider 元数据窗口过小",
+                explain=(
+                    "仅记录闭集 provider/source 与窗口计数；"
+                    "不记录模型名、prompt、回复或用户正文。"
+                ),
+                detail=rejection_detail,
+            )
+    except Exception as exc:  # noqa: BLE001 — observability cannot fail a turn
+        log.warning(
+            "[v2.prompt_frontier_metadata_trace] emit failed user=%s code=%s",
+            user_id,
+            type(exc).__name__.lower(),
+        )
+
+
+def _prompt_frontier_exhaustion_trace_callback(
+    deps: TurnDeps,
+    user_id: str,
+    lane: str,
+):
+    if deps.emit_debug_trace is None:
+        return None
+
+    async def _emit(observation: Any) -> None:
+        await asyncio.to_thread(
+            _emit_prompt_frontier_trace,
+            deps,
+            user_id,
+            observation,
+            lane=lane,
+        )
+
+    return _emit
 
 
 def _emit_context_truncation_trace(
@@ -3018,6 +3352,7 @@ def _ledger_tapped_sink(
     *,
     deps: TurnDeps | None = None,
     user_id: str = "",
+    lane: str = "chat",
 ):
     """`recorder.record` plus the plaintext ledger mirror, for tool_loop.
 
@@ -3034,6 +3369,13 @@ def _ledger_tapped_sink(
             await recorder.record(event_kind, payload)
             await _mirror_provider_attempt(recorder, event_kind, payload)
         if event_kind == "provider_request" and deps is not None:
+            await asyncio.to_thread(
+                _emit_prompt_frontier_trace,
+                deps,
+                user_id,
+                payload.get("prompt_frontier"),
+                lane=lane,
+            )
             await asyncio.to_thread(
                 _emit_context_truncation_trace,
                 deps,
@@ -4184,6 +4526,9 @@ def _make_build_messages_fn(
                     safety_margin_tokens=safety_margin_tokens,
                     utf8_bytes_per_token=utf8_bytes_per_token,
                     image_reserve_tokens=image_reserve_tokens,
+                    message_component_bytes=(
+                        _prompt_frontier_message_component_bytes(messages)
+                    ),
                 )
                 return messages, plan
 
@@ -5307,7 +5652,7 @@ class WorkspaceFileReply:
 
 @dataclass(frozen=True)
 class GeneratedImageReply:
-    """One validated provider image ready for encrypted chat publication."""
+    """One validated provider image ready for native Chat publication."""
 
     name: str
     mime_type: str
@@ -5702,18 +6047,10 @@ def _thinking_extra(thinking: dict | None) -> dict:
     env = thinking.get("envelope")
     if not isinstance(env, dict):
         return {}
-    extra = {
-        "thinking_v": str(env.get("v", 1)),
-        "thinking_id": str(env.get("id") or ""),
-        "thinking_body_ct": str(env.get("body_ct") or ""),
-        "thinking_nonce": str(env.get("nonce") or ""),
-        "thinking_K_user": str(env.get("K_user") or ""),
-        "thinking_visibility": str(env.get("visibility") or "shared"),
-        "thinking_owner_user_id": str(env.get("owner_user_id") or ""),
-        "thinking_enclave_pk_fpr": str(env.get("enclave_pk_fpr") or ""),
-    }
-    if env.get("K_enclave"):
-        extra["thinking_K_enclave"] = str(env.get("K_enclave") or "")
+    try:
+        extra = core_envelope.envelope_prefixed_fields(env, "thinking")
+    except ValueError:
+        return {}
     extra = {k: v for k, v in extra.items() if str(v).strip()}
     meta = thinking.get("metadata") or {}
     for key in ("thinking_kind", "thinking_source", "thinking_model"):
@@ -5867,12 +6204,13 @@ def _build_encrypted_image_reply_effect_payload(
     *,
     effect_id: str,
 ) -> dict:
-    """Seal one normalized image into a deterministic Chat image message."""
+    """Wrap one normalized image into a deterministic Chat image message."""
     item_id = hashlib.sha256(effect_id.encode("utf-8")).hexdigest()[:32]
     envelope, error = core_envelope._build_shared_envelope_for_store(
         store,
         bytes(image_reply.data),
         item_id=item_id,
+        content_kind="binary",
     )
     if envelope is None:
         raise RuntimeError(error or "image reply envelope build failed")
@@ -7017,6 +7355,7 @@ async def _run_wake(
     tm: "TurnMetrics | None" = None,
     trajectory_recorder: "v2_trajectory.TrajectoryRecorder | None" = None,
     attempt_count: int = 0,
+    trace_id: str = "",
 ) -> str:
     """wake-lane（heartbeat/scheduled/manual_wake/screen_watch）turn：让伴侣主动开口，而不是
     回答用户刚发的消息（用户根本没发消息——这就是唤醒的定义）。同 `_run_compaction` 一样自成
@@ -7057,6 +7396,7 @@ async def _run_wake(
         deps,
         user_id,
         lane,
+        trace_id,
     )
     try:
         store = core_store.get_store(user_id)
@@ -8588,7 +8928,14 @@ async def _run_wake(
                     build_messages,
                     provider_config=provider_config,
                 )
-            except v2_prompt_frontier.PromptFrontierExhausted:
+            except v2_prompt_frontier.PromptFrontierExhausted as exc:
+                await asyncio.to_thread(
+                    _emit_prompt_frontier_trace,
+                    deps,
+                    user_id,
+                    exc,
+                    lane=lane,
+                )
                 if tm is not None:
                     tm.record_prompt_frontier_exhaustion()
                 if wake_snapshot_seq <= watermark_seq:
@@ -8634,7 +8981,14 @@ async def _run_wake(
                         build_messages,
                         provider_config=provider_config,
                     )
-                except v2_prompt_frontier.PromptFrontierExhausted:
+                except v2_prompt_frontier.PromptFrontierExhausted as exc:
+                    await asyncio.to_thread(
+                        _emit_prompt_frontier_trace,
+                        deps,
+                        user_id,
+                        exc,
+                        lane=lane,
+                    )
                     if tm is not None:
                         tm.record_prompt_frontier_exhaustion()
                     raise
@@ -8705,7 +9059,9 @@ async def _run_wake(
                 ),
                 on_provider_tool_surface=provider_roundtrip_trace,
                 on_empty_provider_response=(
-                    _empty_provider_response_debug_callback(deps, user_id, lane)
+                    _empty_provider_response_debug_callback(
+                        deps, user_id, lane, trace_id
+                    )
                 ),
                 fold_before_first=deps.read_messages_after_seq is not None,
                 on_progress=_report_turn_progress,
@@ -8713,6 +9069,7 @@ async def _run_wake(
                     trajectory_recorder,
                     deps=deps,
                     user_id=user_id,
+                    lane=lane,
                 ),
                 outbound_blocking_read_tool_names=_PRIVATE_READ_TOOLS,
                 outbound_blocking_read_tool_predicate=_read_blocks_later_outbound,
@@ -8743,6 +9100,11 @@ async def _run_wake(
                     tm.record_prompt_frontier_exhaustion
                     if tm is not None
                     else None
+                ),
+                on_prompt_frontier_exhausted_detail=(
+                    _prompt_frontier_exhaustion_trace_callback(
+                        deps, user_id, lane
+                    )
                 ),
             )
             if shadow_decision_allowed is None:
@@ -10706,7 +11068,12 @@ async def process_job(
     mcp_called_names: list[str] = []
     mcp_turn_outcome = "failed"
     provider_roundtrip_trace = (
-        _provider_tool_surface_callback(deps, user_id, lane)
+        _provider_tool_surface_callback(
+            deps,
+            user_id,
+            lane,
+            str(job.get("trace_id") or ""),
+        )
         if lane == "chat"
         else None
     )
@@ -10841,6 +11208,7 @@ async def process_job(
                 tm,
                 trajectory_recorder,
                 attempt_count=int(job.get("attempt_count") or 0),
+                trace_id=str(job.get("trace_id") or ""),
             )
         if lane in _EXTRACTION_LANES:
             # 自成一体的记忆抽取路径（capture/dream，Task 3）：build prompt → BYOK 抽取 →
@@ -12957,7 +13325,14 @@ async def process_job(
                     build_messages,
                     provider_config=provider_config,
                 )
-            except v2_prompt_frontier.PromptFrontierExhausted:
+            except v2_prompt_frontier.PromptFrontierExhausted as exc:
+                await asyncio.to_thread(
+                    _emit_prompt_frontier_trace,
+                    deps,
+                    user_id,
+                    exc,
+                    lane=lane,
+                )
                 tm.record_prompt_frontier_exhaustion()
                 pending_seqs = [
                     int(row["seq"])
@@ -13018,7 +13393,14 @@ async def process_job(
                         build_messages,
                         provider_config=provider_config,
                     )
-                except v2_prompt_frontier.PromptFrontierExhausted:
+                except v2_prompt_frontier.PromptFrontierExhausted as exc:
+                    await asyncio.to_thread(
+                        _emit_prompt_frontier_trace,
+                        deps,
+                        user_id,
+                        exc,
+                        lane=lane,
+                    )
                     tm.record_prompt_frontier_exhaustion()
                     raise
 
@@ -13078,7 +13460,12 @@ async def process_job(
             ),
             on_provider_tool_surface=provider_roundtrip_trace,
             on_empty_provider_response=(
-                _empty_provider_response_debug_callback(deps, user_id, lane)
+                _empty_provider_response_debug_callback(
+                    deps,
+                    user_id,
+                    lane,
+                    str(job.get("trace_id") or ""),
+                )
             ),
             fold_before_first=seq_native and not ordered_chat_replies,
             on_progress=_report_turn_progress,
@@ -13086,6 +13473,7 @@ async def process_job(
                 trajectory_recorder,
                 deps=deps,
                 user_id=user_id,
+                lane=lane,
             ),
             extra_tool_specs=offered_mcp_tool_specs,
             refresh_extra_tool_specs=_current_offered_mcp_tool_specs,
@@ -13114,6 +13502,11 @@ async def process_job(
             on_tail_window=_tail_window_callback(tm),
             on_prompt_frontier_exhaustion=(
                 tm.record_prompt_frontier_exhaustion
+            ),
+            on_prompt_frontier_exhausted_detail=(
+                _prompt_frontier_exhaustion_trace_callback(
+                    deps, user_id, lane
+                )
             ),
         )
         if pushed_screen_frame_ids:

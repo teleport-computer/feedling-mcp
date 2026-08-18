@@ -105,6 +105,28 @@ _CONTENT_FREE_STOP_REASONS = frozenset(
         "tool_use",
     }
 )
+# These values are emitted by the provider-surface callback and later summarized
+# for admin diagnostics.  Keep the producer vocabulary here, beside the state
+# machine that creates it; worker/admin consume these sets instead of copying
+# telemetry enums that can silently drift apart.
+_PROVIDER_TERMINAL_TEXT_ROUND_REASONS = frozenset(
+    {
+        "none",
+        "force_text_fallback",
+        "final_reply_correction",
+        "max_calls",
+        "other",
+    }
+)
+_PROVIDER_FORCE_TEXT_FALLBACK_REASONS = frozenset(
+    {
+        "none",
+        "tool_schema_rejected",
+        "final_reply_correction",
+        "invalid_or_over_budget_tool_exchange",
+        "other",
+    }
+)
 
 
 def _catalog():
@@ -592,6 +614,7 @@ async def run_tool_loop(
     prompt_image_reserve_tokens: int = prompt_frontier.DEFAULT_IMAGE_RESERVE_TOKENS,
     on_tail_window=None,
     on_prompt_frontier_exhaustion=None,
+    on_prompt_frontier_exhausted_detail=None,
 ) -> LoopOutcome:
     """Run one chronological, provider-native tool transcript.
 
@@ -1133,7 +1156,14 @@ async def run_tool_loop(
                     utf8_bytes_per_token=prompt_estimator_utf8_bytes_per_token,
                     image_reserve_tokens=prompt_image_reserve_tokens,
                 )
-        except prompt_frontier.PromptFrontierExhausted:
+        except prompt_frontier.PromptFrontierExhausted as exc:
+            if on_prompt_frontier_exhausted_detail is not None:
+                try:
+                    emitted = on_prompt_frontier_exhausted_detail(exc)
+                    if inspect.isawaitable(emitted):
+                        await emitted
+                except Exception:
+                    pass
             if on_prompt_frontier_exhaustion is not None:
                 try:
                     on_prompt_frontier_exhaustion()

@@ -124,7 +124,12 @@ input.
 Self-hosted operators can override the default with
 `FEEDLING_V2_UNAUDITED_DEFAULT_CONTEXT_WINDOW_TOKENS`; setting it to `0`
 restores fail-closed configuration. Explicit route metadata, audited model
-families, and deployment overrides keep precedence over this fallback.
+families, and deployment overrides keep precedence over this fallback, except
+that route metadata below the deployment-tunable trust floor is rejected. The
+floor defaults to 32,768 tokens and can be changed with
+`FEEDLING_V2_PROVIDER_METADATA_CONTEXT_WINDOW_FLOOR_TOKENS`. A rejected value
+falls through to the next source and emits a content-free warning containing
+only window counts, the resolved source, and a closed provider class.
 
 Runtime V2 takes one temporal snapshot for each chat or wake turn.
 The prompt receives the current UTC time, the user's local IANA timezone and

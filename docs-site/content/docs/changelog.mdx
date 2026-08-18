@@ -10,6 +10,15 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **Hosted Runtime V2 no longer trusts route context-window metadata below a
+  deployment-tunable floor.** Values below the default 32,768-token floor now
+  fall through to the audited-family or unaudited-route default instead of
+  silently shrinking the required prompt surface. A content-free warning records
+  the reported value, floor, resolved value/source, and closed provider class;
+  it never records the model name or prompt content. Because saved routes do not
+  carry provenance for this field, the same rule also applies to a small value
+  entered explicitly during Model API setup.
+
 - **Hosted Runtime V2 now allows up to 15 provider rounds in an ordinary Chat
   or proactive turn before its hard terminal-reply round, up from six.** The
   final allowed round still withholds new tool use so the limit remains a real
@@ -18,12 +27,12 @@ change must not be interpreted as an API guarantee.
 
 - **Genesis imports now publish the identity card, MEMORY/STYLE, and the
   transitional persona together.** Genesis reuses Runtime V2's bounded profile
-  generation and encrypted CAS storage, requires a non-empty field when the
-  current upload reducer proposes corresponding memory or persona/voice
-  material, and copies an untouched encrypted side without decrypting or
-  resealing it. Genesis does not read the existing Garden; scheduled profile
-  refresh remains the exclusive Garden-to-MEMORY/STYLE path, while add-memory
-  imports only write cards. Identity edits made while a distill is running win
+  generation and content-shape-aware CAS storage, requires a non-empty field
+  when the current upload reducer proposes corresponding memory or persona/voice
+  material, and copies an untouched side byte-for-byte regardless of whether it
+  is plaintext or encrypted. Genesis does not read the existing Garden;
+  scheduled profile refresh remains the exclusive Garden-to-MEMORY/STYLE path,
+  while add-memory imports only write cards. Identity edits made while a distill is running win
   at canonical field granularity; `GET /v1/identity/changes` now adds a
   content-free `fields` array to new change records so this lock is observable
   and deterministic. Legacy records without field labels trigger a traced
@@ -143,14 +152,14 @@ change must not be interpreted as an API guarantee.
 - **Runtime V2 Profile generation now recovers without another Chat turn.**
   Retryable provider failures persist the exact Profile Job as delayed pending
   work with exponential backoff from five minutes to six hours; malformed
-  Memory/User output receives at most three delayed retries. Provider setup
+  MEMORY/STYLE output receives at most three delayed retries. Provider setup
   failures wait for a successful configuration change, source failures wait for
   the Memory Garden witness to change, and unknown internal failures terminate
   instead of looping. Delayed Jobs occupy no worker slot and do not make the
   watchdog treat an idle pool as wedged. Ordinary post-Chat freshness checks do
   not accelerate them, while a successful provider repair or the existing Dream
   force trigger can make the same Job ready immediately. Runtime V2 semantic
-  conversation compaction remains removed, so Memory/User is its only long-term
+  conversation compaction remains removed, so MEMORY/STYLE is its only long-term
   semantic layer beside content-free deterministic history coverage.
 
 - **Hosted Runtime V2 isolates foreground Chat from background maintenance.**
@@ -245,6 +254,28 @@ change must not be interpreted as an API guarantee.
   allowlisted internal socket proxy exposes only the Docker reads required by
   the recorder; no public metrics endpoint, application content collection, or
   alerting is introduced.
+- **Plaintext accounts can send hosted Chat images and files and upload capture
+  media without an enclave dependency.** Hosted image and PDF/file bodies now
+  use the strict binary `body_b64` envelope instead of being decoded as UTF-8,
+  preventing the previous `plaintext_body_not_utf8` 409 (and PostgreSQL null-byte
+  failure). Screen frames and perception photos use the same authenticated,
+  owner-bound binary shape. Encrypted accounts retain the existing dual-recipient
+  envelope and verification chain, and plaintext photos keep derived place labels
+  on-device rather than adding them to the plaintext request.
+
+- **Plaintext content now stays outside the enclave across normal read and
+  processing workflows.** Memory, History Search/Fetch, World Book, Hosted and
+  resident Chat, Identity, attachments, voice reconstruction, Genesis persona
+  paths, and reasoning metadata route per stored record. `body` and `body_b64`
+  are processed locally, while only `body_ct` projections enter enclave
+  decrypt/readside endpoints. Mixed encrypted/plaintext history preserves its
+  existing ordering, cursor, authorization, and resource-limit behavior.
+
+- **Plaintext-account Genesis imports now commit and resume without entering the
+  enclave decrypt path.** Estimate/commit staged uploads and resumable
+  checkpoints read plaintext envelopes locally, while encrypted accounts keep
+  the existing authenticated enclave decryption. This restores both long-term
+  memory and chat-history file imports when content encryption is off.
 
 - **User-configured MCP servers now follow the selected-server trust model.**
   MCP tools remain available after private reads and earlier MCP results, which
@@ -520,10 +551,11 @@ change must not be interpreted as an API guarantee.
 
 - **Voice calls are now archived in full, and memory is distilled from the
   whole call.** At hang-up `POST /v1/voice/finalize` archives the complete
-  transcript (permanent, sealed to the account's content key) and leaves ONE
-  bounded preview card in chat; the per-turn rows are deleted only after the
-  archive is durable. Memory then runs through the ordinary capture pipeline
-  over the archived full text. This replaces the earlier behaviour where a
+  transcript permanently using the account's effective content-encryption tier
+  (ciphertext for opted-in accounts, plaintext for opted-out accounts) and
+  leaves ONE bounded preview card in chat; the per-turn rows are deleted only
+  after the archive is durable. Memory then runs through the ordinary capture
+  pipeline over the archived full text. This replaces the earlier behaviour where a
   model-written 1–3 sentence summary was both the chat artifact and the only
   thing memory ever saw — anything not in those sentences was lost. The
   response now returns `transcript_message_id`; `summary_message_id` is still
@@ -533,10 +565,11 @@ change must not be interpreted as an API guarantee.
 
 - **New public endpoints for reading archived calls.**
   `GET /v1/voice/transcripts` lists a caller's calls (metadata only — no
-  words), and `GET /v1/voice/transcripts/{call_id}` returns one call's sealed
-  envelope for the client to decrypt locally. The server never returns
-  transcript plaintext. Calls are retained until the account is deleted;
-  clearing chat history does not remove them.
+  words), and `GET /v1/voice/transcripts/{call_id}` returns one call's
+  shape-aware content envelope. Encrypted-tier clients decrypt ciphertext
+  locally; plaintext-tier clients receive the plaintext envelope shape. Calls
+  are retained until the account is deleted; clearing chat history does not
+  remove them.
 
 - **Voice call length raised from 5 minutes to 1 hour.** The previous cap was
   shorter than the voice provider's own default and had no product rationale.
@@ -561,6 +594,77 @@ change must not be interpreted as an API guarantee.
   after such an incomplete historical result now creates a new processing job
   instead of returning the empty result as successfully completed.
 
+- **Runtime V2 memory capture now supports both content-storage tiers.** Its
+  atomic capture journal accepts a plaintext `body` envelope only when the
+  account's effective encryption mode is off, continues to require the full
+  sealed envelope for encrypted accounts, and rejects mixed shapes. Profile
+  distillation also forces its provider response through a typed output tool
+  instead of relying on a JSON formatting instruction, reducing failed
+  background retries that can delay a later turn for the same account.
+
+- **Runtime V2 Chat no longer fails during setup for plaintext-tier accounts.**
+  Its internal trajectory recorder now carries compressed binary events in an
+  explicit plaintext base64 wire when encryption is off, while encrypted
+  accounts retain the existing sealed trajectory envelope. This fixes a
+  deployment-only mismatch that prevented the model call from starting.
+
+- **Plaintext and encrypted accounts now render the same identity and memory
+  metadata and receive the same Runtime V2 identity context.** Structured
+  plaintext `body` values are consumed directly while historical `body_ct`
+  records continue through the decrypt service. Runtime V1 and V2 reply writers
+  also share the deployment's plaintext-write gate, so the wire shape returned
+  by Chat remains consistent with `content_encryption_effective`.
+
+- **The plaintext tier now covers the remaining active content producers.**
+  Runtime V2 standalone workers receive the same per-user shape resolver as the
+  API process, and plaintext trajectories are accepted by the application
+  contract. Genesis chunks, sensitive Perception context/photos, Chat
+  attachment captions, and Broadcast frames now select encrypted or plaintext
+  wire shapes from `content_encryption_effective`. Plaintext binary frames use
+  strict `body_b64`, may be stored behind a `plaintext_v1` object pointer, and
+  are read without an enclave call. Encrypted old-client writes and mixed
+  historical rows remain supported; changing the preference affects new writes
+  rather than silently rewriting existing records.
+
+- **Managed deployments can promote the confidential-VM PostgreSQL replica to
+  the application primary without running the legacy RDS migration chain on
+  it.** Backend and runner processes now use an explicit schema contract,
+  assert the owner-migrated TEE head read-only, and force shadow dual-write off
+  after promotion. The maintenance-window preflight also drains transient
+  queues, copies the existing FrameEnvelope v1 metadata/object-pointer bridge
+  without decrypting frame bodies, and aligns identity sequences before the DSN
+  switch. This changes managed deployment topology, not the public HTTP schema.
+
+- **Plaintext-tier Chat image/file bodies now have an explicit binary wire and
+  object-storage shape.** Main Chat envelopes may carry strict-base64
+  `body_b64` (and optional matching `body_size_bytes`) only for `image` or
+  `file` while `content_encryption_effective` is `"off"`. Heavy bodies are
+  offloaded as raw bytes behind a `plaintext_v1` pointer and verified by
+  SHA-256 and byte length before delivery; public responses never expose the
+  object key or stored hash. Encrypted-tier attachments retain the existing
+  `body_ct` envelope and ciphertext object. This expands the plaintext tier's
+  trust boundary to object storage and its backups. Existing ciphertext
+  attachment migration remains rollout-gated until supported clients are in
+  the forced-upgrade window.
+
+- **Content encryption is becoming a per-user preference with two storage
+  tiers.** `whoami` now returns `content_encryption` (the user's stated
+  preference) and `content_encryption_effective` (the shape a client must
+  actually write). `POST /v1/users/preferences` accepts `content_encryption`
+  with `"on"`, `"off"`, or `null`. Write paths must act on the *effective*
+  field only, and must treat an absent, empty, or unrecognized value as `on`;
+  a deployment that has not enabled plaintext storage reports `on` regardless
+  of the preference, so a client can ship support ahead of the server without
+  writing an unsupported shape. Read paths must route per record — a row
+  carrying `body_ct` is opened through the decrypt service, a row carrying
+  `body` is read directly — because both shapes coexist for a user who changes
+  the preference. `/v1/content/swap` converts existing records between shapes
+  in place. Two boundaries are enforced server-side: a record is never silently
+  downgraded to plaintext, and `local_only` visibility still requires
+  encryption. The pre-production environment now enables plaintext storage for
+  functional testing through the default-off deployment gate; test and
+  production still report an effective value of `on` for every user. See
+  [architecture](/docs/architecture#content-encryption-is-a-per-user-preference).
 - **Do Not Disturb now suppresses Runtime V2 heartbeat and screen-watch
   scheduling.** Due-query polling excludes accounts whose proactive settings
   have `dnd` enabled and resumes automatically when DND is turned off.
@@ -796,12 +900,13 @@ change must not be interpreted as an API guarantee.
   retries now fetch the requested message directly rather than searching only
   the newest 20 Chat rows. Requests with neither credential still fail closed.
 
-- **Runtime V2 can supply a bounded Memory/User profile as its long-term
+- **Runtime V2 can supply a bounded MEMORY/STYLE profile as its long-term
   semantic layer.** The default-off `FEEDLING_V2_PROFILE_ENABLED` switch gates
   both generation and turn-time selection. Only an `ok`, non-disabled profile
-  whose two encrypted fields both validate and decrypt is injected, as one
-  early user-role block explicitly labeled model-derived untrusted data.
-  Missing, pending, degraded, disabled, invalid, or undecryptable profiles keep
+  whose two content fields validate and resolve is injected into the trusted
+  system prefix: plaintext fields are read locally and ciphertext fields are
+  decrypted through the enclave. Missing, pending, degraded, disabled, invalid,
+  or unreadable profiles keep
   deterministic history coverage plus the bounded verbatim tail, but no legacy
   semantic summary. Verbatim replay wins on conflict, coverage gaps remain a
   separate late data notice, and OpenAI Chat and Anthropic cache
@@ -811,8 +916,8 @@ change must not be interpreted as an API guarantee.
 - **Runtime V2 stages bounded profile generation and restores the pooled
   worker's Memory lanes.** A new low-priority `profile` job reads the complete
   eligible Memory Garden with a scoped runtime token, rejects truncated views,
-  generates Memory/User fields with a bounded provider-call budget, and writes
-  them through the encrypted profile CAS. Runtime V2 cutover, successful dream
+  generates MEMORY/STYLE fields with a bounded provider-call budget, and writes
+  them through the content-shape-aware profile CAS. Runtime V2 cutover, successful dream
   writes, and best-effort post-Chat freshness checks can enqueue the job;
   delayed retryable failures persist the exact Job without requiring another
   Chat, and the seven-day stale floor runs independently of the dream setting.
@@ -832,13 +937,14 @@ change must not be interpreted as an API guarantee.
   respond to the actual change. The pooled worker also runs the independently
   consent-gated Memory Capture and Dream producers; each fleet lane remains
   independently reversible through deployment configuration.
-- **Encrypted Runtime V2 profile storage is staged for the bounded
-  Memory/User rollout.** Both fields share one `v2_agent_profile` CAS document
-  but remain separate shared encrypted envelopes. PostgreSQL and the TEE shadow
-  receive the same ciphertext document; only state, character counts, source
-  counts, and generation/retry timestamps remain plaintext metadata.
+- **Content-shape-aware Runtime V2 profile storage is staged for the bounded
+  MEMORY/STYLE rollout.** Both fields share one `v2_agent_profile` CAS document
+  but remain separate content records. Each follows the owner's effective
+  content shape, and PostgreSQL plus the TEE mirror preserve that shape; only
+  state, character counts, source counts, and generation/retry timestamps are
+  always plaintext metadata.
 
-- **Runtime V2 removed provider-backed conversation summarization.** MEMORY/USER
+- **Runtime V2 removed provider-backed conversation summarization.** MEMORY/STYLE
   is now the sole long-term semantic layer. Conversation maintenance advances
   exact history coverage with local count sentinels, while encrypted Chat rows
   remain the durable source ledger. Existing model-authored segments remain

@@ -9,8 +9,8 @@ E2E / enclave boundary (unchanged): ``/v1/model_api/key_envelope`` returns the
 caller's OWN ``api_key_envelope`` ciphertext — the server never decrypts it; only
 the enclave can. ``model_api_setup`` seals a freshly-supplied provider key into a
 shared envelope via ``core.envelope._build_shared_envelope_for_store`` and, when
-reusing a saved key, decrypts the existing envelope ONLY through the enclave
-(``core.enclave._decrypt_envelope_via_enclave``). These functions take
+reusing a saved key, reads the existing row through the shared shape router.
+Encrypted rows still cross the enclave boundary; plaintext rows are read locally. These functions take
 already-parsed params + the store and the caller's credential as explicit
 arguments — they never read ``flask.request`` — so no new server-side plaintext
 is ever introduced here. Module-level references (``provider_client``,
@@ -29,7 +29,7 @@ import db
 import debug_trace
 import provider_health
 from capabilities import vision_probe as vision_probe_capability
-from core import enclave as core_enclave
+from core import enclave as core_enclave  # noqa: F401 — 见模块 docstring：故意保留供测试 monkeypatch
 from core import envelope as core_envelope
 from core import util as core_util
 from core import wake_bus
@@ -46,6 +46,7 @@ from hosted import vision_observer
 from model_api_runtime.v2 import prompt_frontier
 
 
+_TEST_PATCHABLE_MODULES = (core_enclave,)
 _REASONING_EFFORT_OFF = {"off", "none", "no", "false", "0", "disabled"}
 _REASONING_EFFORT_LEVELS = {"low", "medium", "high"}
 _VISION_TEST_LOCKS = tuple(threading.Lock() for _ in range(32))
@@ -84,11 +85,11 @@ def _resolve_route_context_window(
 ) -> tuple[int | None, tuple[dict, int] | None]:
     """Resolve and preflight the context-window contract for a saved route.
 
-    ``context_window_tokens`` is a conservative lower bound for this exact
-    provider/model/destination, not a marketing maximum.  Audited first-party
-    families and deployment overrides may supply it automatically.  Every
-    unaudited route must provide it explicitly; otherwise setup is rejected
-    before encryption, provider I/O, or a DB mutation.
+    ``context_window_tokens`` is route metadata, not a marketing maximum.
+    Values below Runtime V2's metadata floor fall through to audited family or
+    deployment/default knowledge; this prevents stale small metadata from
+    silently removing the required prompt surface. Audited first-party families
+    and deployment overrides may also supply the resolved lower bound.
     """
 
     try:
@@ -398,10 +399,9 @@ def _run_route_vision_test_or_error(
         return {"error": "model_api_key_envelope_missing"}, 404
     decrypt_kwargs = {"runtime_token": runtime_token} if runtime_token else {}
     try:
-        provider_key = core_enclave._decrypt_envelope_via_enclave(
+        provider_key = core_envelope.decrypt_provider_key_envelope(
             envelope,
             caller_api_key,
-            purpose="model_api_provider_key",
             **decrypt_kwargs,
         ).decode("utf-8")
     except Exception as exc:
@@ -791,10 +791,9 @@ def _test_route_image_generation_or_error(
     if not isinstance(envelope, dict):
         return {"error": "model_api_key_envelope_missing"}, 404
     try:
-        provider_key = core_enclave._decrypt_envelope_via_enclave(
+        provider_key = core_envelope.decrypt_provider_key_envelope(
             envelope,
             caller_api_key,
-            purpose="model_api_provider_key",
         ).decode("utf-8")
     except Exception:
         return {"error": "model_api_key_decrypt_failed"}, 400
@@ -864,8 +863,8 @@ def _resolve_provider_key(store, raw_key: str, existing: dict | None,
     if not isinstance(existing_envelope, dict):
         return None, {"error": "api_key required"}, 400
     try:
-        provider_key = core_enclave._decrypt_envelope_via_enclave(
-            existing_envelope, caller_api_key, purpose="model_api_provider_key",
+        provider_key = core_envelope.decrypt_provider_key_envelope(
+            existing_envelope, caller_api_key,
         ).decode("utf-8")
     except Exception as e:
         return None, {"error": "model_api_key_decrypt_failed", "detail": str(e)[:220]}, 400
@@ -1671,8 +1670,8 @@ def _test_active_route(store, route: dict, api_key: str | None) -> tuple[dict, i
     if not isinstance(envelope, dict):
         return {"error": "model_api_key_envelope_missing"}, 404
     try:
-        provider_key = core_enclave._decrypt_envelope_via_enclave(
-            envelope, api_key, purpose="model_api_provider_key").decode("utf-8")
+        provider_key = core_envelope.decrypt_provider_key_envelope(
+            envelope, api_key).decode("utf-8")
     except Exception as e:
         return {"error": "model_api_key_decrypt_failed", "detail": str(e)[:220]}, 400
     try:
@@ -1992,8 +1991,8 @@ def _test_route_or_error(store, route: dict, caller_api_key: str | None):
     if not isinstance(envelope, dict):
         return {"error": "model_api_key_envelope_missing"}, 404
     try:
-        provider_key = core_enclave._decrypt_envelope_via_enclave(
-            envelope, caller_api_key, purpose="model_api_provider_key").decode("utf-8")
+        provider_key = core_envelope.decrypt_provider_key_envelope(
+            envelope, caller_api_key).decode("utf-8")
     except Exception as e:
         return {"error": "model_api_key_decrypt_failed", "detail": str(e)[:220]}, 400
     context_window_tokens, frontier_error = _resolve_route_context_window(
@@ -2229,8 +2228,8 @@ def model_api_models(store, payload: dict, *, caller_api_key: str | None) -> tup
         if not isinstance(envelope, dict):
             return {"error": "model_api_key_envelope_missing"}, 404
         try:
-            provider_key = core_enclave._decrypt_envelope_via_enclave(
-                envelope, caller_api_key, purpose="model_api_provider_key").decode("utf-8")
+            provider_key = core_envelope.decrypt_provider_key_envelope(
+                envelope, caller_api_key).decode("utf-8")
         except Exception as e:
             return {"error": "model_api_key_decrypt_failed", "detail": str(e)[:220]}, 400
     else:

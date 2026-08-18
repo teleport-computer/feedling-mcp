@@ -29,6 +29,8 @@ behavior identical to the file era. Read helpers return empty/None on failure.
 
 from __future__ import annotations
 
+import base64
+import hashlib
 import json
 import logging
 import os
@@ -74,6 +76,21 @@ def _database_url() -> str:
             "set DATABASE_URL (must include sslmode=require for external PG)."
         )
     return url
+
+
+def database_schema() -> str:
+    """Return the migration contract for ``DATABASE_URL``.
+
+    ``rds`` is the backwards-compatible default.  Phase-4 promotion sets this
+    explicitly to ``tee`` on every process that points ``DATABASE_URL`` at the
+    promoted database.  Keeping the selector independent from the hostname is
+    deliberate: inferring a trust/schema boundary from a mutable DSN is too
+    easy to get wrong during rollback.
+    """
+    value = os.environ.get("FEEDLING_DATABASE_SCHEMA", "rds").strip().lower()
+    if value not in {"rds", "tee"}:
+        raise RuntimeError("FEEDLING_DATABASE_SCHEMA must be 'rds' or 'tee'")
+    return value
 
 
 def _pool_max_size() -> int:
@@ -151,16 +168,79 @@ def close_pool() -> None:
 # ---------------------------------------------------------------------------
 
 _schema_lock = threading.Lock()
+_TEE_PRIMARY_PREPARED_KEY = "phase4_primary_prepared"
+_TEE_PRIMARY_TRIGGERS = {
+    "chat_messages_retire_r2_body",
+    "chat_message_archive_retire_r2_body",
+    "chat_message_archive_immutable",
+}
 
 
 def init_schema() -> None:
-    """Bring the database schema up to the latest Alembic revision.
+    """Bring the selected database schema to a safe application state.
 
-    Runs ``alembic upgrade head`` programmatically, reading DATABASE_URL via
-    backend/alembic/env.py. The baseline revision's DDL is idempotent, so this
-    is safe on the already-provisioned production database (it just records the
-    version). Called at app startup, by the migrate container, and by tests.
+    The historical ``rds`` mode runs ``alembic upgrade head``.  A promoted TEE
+    database is different: its owner-only migration chain has already run in a
+    dedicated workflow, while application processes connect as the non-DDL
+    ``app`` role.  ``tee`` mode therefore performs a read-only, fail-closed head
+    assertion and must never run the RDS chain against that database.
     """
+    if database_schema() == "tee":
+        from alembic.script import ScriptDirectory
+        from alembic.config import Config
+
+        here = Path(__file__).resolve().parent
+        cfg = Config(str(here / "alembic_tee" / "alembic.ini"))
+        cfg.set_main_option("script_location", str(here / "alembic_tee"))
+        expected_heads = set(ScriptDirectory.from_config(cfg).get_heads())
+        with _schema_lock, psycopg.connect(_database_url(), autocommit=True) as conn:
+            actual_heads = {
+                str(row[0])
+                for row in conn.execute(
+                    "SELECT version_num FROM alembic_tee_version"
+                ).fetchall()
+            }
+            marker_row = conn.execute(
+                "SELECT value FROM server_config WHERE key = %s",
+                (_TEE_PRIMARY_PREPARED_KEY,),
+            ).fetchone()
+            enabled_triggers = {
+                str(row[0])
+                for row in conn.execute(
+                    "SELECT tgname FROM pg_trigger "
+                    "WHERE NOT tgisinternal AND tgenabled = 'O' "
+                    "AND tgname = ANY(%s)",
+                    (list(_TEE_PRIMARY_TRIGGERS),),
+                ).fetchall()
+            }
+        if actual_heads != expected_heads:
+            raise RuntimeError(
+                "TEE database schema is not at the application head: "
+                f"expected={sorted(expected_heads)} actual={sorted(actual_heads)}; "
+                "run the owner-only alembic_tee migration workflow before startup"
+            )
+        marker = None
+        if marker_row is not None:
+            try:
+                marker = json.loads(bytes(marker_row[0]).decode("utf-8"))
+            except (TypeError, ValueError, UnicodeDecodeError, json.JSONDecodeError):
+                marker = None
+        if (
+            not isinstance(marker, dict)
+            or marker.get("prepared") is not True
+            or set(marker.get("tee_heads") or ()) != expected_heads
+            or enabled_triggers != _TEE_PRIMARY_TRIGGERS
+        ):
+            raise RuntimeError(
+                "TEE database has not completed the frozen Phase-4 prepare: "
+                f"marker_ok={isinstance(marker, dict) and marker.get('prepared') is True} "
+                f"enabled_triggers={sorted(enabled_triggers)}; run "
+                "admin.phase4_cutover --apply --confirm-writes-frozen before startup"
+            )
+        log.info("[db] TEE schema at head (read-only assertion: %s)",
+                 ",".join(sorted(actual_heads)))
+        return
+
     from alembic import command
     from alembic.config import Config
 
@@ -7611,6 +7691,7 @@ _CHAT_BODY_CAS_FIELDS = (
     "id",
     "v",
     "body_ct",
+    "body_b64",
     "nonce",
     "K_user",
     "K_enclave",
@@ -7623,6 +7704,21 @@ _CHAT_BODY_CAS_FIELDS = (
 _CHAT_BODY_CAS_PREDICATE = " AND ".join(
     f"(doc->'{field}') IS NOT DISTINCT FROM %s"
     for field in _CHAT_BODY_CAS_FIELDS
+)
+_CHAT_POINTER_REPLACED_FIELDS = (
+    "body_ct",
+    "body_b64",
+    "body",
+    "body_key",
+    "body_ct_len",
+    "body_object_format",
+    "body_size_bytes",
+    "body_sha256",
+    "nonce",
+    "K_user",
+    "K_enclave",
+    "enclave_pk_fpr",
+    "content_pk_fpr",
 )
 
 
@@ -8168,16 +8264,32 @@ def seq_for_watermark_ts(user_id: str, watermark_ts: float) -> int:
 
 
 def _is_chat_file_pointer(doc) -> bool:
-    return isinstance(doc, dict) and bool(doc.get("body_key")) and doc.get("body_ct") is None
+    return (
+        isinstance(doc, dict)
+        and bool(doc.get("body_key"))
+        and doc.get("body_ct") is None
+        and doc.get("body_b64") is None
+    )
+
+
+def _chat_body_object_format(doc: dict) -> str:
+    """Classify an R2 pointer without guessing an unknown marker."""
+    if "body_object_format" not in doc or doc.get("body_object_format") is None:
+        return "sealed_v1"
+    marker = doc.get("body_object_format")
+    if marker == "plaintext_v1":
+        return marker
+    raise ValueError("chat_body_object_format_unrecognized")
 
 
 def hydrate_chat_file_body(user_id: str, doc: dict) -> dict:
-    """Return a doc guaranteed to carry ``body_ct``. If ``doc`` is an R2 pointer
-    (``body_key`` set, ``body_ct`` absent) the ciphertext is fetched from R2 and
-    inlined into a COPY (the stored/cached row stays slim). Non-pointers and, when
-    R2 is unconfigured, everything are returned unchanged. A missing/failed fetch
-    returns the doc as-is (``body_ct`` still absent) so the enclave surfaces a
-    per-item decrypt error for that one message rather than crashing the read.
+    """Hydrate a sealed or plaintext R2 pointer according to its marker.
+
+    Legacy pointers (marker absent) produce ``body_ct`` exactly as before.
+    ``plaintext_v1`` pointers validate raw size and SHA-256 before producing
+    ``body_b64``.  Unknown markers and corrupt plaintext objects fail closed;
+    missing/unavailable objects retain the pointer so the caller can surface an
+    absent body or retry without misclassifying its bytes.
 
     Call this ONLY at exits that actually deliver a body (poll delivery, a
     history page that includes the body, single message-body fetch) — never in
@@ -8188,11 +8300,54 @@ def hydrate_chat_file_body(user_id: str, doc: dict) -> dict:
     so object_storage refuses one that isn't under this user's own prefix."""
     if not _is_chat_file_pointer(doc) or not object_storage.chat_files_enabled():
         return doc
-    body = object_storage.get_chat_body(str(doc.get("body_key") or ""), user_id)
-    if body is None:
+    body_format = _chat_body_object_format(doc)
+    if body_format == "sealed_v1":
+        body = object_storage.get_chat_body(
+            str(doc.get("body_key") or ""),
+            user_id,
+        )
+        if body is None:
+            return doc
+        out = {
+            k: v
+            for k, v in doc.items()
+            if k not in ("body_key", "body_object_format", "body_sha256")
+        }
+        out["body_ct"] = body
+        return out
+
+    raw = object_storage.get_chat_body_bytes(
+        str(doc.get("body_key") or ""),
+        user_id,
+    )
+    if raw is None:
         return doc
-    out = {k: v for k, v in doc.items() if k != "body_key"}
-    out["body_ct"] = body
+    out = {
+        k: v
+        for k, v in doc.items()
+        if k not in ("body_key", "body_object_format", "body_sha256")
+    }
+    encoded = base64.b64encode(raw).decode("ascii")
+
+    try:
+        expected_size = int(doc["body_size_bytes"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError("chat_plaintext_body_size_invalid") from exc
+    expected_sha256 = doc.get("body_sha256")
+    if (
+        expected_size < 0
+        or len(raw) != expected_size
+        or not isinstance(expected_sha256, str)
+        or len(expected_sha256) != 64
+        or expected_sha256.lower() != expected_sha256
+        or any(ch not in "0123456789abcdef" for ch in expected_sha256)
+    ):
+        raise ValueError("chat_plaintext_body_integrity_mismatch")
+    if hashlib.sha256(raw).hexdigest() != expected_sha256:
+        raise ValueError("chat_plaintext_body_integrity_mismatch")
+    out.pop("body_ct_len", None)
+    out["body_b64"] = encoded
+    out["body_size_bytes"] = expected_size
     return out
 
 
@@ -8214,8 +8369,10 @@ def _normalize_chat_body_doc(doc: dict) -> dict:
     branch in :func:`_chat_insert_on_cursor`.
     """
     out = dict(doc or {})
-    if out.get("body_ct") is not None:
+    if out.get("body_ct") is not None or out.get("body_b64") is not None:
         out.pop("body_key", None)
+        out.pop("body_object_format", None)
+        out.pop("body_sha256", None)
         out.pop("body_ct_len", None)
     return out
 
@@ -8929,7 +9086,10 @@ def _offload_chat_body_after_commit(
         object_storage.chat_files_enabled()
         and isinstance(doc, dict)
         and doc.get("content_type") in _R2_OFFLOAD_CONTENT_TYPES
-        and doc.get("body_ct") is not None
+        and (
+            doc.get("body_ct") is not None
+            or doc.get("body_b64") is not None
+        )
     ):
         return
     normalized_doc = _normalize_chat_body_doc(doc)
@@ -8973,8 +9133,25 @@ def _offload_chat_body_after_commit(
                         expected_generation,
                         "upload_guard",
                     )
-        body_ct_len = len(normalized_doc["body_ct"])
-        pointer = {"body_key": key, "body_ct_len": body_ct_len}
+        is_plaintext = normalized_doc.get("body_b64") is not None
+        if is_plaintext:
+            raw_plaintext = base64.b64decode(
+                normalized_doc["body_b64"],
+                validate=True,
+            )
+            pointer = {
+                "body_key": key,
+                "body_object_format": "plaintext_v1",
+                "body_size_bytes": len(raw_plaintext),
+                "body_sha256": hashlib.sha256(raw_plaintext).hexdigest(),
+            }
+            inline_field = "body_b64"
+        else:
+            pointer = {
+                "body_key": key,
+                "body_ct_len": len(normalized_doc["body_ct"]),
+            }
+            inline_field = "body_ct"
         with get_pool().connection() as conn:
             conn.execute(
                 "SELECT pg_advisory_lock(hashtextextended(%s, 0))",
@@ -9012,14 +9189,24 @@ def _offload_chat_body_after_commit(
                             and current_generation == int(expected_generation)
                         )
                 if upload_allowed:
-                    object_storage.put_chat_body(
-                        user_id,
-                        msg_id,
-                        normalized_doc["body_ct"],
-                        content_type,
-                        upload_version=upload_version,
-                        storage_generation=expected_generation,
-                    )
+                    if is_plaintext:
+                        object_storage.put_chat_body_bytes(
+                            user_id,
+                            msg_id,
+                            raw_plaintext,
+                            content_type,
+                            upload_version=upload_version,
+                            storage_generation=expected_generation,
+                        )
+                    else:
+                        object_storage.put_chat_body(
+                            user_id,
+                            msg_id,
+                            normalized_doc["body_ct"],
+                            content_type,
+                            upload_version=upload_version,
+                            storage_generation=expected_generation,
+                        )
                     with conn.transaction():
                         with conn.cursor() as cur:
                             current_generation = _lock_chat_r2_lifecycle_on_cursor(
@@ -9037,7 +9224,7 @@ def _offload_chat_body_after_commit(
                             ):
                                 cur.execute(
                                     "UPDATE chat_messages "
-                                    "SET doc = (doc - 'body_ct') || %s "
+                                    f"SET doc = (doc - '{inline_field}') || %s "
                                     "WHERE user_id=%s AND msg_id=%s "
                                     "  AND storage_generation=%s AND "
                                     f"{_CHAT_BODY_CAS_PREDICATE} RETURNING 1",
@@ -9071,6 +9258,275 @@ def _offload_chat_body_after_commit(
         # The upload guard was committed before PUT. Never perform network
         # cleanup on this write path: the isolated cleanup worker owns retries,
         # including ambiguous PUT/COMMIT outcomes.
+
+
+def migrate_chat_r2_pointer_to_plaintext(
+    user_id: str,
+    *,
+    table: str,
+    item_id: str | int,
+    old_body_key: str,
+    storage_generation: int,
+    plaintext: bytes,
+    content_type: str,
+) -> bool:
+    """Atomically replace one sealed R2 pointer with a plaintext-v1 pointer.
+
+    The plaintext is written to a fresh private key under an upload guard.  A
+    successful database CAS removes that guard in the same transaction; the
+    existing row-retirement trigger durably queues the old key.  Any failure or
+    CAS loss leaves the new-key guard intact for the normal cleanup worker.
+
+    ``table`` is ``"live"`` (``item_id`` = msg_id) or ``"archive"``
+    (``item_id`` = source_seq).  Archive replacement uses delete+insert so the
+    immutable UPDATE trigger remains load-bearing.
+    """
+    if table not in ("live", "archive"):
+        raise ValueError("table must be live or archive")
+    if not isinstance(plaintext, bytes):
+        raise TypeError("plaintext must be bytes")
+    if content_type not in _R2_OFFLOAD_CONTENT_TYPES:
+        raise ValueError("chat plaintext R2 migration requires file/image")
+    if not object_storage.chat_key_owned_by(old_body_key, user_id):
+        raise ValueError("chat plaintext R2 migration foreign body key")
+
+    generation = int(storage_generation)
+    upload_version = object_storage.new_chat_body_upload_version()
+    new_key = object_storage.chat_body_key(
+        user_id,
+        str(item_id) if table == "live" else "",
+        content_type,
+        upload_version=upload_version,
+        storage_generation=generation,
+    )
+    if table == "archive":
+        # Archive item_id is source_seq, not msg_id. Resolve the current msg_id
+        # under the initial row lock before deriving the destination key.
+        new_key = ""
+
+    def _select_current(cur, *, for_update: bool = True):
+        suffix = " FOR UPDATE" if for_update else ""
+        if table == "live":
+            cur.execute(
+                "SELECT msg_id,doc FROM chat_messages "
+                "WHERE user_id=%s AND msg_id=%s AND storage_generation=%s "
+                "AND doc->>'body_key'=%s "
+                "AND COALESCE(doc->>'body_object_format','sealed_v1')='sealed_v1' "
+                "AND doc ? 'K_enclave'"
+                + suffix,
+                (user_id, str(item_id), generation, old_body_key),
+            )
+        else:
+            cur.execute(
+                "SELECT msg_id,doc FROM chat_message_archive "
+                "WHERE user_id=%s AND source_seq=%s AND storage_generation=%s "
+                "AND doc->>'body_key'=%s "
+                "AND COALESCE(doc->>'body_object_format','sealed_v1')='sealed_v1' "
+                "AND doc ? 'K_enclave'"
+                + suffix,
+                (user_id, int(item_id), generation, old_body_key),
+            )
+        return cur.fetchone()
+
+    # S0 -> S1: validate the authoritative row/tier and commit a durable guard.
+    with get_pool().connection() as conn:
+        with conn.transaction():
+            with conn.cursor() as cur:
+                current_generation = _lock_chat_r2_lifecycle_on_cursor(cur, user_id)
+                if current_generation != generation:
+                    return False
+                cur.execute(
+                    "SELECT 1 FROM users WHERE user_id=%s "
+                    "AND doc->>'content_encryption'='off'",
+                    (user_id,),
+                )
+                if cur.fetchone() is None:
+                    return False
+                current = _select_current(cur)
+                if current is None:
+                    return False
+                current_msg_id = str(current[0])
+                if not new_key:
+                    new_key = object_storage.chat_body_key(
+                        user_id,
+                        current_msg_id,
+                        content_type,
+                        upload_version=upload_version,
+                        storage_generation=generation,
+                    )
+                _enqueue_chat_r2_cleanup_on_cursor(
+                    cur,
+                    user_id,
+                    new_key,
+                    generation,
+                    "upload_guard",
+                )
+
+    pointer = {
+        "body_key": new_key,
+        "body_object_format": "plaintext_v1",
+        "body_size_bytes": len(plaintext),
+        "body_sha256": hashlib.sha256(plaintext).hexdigest(),
+    }
+    promoted = False
+    with get_pool().connection() as conn:
+        conn.execute(
+            "SELECT pg_advisory_lock(hashtextextended(%s, 0))",
+            (new_key,),
+        )
+        try:
+            # Revalidate after the committed guard and before network I/O.
+            with conn.transaction():
+                with conn.cursor() as cur:
+                    current_generation = _lock_chat_r2_lifecycle_on_cursor(
+                        cur, user_id,
+                    )
+                    cur.execute(
+                        "SELECT 1 FROM chat_r2_cleanup "
+                        "WHERE body_key=%s AND user_id=%s FOR UPDATE",
+                        (new_key, user_id),
+                    )
+                    guard_exists = cur.fetchone() is not None
+                    cur.execute(
+                        "SELECT 1 FROM users WHERE user_id=%s "
+                        "AND doc->>'content_encryption'='off'",
+                        (user_id,),
+                    )
+                    tier_allows = cur.fetchone() is not None
+                    row_matches = _select_current(cur) is not None
+                    upload_allowed = (
+                        guard_exists
+                        and tier_allows
+                        and row_matches
+                        and current_generation == generation
+                    )
+            if not upload_allowed:
+                return False
+
+            object_storage.put_chat_body_bytes(
+                user_id,
+                current_msg_id,
+                plaintext,
+                content_type,
+                upload_version=upload_version,
+                storage_generation=generation,
+            )
+
+            # S2 -> S3: CAS pointer and delete the new-key guard atomically.
+            with conn.transaction():
+                with conn.cursor() as cur:
+                    current_generation = _lock_chat_r2_lifecycle_on_cursor(
+                        cur, user_id,
+                    )
+                    cur.execute(
+                        "SELECT 1 FROM chat_r2_cleanup "
+                        "WHERE body_key=%s AND user_id=%s FOR UPDATE",
+                        (new_key, user_id),
+                    )
+                    guard_exists = cur.fetchone() is not None
+                    cur.execute(
+                        "SELECT 1 FROM users WHERE user_id=%s "
+                        "AND doc->>'content_encryption'='off'",
+                        (user_id,),
+                    )
+                    tier_allows = cur.fetchone() is not None
+                    if (
+                        not guard_exists
+                        or not tier_allows
+                        or current_generation != generation
+                    ):
+                        return False
+
+                    if table == "live":
+                        subtraction = " ".join(
+                            f"- '{field}'" for field in _CHAT_POINTER_REPLACED_FIELDS
+                        )
+                        cur.execute(
+                            "UPDATE chat_messages SET doc = (doc "
+                            f"{subtraction}) || %s "
+                            "WHERE user_id=%s AND msg_id=%s "
+                            "AND storage_generation=%s "
+                            "AND doc->>'body_key'=%s "
+                            "AND COALESCE(doc->>'body_object_format','sealed_v1')="
+                            "'sealed_v1' AND doc ? 'K_enclave' RETURNING 1",
+                            (
+                                Jsonb(pointer),
+                                user_id,
+                                str(item_id),
+                                generation,
+                                old_body_key,
+                            ),
+                        )
+                        promoted = cur.fetchone() is not None
+                    else:
+                        # Lock/current-shape check precedes DELETE. DELETE
+                        # RETURNING supplies every immutable column so reinsertion
+                        # cannot accidentally regenerate timestamps/generations.
+                        if _select_current(cur) is None:
+                            promoted = False
+                        else:
+                            cur.execute(
+                                "DELETE FROM chat_message_archive "
+                                "WHERE user_id=%s AND source_seq=%s "
+                                "AND storage_generation=%s "
+                                "AND doc->>'body_key'=%s "
+                                "RETURNING user_id,source_seq,msg_id,ts,doc,"
+                                "storage_generation,clear_generation,cleared_at",
+                                (
+                                    user_id,
+                                    int(item_id),
+                                    generation,
+                                    old_body_key,
+                                ),
+                            )
+                            retired = cur.fetchone()
+                            if retired is not None:
+                                new_doc = dict(retired[4])
+                                for field in _CHAT_POINTER_REPLACED_FIELDS:
+                                    new_doc.pop(field, None)
+                                new_doc.update(pointer)
+                                cur.execute(
+                                    "INSERT INTO chat_message_archive "
+                                    "(user_id,source_seq,msg_id,ts,doc,"
+                                    "storage_generation,clear_generation,cleared_at) "
+                                    "VALUES (%s,%s,%s,%s,%s,%s,%s,%s)",
+                                    (
+                                        retired[0],
+                                        retired[1],
+                                        retired[2],
+                                        retired[3],
+                                        Jsonb(new_doc),
+                                        retired[5],
+                                        retired[6],
+                                        retired[7],
+                                    ),
+                                )
+                                promoted = True
+                    if promoted:
+                        cur.execute(
+                            "DELETE FROM chat_r2_cleanup "
+                            "WHERE body_key=%s AND user_id=%s",
+                            (new_key, user_id),
+                        )
+        finally:
+            conn.execute(
+                "SELECT pg_advisory_unlock(hashtextextended(%s, 0))",
+                (new_key,),
+            )
+
+    if promoted:
+        from tee_shadow import mirror
+
+        tee_table = (
+            "chat_messages" if table == "live" else "chat_message_archive"
+        )
+        mirror.mark_pending(
+            user_id,
+            tee_table,
+            str(item_id),
+            "requeue_r2_plaintext_pointer",
+        )
+    return promoted
 
 
 def _chat_insert_on_cursor(
@@ -9262,27 +9718,56 @@ def _same_reply_envelope(existing_doc, requested_doc) -> bool:
             )
         )
     immutable_reply_fields = (
-        "id", "role", "source", "v", "body_ct", "nonce",
+        "id", "role", "source", "v", "body_ct", "body_b64", "nonce",
         "K_user", "K_enclave", "enclave_pk_fpr", "visibility",
         "owner_user_id", "content_type", "reply_to_message_id",
+        # 明文行的正文（v6）。密文行有 body_ct 在清单里兜着，明文行漏了它就会
+        # 把「同 id 不同正文」判成同一条而静默丢弃后者。
+        "body",
         "voice_call_id", "voice_turn_id",
     )
     if not isinstance(existing_doc, dict) or not isinstance(requested_doc, dict):
         return False
-    if _is_chat_file_pointer(existing_doc) and requested_doc.get("body_ct") is not None:
-        # Post-commit R2 offload intentionally replaces body_ct with a pointer.
-        # A retry still has the original inline envelope, so compare every other
-        # immutable crypto/routing field and use the persisted ciphertext length
-        # to bridge the one deliberate shape change.
+    requested_inline_field = (
+        "body_ct"
+        if requested_doc.get("body_ct") is not None
+        else "body_b64"
+        if requested_doc.get("body_b64") is not None
+        else ""
+    )
+    if _is_chat_file_pointer(existing_doc) and requested_inline_field:
+        # Post-commit R2 offload intentionally replaces the inline body with a
+        # pointer. A retry still carries that inline body, so compare every
+        # other immutable field and bridge the deliberate shape change using
+        # the pointer's format-specific length/hash metadata.
         pointer_fields = tuple(
-            field for field in immutable_reply_fields if field != "body_ct"
+            field
+            for field in immutable_reply_fields
+            if field != requested_inline_field
         )
-        return (
-            all(
-                existing_doc.get(field) == requested_doc.get(field)
-                for field in pointer_fields
+        fields_match = all(
+            existing_doc.get(field) == requested_doc.get(field)
+            for field in pointer_fields
+        )
+        if not fields_match:
+            return False
+        if requested_inline_field == "body_ct":
+            return (
+                existing_doc.get("body_object_format") in (None, "")
+                and existing_doc.get("body_ct_len")
+                == len(requested_doc["body_ct"])
             )
-            and existing_doc.get("body_ct_len") == len(requested_doc["body_ct"])
+        try:
+            raw = base64.b64decode(
+                requested_doc["body_b64"],
+                validate=True,
+            )
+        except Exception:
+            return False
+        return (
+            existing_doc.get("body_object_format") == "plaintext_v1"
+            and existing_doc.get("body_size_bytes") == len(raw)
+            and existing_doc.get("body_sha256") == hashlib.sha256(raw).hexdigest()
         )
     return all(
         existing_doc.get(field) == requested_doc.get(field)
@@ -11141,37 +11626,20 @@ def chat_finalize_reply_post_commit(
     committed inline reply readable.
     """
     reply_msg_id = str(reply_doc.get("id") or "")
-    offload = (
-        object_storage.chat_files_enabled()
-        and reply_doc.get("content_type") in _R2_OFFLOAD_CONTENT_TYPES
-        and reply_doc.get("body_ct") is not None
-    )
     try:
-        if offload:
-            try:
-                body_ct_len = len(reply_doc["body_ct"])
-                key = object_storage.put_chat_body(
-                    user_id,
-                    reply_msg_id,
-                    reply_doc["body_ct"],
-                    str(reply_doc.get("content_type") or "file"),
-                )
-                pointer = {"body_key": key, "body_ct_len": body_ct_len}
-                with get_pool().connection() as conn:
-                    conn.execute(
-                        "UPDATE chat_messages SET doc = (doc - 'body_ct') || %s "
-                        "WHERE user_id = %s AND msg_id = %s AND doc ? 'body_ct'",
-                        (Jsonb(pointer), user_id, reply_msg_id),
-                    )
-            except Exception as e:  # noqa: BLE001
-                log.error(
-                    "[db] chat_finalize_reply_post_commit(%s,%s) R2 offload "
-                    "failed, left inline: %s",
-                    user_id,
-                    reply_msg_id,
-                    e,
-                )
-
+        with get_pool().connection() as conn:
+            row = conn.execute(
+                "SELECT storage_generation FROM chat_messages "
+                "WHERE user_id=%s AND msg_id=%s",
+                (user_id, reply_msg_id),
+            ).fetchone()
+        if row is not None:
+            _offload_chat_body_after_commit(
+                user_id,
+                reply_msg_id,
+                reply_doc,
+                int(row[0]),
+            )
     except Exception as e:  # noqa: BLE001
         log.error(
             "[db] chat_finalize_reply_post_commit(%s,%s) failed: %s",
@@ -12653,6 +13121,10 @@ def model_api_autoselect_active(user_id: str) -> str | None:
 # ---------------------------------------------------------------------------
 
 
+class FrameReadUnavailable(RuntimeError):
+    """The frame may exist, but its durable store could not be read."""
+
+
 def _frame_write_row(user_id: str, frame_id: str, ts: float,
                      doc: dict | None, env_meta: dict | None, body_key: str | None) -> bool:
     """Upsert one frame_envelopes row. Returns True on success; swallows-and-logs
@@ -12676,7 +13148,7 @@ def _frame_write_row(user_id: str, frame_id: str, ts: float,
         return False
 
 
-def frame_upsert(user_id: str, frame_id: str, ts: float, doc: dict) -> None:
+def frame_upsert(user_id: str, frame_id: str, ts: float, doc: dict) -> bool:
     """Persist a v1 frame envelope.
 
     With R2 configured, the heavy ``body_ct`` is offloaded to object storage and
@@ -12693,26 +13165,36 @@ def frame_upsert(user_id: str, frame_id: str, ts: float, doc: dict) -> None:
     A crash/abort at any point leaves either an inline (readable) row or a
     pointer whose object is already present; a failed upload just keeps the
     inline row. ``doc`` is offloaded out of the row only after the body is in
-    R2, so the at-rest table stays small without a missing-object window."""
-    if object_storage.enabled() and isinstance(doc, dict) and doc.get("body_ct") is not None:
+    R2, so the at-rest table stays small without a missing-object window.
+    Returns whether a readable row was durably stored."""
+    body_field = (
+        "body_ct" if isinstance(doc, dict) and doc.get("body_ct") is not None
+        else "body_b64" if isinstance(doc, dict) and doc.get("body_b64") is not None
+        else None
+    )
+    if object_storage.enabled() and body_field is not None:
         # 1) inline first — frame readable, references no R2 object yet.
         if not _frame_write_row(user_id, frame_id, ts, doc, None, None):
-            return  # DB write failed → nothing committed, R2 untouched.
+            return False  # DB write failed → nothing committed, R2 untouched.
         # 2) upload; on failure keep the inline row (frame stays readable).
         try:
-            object_storage.put_frame_body(user_id, frame_id, doc["body_ct"])
+            object_storage.put_frame_body(user_id, frame_id, doc[body_field])
         except Exception as e:  # noqa: BLE001
             log.error("[db] frame_upsert(%s,%s) R2 upload failed, leaving inline: %s",
                       user_id, frame_id, e)
-            return
+            return True
         # 3) object now exists → flip to pointer as the last durable step. If
         #    this write fails the row stays inline (readable); the uploaded
         #    object is a harmless orphan.
-        env_meta = {k: v for k, v in doc.items() if k != "body_ct"}
+        env_meta = {k: v for k, v in doc.items() if k != body_field}
+        if body_field == "body_b64":
+            env_meta["body_object_format"] = "plaintext_v1"
+            raw = base64.b64decode(str(doc[body_field]), validate=True)
+            env_meta["body_sha256"] = hashlib.sha256(raw).hexdigest()
         body_key = object_storage.frame_key(user_id, frame_id)
         _frame_write_row(user_id, frame_id, ts, None, env_meta, body_key)
-        return
-    _frame_write_row(user_id, frame_id, ts, doc, None, None)
+        return True
+    return _frame_write_row(user_id, frame_id, ts, doc, None, None)
 
 
 def frame_exists(user_id: str, frame_id: str) -> bool:
@@ -12761,10 +13243,19 @@ def perception_broadcast_meta(user_id: str) -> dict:
     }
 
 
-def frame_get(user_id: str, frame_id: str) -> dict | None:
+def frame_get(
+    user_id: str,
+    frame_id: str,
+    *,
+    unavailable_raises: bool = False,
+) -> dict | None:
     """Return the full v1 envelope, reconstructing ``body_ct`` from R2 for
     offloaded rows (``body_key`` set) and returning the inline ``doc`` for
-    legacy rows."""
+    legacy rows.
+
+    When ``unavailable_raises`` is true, storage outages are distinguished from
+    a definitive missing row or object so request handlers can return 503.
+    """
     try:
         with get_pool().connection() as conn:
             row = conn.execute(
@@ -12774,20 +13265,56 @@ def frame_get(user_id: str, frame_id: str) -> dict | None:
             ).fetchone()
     except Exception as e:
         log.error("[db] frame_get(%s,%s) failed: %s", user_id, frame_id, e)
+        if unavailable_raises:
+            raise FrameReadUnavailable("frame row read unavailable") from e
         return None
     if row is None:
         return None
     doc, env_meta, body_key = row
     if body_key:
-        body_ct = object_storage.get_frame_body(user_id, frame_id)
-        if body_ct is None:
-            # The pointer row exists but its R2 body is missing/unreadable.
+        body = None
+        for attempt in range(2):
+            try:
+                body = object_storage.get_frame_body_strict(user_id, frame_id)
+                break
+            except Exception as e:  # noqa: BLE001
+                if attempt == 0:
+                    # One fresh read covers a broken pooled connection after
+                    # the SDK's own bounded HTTP retries are exhausted.
+                    time.sleep(0.15)
+                    continue
+                log.error("[db] frame_get(%s,%s) R2 read unavailable: %s",
+                          user_id, frame_id, e)
+                if unavailable_raises:
+                    raise FrameReadUnavailable("frame body read unavailable") from e
+                return None
+        if body is None:
+            # The pointer row exists but its R2 body is definitively missing.
             # Report not-found rather than a metadata-only dict — callers treat
             # any dict as a valid envelope and would serve an undecryptable frame.
             log.error("[db] frame_get(%s,%s) R2 body missing for key %s",
                       user_id, frame_id, body_key)
             return None
-        return {**(env_meta or {}), "body_ct": body_ct}
+        out = dict(env_meta or {})
+        if out.pop("body_object_format", None) == "plaintext_v1":
+            try:
+                raw = base64.b64decode(body, validate=True)
+            except Exception:
+                log.error("[db] frame_get(%s,%s) plaintext R2 body invalid base64",
+                          user_id, frame_id)
+                return None
+            expected_size = out.get("body_size_bytes")
+            expected_sha = str(out.pop("body_sha256", "") or "")
+            if (type(expected_size) is not int or len(raw) != expected_size
+                    or not expected_sha
+                    or hashlib.sha256(raw).hexdigest() != expected_sha):
+                log.error("[db] frame_get(%s,%s) plaintext R2 integrity mismatch",
+                          user_id, frame_id)
+                return None
+            out["body_b64"] = body
+        else:
+            out["body_ct"] = body
+        return out
     return doc
 
 

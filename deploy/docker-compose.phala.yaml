@@ -323,6 +323,7 @@ services:
       # (the setup path resolves/validates the same limit). See the serve-worker
       # block for the rationale. ${VAR:-} form → tunable without a new compose_hash.
       FEEDLING_V2_UNAUDITED_DEFAULT_CONTEXT_WINDOW_TOKENS: "${FEEDLING_V2_UNAUDITED_DEFAULT_CONTEXT_WINDOW_TOKENS:-131072}"
+      FEEDLING_V2_PROVIDER_METADATA_CONTEXT_WINDOW_FLOOR_TOKENS: "${FEEDLING_V2_PROVIDER_METADATA_CONTEXT_WINDOW_FLOOR_TOKENS:-32768}"
       # Genesis v2 (foreground-fast onboarding): greet on 3-5 core + identity
       # baseline, push the heavy reduce (the old ~37% failure surface) to the
       # background. Validated on test; flip to "false" to revert to the v1
@@ -404,6 +405,11 @@ services:
       FEEDLING_API_URL: "http://backend:5001"
       FEEDLING_ENCLAVE_URL: "https://enclave:5003"
       DATABASE_URL: "${DATABASE_URL:-}"
+      # frame_get resolves R2-backed photo pointers in this process.
+      R2_ENDPOINT: "${R2_ENDPOINT:-}"
+      R2_ACCESS_KEY_ID: "${R2_ACCESS_KEY_ID:-}"
+      R2_SECRET_ACCESS_KEY: "${R2_SECRET_ACCESS_KEY:-}"
+      R2_FRAMES_BUCKET: "${R2_FRAMES_BUCKET:-}"
       FEEDLING_RUNTIME_TOKEN_SECRET: "${FEEDLING_RUNTIME_TOKEN_SECRET:-}"
       FEEDLING_V2_MAX_WORKERS: "4"
       FEEDLING_V2_FLEET_IDENTITY_REQUIRED: "1"
@@ -425,6 +431,7 @@ services:
       # call). ${VAR:-} form: tunable later via encrypted env WITHOUT a new
       # compose_hash; "0" restores strict fail-closed.
       FEEDLING_V2_UNAUDITED_DEFAULT_CONTEXT_WINDOW_TOKENS: "${FEEDLING_V2_UNAUDITED_DEFAULT_CONTEXT_WINDOW_TOKENS:-131072}"
+      FEEDLING_V2_PROVIDER_METADATA_CONTEXT_WINDOW_FLOOR_TOKENS: "${FEEDLING_V2_PROVIDER_METADATA_CONTEXT_WINDOW_FLOOR_TOKENS:-32768}"
       # web_fetch article extraction (trafilatura, runs in this serve-worker).
       # Default ON — a rollback lever, not a feature gate. Set to "0" to fall back
       # to the plain tag-strip; takes effect on the next serve-worker restart.

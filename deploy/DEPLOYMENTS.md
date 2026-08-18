@@ -343,9 +343,15 @@ in test, pre, and production.
 | Release/source topology | The staged `deploy/docker-compose.phala.pre.yaml` definition has `ingress`, `backend`, `enclave`, `enclave-domain`, and `serve-worker`; this source row is not evidence that the custom domain has been deployed or is live. |
 | Public API | `https://pre-api.feedling.app` (dstack-ingress auto-creates the CF DNS records once CI injects `CF_*`) |
 | Attestation | `https://7d18a1f234a0d90e5f643cac8283b6048451b8f7-5003s.dstack-pha-prod9.phala.network/attestation` (repo var `PRE_MAIN_ENCLAVE_URL`) |
-| Database | Dedicated pre RDS, injected via `PRE_DATABASE_URL` — fully isolated from test/prod (pre's enclave content key differs from test's, so sharing a DB would mix mutually-undecryptable ciphertext + double-schedule proactive jobs). |
+| Database | Dedicated pre RDS during shadow convergence; Phase 4 promotes `feedling-io-db-pre` by changing `PRE_DATABASE_URL` to its app DSN and setting `FEEDLING_DATABASE_SCHEMA=tee` on the main and runner deployment units together. Both databases remain fully isolated from test/prod. |
 | On-chain | **Separate** Sepolia FeedlingAppAuth `0x65844Dd69eba4Aa4a784e089dA9D9308F430F794` (owner = the `ETH_DEPLOYER_KEY` address, deployed 2026-07-07 via `deploy-test-contract.yml` dispatch), repo var `PRE_FEEDLING_APP_AUTH_CONTRACT`. Kept apart from test's contract because a shared AppAuth + a newly created CVM is the exact combination that flipped the main enclave key in the 2026-07-05 prod-runner incident. |
 | Deploy path | CI `deploy-pre-cvm` job (in `ci.yml`) on push to the `pre` branch. Clone of `deploy-test-cvm` with pre compose / CVM / DB / contract, branch-gated to `refs/heads/pre`. |
+
+The pre backend sets `FEEDLING_PLAINTEXT_WRITES_ACCEPTED=1` to exercise PR #131's
+per-user plaintext tier. The code default is closed and the test/prod manifests
+intentionally omit the variable, so merging the implementation cannot enable
+plaintext writes outside pre. Unknown users and users whose effective preference
+is `on` still write encrypted envelopes.
 | Baseline | Set repo var `PRE_ENCLAVE_CONTENT_PK_BASELINE` from a manual `/attestation` read after the first healthy deploy (the attestation gate is inert until then). |
 
 部署后从仓库根目录验证 pre 自定义 enclave 域名的 live ingress evidence；
@@ -449,7 +455,7 @@ The heavy frame ciphertext (`frame_envelopes.doc.body_ct`, >150KB ChaCha20-Poly1
   - `R2_FRAMES_BUCKET` — the dedicated frames bucket, e.g. `io-image-frames`.
   - `R2_CHAT_FILES_BUCKET` — dedicated bucket for heavy chat ciphertext — **both `content_type=file` AND `content_type=image`** — offloaded off the `chat_messages` row (keeps the row a slim pointer; the body is lazily re-fetched at the delivery exits). Two prefixes in the one bucket: `chatfiles/<user>/<msg>` and `chatimages/<user>/<msg>`, split so images can carry their own lifecycle rule / usage accounting (they dwarf files in both count and bytes). Reads and deletes use the `body_key` stored on the row — never a recomputed one — so an older key layout still resolves; `object_storage.chat_key_owned_by` rejects any key outside the row owner's own prefix. Non-secret name, so both compose files default it to `io-user-attachments` — it activates automatically wherever the frames R2 credentials are injected. **The R2 token MUST also be scoped to `io-user-attachments`** (a frames-only token returns `AccessDenied` on PUT → the offload fails and the row stays inline in Postgres, exactly like today). Create the bucket + widen the token scope before relying on the R2 path.
   - **Migrating existing chat images**: rows written before images joined the offload still carry a 1–2MB base64 body inline. Run `backend/backfill_chat_images_to_r2.py` offline against the target `DATABASE_URL` + R2 creds (`--dry-run` first to count/size; `--user <uid>` to scope). Idempotent + resumable; already-offloaded rows are skipped, and a failed upload leaves the row inline and readable rather than pointing at a missing object.
-  Injected via `phala deploy -e R2_*=<value>` (encrypted env channel; the compose `environment:` keys exist for interpolation, so the *values* are not baked into compose_hash — same mechanism as `DATABASE_URL` / `FEEDLING_SCREEN_VLM_API_KEY`).
+  Injected via `phala deploy -e R2_*=<value>` (encrypted env channel; the compose `environment:` keys exist for interpolation, so the *values* are not baked into compose_hash — same mechanism as `DATABASE_URL` / `FEEDLING_SCREEN_VLM_API_KEY`). Every frame reader must receive the same values: the main `backend`, pooled `serve-worker`, and standalone V1 `agent-runner`; otherwise a valid `body_key` pointer cannot be resolved in that process.
 - **GitHub Secrets / CI wiring** (`.github/workflows/ci.yml` deploy jobs map these into the `phala deploy -e` calls; `backend` service env lives in `deploy/docker-compose.phala*.yaml`):
   - **Prod** (`deploy-cvm`): repo secrets `R2_ENDPOINT`, `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`, `R2_FRAMES_BUCKET`.
   - **Test** (`deploy-test-cvm`): `TEST_`-prefixed secrets `TEST_R2_ENDPOINT`, `TEST_R2_ACCESS_KEY_ID`, `TEST_R2_SECRET_ACCESS_KEY`, `TEST_R2_FRAMES_BUCKET` (mapped to the un-prefixed container env, same convention as `TEST_DATABASE_URL`).
@@ -706,10 +712,12 @@ forge script script/DeployFeedlingAppAuth.s.sol \
 After deploy, run `cast send` with `addComposeHash()` for your compose_hash.
 Record the new address + first-tx info in the table above.
 
-## TEE Postgres — ✅ 已开通（test + prod）
+## TEE Postgres — ✅ 已开通（test + pre + prod）
 
-**状态更新（2026-07-18）**：`feedling-io-db-test` 与 `feedling-io-db-prod`
-（2026-07-14 上线，WAL-G 备份 + 双写 + in-process 同步调度器）均已运行。
+**状态更新**：`feedling-io-db-test` 与 `feedling-io-db-prod` 于 2026-07-18 已运行；
+`feedling-io-db-pre` 于 2026-07-31 独立开通，不再复用 test 影子库。三套均使用
+WAL-G 备份；test/prod 已接双写 + in-process 同步调度器，pre 在首次应用部署验证前
+保持双写关闭。
 实际开通流程与踩坑记录见 `docs/TEE_POSTGRES_SHADOW_PROVISIONING.md`——
 **新开实例以那篇为准**。下列原始 runbook 清单保留作核对参考（对应
 `docs/superpowers/plans/2026-07-07-tee-pg-phase0-1-infra.md` 的 Task 编号）：
@@ -732,6 +740,55 @@ Record the new address + first-tx info in the table above.
 
 密码一律用 `openssl rand -hex`（十六进制无特殊字符）——引号 / `$` / 反引号等字符会
 破坏 ensure-roles 的 SQL 与 compose 环境注入。
+
+### Pre TEE Postgres（prod9）
+
+| | |
+|---|---|
+| CVM | `feedling-io-db-pre`，UUID `dc5c8593-0e44-43a9-b018-fe0431ff44d5` |
+| App ID | `ade3cabf133ec3e9ee6220265843c4ac993e1e63` |
+| Placement | prod9 node 18，`tdx.medium`（2 vCPU / 4GB），30GB ZFS |
+| Public PG | `ade3cabf133ec3e9ee6220265843c4ac993e1e63-5432s.dstack-pha-prod9.phala.network:443`（direct TLS） |
+| Backup | `s3://io-in-enclave-db/pre/wal-g`，pre 独立 libsodium key |
+| Schema baseline | Phase 4 target is the current `alembic_tee` release head (`0017_voice_primary_alignment` at this revision); the owner-only workflow must reach the release's head before any app DSN switch. |
+| Deploy path | `Deploy Postgres CVM` workflow 的 `pre` lane，目标 ID 在 `deploy/pre-pg-cvm-id.txt` |
+| Migration | `TEE migrate` workflow 的 `pre` lane，owner DSN + verify-full CA |
+| App wiring | Shadow stage: `PRE_TEE_DATABASE_URL` + `PRE_FEEDLING_TEE_DUAL_WRITE`. Primary stage: `PRE_DATABASE_URL` points to the TEE app DSN, `FEEDLING_DATABASE_SCHEMA=tee`, and both shadow variables are empty. |
+
+Phase 4 is a stop-the-world release unit. After stopping backend, main
+`serve-worker`, and the independent runner, run the final replicate/reconcile
+and strict verify, then execute the offline bridge tool from the same release:
+
+```bash
+cd backend
+python -m admin.phase4_cutover
+python -m admin.phase4_cutover --apply --confirm-writes-frozen
+```
+
+The first invocation is read-only. The second refuses to run unless Genesis
+chunks/jobs, active voice handoffs, active agent jobs, the action queue, both
+V2 outboxes, and TEE pending-device migrations are drained. It copies
+`frame_envelopes` to the TEE compatibility
+bridge, carries the live Chat R2 storage-generation fences, and aligns every
+identity sequence. Only after its report is green may
+CI redeploy both pre units with the primary-stage variables. Before writes are
+re-enabled, rollback can switch both units back to the RDS DSN with
+`FEEDLING_DATABASE_SCHEMA=rds`; do not mix a TEE DSN with the RDS selector or
+vice versa. After the first TEE-primary write, the frozen RDS no longer contains
+a lossless current state. A later rollback must stop writes and reverse-reconcile
+or restore the TEE changes first; changing only the DSN would lose new/updated
+rows and resurrect deletes.
+
+The apply invocation also requires `TEE_MIGRATION_DATABASE_URL` for the TEE
+owner role. Revision 0011 creates the Chat R2-retirement and archive-immutability
+triggers disabled, so it is safe to migrate before the freeze; apply enables
+them only after data copying, then writes a head-bound prepared marker. TEE-mode
+application startup checks that marker and the three enabled triggers read-only
+and refuses to boot if the prepare was skipped or only partially completed.
+
+The complete encrypted/plaintext two-account release order, inventory queries,
+and test/prod promotion checklist are in
+`docs/CONTENT_ENCRYPTION_TEE_MIGRATION_RUNBOOK.md`.
 
 ### 磁盘 sizing 依据（实测 2026-07-13，prod RDS）
 

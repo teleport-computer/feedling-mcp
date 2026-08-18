@@ -3,6 +3,7 @@
 import os
 
 import psycopg
+import pytest
 
 
 def _tee_conn():
@@ -20,7 +21,8 @@ def test_tee_schema_has_all_tables():
     want = {"server_config","global_blobs","users","user_blobs","user_logs",
             "perception_items","perception_daily","copytext_strings","copytext_meta",
             "genesis_import_jobs","genesis_import_outputs","chat_messages","memory_moments",
-            "world_book_entries","frames","tee_replication_cursors",
+            "world_book_entries","frames","frame_envelopes","genesis_import_chunks",
+            "voice_turn_results","voice_turn_streams","tee_replication_cursors",
             "tee_pending_device_migration","notify_relay_configs","notify_relay_logs",
             "agent_runtime_instances","agent_runtime_supervisor_heartbeats"}
     with _tee_conn() as c:
@@ -32,3 +34,196 @@ def test_tee_version_table_is_isolated():
     with _tee_conn() as c:
         rows = c.execute("SELECT tablename FROM pg_tables WHERE tablename LIKE 'alembic%'").fetchall()
     assert {r[0] for r in rows} == {"alembic_tee_version"}
+
+
+def test_tee_primary_startup_refuses_unprepared_shadow(monkeypatch):
+    """A schema head alone is not proof that the frozen prepare completed."""
+    import db
+
+    with _tee_conn() as c:
+        before = {
+            r[0]
+            for r in c.execute(
+                "SELECT tablename FROM pg_tables WHERE schemaname='public'"
+            ).fetchall()
+        }
+
+    monkeypatch.setenv("DATABASE_URL", os.environ["TEE_DATABASE_URL"])
+    monkeypatch.setenv("FEEDLING_DATABASE_SCHEMA", "tee")
+    with pytest.raises(RuntimeError, match="frozen Phase-4 prepare"):
+        db.init_schema()
+
+    with _tee_conn() as c:
+        after = {
+            r[0]
+            for r in c.execute(
+                "SELECT tablename FROM pg_tables WHERE schemaname='public'"
+            ).fetchall()
+        }
+    assert after == before
+    assert "alembic_version" not in after
+
+
+def test_tee_primary_disables_stale_shadow_configuration(monkeypatch):
+    from tee_shadow import mirror
+
+    monkeypatch.setenv("FEEDLING_DATABASE_SCHEMA", "tee")
+    monkeypatch.setenv("FEEDLING_TEE_DUAL_WRITE", "1")
+    monkeypatch.setenv("TEE_DATABASE_URL", os.environ["TEE_DATABASE_URL"])
+    assert mirror.enabled() is False
+
+
+def test_tee_primary_shared_table_columns_match_runtime_schema():
+    """A shadow may omit scratch values; a promoted primary may not.
+
+    This guard caught the Phase-4 gaps in chat storage generations, Genesis
+    claim ownership, and Runtime V2's effective compaction batch cap.
+    """
+    query = """
+        SELECT table_name, column_name, udt_name, is_nullable
+        FROM information_schema.columns
+        WHERE table_schema='public'
+        ORDER BY table_name, ordinal_position
+    """
+
+    def columns(url: str) -> dict[str, dict[str, tuple[str, str]]]:
+        with psycopg.connect(url) as conn:
+            rows = conn.execute(query).fetchall()
+        result: dict[str, dict[str, tuple[str, str]]] = {}
+        for table, column, udt_name, nullable in rows:
+            result.setdefault(table, {})[column] = (udt_name, nullable)
+        return result
+
+    rds = columns(os.environ["DATABASE_URL"])
+    tee = columns(os.environ["TEE_DATABASE_URL"])
+    shared = set(rds) & set(tee)
+    mismatches = {
+        table: {"rds": rds[table], "tee": tee[table]}
+        for table in sorted(shared)
+        if rds[table] != tee[table]
+    }
+    assert mismatches == {}
+
+
+def test_tee_primary_shared_unique_contracts_match_runtime_schema():
+    """A promoted primary must satisfy every runtime ON CONFLICT target.
+
+    The old shadow deliberately omitted unique indexes because RDS serialized
+    writes.  That is unsafe once TEE becomes DATABASE_URL and was first exposed
+    by the whole-turn metric upsert failing on ``ON CONFLICT (job_id)``.
+    """
+    query = """
+        SELECT table_name, is_primary, is_unique, key_columns, predicate
+        FROM (
+          SELECT tbl.relname AS table_name,
+                 idx.indisprimary AS is_primary,
+                 idx.indisunique AS is_unique,
+                 ARRAY(
+                   SELECT pg_get_indexdef(idx.indexrelid, key_position, true)
+                   FROM generate_series(1, idx.indnkeyatts) AS key_position
+                   ORDER BY key_position
+                 ) AS key_columns,
+                 COALESCE(pg_get_expr(idx.indpred, idx.indrelid), '') AS predicate
+          FROM pg_index AS idx
+          JOIN pg_class AS tbl ON tbl.oid = idx.indrelid
+          JOIN pg_namespace AS ns ON ns.oid = tbl.relnamespace
+          WHERE ns.nspname = 'public'
+            AND (idx.indisprimary OR idx.indisunique)
+        ) AS contracts
+        ORDER BY table_name, is_primary, key_columns, predicate
+    """
+
+    def contracts(url: str) -> dict[str, set[tuple]]:
+        with psycopg.connect(url) as conn:
+            rows = conn.execute(query).fetchall()
+        result: dict[str, set[tuple]] = {}
+        for table, primary, unique, columns, predicate in rows:
+            result.setdefault(table, set()).add(
+                (bool(primary), bool(unique), tuple(columns), predicate)
+            )
+        return result
+
+    rds = contracts(os.environ["DATABASE_URL"])
+    tee = contracts(os.environ["TEE_DATABASE_URL"])
+    shared = set(rds) & set(tee)
+    missing = {
+        table: sorted(rds[table] - tee[table], key=repr)
+        for table in sorted(shared)
+        if rds[table] - tee[table]
+    }
+    assert missing == {}
+
+
+def test_tee_primary_shared_checks_and_foreign_keys_match_runtime_schema():
+    """Primary data validity and cascade behavior must match RDS."""
+    query = """
+        SELECT tbl.relname, contract.contype,
+               pg_get_constraintdef(contract.oid, true)
+        FROM pg_constraint AS contract
+        JOIN pg_class AS tbl ON tbl.oid = contract.conrelid
+        JOIN pg_namespace AS ns ON ns.oid = tbl.relnamespace
+        WHERE ns.nspname = 'public'
+          AND contract.contype IN ('c', 'f', 'x')
+        ORDER BY tbl.relname, contract.contype,
+                 pg_get_constraintdef(contract.oid, true)
+    """
+
+    def constraints(url: str) -> dict[str, set[tuple[str, str]]]:
+        with psycopg.connect(url) as conn:
+            rows = conn.execute(query).fetchall()
+        result: dict[str, set[tuple[str, str]]] = {}
+        for table, kind, definition in rows:
+            result.setdefault(table, set()).add((kind, definition))
+        return result
+
+    rds = constraints(os.environ["DATABASE_URL"])
+    tee = constraints(os.environ["TEE_DATABASE_URL"])
+    shared = set(rds) & set(tee)
+    missing = {
+        table: sorted(rds[table] - tee[table])
+        for table in sorted(shared)
+        if rds[table] - tee[table]
+    }
+    assert missing == {}
+
+
+def test_tee_primary_shared_runtime_indexes_match_runtime_schema():
+    """Do not promote a schema that drops the runtime's query plan contracts."""
+    query = """
+        SELECT tbl.relname, idx.indisprimary, idx.indisunique,
+               idx.indnkeyatts, idx.indnatts,
+               ARRAY(
+                 SELECT pg_get_indexdef(idx.indexrelid, position, true)
+                 FROM generate_series(1, idx.indnatts) AS position
+                 ORDER BY position
+               ),
+               COALESCE(pg_get_expr(idx.indpred, idx.indrelid), '')
+        FROM pg_index AS idx
+        JOIN pg_class AS tbl ON tbl.oid = idx.indrelid
+        JOIN pg_namespace AS ns ON ns.oid = tbl.relnamespace
+        WHERE ns.nspname = 'public'
+        ORDER BY tbl.relname, idx.indisprimary, idx.indisunique
+    """
+
+    def indexes(url: str) -> dict[str, set[tuple]]:
+        with psycopg.connect(url) as conn:
+            rows = conn.execute(query).fetchall()
+        result: dict[str, set[tuple]] = {}
+        for table, primary, unique, key_count, attr_count, columns, predicate in rows:
+            result.setdefault(table, set()).add(
+                (
+                    bool(primary), bool(unique), int(key_count), int(attr_count),
+                    tuple(columns), predicate,
+                )
+            )
+        return result
+
+    rds = indexes(os.environ["DATABASE_URL"])
+    tee = indexes(os.environ["TEE_DATABASE_URL"])
+    shared = set(rds) & set(tee)
+    missing = {
+        table: sorted(rds[table] - tee[table], key=repr)
+        for table in sorted(shared)
+        if rds[table] - tee[table]
+    }
+    assert missing == {}

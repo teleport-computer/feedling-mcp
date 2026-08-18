@@ -120,6 +120,38 @@ def test_profile_document_rejects_torn_or_plaintext_fields():
         profile_store.validate_profile_document(doc)
 
 
+def test_profile_document_accepts_plaintext_content_shape():
+    uid = "u-profile-plaintext-shape"
+    doc = profile_store.build_profile_document(
+        uid,
+        state="ok",
+        source=_source(1),
+        last_attempt=_attempt(),
+        memory_text="memory plain",
+        style_text="style plain",
+        seal_text=lambda user_id, text: {
+            "body": text,
+            "id": f"{user_id}:{len(text)}",
+            "owner_user_id": user_id,
+            "visibility": "shared",
+        },
+    )
+
+    assert doc["memory"]["envelope"]["body"] == "memory plain"
+    assert doc["style"]["envelope"]["body"] == "style plain"
+    assert "body_ct" not in doc["memory"]["envelope"]
+
+
+def test_profile_document_rejects_mixed_content_shape():
+    doc = _ok_doc("u-profile-mixed-shape", 1)
+    doc["memory"]["envelope"]["body"] = "plaintext leak"
+
+    with pytest.raises(
+        profile_store.ProfileStorageError, match="mixed_memory_content_shape"
+    ):
+        profile_store.validate_profile_document(doc)
+
+
 def test_profile_document_accepts_empty_strings_for_explicitly_untouched_side():
     document = profile_store.build_profile_document(
         "u-profile-empty-side",
@@ -708,6 +740,38 @@ def test_ok_profile_suppresses_summary_only_after_both_fields_decrypt():
     assert selection.summary == ""
     assert selection.memory == "memory-1"
     assert selection.style == "style-1"
+
+
+def test_ok_plaintext_profile_bypasses_decrypt():
+    uid = "u-profile-plaintext-turn"
+    doc = profile_store.build_profile_document(
+        uid,
+        state="ok",
+        source=_source(1),
+        last_attempt=_attempt(),
+        memory_text="memory plain",
+        style_text="style plain",
+        seal_text=lambda user_id, text: {
+            "body": text,
+            "id": f"{user_id}:{len(text)}",
+            "owner_user_id": user_id,
+            "visibility": "shared",
+        },
+    )
+    selection = profile_store.select_profile_for_turn(
+        uid,
+        "- old summary",
+        enabled=True,
+        read_blob=lambda *_args: doc,
+        decrypt_envelope=lambda *_args: (_ for _ in ()).throw(
+            AssertionError("plaintext profile must not touch enclave")
+        ),
+    )
+
+    assert selection.used_profile is True
+    assert selection.summary == ""
+    assert selection.memory == "memory plain"
+    assert selection.style == "style plain"
 
 
 def test_disabled_ok_profile_keeps_summary_without_decrypting_fields():

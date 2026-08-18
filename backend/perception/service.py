@@ -25,7 +25,10 @@ from datetime import datetime
 from typing import Any, Callable, Mapping
 
 from content_encryption import random_item_id
-from core import enclave as core_enclave
+from core import envelope as core_envelope
+from core import enclave as core_enclave  # noqa: F401 — 读侧已改走 core_envelope.read_envelope_body；
+# 这行保留是因为测试 monkeypatch `<module>.core_enclave` 上的
+# _decrypt_envelope_via_enclave（patch 的是共享模块对象，仍然生效）。
 
 from . import catalog, history, permissions, resolve, store
 from .ingress_v2 import device_event_observations_v2, operation_observations_v2, observe_signal_v2
@@ -139,10 +142,13 @@ def _decrypt_signal_payload_v2(
 ) -> tuple[Any | None, str]:
     if not isinstance(envelope, Mapping):
         return None, "invalid_envelope"
-    if not api_key and decrypt_envelope is None:
+    if (not envelope.get("body") and not envelope.get("body_b64")
+            and not api_key and decrypt_envelope is None):
         return None, "decrypt_skipped"
     try:
-        decrypt = decrypt_envelope or core_enclave._decrypt_envelope_via_enclave
+        # 默认走形状路由：明文行直读、信封行才打 enclave。签名与
+        # _decrypt_envelope_via_enclave 逐字一致，注入方（测试/上层）不受影响。
+        decrypt = decrypt_envelope or core_envelope.read_envelope_body
         raw = decrypt(dict(envelope), api_key, purpose=f"perception:{key}")
         return _decode_decrypted_payload_v2(raw), ""
     except Exception as e:
@@ -370,11 +376,19 @@ def _ingest_snapshot_v2_inner(
                 results[key] = "accepted"
             continue
         if key in ENCRYPTED_SIGNAL_KEYS_V2:
-            if signal.encrypted:
+            envelope = item.get("envelope")
+            if isinstance(envelope, Mapping):
+                shape_error = None
+                if envelope.get("body") is not None:
+                    shape_error = core_envelope.validate_uploaded_envelope(
+                        dict(envelope), user_id=user_id)
+                if shape_error is not None:
+                    results[key] = str(shape_error.get("error") or "invalid_envelope")
+                    continue
                 results[key] = "accepted"
                 plaintext, err = _decrypt_signal_payload_v2(
                     key,
-                    item.get("envelope") if isinstance(item.get("envelope"), Mapping) else {},
+                    envelope,
                     api_key=api_key,
                     decrypt_envelope=decrypt_envelope,
                 )
@@ -1306,7 +1320,11 @@ def photo_evaluate(user_id: str, metadata: dict,
         return {"error": "content_envelope_required"}, 400
 
     # Store ciphertext in the frame channel + metadata as a confirmed item.
-    store.put_photo_envelope(user_id, photo_id, now, content_envelope)
+    stored = store.put_photo_envelope(user_id, photo_id, now, content_envelope)
+    if stored is False:
+        # Do not confirm metadata without durable pixels. iOS keeps its cursor
+        # unchanged on this retryable non-2xx response.
+        return {"error": "photo_storage_unavailable"}, 503
     doc = {"photo_id": photo_id, "metadata": meta_out, "status": "confirmed",
            "usable": True, "sensitive": sensitive, "frame_id": photo_id}
     if meta_envelope:

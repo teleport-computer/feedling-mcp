@@ -440,6 +440,28 @@ def _fetch_provider_key(api_url: str, enclave_url: str, runtime_token: str, *, s
         raise GenesisWorkerError(f"provider_key_envelope_fetch_failed:{type(e).__name__}") from e
     if not isinstance(envelope, dict):
         raise GenesisWorkerError("provider_key_envelope_missing")
+    return _provider_key_from_envelope(
+        envelope, enclave_url=enclave_url, runtime_token=runtime_token,
+        store=store, job_id=job_id)
+
+
+def _provider_key_from_envelope(envelope: dict, *, enclave_url: str,
+                                runtime_token: str, store=None,
+                                job_id: str = "") -> str:
+    """取 provider key：明文行本地直读，信封行才走 enclave。
+
+    cutover 后 ``model_api_credentials`` 的 ``api_key_envelope`` 是
+    ``{body,…}``、无 ``body_ct``（表同步在复制时已解密）。原样发给 enclave 会拿回
+    ``decrypt_failed: envelope missing body_ct``，genesis 入住流程直接失败。
+    判据与 ``core.envelope.decrypt_provider_key_envelope`` 一致（``body_ct`` 优先）。
+
+    这里不复用 core 那个函数：genesis worker 与 enclave 只经 HTTP 打交道，
+    走的是本模块自己的 ``_decrypt_envelope``（带 store/job_id 的审计参数）。
+    """
+    if not envelope.get("body_ct"):
+        body = envelope.get("body")
+        if isinstance(body, str):
+            return body
     return _decrypt_envelope(
         enclave_url,
         runtime_token,
@@ -542,14 +564,13 @@ def _decrypt_chunks(enclave_url: str, runtime_token: str, chunks: list[dict], *,
     texts: list[str] = []
     for chunk in chunks:
         envelope = service.chunk_envelope_from_row(chunk)
-        raw = _decrypt_envelope(
-            enclave_url,
-            runtime_token,
-            envelope,
-            purpose="genesis_chunk",
-            store=store,
-            job_id=job_id,
-        )
+        if envelope.get("body") is not None:
+            raw = str(envelope.get("body") or "").encode("utf-8")
+        else:
+            raw = _decrypt_envelope(
+                enclave_url, runtime_token, envelope, purpose="genesis_chunk",
+                store=store, job_id=job_id,
+            )
         texts.append(raw.decode("utf-8"))
     return texts
 
@@ -566,6 +587,15 @@ def _decrypt_blob_text(
     envelope = blob.get("content_envelope") if isinstance(blob.get("content_envelope"), dict) else {}
     if not envelope:
         return ""
+    from core import envelope as core_envelope
+
+    shape = core_envelope.classify_envelope_shape(envelope)
+    if shape in ("plaintext_text", "plaintext_binary"):
+        raw = core_envelope.read_plaintext_envelope_body(
+            envelope,
+            owner_user_id=str(getattr(store, "user_id", "") or ""),
+        )
+        return raw.decode("utf-8")
     return _decrypt_envelope(enclave_url, runtime_token, envelope, purpose=purpose, store=store, job_id=job_id).decode("utf-8")
 
 
@@ -809,6 +839,7 @@ def _complete_text(
     max_tokens: int,
     idempotency_key: str,
     temperature: float = 0.2,
+    response_format: dict[str, Any] | None = None,
 ) -> str:
     result = llm.complete(
         user_id=user_id,
@@ -820,6 +851,7 @@ def _complete_text(
         timeout=float(_env_int("FEEDLING_GENESIS_LLM_TIMEOUT_SEC", 90)),
         idempotency_key=idempotency_key,
         temperature=temperature,
+        response_format=response_format,
     )
     return result.text
 
@@ -1568,8 +1600,15 @@ def build_profile_output_from_sources(
         max_tokens,
         temperature,
         timeout,
+        response_format=None,
+        tools=None,
+        tool_choice=None,
     ):
-        del timeout
+        # Genesis uses the synchronous provider surface, which supports native
+        # JSON mode but not forced tool choice.  The shared profile prompt is
+        # already strict JSON, so preserve JSON mode and intentionally ignore
+        # the optional tool hint instead of rejecting the V2 call contract.
+        del timeout, tools, tool_choice
         nonlocal call_number
         call_number += 1
         reply = _complete_text(
@@ -1581,6 +1620,7 @@ def build_profile_output_from_sources(
             messages=messages,
             max_tokens=max_tokens,
             temperature=temperature,
+            response_format=response_format,
             idempotency_key=f"{prefix}:profile:{call_number}",
         )
         return {"reply": reply}

@@ -54,6 +54,28 @@ _PROFILE_MAP_SYSTEM_PROMPT = (
 )
 
 
+@dataclass(frozen=True)
+class _ProfileOutputTool:
+    name: str
+    description: str
+    parameters: dict[str, Any]
+
+
+_PROFILE_OUTPUT_TOOL = _ProfileOutputTool(
+    name="emit_profile",
+    description="Return the distilled MEMORY and STYLE profile fields.",
+    parameters={
+        "type": "object",
+        "properties": {
+            "memory": {"type": "string", "maxLength": PROFILE_MEMORY_MAX_CHARS},
+            "style": {"type": "string", "maxLength": PROFILE_STYLE_MAX_CHARS},
+        },
+        "required": ["memory", "style"],
+        "additionalProperties": False,
+    },
+)
+
+
 class ProfileGenerationExhausted(RuntimeError):
     """A bounded profile map/reduce cannot finish within its call budget."""
 
@@ -520,6 +542,7 @@ async def generate_profile(
         *,
         max_tokens: int,
         temperature: float,
+        json_object: bool = False,
     ) -> Any:
         nonlocal provider_calls
         if provider_calls >= call_limit:
@@ -531,19 +554,64 @@ async def generate_profile(
             {"tail_window": dict(provider_tail_window)},
         )
         try:
-            result = await llm(
-                provider_config,
-                messages,
-                max_tokens=max_tokens,
-                temperature=temperature,
-                timeout=90.0,
-            )
+            call_kwargs: dict[str, Any] = {
+                "max_tokens": max_tokens,
+                "temperature": temperature,
+                "timeout": 90.0,
+            }
+            if json_object:
+                # Use the provider adapter's native JSON mode when available;
+                # adapters without one append the same strict JSON-only
+                # instruction.  This is intentionally limited to the final
+                # two-field response: map summaries are bullet text.
+                call_kwargs["response_format"] = {"type": "json_object"}
+                call_kwargs["tools"] = [_PROFILE_OUTPUT_TOOL]
+                call_kwargs["tool_choice"] = {
+                    "type": "function",
+                    "function": {"name": _PROFILE_OUTPUT_TOOL.name},
+                }
+            result = await llm(provider_config, messages, **call_kwargs)
         except Exception:
             if usage_out is not None:
                 usage_out(None)
             raise
         if usage_out is not None:
             usage_out(result.get("usage") if isinstance(result, dict) else None)
+        if json_object:
+            if isinstance(result, dict):
+                tool_calls = result.get("tool_calls")
+                if isinstance(tool_calls, list):
+                    matching = [
+                        call
+                        for call in tool_calls
+                        if isinstance(call, dict)
+                        and call.get("name") == _PROFILE_OUTPUT_TOOL.name
+                        and call.get("args_ok") is not False
+                        and isinstance(call.get("args"), dict)
+                    ]
+                    if len(matching) == 1:
+                        result = dict(result)
+                        result["reply"] = json.dumps(
+                            matching[0]["args"], ensure_ascii=False
+                        )
+            reply = result.get("reply") if isinstance(result, dict) else None
+            await _emit(
+                trajectory_out,
+                "profile_provider_response_observed",
+                {
+                    "provider_call": provider_calls,
+                    "reply_is_text": isinstance(reply, str),
+                    "reply_chars": len(reply) if isinstance(reply, str) else 0,
+                    "has_json_object": bool(
+                        isinstance(reply, str) and _extract_json_block(reply)
+                    ),
+                    "stop_reason": str(
+                        (result.get("stop_reason") or "")
+                        if isinstance(result, dict)
+                        else ""
+                    )[:40],
+                },
+            )
         return result
 
     final_source = source
@@ -598,6 +666,7 @@ async def generate_profile(
         messages,
         max_tokens=_PROFILE_MAX_OUTPUT_TOKENS,
         temperature=0.2,
+        json_object=True,
     )
     reply = result.get("reply") if isinstance(result, dict) else None
     fields, reject, observation = _validate_profile_with_observation(
@@ -645,6 +714,7 @@ async def generate_profile(
         retry_messages,
         max_tokens=_PROFILE_MAX_OUTPUT_TOKENS,
         temperature=0.2,
+        json_object=True,
     )
     retry_reply = retry_result.get("reply") if isinstance(retry_result, dict) else None
     fields, retry_reject, observation = _validate_profile_with_observation(

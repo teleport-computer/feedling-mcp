@@ -154,6 +154,13 @@ async def lifespan(app):
 
     core_envelope.get_user_public_key = accounts_registry._get_user_public_key
 
+    # (4c) 同理注入「生效内容形状」解析（v6 加密可选）。用 effective 而不是原始
+    #      偏好：它把 core.envelope.PLAINTEXT_WRITES_ACCEPTED 一并算进去，所以
+    #      服务端自产内容与客户端上传闸是**同一个开关**，不会一边放开一边没放。
+    #      未接线时 core 侧默认 "on"（fail-safe 加密）。
+    core_envelope.resolve_content_encryption = (
+        accounts_registry.effective_content_encryption)
+
     # (5) Cross-worker wake bus — always on (required for poll wakes). Its
     #     "users" handler keeps the registry fresh on later cross-process writes.
     _start_wake_bus()

@@ -27,6 +27,7 @@ credentials through the current enclave adapter.
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import sys
 from pathlib import Path
@@ -39,6 +40,7 @@ from asgi import middleware  # noqa: E402
 from fastapi import FastAPI  # noqa: E402
 
 import accounts.auth_core as auth_core  # noqa: E402
+from core import envelope as core_envelope  # noqa: E402
 import perception.routes_asgi as perception_asgi  # noqa: E402
 import perception.service as service  # noqa: E402
 
@@ -280,6 +282,71 @@ def test_photo_evaluate_stores_ciphertext_parity(env):
     stored = fake.get_photo_envelope(UID, "p_ok")
     assert stored["body_ct"] == "CIPHERTEXT"
     assert "image_b64" not in stored and "ocr_text" not in stored
+
+
+def test_photo_evaluate_stores_plaintext_binary_for_off_account(env, monkeypatch):
+    fake, _ = env
+    raw = b"jpeg-plaintext"
+    wire = {
+        "v": 1, "id": "p_plain", "body_b64": base64.b64encode(raw).decode(),
+        "body_size_bytes": len(raw), "visibility": "shared", "owner_user_id": UID,
+    }
+    monkeypatch.setattr(core_envelope, "PLAINTEXT_WRITES_ACCEPTED", True)
+    monkeypatch.setattr(core_envelope, "resolve_content_encryption", lambda uid: "off")
+
+    status, out, _ct = _both(
+        "POST", "/v1/perception/photo/evaluate",
+        json={"metadata": {"scene_hint": "landscape"}, "content_envelope": wire},
+    )
+
+    assert status == 200 and out["photo_id"] == "p_plain"
+    assert fake.get_photo_envelope(UID, "p_plain") == wire
+
+
+def test_photo_evaluate_rejects_plaintext_binary_owned_by_another_user(
+    env, monkeypatch,
+):
+    fake, _ = env
+    wire = {
+        "v": 1,
+        "id": "p_wrong_owner",
+        "body_b64": base64.b64encode(b"jpeg-plaintext").decode(),
+        "body_size_bytes": len(b"jpeg-plaintext"),
+        "visibility": "shared",
+        "owner_user_id": "usr_someone_else",
+    }
+    monkeypatch.setattr(core_envelope, "PLAINTEXT_WRITES_ACCEPTED", True)
+    monkeypatch.setattr(core_envelope, "resolve_content_encryption", lambda uid: "off")
+
+    status, out, _ct = _both(
+        "POST", "/v1/perception/photo/evaluate",
+        json={"metadata": {"scene_hint": "landscape"}, "content_envelope": wire},
+    )
+
+    assert status == 403
+    assert out == {"error": "envelope.owner_user_id does not match caller"}
+    assert fake.get_photo_envelope(UID, "p_wrong_owner") is None
+
+
+def test_photo_evaluate_rejects_utf8_plaintext_photo_shape(env, monkeypatch):
+    fake, _ = env
+    wire = {
+        "id": "p_utf8",
+        "body": "not a binary photo envelope",
+        "visibility": "shared",
+        "owner_user_id": UID,
+    }
+    monkeypatch.setattr(core_envelope, "PLAINTEXT_WRITES_ACCEPTED", True)
+    monkeypatch.setattr(core_envelope, "resolve_content_encryption", lambda uid: "off")
+
+    status, out, _ct = _both(
+        "POST", "/v1/perception/photo/evaluate",
+        json={"metadata": {"scene_hint": "landscape"}, "content_envelope": wire},
+    )
+
+    assert status == 400
+    assert out == {"error": "photo_content_envelope_requires_binary_body"}
+    assert fake.get_photo_envelope(UID, "p_utf8") is None
 
 
 def test_photo_evaluate_missing_envelope_400_parity(env):

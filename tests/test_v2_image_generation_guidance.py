@@ -39,7 +39,12 @@ def _run(monkeypatch, *, classified, exc_text="boom", has_route=False):
     monkeypatch.setattr(
         serve_worker.db, "model_api_image_generation_route",
         lambda _uid: ({"id": "r1", "image_generation_test_status": "ok",
-                       "api_key_envelope": {"ciphertext": "x"}} if has_route else None),
+                       "api_key_envelope": {
+                           "body_ct": "x", "nonce": "n",
+                           "K_user": "ku", "K_enclave": "ke",
+                           "id": "credential-1", "owner_user_id": _uid,
+                           "visibility": "shared", "v": 1,
+                       }} if has_route else None),
     )
     monkeypatch.setattr(serve_worker.db, "model_api_active_route", lambda _uid: None)
     monkeypatch.setattr(

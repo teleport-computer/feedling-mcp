@@ -45,12 +45,16 @@ async def v1_worldbook_match(request: Request):
             if not isinstance(env, dict):
                 continue
             entry_id = str(env.get("id") or "")
-            if env.get("visibility") == "local_only" or not env.get("K_enclave"):
+            if env.get("visibility") == "local_only" or (
+                not env.get("K_enclave")
+                and env.get("body") is None
+                and env.get("body_b64") is None
+            ):
                 if entry_id:
                     unavailable_ids.append(entry_id)
                 continue
             try:
-                plaintext = envelope.decrypt_envelope(env, user_id or "", content_sk)
+                plaintext = envelope.read_envelope(env, user_id or "", content_sk)
                 inner = json.loads(plaintext.decode("utf-8"))
                 if not isinstance(inner, dict):
                     raise ValueError("world book plaintext is not an object")

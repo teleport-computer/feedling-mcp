@@ -1,4 +1,4 @@
-# deploy/docker-compose.phala.postgres.yaml — feedling-pg-{test,prod} CVM
+# deploy/docker-compose.phala.postgres.yaml — feedling-pg-{test,pre,prod} CVM
 #
 # 部署（首次开通见 DEPLOYMENTS.md runbook；日常用 pg-deploy workflow）：
 #   phala deploy --cvm-id <id> -c deploy/docker-compose.phala.postgres.yaml -e KEY=VAL ... --wait

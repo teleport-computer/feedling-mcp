@@ -27,6 +27,7 @@ from datetime import datetime
 import db
 import debug_trace
 from accounts import registry
+from core import envelope as core_envelope
 from bootstrap import gates as boot_gates
 from identity import service as identity_service
 from memory import actions as memory_actions_mod
@@ -329,14 +330,9 @@ def add(store, payload: dict) -> tuple[dict, int]:
     if envelope is None:
         return {"error": "envelope required (v1 encryption is mandatory)"}, 400
 
-    required = ["body_ct", "nonce", "K_user", "visibility", "owner_user_id"]
-    missing = [f for f in required if not envelope.get(f)]
-    if missing:
-        return {"error": "envelope_missing_fields", "detail": missing}, 400
-    if envelope["visibility"] not in ("shared", "local_only"):
-        return {"error": "envelope.visibility must be 'shared' or 'local_only'"}, 400
-    if envelope["visibility"] == "shared" and not envelope.get("K_enclave"):
-        return {"error": "envelope with visibility=shared requires K_enclave"}, 400
+    gate_err = core_envelope.validate_uploaded_envelope(envelope, user_id=store.user_id)
+    if gate_err is not None:
+        return gate_err, 400
     occurred_at = memory_timestamps.normalize(envelope.get("occurred_at"))
     if not occurred_at:
         return {"error": "occurred_at required (plaintext metadata for ordering)"}, 400
@@ -402,15 +398,9 @@ def add(store, payload: dict) -> tuple[dict, int]:
         "occurred_at": occurred_at,
         "created_at": now,
         "source": (envelope.get("source") or "live_conversation").strip(),
-        "body_ct": envelope["body_ct"],
-        "nonce": envelope["nonce"],
-        "K_user": envelope["K_user"],
-        "enclave_pk_fpr": envelope.get("enclave_pk_fpr", ""),
-        "visibility": envelope["visibility"],
-        "owner_user_id": envelope["owner_user_id"],
+        "enclave_pk_fpr": "",
+        **core_envelope.envelope_storage_fields(envelope),
     }
-    if envelope.get("K_enclave"):
-        moment["K_enclave"] = envelope["K_enclave"]
     if anchor_ids:
         moment["anchor_memory_ids"] = list(anchor_ids)
     # Re-read + append + save under one memory_lock hold so a concurrent

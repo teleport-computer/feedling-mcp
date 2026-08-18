@@ -1,8 +1,9 @@
-"""Encrypted storage contract for the Runtime V2 MEMORY/STYLE profile.
+"""Content-shape-aware storage contract for the Runtime V2 MEMORY/STYLE profile.
 
 ``user_blobs.doc`` is ordinary JSONB.  Only bounded metadata may live outside
-the two shared envelopes; profile plaintext must be sealed before this module
-hands a document to the blob CAS or its TEE mirror.
+the two content records. Each record follows the user's effective content
+encryption shape: encrypted tier stores a shared envelope; plaintext tier stores
+``body``. The blob CAS and TEE mirror preserve that chosen shape verbatim.
 """
 
 from __future__ import annotations
@@ -110,16 +111,20 @@ def _nonnegative_int(value: Any, name: str) -> int:
     return parsed
 
 
-def _validate_encrypted_field(value: Any, name: str) -> dict:
+def _validate_content_field(value: Any, name: str) -> dict:
     if not isinstance(value, dict):
         raise ProfileStorageError(f"invalid_{name}")
     envelope = value.get("envelope")
     if not isinstance(envelope, dict) or not envelope:
         raise ProfileStorageError(f"invalid_{name}_envelope")
-    if not str(envelope.get("body_ct") or ""):
-        raise ProfileStorageError(f"invalid_{name}_ciphertext")
     if any(key in envelope for key in ("plaintext", "text", "content")):
         raise ProfileStorageError(f"plaintext_{name}_envelope")
+    has_ciphertext = bool(str(envelope.get("body_ct") or ""))
+    has_plaintext = isinstance(envelope.get("body"), str)
+    if has_ciphertext and has_plaintext:
+        raise ProfileStorageError(f"mixed_{name}_content_shape")
+    if not has_ciphertext and not has_plaintext:
+        raise ProfileStorageError(f"invalid_{name}_content_shape")
     chars = _nonnegative_int(value.get("chars"), f"{name}_chars")
     return {"envelope": deepcopy(envelope), "chars": chars}
 
@@ -208,8 +213,8 @@ def validate_profile_document(value: Any) -> dict:
     if (memory is None) != (style_value is None):
         raise ProfileStorageError("profile_fields_torn")
     if memory is not None:
-        normalized["memory"] = _validate_encrypted_field(memory, "memory")
-        normalized[style_key] = _validate_encrypted_field(
+        normalized["memory"] = _validate_content_field(memory, "memory")
+        normalized[style_key] = _validate_content_field(
             style_value,
             style_key,
         )
@@ -241,11 +246,14 @@ def build_profile_document(
     disabled: bool = False,
     seal_text: Callable[[str, str], dict] = _seal_text,
 ) -> dict:
-    """Build one all-or-nothing profile document with locally sealed fields.
+    """Build one all-or-nothing profile document with shape-routed fields.
 
     A degraded/pending metadata update may omit both plaintext fields to retain
-    the previous winning envelopes.  Supplying only one field is always a torn
-    write and fails before any CAS.
+    the previous winning records. ``seal_text`` is retained as the injection
+    parameter name for source compatibility; the production implementation
+    returns either a shared envelope or ``body`` according to effective
+    ``content_encryption``. Supplying only one field is always a torn write and
+    fails before any CAS.
     """
     if (memory_text is None) != (style_text is None):
         raise ProfileStorageError("profile_fields_torn")
@@ -293,13 +301,13 @@ def build_profile_document_patching_fields(
     disabled: bool | None = None,
     seal_text: Callable[[str, str], dict] = _seal_text,
 ) -> dict:
-    """Seal touched fields and byte-preserve untouched encrypted fields.
+    """Write touched fields and byte-preserve untouched content shapes.
 
     Genesis can derive only MEMORY or only STYLE from one upload.  Requiring it
     to decrypt and reseal the untouched side adds an enclave dependency and can
-    change ciphertext for data the pass did not own.  A missing prior side is
-    initialized as an encrypted empty string so the paired-field contract stays
-    atomic.
+    change content for data the pass did not own. A missing prior side is
+    initialized through ``seal_text`` using the owner's effective content shape
+    so the paired-field contract stays atomic.
     """
     prior = (
         validate_profile_document(previous)
@@ -572,7 +580,7 @@ def select_profile_for_turn(
     decrypt_envelope: Callable[[dict, str], bytes],
     read_blob: Callable[[str, str], Any] = db.get_blob_strict,
 ) -> ProfilePromptSelection:
-    """Strictly read/decrypt an enabled profile or visibly fall back to summary."""
+    """Strictly read an enabled profile by field shape or visibly fall back."""
     if not enabled:
         return ProfilePromptSelection(summary=str(summary))
     try:
@@ -601,18 +609,22 @@ def select_profile_for_turn(
         return ProfilePromptSelection(
             summary=str(summary), fallback_reason=f"state:{document['state']}"
         )
+    def _read_field(name: str) -> str:
+        envelope = document[name]["envelope"]
+        if envelope.get("body_ct"):
+            return decrypt_envelope(envelope, name).decode("utf-8")
+        body = envelope.get("body")
+        if isinstance(body, str):
+            return body
+        raise ProfileStorageError(f"invalid_{name}_content_shape")
+
     try:
-        memory = decrypt_envelope(document["memory"]["envelope"], "memory").decode(
-            "utf-8"
-        )
+        memory = _read_field("memory")
         # TODO(profile-style-migration): delete the USER fallback after the
         # fleet has naturally rewritten every profile through distillation.
         style_key = "style" if document.get("style") is not None else "user"
         style_field = document[style_key]
-        style = decrypt_envelope(
-            style_field["envelope"],
-            style_key,
-        ).decode("utf-8")
+        style = _read_field(style_key)
         if len(memory) != document["memory"]["chars"]:
             raise ProfileStorageError("memory_chars_mismatch")
         if len(style) != style_field["chars"]:

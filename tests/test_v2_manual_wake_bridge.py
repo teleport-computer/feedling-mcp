@@ -4,6 +4,7 @@ db_action_v2 用户没有常驻 consumer（D0 排他性 guard 已把他们从发
 所以 MANUAL wake（"talk to me now"）不能再走常驻 proactive_job（永远不会被认领）；
 必须落成 V2 的 manual_wake agent_job。非 manual（heartbeat）tick 归 V2 scheduler
 自己管，这里不建任何常驻 job。"""
+import re
 import sys
 from pathlib import Path
 
@@ -44,7 +45,8 @@ def _manual_wake_jobs(uid):
     with db.get_pool().connection() as conn:
         with conn.cursor(row_factory=dict_row) as cur:
             cur.execute(
-                "SELECT id, lane, status, reason FROM agent_jobs WHERE user_id=%s AND lane='manual_wake'",
+                "SELECT id, lane, status, reason, trace_id FROM agent_jobs "
+                "WHERE user_id=%s AND lane='manual_wake'",
                 (uid,),
             )
             rows = cur.fetchall()
@@ -84,6 +86,7 @@ def test_db_action_v2_manual_tick_enqueues_manual_wake_job(monkeypatch):
     rows = _manual_wake_jobs("u_manual_v2")
     assert len(rows) == 1
     assert rows[0]["status"] == "pending"
+    assert re.fullmatch(r"[0-9a-f]{32}", rows[0]["trace_id"])
 
 
 def test_db_action_v2_manual_via_force_flag_also_enqueues(monkeypatch):

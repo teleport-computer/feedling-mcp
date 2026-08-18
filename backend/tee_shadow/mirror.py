@@ -17,6 +17,12 @@ _failures_lock = threading.Lock()
 
 
 def enabled() -> bool:
+    # Once DATABASE_URL is the promoted TEE database there is no shadow target.
+    # Fail closed even if stale rollout secrets still carry the old dual-write
+    # flag/DSN; otherwise a request could write the primary twice or resurrect
+    # the Phase-3 scheduler after cutover.
+    if os.environ.get("FEEDLING_DATABASE_SCHEMA", "rds").strip().lower() == "tee":
+        return False
     return os.environ.get("FEEDLING_TEE_DUAL_WRITE", "") == "1" and bool(
         os.environ.get("TEE_DATABASE_URL"))
 

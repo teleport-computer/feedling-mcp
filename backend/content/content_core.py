@@ -144,9 +144,20 @@ def _encrypted_content_counts(store: UserStore) -> dict:
 # --------------------------------------------------------------------------- #
 
 def _swap_envelope_missing(env) -> list:
+    """三种形状都收（v6）：信封、UTF-8 明文、二进制明文。
+
+    形状判别用 ``body_ct`` 在不在，与读侧的 ``body_ct`` 优先规则一致；两者都没有
+    时按信封报缺失，把「你想传信封但漏了字段」这个更常见的意图放在前面。
+    """
     if not isinstance(env, dict):
         return ["envelope"]
-    return [f for f in ("body_ct", "nonce", "K_user", "visibility", "owner_user_id") if not env.get(f)]
+    common = ("visibility", "owner_user_id")
+    if (
+        (env.get("body") is not None or env.get("body_b64") is not None)
+        and not env.get("body_ct")
+    ):
+        return [f for f in common if not env.get(f)]
+    return [f for f in ("body_ct", "nonce", "K_user", *common) if not env.get(f)]
 
 
 def _swap_summary(results: list) -> dict:
@@ -197,21 +208,16 @@ def _swap_chat(
             if msg.get("id") != msg_id:
                 continue
             if env is not None:
+                if env.get("body_b64") is not None:
+                    gate_err = core_envelope.validate_uploaded_chat_envelope(
+                        env,
+                        user_id=store.user_id,
+                        content_type=str(msg.get("content_type") or "text"),
+                    )
+                    if gate_err is not None:
+                        return f"error: {gate_err['error']}"
                 msg["v"] = int(env.get("v", 1))
-                msg["body_ct"] = env["body_ct"]
-                msg["nonce"] = env["nonce"]
-                msg["K_user"] = env["K_user"]
-                if env.get("K_enclave"):
-                    msg["K_enclave"] = env["K_enclave"]
-                else:
-                    msg.pop("K_enclave", None)
-                msg["enclave_pk_fpr"] = env.get("enclave_pk_fpr", "")
-                if env.get("content_pk_fpr"):
-                    msg["content_pk_fpr"] = env["content_pk_fpr"]
-                else:
-                    msg.pop("content_pk_fpr", None)
-                msg["visibility"] = env["visibility"]
-                msg["owner_user_id"] = env["owner_user_id"]
+                core_envelope.replace_record_shape(msg, env)
             for prefix, sub_env in (sub_envs or {}).items():
                 _apply_sub_envelope_fields(msg, prefix, sub_env)
             # Full-row replace: the K_enclave key may have been removed, which a
@@ -232,17 +238,9 @@ def _swap_memory_inplace(moments: list, mom_id: str, env: dict) -> str:
         if m.get("id") != mom_id:
             continue
         m["v"] = int(env.get("v", 1))
-        m["body_ct"] = env["body_ct"]
-        m["nonce"] = env["nonce"]
-        m["K_user"] = env["K_user"]
-        if env.get("K_enclave"):
-            m["K_enclave"] = env["K_enclave"]
-        else:
-            m.pop("K_enclave", None)
-        m["enclave_pk_fpr"] = env.get("enclave_pk_fpr", "")
-        m.pop("content_pk_fpr", None)  # swap is not a rewrap; drop any stale server stamp
-        m["visibility"] = env["visibility"]
-        m["owner_user_id"] = env["owner_user_id"]
+        # swap 不是 rewrap：content_pk_fpr 这个服务端戳由 replace_record_shape
+        # 一并清掉（swap() 也已把客户端传来的那个 pop 掉，绝不采信）。
+        core_envelope.replace_record_shape(m, env)
         return "ok"
     return "not_found"
 
@@ -297,20 +295,7 @@ def _apply_envelope_fields(record: dict, env: dict) -> None:
     if not record.get("id") and env.get("id"):
         record["id"] = env["id"]
     record["v"] = int(env.get("v", 1))
-    record["body_ct"] = env["body_ct"]
-    record["nonce"] = env["nonce"]
-    record["K_user"] = env["K_user"]
-    if env.get("K_enclave"):
-        record["K_enclave"] = env["K_enclave"]
-    else:
-        record.pop("K_enclave", None)
-    record["enclave_pk_fpr"] = env.get("enclave_pk_fpr", "")
-    if env.get("content_pk_fpr"):
-        record["content_pk_fpr"] = env["content_pk_fpr"]
-    else:
-        record.pop("content_pk_fpr", None)
-    record["visibility"] = env["visibility"]
-    record["owner_user_id"] = env["owner_user_id"]
+    core_envelope.replace_record_shape(record, env)
 
 
 # 一条 chat 记录可以挂两个独立信封:agent 的思维链、图片的说明文字。它们各自带
@@ -548,8 +533,21 @@ def swap(store: UserStore, payload: dict) -> tuple[dict, int]:
         if env["visibility"] not in ("shared", "local_only"):
             results.append({"type": itype, "id": iid, "status": "error: envelope.visibility must be 'shared' or 'local_only'"})
             continue
-        if env["visibility"] == "shared" and not env.get("K_enclave"):
+        if env.get("body_ct") and env["visibility"] == "shared" and not env.get("K_enclave"):
             results.append({"type": itype, "id": iid, "status": "error: shared visibility requires K_enclave"})
+            continue
+        if env.get("body_b64") is not None and itype != "chat":
+            results.append({
+                "type": itype,
+                "id": iid,
+                "status": "error: body_b64 requires chat file/image",
+            })
+            continue
+        if not env.get("body_ct") and env["visibility"] == "local_only":
+            # local_only 的含义是「只有设备解得开」，靠的就是没有 K_enclave。一行
+            # 明文服务端天然读得到，标成 local_only 等于给用户一个假的隐私承诺。
+            results.append({"type": itype, "id": iid,
+                            "status": "error: plaintext envelope cannot be local_only"})
             continue
         if env["owner_user_id"] != store.user_id:
             results.append({"type": itype, "id": iid, "status": "error: owner_user_id does not match caller"})
