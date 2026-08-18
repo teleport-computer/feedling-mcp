@@ -679,6 +679,7 @@ jobs:
           python -m pytest \
             tests/test_ci_image_tag_width.py \
             tests/test_deploy_yaml_strict.py \
+            tests/test_frame_r2_deploy_config.py \
             tests/test_admin_runtime_mode.py \
             tests/test_hosted_runtime_policy.py \
             tests/test_dual_runtime_coexistence.py \
@@ -2201,6 +2202,10 @@ jobs:
           AGENT_MAX_CHILDREN:           ${{ vars.TEST_AGENT_MAX_CHILDREN }}
           # Shared with the main test CVM — MUST match (esp. the token secret).
           DATABASE_URL:                 ${{ secrets.TEST_DATABASE_URL }}
+          R2_ENDPOINT:                  ${{ secrets.TEST_R2_ENDPOINT }}
+          R2_ACCESS_KEY_ID:             ${{ secrets.TEST_R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY:         ${{ secrets.TEST_R2_SECRET_ACCESS_KEY }}
+          R2_FRAMES_BUCKET:             ${{ secrets.TEST_R2_FRAMES_BUCKET }}
           FEEDLING_RUNTIME_TOKEN_SECRET: ${{ secrets.TEST_FEEDLING_RUNTIME_TOKEN_SECRET }}
           AGENT_RUNTIME_USERS:          ${{ secrets.TEST_AGENT_RUNTIME_USERS }}
           AGENT_RUNTIME_AUTODISCOVER:   ${{ vars.TEST_AGENT_RUNTIME_AUTODISCOVER }}
@@ -2224,6 +2229,10 @@ jobs:
             -e "FEEDLING_ENCLAVE_URL=$FEEDLING_ENCLAVE_URL" \
             -e "AGENT_MAX_CHILDREN=$AGENT_MAX_CHILDREN" \
             -e "DATABASE_URL=$DATABASE_URL" \
+            -e "R2_ENDPOINT=$R2_ENDPOINT" \
+            -e "R2_ACCESS_KEY_ID=$R2_ACCESS_KEY_ID" \
+            -e "R2_SECRET_ACCESS_KEY=$R2_SECRET_ACCESS_KEY" \
+            -e "R2_FRAMES_BUCKET=$R2_FRAMES_BUCKET" \
             -e "FEEDLING_RUNTIME_TOKEN_SECRET=$FEEDLING_RUNTIME_TOKEN_SECRET" \
             -e "AGENT_RUNTIME_USERS=$AGENT_RUNTIME_USERS" \
             -e "AGENT_RUNTIME_AUTODISCOVER=$AGENT_RUNTIME_AUTODISCOVER" \
@@ -2583,6 +2592,10 @@ jobs:
           AGENT_MAX_CHILDREN:           ${{ vars.PRE_AGENT_MAX_CHILDREN }}
           # Shared with the main pre CVM — MUST match (esp. the token secret).
           DATABASE_URL:                 ${{ secrets.PRE_DATABASE_URL }}
+          R2_ENDPOINT:                  ${{ secrets.TEST_R2_ENDPOINT }}
+          R2_ACCESS_KEY_ID:             ${{ secrets.TEST_R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY:         ${{ secrets.TEST_R2_SECRET_ACCESS_KEY }}
+          R2_FRAMES_BUCKET:             ${{ secrets.TEST_R2_FRAMES_BUCKET }}
           FEEDLING_DATABASE_SCHEMA:      ${{ vars.PRE_FEEDLING_DATABASE_SCHEMA || 'rds' }}
           FEEDLING_RUNTIME_TOKEN_SECRET: ${{ secrets.TEST_FEEDLING_RUNTIME_TOKEN_SECRET }}
           AGENT_RUNTIME_USERS:          ${{ secrets.PRE_AGENT_RUNTIME_USERS }}
@@ -2607,6 +2620,10 @@ jobs:
             -e "FEEDLING_ENCLAVE_URL=$FEEDLING_ENCLAVE_URL" \
             -e "AGENT_MAX_CHILDREN=$AGENT_MAX_CHILDREN" \
             -e "DATABASE_URL=$DATABASE_URL" \
+            -e "R2_ENDPOINT=$R2_ENDPOINT" \
+            -e "R2_ACCESS_KEY_ID=$R2_ACCESS_KEY_ID" \
+            -e "R2_SECRET_ACCESS_KEY=$R2_SECRET_ACCESS_KEY" \
+            -e "R2_FRAMES_BUCKET=$R2_FRAMES_BUCKET" \
             -e "FEEDLING_DATABASE_SCHEMA=$FEEDLING_DATABASE_SCHEMA" \
             -e "FEEDLING_RUNTIME_TOKEN_SECRET=$FEEDLING_RUNTIME_TOKEN_SECRET" \
             -e "AGENT_RUNTIME_USERS=$AGENT_RUNTIME_USERS" \
@@ -2749,6 +2766,10 @@ jobs:
           AGENT_MAX_CHILDREN:            ${{ vars.AGENT_MAX_CHILDREN }}
           # Reused from the main prod CVM — MUST match (esp. the token secret).
           DATABASE_URL:                  ${{ secrets.DATABASE_URL }}
+          R2_ENDPOINT:                   ${{ secrets.R2_ENDPOINT }}
+          R2_ACCESS_KEY_ID:              ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY:          ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_FRAMES_BUCKET:              ${{ secrets.R2_FRAMES_BUCKET }}
           FEEDLING_RUNTIME_TOKEN_SECRET: ${{ secrets.FEEDLING_RUNTIME_TOKEN_SECRET }}
           AGENT_RUNTIME_USERS:           ${{ secrets.AGENT_RUNTIME_USERS }}
           AGENT_RUNTIME_AUTODISCOVER:    ${{ vars.AGENT_RUNTIME_AUTODISCOVER }}
@@ -2773,6 +2794,10 @@ jobs:
               -e "FEEDLING_ENCLAVE_URL=$FEEDLING_ENCLAVE_URL" \
               -e "AGENT_MAX_CHILDREN=$AGENT_MAX_CHILDREN" \
               -e "DATABASE_URL=$DATABASE_URL" \
+              -e "R2_ENDPOINT=$R2_ENDPOINT" \
+              -e "R2_ACCESS_KEY_ID=$R2_ACCESS_KEY_ID" \
+              -e "R2_SECRET_ACCESS_KEY=$R2_SECRET_ACCESS_KEY" \
+              -e "R2_FRAMES_BUCKET=$R2_FRAMES_BUCKET" \
               -e "FEEDLING_RUNTIME_TOKEN_SECRET=$FEEDLING_RUNTIME_TOKEN_SECRET" \
               -e "AGENT_RUNTIME_USERS=$AGENT_RUNTIME_USERS" \
               -e "AGENT_RUNTIME_AUTODISCOVER=$AGENT_RUNTIME_AUTODISCOVER" \
