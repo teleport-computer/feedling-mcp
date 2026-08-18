@@ -9,6 +9,7 @@ from screen import screen_read_core
 
 from capabilities import errors
 from capabilities.types import CapabilityResult, ok, err
+from core.frame_ids import is_supported_frame_id
 
 
 def _norm(body, status, *, default_msg) -> CapabilityResult:
@@ -23,6 +24,16 @@ def _norm(body, status, *, default_msg) -> CapabilityResult:
 def recent(store, *, api_key=None, runtime_token=None, params=None) -> CapabilityResult:
     params = params or {}
     body, status = perception_read_core.photos_recent(store, params.get("limit"))
+    if status == 200 and isinstance(body, dict) and isinstance(body.get("photos"), list):
+        body = {
+            **body,
+            "photos": [
+                photo
+                for photo in body["photos"]
+                if isinstance(photo, dict)
+                and is_supported_frame_id(photo.get("photo_id") or photo.get("id"))
+            ],
+        }
     return _norm(body, status, default_msg="photos unavailable")
 
 
