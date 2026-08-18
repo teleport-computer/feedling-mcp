@@ -43,12 +43,33 @@ _NOW_EPOCH = datetime(2030, 6, 4, 4, 0, tzinfo=timezone.utc).timestamp()
 
 
 def _insert_job(user_id: str, lane: str, status: str, *, finished: datetime,
-                reason: str | None = None, last_error: str | None = None) -> None:
+                reason: str | None = None, last_error: str | None = None,
+                wake_result: str | None = None) -> int:
+    with db.get_pool().connection() as conn:
+        return conn.execute(
+            "INSERT INTO agent_jobs (user_id, lane, status, reason, last_error,"
+            " wake_result, created_at, finished_at)"
+            " VALUES (%s, %s, %s, %s, %s, %s, %s, %s) RETURNING id",
+            (user_id, lane, status, reason, last_error, wake_result,
+             finished, finished),
+        ).fetchone()[0]
+
+
+def _deliver(job_id: int, user_id: str, *, effect_type: str = "reply_final_fenced_v1",
+             status: str = "applied") -> None:
+    """Record that this attempt actually produced a user-visible bubble.
+
+    The speak metric anchors on OUTPUT, so tests must create the output row
+    rather than set a status column — writing only ``wake_result`` would test
+    a claim, not a delivery.
+    """
     with db.get_pool().connection() as conn:
         conn.execute(
-            "INSERT INTO agent_jobs (user_id, lane, status, reason, last_error,"
-            " created_at, finished_at) VALUES (%s, %s, %s, %s, %s, %s, %s)",
-            (user_id, lane, status, reason, last_error, finished, finished),
+            "INSERT INTO v2_effect_outbox (effect_id, user_id, job_id,"
+            " effect_type, expected_generation, payload, status)"
+            " VALUES (%s, %s, %s, %s, 0, '{}'::jsonb, %s)",
+            (f"eff-{job_id}-{effect_type}-{status}", user_id, job_id,
+             effect_type, status),
         )
 
 
@@ -236,9 +257,12 @@ def test_freeze_mirrors_each_day_as_one_atomic_group(clean_rollup, monkeypatch):
     assert all("INSERT INTO lane_daily_rollup" in s for s in cell_sqls)
     # Verbatim fidelity: the mirrored cell params are exactly the rows the
     # main path wrote (user, day, lane, counts) — not a lookalike rebuild.
-    # Param layout: (day, lane, src, completed, failed, expired, superseded,
-    # codes, uid) — uid last, feeding the users FOR KEY SHARE source select.
-    mirrored = {(p[8], p[0], p[1], p[3], p[4]) for _, p in day1[:-1]}
+    # Param layout starts (day, lane, src, completed, failed, ...) and ENDS
+    # with uid, which feeds the users FOR KEY SHARE source select. uid is read
+    # as p[-1], never a fixed index: adding a counted column shifts every
+    # absolute position, and a hardcoded one turns a schema addition into a
+    # mystery failure here instead of a real signal.
+    mirrored = {(p[-1], p[0], p[1], p[3], p[4]) for _, p in day1[:-1]}
     stored = {(r["user_id"], r["day"], r["lane"], r["completed"], r["failed"])
               for r in _cells(user_id=uid)}
     assert mirrored == stored
@@ -1190,3 +1214,269 @@ def test_lifespan_leader_uses_distinct_singleton_name(monkeypatch):
     )
     lifespan_mod._start_lane_rollup_leader()
     assert calls == [("lane-rollup", sched.start)]
+
+
+# --- phase 3a: speak rate + the measured blind spot ------------------------- #
+#
+# Seven 2026-08-18: the proactive side needs TWO numbers on one denominator —
+# failure rate answers "is the machinery healthy", speak rate answers "is the
+# agent's choice right". A clean run that says nothing is ``completed``, i.e.
+# indistinguishable from a successful reply on the failure rate alone.
+#
+# The rule these tests exist to hold: ``spoke`` is anchored on OUTPUT. Every
+# case below creates (or withholds) an actual delivery row; none of them can be
+# satisfied by writing a status column.
+
+
+def test_spoke_counts_a_delivered_bubble_not_a_status_column(clean_rollup):
+    """The load-bearing distinction: wake_result is a claim, the outbox row is
+    the product. A turn that declared itself asleep but DID deliver counts as
+    speaking; a turn that declared nothing and delivered nothing does not."""
+    uid = "usr_rollup_voice_anchor"
+    seed_user(uid)
+    t = datetime(2030, 6, 1, 2, 0, tzinfo=timezone.utc)
+    spoke_id = _insert_job(uid, "heartbeat", "completed", finished=t)
+    _deliver(spoke_id, uid)
+    # Declared asleep yet a bubble landed — output wins over the status field.
+    contradictory = _insert_job(uid, "heartbeat", "completed", finished=t,
+                                wake_result="sleep")
+    _deliver(contradictory, uid)
+    _insert_job(uid, "heartbeat", "completed", finished=t, wake_result="sleep")
+    _insert_job(uid, "heartbeat", "completed", finished=t)
+
+    db.freeze_completed_lane_days(now_epoch=_NOW_EPOCH)
+    (cell,) = [r for r in _cells(user_id=uid) if r["lane"] == "heartbeat"]
+    assert cell["completed"] == 4
+    assert cell["spoke"] == 2
+    assert cell["silent_declared"] == 1
+    assert cell["silent_undeclared"] == 1
+
+
+def test_voice_decomposition_is_exact_for_every_frozen_cell(clean_rollup):
+    """completed = (spoke - spoke_failed) + silent_declared + silent_undeclared.
+
+    This identity is the whole reason the four columns can be trusted: any
+    attempt that terminates ok lands in exactly one bucket. If a future edit
+    drops a case (say a new wake_result value that matches neither branch),
+    the sum stops closing and this fails — which is the point."""
+    uid = "usr_rollup_voice_identity"
+    seed_user(uid)
+    t = datetime(2030, 6, 1, 2, 0, tzinfo=timezone.utc)
+    _deliver(_insert_job(uid, "heartbeat", "completed", finished=t), uid)
+    _insert_job(uid, "heartbeat", "completed", finished=t, wake_result="sleep")
+    _insert_job(uid, "heartbeat", "completed", finished=t)
+    # An unfamiliar wake_result must NOT vanish from the decomposition: it is
+    # undeclared silence, not a fourth invisible bucket.
+    _insert_job(uid, "heartbeat", "completed", finished=t,
+                wake_result="some_future_value")
+    # Delivered a bubble, then the attempt failed — counted in spoke and in
+    # spoke_failed, so it is excluded from the completed-side sum.
+    failed_but_spoke = _insert_job(uid, "heartbeat", "failed", finished=t,
+                                   last_error="provider_error")
+    _deliver(failed_but_spoke, uid)
+    _insert_job(uid, "scheduled", "completed", finished=t)
+
+    db.freeze_completed_lane_days(now_epoch=_NOW_EPOCH)
+    cells = _cells(user_id=uid)
+    assert cells, "no cells frozen — the identity below would be vacuous"
+    for cell in cells:
+        assert cell["completed"] == (
+            (cell["spoke"] - cell["spoke_failed"])
+            + cell["silent_declared"] + cell["silent_undeclared"]
+        ), f"decomposition does not close for {cell['lane']}: {cell}"
+    (hb,) = [r for r in cells if r["lane"] == "heartbeat"]
+    assert hb["spoke"] == 2 and hb["spoke_failed"] == 1
+    assert hb["silent_declared"] == 1
+    assert hb["silent_undeclared"] == 2
+
+
+def test_spoke_uses_the_wide_reply_predicate_from_its_single_source():
+    """An intermediate bubble is still the agent speaking, and
+    ``applied_with_results`` is still a completed delivery.
+
+    Both were nearly missed by hand-copying: jobs_store carries a deliberately
+    NARROWER final-delivery predicate next to the wide one, and the composite
+    sink's status is easy to overlook. The predicate therefore lives in exactly
+    one place and this pins what that place must contain."""
+    from model_api_runtime.v2 import effect_outbox as eo
+
+    assert eo.REPLY_EFFECT_TYPES == {
+        "reply",
+        eo.FINAL_REPLY_EFFECT_TYPE,
+        eo.TERMINAL_REPLY_EFFECT_TYPE,
+        eo.INTERMEDIATE_REPLY_EFFECT_TYPE,
+    }
+    assert eo.DELIVERED_EFFECT_STATUSES == {
+        "applied", eo.APPLIED_WITH_RESULTS_STATUS,
+    }
+    # The narrow final-delivery set must stay a strict subset — if they ever
+    # became equal, the two questions would have collapsed into one.
+    narrow = {eo.FINAL_REPLY_EFFECT_TYPE, eo.TERMINAL_REPLY_EFFECT_TYPE}
+    assert narrow < eo.REPLY_EFFECT_TYPES
+
+
+@pytest.mark.parametrize(
+    "effect_type,status",
+    [
+        ("reply_intermediate_fenced_v1", "applied"),
+        ("reply_terminal_fenced_v1", "applied_with_results"),
+        ("reply", "applied"),
+    ],
+)
+def test_every_delivered_reply_shape_counts_as_speaking(clean_rollup,
+                                                        effect_type, status):
+    uid = f"usr_voice_{effect_type[:12]}_{status[:8]}"
+    seed_user(uid)
+    t = datetime(2030, 6, 1, 2, 0, tzinfo=timezone.utc)
+    job_id = _insert_job(uid, "heartbeat", "completed", finished=t)
+    _deliver(job_id, uid, effect_type=effect_type, status=status)
+    db.freeze_completed_lane_days(now_epoch=_NOW_EPOCH)
+    (cell,) = [r for r in _cells(user_id=uid) if r["lane"] == "heartbeat"]
+    assert cell["spoke"] == 1, f"{effect_type}/{status} should count as spoken"
+    assert cell["silent_undeclared"] == 0
+
+
+def test_an_undelivered_effect_is_not_speaking(clean_rollup):
+    """A pending or discarded effect never reached the user. Counting it would
+    make the speak rate describe intent instead of product."""
+    uid = "usr_rollup_voice_pending"
+    seed_user(uid)
+    t = datetime(2030, 6, 1, 2, 0, tzinfo=timezone.utc)
+    pending = _insert_job(uid, "heartbeat", "completed", finished=t)
+    _deliver(pending, uid, status="pending")
+    discarded = _insert_job(uid, "heartbeat", "completed", finished=t)
+    _deliver(discarded, uid, status="discarded")
+    db.freeze_completed_lane_days(now_epoch=_NOW_EPOCH)
+    (cell,) = [r for r in _cells(user_id=uid) if r["lane"] == "heartbeat"]
+    assert cell["spoke"] == 0
+    assert cell["silent_undeclared"] == 2
+
+
+def test_a_non_reply_effect_is_not_speaking(clean_rollup):
+    """Status/memory/schedule effects are side effects, not bubbles."""
+    uid = "usr_rollup_voice_nonreply"
+    seed_user(uid)
+    t = datetime(2030, 6, 1, 2, 0, tzinfo=timezone.utc)
+    job_id = _insert_job(uid, "heartbeat", "completed", finished=t)
+    _deliver(job_id, uid, effect_type="status")
+    db.freeze_completed_lane_days(now_epoch=_NOW_EPOCH)
+    (cell,) = [r for r in _cells(user_id=uid) if r["lane"] == "heartbeat"]
+    assert cell["spoke"] == 0
+
+
+def _post_proactive_reply(user_id: str, job_id: str, *, ts: datetime) -> None:
+    """The resident delivery anchor: a chat row carrying this job's id.
+
+    chat_core writes ``proactive_job_id`` into the message extra, so V1
+    attributes a delivered bubble to a specific attempt at the same strength
+    V2 gets from the outbox — no fallback to ``status='posted'`` needed."""
+    db.chat_append(
+        user_id, f"msg-{job_id}", ts.timestamp(),
+        {
+            "id": f"msg-{job_id}",
+            "role": "openclaw",
+            "source": "agent_initiated_proactive",
+            "proactive_job_id": job_id,
+        },
+        1000,
+    )
+
+
+def _log_job_id(user_id: str, **kwargs) -> str:
+    """_log_job with an explicit job_id so a delivery can point back at it."""
+    job_id = kwargs.pop("job_id")
+    ts = kwargs["ts"]
+    doc: dict = {"status": kwargs["status"], "job_id": job_id,
+                 "created_at": ts.isoformat()}
+    if kwargs.get("kind"):
+        doc["wake_kind"] = kwargs["kind"]
+    if kwargs.get("wake_result"):
+        doc["wake_result"] = kwargs["wake_result"]
+    terminal_at = kwargs.get("terminal_at") or ts
+    key = ("failed_at" if kwargs["status"] in ("failed", "error", "skipped")
+           else "completed_at")
+    doc[key] = terminal_at.isoformat()
+    db.log_append(user_id, "proactive_jobs", doc, ts=ts.timestamp())
+    return job_id
+
+
+def test_resident_spoke_follows_the_chat_row_not_the_posted_status(clean_rollup):
+    """V1's anchor is the delivered chat row, reached via proactive_job_id.
+
+    The contradiction case is the one that matters: a job stamped ``posted``
+    whose message never landed must NOT count as speaking — that is exactly
+    the broadcast=on-yet-zero-frames failure mode, one layer down."""
+    uid = "usr_rollup_res_voice"
+    _seed_resident(uid)
+    t = datetime(2030, 6, 1, 3, 0, tzinfo=timezone.utc)
+    spoke = _log_job_id(uid, job_id="pj-spoke", ts=t, status="posted",
+                        kind="heartbeat_tick")
+    _post_proactive_reply(uid, spoke, ts=t)
+    # Claims delivery, produced nothing.
+    _log_job_id(uid, job_id="pj-claims", ts=t, status="posted",
+                kind="heartbeat_tick")
+    _log_job_id(uid, job_id="pj-slept", ts=t, status="completed",
+                kind="heartbeat_tick", wake_result="sleep")
+    _log_job_id(uid, job_id="pj-quiet", ts=t, status="completed",
+                kind="heartbeat_tick")
+
+    db.freeze_completed_resident_lane_days(now_epoch=_NOW_EPOCH)
+    (cell,) = [r for r in _cells(user_id=uid) if r["lane"] == "heartbeat"]
+    assert cell["completed"] == 4
+    assert cell["spoke"] == 1
+    assert cell["silent_declared"] == 1
+    assert cell["silent_undeclared"] == 2
+    assert cell["completed"] == (
+        (cell["spoke"] - cell["spoke_failed"])
+        + cell["silent_declared"] + cell["silent_undeclared"]
+    )
+
+
+def test_voice_coverage_marks_where_the_numbers_start(clean_rollup):
+    """``voice_from`` exists so a 0 in these columns cannot be read as "we
+    measured, it stayed quiet" for days frozen before the columns existed.
+
+    It pins to the FIRST day frozen with voice numbers and never moves — a
+    later tick must not drag the honest start date forward."""
+    uid = "usr_rollup_voice_cov"
+    seed_user(uid)
+    t = datetime(2030, 6, 1, 2, 0, tzinfo=timezone.utc)
+    _deliver(_insert_job(uid, "heartbeat", "completed", finished=t), uid)
+    db.freeze_completed_lane_days(now_epoch=_NOW_EPOCH)
+    first = db.admin_lane_rollup(route="model_api")["coverage"]["model_api"]
+    assert first["voice_from"] == "2030-06-01"
+
+    # A later tick freezes more days; the start date must stay put.
+    later = datetime(2030, 6, 6, 4, 0, tzinfo=timezone.utc).timestamp()
+    db.freeze_completed_lane_days(now_epoch=later)
+    again = db.admin_lane_rollup(route="model_api")["coverage"]["model_api"]
+    assert again["voice_from"] == "2030-06-01"
+    assert again["through_day"] > first["through_day"]
+
+
+def test_live_topup_reports_voice_for_the_still_open_day(clean_rollup):
+    """The unfrozen day is where an operator looks during an incident. If the
+    live path returned counts without voice columns, today would silently read
+    as "nobody spoke" next to frozen days that report properly."""
+    uid = "usr_rollup_voice_live"
+    seed_user(uid)
+    now = datetime.now(timezone.utc)
+    spoke = _insert_job(uid, "heartbeat", "completed", finished=now)
+    _deliver(spoke, uid)
+    _insert_job(uid, "heartbeat", "completed", finished=now, wake_result="sleep")
+
+    # The open day is returned in ``today_partial``, deliberately separate from
+    # the frozen ``rows`` so an estimate can never be mistaken for a cell.
+    payload = db.admin_lane_rollup(user_id=uid, route="model_api")
+    assert not payload["rows"], "nothing is frozen yet in this test"
+    rows = [r for r in payload["today_partial"]
+            if r["day"] == _beijing_today().isoformat()]
+    assert rows, "live top-up returned nothing for the open day"
+    (row,) = rows
+    assert row["frozen"] is False
+    assert row["spoke"] == 1
+    assert row["silent_declared"] == 1
+    assert row["completed"] == (
+        (row["spoke"] - row["spoke_failed"])
+        + row["silent_declared"] + row["silent_undeclared"]
+    )
