@@ -162,6 +162,26 @@ CI 部署步骤把 `<ENV_PREFIX>_TEE_DATABASE_URL` / `_FEEDLING_TEE_DUAL_WRITE` 
 
 ### 2.9 迁移落地通道（alembic_tee revision 上线）
 
+在 Phase 4 strict verify 前若发现历史游标已经越过缺失行，使用 `TEE replicate`
+workflow 的受保护恢复动作，不要手工改 `tee_replication_cursors`：
+
+1. `action=reflow` 仅支持 `chat_messages`、`memory_moments`、
+   `world_book_entries`、`identity`、`voice_transcripts`。先保持
+   `dry_run=true` 查看 `would_copy`、`pending_cleared`、`orphan_pending`、
+   `stale` 和 `failures`；真跑时关闭 dry-run、填写 `confirm=MIGRATE`，可用
+   `qps` 限速（`0` 表示不额外 sleep）。reflow 从真实下界扫描但不回退持久游标，
+   成功 upsert 与旧 pending 清理同事务；源行不存在的 pending 只在确认缺失后删除。
+2. `action=prune` 用于只删除 TEE 中源库已不存在的孤儿行，例如
+   `v2_trajectory_events`。先 dry-run 记录 `stale=N`；若 N 超过默认安全阈值，apply
+   必须同时填写同一个 `expected_stale=N`。服务端会重新按“先 TEE 快照、后 RDS
+   快照”计算差集，实时数不再等于 N 就拒绝整次删除。
+3. 任一响应 `ok=false`、`failures>0`、`refused` 非空或 `prune_error` 非空，都表示
+   未收敛；操作幂等，可排障后用新的 dry-run 结果重试。dry-run 不写 RDS、TEE，
+   包括不落持久错误日志。
+
+终态 pending 若源记录仍在，代表设备专有密文或确定性坏信封；reflow 不会伪装成
+成功并删掉标记，仍需设备重传或单独的数据处置决策。
+
 alembic_tee 曾经**无 CI 钩子、纯人工执行**——0002/0003 合并后从未在 test/prod 实库
 跑过，两库停在 0001 直到 2026-07-27 才发现（见 Task 0.6）。现在有了固定通道：
 

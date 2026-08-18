@@ -131,18 +131,16 @@ class _Table:
     requeue_delete_tee_sql: str | None = None  # drop the TEE row when RDS row is gone
     requeue_by_user_only: bool = False          # identity: key on user_id alone
     # prune lane（删除传播的兜底对账，见 tee_shadow/ciphertext_prune.py）。两条
-    # SELECT 必须返回**同构**的主键元组，且元组顺序与 requeue_delete_tee_sql 的
-    # 参数顺序逐位对齐——prune 就是把差集里的元组原样喂给那条 DELETE。
+    # SELECT 必须返回**同构**的主键元组，且元组顺序与
+    # tee_shadow.ciphertext_prune._PRUNE_DELETE_SQL 的参数逐位对齐。
     #
     # 为什么两侧要分别给一条而不是共用：表名和辖区在两侧不一定相同。
     # frame_envelopes（RDS）在 TEE 侧叫 frames；identity 是伪表，两侧都要
     # `WHERE kind='identity'` 的辖区限定，否则会把 user_blobs 的其它 kind
     # （归 MIRROR lane 的 reconciler 管）卷进来当孤儿删掉。
     #
-    # 留空 = 本表不参与 prune。纯 append-only、连 requeue_delete_tee_sql 都没有的
-    # 表（chat_message_archive / v2_trajectory_events /
-    # v2_conversation_summary_segments）就该留空：它们没有删除语义，prune 无从
-    # 判断"消失"是删除还是尚未复制。
+    # 留空 = 本表不参与 prune。没有安全删除契约的表（chat_message_archive /
+    # v2_conversation_summary_segments）就该留空。
     prune_rds_keys_sql: str | None = None
     prune_tee_keys_sql: str | None = None
     # 冷启动（tee_replication_cursors 里还没有本表的行）时喂给 select_sql 的参数
@@ -539,7 +537,7 @@ _TABLES["frame_envelopes"] = _Table(
     row_writer=_frames_row_writer,
     requeue_delete_tee_sql="DELETE FROM frames WHERE user_id = %s AND frame_id = %s",
     # ⚠️ 两侧表名不同：RDS 是 frame_envelopes，TEE 侧叫 frames。
-    # 遗留风险与上面 requeue_delete_tee_sql 那段注释同源：prune 删掉 TEE 明文指针
+    # 遗留风险与上面 requeue_delete_tee_sql 那段注释同源：prune 的独立删除契约删掉 TEE 明文指针
     # 行时，不清理该行 body_storage_key 指向的 frames-tee R2 对象，会留下孤儿对象。
     # 与 requeue lane 的既有行为一致（那条 DELETE 同样不碰 R2），不在本次修复范围。
     prune_rds_keys_sql="SELECT user_id, frame_id FROM frame_envelopes",
@@ -751,6 +749,10 @@ _TABLES["v2_trajectory_events"] = _Table(
     # 原地改写路径，不需要 requeue。
     requeue_fetch_sql=None,
     requeue_delete_tee_sql=None,
+    # 实际运行中 agent_jobs 清理会让 RDS 轨迹事件消失；TEE 表刻意没有跨表 FK，
+    # 因此不能再把它视作永不删除。全量 reflow/prune 用真实复合 PK 收敛孤儿行。
+    prune_rds_keys_sql="SELECT job_id, event_index FROM v2_trajectory_events",
+    prune_tee_keys_sql="SELECT job_id, event_index FROM v2_trajectory_events",
     # 冷启动：created_at 是 TIMESTAMPTZ，"-infinity" 合法；第二列在 SQL 里已经
     # ::text 转型成字符串拼接，空串本身就是合法 TEXT 且排在任何非空拼接结果之前。
     cursor_zero=("-infinity", ""),
@@ -1302,6 +1304,19 @@ def _consume_requeue(cfg: _Table, table: str) -> tuple[int, int, int, int]:
 _SEQ_TABLES: dict[str, str] = {"chat_messages": "seq"}
 
 
+def finalize_identity_sequence(table: str) -> None:
+    """Fast-forward a carried identity sequence after a successful full pass."""
+    seq_col = _SEQ_TABLES.get(table)
+    if not seq_col:
+        return
+    with mirror.get_tee_pool().connection() as dst:
+        dst.execute(
+            f"SELECT setval(pg_get_serial_sequence(%s, %s), "
+            f"GREATEST((SELECT COALESCE(MAX({seq_col}), 1) FROM {table}), 1))",
+            (table, seq_col),
+        )
+
+
 def _write_pending_and_cursor(dst, cfg, table, pend_rows, adv_ts, adv_id) -> None:
     """把 PendingDeviceMigration 标记 + 游标推进写进当前(调用方开的)事务。
 
@@ -1473,18 +1488,8 @@ def run_table(table: str, *, qps: float = 2.0, dry_run: bool = False,
                 break
 
     if not dry_run:
-        seq_col = _SEQ_TABLES.get(table)
-        if seq_col:
-            # See _SEQ_TABLES above: fast-forward the TEE identity sequence past
-            # the highest carried-over seq so a post-cutover direct INSERT on
-            # TEE can't collide with an already-replicated high value.
-            # GREATEST(...,1) guards an empty table (COALESCE(MAX,1) also
-            # guards NULL) — same shape as reconciler.reconcile_table's setval.
-            with mirror.get_tee_pool().connection() as dst:
-                dst.execute(
-                    f"SELECT setval(pg_get_serial_sequence(%s, %s), "
-                    f"GREATEST((SELECT COALESCE(MAX({seq_col}), 1) FROM {table}), 1))",
-                    (table, seq_col))
+        # See _SEQ_TABLES above: keep future TEE-primary inserts collision-free.
+        finalize_identity_sequence(table)
 
     report = {"table": table, "copied": copied, "pending": pending, "errors": errors,
               "skipped": skipped, "quarantined": quarantined,

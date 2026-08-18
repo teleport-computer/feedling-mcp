@@ -375,6 +375,7 @@ async def tee_replication_run(request: Request):
             confirm=payload.get("confirm"),
             qps=payload.get("qps"),
             sample_rate=payload.get("sample_rate"),
+            expected_stale=payload.get("expected_stale"),
         )
     except admin_tee_replication.BadRequest as exc:
         return JSONResponse({"error": exc.error}, status_code=400)
