@@ -1166,10 +1166,11 @@ def plan_provider_round(
 
     Native exchanges are separated only for accounting/diagnostics; the caller
     still sends its original chronological ``messages`` list unchanged. The
-    default policy folds non-resident schemas to bounded discovery entries
-    while every tool name remains present. The rollback policy attempts the
-    complete catalog first and folds only under pressure. Resident, historically
-    referenced, and explicitly protected schemas stay complete and required.
+    The default policy attempts the complete catalog first and folds only under
+    pressure. The opt-in ``always`` policy folds non-resident schemas to bounded
+    discovery entries immediately. Every tool name remains present. Resident,
+    historically referenced, and explicitly protected schemas stay complete
+    and required.
     Conversation messages and native call/result pairs are required and are
     never silently truncated.
     """
@@ -1336,8 +1337,9 @@ def plan_provider_round(
         plan, _required, _optional = _atomic_plan(())
         return _finalize(plan, ())
 
-    # Under the rollback policy, schema search stays latent while the complete
-    # catalog fits. The default policy keeps it resident and folds immediately.
+    # Under the default policy, schema search stays latent while the complete
+    # catalog fits. The opt-in ``always`` policy keeps it resident and folds
+    # immediately.
     baseline_tools = [
         tool for tool in offered_tools
         if not (

@@ -998,7 +998,7 @@ def test_under_pressure_policy_keeps_full_fit_and_leaves_search_latent():
     assert not plan.schema_recovery_needed
 
 
-def test_runtime_v2_catalog_has_twelve_resident_and_twenty_four_foldable_tools():
+def test_runtime_v2_catalog_has_five_resident_and_thirty_one_foldable_tools():
     specs = tool_schema.build_tool_specs()
     resident = [
         spec for spec in specs
@@ -1009,8 +1009,8 @@ def test_runtime_v2_catalog_has_twelve_resident_and_twenty_four_foldable_tools()
         if spec.name not in frontier._CORE_TOOL_FLOOR_NAMES
     ]
 
-    assert len(resident) == 12
-    assert len(foldable) == 24
+    assert len(resident) == 5
+    assert len(foldable) == 31
     assert all(
         len(tool_surface.collapsed_tool_spec(spec).description)
         <= tool_surface.MAX_COLLAPSED_DESCRIPTION_CHARS
@@ -1022,6 +1022,7 @@ def test_runtime_v2_catalog_has_twelve_resident_and_twenty_four_foldable_tools()
         messages=[{"role": "user", "content": "hello"}],
         tools=specs,
         recovery_tool_name="mcp_tool_search",
+        tool_schema_collapse_policy=tool_surface.COLLAPSE_POLICY_ALWAYS,
         output_reserve_tokens=128,
         safety_margin_tokens=128,
     )
@@ -1034,7 +1035,7 @@ def test_runtime_v2_catalog_has_twelve_resident_and_twenty_four_foldable_tools()
 
 
 def test_tool_schema_collapse_policy_is_explicit_and_validated():
-    assert tool_surface.DEFAULT_COLLAPSE_POLICY == "always"
+    assert tool_surface.DEFAULT_COLLAPSE_POLICY == "under_pressure"
     assert tool_surface.normalize_collapse_policy("under_pressure") == (
         "under_pressure"
     )
@@ -1591,9 +1592,7 @@ def test_provider_round_carries_closed_component_bytes_on_success_and_exhaustion
         ("tail", 123),
         (
             "tools",
-            frontier.prompt_structure_utf8_bytes([
-                tool_surface.collapsed_tool_spec(tool)
-            ]),
+            frontier.prompt_structure_utf8_bytes([tool]),
         ),
     ]
     assert plan.utf8_bytes_per_token == 1.0
@@ -1614,15 +1613,9 @@ def test_provider_round_carries_closed_component_bytes_on_success_and_exhaustion
     assert error.output_reserve_tokens == 512
     assert error.safety_margin_tokens == 512
     assert error.utf8_bytes_per_token == 1.0
-    # The default folded directory is required and reported without content.
+    # Required messages exhaust the default-policy attempt before tool folding.
     assert [(item.name, item.bytes) for item in error.component_bytes] == [
         ("system", 1_500),
-        (
-            "tools",
-            frontier.prompt_structure_utf8_bytes([
-                tool_surface.collapsed_tool_spec(tool)
-            ]),
-        ),
     ]
 
 

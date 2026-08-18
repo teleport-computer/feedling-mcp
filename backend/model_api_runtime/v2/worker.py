@@ -475,7 +475,10 @@ PROMPT_IMAGE_RESERVE_TOKENS = _positive_int_env(
 )
 try:
     TOOL_SCHEMA_COLLAPSE_POLICY = v2_tool_surface.normalize_collapse_policy(
-        os.environ.get("FEEDLING_V2_TOOL_SCHEMA_COLLAPSE_POLICY", "always")
+        os.environ.get(
+            "FEEDLING_V2_TOOL_SCHEMA_COLLAPSE_POLICY",
+            v2_tool_surface.DEFAULT_COLLAPSE_POLICY,
+        )
     )
 except ValueError as exc:
     raise RuntimeError(
