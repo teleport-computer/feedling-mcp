@@ -13121,6 +13121,10 @@ def model_api_autoselect_active(user_id: str) -> str | None:
 # ---------------------------------------------------------------------------
 
 
+class FrameReadUnavailable(RuntimeError):
+    """The frame may exist, but its durable store could not be read."""
+
+
 def _frame_write_row(user_id: str, frame_id: str, ts: float,
                      doc: dict | None, env_meta: dict | None, body_key: str | None) -> bool:
     """Upsert one frame_envelopes row. Returns True on success; swallows-and-logs
@@ -13144,7 +13148,7 @@ def _frame_write_row(user_id: str, frame_id: str, ts: float,
         return False
 
 
-def frame_upsert(user_id: str, frame_id: str, ts: float, doc: dict) -> None:
+def frame_upsert(user_id: str, frame_id: str, ts: float, doc: dict) -> bool:
     """Persist a v1 frame envelope.
 
     With R2 configured, the heavy ``body_ct`` is offloaded to object storage and
@@ -13161,7 +13165,8 @@ def frame_upsert(user_id: str, frame_id: str, ts: float, doc: dict) -> None:
     A crash/abort at any point leaves either an inline (readable) row or a
     pointer whose object is already present; a failed upload just keeps the
     inline row. ``doc`` is offloaded out of the row only after the body is in
-    R2, so the at-rest table stays small without a missing-object window."""
+    R2, so the at-rest table stays small without a missing-object window.
+    Returns whether a readable row was durably stored."""
     body_field = (
         "body_ct" if isinstance(doc, dict) and doc.get("body_ct") is not None
         else "body_b64" if isinstance(doc, dict) and doc.get("body_b64") is not None
@@ -13170,14 +13175,14 @@ def frame_upsert(user_id: str, frame_id: str, ts: float, doc: dict) -> None:
     if object_storage.enabled() and body_field is not None:
         # 1) inline first — frame readable, references no R2 object yet.
         if not _frame_write_row(user_id, frame_id, ts, doc, None, None):
-            return  # DB write failed → nothing committed, R2 untouched.
+            return False  # DB write failed → nothing committed, R2 untouched.
         # 2) upload; on failure keep the inline row (frame stays readable).
         try:
             object_storage.put_frame_body(user_id, frame_id, doc[body_field])
         except Exception as e:  # noqa: BLE001
             log.error("[db] frame_upsert(%s,%s) R2 upload failed, leaving inline: %s",
                       user_id, frame_id, e)
-            return
+            return True
         # 3) object now exists → flip to pointer as the last durable step. If
         #    this write fails the row stays inline (readable); the uploaded
         #    object is a harmless orphan.
@@ -13188,8 +13193,8 @@ def frame_upsert(user_id: str, frame_id: str, ts: float, doc: dict) -> None:
             env_meta["body_sha256"] = hashlib.sha256(raw).hexdigest()
         body_key = object_storage.frame_key(user_id, frame_id)
         _frame_write_row(user_id, frame_id, ts, None, env_meta, body_key)
-        return
-    _frame_write_row(user_id, frame_id, ts, doc, None, None)
+        return True
+    return _frame_write_row(user_id, frame_id, ts, doc, None, None)
 
 
 def frame_exists(user_id: str, frame_id: str) -> bool:
@@ -13238,10 +13243,19 @@ def perception_broadcast_meta(user_id: str) -> dict:
     }
 
 
-def frame_get(user_id: str, frame_id: str) -> dict | None:
+def frame_get(
+    user_id: str,
+    frame_id: str,
+    *,
+    unavailable_raises: bool = False,
+) -> dict | None:
     """Return the full v1 envelope, reconstructing ``body_ct`` from R2 for
     offloaded rows (``body_key`` set) and returning the inline ``doc`` for
-    legacy rows."""
+    legacy rows.
+
+    When ``unavailable_raises`` is true, storage outages are distinguished from
+    a definitive missing row or object so request handlers can return 503.
+    """
     try:
         with get_pool().connection() as conn:
             row = conn.execute(
@@ -13251,14 +13265,31 @@ def frame_get(user_id: str, frame_id: str) -> dict | None:
             ).fetchone()
     except Exception as e:
         log.error("[db] frame_get(%s,%s) failed: %s", user_id, frame_id, e)
+        if unavailable_raises:
+            raise FrameReadUnavailable("frame row read unavailable") from e
         return None
     if row is None:
         return None
     doc, env_meta, body_key = row
     if body_key:
-        body = object_storage.get_frame_body(user_id, frame_id)
+        body = None
+        for attempt in range(2):
+            try:
+                body = object_storage.get_frame_body_strict(user_id, frame_id)
+                break
+            except Exception as e:  # noqa: BLE001
+                if attempt == 0:
+                    # One fresh read covers a broken pooled connection after
+                    # the SDK's own bounded HTTP retries are exhausted.
+                    time.sleep(0.15)
+                    continue
+                log.error("[db] frame_get(%s,%s) R2 read unavailable: %s",
+                          user_id, frame_id, e)
+                if unavailable_raises:
+                    raise FrameReadUnavailable("frame body read unavailable") from e
+                return None
         if body is None:
-            # The pointer row exists but its R2 body is missing/unreadable.
+            # The pointer row exists but its R2 body is definitively missing.
             # Report not-found rather than a metadata-only dict — callers treat
             # any dict as a valid envelope and would serve an undecryptable frame.
             log.error("[db] frame_get(%s,%s) R2 body missing for key %s",

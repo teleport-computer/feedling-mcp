@@ -311,7 +311,10 @@ def serve_frame(store, filename: str) -> ScreenResult:
     # Filenames are `<frame_id>.env.json`; map back to the frame_id and serve the
     # stored envelope JSON bytes (frames are always v1 ciphertext now).
     frame_id = filename.split(".")[0]
-    env = db.frame_get(store.user_id, frame_id)
+    try:
+        env = db.frame_get(store.user_id, frame_id, unavailable_raises=True)
+    except db.FrameReadUnavailable:
+        return ScreenResult(503, json_body={"error": "frame_store_unavailable"})
     if env is None:
         return ScreenResult(404, json_body={"error": "not found"})
     # Byte-identical to Flask ``Response(json.dumps(env), mimetype="application/json")``.
@@ -339,7 +342,10 @@ def frame_decrypt(
     credential + the ``include_image`` flag and relays the enclave's response
     bytes/status/content-type. No plaintext is produced here.
     """
-    env = db.frame_get(store.user_id, frame_id)
+    try:
+        env = db.frame_get(store.user_id, frame_id, unavailable_raises=True)
+    except db.FrameReadUnavailable:
+        return ScreenResult(503, json_body={"error": "frame_store_unavailable"})
     if env is None:
         return ScreenResult(404, json_body={"error": "not found"})
     inner = frames._read_plaintext_frame(env)
@@ -420,7 +426,10 @@ def frame_image(
     Returns the enclave's Content-Type image/jpeg with Accept-Ranges: bytes (and
     Content-Range on 206). The enclave owns decryption; this only relays bytes.
     """
-    env = db.frame_get(store.user_id, frame_id)
+    try:
+        env = db.frame_get(store.user_id, frame_id, unavailable_raises=True)
+    except db.FrameReadUnavailable:
+        return ScreenResult(503, json_body={"error": "frame_store_unavailable"})
     if env is None:
         return ScreenResult(404, json_body={"error": "not found"})
     inner = frames._read_plaintext_frame(env)
