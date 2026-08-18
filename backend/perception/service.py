@@ -1320,7 +1320,11 @@ def photo_evaluate(user_id: str, metadata: dict,
         return {"error": "content_envelope_required"}, 400
 
     # Store ciphertext in the frame channel + metadata as a confirmed item.
-    store.put_photo_envelope(user_id, photo_id, now, content_envelope)
+    stored = store.put_photo_envelope(user_id, photo_id, now, content_envelope)
+    if stored is False:
+        # Do not confirm metadata without durable pixels. iOS keeps its cursor
+        # unchanged on this retryable non-2xx response.
+        return {"error": "photo_storage_unavailable"}, 503
     doc = {"photo_id": photo_id, "metadata": meta_out, "status": "confirmed",
            "usable": True, "sensitive": sensitive, "frame_id": photo_id}
     if meta_envelope:

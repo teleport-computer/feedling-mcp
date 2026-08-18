@@ -79,7 +79,8 @@ def _save_frame_envelope(store: UserStore, payload: dict, env: dict):
     """
     item_id = env.get("id") or uuid.uuid4().hex
     ts = payload.get("ts") or time.time()
-    db.frame_upsert(store.user_id, item_id, ts, env)
+    if db.frame_upsert(store.user_id, item_id, ts, env) is False:
+        return
 
     encrypted = bool(env.get("body_ct"))
     inner = _read_plaintext_frame(env) if not encrypted else None
