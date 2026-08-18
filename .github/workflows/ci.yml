@@ -71,6 +71,8 @@ jobs:
         if: ${{ inputs.operation == 'diagnose-test-photo' }}
         env:
           PHALA_CLOUD_API_KEY: ${{ secrets.TEST_PHALA_CLOUD_API_KEY }}
+          TEST_ADMIN_BASE_URL: ${{ secrets.TEST_ADMIN_BASE_URL }}
+          TEST_ADMIN_KEY: ${{ secrets.TEST_ADMIN_KEY }}
         run: |
           if [ -z "$PHALA_CLOUD_API_KEY" ]; then
             echo "::error::TEST_PHALA_CLOUD_API_KEY is not configured"
@@ -86,11 +88,21 @@ jobs:
           # request bodies, encrypted frames, provider keys, or photo pixels.
           pattern='photo_read|photo_storage_unavailable|frame_store_unavailable|frame_get|/v1/perception/photos|/v1/screen/frames/|bad frame id|vision_model_unavailable|photo_(observation|pixels)'
           found=0
-          for container in \
-            feedling-enclave-backend-1 \
-            feedling-enclave-serve-worker-1 \
-            feedling-enclave-enclave-1 \
-            feedling-enclave-enclave-domain-1; do
+          containers_json=$(phala ps "$CVM_ID" \
+            --api-token "$PHALA_CLOUD_API_KEY" --json)
+          mapfile -t containers < <(
+            printf '%s' "$containers_json" | jq -r \
+              '.. | objects | (.name? // .container_name? // empty)' | \
+              grep -E '(^|[-_])(backend|serve-worker|enclave|enclave-domain)([-_]|$)' | \
+              sort -u
+          )
+          if [ "${#containers[@]}" -eq 0 ]; then
+            echo "::warning::Phala returned no matching container names; trying compose service names"
+            containers=(backend serve-worker enclave enclave-domain)
+          fi
+          printf 'Inspecting containers: %s\n' "${containers[*]}"
+
+          for container in "${containers[@]}"; do
             log_file=$(mktemp)
             if phala logs "$container" \
               --cvm-id "$CVM_ID" \
@@ -105,11 +117,52 @@ jobs:
               fi
             else
               echo "::warning::could not fetch $container logs"
+              tail -n 2 "$log_file" | sed -E 's/phak_[A-Za-z0-9_-]+/[redacted]/g'
             fi
             rm -f "$log_file"
           done
           if [ "$found" -eq 0 ]; then
             echo "No matching photo failure breadcrumbs in the last 45 minutes"
+          fi
+
+          if [ -n "$TEST_ADMIN_KEY" ]; then
+            base_url=${TEST_ADMIN_BASE_URL:-https://test-api.feedling.app}
+            trace_file=$(mktemp)
+            http_code=$(curl --silent --show-error \
+              --retry 6 --retry-all-errors --retry-delay 1 \
+              --connect-timeout 8 --max-time 45 \
+              --get --output "$trace_file" --write-out '%{http_code}' \
+              --header "X-Admin-Token: $TEST_ADMIN_KEY" \
+              --data-urlencode 'since=2h' \
+              --data-urlencode 'q=photo_read' \
+              --data-urlencode 'limit=100' \
+              --data-urlencode 'mode=flat' \
+              "$base_url/v1/admin/data-track/debug")
+            if [ "$http_code" = "200" ]; then
+              # The admin payload contains full traces. Emit only identity-free
+              # stage/status fields and stable photo/vision/frame error strings.
+              jq '{
+                summary,
+                events: [.events[] | {
+                  ts,
+                  trace_id,
+                  subsystem,
+                  type,
+                  status,
+                  dur_ms,
+                  codes: ([
+                    .detail | .. | strings |
+                    select(test("vision_model_|photo_read|photo_storage_|frame_store_|capability_")) |
+                    .[0:120]
+                  ] | unique)
+                }]
+              }' "$trace_file"
+            else
+              echo "::warning::photo trace query returned HTTP $http_code"
+            fi
+            rm -f "$trace_file"
+          else
+            echo "::warning::TEST_ADMIN_KEY is not configured; skipped photo trace query"
           fi
 
       - name: Require stable Test transports
