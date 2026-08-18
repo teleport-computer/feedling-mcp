@@ -10,10 +10,31 @@ from capabilities import photo as cap_photo  # noqa: E402
 
 
 def test_recent_wraps(monkeypatch):
+    photo_id = "ab" * 16
     monkeypatch.setattr(perception_read_core, "photos_recent",
-                        lambda store, limit: ({"photos": [{"id": "p1"}]}, 200))
+                        lambda store, limit: ({"photos": [{"photo_id": photo_id}]}, 200))
     r = cap_photo.recent("STORE", params={"limit": 3})
-    assert r.ok is True and r.data == {"photos": [{"id": "p1"}]}
+    assert r.ok is True and r.data == {"photos": [{"photo_id": photo_id}]}
+
+
+def test_recent_omits_photos_the_decrypt_route_cannot_address(monkeypatch):
+    readable = "cd" * 16
+    legacy_uuid = "A1234567-B89C-4DEF-8123-456789ABCDEF"
+    monkeypatch.setattr(
+        perception_read_core,
+        "photos_recent",
+        lambda store, limit: ({
+            "photos": [
+                {"photo_id": readable},
+                {"photo_id": legacy_uuid},
+            ],
+        }, 200),
+    )
+
+    r = cap_photo.recent("STORE", params={})
+
+    assert r.ok is True
+    assert r.data == {"photos": [{"photo_id": readable}]}
 
 
 def test_read_requires_id():
@@ -112,6 +133,9 @@ def test_read_without_include_image_never_decrypts(monkeypatch):
 
 def test_recent_caps_large_photo_list(monkeypatch):
     monkeypatch.setattr(perception_read_core, "photos_recent",
-                        lambda store, limit: ({"photos": list(range(1000))}, 200))
+                        lambda store, limit: ({"photos": [
+                            {"photo_id": f"{index:032x}"}
+                            for index in range(1000)
+                        ]}, 200))
     r = cap_photo.recent("STORE", params={})
     assert r.ok is True and len(r.data["photos"]) == 50
