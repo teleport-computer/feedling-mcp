@@ -8200,6 +8200,8 @@ def _debug_time(ts) -> str:
 _DEBUG_STEP_LABELS = {
     "route.decided": ("🧭", "路由决策"),
     "context.build": ("📎", "组装上下文"),
+    "memory.inject": ("🧠", "自动注入记忆"),
+    "memory.dream.tick": ("🌙", "做梦判定"),
     "agent.model.call.start": ("🧠", "调用模型 · 开始"),
     "agent.model.call.done": ("🧠", "调用模型 · 完成"),
     "agent.tool.call": ("🔧", "调用工具"),

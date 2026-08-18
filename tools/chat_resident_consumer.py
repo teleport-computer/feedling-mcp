@@ -2446,6 +2446,33 @@ def _unmark_seen(keys) -> None:
 # Decrypt sources — plaintext content for v1 encrypted messages
 # ---------------------------------------------------------------------------
 
+
+def _emit_injection_trace(log: dict | None) -> None:
+    """把 enclave 带回来的注入记录落成一条 debug trace。
+
+    记录本身已经是内容无关的（见 memory_garden/observability.py）；
+    这里只负责转发，不再加工 —— 加工会让「什么算内容」这件事散成两处。
+    失败一律吞掉：可观测性绝不能拖垮聊天。
+    """
+    if not isinstance(log, dict) or not log:
+        return
+    try:
+        counts = log.get("counts") or {}
+        injected = counts.get("injected", 0)
+        pool = counts.get("candidate_pool", 0)
+        mode = log.get("mode", "?")
+        _emit_debug_trace(
+            "memory", "memory.inject",
+            status="ok" if mode != "failed" else "failed",
+            summary=f"注入 {injected} 张（{mode}，候选 {pool}）",
+            explain="每轮自动挑卡的结果。id 与计数落库，卡片正文不落库。",
+            detail=log,
+            dur_ms=log.get("dur_ms"),
+        )
+    except Exception:  # noqa: BLE001 — 观测失败绝不能影响这一轮对话
+        pass
+
+
 def _filter_since(msgs: list, since: float) -> list:
     return [m for m in msgs if float(m.get("ts", m.get("timestamp", 0)) or 0) > since]
 
@@ -2479,6 +2506,10 @@ def _fetch_from_enclave(
             )
             resp.raise_for_status()
             data = resp.json()
+            # 自动注入的内容无关记录：enclave 算好带出来，由这里落库 ——
+            # enclave 自己没有数据库发不了 debug_trace（2026-08-17 补的盲区，
+            # 此前「每轮注入了哪几张卡」服务端一个字都查不到）。
+            _emit_injection_trace(data.get("context_memory_log"))
             msgs = data.get("messages") or data.get("history") or []
             return _filter_since(msgs, since)
         except httpx.HTTPStatusError as e:
