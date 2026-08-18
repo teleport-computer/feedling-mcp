@@ -69,6 +69,19 @@ REGISTRY: dict[str, Entry] = {
     "genesis_import_outputs": Entry(MIRROR, "入住导入产物，明文；reconciler.TABLES 已覆盖"),
     "notify_relay_configs": Entry(MIRROR, "自部署推送中继配置；alembic_tee 0002 已建表"),
     "notify_relay_logs": Entry(MIRROR, "推送中继日志；id 是 IDENTITY 列"),
+    "lane_daily_rollup": Entry(
+        MIRROR,
+        "按用户×道×北京日的 job 结果冻结格子（0091/tee 0023），单例调度器日批写、"
+        "写后不变、永久增长——正因永久增长不能走 SNAPSHOT（20 万行 MAX_ROWS 硬阀，"
+        "约 234 天触顶且超限整轮失败，codex2 2026-08-18 审出）。语句幂等"
+        "（ON CONFLICT DO NOTHING），冻结点以 execute_many 按日整组镜像；"
+        "期 2 接 user_logs 源后格子是环形缓冲滚掉明细后的唯一存留，必须双写",
+    ),
+    "lane_rollup_watermark": Entry(
+        MIRROR,
+        "格子覆盖水位（每 route 一行，through_day 原地 UPDATE），与当日格子同组"
+        "镜像——TEE 侧水位若滞后，cutover 后会把「已冻结」误读成「记录史之前」",
+    ),
 
     # ---------------------------------------------------------------- #
     # CIPHERTEXT —— 装信封的表，经 enclave 解密成明文写进 TEE。

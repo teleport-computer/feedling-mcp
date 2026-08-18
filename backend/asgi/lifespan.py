@@ -100,6 +100,15 @@ def _start_runtime_reconciler_leader() -> None:
     core_leader.run_singleton("runtime-reconciler", runtime_reconciler.start)
 
 
+def _start_lane_rollup_leader() -> None:
+    """Freeze per-user per-lane daily job-outcome cells on exactly one
+    backend worker (admin read path must never scan full history)."""
+    from admin import lane_rollup_scheduler
+    from core import leader as core_leader
+
+    core_leader.run_singleton("lane-rollup", lane_rollup_scheduler.start)
+
+
 @asynccontextmanager
 async def lifespan(app):
     # (1) Threadpool limiter — off anyio's 40-token default (§5.2).
@@ -170,6 +179,7 @@ async def lifespan(app):
         _start_ws_leader()
         _start_dau_snapshot_leader()
         _start_runtime_reconciler_leader()
+        _start_lane_rollup_leader()
         # (6b) TEE 影子库自动同步单例 — 仅在双写已接时选举（env 决定，接=重部署）。
         from tee_shadow import mirror as _tee_mirror
 
