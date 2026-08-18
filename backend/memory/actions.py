@@ -19,7 +19,7 @@ from memory_garden.text import card_text
 from memory import service as memory_service
 from memory_garden import timestamps as memory_timestamps
 from memory_garden.prompts.buckets import normalize_bucket_language
-from memory_garden.types import (
+from memory.source_policy import (
     MAX_MEMORY_SUPERSEDE_TARGETS,
     MEMORY_CAPTURE_MODE_VALUES,
     MEMORY_SOURCE_VALUES,

@@ -39,7 +39,7 @@ import urllib.request
 import uuid
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "backend"))
-from memory_garden.types import (  # noqa: E402
+from memory.source_policy import (  # noqa: E402
     MEMORY_SOURCE_VALUES,
     RESIDENT_ABSORB_SOURCE,
     RESIDENT_PATCH_SOURCE,

@@ -1,4 +1,4 @@
-"""字段映射：摘要不许漏正文、纯老卡逐字节不变。
+"""io 侧的卡片形状翻译：摘要不许漏正文、两种历史形状都能翻。
 
 这两条是本批的硬约束（都是踩出来的，不是设计洁癖）：
 
@@ -18,7 +18,7 @@ BACKEND = pathlib.Path(__file__).resolve().parent.parent / "backend"
 if str(BACKEND) not in sys.path:
     sys.path.insert(0, str(BACKEND))
 
-from memory_garden import card_fields  # noqa: E402
+from memory import card_shape as card_fields  # noqa: E402
 
 #: 改造前 `_text_for_memory` 的实现，逐字复刻。纯老卡必须与它输出完全一致。
 _LEGACY_FIELDS = ("title", "description", "her_quote", "context", "linked_dimension")

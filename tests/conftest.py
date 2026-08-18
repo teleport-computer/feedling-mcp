@@ -262,7 +262,8 @@ if not _provisioned:
     # no-Postgres dev machine still runs something useful.
     _PURE_UNIT = {
     "test_memory_injection_observability.py",
-    "test_memory_garden_card_fields.py",
+    "test_garden_selection_pluggable.py",
+    "test_garden_card_shape.py",
     "test_route_b_card_shape_recall.py",
     "test_route_b_sensitive_gate.py",
         "test_card_guard.py",
