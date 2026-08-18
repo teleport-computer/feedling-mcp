@@ -114,6 +114,22 @@ def test_requested_pixels_never_treat_malformed_json_as_an_image(monkeypatch):
     assert r.error["code"] == "capability_upstream_error"
 
 
+def test_retryable_frame_store_failure_is_not_reported_as_missing(monkeypatch):
+    monkeypatch.setattr(perception_read_core, "photo_content",
+                        lambda store, pid: ({"id": "p1", "frame_id": "f9"}, 200))
+    monkeypatch.setattr(screen_read_core, "frame_decrypt",
+                        lambda *a, **k: ScreenResult(
+                            status=503,
+                            json_body={"error": "frame_store_unavailable"},
+                        ))
+
+    r = cap_photo.read("STORE", params={"id": "p1", "include_image": True})
+
+    assert r.ok is False
+    assert r.error["code"] == "capability_upstream_error"
+    assert r.error["retryable"] is True
+
+
 def test_read_without_include_image_never_decrypts(monkeypatch):
     monkeypatch.setattr(perception_read_core, "photo_content",
                         lambda store, pid: ({"id": "p1", "frame_id": "f9"}, 200))
