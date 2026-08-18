@@ -635,6 +635,153 @@ def test_foreground_semantic_empty_response_gets_one_correction(monkeypatch):
     )
 
 
+def test_reply_bubble_promotes_only_after_empty_recovery_is_exhausted(monkeypatch):
+    provider = _ScriptedProvider([
+        {
+            "reply": "",
+            "tool_calls": [
+                {"id": "r1", "name": "reply", "args": {"text": "complete answer"}}
+            ],
+            "usage": {},
+        },
+        {
+            "reply": "",
+            "reasoning": "private work with no visible answer",
+            "stop_reason": "end_turn",
+            "tool_calls": [],
+            "usage": {"completion_tokens": 3930},
+        },
+        {
+            "reply": "",
+            "reasoning": "still no new visible answer",
+            "stop_reason": "end_turn",
+            "tool_calls": [],
+            "usage": {"completion_tokens": 5},
+        },
+    ])
+    monkeypatch.setattr(provider_client, "chat_completion_async", provider)
+    on_reply = _RecordingReply()
+    promotion_calls = []
+
+    async def promote():
+        promotion_calls.append(len(provider.calls))
+        return True
+
+    outcome = asyncio.run(tool_loop.run_tool_loop(
+        provider_config=_TEST_PROVIDER_CONFIG,
+        build_messages=_AdaptiveBuildMessages(),
+        dispatch_tools=_RecordingDispatch(),
+        on_reply=on_reply,
+        on_promote_last_intermediate=promote,
+        fold_new_messages=_RecordingFold([]),
+        add_usage=_noop_add_usage,
+        max_calls=5,
+    ))
+
+    assert len(provider.calls) == 3
+    assert promotion_calls == [3]
+    assert "without visible text" in provider.calls[2]["messages"][0]["content"]
+    assert on_reply.calls == [("complete answer", False)]
+    assert outcome.final_text == ""
+    assert outcome.stop_reason == "intermediate_promoted"
+    assert outcome.replied_intermediate is True
+
+
+def test_first_empty_at_call_budget_never_promotes_reply_bubble(monkeypatch):
+    provider = _ScriptedProvider([
+        {
+            "reply": "",
+            "tool_calls": [
+                {"id": "r1", "name": "reply", "args": {"text": "one moment"}}
+            ],
+            "usage": {},
+        },
+        {
+            "reply": "",
+            "reasoning": "provider produced no visible answer",
+            "stop_reason": "end_turn",
+            "tool_calls": [],
+            "usage": {"completion_tokens": 3930},
+        },
+    ])
+    monkeypatch.setattr(provider_client, "chat_completion_async", provider)
+    on_reply = _RecordingReply()
+    promotion_calls = []
+
+    async def promote():
+        promotion_calls.append(True)
+        return True
+
+    with pytest.raises(tool_loop.ProviderEmptyReply, match="empty_reply"):
+        asyncio.run(tool_loop.run_tool_loop(
+            provider_config=_TEST_PROVIDER_CONFIG,
+            build_messages=_AdaptiveBuildMessages(),
+            dispatch_tools=_RecordingDispatch(),
+            on_reply=on_reply,
+            on_promote_last_intermediate=promote,
+            fold_new_messages=_RecordingFold([]),
+            add_usage=_noop_add_usage,
+            max_calls=2,
+        ))
+
+    assert len(provider.calls) == 2
+    assert provider.calls[1]["tools"] is not None
+    assert provider.calls[1]["tool_choice"] == "none"
+    assert on_reply.calls == [("one moment", False)]
+    assert promotion_calls == []
+
+
+def test_empty_recovery_can_still_publish_new_final_after_reply_bubble(monkeypatch):
+    provider = _ScriptedProvider([
+        {
+            "reply": "",
+            "tool_calls": [
+                {"id": "r1", "name": "reply", "args": {"text": "one moment"}}
+            ],
+            "usage": {},
+        },
+        {
+            "reply": "",
+            "reasoning": "provider produced no body",
+            "stop_reason": "end_turn",
+            "tool_calls": [],
+            "usage": {},
+        },
+        {
+            "reply": "different final answer",
+            "stop_reason": "end_turn",
+            "tool_calls": [],
+            "usage": {},
+        },
+    ])
+    monkeypatch.setattr(provider_client, "chat_completion_async", provider)
+    on_reply = _RecordingReply()
+    promotion_calls = []
+
+    async def promote():
+        promotion_calls.append(True)
+        return True
+
+    outcome = asyncio.run(tool_loop.run_tool_loop(
+        provider_config=_TEST_PROVIDER_CONFIG,
+        build_messages=_AdaptiveBuildMessages(),
+        dispatch_tools=_RecordingDispatch(),
+        on_reply=on_reply,
+        on_promote_last_intermediate=promote,
+        fold_new_messages=_RecordingFold([]),
+        add_usage=_noop_add_usage,
+        max_calls=5,
+    ))
+
+    assert promotion_calls == []
+    assert on_reply.calls == [
+        ("one moment", False),
+        ("different final answer", True),
+    ]
+    assert outcome.final_text == "different final answer"
+    assert outcome.stop_reason == "final_text"
+
+
 def test_serialized_upstream_response_envelope_gets_one_correction(monkeypatch):
     """usr_90184: a relay serialized Gemini's whole body as visible text."""
     leaked = json.dumps(

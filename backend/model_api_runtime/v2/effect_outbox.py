@@ -25,6 +25,7 @@ _PENDING_EFFECT_STATUSES = frozenset({"pending", "pending_fenced_v1"})
 # contract and never need to know about the agent-job admission protocol.
 FINAL_REPLY_FENCE_KEY = "_final_reply_fence"
 REPLY_SOURCE_FENCE_KEY = "_reply_source_fence"
+PROMOTED_INTERMEDIATE_EFFECT_ID_KEY = "_promoted_intermediate_effect_id"
 PERCEPTION_GLANCE_FINGERPRINT_KEY = "_perception_glance_fingerprint"
 FINAL_REPLY_EFFECT_TYPE = "reply_final_fenced_v1"
 TERMINAL_REPLY_EFFECT_TYPE = "reply_terminal_fenced_v1"
@@ -305,6 +306,33 @@ def enqueue_effect(
         expected_generation,
         payload,
         input_frontier_seq=input_frontier_seq,
+    )
+    return eid
+
+
+def enqueue_reply_promotion(
+    *,
+    intermediate_effect_id: str,
+    job_id,
+    user_id,
+    expected_generation,
+    payload,
+) -> str:
+    """Enqueue the deterministic terminal half of an intermediate reply.
+
+    The source intermediate effect, rather than an in-process ordinal, is the
+    durable idempotency key.  This keeps promotion stable across lease recovery.
+    """
+    eid = _effect_id.derive_reply_promotion(
+        intermediate_effect_id=intermediate_effect_id,
+    )
+    db.effect_enqueue(
+        eid,
+        user_id,
+        job_id,
+        FINAL_REPLY_EFFECT_TYPE,
+        expected_generation,
+        payload,
     )
     return eid
 
@@ -783,6 +811,59 @@ def get_effect_disposition(
             raise RuntimeError("persisted applied effect result is invalid")
         disposition["result"] = result
     return disposition
+
+
+def last_promotable_intermediate_reply(
+    *,
+    user_id: str,
+    job_id,
+) -> dict | None:
+    """Return the newest durable text bubble not terminally rejected for promotion.
+
+    The outbox row is the recovery record: process-local state may disappear
+    after the bubble is visible but before the provider closes the turn.  File
+    and image cards carry ``message_extra`` and are intentionally ineligible;
+    this promotion contract is for the chat ``reply`` text tool only.
+    """
+    with db.get_pool().connection() as conn:
+        row = conn.execute(
+            "SELECT source.effect_id,source.payload "
+            "FROM v2_effect_outbox source "
+            "WHERE source.user_id=%s AND source.job_id=%s "
+            "AND source.effect_type=%s AND source.status='applied' "
+            "AND source.payload ? 'envelope' "
+            "AND NOT (source.payload ? 'message_extra') "
+            "AND NOT EXISTS ("
+            " SELECT 1 FROM v2_effect_outbox promotion "
+            " WHERE promotion.user_id=source.user_id "
+            " AND promotion.job_id=source.job_id "
+            " AND promotion.effect_type=%s "
+            " AND promotion.status='discarded' "
+            " AND promotion.payload->>%s=source.effect_id"
+            ") ORDER BY source.enqueue_seq DESC LIMIT 1",
+            (
+                str(user_id),
+                job_id,
+                INTERMEDIATE_REPLY_EFFECT_TYPE,
+                FINAL_REPLY_EFFECT_TYPE,
+                PROMOTED_INTERMEDIATE_EFFECT_ID_KEY,
+            ),
+        ).fetchone()
+    if row is None:
+        return None
+    effect_id = str(row[0] or "").strip()
+    payload = row[1]
+    if isinstance(payload, str):
+        payload = json.loads(payload)
+    if (
+        not effect_id
+        or not isinstance(payload, dict)
+        or not isinstance(payload.get("envelope"), dict)
+        or "reply_through_seq" in payload
+        or FINAL_REPLY_FENCE_KEY in payload
+    ):
+        raise RuntimeError("invalid promotable intermediate reply")
+    return {"effect_id": effect_id, "payload": payload}
 
 
 def apply_pending_effects(

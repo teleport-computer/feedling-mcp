@@ -542,6 +542,7 @@ async def run_tool_loop(
     build_messages,
     dispatch_tools,
     on_reply,
+    on_promote_last_intermediate=None,
     fold_new_messages,
     add_usage,
     max_calls: int,
@@ -641,6 +642,12 @@ async def run_tool_loop(
     publishing, then either publish the accepted rewrite or return
     :class:`FinalReplyCorrectionRejected`.  The loop gives that request exactly one
     text-only provider call and otherwise republishes the original fail-open.
+
+    Foreground Chat may also provide ``on_promote_last_intermediate``.  It is
+    consulted only after the existing one-shot semantic-empty recovery has
+    already been consumed.  A true result means the caller atomically closed
+    the turn through a previously published reply bubble; false preserves the
+    ordinary empty-reply failure.
 
     ``on_file_reply`` is an optional async chat-lane callback. When absent, the
     ``send_file`` tool is removed from the offered catalog. Production resolves
@@ -1591,6 +1598,11 @@ async def run_tool_loop(
                 and not empty_response_recovery_used
                 and attempts < max_calls - 1
             )
+            can_attempt_promotion = bool(
+                on_promote_last_intermediate is not None
+                and empty_response_recovery_used
+                and not upstream_response_envelope
+            )
             await _trajectory(
                 "empty_provider_response",
                 {
@@ -1604,7 +1616,11 @@ async def run_tool_loop(
                     "action": (
                         "semantic_correction"
                         if can_correct
-                        else "fail_provider_empty_reply"
+                        else (
+                            "promote_intermediate_or_fail"
+                            if can_attempt_promotion
+                            else "fail_provider_empty_reply"
+                        )
                     ),
                 },
             )
@@ -1624,6 +1640,31 @@ async def run_tool_loop(
                 seen_reasoning_fragments.clear()
                 _progress("empty_response_retry_boundary")
                 continue
+            if can_attempt_promotion:
+                try:
+                    promoted = await on_promote_last_intermediate()
+                except FinalReplySuperseded:
+                    reasoning_fragments.clear()
+                    seen_reasoning_fragments.clear()
+                    _progress("final_reply_superseded")
+                    await _trajectory(
+                        "final_reply_superseded",
+                        {"round": attempts, "source": "intermediate_promotion"},
+                    )
+                    if attempts < max_calls:
+                        continue
+                    return LoopOutcome(
+                        "", attempts, "input_advanced", replied_intermediate
+                    )
+                if promoted:
+                    replied_intermediate = True
+                    await _trajectory(
+                        "intermediate_reply_promoted",
+                        {"round": attempts},
+                    )
+                    return LoopOutcome(
+                        "", attempts, "intermediate_promoted", True
+                    )
             exc = ProviderEmptyReply("empty_reply")
             if on_provider_failure is not None:
                 try:

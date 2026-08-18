@@ -34,3 +34,17 @@ def derive_batch_item(*, parent_effect_id: str, ordinal: int) -> str:
     if index < 0:
         raise ValueError("ordinal must be non-negative")
     return f"{parent}:item:{index}"
+
+
+def derive_reply_promotion(*, intermediate_effect_id: str) -> str:
+    """Terminal effect that promotes one already-applied reply bubble.
+
+    A worker retry may rebuild its local execution ordinal from zero, while the
+    intermediate bubble it is closing is already durable.  Key the promotion
+    directly to that durable source identity so every replay targets the same
+    final outbox row.
+    """
+    source = str(intermediate_effect_id or "").strip()
+    if not source:
+        raise ValueError("intermediate_effect_id is required")
+    return f"{source}:promoted-final"
