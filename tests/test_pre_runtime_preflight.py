@@ -18,7 +18,11 @@ def test_tee_migrate_has_one_head_after_runtime_v2_alignment():
     cfg.set_main_option("script_location", str(ROOT / "backend" / "alembic_tee"))
     script = ScriptDirectory.from_config(cfg)
 
-    assert script.get_heads() == ["0024_lane_rollup_safe_ts"]
+    assert script.get_heads() == ["0025_lane_rollup_voice"]
+    assert (
+        script.get_revision("0025_lane_rollup_voice").down_revision
+        == "0024_lane_rollup_safe_ts"
+    )
     assert (
         script.get_revision("0024_lane_rollup_safe_ts").down_revision
         == "0023_lane_daily_rollup"
@@ -47,10 +51,14 @@ def test_tee_migrate_has_one_head_after_runtime_v2_alignment():
         script.get_revision("0018_v2_wake_shadow_decisions").down_revision
         == "0017_voice_primary_alignment"
     )
-    migration = script.get_revision("0024_lane_rollup_safe_ts").module
-    assert "'[\"0024_lane_rollup_safe_ts\"]'::jsonb" in (
-        migration._UPDATE_PREPARED_HEAD
-    )
+    # The prepared-head pin must name whichever revision is CURRENTLY head —
+    # a cutover that replays a stale pin re-arms the old head and the preflight
+    # then waves through a database that is one migration behind. Derive it
+    # from get_heads() so adding a revision without advancing its pin fails
+    # here instead of at cutover time.
+    (head,) = script.get_heads()
+    migration = script.get_revision(head).module
+    assert f"'[\"{head}\"]'::jsonb" in migration._UPDATE_PREPARED_HEAD
 
 
 def _job(source: str, name: str, next_name: str) -> str:

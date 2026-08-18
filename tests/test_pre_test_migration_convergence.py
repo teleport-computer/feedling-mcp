@@ -16,7 +16,11 @@ def _scripts(tree: str) -> ScriptDirectory:
 
 def test_rds_pre_and_test_heads_converge():
     script = _scripts("alembic")
-    assert script.get_heads() == ["0092_lane_rollup_safe_ts"]
+    assert script.get_heads() == ["0093_lane_rollup_voice"]
+    assert (
+        script.get_revision("0093_lane_rollup_voice").down_revision
+        == "0092_lane_rollup_safe_ts"
+    )
     assert (
         script.get_revision("0092_lane_rollup_safe_ts").down_revision
         == "0091_lane_daily_rollup"
@@ -45,7 +49,11 @@ def test_rds_pre_and_test_heads_converge():
 
 def test_tee_chain_carries_test_runtime_schema():
     script = _scripts("alembic_tee")
-    assert script.get_heads() == ["0024_lane_rollup_safe_ts"]
+    assert script.get_heads() == ["0025_lane_rollup_voice"]
+    assert (
+        script.get_revision("0025_lane_rollup_voice").down_revision
+        == "0024_lane_rollup_safe_ts"
+    )
     assert (
         script.get_revision("0024_lane_rollup_safe_ts").down_revision
         == "0023_lane_daily_rollup"
@@ -98,4 +106,14 @@ def test_tee_migrations_reuse_the_rds_contract_sql():
     assert (
         tee.get_revision("0022_v2_wake_outcomes").module._UP
         == rds.get_revision("0089_v2_wake_outcomes").module._UP
+    )
+    # Alembic revision modules cannot import each other (names start with a
+    # digit), so the two chains hold separate copies of the voice DDL. This is
+    # the guard that keeps them one contract: edit either side alone and CI
+    # fails here rather than the columns silently diverging between the RDS
+    # and TEE databases — and test已把 TEE 提为 primary, so a divergence there
+    # is what the freezer would actually run against.
+    assert (
+        tee.get_revision("0025_lane_rollup_voice").module._UP
+        == rds.get_revision("0093_lane_rollup_voice").module._UP
     )

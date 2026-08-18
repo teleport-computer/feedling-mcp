@@ -4329,22 +4329,31 @@ def _lane_rollup_freeze_day(conn, *, day: date, zone: ZoneInfo,
     perception path always sets one). Other lanes carry ''.
     """
     start, end = _lane_rollup_day_bounds(day, zone)
+    # 说话判据的两份取值都从 v2/effect_outbox 取,不在这里手抄——宽窄两套 reply
+    # 谓词并存(见该模块 REPLY_EFFECT_TYPES 注释),抄错一套指标就是错的。
+    from model_api_runtime.v2.effect_outbox import (
+        DELIVERED_EFFECT_STATUSES,
+        REPLY_EFFECT_TYPES,
+    )
+
     counts = conn.execute(
-        """
-        SELECT user_id, lane,
-               CASE WHEN lane = 'heartbeat'
-                    THEN CASE WHEN reason IS NULL THEN 'clock' ELSE 'perception' END
+        f"""
+        SELECT j.user_id, j.lane,
+               CASE WHEN j.lane = 'heartbeat'
+                    THEN CASE WHEN j.reason IS NULL THEN 'clock' ELSE 'perception' END
                     ELSE '' END AS enqueue_source,
-               COUNT(*) FILTER (WHERE status = 'completed')::int AS completed,
-               COUNT(*) FILTER (WHERE status = 'failed')::int AS failed,
-               COUNT(*) FILTER (WHERE status = 'expired')::int AS expired,
-               COUNT(*) FILTER (WHERE status = 'superseded')::int AS superseded
-        FROM agent_jobs
-        WHERE status = ANY(%s)
-          AND finished_at >= %s AND finished_at < %s
-        GROUP BY user_id, lane, enqueue_source
+               COUNT(*) FILTER (WHERE j.status = 'completed')::int AS completed,
+               COUNT(*) FILTER (WHERE j.status = 'failed')::int AS failed,
+               COUNT(*) FILTER (WHERE j.status = 'expired')::int AS expired,
+               COUNT(*) FILTER (WHERE j.status = 'superseded')::int AS superseded,
+               {_LANE_ROLLUP_V2_VOICE_SELECT}
+        FROM agent_jobs j{_LANE_ROLLUP_V2_SPOKE_JOIN}
+        WHERE j.status = ANY(%s)
+          AND j.finished_at >= %s AND j.finished_at < %s
+        GROUP BY j.user_id, j.lane, enqueue_source
         """,
-        (list(_LANE_ROLLUP_TERMINAL), start, end),
+        (sorted(REPLY_EFFECT_TYPES), sorted(DELIVERED_EFFECT_STATUSES),
+         list(_LANE_ROLLUP_TERMINAL), start, end),
     ).fetchall()
     if not counts:
         return 0
@@ -4378,15 +4387,19 @@ def _lane_rollup_freeze_day(conn, *, day: date, zone: ZoneInfo,
     cell_sql = """
             INSERT INTO lane_daily_rollup
                 (user_id, day, route, lane, enqueue_source,
-                 completed, failed, expired, superseded, failure_codes)
-            SELECT u.user_id, %s, 'model_api', %s, %s, %s, %s, %s, %s, %s
+                 completed, failed, expired, superseded, failure_codes,
+                 spoke, spoke_completed, silent_declared, silent_undeclared)
+            SELECT u.user_id, %s, 'model_api', %s, %s, %s, %s, %s, %s, %s,
+                   %s, %s, %s, %s
             FROM users u WHERE u.user_id = %s FOR KEY SHARE OF u
             ON CONFLICT (user_id, day, route, lane, enqueue_source) DO NOTHING
             RETURNING user_id
             """
-    for uid, lane, src, completed, failed, expired, superseded in counts:
+    for (uid, lane, src, completed, failed, expired, superseded,
+         spoke, spoke_completed, silent_declared, silent_undeclared) in counts:
         params = (day_s, lane, src, completed, failed, expired, superseded,
-                  Jsonb(codes.get((str(uid), str(lane), str(src)), {})), uid)
+                  Jsonb(codes.get((str(uid), str(lane), str(src)), {})),
+                  spoke, spoke_completed, silent_declared, silent_undeclared, uid)
         saved = conn.execute(cell_sql, params).fetchone()
         if saved:
             written += 1
@@ -4427,6 +4440,92 @@ _LANE_ROLLUP_NONTERMINAL = ("pending", "claimed", "running")
 _LANE_ROLLUP_V1_NONTERMINAL = ("pending", "active", "claimed", "realizing")
 _LANE_ROLLUP_STUCK_AFTER_HOURS = 6.0
 
+# --- 说话率与沉默分解（Seven 2026-08-18 拍板：主动侧要两个数） ---------------- #
+#
+# 失败率答「机制坏没坏」，答不了「它是不是不理我」——一个干净跑完却一个字没说的
+# 唤醒回合，终态和说了话的那次一模一样。所以并排放第二个数：
+#     失败率 = failed / 已终结      说话率 = spoke / 已终结
+# 同一个分母，两个数可以直接加减，共同把已终结的尝试切完。
+#
+# spoke 锚**产出**，绝不锚状态字段（broadcast=on 而后端零帧那次立的规矩：状态字段
+# 描述的是另一条通路，会和真实产出漂开）：
+#   model_api → v2_effect_outbox 里该 job 有 reply 类效果且处于送达终态；
+#   resident  → chat_messages 里有行带着该 job 的 proactive_job_id
+#               （chat_core.py 写进 extra），所以 V1 也是按尝试归因，
+#               和 V2 同强度，不必退回 status='posted' 这种收据。
+#
+# 沉默必须再拆，因为它盖着两件完全不同的事：
+#   silent_declared   —— 模型显式选择闭嘴（两个运行时都写 wake_result='sleep'，
+#                        V1 在 consumer 的 sleep 分支，V2 在 stay_silent 工具后）；
+#   silent_undeclared —— 没有任何声明的沉默。这是**被计量的盲区**，不是一个干净
+#                        类别：除 scheduled 外的唤醒 lane 都是 require_reply=False，
+#                        空回复检测整段不执行，于是「provider 返回空」和「模型没
+#                        产文本」目前不可区分。把它量出来，指标就带着自己盲区的
+#                        大小一起上线，而不是把盲区悄悄吸收进说话率。将来那条
+#                        silent_empty_response trace 落地后，是把这一列再劈两半，
+#                        表结构不动。
+#
+# 承重恒等式（写漏任何一侧都会破）：
+#     completed = spoke_completed + silent_declared + silent_undeclared
+#
+# ⚠️ 完成侧**直接数**，不要改回 (spoke - 某个扣减项) 的减法形态。减法曾经在这里
+# 待过，被 codex2 在全新 PG 上实证打掉：一次尝试可以先投出中间气泡、再因租约超时
+# 终结成 expired（或 superseded），只扣 failed 的减法盖不住，等式当场不闭合。直接
+# 数 completed 那一侧，除 completed 外的终态根本不进这个和，同类洞长不出来。
+# 「投了气泡但没完成」需要时用 spoke - spoke_completed 现算，信息没丢。
+#
+# ⚠️ 逐 lane 一律计算，不按 lane 名开白名单——lane 是开集，写死枚举那次漏了 9 个
+# 里的 3 个。代价是 capture/dream 这类结构上就不说话的 lane 恒为 spoke=0，读侧据此
+# 说明「说话率只对以消息为产物的 lane 可解释」，而这个 0 本身也是真的。
+# 四列的表达式各抽成**一份**，冻结与读侧 live 补齐共用。期 2 的教训就在这条上：
+# 计数和失败码各写了一份成败谓词，proactive 的 status='error' 于是在两处算出不同
+# 的数。这里同样有两条路会用到同一组判据，先合并再用。
+_LANE_ROLLUP_V2_SPOKE_JOIN = """
+        CROSS JOIN LATERAL (
+            SELECT EXISTS (
+                SELECT 1 FROM v2_effect_outbox e
+                WHERE e.job_id = j.id
+                  AND e.effect_type = ANY(%s)
+                  AND e.status = ANY(%s)
+            ) AS hit
+        ) spoke"""
+#
+# ⚠️ 完成侧**直接数**，不用「spoke 减去说过话又失败的」这种减法。codex2 在全新
+# PG head 上实证过减法的洞:一次尝试可以先投出中间气泡、随后因租约超时终结成
+# expired(或 superseded),只扣 failed 的减法盖不住,恒等式当场不闭合。直接数
+# completed 那一侧结构上不会长出这类洞——除 completed 外的终态根本不在这个和里。
+_LANE_ROLLUP_V2_VOICE_SELECT = """
+               COUNT(*) FILTER (WHERE spoke.hit)::int,
+               COUNT(*) FILTER (WHERE spoke.hit AND j.status = 'completed')::int,
+               COUNT(*) FILTER (WHERE NOT spoke.hit AND j.status = 'completed'
+                                  AND j.wake_result = 'sleep')::int,
+               COUNT(*) FILTER (WHERE NOT spoke.hit AND j.status = 'completed'
+                                  AND j.wake_result IS DISTINCT FROM 'sleep')::int"""
+
+# resident 的送达锚：聊天行自带 proactive_job_id，能落到具体那一次尝试。
+#
+# ⚠️ 刻意**不设时间窗**。早先按 chat_messages.ts 给了一天下界，理由是「聊天行先落、
+# 状态补丁后写，间隔毫秒级」——codex2 实证这个理由没有代码保证:consumer 里
+# post_reply 与 update_proactive_job_status 是两次独立调用，后者失败只 warning，
+# 进程重启/恢复可以让终态补丁晚几天才写上。窗口一旦漏掉那条聊天行，这次尝试就被
+# 误记成 silent_undeclared——把真实产出算进「盲区」，正好污染了这个指标最该诚实的
+# 那一列。改成按 (user_id, job_id) 直接找产出，代价是需要 0093 建的表达式索引。
+_LANE_ROLLUP_V1_SPOKE_JOIN = """
+        LEFT JOIN LATERAL (
+            SELECT 1 AS hit FROM chat_messages m
+            WHERE m.user_id = l.user_id
+              AND m.doc->>'proactive_job_id' = l.doc->>'job_id'
+              AND COALESCE(m.doc->>'proactive_job_id','') <> ''
+            LIMIT 1
+        ) d ON COALESCE(l.doc->>'job_id','') <> ''"""
+_LANE_ROLLUP_V1_VOICE_SELECT = """
+               COUNT(*) FILTER (WHERE d.hit IS NOT NULL)::int,
+               COUNT(*) FILTER (WHERE d.hit IS NOT NULL AND {ok})::int,
+               COUNT(*) FILTER (WHERE d.hit IS NULL AND {ok}
+                                  AND l.doc->>'wake_result' = 'sleep')::int,
+               COUNT(*) FILTER (WHERE d.hit IS NULL AND {ok}
+                                  AND l.doc->>'wake_result'
+                                      IS DISTINCT FROM 'sleep')::int"""
 
 def freeze_completed_lane_days(*, now_epoch: float | None = None,
                                tz: str = "Asia/Shanghai") -> list[str]:
@@ -4464,11 +4563,17 @@ def freeze_completed_lane_days(*, now_epoch: float | None = None,
                 cursor = oldest[0].astimezone(zone).date()
                 backfill_from = cursor.isoformat()
             steps = 0
+            # voice_from 用 COALESCE 只认第一次：说话四列是 0093 之后才有的，它之前
+            # 冻的格子在这四列上是结构性的 0（不是「量过、确实没说话」）。第一次带着
+            # 说话数字冻的那天就是可信起点，之后不再移动。
             watermark_sql = """
-                    INSERT INTO lane_rollup_watermark (route, backfill_from, through_day)
-                    VALUES ('model_api', %s, %s)
+                    INSERT INTO lane_rollup_watermark
+                        (route, backfill_from, through_day, voice_from)
+                    VALUES ('model_api', %s, %s, %s)
                     ON CONFLICT (route) DO UPDATE
-                        SET through_day = EXCLUDED.through_day, frozen_at = now()
+                        SET through_day = EXCLUDED.through_day, frozen_at = now(),
+                            voice_from = COALESCE(lane_rollup_watermark.voice_from,
+                                                  EXCLUDED.voice_from)
                     """
             from tee_shadow import mirror
             while cursor <= last_completed and steps < _LANE_ROLLUP_MAX_DAYS_PER_TICK:
@@ -4479,7 +4584,8 @@ def freeze_completed_lane_days(*, now_epoch: float | None = None,
                 mirror_batch: list[tuple[str, tuple]] = []
                 _lane_rollup_freeze_day(conn, day=cursor, zone=zone,
                                         mirror_batch=mirror_batch)
-                wm_params = (backfill_from, cursor.isoformat())
+                wm_params = (backfill_from, cursor.isoformat(),
+                             cursor.isoformat())
                 conn.execute(watermark_sql, wm_params)
                 mirror_batch.append((watermark_sql, wm_params))
                 mirror.execute_many(mirror_batch)
@@ -4616,6 +4722,7 @@ def _lane_rollup_freeze_resident_day(conn, *, day: date, zone: ZoneInfo,
     start, end = _lane_rollup_day_bounds(day, zone)
     ok_pred = _LANE_ROLLUP_V1_OK_PRED.format(mem=_LANE_ROLLUP_V1_IS_MEMORY)
     fail_pred = _LANE_ROLLUP_V1_FAIL_PRED.format(mem=_LANE_ROLLUP_V1_IS_MEMORY)
+    voice_select = _LANE_ROLLUP_V1_VOICE_SELECT.format(ok=ok_pred)
     rows = conn.execute(
         f"""
         WITH routes AS (
@@ -4626,9 +4733,11 @@ def _lane_rollup_freeze_resident_day(conn, *, day: date, zone: ZoneInfo,
         SELECT l.user_id,
                {_LANE_ROLLUP_V1_LANE} AS lane,
                COUNT(*) FILTER (WHERE {ok_pred})::int AS completed,
-               COUNT(*) FILTER (WHERE {fail_pred})::int AS failed
+               COUNT(*) FILTER (WHERE {fail_pred})::int AS failed,
+               {voice_select}
         FROM user_logs l
-        LEFT JOIN routes r ON r.user_id = l.user_id,
+        LEFT JOIN routes r ON r.user_id = l.user_id
+{_LANE_ROLLUP_V1_SPOKE_JOIN},
         LATERAL (SELECT COALESCE(NULLIF(l.doc->>'job_kind',''),
                                  NULLIF(l.doc->>'wake_kind',''),
                                  NULLIF(l.doc->>'trigger',''),'unknown') AS kind) k
@@ -4677,17 +4786,21 @@ def _lane_rollup_freeze_resident_day(conn, *, day: date, zone: ZoneInfo,
     cell_sql = """
             INSERT INTO lane_daily_rollup
                 (user_id, day, route, lane, enqueue_source,
-                 completed, failed, expired, superseded, failure_codes)
-            SELECT u.user_id, %s, 'resident', %s, '', %s, %s, 0, 0, %s
+                 completed, failed, expired, superseded, failure_codes,
+                 spoke, spoke_completed, silent_declared, silent_undeclared)
+            SELECT u.user_id, %s, 'resident', %s, '', %s, %s, 0, 0, %s,
+                   %s, %s, %s, %s
             FROM users u WHERE u.user_id = %s FOR KEY SHARE OF u
             ON CONFLICT (user_id, day, route, lane, enqueue_source) DO NOTHING
             RETURNING user_id
             """
-    for uid, lane, completed, failed in rows:
+    for (uid, lane, completed, failed,
+         spoke, spoke_completed, silent_declared, silent_undeclared) in rows:
         if not completed and not failed:
             continue  # 该组全是非终态,不落格子
         params = (day_s, lane, completed, failed,
-                  Jsonb(codes.get((str(uid), str(lane)), {})), uid)
+                  Jsonb(codes.get((str(uid), str(lane)), {})),
+                  spoke, spoke_completed, silent_declared, silent_undeclared, uid)
         saved = conn.execute(cell_sql, params).fetchone()
         if saved:
             written += 1
@@ -4732,18 +4845,23 @@ def freeze_completed_resident_lane_days(*, now_epoch: float | None = None,
                 cursor = datetime.fromtimestamp(float(oldest[0]), zone).date()
                 backfill_from = cursor.isoformat()
             steps = 0
+            # voice_from 语义同 model_api 路：只认第一次，见那边的说明。
             watermark_sql = """
-                    INSERT INTO lane_rollup_watermark (route, backfill_from, through_day)
-                    VALUES ('resident', %s, %s)
+                    INSERT INTO lane_rollup_watermark
+                        (route, backfill_from, through_day, voice_from)
+                    VALUES ('resident', %s, %s, %s)
                     ON CONFLICT (route) DO UPDATE
-                        SET through_day = EXCLUDED.through_day, frozen_at = now()
+                        SET through_day = EXCLUDED.through_day, frozen_at = now(),
+                            voice_from = COALESCE(lane_rollup_watermark.voice_from,
+                                                  EXCLUDED.voice_from)
                     """
             from tee_shadow import mirror
             while cursor <= last_completed and steps < _LANE_ROLLUP_MAX_DAYS_PER_TICK:
                 mirror_batch: list[tuple[str, tuple]] = []
                 _lane_rollup_freeze_resident_day(conn, day=cursor, zone=zone,
                                                  mirror_batch=mirror_batch)
-                wm_params = (backfill_from, cursor.isoformat())
+                wm_params = (backfill_from, cursor.isoformat(),
+                             cursor.isoformat())
                 conn.execute(watermark_sql, wm_params)
                 mirror_batch.append((watermark_sql, wm_params))
                 mirror.execute_many(mirror_batch)
@@ -4767,15 +4885,23 @@ _LANE_ROLLUP_DELETED_USER = "deleted"
 _LANE_ROLLUP_ANON_MERGE_SQL = """
 INSERT INTO lane_daily_rollup
     (user_id, day, route, lane, enqueue_source,
-     completed, failed, expired, superseded, failure_codes)
+     completed, failed, expired, superseded, failure_codes,
+     spoke, spoke_completed, silent_declared, silent_undeclared)
 SELECT %s, day, route, lane, enqueue_source,
-       completed, failed, expired, superseded, failure_codes
+       completed, failed, expired, superseded, failure_codes,
+       spoke, spoke_completed, silent_declared, silent_undeclared
 FROM lane_daily_rollup WHERE user_id = %s
 ON CONFLICT (user_id, day, route, lane, enqueue_source) DO UPDATE SET
     completed = lane_daily_rollup.completed + EXCLUDED.completed,
     failed = lane_daily_rollup.failed + EXCLUDED.failed,
     expired = lane_daily_rollup.expired + EXCLUDED.expired,
     superseded = lane_daily_rollup.superseded + EXCLUDED.superseded,
+    spoke = lane_daily_rollup.spoke + EXCLUDED.spoke,
+    spoke_completed = lane_daily_rollup.spoke_completed + EXCLUDED.spoke_completed,
+    silent_declared = lane_daily_rollup.silent_declared
+                      + EXCLUDED.silent_declared,
+    silent_undeclared = lane_daily_rollup.silent_undeclared
+                        + EXCLUDED.silent_undeclared,
     failure_codes = (
         SELECT COALESCE(
             jsonb_object_agg(
@@ -4851,7 +4977,8 @@ def admin_lane_rollup(*, user_id: str = "", lane: str = "", route: str = "",
         rows = conn.execute(
             f"""
             SELECT user_id, day, route, lane, enqueue_source,
-                   completed, failed, expired, superseded, failure_codes
+                   completed, failed, expired, superseded, failure_codes,
+                   spoke, spoke_completed, silent_declared, silent_undeclared
             FROM lane_daily_rollup{clause}
             ORDER BY day DESC, user_id, lane, enqueue_source
             LIMIT %s OFFSET %s
@@ -4862,17 +4989,23 @@ def admin_lane_rollup(*, user_id: str = "", lane: str = "", route: str = "",
             {"user_id": r[0], "day": r[1], "route": r[2], "lane": r[3],
              "enqueue_source": r[4], "completed": r[5], "failed": r[6],
              "expired": r[7], "superseded": r[8],
-             "failure_codes": dict(r[9] or {}), "frozen": True}
+             "failure_codes": dict(r[9] or {}), "frozen": True,
+             "spoke": r[10], "spoke_completed": r[11],
+             "silent_declared": r[12], "silent_undeclared": r[13]}
             for r in rows
         ]
         coverage: dict[str, dict] = {}
         for r in conn.execute(
-            "SELECT route, backfill_from, through_day FROM lane_rollup_watermark",
+            "SELECT route, backfill_from, through_day, voice_from "
+            "FROM lane_rollup_watermark",
         ).fetchall():
             coverage[str(r[0])] = {
                 "backfill_from": r[1],
                 "through_day": r[2],
                 "partial_before": r[1],
+                # 说话四列比计数列晚上线，所以有自己的起点。None = 还没有任何格子
+                # 带过说话数字，读的人**不许**把 0 当成「量过、确实没说话」。
+                "voice_from": r[3],
             }
         # Days after the watermark cannot be frozen yet — surface them live and
         # explicitly non-frozen, so a still-open day (or resident's 4h freeze
@@ -4911,29 +5044,37 @@ def admin_lane_rollup(*, user_id: str = "", lane: str = "", route: str = "",
             _, win_end = _lane_rollup_day_bounds(today, zone)
             live_params: list = [tz]
             if live_route == "model_api":
-                live_where = ["status = ANY(%s)",
-                              "finished_at >= %s", "finished_at < %s"]
-                live_params += [list(_LANE_ROLLUP_TERMINAL), win_start, win_end]
+                from model_api_runtime.v2.effect_outbox import (
+                    DELIVERED_EFFECT_STATUSES,
+                    REPLY_EFFECT_TYPES,
+                )
+
+                live_where = ["j.status = ANY(%s)",
+                              "j.finished_at >= %s", "j.finished_at < %s"]
+                live_params += [sorted(REPLY_EFFECT_TYPES),
+                                sorted(DELIVERED_EFFECT_STATUSES),
+                                list(_LANE_ROLLUP_TERMINAL), win_start, win_end]
                 if user_id:
-                    live_where.append("user_id = %s")
+                    live_where.append("j.user_id = %s")
                     live_params.append(user_id)
                 if lane:
-                    live_where.append("lane = %s")
+                    live_where.append("j.lane = %s")
                     live_params.append(lane)
                 live_sql = f"""
-                SELECT to_char(timezone(%s, finished_at), 'YYYY-MM-DD') AS day,
-                       user_id, lane,
-                       CASE WHEN lane = 'heartbeat'
-                            THEN CASE WHEN reason IS NULL THEN 'clock' ELSE 'perception' END
+                SELECT to_char(timezone(%s, j.finished_at), 'YYYY-MM-DD') AS day,
+                       j.user_id, j.lane,
+                       CASE WHEN j.lane = 'heartbeat'
+                            THEN CASE WHEN j.reason IS NULL THEN 'clock' ELSE 'perception' END
                             ELSE '' END AS enqueue_source,
-                       COUNT(*) FILTER (WHERE status = 'completed')::int,
-                       COUNT(*) FILTER (WHERE status = 'failed')::int,
-                       COUNT(*) FILTER (WHERE status = 'expired')::int,
-                       COUNT(*) FILTER (WHERE status = 'superseded')::int
-                FROM agent_jobs
+                       COUNT(*) FILTER (WHERE j.status = 'completed')::int,
+                       COUNT(*) FILTER (WHERE j.status = 'failed')::int,
+                       COUNT(*) FILTER (WHERE j.status = 'expired')::int,
+                       COUNT(*) FILTER (WHERE j.status = 'superseded')::int,
+                       {_LANE_ROLLUP_V2_VOICE_SELECT}
+                FROM agent_jobs j{_LANE_ROLLUP_V2_SPOKE_JOIN}
                 WHERE {' AND '.join(live_where)}
-                GROUP BY day, user_id, lane, enqueue_source
-                ORDER BY day, user_id, lane, enqueue_source
+                GROUP BY day, j.user_id, j.lane, enqueue_source
+                ORDER BY day, j.user_id, j.lane, enqueue_source
                 """
             else:
                 live_where = [f"{_LANE_ROLLUP_V1_TS} >= %s",
@@ -4944,6 +5085,7 @@ def admin_lane_rollup(*, user_id: str = "", lane: str = "", route: str = "",
                     live_params.append(user_id)
                 _ok = _LANE_ROLLUP_V1_OK_PRED.format(mem=_LANE_ROLLUP_V1_IS_MEMORY)
                 _fail = _LANE_ROLLUP_V1_FAIL_PRED.format(mem=_LANE_ROLLUP_V1_IS_MEMORY)
+                _voice = _LANE_ROLLUP_V1_VOICE_SELECT.format(ok=_ok)
                 live_sql = f"""
                 WITH routes AS (
                     SELECT user_id,
@@ -4955,9 +5097,11 @@ def admin_lane_rollup(*, user_id: str = "", lane: str = "", route: str = "",
                        l.user_id, {_LANE_ROLLUP_V1_LANE} AS lane, '' AS enqueue_source,
                        COUNT(*) FILTER (WHERE {_ok})::int,
                        COUNT(*) FILTER (WHERE {_fail})::int,
-                       0, 0
+                       0, 0,
+                       {_voice}
                 FROM user_logs l
-                LEFT JOIN routes r ON r.user_id = l.user_id,
+                LEFT JOIN routes r ON r.user_id = l.user_id
+{_LANE_ROLLUP_V1_SPOKE_JOIN},
                 LATERAL (SELECT COALESCE(NULLIF(l.doc->>'job_kind',''),
                                          NULLIF(l.doc->>'wake_kind',''),
                                          NULLIF(l.doc->>'trigger',''),'unknown') AS kind) k
@@ -4980,7 +5124,9 @@ def admin_lane_rollup(*, user_id: str = "", lane: str = "", route: str = "",
                     {"user_id": r[1], "day": r[0], "route": live_route,
                      "lane": r[2], "enqueue_source": r[3],
                      "completed": r[4], "failed": r[5], "expired": r[6],
-                     "superseded": r[7], "failure_codes": {}, "frozen": False}
+                     "superseded": r[7], "failure_codes": {}, "frozen": False,
+                     "spoke": r[8], "spoke_completed": r[9],
+                     "silent_declared": r[10], "silent_undeclared": r[11]}
                 )
         # stuck：实时查询，与失败率并排返回（见常量处的口径说明）。带 job 定位信息
         # ——Seven 要求「能点到具体 job」，只给数字等于又造一个查不下去的聚合。
