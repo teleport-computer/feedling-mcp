@@ -73,7 +73,7 @@ REGISTRY: dict[str, Entry] = {
         MIRROR,
         "按用户×道×北京日的 job 结果冻结格子（0091/tee 0023），单例调度器日批写、"
         "写后不变、永久增长——正因永久增长不能走 SNAPSHOT（20 万行 MAX_ROWS 硬阀，"
-        "约 234 天触顶且超限整轮失败，codex2 2026-08-18 审出）。语句幂等"
+        "超限后仅该表复制失败并停止更新、其余表继续，codex2 2026-08-18 审出）。语句幂等"
         "（ON CONFLICT DO NOTHING），冻结点以 execute_many 按日整组镜像；"
         "期 2 接 user_logs 源后格子是环形缓冲滚掉明细后的唯一存留，必须双写",
     ),
@@ -163,13 +163,19 @@ REGISTRY: dict[str, Entry] = {
     "v2_chat_tail_anchor": Entry(
         SNAPSHOT,
         "V2 对话尾锚点 anchor_seq，per-user 单行 UPDATE 密集（GREATEST 单调 upsert），明文整数"),
-    "v2_effect_outbox": Entry(SNAPSHOT, "V2 效果 outbox，投递后删行，明文 payload（实测非信封）"),
+    "v2_effect_outbox": Entry(
+        SNAPSHOT,
+        "V2 效果 outbox，投递后更新状态而非删行（仅账号清空时删除），明文 payload（实测非信封）",
+    ),
     "v2_effect_sink_applied": Entry(SNAPSHOT, "V2 效果幂等标记，明文"),
     "v2_mcp_mutation_attempts": Entry(SNAPSHOT, "V2 MCP 变更尝试记录，明文"),
     "v2_runtime_control": Entry(SNAPSHOT, "V2 运行时总控单行表，明文"),
     "v2_runtime_state": Entry(SNAPSHOT, "V2 per-user 运行时 fence，UPDATE 密集，明文"),
     "v2_sandbox_usage_events": Entry(SNAPSHOT, "V2 sandbox 用量事件，明文"),
-    "v2_terminal_failure_outbox": Entry(SNAPSHOT, "V2 终态失败 outbox，投递后删行，明文"),
+    "v2_terminal_failure_outbox": Entry(
+        SNAPSHOT,
+        "V2 终态失败 outbox，投递后更新状态而非删行（仅账号清空时删除），明文",
+    ),
     "v2_trajectory_access_audit": Entry(SNAPSHOT, "V2 轨迹访问审计（审计元数据本身是明文）"),
     "v2_trajectory_streams": Entry(SNAPSHOT, "V2 轨迹流游标，UPDATE 密集，明文"),
     "v2_turn_metrics": Entry(SNAPSHOT, "V2 回合指标，明文"),

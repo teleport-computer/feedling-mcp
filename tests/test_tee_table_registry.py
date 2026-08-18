@@ -73,6 +73,18 @@ def test_lanes_are_valid_and_reasons_nonempty():
     assert not no_reason, f"这些条目没写理由：{no_reason}"
 
 
+def test_growth_lane_reasons_match_actual_failure_and_cleanup_semantics():
+    """Registry guidance must not invent cleanup or an all-table hard failure."""
+    for table in ("v2_effect_outbox", "v2_terminal_failure_outbox"):
+        reason = reg.REGISTRY[table].reason
+        assert "投递后删行" not in reason
+        assert "投递后更新状态而非删行" in reason
+
+    rollup_reason = reg.REGISTRY["lane_daily_rollup"].reason
+    assert "超限整轮失败" not in rollup_reason
+    assert "仅该表复制失败并停止更新、其余表继续" in rollup_reason
+
+
 def test_perception_signal_state_uses_snapshot_lane():
     """Mutable fingerprint state must converge; a SKIP/MIRROR lane can drift."""
     entry = reg.REGISTRY.get("perception_signal_state_v2")
