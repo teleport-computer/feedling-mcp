@@ -78,7 +78,9 @@ def test_agent_jobs_chain_has_one_installed_head_and_available_at_baseline():
     script = ScriptDirectory.from_config(cfg)
 
     heads = script.get_heads()
-    assert heads == ["0090_merge_wake_outcomes"]
+    assert heads == ["0091_lane_daily_rollup"]
+    rollup = script.get_revision("0091_lane_daily_rollup")
+    assert rollup.down_revision == "0090_merge_wake_outcomes"
     release_merge = script.get_revision("0090_merge_wake_outcomes")
     assert set(release_merge.down_revision) == {
         "0089_merge_pre_test_agent_jobs",
@@ -194,7 +196,7 @@ def test_perception_signal_schema_is_installed_at_the_merged_head():
             "AND indexname='ix_agent_jobs_pending_available_at'"
         ).fetchone()
 
-    assert installed_head == ("0090_merge_wake_outcomes",)
+    assert installed_head == ("0091_lane_daily_rollup",)
     assert available_at[:2] == ("timestamp with time zone", "NO")
     assert "now()" in str(available_at[2])
     assert pending_index is not None
@@ -262,7 +264,7 @@ def test_0075_usage_rollup_schema_is_installed_without_source_backfill():
             "AND tgrelid='v2_turn_metrics'::regclass"
         ).fetchone()[0]
 
-    assert heads == {"0090_merge_wake_outcomes"}
+    assert heads == {"0091_lane_daily_rollup"}
     assert tables == {
         "v2_usage_daily_users",
         "v2_usage_daily_dimensions",
