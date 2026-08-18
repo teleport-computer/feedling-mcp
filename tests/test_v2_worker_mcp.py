@@ -17,9 +17,11 @@ import conftest
 import db
 import provider_client
 from capabilities import registry as cap_registry
+from capabilities import tool_schema as cap_tool_schema
 from provider_types import ToolResult, ToolSpec
 from core import store as core_store
 from model_api_runtime.v2 import jobs_store
+from model_api_runtime.v2 import tool_loop
 from model_api_runtime.v2 import worker
 
 pytestmark = pytest.mark.skipif(
@@ -292,6 +294,63 @@ def test_chat_tool_search_injects_full_schema_before_mcp_dispatch(monkeypatch):
     assert first[_MCP_SPEC.name].parameters["properties"] == {}
     assert second[_MCP_SPEC.name] == _MCP_SPEC
     assert dispatched == [(_MCP_SPEC.name, {})]
+
+
+def test_chat_pressure_folded_platform_schema_is_searchable_and_protected(
+    monkeypatch,
+):
+    uid = "u_platform_tool_search"
+    conftest.seed_user(uid)
+    _reset(uid)
+    jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("w")
+    _patch_real_write(monkeypatch)
+
+    # One unrelated oversized manual forces the pressure form. workspace_read
+    # is then folded too, searched explicitly, and must return full next round.
+    monkeypatch.setitem(
+        cap_tool_schema.DESCRIPTIONS,
+        "identity_get",
+        "oversized optional manual " * 6_000,
+    )
+    monkeypatch.setattr(tool_loop, "_CATALOG", None)
+    pressure_config = provider_client.ProviderConfig(
+        provider="anthropic",
+        model="claude-sonnet-4-test",
+        api_key="sk-user-byok",
+        base_url="",
+        context_window_tokens=40_000,
+    )
+    calls = _script_provider(monkeypatch, [
+        {
+            "reply": "",
+            "tool_calls": [{
+                "id": "find",
+                "name": "mcp_tool_search",
+                "args": {"names": ["workspace_read"]},
+            }],
+            "usage": {},
+        },
+        {"reply": "schema loaded", "tool_calls": [], "usage": {}},
+    ])
+    deps = _deps([
+        {"id": "m1", "ts": 10.0, "role": "user", "content": "read my file"}
+    ])
+
+    assert asyncio.run(worker.process_job(
+        job,
+        deps,
+        provider_config=pressure_config,
+        api_key=None,
+        runtime_token="rt-turn",
+    )) == "completed"
+
+    first = {spec.name: spec for spec in calls[0]["tools"]}
+    second = {spec.name: spec for spec in calls[1]["tools"]}
+    assert "mcp_tool_search" in first
+    assert first["workspace_read"].parameters["properties"] == {}
+    assert second["workspace_read"].parameters["required"] == ["path"]
+    assert second["identity_get"].parameters["properties"] == {}
 
 
 def test_chat_turn_keeps_mcp_usable_after_its_own_remote_result(
