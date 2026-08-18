@@ -217,3 +217,74 @@ python -m admin.phase4_cutover
 ```
 
 Record schema head and drain blockers. Do not run `--apply`, stop writers, change DSNs, change `FEEDLING_DATABASE_SCHEMA`, or open plaintext writes without a separate explicit approval.
+
+---
+
+### Task 3: Release retained-row partial unique keys before inserting new rows
+
+**Files:**
+- Modify: `tests/test_tee_snapshot.py`
+- Modify: `backend/tee_shadow/snapshot.py`
+
+**Interfaces:**
+- Consumes: Task 1's staged payload, `_prune_target(...)`, common-column list, and primary-key list.
+- Produces: unchanged signatures; retained target rows are updated set-wise before the existing UPSERT.
+
+- [ ] **Step 1: Add the live-shape failing test**
+
+Add a fixture table with `id TEXT PRIMARY KEY`, `user_id TEXT NOT NULL`,
+`is_active BOOLEAN NOT NULL`, and a partial unique index on `(user_id) WHERE is_active`.
+Insert source rows in this order so COPY presents the new active row first:
+
+```python
+source_rows = [
+    ("new-active", "user", True),
+    ("retained-old", "user", False),
+]
+target_rows = [("retained-old", "user", True)]
+```
+
+Call `snapshot.snapshot_table(table)` and assert `rep["ok"] is True` plus exact target
+rows ordered by `id`:
+
+```python
+[("new-active", "user", True), ("retained-old", "user", False)]
+```
+
+- [ ] **Step 2: Verify RED on the deployed prune-before-upsert implementation**
+
+Run only the new test with the established `FEEDLING_TEST_PG` command. Expected: FAIL with
+the fixture's partial unique index because the UPSERT attempts the new active row before
+updating the retained row inactive.
+
+- [ ] **Step 3: Add one set-based retained-row update**
+
+In `_merge_payload`, after `_prune_target(...)` and after constructing `mutable_cols`, build:
+
+- `target.pk IS NOT DISTINCT FROM staged.pk` for every primary-key column;
+- `target.col IS DISTINCT FROM staged.col` for every mutable common column;
+- assignments `col = staged.col` for every mutable common column.
+
+Execute one identifier-safe psycopg SQL statement:
+
+```sql
+UPDATE <table> AS target
+SET <mutable assignments from staged>
+FROM <stage> AS staged
+WHERE <full primary-key match>
+  AND (<any mutable column differs>)
+```
+
+Keep the existing UPSERT immediately afterward for new rows and concurrency-safe same-PK
+fallback. Do not add table names, unique-index introspection, or business-column special cases.
+
+- [ ] **Step 4: Verify GREEN and regression coverage**
+
+Run the new focused test, then all of `tests/test_tee_snapshot.py`, then the TEE slice from
+Task 2 Step 1. Expected: all pass.
+
+- [ ] **Step 5: Commit and run release gates**
+
+Commit production code, test, and these plan/spec updates. Run the PostgreSQL-backed full
+suite, request independent review, merge to latest `test`, push, monitor both TEST CVMs, and
+require a newer sync tick with `snapshot_failures=0` before strict verify or Phase 4 dry-run.
