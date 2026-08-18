@@ -24,7 +24,7 @@ sys.path.insert(0, str(TOOLS))
 sys.path.insert(0, str(BACKEND))
 
 from export_public_openapi import _build_public_schema, _load_schema  # noqa: E402
-from memory_garden.types import MEMORY_SOURCE_VALUES  # noqa: E402
+from memory.source_policy import MEMORY_SOURCE_VALUES  # noqa: E402
 
 
 HTTP_METHODS = {"get", "post", "put", "patch", "delete", "options", "head", "trace"}

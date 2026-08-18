@@ -19,12 +19,29 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
 # Pure-function module — zero native deps, imports cleanly anywhere Python runs.
+from memory import card_shape  # noqa: E402
 from memory_garden.scoring.relevance import (  # noqa: E402
     char_bigrams as _char_bigrams,
     bigram_jaccard as _bigram_jaccard,
-    select_context_memories as _select_context_memories,
-    select_context_memories_with_trace as _select_context_memories_with_trace,
+    select_context_memories as _kernel_select,
+    select_context_memories_with_trace as _kernel_select_with_trace,
 )
+
+
+# 2026-08-17 边界整理：内核只认翻译后的卡，且生命周期过滤归宿主。
+# 在这层包住，34 个调用点就都自动走真实的三段式：
+#     宿主过滤 → 宿主翻译 → 内核挑卡
+# 这样测试跑的路径和线上完全一致 —— 而不是绕过入口直接喂内核。
+def _for_garden(moments: list[dict]) -> list[dict]:
+    return [card_shape.to_garden_card(m) for m in moments if not card_shape.is_retired(m)]
+
+
+def _select_context_memories(moments, *args, **kwargs):
+    return _kernel_select(_for_garden(moments), *args, **kwargs)
+
+
+def _select_context_memories_with_trace(moments, *args, **kwargs):
+    return _kernel_select_with_trace(_for_garden(moments), *args, **kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -39,15 +56,22 @@ def _moment(
     occurred_at: str = "2026-01-01T00:00:00",
     created_at: str = "2026-01-01T00:00:00",
     type: str = "",
+    source: str = "",
 ) -> dict:
-    return {
+    # 工厂产出**原始卡**（io 的老形状）。翻译不在这里做 ——
+    # 2026-08-17 踩过：工厂里翻译会让后续加的 is_archived / source 落在
+    # 翻译产物上，把「归档过滤必须在翻译之前」这个真实入口问题掩盖掉。
+    # 正确顺序见 _for_garden()：过滤 → 翻译 → 挑卡，与线上一致。
+    return ({
         "id": id,
         "title": title,
         "description": description,
         "type": type,
         "occurred_at": occurred_at,
         "created_at": created_at,
-    }
+        "source": source,
+    })
+
 
 
 def _retrieval_fixture_moments() -> list[dict]:
@@ -112,16 +136,16 @@ def _retrieval_fixture_moments() -> list[dict]:
                 id="correction_global",
                 title="用户更新称呼边界",
                 description="以后不要再叫用户老师。",
+                source="model_api_correction",
             ),
-            "source": "model_api_correction",
         },
         {
             **_moment(
                 id="correction_lemon",
                 title="柠檬茶纠正",
                 description="用户纠正过柠檬茶不是冰的。",
+                source="model_api_correction",
             ),
-            "source": "model_api_correction",
         },
     ]
 
@@ -352,8 +376,8 @@ def test_model_api_mode_skips_unrelated_recent_cards_and_keeps_corrections():
                 title="用户更新了 AI 设定",
                 description="以后不要再使用烂梗王设定。",
                 created_at="2026-06-04T12:00:00",
+                source="model_api_correction",
             ),
-            "source": "model_api_correction",
         },
     ]
 
@@ -591,8 +615,7 @@ def test_model_api_mixed_alias_handles_spaces_between_chinese_and_english():
 def test_model_api_keeps_at_most_two_global_corrections():
     moments = [
         {
-            **_moment(id=f"corr{i}", title=f"边界更新 {i}", description=f"以后不要再使用称呼 {i}。"),
-            "source": "model_api_correction",
+            **_moment(id=f"corr{i}", title=f"边界更新 {i}", description=f"以后不要再使用称呼 {i}。", source="model_api_correction"),
         }
         for i in range(4)
     ]
@@ -615,8 +638,8 @@ def test_model_api_correction_tuple_compares_created_at_instants():
                 title="称呼边界",
                 description="以后不要再使用旧称呼。",
                 created_at="garbage",
+                source="model_api_correction",
             ),
-            "source": "model_api_correction",
         },
         {
             **_moment(
@@ -624,8 +647,8 @@ def test_model_api_correction_tuple_compares_created_at_instants():
                 title="称呼边界",
                 description="以后不要再使用旧称呼。",
                 created_at="2026-08-13T20:00:00+08:00",
+                source="model_api_correction",
             ),
-            "source": "model_api_correction",
         },
         {
             **_moment(
@@ -633,8 +656,8 @@ def test_model_api_correction_tuple_compares_created_at_instants():
                 title="称呼边界",
                 description="以后不要再使用旧称呼。",
                 created_at="2026-08-13T13:00:00Z",
+                source="model_api_correction",
             ),
-            "source": "model_api_correction",
         },
     ]
 

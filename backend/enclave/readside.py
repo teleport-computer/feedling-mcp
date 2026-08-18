@@ -16,7 +16,7 @@ import json
 import os
 
 from enclave import config, envelope
-from memory_garden import card_fields  # noqa: E402
+from memory import card_shape  # noqa: E402
 from memory_garden.scoring.selector import select_memory_index_items  # noqa: E402
 
 
@@ -79,14 +79,14 @@ def context_moment_to_index_item(moment: dict) -> dict:
     # 摘要**只能**来自可公开字段（card_fields 保证 content 不在其列）——
     # 它会进 selector 的 skipped/selected trace，而 context_trace=1 时整个
     # trace 会返回客户端。用正文兜底会让被拒掉的卡从 trace 漏出正文。
-    summary = memory_readside_text(card_fields.summary_of(moment), 500)
+    summary = memory_readside_text(card_shape.summary_of(moment), 500)
     bucket_refs = [item for item in (linked, memory_readside_text(moment.get("type"), 40)) if item]
     return {
         "id": memory_readside_text(moment.get("id"), 120),
         "summary": summary,
         # 私有搜索语料：只在 enclave 内参与匹配，任何出口都必须剥掉。
         # 沿用 build_memory_search_item 已有的字段名与既定语义，不新造一套。
-        "_search_content": card_fields.private_text(moment),
+        "_search_content": card_shape.private_text(moment),
         "bucket_refs": bucket_refs,
         "status": "active",
         "salience": "medium",

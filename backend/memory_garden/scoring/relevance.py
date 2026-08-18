@@ -22,14 +22,19 @@ from __future__ import annotations
 
 import re
 
-from .. import card_fields
 
 from .. import timestamps as memory_timestamps
 
 
-#: 字段知识已收进 card_fields —— 别在这里改「正文在哪个字段」。
-#: 保留这个名字只为不打断既有引用；真正的规则见 card_fields.DEFAULT_FIELD_MAP。
-_MEMORY_TEXT_FIELDS = card_fields.DEFAULT_FIELD_MAP.legacy_match_fields
+#: 内核认的卡片文本字段 —— **固定的，不适应宿主**。
+#: 宿主负责把自己的形状翻译成这一种（io 侧见 memory/card_shape.py::to_garden_card）。
+#: 2026-08-17 边界整理：此前这里兼容 io 的两种历史形状，那是把宿主的债背进了内核。
+_MEMORY_TEXT_FIELDS = ("summary", "content", "bucket")
+
+#: 内核认的卡片角色。宿主负责把自己的识别方式（标题前缀、来源名、显式字段…）
+#: 翻译成这两个值 —— 内核不认任何宿主的命名约定。
+ROLE_TURNING_POINT = "turning_point"
+ROLE_CORRECTION = "correction"
 
 
 def char_bigrams(s: str) -> set:
@@ -79,8 +84,19 @@ _ZH_GENERIC_PHRASES = {
 
 
 def _text_for_memory(memory: dict) -> str:
-    """匹配用的 haystack。规则（含空格）由 card_fields 定，见那里的「硬约束 2」。"""
-    return card_fields.text_for_match(memory)
+    """匹配用的 haystack。
+
+    **优先用宿主显式给的 `search_text`** —— 内核不从展示字段猜搜索语料。
+    宿主最清楚自己哪些字段承载可搜索的文本（io 的老卡把它散在 title /
+    her_quote / linked_dimension 里，光看 summary 会漏掉一大半）。
+
+    没给 search_text 时退回 summary + content：让只有规范字段的简单宿主
+    也能直接用，不必先理解这套机制。
+    """
+    explicit = str(memory.get("search_text") or "").strip()
+    if explicit:
+        return str(memory.get("search_text"))
+    return " ".join(str(memory.get(key) or "") for key in _MEMORY_TEXT_FIELDS)
 
 
 def _norm_compact(text: str) -> str:
@@ -286,6 +302,16 @@ def memory_relevance_details(query: str, memory: dict) -> dict:
 
 
 def _is_correction_memory(memory: dict) -> bool:
+    """是不是纠正卡 —— 只认宿主打好的 `roles` 标记。
+
+    2026-08-17 边界整理：此前靠 source 名与标题里的「纠正/correction」字样判断，
+    那是把宿主的命名约定写进了内核，而且对没有 title 的新形状卡完全失效。
+    识别的脆弱部分已收到 io 侧（memory/card_shape.py::roles_of）。
+    """
+    return ROLE_CORRECTION in (memory.get("roles") or [])
+
+
+def _legacy_is_correction_memory(memory: dict) -> bool:
     source = str(memory.get("source") or "").lower()
     if source in {"model_api_correction", "user_correction", "settings_correction"}:
         return True
@@ -352,16 +378,9 @@ def select_context_memories_with_trace(
     if not moments:
         return [], {**_query_trace(latest_user_text), "selected": [], "rejected_sample": []}
 
-    moments = [
-        m for m in moments
-        if not (
-            m.get("is_archived") is True
-            or str(m.get("archived_at") or "").strip()
-            or str(m.get("archive_reason") or "").strip()
-        )
-    ]
-    if not moments:
-        return [], {**_query_trace(latest_user_text), "selected": [], "rejected_sample": []}
+    # 2026-08-17 边界整理：生命周期过滤（归档/被取代）已归宿主，在翻译前完成。
+    # 内核不再认识 io 的 is_archived / archived_at / archive_reason 三个字段 ——
+    # 那是宿主的命名约定，换个宿主就不成立。
 
     strict = str(mode or "").strip().lower() in {"model_api", "strict"}
     chosen_ids: set = set()
@@ -449,7 +468,7 @@ def select_context_memories_with_trace(
         index_pool = sorted(
             [m for m in moments if m.get("id") not in index_ids],
             key=lambda m: (
-                str(m.get("title") or "").startswith("转折｜"),
+                ROLE_TURNING_POINT in (m.get("roles") or []),
                 memory_timestamps.sort_key(m.get("occurred_at")),
                 memory_timestamps.sort_key(m.get("created_at")),
             ),
@@ -478,7 +497,7 @@ def select_context_memories_with_trace(
 
     # Bucket 1 — turning points by occurred_at desc, max 3
     turning = sorted(
-        [m for m in moments if (m.get("title") or "").startswith("转折｜")],
+        [m for m in moments if ROLE_TURNING_POINT in (m.get("roles") or [])],
         key=lambda m: memory_timestamps.sort_key(m.get("occurred_at")),
         reverse=True,
     )[:3]

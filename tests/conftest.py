@@ -261,7 +261,7 @@ if not _provisioned:
     # Pure-unit modules that don't touch the DB — keep them collectable so a
     # no-Postgres dev machine still runs something useful.
     _PURE_UNIT = {
-    "test_memory_garden_card_fields.py",
+    "test_garden_card_shape.py",
     "test_route_b_card_shape_recall.py",
     "test_route_b_sensitive_gate.py",
         "test_card_guard.py",

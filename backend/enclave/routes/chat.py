@@ -19,6 +19,7 @@ from memory_garden.scoring.relevance import (
     select_context_memories,
     select_context_memories_with_trace,
 )
+from memory import card_shape
 from enclave import auth, backend_client, envelope, readside
 from enclave.routes._errors import backend_call_or_error, content_sk_or_503
 from enclave.routes._json import json_response_offthread
@@ -262,28 +263,50 @@ def _build_context_memories(moments, decrypted, query_args):
 
     cards = readside.moments_to_cards(
         moments, query_args["authorized_user_id"], query_args["content_sk"])
+    # 生命周期过滤归宿主 —— **必须在翻译之前**。
+    # 翻译产物里没有 io 的 archive 字段，放到翻译之后就漏了，已归档的卡
+    # 会重新进上下文（codex 2026-08-17 指出）。
+    selectable = [c for c in cards if not card_shape.is_retired(c)]
+    # 翻成内核认的形状：内核只读 summary/content/bucket + 宿主显式给的
+    # search_text，不认 title/her_quote/linked_dimension。
+    garden_cards = [card_shape.to_garden_card(c) for c in selectable]
 
     # Expand any user-selected memory references (Garden「talk in chat」) onto
     # their message using the already-decrypted cards. Best-effort side pass;
     # does not affect the context_memories selection below.
     _attach_quoted_memories(decrypted, cards)
 
+    # ⚠️ 挑卡用翻译后的卡（内核只认那一种形状），但**注入给模型的是原卡** ——
+    # 原卡带着 title/her_quote 等 io 侧要用来渲染和留痕的字段，
+    # 翻译产物只是给内核打分用的中间态，不该外流。
+    by_original = {str(c.get("id") or ""): c for c in cards if c.get("id")}
+
+    def _back_to_original(picked: list[dict]) -> list[dict]:
+        out = []
+        for item in picked:
+            src = by_original.get(str(item.get("id") or ""))
+            out.append(dict(src) if src else item)
+        return out
+
     if use_readside:
-        context_memories, context_memory_trace = readside.select_context_memories_via_readside(
-            cards,
+        picked, context_memory_trace = readside.select_context_memories_via_readside(
+            garden_cards,
             latest_user_text,
             cap=8,
         )
+        context_memories = _back_to_original(picked)
         if not want_trace:
             context_memory_trace = None
     elif want_trace:
-        context_memories, context_memory_trace = select_context_memories_with_trace(
-            cards,
+        picked, context_memory_trace = select_context_memories_with_trace(
+            garden_cards,
             latest_user_text,
             mode=context_mode,
         )
+        context_memories = _back_to_original(picked)
     else:
-        context_memories = select_context_memories(cards, latest_user_text, mode=context_mode)
+        context_memories = _back_to_original(
+            select_context_memories(garden_cards, latest_user_text, mode=context_mode))
 
     return context_memories, context_memory_trace
 

@@ -231,7 +231,7 @@ git commit -m "feat(memory-garden): 包骨架 + 内核纯度守卫测试"
 - Modify: 上述四个原文件 → re-export
 
 **Interfaces:**
-- Produces: `memory_garden.types` 的 `MEMORY_SOURCE_VALUES` / `MEMORY_CAPTURE_MODE_VALUES` /
+- Produces: `memory.source_policy` 的 `MEMORY_SOURCE_VALUES` / `MEMORY_CAPTURE_MODE_VALUES` /
   `RESIDENT_ABSORB_SOURCE` / `RESIDENT_PATCH_SOURCE`；
   `memory_garden.guards.dream_gates` 的 `known_id_in_text` / `result_id_leak` 等全部公开名；
   `memory_garden.prompts.buckets` 的 `COMMON_BUCKETS_GUIDANCE_V1` /
@@ -256,9 +256,9 @@ git mv context_memory_selection.py        memory_garden/scoring/relevance.py
 
 ```python
 # backend/memory/source_policy.py
-"""已搬至 memory_garden.types —— 此处保留 re-export 以兼容现有 import 路径。"""
-from memory_garden.types import *  # noqa: F401,F403
-from memory_garden.types import (  # noqa: F401
+"""已搬至 memory.source_policy —— 此处保留 re-export 以兼容现有 import 路径。"""
+from memory.source_policy import *  # noqa: F401,F403
+from memory.source_policy import (  # noqa: F401
     MEMORY_SOURCE_VALUES,
     MEMORY_CAPTURE_MODE_VALUES,
     RESIDENT_ABSORB_SOURCE,
