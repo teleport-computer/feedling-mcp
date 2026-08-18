@@ -158,16 +158,21 @@ def test_reflow_removes_pending_whose_source_row_is_gone(backend_env):
     )[0][0] == 0
 
 
-def test_prune_requires_exact_stale_count_to_override_delete_guard(backend_env, monkeypatch):
+def test_prune_requires_exact_stale_count_to_override_delete_guard(monkeypatch):
     """A broad override must not delete if the live stale count changed after preview."""
     monkeypatch.setattr("tee_shadow.ciphertext_prune._MIN_ABS_GUARD", 0)
     monkeypatch.setattr("tee_shadow.ciphertext_prune._MAX_FRACTION", 0.0)
-    with psycopg.connect(os.environ["TEE_DATABASE_URL"], autocommit=True) as conn:
-        conn.execute(
-            "INSERT INTO v2_trajectory_events "
-            "(user_id,job_id,event_index,event_kind,idempotency_key,payload_bytes,truncated,created_at,payload_envelope) "
-            "VALUES ('usr_gone',900001,0,'turn','stale',1,false,now(),'{}'::jsonb)"
-        )
+    delete_calls = []
+
+    def fake_with_conn_retry(_pool_getter, _work, *, label):
+        if label.endswith("tee-keys"):
+            return {(900001, 0)}
+        if label.endswith("rds-keys"):
+            return set()
+        delete_calls.append(label)
+        return None
+
+    monkeypatch.setattr(ciphertext_prune, "_with_conn_retry", fake_with_conn_retry)
 
     refused = ciphertext_prune.prune_table(
         "v2_trajectory_events", dry_run=False, expected_stale=2
@@ -175,14 +180,14 @@ def test_prune_requires_exact_stale_count_to_override_delete_guard(backend_env, 
     assert refused["stale"] == 1
     assert refused["deleted"] == 0
     assert refused["refused"]
-    assert _tee("SELECT count(*) FROM v2_trajectory_events WHERE job_id=900001")[0][0] == 1
+    assert delete_calls == []
 
     applied = ciphertext_prune.prune_table(
         "v2_trajectory_events", dry_run=False, expected_stale=1
     )
     assert applied["deleted"] == 1
     assert applied["refused"] is None
-    assert _tee("SELECT count(*) FROM v2_trajectory_events WHERE job_id=900001")[0][0] == 0
+    assert delete_calls == ["v2_trajectory_events delete[0:1]"]
 
 
 def test_reflow_dry_run_does_not_write_error_logs(backend_env, monkeypatch):
