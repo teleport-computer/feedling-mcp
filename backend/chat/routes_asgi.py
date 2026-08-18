@@ -185,7 +185,11 @@ async def chat_response(request: Request, auth: AuthResult = Depends(require_aut
         _allow_verify_reply_with_fresh_pending_check, store, payload
     )
     gated = await threadpool.run_db(
-        chat_core.gate_response_dict, store, allow_verify_reply, payload
+        chat_core.gate_response_dict,
+        store,
+        allow_verify_reply,
+        payload,
+        consumer_info,
     )
     if gated is not None:
         await threadpool.run_db(chat_core.trace_response_gated, store, payload, allow_verify_reply)

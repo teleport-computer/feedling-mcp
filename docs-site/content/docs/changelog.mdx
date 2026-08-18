@@ -10,6 +10,15 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **Self-hosted resident replies no longer become permanently lost when a long
+  agent turn crosses the consumer freshness window.** Resident liveness now
+  follows the newest poll or accepted response activity, and a current response
+  from the same identity that previously polled is valid liveness evidence
+  without changing the separate poll timestamp. `409 bootstrap_incomplete`
+  responses now include `retryable`; only `needs_resident_consumer` is retryable,
+  and the standard resident uses a configurable, bounded exponential backoff.
+  Other stages and older servers without the field remain terminal.
+
 - **Hosted Runtime V2 no longer trusts route context-window metadata below a
   deployment-tunable floor.** Values below the default 32,768-token floor now
   fall through to the audited-family or unaudited-route default instead of
