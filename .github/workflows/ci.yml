@@ -729,6 +729,7 @@ jobs:
             tests/test_v2_first_chat_activation_backfill.py \
             tests/test_pre_test_migration_convergence.py \
             tests/test_v2_jobs_migration.py \
+            tests/test_lane_rollup.py \
             tests/test_v2_jobs_store.py \
             tests/test_v2_enclave_broker.py \
             tests/test_v2_job_lease_fencing.py \
