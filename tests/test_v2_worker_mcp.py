@@ -194,12 +194,14 @@ def _make_load_turn_mcp(turn, seen=None):
         api_key=None,
         runtime_token="",
         enclave_sem=None,
+        lane="chat",
     ):
         if seen is not None:
             seen.append({
                 "user_id": store.user_id,
                 "runtime_token": runtime_token,
                 "enclave_sem": enclave_sem,
+                "lane": lane,
             })
         return turn
     return _fake_load
@@ -1016,3 +1018,81 @@ def test_no_instructions_means_no_section_at_all(monkeypatch):
         for m in calls[0]["messages"] if m.get("role") == "system"
     )
     assert "MCP 服务器说明" not in system_text
+
+
+def test_chat_refuses_folded_platform_call_before_dispatch(monkeypatch):
+    """折叠态下直接调平台工具 → 运行时拒绝,不落 executor。
+
+    worker 里那句注释说这是「durable mutation marker 或远端请求之前」的一道
+    独立闸。2026-08-20 之前**全仓库没有一条测试提到过它**:把
+    `requires_resolution` 改成恒 False,所有既有 MCP 用例照绿。
+    唤醒侧的同一条在 tests/test_v2_wake_mcp.py。
+    """
+    uid = "u_chat_folded_refused"
+    conftest.seed_user(uid)
+    _reset(uid)
+    jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("w")
+    _patch_real_write(monkeypatch)
+
+    monkeypatch.setitem(
+        cap_tool_schema.DESCRIPTIONS,
+        "identity_get",
+        "oversized optional manual " * 6_000,
+    )
+    monkeypatch.setattr(tool_loop, "_CATALOG", None)
+    pressure_config = provider_client.ProviderConfig(
+        provider="anthropic",
+        model="claude-sonnet-4-test",
+        api_key="sk-user-byok",
+        base_url="",
+        context_window_tokens=40_000,
+    )
+
+    dispatched = []
+    real_dispatch = worker.v2_executor.dispatch_tool_calls
+
+    async def _spy_dispatch(calls, **kwargs):
+        dispatched.extend(str(tc.name) for tc in calls)
+        return await real_dispatch(calls, **kwargs)
+
+    monkeypatch.setattr(
+        worker.v2_executor, "dispatch_tool_calls", _spy_dispatch
+    )
+
+    calls = _script_provider(monkeypatch, [
+        {
+            "reply": "",
+            "tool_calls": [{
+                "id": "guess",
+                "name": "workspace_read",
+                "args": {"path": "notes.md"},
+            }],
+            "usage": {},
+        },
+        {"reply": "我先查工具说明", "tool_calls": [], "usage": {}},
+    ])
+    deps = _deps([
+        {"id": "m1", "ts": 10.0, "role": "user", "content": "read my file"}
+    ])
+
+    status = asyncio.run(worker.process_job(
+        job,
+        deps,
+        provider_config=pressure_config,
+        api_key=None,
+        runtime_token="rt-turn",
+    ))
+
+    assert status == "completed"
+    assert "workspace_read" not in dispatched
+    texts = []
+    for message in calls[1]["messages"]:
+        for result in getattr(message, "results", ()) or ():
+            texts.append(str(getattr(result, "content", "") or ""))
+    assert texts, "no tool results reached the second round at all"
+    assert any(
+        "tool schema is not loaded" in text
+        and cap_tool_schema.MCP_TOOL_SEARCH_TOOL in text
+        for text in texts
+    )

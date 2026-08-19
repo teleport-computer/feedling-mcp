@@ -1517,8 +1517,12 @@ class TurnDeps:
 
 
 class _EmptyMcpTurn:
-    """The no-MCP turn: offered when `TurnDeps.load_mcp_turn` is unwired (wake
-    lane, legacy callers, tests). No tools, handles nothing."""
+    """The no-MCP turn: offered when `TurnDeps.load_mcp_turn` is unwired
+    (legacy callers, tests) or the user has zero enabled servers. No tools,
+    handles nothing.
+
+    Since T154 "wake lane" is no longer on that list — the wake lanes load a
+    real turn like chat does."""
 
     tool_specs: tuple = ()
 
@@ -8263,6 +8267,9 @@ async def _run_wake(
                 api_key=None,
                 runtime_token=token,
                 enclave_sem=enclave_sem,
+                # 纯观测:让 mcp.surface.resolved 报真实 lane。不传的话装配层
+                # 默认写 chat,四条 wake lane 会在 admin 里全部伪装成聊天轮。
+                lane=lane,
             )
         mcp_instructions_block = _render_mcp_instructions(mcp_turn)
         if mcp_instructions_block:
@@ -8286,13 +8293,16 @@ async def _run_wake(
         )
         mcp_wall_budget = _McpTurnWallBudget(MCP_TURN_WALL_BUDGET_SEC)
 
-        def _wake_input_frontier_seq() -> int:
-            # 与 chat 同义:这次远端写基于哪个输入边界。唤醒的非 seq-native
-            # 回退路径里 cursor_box 没有 seq(纯时间戳),此时记 0。
-            try:
-                return max(0, int(cursor_box.get("seq", 0) or 0))
-            except (TypeError, ValueError, OverflowError):
-                return 0
+        # 这次远端写基于哪个**用户输入**边界。早绑,不用 cursor_box:
+        # `cursor_box["seq"]` 由 wake_snapshot_seq 初始化,那是 all-role 快照,
+        # 而这个字段的契约是 user input frontier —— 若最新一行是 assistant,
+        # 它会造出一个 reply cursor 永远覆盖不到的假 frontier(codex 复核指出)。
+        # 唤醒能执行本身已证明 wake_reply_cursor_seq 之后没有未答的 user 行:
+        # 新的用户消息会抢占本 job,写栅栏随即失败。
+        # legacy(非 seq-native)路径没有 seq 语义,记 0。
+        mutation_input_frontier_seq = (
+            int(wake_reply_cursor_seq) if seq_native else 0
+        )
 
         async def _mcp_mutation_started(tc) -> None:
             # 意图先落库再发请求。它同时是重投安全谓词读的那张表 ——
@@ -8304,7 +8314,7 @@ async def _run_wake(
                 claimed_by=claimed_by,
                 call_id=str(tc.id),
                 tool_name=str(tc.name),
-                input_frontier_seq=_wake_input_frontier_seq(),
+                input_frontier_seq=mutation_input_frontier_seq,
             )
             if not started:
                 raise RuntimeError("MCP mutation intent was not durably recorded")
@@ -12200,6 +12210,7 @@ async def process_job(
                 api_key=api_key,
                 runtime_token=runtime_token,
                 enclave_sem=enclave_sem,
+                lane=lane,
             )
         # 服务器自己写的使用说明进系统提示(MCP spec 的 initialize.result.
         # instructions)。走 trusted_system_blocks 这条现成通道,和 skills 同一个

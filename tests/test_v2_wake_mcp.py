@@ -35,6 +35,7 @@ from capabilities import tool_schema as cap_tool_schema
 from provider_types import ToolResult, ToolSpec
 from model_api_runtime.v2 import effect_outbox as v2_effect_outbox
 from model_api_runtime.v2 import jobs_store
+from model_api_runtime.v2 import serve_worker
 from model_api_runtime.v2 import tool_loop
 from model_api_runtime.v2 import worker
 from core import store as core_store
@@ -231,13 +232,14 @@ class _FoldedFakeMcpTurn(_FakeMcpTurn):
 
 def _make_load_turn_mcp(turn, seen=None):
     async def _fake_load(store, *, api_key=None, runtime_token="",
-                         enclave_sem=None):
+                         enclave_sem=None, lane="chat"):
         if seen is not None:
             seen.append({
                 "user_id": store.user_id,
                 "api_key": api_key,
                 "runtime_token": runtime_token,
                 "enclave_sem": enclave_sem,
+                "lane": lane,
             })
         return turn
     return _fake_load
@@ -248,7 +250,7 @@ def _make_load_turn_mcp(turn, seen=None):
 # ---------------------------------------------------------------------------
 
 @pytest.mark.parametrize(
-    "lane", ["heartbeat", "scheduled", "manual_wake"]
+    "lane", ["heartbeat", "scheduled", "manual_wake", "screen_watch"]
 )
 def test_wake_offers_and_dispatches_mcp_tool(monkeypatch, lane):
     """心跳/定时/手动唤醒都拿到 MCP,并且调用路由到 turn 的 dispatcher。
@@ -668,3 +670,180 @@ def test_wake_without_mcp_servers_emits_no_usage_trace(monkeypatch):
 
     assert status == "completed"
     assert "mcp.turn.usage" not in events
+
+
+def test_wake_mcp_instructions_reach_the_system_context_once(monkeypatch):
+    """服务器自写的使用说明要进唤醒轮的系统提示,且一轮只进一次。
+
+    这是 chat 早有、唤醒此前完全没有的一段:MCP spec 的
+    `initialize.result.instructions`。没有它,模型拿到一堆工具却不知道这台
+    服务器希望它怎么用 —— 而唤醒轮没有用户在旁边纠正。
+    """
+    uid = "u_wake_mcp_instructions"
+    conftest.seed_user(uid)
+    _reset(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, "heartbeat")
+    claimed_by = _claim(job_id)
+    _spy_reply(monkeypatch)
+
+    turn = _FakeMcpTurn(
+        [_MCP_SPEC], [],
+        read_only_names={_MCP_SPEC.name},
+        instructions=[("town", "开门时间是早上八点,别在半夜敲门。")],
+    )
+    calls = _script_provider(monkeypatch, [
+        {
+            "reply": "",
+            "tool_calls": [
+                {"id": "w1", "name": _MCP_SPEC.name, "args": {"where": "park"}}
+            ],
+            "usage": {},
+        },
+        {"reply": "逛完了", "tool_calls": [], "usage": {}},
+    ])
+    deps = _wake_deps(tail=_TAIL, load_mcp_turn=_make_load_turn_mcp(turn))
+
+    status = asyncio.run(worker._run_wake(
+        job_id, uid, "heartbeat", deps, _BYOK, asyncio.Semaphore(2), claimed_by,
+    ))
+
+    assert status == "completed"
+    systems = [
+        str(message.get("content") or "")
+        for message in calls[0]["messages"]
+        if isinstance(message, dict) and message.get("role") == "system"
+    ]
+    assert systems, "wake turn had no system message at all"
+    joined = "\n".join(systems)
+    assert "开门时间是早上八点" in joined
+    # 两轮都注入 = 说明书随轮次翻倍。只许一次。
+    assert joined.count("开门时间是早上八点") == 1
+
+
+def test_wake_mcp_mutation_frontier_is_the_user_reply_cursor(monkeypatch):
+    """写台账记的 frontier 是**用户输入**边界,不是 all-role 快照。
+
+    早绑 `wake_reply_cursor_seq` 而不是 late-bound `cursor_box["seq"]`:后者由
+    all-role 快照初始化,若最新一行是 assistant,会造出一个 reply cursor 永远
+    覆盖不到的假 frontier(codex 复核指出)。
+    """
+    from model_api_runtime.v2 import cursor as v2_cursor
+
+    uid = "u_wake_mcp_frontier"
+    conftest.seed_user(uid)
+    _reset(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, "heartbeat")
+    claimed_by = _claim(job_id)
+    assert jobs_store.mark_running(job_id, claimed_by=claimed_by)
+    _spy_reply(monkeypatch)
+
+    # 新用户的 cursor 是 0 —— 直接断言它等于 0 会让「记成 0」的突变照样通过
+    # (我第一版就是这么假绿的)。先把它推到一个非零值。
+    store = core_store.get_store(uid)
+    profile = db.get_blob_strict(uid, "model_api_runtime") or {}
+    profile[v2_cursor.CURSOR_KEY] = 41
+    db.set_blob(uid, "model_api_runtime", profile)
+    expected_seq = int(v2_cursor.load_seq(store))
+    assert expected_seq == 41, "precondition: cursor must be non-zero"
+
+    turn = _FakeMcpTurn([_MCP_SPEC], [])
+    _script_provider(monkeypatch, [
+        {
+            "reply": "",
+            "tool_calls": [
+                {"id": "w1", "name": _MCP_SPEC.name, "args": {"where": "park"}}
+            ],
+            "usage": {},
+        },
+        {"reply": "写完了", "tool_calls": [], "usage": {}},
+    ])
+    # seq-native 的回复走真信封路径(不再经过 _write_encrypted_reply 打桩),
+    # 所以要把信封构造也换成桩,否则回合会以「公钥未接线」失败。
+    def _fake_envelope(_store, _text, *, item_id=None):
+        return (
+            {
+                "v": 1,
+                "id": str(item_id),
+                "owner_user_id": "ignored-by-store",
+                "visibility": "shared",
+                "body_ct": "ciphertext",
+                "nonce": "nonce",
+                "K_user": "sealed-user-key",
+                "K_enclave": "sealed-enclave-key",
+            },
+            "",
+        )
+
+    monkeypatch.setattr(
+        worker.core_envelope, "_build_shared_envelope_for_store", _fake_envelope
+    )
+    deps = _wake_deps(tail=_TAIL, load_mcp_turn=_make_load_turn_mcp(turn))
+    # seq-native 才有 frontier 语义;legacy 路径记 0(下面单独钉)。
+    deps.read_messages_after_seq = lambda _uid, _after_seq: []
+    # seq-native 的 reply effect 要求生产那条事务性 sink,测试里的简易
+    # dispatch 到不了(`transactional reply sink is not wired`)。
+    deps.apply_pending_effects = serve_worker._apply_pending_effects_for_user
+
+    status = asyncio.run(worker._run_wake(
+        job_id, uid, "heartbeat", deps, _BYOK, asyncio.Semaphore(2), claimed_by,
+    ))
+
+    assert status == "completed"
+    with db.get_pool().connection() as conn:
+        rows = conn.execute(
+            "SELECT input_frontier_seq FROM v2_mcp_mutation_attempts "
+            "WHERE job_id=%s",
+            (job_id,),
+        ).fetchall()
+    assert len(rows) == 1
+    assert int(rows[0][0]) == expected_seq
+
+
+def test_production_mcp_surface_trace_reports_the_real_wake_lane(monkeypatch):
+    """生产装配层的 `mcp.surface.resolved` 必须报真实 lane。
+
+    这一条钉的是 `serve_worker._load_mcp_turn_observed`,不是 worker —— T154
+    之前它把 `detail.lane` 写死成 `"chat"`。唤醒复用同一个 deps,所以四条 wake
+    lane 的工具面加载会在 admin 里全部伪装成聊天轮,和同一轮的
+    `mcp.turn.usage`(带真实 lane)互相矛盾:排查的人会看到两个互斥的事实。
+    """
+    from model_api_runtime.v2 import serve_worker
+
+    uid = "u_wake_surface_lane"
+    conftest.seed_user(uid)
+    _reset(uid)
+    store = core_store.get_store(uid)
+
+    turn = _FakeMcpTurn([_MCP_SPEC], [], read_only_names={_MCP_SPEC.name})
+    turn.summary = {"expected": 1, "resolved": 1, "kept": 1, "offered": 1}
+
+    async def _fake_load(_store, **_kwargs):
+        assert "lane" not in _kwargs, "lane 是纯观测参数,不该下传给 loader"
+        return turn
+
+    monkeypatch.setattr(serve_worker.mcp_tools, "load_turn_mcp", _fake_load)
+    monkeypatch.setattr(
+        serve_worker, "_mcp_catalog_fingerprint_if_new", lambda _s: ""
+    )
+    emitted = []
+    monkeypatch.setattr(
+        serve_worker,
+        "_emit_v2_debug_trace",
+        lambda _store, event, **kwargs: emitted.append(
+            (event, dict(kwargs.get("detail") or {}))
+        ),
+    )
+    monkeypatch.setattr(
+        serve_worker.mcp_status, "record_runtime_results", lambda *a, **k: None
+    )
+
+    asyncio.run(serve_worker._load_mcp_turn_observed(store, lane="heartbeat"))
+    resolved = [d for event, d in emitted if event == "mcp.surface.resolved"]
+    assert len(resolved) == 1
+    assert resolved[0]["lane"] == "heartbeat"
+
+    emitted.clear()
+    asyncio.run(serve_worker._load_mcp_turn_observed(store))
+    resolved = [d for event, d in emitted if event == "mcp.surface.resolved"]
+    assert len(resolved) == 1
+    assert resolved[0]["lane"] == "chat", "未指定时保留旧默认,不改既有调用点"

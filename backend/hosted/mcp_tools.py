@@ -567,8 +567,12 @@ async def load_turn_mcp(
     runtime_token="",
     enclave_sem: asyncio.Semaphore | None = None,
 ) -> McpTurn:
-    """Build the turn's MCP tool surface. Chat lane only — callers on other lanes
-    simply don't call this (mirrors the resident, which gives MCP only on chat)."""
+    """Build the turn's MCP tool surface for one turn.
+
+    Chat and the four wake lanes both call this since T154; the proactive
+    companion needs the same外部 tools it has in conversation. Wake has no user
+    present, so it passes ``api_key=None`` and relies on ``runtime_token``
+    alone (``core.envelope.read_envelope_body`` supports that path)."""
     try:
         payload = mcp_core.envelopes_payload(store)
     except Exception:  # noqa: BLE001
