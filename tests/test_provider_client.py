@@ -1764,3 +1764,400 @@ def test_relay_image_falls_back_only_on_an_explicit_endpoint_refusal(
         f"{_RELAY_BASE}/chat/completions",
     ]
     assert result["media"][0]["data_base64"] == _TINY_PNG_B64
+
+
+# --- Fetching a provider-chosen image link (dedicated endpoint only) --------
+
+def _png_bytes(size: int = 8) -> bytes:
+    from io import BytesIO
+
+    from PIL import Image
+
+    buffer = BytesIO()
+    Image.new("RGB", (size, size), (0, 0, 255)).save(buffer, format="PNG")
+    return buffer.getvalue()
+
+
+def _fetches(monkeypatch, results):
+    """Stub the guarded fetcher; record which links it was asked for."""
+    import safe_url_fetch
+
+    asked: list[str] = []
+
+    async def fake_fetch(url, *, max_bytes, **kwargs):
+        asked.append(url)
+        outcome = results.get(url)
+        if outcome is None:
+            raise safe_url_fetch.UnsafeURLError("image_url_blocked")
+        if isinstance(outcome, Exception):
+            raise outcome
+        return safe_url_fetch.FetchedBytes(outcome, "image/png")
+
+    monkeypatch.setattr(pc.safe_url_fetch, "fetch_image_bytes_async", fake_fetch)
+    return asked
+
+
+def test_dedicated_url_answer_is_fetched_and_must_decode(monkeypatch):
+    """Measured: one relay answers `data[0].url` for the 2K variant of a model
+    that is inline at lower resolutions. The request was billed either way."""
+    import asyncio
+
+    png = _png_bytes()
+    asked = _fetches(monkeypatch, {"https://cdn.example/a.png": png})
+
+    def handler(url, payload):
+        return FakeResponse(200, {"data": [{"url": "https://cdn.example/a.png"}]})
+
+    _relay_client(monkeypatch, handler)
+
+    result = asyncio.run(
+        pc.generate_image_async(
+            pc.ProviderConfig(
+                "openai_compatible", "gpt-image-2-2k", "sk-relay", _RELAY_BASE
+            ),
+            "draw a small red robot",
+        )
+    )
+
+    assert asked == ["https://cdn.example/a.png"]
+    assert result["media"][0]["mime_type"] == "image/png"
+
+
+def test_bytes_that_do_not_decode_never_count_as_an_image(monkeypatch):
+    """setup_core's route probe only checks that media came back, so a fetch
+    that trusted the content-type header alone would mark a route ok and fail
+    later in a real chat."""
+    import asyncio
+
+    _fetches(monkeypatch, {"https://cdn.example/a.png": b"not-an-image-at-all"})
+
+    def handler(url, payload):
+        return FakeResponse(200, {"data": [{"url": "https://cdn.example/a.png"}]})
+
+    _relay_client(monkeypatch, handler)
+
+    with pytest.raises(pc.ProviderError, match="image_generation_invalid_output"):
+        asyncio.run(
+            pc.generate_image_async(
+                pc.ProviderConfig(
+                    "openai_compatible", "gpt-image-2-2k", "sk-relay", _RELAY_BASE
+                ),
+                "draw a small red robot",
+            )
+        )
+
+
+def test_inline_bytes_are_preferred_and_no_link_is_fetched(monkeypatch):
+    import asyncio
+
+    asked = _fetches(monkeypatch, {})
+
+    def handler(url, payload):
+        return FakeResponse(
+            200,
+            {
+                "data": [
+                    {"b64_json": _TINY_PNG_B64, "url": "https://cdn.example/a.png"}
+                ]
+            },
+        )
+
+    _relay_client(monkeypatch, handler)
+
+    result = asyncio.run(
+        pc.generate_image_async(
+            pc.ProviderConfig(
+                "openai_compatible", "gpt-image-2", "sk-relay", _RELAY_BASE
+            ),
+            "draw a small red robot",
+        )
+    )
+
+    assert asked == []
+    assert result["media"][0]["data_base64"] == _TINY_PNG_B64
+
+
+def test_a_link_inside_a_chat_reply_is_never_fetched(monkeypatch):
+    """Chat text is model-authored; only the dedicated endpoint's data[].url is
+    eligible. Measured relays that answer chat with a link also serve the
+    dedicated endpoint, which returns the bytes directly."""
+    import asyncio
+
+    asked = _fetches(monkeypatch, {"https://cdn.example/a.png": _png_bytes()})
+
+    def handler(url, payload):
+        if url.endswith("/images/generations"):
+            return FakeResponse(
+                500,
+                {"error": {"message": "not supported model for image generation"}},
+            )
+        return FakeResponse(
+            200,
+            {
+                "choices": [
+                    {"message": {"content": "![i](https://cdn.example/a.png)"}}
+                ]
+            },
+        )
+
+    _relay_client(monkeypatch, handler)
+
+    with pytest.raises(pc.ProviderError, match="image_generation_invalid_output"):
+        asyncio.run(
+            pc.generate_image_async(
+                pc.ProviderConfig(
+                    "openai_compatible", "gemini-3-pro-image-preview", "sk-relay",
+                    _RELAY_BASE,
+                ),
+                "draw a small red robot",
+            )
+        )
+
+    assert asked == []
+
+
+def test_a_refused_link_does_not_retry_on_the_chat_wire(monkeypatch):
+    """The dedicated request was already billed."""
+    import asyncio
+
+    _fetches(monkeypatch, {})  # every link is refused
+
+    def handler(url, payload):
+        if url.endswith("/images/generations"):
+            return FakeResponse(200, {"data": [{"url": "https://cdn.example/a.png"}]})
+        raise AssertionError("a refused link must not trigger a second request")
+
+    calls = _relay_client(monkeypatch, handler)
+
+    with pytest.raises(pc.ProviderError, match="image_generation_invalid_output"):
+        asyncio.run(
+            pc.generate_image_async(
+                pc.ProviderConfig(
+                    "openai_compatible", "gpt-image-2", "sk-relay", _RELAY_BASE
+                ),
+                "draw a small red robot",
+            )
+        )
+
+    assert [c["url"] for c in calls] == [f"{_RELAY_BASE}/images/generations"]
+
+
+def test_links_are_capped_and_share_one_byte_budget(monkeypatch):
+    """Four links must not pull four times the single-image ceiling, and a
+    fifth link is never even considered."""
+    import asyncio
+
+    png = _png_bytes()
+    urls = [f"https://cdn.example/{i}.png" for i in range(6)]
+    asked = _fetches(monkeypatch, {u: png for u in urls})
+    budgets: list[int] = []
+    original = pc.safe_url_fetch.fetch_image_bytes_async
+
+    async def recording(url, *, max_bytes, **kwargs):
+        budgets.append(max_bytes)
+        return await original(url, max_bytes=max_bytes, **kwargs)
+
+    monkeypatch.setattr(pc.safe_url_fetch, "fetch_image_bytes_async", recording)
+
+    def handler(url, payload):
+        return FakeResponse(200, {"data": [{"url": u} for u in urls]})
+
+    _relay_client(monkeypatch, handler)
+
+    result = asyncio.run(
+        pc.generate_image_async(
+            pc.ProviderConfig(
+                "openai_compatible", "gpt-image-2", "sk-relay", _RELAY_BASE
+            ),
+            "draw a small red robot",
+        )
+    )
+
+    assert len(result["media"]) == pc.MAX_GENERATED_IMAGES_PER_REPLY
+    assert len(asked) == pc.MAX_GENERATED_IMAGES_PER_REPLY
+    # The budget shrinks as bytes are spent, rather than resetting per link.
+    assert budgets[0] == pc.MAX_GENERATED_IMAGE_SOURCE_BYTES
+    assert budgets == sorted(budgets, reverse=True)
+    assert budgets[-1] < budgets[0]
+
+
+def test_official_providers_also_fetch_a_url_answer(monkeypatch):
+    """The dedicated branch is shared, so this is not relay-only behaviour —
+    the public changelog must say so."""
+    import asyncio
+
+    png = _png_bytes()
+    asked = _fetches(monkeypatch, {"https://cdn.openai.example/a.png": png})
+
+    def handler(url, payload):
+        return FakeResponse(
+            200, {"data": [{"url": "https://cdn.openai.example/a.png"}]}
+        )
+
+    _relay_client(monkeypatch, handler)
+
+    result = asyncio.run(
+        pc.generate_image_async(
+            pc.ProviderConfig("openai", "gpt-image-2", "sk-test"),
+            "draw a small red robot",
+        )
+    )
+
+    assert asked == ["https://cdn.openai.example/a.png"]
+    assert result["media"]
+
+
+def test_undecodable_downloads_still_spend_the_shared_budget(monkeypatch):
+    """Bytes that arrive are charged when they arrive. Charging only what
+    decodes would let four hostile 25MB "images" each refill the budget."""
+    import asyncio
+    import safe_url_fetch
+
+    urls = [f"https://cdn.example/{i}.png" for i in range(4)]
+    budgets: list[int] = []
+
+    async def fake_fetch(url, *, max_bytes, **kwargs):
+        budgets.append(max_bytes)
+        # Downloaded in full, but not an image.
+        return safe_url_fetch.FetchedBytes(b"x" * 1000, "image/png")
+
+    monkeypatch.setattr(pc.safe_url_fetch, "fetch_image_bytes_async", fake_fetch)
+
+    def handler(url, payload):
+        return FakeResponse(200, {"data": [{"url": u} for u in urls]})
+
+    _relay_client(monkeypatch, handler)
+
+    with pytest.raises(pc.ProviderError, match="image_generation_invalid_output"):
+        asyncio.run(
+            pc.generate_image_async(
+                pc.ProviderConfig(
+                    "openai_compatible", "gpt-image-2", "sk-relay", _RELAY_BASE
+                ),
+                "draw a small red robot",
+            )
+        )
+
+    assert budgets == sorted(budgets, reverse=True)
+    assert len(set(budgets)) == len(budgets), "each failed decode must still cost"
+    assert budgets[-1] == pc.MAX_GENERATED_IMAGE_SOURCE_BYTES - 3000
+
+
+def test_a_failed_download_stops_the_remaining_links(monkeypatch):
+    """A failed fetch reports no length, so its consumed bytes cannot be
+    charged; handing the next link a full budget would be silently wrong."""
+    import asyncio
+    import safe_url_fetch
+
+    urls = [f"https://cdn.example/{i}.png" for i in range(4)]
+    asked: list[str] = []
+
+    async def fake_fetch(url, *, max_bytes, **kwargs):
+        asked.append(url)
+        raise safe_url_fetch.UnsafeURLError("image_url_too_large")
+
+    monkeypatch.setattr(pc.safe_url_fetch, "fetch_image_bytes_async", fake_fetch)
+
+    def handler(url, payload):
+        return FakeResponse(200, {"data": [{"url": u} for u in urls]})
+
+    _relay_client(monkeypatch, handler)
+
+    with pytest.raises(pc.ProviderError, match="image_generation_invalid_output"):
+        asyncio.run(
+            pc.generate_image_async(
+                pc.ProviderConfig(
+                    "openai_compatible", "gpt-image-2", "sk-relay", _RELAY_BASE
+                ),
+                "draw a small red robot",
+            )
+        )
+
+    assert asked == urls[:1]
+
+
+def test_links_share_one_wall_clock_budget(monkeypatch):
+    """Four slow links must not each add a fresh deadline to the turn."""
+    import asyncio
+    import safe_url_fetch
+
+    urls = [f"https://cdn.example/{i}.png" for i in range(4)]
+    granted: list[float] = []
+    png = _png_bytes()
+
+    async def fake_fetch(url, *, max_bytes, deadline_seconds=None, **kwargs):
+        granted.append(deadline_seconds)
+        await asyncio.sleep(0.05)
+        return safe_url_fetch.FetchedBytes(png, "image/png")
+
+    monkeypatch.setattr(pc.safe_url_fetch, "fetch_image_bytes_async", fake_fetch)
+    monkeypatch.setattr(pc, "IMAGE_LINK_TOTAL_DEADLINE_SECONDS", 0.2)
+
+    def handler(url, payload):
+        return FakeResponse(200, {"data": [{"url": u} for u in urls]})
+
+    _relay_client(monkeypatch, handler)
+
+    asyncio.run(
+        pc.generate_image_async(
+            pc.ProviderConfig(
+                "openai_compatible", "gpt-image-2", "sk-relay", _RELAY_BASE
+            ),
+            "draw a small red robot",
+        )
+    )
+
+    assert granted, "the fetcher must receive an explicit deadline"
+    assert granted == sorted(granted, reverse=True), "the budget must shrink"
+    assert granted[-1] < granted[0]
+
+
+def test_decoding_does_not_block_the_event_loop(monkeypatch):
+    """Pillow on a 25MB attacker-sized image would stall every other turn in
+    this process if it ran on the loop."""
+    import asyncio
+    import safe_url_fetch
+    import time as _time
+
+    async def fake_fetch(url, *, max_bytes, **kwargs):
+        return safe_url_fetch.FetchedBytes(b"pretend", "image/png")
+
+    def slow_normalize(*args, **kwargs):
+        _time.sleep(0.3)
+        raise ValueError("not an image")
+
+    monkeypatch.setattr(pc.safe_url_fetch, "fetch_image_bytes_async", fake_fetch)
+    monkeypatch.setattr(
+        pc.generated_image, "normalize_generated_image", slow_normalize
+    )
+
+    def handler(url, payload):
+        return FakeResponse(200, {"data": [{"url": "https://cdn.example/a.png"}]})
+
+    _relay_client(monkeypatch, handler)
+
+    async def scenario():
+        ticks = []
+
+        async def heartbeat():
+            while True:
+                await asyncio.sleep(0.01)
+                ticks.append(asyncio.get_running_loop().time())
+
+        beat = asyncio.create_task(heartbeat())
+        try:
+            with pytest.raises(pc.ProviderError):
+                await pc.generate_image_async(
+                    pc.ProviderConfig(
+                        "openai_compatible", "gpt-image-2", "sk-relay", _RELAY_BASE
+                    ),
+                    "draw a small red robot",
+                )
+        finally:
+            beat.cancel()
+        return ticks
+
+    ticks = asyncio.run(scenario())
+    gaps = [b - a for a, b in zip(ticks, ticks[1:])]
+    assert ticks, "the heartbeat must have run at all"
+    assert max(gaps or [0]) < 0.15, f"loop was blocked for {max(gaps or [0]):.3f}s"
