@@ -49,7 +49,11 @@ def test_rds_pre_and_test_heads_converge():
 
 def test_tee_chain_carries_test_runtime_schema():
     script = _scripts("alembic_tee")
-    assert script.get_heads() == ["0025_lane_rollup_voice"]
+    assert script.get_heads() == ["0026_plaintext_shadow_control"]
+    assert (
+        script.get_revision("0026_plaintext_shadow_control").down_revision
+        == "0025_lane_rollup_voice"
+    )
     assert (
         script.get_revision("0025_lane_rollup_voice").down_revision
         == "0024_lane_rollup_safe_ts"

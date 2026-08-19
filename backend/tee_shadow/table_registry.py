@@ -13,7 +13,7 @@ scheduler、verify、snapshot 三处消费，必须能在任何上下文里安�
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 # 热路径双写：写主库的同时经 tee_shadow.mirror.execute 尽力而为地写 TEE。
 # 适用于低频写的明文运维表。
@@ -47,6 +47,13 @@ class Entry:
     # True = 这张表不由 alembic 迁移链创建（人工 SQL 建的，如一次性备份表）。
     # 守卫据此放行"注册表里有、迁移链里没有"的条目；不标就当成表名打错。
     manual: bool = False
+    # Plaintext-shadow dirty-key capture records these identifiers only.  They
+    # are asserted against pg_catalog so a schema change cannot silently make
+    # replay address the wrong row.
+    key_columns: tuple[str, ...] = ()
+    # Most targets keep the source name.  frame_envelopes is transformed into
+    # the historical `frames` plaintext shape.
+    destination_table: str | None = None
 
 
 REGISTRY: dict[str, Entry] = {
@@ -242,6 +249,93 @@ REGISTRY: dict[str, Entry] = {
         SKIP, "2026-07-10 单用户事故的一次性人工备份表，非生产数据", manual=True),
     "bak_20260710_usr5d4a_users": Entry(
         SKIP, "2026-07-10 单用户事故的一次性人工备份表，非生产数据", manual=True),
+}
+
+
+# Authoritative primary-key inventory for content-free change capture.  Keep
+# this static: deriving it at runtime would make a compromised/mis-migrated
+# database define what the replication code is allowed to address.  The test
+# suite compares every value with a freshly migrated PostgreSQL catalog.
+_PRIMARY_KEYS: dict[str, tuple[str, ...]] = {
+    "server_config": ("key",),
+    "global_blobs": ("key",),
+    "users": ("user_id",),
+    "user_blobs": ("user_id", "kind"),
+    "user_logs": ("user_id", "stream", "seq"),
+    "perception_items": ("user_id", "kind", "item_id"),
+    "perception_daily": ("user_id", "date", "signal"),
+    "copytext_strings": ("key", "lang"),
+    "copytext_meta": ("id",),
+    "genesis_import_jobs": ("user_id", "job_id"),
+    "genesis_import_outputs": ("user_id", "job_id", "output_type"),
+    "notify_relay_configs": ("auth_token",),
+    "notify_relay_logs": ("id",),
+    "lane_daily_rollup": ("user_id", "day", "route", "lane", "enqueue_source"),
+    "lane_rollup_watermark": ("route",),
+    "chat_messages": ("user_id", "msg_id"),
+    "memory_moments": ("user_id", "moment_id"),
+    "world_book_entries": ("user_id", "entry_id"),
+    "frame_envelopes": ("user_id", "frame_id"),
+    "chat_message_archive": ("user_id", "source_seq"),
+    "v2_trajectory_events": ("job_id", "event_index"),
+    "model_api_credentials": ("id",),
+    "v2_conversation_summary": ("user_id",),
+    "v2_conversation_summary_segments": ("segment_id",),
+    "v2_trajectory_reviews": ("source_job_id",),
+    "v2_workspace_entries": ("user_id", "path"),
+    "agent_action_queue": ("id",),
+    "agent_jobs": ("id",),
+    "agent_runtime_instances": ("user_id",),
+    "agent_runtime_supervisor_heartbeats": ("owner",),
+    "agent_status_events": ("id",),
+    "chat_turn_activity_events": ("id",),
+    "chat_r2_cleanup": ("body_key",),
+    "chat_r2_lifecycle": ("user_id",),
+    "dau_daily_snapshot": ("day",),
+    "model_api_routes": ("id",),
+    "perception_signal_state_v2": ("user_id", "signal"),
+    "provider_health": ("user_id",),
+    "retention_cohort_snapshot": ("cohort_week", "period_index"),
+    "runtime_state": ("user_id",),
+    "user_growth_daily_snapshot": ("day",),
+    "v2_capture_batches": ("id",),
+    "v2_chat_tail_anchor": ("user_id",),
+    "v2_effect_outbox": ("effect_id",),
+    "v2_effect_sink_applied": ("effect_id",),
+    "v2_mcp_mutation_attempts": ("job_id", "call_key"),
+    "v2_runtime_control": ("id",),
+    "v2_runtime_state": ("user_id",),
+    "v2_sandbox_usage_events": ("id",),
+    "v2_terminal_failure_outbox": ("job_id",),
+    "v2_trajectory_access_audit": ("id",),
+    "v2_trajectory_streams": ("job_id",),
+    "v2_turn_metrics": ("id",),
+    "v2_usage_daily_dimensions": ("id",),
+    "v2_usage_daily_users": ("id",),
+    "v2_usage_rollup_watermarks": ("rollup_name",),
+    "v2_user_allowlist": ("user_id",),
+    "v2_wake_schedule": ("user_id",),
+    "v2_worker_heartbeats": ("worker_id",),
+    "voice_transcripts": ("user_id", "call_id"),
+}
+
+_capture_tables = {
+    name for name, entry in REGISTRY.items() if entry.lane not in (SKIP, LOGICAL)
+}
+if set(_PRIMARY_KEYS) != _capture_tables:
+    missing = sorted(_capture_tables - set(_PRIMARY_KEYS))
+    extra = sorted(set(_PRIMARY_KEYS) - _capture_tables)
+    raise RuntimeError(
+        f"plaintext shadow key registry mismatch: missing={missing} extra={extra}"
+    )
+
+REGISTRY = {
+    name: replace(
+        entry,
+        key_columns=_PRIMARY_KEYS.get(name, ()),
+        destination_table="frames" if name == "frame_envelopes" else name,
+    )
+    for name, entry in REGISTRY.items()
 }
 
 
