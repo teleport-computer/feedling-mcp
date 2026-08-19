@@ -6838,10 +6838,61 @@ ON CONFLICT (day, writer_id, subsystem, event_type, lane) DO UPDATE SET
     updated_at = now()
 """
 
+_TRACE_WRITE_STATS_HEALTH_UPSERT_SQL = """
+INSERT INTO trace_write_stats_health (
+    writer_id, process_started_at, last_success_at, last_failure_at,
+    failures_total, max_consecutive_failures, dirty_rows, stopped_at, updated_at
+) VALUES (%s,to_timestamp(%s),now(),to_timestamp(%s),%s,%s,%s,NULL,now())
+ON CONFLICT (writer_id) DO UPDATE SET
+    process_started_at = LEAST(
+        trace_write_stats_health.process_started_at,
+        EXCLUDED.process_started_at),
+    last_success_at = now(),
+    last_failure_at = CASE
+        WHEN EXCLUDED.last_failure_at IS NULL
+            THEN trace_write_stats_health.last_failure_at
+        WHEN trace_write_stats_health.last_failure_at IS NULL
+            THEN EXCLUDED.last_failure_at
+        ELSE GREATEST(
+            trace_write_stats_health.last_failure_at,
+            EXCLUDED.last_failure_at)
+    END,
+    failures_total = GREATEST(
+        trace_write_stats_health.failures_total,
+        EXCLUDED.failures_total),
+    max_consecutive_failures = GREATEST(
+        trace_write_stats_health.max_consecutive_failures,
+        EXCLUDED.max_consecutive_failures),
+    dirty_rows = EXCLUDED.dirty_rows,
+    updated_at = now()
+"""
+
+_TRACE_WRITE_STATS_HEALTH_STOP_SQL = """
+UPDATE trace_write_stats_health
+SET stopped_at = now(), updated_at = now()
+WHERE writer_id = %s AND stopped_at IS NULL AND dirty_rows = 0
+"""
+
 _TRACE_WRITE_STATS_MIN_MEASUREMENT_HOURS = 7 * 24
+# Shared with debug_trace's writer loop. Keep the producer cadence and the
+# reader's stale threshold on one source of truth so a cadence change cannot
+# make every healthy writer look stale.
+TRACE_WRITE_STATS_HEARTBEAT_SEC = 60.0
+_TRACE_WRITE_STATS_HEALTH_STALE_SEC = 3 * TRACE_WRITE_STATS_HEARTBEAT_SEC
+# The health window's upper bound exists to keep a future-dated row out of a
+# fixed-``now`` report.  It must NOT be zero-tolerance: ``last_success_at`` is
+# stamped by the DATABASE clock while ``now`` comes from the READER's clock, so
+# an exact ``<= now`` drops the row a healthy writer just wrote whenever the
+# reader lags the database at all — and a dropped health row reads as
+# "unregistered writer", i.e. the gate reports a registration failure that did
+# not happen.  A day of slack is far beyond any real app/RDS/CVM skew while
+# still shorter than the gaps between the report's own fixed test instants.
+_TRACE_WRITE_STATS_HEALTH_FUTURE_TOLERANCE_SEC = 86400.0
 
 
-def upsert_trace_write_stats(rows: list[tuple]) -> None:
+def upsert_trace_write_stats(
+    rows: list[tuple], *, writer_health: tuple | None = None,
+) -> None:
     """Persist absolute trace-rate counters and best-effort mirror them.
 
     Each row is ``(day, writer_id, subsystem, event_type, lane,
@@ -6850,16 +6901,39 @@ def upsert_trace_write_stats(rows: list[tuple]) -> None:
     atomic; replay is safe even if the caller cannot tell whether a prior
     commit succeeded.
     """
-    if not rows:
+    if not rows and writer_health is None:
         return
     normalized = [tuple(row) for row in rows]
     with get_pool().connection() as conn:
         with conn.transaction(), conn.cursor() as cur:
-            cur.executemany(_TRACE_WRITE_STATS_UPSERT_SQL, normalized)
+            if normalized:
+                cur.executemany(_TRACE_WRITE_STATS_UPSERT_SQL, normalized)
+            if writer_health is not None:
+                cur.execute(
+                    _TRACE_WRITE_STATS_HEALTH_UPSERT_SQL,
+                    tuple(writer_health),
+                )
     from tee_shadow import mirror
-    mirror.execute_many([
+    statements = [
         (_TRACE_WRITE_STATS_UPSERT_SQL, params) for params in normalized
-    ])
+    ]
+    if writer_health is not None:
+        statements.append((
+            _TRACE_WRITE_STATS_HEALTH_UPSERT_SQL,
+            tuple(writer_health),
+        ))
+    mirror.execute_many(statements)
+
+
+def stop_trace_write_stats_writer(writer_id: str) -> None:
+    """Mark one gracefully exiting writer; an abnormal exit stays stale."""
+    if not writer_id:
+        return
+    params = (str(writer_id),)
+    with get_pool().connection() as conn:
+        conn.execute(_TRACE_WRITE_STATS_HEALTH_STOP_SQL, params)
+    from tee_shadow import mirror
+    mirror.execute(_TRACE_WRITE_STATS_HEALTH_STOP_SQL, params)
 
 
 def trace_write_stats_measurement(
@@ -6892,6 +6966,27 @@ def trace_write_stats_measurement(
             "GROUP BY day, subsystem, event_type, lane "
             "ORDER BY day, subsystem, event_type, lane",
             (since_day,),
+        ).fetchall()
+        health_rows = conn.execute(
+            "SELECT writer_id, "
+            "extract(epoch FROM process_started_at), "
+            "extract(epoch FROM last_success_at), "
+            "extract(epoch FROM last_failure_at), failures_total, "
+            "max_consecutive_failures, dirty_rows, "
+            "extract(epoch FROM stopped_at) "
+            "FROM trace_write_stats_health "
+            "WHERE COALESCE(stopped_at, last_success_at) >= to_timestamp(%s) "
+            "AND COALESCE(stopped_at, last_success_at) <= to_timestamp(%s) "
+            "ORDER BY process_started_at, writer_id",
+            (
+                now - _TRACE_WRITE_STATS_MIN_MEASUREMENT_HOURS * 3600,
+                now + _TRACE_WRITE_STATS_HEALTH_FUTURE_TOLERANCE_SEC,
+            ),
+        ).fetchall()
+        measured_writer_rows = conn.execute(
+            "SELECT DISTINCT writer_id FROM trace_write_stats "
+            "WHERE day >= %s ORDER BY writer_id",
+            ((today - timedelta(days=6)).isoformat(),),
         ).fetchall()
 
     started_epoch = (
@@ -6949,6 +7044,53 @@ def trace_write_stats_measurement(
         max(0.0, (now - started_epoch) / 3600.0)
         if started_epoch is not None else 0.0
     )
+    writer_health = []
+    health_writer_ids = set()
+    stale_writer_ids = []
+    for row in health_rows:
+        writer_id = str(row[0])
+        health_writer_ids.add(writer_id)
+        last_success_epoch = float(row[2])
+        stopped_epoch = float(row[7]) if row[7] is not None else None
+        success_age_sec = max(0.0, now - last_success_epoch)
+        stale = (
+            stopped_epoch is None
+            and success_age_sec > _TRACE_WRITE_STATS_HEALTH_STALE_SEC
+        )
+        if stale:
+            stale_writer_ids.append(writer_id)
+        writer_health.append({
+            "writer_id": writer_id,
+            "process_started_epoch": float(row[1]),
+            "last_success_epoch": last_success_epoch,
+            "last_failure_epoch": (
+                float(row[3]) if row[3] is not None else None
+            ),
+            "failures_total": int(row[4] or 0),
+            "max_consecutive_failures": int(row[5] or 0),
+            # A successful production flush publishes zero here as a durable
+            # drain acknowledgement. A failing writer's real backlog remains
+            # process-local, so once its heartbeat is stale even that stored
+            # zero is no longer current evidence and must become unknown.
+            "dirty_rows": None if stale else int(row[6] or 0),
+            "dirty_rows_status": "unknown_stale" if stale else "current",
+            "last_success_age_sec": round(success_age_sec, 3),
+            "missed_heartbeat_intervals": (
+                int(success_age_sec // TRACE_WRITE_STATS_HEARTBEAT_SEC)
+                if stale else 0
+            ),
+            "stopped_epoch": stopped_epoch,
+            "status": "stopped" if stopped_epoch is not None else (
+                "stale" if stale else "healthy"
+            ),
+        })
+    measured_writer_ids = {str(row[0]) for row in measured_writer_rows}
+    unregistered_writer_ids = sorted(measured_writer_ids - health_writer_ids)
+    health_complete = (
+        bool(writer_health)
+        and not stale_writer_ids
+        and not unregistered_writer_ids
+    )
     return {
         "timezone": "Asia/Shanghai",
         "window_days": window_days,
@@ -6960,7 +7102,16 @@ def trace_write_stats_measurement(
         "minimum_measurement_hours": _TRACE_WRITE_STATS_MIN_MEASUREMENT_HOURS,
         "measurement_ready": (
             elapsed_hours >= _TRACE_WRITE_STATS_MIN_MEASUREMENT_HOURS
+            and health_complete
         ),
+        "writer_health": {
+            "heartbeat_interval_sec": TRACE_WRITE_STATS_HEARTBEAT_SEC,
+            "stale_after_sec": _TRACE_WRITE_STATS_HEALTH_STALE_SEC,
+            "complete": health_complete,
+            "stale_writer_ids": stale_writer_ids,
+            "unregistered_writer_ids": unregistered_writer_ids,
+            "writers": writer_health,
+        },
         "capacity_basis": "daily_peak_not_average",
         "peak": peak,
         "daily": rendered_daily,

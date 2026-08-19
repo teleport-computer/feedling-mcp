@@ -106,6 +106,12 @@ REGISTRY: dict[str, Entry] = {
         "TEE，RDS-primary 期间则以每进程启动实例的单调绝对值幂等热镜像。行按日永久"
         "增长，不能进 20 万行硬阀的 SNAPSHOT；reconciler 按复合主键扶正漏镜像",
     ),
+    "trace_write_stats_health": Entry(
+        MIRROR,
+        "T138 尺子每个进程 writer 的成功心跳（RDS 0096/TEE 0028）；失败时不依赖"
+        "同一坏通道写失败态，而由 last_success_at 自然过期。每 writer 单行原地更新，"
+        "热镜像并由 reconciler 按 writer_id 扶正",
+    ),
 
     # ---------------------------------------------------------------- #
     # CIPHERTEXT —— 装信封的表，经 enclave 解密成明文写进 TEE。

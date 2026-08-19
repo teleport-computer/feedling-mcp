@@ -5991,7 +5991,18 @@ def main() -> None:
         db_pool_max,
         len(config.slots),
     )
-    _run_forever(worker_id, poll_interval)
+    try:
+        _run_forever(worker_id, poll_interval)
+    finally:
+        # The parent can emit traces from its Genesis thread.  Keep one writer
+        # identity across in-process _serve relaunches; tombstone it only when
+        # the process itself is really draining.
+        try:
+            import debug_trace
+
+            debug_trace.stop_trace_stats_writer()
+        except Exception:  # noqa: BLE001 — process cleanup remains best-effort
+            pass
 
 
 if __name__ == "__main__":

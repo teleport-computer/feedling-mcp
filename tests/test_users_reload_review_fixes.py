@@ -499,8 +499,10 @@ def test_turn_child_main_starts_the_periodic_full_reload(monkeypatch):
     the daemon) but runs its own entry — so main() must start it, or a dropped
     users notify never self-heals in the long-lived turn_child process."""
     from model_api_runtime.v2 import serve_worker, turn_child
+    import debug_trace
 
     started = {"n": 0}
+    stopped = {"n": 0}
     configured = []
     monkeypatch.setattr(
         turn_child.db,
@@ -515,6 +517,11 @@ def test_turn_child_main_starts_the_periodic_full_reload(monkeypatch):
         lambda: started.__setitem__("n", started["n"] + 1),
     )
     monkeypatch.setattr(turn_child.asyncio, "run", lambda coro: coro.close())
+    monkeypatch.setattr(
+        debug_trace,
+        "stop_trace_stats_writer",
+        lambda: stopped.__setitem__("n", stopped["n"] + 1),
+    )
 
     class FakeConn:
         def close(self):
@@ -522,6 +529,7 @@ def test_turn_child_main_starts_the_periodic_full_reload(monkeypatch):
 
     turn_child.main(FakeConn(), "worker-test", poll_interval=1.0)
     assert started["n"] == 1
+    assert stopped["n"] == 1
     assert configured == [2]
 
 

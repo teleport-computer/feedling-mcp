@@ -152,6 +152,14 @@ async def lifespan(app):
 
     await threadpool.run_db(accounts_registry.load_users)
 
+    # Register every gunicorn worker with T138's expiring success heartbeat,
+    # including an idle worker that has not happened to receive a trace yet.
+    # This is what lets the report enumerate the whole writer fleet instead of
+    # only whichever process the admin request happens to hit.
+    import debug_trace
+
+    debug_trace.start_trace_stats_writer()
+
     # (4b) Wire core.envelope's user-public-key lookup — mirrors app.py:412.
     #      `core.envelope.get_user_public_key` ships as a RuntimeError stub so
     #      core does not import accounts; the assembly layer must inject the real
@@ -216,6 +224,10 @@ async def lifespan(app):
     finally:
         # Shutdown: release parked waiters so in-flight polls return, drop the
         # hook, then close the async clients.
+        # T138: seal a gracefully retiring trace writer.  If the process dies
+        # before this point, its missing tombstone is deliberately visible as
+        # a stale success heartbeat in the cross-process rate report.
+        await threadpool.run_db(debug_trace.stop_trace_stats_writer)
         registry.wake_all()
         core_store.set_async_wake_hook(None)
         reaper_stop.set()

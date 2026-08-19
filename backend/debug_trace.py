@@ -15,6 +15,7 @@ deploy-wide kill switch, and a per-user flag can still opt a user out.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import queue
 import threading
@@ -54,7 +55,10 @@ _QUEUE_MAX = 5000
 _FLUSH_BATCH_MAX = 100
 _FLUSH_WAIT_SEC = 0.25
 _STATS_RETRY_SEC = 1.0
+_STATS_HEARTBEAT_SEC = db.TRACE_WRITE_STATS_HEARTBEAT_SEC
+_STATS_FAILURE_LOG_INTERVAL_SEC = 60.0
 _STATS_ZONE = ZoneInfo("Asia/Shanghai")
+log = logging.getLogger("feedling.debug_trace")
 
 # subsystem ∈ memory|genesis|identity|route|voice|perception|proactive|fallback|account
 # actor     ∈ host_agent_runtime|vps_resident|backend|ios
@@ -74,9 +78,16 @@ _at_risk_by_uid: dict[str, int] = {}
 _stats_lock = threading.Lock()
 _stats_pid = -1
 _stats_writer_id = ""
+_stats_process_started_at = 0.0
 _stats_totals: dict[tuple[str, str, str, str], list[int]] = {}
 _stats_flushed: dict[tuple[str, str, str, str], tuple[int, ...]] = {}
 _stats_first_seen: dict[tuple[str, str, str, str], float] = {}
+_stats_flush_failures_total = 0
+_stats_flush_consecutive_failures = 0
+_stats_last_flush_failure_at = 0.0
+_stats_last_flush_success_at = 0.0
+_stats_last_flush_error = ""
+_stats_last_failure_warning_at = 0.0
 # Count events from enqueue until either the background worker or a synchronous
 # debug read has finished persisting them. Queue emptiness is insufficient: the
 # worker removes an item before its 250ms batching window, so a concurrent GET
@@ -223,14 +234,24 @@ def _take_at_risk_marker(uid: str) -> int:
 
 
 def _stats_identity_locked() -> str:
-    global _stats_pid, _stats_writer_id
+    global _stats_pid, _stats_writer_id, _stats_process_started_at
+    global _stats_flush_failures_total, _stats_flush_consecutive_failures
+    global _stats_last_flush_failure_at, _stats_last_flush_success_at
+    global _stats_last_flush_error, _stats_last_failure_warning_at
     pid = os.getpid()
     if _stats_pid != pid:
         _stats_pid = pid
         _stats_writer_id = f"{pid}:{uuid.uuid4().hex}"
+        _stats_process_started_at = time.time()
         _stats_totals.clear()
         _stats_flushed.clear()
         _stats_first_seen.clear()
+        _stats_flush_failures_total = 0
+        _stats_flush_consecutive_failures = 0
+        _stats_last_flush_failure_at = 0.0
+        _stats_last_flush_success_at = 0.0
+        _stats_last_flush_error = ""
+        _stats_last_failure_warning_at = 0.0
     return _stats_writer_id
 
 
@@ -284,7 +305,13 @@ def _record_trace_stats(
 
 def _flush_trace_stats() -> None:
     """Best-effort flush of changed absolute totals; failures remain dirty."""
+    global _stats_flush_failures_total, _stats_flush_consecutive_failures
+    global _stats_last_flush_failure_at, _stats_last_flush_success_at
+    global _stats_last_flush_error, _stats_last_failure_warning_at
+    writer_id = "unknown"
+    dirty_rows = 0
     try:
+        now = time.time()
         with _stats_lock:
             writer_id = _stats_identity_locked()
             snapshots = {
@@ -292,20 +319,134 @@ def _flush_trace_stats() -> None:
                 for key, values in _stats_totals.items()
                 if tuple(values) != _stats_flushed.get(key)
             }
+            dirty_rows = len(snapshots)
             rows = [
                 (*key[:1], writer_id, *key[1:], *values, _stats_first_seen[key])
                 for key, values in snapshots.items()
             ]
-        if not rows:
-            return
-        db.upsert_trace_write_stats(rows)
+            heartbeat_due = (
+                bool(rows)
+                or _stats_last_flush_success_at <= 0
+                or now - _stats_last_flush_success_at >= _STATS_HEARTBEAT_SEC
+            )
+            if not heartbeat_due:
+                return
+            writer_health = (
+                writer_id,
+                _stats_process_started_at,
+                _stats_last_flush_failure_at or None,
+                _stats_flush_failures_total,
+                _stats_flush_consecutive_failures,
+                0,
+            )
+        db.upsert_trace_write_stats(rows, writer_health=writer_health)
+        recovered_failures = 0
+        recovered_after = 0.0
+        now = time.time()
         with _stats_lock:
             if writer_id != _stats_identity_locked():
                 return
             for key, values in snapshots.items():
                 _stats_flushed[key] = values
-    except Exception:
-        pass
+            recovered_failures = _stats_flush_consecutive_failures
+            if recovered_failures and _stats_last_flush_failure_at:
+                recovered_after = max(0.0, now - _stats_last_flush_failure_at)
+            _stats_flush_consecutive_failures = 0
+            _stats_last_flush_success_at = now
+            _stats_last_flush_error = ""
+        if recovered_failures:
+            log.info(
+                "[debug-trace-stats] flush recovered writer=%s "
+                "after_failures=%d recovery_sec=%.1f",
+                writer_id,
+                recovered_failures,
+                recovered_after,
+            )
+    except Exception as exc:
+        now = time.time()
+        error_code = type(exc).__name__.lower()
+        with _stats_lock:
+            _stats_flush_failures_total += 1
+            _stats_flush_consecutive_failures += 1
+            _stats_last_flush_failure_at = now
+            _stats_last_flush_error = error_code
+            should_warn = (
+                _stats_last_failure_warning_at <= 0
+                or now - _stats_last_failure_warning_at
+                >= _STATS_FAILURE_LOG_INTERVAL_SEC
+            )
+            if should_warn:
+                _stats_last_failure_warning_at = now
+            total = _stats_flush_failures_total
+            consecutive = _stats_flush_consecutive_failures
+        if should_warn:
+            log.warning(
+                "[debug-trace-stats] persistent counter flush failed "
+                "writer=%s total=%d consecutive=%d dirty_rows=%d code=%s; "
+                "absolute totals remain dirty for idempotent retry",
+                writer_id,
+                total,
+                consecutive,
+                dirty_rows,
+                error_code,
+            )
+
+
+def trace_stats_health() -> dict[str, Any]:
+    """Process-local detail; the durable report uses expiring success heartbeats."""
+    with _stats_lock:
+        writer_id = _stats_identity_locked()
+        dirty_rows = sum(
+            tuple(values) != _stats_flushed.get(key)
+            for key, values in _stats_totals.items()
+        )
+        return {
+            "writer_id": writer_id,
+            "dirty_rows": dirty_rows,
+            "failures_total": _stats_flush_failures_total,
+            "consecutive_failures": _stats_flush_consecutive_failures,
+            "last_failure_at": _stats_last_flush_failure_at or None,
+            "last_success_at": _stats_last_flush_success_at or None,
+            "last_error": _stats_last_flush_error,
+            "healthy": _stats_flush_consecutive_failures == 0,
+        }
+
+
+def stop_trace_stats_writer() -> None:
+    """Best-effort graceful tombstone; a crash deliberately remains stale."""
+    with _stats_lock:
+        if _stats_pid != os.getpid() or not _stats_writer_id:
+            return
+    _flush_trace_stats()
+    with _stats_lock:
+        writer_id = _stats_writer_id
+        dirty_rows = sum(
+            tuple(values) != _stats_flushed.get(key)
+            for key, values in _stats_totals.items()
+        )
+        consecutive_failures = _stats_flush_consecutive_failures
+    # A tombstone is affirmative evidence that this writer drained cleanly.
+    # Never publish it after the fail-open final flush left anything dirty;
+    # keeping the row open lets last_success_at expire into the honest stale
+    # state instead of hiding an unknown shutdown gap as graceful.
+    if dirty_rows or consecutive_failures:
+        log.warning(
+            "[debug-trace-stats] writer stop remains unstopped "
+            "writer=%s dirty_rows=%d consecutive_failures=%d",
+            writer_id,
+            dirty_rows,
+            consecutive_failures,
+        )
+        return
+    try:
+        db.stop_trace_write_stats_writer(writer_id)
+    except Exception as exc:
+        log.warning(
+            "[debug-trace-stats] graceful writer stop was not persisted "
+            "writer=%s code=%s",
+            writer_id,
+            type(exc).__name__.lower(),
+        )
 
 
 def _append_events(uid: str, new_events: list[dict[str, Any]]) -> None:
@@ -459,6 +600,11 @@ def _ensure_worker_started() -> None:
             daemon=True,
         ).start()
         _worker_started = True
+
+
+def start_trace_stats_writer() -> None:
+    """Register this service process as a ruler writer via its stats loop."""
+    _ensure_worker_started()
 
 
 def _enqueue(uid: str, event: dict[str, Any]) -> None:

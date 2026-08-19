@@ -106,6 +106,12 @@ TABLES: dict[str, tuple[tuple[str, ...], str]] = {
         "persisted_bytes, known_drop_events, known_drop_bytes, at_risk_events, "
         "at_risk_bytes, first_seen_at, updated_at",
     ),
+    "trace_write_stats_health": (
+        ("writer_id",),
+        "writer_id, process_started_at, last_success_at, last_failure_at, "
+        "failures_total, max_consecutive_failures, dirty_rows, stopped_at, "
+        "updated_at",
+    ),
 }
 
 # 每表可选的辖区 WHERE 子句：不满足的行完全不归本 reconciler 管——既不 copy、

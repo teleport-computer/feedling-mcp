@@ -16,7 +16,11 @@ def _scripts(tree: str) -> ScriptDirectory:
 
 def test_rds_pre_and_test_heads_converge():
     script = _scripts("alembic")
-    assert script.get_heads() == ["0095_trace_write_stats"]
+    assert script.get_heads() == ["0096_trace_write_stats_health"]
+    assert (
+        script.get_revision("0096_trace_write_stats_health").down_revision
+        == "0095_trace_write_stats"
+    )
     assert (
         script.get_revision("0095_trace_write_stats").down_revision
         == "0094_chat_daily_rollup"
@@ -57,7 +61,11 @@ def test_rds_pre_and_test_heads_converge():
 
 def test_tee_chain_carries_test_runtime_schema():
     script = _scripts("alembic_tee")
-    assert script.get_heads() == ["0027_trace_write_stats"]
+    assert script.get_heads() == ["0028_trace_write_stats_health"]
+    assert (
+        script.get_revision("0028_trace_write_stats_health").down_revision
+        == "0027_trace_write_stats"
+    )
     assert (
         script.get_revision("0027_trace_write_stats").down_revision
         == "0026_chat_daily_rollup"
@@ -140,4 +148,8 @@ def test_tee_migrations_reuse_the_rds_contract_sql():
     assert (
         tee.get_revision("0027_trace_write_stats").module._UP
         == rds.get_revision("0095_trace_write_stats").module._UP
+    )
+    assert (
+        tee.get_revision("0028_trace_write_stats_health").module._UP
+        == rds.get_revision("0096_trace_write_stats_health").module._UP
     )

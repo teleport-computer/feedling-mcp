@@ -40,21 +40,39 @@ must apply measured storage overhead.
 
 An abnormal process exit can lose both queued events and their unflushed
 counters. No counter inside that same process can measure its own death. The
-report states this limitation explicitly; deployment/process liveness must be
-used to identify the unknown time window.
+report states this limitation explicitly and detects its boundary from a
+separate per-writer success heartbeat. Active writers refresh
+`last_success_at` every 60 seconds even when idle. A graceful exit writes
+`stopped_at`; a crash or persistent database failure cannot refresh the row and
+therefore becomes `stale` after three missed heartbeats without needing the
+failing path to publish "I failed".
+
+The health row also carries cumulative failures, the largest recovered failure
+streak, the most recent failure time, and a durable drain acknowledgement.
+A successful production flush writes `dirty_rows=0`; non-zero in-memory backlog
+during a database failure is visible only in the writer's local warning and
+`trace_stats_health()`, because the failing channel cannot durably report it.
+Once the success heartbeat is stale, the report therefore returns
+`dirty_rows=null` / `unknown_stale` instead of presenting the last stored zero
+as current evidence.
 
 ## Capacity decision rule
 
 Run `scripts/trace-write-rate-report.py --days 7` against test. `--days` changes
 only the displayed detail window; it cannot weaken the readiness gate. The
 report marks itself ready only after at least 168 hours since its first
-persisted sample. It returns:
+persisted sample **and** only when every writer overlapping the seven-day
+measurement window has a registered, non-stale heartbeat (or a graceful stop).
+It returns:
 
 - confirmed daily totals (`persisted_*`);
 - a conservative daily observation (`persisted + known_drop + at_risk`), where
   at-risk may overlap persisted because its outcome is unknown;
 - the day with the largest conservative byte total, broken down by lane,
   subsystem, and event type.
+- every writer's success-heartbeat age, failure history, durable drain
+  acknowledgement (or an explicit stale/unknown marker), and graceful-stop
+  state.
 
 Capacity planning uses that observed daily peak, never the seven-day average.
 The measurement remains a lower bound with respect to any externally observed
