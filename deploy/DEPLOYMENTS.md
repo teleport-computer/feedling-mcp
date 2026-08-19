@@ -236,6 +236,7 @@ certificate-chain 与 hostname 验证；不得改成 unverified context、`verif
 | Attestation | `https://9798850e096d770293c67305c6cfdceed68c1d28-5003s.dstack-pha-prod9.phala.network/attestation` |
 | WS ingest | `wss://9798850e096d770293c67305c6cfdceed68c1d28-9998.dstack-pha-prod9.phala.network/ingest` |
 | TLS model | `api.feedling.app` terminates at `dstack-ingress`; `/attestation` keeps its own dstack-KMS-derived TLS on `:5003` for iOS pinning. |
+| Database promotion wiring | The staged production workflow defaults `PROD_FEEDLING_DATABASE_SCHEMA` to `rds` and forwards the same selector to the backend, in-CVM `serve-worker`, and every independent runner. Selecting `tee` is fail-closed before any CVM mutation: CI requires the owner migration DSN and CA, proves the owner/app DSNs target the same database, requires the deployed `DATABASE_URL` role to be `app`, checks the exact `alembic_tee` head, and runs the Phase-4 startup contract. `PROD_TEE_DATABASE_URL` and `PROD_FEEDLING_TEE_DUAL_WRITE` must both be empty in primary mode. This row describes release wiring, not evidence that the live production database has already been promoted. |
 | MCP pubkey pin | Retired in prod9 architecture: `mcp_tls_cert_pubkey_fingerprint_hex` is empty by design; content-layer envelopes sealed to `enclave_content_pk` are the privacy boundary. |
 | **Enclave content pk** | `2d642ec1f54719d8c6088e8cbaf394961cb804a533bd4d7366d48d1d543f5620` — **THE prod9 content-key baseline.** Verified against live `/attestation` 2026-07-03. Envelope `enclave_pk_fpr` = `sha256(pk)[:16]` = `50f9a01800d4a230de85507d25b86eb1`, a constant stamped on envelopes April→July → the enclave content key has **never changed**. ⚠️ Do NOT confuse with the retired prod5 value `f50c90f7…` (app `051a174f`) that still appears in the Phase A/B tables below — that is a different, dead CVM and is NOT this baseline. |
 | mr-kms | `692afc6d7a86a32cfc1ebd9cad1a576aab012bab46986ba609bc8d6407270572` (live `/attestation` 2026-07-03) |
@@ -266,7 +267,8 @@ python tools/verify_enclave_domain.py \
 | Release/source topology | The staged `deploy/docker-compose.phala.test.yaml` definition has `ingress`, `backend`, `enclave`, `enclave-domain`, `serve-worker`, `cpu-socket-proxy`, and `cpu-recorder`; this source row is not evidence that the custom domain or CPU recorder has been deployed or is live. |
 | Public API | `https://test-api.feedling.app` (via dstack-ingress — live, `/healthz` 200) |
 | Public MCP | 已下线（FastMCP 服务器 2026-06-12 移除） |
-| Database | Dedicated test RDS `feedling-mcp-test-t4g-micro.cgh0oucoe0x9.us-east-1.rds.amazonaws.com:5432/postgres` — fully isolated from prod (separate instance → separate `enclave_content_pk` self-consistent, no shared schema). Injected via `TEST_DATABASE_URL`. |
+| Database | **TEE primary is live since 2026-08-18**, promoted by test release [`82c4c019`](https://github.com/teleport-computer/feedling-mcp/commit/82c4c019da24e6bfbe47d05411c0f812bf519ae7). `TEST_DATABASE_URL` is the TEE `app`-role DSN shared by the main CVM and runner, `TEST_FEEDLING_DATABASE_SCHEMA=tee`, and the old dual-write secret is absent. CI verified the owner/app database fingerprint, `alembic_tee` head, and application startup contract before changing either CVM. The former RDS is a frozen pre-cutover snapshot only; after the first TEE-primary write it is not a lossless rollback target without reverse reconciliation. |
+| Content shape | `FEEDLING_PLAINTEXT_WRITES_ACCEPTED=1` is set on the backend, in-CVM `serve-worker`, and independent runner. Known users whose preference is unset or `off` create plaintext rows; explicit `on` and unknown users remain encrypted. Historical ciphertext remains supported and is not rewritten by this deployment switch. |
 | On-chain | **Separate** Sepolia FeedlingAppAuth `0x9AC034AAEf6Bb80690Be4d1f698b51796Bb7F2D5` (owner = the `ETH_DEPLOYER_KEY` address `0xa0eBcd26…`, so the CI `addComposeHash` is authorized), kept apart from prod's contract so the prod release log stays clean. Address lives in repo var `TEST_FEEDLING_APP_AUTH_CONTRACT`. Each `deploy-test-cvm` run publishes the live compose_hash here, fail-loud, same as prod. Deployed 2026-06-09 via a one-shot `workflow_dispatch` (since removed). |
 | Deploy path | GitHub Actions `deploy-test-cvm` job (in `ci.yml`) on push to the `test` branch. Mirrors prod but targets the test compose / CVM / DB / contract and is branch-gated to `refs/heads/test`. |
 | First-boot note | The CVM was first created 2026-06-09 WITHOUT a CF token (to mint the app_id quickly), so `dstack-ingress` couldn't issue the `test-*.feedling.app` LE certs initially. The `test`-branch CI deploy injects `CF_*` from GitHub secrets — domains + certs are now live. Backend also needed the test RDS reachable from the CVM (Publicly accessible + SG inbound 5432) before it stopped crash-looping. |
@@ -320,7 +322,7 @@ only the Python Runtime V2 `serve-worker`.
 | Created | 2026-07-02 as `feedling-io-agents-test`, `tdx.small`, **Phala KMS** (prod9). Provisioned locally via `phala deploy` (no `--cvm-id` ⇒ new app) pinned to `feedling-agent-runner:ab78491` with only the non-secret cross-CVM env (`FEEDLING_API_URL` / `FEEDLING_ENCLAVE_URL` / `AGENT_MAX_CHILDREN`). The **healthy, secret-bearing** deploy + on-chain compose_hash auth are done by the CI `deploy-test-runner-cvm` job (it holds `TEST_DATABASE_URL` / `TEST_FEEDLING_RUNTIME_TOKEN_SECRET` / `ETH_DEPLOYER_KEY`), which `phala deploy --cvm-id`s this same CVM in place. |
 | Compose | `deploy/docker-compose.phala.runner.yaml` — exactly one `serve-worker`; no resident service, CLI toolchain, per-user process, data volume, lease, or checkpoint. Genesis runs on the worker's dedicated thread and claims from PostgreSQL. |
 | Runtime | `backend/model_api_runtime/v2/serve_worker.py`; chat jobs coordinate through `FOR UPDATE SKIP LOCKED`, and worker liveness is published in `v2_worker_heartbeats`. |
-| Shares w/ main test CVM | same test RDS (`TEST_DATABASE_URL`), same `FEEDLING_RUNTIME_TOKEN_SECRET`, same Sepolia FeedlingAppAuth `0x9AC0…` (runner publishes its OWN compose_hash there — harmless; iOS audit card only checks the MAIN app's hashes) |
+| Shares w/ main test CVM | same primary DSN (`TEST_DATABASE_URL`) and schema selector (`TEST_FEEDLING_DATABASE_SCHEMA`), same `FEEDLING_RUNTIME_TOKEN_SECRET`, same Sepolia FeedlingAppAuth `0x9AC0…` (runner publishes its OWN compose_hash there — harmless; iOS audit card only checks the MAIN app's hashes) |
 | Cross-CVM reach | `FEEDLING_API_URL=https://test-api.feedling.app`; `FEEDLING_ENCLAVE_URL=https://173c7f49…-5003s.dstack-pha-prod9.phala.network` (main enclave passthrough, in-enclave TLS, `verify=False`) |
 | Deploy path | Mandatory CI `deploy-test-runner-cvm` job after every hosted/CVM-affecting `test` deployment. |
 | Status | V2-only source topology. A dead pool fails chat before persistence with `workers_unavailable`; there is no resident fallback selector. |
@@ -348,10 +350,9 @@ in test, pre, and production.
 | Deploy path | CI `deploy-pre-cvm` job (in `ci.yml`) on push to the `pre` branch. Clone of `deploy-test-cvm` with pre compose / CVM / DB / contract, branch-gated to `refs/heads/pre`. |
 
 The pre backend sets `FEEDLING_PLAINTEXT_WRITES_ACCEPTED=1` to exercise PR #131's
-per-user plaintext tier. The code default is closed and the test/prod manifests
-intentionally omit the variable, so merging the implementation cannot enable
-plaintext writes outside pre. Unknown users and users whose effective preference
-is `on` still write encrypted envelopes.
+per-user plaintext tier. Test also opens the gate after its TEE-primary promotion;
+production remains closed by default. Unknown users and users whose effective
+preference is `on` still write encrypted envelopes.
 | Baseline | Set repo var `PRE_ENCLAVE_CONTENT_PK_BASELINE` from a manual `/attestation` read after the first healthy deploy (the attestation gate is inert until then). |
 
 部署后从仓库根目录验证 pre 自定义 enclave 域名的 live ingress evidence；
@@ -418,7 +419,7 @@ Mirror of the V2-only test worker CVM for the pre environment.
 |---|---|
 | CVM IDs | One independent worker CVM per non-comment line in `deploy/prod-runner-cvm-ids.txt`; at least two distinct IDs are a hard CI precondition |
 | Compose | `deploy/docker-compose.phala.prod.runner.yaml` — exactly one pooled `serve-worker` per CVM |
-| Shared control plane | Production `DATABASE_URL`, `FEEDLING_RUNTIME_TOKEN_SECRET`, main API URL, and main enclave URL |
+| Shared control plane | Production `DATABASE_URL`, `PROD_FEEDLING_DATABASE_SCHEMA`, `FEEDLING_RUNTIME_TOKEN_SECRET`, main API URL, and main enclave URL. The main CVM and every runner must receive the same database URL/schema pair. |
 | Deploy path | Mandatory CI `deploy-prod-runner-cvm`; the same image and compose are rolled across every listed CVM |
 | Application identity | CI injects `FEEDLING_V2_RUNNER_CVM_ID=<target CVM>` and `FEEDLING_V2_DEPLOYED_BUILD=<exact 7-char image build>`; production `serve-worker` fails closed on missing/mismatched values |
 | Post-deploy proof | After outliving old heartbeat freshness, CI requires a positive-capacity turn heartbeat and matching Genesis heartbeat for every exact inventory CVM/build identity, plus fully reconciled `v2_only` policy |

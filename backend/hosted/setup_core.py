@@ -1439,9 +1439,11 @@ def vision_route_configure(
     )
     route_id = str(route.get("id") or "")
     if selected_status != 200 and route_id not in route_ids_before:
-        if str(payload.get("credential_id") or "").strip():
-            db.model_api_route_delete(store.user_id, route_id)
-        else:
+        # 显式删路线,别指望凭据外键级联(tee schema 的 routes 表没有 credential
+        # 外键;漏删会留下一条 JOIN 不出来、用户删不掉的僵尸路线)。贴新 key 时
+        # 凭据是本请求新建的,一并回收;复用的凭据别的路线可能还在引用,不动。
+        db.model_api_route_delete(store.user_id, route_id)
+        if not str(payload.get("credential_id") or "").strip():
             credential_id = str(route.get("credential_id") or "")
             if credential_id:
                 db.model_api_credential_delete(store.user_id, credential_id)
@@ -1542,9 +1544,9 @@ def image_generation_route_configure(
     )
     route_id = str(route.get("id") or "")
     if selected_status != 200 and route_id not in route_ids_before:
-        if str(payload.get("credential_id") or "").strip():
-            db.model_api_route_delete(store.user_id, route_id)
-        else:
+        # 同 vision_route_configure:显式删路线 + 只回收本请求新建的凭据。
+        db.model_api_route_delete(store.user_id, route_id)
+        if not str(payload.get("credential_id") or "").strip():
             credential_id = str(route.get("credential_id") or "")
             if credential_id:
                 db.model_api_credential_delete(store.user_id, credential_id)

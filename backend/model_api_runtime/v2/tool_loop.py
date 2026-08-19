@@ -15,6 +15,7 @@ from capabilities import tool_schema
 from core import protocol_leak
 from model_api_runtime.v2 import prompt_frontier
 from model_api_runtime.v2 import provenance
+from model_api_runtime.v2 import tool_surface
 import provider_client
 
 
@@ -542,6 +543,7 @@ async def run_tool_loop(
     build_messages,
     dispatch_tools,
     on_reply,
+    on_promote_last_intermediate=None,
     fold_new_messages,
     add_usage,
     max_calls: int,
@@ -555,6 +557,11 @@ async def run_tool_loop(
     on_trajectory_event=None,
     extra_tool_specs=None,
     refresh_extra_tool_specs=None,
+    refresh_pressure_collapsed_extra_tool_specs=None,
+    refresh_protected_extra_tool_names=None,
+    extra_tool_recovery_name: str = "",
+    extra_tool_recovery_active=None,
+    on_extra_tool_surface_plan=None,
     extra_mutating_tool_names=None,
     disabled_tool_names=None,
     # Wake turns retain memory add/update but must never be offered delete.
@@ -612,6 +619,11 @@ async def run_tool_loop(
     prompt_safety_margin_tokens: int | None = None,
     prompt_estimator_utf8_bytes_per_token: float = prompt_frontier.DEFAULT_ESTIMATOR_UTF8_BYTES_PER_TOKEN,
     prompt_image_reserve_tokens: int = prompt_frontier.DEFAULT_IMAGE_RESERVE_TOKENS,
+    # Chat passes its configured policy explicitly. Other lanes retain the
+    # pressure-only behavior until they own a schema-search recovery state.
+    tool_schema_collapse_policy: str = (
+        tool_surface.COLLAPSE_POLICY_UNDER_PRESSURE
+    ),
     on_tail_window=None,
     on_prompt_frontier_exhaustion=None,
     on_prompt_frontier_exhausted_detail=None,
@@ -641,6 +653,12 @@ async def run_tool_loop(
     publishing, then either publish the accepted rewrite or return
     :class:`FinalReplyCorrectionRejected`.  The loop gives that request exactly one
     text-only provider call and otherwise republishes the original fail-open.
+
+    Foreground Chat may also provide ``on_promote_last_intermediate``.  It is
+    consulted only after the existing one-shot semantic-empty recovery has
+    already been consumed.  A true result means the caller atomically closed
+    the turn through a previously published reply bubble; false preserves the
+    ordinary empty-reply failure.
 
     ``on_file_reply`` is an optional async chat-lane callback. When absent, the
     ``send_file`` tool is removed from the offered catalog. Production resolves
@@ -1116,7 +1134,11 @@ async def run_tool_loop(
             and not requirement_already_met
         ):
             # Keep the recovery path narrow enough for weaker tool-using models.
-            tools = [spec for spec in tools if spec.name in _FILE_DELIVERY_TOOLS]
+            tools = [
+                spec for spec in tools
+                if spec.name in _FILE_DELIVERY_TOOLS
+                or spec.name == extra_tool_recovery_name
+            ]
             surface_reason = "file_delivery_forced"
             if file_delivery_recovery_needed:
                 forced_delivery_tool = (
@@ -1124,13 +1146,53 @@ async def run_tool_loop(
                     if workspace_write_applied
                     else "workspace_write"
                 )
-                tools = [spec for spec in tools if spec.name == forced_delivery_tool]
+                tools = [
+                    spec for spec in tools
+                    if spec.name in {
+                        forced_delivery_tool,
+                        extra_tool_recovery_name,
+                    }
+                ]
         tail_window = None
         required_schema_names = (
             historical_tool_names
             if terminal_schema_guard
             else completed_memory_discovery_tools
         )
+        if forced_delivery_tool:
+            required_schema_names = set(required_schema_names) | {
+                forced_delivery_tool
+            }
+        pressure_collapsed_specs = {}
+        if refresh_pressure_collapsed_extra_tool_specs is not None:
+            try:
+                pressure_collapsed_specs = {
+                    str(name): spec
+                    for name, spec in dict(
+                        refresh_pressure_collapsed_extra_tool_specs() or {}
+                    ).items()
+                    if str(name)
+                }
+            except Exception:
+                pressure_collapsed_specs = {}
+        protected_extra_names: set[str] = set()
+        if refresh_protected_extra_tool_names is not None:
+            try:
+                protected_extra_names = {
+                    str(name)
+                    for name in (
+                        refresh_protected_extra_tool_names() or ()
+                    )
+                    if str(name)
+                }
+            except Exception:
+                protected_extra_names = set()
+        recovery_active = False
+        if extra_tool_recovery_active is not None:
+            try:
+                recovery_active = bool(extra_tool_recovery_active())
+            except Exception:
+                recovery_active = False
         adaptive_planner = getattr(build_messages, "plan_provider_round", None)
         try:
             if callable(adaptive_planner):
@@ -1138,6 +1200,11 @@ async def run_tool_loop(
                     transcript=list(transcript),
                     tools=tools,
                     required_tool_names=required_schema_names,
+                    protected_tool_names=protected_extra_names,
+                    collapsed_tool_specs=pressure_collapsed_specs,
+                    recovery_tool_name=extra_tool_recovery_name,
+                    recovery_tool_active=recovery_active,
+                    tool_schema_collapse_policy=tool_schema_collapse_policy,
                     model_limit=model_prompt_limit,
                     output_reserve_tokens=prompt_output_reserve_tokens,
                     safety_margin_tokens=prompt_safety_margin_tokens,
@@ -1151,6 +1218,11 @@ async def run_tool_loop(
                     messages=messages,
                     tools=tools,
                     required_tool_names=required_schema_names,
+                    protected_tool_names=protected_extra_names,
+                    collapsed_tool_specs=pressure_collapsed_specs,
+                    recovery_tool_name=extra_tool_recovery_name,
+                    recovery_tool_active=recovery_active,
+                    tool_schema_collapse_policy=tool_schema_collapse_policy,
                     output_reserve_tokens=prompt_output_reserve_tokens,
                     safety_margin_tokens=prompt_safety_margin_tokens,
                     utf8_bytes_per_token=prompt_estimator_utf8_bytes_per_token,
@@ -1181,13 +1253,40 @@ async def run_tool_loop(
         planned_offered_tool_names = tuple(
             getattr(frontier_plan, "offered_tool_names", ()) or ()
         )
+        if (
+            extra_tool_recovery_name
+            and not getattr(
+                frontier_plan,
+                "schema_recovery_needed",
+                getattr(frontier_plan, "mcp_recovery_needed", False),
+            )
+        ):
+            surface_candidate_tools = [
+                spec for spec in surface_candidate_tools
+                if spec.name != extra_tool_recovery_name
+            ]
         if planned_offered_tool_names:
             included_tool_names = set(planned_tool_names)
+            pressure_collapsed_names = set(
+                getattr(
+                    frontier_plan,
+                    "pressure_collapsed_tool_names",
+                    (),
+                )
+                or ()
+            )
             tools = [
-                spec
+                pressure_collapsed_specs.get(
+                    spec.name,
+                    tool_surface.collapsed_tool_spec(spec),
+                )
+                if spec.name in pressure_collapsed_names
+                else spec
                 for spec in (tools or [])
                 if spec.name in included_tool_names
             ] or None
+            if pressure_collapsed_names and not surface_reason:
+                surface_reason = "frontier_collapsed"
             if (
                 not surface_reason
                 and len(tools or []) < len(surface_candidate_tools)
@@ -1209,6 +1308,21 @@ async def run_tool_loop(
                 and len(tools or []) < len(surface_candidate_tools)
             ):
                 surface_reason = "frontier_omitted"
+        if on_extra_tool_surface_plan is not None:
+            planned = on_extra_tool_surface_plan(
+                {
+                    "pressure_collapsed_names": tuple(
+                        getattr(
+                            frontier_plan,
+                            "pressure_collapsed_tool_names",
+                            (),
+                        )
+                        or ()
+                    ),
+                }
+            )
+            if inspect.isawaitable(planned):
+                await planned
         if before_provider_call is not None:
             before_provider_call()
         if tagged_image_fallback_active:
@@ -1591,6 +1705,11 @@ async def run_tool_loop(
                 and not empty_response_recovery_used
                 and attempts < max_calls - 1
             )
+            can_attempt_promotion = bool(
+                on_promote_last_intermediate is not None
+                and empty_response_recovery_used
+                and not upstream_response_envelope
+            )
             await _trajectory(
                 "empty_provider_response",
                 {
@@ -1604,7 +1723,11 @@ async def run_tool_loop(
                     "action": (
                         "semantic_correction"
                         if can_correct
-                        else "fail_provider_empty_reply"
+                        else (
+                            "promote_intermediate_or_fail"
+                            if can_attempt_promotion
+                            else "fail_provider_empty_reply"
+                        )
                     ),
                 },
             )
@@ -1624,6 +1747,31 @@ async def run_tool_loop(
                 seen_reasoning_fragments.clear()
                 _progress("empty_response_retry_boundary")
                 continue
+            if can_attempt_promotion:
+                try:
+                    promoted = await on_promote_last_intermediate()
+                except FinalReplySuperseded:
+                    reasoning_fragments.clear()
+                    seen_reasoning_fragments.clear()
+                    _progress("final_reply_superseded")
+                    await _trajectory(
+                        "final_reply_superseded",
+                        {"round": attempts, "source": "intermediate_promotion"},
+                    )
+                    if attempts < max_calls:
+                        continue
+                    return LoopOutcome(
+                        "", attempts, "input_advanced", replied_intermediate
+                    )
+                if promoted:
+                    replied_intermediate = True
+                    await _trajectory(
+                        "intermediate_reply_promoted",
+                        {"round": attempts},
+                    )
+                    return LoopOutcome(
+                        "", attempts, "intermediate_promoted", True
+                    )
             exc = ProviderEmptyReply("empty_reply")
             if on_provider_failure is not None:
                 try:

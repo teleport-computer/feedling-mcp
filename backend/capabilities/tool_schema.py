@@ -714,8 +714,9 @@ DESCRIPTIONS: dict[str, str] = {
     REPLY_TOOL: (
         "Send an immediate reply bubble to the user with the given text during a "
         "long-running task when timely progress feedback is useful. This bubble is "
-        "not the final reply, does not need and must not include <think>, and must "
-        "not replace the final reply."
+        "sent without <think>. If it already says everything you need to say, end "
+        "the turn with no additional visible text and do not repeat it. Continue "
+        "to a final visible answer only when you still have new content for the user."
     ),
     STAY_SILENT_TOOL: (
         "Choose not to send a proactive message on this wake. Give one short, "
@@ -762,10 +763,10 @@ DESCRIPTIONS: dict[str, str] = {
         "turn merge cards directly."
     ),
     MCP_TOOL_SEARCH_TOOL: (
-        "Load complete argument schemas for user-connected MCP tools whose names "
-        "and short descriptions are already visible. Provide either a search query "
-        "or exact qualified tool names. After this returns, call a resolved tool in "
-        "a later round using its newly available parameters."
+        "Non-resident platform tools and connected MCP tools may show shortened "
+        "schemas under context pressure. Search them by capability query or exact "
+        "tool name to load complete argument schemas. After this returns, call a "
+        "resolved tool in a later round using its newly available parameters."
     ),
 }
 

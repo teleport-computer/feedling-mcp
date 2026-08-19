@@ -73,6 +73,7 @@ services:
       # runner CVMs (each also 0 -> any one can hold the whole fleet).
       AGENT_MAX_CHILDREN: "${AGENT_MAX_CHILDREN:-0}"
       DATABASE_URL: "${DATABASE_URL:-}"
+      FEEDLING_DATABASE_SCHEMA: "${FEEDLING_DATABASE_SCHEMA:-rds}"
       # Resident photo tools resolve the same R2-backed frame pointers as V2.
       R2_ENDPOINT: "${R2_ENDPOINT:-}"
       R2_ACCESS_KEY_ID: "${R2_ACCESS_KEY_ID:-}"

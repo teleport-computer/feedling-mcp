@@ -208,8 +208,8 @@ def test_plaintext_write_gate_defaults_closed():
     assert core_envelope._plaintext_writes_accepted({key: " 1 "}) is True
 
 
-def test_pre_processes_share_the_plaintext_gate_and_other_envs_stay_closed():
-    """Every Pre reply writer must agree with whoami; test/prod stay closed."""
+def test_pre_and_test_processes_share_the_plaintext_gate_and_prod_stays_closed():
+    """Every Pre/Test reply writer must agree with whoami; prod stays closed."""
     from pathlib import Path
 
     import yaml
@@ -219,7 +219,9 @@ def test_pre_processes_share_the_plaintext_gate_and_other_envs_stay_closed():
     pre = (root / "deploy/docker-compose.phala.pre.yaml").read_text()
     pre_runner = (root / "deploy/docker-compose.phala.pre.runner.yaml").read_text()
     test = (root / "deploy/docker-compose.phala.test.yaml").read_text()
+    test_runner = (root / "deploy/docker-compose.phala.runner.yaml").read_text()
     prod = (root / "deploy/docker-compose.phala.yaml").read_text()
+    prod_runner = (root / "deploy/docker-compose.phala.prod.runner.yaml").read_text()
 
     pre_compose = yaml.safe_load(pre)
     for service in ("backend", "serve-worker"):
@@ -229,8 +231,30 @@ def test_pre_processes_share_the_plaintext_gate_and_other_envs_stay_closed():
     ] == "1"
     runner_compose = yaml.safe_load(pre_runner)
     assert runner_compose["x-agent-runner-env"][key] == "1"
-    assert key not in test
+    test_compose = yaml.safe_load(test)
+    for service in ("backend", "serve-worker"):
+        assert test_compose["services"][service]["environment"][key] == "1"
+    test_runner_compose = yaml.safe_load(test_runner)
+    assert test_runner_compose["x-agent-runner-env"][key] == "1"
     assert key not in prod
+    assert key not in prod_runner
+
+
+def test_test_runner_deploy_verifies_the_live_plaintext_gate_release_unit():
+    """CI must not report success while either TEST CVM has the old gate."""
+    from pathlib import Path
+
+    workflow = (
+        Path(__file__).resolve().parents[1] / ".github/workflows/ci.yml"
+    ).read_text()
+    runner_job = workflow.split("\n  deploy-test-runner-cvm:\n", 1)[1].split(
+        "\n  deploy-pre-cvm:\n", 1
+    )[0]
+
+    assert "Verify live TEST plaintext gate release unit" in runner_job
+    assert "deploy/test-cvm-id.txt" in runner_job
+    for container in ("feedling-test-backend-1", "serve-worker", "agent-runner"):
+        assert container in runner_job
 
 
 def test_effective_follows_intent_once_plaintext_writes_are_accepted(uid, monkeypatch):

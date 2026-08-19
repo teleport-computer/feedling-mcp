@@ -47,6 +47,15 @@
 
 ## 记录正文（最新的在上面）
 
+## 2026-08-19 — TEST 打开按用户明文内容档
+
+**[DONE] test backend、主 serve-worker 与独立 runner 统一打开明文写入闸。**
+
+- 未设置或显式 `off` 的已知用户新写入走 `body` / `body_b64` 明文形状；显式
+  `on` 和未知用户继续加密，production 仍保持关闭。
+- 本次只改变新写入，不改写历史密文；混合形状读侧与 enclave 兼容路径保留。
+- 部署契约测试锁定三类 test 写入进程必须使用相同闸值，避免 worker 漂移回密文。
+
 ## 2026-08-14 — Runtime V2 profile 失败可自动持久恢复
 
 **[DONE] profile retry 不再依赖用户下一轮 Chat，且不挤占前台或触发 watchdog 误杀。**

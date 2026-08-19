@@ -66,6 +66,18 @@ TABLES: dict[str, tuple[tuple[str, ...], str]] = {
         "id, auth_token, push_type, target_token, apns_env, status, err_msg, "
         "content, created_at, updated_at",
     ),
+    # 冻结格子（0091 / tee 0023）。写侧是 execute_many 按日整组 best-effort
+    # 镜像；本 reconciler 是漏写后的扶正通道（格子写后不变、语句幂等，按 PK
+    # 对齐即收敛）。
+    "lane_daily_rollup": (
+        ("user_id", "day", "route", "lane", "enqueue_source"),
+        "user_id, day, route, lane, enqueue_source, completed, failed, "
+        "expired, superseded, failure_codes, frozen_at",
+    ),
+    "lane_rollup_watermark": (
+        ("route",),
+        "route, backfill_from, through_day, frozen_at",
+    ),
 }
 
 # 每表可选的辖区 WHERE 子句：不满足的行完全不归本 reconciler 管——既不 copy、
