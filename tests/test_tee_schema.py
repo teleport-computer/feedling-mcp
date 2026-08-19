@@ -59,15 +59,6 @@ def _derived_check_debt(source_name: str, revision: str) -> _KnownConstraintDiff
     )
 
 
-def _lane_check_debt(source_name: str) -> _KnownConstraintDifference:
-    return _known(
-        source_name,
-        cause="T149/external: RDS 0091 vs TEE 0023; owned by claude2's lane-rollup repair",
-        remediation="land the separately reviewed idempotent TEE lane-rollup CHECK migration",
-        removal_condition="the claude2 migration lands and this entry has become stale",
-    )
-
-
 _KNOWN_MISSING_TEE_DEBT: dict[_DifferenceKey, _KnownConstraintDifference] = {
     _difference_key("chat_r2_cleanup", "c", "CHECK (attempt_count >= 0)"):
         _derived_check_debt("chat_r2_cleanup_attempt_count_check", "0036_chat_r2_lifecycle"),
@@ -174,22 +165,6 @@ _KNOWN_MISSING_TEE_DEBT: dict[_DifferenceKey, _KnownConstraintDifference] = {
     ): _derived_check_debt("v2_user_allowlist_desired_check", "0052_dual_runtime_coexistence"),
     _difference_key("v2_worker_heartbeats", "c", "CHECK (capacity >= 0)"):
         _derived_check_debt("v2_worker_heartbeats_capacity_check", "0024_v2_worker_capacity"),
-    _difference_key(
-        "lane_daily_rollup", "c",
-        "CHECK (completed >= 0 AND failed >= 0 AND expired >= 0 AND superseded >= 0)",
-    ): _lane_check_debt("lane_daily_rollup_counts_nonneg"),
-    _difference_key(
-        "lane_daily_rollup", "c",
-        "CHECK (day ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}$'::text)",
-    ): _lane_check_debt("lane_daily_rollup_day_format"),
-    _difference_key(
-        "lane_rollup_watermark", "c",
-        "CHECK (backfill_from ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}$'::text)",
-    ): _lane_check_debt("lane_rollup_watermark_from_format"),
-    _difference_key(
-        "lane_rollup_watermark", "c",
-        "CHECK (through_day ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}$'::text)",
-    ): _lane_check_debt("lane_rollup_watermark_through_format"),
 }
 
 
