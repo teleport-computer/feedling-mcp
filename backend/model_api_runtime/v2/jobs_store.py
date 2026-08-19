@@ -806,8 +806,17 @@ def preempt_active_for_chat_on_cursor(
             # 不安全的 scheduled 也要背上交付义务:它是「到点交付」,失败必须
             # 让用户看见。普通抢占(pristine 的其它 lane)只是让位,没有失败可言。
             unsafe_scheduled = lane == "scheduled"
+            # 终态用 `expired` 而不是 `superseded`:它不是「被新版本替代」,
+            # 是**因重放不安全而终态失败**。这个区分不是措辞 ——
+            # `_queue_failure_review_on_cursor` 的 INSERT 明确只接受
+            # `status IN ('failed','expired')`,写成 superseded 时它会静默
+            # 返回 False,复核根本没排进去(codex 复核抓出,我的测试当时只断
+            # 了失败 outbox 没断复核行,所以是个假闭环)。
+            # 普通让位(pristine 的其它 lane)仍然是 superseded:那确实只是让位。
             cur.execute(
-                "UPDATE agent_jobs SET status='superseded', finished_at=now(), "
+                "UPDATE agent_jobs SET status="
+                + ("'expired'" if unsafe_scheduled else "'superseded'")
+                + ", finished_at=now(), "
                 "last_error=" + (
                     "CASE WHEN EXISTS ("
                     "  SELECT 1 FROM v2_mcp_mutation_attempts a "
@@ -2078,6 +2087,20 @@ def recover_killed_job(
                         cur, int(job_id)
                     )
                     _queue_failure_review_on_cursor(cur, int(job_id))
+                    # ⚠️ 这里**刻意不建后继 job** 承接未消费的 perception wake
+                    # context。那些行按 `agent_job_id` 绑在这个已终结的 job 上,
+                    # 从此只用于审计与后续 trim,不会被任何 worker 消费。
+                    #
+                    # 看起来像「漏交付」,但转移是不安全的:watchdog 杀进程时
+                    # **没有持久化的 `consumed_context_seq`**,因此无法区分哪些
+                    # context 已经进过 prompt、甚至已经因果地产生了那条 durable
+                    # 或远端写。把它们交给后继 = 同一份感知输入再驱动一次写,
+                    # 正好绕回本分支要堵的洞。晚到且确实未消费的行可能是安全的,
+                    # 但当前 schema 证明不了;证不了就必须按已消费处理。
+                    #
+                    # 想无损转移,先把「写动作所见的 perception context 水位」
+                    # 持久化进 attempt/effect —— 那是另一件事,不能在这里猜。
+                    # 后台复盘由上面那条 failure review 承担。
                 else:
                     recovery = "requeued"
                     cur.execute(

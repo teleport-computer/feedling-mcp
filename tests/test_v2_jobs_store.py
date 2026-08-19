@@ -2965,7 +2965,9 @@ def test_foreground_chat_preempt_terminalizes_a_scheduled_job_that_wrote():
     assert [p.lane for p in preempted] == ["scheduled"]
     assert preempted[0].recovery == "terminal"
     status, _attempts, last_error = _job_row(job_id)
-    assert status == "superseded"
+    # `expired` 而不是 `superseded`:重放不安全是终态失败,不是被新版本替代 ——
+    # 而且 failure review 的 INSERT 只认 failed/expired。
+    assert status == "expired"
     assert last_error == "foreground_chat_preempted"
 
 
@@ -3004,6 +3006,16 @@ def test_foreground_chat_preempt_still_requeues_capture_that_wrote():
     assert status == "pending"
 
 
+def _pending_reviews(job_id: int):
+    with db.get_pool().connection() as conn:
+        return [
+            row[0] for row in conn.execute(
+                "SELECT status FROM v2_trajectory_reviews WHERE source_job_id=%s",
+                (job_id,),
+            ).fetchall()
+        ]
+
+
 def _terminal_outbox(job_id: int):
     with db.get_pool().connection() as conn:
         return conn.execute(
@@ -3035,6 +3047,13 @@ def test_preempt_unsafe_scheduled_keeps_its_delivery_obligation():
 
     assert [p.recovery for p in preempted] == ["terminal"]
     assert _terminal_outbox(job_id) == ("foreground_chat_preempted",)
+    # ⚠️ 只断失败 outbox 是不够的:`_queue_failure_review_on_cursor` 的 INSERT
+    # 只接受 `status IN ('failed','expired')`,行写成 superseded 时它会**静默
+    # 返回 False** —— 调用在、复核没排上,而上面那条断言照样绿。
+    # 必须直接断复核行本身。
+    status, _attempts, _err = _job_row(job_id)
+    assert status == "expired"
+    assert _pending_reviews(job_id) == ["pending"]
 
 
 def test_preempt_unsafe_scheduled_closes_out_a_dangling_mcp_attempt():
@@ -3069,6 +3088,7 @@ def test_preempt_unsafe_scheduled_closes_out_a_dangling_mcp_attempt():
         ]
     assert outcomes == ["unknown"]
     assert jobs_store.has_ambiguous_mcp_mutation(job_id=job_id) is True
+    assert _pending_reviews(job_id) == ["pending"]
 
 
 @pytest.mark.parametrize("lane", ["scheduled", "capture"])
@@ -3085,6 +3105,7 @@ def test_preempt_pristine_job_creates_no_failure_obligation(lane):
 
     assert [p.recovery for p in preempted] == ["requeued"]
     assert _terminal_outbox(job_id) is None
+    assert _pending_reviews(job_id) == []
 
 
 def test_effect_enqueue_fence_refuses_a_stale_job_owner():
@@ -3195,3 +3216,51 @@ def test_effect_enqueue_without_fence_stays_unfenced():
         payload={"ct": "x"},
         input_frontier_seq=0,
     )
+
+
+def test_unsafe_heartbeat_terminal_strands_its_perception_context_on_purpose():
+    """不安全的心跳终结之后**刻意不建后继**承接未消费的感知上下文。
+
+    看起来像漏交付，所以必须写成一条用例，否则后人很容易把它当普通 bug
+    「修」回去 —— 那会重新打开重复写。
+
+    转移不安全的原因不是「弱唤醒可丢」，是 **watchdog 杀进程时没有持久化的
+    `consumed_context_seq`**：无法区分哪些 context 已经进过 prompt、甚至已经
+    因果地产生了那条 durable/远端写。交给后继 = 同一份感知输入再驱动一次写。
+    晚到且确实未消费的行可能安全，但当前 schema 证明不了；证不了就按已消费
+    处理。想无损转移，得先把「写动作所见的 context 水位」持久化，那是另一件事。
+    """
+    from perception import store as perception_store
+
+    uid = "u_js_weak_wake_context_stranded"
+    job_id = _stuck_wake(uid, "heartbeat")
+    perception_store.append_v2_wake_context(
+        uid, job_id, {"kind": "app_focus"}, ts=1_700_000_000.0
+    )
+    assert perception_store.read_v2_wake_context(uid, job_id)
+    _record_durable_platform_effect(job_id, uid)
+
+    recovered = jobs_store.recover_killed_job(
+        job_id=job_id, claimed_by="w", reason="slot_watchdog_timeout",
+    )
+    assert recovered is not None and recovered["recovery"] == "terminal"
+
+    # 1) 没有**唤醒道**后继 —— 这条道安静地停下，不把感知事件搬到新 job 上
+    #    重跑。(failure review 自己的 runner job 是另一回事：它只读轨迹做
+    #    后台复盘，不重跑模型、不产生副作用。)
+    with db.get_pool().connection() as conn:
+        jobs = conn.execute(
+            "SELECT id,lane,status FROM agent_jobs WHERE user_id=%s ORDER BY id",
+            (uid,),
+        ).fetchall()
+    wake_jobs = [
+        (jid, status) for jid, lane, status in jobs
+        if lane in {"heartbeat", "manual_wake", "screen_watch", "scheduled"}
+    ]
+    assert wake_jobs == [(job_id, "expired")]
+
+    # 2) context 行仍绑在这个已终结的 job 上，只供审计/后续 trim
+    assert perception_store.read_v2_wake_context(uid, job_id)
+
+    # 3) 后台复盘由 failure review 承担，不靠转移 context
+    assert _pending_reviews(job_id) == ["pending"]

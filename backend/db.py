@@ -15682,7 +15682,11 @@ def effect_enqueue(
     ON CONFLICT (effect_id) DO NOTHING is the idempotency guarantee: re-enqueuing
     the same logical effect (same job_id/effect_type/ordinal, or same
     generation/effect_type/key for control-plane effects) is a no-op. Returns
-    True if this call actually inserted the row, False if it already existed.
+    返回值按分支不同,别混用:
+      * unfenced(``claimed_by is None``)—— True=本次插入,False=已存在。
+      * fenced —— True=**这条 effect 已持久**(本次插入或幂等重放都算),
+        False=**栅栏拒绝**(租约丢失/换了持有者/job 不再 running)。
+        fenced 分支下 False 绝不是「已存在」,调用方必须当成写被拒绝。
 
     ``claimed_by`` opts into the owner-fenced form: the source job row is
     locked and rechecked (same user, still ``running``, same owner, live lease)
