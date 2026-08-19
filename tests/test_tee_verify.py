@@ -759,14 +759,20 @@ def test_migration_seeded_singletons_constant_is_complete():
 # 本守卫上线时就已存在的缺口。**只减不增**：新表/新列一律不许进这里，
 # 加进来就等于把「静默写默认值」重新合法化。
 #
-# genesis_import_jobs 的这几列是认领/租约状态（worker_claimed_by、
-# resident_heartbeat_at 等）。它们**可能是有意不镜像的**——认领状态属于运行时
-# 本地，跨库复制反而会造出两个认领者。但代码里没有写明这个意图，所以这里只记
-# 「已存在」，不替 genesis 的作者判断对错；已另行上报由该线确认。
+# genesis_import_jobs 的认领/租约列。上报后 Supervisor 拍板 T150，处置分两半：
+#
+#   · worker_claimed_by / worker_claimed_at —— **已由 T150(PR #291, 816109f5)
+#     补进 reconciler.TABLES 并合入 test，因此从本白名单移除**。留着的话白名单
+#     会静默吞掉那次修复：守卫照样绿，而扶正仍把它们写成默认值。
+#   · resident_* 四列 —— 设计意图待定（认领状态属运行时本地，跨库复制可能反而
+#     造出两个认领者），T150 明确不碰，保留。
+#
+# 本表**只减不增**：新表/新列一律不许进来，加进来就等于把「静默写默认值」重新
+# 合法化。这次收窄是它上线后的第一次减项。
 _PREEXISTING_COLUMN_GAPS = {
     "genesis_import_jobs": {
         "resident_attempts", "resident_claimed_at", "resident_consumer_id",
-        "resident_heartbeat_at", "worker_claimed_at", "worker_claimed_by",
+        "resident_heartbeat_at",
     },
 }
 
