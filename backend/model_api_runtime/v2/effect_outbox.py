@@ -30,7 +30,13 @@ PERCEPTION_GLANCE_FINGERPRINT_KEY = "_perception_glance_fingerprint"
 FINAL_REPLY_EFFECT_TYPE = "reply_final_fenced_v1"
 TERMINAL_REPLY_EFFECT_TYPE = "reply_terminal_fenced_v1"
 INTERMEDIATE_REPLY_EFFECT_TYPE = "reply_intermediate_fenced_v1"
-_REPLY_EFFECT_TYPES = frozenset(
+# 「这次尝试有没有产出用户可见的气泡」的**唯一**判据来源。
+#
+# ⚠️ 与「最终送达」是两套谓词,不可互换:jobs_store 的 chat 送达率只认
+# {reply_final_fenced_v1, reply_terminal_fenced_v1}(裸 'reply' 是旧词汇,
+# 可能只是个中间气泡,混进去会让送达率超过 100%)。本集合刻意更宽——中间
+# 气泡对用户同样是「它说话了」,说话率要的正是这个宽口径。
+REPLY_EFFECT_TYPES = frozenset(
     {
         "reply",
         FINAL_REPLY_EFFECT_TYPE,
@@ -38,6 +44,7 @@ _REPLY_EFFECT_TYPES = frozenset(
         INTERMEDIATE_REPLY_EFFECT_TYPE,
     }
 )
+_REPLY_EFFECT_TYPES = REPLY_EFFECT_TYPES
 _REPLY_SOURCE_LANES = frozenset(
     {"chat", "heartbeat", "scheduled", "manual_wake", "screen_watch"}
 )
@@ -52,6 +59,10 @@ EFFECT_RUNTIME_STATE_CHANGED = "runtime_state_not_v2"
 EFFECT_RUNTIME_GENERATION_CHANGED = "runtime_generation_advanced"
 APPLIED_RESULT_PAYLOAD_KEY = "_applied_result_v1"
 APPLIED_WITH_RESULTS_STATUS = "applied_with_results"
+# 送达成立的两个终态。``applied_with_results`` 是复合 sink 带确定性逐项拒绝时的
+# 父状态——投递**已经完成**(见 WorkspaceBatchAppliedResult 的说明),漏掉它会把
+# 已经说过话的回合算成沉默。
+DELIVERED_EFFECT_STATUSES = frozenset({"applied", APPLIED_WITH_RESULTS_STATUS})
 WORKSPACE_BATCH_RESULT_KIND = "workspace_batch_v1"
 WORKSPACE_BATCH_RESULT_MAX_ITEMS = 24
 SCHEDULE_RESULT_KIND = "schedule_v1"

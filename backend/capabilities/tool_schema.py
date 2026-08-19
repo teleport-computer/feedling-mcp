@@ -763,10 +763,10 @@ DESCRIPTIONS: dict[str, str] = {
         "turn merge cards directly."
     ),
     MCP_TOOL_SEARCH_TOOL: (
-        "Load complete argument schemas for user-connected MCP tools whose names "
-        "and short descriptions are already visible. Provide either a search query "
-        "or exact qualified tool names. After this returns, call a resolved tool in "
-        "a later round using its newly available parameters."
+        "Non-resident platform tools and connected MCP tools may show shortened "
+        "schemas under context pressure. Search them by capability query or exact "
+        "tool name to load complete argument schemas. After this returns, call a "
+        "resolved tool in a later round using its newly available parameters."
     ),
 }
 

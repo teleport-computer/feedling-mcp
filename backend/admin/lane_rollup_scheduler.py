@@ -31,6 +31,17 @@ def _tick(*, now_epoch: float | None = None) -> list[str]:
     frozen = db.freeze_completed_lane_days(now_epoch=now_epoch, tz="Asia/Shanghai")
     if frozen:
         log.info("[lane-rollup] froze completed Beijing days: %s", ",".join(frozen))
+    # resident (user_logs) source rides the same single-leader tick; a failure
+    # in one source must not starve the other (same pattern as dau_snapshot's
+    # growth/retention riders).
+    try:
+        resident = db.freeze_completed_resident_lane_days(
+            now_epoch=now_epoch, tz="Asia/Shanghai")
+        if resident:
+            log.info("[lane-rollup] froze resident Beijing days: %s",
+                     ",".join(resident))
+    except Exception as e:  # noqa: BLE001
+        log.warning("[lane-rollup] resident tick failed: %s", e)
     return frozen
 
 

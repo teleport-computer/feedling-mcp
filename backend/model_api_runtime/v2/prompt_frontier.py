@@ -37,6 +37,8 @@ from dataclasses import dataclass
 from typing import Any, Literal
 from urllib.parse import urlsplit
 
+from model_api_runtime.v2 import tool_surface
+
 
 DEFAULT_OUTPUT_RESERVE_TOKENS = 4_096
 DEFAULT_SAFETY_MARGIN_RATIO = 0.05
@@ -96,22 +98,10 @@ PROMPT_BYTE_COMPONENT_NAMES = frozenset(
     }
 )
 
-# When the complete catalog does not fit, retain the user-selected MCP surface
-# and the smallest useful memory/reply loop before admitting less essential
-# platform capabilities. The priority decision belongs here, beside the budget
-# that applies it, rather than being copied into each worker/tool-loop caller.
-_MCP_TOOL_PREFIX = "mcp__"
-_CORE_TOOL_FLOOR_NAMES = frozenset(
-    {
-        "memory_index",
-        "memory_search",
-        "memory_fetch",
-        "memory_write",
-        "memory_organize",
-        "reply",
-        "send_file",
-    }
-)
+# When the complete catalog does not fit, the directory remains complete while
+# non-resident parameter manuals fold.  The residency decision belongs beside
+# the budget that applies it, rather than being copied into each caller.
+_CORE_TOOL_FLOOR_NAMES = tool_surface.RESIDENT_TOOL_NAMES
 
 
 @dataclass(frozen=True)
@@ -217,6 +207,8 @@ class PromptFrontierPlan:
     status: PlanStatus
     offered_tool_names: tuple[str, ...] = ()
     included_tool_names: tuple[str, ...] = ()
+    pressure_collapsed_tool_names: tuple[str, ...] = ()
+    schema_recovery_needed: bool = False
     component_bytes: tuple[PromptByteComponent, ...] = ()
     utf8_bytes_per_token: float = DEFAULT_ESTIMATOR_UTF8_BYTES_PER_TOKEN
 
@@ -1157,6 +1149,11 @@ def plan_provider_round(
     messages: Sequence[Any],
     tools: Sequence[Any] | None,
     required_tool_names: Collection[str] = (),
+    protected_tool_names: Collection[str] = (),
+    collapsed_tool_specs: Mapping[str, Any] | None = None,
+    recovery_tool_name: str = "",
+    recovery_tool_active: bool = False,
+    tool_schema_collapse_policy: str = tool_surface.DEFAULT_COLLAPSE_POLICY,
     output_reserve_tokens: int = DEFAULT_OUTPUT_RESERVE_TOKENS,
     safety_margin_tokens: int | None = None,
     utf8_bytes_per_token: float = DEFAULT_ESTIMATOR_UTF8_BYTES_PER_TOKEN,
@@ -1168,12 +1165,14 @@ def plan_provider_round(
     """Budget the exact messages and exact offered schemas for one provider call.
 
     Native exchanges are separated only for accounting/diagnostics; the caller
-    still sends its original chronological ``messages`` list unchanged. Tool
-    schemas are normally optional because the unified loop can safely degrade to
-    one text-only terminal request. Schemas named in ``required_tool_names`` stay
-    required when their native call/result history is retained; the remaining
-    catalog may still be omitted atomically. Conversation messages and native
-    call/result pairs are required and are never silently truncated.
+    still sends its original chronological ``messages`` list unchanged. The
+    The default policy attempts the complete catalog first and folds only under
+    pressure. The opt-in ``always`` policy folds non-resident schemas to bounded
+    discovery entries immediately. Every tool name remains present. Resident,
+    historically referenced, and explicitly protected schemas stay complete
+    and required.
+    Conversation messages and native call/result pairs are required and are
+    never silently truncated.
     """
 
     ordinary_messages = [
@@ -1245,123 +1244,172 @@ def plan_provider_round(
             )
         )
     offered_tools = list(tools or [])
-    required_tools: list[Any] = []
-    optional_tools: list[Any] = []
-    if tools is not None:
-        required_names = {str(name) for name in required_tool_names if str(name)}
-        required_tools = [
-            tool
-            for tool in tools
+    offered_names = tuple(
+        str(getattr(tool, "name", "")) for tool in offered_tools
+    )
+    collapsed_by_name = {
+        str(name): spec
+        for name, spec in (collapsed_tool_specs or {}).items()
+        if str(name)
+    }
+    recovery_name = str(recovery_tool_name or "")
+    collapse_policy = tool_surface.normalize_collapse_policy(
+        tool_schema_collapse_policy
+    )
+    base_required_names = {
+        str(name)
+        for name in (*required_tool_names, *protected_tool_names)
+        if str(name)
+    }
+
+    def _split_catalog(catalog: Sequence[Any]) -> tuple[list[Any], list[Any]]:
+        required_names = base_required_names | _CORE_TOOL_FLOOR_NAMES
+        required = [
+            tool for tool in catalog
             if str(getattr(tool, "name", "")) in required_names
         ]
-        optional_tools = [
-            tool
-            for tool in tools
+        optional = [
+            tool for tool in catalog
             if str(getattr(tool, "name", "")) not in required_names
         ]
-        if required_tools:
-            components.append(
-                tool_schemas_component(
-                    required_tools,
-                    name="required_tool_schemas",
-                    required=True,
-                )
+        return required, optional
+
+    def _atomic_plan(
+        catalog: Sequence[Any],
+    ) -> tuple[PromptFrontierPlan, list[Any], list[Any]]:
+        required, optional = _split_catalog(catalog)
+        candidate_components = list(components)
+        if required:
+            candidate_components.append(tool_schemas_component(
+                required,
+                name="required_tool_schemas",
+                required=True,
+            ))
+        if optional:
+            candidate_components.append(tool_schemas_component(
+                optional,
+                required=False,
+                priority=1,
+            ))
+        try:
+            candidate = plan_prompt(
+                model_limit=model_limit,
+                components=candidate_components,
+                output_reserve_tokens=output_reserve_tokens,
+                safety_margin_tokens=safety_margin_tokens,
             )
-        if optional_tools:
-            components.append(
-                tool_schemas_component(
-                    optional_tools,
-                    required=False,
-                    priority=1,
-                )
-            )
-    try:
-        plan = plan_prompt(
-            model_limit=model_limit,
-            components=components,
-            output_reserve_tokens=output_reserve_tokens,
-            safety_margin_tokens=safety_margin_tokens,
+        except PromptFrontierExhausted as exc:
+            _attach_exhaustion(exc, observed_tools=required)
+            raise
+        return candidate, required, optional
+
+    def _finalize(
+        candidate: PromptFrontierPlan,
+        included_tools: Sequence[Any],
+        *,
+        pressure_collapsed_names: Collection[str] = (),
+    ) -> PromptFrontierPlan:
+        included_names = tuple(
+            str(getattr(tool, "name", "")) for tool in included_tools
         )
-    except PromptFrontierExhausted as exc:
-        _attach_exhaustion(exc, observed_tools=required_tools)
-        raise
-    offered_names = tuple(str(getattr(tool, "name", "")) for tool in offered_tools)
-    required_name_set = {
-        str(getattr(tool, "name", "")) for tool in required_tools
-    }
-    if not optional_tools or "tool_schemas" not in plan.omitted_optional_components:
+        collapsed_name_set = set(pressure_collapsed_names)
+        collapsed_names = tuple(
+            name for name in included_names if name in collapsed_name_set
+        )
+        recovery_needed = (
+            collapse_policy == tool_surface.COLLAPSE_POLICY_ALWAYS
+            or recovery_tool_active
+            or bool(collapsed_names)
+        )
         return dataclasses.replace(
-            plan,
+            candidate,
             offered_tool_names=offered_names,
-            included_tool_names=offered_names,
-            component_bytes=_observed_components(offered_tools),
+            included_tool_names=included_names,
+            pressure_collapsed_tool_names=collapsed_names,
+            schema_recovery_needed=recovery_needed,
+            component_bytes=_observed_components(included_tools),
             utf8_bytes_per_token=_validated_estimator_ratio(
                 utf8_bytes_per_token
             ),
         )
 
-    # The complete optional catalog is too large. Re-plan the same exact prompt
-    # with one atomic component per remaining schema so pressure trims a
-    # deterministic tail instead of turning every tool off. User MCP and the
-    # core memory/reply loop are admitted first; schemas referenced by retained
-    # native history remain required exactly as above.
-    granular_components = [
-        component for component in components if component.name != "tool_schemas"
+    if tools is None:
+        plan, _required, _optional = _atomic_plan(())
+        return _finalize(plan, ())
+
+    # Under the default policy, schema search stays latent while the complete
+    # catalog fits. The opt-in ``always`` policy keeps it resident and folds
+    # immediately.
+    baseline_tools = [
+        tool for tool in offered_tools
+        if not (
+            collapse_policy == tool_surface.COLLAPSE_POLICY_UNDER_PRESSURE
+            and recovery_name
+            and str(getattr(tool, "name", "")) == recovery_name
+            and not recovery_tool_active
+        )
     ]
-    optional_component_names: list[tuple[str, str]] = []
-    for index, tool in enumerate(optional_tools):
-        tool_name = str(getattr(tool, "name", ""))
-        component_name = f"tool_schema_{index}"
-        priority = (
-            2
-            if tool_name.startswith(_MCP_TOOL_PREFIX)
-            or tool_name in _CORE_TOOL_FLOOR_NAMES
-            else 1
+    if collapse_policy == tool_surface.COLLAPSE_POLICY_UNDER_PRESSURE:
+        plan, required_tools, optional_tools = _atomic_plan(baseline_tools)
+        if (
+            not optional_tools
+            or "tool_schemas" not in plan.omitted_optional_components
+        ):
+            return _finalize(plan, baseline_tools)
+    else:
+        required_tools, _optional_tools = _split_catalog(baseline_tools)
+
+    required_name_set = {
+        str(getattr(tool, "name", "")) for tool in required_tools
+    }
+    pressure_recovery_needed = (
+        collapse_policy == tool_surface.COLLAPSE_POLICY_ALWAYS
+        or recovery_tool_active
+        or any(
+            str(getattr(tool, "name", "")) not in required_name_set
+            for tool in baseline_tools
         )
-        granular_components.append(
-            tool_schemas_component(
-                [tool],
-                name=component_name,
-                required=False,
-                priority=priority,
-            )
-        )
-        optional_component_names.append((component_name, tool_name))
+    )
+    degraded_tools: list[Any] = []
+    pressure_collapsed_names: set[str] = set()
+    for tool in offered_tools:
+        name = str(getattr(tool, "name", ""))
+        if name == recovery_name:
+            if pressure_recovery_needed:
+                degraded_tools.append(tool)
+            continue
+        if name not in required_name_set:
+            collapsed = collapsed_by_name.get(name)
+            if collapsed is None:
+                collapsed = tool_surface.collapsed_tool_spec(tool)
+            degraded_tools.append(collapsed)
+            pressure_collapsed_names.add(name)
+        else:
+            degraded_tools.append(tool)
+
+    # The folded form is still one complete directory. Make it required so
+    # a smaller window fails loudly instead of silently deleting tool names.
+    collapsed_components = list(components)
+    if degraded_tools:
+        collapsed_components.append(tool_schemas_component(
+            degraded_tools,
+            name="required_tool_schemas",
+            required=True,
+        ))
     try:
-        plan = plan_prompt(
+        collapsed_plan = plan_prompt(
             model_limit=model_limit,
-            components=granular_components,
+            components=collapsed_components,
             output_reserve_tokens=output_reserve_tokens,
             safety_margin_tokens=safety_margin_tokens,
         )
     except PromptFrontierExhausted as exc:
-        _attach_exhaustion(exc, observed_tools=required_tools)
+        _attach_exhaustion(exc, observed_tools=degraded_tools)
         raise
-    included_components = set(plan.included_components)
-    included_optional_names = {
-        tool_name
-        for component_name, tool_name in optional_component_names
-        if component_name in included_components
-    }
-    included_names = tuple(
-        name
-        for name in offered_names
-        if name in required_name_set or name in included_optional_names
-    )
-    included_name_set = set(included_names)
-    included_tools = [
-        tool
-        for tool in offered_tools
-        if str(getattr(tool, "name", "")) in included_name_set
-    ]
-    return dataclasses.replace(
-        plan,
-        offered_tool_names=offered_names,
-        included_tool_names=included_names,
-        component_bytes=_observed_components(included_tools),
-        utf8_bytes_per_token=_validated_estimator_ratio(
-            utf8_bytes_per_token
-        ),
+    return _finalize(
+        collapsed_plan,
+        degraded_tools,
+        pressure_collapsed_names=pressure_collapsed_names,
     )
 
 
