@@ -450,4 +450,47 @@ def test_catch_up_is_sliced_so_one_tick_cannot_wedge(clean_chat_rollup):
     assert 0 < len(first) <= db._CHAT_ROLLUP_MAX_DAYS_PER_TICK
     second = db.freeze_completed_chat_days()
     assert second, "第二轮没有继续推进"
-    assert second[0] > first[-1], "第二轮应从上次水位之后接着冻" 
+    assert second[0] > first[-1], "第二轮应从上次水位之后接着冻"
+
+
+def test_deleting_an_account_removes_its_chat_cells(clean_chat_rollup):
+    """销号必须带走格子。
+
+    lane 格子是匿名归并(纯结果计数,加总仍可读);chat 格子是**丢弃** —— 它带
+    着这个人的活动形状(首末时刻、来源构成),把这些跨账号加总只会得到一行没人
+    能解释的数。留着更糟:一个已注销的人会继续出现在活跃统计里。
+    """
+    uid = "usr_dt_golden_delete"
+    seed_user(uid)
+    _seed_chat(uid)
+    db.freeze_completed_chat_days()
+    with db.get_pool().connection() as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM chat_daily_rollup WHERE user_id=%s", (uid,),
+        ).fetchone()[0] > 0
+    db.delete_user(uid)
+    with db.get_pool().connection() as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM chat_daily_rollup WHERE user_id=%s", (uid,),
+        ).fetchone()[0] == 0
+
+
+def test_the_scheduler_actually_calls_the_chat_freeze():
+    """冻结器必须被真的接到调度器上。
+
+    这条看着像凑数,其实是本期最容易静默失败的一处:重写后端点**只**从格子读
+    历史,冻结是填充它的唯一来源。调度器没接线的话,页面显示的就是「这些用户
+    从没说过话」—— 一个没有任何报错、看起来完全正常的空面板。
+    (同族教训:T130 的 wake 道 trace_id 全空,机制建好了但没接到这条道上。)
+    """
+    from admin import lane_rollup_scheduler as sched
+
+    called: list[str] = []
+    real = db.freeze_completed_chat_days
+    try:
+        db.freeze_completed_chat_days = (  # type: ignore[assignment]
+            lambda **kw: called.append("chat") or [])
+        sched._tick()
+    finally:
+        db.freeze_completed_chat_days = real  # type: ignore[assignment]
+    assert called == ["chat"], "调度器 tick 没有调用 chat 冻结"

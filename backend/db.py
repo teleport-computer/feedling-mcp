@@ -834,6 +834,9 @@ def save_all_users(users: list[dict]) -> None:
                 # ordering rationale (users DELETE first, merge second), same
                 # mirror statements appended from the same operation.
                 for removed_id in removed_ids:
+                    if chat_rollup_anonymize_user(conn, removed_id):
+                        mirror_group.append(
+                            (_CHAT_ROLLUP_DELETE_SQL, (removed_id,)))
                     if lane_rollup_anonymize_user(conn, removed_id):
                         mirror_group.append(
                             (_LANE_ROLLUP_ANON_MERGE_SQL,
@@ -889,9 +892,12 @@ def delete_user(user_id: str) -> bool:
             # freeze's cells are committed and visible to this merge; and any
             # later freeze finds no users row, so its guarded INSERT..SELECT
             # inserts nothing.
+            chat_cells = chat_rollup_anonymize_user(conn, user_id)
             anonymized = lane_rollup_anonymize_user(conn, user_id)
     from tee_shadow import mirror
     group: list[tuple[str, tuple]] = [(sql, (user_id,))]
+    if chat_cells:
+        group.append((_CHAT_ROLLUP_DELETE_SQL, (user_id,)))
     if anonymized:
         group.append((_LANE_ROLLUP_ANON_MERGE_SQL,
                       (_LANE_ROLLUP_DELETED_USER, user_id)))
@@ -5198,6 +5204,9 @@ def freeze_completed_chat_days(*, now_epoch: float | None = None,
     except Exception as e:
         log.error("[db] freeze_completed_chat_days failed: %s", e)
         return []
+
+
+_CHAT_ROLLUP_DELETE_SQL = "DELETE FROM chat_daily_rollup WHERE user_id = %s"
 
 
 def chat_rollup_coverage(*, tz: str = "Asia/Shanghai") -> dict:
@@ -14983,6 +14992,7 @@ def delete_user_data(user_id: str) -> None:
                 # frozen cells are anonymize-merged into user_id='deleted'
                 # instead of dropped (Seven 2026-08-18) so aggregate history
                 # stays true while the per-user linkage dies with the account.
+                chat_cells_dropped = chat_rollup_anonymize_user(conn, user_id)
                 anonymized_cells = lane_rollup_anonymize_user(conn, user_id)
     except Exception as e:
         log.error("[db] delete_user_data(%s) failed: %s", user_id, e)
@@ -15016,6 +15026,12 @@ def delete_user_data(user_id: str) -> None:
     # re-deriving it table-by-table.
     mirror_group.append(
         ("DELETE FROM tee_pending_device_migration WHERE user_id = %s", (user_id,)))
+    if chat_cells_dropped:
+        # Chat cells are dropped, not merged: they carry per-user activity
+        # shape (first/last timestamps, source mix), and summing that across
+        # deleted accounts yields a row nobody can read. The lane cells merge
+        # because they are pure outcome counts.
+        mirror_group.append((_CHAT_ROLLUP_DELETE_SQL, (user_id,)))
     if anonymized_cells:
         # Same additive merge + delete replayed on TEE: additive statements
         # take two consistent stores to the same end state.
