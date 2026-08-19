@@ -702,6 +702,8 @@ jobs:
             tests/test_prompt_cache_canary.py \
             tests/test_provider_usage_normalize.py \
             tests/test_provider_malformed_tool_fallback.py \
+            tests/test_provider_client.py \
+            tests/test_capability_web.py \
             tests/test_perception_tool_surface_contract.py \
             tests/test_v2_tool_trace_privacy.py \
             tests/test_capabilities_memory.py \
