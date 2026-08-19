@@ -45,6 +45,10 @@ _RETRYABLE_HTTPX = (httpx.TimeoutException, httpx.TransportError)
 _RETRYABLE_STATUS = frozenset({408, 425, 429, 500, 502, 503, 504})
 _PROVIDER_CONFIG_STATUS = frozenset({400, 401, 402, 403, 404, 415, 422})
 _MAX_PG_BIGINT = (1 << 63) - 1
+# The chat wires cap max_tokens at 8192 when they encode the payload; image
+# bytes are billed against that same completion budget, so image requests ask
+# for the ceiling rather than a text-sized slice.
+IMAGE_OUTPUT_MAX_TOKENS = 8192
 
 
 def classify_provider_error(exc: BaseException) -> str:
@@ -2745,6 +2749,73 @@ def _data_url_media_item(value: Any, *, name: str = "") -> dict | None:
     return _inline_media_item(encoded, mime_type, name=name)
 
 
+_INLINE_DATA_URL_RE = re.compile(
+    r"data:image/(?P<mime>[a-z0-9.+-]{1,32});base64,(?P<body>[A-Za-z0-9+/=]{64,})",
+    re.IGNORECASE,
+)
+
+
+def _inline_data_urls_in_text(text: str) -> list[dict]:
+    """Pull inline images out of a plain-string reply.
+
+    Several OpenAI-compatible relays return the generated image inside the
+    assistant's `content` string — usually as markdown, `![image](data:...)` —
+    instead of the structured `images` array OpenRouter uses. The bytes are
+    already inline, so reading them fetches nothing: an `http(s)` link in the
+    same string stays ignored, exactly as it is everywhere else here.
+    """
+    out: list[dict] = []
+    for match in _INLINE_DATA_URL_RE.finditer(text or ""):
+        item = _inline_media_item(
+            match.group("body"),
+            f"image/{match.group('mime').lower()}",
+        )
+        if item is not None:
+            out.append(item)
+            if len(out) >= MAX_GENERATED_IMAGES_PER_REPLY:
+                break
+    return out
+
+
+# Each marker must mean "this endpoint does not serve this model" on its own.
+# Generic failure codes and permission wording are deliberately absent: a
+# transport-level code like `convert_request_failed` also covers a malformed
+# payload, and "not allowed to access this endpoint" is an authorization
+# answer — treating either as unsupported would hide the real error behind a
+# second, separately billed request.
+_DEDICATED_IMAGE_UNSUPPORTED_MARKERS = (
+    "not supported model for image generation",
+    "only imagen models are supported",
+    "unsupported endpoint",
+    "不支持该端点",
+)
+
+
+def _dedicated_image_wire_rejection(resp: Any) -> str:
+    """Name the reason a relay declined the dedicated image wire, or "".
+
+    Only a refusal that clearly means *this endpoint does not serve this model*
+    may send the request to the chat wire. Everything else — auth, quota, rate
+    limits, an unexplained 5xx — is the real answer: retrying elsewhere would
+    bill the user a second time and rewrite the error into an unrelated one.
+    """
+    status = int(getattr(resp, "status_code", 0) or 0)
+    # The relay simply does not implement the endpoint. Nothing ran upstream.
+    if status in {404, 405, 501}:
+        return f"endpoint_absent_{status}"
+    if status not in {400, 422, 500}:
+        return ""
+    try:
+        text = str(getattr(resp, "text", "") or "")
+    except Exception:  # noqa: BLE001 - a body we cannot read tells us nothing
+        return ""
+    lowered = text.lower()
+    for marker in _DEDICATED_IMAGE_UNSUPPORTED_MARKERS:
+        if marker in lowered:
+            return f"model_unsupported_{status}"
+    return ""
+
+
 def _extract_openai_compatible_media(body: dict[str, Any]) -> list[dict]:
     """Accept only inline image data; provider URLs never become server fetches."""
     media: list[dict] = []
@@ -2787,6 +2858,11 @@ def _extract_openai_compatible_media(body: dict[str, Any]) -> list[dict]:
                 media.append(item)
                 if len(media) >= MAX_GENERATED_IMAGES_PER_REPLY:
                     return media
+    elif isinstance(content, str):
+        for item in _inline_data_urls_in_text(content):
+            media.append(item)
+            if len(media) >= MAX_GENERATED_IMAGES_PER_REPLY:
+                return media
 
     raw_data = body.get("data")
     if isinstance(raw_data, list):
@@ -4188,11 +4264,20 @@ async def _chat_completion_async_impl(
     # transport——不再经 anyio 线程桥调用同步 chat_completion（该桥曾把这 3
     # 个 provider 的并发上限静默锁死在线程池大小）。
 
+    # Relays (openai_compatible) are tried here too, but they get a narrow
+    # fallback: measured on two of them, one model only answers on
+    # /images/generations while another rejects that endpoint outright and only
+    # answers on /chat/completions — and the same model id differs between
+    # relays, so the wire cannot be picked from the name. The dedicated endpoint
+    # goes first because *this* rejection is a cheap pre-flight error, whereas a
+    # chat call that yields no usable image is billed in full. Only that
+    # rejection opens the fallback; see _dedicated_image_wire_rejection.
     if (
-        provider in {"openai", "openrouter"}
+        provider in {"openai", "openrouter", "openai_compatible"}
         and allow_image_output
         and _model_has_native_image_output(provider, request_model)
     ):
+        dedicated_may_fall_back = provider == "openai_compatible"
         payload = _build_openrouter_images_payload(
             model=request_model,
             messages=messages,
@@ -4202,7 +4287,7 @@ async def _chat_completion_async_impl(
             request_payload: dict[str, Any],
         ) -> httpx.Response:
             try:
-                suffix = "/images/generations" if provider == "openai" else "/images"
+                suffix = "/images" if provider == "openrouter" else "/images/generations"
                 return await _async_http_client().post(
                     f"{base_url.rstrip('/')}{suffix}",
                     headers=_headers(
@@ -4218,6 +4303,8 @@ async def _chat_completion_async_impl(
                     f"provider network error: {type(exc).__name__}"
                 ) from exc
 
+        # A network error inside the post raises straight out — never retried on
+        # the other wire, since the request may well have been served and billed.
         resp, _ = await _traced_async_json_post(
             trace=_attempt_trace,
             provider=provider,
@@ -4226,17 +4313,38 @@ async def _chat_completion_async_impl(
             request_payload=payload,
             post=post_dedicated_image,
         )
-        _raise_for_provider_status(resp)
-        try:
-            body = resp.json()
-        except ValueError as exc:
-            raise ProviderError("provider returned non-json response") from exc
-        if not isinstance(body, dict):
-            raise ProviderError("provider returned non-object response")
-        return _parse_openrouter_images_body(
-            body,
-            provider=provider,
-            model=request_model,
+        fall_back_reason = ""
+        if resp.status_code >= 400:
+            fall_back_reason = (
+                _dedicated_image_wire_rejection(resp)
+                if dedicated_may_fall_back
+                else ""
+            )
+            if not fall_back_reason:
+                # Auth, quota, rate limits, transport-ish 5xx: the answer is
+                # this failure. Retrying on the chat wire would bill a second
+                # request and rewrite the error into something unrelated.
+                _raise_for_provider_status(resp)
+        if not fall_back_reason:
+            try:
+                body = resp.json()
+            except ValueError as exc:
+                raise ProviderError("provider returned non-json response") from exc
+            if not isinstance(body, dict):
+                raise ProviderError("provider returned non-object response")
+            # A 2xx that carried no inline image (e.g. a URL-only answer) is a
+            # real answer too: it was billed, so it must not be paid for twice.
+            return _parse_openrouter_images_body(
+                body,
+                provider=provider,
+                model=request_model,
+            )
+        log.info(
+            "[image-generation] dedicated image endpoint declined this model, "
+            "falling back to the chat wire model=%s status=%s reason=%s",
+            str(request_model or "")[:96],
+            resp.status_code,
+            fall_back_reason,
         )
 
     if provider == "anthropic":
@@ -4677,7 +4785,13 @@ async def generate_image_async(
     result = await chat_completion_async(
         config,
         [{"role": "user", "content": normalized_prompt}],
-        max_tokens=512,
+        # Image bytes are billed as completion tokens on this wire. A relay was
+        # measured spending 121 completion tokens against a 512 cap and
+        # returning finish_reason=length with empty content — a truncated image
+        # the user still paid for. Ask for the wire maximum instead. This is a
+        # ceiling, not a reservation: a normal image lands well under it, but a
+        # model that answers with prose can now bill more than it used to.
+        max_tokens=IMAGE_OUTPUT_MAX_TOKENS,
         temperature=None,
         timeout=max(float(timeout), 120.0),
         require_reply=True,
