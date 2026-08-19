@@ -73,11 +73,30 @@ TABLES: dict[str, tuple[tuple[str, ...], str]] = {
     "lane_daily_rollup": (
         ("user_id", "day", "route", "lane", "enqueue_source"),
         "user_id, day, route, lane, enqueue_source, completed, failed, "
-        "expired, superseded, failure_codes, frozen_at",
+        "expired, superseded, failure_codes, "
+        # ⚠️ 说话四列（0093 / tee 0025）必须列在这里。漏列**不会报错**——扶正
+        # 会把它们按默认值 0 写进 TEE，而 test 的 primary 就是 TEE，于是被读的
+        # 那一份悄悄变成「谁都没说过话」。列漂移交给
+        # test_reconciler_columns_cover_the_whole_table 守，别再靠人记得改这行。
+        "spoke, spoke_completed, silent_declared, silent_undeclared, "
+        "frozen_at",
     ),
     "lane_rollup_watermark": (
         ("route",),
-        "route, backfill_from, through_day, frozen_at",
+        "route, backfill_from, through_day, voice_from, frozen_at",
+    ),
+    # 聊天格子（0094 / tee 0026）。同样写后不变、语句幂等，按 PK 对齐即收敛。
+    "chat_daily_rollup": (
+        ("user_id", "day"),
+        "user_id, day, total, user_messages, agent_messages, image_messages, "
+        "proactive_messages, model_api_user_messages, "
+        "model_api_agent_messages, model_api_greetings, first_ts, last_ts, "
+        "proactive_last_ts, last_user_ts, last_agent_ts, by_role, by_source, "
+        "by_content_type, live_activity_status, alert_status, frozen_at",
+    ),
+    "chat_rollup_watermark": (
+        ("scope",),
+        "scope, backfill_from, through_day, frozen_at",
     ),
 }
 
