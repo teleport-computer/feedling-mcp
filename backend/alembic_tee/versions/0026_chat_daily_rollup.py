@@ -60,15 +60,25 @@ CREATE TABLE IF NOT EXISTS chat_daily_rollup (
 CREATE INDEX IF NOT EXISTS ix_chat_daily_rollup_day
     ON chat_daily_rollup (day);
 
+-- ⚠️ ``chat_message_archive`` 原有索引都以 (user_id, cleared_at/msg_id) 打头，
+-- 给不出 ts 范围收窄。冻结与「今天」实时窗都按 ts 过滤 live ∪ archive，没有这
+-- 个索引，实时窗会退化成 archive 全史顺扫——正是本期要消灭的形态，只是换了张表
+-- （codex2 2026-08-19 要求补证）。与 ix_chat_messages_ts（0079）对称。
+CREATE INDEX IF NOT EXISTS ix_chat_message_archive_ts
+    ON chat_message_archive (ts);
+
 -- Coverage watermark, separate from lane_rollup_watermark on purpose: the two
 -- sources lose history in different ways, so one shared bound would be wrong
 -- for both. ``user_logs`` is ring-buffered, so its oldest days are simply gone.
--- ``chat_messages`` has no ring, but it is not an intact archive either — a
--- history clear moves rows out of the live set. Precise meaning of
--- ``backfill_from``: cells can be built from the oldest row still present at
--- the time of the first freeze. Anything cleared before that first run was
--- never counted and is honestly reported as outside coverage rather than as
--- a real zero.
+-- ``chat_messages`` has no ring, and a history clear does not destroy history
+-- either — ``chat_clear`` MOVES rows into ``chat_message_archive``.
+-- ``backfill_from`` is therefore the oldest day present in
+-- ``LEAST(min(chat_messages.ts), min(chat_message_archive.ts))`` at the first
+-- freeze: cleared history IS counted, which is exactly what the "how much
+-- happened" reading requires. (An earlier draft of this comment said cells
+-- start at the oldest surviving LIVE row and that cleared history is never
+-- counted — that contradicted the implementation, the historical-fact ruling,
+-- and table_registry's own description. Fixed after codex2 caught it.)
 CREATE TABLE IF NOT EXISTS chat_rollup_watermark (
     scope         TEXT PRIMARY KEY,
     backfill_from TEXT NOT NULL,

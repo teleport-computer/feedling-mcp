@@ -1165,11 +1165,10 @@ def _chat_rollup_into(conn, ids: list[str], out: dict, ensure) -> None:
     for row in conn.execute(
         f"""
         SELECT user_id,{_CHAT_ROLLUP_COUNTS_SELECT}
-        FROM {_CHAT_ROLLUP_SOURCE} src
-        WHERE user_id = ANY(%s) AND ts >= %s
+        FROM {_chat_rollup_source('user_id = ANY(%s) AND ts >= %s')} src
         GROUP BY user_id
         """,
-        (ids, cutoff),
+        (ids, cutoff, ids, cutoff),
     ).fetchall():
         n = len(_CHAT_SNAPSHOT_COUNT_KEYS)
         cell = acc.setdefault(str(row[0]), {})
@@ -1189,11 +1188,10 @@ def _chat_rollup_into(conn, ids: list[str], out: dict, ensure) -> None:
             f"""
             SELECT user_id, COALESCE(NULLIF(doc->>%s, ''), 'unknown') AS value,
                    COUNT(*)::int
-            FROM {_CHAT_ROLLUP_SOURCE} src
-            WHERE user_id = ANY(%s) AND ts >= %s{extra}
+            FROM {_chat_rollup_source(f'user_id = ANY(%s) AND ts >= %s{extra}')} src
             GROUP BY user_id, value
             """,
-            (field, ids, cutoff),
+            (field, ids, cutoff, ids, cutoff),
         ).fetchall():
             bucket = acc.setdefault(str(uid), {}).setdefault(target, {})
             bucket[str(value)] = bucket.get(str(value), 0) + int(count)
@@ -1210,6 +1208,65 @@ def _chat_rollup_into(conn, ids: list[str], out: dict, ensure) -> None:
                     "last_user_ts", "last_agent_ts"):
             cell.setdefault(key, None)
         ensure(out, uid)["chat"] = cell
+
+
+def _chat_proactive_status_into(conn, ids: list[str], out: dict, ensure) -> None:
+    """proactive_extra 的两个 status 分布：冻结格子 + 今天实时窗。
+
+    与 ``_chat_rollup_into`` 分开只是因为它们挂在 ``proactive_extra`` 而不是
+    ``chat`` 下；口径、边界（day < today / ts >= today 起点）、来源（live ∪
+    archive）三者完全一致，共用同一组常量。
+    """
+    zone = ZoneInfo("Asia/Shanghai")
+    today = datetime.now(zone).date()
+    day_start, _ = _lane_rollup_day_bounds(today, zone)
+    cutoff = day_start.timestamp()
+    acc: dict[str, dict[str, dict[str, int]]] = {}
+
+    for uid, folded in conn.execute(
+        """
+        SELECT user_id, jsonb_object_agg(src, buckets)
+        FROM (
+            SELECT user_id, src, jsonb_object_agg(k, v) AS buckets
+            FROM (
+                SELECT user_id, src, k, SUM(raw::int)::int AS v
+                FROM chat_daily_rollup,
+                LATERAL (VALUES ('live_activity_status', live_activity_status),
+                                ('alert_status', alert_status)) AS d(src, doc),
+                LATERAL jsonb_each_text(doc) AS e(k, raw)
+                WHERE user_id = ANY(%s) AND day < %s
+                GROUP BY user_id, src, k
+            ) per_key
+            GROUP BY user_id, src
+        ) per_src
+        GROUP BY user_id
+        """,
+        (ids, today.isoformat()),
+    ).fetchall():
+        by = acc.setdefault(str(uid), {})
+        for key, buckets in (folded or {}).items():
+            by[str(key)] = {str(k): int(v) for k, v in (buckets or {}).items()}
+
+    for field, target, extra in _CHAT_ROLLUP_DIST_FIELDS[3:]:
+        for uid, value, count in conn.execute(
+            f"""
+            SELECT user_id, COALESCE(NULLIF(doc->>%s, ''), 'unknown') AS value,
+                   COUNT(*)::int
+            FROM {_chat_rollup_source(f'user_id = ANY(%s) AND ts >= %s{extra}')} src
+            GROUP BY user_id, value
+            """,
+            (field, ids, cutoff, ids, cutoff),
+        ).fetchall():
+            bucket = acc.setdefault(str(uid), {}).setdefault(target, {})
+            bucket[str(value)] = bucket.get(str(value), 0) + int(count)
+
+    for uid, by in acc.items():
+        if not any(by.values()):
+            continue
+        extra_block = ensure(out, uid).setdefault("proactive_extra", {})
+        for key, buckets in by.items():
+            if buckets:
+                extra_block[key] = buckets
 
 
 def admin_data_track_snapshot(user_ids: list[str]) -> dict[str, dict]:
@@ -1444,33 +1501,11 @@ def admin_data_track_snapshot(user_ids: list[str]) -> dict[str, dict]:
                     "jobs_failed_by_reason", {}
                 )[reason] = count
 
-            rows = conn.execute(
-                """
-                SELECT user_id,
-                       COALESCE(NULLIF(doc->>'live_activity_status', ''), 'unknown') AS live_status,
-                       COUNT(*)::int
-                FROM chat_messages
-                WHERE user_id = ANY(%s) AND doc->>'source' = 'agent_initiated_proactive'
-                GROUP BY user_id, live_status
-                """,
-                (ids,),
-            ).fetchall()
-            for uid, status, count in rows:
-                ensure(out, uid).setdefault("proactive_extra", {}).setdefault("live_activity_status", {})[status] = count
-
-            rows = conn.execute(
-                """
-                SELECT user_id,
-                       COALESCE(NULLIF(doc->>'alert_status', ''), 'unknown') AS alert_status,
-                       COUNT(*)::int
-                FROM chat_messages
-                WHERE user_id = ANY(%s) AND doc->>'source' = 'agent_initiated_proactive'
-                GROUP BY user_id, alert_status
-                """,
-                (ids,),
-            ).fetchall()
-            for uid, status, count in rows:
-                ensure(out, uid).setdefault("proactive_extra", {}).setdefault("alert_status", {})[status] = count
+            # ⚠️ 这两个维度**必须**走格子，不能留原来的全史 GROUP BY。
+            # 把它们冻进格子却仍从 chat_messages 现算，等于新增列只写不读、
+            # 端点照样随全史增长——那正是本期要消灭的东西（codex2 2026-08-19
+            # 逮到我就是这么写的：写侧改了、读侧一行没动）。
+            _chat_proactive_status_into(conn, ids, out, ensure)
 
             rows = conn.execute(
                 """
@@ -5020,10 +5055,38 @@ _LANE_ROLLUP_ANON_DELETE_SQL = "DELETE FROM lane_daily_rollup WHERE user_id = %s
 #
 # 按 (user_id, source_seq) 去重：搬迁瞬间同一条可能在两张表里同时出现，
 # UNION ALL 会双计。archive 的 PK 就是这个键，live 侧对应 seq。
-_CHAT_ROLLUP_SOURCE = """(
-            SELECT user_id, seq AS source_seq, ts, doc FROM chat_messages
-            UNION
-            SELECT user_id, source_seq, ts, doc FROM chat_message_archive
+# ⚠️ 必须按 **(user_id, source_seq)** 定胜，不能用 UNION。
+# UNION 去的是**整行**重：只要同一条消息在 live 与 archive 两侧的 doc 或 ts 有
+# 任何差异（clear 事务搬行时补字段、R2 offload 把正文换成指针、时间戳精度），
+# 两行就都活下来、被计两次。codex2 2026-08-19 指出；我原先的测试复制的是**完全
+# 相同**的行，所以这个反例根本没被触发——又一次「样本没让被测分支走到」。
+#
+# precedence：live 胜。理由是 archive 行是 clear 那一刻的拷贝，之后不再更新；
+# live 行若还在，它才是这条消息的现状。用 rank 列显式排序，不依赖 UNION 的
+# 任意顺序。
+def _chat_rollup_source(where: str) -> str:
+    """live ∪ archive 的联合源，**ts 谓词下推到两个分支内部**。
+
+    ⚠️ 谓词必须在 DISTINCT ON 之前施加。DISTINCT ON 是优化屏障，外层的
+    ``ts >=`` 推不进去——实测 5 万行归档时，PG 会把 52000 行全部物化排序再过滤，
+    ts 索引完全用不上，「有界今日窗」实际在扫全史（正是本期要消灭的形态，只是
+    换了张表）。下推之后两侧各走自己的 ts 索引。
+
+    去重仍按 (user_id, source_seq) 定胜、live 优先（rank 0）：UNION 去的是整行
+    重，同一条消息只要两侧 doc/ts 有任何差异就会双计（codex2 2026-08-19）。
+
+    ``where`` 里的占位符会出现**两次**（每个分支一次），调用方的参数要给两遍。
+    """
+    return f"""(
+            SELECT DISTINCT ON (user_id, source_seq) user_id, source_seq, ts, doc
+            FROM (
+                SELECT user_id, seq AS source_seq, ts, doc, 0 AS rank
+                FROM chat_messages WHERE {where}
+                UNION ALL
+                SELECT user_id, source_seq, ts, doc, 1 AS rank
+                FROM chat_message_archive WHERE {where}
+            ) merged
+            ORDER BY user_id, source_seq, rank
         )"""
 
 # ⚠️ 另有两族**硬删且不归档**的行（codex2 2026-08-19 指出），联合源救不回来：
@@ -5094,11 +5157,10 @@ def _chat_rollup_freeze_day(conn, *, day: date, zone: ZoneInfo,
     counts = conn.execute(
         f"""
         SELECT user_id,{_CHAT_ROLLUP_COUNTS_SELECT}
-        FROM {_CHAT_ROLLUP_SOURCE} src
-        WHERE ts >= %s AND ts < %s
+        FROM {_chat_rollup_source('ts >= %s AND ts < %s')} src
         GROUP BY user_id
         """,
-        (lo, hi),
+        (lo, hi, lo, hi),
     ).fetchall()
     if not counts:
         return 0
@@ -5109,11 +5171,10 @@ def _chat_rollup_freeze_day(conn, *, day: date, zone: ZoneInfo,
             f"""
             SELECT user_id, COALESCE(NULLIF(doc->>%s, ''), 'unknown') AS value,
                    COUNT(*)::int
-            FROM {_CHAT_ROLLUP_SOURCE} src
-            WHERE ts >= %s AND ts < %s{extra}
+            FROM {_chat_rollup_source(f'ts >= %s AND ts < %s{extra}')} src
             GROUP BY user_id, value
             """,
-            (field, lo, hi),
+            (field, lo, hi, lo, hi),
         ).fetchall():
             dists.setdefault(str(uid), {}).setdefault(target, {})[str(value)] = int(n)
 

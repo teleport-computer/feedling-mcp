@@ -494,3 +494,120 @@ def test_the_scheduler_actually_calls_the_chat_freeze():
     finally:
         db.freeze_completed_chat_days = real  # type: ignore[assignment]
     assert called == ["chat"], "调度器 tick 没有调用 chat 冻结"
+
+
+def test_same_key_with_diverged_doc_is_still_one_row(clean_chat_rollup):
+    """去重按 (user_id, source_seq) 定胜,不是按整行。
+
+    codex2 的反例:UNION 去的是**整行**重,只要同一条消息在 live 与 archive 两侧
+    的 doc 或 ts 有任何差异(搬行时补字段、R2 offload 把正文换成指针、时间戳精度),
+    两行就都活下来被计两次。我原来的测试复制的是完全相同的行,所以这个反例根本
+    没被触发 —— 又一次「样本没让被测分支走到」。
+    """
+    uid = "usr_dt_golden_diverged"
+    seed_user(uid)
+    db.chat_append(uid, "x0", _T0,
+                   {"id": "x0", "role": "user", "source": "ios",
+                    "content_type": "text"}, 1000)
+    with db.get_pool().connection() as conn:
+        # 归档副本:同一 (user_id, source_seq),但 doc 与 ts 都不同
+        conn.execute(
+            "INSERT INTO chat_message_archive"
+            " (user_id, source_seq, msg_id, ts, doc, clear_generation)"
+            " SELECT user_id, seq, msg_id, ts + 0.5,"
+            "        doc || '{\"body_key\": \"r2://moved\"}'::jsonb, 1"
+            " FROM chat_messages WHERE user_id = %s", (uid,))
+    db.freeze_completed_chat_days()
+    with db.get_pool().connection() as conn:
+        total = conn.execute(
+            "SELECT SUM(total) FROM chat_daily_rollup WHERE user_id = %s",
+            (uid,)).fetchone()[0]
+    assert total == 1, "同 key 不同 doc 被计了两次 —— 去重没有按 key 定胜"
+
+
+def test_proactive_status_reads_cells_not_full_history(clean_chat_rollup,
+                                                       monkeypatch):
+    """两个 proactive status 分布必须从格子读。
+
+    只把它们冻进格子、读侧仍跑全史 GROUP BY,等于新增列只写不读、端点照样随
+    历史增长 —— 本期要消灭的正是这个。codex2 逮到的就是这一处。
+
+    判据不是「值对不对」(全史现算也能给出对的值),而是「**旧的全史查询还在不在
+    执行**」。所以这里直接把 chat_messages 挡掉:走格子就应当照样出数。
+    """
+    uid = "usr_dt_golden_pstatus"
+    seed_user(uid)
+    for index, doc in enumerate([
+        {"live_activity_status": "shown", "alert_status": "delivered"},
+        {"live_activity_status": "shown"},
+    ]):
+        mid = f"ps{index}"
+        db.chat_append(uid, mid, _T0 + index,
+                       {"id": mid, "role": "openclaw",
+                        "source": "agent_initiated_proactive",
+                        "content_type": "text", **doc}, 1000)
+    db.freeze_completed_chat_days()
+    # 冻完把 live 清空:若读侧仍现算全史,这两个分布就会变空。
+    with db.get_pool().connection() as conn:
+        conn.execute("DELETE FROM chat_messages WHERE user_id = %s", (uid,))
+
+    extra = db.admin_data_track_snapshot([uid])[uid]["proactive_extra"]
+    assert extra["live_activity_status"] == {"shown": 2}
+    assert extra["alert_status"] == {"delivered": 1, "unknown": 1}
+
+
+# --- 缺口口径 A 的生产接线(codex2 要求:不能只有函数和单测) ------------------ #
+
+
+def test_coverage_note_states_the_gap_when_freeze_is_behind():
+    """冻结落后时,页面必须写出缺了哪段,而不是让偏低的数冒充全量。"""
+    from admin import data_track
+
+    behind = data_track._render_chat_coverage_note({
+        "backfill_from": "2026-06-01", "through_day": "2026-07-01",
+        "expected_through_day": "2026-08-18", "complete": False,
+    })
+    assert "偏低" in behind
+    assert "2026-07-01" in behind and "2026-08-18" in behind
+
+
+def test_coverage_note_distinguishes_never_frozen_from_zero():
+    """一天都没冻 ≠ 这些用户没说过话。两者必须长得不一样。"""
+    from admin import data_track
+
+    never = data_track._render_chat_coverage_note({
+        "backfill_from": None, "through_day": None,
+        "expected_through_day": "2026-08-18", "complete": False,
+    })
+    assert "尚未冻结" in never
+    assert "不是「这些用户没说过话」" in never
+
+    healthy = data_track._render_chat_coverage_note({
+        "backfill_from": "2026-06-01", "through_day": "2026-08-18",
+        "expected_through_day": "2026-08-18", "complete": True,
+    })
+    assert "偏低" not in healthy and "尚未冻结" not in healthy
+    # 健康态也要说清语义,否则「累计发生」会被当成当前条数
+    assert "累计发生" in healthy
+
+    assert "暂不可用" in data_track._render_chat_coverage_note(None)
+
+
+def test_users_page_carries_the_cumulative_label_and_the_note():
+    """列名与缺口说明必须真的接进 HTML —— 只写渲染函数不接线等于没做。"""
+    import inspect
+    from admin import data_track
+
+    source = inspect.getsource(data_track)
+    assert "<th>Chat 累计发生</th>" in source, "列名没改成累计口径"
+    assert '_render_chat_coverage_note(summary.get("chat_coverage"))' in source, \
+        "缺口说明没接进 users 页"
+
+
+def test_summary_payload_exposes_coverage_at_top_level():
+    """coverage 走顶层 summary,不进每个用户行。"""
+    import inspect
+    from admin import data_track
+
+    source = inspect.getsource(data_track._data_track_payload)
+    assert '"chat_coverage": db.chat_rollup_coverage()' in source
