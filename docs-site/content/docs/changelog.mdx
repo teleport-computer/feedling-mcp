@@ -10,6 +10,25 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **Image generation now works for more OpenAI-compatible relay routes.** Some
+  routes whose provider is `openai_compatible` ended in
+  `image_generation_invalid_output` even though the upstream request had already
+  been made and billed, because the generated image arrived in a response shape
+  the route never reached or never read. Such a route is now sent to the
+  provider's `/images/generations` endpoint first and falls back to the chat
+  endpoint only when the provider explicitly refuses that endpoint for the
+  model; an authentication, quota, rate-limit, transport, or unexplained server
+  failure is returned as-is instead of being retried on the other endpoint, so
+  Feedling does not issue a second request after a failure that may represent
+  paid work. Generated images are also accepted when a provider embeds them in
+  the reply text as an inline `data:` URL. **Only inline image bytes are ever
+  read — an `http(s)` image link in a provider response is ignored and is never
+  fetched by the server.** Endpoint selection and fallback routing for official
+  OpenAI and OpenRouter routes are unchanged; image-generation requests on
+  provider wires that carry a token output budget now ask for that wire's
+  existing ceiling, because the previous fixed budget could truncate an image
+  that had already been billed.
+
 - **The test environment now enables the per-user plaintext content tier.**
   Users whose content-encryption preference is unset or `off` create plaintext
   content shapes across the API and managed workers; explicit `on` users and
