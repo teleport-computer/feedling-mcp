@@ -16,7 +16,11 @@ def _scripts(tree: str) -> ScriptDirectory:
 
 def test_rds_pre_and_test_heads_converge():
     script = _scripts("alembic")
-    assert script.get_heads() == ["0093_lane_rollup_voice"]
+    assert script.get_heads() == ["0094_chat_daily_rollup"]
+    assert (
+        script.get_revision("0094_chat_daily_rollup").down_revision
+        == "0093_lane_rollup_voice"
+    )
     assert (
         script.get_revision("0093_lane_rollup_voice").down_revision
         == "0092_lane_rollup_safe_ts"
@@ -49,7 +53,11 @@ def test_rds_pre_and_test_heads_converge():
 
 def test_tee_chain_carries_test_runtime_schema():
     script = _scripts("alembic_tee")
-    assert script.get_heads() == ["0025_lane_rollup_voice"]
+    assert script.get_heads() == ["0026_chat_daily_rollup"]
+    assert (
+        script.get_revision("0026_chat_daily_rollup").down_revision
+        == "0025_lane_rollup_voice"
+    )
     assert (
         script.get_revision("0025_lane_rollup_voice").down_revision
         == "0024_lane_rollup_safe_ts"
@@ -116,4 +124,8 @@ def test_tee_migrations_reuse_the_rds_contract_sql():
     assert (
         tee.get_revision("0025_lane_rollup_voice").module._UP
         == rds.get_revision("0093_lane_rollup_voice").module._UP
+    )
+    assert (
+        tee.get_revision("0026_chat_daily_rollup").module._UP
+        == rds.get_revision("0094_chat_daily_rollup").module._UP
     )
