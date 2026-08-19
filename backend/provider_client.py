@@ -33,10 +33,45 @@ if TYPE_CHECKING:
 log = logging.getLogger(__name__)
 
 
+@dataclass(frozen=True)
+class UpstreamErrorSignals:
+    """What the upstream error body meant, carried as booleans beside the error.
+
+    Two decisions depend on what the far end said, and both used to recover it by
+    grepping the exception's own message:
+
+    * `hosted.setup_core._looks_like_wrong_api_endpoint` — a 404 whose body is an
+      HTML page means "this address is a web page, not an API", the one hint that
+      unblocks a mis-typed relay base_url;
+    * `model_api_runtime.v2.tool_loop` — a 400 mentioning tools/functions means
+      "retry once without tools", while any other 400 must surface on its first
+      call instead of being masked as a tool-schema problem and billed twice.
+
+    Reading the message worked only because the message happens to embed the
+    upstream body today. That coupling is what makes both behaviours fragile:
+    changing how the error string is composed flips them silently, and neither
+    consumer lives anywhere near `_raise_for_provider_status`. Classifying at the
+    response — where the body is unambiguously in hand — decouples them.
+
+    ⚠️ Only booleans and stable enums may cross this boundary. Putting the text
+    on here would recreate the same coupling with extra steps.
+    """
+
+    looks_like_web_page: bool = False
+    mentions_tool_schema: bool = False
+
+
 class ProviderError(Exception):
-    def __init__(self, message: str, *, status_code: int | None = None):
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int | None = None,
+        upstream_signals: UpstreamErrorSignals | None = None,
+    ):
         super().__init__(message)
         self.status_code = status_code
+        self.upstream_signals = upstream_signals or UpstreamErrorSignals()
 
 
 # --- Genesis v2 Step 1: shared retry wrapper + failure classification ---------
@@ -481,14 +516,42 @@ def _response_error_detail(resp: httpx.Response) -> str:
     return resp.text[:240]
 
 
+_TOOL_SCHEMA_WORDS = ("tool", "function")
+_WEB_PAGE_MARKERS = ("<!doctype", "<html")
+
+
+def _upstream_error_signals(detail: str) -> UpstreamErrorSignals:
+    """Classify an upstream error body into booleans. Carries no text onward.
+
+    Same predicates the two consumers applied to the exception message, moved to
+    where the body is known rather than inferred. Note the message currently
+    embeds that body, so this is a pure decoupling: both consumers compute the
+    same answer they did before.
+    """
+    text = (detail or "").lower()
+    return UpstreamErrorSignals(
+        looks_like_web_page=any(marker in text for marker in _WEB_PAGE_MARKERS),
+        mentions_tool_schema=any(word in text for word in _TOOL_SCHEMA_WORDS),
+    )
+
+
 def _raise_for_provider_status(resp: httpx.Response) -> None:
     if resp.status_code < 400:
         return
     detail = _response_error_detail(resp)
     suffix = f": {detail}" if detail else ""
+    # NOTE: `detail` is the upstream response body and it still travels in this
+    # message — which `hosted.setup_core._provider_test_failed_body` returns to
+    # the tenant and `route.test_error` persists. That is deliberate for now: it
+    # is what surfaces a relay's own "quota exhausted" / "invalid token" text,
+    # and removing it trades a real diagnostic for a security improvement. That
+    # trade is a product decision, pending (T159). The signals below exist so
+    # that decision can be made without also silently disabling the two
+    # behaviours that need to know what the body said.
     raise ProviderError(
         f"provider_http_{resp.status_code}{suffix}",
         status_code=resp.status_code,
+        upstream_signals=_upstream_error_signals(detail),
     )
 
 

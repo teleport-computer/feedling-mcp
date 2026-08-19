@@ -1639,7 +1639,11 @@ def _looks_like_wrong_api_endpoint(exc: BaseException) -> bool:
     if _NON_JSON_MARKER in text:
         return True
     status = getattr(exc, "status_code", None)
-    return status == 404 and any(marker in text for marker in _HTML_MARKERS)
+    # 读分类信号,不再在异常文本里找 HTML 标记。两者今天答案相同(异常文本
+    # 目前就嵌着上游正文),但那个巧合正是脆弱之处:一旦 T159 决定不再回显
+    # 正文,标记匹配会**静默恒假**,这条提示消失而没有任何测试变红。
+    signals = getattr(exc, "upstream_signals", None)
+    return status == 404 and bool(getattr(signals, "looks_like_web_page", False))
 
 
 def _provider_test_failed_body(exc: BaseException) -> dict:

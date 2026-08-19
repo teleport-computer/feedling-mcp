@@ -11,6 +11,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
+import httpx
 import pytest
 
 import conftest
@@ -541,10 +542,9 @@ def test_provider_roundtrip_trace_distinguishes_schema_fallback(monkeypatch):
     async def reject_tools_once(config, messages, *, tools=None, **kwargs):
         provider_calls.append({"tools": tools, **kwargs})
         if len(provider_calls) == 1:
-            raise provider_client.ProviderError(
-                "provider rejected tool schema",
-                status_code=400,
-            )
+            # 经真实 raiser:工具 schema 判据读的是响应体分类信号,不是异常文本。
+            provider_client._raise_for_provider_status(httpx.Response(
+                400, json={"error": {"message": "provider rejected tool schema"}}))
         return {"reply": "fallback done", "tool_calls": [], "usage": {}}
 
     monkeypatch.setattr(

@@ -168,13 +168,18 @@ def _is_probably_tool_schema_rejection(exc: provider_client.ProviderError) -> bo
     schema. A 400 can equally come from the message content (e.g. an OpenAI
     Responses assistant history part sent as input_text instead of output_text).
     Dropping tools then re-sends the identical bad history — a second billed
-    call that 400s again and masks the real error as 'tool_schema_rejected'. The
-    provider surfaces its error body in the ProviderError message
-    (``provider_http_400: <detail>``), and content errors don't mention
-    tools/functions, so this gate keeps the genuine tool-schema fallback while
-    letting a content error propagate on its first call."""
-    detail = str(exc).lower()
-    return "tool" in detail or "function" in detail
+    call that 400s again and masks the real error as 'tool_schema_rejected'.
+    Content errors don't mention tools/functions, so this gate keeps the genuine
+    tool-schema fallback while letting a content error propagate on its first
+    call.
+
+    The verdict arrives as ``upstream_signals.mentions_tool_schema``, classified
+    where the response body is in hand. This used to read the body back out of
+    the message (``provider_http_400: <detail>``) — same answer today, because
+    the message still embeds it, but that made a billing-relevant fallback
+    depend on how an error string three modules away happens to be composed."""
+    signals = getattr(exc, "upstream_signals", None)
+    return bool(getattr(signals, "mentions_tool_schema", False))
 
 
 def _search_result_urls(content: str) -> set[str]:
