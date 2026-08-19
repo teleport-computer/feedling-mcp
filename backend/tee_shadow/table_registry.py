@@ -65,7 +65,11 @@ REGISTRY: dict[str, Entry] = {
     "perception_daily": Entry(MIRROR, "感知日聚合，明文；reconciler.TABLES 已覆盖"),
     "copytext_strings": Entry(MIRROR, "文案表，明文；reconciler.TABLES 已覆盖"),
     "copytext_meta": Entry(MIRROR, "文案版本哨兵单行表；reconciler.TABLES 已覆盖"),
-    "genesis_import_jobs": Entry(MIRROR, "入住导入作业元数据，明文；reconciler.TABLES 已覆盖"),
+    "genesis_import_jobs": Entry(
+        MIRROR,
+        "入住导入作业元数据，明文；worker_claimed_* 已纳入 reconciler；"
+        "resident_* 四列当前既不热路径双写也不扶正（T150 待设计决定）",
+    ),
     "genesis_import_outputs": Entry(MIRROR, "入住导入产物，明文；reconciler.TABLES 已覆盖"),
     "notify_relay_configs": Entry(MIRROR, "自部署推送中继配置；alembic_tee 0002 已建表"),
     "notify_relay_logs": Entry(MIRROR, "推送中继日志；id 是 IDENTITY 列"),
