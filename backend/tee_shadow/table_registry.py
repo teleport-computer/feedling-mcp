@@ -88,7 +88,11 @@ REGISTRY: dict[str, Entry] = {
     # ---------------------------------------------------------------- #
     "chat_messages": Entry(CIPHERTEXT, "对话正文信封 doc；worker._TABLES 已覆盖"),
     "memory_moments": Entry(CIPHERTEXT, "记忆信封 doc；worker._TABLES 已覆盖"),
-    "world_book_entries": Entry(CIPHERTEXT, "世界书信封 doc；worker._TABLES 已覆盖"),
+    "world_book_entries": Entry(
+        CIPHERTEXT,
+        "世界书信封 doc；worker._TABLES 已覆盖。T149 反向约束债：TEE 0004 多出 "
+        "user_id→users CASCADE，违反源库 parity；实库孤儿预检后应删 TEE FK",
+    ),
     "frame_envelopes": Entry(
         CIPHERTEXT,
         "帧信封；TEE 侧对应物是形状不同的 frames（R2 存储层指针），由 worker "
@@ -102,8 +106,9 @@ REGISTRY: dict[str, Entry] = {
     ),
     "v2_trajectory_events": Entry(
         CIPHERTEXT,
-        "V2 轨迹事件 payload_envelope；表级 CHECK ck_v2_trajectory_envelope 强制 "
-        "K_enclave + visibility='shared'，故服务端可解",
+        "V2 轨迹事件 payload_envelope；RDS 0072 的现行 CHECK 同时允许密文信封与 "
+        "TEE worker 产出的四键明文 body。T149 约束债：TEE 缺 5 条 CHECK；复合跨表 "
+        "FK 则由 0004 §2 有意省略并靠 worker reflow/prune 收敛，TEE-primary 后须复评",
     ),
     "model_api_credentials": Entry(
         CIPHERTEXT,
@@ -123,7 +128,11 @@ REGISTRY: dict[str, Entry] = {
     # 已实测确认这批表的 jsonb 列（payload_json / result_json / detail_json /
     # state_json / actions_json / v2_effect_outbox.payload）装的是明文，不含信封。
     # ---------------------------------------------------------------- #
-    "agent_action_queue": Entry(SNAPSHOT, "动作队列，行状态流转（UPDATE 密集），明文 payload_json"),
+    "agent_action_queue": Entry(
+        SNAPSHOT,
+        "动作队列，行状态流转（UPDATE 密集），明文 payload_json。T149/B：job_id 跨表 "
+        "FK 由 TEE 0004 §2 为独立刷新顺序有意省略；TEE-primary 后须复评",
+    ),
     "agent_jobs": Entry(SNAPSHOT, "agent 作业表，status 流转，明文"),
     "agent_runtime_instances": Entry(
         SNAPSHOT,
@@ -147,18 +156,23 @@ REGISTRY: dict[str, Entry] = {
         "V1 工具活动时间线的固定标识、状态与展示安全 detail_json；持久用户回合元数据，"
         "有追加与级联删除，整表快照天然收敛",
     ),
-    "chat_r2_cleanup": Entry(SNAPSHOT, "R2 清理队列，行会被删，明文"),
-    "chat_r2_lifecycle": Entry(SNAPSHOT, "R2 生命周期状态，UPDATE 密集，明文"),
-    "dau_daily_snapshot": Entry(SNAPSHOT, "DAU 日快照，每日批量写，明文"),
+    "chat_r2_cleanup": Entry(
+        SNAPSHOT, "R2 清理队列，行会被删，明文；T149/A：TEE 0004 派生漏 2 条 RDS CHECK"),
+    "chat_r2_lifecycle": Entry(
+        SNAPSHOT, "R2 生命周期状态，UPDATE 密集，明文；T149/A：TEE 0004 派生漏 2 条 RDS CHECK"),
+    "dau_daily_snapshot": Entry(
+        SNAPSHOT, "DAU 日快照，每日批量写，明文；T149/A：TEE 0004 派生漏 day CHECK"),
     "model_api_routes": Entry(SNAPSHOT, "BYOK 路由配置（不含凭证，凭证在 model_api_credentials），明文"),
     "perception_signal_state_v2": Entry(
         SNAPSHOT,
         "V2 感知去重基线，频繁原地 UPDATE；只含 HMAC 指纹、事件标识与时间戳，明文整表收敛",
     ),
     "provider_health": Entry(SNAPSHOT, "provider 健康状态，UPDATE 密集，明文"),
-    "retention_cohort_snapshot": Entry(SNAPSHOT, "留存 cohort 快照，批量写，明文"),
+    "retention_cohort_snapshot": Entry(
+        SNAPSHOT, "留存 cohort 快照，批量写，明文；T149/A：TEE 0004 派生漏 2 条 RDS CHECK"),
     "runtime_state": Entry(SNAPSHOT, "runtime 状态 state_json，UPDATE 密集，明文"),
-    "user_growth_daily_snapshot": Entry(SNAPSHOT, "增长日快照，批量写，明文"),
+    "user_growth_daily_snapshot": Entry(
+        SNAPSHOT, "增长日快照，批量写，明文；T149/A：TEE 0004 派生漏 day CHECK"),
     "v2_capture_batches": Entry(SNAPSHOT, "V2 捕获批次 actions_json，status 流转，明文"),
     "v2_chat_tail_anchor": Entry(
         SNAPSHOT,
@@ -167,9 +181,13 @@ REGISTRY: dict[str, Entry] = {
         SNAPSHOT,
         "V2 效果 outbox，投递后更新状态而非删行（仅账号清空时删除），明文 payload（实测非信封）",
     ),
-    "v2_effect_sink_applied": Entry(SNAPSHOT, "V2 效果幂等标记，明文"),
+    "v2_effect_sink_applied": Entry(
+        SNAPSHOT,
+        "V2 效果幂等标记，明文；T149/A：TEE 0004 派生漏 claim_state CHECK",
+    ),
     "v2_mcp_mutation_attempts": Entry(SNAPSHOT, "V2 MCP 变更尝试记录，明文"),
-    "v2_runtime_control": Entry(SNAPSHOT, "V2 运行时总控单行表，明文"),
+    "v2_runtime_control": Entry(
+        SNAPSHOT, "V2 运行时总控单行表，明文；T149/A：TEE 0004 派生漏 id=1 CHECK"),
     "v2_runtime_state": Entry(SNAPSHOT, "V2 per-user 运行时 fence，UPDATE 密集，明文"),
     "v2_sandbox_usage_events": Entry(SNAPSHOT, "V2 sandbox 用量事件，明文"),
     "v2_terminal_failure_outbox": Entry(
@@ -191,9 +209,11 @@ REGISTRY: dict[str, Entry] = {
         SNAPSHOT,
         "Admin 用量 rollup 的 bootstrap/cursor/error 控制面；必须与扶正后的派生表同库推进",
     ),
-    "v2_user_allowlist": Entry(SNAPSHOT, "V2 灰度名单，UPDATE 密集，明文"),
+    "v2_user_allowlist": Entry(
+        SNAPSHOT, "V2 灰度名单，UPDATE 密集，明文；T149/A：TEE 0004 派生漏 desired CHECK"),
     "v2_wake_schedule": Entry(SNAPSHOT, "V2 唤醒排程，UPDATE 密集，明文"),
-    "v2_worker_heartbeats": Entry(SNAPSHOT, "V2 worker 心跳，UPDATE 密集，明文"),
+    "v2_worker_heartbeats": Entry(
+        SNAPSHOT, "V2 worker 心跳，UPDATE 密集，明文；T149/A：TEE 0004 派生漏 capacity CHECK"),
 
     # ---------------------------------------------------------------- #
     # SKIP —— 永远不进 TEE。理由必须具体。
