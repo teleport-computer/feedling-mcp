@@ -261,6 +261,15 @@ def main(
             )
         )
     finally:
+        # Seal the child process's trace-rate writer on a graceful drain.  A
+        # watchdog SIGKILL cannot run this and intentionally leaves a stale
+        # heartbeat for the seven-day ruler to flag as an unknown crash gap.
+        try:
+            import debug_trace
+
+            debug_trace.stop_trace_stats_writer()
+        except Exception:  # noqa: BLE001 — process cleanup remains best-effort
+            pass
         try:
             conn.close()
         except Exception:  # noqa: BLE001 — best-effort fd cleanup on the way out

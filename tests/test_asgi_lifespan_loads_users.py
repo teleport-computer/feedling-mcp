@@ -22,6 +22,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 import asgi.lifespan as lifespan_mod  # noqa: E402
+import debug_trace  # noqa: E402
 from accounts import registry as accounts_registry  # noqa: E402
 from asgi import threadpool  # noqa: E402
 from core import store as core_store  # noqa: E402
@@ -40,6 +41,16 @@ async def test_lifespan_loads_registry_before_wake_bus(monkeypatch):
     monkeypatch.setattr(lifespan_mod, "_start_ws_leader", lambda: calls.append("ws"))
     monkeypatch.setattr(threadpool, "configure_thread_limiter", lambda: None)
     monkeypatch.setattr(core_store, "set_async_wake_hook", lambda _fn: None)
+    monkeypatch.setattr(
+        debug_trace,
+        "start_trace_stats_writer",
+        lambda: calls.append("trace_stats"),
+    )
+    monkeypatch.setattr(
+        debug_trace,
+        "stop_trace_stats_writer",
+        lambda: calls.append("trace_stats_stop"),
+    )
 
     # run_db normally hops to the threadpool; here just invoke the callable so the
     # spy fires synchronously.
@@ -56,3 +67,5 @@ async def test_lifespan_loads_registry_before_wake_bus(monkeypatch):
     assert calls.index("load_users") < calls.index("wake_bus"), (
         "load_users() must run before the wake bus starts listening"
     )
+    assert calls.count("trace_stats") == 1
+    assert calls.count("trace_stats_stop") == 1

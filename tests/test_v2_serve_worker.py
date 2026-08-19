@@ -19,6 +19,7 @@ from model_api_runtime.v2 import (
     summary_frontier as v2_summary_frontier,
     worker,
 )
+import debug_trace
 
 
 def _fake_serve_from_script(script, calls):
@@ -398,10 +399,19 @@ def test_main_configures_parent_pool_to_eight_before_db_startup(monkeypatch):
         serve_worker.accounts_registry, "start_periodic_full_reload", lambda: None
     )
     monkeypatch.setattr(serve_worker, "_run_forever", lambda *_args: None)
+    monkeypatch.setattr(
+        debug_trace,
+        "stop_trace_stats_writer",
+        lambda: order.append(("trace_stop", None)),
+    )
 
     serve_worker.main()
 
-    assert order == [("configure", 8), ("init", None)]
+    assert order == [
+        ("configure", 8),
+        ("init", None),
+        ("trace_stop", None),
+    ]
 
 
 @pytest.mark.parametrize("raw", ["0", "-1", "nan", "inf", "nope"])
