@@ -472,6 +472,28 @@ jobs:
             exit 1
           fi
 
+      - name: Run trace write-rate ruler suite (needs its own database)
+        env:
+          FEEDLING_TEST_PG: "postgresql://postgres:postgres@127.0.0.1:5432/postgres"
+        run: |
+          # ⚠️ 必须单独一次 pytest 调用,别并进上面的合并步骤 —— 同 admin usage
+          # 那一条的理由,不是巧合而是同一类指标。
+          #
+          # `trace_write_stats_measurement` 的 measurement_started_epoch 是
+          # **全表** MIN(first_seen_at),没有任何窗口过滤。这在生产里是对的语义
+          # ("尺子什么时候开始记的"),在共享测试库里是致命的:conftest 每个
+          # pytest 进程建一个库、进程内所有文件共享它,所以别的文件留下的真实
+          # 时间行会把地板拉回去,冻结在 2027 的用例于是把自己的 25 小时窗口
+          # 读成 ~4300 小时(实测 4304.035 vs 25.0)。
+          #
+          # 这不是测试写错了 —— 全局指标本来就该按全局断言;它只是需要独占的库。
+          # 独占之后另有一个副作用是必须的:常开的 debug-trace-stats-flush 线程
+          # 本文件从不启动(唯一的 _enqueue 前面把 _ensure_worker_started 掐掉了),
+          # 所以独占进程里根本不存在"刷盘已在途"那条竞态。
+          python -m pytest \
+            tests/test_trace_write_stats.py \
+            -v
+
       - name: Run admin usage snapshot suite (needs its own database)
         env:
           FEEDLING_TEST_PG: "postgresql://postgres:postgres@127.0.0.1:5432/postgres"
@@ -744,7 +766,6 @@ jobs:
             tests/test_v2_jobs_migration.py \
             tests/test_lane_rollup.py \
             tests/test_data_track_snapshot_golden.py \
-            tests/test_trace_write_stats.py \
             tests/test_v2_jobs_store.py \
             tests/test_v2_enclave_broker.py \
             tests/test_v2_job_lease_fencing.py \

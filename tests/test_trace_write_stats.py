@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import queue
 import sys
-import threading
 import time
 from datetime import datetime
 from pathlib import Path
@@ -18,96 +17,38 @@ import debug_trace
 import conftest
 
 
-_STATS_FLUSH_THREAD = "debug-trace-stats-flush"
+@pytest.fixture(autouse=True)
+def _start_each_case_from_an_empty_ruler_table():
+    """Best-effort cleanup for LOCAL whole-suite runs. CI gives this file its
+    own database instead — see the dedicated step in .github/workflows/ci.yml.
 
-# Held for the whole duration of a background ruler write, so a purge can wait
-# out a flush that is already inside the database call.  Silencing the flusher's
-# *decision* (``heartbeat_due``) is not enough: ``_flush_trace_stats`` releases
-# ``_stats_lock`` before it calls ``db.upsert_trace_write_stats``, so a flush can
-# already be past every in-process signal and still land its rows after a purge.
-_ruler_write_gate = threading.Lock()
-_ruler_background_writes_blocked = False
+    ``measurement_started_epoch`` is ``MIN(first_seen_at)`` over the WHOLE
+    table, with no window.  That is right in production ("when did the ruler
+    first record anything") and unusable in a shared test database: one row
+    another file left drags the floor back to real time, so a case that freezes
+    ``now`` in 2027 reads its elapsed window as ~4300 hours instead of 25 and
+    the seven-day gate assertion fails for a reason unrelated to the gate.
 
+    A global metric deserves a global assertion; what it needs is an exclusive
+    database, exactly as ``tests/test_admin_usage.py`` already documents for the
+    same reason.  So the real fix is the separate CI step, and this fixture only
+    removes rows that are already there.
 
-def _guarded_upsert_trace_write_stats(real, *args, **kwargs):
-    with _ruler_write_gate:
-        if (
-            _ruler_background_writes_blocked
-            and threading.current_thread().name == _STATS_FLUSH_THREAD
-        ):
-            return None
-        return real(*args, **kwargs)
-
-
-def _purge_ruler_tables_behind_the_gate() -> None:
-    """Delete while holding the gate, so an in-flight write cannot follow us."""
-    with _ruler_write_gate:
+    ⚠️ It does NOT close the in-flight race codex2 reproduced: the flusher
+    releases ``_stats_lock`` before ``db.upsert_trace_write_stats``, so a write
+    already inside that call can still land after this delete.  This file never
+    starts that thread (``_ensure_worker_started`` is stubbed before the only
+    ``_enqueue``), so the window needs another file's thread plus a shared
+    process — which is precisely the arrangement the CI step removes.
+    """
+    def _purge() -> None:
         with db.get_pool().connection() as conn:
             conn.execute("DELETE FROM trace_write_stats")
             conn.execute("DELETE FROM trace_write_stats_health")
 
-
-@pytest.fixture(scope="session", autouse=True)
-def _route_ruler_writes_through_a_gate():
-    """Put every ruler write behind one gate for this session.
-
-    Installed session-wide (not per case) on purpose: a gate that appears
-    half-way through cannot see a write that entered before it existed, and
-    that unobservable write is exactly the one that repopulates a purged table.
-    """
-    patch = pytest.MonkeyPatch()
-    real = db.upsert_trace_write_stats
-    def gated(*a, **kw):
-        return _guarded_upsert_trace_write_stats(real, *a, **kw)
-
-    # Exposed so the in-flight regression can reach the genuine writer instead
-    # of re-implementing it — a hand-copied stand-in would stop matching the
-    # moment the real one changes.
-    gated.__wrapped_real__ = real
-    patch.setattr(db, "upsert_trace_write_stats", gated)
+    _purge()
     yield
-    patch.undo()
-
-
-@pytest.fixture(autouse=True)
-def _only_this_test_owns_the_ruler_tables(_route_ruler_writes_through_a_gate):
-    """Give every case in this file the whole ruler table to itself.
-
-    ``measurement_started_epoch`` is ``MIN(first_seen_at)`` over the WHOLE
-    table, with no window — that is right in production ("when did the ruler
-    first record anything") and fatal in a shared test database.  Any row left
-    by an earlier file drags the floor back to real 2026 time, so a case that
-    freezes ``now`` in 2027 reads its elapsed window as ~4300 hours instead of
-    25 and the seven-day gate assertion fails for a reason that has nothing to
-    do with the gate.
-
-    Three leak paths, all closed at the boundary each one actually crosses:
-      * rows another file wrote — deleted before and after each case;
-      * the always-on flusher deciding to write again — its accumulator is
-        cleared and a fresh success stamped, so ``heartbeat_due`` stays false
-        for a minute, orders of magnitude longer than a case;
-      * a flush ALREADY inside the database write — the purge takes the same
-        gate that write holds, so it waits the write out instead of racing it,
-        and further background writes are dropped for the rest of the case.
-        codex2 reproduced this one deterministically: without the gate, a
-        blocked in-flight flush released after the purge left health_rows=1.
-    """
-    global _ruler_background_writes_blocked
-
-    with _ruler_write_gate:
-        _ruler_background_writes_blocked = True
-        with debug_trace._stats_lock:
-            debug_trace._stats_totals.clear()
-            debug_trace._stats_flushed.clear()
-            debug_trace._stats_first_seen.clear()
-            debug_trace._stats_last_flush_success_at = time.time()
-    _purge_ruler_tables_behind_the_gate()
-    yield
-    # Purge first, unblock second: the reverse order re-opens the window for one
-    # background write between the delete and the end of the case.
-    _purge_ruler_tables_behind_the_gate()
-    with _ruler_write_gate:
-        _ruler_background_writes_blocked = False
+    _purge()
 
 
 def _reset_stats(monkeypatch, *, pid: int = 4242) -> None:
@@ -738,74 +679,3 @@ def test_the_resident_lower_bound_rides_with_the_number_it_limits(backend_env):
         with db.get_pool().connection() as conn:
             conn.execute("DELETE FROM trace_write_stats WHERE day=%s", (day,))
         _delete_health(writer)
-
-
-def test_purge_waits_out_a_flush_already_inside_the_database_write(backend_env):
-    """The isolation barrier must cover the write, not just the decision to write.
-
-    ``_flush_trace_stats`` releases ``_stats_lock`` BEFORE it calls
-    ``db.upsert_trace_write_stats``.  So a background flush can be past every
-    in-process signal the fixture can see, still inside the database call, and
-    land its rows after the purge — repopulating a table the case believes it
-    owns.  codex2 reproduced exactly this: purge, then ``health_rows == 1``.
-
-    Silencing ``heartbeat_due`` cannot close it; only sharing a gate with the
-    write itself can.  This case widens that window deliberately and asserts the
-    purge blocks on it instead of racing it.
-    """
-    global _ruler_background_writes_blocked
-
-    inside_the_write = threading.Event()
-    may_finish_the_write = threading.Event()
-    real_upsert = db.upsert_trace_write_stats.__wrapped_real__
-
-    def blocking_upsert(*args, **kwargs):
-        inside_the_write.set()
-        assert may_finish_the_write.wait(10), "test rig deadlocked"
-        return real_upsert(*args, **kwargs)
-
-    writer = threading.Thread(
-        name=_STATS_FLUSH_THREAD,
-        target=lambda: _guarded_upsert_trace_write_stats(
-            blocking_upsert, [], writer_health=("in-flight-writer", 1_800_000_000.0, None, 0, 0, 0),
-        ),
-    )
-    purge_returned = threading.Event()
-
-    def purge():
-        _purge_ruler_tables_behind_the_gate()
-        purge_returned.set()
-
-    purger = threading.Thread(target=purge)
-    with _ruler_write_gate:
-        _ruler_background_writes_blocked = False  # pre-fixture state
-    try:
-        writer.start()
-        assert inside_the_write.wait(10), "the rig never entered the write"
-
-        purger.start()
-        # The whole point: the purge must NOT be able to run to completion while
-        # a write is still inside.  Without the gate it returns immediately here
-        # and the row lands behind it.
-        assert not purge_returned.wait(1.0), (
-            "purge completed while a background write was still in flight — "
-            "the barrier does not cover the write boundary"
-        )
-
-        may_finish_the_write.set()
-        writer.join(10)
-        purger.join(10)
-        assert purge_returned.is_set()
-
-        with db.get_pool().connection() as conn:
-            leftover = conn.execute(
-                "SELECT count(*) FROM trace_write_stats_health"
-            ).fetchone()[0]
-        assert leftover == 0, "an in-flight flush survived the purge"
-    finally:
-        may_finish_the_write.set()
-        writer.join(10)
-        purger.join(10)
-        with _ruler_write_gate:
-            _ruler_background_writes_blocked = True
-        _purge_ruler_tables_behind_the_gate()
