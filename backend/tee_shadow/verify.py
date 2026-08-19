@@ -39,6 +39,8 @@ from typing import Callable
 
 import db
 import object_storage
+from plaintext_shadow import config as plaintext_shadow_config
+from plaintext_shadow.config import TargetPolicy
 from tee_replicator import transforms
 from tee_replicator import worker as _worker
 from tee_shadow import mirror, reconciler
@@ -308,7 +310,13 @@ def _diff_docs(table: str, user_id: str, item_id: str, expected: dict, actual, p
     return out
 
 
-def _expected_doc(user_id: str, doc: dict, transform, decrypt_cache: dict):
+def _expected_doc(
+    user_id: str,
+    doc: dict,
+    transform,
+    decrypt_cache: dict,
+    target_policy: TargetPolicy | None = None,
+):
     """RDS 行 → TEE 里**应当**是什么。返回 ``(expected, decrypt_error)``。
 
     对账口径必须跟着搬运口径走（Task 2.4）：加密档的行复制层不解密，verify 若还
@@ -324,7 +332,7 @@ def _expected_doc(user_id: str, doc: dict, transform, decrypt_cache: dict):
     一条 "envelope missing body_ct" 让 verify 整趟抛异常、再被 tee_sync_scheduler
     的兜底 except 静默吞掉 → verify_ran 24h 恒 false。
     """
-    if _worker._carries_verbatim(user_id):
+    if _worker._carries_verbatim(user_id, target_policy):
         return transforms.carry_verbatim(doc), None
     decrypt = _get_decrypt(decrypt_cache, user_id)
     try:
@@ -362,7 +370,8 @@ def _plaintext_pointer_integrity_error(user_id: str, doc: dict) -> str | None:
 
 def _sample_ciphertext_content(key: str, cfg: dict, sample_rate: float,
                                 pending_rows: list[tuple[str, str]],
-                                decrypt_cache: dict[str, Callable]) -> list[dict]:
+                                decrypt_cache: dict[str, Callable],
+                                target_policy: TargetPolicy | None = None) -> list[dict]:
     rds_where = f" WHERE {cfg['rds_where']}" if cfg.get("rds_where") else ""
     tee_where_extra = f" AND {cfg['tee_where']}" if cfg.get("tee_where") else ""
     item_col = cfg["item_col"]
@@ -405,7 +414,7 @@ def _sample_ciphertext_content(key: str, cfg: dict, sample_rate: float,
                     "error": integrity_error,
                 })
             expected, decrypt_error = _expected_doc(
-                user_id, doc, transform, decrypt_cache)
+                user_id, doc, transform, decrypt_cache, target_policy)
             if expected is None:
                 if decrypt_error is None:
                     continue  # PendingDeviceMigration：跳过，理由见 _expected_doc
@@ -522,6 +531,7 @@ def run(*, sample_rate: float = 0.02) -> dict:
     tables: dict[str, dict] = {}
     mismatches: list[dict] = []
     decrypt_cache: dict[str, Callable] = {}
+    target_policy = plaintext_shadow_config.load_target()
 
     for table in reconciler.TABLES:
         tables[table] = _plaintext_table_report(table)
@@ -575,7 +585,15 @@ def run(*, sample_rate: float = 0.02) -> dict:
             mismatches.extend(_sample_frames(key, cfg, sample_rate, terminal_rows))
         else:
             mismatches.extend(
-                _sample_ciphertext_content(key, cfg, sample_rate, terminal_rows, decrypt_cache))
+                _sample_ciphertext_content(
+                    key,
+                    cfg,
+                    sample_rate,
+                    terminal_rows,
+                    decrypt_cache,
+                    target_policy,
+                )
+            )
 
     rows_ok = all(t["rows_ok"] for t in tables.values())
     # strict_ok：忽略 advisory 放宽，逐表的严格判据是否全过。表没有单独的

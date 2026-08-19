@@ -9,14 +9,21 @@ import os
 import threading
 import time
 
+from plaintext_shadow import config as plaintext_shadow_config
+
 log = logging.getLogger("feedling.tee_shadow")
 _pool = None
+_pool_dsn: str | None = None
 _pool_lock = threading.Lock()
 _failures = 0
 _failures_lock = threading.Lock()
 
 
 def enabled() -> bool:
+    target = plaintext_shadow_config.load_target()
+    if target is not None:
+        plaintext_shadow_config.validate_startup()
+        return True
     # Once DATABASE_URL is the promoted TEE database there is no shadow target.
     # Fail closed even if stale rollout secrets still carry the old dual-write
     # flag/DSN; otherwise a request could write the primary twice or resurrect
@@ -126,12 +133,28 @@ def _tcp_user_timeout_ms() -> int:
         return 30000
 
 
-def get_tee_pool():
-    global _pool
-    if _pool is None:
+def _target_dsn(policy=None) -> str:
+    if policy is not None:
+        return policy.dsn
+    target = plaintext_shadow_config.load_target()
+    if target is not None:
+        plaintext_shadow_config.validate_startup()
+        return target.dsn
+    dsn = os.environ.get("TEE_DATABASE_URL", "").strip()
+    if not dsn:
+        raise RuntimeError("shadow database is not configured")
+    return dsn
+
+
+def get_target_pool(policy=None):
+    global _pool, _pool_dsn
+    dsn = _target_dsn(policy)
+    if _pool is None or _pool_dsn != dsn:
         with _pool_lock:
-            if _pool is None:
+            if _pool is None or _pool_dsn != dsn:
                 from psycopg_pool import ConnectionPool
+                if _pool is not None:
+                    _pool.close()
                 # connect_timeout:单条连接的建立上限,防止一次网关握手无限期挂住占着
                 #   pool 的补给名额。
                 # keepalives:内核每 30s 发 TCP 探活,尽量别让网关按空闲掐断。
@@ -147,7 +170,7 @@ def get_tee_pool():
                 if tcp_ut:
                     kwargs["tcp_user_timeout"] = tcp_ut
                 _pool = ConnectionPool(
-                    os.environ["TEE_DATABASE_URL"],
+                    dsn,
                     min_size=_pool_min(),
                     max_size=_pool_max(),
                     timeout=_pool_timeout(),
@@ -158,7 +181,13 @@ def get_tee_pool():
                     kwargs=kwargs,
                     open=True,
                 )
+                _pool_dsn = dsn
     return _pool
+
+
+def get_tee_pool():
+    """Compatibility alias for callers that mean the active shadow target."""
+    return get_target_pool()
 
 
 def failure_count() -> int:
@@ -172,7 +201,9 @@ def probe() -> dict:
 
     走 ``get_tee_pool()`` 的既有池（受 ``_pool_timeout`` 上限约束),所以探活也享受
     2s 短超时——TEE 卡住时探活自己不会把调用方拖住。"""
-    if not os.environ.get("TEE_DATABASE_URL"):
+    try:
+        _target_dsn()
+    except RuntimeError:
         return {"ok": False, "latency_ms": None, "error": "unconfigured"}
     t0 = time.monotonic()
     try:
