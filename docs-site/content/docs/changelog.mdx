@@ -10,6 +10,12 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **The test environment now enables the per-user plaintext content tier.**
+  Users whose content-encryption preference is unset or `off` create plaintext
+  content shapes across the API and managed workers; explicit `on` users and
+  unknown users remain encrypted. Existing ciphertext remains readable and is
+  not rewritten by this deployment switch. Production remains closed.
+
 - **Memory Garden list synchronization now supports lossless cursor pagination.**
   `GET /v1/memory/list` returns `next_cursor`, keeps `total` equal to the full
   filtered count on every page, and uses memory ID to disambiguate cards with

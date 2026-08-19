@@ -2486,6 +2486,33 @@ jobs:
             fi
           done
           exit "$publish_status"
+
+      # TEST deploys main-first deliberately: the updated backend continues to
+      # accept ciphertext from an older runner, while runner-first could emit
+      # plaintext to a backend whose fail-safe gate is still closed. Treat the
+      # two CVMs as released only after every reply writer reports the new gate.
+      - name: Verify live TEST plaintext gate release unit
+        env:
+          PHALA_CLOUD_API_KEY: ${{ secrets.TEST_PHALA_CLOUD_API_KEY }}
+          RUNNER_CVM_ID:       ${{ steps.cvmid.outputs.cvm_id }}
+        run: |
+          MAIN_CVM_ID=$(tr -d '[:space:]' < deploy/test-cvm-id.txt)
+          KEY=FEEDLING_PLAINTEXT_WRITES_ACCEPTED
+
+          verify_gate() {
+            cvm_id="$1"
+            container="$2"
+            if ! phala ssh --api-token "$PHALA_CLOUD_API_KEY" "$cvm_id" -- \
+              docker exec "$container" printenv "$KEY" | tr -d '\r' | grep -qx '1'; then
+              echo "::error::$container on $cvm_id does not report $KEY=1"
+              return 1
+            fi
+            echo "$container on $cvm_id reports $KEY=1"
+          }
+
+          verify_gate "$MAIN_CVM_ID" feedling-test-backend-1
+          verify_gate "$MAIN_CVM_ID" serve-worker
+          verify_gate "$RUNNER_CVM_ID" agent-runner
       # No post-deploy Runtime V2 fleet gate here — this CVM runs the V1
       # agent-runner, which has no v2_worker_heartbeats identity to check.
       # The main test CVM's serve-worker liveness is proved separately by the

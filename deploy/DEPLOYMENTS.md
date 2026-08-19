@@ -268,6 +268,7 @@ python tools/verify_enclave_domain.py \
 | Public API | `https://test-api.feedling.app` (via dstack-ingress — live, `/healthz` 200) |
 | Public MCP | 已下线（FastMCP 服务器 2026-06-12 移除） |
 | Database | **TEE primary is live since 2026-08-18**, promoted by test release [`82c4c019`](https://github.com/teleport-computer/feedling-mcp/commit/82c4c019da24e6bfbe47d05411c0f812bf519ae7). `TEST_DATABASE_URL` is the TEE `app`-role DSN shared by the main CVM and runner, `TEST_FEEDLING_DATABASE_SCHEMA=tee`, and the old dual-write secret is absent. CI verified the owner/app database fingerprint, `alembic_tee` head, and application startup contract before changing either CVM. The former RDS is a frozen pre-cutover snapshot only; after the first TEE-primary write it is not a lossless rollback target without reverse reconciliation. |
+| Content shape | `FEEDLING_PLAINTEXT_WRITES_ACCEPTED=1` is set on the backend, in-CVM `serve-worker`, and independent runner. Known users whose preference is unset or `off` create plaintext rows; explicit `on` and unknown users remain encrypted. Historical ciphertext remains supported and is not rewritten by this deployment switch. |
 | On-chain | **Separate** Sepolia FeedlingAppAuth `0x9AC034AAEf6Bb80690Be4d1f698b51796Bb7F2D5` (owner = the `ETH_DEPLOYER_KEY` address `0xa0eBcd26…`, so the CI `addComposeHash` is authorized), kept apart from prod's contract so the prod release log stays clean. Address lives in repo var `TEST_FEEDLING_APP_AUTH_CONTRACT`. Each `deploy-test-cvm` run publishes the live compose_hash here, fail-loud, same as prod. Deployed 2026-06-09 via a one-shot `workflow_dispatch` (since removed). |
 | Deploy path | GitHub Actions `deploy-test-cvm` job (in `ci.yml`) on push to the `test` branch. Mirrors prod but targets the test compose / CVM / DB / contract and is branch-gated to `refs/heads/test`. |
 | First-boot note | The CVM was first created 2026-06-09 WITHOUT a CF token (to mint the app_id quickly), so `dstack-ingress` couldn't issue the `test-*.feedling.app` LE certs initially. The `test`-branch CI deploy injects `CF_*` from GitHub secrets — domains + certs are now live. Backend also needed the test RDS reachable from the CVM (Publicly accessible + SG inbound 5432) before it stopped crash-looping. |
@@ -349,10 +350,9 @@ in test, pre, and production.
 | Deploy path | CI `deploy-pre-cvm` job (in `ci.yml`) on push to the `pre` branch. Clone of `deploy-test-cvm` with pre compose / CVM / DB / contract, branch-gated to `refs/heads/pre`. |
 
 The pre backend sets `FEEDLING_PLAINTEXT_WRITES_ACCEPTED=1` to exercise PR #131's
-per-user plaintext tier. The code default is closed and the test/prod manifests
-intentionally omit the variable, so merging the implementation cannot enable
-plaintext writes outside pre. Unknown users and users whose effective preference
-is `on` still write encrypted envelopes.
+per-user plaintext tier. Test also opens the gate after its TEE-primary promotion;
+production remains closed by default. Unknown users and users whose effective
+preference is `on` still write encrypted envelopes.
 | Baseline | Set repo var `PRE_ENCLAVE_CONTENT_PK_BASELINE` from a manual `/attestation` read after the first healthy deploy (the attestation gate is inert until then). |
 
 部署后从仓库根目录验证 pre 自定义 enclave 域名的 live ingress evidence；
