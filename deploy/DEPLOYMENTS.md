@@ -730,7 +730,9 @@ WAL-G 备份；test/prod 已接双写 + in-process 同步调度器，pre 在首�
   流程分存（Phase 1 / P1T4）。
 - **证书重签**：用 `deploy/postgres/gen-certs.sh` 重签 server/client TLS 证书，
   把 `TEE_DATABASE_URL` 的 sslmode/根证书接进后端 secrets（P1T1）。
-- **restore 演练**：开通前跑一次 WAL-G 全量 restore + PITR 演练，确认备份可用
+- **restore 演练**：开通前跑一次 WAL-G 全量 restore + PITR 演练；执行
+  `restore-start-and-wait.sh` 并确认 `pg_is_in_recovery() = false`，不能把
+  `pg_ctl -w` 当作 WAL 回放完成
   （Phase 1 验收）。
 - **Phase 1 验收清单**：走一遍 reconcile → replicate → verify（`ok==true`）
   的三段收敛，作为停 RDS gate 的硬条件（P2T7 / plan Phase 1 验收 Task）。

@@ -11,7 +11,18 @@ BACKUP_NAME="${1:-LATEST}"
 export AWS_S3_FORCE_PATH_STYLE="true" AWS_REGION="${AWS_REGION:-auto}"
 # pg_ctl / pg_controldata 不一定在 PATH 上（官方镜像里在 /usr/lib/postgresql/*/bin）。
 # 演练时踩过：pg_isready 有、pg_ctl 没有。
-PGBIN="$(dirname "$(command -v pg_controldata || command -v postgres || echo /usr/lib/postgresql/18/bin/x)")"
+if [ -n "${PG_BIN_DIR:-}" ]; then
+    PGBIN="$PG_BIN_DIR"
+elif command -v pg_config >/dev/null 2>&1; then
+    PGBIN="$(pg_config --bindir)"
+elif command -v pg_controldata >/dev/null 2>&1; then
+    PGBIN="$(dirname "$(command -v pg_controldata)")"
+elif command -v postgres >/dev/null 2>&1; then
+    PGBIN="$(dirname "$(command -v postgres)")"
+else
+    echo "[restore] FATAL: PostgreSQL binaries not found; set PG_BIN_DIR" >&2
+    exit 1
+fi
 export PATH="$PGBIN:$PATH"
 
 echo "[restore] available backups:"; wal-g backup-list

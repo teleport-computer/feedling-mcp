@@ -33,9 +33,11 @@ RUN printf '%s\n' \
     && chmod 0644 /etc/cron.d/walg-backup
 
 COPY postgres/pg_hba.conf /etc/postgresql/pg_hba.conf
-COPY postgres/backup-push.sh postgres/restore.sh postgres/ensure-roles.sh \
+COPY postgres/backup-push.sh postgres/restore.sh postgres/restore-start-and-wait.sh \
+     postgres/ensure-roles.sh \
      postgres/entrypoint-wrapper.sh /usr/local/bin/
 RUN chmod +x /usr/local/bin/backup-push.sh /usr/local/bin/restore.sh \
+    /usr/local/bin/restore-start-and-wait.sh \
     /usr/local/bin/ensure-roles.sh /usr/local/bin/entrypoint-wrapper.sh
 # 构建期断言：PATH 修复（463f6b7b）曾在一次"从 docker ps 抄现役 tag"的重部署里被
 # 悄悄带走，且只有等到次日 03:00 备份失败才暴露。让镜像根本构建不出来，比等监控报警快。
