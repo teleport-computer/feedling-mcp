@@ -65,6 +65,8 @@ x-agent-runner-env: &agent-runner-env
   # Must flip atomically with DATABASE_URL during a Phase-4 promotion.
   # Child processes inherit the selector and assert the TEE migration head.
   FEEDLING_DATABASE_SCHEMA: "${FEEDLING_DATABASE_SCHEMA:-rds}"
+  # Keep resident/worker writes aligned with TEST backend's plaintext tier.
+  FEEDLING_PLAINTEXT_WRITES_ACCEPTED: "1"
   R2_ENDPOINT: "${R2_ENDPOINT:-}"
   R2_ACCESS_KEY_ID: "${R2_ACCESS_KEY_ID:-}"
   R2_SECRET_ACCESS_KEY: "${R2_SECRET_ACCESS_KEY:-}"
@@ -86,7 +88,7 @@ services:
   # + chat checkpoint always live in one place, so a lease that re-acquires here
   # resumes from a consistent cursor (no cross-runner stale-checkpoint wedge).
   agent-runner:
-    image: ghcr.io/teleport-computer/feedling-agent-runner:d4f3cae   # CI pins the sha
+    image: ghcr.io/teleport-computer/feedling-agent-runner:816109f   # CI pins the sha
     container_name: agent-runner
     command: ["python", "-u", "backend/agent_runtime/supervisor.py"]
     restart: unless-stopped

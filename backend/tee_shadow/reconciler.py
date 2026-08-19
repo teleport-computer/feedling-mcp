@@ -44,7 +44,8 @@ TABLES: dict[str, tuple[tuple[str, ...], str]] = {
         "user_id, job_id, status, source_kind, file_manifest_hash, total_chunks, "
         "received_chunks, processed_chunks, total_bytes, received_bytes, privacy_mode, "
         "metadata, output, memory_action_count, identity_status, persona_ref, "
-        "persona_sha256, error, created_at, updated_at, finalized_at, completed_at",
+        "persona_sha256, error, created_at, updated_at, finalized_at, completed_at, "
+        "worker_claimed_by, worker_claimed_at",
     ),
     # PK 有三列 (user_id, job_id, output_type)，不是两列；且没有单一 doc 列。
     "genesis_import_outputs": (

@@ -122,3 +122,31 @@ def test_clean_run_passes(canary_env, monkeypatch, capsys):
     monkeypatch.setattr(dc, "_http", _stub_http(reset_status=200))
     dc.main()  # no SystemExit
     assert "CANARY OK" in capsys.readouterr().out
+
+
+def test_test_plaintext_expectation_accepts_effective_off(
+    canary_env, monkeypatch, capsys
+):
+    inner = _stub_http(reset_status=200)
+
+    def plaintext_whoami(method, url, **kw):
+        status, body = inner(method, url, **kw)
+        if url.endswith("/v1/users/whoami"):
+            body["content_encryption_effective"] = "off"
+        return status, body
+
+    monkeypatch.setattr(dc, "EXPECT_PLAINTEXT", True)
+    monkeypatch.setattr(dc, "_http", plaintext_whoami)
+    dc.main()
+    assert "plaintext effective tier = off" in capsys.readouterr().out
+
+
+def test_test_plaintext_expectation_rejects_effective_on(
+    canary_env, monkeypatch, capsys
+):
+    monkeypatch.setattr(dc, "EXPECT_PLAINTEXT", True)
+    monkeypatch.setattr(dc, "_http", _stub_http(reset_status=200))
+    with pytest.raises(SystemExit) as exc:
+        dc.main()
+    assert exc.value.code == 1
+    assert "content_encryption_effective" in capsys.readouterr().err
