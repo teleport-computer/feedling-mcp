@@ -194,8 +194,13 @@ SCHEDULED_LEASE_REQUEUE_MAX_ATTEMPTS = _positive_int_env(
 # Shared by the periodic lease reaper and the eager watchdog recovery path.
 # Keeping the SQL predicate single-sourced prevents either recovery mechanism
 # from silently widening scheduled whole-turn replay in the future.
-_SCHEDULED_REQUEUE_SAFETY_SQL = (
-    "AND attempt_count < %s "
+# 「这一轮还是 pristine 吗」—— 唯一定义。整轮重放只在这条为真时安全。
+# ⚠️ 它能看见的只有两张表:`v2_mcp_mutation_attempts` 和 `v2_effect_outbox`。
+# 因此它对**直写**的 lane 结构上无效 —— dream 走
+# `memory_core.actions`(那个模块里 `effect_outbox` 出现 0 次),把这条谓词
+# 套到 dream 上只会让它显示成「已受保护」而实际不受保护,比不套更坏。
+# 各 lane 的归类见 `_PRISTINE_GUARDED_WAKE_LANES` 附近的说明。
+_PRISTINE_TURN_SQL = (
     "AND NOT EXISTS ("
     "  SELECT 1 FROM v2_mcp_mutation_attempts a "
     "  WHERE a.job_id=agent_jobs.id) "
@@ -204,6 +209,41 @@ _SCHEDULED_REQUEUE_SAFETY_SQL = (
     "  WHERE e.job_id=agent_jobs.id "
     "    AND e.effect_type = ANY(%s)) "
 )
+# 重投预算与 pristine 判定是两件事,分开组合:弱唤醒道只要 pristine
+# (它们的重投次数由各自的 backoff/due 策略约束),scheduled 两者都要。
+_ATTEMPT_BUDGET_SQL = "AND attempt_count < %s "
+_SCHEDULED_REQUEUE_SAFETY_SQL = _ATTEMPT_BUDGET_SQL + _PRISTINE_TURN_SQL
+
+# 谓词**对它们有效**的唤醒道:持久写全部经由 `v2_effect_outbox`
+# (`_enqueue_write_effect`),远端写经由 `v2_mcp_mutation_attempts`。
+#
+# 其余 lane 刻意不在此列,理由各不相同,别顺手加进来:
+#   - `scheduled` 有自己的分支(还要 attempt 预算 + 用户可见终态失败)
+#   - `capture`   靠 prepare/commit 批次状态机(已提交的批次无法二次提交),
+#                 重投的代价是白烧一轮 token,不是双写
+#   - `dream`     直写 `memory_core.actions`,**这条谓词看不见**(T157)
+#   - `profile`   latest-wins 覆盖写,重跑幂等
+#   - `maintenance` 确定性摘要 + 版本/水位校验,可重入
+#   - `trajectory_review` 另有 eager watchdog 缺陷(T158)
+_PRISTINE_GUARDED_WAKE_LANES = frozenset(
+    {"heartbeat", "manual_wake", "screen_watch"}
+)
+
+
+def _turn_is_pristine_on_cursor(cur: psycopg.Cursor, job_id) -> bool:
+    """True when this job has produced no durable platform or remote write.
+
+    Same predicate as the set-based recovery paths, single-sourced. Callers use
+    it to CHOOSE a branch instead of folding it into an UPDATE's WHERE clause:
+    inside the foreground chat transaction a zero-rowcount update would be
+    indistinguishable from a lost ownership race and would abort the user's
+    chat turn.
+    """
+    cur.execute(
+        "SELECT 1 FROM agent_jobs WHERE id=%s " + _PRISTINE_TURN_SQL,
+        (int(job_id), sorted(DURABLE_TOOL_EFFECT_TYPES)),
+    )
+    return cur.fetchone() is not None
 
 _ACTIVE_STATUSES = ("pending", "claimed", "running")
 SCHEDULED_WAKE_STREAM = "proactive_scheduled_wakes_v2"
@@ -735,7 +775,17 @@ def preempt_active_for_chat_on_cursor(
     for row in rows:
         lane = str(row["lane"])
         recovery: Literal["terminal", "requeued"]
-        if lane in {"scheduled", "capture"}:
+        # 重投复用同一个 job_id 并重跑整轮。已经写出去的东西会再写一遍,
+        # 而 `get_chat_mutation_recovery_barrier` 只保护 lane='chat',
+        # 保护不到这里。所以 scheduled 只有 pristine 时才允许重投 ——
+        # 这条契约在租约回收器和 watchdog 上早就有,唯独前台抢占这条路没有。
+        #
+        # capture 不受此限:它的落库走 prepare/commit 批次状态机,已提交的
+        # 批次无法二次提交,重投的代价是白烧一轮 token 而不是双写。
+        requeueable = lane == "capture" or (
+            lane == "scheduled" and _turn_is_pristine_on_cursor(cur, row["id"])
+        )
+        if requeueable:
             recovery = "requeued"
             cur.execute(
                 "UPDATE agent_jobs SET status='pending', "
@@ -1947,6 +1997,50 @@ def recover_killed_job(
                             cur, int(job_id)
                         )
                         _queue_failure_review_on_cursor(cur, int(job_id))
+                elif (
+                    lane in _PRISTINE_GUARDED_WAKE_LANES
+                    and not _turn_is_pristine_on_cursor(cur, job_id)
+                ):
+                    # 弱唤醒道同样能落持久平台写(memory/identity/schedule/
+                    # workspace 都走共享的 `_enqueue_write_effect`),接上 MCP 之后
+                    # 还能发远端写。整轮重放会把它们再做一遍,而 chat 那条
+                    # mutation recovery barrier 覆盖不到这些 lane。
+                    #
+                    # 与 scheduled 的差别只在**可见性**:到点交付有明确的交付
+                    # 义务,失败要让用户看见;弱唤醒失败对用户始终静默
+                    # (2026-08-10 Seven 定案),所以这里不排用户可见失败 outbox,
+                    # 只留后台终态与轨迹复核。
+                    recovery = "terminal"
+                    cur.execute(
+                        "UPDATE agent_jobs SET status='expired',finished_at=now(), "
+                        "last_error=CASE WHEN EXISTS ("
+                        "  SELECT 1 FROM v2_mcp_mutation_attempts a "
+                        "  WHERE a.job_id=agent_jobs.id "
+                        "    AND (a.outcome IS NULL OR a.outcome='unknown')"
+                        ") THEN 'mcp_mutation_outcome_unknown' "
+                        "ELSE 'wake_replay_unsafe' END, "
+                        "attempt_count=attempt_count+1,"
+                        "claimed_by=NULL,claimed_at=NULL,started_at=NULL,"
+                        "lease_expires_at=NULL,deadline_at=NULL "
+                        "WHERE id=%s AND claimed_by=%s "
+                        "AND status IN ('claimed','running')",
+                        (int(job_id), str(claimed_by)),
+                    )
+                    if cur.rowcount != 1:
+                        return None
+                    # 悬空的 NULL outcome 记为 unknown:worker 死在请求途中,
+                    # 远端是否已经写成永远无法确定,留 NULL 会让后续判定把它
+                    # 当成「没发生过」。
+                    cur.execute(
+                        "UPDATE v2_mcp_mutation_attempts "
+                        "SET outcome='unknown',resolved_at=clock_timestamp() "
+                        "WHERE job_id=%s AND outcome IS NULL",
+                        (int(job_id),),
+                    )
+                    recovered_reviews = _recover_review_runner_on_cursor(
+                        cur, int(job_id)
+                    )
+                    _queue_failure_review_on_cursor(cur, int(job_id))
                 else:
                     recovery = "requeued"
                     cur.execute(
