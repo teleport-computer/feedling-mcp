@@ -169,12 +169,22 @@ def _is_probably_tool_schema_rejection(exc: provider_client.ProviderError) -> bo
     Responses assistant history part sent as input_text instead of output_text).
     Dropping tools then re-sends the identical bad history — a second billed
     call that 400s again and masks the real error as 'tool_schema_rejected'. The
-    provider surfaces its error body in the ProviderError message
-    (``provider_http_400: <detail>``), and content errors don't mention
-    tools/functions, so this gate keeps the genuine tool-schema fallback while
-    letting a content error propagate on its first call."""
-    detail = str(exc).lower()
-    return "tool" in detail or "function" in detail
+    body's meaning arrives as ``upstream_signals.mentions_tool_schema``, and
+    content errors don't mention tools/functions, so this gate keeps the genuine
+    tool-schema fallback while letting a content error propagate on its first
+    call.
+
+    It used to read the body out of the message itself
+    (``provider_http_400: <detail>``). That body no longer travels — it was
+    reaching the tenant, and base_url can point at an internal service — so the
+    classification is made in provider_client where the response still exists.
+    Matching on ``str(exc)`` here would now be always-False and every
+    tool-schema rejection would become a hard failure — three existing tests do
+    catch that, but only after they were changed to raise through
+    ``_raise_for_provider_status`` instead of hand-building an exception with the
+    body inline, which is a shape production no longer emits."""
+    signals = getattr(exc, "upstream_signals", None)
+    return bool(getattr(signals, "mentions_tool_schema", False))
 
 
 def _search_result_urls(content: str) -> set[str]:

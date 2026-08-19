@@ -5,6 +5,7 @@ import asyncio
 import sys
 from pathlib import Path
 
+import httpx
 import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
@@ -143,11 +144,14 @@ def test_content_400_raises_without_a_wasted_tools_disabled_retry(monkeypatch):
 
     async def _provider(_config, _messages, *, tools=None, **kwargs):
         seen_tools.append(tools)
-        raise provider_client.ProviderError(
-            "provider_http_400: Invalid value: 'input_text'. "
-            "Supported values are: 'output_text' and 'refusal'.",
-            status_code=400,
-        )
+        # Raised through the real classifier, not hand-built: the upstream body
+        # no longer travels inside the message, so an exception fabricated with
+        # the body inline would test a shape production cannot produce.
+        provider_client._raise_for_provider_status(httpx.Response(
+            400,
+            json={"error": {"message": "Invalid value: 'input_text'. "
+                                       "Supported values are: 'output_text' and 'refusal'."}},
+        ))
 
     async def _dispatch(_calls):
         raise AssertionError("no tool calls in this scenario")
@@ -184,11 +188,11 @@ def test_tool_schema_400_still_falls_back_to_text(monkeypatch):
         seen_tools.append(tools)
         if tools is None:
             return {"reply": "text without tools", "tool_calls": [], "usage": {}}
-        raise provider_client.ProviderError(
-            "provider_http_400: Invalid schema for function 'do_thing': "
-            "parameters.type must be 'object'.",
-            status_code=400,
-        )
+        provider_client._raise_for_provider_status(httpx.Response(
+            400,
+            json={"error": {"message": "Invalid schema for function 'do_thing': "
+                                       "parameters.type must be 'object'."}},
+        ))
 
     async def _dispatch(_calls):
         raise AssertionError("tools were rejected; never dispatched")

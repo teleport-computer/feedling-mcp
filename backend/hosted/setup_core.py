@@ -1639,7 +1639,15 @@ def _looks_like_wrong_api_endpoint(exc: BaseException) -> bool:
     if _NON_JSON_MARKER in text:
         return True
     status = getattr(exc, "status_code", None)
-    return status == 404 and any(marker in text for marker in _HTML_MARKERS)
+    # The HTML check reads a signal, not the body. `provider_http_404` no longer
+    # carries the upstream page (it was echoed to the tenant and persisted to
+    # route.test_error, and base_url can point at an internal service), so
+    # provider_client classifies the body where it still has it. Matching
+    # markers in `str(exc)` here would now always be False, and the hint would
+    # vanish — which is why the signal is computed upstream rather than this
+    # branch simply being deleted.
+    signals = getattr(exc, "upstream_signals", None)
+    return status == 404 and bool(getattr(signals, "looks_like_web_page", False))
 
 
 def _provider_test_failed_body(exc: BaseException) -> dict:

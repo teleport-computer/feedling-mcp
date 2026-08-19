@@ -2161,3 +2161,97 @@ def test_decoding_does_not_block_the_event_loop(monkeypatch):
     gaps = [b - a for a, b in zip(ticks, ticks[1:])]
     assert ticks, "the heartbeat must have run at all"
     assert max(gaps or [0]) < 0.15, f"loop was blocked for {max(gaps or [0]):.3f}s"
+
+
+# --- T159: an upstream error body never reaches anything the tenant can read --
+#
+# `base_url` is user-supplied and https targets get no address check, so the far
+# end may be an internal service the tenant aimed us at. The body used to be
+# appended to `provider_http_<status>`, which `_provider_test_failed_body`
+# returns as `detail` and `route.test_error` persists — a bounded read primitive.
+# These tests assert the body is gone while the status code and the two
+# behaviours that depend on the body's *meaning* still work.
+
+_LEAK_MARKER = "INTERNAL-ONLY-db=prod-primary-token=s3cr3t"
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        # JSON error envelope — the shape `_upstream_error_detail_internal`
+        # prefers, i.e. the one most likely to be surfaced.
+        httpx.Response(403, json={"error": {"message": _LEAK_MARKER}}),
+        # Nested/alternate JSON key.
+        httpx.Response(500, json={"detail": _LEAK_MARKER}),
+        # Plain text — the `resp.text[:240]` fallback branch.
+        httpx.Response(401, text=_LEAK_MARKER),
+        # An HTML error page, as relays and WAFs return.
+        httpx.Response(404, text=f"<!DOCTYPE html><html><body>{_LEAK_MARKER}</body></html>"),
+        # Body long enough that the old 240-byte slice would still carry it.
+        httpx.Response(502, text=("x" * 50) + _LEAK_MARKER + ("y" * 500)),
+    ],
+)
+def test_upstream_body_never_enters_the_raised_error(response):
+    with pytest.raises(pc.ProviderError) as caught:
+        pc._raise_for_provider_status(response)
+
+    exc = caught.value
+    assert _LEAK_MARKER not in str(exc)
+    assert _LEAK_MARKER not in repr(exc)
+    # `route.test_error` persists str(exc); args is what a naive serializer walks.
+    assert not any(_LEAK_MARKER in str(arg) for arg in exc.args)
+    # The part users actually need for triage survives.
+    assert str(exc) == f"provider_http_{response.status_code}"
+    assert exc.status_code == response.status_code
+
+
+def test_html_error_page_is_classified_without_carrying_the_page():
+    """The wrong-endpoint hint is the one message that unblocks a mis-typed relay
+    base_url, and it used to be derived by grepping the exception for '<html'."""
+    with pytest.raises(pc.ProviderError) as caught:
+        pc._raise_for_provider_status(
+            httpx.Response(404, text=f"<!DOCTYPE html><html>{_LEAK_MARKER}</html>")
+        )
+
+    assert caught.value.upstream_signals.looks_like_web_page is True
+    assert _LEAK_MARKER not in str(caught.value)
+
+
+def test_tool_schema_rejection_is_classified_without_carrying_the_body():
+    with pytest.raises(pc.ProviderError) as caught:
+        pc._raise_for_provider_status(
+            httpx.Response(400, json={"error": {"message": f"Invalid schema for function 'x' {_LEAK_MARKER}"}})
+        )
+
+    assert caught.value.upstream_signals.mentions_tool_schema is True
+    assert _LEAK_MARKER not in str(caught.value)
+
+
+def test_a_plain_content_error_is_not_classified_as_a_tool_rejection():
+    """Retrying without tools re-sends the same bad history and bills a second
+    call, so this signal must stay narrow."""
+    with pytest.raises(pc.ProviderError) as caught:
+        pc._raise_for_provider_status(
+            httpx.Response(400, json={"error": {"message": "Invalid value: 'input_text'."}})
+        )
+
+    assert caught.value.upstream_signals.mentions_tool_schema is False
+    assert caught.value.upstream_signals.looks_like_web_page is False
+
+
+def test_signals_default_to_false_for_errors_raised_without_a_response():
+    """Most ProviderErrors are ours, not an upstream body. They must classify as
+    nothing rather than inherit a stale signal."""
+    exc = pc.ProviderError("base_url required for openai_compatible")
+    assert exc.upstream_signals.looks_like_web_page is False
+    assert exc.upstream_signals.mentions_tool_schema is False
+
+
+def test_internal_detail_helper_still_reads_the_body_for_our_own_branching():
+    """The fallback logic that inspects the body (cache fields, reasoning,
+    region hints, the bedrock temperature retry) must keep working — the fix
+    stops the body from LEAVING, it does not stop us from reading it."""
+    detail = pc._upstream_error_detail_internal(
+        httpx.Response(400, json={"error": {"message": "temperature is not supported"}})
+    )
+    assert "temperature" in detail

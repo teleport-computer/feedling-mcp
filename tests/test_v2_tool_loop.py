@@ -17,6 +17,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
+import httpx
 import pytest
 
 import provider_client
@@ -2639,7 +2640,12 @@ def test_tool_schema_rejection_gets_exactly_one_tools_disabled_fallback(monkeypa
         async def __call__(self, config, messages, *, tools=None, **kwargs):
             self.calls.append({"tools": tools, **kwargs})
             if len(self.calls) == 1:
-                raise provider_client.ProviderError("tools rejected", status_code=status_code)
+                # Through the real classifier: the tool-schema signal is derived
+                # from the response body, which no longer rides in the message.
+                provider_client._raise_for_provider_status(httpx.Response(
+                    status_code,
+                    json={"error": {"message": "tools rejected"}},
+                ))
             return {"reply": "fallback answer", "tool_calls": [], "usage": {}}
 
     provider = _RejectThenReply()

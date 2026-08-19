@@ -33,10 +33,40 @@ if TYPE_CHECKING:
 log = logging.getLogger(__name__)
 
 
+@dataclass(frozen=True)
+class UpstreamErrorSignals:
+    """What the upstream error body meant, carried WITHOUT the body itself.
+
+    A `ProviderError` message reaches the tenant (as the `detail` of a failed
+    provider test) and is persisted to `route.test_error`, so it must never
+    contain upstream bytes. But two decisions legitimately depend on what the
+    far end said, and both used to grep the exception text for it:
+
+    * `hosted.setup_core._looks_like_wrong_api_endpoint` — a 404 whose body is an
+      HTML page means "this address is a web page, not an API", which is the one
+      hint that actually unblocks a mis-typed relay base_url;
+    * `model_api_runtime.v2.tool_loop` — a 400 mentioning tools/functions means
+      "retry without tools", while any other 400 must propagate on its first call
+      rather than be masked as a tool-schema problem and billed twice.
+
+    Booleans cross the boundary; text does not.
+    """
+
+    looks_like_web_page: bool = False
+    mentions_tool_schema: bool = False
+
+
 class ProviderError(Exception):
-    def __init__(self, message: str, *, status_code: int | None = None):
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int | None = None,
+        upstream_signals: UpstreamErrorSignals | None = None,
+    ):
         super().__init__(message)
         self.status_code = status_code
+        self.upstream_signals = upstream_signals or UpstreamErrorSignals()
 
 
 # --- Genesis v2 Step 1: shared retry wrapper + failure classification ---------
@@ -460,7 +490,21 @@ def _collect_provider_error_details(
             _collect_provider_error_details(value[field], output, depth=depth + 1)
 
 
-def _response_error_detail(resp: httpx.Response) -> str:
+def _upstream_error_detail_internal(resp: httpx.Response) -> str:
+    """Read the upstream error body for our OWN branching decisions.
+
+    ⚠️ The return value MUST NOT reach anything the tenant can read — not an
+    exception message, not an HTTP response field, not a persisted
+    ``test_error``. ``base_url`` is user-supplied and is NOT address-checked for
+    https targets, so "whatever the far end said" may be the body of an internal
+    service the tenant pointed us at. Echoing 240 bytes of it back turns a blind
+    probe into a bounded read primitive.
+
+    The name carries the constraint because a comment did not hold the line last
+    time: the sibling loopback check sat next to an owner NOTE describing its own
+    flaw and the flaw survived anyway. Callers that need to tell the user
+    something must branch on ``_upstream_error_signals``, never on this text.
+    """
     try:
         body = resp.json()
         if isinstance(body, dict):
@@ -481,14 +525,41 @@ def _response_error_detail(resp: httpx.Response) -> str:
     return resp.text[:240]
 
 
+_TOOL_SCHEMA_WORDS = ("tool", "function")
+_WEB_PAGE_MARKERS = ("<!doctype", "<html")
+
+
+def _upstream_error_signals(resp: httpx.Response) -> UpstreamErrorSignals:
+    """Classify the upstream error body into fixed booleans, carrying no text.
+
+    Two decisions downstream genuinely need to know what the far end said, and
+    both used to read it out of the exception message. Deciding here — where the
+    response is still in hand — is what lets the message itself stop carrying the
+    body without silently disabling either one.
+    """
+    try:
+        detail = _upstream_error_detail_internal(resp).lower()
+    except Exception:  # noqa: BLE001 - an unreadable body classifies as nothing
+        return UpstreamErrorSignals()
+    return UpstreamErrorSignals(
+        looks_like_web_page=any(marker in detail for marker in _WEB_PAGE_MARKERS),
+        mentions_tool_schema=any(word in detail for word in _TOOL_SCHEMA_WORDS),
+    )
+
+
 def _raise_for_provider_status(resp: httpx.Response) -> None:
     if resp.status_code < 400:
         return
-    detail = _response_error_detail(resp)
-    suffix = f": {detail}" if detail else ""
+    # The message is the stable code ALONE. It used to append up to 240 bytes of
+    # the upstream body, which `_provider_test_failed_body` returned verbatim to
+    # the tenant and `route.test_error` persisted — so a tenant pointing base_url
+    # at an internal https service could read it back a slice at a time. The
+    # status code stays (users need to tell 401 from 429) and the body's meaning
+    # survives as signals; only the text is dropped.
     raise ProviderError(
-        f"provider_http_{resp.status_code}{suffix}",
+        f"provider_http_{resp.status_code}",
         status_code=resp.status_code,
+        upstream_signals=_upstream_error_signals(resp),
     )
 
 
@@ -1032,7 +1103,7 @@ def _without_cache_field(payload: dict[str, Any], field: str) -> dict[str, Any]:
 
 def _cache_field_named_in_error(resp) -> str | None:
     try:
-        detail = _response_error_detail(resp).lower()
+        detail = _upstream_error_detail_internal(resp).lower()
     except Exception:  # noqa: BLE001 — absent error text is not a field hint
         return None
     for field, aliases in _CACHE_FIELD_ALIASES.items():
@@ -1062,7 +1133,7 @@ def _cache_fallback_payload(
     if not present:
         return None
     try:
-        detail = _response_error_detail(resp).lower()
+        detail = _upstream_error_detail_internal(resp).lower()
     except Exception:  # noqa: BLE001 — absent error text is not a hint
         detail = ""
     named = _cache_field_named_in_error(resp)
@@ -2376,7 +2447,7 @@ def _reasoning_fallback_payload(
         and "additionalModelRequestFields" in payload
     ):
         try:
-            detail = _response_error_detail(resp).lower()
+            detail = _upstream_error_detail_internal(resp).lower()
         except Exception:  # noqa: BLE001
             return None
         if "reasoning" not in detail and "thinking" not in detail:
@@ -2391,7 +2462,7 @@ def _reasoning_fallback_payload(
         and "reasoning" in payload
     ):
         try:
-            detail = _response_error_detail(resp).lower()
+            detail = _upstream_error_detail_internal(resp).lower()
         except Exception:  # noqa: BLE001 — no body means no safe downgrade hint
             return None
         if "reasoning" not in detail and "thinking" not in detail:
@@ -2414,7 +2485,7 @@ def _openrouter_region_route_fallback(
     ):
         return None
     try:
-        detail = _response_error_detail(resp).lower()
+        detail = _upstream_error_detail_internal(resp).lower()
     except Exception:  # noqa: BLE001 — no explicit region error means no retry
         return None
     if not any(
