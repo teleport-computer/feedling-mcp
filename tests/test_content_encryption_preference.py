@@ -240,23 +240,20 @@ def test_pre_and_test_processes_share_the_plaintext_gate_and_prod_stays_closed()
     assert key not in prod_runner
 
 
-def test_test_runner_deploy_verifies_the_live_plaintext_gate_release_unit():
-    """CI must not report success while either TEST CVM has the old gate."""
+def test_test_main_deploy_canary_requires_plaintext_effective_state():
+    """TEST deploy must prove the public write contract after main starts."""
     from pathlib import Path
 
     workflow = (
         Path(__file__).resolve().parents[1] / ".github/workflows/ci.yml"
     ).read_text()
-    runner_job = workflow.split("\n  deploy-test-runner-cvm:\n", 1)[1].split(
-        "\n  deploy-pre-cvm:\n", 1
+    main_job = workflow.split("\n  deploy-test-cvm:\n", 1)[1].split(
+        "\n  deploy-test-runner-cvm:\n", 1
     )[0]
 
-    assert "Verify live TEST plaintext gate release unit" in runner_job
-    assert "deploy/test-cvm-id.txt" in runner_job
-    assert "for attempt in $(seq 1 12)" in runner_job
-    assert "sleep 10" in runner_job
-    for container in ("feedling-test-backend-1", "serve-worker", "agent-runner"):
-        assert container in runner_job
+    assert "Post-deploy canary round-trip (test)" in main_job
+    assert 'FEEDLING_CANARY_EXPECT_PLAINTEXT: "1"' in main_job
+    assert "Verify live TEST plaintext gate release unit" not in workflow
 
 
 def test_effective_follows_intent_once_plaintext_writes_are_accepted(uid, monkeypatch):
