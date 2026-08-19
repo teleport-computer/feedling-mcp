@@ -3199,3 +3199,141 @@ def test_worldbook_failure_does_not_kill_the_wake(monkeypatch):
     assert written.get("text") == "在想你呢"
     blocks = [str(m.get("content") or "") for m in calls[0]["messages"]]
     assert not any(v2_context.WORLD_BOOK_CONTEXT_HEADER in b for b in blocks), blocks[:3]
+
+
+def _mcp_trust_probe_turn():
+    """A duck-typed MCP turn with one read-only and one mutating tool."""
+    from provider_types import ToolResult as _ToolResult
+    from provider_types import ToolSpec as _ToolSpec
+
+    read_spec = _ToolSpec(
+        name="mcp__town__look",
+        description="read the town board",
+        parameters={"type": "object", "properties": {}},
+    )
+    write_spec = _ToolSpec(
+        name="mcp__town__post",
+        description="post to the town board",
+        parameters={"type": "object", "properties": {}},
+    )
+
+    class _Turn:
+        tool_specs = [read_spec, write_spec]
+        instructions: list = []
+
+        @property
+        def is_empty(self):
+            return False
+
+        def handles(self, name):
+            return str(name).startswith("mcp__")
+
+        def is_read_only(self, name):
+            return name == read_spec.name
+
+        @property
+        def mutating_tool_names(self):
+            return frozenset({write_spec.name})
+
+        async def dispatch(self, call):
+            return _ToolResult(call_id=call.id, content="ok")
+
+    return _Turn(), read_spec.name, write_spec.name
+
+
+def _run_screen_watch_with_mcp(monkeypatch, uid, *, with_frames: bool):
+    """Drive the production screen_watch path, optionally carrying live pixels."""
+    conftest.seed_user(uid)
+    _reset(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, "screen_watch")
+    claimed_by = _claim(job_id)
+    calls = _script_provider(monkeypatch, [_text_round("看到了。")])
+
+    frames = [{"id": "f1", "ts": time.time()}] if with_frames else []
+
+    async def _screen_recent(*_args, **_kwargs):
+        return {"frames": frames, "total": len(frames)}
+
+    monkeypatch.setattr(worker, "_cap_data", _screen_recent)
+    monkeypatch.setattr(
+        worker.db,
+        "model_api_active_route_vision_verdict",
+        lambda _uid: {"supported": True},
+    )
+    monkeypatch.setattr(
+        worker, "_write_encrypted_reply", lambda store, text: {"id": "r"}
+    )
+    turn, read_name, write_name = _mcp_trust_probe_turn()
+    deps = _wake_deps(
+        tail=[{"id": "m1", "ts": 1.0, "role": "user", "content": "先忙会儿"}]
+    )
+    deps.web_tools_enabled = lambda _uid: True
+    deps.read_screen_frames = lambda _uid, frame_ids: {
+        "frames": {
+            "f1": {
+                "image_b64": "AAAA",
+                "image_mime": "image/jpeg",
+                "ocr_text": "ElevenLabs",
+                "app": "WeChat",
+                "ts": time.time(),
+            }
+        },
+        "cache_hits": 0,
+        "cache_misses": 1,
+    }
+
+    async def _load(_store, **_kwargs):
+        return turn
+
+    deps.load_mcp_turn = _load
+
+    status = asyncio.run(worker._run_wake(
+        job_id, uid, "screen_watch", deps, _BYOK, asyncio.Semaphore(4),
+        claimed_by,
+    ))
+    assert status == "completed"
+    carried_pixels = any(
+        message.get(v2_screen_chat.MESSAGE_TAG) is True
+        for message in calls[0]["messages"]
+    )
+    offered = {spec.name for spec in calls[0]["tools"]}
+    return offered, carried_pixels, read_name, write_name
+
+
+def test_screen_watch_live_pixels_keep_user_mcp_but_drop_web_and_task(
+    monkeypatch,
+):
+    """带用户屏幕实时像素的 screen_watch 首轮:web/task 被摘,**用户自选 MCP
+    (只读**与写**)都保留** —— 包括写。
+
+    ⚠️ characterization test:记录**现状**,不是我们主张的边界。
+    来源是 `57b4aedb`(2026-08-12「用户自建 MCP 不再被出站围栏下架」),
+    分界线是「谁选的目的地」:web/task 是模型挑的,MCP 服务器是用户配的。
+
+    ⚠️ `docs-site/.../architecture.mdx` 至今写着「收到屏幕像素的那一轮会移除
+    web、MCP 和 task」—— 与本用例记录的实际行为不符。Seven 若裁定屏幕像素轮
+    单独禁 MCP,本用例反转,且 **chat 与 wake 必须一起改**。
+
+    无帧对照轮不是装饰:只断言「web 不在」时,如果夹具目录本来就没有 web,
+    这条断言恒真、不报错、看起来完全像一次成功验证(我在 tool_loop 层的
+    第一版正是这么假绿的)。对照轮显式钉死那三件在场。
+    """
+    control, control_pixels, read_name, write_name = _run_screen_watch_with_mcp(
+        monkeypatch, "u_screen_mcp_control", with_frames=False
+    )
+    assert not control_pixels, "control round must not carry pixels"
+    assert {"web_search", "web_fetch", cap_tool_schema.TASK_TOOL} <= control, (
+        "control round must actually offer the outbound tools, otherwise the "
+        "assertions below prove nothing"
+    )
+    assert {read_name, write_name} <= control
+
+    offered, carried_pixels, _r, _w = _run_screen_watch_with_mcp(
+        monkeypatch, "u_screen_mcp_pixels", with_frames=True
+    )
+    assert carried_pixels, "target round must actually carry screen pixels"
+    assert "web_search" not in offered
+    assert "web_fetch" not in offered
+    assert cap_tool_schema.TASK_TOOL not in offered
+    assert read_name in offered, "read-only user MCP survives the pixel fence"
+    assert write_name in offered, "mutating user MCP survives it too"
