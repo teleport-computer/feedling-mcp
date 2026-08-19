@@ -20,7 +20,11 @@ def test_tee_migrate_has_one_head_after_runtime_v2_alignment():
     cfg.set_main_option("script_location", str(ROOT / "backend" / "alembic_tee"))
     script = ScriptDirectory.from_config(cfg)
 
-    assert script.get_heads() == ["0025_lane_rollup_voice"]
+    assert script.get_heads() == ["0026_chat_daily_rollup"]
+    assert (
+        script.get_revision("0026_chat_daily_rollup").down_revision
+        == "0025_lane_rollup_voice"
+    )
     assert (
         script.get_revision("0025_lane_rollup_voice").down_revision
         == "0024_lane_rollup_safe_ts"

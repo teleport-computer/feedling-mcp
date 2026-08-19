@@ -834,6 +834,9 @@ def save_all_users(users: list[dict]) -> None:
                 # ordering rationale (users DELETE first, merge second), same
                 # mirror statements appended from the same operation.
                 for removed_id in removed_ids:
+                    if chat_rollup_anonymize_user(conn, removed_id):
+                        mirror_group.append(
+                            (_CHAT_ROLLUP_DELETE_SQL, (removed_id,)))
                     if lane_rollup_anonymize_user(conn, removed_id):
                         mirror_group.append(
                             (_LANE_ROLLUP_ANON_MERGE_SQL,
@@ -889,9 +892,12 @@ def delete_user(user_id: str) -> bool:
             # freeze's cells are committed and visible to this merge; and any
             # later freeze finds no users row, so its guarded INSERT..SELECT
             # inserts nothing.
+            chat_cells = chat_rollup_anonymize_user(conn, user_id)
             anonymized = lane_rollup_anonymize_user(conn, user_id)
     from tee_shadow import mirror
     group: list[tuple[str, tuple]] = [(sql, (user_id,))]
+    if chat_cells:
+        group.append((_CHAT_ROLLUP_DELETE_SQL, (user_id,)))
     if anonymized:
         group.append((_LANE_ROLLUP_ANON_MERGE_SQL,
                       (_LANE_ROLLUP_DELETED_USER, user_id)))
@@ -1077,6 +1083,192 @@ def user_exists(user_id: str) -> bool:
 # ---------------------------------------------------------------------------
 
 
+_CHAT_SNAPSHOT_COUNT_KEYS = (
+    "total", "user_messages", "agent_messages", "image_messages",
+    "proactive_messages", "model_api_user_messages",
+    "model_api_agent_messages", "model_api_greetings",
+)
+_CHAT_SNAPSHOT_DIST_KEYS = ("by_role", "by_source", "by_content_type")
+
+
+def _chat_rollup_into(conn, ids: list[str], out: dict, ensure) -> None:
+    """Fill each user's ``chat`` block from frozen cells + today's live window.
+
+    Replaces five full-history GROUP BYs (measured 99-115s on prod, killed by
+    gunicorn's 120s timeout). The row shape is deliberately unchanged — the
+    data-track surface is server-rendered with no client fetch, so a key added
+    or dropped here breaks the page silently.
+
+    Two parts, and the split is the whole point:
+      · closed days — sum the frozen cells. They survive a later history clear,
+        which is why the numbers do not collapse when a user wipes their chat;
+      · today — one bounded query over the still-open day.
+    No unbounded historical scan remains.
+
+    ⚠️ These counts mean "how much happened", not "how much is still stored"
+    (Seven 2026-08-19). The read surface must label them cumulative.
+    """
+    zone = ZoneInfo("Asia/Shanghai")
+    today = datetime.now(zone).date()
+    day_start, _ = _lane_rollup_day_bounds(today, zone)
+    cutoff = day_start.timestamp()
+    sums = ", ".join(f"SUM({k})::int" for k in _CHAT_SNAPSHOT_COUNT_KEYS)
+    acc: dict[str, dict] = {}
+
+    # ⚠️ 两段的边界必须**互斥**：格子取 day < today，实时窗取 ts >= today 起点。
+    # 少了这个 day 上界，任何落在今天或之后的格子会被两边各数一次。冻结器只冻
+    # 已关闭的日子，正常情况下今天不会有格子——但「正常情况下不会」不是边界条件，
+    # 写出来才是。（本条是测试种子用了未来时刻、把这个重叠暴露出来后补的。）
+    for row in conn.execute(
+        f"""
+        SELECT user_id, {sums},
+               MIN(first_ts), MAX(last_ts), MAX(proactive_last_ts),
+               MAX(last_user_ts), MAX(last_agent_ts)
+        FROM chat_daily_rollup WHERE user_id = ANY(%s) AND day < %s
+        GROUP BY user_id
+        """,
+        (ids, today.isoformat()),
+    ).fetchall():
+        n = len(_CHAT_SNAPSHOT_COUNT_KEYS)
+        cell = {key: int(row[1 + i] or 0)
+                for i, key in enumerate(_CHAT_SNAPSHOT_COUNT_KEYS)}
+        for offset, key in enumerate(("first_ts", "last_ts", "proactive_last_ts",
+                                      "last_user_ts", "last_agent_ts")):
+            cell[key] = row[1 + n + offset]
+        acc[str(row[0])] = cell
+
+    for uid, folded in conn.execute(
+        """
+        SELECT user_id, jsonb_object_agg(src, buckets)
+        FROM (
+            SELECT user_id, src, jsonb_object_agg(k, v) AS buckets
+            FROM (
+                SELECT user_id, src, k, SUM(raw::int)::int AS v
+                FROM chat_daily_rollup,
+                LATERAL (VALUES ('by_role', by_role), ('by_source', by_source),
+                                ('by_content_type', by_content_type)) AS d(src, doc),
+                LATERAL jsonb_each_text(doc) AS e(k, raw)
+                WHERE user_id = ANY(%s) AND day < %s
+                GROUP BY user_id, src, k
+            ) per_key
+            GROUP BY user_id, src
+        ) per_src
+        GROUP BY user_id
+        """,
+        (ids, today.isoformat()),
+    ).fetchall():
+        cell = acc.setdefault(str(uid), {})
+        for key in _CHAT_SNAPSHOT_DIST_KEYS:
+            cell[key] = dict((folded or {}).get(key) or {})
+
+    # 当天还没冻结的那一段：单次有界查询，窗口就是今天。
+    for row in conn.execute(
+        f"""
+        SELECT user_id,{_CHAT_ROLLUP_COUNTS_SELECT}
+        FROM {_chat_rollup_source('user_id = ANY(%s) AND ts >= %s')} src
+        GROUP BY user_id
+        """,
+        (ids, cutoff, ids, cutoff),
+    ).fetchall():
+        n = len(_CHAT_SNAPSHOT_COUNT_KEYS)
+        cell = acc.setdefault(str(row[0]), {})
+        for i, key in enumerate(_CHAT_SNAPSHOT_COUNT_KEYS):
+            cell[key] = int(cell.get(key) or 0) + int(row[1 + i] or 0)
+        first = row[1 + n]
+        if first is not None and cell.get("first_ts") is None:
+            cell["first_ts"] = first
+        for offset, key in enumerate(("last_ts", "proactive_last_ts",
+                                      "last_user_ts", "last_agent_ts")):
+            live = row[2 + n + offset]
+            if live is not None and (cell.get(key) is None or live > cell[key]):
+                cell[key] = live
+
+    for field, target, extra in _CHAT_ROLLUP_DIST_FIELDS[:3]:
+        for uid, value, count in conn.execute(
+            f"""
+            SELECT user_id, COALESCE(NULLIF(doc->>%s, ''), 'unknown') AS value,
+                   COUNT(*)::int
+            FROM {_chat_rollup_source(f'user_id = ANY(%s) AND ts >= %s{extra}')} src
+            GROUP BY user_id, value
+            """,
+            (field, ids, cutoff, ids, cutoff),
+        ).fetchall():
+            bucket = acc.setdefault(str(uid), {}).setdefault(target, {})
+            bucket[str(value)] = bucket.get(str(value), 0) + int(count)
+
+    for uid, cell in acc.items():
+        if not cell.get("total"):
+            # 无聊天的用户不建 chat 键 —— 既有契约，前端按键存在与否分支。
+            continue
+        for key in _CHAT_SNAPSHOT_COUNT_KEYS:
+            cell.setdefault(key, 0)
+        for key in _CHAT_SNAPSHOT_DIST_KEYS:
+            cell.setdefault(key, {})
+        for key in ("first_ts", "last_ts", "proactive_last_ts",
+                    "last_user_ts", "last_agent_ts"):
+            cell.setdefault(key, None)
+        ensure(out, uid)["chat"] = cell
+
+
+def _chat_proactive_status_into(conn, ids: list[str], out: dict, ensure) -> None:
+    """proactive_extra 的两个 status 分布：冻结格子 + 今天实时窗。
+
+    与 ``_chat_rollup_into`` 分开只是因为它们挂在 ``proactive_extra`` 而不是
+    ``chat`` 下；口径、边界（day < today / ts >= today 起点）、来源（live ∪
+    archive）三者完全一致，共用同一组常量。
+    """
+    zone = ZoneInfo("Asia/Shanghai")
+    today = datetime.now(zone).date()
+    day_start, _ = _lane_rollup_day_bounds(today, zone)
+    cutoff = day_start.timestamp()
+    acc: dict[str, dict[str, dict[str, int]]] = {}
+
+    for uid, folded in conn.execute(
+        """
+        SELECT user_id, jsonb_object_agg(src, buckets)
+        FROM (
+            SELECT user_id, src, jsonb_object_agg(k, v) AS buckets
+            FROM (
+                SELECT user_id, src, k, SUM(raw::int)::int AS v
+                FROM chat_daily_rollup,
+                LATERAL (VALUES ('live_activity_status', live_activity_status),
+                                ('alert_status', alert_status)) AS d(src, doc),
+                LATERAL jsonb_each_text(doc) AS e(k, raw)
+                WHERE user_id = ANY(%s) AND day < %s
+                GROUP BY user_id, src, k
+            ) per_key
+            GROUP BY user_id, src
+        ) per_src
+        GROUP BY user_id
+        """,
+        (ids, today.isoformat()),
+    ).fetchall():
+        by = acc.setdefault(str(uid), {})
+        for key, buckets in (folded or {}).items():
+            by[str(key)] = {str(k): int(v) for k, v in (buckets or {}).items()}
+
+    for field, target, extra in _CHAT_ROLLUP_DIST_FIELDS[3:]:
+        for uid, value, count in conn.execute(
+            f"""
+            SELECT user_id, COALESCE(NULLIF(doc->>%s, ''), 'unknown') AS value,
+                   COUNT(*)::int
+            FROM {_chat_rollup_source(f'user_id = ANY(%s) AND ts >= %s{extra}')} src
+            GROUP BY user_id, value
+            """,
+            (field, ids, cutoff, ids, cutoff),
+        ).fetchall():
+            bucket = acc.setdefault(str(uid), {}).setdefault(target, {})
+            bucket[str(value)] = bucket.get(str(value), 0) + int(count)
+
+    for uid, by in acc.items():
+        if not any(by.values()):
+            continue
+        extra_block = ensure(out, uid).setdefault("proactive_extra", {})
+        for key, buckets in by.items():
+            if buckets:
+                extra_block[key] = buckets
+
+
 def admin_data_track_snapshot(user_ids: list[str]) -> dict[str, dict]:
     """Return metadata-only aggregate stats for a set of users.
 
@@ -1098,73 +1290,7 @@ def admin_data_track_snapshot(user_ids: list[str]) -> dict[str, dict]:
     }
     try:
         with get_pool().connection() as conn:
-            rows = conn.execute(
-                """
-                SELECT user_id,
-                       COUNT(*)::int AS total,
-                       COUNT(*) FILTER (
-                         WHERE doc->>'role' = 'user'
-                           AND COALESCE(doc->>'source', '') NOT IN ('verify_ping', 'resident_maintenance')
-                       )::int AS user_messages,
-                       COUNT(*) FILTER (WHERE doc->>'role' IN ('agent', 'openclaw'))::int AS agent_messages,
-                       COUNT(*) FILTER (WHERE doc->>'content_type' = 'image')::int AS image_messages,
-                       COUNT(*) FILTER (WHERE doc->>'source' = 'agent_initiated_proactive')::int AS proactive_messages,
-                       COUNT(*) FILTER (WHERE doc->>'source' = 'model_api' AND doc->>'role' = 'user')::int AS model_api_user_messages,
-                       COUNT(*) FILTER (WHERE doc->>'source' = 'model_api' AND doc->>'role' IN ('agent', 'openclaw'))::int AS model_api_agent_messages,
-                       COUNT(*) FILTER (WHERE doc->>'source' = 'model_api' AND doc->>'model_api_kind' = 'onboarding_greeting')::int AS model_api_greetings,
-                       MIN(ts) AS first_ts,
-                       MAX(ts) AS last_ts,
-                       MAX(ts) FILTER (WHERE doc->>'source' = 'agent_initiated_proactive') AS proactive_last_ts,
-                       MAX(ts) FILTER (
-                         WHERE doc->>'role' = 'user'
-                           AND COALESCE(doc->>'source', '') NOT IN ('verify_ping', 'resident_maintenance')
-                       ) AS last_user_ts,
-                       MAX(ts) FILTER (WHERE doc->>'role' IN ('agent', 'openclaw')) AS last_agent_ts
-                FROM chat_messages
-                WHERE user_id = ANY(%s)
-                GROUP BY user_id
-                """,
-                (ids,),
-            ).fetchall()
-            for row in rows:
-                uid = row[0]
-                ensure(out, uid)["chat"] = {
-                    "total": row[1],
-                    "user_messages": row[2],
-                    "agent_messages": row[3],
-                    "image_messages": row[4],
-                    "proactive_messages": row[5],
-                    "model_api_user_messages": row[6],
-                    "model_api_agent_messages": row[7],
-                    "model_api_greetings": row[8],
-                    "first_ts": row[9],
-                    "last_ts": row[10],
-                    "proactive_last_ts": row[11],
-                    "last_user_ts": row[12],
-                    "last_agent_ts": row[13],
-                    "by_role": {},
-                    "by_source": {},
-                    "by_content_type": {},
-                }
-
-            for field, target in (
-                ("role", "by_role"),
-                ("source", "by_source"),
-                ("content_type", "by_content_type"),
-            ):
-                rows = conn.execute(
-                    """
-                    SELECT user_id, COALESCE(NULLIF(doc->>%s, ''), 'unknown') AS value,
-                           COUNT(*)::int
-                    FROM chat_messages
-                    WHERE user_id = ANY(%s)
-                    GROUP BY user_id, value
-                    """,
-                    (field, ids),
-                ).fetchall()
-                for uid, value, count in rows:
-                    chat = ensure(out, uid).setdefault("chat", {})
-                    chat.setdefault(target, {})[value] = count
+            _chat_rollup_into(conn, ids, out, ensure)
 
             rows = conn.execute(
                 """
@@ -1375,33 +1501,11 @@ def admin_data_track_snapshot(user_ids: list[str]) -> dict[str, dict]:
                     "jobs_failed_by_reason", {}
                 )[reason] = count
 
-            rows = conn.execute(
-                """
-                SELECT user_id,
-                       COALESCE(NULLIF(doc->>'live_activity_status', ''), 'unknown') AS live_status,
-                       COUNT(*)::int
-                FROM chat_messages
-                WHERE user_id = ANY(%s) AND doc->>'source' = 'agent_initiated_proactive'
-                GROUP BY user_id, live_status
-                """,
-                (ids,),
-            ).fetchall()
-            for uid, status, count in rows:
-                ensure(out, uid).setdefault("proactive_extra", {}).setdefault("live_activity_status", {})[status] = count
-
-            rows = conn.execute(
-                """
-                SELECT user_id,
-                       COALESCE(NULLIF(doc->>'alert_status', ''), 'unknown') AS alert_status,
-                       COUNT(*)::int
-                FROM chat_messages
-                WHERE user_id = ANY(%s) AND doc->>'source' = 'agent_initiated_proactive'
-                GROUP BY user_id, alert_status
-                """,
-                (ids,),
-            ).fetchall()
-            for uid, status, count in rows:
-                ensure(out, uid).setdefault("proactive_extra", {}).setdefault("alert_status", {})[status] = count
+            # ⚠️ 这两个维度**必须**走格子，不能留原来的全史 GROUP BY。
+            # 把它们冻进格子却仍从 chat_messages 现算，等于新增列只写不读、
+            # 端点照样随全史增长——那正是本期要消灭的东西（codex2 2026-08-19
+            # 逮到我就是这么写的：写侧改了、读侧一行没动）。
+            _chat_proactive_status_into(conn, ids, out, ensure)
 
             rows = conn.execute(
                 """
@@ -4919,6 +5023,318 @@ ON CONFLICT (user_id, day, route, lane, enqueue_source) DO UPDATE SET
 """
 
 _LANE_ROLLUP_ANON_DELETE_SQL = "DELETE FROM lane_daily_rollup WHERE user_id = %s"
+
+
+# --- 期 3b：chat 日格子（救活 data-track） --------------------------------- #
+#
+# admin_data_track_snapshot 对全部用户、全部历史现算，五处无时间窗的全史
+# GROUP BY，prod 实测 99-115s、被 gunicorn 120s 打死。这里把它挪到每日冻结。
+#
+# ⚠️ 格子的含义是「**那天发生过多少**」，不是「当前 live 集合还剩多少」。
+# Seven 2026-08-19 定的产品口径，理由是:后台是用来看用户有没有在用的，用户
+# 清空历史后统计跟着凭空少 500 条，面板就变成「这人几乎没用过」——那才是真误导。
+# 读侧列名必须写「累计发生」，不得写「当前条数」。
+#
+# ⚠️⚠️ 「能冻结」的理由与 lane_daily_rollup **不同**，不要混用论证:
+#   lane 能冻 = **源闭合**（终态 agent_jobs 行此后不再变）
+#   chat 能冻 = **问题本身是历史性的**（「08-18 发生了多少条」的答案不随之后
+#               的删除改变）——chat_messages 的源**并不闭合**，clear 会把行搬走。
+# 所以 ON CONFLICT DO NOTHING 在这里正确，但谁要是拿「源不可变」来论证它就错了。
+# 一旦有人把这些格子改成回答「现在还剩多少」，冻结立刻不成立，且必须引入变更
+# 追踪——因为删除**事后扫不出来**（行没了，没有任何后续扫描能看见它曾存在）。
+#
+# 口径逐字取自现有 snapshot 实现，否则 golden 会红（这正是 golden 的用处）。
+#
+# ⚠️ 历史源 = live + archive，**不能只扫 chat_messages**（codex2 2026-08-19）。
+# chat_clear 在权威事务里先把行搬进 chat_message_archive 再删 live（0052 建表，
+# 主键 (user_id, source_seq)）。若只扫 live：
+#   · 首次回填会永久漏掉上线前已经 clear 过的历史；
+#   · 当天这个还没冻的窗口，会在用户 clear 的瞬间数字骤降。
+# 两者都正好复现 Seven 要避免的那件事（清空历史后面板显示「这人几乎没用过」），
+# 只是范围更窄。既然口径是「那天发生过多少」，归档里的行也发生过。
+#
+# 按 (user_id, source_seq) 去重：搬迁瞬间同一条可能在两张表里同时出现，
+# UNION ALL 会双计。archive 的 PK 就是这个键，live 侧对应 seq。
+# ⚠️ 必须按 **(user_id, source_seq)** 定胜，不能用 UNION。
+# UNION 去的是**整行**重：只要同一条消息在 live 与 archive 两侧的 doc 或 ts 有
+# 任何差异（clear 事务搬行时补字段、R2 offload 把正文换成指针、时间戳精度），
+# 两行就都活下来、被计两次。codex2 2026-08-19 指出；我原先的测试复制的是**完全
+# 相同**的行，所以这个反例根本没被触发——又一次「样本没让被测分支走到」。
+#
+# precedence：live 胜。理由是 archive 行是 clear 那一刻的拷贝，之后不再更新；
+# live 行若还在，它才是这条消息的现状。用 rank 列显式排序，不依赖 UNION 的
+# 任意顺序。
+def _chat_rollup_source(where: str) -> str:
+    """live ∪ archive 的联合源，谓词下推 + **全局** live 优先。
+
+    两个约束必须同时成立，任缺其一都出错：
+
+    ① **谓词下推**。ts 过滤必须在去重之前施加。DISTINCT ON 是优化屏障，外层
+       ``ts >=`` 推不进去——实测 5 万行归档时 PG 把 52000 行全部物化再过滤，
+       ts 索引完全用不上，「有界今日窗」实际在扫全史（要消灭的形态换了张表）。
+
+    ② **live 优先必须是全局的，不是窗内的**。这两条放一起会打架，而打架的
+       后果是同一条消息被计两次：同一 (user_id, source_seq) 若 live 与 archive
+       的 ts 分处两个北京日，先在各分支过滤再去重 ⇒ 冻昨日时 live 被滤掉、
+       archive 入格；读今日时 archive 被滤掉、live 又入实时窗。codex2 在隔离库
+       实测复现（frozen_yesterday=1 且 today=1，同一 key 合计 2），破坏累计守恒。
+       我上一轮把它当「数据异常，可接受」——错了：它不是异常输入下的行为，
+       是这个查询结构自带的双计。
+
+    所以不用 DISTINCT ON，改成 archive 分支对**全部** live key 做反连接：
+    live 窗内行，UNION ALL archive 窗内且全局无同 key live 的行。live 即使落在
+    窗外也照样压住 archive，那条消息只会在 live 自己的那一天被计一次。
+    反连接走 chat_user_seq_idx (user_id, seq)，不引入新扫描。
+
+    ``where`` 里的占位符出现**两次**（每分支一次），调用方参数要给两遍。
+    """
+    return f"""(
+            SELECT user_id, seq AS source_seq, ts, doc
+            FROM chat_messages WHERE {where}
+            UNION ALL
+            SELECT a.user_id, a.source_seq, a.ts, a.doc
+            FROM chat_message_archive a
+            WHERE {where.replace('user_id', 'a.user_id').replace(' ts ', ' a.ts ')}
+              AND NOT EXISTS (
+                  SELECT 1 FROM chat_messages m
+                  WHERE m.user_id = a.user_id AND m.seq = a.source_seq
+              )
+        )"""
+
+# ⚠️ 另有两族**硬删且不归档**的行（codex2 2026-08-19 指出），联合源救不回来：
+#   · verify_ping 连通性自测消息 —— verify 循环结束即 GC（chat/chat_core.py）
+#   · 语音逐轮行 —— 通话 finalize 时删除，除非已被 V2 压实覆盖（voice/cleanup.py）
+# 这里**刻意不加过滤**，三条理由：
+#   1. 口径是「那天发生过多少」，它们当时确实在；
+#   2. 加过滤会改动 total / by_role / by_source / by_content_type / first_ts 的数，
+#      即改变前端今天显示的数字——那是产品变更，不该夹在提速改动里；
+#   3. 决定性由**生命周期**保证，不靠过滤：两族都在当日内被清掉，而 D 日要到
+#      D+1 才冻结，冻结时它们已不在，现算与冻结看到同一幅图。
+# ⚠️ 但第 3 条是「实践上成立」而非「机制上强制」：一次永不完成的 verify 会把 ping
+# 行留过夜，那时冻结会把它计进去——**与当时的现算完全一致**（所以不违反「提速不
+# 许改数」），只是那天的 total 多一条自测消息。两族各钉一条测试，让这是**被写下
+# 来的选择**而不是没人想过。⚠️ 我曾据「verify_ping 不进 user_messages」推断
+# 「删它不影响格子」——那是错的：它照样进 total 与三个分布。别再这样推。
+
+_CHAT_ROLLUP_USER_MSG_PRED = (
+    "doc->>'role' = 'user' AND COALESCE(doc->>'source','') "
+    "NOT IN ('verify_ping','resident_maintenance')"
+)
+_CHAT_ROLLUP_AGENT_PRED = "doc->>'role' IN ('agent','openclaw')"
+
+_CHAT_ROLLUP_COUNTS_SELECT = f"""
+       COUNT(*)::int AS total,
+       COUNT(*) FILTER (WHERE {_CHAT_ROLLUP_USER_MSG_PRED})::int AS user_messages,
+       COUNT(*) FILTER (WHERE {_CHAT_ROLLUP_AGENT_PRED})::int AS agent_messages,
+       COUNT(*) FILTER (WHERE doc->>'content_type' = 'image')::int AS image_messages,
+       COUNT(*) FILTER (WHERE doc->>'source' = 'agent_initiated_proactive')::int
+           AS proactive_messages,
+       COUNT(*) FILTER (WHERE doc->>'source' = 'model_api'
+                          AND doc->>'role' = 'user')::int AS model_api_user_messages,
+       COUNT(*) FILTER (WHERE doc->>'source' = 'model_api'
+                          AND {_CHAT_ROLLUP_AGENT_PRED})::int
+           AS model_api_agent_messages,
+       COUNT(*) FILTER (WHERE doc->>'source' = 'model_api'
+                          AND doc->>'model_api_kind' = 'onboarding_greeting')::int
+           AS model_api_greetings,
+       MIN(ts) AS first_ts,
+       MAX(ts) AS last_ts,
+       MAX(ts) FILTER (WHERE doc->>'source' = 'agent_initiated_proactive')
+           AS proactive_last_ts,
+       MAX(ts) FILTER (WHERE {_CHAT_ROLLUP_USER_MSG_PRED}) AS last_user_ts,
+       MAX(ts) FILTER (WHERE {_CHAT_ROLLUP_AGENT_PRED}) AS last_agent_ts"""
+
+# 三个分布 + 两个 proactive 维度。后两个是 codex2 抓出来的漏扫:snapshot 里
+# live_activity_status / alert_status 各自还有一次**全史** GROUP BY（无窗、无
+# 索引），只格子化前面 16 个字段的话它们照样随历史线性增长，端点可能照样死。
+_CHAT_ROLLUP_DIST_FIELDS = (
+    ("role", "by_role", ""),
+    ("source", "by_source", ""),
+    ("content_type", "by_content_type", ""),
+    ("live_activity_status", "live_activity_status",
+     " AND doc->>'source' = 'agent_initiated_proactive'"),
+    ("alert_status", "alert_status",
+     " AND doc->>'source' = 'agent_initiated_proactive'"),
+)
+
+_CHAT_ROLLUP_MAX_DAYS_PER_TICK = 45
+
+
+def _chat_rollup_freeze_day(conn, *, day: date, zone: ZoneInfo,
+                            mirror_batch: list | None = None) -> int:
+    """Insert chat cells for one closed Beijing day. Idempotent
+    (ON CONFLICT DO NOTHING); returns how many cells were newly written."""
+    start, end = _lane_rollup_day_bounds(day, zone)
+    lo, hi = start.timestamp(), end.timestamp()
+    counts = conn.execute(
+        f"""
+        SELECT user_id,{_CHAT_ROLLUP_COUNTS_SELECT}
+        FROM {_chat_rollup_source('ts >= %s AND ts < %s')} src
+        GROUP BY user_id
+        """,
+        (lo, hi, lo, hi),
+    ).fetchall()
+    if not counts:
+        return 0
+
+    dists: dict[str, dict[str, dict[str, int]]] = {}
+    for field, target, extra in _CHAT_ROLLUP_DIST_FIELDS:
+        for uid, value, n in conn.execute(
+            f"""
+            SELECT user_id, COALESCE(NULLIF(doc->>%s, ''), 'unknown') AS value,
+                   COUNT(*)::int
+            FROM {_chat_rollup_source(f'ts >= %s AND ts < %s{extra}')} src
+            GROUP BY user_id, value
+            """,
+            (field, lo, hi, lo, hi),
+        ).fetchall():
+            dists.setdefault(str(uid), {}).setdefault(target, {})[str(value)] = int(n)
+
+    cell_sql = """
+            INSERT INTO chat_daily_rollup
+                (user_id, day, total, user_messages, agent_messages,
+                 image_messages, proactive_messages, model_api_user_messages,
+                 model_api_agent_messages, model_api_greetings,
+                 first_ts, last_ts, proactive_last_ts, last_user_ts,
+                 last_agent_ts, by_role, by_source, by_content_type,
+                 live_activity_status, alert_status)
+            SELECT u.user_id, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                   %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+            FROM users u WHERE u.user_id = %s FOR KEY SHARE OF u
+            ON CONFLICT (user_id, day) DO NOTHING
+            RETURNING user_id
+            """
+    written = 0
+    day_s = day.isoformat()
+    for row in counts:
+        uid = str(row[0])
+        by = dists.get(uid, {})
+        params = (day_s, *row[1:], Jsonb(by.get("by_role", {})),
+                  Jsonb(by.get("by_source", {})),
+                  Jsonb(by.get("by_content_type", {})),
+                  Jsonb(by.get("live_activity_status", {})),
+                  Jsonb(by.get("alert_status", {})), uid)
+        if conn.execute(cell_sql, params).fetchone():
+            written += 1
+        if mirror_batch is not None:
+            mirror_batch.append((cell_sql, params))
+    return written
+
+
+def freeze_completed_chat_days(*, now_epoch: float | None = None,
+                               tz: str = "Asia/Shanghai") -> list[str]:
+    """Freeze chat cells for every closed Beijing day.
+
+    No lag is needed: a chat row's ``ts`` is fixed at insert, so once a day has
+    closed no new row can land in it. (The resident lane freezer needs 4h
+    because its terminal timestamps are patched into a doc after the fact.)
+    """
+    try:
+        zone = ZoneInfo(tz)
+        now = (datetime.fromtimestamp(float(now_epoch), zone)
+               if now_epoch is not None else datetime.now(zone))
+        last_completed = now.date() - timedelta(days=1)
+        frozen: list[str] = []
+        with get_pool().connection() as conn:
+            row = conn.execute(
+                "SELECT backfill_from, through_day FROM chat_rollup_watermark "
+                "WHERE scope = 'chat'",
+            ).fetchone()
+            if row:
+                backfill_from = row[0]
+                cursor = date.fromisoformat(row[1]) + timedelta(days=1)
+            else:
+                oldest = conn.execute(
+                    "SELECT LEAST("
+                    " (SELECT MIN(ts) FROM chat_messages),"
+                    " (SELECT MIN(ts) FROM chat_message_archive))",
+                ).fetchone()
+                if not oldest or oldest[0] is None:
+                    return []
+                cursor = datetime.fromtimestamp(float(oldest[0]), zone).date()
+                backfill_from = cursor.isoformat()
+            steps = 0
+            watermark_sql = """
+                    INSERT INTO chat_rollup_watermark
+                        (scope, backfill_from, through_day)
+                    VALUES ('chat', %s, %s)
+                    ON CONFLICT (scope) DO UPDATE
+                        SET through_day = EXCLUDED.through_day, frozen_at = now()
+                    """
+            from tee_shadow import mirror
+            while cursor <= last_completed and steps < _CHAT_ROLLUP_MAX_DAYS_PER_TICK:
+                mirror_batch: list[tuple[str, tuple]] = []
+                _chat_rollup_freeze_day(conn, day=cursor, zone=zone,
+                                        mirror_batch=mirror_batch)
+                wm_params = (backfill_from, cursor.isoformat())
+                conn.execute(watermark_sql, wm_params)
+                mirror_batch.append((watermark_sql, wm_params))
+                mirror.execute_many(mirror_batch)
+                frozen.append(cursor.isoformat())
+                cursor += timedelta(days=1)
+                steps += 1
+        return frozen
+    except Exception as e:
+        log.error("[db] freeze_completed_chat_days failed: %s", e)
+        return []
+
+
+_CHAT_ROLLUP_DELETE_SQL = "DELETE FROM chat_daily_rollup WHERE user_id = %s"
+
+
+def chat_rollup_coverage(*, tz: str = "Asia/Shanghai") -> dict:
+    """覆盖范围，给读侧与面板用（Seven 2026-08-19 定 A：照常给数 + 标注缺口）。
+
+    刻意**不塞进 admin_data_track_snapshot 的每个用户行**：那份返回按 user_id
+    键控，加一个非 uid 的顶层键会让所有 ``for uid, row in ...`` 的调用方拿到一个
+    假用户；而每行各存一份既冗余，又会让读的人以为覆盖是 per-user 的。
+
+    ``complete=False`` 表示冻结器还没把已关闭的日子追平，此时端点给出的历史数字
+    是偏低的。面板必须把这件事显示出来——一个数字旁边没有它的覆盖范围就会被当成
+    全量，那正是 A 口径要避免的误读。
+    """
+    zone = ZoneInfo(tz)
+    expected = (datetime.now(zone).date() - timedelta(days=1)).isoformat()
+    blank = {"backfill_from": None, "through_day": None,
+             "expected_through_day": expected, "complete": False}
+    try:
+        with get_pool().connection() as conn:
+            row = conn.execute(
+                "SELECT backfill_from, through_day FROM chat_rollup_watermark "
+                "WHERE scope = 'chat'",
+            ).fetchone()
+    except Exception as e:  # noqa: BLE001 — 覆盖信息缺失本身就是要显示的状态
+        log.error("[db] chat_rollup_coverage failed: %s", e)
+        return blank
+    if not row:
+        return blank
+    return {
+        "backfill_from": str(row[0]),
+        "through_day": str(row[1]),
+        "expected_through_day": expected,
+        "complete": str(row[1]) >= expected,
+    }
+
+
+def chat_rollup_anonymize_user(conn, user_id: str) -> int:
+    """Drop one user's chat cells on account deletion.
+
+    Unlike ``lane_rollup_anonymize_user`` these are NOT merged into an
+    anonymous bucket: chat cells carry per-user activity shape (first/last
+    timestamps, source mix), and summing that across deleted accounts produces
+    a row nobody can interpret. The lane cells merge because they are pure
+    outcome counts. Deleting is also what the live-set reading expects — a
+    deleted account has no activity to report.
+    """
+    if not user_id:
+        return 0
+    n = conn.execute(
+        "SELECT COUNT(*) FROM chat_daily_rollup WHERE user_id = %s", (user_id,),
+    ).fetchone()[0]
+    if not n:
+        return 0
+    conn.execute("DELETE FROM chat_daily_rollup WHERE user_id = %s", (user_id,))
+    return int(n)
 
 
 def lane_rollup_anonymize_user(conn, user_id: str) -> int:
@@ -14649,6 +15065,7 @@ def delete_user_data(user_id: str) -> None:
                 # frozen cells are anonymize-merged into user_id='deleted'
                 # instead of dropped (Seven 2026-08-18) so aggregate history
                 # stays true while the per-user linkage dies with the account.
+                chat_cells_dropped = chat_rollup_anonymize_user(conn, user_id)
                 anonymized_cells = lane_rollup_anonymize_user(conn, user_id)
     except Exception as e:
         log.error("[db] delete_user_data(%s) failed: %s", user_id, e)
@@ -14682,6 +15099,12 @@ def delete_user_data(user_id: str) -> None:
     # re-deriving it table-by-table.
     mirror_group.append(
         ("DELETE FROM tee_pending_device_migration WHERE user_id = %s", (user_id,)))
+    if chat_cells_dropped:
+        # Chat cells are dropped, not merged: they carry per-user activity
+        # shape (first/last timestamps, source mix), and summing that across
+        # deleted accounts yields a row nobody can read. The lane cells merge
+        # because they are pure outcome counts.
+        mirror_group.append((_CHAT_ROLLUP_DELETE_SQL, (user_id,)))
     if anonymized_cells:
         # Same additive merge + delete replayed on TEE: additive statements
         # take two consistent stores to the same end state.

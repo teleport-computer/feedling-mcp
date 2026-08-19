@@ -86,6 +86,20 @@ REGISTRY: dict[str, Entry] = {
         "格子覆盖水位（每 route 一行，through_day 原地 UPDATE），与当日格子同组"
         "镜像——TEE 侧水位若滞后，cutover 后会把「已冻结」误读成「记录史之前」",
     ),
+    "chat_daily_rollup": Entry(
+        MIRROR,
+        "按用户×北京日的聊天冻结格子（0094/tee 0026），救 data-track 用（现算全史"
+        "在 prod 实测 99-115s、被 gunicorn 120s 打死）。与 lane 格子同理永久增长，"
+        "不能走 SNAPSHOT。⚠️ 内容是「那天发生过多少」而非「当前 live 还剩多少」"
+        "（Seven 2026-08-19 定），源含 chat_messages + chat_message_archive，"
+        "所以清空历史不会让数字掉下去；ON CONFLICT DO NOTHING，按日整组镜像",
+    ),
+    "chat_rollup_watermark": Entry(
+        MIRROR,
+        "聊天格子覆盖水位（单行 scope='chat'），与当日格子同组镜像；独立于 "
+        "lane_rollup_watermark——两个源丢历史的方式不同，共用一行会把更悲观的"
+        "下界强加给两边",
+    ),
 
     # ---------------------------------------------------------------- #
     # CIPHERTEXT —— 装信封的表，经 enclave 解密成明文写进 TEE。
