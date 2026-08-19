@@ -1545,7 +1545,6 @@ def image_generation_route_configure(
     route_id = str(route.get("id") or "")
     if selected_status != 200 and route_id not in route_ids_before:
         # 同 vision_route_configure:显式删路线 + 只回收本请求新建的凭据。
-        # 2026-08 生图排查里的僵尸路线就是原先漏删路线这半边留下的。
         db.model_api_route_delete(store.user_id, route_id)
         if not str(payload.get("credential_id") or "").strip():
             credential_id = str(route.get("credential_id") or "")
