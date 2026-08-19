@@ -546,6 +546,10 @@ if not math.isfinite(MCP_TURN_WALL_BUDGET_SEC) or MCP_TURN_WALL_BUDGET_SEC <= 0:
     raise RuntimeError(
         "FEEDLING_V2_MCP_TURN_WALL_BUDGET_SEC must be positive and finite"
     )
+# How many folded manuals one `mcp_tool_search` call may unfold. Bounded because
+# every resolved schema goes back into the next request's prompt: an unbounded
+# search would simply undo the folding that created the headroom.
+_SCHEMA_SEARCH_MAX_RESULTS = 8
 # History tools' cumulative per-chat-turn budget (spec §5): raw rows OR wall
 # seconds, whichever exhausts first,累计跨 provider round（两工具合计）。
 # Exhaustion is not a turn failure — later history calls get a short error
@@ -1852,6 +1856,159 @@ def _mcp_mutating_names_for_turn(mcp_turn) -> frozenset[str]:
     except Exception:  # noqa: BLE001 — duck-typed seam fails closed
         return offered
     return offered & mutating
+
+
+class _SchemaRecovery:
+    """One turn's folded-schema recovery contract, shared by chat and wake.
+
+    The prompt frontier may fold any non-resident tool down to a bounded
+    description with an empty parameter schema.  A lane that offers folded tools
+    without this object has no way back: the model sees a name it cannot call
+    correctly and the runtime has no resolver to hand the manual back.  Chat
+    owned this since T143; the wake lanes folded with ``recovery_name=''`` and
+    therefore never matched the recovery branch at all.
+
+    Both tool domains are covered here on purpose.  Platform schemas live in
+    ``SchemaRecoveryState``; user-MCP schemas stay inside the loader's turn
+    object (it owns the remote catalog and its own budget), and this class only
+    federates the two behind one contract so no lane can wire up half of it.
+    """
+
+    def __init__(self, mcp_turn, *, current_offered_mcp_tool_specs) -> None:
+        self._mcp_turn = mcp_turn
+        self._current_specs = current_offered_mcp_tool_specs
+        self.platform = v2_tool_surface.SchemaRecoveryState({
+            spec.name: spec for spec in cap_tool_schema.build_tool_specs()
+        })
+        self.pressure_extra_specs = getattr(
+            mcp_turn, "pressure_collapsed_tool_specs", None
+        )
+        if not callable(self.pressure_extra_specs):
+            self.pressure_extra_specs = None
+        self._record_mcp_surface = getattr(
+            mcp_turn, "set_pressure_tool_surface", None
+        )
+        self._mcp_protected = getattr(mcp_turn, "protected_tool_names", None)
+        self._mcp_recovery_needed = getattr(mcp_turn, "recovery_needed", None)
+
+    def _requires_mcp_resolution(self, name: str) -> bool:
+        predicate = getattr(self._mcp_turn, "requires_resolution", None)
+        return callable(predicate) and bool(predicate(name))
+
+    def _offered_mcp_names(self) -> tuple[str, ...]:
+        return tuple(
+            str(spec.name)
+            for spec in self._current_specs()
+            if str(getattr(spec, "name", "") or "")
+        )
+
+    def requires_resolution(self, name: str) -> bool:
+        """True when this call must be refused until its manual is loaded."""
+        return name in self.platform.discoverable_specs() or (
+            self._requires_mcp_resolution(name)
+        )
+
+    def record_surface(self, decision: dict | None) -> None:
+        detail = decision if isinstance(decision, dict) else {}
+        self.platform.set_pressure_collapsed(
+            detail.get("pressure_collapsed_names", ())
+        )
+        if callable(self._record_mcp_surface):
+            self._record_mcp_surface(detail)
+
+    def protected_names(self) -> set[str]:
+        protected = self.platform.protected_names()
+        if callable(self._mcp_protected):
+            protected.update(self._mcp_protected() or ())
+        else:
+            # Legacy duck-typed turn: a collapsed name that no longer requires
+            # resolution has already been resolved, so it must stay unfolded.
+            protected.update(
+                name
+                for name in (getattr(self._mcp_turn, "collapsed_names", ()) or ())
+                if not self._requires_mcp_resolution(name)
+            )
+        return protected
+
+    def recovery_needed(self) -> bool:
+        if self.platform.recovery_needed():
+            return True
+        if callable(self._mcp_recovery_needed):
+            return bool(self._mcp_recovery_needed())
+        return any(
+            self._requires_mcp_resolution(name)
+            for name in self._offered_mcp_names()
+        )
+
+    def resolve(self, args: dict | None) -> dict:
+        """`mcp_tool_search` body: hand back the full manuals that were folded."""
+        mcp_candidates = {
+            spec.name: spec
+            for spec in self._current_specs()
+            if self._requires_mcp_resolution(spec.name)
+        }
+        candidates = {
+            **self.platform.discoverable_specs(),
+            **mcp_candidates,
+        }
+        selection = v2_tool_surface.select_schema_names(
+            args,
+            candidates,
+            max_results=_SCHEMA_SEARCH_MAX_RESULTS,
+        )
+        if selection.get("error"):
+            return {"error": selection["error"], "tools": []}
+        selected = list(selection.get("selected") or [])
+        platform_resolved = self.platform.resolve([
+            name for name in selected if name in self.platform.full_specs
+        ])
+        tools_by_name: dict[str, Any] = {
+            name: self.platform.full_specs[name] for name in platform_resolved
+        }
+        mcp_selected = [name for name in selected if name in mcp_candidates]
+        mcp_result = {"resolved": [], "not_found": [], "tools": []}
+        resolve_mcp = getattr(self._mcp_turn, "resolve_tool_schemas", None)
+        if mcp_selected and callable(resolve_mcp):
+            mcp_result = resolve_mcp({"names": mcp_selected})
+            for item in mcp_result.get("tools") or []:
+                if isinstance(item, dict) and item.get("name"):
+                    tools_by_name[str(item["name"])] = item
+        resolved_set = set(platform_resolved) | set(
+            mcp_result.get("resolved") or []
+        )
+
+        def _public_tool(name: str) -> dict | None:
+            item = tools_by_name.get(name)
+            if isinstance(item, dict):
+                return item
+            if item is None:
+                return None
+            return {
+                "name": item.name,
+                "description": item.description,
+                "parameters": item.parameters,
+            }
+
+        return {
+            "resolved": [name for name in selected if name in resolved_set],
+            "not_found": list(selection.get("not_found") or [])
+            + list(mcp_result.get("not_found") or []),
+            "schema_budget_exceeded": list(
+                mcp_result.get("schema_budget_exceeded") or []
+            ),
+            "tools": [
+                public
+                for name in selected
+                if (public := _public_tool(name)) is not None
+            ],
+        }
+
+    def unresolved_call_error(self, tool_name: str) -> str:
+        return (
+            "error: tool schema is not loaded; call "
+            f'{cap_tool_schema.MCP_TOOL_SEARCH_TOOL} with '
+            f'names=["{tool_name}"] first'
+        )
 
 
 def _mcp_turn_usage_detail(
@@ -4950,6 +5107,14 @@ def _make_task_batch_dispatcher(
                     exc,
                 ),
                 disabled_tool_names=child_disabled_tools,
+                # 子 agent 的整个工具面只有 7 件,其中只有 memory_search 是常驻。
+                # 压力折叠会把另外 6 件折成空参数表,而子 agent **没有恢复口**:
+                # mcp_tool_search 不在 _SUBAGENT_ALLOWED_TOOLS 里,折掉就再也
+                # 拿不回来。与其让它看着名字填不出参数,不如全部保护 —— 真放不下
+                # 时 PromptFrontierExhausted 是一次可见的失败,好过静默失能。
+                refresh_protected_extra_tool_names=(
+                    lambda: set(_SUBAGENT_ALLOWED_TOOLS)
+                ),
                 allow_reply_tool=False,
                 outbound_blocking_read_tool_names=(_PRIVATE_READ_TOOLS),
                 outbound_blocking_read_tool_predicate=_read_blocks_later_outbound,
@@ -7419,6 +7584,13 @@ async def _run_wake(
     shadow_decision_allowed: bool | None = None
     stay_silent_reason: str | None = None
     language_user_rows: list[dict] = []
+    # Same content-free MCP usage counters chat keeps, declared before the try so
+    # the finally can emit `mcp.turn.usage` for wake lanes too. Without a wake
+    # copy of this trace, "did the heartbeat actually get the MCP surface?" is
+    # only answerable by reading code.
+    mcp_offered_names: tuple[str, ...] = ()
+    mcp_called_names: list[str] = []
+    mcp_turn_outcome = "failed"
     provider_roundtrip_trace = _provider_tool_surface_callback(
         deps,
         user_id,
@@ -8072,6 +8244,93 @@ async def _run_wake(
             if tm is not None:
                 tm.add_call(usage)
 
+        # ------------------------------------------------------------------
+        # 唤醒道的用户 MCP 工具面,以及被折叠 schema 的恢复通道。
+        #
+        # 这两件必须一起接。prompt frontier 在上下文压力下会把非常驻工具折成
+        # 「只剩一句描述、参数表为空」的发现态;chat 自 T143 起有 mcp_tool_search
+        # 把说明书要回来,唤醒道**一样会折,却既没有 recovery state 也把
+        # mcp_tool_search 关着** —— 折掉的工具在这一轮里再也拿不回参数。
+        # 该洞在接 MCP 之前就存在(平台工具同样被折),接了 MCP 只是把它放大。
+        #
+        # api_key 在唤醒道恒为 None:没有用户在场。runtime_token 是这条道唯一的
+        # 解密凭据,`core.envelope.read_envelope_body` 已经支持它。
+        # ------------------------------------------------------------------
+        mcp_turn = _EMPTY_MCP_TURN
+        if deps.load_mcp_turn is not None:
+            mcp_turn = await deps.load_mcp_turn(
+                store,
+                api_key=None,
+                runtime_token=token,
+                enclave_sem=enclave_sem,
+            )
+        mcp_instructions_block = _render_mcp_instructions(mcp_turn)
+        if mcp_instructions_block:
+            trusted_system_blocks = (*trusted_system_blocks, mcp_instructions_block)
+        mcp_mutating_names = _mcp_mutating_names_for_turn(mcp_turn)
+
+        def _current_offered_mcp_tool_specs() -> tuple:
+            # 不做 chat 的写工具扣留:`mutation_recovery_barrier` 只保护
+            # lane='chat',唤醒道没有那个屏障可言;而这一批的口径是读写都给。
+            refresh = getattr(mcp_turn, "current_tool_specs", None)
+            specs = refresh() if callable(refresh) else mcp_turn.tool_specs
+            return tuple(specs)
+
+        offered_mcp_tool_specs = _current_offered_mcp_tool_specs()
+        mcp_offered_names = tuple(
+            str(spec.name) for spec in offered_mcp_tool_specs if str(spec.name)
+        )
+        schema_recovery = _SchemaRecovery(
+            mcp_turn,
+            current_offered_mcp_tool_specs=_current_offered_mcp_tool_specs,
+        )
+        mcp_wall_budget = _McpTurnWallBudget(MCP_TURN_WALL_BUDGET_SEC)
+
+        def _wake_input_frontier_seq() -> int:
+            # 与 chat 同义:这次远端写基于哪个输入边界。唤醒的非 seq-native
+            # 回退路径里 cursor_box 没有 seq(纯时间戳),此时记 0。
+            try:
+                return max(0, int(cursor_box.get("seq", 0) or 0))
+            except (TypeError, ValueError, OverflowError):
+                return 0
+
+        async def _mcp_mutation_started(tc) -> None:
+            # 意图先落库再发请求。它同时是重投安全谓词读的那张表 ——
+            # 一个已经发过远端写的唤醒 job 不允许整轮重放。
+            started = await asyncio.to_thread(
+                jobs_store.start_mcp_mutation_attempt,
+                job_id,
+                user_id=user_id,
+                claimed_by=claimed_by,
+                call_id=str(tc.id),
+                tool_name=str(tc.name),
+                input_frontier_seq=_wake_input_frontier_seq(),
+            )
+            if not started:
+                raise RuntimeError("MCP mutation intent was not durably recorded")
+            effect_evidence_by_call[str(tc.id)] = {
+                "domain": "mcp",
+                "call_id": str(tc.id),
+                "tool_name": str(tc.name),
+                "status": "started",
+            }
+
+        async def _mcp_mutation_finished(tc, outcome: str) -> None:
+            evidence = effect_evidence_by_call.setdefault(
+                str(tc.id),
+                {"domain": "mcp", "call_id": str(tc.id)},
+            )
+            evidence["status"] = "uncertain"
+            finished = await asyncio.to_thread(
+                jobs_store.finish_mcp_mutation_attempt,
+                job_id,
+                call_id=str(tc.id),
+                outcome=str(outcome),
+            )
+            if not finished:
+                raise RuntimeError("MCP mutation outcome was not durably recorded")
+            evidence["status"] = str(outcome)
+
         # The wake lane follows the SAME user switch as chat. The proactive
         # companion could already reach the network before this feature existed
         # (pre offered these tools here with no gate at all), so closing it
@@ -8095,10 +8354,11 @@ async def _run_wake(
         # proactive companion never has a user-asked-a-question moment to
         # answer, so it must never be offered here — unconditionally, not
         # gated by the kill switch (that gate is chat-lane's Task 6 concern).
+        # `mcp_tool_search` 不在这里 —— 它是折叠 schema 的唯一取回口。禁掉它
+        # 等于让唤醒道在压力下永久丢失工具参数(T154 之前正是如此)。
         wake_disabled_tool_names = wake_disabled_web_tool_names | {
             cap_tool_schema.PROVIDER_USAGE_TOOL,
             cap_tool_schema.MEMORY_ORGANIZE_TOOL,
-            cap_tool_schema.MCP_TOOL_SEARCH_TOOL,
             # History tools are chat-lane only (spec §6 offer gate): the
             # proactive companion must never browse raw history on its own.
             # Withheld unconditionally — not tied to the kill switch — and the
@@ -8138,6 +8398,16 @@ async def _run_wake(
             await _fence_wake_effect("tool dispatch")
 
             async def _dispatch_platform_one(tc) -> ToolResult:
+                if tc.name == cap_tool_schema.MCP_TOOL_SEARCH_TOOL:
+                    return ToolResult(
+                        call_id=tc.id,
+                        content=json.dumps(
+                            schema_recovery.resolve(tc.args),
+                            ensure_ascii=False,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ),
+                    )
                 if tc.name == cap_tool_schema.MEMORY_ORGANIZE_TOOL:
                     return await _dispatch_memory_organize_tool(user_id, tc)
                 try:
@@ -8321,10 +8591,44 @@ async def _run_wake(
                     for tc, result in zip(calls, results)
                 ]
 
-            return await _dispatch_mixed_tool_calls(
-                tool_calls,
-                mcp_turn=_EMPTY_MCP_TURN,
-                mutating_mcp_names=frozenset(),
+            wake_tool_event = _make_tool_trajectory_callback(
+                trajectory_recorder,
+                effect_evidence_by_call,
+            )
+            # Folding is the provider-facing control; this runtime gate
+            # independently refuses every unresolved call before a durable
+            # mutation marker or remote request. Same contract as chat — a
+            # folded tool the model guessed at must not reach the network.
+            unresolved_by_id = {
+                str(tc.id): ToolResult(
+                    call_id=tc.id,
+                    content=schema_recovery.unresolved_call_error(tc.name),
+                )
+                for tc in tool_calls
+                if schema_recovery.requires_resolution(tc.name)
+            }
+            dispatchable_calls = [
+                tc for tc in tool_calls if str(tc.id) not in unresolved_by_id
+            ]
+            # `_make_tool_trajectory_callback` returns None when no recorder is
+            # wired (tests/legacy), so the refusal path must stay callable
+            # without one — the gate is a safety gate, not telemetry.
+            for tc in tool_calls if wake_tool_event is not None else ():
+                blocked = unresolved_by_id.get(str(tc.id))
+                if blocked is None:
+                    continue
+                await wake_tool_event(
+                    tc, "tool_call_started", {"phase": "mcp_schema_required"}
+                )
+                await wake_tool_event(
+                    tc,
+                    "tool_call_result",
+                    {"phase": "mcp_schema_required", "result": blocked},
+                )
+            dispatched = await _dispatch_mixed_tool_calls(
+                dispatchable_calls,
+                mcp_turn=mcp_turn,
+                mutating_mcp_names=mcp_mutating_names,
                 dispatch_platform_one=_dispatch_platform_one,
                 before_mcp_mutation=_before_write,
                 dispatch_workspace_batch=_dispatch_workspace_batch,
@@ -8333,12 +8637,18 @@ async def _run_wake(
                 dispatch_task_batch=dispatch_task_batch,
                 prepare_platform_mutation=effect_reservations.prepare,
                 prepare_workspace_batch=effect_reservations.prepare_batch,
+                mcp_mutation_started=_mcp_mutation_started,
+                mcp_mutation_finished=_mcp_mutation_finished,
+                mcp_wall_budget=mcp_wall_budget,
                 on_progress=_report_turn_progress,
-                on_tool_event=_make_tool_trajectory_callback(
-                    trajectory_recorder,
-                    effect_evidence_by_call,
-                ),
+                on_tool_event=wake_tool_event,
+                mcp_called_names=mcp_called_names,
             )
+            dispatched_by_id = {str(r.call_id): r for r in dispatched}
+            return [
+                unresolved_by_id.get(str(tc.id)) or dispatched_by_id[str(tc.id)]
+                for tc in tool_calls
+            ]
 
         thinking_trace_emitted = False
         language_trace_emitted = False
@@ -9043,6 +9353,21 @@ async def _run_wake(
                 build_messages=build_messages,
                 suppress_native_reasoning=_st_wake_loop.enabled(),
                 disabled_tool_names=wake_disabled_tool_names,
+                extra_tool_specs=offered_mcp_tool_specs,
+                refresh_extra_tool_specs=_current_offered_mcp_tool_specs,
+                refresh_pressure_collapsed_extra_tool_specs=(
+                    schema_recovery.pressure_extra_specs
+                ),
+                refresh_protected_extra_tool_names=(
+                    schema_recovery.protected_names
+                ),
+                extra_tool_recovery_name=cap_tool_schema.MCP_TOOL_SEARCH_TOOL,
+                extra_tool_recovery_active=schema_recovery.recovery_needed,
+                on_extra_tool_surface_plan=schema_recovery.record_surface,
+                extra_mutating_tool_names=mcp_mutating_names,
+                # 只有在 recovery 接齐之后才允许把策略交给唤醒:折叠而没有取回口
+                # 正是 T154 之前的那个洞,顺序反了会把洞做成默认行为。
+                tool_schema_collapse_policy=TOOL_SCHEMA_COLLAPSE_POLICY,
                 on_stay_silent=(_on_stay_silent if lane != "scheduled" else None),
                 memory_delete_allowed=False,
                 dispatch_tools=_dispatch_tools,
@@ -9071,8 +9396,13 @@ async def _run_wake(
                 # 打开它拿到的是 tool_loop 已有的整条恢复链，而不是直接判死：
                 # 先追加 _EMPTY_RESPONSE_CORRECTION 重试一轮（多数抽风到此为止），
                 # 仍空才 ProviderEmptyReply → wake_failed:empty_reply。失败不会
-                # 重放定时器（mark_fired 在入队时就落，不等 job 成功），只会 arm
-                # 60s 起、1h 封顶的 proactive 退避，用户下次说话即清。
+                # 重放定时器（mark_fired 在入队时就落，不等 job 成功）。
+                #
+                # ⚠️ 失败之后走哪条路按 lane 分，别照抄 heartbeat 的直觉：
+                # `_FAIL_BACKOFF_WAKE_LANES` 只含 heartbeat，所以「60s 起、1h 封顶
+                # 的 proactive 退避」**不适用于 scheduled**。scheduled 走
+                # `_SCHEDULED_FAILURE_RETRY_DELAYS_SEC` 的有限重投，退完仍失败就落
+                # 用户可见的终态失败 outbox —— 到点交付不允许无声消失。
                 require_reply=(lane == "scheduled"),
                 empty_response_correction=(
                     _SCHEDULED_WAKE_EMPTY_RESPONSE_CORRECTION
@@ -9134,6 +9464,7 @@ async def _run_wake(
                     )
                 ),
             )
+            mcp_turn_outcome = "completed"
             if shadow_decision_allowed is None:
                 # A successful weak-wake turn with no applied reply is the
                 # model's suppress/sleep outcome.  This assignment is after the
@@ -9321,6 +9652,33 @@ async def _run_wake(
     finally:
         if provider_roundtrip_trace is not None:
             await provider_roundtrip_trace.emit_summary()
+        if mcp_offered_names and deps.emit_debug_trace is not None:
+            # 与 chat 同名同形的事件,detail.lane 区分。没有它就只能靠读代码回答
+            # 「这次心跳到底拿没拿到 MCP 工具面」。
+            detail = _mcp_turn_usage_detail(mcp_offered_names, mcp_called_names)
+            try:
+                await asyncio.to_thread(
+                    deps.emit_debug_trace,
+                    user_id,
+                    "mcp.turn.usage",
+                    status="ok" if mcp_turn_outcome == "completed" else "error",
+                    summary=(
+                        f"MCP 本轮解析 {detail['offered_tool_count']} 个工具，"
+                        f"调用 {detail['call_count']} 次"
+                    ),
+                    explain=(
+                        "解析数是 prompt 预算前的回合工具面，不证明 provider 实收；"
+                        "实际下发见 mcp.surface.provider。仅记录数量和调用次数，"
+                        "不记录参数、返回值或用户内容。"
+                    ),
+                    detail={"lane": lane, "outcome": mcp_turn_outcome, **detail},
+                )
+            except Exception as exc:  # noqa: BLE001 -- telemetry is best-effort
+                log.warning(
+                    "[v2.mcp] wake turn usage trace failed user=%s code=%s",
+                    user_id,
+                    type(exc).__name__.lower(),
+                )
         decided_at = time.time()
         apns_alert_sent = False
         if push_slot is not None and deps.send_reply_push is not None:
@@ -11863,139 +12221,16 @@ async def process_job(
             )
 
         offered_mcp_tool_specs = _current_offered_mcp_tool_specs()
-        platform_schema_recovery = v2_tool_surface.SchemaRecoveryState({
-            spec.name: spec for spec in cap_tool_schema.build_tool_specs()
-        })
-        pressure_mcp_specs = getattr(
-            mcp_turn, "pressure_collapsed_tool_specs", None
-        )
-        protected_mcp_names = getattr(
-            mcp_turn, "protected_tool_names", None
-        )
-        mcp_recovery_needed = getattr(mcp_turn, "recovery_needed", None)
-        record_mcp_pressure_surface = getattr(
-            mcp_turn, "set_pressure_tool_surface", None
+        # Both tool domains' folded-schema recovery, federated behind one
+        # object so chat and the wake lanes cannot wire up different halves of
+        # it (they did: wake had none of it until T154).
+        schema_recovery = _SchemaRecovery(
+            mcp_turn,
+            current_offered_mcp_tool_specs=_current_offered_mcp_tool_specs,
         )
         mcp_offered_names = tuple(
             str(spec.name) for spec in offered_mcp_tool_specs if str(spec.name)
         )
-        if not callable(mcp_recovery_needed):
-            requires_mcp_resolution = getattr(
-                mcp_turn, "requires_resolution", None
-            )
-
-            def _legacy_mcp_recovery_needed() -> bool:
-                return callable(requires_mcp_resolution) and any(
-                    requires_mcp_resolution(name) for name in mcp_offered_names
-                )
-
-            mcp_recovery_needed = _legacy_mcp_recovery_needed
-        if not callable(protected_mcp_names):
-            requires_mcp_resolution = getattr(
-                mcp_turn, "requires_resolution", None
-            )
-
-            def _legacy_protected_mcp_names() -> set[str]:
-                collapsed = set(
-                    getattr(mcp_turn, "collapsed_names", ()) or ()
-                )
-                if not callable(requires_mcp_resolution):
-                    return set()
-                return {
-                    name for name in collapsed
-                    if not requires_mcp_resolution(name)
-                }
-
-            protected_mcp_names = _legacy_protected_mcp_names
-
-        def _record_pressure_tool_surface(decision: dict | None) -> None:
-            detail = decision if isinstance(decision, dict) else {}
-            collapsed = detail.get("pressure_collapsed_names", ())
-            platform_schema_recovery.set_pressure_collapsed(collapsed)
-            if callable(record_mcp_pressure_surface):
-                record_mcp_pressure_surface(detail)
-
-        def _protected_pressure_tool_names() -> set[str]:
-            protected = platform_schema_recovery.protected_names()
-            if callable(protected_mcp_names):
-                protected.update(protected_mcp_names() or ())
-            return protected
-
-        def _pressure_tool_recovery_needed() -> bool:
-            return platform_schema_recovery.recovery_needed() or (
-                callable(mcp_recovery_needed) and bool(mcp_recovery_needed())
-            )
-
-        def _resolve_pressure_tool_schemas(args: dict | None) -> dict:
-            requires_mcp_resolution = getattr(
-                mcp_turn, "requires_resolution", None
-            )
-            mcp_candidates = {
-                spec.name: spec
-                for spec in _current_offered_mcp_tool_specs()
-                if callable(requires_mcp_resolution)
-                and requires_mcp_resolution(spec.name)
-            }
-            candidates = {
-                **platform_schema_recovery.discoverable_specs(),
-                **mcp_candidates,
-            }
-            selection = v2_tool_surface.select_schema_names(
-                args,
-                candidates,
-                max_results=8,
-            )
-            if selection.get("error"):
-                return {"error": selection["error"], "tools": []}
-            selected = list(selection.get("selected") or [])
-            platform_selected = [
-                name for name in selected
-                if name in platform_schema_recovery.full_specs
-            ]
-            platform_resolved = platform_schema_recovery.resolve(
-                platform_selected
-            )
-            tools_by_name = {
-                name: platform_schema_recovery.full_specs[name]
-                for name in platform_resolved
-            }
-            mcp_selected = [name for name in selected if name in mcp_candidates]
-            mcp_result = {"resolved": [], "not_found": [], "tools": []}
-            resolve_mcp = getattr(mcp_turn, "resolve_tool_schemas", None)
-            if mcp_selected and callable(resolve_mcp):
-                mcp_result = resolve_mcp({"names": mcp_selected})
-                for item in mcp_result.get("tools") or []:
-                    if isinstance(item, dict) and item.get("name"):
-                        tools_by_name[str(item["name"])] = item
-            resolved_set = set(platform_resolved) | set(
-                mcp_result.get("resolved") or []
-            )
-
-            def _public_tool(name: str) -> dict | None:
-                item = tools_by_name.get(name)
-                if isinstance(item, dict):
-                    return item
-                if item is None:
-                    return None
-                return {
-                    "name": item.name,
-                    "description": item.description,
-                    "parameters": item.parameters,
-                }
-
-            return {
-                "resolved": [name for name in selected if name in resolved_set],
-                "not_found": list(selection.get("not_found") or [])
-                + list(mcp_result.get("not_found") or []),
-                "schema_budget_exceeded": list(
-                    mcp_result.get("schema_budget_exceeded") or []
-                ),
-                "tools": [
-                    public
-                    for name in selected
-                    if (public := _public_tool(name)) is not None
-                ],
-            }
         if mutation_recovery_barrier is not None:
             disabled_mutation_tool_names = frozenset(
                 set(cap_registry.WRITE_ACTIONS)
@@ -12206,7 +12441,7 @@ async def process_job(
                     return ToolResult(
                         call_id=tc.id,
                         content=json.dumps(
-                            _resolve_pressure_tool_schemas(tc.args),
+                            schema_recovery.resolve(tc.args),
                             ensure_ascii=False,
                             sort_keys=True,
                             separators=(",", ":"),
@@ -12399,21 +12634,10 @@ async def process_job(
             unresolved_by_id = {
                 str(tc.id): ToolResult(
                     call_id=tc.id,
-                    content=(
-                        "error: tool schema is not loaded; call "
-                        f'{cap_tool_schema.MCP_TOOL_SEARCH_TOOL} with '
-                        f'names=["{tc.name}"] first'
-                    ),
+                    content=schema_recovery.unresolved_call_error(tc.name),
                 )
                 for tc in dispatchable_calls
-                if (
-                    tc.name
-                    in platform_schema_recovery.discoverable_specs()
-                    or (
-                        callable(getattr(mcp_turn, "requires_resolution", None))
-                        and mcp_turn.requires_resolution(tc.name)
-                    )
-                )
+                if schema_recovery.requires_resolution(tc.name)
             }
             if unresolved_by_id:
                 blocked_by_id.update(unresolved_by_id)
@@ -13822,17 +14046,17 @@ async def process_job(
             extra_tool_specs=offered_mcp_tool_specs,
             refresh_extra_tool_specs=_current_offered_mcp_tool_specs,
             refresh_pressure_collapsed_extra_tool_specs=(
-                pressure_mcp_specs if callable(pressure_mcp_specs) else None
+                schema_recovery.pressure_extra_specs
             ),
             refresh_protected_extra_tool_names=(
-                _protected_pressure_tool_names
+                schema_recovery.protected_names
             ),
             extra_tool_recovery_name=cap_tool_schema.MCP_TOOL_SEARCH_TOOL,
             extra_tool_recovery_active=(
-                _pressure_tool_recovery_needed
+                schema_recovery.recovery_needed
             ),
             on_extra_tool_surface_plan=(
-                _record_pressure_tool_surface
+                schema_recovery.record_surface
             ),
             extra_mutating_tool_names=mcp_mutating_names,
             disabled_tool_names=disabled_tool_names_for_turn,
