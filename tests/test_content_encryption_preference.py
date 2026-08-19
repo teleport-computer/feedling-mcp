@@ -253,6 +253,8 @@ def test_test_runner_deploy_verifies_the_live_plaintext_gate_release_unit():
 
     assert "Verify live TEST plaintext gate release unit" in runner_job
     assert "deploy/test-cvm-id.txt" in runner_job
+    assert "for attempt in $(seq 1 12)" in runner_job
+    assert "sleep 10" in runner_job
     for container in ("feedling-test-backend-1", "serve-worker", "agent-runner"):
         assert container in runner_job
 

@@ -2502,12 +2502,23 @@ jobs:
           verify_gate() {
             cvm_id="$1"
             container="$2"
-            if ! phala ssh --api-token "$PHALA_CLOUD_API_KEY" "$cvm_id" -- \
-              docker exec "$container" printenv "$KEY" | tr -d '\r' | grep -qx '1'; then
-              echo "::error::$container on $cvm_id does not report $KEY=1"
-              return 1
-            fi
-            echo "$container on $cvm_id reports $KEY=1"
+            # Phala's control-plane/SSH gateway can return a transient unknown
+            # API error for a few seconds after either CVM becomes running.
+            # Retry the read, but keep the value check exact and fail closed.
+            for attempt in $(seq 1 12); do
+              if phala ssh --api-token "$PHALA_CLOUD_API_KEY" "$cvm_id" -- \
+                docker exec "$container" printenv "$KEY" 2>&1 \
+                | tr -d '\r' | grep -qx '1'; then
+                echo "$container on $cvm_id reports $KEY=1"
+                return 0
+              fi
+              if [ "$attempt" -lt 12 ]; then
+                echo "::warning::$container gate check failed (attempt $attempt/12); retrying in 10s"
+                sleep 10
+              fi
+            done
+            echo "::error::$container on $cvm_id does not report $KEY=1"
+            return 1
           }
 
           verify_gate "$MAIN_CVM_ID" feedling-test-backend-1
