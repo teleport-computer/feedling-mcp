@@ -327,6 +327,7 @@ def test_prod_preflight_blocks_unready_tee_primary_before_mutating_any_cvm():
         "backend/alembic_tee/alembic.ini",
         "SELECT version_num FROM alembic_tee_version",
         "owner_fingerprint != app_fingerprint",
+        'owner_user != "feedling_owner"',
         "current_user",
         "PROD TEE schema migration required",
         "run the TEE migrate workflow for prod",

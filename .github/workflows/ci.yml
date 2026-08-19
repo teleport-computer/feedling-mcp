@@ -1178,6 +1178,7 @@ jobs:
           )
           with psycopg.connect(os.environ["TEE_MIGRATION_DATABASE_URL"]) as conn:
               owner_fingerprint = tuple(conn.execute(fingerprint_sql).fetchone())
+              owner_user = str(conn.execute("SELECT current_user").fetchone()[0])
               actual = {
                   str(row[0])
                   for row in conn.execute(
@@ -1399,6 +1400,12 @@ jobs:
           with psycopg.connect(os.environ["APP_DATABASE_URL"]) as conn:
               app_fingerprint = tuple(conn.execute(fingerprint_sql).fetchone())
               app_user = str(conn.execute("SELECT current_user").fetchone()[0])
+          if owner_user != "feedling_owner":
+              print(
+                  "::error::PROD_TEE_MIGRATION_DSN must use the feedling_owner "
+                  f"role; got {owner_user!r}. No production CVM was changed."
+              )
+              raise SystemExit(1)
           if owner_fingerprint != app_fingerprint:
               print(
                   "::error::DATABASE_URL and PROD_TEE_MIGRATION_DSN must "
