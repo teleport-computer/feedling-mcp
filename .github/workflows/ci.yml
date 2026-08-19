@@ -1391,6 +1391,7 @@ jobs:
           )
           with psycopg.connect(os.environ["TEE_MIGRATION_DATABASE_URL"]) as conn:
               owner_fingerprint = tuple(conn.execute(fingerprint_sql).fetchone())
+              owner_user = str(conn.execute("SELECT current_user").fetchone()[0])
               actual = {
                   str(row[0])
                   for row in conn.execute(

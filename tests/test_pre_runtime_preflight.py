@@ -347,6 +347,25 @@ def test_prod_preflight_blocks_unready_tee_primary_before_mutating_any_cvm():
     assert schema_gate < image_gate
 
 
+def test_prod_preflight_reads_owner_role_before_enforcing_it():
+    preflight = _job(
+        WORKFLOW.read_text(),
+        "validate-prod-runner-topology",
+        "detect-cvm-changes-pre",
+    )
+    schema_step = preflight.split(
+        "- name: Require PROD TEE schema at release head before mutating any CVM",
+        1,
+    )[1].split("\n      - name:", 1)[0]
+
+    assignment = (
+        'owner_user = str(conn.execute("SELECT current_user").fetchone()[0])'
+    )
+    enforcement = 'if owner_user != "feedling_owner":'
+    assert assignment in schema_step
+    assert schema_step.index(assignment) < schema_step.index(enforcement)
+
+
 def test_prod_preflight_rejects_invalid_selector_and_stale_shadow_wiring():
     preflight = _job(
         WORKFLOW.read_text(),
